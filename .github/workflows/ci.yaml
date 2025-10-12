@@ -23,21 +23,14 @@ jobs:
       run: make lint
 
   test:
-    name: Test
+    name: Test All Features
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        features:
-          - "testing,std,tcp,tokio"
-          - "testing,aes-gcm,sha3,secp256k1"
-          - "testing,zstd,compress"
-          - "testing,x509,signature"
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
-    - name: Run tests
-      run: make test features="${{ matrix.features }}"
+    - name: Run all feature combination tests
+      run: make test-all
 
   test-no-default:
     name: Test (no default features)
