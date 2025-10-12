@@ -9,7 +9,6 @@
 
 ## Status
 > Warning: This project is under active development. Public APIs and file formats MAY change WITHOUT notice. It is NOT yet production-ready.
-# tightbeam
 
 ## Abstract
 
