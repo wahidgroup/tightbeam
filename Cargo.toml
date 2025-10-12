@@ -1,0 +1,101 @@
+[workspace]
+resolver = "2"
+members = [
+    "tightbeam",
+    "tightbeam-derive",
+]
+
+[workspace.package]
+authors = ["Tanveer Wahid <tan@wahid.email>"]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tanveerw/tightbeam"
+homepage = "https://github.com/tanveerw/tightbeam"
+documentation = "https://docs.rs/tightbeam"
+readme = "README.md"
+keywords = ["cryptography", "security", "messaging", "protocol"]
+categories = ["cryptography", "network-programming"]
+
+[workspace.dependencies]
+# RustCrypto dependencies
+spki = { version = "0.7", default-features = false }
+der = { version = "0.7", default-features = false, features = [
+	"alloc",
+	"derive",
+	"oid",
+] }
+hex-literal = { version = "1.0.0" }
+zeroize = { version = "1.5", features = [
+	"alloc",
+	"zeroize_derive",
+] }
+crypto-common = { version = "0.1.6", default-features = false, features = [
+	"getrandom",
+	"rand_core",
+] }
+aead = { version = "0.5.2", default-features = false, features = [
+	"alloc",
+] }
+signature = { version = "2.2.0", default-features = false, features = [
+	"alloc",
+] }
+digest = { version = "0.10.7", default-features = false, features = [
+	"alloc",
+] }
+aes-gcm = { version = "0.10.3", default-features = false, features = [
+	"aes",
+	"alloc",
+] }
+sha3 = { version = "0.10.8", default-features = false, features = [
+	"oid",
+] }
+ecdsa = { version = "0.16.9", default-features = false, features = [
+	"signing",
+	"digest",
+	"der",
+] }
+k256 = { version = "0.13.4", default-features = false, features = [
+	"alloc",
+	"signature",
+	"schnorr",
+	"ecdsa",
+	"pkcs8",
+] }
+x509-cert = { version = "0.2.5", default-features = false, features = [
+	"pem",
+] }
+
+# Non-RustCrypto dependencies
+rand_core = { version = "0.6", default-features = false, features = [
+	"getrandom",
+] }
+tokio = { version = "1.47.1", default-features = false, features = [
+	"full",
+] }
+time = { version = "0.3.44", default-features = false, features = [
+	"macros",
+	"alloc",
+] }
+
+# Compression dependencies
+zeekstd = { version = "0.6.1", default-features = false }
+
+# Dev dependencies
+rand = { version = "0.9" }
+fake = { version = "=4.3.0", features = [
+	"derive",
+	"uuid",
+	"time",
+	"url",
+	"email_address",
+] }
+
+# Proc macro dependencies
+proc-macro2 = "1.0.101"
+quote = "1.0.41"
+syn = { version = "2.0.106", features = ["full", "derive"] }
+
+# Internal workspace dependencies
+tightbeam = { path = "tightbeam" }
+tightbeam-derive = { path = "tightbeam-derive" }

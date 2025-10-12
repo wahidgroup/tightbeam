@@ -1,0 +1,154 @@
+[package]
+name = "tightbeam"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "A secure, high-performance messaging protocol library"
+
+[lib]
+name = "tightbeam"
+
+[dependencies]
+# RustCrypto dependencies
+spki = { workspace = true }
+der = { workspace = true }
+hex-literal = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+crypto-common = { workspace = true, optional = true }
+aead = { workspace = true, optional = true }
+signature = { workspace = true, optional = true }
+digest = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+sha3 = { workspace = true, optional = true }
+ecdsa = { workspace = true, optional = true }
+k256 = { workspace = true, optional = true }
+x509-cert = { workspace = true, optional = true }
+
+# Non-RustCrypto dependencies
+rand_core = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+
+## Compression dependencies
+zeekstd = { workspace = true, optional = true }
+# Ecosystem crates
+tightbeam-derive = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+fake = { workspace = true }
+
+[features]
+default = ["full"]
+
+full = [
+	"std",
+	"random",
+	"hex",
+	"zeroize",
+	"builder",
+	"policy",
+	"router",
+	"transport",
+	"transport-policy",
+	"tcp",
+	"aead",
+	"x509",
+	"signature",
+	"digest",
+	"aes-gcm",
+	"sha3",
+	"secp256k1",
+	"derive",
+	"tokio",
+	"constants",
+	"zstd",
+	"time",
+	"standards-rfc",
+	"standards-iso",
+	"testing",
+]
+
+# Core features
+constants = ["hex"]
+crypto = ["random"]
+builder = ["derive", "x509-cert?/builder"]
+policy = []
+router = []
+transport = []
+doc = []
+compress = ["tightbeam-derive?/compress"]
+transport-policy = ["policy", "transport"]
+tcp = ["transport"]
+testing = []
+
+# TODO
+bitcoin = ["dep:k256"]
+
+# RustCrypto features
+hex = ["dep:hex-literal"]
+aead = [
+	"crypto",
+	"dep:aead",
+	"dep:ecdsa",
+	"dep:crypto-common",
+	"tightbeam-derive?/aead",
+]
+signature = [
+	"crypto",
+	"tightbeam-derive?/signature",
+	"dep:signature",
+	"x509-cert?/signature",
+]
+digest = ["crypto", "dep:digest"]
+x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
+
+## Security features
+random = ["dep:rand_core"]
+zeroize = ["dep:zeroize", "der/zeroize", "aes-gcm?/zeroize"]
+
+## Cryptographic algorithm features
+aes-gcm = ["crypto", "aead", "dep:aes-gcm"]
+sha3 = ["crypto", "dep:sha3"]
+secp256k1 = ["crypto", "dep:k256"]
+
+# Derive macro support
+derive = ["dep:tightbeam-derive"]
+
+# Standard library support
+std = [
+	"spki/std",
+	"der/std",
+	"crypto-common?/std",
+	"zeroize?/std",
+	"digest?/std",
+	"aead?/std",
+	"signature?/std",
+	"aes-gcm?/std",
+	"sha3?/std",
+	"k256?/std",
+	"zeekstd?/std",
+	"time?/std",
+	"rand_core?/std",
+	"x509-cert?/std",
+]
+
+# NON-RustCrypto features
+time = ["dep:time", "der/time"]
+tokio = ["dep:tokio", "std"]
+zstd = ["dep:zeekstd", "compress", "std"]
+# TODO
+gzip = ["compress"]
+
+# Standards
+standards = []
+standards-rfc = ["standards"]
+standards-iso = ["standards"]
