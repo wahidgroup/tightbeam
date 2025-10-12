@@ -1,4 +1,4 @@
-# Layer-5 tightbeam Framework
+# tightbeam
 
 ## Abstract
 
@@ -20,7 +20,33 @@ tightbeam is a Layer-5 framework implementing high-fidelity information theory t
 
 tightbeam addresses the need for a structured, versioned messaging protocol that guarantees information fidelity through applied mathematical constraints where I(t) ∈ (0,1) ∀t ∈ T_t.
 
-### 1.1 Requirements Language
+### 1.1 Information Fidelity Constraint
+
+The foundational mathematical principle underlying tightbeam is the information fidelity constraint:
+
+**I(t) ∈ (0,1) ∀t ∈ T_t**
+
+Where:
+- **I(t)**: The Frame as an information state at time t
+- **(0,1)**: Bounded information fidelity interval
+  - Never perfect (1): Acknowledges fundamental limits of information transmission
+  - Never absent (0): Guarantees non-zero information content in all valid frames
+- **∀t ∈ T_t**: Holds for all time points in the protocol's temporal domain
+
+This constraint reflects applied information theory principles:
+
+1. **Theoretical Foundation**: Information transmission systems exhibit bounded fidelity due to physical limitations, encoding constraints, stochastic noise & shock, and temporal factors
+2. **Practical Implications**: tightbeam's design ensures frames always carry bounded information content while acknowledging imperfection inherent in any communication system
+3. **Protocol Guarantee**: The constraints provide applied mathematical basis for frame validation and quality assurance
+
+The I(t) constraint informs several protocol design decisions:
+- ASN.1 DER encoding for maximum structural fidelity
+- Versioned metadata allowing graceful capability evolution
+- Optional integrity and confidentiality fields preserving information quality
+- Temporal ordering ensuring coherent information flow over time
+- Optional cryptographic signing to ensure non-repudiation
+
+### 1.2 Requirements Language
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC2119](https://datatracker.ietf.org/doc/html/rfc2119).
 
@@ -70,6 +96,128 @@ tightbeam implements high-fidelity information transmission through the followin
   - OPTIONAL: Message lifetime (64-bit TTL)
   - OPTIONAL: State chaining (previous message integrity)
   - OPTIONAL: Stage control (8×8 matrix flags)
+
+### 4.1.1 Security Profiles
+
+tightbeam defines standardized security profiles that reference established cryptographic standards:
+
+- **Profile 0 (Testing)**: No mandatory security features
+  - Use case: Development, testing, non-sensitive data
+  - Security: Optional per version capabilities
+
+- **Profile 1 (Standard Security)**: TLS 1.3 equivalent security
+  - Reference: RFC 8446 cipher suites
+  - Mandatory: AES-GCM encryption, SHA-256/384 integrity
+  - Key Exchange: Compatible with TLS 1.3 key schedule
+
+- **Profile 2 (High Security)**: NSA Suite B equivalent
+  - Reference: RFC 6460, NIST SP 800-56A
+  - Mandatory: AES-256-GCM, SHA-384, ECDSA P-384
+  - Compliance: FIPS 140-2 Level 3 compatible
+
+- **Profile 3 (Future-Ready)**: Post-quantum resistant
+  - Reference: NIST post-quantum standardization
+  - Mandatory: Hybrid classical/post-quantum algorithms
+  - Migration: Smooth transition path from Profile 2
+
+### 4.1.2 Message-Level Security Requirements
+
+tightbeam supports compile-time security enforcement at the message type level through the `Message` trait:
+
+```rust
+pub trait Message: /* trait bounds */ {
+    const MUST_BE_NON_REPUDIABLE: bool = false;
+    const MUST_BE_CONFIDENTIAL: bool = false;
+    const MUST_BE_COMPRESSED: bool = false;
+    const MUST_BE_PRIORITIZED: bool = false;
+    const MIN_VERSION: Version = Version::V0;
+}
+```
+
+#### Security Requirement Semantics
+
+- **`MUST_BE_NON_REPUDIABLE`**: When `true`, the message MUST include a digital signature in the Frame's `nonrepudiation` field
+- **`MUST_BE_CONFIDENTIAL`**: When `true`, the message MUST be encrypted using the metadata's `confidentiality` field
+- **`MUST_BE_COMPRESSED`**: When `true`, the message MUST be compressed using a non-none `compactness` algorithm
+- **`MUST_BE_PRIORITIZED`**: When `true`, the message MUST include a `priority` field in V2+ metadata
+- **`MIN_VERSION`**: Specifies the minimum protocol version required for this message type
+
+#### Implementation Enforcement
+
+These requirements are enforced at:
+- **Compile Time**: Type system prevents composition of messages that don't meet requirements
+- **Runtime Validation**: Frame validation ensures required fields are present
+- **Profile Compliance**: Security profiles can reference message types with specific requirements
+
+#### Derive Macro Usage
+
+The `#[derive(Beamable)]` macro automatically implements the `Message` trait:
+
+```rust
+// This derive macro...
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(nonrepudiable, confidential, min_version = "V1")]
+struct PaymentInstruction { /* fields */ }
+
+// ...expands to:
+impl Message for PaymentInstruction {
+    const MUST_BE_NON_REPUDIABLE: bool = true;
+    const MUST_BE_CONFIDENTIAL: bool = true;
+    const MUST_BE_COMPRESSED: bool = false;
+    const MUST_BE_PRIORITIZED: bool = false;
+    const MIN_VERSION: Version = Version::V1;
+}
+```
+
+**Supported attributes:**
+- `#[beam(nonrepudiable)]` - Sets `MUST_BE_NON_REPUDIABLE = true`
+- `#[beam(confidential)]` - Sets `MUST_BE_CONFIDENTIAL = true`
+- `#[beam(compressed)]` - Sets `MUST_BE_COMPRESSED = true`
+- `#[beam(prioritized)]` - Sets `MUST_BE_PRIORITIZED = true`
+- `#[beam(min_version = "V1")]` - Sets minimum protocol version
+
+#### Example Message Types
+
+```rust
+use tightbeam::Beamable;
+use der::Sequence;
+
+// High-security financial transaction
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(nonrepudiable, confidential, min_version = "V1")]
+struct PaymentInstruction {
+    account_from: String,
+    account_to: String,
+    amount: u64,
+    currency: String,
+}
+
+// Bulk data transfer
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(compressed, prioritized, min_version = "V2")]
+struct DataTransfer {
+    dataset_id: String,
+    data: Vec<u8>,
+    checksum: [u8; 32],
+}
+
+// Development/testing message (no security requirements)
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+struct TestMessage {
+    test_id: u32,
+    content: String,
+}
+
+// Critical system alert (requires all security features)
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(nonrepudiable, confidential, compressed, prioritized, min_version = "V2")]
+struct SecurityAlert {
+    severity: u8,
+    source: String,
+    description: String,
+    timestamp: u64,
+}
+```
 
 ### 4.2 Frame Structure
 
@@ -292,6 +440,18 @@ AlgorithmIdentifier ::= SEQUENCE {
 - `originalSize` in compression info MUST match the uncompressed message size
 - Compression level MUST be within algorithm-specific valid ranges
 
+#### Message-Level Security Constraints
+- When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
+- When a message type specifies `MUST_BE_CONFIDENTIAL = true`, the Frame's metadata MUST include a `confidentiality` field
+- When a message type specifies `MUST_BE_COMPRESSED = true`, the Frame's metadata `compactness` field MUST NOT be `none`
+- When a message type specifies `MUST_BE_PRIORITIZED = true`, the Frame's metadata MUST include a `priority` field (V2+ only)
+- The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
+
+#### Profile-Message Type Mapping
+- Security profiles MAY specify approved message types
+- Message types with security requirements SHOULD be used with compatible security profiles
+- Profile 0 (Testing) MAY use message types with security requirements for development purposes only
+
 ### 5.9 Complete ASN.1 Module
 
 ```asn1
@@ -389,16 +549,86 @@ Implementations MUST provide:
 - Memory safety and ownership guarantees
 - ASN.1 DER encoding/decoding
 - Frame and Metadata as specified as ASN.1
+- Message-level security requirement enforcement
 
 Implementations MUST OPTIONALLY provide:
 - Abstract Layer-4 transport with async/sync
 - Cryptographic abstraction for confidentiality, integrity and non-repudiation
+
+### 6.1.1 Message Security Enforcement
+
+Implementations MUST enforce message-level security requirements through:
+
+#### Compile-Time Validation
+- Type system integration to prevent unsafe message composition
+- Trait-based constraints that enforce security requirements at build time
+- Version compatibility checking during message type definition
+
+#### Runtime Validation
+- Frame validation against message type requirements during encoding/decoding
+- Security profile compliance verification
+- Graceful error handling for requirement violations
+
+#### Example Implementation Pattern
+```rust
+// Pseudo-code for enforcement mechanism
+impl<T: Message> Frame {
+    fn compose_with_message(message: T) -> Result<Frame> {
+        let mut frame = Frame::new();
+        
+        // Enforce version requirement
+        if frame.version < T::MIN_VERSION {
+            return Err(TightBeamError::InsufficientVersion);
+        }
+        
+        // Enforce security requirements
+        if T::MUST_BE_NON_REPUDIABLE && frame.nonrepudiation.is_none() {
+            return Err(TightBeamError::MissingSignature);
+        }
+        
+        if T::MUST_BE_CONFIDENTIAL && frame.metadata.confidentiality.is_none() {
+            return Err(TightBeamError::MissingEncryption);
+        }
+        
+        // Additional enforcement logic...
+        Ok(frame)
+    }
+}
+```
 
 ### 6.2 Transport Layer
 
 tightbeam operates over ANY transport protocols:
 - TCP (built-in async/sync support)
 - Custom transports via trait implementation
+
+### 6.3 Key Management Integration
+
+tightbeam integrates with existing key management standards and infrastructure:
+
+#### 6.3.1 Public Key Infrastructure
+- **Certificates**: X.509 certificates per RFC 5280
+- **Certificate Chains**: Standard PKI validation chains
+- **Certificate Revocation**: CRL (RFC 5280) or OCSP (RFC 6960)
+- **Enterprise Integration**: Compatible with existing CA infrastructure
+
+#### 6.3.2 Key Exchange and Distribution
+- **Key Schedule**: Compatible with TLS 1.3 key derivation (RFC 8446)
+- **Ephemeral Keys**: ECDHE key exchange per NIST SP 800-56A
+- **Key Agreement**: Follows NIST SP 800-56A/B/C recommendations
+- **Perfect Forward Secrecy**: Ephemeral key exchange for session keys
+
+#### 6.3.3 Key Lifecycle Management
+- **Key Rotation**: Follow NIST SP 800-57 Part 1 guidelines
+- **Key Escrow**: Integration with enterprise key management systems
+- **Hardware Security**: HSM compatibility for key storage
+- **Key Derivation**: HKDF (RFC 5869) for session key derivation
+
+#### 6.3.4 Enterprise Integration
+- **PKCS#11**: Hardware token and HSM integration
+- **Key Management Systems**: Compatible with enterprise KMS
+- **Directory Services**: LDAP/Active Directory certificate lookup
+- **Policy Enforcement**: Supports organizational key policies
 
 ## 7. Security Considerations
 
@@ -420,6 +650,35 @@ tightbeam operates over ANY transport protocols:
 - Context-specific tags prevent field confusion
 - Explicit versioning prevents downgrade attacks
 - Optional field handling prevents injection attacks
+
+### 7.4 Cryptographic Algorithm Policy
+
+tightbeam follows established cryptographic standards and maintains algorithm agility:
+
+#### 7.4.1 Approved Algorithms
+- **Current Standards**: NIST FIPS 140-2/3 approved algorithm lists
+- **Symmetric Encryption**: AES (FIPS 197), ChaCha20-Poly1305 (RFC 8439)
+- **Hash Functions**: SHA-2 (FIPS 180-4), SHA-3 (FIPS 202)
+- **Digital Signatures**: ECDSA (FIPS 186-4), EdDSA (RFC 8032)
+- **Key Exchange**: ECDH (NIST SP 800-56A), X25519 (RFC 7748)
+
+#### 7.4.2 Algorithm Deprecation Schedule
+- **Transition Guidelines**: NIST SP 800-131A Rev. 2 compliance
+- **Legacy Support**: Controlled deprecation with migration periods
+- **Vulnerability Response**: Rapid algorithm disabling capability
+- **Industry Alignment**: Follow IETF/RFC security considerations
+
+#### 7.4.3 Post-Quantum Cryptography
+- **Preparation**: Monitor NIST post-quantum standardization process
+- **Hybrid Approach**: Classical + post-quantum algorithm combinations
+- **Migration Strategy**: Gradual transition from classical to post-quantum
+- **Interoperability**: Maintain backward compatibility during transition
+
+#### 7.4.4 Algorithm Identifier Management
+- **OID Registry**: Use standard algorithm OIDs from IANA/ITU-T
+- **Parameter Validation**: Enforce minimum key sizes and parameters
+- **Algorithm Negotiation**: Support for algorithm capability discovery
+- **Security Policy**: Configurable algorithm allow/deny lists
 
 ## 8. Examples
 
@@ -500,8 +759,27 @@ test_container! {
 - RFC 2119: Key words for use in RFCs to Indicate Requirement Levels
 - ITU-T X.690: ASN.1 Distinguished Encoding Rules (DER)
 - RFC 5652: Cryptographic Message Syntax (CMS)
-- RFC 3280: Internet X.509 Public Key Infrastructure
+- RFC 5280: Internet X.509 Public Key Infrastructure Certificate and CRL Profile
 - RFC 5480: Elliptic Curve Cryptography Subject Public Key Info
+- RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
+- RFC 6460: Suite B Profile for Transport Layer Security (TLS)
+- RFC 5869: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
+- RFC 6960: X.509 Internet Public Key Infrastructure Online Certificate Status Protocol
+- RFC 8439: ChaCha20 and Poly1305 for IETF Protocols
+- RFC 8032: Edwards-Curve Digital Signature Algorithm (EdDSA)
+- RFC 7748: Elliptic Curves for Security
+
+### 9.1.1 NIST Standards References
+
+- FIPS 140-2: Security Requirements for Cryptographic Modules
+- FIPS 140-3: Security Requirements for Cryptographic Modules
+- FIPS 180-4: Secure Hash Standard (SHS)
+- FIPS 186-4: Digital Signature Standard (DSS)
+- FIPS 197: Advanced Encryption Standard (AES)
+- FIPS 202: SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions
+- NIST SP 800-56A: Recommendation for Pair-Wise Key Establishment Schemes
+- NIST SP 800-57: Recommendation for Key Management
+- NIST SP 800-131A: Transitioning the Use of Cryptographic Algorithms and Key Lengths
 
 ### 9.2 Informative References
 

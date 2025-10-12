@@ -269,7 +269,6 @@ mod tests {
 		let test_message = create_v0_tightbeam(None, None);
 
 		// Spawn server task
-		// Spawn server task
 		let (tx, mut rx) = tokio::sync::mpsc::channel(2);
 		let server_handle = tokio::spawn(async move {
 			let mut transport = server
