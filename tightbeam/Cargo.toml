@@ -1,5 +1,5 @@
 [package]
-name = "tightbeam"
+name = "tightbeam-rs"
 authors.workspace = true
 rust-version.workspace = true
 version.workspace = true

@@ -1118,7 +1118,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "tightbeam"
+name = "tightbeam-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "tightbeam-rs"
 version = "0.1.0"
 dependencies = [
  "aead",
@@ -1141,15 +1150,6 @@ dependencies = [
  "x509-cert",
  "zeekstd",
  "zeroize",
-]
-
-[[package]]
-name = "tightbeam-derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
