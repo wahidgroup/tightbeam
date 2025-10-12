@@ -371,7 +371,7 @@ Metadata ::= SEQUENCE {
     compactness      CompressionInfo,
     
     -- V1+ fields (context-specific tags)
-    integrity        [0] IntegrityInfo OPTIONAL,
+    messageIntegrity [0] IntegrityInfo OPTIONAL,
     confidentiality  [1] EncryptionInfo OPTIONAL,
     
     -- V2+ fields (context-specific tags)
@@ -571,27 +571,49 @@ Implementations MUST enforce message-level security requirements through:
 
 #### Example Implementation Pattern
 ```rust
-// Pseudo-code for enforcement mechanism
-impl<T: Message> Frame {
-    fn compose_with_message(message: T) -> Result<Frame> {
-        let mut frame = Frame::new();
-        
-        // Enforce version requirement
-        if frame.version < T::MIN_VERSION {
-            return Err(TightBeamError::InsufficientVersion);
+impl<T: Message> FrameBuilder<T> {
+    fn validate(&self) -> Result<()> {
+        // Check minimum version requirement
+        if self.version < T::MIN_VERSION {
+            return Err(TightBeamError::UnsupportedVersion(ExpectError::from((
+                self.version,
+                T::MIN_VERSION,
+            ))));
         }
-        
-        // Enforce security requirements
-        if T::MUST_BE_NON_REPUDIABLE && frame.nonrepudiation.is_none() {
-            return Err(TightBeamError::MissingSignature);
+
+        // Check if encryption is set when required
+        #[cfg(feature = "aead")]
+        {
+            let has_encryption = self.encryptor.is_some();
+            if T::MUST_BE_CONFIDENTIAL && !has_encryption {
+                return Err(TightBeamError::MissingEncryptionInfo);
+            }
         }
-        
-        if T::MUST_BE_CONFIDENTIAL && frame.metadata.confidentiality.is_none() {
-            return Err(TightBeamError::MissingEncryption);
+
+        // Check if signature is set when required
+        #[cfg(feature = "signature")]
+        {
+            let has_signer = self.signer.is_some();
+            if T::MUST_BE_NON_REPUDIABLE && !has_signer {
+                return Err(TightBeamError::MissingSignatureInfo);
+            }
         }
-        
-        // Additional enforcement logic...
-        Ok(frame)
+
+        // Check if compression is set when required
+        #[cfg(feature = "compress")]
+        {
+            let has_compression = self.compressor.is_some();
+            if T::MUST_BE_COMPRESSED && !has_compression {
+                return Err(TightBeamError::MissingCompressionInfo);
+            }
+        }
+
+        // Check if priority is set when required
+        if T::MUST_BE_PRIORITIZED && !self.metadata_builder.has_priority() {
+            return Err(TightBeamError::MissingPriority);
+        }
+
+        Ok(())
     }
 }
 ```
