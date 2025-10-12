@@ -2,7 +2,7 @@
 
 # Default target
 help:
-	@echo "TightBeam Framework Commands:"
+	@echo "tightbeam framework commands:"
 	@echo "  setup    - Setup the development environment"
 	@echo "  build    - Build all projects"
 	@echo "  clean    - Clean build artifacts"
@@ -29,7 +29,7 @@ setup:
 
 # Build all projects
 build:
-	@echo "Building TightBeam..."
+	@echo "Building tightbeam..."
 	cargo build --release $(if $(features),--features "$(features)")
 	@echo "Generating feature test scripts..."
 	mkdir -p built

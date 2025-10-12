@@ -8,7 +8,7 @@ rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
-description = "Derive macro for TightBeam message types"
+description = "Derive macro for tightbeam message types"
 
 [lib]
 proc-macro = true

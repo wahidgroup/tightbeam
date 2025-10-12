@@ -1,5 +1,16 @@
 # tightbeam
 
+[![Crate][crate-image]][crate-link]
+[![Docs][docs-image]][docs-link]
+[![Build Status][build-image]][build-link]
+![Apache2/MIT licensed][license-image]
+![Rust Version][rustc-image]
+[![Project Chat][chat-image]][chat-link]
+
+## Status
+> Warning: This project is under active development. Public APIs and file formats MAY change WITHOUT notice. It is NOT yet production-ready.
+# tightbeam
+
 ## Abstract
 
 tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures. This specification defines the protocol's core properties: structure, frame versioning, idempotence, ordering, compactness, integrity, confidentiality, priority, lifetime, state management, stage control, and non-repudiation.
@@ -51,11 +62,15 @@ The I(t) constraint informs several protocol design decisions:
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC2119](https://datatracker.ietf.org/doc/html/rfc2119).
 
 ## 2. Terminology
+The following project terms MUST be used consistently:
+- tightbeam: The project name. Lowercase as tightbeam.
+- Frame: A discrete unit in the tightbeam message format.
+- Metadata: Per-frame or per-message metadata as defined by the protocol.
+- Message: One or more frames comprising an application payload.
+- Version: The protocol version identifier.
+- [TIP](tips/tip-0001.md): tightbeam Improvement Proposal.
 
-- **Frame**: The complete tightbeam message structure containing version, metadata, and payload
-- **Metadata**: Structured information about the message including routing, security, and lifecycle data
-- **Version**: Protocol version determining available features and validation rules
-- **Message**: The application payload encoded within a Frame
+Additional terms introduced by proposals MUST be defined in their respective TIPs.
 
 ## 3. Architecture
 
@@ -864,32 +879,17 @@ The workspace consists of the following components:
 - **src/main.rs**: Application entry point
 - **tests/**: Integration test suites
 
-#### Getting Started
+[crate-image]: https://img.shields.io/crates/v/tightbeam.svg
+[crate-link]: https://crates.io/crates/tightbeam-rs
 
-**Requirements:**
-- Rust (minimum version TBD)
-- System dependencies for cryptographic operations
+[docs-image]: https://img.shields.io/docsrs/tightbeam-rs
+[docs-link]: https://docs.rs/tightbeam-rs
 
-**Commands:**
-```bash
-# Basic development
-make build                             # Build all projects
-make clean                             # Clean build artifacts  
-make test                              # Run all tests
-make lint                              # Run linters
-make lint ARGS="--fix --allow-staged"  # Run linters with fixes
-make doc                               # Build documentation
+[build-image]: https://img.shields.io/github/actions/workflow/status/wahidgroup/tightbeam/ci.yaml?branch=main
+[build-link]: https://github.com/wahidgroup/tightbeam/actions/workflows/ci.yaml
 
-# Feature-specific builds
-make build features="std,tcp,tokio"
-make build features="aes-gcm,sha3,secp256k1"
-make build features="zstd,compress"
-make build features="x509,signature"
+[license-image]: https://img.shields.io/badge/license-MIT%2FApache--2.0-blue
+[rustc-image]: https://img.shields.io/badge/rustc-1.85.1%2B-orange?logo=rust
 
-# Testing with specific features
-make test features="testing,std,tcp,tokio" 
-make test features="testing" no-default=1
-
-# Development server (from project root)
-make dev
-```
+[chat-image]: https://img.shields.io/badge/chat-Discussions-blue?logo=github
+[chat-link]: https://github.com/wahidgroup/tightbeam/discussions
