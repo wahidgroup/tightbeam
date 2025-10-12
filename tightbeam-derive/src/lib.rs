@@ -75,19 +75,6 @@ fn get_error_message(attrs: &[Attribute]) -> Option<String> {
 ///
 /// This macro can be applied to any struct that implements the necessary
 /// serialization traits (typically `der::Sequence`).
-///
-/// # Example
-///
-/// ```rust
-/// use tightbeam::Beamable;
-/// use der::Sequence;
-///
-/// #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-/// struct MyMessage {
-///     content: String,
-///     timestamp: u64,
-/// }
-/// ```
 #[proc_macro_derive(Beamable, attributes(beam))]
 pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -157,38 +144,6 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 ///
 /// This macro automatically adds the necessary attributes and trait implementations
 /// for flag enums used with the TightBeam flag system.
-///
-/// # Example
-///
-/// ```rust
-/// use tightbeam::Flaggable;
-///
-/// #[derive(Flaggable)]
-/// enum LogLevel {
-///     Error = 0,
-///     Warn = 1,
-///     Info = 2,
-///     Debug = 3,
-/// }
-/// ```
-///
-/// This expands to:
-/// ```rust
-/// #[derive(der::Enumerated, Debug, Clone, Copy, PartialEq, Eq)]
-/// #[repr(u8)]
-/// enum LogLevel {
-///     Error = 0,
-///     Warn = 1,
-///     Info = 2,
-///     Debug = 3,
-/// }
-///
-/// impl From<LogLevel> for u8 {
-///     fn from(flag: LogLevel) -> Self {
-///         flag as u8
-///     }
-/// }
-/// ```
 #[proc_macro_derive(Flaggable)]
 pub fn derive_flaggable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -225,22 +180,6 @@ pub fn derive_flaggable(input: TokenStream) -> TokenStream {
 ///
 /// - `#[error("format string")]` - Specifies the display format for the variant
 /// - `#[from]` - Automatically implements `From` for the wrapped type
-///
-/// # Example
-///
-/// ```rust
-/// use tightbeam::Errorizable;
-///
-/// #[derive(Debug, Errorizable)]
-/// pub enum MyError {
-///     #[error("Encryption failed: {0}")]
-///     #[from]
-///     EncryptionError(aead::Error),
-///
-///     #[error("Invalid value: expected {expected}, got {received}")]
-///     InvalidValue { expected: u32, received: u32 },
-/// }
-/// ```
 #[proc_macro_derive(Errorizable, attributes(error, from))]
 pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);

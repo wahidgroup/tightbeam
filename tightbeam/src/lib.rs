@@ -89,6 +89,9 @@ pub mod router;
 pub mod policy;
 #[cfg(feature = "doc")]
 pub mod doc;
+#[cfg(feature = "servlets")]
+pub mod servlets;
+
 
 // Re-export
 pub use asn1::*;
