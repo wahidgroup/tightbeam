@@ -17,6 +17,8 @@ description = "A secure, high-performance messaging protocol library"
 name = "tightbeam"
 
 [dependencies]
+tightbeam-derive = { workspace = true, optional = true }
+
 # RustCrypto dependencies
 spki = { workspace = true }
 der = { workspace = true }
@@ -39,8 +41,6 @@ time = { workspace = true, optional = true }
 
 ## Compression dependencies
 zeekstd = { workspace = true, optional = true }
-# Ecosystem crates
-tightbeam-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }

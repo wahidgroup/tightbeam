@@ -7,18 +7,20 @@ members = [
 
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85.1"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/tanveerw/tightbeam"
-homepage = "https://github.com/tanveerw/tightbeam"
+repository = "https://github.com/wahidgroup/tightbeam"
+homepage = "https://github.com/wahidgroup/tightbeam"
 documentation = "https://docs.rs/tightbeam"
 readme = "README.md"
 keywords = ["cryptography", "security", "messaging", "protocol"]
 categories = ["cryptography", "network-programming"]
 
 [workspace.dependencies]
+tightbeam-derive = { version = "0.1.0", path = "tightbeam-derive" }
+
 # RustCrypto dependencies
 spki = { version = "0.7", default-features = false }
 der = { version = "0.7", default-features = false, features = [
@@ -97,7 +99,3 @@ fake = { version = "=4.3.0", features = [
 proc-macro2 = "1.0.101"
 quote = "1.0.41"
 syn = { version = "2.0.106", features = ["full", "derive"] }
-
-# Internal workspace dependencies
-tightbeam = { path = "tightbeam" }
-tightbeam-derive = { path = "tightbeam-derive" }
