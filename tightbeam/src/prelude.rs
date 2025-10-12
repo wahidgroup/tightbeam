@@ -13,6 +13,7 @@
 //! ```
 
 // Multi-threading support
+#[cfg(any(feature = "std", feature = "tokio"))]
 pub use crate::mpsc;
 // ASN.1/DER support
 pub use der::{Decode, Encode, Sequence};

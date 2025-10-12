@@ -104,7 +104,6 @@ pub use hex_literal::hex;
 pub use time;
 #[cfg(feature = "tokio")]
 pub use tokio::sync::mpsc;
-
 #[cfg(all(feature = "std", not(feature = "tokio")))]
 pub use std::sync::mpsc;
 
