@@ -47,11 +47,12 @@ The following commands MAY be used during development:
 
 ```bash
 # Basic development
+make help                              # Help
 make build                             # Build all projects
 make clean                             # Clean build artifacts  
 make test                              # Run all tests
 make lint                              # Run linters
-make lint ARGS="--fix --allow-staged"  # Run linters with fixes
+make lint ARGS="--fix --allow-matrixd"  # Run linters with fixes
 make doc                               # Build documentation
 
 # Feature-specific builds

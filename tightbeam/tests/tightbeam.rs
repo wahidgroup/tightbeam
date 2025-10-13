@@ -3,6 +3,7 @@
 //! Demonstrates full V2 protocol capabilities using the compose! macro.
 
 use tightbeam::compose;
+use tightbeam::matrix::MatrixDyn;
 use tightbeam::prelude::*;
 
 use tightbeam::crypto::aead::KeyInit;
@@ -24,7 +25,7 @@ impl tightbeam::Message for TestMessage {
 	const MIN_VERSION: tightbeam::Version = tightbeam::Version::V0;
 }
 
-/// Custom test flags for message metadata
+/// Custom test matrix for message metadata
 #[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum FlagTestDevelopmentMode {
@@ -48,7 +49,7 @@ impl PartialEq<u8> for FlagTestDevelopmentMode {
 	}
 }
 
-/// Custom test flags for message metadata
+/// Custom test matrix for message metadata
 #[cfg_attr(feature = "derive", derive(tightbeam::Flaggable))]
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 enum FlagTestDebugLevel {
@@ -99,12 +100,12 @@ fn test_workflow_v0() -> Result<(), Box<dyn core::error::Error>> {
 	assert_eq!(str::from_utf8(&tightbeam.metadata.id), Ok("basic-test"));
 	assert_eq!(tightbeam.version, tightbeam::Version::V0);
 
-	// V0 doesn't have encryption, signatures, priority, TTL, or flags
+	// V0 doesn't have encryption, signatures, priority, TTL, or matrix
 	assert!(tightbeam.metadata.confidentiality.is_none());
 	assert!(tightbeam.nonrepudiation.is_none());
 	assert!(tightbeam.metadata.priority.is_none());
 	assert!(tightbeam.metadata.lifetime.is_none());
-	assert!(tightbeam.metadata.stage.is_none());
+	assert!(tightbeam.metadata.matrix.is_none());
 
 	Ok(())
 }
@@ -141,8 +142,9 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 
 	// Create custom flags for this message using the flagset
 	let flags = tightbeam::flags![
-		TestFlagSet: FlagTestDevelopmentMode::IsMaintenanceMode,
-		FlagTestDebugLevel::Basic
+		TestFlagSet: 
+			FlagTestDevelopmentMode::IsMaintenanceMode,
+			FlagTestDebugLevel::Basic
 	];
 
 	// Create full V2 message with all features including custom flags
@@ -156,7 +158,7 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 			priority: priority,
 			lifetime: ttl,
 			previous_frame: previous.clone(),
-			flags: flags
+			matrix: flags
 	}?;
 
 	// Decrypt and verify the message was correctly processed
@@ -175,11 +177,12 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 	assert_eq!(tightbeam.metadata.lifetime, Some(ttl));
 	assert_eq!(tightbeam.metadata.previous_frame, Some(previous));
 	assert!(tightbeam.metadata.integrity.clone().unwrap().compare(&message_hash));
-	assert!(tightbeam.metadata.stage.is_some());
+	assert!(tightbeam.metadata.matrix.is_some());
 	assert!(tightbeam.metadata.previous_frame.is_some());
 
 	// Check flag switches using position-aware contains method
-	let flags = TestFlagSet::from(tightbeam.metadata.stage.clone());
+	let matrix = MatrixDyn::try_from(tightbeam.metadata.matrix.clone())?;
+	let flags = TestFlagSet::from(matrix);
 	assert!(flags.contains(FlagTestDevelopmentMode::IsMaintenanceMode));
 	assert!(flags.contains(FlagTestDebugLevel::Basic));
 	// Negative checks

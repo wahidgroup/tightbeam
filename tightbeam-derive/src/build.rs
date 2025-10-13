@@ -32,7 +32,7 @@ pub const BUILDER_CONFIGS: &[MacroConfig] = &[MacroConfig {
 		("priority", "with_priority", false, false),
 		("lifetime", "with_lifetime", false, false),
 		("previous_frame", "with_previous_hash", false, false),
-		("flags", "with_flags", false, false),
+		("matrix", "with_matrix", false, false),
 	],
 }];
 

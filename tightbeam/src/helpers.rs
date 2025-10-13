@@ -5,14 +5,18 @@ extern crate alloc;
 #[cfg(feature = "zeroize")]
 pub use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::der::{Decode, Encode};
+use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
 use crate::error::TightBeamError;
+use crate::matrix::MatrixError;
 use crate::AlgorithmIdentifier;
+use crate::Asn1Matrix;
 use crate::Result;
 
-#[cfg(feature = "compress")]
-use crate::CompressionInfo;
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::der::oid::AssociatedOid;
+#[cfg(feature = "compress")]
+use crate::CompressionInfo;
 #[cfg(feature = "aead")]
 use crate::EncryptionInfo;
 #[cfg(feature = "digest")]
@@ -54,7 +58,7 @@ impl IntegrityInfo {
 
 		let algorithm = AlgorithmIdentifier { oid: D::OID, parameters: None };
 		let digest = result.to_vec();
-		Ok(Self { algorithm, parameters: digest })
+		Ok(Self { hashing_algorithm: algorithm, parameters: digest })
 	}
 
 	pub fn compare(&self, hash: impl AsRef<[u8]>) -> bool {
@@ -75,7 +79,7 @@ impl EncryptionInfo {
 	{
 		let algorithm = AlgorithmIdentifier { oid: C::OID, parameters: None };
 		let parameters = nonce.as_ref().to_vec();
-		Ok(Self { algorithm, parameters })
+		Ok(Self { encryption_algorithm: algorithm, parameters })
 	}
 }
 
@@ -101,6 +105,86 @@ impl SignatureInfo {
 		let signature_algorithm = AlgorithmIdentifier { oid: C::OID, parameters: None };
 		let signature = signature_encoded.to_vec();
 		Ok(Self { signature_algorithm, signature })
+	}
+}
+
+impl Asn1Matrix {
+	/// Validate invariants per spec.
+	pub fn validate(&self) -> Result<()> {
+		if self.n == 0 {
+			return Err(MatrixError::InvalidN(self.n).into());
+		}
+
+		let n2 = (self.n as usize) * (self.n as usize);
+		if self.data.len() != n2 {
+			return Err(MatrixError::LengthMismatch { n: self.n, len: self.data.len() }.into());
+		}
+
+		Ok(())
+	}
+}
+
+impl Tagged for Asn1Matrix {
+	fn tag(&self) -> Tag {
+		Tag::Sequence
+	}
+}
+
+impl<'a> DecodeValue<'a> for Asn1Matrix {
+	fn decode_value<R: Reader<'a>>(reader: &mut R, _header: Header) -> crate::der::Result<Self> {
+		reader.sequence(|seq: &mut der::NestedReader<'_, R>| {
+			let n = u8::decode(seq)?;
+			let data_os = crate::der::asn1::OctetString::decode(seq)?;
+
+			// Validate per spec
+			if n == 0 {
+				return Err(crate::der::ErrorKind::Value { tag: Tag::Integer }.into());
+			}
+
+			let data = data_os.as_bytes();
+			let n2 = (n as usize) * (n as usize);
+			if data.len() != n2 {
+				return Err(crate::der::ErrorKind::Length { tag: Tag::OctetString }.into());
+			}
+
+			Ok(Self { n, data: data.to_vec() })
+		})
+	}
+}
+
+impl EncodeValue for Asn1Matrix {
+	fn value_len(&self) -> crate::der::Result<Length> {
+		// INTEGER(n) + OCTET STRING(data)
+		let n_len = self.n.encoded_len()?;
+		// Validate before encoding
+		if self.n == 0 {
+			return Err(crate::der::ErrorKind::Value { tag: Tag::Integer }.into());
+		}
+
+		let n2 = (self.n as usize) * (self.n as usize);
+		if self.data.len() != n2 {
+			return Err(crate::der::ErrorKind::Length { tag: Tag::OctetString }.into());
+		}
+
+		let os = crate::der::asn1::OctetString::new(self.data.as_slice())?;
+		let os_len = os.encoded_len()?;
+		let total = (n_len + os_len)?;
+		Ok(total)
+	}
+
+	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
+		// Encode fields inside SEQUENCE
+		self.n.encode(encoder)?;
+
+		let os = crate::der::asn1::OctetString::new(self.data.as_slice())?;
+		os.encode(encoder)
+	}
+}
+
+impl<'a> Decode<'a> for Asn1Matrix {
+	fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+		let header = reader.peek_header()?;
+		Self::decode_value(reader, header)
 	}
 }
 
@@ -252,7 +336,7 @@ mod tests {
 	mod sign {
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 		use crate::crypto::sign::Signer;
-		use crate::{SignatureInfo, Result};
+		use crate::{Result, SignatureInfo};
 
 		#[test]
 		fn test_sign_macro() -> Result<()> {
@@ -278,7 +362,7 @@ mod tests {
 	mod notarize {
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 		use crate::crypto::sign::Signer;
-		use crate::{SignatureInfo, Result};
+		use crate::{Result, SignatureInfo};
 
 		#[test]
 		fn test_notarize_macro() -> Result<()> {
@@ -334,7 +418,7 @@ mod tests {
 			.expect_err("expected missing encryption error");
 			assert!(matches!(err, tightbeam::TightBeamError::MissingEncryptionInfo));
 
-			// Provide cipher: should fail without signer 
+			// Provide cipher: should fail without signer
 			let (_, cipher) = create_test_cipher_key();
 			let err = compose! {
 				V1: id: "conf-with-enc",
@@ -406,7 +490,7 @@ mod tests {
 		let hash_info = IntegrityInfo::digest::<Sha3_256>(data).unwrap();
 
 		// Verify the hash algorithm OID is set correctly (SHA3-256 OID)
-		let algorithm = hash_info.algorithm.oid.to_string();
+		let algorithm = hash_info.hashing_algorithm.oid.to_string();
 		assert_eq!(algorithm, "2.16.840.1.101.3.4.2.8");
 
 		// Verify the digest is not empty
@@ -429,7 +513,7 @@ mod tests {
 		let encryption_info = EncryptionInfo::prepare::<Aes256GcmOid>(&nonce).unwrap();
 
 		// Verify the algorithm OID is set correctly (AES-256-GCM OID)
-		let algorithm = encryption_info.algorithm.oid.to_string();
+		let algorithm = encryption_info.encryption_algorithm.oid.to_string();
 		assert_eq!(algorithm, "2.16.840.1.101.3.4.1.46");
 		// Verify the nonce is stored correctly
 		assert_eq!(encryption_info.parameters, &nonce);

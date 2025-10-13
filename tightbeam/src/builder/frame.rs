@@ -5,25 +5,25 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
 use crate::error::{ExpectError, TightBeamError};
-use crate::flags::Flags;
+use crate::matrix::{MatrixDyn, MatrixLike};
 use crate::Result;
-use crate::{Version, Frame, Message};
+use crate::{Frame, Message, Version};
 
-#[cfg(feature = "compress")]
-use crate::CompressionAlgorithm;
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{SignatureEncoding, Signer};
+#[cfg(feature = "compress")]
+use crate::CompressionAlgorithm;
 
 #[cfg(feature = "compress")]
 use crate::helpers::Compressor;
+#[cfg(feature = "digest")]
+use crate::helpers::Digestor;
 #[cfg(feature = "aead")]
 use crate::helpers::Encryptor;
 #[cfg(feature = "signature")]
 use crate::helpers::Signatory;
-#[cfg(feature = "digest")]
-use crate::helpers::Digestor;
 
 /// A fluent builder for creating tightbeam messages with metadata generation
 pub struct FrameBuilder<T: Message> {
@@ -156,12 +156,21 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Set custom flags (V2+ only)
-	pub fn with_flags<F, const N: usize>(mut self, flags: F) -> Self
+	/// Set a custom reality (V2+ only)
+	pub fn with_matrix<M>(mut self, matrix: M) -> Self
 	where
-		F: Into<Flags<N>>,
+		M: MatrixLike,
+		MatrixDyn: TryFrom<M>,
+		<MatrixDyn as TryFrom<M>>::Error: Into<TightBeamError>,
 	{
-		self.metadata_builder = self.metadata_builder.with_stage(flags);
+		match MatrixDyn::try_from(matrix) {
+			Ok(matrix_dyn) => {
+				self.metadata_builder = self.metadata_builder.with_matrix(matrix_dyn);
+			}
+			Err(e) => {
+				self.errors.push(e.into());
+			}
+		}
 		self
 	}
 
@@ -195,9 +204,7 @@ impl<T: Message> FrameBuilder<T> {
 
 		// Store encryption info in metadata
 		let encryption_info = match crate::EncryptionInfo::prepare::<C>(&nonce_bytes) {
-			Ok(encryption_info) => {
-				encryption_info
-			}
+			Ok(encryption_info) => encryption_info,
 			Err(e) => {
 				self.errors.push(e);
 				return self;
@@ -323,7 +330,7 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 
 		// 3. Optional encryption
 		#[cfg(feature = "aead")]
-		let bytes= if let Some(enc) = self.encryptor {
+		let bytes = if let Some(enc) = self.encryptor {
 			let (cipher_text, _) = enc(&bytes)?;
 			cipher_text
 		} else {
@@ -509,7 +516,7 @@ mod tests {
 				.with_priority(crate::MessagePriority::High)
 				.with_lifetime(3600)
 				.with_previous_hash(previous_hash)
-				.with_flags(flags)
+				.with_matrix(flags)
 				.build()
 		},
 		assertions: |result| {
@@ -522,7 +529,7 @@ mod tests {
 			assert_eq!(tightbeam.metadata.priority, Some(crate::MessagePriority::High));
 			assert_eq!(tightbeam.metadata.lifetime, Some(3600));
 			assert!(tightbeam.metadata.previous_frame.is_some());
-			assert!(tightbeam.metadata.stage.is_some());
+			assert!(tightbeam.metadata.matrix.is_some());
 			assert!(tightbeam.integrity.is_some());
 			assert!(tightbeam.nonrepudiation.is_some());
 

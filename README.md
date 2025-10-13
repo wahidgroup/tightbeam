@@ -12,7 +12,7 @@
 
 ## Abstract
 
-tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures. This specification defines the protocol's core properties: structure, frame versioning, idempotence, ordering, compactness, integrity, confidentiality, priority, lifetime, state management, stage control, and non-repudiation.
+tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures. This specification defines the protocol's core properties: structure, frame versioning, idempotence, ordering, compactness, integrity, confidentiality, priority, lifetime, state management, matrix control, and non-repudiation.
 
 ## Table of Contents
 
@@ -28,26 +28,28 @@ tightbeam is a Layer-5 framework implementing high-fidelity information theory t
 
 ## 1. Introduction
 
-tightbeam addresses the need for a structured, versioned messaging protocol that guarantees information fidelity through applied mathematical constraints where I(t) ∈ (0,1) ∀t ∈ T_t.
+tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T.
 
 ### 1.1 Information Fidelity Constraint
 
-The foundational mathematical principle underlying tightbeam is the information fidelity constraint:
+ The foundational mathematical principle underlying tightbeam is the information fidelity constraint:
 
-**I(t) ∈ (0,1) ∀t ∈ T_t**
+ **I(t) ∈ (0,1) ∀t ∈ T_t**
 
-Where:
-- **I(t)**: The Frame as an information state at time t
-- **(0,1)**: Bounded information fidelity interval
-  - Never perfect (1): Acknowledges fundamental limits of information transmission
-  - Never absent (0): Guarantees non-zero information content in all valid frames
-- **∀t ∈ T_t**: Holds for all time points in the protocol's temporal domain
+Intuition: how well does information maintain fidelity over time?
 
-This constraint reflects applied information theory principles:
+ Where:
+- **I(t)**: Information state of a Frame at time t
+- **(0,1)**: Strictly bounded information fidelity interval
+  - Strictly less than 1 (never perfect): acknowledges fundamental limits of transmission
+  - Strictly greater than 0 (never absent): guarantees non-zero information content in valid frames
+- **∀t ∈ T**: Holds for all time points in the protocol’s temporal domain
+
+This constraint reflects information-theoretic limits:
 
 1. **Theoretical Foundation**: Information transmission systems exhibit bounded fidelity due to physical limitations, encoding constraints, stochastic noise & shock, and temporal factors
-2. **Practical Implications**: tightbeam's design ensures frames always carry bounded information content while acknowledging imperfection inherent in any communication system
-3. **Protocol Guarantee**: The constraints provide applied mathematical basis for frame validation and quality assurance
+2. **Practical Implications**: tightbeam’s design ensures frames always carry bounded information content while acknowledging that no communication system achieves perfect fidelity
+3. **Protocol Guarantee**: The constraint provides a mathematical basis for frame validation and quality assurance
 
 The I(t) constraint informs several protocol design decisions:
 - ASN.1 DER encoding for maximum structural fidelity
@@ -63,9 +65,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 ## 2. Terminology
 The following project terms MUST be used consistently:
 - tightbeam: The project name. Lowercase as tightbeam.
-- Frame: A discrete unit in the tightbeam message format.
-- Metadata: Per-frame or per-message metadata as defined by the protocol.
-- Message: One or more frames comprising an application payload.
+- Frame: A versioned snapshot (state) at time t.
+- Message: A typed application payload serialized within a Frame.
+- Metadata: Per-message metadata as defined by the protocol.
 - Version: The protocol version identifier.
 - [TIP](tips/tip-0001.md): tightbeam Improvement Proposal.
 
@@ -87,7 +89,7 @@ tightbeam implements high-fidelity information transmission through the followin
 - **PRIORITY**: 7-level priority system
 - **LIFETIME**: 64-bit TTL values
 - **STATE**: Previous message chaining
-- **STAGE**: 8×8 matrix encoded control flags
+- **STAGE**: N×N matrix-encoded control flags (N ∈ [1,255], row-major)
 - **NONREPUDIATION**: Cryptographic signatures
 
 ## 4. Protocol Specification
@@ -109,7 +111,7 @@ tightbeam implements high-fidelity information transmission through the followin
   - OPTIONAL: Priority levels (7-level enumeration)
   - OPTIONAL: Message lifetime (64-bit TTL)
   - OPTIONAL: State chaining (previous message integrity)
-  - OPTIONAL: Stage control (8×8 matrix flags)
+  - OPTIONAL: Matrix control (NxN matrix flags)
 
 ### 4.1.1 Security Profiles
 
@@ -271,7 +273,7 @@ pub struct Metadata {
     #[asn1(context_specific = "4", optional = "true")]
     pub previous_frame: Option<IntegrityInfo>,
     #[asn1(context_specific = "5", optional = "true")]
-    pub stage: Option<Vec<u8>>,
+    pub matrix: Option<Asn1Matrix>,
 }
 ```
 
@@ -374,26 +376,32 @@ SignatureInfo ::= SEQUENCE {
 }
 ```
 
+#### Matrix
+```asn1
+Matrix ::= SEQUENCE {
+    n     INTEGER (1..255),
+    data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
+}
+```
+
 ### 5.4 Message Structure
 
 #### Metadata Structure
 ```asn1
-Metadata ::= SEQUENCE {
-    -- Core fields (V0+)
-    id               OCTET STRING,
-    order            INTEGER,
-    compactness      CompressionInfo,
-    
-    -- V1+ fields (context-specific tags)
-    messageIntegrity [0] IntegrityInfo OPTIONAL,
-    confidentiality  [1] EncryptionInfo OPTIONAL,
-    
-    -- V2+ fields (context-specific tags)
-    priority         [2] MessagePriority OPTIONAL,
-    lifetime         [3] INTEGER OPTIONAL,
-    previousFrame    [4] IntegrityInfo OPTIONAL,
-    stage            [5] OCTET STRING OPTIONAL
-}
+ Metadata ::= SEQUENCE {
+     -- Core fields (V0+)
+     id               OCTET STRING,
+     order            INTEGER,
+     compactness      CompressionInfo,
+     integrity        [0] IntegrityInfo OPTIONAL,
+     confidentiality  [1] EncryptionInfo OPTIONAL,
+     
+     -- V2+ fields (context-specific tags)
+     priority         [2] MessagePriority OPTIONAL,
+     lifetime         [3] INTEGER OPTIONAL,
+     previousFrame    [4] IntegrityInfo OPTIONAL,
+     matrix           [5] Matrix OPTIONAL
+ }
 ```
 
 #### Complete Frame Structure
@@ -440,7 +448,7 @@ AlgorithmIdentifier ::= SEQUENCE {
 
 #### Version 2 (V2)
 - INHERITS: All V1 requirements
-- OPTIONAL: `priority`, `lifetime`, `previousFrame`, `stage`
+- OPTIONAL: `priority`, `lifetime`, `previousFrame`, `matrix`
 
 ### 5.8 Semantic Constraints
 
@@ -465,6 +473,30 @@ AlgorithmIdentifier ::= SEQUENCE {
 - Security profiles MAY specify approved message types
 - Message types with security requirements SHOULD be used with compatible security profiles
 - Profile 0 (Testing) MAY use message types with security requirements for development purposes only
+
+#### Matrix Specification
+
+Wire format
+- ASN.1 type: Matrix ::= SEQUENCE { n INTEGER (1..255), data OCTET STRING (SIZE(1..(255*255))) }
+- Encoding: DER. The data field is row-major; the cell at (row r, col c) is at index r*n + c.
+- Size bounds: n ∈ [1, 255]; data length MUST equal n*n. Total payload for data is n² octets.
+
+Semantics
+- Cells are u8 values. Protocol profiles MUST define the meaning of non-zero values.
+- Unless a profile defines otherwise, receivers SHOULD treat off-diagonal cells as unspecified and MUST NOT fail if they are non-zero.
+- Flags mapping: profiles MAY map independent, position-stable flags onto the diagonal (r == c). Unset is 0; set or configured values are non-zero per profile.
+
+Validation
+- Encoders MUST only emit a Matrix when data.len == n*n.
+- Decoders MUST reject a Matrix whose data length != n*n.
+- Absent/optional Matrix fields MUST be treated as “no matrix provided”; profiles MAY define a default.
+
+Runtime mapping (non-normative)
+- Implementations typically expose dynamic MatrixDyn (n decided at runtime) and Matrix<N> (const generic) types that implement a MatrixLike trait.
+- Conversions between wire and runtime matrices SHOULD preserve row-major ordering and exact length; invalid input MUST be rejected.
+
+Intermediaries
+- Profiles MAY define merge/override rules (e.g., element-wise AND/OR/min/max) for multi-hop processing. If defined, intermediaries MUST apply them deterministically and re-sign if nonrepudiation is used.
 
 ### 5.9 Complete ASN.1 Module
 
@@ -531,6 +563,11 @@ SignatureInfo ::= SEQUENCE {
     signature           OCTET STRING
 }
 
+Matrix ::= SEQUENCE {
+    n     INTEGER (1..255),
+    data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
+}
+
 -- Core message structures
 Metadata ::= SEQUENCE {
     id               OCTET STRING,
@@ -541,7 +578,7 @@ Metadata ::= SEQUENCE {
     priority         [2] MessagePriority OPTIONAL,
     lifetime         [3] INTEGER OPTIONAL,
     previousFrame    [4] IntegrityInfo OPTIONAL,
-    stage            [5] OCTET STRING OPTIONAL
+    matrix           [5] Matrix OPTIONAL
 }
 
 Frame ::= SEQUENCE {
@@ -678,7 +715,7 @@ tightbeam integrates with existing key management standards and infrastructure:
 
 - V0: No mandatory security features
 - V1: Optional integrity and confidentiality support
-- V2: Enhanced with priority, lifetime, state chaining, and stage controls
+- V2: Enhanced with priority, lifetime, state chaining, and matrix controls
 
 ### 7.3 ASN.1 Security Considerations
 
@@ -805,7 +842,7 @@ test_container! {
 - RFC 8032: Edwards-Curve Digital Signature Algorithm (EdDSA)
 - RFC 7748: Elliptic Curves for Security
 
-### 9.1.1 NIST Standards References
+### 9.1.1 Standards References
 
 - FIPS 140-2: Security Requirements for Cryptographic Modules
 - FIPS 140-3: Security Requirements for Cryptographic Modules
@@ -874,9 +911,9 @@ This dual-licensing strategy ensures maximum compatibility while providing paten
 
 The workspace consists of the following components:
 
-- **core**: Shared library code and common utilities
-- **src/main.rs**: Application entry point
-- **tests/**: Integration test suites
+- **tightbeam/src/core.rs**: Shared library code and common utilities
+- **tightbeam/src/lib.rs**: Library root
+- **tightbeam/tests/**: Integration test suites
 
 [crate-image]: https://img.shields.io/crates/v/tightbeam.svg
 [crate-link]: https://crates.io/crates/tightbeam-rs

@@ -64,6 +64,7 @@ use alloc::vec::Vec;
 pub mod asn1;
 pub mod core;
 pub mod error;
+pub mod matrix;
 pub mod flags;
 pub mod helpers;
 pub mod prelude;

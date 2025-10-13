@@ -138,7 +138,7 @@ pub fn create_test_cipher_key() -> (
 
 pub fn create_test_hash_info() -> crate::IntegrityInfo {
 	crate::IntegrityInfo {
-		algorithm: crate::AlgorithmIdentifier {
+		hashing_algorithm: crate::AlgorithmIdentifier {
 			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"), // SHA-256
 			parameters: None,
 		},
@@ -148,7 +148,7 @@ pub fn create_test_hash_info() -> crate::IntegrityInfo {
 
 pub fn create_test_encryption_info() -> crate::EncryptionInfo {
 	crate::EncryptionInfo {
-		algorithm: crate::AlgorithmIdentifier {
+		encryption_algorithm: crate::AlgorithmIdentifier {
 			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.42"), // AES-256-GCM
 			parameters: None,
 		},
@@ -172,19 +172,34 @@ pub fn create_test_signature_info() -> crate::SignatureInfo {
 /// receive that type.
 #[macro_export]
 macro_rules! test_case {
-	(
-		name: $test_name:ident,
-		$(features: [$($feature:literal),*],)?
-		setup: $setup:expr,
-		assertions: $assertions:expr
-	) => {
-		#[test]
-		$(#[cfg(all($(feature = $feature),*))])?
-		fn $test_name() -> $crate::Result<()> {
-			let result = $setup();
-			$assertions(result)
-		}
-	};
+    (
+        name: $test_name:ident,
+        $(features: [$($feature:literal),*],)?
+        setup: $setup:expr,
+        assertions: |$result_pat:pat_param| $body:block
+    ) => {
+        #[test]
+        $(#[cfg(all($(feature = $feature),*))])?
+        fn $test_name() -> $crate::Result<()> {
+            let $result_pat = $setup();
+            $body
+        }
+    };
+
+    // Back-compat: closure form
+    (
+        name: $test_name:ident,
+        $(features: [$($feature:literal),*],)?
+        setup: $setup:expr,
+        assertions: $assertions:expr
+    ) => {
+        #[test]
+        $(#[cfg(all($(feature = $feature),*))])?
+        fn $test_name() -> $crate::Result<()> {
+            let result = $setup();
+            $assertions(result)
+        }
+    };
 }
 
 /// Generic builder test macro

@@ -94,6 +94,11 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Signature encoding error"))]
 	SignatureEncodingError,
 
+	/// Error from the matrix implementation
+	#[cfg_attr(feature = "derive", error("Matrix error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	MatrixError(crate::matrix::MatrixError),
+
 	#[cfg(feature = "router")]
 	#[cfg_attr(feature = "derive", error("Route error: {0}"))]
     #[cfg_attr(feature = "derive", from)]

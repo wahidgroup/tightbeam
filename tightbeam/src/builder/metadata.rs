@@ -5,9 +5,10 @@ use alloc::{string::String, vec::Vec};
 
 use crate::builder::error::{BuildError, MetadataError};
 use crate::der::asn1::Null;
-use crate::flags::Flags;
+use crate::matrix::MatrixDyn;
 use crate::{
-	CompressionInfo, EncryptionInfo, IntegrityInfo, Metadata, MessagePriority, Version, SignatureInfo,
+	Asn1Matrix, CompressionInfo, EncryptionInfo, IntegrityInfo, MessagePriority, 
+	Metadata, SignatureInfo, Version
 };
 
 /// A fluent builder for TightBeam metadata.
@@ -22,7 +23,7 @@ pub struct MetadataBuilder {
 	priority: Option<MessagePriority>,
 	lifetime: Option<u64>,
 	previous_frame: Option<IntegrityInfo>,
-	stage: Option<Vec<u8>>,
+	matrix: Option<MatrixDyn>,
 }
 
 impl From<Version> for MetadataBuilder {
@@ -38,7 +39,7 @@ impl From<Version> for MetadataBuilder {
 			priority: None,
 			lifetime: None,
 			previous_frame: None,
-			stage: None,
+			matrix: None,
 		}
 	}
 }
@@ -101,13 +102,8 @@ impl MetadataBuilder {
 	}
 
 	/// Set custom flags (V2+ only)
-	pub fn with_stage<T, const N: usize>(mut self, flags: T) -> Self
-	where
-		T: Into<Flags<N>>,
-	{
-		// Convert to Flags<N> first, then to Vec<u8> for ASN.1 storage
-		let flags: Flags<N> = flags.into();
-		self.stage = Some(Vec::from(flags));
+	pub fn with_matrix(mut self, matrix: MatrixDyn) -> Self {
+		self.matrix = Some(matrix);
 		self
 	}
 
@@ -121,6 +117,11 @@ impl MetadataBuilder {
 			.order
 			.ok_or(BuildError::InvalidMetadata(MetadataError::MissingTimestamp))?;
 		let compression = self.compactness.unwrap_or(CompressionInfo::NONE(Null));
+		let matrix = if let Some(m) = self.matrix {
+			Some(Asn1Matrix::from(m))
+		} else {
+			None
+		};
 
 		match self.version {
 			Version::V0 => {
@@ -134,7 +135,7 @@ impl MetadataBuilder {
 					priority: None,
 					lifetime: None,
 					previous_frame: None,
-					stage: None,
+					matrix: None,
 				})
 			}
 			Version::V1 => {
@@ -152,7 +153,7 @@ impl MetadataBuilder {
 					priority: None,
 					lifetime: None,
 					previous_frame: None,
-					stage: None,
+					matrix: None,
 				})
 			}
 			Version::V2 => {
@@ -172,7 +173,7 @@ impl MetadataBuilder {
 					priority: Some(priority),
 					lifetime: self.lifetime,
 					previous_frame: self.previous_frame,
-					stage: self.stage,
+					matrix: matrix,
 				})
 			}
 		}
@@ -205,7 +206,7 @@ impl MetadataBuilder {
 
 	/// Check if flags are set
 	pub fn has_flags(&self) -> bool {
-		self.stage.is_some()
+		self.matrix.is_some()
 	}
 
 	/// Check if compression is set
@@ -249,14 +250,14 @@ mod tests {
 						assert!(metadata.priority.is_none());
 						assert!(metadata.lifetime.is_none());
 						assert!(metadata.previous_frame.is_none());
-						assert!(metadata.stage.is_none());
+						assert!(metadata.matrix.is_none());
 					}
 					Version::V1 => {
 						assert!(metadata.confidentiality.is_some());
 						assert!(metadata.priority.is_none());
 						assert!(metadata.lifetime.is_none());
 						assert!(metadata.previous_frame.is_none());
-						assert!(metadata.stage.is_none());
+						assert!(metadata.matrix.is_none());
 					}
 					Version::V2 => {
 						assert!(metadata.confidentiality.is_some());

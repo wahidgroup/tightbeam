@@ -68,7 +68,7 @@ macro_rules! routes {
 	) => {
 		use $crate::router::RouterPolicy;
 		struct $RouterName { $( $field : $fty ),* }
-		impl $crate::router::RouterPolicy for $RouterName {
+		impl RouterPolicy for $RouterName {
 			fn dispatch<T: $crate::Message + Send + 'static>(&self, message: $crate::Frame) -> $crate::router::Result<()> {
 				$(
 					if std::any::TypeId::of::<T>() == std::any::TypeId::of::<$MsgTy>() {

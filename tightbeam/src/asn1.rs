@@ -158,7 +158,7 @@ where
 	T: zeroize::Zeroize,
 {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub algorithm: AlgorithmIdentifier<A>,
+	pub encryption_algorithm: AlgorithmIdentifier<A>,
 	pub parameters: T,
 }
 
@@ -178,7 +178,7 @@ where
 	for<'a> A: crate::der::Choice<'a> + crate::der::Encode,
 	for<'a> T: crate::der::Decode<'a> + crate::der::Encode,
 {
-	pub algorithm: AlgorithmIdentifier<A>,
+	pub encryption_algorithm: AlgorithmIdentifier<A>,
 	pub parameters: T,
 }
 
@@ -200,7 +200,7 @@ where
 	T: zeroize::Zeroize,
 {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub algorithm: AlgorithmIdentifier<A>,
+	pub hashing_algorithm: AlgorithmIdentifier<A>,
 	pub parameters: T,
 }
 
@@ -220,7 +220,7 @@ where
 	for<'a> A: crate::der::Choice<'a> + crate::der::Encode,
 	for<'a> T: crate::der::Decode<'a> + crate::der::Encode,
 {
-	pub algorithm: AlgorithmIdentifier<A>,
+	pub hashing_algorithm: AlgorithmIdentifier<A>,
 	pub parameters: T,
 }
 
@@ -264,6 +264,32 @@ where
 {
 	pub signature_algorithm: AlgorithmIdentifier<A>,
 	pub signature: T,
+}
+
+/// NxN matrix control flags
+///
+/// ASN.1 Definition:
+/// ```asn1
+/// Matrix ::= SEQUENCE {
+///     n     INTEGER (1..255),
+///     data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
+/// }
+/// ```
+/// 
+/// Notes:
+/// - n MUST be in 1..=255.
+/// - data MUST be exactly n*n octets, row-major (cell (r,c) at offset r*n + c).
+/// - Encoders MUST only emit conforming lengths; decoders MUST reject non-conforming lengths.
+/// - Semantics of cell values are profile-defined. By default, off-diagonal cells are unspecified.
+/// - Profiles MAY map position-stable flags onto the diagonal (r == c); unset is 0, set/non-default is non-zero.
+/// - Intermediaries MUST preserve bytes unless a profile defines deterministic merge rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
+pub struct Asn1Matrix {
+	/// Dimension N (1..=255)
+	pub n: u8,
+	/// Row-major bytes; MUST be exactly n*n octets
+	pub data: Vec<u8>,
 }
 
 /// Metadata structure for message handling
@@ -280,7 +306,7 @@ where
 ///     priority         [2] MessagePriority OPTIONAL,
 ///     lifetime         [3] INTEGER OPTIONAL,
 ///     previousFrame    [4] IntegrityInfo OPTIONAL,
-///     stage            [5] OCTET STRING OPTIONAL
+///     matrix           [5] Matrix OPTIONAL
 /// }
 /// ```
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
@@ -306,7 +332,7 @@ pub struct Metadata {
 	#[asn1(context_specific = "4", optional = "true")]
 	pub previous_frame: Option<IntegrityInfo>,
 	#[asn1(context_specific = "5", optional = "true")]
-	pub stage: Option<Vec<u8>>,
+	pub matrix: Option<Asn1Matrix>,
 }
 
 /// Core TightBeam message structure

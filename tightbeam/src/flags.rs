@@ -1,9 +1,11 @@
+use crate::matrix::{Matrix, MatrixLike};
+
 /// A fixed-size array of flags, where each flag is a `u8`
 ///
 /// This struct provides a compile-time sized container for storing flag values.
 /// Each position in the array can hold a single `u8` flag value. The size `N`
 /// is determined at compile time, ensuring zero-cost abstractions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Flags<const N: usize>([u8; N]);
 
 impl<const N: usize> Flags<N> {
@@ -84,4 +86,79 @@ pub trait FlagSet<T> {
 	/// # Returns
 	/// `true` if the flag is present, `false` otherwise
 	fn contains(&self, flag: T) -> bool;
+}
+
+impl<const N: usize> MatrixLike for Flags<N> {
+	fn n(&self) -> u8 {
+		N as u8
+	}
+
+	fn get(&self, r: u8, c: u8) -> u8 {
+		if r == c && (r as usize) < N {
+			self.0[r as usize]
+		} else {
+			0
+		}
+	}
+
+	fn set(&mut self, r: u8, c: u8, value: u8) {
+		if r == c && (r as usize) < N {
+			self.0[r as usize] = value;
+		}
+	}
+
+	fn fill(&mut self, value: u8) {
+		for i in 0..N {
+			self.0[i] = value;
+		}
+	}
+}
+
+macro_rules! flags_to_matrix_impl {
+    ($flags:expr, $matrix_type:ty, $n:expr) => {{
+        let mut m = <$matrix_type>::default();
+        for i in 0..$n {
+            m.set(i as u8, i as u8, $flags.get_at(i));
+        }
+        m
+    }};
+}
+
+macro_rules! flags_to_matrix_dyn_impl {
+    ($flags:expr, $n:expr) => {{
+        let n = $n as u8;
+        let mut m = crate::matrix::MatrixDyn::try_from(n)?;
+        for i in 0..$n {
+            m.set(i as u8, i as u8, $flags.get_at(i));
+        }
+        Ok(m)
+    }};
+}
+
+impl<const N: usize> From<crate::flags::Flags<N>> for Matrix<N> {
+    fn from(flags: crate::flags::Flags<N>) -> Self {
+        flags_to_matrix_impl!(flags, Matrix<N>, N)
+    }
+}
+
+impl<const N: usize> From<&crate::flags::Flags<N>> for Matrix<N> {
+    fn from(flags: &crate::flags::Flags<N>) -> Self {
+        flags_to_matrix_impl!(flags, Matrix<N>, N)
+    }
+}
+
+impl<const N: usize> TryFrom<crate::flags::Flags<N>> for crate::matrix::MatrixDyn {
+    type Error = crate::matrix::MatrixError;
+    
+    fn try_from(flags: crate::flags::Flags<N>) -> Result<Self, Self::Error> {
+        flags_to_matrix_dyn_impl!(flags, N)
+    }
+}
+
+impl<const N: usize> TryFrom<&crate::flags::Flags<N>> for crate::matrix::MatrixDyn {
+    type Error = crate::matrix::MatrixError;
+    
+    fn try_from(flags: &crate::flags::Flags<N>) -> Result<Self, Self::Error> {
+        flags_to_matrix_dyn_impl!(flags, N)
+    }
 }
