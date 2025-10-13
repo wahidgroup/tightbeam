@@ -18,122 +18,122 @@
 /// ```
 #[macro_export]
 macro_rules! cert {
-    // Root CA certificate (requires subject_public_key)
-    (
-        profile: Root,
-        subject: $subject:expr,
-        serial: $serial:expr,
-        validity: ($not_before:expr, $not_after:expr),
-        signer: $signer:expr,
-        subject_public_key: $spki:expr
-    ) => {{
-        use core::str::FromStr;
+	// Root CA certificate (requires subject_public_key)
+	(
+		profile: Root,
+		subject: $subject:expr,
+		serial: $serial:expr,
+		validity: ($not_before:expr, $not_after:expr),
+		signer: $signer:expr,
+		subject_public_key: $spki:expr
+	) => {{
+		use core::str::FromStr;
 
-        use $crate::crypto::x509::builder::{Builder, Profile};
-        use $crate::crypto::x509::name::Name;
+		use $crate::crypto::x509::builder::{Builder, Profile};
+		use $crate::crypto::x509::name::Name;
 
-        let subject = Name::from_str($subject)?;
-        let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
+		let subject = Name::from_str($subject)?;
+		let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
 
-        let builder = $crate::crypto::x509::builder::CertificateBuilder::new(
-            Profile::Root,
-            serial,
-            $crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
-            subject.clone(),
-            $spki,
-            $signer,
-        )?;
+		let builder = $crate::crypto::x509::builder::CertificateBuilder::new(
+			Profile::Root,
+			serial,
+			$crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
+			subject.clone(),
+			$spki,
+			$signer,
+		)?;
 
-        builder.build::<$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>>()
-    }};
+		builder.build::<$crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>>()
+	}};
 
-    // Root CA certificate (no SPKI provided -> clearer error)
-    (
-        profile: Root,
-        subject: $subject:expr,
-        serial: $serial:expr,
-        validity: ($not_before:expr, $not_after:expr),
-        signer: $signer:expr
-    ) => {{
-        compile_error!(
-            "cert!(profile: Root, ...) requires [subject_public_key: <SPKI>](http://_vscodecontentref_/0).\n\
-             Pass the subject's SPKI explicitly to avoid argument shifting.\n\
-             If you want it derived from the signer, please specify how to obtain SPKI from your signer type."
-        );
-    }};
+	// Root CA certificate (no SPKI provided -> clearer error)
+	(
+		profile: Root,
+		subject: $subject:expr,
+		serial: $serial:expr,
+		validity: ($not_before:expr, $not_after:expr),
+		signer: $signer:expr
+	) => {{
+		compile_error!(
+			"cert!(profile: Root, ...) requires [subject_public_key: <SPKI>](http://_vscodecontentref_/0).\n\
+			 Pass the subject's SPKI explicitly to avoid argument shifting.\n\
+			 If you want it derived from the signer, please specify how to obtain SPKI from your signer type."
+		);
+	}};
 
-    // Leaf certificate
-    (
-        profile: Leaf,
-        subject: $subject:expr,
-        issuer: $issuer:expr,
-        serial: $serial:expr,
-        validity: ($not_before:expr, $not_after:expr),
-        subject_public_key: $spki:expr,
-        signer: $signer:expr
-        $(, extensions: [$($ext:expr),* $(,)?])?
-    ) => {{
-        use $crate::crypto::x509::builder::{Builder, Profile};
-        use $crate::crypto::x509::name::Name;
-        use $crate::der::Encode;
+	// Leaf certificate
+	(
+		profile: Leaf,
+		subject: $subject:expr,
+		issuer: $issuer:expr,
+		serial: $serial:expr,
+		validity: ($not_before:expr, $not_after:expr),
+		subject_public_key: $spki:expr,
+		signer: $signer:expr
+		$(, extensions: [$($ext:expr),* $(,)?])?
+	) => {{
+		use $crate::crypto::x509::builder::{Builder, Profile};
+		use $crate::crypto::x509::name::Name;
+		use $crate::der::Encode;
 
-        let subject = Name::from_str($subject)?;
-        let issuer = Name::from_str($issuer)?;
-        let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
+		let subject = Name::from_str($subject)?;
+		let issuer = Name::from_str($issuer)?;
+		let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
 
-        let mut builder = $crate::crypto::x509::builder::CertificateBuilder::new(
-            Profile::Leaf { issuer: issuer.clone(), enable_key_agreement: false },
-            serial,
-            $crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
-            subject,
-            $spki,
-            $signer,
-        )?;
+		let mut builder = $crate::crypto::x509::builder::CertificateBuilder::new(
+			Profile::Leaf { issuer: issuer.clone(), enable_key_agreement: false },
+			serial,
+			$crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
+			subject,
+			$spki,
+			$signer,
+		)?;
 
-        $(
-            $(
-                builder.add_extension(&$ext)?;
-            )*
-        )?
+		$(
+			$(
+				builder.add_extension(&$ext)?;
+			)*
+		)?
 
-        builder.build::<$crate::crypto::sign::Signer>()
-    }};
+		builder.build::<$crate::crypto::sign::Signer>()
+	}};
 
-    // SubCA certificate
-    (
-        profile: SubCA,
-        subject: $subject:expr,
-        issuer: $issuer:expr,
-        serial: $serial:expr,
-        validity: ($not_before:expr, $not_after:expr),
-        subject_public_key: $spki:expr,
-        signer: $signer:expr
-        $(, path_len: $path_len:expr)?
-    ) => {{
-        use $crate::crypto::x509::builder::{Builder, Profile};
-        use $crate::crypto::x509::name::Name;
-        use $crate::der::Encode;
+	// SubCA certificate
+	(
+		profile: SubCA,
+		subject: $subject:expr,
+		issuer: $issuer:expr,
+		serial: $serial:expr,
+		validity: ($not_before:expr, $not_after:expr),
+		subject_public_key: $spki:expr,
+		signer: $signer:expr
+		$(, path_len: $path_len:expr)?
+	) => {{
+		use $crate::crypto::x509::builder::{Builder, Profile};
+		use $crate::crypto::x509::name::Name;
+		use $crate::der::Encode;
 
-        let subject = Name::from_str($subject)?;
-        let issuer = Name::from_str($issuer)?;
-        let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
+		let subject = Name::from_str($subject)?;
+		let issuer = Name::from_str($issuer)?;
+		let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
 
-        let profile = Profile::SubCA {
-            issuer: issuer.clone(),
-            path_len_constraint: $( Some($path_len) )?,
-        };
+		let profile = Profile::SubCA {
+			issuer: issuer.clone(),
+			path_len_constraint: $( Some($path_len) )?,
+		};
 
-        let builder = $crate::crypto::x509::builder::CertificateBuilder::new(
-            profile,
-            serial,
-            $crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
-            subject,
-            $spki,
-            $signer,
-        )?;
+		let builder = $crate::crypto::x509::builder::CertificateBuilder::new(
+			profile,
+			serial,
+			$crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
+			subject,
+			$spki,
+			$signer,
+		)?;
 
-        builder.build::<$crate::crypto::sign::Signer>()
-    }};
+		builder.build::<$crate::crypto::sign::Signer>()
+	}};
 }
 
 /// Create an X.509 Certificate Signing Request using the builder pattern
@@ -144,35 +144,35 @@ macro_rules! cert {
 /// use tightbeam::csr;
 ///
 /// let csr = csr!(
-///     subject: "CN=example.com",
-///     signer: &signing_key
+///	 subject: "CN=example.com",
+///	 signer: &signing_key
 /// )?;
 /// ```
 #[cfg(feature = "x509")]
 #[macro_export]
 macro_rules! csr {
-    (
-        subject: $subject:expr,
-        signer: $signer:expr
-        $(, extensions: [$($ext:expr),* $(,)?])?
-    ) => {{
+	(
+		subject: $subject:expr,
+		signer: $signer:expr
+		$(, extensions: [$($ext:expr),* $(,)?])?
+	) => {{
 		use core::str::FromStr;
 
-        use $crate::crypto::x509::builder::RequestBuilder;
-        use $crate::crypto::x509::name::Name;
-        use $crate::der::Encode;
+		use $crate::crypto::x509::builder::RequestBuilder;
+		use $crate::crypto::x509::name::Name;
+		use $crate::der::Encode;
 
-        let subject = Name::from_str($subject)?;
-        let mut builder = RequestBuilder::new(subject, $signer)?;
+		let subject = Name::from_str($subject)?;
+		let mut builder = RequestBuilder::new(subject, $signer)?;
 
-        $(
-            $(
-                builder.add_extension(&$ext)?;
-            )*
-        )?
+		$(
+			$(
+				builder.add_extension(&$ext)?;
+			)*
+		)?
 
-        builder.build::<$crate::crypto::sign::Signer>()
-    }};
+		builder.build::<$crate::crypto::sign::Signer>()
+	}};
 }
 
 #[cfg(test)]

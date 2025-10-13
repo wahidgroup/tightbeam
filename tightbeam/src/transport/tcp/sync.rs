@@ -5,18 +5,18 @@ use crate::Frame;
 #[cfg(feature = "transport-policy")]
 use crate::{
 	policy::GatePolicy,
-	transport::{error::TransportError, policy::RestartPolicy, tcp::TcpStreamTrait},
+	transport::{error::TransportError, policy::RestartPolicy, tcp::ProtocolStream},
 };
 
 /// TCP transport implementation using abstract traits
 #[cfg(not(feature = "transport-policy"))]
-pub struct TcpTransport<S: TcpStreamTrait> {
+pub struct TcpTransport<S: ProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 }
 
 #[cfg(feature = "transport-policy")]
-pub struct TcpTransport<S: TcpStreamTrait> {
+pub struct TcpTransport<S: ProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 	restart_policy: Box<dyn RestartPolicy>,
@@ -24,7 +24,7 @@ pub struct TcpTransport<S: TcpStreamTrait> {
 	collector_gate: Box<dyn GatePolicy>,
 }
 
-impl<S: TcpStreamTrait> Pingable for TcpTransport<S>
+impl<S: ProtocolStream> Pingable for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
@@ -35,9 +35,9 @@ where
 }
 
 // Use the macro to generate common implementations
-crate::impl_tcp_common!(TcpTransport, crate::transport::tcp::TcpStreamTrait);
+crate::impl_tcp_common!(TcpTransport, crate::transport::tcp::ProtocolStream);
 
-impl<S: TcpStreamTrait> MessageIO for TcpTransport<S>
+impl<S: ProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
@@ -88,10 +88,34 @@ pub struct TcpServer<L: TcpListenerTrait> {
 	listener: L,
 }
 
+#[cfg(feature = "std")]
+impl crate::transport::Protocol for TcpServer<std::net::TcpListener> {
+	type Listener = std::net::TcpListener;
+	type Stream = std::net::TcpStream;
+	type Error = std::io::Error;
+	type Transport = TcpTransport<std::net::TcpStream>;
+	type Address = std::net::SocketAddr;
+
+	async fn bind(addr: &str) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = std::net::TcpListener::bind(addr)?;
+		let bound_addr = listener.local_addr()?;
+		Ok((listener, bound_addr))
+	}
+
+	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
+		std::net::TcpStream::connect(addr)
+	}
+
+	fn create_transport(stream: Self::Stream) -> Self::Transport {
+		TcpTransport::from(stream)
+	}
+}
+
 impl<L: TcpListenerTrait> TcpServer<L>
 where
 	TransportError: From<L::Error>,
-	TransportError: From<<L::Stream as TcpStreamTrait>::Error>,
+	TransportError: From<<L::Stream as ProtocolStream>::Error>,
+	L::Stream: ProtocolStream,
 {
 	pub fn from_listener(listener: L) -> Self {
 		Self { listener }
@@ -100,30 +124,6 @@ where
 	pub fn accept(&self) -> TransportResult<TcpTransport<L::Stream>> {
 		let (stream, _) = self.listener.accept()?;
 		Ok(TcpTransport::from(stream))
-	}
-}
-
-// std::net implementations when std is available
-#[cfg(feature = "std")]
-impl TcpStreamTrait for std::net::TcpStream {
-	type Error = std::io::Error;
-
-	fn write_all(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
-		std::io::Write::write_all(self, buf)
-	}
-
-	fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
-		std::io::Read::read_exact(self, buf)
-	}
-}
-
-#[cfg(feature = "std")]
-impl TcpListenerTrait for std::net::TcpListener {
-	type Stream = std::net::TcpStream;
-	type Error = std::io::Error;
-
-	fn accept(&self) -> Result<(Self::Stream, std::net::SocketAddr), Self::Error> {
-		self.accept()
 	}
 }
 

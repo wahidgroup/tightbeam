@@ -80,7 +80,7 @@ async fn test_macro_integration_full() -> core::result::Result<(), Box<dyn core:
 
 	// Server
 	let server_handle = tb::server! {
-		async tcp: listener,
+		protocol collect::TokioListener: listener,
 		channels: {
 			error: error_tx.clone(),
 			ok: ok_tx.clone()
@@ -96,13 +96,12 @@ async fn test_macro_integration_full() -> core::result::Result<(), Box<dyn core:
 
 	// Client
 	let _client = tb::client! {
-		async tcp: connect addr,
+		connect collect::TokioListener: addr,
 		policies: {
 			gate: policy::AcceptAllGate,
 			restart: policy::RestartLinearBackoff::default(),
 		}
-	}
-	.await?;
+	};
 
 	// No ok signals expected yet
 	assert!(ok_rx.try_recv().is_err());

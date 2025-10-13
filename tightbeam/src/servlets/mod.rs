@@ -34,434 +34,429 @@ pub trait Servlet {
 /// Servlet macro for creating containerized tightbeam applications
 #[macro_export]
 macro_rules! servlet {
-    // Full servlet with router, policies, and config
-    (
-        name: $servlet_name:ident,
-        $(worker_threads: $threads:literal,)?
-        protocol: $protocol:ident,
-        $(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
-        router: $router:expr,
-        config: { $($config_field:ident: $config_type:ty),* $(,)? },
-        handle: |$message:ident, $router_param:ident, $config_param:ident| async move $handler_body:block
-    ) => {
-        servlet!(@generate $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-                 router_and_config, $router, { $($config_field: $config_type,)* },
-                 |$message, $router_param, $config_param| $handler_body);
-    };
+	// Full servlet with router, policies, and config
+	(
+		name: $servlet_name:ident,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
+		router: $router:expr,
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		handle: |$message:ident, $router_param:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				 router_and_config, $router, { $($config_field: $config_type,)* },
+				 |$message, $router_param, $config_param| $handler_body);
+	};
 
-    // Servlet with router only
-    (
-        name: $servlet_name:ident,
-        $(worker_threads: $threads:literal,)?
-        protocol: $protocol:ident,
-        $(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
-        router: $router:expr,
-        handle: |$message:ident, $router_param:ident| async move $handler_body:block
-    ) => {
-        servlet!(@generate $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-                 router_only, $router, {},
-                 |$message, $router_param| $handler_body);
-    };
+	// Servlet with router only
+	(
+		name: $servlet_name:ident,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
+		router: $router:expr,
+		handle: |$message:ident, $router_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				 router_only, $router, {},
+				 |$message, $router_param| $handler_body);
+	};
 
-    // Servlet with config only
-    (
-        name: $servlet_name:ident,
-        $(worker_threads: $threads:literal,)?
-        protocol: $protocol:ident,
-        $(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
-        config: { $($config_field:ident: $config_type:ty),* $(,)? },
-        handle: |$message:ident, $config_param:ident| async move $handler_body:block
-    ) => {
-        servlet!(@generate $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-                 config_only, {}, { $($config_field: $config_type,)* },
-                 |$message, $config_param| $handler_body);
-    };
+	// Servlet with config only
+	(
+		name: $servlet_name:ident,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		handle: |$message:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				 config_only, {}, { $($config_field: $config_type,)* },
+				 |$message, $config_param| $handler_body);
+	};
 
-    // Basic servlet with just message
-    (
-        name: $servlet_name:ident,
-        $(worker_threads: $threads:literal,)?
-        protocol: $protocol:ident,
-        $(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
-        handle: |$message:ident| async move $handler_body:block
-    ) => {
-        servlet!(@generate $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-                 basic, {}, {},
-                 |$message| $handler_body);
-    };
+	// Basic servlet with just message
+	(
+		name: $servlet_name:ident,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
+		handle: |$message:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				 basic, {}, {},
+				 |$message| $handler_body);
+	};
 
-    // Main implementation generator
-    (@generate $servlet_name:ident, $protocol:ident, [$($policy_key:ident: $policy_val:expr,)*],
-              router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
-              |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
-        servlet!(@impl_struct $servlet_name, { $($config_field: $config_type,)* });
-        servlet!(@impl_methods $servlet_name, $protocol, [$($policy_key: $policy_val),*],
-                 router_and_config, $router, { $($config_field: $config_type,)* },
-                 |$message, $router_param, $config_param| $handler_body);
-        servlet!(@impl_trait $servlet_name, { $($config_field: $config_type,)* });
-    };
+	// Main implementation generator
+	(@generate $servlet_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr,)*],
+			  router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
+			  |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
+		servlet!(@impl_struct $servlet_name, { $($config_field: $config_type,)* });
+		servlet!(@impl_methods $servlet_name, $protocol, [$($policy_key: $policy_val),*],
+				 router_and_config, $router, { $($config_field: $config_type,)* },
+				 |$message, $router_param, $config_param| $handler_body);
+		servlet!(@impl_trait $servlet_name, { $($config_field: $config_type,)* });
+	};
 
-    (@generate $servlet_name:ident, $protocol:ident, [$($policy_key:ident: $policy_val:expr,)*],
-              router_only, $router:tt, {},
-              |$message:ident, $router_param:ident| $handler_body:expr) => {
-        servlet!(@impl_struct $servlet_name, {});
-        servlet!(@impl_methods $servlet_name, $protocol, [$($policy_key: $policy_val),*],
-                 router_only, $router, {},
-                 |$message, $router_param| $handler_body);
-        servlet!(@impl_trait $servlet_name, {});
-    };
+	(@generate $servlet_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr,)*],
+			  router_only, $router:tt, {},
+			  |$message:ident, $router_param:ident| $handler_body:expr) => {
+		servlet!(@impl_struct $servlet_name, {});
+		servlet!(@impl_methods $servlet_name, $protocol, [$($policy_key: $policy_val),*],
+				 router_only, $router, {},
+				 |$message, $router_param| $handler_body);
+		servlet!(@impl_trait $servlet_name, {});
+	};
 
-    (@generate $servlet_name:ident, $protocol:ident, [$($policy_key:ident: $policy_val:expr,)*],
-              config_only, {}, { $($config_field:ident: $config_type:ty,)* },
-              |$message:ident, $config_param:ident| $handler_body:expr) => {
-        servlet!(@impl_struct $servlet_name, { $($config_field: $config_type,)* });
-        servlet!(@impl_methods $servlet_name, $protocol, [$($policy_key: $policy_val),*],
-                 config_only, {}, { $($config_field: $config_type,)* },
-                 |$message, $config_param| $handler_body);
-        servlet!(@impl_trait $servlet_name, { $($config_field: $config_type,)* });
-    };
+	(@generate $servlet_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr,)*],
+			  config_only, {}, { $($config_field:ident: $config_type:ty,)* },
+			  |$message:ident, $config_param:ident| $handler_body:expr) => {
+		servlet!(@impl_struct $servlet_name, { $($config_field: $config_type,)* });
+		servlet!(@impl_methods $servlet_name, $protocol, [$($policy_key: $policy_val),*],
+				 config_only, {}, { $($config_field: $config_type,)* },
+				 |$message, $config_param| $handler_body);
+		servlet!(@impl_trait $servlet_name, { $($config_field: $config_type,)* });
+	};
 
-    (@generate $servlet_name:ident, $protocol:ident, [$($policy_key:ident: $policy_val:expr,)*],
-              basic, {}, {},
-              |$message:ident| $handler_body:expr) => {
-        servlet!(@impl_struct $servlet_name, {});
-        servlet!(@impl_methods $servlet_name, $protocol, [$($policy_key: $policy_val),*],
-                 basic, {}, {},
-                 |$message| $handler_body);
-        servlet!(@impl_trait $servlet_name, {});
-    };
+	(@generate $servlet_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr,)*],
+			  basic, {}, {},
+			  |$message:ident| $handler_body:expr) => {
+		servlet!(@impl_struct $servlet_name, {});
+		servlet!(@impl_methods $servlet_name, $protocol, [$($policy_key: $policy_val),*],
+				 basic, {}, {},
+				 |$message| $handler_body);
+		servlet!(@impl_trait $servlet_name, {});
+	};
 
-    // Generate struct and optional config struct
-    (@impl_struct $servlet_name:ident, {}) => {
-        pub struct $servlet_name {
-            server_handle: Option<tokio::task::JoinHandle<()>>,
-            addr: std::net::SocketAddr,
-        }
-    };
+	// Generate struct and optional config struct
+	(@impl_struct $servlet_name:ident, {}) => {
+		pub struct $servlet_name {
+			server_handle: Option<tokio::task::JoinHandle<()>>,
+			addr: std::net::SocketAddr,
+		}
+	};
 
-    (@impl_struct $servlet_name:ident, { $($config_field:ident: $config_type:ty,)* }) => {
-        paste::paste! {
-            pub struct $servlet_name {
-                server_handle: Option<tokio::task::JoinHandle<()>>,
-                addr: std::net::SocketAddr,
-            }
+	(@impl_struct $servlet_name:ident, { $($config_field:ident: $config_type:ty,)* }) => {
+		paste::paste! {
+			pub struct $servlet_name {
+				server_handle: Option<tokio::task::JoinHandle<()>>,
+				addr: std::net::SocketAddr,
+			}
 
-            #[derive(Clone)]
-            pub struct [<$servlet_name Config>] {
-                $(pub $config_field: $config_type,)*
-            }
-        }
-    };
+			#[derive(Clone)]
+			pub struct [<$servlet_name Config>] {
+				$(pub $config_field: $config_type,)*
+			}
+		}
+	};
 
-    // Generate implementation methods
-    (@impl_methods $servlet_name:ident, $protocol:ident, [$($policy_key:ident: $policy_val:expr),*],
-                   router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
-                   |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
-        paste::paste! {
-            impl $servlet_name {
-                pub async fn start(config: [<$servlet_name Config>]) -> Result<Self, $crate::TightBeamError> {
-                    servlet!(@setup_protocol $protocol listener addr);
-                    let server_handle = servlet!(@build_server_with_config
-                        $protocol, listener, [$($policy_key: $policy_val),*], $router, config,
-                        (|$message: $crate::Frame, $router_param, $config_param| async move { $handler_body }));
-                    Ok(Self { server_handle: Some(server_handle), addr })
-                }
+	// Generate implementation methods
+	(@impl_methods $servlet_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr),*],
+				   router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
+				   |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
+		paste::paste! {
+			impl $servlet_name {
+				pub async fn start(config: [<$servlet_name Config>]) -> Result<Self, $crate::TightBeamError> {
+					servlet!(@setup_protocol $protocol, listener, addr);
+					let server_handle = servlet!(@build_server_with_config
+						$protocol, listener, [$($policy_key: $policy_val),*], $router, config,
+						(|$message: $crate::Frame, $router_param, $config_param| async move { $handler_body }));
+					Ok(Self { server_handle: Some(server_handle), addr })
+				}
 
-                servlet!(@common_methods);
-            }
+				servlet!(@common_methods);
+			}
 
-            servlet!(@drop_impl $servlet_name);
-        }
-    };
+			servlet!(@drop_impl $servlet_name);
+		}
+	};
 
-    (@impl_methods $servlet_name:ident, $protocol:ident, [$($policy_key:ident: $policy_val:expr),*],
-                   router_only, $router:tt, {},
-                   |$message:ident, $router_param:ident| $handler_body:expr) => {
-        impl $servlet_name {
-            pub async fn start() -> Result<Self, $crate::TightBeamError> {
-                servlet!(@setup_protocol $protocol listener addr);
-                let server_handle = servlet!(@build_server
-                    $protocol, listener, [$($policy_key: $policy_val),*], $router,
-                    (|$message: $crate::Frame, $router_param| async move { $handler_body }));
-                Ok(Self { server_handle: Some(server_handle), addr })
-            }
+	(@impl_methods $servlet_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr),*],
+				   router_only, $router:tt, {},
+				   |$message:ident, $router_param:ident| $handler_body:expr) => {
+		impl $servlet_name {
+			pub async fn start() -> Result<Self, $crate::TightBeamError> {
+				servlet!(@setup_protocol $protocol, listener, addr);
+				let server_handle = servlet!(@build_server
+					$protocol, listener, [$($policy_key: $policy_val),*], $router,
+					(|$message: $crate::Frame, $router_param| async move { $handler_body }));
+				Ok(Self { server_handle: Some(server_handle), addr })
+			}
 
-            servlet!(@common_methods);
-        }
+			servlet!(@common_methods);
+		}
 
-        servlet!(@drop_impl $servlet_name);
-    };
+		servlet!(@drop_impl $servlet_name);
+	};
 
-    (@impl_methods $servlet_name:ident, $protocol:ident, [$($policy_key:ident: $policy_val:expr),*],
-                   config_only, {}, { $($config_field:ident: $config_type:ty,)* },
-                   |$message:ident, $config_param:ident| $handler_body:expr) => {
-        paste::paste! {
-            impl $servlet_name {
-                pub async fn start(config: [<$servlet_name Config>]) -> Result<Self, $crate::TightBeamError> {
-                    servlet!(@setup_protocol $protocol listener addr);
-                    let server_handle = servlet!(@build_server_with_config
-                        $protocol, listener, [$($policy_key: $policy_val),*], config,
-                        (|$message: $crate::Frame, $config_param| async move { $handler_body }));
-                    Ok(Self { server_handle: Some(server_handle), addr })
-                }
+	(@impl_methods $servlet_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr),*],
+				   config_only, {}, { $($config_field:ident: $config_type:ty,)* },
+				   |$message:ident, $config_param:ident| $handler_body:expr) => {
+		paste::paste! {
+			impl $servlet_name {
+				pub async fn start(config: [<$servlet_name Config>]) -> Result<Self, $crate::TightBeamError> {
+					servlet!(@setup_protocol $protocol, listener, addr);
+					let server_handle = servlet!(@build_server_with_config
+						$protocol, listener, [$($policy_key: $policy_val),*], config,
+						(|$message: $crate::Frame, $config_param| async move { $handler_body }));
+					Ok(Self { server_handle: Some(server_handle), addr })
+				}
 
-                servlet!(@common_methods);
-            }
+				servlet!(@common_methods);
+			}
 
-            servlet!(@drop_impl $servlet_name);
-        }
-    };
+			servlet!(@drop_impl $servlet_name);
+		}
+	};
 
-    (@impl_methods $servlet_name:ident, $protocol:ident, [$($policy_key:ident: $policy_val:expr),*],
-                   basic, {}, {},
-                   |$message:ident| $handler_body:expr) => {
-        impl $servlet_name {
-            pub async fn start() -> Result<Self, $crate::TightBeamError> {
-                servlet!(@setup_protocol $protocol listener addr);
-                let server_handle = servlet!(@build_server
-                    $protocol, listener, [$($policy_key: $policy_val),*],
-                    (|$message: $crate::Frame| async move { $handler_body }));
-                Ok(Self { server_handle: Some(server_handle), addr })
-            }
+	(@impl_methods $servlet_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr),*],
+				   basic, {}, {},
+				   |$message:ident| $handler_body:expr) => {
+		impl $servlet_name {
+			pub async fn start() -> Result<Self, $crate::TightBeamError> {
+				servlet!(@setup_protocol $protocol, listener, addr);
+				let server_handle = servlet!(@build_server
+					$protocol, listener, [$($policy_key: $policy_val),*],
+					(|$message: $crate::Frame| async move { $handler_body }));
+				Ok(Self { server_handle: Some(server_handle), addr })
+			}
 
-            servlet!(@common_methods);
-        }
+			servlet!(@common_methods);
+		}
 
-        servlet!(@drop_impl $servlet_name);
-    };
+		servlet!(@drop_impl $servlet_name);
+	};
 
-    // Generate trait implementation (with config)
-    (@impl_trait $servlet_name:ident, { $($config_field:ident: $config_type:ty,)* }) => {
-        paste::paste! {
-            impl $crate::servlets::Servlet for $servlet_name {
-                type Config = [<$servlet_name Config>];
+	// Generate trait implementation (with config)
+	(@impl_trait $servlet_name:ident, { $($config_field:ident: $config_type:ty,)* }) => {
+		paste::paste! {
+			impl $crate::servlets::Servlet for $servlet_name {
+				type Config = [<$servlet_name Config>];
 
-                async fn start(config: Option<Self::Config>) -> Result<Self, $crate::TightBeamError> {
-                    let cfg = config.ok_or_else(|| $crate::TightBeamError::MissingConfiguration)?;
-                    Self::start(cfg).await
-                }
+				async fn start(config: Option<Self::Config>) -> Result<Self, $crate::TightBeamError> {
+					let cfg = config.ok_or_else(|| $crate::TightBeamError::MissingConfiguration)?;
+					Self::start(cfg).await
+				}
 
-                fn addr(&self) -> std::net::SocketAddr {
-                    self.addr()
-                }
+				fn addr(&self) -> std::net::SocketAddr {
+					self.addr()
+				}
 
-                fn stop(self) {
-                    self.stop()
-                }
+				fn stop(self) {
+					self.stop()
+				}
 
-                async fn join(self) -> Result<(), tokio::task::JoinError> {
-                    self.join().await
-                }
-            }
-        }
-    };
+				async fn join(self) -> Result<(), tokio::task::JoinError> {
+					self.join().await
+				}
+			}
+		}
+	};
 
-    // Generate trait implementation (without config)
-    (@impl_trait $servlet_name:ident, {}) => {
-        impl $crate::servlets::Servlet for $servlet_name {
-            type Config = ();
+	// Generate trait implementation (without config)
+	(@impl_trait $servlet_name:ident, {}) => {
+		impl $crate::servlets::Servlet for $servlet_name {
+			type Config = ();
 
-            async fn start(config: Option<Self::Config>) -> Result<Self, $crate::TightBeamError> {
-                let _ = config; // Ignore config for basic servlets
-                Self::start().await.map_err(|e| $crate::TightBeamError::ConfigurationError(e.to_string()))
-            }
+			async fn start(config: Option<Self::Config>) -> Result<Self, $crate::TightBeamError> {
+				let _ = config; // Ignore config for basic servlets
+				Self::start().await.map_err(|e| $crate::TightBeamError::ConfigurationError(e.to_string()))
+			}
 
-            fn addr(&self) -> std::net::SocketAddr {
-                self.addr()
-            }
+			fn addr(&self) -> std::net::SocketAddr {
+				self.addr()
+			}
 
-            fn stop(self) {
-                self.stop()
-            }
+			fn stop(self) {
+				self.stop()
+			}
 
-            async fn join(self) -> Result<(), tokio::task::JoinError> {
-                self.join().await
-            }
-        }
-    };
+			async fn join(self) -> Result<(), tokio::task::JoinError> {
+				self.join().await
+			}
+		}
+	};
 
-    // Common methods shared by all servlets
-    (@common_methods) => {
-        pub fn addr(&self) -> std::net::SocketAddr {
-            self.addr
-        }
+	// Common methods shared by all servlets
+	(@common_methods) => {
+		pub fn addr(&self) -> std::net::SocketAddr {
+			self.addr
+		}
 
-        pub fn stop(mut self) {
-            if let Some(handle) = self.server_handle.take() {
-                handle.abort();
-            }
-        }
+		pub fn stop(mut self) {
+			if let Some(handle) = self.server_handle.take() {
+				handle.abort();
+			}
+		}
 
-        pub async fn join(mut self) -> Result<(), tokio::task::JoinError> {
-            if let Some(handle) = self.server_handle.take() {
-                handle.await
-            } else {
-                Ok(())
-            }
-        }
-    };
+		pub async fn join(mut self) -> Result<(), tokio::task::JoinError> {
+			if let Some(handle) = self.server_handle.take() {
+				handle.await
+			} else {
+				Ok(())
+			}
+		}
+	};
 
-    // Drop implementation shared by all servlets
-    (@drop_impl $servlet_name:ident) => {
-        impl Drop for $servlet_name {
-            fn drop(&mut self) {
-                if let Some(handle) = self.server_handle.take() {
-                    handle.abort();
-                }
-            }
-        }
-    };
+	// Drop implementation shared by all servlets
+	(@drop_impl $servlet_name:ident) => {
+		impl Drop for $servlet_name {
+			fn drop(&mut self) {
+				if let Some(handle) = self.server_handle.take() {
+					handle.abort();
+				}
+			}
+		}
+	};
 
-    // Build server variants (simplified with proper routing to existing patterns)
-    (@build_server_with_config $protocol:ident, $listener:ident, [$($policy_key:ident: $policy_val:expr),*],
-                               $router:tt, $config:ident, $handler:tt) => {
-        servlet!(@build_server_router_config $protocol, $listener, [$($policy_key: $policy_val),*],
-                 $router, $config, $handler)
-    };
+	// Build server variants (simplified with proper routing to existing patterns)
+	(@build_server_with_config $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),*],
+							   $router:tt, $config:ident, $handler:tt) => {
+		servlet!(@build_server_router_config $protocol, $listener, [$($policy_key: $policy_val),*],
+				 $router, $config, $handler)
+	};
 
-    (@build_server_with_config $protocol:ident, $listener:ident, [$($policy_key:ident: $policy_val:expr),*],
-                               $config:ident, $handler:tt) => {
-        servlet!(@build_server_config_only $protocol, $listener, [$($policy_key: $policy_val),*],
-                 $config, $handler)
-    };
+	(@build_server_with_config $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),*],
+							   $config:ident, $handler:tt) => {
+		servlet!(@build_server_config_only $protocol, $listener, [$($policy_key: $policy_val),*],
+				 $config, $handler)
+	};
 
-    // Keep the existing @build_server patterns for router+config, config-only, etc.
-    // (the detailed patterns you already have)
+	// Protocol setup - updated to handle protocol paths
+	(@setup_protocol $protocol:path, $listener:ident, $addr:ident) => {
+		use $crate::transport::Protocol;
 
-    // TCP protocol setup
-    (@setup_protocol tcp $listener:ident $addr:ident) => {
-        use $crate::transport::tcp::r#async::TokioListener;
+		let ($listener, $addr) = <$protocol as Protocol>::bind("127.0.0.1:0").await
+			.map_err(|e| $crate::TightBeamError::from(e))?;
+	};
 
-        let $listener = TokioListener::bind("127.0.0.1:0").await?;
-        let $addr = $listener.local_addr()?;
-    };
+	// Build server with router and config (non-empty policies)
+	(@build_server_router_config $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $router:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $router_param:ident, $config_param:ident| async move $body:block)) => {
+		{
+			let router_arc = ::std::sync::Arc::new($router);
+			let config_arc = ::std::sync::Arc::new($config);
+			$crate::server! {
+				protocol $protocol: $listener,
+				policies: { $($policy_key: $policy_val),* },
+				handle: move |$msg: $msg_ty| async move {
+					let router_arc = router_arc.clone();
+					let config_arc = config_arc.clone();
+					let $router_param = &router_arc;
+					let $config_param = &config_arc;
+					$body
+				}
+			}
+		}
+	};
 
-    // The existing detailed @build_server patterns go here...
-    // (keeping the ones you already have for @build_server_router_config, @build_server_config_only, etc.)
+	// Build server with router and config (empty policies)
+	(@build_server_router_config $protocol:path, $listener:ident, [], $router:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $router_param:ident, $config_param:ident| async move $body:block)) => {
+		{
+			let router_arc = ::std::sync::Arc::new($router);
+			let config_arc = ::std::sync::Arc::new($config);
+			$crate::server! {
+				protocol $protocol: $listener,
+				handle: move |$msg: $msg_ty| async move {
+					let router_arc = router_arc.clone();
+					let config_arc = config_arc.clone();
+					let $router_param = &router_arc;
+					let $config_param = &config_arc;
+					$body
+				}
+			}
+		}
+	};
 
-    // Build server with router and config (non-empty policies)
-    (@build_server_router_config $protocol:ident, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $router:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $router_param:ident, $config_param:ident| async move $body:block)) => {
-        {
-            let router_arc = ::std::sync::Arc::new($router);
-            let config_arc = ::std::sync::Arc::new($config);
-            $crate::server! {
-                async $protocol: $listener,
-                policies: { $($policy_key: $policy_val),* },
-                handle: move |$msg: $msg_ty| async move {
-                    let router_arc = router_arc.clone();
-                    let config_arc = config_arc.clone();
-                    let $router_param = &router_arc;
-                    let $config_param = &config_arc;
-                    $body
-                }
-            }
-        }
-    };
+	// Build server with config only (non-empty policies)
+	(@build_server_config_only $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $config:ident, (|$msg:ident: $msg_ty:ty, $config_param:ident| async move $body:block)) => {
+		{
+			let config_arc = ::std::sync::Arc::new($config);
+			$crate::server! {
+				protocol $protocol: $listener,
+				policies: { $($policy_key: $policy_val),* },
+				handle: move |$msg: $msg_ty| async move {
+					let config_arc = config_arc.clone();
+					let $config_param = &config_arc;
+					$body
+				}
+			}
+		}
+	};
 
-    // Build server with router and config (empty policies)
-    (@build_server_router_config $protocol:ident, $listener:ident, [], $router:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $router_param:ident, $config_param:ident| async move $body:block)) => {
-        {
-            let router_arc = ::std::sync::Arc::new($router);
-            let config_arc = ::std::sync::Arc::new($config);
-            $crate::server! {
-                async $protocol: $listener,
-                handle: move |$msg: $msg_ty| async move {
-                    let router_arc = router_arc.clone();
-                    let config_arc = config_arc.clone();
-                    let $router_param = &router_arc;
-                    let $config_param = &config_arc;
-                    $body
-                }
-            }
-        }
-    };
+	// Build server with config only (empty policies)
+	(@build_server_config_only $protocol:path, $listener:ident, [], $config:ident, (|$msg:ident: $msg_ty:ty, $config_param:ident| async move $body:block)) => {
+		{
+			let config_arc = ::std::sync::Arc::new($config);
+			$crate::server! {
+				protocol $protocol: $listener,
+				handle: move |$msg: $msg_ty| async move {
+					let config_arc = config_arc.clone();
+					let $config_param = &config_arc;
+					$body
+				}
+			}
+		}
+	};
 
-    // Build server with config only (non-empty policies)
-    (@build_server_config_only $protocol:ident, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $config:ident, (|$msg:ident: $msg_ty:ty, $config_param:ident| async move $body:block)) => {
-        {
-            let config_arc = ::std::sync::Arc::new($config);
-            $crate::server! {
-                async $protocol: $listener,
-                policies: { $($policy_key: $policy_val),* },
-                handle: move |$msg: $msg_ty| async move {
-                    let config_arc = config_arc.clone();
-                    let $config_param = &config_arc;
-                    $body
-                }
-            }
-        }
-    };
+	// Build server with router only (non-empty policies)
+	(@build_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $router:expr, (|$msg:ident: $msg_ty:ty, $router_param:ident| async move $body:block)) => {
+		{
+			let router_arc = ::std::sync::Arc::new($router);
+			$crate::server! {
+				protocol $protocol: $listener,
+				policies: { $($policy_key: $policy_val),* },
+				handle: move |$msg: $msg_ty| async move {
+					let router_arc = router_arc.clone();
+					let $router_param = &router_arc;
+					$body
+				}
+			}
+		}
+	};
 
-    // Build server with config only (empty policies)
-    (@build_server_config_only $protocol:ident, $listener:ident, [], $config:ident, (|$msg:ident: $msg_ty:ty, $config_param:ident| async move $body:block)) => {
-        {
-            let config_arc = ::std::sync::Arc::new($config);
-            $crate::server! {
-                async $protocol: $listener,
-                handle: move |$msg: $msg_ty| async move {
-                    let config_arc = config_arc.clone();
-                    let $config_param = &config_arc;
-                    $body
-                }
-            }
-        }
-    };
+	// Build server with router only (empty policies)
+	(@build_server $protocol:path, $listener:ident, [], $router:expr, (|$msg:ident: $msg_ty:ty, $router_param:ident| async move $body:block)) => {
+		{
+			let router_arc = ::std::sync::Arc::new($router);
+			$crate::server! {
+				protocol $protocol: $listener,
+				handle: move |$msg: $msg_ty| async move {
+					let router_arc = router_arc.clone();
+					let $router_param = &router_arc;
+					$body
+				}
+			}
+		}
+	};
 
-    // Build server with router only (non-empty policies)
-    (@build_server $protocol:ident, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $router:expr, (|$msg:ident: $msg_ty:ty, $router_param:ident| async move $body:block)) => {
-        {
-            let router_arc = ::std::sync::Arc::new($router);
-            $crate::server! {
-                async $protocol: $listener,
-                policies: { $($policy_key: $policy_val),* },
-                handle: move |$msg: $msg_ty| async move {
-                    let router_arc = router_arc.clone();
-                    let $router_param = &router_arc;
-                    $body
-                }
-            }
-        }
-    };
+	// Build server basic (non-empty policies)
+	(@build_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], (|$msg:ident: $msg_ty:ty| async move $body:block)) => {
+		$crate::server! {
+			protocol $protocol: $listener,
+			policies: { $($policy_key: $policy_val),* },
+			handle: move |$msg: $msg_ty| async move {
+				$body
+			}
+		}
+	};
 
-    // Build server with router only (empty policies)
-    (@build_server $protocol:ident, $listener:ident, [], $router:expr, (|$msg:ident: $msg_ty:ty, $router_param:ident| async move $body:block)) => {
-        {
-            let router_arc = ::std::sync::Arc::new($router);
-            $crate::server! {
-                async $protocol: $listener,
-                handle: move |$msg: $msg_ty| async move {
-                    let router_arc = router_arc.clone();
-                    let $router_param = &router_arc;
-                    $body
-                }
-            }
-        }
-    };
-
-    // Build server basic (non-empty policies)
-    (@build_server $protocol:ident, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], (|$msg:ident: $msg_ty:ty| async move $body:block)) => {
-        $crate::server! {
-            async $protocol: $listener,
-            policies: { $($policy_key: $policy_val),* },
-            handle: move |$msg: $msg_ty| async move {
-                $body
-            }
-        }
-    };
-
-    // Build server basic (empty policies)
-    (@build_server $protocol:ident, $listener:ident, [], (|$msg:ident: $msg_ty:ty| async move $body:block)) => {
-        $crate::server! {
-            async $protocol: $listener,
-            handle: move |$msg: $msg_ty| async move {
-                $body
-            }
-        }
-    };
+	// Build server basic (empty policies)
+	(@build_server $protocol:path, $listener:ident, [], (|$msg:ident: $msg_ty:ty| async move $body:block)) => {
+		$crate::server! {
+			protocol $protocol: $listener,
+			handle: move |$msg: $msg_ty| async move {
+				$body
+			}
+		}
+	};
 }
 
 #[cfg(test)]
 mod tests {
+	use crate::transport::tcp::TokioListener;
 	use crate::transport::policy::PolicyConfiguration;
 	use crate::transport::MessageEmitter;
 
@@ -488,7 +483,7 @@ mod tests {
 
 	servlet! {
 		name: PingPongServlet,
-		protocol: tcp,
+		protocol: TokioListener,
 		policies: {
 			with_collector_gate: crate::policy::AcceptAllGate
 		},
@@ -517,7 +512,7 @@ mod tests {
 		name: test_servlet_with_test_async_case,
 		features: ["std", "tcp", "tokio"],
 		worker_threads: 2,
-		protocol: tcp,
+		protocol: TokioListener,
 		setup: || {
 			PingPongServlet::start(PingPongServletConfig { lotto_number: 42 })
 		},

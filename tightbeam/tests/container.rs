@@ -2,6 +2,8 @@
 #![cfg(feature = "full")]
 
 use tightbeam::prelude::*;
+
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
 
 use der::Sequence;
@@ -20,7 +22,7 @@ test_container! {
 	name: container_gates_basic,
 	features: ["testing", "std", "tcp", "tokio"],
 	worker_threads: 2,
-	protocol: tcp,
+	protocol: TokioListener,
 	service_policies: {
 		gate: policy::AcceptAllGate
 	},

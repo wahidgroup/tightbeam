@@ -1,35 +1,24 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::transport::{MessageIO, Pingable, TransportEnvelope, TransportError, TransportResult};
+use crate::transport::{
+	AsyncListenerTrait, MessageIO, Pingable, Protocol, TransportEnvelope, TransportError, TransportResult,
+};
 use crate::Frame;
 
 #[cfg(feature = "transport-policy")]
 use crate::{policy::GatePolicy, transport::policy::RestartPolicy};
 
-pub trait AsyncTcpStreamTrait: Send + Unpin {
+pub trait AsyncProtocolStream: Send + Unpin {
 	type Error: Into<TransportError>;
 	fn inner_mut(&mut self) -> &mut TcpStream;
-}
-
-pub trait AsyncTcpListenerTrait: Send {
-	type Stream: AsyncTcpStreamTrait;
-	type Error: Into<TransportError>;
-	#[allow(async_fn_in_trait)]
-	async fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error>;
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum SocketAddr {
-	V4([u8; 4], u16),
-	V6([u8; 16], u16),
 }
 
 pub struct TokioStream {
 	stream: TcpStream,
 }
 
-impl AsyncTcpStreamTrait for TokioStream {
+impl AsyncProtocolStream for TokioStream {
 	type Error = std::io::Error;
 	fn inner_mut(&mut self) -> &mut TcpStream {
 		&mut self.stream
@@ -57,28 +46,44 @@ impl TokioListener {
 	}
 }
 
-impl AsyncTcpListenerTrait for TokioListener {
+impl Protocol for TokioListener {
+	type Listener = TokioListener;
 	type Stream = TokioStream;
 	type Error = std::io::Error;
-	async fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error> {
-		let (stream, addr) = self.listener.accept().await?;
-		let socket_addr = match addr {
-			std::net::SocketAddr::V4(v4) => SocketAddr::V4(v4.ip().octets(), v4.port()),
-			std::net::SocketAddr::V6(v6) => SocketAddr::V6(v6.ip().octets(), v6.port()),
-		};
+	type Transport = TcpTransportAsync<TokioStream>;
+	type Address = std::net::SocketAddr;
 
-		Ok((TokioStream { stream }, socket_addr))
+	async fn bind(addr: &str) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = TokioListener::bind(addr).await?;
+		let bound_addr = listener.local_addr()?;
+		Ok((listener, bound_addr))
+	}
+
+	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
+		let stream = TcpStream::connect(addr).await?;
+		Ok(TokioStream::from(stream))
+	}
+
+	fn create_transport(stream: Self::Stream) -> Self::Transport {
+		TcpTransportAsync::from(stream)
+	}
+}
+
+impl AsyncListenerTrait for TokioListener {
+	async fn accept(&self) -> Result<(Self::Stream, Self::Address), Self::Error> {
+		let (stream, addr) = self.listener.accept().await?;
+		Ok((TokioStream { stream }, addr))
 	}
 }
 
 #[cfg(not(feature = "transport-policy"))]
-pub struct TcpTransportAsync<S: AsyncTcpStreamTrait> {
+pub struct TcpTransportAsync<S: AsyncProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 }
 
 #[cfg(feature = "transport-policy")]
-pub struct TcpTransportAsync<S: AsyncTcpStreamTrait> {
+pub struct TcpTransportAsync<S: AsyncProtocolStream> {
 	stream: S,
 	restart_policy: Box<dyn RestartPolicy>,
 	emitter_gate: Box<dyn GatePolicy>,
@@ -86,7 +91,7 @@ pub struct TcpTransportAsync<S: AsyncTcpStreamTrait> {
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 }
 
-impl<S: AsyncTcpStreamTrait> Pingable for TcpTransportAsync<S>
+impl<S: AsyncProtocolStream> Pingable for TcpTransportAsync<S>
 where
 	TransportError: From<S::Error>,
 {
@@ -97,9 +102,9 @@ where
 	}
 }
 
-crate::impl_tcp_common!(TcpTransportAsync, AsyncTcpStreamTrait);
+crate::impl_tcp_common!(TcpTransportAsync, AsyncProtocolStream);
 
-impl<S: AsyncTcpStreamTrait> MessageIO for TcpTransportAsync<S>
+impl<S: AsyncProtocolStream> MessageIO for TcpTransportAsync<S>
 where
 	TransportError: From<S::Error>,
 {
@@ -150,14 +155,14 @@ where
 	}
 }
 
-pub struct TcpServerAsync<L: AsyncTcpListenerTrait> {
+pub struct TcpServerAsync<L: AsyncListenerTrait> {
 	listener: L,
 }
 
 impl<L> TcpServerAsync<L>
 where
-	L: AsyncTcpListenerTrait,
-	L::Stream: AsyncTcpStreamTrait<Error = std::io::Error>,
+	L: AsyncListenerTrait,
+	L::Stream: AsyncProtocolStream<Error = std::io::Error>,
 	TransportError: From<L::Error>,
 {
 	pub async fn accept(&self) -> TransportResult<TcpTransportAsync<L::Stream>> {
@@ -184,8 +189,8 @@ where
 
 impl<L> From<L> for TcpServerAsync<L>
 where
-	L: AsyncTcpListenerTrait,
-	L::Stream: AsyncTcpStreamTrait<Error = std::io::Error>,
+	L: AsyncListenerTrait,
+	L::Stream: AsyncProtocolStream<Error = std::io::Error>,
 	TransportError: From<L::Error>,
 {
 	fn from(listener: L) -> Self {

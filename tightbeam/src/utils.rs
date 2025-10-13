@@ -47,23 +47,23 @@ macro_rules! impl_from {
 	};
 
 	// Pattern for conditional error conversions via enum wrapper (with cfg)
-    (#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident via $wrapper:path) => {
-        #[cfg($feature)]
-        impl From<$from_type> for $target {
-            fn from(err: $from_type) -> Self {
-                $target::$variant($wrapper(err))
-            }
-        }
-    };
+	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident via $wrapper:path) => {
+		#[cfg($feature)]
+		impl From<$from_type> for $target {
+			fn from(err: $from_type) -> Self {
+				$target::$variant($wrapper(err))
+			}
+		}
+	};
 
-    // Pattern for unconditional error conversions via enum wrapper
-    ($from_type:ty => $target:ident::$variant:ident via $wrapper:path) => {
-        impl From<$from_type> for $target {
-            fn from(err: $from_type) -> Self {
-                $target::$variant($wrapper(err))
-            }
-        }
-    };
+	// Pattern for unconditional error conversions via enum wrapper
+	($from_type:ty => $target:ident::$variant:ident via $wrapper:path) => {
+		impl From<$from_type> for $target {
+			fn from(err: $from_type) -> Self {
+				$target::$variant($wrapper(err))
+			}
+		}
+	};
 }
 
 /// Macro to implement TryFrom trait for extracting optional fields

@@ -212,6 +212,40 @@ impl From<Frame> for TransportEnvelope {
 	}
 }
 
+/// Stream trait - defines how to read and write
+pub trait ProtocolStream: Send {
+	type Error: Into<TransportError>;
+
+	fn write_all(&mut self, buf: &[u8]) -> Result<(), Self::Error>;
+	fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error>;
+}
+
+/// Protocol trait - defines how to bind and connect
+pub trait Protocol {
+	type Listener: Send;
+	type Stream: Send;
+	type Transport: Send;
+	type Error: Into<TransportError>;
+	type Address: Clone + Send;
+
+	/// Bind to an address and return listener + actual bound address
+	fn bind(
+		addr: &str,
+	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
+
+	/// Connect to an address
+	fn connect(addr: Self::Address) -> impl core::future::Future<Output = Result<Self::Stream, Self::Error>> + Send;
+
+	/// Create transport from stream
+	fn create_transport(stream: Self::Stream) -> Self::Transport;
+}
+
+/// Async listener trait
+pub trait AsyncListenerTrait: Protocol + Send {
+	#[allow(async_fn_in_trait)]
+	async fn accept(&self) -> Result<(Self::Stream, Self::Address), Self::Error>;
+}
+
 /// Base I/O operations for message transport
 pub trait MessageIO: ResponseHandler {
 	/// Read raw message data from the transport (reads TransportEnvelope)
@@ -463,7 +497,7 @@ mod tests {
 
 		use crate::transport::policy::PolicyConfiguration;
 		use crate::transport::policy::RestartLinearBackoff;
-		use crate::transport::tcp::r#async::TokioListener;
+		use crate::transport::tcp::r#async::{TokioListener};
 
 		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
 		let addr = listener.local_addr().unwrap();
@@ -473,7 +507,7 @@ mod tests {
 
 		// Spawn server using server! macro
 		let server_handle = crate::server! {
-			async tcp: listener,
+			protocol TokioListener: listener,
 			handle: move |message: Frame| {
 				let tx = tx.clone();
 				async move {
@@ -486,12 +520,11 @@ mod tests {
 
 		// Create client using client! macro
 		let mut client = crate::client! {
-			async tcp: connect addr,
+			connect TokioListener: addr,
 			policies: {
 				restart_policy: RestartLinearBackoff::default(),
 			}
-		}
-		.await?;
+		};
 
 		let message = create_v0_tightbeam(None, None);
 		let result = client.emit(message.clone(), None).await;

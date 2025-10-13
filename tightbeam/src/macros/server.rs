@@ -37,13 +37,15 @@ macro_rules! server {
 		let handler = Arc::new($handler);
 		loop {
 			match $server.accept().await {
-				Ok(transport) => {
+				Ok((stream, _addr)) => {
+					use $crate::transport::tcp::r#async::TcpTransportAsync;
+					let mut transport = TcpTransportAsync::from(stream);
 					$(
-						let transport = transport.$policy_name($policy_value);
+						transport = transport.$policy_name($policy_value);
 					)*
 					let handler = handler.clone();
 					tokio::spawn(async move {
-						let mut transport = transport.with_handler(Box::new(move |msg: tightbeam::TightBeam| {
+						let mut transport = transport.with_handler(Box::new(move |msg: $crate::Frame| {
 							let handler = handler.clone();
 							tokio::task::block_in_place(|| {
 								tokio::runtime::Handle::current().block_on(handler(msg.clone()))
@@ -73,13 +75,18 @@ macro_rules! server {
 	// Internal: async accept loop with channels
 	(@async_loop $server:expr, $handler:expr, $error_tx:expr, $ok_tx:expr, $($policy_name:ident: $policy_value:expr),*) => {{
 		use std::sync::Arc;
-		use $crate::transport::{ResponseHandler, MessageCollector};
+		use $crate::transport::AsyncListenerTrait;
 		let handler = Arc::new($handler);
 		loop {
 			match $server.accept().await {
-				Ok(transport) => {
+				Ok((stream, _addr)) => {
+					use $crate::transport::tcp::r#async::TcpTransportAsync;
+					use $crate::transport::{ResponseHandler, MessageCollector};
+					// False positive: transport is used mutably
+					#[allow(unused_mut)]
+					let mut transport = TcpTransportAsync::from(stream);
 					$(
-						let transport = transport.$policy_name($policy_value);
+						transport = transport.$policy_name($policy_value);
 					)*
 					let handler = handler.clone();
 					// Explicitly annotate channel types to satisfy inference
@@ -120,98 +127,104 @@ macro_rules! server {
 		}
 	}};
 
-	// Sync: tcp: listener, handle: closure
-	(tcp: $listener:expr, handle: $handler:expr) => {{
+	// Generic sync: protocol: listener, handle: closure
+	($protocol:path: $listener:expr, handle: $handler:expr) => {{
 		#[cfg(feature = "std")]
 		{
-			let server = $crate::transport::tcp::sync::TcpServer::from_listener($listener);
+			// Use generic server construction - protocol must provide server type
+			let server = $listener;
 			$crate::server!(@sync_loop server, $handler)
 		}
 	}};
 
-	// Sync: tcp: bind "addr", handle: $handler:expr
-	(tcp: bind $addr:expr, handle: $handler:expr) => {{
+	// Generic sync: protocol: bind "addr", handle: $handler:expr
+	($protocol:path: bind $addr:expr, handle: $handler:expr) => {{
 		#[cfg(feature = "std")]
 		{
-			let listener = std::net::TcpListener::bind($addr)?;
-			let server = $crate::transport::tcp::sync::TcpServer::from_listener(listener);
+			use $crate::transport::Protocol;
+			let (listener, _) = <$protocol as Protocol>::bind($addr).await?;
+			let server = $listener;
 			$crate::server!(@sync_loop server, $handler)
 		}
 	}};
 
-	// Sync: tcp: listener, policies: {...}, handle: closure
-	(tcp: $listener:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	// Generic sync: protocol: listener, policies: {...}, handle: closure
+	($protocol:path: $listener:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "std")]
 		{
-			let server = $crate::transport::tcp::sync::TcpServer::from_listener($listener);
+			let server = $listener;
 			$crate::server!(@sync_loop server, $handler, $($policy_name: $policy_value),*)
 		}
 	}};
 
-	// Sync: tcp: bind "addr", policies: {...}, handle: closure
-	(tcp: bind $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	// Generic sync: protocol: bind "addr", policies: {...}, handle: closure
+	($protocol:path: bind $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "std")]
 		{
-			let listener = std::net::TcpListener::bind($addr)?;
-			let server = $crate::transport::tcp::sync::TcpServer::from_listener(listener);
+			use $crate::transport::Protocol;
+			let (listener, _) = <$protocol as Protocol>::bind($addr).await?;
+			let server = $listener;
 			$crate::server!(@sync_loop server, $handler, $($policy_name: $policy_value),*)
 		}
 	}};
 
-	// Async: async tcp: listener, handle: closure
-	(async tcp: $listener:expr, handle: $handler:expr) => {{
+	// Async patterns - use protocol to handle the async keyword
+	(protocol $protocol:path: $listener:expr, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let server = $crate::transport::tcp::r#async::TcpServerAsync::from($listener);
+			let server = $listener;
 			tokio::spawn(async move {
 				$crate::server!(@async_loop server, $handler, None, None,)
 			})
 		}
 	}};
 
-	// Async: async tcp: bind "addr", handle: $handler:expr
-	(async tcp: bind $addr:expr, handle: $handler:expr) => {{
+	(protocol $protocol:path: bind $addr:expr, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let listener = $crate::transport::tcp::r#async::TokioListener::bind($addr).await?;
-			let server = $crate::transport::tcp::r#async::TcpServerAsync::from(listener);
+			use $crate::transport::Protocol;
+			let (listener, _) = <$protocol as Protocol>::bind($addr).await?;
+			let server = <$protocol>::from(listener);
 			tokio::spawn(async move {
 				$crate::server!(@async_loop server, $handler, None, None,)
 			})
 		}
 	}};
 
-	// Async: async tcp: listener, policies: {...}, handle: closure
-	(async tcp: $listener:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let server = $crate::transport::tcp::r#async::TcpServerAsync::from($listener);
+			let server = $listener;	
 			tokio::spawn(async move {
 				$crate::server!(@async_loop server, $handler, None, None, $($policy_name: $policy_value),*)
 			})
 		}
 	}};
 
-	// Async: async tcp: listener, channels: {...}, policies: {...}, handle: closure
-	(async tcp: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let server = $crate::transport::tcp::r#async::TcpServerAsync::from($listener);
+			let server = $listener;	
 			tokio::spawn(async move {
 				$crate::server!(@async_loop server, $handler, Some($error_tx), Some($ok_tx), $($policy_name: $policy_value),*)
 			})
 		}
 	}};
 
-	// Async: async tcp: bind "addr", policies: {...}, handle: closure
-	(async tcp: bind $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	(protocol $protocol:path: bind $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let listener = $crate::transport::tcp::r#async::TokioListener::bind($addr).await?;
-			let server = $crate::transport::tcp::r#async::TcpServerAsync::from(listener);
+			use $crate::transport::Protocol;
+			let (listener, _) = <$protocol as Protocol>::bind($addr).await?;
+			let server = <$protocol>::from(listener);
 			tokio::spawn(async move {
 				$crate::server!(@async_loop server, $handler, None, None, $($policy_name: $policy_value),*)
 			})
 		}
 	}};
+
+	// Public async entry points
+	(async $($rest:tt)*) => {
+		$crate::server!(protocol $($rest)*)
+	};
 }
