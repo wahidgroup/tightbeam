@@ -122,58 +122,39 @@ impl MetadataBuilder {
 		};
 
 		match self.version {
-			Version::V0 => {
-				// V0: Core fields only
-				Ok(Metadata {
-					id,
-					order,
-					compactness: compression,
-					integrity: None,
-					confidentiality: None,
-					priority: None,
-					lifetime: None,
-					previous_frame: None,
-					matrix: None,
-				})
-			}
-			Version::V1 => {
-				// V1: Core fields + encryption
-				let encryption = self
-					.confidentiality
-					.ok_or(BuildError::InvalidMetadata(MetadataError::MissingEncryption))?;
-
-				Ok(Metadata {
-					id,
-					order,
-					compactness: compression,
-					integrity: self.integrity,
-					confidentiality: Some(encryption),
-					priority: None,
-					lifetime: None,
-					previous_frame: None,
-					matrix: None,
-				})
-			}
-			Version::V2 => {
-				// V2: All fields
-				let encryption = self
-					.confidentiality
-					.ok_or(BuildError::InvalidMetadata(MetadataError::MissingEncryption))?;
-				let hash = self.integrity.ok_or(BuildError::InvalidMetadata(MetadataError::MissingHash))?;
-				let priority = self.priority.unwrap_or(MessagePriority::Normal);
-
-				Ok(Metadata {
-					id,
-					order,
-					compactness: compression,
-					integrity: Some(hash),
-					confidentiality: Some(encryption),
-					priority: Some(priority),
-					lifetime: self.lifetime,
-					previous_frame: self.previous_frame,
-					matrix,
-				})
-			}
+			Version::V0 => Ok(Metadata {
+				id,
+				order,
+				compactness: compression,
+				integrity: None,
+				confidentiality: None,
+				priority: None,
+				lifetime: None,
+				previous_frame: None,
+				matrix: None,
+			}),
+			Version::V1 => Ok(Metadata {
+				id,
+				order,
+				compactness: compression,
+				integrity: self.integrity,
+				confidentiality: self.confidentiality,
+				priority: None,
+				lifetime: None,
+				previous_frame: None,
+				matrix: None,
+			}),
+			Version::V2 => Ok(Metadata {
+				id,
+				order,
+				compactness: compression,
+				integrity: self.integrity,
+				confidentiality: self.confidentiality,
+				priority: self.priority,
+				lifetime: self.lifetime,
+				previous_frame: self.previous_frame,
+				matrix,
+			}),
 		}
 	}
 
@@ -310,22 +291,6 @@ mod tests {
 		));
 	}
 
-	#[test]
-	fn test_metadata_builder_v1_missing_encryption() {
-		let result = MetadataBuilder::from(Version::V1)
-			.with_id("test-id")
-			.with_order(1696521600u64)
-			.with_integrity_info(create_test_hash_info())
-			.with_nonrepudiation_info(create_test_signature_info())
-			.build();
-
-		assert!(result.is_err());
-		assert!(matches!(
-			result.unwrap_err(),
-			BuildError::InvalidMetadata(MetadataError::MissingEncryption)
-		));
-	}
-
 	mod errors {
 		use super::*;
 
@@ -350,86 +315,33 @@ mod tests {
 				},
 				ErrorTestCase {
 					name: "V1 missing id",
-					builder: || {
-						MetadataBuilder::from(Version::V1)
-							.with_order(1696521600)
-							.with_confidentiality_info(create_test_encryption_info())
-					},
+					builder: || MetadataBuilder::from(Version::V1).with_order(1696521600),
 					expected_error: MetadataError::MissingId,
 				},
 				ErrorTestCase {
 					name: "V1 missing order",
-					builder: || {
-						MetadataBuilder::from(Version::V1)
-							.with_id("test-id")
-							.with_confidentiality_info(create_test_encryption_info())
-					},
+					builder: || MetadataBuilder::from(Version::V1).with_id("test-id"),
 					expected_error: MetadataError::MissingTimestamp,
 				},
 				ErrorTestCase {
-					name: "V1 missing encryption",
-					builder: || {
-						MetadataBuilder::from(Version::V1)
-							.with_id("test-id")
-							.with_order(1696521600)
-							.with_integrity_info(create_test_hash_info())
-							.with_nonrepudiation_info(create_test_signature_info())
-					},
-					expected_error: MetadataError::MissingEncryption,
-				},
-				ErrorTestCase {
 					name: "V2 missing id",
-					builder: || {
-						MetadataBuilder::from(Version::V2)
-							.with_order(1696521600)
-							.with_integrity_info(create_test_hash_info())
-							.with_confidentiality_info(create_test_encryption_info())
-					},
+					builder: || MetadataBuilder::from(Version::V2).with_order(1696521600),
 					expected_error: MetadataError::MissingId,
 				},
 				ErrorTestCase {
 					name: "V2 missing order",
-					builder: || {
-						MetadataBuilder::from(Version::V2)
-							.with_id("test-id")
-							.with_integrity_info(create_test_hash_info())
-							.with_confidentiality_info(create_test_encryption_info())
-					},
+					builder: || MetadataBuilder::from(Version::V2).with_id("test-id"),
 					expected_error: MetadataError::MissingTimestamp,
-				},
-				ErrorTestCase {
-					name: "V2 missing hash",
-					builder: || {
-						MetadataBuilder::from(Version::V2)
-							.with_id("test-id")
-							.with_order(1696521600)
-							.with_confidentiality_info(create_test_encryption_info())
-					},
-					expected_error: MetadataError::MissingHash,
-				},
-				ErrorTestCase {
-					name: "V2 missing encryption",
-					builder: || {
-						MetadataBuilder::from(Version::V2)
-							.with_id("test-id")
-							.with_order(1696521600)
-							.with_integrity_info(create_test_hash_info())
-					},
-					expected_error: MetadataError::MissingEncryption,
 				},
 			];
 
 			for case in test_cases {
 				let result = (case.builder)().build();
-				assert!(result.is_err(), "Test case '{}' should have failed", case.name);
+				assert!(result.is_err());
 
 				match result.unwrap_err() {
 					BuildError::InvalidMetadata(err) => {
-						assert_eq!(
-							err, case.expected_error,
-							"Test case '{}' failed: expected {:?}, got {:?}",
-							case.name, case.expected_error, err
-						);
+						assert_eq!(err, case.expected_error);
 					}
 					other => panic!("Test case '{}' failed: expected InvalidMetadata, got {:?}", case.name, other),
 				}

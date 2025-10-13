@@ -1,3 +1,5 @@
+//! Flags utilize the Matrix to create Flatworld.
+
 use crate::matrix::{Matrix, MatrixLike};
 
 /// A fixed-size array of flags, where each flag is a `u8`

@@ -33,7 +33,7 @@ struct_variant_width = 80 # Struct field initialization
 # even though the hard limit is 120 chars. This improves readability, especially
 # for documentation comments (///). Parameter and return value documentation can
 # be slightly longer when needed for clarity.
-wrap_comments = true
+# wrap_comments = true // Nightly only
 
 # Method chain formatting
 # ----------------------
@@ -44,4 +44,4 @@ chain_width = 80
 # ---------------------------------
 # Force multi-line formatting for if-else and other control flow expressions
 single_line_if_else_max_width = 0
-force_multiline_blocks = true
+# force_multiline_blocks = true // Nightly only

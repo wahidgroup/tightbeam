@@ -157,6 +157,11 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Missing encryption info"))]
 	MissingEncryptionInfo,
 
+	/// Missing Integrity Info
+	#[cfg(feature = "digest")]
+	#[cfg_attr(feature = "derive", error("Missing integrity info"))]
+	MissingIntegrityInfo,
+
 	/// Missing Compression Info
 	#[cfg(feature = "compress")]
 	#[cfg_attr(feature = "derive", error("Missing compression info"))]
@@ -195,6 +200,8 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::SignatureError(err) => write!(f, "Signature verification or generation error: {err}"),
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
+			#[cfg(feature = "digest")]
+			TightBeamError::MissingIntegrityInfo => write!(f, "Missing integrity info"),
 			#[cfg(feature = "aead")]
 			TightBeamError::MissingEncryptionInfo => write!(f, "Missing encryption info"),
 			#[cfg(feature = "signature")]
@@ -204,13 +211,11 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "compress")]
 			TightBeamError::MissingCompressionInfo => write!(f, "Missing compression info"),
 			#[cfg(feature = "compress")]
-			TightBeamError::CompressionError(err) => {
-				match err {
-					#[cfg(feature = "zstd")]
-					CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
-					CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
-				}
-			}
+			TightBeamError::CompressionError(err) => match err {
+				#[cfg(feature = "zstd")]
+				CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
+				CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
+			},
 			TightBeamError::Sequence(errors) => {
 				write!(f, "Multiple errors: ")?;
 				for (i, error) in errors.iter().enumerate() {

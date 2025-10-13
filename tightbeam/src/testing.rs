@@ -56,6 +56,13 @@ pub struct ConfidentialNonrepudiableNote {
 	pub content: String,
 }
 
+#[cfg(feature = "derive")]
+#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+#[beam(message_integrity, frame_integrity)]
+pub struct IntegralNote {
+	pub content: String,
+}
+
 #[cfg(not(feature = "derive"))]
 #[derive(Clone, Debug, PartialEq, Sequence)]
 pub struct ConfidentialNonrepudiableNote {
@@ -68,6 +75,17 @@ impl crate::Message for ConfidentialNonrepudiableNote {
 	const MUST_BE_NON_REPUDIABLE: bool = true;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
+	const MIN_VERSION: crate::Version = crate::Version::V0;
+}
+
+#[cfg(not(feature = "derive"))]
+impl crate::Message for IntegralNote {
+	const MUST_BE_NON_REPUDIABLE: bool = false;
+	const MUST_BE_CONFIDENTIAL: bool = false;
+	const MUST_BE_COMPRESSED: bool = false;
+	const MUST_BE_PRIORITIZED: bool = false;
+	const MUST_HAVE_MESSAGE_INTEGRITY: bool = true;
+	const MUST_HAVE_FRAME_INTEGRITY: bool = true;
 	const MIN_VERSION: crate::Version = crate::Version::V0;
 }
 

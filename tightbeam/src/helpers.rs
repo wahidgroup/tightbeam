@@ -255,83 +255,83 @@ macro_rules! decompress {
 #[cfg(feature = "std")]
 #[macro_export]
 macro_rules! rwlock {
-    // Single declaration with default
-    ($name:ident: $ty:ty = $default:expr) => {
-        const _: () = {
-            static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
+	// Single declaration with default
+	($name:ident: $ty:ty = $default:expr) => {
+		const _: () = {
+			static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
 
-            #[allow(non_snake_case)]
-            pub(crate) fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
-                CELL.get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
-                    .clone()
-            }
-        };
-    };
+			#[allow(non_snake_case)]
+			pub(crate) fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
+				CELL.get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
+					.clone()
+			}
+		};
+	};
 
-    // Single declaration without default (uses Default trait)
-    ($name:ident: $ty:ty) => {
-        const _: () = {
-            static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
+	// Single declaration without default (uses Default trait)
+	($name:ident: $ty:ty) => {
+		const _: () = {
+			static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
 
-            #[allow(non_snake_case)]
-            pub(crate) fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
-                CELL.get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Default::default())))
-                    .clone()
-            }
-        };
-    };
+			#[allow(non_snake_case)]
+			pub(crate) fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
+				CELL.get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Default::default())))
+					.clone()
+			}
+		};
+	};
 
-    // Multiple declarations
-    ($($name:ident: $ty:ty $(= $default:expr)?),+ $(,)?) => {
-        $(
-            $crate::rwlock!($name: $ty $(= $default)?);
-        )+
-    };
+	// Multiple declarations
+	($($name:ident: $ty:ty $(= $default:expr)?),+ $(,)?) => {
+		$(
+			$crate::rwlock!($name: $ty $(= $default)?);
+		)+
+	};
 }
 
 #[cfg(feature = "std")]
 #[macro_export]
 macro_rules! mutex {
-    // Single declaration with default
-    ($name:ident: $ty:ty = $default:expr) => {
-        const _: () = {
-            static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
+	// Single declaration with default
+	($name:ident: $ty:ty = $default:expr) => {
+		const _: () = {
+			static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
 
-            #[allow(non_snake_case)]
-            pub(crate) fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
-                CELL.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new($default)))
-                    .clone()
-            }
-        };
-    };
+			#[allow(non_snake_case)]
+			pub(crate) fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
+				CELL.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new($default)))
+					.clone()
+			}
+		};
+	};
 
-    // Single declaration without default (uses Default trait)
-    ($name:ident: $ty:ty) => {
-        const _: () = {
-            static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
+	// Single declaration without default (uses Default trait)
+	($name:ident: $ty:ty) => {
+		const _: () = {
+			static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
 
-            #[allow(non_snake_case)]
-            pub(crate) fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
-                CELL.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Default::default())))
-                    .clone()
-            }
-        };
-    };
+			#[allow(non_snake_case)]
+			pub(crate) fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
+				CELL.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Default::default())))
+					.clone()
+			}
+		};
+	};
 
-    // Multiple declarations
-    ($($name:ident: $ty:ty $(= $default:expr)?),+ $(,)?) => {
-        $(
-            $crate::mutex!($name: $ty $(= $default)?);
-        )+
-    };
+	// Multiple declarations
+	($($name:ident: $ty:ty $(= $default:expr)?),+ $(,)?) => {
+		$(
+			$crate::mutex!($name: $ty $(= $default)?);
+		)+
+	};
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-
 	#[cfg(not(feature = "std"))]
 	use alloc::string::ToString;
+
+	use super::*;
 
 	#[cfg(feature = "signature")]
 	mod sign {
@@ -382,67 +382,6 @@ mod tests {
 			assert!(notarized.nonrepudiation.is_some());
 
 			Ok(())
-		}
-	}
-
-	#[cfg(all(
-		feature = "aead",
-		feature = "aes-gcm",
-		feature = "signature",
-		feature = "secp256k1"
-	))]
-	mod validation {
-		use crate::compose;
-		use crate::crypto::aead::Aes256GcmOid;
-		use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
-		use crate::testing::{
-			create_test_cipher_key, create_test_signing_key, create_v0_tightbeam, ConfidentialNonrepudiableNote,
-		};
-		use crate::Version;
-
-		#[test]
-		fn test_confidential_nonrepudiable() {
-			// Standard note should be fine
-			let msg = create_v0_tightbeam(None, None);
-			assert_eq!(msg.version, Version::V0);
-			assert!(msg.metadata.confidentiality.is_none());
-			assert!(msg.nonrepudiation.is_none());
-
-			let msg = ConfidentialNonrepudiableNote { content: "secret".to_string() };
-
-			// Build via macro without cipher
-			let err = compose! {
-				V1: id: "conf-no-enc",
-					order: 0,
-					message: msg.clone()
-			}
-			.expect_err("expected missing encryption error");
-			assert!(matches!(err, tightbeam::TightBeamError::MissingEncryptionInfo));
-
-			// Provide cipher: should fail without signer
-			let (_, cipher) = create_test_cipher_key();
-			let err = compose! {
-				V1: id: "conf-with-enc",
-					order: 0,
-					message: msg,
-					confidentiality<Aes256GcmOid, _>: &cipher
-			}
-			.expect_err("expected missing signature error");
-			assert!(matches!(err, tightbeam::TightBeamError::MissingSignatureInfo));
-
-			// Provide signer: should succeed
-			let signing_key = create_test_signing_key();
-			let tb = compose! {
-				V1: id: "conf-with-sig",
-					order: 0,
-					message: ConfidentialNonrepudiableNote { content: "another secret".to_string() },
-					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key
-			}
-			.expect("signing provided");
-			assert_eq!(tb.version, Version::V1);
-			assert!(tb.metadata.confidentiality.is_some());
-			assert!(tb.nonrepudiation.is_some());
 		}
 	}
 
@@ -520,5 +459,190 @@ mod tests {
 		assert_eq!(encryption_info.parameters, &nonce);
 		// Verify correct length
 		assert_eq!(encryption_info.parameters.len(), 12);
+	}
+
+	mod validation {
+		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey};
+		use crate::testing::{create_test_cipher_key, create_test_signing_key};
+		use crate::Version;
+
+		#[test]
+		fn test_message_traits() {
+			let (_, cipher) = create_test_cipher_key();
+			let signing_key = create_test_signing_key();
+
+			// Helper to compose frames based on requirements
+			#[allow(clippy::too_many_arguments)]
+			fn compose_frame(
+				test_name: &str,
+				message: impl crate::Message,
+				cipher: &Aes256Gcm,
+				signing_key: &Secp256k1SigningKey,
+				confidential: bool,
+				nonrepudiable: bool,
+				message_integrity: bool,
+				frame_integrity: bool,
+			) -> crate::Result<crate::Frame> {
+				match (confidential, nonrepudiable, message_integrity, frame_integrity) {
+					(true, true, true, true) => crate::compose! {
+						V2: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key,
+						message_integrity: type Sha3_256,
+						frame_integrity: type Sha3_256
+					},
+					(true, false, true, _) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						message_integrity: type Sha3_256
+					},
+					(true, false, false, _) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher
+					},
+					(false, true, true, _) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key,
+						message_integrity: type Sha3_256
+					},
+					(false, true, false, _) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key
+					},
+					(false, false, true, true) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						message_integrity: type Sha3_256,
+						frame_integrity: type Sha3_256
+					},
+					(false, false, true, false) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						message_integrity: type Sha3_256
+					},
+					(false, false, false, true) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						frame_integrity: type Sha3_256
+					},
+					(false, false, false, false) => crate::compose! {
+						V0: id: test_name, order: 1u64, message: message.clone()
+					},
+					(true, true, true, false) => crate::compose! {
+						V2: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key,
+						message_integrity: type Sha3_256
+					},
+					(true, true, false, true) => crate::compose! {
+						V2: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key,
+						frame_integrity: type Sha3_256
+					},
+					(true, true, false, false) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key
+					},
+				}
+			}
+
+			// Test cases: (name, attrs, confidential, nonrepudiable, message_integrity, frame_integrity, min_version)
+			let test_cases = [
+				("BasicMessage", "", false, false, false, false, Version::V0),
+				(
+					"ConfidentialMessage",
+					"confidential, min_version = \"V1\"",
+					true,
+					false,
+					false,
+					false,
+					Version::V1,
+				),
+				(
+					"NonrepudiableMessage",
+					"nonrepudiable, min_version = \"V1\"",
+					false,
+					true,
+					false,
+					false,
+					Version::V1,
+				),
+				(
+					"FullSecurityMessage",
+					"confidential, nonrepudiable, message_integrity, frame_integrity, min_version = \"V2\"",
+					true,
+					true,
+					true,
+					true,
+					Version::V2,
+				),
+			];
+
+			for (name, _attrs, confidential, nonrepudiable, message_integrity, frame_integrity, min_version) in
+				test_cases
+			{
+				// Create test message with constants determined at compile time
+				macro_rules! test_message_case {
+					($conf:expr, $nonrep:expr, $msg_int:expr, $frame_int:expr, $min_ver:ident) => {{
+						use $crate::core::Message;
+						#[derive(Clone, Debug, PartialEq, der::Sequence)]
+						struct TestMsg {
+							content: String,
+						}
+						impl crate::Message for TestMsg {
+							const MUST_BE_CONFIDENTIAL: bool = $conf;
+							const MUST_BE_NON_REPUDIABLE: bool = $nonrep;
+							const MUST_BE_COMPRESSED: bool = false;
+							const MUST_BE_PRIORITIZED: bool = false;
+							const MUST_HAVE_MESSAGE_INTEGRITY: bool = $msg_int;
+							const MUST_HAVE_FRAME_INTEGRITY: bool = $frame_int;
+							const MIN_VERSION: Version = Version::$min_ver;
+						}
+
+						// Test 1: Verify constants
+						let message = TestMsg { content: format!("test {}", name) };
+						assert_eq!(TestMsg::MUST_BE_CONFIDENTIAL, confidential);
+						assert_eq!(TestMsg::MUST_BE_NON_REPUDIABLE, nonrepudiable);
+						assert_eq!(TestMsg::MUST_HAVE_MESSAGE_INTEGRITY, message_integrity);
+						assert_eq!(TestMsg::MUST_HAVE_FRAME_INTEGRITY, frame_integrity);
+						assert_eq!(TestMsg::MIN_VERSION, min_version);
+
+						// Test 2: Verify frame composition
+						let result = compose_frame(
+							name,
+							message.clone(),
+							&cipher,
+							&signing_key,
+							confidential,
+							nonrepudiable,
+							message_integrity,
+							frame_integrity,
+						);
+						assert!(result.is_ok());
+
+						let frame = result.unwrap();
+						assert_eq!(frame.metadata.confidentiality.is_some(), confidential);
+						assert_eq!(frame.nonrepudiation.is_some(), nonrepudiable);
+
+						// Test 3: Verify version enforcement
+						if min_version > Version::V0 {
+							let result_v0 = crate::compose! {
+								V0: id: name, order: 1u64, message: message.clone()
+							};
+							assert!(result_v0.is_err());
+						}
+					}};
+				}
+
+				match (confidential, nonrepudiable, message_integrity, frame_integrity, min_version) {
+					(false, false, false, false, Version::V0) => test_message_case!(false, false, false, false, V0),
+					(true, false, false, false, Version::V1) => test_message_case!(true, false, false, false, V1),
+					(false, true, false, false, Version::V1) => test_message_case!(false, true, false, false, V1),
+					(true, true, true, true, Version::V2) => test_message_case!(true, true, true, true, V2),
+					_ => panic!("Unhandled test case combination"),
+				}
+			}
+		}
 	}
 }

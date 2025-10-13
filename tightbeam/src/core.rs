@@ -21,6 +21,8 @@ pub trait Message:
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
+	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
 	// TODO MUST_BE_ORDERED: bool = - with_genesis<hash>
 	const MIN_VERSION: Version = Version::V0;
 }

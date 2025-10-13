@@ -173,29 +173,33 @@ The `#[derive(Beamable)]` macro automatically implements the `Message` trait:
 ```rust
 // This derive macro...
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[beam(nonrepudiable, confidential, min_version = "V1")]
+#[beam(min_version = "V1", nonrepudiable, confidential)]
 struct PaymentInstruction { /* fields */ }
 
 // ...expands to:
 impl Message for PaymentInstruction {
+    const MIN_VERSION: Version = Version::V1;
     const MUST_BE_NON_REPUDIABLE: bool = true;
     const MUST_BE_CONFIDENTIAL: bool = true;
+
     const MUST_BE_COMPRESSED: bool = false;
     const MUST_BE_PRIORITIZED: bool = false;
-    const MIN_VERSION: Version = Version::V1;
+    const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+    const MUST_HAVE_FRAME_INTEGRITY: bool = false;
 }
 ```
 
 **Supported attributes:**
+- `#[beam(message_integrity)]` - Sets `MUST_HAVE_MESSAGE_INTEGRITY = true`
+- `#[beam(frame_integrity)]` - Sets `MUST_HAVE_FRAME_INTEGRITY = true`
 - `#[beam(nonrepudiable)]` - Sets `MUST_BE_NON_REPUDIABLE = true`
 - `#[beam(confidential)]` - Sets `MUST_BE_CONFIDENTIAL = true`
 - `#[beam(compressed)]` - Sets `MUST_BE_COMPRESSED = true`
 - `#[beam(prioritized)]` - Sets `MUST_BE_PRIORITIZED = true`
 - `#[beam(min_version = "V1")]` - Sets minimum protocol version
 - WIP (UNSTABLE)
-    - `#[beam(profile = 0)]`
-    - `#[beam(profile = 1)]`
-    - `#[beam(profile = 2)]`
+    - `#[beam(profile = 1)]` - Added but unsafe
+    - `#[beam(profile = 2)]` - Added but unsafe
     - `#[beam(profile = 3)]`
 
 #### Example Message Types
@@ -617,49 +621,50 @@ Implementations MUST enforce message-level security requirements through:
 #### Example Implementation Pattern
 ```rust
 impl<T: Message> FrameBuilder<T> {
-    fn validate(&self) -> Result<()> {
-        // Check minimum version requirement
-        if self.version < T::MIN_VERSION {
-            return Err(TightBeamError::UnsupportedVersion(ExpectError::from((
-                self.version,
-                T::MIN_VERSION,
-            ))));
-        }
+	fn validate(&self) -> Result<()> {
+		// Check minimum version requirement
+		if self.version < T::MIN_VERSION {
+			return Err(TightBeamError::UnsupportedVersion(ExpectError::from((
+				self.version,
+				T::MIN_VERSION,
+			))));
+		}
 
-        // Check if encryption is set when required
-        #[cfg(feature = "aead")]
-        {
-            let has_encryption = self.encryptor.is_some();
-            if T::MUST_BE_CONFIDENTIAL && !has_encryption {
-                return Err(TightBeamError::MissingEncryptionInfo);
-            }
-        }
+		// Check if encryption is set when required
+		let has_encryption = self.encryptor.is_some();
+		if T::MUST_BE_CONFIDENTIAL && !has_encryption {
+			return Err(TightBeamError::MissingEncryptionInfo);
+		}
 
-        // Check if signature is set when required
-        #[cfg(feature = "signature")]
-        {
-            let has_signer = self.signer.is_some();
-            if T::MUST_BE_NON_REPUDIABLE && !has_signer {
-                return Err(TightBeamError::MissingSignatureInfo);
-            }
-        }
+		// Check if signature is set when required
+		let has_signer = self.signer.is_some();
+		if T::MUST_BE_NON_REPUDIABLE && !has_signer {
+			return Err(TightBeamError::MissingSignatureInfo);
+		}
 
-        // Check if compression is set when required
-        #[cfg(feature = "compress")]
-        {
-            let has_compression = self.compressor.is_some();
-            if T::MUST_BE_COMPRESSED && !has_compression {
-                return Err(TightBeamError::MissingCompressionInfo);
-            }
-        }
+		// Check if compression is set when required
+		let has_compression = self.compressor.is_some();
+		if T::MUST_BE_COMPRESSED && !has_compression {
+			return Err(TightBeamError::MissingCompressionInfo);
+		}
 
-        // Check if priority is set when required
-        if T::MUST_BE_PRIORITIZED && !self.metadata_builder.has_priority() {
-            return Err(TightBeamError::MissingPriority);
-        }
+		let has_message_integrity = self.metadata_builder.has_hash();
+		if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
+			return Err(TightBeamError::MissingIntegrityInfo);
+		}
 
-        Ok(())
-    }
+		let has_frame_integrity = self.witness.is_some();
+		if T::MUST_HAVE_FRAME_INTEGRITY && !has_frame_integrity {
+			return Err(TightBeamError::MissingIntegrityInfo);
+		}
+
+		// Check if priority is set when required
+		if T::MUST_BE_PRIORITIZED && !self.metadata_builder.has_priority() {
+			return Err(TightBeamError::MissingPriority);
+		}
+
+		Ok(())
+	}
 }
 ```
 

@@ -112,7 +112,7 @@ signature = [
 	"dep:signature",
 	"x509-cert?/signature",
 ]
-digest = ["crypto", "dep:digest"]
+digest = ["crypto", "dep:digest", "tightbeam-derive?/digest"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
 
 ## Security features

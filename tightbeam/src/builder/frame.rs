@@ -31,15 +31,10 @@ pub struct FrameBuilder<T: Message> {
 	message: Option<T>,
 	metadata_builder: MetadataBuilder,
 	errors: Vec<TightBeamError>,
-	#[cfg(feature = "compress")]
 	compressor: Option<Compressor>,
-	#[cfg(feature = "aead")]
 	encryptor: Option<Encryptor>,
-	#[cfg(feature = "aead")]
 	rng: Option<Box<dyn rand_core::CryptoRngCore>>,
-	#[cfg(feature = "digest")]
 	witness: Option<Digestor>,
-	#[cfg(feature = "signature")]
 	signer: Option<Signatory>,
 }
 
@@ -50,15 +45,10 @@ impl<T: Message> From<Version> for FrameBuilder<T> {
 			message: None,
 			metadata_builder: MetadataBuilder::from(version),
 			errors: Vec::new(),
-			#[cfg(feature = "compress")]
 			compressor: None,
-			#[cfg(feature = "aead")]
 			encryptor: None,
-			#[cfg(feature = "aead")]
 			rng: None,
-			#[cfg(feature = "digest")]
 			witness: None,
-			#[cfg(feature = "signature")]
 			signer: None,
 		}
 	}
@@ -250,30 +240,31 @@ impl<T: Message> FrameBuilder<T> {
 		}
 
 		// Check if encryption is set when required
-		#[cfg(feature = "aead")]
-		{
-			let has_encryption = self.encryptor.is_some();
-			if T::MUST_BE_CONFIDENTIAL && !has_encryption {
-				return Err(TightBeamError::MissingEncryptionInfo);
-			}
+		let has_encryption = self.encryptor.is_some();
+		if T::MUST_BE_CONFIDENTIAL && !has_encryption {
+			return Err(TightBeamError::MissingEncryptionInfo);
 		}
 
 		// Check if signature is set when required
-		#[cfg(feature = "signature")]
-		{
-			let has_signer = self.signer.is_some();
-			if T::MUST_BE_NON_REPUDIABLE && !has_signer {
-				return Err(TightBeamError::MissingSignatureInfo);
-			}
+		let has_signer = self.signer.is_some();
+		if T::MUST_BE_NON_REPUDIABLE && !has_signer {
+			return Err(TightBeamError::MissingSignatureInfo);
 		}
 
 		// Check if compression is set when required
-		#[cfg(feature = "compress")]
-		{
-			let has_compression = self.compressor.is_some();
-			if T::MUST_BE_COMPRESSED && !has_compression {
-				return Err(TightBeamError::MissingCompressionInfo);
-			}
+		let has_compression = self.compressor.is_some();
+		if T::MUST_BE_COMPRESSED && !has_compression {
+			return Err(TightBeamError::MissingCompressionInfo);
+		}
+
+		let has_message_integrity = self.metadata_builder.has_hash();
+		if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
+			return Err(TightBeamError::MissingIntegrityInfo);
+		}
+
+		let has_frame_integrity = self.witness.is_some();
+		if T::MUST_HAVE_FRAME_INTEGRITY && !has_frame_integrity {
+			return Err(TightBeamError::MissingIntegrityInfo);
 		}
 
 		// Check if priority is set when required

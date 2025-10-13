@@ -9,7 +9,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
-use syn::{parse_macro_input, Attribute, DeriveInput, Ident, Meta, Token};
+use syn::{parse_macro_input, Attribute, DeriveInput, Meta, Token};
 
 fn has_flag(attrs: &[Attribute], name: &str) -> bool {
 	for attr in attrs {
@@ -17,12 +17,14 @@ fn has_flag(attrs: &[Attribute], name: &str) -> bool {
 			continue;
 		}
 		if let Meta::List(list) = &attr.meta {
-			// Parse the inner tokens as a comma‑separated list of identifiers.
-			let parser = Punctuated::<Ident, Token![,]>::parse_terminated;
-			if let Ok(idents) = parser.parse2(list.tokens.clone()) {
-				for ident in idents {
-					if ident == name {
-						return true;
+			// Allow mixing identifiers and name-value pairs in #[beam(...)]
+			let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+			if let Ok(metas) = parser.parse2(list.tokens.clone()) {
+				for meta in metas {
+					if let Meta::Path(path) = meta {
+						if path.is_ident(name) {
+							return true;
+						}
 					}
 				}
 			}
@@ -109,6 +111,8 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	let nonrep = has_flag(&input.attrs, "nonrepudiable");
 	let compressed = has_flag(&input.attrs, "compressed");
 	let prioritized = has_flag(&input.attrs, "prioritized");
+	let message_integrity = has_flag(&input.attrs, "message_integrity");
+	let frame_integrity = has_flag(&input.attrs, "frame_integrity");
 	let min_version = get_version_value(&input.attrs);
 	let profile = get_profile_value(&input.attrs);
 
@@ -124,6 +128,8 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	let final_confidential = profile_confidential || confidential;
 	let final_nonrep = profile_nonrep || nonrep;
 	let final_min_version = profile_min_version.or(min_version);
+	let final_message_integrity = message_integrity;
+	let final_frame_integrity = frame_integrity;
 
 	let mut feature_checks = Vec::new();
 
@@ -157,6 +163,16 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		});
 	}
 
+	if (final_message_integrity || final_frame_integrity) && !cfg!(feature = "digest") {
+		feature_checks.push(quote! {
+			compile_error!(concat!(
+				"Message type `", stringify!(#name), "` is marked as requiring message integrity ",
+				"but the `digest` feature is not enabled. ",
+				"Enable the feature in Cargo.toml: features = [\"digest\"]"
+			));
+		});
+	}
+
 	let min_version_value = if let Some(version) = final_min_version {
 		quote! { ::tightbeam::Version::#version }
 	} else {
@@ -171,6 +187,8 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		impl ::tightbeam::Message for #name {
 			const MUST_BE_CONFIDENTIAL: bool = #final_confidential;
 			const MUST_BE_NON_REPUDIABLE: bool = #final_nonrep;
+			const MUST_HAVE_MESSAGE_INTEGRITY: bool = #final_message_integrity;
+			const MUST_HAVE_FRAME_INTEGRITY: bool = #final_frame_integrity;
 			const MUST_BE_COMPRESSED: bool = #compressed;
 			const MUST_BE_PRIORITIZED: bool = #prioritized;
 			const MIN_VERSION: ::tightbeam::Version = #min_version_value;
@@ -250,7 +268,7 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 			syn::Fields::Unnamed(fields) => {
 				let field_count = fields.unnamed.len();
 				let field_bindings: Vec<_> = (0..field_count)
-					.map(|i| syn::Ident::new(&format!("f{}", i), variant_name.span()))
+					.map(|i| syn::Ident::new(&format!("f{i}"), variant_name.span()))
 					.collect();
 
 				if let Some(msg) = error_msg {

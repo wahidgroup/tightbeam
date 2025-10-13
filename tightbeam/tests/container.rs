@@ -63,6 +63,12 @@ test_container! {
 		// Send and expect acceptance + echo response
 		let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
 			assert_eq!(response.metadata.id, message.metadata.id);
+			// Ensure we received the message on the server side
+			assert_recv!(rx, message, 2, 1);
+			assert_recv!(ok_rx, message, 2, 1);
+			// Ensure no rejections
+			assert_channels_quiet!(reject_rx);
+
 			tightbeam::decode::<ResponseMessage, _>(&response.message).ok()
 		} else {
 			panic!("Expected a response from the service");
@@ -74,10 +80,6 @@ test_container! {
 			},
 			None => panic!("Expected a PONG")
 		};
-
-		assert_recv!(rx, message, 2, 1);
-		assert_recv!(ok_rx, message, 2, 1);
-		assert_channels_quiet!(reject_rx);
 
 		Ok(())
 	}
