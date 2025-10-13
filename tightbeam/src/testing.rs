@@ -51,7 +51,7 @@ impl crate::Message for ConfidentialNote {
 
 #[cfg(feature = "derive")]
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
-#[beam(confidential, nonrepudiable)]
+#[beam(profile = 1)]
 pub struct ConfidentialNonrepudiableNote {
 	pub content: String,
 }

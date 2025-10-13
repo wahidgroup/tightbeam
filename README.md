@@ -12,7 +12,7 @@
 
 ## Abstract
 
-tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures. This specification defines the protocol's core properties: structure, frame versioning, idempotence, ordering, compactness, integrity, confidentiality, priority, lifetime, state management, matrix control, and non-repudiation.
+tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures. This specification defines the protocol's core properties: structure, frame versioning, idempotence, ordering, compactness, integrity, confidentiality, priority, lifetime, state management, matrix environment, and non-repudiation.
 
 ## Table of Contents
 
@@ -31,12 +31,11 @@ tightbeam is a Layer-5 framework implementing high-fidelity information theory t
 tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T.
 
 ### 1.1 Information Fidelity Constraint
+Question: How well does information maintain fidelity across time?
 
- The foundational mathematical principle underlying tightbeam is the information fidelity constraint:
+The foundational mathematical principle underlying tightbeam is the information fidelity constraint:
 
  **I(t) ∈ (0,1) ∀t ∈ T_t**
-
-Intuition: how well does information maintain fidelity over time?
 
  Where:
 - **I(t)**: Information state of a Frame at time t
@@ -51,12 +50,7 @@ This constraint reflects information-theoretic limits:
 2. **Practical Implications**: tightbeam’s design ensures frames always carry bounded information content while acknowledging that no communication system achieves perfect fidelity
 3. **Protocol Guarantee**: The constraint provides a mathematical basis for frame validation and quality assurance
 
-The I(t) constraint informs several protocol design decisions:
-- ASN.1 DER encoding for maximum structural fidelity
-- Versioned metadata allowing graceful capability evolution
-- Optional integrity and confidentiality fields preserving information quality
-- Temporal ordering ensuring coherent information flow over time
-- Optional cryptographic signing to ensure non-repudiation
+The I(t) constraint informs all protocol design decisions.
 
 ### 1.2 Requirements Language
 
@@ -64,12 +58,13 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ## 2. Terminology
 The following project terms MUST be used consistently:
-- tightbeam: The project name. Lowercase as tightbeam.
-- Frame: A versioned snapshot (state) at time t.
-- Message: A typed application payload serialized within a Frame.
-- Metadata: Per-message metadata as defined by the protocol.
-- Version: The protocol version identifier.
+- [tightbeam](https://docs.rs/tightbeam-rs/latest): The project name. Lowercase as tightbeam.
+- [Frame](#42-frame-structure): A versioned snapshot (state) at time t.
+- [Message](#54-message-structure): A typed application payload serialized within a Frame.
+- [Metadata](#43-metadata-specification): Per-message metadata as defined by the protocol.
+- [Version](#41-version-evolution): The protocol version identifier.
 - [TIP](tips/tip-0001.md): tightbeam Improvement Proposal.
+- [Information Theory Properties](#31-information-theory-properties)
 
 Additional terms introduced by proposals MUST be defined in their respective TIPs.
 
@@ -138,7 +133,7 @@ tightbeam defines standardized security profiles that reference established cryp
 
 ### 4.1.2 Message-Level Security Requirements
 
-tightbeam supports compile-time security enforcement at the message type level through the `Message` trait:
+tightbeam supports run-time security profile enforcement at the message type level through the `Message` trait and compile-time security enforcement at the message composition level:
 
 ```rust
 pub trait Message: /* trait bounds */ {
@@ -152,17 +147,23 @@ pub trait Message: /* trait bounds */ {
 
 #### Security Requirement Semantics
 
-- **`MUST_BE_NON_REPUDIABLE`**: When `true`, the message MUST include a digital signature in the Frame's `nonrepudiation` field
-- **`MUST_BE_CONFIDENTIAL`**: When `true`, the message MUST be encrypted using the metadata's `confidentiality` field
-- **`MUST_BE_COMPRESSED`**: When `true`, the message MUST be compressed using a non-none `compactness` algorithm
-- **`MUST_BE_PRIORITIZED`**: When `true`, the message MUST include a `priority` field in V2+ metadata
-- **`MIN_VERSION`**: Specifies the minimum protocol version required for this message type
+- When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
+- When a message type specifies `MUST_BE_CONFIDENTIAL = true`, the Frame's metadata MUST include a `confidentiality` field
+- When a message type specifies `MUST_BE_COMPRESSED = true`, the Frame's metadata `compactness` field MUST NOT be `none`
+- When a message type specifies `MUST_BE_PRIORITIZED = true`, the Frame's metadata MUST include a `priority` field (V2+ only)
+- The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
+
+#### Profile-Message Type Mapping
+
+- Security profiles MAY specify approved message types
+- Message types with security requirements SHOULD be used with compatible security profiles
+- Profile 0 (Testing) MAY use message types with security requirements for development purposes only
 
 #### Implementation Enforcement
 
 These requirements are enforced at:
 - **Compile Time**: Type system prevents composition of messages that don't meet requirements
-- **Runtime Validation**: Frame validation ensures required fields are present
+- **Runtime Validation**: Frame validation ensures expected frame shape to meet requirements
 - **Profile Compliance**: Security profiles can reference message types with specific requirements
 
 #### Derive Macro Usage
@@ -191,6 +192,11 @@ impl Message for PaymentInstruction {
 - `#[beam(compressed)]` - Sets `MUST_BE_COMPRESSED = true`
 - `#[beam(prioritized)]` - Sets `MUST_BE_PRIORITIZED = true`
 - `#[beam(min_version = "V1")]` - Sets minimum protocol version
+- WIP (UNSTABLE)
+    - `#[beam(profile = 0)]`
+    - `#[beam(profile = 1)]`
+    - `#[beam(profile = 2)]`
+    - `#[beam(profile = 3)]`
 
 #### Example Message Types
 
@@ -241,9 +247,9 @@ All versions MUST include:
 - Identifier
 - Frame Version
 - Order
+- Message payload (bytecode)
 
 All versions MAY include:
-- Message payload (bytecode)
 - Frame integrity (digest of complete structure)
 - Non-repudiation (cryptographic signature)
 
@@ -429,7 +435,7 @@ AlgorithmIdentifier ::= SEQUENCE {
 
 ### 5.6 Encoding Rules
 
-- **Encoding**: Distinguished Encoding Rules (DER) as specified in ITU-T X.690
+- **Encoding**: Distinguished Encoding Rules (DER) as specified in [ITU-T X.690](https://www.itu.int/rec/T-REC-X.690)
 - **Byte Order**: Network byte order (big-endian) for multi-byte integers
 - **String Encoding**: UTF-8 for textual content, raw bytes for binary data
 - **Optional Fields**: Absent optional fields MUST NOT be encoded (DER requirement)
@@ -461,18 +467,6 @@ AlgorithmIdentifier ::= SEQUENCE {
 - When `compactness` is not `none`, the `message` field MUST contain compressed data
 - `originalSize` in compression info MUST match the uncompressed message size
 - Compression level MUST be within algorithm-specific valid ranges
-
-#### Message-Level Security Constraints
-- When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
-- When a message type specifies `MUST_BE_CONFIDENTIAL = true`, the Frame's metadata MUST include a `confidentiality` field
-- When a message type specifies `MUST_BE_COMPRESSED = true`, the Frame's metadata `compactness` field MUST NOT be `none`
-- When a message type specifies `MUST_BE_PRIORITIZED = true`, the Frame's metadata MUST include a `priority` field (V2+ only)
-- The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
-
-#### Profile-Message Type Mapping
-- Security profiles MAY specify approved message types
-- Message types with security requirements SHOULD be used with compatible security profiles
-- Profile 0 (Testing) MAY use message types with security requirements for development purposes only
 
 #### Matrix Specification
 
@@ -755,7 +749,7 @@ tightbeam follows established cryptographic standards and maintains algorithm ag
 
 ## 8. Examples
 
-### 8.1 Basic Container Test
+### 8.1 Basic Test Container
 ```rust
 test_container! {
     name: container_gates_basic,
@@ -825,6 +819,12 @@ test_container! {
 }
 ```
 
+#### Testing Framework
+- Asynchronous/synchronous containerized end-to-end testing
+- Client/server quantum tunneling via MPSC channels
+
+**See:** [Container Integration Test](tightbeam/tests/container.rs)
+
 ## 9. References
 
 ### 9.1 Normative References
@@ -863,12 +863,6 @@ test_container! {
 
 **See:** [Transport Integration Tests](tightbeam/tests/transport.rs)
 
-#### Testing Framework
-- Asynchronous/synchronous containerized end-to-end testing
-- Client/server quantum tunneling via MPSC channels
-
-**See:** [Container Integration Test](tightbeam/tests/container.rs)
-
 ### 9.3 ASN.1 References
 
 - ITU-T X.680: ASN.1 Specification of basic notation
@@ -902,8 +896,6 @@ dual licensed as above, without any additional terms or conditions.
 **This means contributors grant rights under BOTH licenses**, providing:
 - MIT's simplicity for users who prefer it
 - Apache-2.0's patent grants for enhanced protection
-
-This dual-licensing strategy ensures maximum compatibility while providing patent protection from all contributors.
 
 ### 10.1 Implementation Notes
 
