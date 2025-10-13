@@ -63,6 +63,11 @@ pub enum BuildError {
 	#[cfg_attr(feature = "derive", error("Invalid metadata: {0}"))]
 	InvalidMetadata(MetadataError),
 
+	/// Glitch in the Matrix
+	#[cfg_attr(feature = "derive", error("Matrix error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	MatrixError(crate::matrix::MatrixError),
+
 	/// Error during serialization
 	#[cfg_attr(feature = "derive", error("Serialization error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]

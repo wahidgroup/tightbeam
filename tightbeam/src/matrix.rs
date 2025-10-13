@@ -226,11 +226,13 @@ impl TryFrom<&Asn1Matrix> for MatrixDyn {
 		if n == 0 {
 			return Err(MatrixError::InvalidN(n));
 		}
+		
 		let n_u8 = n as u8;
 		let n2 = (n_u8 * n_u8) as usize;
 		if m.data.len() != n2 {
 			return Err(MatrixError::LengthMismatch { n, len: m.data.len() });
 		}
+
 		let mut md = MatrixDyn::try_from(n)?;
 		let mut i = 0usize;
 		for r in 0..n_u8 {
@@ -266,17 +268,23 @@ impl TryFrom<u8> for MatrixDyn {
 	}
 }
 
-impl<T: MatrixLike> From<T> for Asn1Matrix {
-	fn from(matrix: T) -> Self {
-		let n = matrix.n();
-		let mut data = Vec::with_capacity((n as usize) * (n as usize));
-		for r in 0..n {
-			for c in 0..n {
-				data.push(matrix.get(r, c));
-			}
-		}
-		Self { n, data }
-	}
+impl TryFrom<MatrixDyn> for Asn1Matrix {
+    type Error = crate::matrix::MatrixError;
+    
+    fn try_from(matrix: MatrixDyn) -> Result<Self, Self::Error> {
+        let n = matrix.n();
+        if n == 0 {
+            return Err(crate::matrix::MatrixError::InvalidN(n));
+        }
+
+        let mut data = Vec::with_capacity((n as usize) * (n as usize));
+        for r in 0..n {
+            for c in 0..n {
+                data.push(matrix.get(r, c));
+            }
+        }
+        Ok(Self { n, data })
+    }
 }
 
 #[cfg(test)]

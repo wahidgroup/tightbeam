@@ -118,7 +118,7 @@ impl MetadataBuilder {
 			.ok_or(BuildError::InvalidMetadata(MetadataError::MissingTimestamp))?;
 		let compression = self.compactness.unwrap_or(CompressionInfo::NONE(Null));
 		let matrix = if let Some(m) = self.matrix {
-			Some(Asn1Matrix::from(m))
+			Some(Asn1Matrix::try_from(m)?)
 		} else {
 			None
 		};
