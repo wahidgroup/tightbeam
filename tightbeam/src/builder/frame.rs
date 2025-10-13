@@ -225,8 +225,9 @@ impl<T: Message> FrameBuilder<T> {
 
 	/// Set the signer for message signing
 	///
-	/// The signature will be computed during `build()` over the complete message structure.
-	/// This method captures the signer and signing algorithm to be used later.
+	/// The signature will be computed during `build()` over the complete
+	/// message structure. This method captures the signer and signing
+	/// algorithm to be used later.
 	#[cfg(feature = "signature")]
 	pub fn with_signer<C, S, X>(mut self, signer: &X) -> Self
 	where

@@ -35,7 +35,8 @@ impl GatePolicy for AcceptAllGate {
 /// Middleware wrapper for gate policies that observes evaluations.
 ///
 /// Wraps any `GatePolicy` and calls a closure with the evaluation result.
-/// The middleware is transparent - it passes through the gate's decision unchanged.
+/// The middleware is transparent - it passes through the gate's decision
+/// unchanged.
 pub struct GateMiddleware<G: GatePolicy, F>
 where
 	F: Fn(&Frame, &TransitStatus) + Send + Sync,

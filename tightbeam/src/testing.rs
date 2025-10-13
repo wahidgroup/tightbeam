@@ -168,7 +168,7 @@ pub fn create_test_signature_info() -> crate::SignatureInfo {
 
 /// Generic test macro for data-driven test cases
 ///
-/// Allows specifying setup that returns any type, and assertions that 
+/// Allows specifying setup that returns any type, and assertions that
 /// receive that type.
 #[macro_export]
 macro_rules! test_case {
@@ -528,8 +528,9 @@ macro_rules! assert_channel_ne {
 	}};
 }
 
-/// Assert that a channel receives a specific TightBeam (by id) within a timeout,
-/// optionally N times. If COUNT is omitted, succeeds after the first match within the timeout.
+/// Assert that a channel receives a specific TightBeam (by id) within a
+/// timeout, optionally N times. If COUNT is omitted, succeeds after the first
+/// match within the timeout.
 #[macro_export]
 macro_rules! assert_recv {
 	// Shorthand: assert_recv!(rx, msg, ms, n)
@@ -565,7 +566,7 @@ macro_rules! assert_recv {
 			}
 		}
 		if $is_count {
-			assert!( 
+			assert!(
 				__got == $need,
 				"assert_recv! expected {} occurrences of id {:#?}, got {} within {}ms",
 				$need,
@@ -613,7 +614,7 @@ macro_rules! start_reject_order_collection {
 }
 
 /// Finish the background collector and return the captured Instants.
-#[macro_export] 
+#[macro_export]
 macro_rules! finish_reject_order_collection {
 	($times:expr, $handle:expr) => {{
 		let _ = $handle.join();
@@ -622,9 +623,9 @@ macro_rules! finish_reject_order_collection {
 }
 
 /// Assert client retry timing against expected backoff ranges.
-/// Uses the provided reject tunnel to order each non-Accepted server response for the given message id.
-/// attempts must be a compile-time constant; the number of ranges must be attempts-1 (enforced at compile time).
-/// Example:
+/// Uses the provided reject tunnel to order each non-Accepted server response
+/// for the given message id. attempts must be a compile-time constant; the
+/// number of ranges must be attempts-1 (enforced at compile time). Example:
 /// assert_retry_metric!(client, msg.clone(), reject_rx, 3, [[1,3],[2,5]]);
 #[macro_export]
 macro_rules! assert_retry_metric {
@@ -654,6 +655,81 @@ macro_rules! assert_retry_metric {
             assert!(d <= hi, "backoff[{}] too large: {}ms > {}ms", i, d, hi);
         }
     }};
+}
+
+/// Async test macro with servlet setup
+///
+/// Automatically starts a servlet, creates a client, and passes the ready
+/// client to the assertions block for testing. Properly manages servlet
+/// lifecycle.
+#[macro_export]
+macro_rules! test_servlet {
+	// With worker_threads specified
+	(
+		name: $test_name:ident,
+		$(features: [$($feature:literal),*],)?
+		worker_threads: $threads:literal,
+		protocol: $protocol:ident,
+		setup: || $setup_body:expr,
+		assertions: |$client:ident| $assertions_body:expr
+	) => {
+		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
+		$(#[cfg(all($(feature = $feature),*))])?
+		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+				// Call the setup closure and await the resulting future
+				let servlet = $setup_body.await?;
+				// Get the servlet address
+				let addr = servlet.addr();
+
+				// Create client
+				let mut $client = $crate::client! {
+					async $protocol: connect addr
+				}.await?;
+
+				// Run assertions
+				let result = $assertions_body.await;
+
+				// Clean shutdown
+				servlet.stop();
+
+				result
+		}
+	};
+
+	// Without worker_threads (defaults to single threaded)
+	(
+		name: $test_name:ident,
+		$(features: [$($feature:literal),*],)?
+		protocol: $protocol:ident,
+		setup: || $setup_body:expr,
+		assertions: |$client:ident| $assertions_body:expr
+	) => {
+		#[tokio::test]
+		$(#[cfg(all($(feature = $feature),*))])?
+		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+				// Call the setup closure and await the resulting future
+				let servlet = ($setup_body).await?;
+
+				// Get the servlet address
+				let addr = servlet.addr();
+
+				// Give server time to start
+				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+				// Create client
+				let mut $client = $crate::client! {
+					async $protocol: connect addr
+				}.await?;
+
+				// Run assertions
+				let result = $assertions_body.await;
+
+				// Clean shutdown
+				servlet.stop();
+
+				result
+		}
+	};
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 #![cfg(feature = "full")]
 
 use tightbeam::prelude::*;
-use tightbeam::{test_container, assert_recv, assert_channels_quiet, assert_channel_empty};
+use tightbeam::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
 
 use der::Sequence;
 

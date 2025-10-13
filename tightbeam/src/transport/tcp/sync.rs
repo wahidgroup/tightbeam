@@ -5,11 +5,7 @@ use crate::Frame;
 #[cfg(feature = "transport-policy")]
 use crate::{
 	policy::GatePolicy,
-	transport::{
-		error::TransportError,
-		policy::RestartPolicy,
-		tcp::TcpStreamTrait,
-	},
+	transport::{error::TransportError, policy::RestartPolicy, tcp::TcpStreamTrait},
 };
 
 /// TCP transport implementation using abstract traits

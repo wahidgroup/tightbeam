@@ -85,11 +85,40 @@ test-all: build
 	@echo "Running tests with all feature combinations..."
 	./built/test_all_features.sh
 
+# Collect extra args passed after the target (e.g., `make lint -- --fix ...`)
+# Strip the target name and the bare `--` separator
+LINT_ARGS := $(filter-out lint,$(MAKECMDGOALS))
+LINT_ARGS := $(filter-out --,$(LINT_ARGS))
+# Back-compat: also honor ARGS=... if provided
+ifneq ($(strip $(ARGS)),)
+LINT_ARGS += $(ARGS)
+endif
+
+# Decide fmt/clippy behavior based on presence of --fix
+ifeq (,$(findstring --fix,$(LINT_ARGS)))
+FMT_CMD := cargo fmt --all --check
+CLIPPY_EXTRA := -- -D warnings
+LINT_MODE := check
+else
+FMT_CMD := cargo fmt --all
+CLIPPY_EXTRA :=
+LINT_MODE := fix
+endif
+
+# Swallow option-like extra MAKECMDGOALS so make doesn't error on them
+# Supports: `--`, `--foo`, `--foo=bar`
+--:
+	@:
+--%:
+	@:
+
 # Run linters
 lint:
-	@echo "Running linters..."
-	cargo clippy --all-targets --all-features $(ARGS) -- -D warnings
-	cargo fmt --check
+	@echo "Running linters (mode: $(LINT_MODE))..."
+	@echo "Formatting: $(FMT_CMD)"
+	$(FMT_CMD)
+	@echo "Clippy: cargo clippy --all-targets --all-features $(LINT_ARGS) $(CLIPPY_EXTRA)"
+	cargo clippy --all-targets --all-features $(LINT_ARGS) $(CLIPPY_EXTRA)
 
 # Build documentation
 doc:

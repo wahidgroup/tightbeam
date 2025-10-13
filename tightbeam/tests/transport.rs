@@ -3,8 +3,6 @@ use fake::{faker, Fake};
 
 use tightbeam::prelude::*;
 
-
-use collect::{MessageCollector, ResponseHandler};
 use policy::PolicyConfiguration;
 
 tightbeam::mutex! {
@@ -41,14 +39,14 @@ struct Block {
 mod helpers {
 	use super::*;
 
-	pub fn generate_mail() -> Mail {
+	pub fn _generate_mail() -> Mail {
 		Mail {
 			subject: faker::lorem::en::Sentence(3..6).fake(),
 			body: faker::lorem::en::Paragraph(1..3).fake::<String>().into_bytes(),
 		}
 	}
 
-	pub fn generate_address() -> Result<Address, Box<dyn std::error::Error>> {
+	pub fn _generate_address() -> Result<Address, Box<dyn std::error::Error>> {
 		Ok(Address {
 			street: vec![
 				faker::address::en::StreetName().fake(),
@@ -60,10 +58,10 @@ mod helpers {
 		})
 	}
 
-	pub fn generate_block(id: u64, count: usize) -> Block {
+	pub fn _generate_block(id: u64, count: usize) -> Block {
 		let mut transactions = Vec::with_capacity(count);
 		for _ in 0..count {
-			transactions.push(generate_mail());
+			transactions.push(_generate_mail());
 		}
 		Block { id, transactions }
 	}

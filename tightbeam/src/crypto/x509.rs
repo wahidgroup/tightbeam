@@ -1,22 +1,16 @@
 // Re-exports
 pub use x509_cert::*;
 
-
 #[macro_export]
- macro_rules! pem {
+macro_rules! pem {
 	(
 		$pem:literal
 	) => {{
-		use $crate::der::DecodePem;
 		use $crate::crypto::x509::Certificate;
-		let cleaned_pem = $pem
-			.lines()
-			.map(|line| line.trim())
-			.collect::<Vec<_>>()
-			.join("\n");
-		Certificate::from_pem(cleaned_pem.as_bytes())
-			.map_err(|e| format!("Failed to parse X.509 certificate: {}", e))
-	 }};
+		use $crate::der::DecodePem;
+		let cleaned_pem = $pem.lines().map(|line| line.trim()).collect::<Vec<_>>().join("\n");
+		Certificate::from_pem(cleaned_pem.as_bytes()).map_err(|e| format!("Failed to parse X.509 certificate: {}", e))
+	}};
 }
 
 #[cfg(test)]
@@ -73,4 +67,3 @@ mod tests {
 		assert!(cert.is_ok());
 	}
 }
-

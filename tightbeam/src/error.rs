@@ -49,6 +49,12 @@ impl core::fmt::Display for CompressionError {
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]
 pub enum TightBeamError {
+	#[cfg(feature = "std")]
+	/// I/O error
+	#[cfg_attr(feature = "derive", error("I/O error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	IoError(std::io::Error),
+
 	/// Invalid or unsupported algorithm identifier
 	#[cfg_attr(feature = "derive", error("Invalid or unsupported object identifier: {0}"))]
 	InvalidOID(crate::der::oid::Error),
@@ -101,8 +107,8 @@ pub enum TightBeamError {
 
 	#[cfg(feature = "router")]
 	#[cfg_attr(feature = "derive", error("Route error: {0}"))]
-    #[cfg_attr(feature = "derive", from)]
-    RouterError(crate::router::RouterError),
+	#[cfg_attr(feature = "derive", from)]
+	RouterError(crate::router::RouterError),
 
 	/// Error from the message builder
 	#[cfg(feature = "builder")]
@@ -156,6 +162,10 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Missing compression info"))]
 	MissingCompressionInfo,
 
+	/// Missing or invalid configuration
+	#[cfg_attr(feature = "derive", error("Missing configuration"))]
+	MissingConfiguration,
+
 	/// Multiple errors collected together
 	#[cfg_attr(feature = "derive", error("Multiple errors occurred: {0:?}"))]
 	Sequence(Vec<TightBeamError>),
@@ -174,6 +184,7 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::InvalidOverflowValue => write!(f, "Invalid overflow value"),
 			TightBeamError::MissingPriority => write!(f, "Missing priority"),
 			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
+			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),
 			#[cfg(feature = "standards")]
 			TightBeamError::StandardError(err) => write!(f, "Standard error: {err}"),
 			#[cfg(feature = "random")]
@@ -193,11 +204,13 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "compress")]
 			TightBeamError::MissingCompressionInfo => write!(f, "Missing compression info"),
 			#[cfg(feature = "compress")]
-			TightBeamError::CompressionError(err) => match err {
-				#[cfg(feature = "zstd")]
-				CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
-				CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
-			},
+			TightBeamError::CompressionError(err) => {
+				match err {
+					#[cfg(feature = "zstd")]
+					CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
+					CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
+				}
+			}
 			TightBeamError::Sequence(errors) => {
 				write!(f, "Multiple errors: ")?;
 				for (i, error) in errors.iter().enumerate() {
@@ -208,11 +221,13 @@ impl core::fmt::Display for TightBeamError {
 				}
 				Ok(())
 			}
-			TightBeamError::UnsupportedVersion(err) => write!(
-				f,
-				"Unsupported protocol version: expected {:?}, got {:?}",
-				err.expected, err.received
-			),
+			TightBeamError::UnsupportedVersion(err) => {
+				write!(
+					f,
+					"Unsupported protocol version: expected {:?}, got {:?}",
+					err.expected, err.received
+				)
+			}
 		}
 	}
 }

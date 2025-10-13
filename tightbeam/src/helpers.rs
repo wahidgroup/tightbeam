@@ -41,8 +41,8 @@ pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::IntegrityInfo>>;
 
 #[cfg(feature = "digest")]
 impl IntegrityInfo {
-	/// Create a IntegrityInfo by computing a digest of the data using a RustCrypto
-	/// Digest implementation.
+	/// Create a IntegrityInfo by computing a digest of the data using a
+	/// RustCrypto Digest implementation.
 	///
 	/// # Security Note
 	/// The hash is computed over the plaintext message before encryption.
@@ -86,7 +86,8 @@ impl EncryptionInfo {
 #[cfg(feature = "signature")]
 impl SignatureInfo {
 	/// Create SignatureInfo by signing data with a RustCrypto Signer.
-	/// Requires a curve/algorithm type `C` that implements `AssociatedOid` (e.g., k256::Secp256k1).
+	/// Requires a curve/algorithm type `C` that implements `AssociatedOid`
+	/// (e.g., k256::Secp256k1).
 	///
 	/// # Security Note
 	/// Follows the sign-then-encrypt pattern: signatures are computed over

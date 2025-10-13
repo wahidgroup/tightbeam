@@ -39,26 +39,33 @@ macro_rules! client {
 
     // Async: async tcp: stream
     (async tcp: $stream:expr) => {{
-        $crate::transport::tcp::r#async::TcpTransportAsync::from($stream)
+        async {
+            let transport = $crate::transport::tcp::r#async::TcpTransportAsync::from($stream);
+            Ok::<_, $crate::transport::error::TransportError>(transport)
+        }
     }};
 
 	// Async: async tcp: connect "addr"
     (async tcp: connect $addr:expr) => {{
         #[cfg(feature = "tokio")]
-        {
-            let stream = tokio::net::TcpStream::connect($addr).await?;
+        async {
+            let stream = tokio::net::TcpStream::connect($addr).await
+                .map_err(|e| $crate::transport::error::TransportError::from(e))?;
             let tokio_stream = $crate::transport::tcp::r#async::TokioStream::from(stream);
-            $crate::transport::tcp::r#async::TcpTransportAsync::from(tokio_stream)
+            let transport = $crate::transport::tcp::r#async::TcpTransportAsync::from(tokio_stream);
+            Ok::<_, $crate::transport::error::TransportError>(transport)
         }
     }};
 
     // Async: async tcp: stream, policies: {...}
     (async tcp: $stream:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
-        let mut transport = $crate::transport::tcp::r#async::TcpTransportAsync::from($stream);
-        $(
-            transport = $crate::client!(@set_policy transport, $policy_name, $policy_value);
-        )*
-        transport
+        async {
+            let mut transport = $crate::transport::tcp::r#async::TcpTransportAsync::from($stream);
+            $(
+                transport = $crate::client!(@set_policy transport, $policy_name, $policy_value);
+            )*
+            Ok::<_, $crate::transport::error::TransportError>(transport)
+        }
     }};
 
     // Async: async tcp: connect "addr", policies: {...}
@@ -68,9 +75,9 @@ macro_rules! client {
             let stream = tokio::net::TcpStream::connect($addr).await
                 .map_err(|e| $crate::transport::error::TransportError::from(e))?;
             let tokio_stream = $crate::transport::tcp::r#async::TokioStream::from(stream);
-            let transport = $crate::transport::tcp::r#async::TcpTransportAsync::from(tokio_stream);
+            let mut transport = $crate::transport::tcp::r#async::TcpTransportAsync::from(tokio_stream);
             $(
-                let transport = $crate::client!(@set_policy transport, $policy_name, $policy_value);
+                transport = $crate::client!(@set_policy transport, $policy_name, $policy_value);
             )*
             Ok::<_, $crate::transport::error::TransportError>(transport)
         }

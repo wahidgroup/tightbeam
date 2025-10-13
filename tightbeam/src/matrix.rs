@@ -12,7 +12,7 @@ pub enum MatrixError {
 	LengthMismatch { n: u8, len: usize },
 }
 
-#[cfg(all(not(feature = "derive")))]
+#[cfg(not(feature = "derive"))]
 impl core::fmt::Display for MatrixError {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
@@ -98,7 +98,7 @@ impl MatrixDyn {
 
 	/// Borrow a single row as a slice.
 	pub fn row(&self, r: u8) -> Option<&[u8]> {
-		let n = self.n as u8;
+		let n = self.n;
 		if r >= n {
 			return None;
 		}
@@ -147,7 +147,8 @@ impl<const N: usize> Matrix<N> {
 		Self::default()
 	}
 
-	/// Construct from row-major bytes; extra bytes are ignored, missing are zeroed.
+	/// Construct from row-major bytes; extra bytes are ignored, missing are
+	/// zeroed.
 	pub fn from_row_major(bytes: &[u8]) -> Self {
 		let mut m = Self::default();
 		let mut i = 0usize;
@@ -194,7 +195,7 @@ impl<const N: usize> MatrixLike for Matrix<N> {
 	fn fill(&mut self, value: u8) {
 		for r in 0..N {
 			for c in 0..N {
-				self.data[r as usize][c as usize] = value;
+				self.data[r][c] = value;
 			}
 		}
 	}
@@ -266,13 +267,13 @@ impl TryFrom<&Asn1Matrix> for MatrixDyn {
 	type Error = MatrixError;
 	fn try_from(m: &Asn1Matrix) -> Result<Self, Self::Error> {
 		asn1_to_matrix_dyn_impl!(m);
-		let n_u8 = m.n as u8;
+		let n_u8 = m.n;
 
 		let mut md = MatrixDyn::try_from(n_u8)?;
 		let mut i = 0usize;
 		for r in 0..n_u8 {
 			for c in 0..n_u8 {
-				md.set(r as u8, c as u8, m.data[i]);
+				md.set(r, c, m.data[i]);
 				i += 1;
 			}
 		}

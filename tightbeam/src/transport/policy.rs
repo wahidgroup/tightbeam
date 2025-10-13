@@ -110,7 +110,8 @@ impl Default for RestartExponentialBackoff {
 /// Linear backoff restart policy.
 ///
 /// Retries on errors with linearly increasing delays.
-/// The delay increases by: scale_factor * interval_ms * (attempt + 1) milliseconds.
+/// The delay increases by: scale_factor * interval_ms * (attempt + 1)
+/// milliseconds.
 #[cfg(feature = "std")]
 pub struct RestartLinearBackoff {
 	pub max_attempts: usize,
@@ -142,12 +143,7 @@ impl Default for RestartLinearBackoff {
 macro_rules! impl_timed_backoff_policy {
 	($policy:ident, $delay_calc:expr) => {
 		impl RestartPolicy for $policy {
-			fn evaluate(
-				&self,
-				message: Frame,
-				result: TransportResult<&Frame>,
-				attempt: usize,
-			) -> Option<Frame> {
+			fn evaluate(&self, message: Frame, result: TransportResult<&Frame>, attempt: usize) -> Option<Frame> {
 				if attempt >= self.max_attempts {
 					return None;
 				}

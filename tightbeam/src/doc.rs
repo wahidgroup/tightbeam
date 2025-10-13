@@ -12,15 +12,15 @@ macro_rules! doc {
             $(stringify!($doc_attr), "\n",)*
             stringify!($item)
         );
-        
+
         // Also emit the original item with docs
         $(#[$doc_attr])*
         $item
     };
-    
+
     // Retrieve and emit a stored doc block
     ($name:ident) => {
         #[doc = $name]
-        /// 
+        ///
     };
 }

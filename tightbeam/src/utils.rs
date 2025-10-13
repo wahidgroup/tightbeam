@@ -70,7 +70,8 @@ macro_rules! impl_from {
 ///
 /// This generates:
 /// - `impl TryFrom<&TightBeam> for TargetType` that extracts optional fields
-/// - `impl TryFrom<TightBeam> for TargetType` that delegates to the reference impl
+/// - `impl TryFrom<TightBeam> for TargetType` that delegates to the reference
+///   impl
 #[macro_export]
 macro_rules! impl_try_from {
 	// For fields directly on TightBeam
@@ -210,8 +211,7 @@ pub fn decompress(data: impl AsRef<[u8]>, info: &CompressionInfo) -> Result<Vec<
 		}
 		#[cfg(feature = "gzip")]
 		crate::asn1::CompressionInfo::GZIP(_) => {
-			// TODO
-			Err(CompressionError::MissingFeature("gzip"))
+			todo!("gzip decompression not implemented yet");
 		}
 	}
 }

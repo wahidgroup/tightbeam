@@ -19,11 +19,11 @@ pub use crate::mpsc;
 pub use der::{Decode, Encode, Sequence};
 
 // Core types
-pub use crate::tightbeam::flags::FlagSet;
-pub use crate::{Version, Frame, Message};
 pub use crate::error;
 pub use crate::flags;
+pub use crate::tightbeam::flags::FlagSet;
 pub use crate::utils;
+pub use crate::{Frame, Message, Version};
 
 // Derive macro
 #[cfg(feature = "derive")]
@@ -33,19 +33,19 @@ pub use crate::Beamable;
 #[cfg(feature = "builder")]
 pub use crate::builder::FrameBuilder;
 // Cryptographic types
+#[cfg(feature = "random")]
+pub use crate::random;
 #[cfg(feature = "aead")]
 pub use crate::EncryptionInfo;
 #[cfg(feature = "digest")]
 pub use crate::IntegrityInfo;
 #[cfg(feature = "signature")]
 pub use crate::SignatureInfo;
-#[cfg(feature = "random")]
-pub use crate::random;
 
 #[cfg(feature = "policy")]
 pub mod policy {
 	pub use crate::policy::*;
-	
+
 	#[cfg(feature = "transport-policy")]
 	pub use crate::transport::policy::*;
 }
@@ -57,6 +57,8 @@ pub mod tb {
 
 	#[cfg(feature = "builder")]
 	pub use crate::compose;
+	#[cfg(feature = "testing")]
+	pub use crate::test_container;
 	#[cfg(feature = "transport")]
 	pub use crate::{client, server};
 	#[cfg(feature = "compress")]
@@ -65,8 +67,6 @@ pub mod tb {
 	pub use crate::{mutex, rwlock};
 	#[cfg(feature = "signature")]
 	pub use crate::{notarize, sign};
-	#[cfg(feature = "testing")]
-	pub use crate::test_container;
 
 	pub use crate::asn1::MessagePriority;
 }

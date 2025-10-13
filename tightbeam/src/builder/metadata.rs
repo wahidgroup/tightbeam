@@ -7,8 +7,7 @@ use crate::builder::error::{BuildError, MetadataError};
 use crate::der::asn1::Null;
 use crate::matrix::MatrixDyn;
 use crate::{
-	Asn1Matrix, CompressionInfo, EncryptionInfo, IntegrityInfo, MessagePriority, 
-	Metadata, SignatureInfo, Version
+	Asn1Matrix, CompressionInfo, EncryptionInfo, IntegrityInfo, MessagePriority, Metadata, SignatureInfo, Version,
 };
 
 /// A fluent builder for TightBeam metadata.
@@ -110,12 +109,11 @@ impl MetadataBuilder {
 	/// Build the metadata based on the protocol version
 	///
 	/// # Errors
-	/// Returns an error if required fields are missing for the specified version
+	/// Returns an error if required fields are missing for the specified
+	/// version
 	pub fn build(self) -> Result<Metadata, BuildError> {
 		let id = self.id.ok_or(BuildError::InvalidMetadata(MetadataError::MissingId))?;
-		let order = self
-			.order
-			.ok_or(BuildError::InvalidMetadata(MetadataError::MissingTimestamp))?;
+		let order = self.order.ok_or(BuildError::InvalidMetadata(MetadataError::MissingTimestamp))?;
 		let compression = self.compactness.unwrap_or(CompressionInfo::NONE(Null));
 		let matrix = if let Some(m) = self.matrix {
 			Some(Asn1Matrix::try_from(m)?)
@@ -173,7 +171,7 @@ impl MetadataBuilder {
 					priority: Some(priority),
 					lifetime: self.lifetime,
 					previous_frame: self.previous_frame,
-					matrix: matrix,
+					matrix,
 				})
 			}
 		}

@@ -64,9 +64,9 @@ use alloc::vec::Vec;
 pub mod asn1;
 pub mod core;
 pub mod error;
-pub mod matrix;
 pub mod flags;
 pub mod helpers;
+pub mod matrix;
 pub mod prelude;
 pub mod utils;
 
@@ -76,23 +76,22 @@ pub mod builder;
 pub mod constants;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+#[cfg(feature = "doc")]
+pub mod doc;
 #[cfg(feature = "builder")]
 pub mod macros;
+#[cfg(feature = "policy")]
+pub mod policy;
 #[cfg(feature = "random")]
 pub mod random;
+#[cfg(feature = "router")]
+pub mod router;
+#[cfg(feature = "servlets")]
+pub mod servlets;
 #[cfg(feature = "standards")]
 pub mod standards;
 #[cfg(feature = "transport")]
 pub mod transport;
-#[cfg(feature = "router")]
-pub mod router;
-#[cfg(feature = "policy")]
-pub mod policy;
-#[cfg(feature = "doc")]
-pub mod doc;
-#[cfg(feature = "servlets")]
-pub mod servlets;
-
 
 // Re-export
 pub use asn1::*;
@@ -101,17 +100,17 @@ pub use spki;
 
 #[cfg(feature = "hex")]
 pub use hex_literal::hex;
+#[cfg(all(feature = "std", not(feature = "tokio")))]
+pub use std::sync::mpsc;
 #[cfg(feature = "time")]
 pub use time;
 #[cfg(feature = "tokio")]
 pub use tokio::sync::mpsc;
-#[cfg(all(feature = "std", not(feature = "tokio")))]
-pub use std::sync::mpsc;
 
 pub use utils::{decode, encode};
 
 #[cfg(feature = "derive")]
-pub use tightbeam_derive::{Beamable, Flaggable, Errorizable};
+pub use tightbeam_derive::{Beamable, Errorizable, Flaggable};
 
 extern crate self as tightbeam;
 

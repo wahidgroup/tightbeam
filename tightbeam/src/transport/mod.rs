@@ -16,9 +16,7 @@ pub mod tcp;
 
 use crate::asn1::Frame;
 use crate::der::asn1::Uint;
-use crate::der::{
-	Choice, Decode, DecodeValue, Encode, EncodeValue, FixedTag, Header, Length, Reader, Tag, Writer,
-};
+use crate::der::{Choice, Decode, DecodeValue, Encode, EncodeValue, FixedTag, Header, Length, Reader, Tag, Writer};
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::error::TransportError;
 

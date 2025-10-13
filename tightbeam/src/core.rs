@@ -1,4 +1,4 @@
-use crate::{Metadata, Version, Frame, TightBeamError};
+use crate::{Frame, Metadata, TightBeamError, Version};
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
@@ -12,7 +12,8 @@ use crate::SignatureInfo;
 /// A specialized Result type for TightBeam operations
 pub type Result<T> = core::result::Result<T, TightBeamError>;
 
-/// A marker trait for types that can be used as the body of a TightBeam message.
+/// A marker trait for types that can be used as the body of a TightBeam
+/// message.
 pub trait Message:
 	der::EncodeValue + der::Tagged + for<'a> der::Decode<'a> + Clone + PartialEq + core::fmt::Debug + Sized + Send + Sync
 {
@@ -24,7 +25,8 @@ pub trait Message:
 	const MIN_VERSION: Version = Version::V0;
 }
 
-/// A trait for types that represent a TightBeam message with metadata and version
+/// A trait for types that represent a TightBeam message with metadata and
+/// version
 pub trait TightBeamLike:
 	der::Encode
 	+ for<'a> der::Decode<'a>

@@ -87,7 +87,7 @@ macro_rules! routes {
 mod tests {
 	use std::sync::mpsc;
 	use std::time::Duration;
-	
+
 	use crate::der::Sequence;
 	use crate::Beamable;
 
@@ -129,8 +129,8 @@ mod tests {
 	fn test_mpsc_channel_routing() -> Result<(), Box<dyn std::error::Error>> {
 		#[cfg(feature = "derive")]
 		routes! {
-			ChannelRouter { 
-				payment_tx: mpsc::Sender<crate::Frame>, 
+			ChannelRouter {
+				payment_tx: mpsc::Sender<crate::Frame>,
 				health_tx: mpsc::Sender<crate::Frame>,
 			}:
 				Payment |router, msg| {
@@ -140,7 +140,7 @@ mod tests {
 					let _ = router.health_tx.send(msg.clone());
 				}
 		}
-		
+
 		#[cfg(not(feature = "derive"))]
 		struct ChannelRouter {
 			payment_tx: mpsc::Sender<crate::Frame>,
@@ -154,7 +154,7 @@ mod tests {
 					let _ = self.payment_tx.send(message);
 					return Ok(());
 				}
-				
+
 				if std::any::TypeId::of::<M>() == std::any::TypeId::of::<HealthCheck>() {
 					let _ = self.health_tx.send(message);
 					return Ok(());
@@ -207,7 +207,7 @@ mod tests {
 			assert_eq!(received_health.metadata.id, format!("h-{i}").as_bytes());
 			assert_eq!(message, HealthCheck { uptime: i as u64 });
 		}
-		
+
 		Ok(())
 	}
 }

@@ -9,7 +9,7 @@ use crate::der::asn1::Null;
 use crate::der::{Choice, Enumerated, Sequence};
 
 /// Protocol version determines metadata structure and features
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// Version ::= ENUMERATED {
@@ -27,7 +27,7 @@ pub enum Version {
 }
 
 /// Compression algorithms
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// CompressionAlgorithm ::= ENUMERATED {
@@ -44,13 +44,13 @@ pub enum CompressionAlgorithm {
 }
 
 /// Message priority levels (V2+)
-/// 
+///
 /// Priority levels inspired by various standards:
 /// - RFC 3246: Expedited Forwarding PHB
 /// - RFC 2474: Differentiated Services Field
 /// - X.400/X.420: Message Handling Systems
 /// - SIP RFC 3261: Session priority mechanisms
-/// 
+///
 /// Values arranged from highest (0) to lowest (5) priority:
 /// - Critical: System/security alerts, emergency notifications
 /// - Top: High-priority interactive traffic, real-time responses
@@ -59,7 +59,7 @@ pub enum CompressionAlgorithm {
 /// - Low: Non-urgent notifications, background updates
 /// - Bulk: Batch processing, large data transfers, logs
 /// - Heartbeat: Keep-alive signals, periodic status updates
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// MessagePriority ::= ENUMERATED {
@@ -85,7 +85,7 @@ pub enum MessagePriority {
 }
 
 /// Gzip compression information
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// GzipInfo ::= SEQUENCE {
@@ -102,7 +102,7 @@ pub struct GzipInfo {
 }
 
 /// Zstandard compression information
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// ZstdInfo ::= SEQUENCE {
@@ -119,7 +119,7 @@ pub struct ZstdInfo {
 }
 
 /// Compression information using CHOICE for different algorithms
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// CompressionInfo ::= CHOICE {
@@ -141,7 +141,7 @@ pub enum CompressionInfo {
 }
 
 /// Encryption information for confidentiality
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// EncryptionInfo ::= SEQUENCE {
@@ -163,7 +163,7 @@ where
 }
 
 /// Encryption information for confidentiality
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// EncryptionInfo ::= SEQUENCE {
@@ -183,7 +183,7 @@ where
 }
 
 /// Hash information for integrity validation
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// IntegrityInfo ::= SEQUENCE {
@@ -205,7 +205,7 @@ where
 }
 
 /// Hash information for integrity validation
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// IntegrityInfo ::= SEQUENCE {
@@ -225,7 +225,7 @@ where
 }
 
 /// Signature information for non-repudiation
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// SignatureInfo ::= SEQUENCE {
@@ -247,7 +247,7 @@ where
 }
 
 /// Signature information for non-repudiation
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// SignatureInfo ::= SEQUENCE {
@@ -275,14 +275,18 @@ where
 ///     data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
 /// }
 /// ```
-/// 
+///
 /// Notes:
 /// - n MUST be in 1..=255.
 /// - data MUST be exactly n*n octets, row-major (cell (r,c) at offset r*n + c).
-/// - Encoders MUST only emit conforming lengths; decoders MUST reject non-conforming lengths.
-/// - Semantics of cell values are profile-defined. By default, off-diagonal cells are unspecified.
-/// - Profiles MAY map position-stable flags onto the diagonal (r == c); unset is 0, set/non-default is non-zero.
-/// - Intermediaries MUST preserve bytes unless a profile defines deterministic merge rules.
+/// - Encoders MUST only emit conforming lengths; decoders MUST reject
+///   non-conforming lengths.
+/// - Semantics of cell values are profile-defined. By default, off-diagonal
+///   cells are unspecified.
+/// - Profiles MAY map position-stable flags onto the diagonal (r == c); unset
+///   is 0, set/non-default is non-zero.
+/// - Intermediaries MUST preserve bytes unless a profile defines deterministic
+///   merge rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Asn1Matrix {
@@ -294,7 +298,7 @@ pub struct Asn1Matrix {
 
 /// Metadata structure for message handling
 /// Version determines which fields are present
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// Metadata ::= SEQUENCE {
@@ -338,7 +342,7 @@ pub struct Metadata {
 /// Core TightBeam message structure
 /// The version field explicitly determines which metadata variant to use
 /// The signature signs the entire message (version + metadata + body)
-/// 
+///
 /// ASN.1 Definition:
 /// ```asn1
 /// Frame ::= SEQUENCE {

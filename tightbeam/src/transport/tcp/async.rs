@@ -5,7 +5,7 @@ use crate::transport::{MessageIO, Pingable, TransportEnvelope, TransportError, T
 use crate::Frame;
 
 #[cfg(feature = "transport-policy")]
-use crate::{transport::policy::RestartPolicy, policy::GatePolicy};
+use crate::{policy::GatePolicy, transport::policy::RestartPolicy};
 
 pub trait AsyncTcpStreamTrait: Send + Unpin {
 	type Error: Into<TransportError>;
@@ -299,7 +299,8 @@ mod tests {
 		// Second attempt - server responds with Accepted
 		transport.emit(test_message.clone(), None).await?;
 
-		// Server should have only received the second message (first was rejected by gate)
+		// Server should have only received the second message (first was rejected by
+		// gate)
 		let received = rx.recv().await.unwrap();
 		assert_eq!(test_message, received);
 

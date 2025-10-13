@@ -21,7 +21,7 @@ fn has_flag(attrs: &[Attribute], name: &str) -> bool {
 			let parser = Punctuated::<Ident, Token![,]>::parse_terminated;
 			if let Ok(idents) = parser.parse2(list.tokens.clone()) {
 				for ident in idents {
-					if ident.to_string() == name {
+					if ident == name {
 						return true;
 					}
 				}
@@ -102,94 +102,88 @@ fn get_error_message(attrs: &[Attribute]) -> Option<String> {
 /// serialization traits (typically `der::Sequence`).
 #[proc_macro_derive(Beamable, attributes(beam))]
 pub fn derive_beamable(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    let name = &input.ident;
+	let input = parse_macro_input!(input as DeriveInput);
+	let name = &input.ident;
 
-    let confidential = has_flag(&input.attrs, "confidential");
-    let nonrep = has_flag(&input.attrs, "nonrepudiable");
-    let compressed = has_flag(&input.attrs, "compressed");
-    let prioritized = has_flag(&input.attrs, "prioritized");
-    let min_version = get_version_value(&input.attrs);
-    let profile = get_profile_value(&input.attrs);
+	let confidential = has_flag(&input.attrs, "confidential");
+	let nonrep = has_flag(&input.attrs, "nonrepudiable");
+	let compressed = has_flag(&input.attrs, "compressed");
+	let prioritized = has_flag(&input.attrs, "prioritized");
+	let min_version = get_version_value(&input.attrs);
+	let profile = get_profile_value(&input.attrs);
 
-    // Profile-based security requirements
-    let (profile_confidential, profile_nonrep, profile_min_version) = match profile {
-        Some(1) => {
-            (true, true, Some(syn::Ident::new("V1", name.span())))
-        },
-        Some(2) => {
-            (true, true, Some(syn::Ident::new("V1", name.span())))
-        },
-        Some(p) if p > 2 => {
-            (false, false, None)
-        },
-        _ => (false, false, None)
-    };
+	// Profile-based security requirements
+	let (profile_confidential, profile_nonrep, profile_min_version) = match profile {
+		Some(1) => (true, true, Some(syn::Ident::new("V1", name.span()))),
+		Some(2) => (true, true, Some(syn::Ident::new("V1", name.span()))),
+		Some(p) if p > 2 => (false, false, None),
+		_ => (false, false, None),
+	};
 
-    // Apply profile requirements (override individual flags)
-    let final_confidential = profile_confidential || confidential;
-    let final_nonrep = profile_nonrep || nonrep;
-    let final_min_version = profile_min_version.or(min_version);
+	// Apply profile requirements (override individual flags)
+	let final_confidential = profile_confidential || confidential;
+	let final_nonrep = profile_nonrep || nonrep;
+	let final_min_version = profile_min_version.or(min_version);
 
-    let mut feature_checks = Vec::new();
+	let mut feature_checks = Vec::new();
 
-    if final_confidential && !cfg!(feature = "aead") {
-        feature_checks.push(quote! {
-            compile_error!(concat!(
-                "Message type `", stringify!(#name), "` is marked as confidential ",
-                "but the `aead` feature is not enabled. ",
-                "Enable the feature in Cargo.toml: features = [\"aead\"]"
-            ));
-        });
-    }
+	if final_confidential && !cfg!(feature = "aead") {
+		feature_checks.push(quote! {
+			compile_error!(concat!(
+				"Message type `", stringify!(#name), "` is marked as confidential ",
+				"but the `aead` feature is not enabled. ",
+				"Enable the feature in Cargo.toml: features = [\"aead\"]"
+			));
+		});
+	}
 
-    if final_nonrep && !cfg!(feature = "signature") {
-        feature_checks.push(quote! {
-            compile_error!(concat!(
-                "Message type `", stringify!(#name), "` is marked as non-repudiable ",
-                "but the `signature` feature is not enabled. ",
-                "Enable the feature in Cargo.toml: features = [\"signature\"]"
-            ));
-        });
-    }
+	if final_nonrep && !cfg!(feature = "signature") {
+		feature_checks.push(quote! {
+			compile_error!(concat!(
+				"Message type `", stringify!(#name), "` is marked as non-repudiable ",
+				"but the `signature` feature is not enabled. ",
+				"Enable the feature in Cargo.toml: features = [\"signature\"]"
+			));
+		});
+	}
 
-    if compressed && !cfg!(feature = "compress") {
-        feature_checks.push(quote! {
-            compile_error!(concat!(
-                "Message type `", stringify!(#name), "` is marked as compressed ",
-                "but the `compress` feature is not enabled. ",
-                "Enable the feature in Cargo.toml: features = [\"compress\"]"
-            ));
-        });
-    }
+	if compressed && !cfg!(feature = "compress") {
+		feature_checks.push(quote! {
+			compile_error!(concat!(
+				"Message type `", stringify!(#name), "` is marked as compressed ",
+				"but the `compress` feature is not enabled. ",
+				"Enable the feature in Cargo.toml: features = [\"compress\"]"
+			));
+		});
+	}
 
-    let min_version_value = if let Some(version) = final_min_version {
-        quote! { ::tightbeam::Version::#version }
-    } else {
-        quote! { ::tightbeam::Version::V0 }
-    };
+	let min_version_value = if let Some(version) = final_min_version {
+		quote! { ::tightbeam::Version::#version }
+	} else {
+		quote! { ::tightbeam::Version::V0 }
+	};
 
-    let expanded = quote! {
+	let expanded = quote! {
 		const _: () = {
 			#(#feature_checks)*
 		};
 
-        impl ::tightbeam::Message for #name {
-            const MUST_BE_CONFIDENTIAL: bool = #final_confidential;
-            const MUST_BE_NON_REPUDIABLE: bool = #final_nonrep;
-            const MUST_BE_COMPRESSED: bool = #compressed;
-            const MUST_BE_PRIORITIZED: bool = #prioritized;
-            const MIN_VERSION: ::tightbeam::Version = #min_version_value;
-        }
-    };
+		impl ::tightbeam::Message for #name {
+			const MUST_BE_CONFIDENTIAL: bool = #final_confidential;
+			const MUST_BE_NON_REPUDIABLE: bool = #final_nonrep;
+			const MUST_BE_COMPRESSED: bool = #compressed;
+			const MUST_BE_PRIORITIZED: bool = #prioritized;
+			const MIN_VERSION: ::tightbeam::Version = #min_version_value;
+		}
+	};
 
-    TokenStream::from(expanded)
+	TokenStream::from(expanded)
 }
 
 /// Derive macro for implementing flag enum traits
 ///
-/// This macro automatically adds the necessary attributes and trait implementations
-/// for flag enums used with the TightBeam flag system.
+/// This macro automatically adds the necessary attributes and trait
+/// implementations for flag enums used with the TightBeam flag system.
 #[proc_macro_derive(Flaggable)]
 pub fn derive_flaggable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
@@ -217,10 +211,11 @@ pub fn derive_flaggable(input: TokenStream) -> TokenStream {
 	TokenStream::from(expanded)
 }
 
-/// Derive macro for implementing error traits with automatic Display and From implementations
+/// Derive macro for implementing error traits with automatic Display and From
+/// implementations
 ///
-/// This macro automatically implements `Display`, `Error`, and `From` conversions
-/// for error enums, similar to the `snafu` crate.
+/// This macro automatically implements `Display`, `Error`, and `From`
+/// conversions for error enums, similar to the `snafu` crate.
 ///
 /// # Attributes
 ///
@@ -291,7 +286,7 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 								#name::#variant_name(err)
 							}
 						}
-						
+
 						impl From<#name> for #field_type {
 							fn from(err: #name) -> Self {
 								match err {
@@ -354,10 +349,7 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 /// Generate all configured builder macros
 #[proc_macro]
 pub fn generate_builders(_input: TokenStream) -> TokenStream {
-	let macros: Vec<_> = build::BUILDER_CONFIGS
-		.iter()
-		.map(|config| build::generate_builder_macro(config))
-		.collect();
+	let macros: Vec<_> = build::BUILDER_CONFIGS.iter().map(build::generate_builder_macro).collect();
 
 	let output = quote! {
 		#(#macros)*

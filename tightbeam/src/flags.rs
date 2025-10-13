@@ -115,50 +115,50 @@ impl<const N: usize> MatrixLike for Flags<N> {
 }
 
 macro_rules! flags_to_matrix_impl {
-    ($flags:expr, $matrix_type:ty, $n:expr) => {{
-        let mut m = <$matrix_type>::default();
-        for i in 0..$n {
-            m.set(i as u8, i as u8, $flags.get_at(i));
-        }
-        m
-    }};
+	($flags:expr, $matrix_type:ty, $n:expr) => {{
+		let mut m = <$matrix_type>::default();
+		for i in 0..$n {
+			m.set(i as u8, i as u8, $flags.get_at(i));
+		}
+		m
+	}};
 }
 
 macro_rules! flags_to_matrix_dyn_impl {
-    ($flags:expr, $n:expr) => {{
-        let n = $n as u8;
-        let mut m = crate::matrix::MatrixDyn::try_from(n)?;
-        for i in 0..$n {
-            m.set(i as u8, i as u8, $flags.get_at(i));
-        }
-        Ok(m)
-    }};
+	($flags:expr, $n:expr) => {{
+		let n = $n as u8;
+		let mut m = crate::matrix::MatrixDyn::try_from(n)?;
+		for i in 0..$n {
+			m.set(i as u8, i as u8, $flags.get_at(i));
+		}
+		Ok(m)
+	}};
 }
 
 impl<const N: usize> From<crate::flags::Flags<N>> for Matrix<N> {
-    fn from(flags: crate::flags::Flags<N>) -> Self {
-        flags_to_matrix_impl!(flags, Matrix<N>, N)
-    }
+	fn from(flags: crate::flags::Flags<N>) -> Self {
+		flags_to_matrix_impl!(flags, Matrix<N>, N)
+	}
 }
 
 impl<const N: usize> From<&crate::flags::Flags<N>> for Matrix<N> {
-    fn from(flags: &crate::flags::Flags<N>) -> Self {
-        flags_to_matrix_impl!(flags, Matrix<N>, N)
-    }
+	fn from(flags: &crate::flags::Flags<N>) -> Self {
+		flags_to_matrix_impl!(flags, Matrix<N>, N)
+	}
 }
 
 impl<const N: usize> TryFrom<crate::flags::Flags<N>> for crate::matrix::MatrixDyn {
-    type Error = crate::matrix::MatrixError;
-    
-    fn try_from(flags: crate::flags::Flags<N>) -> Result<Self, Self::Error> {
-        flags_to_matrix_dyn_impl!(flags, N)
-    }
+	type Error = crate::matrix::MatrixError;
+
+	fn try_from(flags: crate::flags::Flags<N>) -> Result<Self, Self::Error> {
+		flags_to_matrix_dyn_impl!(flags, N)
+	}
 }
 
 impl<const N: usize> TryFrom<&crate::flags::Flags<N>> for crate::matrix::MatrixDyn {
-    type Error = crate::matrix::MatrixError;
-    
-    fn try_from(flags: &crate::flags::Flags<N>) -> Result<Self, Self::Error> {
-        flags_to_matrix_dyn_impl!(flags, N)
-    }
+	type Error = crate::matrix::MatrixError;
+
+	fn try_from(flags: &crate::flags::Flags<N>) -> Result<Self, Self::Error> {
+		flags_to_matrix_dyn_impl!(flags, N)
+	}
 }

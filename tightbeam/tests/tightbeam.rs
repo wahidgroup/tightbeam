@@ -142,7 +142,7 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 
 	// Create custom flags for this message using the flagset
 	let flags = tightbeam::flags![
-		TestFlagSet: 
+		TestFlagSet:
 			FlagTestDevelopmentMode::IsMaintenanceMode,
 			FlagTestDebugLevel::Basic
 	];
