@@ -137,11 +137,11 @@ tightbeam supports run-time security profile enforcement at the message type lev
 
 ```rust
 pub trait Message: /* trait bounds */ {
-    const MUST_BE_NON_REPUDIABLE: bool = false;
-    const MUST_BE_CONFIDENTIAL: bool = false;
-    const MUST_BE_COMPRESSED: bool = false;
-    const MUST_BE_PRIORITIZED: bool = false;
-    const MIN_VERSION: Version = Version::V0;
+	const MUST_BE_NON_REPUDIABLE: bool = false;
+	const MUST_BE_CONFIDENTIAL: bool = false;
+	const MUST_BE_COMPRESSED: bool = false;
+	const MUST_BE_PRIORITIZED: bool = false;
+	const MIN_VERSION: Version = Version::V0;
 }
 ```
 
@@ -173,30 +173,34 @@ The `#[derive(Beamable)]` macro automatically implements the `Message` trait:
 ```rust
 // This derive macro...
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[beam(nonrepudiable, confidential, min_version = "V1")]
+#[beam(min_version = "V1", nonrepudiable, confidential)]
 struct PaymentInstruction { /* fields */ }
 
 // ...expands to:
 impl Message for PaymentInstruction {
-    const MUST_BE_NON_REPUDIABLE: bool = true;
-    const MUST_BE_CONFIDENTIAL: bool = true;
-    const MUST_BE_COMPRESSED: bool = false;
-    const MUST_BE_PRIORITIZED: bool = false;
-    const MIN_VERSION: Version = Version::V1;
+	const MIN_VERSION: Version = Version::V1;
+	const MUST_BE_NON_REPUDIABLE: bool = true;
+	const MUST_BE_CONFIDENTIAL: bool = true;
+
+	const MUST_BE_COMPRESSED: bool = false;
+	const MUST_BE_PRIORITIZED: bool = false;
+	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
 }
 ```
 
 **Supported attributes:**
+- `#[beam(message_integrity)]` - Sets `MUST_HAVE_MESSAGE_INTEGRITY = true`
+- `#[beam(frame_integrity)]` - Sets `MUST_HAVE_FRAME_INTEGRITY = true`
 - `#[beam(nonrepudiable)]` - Sets `MUST_BE_NON_REPUDIABLE = true`
 - `#[beam(confidential)]` - Sets `MUST_BE_CONFIDENTIAL = true`
 - `#[beam(compressed)]` - Sets `MUST_BE_COMPRESSED = true`
 - `#[beam(prioritized)]` - Sets `MUST_BE_PRIORITIZED = true`
 - `#[beam(min_version = "V1")]` - Sets minimum protocol version
 - WIP (UNSTABLE)
-    - `#[beam(profile = 0)]`
-    - `#[beam(profile = 1)]`
-    - `#[beam(profile = 2)]`
-    - `#[beam(profile = 3)]`
+	- `#[beam(profile = 1)]` - Added but unsafe
+	- `#[beam(profile = 2)]` - Added but unsafe
+	- `#[beam(profile = 3)]`
 
 #### Example Message Types
 
@@ -208,36 +212,36 @@ use der::Sequence;
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[beam(nonrepudiable, confidential, min_version = "V1")]
 struct PaymentInstruction {
-    account_from: String,
-    account_to: String,
-    amount: u64,
-    currency: String,
+	account_from: String,
+	account_to: String,
+	amount: u64,
+	currency: String,
 }
 
 // Bulk data transfer
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[beam(compressed, prioritized, min_version = "V2")]
 struct DataTransfer {
-    dataset_id: String,
-    data: Vec<u8>,
-    checksum: [u8; 32],
+	dataset_id: String,
+	data: Vec<u8>,
+	checksum: [u8; 32],
 }
 
 // Development/testing message (no security requirements)
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 struct TestMessage {
-    test_id: u32,
-    content: String,
+	test_id: u32,
+	content: String,
 }
 
 // Critical system alert (requires all security features)
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 #[beam(nonrepudiable, confidential, compressed, prioritized, min_version = "V2")]
 struct SecurityAlert {
-    severity: u8,
-    source: String,
-    description: String,
-    timestamp: u64,
+	severity: u8,
+	source: String,
+	description: String,
+	timestamp: u64,
 }
 ```
 
@@ -259,27 +263,27 @@ All versions MAY include:
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Metadata {
-    // Core fields (V0+)
-    pub id: Vec<u8>,
-    pub order: u64,
-    pub compactness: CompressionInfo,
+	// Core fields (V0+)
+	pub id: Vec<u8>,
+	pub order: u64,
+	pub compactness: CompressionInfo,
 
-    // V1+ fields
-    #[asn1(context_specific = "0", optional = "true")]
-    pub integrity: Option<IntegrityInfo>,
-    #[asn1(context_specific = "1", optional = "true")]
-    pub confidentiality: Option<EncryptionInfo>,
+	// V1+ fields
+	#[asn1(context_specific = "0", optional = "true")]
+	pub integrity: Option<IntegrityInfo>,
+	#[asn1(context_specific = "1", optional = "true")]
+	pub confidentiality: Option<EncryptionInfo>,
 
-    // V2+ fields
-    #[asn1(context_specific = "2", optional = "true")]
-    #[cfg_attr(feature = "zeroize", zeroize(skip))]
-    pub priority: Option<MessagePriority>,
-    #[asn1(context_specific = "3", optional = "true")]
-    pub lifetime: Option<u64>,
-    #[asn1(context_specific = "4", optional = "true")]
-    pub previous_frame: Option<IntegrityInfo>,
-    #[asn1(context_specific = "5", optional = "true")]
-    pub matrix: Option<Asn1Matrix>,
+	// V2+ fields
+	#[asn1(context_specific = "2", optional = "true")]
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub priority: Option<MessagePriority>,
+	#[asn1(context_specific = "3", optional = "true")]
+	pub lifetime: Option<u64>,
+	#[asn1(context_specific = "4", optional = "true")]
+	pub previous_frame: Option<IntegrityInfo>,
+	#[asn1(context_specific = "5", optional = "true")]
+	pub matrix: Option<Asn1Matrix>,
 }
 ```
 
@@ -288,14 +292,14 @@ pub struct Metadata {
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Frame {
-    #[cfg_attr(feature = "zeroize", zeroize(skip))]
-    pub version: Version,
-    pub metadata: Metadata,
-    pub message: Vec<u8>,
-    #[asn1(context_specific = "0", optional = "true")]
-    pub integrity: Option<IntegrityInfo>,
-    #[asn1(context_specific = "1", optional = "true")]
-    pub nonrepudiation: Option<SignatureInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub version: Version,
+	pub metadata: Metadata,
+	pub message: Vec<u8>,
+	#[asn1(context_specific = "0", optional = "true")]
+	pub integrity: Option<IntegrityInfo>,
+	#[asn1(context_specific = "1", optional = "true")]
+	pub nonrepudiation: Option<SignatureInfo>,
 }
 ```
 
@@ -308,22 +312,22 @@ This section provides the complete ASN.1 definitions for all tightbeam protocol 
 #### Version Enumeration
 ```asn1
 Version ::= ENUMERATED {
-    v0(0),
-    v1(1),
-    v2(2)
+	v0(0),
+	v1(1),
+	v2(2)
 }
 ```
 
 #### Message Priority Levels
 ```asn1
 MessagePriority ::= ENUMERATED {
-    critical(0),     -- System/security alerts, emergency notifications
-    top(1),          -- High-priority interactive traffic, real-time responses
-    high(2),         -- Important business messages, time-sensitive data
-    normal(3),       -- Standard message traffic (default)
-    low(4),          -- Non-urgent notifications, background updates
-    bulk(5),         -- Batch processing, large data transfers, logs
-    heartbeat(6)     -- Keep-alive signals, periodic status updates
+	critical(0),	 -- System/security alerts, emergency notifications
+	top(1),		  -- High-priority interactive traffic, real-time responses
+	high(2),		 -- Important business messages, time-sensitive data
+	normal(3),	   -- Standard message traffic (default)
+	low(4),		  -- Non-urgent notifications, background updates
+	bulk(5),		 -- Batch processing, large data transfers, logs
+	heartbeat(6)	 -- Keep-alive signals, periodic status updates
 }
 ```
 
@@ -332,27 +336,27 @@ MessagePriority ::= ENUMERATED {
 #### Compression Algorithm Types
 ```asn1
 CompressionAlgorithm ::= ENUMERATED {
-    none(0),
-    zstd(1)
+	none(0),
+	zstd(1)
 }
 ```
 
 #### Compression Algorithm Information
 ```asn1
 ZstdInfo ::= SEQUENCE {
-    level         INTEGER,
-    originalSize  INTEGER
+	level		 INTEGER,
+	originalSize  INTEGER
 }
 
 GzipInfo ::= SEQUENCE {
-    level         INTEGER,
-    originalSize  INTEGER
+	level		 INTEGER,
+	originalSize  INTEGER
 }
 
 CompressionInfo ::= CHOICE {
-    none  NULL,
-    zstd  ZstdInfo,
-    gzip  GzipInfo
+	none  NULL,
+	zstd  ZstdInfo,
+	gzip  GzipInfo
 }
 ```
 
@@ -361,32 +365,32 @@ CompressionInfo ::= CHOICE {
 #### Encryption Information
 ```asn1
 EncryptionInfo ::= SEQUENCE {
-    algorithm   AlgorithmIdentifier,
-    parameters  ANY DEFINED BY algorithm
+	algorithm   AlgorithmIdentifier,
+	parameters  ANY DEFINED BY algorithm
 }
 ```
 
 #### Integrity Information
 ```asn1
 IntegrityInfo ::= SEQUENCE {
-    algorithm   AlgorithmIdentifier,
-    parameters  ANY DEFINED BY algorithm
+	algorithm   AlgorithmIdentifier,
+	parameters  ANY DEFINED BY algorithm
 }
 ```
 
 #### Digital Signature Information
 ```asn1
 SignatureInfo ::= SEQUENCE {
-    signatureAlgorithm  AlgorithmIdentifier,
-    signature           OCTET STRING
+	signatureAlgorithm  AlgorithmIdentifier,
+	signature		   OCTET STRING
 }
 ```
 
 #### Matrix
 ```asn1
 Matrix ::= SEQUENCE {
-    n     INTEGER (1..255),
-    data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
+	n	 INTEGER (1..255),
+	data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
 }
 ```
 
@@ -395,29 +399,29 @@ Matrix ::= SEQUENCE {
 #### Metadata Structure
 ```asn1
  Metadata ::= SEQUENCE {
-     -- Core fields (V0+)
-     id               OCTET STRING,
-     order            INTEGER,
-     compactness      CompressionInfo,
-     integrity        [0] IntegrityInfo OPTIONAL,
-     confidentiality  [1] EncryptionInfo OPTIONAL,
-     
-     -- V2+ fields (context-specific tags)
-     priority         [2] MessagePriority OPTIONAL,
-     lifetime         [3] INTEGER OPTIONAL,
-     previousFrame    [4] IntegrityInfo OPTIONAL,
-     matrix           [5] Matrix OPTIONAL
+	 -- Core fields (V0+)
+	 id			   OCTET STRING,
+	 order			INTEGER,
+	 compactness	  CompressionInfo,
+	 integrity		[0] IntegrityInfo OPTIONAL,
+	 confidentiality  [1] EncryptionInfo OPTIONAL,
+	 
+	 -- V2+ fields (context-specific tags)
+	 priority		 [2] MessagePriority OPTIONAL,
+	 lifetime		 [3] INTEGER OPTIONAL,
+	 previousFrame	[4] IntegrityInfo OPTIONAL,
+	 matrix		   [5] Matrix OPTIONAL
  }
 ```
 
 #### Complete Frame Structure
 ```asn1
 Frame ::= SEQUENCE {
-    version         Version,
-    metadata        Metadata,
-    message         OCTET STRING,
-    integrity       [0] IntegrityInfo OPTIONAL,
-    nonrepudiation  [1] SignatureInfo OPTIONAL
+	version		 Version,
+	metadata		Metadata,
+	message		 OCTET STRING,
+	integrity	   [0] IntegrityInfo OPTIONAL,
+	nonrepudiation  [1] SignatureInfo OPTIONAL
 }
 ```
 
@@ -428,8 +432,8 @@ The protocol relies on standard ASN.1 structures:
 ```asn1
 -- From RFC 5652 and related PKCS standards
 AlgorithmIdentifier ::= SEQUENCE {
-    algorithm    OBJECT IDENTIFIER,
-    parameters   ANY DEFINED BY algorithm OPTIONAL
+	algorithm	OBJECT IDENTIFIER,
+	parameters   ANY DEFINED BY algorithm OPTIONAL
 }
 ```
 
@@ -499,88 +503,88 @@ tightbeam-Protocol-V2 DEFINITIONS EXPLICIT TAGS ::= BEGIN
 
 -- Import standard algorithm identifier
 IMPORTS AlgorithmIdentifier FROM PKCS-1 
-        { iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-1(1) };
+		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-1(1) };
 
 -- Core protocol version
 Version ::= ENUMERATED {
-    v0(0),
-    v1(1),
-    v2(2)
+	v0(0),
+	v1(1),
+	v2(2)
 }
 
 -- Message priority enumeration
 MessagePriority ::= ENUMERATED {
-    critical(0),
-    top(1),
-    high(2),
-    normal(3),
-    low(4),
-    bulk(5),
-    heartbeat(6)
+	critical(0),
+	top(1),
+	high(2),
+	normal(3),
+	low(4),
+	bulk(5),
+	heartbeat(6)
 }
 
 -- Compression structures
 CompressionAlgorithm ::= ENUMERATED {
-    none(0),
-    zstd(1)
+	none(0),
+	zstd(1)
 }
 
 ZstdInfo ::= SEQUENCE {
-    level         INTEGER,
-    originalSize  INTEGER
+	level		 INTEGER,
+	originalSize  INTEGER
 }
 
 GzipInfo ::= SEQUENCE {
-    level         INTEGER,
-    originalSize  INTEGER
+	level		 INTEGER,
+	originalSize  INTEGER
 }
 
 CompressionInfo ::= CHOICE {
-    none  NULL,
-    zstd  ZstdInfo,
-    gzip  GzipInfo
+	none  NULL,
+	zstd  ZstdInfo,
+	gzip  GzipInfo
 }
 
 -- Cryptographic structures
 EncryptionInfo ::= SEQUENCE {
-    algorithm   AlgorithmIdentifier,
-    parameters  ANY DEFINED BY algorithm
+	algorithm   AlgorithmIdentifier,
+	parameters  ANY DEFINED BY algorithm
 }
 
 IntegrityInfo ::= SEQUENCE {
-    algorithm   AlgorithmIdentifier,
-    parameters  ANY DEFINED BY algorithm
+	algorithm   AlgorithmIdentifier,
+	parameters  ANY DEFINED BY algorithm
 }
 
 SignatureInfo ::= SEQUENCE {
-    signatureAlgorithm  AlgorithmIdentifier,
-    signature           OCTET STRING
+	signatureAlgorithm  AlgorithmIdentifier,
+	signature		   OCTET STRING
 }
 
 Matrix ::= SEQUENCE {
-    n     INTEGER (1..255),
-    data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
+	n	 INTEGER (1..255),
+	data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
 }
 
 -- Core message structures
 Metadata ::= SEQUENCE {
-    id               OCTET STRING,
-    order            INTEGER,
-    compactness      CompressionInfo,
-    integrity        [0] IntegrityInfo OPTIONAL,
-    confidentiality  [1] EncryptionInfo OPTIONAL,
-    priority         [2] MessagePriority OPTIONAL,
-    lifetime         [3] INTEGER OPTIONAL,
-    previousFrame    [4] IntegrityInfo OPTIONAL,
-    matrix           [5] Matrix OPTIONAL
+	id			   OCTET STRING,
+	order			INTEGER,
+	compactness	  CompressionInfo,
+	integrity		[0] IntegrityInfo OPTIONAL,
+	confidentiality  [1] EncryptionInfo OPTIONAL,
+	priority		 [2] MessagePriority OPTIONAL,
+	lifetime		 [3] INTEGER OPTIONAL,
+	previousFrame	[4] IntegrityInfo OPTIONAL,
+	matrix		   [5] Matrix OPTIONAL
 }
 
 Frame ::= SEQUENCE {
-    version         Version,
-    metadata        Metadata,
-    message         OCTET STRING,
-    integrity       [0] IntegrityInfo OPTIONAL,
-    nonrepudiation  [1] SignatureInfo OPTIONAL
+	version		 Version,
+	metadata		Metadata,
+	message		 OCTET STRING,
+	integrity	   [0] IntegrityInfo OPTIONAL,
+	nonrepudiation  [1] SignatureInfo OPTIONAL
 }
 
 END
@@ -617,49 +621,50 @@ Implementations MUST enforce message-level security requirements through:
 #### Example Implementation Pattern
 ```rust
 impl<T: Message> FrameBuilder<T> {
-    fn validate(&self) -> Result<()> {
-        // Check minimum version requirement
-        if self.version < T::MIN_VERSION {
-            return Err(TightBeamError::UnsupportedVersion(ExpectError::from((
-                self.version,
-                T::MIN_VERSION,
-            ))));
-        }
+	fn validate(&self) -> Result<()> {
+		// Check minimum version requirement
+		if self.version < T::MIN_VERSION {
+			return Err(TightBeamError::UnsupportedVersion(ExpectError::from((
+				self.version,
+				T::MIN_VERSION,
+			))));
+		}
 
-        // Check if encryption is set when required
-        #[cfg(feature = "aead")]
-        {
-            let has_encryption = self.encryptor.is_some();
-            if T::MUST_BE_CONFIDENTIAL && !has_encryption {
-                return Err(TightBeamError::MissingEncryptionInfo);
-            }
-        }
+		// Check if encryption is set when required
+		let has_encryption = self.encryptor.is_some();
+		if T::MUST_BE_CONFIDENTIAL && !has_encryption {
+			return Err(TightBeamError::MissingEncryptionInfo);
+		}
 
-        // Check if signature is set when required
-        #[cfg(feature = "signature")]
-        {
-            let has_signer = self.signer.is_some();
-            if T::MUST_BE_NON_REPUDIABLE && !has_signer {
-                return Err(TightBeamError::MissingSignatureInfo);
-            }
-        }
+		// Check if signature is set when required
+		let has_signer = self.signer.is_some();
+		if T::MUST_BE_NON_REPUDIABLE && !has_signer {
+			return Err(TightBeamError::MissingSignatureInfo);
+		}
 
-        // Check if compression is set when required
-        #[cfg(feature = "compress")]
-        {
-            let has_compression = self.compressor.is_some();
-            if T::MUST_BE_COMPRESSED && !has_compression {
-                return Err(TightBeamError::MissingCompressionInfo);
-            }
-        }
+		// Check if compression is set when required
+		let has_compression = self.compressor.is_some();
+		if T::MUST_BE_COMPRESSED && !has_compression {
+			return Err(TightBeamError::MissingCompressionInfo);
+		}
 
-        // Check if priority is set when required
-        if T::MUST_BE_PRIORITIZED && !self.metadata_builder.has_priority() {
-            return Err(TightBeamError::MissingPriority);
-        }
+		let has_message_integrity = self.metadata_builder.has_hash();
+		if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
+			return Err(TightBeamError::MissingIntegrityInfo);
+		}
 
-        Ok(())
-    }
+		let has_frame_integrity = self.witness.is_some();
+		if T::MUST_HAVE_FRAME_INTEGRITY && !has_frame_integrity {
+			return Err(TightBeamError::MissingIntegrityInfo);
+		}
+
+		// Check if priority is set when required
+		if T::MUST_BE_PRIORITIZED && !self.metadata_builder.has_priority() {
+			return Err(TightBeamError::MissingPriority);
+		}
+
+		Ok(())
+	}
 }
 ```
 
@@ -747,83 +752,207 @@ tightbeam follows established cryptographic standards and maintains algorithm ag
 - **Algorithm Negotiation**: Support for algorithm capability discovery
 - **Security Policy**: Configurable algorithm allow/deny lists
 
+## 8 Network Theory
+
+### 8.1 Network Architecture
+- Egress/ingress policy management
+- Retry and Egress client policy
+- Service orchestration via Colony Monodomy/Polydomy patterns  
+- Cryptographically chainable message sequences
+
+TODO Efficient Compute Exchange Interconnect
+
+cluster!{}
+
+servlet!{}
+
+**See:** [Transport Integration Tests](tightbeam/tests/transport.rs)
+
+## 9 Testing Framework
+Full end-to-end containerized testing framework
+- Asynchronous/synchronous containerized end-to-end testing
+- Client/server "quantum tunneling" via MPSC channels
+
+### Quantum Tunnel Testing
+These are our three "entangled particles" for a quantum tunnel.
+
+```rust
+// Server handler channel: tx for server, rx for container
+let (tx, rx) = mpsc::channel();
+
+// Status channels (container receives ok/reject)
+let (ok_tx, ok_rx) = mpsc::channel();
+let (reject_tx, reject_rx) = mpsc::channel();
+
+// Exposed in test as single tuple
+let channels = (rx, ok_rx, reject_rx);
+```
+
+#### Message Flow Sequence
+1. Client emits a message
+2. The server MAY receive the message
+3. The gate MAY reject the message and MUST tell reject_tx
+	- If so, the client SHOULD[^mpsc] hear from reject_rx
+	- If not, the gate tells ok_tx and the client SHOULD[^mpsc] hear from ok_rx
+4. The server handles the message and MAY arbitrarily talk to tx
+	- If so, the client SHOULD[^mpsc] hear from rx
+5. The server MAY respond with a message
+
+[^mpsc]: MPSC ops MAY return Empty while polling; Disconnected ONLY occurs at teardown.
+```rust
+service: |message, tx| async move {
+    tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
+
+    let decoded = tightbeam::decode::<RequestMessage, _>(&message.clone().message).ok()?;
+    if &decoded.content == "PING" {
+        tightbeam::relay!(ServiceAssertChecklist::ContainerPingReceived, tx)?;
+
+        let response = Some(tightbeam::compose! {
+            V0: id: message.metadata.id.clone(),
+                order: 1_700_000_000u64,
+                message: ResponseMessage {
+                    result: "PONG".into()
+                }
+        }.ok()?);
+
+        tightbeam::relay!(ServiceAssertChecklist::SentResponse, tx)?;
+        response
+    } else {
+        None
+    }
+}
+```
+6. The client MAY receive a response or error or timeout
+	- If no response, `None`
+	- If response, `Some(Frame)`
+	- If error, `Err(TransportError)`
+7. The client can process the response and can now determine:
+	- What the client sent
+	- What the gate received
+	- What the gate accepted or rejected
+	- What the server wants to assert
+	- What the server responded with
+	- What the client received
+
+Container is in a "Quantum State" before the client gets the response. The 
+"wave function collapses" when await completes--causality intact. You can now 
+observe the results of rx, ok_rx, and reject_rx: 
+```rust
+let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
+    // Collect checklist items
+    assert_recv!(rx, ServiceAssertChecklist::ContainerMessageReceived);
+    assert_recv!(rx, ServiceAssertChecklist::ContainerPingReceived);
+    assert_recv!(rx, ServiceAssertChecklist::SentResponse);
+    // Verify response metadata
+    assert_eq!(response.metadata.id, message.metadata.id);
+    // Ensure we received the message on the server side
+    assert_recv!(ok_rx, message);
+    // Ensure server did not reject
+    assert_channels_quiet!(reject_rx);
+
+    tightbeam::decode::<ResponseMessage, _>(&response.message).ok()
+} else {
+    panic!("Expected a response from the service");
+};
+
+```
+This occurs while ensuring each client and server operate within their own 
+scope in a single containerized test. Channels are automatically cleaned up.
+
+**See:** [Container Integration Test](tightbeam/tests/container.rs)
+
 ## 8. Examples
 
 ### 8.1 Basic Test Container
 ```rust
-test_container! {
-    name: container_gates_basic,
-    features: ["testing", "std", "tcp", "tokio"],
-    worker_threads: 2,
-    protocol: tcp,
-    service_policies: {
-        gate: policy::AcceptAllGate
-    },
-    client_policies: {
-        restart: policy::RestartExponentialBackoff::default(),
-        gate: policy::AcceptAllGate
-    },
-    service: |message, tx| async move {
-        // Echo service implementation
-        let result = tx.send(message.clone());
-        assert!(result.is_ok());
-
-        let decoded = tightbeam::decode::<RequestMessage, _>(&message.clone().message).ok()?;
-        if &decoded.content == "PING" {
-            Some(tightbeam::compose! {
-                V0: id: message.metadata.id.clone(),
-                    order: 1_700_000_000u64,
-                    message: ResponseMessage {
-                        result: "PONG".into()
-                    }
-            }.ok()?)
-        } else {
-            None
-        }
-    },
-    container: |client, channels| async move {
-        use tightbeam::transport::MessageEmitter;
-
-        let (rx, ok_rx, reject_rx) = channels;
-
-        // Compose a simple V0 message
-        let message = tightbeam::compose! {
-            V0: id: b"request",
-                order: 1_700_000_000u64,
-                message: RequestMessage {
-                    content: "PING".into()
-                }
-        }?;
-
-        // Send and expect acceptance + echo response
-        let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
-            assert_eq!(response.metadata.id, message.metadata.id);
-            tightbeam::decode::<ResponseMessage, _>(&response.message).ok()
-        } else {
-            panic!("Expected a response from the service");
-        };
-
-        match decoded {
-            Some(reply) => {
-                assert_eq!(reply.result, "PONG");
-            },
-            None => panic!("Expected a PONG")
-        };
-
-        assert_recv!(rx, message, 2, 1);
-        assert_recv!(ok_rx, message, 2, 1);
-        assert_channels_quiet!(reject_rx);
-
-        Ok(())
-    }
+/// Checklist for container assertions
+#[derive(Enumerated, Beamable, Copy, Clone, Debug, PartialEq)]
+#[repr(u8)]
+enum ServiceAssertChecklist {
+	ContainerMessageReceived = 1,
+	ContainerPingReceived = 2,
+	SentResponse = 3,
 }
+
+test_container! {
+	name: container_gates_basic,
+	features: ["testing", "std", "tcp", "tokio"],
+	worker_threads: 2,
+	protocol: TokioListener,
+	service_policies: {
+		gate: policy::AcceptAllGate
+	},
+	client_policies: {
+		restart: policy::RestartExponentialBackoff::default(),
+		gate: policy::AcceptAllGate
+	},
+	service: |message, tx| async move {
+		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
+
+		let decoded = tightbeam::decode::<RequestMessage, _>(&message.clone().message).ok()?;
+		if &decoded.content == "PING" {
+			tightbeam::relay!(ServiceAssertChecklist::ContainerPingReceived, tx)?;
+
+			let response = Some(tightbeam::compose! {
+				V0: id: message.metadata.id.clone(),
+					order: 1_700_000_000u64,
+					message: ResponseMessage {
+						result: "PONG".into()
+					}
+			}.ok()?);
+
+			tightbeam::relay!(ServiceAssertChecklist::SentResponse, tx)?;
+			response
+		} else {
+			None
+		}
+	},
+	container: |client, channels| async move {
+		use tightbeam::transport::MessageEmitter;
+
+		let (rx, ok_rx, reject_rx) = channels;
+
+		// Compose a simple V0 message
+		let message = tightbeam::compose! {
+			V0: id: b"request",
+				order: 1_700_000_000u64,
+				message: RequestMessage {
+					content: "PING".into()
+				}
+		}?;
+
+		// Test Message Transport
+
+		// Send and expect acceptance + echo response
+		let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
+			// Collect checklist items
+			assert_recv!(rx, ServiceAssertChecklist::ContainerMessageReceived);
+			assert_recv!(rx, ServiceAssertChecklist::ContainerPingReceived);
+			assert_recv!(rx, ServiceAssertChecklist::SentResponse);
+			// Verify response metadata
+			assert_eq!(response.metadata.id, message.metadata.id);
+			// Ensure we received the message on the server side
+			assert_recv!(ok_rx, message);
+			// Ensure server did not reject
+			assert_channels_quiet!(reject_rx);
+
+			tightbeam::decode::<ResponseMessage, _>(&response.message).ok()
+		} else {
+			panic!("Expected a response from the service");
+		};
+
+		match decoded {
+			Some(reply) => {
+				assert_eq!(reply.result, "PONG");
+			},
+			None => panic!("Expected a PONG")
+		};
+
+		Ok(())
+	}
+}
+
 ```
-
-#### Testing Framework
-- Asynchronous/synchronous containerized end-to-end testing
-- Client/server quantum tunneling via MPSC channels
-
-**See:** [Container Integration Test](tightbeam/tests/container.rs)
 
 ## 9. References
 
@@ -853,15 +982,6 @@ test_container! {
 - NIST SP 800-56A: Recommendation for Pair-Wise Key Establishment Schemes
 - NIST SP 800-57: Recommendation for Key Management
 - NIST SP 800-131A: Transitioning the Use of Cryptographic Algorithms and Key Lengths
-
-### 9.2 Informative References
-
-#### Network Architecture
-- Egress/ingress policy management
-- Service orchestration via Colony Monodomy/Polydomy patterns  
-- Cryptographically chainable message sequences
-
-**See:** [Transport Integration Tests](tightbeam/tests/transport.rs)
 
 ### 9.3 ASN.1 References
 
