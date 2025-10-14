@@ -725,6 +725,38 @@ macro_rules! assert_retry_metric {
 
 /// Async test macro with worker setup
 ///
+/// Automatically starts a worker and passes it to the assertions block for testing.
+/// Properly manages worker lifecycle with shutdown.
+#[macro_export]
+macro_rules! test_worker {
+    (
+        name: $test_name:ident,
+        $(features: [$($feature:literal),*],)?
+        setup: || $setup_body:expr,
+        assertions: |$worker:ident| $assertions_body:expr
+    ) => {
+        #[tokio::test]
+        $(#[cfg(all($(feature = $feature),*))])?
+        async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+            // Call the setup closure and get the worker
+            let worker = $setup_body?;
+
+            // Run assertions with reference to worker
+            let result = {
+                let $worker = &worker;
+                $assertions_body.await
+            };
+
+            // Clean shutdown
+            worker.shutdown().await?;
+
+            result
+        }
+    };
+}
+
+/// Async test macro with worker setup
+///
 /// Automatically starts a worker, creates a client, and passes the ready
 /// client to the assertions block for testing. Properly manages worker
 /// lifecycle.

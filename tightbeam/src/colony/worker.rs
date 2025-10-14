@@ -528,56 +528,58 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn lucky_number_worker_checks_winner() -> Result<(), Box<dyn std::error::Error>> {
-        let worker = LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig { lotto_number: 42 }).unwrap();
-        assert_eq!(worker.queue_capacity(), 64, "worker queue capacity should match default");
+	crate::test_worker! {
+        name: lucky_number_worker_checks_winner,
+        features: ["std"],
+        setup: || {
+            LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig { lotto_number: 42 })
+        },
+        assertions: |worker| async move {
+            assert_eq!(worker.queue_capacity(), 64);
 
-        let winner = worker.relay(RequestMessage {
-            content: "PING".to_string(),
-            lucky_number: 42,
-        }).await?;
-        assert!(winner);
+            let winner = worker.relay(RequestMessage {
+                content: "PING".to_string(),
+                lucky_number: 42,
+            }).await?;
+            assert!(winner);
 
-        let loser = worker.relay(RequestMessage {
-            content: "PING".to_string(),
-            lucky_number: 7,
-        }).await?;
-        assert!(!loser);
+            let loser = worker.relay(RequestMessage {
+                content: "PING".to_string(),
+                lucky_number: 7,
+            }).await?;
+            assert!(!loser);
 
-        worker.shutdown().await.unwrap();
-        Ok(())
+            Ok(())
+        }
     }
 
-	#[tokio::test]
-    async fn receptor_gate_blocks_non_ping() -> Result<(), Box<dyn std::error::Error>>  {
-        let expected_message = PongMessage {
-            result: "PONG".to_string()
-        };
-        let worker = PingPongWorker::start(PingPongWorkerConfig {
-            expected_message: "PING".to_string(),
-        })?;
+    crate::test_worker! {
+        name: test_ping_pong_worker,
+        features: ["std"],
+        setup: || {
+            PingPongWorker::start(PingPongWorkerConfig {
+                expected_message: "PING".to_string(),
+            })
+        },
+        assertions: |worker| async move {
+            // Test accepted message
+            let ping_msg = RequestMessage {
+                content: "PING".to_string(),
+                lucky_number: 42,
+            };
+            let response = worker.relay(ping_msg).await?;
+            assert_eq!(response, Some(PongMessage { result: "PONG".to_string() }));
 
-        let accepted = worker.relay(RequestMessage {
-            content: "PING".to_string(),
-            lucky_number: 0,
-        }).await?;
-        assert_eq!(accepted, Some(expected_message));
+            // Test rejected message
+            let pong_msg = RequestMessage {
+                content: "PONG".to_string(),
+                lucky_number: 42,
+            };
 
-        let rejection = worker.relay(RequestMessage {
-            content: "PONG".to_string(),
-            lucky_number: 0,
-        }).await
-        .err().expect("expected rejection");
+            let result = worker.relay(pong_msg).await;
+            assert!(matches!(result, Err(WorkerRelayError::Rejected(_))));
 
-        match rejection {
-            WorkerRelayError::Rejected(status) => {
-                assert_eq!(status, TransitStatus::Forbidden);
-            }
-            other => panic!("expected rejection, got {:?}", other),
+            Ok(())
         }
-
-        worker.shutdown().await.unwrap();
-        Ok(())
     }
 }
