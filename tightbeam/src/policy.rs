@@ -51,11 +51,7 @@ where
 	/// * `inner` - The underlying receptor policy to wrap
 	/// * `observer` - Closure called with the message and evaluation result
 	pub fn new(inner: R, observer: F) -> Self {
-		Self {
-			inner,
-			observer,
-			_phantom: core::marker::PhantomData,
-		}
+		Self { inner, observer, _phantom: core::marker::PhantomData }
 	}
 }
 

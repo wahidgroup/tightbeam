@@ -315,6 +315,8 @@ macro_rules! servlet {
 			pub struct $worker_name {
 				server_handle: Option<tokio::task::JoinHandle<()>>,
 				addr: std::net::SocketAddr,
+				// This is where workers live
+				#[allow(dead_code)]
 				workers: ::std::sync::Arc<[<$worker_name Workers>]>,
 			}
 
@@ -610,7 +612,7 @@ mod tests {
 		name: PingPongServlet,
 		protocol: TokioListener,
 		policies: {
-			with_collector_gate: crate::policy::AcceptAllGate::default()
+			with_collector_gate: crate::policy::AcceptAllGate
 		},
 		config: {
 			lotto_number: u32,
@@ -706,8 +708,8 @@ mod tests {
 				lotto_number: u32,
 			},
 			handle: |message, config| async move {
-				let is_winner = message.lucky_number == config.lotto_number;
-				is_winner
+
+				message.lucky_number == config.lotto_number
 			}
 		}
 
@@ -717,7 +719,7 @@ mod tests {
 				expected_message: String,
 			},
 			policies: {
-				with_receptor_gate: PingGate::default()
+				with_receptor_gate: PingGate
 			},
 			handle: |message, config| async move {
 				if message.content == config.expected_message {

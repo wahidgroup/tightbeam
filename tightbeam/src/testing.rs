@@ -748,7 +748,7 @@ macro_rules! test_worker {
             };
 
             // Clean shutdown
-            worker.shutdown().await?;
+            worker.kill().await?;
 
             result
         }

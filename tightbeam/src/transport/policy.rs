@@ -11,7 +11,10 @@ use crate::transport::TransportResult;
 use crate::{Frame, Message};
 
 /// Trait for transports that support policy configuration
-pub trait PolicyConfiguration where Self: Sized {
+pub trait PolicyConfiguration
+where
+	Self: Sized,
+{
 	fn with_restart_policy<P: RestartPolicy + 'static>(self, _: P) -> Self {
 		panic!("Restart policy is not supported on this transport");
 	}

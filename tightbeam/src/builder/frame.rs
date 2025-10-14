@@ -308,15 +308,15 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 		let mut metadata_builder = self.metadata_builder;
 
 		// Auto-set current time if order is omitted
-        #[cfg(feature = "std")]
-        if !metadata_builder.has_order() {
-            match SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-                Ok(duration) => {
-                    metadata_builder = metadata_builder.with_order(duration.as_secs());
-                }
-                Err(_) => return Err(TightBeamError::InvalidOrder),
-            }
-        }
+		#[cfg(feature = "std")]
+		if !metadata_builder.has_order() {
+			match SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+				Ok(duration) => {
+					metadata_builder = metadata_builder.with_order(duration.as_secs());
+				}
+				Err(_) => return Err(TightBeamError::InvalidOrder),
+			}
+		}
 
 		// 1. Encode ASN.1
 		let bytes = crate::encode(&message)?;
