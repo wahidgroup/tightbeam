@@ -1,4 +1,5 @@
 //! Worker framework for containerized tightbeam applications
+//! // TODO Disambiguate from tokio
 //!
 //! Workers provide a way to create self-contained, policy-driven message
 //! processing applications that can be easily deployed and tested.
@@ -485,7 +486,7 @@ mod tests {
 		name: PingPongWorker,
 		protocol: TokioListener,
 		policies: {
-			with_collector_gate: crate::policy::AcceptAllGate
+			with_collector_gate: crate::policy::AcceptAllGate::default()
 		},
 		config: {
 			lotto_number: u32,

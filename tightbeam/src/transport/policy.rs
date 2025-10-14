@@ -6,15 +6,24 @@ use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
-use crate::policy::GatePolicy;
+use crate::policy::{GatePolicy, ReceptorPolicy};
 use crate::transport::TransportResult;
-use crate::Frame;
+use crate::{Frame, Message};
 
 /// Trait for transports that support policy configuration
-pub trait PolicyConfiguration {
-	fn with_restart_policy<P: RestartPolicy + 'static>(self, policy: P) -> Self;
-	fn with_emitter_gate<G: GatePolicy + 'static>(self, gate: G) -> Self;
-	fn with_collector_gate<G: GatePolicy + 'static>(self, gate: G) -> Self;
+pub trait PolicyConfiguration where Self: Sized {
+	fn with_restart_policy<P: RestartPolicy + 'static>(self, _: P) -> Self {
+		panic!("Restart policy is not supported on this transport");
+	}
+	fn with_emitter_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
+		panic!("Emitter gate is not supported on this transport");
+	}
+	fn with_collector_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
+		panic!("Collector gate is not supported on this transport");
+	}
+	fn with_receptor_gate<T: Message, R: ReceptorPolicy<T> + 'static>(self, _: R) -> Self {
+		panic!("Receptor policy is not supported on this transport");
+	}
 }
 
 /// Restart policy trait - decides whether to retry and with what message.

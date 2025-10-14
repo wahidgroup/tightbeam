@@ -27,6 +27,51 @@ pub trait ReceptorPolicy<T: Message>: Send + Sync {
 	fn evaluate(&self, message: &T) -> TransitStatus;
 }
 
+/// Middleware wrapper for receptor policies that observes evaluations.
+///
+/// Wraps any `ReceptorPolicy` and calls a closure with the evaluation result.
+/// The middleware is transparent - it passes through the gate's decision
+/// unchanged.
+pub struct ReceptorMiddleware<T: Message, R: ReceptorPolicy<T>, F>
+where
+	F: Fn(&T, &TransitStatus) + Send + Sync,
+{
+	inner: R,
+	observer: F,
+	_phantom: core::marker::PhantomData<T>,
+}
+
+impl<T: Message, R: ReceptorPolicy<T>, F> ReceptorMiddleware<T, R, F>
+where
+	F: Fn(&T, &TransitStatus) + Send + Sync,
+{
+	/// Create a new middleware wrapper around a receptor policy.
+	///
+	/// # Arguments
+	/// * `inner` - The underlying receptor policy to wrap
+	/// * `observer` - Closure called with the message and evaluation result
+	pub fn new(inner: R, observer: F) -> Self {
+		Self {
+			inner,
+			observer,
+			_phantom: core::marker::PhantomData,
+		}
+	}
+}
+
+impl<T: Message, R: ReceptorPolicy<T>, F> ReceptorPolicy<T> for ReceptorMiddleware<T, R, F>
+where
+	F: Fn(&T, &TransitStatus) + Send + Sync,
+{
+	fn evaluate(&self, message: &T) -> TransitStatus {
+		let status = self.inner.evaluate(message);
+
+		// Observe the evaluation (transparent)
+		(self.observer)(message, &status);
+
+		status
+	}
+}
 /// Default gate that always accepts.
 #[derive(Default)]
 pub struct AcceptAllGate;

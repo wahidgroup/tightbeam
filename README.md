@@ -762,13 +762,22 @@ tightbeam follows established cryptographic standards and maintains algorithm ag
 - Service orchestration via Colony Monodomy/Polydomy patterns  
 - Cryptographically chainable message sequences
 
-TODO Efficient Compute Exchange Interconnect
+#### 8.1 Efficient Exchange Compute Interconnect
+The Efficient Exchange Compute Interconnect or EECI is a completely new
+software development paradigm inspired by the entymological world. As threads
+and tunnels underpin the basics of processing and communication, we can start
+at these base levels and develop from here.
 
-cluster!{}
+#### 8.2 Components
+There are three main components to the EECI:
+- Workers
+- Servlets
+- Clusters
 
-servlet!{}
 
-**See:** [Transport Integration Tests](tightbeam/tests/transport.rs)
+
+#### 8.2 Colony Monodomy/Polydomy Patterns
+A simple analogy is the look at insect colony patterns and extrapolate. 
 
 ## 9 Testing Framework
 Full end-to-end containerized testing framework
