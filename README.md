@@ -774,32 +774,31 @@ Full end-to-end containerized testing framework
 - Client/server "quantum tunneling" via MPSC channels
 
 ### Quantum Tunnel Testing
-These are our three "quantum particles" for a quantum tunnel.
-Each has a counterpart (up, down, charm, strange, top, and bottom)
+These are our three "entangled particles" for a quantum tunnel.
 
 ```rust
 // Server handler channel: tx for server, rx for container
-let (server_tx_charm, rx_strange) = mpsc::channel();
+let (tx, rx) = mpsc::channel();
 
 // Status channels (container receives ok/reject)
-let (ok_tx_up, ok_rx_down) = mpsc::channel();
-let (reject_tx_top, reject_rx_bottom) = mpsc::channel();
+let (ok_tx, ok_rx) = mpsc::channel();
+let (reject_tx, reject_rx) = mpsc::channel();
 
 // Exposed in test as single tuple
-let channels = (rx_strange, ok_rx_down, reject_rx_bottom);
+let channels = (rx, ok_rx, reject_rx);
 ```
 
 #### Message Flow Sequence
 1. Client emits a message
 2. The server MAY receive the message
-3. The gate MAY reject the message and MUST tell reject_tx_top
-	- If so, the client SHOULD* hear from reject_rx_bottom (MPSC channels may error)
-	- If not, the gate tells ok_tx_up and the client SHOULD* hear from ok_rx_down
-4. The server handles the message and MAY arbitrarily talk to server_tx_charm
-	- If so, the client SHOULD* hear from rx_strange
+3. The gate MAY reject the message and MUST tell reject_tx
+	- If so, the client SHOULD[^mpsc] hear from reject_rx
+	- If not, the gate tells ok_tx and the client SHOULD[^mpsc] hear from ok_rx
+4. The server handles the message and MAY arbitrarily talk to tx
+	- If so, the client SHOULD[^mpsc] hear from rx
 5. The server MAY respond with a message
 
-** MPSC ops MAY return Empty while polling; Disconnected ONLY occurs at teardown.
+[^mpsc]: MPSC ops MAY return Empty while polling; Disconnected ONLY occurs at teardown.
 ```rust
 service: |message, tx| async move {
     tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
@@ -837,7 +836,7 @@ service: |message, tx| async move {
 
 Container is in a "Quantum State" before the client gets the response. The 
 "wave function collapses" when await completes--causality intact. You can now 
-observe the results of rx_strange, ok_rx_down, and reject_rx_bottom: 
+observe the results of rx, ok_rx, and reject_rx: 
 ```rust
 let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
     // Collect checklist items
