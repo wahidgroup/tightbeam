@@ -78,6 +78,22 @@ macro_rules! servlet {
 				 |$message, $config_param| $handler_body);
 	};
 
+	// Worker with config and workers
+	(
+		name: $worker_name:ident,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:expr),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		workers: |$worker_config:ident| { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* $(,)? },
+		handle: |$message:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				 config_and_workers, {}, { $($config_field: $config_type,)* },
+				 { $($worker_field: $worker_type = $worker_init),* },
+				 |$message, $config_param, $workers_param| $handler_body, $worker_config);
+	};
+
 	// Basic worker with just message
 	(
 		name: $worker_name:ident,
@@ -130,6 +146,19 @@ macro_rules! servlet {
 				 basic, {}, {},
 				 |$message| $handler_body);
 		servlet!(@impl_trait $worker_name, {});
+	};
+
+	// Worker with config and workers
+	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr,)*],
+			  config_and_workers, {}, { $($config_field:ident: $config_type:ty,)* },
+			  { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+			  |$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident) => {
+		servlet!(@impl_struct_with_workers $worker_name, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* });
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				 config_and_workers, {}, { $($config_field: $config_type,)* },
+				 { $($worker_field: $worker_type = $worker_init),* },
+				 |$message, $config_param, $workers_param| $handler_body, $worker_config);
+		servlet!(@impl_trait $worker_name, { $($config_field: $config_type,)* });
 	};
 
 	// Generate struct and optional config struct
@@ -281,6 +310,98 @@ macro_rules! servlet {
 		}
 	};
 
+	(@impl_struct_with_workers $worker_name:ident, { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:ty),* }) => {
+		paste::paste! {
+			pub struct $worker_name {
+				server_handle: Option<tokio::task::JoinHandle<()>>,
+				addr: std::net::SocketAddr,
+				workers: ::std::sync::Arc<[<$worker_name Workers>]>,
+			}
+
+			#[derive(Clone)]
+			pub struct [<$worker_name Config>] {
+				$(pub $config_field: $config_type,)*
+			}
+
+			pub struct [<$worker_name Workers>] {
+				$(pub $worker_field: $worker_type,)*
+			}
+		}
+	};
+
+	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr),*],
+		config_and_workers, {}, { $($config_field:ident: $config_type:ty,)* },
+		{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+		|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident) => {
+		paste::paste! {
+			impl $worker_name {
+				pub async fn start(config: [<$worker_name Config>]) -> Result<Self, $crate::TightBeamError> {
+					servlet!(@setup_protocol $protocol, listener, addr);
+
+					let $worker_config = &config;
+					$(
+						let $worker_field = $worker_init?;
+					)*
+					let workers = [<$worker_name Workers>] {
+						$($worker_field,)*
+					};
+					let workers = ::std::sync::Arc::new(workers);
+
+					let server_handle = servlet!(@build_server_with_config_and_workers
+						$protocol, listener, [$($policy_key: $policy_val),*], config, workers.clone(),
+						(|$message: $crate::Frame, $config_param, $workers_param| async move { $handler_body }));
+
+					Ok(Self {
+						server_handle: Some(server_handle),
+						addr,
+						workers,
+					})
+				}
+
+				servlet!(@common_methods);
+			}
+
+			servlet!(@drop_impl_with_workers $worker_name);
+		}
+	};
+
+	// Build server with config and workers (non-empty policies)
+	(@build_server_with_config_and_workers $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $config:ident, $workers:expr, (|$msg:ident: $msg_ty:ty, $config_param:ident, $workers_param:ident| async move $body:block)) => {
+		{
+			let config_arc = ::std::sync::Arc::new($config);
+			let workers_arc = $workers;
+			$crate::server! {
+				protocol $protocol: $listener,
+				policies: { $($policy_key: $policy_val),* },
+				handle: move |$msg: $msg_ty| async move {
+					let config_arc = config_arc.clone();
+					let workers_arc = workers_arc.clone();
+					let $config_param = &config_arc;
+					let $workers_param = &workers_arc;
+					$body
+				}
+			}
+		}
+	};
+
+	// Build server with config and workers (empty policies)
+	(@build_server_with_config_and_workers $protocol:path, $listener:ident, [], $config:ident, $workers:expr, (|$msg:ident: $msg_ty:ty, $config_param:ident, $workers_param:ident| async move $body:block)) => {
+		{
+			let config_arc = ::std::sync::Arc::new($config);
+			let workers_arc = $workers;
+			$crate::server! {
+				protocol $protocol: $listener,
+				handle: move |$msg: $msg_ty| async move {
+					let config_arc = config_arc.clone();
+					let workers_arc = workers_arc.clone();
+					let $config_param = &config_arc;
+					let $workers_param = &workers_arc;
+					$body
+				}
+			}
+		}
+	};
+
 	// Common methods shared by all colony
 	(@common_methods) => {
 		pub fn addr(&self) -> std::net::SocketAddr {
@@ -304,6 +425,17 @@ macro_rules! servlet {
 
 	// Drop implementation shared by all colony
 	(@drop_impl $worker_name:ident) => {
+		impl Drop for $worker_name {
+			fn drop(&mut self) {
+				if let Some(handle) = self.server_handle.take() {
+					handle.abort();
+				}
+			}
+		}
+	};
+
+	// Drop implementation with workers
+	(@drop_impl_with_workers $worker_name:ident) => {
 		impl Drop for $worker_name {
 			fn drop(&mut self) {
 				if let Some(handle) = self.server_handle.take() {
@@ -457,33 +589,25 @@ macro_rules! servlet {
 
 #[cfg(test)]
 mod tests {
+	use crate::der::Sequence;
 	use crate::transport::policy::PolicyConfiguration;
 	use crate::transport::tcp::TokioListener;
 	use crate::transport::MessageEmitter;
 
-	// crate::routes! {
-	// 	EchoRouter {
-	// 		echo_tx: mpsc::Sender<crate::Frame>,
-	// 	}:
-	// 		TestMessage |router, msg| {
-	// 			let _ = router.echo_tx.send(msg);
-	// 		}
-	// }
-
-	#[derive(crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
+	#[derive(crate::Beamable, Clone, Debug, PartialEq, Sequence)]
 	struct RequestMessage {
 		content: String,
 		lucky_number: u32,
 	}
 
-	#[derive(crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
+	#[derive(crate::Beamable, Clone, Debug, PartialEq, Sequence)]
 	struct ResponseMessage {
 		result: String,
 		is_winner: bool,
 	}
 
 	servlet! {
-		name: PingPongWorker,
+		name: PingPongServlet,
 		protocol: TokioListener,
 		policies: {
 			with_collector_gate: crate::policy::AcceptAllGate::default()
@@ -515,7 +639,7 @@ mod tests {
 		worker_threads: 2,
 		protocol: TokioListener,
 		setup: || {
-			PingPongWorker::start(PingPongWorkerConfig { lotto_number: 42 })
+			PingPongServlet::start(PingPongServletConfig { lotto_number: 42 })
 		},
 		assertions: |client| async move {
 			fn generate_message(
@@ -548,6 +672,143 @@ mod tests {
 			assert!(!response_message.is_winner);
 
 			Ok(())
+		}
+	}
+
+	mod workers {
+		use super::*;
+		use crate::{
+			policy::{ReceptorPolicy, TransitStatus},
+			Beamable,
+		};
+
+		#[derive(Sequence, Beamable, Clone, Debug, PartialEq)]
+		pub struct PongMessage {
+			result: String,
+		}
+
+		#[derive(Default)]
+		struct PingGate;
+
+		impl ReceptorPolicy<RequestMessage> for PingGate {
+			fn evaluate(&self, maybe_ping: &RequestMessage) -> TransitStatus {
+				if maybe_ping.content == "PING" {
+					TransitStatus::Accepted
+				} else {
+					TransitStatus::Forbidden
+				}
+			}
+		}
+
+		crate::worker! {
+			name: LuckyNumberDeterminer<RequestMessage, bool>,
+			config: {
+				lotto_number: u32,
+			},
+			handle: |message, config| async move {
+				let is_winner = message.lucky_number == config.lotto_number;
+				is_winner
+			}
+		}
+
+		crate::worker! {
+			name: PingPongWorker<RequestMessage, Option<PongMessage>>,
+			config: {
+				expected_message: String,
+			},
+			policies: {
+				with_receptor_gate: PingGate::default()
+			},
+			handle: |message, config| async move {
+				if message.content == config.expected_message {
+					Some(PongMessage {
+						result: "PONG".to_string(),
+					})
+				} else {
+					None
+				}
+			}
+		}
+
+		servlet! {
+			name: PingPongServletWithWorker,
+			protocol: TokioListener,
+			config: {
+				lotto_number: u32,
+				expected_message: String,
+			},
+			workers: |config| {
+				ping_pong: PingPongWorker = PingPongWorker::start(PingPongWorkerConfig {
+					expected_message: config.expected_message.clone(),
+				}),
+				lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig {
+					lotto_number: config.lotto_number,
+				})
+			},
+			handle: |message, _config, workers| async move {
+				let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
+				let (ping_result, lucky_result) = tokio::join!(
+					workers.ping_pong.relay(decoded.clone()),
+					workers.lucky_number.relay(decoded.clone())
+				);
+
+				let reply = match ping_result {
+					Ok(reply) => reply,
+					Err(_) => return None,
+				};
+
+				let is_winner = match lucky_result {
+					Ok(is_winner) => is_winner,
+					Err(_) => return None,
+				};
+
+				if let Some(reply) = reply {
+					crate::compose! {
+						V0: id: message.metadata.id.clone(),
+							message: ResponseMessage {
+								result: reply.result,
+								is_winner,
+							}
+					}.ok()
+				} else {
+					None
+				}
+			}
+		}
+
+		crate::test_servlet! {
+			name: test_servlet_with_workers,
+			features: ["std", "tcp", "tokio"],
+			worker_threads: 2,
+			protocol: TokioListener,
+			setup: || {
+				PingPongServletWithWorker::start(PingPongServletWithWorkerConfig {
+					lotto_number: 42,
+					expected_message: "PING".to_string(),
+				})
+			},
+			assertions: |client| async move {
+				fn generate_message(
+					lucky_number: u32,
+					content: Option<String>
+				) -> Result<crate::Frame, crate::TightBeamError> {
+					let message = RequestMessage {
+						content: content.unwrap_or_else(|| "PING".to_string()),
+						lucky_number,
+					};
+
+					crate::compose! { V0: id: b"test-ping", message: message }
+				}
+
+				// Test winning case
+				let ping_message = generate_message(42, None)?;
+				let response = client.emit(ping_message, None).await?;
+				let response_message = crate::decode::<ResponseMessage, _>(&response.unwrap().message)?;
+				assert_eq!(response_message.result, "PONG");
+				assert!(response_message.is_winner);
+
+				Ok(())
+			}
 		}
 	}
 }

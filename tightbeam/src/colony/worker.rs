@@ -38,6 +38,7 @@ impl core::fmt::Display for WorkerRelayError {
 impl std::error::Error for WorkerRelayError {}
 
 pub struct WorkerPolicies<I: Send> {
+    #[allow(dead_code)]
     pub(crate) receptor_gate: Option<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
 }
 

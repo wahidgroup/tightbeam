@@ -139,6 +139,14 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Invalid overflow value"))]
 	InvalidOverflowValue,
 
+	/// Invalid order
+	#[cfg_attr(feature = "derive", error("Invalid order"))]
+	InvalidOrder,
+
+	// Missing order
+	#[cfg_attr(feature = "derive", error("Missing order"))]
+	MissingOrder,
+
 	/// Missing feature
 	#[cfg_attr(feature = "derive", error("Missing feature: {0}"))]
 	MissingFeature(&'static str),
@@ -192,6 +200,8 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::InvalidBody => write!(f, "Invalid message body"),
 			TightBeamError::InvalidOID(err) => write!(f, "Invalid or unsupported object identifier: {err}"),
 			TightBeamError::InvalidOverflowValue => write!(f, "Invalid overflow value"),
+			TightBeamError::InvalidOrder => write!(f, "Invalid order"),
+			TightBeamError::MissingOrder => write!(f, "Missing order"),
 			TightBeamError::MissingPriority => write!(f, "Missing priority"),
 			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
 			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),

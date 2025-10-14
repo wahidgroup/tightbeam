@@ -766,14 +766,14 @@ tightbeam follows established cryptographic standards and maintains algorithm ag
 The Efficient Exchange Compute Interconnect or EECI is a completely new
 software development paradigm inspired by the entymological world. As threads
 and tunnels underpin the basics of processing and communication, we can start
-at these base levels and develop from here.
+at these base levels and develop from here. The goal of EECI is to operate
+on these base layers across any transmission protocol: thread-to-thread.
 
 #### 8.2 Components
 There are three main components to the EECI:
 - Workers
 - Servlets
 - Clusters
-
 
 
 #### 8.2 Colony Monodomy/Polydomy Patterns
