@@ -144,8 +144,8 @@ macro_rules! cert {
 /// use tightbeam::csr;
 ///
 /// let csr = csr!(
-///	 subject: "CN=example.com",
-///	 signer: &signing_key
+///     subject: "CN=example.com",
+///     signer: &signing_key
 /// )?;
 /// ```
 #[cfg(feature = "x509")]

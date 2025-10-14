@@ -1,4 +1,3 @@
-use crate::error::TightBeamError;
 use crate::transport::TransitStatus;
 
 /// Transport error types
@@ -15,7 +14,6 @@ pub enum TransportError {
 	InvalidReply,
 	MissingRequest,
 	MaxRetriesExceeded,
-	TightBeamError(TightBeamError),
 	#[cfg(feature = "std")]
 	IoError(std::io::Error),
 }
@@ -25,8 +23,6 @@ impl core::fmt::Display for TransportError {
 		write!(f, "{self:?}")
 	}
 }
-
-crate::impl_from!(TightBeamError => TransportError::TightBeamError);
 
 #[cfg(feature = "std")]
 crate::impl_from!(std::io::Error => TransportError::IoError);

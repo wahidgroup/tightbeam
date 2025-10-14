@@ -497,7 +497,7 @@ mod tests {
 
 		use crate::transport::policy::PolicyConfiguration;
 		use crate::transport::policy::RestartLinearBackoff;
-		use crate::transport::tcp::r#async::{TokioListener};
+		use crate::transport::tcp::r#async::TokioListener;
 
 		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
 		let addr = listener.local_addr().unwrap();

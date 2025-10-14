@@ -6,7 +6,7 @@ use tightbeam::prelude::*;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
 
-use der::Sequence;
+use der::{Enumerated, Sequence};
 
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 struct RequestMessage {
@@ -16,6 +16,15 @@ struct RequestMessage {
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 struct ResponseMessage {
 	result: String,
+}
+
+/// Checklist for container assertions
+#[derive(Enumerated, Beamable, Copy, Clone, Debug, PartialEq)]
+#[repr(u8)]
+enum ServiceAssertChecklist {
+	ContainerMessageReceived = 1,
+	ContainerPingReceived = 2,
+	SentResponse = 3,
 }
 
 test_container! {
@@ -31,19 +40,22 @@ test_container! {
 		gate: policy::AcceptAllGate
 	},
 	service: |message, tx| async move {
-		// Echo the message back when server gate Accepted it
-		let result = tx.send(message.clone());
-		assert!(result.is_ok());
+		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
 
 		let decoded = tightbeam::decode::<RequestMessage, _>(&message.clone().message).ok()?;
 		if &decoded.content == "PING" {
-			Some(tightbeam::compose! {
+			tightbeam::relay!(ServiceAssertChecklist::ContainerPingReceived, tx)?;
+
+			let response = Some(tightbeam::compose! {
 				V0: id: message.metadata.id.clone(),
 					order: 1_700_000_000u64,
 					message: ResponseMessage {
 						result: "PONG".into()
 					}
-			}.ok()?)
+			}.ok()?);
+
+			tightbeam::relay!(ServiceAssertChecklist::SentResponse, tx)?;
+			response
 		} else {
 			None
 		}
@@ -62,13 +74,19 @@ test_container! {
 				}
 		}?;
 
+		// Test Message Transport
+
 		// Send and expect acceptance + echo response
 		let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
+			// Collect checklist items
+			assert_recv!(rx, ServiceAssertChecklist::ContainerMessageReceived);
+			assert_recv!(rx, ServiceAssertChecklist::ContainerPingReceived);
+			assert_recv!(rx, ServiceAssertChecklist::SentResponse);
+			// Verify response metadata
 			assert_eq!(response.metadata.id, message.metadata.id);
 			// Ensure we received the message on the server side
-			assert_recv!(rx, message, 2, 1);
-			assert_recv!(ok_rx, message, 2, 1);
-			// Ensure no rejections
+			assert_recv!(ok_rx, message);
+			// Ensure server did not reject
 			assert_channels_quiet!(reject_rx);
 
 			tightbeam::decode::<ResponseMessage, _>(&response.message).ok()

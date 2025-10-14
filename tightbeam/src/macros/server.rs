@@ -194,7 +194,7 @@ macro_rules! server {
 	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let server = $listener;	
+			let server = $listener;
 			tokio::spawn(async move {
 				$crate::server!(@async_loop server, $handler, None, None, $($policy_name: $policy_value),*)
 			})
@@ -204,7 +204,7 @@ macro_rules! server {
 	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let server = $listener;	
+			let server = $listener;
 			tokio::spawn(async move {
 				$crate::server!(@async_loop server, $handler, Some($error_tx), Some($ok_tx), $($policy_name: $policy_value),*)
 			})

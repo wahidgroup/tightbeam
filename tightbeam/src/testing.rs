@@ -228,21 +228,21 @@ macro_rules! test_case {
 /// # Example
 /// ```ignore
 /// test_builder! {
-///	 name: test_metadata_v2,
-///	 builder_type: MetadataBuilder,
-///	 version: ProtocolVersion::V2,
-///	 features: ["std"],
-///	 setup: |builder| {
-///		 builder
-///			 .with_id(b"test")
-///			 .with_order(123)
-///			 .build()
-///	 },
-///	 assertions: |result| {
-///		 let metadata = result?;
-///		 assert_eq!(metadata.id, "test");
-///		 Ok(())
-///	 }
+///     name: test_metadata_v2,
+///     builder_type: MetadataBuilder,
+///     version: ProtocolVersion::V2,
+///     features: ["std"],
+///     setup: |builder| {
+///     builder
+///         .with_id(b"test")
+///         .with_order(123)
+///         .build()
+///     },
+///     assertions: |result| {
+///         let metadata = result?;
+///         assert_eq!(metadata.id, "test");
+///         Ok(())
+///     }
 /// }
 /// ```
 #[macro_export]
@@ -566,60 +566,88 @@ macro_rules! assert_channel_ne {
 	}};
 }
 
-/// Assert that a channel receives a specific TightBeam (by id) within a
-/// timeout, optionally N times. If COUNT is omitted, succeeds after the first
-/// match within the timeout.
+// Helper: match a Frame against various "expected" forms.
+// - Frame => compare metadata.id
+// - Result<Frame, E> => compare metadata.id from Ok(frame)
+// - Any T: Beamable + PartialEq => decode T from frame.message and compare
+pub trait ExpectedMatcher {
+	fn matches(&self, frame: &crate::Frame) -> bool;
+}
+
+impl ExpectedMatcher for crate::Frame {
+	fn matches(&self, frame: &crate::Frame) -> bool {
+		frame.metadata.id == self.metadata.id
+	}
+}
+
+impl<E> ExpectedMatcher for Result<crate::Frame, E> {
+	fn matches(&self, frame: &crate::Frame) -> bool {
+		match self {
+			Ok(f) => frame.metadata.id == f.metadata.id,
+			Err(_) => false,
+		}
+	}
+}
+
+impl<T> ExpectedMatcher for T
+where
+	T: crate::Message + PartialEq,
+{
+	fn matches(&self, frame: &crate::Frame) -> bool {
+		if let Ok(decoded) = crate::decode::<T, _>(&frame.message) {
+			decoded == *self
+		} else {
+			false
+		}
+	}
+}
+
+/// Assert that a channel receives a specific TightBeam message within a count,
+/// draining whatever is already available (no wait).
+/// Supports:
+/// - Frame / Result<Frame, E>: matched by metadata.id
+/// - Any Beamable/Message value: matched by decoding and comparing equality
 #[macro_export]
 macro_rules! assert_recv {
-	// Shorthand: assert_recv!(rx, msg, ms, n)
-	($rx:expr, $msg:expr, $ms:expr, $n:expr) => {{
-		assert_recv!(@impl $rx, ($msg).metadata.id.clone(), $ms, ($n as usize), true)
-	}};
-	// Shorthand: assert_recv!(rx, msg, ms)
-	($rx:expr, $msg:expr, $ms:expr) => {{
-		assert_recv!(@impl $rx, ($msg).metadata.id.clone(), $ms, 1usize, false)
-	}};
-	// Internal implementation
-	(@impl $rx:expr, $id:expr, $ms:expr, $need:expr, $is_count:expr) => {{
-		use std::sync::mpsc::RecvTimeoutError;
-		use std::time::{Duration, Instant};
-		let __target_id = $id;
-		let __start = Instant::now();
-		let __timeout = Duration::from_millis($ms as u64);
+	// Count form: consume up to N matches, stop once satisfied (non-blocking)
+	($rx:expr, $expected:expr, $n:expr) => {{
+		use $crate::testing::ExpectedMatcher as _;
+		let __expected_ref = &($expected);
 		let mut __got: usize = 0;
-		while __got < $need {
-			let __elapsed = __start.elapsed();
-			if __elapsed >= __timeout {
-				break;
-			}
-			let __remain = __timeout - __elapsed;
-			match $rx.recv_timeout(__remain) {
+		while __got < ($n as usize) {
+			match $rx.try_recv() {
 				Ok(__m) => {
-					if __m.metadata.id == __target_id {
+					if __expected_ref.matches(&__m) {
 						__got += 1;
 					}
 				}
-				Err(RecvTimeoutError::Timeout) => break,
-				Err(RecvTimeoutError::Disconnected) => break,
+				Err(std::sync::mpsc::TryRecvError::Empty) => break,
+				Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
 			}
 		}
-		if $is_count {
-			assert!(
-				__got == $need,
-				"assert_recv! expected {} occurrences of id {:#?}, got {} within {}ms",
-				$need,
-				__target_id,
-				__got,
-				$ms
-			);
-		} else {
-			assert!(
-				__got >= 1,
-				"assert_recv! expected id {:#?} within {}ms but none was received",
-				__target_id,
-				$ms
-			);
+		assert!(
+			__got == ($n as usize),
+			"assert_recv! expected {} occurrences, got {} (non-blocking, stop on match)",
+			$n as usize,
+			__got
+		);
+	}};
+
+	// Single form: stop on first match (non-blocking)
+	($rx:expr, $expected:expr) => {{
+		use $crate::testing::ExpectedMatcher as _;
+		let __expected_ref = &($expected);
+		let mut __found = false;
+		while let Ok(__m) = $rx.try_recv() {
+			if __expected_ref.matches(&__m) {
+				__found = true;
+				break;
+			}
 		}
+		assert!(
+			__found,
+			"assert_recv! expected at least 1 occurrence but none was received (non-blocking, stop on first match)"
+		);
 	}};
 }
 
@@ -897,15 +925,15 @@ mod tests {
 			let response_message = response.unwrap();
 			assert_eq!(response_message.metadata.id, accept_msg.clone().metadata.id);
 			assert_eq!(crate::decode::<TestMessage, _>(&response_message.message)?.content, "OK".to_string());
-			assert_recv!(ok_rx, accept_msg, 2, 1);
-			assert_recv!(rx, accept_msg, 2, 1);
+			assert_recv!(ok_rx, accept_msg, 1);
+			assert_recv!(rx, accept_msg, 1);
 			assert_channel_ne!(reject_rx, accept_msg);
 
 			// Rejected by server gate
 			let reject_msg = create_v0_tightbeam(Some("reject case"), Some("reject-13"));
 			let response = client.emit(reject_msg.clone(), None).await;
 			assert!(response.is_err());
-			assert_recv!(reject_rx, reject_msg.clone(), 10, 4); // 1 initial + 3 retries
+			assert_recv!(reject_rx, reject_msg.clone(), 4); // 1 initial + 3 retries
 			assert_channel_ne!(ok_rx, reject_msg);
 			assert_channel_ne!(rx, reject_msg);
 
@@ -914,7 +942,7 @@ mod tests {
 			let start = std::time::Instant::now();
 			let response = client.emit(timeout_msg.clone(), None).await;
 			assert!(response.is_err());
-			assert_recv!(reject_rx, timeout_msg.clone(), 20, 4); // 1 initial + 3 retries
+			assert_recv!(reject_rx, timeout_msg.clone(), 4); // 1 initial + 3 retries
 			assert!(start.elapsed().as_millis() >= 5);
 			assert_channels_quiet!(rx, ok_rx);
 

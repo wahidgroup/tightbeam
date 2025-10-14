@@ -76,6 +76,11 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	CompressionError(CompressionError),
 
+	#[cfg(feature = "transport")]
+	#[cfg_attr(feature = "derive", error("Transport error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	TransportError(crate::transport::error::TransportError),
+
 	/// Unsupported protocol version
 	#[cfg_attr(
 		feature = "derive",

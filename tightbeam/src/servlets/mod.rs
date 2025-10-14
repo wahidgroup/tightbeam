@@ -456,8 +456,8 @@ macro_rules! servlet {
 
 #[cfg(test)]
 mod tests {
-	use crate::transport::tcp::TokioListener;
 	use crate::transport::policy::PolicyConfiguration;
+	use crate::transport::tcp::TokioListener;
 	use crate::transport::MessageEmitter;
 
 	// crate::routes! {
