@@ -137,11 +137,13 @@ tightbeam supports run-time security profile enforcement at the message type lev
 
 ```rust
 pub trait Message: /* trait bounds */ {
+	const MIN_VERSION: Version = Version::V0;
 	const MUST_BE_NON_REPUDIABLE: bool = false;
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: Version = Version::V0;
+	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
 }
 ```
 
@@ -921,7 +923,7 @@ test_container! {
 				}
 		}?;
 
-		// Test Message Transport
+		//# Test message transport
 
 		// Send and expect acceptance + echo response
 		let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
@@ -940,6 +942,8 @@ test_container! {
 		} else {
 			panic!("Expected a response from the service");
 		};
+
+		//# Test message shape
 
 		match decoded {
 			Some(reply) => {

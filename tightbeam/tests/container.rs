@@ -74,7 +74,7 @@ test_container! {
 				}
 		}?;
 
-		// Test Message Transport
+		//# Test message transport
 
 		// Send and expect acceptance + echo response
 		let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
@@ -93,6 +93,8 @@ test_container! {
 		} else {
 			panic!("Expected a response from the service");
 		};
+
+		//# Test message shape
 
 		match decoded {
 			Some(reply) => {
