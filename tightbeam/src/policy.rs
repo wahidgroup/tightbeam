@@ -1,5 +1,5 @@
 use crate::der::Enumerated;
-use crate::Frame;
+use crate::{Frame, Message};
 
 /// Transport response status codes
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +20,11 @@ pub enum TransitStatus {
 /// should be accepted or rejected.
 pub trait GatePolicy: Send + Sync {
 	fn evaluate(&self, message: &Frame) -> TransitStatus;
+}
+
+/// Policy trait a user implements to decide message acceptance.
+pub trait ReceptorPolicy<T: Message>: Send + Sync {
+	fn evaluate(&self, message: &T) -> TransitStatus;
 }
 
 /// Default gate that always accepts.

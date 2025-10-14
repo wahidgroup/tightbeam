@@ -72,6 +72,8 @@ pub mod utils;
 
 #[cfg(feature = "builder")]
 pub mod builder;
+#[cfg(feature = "colony")]
+pub mod colony;
 #[cfg(feature = "constants")]
 pub mod constants;
 #[cfg(feature = "crypto")]
@@ -86,8 +88,6 @@ pub mod policy;
 pub mod random;
 #[cfg(feature = "router")]
 pub mod router;
-#[cfg(feature = "servlets")]
-pub mod servlets;
 #[cfg(feature = "standards")]
 pub mod standards;
 #[cfg(feature = "transport")]
@@ -122,5 +122,3 @@ pub mod testing;
 
 #[cfg(feature = "builder")]
 tightbeam_derive::generate_builders!();
-
-// TODO relay! { TightBeam, Router }

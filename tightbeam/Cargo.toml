@@ -77,7 +77,7 @@ full = [
 	"standards-rfc",
 	"standards-iso",
 	"testing",
-	"servlets"
+	"colony"
 ]
 
 # Core features
@@ -91,7 +91,7 @@ doc = []
 compress = ["tightbeam-derive?/compress"]
 transport-policy = ["policy", "transport"]
 tcp = ["transport"]
-servlets = ["full"]
+colony = ["full"]
 testing = []
 
 # TODO

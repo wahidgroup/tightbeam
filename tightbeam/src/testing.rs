@@ -723,10 +723,10 @@ macro_rules! assert_retry_metric {
 	}};
 }
 
-/// Async test macro with servlet setup
+/// Async test macro with worker setup
 ///
-/// Automatically starts a servlet, creates a client, and passes the ready
-/// client to the assertions block for testing. Properly manages servlet
+/// Automatically starts a worker, creates a client, and passes the ready
+/// client to the assertions block for testing. Properly manages worker
 /// lifecycle.
 #[macro_export]
 macro_rules! test_servlet {
@@ -742,23 +742,23 @@ macro_rules! test_servlet {
 		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
 		$(#[cfg(all($(feature = $feature),*))])?
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
-				// Call the setup closure and await the resulting future
-				let servlet = $setup_body.await?;
-				// Get the servlet address
-				let addr = servlet.addr();
+			// Call the setup closure and await the resulting future
+			let worker = $setup_body.await?;
+			// Get the worker address
+			let addr = worker.addr();
 
-				// Create client
-				let mut $client = $crate::client! {
-					connect $protocol: addr
-				};
+			// Create client
+			let mut $client = $crate::client! {
+				connect $protocol: addr
+			};
 
-				// Run assertions
-				let result = $assertions_body.await;
+			// Run assertions
+			let result = $assertions_body.await;
 
-				// Clean shutdown
-				servlet.stop();
+			// Clean shutdown
+			worker.stop();
 
-				result
+			result
 		}
 	};
 
@@ -773,27 +773,24 @@ macro_rules! test_servlet {
 		#[tokio::test]
 		$(#[cfg(all($(feature = $feature),*))])?
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
-				// Call the setup closure and await the resulting future
-				let servlet = ($setup_body).await?;
+			// Call the setup closure and await the resulting future
+			let worker = ($setup_body).await?;
 
-				// Get the servlet address
-				let addr = servlet.addr();
+			// Get the worker address
+			let addr = worker.addr();
 
-				// Give server time to start
-				tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+			// Create client
+			let mut $client = $crate::client! {
+				async $protocol: connect addr
+			}.await?;
 
-				// Create client
-				let mut $client = $crate::client! {
-					async $protocol: connect addr
-				}.await?;
+			// Run assertions
+			let result = $assertions_body.await;
 
-				// Run assertions
-				let result = $assertions_body.await;
+			// Clean shutdown
+			worker.stop();
 
-				// Clean shutdown
-				servlet.stop();
-
-				result
+			result
 		}
 	};
 }
