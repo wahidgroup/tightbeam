@@ -108,7 +108,7 @@ macro_rules! cert {
 		$(, path_len: $path_len:expr)?
 	) => {{
 		use core::str::FromStr;
-		use crate::crypto::x509::builder::Builder;
+		use $crate::crypto::x509::builder::Builder;
 
 		let subject = $crate::crypto::x509::name::Name::from_str($subject)?;
 		let issuer = $crate::crypto::x509::name::Name::from_str($issuer)?;

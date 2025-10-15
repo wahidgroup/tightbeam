@@ -224,27 +224,6 @@ macro_rules! test_case {
 ///
 /// Similar to test_case! but specifically designed for testing builders.
 /// Automatically provides a base builder instance and allows customization.
-///
-/// # Example
-/// ```ignore
-/// test_builder! {
-///     name: test_metadata_v2,
-///     builder_type: MetadataBuilder,
-///     version: ProtocolVersion::V2,
-///     features: ["std"],
-///     setup: |builder| {
-///     builder
-///         .with_id(b"test")
-///         .with_order(123)
-///         .build()
-///     },
-///     assertions: |result| {
-///         let metadata = result?;
-///         assert_eq!(metadata.id, "test");
-///         Ok(())
-///     }
-/// }
-/// ```
 #[macro_export]
 macro_rules! test_builder {
 	(
@@ -430,58 +409,29 @@ macro_rules! test_container {
 		.expect("Failed to create client")
 	}};
 
-	// Build server with gate policy provided as an inline block that returns a GatePolicy
-	(@build_server $protocol:path, $listener:ident, $tx:ident, $ok_tx:ident, $reject_tx:ident, [gate: { $($gate_block:tt)* } $(, $($rest:tt)*)?], |$msg:ident: $msg_ty:ty, $svc_tx:ident| $body:expr) => {
-		{
-			$crate::server! {
-				protocol $protocol: $listener,
-				policies: {
-					with_collector_gate: {
-						// Generate GateMiddleware here to observe and forward decisions
-						let ok_tx_clone = $ok_tx.clone();
-						let reject_tx_clone = $reject_tx.clone();
-						$crate::policy::GateMiddleware::new(
-							{ $($gate_block)* },
-							move |message: &$crate::Frame, status: &$crate::policy::TransitStatus| {
-								if *status == $crate::policy::TransitStatus::Accepted {
-									let _ = ok_tx_clone.send(message.clone());
-								} else {
-									let _ = reject_tx_clone.send(message.clone());
-								}
-							}
-						)
-					}
-					$(, $($rest)*)?
-				},
-				handle: move |$msg: $msg_ty| {
-					let $svc_tx = $tx.clone();
-					$body
-				}
-			}
-		}
-	};
-
-	// Build server with gate policy
+	// Build server with gate policy - wrap in array for server! macro
 	(@build_server $protocol:path, $listener:ident, $tx:ident, $ok_tx:ident, $reject_tx:ident, [gate: $gate:expr $(, $($rest:tt)*)?], |$msg:ident: $msg_ty:ty, $svc_tx:ident| $body:expr) => {
 		{
 			$crate::server! {
 				protocol $protocol: $listener,
 				policies: {
-					with_collector_gate: {
-						// Generate GateMiddleware here to observe and forward decisions
-						let ok_tx_clone = $ok_tx.clone();
-						let reject_tx_clone = $reject_tx.clone();
+					with_collector_gate: [{
+						let ok_tx_arc = $ok_tx.clone();
+						let reject_tx_arc = $reject_tx.clone();
+						let gate_instance = $gate;
 						$crate::policy::GateMiddleware::new(
-							$gate,
+							gate_instance,
 							move |message: &$crate::Frame, status: &$crate::policy::TransitStatus| {
+								let ok_tx = ok_tx_arc.clone();
+								let reject_tx = reject_tx_arc.clone();
 								if *status == $crate::policy::TransitStatus::Accepted {
-									let _ = ok_tx_clone.send(message.clone());
+									let _ = ok_tx.send(message.clone());
 								} else {
-									let _ = reject_tx_clone.send(message.clone());
+									let _ = reject_tx.send(message.clone());
 								}
 							}
 						)
-					}
+					}]
 					$(, $($rest)*)?
 				},
 				handle: move |$msg: $msg_ty| {
@@ -492,12 +442,12 @@ macro_rules! test_container {
 		}
 	};
 
-	// Build server with policies (but not gate)
+	// Build server with policies (but not gate) - wrap each policy value in array
 	(@build_server $protocol:path, $listener:ident, $tx:ident, $ok_tx:ident, $reject_tx:ident, [$($policy_key:ident: $policy_val:expr),+], |$msg:ident: $msg_ty:ty, $svc_tx:ident| $body:expr) => {
 		{
 			$crate::server! {
 				protocol $protocol: $listener,
-				policies: { $($policy_key: $policy_val),* },
+				policies: { $($policy_key: [$policy_val]),+ },
 				handle: move |$msg: $msg_ty| {
 					let $svc_tx = $tx.clone();
 					$body
@@ -725,33 +675,31 @@ macro_rules! assert_retry_metric {
 /// Properly manages worker lifecycle with shutdown.
 #[macro_export]
 macro_rules! test_worker {
-    (
-        name: $test_name:ident,
-        $(features: [$($feature:literal),*],)?
-        setup: || $setup_body:expr,
-        assertions: |$worker:ident| $assertions_body:expr
-    ) => {
-        #[tokio::test]
-        $(#[cfg(all($(feature = $feature),*))])?
-        async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
-            // Call the setup closure and get the worker
-            let worker = $setup_body?;
+	(
+		name: $test_name:ident,
+		setup: || $setup_body:expr,
+		assertions: |$worker:ident| $assertions_body:expr
+	) => {
+		#[tokio::test]
+		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+			// Call the setup closure and get the worker
+			let worker = $setup_body?;
 
-            // Run assertions with reference to worker
-            let result = {
-                let $worker = &worker;
-                $assertions_body.await
-            };
+			// Run assertions with reference to worker
+			let result = {
+				let $worker = &worker;
+				$assertions_body.await
+			};
 
-            // Clean shutdown
+			// Clean shutdown
 			#[cfg(feature = "tokio")]
-            worker.kill().await?;
+			worker.kill().await?;
 			#[cfg(all(not(feature = "tokio"), feature = "std"))]
-            worker.kill()?;
+			worker.kill()?;
 
-            result
-        }
-    };
+			result
+		}
+	};
 }
 
 /// Async test macro with worker setup
@@ -764,14 +712,12 @@ macro_rules! test_servlet {
 	// With worker_threads specified
 	(
 		name: $test_name:ident,
-		$(features: [$($feature:literal),*],)?
 		worker_threads: $threads:literal,
 		protocol: $protocol:ident,
 		setup: || $setup_body:expr,
 		assertions: |$client:ident| $assertions_body:expr
 	) => {
 		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
-		$(#[cfg(all($(feature = $feature),*))])?
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Call the setup closure and await the resulting future
 			let worker = $setup_body.await?;
@@ -796,13 +742,11 @@ macro_rules! test_servlet {
 	// Without worker_threads (defaults to single threaded)
 	(
 		name: $test_name:ident,
-		$(features: [$($feature:literal),*],)?
 		protocol: $protocol:ident,
 		setup: || $setup_body:expr,
 		assertions: |$client:ident| $assertions_body:expr
 	) => {
 		#[tokio::test]
-		$(#[cfg(all($(feature = $feature),*))])?
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Call the setup closure and await the resulting future
 			let worker = ($setup_body).await?;
@@ -813,7 +757,8 @@ macro_rules! test_servlet {
 			// Create client
 			let mut $client = $crate::client! {
 				async $protocol: connect addr
-			}.await?;
+			}
+			.await?;
 
 			// Run assertions
 			let result = $assertions_body.await;
@@ -830,11 +775,54 @@ macro_rules! test_servlet {
 mod tests {
 	use super::*;
 
+	use crate::policy::{GatePolicy, TransitStatus};
 	use crate::transport::policy::PolicyConfiguration;
 
+	/// Custom gate that interprets message.metadata.id:
+	/// - "accept-{ID}"  => accept immediately
+	/// - "reject-{ID}"  => forbidden
+	/// - "timeout-{MS}" => sleep MS millis then timeout (or timeout if MS is invalid)
+	#[derive(Default, Clone)]
+	pub struct IdPatternGate;
+
+	impl GatePolicy for IdPatternGate {
+		fn evaluate(&self, msg: &crate::Frame) -> TransitStatus {
+			let id = &msg.metadata.id;
+			if id.strip_prefix(b"accept-").is_some() {
+				TransitStatus::Accepted
+			} else if id.strip_prefix(b"reject-").is_some() {
+				TransitStatus::Forbidden
+			} else if let Ok(ms_str) = std::str::from_utf8(id.strip_prefix(b"timeout-").unwrap_or(&[])) {
+				if let Ok(ms) = ms_str.parse::<u64>() {
+					std::thread::sleep(std::time::Duration::from_millis(ms));
+					TransitStatus::Timeout
+				} else {
+					TransitStatus::Timeout
+				}
+			} else {
+				// Default accept
+				TransitStatus::Accepted
+			}
+		}
+	}
+
+	// Client-side gate: block ids starting with "illegal-"
+	#[derive(Default, Clone)]
+	pub struct IllegalEgressGate;
+
+	impl GatePolicy for IllegalEgressGate {
+		fn evaluate(&self, msg: &crate::Frame) -> TransitStatus {
+			if msg.metadata.id.starts_with(b"illegal-") {
+				TransitStatus::Forbidden
+			} else {
+				TransitStatus::Accepted
+			}
+		}
+	}
+
+	#[cfg(feature = "std")]
 	test_case! {
 		name: test_create_test_message,
-		features: ["std"],
 		setup: || {
 			create_test_message(Some("Test content"))
 		},
@@ -848,7 +836,6 @@ mod tests {
 		name: test_metadata_builder_basic,
 		builder_type: crate::builder::MetadataBuilder,
 		version: crate::Version::V0,
-		features: ["std"],
 		setup: |builder| {
 			builder
 				.with_id("test-id")
@@ -866,66 +853,16 @@ mod tests {
 	}
 
 	// Demonstrates test_container! with custom gate policies and retry backoff.
-	#[cfg(feature = "tokio")]
+	#[cfg(all(feature = "tokio", feature = "tcp", feature = "std"))]
 	test_container! {
 		name: test_container_custom_gate_patterns,
-		features: ["std", "tcp"],
 		worker_threads: 2,
 		protocol: crate::transport::tcp::r#async::TokioListener,
 		service_policies: {
-			gate: {
-				use crate::policy::TransitStatus;
-				/// Custom gate that interprets message.metadata.id:
-				/// - "accept-{ID}"  => accept immediately
-				/// - "reject-{ID}"  => forbidden
-				/// - "timeout-{MS}" => sleep MS millis then timeout (or timeout if MS is invalid)
-				#[derive(Default, Clone)]
-				struct IdPatternGate;
-
-				impl crate::policy::GatePolicy for IdPatternGate {
-					fn evaluate(&self, msg: &crate::Frame) -> TransitStatus {
-						let id = &msg.metadata.id;
-						if id.strip_prefix(b"accept-").is_some() {
-							TransitStatus::Accepted
-						} else if id.strip_prefix(b"reject-").is_some() {
-							TransitStatus::Forbidden
-						} else if let Ok(ms_str) = std::str::from_utf8(id.strip_prefix(b"timeout-").unwrap_or(&[])) {
-							if let Ok(ms) = ms_str.parse::<u64>() {
-								std::thread::sleep(std::time::Duration::from_millis(ms));
-								TransitStatus::Timeout
-							} else {
-								TransitStatus::Timeout
-							}
-						} else {
-							// Default accept
-							TransitStatus::Accepted
-						}
-					}
-				}
-
-				IdPatternGate
-			},
+			gate: IdPatternGate,
 		},
 		client_policies: {
-			gate: {
-				use crate::policy::TransitStatus;
-
-				// Client-side gate: block ids starting with "illegal-"
-				#[derive(Default, Clone)]
-				struct IllegalEgressGate;
-
-				impl crate::policy::GatePolicy for IllegalEgressGate {
-					fn evaluate(&self, msg: &crate::Frame) -> TransitStatus {
-						if msg.metadata.id.starts_with(b"illegal-") {
-							TransitStatus::Forbidden
-						} else {
-							TransitStatus::Accepted
-						}
-					}
-				}
-
-				IllegalEgressGate
-			},
+			gate: IllegalEgressGate,
 			restart: {
 				crate::transport::policy::RestartLinearBackoff {
 					max_attempts: 3,

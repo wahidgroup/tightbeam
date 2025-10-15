@@ -83,6 +83,7 @@ impl GatePolicy for AcceptAllGate {
 /// Wraps any `GatePolicy` and calls a closure with the evaluation result.
 /// The middleware is transparent - it passes through the gate's decision
 /// unchanged.
+#[derive(Debug, Clone)]
 pub struct GateMiddleware<G: GatePolicy, F>
 where
 	F: Fn(&Frame, &TransitStatus) + Send + Sync,

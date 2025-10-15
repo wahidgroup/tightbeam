@@ -665,9 +665,9 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "std")]
 	crate::test_worker! {
 		name: lucky_number_worker_checks_winner,
-		features: ["std"],
 		setup: || {
 			LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig { lotto_number: 42 })
 		},
@@ -690,9 +690,9 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "std")]
 	crate::test_worker! {
 		name: test_ping_pong_worker,
-		features: ["std"],
 		setup: || {
 			PingPongWorker::start()
 		},

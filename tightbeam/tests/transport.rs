@@ -86,7 +86,7 @@ async fn test_macro_integration_full() -> core::result::Result<(), Box<dyn core:
 			ok: ok_tx.clone()
 		},
 		policies: {
-			with_collector_gate: policy::AcceptAllGate,
+			with_collector_gate: [policy::AcceptAllGate],
 		},
 		handle: |msg: Frame| async move {
 			eprintln!("Server received (ignored) id={:?}", msg.metadata.id);

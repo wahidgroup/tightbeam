@@ -37,7 +37,6 @@ enum ServiceAssertChecklist {
 
 test_container! {
 	name: container_gates_basic,
-	features: ["testing", "std", "tcp", "tokio"],
 	worker_threads: 2,
 	protocol: Listener,
 	service_policies: {

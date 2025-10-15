@@ -1061,11 +1061,11 @@ test_container! {
 	worker_threads: 2,
 	protocol: TokioListener,
 	service_policies: {
-		gate: policy::AcceptAllGate
+		gate: [policy::AcceptAllGate]
 	},
 	client_policies: {
 		restart: policy::RestartExponentialBackoff::default(),
-		gate: policy::AcceptAllGate
+		gate: [policy::AcceptAllGate]
 	},
 	service: |message, tx| async move {
 		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;

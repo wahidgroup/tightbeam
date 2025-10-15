@@ -92,13 +92,21 @@ pub mod server_runtime {
 
 #[macro_export]
 macro_rules! server {
-	(@sync_loop_body $protocol:path, $listener:ident, $handler:ident, $($policy_name:ident: $policy_value:expr),* $(,)?) => {{
+	(@apply_policy $transport:ident, $policy_name:ident, [ $( $policy_expr:expr ),* $(,)? ]) => {{
+		$(
+			$transport = $transport.$policy_name($policy_expr);
+		)*
+	}};
+
+	(@sync_loop_body $protocol:path, $listener:ident, $handler:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		loop {
 			match $listener.accept() {
 				Ok((__stream, _addr)) => {
 					let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(__stream);
 					$(
-						__transport = __transport.$policy_name($policy_value);
+						$(
+							__transport = __transport.$policy_name($policy_expr);
+						)*
 					)*
 					let __handler_clone = $handler.clone();
 					#[allow(unused_imports)]
@@ -141,13 +149,15 @@ macro_rules! server {
 		}
 	}};
 
-	(@async_loop_body $protocol:path, $listener:ident, $handler:ident, $error_tx:ident, $ok_tx:ident, $($policy_name:ident: $policy_value:expr),* $(,)?) => {{
+	(@async_loop_body $protocol:path, $listener:ident, $handler:ident, $error_tx:ident, $ok_tx:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		loop {
 			match $listener.accept().await {
 				Ok((__stream, _addr)) => {
 					let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(__stream);
 					$(
-						__transport = __transport.$policy_name($policy_value);
+						$(
+							__transport = __transport.$policy_name($policy_expr);
+						)*
 					)*
 					let __handler_clone = $handler.clone();
 					let mut __error_channel = $error_tx.clone();
@@ -204,20 +214,20 @@ macro_rules! server {
 		}
 	}};
 
-	(@sync_loop $protocol:path, $listener:expr, $handler:expr, $($policy_name:ident: $policy_value:expr),* $(,)?) => {{
+	(@sync_loop $protocol:path, $listener:expr, $handler:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		let mut __listener = $listener;
 		let __handler = $crate::macros::server::into_shared_handler($handler);
 
-		$crate::server!(@sync_loop_body $protocol, __listener, __handler, $($policy_name: $policy_value),*);
+		$crate::server!(@sync_loop_body $protocol, __listener, __handler, $($policy_name: [ $( $policy_expr ),* ]),*);
 	}};
 
-	(@async_loop $protocol:path, $listener:expr, $handler:expr, $error_tx:expr, $ok_tx:expr, $($policy_name:ident: $policy_value:expr),* $(,)?) => {{
+	(@async_loop $protocol:path, $listener:expr, $handler:expr, $error_tx:expr, $ok_tx:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		let mut __listener = $listener;
 		let __handler = $crate::macros::server::into_shared_handler($handler);
 		let mut __error_tx = $error_tx;
 		let mut __ok_tx = $ok_tx;
 
-		$crate::server!(@async_loop_body $protocol, __listener, __handler, __error_tx, __ok_tx, $($policy_name: $policy_value),*);
+		$crate::server!(@async_loop_body $protocol, __listener, __handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*);
 	}};
 
 	($protocol:path: $listener:expr, handle: $handler:expr) => {{
@@ -237,20 +247,20 @@ macro_rules! server {
 		}
 	}};
 
-	($protocol:path: $listener:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	($protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "std")]
 		{
 			let __listener = $listener;
-			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: $policy_value),*)
+			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*);
 		}
 	}};
 
-	($protocol:path: bind $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	($protocol:path: bind $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "std")]
 		{
 			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
-			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: $policy_value),*)
+			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*);
 		}
 	}};
 
@@ -302,21 +312,21 @@ macro_rules! server {
 		}
 	}};
 
-	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
 			let __listener = $listener;
 			tokio::spawn(async move {
 				let __error_tx: Option<tokio::sync::mpsc::Sender<$crate::transport::error::TransportError>> = None;
 				let __ok_tx: Option<tokio::sync::mpsc::Sender<()>> = None;
-				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx, $($policy_name: $policy_value),*)
+				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
 			})
 		}
 		#[cfg(all(not(feature = "tokio"), feature = "std"))]
 		{
 			let __listener = $listener;
 			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: $policy_value),*)
+				$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
 			})
 		}
 		#[cfg(not(any(feature = "tokio", feature = "std")))]
@@ -325,21 +335,21 @@ macro_rules! server {
 		}
 	}};
 
-	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
 			let __listener = $listener;
 			tokio::spawn(async move {
 				let __error_tx = Some($error_tx);
 				let __ok_tx = Some($ok_tx);
-				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx, $($policy_name: $policy_value),*)
+				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
 			})
 		}
 		#[cfg(all(not(feature = "tokio"), feature = "std"))]
 		{
 			let __listener = $listener;
 			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: $policy_value),*)
+				$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
 			})
 		}
 		#[cfg(not(any(feature = "tokio", feature = "std")))]
@@ -348,7 +358,7 @@ macro_rules! server {
 		}
 	}};
 
-	(protocol $protocol:path: bind $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
+	(protocol $protocol:path: bind $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
 			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
@@ -356,7 +366,7 @@ macro_rules! server {
 			tokio::spawn(async move {
 				let __error_tx: Option<tokio::sync::mpsc::Sender<$crate::transport::error::TransportError>> = None;
 				let __ok_tx: Option<tokio::sync::mpsc::Sender<()>> = None;
-				$crate::server!(@async_loop $protocol, __server, $handler, __error_tx, __ok_tx, $($policy_name: $policy_value),*)
+				$crate::server!(@async_loop $protocol, __server, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
 			})
 		}
 		#[cfg(all(not(feature = "tokio"), feature = "std"))]
@@ -364,7 +374,7 @@ macro_rules! server {
 			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: $policy_value),*)
+				$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
 			});
 		}
 		#[cfg(not(any(feature = "tokio", feature = "std")))]
