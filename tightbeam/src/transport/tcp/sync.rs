@@ -84,12 +84,12 @@ where
 }
 
 /// TCP server using abstract listener trait
-pub struct TcpServer<L: TcpListenerTrait> {
+pub struct TcpListener<L: TcpListenerTrait> {
 	listener: L,
 }
 
 #[cfg(feature = "std")]
-impl crate::transport::Protocol for TcpServer<std::net::TcpListener> {
+impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 	type Listener = std::net::TcpListener;
 	type Stream = std::net::TcpStream;
 	type Error = std::io::Error;
@@ -111,7 +111,7 @@ impl crate::transport::Protocol for TcpServer<std::net::TcpListener> {
 	}
 }
 
-impl<L: TcpListenerTrait> TcpServer<L>
+impl<L: TcpListenerTrait> TcpListener<L>
 where
 	TransportError: From<L::Error>,
 	TransportError: From<<L::Stream as ProtocolStream>::Error>,
@@ -129,7 +129,7 @@ where
 
 #[cfg(test)]
 mod tests {
-	use std::net::{TcpListener, TcpStream};
+	use std::net::TcpStream;
 	use std::sync::mpsc;
 
 	use super::*;
@@ -139,12 +139,12 @@ mod tests {
 	#[tokio::test]
 	async fn test_tcp_transport_emit_collect() -> TransportResult<()> {
 		let message = create_v0_tightbeam(None, None);
-		let listener = TcpListener::bind("127.0.0.1:0")?;
+		let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
 		let addr = listener.local_addr()?;
 		let (ready_tx, ready_rx) = mpsc::channel();
 
 		let server_handle = std::thread::spawn(move || {
-			let server = TcpServer::from_listener(listener);
+			let server = TcpListener::from_listener(listener);
 			let _ = ready_tx.send(());
 			let mut transport = server.accept().unwrap();
 
@@ -195,12 +195,12 @@ mod tests {
 		}
 
 		let message = create_v0_tightbeam(None, None);
-		let listener = TcpListener::bind("127.0.0.1:0")?;
+		let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
 		let addr = listener.local_addr()?;
 		let (ready_tx, ready_rx) = mpsc::channel();
 
 		let server_handle = std::thread::spawn(move || {
-			let server = TcpServer::from_listener(listener);
+			let server = TcpListener::from_listener(listener);
 			let _ = ready_tx.send(());
 			let mut transport = server.accept().unwrap().with_collector_gate(BusyFirstGate::new());
 

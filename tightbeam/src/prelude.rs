@@ -101,7 +101,7 @@ pub mod collect {
 	pub use crate::transport::tcp::r#async::TokioListener;
 
 	#[cfg(feature = "tcp")]
-	pub use crate::transport::tcp::sync::TcpServer;
+	pub use crate::transport::tcp::sync::TcpListener;
 }
 
 // Crypto module re-exports

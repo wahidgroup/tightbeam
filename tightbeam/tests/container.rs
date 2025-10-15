@@ -3,8 +3,15 @@
 
 use tightbeam::prelude::*;
 
-use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
+
+#[cfg(feature = "tokio")]
+use tightbeam::transport::tcp::r#async::TokioListener as Listener;
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+use tightbeam::transport::tcp::sync::TcpListener;
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+type Listener = TcpListener<std::net::TcpListener>;
 
 use der::{Enumerated, Sequence};
 
@@ -31,7 +38,7 @@ test_container! {
 	name: container_gates_basic,
 	features: ["testing", "std", "tcp", "tokio"],
 	worker_threads: 2,
-	protocol: TokioListener,
+	protocol: Listener,
 	service_policies: {
 		gate: policy::AcceptAllGate
 	},

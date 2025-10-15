@@ -153,13 +153,28 @@ where
 
 		Ok(())
 	}
+
+	fn collect(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send {
+		async {
+			loop {
+				match self.collector.collect().await {
+					Ok(Some(frame)) => {
+						if let Some(response) = self.handler(&frame).await {
+							self.io.send(response).await?;
+						}
+					}
+					Err(e) => return Err(e),
+				}
+			}
+		}
+	}
 }
 
-pub struct TcpServerAsync<L: AsyncListenerTrait> {
+pub struct TcpListenerAsync<L: AsyncListenerTrait> {
 	listener: L,
 }
 
-impl<L> TcpServerAsync<L>
+impl<L> TcpListenerAsync<L>
 where
 	L: AsyncListenerTrait,
 	L::Stream: AsyncProtocolStream<Error = std::io::Error>,
@@ -187,7 +202,7 @@ where
 	}
 }
 
-impl<L> From<L> for TcpServerAsync<L>
+impl<L> From<L> for TcpListenerAsync<L>
 where
 	L: AsyncListenerTrait,
 	L::Stream: AsyncProtocolStream<Error = std::io::Error>,
@@ -209,7 +224,7 @@ mod tests {
 	async fn async_round_trip() -> TransportResult<()> {
 		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
 		let addr = listener.listener.local_addr().unwrap();
-		let server = TcpServerAsync::from(listener);
+		let server = TcpListenerAsync::from(listener);
 
 		let test_message = create_v0_tightbeam(None, None);
 		let expected_response = create_v0_tightbeam(None, None);
@@ -269,7 +284,7 @@ mod tests {
 
 		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
 		let addr = listener.listener.local_addr().unwrap();
-		let server = TcpServerAsync::from(listener);
+		let server = TcpListenerAsync::from(listener);
 
 		let test_message = create_v0_tightbeam(None, None);
 

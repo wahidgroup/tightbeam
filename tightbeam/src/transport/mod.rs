@@ -490,7 +490,7 @@ mod tests {
 	use crate::der::{Decode, Encode};
 	use crate::testing::create_v0_tightbeam;
 
-	#[cfg(feature = "std")]
+	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn test_server_and_client_macros() -> TransportResult<()> {
 		use std::sync::{mpsc, Arc};

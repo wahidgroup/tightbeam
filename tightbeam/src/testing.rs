@@ -748,7 +748,10 @@ macro_rules! test_worker {
             };
 
             // Clean shutdown
+			#[cfg(feature = "tokio")]
             worker.kill().await?;
+			#[cfg(all(not(feature = "tokio"), feature = "std"))]
+            worker.kill()?;
 
             result
         }
@@ -830,7 +833,6 @@ macro_rules! test_servlet {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::policy::TransitStatus;
 
 	test_case! {
 		name: test_create_test_message,
@@ -866,6 +868,7 @@ mod tests {
 	}
 
 	// Demonstrates test_container! with custom gate policies and retry backoff.
+	#[cfg(feature = "tokio")]
 	test_container! {
 		name: test_container_custom_gate_patterns,
 		features: ["std", "tcp"],
@@ -873,6 +876,7 @@ mod tests {
 		protocol: crate::transport::tcp::r#async::TokioListener,
 		service_policies: {
 			gate: {
+				use crate::policy::TransitStatus;
 				/// Custom gate that interprets message.metadata.id:
 				/// - "accept-{ID}"  => accept immediately
 				/// - "reject-{ID}"  => forbidden

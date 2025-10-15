@@ -70,7 +70,7 @@ full = [
 	"sha3",
 	"secp256k1",
 	"derive",
-	"tokio",
+	#"tokio",
 	"constants",
 	"zstd",
 	"time",
