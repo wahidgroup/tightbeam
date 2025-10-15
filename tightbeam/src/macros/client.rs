@@ -83,11 +83,11 @@ macro_rules! client {
 
 	// Internal helper to set policies
 	(@set_policy $transport:expr, restart_policy, $value:expr) => {
-		$transport.with_restart_policy($value)
+		$transport.with_restart($value)
 	};
-	// Shorthand: restart -> with_restart_policy(...)
+	// Shorthand: restart -> with_restart(...)
 	(@set_policy $transport:expr, restart, $value:expr) => {
-		$transport.with_restart_policy($value)
+		$transport.with_restart($value)
 	};
 	(@set_policy $transport:expr, emitter_gate, $value:expr) => {
 		$transport.with_emitter_gate($value)

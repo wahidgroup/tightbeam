@@ -131,7 +131,7 @@ macro_rules! impl_tcp_common {
 		where
 			TransportError: From<S::Error>,
 		{
-			fn with_restart_policy<P: RestartPolicy + 'static>(mut self, policy: P) -> Self {
+			fn with_restart<P: RestartPolicy + 'static>(mut self, policy: P) -> Self {
 				self.restart_policy = Box::new(policy);
 				self
 			}

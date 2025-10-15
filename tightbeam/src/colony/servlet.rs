@@ -919,9 +919,12 @@ mod tests {
 			}
 		}
 
-		servlet! {
+		crate::servlet! {
 			name: PingPongServletWithServlet,
 			protocol: Listener,
+			policies: {
+				with_collector_gate: [crate::policy::AcceptAllGate],
+			},
 			config: {
 				lotto_number: u32,
 			},

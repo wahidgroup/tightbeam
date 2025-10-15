@@ -258,8 +258,8 @@ macro_rules! test_container {
 		$(features: [$($feature:literal),*],)?
 		worker_threads: $threads:literal,
 		protocol: $protocol:path,
-		$(service_policies: { $($server_policy_key:ident: $server_policy_val:expr),* $(,)? },)?
-		$(client_policies: { $($client_policy_key:ident: $client_policy_val:expr),* $(,)? },)?
+		$(service_policies: { $($server_policy_key:ident: $server_policy_val:tt),* $(,)? },)?
+		$(client_policies: { $($client_policy_key:ident: $client_policy_val:tt),* $(,)? },)?
 		service: |$svc_message:ident, $svc_tx:ident| $service_body:expr,
 		container: |$client:ident, $channels:ident| $container_body:expr
 	) => {
@@ -281,8 +281,8 @@ macro_rules! test_container {
 		name: $test_name:ident,
 		$(features: [$($feature:literal),*],)?
 		protocol: $protocol:path,
-		$(service_policies: { $($server_policy_key:ident: $server_policy_val:expr),* $(,)? },)?
-		$(client_policies: { $($client_policy_key:ident: $client_policy_val:expr),* $(,)? },)?
+		$(service_policies: { $($server_policy_key:ident: $server_policy_val:tt),* $(,)? },)?
+		$(client_policies: { $($client_policy_key:ident: $client_policy_val:tt),* $(,)? },)?
 		service: |$svc_message:ident, $svc_tx:ident| $service_body:expr,
 		container: |$client:ident, $channels:ident| $container_body:expr
 	) => {
@@ -301,8 +301,8 @@ macro_rules! test_container {
 
 	// Test body implementation (bind a single `channels` tuple)
 	(@test_body $protocol:path,
-		[$($server_policy_key:ident: $server_policy_val:expr),*],
-		[$($client_policy_key:ident: $client_policy_val:expr),*],
+		[$($server_policy_key:ident: $server_policy_val:tt),*],
+		[$($client_policy_key:ident: $client_policy_val:tt),*],
 		|$svc_message:ident, $svc_tx:ident| $service_body:expr,
 		|$client:ident, $channels:ident| $container_body:expr
 	) => {
@@ -371,7 +371,7 @@ macro_rules! test_container {
 	};
 
 	// Build client with policies (direct pass-through; client! supports shorthands)
-	(@build_client $protocol:path, $addr:ident, [$($policy_key:ident: $policy_val:expr),+]) => {{
+	(@build_client $protocol:path, $addr:ident, [$($policy_key:ident: $policy_val:tt),+]) => {{
 		{
 			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await
 				.map_err(|e| $crate::transport::error::TransportError::from(e))?;
@@ -384,21 +384,28 @@ macro_rules! test_container {
 	}};
 
 	// Internal helper to set client policies with correct method names
-	(@set_client_policy $transport:expr, restart_policy, $value:expr) => {
-		$transport.with_restart_policy($value)
-	};
-	(@set_client_policy $transport:expr, restart, $value:expr) => {
-		$transport.with_restart_policy($value)
-	};
-	(@set_client_policy $transport:expr, emitter_gate, $value:expr) => {
-		$transport.with_emitter_gate($value)
-	};
-	(@set_client_policy $transport:expr, gate, $value:expr) => {
-		$transport.with_emitter_gate($value)
-	};
-	(@set_client_policy $transport:expr, collector_gate, $value:expr) => {
-		$transport.with_collector_gate($value)
-	};
+	// Expects policies in the format: policy_name: [value1, value2, ...]
+	(@set_client_policy $transport:expr, with_restart, [ $( $value:expr ),* $(,)? ]) => {{
+		let mut __transport = $transport;
+		$(
+			__transport = __transport.with_restart($value);
+		)*
+		__transport
+	}};
+	(@set_client_policy $transport:expr, with_emitter_gate, [ $( $value:expr ),* $(,)? ]) => {{
+		let mut __transport = $transport;
+		$(
+			__transport = __transport.with_emitter_gate($value);
+		)*
+		__transport
+	}};
+	(@set_client_policy $transport:expr, with_collector_gate, [ $( $value:expr ),* $(,)? ]) => {{
+		let mut __transport = $transport;
+		$(
+			__transport = __transport.with_collector_gate($value);
+		)*
+		__transport
+	}};
 
 	// Build client without policies
 	(@build_client $protocol:path, $addr:ident, []) => {{
@@ -409,30 +416,31 @@ macro_rules! test_container {
 		.expect("Failed to create client")
 	}};
 
-	// Build server with gate policy - wrap in array for server! macro
-	(@build_server $protocol:path, $listener:ident, $tx:ident, $ok_tx:ident, $reject_tx:ident, [gate: $gate:expr $(, $($rest:tt)*)?], |$msg:ident: $msg_ty:ty, $svc_tx:ident| $body:expr) => {
+	// Build server with policies - wrap with_collector_gate in GateMiddleware for tracking
+	(@build_server $protocol:path, $listener:ident, $tx:ident, $ok_tx:ident, $reject_tx:ident,
+		[with_collector_gate: [ $( $gate:expr ),* $(,)? ] $(, $($rest_key:ident: $rest_val:tt),* )?],
+		|$msg:ident: $msg_ty:ty, $svc_tx:ident| $body:expr) => {
 		{
 			$crate::server! {
 				protocol $protocol: $listener,
 				policies: {
-					with_collector_gate: [{
-						let ok_tx_arc = $ok_tx.clone();
-						let reject_tx_arc = $reject_tx.clone();
-						let gate_instance = $gate;
-						$crate::policy::GateMiddleware::new(
-							gate_instance,
-							move |message: &$crate::Frame, status: &$crate::policy::TransitStatus| {
-								let ok_tx = ok_tx_arc.clone();
-								let reject_tx = reject_tx_arc.clone();
-								if *status == $crate::policy::TransitStatus::Accepted {
-									let _ = ok_tx.send(message.clone());
-								} else {
-									let _ = reject_tx.send(message.clone());
+					with_collector_gate: [$(
+						{
+							let ok_tx_for_gate = $ok_tx.clone();
+							let reject_tx_for_gate = $reject_tx.clone();
+							$crate::policy::GateMiddleware::new(
+								$gate,
+								move |message: &$crate::Frame, status: &$crate::policy::TransitStatus| {
+									if *status == $crate::policy::TransitStatus::Accepted {
+										let _ = ok_tx_for_gate.send(message.clone());
+									} else {
+										let _ = reject_tx_for_gate.send(message.clone());
+									}
 								}
-							}
-						)
-					}]
-					$(, $($rest)*)?
+							)
+						}
+					),*]
+					$(, $($rest_key: $rest_val),*)?
 				},
 				handle: move |$msg: $msg_ty| {
 					let $svc_tx = $tx.clone();
@@ -442,12 +450,12 @@ macro_rules! test_container {
 		}
 	};
 
-	// Build server with policies (but not gate) - wrap each policy value in array
-	(@build_server $protocol:path, $listener:ident, $tx:ident, $ok_tx:ident, $reject_tx:ident, [$($policy_key:ident: $policy_val:expr),+], |$msg:ident: $msg_ty:ty, $svc_tx:ident| $body:expr) => {
+	// Build server with policies (no with_collector_gate) - policies are already in array format
+	(@build_server $protocol:path, $listener:ident, $tx:ident, $ok_tx:ident, $reject_tx:ident, [$($policy_key:ident: $policy_val:tt),+], |$msg:ident: $msg_ty:ty, $svc_tx:ident| $body:expr) => {
 		{
 			$crate::server! {
 				protocol $protocol: $listener,
-				policies: { $($policy_key: [$policy_val]),+ },
+				policies: { $($policy_key: $policy_val),+ },
 				handle: move |$msg: $msg_ty| {
 					let $svc_tx = $tx.clone();
 					$body
@@ -776,7 +784,7 @@ mod tests {
 	use super::*;
 
 	use crate::policy::{GatePolicy, TransitStatus};
-	use crate::transport::policy::PolicyConfiguration;
+	use crate::transport::policy::{PolicyConfiguration, RestartLinearBackoff};
 
 	/// Custom gate that interprets message.metadata.id:
 	/// - "accept-{ID}"  => accept immediately
@@ -852,25 +860,17 @@ mod tests {
 		}
 	}
 
-	// Demonstrates test_container! with custom gate policies and retry backoff.
 	#[cfg(all(feature = "tokio", feature = "tcp", feature = "std"))]
 	test_container! {
 		name: test_container_custom_gate_patterns,
 		worker_threads: 2,
 		protocol: crate::transport::tcp::r#async::TokioListener,
 		service_policies: {
-			gate: IdPatternGate,
+			with_collector_gate: [IdPatternGate]
 		},
 		client_policies: {
-			gate: IllegalEgressGate,
-			restart: {
-				crate::transport::policy::RestartLinearBackoff {
-					max_attempts: 3,
-					interval_ms: 1,
-					scale_factor: 1,
-					jitter: None
-				}
-			},
+			with_emitter_gate: [IllegalEgressGate],
+			with_restart: [RestartLinearBackoff::new(3, 1, 1, None)],
 		},
 		service: |message, tx| async move {
 			let _ = tx.send(message.clone());

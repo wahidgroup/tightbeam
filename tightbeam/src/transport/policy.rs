@@ -15,7 +15,7 @@ pub trait PolicyConfiguration
 where
 	Self: Sized,
 {
-	fn with_restart_policy<P: RestartPolicy + 'static>(self, _: P) -> Self {
+	fn with_restart<P: RestartPolicy + 'static>(self, _: P) -> Self {
 		panic!("Restart policy is not supported on this transport");
 	}
 	fn with_emitter_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
@@ -130,6 +130,17 @@ pub struct RestartLinearBackoff {
 	pub interval_ms: u64,
 	pub scale_factor: u64,
 	pub jitter: Option<Box<dyn JitterStrategy>>,
+}
+
+impl RestartLinearBackoff {
+	pub fn new(
+		max_attempts: usize,
+		interval_ms: u64,
+		scale_factor: u64,
+		jitter: Option<Box<dyn JitterStrategy>>,
+	) -> Self {
+		Self { max_attempts, interval_ms, scale_factor, jitter }
+	}
 }
 
 #[cfg(feature = "std")]
