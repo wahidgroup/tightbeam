@@ -396,9 +396,10 @@ pub trait MessageCollector: MessageIO {
 	/// Get the collector gate policy instance
 	fn collector_gate(&self) -> &Self::CollectorGate;
 
-	/// Collect next available message
+	/// Read and validate a message without sending a response
+	/// Returns the message and the gate evaluation status
 	#[allow(async_fn_in_trait)]
-	async fn collect(&mut self) -> TransportResult<()> {
+	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)> {
 		// Read the envelope
 		let request_envelope = self.read_envelope().await?;
 		let request = match request_envelope {
@@ -416,6 +417,23 @@ pub trait MessageCollector: MessageIO {
 			return Err(TransportError::InvalidReply);
 		}
 
+		Ok((request, status))
+	}
+
+	/// Send a response for a previously collected message
+	#[allow(async_fn_in_trait)]
+	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
+		let response_pkg = ResponsePackage { status, message, length: None };
+		let response_envelope = TransportEnvelope::from(response_pkg);
+		self.write_envelope(&response_envelope).await?;
+		Ok(())
+	}
+
+	/// Collect next available message (original behavior for backward compatibility)
+	#[allow(async_fn_in_trait)]
+	async fn collect(&mut self) -> TransportResult<()> {
+		let (request, status) = self.collect_message().await?;
+
 		let message = if status == TransitStatus::Accepted {
 			// If the gate accepted it, handle the message
 			self.handle_message(request)
@@ -424,21 +442,16 @@ pub trait MessageCollector: MessageIO {
 			None
 		};
 
-		// Generate response
-		let response_pkg = ResponsePackage { status, message, length: None };
-		let response_envelope = TransportEnvelope::from(response_pkg);
-
-		// Send response
-		self.write_envelope(&response_envelope).await?;
-		Ok(())
+		self.send_response(status, message).await
 	}
 }
 
 #[cfg(not(feature = "transport-policy"))]
 pub trait MessageCollector: MessageIO {
-	/// Collect next available message
+	/// Read and validate a message without sending a response
+	/// Returns the message (status is always Accepted without policies)
 	#[allow(async_fn_in_trait)]
-	async fn collect(&mut self) -> TransportResult<()> {
+	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)> {
 		// Read the envelope
 		let request_envelope = self.read_envelope().await?;
 		// Extract message from request
@@ -449,14 +462,24 @@ pub trait MessageCollector: MessageIO {
 			}
 		};
 
-		// Generate response
-		let message = self.handle_message(request);
-		let response_pkg = ResponsePackage { status: TransitStatus::Accepted, message };
-		let response_envelope = TransportEnvelope::from(response_pkg);
+		Ok((request, TransitStatus::Accepted))
+	}
 
-		// Send response
+	/// Send a response for a previously collected message
+	#[allow(async_fn_in_trait)]
+	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
+		let response_pkg = ResponsePackage { status, message };
+		let response_envelope = TransportEnvelope::from(response_pkg);
 		self.write_envelope(&response_envelope).await?;
 		Ok(())
+	}
+
+	/// Collect next available message (original behavior for backward compatibility)
+	#[allow(async_fn_in_trait)]
+	async fn collect(&mut self) -> TransportResult<()> {
+		let (request, status) = self.collect_message().await?;
+		let message = self.handle_message(request);
+		self.send_response(status, message).await
 	}
 }
 
@@ -495,7 +518,6 @@ mod tests {
 	async fn test_server_and_client_macros() -> TransportResult<()> {
 		use std::sync::{mpsc, Arc};
 
-		use crate::transport::policy::PolicyConfiguration;
 		use crate::transport::policy::RestartLinearBackoff;
 		use crate::transport::tcp::r#async::TokioListener;
 

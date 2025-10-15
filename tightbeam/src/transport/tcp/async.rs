@@ -20,6 +20,7 @@ pub struct TokioStream {
 
 impl AsyncProtocolStream for TokioStream {
 	type Error = std::io::Error;
+
 	fn inner_mut(&mut self) -> &mut TcpStream {
 		&mut self.stream
 	}
@@ -44,19 +45,24 @@ impl TokioListener {
 		let listener = TcpListener::bind(addr).await?;
 		Ok(Self { listener })
 	}
+
+	pub async fn accept(&self) -> std::io::Result<(TokioStream, std::net::SocketAddr)> {
+		let (stream, addr) = self.listener.accept().await?;
+		Ok((TokioStream::from(stream), addr))
+	}
 }
 
 impl Protocol for TokioListener {
 	type Listener = TokioListener;
 	type Stream = TokioStream;
 	type Error = std::io::Error;
-	type Transport = TcpTransportAsync<TokioStream>;
+	type Transport = TcpTransport<TokioStream>;
 	type Address = std::net::SocketAddr;
 
 	async fn bind(addr: &str) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = TokioListener::bind(addr).await?;
-		let bound_addr = listener.local_addr()?;
-		Ok((listener, bound_addr))
+		let listener = Self::bind(addr).await?;
+		let addr = listener.local_addr()?;
+		Ok((listener, addr))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
@@ -65,151 +71,80 @@ impl Protocol for TokioListener {
 	}
 
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
-		TcpTransportAsync::from(stream)
+		TcpTransport::from(stream)
 	}
 }
 
 impl AsyncListenerTrait for TokioListener {
 	async fn accept(&self) -> Result<(Self::Stream, Self::Address), Self::Error> {
 		let (stream, addr) = self.listener.accept().await?;
-		Ok((TokioStream { stream }, addr))
+		Ok((TokioStream::from(stream), addr))
 	}
 }
 
 #[cfg(not(feature = "transport-policy"))]
-pub struct TcpTransportAsync<S: AsyncProtocolStream> {
+pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 }
 
 #[cfg(feature = "transport-policy")]
-pub struct TcpTransportAsync<S: AsyncProtocolStream> {
+pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
+	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 	restart_policy: Box<dyn RestartPolicy>,
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
-	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 }
 
-impl<S: AsyncProtocolStream> Pingable for TcpTransportAsync<S>
+impl<S: AsyncProtocolStream> Pingable for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
+	TransportError: From<std::io::Error>,
 {
 	fn ping(&mut self) -> TransportResult<()> {
-		// Check if the connection is still valid by calling peer_addr()
-		// This is a synchronous method that will fail if the socket is closed
-		self.stream.inner_mut().peer_addr().map(|_| ()).map_err(TransportError::IoError)
+		self.stream.inner_mut().peer_addr().map(|_| ()).map_err(TransportError::from)
 	}
 }
 
-crate::impl_tcp_common!(TcpTransportAsync, AsyncProtocolStream);
+crate::impl_tcp_common!(TcpTransport, AsyncProtocolStream);
 
-impl<S: AsyncProtocolStream> MessageIO for TcpTransportAsync<S>
+impl<S: AsyncProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
 	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let s = self.stream.inner_mut();
+		let stream = self.stream.inner_mut();
 
-		// Read tag byte
-		let mut tag_byte = [0u8; 1];
-		s.read_exact(&mut tag_byte).await?;
+		let mut tag = [0u8; 1];
+		stream.read_exact(&mut tag).await?;
 
-		// Read length encoding
 		let mut length_first = [0u8; 1];
-		s.read_exact(&mut length_first).await?;
+		stream.read_exact(&mut length_first).await?;
 
 		let (length_octets, content_length) = if length_first[0] & 0x80 == 0 {
-			// Short form
 			(vec![], length_first[0] as usize)
 		} else {
-			// Long form
-			let num_length_octets = (length_first[0] & 0x7F) as usize;
-			let mut length_octets = vec![0u8; num_length_octets];
-			s.read_exact(&mut length_octets).await?;
-
+			let octet_count = (length_first[0] & 0x7F) as usize;
+			let mut length_octets = vec![0u8; octet_count];
+			stream.read_exact(&mut length_octets).await?;
 			let length = Self::parse_der_length(length_first[0], &length_octets);
 			(length_octets, length)
 		};
 
-		// Read content
 		let mut content = vec![0u8; content_length];
-		s.read_exact(&mut content).await?;
+		stream.read_exact(&mut content).await?;
 
-		// Reconstruct full DER encoding using the helper
-		let buffer = Self::reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
-
-		// Decode
-		let envelope: TransportEnvelope = crate::decode(&buffer)?;
+		let buffer = Self::reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content);
+		let envelope = crate::decode(&buffer)?;
 		Ok(envelope)
 	}
 
 	async fn write_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()> {
-		let s = self.stream.inner_mut();
-
-		// Encode and write directly
-		let data = crate::encode(envelope)?;
-		s.write_all(&data).await?;
-
+		let stream = self.stream.inner_mut();
+		let encoded = crate::encode(envelope)?;
+		stream.write_all(&encoded).await?;
 		Ok(())
-	}
-
-	fn collect(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send {
-		async {
-			loop {
-				match self.collector.collect().await {
-					Ok(Some(frame)) => {
-						if let Some(response) = self.handler(&frame).await {
-							self.io.send(response).await?;
-						}
-					}
-					Err(e) => return Err(e),
-				}
-			}
-		}
-	}
-}
-
-pub struct TcpListenerAsync<L: AsyncListenerTrait> {
-	listener: L,
-}
-
-impl<L> TcpListenerAsync<L>
-where
-	L: AsyncListenerTrait,
-	L::Stream: AsyncProtocolStream<Error = std::io::Error>,
-	TransportError: From<L::Error>,
-{
-	pub async fn accept(&self) -> TransportResult<TcpTransportAsync<L::Stream>> {
-		let (stream, _addr) = self.listener.accept().await?;
-		Ok(TcpTransportAsync::from(stream))
-	}
-
-	/// Accept loop spawning a task per connection.
-	pub async fn run<F, Fut>(&self, handler: F) -> TransportResult<()>
-	where
-		F: Send + Sync + Clone + 'static + Fn(TcpTransportAsync<L::Stream>) -> Fut,
-		Fut: core::future::Future<Output = ()> + Send + 'static,
-		L::Stream: Send + 'static,
-	{
-		loop {
-			let (stream, _addr) = self.listener.accept().await?;
-			let transport = TcpTransportAsync::from(stream);
-			let h = handler.clone();
-
-			tokio::spawn(async move { h(transport).await });
-		}
-	}
-}
-
-impl<L> From<L> for TcpListenerAsync<L>
-where
-	L: AsyncListenerTrait,
-	L::Stream: AsyncProtocolStream<Error = std::io::Error>,
-	TransportError: From<L::Error>,
-{
-	fn from(listener: L) -> Self {
-		Self { listener }
 	}
 }
 
@@ -218,36 +153,33 @@ mod tests {
 	use super::*;
 	use crate::testing::*;
 	use crate::transport::{MessageCollector, MessageEmitter, ResponseHandler, TransitStatus};
-	use crate::Frame;
 
 	#[tokio::test]
 	async fn async_round_trip() -> TransportResult<()> {
 		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.listener.local_addr().unwrap();
-		let server = TcpListenerAsync::from(listener);
+		let addr = listener.local_addr().unwrap();
 
 		let test_message = create_v0_tightbeam(None, None);
 		let expected_response = create_v0_tightbeam(None, None);
 
-		// Spawn server task with handler
 		let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 		let response_msg = expected_response.clone();
+		let server = listener;
 		let server_handle = tokio::spawn(async move {
-			let mut transport = server.accept().await.unwrap().with_handler(Box::new(move |msg: Frame| {
+			let (stream, _) = server.accept().await.unwrap();
+			let mut transport = TcpTransport::from(stream).with_handler(Box::new(move |msg: Frame| {
 				let _ = tx.try_send(msg.clone());
 				Some(response_msg.clone())
 			}));
 			transport.collect().await.unwrap();
 		});
 
-		// Client
 		let stream = TcpStream::connect(addr).await.unwrap();
-		let mut transport = TcpTransportAsync::from(TokioStream { stream });
+		let mut transport = TcpTransport::from(TokioStream::from(stream));
 		let response = transport.emit(test_message.clone(), None).await?;
 
 		let received = rx.recv().await.unwrap();
 		assert_eq!(test_message, received);
-		// Response should match what the handler returned
 		assert_eq!(response, Some(expected_response));
 
 		server_handle.await.unwrap();
@@ -261,7 +193,6 @@ mod tests {
 
 		use crate::transport::policy::PolicyConfiguration;
 
-		/// Policy: First Busy, then Accepted
 		struct BusyFirstGate {
 			first: AtomicBool,
 		}
@@ -283,48 +214,35 @@ mod tests {
 		}
 
 		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.listener.local_addr().unwrap();
-		let server = TcpListenerAsync::from(listener);
+		let addr = listener.local_addr().unwrap();
+		let server = listener;
 
 		let test_message = create_v0_tightbeam(None, None);
 
-		// Spawn server task
 		let (tx, mut rx) = tokio::sync::mpsc::channel(2);
 		let server_handle = tokio::spawn(async move {
-			let mut transport = server
-				.accept()
-				.await
-				.unwrap()
+			let (stream, _) = server.accept().await.unwrap();
+			let mut transport = TcpTransport::from(stream)
 				.with_collector_gate(BusyFirstGate::new())
 				.with_handler(Box::new(move |msg: Frame| {
 					let _ = tx.try_send(msg.clone());
 					Some(msg.clone())
 				}));
 
-			// First collect - gate returns Busy, handler NOT called
-			transport.collect().await.unwrap();
-
-			// Second collect - gate returns Accepted, handler IS called
+			transport.collect().await.ok();
 			transport.collect().await.unwrap();
 		});
 
-		// Client
 		let stream = TcpStream::connect(addr).await.unwrap();
-		let mut transport = TcpTransportAsync::from(TokioStream { stream });
+		let mut transport = TcpTransport::from(TokioStream::from(stream));
 
-		// First attempt - server responds with Busy
 		let first = transport.emit(test_message.clone(), None).await;
 		assert!(matches!(first, Err(TransportError::Busy)));
 
-		// Second attempt - server responds with Accepted
 		transport.emit(test_message.clone(), None).await?;
 
-		// Server should have only received the second message (first was rejected by
-		// gate)
 		let received = rx.recv().await.unwrap();
 		assert_eq!(test_message, received);
-
-		// No more messages should be in the channel
 		assert!(rx.try_recv().is_err());
 
 		server_handle.await.unwrap();

@@ -29,6 +29,7 @@ macro_rules! client {
 	(connect $protocol:path: $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
 		#[cfg(feature = "std")]
 		{
+			use $crate::prelude::policy::PolicyConfiguration;
 			use $crate::transport::Protocol;
 			let stream = <$protocol as Protocol>::connect($addr).await?;
 			let mut transport = <$protocol as Protocol>::create_transport(stream);
@@ -42,6 +43,7 @@ macro_rules! client {
 	// Generic async: async protocol: stream
 	(async $protocol:path: $stream:expr) => {{
 		async {
+			use $crate::prelude::policy::PolicyConfiguration;
 			use $crate::transport::Protocol;
 			let transport = <$protocol as Protocol>::create_transport($stream);
 			Ok::<_, $crate::transport::error::TransportError>(transport)
@@ -52,6 +54,7 @@ macro_rules! client {
 	(async connect $protocol:path: $addr:expr) => {{
 		#[cfg(feature = "tokio")]
 		async {
+			use $crate::prelude::policy::PolicyConfiguration;
 			use $crate::transport::Protocol;
 			let stream = <$protocol as Protocol>::connect($addr).await
 				.map_err(|e| $crate::transport::error::TransportError::from(e))?;
@@ -63,6 +66,7 @@ macro_rules! client {
 	// Generic async: async protocol: stream, policies: {...}
 	(async $protocol:path: $stream:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
 		async {
+			use $crate::prelude::policy::PolicyConfiguration;
 			use $crate::transport::Protocol;
 			let mut transport = <$protocol as Protocol>::create_transport($stream);
 			$(
@@ -76,6 +80,7 @@ macro_rules! client {
 	(async connect $protocol:path: $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
 		#[cfg(feature = "tokio")]
 		async {
+			use $crate::prelude::policy::PolicyConfiguration;
 			use $crate::transport::Protocol;
 			let stream = <$protocol as Protocol>::connect($addr).await
 				.map_err(|e| $crate::transport::error::TransportError::from(e))?;

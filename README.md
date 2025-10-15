@@ -148,7 +148,6 @@ pub trait Message: /* trait bounds */ {
 ```
 
 #### Security Requirement Semantics
-
 - When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
 - When a message type specifies `MUST_BE_CONFIDENTIAL = true`, the Frame's metadata MUST include a `confidentiality` field
 - When a message type specifies `MUST_BE_COMPRESSED = true`, the Frame's metadata `compactness` field MUST NOT be `none`
@@ -156,13 +155,11 @@ pub trait Message: /* trait bounds */ {
 - The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
 
 #### Profile-Message Type Mapping
-
 - Security profiles MAY specify approved message types
 - Message types with security requirements SHOULD be used with compatible security profiles
 - Profile 0 (Testing) MAY use message types with security requirements for development purposes only
 
 #### Implementation Enforcement
-
 These requirements are enforced at:
 - **Compile Time**: Type system prevents composition of messages that don't meet requirements
 - **Runtime Validation**: Frame validation ensures expected frame shape to meet requirements
@@ -290,6 +287,7 @@ pub struct Metadata {
 ```
 
 ### 4.4 Frame Encapsulation
+
 ```rust
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
@@ -475,7 +473,6 @@ AlgorithmIdentifier ::= SEQUENCE {
 - Compression level MUST be within algorithm-specific valid ranges
 
 #### Matrix Specification
-
 Wire format
 - ASN.1 type: Matrix ::= SEQUENCE { n INTEGER (1..255), data OCTET STRING (SIZE(1..(255*255))) }
 - Encoding: DER. The data field is row-major; the cell at (row r, col c) is at index r*n + c.
@@ -757,34 +754,214 @@ tightbeam follows established cryptographic standards and maintains algorithm ag
 ## 8 Network Theory
 
 ### 8.1 Network Architecture
-- Egress/ingress policy management
+
+- Egress/Ingress policy management
 - Retry and Egress client policy
 - Service orchestration via Colony Monodomy/Polydomy patterns  
 - Cryptographically chainable message sequences
 
-#### 8.1 Efficient Exchange Compute Interconnect
-The Efficient Exchange Compute Interconnect or EECI is a completely new
-software development paradigm inspired by the entymological world. As threads
-and tunnels underpin the basics of processing and communication, we can start
-at these base levels and develop from here. The goal of EECI is to operate
-on these base layers across any transmission protocol: thread-to-thread.
+### 8.2 Efficient Exchange-Compute Interconnect
 
-#### 8.2 Components
+The Efficient Exchange-Compute Interconnect or EECI is a software development 
+paradigm inspired by the entymological world. As threads and tunnels underpin 
+the basics of processing and communication, we can start at these base levels 
+and develop from here. The goal of EECI is to operate on these base layers 
+across any transmission protocol: 
+- thread-thread.
+- thread-port-thread.
+
+### 8.3 Components
+
 There are three main components to the EECI:
-- Workers
-- Servlets
-- Clusters
+- [Workers](#821-workers)
+- [Servlets](#822-servlets)
+- [Clusters](#823-clusters)
 
+Think of workers as ants, servlets as ant hills, and clusters as ant colonies.
+Insects have specific functions for which they process biological information.
+These functions are often simple, but when combined in large numbers,
+they can perform complex tasks. The efficiency of each unit is attributed to 
+their fungible nature--how well it can accomplish its singular task. 
 
-#### 8.2 Colony Monodomy/Polydomy Patterns
-A simple analogy is the look at insect colony patterns and extrapolate. 
+#### 8.3.1 Workers
+
+Workers are the smallest unit of computation. They must be single-threaded and
+handle a single message at a time. Workers are the "ants" of the EECI. Insects 
+have a head, thorax, and abdomen. Workers have the following similarly 
+inspired structure:
+
+```rust
+tightbeam::worker! {
+	name: PingPongWorker<RequestMessage, PongMessage>,
+	config: {
+		expected_message: String,
+	},
+	policies: {
+		with_receptor_gate: PingGate
+	},
+	handle: |_message, _config| async move {
+		PongMessage {
+			result: "PONG".to_string(),
+		}
+	}
+}
+```
+
+Not unlike supraorganisms we can name them, and their "head" may possess
+a specific configuration (config). They may or may not have a receptor which 
+can be used to optionally gate messages. Its "thorax" is itself its container
+for which isolates the entity within its own scoped thread. Finally, it's 
+"abdomen" is the handle which digests the message and produces a response.
+
+##### Testing
+Testing workers is simple and a container is provided:
+
+```rust
+tightbeam::test_worker! {
+	name: test_ping_pong_worker,
+	features: ["std"],
+	setup: || {
+		PingPongWorker::start(PingPongWorkerConfig {
+			expected_message: "PING".to_string(),
+		})
+	},
+	assertions: |worker| async move {
+		// Test accepted message
+		let ping_msg = RequestMessage {
+			content: "PING".to_string(),
+			lucky_number: 42,
+		};
+		let response = worker.relay(ping_msg).await?;
+		assert_eq!(response, Some(PongMessage { result: "PONG".to_string() }));
+
+		// Test rejected message
+		let pong_msg = RequestMessage {
+			content: "PONG".to_string(),
+			lucky_number: 42,
+		};
+
+		let result = worker.relay(pong_msg).await;
+		assert!(matches!(result, Err(WorkerRelayError::Rejected(_))));
+
+		Ok(())
+	}
+}
+```
+
+#### 8.3.2 Servlets
+
+Servlets are "anthills" in the sense they operate on a specific protocol. From
+a TCP/IP perspective, an anthill is a port in many ways. Servlets are 
+multi-threaded and must handle messages asynchronously. A servlet may also
+define as many different workers as it needs to accomplish its task as well
+as a set of configurations. Servlets must be provided a relay which is used to
+relay Message types to the worker without the entire Frame.
+
+```rust
+tightbeam::servlet! {
+	name: PingPongServletWithWorker,
+	protocol: Listener,
+	config: {
+		lotto_number: u32,
+		expected_message: String,
+	},
+	workers: |config| {
+		ping_pong: PingPongWorker = PingPongWorker::start(PingPongWorkerConfig {
+			expected_message: config.expected_message.clone(),
+		}),
+		lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig {
+			lotto_number: config.lotto_number,
+		})
+	},
+	handle: |message, _config, workers| async move {
+		let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
+		let (ping_result, lucky_result) = tokio::join!(
+			workers.ping_pong.relay(decoded.clone()),
+			workers.lucky_number.relay(decoded.clone())
+		);
+
+		let reply = match ping_result {
+			Ok(reply) => reply,
+			Err(_) => return None,
+		};
+
+		let is_winner = match lucky_result {
+			Ok(is_winner) => is_winner,
+			Err(_) => return None,
+		};
+
+		crate::compose! {
+			V0: id: message.metadata.id.clone(),
+				message: ResponseMessage {
+					result: reply.result,
+					is_winner,
+				}
+		}.ok()
+	}
+}
+```
+
+Workers may process the message in parallel and have the results combined into 
+a single response. 
+
+##### Testing
+Testing servlets is simple and a container is provided:
+
+```rust
+crate::test_servlet! {
+	name: test_servlet_with_workers,
+	features: ["std", "tcp", "tokio"],
+	worker_threads: 2,
+	protocol: Listener,
+	setup: || {
+		PingPongServletWithWorker::start(PingPongServletWithWorkerConfig {
+			lotto_number: 42,
+			expected_message: "PING".to_string(),
+		})
+	},
+	assertions: |client| async move {
+		fn generate_message(
+			lucky_number: u32,
+			content: Option<String>
+		) -> Result<crate::Frame, crate::TightBeamError> {
+			let message = RequestMessage {
+				content: content.unwrap_or_else(|| "PING".to_string()),
+				lucky_number,
+			};
+
+			crate::compose! { V0: id: b"test-ping", message: message }
+		}
+
+		// Test winning case
+		let ping_message = generate_message(42, None)?;
+		let response = client.emit(ping_message, None).await?;
+		let response_message = crate::decode::<ResponseMessage, _>(&response.unwrap().message)?;
+		assert_eq!(response_message.result, "PONG");
+		assert!(response_message.is_winner);
+
+		Ok(())
+	}
+}
+```
+
+#### 8.3.3 Clusters
+
+Clusters orchestrate multiple servlets and workers. They are the "ant colonies" 
+of the EECI. Ant colonies are made up of multiple anthills (servlets) and ants 
+(workers). Clusters are multi-threaded and must handle messages asynchronously. 
+Clusters may also define a configuration and as many different servlets as it 
+needs to handle its purpose. While servlets are given a relay, clusters must be 
+provided a router. Routers can emit messages to the servlets within the 
+cluster. 
 
 ## 9 Testing Framework
+
 Full end-to-end containerized testing framework
 - Asynchronous/synchronous containerized end-to-end testing
 - Client/server "quantum tunneling" via MPSC channels
 
-### Quantum Tunnel Testing
+### 9.1 Quantum Tunnel Testing
+
 These are our three "entangled particles" for a quantum tunnel.
 
 ```rust
@@ -799,7 +976,7 @@ let (reject_tx, reject_rx) = mpsc::channel();
 let channels = (rx, ok_rx, reject_rx);
 ```
 
-#### Message Flow Sequence
+####  Message Flow Sequence
 1. Client emits a message
 2. The server MAY receive the message
 3. The gate MAY reject the message and MUST tell reject_tx
@@ -809,7 +986,8 @@ let channels = (rx, ok_rx, reject_rx);
 	- If so, the client SHOULD[^mpsc] hear from rx
 5. The server MAY respond with a message
 
-[^mpsc]: MPSC ops MAY return Empty while polling; Disconnected ONLY occurs at teardown.
+[^mpsc]: MPSC ops MAY return Empty while polling; Disconnected occurs at teardown.
+
 ```rust
 service: |message, tx| async move {
     tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
@@ -872,9 +1050,9 @@ scope in a single containerized test. Channels are automatically cleaned up.
 
 **See:** [Container Integration Test](tightbeam/tests/container.rs)
 
-## 8. Examples
+## 10. Examples
 
-### 8.1 Basic Test Container
+### 10.1 Basic Test Container
 ```rust
 /// Checklist for container assertions
 #[derive(Enumerated, Beamable, Copy, Clone, Debug, PartialEq)]
@@ -926,7 +1104,7 @@ test_container! {
 		// Compose a simple V0 message
 		let message = tightbeam::compose! {
 			V0: id: b"request",
-				order: 1_700_000_000u64,
+				order: 21_000_000u64,
 				message: RequestMessage {
 					content: "PING".into()
 				}
@@ -967,9 +1145,9 @@ test_container! {
 
 ```
 
-## 9. References
+## 11. References
 
-### 9.1 Normative References
+### 11.1 Normative References
 
 - RFC 2119: Key words for use in RFCs to Indicate Requirement Levels
 - ITU-T X.690: ASN.1 Distinguished Encoding Rules (DER)
@@ -984,7 +1162,7 @@ test_container! {
 - RFC 8032: Edwards-Curve Digital Signature Algorithm (EdDSA)
 - RFC 7748: Elliptic Curves for Security
 
-### 9.1.1 Standards References
+### 11.1.1 Standards References
 
 - FIPS 140-2: Security Requirements for Cryptographic Modules
 - FIPS 140-3: Security Requirements for Cryptographic Modules
@@ -996,7 +1174,7 @@ test_container! {
 - NIST SP 800-57: Recommendation for Key Management
 - NIST SP 800-131A: Transitioning the Use of Cryptographic Algorithms and Key Lengths
 
-### 9.3 ASN.1 References
+### 11.3 ASN.1 References
 
 - ITU-T X.680: ASN.1 Specification of basic notation
 - ITU-T X.681: ASN.1 Information object specification
@@ -1006,7 +1184,7 @@ test_container! {
 - RFC 2474: Differentiated Services Field (Priority levels inspiration)
 - X.400/X.420: Message Handling Systems (Priority levels inspiration)
 
-## 10. License
+## 12. License
 
 ### For Users (Outbound Licensing)
 
@@ -1030,7 +1208,7 @@ dual licensed as above, without any additional terms or conditions.
 - MIT's simplicity for users who prefer it
 - Apache-2.0's patent grants for enhanced protection
 
-### 10.1 Implementation Notes
+## 13 Implementation Notes
 
 #### Project Structure
 

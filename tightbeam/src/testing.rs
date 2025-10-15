@@ -910,6 +910,8 @@ mod tests {
 		},
 		client_policies: {
 			gate: {
+				use crate::policy::TransitStatus;
+
 				// Client-side gate: block ids starting with "illegal-"
 				#[derive(Default, Clone)]
 				struct IllegalEgressGate;

@@ -8,11 +8,10 @@ pub mod r#async;
 
 use crate::transport::{Protocol, ProtocolStream};
 
-// Re-exports
-pub use crate::transport::tcp::sync::*;
-
-#[cfg(feature = "tokio")]
-pub use crate::transport::tcp::r#async::*;
+#[cfg(not(feature = "tokio"))]
+use crate::transport::tcp::r#async::TcpTransport;
+#[cfg(feature = "std")]
+use crate::transport::tcp::sync::TcpTransport;
 
 /// Abstract TCP listener trait for different networking backends.
 pub trait TcpListenerTrait: Protocol + Send {

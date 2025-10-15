@@ -1,7 +1,7 @@
-//! Worker framework for containerized tightbeam applications
+//! Servlet framework for containerized tightbeam applications
 //! // TODO Disambiguate from tokio
 //!
-//! Workers provide a way to create self-contained, policy-driven message
+//! Servlets provide a way to create self-contained, policy-driven message
 //! processing applications that can be easily deployed and tested.
 
 use std::net::SocketAddr;
@@ -9,15 +9,46 @@ use std::net::SocketAddr;
 pub(crate) mod servlet_runtime {
 	#[cfg(feature = "tokio")]
 	pub(crate) mod rt {
+		#[allow(dead_code)]
 		pub type JoinHandle = tokio::task::JoinHandle<()>;
+		#[allow(dead_code)]
 		pub type JoinError = tokio::task::JoinError;
+		#[allow(dead_code)]
+		pub type ServerPoolSender = tokio::sync::mpsc::Sender<crate::Frame>;
+		#[allow(dead_code)]
+		pub type ServerPoolReceiver = tokio::sync::mpsc::Receiver<crate::Frame>;
 
+		#[allow(dead_code)]
 		pub fn abort(handle: JoinHandle) {
 			handle.abort();
 		}
 
+		#[allow(dead_code)]
 		pub async fn join(handle: JoinHandle) -> Result<(), JoinError> {
 			handle.await
+		}
+
+		#[allow(dead_code)]
+		pub fn server_pool_channel(capacity: usize) -> (ServerPoolSender, ServerPoolReceiver) {
+			tokio::sync::mpsc::channel(capacity)
+		}
+
+		#[allow(dead_code)]
+		pub async fn send_to_pool(sender: &ServerPoolSender, frame: crate::Frame) -> Result<(), ()> {
+			sender.send(frame).await.map_err(|_| ())
+		}
+
+		#[allow(dead_code)]
+		pub async fn recv_from_pool(receiver: &mut ServerPoolReceiver) -> Option<crate::Frame> {
+			receiver.recv().await
+		}
+
+		#[allow(dead_code)]
+		pub fn spawn<F>(fut: F) -> JoinHandle
+		where
+			F: core::future::Future<Output = ()> + Send + 'static,
+		{
+			tokio::spawn(fut)
 		}
 	}
 
@@ -25,6 +56,7 @@ pub(crate) mod servlet_runtime {
 	pub(crate) mod rt {
 		use std::{
 			io::{Error, ErrorKind},
+			sync::mpsc,
 			thread,
 		};
 
@@ -32,6 +64,10 @@ pub(crate) mod servlet_runtime {
 		pub type JoinHandle = thread::JoinHandle<()>;
 		#[allow(dead_code)]
 		pub type JoinError = Error;
+		#[allow(dead_code)]
+		pub type ServerPoolSender = mpsc::Sender<crate::Frame>;
+		#[allow(dead_code)]
+		pub type ServerPoolReceiver = mpsc::Receiver<crate::Frame>;
 
 		#[allow(dead_code)]
 		pub fn abort(_handle: JoinHandle) {
@@ -44,15 +80,63 @@ pub(crate) mod servlet_runtime {
 				.join()
 				.map_err(|_| Error::new(ErrorKind::Other, "servlet thread panicked"))
 		}
+
+		#[allow(dead_code)]
+		pub fn server_pool_channel(_capacity: usize) -> (ServerPoolSender, ServerPoolReceiver) {
+			mpsc::channel()
+		}
+
+		#[allow(dead_code)]
+		pub fn send_to_pool(sender: &ServerPoolSender, frame: crate::Frame) -> Result<(), ()> {
+			sender.send(frame).map_err(|_| ())
+		}
+
+		#[allow(dead_code)]
+		pub fn recv_from_pool(receiver: &mut ServerPoolReceiver) -> Option<crate::Frame> {
+			receiver.recv().ok()
+		}
+
+		#[allow(dead_code)]
+		pub fn spawn<F>(fut: F) -> JoinHandle
+		where
+			F: core::future::Future<Output = ()> + Send + 'static,
+		{
+			thread::spawn(move || {
+				// Simple block_on implementation for std
+				use std::{
+					future::Future,
+					pin::Pin,
+					task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+				};
+				fn raw_waker() -> RawWaker {
+					fn clone(_: *const ()) -> RawWaker {
+						raw_waker()
+					}
+					fn wake(_: *const ()) {}
+					fn wake_by_ref(_: *const ()) {}
+					fn drop(_: *const ()) {}
+					RawWaker::new(core::ptr::null(), &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
+				}
+				let waker = unsafe { Waker::from_raw(raw_waker()) };
+				let mut cx = Context::from_waker(&waker);
+				let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+				loop {
+					match fut.as_mut().poll(&mut cx) {
+						Poll::Ready(res) => break res,
+						Poll::Pending => thread::yield_now(),
+					}
+				}
+			})
+		}
 	}
 }
 
 /// Trait for worker implementations
 ///
 /// Provides a common interface for all colony created with the `servlet!`
-/// macro. Workers are containerized applications that process TightBeam
+/// macro. Servlets are containerized applications that process TightBeam
 /// messages.
-pub trait Worker {
+pub trait Servlet {
 	/// Configuration type for this worker (use () for no config)
 	type Config;
 
@@ -75,7 +159,7 @@ pub trait Worker {
 	) -> impl std::future::Future<Output = Result<(), crate::colony::servlet_runtime::rt::JoinError>> + Send;
 }
 
-/// Worker macro for creating containerized tightbeam applications
+/// Servlet macro for creating containerized tightbeam applications
 #[macro_export]
 macro_rules! servlet {
 	// Full worker with router, policies, and config
@@ -93,7 +177,7 @@ macro_rules! servlet {
 				 |$message, $router_param, $config_param| $handler_body);
 	};
 
-	// Worker with router only
+	// Servlet with router only
 	(
 		name: $worker_name:ident,
 		$(worker_threads: $threads:literal,)?
@@ -103,11 +187,11 @@ macro_rules! servlet {
 		handle: |$message:ident, $router_param:ident| async move $handler_body:block
 	) => {
 		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-				 router_only, $router, {},
-				 |$message, $router_param| $handler_body);
+				router_only, $router, {},
+				|$message, $router_param| $handler_body);
 	};
 
-	// Worker with config only
+	// Servlet with config only
 	(
 		name: $worker_name:ident,
 		$(worker_threads: $threads:literal,)?
@@ -117,11 +201,11 @@ macro_rules! servlet {
 		handle: |$message:ident, $config_param:ident| async move $handler_body:block
 	) => {
 		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-				 config_only, {}, { $($config_field: $config_type,)* },
-				 |$message, $config_param| $handler_body);
+				config_only, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body);
 	};
 
-	// Worker with config and workers
+	// Servlet with config and workers
 	(
 		name: $worker_name:ident,
 		$(worker_threads: $threads:literal,)?
@@ -132,9 +216,9 @@ macro_rules! servlet {
 		handle: |$message:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
 	) => {
 		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-				 config_and_workers, {}, { $($config_field: $config_type,)* },
-				 { $($worker_field: $worker_type = $worker_init),* },
-				 |$message, $config_param, $workers_param| $handler_body, $worker_config);
+				config_and_workers, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config);
 	};
 
 	// Basic worker with just message
@@ -146,8 +230,8 @@ macro_rules! servlet {
 		handle: |$message:ident| async move $handler_body:block
 	) => {
 		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-				 basic, {}, {},
-				 |$message| $handler_body);
+				basic, {}, {},
+				|$message| $handler_body);
 	};
 
 	// Main implementation generator
@@ -156,8 +240,8 @@ macro_rules! servlet {
 			  |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
 		servlet!(@impl_struct $worker_name, { $($config_field: $config_type,)* });
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
-				 router_and_config, $router, { $($config_field: $config_type,)* },
-				 |$message, $router_param, $config_param| $handler_body);
+				router_and_config, $router, { $($config_field: $config_type,)* },
+				|$message, $router_param, $config_param| $handler_body);
 		servlet!(@impl_trait $worker_name, { $($config_field: $config_type,)* });
 	};
 
@@ -166,8 +250,8 @@ macro_rules! servlet {
 			  |$message:ident, $router_param:ident| $handler_body:expr) => {
 		servlet!(@impl_struct $worker_name, {});
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
-				 router_only, $router, {},
-				 |$message, $router_param| $handler_body);
+				router_only, $router, {},
+				|$message, $router_param| $handler_body);
 		servlet!(@impl_trait $worker_name, {});
 	};
 
@@ -176,8 +260,8 @@ macro_rules! servlet {
 			  |$message:ident, $config_param:ident| $handler_body:expr) => {
 		servlet!(@impl_struct $worker_name, { $($config_field: $config_type,)* });
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
-				 config_only, {}, { $($config_field: $config_type,)* },
-				 |$message, $config_param| $handler_body);
+				config_only, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body);
 		servlet!(@impl_trait $worker_name, { $($config_field: $config_type,)* });
 	};
 
@@ -186,58 +270,60 @@ macro_rules! servlet {
 			  |$message:ident| $handler_body:expr) => {
 		servlet!(@impl_struct $worker_name, {});
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
-				 basic, {}, {},
-				 |$message| $handler_body);
+				basic, {}, {},
+				|$message| $handler_body);
 		servlet!(@impl_trait $worker_name, {});
 	};
 
-	// Worker with config and workers
+	// Servlet with config and workers
 	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr,)*],
-			  config_and_workers, {}, { $( $config_field:ident : $config_type:ty, )* },
-			  { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
-			  |$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident) => {
+			config_and_workers, {}, { $( $config_field:ident : $config_type:ty, )* },
+			{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+			|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident) => {
 		servlet!(@impl_struct_with_workers $worker_name, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* });
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
-				 config_and_workers, {}, { $($config_field: $config_type,)* },
-				 { $($worker_field: $worker_type = $worker_init),* },
-				 |$message, $config_param, $workers_param| $handler_body, $worker_config);
+				config_and_workers, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config);
 		servlet!(@impl_trait $worker_name, { $($config_field: $config_type,)* });
 	};
 
 	// Generate struct and optional config struct
 	(@impl_struct $worker_name:ident, {}) => {
-        pub struct $worker_name {
-            server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
-            addr: std::net::SocketAddr,
-        }
-    };
+		pub struct $worker_name {
+			server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+			server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
+			addr: std::net::SocketAddr,
+		}
+	};
 
-    (@impl_struct $worker_name:ident, { $($config_field:ident: $config_type:ty,)* }) => {
-        paste::paste! {
-            pub struct $worker_name {
-                server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
-                addr: std::net::SocketAddr,
-            }
+	(@impl_struct $worker_name:ident, { $($config_field:ident: $config_type:ty,)* }) => {
+		paste::paste! {
+			pub struct $worker_name {
+				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				addr: std::net::SocketAddr,
+			}
 
-            #[derive(Clone)]
-            pub struct [<$worker_name Config>] {
-                $(pub $config_field: $config_type,)*
-            }
-        }
-    };
+			#[derive(Clone)]
+			pub struct [<$worker_name Config>] {
+				$(pub $config_field: $config_type,)*
+			}
+		}
+	};
 
 	// Generate implementation methods
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr),*],
-				   router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
-				   |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
+				router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
+				|$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
 		paste::paste! {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Config>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
-					let server_handle = servlet!(@build_server_with_config
+					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
 						$protocol, listener, [$($policy_key: $policy_val),*], $router, config,
 						(|$message: $crate::Frame, $router_param, $config_param| async move { $handler_body }));
-					Ok(Self { server_handle: Some(server_handle), addr })
+					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
 				}
 
 				servlet!(@common_methods);
@@ -253,10 +339,10 @@ macro_rules! servlet {
 		impl $worker_name {
 			pub async fn start() -> Result<Self, $crate::TightBeamError> {
 				servlet!(@setup_protocol $protocol, listener, addr);
-				let server_handle = servlet!(@build_server
+				let (server_handle, server_pool_handles) = servlet!(@build_server
 					$protocol, listener, [$($policy_key: $policy_val),*], $router,
 					(|$message: $crate::Frame, $router_param| async move { $handler_body }));
-				Ok(Self { server_handle: Some(server_handle), addr })
+				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
 			}
 
 			servlet!(@common_methods);
@@ -272,10 +358,10 @@ macro_rules! servlet {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Config>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
-					let server_handle = servlet!(@build_server_with_config
+					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
 						$protocol, listener, [$($policy_key: $policy_val),*], config,
 						(|$message: $crate::Frame, $config_param| async move { $handler_body }));
-					Ok(Self { server_handle: Some(server_handle), addr })
+					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
 				}
 
 				servlet!(@common_methods);
@@ -291,10 +377,10 @@ macro_rules! servlet {
 		impl $worker_name {
 			pub async fn start() -> Result<Self, $crate::TightBeamError> {
 				servlet!(@setup_protocol $protocol, listener, addr);
-				let server_handle = servlet!(@build_server
+				let (server_handle, server_pool_handles) = servlet!(@build_server
 					$protocol, listener, [$($policy_key: $policy_val),*],
 					(|$message: $crate::Frame| async move { $handler_body }));
-				Ok(Self { server_handle: Some(server_handle), addr })
+				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
 			}
 
 			servlet!(@common_methods);
@@ -306,7 +392,7 @@ macro_rules! servlet {
 	// Generate trait implementation (with config)
 	(@impl_trait $worker_name:ident, { $($config_field:ident: $config_type:ty,)* }) => {
 		paste::paste! {
-			impl $crate::colony::Worker for $worker_name {
+			impl $crate::colony::Servlet for $worker_name {
 				type Config = [<$worker_name Config>];
 
 				async fn start(config: Option<Self::Config>) -> Result<Self, $crate::TightBeamError> {
@@ -331,7 +417,7 @@ macro_rules! servlet {
 
 	// Generate trait implementation (without config)
 	(@impl_trait $worker_name:ident, {}) => {
-		impl $crate::colony::Worker for $worker_name {
+		impl $crate::colony::Servlet for $worker_name {
 			type Config = ();
 
 			async fn start(config: Option<Self::Config>) -> Result<Self, $crate::TightBeamError> {
@@ -354,24 +440,25 @@ macro_rules! servlet {
 	};
 
 	(@impl_struct_with_workers $worker_name:ident, { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:ty),* }) => {
-        paste::paste! {
-            pub struct $worker_name {
-                server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
-                addr: std::net::SocketAddr,
-                #[allow(dead_code)]
-                workers: ::std::sync::Arc<[<$worker_name Workers>]>,
-            }
+		paste::paste! {
+			pub struct $worker_name {
+				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				addr: std::net::SocketAddr,
+				#[allow(dead_code)]
+				workers: ::std::sync::Arc<[<$worker_name Servlets>]>,
+			}
 
-            #[derive(Clone)]
-            pub struct [<$worker_name Config>] {
-                $(pub $config_field: $config_type,)*
-            }
+			#[derive(Clone)]
+			pub struct [<$worker_name Config>] {
+				$(pub $config_field: $config_type,)*
+			}
 
-            pub struct [<$worker_name Workers>] {
-                $(pub $worker_field: $worker_type,)*
-            }
-        }
-    };
+			pub struct [<$worker_name Servlets>] {
+				$(pub $worker_field: $worker_type,)*
+			}
+		}
+	};
 
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:expr),*],
 		config_and_workers, {}, { $($config_field:ident: $config_type:ty,)* },
@@ -386,17 +473,18 @@ macro_rules! servlet {
 					$(
 						let $worker_field = $worker_init?;
 					)*
-					let workers = [<$worker_name Workers>] {
+					let workers = [<$worker_name Servlets>] {
 						$($worker_field,)*
 					};
 					let workers = ::std::sync::Arc::new(workers);
 
-					let server_handle = servlet!(@build_server_with_config_and_workers
+					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config_and_workers
 						$protocol, listener, [$($policy_key: $policy_val),*], config, workers.clone(),
 						(|$message: $crate::Frame, $config_param, $workers_param| async move { $handler_body }));
 
 					Ok(Self {
 						server_handle: Some(server_handle),
+						server_pool_handles,
 						addr,
 						workers,
 					})
@@ -414,19 +502,20 @@ macro_rules! servlet {
 		{
 			let config_arc = ::std::sync::Arc::new($config);
 			let workers_arc = $workers;
-			$crate::server! {
+			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
 				handle: move |$msg: $msg_ty| {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
-					$crate::macros::server::server_runtime::rt::block_on(async move {
+					async move {
 						let $config_param = &config_arc;
 						let $workers_param = &workers_arc;
 						$body
-					})
+					}
 				}
-			}
+			};
+			(server_handle, Vec::new())
 		}
 	};
 
@@ -435,57 +524,62 @@ macro_rules! servlet {
 		{
 			let config_arc = ::std::sync::Arc::new($config);
 			let workers_arc = $workers;
-			$crate::server! {
+			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				handle: move |$msg: $msg_ty| {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
-					$crate::macros::server::server_runtime::rt::block_on(async move {
+					async move {
 						let $config_param = &config_arc;
 						let $workers_param = &workers_arc;
 						$body
-					})
+					}
 				}
-			}
+			};
+			(server_handle, Vec::new())
 		}
 	};
 
 	// Common methods shared by all colony
 	(@common_methods) => {
-        pub fn addr(&self) -> std::net::SocketAddr {
-            self.addr
-        }
+		pub fn addr(&self) -> std::net::SocketAddr {
+			self.addr
+		}
 
-        pub fn stop(mut self) {
-            if let Some(handle) = self.server_handle.take() {
-                $crate::colony::servlet_runtime::rt::abort(handle);
-            }
-        }
+		pub fn stop(mut self) {
+			if let Some(handle) = self.server_handle.take() {
+				$crate::colony::servlet_runtime::rt::abort(handle);
+			}
+		}
 
-        #[cfg(feature = "tokio")]
-        pub async fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
-            if let Some(handle) = self.server_handle.take() {
-                $crate::colony::servlet_runtime::rt::join(handle).await
-            } else {
-                Ok(())
-            }
-        }
+		#[cfg(feature = "tokio")]
+		pub async fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+			if let Some(handle) = self.server_handle.take() {
+				$crate::colony::servlet_runtime::rt::join(handle).await
+			} else {
+				Ok(())
+			}
+		}
 
-        #[cfg(all(not(feature = "tokio"), feature = "std"))]
-        pub async fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
-            if let Some(handle) = self.server_handle.take() {
-                $crate::colony::servlet_runtime::rt::join(handle)
-            } else {
-                Ok(())
-            }
-        }
-    };
+		#[cfg(all(not(feature = "tokio"), feature = "std"))]
+		pub async fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+			if let Some(handle) = self.server_handle.take() {
+				$crate::colony::servlet_runtime::rt::join(handle)
+			} else {
+				Ok(())
+			}
+		}
+	};
 
 	// Drop implementation shared by all colony
 	(@drop_impl $worker_name:ident) => {
 		impl Drop for $worker_name {
 			fn drop(&mut self) {
 				if let Some(handle) = self.server_handle.take() {
+					$crate::colony::servlet_runtime::rt::abort(handle);
+				}
+				// Abort all pool handles
+				for handle in self.server_pool_handles.drain(..) {
 					$crate::colony::servlet_runtime::rt::abort(handle);
 				}
 			}
@@ -497,6 +591,10 @@ macro_rules! servlet {
 		impl Drop for $worker_name {
 			fn drop(&mut self) {
 				if let Some(handle) = self.server_handle.take() {
+					$crate::colony::servlet_runtime::rt::abort(handle);
+				}
+				// Abort all pool handles
+				for handle in self.server_pool_handles.drain(..) {
 					$crate::colony::servlet_runtime::rt::abort(handle);
 				}
 			}
@@ -529,19 +627,20 @@ macro_rules! servlet {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
 			let config_arc = ::std::sync::Arc::new($config);
-			$crate::server! {
+			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
 				handle: move |$msg: $msg_ty| {
 					let router_arc = router_arc.clone();
 					let config_arc = config_arc.clone();
-					$crate::macros::server::server_runtime::rt::block_on(async move {
+					async move {
 						let $router_param = &router_arc;
 						let $config_param = &config_arc;
 						$body
-					})
+					}
 				}
-			}
+			};
+			(server_handle, Vec::new())
 		}
 	};
 
@@ -550,18 +649,19 @@ macro_rules! servlet {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
 			let config_arc = ::std::sync::Arc::new($config);
-			$crate::server! {
+			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				handle: move |$msg: $msg_ty| {
 					let router_arc = router_arc.clone();
 					let config_arc = config_arc.clone();
-					$crate::macros::server::server_runtime::rt::block_on(async move {
+					async move {
 						let $router_param = &router_arc;
 						let $config_param = &config_arc;
 						$body
-					})
+					}
 				}
-			}
+			};
+			(server_handle, Vec::new())
 		}
 	};
 
@@ -569,17 +669,18 @@ macro_rules! servlet {
 	(@build_server_config_only $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $config:ident, (|$msg:ident: $msg_ty:ty, $config_param:ident| async move $body:block)) => {
 		{
 			let config_arc = ::std::sync::Arc::new($config);
-			$crate::server! {
+			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
 				handle: move |$msg: $msg_ty| {
 					let config_arc = config_arc.clone();
-					$crate::macros::server::server_runtime::rt::block_on(async move {
+					async move {
 						let $config_param = &config_arc;
 						$body
-					})
+					}
 				}
-			}
+			};
+			(server_handle, Vec::new())
 		}
 	};
 
@@ -587,16 +688,17 @@ macro_rules! servlet {
 	(@build_server_config_only $protocol:path, $listener:ident, [], $config:ident, (|$msg:ident: $msg_ty:ty, $config_param:ident| async move $body:block)) => {
 		{
 			let config_arc = ::std::sync::Arc::new($config);
-			$crate::server! {
+			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				handle: move |$msg: $msg_ty| {
 					let config_arc = config_arc.clone();
-					$crate::macros::server::server_runtime::rt::block_on(async move {
+					async move {
 						let $config_param = &config_arc;
 						$body
-					})
+					}
 				}
-			}
+			};
+			(server_handle, Vec::new())
 		}
 	};
 
@@ -604,17 +706,18 @@ macro_rules! servlet {
 	(@build_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], $router:expr, (|$msg:ident: $msg_ty:ty, $router_param:ident| async move $body:block)) => {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
-			$crate::server! {
+			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
 				handle: move |$msg: $msg_ty| {
 					let router_arc = router_arc.clone();
-					$crate::macros::server::server_runtime::rt::block_on(async move {
+					async move {
 						let $router_param = &router_arc;
 						$body
-					})
+					}
 				}
-			}
+			};
+			(server_handle, Vec::new())
 		}
 	};
 
@@ -622,41 +725,54 @@ macro_rules! servlet {
 	(@build_server $protocol:path, $listener:ident, [], $router:expr, (|$msg:ident: $msg_ty:ty, $router_param:ident| async move $body:block)) => {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
-			$crate::server! {
+			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				handle: move |$msg: $msg_ty| {
 					let router_arc = router_arc.clone();
-					$crate::macros::server::server_runtime::rt::block_on(async move {
+					async move {
 						let $router_param = &router_arc;
 						$body
-					})
+					}
 				}
-			}
+			};
+			(server_handle, Vec::new())
 		}
 	};
 
 	// Build server basic (non-empty policies)
 	(@build_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:expr),+], (|$msg:ident: $msg_ty:ty| async move $body:block)) => {
-		$crate::server! {
-			protocol $protocol: $listener,
-			policies: { $($policy_key: $policy_val),* },
-			handle: move |$msg: $msg_ty| {
-				$crate::macros::server::server_runtime::rt::block_on(async move {
-					$body
-				})
-			}
+		{
+			// For now, return empty pool - the server macro spawns tasks per connection
+			// which already provides concurrency
+			let server_handle = $crate::server! {
+				protocol $protocol: $listener,
+				policies: { $($policy_key: $policy_val),* },
+				handle: move |$msg: $msg_ty| {
+					async move {
+						$body
+					}
+				}
+			};
+
+			(server_handle, Vec::new())
 		}
 	};
 
 	// Build server basic (empty policies)
 	(@build_server $protocol:path, $listener:ident, [], (|$msg:ident: $msg_ty:ty| async move $body:block)) => {
-		$crate::server! {
-			protocol $protocol: $listener,
-			handle: move |$msg: $msg_ty| {
-				$crate::macros::server::server_runtime::rt::block_on(async move {
-					$body
-				})
-			}
+		{
+			// For now, return empty pool - the server macro spawns tasks per connection
+			// which already provides concurrency
+			let server_handle = $crate::server! {
+				protocol $protocol: $listener,
+				handle: move |$msg: $msg_ty| {
+					async move {
+						$body
+					}
+				}
+			};
+
+			(server_handle, Vec::new())
 		}
 	};
 }
@@ -664,12 +780,11 @@ macro_rules! servlet {
 #[cfg(test)]
 mod tests {
 	use crate::der::Sequence;
-	use crate::transport::policy::PolicyConfiguration;
 
+	#[cfg(feature = "tokio")]
+	use crate::transport::tcp::r#async::TokioListener as Listener;
 	#[cfg(all(not(feature = "tokio"), feature = "std"))]
 	use crate::transport::tcp::TcpListener;
-	#[cfg(feature = "tokio")]
-	use crate::transport::tcp::TokioListener as Listener;
 	#[cfg(feature = "tokio")]
 	use crate::transport::MessageEmitter;
 
@@ -719,7 +834,7 @@ mod tests {
 		name: test_worker_with_test_async_case,
 		features: ["std", "tcp", "tokio"],
 		worker_threads: 2,
-		protocol: TokioListener,
+		protocol: Listener,
 		setup: || {
 			PingPongServlet::start(PingPongServletConfig { lotto_number: 42 })
 		},
@@ -794,35 +909,25 @@ mod tests {
 		}
 
 		crate::worker! {
-			name: PingPongWorker<RequestMessage, Option<PongMessage>>,
-			config: {
-				expected_message: String,
-			},
+			name: PingPongServlet<RequestMessage, PongMessage>,
 			policies: {
 				with_receptor_gate: PingGate
 			},
-			handle: |message, config| async move {
-				if message.content == config.expected_message {
-					Some(PongMessage {
-						result: "PONG".to_string(),
-					})
-				} else {
-					None
+			handle: |_message | async move {
+				PongMessage {
+					result: "PONG".to_string(),
 				}
 			}
 		}
 
 		servlet! {
-			name: PingPongServletWithWorker,
+			name: PingPongServletWithServlet,
 			protocol: Listener,
 			config: {
 				lotto_number: u32,
-				expected_message: String,
 			},
 			workers: |config| {
-				ping_pong: PingPongWorker = PingPongWorker::start(PingPongWorkerConfig {
-					expected_message: config.expected_message.clone(),
-				}),
+				ping_pong: PingPongServlet = PingPongServlet::start(),
 				lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig {
 					lotto_number: config.lotto_number,
 				})
@@ -844,17 +949,13 @@ mod tests {
 					Err(_) => return None,
 				};
 
-				if let Some(reply) = reply {
-					crate::compose! {
-						V0: id: message.metadata.id.clone(),
-							message: ResponseMessage {
-								result: reply.result,
-								is_winner,
-							}
-					}.ok()
-				} else {
-					None
-				}
+				crate::compose! {
+					V0: id: message.metadata.id.clone(),
+						message: ResponseMessage {
+							result: reply.result,
+							is_winner,
+						}
+				}.ok()
 			}
 		}
 
@@ -862,11 +963,10 @@ mod tests {
 			name: test_servlet_with_workers,
 			features: ["std", "tcp", "tokio"],
 			worker_threads: 2,
-			protocol: TokioListener,
+			protocol: Listener,
 			setup: || {
-				PingPongServletWithWorker::start(PingPongServletWithWorkerConfig {
+				PingPongServletWithServlet::start(PingPongServletWithServletConfig {
 					lotto_number: 42,
-					expected_message: "PING".to_string(),
 				})
 			},
 			assertions: |client| async move {
