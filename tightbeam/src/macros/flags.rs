@@ -12,7 +12,6 @@ macro_rules! flags {
 #[macro_export]
 macro_rules! flagset {
 	($name:ident: $first:ty $(, $rest:ty)* $(,)?) => {
-		use $crate::matrix::MatrixLike;
 		#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 		pub struct $name {
 			flags: $crate::flags::Flags<{ tightbeam::flagset!(@count $first $(, $rest)*) }>,

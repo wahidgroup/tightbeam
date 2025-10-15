@@ -162,35 +162,39 @@ impl std::error::Error for WorkerRelayError {}
 
 pub struct WorkerPolicies<I: Send> {
 	#[allow(dead_code)]
-	pub(crate) receptor_gate: Option<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
+	pub(crate) receptor_gates: Vec<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
 }
 
 impl<I: Send> Default for WorkerPolicies<I> {
 	fn default() -> Self {
-		Self { receptor_gate: None }
+		Self { receptor_gates: Vec::new() }
 	}
 }
 
 pub struct WorkerPolicyBuilder<I: Send> {
-	receptor_gate: Option<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
+	receptor_gates: Vec<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
 }
 
 impl<I: Send> Default for WorkerPolicyBuilder<I> {
 	fn default() -> Self {
-		Self { receptor_gate: None }
+		Self { receptor_gates: Vec::new() }
 	}
 }
 
 impl<I: Message + Send> WorkerPolicyBuilder<I> {
 	pub fn build(self) -> WorkerPolicies<I> {
-		WorkerPolicies { receptor_gate: self.receptor_gate }
+		WorkerPolicies { receptor_gates: self.receptor_gates }
 	}
 
-	pub fn with_receptor_gate<R>(mut self, gate: R) -> Self
+	pub fn with_receptor_gate<R, const N: usize>(mut self, gates: [R; N]) -> Self
 	where
 		R: ReceptorPolicy<I> + Send + Sync + 'static,
 	{
-		self.receptor_gate = Some(Arc::new(gate));
+		self.receptor_gates.extend(
+			gates
+				.into_iter()
+				.map(|gate| Arc::new(gate) as Arc<dyn ReceptorPolicy<I> + Send + Sync>),
+		);
 		self
 	}
 }
@@ -204,14 +208,14 @@ macro_rules! worker {
 		name: $worker_name:ident < $input:ty, $output:ty >,
 		$(queue: $queue:expr,)?
 		config: { $($cfg_field:ident : $cfg_ty:ty),* $(,)? },
-		policies: { $( $policy_method:ident : $policy_expr:expr ),* $(,)? },
+		policies: { $( $policy_method:ident : $policy_value:tt ),* $(,)? },
 		handle: |$message_ident:ident, $config_ident:ident| async move $handler_block:block
 	) => {
 		$crate::worker!(@generate
 			$worker_name, $input, $output, [$($queue)?],
 			config,
 			{ $($cfg_field: $cfg_ty,)* },
-			{ $( $policy_method : $policy_expr ),* },
+			{ $( $policy_method : $policy_value ),* },
 			(|$message_ident, $config_ident| async move $handler_block)
 		);
 	};
@@ -219,14 +223,14 @@ macro_rules! worker {
 	(
 		name: $worker_name:ident < $input:ty, $output:ty >,
 		$(queue: $queue:expr,)?
-		policies: { $( $policy_method:ident : $policy_expr:expr ),* $(,)? },
+		policies: { $( $policy_method:ident : $policy_value:tt ),* $(,)? },
 		handle: |$message_ident:ident| async move $handler_block:block
 	) => {
 		$crate::worker!(@generate
 			$worker_name, $input, $output, [$($queue)?],
 			no_config,
 			{},
-			{ $( $policy_method : $policy_expr ),* },
+			{ $( $policy_method : $policy_value ),* },
 			(|$message_ident| async move $handler_block)
 		);
 	};
@@ -263,14 +267,14 @@ macro_rules! worker {
 	(@generate $worker_name:ident, $input:ty, $output:ty, [$($queue:expr)?],
 		$config_kind:ident,
 		{ $($cfg_field:ident: $cfg_ty:ty,)* },
-		{ $( $policy_method:ident : $policy_expr:expr ),* },
+		{ $( $policy_method:ident : $policy_value:tt ),* },
 		$handler:tt) => {
 		$crate::worker!(@impl_struct $worker_name, $input, $output, { $($cfg_field: $cfg_ty,)* });
 		$crate::worker!(@impl_methods
 			$worker_name, $input, $output, [$($queue)?],
 			$config_kind,
 			{ $($cfg_field: $cfg_ty,)* },
-			{ $( $policy_method : $policy_expr ),* },
+			{ $( $policy_method : $policy_value ),* },
 			$handler
 		);
 		$crate::worker!(@drop_impl $worker_name);
@@ -279,14 +283,14 @@ macro_rules! worker {
 	(@generate $worker_name:ident, $input:ty, $output:ty, [$($queue:expr)?],
 		no_config,
 		{},
-		{ $( $policy_method:ident : $policy_expr:expr ),* },
+		{ $( $policy_method:ident : $policy_value:tt ),* },
 		$handler:tt) => {
 		$crate::worker!(@impl_struct $worker_name, $input, $output, {});
 		$crate::worker!(@impl_methods
 			$worker_name, $input, $output, [$($queue)?],
 			no_config,
 			{},
-			{ $( $policy_method : $policy_expr ),* },
+			{ $( $policy_method : $policy_value ),* },
 			$handler
 		);
 		$crate::worker!(@drop_impl $worker_name);
@@ -351,7 +355,7 @@ macro_rules! worker {
 		$worker_name:ident, $input:ty, $output:ty, [$($queue:expr)?],
 		config,
 		{ $($cfg_field:ident: $cfg_ty:ty,)* },
-		{ $( $policy_method:ident : $policy_expr:expr ),* },
+		{ $( $policy_method:ident : $policy_value:tt ),* },
 		$handler:tt
 	) => {
 		paste::paste! {
@@ -362,7 +366,7 @@ macro_rules! worker {
 
 					let config_arc = std::sync::Arc::new(config);
 					let policies = std::sync::Arc::new(
-						$crate::worker!(@build_policies $input, { $( $policy_method : $policy_expr ),* })
+						$crate::worker!(@build_policies $input, { $( $policy_method : $policy_value ),* })
 					);
 
 					let run_loop = {
@@ -384,7 +388,7 @@ macro_rules! worker {
 		$worker_name:ident, $input:ty, $output:ty, [$($queue:expr)?],
 		no_config,
 		{},
-		{ $( $policy_method:ident : $policy_expr:expr ),* },
+		{ $( $policy_method:ident : $policy_value:tt ),* },
 		$handler:tt
 	) => {
 		impl $worker_name {
@@ -393,7 +397,7 @@ macro_rules! worker {
 				let (tx, rx) = $crate::colony::worker_runtime::rt::channel::<$crate::colony::worker::WorkerRequest<$input, $output>>(queue_capacity);
 
 				let policies = std::sync::Arc::new(
-					$crate::worker!(@build_policies $input, { $( $policy_method : $policy_expr ),* })
+					$crate::worker!(@build_policies $input, { $( $policy_method : $policy_value ),* })
 				);
 
 				let run_loop = {
@@ -473,108 +477,62 @@ macro_rules! worker {
 	};
 
 	(@run_loop $rx:ident, (config Some($config_arc:ident)), $policies:ident, (|$message_ident:ident, $config_ident:ident| async move $handler_block:block)) => {{
+		let mut receiver = $rx;
+		let config_arc = $config_arc;
+		let policies = $policies;
 		async move {
-			#[cfg(feature = "tokio")]
-			{
-				let mut receiver = $rx;
-				while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver).await {
-					let $crate::colony::worker::WorkerRequest { message, respond_to } = request;
-					if let Err(status) = $crate::worker!(@evaluate_policies $policies, &message) {
-						let _ = respond_to.send(Err(status));
-						continue;
-					}
-					let config_clone = $config_arc.clone();
-					let output = {
-						let $message_ident = message;
-						let $config_ident = config_clone;
-						async move $handler_block
-					}
-					.await;
-					let _ = respond_to.send(Ok(output));
+			while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver).await {
+				let $crate::colony::worker::WorkerRequest { message, respond_to } = request;
+				if let Err(status) = $crate::worker!(@evaluate_policies policies, &message) {
+					let _ = respond_to.send(Err(status));
+					continue;
 				}
-			}
-
-			#[cfg(all(not(feature = "tokio"), feature = "std"))]
-			{
-				let mut receiver = $rx;
-				while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver) {
-					let $crate::colony::worker::WorkerRequest { message, respond_to } = request;
-					if let Err(status) = $crate::worker!(@evaluate_policies $policies, &message) {
-						let _ = respond_to.send(Err(status));
-						continue;
-					}
-					let config_clone = $config_arc.clone();
-					let output = {
-						let $message_ident = message;
-						let $config_ident = config_clone;
-						async move $handler_block
-					}
-					.await;
-					let _ = respond_to.send(Ok(output));
-				}
+				let $message_ident = message;
+				let $config_ident = config_arc.as_ref();
+				let output = (async move $handler_block).await;
+				let _ = respond_to.send(Ok(output));
 			}
 		}
 	}};
 
 	(@run_loop $rx:ident, (config None), $policies:ident, (|$message_ident:ident| async move $handler_block:block)) => {{
+		let mut receiver = $rx;
+		let policies = $policies;
 		async move {
-			#[cfg(feature = "tokio")]
-			{
-				let mut receiver = $rx;
-				while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver).await {
-					let $crate::colony::worker::WorkerRequest { message, respond_to } = request;
-					if let Err(status) = $crate::worker!(@evaluate_policies $policies, &message) {
-						let _ = respond_to.send(Err(status));
-						continue;
-					}
-					let output = {
-						let $message_ident = message;
-						async move $handler_block
-					}
-					.await;
-					let _ = respond_to.send(Ok(output));
+			while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver).await {
+				let $crate::colony::worker::WorkerRequest { message, respond_to } = request;
+				if let Err(status) = $crate::worker!(@evaluate_policies policies, &message) {
+					let _ = respond_to.send(Err(status));
+					continue;
 				}
-			}
-
-			#[cfg(all(not(feature = "tokio"), feature = "std"))]
-			{
-				let mut receiver = $rx;
-				while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver) {
-					let $crate::colony::worker::WorkerRequest { message, respond_to } = request;
-					if let Err(status) = $crate::worker!(@evaluate_policies $policies, &message) {
-						let _ = respond_to.send(Err(status));
-						continue;
-					}
-					let output = {
-						let $message_ident = message;
-						async move $handler_block
-					}
-					.await;
-					let _ = respond_to.send(Ok(output));
-				}
+				let $message_ident = message;
+				let output = (async move $handler_block).await;
+				let _ = respond_to.send(Ok(output));
 			}
 		}
 	}};
 
 	(@evaluate_policies $policies:expr, $message:expr) => {{
-		if let Some(gate) = $policies.receptor_gate.as_ref() {
-			let status = gate.evaluate($message);
-			if status == $crate::policy::TransitStatus::Accepted {
-				Ok(())
-			} else {
-				Err(status)
+		let __result: Result<(), $crate::policy::TransitStatus> = (|| {
+			for gate in $policies.receptor_gates.iter() {
+				let status = gate.evaluate($message);
+				if status != $crate::policy::TransitStatus::Accepted {
+					return Err(status);
+				}
 			}
-		} else {
 			Ok(())
-		}
+		})();
+		__result
 	}};
 
-	(@build_policies $input:ty, { $( $policy_method:ident : $policy_expr:expr ),* $(,)? }) => {{
-		let builder = $crate::colony::worker::WorkerPolicyBuilder::<$input>::default();
-		$(
-			let builder = builder.$policy_method($policy_expr);
-		)*
-		builder.build()
+	(@build_policies $input:ty, {}) => {{
+		$crate::colony::worker::WorkerPolicyBuilder::<$input>::default().build()
+	}};
+
+	(@build_policies $input:ty, { $( with_receptor_gate : [ $( $gate:expr ),* $(,)? ] ),* $(,)? }) => {{
+		$crate::colony::worker::WorkerPolicyBuilder::<$input>::default()
+			$(.with_receptor_gate([ $( $gate ),* ]))*
+			.build()
 	}};
 
 	(@common_methods $input:ty, $output:ty) => {
@@ -696,20 +654,13 @@ mod tests {
 	}
 
 	worker! {
-		name: PingPongWorker<RequestMessage, Option<PongMessage>>,
-		config: {
-			expected_message: String,
-		},
+		name: PingPongWorker<RequestMessage, PongMessage>,
 		policies: {
-			with_receptor_gate: PingGate
+			with_receptor_gate: [PingGate]
 		},
-		handle: |message, config| async move {
-			if message.content == config.expected_message {
-				Some(PongMessage {
-					result: "PONG".to_string(),
-				})
-			} else {
-				None
+		handle: |_message| async move {
+			PongMessage {
+				result: "PONG".to_string(),
 			}
 		}
 	}
@@ -743,9 +694,7 @@ mod tests {
 		name: test_ping_pong_worker,
 		features: ["std"],
 		setup: || {
-			PingPongWorker::start(PingPongWorkerConfig {
-				expected_message: "PING".to_string(),
-			})
+			PingPongWorker::start()
 		},
 		assertions: |worker| async move {
 			// Test accepted message
@@ -754,7 +703,7 @@ mod tests {
 				lucky_number: 42,
 			};
 			let response = worker.relay(ping_msg).await?;
-			assert_eq!(response, Some(PongMessage { result: "PONG".to_string() }));
+			assert_eq!(response, PongMessage { result: "PONG".to_string() });
 
 			// Test rejected message
 			let pong_msg = RequestMessage {

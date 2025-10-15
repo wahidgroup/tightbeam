@@ -66,9 +66,8 @@ macro_rules! routes {
 			$MsgTy:ty | $($arg:ident),* | $handler:block
 		)+
 	) => {
-		use $crate::router::RouterPolicy;
 		struct $RouterName { $( $field : $fty ),* }
-		impl RouterPolicy for $RouterName {
+		impl $crate::router::RouterPolicy for $RouterName {
 			fn dispatch<T: $crate::Message + Send + 'static>(&self, message: $crate::Frame) -> $crate::router::Result<()> {
 				$(
 					if std::any::TypeId::of::<T>() == std::any::TypeId::of::<$MsgTy>() {
@@ -89,6 +88,7 @@ mod tests {
 	use std::time::Duration;
 
 	use crate::der::Sequence;
+	use crate::router::RouterPolicy;
 	use crate::Beamable;
 
 	#[cfg(not(feature = "derive"))]

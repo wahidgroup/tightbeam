@@ -392,6 +392,8 @@ macro_rules! servlet {
 	// Generate trait implementation (with config)
 	(@impl_trait $worker_name:ident, { $($config_field:ident: $config_type:ty,)* }) => {
 		paste::paste! {
+			#[allow(unused_imports)]
+			use $crate::transport::MessageCollector;
 			impl $crate::colony::Servlet for $worker_name {
 				type Config = [<$worker_name Config>];
 
@@ -417,6 +419,7 @@ macro_rules! servlet {
 
 	// Generate trait implementation (without config)
 	(@impl_trait $worker_name:ident, {}) => {
+		use $crate::transport::MessageCollector;
 		impl $crate::colony::Servlet for $worker_name {
 			type Config = ();
 
@@ -616,9 +619,7 @@ macro_rules! servlet {
 
 	// Protocol setup - updated to handle protocol paths
 	(@setup_protocol $protocol:path, $listener:ident, $addr:ident) => {
-		use $crate::transport::Protocol;
-
-		let ($listener, $addr) = <$protocol as Protocol>::bind("127.0.0.1:0").await
+		let ($listener, $addr) = <$protocol as $crate::transport::Protocol>::bind("127.0.0.1:0").await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 	};
 
@@ -780,6 +781,7 @@ macro_rules! servlet {
 #[cfg(test)]
 mod tests {
 	use crate::der::Sequence;
+	use crate::transport::policy::PolicyConfiguration;
 
 	#[cfg(feature = "tokio")]
 	use crate::transport::tcp::r#async::TokioListener as Listener;
@@ -911,7 +913,7 @@ mod tests {
 		crate::worker! {
 			name: PingPongServlet<RequestMessage, PongMessage>,
 			policies: {
-				with_receptor_gate: PingGate
+				with_receptor_gate: [PingGate]
 			},
 			handle: |_message | async move {
 				PongMessage {

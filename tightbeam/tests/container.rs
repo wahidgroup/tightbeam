@@ -3,6 +3,7 @@
 
 use tightbeam::prelude::*;
 
+use tightbeam::prelude::policy::PolicyConfiguration;
 use tightbeam::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
 
 #[cfg(feature = "tokio")]

@@ -269,9 +269,7 @@ macro_rules! test_builder {
 macro_rules! test_container {
 	// Protocol setup - separate protocol path from identifiers
 	(@setup_protocol $protocol:path, $listener:ident, $addr:ident) => {
-		use $crate::transport::Protocol;
-
-		let ($listener, $addr) = <$protocol as Protocol>::bind("127.0.0.1:0").await
+		let ($listener, $addr) = <$protocol as $crate::transport::Protocol>::bind("127.0.0.1:0").await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 	};
 
@@ -331,7 +329,6 @@ macro_rules! test_container {
 	) => {
 		{
 			use std::sync::{mpsc, Arc};
-			use $crate::transport::policy::PolicyConfiguration;
 
 			test_container!(@setup_protocol $protocol, listener, addr);
 
@@ -397,10 +394,9 @@ macro_rules! test_container {
 	// Build client with policies (direct pass-through; client! supports shorthands)
 	(@build_client $protocol:path, $addr:ident, [$($policy_key:ident: $policy_val:expr),+]) => {{
 		{
-			use $crate::transport::Protocol;
-			let stream = <$protocol as Protocol>::connect($addr).await
+			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await
 				.map_err(|e| $crate::transport::error::TransportError::from(e))?;
-			let mut transport = <$protocol as Protocol>::create_transport(stream);
+			let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
 			$(
 				transport = $crate::test_container!(@set_client_policy transport, $policy_key, $policy_val);
 			)*
@@ -833,6 +829,8 @@ macro_rules! test_servlet {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	use crate::transport::policy::PolicyConfiguration;
 
 	test_case! {
 		name: test_create_test_message,

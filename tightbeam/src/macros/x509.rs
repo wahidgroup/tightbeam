@@ -28,15 +28,13 @@ macro_rules! cert {
 		subject_public_key: $spki:expr
 	) => {{
 		use core::str::FromStr;
+		use $crate::crypto::x509::builder::Builder;
 
-		use $crate::crypto::x509::builder::{Builder, Profile};
-		use $crate::crypto::x509::name::Name;
-
-		let subject = Name::from_str($subject)?;
+		let subject = $crate::crypto::x509::name::Name::from_str($subject)?;
 		let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
 
 		let builder = $crate::crypto::x509::builder::CertificateBuilder::new(
-			Profile::Root,
+			$crate::crypto::x509::builder::Profile::Root,
 			serial,
 			$crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
 			subject.clone(),
@@ -73,16 +71,15 @@ macro_rules! cert {
 		signer: $signer:expr
 		$(, extensions: [$($ext:expr),* $(,)?])?
 	) => {{
-		use $crate::crypto::x509::builder::{Builder, Profile};
-		use $crate::crypto::x509::name::Name;
-		use $crate::der::Encode;
+		use core::str::FromStr;
+		use $crate::crypto::x509::builder::Builder;
 
-		let subject = Name::from_str($subject)?;
-		let issuer = Name::from_str($issuer)?;
+		let subject = $crate::crypto::x509::name::Name::from_str($subject)?;
+		let issuer = $crate::crypto::x509::name::Name::from_str($issuer)?;
 		let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
 
 		let mut builder = $crate::crypto::x509::builder::CertificateBuilder::new(
-			Profile::Leaf { issuer: issuer.clone(), enable_key_agreement: false },
+			$crate::crypto::x509::builder::Profile::Leaf { issuer: issuer.clone(), enable_key_agreement: false },
 			serial,
 			$crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
 			subject,
@@ -110,15 +107,14 @@ macro_rules! cert {
 		signer: $signer:expr
 		$(, path_len: $path_len:expr)?
 	) => {{
-		use $crate::crypto::x509::builder::{Builder, Profile};
-		use $crate::crypto::x509::name::Name;
-		use $crate::der::Encode;
+		use core::str::FromStr;
+		use crate::crypto::x509::builder::Builder;
 
-		let subject = Name::from_str($subject)?;
-		let issuer = Name::from_str($issuer)?;
+		let subject = $crate::crypto::x509::name::Name::from_str($subject)?;
+		let issuer = $crate::crypto::x509::name::Name::from_str($issuer)?;
 		let serial = $crate::crypto::x509::serial_number::SerialNumber::from($serial);
 
-		let profile = Profile::SubCA {
+		let profile = $crate::crypto::x509::builder::Profile::SubCA {
 			issuer: issuer.clone(),
 			path_len_constraint: $( Some($path_len) )?,
 		};

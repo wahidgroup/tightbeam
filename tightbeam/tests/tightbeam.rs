@@ -3,7 +3,7 @@
 //! Demonstrates full V2 protocol capabilities using the compose! macro.
 
 use tightbeam::compose;
-use tightbeam::matrix::MatrixDyn;
+use tightbeam::matrix::{MatrixDyn, MatrixLike};
 use tightbeam::prelude::*;
 
 use tightbeam::crypto::aead::KeyInit;

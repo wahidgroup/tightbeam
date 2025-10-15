@@ -793,11 +793,8 @@ inspired structure:
 ```rust
 tightbeam::worker! {
 	name: PingPongWorker<RequestMessage, PongMessage>,
-	config: {
-		expected_message: String,
-	},
 	policies: {
-		with_receptor_gate: PingGate
+		with_receptor_gate: [PingGate]
 	},
 	handle: |_message, _config| async move {
 		PongMessage {
@@ -807,10 +804,10 @@ tightbeam::worker! {
 }
 ```
 
-Not unlike supraorganisms we can name them, and their "head" may possess
-a specific configuration (config). They may or may not have a receptor which 
-can be used to optionally gate messages. Its "thorax" is itself its container
-for which isolates the entity within its own scoped thread. Finally, it's 
+Not unlike supraorganisms, we can name them, and their "head" may possess
+a specific configuration (config). They may or may not have receptors which 
+can be used to optionally gate messages. The "thorax" is itself the container
+for which isolates the entity within its own scoped thread. Finally, its 
 "abdomen" is the handle which digests the message and produces a response.
 
 ##### Testing
@@ -821,9 +818,7 @@ tightbeam::test_worker! {
 	name: test_ping_pong_worker,
 	features: ["std"],
 	setup: || {
-		PingPongWorker::start(PingPongWorkerConfig {
-			expected_message: "PING".to_string(),
-		})
+		PingPongWorker::start()
 	},
 	assertions: |worker| async move {
 		// Test accepted message
@@ -862,13 +857,10 @@ tightbeam::servlet! {
 	name: PingPongServletWithWorker,
 	protocol: Listener,
 	config: {
-		lotto_number: u32,
-		expected_message: String,
+		lotto_number: u32
 	},
 	workers: |config| {
-		ping_pong: PingPongWorker = PingPongWorker::start(PingPongWorkerConfig {
-			expected_message: config.expected_message.clone(),
-		}),
+		ping_pong: PingPongWorker = PingPongWorker::start(),
 		lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig {
 			lotto_number: config.lotto_number,
 		})

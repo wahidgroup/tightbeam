@@ -1,6 +1,7 @@
 pub mod client;
 pub mod emit;
 pub mod flags;
+pub mod policy;
 pub mod relay;
 pub mod server;
 

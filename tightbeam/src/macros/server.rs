@@ -102,7 +102,6 @@ macro_rules! server {
 					)*
 					let __handler_clone = $handler.clone();
 					#[allow(unused_imports)]
-					use $crate::transport::policy::PolicyConfiguration;
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(move || {
 						let mut __transport = __transport;
@@ -154,7 +153,6 @@ macro_rules! server {
 					let mut __error_channel = $error_tx.clone();
 					let mut __ok_channel = $ok_tx.clone();
 					#[allow(unused_imports)]
-					use $crate::transport::policy::PolicyConfiguration;
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(async move {
 						let mut __transport = __transport;
@@ -233,8 +231,7 @@ macro_rules! server {
 	($protocol:path: bind $addr:expr, handle: $handler:expr) => {{
 		#[cfg(feature = "std")]
 		{
-			use $crate::transport::Protocol;
-			let (listener, _) = <$protocol as Protocol>::bind($addr)?;
+			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler,)
 		}
@@ -251,8 +248,7 @@ macro_rules! server {
 	($protocol:path: bind $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "std")]
 		{
-			use $crate::transport::Protocol;
-			let (listener, _) = <$protocol as Protocol>::bind($addr)?;
+			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: $policy_value),*)
 		}
@@ -284,8 +280,7 @@ macro_rules! server {
 	(protocol $protocol:path: bind $addr:expr, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			use $crate::transport::Protocol;
-			let (listener, _) = <$protocol as Protocol>::bind($addr).await?;
+			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
 			let __server = <$protocol>::from(listener);
 			tokio::spawn(async move {
 				let __error_tx: Option<tokio::sync::mpsc::Sender<$crate::transport::error::TransportError>> = None;
@@ -295,8 +290,7 @@ macro_rules! server {
 		}
 		#[cfg(all(not(feature = "tokio"), feature = "std"))]
 		{
-			use $crate::transport::Protocol;
-			let (listener, _) = <$protocol as Protocol>::bind($addr)?;
+			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			std::thread::spawn(move || {
 				$crate::server!(@sync_loop $protocol, __server, $handler,)
@@ -357,8 +351,7 @@ macro_rules! server {
 	(protocol $protocol:path: bind $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{
-			use $crate::transport::Protocol;
-			let (listener, _) = <$protocol as Protocol>::bind($addr).await?;
+			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
 			let __server = <$protocol>::from(listener);
 			tokio::spawn(async move {
 				let __error_tx: Option<tokio::sync::mpsc::Sender<$crate::transport::error::TransportError>> = None;
@@ -368,8 +361,7 @@ macro_rules! server {
 		}
 		#[cfg(all(not(feature = "tokio"), feature = "std"))]
 		{
-			use $crate::transport::Protocol;
-			let (listener, _) = <$protocol as Protocol>::bind($addr)?;
+			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			std::thread::spawn(move || {
 				$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: $policy_value),*)

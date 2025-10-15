@@ -3,6 +3,8 @@ use fake::{faker, Fake};
 
 use tightbeam::prelude::*;
 
+use tightbeam::prelude::policy::PolicyConfiguration;
+
 tightbeam::mutex! {
 	CRYPTO_CHAINS: Vec<IntegrityInfo> = vec![],
 }

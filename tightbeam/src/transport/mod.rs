@@ -473,14 +473,6 @@ pub trait MessageCollector: MessageIO {
 		self.write_envelope(&response_envelope).await?;
 		Ok(())
 	}
-
-	/// Collect next available message (original behavior for backward compatibility)
-	#[allow(async_fn_in_trait)]
-	async fn collect(&mut self) -> TransportResult<()> {
-		let (request, status) = self.collect_message().await?;
-		let message = self.handle_message(request);
-		self.send_response(status, message).await
-	}
 }
 
 /// Bidirectional transport combines emitter and collector
@@ -512,6 +504,7 @@ mod tests {
 	use super::*;
 	use crate::der::{Decode, Encode};
 	use crate::testing::create_v0_tightbeam;
+	use crate::transport::policy::PolicyConfiguration;
 
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
