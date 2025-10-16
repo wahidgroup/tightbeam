@@ -49,6 +49,33 @@ impl core::fmt::Display for CompressionError {
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]
 pub enum TightBeamError {
+	/// Error from the matrix implementation
+	#[cfg_attr(feature = "derive", error("Matrix error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	MatrixError(crate::matrix::MatrixError),
+
+	#[cfg(feature = "router")]
+	#[cfg_attr(feature = "derive", error("Route error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	RouterError(crate::router::RouterError),
+
+	/// Error from the message builder
+	#[cfg(feature = "builder")]
+	#[cfg_attr(feature = "derive", error("Build error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	BuildError(crate::builder::error::BuildError),
+
+	/// StandardError
+	#[cfg(feature = "standards")]
+	#[cfg_attr(feature = "derive", error("Standard error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	StandardError(crate::standards::error::StandardError),
+
+	#[cfg(feature = "colony")]
+	#[cfg_attr(feature = "derive", error("Drone error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	DroneError(crate::colony::DroneError),
+
 	#[cfg(feature = "std")]
 	/// I/O error
 	#[cfg_attr(feature = "derive", error("I/O error: {0}"))]
@@ -104,28 +131,6 @@ pub enum TightBeamError {
 	#[cfg(feature = "signature")]
 	#[cfg_attr(feature = "derive", error("Signature encoding error"))]
 	SignatureEncodingError,
-
-	/// Error from the matrix implementation
-	#[cfg_attr(feature = "derive", error("Matrix error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	MatrixError(crate::matrix::MatrixError),
-
-	#[cfg(feature = "router")]
-	#[cfg_attr(feature = "derive", error("Route error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	RouterError(crate::router::RouterError),
-
-	/// Error from the message builder
-	#[cfg(feature = "builder")]
-	#[cfg_attr(feature = "derive", error("Build error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	BuildError(crate::builder::error::BuildError),
-
-	/// StandardError
-	#[cfg(feature = "standards")]
-	#[cfg_attr(feature = "derive", error("Standard error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	StandardError(crate::standards::error::StandardError),
 
 	/// Invalid metadata
 	#[cfg_attr(feature = "derive", error("Invalid metadata"))]
@@ -205,6 +210,8 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingPriority => write!(f, "Missing priority"),
 			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
 			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),
+			#[cfg(feature = "colony")]
+			TightBeamError::DroneError(err) => write!(f, "Drone error: {err}"),
 			#[cfg(feature = "standards")]
 			TightBeamError::StandardError(err) => write!(f, "Standard error: {err}"),
 			#[cfg(feature = "random")]

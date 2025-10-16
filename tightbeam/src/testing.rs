@@ -783,126 +783,158 @@ macro_rules! test_servlet {
 
 /// Async test macro for drones
 ///
-/// Automatically creates a drone, morphs it to a servlet, and provides
-/// a client for testing. Properly manages drone lifecycle.
+/// Automatically starts a drone, creates a client, and passes the ready
+/// client to the assertions block for testing. Properly manages drone lifecycle.
+///
+/// Note: Gate observation channels are not yet implemented for drones.
+/// The `channels` parameter is reserved for future use.
 #[macro_export]
 macro_rules! test_drone {
-	// Variant with setup callback
+	// With worker_threads and setup callback
+	(
+		name: $test_name:ident,
+		worker_threads: $threads:literal,
+		protocol: $protocol:ident,
+		drone: $drone_type:ty,
+		config: $config:expr,
+		setup: |$setup_drone:ident| $setup_body:expr,
+		assertions: |$client:ident, $channels:ident| $assertions_body:expr
+	) => {
+		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
+		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+			// Start the drone
+			let drone = <$drone_type as $crate::colony::Servlet>::start($config).await?;
+
+			// Call the setup closure and await the resulting future
+			let $setup_drone = drone;
+			let drone = $setup_body.await;
+
+			// Get the drone address
+			let addr = drone.addr();
+
+			// Create client
+			let mut $client = $crate::client! {
+				connect $protocol: addr
+			};
+
+			// Placeholder channels tuple (not yet implemented for drones)
+			let $channels = ((), ());
+
+			// Run assertions
+			let result = $assertions_body.await;
+
+			// Clean shutdown
+			drone.stop();
+
+			result
+		}
+	};
+
+	// Without worker_threads but with setup callback
 	(
 		name: $test_name:ident,
 		protocol: $protocol:ident,
 		drone: $drone_type:ty,
-		servlet_id: $servlet_id:expr,
 		config: $config:expr,
 		setup: |$setup_drone:ident| $setup_body:expr,
 		assertions: |$client:ident, $channels:ident| $assertions_body:expr
 	) => {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
-			use std::sync::{mpsc, Arc};
+			// Start the drone
+			let drone = <$drone_type as $crate::colony::Servlet>::start($config).await?;
 
-			// Create the drone
-			let mut drone = <$drone_type>::new();
+			// Call the setup closure and await the resulting future
+			let $setup_drone = drone;
+			let drone = $setup_body.await;
 
-			// Status channels for observing gate decisions
-			let (ok_tx_inner, ok_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
-			let (reject_tx_inner, reject_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
-			let ok_tx_arc = Arc::new(ok_tx_inner);
-			let reject_tx_arc = Arc::new(reject_tx_inner);
-
-			// Run setup callback
-			let $setup_drone = &mut drone;
-			$setup_body.await;
-
-			// Morph to the specified servlet
-			let activate_msg =
-				$crate::colony::drone::ActivateServletRequest { servlet_id: $servlet_id.to_vec(), config: $config };
-			drone.morph(activate_msg).await?;
-
-			// Get the servlet address from the active servlet
-			let addr = drone.active_addr().ok_or("No active servlet after morph")?.clone();
+			// Get the drone address
+			let addr = drone.addr();
 
 			// Create client
 			let mut $client = $crate::client! {
 				connect $protocol: addr
 			};
 
-			// Expose channels tuple to assertions
-			let $channels = (ok_rx_inner, reject_rx_inner);
+			// Placeholder channels tuple (not yet implemented for drones)
+			let $channels = ((), ());
 
 			// Run assertions
 			let result = $assertions_body.await;
 
 			// Clean shutdown
-			drone.deactivate().await?;
+			drone.stop();
 
 			result
 		}
 	};
 
-	// Standard variant with config
+	// Simple variant without setup callback, with worker_threads
+	(
+		name: $test_name:ident,
+		worker_threads: $threads:literal,
+		protocol: $protocol:ident,
+		drone: $drone_type:ty,
+		config: $config:expr,
+		assertions: |$client:ident, $channels:ident| $assertions_body:expr
+	) => {
+		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
+		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+			// Start the drone
+			let drone = <$drone_type as $crate::colony::Servlet>::start($config).await?;
+
+			// Get the drone address
+			let addr = drone.addr();
+
+			// Create client
+			let mut $client = $crate::client! {
+				connect $protocol: addr
+			};
+
+			// Placeholder channels tuple (not yet implemented for drones)
+			let $channels = ((), ());
+
+			// Run assertions
+			let result = $assertions_body.await;
+
+			// Clean shutdown
+			drone.stop();
+
+			result
+		}
+	};
+
+	// Simple variant without setup callback, without worker_threads
 	(
 		name: $test_name:ident,
 		protocol: $protocol:ident,
 		drone: $drone_type:ty,
-		servlet_id: $servlet_id:expr,
 		config: $config:expr,
 		assertions: |$client:ident, $channels:ident| $assertions_body:expr
 	) => {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
-			use std::sync::{mpsc, Arc};
+			// Start the drone
+			let drone = <$drone_type as $crate::colony::Servlet>::start($config).await?;
 
-			// Create the drone
-			let mut drone = <$drone_type>::new();
-
-			// Status channels for observing gate decisions
-			let (ok_tx_inner, ok_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
-			let (reject_tx_inner, reject_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
-			let ok_tx_arc = Arc::new(ok_tx_inner);
-			let reject_tx_arc = Arc::new(reject_tx_inner);
-
-			// Morph to the specified servlet
-			let activate_msg =
-				$crate::colony::drone::ActivateServletRequest { servlet_id: $servlet_id.to_vec(), config: $config };
-			drone.morph(activate_msg).await?;
-
-			// Get the servlet address from the active servlet
-			let addr = drone.active_addr().ok_or("No active servlet after morph")?.clone();
+			// Get the drone address
+			let addr = drone.addr();
 
 			// Create client
 			let mut $client = $crate::client! {
 				connect $protocol: addr
 			};
 
-			// Expose channels tuple to assertions
-			let $channels = (ok_rx_inner, reject_rx_inner);
+			// Placeholder channels tuple (not yet implemented for drones)
+			let $channels = ((), ());
 
 			// Run assertions
 			let result = $assertions_body.await;
 
 			// Clean shutdown
-			drone.deactivate().await?;
+			drone.stop();
 
 			result
-		}
-	};
-
-	// Variant without config
-	(
-		name: $test_name:ident,
-		protocol: $protocol:ident,
-		drone: $drone_type:ty,
-		servlet_id: $servlet_id:expr,
-		assertions: |$client:ident, $channels:ident| $assertions_body:expr
-	) => {
-		$crate::test_drone! {
-			name: $test_name,
-			protocol: $protocol,
-			drone: $drone_type,
-			servlet_id: $servlet_id,
-			config: None,
-			assertions: |$client, $channels| $assertions_body
 		}
 	};
 }

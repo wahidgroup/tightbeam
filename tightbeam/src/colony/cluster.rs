@@ -1,7 +1,7 @@
 /*
 //  The Drone (192.168.1.101:889)
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let drone_handle = drone! {
+	Ok(drone! {
 		name: RegularDrone,
 		protocol: Listener,
 		id: b"regular-drone",
@@ -10,12 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			configurable_servlet: ConfurableServlet,
 			worker_servlet: WorkerServlet
 		}
-	}.start();
-
-	// Graceful shutdown
-	drone_handle.join().await?;
-
-	Ok(())
+	}.start().await?)
 }
 
 // Cluster (192.168.1.101:888)
@@ -29,6 +24,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		config: {
 			arbitrary: u32,
 		},
+		servlets: {
+			simple_servlet: SimpleServlet,
+			configurable_servlet: ConfurableServlet,
+			worker_servlet: WorkerServlet
+		}
+		router: {
+			PingMessage: simple_servlet,
+			OtherMessage: worker_servlet,
+		},
 		// Optionally define cluster-wide commands
 		commands: {
 			emergency_stop: |self| async move {
@@ -38,12 +42,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	};
 
 	let user_cluster = UserCluster::new(UserClusterConf { arbitrary: 42 });
-	let user_cluster.colonize()
+	let drones = vec![
+		TightBeamSocketAddr("192.168.1.101:889".parse()?),
+	];
 
-	// Graceful shutdown
-	user_cluster.stop().await?;
+	// Connect to drones
+	drones.iter().for_each(|addr| user_cluster.colonize(addr.clone()));
 
-	Ok(())
+	Ok(user_cluster.run().await?)
 }
 
 */

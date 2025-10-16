@@ -1,4 +1,4 @@
-.PHONY: help help-ref version setup build clean test lint doc test-all
+.PHONY: help help-ref version setup check build clean test lint doc test-all
 
 # Project metadata for help/version
 PROJECT := tightbeam
@@ -25,11 +25,12 @@ help-body:
 	@printf '    help-ref        Show reference documentation links\n'
 	@printf '    version         Show project version information\n'
 	@printf '    setup           Setup the development environment\n'
-	@printf '    build           Build all projects (honors features)\n'
+	@printf '    check           Run code check (honors cargo features)\n'
+	@printf '    build           Build all projects (honors cargo features)\n'
 	@printf '    clean           Clean build artifacts\n'
-	@printf '    test            Run all tests (honors features and no-default)\n'
+	@printf '    test            Run all tests (honors cargo features and no-default)\n'
 	@printf '    test-all        Run tests with all feature combinations\n'
-	@printf '    lint            Run linters (pass extra args via ARGS)\n'
+	@printf '    lint            Run linters (pass extra clippy args via ARGS)\n'
 	@printf '    doc             Build documentation (all features)\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'
@@ -74,6 +75,11 @@ build:
 clean:
 	@echo "Cleaning build artifacts..."
 	cargo clean
+
+# Check
+check:
+	@echo "Checking tightbeam..."
+	cargo check $(if $(features),--features "$(features)")
 
 # Run all tests
 test: build
