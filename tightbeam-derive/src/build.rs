@@ -1,7 +1,7 @@
 use quote::quote;
 
 /// Configuration for a specific builder macro
-pub struct MacroConfig {
+pub struct MacroConf {
 	/// Name of the macro to generate (e.g., "compose")
 	pub name: &'static str,
 	/// Path to the builder type (e.g., "crate::builder::FrameBuilder")
@@ -15,7 +15,7 @@ pub struct MacroConfig {
 }
 
 /// Predefined builder configurations
-pub const BUILDER_CONFIGS: &[MacroConfig] = &[MacroConfig {
+pub const BUILDER_CONFIGS: &[MacroConf] = &[MacroConf {
 	name: "compose",
 	builder_path: "crate::builder::FrameBuilder",
 	has_generics: true,
@@ -37,7 +37,7 @@ pub const BUILDER_CONFIGS: &[MacroConfig] = &[MacroConfig {
 }];
 
 /// Generate a builder macro from a configuration
-pub fn generate_builder_macro(config: &MacroConfig) -> proc_macro2::TokenStream {
+pub fn generate_builder_macro(config: &MacroConf) -> proc_macro2::TokenStream {
 	let macro_name = syn::Ident::new(config.name, proc_macro2::Span::call_site());
 	let helper_name = syn::Ident::new(&format!("__{}_call", config.name), proc_macro2::Span::call_site());
 

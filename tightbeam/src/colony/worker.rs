@@ -345,7 +345,7 @@ macro_rules! worker {
 			}
 
 			#[derive(Clone)]
-			pub struct [<$worker_name Config>] {
+			pub struct [<$worker_name Conf>] {
 				$(pub $cfg_field: $cfg_ty,)*
 			}
 		}
@@ -360,7 +360,7 @@ macro_rules! worker {
 	) => {
 		paste::paste! {
 			impl $worker_name {
-				pub fn start(config: [<$worker_name Config>]) -> $crate::Result<Self> {
+				pub fn start(config: [<$worker_name Conf>]) -> $crate::Result<Self> {
 					let queue_capacity = $crate::worker!(@queue $($queue)?);
 					let (tx, rx) = $crate::colony::worker_runtime::rt::channel::<$crate::colony::worker::WorkerRequest<$input, $output>>(queue_capacity);
 
@@ -422,7 +422,7 @@ macro_rules! worker {
 	) => {
 		paste::paste! {
 			impl $worker_name {
-				pub fn start(config: [<$worker_name Config>]) -> $crate::Result<Self> {
+				pub fn start(config: [<$worker_name Conf>]) -> $crate::Result<Self> {
 					let queue_capacity = $crate::worker!(@queue $($queue)?);
 					let (tx, rx) = rt::channel::<$crate::colony::worker::WorkerRequest<$input, $output>>(queue_capacity);
 
@@ -669,7 +669,7 @@ mod tests {
 	crate::test_worker! {
 		name: lucky_number_worker_checks_winner,
 		setup: || {
-			LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig { lotto_number: 42 })
+			LuckyNumberDeterminer::start(LuckyNumberDeterminerConf { lotto_number: 42 })
 		},
 		assertions: |worker| async move {
 			assert_eq!(worker.queue_capacity(), 64);

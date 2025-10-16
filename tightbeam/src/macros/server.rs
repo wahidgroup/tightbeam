@@ -335,6 +335,29 @@ macro_rules! server {
 		}
 	}};
 
+	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, handle: $handler:expr) => {{
+		#[cfg(feature = "tokio")]
+		{
+			let __listener = $listener;
+			tokio::spawn(async move {
+				let __error_tx = Some($error_tx);
+				let __ok_tx = Some($ok_tx);
+				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx,)
+			})
+		}
+		#[cfg(all(not(feature = "tokio"), feature = "std"))]
+		{
+			let __listener = $listener;
+			std::thread::spawn(move || {
+				$crate::server!(@sync_loop $protocol, __listener, $handler,)
+			})
+		}
+		#[cfg(not(any(feature = "tokio", feature = "std")))]
+		{
+			compile_error!("server!(protocol …, channels: …) requires either the `tokio` or `std` feature");
+		}
+	}};
+
 	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		#[cfg(feature = "tokio")]
 		{

@@ -51,6 +51,10 @@ impl Protocol for std::net::TcpListener {
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
 		TcpTransport::from(stream)
 	}
+
+	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
+		self.local_addr()
+	}
 }
 
 #[cfg(feature = "std")]
@@ -127,7 +131,7 @@ macro_rules! impl_tcp_common {
 		}
 
 		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait> $crate::transport::policy::PolicyConfiguration for $transport<S>
+		impl<S: $stream_trait> $crate::transport::policy::PolicyConf for $transport<S>
 		where
 			TransportError: From<S::Error>,
 		{

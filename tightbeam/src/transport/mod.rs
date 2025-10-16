@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
@@ -25,6 +26,11 @@ use crate::transport::policy::RestartPolicy;
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;
+
+/// Marker crate for applications to handle the address the way they wish
+pub trait TightBeamAddress: Clone + Send {}
+
+impl TightBeamAddress for core::net::SocketAddr {}
 
 // Remove Sequence derive, implement custom encoding
 #[derive(Debug, Clone)]
@@ -226,7 +232,7 @@ pub trait Protocol {
 	type Stream: Send;
 	type Transport: Send;
 	type Error: Into<TransportError>;
-	type Address: Clone + Send;
+	type Address: TightBeamAddress;
 
 	/// Bind to an address and return listener + actual bound address
 	fn bind(
@@ -238,6 +244,15 @@ pub trait Protocol {
 
 	/// Create transport from stream
 	fn create_transport(stream: Self::Stream) -> Self::Transport;
+
+	// Get the tightbeam address for this protocol
+	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error>;
+		
+}
+
+/// This protocol can operate as a mycelial network (ie. different TCP ports)
+pub trait Mycelial: Protocol {
+	fn get_available_connect(&self) -> Result<Self::Address, Self::Error>;
 }
 
 /// Async listener trait
@@ -504,7 +519,7 @@ mod tests {
 	use super::*;
 	use crate::der::{Decode, Encode};
 	use crate::testing::create_v0_tightbeam;
-	use crate::transport::policy::PolicyConfiguration;
+	use crate::transport::policy::PolicyConf;
 
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -11,7 +11,7 @@ use crate::transport::TransportResult;
 use crate::{Frame, Message};
 
 /// Trait for transports that support policy configuration
-pub trait PolicyConfiguration
+pub trait PolicyConf
 where
 	Self: Sized,
 {

@@ -73,6 +73,10 @@ impl Protocol for TokioListener {
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
 		TcpTransport::from(stream)
 	}
+
+	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
+		self.local_addr()
+	}
 }
 
 impl AsyncListenerTrait for TokioListener {
@@ -191,7 +195,7 @@ mod tests {
 	async fn async_with_gate_policy() -> TransportResult<()> {
 		use std::sync::atomic::{AtomicBool, Ordering};
 
-		use crate::transport::policy::PolicyConfiguration;
+		use crate::transport::policy::PolicyConf;
 
 		struct BusyFirstGate {
 			first: AtomicBool,

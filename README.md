@@ -23,8 +23,12 @@ tightbeam is a Layer-5 framework implementing high-fidelity information theory t
 5. [ASN.1 Formal Specification](#asn1-formal-specification)
 6. [Implementation](#implementation)
 7. [Security Considerations](#security-considerations)
-8. [Examples](#examples)
-9. [References](#references)
+8. [Network Theory](#network-theory)
+9. [Testing Framework](#testing-framework)
+10. [Examples](#examples)
+11. [References](#references)
+12. [License](#license)
+13. [Implementation Notes](#implementation-notes)
 
 ## 1. Introduction
 
@@ -751,7 +755,7 @@ tightbeam follows established cryptographic standards and maintains algorithm ag
 - **Algorithm Negotiation**: Support for algorithm capability discovery
 - **Security Policy**: Configurable algorithm allow/deny lists
 
-## 8 Network Theory
+## 8. Network Theory
 
 ### 8.1 Network Architecture
 
@@ -773,9 +777,10 @@ across any transmission protocol:
 ### 8.3 Components
 
 There are three main components to the EECI:
-- [Workers](#821-workers)
-- [Servlets](#822-servlets)
-- [Clusters](#823-clusters)
+- E [Workers](#821-workers)
+- E [Servlets](#822-servlets)
+- C [Clusters](#823-clusters)
+- I [Drones](#824-drones)
 
 Think of workers as ants, servlets as ant hills, and clusters as ant colonies.
 Insects have specific functions for which they process biological information.
@@ -796,7 +801,7 @@ tightbeam::worker! {
 	policies: {
 		with_receptor_gate: [PingGate]
 	},
-	handle: |_message, _config| async move {
+	handle: |_message| async move {
 		PongMessage {
 			result: "PONG".to_string(),
 		}
@@ -809,6 +814,12 @@ a specific configuration (config). They may or may not have receptors which
 can be used to optionally gate messages. The "thorax" is itself the container
 for which isolates the entity within its own scoped thread. Finally, its 
 "abdomen" is the handle which digests the message and produces a response.
+
+The other important thing to note is that like ants, workers operate on 
+local information. They are not aware of the larger system and only operate on
+the message they are given. This is a critical aspect of the EECI and allows
+for a high degree of parallelism and fault tolerance. As a result, they do
+not have access to the full Frame nor should they need it.
 
 ##### Testing
 Testing workers is simple and a container is provided:
@@ -861,7 +872,7 @@ tightbeam::servlet! {
 	},
 	workers: |config| {
 		ping_pong: PingPongWorker = PingPongWorker::start(),
-		lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConfig {
+		lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConf {
 			lotto_number: config.lotto_number,
 		})
 	},
@@ -902,11 +913,10 @@ Testing servlets is simple and a container is provided:
 ```rust
 crate::test_servlet! {
 	name: test_servlet_with_workers,
-	features: ["std", "tcp", "tokio"],
 	worker_threads: 2,
 	protocol: Listener,
 	setup: || {
-		PingPongServletWithWorker::start(PingPongServletWithWorkerConfig {
+		PingPongServletWithWorker::start(PingPongServletWithWorkerConf {
 			lotto_number: 42,
 			expected_message: "PING".to_string(),
 		})
@@ -939,22 +949,41 @@ crate::test_servlet! {
 #### 8.3.3 Clusters
 
 Clusters orchestrate multiple servlets and workers. They are the "ant colonies" 
-of the EECI. Ant colonies are made up of multiple anthills (servlets) and ants 
-(workers). Clusters are multi-threaded and must handle messages asynchronously. 
+of the EECI. Colonies are made up of multiple servlets which command different
+workers. Clusters are multi-threaded and must handle messages asynchronously. 
 Clusters may also define a configuration and as many different servlets as it 
 needs to handle its purpose. While servlets are given a relay, clusters must be 
 provided a router. Routers can emit messages to the servlets within the 
 cluster. 
 
-## 9 Testing Framework
+TODO
+
+#### 8.3.4 Drones
+
+Drones are containerized servlet runners that can dynamically morph between 
+different servlet types based on activation messages from a cluster. This 
+allows you to seed your application over a specific protocol and then morph
+into any known servlet type at runtime.
+
+```rust
+
+```
+
+##### Conclusion
+
+How you wish to model your colonies is beyond the scope of this document. 
+However, it is important to understand the basic building blocks and how they
+can be combined to create complex systems.
+
+## 9. Testing Framework
 
 Full end-to-end containerized testing framework
 - Asynchronous/synchronous containerized end-to-end testing
 - Client/server "quantum tunneling" via MPSC channels
 
-### 9.1 Quantum Tunnel Testing
+### 9.1 Quantum Entanglement Testing
 
-These are our three "entangled particles" for a quantum tunnel.
+These are our three "entangled particles" for our test.
 
 ```rust
 // Server handler channel: tx for server, rx for container
@@ -990,7 +1019,6 @@ service: |message, tx| async move {
 
         let response = Some(tightbeam::compose! {
             V0: id: message.metadata.id.clone(),
-                order: 1_700_000_000u64,
                 message: ResponseMessage {
                     result: "PONG".into()
                 }
@@ -1057,15 +1085,14 @@ enum ServiceAssertChecklist {
 
 test_container! {
 	name: container_gates_basic,
-	features: ["testing", "std", "tcp", "tokio"],
 	worker_threads: 2,
-	protocol: TokioListener,
+	protocol: Listener,
 	service_policies: {
-		gate: [policy::AcceptAllGate]
+		with_collector_gate: [policy::AcceptAllGate]
 	},
 	client_policies: {
-		restart: policy::RestartExponentialBackoff::default(),
-		gate: [policy::AcceptAllGate]
+		with_emitter_gate: [policy::AcceptAllGate],
+		with_restart: [RestartLinearBackoff::new(3, 1, 1, None)]
 	},
 	service: |message, tx| async move {
 		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
@@ -1076,7 +1103,6 @@ test_container! {
 
 			let response = Some(tightbeam::compose! {
 				V0: id: message.metadata.id.clone(),
-					order: 1_700_000_000u64,
 					message: ResponseMessage {
 						result: "PONG".into()
 					}
@@ -1096,7 +1122,6 @@ test_container! {
 		// Compose a simple V0 message
 		let message = tightbeam::compose! {
 			V0: id: b"request",
-				order: 21_000_000u64,
 				message: RequestMessage {
 					content: "PING".into()
 				}
@@ -1134,7 +1159,6 @@ test_container! {
 		Ok(())
 	}
 }
-
 ```
 
 ## 11. References
@@ -1154,7 +1178,7 @@ test_container! {
 - RFC 8032: Edwards-Curve Digital Signature Algorithm (EdDSA)
 - RFC 7748: Elliptic Curves for Security
 
-### 11.1.1 Standards References
+### 11.2 Standards References
 
 - FIPS 140-2: Security Requirements for Cryptographic Modules
 - FIPS 140-3: Security Requirements for Cryptographic Modules
@@ -1200,7 +1224,7 @@ dual licensed as above, without any additional terms or conditions.
 - MIT's simplicity for users who prefer it
 - Apache-2.0's patent grants for enhanced protection
 
-## 13 Implementation Notes
+## 13. Implementation Notes
 
 #### Project Structure
 

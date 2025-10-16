@@ -109,6 +109,10 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
 		TcpTransport::from(stream)
 	}
+
+	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
+		self.listener.local_addr()
+	}
 }
 
 impl<L: TcpListenerTrait> TcpListener<L>
@@ -171,7 +175,7 @@ mod tests {
 	async fn test_tcp_transport_with_gate_policy() -> TransportResult<()> {
 		use std::sync::atomic::{AtomicBool, Ordering};
 
-		use crate::transport::policy::PolicyConfiguration;
+		use crate::transport::policy::PolicyConf;
 
 		/// Policy: first Busy, then Accepted
 		struct BusyFirstGate {

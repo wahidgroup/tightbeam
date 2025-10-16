@@ -3,7 +3,7 @@
 
 use tightbeam::prelude::*;
 
-use tightbeam::prelude::policy::PolicyConfiguration;
+use tightbeam::prelude::policy::{PolicyConf, RestartLinearBackoff};
 use tightbeam::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
 
 #[cfg(feature = "tokio")]
@@ -44,7 +44,7 @@ test_container! {
 	},
 	client_policies: {
 		with_emitter_gate: [policy::AcceptAllGate],
-		with_restart: [policy::RestartExponentialBackoff::default()]
+		with_restart: [RestartLinearBackoff::new(3, 1, 1, None)]
 	},
 	service: |message, tx| async move {
 		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
@@ -55,7 +55,6 @@ test_container! {
 
 			let response = Some(tightbeam::compose! {
 				V0: id: message.metadata.id.clone(),
-					order: 1_700_000_000u64,
 					message: ResponseMessage {
 						result: "PONG".into()
 					}
@@ -75,7 +74,6 @@ test_container! {
 		// Compose a simple V0 message
 		let message = tightbeam::compose! {
 			V0: id: b"request",
-				order: 1_700_000_000u64,
 				message: RequestMessage {
 					content: "PING".into()
 				}

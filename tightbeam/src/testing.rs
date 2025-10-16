@@ -779,12 +779,77 @@ macro_rules! test_servlet {
 	};
 }
 
+/// Async test macro for drones
+///
+/// Automatically creates a drone, morphs it to a servlet, and provides
+/// a client for testing. Properly manages drone lifecycle.
+#[macro_export]
+macro_rules! test_drone {
+	(
+		name: $test_name:ident,
+		protocol: $protocol:ident,
+		drone: $drone_type:ty,
+		servlet_id: $servlet_id:expr,
+		config: $config:expr,
+		assertions: |$client:ident, $drone:ident| $assertions_body:expr
+	) => {
+		#[tokio::test]
+		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+			// Create the drone
+			let mut $drone = <$drone_type>::new();
+
+			// Morph to the specified servlet
+			let activate_msg = $crate::colony::drone::ActivateServletMessage {
+				servlet_id: $servlet_id.to_vec(),
+				config: $config,
+			};
+			$drone.morph(activate_msg).await?;
+
+			// Get the servlet address from the active servlet
+			let addr = $drone.active_addr()
+				.ok_or("No active servlet after morph")?
+				.clone();
+
+			// Create client
+			let mut $client = $crate::client! {
+				connect $protocol: addr
+			};
+
+			// Run assertions
+			let result = $assertions_body.await;
+
+			// Clean shutdown
+			$drone.deactivate().await?;
+
+			result
+		}
+	};
+
+	// Variant without config
+	(
+		name: $test_name:ident,
+		protocol: $protocol:ident,
+		drone: $drone_type:ty,
+		servlet_id: $servlet_id:expr,
+		assertions: |$client:ident, $drone:ident| $assertions_body:expr
+	) => {
+		$crate::test_drone! {
+			name: $test_name,
+			protocol: $protocol,
+			drone: $drone_type,
+			servlet_id: $servlet_id,
+			config: None,
+			assertions: |$client, $drone| $assertions_body
+		}
+	};
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	use crate::policy::{GatePolicy, TransitStatus};
-	use crate::transport::policy::{PolicyConfiguration, RestartLinearBackoff};
+	use crate::transport::policy::{PolicyConf, RestartLinearBackoff};
 
 	/// Custom gate that interprets message.metadata.id:
 	/// - "accept-{ID}"  => accept immediately
