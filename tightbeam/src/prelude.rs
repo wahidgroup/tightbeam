@@ -50,6 +50,9 @@ pub mod policy {
 	pub use crate::transport::policy::*;
 }
 
+#[cfg(feature = "tcp")]
+pub use crate::transport::tcp::TightBeamSocketAddr;
+
 // Macros
 #[cfg(feature = "derive")]
 pub mod tb {

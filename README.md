@@ -476,7 +476,9 @@ AlgorithmIdentifier ::= SEQUENCE {
 - `originalSize` in compression info MUST match the uncompressed message size
 - Compression level MUST be within algorithm-specific valid ranges
 
-#### Matrix Specification
+#### What is the Matrix?
+The short answer: What Universe does this information reside in?
+
 Wire format
 - ASN.1 type: Matrix ::= SEQUENCE { n INTEGER (1..255), data OCTET STRING (SIZE(1..(255*255))) }
 - Encoding: DER. The data field is row-major; the cell at (row r, col c) is at index r*n + c.
@@ -964,6 +966,14 @@ Drones are containerized servlet runners that can dynamically morph between
 different servlet types based on activation messages from a cluster. This 
 allows you to seed your application over a specific protocol and then morph
 into any known servlet type at runtime.
+
+##### "Mycelial" Protocols
+
+Protocols such as TCP are considered "mycelial" as they operate over a single
+address but can have multiple ports. This allows the drone to establish
+a servlet on different ports and provide the protocol address to the cluster
+so it can register it under its hive.
+
 
 ```rust
 

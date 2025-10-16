@@ -257,28 +257,28 @@ macro_rules! decompress {
 macro_rules! rwlock {
 	// Single declaration with default
 	($name:ident: $ty:ty = $default:expr) => {
-		const _: () = {
-			static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
+		paste::paste! {
+			static [<$name _CELL>]: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
 
 			#[allow(non_snake_case)]
-			pub(crate) fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
-				CELL.get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
+			fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
+				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
 					.clone()
 			}
-		};
+		}
 	};
 
 	// Single declaration without default (uses Default trait)
 	($name:ident: $ty:ty) => {
-		const _: () = {
-			static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
+		paste::paste! {
+			static [<$name _CELL>]: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<$ty>>> = std::sync::OnceLock::new();
 
 			#[allow(non_snake_case)]
-			pub(crate) fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
-				CELL.get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Default::default())))
+			fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
+				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Default::default())))
 					.clone()
 			}
-		};
+		}
 	};
 
 	// Multiple declarations
@@ -294,28 +294,28 @@ macro_rules! rwlock {
 macro_rules! mutex {
 	// Single declaration with default
 	($name:ident: $ty:ty = $default:expr) => {
-		const _: () = {
-			static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
+		paste::paste! {
+			static [<$name _CELL>]: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
 
 			#[allow(non_snake_case)]
-			pub(crate) fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
-				CELL.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new($default)))
+			fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
+				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new($default)))
 					.clone()
 			}
-		};
+		}
 	};
 
 	// Single declaration without default (uses Default trait)
 	($name:ident: $ty:ty) => {
-		const _: () = {
-			static CELL: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
+		paste::paste! {
+			static [<$name _CELL>]: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<$ty>>> = std::sync::OnceLock::new();
 
 			#[allow(non_snake_case)]
-			pub(crate) fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
-				CELL.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Default::default())))
+			fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
+				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Default::default())))
 					.clone()
 			}
-		};
+		}
 	};
 
 	// Multiple declarations

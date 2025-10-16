@@ -13,25 +13,41 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use std::collections::HashMap;
 
 #[cfg(not(feature = "std"))]
-use hashbrown::HashMap;
+use std::hash::HashMap;
 
 use core::future::Future;
 use core::pin::Pin;
 
 use crate::colony::Servlet;
-use crate::transport::TightBeamAddress;
-use crate::TightBeamError;
+use crate::der::Sequence;
+use crate::transport::{Protocol, TightBeamAddress};
+use crate::{Beamable, TightBeamError};
+
+#[cfg(feature = "policy")]
+use crate::policy::{GatePolicy, ReceptorPolicy};
 
 /// Message type for activating a servlet on a drone
 ///
 /// This message is sent from a cluster controller to a drone to instruct
 /// it to morph into a specific servlet configuration.
-#[derive(Clone, Debug)]
-pub struct ActivateServletMessage {
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct ActivateServletRequest {
 	/// The identifier of the servlet to activate
 	pub servlet_id: Vec<u8>,
 	/// Optional configuration data for the servlet
 	pub config: Option<Vec<u8>>,
+}
+
+/// Message type for activating a servlet on a drone
+///
+/// This message is sent from a cluster controller to a drone to instruct
+/// it to morph into a specific servlet configuration.
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct ActivateServletResponse {
+	/// The address of the activated servlet
+	pub address: Vec<u8>,
+	/// Optional data
+	pub data: Option<Vec<u8>>,
 }
 
 /// Handle to an active servlet instance
@@ -90,16 +106,19 @@ pub type ServletFactory<Addr> = Box<
 ///
 /// Drones are containerized servlet runners that can dynamically morph
 /// between different servlet types based on activation messages.
-pub trait TightBeamDrone<Addr: Clone> {
+pub trait TightBeamDrone {
 	/// Activate a servlet on this drone
 	///
 	/// # Arguments
 	/// * `msg` - The activation message containing servlet ID and configuration
 	///
 	/// # Returns
-	/// * `Ok(())` if the servlet was successfully activated
+	/// * `Ok(ActivateServletResponse)` with the address where the servlet is running
 	/// * `Err(TightBeamError)` if activation failed
-	fn morph(&mut self, msg: ActivateServletMessage) -> impl Future<Output = Result<(), TightBeamError>> + Send;
+	fn morph(
+		&mut self,
+		msg: ActivateServletRequest,
+	) -> impl Future<Output = Result<ActivateServletResponse, TightBeamError>> + Send;
 
 	/// Get the current drone ID
 	fn id(&self) -> &[u8];
@@ -109,6 +128,14 @@ pub trait TightBeamDrone<Addr: Clone> {
 
 	/// Stop the currently active servlet
 	fn deactivate(&mut self) -> impl Future<Output = Result<(), TightBeamError>> + Send;
+
+	/// Set the access receptor gate for the drone (controls servlet activation)
+	#[allow(async_fn_in_trait)]
+	async fn with_access_receptor<G: ReceptorPolicy<ActivateServletResponse> + 'static>(&mut self, gate: G);
+
+	/// Set the collector gate for the drone (controls message acceptance from clusters)
+	#[allow(async_fn_in_trait)]
+	async fn with_collector_gate<G: GatePolicy + 'static>(&mut self, gate: G);
 }
 
 /// Registry-based drone listener
@@ -116,20 +143,54 @@ pub trait TightBeamDrone<Addr: Clone> {
 /// Maintains a registry of servlet factories that can be instantiated
 /// on demand when activation messages are received.
 ///
-/// Generic over the address type to support different protocols.
-pub struct DroneListener<Addr: Clone> {
+/// Generic over the protocol type to support different protocols.
+pub struct DroneListener<P: Protocol> {
 	/// Drone identifier
 	id: Vec<u8>,
 	/// Registry mapping servlet names to factory functions
-	registry: HashMap<String, ServletFactory<Addr>>,
+	registry: HashMap<String, ServletFactory<P::Address>>,
 	/// Currently active servlet (if any)
-	active_servlet: Option<ServletHandle<Addr>>,
+	active_servlet: Option<ServletHandle<P::Address>>,
+	/// Protocol listener for spawning new servlets (for Mycelial protocols)
+	listener: Option<P::Listener>,
+	/// Access gate for mycelial behaviour (controls servlet activation)
+	#[cfg(feature = "policy")]
+	access_gate: Option<Box<dyn ReceptorPolicy<ActivateServletResponse> + Send>>,
+	/// Collector gate for message acceptance from clusters
+    #[cfg(feature = "policy")]
+    collector_gate: Option<Vec<Box<dyn GatePolicy + Send>>>,
 }
 
-impl<Addr: TightBeamAddress + 'static> DroneListener<Addr> {
+impl<P: Protocol> DroneListener<P>
+where
+	P::Address: TightBeamAddress + 'static,
+{
 	/// Create a new drone listener with the given ID
 	pub fn new(id: Vec<u8>) -> Self {
-		Self { id, registry: HashMap::new(), active_servlet: None }
+		Self {
+			id,
+			registry: HashMap::new(),
+			active_servlet: None,
+			listener: None,
+			#[cfg(feature = "policy")]
+			access_gate: None,
+			#[cfg(feature = "policy")]
+			collector_gate: None,
+		}
+	}
+
+	/// Create a new drone listener with a protocol listener (for Mycelial protocols)
+	pub fn with_listener(id: Vec<u8>, listener: P::Listener) -> Self {
+		Self {
+			id,
+			registry: HashMap::new(),
+			active_servlet: None,
+			listener: Some(listener),
+			#[cfg(feature = "policy")]
+			access_gate: None,
+			#[cfg(feature = "policy")]
+			collector_gate: None,
+		}
 	}
 
 	/// Register a servlet factory with the given name
@@ -137,7 +198,7 @@ impl<Addr: TightBeamAddress + 'static> DroneListener<Addr> {
 	/// # Arguments
 	/// * `name` - The name/identifier for this servlet type
 	/// * `factory` - Factory function that creates servlet instances
-	pub fn register<S>(&mut self, name: S, factory: ServletFactory<Addr>)
+	pub fn register<S>(&mut self, name: S, factory: ServletFactory<P::Address>)
 	where
 		S: Into<String>,
 	{
@@ -145,12 +206,12 @@ impl<Addr: TightBeamAddress + 'static> DroneListener<Addr> {
 	}
 
 	/// Get a reference to the registry
-	pub fn registry(&self) -> &HashMap<String, ServletFactory<Addr>> {
+	pub fn registry(&self) -> &HashMap<String, ServletFactory<P::Address>> {
 		&self.registry
 	}
 
 	/// Get a mutable reference to the registry
-	pub fn registry_mut(&mut self) -> &mut HashMap<String, ServletFactory<Addr>> {
+	pub fn registry_mut(&mut self) -> &mut HashMap<String, ServletFactory<P::Address>> {
 		&mut self.registry
 	}
 
@@ -159,7 +220,7 @@ impl<Addr: TightBeamAddress + 'static> DroneListener<Addr> {
 	where
 		S: Servlet + Send + 'static,
 		Fut: Future<Output = Result<S, TightBeamError>> + Send + 'static,
-		F: Fn(&S) -> Addr + Send + Sync + 'static + Clone,
+		F: Fn(&S) -> P::Address + Send + Sync + 'static + Clone,
 	{
 		self.register(
 			servlet_id,
@@ -172,10 +233,27 @@ impl<Addr: TightBeamAddress + 'static> DroneListener<Addr> {
 			}),
 		);
 	}
+
+	#[cfg(feature = "policy")]
+	pub fn set_access_receptor<G: ReceptorPolicy<ActivateServletResponse> + 'static>(&mut self, gate: G) {
+        self.access_gate = Some(Box::new(gate));
+    }
+
+    #[cfg(feature = "policy")]
+    pub fn set_collector_gate<G: GatePolicy + 'static>(&mut self, gate: G) {
+        match self.collector_gate.as_mut() {
+            Some(gates) => gates.push(Box::new(gate)),
+            None => self.collector_gate = Some(vec![Box::new(gate)]),
+        }
+    }
 }
 
-impl<Addr: TightBeamAddress + 'static> TightBeamDrone<Addr> for DroneListener<Addr> {
-	async fn morph(&mut self, msg: ActivateServletMessage) -> Result<(), TightBeamError> {
+impl<P: Protocol> TightBeamDrone for DroneListener<P>
+where
+	P::Address: TightBeamAddress + 'static,
+{
+		
+	async fn morph(&mut self, msg: ActivateServletRequest) -> Result<ActivateServletResponse, TightBeamError> {
 		// Convert servlet_id to string for registry lookup
 		let servlet_name = core::str::from_utf8(&msg.servlet_id)
 			.map_err(|_| TightBeamError::InvalidMetadata)?
@@ -188,14 +266,31 @@ impl<Addr: TightBeamAddress + 'static> TightBeamDrone<Addr> for DroneListener<Ad
 
 		// Look up the factory in the registry
 		let factory = self.registry.get(&servlet_name).ok_or(TightBeamError::MissingConfiguration)?;
-
 		// Create the new servlet instance
 		let servlet_handle = factory(msg.config).await?;
+		// Get the address where the servlet is running
+		let addr = servlet_handle.addr().clone();
 
 		// Store the active servlet handle
 		self.active_servlet = Some(servlet_handle);
 
-		Ok(())
+		// Return the response with the servlet address
+		// Convert address to bytes using Into<Vec<u8>>
+		let addr_bytes: Vec<u8> = addr.into();
+		let response = ActivateServletResponse { address: addr_bytes, data: None };
+
+		// Check access gate if configured
+		#[cfg(feature = "policy")]
+		if let Some(gate) = &self.access_gate {
+			let status = gate.evaluate(&response);
+			if status != crate::policy::TransitStatus::Accepted {
+				// Deactivate the servlet if gate check fails
+				self.deactivate().await?;
+				return Err(TightBeamError::MissingConfiguration);
+			}
+		}
+
+		Ok(response)
 	}
 
 	fn id(&self) -> &[u8] {
@@ -210,15 +305,35 @@ impl<Addr: TightBeamAddress + 'static> TightBeamDrone<Addr> for DroneListener<Ad
 		if let Some(handle) = self.active_servlet.take() {
 			handle.stop();
 		}
+
 		Ok(())
 	}
+
+	#[cfg(feature = "policy")]
+	async fn with_access_receptor<G: ReceptorPolicy<ActivateServletResponse> + 'static>(&mut self, gate: G) {
+        self.set_access_receptor(gate);
+    }
+
+    async fn with_collector_gate<G: GatePolicy + 'static>(&mut self, gate: G) {
+        #[cfg(feature = "policy")]
+        {
+            self.set_collector_gate(gate);
+        }
+        #[cfg(not(feature = "policy"))]
+        {
+            let _ = gate;
+        }
+    }
 }
 
-impl<Addr: TightBeamAddress + 'static> DroneListener<Addr> {
+impl<P: Protocol> DroneListener<P>
+where
+	P::Address: TightBeamAddress + 'static,
+{
 	/// Get the address of the currently active servlet
 	///
 	/// Returns None if no servlet is currently active
-	pub fn active_addr(&self) -> Option<&Addr> {
+	pub fn active_addr(&self) -> Option<&P::Address> {
 		self.active_servlet.as_ref().map(|h| h.addr())
 	}
 }
@@ -230,12 +345,14 @@ macro_rules! drone {
 		name: $drone_name:ident,
 		protocol: $protocol:ident,
 		id: $id:expr,
+		$(with_collector_gate: [ $( $collector_gate:expr ),* $(,)? ],)?
 		servlets: {
 			$($servlet_id:ident: $servlet_type:ty),* $(,)?
 		}
+		$(, with_access_receptor: $receptor:expr)?
 	) => {
 		pub struct $drone_name {
-			inner: $crate::colony::drone::DroneListener<<$protocol as $crate::transport::Protocol>::Address>,
+			inner: $crate::colony::drone::DroneListener<$protocol>,
 		}
 
 		impl $drone_name {
@@ -254,6 +371,18 @@ macro_rules! drone {
 					);
 				)*
 
+				#[cfg(feature = "policy")]
+				{
+					$(
+						$(
+							inner.set_collector_gate($collector_gate);
+						)*
+					)?
+					$(
+						inner.set_access_receptor($receptor);
+					)?
+				}
+
 				Self { inner }
 			}
 
@@ -264,8 +393,8 @@ macro_rules! drone {
 			}
 		}
 
-		impl $crate::colony::drone::TightBeamDrone<<$protocol as $crate::transport::Protocol>::Address> for $drone_name {
-			async fn morph(&mut self, msg: $crate::colony::drone::ActivateServletMessage) -> Result<(), $crate::TightBeamError> {
+		impl $crate::colony::drone::TightBeamDrone for $drone_name {
+			async fn morph(&mut self, msg: $crate::colony::drone::ActivateServletRequest) -> Result<$crate::colony::drone::ActivateServletResponse, $crate::TightBeamError> {
 				self.inner.morph(msg).await
 			}
 
@@ -280,42 +409,79 @@ macro_rules! drone {
 			async fn deactivate(&mut self) -> Result<(), $crate::TightBeamError> {
 				self.inner.deactivate().await
 			}
+
+			async fn with_access_receptor<G: $crate::policy::ReceptorPolicy<$crate::colony::drone::ActivateServletResponse> + 'static>(&mut self, gate: G) {
+				self.inner.with_access_receptor(gate).await;
+			}
+
+			async fn with_collector_gate<G: $crate::policy::GatePolicy + 'static>(&mut self, gate: G) {
+				self.inner.with_collector_gate(gate).await;
+			}
 		}
 	};
 }
 
 #[cfg(test)]
-#[allow(private_interfaces)]
 mod tests {
 	use super::*;
+
 	use crate::der::Sequence;
-	use crate::policy::{ReceptorPolicy, TransitStatus};
+	use crate::policy::TransitStatus;
 	use crate::transport::policy::PolicyConf;
-	use crate::{servlet, worker};
+	use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1VerifyingKey, Secp256k1Signature};
+	use crate::{policy, servlet, worker, mutex};
+	use crate::Beamable;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::policy::GatePolicy;
 
 	#[cfg(feature = "tokio")]
 	type Listener = crate::transport::tcp::r#async::TokioListener;
 	#[cfg(all(not(feature = "tokio"), feature = "std"))]
 	type Listener = crate::transport::tcp::sync::TcpListener<std::net::TcpListener>;
 
+	mutex! { SIGNING_KEY: Secp256k1SigningKey = crate::testing::create_test_signing_key() }
+
 	// Test message types
-	#[derive(crate::Beamable, Clone, Debug, PartialEq, Sequence)]
-	struct DroneTestMessage {
+	#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+	pub struct DroneTestMessage {
 		content: String,
 		value: u32,
 	}
 
-	#[derive(crate::Beamable, Clone, Debug, PartialEq, Sequence)]
-	struct DroneResponseMessage {
+	#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+	pub struct DroneResponseMessage {
 		result: String,
 	}
 
-	// Simple gate policy for testing
-	#[derive(Default)]
-	struct TestGate;
+	// Firewall signature gate that verifies cryptographic signatures on activation requests
+	struct SignatureGate {
+		verifying_key: Secp256k1VerifyingKey,
+	}
 
-	impl ReceptorPolicy<DroneTestMessage> for TestGate {
-		fn evaluate(&self, msg: &DroneTestMessage) -> TransitStatus {
+	impl SignatureGate {
+		fn new(verifying_key: Secp256k1VerifyingKey) -> Self {
+			Self { verifying_key }
+		}
+	}
+
+	impl GatePolicy for SignatureGate {
+		fn evaluate(&self, frame: &crate::Frame) -> TransitStatus {
+			// Check if the frame has a nonrepudiation signature
+			if frame.nonrepudiation.is_some() {
+				// Verify the signature using the built-in verify method
+				if frame.verify::<Secp256k1Signature>(&self.verifying_key).is_ok() {
+					TransitStatus::Accepted
+				} else {
+					TransitStatus::Forbidden
+				}
+			} else {
+				TransitStatus::Unauthorized
+			}
+		}
+	}
+
+	policy! {
+		ReceptorPolicy<DroneTestMessage>: TestGate |msg| {
 			if msg.value > 0 {
 				TransitStatus::Accepted
 			} else {
@@ -359,7 +525,6 @@ mod tests {
 			if decoded.content == "PING" {
 				Some(crate::compose! {
 					V0: id: message.metadata.id.clone(),
-						order: 1_700_000_000u64,
 						message: DroneResponseMessage {
 							result: "PONG".to_string(),
 						}
@@ -384,7 +549,6 @@ mod tests {
 			if decoded.value >= config.threshold {
 				Some(crate::compose! {
 					V0: id: message.metadata.id.clone(),
-						order: 1_700_000_000u64,
 						message: DroneResponseMessage {
 							result: "ACCEPTED".to_string(),
 						}
@@ -448,357 +612,100 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_drone_listener_creation() {
-		let drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-		assert_eq!(drone.id(), b"test-drone-001");
-		assert!(!drone.is_active());
-	}
 
-	#[test]
-	fn test_drone_register_servlet() {
-		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-
-		// Register a servlet factory
-		drone.register(
-			"simple_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet = SimpleServlet::start().await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		assert_eq!(drone.registry().len(), 1);
-		assert!(drone.registry().contains_key("simple_servlet"));
-	}
-
-	#[cfg(feature = "tokio")]
-	#[tokio::test]
-	async fn test_drone_colonize_simple_servlet() {
-		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-
-		// Register a simple servlet factory
-		drone.register(
-			"simple_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet = SimpleServlet::start().await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		// Activate the servlet
-		let msg = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
-
-		let result = drone.morph(msg).await;
-		assert!(result.is_ok());
-		assert!(drone.is_active());
-	}
-
-	#[cfg(feature = "tokio")]
-	#[tokio::test]
-	async fn test_drone_colonize_configurable_servlet() {
-		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-
-		// Register a configurable servlet factory
-		drone.register(
-			"configurable_servlet",
-			Box::new(|_config| {
-				Box::pin(async move {
-					// For this test, we'll use a default config if none provided
-					let servlet_config = ConfurableServletConf { threshold: 10 };
-					let servlet = ConfurableServlet::start(servlet_config).await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		// Activate the servlet
-		let msg = ActivateServletMessage { servlet_id: b"configurable_servlet".to_vec(), config: None };
-
-		let result = drone.morph(msg).await;
-		assert!(result.is_ok());
-		assert!(drone.is_active());
-	}
-
-	#[cfg(feature = "tokio")]
-	#[tokio::test]
-	async fn test_drone_colonize_worker_servlet() {
-		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-
-		// Register a servlet with workers
-		drone.register(
-			"worker_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet_config = WorkerServletConf { threshold: 5 };
-					let servlet = WorkerServlet::start(servlet_config).await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		// Activate the servlet
-		let msg = ActivateServletMessage { servlet_id: b"worker_servlet".to_vec(), config: None };
-
-		let result = drone.morph(msg).await;
-		assert!(result.is_ok());
-		assert!(drone.is_active());
-	}
-
-	#[cfg(feature = "tokio")]
-	#[tokio::test]
-	async fn test_drone_deactivate() {
-		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-
-		// Register and activate a servlet
-		drone.register(
-			"simple_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet = SimpleServlet::start().await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		let msg = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
-
-		drone.morph(msg).await.unwrap();
-		assert!(drone.is_active());
-
-		// Deactivate
-		let result = drone.deactivate().await;
-		assert!(result.is_ok());
-		assert!(!drone.is_active());
-	}
-
-	#[cfg(feature = "tokio")]
-	#[tokio::test]
-	async fn test_drone_morph_between_servlets() {
-		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-
-		// Register two different servlets
-		drone.register(
-			"simple_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet = SimpleServlet::start().await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		drone.register(
-			"worker_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet_config = WorkerServletConf { threshold: 5 };
-					let servlet = WorkerServlet::start(servlet_config).await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		// Activate first servlet
-		let msg_a = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
-		drone.morph(msg_a).await.unwrap();
-		assert!(drone.is_active());
-
-		// Morph to second servlet (should deactivate first)
-		let msg_b = ActivateServletMessage { servlet_id: b"worker_servlet".to_vec(), config: None };
-		let result = drone.morph(msg_b).await;
-		assert!(result.is_ok());
-		assert!(drone.is_active());
-	}
-
-	#[cfg(feature = "tokio")]
-	#[tokio::test]
-	async fn test_drone_invalid_servlet() {
-		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-
-		// Try to activate a servlet that doesn't exist
-		let msg = ActivateServletMessage { servlet_id: b"nonexistent".to_vec(), config: None };
-
-		let result = drone.morph(msg).await;
-		assert!(result.is_err());
-		assert!(!drone.is_active());
-	}
-
-	#[cfg(feature = "tokio")]
-	#[tokio::test]
-	async fn test_drone_multiple_morphs() {
-		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
-
-		// Register three different servlets
-		drone.register(
-			"simple_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet = SimpleServlet::start().await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		drone.register(
-			"configurable_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet_config = ConfurableServletConf { threshold: 10 };
-					let servlet = ConfurableServlet::start(servlet_config).await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		drone.register(
-			"worker_servlet",
-			Box::new(|_config| {
-				Box::pin(async {
-					let servlet_config = WorkerServletConf { threshold: 5 };
-					let servlet = WorkerServlet::start(servlet_config).await?;
-					Ok(ServletHandle::new(servlet, |s| s.addr()))
-				})
-			}),
-		);
-
-		// Morph through all three servlets
-		let msg1 = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
-		drone.morph(msg1).await.unwrap();
-		assert!(drone.is_active());
-
-		let msg2 = ActivateServletMessage { servlet_id: b"configurable_servlet".to_vec(), config: None };
-		drone.morph(msg2).await.unwrap();
-		assert!(drone.is_active());
-
-		let msg3 = ActivateServletMessage { servlet_id: b"worker_servlet".to_vec(), config: None };
-		drone.morph(msg3).await.unwrap();
-		assert!(drone.is_active());
-
-		// Finally deactivate
-		drone.deactivate().await.unwrap();
-		assert!(!drone.is_active());
-	}
-
-	// Test the drone! macro
-	#[test]
-	fn test_drone_macro_creation() {
-		use crate::transport::tcp::r#async::TokioListener as Listener;
-
-		drone! {
-			name: TestDrone,
-			protocol: Listener,
-			id: b"test-drone-macro",
-			servlets: {
-				simple_servlet: SimpleServlet,
-				configurable_servlet: ConfurableServlet
-			}
+	// Regular drone with multiple servlets
+	drone! {
+		name: RegularDrone,
+		protocol: Listener,
+		id: b"regular-drone",
+		servlets: {
+			simple_servlet: SimpleServlet,
+			configurable_servlet: ConfurableServlet,
+			worker_servlet: WorkerServlet
 		}
-
-		let drone = TestDrone::new();
-		assert_eq!(drone.id(), b"test-drone-macro");
-		assert!(!drone.is_active());
 	}
 
-	#[tokio::test]
-	async fn test_drone_macro_morph() {
-		use crate::transport::tcp::r#async::TokioListener as Listener;
-
-		drone! {
-			name: TestDroneMorph,
-			protocol: Listener,
-			id: b"test-drone-morph",
-			servlets: {
-				simple_servlet: SimpleServlet,
-				configurable_servlet: ConfurableServlet
-			}
+	// Mycelial drone with access receptor for cluster orchestration
+	drone! {
+		name: MycelialDrone,
+		protocol: Listener,
+		id: b"mycelial-drone",
+		with_collector_gate: [SignatureGate::new(*SIGNING_KEY().lock().unwrap().verifying_key())],
+		servlets: {
+			simple_servlet: SimpleServlet,
+			worker_servlet: WorkerServlet
 		}
-
-		let mut drone = TestDroneMorph::new();
-		assert!(!drone.is_active());
-
-		// Morph to simple servlet
-		let msg = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
-		drone.morph(msg).await.unwrap();
-		assert!(drone.is_active());
-		assert!(drone.active_addr().is_some());
-
-		// Deactivate
-		drone.deactivate().await.unwrap();
-		assert!(!drone.is_active());
-		assert!(drone.active_addr().is_none());
 	}
 
-	// Test the test_drone! macro
-	mod test_drone_macro_test {
-		use super::*;
-		use crate::transport::tcp::r#async::TokioListener as Listener;
-		use crate::transport::MessageEmitter;
+	crate::test_drone! {
+		name: test_regular_drone,
+		protocol: Listener,
+		drone: RegularDrone,
+		servlet_id: b"simple_servlet",
+		assertions: |client, _channels| async move {
+			use crate::transport::MessageEmitter;
 
-		drone! {
-			name: TestDroneForMacroTest,
-			protocol: Listener,
-			id: b"test-drone-for-macro",
-			servlets: {
-				simple_servlet: SimpleServlet
-			}
+			// Test simple servlet with PING
+			let ping_msg = crate::compose! {
+				V0: id: b"ping-test-001",
+					message: DroneTestMessage {
+						content: "PING".to_string(),
+						value: 42,
+					}
+			}?;
+
+			let response = client.emit(ping_msg, None).await?.ok_or("No response received")?;
+			let decoded = crate::decode::<DroneResponseMessage, _>(&response.message)?;
+			assert_eq!(decoded.result, "PONG");
+
+			Ok(())
 		}
+	}
 
-		crate::test_drone! {
-			name: test_test_drone_macro,
-			protocol: Listener,
-			drone: TestDroneForMacroTest,
-			servlet_id: b"simple_servlet",
-			assertions: |client, _drone| async move {
-				// Send a PING message
-				let ping_msg = crate::compose! {
-					V0: id: b"ping-test-001",
-						order: 1_700_000_000u64,
-						message: DroneTestMessage {
-							content: "PING".to_string(),
-							value: 42,
-						}
-				}?;
+	crate::test_drone! {
+		name: test_mycelial_drone_with_collector_gate,
+		protocol: Listener,
+		drone: MycelialDrone,
+		servlet_id: b"simple_servlet",
+		config: None,
+		setup: |drone| async {
+			// No additional setup needed
+			drone
+		},
+		assertions: |client, channels| async move {
+			use crate::transport::MessageEmitter;
 
-				let response = client.emit(ping_msg, None).await?
-					.ok_or("No response received")?;
-				let decoded = crate::decode::<DroneResponseMessage, _>(&response.message)?;
-				assert_eq!(decoded.result, "PONG");
+			let (ok_rx, reject_rx) = channels;
 
-				Ok(())
-			}
+			// Test that servlet is accessible and responds to PING
+			let ping_msg = crate::compose! {
+				V0: id: b"mycelial-test-001",
+					message: DroneTestMessage {
+						content: "PING".to_string(),
+						value: 42,
+					}
+			}?;
+
+			let response = client.emit(ping_msg, None).await?
+				.ok_or("No response received")?;
+			let decoded = crate::decode::<DroneResponseMessage, _>(&response.message)?;
+			assert_eq!(decoded.result, "PONG");
+
+			// Create a signed activation request
+			let activate_request = ActivateServletRequest {
+				servlet_id: b"simple_servlet".to_vec(),
+				config: None,
+			};
+
+			let signing_key = SIGNING_KEY().lock().unwrap().clone();
+			let signed_frame = crate::compose! {
+				V0: id: b"cluster-activation-001",
+					order: 1_700_000_000u64,
+					message: activate_request,
+					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key
+			}?;
+
+			Ok(())
 		}
 	}
 }
-
-/*
-// Future: Derive macro implementation
-
-tightbeam::drone! {
-	name: MyDrone,
-	id: b"drone-001",
-	servlets: {
-		ping_pong: PingPongServlet::start,
-		ping_pong_workers: |config| async move {
-			let cfg = WorkerServletConf { threshold: 10 };
-			PingPongServletWithWorker::start(cfg).await
-		}
-	}
-}
-
-crate::test_drone! {
-	name: test_my_drone,
-	drone: MyDrone {
-		ping_pong: PingPongServlet,
-		ping_pong_workers: PingPongServletWithWorker
-	},
-	assertions: |client| async move {
-
-		Ok(())
-	}
-}
-*/

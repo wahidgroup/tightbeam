@@ -57,16 +57,20 @@ impl Protocol for TokioListener {
 	type Stream = TokioStream;
 	type Error = std::io::Error;
 	type Transport = TcpTransport<TokioStream>;
-	type Address = std::net::SocketAddr;
+	type Address = crate::transport::tcp::TightBeamSocketAddr;
 
-	async fn bind(addr: &str) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = Self::bind(addr).await?;
-		let addr = listener.local_addr()?;
-		Ok((listener, addr))
+	fn default_bind_address() -> Result<Self::Address, Self::Error> {
+		Ok("127.0.0.1:0".parse().expect("Valid default TCP address"))
+	}
+
+	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = TcpListener::bind(addr.0).await?;
+		let bound_addr = listener.local_addr()?;
+		Ok((Self { listener }, crate::transport::tcp::TightBeamSocketAddr(bound_addr)))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
-		let stream = TcpStream::connect(addr).await?;
+		let stream = TcpStream::connect(addr.0).await?;
 		Ok(TokioStream::from(stream))
 	}
 
@@ -75,14 +79,14 @@ impl Protocol for TokioListener {
 	}
 
 	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
-		self.local_addr()
+		Ok(crate::transport::tcp::TightBeamSocketAddr(self.local_addr()?))
 	}
 }
 
 impl AsyncListenerTrait for TokioListener {
 	async fn accept(&self) -> Result<(Self::Stream, Self::Address), Self::Error> {
 		let (stream, addr) = self.listener.accept().await?;
-		Ok((TokioStream::from(stream), addr))
+		Ok((TokioStream::from(stream), crate::transport::tcp::TightBeamSocketAddr(addr)))
 	}
 }
 

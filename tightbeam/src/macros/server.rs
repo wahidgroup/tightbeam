@@ -162,7 +162,6 @@ macro_rules! server {
 					let __handler_clone = $handler.clone();
 					let mut __error_channel = $error_tx.clone();
 					let mut __ok_channel = $ok_tx.clone();
-					#[allow(unused_imports)]
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(async move {
 						let mut __transport = __transport;

@@ -1,35 +1,49 @@
 /*
-// Central/Decentral Authority (192.168.1.100)
-
-let user_cluster = cluster! {
-	// How the cluster receives messages
-	protocol TokioListener: listener,
-	config: {
-	},
-	// Optionally define cluster-wide commands
-	commands: {
-		EmergencyStop: |config, members| async move {
-
+//  The Drone (192.168.1.101:889)
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let drone_handle = drone! {
+		name: RegularDrone,
+		protocol: Listener,
+		id: b"regular-drone",
+		servlets: {
+			simple_servlet: SimpleServlet,
+			configurable_servlet: ConfurableServlet,
+			worker_servlet: WorkerServlet
 		}
-	}
-	members: |config| {
-		User: UserManagerServlet::start()
-		Items: ItemManagerServlet::start()
-	}
-};
+	}.start();
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+	// Graceful shutdown
+	drone_handle.join().await?;
 
-	user_cluster::colonize
-
-	let (ant_a_tx, ant_b_tx, ant_c_tx)?;
+	Ok(())
 }
 
-// Any node running your application (192.168.1.101:888)
-
+// Cluster (192.168.1.101:888)
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-	entrypoint! {
+	cluster! {
+		// How the cluster receives messages
+		name: UserCluster,
+		// The protocol the cluster operates on
 		protocol TokioListener: listener,
-	}.await?;
+		// The cluster's configuration
+		config: {
+			arbitrary: u32,
+		},
+		// Optionally define cluster-wide commands
+		commands: {
+			emergency_stop: |self| async move {
+
+			}
+		}
+	};
+
+	let user_cluster = UserCluster::new(UserClusterConf { arbitrary: 42 });
+	let user_cluster.colonize()
+
+	// Graceful shutdown
+	user_cluster.stop().await?;
+
+	Ok(())
 }
+
 */

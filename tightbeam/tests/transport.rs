@@ -3,7 +3,7 @@ use fake::{faker, Fake};
 
 use tightbeam::prelude::*;
 
-use tightbeam::prelude::policy::PolicyConf;
+use tightbeam::transport::policy::PolicyConf;
 
 tightbeam::mutex! {
 	CRYPTO_CHAINS: Vec<IntegrityInfo> = vec![],
@@ -72,7 +72,7 @@ mod helpers {
 async fn test_macro_integration_full() -> core::result::Result<(), Box<dyn core::error::Error>> {
 	// Listener
 	let listener = collect::TokioListener::bind("127.0.0.1:0").await?;
-	let addr = listener.local_addr()?;
+	let addr = TightBeamSocketAddr(listener.local_addr()?);
 
 	// Channels
 	let (error_tx, mut error_rx) = mpsc::channel(8);

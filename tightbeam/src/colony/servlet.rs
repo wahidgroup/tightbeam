@@ -547,6 +547,7 @@ macro_rules! servlet {
 
 	// Common methods shared by all colony
 	(@common_methods $protocol:path) => {
+		#[allow(dead_code)]
 		pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
 			self.addr.clone()
 		}
@@ -621,7 +622,9 @@ macro_rules! servlet {
 
 	// Protocol setup - updated to handle protocol paths
 	(@setup_protocol $protocol:path, $listener:ident, $addr:ident) => {
-		let ($listener, $addr) = <$protocol as $crate::transport::Protocol>::bind("127.0.0.1:0").await
+		let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
+			.map_err(|e| $crate::TightBeamError::from(e))?;
+		let ($listener, $addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 	};
 

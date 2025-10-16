@@ -27,9 +27,7 @@ use crate::transport::policy::RestartPolicy;
 pub type TransportResult<T> = Result<T, TransportError>;
 
 /// Marker crate for applications to handle the address the way they wish
-pub trait TightBeamAddress: Clone + Send {}
-
-impl TightBeamAddress for core::net::SocketAddr {}
+pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
 
 // Remove Sequence derive, implement custom encoding
 #[derive(Debug, Clone)]
@@ -233,9 +231,13 @@ pub trait Protocol {
 	type Error: Into<TransportError>;
 	type Address: TightBeamAddress;
 
+	/// Get a default address for binding to any available port/endpoint
+	/// This is protocol-specific (e.g., "127.0.0.1:0" for TCP)
+	fn default_bind_address() -> Result<Self::Address, Self::Error>;
+
 	/// Bind to an address and return listener + actual bound address
 	fn bind(
-		addr: &str,
+		addr: Self::Address,
 	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
 
 	/// Connect to an address
@@ -250,7 +252,7 @@ pub trait Protocol {
 
 /// This protocol can operate as a mycelial network (ie. different TCP ports)
 pub trait Mycelial: Protocol {
-	fn get_available_connect(&self) -> Result<Self::Address, Self::Error>;
+	fn get_available_connect(&self) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
 }
 
 /// Async listener trait
@@ -526,9 +528,10 @@ mod tests {
 
 		use crate::transport::policy::RestartLinearBackoff;
 		use crate::transport::tcp::r#async::TokioListener;
+		use crate::transport::tcp::TightBeamSocketAddr;
 
 		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.local_addr().unwrap();
+		let addr = TightBeamSocketAddr(listener.local_addr().unwrap());
 
 		let (tx, rx) = mpsc::channel();
 		let tx = Arc::new(tx);

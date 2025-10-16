@@ -1,4 +1,7 @@
 #[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 
 pub mod sync;
@@ -11,7 +14,7 @@ use crate::transport::{Protocol, ProtocolStream};
 #[cfg(not(feature = "tokio"))]
 use crate::transport::tcp::r#async::TcpTransport;
 #[cfg(feature = "std")]
-use crate::transport::tcp::sync::TcpTransport;
+use crate::transport::{tcp::sync::TcpTransport, Mycelial};
 
 /// Abstract TCP listener trait for different networking backends.
 pub trait TcpListenerTrait: Protocol + Send {
@@ -36,16 +39,20 @@ impl Protocol for std::net::TcpListener {
 	type Stream = std::net::TcpStream;
 	type Error = std::io::Error;
 	type Transport = TcpTransport<Self::Stream>;
-	type Address = std::net::SocketAddr;
+	type Address = TightBeamSocketAddr;
 
-	async fn bind(addr: &str) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = std::net::TcpListener::bind(addr)?;
+	fn default_bind_address() -> Result<Self::Address, Self::Error> {
+		Ok("127.0.0.1:0".parse().expect("Valid default TCP address"))
+	}
+
+	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = std::net::TcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		Ok((listener, bound_addr))
+		Ok((listener, TightBeamSocketAddr(bound_addr)))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
-		std::net::TcpStream::connect(addr)
+		std::net::TcpStream::connect(addr.0)
 	}
 
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
@@ -53,7 +60,17 @@ impl Protocol for std::net::TcpListener {
 	}
 
 	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
-		self.local_addr()
+		Ok(TightBeamSocketAddr(self.local_addr()?))
+	}
+}
+
+#[cfg(feature = "std")]
+impl Mycelial for std::net::TcpListener {
+	async fn get_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let addr = "0.0.0.0:0"
+			.parse::<TightBeamSocketAddr>()
+			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+		<std::net::TcpListener as Protocol>::bind(addr).await
 	}
 }
 
@@ -77,6 +94,51 @@ impl ProtocolStream for std::net::TcpStream {
 		std::io::Read::read_exact(self, buf)
 	}
 }
+
+// Newtype wrapper for SocketAddr that implements Into<Vec<u8>>
+#[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TightBeamSocketAddr(pub std::net::SocketAddr);
+
+#[cfg(feature = "std")]
+impl From<std::net::SocketAddr> for TightBeamSocketAddr {
+	fn from(addr: std::net::SocketAddr) -> Self {
+		Self(addr)
+	}
+}
+
+#[cfg(feature = "std")]
+impl From<TightBeamSocketAddr> for std::net::SocketAddr {
+	fn from(addr: TightBeamSocketAddr) -> Self {
+		addr.0
+	}
+}
+
+#[cfg(feature = "std")]
+impl From<TightBeamSocketAddr> for Vec<u8> {
+	fn from(addr: TightBeamSocketAddr) -> Self {
+		std::format!("{}", addr.0).into_bytes()
+	}
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Display for TightBeamSocketAddr {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+#[cfg(feature = "std")]
+impl core::str::FromStr for TightBeamSocketAddr {
+	type Err = std::net::AddrParseError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		Ok(Self(s.parse()?))
+	}
+}
+
+#[cfg(feature = "std")]
+impl crate::transport::TightBeamAddress for TightBeamSocketAddr {}
 
 /// Macro to generate common transport implementation for both sync and async.
 #[macro_export]

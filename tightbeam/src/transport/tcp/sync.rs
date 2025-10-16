@@ -1,3 +1,5 @@
+use core::str::FromStr;
+
 use crate::transport::tcp::TcpListenerTrait;
 use crate::transport::{MessageIO, Pingable, TransportEnvelope, TransportResult};
 use crate::Frame;
@@ -94,16 +96,22 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 	type Stream = std::net::TcpStream;
 	type Error = std::io::Error;
 	type Transport = TcpTransport<std::net::TcpStream>;
-	type Address = std::net::SocketAddr;
+	type Address = crate::transport::tcp::TightBeamSocketAddr;
 
-	async fn bind(addr: &str) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = std::net::TcpListener::bind(addr)?;
+	fn default_bind_address() -> Result<Self::Address, Self::Error> {
+		std::net::SocketAddr::from_str("127.0.0.1:0")
+			.map(crate::transport::tcp::TightBeamSocketAddr)
+			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+	}
+
+	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = std::net::TcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
-		Ok((listener, bound_addr))
+		Ok((listener, crate::transport::tcp::TightBeamSocketAddr(bound_addr)))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
-		std::net::TcpStream::connect(addr)
+		std::net::TcpStream::connect(addr.0)
 	}
 
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
@@ -111,7 +119,7 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 	}
 
 	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
-		self.listener.local_addr()
+		Ok(crate::transport::tcp::TightBeamSocketAddr(self.listener.local_addr()?))
 	}
 }
 

@@ -139,7 +139,7 @@ pub fn create_v0_tightbeam(content: Option<&str>, id: Option<&str>) -> Frame {
 #[cfg(all(feature = "secp256k1", feature = "signature"))]
 pub fn create_test_signing_key() -> k256::ecdsa::SigningKey {
 	let secret_bytes = [1u8; 32];
-	k256::ecdsa::SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
+	crate::crypto::sign::ecdsa::SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
 }
 
 #[cfg(feature = "aead")]
@@ -248,7 +248,9 @@ macro_rules! test_builder {
 macro_rules! test_container {
 	// Protocol setup - separate protocol path from identifiers
 	(@setup_protocol $protocol:path, $listener:ident, $addr:ident) => {
-		let ($listener, $addr) = <$protocol as $crate::transport::Protocol>::bind("127.0.0.1:0").await
+		let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
+			.map_err(|e| $crate::TightBeamError::from(e))?;
+		let ($listener, $addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 	};
 
@@ -785,37 +787,102 @@ macro_rules! test_servlet {
 /// a client for testing. Properly manages drone lifecycle.
 #[macro_export]
 macro_rules! test_drone {
+	// Variant with setup callback
 	(
 		name: $test_name:ident,
 		protocol: $protocol:ident,
 		drone: $drone_type:ty,
 		servlet_id: $servlet_id:expr,
 		config: $config:expr,
-		assertions: |$client:ident, $drone:ident| $assertions_body:expr
+		setup: |$setup_drone:ident| $setup_body:expr,
+		assertions: |$client:ident, $channels:ident| $assertions_body:expr
 	) => {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+			use std::sync::{mpsc, Arc};
+
 			// Create the drone
-			let mut $drone = <$drone_type>::new();
+			let mut drone = <$drone_type>::new();
+
+			// Status channels for observing gate decisions
+			let (ok_tx_inner, ok_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
+			let (reject_tx_inner, reject_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
+			let ok_tx_arc = Arc::new(ok_tx_inner);
+			let reject_tx_arc = Arc::new(reject_tx_inner);
+
+			// Run setup callback
+			let $setup_drone = &mut drone;
+			$setup_body.await;
 
 			// Morph to the specified servlet
 			let activate_msg =
-				$crate::colony::drone::ActivateServletMessage { servlet_id: $servlet_id.to_vec(), config: $config };
-			$drone.morph(activate_msg).await?;
+				$crate::colony::drone::ActivateServletRequest { servlet_id: $servlet_id.to_vec(), config: $config };
+			drone.morph(activate_msg).await?;
 
 			// Get the servlet address from the active servlet
-			let addr = $drone.active_addr().ok_or("No active servlet after morph")?.clone();
+			let addr = drone.active_addr().ok_or("No active servlet after morph")?.clone();
 
 			// Create client
 			let mut $client = $crate::client! {
 				connect $protocol: addr
 			};
 
+			// Expose channels tuple to assertions
+			let $channels = (ok_rx_inner, reject_rx_inner);
+
 			// Run assertions
 			let result = $assertions_body.await;
 
 			// Clean shutdown
-			$drone.deactivate().await?;
+			drone.deactivate().await?;
+
+			result
+		}
+	};
+
+	// Standard variant with config
+	(
+		name: $test_name:ident,
+		protocol: $protocol:ident,
+		drone: $drone_type:ty,
+		servlet_id: $servlet_id:expr,
+		config: $config:expr,
+		assertions: |$client:ident, $channels:ident| $assertions_body:expr
+	) => {
+		#[tokio::test]
+		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+			use std::sync::{mpsc, Arc};
+
+			// Create the drone
+			let mut drone = <$drone_type>::new();
+
+			// Status channels for observing gate decisions
+			let (ok_tx_inner, ok_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
+			let (reject_tx_inner, reject_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
+			let ok_tx_arc = Arc::new(ok_tx_inner);
+			let reject_tx_arc = Arc::new(reject_tx_inner);
+
+			// Morph to the specified servlet
+			let activate_msg =
+				$crate::colony::drone::ActivateServletRequest { servlet_id: $servlet_id.to_vec(), config: $config };
+			drone.morph(activate_msg).await?;
+
+			// Get the servlet address from the active servlet
+			let addr = drone.active_addr().ok_or("No active servlet after morph")?.clone();
+
+			// Create client
+			let mut $client = $crate::client! {
+				connect $protocol: addr
+			};
+
+			// Expose channels tuple to assertions
+			let $channels = (ok_rx_inner, reject_rx_inner);
+
+			// Run assertions
+			let result = $assertions_body.await;
+
+			// Clean shutdown
+			drone.deactivate().await?;
 
 			result
 		}
@@ -827,7 +894,7 @@ macro_rules! test_drone {
 		protocol: $protocol:ident,
 		drone: $drone_type:ty,
 		servlet_id: $servlet_id:expr,
-		assertions: |$client:ident, $drone:ident| $assertions_body:expr
+		assertions: |$client:ident, $channels:ident| $assertions_body:expr
 	) => {
 		$crate::test_drone! {
 			name: $test_name,
@@ -835,7 +902,7 @@ macro_rules! test_drone {
 			drone: $drone_type,
 			servlet_id: $servlet_id,
 			config: None,
-			assertions: |$client, $drone| $assertions_body
+			assertions: |$client, $channels| $assertions_body
 		}
 	};
 }
