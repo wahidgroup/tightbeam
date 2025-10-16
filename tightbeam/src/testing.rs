@@ -799,16 +799,12 @@ macro_rules! test_drone {
 			let mut $drone = <$drone_type>::new();
 
 			// Morph to the specified servlet
-			let activate_msg = $crate::colony::drone::ActivateServletMessage {
-				servlet_id: $servlet_id.to_vec(),
-				config: $config,
-			};
+			let activate_msg =
+				$crate::colony::drone::ActivateServletMessage { servlet_id: $servlet_id.to_vec(), config: $config };
 			$drone.morph(activate_msg).await?;
 
 			// Get the servlet address from the active servlet
-			let addr = $drone.active_addr()
-				.ok_or("No active servlet after morph")?
-				.clone();
+			let addr = $drone.active_addr().ok_or("No active servlet after morph")?.clone();
 
 			// Create client
 			let mut $client = $crate::client! {

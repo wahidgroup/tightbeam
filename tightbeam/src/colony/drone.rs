@@ -99,10 +99,7 @@ pub trait TightBeamDrone<Addr: Clone> {
 	/// # Returns
 	/// * `Ok(())` if the servlet was successfully activated
 	/// * `Err(TightBeamError)` if activation failed
-	fn morph(
-		&mut self,
-		msg: ActivateServletMessage,
-	) -> impl Future<Output = Result<(), TightBeamError>> + Send;
+	fn morph(&mut self, msg: ActivateServletMessage) -> impl Future<Output = Result<(), TightBeamError>> + Send;
 
 	/// Get the current drone ID
 	fn id(&self) -> &[u8];
@@ -132,11 +129,7 @@ pub struct DroneListener<Addr: Clone> {
 impl<Addr: TightBeamAddress + 'static> DroneListener<Addr> {
 	/// Create a new drone listener with the given ID
 	pub fn new(id: Vec<u8>) -> Self {
-		Self {
-			id,
-			registry: HashMap::new(),
-			active_servlet: None,
-		}
+		Self { id, registry: HashMap::new(), active_servlet: None }
 	}
 
 	/// Register a servlet factory with the given name
@@ -194,10 +187,7 @@ impl<Addr: TightBeamAddress + 'static> TightBeamDrone<Addr> for DroneListener<Ad
 		}
 
 		// Look up the factory in the registry
-		let factory = self
-			.registry
-			.get(&servlet_name)
-			.ok_or(TightBeamError::MissingConfiguration)?;
+		let factory = self.registry.get(&servlet_name).ok_or(TightBeamError::MissingConfiguration)?;
 
 		// Create the new servlet instance
 		let servlet_handle = factory(msg.config).await?;
@@ -268,6 +258,7 @@ macro_rules! drone {
 			}
 
 			/// Get the address of the currently active servlet
+			#[allow(dead_code)]
 			pub fn active_addr(&self) -> Option<&<$protocol as $crate::transport::Protocol>::Address> {
 				self.inner.active_addr()
 			}
@@ -299,8 +290,8 @@ mod tests {
 	use super::*;
 	use crate::der::Sequence;
 	use crate::policy::{ReceptorPolicy, TransitStatus};
+	use crate::transport::policy::PolicyConf;
 	use crate::{servlet, worker};
-    use crate::transport::policy::PolicyConf;
 
 	#[cfg(feature = "tokio")]
 	type Listener = crate::transport::tcp::r#async::TokioListener;
@@ -500,10 +491,7 @@ mod tests {
 		);
 
 		// Activate the servlet
-		let msg = ActivateServletMessage {
-			servlet_id: b"simple_servlet".to_vec(),
-			config: None,
-		};
+		let msg = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
 
 		let result = drone.morph(msg).await;
 		assert!(result.is_ok());
@@ -529,10 +517,7 @@ mod tests {
 		);
 
 		// Activate the servlet
-		let msg = ActivateServletMessage {
-			servlet_id: b"configurable_servlet".to_vec(),
-			config: None,
-		};
+		let msg = ActivateServletMessage { servlet_id: b"configurable_servlet".to_vec(), config: None };
 
 		let result = drone.morph(msg).await;
 		assert!(result.is_ok());
@@ -557,10 +542,7 @@ mod tests {
 		);
 
 		// Activate the servlet
-		let msg = ActivateServletMessage {
-			servlet_id: b"worker_servlet".to_vec(),
-			config: None,
-		};
+		let msg = ActivateServletMessage { servlet_id: b"worker_servlet".to_vec(), config: None };
 
 		let result = drone.morph(msg).await;
 		assert!(result.is_ok());
@@ -583,10 +565,7 @@ mod tests {
 			}),
 		);
 
-		let msg = ActivateServletMessage {
-			servlet_id: b"simple_servlet".to_vec(),
-			config: None,
-		};
+		let msg = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
 
 		drone.morph(msg).await.unwrap();
 		assert!(drone.is_active());
@@ -625,18 +604,12 @@ mod tests {
 		);
 
 		// Activate first servlet
-		let msg_a = ActivateServletMessage {
-			servlet_id: b"simple_servlet".to_vec(),
-			config: None,
-		};
+		let msg_a = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
 		drone.morph(msg_a).await.unwrap();
 		assert!(drone.is_active());
 
 		// Morph to second servlet (should deactivate first)
-		let msg_b = ActivateServletMessage {
-			servlet_id: b"worker_servlet".to_vec(),
-			config: None,
-		};
+		let msg_b = ActivateServletMessage { servlet_id: b"worker_servlet".to_vec(), config: None };
 		let result = drone.morph(msg_b).await;
 		assert!(result.is_ok());
 		assert!(drone.is_active());
@@ -648,10 +621,7 @@ mod tests {
 		let mut drone = DroneListener::<core::net::SocketAddr>::new(b"test-drone-001".to_vec());
 
 		// Try to activate a servlet that doesn't exist
-		let msg = ActivateServletMessage {
-			servlet_id: b"nonexistent".to_vec(),
-			config: None,
-		};
+		let msg = ActivateServletMessage { servlet_id: b"nonexistent".to_vec(), config: None };
 
 		let result = drone.morph(msg).await;
 		assert!(result.is_err());
@@ -697,24 +667,15 @@ mod tests {
 		);
 
 		// Morph through all three servlets
-		let msg1 = ActivateServletMessage {
-			servlet_id: b"simple_servlet".to_vec(),
-			config: None,
-		};
+		let msg1 = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
 		drone.morph(msg1).await.unwrap();
 		assert!(drone.is_active());
 
-		let msg2 = ActivateServletMessage {
-			servlet_id: b"configurable_servlet".to_vec(),
-			config: None,
-		};
+		let msg2 = ActivateServletMessage { servlet_id: b"configurable_servlet".to_vec(), config: None };
 		drone.morph(msg2).await.unwrap();
 		assert!(drone.is_active());
 
-		let msg3 = ActivateServletMessage {
-			servlet_id: b"worker_servlet".to_vec(),
-			config: None,
-		};
+		let msg3 = ActivateServletMessage { servlet_id: b"worker_servlet".to_vec(), config: None };
 		drone.morph(msg3).await.unwrap();
 		assert!(drone.is_active());
 
@@ -761,10 +722,7 @@ mod tests {
 		assert!(!drone.is_active());
 
 		// Morph to simple servlet
-		let msg = ActivateServletMessage {
-			servlet_id: b"simple_servlet".to_vec(),
-			config: None,
-		};
+		let msg = ActivateServletMessage { servlet_id: b"simple_servlet".to_vec(), config: None };
 		drone.morph(msg).await.unwrap();
 		assert!(drone.is_active());
 		assert!(drone.active_addr().is_some());
@@ -821,15 +779,15 @@ mod tests {
 // Future: Derive macro implementation
 
 tightbeam::drone! {
-    name: MyDrone,
-    id: b"drone-001",
-    servlets: {
-        ping_pong: PingPongServlet::start,
-        ping_pong_workers: |config| async move {
-            let cfg = WorkerServletConf { threshold: 10 };
-            PingPongServletWithWorker::start(cfg).await
-        }
-    }
+	name: MyDrone,
+	id: b"drone-001",
+	servlets: {
+		ping_pong: PingPongServlet::start,
+		ping_pong_workers: |config| async move {
+			let cfg = WorkerServletConf { threshold: 10 };
+			PingPongServletWithWorker::start(cfg).await
+		}
+	}
 }
 
 crate::test_drone! {

@@ -1,7 +1,6 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
-
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
@@ -247,7 +246,6 @@ pub trait Protocol {
 
 	// Get the tightbeam address for this protocol
 	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error>;
-		
 }
 
 /// This protocol can operate as a mycelial network (ie. different TCP ports)
