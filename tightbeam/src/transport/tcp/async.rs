@@ -90,6 +90,16 @@ impl AsyncListenerTrait for TokioListener {
 	}
 }
 
+impl crate::transport::Mycelial for TokioListener {
+	async fn get_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		// Bind to an available port (0.0.0.0:0 lets the OS choose)
+		let addr = "0.0.0.0:0"
+			.parse::<crate::transport::tcp::TightBeamSocketAddr>()
+			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+		<TokioListener as Protocol>::bind(addr).await
+	}
+}
+
 #[cfg(not(feature = "transport-policy"))]
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
