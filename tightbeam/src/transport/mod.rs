@@ -252,7 +252,9 @@ pub trait Protocol {
 
 /// This protocol can operate as a mycelial network (ie. different TCP ports)
 pub trait Mycelial: Protocol {
-	fn get_available_connect(&self) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
+	fn get_available_connect(
+		&self,
+	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
 }
 
 /// Async listener trait

@@ -3,17 +3,17 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-use crate::der::{Enumerated, Sequence};
 use crate::der::oid::ObjectIdentifier;
+use crate::der::{Enumerated, Sequence};
 
-pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::signed_data::EncapsulatedContentInfo;
+pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
 
-/// id-alg-zlibCompress OBJECT IDENTIFIER ::= { 
-/// 	iso(1)   member-body(2)  us(840)    rsadsi(113549) 
-/// 	pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8 
+/// id-alg-zlibCompress OBJECT IDENTIFIER ::= {
+///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
+///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
 /// }
 pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
 pub const COMPRESSION_CONTENT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
@@ -35,7 +35,6 @@ pub enum Version {
 	V1 = 1,
 	V2 = 2,
 }
-
 
 /// Message priority levels (V2+)
 ///

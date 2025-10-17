@@ -14,14 +14,14 @@ use crate::crypto::aead::Aead;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{SignatureEncoding, Signer};
 
-#[cfg(feature = "compress")]
-use crate::{helpers::Compressor, cms::signed_data::EncapsulatedContentInfo};
 #[cfg(feature = "digest")]
 use crate::helpers::Digestor;
 #[cfg(feature = "aead")]
 use crate::helpers::Encryptor;
 #[cfg(feature = "signature")]
 use crate::helpers::Signatory;
+#[cfg(feature = "compress")]
+use crate::{cms::signed_data::EncapsulatedContentInfo, helpers::Compressor};
 
 #[cfg(feature = "std")]
 use std::time::SystemTime;
@@ -84,7 +84,11 @@ impl<T: Message> FrameBuilder<T> {
 
 	/// Set the compression algorithm (all versions)
 	#[cfg(feature = "compress")]
-	pub fn with_compression(mut self, compressor: impl Compressor + 'static, content_info: Option<EncapsulatedContentInfo>) -> Self {
+	pub fn with_compression(
+		mut self,
+		compressor: impl Compressor + 'static,
+		content_info: Option<EncapsulatedContentInfo>,
+	) -> Self {
 		self.compressor = Some((Box::new(compressor), content_info));
 		self
 	}
@@ -383,9 +387,9 @@ mod tests {
 	use sha3::Sha3_256;
 
 	use super::*;
+	use crate::helpers::ZstdCompression;
 	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
 	use crate::{compose, test_builder, test_case};
-	use crate::helpers::ZstdCompression;
 
 	test_builder! {
 		name: test_v0_basic,

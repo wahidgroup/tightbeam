@@ -608,7 +608,6 @@ macro_rules! assert_recv {
 }
 
 /// Start a background collector that orders each reject for a given id.
-/// Returns (Arc<Mutex<Vec<Instant>>>, JoinHandle<()>).
 #[macro_export]
 macro_rules! start_reject_order_collection {
 	($rx:expr, $id:expr, $attempts:expr) => {{
@@ -647,8 +646,7 @@ macro_rules! finish_reject_order_collection {
 /// Assert client retry timing against expected backoff ranges.
 /// Uses the provided reject tunnel to order each non-Accepted server response
 /// for the given message id. attempts must be a compile-time constant; the
-/// number of ranges must be attempts-1 (enforced at compile time). Example:
-/// assert_retry_metric!(client, msg.clone(), reject_rx, 3, [[1,3],[2,5]]);
+/// number of ranges must be attempts-1 (enforced at compile time).
 #[macro_export]
 macro_rules! assert_retry_metric {
 	($client:expr, $msg:expr, $rx:expr, $attempts:expr, [ $( [$min:expr, $max:expr] ),* $(,)? ]) => {{

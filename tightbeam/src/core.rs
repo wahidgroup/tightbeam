@@ -4,12 +4,12 @@ use crate::{Frame, Metadata, TightBeamError, Version};
 use crate::crypto::aead::Aead;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{SignatureEncoding, Verifier};
+#[cfg(feature = "compress")]
+use crate::helpers::Inflator;
 #[cfg(feature = "aead")]
 use crate::EncryptionInfo;
 #[cfg(feature = "signature")]
 use crate::SignatureInfo;
-#[cfg(feature = "compress")]
-use crate::helpers::Inflator;
 
 /// A specialized Result type for TightBeam operations
 pub type Result<T> = core::result::Result<T, TightBeamError>;
@@ -128,8 +128,8 @@ impl Frame {
 			#[cfg(feature = "compress")]
 			{
 				let inflator = inflator.ok_or(TightBeamError::MissingInflator)?;
-				let (decompressed, _) = inflator.decompress(&plaintext)?;
-				decompressed
+
+				inflator.decompress(&plaintext)?
 			}
 		} else {
 			plaintext

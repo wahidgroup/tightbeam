@@ -995,36 +995,36 @@ macro_rules! drone {
 									stop_old_servlet(old_servlet);
 
 									// Return success response with servlet address
-									return Some($crate::compose! {
+									return $crate::compose! {
 										V0: id: $frame.metadata.id.clone(),
 											message: $crate::colony::drone::ActivateServletResponse {
 												status: $crate::policy::TransitStatus::Accepted,
 												servlet_address: Some(addr_bytes)
 											}
-									}.ok()?);
+									}.ok();
 								}
 								Err(_) => {
 									// Return error response
-									return Some($crate::compose! {
+									return $crate::compose! {
 										V0: id: $frame.metadata.id.clone(),
 											message: $crate::colony::drone::ActivateServletResponse {
 												status: $crate::policy::TransitStatus::Forbidden,
 												servlet_address: None
 											}
-									}.ok()?);
+									}.ok();
 								}
 							}
 						}
 					)*
 
 					// Unknown servlet ID - return error
-					return Some($crate::compose! {
+					return $crate::compose! {
 						V0: id: $frame.metadata.id.clone(),
 							message: $crate::colony::drone::ActivateServletResponse {
 								status: $crate::policy::TransitStatus::Forbidden,
 								servlet_address: None
 							}
-					}.ok()?);
+					}.ok();
 				}
 
 				// Not an activation request - check if there's an active servlet to handle it
@@ -1066,7 +1066,7 @@ macro_rules! drone {
 										servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
 										drop(servlets);
 
-										return Some($crate::compose! {
+										return $crate::compose! {
 											V0: id: $frame.metadata.id.clone(),
 												message: $crate::colony::drone::HiveManagementResponse {
 													spawn: Some($crate::colony::drone::SpawnServletResult {
@@ -1077,10 +1077,10 @@ macro_rules! drone {
 													list: None,
 													stop: None,
 												}
-										}.ok()?);
+										}.ok();
 									}
 									Err(_) => {
-										return Some($crate::compose! {
+										return $crate::compose! {
 											V0: id: $frame.metadata.id.clone(),
 												message: $crate::colony::drone::HiveManagementResponse {
 													spawn: Some($crate::colony::drone::SpawnServletResult {
@@ -1091,14 +1091,14 @@ macro_rules! drone {
 													list: None,
 													stop: None,
 												}
-										}.ok()?);
+										}.ok();
 									}
 								}
 							}
 						)*
 
 						// Unknown servlet type
-						return Some($crate::compose! {
+						return $crate::compose! {
 							V0: id: $frame.metadata.id.clone(),
 								message: $crate::colony::drone::HiveManagementResponse {
 									spawn: Some($crate::colony::drone::SpawnServletResult {
@@ -1109,7 +1109,7 @@ macro_rules! drone {
 									list: None,
 									stop: None,
 								}
-						}.ok()?);
+						}.ok();
 					}
 
 					// Handle list request
@@ -1131,7 +1131,7 @@ macro_rules! drone {
 						}
 						drop(servlets);
 
-						return Some($crate::compose! {
+						return $crate::compose! {
 							V0: id: $frame.metadata.id.clone(),
 								message: $crate::colony::drone::HiveManagementResponse {
 									spawn: None,
@@ -1141,7 +1141,7 @@ macro_rules! drone {
 									}),
 									stop: None,
 								}
-						}.ok()?);
+						}.ok();
 					}
 
 					// Handle stop request
@@ -1157,7 +1157,7 @@ macro_rules! drone {
 							}
 							drop(servlets);
 
-							return Some($crate::compose! {
+							return $crate::compose! {
 								V0: id: $frame.metadata.id.clone(),
 									message: $crate::colony::drone::HiveManagementResponse {
 										spawn: None,
@@ -1166,11 +1166,11 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Accepted
 										}),
 									}
-							}.ok()?);
+							}.ok();
 						} else {
 							drop(servlets);
 
-							return Some($crate::compose! {
+							return $crate::compose! {
 								V0: id: $frame.metadata.id.clone(),
 									message: $crate::colony::drone::HiveManagementResponse {
 										spawn: None,
@@ -1179,7 +1179,7 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Forbidden
 										}),
 									}
-							}.ok()?);
+							}.ok();
 						}
 					}
 				}
@@ -1566,10 +1566,10 @@ mod tests {
 		},
 		handle: |message| async move {
 			let decoded = crate::decode::<DroneTestMessage, _>(&message.message).ok()?;
-			Some(DroneResponseJob::run(
+			DroneResponseJob::run(
 				message.metadata.id.clone(),
 				format!("ECHO: {}", decoded.content)
-			).ok()?)
+			).ok()
 		}
 	}
 
@@ -1583,7 +1583,7 @@ mod tests {
 
 		// Get the hive's control server address
 		let control_addr = hive.addr();
-		println!("Hive control server at: {:?}", control_addr);
+		println!("Hive control server at: {control_addr:?}");
 
 		// Establish the hive (start all servlets on unique ports)
 		hive.establish_hive().await?;
@@ -1603,17 +1603,17 @@ mod tests {
 
 		// Verify addresses are all different (mycelial networking)
 		assert_ne!(
-			format!("{:?}", control_addr),
+			format!("{control_addr:?}"),
 			format!("{:?}", servlet1_addr),
 			"Servlet 1 should have a different address than control server"
 		);
 		assert_ne!(
-			format!("{:?}", control_addr),
+			format!("{control_addr:?}"),
 			format!("{:?}", servlet2_addr),
 			"Servlet 2 should have a different address than control server"
 		);
 		assert_ne!(
-			format!("{:?}", servlet1_addr),
+			format!("{servlet1_addr:?}"),
 			format!("{:?}", servlet2_addr),
 			"Servlets should have different addresses from each other"
 		);
@@ -1634,13 +1634,13 @@ mod tests {
 		// Start the hive
 		let mut hive = TestHive::start(None).await?;
 		let control_addr = hive.addr();
-		println!("Hive control server at: {:?}", control_addr);
+		println!("Hive control server at: {control_addr:?}");
 
 		// Establish the hive (start default servlets)
 		hive.establish_hive().await?;
 
 		// Connect to the hive control server
-		let stream = TokioListener::connect(control_addr.clone()).await?;
+		let stream = TokioListener::connect(control_addr).await?;
 		let mut transport = TokioListener::create_transport(stream);
 
 		// Test 1: List servlets (should have 2 default servlets)
@@ -1655,7 +1655,8 @@ mod tests {
 		assert_eq!(list_response.servlets.len(), 2, "Should have 2 default servlets");
 
 		for servlet in &list_response.servlets {
-			println!("  - {}: {}",
+			println!(
+				"  - {}: {}",
 				String::from_utf8_lossy(&servlet.servlet_id),
 				String::from_utf8_lossy(&servlet.address)
 			);
@@ -1676,7 +1677,8 @@ mod tests {
 		let new_servlet_id = spawn_response.servlet_id.unwrap();
 		let new_servlet_addr = spawn_response.servlet_address.unwrap();
 
-		println!("  Spawned: {} at {}",
+		println!(
+			"  Spawned: {} at {}",
 			String::from_utf8_lossy(&new_servlet_id),
 			String::from_utf8_lossy(&new_servlet_addr)
 		);
@@ -1693,7 +1695,8 @@ mod tests {
 		assert_eq!(list_response.servlets.len(), 3, "Should have 3 servlets after spawn");
 
 		for servlet in &list_response.servlets {
-			println!("  - {}: {}",
+			println!(
+				"  - {}: {}",
 				String::from_utf8_lossy(&servlet.servlet_id),
 				String::from_utf8_lossy(&servlet.address)
 			);
@@ -1710,7 +1713,7 @@ mod tests {
 
 		if stop_response.status != crate::policy::TransitStatus::Accepted {
 			println!("  ERROR: Stop failed with status: {:?}", stop_response.status);
-			println!("  Servlet ID sent: {:?}", new_servlet_id);
+			println!("  Servlet ID sent: {new_servlet_id:?}");
 			println!("  Current servlets:");
 			let list_frame = ListServletsJob::run(b"list-debug")?;
 			let response = transport.emit(list_frame, None).await?.unwrap();
@@ -1736,7 +1739,8 @@ mod tests {
 		assert_eq!(list_response.servlets.len(), 2, "Should be back to 2 servlets after stop");
 
 		for servlet in &list_response.servlets {
-			println!("  - {}: {}",
+			println!(
+				"  - {}: {}",
 				String::from_utf8_lossy(&servlet.servlet_id),
 				String::from_utf8_lossy(&servlet.address)
 			);
@@ -1760,4 +1764,3 @@ mod tests {
 		Ok(())
 	}
 }
-

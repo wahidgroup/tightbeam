@@ -1,7 +1,7 @@
-/// Job macro for creating reusable frame composition functions
-///
-/// Jobs are simple functions that compose TightBeam frames with optional parameters.
-/// They can be sync or async and return a Result<Frame, TightBeamError>.
+//! Job macro for creating reusable frame composition functions
+//!
+//! Jobs are simple functions that compose TightBeam frames with optional parameters.
+//! They can be sync or async and return a Result<Frame, TightBeamError>.
 
 #[macro_export]
 macro_rules! test_job {
@@ -171,4 +171,3 @@ mod tests {
 		}
 	}
 }
-

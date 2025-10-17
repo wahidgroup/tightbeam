@@ -3,12 +3,12 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::{Version, CompressedData};
+use crate::Version;
 
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
-pub type CompressionResult = Result<(Vec<u8>, CompressedData), CompressionError>;
+pub type CompressionResult<T> = Result<T, CompressionError>;
 
 /// Error indicating a mismatch between received and expected values
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -153,7 +153,7 @@ pub enum TightBeamError {
 	// Missing order
 	#[cfg_attr(feature = "derive", error("Missing order"))]
 	MissingOrder,
-	
+
 	/// Missing inflator
 	#[cfg_attr(feature = "derive", error("Missing inflator"))]
 	MissingInflator,

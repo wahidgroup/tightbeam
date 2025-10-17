@@ -9,7 +9,7 @@ use crate::der::{Decode, Encode};
 use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
 use crate::error::TightBeamError;
 use crate::matrix::MatrixError;
-use crate::{Result, Asn1Matrix, AlgorithmIdentifier, AlgorithmIdentifierOwned};
+use crate::{AlgorithmIdentifier, AlgorithmIdentifierOwned, Asn1Matrix, Result};
 
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::der::oid::AssociatedOid;
@@ -21,12 +21,9 @@ use crate::IntegrityInfo;
 use crate::SignatureInfo;
 #[cfg(feature = "compress")]
 use crate::{
-	CompressedData, 
-	error::CompressionResult, 
-	cms::{
-		content_info::CmsVersion,
-		signed_data::EncapsulatedContentInfo
-	}
+	cms::{content_info::CmsVersion, signed_data::EncapsulatedContentInfo},
+	error::CompressionResult,
+	CompressedData,
 };
 
 #[cfg(feature = "aead")]
@@ -44,14 +41,18 @@ pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::IntegrityInfo>>;
 #[cfg(feature = "compress")]
 pub trait Compressor {
 	/// Compress data and return the compressed bytes along with compression metadata
-	fn compress(&self, data: &[u8], content_info: Option<EncapsulatedContentInfo>) -> CompressionResult;
+	fn compress(
+		&self,
+		data: &[u8],
+		content_info: Option<EncapsulatedContentInfo>,
+	) -> CompressionResult<(Vec<u8>, CompressedData)>;
 }
 
 /// Trait for decompressing data
 #[cfg(feature = "compress")]
 pub trait Inflator {
 	/// Decompress data and return the decompressed bytes along with compression metadata
-	fn decompress(&self, data: &[u8]) -> CompressionResult;
+	fn decompress(&self, data: &[u8]) -> CompressionResult<Vec<u8>>;
 }
 
 #[cfg(feature = "compress")]
@@ -60,7 +61,11 @@ pub struct ZstdCompression;
 
 #[cfg(feature = "compress")]
 impl Compressor for ZstdCompression {
-	fn compress(&self, data: &[u8], content_info: Option<EncapsulatedContentInfo>) -> CompressionResult {
+	fn compress(
+		&self,
+		data: &[u8],
+		content_info: Option<EncapsulatedContentInfo>,
+	) -> CompressionResult<(Vec<u8>, CompressedData)> {
 		use std::io::Cursor;
 
 		let mut output: Vec<u8> = vec![];
@@ -69,15 +74,9 @@ impl Compressor for ZstdCompression {
 		encoder.finish()?;
 
 		let compression_alg = AlgorithmIdentifierOwned::from(ZstdCompression);
-		let encap_content_info = content_info.unwrap_or(EncapsulatedContentInfo {
-			econtent_type: crate::asn1::COMPRESSION_CONTENT_OID,
-			econtent: None
-		});
-		let compressed_data = CompressedData {
-			version: CmsVersion::V0,
-			compression_alg,
-			encap_content_info
-		};
+		let encap_content_info = content_info
+			.unwrap_or(EncapsulatedContentInfo { econtent_type: crate::asn1::COMPRESSION_CONTENT_OID, econtent: None });
+		let compressed_data = CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info };
 
 		Ok((output, compressed_data))
 	}
@@ -85,36 +84,22 @@ impl Compressor for ZstdCompression {
 
 #[cfg(feature = "compress")]
 impl Inflator for ZstdCompression {
-	fn decompress(&self, data: &[u8]) -> CompressionResult {
+	fn decompress(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
 		use std::io::Cursor;
 
-		let mut output: Vec<u8> = vec![];
-		let mut decoder = zeekstd::Decoder::new(Cursor::new(data))?;
-		std::io::copy(&mut decoder, &mut output)?;
+		let cursor = Cursor::new(data);
+		let mut decoder = zeekstd::Decoder::new(cursor)?;
+		let mut out: Vec<u8> = Vec::new();
 
-		let compression_alg = AlgorithmIdentifierOwned::from(ZstdCompression);
-		let encap_content_info = EncapsulatedContentInfo {
-			econtent_type: crate::asn1::COMPRESSION_CONTENT_OID,
-			econtent: None
-		};
-		let compressed_data = CompressedData {
-			version: CmsVersion::V0,
-			compression_alg,
-			encap_content_info
-		};
-
-		Ok((output, compressed_data))
+		std::io::copy(&mut decoder, &mut out)?;
+		Ok(out)
 	}
 }
-
 
 #[cfg(feature = "compress")]
 impl From<&ZstdCompression> for AlgorithmIdentifierOwned {
 	fn from(_: &ZstdCompression) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned {
-			oid: crate::asn1::COMPRESSION_ZSTD_OID,
-			parameters: None,
-		}
+		AlgorithmIdentifierOwned { oid: crate::asn1::COMPRESSION_ZSTD_OID, parameters: None }
 	}
 }
 

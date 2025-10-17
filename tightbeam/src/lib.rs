@@ -133,9 +133,9 @@ pub mod transport;
 
 // Re-export
 pub use asn1::*;
+pub use cms;
 pub use der;
 pub use spki;
-pub use cms;
 pub use x509_cert as x509;
 
 #[cfg(feature = "hex")]

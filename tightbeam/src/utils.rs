@@ -5,7 +5,7 @@ use crate::error::CompressionError;
 #[cfg(feature = "compress")]
 use crate::helpers::{Compressor, Inflator};
 #[cfg(feature = "compress")]
-use crate::{AlgorithmIdentifierOwned, CompressedData};
+use crate::CompressedData;
 
 /// Macro to implement From trait for both reference and owned types
 ///
@@ -173,21 +173,18 @@ pub fn decode<'a, T: der::Decode<'a>, B: AsRef<[u8]>>(bytes: &'a B) -> Result<T,
 pub fn compress(
 	data: impl AsRef<[u8]>,
 	compressor: &impl Compressor,
-	content_info: Option<crate::cms::signed_data::EncapsulatedContentInfo>
+	content_info: Option<crate::cms::signed_data::EncapsulatedContentInfo>,
 ) -> Result<(Vec<u8>, CompressedData), CompressionError> {
 	let data = data.as_ref();
-	Ok(compressor.compress(data, content_info)?)
+	compressor.compress(data, content_info)
 }
 
 /// Decompress data using the specified algorithm.
 #[cfg(feature = "compress")]
 #[inline]
-pub fn decompress(
-	data: impl AsRef<[u8]>,
-	inflator: &impl Inflator
-) -> Result<(Vec<u8>, CompressedData), CompressionError> {
+pub fn decompress(data: impl AsRef<[u8]>, inflator: &impl Inflator) -> Result<Vec<u8>, CompressionError> {
 	let data = data.as_ref();
-	Ok(inflator.decompress(data)?)
+	inflator.decompress(data)
 }
 
 #[cfg(test)]
@@ -239,7 +236,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "compress")]
 	fn test_compress_decompress() -> Result<(), CompressionError> {
-		let algorithms = [AlgorithmIdentifierOwned::NONE, AlgorithmIdentifierOwned::ZSTD];
+		use crate::helpers::ZstdCompression;
 
 		// Data-driven cases
 		let patterned = (0u32..2048).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
@@ -253,29 +250,11 @@ mod tests {
 			&big_repeat,
 		];
 
-		for &alg in &algorithms {
-			for &data in &cases {
-				let (compressed, info) = compress(data, alg)?;
-				let decompressed = decompress(&compressed, &info)?;
-				assert_eq!(decompressed, data);
-
-				// Assert CompressedData metadata
-				match &info {
-					crate::asn1::CompressedData::NONE(_) => {
-						// NONE should be identical
-						assert_eq!(compressed, data);
-					}
-					#[cfg(feature = "zstd")]
-					crate::asn1::CompressedData::ZSTD(z) => {
-						assert_eq!(z.original_size as usize, data.len());
-						assert_eq!(z.level, 0);
-					}
-					#[cfg(feature = "gzip")]
-					crate::asn1::CompressedData::GZIP(_) => {
-						unreachable!("GZIP not in algorithms set");
-					}
-				}
-			}
+		let compressor = ZstdCompression;
+		for &data in &cases {
+			let (compressed, _info) = compress(data, &compressor, None)?;
+			let decompressed = decompress(&compressed, &compressor)?;
+			assert_eq!(decompressed, data);
 		}
 
 		Ok(())
