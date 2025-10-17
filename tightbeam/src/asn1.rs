@@ -25,7 +25,8 @@ pub use crate::x509::ext::pkix::SignatureAlgorithm;
 pub const COMPRESSION_CONTENT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
 /// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
 /// id-alg-zlibCompress OBJECT IDENTIFIER ::= {
-///     alg(
+///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
+///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
 /// }
 pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
 /// sha3-256
@@ -136,9 +137,9 @@ pub struct Asn1Matrix {
 /// Metadata ::= SEQUENCE {
 ///     id               OCTET STRING,
 ///     order            INTEGER,
-///     compactness      CompressedData,
+///     compactness      CompressedData OPTIONAL,
 ///     integrity        [0] DigestInfo OPTIONAL,
-///     confidentiality  [1] EncryptionInfo OPTIONAL,
+///     confidentiality  [1] EncryptedContentInfo OPTIONAL,
 ///     priority         [2] MessagePriority OPTIONAL,
 ///     lifetime         [3] INTEGER OPTIONAL,
 ///     previousFrame    [4] DigestInfo OPTIONAL,
@@ -185,9 +186,9 @@ pub struct Metadata {
 /// Frame ::= SEQUENCE {
 ///     version        Version,
 ///     metadata       Metadata,
-///     message        MessageContent,
+///     message        OCTET STRING,
 ///     integrity      [0] DigestInfo OPTIONAL,
-///     nonrepudiation [1] SignerInfo    OPTIONAL
+///     nonrepudiation [1] SignerInfo OPTIONAL
 /// }
 /// ```
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
