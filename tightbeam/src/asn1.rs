@@ -4,10 +4,11 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 
 use crate::der::oid::ObjectIdentifier;
-use crate::der::{Enumerated, Sequence};
+use crate::der::{Enumerated, Sequence, Choice};
 
 pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
+pub use crate::cms::enveloped_data::EncryptedContentInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
@@ -29,6 +30,10 @@ pub const HASH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.
 /// ecdsa-with-SHA256
 /// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
 pub const SIGNER_ECDSA_WITH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+/// id-data
+/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
+/// See `<https://oid-base.com/get/1.2.840.113549.1.7.1>`
+pub const DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
 
 /// Protocol version determines metadata structure and features
 ///
@@ -87,48 +92,6 @@ pub enum MessagePriority {
 	Low = 4,
 	Bulk = 5,
 	Heartbeat = 6,
-}
-
-/// Encryption information for confidentiality
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// EncryptionInfo ::= SEQUENCE {
-///     algorithm   AlgorithmIdentifier,
-///     parameters  ANY DEFINED BY algorithm
-/// }
-/// ```
-#[cfg(feature = "zeroize")]
-#[derive(Sequence, Debug, Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
-pub struct EncryptionInfo<A = crate::der::asn1::Any, T = Vec<u8>>
-where
-	for<'a> A: crate::der::Choice<'a> + crate::der::Encode,
-	for<'a> T: crate::der::Decode<'a> + crate::der::Encode,
-	T: zeroize::Zeroize,
-{
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub encryption_algorithm: AlgorithmIdentifier<A>,
-	pub parameters: T,
-}
-
-/// Encryption information for confidentiality
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// EncryptionInfo ::= SEQUENCE {
-///     algorithm   AlgorithmIdentifier,
-///     parameters  ANY DEFINED BY algorithm
-/// }
-/// ```
-#[cfg(not(feature = "zeroize"))]
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
-pub struct EncryptionInfo<A = crate::der::asn1::Any, T = Vec<u8>>
-where
-	for<'a> A: crate::der::Choice<'a> + crate::der::Encode,
-	for<'a> T: crate::der::Decode<'a> + crate::der::Encode,
-{
-	pub encryption_algorithm: AlgorithmIdentifier<A>,
-	pub parameters: T,
 }
 
 /// Hash information for integrity validation
@@ -233,8 +196,6 @@ pub struct Metadata {
 	// V1+ fields
 	#[asn1(context_specific = "0", optional = "true")]
 	pub integrity: Option<IntegrityInfo>,
-	#[asn1(context_specific = "1", optional = "true")]
-	pub confidentiality: Option<EncryptionInfo>,
 
 	// V2+ fields
 	#[asn1(context_specific = "2", optional = "true")]
@@ -248,6 +209,23 @@ pub struct Metadata {
 	pub matrix: Option<Asn1Matrix>,
 }
 
+/// Message content - either plaintext or encrypted
+///
+/// ASN.1 Definition:
+/// ```asn1
+/// MessageContent ::= CHOICE {
+///     plaintext   OCTET STRING,
+///     encrypted   EncryptedContentInfo
+/// }
+/// ```
+#[derive(Choice, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
+pub enum MessageContent {
+    Plaintext(Vec<u8>),
+	#[zeroize(skip)] // EncryptedContentInfo does not implement Zeroize
+    Encrypted(EncryptedContentInfo),
+}
+
 /// Core TightBeam message structure
 /// The version field explicitly determines which metadata variant to use
 /// The signature signs the entire message (version + metadata + body)
@@ -257,7 +235,7 @@ pub struct Metadata {
 /// Frame ::= SEQUENCE {
 ///     version        Version,
 ///     metadata       Metadata,
-///     message        OCTET STRING,
+///     message        MessageContent,
 ///     integrity      [0] IntegrityInfo OPTIONAL,
 ///     nonrepudiation [1] SignerInfo    OPTIONAL
 /// }
@@ -268,7 +246,7 @@ pub struct Frame {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub version: Version,
 	pub metadata: Metadata,
-	pub message: Vec<u8>,
+	pub message: MessageContent,
 	#[asn1(context_specific = "0", optional = "true")]
 	pub integrity: Option<IntegrityInfo>,
 	#[asn1(context_specific = "1", optional = "true")]

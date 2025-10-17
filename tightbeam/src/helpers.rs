@@ -8,25 +8,52 @@ pub use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::der::{Decode, Encode};
 use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
 use crate::matrix::MatrixError;
-use crate::{AlgorithmIdentifier, Asn1Matrix, Result};
+use crate::{AlgorithmIdentifier, Asn1Matrix, MessageContent};
+use crate::error::Result;
 
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::der::oid::AssociatedOid;
-#[cfg(feature = "aead")]
-use crate::EncryptionInfo;
 #[cfg(feature = "digest")]
 use crate::IntegrityInfo;
 #[cfg(feature = "signature")]
 use crate::SignerInfo;
+#[cfg(feature = "aead")]
+use crate::crypto::aead::Decryptor;
 
-#[cfg(feature = "aead")]
-pub type Encryptor = Box<dyn FnOnce(&[u8]) -> Result<(Vec<u8>, EncryptionInfo)>>;
-#[cfg(feature = "aead")]
-pub type Decryptor = Box<dyn FnOnce(&[u8], &EncryptionInfo) -> Result<Vec<u8>>>;
 #[cfg(feature = "signature")]
 pub type SignatureVerifier = Box<dyn FnOnce(&[u8], &SignerInfo) -> Result<()>>;
 #[cfg(feature = "digest")]
 pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::IntegrityInfo>>;
+
+impl MessageContent {
+	pub fn is_plaintext(&self) -> bool {
+		matches!(self, Self::Plaintext(_))
+	}
+
+	pub fn is_encrypted(&self) -> bool {
+		matches!(self, Self::Encrypted(_))
+	}
+
+	#[cfg(feature = "aead")]
+	pub fn decrypt(&self, decryptor: &impl Decryptor) -> Result<Vec<u8>> {
+		match self {
+			Self::Plaintext(data) => Ok(data.clone()),
+			Self::Encrypted(info) => decryptor.decrypt_content(info),
+		}
+	}
+}
+
+impl From<&MessageContent> for Vec<u8> {
+	fn from(value: &MessageContent) -> Self {
+		match &value {
+			MessageContent::Plaintext(data) => data.clone(),
+			MessageContent::Encrypted(info) => {
+				// Encode the EncryptedContentInfo to DER bytes
+				crate::encode(info).unwrap_or_default()
+			}
+		}
+	}
+}
 
 #[cfg(feature = "digest")]
 impl IntegrityInfo {
@@ -52,23 +79,6 @@ impl IntegrityInfo {
 
 	pub fn compare(&self, hash: impl AsRef<[u8]>) -> bool {
 		self.parameters.as_slice() == hash.as_ref()
-	}
-}
-
-#[cfg(feature = "aead")]
-impl EncryptionInfo {
-	/// Create EncryptionInfo for an AEAD cipher with a nonce
-	///
-	/// # Security Warning
-	/// **NEVER reuse a nonce with the same key!** Nonce reuse completely breaks
-	/// AEAD security, allowing plaintext recovery and forgery attacks.
-	pub fn prepare<C>(nonce: impl AsRef<[u8]>) -> Result<Self>
-	where
-		C: AssociatedOid,
-	{
-		let algorithm = AlgorithmIdentifier { oid: C::OID, parameters: None };
-		let parameters = nonce.as_ref().to_vec();
-		Ok(Self { encryption_algorithm: algorithm, parameters })
 	}
 }
 
@@ -287,7 +297,7 @@ mod tests {
 	#[cfg(feature = "signature")]
 	mod notarize {
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-		use crate::Result;
+		use crate::error::Result;
 
 		#[test]
 		fn test_notarize_macro() -> Result<()> {
@@ -328,26 +338,6 @@ mod tests {
 		assert_eq!(length, 32);
 	}
 
-	#[cfg(feature = "aes-gcm")]
-	#[test]
-	fn test_encryption_info_prepare() {
-		use crate::crypto::aead::Aes256GcmOid;
-		use crate::EncryptionInfo;
-
-		// Create a nonce for AES-256-GCM (96 bits / 12 bytes)
-		let nonce = [1u8; 12];
-		// Use the prepare helper method
-		let encryption_info = EncryptionInfo::prepare::<Aes256GcmOid>(&nonce).unwrap();
-
-		// Verify the algorithm OID is set correctly (AES-256-GCM OID)
-		let algorithm = encryption_info.encryption_algorithm.oid.to_string();
-		assert_eq!(algorithm, "2.16.840.1.101.3.4.1.46");
-		// Verify the nonce is stored correctly
-		assert_eq!(encryption_info.parameters, &nonce);
-		// Verify correct length
-		assert_eq!(encryption_info.parameters.len(), 12);
-	}
-
 	mod validation {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 		use crate::crypto::hash::Sha3_256;
@@ -371,7 +361,7 @@ mod tests {
 				nonrepudiable: bool,
 				message_integrity: bool,
 				frame_integrity: bool,
-			) -> crate::Result<crate::Frame> {
+			) -> crate::error::Result<crate::Frame> {
 				match (confidential, nonrepudiable, message_integrity, frame_integrity) {
 					(true, true, true, true) => crate::compose! {
 						V2: id: test_name, order: 1u64, message: message.clone(),
@@ -509,7 +499,6 @@ mod tests {
 						assert!(result.is_ok());
 
 						let frame = result.unwrap();
-						assert_eq!(frame.metadata.confidentiality.is_some(), confidential);
 						assert_eq!(frame.nonrepudiation.is_some(), nonrepudiable);
 
 						// Test 3: Verify version enforcement

@@ -5,9 +5,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::builder::error::{BuildError, MetadataError};
 use crate::matrix::MatrixDyn;
-use crate::{
-	Asn1Matrix, CompressedData, EncryptionInfo, IntegrityInfo, MessagePriority, Metadata, SignerInfo, Version,
-};
+use crate::{Asn1Matrix, CompressedData, IntegrityInfo, MessagePriority, Metadata, Version};
 
 /// A fluent builder for TightBeam metadata.
 pub struct MetadataBuilder {
@@ -15,8 +13,6 @@ pub struct MetadataBuilder {
 	id: Option<Vec<u8>>,
 	order: Option<u64>,
 	integrity: Option<IntegrityInfo>,
-	confidentiality: Option<EncryptionInfo>,
-	nonrepudiation: Option<SignerInfo>,
 	compactness: Option<CompressedData>,
 	priority: Option<MessagePriority>,
 	lifetime: Option<u64>,
@@ -31,8 +27,6 @@ impl From<Version> for MetadataBuilder {
 			id: None,
 			order: None,
 			integrity: None,
-			confidentiality: None,
-			nonrepudiation: None,
 			compactness: None,
 			priority: None,
 			lifetime: None,
@@ -60,18 +54,6 @@ impl MetadataBuilder {
 	/// Set the integrity information
 	pub fn with_integrity_info(mut self, hash: IntegrityInfo) -> Self {
 		self.integrity = Some(hash);
-		self
-	}
-
-	/// Set the encryption information
-	pub fn with_confidentiality_info(mut self, encryption: EncryptionInfo) -> Self {
-		self.confidentiality = Some(encryption);
-		self
-	}
-
-	/// Set the signature information
-	pub fn with_nonrepudiation_info(mut self, signature: SignerInfo) -> Self {
-		self.nonrepudiation = Some(signature);
 		self
 	}
 
@@ -116,8 +98,6 @@ impl MetadataBuilder {
 			id,
 			order,
 			integrity,
-			confidentiality,
-			nonrepudiation: _,
 			compactness,
 			priority,
 			lifetime,
@@ -139,7 +119,6 @@ impl MetadataBuilder {
 				order,
 				compactness,
 				integrity: None,
-				confidentiality: None,
 				priority: None,
 				lifetime: None,
 				previous_frame: None,
@@ -150,23 +129,14 @@ impl MetadataBuilder {
 				order,
 				compactness,
 				integrity,
-				confidentiality,
 				priority: None,
 				lifetime: None,
 				previous_frame: None,
 				matrix: None,
 			}),
-			Version::V2 => Ok(Metadata {
-				id,
-				order,
-				compactness,
-				integrity,
-				confidentiality,
-				priority,
-				lifetime,
-				previous_frame,
-				matrix,
-			}),
+			Version::V2 => {
+				Ok(Metadata { id, order, compactness, integrity, priority, lifetime, previous_frame, matrix })
+			}
 		}
 	}
 
@@ -205,16 +175,6 @@ impl MetadataBuilder {
 		self.compactness.is_some()
 	}
 
-	/// Check if encryption is set
-	pub fn has_encryption(&self) -> bool {
-		self.confidentiality.is_some()
-	}
-
-	/// Check if signature is set
-	pub fn has_signature(&self) -> bool {
-		self.nonrepudiation.is_some()
-	}
-
 	/// Check if hash is set
 	pub fn has_hash(&self) -> bool {
 		self.integrity.is_some()
@@ -224,7 +184,7 @@ impl MetadataBuilder {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::{create_test_encryption_info, create_test_hash_info, create_test_signer_info};
+	use crate::testing::create_test_hash_info;
 
 	macro_rules! test_metadata_builder {
 		($test_name:ident, $version:expr, $builder:expr) => {
@@ -237,21 +197,18 @@ mod tests {
 				// X.509-style: single structure, validate based on version
 				match $version {
 					Version::V0 => {
-						assert!(metadata.confidentiality.is_none());
 						assert!(metadata.priority.is_none());
 						assert!(metadata.lifetime.is_none());
 						assert!(metadata.previous_frame.is_none());
 						assert!(metadata.matrix.is_none());
 					}
 					Version::V1 => {
-						assert!(metadata.confidentiality.is_some());
 						assert!(metadata.priority.is_none());
 						assert!(metadata.lifetime.is_none());
 						assert!(metadata.previous_frame.is_none());
 						assert!(metadata.matrix.is_none());
 					}
 					Version::V2 => {
-						assert!(metadata.confidentiality.is_some());
 						assert!(metadata.priority.is_some());
 					}
 				}
@@ -275,8 +232,6 @@ mod tests {
 			.with_id("test-id-v1")
 			.with_order(1696521600u64)
 			.with_integrity_info(create_test_hash_info())
-			.with_confidentiality_info(create_test_encryption_info())
-			.with_nonrepudiation_info(create_test_signer_info())
 	);
 
 	test_metadata_builder!(
@@ -286,8 +241,6 @@ mod tests {
 			.with_id("test-id-v2")
 			.with_order(1696521600u64)
 			.with_integrity_info(create_test_hash_info())
-			.with_confidentiality_info(create_test_encryption_info())
-			.with_nonrepudiation_info(create_test_signer_info())
 			.with_priority(MessagePriority::High)
 			.with_lifetime(3600)
 	);

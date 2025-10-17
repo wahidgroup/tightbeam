@@ -41,7 +41,7 @@ macro_rules! job {
 		pub struct $job_name;
 
 		impl $job_name {
-			pub async fn run($($param: $param_ty),*) -> $crate::Result<$crate::Frame> {
+			pub async fn run($($param: $param_ty),*) -> $crate::error::Result<$crate::Frame> {
 				$body
 			}
 		}
@@ -55,7 +55,7 @@ macro_rules! job {
 		pub struct $job_name;
 
 		impl $job_name {
-			pub fn run($($param: $param_ty),*) -> $crate::Result<$crate::Frame> {
+			pub fn run($($param: $param_ty),*) -> $crate::error::Result<$crate::Frame> {
 				$body
 			}
 		}

@@ -198,12 +198,12 @@ mod tests {
 		let timeout = Duration::from_millis(200);
 		for i in 0..n {
 			let received_payment = payment_rx.recv_timeout(timeout)?;
-			let message = crate::decode::<Payment, _>(&received_payment.message)?;
+			let message: Payment = crate::decode(&received_payment.message)?;
 			assert_eq!(&received_payment.metadata.id, &format!("p-{i}").as_bytes());
 			assert_eq!(message, Payment { from: "alice".into(), amount: i as u64 });
 
 			let received_health = health_rx.recv_timeout(timeout)?;
-			let message = crate::decode::<HealthCheck, _>(&received_health.message)?;
+			let message: HealthCheck = crate::decode(&received_health.message)?;
 			assert_eq!(received_health.metadata.id, format!("h-{i}").as_bytes());
 			assert_eq!(message, HealthCheck { uptime: i as u64 });
 		}

@@ -360,7 +360,7 @@ macro_rules! worker {
 	) => {
 		paste::paste! {
 			impl $worker_name {
-				pub fn start(config: [<$worker_name Conf>]) -> $crate::Result<Self> {
+				pub fn start(config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
 					let queue_capacity = $crate::worker!(@queue $($queue)?);
 					let (tx, rx) = $crate::colony::worker_runtime::rt::channel::<$crate::colony::worker::WorkerRequest<$input, $output>>(queue_capacity);
 

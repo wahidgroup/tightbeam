@@ -624,7 +624,7 @@ macro_rules! drone {
 						.ok_or_else(|| $crate::colony::drone::DroneError::NoResponse)?;
 
 					// Decode response
-					let response = $crate::decode::<$crate::colony::drone::RegisterDroneResponse, _>(&response_frame.message)
+					let response = $crate::decode::<$crate::colony::drone::RegisterDroneResponse>(&response_frame.message)
 						.map_err(|_| $crate::colony::drone::DroneError::DecodeFailed)?;
 
 					Ok(response)
@@ -806,7 +806,7 @@ macro_rules! drone {
 						.ok_or_else(|| $crate::colony::drone::DroneError::NoResponse)?;
 
 					// Decode response
-					let response = $crate::decode::<$crate::colony::drone::RegisterDroneResponse, _>(&response_frame.message)
+					let response = $crate::decode::<$crate::colony::drone::RegisterDroneResponse>(&response_frame.message)
 						.map_err(|_| $crate::colony::drone::DroneError::DecodeFailed)?;
 
 					Ok(response)
@@ -976,7 +976,7 @@ macro_rules! drone {
 				};
 
 				// First, try to decode as an activation request
-				if let Ok(request) = $crate::decode::<$crate::colony::drone::ActivateServletRequest, _>(&$frame.message) {
+				if let Ok(request) = $crate::decode::<$crate::colony::drone::ActivateServletRequest>(&$frame.message) {
 					// Match servlet_id and activate the corresponding servlet
 					$(
 						if request.servlet_id == stringify!($servlet_id).as_bytes() {
@@ -1041,7 +1041,7 @@ macro_rules! drone {
 		paste::paste! {
 			{
 				// Decode the management request
-				if let Ok(request) = $crate::decode::<$crate::colony::drone::HiveManagementRequest, _>(&$frame.message) {
+				if let Ok(request) = $crate::decode::<$crate::colony::drone::HiveManagementRequest>(&$frame.message) {
 
 					// Handle spawn request
 					if let Some(spawn_params) = request.spawn {
@@ -1378,7 +1378,7 @@ mod tests {
 			with_collector_gate: [crate::policy::AcceptAllGate]
 		},
 		handle: |message| async move {
-			let decoded = crate::decode::<DroneTestMessage, _>(&message.message).ok()?;
+			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
 			if decoded.content == "PING" {
 				Some(DroneResponseJob::run(message.metadata.id.clone(), "PONG".to_string()).ok()?)
 			} else {
@@ -1397,7 +1397,7 @@ mod tests {
 			threshold: u32,
 		},
 		handle: |message, config| async move {
-			let decoded = crate::decode::<DroneTestMessage, _>(&message.message).ok()?;
+			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
 			if decoded.value >= config.threshold {
 				Some(DroneResponseJob::run(message.metadata.id.clone(), "ACCEPTED".to_string()).ok()?)
 			} else {
@@ -1422,7 +1422,7 @@ mod tests {
 			})
 		},
 		handle: |message, _config, workers| async move {
-			let decoded = crate::decode::<DroneTestMessage, _>(&message.message).ok()?;
+			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
 
 			#[cfg(feature = "tokio")]
 			let (echo_result, check_result) = tokio::join!(
@@ -1502,7 +1502,7 @@ mod tests {
 				.ok_or("No response received from drone")?;
 
 			// Decode the activation response
-			let activation_response = crate::decode::<ActivateServletResponse, _>(&response.message)?;
+			let activation_response: ActivateServletResponse = crate::decode(&response.message)?;
 			assert_eq!(activation_response.status, TransitStatus::Accepted, "Servlet activation should succeed");
 
 			// Step 2: Test morphing back to simple_servlet (verify we can morph multiple times)
@@ -1516,7 +1516,7 @@ mod tests {
 			let simple_again_response = client.emit(signed_simple_again_frame, None).await?
 				.ok_or("No response from drone for second simple activation")?;
 
-			let simple_again_activation = crate::decode::<ActivateServletResponse, _>(&simple_again_response.message)?;
+			let simple_again_activation: ActivateServletResponse = crate::decode(&simple_again_response.message)?;
 			assert_eq!(simple_again_activation.status, TransitStatus::Accepted, "Second simple servlet activation should succeed");
 
 			// Step 3: Test invalid servlet ID
@@ -1530,7 +1530,7 @@ mod tests {
 			let invalid_response = client.emit(signed_invalid_frame, None).await?
 				.ok_or("No response from drone for invalid activation")?;
 
-			let invalid_activation = crate::decode::<ActivateServletResponse, _>(&invalid_response.message)?;
+			let invalid_activation: ActivateServletResponse = crate::decode(&invalid_response.message)?;
 			assert_eq!(invalid_activation.status, TransitStatus::Forbidden, "Invalid servlet activation should be rejected");
 
 			// Note: In the current architecture, activated servlets run their own servers
@@ -1564,7 +1564,7 @@ mod tests {
 			with_collector_gate: [crate::policy::AcceptAllGate]
 		},
 		handle: |message| async move {
-			let decoded = crate::decode::<DroneTestMessage, _>(&message.message).ok()?;
+			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
 			DroneResponseJob::run(
 				message.metadata.id.clone(),
 				format!("ECHO: {}", decoded.content)
@@ -1647,7 +1647,7 @@ mod tests {
 		let list_frame = ListServletsJob::run(b"list-1")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
-		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
+		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
 		let list_response = mgmt_response.list.expect("Should have list response");
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
@@ -1666,7 +1666,7 @@ mod tests {
 		let spawn_frame = SpawnServletJob::run(b"spawn-1", b"simple_servlet", None)?;
 
 		let response = transport.emit(spawn_frame, None).await?.unwrap();
-		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
+		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
 		let spawn_response = mgmt_response.spawn.expect("Should have spawn response");
 
 		assert_eq!(spawn_response.status, crate::policy::TransitStatus::Accepted);
@@ -1687,7 +1687,7 @@ mod tests {
 		let list_frame = ListServletsJob::run(b"list-2")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
-		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
+		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
 		let list_response = mgmt_response.list.expect("Should have list response");
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
@@ -1707,7 +1707,7 @@ mod tests {
 		let stop_frame = StopServletJob::run(b"stop-1", new_servlet_id.clone())?;
 
 		let response = transport.emit(stop_frame, None).await?.unwrap();
-		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
+		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
 		let stop_response = mgmt_response.stop.expect("Should have stop response");
 
 		if stop_response.status != crate::policy::TransitStatus::Accepted {
@@ -1716,7 +1716,7 @@ mod tests {
 			println!("  Current servlets:");
 			let list_frame = ListServletsJob::run(b"list-debug")?;
 			let response = transport.emit(list_frame, None).await?.unwrap();
-			let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
+			let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
 			let list_response = mgmt_response.list.expect("Should have list response");
 			for servlet in &list_response.servlets {
 				println!("    - ID: {:?}", servlet.servlet_id);
@@ -1731,7 +1731,7 @@ mod tests {
 		let list_frame = ListServletsJob::run(b"list-3")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
-		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
+		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
 		let list_response = mgmt_response.list.expect("Should have list response");
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
@@ -1750,7 +1750,7 @@ mod tests {
 		let spawn_frame = SpawnServletJob::run(b"spawn-2", b"unknown_servlet", None)?;
 
 		let response = transport.emit(spawn_frame, None).await?.unwrap();
-		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
+		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
 		let spawn_response = mgmt_response.spawn.expect("Should have spawn response");
 
 		assert_eq!(spawn_response.status, crate::policy::TransitStatus::Forbidden);

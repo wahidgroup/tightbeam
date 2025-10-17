@@ -49,7 +49,7 @@ test_container! {
 	service: |message, tx| async move {
 		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
 
-		let decoded = tightbeam::decode::<RequestMessage, _>(&message.clone().message).ok()?;
+		let decoded: RequestMessage = tightbeam::decode(&message.clone().message).ok()?;
 		if &decoded.content == "PING" {
 			tightbeam::relay!(ServiceAssertChecklist::ContainerPingReceived, tx)?;
 
@@ -94,7 +94,7 @@ test_container! {
 			// Ensure server did not reject
 			assert_channels_quiet!(reject_rx);
 
-			tightbeam::decode::<ResponseMessage, _>(&response.message).ok()
+			tightbeam::decode::<ResponseMessage>(&response.message).ok()
 		} else {
 			panic!("Expected a response from the service");
 		};

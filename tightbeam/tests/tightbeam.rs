@@ -101,7 +101,6 @@ fn test_workflow_v0() -> Result<(), Box<dyn core::error::Error>> {
 	assert_eq!(tightbeam.version, tightbeam::Version::V0);
 
 	// V0 doesn't have encryption, signatures, priority, TTL, or matrix
-	assert!(tightbeam.metadata.confidentiality.is_none());
 	assert!(tightbeam.nonrepudiation.is_none());
 	assert!(tightbeam.metadata.priority.is_none());
 	assert!(tightbeam.metadata.lifetime.is_none());
@@ -162,7 +161,7 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 	}?;
 
 	// Decrypt and verify the message was correctly processed
-	let decrypted = tightbeam.decrypt::<TestMessage, crypto::aead::Aes256Gcm>(&cipher, None)?;
+	let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, None)?;
 	assert_eq!(decrypted, message);
 
 	// Verify signature

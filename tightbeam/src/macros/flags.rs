@@ -71,14 +71,14 @@ macro_rules! flagset {
 				T: Into<u8> + 'static,
 			{
 				let type_name = std::any::type_name::<T>();
-				let type_name = core::any::type_name::<T>();
+				let type_name = ::core::any::type_name::<T>();
 				let pos = Self::get_pos(type_name);
 				self.flags.set_at(pos, flag.into());
 			}
 
 		fn unset(&mut self) {
 			let type_name = std::any::type_name::<T>();
-			let type_name = core::any::type_name::<T>();
+			let type_name = ::core::any::type_name::<T>();
 			let pos = Self::get_pos(type_name);
 			self.flags.set_at(pos, T::default().into());
 		}
@@ -88,7 +88,7 @@ macro_rules! flagset {
 			T: Into<u8> + PartialEq<u8> + Default + 'static,
 			{
 				let type_name = std::any::type_name::<T>();
-				let type_name = core::any::type_name::<T>();
+				let type_name = ::core::any::type_name::<T>();
 				let pos = Self::get_pos(type_name);
 				let stored_value = self.flags.get_at(pos);
 				let flag_value = flag.into();
@@ -127,7 +127,7 @@ macro_rules! flagset {
 		impl From<$crate::matrix::MatrixDyn> for $name {
 			fn from(m: $crate::matrix::MatrixDyn) -> Self {
 				let n = m.n();
-				let dim = core::cmp::min(n as usize, tightbeam::flagset!(@count $first $(, $rest)*));
+				let dim = ::core::cmp::min(n as usize, tightbeam::flagset!(@count $first $(, $rest)*));
 				let mut flags = $crate::flags::Flags::<{ tightbeam::flagset!(@count $first $(, $rest)*) }>::default();
 				for __idx in 0..dim {
 					flags.set_at(__idx, m.get(__idx as u8, __idx as u8));
@@ -139,7 +139,7 @@ macro_rules! flagset {
 		impl From<&$crate::matrix::MatrixDyn> for $name {
 			fn from(m: &$crate::matrix::MatrixDyn) -> Self {
 				let n = m.n();
-				let dim = core::cmp::min(n as usize, tightbeam::flagset!(@count $first $(, $rest)*));
+				let dim = ::core::cmp::min(n as usize, tightbeam::flagset!(@count $first $(, $rest)*));
 				let mut flags = $crate::flags::Flags::<{ tightbeam::flagset!(@count $first $(, $rest)*) }>::default();
 				for __idx in 0..dim {
 					flags.set_at(__idx, m.get(__idx as u8, __idx as u8));

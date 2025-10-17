@@ -19,6 +19,7 @@ pub use crate::mpsc;
 pub use der::{Decode, Encode, Sequence};
 
 // Core types
+pub use crate::asn1;
 pub use crate::error;
 pub use crate::flags;
 pub use crate::tightbeam::flags::FlagSet;
@@ -32,15 +33,6 @@ pub use crate::Beamable;
 // Builder support
 #[cfg(feature = "builder")]
 pub use crate::builder::FrameBuilder;
-// Cryptographic types
-#[cfg(feature = "random")]
-pub use crate::random;
-#[cfg(feature = "aead")]
-pub use crate::EncryptionInfo;
-#[cfg(feature = "digest")]
-pub use crate::IntegrityInfo;
-#[cfg(feature = "signature")]
-pub use crate::SignerInfo;
 
 #[cfg(feature = "policy")]
 pub mod policy {

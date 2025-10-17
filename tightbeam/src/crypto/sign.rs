@@ -31,7 +31,7 @@ where
 	type DigestAlgorithm: Digest + AssociatedOid;
 
 	/// Sign data and return the signature information
-	fn to_signer_info(&self, data: &[u8]) -> crate::Result<SignerInfo> {
+	fn to_signer_info(&self, data: &[u8]) -> crate::error::Result<SignerInfo> {
 		// Compute digest first
 		let mut hasher = Self::DigestAlgorithm::new();
 		hasher.update(data);
@@ -66,7 +66,7 @@ where
 	fn signature_algorithm(&self) -> AlgorithmIdentifierOwned;
 
 	/// Get the signer's identifier
-	fn signer_identifier(&self) -> crate::Result<SignerIdentifier>;
+	fn signer_identifier(&self) -> crate::error::Result<SignerIdentifier>;
 }
 
 #[cfg(feature = "secp256k1")]
@@ -77,7 +77,7 @@ impl Signatory<ecdsa::Signature<ecdsa::Secp256k1>> for ecdsa::SigningKey<ecdsa::
 		AlgorithmIdentifierOwned { oid: crate::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
 	}
 
-	fn signer_identifier(&self) -> crate::Result<SignerIdentifier> {
+	fn signer_identifier(&self) -> crate::error::Result<SignerIdentifier> {
 		let verifying_key = self.verifying_key();
 		let encoded_point = verifying_key.to_encoded_point(false);
 		let octet_string = OctetString::new(encoded_point.as_bytes())?;

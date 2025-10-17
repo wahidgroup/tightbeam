@@ -164,13 +164,14 @@ pub fn create_test_hash_info() -> crate::IntegrityInfo {
 	}
 }
 
-pub fn create_test_encryption_info() -> crate::EncryptionInfo {
-	crate::EncryptionInfo {
-		encryption_algorithm: crate::AlgorithmIdentifier {
+pub fn create_test_encryption_info() -> crate::EncryptedContentInfo {
+	crate::EncryptedContentInfo {
+		content_type: crate::asn1::COMPRESSION_CONTENT_OID,
+		content_enc_alg: crate::AlgorithmIdentifier {
 			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.42"), // AES-256-GCM
 			parameters: None,
 		},
-		parameters: vec![0u8; 12],
+		encrypted_content: Some(crate::der::asn1::OctetString::new(vec![0u8; 12]).unwrap()),
 	}
 }
 
@@ -205,7 +206,7 @@ macro_rules! test_case {
 		assertions: |$result_pat:pat_param| $body:block
 	) => {
 		#[test]
-		fn $test_name() -> $crate::Result<()> {
+		fn $test_name() -> $crate::error::Result<()> {
 			let $result_pat = $setup();
 			$body
 		}
@@ -218,7 +219,7 @@ macro_rules! test_case {
 		assertions: $assertions:expr
 	) => {
 		#[test]
-		fn $test_name() -> $crate::Result<()> {
+		fn $test_name() -> $crate::error::Result<()> {
 			let result = $setup();
 			$assertions(result)
 		}
@@ -239,7 +240,7 @@ macro_rules! test_builder {
 		assertions: |$result:ident| $assertions_body:expr
 	) => {
 		#[test]
-		fn $test_name() -> $crate::Result<()> {
+		fn $test_name() -> $crate::error::Result<()> {
 			let $builder: $builder_type = <$builder_type>::from($version);
 			let $result = $setup_body;
 			$assertions_body
@@ -553,7 +554,7 @@ where
 	T: crate::Message + PartialEq,
 {
 	fn matches(&self, frame: &crate::Frame) -> bool {
-		if let Ok(decoded) = crate::decode::<T, _>(&frame.message) {
+		if let Ok(decoded) = crate::decode::<T>(&frame.message) {
 			decoded == *self
 		} else {
 			false
@@ -1016,7 +1017,6 @@ mod tests {
 			assert_eq!(metadata.id, b"test-id");
 			assert_eq!(metadata.order, 1696521600);
 			assert!(metadata.integrity.is_none());
-			assert!(metadata.confidentiality.is_none());
 			Ok(())
 		}
 	}
@@ -1055,7 +1055,7 @@ mod tests {
 			assert!(response.is_some());
 			let response_message = response.unwrap();
 			assert_eq!(response_message.metadata.id, accept_msg.clone().metadata.id);
-			assert_eq!(crate::decode::<TestMessage, _>(&response_message.message)?.content, "OK".to_string());
+			assert_eq!(crate::decode::<TestMessage>(&response_message.message)?.content, "OK".to_string());
 			assert_recv!(ok_rx, accept_msg, 1);
 			assert_recv!(rx, accept_msg, 1);
 			assert_channel_ne!(reject_rx, accept_msg);

@@ -1,4 +1,4 @@
-use crate::error::TightBeamError;
+use crate::{error::TightBeamError, MessageContent};
 
 #[cfg(feature = "compress")]
 use crate::{
@@ -161,10 +161,20 @@ pub fn encode<T: der::Encode>(value: &T) -> Result<Vec<u8>, TightBeamError> {
 	Ok(der::Encode::to_der(value)?)
 }
 
-/// Decode a value from DER format
+/// Decode a value from MessageContent
+/// This is used for decoding messages from frame content
 #[inline]
-pub fn decode<'a, T: der::Decode<'a>, B: AsRef<[u8]>>(bytes: &'a B) -> Result<T, TightBeamError> {
-	Ok(der::Decode::from_der(bytes.as_ref())?)
+pub fn decode<'a, T: der::Decode<'a>>(content: &'a MessageContent) -> Result<T, TightBeamError> {
+	match &content {
+		MessageContent::Plaintext(data) => Ok(der::Decode::from_der(data.as_slice())?),
+		MessageContent::Encrypted(_) => Err(TightBeamError::InvalidBody),
+	}
+}
+
+/// Decode a value from DER format bytes
+#[inline]
+pub fn decode_der<'a, T: der::Decode<'a>>(bytes: &'a [u8]) -> Result<T, TightBeamError> {
+	Ok(der::Decode::from_der(bytes)?)
 }
 
 /// Compress data using the specified algorithm.
@@ -217,7 +227,8 @@ mod tests {
 			assert!(!enc.is_empty());
 			assert_eq!(enc[0], 0x06);
 
-			let dec: ObjectIdentifier = decode(&enc)?;
+			let message = MessageContent::Plaintext(enc);
+			let dec: ObjectIdentifier = decode(&message)?;
 			assert_eq!(dec, oid);
 		}
 
@@ -225,8 +236,9 @@ mod tests {
 			let oct = OctetStringRef::new(data)?;
 			let enc = encode(&oct)?;
 			assert_eq!(enc[0], 0x04);
-
-			let dec: OctetStringRef<'_> = decode(&enc)?;
+			
+			let message = MessageContent::Plaintext(enc);
+			let dec: OctetStringRef<'_> = decode(&message)?;
 			assert_eq!(dec.as_bytes(), *data);
 		}
 

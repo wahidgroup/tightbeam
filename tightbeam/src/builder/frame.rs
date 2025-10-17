@@ -4,13 +4,14 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
+use crate::der::oid::{AssociatedOid, ObjectIdentifier};
+use crate::error::Result;
 use crate::error::{ExpectError, TightBeamError};
 use crate::matrix::{MatrixDyn, MatrixLike};
-use crate::Result;
-use crate::{Frame, Message, Version};
+use crate::{Frame, Message, MessageContent, Version};
 
 #[cfg(feature = "aead")]
-use crate::crypto::aead::Aead;
+use crate::crypto::aead::{Aead, Encryptor};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::SignatureEncoding;
 
@@ -20,8 +21,6 @@ use crate::compress::Compressor;
 use crate::crypto::sign::Signatory;
 #[cfg(feature = "digest")]
 use crate::helpers::Digestor;
-#[cfg(feature = "aead")]
-use crate::helpers::Encryptor;
 
 #[cfg(feature = "std")]
 use std::time::SystemTime;
@@ -35,7 +34,8 @@ pub struct FrameBuilder<T: Message> {
 	#[cfg(feature = "compress")]
 	compressor: Option<Box<dyn Compressor>>,
 	#[cfg(feature = "aead")]
-	encryptor: Option<Encryptor>,
+	#[allow(clippy::type_complexity)]
+	encryptor: Option<Box<dyn FnOnce(&[u8]) -> Result<crate::EncryptedContentInfo>>>,
 	rng: Option<Box<dyn rand_core::CryptoRngCore>>,
 	#[cfg(feature = "digest")]
 	witness: Option<Digestor>,
@@ -178,9 +178,18 @@ impl<T: Message> FrameBuilder<T> {
 	}
 
 	#[cfg(feature = "aead")]
-	pub fn with_cipher<C, Cipher>(mut self, cipher: &Cipher) -> Self
+	pub fn with_cipher<C, Cipher>(self, cipher: &Cipher) -> Self
 	where
-		C: crate::der::oid::AssociatedOid,
+		C: AssociatedOid,
+		Cipher: Aead + Clone + 'static,
+	{
+		self.with_cipher_and_content_type::<C, Cipher>(cipher, None)
+	}
+
+	#[cfg(feature = "aead")]
+	pub fn with_cipher_and_content_type<C, Cipher>(mut self, cipher: &Cipher, content_type: Option<ObjectIdentifier>) -> Self
+	where
+		C: AssociatedOid,
 		Cipher: Aead + Clone + 'static,
 	{
 		// Get the concrete RNG or default to OS RNG
@@ -189,32 +198,13 @@ impl<T: Message> FrameBuilder<T> {
 			None => &mut rand_core::OsRng,
 		};
 
-		// 96-bit nonce for AES-GCM
-		let nonce = crate::random::generate_nonce::<12>(Some(rng));
-		let nonce_bytes = match nonce {
-			Ok(nonce) => nonce.as_ref().to_vec(),
-			Err(err) => {
-				self.errors.push(err);
-				return self;
-			}
-		};
-
-		// Store encryption info in metadata
-		let encryption_info = match crate::EncryptionInfo::prepare::<C>(&nonce_bytes) {
-			Ok(encryption_info) => encryption_info,
-			Err(e) => {
-				self.errors.push(e);
-				return self;
-			}
-		};
-
-		self.metadata_builder = self.metadata_builder.with_confidentiality_info(encryption_info.clone());
-
+		// Generate nonce
+		let nonce = Cipher::generate_nonce(rng);
 		let cipher_cloned = cipher.clone();
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
-			let nonce_ref = aead::Nonce::<Cipher>::from_slice(&nonce_bytes);
-			let ct = cipher_cloned.encrypt(nonce_ref, plaintext).map_err(TightBeamError::from)?;
-			Ok((ct, encryption_info))
+			let encrypted_content =
+				<Cipher as Encryptor<C>>::encrypt_content(&cipher_cloned, plaintext, &nonce, content_type)?;
+			Ok(encrypted_content)
 		}));
 
 		self
@@ -339,17 +329,18 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 
 		// 3. Optional encryption
 		#[cfg(feature = "aead")]
-		let bytes = if let Some(enc) = self.encryptor {
-			let (cipher_text, _) = enc(&bytes)?;
-			cipher_text
+		let message = if let Some(enc) = self.encryptor {
+			MessageContent::Encrypted(enc(&bytes)?)
 		} else {
-			bytes
+			MessageContent::Plaintext(bytes)
 		};
 
-		// Final assembled body
-		let body = bytes;
+		#[cfg(not(feature = "aead"))]
+		let message = MessageContent::Plaintext(bytes);
+
+		// Final assembled frame
 		let metadata = metadata_builder.build()?;
-		let mut tbs = Frame { version, metadata, message: body, integrity: None, nonrepudiation: None };
+		let mut tbs = Frame { version, metadata, message, integrity: None, nonrepudiation: None };
 
 		// 4. Optional witness
 		#[cfg(feature = "digest")]
@@ -431,8 +422,6 @@ mod tests {
 				.build()
 		},
 		assertions: |result| {
-			use aes_gcm::Aes256Gcm;
-
 			let tightbeam  = result?;
 			assert_eq!(tightbeam.version, Version::V1);
 
@@ -443,7 +432,7 @@ mod tests {
 			// Decrypt and verify
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
-			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher, None)?;
+			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, None)?;
 			assert_eq!(decrypted, message);
 
 			Ok(())
@@ -480,8 +469,6 @@ mod tests {
 				.build()
 		},
 		assertions: |result| {
-			use aes_gcm::Aes256Gcm;
-
 			let tightbeam = result?;
 			assert_eq!(tightbeam.version, Version::V1);
 
@@ -492,7 +479,7 @@ mod tests {
 			// Decrypt (automatically decompresses) and verify
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
-			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher, Some(&ZstdCompression))?;
+			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression))?;
 			assert_eq!(decrypted, message);
 
 			Ok(())
@@ -542,7 +529,6 @@ mod tests {
 				.build()
 		},
 		assertions: |result| {
-			use aes_gcm::Aes256Gcm;
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let tightbeam = result?;
@@ -562,7 +548,7 @@ mod tests {
 			// Decrypt (automatically decompresses) and verify
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
-			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher, Some(&ZstdCompression))?;
+			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression))?;
 			assert_eq!(decrypted, message);
 
 			// Verify signature

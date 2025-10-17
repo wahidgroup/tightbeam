@@ -1,7 +1,7 @@
 // Re-exports
 pub use rand_core::{CryptoRngCore, OsRng, RngCore};
 
-use crate::Result;
+use crate::error::Result;
 
 /// Generate a cryptographically random nonce.
 ///

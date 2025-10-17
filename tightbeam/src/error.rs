@@ -8,7 +8,11 @@ use crate::Version;
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
-pub type CompressionResult<T> = Result<T, CompressionError>;
+/// A specialized Result type for TightBeam operations
+pub type Result<T> = core::result::Result<T, TightBeamError>;
+
+/// A specialized Result type for compression operations
+pub type CompressionResult<T> = core::result::Result<T, CompressionError>;
 
 /// Error indicating a mismatch between received and expected values
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

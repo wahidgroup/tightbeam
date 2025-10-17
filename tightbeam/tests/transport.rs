@@ -6,7 +6,7 @@ use tightbeam::prelude::*;
 use tightbeam::transport::policy::PolicyConf;
 
 tightbeam::mutex! {
-	CRYPTO_CHAINS: Vec<IntegrityInfo> = vec![],
+	CRYPTO_CHAINS: Vec<asn1::IntegrityInfo> = vec![],
 }
 
 tightbeam::rwlock! {

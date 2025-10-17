@@ -820,7 +820,7 @@ mod tests {
 			lotto_number: u32,
 		},
 		handle: |message, config| async move {
-			let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
+			let decoded: RequestMessage = crate::decode(&message.message).ok()?;
 			let is_winner = decoded.lucky_number == config.lotto_number;
 			if decoded.content == "PING" {
 				 Some(crate::compose! {
@@ -865,13 +865,13 @@ mod tests {
 			// Test winning case
 			let ping_message = generate_message(42, None)?;
 			let response = client.emit(ping_message, None).await?;
-			let response_message = crate::decode::<ResponseMessage, _>(&response.unwrap().message)?;
+			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
 			assert_eq!(response_message.result, "PONG");
 			assert!(response_message.is_winner);
 
 			let ping_message_loser = generate_message(99, None)?;
 			let response = client.emit(ping_message_loser, None).await?;
-			let response_message = crate::decode::<ResponseMessage, _>(&response.unwrap().message)?;
+			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
 			assert_eq!(response_message.result, "PONG");
 			assert!(!response_message.is_winner);
 
@@ -940,7 +940,7 @@ mod tests {
 				})
 			},
 			handle: |message, _config, workers| async move {
-				let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
+				let decoded: RequestMessage = crate::decode(&message.message).ok()?;
 				let (ping_result, lucky_result) = tokio::join!(
 					workers.ping_pong.relay(decoded.clone()),
 					workers.lucky_number.relay(decoded.clone())
@@ -992,7 +992,7 @@ mod tests {
 				// Test winning case
 				let ping_message = generate_message(42, None)?;
 				let response = client.emit(ping_message, None).await?;
-				let response_message = crate::decode::<ResponseMessage, _>(&response.unwrap().message)?;
+				let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
 				assert_eq!(response_message.result, "PONG");
 				assert!(response_message.is_winner);
 

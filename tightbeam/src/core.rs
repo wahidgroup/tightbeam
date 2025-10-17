@@ -1,18 +1,14 @@
 use crate::{Frame, Metadata, TightBeamError, Version};
+use crate::error::Result;
 
 #[cfg(feature = "compress")]
 use crate::compress::Inflator;
-#[cfg(feature = "aead")]
-use crate::crypto::aead::Aead;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{SignatureEncoding, Verifier};
 #[cfg(feature = "aead")]
-use crate::EncryptionInfo;
+use crate::EncryptedContentInfo;
 #[cfg(feature = "signature")]
 use crate::SignerInfo;
-
-/// A specialized Result type for TightBeam operations
-pub type Result<T> = core::result::Result<T, TightBeamError>;
 
 /// A marker trait for types that can be used as the body of a TightBeam
 /// message.
@@ -42,14 +38,6 @@ pub trait TightBeamLike:
 	+ Into<Version>
 {
 }
-
-crate::impl_from!(Frame, tb => Metadata: tb.metadata.clone());
-crate::impl_from!(Frame, tb => Version: tb.version);
-
-#[cfg(feature = "signature")]
-crate::impl_try_from!(Frame, tb => SignerInfo: nonrepudiation, TightBeamError::MissingSignature);
-#[cfg(feature = "aead")]
-crate::impl_try_from!(Frame, tb => EncryptionInfo: metadata.confidentiality, TightBeamError::MissingEncryptionInfo);
 
 impl Frame {
 	/// Verify the signature of the TightBeam message
@@ -106,20 +94,21 @@ impl Frame {
 	/// - Decryption fails
 	/// - Deserialization of the decrypted data fails
 	#[cfg(feature = "aead")]
-	pub fn decrypt<T, C>(&self, cipher: &C, inflator: Option<&dyn Inflator>) -> Result<T>
+	pub fn decrypt<T>(
+		&self,
+		decryptor: &impl crate::crypto::aead::Decryptor,
+		inflator: Option<&dyn Inflator>,
+	) -> Result<T>
 	where
 		T: Message,
-		C: Aead,
 	{
-		// Extract encryption info from metadata
-		let encryption_info = EncryptionInfo::try_from(self)?;
-		// The parameters field contains the nonce/IV for AEAD
-		let nonce = aead::Nonce::<C>::from_slice(&encryption_info.parameters);
-		// Decrypt the body
-		let plaintext = cipher.decrypt(nonce, self.message.as_slice())?;
+		// Extract encrypted content info from message
+		let encrypted_content_info = EncryptedContentInfo::try_from(self)?;
+		// Decrypt using the Decryptor trait
+		let plaintext = decryptor.decrypt_content(&encrypted_content_info)?;
 
 		// When compressed, decompress before decoding
-		let bytes = if self.metadata.compactness.is_some() {
+		let message_content = crate::MessageContent::Plaintext(if self.metadata.compactness.is_some() {
 			#[cfg(not(feature = "compress"))]
 			return Err(TightBeamError::MissingFeature("compress"));
 
@@ -131,21 +120,39 @@ impl Frame {
 			}
 		} else {
 			plaintext
-		};
+		});
 
 		// Decode the plaintext into type T
-		crate::decode::<T, _>(&bytes)
+		crate::decode::<T>(&message_content)
 	}
 }
 
 impl TightBeamLike for Frame {}
+
+crate::impl_from!(Frame, tb => Metadata: tb.metadata.clone());
+crate::impl_from!(Frame, tb => Version: tb.version);
+
+#[cfg(feature = "signature")]
+crate::impl_try_from!(Frame, tb => SignerInfo: nonrepudiation, TightBeamError::MissingSignature);
+
+#[cfg(feature = "aead")]
+impl TryFrom<&Frame> for EncryptedContentInfo {
+	type Error = TightBeamError;
+
+	fn try_from(frame: &Frame) -> core::result::Result<Self, Self::Error> {
+		match &frame.message {
+			crate::MessageContent::Encrypted(info) => Ok(info.clone()),
+			crate::MessageContent::Plaintext(_) => Err(TightBeamError::MissingEncryptionInfo),
+		}
+	}
+}
 
 #[cfg(test)]
 mod tests {
 	use crate::compose;
 	use crate::testing::create_test_cipher_key;
 	use crate::testing::{create_test_message, create_test_signing_key};
-	use crate::MessagePriority;
+	use crate::{MessageContent, MessagePriority};
 
 	use super::*;
 
@@ -183,7 +190,8 @@ mod tests {
 					assert!(!encoded.is_empty());
 
 					// Decode
-					let decoded = crate::decode(&encoded).unwrap();
+					let message_content = crate::MessageContent::Plaintext(encoded.clone());
+					let decoded = crate::decode(&message_content).unwrap();
 					assert_eq!(original, decoded);
 
 					// Verify it's valid DER (encode again and compare)
@@ -237,10 +245,10 @@ mod tests {
 	}
 
 	test_decode_failure! {
-		decode_invalid_der_should_fail: &[0xFF, 0xFF, 0xFF] => u32,
-		decode_empty_should_fail: &[] => u32,
-		decode_invalid_sequence: &[0x30, 0xFF] => SimpleMessage,
-		decode_wrong_type: &[0x02, 0x01, 0x2A] => SimpleMessage, // INTEGER instead of SEQUENCE
+		decode_invalid_der_should_fail: &MessageContent::Plaintext(vec![0xFF, 0xFF, 0xFF]) => u32,
+		decode_empty_should_fail: &MessageContent::Plaintext(vec![]) => u32,
+		decode_invalid_sequence: &MessageContent::Plaintext(vec![0x30, 0xFF]) => SimpleMessage,
+		decode_wrong_type: &MessageContent::Plaintext(vec![0x02, 0x01, 0x2A]) => SimpleMessage, // INTEGER instead of SEQUENCE
 	}
 
 	#[test]
@@ -250,7 +258,8 @@ mod tests {
 		let mut encoded = crate::encode(&original).unwrap();
 		encoded.truncate(5);
 
-		let result: Result<SimpleMessage> = crate::decode(&encoded);
+		let message_content = crate::MessageContent::Plaintext(encoded);
+		let result: Result<SimpleMessage> = crate::decode(&message_content);
 		assert!(result.is_err());
 	}
 
@@ -267,7 +276,8 @@ mod tests {
 					assert!(!encoded.is_empty());
 
 					// Decode
-					let decoded: Frame = crate::decode(&encoded).unwrap();
+					let message_content = crate::MessageContent::Plaintext(encoded.clone());
+					let decoded: Frame = crate::decode(&message_content).unwrap();
 
 					// Verify round-trip
 					assert_eq!(original, decoded);
@@ -453,7 +463,7 @@ mod tests {
 					priority: MessagePriority::High,
 					lifetime: 120
 			}.unwrap()
-		} => EncryptionInfo,
+		} => EncryptedContentInfo,
 	}
 
 	test_tightbeam_try_conversions! {
@@ -475,6 +485,6 @@ mod tests {
 					order: 6000,
 					message: message
 			}.unwrap()
-		} => EncryptionInfo,
+		} => EncryptedContentInfo,
 	}
 }

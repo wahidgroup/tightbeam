@@ -102,10 +102,12 @@ bitcoin = ["dep:k256"]
 hex = ["dep:hex-literal"]
 aead = [
 	"crypto",
+	"random",
 	"dep:aead",
 	"dep:ecdsa",
 	"dep:crypto-common",
 	"tightbeam-derive?/aead",
+	"aead/rand_core",
 ]
 signature = [
 	"crypto",
