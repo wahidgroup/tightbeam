@@ -4,6 +4,7 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 
 use crate::builder::error::{BuildError, MetadataError};
+use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::matrix::MatrixDyn;
 use crate::{Asn1Matrix, CompressedData, IntegrityInfo, MessagePriority, Metadata, Version};
 
@@ -14,6 +15,7 @@ pub struct MetadataBuilder {
 	order: Option<u64>,
 	integrity: Option<IntegrityInfo>,
 	compactness: Option<CompressedData>,
+	confidentiality: Option<EncryptedContentInfo>,
 	priority: Option<MessagePriority>,
 	lifetime: Option<u64>,
 	previous_frame: Option<IntegrityInfo>,
@@ -28,6 +30,7 @@ impl From<Version> for MetadataBuilder {
 			order: None,
 			integrity: None,
 			compactness: None,
+			confidentiality: None,
 			priority: None,
 			lifetime: None,
 			previous_frame: None,
@@ -60,6 +63,12 @@ impl MetadataBuilder {
 	/// Set the compression information
 	pub fn with_compactness_info(mut self, compression: CompressedData) -> Self {
 		self.compactness = Some(compression);
+		self
+	}
+
+	/// Set the encryption information
+	pub fn with_confidentiality_info(mut self, encryption: EncryptedContentInfo) -> Self {
+		self.confidentiality = Some(encryption);
 		self
 	}
 
@@ -99,6 +108,7 @@ impl MetadataBuilder {
 			order,
 			integrity,
 			compactness,
+			confidentiality,
 			priority,
 			lifetime,
 			previous_frame,
@@ -119,6 +129,7 @@ impl MetadataBuilder {
 				order,
 				compactness,
 				integrity: None,
+				confidentiality: None,
 				priority: None,
 				lifetime: None,
 				previous_frame: None,
@@ -128,15 +139,24 @@ impl MetadataBuilder {
 				id,
 				order,
 				compactness,
+				confidentiality,
 				integrity,
 				priority: None,
 				lifetime: None,
 				previous_frame: None,
 				matrix: None,
 			}),
-			Version::V2 => {
-				Ok(Metadata { id, order, compactness, integrity, priority, lifetime, previous_frame, matrix })
-			}
+			Version::V2 => Ok(Metadata {
+				id,
+				order,
+				compactness,
+				integrity,
+				confidentiality,
+				priority,
+				lifetime,
+				previous_frame,
+				matrix,
+			}),
 		}
 	}
 

@@ -7,9 +7,9 @@ pub use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::der::{Decode, Encode};
 use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
-use crate::matrix::MatrixError;
-use crate::{AlgorithmIdentifier, Asn1Matrix, MessageContent};
 use crate::error::Result;
+use crate::matrix::MatrixError;
+use crate::{AlgorithmIdentifier, Asn1Matrix};
 
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::der::oid::AssociatedOid;
@@ -17,43 +17,11 @@ use crate::der::oid::AssociatedOid;
 use crate::IntegrityInfo;
 #[cfg(feature = "signature")]
 use crate::SignerInfo;
-#[cfg(feature = "aead")]
-use crate::crypto::aead::Decryptor;
 
 #[cfg(feature = "signature")]
 pub type SignatureVerifier = Box<dyn FnOnce(&[u8], &SignerInfo) -> Result<()>>;
 #[cfg(feature = "digest")]
 pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::IntegrityInfo>>;
-
-impl MessageContent {
-	pub fn is_plaintext(&self) -> bool {
-		matches!(self, Self::Plaintext(_))
-	}
-
-	pub fn is_encrypted(&self) -> bool {
-		matches!(self, Self::Encrypted(_))
-	}
-
-	#[cfg(feature = "aead")]
-	pub fn decrypt(&self, decryptor: &impl Decryptor) -> Result<Vec<u8>> {
-		match self {
-			Self::Plaintext(data) => Ok(data.clone()),
-			Self::Encrypted(info) => decryptor.decrypt_content(info),
-		}
-	}
-}
-
-impl From<&MessageContent> for Vec<u8> {
-	fn from(value: &MessageContent) -> Self {
-		match &value {
-			MessageContent::Plaintext(data) => data.clone(),
-			MessageContent::Encrypted(info) => {
-				// Encode the EncryptedContentInfo to DER bytes
-				crate::encode(info).unwrap_or_default()
-			}
-		}
-	}
-}
 
 #[cfg(feature = "digest")]
 impl IntegrityInfo {

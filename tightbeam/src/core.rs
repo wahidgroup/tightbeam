@@ -1,5 +1,5 @@
-use crate::{Frame, Metadata, TightBeamError, Version};
 use crate::error::Result;
+use crate::{Frame, Metadata, TightBeamError, Version};
 
 #[cfg(feature = "compress")]
 use crate::compress::Inflator;
@@ -102,27 +102,34 @@ impl Frame {
 	where
 		T: Message,
 	{
-		// Extract encrypted content info from message
-		let encrypted_content_info = EncryptedContentInfo::try_from(self)?;
+		// Extract encrypted content info from metadata and reconstruct with message bytes
+		let mut encrypted_content_info = self
+			.metadata
+			.confidentiality
+			.clone()
+			.ok_or(TightBeamError::MissingEncryptionInfo)?;
+
+		// The encrypted content is stored in the message field
+		encrypted_content_info.encrypted_content = Some(self.message.clone());
+
 		// Decrypt using the Decryptor trait
 		let plaintext = decryptor.decrypt_content(&encrypted_content_info)?;
-
 		// When compressed, decompress before decoding
-		let message_content = crate::MessageContent::Plaintext(if self.metadata.compactness.is_some() {
+		let decompressed = if self.metadata.compactness.is_some() {
 			#[cfg(not(feature = "compress"))]
 			return Err(TightBeamError::MissingFeature("compress"));
 
 			#[cfg(feature = "compress")]
 			{
 				let inflator = inflator.ok_or(TightBeamError::MissingInflator)?;
-
 				inflator.decompress(&plaintext)?
 			}
 		} else {
 			plaintext
-		});
+		};
 
 		// Decode the plaintext into type T
+		let message_content = decompressed;
 		crate::decode::<T>(&message_content)
 	}
 }
@@ -140,28 +147,29 @@ impl TryFrom<&Frame> for EncryptedContentInfo {
 	type Error = TightBeamError;
 
 	fn try_from(frame: &Frame) -> core::result::Result<Self, Self::Error> {
-		match &frame.message {
-			crate::MessageContent::Encrypted(info) => Ok(info.clone()),
-			crate::MessageContent::Plaintext(_) => Err(TightBeamError::MissingEncryptionInfo),
-		}
+		frame
+			.metadata
+			.confidentiality
+			.clone()
+			.ok_or(TightBeamError::MissingEncryptionInfo)
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use crate::compose;
-	use crate::testing::create_test_cipher_key;
-	use crate::testing::{create_test_message, create_test_signing_key};
-	use crate::{MessageContent, MessagePriority};
-
-	use super::*;
-
 	#[cfg(not(feature = "std"))]
 	use alloc::{
 		string::{String, ToString},
 		vec,
 		vec::Vec,
 	};
+
+	use crate::compose;
+	use crate::testing::create_test_cipher_key;
+	use crate::testing::{create_test_message, create_test_signing_key};
+	use crate::MessagePriority;
+
+	use super::*;
 
 	// Test data structures
 	#[derive(Clone, Debug, PartialEq, der::Sequence)]
@@ -190,8 +198,7 @@ mod tests {
 					assert!(!encoded.is_empty());
 
 					// Decode
-					let message_content = crate::MessageContent::Plaintext(encoded.clone());
-					let decoded = crate::decode(&message_content).unwrap();
+					let decoded = crate::decode(&encoded).unwrap();
 					assert_eq!(original, decoded);
 
 					// Verify it's valid DER (encode again and compare)
@@ -245,22 +252,23 @@ mod tests {
 	}
 
 	test_decode_failure! {
-		decode_invalid_der_should_fail: &MessageContent::Plaintext(vec![0xFF, 0xFF, 0xFF]) => u32,
-		decode_empty_should_fail: &MessageContent::Plaintext(vec![]) => u32,
-		decode_invalid_sequence: &MessageContent::Plaintext(vec![0x30, 0xFF]) => SimpleMessage,
-		decode_wrong_type: &MessageContent::Plaintext(vec![0x02, 0x01, 0x2A]) => SimpleMessage, // INTEGER instead of SEQUENCE
+		decode_invalid_der_should_fail: &vec![0xFF, 0xFF, 0xFF] => u32,
+		decode_empty_should_fail: &vec![] => u32,
+		decode_invalid_sequence: &vec![0x30, 0xFF] => SimpleMessage,
+		decode_wrong_type: &vec![0x02, 0x01, 0x2A] => SimpleMessage, // INTEGER instead of SEQUENCE
 	}
 
 	#[test]
-	fn decode_truncated_should_fail() {
+	fn decode_truncated_should_fail() -> Result<()> {
 		// Create a valid encoding then truncate it
 		let original = SimpleMessage { id: 100, name: "test".to_string() };
 		let mut encoded = crate::encode(&original).unwrap();
 		encoded.truncate(5);
 
-		let message_content = crate::MessageContent::Plaintext(encoded);
-		let result: Result<SimpleMessage> = crate::decode(&message_content);
+		let result: Result<SimpleMessage> = crate::decode(&encoded);
 		assert!(result.is_err());
+
+		Ok(())
 	}
 
 	/// Macro to generate TightBeam encode/decode round-trip tests
@@ -268,7 +276,7 @@ mod tests {
 		($($name:ident: $tightbeam:expr,)*) => {
 			$(
 				#[test]
-				fn $name() {
+				fn $name() -> Result<()> {
 					let original = $tightbeam;
 
 					// Encode
@@ -276,15 +284,15 @@ mod tests {
 					assert!(!encoded.is_empty());
 
 					// Decode
-					let message_content = crate::MessageContent::Plaintext(encoded.clone());
-					let decoded: Frame = crate::decode(&message_content).unwrap();
-
+					let decoded: Frame = crate::decode(&encoded).unwrap();
 					// Verify round-trip
 					assert_eq!(original, decoded);
 
 					// Verify it's valid DER (encode again and compare)
 					let re_encoded = crate::encode(&decoded).unwrap();
 					assert_eq!(encoded, re_encoded);
+
+					Ok(())
 				}
 			)*
 		};

@@ -3,8 +3,6 @@ pub use aead::*;
 #[cfg(feature = "aes-gcm")]
 pub use aes_gcm::{Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmNonce};
 
-use der::Decode;
-
 #[cfg(feature = "aes-gcm")]
 use der::oid::{AssociatedOid, ObjectIdentifier};
 
@@ -79,14 +77,14 @@ where
 			.as_bytes();
 
 		// Extract nonce from algorithm parameters
-		let nonce_bytes = info
+		let nonce_any = info
 			.content_enc_alg
 			.parameters
 			.as_ref()
 			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?;
 
-		// Decode the nonce from the Any type
-		let nonce_octet_string = crate::der::asn1::OctetString::from_der(nonce_bytes.value())?;
+		// Decode the nonce from the Any type - use decode_as to get the OctetString
+		let nonce_octet_string: crate::der::asn1::OctetString = nonce_any.decode_as()?;
 		let nonce_ref = aead::Nonce::<A>::from_slice(nonce_octet_string.as_bytes());
 
 		// Decrypt

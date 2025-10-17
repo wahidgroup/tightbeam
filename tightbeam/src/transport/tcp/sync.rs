@@ -73,7 +73,7 @@ where
 		let buffer = Self::reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
 
 		// Decode from raw DER bytes
-		let envelope: TransportEnvelope = crate::utils::decode_der(&buffer)?;
+		let envelope: TransportEnvelope = crate::utils::decode(&buffer)?;
 		Ok(envelope)
 	}
 

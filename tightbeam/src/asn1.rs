@@ -3,12 +3,15 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
+use crate::der::asn1::OctetString;
 use crate::der::oid::ObjectIdentifier;
-use crate::der::{Enumerated, Sequence, Choice};
+use crate::der::{Enumerated, Sequence};
 
+// Re-exports
 pub use crate::cms::compressed_data::CompressedData;
-pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
+pub use crate::cms::content_info::ContentInfo;
 pub use crate::cms::enveloped_data::EncryptedContentInfo;
+pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
@@ -196,6 +199,9 @@ pub struct Metadata {
 	// V1+ fields
 	#[asn1(context_specific = "0", optional = "true")]
 	pub integrity: Option<IntegrityInfo>,
+	#[asn1(context_specific = "1", optional = "true")]
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub confidentiality: Option<EncryptedContentInfo>,
 
 	// V2+ fields
 	#[asn1(context_specific = "2", optional = "true")]
@@ -207,23 +213,6 @@ pub struct Metadata {
 	pub previous_frame: Option<IntegrityInfo>,
 	#[asn1(context_specific = "5", optional = "true")]
 	pub matrix: Option<Asn1Matrix>,
-}
-
-/// Message content - either plaintext or encrypted
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// MessageContent ::= CHOICE {
-///     plaintext   OCTET STRING,
-///     encrypted   EncryptedContentInfo
-/// }
-/// ```
-#[derive(Choice, Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
-pub enum MessageContent {
-    Plaintext(Vec<u8>),
-	#[zeroize(skip)] // EncryptedContentInfo does not implement Zeroize
-    Encrypted(EncryptedContentInfo),
 }
 
 /// Core TightBeam message structure
@@ -246,7 +235,8 @@ pub struct Frame {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub version: Version,
 	pub metadata: Metadata,
-	pub message: MessageContent,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub message: OctetString,
 	#[asn1(context_specific = "0", optional = "true")]
 	pub integrity: Option<IntegrityInfo>,
 	#[asn1(context_specific = "1", optional = "true")]

@@ -8,7 +8,7 @@ use crate::der::oid::{AssociatedOid, ObjectIdentifier};
 use crate::error::Result;
 use crate::error::{ExpectError, TightBeamError};
 use crate::matrix::{MatrixDyn, MatrixLike};
-use crate::{Frame, Message, MessageContent, Version};
+use crate::{Frame, Message, Version};
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::{Aead, Encryptor};
@@ -29,6 +29,7 @@ use std::time::SystemTime;
 pub struct FrameBuilder<T: Message> {
 	version: Version,
 	message: Option<T>,
+	message_oid: Option<ObjectIdentifier>,
 	metadata_builder: MetadataBuilder,
 	errors: Vec<TightBeamError>,
 	#[cfg(feature = "compress")]
@@ -49,6 +50,7 @@ impl<T: Message> From<Version> for FrameBuilder<T> {
 		Self {
 			version,
 			message: None,
+			message_oid: None,
 			metadata_builder: MetadataBuilder::from(version),
 			errors: Vec::new(),
 			#[cfg(feature = "compress")]
@@ -68,6 +70,11 @@ impl<T: Message> FrameBuilder<T> {
 	/// Set the message ID
 	pub fn with_id(mut self, id: impl AsRef<[u8]>) -> Self {
 		self.metadata_builder = self.metadata_builder.with_id(id);
+		self
+	}
+
+	pub fn with_content_oid(mut self, oid: ObjectIdentifier) -> Self {
+		self.message_oid = Some(oid);
 		self
 	}
 
@@ -178,16 +185,7 @@ impl<T: Message> FrameBuilder<T> {
 	}
 
 	#[cfg(feature = "aead")]
-	pub fn with_cipher<C, Cipher>(self, cipher: &Cipher) -> Self
-	where
-		C: AssociatedOid,
-		Cipher: Aead + Clone + 'static,
-	{
-		self.with_cipher_and_content_type::<C, Cipher>(cipher, None)
-	}
-
-	#[cfg(feature = "aead")]
-	pub fn with_cipher_and_content_type<C, Cipher>(mut self, cipher: &Cipher, content_type: Option<ObjectIdentifier>) -> Self
+	pub fn with_cipher<C, Cipher>(mut self, cipher: &Cipher) -> Self
 	where
 		C: AssociatedOid,
 		Cipher: Aead + Clone + 'static,
@@ -201,9 +199,10 @@ impl<T: Message> FrameBuilder<T> {
 		// Generate nonce
 		let nonce = Cipher::generate_nonce(rng);
 		let cipher_cloned = cipher.clone();
+		let message_oid = self.message_oid;
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
 			let encrypted_content =
-				<Cipher as Encryptor<C>>::encrypt_content(&cipher_cloned, plaintext, &nonce, content_type)?;
+				<Cipher as Encryptor<C>>::encrypt_content(&cipher_cloned, plaintext, &nonce, message_oid)?;
 			Ok(encrypted_content)
 		}));
 
@@ -330,13 +329,23 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 		// 3. Optional encryption
 		#[cfg(feature = "aead")]
 		let message = if let Some(enc) = self.encryptor {
-			MessageContent::Encrypted(enc(&bytes)?)
+			// Take the encrypted content bytes out
+			let mut encrypted_content = enc(&bytes)?;
+			let encrypted_bytes = encrypted_content
+				.encrypted_content
+				.take()
+				.ok_or(TightBeamError::MissingEncryptionInfo)?;
+
+			// Update metadata with encryption info without data
+			metadata_builder = metadata_builder.with_confidentiality_info(encrypted_content);
+
+			encrypted_bytes
 		} else {
-			MessageContent::Plaintext(bytes)
+			crate::der::asn1::OctetString::new(bytes)?
 		};
 
 		#[cfg(not(feature = "aead"))]
-		let message = MessageContent::Plaintext(bytes);
+		let message = crate::der::asn1::OctetString::new(bytes)?;
 
 		// Final assembled frame
 		let metadata = metadata_builder.build()?;
@@ -424,6 +433,9 @@ mod tests {
 		assertions: |result| {
 			let tightbeam  = result?;
 			assert_eq!(tightbeam.version, Version::V1);
+			assert!(tightbeam.metadata.confidentiality.is_some());
+			assert!(tightbeam.metadata.integrity.is_some());
+			assert!(tightbeam.nonrepudiation.is_some());
 
 			// Body should be encrypted (not directly decodable)
 			let decode_result: Result<TestMessage> = crate::decode(&tightbeam.message);
@@ -471,6 +483,8 @@ mod tests {
 		assertions: |result| {
 			let tightbeam = result?;
 			assert_eq!(tightbeam.version, Version::V1);
+			assert!(tightbeam.metadata.compactness.is_some());
+			assert!(tightbeam.metadata.confidentiality.is_some());
 
 			// Body should be encrypted+compressed (not directly decodable)
 			let decode_result: Result<TestMessage> = crate::decode(&tightbeam.message);
@@ -536,6 +550,8 @@ mod tests {
 			assert_eq!(tightbeam.metadata.id, b"test_v2_full");
 			assert_eq!(tightbeam.metadata.priority, Some(crate::MessagePriority::High));
 			assert_eq!(tightbeam.metadata.lifetime, Some(3600));
+			assert!(tightbeam.metadata.confidentiality.is_some());
+			assert!(tightbeam.metadata.compactness.is_some());
 			assert!(tightbeam.metadata.previous_frame.is_some());
 			assert!(tightbeam.metadata.matrix.is_some());
 			assert!(tightbeam.integrity.is_some());

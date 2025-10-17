@@ -154,7 +154,7 @@ where
 		stream.read_exact(&mut content).await?;
 
 		let buffer = Self::reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content);
-		let envelope = crate::utils::decode_der(&buffer)?;
+		let envelope = crate::utils::decode(&buffer)?;
 		Ok(envelope)
 	}
 
