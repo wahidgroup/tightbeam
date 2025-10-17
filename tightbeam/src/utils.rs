@@ -1,11 +1,11 @@
 use crate::error::TightBeamError;
 
 #[cfg(feature = "compress")]
-use crate::error::CompressionError;
-#[cfg(feature = "compress")]
-use crate::helpers::{Compressor, Inflator};
-#[cfg(feature = "compress")]
-use crate::CompressedData;
+use crate::{
+	compress::{Compressor, Inflator},
+	error::CompressionError,
+	CompressedData,
+};
 
 /// Macro to implement From trait for both reference and owned types
 ///
@@ -236,7 +236,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "compress")]
 	fn test_compress_decompress() -> Result<(), CompressionError> {
-		use crate::helpers::ZstdCompression;
+		use crate::compress::ZstdCompression;
 
 		// Data-driven cases
 		let patterned = (0u32..2048).map(|i| (i % 251) as u8).collect::<Vec<u8>>();

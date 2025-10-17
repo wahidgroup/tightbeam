@@ -118,7 +118,7 @@ x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
 
 ## Security features
 random = ["dep:rand_core"]
-zeroize = ["dep:zeroize", "der/zeroize", "aes-gcm?/zeroize"]
+zeroize = ["dep:zeroize", "der/zeroize", "cms/zeroize", "aes-gcm?/zeroize"]
 
 ## Cryptographic algorithm features
 aes-gcm = ["crypto", "aead", "dep:aes-gcm"]

@@ -1,15 +1,15 @@
 use crate::{Frame, Metadata, TightBeamError, Version};
 
+#[cfg(feature = "compress")]
+use crate::compress::Inflator;
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{SignatureEncoding, Verifier};
-#[cfg(feature = "compress")]
-use crate::helpers::Inflator;
 #[cfg(feature = "aead")]
 use crate::EncryptionInfo;
 #[cfg(feature = "signature")]
-use crate::SignatureInfo;
+use crate::SignerInfo;
 
 /// A specialized Result type for TightBeam operations
 pub type Result<T> = core::result::Result<T, TightBeamError>;
@@ -47,7 +47,7 @@ crate::impl_from!(Frame, tb => Metadata: tb.metadata.clone());
 crate::impl_from!(Frame, tb => Version: tb.version);
 
 #[cfg(feature = "signature")]
-crate::impl_try_from!(Frame, tb => SignatureInfo: nonrepudiation, TightBeamError::MissingSignature);
+crate::impl_try_from!(Frame, tb => SignerInfo: nonrepudiation, TightBeamError::MissingSignature);
 #[cfg(feature = "aead")]
 crate::impl_try_from!(Frame, tb => EncryptionInfo: metadata.confidentiality, TightBeamError::MissingEncryptionInfo);
 
@@ -71,25 +71,23 @@ impl Frame {
 	where
 		S: SignatureEncoding,
 	{
-		// Extract signature info from the TightBeam
+		// Extract signature info from the Frame
 		let signature_info = self.nonrepudiation.as_ref().ok_or(TightBeamError::MissingSignature)?;
-		// Decode the signature from the signature info
-		let signature = S::try_from(&signature_info.signature).map_err(|_| TightBeamError::SignatureEncodingError)?;
+		let signature_bytes: &[u8] = signature_info.signature.as_bytes();
 
-		// Create the TBS version
-		let unsigned = Frame {
-			version: self.version,
-			metadata: self.metadata.clone(),
-			message: self.message.clone(),
-			integrity: self.integrity.clone(),
-			nonrepudiation: None,
-		};
+		// Decode the signature
+		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;
 
-		// Encode the unsigned message
-		let unsigned_bytes = crate::encode(&unsigned)?;
+		// Recreate TBS (to-be-signed) structure
+		let mut tbs = self.clone();
+		tbs.nonrepudiation = None;
 
-		// Verify the signature
-		verifier.verify(&unsigned_bytes, &signature)?;
+		// Encode TBS to DER
+		let tbs_der = crate::encode(&tbs)?;
+
+		// Verify signature
+		verifier.verify(&tbs_der, &signature)?;
+
 		Ok(())
 	}
 
@@ -303,7 +301,7 @@ mod tests {
 		},
 		tightbeam_v1_encrypted: {
 			use crate::crypto::aead::Aes256GcmOid;
-			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
+			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
@@ -314,12 +312,12 @@ mod tests {
 					order: 1696521800,
 					message: message,
 					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key
+					nonrepudiation<Secp256k1Signature, _>: &signing_key
 			}.unwrap()
 		},
 		tightbeam_v2_full: {
 			use crate::crypto::aead::Aes256GcmOid;
-			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
+			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
 			let message = create_test_message(None);
@@ -331,7 +329,7 @@ mod tests {
 					order: 1696521900,
 					message: message,
 					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key,
+					nonrepudiation<Secp256k1Signature, _>: &signing_key,
 					message_integrity: type Sha3_256,
 					priority: MessagePriority::Bulk,
 					lifetime: 3600
@@ -372,7 +370,7 @@ mod tests {
 		} => Metadata,
 		tightbeam_to_protocol_version: {
 			use crate::crypto::aead::Aes256GcmOid;
-			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
+			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
 			let message = create_test_message(None);
@@ -385,7 +383,7 @@ mod tests {
 					order: 2000,
 					message: message,
 					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key,
+					nonrepudiation<Secp256k1Signature, _>: &signing_key,
 					message_integrity: type Sha3_256,
 					priority: MessagePriority::Top,
 					lifetime: 60
@@ -421,7 +419,7 @@ mod tests {
 		success:
 		tightbeam_v1_to_signature_info: {
 			use crate::crypto::aead::Aes256GcmOid;
-			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
+			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
@@ -432,12 +430,12 @@ mod tests {
 					order: 3000,
 					message: message,
 					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key
+					nonrepudiation<Secp256k1Signature, _>: &signing_key
 			}.unwrap()
-		} => SignatureInfo,
+		} => SignerInfo,
 		tightbeam_v2_to_encryption_info: {
 			use crate::crypto::aead::Aes256GcmOid;
-			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
+			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::crypto::hash::Sha3_256;
 
 			let message = create_test_message(None);
@@ -450,7 +448,7 @@ mod tests {
 					order: 4000,
 					message: message,
 					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key,
+					nonrepudiation<Secp256k1Signature, _>: &signing_key,
 					message_integrity: type Sha3_256,
 					priority: MessagePriority::High,
 					lifetime: 120
@@ -468,7 +466,7 @@ mod tests {
 					order: 5000,
 					message: message
 			}.unwrap()
-		} => SignatureInfo,
+		} => SignerInfo,
 		tightbeam_v0_to_encryption_info_fails: {
 			let message = create_test_message(None);
 			compose! {

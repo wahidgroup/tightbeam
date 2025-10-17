@@ -296,9 +296,9 @@ impl TryFrom<Option<Asn1Matrix>> for MatrixDyn {
 mod tests {
 	use super::*;
 
+	#[cfg(feature = "std")]
 	crate::test_case! {
 		name: test_matrixlike_reality_end_to_end,
-		features: ["std"],
 		setup: || {
 			// Build a 3×3 from row-major bytes 0..9
 			let bytes: Vec<u8> = (0u8..9u8).collect();
@@ -368,9 +368,9 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "std")]
 	crate::test_case! {
 		name: test_matrix_specification_compliance,
-		features: ["std"],
 		setup: || {
 			// Test data for various matrix sizes
 			let test_matrices = vec![

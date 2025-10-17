@@ -1195,8 +1195,7 @@ macro_rules! drone {
 mod tests {
 	use super::*;
 
-	use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1SigningKey};
-	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::der::Sequence;
 	use crate::policy::GatePolicy;
 	use crate::policy::TransitStatus;
@@ -1263,7 +1262,7 @@ mod tests {
 						servlet_id: servlet_id.to_vec(),
 						config,
 					},
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key
+					nonrepudiation<Secp256k1Signature, _>: signing_key
 			}
 		}
 	}

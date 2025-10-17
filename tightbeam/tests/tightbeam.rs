@@ -154,7 +154,7 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 			message: message.clone(),
 			message_integrity: type crypto::hash::Sha3_256,
 			confidentiality<crypto::aead::Aes256GcmOid, _>: &cipher,
-			nonrepudiation<crypto::sign::ecdsa::Secp256k1, crypto::sign::ecdsa::Secp256k1Signature, _>: &signing_key,
+			nonrepudiation<crypto::sign::ecdsa::Secp256k1Signature, _>: &signing_key,
 			priority: priority,
 			lifetime: ttl,
 			previous_frame: previous.clone(),

@@ -112,6 +112,8 @@ pub mod utils;
 pub mod builder;
 #[cfg(feature = "colony")]
 pub mod colony;
+#[cfg(feature = "compress")]
+pub mod compress;
 #[cfg(feature = "constants")]
 pub mod constants;
 #[cfg(feature = "crypto")]

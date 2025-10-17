@@ -40,7 +40,7 @@ pub use crate::EncryptionInfo;
 #[cfg(feature = "digest")]
 pub use crate::IntegrityInfo;
 #[cfg(feature = "signature")]
-pub use crate::SignatureInfo;
+pub use crate::SignerInfo;
 
 #[cfg(feature = "policy")]
 pub mod policy {
@@ -78,15 +78,6 @@ pub mod tb {
 pub mod emit {
 	#[cfg(feature = "builder")]
 	pub use crate::builder::FrameBuilder;
-
-	#[cfg(feature = "digest")]
-	pub use crate::IntegrityInfo;
-
-	#[cfg(feature = "aead")]
-	pub use crate::EncryptionInfo;
-
-	#[cfg(feature = "signature")]
-	pub use crate::SignatureInfo;
 }
 
 /// Message collection and processing

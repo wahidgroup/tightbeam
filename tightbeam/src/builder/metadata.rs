@@ -6,7 +6,7 @@ use alloc::{string::String, vec::Vec};
 use crate::builder::error::{BuildError, MetadataError};
 use crate::matrix::MatrixDyn;
 use crate::{
-	Asn1Matrix, CompressedData, EncryptionInfo, IntegrityInfo, MessagePriority, Metadata, SignatureInfo, Version,
+	Asn1Matrix, CompressedData, EncryptionInfo, IntegrityInfo, MessagePriority, Metadata, SignerInfo, Version,
 };
 
 /// A fluent builder for TightBeam metadata.
@@ -16,7 +16,7 @@ pub struct MetadataBuilder {
 	order: Option<u64>,
 	integrity: Option<IntegrityInfo>,
 	confidentiality: Option<EncryptionInfo>,
-	nonrepudiation: Option<SignatureInfo>,
+	nonrepudiation: Option<SignerInfo>,
 	compactness: Option<CompressedData>,
 	priority: Option<MessagePriority>,
 	lifetime: Option<u64>,
@@ -70,7 +70,7 @@ impl MetadataBuilder {
 	}
 
 	/// Set the signature information
-	pub fn with_nonrepudiation_info(mut self, signature: SignatureInfo) -> Self {
+	pub fn with_nonrepudiation_info(mut self, signature: SignerInfo) -> Self {
 		self.nonrepudiation = Some(signature);
 		self
 	}
@@ -224,7 +224,7 @@ impl MetadataBuilder {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::{create_test_encryption_info, create_test_hash_info, create_test_signature_info};
+	use crate::testing::{create_test_encryption_info, create_test_hash_info, create_test_signer_info};
 
 	macro_rules! test_metadata_builder {
 		($test_name:ident, $version:expr, $builder:expr) => {
@@ -276,7 +276,7 @@ mod tests {
 			.with_order(1696521600u64)
 			.with_integrity_info(create_test_hash_info())
 			.with_confidentiality_info(create_test_encryption_info())
-			.with_nonrepudiation_info(create_test_signature_info())
+			.with_nonrepudiation_info(create_test_signer_info())
 	);
 
 	test_metadata_builder!(
@@ -287,7 +287,7 @@ mod tests {
 			.with_order(1696521600u64)
 			.with_integrity_info(create_test_hash_info())
 			.with_confidentiality_info(create_test_encryption_info())
-			.with_nonrepudiation_info(create_test_signature_info())
+			.with_nonrepudiation_info(create_test_signer_info())
 			.with_priority(MessagePriority::High)
 			.with_lifetime(3600)
 	);

@@ -12,16 +12,16 @@ use crate::{Frame, Message, Version};
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
 #[cfg(feature = "signature")]
-use crate::crypto::sign::{SignatureEncoding, Signer};
+use crate::crypto::sign::SignatureEncoding;
 
+#[cfg(feature = "compress")]
+use crate::compress::Compressor;
+#[cfg(feature = "signature")]
+use crate::crypto::sign::Signatory;
 #[cfg(feature = "digest")]
 use crate::helpers::Digestor;
 #[cfg(feature = "aead")]
 use crate::helpers::Encryptor;
-#[cfg(feature = "signature")]
-use crate::helpers::Signatory;
-#[cfg(feature = "compress")]
-use crate::{cms::signed_data::EncapsulatedContentInfo, helpers::Compressor};
 
 #[cfg(feature = "std")]
 use std::time::SystemTime;
@@ -33,14 +33,15 @@ pub struct FrameBuilder<T: Message> {
 	metadata_builder: MetadataBuilder,
 	errors: Vec<TightBeamError>,
 	#[cfg(feature = "compress")]
-	compressor: Option<(Box<dyn Compressor>, Option<EncapsulatedContentInfo>)>,
+	compressor: Option<Box<dyn Compressor>>,
 	#[cfg(feature = "aead")]
 	encryptor: Option<Encryptor>,
 	rng: Option<Box<dyn rand_core::CryptoRngCore>>,
 	#[cfg(feature = "digest")]
 	witness: Option<Digestor>,
 	#[cfg(feature = "signature")]
-	signer: Option<Signatory>,
+	#[allow(clippy::type_complexity)]
+	signer: Option<Box<dyn FnOnce(&[u8]) -> Result<crate::SignerInfo>>>,
 }
 
 impl<T: Message> From<Version> for FrameBuilder<T> {
@@ -84,12 +85,8 @@ impl<T: Message> FrameBuilder<T> {
 
 	/// Set the compression algorithm (all versions)
 	#[cfg(feature = "compress")]
-	pub fn with_compression(
-		mut self,
-		compressor: impl Compressor + 'static,
-		content_info: Option<EncapsulatedContentInfo>,
-	) -> Self {
-		self.compressor = Some((Box::new(compressor), content_info));
+	pub fn with_compression(mut self, compressor: impl Compressor + 'static) -> Self {
+		self.compressor = Some(Box::new(compressor));
 		self
 	}
 
@@ -229,14 +226,13 @@ impl<T: Message> FrameBuilder<T> {
 	/// message structure. This method captures the signer and signing
 	/// algorithm to be used later.
 	#[cfg(feature = "signature")]
-	pub fn with_signer<C, S, X>(mut self, signer: &X) -> Self
+	pub fn with_signer<S, X>(mut self, signer: &X) -> Self
 	where
-		C: crate::der::oid::AssociatedOid,
 		S: SignatureEncoding,
-		X: Signer<S> + Clone + 'static,
+		X: Signatory<S> + Clone + 'static,
 	{
 		let signer = signer.clone();
-		self.signer = Some(Box::new(move |data: &[u8]| crate::SignatureInfo::sign::<C, S>(&signer, data)));
+		self.signer = Some(Box::new(move |data: &[u8]| signer.to_signer_info(data)));
 		self
 	}
 
@@ -330,8 +326,8 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 
 		// 2. Optional compression
 		#[cfg(feature = "compress")]
-		let bytes = if let Some((compressor, content_info)) = self.compressor {
-			let (compressed, compression_info) = compressor.compress(&bytes, content_info)?;
+		let bytes = if let Some(compressor) = self.compressor {
+			let (compressed, compression_info) = compressor.compress(&bytes, None)?;
 
 			// Update metadata with compression info
 			metadata_builder = metadata_builder.with_compactness_info(compression_info);
@@ -387,15 +383,15 @@ mod tests {
 	use sha3::Sha3_256;
 
 	use super::*;
-	use crate::helpers::ZstdCompression;
+	use crate::compress::ZstdCompression;
 	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
 	use crate::{compose, test_builder, test_case};
 
+	#[cfg(feature = "sha3")]
 	test_builder! {
 		name: test_v0_basic,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V0,
-		features: ["sha3"],
 		setup: |builder| {
 			builder
 				.with_message(create_test_message(None))
@@ -412,14 +408,14 @@ mod tests {
 		}
 	}
 
+	#[cfg(all(feature = "aes-gcm", feature = "sha3", feature = "secp256k1"))]
 	test_builder! {
 		name: test_v1_with_encryption,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V1,
-		features: ["aes-gcm", "sha3", "secp256k1"],
 		setup: |builder| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
-			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
+			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
@@ -431,7 +427,7 @@ mod tests {
 				.with_order(1696521600)
 				.with_message_hasher::<Sha3_256>()
 				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
-				.with_signer::<Secp256k1, Secp256k1Signature, _>(&signing_key)
+				.with_signer::<Secp256k1Signature, _>(&signing_key)
 				.build()
 		},
 		assertions: |result| {
@@ -454,15 +450,20 @@ mod tests {
 		}
 	}
 
+	#[cfg(all(
+		feature = "compress",
+		feature = "aes-gcm",
+		feature = "sha3",
+		feature = "secp256k1"
+	))]
 	test_builder! {
 		name: test_v1_with_compression,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V1,
-		features: ["compress", "aes-gcm", "sha3", "secp256k1"],
 		setup: |builder| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
-			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
-			use crate::helpers::ZstdCompression;
+			use crate::crypto::sign::ecdsa::Secp256k1Signature;
+			use crate::compress::ZstdCompression;
 
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
@@ -473,9 +474,9 @@ mod tests {
 				.with_id("test_v1_with_compression")
 				.with_order(1696521600)
 				.with_message_hasher::<Sha3_256>()
-				.with_compression(ZstdCompression, None)
+				.with_compression(ZstdCompression)
 				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
-				.with_signer::<Secp256k1, Secp256k1Signature, _>(&signing_key)
+				.with_signer::<Secp256k1Signature, _>(&signing_key)
 				.build()
 		},
 		assertions: |result| {
@@ -498,14 +499,20 @@ mod tests {
 		}
 	}
 
+	#[cfg(all(
+		feature = "compress",
+		feature = "aes-gcm",
+		feature = "sha3",
+		feature = "secp256k1",
+		feature = "random"
+	))]
 	test_builder! {
 		name: test_v2_full,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V2,
-		features: ["compress", "aes-gcm", "sha3", "secp256k1", "random"],
 		setup: |builder| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
-			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
+			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
@@ -524,10 +531,10 @@ mod tests {
 				.with_order(1696521600)
 				.with_message_hasher::<Sha3_256>()
 				.with_witness_hasher::<Sha3_256>()
-				.with_compression(ZstdCompression, None)
+				.with_compression(ZstdCompression)
 				.with_rng(Box::new(rng))
 				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
-				.with_signer::<Secp256k1, Secp256k1Signature, _>(&signing_key)
+				.with_signer::<Secp256k1Signature, _>(&signing_key)
 				.with_priority(crate::MessagePriority::High)
 				.with_lifetime(3600)
 				.with_previous_hash(previous_hash)
@@ -567,9 +574,9 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "sha3")]
 	test_case! {
 		name: test_missing_message,
-		features: ["sha3"],
 		setup: || {
 			FrameBuilder::<TestMessage>::from(Version::V0)
 				.with_id("no-message")
@@ -583,9 +590,9 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "sha3")]
 	test_case! {
 		name: test_error_accumulation,
-		features: ["sha3"],
 		setup: || {
 			let message = create_test_message(None);
 			FrameBuilder::from(Version::V0)
@@ -602,9 +609,9 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "derive")]
 	test_case! {
 		name: test_compose_macro,
-		features: ["derive", "sha3"],
 		setup: || {
 			let message = create_test_message(None);
 			compose! {

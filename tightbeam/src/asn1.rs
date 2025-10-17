@@ -7,16 +7,28 @@ use crate::der::oid::ObjectIdentifier;
 use crate::der::{Enumerated, Sequence};
 
 pub use crate::cms::compressed_data::CompressedData;
-pub use crate::cms::signed_data::EncapsulatedContentInfo;
+pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
+pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
 
-/// id-alg-zlibCompress OBJECT IDENTIFIER ::= {
+/// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
+/// id-ct-compressedData OBJECT IDENTIFIER ::= {
 ///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
 ///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
 /// }
-pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
 pub const COMPRESSION_CONTENT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
+/// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
+/// id-alg-zlibCompress OBJECT IDENTIFIER ::= {
+///     alg(
+/// }
+pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
+/// sha3-256
+/// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
+pub const HASH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8");
+/// ecdsa-with-SHA256
+/// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
+pub const SIGNER_ECDSA_WITH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 
 /// Protocol version determines metadata structure and features
 ///
@@ -161,48 +173,6 @@ where
 	pub parameters: T,
 }
 
-/// Signature information for non-repudiation
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// SignatureInfo ::= SEQUENCE {
-///     signatureAlgorithm  AlgorithmIdentifier,
-///     signature           OCTET STRING
-/// }
-/// ```
-#[cfg(feature = "zeroize")]
-#[derive(Sequence, Debug, Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
-pub struct SignatureInfo<A = crate::der::asn1::Any, T = Vec<u8>>
-where
-	for<'a> A: crate::der::Choice<'a> + crate::der::Encode,
-	for<'a> T: crate::der::Decode<'a> + crate::der::Encode,
-	T: zeroize::Zeroize,
-{
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub signature_algorithm: AlgorithmIdentifier<A>,
-	pub signature: T,
-}
-
-/// Signature information for non-repudiation
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// SignatureInfo ::= SEQUENCE {
-///     signatureAlgorithm  AlgorithmIdentifier,
-///     signature           OCTET STRING
-/// }
-/// ```
-#[cfg(not(feature = "zeroize"))]
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
-pub struct SignatureInfo<A = crate::der::asn1::Any, T = Vec<u8>>
-where
-	for<'a> A: crate::der::Choice<'a> + crate::der::Encode,
-	for<'a> T: crate::der::Decode<'a> + crate::der::Encode,
-{
-	pub signature_algorithm: AlgorithmIdentifier<A>,
-	pub signature: T,
-}
-
 /// NxN matrix control flags
 ///
 /// ASN.1 Definition:
@@ -289,7 +259,7 @@ pub struct Metadata {
 ///     metadata       Metadata,
 ///     message        OCTET STRING,
 ///     integrity      [0] IntegrityInfo OPTIONAL,
-///     nonrepudiation [1] SignatureInfo OPTIONAL
+///     nonrepudiation [1] SignerInfo    OPTIONAL
 /// }
 /// ```
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
@@ -302,5 +272,6 @@ pub struct Frame {
 	#[asn1(context_specific = "0", optional = "true")]
 	pub integrity: Option<IntegrityInfo>,
 	#[asn1(context_specific = "1", optional = "true")]
-	pub nonrepudiation: Option<SignatureInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub nonrepudiation: Option<SignerInfo>,
 }

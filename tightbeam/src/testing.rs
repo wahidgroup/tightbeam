@@ -174,13 +174,22 @@ pub fn create_test_encryption_info() -> crate::EncryptionInfo {
 	}
 }
 
-pub fn create_test_signature_info() -> crate::SignatureInfo {
-	crate::SignatureInfo {
-		signature_algorithm: crate::AlgorithmIdentifier {
-			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), // ecdsa-with-SHA256
+pub fn create_test_signer_info() -> crate::SignerInfo {
+	use crate::cms::signed_data::SignerIdentifier;
+	use crate::der::asn1::OctetString;
+	use crate::x509::ext::pkix::SubjectKeyIdentifier;
+
+	crate::SignerInfo {
+		version: crate::cms::content_info::CmsVersion::V1,
+		sid: SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier(OctetString::new([0u8; 20]).unwrap())),
+		digest_alg: crate::AlgorithmIdentifierOwned { oid: crate::HASH_SHA3_256_OID, parameters: None },
+		signed_attrs: None,
+		signature_algorithm: crate::AlgorithmIdentifierOwned {
+			oid: crate::SIGNER_ECDSA_WITH_SHA3_256_OID,
 			parameters: None,
 		},
-		signature: vec![0u8; 64],
+		signature: OctetString::new([0u8; 64]).unwrap(),
+		unsigned_attrs: None,
 	}
 }
 
@@ -192,12 +201,10 @@ pub fn create_test_signature_info() -> crate::SignatureInfo {
 macro_rules! test_case {
 	(
 		name: $test_name:ident,
-		$(features: [$($feature:literal),*],)?
 		setup: $setup:expr,
 		assertions: |$result_pat:pat_param| $body:block
 	) => {
 		#[test]
-		$(#[cfg(all($(feature = $feature),*))])?
 		fn $test_name() -> $crate::Result<()> {
 			let $result_pat = $setup();
 			$body
@@ -207,12 +214,10 @@ macro_rules! test_case {
 	// Back-compat: closure form
 	(
 		name: $test_name:ident,
-		$(features: [$($feature:literal),*],)?
 		setup: $setup:expr,
 		assertions: $assertions:expr
 	) => {
 		#[test]
-		$(#[cfg(all($(feature = $feature),*))])?
 		fn $test_name() -> $crate::Result<()> {
 			let result = $setup();
 			$assertions(result)
@@ -230,12 +235,10 @@ macro_rules! test_builder {
 		name: $test_name:ident,
 		builder_type: $builder_type:ty,
 		version: $version:expr,
-		$(features: [$($feature:literal),*],)?
 		setup: |$builder:ident| $setup_body:expr,
 		assertions: |$result:ident| $assertions_body:expr
 	) => {
 		#[test]
-		$(#[cfg(all($(feature = $feature),*))])?
 		fn $test_name() -> $crate::Result<()> {
 			let $builder: $builder_type = <$builder_type>::from($version);
 			let $result = $setup_body;

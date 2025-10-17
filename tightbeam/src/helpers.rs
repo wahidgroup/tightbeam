@@ -7,9 +7,8 @@ pub use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::der::{Decode, Encode};
 use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
-use crate::error::TightBeamError;
 use crate::matrix::MatrixError;
-use crate::{AlgorithmIdentifier, AlgorithmIdentifierOwned, Asn1Matrix, Result};
+use crate::{AlgorithmIdentifier, Asn1Matrix, Result};
 
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::der::oid::AssociatedOid;
@@ -18,97 +17,16 @@ use crate::EncryptionInfo;
 #[cfg(feature = "digest")]
 use crate::IntegrityInfo;
 #[cfg(feature = "signature")]
-use crate::SignatureInfo;
-#[cfg(feature = "compress")]
-use crate::{
-	cms::{content_info::CmsVersion, signed_data::EncapsulatedContentInfo},
-	error::CompressionResult,
-	CompressedData,
-};
+use crate::SignerInfo;
 
 #[cfg(feature = "aead")]
 pub type Encryptor = Box<dyn FnOnce(&[u8]) -> Result<(Vec<u8>, EncryptionInfo)>>;
 #[cfg(feature = "aead")]
 pub type Decryptor = Box<dyn FnOnce(&[u8], &EncryptionInfo) -> Result<Vec<u8>>>;
 #[cfg(feature = "signature")]
-pub type Signatory = Box<dyn FnOnce(&[u8]) -> Result<crate::SignatureInfo>>;
-#[cfg(feature = "signature")]
-pub type SignatureVerifier = Box<dyn FnOnce(&[u8], &crate::SignatureInfo) -> Result<()>>;
+pub type SignatureVerifier = Box<dyn FnOnce(&[u8], &SignerInfo) -> Result<()>>;
 #[cfg(feature = "digest")]
 pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::IntegrityInfo>>;
-
-/// Trait for compressing data
-#[cfg(feature = "compress")]
-pub trait Compressor {
-	/// Compress data and return the compressed bytes along with compression metadata
-	fn compress(
-		&self,
-		data: &[u8],
-		content_info: Option<EncapsulatedContentInfo>,
-	) -> CompressionResult<(Vec<u8>, CompressedData)>;
-}
-
-/// Trait for decompressing data
-#[cfg(feature = "compress")]
-pub trait Inflator {
-	/// Decompress data and return the decompressed bytes along with compression metadata
-	fn decompress(&self, data: &[u8]) -> CompressionResult<Vec<u8>>;
-}
-
-#[cfg(feature = "compress")]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ZstdCompression;
-
-#[cfg(feature = "compress")]
-impl Compressor for ZstdCompression {
-	fn compress(
-		&self,
-		data: &[u8],
-		content_info: Option<EncapsulatedContentInfo>,
-	) -> CompressionResult<(Vec<u8>, CompressedData)> {
-		use std::io::Cursor;
-
-		let mut output: Vec<u8> = vec![];
-		let mut encoder = zeekstd::Encoder::new(&mut output)?;
-		std::io::copy(&mut Cursor::new(data), &mut encoder)?;
-		encoder.finish()?;
-
-		let compression_alg = AlgorithmIdentifierOwned::from(ZstdCompression);
-		let encap_content_info = content_info
-			.unwrap_or(EncapsulatedContentInfo { econtent_type: crate::asn1::COMPRESSION_CONTENT_OID, econtent: None });
-		let compressed_data = CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info };
-
-		Ok((output, compressed_data))
-	}
-}
-
-#[cfg(feature = "compress")]
-impl Inflator for ZstdCompression {
-	fn decompress(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
-		use std::io::Cursor;
-
-		let cursor = Cursor::new(data);
-		let mut decoder = zeekstd::Decoder::new(cursor)?;
-		let mut out: Vec<u8> = Vec::new();
-
-		std::io::copy(&mut decoder, &mut out)?;
-		Ok(out)
-	}
-}
-
-#[cfg(feature = "compress")]
-impl From<&ZstdCompression> for AlgorithmIdentifierOwned {
-	fn from(_: &ZstdCompression) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: crate::asn1::COMPRESSION_ZSTD_OID, parameters: None }
-	}
-}
-
-#[cfg(feature = "compress")]
-impl From<ZstdCompression> for AlgorithmIdentifierOwned {
-	fn from(_: ZstdCompression) -> AlgorithmIdentifierOwned {
-		(&ZstdCompression).into()
-	}
-}
 
 #[cfg(feature = "digest")]
 impl IntegrityInfo {
@@ -151,32 +69,6 @@ impl EncryptionInfo {
 		let algorithm = AlgorithmIdentifier { oid: C::OID, parameters: None };
 		let parameters = nonce.as_ref().to_vec();
 		Ok(Self { encryption_algorithm: algorithm, parameters })
-	}
-}
-
-#[cfg(feature = "signature")]
-impl SignatureInfo {
-	/// Create SignatureInfo by signing data with a RustCrypto Signer.
-	/// Requires a curve/algorithm type `C` that implements `AssociatedOid`
-	/// (e.g., k256::Secp256k1).
-	///
-	/// # Security Note
-	/// Follows the sign-then-encrypt pattern: signatures are computed over
-	/// plaintext before encryption. This provides:
-	/// - Non-repudiation (signature proves who created the message)
-	/// - Authentication (verifiable without decryption keys)
-	/// - Integrity (tampering detection)
-	pub fn sign<C, S>(signer: &impl signature::Signer<S>, data: impl AsRef<[u8]>) -> Result<Self>
-	where
-		C: AssociatedOid,
-		S: signature::SignatureEncoding,
-	{
-		let signature_bytes = signer.sign(data.as_ref());
-		let signature_encoded = signature_bytes.to_vec();
-
-		let signature_algorithm = AlgorithmIdentifier { oid: C::OID, parameters: None };
-		let signature = signature_encoded.to_vec();
-		Ok(Self { signature_algorithm, signature })
 	}
 }
 
@@ -260,29 +152,6 @@ impl<'a> Decode<'a> for Asn1Matrix {
 	}
 }
 
-#[cfg(feature = "secp256k1")]
-impl TryFrom<SignatureInfo> for crate::crypto::sign::ecdsa::Secp256k1Signature {
-	type Error = TightBeamError;
-
-	fn try_from(info: SignatureInfo) -> core::result::Result<Self, Self::Error> {
-		let bytes = info.signature.as_slice();
-		Ok(crate::crypto::sign::ecdsa::Secp256k1Signature::from_slice(bytes)?)
-	}
-}
-
-#[cfg(feature = "secp256k1")]
-impl TryFrom<crate::crypto::sign::ecdsa::Secp256k1Signature> for SignatureInfo {
-	type Error = TightBeamError;
-
-	fn try_from(sig: crate::crypto::sign::ecdsa::Secp256k1Signature) -> core::result::Result<Self, Self::Error> {
-		let oid = crate::crypto::sign::ecdsa::Secp256k1::OID;
-		Ok(SignatureInfo {
-			signature_algorithm: AlgorithmIdentifier { oid, parameters: None },
-			signature: sig.to_vec(),
-		})
-	}
-}
-
 /// Create a SignatureInfo by signing data
 #[macro_export]
 #[cfg(feature = "signature")]
@@ -297,6 +166,19 @@ macro_rules! sign {
 #[macro_export]
 #[cfg(feature = "signature")]
 macro_rules! notarize {
+	// Pattern for Signatory trait objects (takes a reference)
+	(tbs: $tbs:expr, position: $position:ident, signer: & $signer:expr) => {{
+		use $crate::crypto::sign::Signatory;
+
+		let unsigned_bytes = $crate::encode(&$tbs)?;
+		let $position = Some($signer.to_signer_info(&unsigned_bytes)?);
+
+		let mut tbs = $tbs;
+		tbs.$position = $position;
+		Ok::<_, $crate::TightBeamError>(tbs)
+	}};
+
+	// Pattern for callable (Box<dyn FnOnce> or closures)
 	(tbs: $tbs:expr, position: $position:ident, signer: $signer:expr) => {{
 		let unsigned_bytes = $crate::encode(&$tbs)?;
 		let $position = Some($signer(&unsigned_bytes)?);
@@ -402,39 +284,10 @@ mod tests {
 	#[cfg(not(feature = "std"))]
 	use alloc::string::ToString;
 
-	use super::*;
-
-	#[cfg(feature = "signature")]
-	mod sign {
-		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-		use crate::crypto::sign::Signer;
-		use crate::{Result, SignatureInfo};
-
-		#[test]
-		fn test_sign_macro() -> Result<()> {
-			let secret_bytes = [1u8; 32];
-			let signing_key = Secp256k1SigningKey::from_bytes(&secret_bytes.into())?;
-
-			// Use a simple message type that can be DER encoded
-			let data = crate::testing::TestMessage { content: "Test data for sign macro".to_string() };
-
-			let signer = |bytes: &[u8]| -> Result<SignatureInfo> {
-				let sig: Secp256k1Signature = signing_key.sign(bytes);
-				SignatureInfo::try_from(sig)
-			};
-
-			let sig_info = sign!(signer, data)?;
-			assert_eq!(sig_info.signature.len(), 64);
-
-			Ok(())
-		}
-	}
-
 	#[cfg(feature = "signature")]
 	mod notarize {
-		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-		use crate::crypto::sign::Signer;
-		use crate::{Result, SignatureInfo};
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+		use crate::Result;
 
 		#[test]
 		fn test_notarize_macro() -> Result<()> {
@@ -444,49 +297,12 @@ mod tests {
 			let secret_bytes = [1u8; 32];
 			let signing_key = Secp256k1SigningKey::from_bytes(&secret_bytes.into())?;
 
-			let signer = |bytes: &[u8]| -> Result<SignatureInfo> {
-				let sig: Secp256k1Signature = signing_key.sign(bytes);
-				SignatureInfo::try_from(sig)
-			};
-
-			let notarized = notarize!(tbs: tbs, position: nonrepudiation, signer: signer)?;
+			// Use & to match the first pattern (Signatory trait)
+			let notarized = notarize!(tbs: tbs, position: nonrepudiation, signer: &signing_key)?;
 			assert!(notarized.nonrepudiation.is_some());
 
 			Ok(())
 		}
-	}
-
-	#[cfg(feature = "secp256k1")]
-	#[test]
-	fn test_signature_info_sign() -> Result<()> {
-		use signature::Verifier;
-
-		use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey};
-		use crate::SignatureInfo;
-
-		// Create a deterministic signing key from a fixed seed for testing
-		let secret_bytes = [1u8; 32];
-		let signing_key = Secp256k1SigningKey::from_bytes(&secret_bytes.into())?;
-		// Test data to sign
-		let data = b"Hello, TightBeam!";
-		// Use the sign helper method with Secp256k1 as the curve type parameter
-		let signature_info = SignatureInfo::sign::<Secp256k1, Secp256k1Signature>(&signing_key, data)?;
-
-		// Verify the signature algorithm OID is set correctly (Secp256k1 curve OID)
-		let algorithm = signature_info.signature_algorithm.oid.to_string();
-		assert_eq!(algorithm, "1.3.132.0.10");
-
-		// Verify the signature produces a correct length signature
-		let length = signature_info.signature.len();
-		assert_eq!(length, 64);
-
-		// Verify the signature
-		let verifying_key = signing_key.verifying_key();
-		let signature = Secp256k1Signature::try_from(signature_info)?;
-		let result = verifying_key.verify(data, &signature);
-		assert!(result.is_ok());
-
-		Ok(())
 	}
 
 	#[cfg(feature = "sha3")]
@@ -535,7 +351,7 @@ mod tests {
 	mod validation {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 		use crate::crypto::hash::Sha3_256;
-		use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey};
+		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 		use crate::testing::{create_test_cipher_key, create_test_signing_key};
 		use crate::Version;
 
@@ -560,7 +376,7 @@ mod tests {
 					(true, true, true, true) => crate::compose! {
 						V2: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
-						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key,
+						nonrepudiation<Secp256k1Signature, _>: signing_key,
 						message_integrity: type Sha3_256,
 						frame_integrity: type Sha3_256
 					},
@@ -575,12 +391,12 @@ mod tests {
 					},
 					(false, true, true, _) => crate::compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
-						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key,
+						nonrepudiation<Secp256k1Signature, _>: signing_key,
 						message_integrity: type Sha3_256
 					},
 					(false, true, false, _) => crate::compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
-						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key
+						nonrepudiation<Secp256k1Signature, _>: signing_key
 					},
 					(false, false, true, true) => crate::compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
@@ -601,19 +417,19 @@ mod tests {
 					(true, true, true, false) => crate::compose! {
 						V2: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
-						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key,
+						nonrepudiation<Secp256k1Signature, _>: signing_key,
 						message_integrity: type Sha3_256
 					},
 					(true, true, false, true) => crate::compose! {
 						V2: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
-						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key,
+						nonrepudiation<Secp256k1Signature, _>: signing_key,
 						frame_integrity: type Sha3_256
 					},
 					(true, true, false, false) => crate::compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
-						nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key
+						nonrepudiation<Secp256k1Signature, _>: signing_key
 					},
 				}
 			}
