@@ -3,10 +3,12 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::Version;
+use crate::{Version, CompressedData};
 
 #[cfg(feature = "derive")]
 use crate::Errorizable;
+
+pub type CompressionResult = Result<(Vec<u8>, CompressedData), CompressionError>;
 
 /// Error indicating a mismatch between received and expected values
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -151,6 +153,10 @@ pub enum TightBeamError {
 	// Missing order
 	#[cfg_attr(feature = "derive", error("Missing order"))]
 	MissingOrder,
+	
+	/// Missing inflator
+	#[cfg_attr(feature = "derive", error("Missing inflator"))]
+	MissingInflator,
 
 	/// Missing feature
 	#[cfg_attr(feature = "derive", error("Missing feature: {0}"))]
@@ -183,7 +189,7 @@ pub enum TightBeamError {
 	/// Missing Compression Info
 	#[cfg(feature = "compress")]
 	#[cfg_attr(feature = "derive", error("Missing compression info"))]
-	MissingCompressionInfo,
+	MissingCompressedData,
 
 	/// Missing or invalid configuration
 	#[cfg_attr(feature = "derive", error("Missing configuration"))]
@@ -206,6 +212,7 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::InvalidOID(err) => write!(f, "Invalid or unsupported object identifier: {err}"),
 			TightBeamError::InvalidOverflowValue => write!(f, "Invalid overflow value"),
 			TightBeamError::InvalidOrder => write!(f, "Invalid order"),
+			TightBeamError::MissingInflator => write!(f, "Missing inflator"),
 			TightBeamError::MissingOrder => write!(f, "Missing order"),
 			TightBeamError::MissingPriority => write!(f, "Missing priority"),
 			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
@@ -231,7 +238,7 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "signature")]
 			TightBeamError::MissingSignature => write!(f, "Missing signature"),
 			#[cfg(feature = "compress")]
-			TightBeamError::MissingCompressionInfo => write!(f, "Missing compression info"),
+			TightBeamError::MissingCompressedData => write!(f, "Missing compression info"),
 			#[cfg(feature = "compress")]
 			TightBeamError::CompressionError(err) => match err {
 				#[cfg(feature = "zstd")]

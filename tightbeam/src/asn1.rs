@@ -3,10 +3,20 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-pub use spki::AlgorithmIdentifier;
+use crate::der::{Enumerated, Sequence};
+use crate::der::oid::ObjectIdentifier;
 
-use crate::der::asn1::Null;
-use crate::der::{Choice, Enumerated, Sequence};
+pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
+pub use crate::cms::compressed_data::CompressedData;
+pub use crate::cms::signed_data::EncapsulatedContentInfo;
+pub use crate::x509::ext::pkix::SignatureAlgorithm;
+
+/// id-alg-zlibCompress OBJECT IDENTIFIER ::= { 
+/// 	iso(1)   member-body(2)  us(840)    rsadsi(113549) 
+/// 	pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8 
+/// }
+pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
+pub const COMPRESSION_CONTENT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
 
 /// Protocol version determines metadata structure and features
 ///
@@ -26,22 +36,6 @@ pub enum Version {
 	V2 = 2,
 }
 
-/// Compression algorithms
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// CompressionAlgorithm ::= ENUMERATED {
-///     none(0),
-///     zstd(1)
-/// }
-/// ```
-#[cfg(feature = "compress")]
-#[repr(u8)]
-#[derive(Enumerated, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CompressionAlgorithm {
-	NONE = 0,
-	ZSTD = 1,
-}
 
 /// Message priority levels (V2+)
 ///
@@ -82,62 +76,6 @@ pub enum MessagePriority {
 	Low = 4,
 	Bulk = 5,
 	Heartbeat = 6,
-}
-
-/// Gzip compression information
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// GzipInfo ::= SEQUENCE {
-///     level         INTEGER,
-///     originalSize  INTEGER
-/// }
-/// ```
-#[cfg(feature = "gzip")]
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
-pub struct GzipInfo {
-	pub level: u8,
-	pub original_size: u64,
-}
-
-/// Zstandard compression information
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// ZstdInfo ::= SEQUENCE {
-///     level         INTEGER,
-///     originalSize  INTEGER
-/// }
-/// ```
-#[cfg(feature = "zstd")]
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
-pub struct ZstdInfo {
-	pub level: u8,
-	pub original_size: u64,
-}
-
-/// Compression information using CHOICE for different algorithms
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// CompressionInfo ::= CHOICE {
-///     none  NULL,
-///     zstd  ZstdInfo,
-///     gzip  GzipInfo
-/// }
-/// ```
-#[derive(Choice, Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
-pub enum CompressionInfo {
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	NONE(Null),
-	#[cfg(feature = "zstd")]
-	ZSTD(ZstdInfo),
-	// TODO
-	#[cfg(feature = "gzip")]
-	GZIP(GzipInfo),
 }
 
 /// Encryption information for confidentiality
@@ -304,7 +242,7 @@ pub struct Asn1Matrix {
 /// Metadata ::= SEQUENCE {
 ///     id               OCTET STRING,
 ///     order            INTEGER,
-///     compactness      CompressionInfo,
+///     compactness      CompressedData,
 ///     integrity        [0] IntegrityInfo OPTIONAL,
 ///     confidentiality  [1] EncryptionInfo OPTIONAL,
 ///     priority         [2] MessagePriority OPTIONAL,
@@ -319,7 +257,9 @@ pub struct Metadata {
 	// Core fields (V0+)
 	pub id: Vec<u8>,
 	pub order: u64,
-	pub compactness: CompressionInfo,
+	#[asn1(optional = "true")]
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub compactness: Option<CompressedData>,
 
 	// V1+ fields
 	#[asn1(context_specific = "0", optional = "true")]

@@ -97,15 +97,35 @@ use crate::Errorizable;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DroneError {
 	/// Invalid servlet ID
-	#[cfg_attr(feature = "derive", error("Missing required field: {:#?}"))]
+	#[cfg_attr(feature = "derive", error("Invalid servlet ID: {:#?}"))]
 	InvalidServletId(Vec<u8>),
+	/// Transport connection failed
+	#[cfg_attr(feature = "derive", error("Transport connection failed: {:#?}"))]
+	ConnectionFailed(Vec<u8>),
+	/// Message composition failed
+	#[cfg_attr(feature = "derive", error("Message composition failed"))]
+	ComposeFailed,
+	/// Message emission failed
+	#[cfg_attr(feature = "derive", error("Message emission failed"))]
+	EmitFailed,
+	/// No response received
+	#[cfg_attr(feature = "derive", error("No response received"))]
+	NoResponse,
+	/// Message decoding failed
+	#[cfg_attr(feature = "derive", error("Message decoding failed"))]
+	DecodeFailed,
 }
 
 #[cfg(not(feature = "derive"))]
 impl core::fmt::Display for DroneError {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
-			InvalidServletId(id) => write!(f, "Invalid servlet ID: {:#?}", id),
+			DroneError::InvalidServletId(id) => write!(f, "Invalid servlet ID: {:#?}", id),
+			DroneError::ConnectionFailed(addr) => write!(f, "Transport connection failed: {:#?}", addr),
+			DroneError::ComposeFailed => write!(f, "Message composition failed"),
+			DroneError::EmitFailed => write!(f, "Message emission failed"),
+			DroneError::NoResponse => write!(f, "No response received"),
+			DroneError::DecodeFailed => write!(f, "Message decoding failed"),
 		}
 	}
 }
@@ -155,6 +175,8 @@ pub struct ActivateServletRequest {
 pub struct ActivateServletResponse {
 	/// The status of the activation request
 	pub status: TransitStatus,
+	/// The address of the activated servlet (if successful)
+	pub servlet_address: Option<Vec<u8>>,
 }
 
 /// Servlet information entry
@@ -579,14 +601,14 @@ macro_rules! drone {
 
 					// Create registration request
 					let request = $crate::colony::drone::RegisterDroneRequest {
-						drone_addr: drone_addr_bytes,
+						drone_addr: drone_addr_bytes.clone(),
 						available_servlets,
 						metadata: None,
 					};
 
 					// Connect to cluster and send registration
 					let stream = <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await
-						.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(b"connection_failed".to_vec()))?;
+						.map_err(|_| $crate::colony::drone::DroneError::ConnectionFailed(drone_addr_bytes))?;
 
 					let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
 
@@ -594,16 +616,16 @@ macro_rules! drone {
 					let frame = $crate::compose! {
 						V0: id: b"drone-registration",
 							message: request
-					}.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(b"compose_failed".to_vec()))?;
+					}.map_err(|_| $crate::colony::drone::DroneError::ComposeFailed)?;
 
 					// Send and wait for response
 					let response_frame = transport.emit(frame, None).await
-						.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(b"emit_failed".to_vec()))?
-						.ok_or_else(|| $crate::colony::drone::DroneError::InvalidServletId(b"no_response".to_vec()))?;
+						.map_err(|_| $crate::colony::drone::DroneError::EmitFailed)?
+						.ok_or_else(|| $crate::colony::drone::DroneError::NoResponse)?;
 
 					// Decode response
 					let response = $crate::decode::<$crate::colony::drone::RegisterDroneResponse, _>(&response_frame.message)
-						.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(b"decode_failed".to_vec()))?;
+						.map_err(|_| $crate::colony::drone::DroneError::DecodeFailed)?;
 
 					Ok(response)
 				}
@@ -619,6 +641,7 @@ macro_rules! drone {
 				// Key format: "servlet_type_address" (e.g., "worker_servlet_127.0.0.1:8080")
 				servlets: ::std::sync::Arc<::std::sync::Mutex<::std::collections::HashMap<Vec<u8>, [<$drone_name Servlet>]>>>,
 				// Configuration
+				#[allow(dead_code)]
 				config: $crate::colony::drone::HiveConf,
 				control_server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
@@ -760,14 +783,14 @@ macro_rules! drone {
 
 					// Create registration request
 					let request = $crate::colony::drone::RegisterDroneRequest {
-						drone_addr: drone_addr_bytes,
+						drone_addr: drone_addr_bytes.clone(),
 						available_servlets,
 						metadata: Some(b"hive".to_vec()),
 					};
 
 					// Connect to cluster and send registration
 					let stream = <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await
-						.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(b"connection_failed".to_vec()))?;
+						.map_err(|_| $crate::colony::drone::DroneError::ConnectionFailed(drone_addr_bytes))?;
 
 					let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
 
@@ -775,16 +798,16 @@ macro_rules! drone {
 					let frame = $crate::compose! {
 						V0: id: b"hive-registration",
 							message: request
-					}.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(b"compose_failed".to_vec()))?;
+					}.map_err(|_| $crate::colony::drone::DroneError::ComposeFailed)?;
 
 					// Send and wait for response
 					let response_frame = transport.emit(frame, None).await
-						.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(b"emit_failed".to_vec()))?
-						.ok_or_else(|| $crate::colony::drone::DroneError::InvalidServletId(b"no_response".to_vec()))?;
+						.map_err(|_| $crate::colony::drone::DroneError::EmitFailed)?
+						.ok_or_else(|| $crate::colony::drone::DroneError::NoResponse)?;
 
 					// Decode response
 					let response = $crate::decode::<$crate::colony::drone::RegisterDroneResponse, _>(&response_frame.message)
-						.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(b"decode_failed".to_vec()))?;
+						.map_err(|_| $crate::colony::drone::DroneError::DecodeFailed)?;
 
 					Ok(response)
 				}
@@ -939,6 +962,19 @@ macro_rules! drone {
 	(@handle_activation_request $frame:ident, $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_type:ty),*) => {
 		paste::paste! {
 			{
+				// Define a helper function to stop old servlets
+				// This must be defined outside the repetition so we can generate all match arms
+				let stop_old_servlet = |old: [<$drone_name ActiveServlet>]| {
+					match old {
+						[<$drone_name ActiveServlet>]::None => {},
+						$(
+							[<$drone_name ActiveServlet>]::[<$servlet_id:camel>](s) => {
+								s.stop();
+							}
+						)*
+					}
+				};
+
 				// First, try to decode as an activation request
 				if let Ok(request) = $crate::decode::<$crate::colony::drone::ActivateServletRequest, _>(&$frame.message) {
 					// Match servlet_id and activate the corresponding servlet
@@ -947,28 +983,23 @@ macro_rules! drone {
 							// Start the servlet with optional config
 							match <$servlet_type as $crate::colony::Servlet>::start(None).await {
 								Ok(servlet) => {
-									// Store the servlet
+									let servlet_addr = servlet.addr();
+									let addr_bytes: Vec<u8> = servlet_addr.clone().into();
+
+									// Store the new servlet and get the old one
 									let mut active = $active_servlet.lock().unwrap();
-									// Stop any existing servlet - use a catch-all pattern
 									let old_servlet = core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet));
 									drop(active);
 
 									// Stop the old servlet if there was one
-									// Use a wildcard pattern to match any non-None variant
-									match old_servlet {
-										[<$drone_name ActiveServlet>]::None => {},
-										_ => {
-											// The enum variants will be dropped here, calling stop() via Drop if implemented
-											// For now, we need to manually stop each variant
-											// This is a limitation - we'll handle it in the main impl block instead
-										}
-									}
+									stop_old_servlet(old_servlet);
 
-									// Return success response
+									// Return success response with servlet address
 									return Some($crate::compose! {
 										V0: id: $frame.metadata.id.clone(),
 											message: $crate::colony::drone::ActivateServletResponse {
-												status: $crate::policy::TransitStatus::Accepted
+												status: $crate::policy::TransitStatus::Accepted,
+												servlet_address: Some(addr_bytes)
 											}
 									}.ok()?);
 								}
@@ -977,7 +1008,8 @@ macro_rules! drone {
 									return Some($crate::compose! {
 										V0: id: $frame.metadata.id.clone(),
 											message: $crate::colony::drone::ActivateServletResponse {
-												status: $crate::policy::TransitStatus::Forbidden
+												status: $crate::policy::TransitStatus::Forbidden,
+												servlet_address: None
 											}
 									}.ok()?);
 								}
@@ -989,7 +1021,8 @@ macro_rules! drone {
 					return Some($crate::compose! {
 						V0: id: $frame.metadata.id.clone(),
 							message: $crate::colony::drone::ActivateServletResponse {
-								status: $crate::policy::TransitStatus::Forbidden
+								status: $crate::policy::TransitStatus::Forbidden,
+								servlet_address: None
 							}
 					}.ok()?);
 				}
@@ -1169,7 +1202,95 @@ mod tests {
 	use crate::policy::TransitStatus;
 	use crate::transport::policy::PolicyConf;
 	use crate::Beamable;
-	use crate::{mutex, policy, servlet, worker};
+	use crate::{job, mutex, policy, servlet, worker};
+
+	// Jobs for hive management operations
+	job! {
+		name: ListServletsJob,
+		fn run(id: &[u8]) -> Frame {
+			crate::compose! {
+				V0: id: id,
+					message: HiveManagementRequest {
+						spawn: None,
+						list: Some(ListServletsParams {
+							filter: None,
+						}),
+						stop: None,
+					}
+			}
+		}
+	}
+
+	job! {
+		name: SpawnServletJob,
+		fn run(id: &[u8], servlet_type: &[u8], config: Option<Vec<u8>>) -> Frame {
+			crate::compose! {
+				V0: id: id,
+					message: HiveManagementRequest {
+						spawn: Some(SpawnServletParams {
+							servlet_type: servlet_type.to_vec(),
+							config,
+						}),
+						list: None,
+						stop: None,
+					}
+			}
+		}
+	}
+
+	job! {
+		name: StopServletJob,
+		fn run(id: &[u8], servlet_id: Vec<u8>) -> Frame {
+			crate::compose! {
+				V0: id: id,
+					message: HiveManagementRequest {
+						spawn: None,
+						list: None,
+						stop: Some(StopServletParams {
+							servlet_id,
+						}),
+					}
+			}
+		}
+	}
+
+	job! {
+		name: ActivateServletJob,
+		fn run(id: &[u8], servlet_id: &[u8], config: Option<Vec<u8>>, signing_key: &Secp256k1SigningKey) -> Frame {
+			crate::compose! {
+				V0: id: id,
+					message: ActivateServletRequest {
+						servlet_id: servlet_id.to_vec(),
+						config,
+					},
+					nonrepudiation<Secp256k1, Secp256k1Signature, _>: signing_key
+			}
+		}
+	}
+
+	// Jobs for servlet responses
+	job! {
+		name: DroneResponseJob,
+		fn run(id: Vec<u8>, result: String) -> Frame {
+			crate::compose! {
+				V0: id: id,
+					message: DroneResponseMessage {
+						result,
+					}
+			}
+		}
+	}
+
+	job! {
+		name: DroneResponseWithOrderJob,
+		fn run(id: Vec<u8>, order: u64, message: DroneResponseMessage) -> Frame {
+			crate::compose! {
+				V0: id: id,
+					order: order,
+					message: message
+			}
+		}
+	}
 
 	#[cfg(feature = "tokio")]
 	type Listener = crate::transport::tcp::r#async::TokioListener;
@@ -1260,12 +1381,7 @@ mod tests {
 		handle: |message| async move {
 			let decoded = crate::decode::<DroneTestMessage, _>(&message.message).ok()?;
 			if decoded.content == "PING" {
-				Some(crate::compose! {
-					V0: id: message.metadata.id.clone(),
-						message: DroneResponseMessage {
-							result: "PONG".to_string(),
-						}
-				}.ok()?)
+				Some(DroneResponseJob::run(message.metadata.id.clone(), "PONG".to_string()).ok()?)
 			} else {
 				None
 			}
@@ -1284,12 +1400,7 @@ mod tests {
 		handle: |message, config| async move {
 			let decoded = crate::decode::<DroneTestMessage, _>(&message.message).ok()?;
 			if decoded.value >= config.threshold {
-				Some(crate::compose! {
-					V0: id: message.metadata.id.clone(),
-						message: DroneResponseMessage {
-							result: "ACCEPTED".to_string(),
-						}
-				}.ok()?)
+				Some(DroneResponseJob::run(message.metadata.id.clone(), "ACCEPTED".to_string()).ok()?)
 			} else {
 				None
 			}
@@ -1338,11 +1449,11 @@ mod tests {
 			};
 
 			if is_valid {
-				Some(crate::compose! {
-					V0: id: message.metadata.id.clone(),
-						order: 1_700_000_000u64,
-						message: echo_msg
-				}.ok()?)
+				Some(DroneResponseWithOrderJob::run(
+					message.metadata.id.clone(),
+					1_700_000_000u64,
+					echo_msg
+				).ok()?)
 			} else {
 				None
 			}
@@ -1379,17 +1490,13 @@ mod tests {
 			// let (ok_rx, reject_rx) = channels;
 
 			// Step 1: Send a signed activation request to morph the drone into simple_servlet
-			let activate_request = ActivateServletRequest {
-				servlet_id: b"simple_servlet".to_vec(),
-				config: None,
-			};
-
 			let signing_key = SIGNING_KEY().lock().unwrap().clone();
-			let signed_frame = crate::compose! {
-				V0: id: b"cluster-activation-001",
-					message: activate_request,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key
-			}?;
+			let signed_frame = ActivateServletJob::run(
+				b"cluster-activation-001",
+				b"simple_servlet",
+				None,
+				&signing_key
+			)?;
 
 			// Send activation request to drone's control server
 			let response = client.emit(signed_frame, None).await?
@@ -1400,16 +1507,12 @@ mod tests {
 			assert_eq!(activation_response.status, TransitStatus::Accepted, "Servlet activation should succeed");
 
 			// Step 2: Test morphing back to simple_servlet (verify we can morph multiple times)
-			let activate_simple_again = ActivateServletRequest {
-				servlet_id: b"simple_servlet".to_vec(),
-				config: None,
-			};
-
-			let signed_simple_again_frame = crate::compose! {
-				V0: id: b"cluster-activation-002",
-					message: activate_simple_again,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key
-			}?;
+			let signed_simple_again_frame = ActivateServletJob::run(
+				b"cluster-activation-002",
+				b"simple_servlet",
+				None,
+				&signing_key
+			)?;
 
 			let simple_again_response = client.emit(signed_simple_again_frame, None).await?
 				.ok_or("No response from drone for second simple activation")?;
@@ -1418,16 +1521,12 @@ mod tests {
 			assert_eq!(simple_again_activation.status, TransitStatus::Accepted, "Second simple servlet activation should succeed");
 
 			// Step 3: Test invalid servlet ID
-			let activate_invalid = ActivateServletRequest {
-				servlet_id: b"nonexistent_servlet".to_vec(),
-				config: None,
-			};
-
-			let signed_invalid_frame = crate::compose! {
-				V0: id: b"cluster-activation-003",
-					message: activate_invalid,
-					nonrepudiation<Secp256k1, Secp256k1Signature, _>: &signing_key
-			}?;
+			let signed_invalid_frame = ActivateServletJob::run(
+				b"cluster-activation-003",
+				b"nonexistent_servlet",
+				None,
+				&signing_key
+			)?;
 
 			let invalid_response = client.emit(signed_invalid_frame, None).await?
 				.ok_or("No response from drone for invalid activation")?;
@@ -1467,12 +1566,10 @@ mod tests {
 		},
 		handle: |message| async move {
 			let decoded = crate::decode::<DroneTestMessage, _>(&message.message).ok()?;
-			Some(crate::compose! {
-				V0: id: message.metadata.id.clone(),
-					message: DroneResponseMessage {
-						result: format!("ECHO: {}", decoded.content),
-					}
-			}.ok()?)
+			Some(DroneResponseJob::run(
+				message.metadata.id.clone(),
+				format!("ECHO: {}", decoded.content)
+			).ok()?)
 		}
 	}
 
@@ -1548,16 +1645,7 @@ mod tests {
 
 		// Test 1: List servlets (should have 2 default servlets)
 		println!("\n=== Test 1: List initial servlets ===");
-		let list_frame = crate::compose! {
-			V0: id: b"list-1",
-				message: HiveManagementRequest {
-					spawn: None,
-					list: Some(ListServletsParams {
-						filter: None,
-					}),
-					stop: None,
-				}
-		}?;
+		let list_frame = ListServletsJob::run(b"list-1")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
 		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
@@ -1575,17 +1663,7 @@ mod tests {
 
 		// Test 2: Spawn a new servlet instance
 		println!("\n=== Test 2: Spawn new servlet ===");
-		let spawn_frame = crate::compose! {
-			V0: id: b"spawn-1",
-				message: HiveManagementRequest {
-					spawn: Some(SpawnServletParams {
-						servlet_type: b"simple_servlet".to_vec(),
-						config: None,
-					}),
-					list: None,
-					stop: None,
-				}
-		}?;
+		let spawn_frame = SpawnServletJob::run(b"spawn-1", b"simple_servlet", None)?;
 
 		let response = transport.emit(spawn_frame, None).await?.unwrap();
 		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
@@ -1605,16 +1683,7 @@ mod tests {
 
 		// Test 3: List servlets again (should have 3 now)
 		println!("\n=== Test 3: List servlets after spawn ===");
-		let list_frame = crate::compose! {
-			V0: id: b"list-2",
-				message: HiveManagementRequest {
-					spawn: None,
-					list: Some(ListServletsParams {
-						filter: None,
-					}),
-					stop: None,
-				}
-		}?;
+		let list_frame = ListServletsJob::run(b"list-2")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
 		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
@@ -1633,16 +1702,7 @@ mod tests {
 		// Test 4: Stop the newly spawned servlet
 		println!("\n=== Test 4: Stop servlet ===");
 		println!("  Attempting to stop: {}", String::from_utf8_lossy(&new_servlet_id));
-		let stop_frame = crate::compose! {
-			V0: id: b"stop-1",
-				message: HiveManagementRequest {
-					spawn: None,
-					list: None,
-					stop: Some(StopServletParams {
-						servlet_id: new_servlet_id.clone(),
-					}),
-				}
-		}?;
+		let stop_frame = StopServletJob::run(b"stop-1", new_servlet_id.clone())?;
 
 		let response = transport.emit(stop_frame, None).await?.unwrap();
 		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
@@ -1652,16 +1712,7 @@ mod tests {
 			println!("  ERROR: Stop failed with status: {:?}", stop_response.status);
 			println!("  Servlet ID sent: {:?}", new_servlet_id);
 			println!("  Current servlets:");
-			let list_frame = crate::compose! {
-				V0: id: b"list-debug",
-					message: HiveManagementRequest {
-						spawn: None,
-						list: Some(ListServletsParams {
-							filter: None,
-						}),
-						stop: None,
-					}
-			}?;
+			let list_frame = ListServletsJob::run(b"list-debug")?;
 			let response = transport.emit(list_frame, None).await?.unwrap();
 			let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
 			let list_response = mgmt_response.list.expect("Should have list response");
@@ -1675,16 +1726,7 @@ mod tests {
 
 		// Test 5: List servlets again (should be back to 2)
 		println!("\n=== Test 5: List servlets after stop ===");
-		let list_frame = crate::compose! {
-			V0: id: b"list-3",
-				message: HiveManagementRequest {
-					spawn: None,
-					list: Some(ListServletsParams {
-						filter: None,
-					}),
-					stop: None,
-				}
-		}?;
+		let list_frame = ListServletsJob::run(b"list-3")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
 		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;
@@ -1702,17 +1744,7 @@ mod tests {
 
 		// Test 6: Try to spawn unknown servlet type
 		println!("\n=== Test 6: Spawn unknown servlet type ===");
-		let spawn_frame = crate::compose! {
-			V0: id: b"spawn-2",
-				message: HiveManagementRequest {
-					spawn: Some(SpawnServletParams {
-						servlet_type: b"unknown_servlet".to_vec(),
-						config: None,
-					}),
-					list: None,
-					stop: None,
-				}
-		}?;
+		let spawn_frame = SpawnServletJob::run(b"spawn-2", b"unknown_servlet", None)?;
 
 		let response = transport.emit(spawn_frame, None).await?.unwrap();
 		let mgmt_response = crate::decode::<HiveManagementResponse, _>(&response.message)?;

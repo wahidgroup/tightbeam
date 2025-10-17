@@ -10,6 +10,10 @@
 ## Status
 > Warning: This project is under active development. Public APIs and file formats MAY change WITHOUT notice. It is NOT yet production-ready.
 
+## Copyright Notice
+
+   Copyright (C) WahidGroup, LLC (2025).  All Rights Reserved.
+
 ## Abstract
 
 tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures. This specification defines the protocol's core properties: structure, frame versioning, idempotence, ordering, compactness, integrity, confidentiality, priority, lifetime, state management, matrix environment, and non-repudiation.
@@ -309,7 +313,8 @@ pub struct Frame {
 
 ## 5. ASN.1 Formal Specification
 
-This section provides the complete ASN.1 definitions for all tightbeam protocol structures, encoded using Distinguished Encoding Rules (DER).
+This section provides the complete ASN.1 definitions for all tightbeam protocol 
+structures, encoded using Distinguished Encoding Rules (DER).
 
 ### 5.1 Core Types
 
@@ -433,12 +438,52 @@ Frame ::= SEQUENCE {
 
 The protocol relies on standard ASN.1 structures:
 
+Signature & Hash algorithm as defined in RFC 5246 section 7.4.1.4.1.
+```asn
+enum {
+	none(0), md5(1), sha1(2), sha224(3), sha256(4), sha384(5),
+	sha512(6), (255)
+} HashAlgorithm;
+
+enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
+	SignatureAlgorithm;
+```
+
+From RFC 5652 and related PKCS standards in the 
+[spki](https://crates.io/crates/spki) crate.
+
 ```asn1
--- From RFC 5652 and related PKCS standards
 AlgorithmIdentifier ::= SEQUENCE {
 	algorithm	OBJECT IDENTIFIER,
 	parameters   ANY DEFINED BY algorithm OPTIONAL
 }
+```
+
+From RFC 3274 on Compressed Data Content in the 
+[cms](https://crates.io/crates/cms) crate.
+
+```asn1
+-- AlgorithmIdentifier from RFC 5652
+
+CompressionAlgorithmIdentifier ::= AlgorithmIdentifier
+
+-- Compressed Data Content Type from RFC 3274
+
+CompressedData ::= SEQUENCE {
+	version CMSVersion,       -- Always set to 0
+	compressionAlgorithm CompressionAlgorithmIdentifier,
+	encapContentInfo EncapsulatedContentInfo
+}
+
+-- Algorithm Identifiers
+
+id-alg-zlibCompress OBJECT IDENTIFIER ::= { iso(1) member-body(2)
+	us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) alg(3) 8 }
+
+-- Content Type Object Identifiers
+
+id-ct-compressedData OBJECT IDENTIFIER ::= { iso(1) member-body(2)
+	us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) ct(1) 9 }
 ```
 
 ### 5.6 Encoding Rules
@@ -782,7 +827,7 @@ There are three main components to the EECI:
 - E [Workers](#821-workers)
 - E [Servlets](#822-servlets)
 - C [Clusters](#823-clusters)
-- I [Drones](#824-drones)
+- I [Drone/Hive](#824-drones)
 
 Think of workers as ants, servlets as ant hills, and clusters as ant colonies.
 Insects have specific functions for which they process biological information.
@@ -790,7 +835,7 @@ These functions are often simple, but when combined in large numbers,
 they can perform complex tasks. The efficiency of each unit is attributed to 
 their fungible nature--how well it can accomplish its singular task. 
 
-#### 8.3.1 Workers
+#### 8.3.1 E: Workers
 
 Workers are the smallest unit of computation. They must be single-threaded and
 handle a single message at a time. Workers are the "ants" of the EECI. Insects 
@@ -856,7 +901,7 @@ tightbeam::test_worker! {
 }
 ```
 
-#### 8.3.2 Servlets
+#### 8.3.2 E: Servlets
 
 Servlets are "anthills" in the sense they operate on a specific protocol. From
 a TCP/IP perspective, an anthill is a port in many ways. Servlets are 
@@ -948,7 +993,7 @@ crate::test_servlet! {
 }
 ```
 
-#### 8.3.3 Clusters
+#### 8.3.3 C: Clusters
 
 Clusters orchestrate multiple servlets and workers. They are the "ant colonies" 
 of the EECI. Colonies are made up of multiple servlets which command different
@@ -958,22 +1003,24 @@ needs to handle its purpose. While servlets are given a relay, clusters must be
 provided a router. Routers can emit messages to the servlets within the 
 cluster. 
 
-TODO
-
-#### 8.3.4 Drones
+#### 8.3.4 I: Drones & Hives
 
 Drones are containerized servlet runners that can dynamically morph between 
-different servlet types based on activation messages from a cluster. This 
+different servlet types based on command messages from a cluster. This 
 allows you to seed your application over a specific protocol and then morph
 into any known servlet type at runtime.
+
+Hives are an extension of drones that can manage multiple servlets 
+simultaneously. They are useful for managing a pool of servlets that can be 
+activated on demand. Hives must only be available on [Mycelial](src/transport/mod.rs) 
+protocols which support multiple ports per address.
 
 ##### "Mycelial" Protocols
 
 Protocols such as TCP are considered "mycelial" as they operate over a single
-address but can have multiple ports. This allows the drone to establish
-a servlet on different ports and provide the protocol address to the cluster
-so it can register it under its hive.
-
+address but can have multiple ports (SocketAddress). This allows the hive to 
+establish a servlet on different ports and provide the protocol address to the 
+cluster so it can register it under its hive.
 
 ```rust
 
@@ -1258,3 +1305,7 @@ The workspace consists of the following components:
 
 [chat-image]: https://img.shields.io/badge/chat-Discussions-blue?logo=github
 [chat-link]: https://github.com/wahidgroup/tightbeam/discussions
+
+#### Future 
+- tightbeam-gate
+- tightbeam-exo

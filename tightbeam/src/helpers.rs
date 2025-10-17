@@ -9,25 +9,26 @@ use crate::der::{Decode, Encode};
 use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
 use crate::error::TightBeamError;
 use crate::matrix::MatrixError;
-use crate::AlgorithmIdentifier;
-use crate::Asn1Matrix;
-use crate::Result;
+use crate::{Result, Asn1Matrix, AlgorithmIdentifier, AlgorithmIdentifierOwned};
 
 #[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
 use crate::der::oid::AssociatedOid;
-#[cfg(feature = "compress")]
-use crate::CompressionInfo;
 #[cfg(feature = "aead")]
 use crate::EncryptionInfo;
 #[cfg(feature = "digest")]
 use crate::IntegrityInfo;
 #[cfg(feature = "signature")]
 use crate::SignatureInfo;
+#[cfg(feature = "compress")]
+use crate::{
+	CompressedData, 
+	error::CompressionResult, 
+	cms::{
+		content_info::CmsVersion,
+		signed_data::EncapsulatedContentInfo
+	}
+};
 
-#[cfg(feature = "compress")]
-pub type Inflator = Box<dyn FnOnce(&[u8], &CompressionInfo) -> Result<Vec<u8>>>;
-#[cfg(feature = "compress")]
-pub type Compressor = Box<dyn FnOnce(&[u8]) -> Result<(Vec<u8>, CompressionInfo)>>;
 #[cfg(feature = "aead")]
 pub type Encryptor = Box<dyn FnOnce(&[u8]) -> Result<(Vec<u8>, EncryptionInfo)>>;
 #[cfg(feature = "aead")]
@@ -38,6 +39,91 @@ pub type Signatory = Box<dyn FnOnce(&[u8]) -> Result<crate::SignatureInfo>>;
 pub type SignatureVerifier = Box<dyn FnOnce(&[u8], &crate::SignatureInfo) -> Result<()>>;
 #[cfg(feature = "digest")]
 pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::IntegrityInfo>>;
+
+/// Trait for compressing data
+#[cfg(feature = "compress")]
+pub trait Compressor {
+	/// Compress data and return the compressed bytes along with compression metadata
+	fn compress(&self, data: &[u8], content_info: Option<EncapsulatedContentInfo>) -> CompressionResult;
+}
+
+/// Trait for decompressing data
+#[cfg(feature = "compress")]
+pub trait Inflator {
+	/// Decompress data and return the decompressed bytes along with compression metadata
+	fn decompress(&self, data: &[u8]) -> CompressionResult;
+}
+
+#[cfg(feature = "compress")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ZstdCompression;
+
+#[cfg(feature = "compress")]
+impl Compressor for ZstdCompression {
+	fn compress(&self, data: &[u8], content_info: Option<EncapsulatedContentInfo>) -> CompressionResult {
+		use std::io::Cursor;
+
+		let mut output: Vec<u8> = vec![];
+		let mut encoder = zeekstd::Encoder::new(&mut output)?;
+		std::io::copy(&mut Cursor::new(data), &mut encoder)?;
+		encoder.finish()?;
+
+		let compression_alg = AlgorithmIdentifierOwned::from(ZstdCompression);
+		let encap_content_info = content_info.unwrap_or(EncapsulatedContentInfo {
+			econtent_type: crate::asn1::COMPRESSION_CONTENT_OID,
+			econtent: None
+		});
+		let compressed_data = CompressedData {
+			version: CmsVersion::V0,
+			compression_alg,
+			encap_content_info
+		};
+
+		Ok((output, compressed_data))
+	}
+}
+
+#[cfg(feature = "compress")]
+impl Inflator for ZstdCompression {
+	fn decompress(&self, data: &[u8]) -> CompressionResult {
+		use std::io::Cursor;
+
+		let mut output: Vec<u8> = vec![];
+		let mut decoder = zeekstd::Decoder::new(Cursor::new(data))?;
+		std::io::copy(&mut decoder, &mut output)?;
+
+		let compression_alg = AlgorithmIdentifierOwned::from(ZstdCompression);
+		let encap_content_info = EncapsulatedContentInfo {
+			econtent_type: crate::asn1::COMPRESSION_CONTENT_OID,
+			econtent: None
+		};
+		let compressed_data = CompressedData {
+			version: CmsVersion::V0,
+			compression_alg,
+			encap_content_info
+		};
+
+		Ok((output, compressed_data))
+	}
+}
+
+
+#[cfg(feature = "compress")]
+impl From<&ZstdCompression> for AlgorithmIdentifierOwned {
+	fn from(_: &ZstdCompression) -> AlgorithmIdentifierOwned {
+		AlgorithmIdentifierOwned {
+			oid: crate::asn1::COMPRESSION_ZSTD_OID,
+			parameters: None,
+		}
+	}
+}
+
+#[cfg(feature = "compress")]
+impl From<ZstdCompression> for AlgorithmIdentifierOwned {
+	fn from(_: ZstdCompression) -> AlgorithmIdentifierOwned {
+		(&ZstdCompression).into()
+	}
+}
 
 #[cfg(feature = "digest")]
 impl IntegrityInfo {
@@ -240,7 +326,7 @@ macro_rules! notarize {
 #[macro_export]
 macro_rules! compress {
 	($alg:ident, $data:expr) => {{
-		$crate::utils::compress($data, $crate::CompressionAlgorithm::$alg)
+		$crate::utils::compress($data, $crate::AlgorithmIdentifierOwned::$alg)
 	}};
 }
 
@@ -248,7 +334,7 @@ macro_rules! compress {
 #[macro_export]
 macro_rules! decompress {
 	($alg:ident, $data:expr) => {{
-		$crate::utils::decompress($data, $crate::CompressionAlgorithm::$alg)
+		$crate::utils::decompress($data, $crate::AlgorithmIdentifierOwned::$alg)
 	}};
 }
 

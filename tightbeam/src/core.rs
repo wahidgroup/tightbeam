@@ -8,6 +8,8 @@ use crate::crypto::sign::{SignatureEncoding, Verifier};
 use crate::EncryptionInfo;
 #[cfg(feature = "signature")]
 use crate::SignatureInfo;
+#[cfg(feature = "compress")]
+use crate::helpers::Inflator;
 
 /// A specialized Result type for TightBeam operations
 pub type Result<T> = core::result::Result<T, TightBeamError>;
@@ -95,6 +97,7 @@ impl Frame {
 	///
 	/// # Arguments
 	/// * `cipher` - The AEAD cipher to use for decryption
+	/// * `inflator` - Optional inflator for decompressing the data
 	///
 	/// # Returns
 	/// The decrypted and decoded message of type T
@@ -105,7 +108,7 @@ impl Frame {
 	/// - Decryption fails
 	/// - Deserialization of the decrypted data fails
 	#[cfg(feature = "aead")]
-	pub fn decrypt<T, C>(&self, cipher: &C) -> Result<T>
+	pub fn decrypt<T, C>(&self, cipher: &C, inflator: Option<&dyn Inflator>) -> Result<T>
 	where
 		T: Message,
 		C: Aead,
@@ -118,13 +121,18 @@ impl Frame {
 		let plaintext = cipher.decrypt(nonce, self.message.as_slice())?;
 
 		// When compressed, decompress before decoding
-		#[cfg(feature = "compress")]
-		let bytes = crate::utils::decompress(plaintext, &self.metadata.compactness)?;
+		let bytes = if self.metadata.compactness.is_some() {
+			#[cfg(not(feature = "compress"))]
+			return Err(TightBeamError::MissingFeature("compress"));
 
-		#[cfg(not(feature = "compress"))]
-		let bytes = match self.metadata.compression {
-			CompressionInfo::None => plaintext,
-			_ => return Err(TightBeamError::MissingFeature("compress")),
+			#[cfg(feature = "compress")]
+			{
+				let inflator = inflator.ok_or(TightBeamError::MissingInflator)?;
+				let (decompressed, _) = inflator.decompress(&plaintext)?;
+				decompressed
+			}
+		} else {
+			plaintext
 		};
 
 		// Decode the plaintext into type T

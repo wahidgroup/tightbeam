@@ -1,56 +1,94 @@
+//! ```text
+//!     ╔════════════════════════════════════════════════════════════════╗
+//!     ║                        T I G H T B E A M                       ║
+//!     ║             Efficient Exchange-Compute Interconnect            ║
+//!     ║           Mycelial Networking for Distributed Systems          ║
+//!     ╚════════════════════════════════════════════════════════════════╝
+//!
+//!                              ┌─────────────┐
+//!                              │   CLUSTER   │
+//!                              │  Controller │
+//!                              └──────┬──────┘
+//!                                     │
+//!                     ┌───────────────┼───────────────┐
+//!                     │               │               │
+//!               ┌─────▼─────┐    ┌────▼────┐    ┌─────▼─────┐
+//!               │   HIVE    │    │  DRONE  │    │   HIVE    │
+//!               │ Orchestr. │    │ Morpher │    │ Orchestr. │
+//!               └─────┬─────┘    └────┬────┘    └────┬──────┘
+//!                     │               │              │
+//!          ┌──────────┼──────────┐    │    ┌─────────┼──────────┐
+//!          │          │          │    │    │         │          │
+//!     ┌────▼───┐  ┌───▼────┐ ┌───▼────▼────▼───┐ ┌───▼────┐ ┌───▼────┐
+//!     │Servlet │  │Servlet │ │     Active      │ │Servlet │ │Servlet │
+//!     │  :8001 │  │  :8002 │ │     Servlet     │ │  :8003 │ │  :8004 │
+//!     └────┬───┘  └────┬───┘ └────────┬────────┘ └───┬────┘ └───┬────┘
+//!          │           │              │              │          │
+//!    ┌─────┴─────┬─────┴─────┬─────┬──┴──┬─────┬─────┴─────┬────┴┬─────┐
+//!    │     │     │     │     │     │     │     │     │     │     │     │
+//!  ┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐┌─▼──┐
+//!  │Wrkr││Wrkr││Wrkr││Wrkr││Wrkr││Wrkr││Wrkr││Wrkr││Wrkr││Wrkr││Wrkr││Wrkr│
+//!  └────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘└────┘
+//! ┌──┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌──┐
+//! │Wr││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││Wr│
+//! └──┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└──┘
+//!   Mycelial Network: Workers connect directly to servlets (no routing)
+//!
+//!    ╔═══════════════════════════════════════════════════════════════════╗
+//!    ║  Protocol-Agnostic • Zero-Copy • ASN.1 DER • Sign-Then-Encrypt    ║
+//!    ╚═══════════════════════════════════════════════════════════════════╝
+//!
+//!         ┌──────────────────────────────────────────────────────┐
+//!         │  🔐 Security Model: Sign-Then-Encrypt                │
+//!         │  ├─ Hash:    Integrity verification on plaintext     │
+//!         │  ├─ Sign:    Non-repudiation & authentication        │
+//!         │  └─ Encrypt: Confidentiality of transmitted data     │
+//!         └──────────────────────────────────────────────────────┘
+//!
+//!         ┌──────────────────────────────────────────────────────┐
+//!         │  📦 Protocol Versions                                │
+//!         │  ├─ V0: Basic metadata (id, order, hash)             │
+//!         │  ├─ V1: Secure messaging (encryption + signature)    │
+//!         │  └─ V2: Extended (priority, TTL, headers, chaining)  │
+//!         └──────────────────────────────────────────────────────┘
+//!
+//!         ┌──────────────────────────────────────────────────────┐
+//!         │  🕸️  Mycelial Architecture                           │
+//!         │  ├─ Hives:    Multi-servlet orchestrators            │
+//!         │  ├─ Drones:   Single-servlet morphers                │
+//!         │  ├─ Servlets: Self-contained message processors      │
+//!         │  └─ Direct:   Client-to-servlet connections          │
+//!         └──────────────────────────────────────────────────────┘
+//!
+//!         ┌──────────────────────────────────────────────────────┐
+//!         │  ⚡ Features                                          │
+//!         │  ├─ Protocol-agnostic transport layer                │
+//!         │  ├─ Dynamic port allocation (OS-managed)             │
+//!         │  ├─ Policy-driven message gates                      │
+//!         │  ├─ Lifecycle management (start/stop/join)           │
+//!         │  └─ Service discovery & health monitoring            │
+//!         └──────────────────────────────────────────────────────┘
+//!
+//!    ┌────────────────────────────────────────────────────────────────┐
+//!    │  Quick Start Example                                           │
+//!    ├────────────────────────────────────────────────────────────────┤
+//!    │  use tightbeam::{Message, Beamable, compose};                  │
+//!    │                                                                │
+//!    │  #[derive(Beamable, Clone, Debug, der::Sequence)]              │
+//!    │  struct MyMessage { value: u64 }                               │
+//!    │                                                                │
+//!    │  let frame = compose! {                                        │
+//!    │      V0: id: "msg-001", order: 1, message: MyMessage { .. }    │
+//!    │  }?;                                                           │
+//!    │                                                                │
+//!    │  let decode: MyMessage = tightbeam::decode(&frame.message)?;   │
+//!    └────────────────────────────────────────────────────────────────┘
+//! ```
+//!
 //! # TightBeam Protocol
 //!
 //! A lightweight, versioned messaging protocol with cryptographic primitives
 //! built on ASN.1 DER encoding.
-//!
-//! ## Security Model
-//!
-//! ### Cryptographic Operations Order (Sign-Then-Encrypt)
-//!
-//! 1. **Hash** - Computed on plaintext message for integrity verification
-//! 2. **Sign** - Computed on entire payload and appended
-//! 3. **Encrypt** - Applied to plaintext message, producing ciphertext
-//!
-//! ## Compression
-//!
-//! Optional compression can be applied to the plaintext message before hashing
-//! and signing.
-//!
-//! This follows the **sign-then-encrypt** pattern which provides:
-//! - Non-repudiation: Signature proves who created the original message
-//! - Authentication: Verifiable without requiring decryption keys
-//! - Confidentiality: Only encrypted content is transmitted
-//!
-//! ## Protocol Versions
-//!
-//! - **V0**: Basic metadata (id, order, hash, optional compression)
-//! - **V1**: Secure messaging (adds encryption + signature requirements)
-//! - **V2**: Extended features (adds priority, TTL, headers, message chaining)
-//!
-//! ## Quick Start
-//!
-//! ```rust
-//! use tightbeam::{Message, Beamable};
-//! use tightbeam::compose;
-//!
-//! #[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
-//! struct MyMessage { value: u64 }
-//!
-//! let message = MyMessage { value: 42 };
-//!
-//! // Build basic V0 message
-//! let tightbeam = compose! {
-//!     V0:
-//!         id: "demo-001",
-//!         order: 1696521600,
-//!         message: message
-//! }?;
-//!
-//! // Decode the message
-//! let decoded: MyMessage = tightbeam::decode(&tightbeam.message)?;
-//! assert_eq!(decoded.value, 42);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
 
 // TODO Find a way
 #![allow(macro_expanded_macro_exports_accessed_by_absolute_paths)]
@@ -97,6 +135,8 @@ pub mod transport;
 pub use asn1::*;
 pub use der;
 pub use spki;
+pub use cms;
+pub use x509_cert as x509;
 
 #[cfg(feature = "hex")]
 pub use hex_literal::hex;

@@ -4,10 +4,9 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 
 use crate::builder::error::{BuildError, MetadataError};
-use crate::der::asn1::Null;
 use crate::matrix::MatrixDyn;
 use crate::{
-	Asn1Matrix, CompressionInfo, EncryptionInfo, IntegrityInfo, MessagePriority, Metadata, SignatureInfo, Version,
+	Asn1Matrix, CompressedData, EncryptionInfo, IntegrityInfo, MessagePriority, Metadata, SignatureInfo, Version,
 };
 
 /// A fluent builder for TightBeam metadata.
@@ -18,7 +17,7 @@ pub struct MetadataBuilder {
 	integrity: Option<IntegrityInfo>,
 	confidentiality: Option<EncryptionInfo>,
 	nonrepudiation: Option<SignatureInfo>,
-	compactness: Option<CompressionInfo>,
+	compactness: Option<CompressedData>,
 	priority: Option<MessagePriority>,
 	lifetime: Option<u64>,
 	previous_frame: Option<IntegrityInfo>,
@@ -77,7 +76,7 @@ impl MetadataBuilder {
 	}
 
 	/// Set the compression information
-	pub fn with_compactness_info(mut self, compression: CompressionInfo) -> Self {
+	pub fn with_compactness_info(mut self, compression: CompressedData) -> Self {
 		self.compactness = Some(compression);
 		self
 	}
@@ -112,20 +111,33 @@ impl MetadataBuilder {
 	/// Returns an error if required fields are missing for the specified
 	/// version
 	pub fn build(self) -> Result<Metadata, BuildError> {
-		let id = self.id.ok_or(BuildError::InvalidMetadata(MetadataError::MissingId))?;
-		let order = self.order.ok_or(BuildError::InvalidMetadata(MetadataError::MissingTimestamp))?;
-		let compression = self.compactness.unwrap_or(CompressionInfo::NONE(Null));
-		let matrix = if let Some(m) = self.matrix {
+		let Self {
+			version,
+			id,
+			order,
+			integrity,
+			confidentiality,
+			nonrepudiation: _,
+			compactness,
+			priority,
+			lifetime,
+			previous_frame,
+			matrix,
+		} = self;
+
+		let id = id.ok_or(BuildError::InvalidMetadata(MetadataError::MissingId))?;
+		let order = order.ok_or(BuildError::InvalidMetadata(MetadataError::MissingTimestamp))?;
+		let matrix = if let Some(m) = matrix {
 			Some(Asn1Matrix::try_from(m)?)
 		} else {
 			None
 		};
 
-		match self.version {
+		match version {
 			Version::V0 => Ok(Metadata {
 				id,
 				order,
-				compactness: compression,
+				compactness,
 				integrity: None,
 				confidentiality: None,
 				priority: None,
@@ -136,9 +148,9 @@ impl MetadataBuilder {
 			Version::V1 => Ok(Metadata {
 				id,
 				order,
-				compactness: compression,
-				integrity: self.integrity,
-				confidentiality: self.confidentiality,
+				compactness,
+				integrity,
+				confidentiality,
 				priority: None,
 				lifetime: None,
 				previous_frame: None,
@@ -147,12 +159,12 @@ impl MetadataBuilder {
 			Version::V2 => Ok(Metadata {
 				id,
 				order,
-				compactness: compression,
-				integrity: self.integrity,
-				confidentiality: self.confidentiality,
-				priority: self.priority,
-				lifetime: self.lifetime,
-				previous_frame: self.previous_frame,
+				compactness,
+				integrity,
+				confidentiality,
+				priority,
+				lifetime,
+				previous_frame,
 				matrix,
 			}),
 		}

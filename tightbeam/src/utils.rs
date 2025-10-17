@@ -3,7 +3,9 @@ use crate::error::TightBeamError;
 #[cfg(feature = "compress")]
 use crate::error::CompressionError;
 #[cfg(feature = "compress")]
-use crate::{CompressionAlgorithm, CompressionInfo};
+use crate::helpers::{Compressor, Inflator};
+#[cfg(feature = "compress")]
+use crate::{AlgorithmIdentifierOwned, CompressedData};
 
 /// Macro to implement From trait for both reference and owned types
 ///
@@ -170,50 +172,22 @@ pub fn decode<'a, T: der::Decode<'a>, B: AsRef<[u8]>>(bytes: &'a B) -> Result<T,
 #[inline]
 pub fn compress(
 	data: impl AsRef<[u8]>,
-	algorithm: CompressionAlgorithm,
-) -> Result<(Vec<u8>, CompressionInfo), CompressionError> {
+	compressor: &impl Compressor,
+	content_info: Option<crate::cms::signed_data::EncapsulatedContentInfo>
+) -> Result<(Vec<u8>, CompressedData), CompressionError> {
 	let data = data.as_ref();
-	match algorithm {
-		CompressionAlgorithm::NONE => Ok((data.to_vec(), CompressionInfo::NONE(der::asn1::Null))),
-		CompressionAlgorithm::ZSTD => {
-			use std::io::Cursor;
-
-			let mut output: Vec<u8> = vec![];
-			let mut encoder = zeekstd::Encoder::new(&mut output)?;
-			std::io::copy(&mut Cursor::new(data), &mut encoder)?;
-			encoder.finish()?;
-
-			let level = 0;
-			let original_size = data.len() as u64;
-			let info = CompressionInfo::ZSTD(crate::asn1::ZstdInfo { level, original_size });
-
-			Ok((output, info))
-		}
-	}
+	Ok(compressor.compress(data, content_info)?)
 }
-/// Compress data using the specified algorithm.
+
+/// Decompress data using the specified algorithm.
 #[cfg(feature = "compress")]
 #[inline]
-pub fn decompress(data: impl AsRef<[u8]>, info: &CompressionInfo) -> Result<Vec<u8>, CompressionError> {
+pub fn decompress(
+	data: impl AsRef<[u8]>,
+	inflator: &impl Inflator
+) -> Result<(Vec<u8>, CompressedData), CompressionError> {
 	let data = data.as_ref();
-	match info {
-		crate::asn1::CompressionInfo::NONE(_) => Ok(data.to_vec()),
-		#[cfg(feature = "zstd")]
-		crate::asn1::CompressionInfo::ZSTD(_) => {
-			use std::io::Cursor;
-
-			let cursor = Cursor::new(data);
-			let mut decoder = zeekstd::Decoder::new(cursor)?;
-			let mut out: Vec<u8> = Vec::new();
-
-			std::io::copy(&mut decoder, &mut out)?;
-			Ok(out)
-		}
-		#[cfg(feature = "gzip")]
-		crate::asn1::CompressionInfo::GZIP(_) => {
-			todo!("gzip decompression not implemented yet");
-		}
-	}
+	Ok(inflator.decompress(data)?)
 }
 
 #[cfg(test)]
@@ -265,7 +239,7 @@ mod tests {
 	#[test]
 	#[cfg(feature = "compress")]
 	fn test_compress_decompress() -> Result<(), CompressionError> {
-		let algorithms = [CompressionAlgorithm::NONE, CompressionAlgorithm::ZSTD];
+		let algorithms = [AlgorithmIdentifierOwned::NONE, AlgorithmIdentifierOwned::ZSTD];
 
 		// Data-driven cases
 		let patterned = (0u32..2048).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
@@ -285,19 +259,19 @@ mod tests {
 				let decompressed = decompress(&compressed, &info)?;
 				assert_eq!(decompressed, data);
 
-				// Assert CompressionInfo metadata
+				// Assert CompressedData metadata
 				match &info {
-					crate::asn1::CompressionInfo::NONE(_) => {
+					crate::asn1::CompressedData::NONE(_) => {
 						// NONE should be identical
 						assert_eq!(compressed, data);
 					}
 					#[cfg(feature = "zstd")]
-					crate::asn1::CompressionInfo::ZSTD(z) => {
+					crate::asn1::CompressedData::ZSTD(z) => {
 						assert_eq!(z.original_size as usize, data.len());
 						assert_eq!(z.level, 0);
 					}
 					#[cfg(feature = "gzip")]
-					crate::asn1::CompressionInfo::GZIP(_) => {
+					crate::asn1::CompressedData::GZIP(_) => {
 						unreachable!("GZIP not in algorithms set");
 					}
 				}

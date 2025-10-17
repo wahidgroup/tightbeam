@@ -162,7 +162,7 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 	}?;
 
 	// Decrypt and verify the message was correctly processed
-	let decrypted = tightbeam.decrypt::<TestMessage, crypto::aead::Aes256Gcm>(&cipher)?;
+	let decrypted = tightbeam.decrypt::<TestMessage, crypto::aead::Aes256Gcm>(&cipher, None)?;
 	assert_eq!(decrypted, message);
 
 	// Verify signature

@@ -13,11 +13,9 @@ use crate::{Frame, Message, Version};
 use crate::crypto::aead::Aead;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{SignatureEncoding, Signer};
-#[cfg(feature = "compress")]
-use crate::CompressionAlgorithm;
 
 #[cfg(feature = "compress")]
-use crate::helpers::Compressor;
+use crate::{helpers::Compressor, cms::signed_data::EncapsulatedContentInfo};
 #[cfg(feature = "digest")]
 use crate::helpers::Digestor;
 #[cfg(feature = "aead")]
@@ -34,10 +32,14 @@ pub struct FrameBuilder<T: Message> {
 	message: Option<T>,
 	metadata_builder: MetadataBuilder,
 	errors: Vec<TightBeamError>,
-	compressor: Option<Compressor>,
+	#[cfg(feature = "compress")]
+	compressor: Option<(Box<dyn Compressor>, Option<EncapsulatedContentInfo>)>,
+	#[cfg(feature = "aead")]
 	encryptor: Option<Encryptor>,
 	rng: Option<Box<dyn rand_core::CryptoRngCore>>,
+	#[cfg(feature = "digest")]
 	witness: Option<Digestor>,
+	#[cfg(feature = "signature")]
 	signer: Option<Signatory>,
 }
 
@@ -48,10 +50,14 @@ impl<T: Message> From<Version> for FrameBuilder<T> {
 			message: None,
 			metadata_builder: MetadataBuilder::from(version),
 			errors: Vec::new(),
+			#[cfg(feature = "compress")]
 			compressor: None,
+			#[cfg(feature = "aead")]
 			encryptor: None,
 			rng: None,
+			#[cfg(feature = "digest")]
 			witness: None,
+			#[cfg(feature = "signature")]
 			signer: None,
 		}
 	}
@@ -78,11 +84,8 @@ impl<T: Message> FrameBuilder<T> {
 
 	/// Set the compression algorithm (all versions)
 	#[cfg(feature = "compress")]
-	pub fn with_compression(mut self, compression: CompressionAlgorithm) -> Self {
-		self.compressor = match compression {
-			CompressionAlgorithm::NONE => None,
-			_ => Some(Box::new(move |data| Ok(crate::utils::compress(data, compression)?))),
-		};
+	pub fn with_compression(mut self, compressor: impl Compressor + 'static, content_info: Option<EncapsulatedContentInfo>) -> Self {
+		self.compressor = Some((Box::new(compressor), content_info));
 		self
 	}
 
@@ -257,7 +260,7 @@ impl<T: Message> FrameBuilder<T> {
 		// Check if compression is set when required
 		let has_compression = self.compressor.is_some();
 		if T::MUST_BE_COMPRESSED && !has_compression {
-			return Err(TightBeamError::MissingCompressionInfo);
+			return Err(TightBeamError::MissingCompressedData);
 		}
 
 		let has_message_integrity = self.metadata_builder.has_hash();
@@ -323,8 +326,8 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 
 		// 2. Optional compression
 		#[cfg(feature = "compress")]
-		let bytes = if let Some(comp) = self.compressor {
-			let (compressed, compression_info) = comp(&bytes)?;
+		let bytes = if let Some((compressor, content_info)) = self.compressor {
+			let (compressed, compression_info) = compressor.compress(&bytes, content_info)?;
 
 			// Update metadata with compression info
 			metadata_builder = metadata_builder.with_compactness_info(compression_info);
@@ -382,6 +385,7 @@ mod tests {
 	use super::*;
 	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
 	use crate::{compose, test_builder, test_case};
+	use crate::helpers::ZstdCompression;
 
 	test_builder! {
 		name: test_v0_basic,
@@ -439,7 +443,7 @@ mod tests {
 			// Decrypt and verify
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
-			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher)?;
+			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher, None)?;
 			assert_eq!(decrypted, message);
 
 			Ok(())
@@ -454,6 +458,7 @@ mod tests {
 		setup: |builder| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature};
+			use crate::helpers::ZstdCompression;
 
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
@@ -464,7 +469,7 @@ mod tests {
 				.with_id("test_v1_with_compression")
 				.with_order(1696521600)
 				.with_message_hasher::<Sha3_256>()
-				.with_compression(crate::CompressionAlgorithm::ZSTD)
+				.with_compression(ZstdCompression, None)
 				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
 				.with_signer::<Secp256k1, Secp256k1Signature, _>(&signing_key)
 				.build()
@@ -482,7 +487,7 @@ mod tests {
 			// Decrypt (automatically decompresses) and verify
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
-			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher)?;
+			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher, Some(&ZstdCompression))?;
 			assert_eq!(decrypted, message);
 
 			Ok(())
@@ -515,7 +520,7 @@ mod tests {
 				.with_order(1696521600)
 				.with_message_hasher::<Sha3_256>()
 				.with_witness_hasher::<Sha3_256>()
-				.with_compression(crate::CompressionAlgorithm::ZSTD)
+				.with_compression(ZstdCompression, None)
 				.with_rng(Box::new(rng))
 				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
 				.with_signer::<Secp256k1, Secp256k1Signature, _>(&signing_key)
@@ -546,7 +551,7 @@ mod tests {
 			// Decrypt (automatically decompresses) and verify
 			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
-			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher)?;
+			let decrypted = tightbeam.decrypt::<TestMessage, Aes256Gcm>(&cipher, Some(&ZstdCompression))?;
 			assert_eq!(decrypted, message);
 
 			// Verify signature
