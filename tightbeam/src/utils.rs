@@ -188,6 +188,23 @@ pub fn decompress(data: impl AsRef<[u8]>, inflator: &impl Inflator) -> Result<Ve
 	inflator.decompress(data)
 }
 
+/// Compute a digest of the provided data using the specified algorithm.
+#[cfg(feature = "digest")]
+#[inline]
+pub fn digest<D: digest::Digest + crate::der::oid::AssociatedOid>(
+	data: impl AsRef<[u8]>,
+) -> Result<crate::asn1::DigestInfo, TightBeamError> {
+	let data = data.as_ref();
+
+	let mut hasher = D::new();
+	hasher.update(data);
+
+	let algorithm = crate::asn1::AlgorithmIdentifier { oid: D::OID, parameters: None };
+	let digest = hasher.finalize();
+	let digest_octet_string = crate::asn1::OctetString::new(digest.as_slice())?;
+	Ok(crate::asn1::DigestInfo { algorithm, digest: digest_octet_string })
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

@@ -6,19 +6,19 @@ use alloc::{string::String, vec::Vec};
 use crate::builder::error::{BuildError, MetadataError};
 use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::matrix::MatrixDyn;
-use crate::{Asn1Matrix, CompressedData, IntegrityInfo, MessagePriority, Metadata, Version};
+use crate::{Asn1Matrix, CompressedData, DigestInfo, MessagePriority, Metadata, Version};
 
 /// A fluent builder for TightBeam metadata.
 pub struct MetadataBuilder {
 	version: Version,
 	id: Option<Vec<u8>>,
 	order: Option<u64>,
-	integrity: Option<IntegrityInfo>,
+	integrity: Option<DigestInfo>,
 	compactness: Option<CompressedData>,
 	confidentiality: Option<EncryptedContentInfo>,
 	priority: Option<MessagePriority>,
 	lifetime: Option<u64>,
-	previous_frame: Option<IntegrityInfo>,
+	previous_frame: Option<DigestInfo>,
 	matrix: Option<MatrixDyn>,
 }
 
@@ -55,7 +55,7 @@ impl MetadataBuilder {
 	}
 
 	/// Set the integrity information
-	pub fn with_integrity_info(mut self, hash: IntegrityInfo) -> Self {
+	pub fn with_integrity_info(mut self, hash: DigestInfo) -> Self {
 		self.integrity = Some(hash);
 		self
 	}
@@ -85,7 +85,7 @@ impl MetadataBuilder {
 	}
 
 	/// Set the previous hash reference (V2+ only)
-	pub fn previous_frame(mut self, previous: IntegrityInfo) -> Self {
+	pub fn previous_frame(mut self, previous: DigestInfo) -> Self {
 		self.previous_frame = Some(previous);
 		self
 	}

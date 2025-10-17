@@ -188,7 +188,7 @@ pub enum TightBeamError {
 	/// Missing Integrity Info
 	#[cfg(feature = "digest")]
 	#[cfg_attr(feature = "derive", error("Missing integrity info"))]
-	MissingIntegrityInfo,
+	MissingDigestInfo,
 
 	/// Missing Compression Info
 	#[cfg(feature = "compress")]
@@ -234,7 +234,7 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
 			#[cfg(feature = "digest")]
-			TightBeamError::MissingIntegrityInfo => write!(f, "Missing integrity info"),
+			TightBeamError::MissingDigestInfo => write!(f, "Missing integrity info"),
 			#[cfg(feature = "aead")]
 			TightBeamError::MissingEncryptionInfo => write!(f, "Missing encryption info"),
 			#[cfg(feature = "signature")]

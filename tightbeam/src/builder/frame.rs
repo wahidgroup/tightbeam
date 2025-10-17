@@ -119,7 +119,7 @@ impl<T: Message> FrameBuilder<T> {
 			}
 		};
 
-		match crate::IntegrityInfo::digest::<D>(&encoded) {
+		match crate::utils::digest::<D>(&encoded) {
 			Ok(hash_info) => {
 				self.metadata_builder = self.metadata_builder.with_integrity_info(hash_info);
 			}
@@ -135,7 +135,7 @@ impl<T: Message> FrameBuilder<T> {
 	where
 		D: digest::Digest + crate::der::oid::AssociatedOid + 'static,
 	{
-		self.witness = Some(Box::new(|tbs_der: &[u8]| crate::IntegrityInfo::digest::<D>(tbs_der)));
+		self.witness = Some(Box::new(|tbs_der: &[u8]| crate::utils::digest::<D>(tbs_der)));
 		self
 	}
 
@@ -155,7 +155,7 @@ impl<T: Message> FrameBuilder<T> {
 	/// Links this message to a parent message by including the parent's
 	/// message hash. This creates a cryptographic chain of messages where
 	/// each message references the hash of its parent's content.
-	pub fn with_previous_hash(mut self, parent_hash: crate::IntegrityInfo) -> Self {
+	pub fn with_previous_hash(mut self, parent_hash: crate::DigestInfo) -> Self {
 		self.metadata_builder = self.metadata_builder.previous_frame(parent_hash);
 		self
 	}
@@ -254,12 +254,12 @@ impl<T: Message> FrameBuilder<T> {
 
 		let has_message_integrity = self.metadata_builder.has_hash();
 		if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
-			return Err(TightBeamError::MissingIntegrityInfo);
+			return Err(TightBeamError::MissingDigestInfo);
 		}
 
 		let has_frame_integrity = self.witness.is_some();
 		if T::MUST_HAVE_FRAME_INTEGRITY && !has_frame_integrity {
-			return Err(TightBeamError::MissingIntegrityInfo);
+			return Err(TightBeamError::MissingDigestInfo);
 		}
 
 		// Check if priority is set when required
@@ -339,13 +339,13 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 			// Update metadata with encryption info without data
 			metadata_builder = metadata_builder.with_confidentiality_info(encrypted_content);
 
-			encrypted_bytes
+			encrypted_bytes.into_bytes()
 		} else {
-			crate::der::asn1::OctetString::new(bytes)?
+			bytes
 		};
 
 		#[cfg(not(feature = "aead"))]
-		let message = crate::der::asn1::OctetString::new(bytes)?;
+		let message = bytes;
 
 		// Final assembled frame
 		let metadata = metadata_builder.build()?;
@@ -520,7 +520,7 @@ mod tests {
 			let signing_key = create_test_signing_key();
 
 			// Create a previous message hash for linking
-			let previous_hash = crate::IntegrityInfo::digest::<Sha3_256>(b"previous-message-data")?;
+			let previous_hash = crate::utils::digest::<Sha3_256>(b"previous-message-data")?;
 			let rng = rand_core::OsRng;
 
 			// Create custom flags

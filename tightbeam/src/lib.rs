@@ -137,6 +137,7 @@ pub mod transport;
 pub use asn1::*;
 pub use cms;
 pub use der;
+pub use pkcs12;
 pub use spki;
 pub use x509_cert as x509;
 

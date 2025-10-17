@@ -154,13 +154,13 @@ pub fn create_test_cipher_key() -> (
 	(key, cipher)
 }
 
-pub fn create_test_hash_info() -> crate::IntegrityInfo {
-	crate::IntegrityInfo {
-		hashing_algorithm: crate::AlgorithmIdentifier {
+pub fn create_test_hash_info() -> crate::DigestInfo {
+	crate::DigestInfo {
+		algorithm: crate::AlgorithmIdentifier {
 			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"), // SHA-256
 			parameters: None,
 		},
-		parameters: vec![0u8; 32],
+		digest: crate::asn1::OctetString::new(vec![0u8; 32]).expect("Failed to create OctetString"),
 	}
 }
 

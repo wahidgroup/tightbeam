@@ -1,3 +1,4 @@
+use crate::asn1::OctetString;
 use crate::error::Result;
 use crate::{Frame, Metadata, TightBeamError, Version};
 
@@ -103,6 +104,7 @@ impl Frame {
 		T: Message,
 	{
 		// Extract encrypted content info from metadata and reconstruct with message bytes
+		let message = OctetString::new(self.message.clone())?;
 		let mut encrypted_content_info = self
 			.metadata
 			.confidentiality
@@ -110,7 +112,7 @@ impl Frame {
 			.ok_or(TightBeamError::MissingEncryptionInfo)?;
 
 		// The encrypted content is stored in the message field
-		encrypted_content_info.encrypted_content = Some(self.message.clone());
+		encrypted_content_info.encrypted_content = Some(message);
 
 		// Decrypt using the Decryptor trait
 		let plaintext = decryptor.decrypt_content(&encrypted_content_info)?;

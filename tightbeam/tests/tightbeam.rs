@@ -2,18 +2,24 @@
 //!
 //! Demonstrates full V2 protocol capabilities using the compose! macro.
 
+use der::ValueOrd;
 use tightbeam::compose;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
 use tightbeam::prelude::*;
 
 use tightbeam::crypto::aead::KeyInit;
-use tightbeam::crypto::hash::Digest;
 
 /// Simple test message
 #[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
 #[derive(Clone, Debug, PartialEq, Sequence)]
 struct TestMessage {
 	content: String,
+}
+
+impl AsRef<[u8]> for TestMessage {
+	fn as_ref(&self) -> &[u8] {
+		self.content.as_bytes()
+	}
 }
 
 #[cfg(not(feature = "derive"))]
@@ -72,11 +78,6 @@ impl PartialEq<u8> for FlagTestDebugLevel {
 	}
 }
 
-/// Helper to hash a message for verification (uses default hash)
-fn hash_message(message: &TestMessage) -> Vec<u8> {
-	sha3::Sha3_256::digest(tightbeam::encode(message).unwrap()).to_vec()
-}
-
 // Define the flag set with automatic position assignment
 tightbeam::flagset!(TestFlagSet: FlagTestDevelopmentMode, FlagTestDebugLevel);
 
@@ -114,7 +115,7 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 	// Create a test message
 	let message = TestMessage { content: "Hello, secure world!".to_string() };
 	// Hash the message
-	let message_hash = hash_message(&message);
+	let message_hash = tightbeam::utils::digest::<crypto::hash::Sha3_256>(&message)?;
 
 	// Setup metadata
 	let order = 1696521600;
@@ -175,7 +176,7 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 	assert_eq!(tightbeam.metadata.priority, Some(priority));
 	assert_eq!(tightbeam.metadata.lifetime, Some(ttl));
 	assert_eq!(tightbeam.metadata.previous_frame, Some(previous));
-	assert!(tightbeam.metadata.integrity.clone().unwrap().compare(&message_hash));
+	assert!(tightbeam.metadata.integrity.clone().unwrap().value_cmp(&message_hash).is_ok());
 	assert!(tightbeam.metadata.matrix.is_some());
 	assert!(tightbeam.metadata.previous_frame.is_some());
 

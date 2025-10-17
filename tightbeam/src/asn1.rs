@@ -3,7 +3,6 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-use crate::der::asn1::OctetString;
 use crate::der::oid::ObjectIdentifier;
 use crate::der::{Enumerated, Sequence};
 
@@ -12,6 +11,8 @@ pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::content_info::ContentInfo;
 pub use crate::cms::enveloped_data::EncryptedContentInfo;
 pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
+pub use crate::der::asn1::OctetString;
+pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
@@ -97,48 +98,6 @@ pub enum MessagePriority {
 	Heartbeat = 6,
 }
 
-/// Hash information for integrity validation
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// IntegrityInfo ::= SEQUENCE {
-///     algorithm   AlgorithmIdentifier,
-///     parameters  ANY DEFINED BY algorithm
-/// }
-/// ```
-#[cfg(feature = "zeroize")]
-#[derive(Sequence, Debug, Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
-pub struct IntegrityInfo<A = crate::der::asn1::Any, T = Vec<u8>>
-where
-	for<'a> A: crate::der::Choice<'a> + crate::der::Encode,
-	for<'a> T: crate::der::Decode<'a> + crate::der::Encode,
-	T: zeroize::Zeroize,
-{
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub hashing_algorithm: AlgorithmIdentifier<A>,
-	pub parameters: T,
-}
-
-/// Hash information for integrity validation
-///
-/// ASN.1 Definition:
-/// ```asn1
-/// IntegrityInfo ::= SEQUENCE {
-///     algorithm   AlgorithmIdentifier,
-///     parameters  ANY DEFINED BY algorithm
-/// }
-/// ```
-#[cfg(not(feature = "zeroize"))]
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
-pub struct IntegrityInfo<A = crate::der::asn1::Any, T = Vec<u8>>
-where
-	for<'a> A: crate::der::Choice<'a> + crate::der::Encode,
-	for<'a> T: crate::der::Decode<'a> + crate::der::Encode,
-{
-	pub hashing_algorithm: AlgorithmIdentifier<A>,
-	pub parameters: T,
-}
-
 /// NxN matrix control flags
 ///
 /// ASN.1 Definition:
@@ -178,11 +137,11 @@ pub struct Asn1Matrix {
 ///     id               OCTET STRING,
 ///     order            INTEGER,
 ///     compactness      CompressedData,
-///     integrity        [0] IntegrityInfo OPTIONAL,
+///     integrity        [0] DigestInfo OPTIONAL,
 ///     confidentiality  [1] EncryptionInfo OPTIONAL,
 ///     priority         [2] MessagePriority OPTIONAL,
 ///     lifetime         [3] INTEGER OPTIONAL,
-///     previousFrame    [4] IntegrityInfo OPTIONAL,
+///     previousFrame    [4] DigestInfo OPTIONAL,
 ///     matrix           [5] Matrix OPTIONAL
 /// }
 /// ```
@@ -198,7 +157,8 @@ pub struct Metadata {
 
 	// V1+ fields
 	#[asn1(context_specific = "0", optional = "true")]
-	pub integrity: Option<IntegrityInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub integrity: Option<DigestInfo>,
 	#[asn1(context_specific = "1", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub confidentiality: Option<EncryptedContentInfo>,
@@ -210,7 +170,8 @@ pub struct Metadata {
 	#[asn1(context_specific = "3", optional = "true")]
 	pub lifetime: Option<u64>,
 	#[asn1(context_specific = "4", optional = "true")]
-	pub previous_frame: Option<IntegrityInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub previous_frame: Option<DigestInfo>,
 	#[asn1(context_specific = "5", optional = "true")]
 	pub matrix: Option<Asn1Matrix>,
 }
@@ -225,7 +186,7 @@ pub struct Metadata {
 ///     version        Version,
 ///     metadata       Metadata,
 ///     message        MessageContent,
-///     integrity      [0] IntegrityInfo OPTIONAL,
+///     integrity      [0] DigestInfo OPTIONAL,
 ///     nonrepudiation [1] SignerInfo    OPTIONAL
 /// }
 /// ```
@@ -235,10 +196,10 @@ pub struct Frame {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub version: Version,
 	pub metadata: Metadata,
-	#[cfg_attr(feature = "zeroize", zeroize(skip))]
-	pub message: OctetString,
+	pub message: Vec<u8>,
 	#[asn1(context_specific = "0", optional = "true")]
-	pub integrity: Option<IntegrityInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub integrity: Option<DigestInfo>,
 	#[asn1(context_specific = "1", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub nonrepudiation: Option<SignerInfo>,

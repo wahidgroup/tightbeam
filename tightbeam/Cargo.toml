@@ -23,6 +23,7 @@ tightbeam-derive = { workspace = true, optional = true }
 der = { workspace = true }
 spki = { workspace = true }
 cms = { workspace = true }
+pkcs12 = { workspace = true }
 x509-cert = { workspace = true, optional = true }
 hex-literal = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }

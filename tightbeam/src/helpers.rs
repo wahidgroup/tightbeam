@@ -9,46 +9,15 @@ use crate::der::{Decode, Encode};
 use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
 use crate::error::Result;
 use crate::matrix::MatrixError;
-use crate::{AlgorithmIdentifier, Asn1Matrix};
+use crate::Asn1Matrix;
 
-#[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
-use crate::der::oid::AssociatedOid;
-#[cfg(feature = "digest")]
-use crate::IntegrityInfo;
 #[cfg(feature = "signature")]
 use crate::SignerInfo;
 
 #[cfg(feature = "signature")]
 pub type SignatureVerifier = Box<dyn FnOnce(&[u8], &SignerInfo) -> Result<()>>;
 #[cfg(feature = "digest")]
-pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::IntegrityInfo>>;
-
-#[cfg(feature = "digest")]
-impl IntegrityInfo {
-	/// Create a IntegrityInfo by computing a digest of the data using a
-	/// RustCrypto Digest implementation.
-	///
-	/// # Security Note
-	/// The hash is computed over the plaintext message before encryption.
-	/// This allows integrity verification without requiring decryption keys,
-	/// following the sign-then-encrypt pattern.
-	pub fn digest<D>(data: impl AsRef<[u8]>) -> Result<Self>
-	where
-		D: digest::Digest + AssociatedOid,
-	{
-		let mut hasher = D::new();
-		digest::Digest::update(&mut hasher, data.as_ref());
-		let result = hasher.finalize();
-
-		let algorithm = AlgorithmIdentifier { oid: D::OID, parameters: None };
-		let digest = result.to_vec();
-		Ok(Self { hashing_algorithm: algorithm, parameters: digest })
-	}
-
-	pub fn compare(&self, hash: impl AsRef<[u8]>) -> bool {
-		self.parameters.as_slice() == hash.as_ref()
-	}
-}
+pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::DigestInfo>>;
 
 impl Asn1Matrix {
 	/// Validate invariants per spec.
@@ -281,29 +250,6 @@ mod tests {
 
 			Ok(())
 		}
-	}
-
-	#[cfg(feature = "sha3")]
-	#[test]
-	fn test_hash_info_digest() {
-		use crate::crypto::hash::Sha3_256;
-		use crate::IntegrityInfo;
-
-		// Test data to hash
-		let data = b"Hello, TightBeam!";
-		// Use the digest helper method with SHA3-256
-		let hash_info = IntegrityInfo::digest::<Sha3_256>(data).unwrap();
-
-		// Verify the hash algorithm OID is set correctly (SHA3-256 OID)
-		let algorithm = hash_info.hashing_algorithm.oid.to_string();
-		assert_eq!(algorithm, "2.16.840.1.101.3.4.2.8");
-
-		// Verify the digest is not empty
-		assert!(!hash_info.parameters.is_empty());
-
-		// SHA3-256 produces a 32-byte hash
-		let length = hash_info.parameters.len();
-		assert_eq!(length, 32);
 	}
 
 	mod validation {
