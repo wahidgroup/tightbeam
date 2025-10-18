@@ -1207,14 +1207,14 @@ service: |message, tx| async move {
 	- If no response, `None`
 	- If response, `Some(Frame)`
 	- If error, `Err(TransportError)`
-7. The client MAY process the response and can now determine:
+7. The client MAY process the response and determine:
 	- What the client sent
 	- What the gate accepted or rejected
 	- What the server wants to assert
 	- What the server responded with
 	- What the client received
 
-Container is in a "Quantum State" before the client gets the response. The 
+The container is in a "Quantum State" before the client gets the response. The 
 "wave function collapses" when await completes--causality intact. You can now 
 observe the results of rx, ok_rx, and reject_rx: 
 ```rust
