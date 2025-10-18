@@ -732,7 +732,7 @@ Metadata ::= SEQUENCE {
 	confidentiality  [1] EncryptedContentInfo OPTIONAL,
 	priority         [2] MessagePriority OPTIONAL,
 	lifetime         [3] INTEGER OPTIONAL,
-	`previous_frame`    [4] DigestInfo OPTIONAL,
+	previous_frame   [4] DigestInfo OPTIONAL,
 	matrix           [5] Matrix OPTIONAL
 }
 
@@ -1017,7 +1017,7 @@ a TCP/IP perspective, an anthill is a port in many ways. Servlets are
 multi-threaded and must handle messages asynchronously. A servlet may also
 define as many different workers as it needs to accomplish its task as well
 as a set of configurations. Servlets must be provided a relay which is used to
-relay Message types to the worker without the entire Frame.
+relay `Message` types to the worker without the entire Frame.
 
 ```rust
 tightbeam::servlet! {
@@ -1112,6 +1112,10 @@ needs to handle its purpose. While servlets are given a relay, clusters must be
 provided a router. Routers can emit messages to the servlets registered within 
 the cluster. 
 
+```rust
+TODO
+```
+
 #### 8.3.4 I: Drones & Hives
 
 Drones are containerized servlet runners that can dynamically morph between 
@@ -1123,8 +1127,8 @@ Hives are an extension of drones that can manage multiple servlets
 simultaneously. They are useful for managing a pool of servlets that can be 
 activated on demand. Hives must only be available on 
 [Mycelial](src/transport/mod.rs) protocols which support multiple ports 
-per address. Hives should maintain exactly the number of servlets required
-to efficiently process messages from the cluster.
+per address. Hives should automatically maintain exactly the number of servlets 
+required to efficiently process messages from the cluster.
 
 ##### "Mycelial" Protocols
 
@@ -1135,7 +1139,6 @@ cluster so it can register it under its hive.
 
 ```rust
 TODO
-
 ```
 
 ##### Conclusion
