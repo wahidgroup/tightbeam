@@ -368,7 +368,7 @@ DigestInfo ::= SEQUENCE {
 }
 ```
 
-Used in `Metadata.integrity`, `Metadata.previousFrame`, and `Frame.integrity` fields.
+Used in `Metadata.integrity`, `Metadata.`previous_frame``, and `Frame.integrity` fields.
 
 #### Encrypted Content Information ([RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652) - CMS)
 
@@ -441,7 +441,7 @@ Metadata ::= SEQUENCE {
 	-- V2+ fields (context-specific tags)
 	priority         [2] MessagePriority OPTIONAL,
 	lifetime         [3] INTEGER OPTIONAL,
-	previousFrame    [4] DigestInfo OPTIONAL,
+	`previous_frame`    [4] DigestInfo OPTIONAL,
 	matrix           [5] Matrix OPTIONAL
 }
 ```
@@ -528,83 +528,162 @@ Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms a
 
 #### Version 2 (V2)
 - INHERITS: All V1 requirements
-- OPTIONAL: `priority`, `lifetime`, `previousFrame`, `matrix`
+- OPTIONAL: `priority`, `lifetime`, ``previous_frame``, `matrix`
 
 ### 5.8 Semantic Constraints
 
-#### Message Ordering
+#### 5.8.1 Message Ordering
 - `order` field MUST be monotonically increasing within a message sequence
 - `order` values SHOULD be based on reliable timestamp sources
-- Duplicate `order` values within the same `id` namespace are forbidden
+- Duplicate `order` values within the same `id` namespace MUST be rejected
 
-#### Compression Requirements
-- When `compactness` is not `none`, the `message` field MUST contain compressed data
-- `originalSize` in compression info MUST match the uncompressed message size
-- Compression level MUST be within algorithm-specific valid ranges
+#### 5.8.2 Compression Requirements
+- When `compactness` is present (not `None`), the `message` field MUST contain compressed data encoded as `CompressedData` per RFC 3274
+- The `encapContentInfo` within `CompressedData` MUST use the `id-data` content type OID if the compressed data does not conform to any other recognized content type
+- Compression algorithm identifiers MUST be valid OIDs (e.g., `id-alg-zlibCompress` for zlib, custom OIDs for zstd -- tightbeam uses 1.2.840.113549.1.9.16.3 pending formal assignment)
+- Compression level parameters, when specified in `compressionAlgorithm.parameters`, MUST be within algorithm-specific valid ranges
 
-#### Previous Frame Chaining
-- The `previousFrame` field creates a cryptographic hash chain linking frames
+#### 5.8.3 Previous Frame Chaining
+- The ``previous_frame`` field creates a cryptographic hash chain linking frames
 - Each frame's hash commits to all previous history through transitive hashing
 - This enables:
   - **Causal Ordering**: Frames carry proof of their position in the sequence
   - **Tamper Detection**: Any modification to a previous frame breaks all subsequent hashes
   - **Replay Protection**: Receivers can detect out-of-sequence or duplicate frames
-  - **Fork Detection**: Multiple frames with the same `previousFrame` indicate reality branching
+  - **Fork Detection**: Multiple frames with the same ``previous_frame`` indicate reality branching
   - **Stateless Verification**: Frame ancestry can be verified without storing the entire chain
-- Implementations MAY store frames to enable full chain reconstruction
-- Implementations MAY use sparse storage (e.g., every Nth frame) for efficient verification
+- Implementations MAY store any frames to enable full chain reconstruction to their desired root
 
-#### What is the Matrix?
+### 5.9 What is the Matrix?
 
-The matrix field enables protocol-agnostic state representation and reality modeling through an N×N control structure.
+The Matrix is a compact, flexible structure for transmitting state information. 
+It uses a grid of cells, encoded with ASN.1 DER, to represent application-defined 
+states with perfect structure, aligning with tightbeam's core constraint: $ I(t) \in (0,1) $.
 
-##### Wire Format
-- **ASN.1 Type**: `Matrix ::= SEQUENCE { n INTEGER (1..255), data OCTET STRING (SIZE(1..(255*255))) }`
-- **Encoding**: DER (Distinguished Encoding Rules)
-- **Layout**: Row-major ordering; cell at (row r, col c) is at index `r*n + c`
-- **Size Bounds**: n ∈ [1, 255]; data length MUST equal n²
-- **Maximum Size**: 255×255 = 65,025 bytes (~63.5 KB)
-- **State Space**: 256^(n²) possible combinations per matrix
+#### 5.9.1 Why Use the Matrix?
 
-##### Semantics
-- **Cell Values**: Each cell is a u8 value (0-255)
-- **Profile-Defined Semantics**: Protocol profiles MUST define the meaning of non-zero values
-- **Off-Diagonal Cells**: Unless a profile defines otherwise, receivers SHOULD treat off-diagonal cells as unspecified and MUST NOT fail if they are non-zero
-- **Diagonal Flags**: Profiles MAY map independent, position-stable flags onto the diagonal (r == c); unset is 0, set or configured values are non-zero per profile
-- **Extensibility**: New flags can be added at unused diagonal positions without breaking existing implementations
+The matrix enables applications to:
+- **Pack Dense State**: Store up to 255×255 values (0-255) in ~63.5 KB.
+- **Support Evolution**: Extensible design ensures backward compatibility.
+- **Ensure Fidelity**: Deterministic encoding and validation constrain I(t) ∈ (0,1).
+- **Enable Advanced Modeling**: Combine with `previous_frame` for causal state tracking.
 
-##### Validation
-- Encoders MUST only emit a Matrix when `data.len == n*n`
-- Decoders MUST reject a Matrix whose data length `!= n*n`
-- Absent/optional Matrix fields MUST be treated as “no matrix provided”; profiles MAY define a default
+#### 5.9.2 The Simple View
 
-##### Runtime Mapping (Non-Normative)
-- Implementations typically expose dynamic `MatrixDyn` (n decided at runtime) and `Matrix<N>` (const generic) types that implement a `MatrixLike` trait
-- Conversions between wire and runtime matrices SHOULD preserve row-major ordering and exact length; invalid input MUST be rejected
+The matrix is a 2D grid where each cell holds a number from 0 to 255, with 
+meanings defined by the application (e.g., flags, counters, states, functions). 
+Mathematically, it is a 2D array \( M \) of size \( n \times n \) (\( n \leq 255 \)), 
+with elements \( M[r,c] \in \{0, \dots, 255\} \). 
+Maximum entropy for a full matrix is \( H = n^2 \log_2 256 = 8n^2 \) bits, 
+assuming uniform distribution. Sparse matrices, using fewer cells, have lower 
+entropy (e.g., 8k bits for k used cells).
 
-##### Reality Modeling with Matrix and Previous Frame
-The combination of `matrix` and `previousFrame` enables sophisticated reality modeling:
+**Key Dimensions**:
+1. **Row (r)**: 0 to \( n-1 \), vertical position.
+2. **Column (c)**: 0 to \( n-1 \), horizontal position.
+3. **Value (\( M[r,c] \))**: 0 to 255, application-defined dimension.
 
-- **State Representation**: The `matrix` field encodes the current reality state (N×N control flags)
-- **Causal History**: The `previousFrame` field links to the parent reality through cryptographic hashing
-- **Reality Chains**: Sequential frames form a directed acyclic graph (DAG) of causally-linked states
-- **Reality Branching**: Multiple frames with the same `previousFrame` but different `matrix` values represent parallel realities
-- **State Transitions**: The evolution of `matrix` values across the chain represents reality state transitions
-- **Temporal Ordering**: The `order` field combined with `previousFrame` provides both logical and temporal sequencing
+**Example**: A 2x2 matrix for a game state:
+- \( M[0,0] = 1 \) (Player 1 at (0,0))
+- \( M[1,1] = 2 \) (Player 2 at (1,1))
+- \( M[0,1] = 0, M[1,0] = 0 \) (empty)
+- Matrix coordinates can encode structured data like public keys.
 
-As a result, "shared realities" can be transmitted with each message allowing ephemeral consensus and coordination
-in a hightly compact and efficient manner.
+#### 5.9.3 Wire Format (Technical Details)
 
-This architecture enables:
-- **Distributed Consensus**: Nodes can propose and converge on canonical reality chains
-- **Event Sourcing**: Frames serve as immutable events with state snapshots
-- **Speculative Execution**: Fork realities for "what-if" scenarios, then merge or discard
-- **Conflict-Free Replication**: Matrix state + causal dependencies enable deterministic merging
-- **Blockchain Properties**: Immutability, causal ordering, and fork detection without requiring full chain storage
+The matrix uses ASN.1 DER for deterministic serialization.
 
-A simple "flatworld" implementation of its usage can be observed in the flag system.
+**ASN.1 Schema (full matrix)**:
+```asn1
+Matrix ::= SEQUENCE {
+    n INTEGER (1..255),                 -- Grid size (n x n)
+    data OCTET STRING (SIZE(1..65025))  -- Row-major cell values
+}
+```
 
-### 5.9 Complete ASN.1 Module
+**Encoding & Performance**:
+- **Layout**: Row-major order, cell (r,c) at index \( r \cdot n + c \).
+- **Size**: \( n \in [1, 255] \), data length \( n^2 \), max 65,025 bytes (~63.5 KB).
+- **State Space**: \( 256^{n^2} \) possible matrices.
+- **Entropy**: \( H = 8n^2 \) bits (uniform distribution).
+- **Complexity**: Encoding/decoding: O(n²). Length validation: O(1).
+
+#### 5.9.4 Usage Rules
+
+To constrain \( I(t) \in (0,1) \):
+
+- **Encoding**: Encoders MUST set data.len = n², filling cells with values 0-255.
+- **Decoding**: Decoders MUST reject matrices where data.len != n² or values exceed 255.
+- **Semantics**: Applications define value meanings (e.g., 1 = "active", public key bytes).
+- **Unspecified Cells**: Receivers SHOULD ignore non-zero values in undefined cells to support evolvability.
+- **Absent Matrix**: If the matrix field is omitted, applications MAY assume a default state.
+
+#### 5.9.5 Example: Flag System
+
+Set diagonal flags in a 3x3 matrix:
+
+```rust
+use tightbeam::Matrix;
+
+// Full 3x3 matrix
+let mut matrix = Matrix::<3>::default();
+matrix.set(0, 0, 1)?; // Feature A: enabled
+matrix.set(1, 1, 1)?; // Feature B: enabled
+matrix.set(2, 2, 0)?; // Feature C: disabled
+
+// Embed in a frame
+let frame = compose! {
+    V1: id: "config-001",
+        order: 1000,
+        message: my_message,
+        matrix: Some(matrix)
+}?;
+```
+
+**Visualization (full)**:
+```
+[1, 0, 0]
+[0, 1, 0]
+[0, 0, 0]
+```
+
+This supports up to 255 flags, extensible by adding new diagonal entries. 
+For structured data, use non-diagonal cells (e.g., \( M[0,1] = 10 \) for a 
+count, or map public keys to coordinate regions).
+
+#### 5.9.6 Advanced: Reality Modeling with Matrix and Previous Frame
+
+The matrix, combined with the `previous_frame` field, enables sophisticated 
+state tracking, modeled as a directed acyclic graph (DAG) of state transitions. 
+Mathematically, frames form a Markov chain where each matrix \( M_t \) at time 
+t depends on \( M_{t-1} \), linked via cryptographic hashes in `previous_frame`.
+
+**State Evolution**:
+- **Snapshots**: Each matrix \( M_t \) is a state snapshot, with entropy up to \( 8n^2 \) bits.
+- **Causal Links**: `previous_frame` hashes ensure a DAG, where \( M_t \to M_{t-1} \) via hash verification.
+- **Transitions**: Changes in \( M_t[r,c] \) across frames model state updates.
+- **Branching**: Multiple frames sharing a `previous_frame` but differing in \( M_t \) represent alternative states.
+
+**Mathematical Model**: 
+Applications define a transition probability \( P(M_t | M_{t-1}) \), 
+where changes reflect logic or noise. 
+For example, \( I(t) = I(M_t; M_{t-1}) / H(M_t) \in (0,1) \) may measure 
+fidelity based on shared state, but I(t) is application-defined, constrained
+by hash consistency and partial state recovery.
+
+**Applications**:
+- **Consensus**: Nodes propose \( M_t \), converging on a canonical DAG path.
+- **Event Sourcing**: Frames as immutable events, with \( M_t \) capturing state.
+- **Speculative Execution**: Fork \( M_t \) for "what-if" states, merge via consensus.
+- **Replication**: Causal links enable conflict-free merging, as nodes reconstruct the DAG.
+- **Tamper Detection**: Hash mismatches break the chain, ensuring I(t) > 0 only for valid states.
+
+#### 5.9.7 Summary
+
+The matrix supports flexible state representation, from simple flags to 
+structured data encoding allowing for dynamic computation.
+
+### 5.10 Complete ASN.1 Module
 
 ```asn1
 tightbeam-Protocol-V2 DEFINITIONS EXPLICIT TAGS ::= BEGIN
@@ -653,7 +732,7 @@ Metadata ::= SEQUENCE {
 	confidentiality  [1] EncryptedContentInfo OPTIONAL,
 	priority         [2] MessagePriority OPTIONAL,
 	lifetime         [3] INTEGER OPTIONAL,
-	previousFrame    [4] DigestInfo OPTIONAL,
+	`previous_frame`    [4] DigestInfo OPTIONAL,
 	matrix           [5] Matrix OPTIONAL
 }
 

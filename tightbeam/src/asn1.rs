@@ -27,7 +27,11 @@ pub const COMPRESSION_CONTENT_OID: ObjectIdentifier = ObjectIdentifier::new_unwr
 ///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
 ///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
 /// }
-pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
+pub const COMPRESSION_ZLIB_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
+/// OID for zstd compression defined in RFC 8878
+/// See `<https://datatracker.ietf.org/doc/html/rfc8878>`
+/// See `<https://oid-base.com/get/1.3.6.1.4.1.50274.1.1>`
+pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3");
 /// sha3-256
 /// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
 pub const HASH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8");
