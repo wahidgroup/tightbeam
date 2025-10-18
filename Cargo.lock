@@ -151,6 +151,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cms"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b77c319abfd5219629c45c34c89ba945ed3c5e49fcde9d16b6c3885f118a730"
+dependencies = [
+ "const-oid",
+ "der",
+ "spki",
+ "x509-cert",
+ "zeroize",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -773,6 +786,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -792,6 +811,20 @@ name = "pin-project-lite"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
+
+[[package]]
+name = "pkcs12"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "695b3df3d3cc1015f12d70235e35b6b79befc5fa7a9b95b951eab1dd07c9efc2"
+dependencies = [
+ "cms",
+ "const-oid",
+ "der",
+ "spki",
+ "x509-cert",
+ "zeroize",
+]
 
 [[package]]
 name = "pkcs8"
@@ -1128,10 +1161,11 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-rs"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aead",
  "aes-gcm",
+ "cms",
  "crypto-common",
  "der",
  "digest",
@@ -1139,6 +1173,8 @@ dependencies = [
  "fake",
  "hex-literal",
  "k256",
+ "paste",
+ "pkcs12",
  "rand",
  "rand_core 0.6.4",
  "sha3",
