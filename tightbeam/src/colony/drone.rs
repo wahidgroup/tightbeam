@@ -1200,8 +1200,8 @@ mod tests {
 	use crate::policy::GatePolicy;
 	use crate::policy::TransitStatus;
 	use crate::transport::policy::PolicyConf;
-	use crate::{Beamable, Frame};
 	use crate::{job, mutex, policy, servlet, worker};
+	use crate::{Beamable, Frame};
 
 	// Jobs for hive management operations
 	job! {

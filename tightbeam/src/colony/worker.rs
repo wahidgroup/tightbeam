@@ -161,14 +161,14 @@ impl core::fmt::Display for WorkerRelayError {
 impl std::error::Error for WorkerRelayError {}
 
 pub struct WorkerPolicies<I: Send> {
-    #[allow(dead_code)]
-    pub(crate) receptor_gates: Vec<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
+	#[allow(dead_code)]
+	pub(crate) receptor_gates: Vec<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
 }
 
 impl<I: Send> WorkerPolicies<I> {
-    pub fn receptor_gates(&self) -> &[Arc<dyn ReceptorPolicy<I> + Send + Sync>] {
-        &self.receptor_gates
-    }
+	pub fn receptor_gates(&self) -> &[Arc<dyn ReceptorPolicy<I> + Send + Sync>] {
+		&self.receptor_gates
+	}
 }
 
 impl<I: Send> Default for WorkerPolicies<I> {
@@ -513,7 +513,7 @@ macro_rules! worker {
 				}
 				let $message_ident = message;
 				let output = (async move $handler_block).await;
-				let _ = respond_to.send(output);
+				let _ = respond_to.send(Ok(output));
 			}
 		}
 	}};

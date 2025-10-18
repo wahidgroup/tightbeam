@@ -4,13 +4,13 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 
 // Re-exports
-pub use crate::der::asn1::*;
-pub use crate::der::{Sequence, Choice, Enumerated};
 pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::content_info::ContentInfo;
 pub use crate::cms::enveloped_data::EncryptedContentInfo;
 pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
 pub use crate::der::asn1::OctetString;
+pub use crate::der::asn1::*;
+pub use crate::der::{Choice, Enumerated, Sequence};
 pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::x509::ext::pkix::HashAlgorithm;

@@ -77,6 +77,12 @@ enum LedgerState {
 	Last(u64),
 }
 
+impl Default for LedgerState {
+	fn default() -> Self {
+		Self::Full(Null)
+	}
+}
+
 /// A key-value balance entry in the ledger
 #[derive(Clone, Debug, PartialEq, Eq, Sequence)]
 struct BalanceEntry {
@@ -194,7 +200,11 @@ pub fn map_pubkey_to_matrix<M: MatrixLike>(
 ///
 /// # Errors
 /// Returns MatrixError::OutOfBounds if the region would extend beyond matrix bounds
-pub fn extract_pubkey_from_matrix<M: MatrixLike>(matrix: &M, start_row: u8, start_col: u8) -> MatrixResult<LedgerPublicKey> {
+pub fn extract_pubkey_from_matrix<M: MatrixLike>(
+	matrix: &M,
+	start_row: u8,
+	start_col: u8,
+) -> MatrixResult<LedgerPublicKey> {
 	// Ensure the target region fits within matrix bounds
 	let n = matrix.n();
 	if start_row + 5 > n || start_col + 7 > n {
@@ -233,7 +243,7 @@ job! {
 		}
 
 		while level.len() > 1 {
-			let mut next = Vec::with_capacity((level.len() + 1) / 2);
+			let mut next = Vec::with_capacity(level.len().div_ceil(2));
 			for chunk in level.chunks(2) {
 				let left = chunk[0];
 				let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
@@ -321,37 +331,47 @@ job! {
 worker! {
 	name: MerkleWorker<MerkleRequest, MerkleResponse>,
 	handle: |message| async move {
-		Ok(match message {
+		match message {
 			MerkleRequest::ComputeRoot(sequence) => MerkleComputeRootJob::run(sequence),
 			MerkleRequest::VerifyPath(params) => MerkleVerifyPathJob::run(params),
-		})
+		}
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashMap;
-
 	use rand_core::OsRng;
+	use std::collections::HashMap;
 
 	use super::*;
 
+	use tightbeam::asn1::{AlgorithmIdentifier, OctetString};
 	use tightbeam::cms::signed_data::SignerIdentifier;
-	use tightbeam::crypto::hash::{Digest, Sha3_256};
-	use tightbeam::crypto::sign::ecdsa::k256::elliptic_curve::sec1::ToEncodedPoint;
-	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use tightbeam::crypto::hash::Sha3_256;
+	use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use tightbeam::matrix::MatrixLike;
-	use tightbeam::policy::TransitStatus;
 	use tightbeam::prelude::policy::PolicyConf;
-	use tightbeam::{rwlock, servlet};
+	use tightbeam::DigestInfo;
+	use tightbeam::{compose, decode, rwlock, servlet};
 
 	#[cfg(feature = "tokio")]
 	use tightbeam::transport::tcp::r#async::TokioListener as Listener;
-	#[cfg(all(not(feature = "tokio"), feature = "std"))]
+	#[cfg(not(feature = "tokio"))]
 	type Listener = TcpListener<std::net::TcpListener>;
 
-	const KEY_PUBLIC: LedgerPublicKey = tightbeam::hex!("0289f6f78e3bf63a847b3217a8f205ecb4f55abad95d4b3b3d9ca2d6b9a0f31461");
+	// A Genesis Key is known
+	const GENESIS_KEY: [u8; 32] = tightbeam::hex!("9175e9c61095aaf899f687a7d50d566950ed8c706bce50e6400cdd62bc474e7d");
+	const GENESIS_BLOCK: [u8; 2712] = tightbeam::hex!("30820a940a0102305f302702016702016502016e02016502017302016902017302012d02016202016c02016f02016302016b020101a431302f300b0609608648016503040208042000000000000000000000000000000000000000000000000000000000000000003082095202013002020082020102020200f202013002020082020102020200ee02013002020081020200f7020130020176020130020174020102020101020103020102020102020100020200ac020102020101020131020102020102020100020200e8020102020102020100020200ce020102020102020100020200b802010202010102010102010202010102011902010202010202010002020083020102020102020100020200b60201020201010201610201020201020201000202008502010202010102012d020102020101020157020102020102020100020200820201020201010201350201020201010201670201020201020201000202008002010202010102016c02010202010102013d02010202010102017b020102020101020143020102020102020100020200b3020102020102020100020200c9020102020102020100020200b0020102020102020100020200e802010202010102017e020102020102020100020200d1020102020102020100020200b1020102020102020100020200c002010202010102013d0201020201020201000202009302010202010102015e02013002017d02013002017b020130020174020102020101020103020102020102020100020200ac020102020101020131020102020102020100020200e8020102020102020100020200ce020102020102020100020200b802010202010102010102010202010102011902010202010202010002020083020102020102020100020200b60201020201010201610201020201020201000202008502010202010102012d020102020101020157020102020102020100020200820201020201010201350201020201010201670201020201020201000202008002010202010102016c02010202010102013d02010202010102017b020102020101020143020102020102020100020200b3020102020102020100020200c9020102020102020100020200b0020102020102020100020200e802010202010102017e020102020102020100020200d1020102020102020100020200b1020102020102020100020200c002010202010102013d0201020201020201000202009302010202010102015e02010202010302010f02014202014002013002020081020200f7020130020176020130020174020102020101020103020102020102020100020200ac020102020101020131020102020102020100020200e8020102020102020100020200ce020102020102020100020200b802010202010102010102010202010102011902010202010202010002020083020102020102020100020200b60201020201010201610201020201020201000202008502010202010102012d020102020101020157020102020102020100020200820201020201010201350201020201010201670201020201020201000202008002010202010102016c02010202010102013d02010202010102017b020102020101020143020102020102020100020200b3020102020102020100020200c9020102020102020100020200b0020102020102020100020200e802010202010102017e020102020102020100020200d1020102020102020100020200b1020102020102020100020200c002010202010102013d0201020201020201000202009302010202010102015e02013002017d02013002017b020130020174020102020101020103020102020102020100020200ac020102020101020131020102020102020100020200e8020102020102020100020200ce020102020102020100020200b802010202010102010102010202010102011902010202010202010002020083020102020102020100020200b60201020201010201610201020201020201000202008502010202010102012d020102020101020157020102020102020100020200820201020201010201350201020201010201670201020201020201000202008002010202010102016c02010202010102013d02010202010102017b020102020101020143020102020102020100020200b3020102020102020100020200c9020102020102020100020200b0020102020102020100020200e802010202010102017e020102020102020100020200d1020102020102020100020200b1020102020102020100020200c002010202010102013d0201020201020201000202009302010202010102015e02010202010302010f02014202014002013002020081020200f7020130020176020130020174020102020101020103020102020102020100020200ac020102020101020131020102020102020100020200e8020102020102020100020200ce020102020102020100020200b802010202010102010102010202010102011902010202010202010002020083020102020102020100020200b60201020201010201610201020201020201000202008502010202010102012d020102020101020157020102020102020100020200820201020201010201350201020201010201670201020201020201000202008002010202010102016c02010202010102013d02010202010102017b020102020101020143020102020102020100020200b3020102020102020100020200c9020102020102020100020200b0020102020102020100020200e802010202010102017e020102020102020100020200d1020102020102020100020200b1020102020102020100020200c002010202010102013d0201020201020201000202009302010202010102015e02013002017d02013002017b020130020174020102020101020103020102020102020100020200ac020102020101020131020102020102020100020200e8020102020102020100020200ce020102020102020100020200b802010202010102010102010202010102011902010202010202010002020083020102020102020100020200b60201020201010201610201020201020201000202008502010202010102012d020102020101020157020102020102020100020200820201020201010201350201020201010201670201020201020201000202008002010202010102016c02010202010102013d02010202010102017b020102020101020143020102020102020100020200b3020102020102020100020200c9020102020102020100020200b0020102020102020100020200e802010202010102017e020102020102020100020200d1020102020102020100020200b1020102020102020100020200c002010202010102013d0201020201020201000202009302010202010102015e02010202010302010f020142020140a031302f300b060960864801650304020804207ab691bfe1eecccd96af4365ffd3806f54b18bd55ba872c7e9b28ffae5cf64faa181a43081a102010180410433bb8295cb8fc19c88ad0187dbbc3120f15bcd93682967bf91c41eb0c2d0e171d51143e6c3122bd586e995bbec5e6682e1939c2ace7d369351bbaa59e556aa34300b0609608648016503040208300a06082a8648ce3d04030204402bfa104a25151e50181cc56c07183789b5b9996de91457d76693e54d4303d1bb6400fe190161dce660a13c6b0243568959eebbe1c07722453dda8fbcbca33862");
+
+	const USD: LedgerPublicKey = tightbeam::hex!("03ac31e8ceb8011983b661852d57823567806c3d7b43b3c9b0e87ed1b1c03d935e");
+	const KEY_PUBLIC: LedgerPublicKey =
+		tightbeam::hex!("0289f6f78e3bf63a847b3217a8f205ecb4f55abad95d4b3b3d9ca2d6b9a0f31461");
 	const KEY_PRIVATE: [u8; 32] = tightbeam::hex!("093acfdf59fe9769b4aa2ea7ab5548239806e76b428decfc7408ffb4d6340165");
+	const FUNDED_TEST_ACCOUNTS: [[u8; 32]; 3] = [
+		tightbeam::hex!("b4925a8641325173191bdbd35e20ce152bed20734714eae858056d658077da84"),
+		tightbeam::hex!("a5b93caf6bc960c50f50528f6a0845b702fb9dd9c75abffd2d647e3c65bc1a13"),
+		tightbeam::hex!("25cd0bb6d564753cb8d7ffd894ba61acfa34477d95ae25330f79a16e8438bc9b"),
+	];
 
 	rwlock! {
 		EPOCHS: Vec<Frame> = Vec::new(),
@@ -410,7 +430,7 @@ mod tests {
 				return policy::TransitStatus::Forbidden;
 			};
 
-            // Extract the public key from the signer info
+			// Extract the public key from the signer info
 			let public_key_bytes = match &sender.sid {
 				SignerIdentifier::SubjectKeyIdentifier(ski) => {
 					ski.0.as_bytes().to_vec()
@@ -426,17 +446,17 @@ mod tests {
 				Err(_) => return policy::TransitStatus::Forbidden,
 			};
 
-            // Ensure the sender is in the ledger
+			// Ensure the sender is in the ledger
 			let Some(sender_ledger) = ledger.get(&public_key) else {
 				return policy::TransitStatus::Forbidden;
 			};
 
-            // Get the sender's balance for the asset
-            let Some(sender_balance) = sender_ledger.balances.iter().find(|entry| entry.pubkey == decoded.asset) else {
+			// Get the sender's balance for the asset
+			let Some(sender_balance) = sender_ledger.balances.iter().find(|entry| entry.pubkey == decoded.asset) else {
 				return policy::TransitStatus::Forbidden;
 			};
 
-            // Ensure the sender has sufficient funds
+			// Ensure the sender has sufficient funds
 			if sender_balance.balance < decoded.amount {
 				return policy::TransitStatus::Unauthorized;
 			}
@@ -445,6 +465,63 @@ mod tests {
 			let amount = decoded.amount;
 
 			policy::TransitStatus::Accepted
+		}
+	}
+
+	job! {
+		name: ComputeGenesisBlockJob,
+		fn run() -> Result<Frame> {
+			let Ok(signing_key) = Secp256k1SigningKey::from_bytes(&GENESIS_KEY.into()) else {
+				panic!("Unable to reconstruct genesis signing key")
+			};
+
+			// Create ledgers for each funded test account
+			let mut genesis_balances = Vec::new();
+			for account_private_key in &FUNDED_TEST_ACCOUNTS {
+				// Create signing key from private key
+				let Ok(account_signing_key) = Secp256k1SigningKey::from_bytes(&(*account_private_key).into()) else {
+					panic!("Unable to create signing key for test account")
+				};
+
+				// Get the compressed public key
+				let verifying_key = account_signing_key.verifying_key();
+				let encoded = verifying_key.to_encoded_point(true);
+				let bytes = encoded.as_bytes();
+				let mut account_pubkey = [0u8; 33];
+				account_pubkey.copy_from_slice(bytes);
+
+				// Create balance entry for USD
+				let balance_entry = BalanceEntry {
+					pubkey: USD,
+					balance: 1000000,
+				};
+
+				// Create ledger for this account
+				let account_ledger = Ledger {
+					entries: vec![USD],
+					balances: vec![balance_entry],
+				};
+
+				// Add to genesis ledgers
+				genesis_balances.push(account_ledger);
+			}
+
+			compose! {
+				V2: id: b"genesis-block",
+					order: 1,
+					message: GeneralLedger {
+						entries: genesis_balances,
+					},
+					frame_integrity: type Sha3_256,
+					nonrepudiation<Secp256k1Signature, _>: &signing_key,
+					previous_frame: DigestInfo {
+						algorithm: AlgorithmIdentifier {
+							oid: tightbeam::HASH_SHA3_256_OID,
+							parameters: None,
+						},
+						digest: OctetString::new([0; 32])?
+					}
+			}
 		}
 	}
 
@@ -461,15 +538,40 @@ mod tests {
 		config: {
 			ledger_state: LedgerState,
 		},
-		workers: |config| {
+		// workers: |config| {
 
+		// },
+		init: |_config| {
+			// Ensure we have the ledger
+			let ledger = LEDGERS();
+			let Ok(mut ledger) = ledger.write() else {
+				panic!("Unable to lock ledger")
+			};
+
+			// Compute the genesis block
+			let genesis = ComputeGenesisBlockJob::run()?;
+			let genesis_ledger: GeneralLedger = decode(&genesis.message)?;
+			genesis_ledger.entries.iter().for_each(|account| {
+				ledger.insert(account.entries[0], account.clone());
+			});
+
+			// Verify the genesis block matches the expected value
+			if genesis.to_der()? != GENESIS_BLOCK {
+				panic!("Genesis block mismatch");
+			}
+
+			Ok(())
 		},
-		init: |config| {
-
-		},
-		handle: |message, _config, workers| async move {
-
+		handle: |message, _config| async move {
+			Some(message)
 		}
+	}
+
+	#[tokio::test]
+	async fn test_basic() -> Result<()> {
+		TransactionServlet::start(TransactionServletConf { ledger_state: Default::default() }).await?;
+
+		Ok(())
 	}
 
 	struct TestMatrix {
@@ -512,44 +614,36 @@ mod tests {
 		use core::fmt::Write;
 		let mut out = String::with_capacity(bytes.len() * 2);
 		for byte in bytes {
-			write!(&mut out, "{:02x}", byte).unwrap();
+			write!(&mut out, "{byte:02x}").unwrap();
 		}
 		out
 	}
 
 	#[test]
-	fn test_seeded_secp_matrix_points() {
-		// Signing key
-		let signing_key = Secp256k1SigningKey::from_slice(&KEY_PRIVATE).expect("valid private key");
-		println!("signing key hex: {}", to_hex(&KEY_PRIVATE));
-		// Verifying Key
+	fn test_random_secp_matrix_points() {
+		let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+		let sk_bytes = signing_key.to_bytes();
+		println!("signing key hex: {}", to_hex(sk_bytes.as_slice()));
+
 		let verifying_key = signing_key.verifying_key();
 		let encoded = verifying_key.to_encoded_point(true);
-		let derived_pub = encoded.as_bytes();
-		assert_eq!(derived_pub, KEY_PUBLIC.as_slice());
-		println!("compressed pubkey hex: {}", to_hex(&KEY_PUBLIC));
+		let bytes = encoded.as_bytes();
+		let mut pubkey = [0u8; 33];
+		pubkey.copy_from_slice(bytes);
+		println!("compressed pubkey hex: {}", to_hex(&pubkey));
 
 		let mut matrix = TestMatrix::new(8);
-		map_pubkey_to_matrix(&KEY_PUBLIC, &mut matrix, 0, 0).unwrap();
+		map_pubkey_to_matrix(&pubkey, &mut matrix, 0, 0).unwrap();
 
 		let mut points = Vec::with_capacity(35);
-		let mut matrix_hash = Sha3_256::new();
 		for row in 0..5 {
 			for col in 0..7 {
-				let value = matrix.get(row, col);
-				points.push((row, col, value));
-				matrix_hash.update([row, col, value]);
+				points.push((row, col, matrix.get(row, col)));
 			}
 		}
-		println!("matrix points: {:?}", points);
-
-		let digest = matrix_hash.finalize();
-		let matrix_hash_bytes: [u8; 32] = digest.into();
-
-		// Address of contract
-		println!("matrix hash hex: {}", to_hex(&matrix_hash_bytes));
+		println!("matrix points: {points:?}");
 
 		let extracted = extract_pubkey_from_matrix(&matrix, 0, 0).unwrap();
-		assert_eq!(extracted, KEY_PUBLIC);
+		assert_eq!(extracted, pubkey);
 	}
 }

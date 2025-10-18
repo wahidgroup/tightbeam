@@ -22,11 +22,11 @@ pub use der::{Decode, Encode, Sequence};
 pub use crate::asn1;
 pub use crate::error;
 pub use crate::flags;
+pub use crate::matrix::*;
 pub use crate::tightbeam::flags::FlagSet;
 pub use crate::utils;
-pub use crate::{Frame, Message, Version};
 pub use crate::TightBeamError;
-pub use crate::matrix::*;
+pub use crate::{Frame, Message, Version};
 
 // Derive macro
 #[cfg(feature = "derive")]

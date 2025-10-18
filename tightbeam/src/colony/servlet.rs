@@ -6,9 +6,9 @@
 
 use crate::transport::TightBeamAddress;
 
-pub(crate) mod servlet_runtime {
+pub mod servlet_runtime {
 	#[cfg(feature = "tokio")]
-	pub(crate) mod rt {
+	pub mod rt {
 		#[allow(dead_code)]
 		pub type JoinHandle = tokio::task::JoinHandle<()>;
 		#[allow(dead_code)]
@@ -53,7 +53,7 @@ pub(crate) mod servlet_runtime {
 	}
 
 	#[cfg(all(not(feature = "tokio"), feature = "std"))]
-	pub(crate) mod rt {
+	pub mod rt {
 		use std::{
 			io::{Error, ErrorKind},
 			sync::mpsc,
@@ -208,6 +208,21 @@ macro_rules! servlet {
 				|$message, $config_param| $handler_body);
 	};
 
+	// Servlet with config and init (no workers)
+	(
+		name: $worker_name:ident,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		init: |$init_config:ident| $init_body:block,
+		handle: |$message:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				config_only_with_init, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body, $init_config, $init_body);
+	};
+
 	// Servlet with config and workers
 	(
 		name: $worker_name:ident,
@@ -222,6 +237,23 @@ macro_rules! servlet {
 				config_and_workers, {}, { $($config_field: $config_type,)* },
 				{ $($worker_field: $worker_type = $worker_init),* },
 				|$message, $config_param, $workers_param| $handler_body, $worker_config);
+	};
+
+	// Servlet with config, workers, and init
+	(
+		name: $worker_name:ident,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		workers: |$worker_config:ident| { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* $(,)? },
+		init: |$init_config:ident| $init_body:block,
+		handle: |$message:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				config_and_workers_with_init, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body);
 	};
 
 	// Basic worker with just message
@@ -269,6 +301,16 @@ macro_rules! servlet {
 	};
 
 	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_only_with_init, {}, { $( $config_field:ident : $config_type:ty, )* },
+			  |$message:ident, $config_param:ident| $handler_body:expr, $init_config:ident, $init_body:expr) => {
+		servlet!(@impl_struct $worker_name, $protocol, { $($config_field: $config_type,)* });
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				config_only_with_init, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body, $init_config, $init_body);
+		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
+	};
+
+	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
 			  basic, {}, {},
 			  |$message:ident| $handler_body:expr) => {
 		servlet!(@impl_struct $worker_name, $protocol, {});
@@ -288,6 +330,19 @@ macro_rules! servlet {
 				config_and_workers, {}, { $($config_field: $config_type,)* },
 				{ $($worker_field: $worker_type = $worker_init),* },
 				|$message, $config_param, $workers_param| $handler_body, $worker_config);
+		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
+	};
+
+	// Servlet with config, workers, and init
+	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			config_and_workers_with_init, {}, { $( $config_field:ident : $config_type:ty, )* },
+			{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+			|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $init_config:ident, $init_body:expr) => {
+		servlet!(@impl_struct_with_workers $worker_name, $protocol, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* });
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				config_and_workers_with_init, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body);
 		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
 	};
 
@@ -375,6 +430,32 @@ macro_rules! servlet {
 	};
 
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
+				   config_only_with_init, {}, { $($config_field:ident: $config_type:ty,)* },
+				   |$message:ident, $config_param:ident| $handler_body:expr, $init_config:ident, $init_body:expr) => {
+		paste::paste! {
+			impl $worker_name {
+				pub async fn start(config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
+					servlet!(@setup_protocol $protocol, listener, addr);
+
+					// Run init block - must return Result<(), TightBeamError>
+					let $init_config = &config;
+					let init_result: core::result::Result<(), $crate::TightBeamError> = (|| $init_body)();
+					init_result?;
+
+					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
+						$protocol, listener, [$($policy_key: $policy_val),*], config,
+						(|$message: $crate::Frame, $config_param| async move { $handler_body }));
+					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+				}
+
+				servlet!(@common_methods $protocol);
+			}
+
+			servlet!(@drop_impl $worker_name);
+		}
+	};
+
+	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
 				   basic, {}, {},
 				   |$message:ident| $handler_body:expr) => {
 		impl $worker_name {
@@ -424,7 +505,7 @@ macro_rules! servlet {
 				type Conf = [<$worker_name Conf>];
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
-				async fn start(config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
+				async fn start(config: Option<Self::Conf>) -> $crate::error::Result<Self> {
 					let cfg = config.ok_or_else(|| $crate::TightBeamError::MissingConfiguration)?;
 					Self::start(cfg).await
 				}
@@ -437,7 +518,7 @@ macro_rules! servlet {
 					self.stop()
 				}
 
-				async fn join(self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+				async fn join(self) -> ::core::result::Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
 					self.join().await
 				}
 			}
@@ -473,6 +554,48 @@ macro_rules! servlet {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
+
+					let $worker_config = &config;
+					$(
+						let $worker_field = $worker_init?;
+					)*
+					let workers = [<$worker_name Servlets>] {
+						$($worker_field,)*
+					};
+					let workers = ::std::sync::Arc::new(workers);
+
+					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config_and_workers
+						$protocol, listener, [$($policy_key: $policy_val),*], config, workers.clone(),
+						(|$message: $crate::Frame, $config_param, $workers_param| async move { $handler_body }));
+
+					Ok(Self {
+						server_handle: Some(server_handle),
+						server_pool_handles,
+						addr,
+						workers,
+					})
+				}
+
+				servlet!(@common_methods $protocol);
+			}
+
+			servlet!(@drop_impl_with_workers $worker_name);
+		}
+	};
+
+	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
+		config_and_workers_with_init, {}, { $($config_field:ident: $config_type:ty,)* },
+		{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+		|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $init_config:ident, $init_body:expr) => {
+		paste::paste! {
+			impl $worker_name {
+				pub async fn start(config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
+					servlet!(@setup_protocol $protocol, listener, addr);
+
+					// Run init block - must return Result<(), TightBeamError>
+					let $init_config = &config;
+					let init_result: $crate::error::Result<()> = (|| $init_body)();
+					init_result?;
 
 					let $worker_config = &config;
 					$(
@@ -559,7 +682,7 @@ macro_rules! servlet {
 		}
 
 		#[cfg(feature = "tokio")]
-		pub async fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+		pub async fn join(mut self) -> ::core::result::Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
 			if let Some(handle) = self.server_handle.take() {
 				$crate::colony::servlet_runtime::rt::join(handle).await
 			} else {

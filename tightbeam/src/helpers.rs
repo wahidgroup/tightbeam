@@ -226,6 +226,26 @@ macro_rules! mutex {
 	};
 }
 
+/// Extension trait for Frame to add compute_hash method
+#[cfg(feature = "digest")]
+pub trait FrameHashExt {
+	/// Compute hash of the frame using the specified digest algorithm
+	fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
+	where
+		D: digest::Digest + crate::der::oid::AssociatedOid;
+}
+
+#[cfg(feature = "digest")]
+impl FrameHashExt for crate::Frame {
+	fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
+	where
+		D: digest::Digest + crate::der::oid::AssociatedOid,
+	{
+		let encoded = crate::encode(self)?;
+		crate::utils::digest::<D>(&encoded)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	#[cfg(not(feature = "std"))]
@@ -434,25 +454,5 @@ mod tests {
 				}
 			}
 		}
-	}
-}
-
-/// Extension trait for Frame to add compute_hash method
-#[cfg(feature = "digest")]
-pub trait FrameHashExt {
-	/// Compute hash of the frame using the specified digest algorithm
-	fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
-	where
-		D: digest::Digest + crate::der::oid::AssociatedOid;
-}
-
-#[cfg(feature = "digest")]
-impl FrameHashExt for crate::Frame {
-	fn compute_hash<D>(&self) -> Result<crate::DigestInfo>
-	where
-		D: digest::Digest + crate::der::oid::AssociatedOid,
-	{
-		let encoded = crate::encode(self)?;
-		crate::utils::digest::<D>(&encoded)
 	}
 }
