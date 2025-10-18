@@ -97,7 +97,7 @@ tightbeam implements high-fidelity information transmission through the followin
 - **PRIORITY**: 7-level priority system
 - **LIFETIME**: 64-bit TTL values
 - **STATE**: Previous message chaining
-- **MATRIX**: N×N matrix-encoded control flags (N ∈ [1,255], row-major)
+- **MATRIX**: N×N matrix-encoded control flags
 - **NONREPUDIATION**: Cryptographic signatures
 
 ## 4. Protocol Specification
@@ -126,13 +126,13 @@ tightbeam implements high-fidelity information transmission through the followin
 tightbeam defines standardized security profiles that reference established cryptographic standards:
 
 - **Profile 0 (Testing)**: No mandatory security features
-  - Use case: Development, testing, non-sensitive data
+  - Use case: Testing, non-sensitive data
   - Security: Optional per version capabilities
 
 - **Profile 1 (Standard Security)**: TLS 1.3 equivalent security
   - Reference: RFC 8446 cipher suites
-  - Mandatory: AES-GCM encryption, SHA-256/384 integrity
-  - Key Exchange: Compatible with TLS 1.3 key schedule
+  - Mandatory: AES-GCM encryption, SHA-256/384
+  - Key Exchange: TLS 1.3 key schedule compatible
 
 - **Profile 2 (High Security)**: NSA Suite B equivalent
   - Reference: RFC 6460, NIST SP 800-56A
@@ -141,7 +141,7 @@ tightbeam defines standardized security profiles that reference established cryp
 
 - **Profile 3 (Future-Ready)**: Post-quantum resistant
   - Reference: NIST post-quantum standardization
-  - Mandatory: Hybrid classical/post-quantum algorithms
+  - Mandatory: Hybrid classical/post-quantum
   - Migration: Smooth transition path from Profile 2
 
 ### 4.1.2 Message-Level Security Requirements
