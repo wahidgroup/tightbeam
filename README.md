@@ -41,6 +41,7 @@ information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Sections follow
 a [concept → specification → implementation → testing] pattern.
 
 ### 1.1 Information Fidelity Constraint
+
 Question: How well does information maintain fidelity[^fidelity] across time?
 
 The foundational mathematical principle underlying tightbeam is the information fidelity constraint:
@@ -62,7 +63,7 @@ This constraint reflects information-theoretic limits:
 
 The I(t) constraint informs all protocol design decisions.
 
-[^fidelity] The degree of exactness with which something is copied or reproduced.
+[^fidelity]: The degree of exactness with which something is copied or reproduced.
 
 ### 1.2 Requirements Language
 
