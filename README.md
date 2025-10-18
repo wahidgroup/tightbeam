@@ -10,9 +10,13 @@
 ## Status
 > Warning: This project is under active development. Public APIs and file formats MAY change WITHOUT notice. It is NOT yet production-ready.
 
+## Copyright Notice
+
+   Copyright (C) Tanveer Wahid, WahidGroup, LLC (2025).  All Rights Reserved.
+
 ## Abstract
 
-tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures. This specification defines the protocol's core properties: structure, frame versioning, idempotence, ordering, compactness, integrity, confidentiality, priority, lifetime, state management, matrix environment, and non-repudiation.
+tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures.
 
 ## Table of Contents
 
@@ -23,26 +27,32 @@ tightbeam is a Layer-5 framework implementing high-fidelity information theory t
 5. [ASN.1 Formal Specification](#asn1-formal-specification)
 6. [Implementation](#implementation)
 7. [Security Considerations](#security-considerations)
-8. [Examples](#examples)
-9. [References](#references)
+8. [Network Theory](#network-theory)
+9. [Testing Framework](#testing-framework)
+10. [Examples](#examples)
+11. [References](#references)
+12. [License](#license)
+13. [Implementation Notes](#implementation-notes)
 
 ## 1. Introduction
 
-tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T.
+tightbeam defines a structured, versioned messaging protocol with an 
+information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Sections follow 
+a [concept → specification → implementation → testing] pattern.
 
 ### 1.1 Information Fidelity Constraint
-Question: How well does information maintain fidelity across time?
+Question: How well does information maintain fidelity[^fidelity] across time?
 
 The foundational mathematical principle underlying tightbeam is the information fidelity constraint:
 
- **I(t) ∈ (0,1) ∀t ∈ T_t**
+ **I(t) ∈ (0,1) ∀t ∈ T**
 
  Where:
 - **I(t)**: Information state of a Frame at time t
 - **(0,1)**: Strictly bounded information fidelity interval
   - Strictly less than 1 (never perfect): acknowledges fundamental limits of transmission
   - Strictly greater than 0 (never absent): guarantees non-zero information content in valid frames
-- **∀t ∈ T**: Holds for all time points in the protocol’s temporal domain
+- **∀t ∈ T**: For every moment in time within the protocol's operational timeframe
 
 This constraint reflects information-theoretic limits:
 
@@ -51,6 +61,8 @@ This constraint reflects information-theoretic limits:
 3. **Protocol Guarantee**: The constraint provides a mathematical basis for frame validation and quality assurance
 
 The I(t) constraint informs all protocol design decisions.
+
+[^fidelity] The degree of exactness with which something is copied or reproduced.
 
 ### 1.2 Requirements Language
 
@@ -84,7 +96,7 @@ tightbeam implements high-fidelity information transmission through the followin
 - **PRIORITY**: 7-level priority system
 - **LIFETIME**: 64-bit TTL values
 - **STATE**: Previous message chaining
-- **STAGE**: N×N matrix-encoded control flags (N ∈ [1,255], row-major)
+- **MATRIX**: N×N matrix-encoded control flags (N ∈ [1,255], row-major)
 - **NONREPUDIATION**: Cryptographic signatures
 
 ## 4. Protocol Specification
@@ -137,16 +149,17 @@ tightbeam supports run-time security profile enforcement at the message type lev
 
 ```rust
 pub trait Message: /* trait bounds */ {
+	const MIN_VERSION: Version = Version::V0;
 	const MUST_BE_NON_REPUDIABLE: bool = false;
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: Version = Version::V0;
+	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
 }
 ```
 
 #### Security Requirement Semantics
-
 - When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
 - When a message type specifies `MUST_BE_CONFIDENTIAL = true`, the Frame's metadata MUST include a `confidentiality` field
 - When a message type specifies `MUST_BE_COMPRESSED = true`, the Frame's metadata `compactness` field MUST NOT be `none`
@@ -154,13 +167,11 @@ pub trait Message: /* trait bounds */ {
 - The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
 
 #### Profile-Message Type Mapping
-
 - Security profiles MAY specify approved message types
 - Message types with security requirements SHOULD be used with compatible security profiles
 - Profile 0 (Testing) MAY use message types with security requirements for development purposes only
 
 #### Implementation Enforcement
-
 These requirements are enforced at:
 - **Compile Time**: Type system prevents composition of messages that don't meet requirements
 - **Runtime Validation**: Frame validation ensures expected frame shape to meet requirements
@@ -266,13 +277,17 @@ pub struct Metadata {
 	// Core fields (V0+)
 	pub id: Vec<u8>,
 	pub order: u64,
-	pub compactness: CompressionInfo,
+	#[asn1(optional = "true")]
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub compactness: Option<CompressedData>,
 
 	// V1+ fields
 	#[asn1(context_specific = "0", optional = "true")]
-	pub integrity: Option<IntegrityInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub integrity: Option<DigestInfo>,
 	#[asn1(context_specific = "1", optional = "true")]
-	pub confidentiality: Option<EncryptionInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub confidentiality: Option<EncryptedContentInfo>,
 
 	// V2+ fields
 	#[asn1(context_specific = "2", optional = "true")]
@@ -281,13 +296,15 @@ pub struct Metadata {
 	#[asn1(context_specific = "3", optional = "true")]
 	pub lifetime: Option<u64>,
 	#[asn1(context_specific = "4", optional = "true")]
-	pub previous_frame: Option<IntegrityInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub previous_frame: Option<DigestInfo>,
 	#[asn1(context_specific = "5", optional = "true")]
 	pub matrix: Option<Asn1Matrix>,
 }
 ```
 
 ### 4.4 Frame Encapsulation
+
 ```rust
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
@@ -297,15 +314,18 @@ pub struct Frame {
 	pub metadata: Metadata,
 	pub message: Vec<u8>,
 	#[asn1(context_specific = "0", optional = "true")]
-	pub integrity: Option<IntegrityInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub integrity: Option<DigestInfo>,
 	#[asn1(context_specific = "1", optional = "true")]
-	pub nonrepudiation: Option<SignatureInfo>,
+	#[cfg_attr(feature = "zeroize", zeroize(skip))]
+	pub nonrepudiation: Option<SignerInfo>,
 }
 ```
 
 ## 5. ASN.1 Formal Specification
 
-This section provides the complete ASN.1 definitions for all tightbeam protocol structures, encoded using Distinguished Encoding Rules (DER).
+This section provides the complete ASN.1 definitions for all tightbeam protocol 
+structures, encoded using Distinguished Encoding Rules (DER).
 
 ### 5.1 Core Types
 
@@ -321,75 +341,84 @@ Version ::= ENUMERATED {
 #### Message Priority Levels
 ```asn1
 MessagePriority ::= ENUMERATED {
-	critical(0),	 -- System/security alerts, emergency notifications
-	top(1),		  -- High-priority interactive traffic, real-time responses
-	high(2),		 -- Important business messages, time-sensitive data
-	normal(3),	   -- Standard message traffic (default)
-	low(4),		  -- Non-urgent notifications, background updates
-	bulk(5),		 -- Batch processing, large data transfers, logs
-	heartbeat(6)	 -- Keep-alive signals, periodic status updates
+	critical(0),  -- System/security alerts, emergency notifications
+	top(1),       -- High-priority interactive traffic, real-time responses
+	high(2),      -- Important business messages, time-sensitive data
+	normal(3),    -- Standard message traffic (default)
+	low(4),       -- Non-urgent notifications, background updates
+	bulk(5),      -- Batch processing, large data transfers, logs
+	heartbeat(6)  -- Keep-alive signals, periodic status updates
 }
 ```
 
-### 5.2 Compression Structures
+### 5.2 Cryptographic Structures
 
-#### Compression Algorithm Types
+tightbeam uses standard CMS (Cryptographic Message Syntax) structures from
+RFC 5652 and PKCS standards for cryptographic operations.
+
+#### Digest Information ([RFC 3447](https://datatracker.ietf.org/doc/html/rfc3447) - PKCS #1)
+
+From RFC 3447 Section 9.2:
+
 ```asn1
-CompressionAlgorithm ::= ENUMERATED {
-	none(0),
-	zstd(1)
+DigestInfo ::= SEQUENCE {
+	digestAlgorithm  AlgorithmIdentifier,
+	digest           OCTET STRING
 }
 ```
 
-#### Compression Algorithm Information
+Used in `Metadata.integrity`, `Metadata.previousFrame`, and `Frame.integrity` fields.
+
+#### Encrypted Content Information ([RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652) - CMS)
+
+From RFC 5652 Section 6.1:
+
 ```asn1
-ZstdInfo ::= SEQUENCE {
-	level		 INTEGER,
-	originalSize  INTEGER
-}
-
-GzipInfo ::= SEQUENCE {
-	level		 INTEGER,
-	originalSize  INTEGER
-}
-
-CompressionInfo ::= CHOICE {
-	none  NULL,
-	zstd  ZstdInfo,
-	gzip  GzipInfo
+EncryptedContentInfo ::= SEQUENCE {
+	contentType                 ContentType,
+	contentEncryptionAlgorithm  ContentEncryptionAlgorithmIdentifier,
+	encryptedContent            [0] IMPLICIT OCTET STRING OPTIONAL
 }
 ```
 
-### 5.3 Cryptographic Structures
+Used in `Metadata.confidentiality` field for message-level encryption.
 
-#### Encryption Information
+#### Signer Information ([RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652) - CMS)
+
+From RFC 5652 Section 5.3:
+
 ```asn1
-EncryptionInfo ::= SEQUENCE {
-	algorithm   AlgorithmIdentifier,
-	parameters  ANY DEFINED BY algorithm
+SignerInfo ::= SEQUENCE {
+	version                    CMSVersion,
+	sid                        SignerIdentifier,
+	digestAlgorithm            DigestAlgorithmIdentifier,
+	signedAttrs                [0] IMPLICIT SignedAttributes OPTIONAL,
+	signatureAlgorithm         SignatureAlgorithmIdentifier,
+	signature                  SignatureValue,
+	unsignedAttrs              [1] IMPLICIT UnsignedAttributes OPTIONAL
 }
 ```
 
-#### Integrity Information
+Used in `Frame.nonrepudiation` field for digital signatures.
+
+#### Compressed Data ([RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274) - CMS)
+
+From RFC 3274 Section 2:
+
 ```asn1
-IntegrityInfo ::= SEQUENCE {
-	algorithm   AlgorithmIdentifier,
-	parameters  ANY DEFINED BY algorithm
+CompressedData ::= SEQUENCE {
+	version                    CMSVersion,
+	compressionAlgorithm       CompressionAlgorithmIdentifier,
+	encapContentInfo           EncapsulatedContentInfo
 }
 ```
 
-#### Digital Signature Information
-```asn1
-SignatureInfo ::= SEQUENCE {
-	signatureAlgorithm  AlgorithmIdentifier,
-	signature		   OCTET STRING
-}
-```
+Used in `Metadata.compactness` field for message compression.
 
-#### Matrix
+#### Matrix (TightBeam-specific)
 ```asn1
 Matrix ::= SEQUENCE {
-	n	 INTEGER (1..255),
+	n     INTEGER (1..255),
 	data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
 }
 ```
@@ -398,44 +427,84 @@ Matrix ::= SEQUENCE {
 
 #### Metadata Structure
 ```asn1
- Metadata ::= SEQUENCE {
-	 -- Core fields (V0+)
-	 id			   OCTET STRING,
-	 order			INTEGER,
-	 compactness	  CompressionInfo,
-	 integrity		[0] IntegrityInfo OPTIONAL,
-	 confidentiality  [1] EncryptionInfo OPTIONAL,
-	 
-	 -- V2+ fields (context-specific tags)
-	 priority		 [2] MessagePriority OPTIONAL,
-	 lifetime		 [3] INTEGER OPTIONAL,
-	 previousFrame	[4] IntegrityInfo OPTIONAL,
-	 matrix		   [5] Matrix OPTIONAL
- }
+Metadata ::= SEQUENCE {
+	-- Core fields (V0+)
+	id               OCTET STRING,
+	order            INTEGER,
+	compactness      CompressedData OPTIONAL,
+
+	-- V1+ fields (context-specific tags)
+	integrity        [0] DigestInfo OPTIONAL,
+	confidentiality  [1] EncryptedContentInfo OPTIONAL,
+
+	-- V2+ fields (context-specific tags)
+	priority         [2] MessagePriority OPTIONAL,
+	lifetime         [3] INTEGER OPTIONAL,
+	previousFrame    [4] DigestInfo OPTIONAL,
+	matrix           [5] Matrix OPTIONAL
+}
 ```
 
 #### Complete Frame Structure
 ```asn1
 Frame ::= SEQUENCE {
-	version		 Version,
-	metadata		Metadata,
-	message		 OCTET STRING,
-	integrity	   [0] IntegrityInfo OPTIONAL,
-	nonrepudiation  [1] SignatureInfo OPTIONAL
+	version         Version,
+	metadata        Metadata,
+	message         OCTET STRING,
+	integrity       [0] DigestInfo OPTIONAL,
+	nonrepudiation  [1] SignerInfo OPTIONAL
 }
 ```
 
 ### 5.5 External Dependencies
 
-The protocol relies on standard ASN.1 structures:
+The protocol relies on standard ASN.1 structures from established RFCs.
+
+#### Algorithm Identifier ([RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652))
+
+From RFC 5652 Section 10.1.2:
 
 ```asn1
--- From RFC 5652 and related PKCS standards
 AlgorithmIdentifier ::= SEQUENCE {
-	algorithm	OBJECT IDENTIFIER,
-	parameters   ANY DEFINED BY algorithm OPTIONAL
+	algorithm   OBJECT IDENTIFIER,
+	parameters  ANY DEFINED BY algorithm OPTIONAL
 }
 ```
+
+Implemented via the [spki](https://crates.io/crates/spki) crate.
+
+#### Compression Algorithm Identifiers ([RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274))
+
+From RFC 3274 Section 2:
+
+```asn1
+CompressionAlgorithmIdentifier ::= AlgorithmIdentifier
+
+-- Standard compression algorithm OID
+id-alg-zlibCompress OBJECT IDENTIFIER ::= { iso(1) member-body(2)
+	us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) alg(3) 8 }
+
+-- TightBeam also supports zstd compression
+id-alg-zstdCompress OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 50274 1 1 }
+```
+
+Implemented via the [cms](https://crates.io/crates/cms) crate.
+
+#### Hash and Signature Algorithms ([RFC 5246](https://datatracker.ietf.org/doc/html/rfc5246))
+
+From RFC 5246 Section 7.4.1.4.1 (informative):
+
+```asn1
+enum {
+	none(0), md5(1), sha1(2), sha224(3), sha256(4), sha384(5),
+	sha512(6), (255)
+} HashAlgorithm;
+
+enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
+	SignatureAlgorithm;
+```
+
+Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms and SHOULD NOT use MD5 or SHA-1 for new deployments.
 
 ### 5.6 Encoding Rules
 
@@ -472,38 +541,83 @@ AlgorithmIdentifier ::= SEQUENCE {
 - `originalSize` in compression info MUST match the uncompressed message size
 - Compression level MUST be within algorithm-specific valid ranges
 
-#### Matrix Specification
+#### Previous Frame Chaining
+- The `previousFrame` field creates a cryptographic hash chain linking frames
+- Each frame's hash commits to all previous history through transitive hashing
+- This enables:
+  - **Causal Ordering**: Frames carry proof of their position in the sequence
+  - **Tamper Detection**: Any modification to a previous frame breaks all subsequent hashes
+  - **Replay Protection**: Receivers can detect out-of-sequence or duplicate frames
+  - **Fork Detection**: Multiple frames with the same `previousFrame` indicate reality branching
+  - **Stateless Verification**: Frame ancestry can be verified without storing the entire chain
+- Implementations MAY store frames to enable full chain reconstruction
+- Implementations MAY use sparse storage (e.g., every Nth frame) for efficient verification
 
-Wire format
-- ASN.1 type: Matrix ::= SEQUENCE { n INTEGER (1..255), data OCTET STRING (SIZE(1..(255*255))) }
-- Encoding: DER. The data field is row-major; the cell at (row r, col c) is at index r*n + c.
-- Size bounds: n ∈ [1, 255]; data length MUST equal n*n. Total payload for data is n² octets.
+#### What is the Matrix?
 
-Semantics
-- Cells are u8 values. Protocol profiles MUST define the meaning of non-zero values.
-- Unless a profile defines otherwise, receivers SHOULD treat off-diagonal cells as unspecified and MUST NOT fail if they are non-zero.
-- Flags mapping: profiles MAY map independent, position-stable flags onto the diagonal (r == c). Unset is 0; set or configured values are non-zero per profile.
+The matrix field enables protocol-agnostic state representation and reality modeling through an N×N control structure.
 
-Validation
-- Encoders MUST only emit a Matrix when data.len == n*n.
-- Decoders MUST reject a Matrix whose data length != n*n.
-- Absent/optional Matrix fields MUST be treated as “no matrix provided”; profiles MAY define a default.
+##### Wire Format
+- **ASN.1 Type**: `Matrix ::= SEQUENCE { n INTEGER (1..255), data OCTET STRING (SIZE(1..(255*255))) }`
+- **Encoding**: DER (Distinguished Encoding Rules)
+- **Layout**: Row-major ordering; cell at (row r, col c) is at index `r*n + c`
+- **Size Bounds**: n ∈ [1, 255]; data length MUST equal n²
+- **Maximum Size**: 255×255 = 65,025 bytes (~63.5 KB)
+- **State Space**: 256^(n²) possible combinations per matrix
 
-Runtime mapping (non-normative)
-- Implementations typically expose dynamic MatrixDyn (n decided at runtime) and Matrix<N> (const generic) types that implement a MatrixLike trait.
-- Conversions between wire and runtime matrices SHOULD preserve row-major ordering and exact length; invalid input MUST be rejected.
+##### Semantics
+- **Cell Values**: Each cell is a u8 value (0-255)
+- **Profile-Defined Semantics**: Protocol profiles MUST define the meaning of non-zero values
+- **Off-Diagonal Cells**: Unless a profile defines otherwise, receivers SHOULD treat off-diagonal cells as unspecified and MUST NOT fail if they are non-zero
+- **Diagonal Flags**: Profiles MAY map independent, position-stable flags onto the diagonal (r == c); unset is 0, set or configured values are non-zero per profile
+- **Extensibility**: New flags can be added at unused diagonal positions without breaking existing implementations
 
-Intermediaries
-- Profiles MAY define merge/override rules (e.g., element-wise AND/OR/min/max) for multi-hop processing. If defined, intermediaries MUST apply them deterministically and re-sign if nonrepudiation is used.
+##### Validation
+- Encoders MUST only emit a Matrix when `data.len == n*n`
+- Decoders MUST reject a Matrix whose data length `!= n*n`
+- Absent/optional Matrix fields MUST be treated as “no matrix provided”; profiles MAY define a default
+
+##### Runtime Mapping (Non-Normative)
+- Implementations typically expose dynamic `MatrixDyn` (n decided at runtime) and `Matrix<N>` (const generic) types that implement a `MatrixLike` trait
+- Conversions between wire and runtime matrices SHOULD preserve row-major ordering and exact length; invalid input MUST be rejected
+
+##### Reality Modeling with Matrix and Previous Frame
+The combination of `matrix` and `previousFrame` enables sophisticated reality modeling:
+
+- **State Representation**: The `matrix` field encodes the current reality state (N×N control flags)
+- **Causal History**: The `previousFrame` field links to the parent reality through cryptographic hashing
+- **Reality Chains**: Sequential frames form a directed acyclic graph (DAG) of causally-linked states
+- **Reality Branching**: Multiple frames with the same `previousFrame` but different `matrix` values represent parallel realities
+- **State Transitions**: The evolution of `matrix` values across the chain represents reality state transitions
+- **Temporal Ordering**: The `order` field combined with `previousFrame` provides both logical and temporal sequencing
+
+As a result, "shared realities" can be transmitted with each message allowing ephemeral consensus and coordination
+in a hightly compact and efficient manner.
+
+This architecture enables:
+- **Distributed Consensus**: Nodes can propose and converge on canonical reality chains
+- **Event Sourcing**: Frames serve as immutable events with state snapshots
+- **Speculative Execution**: Fork realities for "what-if" scenarios, then merge or discard
+- **Conflict-Free Replication**: Matrix state + causal dependencies enable deterministic merging
+- **Blockchain Properties**: Immutability, causal ordering, and fork detection without requiring full chain storage
+
+A simple "flatworld" implementation of its usage can be observed in the flag system.
 
 ### 5.9 Complete ASN.1 Module
 
 ```asn1
 tightbeam-Protocol-V2 DEFINITIONS EXPLICIT TAGS ::= BEGIN
 
--- Import standard algorithm identifier
-IMPORTS AlgorithmIdentifier FROM PKCS-1 
-		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-1(1) };
+-- Import standard structures from CMS and PKCS
+IMPORTS
+	AlgorithmIdentifier FROM PKCS-1
+		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-1(1) },
+	DigestInfo FROM PKCS-1
+		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-1(1) },
+	CompressedData FROM CMS-2004
+		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) modules(0) cms-2004(24) },
+	EncryptedContentInfo, SignerInfo FROM CMS-2004
+		{ iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) modules(0) cms-2004(24) };
 
 -- Core protocol version
 Version ::= ENUMERATED {
@@ -523,68 +637,31 @@ MessagePriority ::= ENUMERATED {
 	heartbeat(6)
 }
 
--- Compression structures
-CompressionAlgorithm ::= ENUMERATED {
-	none(0),
-	zstd(1)
-}
-
-ZstdInfo ::= SEQUENCE {
-	level		 INTEGER,
-	originalSize  INTEGER
-}
-
-GzipInfo ::= SEQUENCE {
-	level		 INTEGER,
-	originalSize  INTEGER
-}
-
-CompressionInfo ::= CHOICE {
-	none  NULL,
-	zstd  ZstdInfo,
-	gzip  GzipInfo
-}
-
--- Cryptographic structures
-EncryptionInfo ::= SEQUENCE {
-	algorithm   AlgorithmIdentifier,
-	parameters  ANY DEFINED BY algorithm
-}
-
-IntegrityInfo ::= SEQUENCE {
-	algorithm   AlgorithmIdentifier,
-	parameters  ANY DEFINED BY algorithm
-}
-
-SignatureInfo ::= SEQUENCE {
-	signatureAlgorithm  AlgorithmIdentifier,
-	signature		   OCTET STRING
-}
-
+-- TightBeam-specific matrix structure
 Matrix ::= SEQUENCE {
-	n	 INTEGER (1..255),
+	n     INTEGER (1..255),
 	data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
 }
 
 -- Core message structures
 Metadata ::= SEQUENCE {
-	id			   OCTET STRING,
-	order			INTEGER,
-	compactness	  CompressionInfo,
-	integrity		[0] IntegrityInfo OPTIONAL,
-	confidentiality  [1] EncryptionInfo OPTIONAL,
-	priority		 [2] MessagePriority OPTIONAL,
-	lifetime		 [3] INTEGER OPTIONAL,
-	previousFrame	[4] IntegrityInfo OPTIONAL,
-	matrix		   [5] Matrix OPTIONAL
+	id               OCTET STRING,
+	order            INTEGER,
+	compactness      CompressedData OPTIONAL,
+	integrity        [0] DigestInfo OPTIONAL,
+	confidentiality  [1] EncryptedContentInfo OPTIONAL,
+	priority         [2] MessagePriority OPTIONAL,
+	lifetime         [3] INTEGER OPTIONAL,
+	previousFrame    [4] DigestInfo OPTIONAL,
+	matrix           [5] Matrix OPTIONAL
 }
 
 Frame ::= SEQUENCE {
-	version		 Version,
-	metadata		Metadata,
-	message		 OCTET STRING,
-	integrity	   [0] IntegrityInfo OPTIONAL,
-	nonrepudiation  [1] SignatureInfo OPTIONAL
+	version         Version,
+	metadata        Metadata,
+	message         OCTET STRING,
+	integrity       [0] DigestInfo OPTIONAL,
+	nonrepudiation  [1] SignerInfo OPTIONAL
 }
 
 END
@@ -595,7 +672,7 @@ END
 ### 6.1 Requirements
 
 Implementations MUST provide:
-- Memory safety and ownership guarantees
+- Memory safety AND ownership guarantees (Rust)
 - ASN.1 DER encoding/decoding
 - Frame and Metadata as specified as ASN.1
 - Message-level security requirement enforcement
@@ -645,17 +722,17 @@ impl<T: Message> FrameBuilder<T> {
 		// Check if compression is set when required
 		let has_compression = self.compressor.is_some();
 		if T::MUST_BE_COMPRESSED && !has_compression {
-			return Err(TightBeamError::MissingCompressionInfo);
+			return Err(TightBeamError::MissingCompressedData);
 		}
 
 		let has_message_integrity = self.metadata_builder.has_hash();
 		if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
-			return Err(TightBeamError::MissingIntegrityInfo);
+			return Err(TightBeamError::MissingDigestInfo);
 		}
 
 		let has_frame_integrity = self.witness.is_some();
 		if T::MUST_HAVE_FRAME_INTEGRITY && !has_frame_integrity {
-			return Err(TightBeamError::MissingIntegrityInfo);
+			return Err(TightBeamError::MissingDigestInfo);
 		}
 
 		// Check if priority is set when required
@@ -670,7 +747,7 @@ impl<T: Message> FrameBuilder<T> {
 
 ### 6.2 Transport Layer
 
-tightbeam operates over ANY transport protocols:
+tightbeam MUST operate over ANY transport protocol:
 - TCP (built-in async/sync support)
 - Custom transports via trait implementation
 
@@ -712,7 +789,7 @@ tightbeam integrates with existing key management standards and infrastructure:
 
 ### 7.2 Version Security
 
-- V0: No mandatory security features
+- V0: No security features
 - V1: Optional integrity and confidentiality support
 - V2: Enhanced with priority, lifetime, state chaining, and matrix controls
 
@@ -752,29 +829,250 @@ tightbeam follows established cryptographic standards and maintains algorithm ag
 - **Algorithm Negotiation**: Support for algorithm capability discovery
 - **Security Policy**: Configurable algorithm allow/deny lists
 
-## 8 Network Theory
+## 8. Network Theory
 
 ### 8.1 Network Architecture
-- Egress/ingress policy management
+
+- Egress/Ingress policy management
 - Retry and Egress client policy
-- Service orchestration via Colony Monodomy/Polydomy patterns  
-- Cryptographically chainable message sequences
+- Service orchestration via Colony Monodomy/Polydomy patterns
 
-TODO Efficient Compute Exchange Interconnect
+### 8.2 Efficient Exchange-Compute Interconnect
 
-cluster!{}
+The Efficient Exchange-Compute Interconnect or EECI is a software development 
+paradigm inspired by the entymological world. As threads and tunnels underpin 
+the basics of processing and communication, we can start at these base levels 
+and develop from here. The goal of EECI is to operate on these base layers 
+across any transmission protocol: 
+- thread-thread.
+- thread-port-thread.
 
-servlet!{}
+### 8.3 Components
 
-**See:** [Transport Integration Tests](tightbeam/tests/transport.rs)
+There are four main components to the EECI:
+- **E** [Workers](#831-e-workers) - Efficient processing units
+- **E** [Servlets](#832-e-servlets) - Exchange endpoints
+- **C** [Clusters](#833-c-clusters) - Compute orchestration
+- **I** [Drone/Hive](#834-i-drones--hives) - Interconnected infrastructure
 
-## 9 Testing Framework
+Think of workers as ants, servlets as ant hills, and clusters as ant colonies.
+Insects have specific functions for which they process organic matter 
+using local information. These functions are often simple, but when combined 
+in large numbers, they can perform complex tasks. The efficiency of each unit 
+is attributed to  their fungible nature--how well it can accomplish its 
+singular task. 
+
+#### 8.3.1 E: Workers
+
+Workers are the smallest unit of computation. They must be single-threaded and
+handle a single message at a time. Workers are the "ants" of the EECI. Insects 
+have a head, thorax, and abdomen. Workers have the following similarly 
+inspired structure:
+
+```rust
+tightbeam::worker! {
+	name: PingPongWorker<RequestMessage, PongMessage>,
+	config: {
+		response: &str,
+	},
+	policies: {
+		with_receptor_gate: [PingGate]
+	},
+	handle: |_message, config| async move {
+		PongMessage {
+			result: config.response.to_string(),
+		}
+	}
+}
+```
+
+Not unlike supraorganisms, we can name them, and their "head" may possess
+a specific configuration (config). They may or may not have receptors which 
+can be used to optionally gate messages. The "thorax" is itself the container
+for which isolates the entity within its own scoped thread--locality. Finally, 
+its "abdomen" is the handle which digests the message and produces a response.
+
+The important thing to note is that workers operate on local information 
+within their bounded scope. They are not aware of the larger system and only 
+operate on the message they are given. This is a critical aspect of the EECI 
+and allows for a high degree of parallelism and fault tolerance. As a result, 
+they do not have access to the full Frame nor should they need it.
+
+##### Testing
+Testing workers is simple and a container is provided:
+
+```rust
+tightbeam::test_worker! {
+	name: test_ping_pong_worker,
+	setup: || {
+		PingPongWorker::start()
+	},
+	assertions: |worker| async move {
+		// Test accepted message
+		let ping_msg = RequestMessage {
+			content: "PING".to_string(),
+			lucky_number: 42,
+		};
+		let response = worker.relay(ping_msg).await?;
+		assert_eq!(response, Some(PongMessage { result: "PONG".to_string() }));
+
+		// Test rejected message
+		let pong_msg = RequestMessage {
+			content: "PONG".to_string(),
+			lucky_number: 42,
+		};
+
+		let result = worker.relay(pong_msg).await;
+		assert!(matches!(result, Err(WorkerRelayError::Rejected(_))));
+
+		Ok(())
+	}
+}
+```
+
+#### 8.3.2 E: Servlets
+
+Servlets are "anthills" in the sense they operate on a specific protocol. From
+a TCP/IP perspective, an anthill is a port in many ways. Servlets are 
+multi-threaded and must handle messages asynchronously. A servlet may also
+define as many different workers as it needs to accomplish its task as well
+as a set of configurations. Servlets must be provided a relay which is used to
+relay Message types to the worker without the entire Frame.
+
+```rust
+tightbeam::servlet! {
+	name: PingPongServletWithWorker,
+	protocol: Listener,
+	config: {
+		lotto_number: u32
+	},
+	workers: |config| {
+		ping_pong: PingPongWorker = PingPongWorker::start(),
+		lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConf {
+			lotto_number: config.lotto_number,
+		})
+	},
+	handle: |message, _config, workers| async move {
+		let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
+		let (ping_result, lucky_result) = tokio::join!(
+			workers.ping_pong.relay(decoded.clone()),
+			workers.lucky_number.relay(decoded.clone())
+		);
+
+		let reply = match ping_result {
+			Ok(reply) => reply,
+			Err(_) => return None,
+		};
+
+		let is_winner = match lucky_result {
+			Ok(is_winner) => is_winner,
+			Err(_) => return None,
+		};
+
+		crate::compose! {
+			V0: id: message.metadata.id.clone(),
+				message: ResponseMessage {
+					result: reply.result,
+					is_winner,
+				}
+		}.ok()
+	}
+}
+```
+
+Workers may process the message in parallel and have the results combined into 
+a single response. 
+
+##### Testing
+Testing servlets is simple and a container is provided:
+
+```rust
+tightbeam::test_servlet! {
+	name: test_servlet_with_workers,
+	worker_threads: 2,
+	protocol: Listener,
+	setup: || {
+		PingPongServletWithWorker::start(PingPongServletWithWorkerConf {
+			lotto_number: 42,
+			expected_message: "PING".to_string(),
+		})
+	},
+	assertions: |client| async move {
+		fn generate_message(
+			lucky_number: u32,
+			content: Option<String>
+		) -> Result<crate::Frame, crate::TightBeamError> {
+			let message = RequestMessage {
+				content: content.unwrap_or_else(|| "PING".to_string()),
+				lucky_number,
+			};
+
+			crate::compose! { V0: id: b"test-ping", message: message }
+		}
+
+		// Test winning case
+		let ping_message = generate_message(42, None)?;
+		let response = client.emit(ping_message, None).await?;
+		let response_message = crate::decode::<ResponseMessage, _>(&response.unwrap().message)?;
+		assert_eq!(response_message.result, "PONG");
+		assert!(response_message.is_winner);
+
+		Ok(())
+	}
+}
+```
+
+#### 8.3.3 C: Clusters
+
+Clusters orchestrate multiple servlets and workers. They are the "ant colonies" 
+of the EECI. Colonies are made up of multiple servlets which command different
+workers. Clusters are multi-threaded and must handle messages asynchronously. 
+Clusters may also define a configuration and as many different servlets as it 
+needs to handle its purpose. While servlets are given a relay, clusters must be 
+provided a router. Routers can emit messages to the servlets registered within 
+the cluster. 
+
+#### 8.3.4 I: Drones & Hives
+
+Drones are containerized servlet runners that can dynamically morph between 
+different servlet types based on command messages from a cluster. This 
+allows you to seed your application over a specific protocol and then morph
+into any known servlet type at runtime.
+
+Hives are an extension of drones that can manage multiple servlets 
+simultaneously. They are useful for managing a pool of servlets that can be 
+activated on demand. Hives must only be available on 
+[Mycelial](src/transport/mod.rs) protocols which support multiple ports 
+per address. Hives should maintain exactly the number of servlets required
+to efficiently process messages from the cluster.
+
+##### "Mycelial" Protocols
+
+Protocols such as TCP are considered "mycelial" as they operate over a single
+address but can have multiple ports (SocketAddress). This allows the hive to 
+establish a servlet on different ports and provide the protocol address to the 
+cluster so it can register it under its hive.
+
+```rust
+TODO
+
+```
+
+##### Conclusion
+
+How you wish to model your colonies is beyond the scope of this document. 
+However, it is important to understand the basic building blocks and how they
+can be combined to create complex systems. The swarm is yours to command.
+
+## 9. Testing Framework
+
 Full end-to-end containerized testing framework
 - Asynchronous/synchronous containerized end-to-end testing
 - Client/server "quantum tunneling" via MPSC channels
 
-### Quantum Tunnel Testing
-These are our three "entangled particles" for a quantum tunnel.
+### 9.1 Quantum Entanglement Testing
+
+These are our three "entangled particles" for our test.
 
 ```rust
 // Server handler channel: tx for server, rx for container
@@ -788,17 +1086,18 @@ let (reject_tx, reject_rx) = mpsc::channel();
 let channels = (rx, ok_rx, reject_rx);
 ```
 
-#### Message Flow Sequence
+####  Message Flow Sequence
 1. Client emits a message
 2. The server MAY receive the message
 3. The gate MAY reject the message and MUST tell reject_tx
 	- If so, the client SHOULD[^mpsc] hear from reject_rx
-	- If not, the gate tells ok_tx and the client SHOULD[^mpsc] hear from ok_rx
+	- If not, the gate tells ok_tx and the client SHOULD hear from ok_rx
 4. The server handles the message and MAY arbitrarily talk to tx
-	- If so, the client SHOULD[^mpsc] hear from rx
+	- If so, the client SHOULD hear from rx
 5. The server MAY respond with a message
 
-[^mpsc]: MPSC ops MAY return Empty while polling; Disconnected ONLY occurs at teardown.
+[^mpsc]: MPSC ops MAY return Empty while polling; Disconnect occurs at teardown.
+
 ```rust
 service: |message, tx| async move {
     tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
@@ -809,7 +1108,6 @@ service: |message, tx| async move {
 
         let response = Some(tightbeam::compose! {
             V0: id: message.metadata.id.clone(),
-                order: 1_700_000_000u64,
                 message: ResponseMessage {
                     result: "PONG".into()
                 }
@@ -826,9 +1124,8 @@ service: |message, tx| async move {
 	- If no response, `None`
 	- If response, `Some(Frame)`
 	- If error, `Err(TransportError)`
-7. The client can process the response and can now determine:
+7. The client MAY process the response and can now determine:
 	- What the client sent
-	- What the gate received
 	- What the gate accepted or rejected
 	- What the server wants to assert
 	- What the server responded with
@@ -859,11 +1156,11 @@ let decoded = if let Some(response) = client.emit(message.clone(), None).await? 
 This occurs while ensuring each client and server operate within their own 
 scope in a single containerized test. Channels are automatically cleaned up.
 
-**See:** [Container Integration Test](tightbeam/tests/container.rs)
+**See:** [Container Integration Test](tests/container.rs)
 
-## 8. Examples
+## 10. Examples
 
-### 8.1 Basic Test Container
+### 10.1 Basic Test Container
 ```rust
 /// Checklist for container assertions
 #[derive(Enumerated, Beamable, Copy, Clone, Debug, PartialEq)]
@@ -876,15 +1173,14 @@ enum ServiceAssertChecklist {
 
 test_container! {
 	name: container_gates_basic,
-	features: ["testing", "std", "tcp", "tokio"],
 	worker_threads: 2,
-	protocol: TokioListener,
+	protocol: Listener,
 	service_policies: {
-		gate: policy::AcceptAllGate
+		with_collector_gate: [policy::AcceptAllGate]
 	},
 	client_policies: {
-		restart: policy::RestartExponentialBackoff::default(),
-		gate: policy::AcceptAllGate
+		with_emitter_gate: [policy::AcceptAllGate],
+		with_restart: [RestartLinearBackoff::new(3, 1, 1, None)]
 	},
 	service: |message, tx| async move {
 		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
@@ -895,7 +1191,6 @@ test_container! {
 
 			let response = Some(tightbeam::compose! {
 				V0: id: message.metadata.id.clone(),
-					order: 1_700_000_000u64,
 					message: ResponseMessage {
 						result: "PONG".into()
 					}
@@ -915,13 +1210,12 @@ test_container! {
 		// Compose a simple V0 message
 		let message = tightbeam::compose! {
 			V0: id: b"request",
-				order: 1_700_000_000u64,
 				message: RequestMessage {
 					content: "PING".into()
 				}
 		}?;
 
-		// Test Message Transport
+		//# Test message transport
 
 		// Send and expect acceptance + echo response
 		let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
@@ -941,6 +1235,8 @@ test_container! {
 			panic!("Expected a response from the service");
 		};
 
+		//# Test message shape
+
 		match decoded {
 			Some(reply) => {
 				assert_eq!(reply.result, "PONG");
@@ -951,49 +1247,52 @@ test_container! {
 		Ok(())
 	}
 }
-
 ```
 
-## 9. References
+## 11. References
 
-### 9.1 Normative References
+### 11.1 Normative References
 
-- RFC 2119: Key words for use in RFCs to Indicate Requirement Levels
-- ITU-T X.690: ASN.1 Distinguished Encoding Rules (DER)
-- RFC 5652: Cryptographic Message Syntax (CMS)
-- RFC 5280: Internet X.509 Public Key Infrastructure Certificate and CRL Profile
-- RFC 5480: Elliptic Curve Cryptography Subject Public Key Info
-- RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3
-- RFC 6460: Suite B Profile for Transport Layer Security (TLS)
-- RFC 5869: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
-- RFC 6960: X.509 Internet Public Key Infrastructure Online Certificate Status Protocol
-- RFC 8439: ChaCha20 and Poly1305 for IETF Protocols
-- RFC 8032: Edwards-Curve Digital Signature Algorithm (EdDSA)
-- RFC 7748: Elliptic Curves for Security
+- [RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119): Key words for use in RFCs to Indicate Requirement Levels
+- [ITU-T X.690](https://www.itu.int/rec/T-REC-X.690): ASN.1 Distinguished Encoding Rules (DER)
+- [RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274): Compressed Data Content Type for Cryptographic Message Syntax (CMS)
+- [RFC 3447](https://datatracker.ietf.org/doc/html/rfc3447): Public-Key Cryptography Standards (PKCS) #1: RSA Cryptography Specifications Version 2.1
+- [RFC 5246](https://datatracker.ietf.org/doc/html/rfc5246): The Transport Layer Security (TLS) Protocol Version 1.2
+- [RFC 5280](https://datatracker.ietf.org/doc/html/rfc5280): Internet X.509 Public Key Infrastructure Certificate and CRL Profile
+- [RFC 5480](https://datatracker.ietf.org/doc/html/rfc5480): Elliptic Curve Cryptography Subject Public Key Information
+- [RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652): Cryptographic Message Syntax (CMS)
+- [RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869): HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
+- [RFC 6460](https://datatracker.ietf.org/doc/html/rfc6460): Suite B Profile for Transport Layer Security (TLS)
+- [RFC 6960](https://datatracker.ietf.org/doc/html/rfc6960): X.509 Internet Public Key Infrastructure Online Certificate Status Protocol (OCSP)
+- [RFC 7748](https://datatracker.ietf.org/doc/html/rfc7748): Elliptic Curves for Security
+- [RFC 8032](https://datatracker.ietf.org/doc/html/rfc8032): Edwards-Curve Digital Signature Algorithm (EdDSA)
+- [RFC 8439](https://datatracker.ietf.org/doc/html/rfc8439): ChaCha20 and Poly1305 for IETF Protocols
+- [RFC 8446](https://datatracker.ietf.org/doc/html/rfc8446): The Transport Layer Security (TLS) Protocol Version 1.3
 
-### 9.1.1 Standards References
+### 11.2 Standards References
 
-- FIPS 140-2: Security Requirements for Cryptographic Modules
-- FIPS 140-3: Security Requirements for Cryptographic Modules
-- FIPS 180-4: Secure Hash Standard (SHS)
-- FIPS 186-4: Digital Signature Standard (DSS)
-- FIPS 197: Advanced Encryption Standard (AES)
-- FIPS 202: SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions
-- NIST SP 800-56A: Recommendation for Pair-Wise Key Establishment Schemes
-- NIST SP 800-57: Recommendation for Key Management
-- NIST SP 800-131A: Transitioning the Use of Cryptographic Algorithms and Key Lengths
+- [FIPS 140-2](https://csrc.nist.gov/publications/detail/fips/140/2/final): Security Requirements for Cryptographic Modules
+- [FIPS 140-3](https://csrc.nist.gov/publications/detail/fips/140/3/final): Security Requirements for Cryptographic Modules
+- [FIPS 180-4](https://csrc.nist.gov/publications/detail/fips/180/4/final): Secure Hash Standard (SHS)
+- [FIPS 186-4](https://csrc.nist.gov/publications/detail/fips/186/4/final): Digital Signature Standard (DSS)
+- [FIPS 197](https://csrc.nist.gov/publications/detail/fips/197/final): Advanced Encryption Standard (AES)
+- [FIPS 202](https://csrc.nist.gov/publications/detail/fips/202/final): SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions
+- [NIST SP 800-56A](https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final): Recommendation for Pair-Wise Key Establishment Schemes Using Discrete Logarithm Cryptography
+- [NIST SP 800-57](https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final): Recommendation for Key Management: Part 1 - General
+- [NIST SP 800-131A](https://csrc.nist.gov/publications/detail/sp/800-131a/rev-2/final): Transitioning the Use of Cryptographic Algorithms and Key Lengths
 
-### 9.3 ASN.1 References
+### 11.3 ASN.1 References
 
-- ITU-T X.680: ASN.1 Specification of basic notation
-- ITU-T X.681: ASN.1 Information object specification
-- ITU-T X.682: ASN.1 Constraint specification
-- ITU-T X.683: ASN.1 Parameterization of ASN.1 specifications
-- RFC 3246: Expedited Forwarding PHB (Priority levels inspiration)
-- RFC 2474: Differentiated Services Field (Priority levels inspiration)
-- X.400/X.420: Message Handling Systems (Priority levels inspiration)
+- [ITU-T X.680](https://www.itu.int/rec/T-REC-X.680): ASN.1 Specification of basic notation
+- [ITU-T X.681](https://www.itu.int/rec/T-REC-X.681): ASN.1 Information object specification
+- [ITU-T X.682](https://www.itu.int/rec/T-REC-X.682): ASN.1 Constraint specification
+- [ITU-T X.683](https://www.itu.int/rec/T-REC-X.683): ASN.1 Parameterization of ASN.1 specifications
+- [RFC 2474](https://datatracker.ietf.org/doc/html/rfc2474): Definition of the Differentiated Services Field (DS Field) in the IPv4 and IPv6 Headers
+- [RFC 3246](https://datatracker.ietf.org/doc/html/rfc3246): An Expedited Forwarding PHB (Per-Hop Behavior)
+- [ITU-T X.400](https://www.itu.int/rec/T-REC-X.400): Message Handling Systems (MHS): System and service overview
+- [ITU-T X.420](https://www.itu.int/rec/T-REC-X.420): Message Handling Systems (MHS): Interpersonal messaging system
 
-## 10. License
+## 12. License
 
 ### For Users (Outbound Licensing)
 
@@ -1017,7 +1316,7 @@ dual licensed as above, without any additional terms or conditions.
 - MIT's simplicity for users who prefer it
 - Apache-2.0's patent grants for enhanced protection
 
-### 10.1 Implementation Notes
+## 13. Implementation Notes
 
 #### Project Structure
 
@@ -1041,3 +1340,8 @@ The workspace consists of the following components:
 
 [chat-image]: https://img.shields.io/badge/chat-Discussions-blue?logo=github
 [chat-link]: https://github.com/wahidgroup/tightbeam/discussions
+
+#### Future 
+- tightbeam-os
+- tightbeam-dna
+- tightbeam-gate
