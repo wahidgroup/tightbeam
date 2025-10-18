@@ -1,2 +1,2 @@
 //! Placeholder
-pub use asn1;
+pub mod asn1;
