@@ -119,7 +119,7 @@ pub enum MessagePriority {
 ///   is 0, set/non-default is non-zero.
 /// - Intermediaries MUST preserve bytes unless a profile defines deterministic
 ///   merge rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(der::Sequence, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Asn1Matrix {
 	/// Dimension N (1..=255)
