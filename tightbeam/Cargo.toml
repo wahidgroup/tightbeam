@@ -20,8 +20,11 @@ name = "tightbeam"
 tightbeam-derive = { workspace = true, optional = true }
 
 # RustCrypto dependencies
-spki = { workspace = true }
 der = { workspace = true }
+spki = { workspace = true }
+cms = { workspace = true }
+pkcs12 = { workspace = true }
+x509-cert = { workspace = true, optional = true }
 hex-literal = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 crypto-common = { workspace = true, optional = true }
@@ -32,7 +35,6 @@ aes-gcm = { workspace = true, optional = true }
 sha3 = { workspace = true, optional = true }
 ecdsa = { workspace = true, optional = true }
 k256 = { workspace = true, optional = true }
-x509-cert = { workspace = true, optional = true }
 
 # Non-RustCrypto dependencies
 rand_core = { workspace = true, optional = true }
@@ -43,6 +45,7 @@ time = { workspace = true, optional = true }
 zeekstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+paste = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 fake = { workspace = true }
@@ -76,21 +79,21 @@ full = [
 	"standards-rfc",
 	"standards-iso",
 	"testing",
-	"servlets"
+	"colony"
 ]
 
 # Core features
 constants = ["hex"]
 crypto = ["random"]
-builder = ["derive", "x509-cert?/builder"]
+builder = ["derive", "x509-cert/builder"]
 policy = []
 router = []
 transport = []
 doc = []
 compress = ["tightbeam-derive?/compress"]
-transport-policy = ["policy", "transport"]
+transport-policy = ["transport", "policy"]
 tcp = ["transport"]
-servlets = ["full"]
+colony = ["full"]
 testing = []
 
 # TODO
@@ -100,23 +103,25 @@ bitcoin = ["dep:k256"]
 hex = ["dep:hex-literal"]
 aead = [
 	"crypto",
+	"random",
 	"dep:aead",
 	"dep:ecdsa",
 	"dep:crypto-common",
 	"tightbeam-derive?/aead",
+	"aead/rand_core",
 ]
 signature = [
 	"crypto",
 	"tightbeam-derive?/signature",
 	"dep:signature",
-	"x509-cert?/signature",
+	"x509-cert/signature",
 ]
-digest = ["crypto", "dep:digest"]
+digest = ["crypto", "dep:digest", "tightbeam-derive?/digest"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
 
 ## Security features
 random = ["dep:rand_core"]
-zeroize = ["dep:zeroize", "der/zeroize", "aes-gcm?/zeroize"]
+zeroize = ["dep:zeroize", "der/zeroize", "cms/zeroize", "aes-gcm?/zeroize"]
 
 ## Cryptographic algorithm features
 aes-gcm = ["crypto", "aead", "dep:aes-gcm"]
@@ -128,8 +133,10 @@ derive = ["dep:tightbeam-derive"]
 
 # Standard library support
 std = [
-	"spki/std",
 	"der/std",
+	"spki/std",
+	"cms/std",
+	"x509-cert/std",
 	"crypto-common?/std",
 	"zeroize?/std",
 	"digest?/std",
@@ -141,7 +148,6 @@ std = [
 	"zeekstd?/std",
 	"time?/std",
 	"rand_core?/std",
-	"x509-cert?/std",
 ]
 
 # NON-RustCrypto features
