@@ -7,6 +7,9 @@ use crate::{
 	CompressedData,
 };
 
+// Re-exports
+pub use ::hex_literal::hex;
+
 /// Macro to implement From trait for both reference and owned types
 ///
 /// This generates:

@@ -6,10 +6,10 @@ use crate::Errorizable;
 use crate::policy::{ReceptorPolicy, TransitStatus};
 use crate::Message;
 
-pub(crate) mod worker_runtime {
+pub mod worker_runtime {
 	#![allow(dead_code)]
 	#[cfg(feature = "tokio")]
-	pub(crate) mod rt {
+	pub mod rt {
 		pub type QueueSender<T> = tokio::sync::mpsc::Sender<T>;
 		pub type QueueReceiver<T> = tokio::sync::mpsc::Receiver<T>;
 		pub type ResponseSender<T> = tokio::sync::oneshot::Sender<T>;
@@ -53,7 +53,7 @@ pub(crate) mod worker_runtime {
 	}
 
 	#[cfg(all(not(feature = "tokio"), feature = "std"))]
-	pub(crate) mod rt {
+	pub mod rt {
 		#![allow(dead_code)]
 		use std::{
 			future::Future,
@@ -161,8 +161,14 @@ impl core::fmt::Display for WorkerRelayError {
 impl std::error::Error for WorkerRelayError {}
 
 pub struct WorkerPolicies<I: Send> {
-	#[allow(dead_code)]
-	pub(crate) receptor_gates: Vec<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
+    #[allow(dead_code)]
+    pub(crate) receptor_gates: Vec<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
+}
+
+impl<I: Send> WorkerPolicies<I> {
+    pub fn receptor_gates(&self) -> &[Arc<dyn ReceptorPolicy<I> + Send + Sync>] {
+        &self.receptor_gates
+    }
 }
 
 impl<I: Send> Default for WorkerPolicies<I> {
@@ -330,7 +336,7 @@ macro_rules! worker {
 
 	(@impl_struct $worker_name:ident, $input:ty, $output:ty, {}) => {
 		pub struct $worker_name {
-			sender: Option<$crate::colony::worker_runtime::rt::QueueSender<$crate::colony::worker::WorkerRequest<$input, $output>>>,
+			sender: Option<$crate::colony::worker_runtime::rt::QueueSender<$crate::colony::WorkerRequest<$input, $output>>>,
 			join: Option<$crate::colony::worker_runtime::rt::JoinHandle>,
 			queue: usize,
 		}
@@ -392,9 +398,9 @@ macro_rules! worker {
 		$handler:tt
 	) => {
 		impl $worker_name {
-			pub fn start() -> Result<Self, $crate::TightBeamError> {
+			pub fn start() -> $crate::error::Result<Self> {
 				let queue_capacity = $crate::worker!(@queue $($queue)?);
-				let (tx, rx) = $crate::colony::worker_runtime::rt::channel::<$crate::colony::worker::WorkerRequest<$input, $output>>(queue_capacity);
+				let (tx, rx) = $crate::colony::worker_runtime::rt::channel::<$crate::colony::WorkerRequest<$input, $output>>(queue_capacity);
 
 				let policies = std::sync::Arc::new(
 					$crate::worker!(@build_policies $input, { $( $policy_method : $policy_value ),* })
@@ -500,33 +506,33 @@ macro_rules! worker {
 		let policies = $policies;
 		async move {
 			while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver).await {
-				let $crate::colony::worker::WorkerRequest { message, respond_to } = request;
+				let $crate::colony::WorkerRequest { message, respond_to } = request;
 				if let Err(status) = $crate::worker!(@evaluate_policies policies, &message) {
 					let _ = respond_to.send(Err(status));
 					continue;
 				}
 				let $message_ident = message;
 				let output = (async move $handler_block).await;
-				let _ = respond_to.send(Ok(output));
+				let _ = respond_to.send(output);
 			}
 		}
 	}};
 
 	(@evaluate_policies $policies:expr, $message:expr) => {{
-		let __result: Result<(), $crate::policy::TransitStatus> = (|| {
-			for gate in $policies.receptor_gates.iter() {
-				let status = gate.evaluate($message);
-				if status != $crate::policy::TransitStatus::Accepted {
-					return Err(status);
-				}
-			}
-			Ok(())
-		})();
-		__result
-	}};
+        let __result: ::core::result::Result<(), $crate::policy::TransitStatus> = (|| {
+            for gate in $policies.receptor_gates().iter() {
+                let status = gate.evaluate($message);
+                if status != $crate::policy::TransitStatus::Accepted {
+                    return Err(status);
+                }
+            }
+            Ok(())
+        })();
+        __result
+    }};
 
 	(@build_policies $input:ty, {}) => {{
-		$crate::colony::worker::WorkerPolicyBuilder::<$input>::default().build()
+		$crate::colony::WorkerPolicyBuilder::<$input>::default().build()
 	}};
 
 	(@build_policies $input:ty, { $( with_receptor_gate : [ $( $gate:expr ),* $(,)? ] ),* $(,)? }) => {{
@@ -545,15 +551,15 @@ macro_rules! worker {
 		pub async fn relay(
 			&self,
 			message: $input,
-		) -> core::result::Result<$output, $crate::colony::worker::WorkerRelayError> {
-			let sender = self.sender.as_ref().ok_or($crate::colony::worker::WorkerRelayError::QueueClosed)?;
+		) -> core::result::Result<$output, $crate::colony::WorkerRelayError> {
+			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
 			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
 
-			let result = $crate::colony::worker_runtime::rt::send(sender, $crate::colony::worker::WorkerRequest { message, respond_to: tx });
+			let result = $crate::colony::worker_runtime::rt::send(sender, $crate::colony::WorkerRequest { message, respond_to: tx });
 			#[cfg(feature = "tokio")]
 			let result = result.await;
 
-			result.map_err(|_| $crate::colony::worker::WorkerRelayError::QueueClosed)?;
+			result.map_err(|_| $crate::colony::WorkerRelayError::QueueClosed)?;
 
 			#[cfg(feature = "tokio")]
 			let response = $crate::colony::worker_runtime::rt::wait_response(rx).await;
@@ -562,8 +568,8 @@ macro_rules! worker {
 
 			match response {
 				Ok(Ok(output)) => Ok(output),
-				Ok(Err(status)) => Err($crate::colony::worker::WorkerRelayError::Rejected(status)),
-				Err(_) => Err($crate::colony::worker::WorkerRelayError::ResponseDropped),
+				Ok(Err(status)) => Err($crate::colony::WorkerRelayError::Rejected(status)),
+				Err(_) => Err($crate::colony::WorkerRelayError::ResponseDropped),
 			}
 		}
 

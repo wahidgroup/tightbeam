@@ -1200,13 +1200,13 @@ mod tests {
 	use crate::policy::GatePolicy;
 	use crate::policy::TransitStatus;
 	use crate::transport::policy::PolicyConf;
-	use crate::Beamable;
+	use crate::{Beamable, Frame};
 	use crate::{job, mutex, policy, servlet, worker};
 
 	// Jobs for hive management operations
 	job! {
 		name: ListServletsJob,
-		fn run(id: &[u8]) -> Frame {
+		fn run(id: &[u8]) -> crate::error::Result<Frame> {
 			crate::compose! {
 				V0: id: id,
 					message: HiveManagementRequest {
@@ -1222,7 +1222,7 @@ mod tests {
 
 	job! {
 		name: SpawnServletJob,
-		fn run(id: &[u8], servlet_type: &[u8], config: Option<Vec<u8>>) -> Frame {
+		fn run(id: &[u8], servlet_type: &[u8], config: Option<Vec<u8>>) -> crate::error::Result<Frame> {
 			crate::compose! {
 				V0: id: id,
 					message: HiveManagementRequest {
@@ -1239,7 +1239,7 @@ mod tests {
 
 	job! {
 		name: StopServletJob,
-		fn run(id: &[u8], servlet_id: Vec<u8>) -> Frame {
+		fn run(id: &[u8], servlet_id: Vec<u8>) -> crate::error::Result<Frame> {
 			crate::compose! {
 				V0: id: id,
 					message: HiveManagementRequest {
@@ -1255,7 +1255,7 @@ mod tests {
 
 	job! {
 		name: ActivateServletJob,
-		fn run(id: &[u8], servlet_id: &[u8], config: Option<Vec<u8>>, signing_key: &Secp256k1SigningKey) -> Frame {
+		fn run(id: &[u8], servlet_id: &[u8], config: Option<Vec<u8>>, signing_key: &Secp256k1SigningKey) -> crate::error::Result<Frame> {
 			crate::compose! {
 				V0: id: id,
 					message: ActivateServletRequest {
@@ -1270,7 +1270,7 @@ mod tests {
 	// Jobs for servlet responses
 	job! {
 		name: DroneResponseJob,
-		fn run(id: Vec<u8>, result: String) -> Frame {
+		fn run(id: Vec<u8>, result: String) -> crate::error::Result<Frame> {
 			crate::compose! {
 				V0: id: id,
 					message: DroneResponseMessage {
@@ -1282,7 +1282,7 @@ mod tests {
 
 	job! {
 		name: DroneResponseWithOrderJob,
-		fn run(id: Vec<u8>, order: u64, message: DroneResponseMessage) -> Frame {
+		fn run(id: Vec<u8>, order: u64, message: DroneResponseMessage) -> crate::error::Result<Frame> {
 			crate::compose! {
 				V0: id: id,
 					order: order,

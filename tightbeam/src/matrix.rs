@@ -1,5 +1,7 @@
 use crate::{Asn1Matrix, Errorizable};
 
+pub type MatrixResult<T> = core::result::Result<T, MatrixError>;
+
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MatrixError {

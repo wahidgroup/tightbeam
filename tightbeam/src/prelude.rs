@@ -25,6 +25,8 @@ pub use crate::flags;
 pub use crate::tightbeam::flags::FlagSet;
 pub use crate::utils;
 pub use crate::{Frame, Message, Version};
+pub use crate::TightBeamError;
+pub use crate::matrix::*;
 
 // Derive macro
 #[cfg(feature = "derive")]

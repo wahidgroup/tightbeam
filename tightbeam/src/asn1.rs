@@ -3,10 +3,9 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-use crate::der::oid::ObjectIdentifier;
-use crate::der::{Enumerated, Sequence};
-
 // Re-exports
+pub use crate::der::asn1::*;
+pub use crate::der::{Sequence, Choice, Enumerated};
 pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::content_info::ContentInfo;
 pub use crate::cms::enveloped_data::EncryptedContentInfo;
@@ -146,7 +145,7 @@ pub struct Asn1Matrix {
 ///     matrix           [5] Matrix OPTIONAL
 /// }
 /// ```
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+#[derive(der::Sequence, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Metadata {
 	// Core fields (V0+)
@@ -191,7 +190,7 @@ pub struct Metadata {
 ///     nonrepudiation [1] SignerInfo OPTIONAL
 /// }
 /// ```
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+#[derive(der::Sequence, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Frame {
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]

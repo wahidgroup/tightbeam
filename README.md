@@ -36,7 +36,9 @@ tightbeam is a Layer-5 framework implementing high-fidelity information theory t
 
 ## 1. Introduction
 
-tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T.
+tightbeam defines a structured, versioned messaging protocol with an 
+information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Sections follow 
+a [concept → specification → implementation → testing] pattern.
 
 ### 1.1 Information Fidelity Constraint
 Question: How well does information maintain fidelity[^fidelity] across time?
@@ -1340,5 +1342,6 @@ The workspace consists of the following components:
 [chat-link]: https://github.com/wahidgroup/tightbeam/discussions
 
 #### Future 
+- tightbeam-os
+- tightbeam-dna
 - tightbeam-gate
-- tightbeam-exo4

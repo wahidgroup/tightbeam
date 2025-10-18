@@ -3,6 +3,8 @@ pub mod ecdsa {
 	pub use ecdsa::{Signature, SigningKey, VerifyingKey};
 
 	#[cfg(feature = "secp256k1")]
+	pub use k256;
+	#[cfg(feature = "secp256k1")]
 	pub use k256::{
 		ecdsa::{
 			Signature as Secp256k1Signature, SigningKey as Secp256k1SigningKey, VerifyingKey as Secp256k1VerifyingKey,
