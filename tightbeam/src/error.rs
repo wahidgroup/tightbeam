@@ -127,6 +127,12 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	EncryptionError(crate::crypto::aead::Error),
 
+	/// Error during ECIES operations
+	#[cfg(feature = "ecies")]
+	#[cfg_attr(feature = "derive", error("ECIES error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	EciesError(crate::crypto::ecies::EciesError),
+
 	/// Error obtaining random bytes from the OS
 	#[cfg(feature = "random")]
 	#[cfg_attr(feature = "derive", error("OS random number generator error: {0}"))]
@@ -229,6 +235,8 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::OsRngError(err) => write!(f, "OS random number generator error: {err}"),
 			#[cfg(feature = "aead")]
 			TightBeamError::EncryptionError(err) => write!(f, "Encryption or decryption error: {err}"),
+			#[cfg(feature = "ecies")]
+			TightBeamError::EciesError(err) => write!(f, "ECIES error: {err}"),
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureError(err) => write!(f, "Signature verification or generation error: {err}"),
 			#[cfg(feature = "signature")]
@@ -282,6 +290,8 @@ crate::impl_from!(std::io::Error => CompressionError::IO);
 crate::impl_from!(CompressionError => TightBeamError::CompressionError);
 #[cfg(all(feature = "aead", not(feature = "derive")))]
 crate::impl_from!(aead::Error => TightBeamError::EncryptionError);
+#[cfg(all(feature = "ecies", not(feature = "derive")))]
+crate::impl_from!(EciesError => TightBeamError::EciesError);
 #[cfg(all(feature = "signature", not(feature = "derive")))]
 crate::impl_from!(signature::Error => TightBeamError::SignatureError);
 #[cfg(all(feature = "zstd", not(feature = "derive")))]

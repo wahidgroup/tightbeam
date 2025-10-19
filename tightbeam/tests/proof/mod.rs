@@ -328,6 +328,90 @@ job! {
 	}
 }
 
+// Compute Merkle root for an epoch of frames
+job! {
+	name: ComputeEpochRootJob,
+	fn run(epoch_frames: Vec<Frame>) -> Result<MerkleHash> {
+		use tightbeam::crypto::hash::{Digest, Sha3_256};
+		use tightbeam::der::Encode;
+
+		if epoch_frames.is_empty() {
+			return Err(TightBeamError::InvalidBody);
+		}
+
+		// Hash each frame in the epoch
+		let mut hashes = Vec::with_capacity(epoch_frames.len());
+		for frame in &epoch_frames {
+			let frame_der = frame.to_der()?;
+			let mut hasher = Sha3_256::new();
+			hasher.update(&frame_der);
+			let digest = hasher.finalize();
+
+			let mut hash = [0u8; 32];
+			hash.copy_from_slice(&digest[..32]);
+			hashes.push(hash);
+		}
+
+		// Convert to OctetString sequence
+		let mut items = Vec::with_capacity(hashes.len());
+		for hash in hashes {
+			items.push(asn1::OctetString::new(hash.to_vec())?);
+		}
+
+		// Compute Merkle root
+		let sequence = HashSequence { items };
+		let response = MerkleComputeRootJob::run(sequence);
+
+		match response {
+			MerkleResponse::Root(root) => octet_to_hash(&root),
+			_ => Err(TightBeamError::InvalidBody),
+		}
+	}
+}
+
+// Verify a frame is part of an epoch using Merkle proof
+job! {
+	name: VerifyEpochMembershipJob,
+	fn run(frame: Frame, merkle_path: Vec<MerkleHash>, expected_root: MerkleHash) -> Result<bool> {
+		use tightbeam::crypto::hash::{Digest, Sha3_256};
+		use tightbeam::der::Encode;
+
+		// Hash the frame
+		let frame_der = frame.to_der()?;
+		let mut hasher = Sha3_256::new();
+		hasher.update(&frame_der);
+		let digest = hasher.finalize();
+
+		let mut leaf_hash = [0u8; 32];
+		leaf_hash.copy_from_slice(&digest[..32]);
+
+		// Convert to OctetString
+		let leaf = asn1::OctetString::new(leaf_hash.to_vec())?;
+
+		// Convert path to OctetString sequence
+		let mut path_items = Vec::with_capacity(merkle_path.len());
+		for hash in merkle_path {
+			path_items.push(asn1::OctetString::new(hash.to_vec())?);
+		}
+
+		// Verify the path
+		let verify_request = MerkleVerifyPath {
+			leaf,
+			path: HashSequence { items: path_items },
+		};
+
+		let response = MerkleVerifyPathJob::run(verify_request);
+
+		match response {
+			MerkleResponse::Verified(computed_root) => {
+				let computed = octet_to_hash(&computed_root)?;
+				Ok(computed == expected_root)
+			}
+			_ => Ok(false),
+		}
+	}
+}
+
 worker! {
 	name: MerkleWorker<MerkleRequest, MerkleResponse>,
 	handle: |message| async move {
@@ -527,7 +611,7 @@ mod tests {
 
 	// 538e0b06dc8f91e125660f582510f7edef7f0043fe452fe9950fd15f053bbde2
 	servlet! {
-		name: TransactionServlet,
+		name: BFTLedgerServlet,
 		protocol: Listener,
 		policies: {
 			with_collector_gate: [
@@ -537,6 +621,7 @@ mod tests {
 		},
 		config: {
 			ledger_state: LedgerState,
+			epoch_size: usize,
 		},
 		// workers: |config| {
 
@@ -560,16 +645,54 @@ mod tests {
 				panic!("Genesis block mismatch");
 			}
 
+			// Initialize epoch with genesis block
+			let epochs = EPOCHS();
+			let Ok(mut epochs) = epochs.write() else {
+				panic!("Unable to lock epochs")
+			};
+			epochs.push(genesis);
+
+			println!("BFT Ledger initialized with genesis block");
+
 			Ok(())
 		},
-		handle: |message, _config| async move {
+		handle: |message, config| async move {
+			// Add frame to current epoch
+			let epochs = EPOCHS();
+			let Ok(mut epochs) = epochs.write() else {
+				return None;
+			};
+
+			epochs.push(message.clone());
+
+			// Check if epoch is complete
+			if epochs.len() % config.epoch_size == 0 {
+				let epoch_number = epochs.len() / config.epoch_size;
+				let epoch_start = (epoch_number - 1) * config.epoch_size;
+				let epoch_frames = epochs[epoch_start..].to_vec();
+
+				// Compute Merkle root for the epoch
+				match ComputeEpochRootJob::run(epoch_frames) {
+					Ok(root) => {
+						println!("Epoch {} complete. Merkle root: {}", epoch_number, to_hex(&root));
+						// TODO: Anchor to Bitcoin
+					}
+					Err(e) => {
+						eprintln!("Failed to compute epoch root: {:?}", e);
+					}
+				}
+			}
+
 			Some(message)
 		}
 	}
 
 	#[tokio::test]
 	async fn test_basic() -> Result<()> {
-		TransactionServlet::start(TransactionServletConf { ledger_state: Default::default() }).await?;
+		BFTLedgerServlet::start(BFTLedgerServletConf {
+			ledger_state: Default::default(),
+			epoch_size: 1000,
+		}).await?;
 
 		Ok(())
 	}

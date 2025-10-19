@@ -230,19 +230,67 @@ macro_rules! test_case {
 ///
 /// Similar to test_case! but specifically designed for testing builders.
 /// Automatically provides a base builder instance and allows customization.
+/// Passes both the input message and the resulting frame to assertions.
+///
+/// The `message` parameter supports two forms:
+/// - Direct value: `message: create_test_message(None)`
+/// - Closure: `message: || { create_test_message(None) }`
 #[macro_export]
 macro_rules! test_builder {
+	// Closure form: message: || { ... }
 	(
 		name: $test_name:ident,
 		builder_type: $builder_type:ty,
 		version: $version:expr,
-		setup: |$builder:ident| $setup_body:expr,
-		assertions: |$result:ident| $assertions_body:expr
+		message: || $message_body:expr,
+		setup: |$builder:ident, $msg:ident| $setup_body:expr,
+		assertions: |$msg_result:ident, $frame_result:ident| $assertions_body:expr
+	) => {
+		$crate::test_builder!(@impl
+			$test_name,
+			$builder_type,
+			$version,
+			{ $message_body },
+			|$builder, $msg| $setup_body,
+			|$msg_result, $frame_result| $assertions_body
+		);
+	};
+
+	// Direct value form: message: some_value
+	(
+		name: $test_name:ident,
+		builder_type: $builder_type:ty,
+		version: $version:expr,
+		message: $message:expr,
+		setup: |$builder:ident, $msg:ident| $setup_body:expr,
+		assertions: |$msg_result:ident, $frame_result:ident| $assertions_body:expr
+	) => {
+		$crate::test_builder!(@impl
+			$test_name,
+			$builder_type,
+			$version,
+			$message,
+			|$builder, $msg| $setup_body,
+			|$msg_result, $frame_result| $assertions_body
+		);
+	};
+
+	// Internal implementation (not exposed to users)
+	(@impl
+		$test_name:ident,
+		$builder_type:ty,
+		$version:expr,
+		$message:expr,
+		|$builder:ident, $msg:ident| $setup_body:expr,
+		|$msg_result:ident, $frame_result:ident| $assertions_body:expr
 	) => {
 		#[test]
 		fn $test_name() -> $crate::error::Result<()> {
+			let $msg = $message;
+			let msg_clone = $msg.clone();
 			let $builder: $builder_type = <$builder_type>::from($version);
-			let $result = $setup_body;
+			let $frame_result = $setup_body;
+			let $msg_result = msg_clone;
 			$assertions_body
 		}
 	};
@@ -1006,13 +1054,14 @@ mod tests {
 		name: test_metadata_builder_basic,
 		builder_type: crate::builder::MetadataBuilder,
 		version: crate::Version::V0,
-		setup: |builder| {
+		message: (),
+		setup: |builder, _msg| {
 			builder
 				.with_id("test-id")
 				.with_order(1696521600)
 				.build()
 		},
-		assertions: |result| {
+		assertions: |_msg, result| {
 			let metadata: crate::Metadata = result?;
 			assert_eq!(metadata.id, b"test-id");
 			assert_eq!(metadata.order, 1696521600);

@@ -5,10 +5,11 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
 use crate::der::oid::{AssociatedOid, ObjectIdentifier};
+use crate::der::Sequence;
 use crate::error::Result;
 use crate::error::{ExpectError, TightBeamError};
 use crate::matrix::{MatrixDyn, MatrixLike};
-use crate::{Frame, Message, Version};
+use crate::{Frame, Message, Metadata, Version};
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::{Aead, Encryptor};
@@ -24,6 +25,14 @@ use crate::helpers::Digestor;
 
 #[cfg(feature = "std")]
 use std::time::SystemTime;
+
+/// Scaffold: envelope-only structure (version + metadata) for computing Frame Integrity.
+/// Excludes the message field per spec: FI MUST be computed over envelope only.
+#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+pub struct FrameIntegrityScaffold {
+	pub version: Version,
+	pub metadata: Metadata,
+}
 
 /// A fluent builder for creating tightbeam messages with metadata generation
 pub struct FrameBuilder<T: Message> {
@@ -351,11 +360,12 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 		let metadata = metadata_builder.build()?;
 		let mut tbs = Frame { version, metadata, message, integrity: None, nonrepudiation: None };
 
-		// 4. Optional witness
+		// 4. Optional witness: compute FI over envelope only (version + metadata; excludes message)
 		#[cfg(feature = "digest")]
 		if let Some(witness_fn) = self.witness {
-			let tbs_der = crate::encode(&tbs)?;
-			let witness_info = witness_fn(&tbs_der)?;
+			let scaffold = FrameIntegrityScaffold { version: tbs.version, metadata: tbs.metadata.clone() };
+			let scaffold_der = crate::encode(&scaffold)?;
+			let witness_info = witness_fn(&scaffold_der)?;
 			tbs.integrity = Some(witness_info);
 		}
 
@@ -392,15 +402,15 @@ mod tests {
 		name: test_v0_basic,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V0,
-		setup: |builder| {
+		message: create_test_message(None),
+		setup: |builder, msg| {
 			builder
-				.with_message(create_test_message(None))
+				.with_message(msg)
 				.with_id("test_v0_basic")
 				.with_order(1696521600)
-				.with_message_hasher::<Sha3_256>()
 				.build()
 		},
-		assertions: |result| {
+		assertions: |_msg, result| {
 			let tightbeam  = result?;
 			assert_eq!(tightbeam.version, Version::V0);
 			assert_eq!(str::from_utf8(&tightbeam.metadata.id), Ok("test_v0_basic"));
@@ -413,28 +423,26 @@ mod tests {
 		name: test_v1_with_encryption,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V1,
-		setup: |builder| {
+		message: create_test_message(None),
+		setup: |builder, msg| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
 			let signing_key = create_test_signing_key();
 
 			builder
-				.with_message(message)
+				.with_message(msg)
 				.with_id("test_v1_with_encryption")
 				.with_order(1696521600)
-				.with_message_hasher::<Sha3_256>()
 				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
 				.with_signer::<Secp256k1Signature, _>(&signing_key)
 				.build()
 		},
-		assertions: |result| {
+		assertions: |message, result| {
 			let tightbeam  = result?;
 			assert_eq!(tightbeam.version, Version::V1);
 			assert!(tightbeam.metadata.confidentiality.is_some());
-			assert!(tightbeam.metadata.integrity.is_some());
 			assert!(tightbeam.nonrepudiation.is_some());
 
 			// Body should be encrypted (not directly decodable)
@@ -442,7 +450,6 @@ mod tests {
 			assert!(decode_result.is_err(), "Body should be encrypted");
 
 			// Decrypt and verify
-			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, None)?;
 			assert_eq!(decrypted, message);
@@ -461,26 +468,25 @@ mod tests {
 		name: test_v1_with_compression,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V1,
-		setup: |builder| {
+		message: create_test_message(None),
+		setup: |builder, msg| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 			use crate::compress::ZstdCompression;
 
-			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
 			let signing_key = create_test_signing_key();
 
 			builder
-				.with_message(message)
+				.with_message(msg)
 				.with_id("test_v1_with_compression")
 				.with_order(1696521600)
-				.with_message_hasher::<Sha3_256>()
 				.with_compression(ZstdCompression)
 				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
 				.with_signer::<Secp256k1Signature, _>(&signing_key)
 				.build()
 		},
-		assertions: |result| {
+		assertions: |message, result| {
 			let tightbeam = result?;
 			assert_eq!(tightbeam.version, Version::V1);
 			assert!(tightbeam.metadata.compactness.is_some());
@@ -491,7 +497,6 @@ mod tests {
 			assert!(decode_result.is_err(), "Body should be encrypted/compressed");
 
 			// Decrypt (automatically decompresses) and verify
-			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression))?;
 			assert_eq!(decrypted, message);
@@ -511,11 +516,13 @@ mod tests {
 		name: test_v2_full,
 		builder_type: FrameBuilder<TestMessage>,
 		version: Version::V2,
-		setup: |builder| {
+		message: || {
+			create_test_message(None)
+		},
+		setup: |builder, msg| {
 			use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
 			let signing_key = create_test_signing_key();
 
@@ -527,7 +534,7 @@ mod tests {
 			let flags = crate::flags::Flags::<2>::from([0x01, 0x02]);
 
 			builder
-				.with_message(message)
+				.with_message(msg)
 				.with_id("test_v2_full")
 				.with_order(1696521600)
 				.with_message_hasher::<Sha3_256>()
@@ -542,7 +549,7 @@ mod tests {
 				.with_matrix(flags)
 				.build()
 		},
-		assertions: |result| {
+		assertions: |message, result| {
 			use crate::crypto::sign::ecdsa::Secp256k1Signature;
 
 			let tightbeam = result?;
@@ -557,12 +564,27 @@ mod tests {
 			assert!(tightbeam.integrity.is_some());
 			assert!(tightbeam.nonrepudiation.is_some());
 
+			// Verify Message Integrity (MI): compute hash over original message and compare
+			let message_der = crate::encode(&message)?;
+			let expected_mi = crate::utils::digest::<Sha3_256>(&message_der)?;
+			let actual_mi = tightbeam.metadata.integrity.as_ref().expect("Message integrity should be present");
+			assert_eq!(actual_mi.digest.as_bytes(), expected_mi.digest.as_bytes());
+
+			// Verify Frame Integrity (FI): compute hash over envelope (version + metadata) and compare
+			let scaffold = FrameIntegrityScaffold {
+				version: tightbeam.version,
+				metadata: tightbeam.metadata.clone(),
+			};
+			let scaffold_der = crate::encode(&scaffold)?;
+			let expected_fi = crate::utils::digest::<Sha3_256>(&scaffold_der)?;
+			let actual_fi = tightbeam.integrity.as_ref().expect("Frame integrity should be present");
+			assert_eq!(actual_fi.digest.as_bytes(), expected_fi.digest.as_bytes());
+
 			// Body should be encrypted+compressed (not directly decodable)
 			let decode_result: Result<TestMessage> = crate::decode(&tightbeam.message);
 			assert!(decode_result.is_err());
 
 			// Decrypt (automatically decompresses) and verify
-			let message = create_test_message(None);
 			let (_, cipher) = create_test_cipher_key();
 			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression))?;
 			assert_eq!(decrypted, message);

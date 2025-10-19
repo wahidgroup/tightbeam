@@ -266,7 +266,7 @@ All versions MUST include:
 - Message payload (bytecode)
 
 All versions MAY include:
-- Frame integrity (digest of complete structure)
+- Frame integrity (digest of envelope: version + metadata; excludes message)
 - Non-repudiation (cryptographic signature)
 
 ### 4.3 Metadata Specification
@@ -538,12 +538,79 @@ Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms a
 - Duplicate `order` values within the same `id` namespace MUST be rejected
 
 #### 5.8.2 Compression Requirements
-- When `compactness` is present (not `None`), the `message` field MUST contain compressed data encoded as `CompressedData` per RFC 3274
-- The `encapContentInfo` within `CompressedData` MUST use the `id-data` content type OID if the compressed data does not conform to any recognized content type
-- Compression algorithm identifiers MUST be valid OIDs (e.g., `id-alg-zlibCompress` for zlib, custom OIDs for zstd -- tightbeam uses 1.2.840.113549.1.9.16.3 pending formal assignment)
-- Compression level parameters, when specified in `compressionAlgorithm.parameters`, MUST be within algorithm-specific valid ranges
+- When `compactness` is present (not `None`), the `message` field MUST contain 
+compressed data encoded as `CompressedData` per RFC 3274
+- The `encapContentInfo` within `CompressedData` MUST use the `id-data` content 
+type OID if the compressed data does not conform to any recognized content type
+- Compression algorithm identifiers MUST be valid OIDs (e.g., 
+`id-alg-zlibCompress` for zlib, custom OIDs for zstd -- tightbeam uses 
+1.2.840.113549.1.9.16.3 pending formal assignment)
+- Compression level parameters, when specified in 
+`compressionAlgorithm.parameters`, MUST be within algorithm-specific valid ranges
 
-#### 5.8.3 Previous Frame Chaining
+#### 5.8.3 Integrity Semantics: Order of Operations
+
+This section clarifies the relationship between message integrity and frame 
+integrity. The goals are: (1) unambiguous validation semantics, and (2) clear 
+data retention choices.
+
+- Message Integrity (MI): MI MUST be computed over the message payload bytes. 
+When present at the metadata level (i.e., `Metadata.integrity`), MI MUST bind 
+the message body.
+- Frame Integrity (FI): FI MUST be computed over the envelope only (version + 
+metadata; it MUST exclude the message) using DER-canonical encoding. FI MUST 
+bind the envelope around the message and the metadata itself.
+
+Important properties:
+- FI alone MUST NOT be used to prove message content correctness; it ONLY proves 
+the integrity of the envelope (version + metadata).
+- MI MUST be used to prove message content correctness. Because MI lives in 
+metadata and FI commits to the envelope that contains that metadata, FI 
+therefore witnesses MI. When FI is authenticated (e.g., covered by a signature 
+via nonrepudiation or finalized via consensus), any tampering with MI MUST cause 
+the authenticated FI validation to fail. Receivers SHOULD treat the pair 
+(valid MI, authenticated FI) as sufficient evidence that both envelope and 
+message are intact. Note: an in-band, unsigned FI MUST NOT be relied upon to 
+prevent an active attacker from changing both MI and FI.
+
+Post-consensus retention (optional, system-dependent):
+- If an external consensus or commit layer has finalized a frame that included 
+valid MI and FI, implementations having already processed the message and
+verifying both message and frame integrity MAY discard the message body after 
+consensus if application semantics permit.
+- Implementations MUST retain the minimal audit artifacts: metadata (including 
+MI), FI (if used), and any application-required identifiers/indices. Anyone 
+possessing the exact original body can recompute MI and compare against the 
+retained MI/FI to verify authenticity later.
+
+##### Message Integrity with AEAD
+
+When confidentiality is enabled, tightbeam implementations MUST use Authenticated 
+Encryption with Associated Data (AEAD) ciphers. This requirement is enforced at 
+the type system level through trait bounds:
+
+```rust
+pub fn with_cipher<C, Cipher>(mut self, cipher: &Cipher) -> Self
+where
+    Cipher: Aead + Clone + 'static,  // AEAD trait bound required
+```
+
+This design ensures MI over plaintext is cryptographically sound:
+
+- **Type-level guarantee**: Non-AEAD ciphers cannot be used (compile-time enforcement)
+- **Ciphertext authentication**: AEAD provides built-in authentication tags that prove 
+the ciphertext has not been tampered with (e.g., AES-GCM, ChaCha20-Poly1305)
+- **MI purpose**: Proves the decrypted plaintext matches the original message content
+- **Layered security**: AEAD prevents ciphertext tampering, MI proves plaintext 
+correctness, FI witnesses MI in metadata, signatures cover the entire frame
+
+This approach is cryptographically equivalent to Encrypt-then-MAC when AEAD is 
+enforced, as AEAD ciphers provide both confidentiality and authenticity of the 
+ciphertext. An attacker cannot modify the ciphertext (AEAD authentication fails), 
+cannot modify MI without breaking FI (when FI is signed/consensus-finalized), 
+and cannot decrypt without the key.
+
+#### 5.8.4 Previous Frame Chaining
 - The ``previous_frame`` field creates a cryptographic hash chain linking frames
 - Each frame's hash commits to all previous history through transitive hashing
 - This enables:
@@ -553,6 +620,60 @@ Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms a
   - **Fork Detection**: Multiple frames with the same ``previous_frame`` indicate reality branching
   - **Stateless Verification**: Frame ancestry can be verified without storing the entire chain
 - Implementations MAY store any frames to enable full chain reconstruction to their desired root
+
+#### 5.8.5 Nonrepudiation Coverage and Binding
+
+This section specifies what the nonrepudiation signature covers when present.
+
+- Signature scope (MUST): The signature MUST be computed over the canonical 
+DER encoding of the Frame fields EXCLUDING the `nonrepudiation` field itself; 
+concretely, it MUST cover:
+	- `version`
+	- `metadata` (including MI when present)
+	- `message`
+	- `integrity` (FI) when present
+
+- Security consequence: Any modification to version, metadata (including MI), 
+message, or FI invalidates the signature. This yields the transitive binding:
+	Signature → FI (envelope) → MI (in metadata) → Message body
+
+- Rationale: Because FI commits to the envelope that contains MI, and the 
+signature authenticates FI along with the rest of the envelope and message, 
+honest nodes can reject any post-signature tampering to MI, FI, or the message body.
+
+#### 5.8.6 Security Property Chain
+
+When all security features are enabled (MI, FI, AEAD encryption, and signatures), 
+the complete security property chain operates as follows:
+
+**Sender operations (in order):**
+1. Compute MI over plaintext message
+- Store DigestInfo in Metadata
+2. Optionally compress the plaintext message
+- Store CompressedData in Metadata
+3. Encrypt with AEAD cipher → produce authenticated ciphertext
+- Store EncryptedContentInfo in Metadata
+- Store ciphertext in Frame.message
+4. Compute FI over envelope (Version + Metadata containing MI)
+- Store DigestInfo in Frame
+5. Sign the complete frame (Version + Metadata + ciphertext + FI) 
+- Store SignerInfo in Frame
+
+**Receiver verification (in order):**
+1. Verify signature over complete Frame + Message
+2. Verify FI over envelope (Version + Metadata)
+3. Verify AEAD authentication tag on ciphertext
+4. Decrypt ciphertext to recover plaintext
+5. Verify MI matches the decrypted plaintext
+
+This layered approach provides defense in depth:
+- AEAD ensures ciphertext authenticity (prevents tampering with encrypted data)
+- FI ensures envelope integrity (prevents tampering with metadata including MI)
+- MI ensures message integrity (proves plaintext correctness after decryption)
+- Signature ensures nonrepudiation (cryptographically binds sender to entire frame)
+
+Any tampering at any layer causes verification to fail, ensuring end-to-end 
+integrity and authenticity guarantees.
 
 ### 5.9 What is the Matrix?
 

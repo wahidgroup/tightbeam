@@ -31,6 +31,7 @@ crypto-common = { workspace = true, optional = true }
 aead = { workspace = true, optional = true }
 signature = { workspace = true, optional = true }
 digest = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 sha3 = { workspace = true, optional = true }
 ecdsa = { workspace = true, optional = true }
@@ -71,6 +72,8 @@ full = [
 	"aes-gcm",
 	"sha3",
 	"secp256k1",
+	# "kdf",
+	# "ecies",
 	"derive",
 	"tokio",
 	"constants",
@@ -118,6 +121,8 @@ signature = [
 ]
 digest = ["crypto", "dep:digest", "tightbeam-derive?/digest"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
+kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
+ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
 
 ## Security features
 random = ["dep:rand_core"]
