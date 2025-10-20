@@ -15,23 +15,21 @@
 //! **Encryption:**
 //! 1. Generate ephemeral keypair (r, R = r·G)
 //! 2. Compute shared secret: S = r·P (where P is recipient's public key)
-//! 3. Derive keys: (k_enc, k_mac) = KDF(C0, S) where C0 is ephemeral pubkey
-//! 4. Encrypt: c = AEAD.Encrypt(k_enc, plaintext)
-//! 5. Output: (R, c)
+//! 3. Derive key: k_enc = KDF(C0, S) where C0 is ephemeral pubkey
+//! 4. Encrypt: c = AEAD.Encrypt(k_enc, plaintext) with a random nonce
+//! 5. Output: [R || nonce || ciphertext || tag]
 //!
 //! **Decryption:**
-//! 1. Parse (R, c) from ciphertext
+//! 1. Parse [R || nonce || ciphertext || tag] from ciphertext
 //! 2. Compute shared secret: S = d·R (where d is recipient's private key)
-//! 3. Derive keys: (k_enc, k_mac) = KDF(C0, S)
-//! 4. Decrypt: plaintext = AEAD.Decrypt(k_enc, c)
+//! 3. Derive key: k_enc = KDF(C0, S)
+//! 4. Decrypt: plaintext = AEAD.Decrypt(k_enc, nonce, ciphertext, tag)
 
-use aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
 use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
-use sha3::Sha3_256;
-use zeroize::Zeroizing;
 
-use super::kdf::{ecies_kdf, KdfError};
+use crate::crypto::aead::{Aes256Gcm, Key, Aes256GcmNonce, Aead, KeyInit, Payload};
+use crate::zeroize::Zeroizing;
+use crate::crypto::kdf::{ecies_kdf_sha256, KdfError};
 
 /// KDF info parameter for domain separation and protocol versioning
 const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
@@ -106,7 +104,7 @@ use crate::Errorizable;
 
 /// Errors specific to ECIES operations
 #[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum EciesError {
 	/// Invalid public key
 	#[cfg_attr(feature = "derive", error("Invalid ECIES public key"))]
@@ -247,21 +245,27 @@ impl EciesEphemeral for SecretKey {
 		let ephemeral_secret = EphemeralSecret::random(&mut wrapper);
 		let ephemeral_pubkey = ephemeral_secret.public_key();
 
+		// Perform ECDH to get shared secret
 		let shared_secret = ephemeral_secret.diffie_hellman(recipient_pubkey);
 
 		let ephemeral_point = ephemeral_pubkey.to_encoded_point(true);
 		let ephemeral_bytes = ephemeral_point.as_bytes().to_vec();
 		let shared_bytes = Zeroizing::new(shared_secret.raw_secret_bytes().to_vec());
-
 		Ok((ephemeral_bytes, shared_bytes))
 	}
 }
 
-/// ECIES encrypted message format: [ephemeral_pubkey || ciphertext || tag]
+/// ECIES encrypted message format: [ephemeral_pubkey || nonce || ciphertext || tag]
+///
+/// The wire format consists of:
+/// - `ephemeral_pubkey`: 33 bytes (compressed secp256k1 public key)
+/// - `nonce`: 12 bytes (AES-GCM nonce)
+/// - `ciphertext`: variable length (encrypted plaintext)
+/// - `tag`: 16 bytes (AES-GCM authentication tag, appended to ciphertext)
 pub struct EciesMessage {
-	/// Ephemeral public key (serialized)
+	/// Ephemeral public key (serialized, 33 bytes for compressed secp256k1)
 	pub ephemeral_pubkey: Vec<u8>,
-	/// Encrypted data with authentication tag
+	/// Nonce + encrypted data + authentication tag (12 + len(plaintext) + 16 bytes)
 	pub ciphertext: Vec<u8>,
 }
 
@@ -271,13 +275,15 @@ impl EciesMessage {
 	/// For secp256k1, ephemeral_pubkey is 33 bytes (compressed SEC1)
 	pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
 		let bytes = bytes.as_ref();
-		// Minimum size: 33 (ephemeral pubkey) + 16 (GCM tag minimum)
-		if bytes.len() < 33 + 16 {
+		if bytes.len() < 33 + 12 + 16 {
 			return Err(EciesError::InvalidCiphertext);
 		}
 
 		let ephemeral_pubkey = bytes[0..33].to_vec();
 		let ciphertext = bytes[33..].to_vec();
+		if ciphertext.len() < 12 + 16 {
+			return Err(EciesError::InvalidCiphertext);
+		}
 
 		Ok(Self { ephemeral_pubkey, ciphertext })
 	}
@@ -297,61 +303,81 @@ impl EciesMessage {
 /// * `recipient_pubkey` - Recipient's public key (implements EciesPublicKeyOps)
 /// * `plaintext` - Data to encrypt
 /// * `associated_data` - Optional authenticated associated data (AAD)
-/// * `rng` - Optional cryptographically secure random number generator (uses OsRng if None)
+/// * `rng` - Optional cryptographically secure random number generator (uses OsRng if not provided)
 ///
 /// # Returns
 /// Encrypted message containing ephemeral public key and ciphertext
-pub fn encrypt<PK, P>(
+///
+/// # Type Parameters
+/// * `PK` - Public key type implementing EciesPublicKeyOps
+/// * `P` - Plaintext type that can be converted to bytes
+/// * `R` - Random number generator type (optional, defaults to OsRng)
+///
+/// # Examples
+///
+/// ```ignore
+/// // Using default OsRng
+/// let encrypted = encrypt(&public_key, plaintext, None, None)?;
+///
+/// // Using custom RNG for testing
+/// let mut rng = test_rng();
+/// let encrypted = encrypt(&public_key, plaintext, None, Some(&mut rng))?;
+/// ```
+pub fn encrypt<PK, P, R>(
 	recipient_pubkey: &PK,
 	plaintext: P,
 	associated_data: Option<&[u8]>,
-	rng: Option<&mut dyn CryptoRngCore>,
+	rng: Option<&mut R>,
 ) -> Result<EciesMessage>
 where
 	PK: EciesPublicKeyOps,
 	PK::SecretKey: EciesEphemeral<PublicKey = PK>,
 	P: AsRef<[u8]>,
+	R: CryptoRng + RngCore,
 {
 	let plaintext = plaintext.as_ref();
+	
+	// Helper macro to avoid code duplication
+	macro_rules! do_encrypt {
+		($rng:expr) => {{
+			// Use the trait method to generate ephemeral key and shared secret
+			let (ephemeral_bytes, shared_secret) = PK::SecretKey::generate_ephemeral(recipient_pubkey, $rng)?;
 
-	let rng = if let Some(rng) = rng {
-		rng
-	} else {
-		&mut OsRng
-	};
+			// Derive encryption key using KDF (includes C0 for non-malleability)
+			let k_enc = ecies_kdf_sha256(&ephemeral_bytes, &shared_secret, ECIES_KDF_INFO, None)?;
 
-	// Use the trait method to generate ephemeral key and shared secret
-	let (ephemeral_bytes, shared_secret) = PK::SecretKey::generate_ephemeral(recipient_pubkey, rng)?;
+			// Encrypt using AES-256-GCM
+			let key = Key::<Aes256Gcm>::from_slice(&k_enc[..]);
+			let cipher = Aes256Gcm::new(key);
 
-	// 3. Derive encryption key using KDF (includes C0 for non-malleability)
-	// Uses SHA3-256 with protocol versioning via info parameter
-	// Derives 32-byte keys for AES-256-GCM
-	let (k_enc, _k_mac) = ecies_kdf::<Sha3_256, 0>(&ephemeral_bytes, &shared_secret, ECIES_KDF_INFO)?;
+			// Generate random nonce (96 bits for GCM)
+			let mut nonce_bytes = [0u8; 12];
+			$rng.fill_bytes(&mut nonce_bytes);
+			let nonce = Aes256GcmNonce::from_slice(&nonce_bytes);
 
-	// 4. Encrypt using AES-256-GCM
-	let key = Key::<Aes256Gcm>::from_slice(&k_enc[..]);
-	let cipher = Aes256Gcm::new(key);
+			// Prepare payload with optional AAD
+			let payload = match associated_data {
+				Some(aad) => Payload { msg: plaintext, aad },
+				None => Payload { msg: plaintext, aad: b"" },
+			};
 
-	// Generate random nonce (96 bits for GCM)
-	let mut nonce_bytes = [0u8; 12];
-	rng.fill_bytes(&mut nonce_bytes);
-	let nonce = Nonce::from_slice(&nonce_bytes);
+			// Encrypt (produces ciphertext || tag)
+			let mut ciphertext = cipher.encrypt(nonce, payload).map_err(|_| EciesError::EncryptionFailed)?;
 
-	// Prepare payload with optional AAD
-	let payload = match associated_data {
-		Some(aad) => Payload { msg: plaintext, aad },
-		None => Payload { msg: plaintext, aad: b"" },
-	};
+			// Prepend nonce to ciphertext (for transmission)
+			let mut final_ciphertext = Vec::with_capacity(12 + ciphertext.len());
+			final_ciphertext.extend_from_slice(&nonce_bytes);
+			final_ciphertext.append(&mut ciphertext);
 
-	// Encrypt (produces ciphertext || tag)
-	let mut ciphertext = cipher.encrypt(nonce, payload).map_err(|_| EciesError::EncryptionFailed)?;
+			Ok(EciesMessage { ephemeral_pubkey: ephemeral_bytes, ciphertext: final_ciphertext })
+		}};
+	}
 
-	// Prepend nonce to ciphertext (for transmission)
-	let mut final_ciphertext = Vec::with_capacity(12 + ciphertext.len());
-	final_ciphertext.extend_from_slice(&nonce_bytes);
-	final_ciphertext.append(&mut ciphertext);
-
-	Ok(EciesMessage { ephemeral_pubkey: ephemeral_bytes, ciphertext: final_ciphertext })
+	// Use provided RNG or default to OsRng
+	match rng {
+		Some(r) => do_encrypt!(r),
+		None => do_encrypt!(&mut OsRng),
+	}
 }
 
 /// Decrypt ECIES message using recipient's secret key
@@ -377,14 +403,13 @@ where
 	let shared_secret = recipient_seckey.diffie_hellman(&ephemeral_pubkey);
 	// 3. Derive encryption key using KDF (includes C0 for non-malleability)
 	// Uses SHA3-256 with protocol versioning via info parameter
-	// Derives 32-byte keys for AES-256-GCM
-	let (k_enc, _k_mac) = ecies_kdf::<Sha3_256, 32>(&message.ephemeral_pubkey, &shared_secret, ECIES_KDF_INFO)?;
+	// Derives 32-byte key for AES-256-GCM authenticated encryption
+	let k_enc = ecies_kdf_sha256(&message.ephemeral_pubkey, &shared_secret, ECIES_KDF_INFO, None)?;
 	// 4. Extract nonce and ciphertext
 	if message.ciphertext.len() < 12 + 16 {
 		return Err(EciesError::InvalidCiphertext);
 	}
-
-	let nonce = Nonce::from_slice(&message.ciphertext[0..12]);
+	let nonce = Aes256GcmNonce::from_slice(&message.ciphertext[0..12]);
 	let ciphertext_with_tag = &message.ciphertext[12..];
 
 	// 5. Decrypt using AES-256-GCM
@@ -419,7 +444,7 @@ mod tests {
 	// Helper for encryption roundtrip
 	fn roundtrip(plaintext: &[u8], aad: Option<&[u8]>) -> Result<()> {
 		let (secret, public) = keypair();
-		let encrypted = encrypt(&public, plaintext, aad, None)?;
+		let encrypted = encrypt(&public, plaintext, aad, None::<&mut OsRng>)?;
 		let decrypted = decrypt(&secret, &encrypted, aad)?;
 		assert_eq!(plaintext, &decrypted[..]);
 		Ok(())
@@ -479,7 +504,7 @@ mod tests {
 		let plaintext = b"Test serialization";
 
 		// Message serialization roundtrip
-		let encrypted = encrypt(&public, plaintext, None, None)?;
+		let encrypted = encrypt(&public, plaintext, None, None::<&mut OsRng>)?;
 		let bytes = encrypted.to_bytes();
 		let parsed = EciesMessage::from_bytes(&bytes)?;
 		let decrypted = decrypt(&secret, &parsed, None)?;
@@ -512,7 +537,7 @@ mod tests {
 		let (_, public1) = keypair();
 		let (secret2, _) = keypair();
 
-		let encrypted = encrypt(&public1, plaintext, None, None)?;
+		let encrypted = encrypt(&public1, plaintext, None, None::<&mut OsRng>)?;
 		let result = decrypt(&secret2, &encrypted, None);
 
 		if let Ok(decrypted) = result {
@@ -544,7 +569,7 @@ mod tests {
 		];
 
 		for tamper_fn in tamper_functions {
-			let mut encrypted = encrypt(&public, plaintext, None, None)?;
+			let mut encrypted = encrypt(&public, plaintext, None, None::<&mut OsRng>)?;
 			tamper_fn(&mut encrypted);
 			assert!(decrypt(&secret, &encrypted, None).is_err());
 		}
