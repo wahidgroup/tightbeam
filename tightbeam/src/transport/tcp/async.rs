@@ -1,11 +1,11 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::transport::{
-	AsyncListenerTrait, MessageIO, Pingable, Protocol, TransportEnvelope, TransportError, TransportResult,
-};
+use crate::transport::{AsyncListenerTrait, MessageIO, Pingable, Protocol, TransportError, TransportResult};
 use crate::Frame;
 
+#[cfg(feature = "x509")]
+use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
 #[cfg(feature = "transport-policy")]
 use crate::{policy::GatePolicy, transport::policy::RestartPolicy};
 
@@ -83,6 +83,38 @@ impl Protocol for TokioListener {
 	}
 }
 
+#[cfg(feature = "x509")]
+impl EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid> for TokioListener {
+	type Encryptor = crate::crypto::aead::Aes256Gcm;
+	type Decryptor = crate::crypto::aead::Aes256Gcm;
+
+	async fn bind_with(
+		addr: Self::Address,
+		_cert: crate::crypto::x509::Certificate,
+	) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = TcpListener::bind(addr.0).await?;
+		let bound_addr = listener.local_addr()?;
+		Ok((Self { listener }, crate::transport::tcp::TightBeamSocketAddr(bound_addr)))
+	}
+}
+
+#[cfg(feature = "x509")]
+impl<S: AsyncProtocolStream> EncryptedMessageIO<crate::crypto::ecies::EciesSecp256k1Oid> for TcpTransport<S>
+where
+	TransportError: From<S::Error>,
+{
+	type Encryptor = crate::crypto::aead::Aes256Gcm;
+	type Decryptor = crate::crypto::aead::Aes256Gcm;
+
+	fn encryptor(&self) -> TransportResult<&Self::Encryptor> {
+		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
+	}
+
+	fn decryptor(&self) -> TransportResult<&Self::Decryptor> {
+		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
+	}
+}
+
 impl AsyncListenerTrait for TokioListener {
 	async fn accept(&self) -> Result<(Self::Stream, Self::Address), Self::Error> {
 		let (stream, addr) = self.listener.accept().await?;
@@ -113,6 +145,8 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	restart_policy: Box<dyn RestartPolicy>,
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
+	#[cfg(feature = "x509")]
+	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
 }
 
 impl<S: AsyncProtocolStream> Pingable for TcpTransport<S>
@@ -131,7 +165,7 @@ impl<S: AsyncProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
-	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
 		let stream = self.stream.inner_mut();
 
 		let mut tag = [0u8; 1];
@@ -154,14 +188,12 @@ where
 		stream.read_exact(&mut content).await?;
 
 		let buffer = Self::reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content);
-		let envelope = crate::utils::decode(&buffer)?;
-		Ok(envelope)
+		Ok(buffer)
 	}
 
-	async fn write_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()> {
+	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		let stream = self.stream.inner_mut();
-		let encoded = crate::encode(envelope)?;
-		stream.write_all(&encoded).await?;
+		stream.write_all(buffer).await?;
 		Ok(())
 	}
 }

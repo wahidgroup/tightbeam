@@ -27,12 +27,17 @@
 
 use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 
-use crate::crypto::aead::{Aes256Gcm, Key, Aes256GcmNonce, Aead, KeyInit, Payload};
-use crate::zeroize::Zeroizing;
+use crate::crypto::aead::{Aead, Aes256Gcm, Aes256GcmNonce, Key, KeyInit, Payload};
 use crate::crypto::kdf::{ecies_kdf_sha256, KdfError};
+use crate::zeroize::Zeroizing;
 
 /// KDF info parameter for domain separation and protocol versioning
 const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
+
+/// OID for ECIES with secp256k1
+#[cfg(feature = "x509")]
+pub const ECIES_SECP256K1_OID: crate::spki::ObjectIdentifier =
+	crate::spki::ObjectIdentifier::new_unwrap("1.3.132.1.12.0");
 
 // ============================================================================
 // Generic ECIES Traits
@@ -336,7 +341,7 @@ where
 	R: CryptoRng + RngCore,
 {
 	let plaintext = plaintext.as_ref();
-	
+
 	// Helper macro to avoid code duplication
 	macro_rules! do_encrypt {
 		($rng:expr) => {{
@@ -426,6 +431,15 @@ where
 	let plaintext = cipher.decrypt(nonce, payload).map_err(|_| EciesError::DecryptionFailed)?;
 
 	Ok(Zeroizing::new(plaintext))
+}
+
+/// OID wrapper for ECIES with secp256k1
+#[cfg(feature = "x509")]
+pub struct EciesSecp256k1Oid;
+
+#[cfg(feature = "x509")]
+impl der::oid::AssociatedOid for EciesSecp256k1Oid {
+	const OID: spki::ObjectIdentifier = ECIES_SECP256K1_OID;
 }
 
 #[cfg(test)]

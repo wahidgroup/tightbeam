@@ -4,10 +4,13 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
+#[cfg(feature = "x509")]
+use crate::crypto::aead::{Decryptor, Encryptor};
 #[cfg(feature = "derive")]
 use crate::Beamable;
 
 pub mod error;
+pub mod handshake;
 
 #[cfg(feature = "transport-policy")]
 pub mod policy;
@@ -250,7 +253,22 @@ pub trait Protocol {
 	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error>;
 }
 
-/// This protocol can operate as a mycelial network (ie. different TCP ports)
+#[cfg(feature = "x509")]
+pub trait EncryptedProtocol<O>: Protocol
+where
+	O: der::oid::AssociatedOid,
+{
+	type Encryptor: crate::crypto::aead::Encryptor<O>;
+	type Decryptor: crate::crypto::aead::Decryptor;
+
+	/// Bind to an address with an X.509 certificate for ECIES encryption
+	fn bind_with(
+		addr: Self::Address,
+		cert: crate::crypto::x509::Certificate,
+	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
+}
+
+/// This protocol can operate as a mycelial network (ie. TCP SocketAddress)
 pub trait Mycelial: Protocol {
 	fn get_available_connect(
 		&self,
@@ -265,13 +283,23 @@ pub trait AsyncListenerTrait: Protocol + Send {
 
 /// Base I/O operations for message transport
 pub trait MessageIO: ResponseHandler {
-	/// Read raw message data from the transport (reads TransportEnvelope)
+	/// Read raw DER-encoded bytes from the transport
 	#[allow(async_fn_in_trait)]
-	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope>;
+	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>>;
 
-	/// Write raw message data to the transport (writes TransportEnvelope)
+	/// Write raw DER-encoded bytes to the transport
 	#[allow(async_fn_in_trait)]
-	async fn write_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()>;
+	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()>;
+
+	/// Decode envelope from DER bytes
+	fn decode_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
+		Ok(TransportEnvelope::from_der(buffer)?)
+	}
+
+	/// Encode envelope to DER bytes
+	fn encode_envelope(envelope: &TransportEnvelope) -> TransportResult<Vec<u8>> {
+		crate::encode(envelope).map_err(TransportError::from)
+	}
 
 	/// Send a response back to the sender
 	fn handle_message(&self, message: Frame) -> Option<Frame> {
@@ -316,6 +344,53 @@ pub trait MessageIO: ResponseHandler {
 		buffer
 	}
 }
+#[cfg(feature = "x509")]
+pub trait EncryptedMessageIO<O>: MessageIO
+where
+	O: der::oid::AssociatedOid,
+{
+	type Encryptor: crate::crypto::aead::Encryptor<O>;
+	type Decryptor: crate::crypto::aead::Decryptor;
+
+	/// Get the encryptor instance
+	fn encryptor(&self) -> TransportResult<&Self::Encryptor>;
+
+	/// Get the decryptor instance
+	fn decryptor(&self) -> TransportResult<&Self::Decryptor>;
+
+	/// Read and decrypt an envelope
+	#[allow(async_fn_in_trait)]
+	async fn read_encrypted_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+		let encrypted_bytes = self.read_envelope().await?;
+		let encrypted_info = crate::EncryptedContentInfo::from_der(&encrypted_bytes)
+			.map_err(crate::TightBeamError::from)
+			.map_err(TransportError::from)?;
+
+		let decrypted_bytes = self
+			.decryptor()?
+			.decrypt_content(&encrypted_info)
+			.map_err(TransportError::from)?;
+
+		Self::decode_envelope(&decrypted_bytes)
+	}
+
+	/// Encrypt and write an envelope
+	#[allow(async_fn_in_trait)]
+	async fn write_encrypted_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()> {
+		let envelope_bytes = Self::encode_envelope(envelope)?;
+		let encrypted_info = self
+			.encryptor()?
+			.encrypt_content(&envelope_bytes, [], None)
+			.map_err(TransportError::from)?;
+
+		let encrypted_bytes = encrypted_info
+			.to_der()
+			.map_err(crate::TightBeamError::from)
+			.map_err(TransportError::from)?;
+
+		self.write_envelope(&encrypted_bytes).await
+	}
+}
 
 /// Trait for handling responses to incoming messages
 pub trait Pingable {
@@ -351,7 +426,7 @@ pub trait MessageEmitter: MessageIO {
 
 			// Wrap in envelope and send
 			let envelope = TransportEnvelope::from(current_message);
-			self.write_envelope(&envelope).await?;
+			self.write_envelope(&envelope.to_der()?).await?;
 
 			// Extract message back from envelope
 			current_message = match envelope {
@@ -361,7 +436,8 @@ pub trait MessageEmitter: MessageIO {
 			};
 
 			// Wait for receiver's response envelope
-			let response_envelope = self.read_envelope().await?;
+			let response_bytes = self.read_envelope().await?;
+			let response_envelope = Self::decode_envelope(&response_bytes)?;
 			let (status, response) = match response_envelope {
 				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 				TransportEnvelope::Request(_) => {
@@ -419,7 +495,8 @@ pub trait MessageCollector: MessageIO {
 	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)> {
 		// Read the envelope
 		let request_envelope = self.read_envelope().await?;
-		let request = match request_envelope {
+		let decoded_envelope = Self::decode_envelope(&request_envelope)?;
+		let request = match decoded_envelope {
 			TransportEnvelope::Request(msg) => msg.message,
 			TransportEnvelope::Response(_) => {
 				// Only requests are valid here
@@ -442,7 +519,8 @@ pub trait MessageCollector: MessageIO {
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message, length: None };
 		let response_envelope = TransportEnvelope::from(response_pkg);
-		self.write_envelope(&response_envelope).await?;
+		let response_bytes = Self::encode_envelope(&response_envelope)?;
+		self.write_envelope(&response_bytes).await?;
 		Ok(())
 	}
 

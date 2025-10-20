@@ -13,6 +13,8 @@ use crate::transport::{Protocol, ProtocolStream};
 
 #[cfg(not(feature = "tokio"))]
 use crate::transport::tcp::r#async::TcpTransport;
+#[cfg(feature = "x509")]
+use crate::transport::EncryptedProtocol;
 #[cfg(feature = "std")]
 use crate::transport::{tcp::sync::TcpTransport, Mycelial};
 
@@ -61,6 +63,21 @@ impl Protocol for std::net::TcpListener {
 
 	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
 		Ok(TightBeamSocketAddr(self.local_addr()?))
+	}
+}
+
+#[cfg(feature = "x509")]
+impl EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid> for std::net::TcpListener {
+	type Encryptor = crate::crypto::aead::Aes256Gcm;
+	type Decryptor = crate::crypto::aead::Aes256Gcm;
+
+	async fn bind_with(
+		addr: Self::Address,
+		_cert: x509_cert::Certificate,
+	) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = std::net::TcpListener::bind(addr.0)?;
+		let bound_addr = listener.local_addr()?;
+		Ok((listener, TightBeamSocketAddr(bound_addr)))
 	}
 }
 
@@ -171,6 +188,8 @@ macro_rules! impl_tcp_common {
 					emitter_gate: Box::new(AcceptAllGate),
 					collector_gate: Box::new(AcceptAllGate),
 					handler: None,
+					#[cfg(feature = "x509")]
+					symmetric_key: None,
 				}
 			}
 		}

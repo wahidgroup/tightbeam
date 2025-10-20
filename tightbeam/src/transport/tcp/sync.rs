@@ -1,7 +1,9 @@
 use core::str::FromStr;
 
 use crate::transport::tcp::TcpListenerTrait;
-use crate::transport::{MessageIO, Pingable, TransportEnvelope, TransportResult};
+#[cfg(feature = "x509")]
+use crate::transport::EncryptedMessageIO;
+use crate::transport::{MessageIO, Pingable, TransportResult};
 use crate::Frame;
 
 #[cfg(feature = "transport-policy")]
@@ -24,6 +26,8 @@ pub struct TcpTransport<S: ProtocolStream> {
 	restart_policy: Box<dyn RestartPolicy>,
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
+	#[cfg(feature = "x509")]
+	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
 }
 
 impl<S: ProtocolStream> Pingable for TcpTransport<S>
@@ -43,7 +47,7 @@ impl<S: ProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
-	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
 		// Read tag byte
 		let mut tag_byte = [0u8; 1];
 		self.stream.read_exact(&mut tag_byte)?;
@@ -71,17 +75,29 @@ where
 
 		// Reconstruct full DER encoding using the helper
 		let buffer = Self::reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
-
-		// Decode from raw DER bytes
-		let envelope: TransportEnvelope = crate::utils::decode(&buffer)?;
-		Ok(envelope)
+		Ok(buffer)
 	}
 
-	async fn write_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()> {
-		// Encode and write directly
-		let data = crate::encode(envelope)?;
-		self.stream.write_all(&data)?;
+	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()> {
+		self.stream.write_all(buffer)?;
 		Ok(())
+	}
+}
+
+#[cfg(feature = "x509")]
+impl<S: ProtocolStream> EncryptedMessageIO<crate::crypto::ecies::EciesSecp256k1Oid> for TcpTransport<S>
+where
+	TransportError: From<S::Error>,
+{
+	type Encryptor = crate::crypto::aead::Aes256Gcm;
+	type Decryptor = crate::crypto::aead::Aes256Gcm;
+
+	fn encryptor(&self) -> TransportResult<&Self::Encryptor> {
+		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
+	}
+
+	fn decryptor(&self) -> TransportResult<&Self::Decryptor> {
+		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
 	}
 }
 

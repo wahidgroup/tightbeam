@@ -35,7 +35,7 @@
 //!   Mycelial Network: Workers connect directly to servlets (no routing)
 //!
 //!    ╔═══════════════════════════════════════════════════════════════════╗
-//!    ║  Protocol-Agnostic • Zero-Copy • ASN.1 DER • Sign-Then-Encrypt    ║
+//!    ║  Protocol-Agnostic • Zero-Copy (TODO) • ASN.1 DER • Sign-Then-Encrypt    ║
 //!    ╚═══════════════════════════════════════════════════════════════════╝
 //!
 //!         ┌──────────────────────────────────────────────────────┐
