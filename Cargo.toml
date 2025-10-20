@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "tightbeam",
     "tightbeam-derive",
+	"tightbeam-dna",
+	"tightbeam-gate",
+	"tightbeam-os",
 ]
 
 [workspace.package]

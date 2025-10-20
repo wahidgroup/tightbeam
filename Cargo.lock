@@ -1160,6 +1160,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tightbeam-dna"
+version = "0.1.0"
+
+[[package]]
+name = "tightbeam-gate"
+version = "0.1.0"
+
+[[package]]
+name = "tightbeam-os"
+version = "0.1.0"
+
+[[package]]
 name = "tightbeam-rs"
 version = "0.2.3"
 dependencies = [
