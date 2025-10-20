@@ -1169,7 +1169,7 @@ version = "0.0.1"
 
 [[package]]
 name = "tightbeam-os"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "tightbeam-rs"
