@@ -204,7 +204,7 @@ pub fn digest<D: digest::Digest + crate::der::oid::AssociatedOid>(
 
 	let algorithm = crate::asn1::AlgorithmIdentifier { oid: D::OID, parameters: None };
 	let digest = hasher.finalize();
-	let digest_octet_string = crate::asn1::OctetString::new(digest.as_slice())?;
+	let digest_octet_string = crate::asn1::OctetString::new(&digest[..])?;
 	Ok(crate::asn1::DigestInfo { algorithm, digest: digest_octet_string })
 }
 

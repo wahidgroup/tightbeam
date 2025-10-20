@@ -149,7 +149,8 @@ pub fn create_test_cipher_key() -> (
 ) {
 	use crate::crypto::aead::KeyInit;
 
-	let key = crate::crypto::common::Key::<crate::crypto::aead::Aes256Gcm>::from_slice(&[0x33; 32]).to_owned();
+	let key_bytes = [0x33; 32];
+	let key = crate::crypto::common::Key::<crate::crypto::aead::Aes256Gcm>::from(key_bytes);
 	let cipher = crate::crypto::aead::Aes256Gcm::new(&key);
 	(key, cipher)
 }

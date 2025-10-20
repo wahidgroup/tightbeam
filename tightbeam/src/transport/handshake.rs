@@ -5,9 +5,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::cms::enveloped_data::EnvelopedData;
+use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
 use crate::der::{Decode, Encode, Enumerated};
 use crate::zeroize::Zeroizing;
-use k256::{PublicKey, SecretKey};
 
 /// Handshake phase enumeration
 #[repr(u8)]

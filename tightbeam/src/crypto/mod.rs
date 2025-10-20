@@ -1,3 +1,5 @@
+mod utils;
+
 #[cfg(feature = "aead")]
 pub mod aead;
 #[cfg(feature = "ecies")]
@@ -12,5 +14,4 @@ pub mod sign;
 pub mod x509;
 
 // Re-exports
-#[cfg(feature = "crypto")]
 pub use crypto_common as common;

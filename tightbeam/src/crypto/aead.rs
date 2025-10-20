@@ -49,7 +49,7 @@ where
 		nonce: impl AsRef<[u8]>,
 		content_type: Option<ObjectIdentifier>,
 	) -> crate::error::Result<crate::EncryptedContentInfo> {
-		let nonce_ref = aead::Nonce::<A>::from_slice(nonce.as_ref());
+		let nonce_ref = nonce.as_ref().into();
 		let ciphertext = self.encrypt(nonce_ref, data.as_ref())?;
 		let content_type = content_type.unwrap_or(crate::asn1::DATA_OID);
 
@@ -85,7 +85,7 @@ where
 
 		// Decode the nonce from the Any type - use decode_as to get the OctetString
 		let nonce_octet_string: crate::der::asn1::OctetString = nonce_any.decode_as()?;
-		let nonce_ref = aead::Nonce::<A>::from_slice(nonce_octet_string.as_bytes());
+		let nonce_ref = nonce_octet_string.as_bytes().into();
 
 		// Decrypt
 		let plaintext = self.decrypt(nonce_ref, ciphertext)?;

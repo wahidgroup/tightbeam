@@ -27,7 +27,7 @@
 
 use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 
-use crate::crypto::aead::{Aead, Aes256Gcm, Aes256GcmNonce, Key, KeyInit, Payload};
+use crate::crypto::aead::{Aead, Aes256Gcm, KeyInit, Payload};
 use crate::crypto::kdf::{ecies_kdf_sha256, KdfError};
 use crate::zeroize::Zeroizing;
 
@@ -352,13 +352,13 @@ where
 			let k_enc = ecies_kdf_sha256(&ephemeral_bytes, &shared_secret, ECIES_KDF_INFO, None)?;
 
 			// Encrypt using AES-256-GCM
-			let key = Key::<Aes256Gcm>::from_slice(&k_enc[..]);
-			let cipher = Aes256Gcm::new(key);
+			let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
+			let cipher = Aes256Gcm::new(&key);
 
 			// Generate random nonce (96 bits for GCM)
 			let mut nonce_bytes = [0u8; 12];
 			$rng.fill_bytes(&mut nonce_bytes);
-			let nonce = Aes256GcmNonce::from_slice(&nonce_bytes);
+			let nonce = crate::crypto::utils::nonce_from_slice::<Aes256Gcm>(&nonce_bytes);
 
 			// Prepare payload with optional AAD
 			let payload = match associated_data {
@@ -367,7 +367,7 @@ where
 			};
 
 			// Encrypt (produces ciphertext || tag)
-			let mut ciphertext = cipher.encrypt(nonce, payload).map_err(|_| EciesError::EncryptionFailed)?;
+			let mut ciphertext = cipher.encrypt(&nonce, payload).map_err(|_| EciesError::EncryptionFailed)?;
 
 			// Prepend nonce to ciphertext (for transmission)
 			let mut final_ciphertext = Vec::with_capacity(12 + ciphertext.len());
@@ -385,15 +385,6 @@ where
 	}
 }
 
-/// Decrypt ECIES message using recipient's secret key
-///
-/// # Arguments
-/// * `recipient_seckey` - Recipient's secret key (implements EciesSecretKeyOps)
-/// * `message` - Encrypted ECIES message
-/// * `associated_data` - Optional authenticated associated data (must match encryption AAD)
-///
-/// # Returns
-/// Decrypted plaintext
 pub fn decrypt<SK>(
 	recipient_seckey: &SK,
 	message: &EciesMessage,
@@ -414,12 +405,12 @@ where
 	if message.ciphertext.len() < 12 + 16 {
 		return Err(EciesError::InvalidCiphertext);
 	}
-	let nonce = Aes256GcmNonce::from_slice(&message.ciphertext[0..12]);
+	let nonce = crate::crypto::utils::nonce_from_slice::<Aes256Gcm>(&message.ciphertext[0..12]);
 	let ciphertext_with_tag = &message.ciphertext[12..];
 
 	// 5. Decrypt using AES-256-GCM
-	let key = Key::<Aes256Gcm>::from_slice(&k_enc[..]);
-	let cipher = Aes256Gcm::new(key);
+	let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
+	let cipher = Aes256Gcm::new(&key);
 
 	// Prepare payload with optional AAD
 	let payload = match associated_data {
@@ -428,7 +419,7 @@ where
 	};
 
 	// Decrypt and verify tag
-	let plaintext = cipher.decrypt(nonce, payload).map_err(|_| EciesError::DecryptionFailed)?;
+	let plaintext = cipher.decrypt(&nonce, payload).map_err(|_| EciesError::DecryptionFailed)?;
 
 	Ok(Zeroizing::new(plaintext))
 }
