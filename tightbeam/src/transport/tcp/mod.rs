@@ -112,7 +112,7 @@ impl ProtocolStream for std::net::TcpStream {
 	}
 }
 
-// Newtype wrapper for SocketAddr that implements Into<Vec<u8>>
+// New type wrapper for SocketAddr that implements Into<Vec<u8>>
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TightBeamSocketAddr(pub std::net::SocketAddr);

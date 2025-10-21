@@ -1,4 +1,4 @@
-//! Flags utilize the Matrix to create Flatworld.
+//! Flags utilize the Matrix to create Flat World.
 
 use crate::matrix::{Matrix, MatrixLike};
 

@@ -681,6 +681,7 @@ mod tests {
 				should_have_message: true,
 			},
 			PackageTestCase {
+				// cspell:disable-next-line
 				message_value: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
 				expected_status: TransitStatus::Accepted,
 				should_have_message: true,

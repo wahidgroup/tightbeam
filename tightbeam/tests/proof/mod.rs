@@ -689,10 +689,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_basic() -> Result<()> {
-		BFTLedgerServlet::start(BFTLedgerServletConf {
-			ledger_state: Default::default(),
-			epoch_size: 1000,
-		}).await?;
+		BFTLedgerServlet::start(BFTLedgerServletConf { ledger_state: Default::default(), epoch_size: 1000 }).await?;
 
 		Ok(())
 	}

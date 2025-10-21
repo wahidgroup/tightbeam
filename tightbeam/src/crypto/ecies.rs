@@ -462,6 +462,7 @@ mod tests {
 			(&b"Hello, ECIES!"[..], None),
 			(b"Secret message", Some(&b"authenticated data"[..])),
 			(b"", None),
+			// cspell:disable-next-line
 			(b"The quick brown fox jumps over the lazy dog. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.", None),
 			(b"\x00\x01\x02\x03\xFF\xFE\xFD\xFC", None),
 			(b"Payload", Some(&b"version:1|timestamp:12345|nonce:abcdef"[..])),

@@ -24,7 +24,7 @@ use crate::der::oid::AssociatedOid;
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
-/// TODO Petition RustCypto to adopt AssociatedOid for all
+/// TODO Petition RustCrypto to adopt AssociatedOid for all
 pub trait Signatory<S>: Signer<S> + Keypair
 where
 	S: SignatureEncoding,

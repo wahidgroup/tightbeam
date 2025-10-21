@@ -1,13 +1,10 @@
 [workspace]
 resolver = "2"
-members = [
-    "tightbeam",
-    "tightbeam-derive",
-]
+members = ["tightbeam", "tightbeam-derive"]
 
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85.1"
 license = "MIT OR Apache-2.0"
@@ -33,33 +30,24 @@ pkcs12 = { version = "0.1.0", default-features = false }
 hkdf = { version = "0.12.4", default-features = false }
 x509-cert = { version = "0.2.5", default-features = false, features = [
 	"pem",
-	"sct"
+	"sct",
 ] }
 hex-literal = { version = "1.0.0" }
-zeroize = { version = "1.5", features = [
-	"alloc",
-	"zeroize_derive",
-] }
+zeroize = { version = "1.5", features = ["alloc", "zeroize_derive"] }
 crypto-common = { version = "0.1.6", default-features = false, features = [
 	"getrandom",
 	"rand_core",
 ] }
-aead = { version = "0.5.2", default-features = false, features = [
-	"alloc",
-] }
+aead = { version = "0.5.2", default-features = false, features = ["alloc"] }
 signature = { version = "2.2.0", default-features = false, features = [
 	"alloc",
 ] }
-digest = { version = "0.10.7", default-features = false, features = [
-	"alloc",
-] }
+digest = { version = "0.10.7", default-features = false, features = ["alloc"] }
 aes-gcm = { version = "0.10.3", default-features = false, features = [
 	"aes",
 	"alloc",
 ] }
-sha3 = { version = "0.10.8", default-features = false, features = [
-	"oid",
-] }
+sha3 = { version = "0.10.8", default-features = false, features = ["oid"] }
 ecdsa = { version = "0.16.9", default-features = false, features = [
 	"signing",
 	"digest",
@@ -77,9 +65,7 @@ k256 = { version = "0.13.4", default-features = false, features = [
 rand_core = { version = "0.6", default-features = false, features = [
 	"getrandom",
 ] }
-tokio = { version = "1.47.1", default-features = false, features = [
-	"full",
-] }
+tokio = { version = "1.47.1", default-features = false, features = ["full"] }
 time = { version = "0.3.44", default-features = false, features = [
 	"macros",
 	"alloc",

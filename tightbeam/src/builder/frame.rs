@@ -301,7 +301,7 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 			return Err(TightBeamError::Sequence(self.errors));
 		}
 
-		// 0. Validate message restrications
+		// 0. Validate message restrictions
 		self.validate()?;
 
 		let version = self.version;

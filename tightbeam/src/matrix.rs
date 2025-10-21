@@ -63,7 +63,7 @@ impl Default for MatrixDyn {
 }
 
 impl MatrixDyn {
-	/// Construct from row-major nbytes. Length MUST be n*n.
+	/// Construct from row-major n-bytes. Length MUST be n*n.
 	pub fn from_row_major(n: u8, bytes: Vec<u8>) -> Option<Self> {
 		if n == 0 {
 			return None;
@@ -300,7 +300,7 @@ mod tests {
 
 	#[cfg(feature = "std")]
 	crate::test_case! {
-		name: test_matrixlike_reality_end_to_end,
+		name: test_matrix_like_reality_end_to_end,
 		setup: || {
 			// Build a 3×3 from row-major bytes 0..9
 			let bytes: Vec<u8> = (0u8..9u8).collect();
