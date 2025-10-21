@@ -8,7 +8,8 @@
 [![Project Chat][chat-image]][chat-link]
 
 ## Status
-> Warning: This project is under active development. Public APIs and file formats MAY change WITHOUT notice. It is NOT yet production-ready.
+> Warning: This project is under active development. Public APIs and file 
+formats MAY change WITHOUT notice. It is NOT yet production-ready.
 
 ## Copyright Notice
 
@@ -16,7 +17,9 @@
 
 ## Abstract
 
-tightbeam is a Layer-5 framework implementing high-fidelity information theory through ASN.1 DER encoding with versioned metadata structures.
+tightbeam is a Layer-5 framework implementing high-fidelity information theory 
+through Abstract Syntax Notation One (ASN.1) Distinguished Encoded Rules (DER) 
+with versioned metadata structures.
 
 ## Table of Contents
 
@@ -44,7 +47,8 @@ a [concept → specification → implementation → testing] pattern.
 
 Question: How well does information maintain fidelity[^fidelity] across time?
 
-The foundational mathematical principle underlying tightbeam is the information fidelity constraint:
+The foundational mathematical principle underlying tightbeam is the information 
+fidelity constraint:
 
  **I(t) ∈ (0,1) ∀t ∈ T**
 
@@ -85,7 +89,8 @@ Additional terms introduced by proposals MUST be defined in their respective TIP
 
 ### 3.1 Information Theory Properties
 
-tightbeam implements high-fidelity information transmission through the following properties:
+tightbeam implements high-fidelity information transmission through the 
+following properties:
 
 - **STRUCTURE**: Perfect encoding via ASN.1 DER
 - **FRAME**: Incremental versioning system
@@ -123,7 +128,8 @@ tightbeam implements high-fidelity information transmission through the followin
 
 ### 4.1.1 Security Profiles
 
-tightbeam defines standardized security profiles that reference established cryptographic standards:
+tightbeam defines standardized security profiles that reference established 
+cryptographic standards:
 
 - **Profile 0 (Testing)**: No mandatory security features
   - Use case: Testing, non-sensitive data
@@ -146,7 +152,9 @@ tightbeam defines standardized security profiles that reference established cryp
 
 ### 4.1.2 Message-Level Security Requirements
 
-tightbeam supports run-time security profile enforcement at the message type level through the `Message` trait and compile-time security enforcement at the message composition level:
+tightbeam supports run-time security profile enforcement at the message type 
+level through the `Message` trait and compile-time security enforcement at 
+the message composition level:
 
 ```rust
 pub trait Message: /* trait bounds */ {

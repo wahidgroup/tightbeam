@@ -35,6 +35,12 @@ impl Asn1Matrix {
 	}
 }
 
+impl Default for Asn1Matrix {
+	fn default() -> Self {
+		Self { n: 1, data: Vec::new() }
+	}
+}
+
 impl Tagged for Asn1Matrix {
 	fn tag(&self) -> Tag {
 		Tag::Sequence
