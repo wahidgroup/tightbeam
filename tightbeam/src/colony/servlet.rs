@@ -6,6 +6,64 @@
 
 use crate::transport::TightBeamAddress;
 
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_servlet_common_methods {
+	($protocol:path) => {
+		#[allow(dead_code)]
+		pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
+			self.addr.clone()
+		}
+
+		pub fn stop(mut self) {
+			if let Some(handle) = self.server_handle.take() {
+				$crate::colony::servlet_runtime::rt::abort(handle);
+			}
+		}
+
+		pub async fn join(mut self) -> ::core::result::Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+			if let Some(handle) = self.server_handle.take() {
+				$crate::colony::servlet_runtime::rt::join(handle).await
+			} else {
+				Ok(())
+			}
+		}
+	};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_servlet_common_methods {
+	($protocol:path) => {
+		#[allow(dead_code)]
+		pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
+			self.addr.clone()
+		}
+
+		pub fn stop(mut self) {
+			if let Some(handle) = self.server_handle.take() {
+				$crate::colony::servlet_runtime::rt::abort(handle);
+			}
+		}
+
+		pub async fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+			if let Some(handle) = self.server_handle.take() {
+				$crate::colony::servlet_runtime::rt::join(handle)
+			} else {
+				Ok(())
+			}
+		}
+	};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_servlet_common_methods {
+	($protocol:path) => {
+		compile_error!("tightbeam::servlet! requires tightbeam to be built with either the `tokio` or `std` feature");
+	};
+}
+
 pub mod servlet_runtime {
 	#[cfg(feature = "tokio")]
 	pub mod rt {
@@ -356,7 +414,7 @@ macro_rules! servlet {
 	};
 
 	(@impl_struct $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			pub struct $worker_name {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
@@ -374,7 +432,7 @@ macro_rules! servlet {
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
 				router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
 				|$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
@@ -412,7 +470,7 @@ macro_rules! servlet {
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
 				   config_only, {}, { $($config_field:ident: $config_type:ty,)* },
 				   |$message:ident, $config_param:ident| $handler_body:expr) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
@@ -432,7 +490,7 @@ macro_rules! servlet {
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
 				   config_only_with_init, {}, { $($config_field:ident: $config_type:ty,)* },
 				   |$message:ident, $config_param:ident| $handler_body:expr, $init_config:ident, $init_body:expr) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
 					servlet!(@setup_protocol $protocol, listener, addr);
@@ -500,7 +558,7 @@ macro_rules! servlet {
 
 	// Generate trait implementation (with config)
 	(@impl_trait $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)+ }) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			impl $crate::colony::Servlet for $worker_name {
 				type Conf = [<$worker_name Conf>];
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
@@ -526,7 +584,7 @@ macro_rules! servlet {
 	};
 
 	(@impl_struct_with_workers $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:ty),* }) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			pub struct $worker_name {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
@@ -550,7 +608,7 @@ macro_rules! servlet {
 		config_and_workers, {}, { $($config_field:ident: $config_type:ty,)* },
 		{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
 		|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
@@ -587,7 +645,7 @@ macro_rules! servlet {
 		config_and_workers_with_init, {}, { $($config_field:ident: $config_type:ty,)* },
 		{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
 		|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $init_config:ident, $init_body:expr) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
 					servlet!(@setup_protocol $protocol, listener, addr);
@@ -670,34 +728,7 @@ macro_rules! servlet {
 
 	// Common methods shared by all colony
 	(@common_methods $protocol:path) => {
-		#[allow(dead_code)]
-		pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
-			self.addr.clone()
-		}
-
-		pub fn stop(mut self) {
-			if let Some(handle) = self.server_handle.take() {
-				$crate::colony::servlet_runtime::rt::abort(handle);
-			}
-		}
-
-		#[cfg(feature = "tokio")]
-		pub async fn join(mut self) -> ::core::result::Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
-			if let Some(handle) = self.server_handle.take() {
-				$crate::colony::servlet_runtime::rt::join(handle).await
-			} else {
-				Ok(())
-			}
-		}
-
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		pub async fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
-			if let Some(handle) = self.server_handle.take() {
-				$crate::colony::servlet_runtime::rt::join(handle)
-			} else {
-				Ok(())
-			}
-		}
+		$crate::__tightbeam_servlet_common_methods!($protocol);
 	};
 
 	// Drop implementation shared by all colony

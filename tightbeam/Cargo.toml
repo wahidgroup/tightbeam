@@ -41,12 +41,13 @@ k256 = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
+# Macro helper
+paste = { workspace = true }
 
 ## Compression dependencies
 zeekstd = { workspace = true, optional = true }
 
 [dev-dependencies]
-paste = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 fake = { workspace = true }
@@ -82,7 +83,7 @@ full = [
 	"standards-rfc",
 	"standards-iso",
 	"testing",
-	"colony"
+	"colony",
 ]
 
 # Core features

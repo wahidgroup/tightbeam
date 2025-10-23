@@ -6,6 +6,102 @@ use crate::Errorizable;
 use crate::policy::{ReceptorPolicy, TransitStatus};
 use crate::Message;
 
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_worker_common_methods {
+	($input:ty, $output:ty) => {
+		#[allow(dead_code)]
+		pub fn queue_capacity(&self) -> usize {
+			self.queue
+		}
+
+		/// Relay a message to the worker
+		pub async fn relay(
+			&self,
+			message: $input,
+		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
+			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
+			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
+			let result = $crate::colony::worker_runtime::rt::send(
+				sender,
+				$crate::colony::WorkerRequest { message, respond_to: tx },
+			)
+			.await;
+			result.map_err(|_| $crate::colony::WorkerRelayError::QueueClosed)?;
+
+			let response = $crate::colony::worker_runtime::rt::wait_response(rx).await;
+			match response {
+				Ok(Ok(output)) => Ok(output),
+				Ok(Err(status)) => Err($crate::colony::WorkerRelayError::Rejected(status)),
+				Err(_) => Err($crate::colony::WorkerRelayError::ResponseDropped),
+			}
+		}
+
+		#[allow(dead_code)]
+		pub async fn kill(mut self) -> ::core::result::Result<(), tokio::task::JoinError> {
+			if let Some(sender) = self.sender.take() {
+				drop(sender);
+			}
+
+			if let Some(handle) = self.join.take() {
+				$crate::colony::worker_runtime::rt::join(handle).await
+			} else {
+				Ok(())
+			}
+		}
+	};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_worker_common_methods {
+	($input:ty, $output:ty) => {
+		#[allow(dead_code)]
+		pub fn queue_capacity(&self) -> usize {
+			self.queue
+		}
+
+		/// Relay a message to the worker
+		pub async fn relay(
+			&self,
+			message: $input,
+		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
+			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
+			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
+			$crate::colony::worker_runtime::rt::send(sender, $crate::colony::WorkerRequest { message, respond_to: tx })
+				.map_err(|_| $crate::colony::WorkerRelayError::QueueClosed)?;
+
+			let response = $crate::colony::worker_runtime::rt::wait_response(rx);
+			match response {
+				Ok(Ok(output)) => Ok(output),
+				Ok(Err(status)) => Err($crate::colony::WorkerRelayError::Rejected(status)),
+				Err(_) => Err($crate::colony::WorkerRelayError::ResponseDropped),
+			}
+		}
+
+		#[allow(dead_code)]
+		pub fn kill(mut self) -> ::core::result::Result<(), std::io::Error> {
+			if let Some(sender) = self.sender.take() {
+				drop(sender);
+			}
+
+			if let Some(handle) = self.join.take() {
+				$crate::colony::worker_runtime::rt::join(handle)
+			} else {
+				Ok(())
+			}
+		}
+	};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_worker_common_methods {
+	($input:ty, $output:ty) => {
+		compile_error!("tightbeam::worker! requires tightbeam to be built with either the `tokio` or `std` feature");
+	};
+}
+
 pub mod worker_runtime {
 	#![allow(dead_code)]
 	#[cfg(feature = "tokio")]
@@ -343,7 +439,7 @@ macro_rules! worker {
 	};
 
 	(@impl_struct $worker_name:ident, $input:ty, $output:ty, { $($cfg_field:ident: $cfg_ty:ty,)* }) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			pub struct $worker_name {
 				sender: Option<$crate::colony::worker_runtime::rt::QueueSender<$crate::colony::worker::WorkerRequest<$input, $output>>>,
 				join: Option<$crate::colony::worker_runtime::rt::JoinHandle>,
@@ -364,7 +460,7 @@ macro_rules! worker {
 		{ $( $policy_method:ident : $policy_value:tt ),* },
 		$handler:tt
 	) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			impl $worker_name {
 				pub fn start(config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
 					let queue_capacity = $crate::worker!(@queue $($queue)?);
@@ -426,7 +522,7 @@ macro_rules! worker {
 		{},
 		$handler:tt
 	) => {
-		paste::paste! {
+		$crate::paste::paste! {
 			impl $worker_name {
 				pub fn start(config: [<$worker_name Conf>]) -> $crate::Result<Self> {
 					let queue_capacity = $crate::worker!(@queue $($queue)?);
@@ -542,64 +638,7 @@ macro_rules! worker {
 	}};
 
 	(@common_methods $input:ty, $output:ty) => {
-		#[allow(dead_code)]
-		pub fn queue_capacity(&self) -> usize {
-			self.queue
-		}
-
-		/// Relay a message to the worker
-		pub async fn relay(
-			&self,
-			message: $input,
-		) -> core::result::Result<$output, $crate::colony::WorkerRelayError> {
-			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
-			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
-
-			let result = $crate::colony::worker_runtime::rt::send(sender, $crate::colony::WorkerRequest { message, respond_to: tx });
-			#[cfg(feature = "tokio")]
-			let result = result.await;
-
-			result.map_err(|_| $crate::colony::WorkerRelayError::QueueClosed)?;
-
-			#[cfg(feature = "tokio")]
-			let response = $crate::colony::worker_runtime::rt::wait_response(rx).await;
-			#[cfg(all(not(feature = "tokio"), feature = "std"))]
-			let response = $crate::colony::worker_runtime::rt::wait_response(rx);
-
-			match response {
-				Ok(Ok(output)) => Ok(output),
-				Ok(Err(status)) => Err($crate::colony::WorkerRelayError::Rejected(status)),
-				Err(_) => Err($crate::colony::WorkerRelayError::ResponseDropped),
-			}
-		}
-
-		#[cfg(feature = "tokio")]
-		#[allow(dead_code)]
-		pub async fn kill(mut self) -> core::result::Result<(), tokio::task::JoinError> {
-			if let Some(sender) = self.sender.take() {
-				drop(sender);
-			}
-
-			if let Some(handle) = self.join.take() {
-				$crate::colony::worker_runtime::rt::join(handle).await
-			} else {
-				Ok(())
-			}
-		}
-
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		#[allow(dead_code)]
-		pub fn kill(mut self) -> core::result::Result<(), std::io::Error> {
-			if let Some(sender) = self.sender.take() {
-				drop(sender);
-			}
-
-			if let Some(handle) = self.join.take() {
-				$crate::colony::worker_runtime::rt::join(handle)
-			} else {
-				Ok(())
-			}
-		}
+		$crate::__tightbeam_worker_common_methods!($input, $output);
 	};
 
 	(@drop_impl $worker_name:ident) => {

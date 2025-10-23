@@ -3,6 +3,44 @@
 //! Jobs are simple functions that compose TightBeam frames with optional parameters.
 //! They can be sync or async and return a Result<Frame, TightBeamError>.
 
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_job_async_impl {
+	($job_name:ident, ($($param:ident : $param_ty:ty),* $(,)?), $return_ty:ty, $body:block) => {
+		pub struct $job_name;
+
+		impl $job_name {
+			pub async fn run($($param: $param_ty),*) -> $return_ty {
+				$body
+			}
+		}
+	};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_job_async_impl {
+	($job_name:ident, ($($param:ident : $param_ty:ty),* $(,)?), $return_ty:ty, $body:block) => {
+		pub struct $job_name;
+
+		impl $job_name {
+			pub async fn run($($param: $param_ty),*) -> $return_ty {
+				$body
+			}
+		}
+	};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_job_async_impl {
+	($job_name:ident, ($($param:ident : $param_ty:ty),* $(,)?), $return_ty:ty, $body:block) => {
+		compile_error!(
+			"tightbeam::job! async jobs require tightbeam to be built with either the `tokio` or `std` feature"
+		);
+	};
+}
+
 #[macro_export]
 macro_rules! test_job {
 	(
@@ -35,17 +73,16 @@ macro_rules! test_job {
 macro_rules! job {
 	// Async job with generic return type
 	(
-        name: $job_name:ident,
-        async fn run($($param:ident: $param_ty:ty),* $(,)?) -> $return_ty:ty $body:block
-    ) => {
-        pub struct $job_name;
-
-        impl $job_name {
-            pub async fn run($($param: $param_ty),*) -> $return_ty {
-                $body
-            }
-        }
-    };
+		name: $job_name:ident,
+		async fn run($($param:ident: $param_ty:ty),* $(,)?) -> $return_ty:ty $body:block
+	) => {
+		$crate::__tightbeam_job_async_impl!(
+			$job_name,
+			($($param: $param_ty),*),
+			$return_ty,
+			$body
+		);
+	};
 
     // Sync job with generic return type
     (

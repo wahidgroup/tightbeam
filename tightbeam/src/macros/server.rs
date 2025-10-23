@@ -23,20 +23,239 @@ where
 	Arc::new(move |frame: Frame| -> HandlerFuture { Box::pin(handler(frame)) })
 }
 
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_handle {
+	($protocol:path, $listener:expr, $handler:expr) => {{
+		let __listener = $listener;
+		$crate::macros::server::server_runtime::rt::spawn(async move {
+			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
+			let __ok_tx = $crate::macros::server::server_runtime::rt::empty_ok_channel();
+			$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx,)
+		})
+	}};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_handle {
+	($protocol:path, $listener:expr, $handler:expr) => {{
+		let __listener = $listener;
+		std::thread::spawn(move || {
+			$crate::server!(@sync_loop $protocol, __listener, $handler,)
+		})
+	}};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_handle {
+	($protocol:path, $listener:expr, $handler:expr) => {
+		compile_error!("server!(protocol …) requires tightbeam to be built with either the `tokio` or `std` feature");
+	};
+}
+
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_bind_handle {
+	($protocol:path, $addr:expr, $handler:expr) => {{
+		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
+		let __server = <$protocol>::from(listener);
+		$crate::macros::server::server_runtime::rt::spawn(async move {
+			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
+			let __ok_tx = $crate::macros::server::server_runtime::rt::empty_ok_channel();
+			$crate::server!(@async_loop $protocol, __server, $handler, __error_tx, __ok_tx,)
+		})
+	}};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_bind_handle {
+	($protocol:path, $addr:expr, $handler:expr) => {{
+		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
+		let __server = <$protocol>::from(listener);
+		std::thread::spawn(move || {
+			$crate::server!(@sync_loop $protocol, __server, $handler,)
+		})
+	}};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_bind_handle {
+	($protocol:path, $addr:expr, $handler:expr) => {
+		compile_error!(
+			"server!(protocol …) with `bind` requires tightbeam to be built with either the `tokio` or `std` feature"
+		);
+	};
+}
+
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_policies_handle {
+	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
+		let __listener = $listener;
+		$crate::macros::server::server_runtime::rt::spawn(async move {
+			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
+			let __ok_tx = $crate::macros::server::server_runtime::rt::empty_ok_channel();
+			$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
+		})
+	}};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_policies_handle {
+	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
+		let __listener = $listener;
+		std::thread::spawn(move || {
+			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
+		})
+	}};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_policies_handle {
+	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
+		compile_error!(
+			"server!(protocol …, policies: …) requires tightbeam to be built with either the `tokio` or `std` feature"
+		);
+	};
+}
+
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_channels_handle {
+	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, $handler:expr) => {{
+		let __listener = $listener;
+		$crate::macros::server::server_runtime::rt::spawn(async move {
+			let __error_tx = Some($error_tx);
+			let __ok_tx = Some($ok_tx);
+			$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx,)
+		})
+	}};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_channels_handle {
+	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, $handler:expr) => {{
+		let __listener = $listener;
+		let _ = ($error_tx, $ok_tx);
+		std::thread::spawn(move || {
+			$crate::server!(@sync_loop $protocol, __listener, $handler,)
+		})
+	}};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_channels_handle {
+	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, $handler:expr) => {
+		let _ = ($error_tx, $ok_tx);
+		compile_error!(
+			"server!(protocol …, channels: …) requires tightbeam to be built with either the `tokio` or `std` feature"
+		);
+	};
+}
+
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_channels_policies_handle {
+	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
+		let __listener = $listener;
+		$crate::macros::server::server_runtime::rt::spawn(async move {
+			let __error_tx = Some($error_tx);
+			let __ok_tx = Some($ok_tx);
+			$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
+		})
+	}};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_channels_policies_handle {
+	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
+		let __listener = $listener;
+		let _ = ($error_tx, $ok_tx);
+		std::thread::spawn(move || {
+			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
+		})
+	}};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_channels_policies_handle {
+	($protocol:path, $listener:expr, $error_tx:expr, $ok_tx:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
+		let _ = ($error_tx, $ok_tx);
+		compile_error!(
+			"server!(protocol …, channels: …) requires tightbeam to be built with either the `tokio` or `std` feature"
+		);
+	};
+}
+
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_bind_policies_handle {
+	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
+		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
+		let __server = <$protocol>::from(listener);
+		$crate::macros::server::server_runtime::rt::spawn(async move {
+			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
+			let __ok_tx = $crate::macros::server::server_runtime::rt::empty_ok_channel();
+			$crate::server!(@async_loop $protocol, __server, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
+		})
+	}};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_bind_policies_handle {
+	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {{
+		let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
+		let __server = <$protocol>::from(listener);
+		std::thread::spawn(move || {
+			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
+		})
+	}};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_bind_policies_handle {
+	($protocol:path, $addr:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $handler:expr) => {
+		compile_error!("server!(protocol …, policies: …) with `bind` requires tightbeam to be built with either the `tokio` or `std` feature");
+	};
+}
+
 #[cfg(any(feature = "tokio", feature = "std"))]
 pub mod server_runtime {
 	#[cfg(feature = "tokio")]
 	pub mod rt {
 		#![allow(dead_code)]
+		use crate::transport::error::TransportError;
 		use core::future::Future;
 
 		pub type JoinHandle = tokio::task::JoinHandle<()>;
+		pub type ErrorSender = tokio::sync::mpsc::Sender<TransportError>;
+		pub type OkSender = tokio::sync::mpsc::Sender<()>;
 
 		pub fn spawn<F>(task: F) -> JoinHandle
 		where
 			F: Future<Output = ()> + Send + 'static,
 		{
 			tokio::spawn(task)
+		}
+
+		pub fn empty_error_channel() -> Option<ErrorSender> {
+			None
+		}
+
+		pub fn empty_ok_channel() -> Option<OkSender> {
+			None
 		}
 
 		pub fn block_on<F>(future: F) -> F::Output
@@ -264,145 +483,27 @@ macro_rules! server {
 	}};
 
 	(protocol $protocol:path: $listener:expr, handle: $handler:expr) => {{
-		#[cfg(feature = "tokio")]
-		{
-			let __listener = $listener;
-			tokio::spawn(async move {
-				let __error_tx: Option<tokio::sync::mpsc::Sender<$crate::transport::error::TransportError>> = None;
-				let __ok_tx: Option<tokio::sync::mpsc::Sender<()>> = None;
-				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx,)
-			})
-		}
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		{
-			let __listener = $listener;
-			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __listener, $handler,)
-			})
-		}
-		#[cfg(not(any(feature = "tokio", feature = "std")))]
-		{
-			compile_error!("server!(protocol …) requires either the `tokio` or `std` feature");
-		}
+		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, $handler)
 	}};
 
 	(protocol $protocol:path: bind $addr:expr, handle: $handler:expr) => {{
-		#[cfg(feature = "tokio")]
-		{
-			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
-			let __server = <$protocol>::from(listener);
-			tokio::spawn(async move {
-				let __error_tx: Option<tokio::sync::mpsc::Sender<$crate::transport::error::TransportError>> = None;
-				let __ok_tx: Option<tokio::sync::mpsc::Sender<()>> = None;
-				$crate::server!(@async_loop $protocol, __server, $handler, __error_tx, __ok_tx,)
-			})
-		}
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		{
-			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
-			let __server = <$protocol>::from(listener);
-			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __server, $handler,)
-			});
-		}
-		#[cfg(not(any(feature = "tokio", feature = "std")))]
-		{
-			compile_error!("server!(protocol …) with `bind` requires the `tokio` feature; enable it or use the sync forms");
-		}
+		$crate::__tightbeam_server_protocol_bind_handle!($protocol, $addr, $handler)
 	}};
 
 	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
-		#[cfg(feature = "tokio")]
-		{
-			let __listener = $listener;
-			tokio::spawn(async move {
-				let __error_tx: Option<tokio::sync::mpsc::Sender<$crate::transport::error::TransportError>> = None;
-				let __ok_tx: Option<tokio::sync::mpsc::Sender<()>> = None;
-				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
-			})
-		}
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		{
-			let __listener = $listener;
-			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
-			})
-		}
-		#[cfg(not(any(feature = "tokio", feature = "std")))]
-		{
-			compile_error!("server!(protocol …, policies: …) requires either the `tokio` or `std` feature");
-		}
+		$crate::__tightbeam_server_protocol_policies_handle!($protocol, $listener, [ $($policy_name: [ $( $policy_expr ),* ]),* ], $handler)
 	}};
 
 	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, handle: $handler:expr) => {{
-		#[cfg(feature = "tokio")]
-		{
-			let __listener = $listener;
-			tokio::spawn(async move {
-				let __error_tx = Some($error_tx);
-				let __ok_tx = Some($ok_tx);
-				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx,)
-			})
-		}
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		{
-			let __listener = $listener;
-			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __listener, $handler,)
-			})
-		}
-		#[cfg(not(any(feature = "tokio", feature = "std")))]
-		{
-			compile_error!("server!(protocol …, channels: …) requires either the `tokio` or `std` feature");
-		}
+		$crate::__tightbeam_server_protocol_channels_handle!($protocol, $listener, $error_tx, $ok_tx, $handler)
 	}};
 
 	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
-		#[cfg(feature = "tokio")]
-		{
-			let __listener = $listener;
-			tokio::spawn(async move {
-				let __error_tx = Some($error_tx);
-				let __ok_tx = Some($ok_tx);
-				$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
-			})
-		}
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		{
-			let __listener = $listener;
-			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
-			})
-		}
-		#[cfg(not(any(feature = "tokio", feature = "std")))]
-		{
-			compile_error!("server!(protocol …, channels: …) requires either the `tokio` or `std` feature");
-		}
+		$crate::__tightbeam_server_protocol_channels_policies_handle!($protocol, $listener, $error_tx, $ok_tx, [ $($policy_name: [ $( $policy_expr ),* ]),* ], $handler)
 	}};
 
 	(protocol $protocol:path: bind $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
-		#[cfg(feature = "tokio")]
-		{
-			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr).await?;
-			let __server = <$protocol>::from(listener);
-			tokio::spawn(async move {
-				let __error_tx: Option<tokio::sync::mpsc::Sender<$crate::transport::error::TransportError>> = None;
-				let __ok_tx: Option<tokio::sync::mpsc::Sender<()>> = None;
-				$crate::server!(@async_loop $protocol, __server, $handler, __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
-			})
-		}
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		{
-			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
-			let __server = <$protocol>::from(listener);
-			std::thread::spawn(move || {
-				$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*)
-			});
-		}
-		#[cfg(not(any(feature = "tokio", feature = "std")))]
-		{
-			compile_error!("server!(protocol …, policies: …) with `bind` requires the `tokio` feature; enable it or use the sync forms");
-		}
+		$crate::__tightbeam_server_protocol_bind_policies_handle!($protocol, $addr, [ $($policy_name: [ $( $policy_expr ),* ]),* ], $handler)
 	}};
 
 	(async $($rest:tt)*) => {
