@@ -12,22 +12,40 @@ use crate::{
 	transport::{error::TransportError, policy::RestartPolicy, tcp::ProtocolStream},
 };
 
-/// TCP transport implementation using abstract traits
-#[cfg(not(feature = "transport-policy"))]
-pub struct TcpTransport<S: ProtocolStream> {
-	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
-}
+#[cfg(feature = "x509")]
+use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
+#[cfg(feature = "x509")]
+use crate::transport::handshake::HandshakeState;
+#[cfg(feature = "x509")]
+use crate::x509::Certificate;
+#[cfg(feature = "x509")]
+use std::time::Duration;
 
-#[cfg(feature = "transport-policy")]
 pub struct TcpTransport<S: ProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
+	#[cfg(feature = "transport-policy")]
 	restart_policy: Box<dyn RestartPolicy>,
+	#[cfg(feature = "transport-policy")]
 	emitter_gate: Box<dyn GatePolicy>,
+	#[cfg(feature = "transport-policy")]
 	collector_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "x509")]
+	server_public_key: Option<Secp256k1VerifyingKey>,
+	#[cfg(feature = "x509")]
+	enforce_encryption: bool,
+	#[cfg(feature = "x509")]
+	server_certificate: Option<Certificate>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	signing_key: Option<crate::crypto::sign::ecdsa::Secp256k1SigningKey>,
+	#[cfg(feature = "x509")]
+	handshake_state: HandshakeState,
+	#[cfg(feature = "x509")]
+	handshake_timeout: Duration,
+	#[cfg(feature = "x509")]
 	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	handshake: Option<crate::transport::handshake::TightBeamHandshake>,
 }
 
 impl<S: ProtocolStream> Pingable for TcpTransport<S>
@@ -99,6 +117,22 @@ where
 	fn decryptor(&self) -> TransportResult<&Self::Decryptor> {
 		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
 	}
+
+	fn handshake_state(&self) -> HandshakeState {
+		self.handshake_state
+	}
+
+	fn set_handshake_state(&mut self, state: HandshakeState) {
+		self.handshake_state = state;
+	}
+
+	fn server_certificate(&self) -> Option<&Certificate> {
+		self.server_certificate.as_ref()
+	}
+
+	fn set_symmetric_key(&mut self, key: Self::Encryptor) {
+		self.symmetric_key = Some(key);
+	}
 }
 
 /// TCP server using abstract listener trait
@@ -164,6 +198,7 @@ mod tests {
 	use crate::testing::*;
 	use crate::transport::{MessageCollector, MessageEmitter};
 
+	#[cfg(not(feature = "x509"))]
 	#[tokio::test]
 	async fn test_tcp_transport_emit_collect() -> TransportResult<()> {
 		let message = create_v0_tightbeam(None, None);
@@ -177,7 +212,7 @@ mod tests {
 			let mut transport = server.accept().unwrap();
 
 			let rt = tokio::runtime::Runtime::new().unwrap();
-			rt.block_on(transport.collect()).unwrap();
+			rt.block_on(transport.handle_request()).unwrap();
 		});
 
 		// Await server ready signal
@@ -194,7 +229,7 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "transport-policy")]
+	#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
 	#[tokio::test]
 	async fn test_tcp_transport_with_gate_policy() -> TransportResult<()> {
 		use std::sync::atomic::{AtomicBool, Ordering};
@@ -234,11 +269,11 @@ mod tests {
 
 			let rt = tokio::runtime::Runtime::new().unwrap();
 
-			// First collect - gate policy returns Busy
-			rt.block_on(transport.collect()).ok();
+			// First handle_request - gate policy returns Busy
+			rt.block_on(transport.handle_request()).ok();
 
-			// Second collect - gate policy returns Accepted
-			rt.block_on(transport.collect()).unwrap();
+			// Second handle_request - gate policy returns Accepted
+			rt.block_on(transport.handle_request()).unwrap();
 		});
 
 		let _ = ready_rx.recv();

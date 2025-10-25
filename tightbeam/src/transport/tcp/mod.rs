@@ -71,6 +71,18 @@ impl EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid> for std::net::Tc
 	type Encryptor = crate::crypto::aead::Aes256Gcm;
 	type Decryptor = crate::crypto::aead::Aes256Gcm;
 
+	#[cfg(feature = "secp256k1")]
+	async fn bind_with(
+		addr: Self::Address,
+		_cert: x509_cert::Certificate,
+		_signing_key: crate::crypto::sign::ecdsa::Secp256k1SigningKey,
+	) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = std::net::TcpListener::bind(addr.0)?;
+		let bound_addr = listener.local_addr()?;
+		Ok((listener, TightBeamSocketAddr(bound_addr)))
+	}
+
+	#[cfg(not(feature = "secp256k1"))]
 	async fn bind_with(
 		addr: Self::Address,
 		_cert: x509_cert::Certificate,
@@ -179,6 +191,22 @@ macro_rules! impl_tcp_common {
 				Self {
 					stream,
 					handler: None,
+					#[cfg(feature = "x509")]
+					server_public_key: None,
+					#[cfg(feature = "x509")]
+					enforce_encryption: false,
+					#[cfg(feature = "x509")]
+					server_certificate: None,
+					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					signing_key: None,
+					#[cfg(feature = "x509")]
+					handshake_state: $crate::transport::handshake::HandshakeState::None,
+					#[cfg(feature = "x509")]
+					handshake_timeout: std::time::Duration::from_secs(1),
+					#[cfg(feature = "x509")]
+					symmetric_key: None,
+					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					handshake: None,
 				}
 			}
 		}
@@ -198,7 +226,21 @@ macro_rules! impl_tcp_common {
 					collector_gate: Box::new(AcceptAllGate),
 					handler: None,
 					#[cfg(feature = "x509")]
+					server_public_key: None,
+					#[cfg(feature = "x509")]
+					enforce_encryption: false,
+					#[cfg(feature = "x509")]
+					server_certificate: None,
+					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					signing_key: None,
+					#[cfg(feature = "x509")]
+					handshake_state: $crate::transport::handshake::HandshakeState::None,
+					#[cfg(feature = "x509")]
+					handshake_timeout: std::time::Duration::from_secs(1),
+					#[cfg(feature = "x509")]
 					symmetric_key: None,
+					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					handshake: None,
 				}
 			}
 		}
@@ -217,6 +259,137 @@ macro_rules! impl_tcp_common {
 
 			fn handler(&self) -> Option<&(dyn Fn($crate::Frame) -> Option<$crate::Frame> + Send)> {
 				self.handler.as_ref().map(|h| h.as_ref())
+			}
+		}
+
+		#[cfg(feature = "x509")]
+		impl<S: $stream_trait> $transport<S>
+		where
+			TransportError: From<S::Error>,
+		{
+			/// Set the server's certificate on the client transport
+			/// This indicates that the server requires encryption
+			pub fn with_server_certificate(mut self, cert: $crate::x509::Certificate) -> Self {
+				self.server_certificate = Some(cert);
+				self
+			}
+		}
+
+		#[cfg(all(feature = "x509", feature = "secp256k1"))]
+		impl<S: $stream_trait> $transport<S>
+		where
+			TransportError: From<S::Error>,
+		{
+			/// Perform client-side handshake with server
+			///
+			/// This method:
+			/// 1. Creates a new TightBeamHandshake instance
+			/// 2. Generates and sends ClientKeyExchange
+			/// 3. Receives and validates ServerHandshake
+			/// 4. Derives session key from ECDH
+			/// 5. Stores session key and marks handshake complete
+			async fn perform_client_handshake(&mut self) -> TransportResult<()> {
+				use crate::der::{Decode, Encode};
+				use crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
+				use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+
+				// Create handshake instance
+				let mut handshake = TightBeamHandshake::new_client();
+
+				// Step 1: Generate and send ClientHello
+				let client_hello_bytes = handshake.initiate_client().await?;
+				let client_hello_envelope = TransportEnvelope::from_der(&client_hello_bytes)?;
+				let wire_envelope = WireEnvelope::Cleartext(client_hello_envelope);
+				self.write_envelope(&wire_envelope.to_der()?).await?;
+
+				// Update state machine
+				#[cfg(feature = "std")]
+				{
+					self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingServerResponse {
+						initiated_at: std::time::Instant::now(),
+					});
+				}
+				#[cfg(not(feature = "std"))]
+				{
+					self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingServerResponse { initiated_at: 0 });
+				}
+
+				// Step 2: Receive ServerHandshake response
+				let response_wire_bytes = self.read_envelope().await?;
+				let response_wire = WireEnvelope::from_der(&response_wire_bytes)?;
+
+				// Unwrap WireEnvelope to get TransportEnvelope
+				let response_envelope = match response_wire {
+					WireEnvelope::Cleartext(env) => env,
+					WireEnvelope::Encrypted(_) => {
+						// Handshake messages must be cleartext
+						return Err(TransportError::InvalidMessage);
+					}
+				};
+
+				// Re-encode TransportEnvelope for process_server_response
+				let response_bytes = response_envelope.to_der()?;
+
+				// Step 3: Process ServerHandshake, derive session key, and get ClientKeyExchange to send
+				let session_key = handshake.process_server_response(&response_bytes).await?;
+
+				// Step 4: Send ClientKeyExchange (if pending)
+				if let Some(client_kex_bytes) = handshake.take_client_key_exchange() {
+					let client_kex_envelope = TransportEnvelope::from_der(&client_kex_bytes)?;
+					let wire_envelope = WireEnvelope::Cleartext(client_kex_envelope);
+					self.write_envelope(&wire_envelope.to_der()?).await?;
+				}
+
+				// Store session key and mark handshake complete
+				self.set_symmetric_key(session_key);
+				self.set_handshake_state($crate::transport::handshake::HandshakeState::Complete);
+
+				Ok(())
+			}
+
+			/// Perform server-side handshake with client
+			///
+			/// This method handles both:
+			/// 1. ClientHello → responds with ServerHandshake (cert + server_random + sig)
+			/// 2. ClientKeyExchange → decrypts and derives session key, completes handshake
+			///
+			/// The handshake instance is stored in the transport and persists across both calls.
+			async fn perform_server_handshake(&mut self, handshake_bytes: &[u8]) -> TransportResult<()> {
+				use crate::der::{Decode, Encode};
+				use crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
+				use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+
+				// Get server certificate and signing key
+				let cert = self.server_certificate().ok_or(TransportError::Forbidden)?.clone();
+				let signing_key = self.signing_key.as_ref().ok_or(TransportError::Forbidden)?.clone();
+
+				// Get or create handshake instance (persists state across ClientHello → ClientKeyExchange)
+				if self.handshake.is_none() {
+					self.handshake = Some(TightBeamHandshake::new_server(cert, signing_key));
+				}
+
+				let handshake = self.handshake.as_mut().unwrap();
+
+				// Process handshake message (ClientHello or ClientKeyExchange)
+				let response_bytes = handshake.handle_client_request(handshake_bytes).await?;
+
+				// Send response if any (ServerHandshake for ClientHello, empty for ClientKeyExchange)
+				if !response_bytes.is_empty() {
+					// Parse TransportEnvelope, wrap in WireEnvelope, send
+					let server_envelope = TransportEnvelope::from_der(&response_bytes)?;
+					let wire_envelope = WireEnvelope::Cleartext(server_envelope);
+					self.write_envelope(&wire_envelope.to_der()?).await?;
+				} else {
+					// Empty response means ClientKeyExchange was processed - complete handshake
+					let session_key = handshake.complete_server_handshake().await?;
+					self.set_symmetric_key(session_key);
+					self.set_handshake_state($crate::transport::handshake::HandshakeState::Complete);
+
+					// Clear handshake instance - no longer needed
+					self.handshake = None;
+				}
+
+				Ok(())
 			}
 		}
 
@@ -241,7 +414,7 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
+		#[cfg(all(feature = "transport-policy", not(all(feature = "x509", feature = "secp256k1"))))]
 		impl<S: $stream_trait> $crate::transport::MessageEmitter for $transport<S>
 		where
 			TransportError: From<S::Error>,
@@ -258,7 +431,7 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(feature = "transport-policy")]
+		#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
 		impl<S: $stream_trait> $crate::transport::MessageCollector for $transport<S>
 		where
 			TransportError: From<S::Error>,

@@ -172,6 +172,65 @@ pub fn ecies_kdf_sha256(
 	Ok(okm)
 }
 
+/// General-purpose HKDF-SHA256 key derivation
+///
+/// Derives a cryptographic key from input key material using HKDF (HMAC-based
+/// Extract-and-Expand Key Derivation Function) with SHA3-256.
+///
+/// This is a general-purpose key derivation function suitable for deriving
+/// session keys, encryption keys, and other cryptographic material from
+/// shared secrets or base keys.
+///
+/// # Security Properties
+///
+/// - **Randomness extraction**: Extracts a fixed-length pseudorandom key from input
+/// - **Domain separation**: The `info` parameter prevents key reuse across contexts
+/// - **Salt support**: Optional salt provides additional entropy
+///
+/// # Algorithm
+///
+/// 1. HKDF-Extract: `PRK = HKDF-Extract(salt, ikm)`
+/// 2. HKDF-Expand: `OKM = HKDF-Expand(PRK, info, N)`
+///
+/// # Type Parameters
+///
+/// - `N`: The size in bytes for the derived key. Must be at least 16 bytes.
+///
+/// # Parameters
+///
+/// - `ikm`: Input Key Material - the source entropy (e.g., shared secret, base key)
+/// - `info`: Application-specific context and domain separation string
+/// - `salt`: Optional salt for HKDF-Extract. Use `None` for no salt.
+///
+/// # Returns
+///
+/// An N-byte key wrapped in `Zeroizing` for automatic memory clearing.
+///
+/// # Errors
+///
+/// - [`KdfError::DerivationFailed`] if HKDF expansion fails
+///
+/// # Standards Compliance
+///
+/// - **RFC 5869**: HKDF (HMAC-based Extract-and-Expand Key Derivation Function)
+/// - **NIST SP 800-56C**: Recommendation for Key-Derivation Methods
+/// - **FIPS 202**: SHA3-256 cryptographic hash function
+pub fn hkdf_sha256<const N: usize>(
+	ikm: impl AsRef<[u8]>,
+	info: impl AsRef<[u8]>,
+	salt: Option<&[u8]>,
+) -> Result<SafeSpace<N>> {
+	const { assert!(N >= 16, "Key size must be at least 16 bytes for security") };
+
+	let ikm = ikm.as_ref();
+	let info = info.as_ref();
+
+	let hk = Hkdf::<Sha3_256>::new(salt, ikm);
+	let mut okm = Zeroizing::new([0u8; N]);
+	hk.expand(info, &mut okm[..]).map_err(KdfError::DerivationFailed)?;
+	Ok(okm)
+}
+
 /// ECIES Key Derivation Function using SHA3-256 with configurable key size
 ///
 /// This is the generic version of [`ecies_kdf_sha256`] that allows specifying

@@ -7,7 +7,7 @@ use alloc::{boxed::Box, vec::Vec};
 #[cfg(feature = "x509")]
 use crate::crypto::aead::{Decryptor, Encryptor};
 #[cfg(feature = "x509")]
-use crate::transport::handshake::{ClientKeyExchange, ServerKeyExchange};
+use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake};
 #[cfg(feature = "derive")]
 use crate::Beamable;
 
@@ -200,10 +200,13 @@ pub enum TransportEnvelope {
 	Response(ResponsePackage),
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "2", constructed = "true")]
-	ClientKeyExchange(ClientKeyExchange),
+	ClientHello(ClientHello),
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "3", constructed = "true")]
-	ServerKeyExchange(ServerKeyExchange),
+	ClientKeyExchange(ClientKeyExchange),
+	#[cfg(feature = "x509")]
+	#[asn1(context_specific = "4", constructed = "true")]
+	ServerHandshake(ServerHandshake),
 }
 
 /// Wire-level envelope that can be either cleartext or encrypted
@@ -279,7 +282,16 @@ where
 	type Encryptor: crate::crypto::aead::Encryptor<O>;
 	type Decryptor: crate::crypto::aead::Decryptor;
 
+	/// Bind to an address with an X.509 certificate and signing key for ECIES encryption
+	#[cfg(feature = "secp256k1")]
+	fn bind_with(
+		addr: Self::Address,
+		cert: crate::crypto::x509::Certificate,
+		signing_key: crate::crypto::sign::ecdsa::Secp256k1SigningKey,
+	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
+
 	/// Bind to an address with an X.509 certificate for ECIES encryption
+	#[cfg(not(feature = "secp256k1"))]
 	fn bind_with(
 		addr: Self::Address,
 		cert: crate::crypto::x509::Certificate,
@@ -296,7 +308,7 @@ pub trait Mycelial: Protocol {
 /// Async listener trait
 pub trait AsyncListenerTrait: Protocol + Send {
 	#[allow(async_fn_in_trait)]
-	async fn accept(&self) -> Result<(Self::Stream, Self::Address), Self::Error>;
+	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error>;
 }
 
 /// Base I/O operations for message transport
@@ -317,6 +329,14 @@ pub trait MessageIO: ResponseHandler {
 	/// Encode envelope to DER bytes
 	fn encode_envelope(envelope: &TransportEnvelope) -> TransportResult<Vec<u8>> {
 		crate::encode(envelope).map_err(TransportError::from)
+	}
+
+	/// Read and decode a transport envelope
+	/// This can be overridden by EncryptedMessageIO to handle WireEnvelope parsing
+	#[allow(async_fn_in_trait)]
+	async fn read_decoded_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+		let bytes = self.read_envelope().await?;
+		Self::decode_envelope(&bytes)
 	}
 
 	/// Send a response back to the sender
@@ -375,6 +395,18 @@ where
 
 	/// Get the decryptor instance
 	fn decryptor(&self) -> TransportResult<&Self::Decryptor>;
+
+	/// Get current handshake state (pure accessor)
+	fn handshake_state(&self) -> crate::transport::handshake::HandshakeState;
+
+	/// Set handshake state (pure mutator)
+	fn set_handshake_state(&mut self, state: crate::transport::handshake::HandshakeState);
+
+	/// Get server certificate if present (pure accessor)
+	fn server_certificate(&self) -> Option<&crate::x509::Certificate>;
+
+	/// Set symmetric encryption key (pure mutator)
+	fn set_symmetric_key(&mut self, key: Self::Encryptor);
 
 	/// Relay a message by detecting whether it's encrypted or cleartext
 	/// Returns the decrypted TransportEnvelope ready for processing
@@ -485,7 +517,18 @@ pub trait MessageEmitter: MessageIO {
 
 			// Wrap in envelope and send
 			let envelope = TransportEnvelope::from(current_message);
-			self.write_envelope(&envelope.to_der()?).await?;
+
+			// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
+			#[cfg(feature = "x509")]
+			{
+				let wire_envelope = WireEnvelope::Cleartext(envelope.clone());
+				self.write_envelope(&wire_envelope.to_der()?).await?;
+			}
+
+			#[cfg(not(feature = "x509"))]
+			{
+				self.write_envelope(&envelope.to_der()?).await?;
+			}
 
 			// Extract message back from envelope
 			current_message = match envelope {
@@ -496,7 +539,23 @@ pub trait MessageEmitter: MessageIO {
 
 			// Wait for receiver's response envelope
 			let response_bytes = self.read_envelope().await?;
+
+			// When x509 is enabled, parse as WireEnvelope first
+			#[cfg(feature = "x509")]
+			let response_envelope = {
+				let wire_envelope = WireEnvelope::from_der(&response_bytes)?;
+				match wire_envelope {
+					WireEnvelope::Cleartext(env) => env,
+					WireEnvelope::Encrypted(_) => {
+						// Client doesn't handle encrypted responses in emit() yet
+						return Err(TransportError::InvalidMessage);
+					}
+				}
+			};
+
+			#[cfg(not(feature = "x509"))]
 			let response_envelope = Self::decode_envelope(&response_bytes)?;
+
 			let (status, response) = match response_envelope {
 				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 				TransportEnvelope::Request(_) => {
@@ -504,7 +563,9 @@ pub trait MessageEmitter: MessageIO {
 					return Err(TransportError::InvalidMessage);
 				}
 				#[cfg(feature = "x509")]
-				TransportEnvelope::ClientKeyExchange(_) | TransportEnvelope::ServerKeyExchange(_) => {
+				TransportEnvelope::ClientHello(_)
+				| TransportEnvelope::ClientKeyExchange(_)
+				| TransportEnvelope::ServerHandshake(_) => {
 					// Handshake messages not expected here
 					return Err(TransportError::InvalidMessage);
 				}
@@ -557,9 +618,8 @@ pub trait MessageCollector: MessageIO {
 	/// Returns the message and the gate evaluation status
 	#[allow(async_fn_in_trait)]
 	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)> {
-		// Read the envelope
-		let request_envelope = self.read_envelope().await?;
-		let decoded_envelope = Self::decode_envelope(&request_envelope)?;
+		// Read and decode the envelope (can be overridden for encryption)
+		let decoded_envelope = self.read_decoded_envelope().await?;
 		let request = match decoded_envelope {
 			TransportEnvelope::Request(msg) => msg.message,
 			TransportEnvelope::Response(_) => {
@@ -567,7 +627,9 @@ pub trait MessageCollector: MessageIO {
 				return Err(TransportError::InvalidMessage);
 			}
 			#[cfg(feature = "x509")]
-			TransportEnvelope::ClientKeyExchange(_) | TransportEnvelope::ServerKeyExchange(_) => {
+			TransportEnvelope::ClientHello(_)
+			| TransportEnvelope::ClientKeyExchange(_)
+			| TransportEnvelope::ServerHandshake(_) => {
 				// Handshake messages not expected here
 				return Err(TransportError::InvalidMessage);
 			}
@@ -588,15 +650,37 @@ pub trait MessageCollector: MessageIO {
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message, length: None };
 		let response_envelope = TransportEnvelope::from(response_pkg);
-		let response_bytes = Self::encode_envelope(&response_envelope)?;
-		self.write_envelope(&response_bytes).await?;
+
+		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
+		#[cfg(feature = "x509")]
+		{
+			let wire_envelope = WireEnvelope::Cleartext(response_envelope);
+			let wire_bytes = wire_envelope.to_der()?;
+			self.write_envelope(&wire_bytes).await?;
+		}
+
+		#[cfg(not(feature = "x509"))]
+		{
+			let response_bytes = Self::encode_envelope(&response_envelope)?;
+			self.write_envelope(&response_bytes).await?;
+		}
+
 		Ok(())
 	}
 
-	/// Collect next available message (original behavior for backward compatibility)
+	/// Handle incoming request: collect message, process it, and send response
 	#[allow(async_fn_in_trait)]
-	async fn collect(&mut self) -> TransportResult<()> {
-		let (request, status) = self.collect_message().await?;
+	async fn handle_request(&mut self) -> TransportResult<()> {
+		let (request, status) = match self.collect_message().await {
+			Ok(result) => result,
+			#[cfg(feature = "x509")]
+			Err(TransportError::MissingEncryption) => {
+				// Client sent unencrypted message when encryption required
+				self.send_response(TransitStatus::Forbidden, None).await?;
+				return Ok(());
+			}
+			Err(e) => return Err(e),
+		};
 
 		let message = if status == TransitStatus::Accepted {
 			// If the gate accepted it, handle the message
@@ -632,10 +716,48 @@ pub trait MessageCollector: MessageIO {
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message };
+		let response_pkg = ResponsePackage { status, message, length: None };
 		let response_envelope = TransportEnvelope::from(response_pkg);
-		self.write_envelope(&response_envelope).await?;
+
+		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
+		#[cfg(feature = "x509")]
+		{
+			let wire_envelope = WireEnvelope::Cleartext(response_envelope);
+			let wire_bytes = wire_envelope.to_der()?;
+			self.write_envelope(&wire_bytes).await?;
+		}
+
+		#[cfg(not(feature = "x509"))]
+		{
+			self.write_envelope(&response_envelope.to_der()?).await?;
+		}
+
 		Ok(())
+	}
+
+	/// Handle incoming request: collect message, process it, and send response
+	#[allow(async_fn_in_trait)]
+	async fn handle_request(&mut self) -> TransportResult<()> {
+		let (request, status) = match self.collect_message().await {
+			Ok(result) => result,
+			#[cfg(feature = "x509")]
+			Err(TransportError::MissingEncryption) => {
+				// Client sent unencrypted message when encryption required
+				self.send_response(TransitStatus::Forbidden, None).await?;
+				return Ok(());
+			}
+			Err(e) => return Err(e),
+		};
+
+		let message = if status == TransitStatus::Accepted {
+			// If the gate accepted it, handle the message
+			self.handle_message(request)
+		} else {
+			// If not accepted, no response message
+			None
+		};
+
+		self.send_response(status, message).await
 	}
 }
 

@@ -320,8 +320,7 @@ macro_rules! server {
 	(@sync_loop_body $protocol:path, $listener:ident, $handler:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		loop {
 			match $listener.accept() {
-				Ok((__stream, _addr)) => {
-					let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(__stream);
+				Ok((mut __transport, _addr)) => {
 					$(
 						$(
 							__transport = __transport.$policy_name($policy_expr);
@@ -371,8 +370,7 @@ macro_rules! server {
 	(@async_loop_body $protocol:path, $listener:ident, $handler:ident, $error_tx:ident, $ok_tx:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		loop {
 			match $listener.accept().await {
-				Ok((__stream, _addr)) => {
-					let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(__stream);
+				Ok((mut __transport, _addr)) => {
 					$(
 						$(
 							__transport = __transport.$policy_name($policy_expr);

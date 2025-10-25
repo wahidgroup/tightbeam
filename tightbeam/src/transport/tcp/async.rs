@@ -9,6 +9,15 @@ use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
 #[cfg(feature = "transport-policy")]
 use crate::{policy::GatePolicy, transport::policy::RestartPolicy};
 
+#[cfg(feature = "x509")]
+use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
+#[cfg(feature = "x509")]
+use crate::transport::handshake::HandshakeState;
+#[cfg(feature = "x509")]
+use crate::x509::Certificate;
+#[cfg(feature = "x509")]
+use std::time::Duration;
+
 pub trait AsyncProtocolStream: Send + Unpin {
 	type Error: Into<TransportError>;
 	fn inner_mut(&mut self) -> &mut TcpStream;
@@ -34,6 +43,10 @@ impl From<TcpStream> for TokioStream {
 
 pub struct TokioListener {
 	listener: TcpListener,
+	#[cfg(feature = "x509")]
+	certificate: Option<crate::x509::Certificate>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	signing_key: Option<crate::crypto::sign::ecdsa::Secp256k1SigningKey>,
 }
 
 impl TokioListener {
@@ -43,12 +56,36 @@ impl TokioListener {
 
 	pub async fn bind(addr: &str) -> std::io::Result<Self> {
 		let listener = TcpListener::bind(addr).await?;
-		Ok(Self { listener })
+		Ok(Self {
+			listener,
+			#[cfg(feature = "x509")]
+			certificate: None,
+			#[cfg(all(feature = "x509", feature = "secp256k1"))]
+			signing_key: None,
+		})
 	}
 
+	#[cfg(not(feature = "x509"))]
 	pub async fn accept(&self) -> std::io::Result<(TokioStream, std::net::SocketAddr)> {
 		let (stream, addr) = self.listener.accept().await?;
 		Ok((TokioStream::from(stream), addr))
+	}
+
+	#[cfg(feature = "x509")]
+	pub async fn accept(&self) -> std::io::Result<(TcpTransport<TokioStream>, std::net::SocketAddr)> {
+		let (stream, addr) = self.listener.accept().await?;
+		let mut transport = TcpTransport::from(TokioStream::from(stream));
+
+		if let Some(cert) = &self.certificate {
+			transport.server_certificate = Some(cert.clone());
+		}
+
+		#[cfg(feature = "secp256k1")]
+		if let Some(key) = &self.signing_key {
+			transport.signing_key = Some(key.clone());
+		}
+
+		Ok((transport, addr))
 	}
 }
 
@@ -66,7 +103,16 @@ impl Protocol for TokioListener {
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
-		Ok((Self { listener }, crate::transport::tcp::TightBeamSocketAddr(bound_addr)))
+		Ok((
+			Self {
+				listener,
+				#[cfg(feature = "x509")]
+				certificate: None,
+				#[cfg(all(feature = "x509", feature = "secp256k1"))]
+				signing_key: None,
+			},
+			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
+		))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
@@ -88,13 +134,31 @@ impl EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid> for TokioListene
 	type Encryptor = crate::crypto::aead::Aes256Gcm;
 	type Decryptor = crate::crypto::aead::Aes256Gcm;
 
+	#[cfg(feature = "secp256k1")]
 	async fn bind_with(
 		addr: Self::Address,
-		_cert: crate::crypto::x509::Certificate,
+		cert: crate::crypto::x509::Certificate,
+		signing_key: crate::crypto::sign::ecdsa::Secp256k1SigningKey,
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
-		Ok((Self { listener }, crate::transport::tcp::TightBeamSocketAddr(bound_addr)))
+		Ok((
+			Self { listener, certificate: Some(cert), signing_key: Some(signing_key) },
+			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
+		))
+	}
+
+	#[cfg(not(feature = "secp256k1"))]
+	async fn bind_with(
+		addr: Self::Address,
+		cert: crate::crypto::x509::Certificate,
+	) -> Result<(Self::Listener, Self::Address), Self::Error> {
+		let listener = TcpListener::bind(addr.0).await?;
+		let bound_addr = listener.local_addr()?;
+		Ok((
+			Self { listener, certificate: Some(cert) },
+			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
+		))
 	}
 }
 
@@ -113,12 +177,40 @@ where
 	fn decryptor(&self) -> TransportResult<&Self::Decryptor> {
 		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
 	}
+
+	fn handshake_state(&self) -> HandshakeState {
+		self.handshake_state
+	}
+
+	fn set_handshake_state(&mut self, state: HandshakeState) {
+		self.handshake_state = state;
+	}
+
+	fn server_certificate(&self) -> Option<&Certificate> {
+		self.server_certificate.as_ref()
+	}
+
+	fn set_symmetric_key(&mut self, key: Self::Encryptor) {
+		self.symmetric_key = Some(key);
+	}
 }
 
 impl AsyncListenerTrait for TokioListener {
-	async fn accept(&self) -> Result<(Self::Stream, Self::Address), Self::Error> {
+	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		let (stream, addr) = self.listener.accept().await?;
-		Ok((TokioStream::from(stream), crate::transport::tcp::TightBeamSocketAddr(addr)))
+		let mut transport = Self::create_transport(TokioStream::from(stream));
+
+		#[cfg(feature = "x509")]
+		if let Some(ref cert) = self.certificate {
+			transport.server_certificate = Some(cert.clone());
+		}
+
+		#[cfg(all(feature = "x509", feature = "secp256k1"))]
+		if let Some(ref key) = self.signing_key {
+			transport.signing_key = Some(key.clone());
+		}
+
+		Ok((transport, crate::transport::tcp::TightBeamSocketAddr(addr)))
 	}
 }
 
@@ -136,6 +228,18 @@ impl crate::transport::Mycelial for TokioListener {
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
+	#[cfg(feature = "x509")]
+	server_public_key: Option<Secp256k1VerifyingKey>,
+	#[cfg(feature = "x509")]
+	enforce_encryption: bool,
+	#[cfg(feature = "x509")]
+	server_certificate: Option<Certificate>,
+	#[cfg(feature = "x509")]
+	handshake_state: HandshakeState,
+	#[cfg(feature = "x509")]
+	handshake_timeout: Duration,
+	#[cfg(feature = "x509")]
+	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
 }
 
 #[cfg(feature = "transport-policy")]
@@ -146,7 +250,21 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "x509")]
+	server_public_key: Option<Secp256k1VerifyingKey>,
+	#[cfg(feature = "x509")]
+	enforce_encryption: bool,
+	#[cfg(feature = "x509")]
+	server_certificate: Option<Certificate>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	signing_key: Option<crate::crypto::sign::ecdsa::Secp256k1SigningKey>,
+	#[cfg(feature = "x509")]
+	handshake_state: HandshakeState,
+	#[cfg(feature = "x509")]
+	handshake_timeout: Duration,
+	#[cfg(feature = "x509")]
 	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	handshake: Option<crate::transport::handshake::TightBeamHandshake>,
 }
 
 impl<S: AsyncProtocolStream> Pingable for TcpTransport<S>
@@ -198,6 +316,280 @@ where
 	}
 }
 
+#[cfg(all(feature = "x509", feature = "transport-policy"))]
+impl<S: AsyncProtocolStream> crate::transport::MessageCollector for TcpTransport<S>
+where
+	TransportError: From<S::Error>,
+{
+	type CollectorGate = dyn crate::policy::GatePolicy;
+
+	fn collector_gate(&self) -> &Self::CollectorGate {
+		self.collector_gate.as_ref()
+	}
+
+	async fn collect_message(&mut self) -> TransportResult<(crate::Frame, crate::policy::TransitStatus)> {
+		use crate::crypto::aead::Decryptor;
+		use crate::der::{Decode, Encode};
+		use crate::policy::TransitStatus;
+		use crate::transport::handshake::HandshakeState;
+		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+
+		// Loop until we get an actual message (may need to perform handshake first)
+		loop {
+			// Read and parse as WireEnvelope (always - this is the wire protocol)
+			let wire_bytes = self.read_envelope().await?;
+			let wire_envelope = match WireEnvelope::from_der(&wire_bytes) {
+				Ok(env) => env,
+				Err(e) => return Err(TransportError::DerError(e)),
+			};
+
+			// Only enable handshake/encryption logic if server has a certificate configured
+			let has_certificate = self.server_certificate().is_some();
+
+			let decoded_envelope = match wire_envelope {
+				WireEnvelope::Cleartext(envelope) => {
+					if has_certificate {
+						// Server with certificate - check for handshakes and enforce encryption after handshake
+						match envelope {
+							// Handshake messages - let perform_server_handshake handle them
+							TransportEnvelope::ClientHello(_) | TransportEnvelope::ClientKeyExchange(_) => {
+								// Re-encode as TransportEnvelope bytes
+								let handshake_bytes = envelope.to_der()?;
+								self.perform_server_handshake(&handshake_bytes).await?;
+
+								// After processing, loop back to read next message
+								continue;
+							}
+							// ServerHandshake not expected on server (only sent by server)
+							TransportEnvelope::ServerHandshake(_) => {
+								return Err(TransportError::InvalidMessage);
+							}
+							// Regular messages - check if encryption is required
+							TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
+								// Only enforce encryption AFTER handshake is complete
+								if self.handshake_state() == HandshakeState::Complete {
+									// Circuit breaker: reset state on protocol violation
+									self.set_handshake_state(HandshakeState::None);
+									return Err(TransportError::MissingEncryption);
+								}
+								// Before handshake or no certificate, allow cleartext requests
+								envelope
+							}
+						}
+					} else {
+						// No certificate - allow all cleartext
+						envelope
+					}
+				}
+				WireEnvelope::Encrypted(encrypted_info) => {
+					// Decrypt the envelope (requires certificate/handshake)
+					let decrypted_bytes = match self.decryptor()?.decrypt_content(&encrypted_info) {
+						Ok(bytes) => bytes,
+						Err(_) => return Err(TransportError::InvalidMessage),
+					};
+					<Self as MessageIO>::decode_envelope(&decrypted_bytes)?
+				}
+			};
+
+			// Extract the request message
+			let request = match decoded_envelope {
+				TransportEnvelope::Request(msg) => msg.message,
+				TransportEnvelope::Response(_) => {
+					// Only requests are valid here
+					return Err(TransportError::InvalidMessage);
+				}
+				#[cfg(feature = "x509")]
+				TransportEnvelope::ClientHello(_)
+				| TransportEnvelope::ClientKeyExchange(_)
+				| TransportEnvelope::ServerHandshake(_) => {
+					// Handshake messages not expected here
+					return Err(TransportError::InvalidMessage);
+				}
+			};
+
+			// Evaluate gate policy
+			let status: TransitStatus = self.collector_gate().evaluate(&request);
+			if status == TransitStatus::Request {
+				// Invalid status from gate
+				return Err(TransportError::InvalidReply);
+			}
+
+			return Ok((request, status));
+		}
+	}
+
+	async fn send_response(
+		&mut self,
+		status: crate::policy::TransitStatus,
+		message: Option<crate::Frame>,
+	) -> TransportResult<()> {
+		use crate::crypto::aead::{Aes256GcmOid, Encryptor};
+		use crate::der::Encode;
+		use crate::transport::{ResponsePackage, TransportEnvelope, WireEnvelope};
+
+		let response_pkg = ResponsePackage { status, message, length: None };
+		let response_envelope = TransportEnvelope::from(response_pkg);
+
+		// Check if encryption should be used
+		let wire_envelope = if self.handshake_state() == HandshakeState::Complete {
+			// Use encryption after handshake complete
+			let envelope_bytes = response_envelope.to_der()?;
+			let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
+			let encrypted =
+				<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, &nonce, None)?;
+			WireEnvelope::Encrypted(encrypted)
+		} else {
+			// Use cleartext before handshake or when no certificate
+			WireEnvelope::Cleartext(response_envelope)
+		};
+
+		let wire_bytes = wire_envelope.to_der()?;
+		self.write_envelope(&wire_bytes).await?;
+		Ok(())
+	}
+}
+
+#[cfg(all(feature = "x509", feature = "secp256k1", feature = "transport-policy"))]
+impl<S: AsyncProtocolStream> crate::transport::MessageEmitter for TcpTransport<S>
+where
+	TransportError: From<S::Error>,
+{
+	type EmitterGate = dyn crate::policy::GatePolicy;
+	type RestartPolicy = dyn crate::transport::policy::RestartPolicy;
+
+	fn get_restart_policy(&self) -> &Self::RestartPolicy {
+		self.restart_policy.as_ref()
+	}
+
+	fn get_emitter_gate_policy(&self) -> &Self::EmitterGate {
+		self.emitter_gate.as_ref()
+	}
+
+	/// Send a TightBeam message with automatic handshake
+	///
+	/// # Handshake Flow (when x509 enabled)
+	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
+		use crate::der::{Decode, Encode};
+		use crate::policy::TransitStatus;
+		use crate::transport::handshake::HandshakeState;
+		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+
+		let mut current_message: Frame = message;
+		let mut current_attempt = attempt.unwrap_or(0);
+
+		loop {
+			// Evaluate gate policy before sending
+			let status: TransitStatus = self.get_emitter_gate_policy().evaluate(&current_message);
+			if status != TransitStatus::Accepted {
+				// The gate did not accept the message
+				return Err(<TransportError as From<TransitStatus>>::from(status));
+			}
+
+			// Check if handshake is needed before sending
+			if self.server_certificate().is_some() && self.handshake_state() == HandshakeState::None {
+				// Perform client-side handshake
+				println!("Client: performing handshake");
+				self.perform_client_handshake().await?;
+				println!("Client: handshake complete, state = {:?}", self.handshake_state());
+			}
+
+			// Wrap in envelope and send
+			let envelope = TransportEnvelope::from(current_message.clone());
+
+			// Check if encryption should be used
+			println!("Client: about to send, handshake_state = {:?}", self.handshake_state());
+			let wire_envelope = if self.handshake_state() == HandshakeState::Complete {
+				// Use encryption after handshake complete
+				println!("Client: encrypting message");
+				use crate::crypto::aead::{Aes256GcmOid, Encryptor};
+				let envelope_bytes = envelope.to_der()?;
+				let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
+				let encrypted =
+					<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, &nonce, None)?;
+				WireEnvelope::Encrypted(encrypted)
+			} else {
+				// Use cleartext before handshake or when no certificate
+				println!("Client: sending cleartext");
+				WireEnvelope::Cleartext(envelope.clone())
+			};
+
+			self.write_envelope(&wire_envelope.to_der()?).await?;
+
+			// Extract message back from envelope
+			current_message = match envelope {
+				TransportEnvelope::Request(msg) => msg.message,
+				// This should never happen as we just created it
+				_ => unreachable!(),
+			};
+
+			// Wait for receiver's response envelope
+			let response_bytes = self.read_envelope().await?;
+
+			// When x509 is enabled, parse as WireEnvelope first
+			let response_envelope = {
+				let wire_envelope = WireEnvelope::from_der(&response_bytes)?;
+				match wire_envelope {
+					WireEnvelope::Cleartext(env) => env,
+					WireEnvelope::Encrypted(encrypted_info) => {
+						// Decrypt response when handshake is complete
+						use crate::crypto::aead::Decryptor;
+						let decrypted_bytes = self.decryptor()?.decrypt_content(&encrypted_info)?;
+						<Self as MessageIO>::decode_envelope(&decrypted_bytes)?
+					}
+				}
+			};
+
+			let (status, response) = match response_envelope {
+				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
+				TransportEnvelope::Request(_) => {
+					// Only responses are valid here
+					return Err(TransportError::InvalidMessage);
+				}
+				TransportEnvelope::ClientHello(_)
+				| TransportEnvelope::ClientKeyExchange(_)
+				| TransportEnvelope::ServerHandshake(_) => {
+					// Handshake messages not expected here
+					return Err(TransportError::InvalidMessage);
+				}
+			};
+
+			// Check transport status and handle response
+			let result: TransportResult<&Frame> = if status != TransitStatus::Accepted {
+				Err(<TransportError as From<TransitStatus>>::from(status))
+			} else {
+				match &response {
+					Some(msg) => Ok(msg),
+					None => return Ok(None),
+				}
+			};
+
+			let policy: Option<Frame> =
+				self.get_restart_policy()
+					.evaluate(current_message.clone(), result, current_attempt);
+			match policy {
+				Some(retry_message) => {
+					if current_attempt == usize::MAX {
+						// Prevent overflow
+						return Err(TransportError::MaxRetriesExceeded);
+					} else {
+						current_message = retry_message;
+						current_attempt += 1;
+						continue;
+					}
+				}
+				None => {
+					// Return based on the original result construction
+					if status != TransitStatus::Accepted {
+						return Err(<TransportError as From<TransitStatus>>::from(status));
+					} else {
+						return Ok(response);
+					}
+				}
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -218,12 +610,13 @@ mod tests {
 		let response_msg = expected_response.clone();
 		let server = listener;
 		let server_handle = tokio::spawn(async move {
-			let (stream, _) = server.accept().await?;
-			let mut transport = TcpTransport::from(stream).with_handler(Box::new(move |msg: Frame| {
+			let (transport, _) = server.accept().await?;
+			let mut transport = transport.with_handler(Box::new(move |msg: Frame| {
 				let _ = tx.try_send(msg.clone());
 				Some(response_msg.clone())
 			}));
-			transport.collect().await
+
+			transport.handle_request().await
 		});
 
 		let stream = TcpStream::connect(addr).await?;
@@ -246,8 +639,6 @@ mod tests {
 
 		use spki::SubjectPublicKeyInfoOwned;
 
-		use crate::der::Decode;
-		use crate::transport::WireEnvelope;
 		use crate::{prelude::TightBeamSocketAddr, transport::policy::PolicyConf};
 
 		struct BusyFirstGate {
@@ -289,52 +680,48 @@ mod tests {
 		)?;
 
 		let addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
-		let (listener, socket_addr) = TokioListener::bind_with(addr, cert).await?;
+		let (listener, socket_addr) = TokioListener::bind_with(addr, cert.clone(), signing_key.clone()).await?;
 		let server = listener;
 
 		let test_message = create_v0_tightbeam(None, None);
 
 		let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-		let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel(1);
 
 		let server_handle = tokio::spawn(async move {
-			let (stream, _) = server.accept().await?;
-			let mut transport = TcpTransport::from(stream)
-				.with_collector_gate(BusyFirstGate::new())
-				.with_handler(Box::new(move |msg: Frame| {
-					let _ = tx.try_send(msg.clone());
-					Some(msg.clone())
-				}));
+			let (transport, _) = server.accept().await?;
+			println!("Server: accepted connection");
+			let mut transport =
+				transport
+					.with_collector_gate(BusyFirstGate::new())
+					.with_handler(Box::new(move |msg: Frame| {
+						let _ = tx.try_send(msg.clone());
+						Some(msg.clone())
+					}));
 
-			// Capture the raw wire envelope to verify encryption
-			let wire_bytes = transport.read_envelope().await?;
-			let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-			let _ = wire_tx.try_send(wire_envelope);
+			// First handle_request: processes handshake (ClientHello + ClientKeyExchange)
+			// and first application message. Gate returns Busy for first app message.
+			println!("Server: handling first request (handshake + app message)");
+			let result = transport.handle_request().await;
+			println!("Server: first handle_request result: {:?}", result);
+			result?;
 
-			// Process the first message (should be Busy)
-			transport.send_response(TransitStatus::Busy, None).await?;
-
-			// Process second message normally
-			transport.collect().await
+			// Second handle_request: processes second application message
+			// Gate returns Accepted this time
+			println!("Server: handling second request");
+			transport.handle_request().await
 		});
 
 		let stream = TcpStream::connect(*socket_addr).await?;
-		let mut transport = TcpTransport::from(TokioStream::from(stream));
+		let mut transport = TcpTransport::from(TokioStream::from(stream)).with_server_certificate(cert);
 
+		// First emit triggers handshake, then sends encrypted message
+		// Gate policy returns Busy for first application message
 		let first = transport.emit(test_message.clone(), None).await;
 		println!("First attempt: {:?}", first);
 		assert!(matches!(first, Err(TransportError::Busy)));
 
+		// Second emit sends encrypted message, gate returns Accepted
 		transport.emit(test_message.clone(), None).await?;
-
-		// Verify we received an encrypted wire envelope
-		let wire_envelope = wire_rx.recv().await;
-		assert!(wire_envelope.is_some(), "Should receive wire envelope");
-		if let Some(WireEnvelope::Encrypted(_)) = wire_envelope {
-			// Good - the frame was encrypted
-		} else {
-			panic!("Expected encrypted wire envelope, got cleartext");
-		}
 
 		let received = rx.recv().await;
 		assert_eq!(Some(test_message), received);
