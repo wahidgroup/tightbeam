@@ -155,6 +155,15 @@ impl core::str::FromStr for TightBeamSocketAddr {
 }
 
 #[cfg(feature = "std")]
+impl core::ops::Deref for TightBeamSocketAddr {
+	type Target = std::net::SocketAddr;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
+#[cfg(feature = "std")]
 impl crate::transport::TightBeamAddress for TightBeamSocketAddr {}
 
 /// Macro to generate common transport implementation for both sync and async.

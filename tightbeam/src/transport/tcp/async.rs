@@ -201,13 +201,15 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
+	use crate::crypto::sign::Sha3Signer;
 	use crate::testing::*;
 	use crate::transport::{MessageCollector, MessageEmitter, ResponseHandler, TransitStatus};
 
 	#[tokio::test]
 	async fn async_round_trip() -> TransportResult<()> {
-		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.local_addr().unwrap();
+		let listener = TokioListener::bind("127.0.0.1:0").await?;
+		let addr = listener.local_addr()?;
 
 		let test_message = create_v0_tightbeam(None, None);
 		let expected_response = create_v0_tightbeam(None, None);
@@ -216,32 +218,35 @@ mod tests {
 		let response_msg = expected_response.clone();
 		let server = listener;
 		let server_handle = tokio::spawn(async move {
-			let (stream, _) = server.accept().await.unwrap();
+			let (stream, _) = server.accept().await?;
 			let mut transport = TcpTransport::from(stream).with_handler(Box::new(move |msg: Frame| {
 				let _ = tx.try_send(msg.clone());
 				Some(response_msg.clone())
 			}));
-			transport.collect().await.unwrap();
+			transport.collect().await
 		});
 
-		let stream = TcpStream::connect(addr).await.unwrap();
+		let stream = TcpStream::connect(addr).await?;
 		let mut transport = TcpTransport::from(TokioStream::from(stream));
 		let response = transport.emit(test_message.clone(), None).await?;
 
-		let received = rx.recv().await.unwrap();
-		assert_eq!(test_message, received);
+		let received = rx.recv().await;
+		assert_eq!(Some(test_message), received);
 		assert_eq!(response, Some(expected_response));
 
-		server_handle.await.unwrap();
+		server_handle.await??;
 		Ok(())
 	}
 
 	#[cfg(feature = "transport-policy")]
 	#[tokio::test]
-	async fn async_with_gate_policy() -> TransportResult<()> {
+	async fn async_with_encrypted_and_gate_policy() -> TransportResult<()> {
+		use std::str::FromStr;
 		use std::sync::atomic::{AtomicBool, Ordering};
 
-		use crate::transport::policy::PolicyConf;
+		use spki::SubjectPublicKeyInfoOwned;
+
+		use crate::{prelude::TightBeamSocketAddr, transport::policy::PolicyConf};
 
 		struct BusyFirstGate {
 			first: AtomicBool,
@@ -263,15 +268,33 @@ mod tests {
 			}
 		}
 
-		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.local_addr().unwrap();
+		let signing_key = create_test_signing_key();
+		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
+		let sha3_signer = Sha3Signer::from(&signing_key);
+		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
+
+		let not_before = std::time::Instant::now();
+		let not_after = not_before + std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+		// Create a self-signed root certificate
+		let cert = crate::cert!(
+			profile: Root,
+			subject: "CN=Test Root CA,O=Test Org,C=US",
+			serial: 1u32,
+			validity: (not_before, not_after),
+			signer: &sha3_signer,
+			subject_public_key: spki
+		)?;
+
+		let addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
+		let (listener, socket_addr) = TokioListener::bind_with(addr, cert).await?;
 		let server = listener;
 
 		let test_message = create_v0_tightbeam(None, None);
 
 		let (tx, mut rx) = tokio::sync::mpsc::channel(2);
 		let server_handle = tokio::spawn(async move {
-			let (stream, _) = server.accept().await.unwrap();
+			let (stream, _) = server.accept().await?;
 			let mut transport = TcpTransport::from(stream)
 				.with_collector_gate(BusyFirstGate::new())
 				.with_handler(Box::new(move |msg: Frame| {
@@ -280,10 +303,10 @@ mod tests {
 				}));
 
 			transport.collect().await.ok();
-			transport.collect().await.unwrap();
+			transport.collect().await
 		});
 
-		let stream = TcpStream::connect(addr).await.unwrap();
+		let stream = TcpStream::connect(*socket_addr).await?;
 		let mut transport = TcpTransport::from(TokioStream::from(stream));
 
 		let first = transport.emit(test_message.clone(), None).await;
@@ -291,11 +314,11 @@ mod tests {
 
 		transport.emit(test_message.clone(), None).await?;
 
-		let received = rx.recv().await.unwrap();
-		assert_eq!(test_message, received);
+		let received = rx.recv().await;
+		assert_eq!(Some(test_message), received);
 		assert!(rx.try_recv().is_err());
 
-		server_handle.await.unwrap();
+		server_handle.await??;
 		Ok(())
 	}
 }

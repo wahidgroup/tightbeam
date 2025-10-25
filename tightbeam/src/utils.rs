@@ -69,6 +69,31 @@ macro_rules! impl_from {
 			}
 		}
 	};
+
+	// Pattern for extracting inner value from enum variant with fallback
+	($from_type:ty => $target:ident::$variant:ident extract $enum_variant:pat => $inner:ident else $fallback:expr) => {
+		impl From<$from_type> for $target {
+			fn from(err: $from_type) -> Self {
+				match err {
+					$enum_variant => $target::$variant($inner),
+					_ => $target::$variant($fallback),
+				}
+			}
+		}
+	};
+
+	// Pattern for extracting inner value from enum variant with fallback (conditional)
+	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident extract $enum_variant:pat => $inner:ident else $fallback:expr) => {
+		#[cfg($feature)]
+		impl From<$from_type> for $target {
+			fn from(err: $from_type) -> Self {
+				match err {
+					$enum_variant => $target::$variant($inner),
+					_ => $target::$variant($fallback),
+				}
+			}
+		}
+	};
 }
 
 /// Macro to implement TryFrom trait for extracting optional fields

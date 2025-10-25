@@ -168,3 +168,87 @@ pub mod testing;
 
 #[cfg(feature = "builder")]
 tightbeam_derive::generate_builders!();
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn frame_size_calc() {
+		use crate::asn1::*;
+		use crate::cms::cert::IssuerAndSerialNumber;
+		use crate::cms::compressed_data::CompressedData;
+		use crate::cms::content_info::CmsVersion;
+		use crate::cms::enveloped_data::EncryptedContentInfo;
+		use crate::cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier, SignerInfo};
+		use crate::der::{Decode, Encode};
+		use crate::pkcs12::digest_info::DigestInfo;
+		use crate::spki::AlgorithmIdentifier;
+		use crate::x509::name::Name;
+		use crate::x509::serial_number::SerialNumber;
+
+		// Create a 6x6 matrix with all zeros
+		let matrix = Asn1Matrix { n: 6, data: vec![0; 36] };
+
+		// Create metadata with all optional fields
+		let metadata = Metadata {
+			id: vec![0; 16], // 16-byte ID
+			order: 0,
+			compactness: Some(CompressedData {
+				version: CmsVersion::V0,
+				compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB_OID, parameters: None },
+				encap_content_info: EncapsulatedContentInfo {
+					econtent_type: DATA_OID,
+					econtent: Some(
+						der::Any::from_der(&der::asn1::OctetString::new(vec![0; 10]).unwrap().to_der().unwrap())
+							.unwrap(),
+					),
+				},
+			}),
+			integrity: Some(DigestInfo {
+				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
+				digest: der::asn1::OctetString::new(vec![0; 32]).unwrap(),
+			}),
+			confidentiality: Some(EncryptedContentInfo {
+				content_type: DATA_OID,
+				content_enc_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB_OID, parameters: None },
+				encrypted_content: Some(der::asn1::OctetString::new(vec![0; 50]).unwrap()),
+			}),
+			priority: Some(MessagePriority::Normal),
+			lifetime: Some(3600),
+			previous_frame: Some(DigestInfo {
+				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
+				digest: der::asn1::OctetString::new(vec![0; 32]).unwrap(),
+			}),
+			matrix: Some(matrix),
+		};
+
+		// Create frame with empty message
+		let frame = Frame {
+			version: Version::V2,
+			metadata,
+			message: vec![], // empty message
+			integrity: Some(DigestInfo {
+				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
+				digest: der::asn1::OctetString::new(vec![0; 32]).unwrap(),
+			}),
+			nonrepudiation: Some(SignerInfo {
+				version: CmsVersion::V1,
+				sid: SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+					issuer: Name::default(),
+					serial_number: SerialNumber::new(&[0; 8]).unwrap(),
+				}),
+				digest_alg: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
+				signed_attrs: None,
+				signature_algorithm: AlgorithmIdentifier { oid: SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None },
+				signature: der::asn1::OctetString::new(vec![0; 64]).unwrap(),
+				unsigned_attrs: None,
+			}),
+		};
+
+		// Encode to DER
+		let der_bytes = der::Encode::to_der(&frame).unwrap();
+		println!("DER-encoded frame size: {} bytes", der_bytes.len());
+		assert!(der_bytes.len() > 0);
+	}
+}

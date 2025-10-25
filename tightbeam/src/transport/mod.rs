@@ -18,6 +18,7 @@ pub mod policy;
 pub mod tcp;
 
 use crate::asn1::Frame;
+use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::der::asn1::Uint;
 use crate::der::{Choice, Decode, DecodeValue, Encode, EncodeValue, FixedTag, Header, Length, Reader, Tag, Writer};
 use crate::policy::{GatePolicy, TransitStatus};
@@ -197,6 +198,15 @@ pub enum TransportEnvelope {
 	Response(ResponsePackage),
 }
 
+/// Wire-level envelope that can be either cleartext or encrypted
+#[derive(Choice, Clone, Debug, PartialEq)]
+pub enum WireEnvelope {
+	#[asn1(context_specific = "0", constructed = "true")]
+	Cleartext(TransportEnvelope),
+	#[asn1(context_specific = "1", constructed = "true")]
+	Encrypted(EncryptedContentInfo),
+}
+
 #[cfg(not(feature = "derive"))]
 impl crate::Message for TransportEnvelope {
 	const MUST_BE_NON_REPUDIABLE: bool = false;
@@ -358,7 +368,29 @@ where
 	/// Get the decryptor instance
 	fn decryptor(&self) -> TransportResult<&Self::Decryptor>;
 
-	/// Read and decrypt an envelope
+	/// Relay a message by detecting whether it's encrypted or cleartext
+	/// Returns the decrypted TransportEnvelope ready for processing
+	#[allow(async_fn_in_trait)]
+	async fn relay_message(&mut self) -> TransportResult<TransportEnvelope> {
+		let wire_bytes = self.read_envelope().await?;
+		let wire_envelope = WireEnvelope::from_der(&wire_bytes)
+			.map_err(crate::TightBeamError::from)
+			.map_err(TransportError::from)?;
+
+		match wire_envelope {
+			WireEnvelope::Cleartext(transport_envelope) => Ok(transport_envelope),
+			WireEnvelope::Encrypted(encrypted_info) => {
+				let decrypted_bytes = self
+					.decryptor()?
+					.decrypt_content(&encrypted_info)
+					.map_err(TransportError::from)?;
+
+				Self::decode_envelope(&decrypted_bytes)
+			}
+		}
+	}
+
+	/// Read and decrypt an envelope (legacy method, use relay_message instead)
 	#[allow(async_fn_in_trait)]
 	async fn read_encrypted_envelope(&mut self) -> TransportResult<TransportEnvelope> {
 		let encrypted_bytes = self.read_envelope().await?;
@@ -374,21 +406,33 @@ where
 		Self::decode_envelope(&decrypted_bytes)
 	}
 
-	/// Encrypt and write an envelope
+	/// Send a cleartext or encrypted envelope based on encryption flag
 	#[allow(async_fn_in_trait)]
-	async fn write_encrypted_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()> {
-		let envelope_bytes = Self::encode_envelope(envelope)?;
-		let encrypted_info = self
-			.encryptor()?
-			.encrypt_content(&envelope_bytes, [], None)
-			.map_err(TransportError::from)?;
+	async fn send_envelope(&mut self, envelope: &TransportEnvelope, encrypt: bool) -> TransportResult<()> {
+		let wire_envelope = if encrypt {
+			let envelope_bytes = Self::encode_envelope(envelope)?;
+			let encrypted_info = self
+				.encryptor()?
+				.encrypt_content(&envelope_bytes, [], None)
+				.map_err(TransportError::from)?;
 
-		let encrypted_bytes = encrypted_info
+			WireEnvelope::Encrypted(encrypted_info)
+		} else {
+			WireEnvelope::Cleartext(envelope.clone())
+		};
+
+		let wire_bytes = wire_envelope
 			.to_der()
 			.map_err(crate::TightBeamError::from)
 			.map_err(TransportError::from)?;
 
-		self.write_envelope(&encrypted_bytes).await
+		self.write_envelope(&wire_bytes).await
+	}
+
+	/// Encrypt and write an envelope (legacy method, use send_envelope instead)
+	#[allow(async_fn_in_trait)]
+	async fn write_encrypted_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()> {
+		self.send_envelope(envelope, true).await
 	}
 }
 

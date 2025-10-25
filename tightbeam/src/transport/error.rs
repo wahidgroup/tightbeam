@@ -62,3 +62,31 @@ impl core::error::Error for TransportError {}
 
 #[cfg(all(feature = "std", not(feature = "derive")))]
 crate::impl_from!(std::io::Error => TransportError::IoError);
+#[cfg(not(feature = "derive"))]
+crate::impl_from!(der::Error => TransportError::DerError);
+
+crate::impl_from!(
+	spki::Error => TransportError::DerError extract spki::Error::Asn1(der_err) =>
+		der_err else der::Error::from(der::ErrorKind::Failed)
+);
+#[cfg(feature = "x509")]
+crate::impl_from!(
+	x509_cert::builder::Error => TransportError::DerError extract x509_cert::builder::Error::Asn1(der_err) =>
+		der_err else der::Error::from(der::ErrorKind::Failed)
+);
+
+// Wrap AddrParseError in IoError
+#[cfg(all(feature = "std", feature = "tcp"))]
+impl From<std::net::AddrParseError> for TransportError {
+	fn from(err: std::net::AddrParseError) -> Self {
+		TransportError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
+	}
+}
+
+// Wrap JoinError in IoError
+#[cfg(feature = "tokio")]
+impl From<tokio::task::JoinError> for TransportError {
+	fn from(err: tokio::task::JoinError) -> Self {
+		TransportError::IoError(std::io::Error::new(std::io::ErrorKind::Other, err))
+	}
+}
