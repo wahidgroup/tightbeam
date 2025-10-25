@@ -322,6 +322,7 @@ mod tests {
 		let mut transport = TcpTransport::from(TokioStream::from(stream));
 
 		let first = transport.emit(test_message.clone(), None).await;
+		println!("First attempt: {:?}", first);
 		assert!(matches!(first, Err(TransportError::Busy)));
 
 		transport.emit(test_message.clone(), None).await?;

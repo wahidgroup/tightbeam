@@ -20,6 +20,8 @@ pub enum TransportError {
 	Unauthorized,
 	#[cfg_attr(feature = "derive", error("Forbidden"))]
 	Forbidden,
+	#[cfg_attr(feature = "derive", error("Encryption required but not provided"))]
+	MissingEncryption,
 	#[cfg_attr(feature = "derive", error("Invalid message"))]
 	InvalidMessage,
 	#[cfg_attr(feature = "derive", error("Invalid reply"))]
@@ -28,6 +30,10 @@ pub enum TransportError {
 	MissingRequest,
 	#[cfg_attr(feature = "derive", error("Max retries exceeded"))]
 	MaxRetriesExceeded,
+	#[cfg(feature = "x509")]
+	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	HandshakeError(crate::transport::handshake::HandshakeError),
 	#[cfg_attr(feature = "derive", error("DER error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	DerError(der::Error),
@@ -64,6 +70,8 @@ impl core::error::Error for TransportError {}
 crate::impl_from!(std::io::Error => TransportError::IoError);
 #[cfg(not(feature = "derive"))]
 crate::impl_from!(der::Error => TransportError::DerError);
+#[cfg(all(feature = "x509", not(feature = "derive")))]
+crate::impl_from!(crate::transport::handshake::HandshakeError => TransportError::HandshakeError);
 
 crate::impl_from!(
 	spki::Error => TransportError::DerError extract spki::Error::Asn1(der_err) =>

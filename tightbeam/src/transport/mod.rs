@@ -6,6 +6,8 @@ use alloc::{boxed::Box, vec::Vec};
 
 #[cfg(feature = "x509")]
 use crate::crypto::aead::{Decryptor, Encryptor};
+#[cfg(feature = "x509")]
+use crate::transport::handshake::{ClientKeyExchange, ServerKeyExchange};
 #[cfg(feature = "derive")]
 use crate::Beamable;
 
@@ -196,6 +198,12 @@ pub enum TransportEnvelope {
 	Request(RequestPackage),
 	#[asn1(context_specific = "1", constructed = "true")]
 	Response(ResponsePackage),
+	#[cfg(feature = "x509")]
+	#[asn1(context_specific = "2", constructed = "true")]
+	ClientKeyExchange(ClientKeyExchange),
+	#[cfg(feature = "x509")]
+	#[asn1(context_specific = "3", constructed = "true")]
+	ServerKeyExchange(ServerKeyExchange),
 }
 
 /// Wire-level envelope that can be either cleartext or encrypted
@@ -378,7 +386,14 @@ where
 			.map_err(TransportError::from)?;
 
 		match wire_envelope {
-			WireEnvelope::Cleartext(transport_envelope) => Ok(transport_envelope),
+			WireEnvelope::Cleartext(transport_envelope) => {
+				// Check if server expects encryption but received cleartext
+				if self.decryptor().is_ok() {
+					// Server has encryption configured, reject cleartext
+					return Err(TransportError::MissingEncryption);
+				}
+				Ok(transport_envelope)
+			}
 			WireEnvelope::Encrypted(encrypted_info) => {
 				let decrypted_bytes = self
 					.decryptor()?
@@ -488,6 +503,11 @@ pub trait MessageEmitter: MessageIO {
 					// Only responses are valid here
 					return Err(TransportError::InvalidMessage);
 				}
+				#[cfg(feature = "x509")]
+				TransportEnvelope::ClientKeyExchange(_) | TransportEnvelope::ServerKeyExchange(_) => {
+					// Handshake messages not expected here
+					return Err(TransportError::InvalidMessage);
+				}
 			};
 
 			// Check transport status and handle response
@@ -544,6 +564,11 @@ pub trait MessageCollector: MessageIO {
 			TransportEnvelope::Request(msg) => msg.message,
 			TransportEnvelope::Response(_) => {
 				// Only requests are valid here
+				return Err(TransportError::InvalidMessage);
+			}
+			#[cfg(feature = "x509")]
+			TransportEnvelope::ClientKeyExchange(_) | TransportEnvelope::ServerKeyExchange(_) => {
+				// Handshake messages not expected here
 				return Err(TransportError::InvalidMessage);
 			}
 		};
