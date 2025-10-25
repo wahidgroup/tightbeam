@@ -246,6 +246,8 @@ mod tests {
 
 		use spki::SubjectPublicKeyInfoOwned;
 
+		use crate::der::Decode;
+		use crate::transport::WireEnvelope;
 		use crate::{prelude::TightBeamSocketAddr, transport::policy::PolicyConf};
 
 		struct BusyFirstGate {
@@ -293,6 +295,8 @@ mod tests {
 		let test_message = create_v0_tightbeam(None, None);
 
 		let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+		let (wire_tx, mut wire_rx) = tokio::sync::mpsc::channel(1);
+
 		let server_handle = tokio::spawn(async move {
 			let (stream, _) = server.accept().await?;
 			let mut transport = TcpTransport::from(stream)
@@ -302,7 +306,15 @@ mod tests {
 					Some(msg.clone())
 				}));
 
-			transport.collect().await.ok();
+			// Capture the raw wire envelope to verify encryption
+			let wire_bytes = transport.read_envelope().await?;
+			let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+			let _ = wire_tx.try_send(wire_envelope);
+
+			// Process the first message (should be Busy)
+			transport.send_response(TransitStatus::Busy, None).await?;
+
+			// Process second message normally
 			transport.collect().await
 		});
 
@@ -313,6 +325,15 @@ mod tests {
 		assert!(matches!(first, Err(TransportError::Busy)));
 
 		transport.emit(test_message.clone(), None).await?;
+
+		// Verify we received an encrypted wire envelope
+		let wire_envelope = wire_rx.recv().await;
+		assert!(wire_envelope.is_some(), "Should receive wire envelope");
+		if let Some(WireEnvelope::Encrypted(_)) = wire_envelope {
+			// Good - the frame was encrypted
+		} else {
+			panic!("Expected encrypted wire envelope, got cleartext");
+		}
 
 		let received = rx.recv().await;
 		assert_eq!(Some(test_message), received);

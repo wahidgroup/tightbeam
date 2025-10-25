@@ -30,6 +30,7 @@ use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 use crate::crypto::aead::{Aead, Aes256Gcm, KeyInit, Payload};
 use crate::crypto::kdf::{ecies_kdf_sha256, KdfError};
 use crate::zeroize::Zeroizing;
+use crate::ZeroizingBytes;
 
 /// KDF info parameter for domain separation and protocol versioning
 const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
@@ -77,13 +78,13 @@ pub trait EciesSecretKeyOps: Clone {
 		Self: Sized;
 
 	/// Serialize the secret key to bytes (zeroizing)
-	fn to_bytes(&self) -> Zeroizing<Vec<u8>>;
+	fn to_bytes(&self) -> ZeroizingBytes;
 
 	/// Get the corresponding public key
 	fn public_key(&self) -> Self::PublicKey;
 
 	/// Perform ECDH key agreement with a public key, returning raw shared secret bytes
-	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> Zeroizing<Vec<u8>>;
+	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> ZeroizingBytes;
 }
 
 /// Trait for ephemeral key generation in ECIES encryption
@@ -95,7 +96,7 @@ pub trait EciesEphemeral {
 	fn generate_ephemeral(
 		recipient_pubkey: &Self::PublicKey,
 		rng: &mut dyn rand_core::CryptoRngCore,
-	) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)>;
+	) -> Result<(Vec<u8>, ZeroizingBytes)>;
 }
 
 // ============================================================================
@@ -201,7 +202,7 @@ impl EciesSecretKeyOps for SecretKey {
 		SecretKey::from_slice(bytes.as_ref()).map_err(|_| EciesError::InvalidSecretKey)
 	}
 
-	fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+	fn to_bytes(&self) -> ZeroizingBytes {
 		Zeroizing::new(SecretKey::to_bytes(self).to_vec())
 	}
 
@@ -209,7 +210,7 @@ impl EciesSecretKeyOps for SecretKey {
 		SecretKey::public_key(self)
 	}
 
-	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> Zeroizing<Vec<u8>> {
+	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> ZeroizingBytes {
 		let shared_secret = k256::ecdh::diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
 		Zeroizing::new(shared_secret.raw_secret_bytes().to_vec())
 	}
@@ -221,7 +222,7 @@ impl EciesEphemeral for SecretKey {
 	fn generate_ephemeral(
 		recipient_pubkey: &Self::PublicKey,
 		rng: &mut dyn CryptoRngCore,
-	) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+	) -> Result<(Vec<u8>, ZeroizingBytes)> {
 		// Work around EphemeralSecret::random requiring Sized by using a wrapper
 		// that converts the trait object to a concrete type call
 		struct RngWrapper<'a>(&'a mut dyn CryptoRngCore);
@@ -389,7 +390,7 @@ pub fn decrypt<SK>(
 	recipient_seckey: &SK,
 	message: &EciesMessage,
 	associated_data: Option<&[u8]>,
-) -> Result<Zeroizing<Vec<u8>>>
+) -> Result<ZeroizingBytes>
 where
 	SK: EciesSecretKeyOps,
 {

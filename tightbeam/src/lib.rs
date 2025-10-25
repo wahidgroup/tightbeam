@@ -169,6 +169,9 @@ pub mod testing;
 #[cfg(feature = "builder")]
 tightbeam_derive::generate_builders!();
 
+/// Secure bytes type
+pub type ZeroizingBytes = zeroize::Zeroizing<Vec<u8>>;
+
 #[cfg(test)]
 mod tests {
 	use super::*;

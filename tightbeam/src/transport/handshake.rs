@@ -4,53 +4,49 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::cms::enveloped_data::EnvelopedData;
-use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
-use crate::der::{Decode, Encode, Enumerated};
-use crate::zeroize::Zeroizing;
+use crate::asn1::{ObjectIdentifier, OctetString};
+use crate::der::Sequence;
+use crate::Beamable;
 
-/// Handshake phase enumeration
-#[repr(u8)]
-#[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandshakePhase {
-	#[default]
-	ClientHello = 0,
-	ServerHello = 1,
-	ClientAck = 2,
-	ServerAck = 3,
+// ============================================================================
+// TLS 1.2 ServerKeyExchange / ClientKeyExchange (RFC 5246, RFC 5480)
+// ============================================================================
+
+/// ServerECDHParams - Elliptic Curve Diffie-Hellman parameters sent by server
+/// Per RFC 5246 Section 7.4.3 and RFC 5480 for EC parameters
+#[derive(Sequence, Debug, Clone, PartialEq)]
+pub struct ServerECDHParams {
+	/// Named curve OID (e.g., secp256k1)
+	pub curve: ObjectIdentifier,
+	/// Uncompressed EC point (server's public key)
+	/// Format: 0x04 || x || y (65 bytes for secp256k1)
+	pub public: OctetString,
 }
 
-/// Handshake message containing phase and encrypted payload
-#[derive(der::Sequence, Debug, Clone, PartialEq)]
-pub struct HandshakeMessage {
-	pub phase: HandshakePhase,
-	pub enveloped_data: EnvelopedData,
+/// ClientECDHParams - Client's Elliptic Curve Diffie-Hellman public key
+/// Per RFC 5246 Section 7.4.7
+#[derive(Sequence, Debug, Clone, PartialEq)]
+pub struct ClientECDHParams {
+	/// Uncompressed EC point (client's public key)
+	/// Format: 0x04 || x || y (65 bytes for secp256k1)
+	pub public: OctetString,
 }
 
-/// Session state tracking handshake progress
-#[derive(Debug, Default, Clone)]
-pub struct HandshakeState {
-	pub phase: HandshakePhase,
-	pub client_pubkey: Option<PublicKey>,
-	pub server_pubkey: Option<PublicKey>,
-	pub shared_key: Option<Zeroizing<Vec<u8>>>,
-	pub completed: bool,
+/// ServerKeyExchange message for ECDHE key exchange
+/// Per RFC 5246 Section 7.4.3
+#[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
+pub struct ServerKeyExchange {
+	/// ECDH parameters (curve + server public key)
+	pub params: ServerECDHParams,
+	/// Digital signature over (client_random || server_random || params)
+	/// Signature algorithm determined by server certificate
+	pub signature: OctetString,
 }
 
-impl HandshakeState {
-	/// Check if handshake is complete
-	pub fn is_complete(&self) -> bool {
-		self.completed
-	}
-
-	/// Get the shared key (only available after handshake completion)
-	pub fn shared_key(&self) -> Option<&[u8]> {
-		self.shared_key.as_deref().map(Vec::as_slice)
-	}
-}
-
-/// Handshake initiator (client-side)
-pub struct HandshakeClient {
-	secret_key: SecretKey,
-	state: HandshakeState,
+/// ClientKeyExchange message for ECDHE key exchange
+/// Per RFC 5246 Section 7.4.7
+#[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
+pub struct ClientKeyExchange {
+	/// Client's ECDH public key
+	pub params: ClientECDHParams,
 }
