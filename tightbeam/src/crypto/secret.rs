@@ -112,7 +112,8 @@ impl FromStr for SecretString {
 /// Convert a Secret into its raw underlying type (consumes the Secret).
 ///
 /// - For sized inner types `S`, `to_insecure()` returns `S` by value.
-/// - For dynamically sized inner types like `[T]` and `str`, it returns a `Box<[T]>` or `Box<str>`.
+/// - For dynamically sized inner types like `[T]` and `str`, it returns a
+///   `Box<[T]>` or `Box<str>`.
 pub trait ToInsecure {
 	type Raw;
 	fn to_insecure(self) -> Self::Raw;
@@ -161,18 +162,18 @@ mod tests {
 	#[test]
 	fn test_to_insecure_sized() {
 		let s: Secret<[u8; 2]> = Secret::from([1u8, 2u8]);
-		let raw = <Secret<[u8; 2]> as ToInsecure>::to_insecure(s);
+		let raw = s.to_insecure();
 		assert_eq!(raw, [1, 2]);
 	}
 
 	#[test]
 	fn test_to_insecure_dsts() {
 		let s: SecretString = SecretString::from("abc");
-		let raw: Box<str> = <SecretString as ToInsecure>::to_insecure(s);
+		let raw: Box<str> = s.to_insecure();
 		assert_eq!(&*raw, "abc");
 
 		let s2: SecretSlice<u8> = Vec::from([9u8, 8u8, 7u8]).into();
-		let raw2: Box<[u8]> = <SecretSlice<u8> as ToInsecure>::to_insecure(s2);
+		let raw2: Box<[u8]> = s2.to_insecure();
 		assert_eq!(&*raw2, &[9, 8, 7]);
 	}
 }

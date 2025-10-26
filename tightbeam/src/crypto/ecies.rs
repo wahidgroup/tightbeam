@@ -24,14 +24,24 @@
 //! 2. Compute shared secret: S = d·R (where d is recipient's private key)
 //! 3. Derive key: k_enc = KDF(C0, S)
 //! 4. Decrypt: plaintext = AEAD.Decrypt(k_enc, nonce, ciphertext, tag)
+//!
+//! # Security
+//!
+//! This implementation uses constant-time cryptographic primitives from RustCrypto:
+//! - ECDH operations (k256): constant-time scalar multiplication
+//! - AES-256-GCM: constant-time encryption and tag verification  
+//! - HKDF-SHA3-256: constant-time key derivation
 
 use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 
 use crate::asn1::ObjectIdentifier;
+
 use crate::crypto::aead::{Aead, Aes256Gcm, KeyInit, Payload};
 use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256, KdfError};
-use crate::zeroize::Zeroizing;
-use crate::ZeroizingBytes;
+use crate::crypto::secret::{Secret, SecretSlice, ToInsecure};
+use crate::crypto::sign::ecdsa::k256::ecdh::EphemeralSecret;
+use crate::crypto::sign::ecdsa::k256::elliptic_curve::sec1::ToEncodedPoint;
+use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
 
 /// KDF info parameter for domain separation and protocol versioning
 const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
@@ -68,19 +78,11 @@ pub trait EciesSecretKeyOps: Clone {
 	/// Generate a new random secret key
 	fn random<R: CryptoRng + RngCore>(rng: &mut R) -> Self;
 
-	/// Deserialize a secret key from bytes
-	fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self>
-	where
-		Self: Sized;
-
-	/// Serialize the secret key to bytes (zeroizing)
-	fn to_bytes(&self) -> ZeroizingBytes;
-
 	/// Get the corresponding public key
 	fn public_key(&self) -> Self::PublicKey;
 
 	/// Perform ECDH key agreement with a public key, returning raw shared secret bytes
-	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> ZeroizingBytes;
+	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> SecretSlice<u8>;
 }
 
 /// Trait for ephemeral key generation in ECIES encryption
@@ -92,14 +94,12 @@ pub trait EciesEphemeral {
 	fn generate_ephemeral(
 		recipient_pubkey: &Self::PublicKey,
 		rng: &mut dyn rand_core::CryptoRngCore,
-	) -> Result<(Vec<u8>, ZeroizingBytes)>;
+	) -> Result<(Vec<u8>, SecretSlice<u8>)>;
 }
 
 // ============================================================================
 // secp256k1 Implementation
 // ============================================================================
-
-use k256::{ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint, PublicKey, SecretKey};
 
 #[cfg(feature = "derive")]
 use crate::Errorizable;
@@ -108,28 +108,29 @@ use crate::Errorizable;
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug, Clone)]
 pub enum EciesError {
-	/// Invalid public key
-	#[cfg_attr(feature = "derive", error("Invalid ECIES public key"))]
-	InvalidPublicKey,
-
-	/// Invalid secret key
-	#[cfg_attr(feature = "derive", error("Invalid ECIES secret key"))]
-	InvalidSecretKey,
-
 	/// Invalid ciphertext format
 	#[cfg_attr(feature = "derive", error("Invalid ECIES ciphertext format"))]
 	InvalidCiphertext,
 
+	/// Invalid public key
+	#[cfg_attr(feature = "derive", error("Invalid ECIES public key: {0}"))]
+	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
+
+	/// Invalid secret key
+	#[cfg_attr(feature = "derive", error("Invalid ECIES secret key: {0}"))]
+	InvalidSecretKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
+
 	/// Encryption failed
-	#[cfg_attr(feature = "derive", error("ECIES encryption failed"))]
-	EncryptionFailed,
+	#[cfg_attr(feature = "derive", error("ECIES encryption failed: {0}"))]
+	EncryptionFailed(crate::crypto::aead::Error),
 
 	/// Decryption failed
-	#[cfg_attr(feature = "derive", error("ECIES decryption failed"))]
-	DecryptionFailed,
+	#[cfg_attr(feature = "derive", error("ECIES decryption failed: {0}"))]
+	DecryptionFailed(crate::crypto::aead::Error),
 
 	/// Key derivation failed
 	#[cfg_attr(feature = "derive", error("ECIES key derivation failed: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
 	Kdf(#[cfg_attr(feature = "derive", from)] KdfError),
 }
 
@@ -137,11 +138,11 @@ pub enum EciesError {
 impl core::fmt::Display for EciesError {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
-			EciesError::InvalidPublicKey => write!(f, "Invalid ECIES public key"),
-			EciesError::InvalidSecretKey => write!(f, "Invalid ECIES secret key"),
+			EciesError::InvalidPublicKey(e) => write!(f, "Invalid ECIES public key: {}", e),
+			EciesError::InvalidSecretKey(e) => write!(f, "Invalid ECIES secret key: {}", e),
 			EciesError::InvalidCiphertext => write!(f, "Invalid ECIES ciphertext format"),
-			EciesError::EncryptionFailed => write!(f, "ECIES encryption failed"),
-			EciesError::DecryptionFailed => write!(f, "ECIES decryption failed"),
+			EciesError::EncryptionFailed(e) => write!(f, "ECIES encryption failed: {}", e),
+			EciesError::DecryptionFailed(e) => write!(f, "ECIES decryption failed: {}", e),
 			EciesError::Kdf(e) => write!(f, "ECIES key derivation failed: {}", e),
 		}
 	}
@@ -151,6 +152,10 @@ impl core::fmt::Display for EciesError {
 impl core::error::Error for EciesError {
 	fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
 		match self {
+			EciesError::InvalidPublicKey(e) => Some(e),
+			EciesError::InvalidSecretKey(e) => Some(e),
+			EciesError::EncryptionFailed(e) => Some(e),
+			EciesError::DecryptionFailed(e) => Some(e),
 			EciesError::Kdf(e) => Some(e),
 			_ => None,
 		}
@@ -159,12 +164,6 @@ impl core::error::Error for EciesError {
 
 /// A specialized Result type for ECIES operations
 pub type Result<T> = core::result::Result<T, EciesError>;
-
-impl From<KdfError> for EciesError {
-	fn from(e: KdfError) -> Self {
-		EciesError::Kdf(e)
-	}
-}
 
 // ============================================================================
 // Trait implementations for k256 types (secp256k1)
@@ -176,7 +175,7 @@ impl EciesPublicKeyOps for PublicKey {
 	const PUBLIC_KEY_SIZE: usize = 33;
 
 	fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
-		PublicKey::from_sec1_bytes(bytes.as_ref()).map_err(|_| EciesError::InvalidPublicKey)
+		PublicKey::from_sec1_bytes(bytes.as_ref()).map_err(EciesError::InvalidPublicKey)
 	}
 
 	fn to_bytes(&self) -> Vec<u8> {
@@ -194,21 +193,30 @@ impl EciesSecretKeyOps for SecretKey {
 		SecretKey::random(rng)
 	}
 
-	fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
-		SecretKey::from_slice(bytes.as_ref()).map_err(|_| EciesError::InvalidSecretKey)
-	}
-
-	fn to_bytes(&self) -> ZeroizingBytes {
-		Zeroizing::new(SecretKey::to_bytes(self).to_vec())
-	}
-
 	fn public_key(&self) -> Self::PublicKey {
 		SecretKey::public_key(self)
 	}
 
-	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> ZeroizingBytes {
+	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> SecretSlice<u8> {
 		let shared_secret = k256::ecdh::diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
-		Zeroizing::new(shared_secret.raw_secret_bytes().to_vec())
+		let v = shared_secret.raw_secret_bytes().to_vec().into_boxed_slice();
+		Secret::from(v)
+	}
+}
+
+impl core::convert::TryFrom<SecretSlice<u8>> for SecretKey {
+	type Error = EciesError;
+	fn try_from(bytes: SecretSlice<u8>) -> Result<Self> {
+		use crate::crypto::secret::ToInsecure;
+		let raw = bytes.to_insecure();
+		SecretKey::from_slice(&raw).map_err(EciesError::InvalidSecretKey)
+	}
+}
+
+impl From<&SecretKey> for SecretSlice<u8> {
+	fn from(sk: &SecretKey) -> Self {
+		let v = SecretKey::to_bytes(sk).to_vec();
+		Secret::from(v.into_boxed_slice())
 	}
 }
 
@@ -218,7 +226,7 @@ impl EciesEphemeral for SecretKey {
 	fn generate_ephemeral(
 		recipient_pubkey: &Self::PublicKey,
 		rng: &mut dyn CryptoRngCore,
-	) -> Result<(Vec<u8>, ZeroizingBytes)> {
+	) -> Result<(Vec<u8>, SecretSlice<u8>)> {
 		// Work around EphemeralSecret::random requiring Sized by using a wrapper
 		// that converts the trait object to a concrete type call
 		struct RngWrapper<'a>(&'a mut dyn CryptoRngCore);
@@ -252,38 +260,54 @@ impl EciesEphemeral for SecretKey {
 
 		let ephemeral_point = ephemeral_pubkey.to_encoded_point(true);
 		let ephemeral_bytes = ephemeral_point.as_bytes().to_vec();
-		let shared_bytes = Zeroizing::new(shared_secret.raw_secret_bytes().to_vec());
+		let shared_bytes = Secret::from(shared_secret.raw_secret_bytes().to_vec().into_boxed_slice());
 		Ok((ephemeral_bytes, shared_bytes))
 	}
 }
 
-/// ECIES encrypted message format: [ephemeral_pubkey || nonce || ciphertext || tag]
+/// Trait for ECIES encrypted messages with curve-specific sizes
+pub trait EciesMessageOps: Sized {
+	/// Size of the ephemeral public key in bytes (curve-specific)
+	const PUBKEY_SIZE: usize;
+
+	/// Parse from wire format: [ephemeral_pubkey || ciphertext_with_tag]
+	fn from_bytes(bytes: &[u8]) -> Result<Self>;
+
+	/// Get ephemeral public key bytes
+	fn ephemeral_pubkey(&self) -> &[u8];
+
+	/// Get ciphertext bytes (nonce || encrypted_data || tag)
+	fn ciphertext(&self) -> &[u8];
+}
+
+/// ECIES encrypted message for secp256k1 curve
 ///
 /// The wire format consists of:
 /// - `ephemeral_pubkey`: 33 bytes (compressed secp256k1 public key)
 /// - `nonce`: 12 bytes (AES-GCM nonce)
 /// - `ciphertext`: variable length (encrypted plaintext)
 /// - `tag`: 16 bytes (AES-GCM authentication tag, appended to ciphertext)
-pub struct EciesMessage {
-	/// Ephemeral public key (serialized, 33 bytes for compressed secp256k1)
+pub struct Secp256k1EciesMessage {
+	/// Ephemeral public key (serialized, 33 bytes)
 	pub ephemeral_pubkey: Vec<u8>,
 	/// Nonce + encrypted data + authentication tag (12 + len(plaintext) + 16 bytes)
 	pub ciphertext: Vec<u8>,
 }
 
-impl EciesMessage {
+impl Secp256k1EciesMessage {
+	/// Minimum ciphertext size (nonce + tag)
+	const MIN_CIPHERTEXT_SIZE: usize = 12 + 16;
+
 	/// Parse from wire format: [ephemeral_pubkey || ciphertext_with_tag]
-	///
-	/// For secp256k1, ephemeral_pubkey is 33 bytes (compressed SEC1)
 	pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
 		let bytes = bytes.as_ref();
-		if bytes.len() < 33 + 12 + 16 {
+		if bytes.len() < 33 + Self::MIN_CIPHERTEXT_SIZE {
 			return Err(EciesError::InvalidCiphertext);
 		}
 
 		let ephemeral_pubkey = bytes[0..33].to_vec();
 		let ciphertext = bytes[33..].to_vec();
-		if ciphertext.len() < 12 + 16 {
+		if ciphertext.len() < Self::MIN_CIPHERTEXT_SIZE {
 			return Err(EciesError::InvalidCiphertext);
 		}
 
@@ -296,6 +320,22 @@ impl EciesMessage {
 		bytes.extend_from_slice(&self.ephemeral_pubkey);
 		bytes.extend_from_slice(&self.ciphertext);
 		bytes
+	}
+}
+
+impl EciesMessageOps for Secp256k1EciesMessage {
+	const PUBKEY_SIZE: usize = 33;
+
+	fn from_bytes(bytes: &[u8]) -> Result<Self> {
+		Self::from_bytes(bytes)
+	}
+
+	fn ephemeral_pubkey(&self) -> &[u8] {
+		&self.ephemeral_pubkey
+	}
+
+	fn ciphertext(&self) -> &[u8] {
+		&self.ciphertext
 	}
 }
 
@@ -314,28 +354,19 @@ impl EciesMessage {
 /// * `PK` - Public key type implementing EciesPublicKeyOps
 /// * `P` - Plaintext type that can be converted to bytes
 /// * `R` - Random number generator type (optional, defaults to OsRng)
-///
-/// # Examples
-///
-/// ```ignore
-/// // Using default OsRng
-/// let encrypted = encrypt(&public_key, plaintext, None, None)?;
-///
-/// // Using custom RNG for testing
-/// let mut rng = test_rng();
-/// let encrypted = encrypt(&public_key, plaintext, None, Some(&mut rng))?;
-/// ```
-pub fn encrypt<PK, P, R>(
+/// * `M` - Message type implementing EciesMessageOps
+pub fn encrypt<PK, P, R, M>(
 	recipient_pubkey: &PK,
 	plaintext: P,
 	associated_data: Option<&[u8]>,
 	rng: Option<&mut R>,
-) -> Result<EciesMessage>
+) -> Result<M>
 where
 	PK: EciesPublicKeyOps,
 	PK::SecretKey: EciesEphemeral<PublicKey = PK>,
 	P: AsRef<[u8]>,
 	R: CryptoRng + RngCore,
+	M: EciesMessageOps,
 {
 	let plaintext = plaintext.as_ref();
 
@@ -346,7 +377,8 @@ where
 			let (ephemeral_bytes, shared_secret) = PK::SecretKey::generate_ephemeral(recipient_pubkey, $rng)?;
 
 			// Derive encryption key using KDF (includes C0 for non-malleability)
-			let k_enc = ecies_kdf::<HkdfSha3_256>(&ephemeral_bytes, &shared_secret, ECIES_KDF_INFO, None)?;
+			let k_enc =
+				ecies_kdf::<HkdfSha3_256>(&ephemeral_bytes, &shared_secret.to_insecure(), ECIES_KDF_INFO, None)?;
 
 			// Encrypt using AES-256-GCM
 			let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
@@ -364,14 +396,16 @@ where
 			};
 
 			// Encrypt (produces ciphertext || tag)
-			let mut ciphertext = cipher.encrypt(&nonce, payload).map_err(|_| EciesError::EncryptionFailed)?;
+			let mut ciphertext = cipher.encrypt(&nonce, payload).map_err(EciesError::EncryptionFailed)?;
 
 			// Prepend nonce to ciphertext (for transmission)
 			let mut final_ciphertext = Vec::with_capacity(12 + ciphertext.len());
 			final_ciphertext.extend_from_slice(&nonce_bytes);
 			final_ciphertext.append(&mut ciphertext);
 
-			Ok(EciesMessage { ephemeral_pubkey: ephemeral_bytes, ciphertext: final_ciphertext })
+			// Construct message from concatenated bytes
+			let wire_bytes = [ephemeral_bytes.as_slice(), final_ciphertext.as_slice()].concat();
+			M::from_bytes(&wire_bytes)
 		}};
 	}
 
@@ -382,28 +416,28 @@ where
 	}
 }
 
-pub fn decrypt<SK>(
-	recipient_seckey: &SK,
-	message: &EciesMessage,
-	associated_data: Option<&[u8]>,
-) -> Result<ZeroizingBytes>
+pub fn decrypt<SK, M>(recipient_seckey: &SK, message: &M, associated_data: Option<&[u8]>) -> Result<SecretSlice<u8>>
 where
 	SK: EciesSecretKeyOps,
+	M: EciesMessageOps,
 {
 	// 1. Parse ephemeral public key
-	let ephemeral_pubkey = <SK::PublicKey as EciesPublicKeyOps>::from_bytes(&message.ephemeral_pubkey)?;
+	let ephemeral_pubkey = <SK::PublicKey as EciesPublicKeyOps>::from_bytes(message.ephemeral_pubkey())?;
 	// 2. Perform ECDH to get shared secret
 	let shared_secret = recipient_seckey.diffie_hellman(&ephemeral_pubkey);
 	// 3. Derive encryption key using KDF (includes C0 for non-malleability)
 	// Uses SHA3-256 with protocol versioning via info parameter
 	// Derives 32-byte key for AES-256-GCM authenticated encryption
-	let k_enc = ecies_kdf::<HkdfSha3_256>(&message.ephemeral_pubkey, &shared_secret, ECIES_KDF_INFO, None)?;
+	let k_enc =
+		ecies_kdf::<HkdfSha3_256>(message.ephemeral_pubkey(), &shared_secret.to_insecure(), ECIES_KDF_INFO, None)?;
+
 	// 4. Extract nonce and ciphertext
-	if message.ciphertext.len() < 12 + 16 {
+	let ciphertext_bytes = message.ciphertext();
+	if ciphertext_bytes.len() < 12 + 16 {
 		return Err(EciesError::InvalidCiphertext);
 	}
-	let nonce = crate::crypto::utils::nonce_from_slice::<Aes256Gcm>(&message.ciphertext[0..12]);
-	let ciphertext_with_tag = &message.ciphertext[12..];
+	let nonce = crate::crypto::utils::nonce_from_slice::<Aes256Gcm>(&ciphertext_bytes[0..12]);
+	let ciphertext_with_tag = &ciphertext_bytes[12..];
 
 	// 5. Decrypt using AES-256-GCM
 	let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
@@ -416,9 +450,8 @@ where
 	};
 
 	// Decrypt and verify tag
-	let plaintext = cipher.decrypt(&nonce, payload).map_err(|_| EciesError::DecryptionFailed)?;
-
-	Ok(Zeroizing::new(plaintext))
+	let plaintext = cipher.decrypt(&nonce, payload).map_err(EciesError::DecryptionFailed)?;
+	Ok(Secret::from(plaintext.into_boxed_slice()))
 }
 
 /// OID wrapper for ECIES with secp256k1
@@ -446,9 +479,9 @@ mod tests {
 	// Helper for encryption roundtrip
 	fn roundtrip(plaintext: &[u8], aad: Option<&[u8]>) -> Result<()> {
 		let (secret, public) = keypair();
-		let encrypted = encrypt(&public, plaintext, aad, None::<&mut OsRng>)?;
+		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, aad, None::<&mut OsRng>)?;
 		let decrypted = decrypt(&secret, &encrypted, aad)?;
-		assert_eq!(plaintext, &decrypted[..]);
+		assert_eq!(plaintext, &decrypted.to_insecure()[..]);
 		Ok(())
 	}
 
@@ -480,8 +513,8 @@ mod tests {
 		let correct_aad = b"authenticated data";
 
 		// Test with explicit RNG to verify RNG parameter works
-		let encrypted = encrypt(&public, plaintext, Some(correct_aad), Some(&mut rng))?;
-
+		let encrypted =
+			encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, Some(correct_aad), Some(&mut rng))?;
 		// Test cases: (aad, should_succeed)
 		let cases = [
 			(Some(&correct_aad[..]), true),
@@ -494,7 +527,7 @@ mod tests {
 			let result = decrypt(&secret, &encrypted, aad);
 			assert_eq!(result.is_ok(), should_succeed);
 			if should_succeed {
-				assert_eq!(&plaintext[..], &result?[..]);
+				assert_eq!(&plaintext[..], &result?.to_insecure()[..]);
 			}
 		}
 
@@ -507,27 +540,21 @@ mod tests {
 		let plaintext = b"Test serialization";
 
 		// Message serialization roundtrip
-		let encrypted = encrypt(&public, plaintext, None, None::<&mut OsRng>)?;
+		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, None, None::<&mut OsRng>)?;
 		let bytes = encrypted.to_bytes();
-		let parsed = EciesMessage::from_bytes(&bytes)?;
+		let parsed = Secp256k1EciesMessage::from_bytes(&bytes)?;
 		let decrypted = decrypt(&secret, &parsed, None)?;
-		assert_eq!(&plaintext[..], &decrypted[..]);
+		assert_eq!(&plaintext[..], &decrypted.to_insecure()[..]);
 
 		// Key serialization roundtrip using traits
-		let secret_bytes = <SecretKey as EciesSecretKeyOps>::to_bytes(&secret);
-		let public_bytes = <PublicKey as EciesPublicKeyOps>::to_bytes(&public);
+		let secret_bytes: SecretSlice<u8> = (&secret).into();
+		let public_bytes = public.to_bytes();
 
-		let secret2 = <SecretKey as EciesSecretKeyOps>::from_bytes(&secret_bytes)?;
-		let public2 = <PublicKey as EciesPublicKeyOps>::from_bytes(&public_bytes)?;
+		let secret2 = SecretKey::try_from(secret_bytes)?;
+		let public2 = PublicKey::from_bytes(&public_bytes)?;
 
-		assert_eq!(
-			<PublicKey as EciesPublicKeyOps>::to_bytes(&public),
-			<PublicKey as EciesPublicKeyOps>::to_bytes(&public2)
-		);
-		assert_eq!(
-			<PublicKey as EciesPublicKeyOps>::to_bytes(&secret.public_key()),
-			<PublicKey as EciesPublicKeyOps>::to_bytes(&secret2.public_key())
-		);
+		assert_eq!(public.to_bytes(), public2.to_bytes());
+		assert_eq!(secret.public_key().to_bytes(), secret2.public_key().to_bytes());
 
 		Ok(())
 	}
@@ -540,17 +567,17 @@ mod tests {
 		let (_, public1) = keypair();
 		let (secret2, _) = keypair();
 
-		let encrypted = encrypt(&public1, plaintext, None, None::<&mut OsRng>)?;
+		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage>(&public1, plaintext, None, None::<&mut OsRng>)?;
 		let result = decrypt(&secret2, &encrypted, None);
 
 		if let Ok(decrypted) = result {
-			assert_ne!(&plaintext[..], &decrypted[..]);
+			assert_ne!(&plaintext[..], &decrypted.to_insecure()[..]);
 		}
 
 		// Tampered ciphertext should fail authentication
 		let (secret, public) = keypair();
 
-		let tamper_functions: [fn(&mut EciesMessage); 4] = [
+		let tamper_functions: [fn(&mut Secp256k1EciesMessage); 4] = [
 			|msg| {
 				if let Some(byte) = msg.ciphertext.last_mut() {
 					*byte ^= 0xFF;
@@ -572,7 +599,8 @@ mod tests {
 		];
 
 		for tamper_fn in tamper_functions {
-			let mut encrypted = encrypt(&public, plaintext, None, None::<&mut OsRng>)?;
+			let mut encrypted =
+				encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, None, None::<&mut OsRng>)?;
 			tamper_fn(&mut encrypted);
 			assert!(decrypt(&secret, &encrypted, None).is_err());
 		}
@@ -591,12 +619,12 @@ mod tests {
 		];
 
 		for data in invalid_ciphertexts {
-			assert!(EciesMessage::from_bytes(&data).is_err());
+			assert!(Secp256k1EciesMessage::from_bytes(&data).is_err());
 		}
 
 		// Invalid key formats
-		assert!(<PublicKey as EciesPublicKeyOps>::from_bytes([0xFFu8; 33]).is_err());
-		assert!(<SecretKey as EciesSecretKeyOps>::from_bytes([0x00u8; 32]).is_err());
+		assert!(PublicKey::from_bytes([0xFFu8; 33]).is_err());
+		assert!(SecretKey::try_from(Secret::from(vec![0x00u8; 32].into_boxed_slice())).is_err());
 
 		Ok(())
 	}

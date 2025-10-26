@@ -15,6 +15,7 @@ mod error;
 pub use error::HandshakeError;
 
 use crate::asn1::OctetString;
+use crate::crypto::secret::ToInsecure;
 use crate::der::Sequence;
 use crate::transport::error::TransportError;
 use crate::Beamable;
@@ -37,9 +38,9 @@ pub trait ServerHandshakeKey: Send + Sync {
 	/// Decrypt ECIES message produced by the client key exchange
 	fn decrypt_ecies(
 		&self,
-		msg: &crate::crypto::ecies::EciesMessage,
+		msg: &crate::crypto::ecies::Secp256k1EciesMessage,
 		aad: Option<&[u8]>,
-	) -> core::result::Result<crate::ZeroizingBytes, crate::crypto::ecies::EciesError>;
+	) -> core::result::Result<crate::crypto::secret::Secret<[u8]>, crate::crypto::ecies::EciesError>;
 }
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
@@ -53,13 +54,13 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 
 	fn decrypt_ecies(
 		&self,
-		msg: &crate::crypto::ecies::EciesMessage,
+		msg: &crate::crypto::ecies::Secp256k1EciesMessage,
 		aad: Option<&[u8]>,
-	) -> core::result::Result<crate::ZeroizingBytes, crate::crypto::ecies::EciesError> {
+	) -> core::result::Result<crate::crypto::secret::Secret<[u8]>, crate::crypto::ecies::EciesError> {
 		use crate::crypto::ecies::decrypt;
 		let scalar = self.as_nonzero_scalar();
 		let sk = k256::SecretKey::from(scalar);
-		decrypt::<k256::SecretKey>(&sk, msg, aad)
+		decrypt(&sk, msg, aad)
 	}
 }
 
@@ -430,7 +431,7 @@ mod tightbeam_handshake {
 			)
 			.map_err(|_| HandshakeError::InvalidPublicKey)?;
 
-			let encrypted_message = encrypt(
+			let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
 				&server_pubkey,
 				&plaintext,
 				self.aad_domain_tag.as_deref(),
@@ -530,7 +531,7 @@ mod tightbeam_handshake {
 				TransportEnvelope::ClientKeyExchange(client_kex) => {
 					// Parse ECIES message from encrypted_data
 					let encrypted_bytes = client_kex.encrypted_data.as_bytes();
-					let encrypted_message = crate::crypto::ecies::EciesMessage::from_bytes(encrypted_bytes)
+					let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)
 						.map_err(|_| HandshakeError::ProtocolError("Invalid ECIES message".into()))?;
 
 					// Decrypt using configured server key
@@ -541,6 +542,9 @@ mod tightbeam_handshake {
 					let decrypted = server_key
 						.decrypt_ecies(&encrypted_message, self.aad_domain_tag.as_deref())
 						.map_err(|_| HandshakeError::ProtocolError("ECIES decryption failed".into()))?;
+
+					// Consume the secret to get the raw bytes for parsing
+					let decrypted = decrypted.to_insecure();
 
 					// Extract base_key and client_random
 					if decrypted.len() != 64 {
