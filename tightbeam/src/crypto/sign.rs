@@ -1,6 +1,6 @@
 pub mod ecdsa {
 	pub use ecdsa::der;
-	pub use ecdsa::{Signature, SigningKey, VerifyingKey};
+	pub use ecdsa::{Error, Signature, SigningKey, VerifyingKey};
 
 	#[cfg(feature = "secp256k1")]
 	pub use k256;

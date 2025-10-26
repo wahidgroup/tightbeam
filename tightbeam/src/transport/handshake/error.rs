@@ -3,7 +3,7 @@ use crate::Errorizable;
 
 /// Errors specific to handshake operations
 #[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum HandshakeError {
 	/// Invalid client key exchange message
 	#[cfg_attr(feature = "derive", error("Invalid client key exchange message"))]
@@ -31,6 +31,11 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", from)]
 	KeyDerivationFailed(crate::crypto::aead::Error),
 
+	/// ECDSA error
+	#[cfg_attr(feature = "derive", error("ECDSA error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	EcdsaError(crate::crypto::sign::ecdsa::Error),
+
 	/// Invalid handshake state
 	#[cfg_attr(feature = "derive", error("Invalid handshake state"))]
 	InvalidState,
@@ -52,6 +57,7 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::InvalidServerKeyExchange => write!(f, "Invalid server key exchange message"),
 			HandshakeError::InvalidPublicKey(e) => write!(f, "Invalid public key in handshake: {}", e),
 			HandshakeError::InvalidCertificate => write!(f, "Invalid certificate"),
+			HandshakeError::EcdsaError(e) => write!(f, "ECDSA error: {}", e),
 			HandshakeError::SignatureVerificationFailed => write!(f, "Handshake signature verification failed"),
 			HandshakeError::KeyDerivationFailed(e) => write!(f, "Handshake key derivation failed: {}", e),
 			HandshakeError::InvalidState => write!(f, "Invalid handshake state"),

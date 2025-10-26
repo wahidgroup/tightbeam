@@ -56,7 +56,7 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 	fn sign_server_challenge(&self, msg: &[u8; 32]) -> core::result::Result<Vec<u8>, HandshakeError> {
 		use crate::crypto::sign::ecdsa::Secp256k1Signature;
 		use crate::crypto::sign::Signer;
-		let sig: Secp256k1Signature = self.try_sign(msg).map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+		let sig: Secp256k1Signature = self.try_sign(msg)?;
 		Ok(sig.to_bytes().to_vec())
 	}
 
@@ -216,17 +216,17 @@ pub struct ClientKeyExchange {
 
 /// Helper for encoding transport envelopes with error conversion
 fn encode_envelope(envelope: TransportEnvelope) -> Result<Vec<u8>, TransportError> {
-	envelope.to_der().map_err(TransportError::DerError)
+	Ok(envelope.to_der()?)
 }
 
 /// Helper for decoding transport envelopes with error conversion
 fn decode_envelope(bytes: &[u8]) -> Result<TransportEnvelope, TransportError> {
-	TransportEnvelope::from_der(bytes).map_err(TransportError::DerError)
+	Ok(TransportEnvelope::from_der(bytes)?)
 }
 
 /// Helper for generating random nonces with error conversion
 fn generate_random_nonce() -> Result<[u8; 32], HandshakeError> {
-	generate_nonce::<32>(None).map_err(HandshakeError::from)
+	Ok(generate_nonce::<32>(None)?)
 }
 
 /// Helper for converting octet strings to fixed-size arrays
@@ -274,11 +274,10 @@ fn verify_server_signature(
 	digest: &[u8; 32],
 	signature_bytes: &[u8],
 ) -> Result<(), HandshakeError> {
-	let signature =
-		Secp256k1Signature::try_from(signature_bytes).map_err(|_| HandshakeError::SignatureVerificationFailed)?;
-	verifying_key
-		.verify(digest, &signature)
-		.map_err(|_| HandshakeError::SignatureVerificationFailed)
+	let signature = Secp256k1Signature::try_from(signature_bytes)?;
+	verifying_key.verify(digest, &signature)?;
+
+	Ok(())
 }
 
 /// Perform ECIES encryption of base_key || client_random using server's certificate
@@ -300,8 +299,7 @@ fn perform_ecies_encryption(
 			.subject_public_key_info
 			.subject_public_key
 			.raw_bytes(),
-	)
-	.map_err(HandshakeError::from)?;
+	)?;
 
 	let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
 		&server_pubkey,
@@ -407,9 +405,8 @@ impl TightBeamHandshake {
 
 		// Derive final key using HKDF
 		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, b"tightbeam-session-v1", Some(&salt))?;
-
 		// Create AES-256-GCM cipher from derived key
-		Aes256Gcm::new_from_slice(&final_key_bytes[..]).map_err(HandshakeError::from)
+		Ok(Aes256Gcm::new_from_slice(&final_key_bytes[..])?)
 	}
 	fn extract_verifying_key(cert: &Certificate) -> Result<Secp256k1VerifyingKey, HandshakeError> {
 		let spki = &cert.tbs_certificate.subject_public_key_info;
@@ -491,17 +488,14 @@ impl HandshakeProtocol for TightBeamHandshake {
 		)?;
 
 		// Create ClientKeyExchange
-		let client_kex = ClientKeyExchange {
-			encrypted_data: OctetString::new(encrypted_bytes).map_err(|_| HandshakeError::InvalidClientKeyExchange)?,
-		};
+		let client_kex = ClientKeyExchange { encrypted_data: OctetString::new(encrypted_bytes)? };
 
 		// Encode and store for transport layer to send
 		let envelope = TransportEnvelope::ClientKeyExchange(client_kex);
 		self.pending_client_kex = Some(encode_envelope(envelope)?);
 
 		// Derive final session key (we'll use it after receiving ServerHandshake confirmation)
-		self.derive_final_session_key(&base_key, &client_random, &server_random)
-			.map_err(Into::into)
+		Ok(self.derive_final_session_key(&base_key, &client_random, &server_random)?)
 	}
 
 	async fn handle_client_request(&mut self, request: &[u8]) -> Result<Vec<u8>, Self::Error> {
@@ -582,9 +576,7 @@ impl HandshakeProtocol for TightBeamHandshake {
 			.as_ref()
 			.ok_or_else(|| HandshakeError::ProtocolError("No server random".into()))?;
 
-		let final_key: Aes256Gcm = self
-			.derive_final_session_key(base_key, client_random, server_random)
-			.map_err(|e| TransportError::from(e))?;
+		let final_key: Aes256Gcm = self.derive_final_session_key(base_key, client_random, server_random)?;
 
 		// Zeroize sensitive material after deriving key
 		if let Some(mut bk) = self.base_session_key.take() {
@@ -643,18 +635,14 @@ impl TightBeamHandshake {
 		// Record transcript hash for channel binding AAD
 		self.transcript_hash = Some(digest);
 
-		let sig_bytes = server_key
-			.sign_server_challenge(&digest)
-			.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
-		let signature = Secp256k1Signature::try_from(sig_bytes.as_slice())
-			.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+		let sig_bytes = server_key.sign_server_challenge(&digest)?;
+		let signature = Secp256k1Signature::try_from(sig_bytes.as_slice())?;
 
 		// Create ServerHandshake
 		let server_handshake = ServerHandshake {
 			certificate: self.server_cert.clone().ok_or_else(|| HandshakeError::InvalidCertificate)?,
-			server_random: OctetString::new(&server_random).map_err(|_| HandshakeError::InvalidServerKeyExchange)?,
-			signature: OctetString::new(signature.to_bytes().as_slice())
-				.map_err(|_| HandshakeError::SignatureVerificationFailed)?,
+			server_random: OctetString::new(&server_random)?,
+			signature: OctetString::new(signature.to_bytes().as_slice())?,
 		};
 
 		// Encode as TransportEnvelope

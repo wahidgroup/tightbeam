@@ -98,3 +98,11 @@ impl From<tokio::task::JoinError> for TransportError {
 		TransportError::IoError(std::io::Error::new(std::io::ErrorKind::Other, err))
 	}
 }
+
+// Convert ecdsa::Error through HandshakeError
+#[cfg(all(feature = "x509", feature = "secp256k1"))]
+impl From<k256::ecdsa::Error> for TransportError {
+	fn from(err: k256::ecdsa::Error) -> Self {
+		TransportError::HandshakeError(crate::transport::handshake::HandshakeError::from(err))
+	}
+}
