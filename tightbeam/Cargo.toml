@@ -27,6 +27,7 @@ pkcs12 = { workspace = true }
 x509-cert = { workspace = true, optional = true }
 hex-literal = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
+elliptic-curve = { workspace = true }
 crypto-common = { workspace = true, optional = true }
 aead = { workspace = true, optional = true }
 signature = { workspace = true, optional = true }

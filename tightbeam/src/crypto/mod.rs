@@ -1,5 +1,7 @@
 mod utils;
 
+pub mod secret;
+
 #[cfg(feature = "aead")]
 pub mod aead;
 #[cfg(feature = "ecies")]

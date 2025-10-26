@@ -16,6 +16,7 @@ words:
   - Decryptor
   - DHAES
   - diffie
+  - dsts
   - ECDH
   - ecies
   - econtent
@@ -44,6 +45,7 @@ words:
   - rsadsi
   - rwlock
   - schnorr
+  - SECG
   - seckey
   - Secp
   - smime
@@ -52,4 +54,5 @@ words:
   - Wrkr
   - zeekstd
   - zeroize
+  - zeroizes
   - Zeroizing

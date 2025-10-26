@@ -27,18 +27,14 @@
 
 use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 
+use crate::asn1::ObjectIdentifier;
 use crate::crypto::aead::{Aead, Aes256Gcm, KeyInit, Payload};
-use crate::crypto::kdf::{ecies_kdf_sha256, KdfError};
+use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256, KdfError};
 use crate::zeroize::Zeroizing;
 use crate::ZeroizingBytes;
 
 /// KDF info parameter for domain separation and protocol versioning
 const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
-
-/// OID for ECIES with secp256k1
-#[cfg(feature = "x509")]
-pub const ECIES_SECP256K1_OID: crate::spki::ObjectIdentifier =
-	crate::spki::ObjectIdentifier::new_unwrap("1.3.132.1.12.0");
 
 // ============================================================================
 // Generic ECIES Traits
@@ -350,7 +346,7 @@ where
 			let (ephemeral_bytes, shared_secret) = PK::SecretKey::generate_ephemeral(recipient_pubkey, $rng)?;
 
 			// Derive encryption key using KDF (includes C0 for non-malleability)
-			let k_enc = ecies_kdf_sha256(&ephemeral_bytes, &shared_secret, ECIES_KDF_INFO, None)?;
+			let k_enc = ecies_kdf::<HkdfSha3_256>(&ephemeral_bytes, &shared_secret, ECIES_KDF_INFO, None)?;
 
 			// Encrypt using AES-256-GCM
 			let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
@@ -401,7 +397,7 @@ where
 	// 3. Derive encryption key using KDF (includes C0 for non-malleability)
 	// Uses SHA3-256 with protocol versioning via info parameter
 	// Derives 32-byte key for AES-256-GCM authenticated encryption
-	let k_enc = ecies_kdf_sha256(&message.ephemeral_pubkey, &shared_secret, ECIES_KDF_INFO, None)?;
+	let k_enc = ecies_kdf::<HkdfSha3_256>(&message.ephemeral_pubkey, &shared_secret, ECIES_KDF_INFO, None)?;
 	// 4. Extract nonce and ciphertext
 	if message.ciphertext.len() < 12 + 16 {
 		return Err(EciesError::InvalidCiphertext);
@@ -430,8 +426,8 @@ where
 pub struct EciesSecp256k1Oid;
 
 #[cfg(feature = "x509")]
-impl der::oid::AssociatedOid for EciesSecp256k1Oid {
-	const OID: spki::ObjectIdentifier = ECIES_SECP256K1_OID;
+impl crate::der::oid::AssociatedOid for EciesSecp256k1Oid {
+	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.1.12.0");
 }
 
 #[cfg(test)]

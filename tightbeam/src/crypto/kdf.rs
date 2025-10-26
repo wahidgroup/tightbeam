@@ -1,15 +1,186 @@
 //! Key Derivation Functions (KDF)
 //!
-//! This module provides cryptographic key derivation functions following
-//! industry standards like RFC 5869 (HKDF) and NIST SP 800-56C.
+//! This module provides HKDF-based key derivation following RFC 5869, using
+//! SHA3-256 as the default hash. It’s used both as a general-purpose KDF and
+//! for ECIES-style constructions where distinct encryption and MAC keys are required.
+//!
+//! Key properties
+//! - HKDF (RFC 5869) with SHA3-256
+//! - Deterministic and domain-separated via the `info` parameter
+//! - Secure memory handling via `Zeroizing`/`ZeroizingArray`
+//! - Input validation for ephemeral public key (33/65), shared secret (32), and salt (>=16)
+//!
+//! Provider notes
+//! - HKDF providers honor the optional `salt` parameter per RFC 5869.
+//! - ANSI X9.63 providers ignore `salt` entirely; derivation depends on the
+//!   shared secret Z and the `info`/SharedInfo context bytes.
+//!
+//! ECIES note
+//! - Many ECIES profiles (e.g., SECG SEC 1, IEEE 1363a, ISO/IEC 18033-2) mandate
+//!   separate symmetric encryption and MAC keys. This module enforces key separation
+//!   by either (a) running two HKDF expansions with distinct `info` labels or
+//!   (b) performing one HKDF expansion and splitting the output into two disjoint keys.
+//! - ECIES is parameterized by the KDF (see SECG SEC 1, IEEE 1363a). This
+//!   library provides a proper ECIES instantiation using HKDF per RFC 5869
+//!   with SHA3-256, enforcing key separation and context binding via `info`.
+//!   If you must target a profile that mandates ANSI X9.63 KDF, supply a
+//!   `KdfProvider` that implements that KDF.
+//!
+//! References
+//! - RFC 5869: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
+//! - NIST SP 800-56A Rev. 3: Recommendation for Pair-Wise Key Establishment Schemes
+//! - NIST SP 800-56C Rev. 2: Recommendation for KDFs using HMAC
+//! - SECG SEC 1 v2.0: Elliptic Curve Cryptography (ECIES)
+//! - IEEE 1363a: Standard Specifications for Public-Key Cryptography (ECIES/KEM-DEM)
+//! - ISO/IEC 18033-2: Asymmetric ciphers (ECIES)
 
 pub use hkdf::Hkdf;
 
-use crate::crypto::hash::Sha3_256;
+use crate::crypto::hash::{Digest, Sha3_256};
 use crate::zeroize::Zeroizing;
+use crate::ZeroizingArray;
 
-pub type SafeSpace<const N: usize> = Zeroizing<[u8; N]>;
-pub type UnboundSafeSpace = Zeroizing<Vec<u8>>;
+pub type Result<T> = ::core::result::Result<T, KdfError>;
+
+/// Temporary buffer limit for optimized dual-key expansion in the default provider.
+/// Ensures `2*N <= 128` when deriving (enc, mac) via a single HKDF-Expand.
+const MAX_HKDF_OUTPUT_SIZE: usize = 128;
+/// Minimum secure key size in bytes
+const MIN_KEY_SIZE: usize = 16;
+
+/// Trait for Key Derivation Function providers
+///
+/// This trait allows consumers to plug in different KDF implementations
+/// from the RustCrypto ecosystem or custom implementations.
+pub trait KdfProvider {
+	/// Derive a key of the specified length
+	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>>;
+
+	/// Derive two keys of the specified length (for ECIES encryption + MAC)
+	///
+	/// ECIES standards (e.g., SECG SEC 1, IEEE 1363a, ISO/IEC 18033-2) require
+	/// key separation: distinct symmetric keys must be derived for encryption
+	/// and for message authentication to avoid key reuse across primitives.
+	///
+	/// Default behavior
+	/// - Performs two HKDF-Expand operations with different `info` labels:
+	///   `{info}-encryption` and `{info}-mac`.
+	/// - This yields two independent keys while preserving RFC 5869 domain separation.
+	///
+	/// Provider override
+	/// - Implementations MAY override this with a single HKDF-Expand that
+	///   produces 2*N bytes and split the output into two keys, preserving
+	///   independence by non-overlapping segments. This is equivalent in
+	///   security if the underlying HKDF is robust and the segments do not
+	///   overlap.
+	///
+	/// References
+	/// - RFC 5869 (HKDF): Section 2.2 (the `info` field for context separation)
+	/// - NIST SP 800-56C Rev. 2: HMAC-based KDFs and context information (“OtherInfo”)
+	/// - SECG SEC 1 v2.0 / IEEE 1363a / ISO/IEC 18033-2: ECIES key separation requirement
+	fn derive_dual_keys<const N: usize>(
+		ikm: &[u8],
+		info: &[u8],
+		salt: Option<&[u8]>,
+	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
+		// Use separate info strings for encryption and MAC keys as recommended
+		// by ECIES standards. This prevents key reuse between encryption and
+		// authentication operations.
+		let mut enc_info = Vec::with_capacity(info.len() + 11);
+		enc_info.extend_from_slice(info);
+		enc_info.extend_from_slice(b"-encryption");
+
+		let mut mac_info = Vec::with_capacity(info.len() + 4);
+		mac_info.extend_from_slice(info);
+		mac_info.extend_from_slice(b"-mac");
+
+		let k_enc = Self::derive_key::<N>(ikm, &enc_info, salt)?;
+		let k_mac = Self::derive_key::<N>(ikm, &mac_info, salt)?;
+
+		Ok((k_enc, k_mac))
+	}
+}
+/// Default HKDF-SHA3-256 provider
+pub struct HkdfSha3_256;
+
+impl KdfProvider for HkdfSha3_256 {
+	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
+		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
+		let mut output = Zeroizing::new([0u8; N]);
+		hk.expand(info, &mut output[..]).map_err(KdfError::DerivationFailed)?;
+		Ok(output)
+	}
+
+	/// Optimized: single HKDF-Expand to 2*N bytes, then split into (enc, mac).
+	/// Note: bounded by `MAX_HKDF_OUTPUT_SIZE` for the temporary buffer.
+	fn derive_dual_keys<const N: usize>(
+		ikm: &[u8],
+		info: &[u8],
+		salt: Option<&[u8]>,
+	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
+		// Provider-specific safety bound for the temporary buffer used below.
+		if N * 2 > MAX_HKDF_OUTPUT_SIZE {
+			return Err(KdfError::DerivationFailed(hkdf::InvalidLength));
+		}
+		// Optimized implementation: single HKDF expansion for both keys
+		// This is functionally equivalent to separate derivations but more
+		// efficient ECIES standards require separate encryption/MAC keys,
+		// which this provides by splitting the expanded output into two
+		// distinct key portions
+		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
+		let mut combined = Zeroizing::new([0u8; MAX_HKDF_OUTPUT_SIZE]);
+		hk.expand(info, &mut combined[..N * 2]).map_err(KdfError::DerivationFailed)?;
+
+		let mut k_enc = Zeroizing::new([0u8; N]);
+		let mut k_mac = Zeroizing::new([0u8; N]);
+		k_enc[..].copy_from_slice(&combined[..N]);
+		k_mac[..].copy_from_slice(&combined[N..N * 2]);
+		Ok((k_enc, k_mac))
+	}
+}
+
+/// ANSI X9.63 Concatenation KDF using SHA3-256
+pub struct X963Sha3_256;
+
+impl KdfProvider for X963Sha3_256 {
+	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], _salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
+		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
+		let mut out = Zeroizing::new([0u8; N]);
+		let mut offset = 0usize;
+		let mut counter: u32 = 1;
+		while offset < N {
+			let mut hasher = Sha3_256::new();
+			hasher.update(ikm); // Z only
+			hasher.update(counter.to_be_bytes());
+			hasher.update(info); // SharedInfo/OtherInfo
+			let block = hasher.finalize();
+			let take = core::cmp::min(block.len(), N - offset);
+			out[offset..offset + take].copy_from_slice(&block[..take]);
+			offset += take;
+			counter = counter.wrapping_add(1);
+		}
+		Ok(out)
+	}
+
+	fn derive_dual_keys<const N: usize>(
+		ikm: &[u8],
+		info: &[u8],
+		_salt: Option<&[u8]>,
+	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
+		// Derive two independent keys via distinct SharedInfo labels
+		let mut enc_info = Vec::with_capacity(info.len() + 11);
+		enc_info.extend_from_slice(info);
+		enc_info.extend_from_slice(b"-encryption");
+
+		let mut mac_info = Vec::with_capacity(info.len() + 4);
+		mac_info.extend_from_slice(info);
+		mac_info.extend_from_slice(b"-mac");
+
+		let k_enc = Self::derive_key::<N>(ikm, &enc_info, None)?;
+		let k_mac = Self::derive_key::<N>(ikm, &mac_info, None)?;
+		Ok((k_enc, k_mac))
+	}
+}
 
 /// Errors specific to KDF operations
 #[cfg_attr(feature = "derive", derive(crate::Errorizable))]
@@ -62,9 +233,6 @@ impl core::fmt::Display for KdfError {
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for KdfError {}
 
-/// A specialized Result type for KDF operations
-pub type Result<T> = core::result::Result<T, KdfError>;
-
 /// Validate common KDF inputs (ephemeral pubkey, shared secret, and optional salt)
 #[inline]
 fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: Option<&[u8]>) -> Result<()> {
@@ -80,7 +248,7 @@ fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: 
 
 	// Validate salt length if provided (minimum 16 bytes for security)
 	if let Some(salt_bytes) = salt {
-		if !salt_bytes.is_empty() && salt_bytes.len() < 16 {
+		if !salt_bytes.is_empty() && salt_bytes.len() < MIN_KEY_SIZE {
 			return Err(KdfError::InvalidSaltLength(salt_bytes.len()));
 		}
 	}
@@ -88,205 +256,185 @@ fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: 
 	Ok(())
 }
 
-/// ECIES Key Derivation Function using SHA3-256
+/// Generic ECIES-style KDF using any `KdfProvider`.
 ///
-/// Derives a 32-byte encryption key from an ephemeral public key and
-/// shared secret using HKDF with SHA3-256 as the hash function.
+/// Inputs
+/// - `ephemeral_pubkey`: 33-byte compressed or 65-byte uncompressed
+/// - `shared_secret`: 32 bytes (e.g., ECDH result on a 256-bit curve)
+/// - `info`: application- or protocol-specific context string
+/// - `salt`: optional HKDF salt; if provided and non-empty, must be >= 16 bytes
 ///
-/// This function implements the ECIES key derivation as specified in
-/// IEEE P1363a §15.6.1, which includes the ephemeral public key (C0) in the
-/// key derivation material to provide non-malleability and resistance to
-/// adaptive chosen ciphertext attacks.
+/// Output
+/// - 32-byte key suitable for symmetric encryption or MAC, depending on use
 ///
-/// Note: This function derives only an encryption key (k_enc) since we use
-/// AES-256-GCM for authenticated encryption, which provides both confidentiality
-/// and authentication without requiring a separate MAC key.
+/// Errors
+/// - `InvalidPublicKeyLength`, `InvalidSharedSecretLength`, `InvalidSaltLength`
+/// - `DerivationFailed` if HKDF expansion fails
 ///
-/// # Security Properties
-///
-/// - **Non-malleable**: Including C0 prevents attackers from modifying the ephemeral key
-/// - **CCA-secure**: Provides chosen-ciphertext attack resistance
-/// - **Domain separation**: The `info` parameter enables protocol-specific key derivation
-/// - **Forward secrecy**: Each ephemeral key produces unique derived keys
-/// - **Input validation**: Enforces correct key lengths (33/65 bytes for pubkey, 32 bytes for secret)
-/// - **Side-channel resistance**: Uses fixed-size arrays to avoid timing variations from allocations
-///
-/// # Algorithm
-///
-/// 1. Validate input lengths (ephemeral_pubkey: 33 or 65 bytes, shared_secret: 32 bytes)
-/// 2. Concatenate ephemeral public key and shared secret: `IKM = C0 || S`
-/// 3. Apply HKDF-Extract with optional salt: `PRK = HKDF-Extract(salt, IKM)`
-/// 4. Apply HKDF-Expand to derive 32 bytes: `k_enc = HKDF-Expand(PRK, info, 32)`
-///
-/// # Parameters
-///
-/// - `ephemeral_pubkey`: The ephemeral public key (C0) from ECIES encryption.
-///   Must be 33 bytes (compressed) or 65 bytes (uncompressed) for secp256k1.
-/// - `shared_secret`: The ECDH shared secret (S = r·P or d·R).
-///   Must be exactly 32 bytes for 256-bit curves.
-/// - `info`: Application-specific context and domain separation string.
-/// - `salt`: Optional salt for HKDF-Extract. Provides additional randomness
-///   for enhanced security. Use `None` for standard ECIES (salt-free).
-///
-/// # Returns
-///
-/// A 32-byte encryption key wrapped in `Zeroizing` for automatic memory clearing.
-/// This key is suitable for AES-256-GCM authenticated encryption.
-///
-/// # Errors
-///
-/// - [`KdfError::InvalidPublicKeyLength`] if ephemeral_pubkey is not 33 or 65 bytes
-/// - [`KdfError::InvalidSharedSecretLength`] if shared_secret is not 32 bytes
-/// - [`KdfError::DerivationFailed`] if HKDF expansion fails
-///
-/// # Standards Compliance
-///
-/// - **RFC 5869**: HKDF (HMAC-based Extract-and-Expand Key Derivation Function)
-/// - **NIST SP 800-56C**: Recommendation for Key-Derivation Methods
-/// - **IEEE P1363a**: DHAES mode with C0 inclusion for non-malleability
-/// - **FIPS 202**: SHA3-256 cryptographic hash function
-pub fn ecies_kdf_sha256(
+/// Standards notes
+/// - Uses RFC 5869 (HKDF) with SHA3-256. For strict ECIES profiles that mandate
+///   X9.63 KDF, provide a custom `KdfProvider`.
+pub fn ecies_kdf<P: KdfProvider>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
 	shared_secret: impl AsRef<[u8]>,
 	info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
-) -> Result<SafeSpace<32>> {
-	let ephemeral_pubkey = ephemeral_pubkey.as_ref();
-	let shared_secret = shared_secret.as_ref();
-	let info = info.as_ref();
-
-	// Validate all inputs
+) -> Result<ZeroizingArray<32>> {
+	let (ephemeral_pubkey, shared_secret, info) = (ephemeral_pubkey.as_ref(), shared_secret.as_ref(), info.as_ref());
 	assert_valid_kdf_inputs(ephemeral_pubkey, shared_secret, salt)?;
-
-	// Use fixed-size array for IKM to avoid dynamic allocation and potential timing variations
-	// Maximum size: 65 (uncompressed pubkey) + 32 (shared secret) = 97 bytes
-	let ikm_len = ephemeral_pubkey.len() + shared_secret.len();
-	let mut ikm = Zeroizing::new([0u8; 97]);
-	ikm[..ephemeral_pubkey.len()].copy_from_slice(ephemeral_pubkey);
-	ikm[ephemeral_pubkey.len()..ikm_len].copy_from_slice(shared_secret);
-
-	// HKDF-Extract with optional salt
-	let hk = Hkdf::<Sha3_256>::new(salt, &ikm[..ikm_len]);
-	let mut okm = Zeroizing::new([0u8; 32]);
-	hk.expand(info, &mut okm[..]).map_err(KdfError::DerivationFailed)?;
-	Ok(okm)
+	// ECIES: IKM = Z; SharedInfo binds context and the ephemeral public key
+	let mut shared_info = Vec::with_capacity(info.len() + 5 + ephemeral_pubkey.len());
+	shared_info.extend_from_slice(info);
+	shared_info.extend_from_slice(b"|epk|");
+	shared_info.extend_from_slice(ephemeral_pubkey);
+	P::derive_key::<32>(shared_secret, &shared_info, salt)
 }
 
-/// General-purpose HKDF-SHA256 key derivation
+/// General-purpose HKDF (RFC 5869) using any `KdfProvider`.
 ///
-/// Derives a cryptographic key from input key material using HKDF (HMAC-based
-/// Extract-and-Expand Key Derivation Function) with SHA3-256.
+/// Inputs
+/// - `ikm`: input key material
+/// - `info`: context string for domain separation
+/// - `salt`: optional HKDF salt; if provided and non-empty, must be >= 16 bytes
 ///
-/// This is a general-purpose key derivation function suitable for deriving
-/// session keys, encryption keys, and other cryptographic material from
-/// shared secrets or base keys.
+/// Output
+/// - Key of length `N`
 ///
-/// # Security Properties
-///
-/// - **Randomness extraction**: Extracts a fixed-length pseudorandom key from input
-/// - **Domain separation**: The `info` parameter prevents key reuse across contexts
-/// - **Salt support**: Optional salt provides additional entropy
-///
-/// # Algorithm
-///
-/// 1. HKDF-Extract: `PRK = HKDF-Extract(salt, ikm)`
-/// 2. HKDF-Expand: `OKM = HKDF-Expand(PRK, info, N)`
-///
-/// # Type Parameters
-///
-/// - `N`: The size in bytes for the derived key. Must be at least 16 bytes.
-///
-/// # Parameters
-///
-/// - `ikm`: Input Key Material - the source entropy (e.g., shared secret, base key)
-/// - `info`: Application-specific context and domain separation string
-/// - `salt`: Optional salt for HKDF-Extract. Use `None` for no salt.
-///
-/// # Returns
-///
-/// An N-byte key wrapped in `Zeroizing` for automatic memory clearing.
-///
-/// # Errors
-///
-/// - [`KdfError::DerivationFailed`] if HKDF expansion fails
-///
-/// # Standards Compliance
-///
-/// - **RFC 5869**: HKDF (HMAC-based Extract-and-Expand Key Derivation Function)
-/// - **NIST SP 800-56C**: Recommendation for Key-Derivation Methods
-/// - **FIPS 202**: SHA3-256 cryptographic hash function
-pub fn hkdf_sha256<const N: usize>(
+/// Safety
+/// - `N` SHOULD be >= 16 bytes for cryptographic use.
+pub fn hkdf<P: KdfProvider, const N: usize>(
 	ikm: impl AsRef<[u8]>,
 	info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
-) -> Result<SafeSpace<N>> {
-	const { assert!(N >= 16, "Key size must be at least 16 bytes for security") };
-
-	let ikm = ikm.as_ref();
-	let info = info.as_ref();
-
-	let hk = Hkdf::<Sha3_256>::new(salt, ikm);
-	let mut okm = Zeroizing::new([0u8; N]);
-	hk.expand(info, &mut okm[..]).map_err(KdfError::DerivationFailed)?;
-	Ok(okm)
+) -> Result<ZeroizingArray<N>> {
+	let (ikm, info) = (ikm.as_ref(), info.as_ref());
+	P::derive_key::<N>(ikm, info, salt)
 }
 
-/// ECIES Key Derivation Function using SHA3-256 with configurable key size
+/// ECIES-style dual-key derivation with configurable key size.
 ///
-/// This is the generic version of [`ecies_kdf_sha256`] that allows specifying
-/// custom key sizes. For the common case of 32-byte keys (AES-256-GCM), use
-/// [`ecies_kdf_sha256`] instead.
+/// Inputs
+/// - `ephemeral_pubkey`: 33-byte compressed or 65-byte uncompressed
+/// - `shared_secret`: 32 bytes
+/// - `info`: context string
+/// - `salt`: optional salt (>= 16 bytes if non-empty)
 ///
-/// # Type Parameters
+/// Output
+/// - `(k_enc, k_mac)`, each `N` bytes
 ///
-/// - `N`: The size in bytes for each derived key. Must be at least 16 bytes.
-///   Common values:
-///   - `16`: AES-128-GCM
-///   - `32`: AES-256-GCM (use [`ecies_kdf_sha256`] for this)
-pub fn ecies_kdf_sha256_with_size<const N: usize>(
+/// Constraints
+/// - Provider-scoped bounds MAY apply. For example, the default HKDF provider
+///   performs an optimized single-expand-and-split and enforces `2*N` within its
+///   own internal temporary buffer limit. Other providers (e.g., X9.63) may not
+///   impose the same bound.
+///
+/// References
+/// - RFC 5869 (HKDF), NIST SP 800-56C (context/OtherInfo), ECIES profiles (key separation)
+pub fn ecies_kdf_with_size<P: KdfProvider, const N: usize>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
 	shared_secret: impl AsRef<[u8]>,
 	info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
-) -> Result<(SafeSpace<N>, SafeSpace<N>)> {
-	// Enforce minimum key size for security
-	const { assert!(N >= 16, "Key size must be at least 16 bytes for security") };
-
-	// Extract references
-	let ephemeral_pubkey = ephemeral_pubkey.as_ref();
-	let shared_secret = shared_secret.as_ref();
-	let info = info.as_ref();
-
-	// Validate all inputs
+) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
+	let (ephemeral_pubkey, shared_secret, info) = (ephemeral_pubkey.as_ref(), shared_secret.as_ref(), info.as_ref());
 	assert_valid_kdf_inputs(ephemeral_pubkey, shared_secret, salt)?;
+	// ECIES: IKM = Z; SharedInfo binds context and the ephemeral public key
+	let mut shared_info = Vec::with_capacity(info.len() + 5 + ephemeral_pubkey.len());
+	shared_info.extend_from_slice(info);
+	shared_info.extend_from_slice(b"|epk|");
+	shared_info.extend_from_slice(ephemeral_pubkey);
+	P::derive_dual_keys::<N>(shared_secret, &shared_info, salt)
+}
 
-	// Use fixed-size array for IKM to avoid dynamic allocation and potential timing variations
-	// Maximum size: 65 (uncompressed pubkey) + 32 (shared secret) = 97 bytes
-	let ikm_len = ephemeral_pubkey.len() + shared_secret.len();
-	let mut ikm = Zeroizing::new([0u8; 97]);
-	ikm[..ephemeral_pubkey.len()].copy_from_slice(ephemeral_pubkey);
-	ikm[ephemeral_pubkey.len()..ikm_len].copy_from_slice(shared_secret);
+/// ECIES with raw SharedInfo: caller supplies exact SharedInfo/OtherInfo bytes (no EPK auto-append).
+/// IKM is the shared secret Z.
+pub fn ecies_kdf_with_shared_info<P: KdfProvider>(
+	shared_secret: impl AsRef<[u8]>,
+	shared_info: impl AsRef<[u8]>,
+	salt: Option<&[u8]>,
+) -> Result<ZeroizingArray<32>> {
+	let (shared_secret, shared_info) = (shared_secret.as_ref(), shared_info.as_ref());
+	if shared_secret.len() != 32 {
+		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
+	}
 
-	// HKDF-Extract with optional salt
-	let hk = Hkdf::<Sha3_256>::new(salt, &ikm[..ikm_len]);
+	if let Some(salt_bytes) = salt {
+		if !salt_bytes.is_empty() && salt_bytes.len() < MIN_KEY_SIZE {
+			return Err(KdfError::InvalidSaltLength(salt_bytes.len()));
+		}
+	}
 
-	// HKDF-Expand: derive 2*N bytes total (N bytes for encryption key + N bytes for MAC key)
-	// Maximum size: 2 * 64 bytes = 128 bytes (for N <= 64)
-	let mut okm = Zeroizing::new([0u8; 128]);
-	hk.expand(info, &mut okm[..N * 2]).map_err(KdfError::DerivationFailed)?;
+	P::derive_key::<32>(shared_secret, shared_info, salt)
+}
 
-	// Split into two N-byte keys
-	let mut k_enc = Zeroizing::new([0u8; N]);
-	let mut k_mac = Zeroizing::new([0u8; N]);
-	k_enc[..].copy_from_slice(&okm[..N]);
-	k_mac[..].copy_from_slice(&okm[N..N * 2]);
+/// ECIES dual-key with raw SharedInfo: caller supplies exact SharedInfo/OtherInfo bytes.
+/// IKM is the shared secret Z. Provider-specific bounds may apply.
+pub fn ecies_kdf_with_shared_info_and_size<P: KdfProvider, const N: usize>(
+	shared_secret: impl AsRef<[u8]>,
+	shared_info: impl AsRef<[u8]>,
+	salt: Option<&[u8]>,
+) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
+	let (shared_secret, shared_info) = (shared_secret.as_ref(), shared_info.as_ref());
+	if shared_secret.len() != 32 {
+		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
+	}
 
-	Ok((k_enc, k_mac))
+	if let Some(salt_bytes) = salt {
+		if !salt_bytes.is_empty() && salt_bytes.len() < MIN_KEY_SIZE {
+			return Err(KdfError::InvalidSaltLength(salt_bytes.len()));
+		}
+	}
+
+	P::derive_dual_keys::<N>(shared_secret, shared_info, salt)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	// Test assertion helpers for common patterns
+	#[track_caller]
+	fn assert_key_length<const N: usize>(key: &ZeroizingArray<N>, expected_len: usize) {
+		assert_eq!(key.len(), expected_len, "Key length mismatch");
+	}
+
+	#[track_caller]
+	fn assert_keys_equal<const N: usize>(key1: &ZeroizingArray<N>, key2: &ZeroizingArray<N>) {
+		assert_eq!(key1[..], key2[..], "Keys should be equal");
+	}
+
+	#[track_caller]
+	fn assert_keys_different<const N: usize>(key1: &ZeroizingArray<N>, key2: &ZeroizingArray<N>) {
+		assert_ne!(key1[..], key2[..], "Keys should be different");
+	}
+
+	// Error assertion macros for cleaner test code
+	macro_rules! assert_kdf_error {
+		($result:expr, $variant:ident($value:expr)) => {
+			assert!(matches!($result, Err(KdfError::$variant(v)) if v == $value),
+				"Expected KdfError::{}({}), got {:?}", stringify!($variant), $value, $result);
+		};
+	}
+
+	// Key assertion macros for common test patterns
+	macro_rules! assert_key_pair_lengths {
+		($enc:expr, $mac:expr, $size:expr) => {
+			assert_eq!($enc.len(), $size, "Encryption key length mismatch");
+			assert_eq!($mac.len(), $size, "MAC key length mismatch");
+		};
+	}
+
+	macro_rules! assert_keys_different {
+		($key1:expr, $key2:expr) => {
+			assert_ne!($key1[..], $key2[..], "Keys should be different");
+		};
+	}
+
+	macro_rules! assert_key_length {
+		($key:expr, $size:expr) => {
+			assert_eq!($key.len(), $size, "Key length mismatch");
+		};
+	}
 
 	// Test data constants
 	const EPHEMERAL_PUBKEY_33: &[u8] = b"ephemeral_public_key_33_bytes____";
@@ -296,243 +444,189 @@ mod tests {
 	const INFO_V2: &[u8] = b"protocol-v2";
 	const SALT: &[u8] = b"random_salt_value";
 
-	#[test]
-	fn test_ecies_kdf_sha256_all_cases() {
-		enum TestCase {
-			// Valid test cases
-			Valid {
-				name: &'static str,
-				ephemeral: &'static [u8],
-				secret: &'static [u8],
-				info: &'static [u8],
-				salt: Option<&'static [u8]>,
-				key_size: usize,
-				// Optional comparison with another call
-				compare_with: Option<Box<TestCase>>,
-				should_match: bool,
-			},
-			// Invalid input test cases
-			Invalid {
-				name: &'static str,
-				ephemeral: &'static [u8],
-				secret: &'static [u8],
-				expected_error: fn(&KdfError) -> bool,
-			},
-		}
+	// Consolidated test for ECIES KDF basic functionality, determinism, input variation, and uncompressed pubkey
+	crate::test_case! {
+		name: test_ecies_kdf_basic_functionality,
+		setup: || {
+			// Test cases for basic functionality and determinism
+			let basic_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let same_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			// Test cases for input variation (different inputs should produce different outputs)
+			let different_pubkey = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33_ALT, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let different_info = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V2, None).unwrap();
+			let with_salt = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, Some(SALT)).unwrap();
 
-		let test_cases = vec![
-			// Basic properties tests
-			TestCase::Valid {
-				name: "standard 32-byte keys (compressed pubkey)",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: SHARED_SECRET_32,
-				info: INFO_V1,
-				salt: None,
-				key_size: 32,
-				compare_with: None,
-				should_match: false,
-			},
-			TestCase::Valid {
-				name: "determinism check",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: SHARED_SECRET_32,
-				info: INFO_V1,
-				salt: None,
-				key_size: 32,
-				compare_with: Some(Box::new(TestCase::Valid {
-					name: "same inputs",
-					ephemeral: EPHEMERAL_PUBKEY_33,
-					secret: SHARED_SECRET_32,
-					info: INFO_V1,
-					salt: None,
-					key_size: 32,
-					compare_with: None,
-					should_match: false,
-				})),
-				should_match: true,
-			},
-			// Input variation tests
-			TestCase::Valid {
-				name: "different ephemeral pubkey",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: SHARED_SECRET_32,
-				info: INFO_V1,
-				salt: None,
-				key_size: 32,
-				compare_with: Some(Box::new(TestCase::Valid {
-					name: "alt ephemeral",
-					ephemeral: EPHEMERAL_PUBKEY_33_ALT,
-					secret: SHARED_SECRET_32,
-					info: INFO_V1,
-					salt: None,
-					key_size: 32,
-					compare_with: None,
-					should_match: false,
-				})),
-				should_match: false,
-			},
-			TestCase::Valid {
-				name: "different info",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: SHARED_SECRET_32,
-				info: INFO_V1,
-				salt: None,
-				key_size: 32,
-				compare_with: Some(Box::new(TestCase::Valid {
-					name: "alt info",
-					ephemeral: EPHEMERAL_PUBKEY_33,
-					secret: SHARED_SECRET_32,
-					info: INFO_V2,
-					salt: None,
-					key_size: 32,
-					compare_with: None,
-					should_match: false,
-				})),
-				should_match: false,
-			},
-			TestCase::Valid {
-				name: "with salt vs without",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: SHARED_SECRET_32,
-				info: INFO_V1,
-				salt: None,
-				key_size: 32,
-				compare_with: Some(Box::new(TestCase::Valid {
-					name: "with salt",
-					ephemeral: EPHEMERAL_PUBKEY_33,
-					secret: SHARED_SECRET_32,
-					info: INFO_V1,
-					salt: Some(SALT),
-					key_size: 32,
-					compare_with: None,
-					should_match: false,
-				})),
-				should_match: false,
-			},
-			// Different key sizes
-			TestCase::Valid {
-				name: "16-byte keys (AES-128)",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: SHARED_SECRET_32,
-				info: INFO_V1,
-				salt: None,
-				key_size: 16,
-				compare_with: None,
-				should_match: false,
-			},
-			TestCase::Valid {
-				name: "64-byte keys (high security)",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: SHARED_SECRET_32,
-				info: INFO_V1,
-				salt: None,
-				key_size: 64,
-				compare_with: None,
-				should_match: false,
-			},
-			// Invalid inputs
-			TestCase::Invalid {
-				name: "ephemeral pubkey too short",
-				ephemeral: b"too_short",
-				secret: SHARED_SECRET_32,
-				expected_error: |e| matches!(e, KdfError::InvalidPublicKeyLength(9)),
-			},
-			TestCase::Invalid {
-				name: "ephemeral pubkey wrong size (34 bytes)",
-				ephemeral: b"wrong_size_ephemeral_key_34_bytes_",
-				secret: SHARED_SECRET_32,
-				expected_error: |e| matches!(e, KdfError::InvalidPublicKeyLength(34)),
-			},
-			TestCase::Invalid {
-				name: "shared secret too short",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: b"too_short",
-				expected_error: |e| matches!(e, KdfError::InvalidSharedSecretLength(9)),
-			},
-			TestCase::Invalid {
-				name: "shared secret too long",
-				ephemeral: EPHEMERAL_PUBKEY_33,
-				secret: b"shared_secret_that_is_too_long____",
-				expected_error: |e| matches!(e, KdfError::InvalidSharedSecretLength(34)),
-			},
-		];
-
-		// Helper function to derive keys for a test case
-		fn derive_keys(tc: &TestCase) -> Result<(UnboundSafeSpace, UnboundSafeSpace)> {
-			match tc {
-				TestCase::Valid { ephemeral, secret, info, salt, key_size, .. } => {
-					macro_rules! derive_with_size {
-						($size:expr) => {{
-							let (k_enc, k_mac) = ecies_kdf_sha256_with_size::<$size>(ephemeral, secret, info, *salt)?;
-							Ok((Zeroizing::new(k_enc.to_vec()), Zeroizing::new(k_mac.to_vec())))
-						}};
-					}
-
-					match *key_size {
-						16 => derive_with_size!(16),
-						32 => derive_with_size!(32),
-						64 => derive_with_size!(64),
-						size => panic!("Unsupported key size: {size}"),
-					}
-				}
-				TestCase::Invalid { .. } => {
-					panic!("Cannot derive keys for invalid test case")
-				}
+			// Test case for uncompressed pubkey (65 bytes)
+			let mut uncompressed_pubkey = [0u8; 65];
+			uncompressed_pubkey[0] = 0x04; // Uncompressed marker
+			for (i, byte) in uncompressed_pubkey.iter_mut().enumerate().skip(1) {
+				*byte = (i % 256) as u8;
 			}
-		}
 
-		// Execute test cases
-		for tc in &test_cases {
-			match tc {
-				TestCase::Valid { name, key_size, compare_with, should_match, .. } => {
-					// Derive keys for this test case
-					let result = derive_keys(tc);
-					if let Err(e) = &result {
-						panic!("{name}: {e:?}");
-					}
+			let uncompressed_result = ecies_kdf::<HkdfSha3_256>(uncompressed_pubkey, SHARED_SECRET_32, INFO_V1, None);
+			(basic_key, same_key, different_pubkey, different_info, with_salt, uncompressed_result)
+		},
+		assertions: |(basic_key, same_key, different_pubkey, different_info, with_salt, uncompressed_result)| {
+			// Basic functionality: key should be 32 bytes
+			assert_key_length(&basic_key, 32);
+			// Determinism: same inputs produce same outputs
+			assert_keys_equal(&basic_key, &same_key);
+			// Input variation: different inputs produce different outputs
+			assert_keys_different(&basic_key, &different_pubkey); // Different pubkey
+			assert_keys_different(&basic_key, &different_info); // Different info
+			assert_keys_different(&basic_key, &with_salt); // With vs without salt
+			// Uncompressed pubkey: should work and produce 32-byte key
+			assert!(uncompressed_result.is_ok());
+			assert_key_length(&uncompressed_result.unwrap(), 32);
 
-					let (k_enc, k_mac) = result.unwrap();
-					// Check basic properties
-					assert_eq!(k_enc.len(), *key_size, "{name}");
-					assert_eq!(k_mac.len(), *key_size, "{name}");
-					assert_ne!(&k_enc[..], &k_mac[..], "{name}");
-
-					// If there's a comparison case, test against it
-					if let Some(ref compare_tc) = compare_with {
-						let compare_result = derive_keys(compare_tc);
-						if let Err(e) = &compare_result {
-							panic!("{name} (comparison): {e:?}");
-						}
-
-						let (k_enc_cmp, _) = compare_result.unwrap();
-						if *should_match {
-							assert_eq!(&k_enc[..], &k_enc_cmp[..], "{name}");
-						} else {
-							assert_ne!(&k_enc[..], &k_enc_cmp[..], "{name}");
-						}
-					}
-				}
-				TestCase::Invalid { name, ephemeral, secret, expected_error } => {
-					let result = ecies_kdf_sha256(ephemeral, secret, INFO_V1, None);
-					assert!(result.is_err(), "{name}");
-					assert!(expected_error(&result.unwrap_err()), "{name}");
-				}
-			}
+			Ok(())
 		}
 	}
 
-	#[test]
-	fn test_ecies_kdf_sha256_uncompressed_pubkey() -> Result<()> {
-		// Test with 65-byte uncompressed public key (special case)
-		let mut ephemeral_pubkey = [0u8; 65];
-		ephemeral_pubkey[0] = 0x04; // Uncompressed marker
-		for (i, byte) in ephemeral_pubkey.iter_mut().enumerate().skip(1) {
-			*byte = (i % 256) as u8;
+	// Consolidated test for ECIES KDF size variations
+	crate::test_case! {
+		name: test_ecies_kdf_size_variations,
+		setup: || {
+			// Test different key sizes
+			let keys_16 = ecies_kdf_with_size::<HkdfSha3_256, 16>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let keys_32 = ecies_kdf_with_size::<HkdfSha3_256, 32>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let keys_64 = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+
+			(keys_16, keys_32, keys_64)
+		},
+		assertions: |(keys_16, keys_32, keys_64)| {
+			let (k_enc_16, k_mac_16) = keys_16;
+			let (k_enc_32, k_mac_32) = keys_32;
+			let (k_enc_64, k_mac_64) = keys_64;
+
+			// Check key lengths
+			assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
+			assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
+			assert_key_pair_lengths!(k_enc_64, k_mac_64, 64);
+			// Encryption and MAC keys should be different
+			assert_keys_different!(k_enc_32, k_mac_32);
+
+			Ok(())
 		}
+	}
 
-		let k_enc = ecies_kdf_sha256(ephemeral_pubkey, SHARED_SECRET_32, INFO_V1, None)?;
-		assert_eq!(k_enc.len(), 32);
+	// Consolidated test for input validation
+	crate::test_case! {
+		name: test_ecies_kdf_input_validation,
+		setup: || {
+			// Invalid input test cases
+			let short_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"short", SHARED_SECRET_32, INFO_V1, None);
+			let wrong_size_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"wrong_size_ephemeral_key_34_bytes_", SHARED_SECRET_32, INFO_V1, None);
+			let short_secret_result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, b"short", INFO_V1, None);
+			let long_secret_result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, b"shared_secret_that_is_too_long____", INFO_V1, None);
 
-		Ok(())
+			(short_pubkey_result, wrong_size_pubkey_result, short_secret_result, long_secret_result)
+		},
+		assertions: |(short_pubkey_result, wrong_size_pubkey_result, short_secret_result, long_secret_result)| {
+			// Invalid public key lengths
+			assert_kdf_error!(short_pubkey_result, InvalidPublicKeyLength(5));
+			assert_kdf_error!(wrong_size_pubkey_result, InvalidPublicKeyLength(34));
+			// Invalid shared secret lengths
+			assert_kdf_error!(short_secret_result, InvalidSharedSecretLength(5));
+			assert_kdf_error!(long_secret_result, InvalidSharedSecretLength(34));
+
+			Ok(())
+		}
+	}
+
+	// Consolidated test for general-purpose HKDF
+	crate::test_case! {
+		name: test_hkdf_sha3_256_basic,
+		setup: || {
+			let ikm = b"input_key_material";
+			let info = b"test_info";
+
+			// Test different key sizes
+			let key_16 = hkdf::<HkdfSha3_256, 16>(ikm, info, None).unwrap();
+			let key_32 = hkdf::<HkdfSha3_256, 32>(ikm, info, None).unwrap();
+			let key_64 = hkdf::<HkdfSha3_256, 64>(ikm, info, None).unwrap();
+
+			// Determinism test
+			let key_32_again = hkdf::<HkdfSha3_256, 32>(ikm, info, None).unwrap();
+			// Different inputs test
+			let key_different = hkdf::<HkdfSha3_256, 32>(b"different_ikm", info, None).unwrap();
+
+			(key_16, key_32, key_64, key_32_again, key_different)
+		},
+		assertions: |(key_16, key_32, key_64, key_32_again, key_different)| {
+			// Check key lengths
+			assert_key_length!(key_16, 16);
+			assert_key_length!(key_32, 32);
+			assert_key_length!(key_64, 64);
+			// Same inputs should produce same outputs (determinism)
+			assert_eq!(key_32[..], key_32_again[..]);
+			// Different inputs should produce different outputs
+			assert_keys_different!(key_32, key_different);
+
+			Ok(())
+		}
+	}
+
+	// Test bounds checking for dual key derivation
+	crate::test_case! {
+		name: test_ecies_kdf_bounds_checking,
+		setup: || {
+			// Test maximum allowed key size (64 bytes * 2 = 128 bytes = MAX_HKDF_OUTPUT_SIZE)
+			let max_size_result = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None);
+			// Test oversized key size that should fail (65 bytes * 2 = 130 bytes > MAX_HKDF_OUTPUT_SIZE)
+			let oversized_result = ecies_kdf_with_size::<HkdfSha3_256, 65>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None);
+
+			(max_size_result, oversized_result)
+		},
+		assertions: |(max_size_result, oversized_result)| {
+			// Maximum allowed size should work
+			assert!(max_size_result.is_ok());
+			let (k_enc, k_mac) = max_size_result.unwrap();
+			assert_key_pair_lengths!(k_enc, k_mac, 64);
+
+			// Oversized key should fail with DerivationFailed
+			assert!(oversized_result.is_err());
+			assert!(matches!(oversized_result, Err(KdfError::DerivationFailed(_))));
+
+			Ok(())
+		}
+	}
+
+	// Smoke tests for ANSI X9.63 provider over SHA3-256
+	crate::test_case! {
+		name: test_x963_ecies_kdf_basic,
+		setup: || {
+			let key1 = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let key1_again = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let key_diff_info = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V2, None).unwrap();
+			// Salt is ignored by X9.63; with vs without salt should be equal
+			let key_with_salt = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, Some(SALT)).unwrap();
+			(key1, key1_again, key_diff_info, key_with_salt)
+		},
+		assertions: |(key1, key1_again, key_diff_info, key_with_salt)| {
+			assert_key_length(&key1, 32);
+			assert_keys_equal(&key1, &key1_again);
+			assert_keys_different(&key1, &key_diff_info);
+			// Salt should have no effect in X9.63
+			assert_keys_equal(&key1, &key_with_salt);
+			Ok(())
+		}
+	}
+
+	crate::test_case! {
+		name: test_x963_ecies_kdf_size_variations,
+		setup: || {
+			let keys_16 = ecies_kdf_with_size::<X963Sha3_256, 16>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let keys_32 = ecies_kdf_with_size::<X963Sha3_256, 32>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			(keys_16, keys_32)
+		},
+		assertions: |(keys_16, keys_32)| {
+			let (k_enc_16, k_mac_16) = keys_16;
+			let (k_enc_32, k_mac_32) = keys_32;
+			assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
+			assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
+			assert_keys_different!(k_enc_32, k_mac_32);
+			Ok(())
+		}
 	}
 }

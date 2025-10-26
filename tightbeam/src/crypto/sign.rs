@@ -14,6 +14,7 @@ pub mod ecdsa {
 }
 
 // Re-exports
+pub use elliptic_curve;
 pub use signature::*;
 
 use crate::cms::content_info::CmsVersion;
@@ -33,14 +34,14 @@ where
 	type DigestAlgorithm: Digest + AssociatedOid;
 
 	/// Sign data and return the signature information
-	fn to_signer_info(&self, data: &[u8]) -> crate::error::Result<SignerInfo> {
+	fn to_signer_info(&self, data: impl AsRef<[u8]>) -> crate::error::Result<SignerInfo> {
 		// Compute digest first
 		let mut hasher = Self::DigestAlgorithm::new();
-		hasher.update(data);
+		hasher.update(&data);
 		hasher.finalize();
 
 		// Sign the data
-		let signature: S = self.try_sign(data)?;
+		let signature: S = self.try_sign(data.as_ref())?;
 		let signature_bytes = signature.to_bytes();
 		let signature_value = SignatureValue::new(signature_bytes.as_ref())?;
 

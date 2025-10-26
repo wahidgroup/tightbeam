@@ -71,7 +71,7 @@ macro_rules! client {
 	(async connect $protocol:path: $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
 		#[cfg(feature = "tokio")]
 		async {
-			let stream = <$protocol as Prot$crate::transport::Protocol>::connect($addr).await
+			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await
 				.map_err(|e| $crate::transport::error::TransportError::from(e))?;
 			let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
 			$(

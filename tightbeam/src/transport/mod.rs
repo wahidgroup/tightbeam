@@ -35,6 +35,40 @@ pub type TransportResult<T> = Result<T, TransportError>;
 /// Marker crate for applications to handle the address the way they wish
 pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
 
+#[cfg(all(feature = "x509", feature = "std"))]
+#[derive(Clone)]
+pub struct TransportEncryptionConfig {
+	pub certificate: crate::x509::Certificate,
+	#[cfg(feature = "secp256k1")]
+	pub signatory: std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
+	pub aad_domain_tag: Vec<u8>,
+	pub max_cleartext_envelope: usize,
+	pub max_encrypted_envelope: usize,
+	pub handshake_timeout: std::time::Duration,
+	pub enforce_encryption: bool,
+	pub accept_cleartext_before_handshake: bool,
+}
+
+#[cfg(all(feature = "x509", feature = "std"))]
+impl TransportEncryptionConfig {
+	#[cfg(feature = "secp256k1")]
+	pub fn new(
+		certificate: crate::x509::Certificate,
+		signatory: std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
+	) -> Self {
+		Self {
+			certificate,
+			signatory,
+			aad_domain_tag: b"tb-v1".to_vec(),
+			max_cleartext_envelope: 128 * 1024,
+			max_encrypted_envelope: 256 * 1024,
+			handshake_timeout: std::time::Duration::from_secs(10),
+			enforce_encryption: true,
+			accept_cleartext_before_handshake: true,
+		}
+	}
+}
+
 // Remove Sequence derive, implement custom encoding
 #[derive(Debug, Clone)]
 pub struct RequestPackage {
@@ -282,19 +316,10 @@ where
 	type Encryptor: crate::crypto::aead::Encryptor<O>;
 	type Decryptor: crate::crypto::aead::Decryptor;
 
-	/// Bind to an address with an X.509 certificate and signing key for ECIES encryption
-	#[cfg(feature = "secp256k1")]
+	/// Bind to an address with transport encryption configuration
 	fn bind_with(
 		addr: Self::Address,
-		cert: crate::crypto::x509::Certificate,
-		signing_key: crate::crypto::sign::ecdsa::Secp256k1SigningKey,
-	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
-
-	/// Bind to an address with an X.509 certificate for ECIES encryption
-	#[cfg(not(feature = "secp256k1"))]
-	fn bind_with(
-		addr: Self::Address,
-		cert: crate::crypto::x509::Certificate,
+		config: TransportEncryptionConfig,
 	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
 }
 

@@ -92,6 +92,7 @@
 
 // TODO Find a way
 #![allow(macro_expanded_macro_exports_accessed_by_absolute_paths)]
+#![forbid(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]
@@ -171,6 +172,7 @@ tightbeam_derive::generate_builders!();
 
 /// Secure bytes type
 pub type ZeroizingBytes = zeroize::Zeroizing<Vec<u8>>;
+pub type ZeroizingArray<const N: usize> = zeroize::Zeroizing<[u8; N]>;
 
 #[cfg(test)]
 mod tests {

@@ -45,8 +45,16 @@ pub struct TokioListener {
 	listener: TcpListener,
 	#[cfg(feature = "x509")]
 	certificate: Option<crate::x509::Certificate>,
+	#[cfg(feature = "x509")]
+	aad_domain_tag: Option<Vec<u8>>,
+	#[cfg(feature = "x509")]
+	max_cleartext_envelope: Option<usize>,
+	#[cfg(feature = "x509")]
+	max_encrypted_envelope: Option<usize>,
+	#[cfg(feature = "x509")]
+	handshake_timeout: Option<Duration>,
 	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	signing_key: Option<crate::crypto::sign::ecdsa::Secp256k1SigningKey>,
+	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 }
 
 impl TokioListener {
@@ -60,8 +68,16 @@ impl TokioListener {
 			listener,
 			#[cfg(feature = "x509")]
 			certificate: None,
+			#[cfg(feature = "x509")]
+			aad_domain_tag: None,
+			#[cfg(feature = "x509")]
+			max_cleartext_envelope: None,
+			#[cfg(feature = "x509")]
+			max_encrypted_envelope: None,
+			#[cfg(feature = "x509")]
+			handshake_timeout: None,
 			#[cfg(all(feature = "x509", feature = "secp256k1"))]
-			signing_key: None,
+			signatory: None,
 		})
 	}
 
@@ -80,9 +96,26 @@ impl TokioListener {
 			transport.server_certificate = Some(cert.clone());
 		}
 
+		if let Some(ref aad) = self.aad_domain_tag {
+			transport.aad_domain_tag = Some(aad.clone());
+		}
+
+		if let Some(max) = self.max_cleartext_envelope {
+			transport.max_cleartext_envelope = Some(max);
+		}
+
+		if let Some(max) = self.max_encrypted_envelope {
+			transport.max_encrypted_envelope = Some(max);
+		}
+
+		#[cfg(feature = "x509")]
+		if let Some(timeout) = self.handshake_timeout {
+			transport.handshake_timeout = timeout;
+		}
+
 		#[cfg(feature = "secp256k1")]
-		if let Some(key) = &self.signing_key {
-			transport.signing_key = Some(key.clone());
+		if let Some(signatory) = &self.signatory {
+			transport.signatory = Some(signatory.clone());
 		}
 
 		Ok((transport, addr))
@@ -108,8 +141,16 @@ impl Protocol for TokioListener {
 				listener,
 				#[cfg(feature = "x509")]
 				certificate: None,
+				#[cfg(feature = "x509")]
+				aad_domain_tag: None,
+				#[cfg(feature = "x509")]
+				max_cleartext_envelope: None,
+				#[cfg(feature = "x509")]
+				max_encrypted_envelope: None,
+				#[cfg(feature = "x509")]
+				handshake_timeout: None,
 				#[cfg(all(feature = "x509", feature = "secp256k1"))]
-				signing_key: None,
+				signatory: None,
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
@@ -134,32 +175,27 @@ impl EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid> for TokioListene
 	type Encryptor = crate::crypto::aead::Aes256Gcm;
 	type Decryptor = crate::crypto::aead::Aes256Gcm;
 
-	#[cfg(feature = "secp256k1")]
 	async fn bind_with(
 		addr: Self::Address,
-		cert: crate::crypto::x509::Certificate,
-		signing_key: crate::crypto::sign::ecdsa::Secp256k1SigningKey,
+		config: crate::transport::TransportEncryptionConfig,
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
 		Ok((
-			Self { listener, certificate: Some(cert), signing_key: Some(signing_key) },
+			Self {
+				listener,
+				certificate: Some(config.certificate.clone()),
+				aad_domain_tag: Some(config.aad_domain_tag.clone()),
+				max_cleartext_envelope: Some(config.max_cleartext_envelope),
+				max_encrypted_envelope: Some(config.max_encrypted_envelope),
+				handshake_timeout: Some(config.handshake_timeout),
+				signatory: Some(config.signatory.clone()),
+			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
 	}
 
-	#[cfg(not(feature = "secp256k1"))]
-	async fn bind_with(
-		addr: Self::Address,
-		cert: crate::crypto::x509::Certificate,
-	) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = TcpListener::bind(addr.0).await?;
-		let bound_addr = listener.local_addr()?;
-		Ok((
-			Self { listener, certificate: Some(cert) },
-			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
-		))
-	}
+	// Non-secp256k1 builds can be extended later if needed
 }
 
 #[cfg(feature = "x509")]
@@ -191,7 +227,16 @@ where
 	}
 
 	fn set_symmetric_key(&mut self, key: Self::Encryptor) {
+		// Replace existing key, ensuring the old key material is dropped immediately
+		let _ = self.symmetric_key.take();
 		self.symmetric_key = Some(key);
+	}
+}
+
+// Ensure symmetric key material is dropped when the transport is dropped
+impl<S: AsyncProtocolStream> Drop for TcpTransport<S> {
+	fn drop(&mut self) {
+		let _ = self.symmetric_key.take();
 	}
 }
 
@@ -206,8 +251,13 @@ impl AsyncListenerTrait for TokioListener {
 		}
 
 		#[cfg(all(feature = "x509", feature = "secp256k1"))]
-		if let Some(ref key) = self.signing_key {
-			transport.signing_key = Some(key.clone());
+		if let Some(ref signatory) = self.signatory {
+			transport.signatory = Some(signatory.clone());
+		}
+
+		#[cfg(feature = "x509")]
+		if let Some(timeout) = self.handshake_timeout {
+			transport.handshake_timeout = timeout;
 		}
 
 		Ok((transport, crate::transport::tcp::TightBeamSocketAddr(addr)))
@@ -229,11 +279,21 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 	#[cfg(feature = "x509")]
+	#[allow(dead_code)]
 	server_public_key: Option<Secp256k1VerifyingKey>,
 	#[cfg(feature = "x509")]
+	#[allow(dead_code)]
 	enforce_encryption: bool,
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
+	#[cfg(feature = "x509")]
+	aad_domain_tag: Option<Vec<u8>>,
+	#[cfg(feature = "x509")]
+	max_cleartext_envelope: Option<usize>,
+	#[cfg(feature = "x509")]
+	max_encrypted_envelope: Option<usize>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
 	handshake_state: HandshakeState,
 	#[cfg(feature = "x509")]
@@ -242,6 +302,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
 }
 
+// (single Drop impl above covers both feature variants)
 #[cfg(feature = "transport-policy")]
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
@@ -250,13 +311,21 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "x509")]
+	#[allow(dead_code)]
 	server_public_key: Option<Secp256k1VerifyingKey>,
 	#[cfg(feature = "x509")]
+	#[allow(dead_code)]
 	enforce_encryption: bool,
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
+	#[cfg(feature = "x509")]
+	aad_domain_tag: Option<Vec<u8>>,
+	#[cfg(feature = "x509")]
+	max_cleartext_envelope: Option<usize>,
+	#[cfg(feature = "x509")]
+	max_encrypted_envelope: Option<usize>,
 	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	signing_key: Option<crate::crypto::sign::ecdsa::Secp256k1SigningKey>,
+	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
 	handshake_state: HandshakeState,
 	#[cfg(feature = "x509")]
@@ -284,26 +353,123 @@ where
 	TransportError: From<S::Error>,
 {
 	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
+		use tokio::time::timeout;
+		// Compute handshake deadline before mutably borrowing the stream
+		#[cfg(feature = "x509")]
+		let handshake_deadline: Option<std::time::Instant> = {
+			use crate::transport::handshake::HandshakeState;
+			match self.handshake_state() {
+				HandshakeState::AwaitingServerResponse { initiated_at }
+				| HandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.handshake_timeout),
+				_ => None,
+			}
+		};
+
 		let stream = self.stream.inner_mut();
 
 		let mut tag = [0u8; 1];
-		stream.read_exact(&mut tag).await?;
+		#[cfg(feature = "x509")]
+		{
+			if let Some(deadline) = handshake_deadline {
+				let now = std::time::Instant::now();
+				if now >= deadline {
+					return Err(TransportError::Timeout);
+				}
+				let dur = deadline.saturating_duration_since(now);
+				timeout(dur, stream.read_exact(&mut tag))
+					.await
+					.map_err(|_| TransportError::Timeout)??;
+			} else {
+				stream.read_exact(&mut tag).await?;
+			}
+		}
+		#[cfg(not(feature = "x509"))]
+		{
+			stream.read_exact(&mut tag).await?;
+		}
 
 		let mut length_first = [0u8; 1];
-		stream.read_exact(&mut length_first).await?;
+		#[cfg(feature = "x509")]
+		{
+			if let Some(deadline) = handshake_deadline {
+				let now = std::time::Instant::now();
+				if now >= deadline {
+					return Err(TransportError::Timeout);
+				}
+				let dur = deadline.saturating_duration_since(now);
+				timeout(dur, stream.read_exact(&mut length_first))
+					.await
+					.map_err(|_| TransportError::Timeout)??;
+			} else {
+				stream.read_exact(&mut length_first).await?;
+			}
+		}
+		#[cfg(not(feature = "x509"))]
+		{
+			stream.read_exact(&mut length_first).await?;
+		}
 
 		let (length_octets, content_length) = if length_first[0] & 0x80 == 0 {
 			(vec![], length_first[0] as usize)
 		} else {
 			let octet_count = (length_first[0] & 0x7F) as usize;
 			let mut length_octets = vec![0u8; octet_count];
-			stream.read_exact(&mut length_octets).await?;
+			#[cfg(feature = "x509")]
+			{
+				if let Some(deadline) = handshake_deadline {
+					let now = std::time::Instant::now();
+					if now >= deadline {
+						return Err(TransportError::Timeout);
+					}
+					let dur = deadline.saturating_duration_since(now);
+					timeout(dur, stream.read_exact(&mut length_octets))
+						.await
+						.map_err(|_| TransportError::Timeout)??;
+				} else {
+					stream.read_exact(&mut length_octets).await?;
+				}
+			}
+			#[cfg(not(feature = "x509"))]
+			{
+				stream.read_exact(&mut length_octets).await?;
+			}
 			let length = Self::parse_der_length(length_first[0], &length_octets);
 			(length_octets, length)
 		};
 
+		// Enforce size ceilings if configured
+		#[cfg(feature = "x509")]
+		{
+			// We can’t tell encrypted vs cleartext at this point, so choose the larger cap conservatively
+			let max_allowed = self
+				.max_encrypted_envelope
+				.or(self.max_cleartext_envelope)
+				.unwrap_or(512 * 1024);
+			if content_length > max_allowed {
+				return Err(TransportError::InvalidMessage);
+			}
+		}
+
 		let mut content = vec![0u8; content_length];
-		stream.read_exact(&mut content).await?;
+		#[cfg(feature = "x509")]
+		{
+			if let Some(deadline) = handshake_deadline {
+				let now = std::time::Instant::now();
+				if now >= deadline {
+					return Err(TransportError::Timeout);
+				}
+				let dur = deadline.saturating_duration_since(now);
+				timeout(dur, stream.read_exact(&mut content))
+					.await
+					.map_err(|_| TransportError::Timeout)??;
+			} else {
+				stream.read_exact(&mut content).await?;
+			}
+		}
+		#[cfg(not(feature = "x509"))]
+		{
+			stream.read_exact(&mut content).await?;
+		}
 
 		let buffer = Self::reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content);
 		Ok(buffer)
@@ -343,6 +509,27 @@ where
 				Err(e) => return Err(TransportError::DerError(e)),
 			};
 
+			// Enforce per-envelope size ceilings: cleartext vs encrypted
+			#[cfg(feature = "x509")]
+			{
+				match &wire_envelope {
+					WireEnvelope::Cleartext(_) => {
+						if let Some(max) = self.max_cleartext_envelope {
+							if wire_bytes.len() > max {
+								return Err(TransportError::InvalidMessage);
+							}
+						}
+					}
+					WireEnvelope::Encrypted(_) => {
+						if let Some(max) = self.max_encrypted_envelope {
+							if wire_bytes.len() > max {
+								return Err(TransportError::InvalidMessage);
+							}
+						}
+					}
+				}
+			}
+
 			// Only enable handshake/encryption logic if server has a certificate configured
 			let has_certificate = self.server_certificate().is_some();
 
@@ -370,6 +557,8 @@ where
 								if self.handshake_state() == HandshakeState::Complete {
 									// Circuit breaker: reset state on protocol violation
 									self.set_handshake_state(HandshakeState::None);
+									// Drop symmetric key to force re-handshake and zeroize underlying material
+									self.symmetric_key = None;
 									return Err(TransportError::MissingEncryption);
 								}
 								// Before handshake or no certificate, allow cleartext requests
@@ -385,7 +574,11 @@ where
 					// Decrypt the envelope (requires certificate/handshake)
 					let decrypted_bytes = match self.decryptor()?.decrypt_content(&encrypted_info) {
 						Ok(bytes) => bytes,
-						Err(_) => return Err(TransportError::InvalidMessage),
+						Err(_) => {
+							// Drop symmetric key on decrypt failure
+							self.symmetric_key = None;
+							return Err(TransportError::Forbidden);
+						}
 					};
 					<Self as MessageIO>::decode_envelope(&decrypted_bytes)?
 				}
@@ -434,13 +627,28 @@ where
 		let wire_envelope = if self.handshake_state() == HandshakeState::Complete {
 			// Use encryption after handshake complete
 			let envelope_bytes = response_envelope.to_der()?;
+			// Enforce size ceiling for encrypted responses
+			if let Some(max) = self.max_encrypted_envelope {
+				if envelope_bytes.len() > max {
+					return Err(TransportError::InvalidMessage);
+				}
+			}
 			let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
 			let encrypted =
 				<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, &nonce, None)?;
 			WireEnvelope::Encrypted(encrypted)
 		} else {
 			// Use cleartext before handshake or when no certificate
-			WireEnvelope::Cleartext(response_envelope)
+			// Enforce size ceiling for cleartext responses
+			{
+				let bytes = response_envelope.to_der()?;
+				if let Some(max) = self.max_cleartext_envelope {
+					if bytes.len() > max {
+						return Err(TransportError::InvalidMessage);
+					}
+				}
+				WireEnvelope::Cleartext(response_envelope)
+			}
 		};
 
 		let wire_bytes = wire_envelope.to_der()?;
@@ -481,8 +689,8 @@ where
 			// Evaluate gate policy before sending
 			let status: TransitStatus = self.get_emitter_gate_policy().evaluate(&current_message);
 			if status != TransitStatus::Accepted {
-				// The gate did not accept the message
-				return Err(<TransportError as From<TransitStatus>>::from(status));
+				// The gate did not accept the message: map to Unauthorized per policy
+				return Err(TransportError::Unauthorized);
 			}
 
 			// Check if handshake is needed before sending
@@ -503,6 +711,11 @@ where
 				println!("Client: encrypting message");
 				use crate::crypto::aead::{Aes256GcmOid, Encryptor};
 				let envelope_bytes = envelope.to_der()?;
+				if let Some(max) = self.max_encrypted_envelope {
+					if envelope_bytes.len() > max {
+						return Err(TransportError::InvalidMessage);
+					}
+				}
 				let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
 				let encrypted =
 					<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, &nonce, None)?;
@@ -510,7 +723,15 @@ where
 			} else {
 				// Use cleartext before handshake or when no certificate
 				println!("Client: sending cleartext");
-				WireEnvelope::Cleartext(envelope.clone())
+				{
+					let bytes = envelope.to_der()?;
+					if let Some(max) = self.max_cleartext_envelope {
+						if bytes.len() > max {
+							return Err(TransportError::InvalidMessage);
+						}
+					}
+					WireEnvelope::Cleartext(envelope.clone())
+				}
 			};
 
 			self.write_envelope(&wire_envelope.to_der()?).await?;
@@ -680,7 +901,12 @@ mod tests {
 		)?;
 
 		let addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
-		let (listener, socket_addr) = TokioListener::bind_with(addr, cert.clone(), signing_key.clone()).await?;
+		let config = crate::transport::TransportEncryptionConfig::new(
+			cert.clone(),
+			std::sync::Arc::new(signing_key.clone())
+				as std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
+		);
+		let (listener, socket_addr) = TokioListener::bind_with(addr, config).await?;
 		let server = listener;
 
 		let test_message = create_v0_tightbeam(None, None);

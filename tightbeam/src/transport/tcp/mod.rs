@@ -13,10 +13,13 @@ use crate::transport::{Protocol, ProtocolStream};
 
 #[cfg(not(feature = "tokio"))]
 use crate::transport::tcp::r#async::TcpTransport;
-#[cfg(feature = "x509")]
-use crate::transport::EncryptedProtocol;
 #[cfg(feature = "std")]
 use crate::transport::{tcp::sync::TcpTransport, Mycelial};
+
+/// Maximum wire size allowed for handshake-phase messages.
+/// Handshake messages are small (cert + SPKI + nonces + signature + ECIES blob),
+/// therefore we use a much tighter cap than general envelopes to reduce DoS risk.
+pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
 
 /// Abstract TCP listener trait for different networking backends.
 pub trait TcpListenerTrait: Protocol + Send {
@@ -66,32 +69,7 @@ impl Protocol for std::net::TcpListener {
 	}
 }
 
-#[cfg(feature = "x509")]
-impl EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid> for std::net::TcpListener {
-	type Encryptor = crate::crypto::aead::Aes256Gcm;
-	type Decryptor = crate::crypto::aead::Aes256Gcm;
-
-	#[cfg(feature = "secp256k1")]
-	async fn bind_with(
-		addr: Self::Address,
-		_cert: x509_cert::Certificate,
-		_signing_key: crate::crypto::sign::ecdsa::Secp256k1SigningKey,
-	) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = std::net::TcpListener::bind(addr.0)?;
-		let bound_addr = listener.local_addr()?;
-		Ok((listener, TightBeamSocketAddr(bound_addr)))
-	}
-
-	#[cfg(not(feature = "secp256k1"))]
-	async fn bind_with(
-		addr: Self::Address,
-		_cert: x509_cert::Certificate,
-	) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = std::net::TcpListener::bind(addr.0)?;
-		let bound_addr = listener.local_addr()?;
-		Ok((listener, TightBeamSocketAddr(bound_addr)))
-	}
-}
+// The EncryptedProtocol impl for sync TCP lives on the wrapper in sync.rs
 
 #[cfg(feature = "std")]
 impl Mycelial for std::net::TcpListener {
@@ -197,8 +175,14 @@ macro_rules! impl_tcp_common {
 					enforce_encryption: false,
 					#[cfg(feature = "x509")]
 					server_certificate: None,
+					#[cfg(feature = "x509")]
+					aad_domain_tag: None,
+					#[cfg(feature = "x509")]
+					max_cleartext_envelope: None,
+					#[cfg(feature = "x509")]
+					max_encrypted_envelope: None,
 					#[cfg(all(feature = "x509", feature = "secp256k1"))]
-					signing_key: None,
+									signatory: None,
 					#[cfg(feature = "x509")]
 					handshake_state: $crate::transport::handshake::HandshakeState::None,
 					#[cfg(feature = "x509")]
@@ -231,8 +215,14 @@ macro_rules! impl_tcp_common {
 					enforce_encryption: false,
 					#[cfg(feature = "x509")]
 					server_certificate: None,
+					#[cfg(feature = "x509")]
+					aad_domain_tag: None,
+					#[cfg(feature = "x509")]
+					max_cleartext_envelope: None,
+					#[cfg(feature = "x509")]
+					max_encrypted_envelope: None,
 					#[cfg(all(feature = "x509", feature = "secp256k1"))]
-					signing_key: None,
+									signatory: None,
 					#[cfg(feature = "x509")]
 					handshake_state: $crate::transport::handshake::HandshakeState::None,
 					#[cfg(feature = "x509")]
@@ -298,6 +288,9 @@ macro_rules! impl_tcp_common {
 
 				// Step 1: Generate and send ClientHello
 				let client_hello_bytes = handshake.initiate_client().await?;
+				if client_hello_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+					return Err(TransportError::InvalidMessage);
+				}
 				let client_hello_envelope = TransportEnvelope::from_der(&client_hello_bytes)?;
 				let wire_envelope = WireEnvelope::Cleartext(client_hello_envelope);
 				self.write_envelope(&wire_envelope.to_der()?).await?;
@@ -316,6 +309,9 @@ macro_rules! impl_tcp_common {
 
 				// Step 2: Receive ServerHandshake response
 				let response_wire_bytes = self.read_envelope().await?;
+				if response_wire_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+					return Err(TransportError::InvalidMessage);
+				}
 				let response_wire = WireEnvelope::from_der(&response_wire_bytes)?;
 
 				// Unwrap WireEnvelope to get TransportEnvelope
@@ -329,12 +325,18 @@ macro_rules! impl_tcp_common {
 
 				// Re-encode TransportEnvelope for process_server_response
 				let response_bytes = response_envelope.to_der()?;
+				if response_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+					return Err(TransportError::InvalidMessage);
+				}
 
 				// Step 3: Process ServerHandshake, derive session key, and get ClientKeyExchange to send
 				let session_key = handshake.process_server_response(&response_bytes).await?;
 
 				// Step 4: Send ClientKeyExchange (if pending)
 				if let Some(client_kex_bytes) = handshake.take_client_key_exchange() {
+					if client_kex_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+						return Err(TransportError::InvalidMessage);
+					}
 					let client_kex_envelope = TransportEnvelope::from_der(&client_kex_bytes)?;
 					let wire_envelope = WireEnvelope::Cleartext(client_kex_envelope);
 					self.write_envelope(&wire_envelope.to_der()?).await?;
@@ -359,19 +361,29 @@ macro_rules! impl_tcp_common {
 				use crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
 				use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
-				// Get server certificate and signing key
+				if handshake_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+					return Err(TransportError::InvalidMessage);
+				}
+				// Get server certificate and signatory
 				let cert = self.server_certificate().ok_or(TransportError::Forbidden)?.clone();
-				let signing_key = self.signing_key.as_ref().ok_or(TransportError::Forbidden)?.clone();
+				let signatory = self.signatory.as_ref().ok_or(TransportError::Forbidden)?.clone();
 
 				// Get or create handshake instance (persists state across ClientHello → ClientKeyExchange)
 				if self.handshake.is_none() {
-					self.handshake = Some(TightBeamHandshake::new_server(cert, signing_key));
+					// If available in transport, bind AAD domain tag from transport; otherwise let handshake default
+					let aad = self.aad_domain_tag.clone();
+					self.handshake = Some(TightBeamHandshake::new_server(cert, signatory, aad));
 				}
 
 				let handshake = self.handshake.as_mut().unwrap();
 
 				// Process handshake message (ClientHello or ClientKeyExchange)
 				let response_bytes = handshake.handle_client_request(handshake_bytes).await?;
+				if !response_bytes.is_empty()
+					&& response_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE
+				{
+					return Err(TransportError::InvalidMessage);
+				}
 
 				// Send response if any (ServerHandshake for ClientHello, empty for ClientKeyExchange)
 				if !response_bytes.is_empty() {
@@ -379,6 +391,20 @@ macro_rules! impl_tcp_common {
 					let server_envelope = TransportEnvelope::from_der(&response_bytes)?;
 					let wire_envelope = WireEnvelope::Cleartext(server_envelope);
 					self.write_envelope(&wire_envelope.to_der()?).await?;
+
+					// Set server awaiting state with timeout tracking
+					#[cfg(feature = "std")]
+					{
+						self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingClientFinish {
+							initiated_at: std::time::Instant::now(),
+						});
+					}
+					#[cfg(not(feature = "std"))]
+					{
+						self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingClientFinish {
+							initiated_at: 0,
+						});
+					}
 				} else {
 					// Empty response means ClientKeyExchange was processed - complete handshake
 					let session_key = handshake.complete_server_handshake().await?;
