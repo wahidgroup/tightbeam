@@ -1,5 +1,6 @@
 mod utils;
 
+pub mod policy;
 pub mod secret;
 
 #[cfg(feature = "aead")]

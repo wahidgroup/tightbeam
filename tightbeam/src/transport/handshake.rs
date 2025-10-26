@@ -21,18 +21,105 @@ use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::kdf::{hkdf, HkdfSha3_256};
 use crate::crypto::secret::ToInsecure;
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::Verifier;
 use crate::der::{Decode, Encode, Sequence};
 use crate::random::generate_nonce;
 use crate::transport::error::TransportError;
 use crate::transport::TransportEnvelope;
-use crate::Beamable;
-
-#[cfg(feature = "x509")]
 use crate::x509::Certificate;
+use crate::Beamable;
 
 #[cfg(feature = "std")]
 use std::time::Instant;
+
+// ============================================================================
+// Certificate Validation
+// ============================================================================
+
+/// Validate certificate expiration using time feature (preferred)
+#[cfg(feature = "time")]
+fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
+	use time::OffsetDateTime;
+
+	// Check certificate validity period using time crate
+	let now = OffsetDateTime::now_utc();
+	let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
+	let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
+
+	let now_duration = time::Duration::seconds(now.unix_timestamp());
+
+	if now_duration < not_before {
+		return Err(HandshakeError::ProtocolError("Certificate not yet valid".into()));
+	}
+
+	if now_duration > not_after {
+		return Err(HandshakeError::ProtocolError("Certificate expired".into()));
+	}
+
+	Ok(())
+}
+
+/// Validate certificate expiration using std::time (fallback)
+#[cfg(all(feature = "std", not(feature = "time")))]
+fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
+	// Check certificate validity period using std::time
+	let now = std::time::SystemTime::now();
+	let not_before = cert.tbs_certificate.validity.not_before.to_system_time();
+	let not_after = cert.tbs_certificate.validity.not_after.to_system_time();
+
+	if now < not_before {
+		return Err(HandshakeError::ProtocolError("Certificate not yet valid".into()));
+	}
+
+	if now > not_after {
+		return Err(HandshakeError::ProtocolError("Certificate expired".into()));
+	}
+
+	Ok(())
+}
+
+/// Validate certificate with provided timestamp (no_std without time feature)
+///
+/// For no_std environments without the time feature, certificate validation
+/// requires an explicit timestamp to be provided by the caller.
+/// This allows embedded systems to use hardware RTCs or external time sources.
+#[cfg(all(not(feature = "std"), not(feature = "time")))]
+fn validate_certificate_with_timestamp(cert: &Certificate, current_timestamp: u64) -> Result<(), HandshakeError> {
+	use der::DateTime;
+
+	let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
+	let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
+
+	let now_duration =
+		der::asn1::GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(current_timestamp))
+			.map_err(|_| HandshakeError::ProtocolError("Invalid timestamp".into()))?
+			.to_unix_duration();
+
+	if now_duration < not_before {
+		return Err(HandshakeError::ProtocolError("Certificate not yet valid".into()));
+	}
+
+	if now_duration > not_after {
+		return Err(HandshakeError::ProtocolError("Certificate expired".into()));
+	}
+
+	Ok(())
+}
+
+/// Validate certificate without timestamp checking (no_std without time feature)
+///
+/// WARNING: This does not validate certificate expiration!
+/// Only use this for testing or in environments where time validation
+/// is handled externally.
+#[cfg(all(not(feature = "std"), not(feature = "time")))]
+fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
+	// Basic validation only - no expiration check without timestamp
+	// The caller should use validate_certificate_with_timestamp() instead
+	// if they have access to current time
+	let _ = cert;
+	Ok(())
+}
 
 // ============================================================================
 // Server key abstraction for handshake (sign + decrypt), hides raw key material
@@ -307,7 +394,7 @@ fn perform_ecies_encryption(
 		aad_domain_tag,
 		Some(&mut rand_core::OsRng),
 	)
-	.map_err(|_| HandshakeError::ProtocolError("ECIES encryption failed".into()))?;
+	.map_err(|e| HandshakeError::ProtocolError(format!("ECIES encryption failed: {:?}", e)))?;
 
 	// Serialize ECIES message
 	Ok(encrypted_message.to_bytes())
@@ -390,6 +477,15 @@ impl TightBeamHandshake {
 		}
 	}
 
+	/// Validate certificate with provided timestamp (for no_std environments)
+	///
+	/// This method is useful in no_std environments where the time feature
+	/// is not available. The caller must provide a current UNIX timestamp.
+	#[cfg(all(not(feature = "std"), not(feature = "time")))]
+	pub fn validate_cert_with_timestamp(cert: &Certificate, current_timestamp: u64) -> Result<(), HandshakeError> {
+		validate_certificate_with_timestamp(cert, current_timestamp)
+	}
+
 	/// Derive final session key from base key and both randoms
 	/// final_key = HKDF(base_key, salt: client_random || server_random, info: "tightbeam-session-v1")
 	fn derive_final_session_key(
@@ -443,6 +539,9 @@ impl HandshakeProtocol for TightBeamHandshake {
 			TransportEnvelope::ServerHandshake(handshake) => handshake,
 			_ => return Err(HandshakeError::InvalidServerKeyExchange.into()),
 		};
+
+		// Validate certificate (expiration, etc.)
+		validate_certificate(&server_handshake.certificate)?;
 
 		// Extract server_random
 		let server_random: [u8; 32] =
@@ -512,7 +611,7 @@ impl HandshakeProtocol for TightBeamHandshake {
 				// Parse ECIES message from encrypted_data
 				let encrypted_bytes = client_kex.encrypted_data.as_bytes();
 				let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)
-					.map_err(|_| HandshakeError::ProtocolError("Invalid ECIES message".into()))?;
+					.map_err(|e| HandshakeError::ProtocolError(format!("Invalid ECIES message: {:?}", e)))?;
 
 				// Decrypt using configured server key
 				let server_key = self
@@ -521,7 +620,7 @@ impl HandshakeProtocol for TightBeamHandshake {
 					.ok_or_else(|| HandshakeError::ProtocolError("No server key".into()))?;
 				let decrypted = server_key
 					.decrypt_ecies(&encrypted_message, self.aad_domain_tag.as_deref())
-					.map_err(|_| HandshakeError::ProtocolError("ECIES decryption failed".into()))?;
+					.map_err(|e| HandshakeError::ProtocolError(format!("ECIES decryption failed: {:?}", e)))?;
 
 				// Consume the secret to get the raw bytes for parsing
 				let decrypted = decrypted.to_insecure();
@@ -537,11 +636,14 @@ impl HandshakeProtocol for TightBeamHandshake {
 				client_random.copy_from_slice(&decrypted[32..]);
 
 				// Verify client_random matches the one from ClientHello (replay protection)
+				// Using constant-time comparison to prevent timing attacks
 				let expected_client_random = self
 					.client_random
 					.ok_or_else(|| HandshakeError::ProtocolError("No client_random from ClientHello".into()))?;
 
-				if client_random != expected_client_random {
+				// Constant-time comparison to prevent timing side-channel attacks
+				let is_equal: bool = client_random.ct_eq(&expected_client_random).into();
+				if !is_equal {
 					return Err(HandshakeError::ProtocolError(
 						"client_random mismatch - possible replay attack".into(),
 					)
