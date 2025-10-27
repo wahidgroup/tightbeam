@@ -394,7 +394,7 @@ fn perform_ecies_encryption(
 		aad_domain_tag,
 		Some(&mut rand_core::OsRng),
 	)
-	.map_err(|e| HandshakeError::ProtocolError(format!("ECIES encryption failed: {:?}", e)))?;
+	.map_err(|e| HandshakeError::ProtocolError(format!("ECIES encryption failed: {e:?}")))?;
 
 	// Serialize ECIES message
 	Ok(encrypted_message.to_bytes())
@@ -523,7 +523,7 @@ impl HandshakeProtocol for TightBeamHandshake {
 		// Generate client random
 		let client_random = generate_random_nonce()?;
 		self.client_random = Some(client_random); // Create ClientHello
-		let client_hello = ClientHello { client_random: OctetString::new(&client_random)? };
+		let client_hello = ClientHello { client_random: OctetString::new(client_random)? };
 
 		// Encode as TransportEnvelope
 		let envelope = TransportEnvelope::ClientHello(client_hello);
@@ -551,7 +551,7 @@ impl HandshakeProtocol for TightBeamHandshake {
 
 		// Extract and verify server's certificate public key
 		let verifying_key = Self::extract_verifying_key(&server_handshake.certificate)?;
-		self.server_verifying_key = Some(verifying_key.clone());
+		self.server_verifying_key = Some(verifying_key);
 
 		// Verify signature over H(client_random || server_random || SPKI)
 		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
@@ -611,20 +611,16 @@ impl HandshakeProtocol for TightBeamHandshake {
 				// Parse ECIES message from encrypted_data
 				let encrypted_bytes = client_kex.encrypted_data.as_bytes();
 				let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)
-					.map_err(|e| HandshakeError::ProtocolError(format!("Invalid ECIES message: {:?}", e)))?;
+					.map_err(|e| HandshakeError::ProtocolError(format!("Invalid ECIES message: {e:?}")))?;
 
 				// Decrypt using configured server key
-				let server_key = self
-					.server_key
-					.as_ref()
-					.ok_or_else(|| HandshakeError::ProtocolError("No server key".into()))?;
+				let server_key = self.server_key.as_ref().ok_or(HandshakeError::MissingServerKey)?;
 				let decrypted = server_key
 					.decrypt_ecies(&encrypted_message, self.aad_domain_tag.as_deref())
-					.map_err(|e| HandshakeError::ProtocolError(format!("ECIES decryption failed: {:?}", e)))?;
+					.map_err(|e| HandshakeError::ProtocolError(format!("ECIES decryption failed: {e:?}")))?;
 
 				// Consume the secret to get the raw bytes for parsing
 				let decrypted = decrypted.to_insecure();
-
 				// Extract base_key and client_random
 				if decrypted.len() != 64 {
 					return Err(HandshakeError::ProtocolError("Invalid decrypted payload size".into()).into());
@@ -637,9 +633,9 @@ impl HandshakeProtocol for TightBeamHandshake {
 
 				// Verify client_random matches the one from ClientHello (replay protection)
 				// Using constant-time comparison to prevent timing attacks
-				let expected_client_random = self
-					.client_random
-					.ok_or_else(|| HandshakeError::ProtocolError("No client_random from ClientHello".into()))?;
+				let expected_client_random = self.client_random.ok_or(HandshakeError::MissingClientRandom)?;
+
+				core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
 				// Constant-time comparison to prevent timing side-channel attacks
 				let is_equal: bool = client_random.ct_eq(&expected_client_random).into();
@@ -649,6 +645,8 @@ impl HandshakeProtocol for TightBeamHandshake {
 					)
 					.into());
 				}
+
+				core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
 				self.base_session_key = Some(base_key);
 				// client_random already set from ClientHello, no need to overwrite
@@ -664,19 +662,11 @@ impl HandshakeProtocol for TightBeamHandshake {
 	}
 
 	async fn complete_server_handshake(&mut self) -> Result<Self::SessionKey, Self::Error> {
-		ensure_server_role(self.role)?; // Derive final session key
-		let base_key = self
-			.base_session_key
-			.as_ref()
-			.ok_or_else(|| HandshakeError::ProtocolError("No base session key".into()))?;
-		let client_random = self
-			.client_random
-			.as_ref()
-			.ok_or_else(|| HandshakeError::ProtocolError("No client random".into()))?;
-		let server_random = self
-			.server_random
-			.as_ref()
-			.ok_or_else(|| HandshakeError::ProtocolError("No server random".into()))?;
+		ensure_server_role(self.role)?;
+		// Derive final session key
+		let base_key = self.base_session_key.as_ref().ok_or(HandshakeError::MissingBaseSessionKey)?;
+		let client_random = self.client_random.as_ref().ok_or(HandshakeError::MissingClientRandomState)?;
+		let server_random = self.server_random.as_ref().ok_or(HandshakeError::MissingServerRandom)?;
 
 		let final_key: Aes256Gcm = self.derive_final_session_key(base_key, client_random, server_random)?;
 
@@ -711,7 +701,6 @@ impl TightBeamHandshake {
 	fn handle_client_hello(&mut self, client_hello: ClientHello) -> Result<Vec<u8>, TransportError> {
 		// Extract client_random
 		let client_random: [u8; 32] = octet_string_to_array(&client_hello.client_random, "Invalid client_random size")?;
-
 		self.client_random = Some(client_random);
 
 		// Generate server random
@@ -719,16 +708,13 @@ impl TightBeamHandshake {
 		self.server_random = Some(server_random);
 
 		// Sign H(client_random || server_random || SPKI) using configured server key
-		let server_key = self
-			.server_key
-			.as_ref()
-			.ok_or_else(|| HandshakeError::ProtocolError("No server key".into()))?;
+		let server_key = self.server_key.as_ref().ok_or(HandshakeError::MissingServerKey)?;
 
 		// Compute digest H(client_random || server_random || SPKI)
 		let spki_bytes = self
 			.server_cert
 			.as_ref()
-			.ok_or_else(|| HandshakeError::InvalidCertificate)?
+			.ok_or(HandshakeError::MissingServerCertificate)?
 			.tbs_certificate
 			.subject_public_key_info
 			.subject_public_key
@@ -742,8 +728,8 @@ impl TightBeamHandshake {
 
 		// Create ServerHandshake
 		let server_handshake = ServerHandshake {
-			certificate: self.server_cert.clone().ok_or_else(|| HandshakeError::InvalidCertificate)?,
-			server_random: OctetString::new(&server_random)?,
+			certificate: self.server_cert.clone().ok_or(HandshakeError::MissingServerCertificate)?,
+			server_random: OctetString::new(server_random)?,
 			signature: OctetString::new(signature.to_bytes().as_slice())?,
 		};
 

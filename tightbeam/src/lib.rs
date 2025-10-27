@@ -254,6 +254,6 @@ mod tests {
 		// Encode to DER
 		let der_bytes = der::Encode::to_der(&frame).unwrap();
 		println!("DER-encoded frame size: {} bytes", der_bytes.len());
-		assert!(der_bytes.len() > 0);
+		assert!(!der_bytes.is_empty());
 	}
 }

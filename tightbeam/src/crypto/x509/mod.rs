@@ -1,23 +1,29 @@
 // Re-exports
 pub use x509_cert::*;
 
-mod error;
+pub mod error;
+
+use core::time::Duration;
 
 use crate::asn1::GeneralizedTime;
+use crate::crypto::policy::VerificationPolicy;
+use crate::crypto::sign::Verifier;
 use crate::crypto::x509::error::CertificateValidationError;
+use crate::der::Encode;
 
-/// Trait for certificate validation strategies
+/// Trait for certificate validation strategies.
 ///
 /// This trait allows pluggable certificate validation with different
 /// policies and trust models. Implementors can validate certificates
-/// against specific requirements (expiration, trust chains, revocation, etc.)
-pub trait CertificateValidation {
-	/// Validate a certificate given the current time and issuer public key
+/// against specific requirements.
+pub trait CertificateValidation<P: VerificationPolicy> {
+	/// Validate a certificate given the current time and expected signing key
 	///
 	/// # Arguments
 	/// * `cert` - The certificate to validate
-	/// * `current_time` - Current UNIX timestamp (seconds since epoch)
-	/// * `issuer_public_key` - Public key of the certificate issuer (for signature verification)
+	/// * `curr_time` - Current UNIX timestamp (seconds since epoch)
+	/// * `policy` - Verification policy to use for validation
+	/// * `expected_pub_key` - Public key expected to have signed this certificate
 	///   - For self-signed certificates, use the certificate's own public key
 	///   - For CA-signed certificates, use the CA's public key
 	///   - If None, signature verification is skipped
@@ -28,8 +34,9 @@ pub trait CertificateValidation {
 	fn validate(
 		&self,
 		cert: &Certificate,
-		current_time: u64,
-		issuer_public_key: Option<&[u8]>,
+		curr_time: u64,
+		policy: &P,
+		expected_pub_key: impl AsRef<[u8]>,
 	) -> Result<(), CertificateValidationError>;
 }
 
@@ -37,24 +44,51 @@ pub trait CertificateValidation {
 ///
 /// Validates:
 /// 1. Certificate structure integrity
-/// 2. Expiration (not_before <= current_time <= not_after)
-/// 3. Signature verification (if issuer_public_key is provided)
-#[derive(Default, Clone, Copy)]
-pub struct DefaultCertificateValidator;
+/// 2. Expiration (not_before <= curr_time <= not_after)
+/// 3. Signature verification (if expected_pub_key is provided)
+/// 4. Optional trust chain validation
+#[derive(Default, Clone)]
+pub struct CertificateValidator {
+	trust_chain: Vec<Certificate>,
+}
 
-impl CertificateValidation for DefaultCertificateValidator {
+impl CertificateValidator {
+	/// Create a new certificate validator with an optional trust chain
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Add a trust chain to the validator
+	///
+	/// # Arguments
+	/// * `trust_chain` - Vector of certificates representing the trust chain
+	///
+	/// # Returns
+	/// * `Self` - The validator with the trust chain added
+	pub fn with_trust_chain(mut self, trust_chain: Vec<Certificate>) -> Self {
+		self.trust_chain = trust_chain;
+		self
+	}
+}
+
+impl<P: VerificationPolicy> CertificateValidation<P> for CertificateValidator
+where
+	P::VerifyingKey: Verifier<P::Signature>,
+	for<'a> P::Signature: TryFrom<&'a [u8]>,
+	for<'a> CertificateValidationError: From<<P::Signature as TryFrom<&'a [u8]>>::Error>,
+{
 	fn validate(
 		&self,
 		cert: &Certificate,
-		current_time: u64,
-		issuer_public_key: Option<&[u8]>,
+		curr_time: u64,
+		policy: &P,
+		expected_pub_key: impl AsRef<[u8]>,
 	) -> Result<(), CertificateValidationError> {
 		// Step 1: Validate certificate expiration
 		let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
 		let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
-
-		let now_duration = GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(current_time))
-			.map_err(|e| CertificateValidationError::InvalidTimestamp(format!("{}", e)))?
+		let now_duration = GeneralizedTime::from_unix_duration(Duration::from_secs(curr_time))
+			.map_err(|_| CertificateValidationError::InvalidTimestamp)?
 			.to_unix_duration();
 
 		if now_duration < not_before {
@@ -67,58 +101,33 @@ impl CertificateValidation for DefaultCertificateValidator {
 
 		// Step 2: Extract and validate the subject public key
 		let subject_public_key = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
-
 		if subject_public_key.is_empty() {
 			return Err(CertificateValidationError::EmptyPublicKey);
 		}
 
-		// Step 3: Verify signature if issuer public key is provided
-		if let Some(issuer_key_bytes) = issuer_public_key {
-			// Extract the signature from the certificate
-			let signature_bytes = cert.signature.raw_bytes();
-			if signature_bytes.is_empty() {
-				return Err(CertificateValidationError::EmptySignature);
-			}
-
-			// The TBS (To Be Signed) certificate is what gets signed
-			// We need to re-encode it to verify the signature
-			use crate::der::Encode;
-			let tbs_der = cert.tbs_certificate.to_der()?;
-
-			// Hash the TBS certificate using the signature algorithm
-			// For now, we'll use SHA3-256 as it's our standard
-			use crate::crypto::hash::{Digest, Sha3_256};
-			let tbs_hash = Sha3_256::digest(&tbs_der);
-
-			// Verify the signature using the issuer's public key
-			// This assumes ECDSA with secp256k1 - we should check the algorithm OID
-			#[cfg(feature = "secp256k1")]
-			{
-				use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
-				use crate::crypto::sign::Verifier;
-
-				// Parse the issuer's public key
-				let issuer_pubkey = k256::PublicKey::from_sec1_bytes(issuer_key_bytes)?;
-				let verifying_key = Secp256k1VerifyingKey::from(issuer_pubkey);
-
-				// Parse the signature
-				let signature = Secp256k1Signature::try_from(signature_bytes)?;
-
-				// Verify the signature over the TBS hash
-				let mut hash_array = [0u8; 32];
-				hash_array.copy_from_slice(&tbs_hash);
-
-				verifying_key.verify(&hash_array, &signature)?;
-			}
-
-			#[cfg(not(feature = "secp256k1"))]
-			{
-				return Err(CertificateValidationError::UnsupportedAlgorithm(
-					"Signature verification requires secp256k1 feature".into(),
-				));
-			}
+		// Step 3: Verify signature if expected signing key is provided
+		// Extract the signature from the certificate
+		let signature_bytes = cert.signature.raw_bytes();
+		if signature_bytes.is_empty() {
+			return Err(CertificateValidationError::EmptySignature);
 		}
 
+		// Extract the signature algorithm OID
+		let algorithm_oid = &cert.signature_algorithm.oid;
+		if cert.signature_algorithm.oid != cert.tbs_certificate.signature.oid {
+			return Err(CertificateValidationError::AlgorithmMismatch);
+		}
+
+		let tbs_der = cert.tbs_certificate.to_der()?;
+		// Parse the signature using the policy's signature type
+		let signature = P::Signature::try_from(signature_bytes)?;
+		// Use the policy to create a verifying key for this algorithm
+		let verifying_key = policy
+			.to_verifying_key(algorithm_oid, expected_pub_key.as_ref())
+			.map_err(|_| CertificateValidationError::UnsupportedAlgorithm(*algorithm_oid))?;
+
+		// Verify the signature over the TBS certificate
+		verifying_key.verify(&tbs_der, &signature)?;
 		Ok(())
 	}
 }

@@ -261,7 +261,7 @@ where
 			}
 			let nonce = crate::random::generate_nonce::<12>(None)?;
 			let encrypted =
-				<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, &nonce, None)?;
+				<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, nonce, None)?;
 			WireEnvelope::Encrypted(encrypted)
 		} else {
 			let bytes = response_envelope.to_der()?;
@@ -324,7 +324,7 @@ where
 				}
 				let nonce = crate::random::generate_nonce::<12>(None)?;
 				let encrypted =
-					<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, &nonce, None)?;
+					<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, nonce, None)?;
 				WireEnvelope::Encrypted(encrypted)
 			} else {
 				let bytes = envelope.to_der()?;

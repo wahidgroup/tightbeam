@@ -245,6 +245,7 @@ pub enum TransportEnvelope {
 
 /// Wire-level envelope that can be either cleartext or encrypted
 #[derive(Choice, Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum WireEnvelope {
 	#[asn1(context_specific = "0", constructed = "true")]
 	Cleartext(TransportEnvelope),

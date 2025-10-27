@@ -635,7 +635,7 @@ where
 			}
 			let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
 			let encrypted =
-				<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, &nonce, None)?;
+				<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, nonce, None)?;
 			WireEnvelope::Encrypted(encrypted)
 		} else {
 			// Use cleartext before handshake or when no certificate
@@ -718,7 +718,7 @@ where
 				}
 				let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
 				let encrypted =
-					<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, &nonce, None)?;
+					<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, nonce, None)?;
 				WireEnvelope::Encrypted(encrypted)
 			} else {
 				// Use cleartext before handshake or when no certificate
@@ -928,7 +928,7 @@ mod tests {
 			// and first application message. Gate returns Busy for first app message.
 			println!("Server: handling first request (handshake + app message)");
 			let result = transport.handle_request().await;
-			println!("Server: first handle_request result: {:?}", result);
+			println!("Server: first handle_request result: {result:?}");
 			result?;
 
 			// Second handle_request: processes second application message
@@ -943,7 +943,7 @@ mod tests {
 		// First emit triggers handshake, then sends encrypted message
 		// Gate policy returns Busy for first application message
 		let first = transport.emit(test_message.clone(), None).await;
-		println!("First attempt: {:?}", first);
+		println!("First attempt: {first:?}");
 		assert!(matches!(first, Err(TransportError::Busy)));
 
 		// Second emit sends encrypted message, gate returns Accepted

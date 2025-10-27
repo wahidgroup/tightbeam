@@ -19,8 +19,9 @@ pub enum HandshakeError {
 	InvalidPublicKey(k256::elliptic_curve::Error),
 
 	/// Invalid certificate
-	#[cfg_attr(feature = "derive", error("Invalid certificate"))]
-	InvalidCertificate,
+	#[cfg_attr(feature = "derive", error("Invalid certificate: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	CertificateValidationError(crate::crypto::x509::error::CertificateValidationError),
 
 	/// Signature verification failed
 	#[cfg_attr(feature = "derive", error("Handshake signature verification failed"))]
@@ -40,6 +41,30 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Invalid handshake state"))]
 	InvalidState,
 
+	/// Missing server key
+	#[cfg_attr(feature = "derive", error("Missing server key"))]
+	MissingServerKey,
+
+	/// Missing server certificate
+	#[cfg_attr(feature = "derive", error("Missing server certificate"))]
+	MissingServerCertificate,
+
+	/// Missing client random
+	#[cfg_attr(feature = "derive", error("Missing client random from ClientHello"))]
+	MissingClientRandom,
+
+	/// Missing base session key
+	#[cfg_attr(feature = "derive", error("Missing base session key"))]
+	MissingBaseSessionKey,
+
+	/// Missing client random
+	#[cfg_attr(feature = "derive", error("Missing client random"))]
+	MissingClientRandomState,
+
+	/// Missing server random
+	#[cfg_attr(feature = "derive", error("Missing server random"))]
+	MissingServerRandom,
+
 	/// Handshake timeout
 	#[cfg_attr(feature = "derive", error("Handshake timeout"))]
 	Timeout,
@@ -56,11 +81,17 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::InvalidClientKeyExchange => write!(f, "Invalid client key exchange message"),
 			HandshakeError::InvalidServerKeyExchange => write!(f, "Invalid server key exchange message"),
 			HandshakeError::InvalidPublicKey(e) => write!(f, "Invalid public key in handshake: {}", e),
-			HandshakeError::InvalidCertificate => write!(f, "Invalid certificate"),
+			HandshakeError::CertificateValidationError(e) => write!(f, "Invalid certificate: {}", e),
 			HandshakeError::EcdsaError(e) => write!(f, "ECDSA error: {}", e),
 			HandshakeError::SignatureVerificationFailed => write!(f, "Handshake signature verification failed"),
 			HandshakeError::KeyDerivationFailed(e) => write!(f, "Handshake key derivation failed: {}", e),
 			HandshakeError::InvalidState => write!(f, "Invalid handshake state"),
+			HandshakeError::MissingServerKey => write!(f, "Missing server key"),
+			HandshakeError::MissingServerCertificate => write!(f, "Missing server certificate"),
+			HandshakeError::MissingClientRandom => write!(f, "Missing client random from ClientHello"),
+			HandshakeError::MissingBaseSessionKey => write!(f, "Missing base session key"),
+			HandshakeError::MissingClientRandomState => write!(f, "Missing client random"),
+			HandshakeError::MissingServerRandom => write!(f, "Missing server random"),
 			HandshakeError::Timeout => write!(f, "Handshake timeout"),
 			HandshakeError::ProtocolError(msg) => write!(f, "Handshake protocol error: {}", msg),
 		}

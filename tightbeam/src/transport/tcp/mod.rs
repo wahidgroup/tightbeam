@@ -279,9 +279,9 @@ macro_rules! impl_tcp_common {
 			/// 4. Derives session key from ECDH
 			/// 5. Stores session key and marks handshake complete
 			async fn perform_client_handshake(&mut self) -> TransportResult<()> {
-				use crate::der::{Decode, Encode};
-				use crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
-				use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+				use $crate::der::{Decode, Encode};
+				use $crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
+				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 				// Create handshake instance
 				let mut handshake = TightBeamHandshake::new_client();
@@ -357,9 +357,9 @@ macro_rules! impl_tcp_common {
 			///
 			/// The handshake instance is stored in the transport and persists across both calls.
 			async fn perform_server_handshake(&mut self, handshake_bytes: &[u8]) -> TransportResult<()> {
-				use crate::der::{Decode, Encode};
-				use crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
-				use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+				use $crate::der::{Decode, Encode};
+				use $crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
+				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 				if handshake_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);

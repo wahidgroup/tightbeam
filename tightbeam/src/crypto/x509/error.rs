@@ -22,12 +22,12 @@ pub enum CertificateValidationError {
 	EmptySignature,
 
 	/// Invalid timestamp provided for validation
-	#[cfg_attr(feature = "derive", error("Invalid timestamp: {0}"))]
-	InvalidTimestamp(String),
+	#[cfg_attr(feature = "derive", error("Invalid timestamp"))]
+	InvalidTimestamp,
 
 	/// Signature algorithm not supported
 	#[cfg_attr(feature = "derive", error("Unsupported signature algorithm: {0}"))]
-	UnsupportedAlgorithm(String),
+	UnsupportedAlgorithm(der::asn1::ObjectIdentifier),
 
 	#[cfg_attr(feature = "derive", error("Invalid public key: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -64,12 +64,11 @@ impl core::fmt::Display for CertificateValidationError {
 			CertificateValidationError::NotYetValid => write!(f, "Certificate is not yet valid"),
 			CertificateValidationError::EmptyPublicKey => write!(f, "Certificate has empty subject public key"),
 			CertificateValidationError::EmptySignature => write!(f, "Certificate has empty signature"),
-			CertificateValidationError::InvalidTimestamp(msg) => write!(f, "Invalid timestamp: {}", msg),
-			CertificateValidationError::UnsupportedAlgorithm(msg) => {
-				write!(f, "Unsupported signature algorithm: {}", msg)
+			CertificateValidationError::InvalidTimestamp => write!(f, "Invalid timestamp"),
+			CertificateValidationError::UnsupportedAlgorithm(oid) => {
+				write!(f, "Unsupported signature algorithm: {}", oid)
 			}
-			CertificateValidationError::InvalidPublicKey(e) => write!(f, "Invalid public key: {}", e),
-			CertificateValidationError::InvalidSignature(e) => write!(f, "Invalid signature: {}", e),
+			CertificateValidationError::PublicKeyError(e) => write!(f, "Invalid public key: {}", e),
 			CertificateValidationError::SignatureVerificationFailed(e) => {
 				write!(f, "Signature verification failed: {}", e)
 			}

@@ -133,6 +133,10 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	EciesError(crate::crypto::ecies::EciesError),
 
+	#[cfg_attr(feature = "derive", error("Crypto policy error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	CryptoPolicyError(crate::crypto::policy::CryptoPolicyError),
+
 	/// Error obtaining random bytes from the OS
 	#[cfg(feature = "random")]
 	#[cfg_attr(feature = "derive", error("OS random number generator error: {0}"))]

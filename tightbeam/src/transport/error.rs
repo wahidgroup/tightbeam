@@ -95,7 +95,7 @@ impl From<std::net::AddrParseError> for TransportError {
 #[cfg(feature = "tokio")]
 impl From<tokio::task::JoinError> for TransportError {
 	fn from(err: tokio::task::JoinError) -> Self {
-		TransportError::IoError(std::io::Error::new(std::io::ErrorKind::Other, err))
+		TransportError::IoError(std::io::Error::other(err))
 	}
 }
 
