@@ -3,6 +3,7 @@
 //! Processes received KARI structures to extract the content-encryption key (CEK).
 
 use crate::cms::enveloped_data::KeyAgreeRecipientInfo;
+use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, FieldBytesSize, PublicKey, SecretKey};
@@ -125,7 +126,7 @@ where
 impl TightBeamKariRecipient<k256::Secp256k1> {
 	/// Create a recipient processor with default TightBeam settings.
 	pub fn with_defaults(recipient_priv: k256::SecretKey) -> Self {
-		Self::new(recipient_priv, b"tb-kari-v1")
+		Self::new(recipient_priv, TIGHTBEAM_KARI_KDF_INFO)
 	}
 }
 

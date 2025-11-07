@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use core::marker::PhantomData;
 
+use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::sign::EcdsaSignatureVerifier;
 use crate::der::Decode;
@@ -103,7 +104,7 @@ where
 		let enveloped_data = cms::enveloped_data::EnvelopedData::from_der(enveloped_data_der)?;
 
 		// Use trait method to decrypt KARI and get CEK (Content Encryption Key)
-		let cek = self.server_key.decrypt_kari(enveloped_data_der, b"tb-kari-v1", 0)?;
+		let cek = self.server_key.decrypt_kari(enveloped_data_der, TIGHTBEAM_KARI_KDF_INFO, 0)?;
 
 		// Decrypt the actual content using the CEK
 		let encrypted_content = &enveloped_data.encrypted_content;

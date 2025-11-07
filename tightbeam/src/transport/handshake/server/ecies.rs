@@ -13,6 +13,7 @@ use alloc::sync::Arc;
 use std::sync::Arc;
 
 use crate::asn1::OctetString;
+use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::{Aes256Gcm, KeyInit};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::kdf::{hkdf, HkdfSha3_256};
@@ -50,7 +51,7 @@ impl EciesHandshakeServer {
 	/// # Parameters
 	/// - `server_key`: The server's signing key for authentication (trait object)
 	/// - `server_cert`: The server's certificate
-	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption (defaults to "tb-v1")
+	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
 	pub fn new(
 		server_key: Arc<dyn ServerHandshakeKey>,
 		server_cert: Certificate,
@@ -64,7 +65,7 @@ impl EciesHandshakeServer {
 			server_random: None,
 			base_session_key: None,
 			transcript_hash: None,
-			aad_domain_tag: aad_domain_tag.or_else(|| Some(b"tb-v1".to_vec())),
+			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
 		}
 	}
 
@@ -254,7 +255,7 @@ impl EciesHandshakeServer {
 		let mut salt = [0u8; 64];
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
-		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, b"tightbeam-session-v1", Some(&salt))?;
+		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
 		Ok(Aes256Gcm::new_from_slice(&final_key_bytes[..])?)
 	}
 
@@ -267,7 +268,7 @@ impl EciesHandshakeServer {
 		let mut salt = [0u8; 64];
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
-		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, b"tightbeam-session-v1", Some(&salt))?;
+		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
 		Ok(final_key_bytes.to_vec())
 	}
 }

@@ -19,6 +19,7 @@ pub mod tcp;
 
 use crate::asn1::Frame;
 use crate::cms::enveloped_data::EncryptedContentInfo;
+use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::der::asn1::Uint;
 use crate::der::{Choice, Decode, DecodeValue, Encode, EncodeValue, FixedTag, Header, Length, Reader, Tag, Writer};
 use crate::policy::{GatePolicy, TransitStatus};
@@ -55,7 +56,7 @@ impl TransportEncryptionConfig {
 		Self {
 			certificate,
 			signatory,
-			aad_domain_tag: b"tb-v1".to_vec(),
+			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG.to_vec(),
 			max_cleartext_envelope: 128 * 1024,
 			max_encrypted_envelope: 256 * 1024,
 			handshake_timeout: std::time::Duration::from_secs(10),

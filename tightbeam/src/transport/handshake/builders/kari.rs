@@ -4,6 +4,7 @@
 //! to encrypt the content-encryption key for the recipient.
 
 use super::error::KariBuilderError;
+use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::transport::handshake::error::HandshakeError;
 use der::asn1::BitString;
 use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
@@ -77,7 +78,7 @@ where
 			recipient_rid: None,
 			ukm: None,
 			key_enc_alg: None,
-			kdf_info: b"tb-kari-v1",
+			kdf_info: TIGHTBEAM_KARI_KDF_INFO,
 			kdf: Box::new(hkdf_sha3_256),
 			key_wrapper: Box::new(aes_key_wrap),
 		}
@@ -152,7 +153,7 @@ where
 	/// Derive key-encryption key (KEK) using configured KDF.
 	///
 	/// Salt = UKM (clientNonce || serverNonce)
-	/// Info = self.kdf_info (e.g., b"tb-kari-v1")
+	/// Info = self.kdf_info (e.g., `TIGHTBEAM_KARI_KDF_INFO`)
 	/// Output = 32 bytes (AES-256 KEK)
 	fn derive_kek(&self, shared_secret: &[u8]) -> Result<Vec<u8>, KariBuilderError> {
 		let ukm = self.ukm.as_ref().ok_or(KariBuilderError::MissingUkm)?;
@@ -223,7 +224,7 @@ impl Default for TightBeamKariBuilder<k256::Secp256k1> {
 			recipient_rid: None,
 			ukm: None,
 			key_enc_alg: None,
-			kdf_info: b"tb-kari-v1",
+			kdf_info: TIGHTBEAM_KARI_KDF_INFO,
 			kdf: Box::new(hkdf_sha3_256),
 			key_wrapper: Box::new(aes_key_wrap),
 		}
