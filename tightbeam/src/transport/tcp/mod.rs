@@ -336,7 +336,7 @@ macro_rules! impl_tcp_common {
 				let client_hello = ClientHello::from_der(&initial_message)?;
 				#[cfg(test)]
 				eprintln!("Client: Parsed ClientHello, converting to SignedData");
-				let signed_data: $crate::cms::signed_data::SignedData = 
+				let signed_data: $crate::cms::signed_data::SignedData =
 					(&client_hello).try_into().map_err(|_e| {
 						#[cfg(test)]
 						eprintln!("Client: Failed to convert ClientHello to SignedData: {:?}", _e);
@@ -384,7 +384,7 @@ macro_rules! impl_tcp_common {
 					TransportEnvelope::SignedData(sd) => sd,
 					_ => return Err(TransportError::InvalidMessage),
 				};
-				let server_handshake: ServerHandshake = 
+				let server_handshake: ServerHandshake =
 					(&signed_data).try_into().map_err(|_| TransportError::InvalidMessage)?;
 				let response_bytes = server_handshake.to_der()?;
 				if response_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
@@ -411,7 +411,7 @@ macro_rules! impl_tcp_common {
 					// Parse ClientKeyExchange and wrap in EnvelopedData
 					use $crate::transport::handshake::ClientKeyExchange;
 					let client_kex = ClientKeyExchange::from_der(&msg_bytes)?;
-					let enveloped_data: $crate::cms::enveloped_data::EnvelopedData = 
+					let enveloped_data: $crate::cms::enveloped_data::EnvelopedData =
 						(&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
 					let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
 					let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
@@ -557,7 +557,7 @@ macro_rules! impl_tcp_common {
 					// Parse ServerHandshake and wrap in SignedData → TransportEnvelope
 					use $crate::transport::handshake::ServerHandshake;
 					let server_handshake = ServerHandshake::from_der(&response)?;
-					let signed_data: $crate::cms::signed_data::SignedData = 
+					let signed_data: $crate::cms::signed_data::SignedData =
 						(&server_handshake).try_into().map_err(|_| TransportError::InvalidMessage)?;
 					let server_envelope = TransportEnvelope::SignedData(signed_data);
 					let wire_envelope = WireEnvelope::Cleartext(server_envelope);
