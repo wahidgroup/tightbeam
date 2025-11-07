@@ -42,6 +42,10 @@ pub const SIGNER_ECDSA_WITH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::n
 /// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
 /// See `<https://oid-base.com/get/1.2.840.113549.1.7.1>`
 pub const DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
+/// id-envelopedData
+/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
+/// See `<https://oid-base.com/get/1.2.840.113549.1.7.3>`
+pub const ENVELOPED_DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.3");
 
 /// Protocol version determines metadata structure and features
 ///
@@ -207,4 +211,25 @@ pub struct Frame {
 	#[asn1(context_specific = "1", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub nonrepudiation: Option<SignerInfo>,
+}
+
+// Transport handshake attribute OIDs (FULL_CMS profile)
+// Enterprise arc placeholder: 1.3.6.1.4.1.55555.1.x
+// Replace 55555 with assigned enterprise number before production.
+#[cfg(feature = "transport")]
+pub mod transport {
+	use super::ObjectIdentifier;
+
+	pub const HANDSHAKE_PROTOCOL_VERSION_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.1");
+	pub const HANDSHAKE_ALGORITHM_PROFILE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.2");
+	pub const HANDSHAKE_CLIENT_NONCE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.3");
+	pub const HANDSHAKE_SELECT_VERSION_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.4");
+	pub const HANDSHAKE_SELECT_ALGORITHM_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.5");
+	pub const HANDSHAKE_SERVER_NONCE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.6");
+	pub const HANDSHAKE_ABORT_ALERT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.7");
+	pub const HANDSHAKE_TRANSCRIPT_HASH_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.8");
+
+	/// Composite profile OID (ECIES(secp256k1) + HKDF(SHA3-256) + AES-256-GCM)
+	pub const HANDSHAKE_PROFILE_ECIES_GCM_OID: ObjectIdentifier =
+		ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.100");
 }

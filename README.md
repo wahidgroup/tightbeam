@@ -800,13 +800,6 @@ For example, **I(t) = I(M_t; M_{t-1}) / H(M_t) ∈ (0,1)** may measure
 fidelity based on shared state, but I(t) is application-defined, constrained
 by hash consistency and partial state recovery.
 
-**Applications**:
-- **Consensus**: Nodes propose **M_t**, converging on a canonical DAG path.
-- **Event Sourcing**: Frames as immutable events, with **M_t** capturing state.
-- **Speculative Execution**: Fork **M_t** for "what-if" states, merge via consensus.
-- **Replication**: Causal links enable conflict-free merging, as nodes reconstruct the DAG.
-- **Tamper Detection**: Hash mismatches break the chain, ensuring I(t) > 0 only for valid states.
-
 #### 5.9.7 Summary
 
 The matrix supports flexible state representation, from simple flags to 

@@ -1,0 +1,275 @@
+//! SignedData builder for TightBeam CMS handshake.
+//!
+//! Creates CMS SignedData structures for authenticating handshake messages,
+//! particularly the Finished message that signs the transcript hash.
+
+use crate::cms::content_info::CmsVersion;
+use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
+use crate::crypto::hash::Digest;
+use crate::crypto::sign::Signer;
+use crate::der::asn1::{ObjectIdentifier, OctetString};
+use crate::der::{Decode, Encode};
+use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
+use crate::transport::handshake::error::HandshakeError;
+use crate::x509::ext::pkix::SubjectKeyIdentifier;
+use signature::{Keypair, SignatureEncoding};
+
+/// Builder for CMS `SignedData` structures in TightBeam handshake.
+///
+/// Signs content (typically a transcript hash) with the sender's private key
+/// to provide authentication and non-repudiation.
+///
+/// The builder is algorithm-agnostic and works with any signing key that
+/// implements the required traits.
+#[cfg(all(feature = "builder", feature = "signature"))]
+pub struct TightBeamSignedDataBuilder<S, D>
+where
+	S: SignatureEncoding,
+	D: Digest,
+{
+	/// Signer implementing signature creation
+	signer: Box<dyn Signer<S>>,
+	/// Digest algorithm for hashing content
+	digest_alg: AlgorithmIdentifierOwned,
+	/// Signature algorithm identifier
+	signature_alg: AlgorithmIdentifierOwned,
+	/// Signer identifier (SKID)
+	signer_id: SignerIdentifier,
+	/// Content type OID (default: id-data)
+	content_type: ObjectIdentifier,
+	_phantom: core::marker::PhantomData<D>,
+}
+
+#[cfg(all(feature = "builder", feature = "signature"))]
+impl<S, D> TightBeamSignedDataBuilder<S, D>
+where
+	S: SignatureEncoding,
+	D: Digest + der::oid::AssociatedOid,
+{
+	/// Create a new SignedData builder.
+	///
+	/// # Parameters
+	/// - `signer`: The signing key (must implement `Signer<S>` and `Keypair`)
+	/// - `digest_alg`: Algorithm identifier for the digest algorithm
+	/// - `signature_alg`: Algorithm identifier for the signature algorithm
+	///
+	/// # Returns
+	/// A new builder instance
+	pub fn new<K>(
+		signer: K,
+		digest_alg: AlgorithmIdentifierOwned,
+		signature_alg: AlgorithmIdentifierOwned,
+	) -> Result<Self, HandshakeError>
+	where
+		K: Signer<S> + Keypair + 'static,
+		K::VerifyingKey: EncodePublicKey,
+	{
+		// Generate SKID from public key
+		let verifying_key = signer.verifying_key();
+		let public_key_der = verifying_key.to_public_key_der()?;
+		let mut hasher = D::new();
+		hasher.update(public_key_der.as_bytes());
+		let skid_bytes = hasher.finalize();
+
+		let skid = SubjectKeyIdentifier(OctetString::new(&skid_bytes[..20])?);
+		let signer_id = SignerIdentifier::SubjectKeyIdentifier(skid);
+
+		Ok(Self {
+			signer: Box::new(signer),
+			digest_alg,
+			signature_alg,
+			signer_id,
+			content_type: crate::asn1::DATA_OID,
+			_phantom: core::marker::PhantomData,
+		})
+	}
+
+	/// Set the content type OID.
+	///
+	/// Default is `id-data` (1.2.840.113549.1.7.1).
+	pub fn with_content_type(mut self, content_type: ObjectIdentifier) -> Self {
+		self.content_type = content_type;
+		self
+	}
+
+	/// Build a SignedData structure by signing the provided content.
+	///
+	/// # Parameters
+	/// - `content`: The data to sign (typically a transcript hash)
+	///
+	/// # Returns
+	/// A complete CMS SignedData structure with signature
+	pub fn build(&mut self, content: &[u8]) -> Result<SignedData, HandshakeError> {
+		// 1. Hash the content
+		let mut hasher = D::new();
+		hasher.update(content);
+		let digest = hasher.finalize();
+		let digest_bytes = digest.as_slice();
+
+		// 2. Sign the digest
+		let signature = self.signer.try_sign(digest_bytes)?;
+		let signature_bytes = signature.to_bytes();
+
+		// 3. Create SignerInfo
+		let signer_info = SignerInfo {
+			version: CmsVersion::V1,
+			sid: self.signer_id.clone(),
+			digest_alg: self.digest_alg.clone(),
+			signed_attrs: None, // TightBeam uses simple signature without authenticated attributes
+			signature_algorithm: self.signature_alg.clone(),
+			signature: OctetString::new(signature_bytes.as_ref())?,
+			unsigned_attrs: None,
+		};
+
+		// 4. Create EncapsulatedContentInfo
+		let octet_string = OctetString::new(content)?;
+		let econtent_der = octet_string.to_der()?;
+		let econtent_any = der::Any::from_der(&econtent_der)?;
+
+		let encap_content = EncapsulatedContentInfo { econtent_type: self.content_type, econtent: Some(econtent_any) };
+
+		// 5. Build SignedData
+		Ok(SignedData {
+			version: CmsVersion::V1,
+			digest_algorithms: vec![self.digest_alg.clone()].try_into()?,
+			encap_content_info: encap_content,
+			certificates: None,
+			crls: None,
+			signer_infos: vec![signer_info].try_into()?,
+		})
+	}
+
+	/// Build and encode SignedData as DER bytes.
+	pub fn build_der(&mut self, content: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+		let signed_data = self.build(content)?;
+		Ok(signed_data.to_der()?)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[cfg(all(
+		feature = "builder",
+		feature = "signature",
+		feature = "secp256k1",
+		feature = "sha3"
+	))]
+	mod signed_data {
+		use super::*;
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+		use crate::der::Decode;
+		use crate::random::OsRng;
+
+		#[test]
+		fn test_build_signed_data() -> Result<(), Box<dyn std::error::Error>> {
+			// Generate signing key
+			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+
+			// Content to sign (e.g., transcript hash)
+			let transcript_hash = b"handshake_transcript_hash_placeholder_32bytes";
+
+			// Algorithm identifiers
+			let digest_alg = AlgorithmIdentifierOwned {
+				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
+				parameters: None,
+			};
+			let signature_alg = AlgorithmIdentifierOwned {
+				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), // ecdsa-with-SHA256
+				parameters: None,
+			};
+
+			// Build SignedData
+			let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
+				signing_key,
+				digest_alg,
+				signature_alg,
+			)?;
+			let signed_data = builder.build(transcript_hash)?;
+
+			// Verify structure
+			assert_eq!(signed_data.version, CmsVersion::V1);
+			assert_eq!(signed_data.digest_algorithms.len(), 1);
+			assert_eq!(signed_data.signer_infos.0.len(), 1);
+			assert_eq!(signed_data.encap_content_info.econtent_type, crate::asn1::DATA_OID);
+			assert!(signed_data.encap_content_info.econtent.is_some());
+
+			// Verify signer info
+			let signer_info = &signed_data.signer_infos.0.as_ref()[0];
+			assert_eq!(signer_info.version, CmsVersion::V1);
+			assert!(matches!(signer_info.sid, SignerIdentifier::SubjectKeyIdentifier(_)));
+			assert!(signer_info.signature.as_bytes().len() > 0);
+
+			Ok(())
+		}
+
+		#[test]
+		fn test_der_encoding() -> Result<(), Box<dyn std::error::Error>> {
+			// Generate signing key
+			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+
+			// Content to sign
+			let content = b"test_content";
+
+			// Algorithm identifiers
+			let digest_alg = AlgorithmIdentifierOwned {
+				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
+				parameters: None,
+			};
+			let signature_alg =
+				AlgorithmIdentifierOwned { oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), parameters: None };
+
+			// Build and encode
+			let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
+				signing_key,
+				digest_alg,
+				signature_alg,
+			)?;
+			let der_bytes = builder.build_der(content)?;
+
+			// Verify can decode
+			let decoded = SignedData::from_der(&der_bytes)?;
+			assert_eq!(decoded.version, CmsVersion::V1);
+			assert_eq!(decoded.signer_infos.0.len(), 1);
+
+			Ok(())
+		}
+
+		#[test]
+		fn test_custom_content_type() -> Result<(), Box<dyn std::error::Error>> {
+			// Generate signing key
+			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+
+			// Content to sign
+			let content = b"custom_content";
+
+			// Algorithm identifiers
+			let digest_alg = AlgorithmIdentifierOwned {
+				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
+				parameters: None,
+			};
+			let signature_alg =
+				AlgorithmIdentifierOwned { oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), parameters: None };
+
+			// Custom content type
+			let custom_oid = ObjectIdentifier::new_unwrap("1.2.3.4.5.6");
+
+			// Build with custom content type
+			let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
+				signing_key,
+				digest_alg,
+				signature_alg,
+			)?
+			.with_content_type(custom_oid);
+
+			let signed_data = builder.build(content)?;
+
+			// Verify custom content type
+			assert_eq!(signed_data.encap_content_info.econtent_type, custom_oid);
+
+			Ok(())
+		}
+	}
+}

@@ -11,6 +11,7 @@ words:
   - Beamable
   - ciphertext
   - ciphertexts
+  - crls
   - CSPRNG
   - Decorrelated
   - Decryptor
@@ -37,9 +38,11 @@ words:
   - nonrep
   - nonrepudiable
   - nonrepudiation
+  - oids
   - Pingable
   - pkcs
   - pkix
+  - recip
   - repr
   - REPUDIABLE
   - rsadsi
@@ -51,6 +54,7 @@ words:
   - smime
   - spki
   - tightbeam
+  - unwrapper
   - Wrkr
   - zeekstd
   - zeroize

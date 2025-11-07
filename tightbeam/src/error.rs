@@ -17,13 +17,19 @@ pub type CompressionResult<T> = core::result::Result<T, CompressionError>;
 /// Error indicating a mismatch between received and expected values
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExpectError<Received, Expected> {
-	received: Received,
-	expected: Expected,
+	pub received: Received,
+	pub expected: Expected,
 }
 
 impl<Received, Expected> From<(Received, Expected)> for ExpectError<Received, Expected> {
 	fn from((received, expected): (Received, Expected)) -> Self {
 		Self { received, expected }
+	}
+}
+
+impl<Received: core::fmt::Debug, Expected: core::fmt::Debug> core::fmt::Display for ExpectError<Received, Expected> {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		write!(f, "expected {:?}, got {:?}", self.expected, self.received)
 	}
 }
 

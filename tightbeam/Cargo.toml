@@ -33,7 +33,9 @@ aead = { workspace = true, optional = true }
 signature = { workspace = true, optional = true }
 digest = { workspace = true, optional = true }
 hkdf = { workspace = true, optional = true }
+aes = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
+aes-kw = { workspace = true, optional = true }
 sha3 = { workspace = true, optional = true }
 ecdsa = { workspace = true, optional = true }
 k256 = { workspace = true, optional = true }
@@ -93,7 +95,7 @@ crypto = ["random"]
 builder = ["derive", "x509-cert/builder"]
 policy = []
 router = []
-transport = []
+transport = ["cms/builder"]
 doc = []
 compress = ["tightbeam-derive?/compress"]
 transport-policy = ["transport", "policy"]
@@ -114,11 +116,14 @@ aead = [
 	"dep:crypto-common",
 	"tightbeam-derive?/aead",
 	"aead/rand_core",
+	"dep:aes",
+	"dep:aes-kw",
 ]
 signature = [
 	"crypto",
 	"tightbeam-derive?/signature",
 	"dep:signature",
+	"cms/signature",
 	"x509-cert/signature",
 ]
 digest = ["crypto", "dep:digest", "tightbeam-derive?/digest"]
@@ -131,7 +136,7 @@ random = ["dep:rand_core"]
 zeroize = ["dep:zeroize", "der/zeroize", "cms/zeroize", "aes-gcm?/zeroize"]
 
 ## Cryptographic algorithm features
-aes-gcm = ["crypto", "aead", "dep:aes-gcm"]
+aes-gcm = ["crypto", "aead", "dep:aes-gcm", "cms/aes"]
 sha3 = ["crypto", "dep:sha3"]
 secp256k1 = ["crypto", "dep:k256"]
 

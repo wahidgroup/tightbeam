@@ -44,10 +44,12 @@ signature = { version = "2.2.0", default-features = false, features = [
 	"alloc",
 ] }
 digest = { version = "0.10.7", default-features = false, features = ["alloc"] }
+aes = { version = "0.8.4", default-features = false }
 aes-gcm = { version = "0.10.3", default-features = false, features = [
 	"aes",
 	"alloc",
 ] }
+aes-kw = { version = "0.2.1", default-features = false, features = ["alloc"] }
 sha3 = { version = "0.10.8", default-features = false, features = ["oid"] }
 ecdsa = { version = "0.16.9", default-features = false, features = [
 	"signing",

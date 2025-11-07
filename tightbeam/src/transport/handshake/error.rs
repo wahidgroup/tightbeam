@@ -5,6 +5,7 @@ use crate::Errorizable;
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]
 pub enum HandshakeError {
+	// ---------------- Protocol & structure specific ----------------
 	/// Invalid client key exchange message
 	#[cfg_attr(feature = "derive", error("Invalid client key exchange message"))]
 	InvalidClientKeyExchange,
@@ -32,10 +33,25 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", from)]
 	KeyDerivationFailed(crate::crypto::aead::Error),
 
+	/// Underlying DER encode/decode error
+	#[cfg_attr(feature = "derive", error("DER error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	DerError(der::Error),
+
 	/// ECDSA error
 	#[cfg_attr(feature = "derive", error("ECDSA error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	EcdsaError(crate::crypto::sign::ecdsa::Error),
+
+	/// SPKI (SubjectPublicKeyInfo) error
+	#[cfg_attr(feature = "derive", error("SPKI error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	SpkiError(spki::Error),
+
+	/// CMS builder error
+	#[cfg_attr(feature = "derive", error("CMS builder error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	CmsBuilderError(cms::builder::Error),
 
 	/// Invalid handshake state
 	#[cfg_attr(feature = "derive", error("Invalid handshake state"))]
@@ -48,6 +64,10 @@ pub enum HandshakeError {
 	/// Missing server certificate
 	#[cfg_attr(feature = "derive", error("Missing server certificate"))]
 	MissingServerCertificate,
+
+	/// Missing client certificate
+	#[cfg_attr(feature = "derive", error("Missing client certificate"))]
+	MissingClientCertificate,
 
 	/// Missing client random
 	#[cfg_attr(feature = "derive", error("Missing client random from ClientHello"))]
@@ -69,9 +89,82 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Handshake timeout"))]
 	Timeout,
 
-	/// Handshake protocol error
-	#[cfg_attr(feature = "derive", error("Handshake protocol error: {0}"))]
-	ProtocolError(String),
+	// ---------------- Attribute / ASN.1 profile errors ----------------
+	#[cfg_attr(feature = "derive", error("Attribute must contain exactly one value"))]
+	InvalidAttributeArity,
+	#[cfg_attr(feature = "derive", error("Duplicate attribute present"))]
+	DuplicateAttribute,
+	#[cfg_attr(feature = "derive", error("Required attribute missing"))]
+	MissingAttribute,
+	#[cfg_attr(feature = "derive", error("Nonce value not valid OCTET STRING"))]
+	InvalidNonceEncoding,
+	#[cfg_attr(feature = "derive", error("Nonce length mismatch: {0}"))]
+	NonceLengthError(crate::error::ExpectError<usize, usize>),
+	#[cfg_attr(feature = "derive", error("OCTET STRING length mismatch: {0}"))]
+	OctetStringLengthError(crate::error::ExpectError<usize, usize>),
+	#[cfg_attr(feature = "derive", error("Version/alert value not valid INTEGER"))]
+	InvalidIntegerEncoding,
+	#[cfg_attr(feature = "derive", error("INTEGER out of range"))]
+	IntegerOutOfRange,
+	#[cfg_attr(feature = "derive", error("Unknown alert code: {0:?}"))]
+	UnknownAlertCode(u8),
+
+	// ---------------- Certificate time validation ----------------
+	#[cfg_attr(feature = "derive", error("Certificate not yet valid"))]
+	CertificateNotYetValid,
+	#[cfg_attr(feature = "derive", error("Certificate expired"))]
+	CertificateExpired,
+	#[cfg_attr(feature = "derive", error("Invalid timestamp"))]
+	InvalidTimestamp,
+
+	// ---------------- ECIES / encryption path ----------------
+	#[cfg_attr(feature = "derive", error("ECIES encryption failed: {0}"))]
+	EciesEncryptionFailed(String),
+	#[cfg_attr(feature = "derive", error("Invalid ECIES message: {0}"))]
+	InvalidEciesMessage(String),
+	#[cfg_attr(feature = "derive", error("ECIES decryption failed: {0}"))]
+	EciesDecryptionFailed(String),
+	#[cfg_attr(feature = "derive", error("Invalid decrypted payload size"))]
+	InvalidDecryptedPayloadSize,
+	#[cfg_attr(feature = "derive", error("client_random mismatch - possible replay attack"))]
+	ClientRandomMismatchReplay,
+
+	// ---------------- Key agreement / CMS KARI ----------------
+	#[cfg_attr(feature = "derive", error("ECDH operation failed"))]
+	EcdhFailed,
+	#[cfg_attr(feature = "derive", error("KDF operation failed"))]
+	KdfError,
+	#[cfg_attr(
+		feature = "derive",
+		error("Invalid key size: expected {expected}, got {received}")
+	)]
+	InvalidKeySize { expected: usize, received: usize },
+	#[cfg_attr(feature = "derive", error("ASN.1 encoding error: {0}"))]
+	Asn1Error(der::Error),
+	#[cfg_attr(feature = "derive", error("Invalid recipient index"))]
+	InvalidRecipientIndex,
+	#[cfg_attr(feature = "derive", error("Missing UKM in KeyAgreeRecipientInfo"))]
+	MissingUkm,
+	#[cfg_attr(feature = "derive", error("Failed to parse originator public key"))]
+	InvalidOriginatorPublicKey,
+	#[cfg_attr(feature = "derive", error("Unsupported originator identifier type"))]
+	UnsupportedOriginatorIdentifier,
+	#[cfg_attr(feature = "derive", error("KARI builder already consumed"))]
+	KariBuilderConsumed,
+	#[cfg_attr(feature = "derive", error("Content encryption algorithm not set"))]
+	MissingContentEncryptionAlgorithm,
+	#[cfg(all(feature = "builder", feature = "aead"))]
+	#[cfg_attr(feature = "derive", error("AES key wrap operation failed: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	AesKeyWrap(aes_kw::Error),
+
+	// ---------------- Random generation ----------------
+	#[cfg_attr(feature = "derive", error("Random generation failed"))]
+	RandomGenerationFailed,
+
+	// ---------------- Generic octet string length (server_random/client_random etc.) ----------------
+	#[cfg_attr(feature = "derive", error("Invalid OCTET STRING length: {0}"))]
+	InvalidOctetStringLength(&'static str),
 }
 
 #[cfg(not(feature = "derive"))]
@@ -83,6 +176,8 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::InvalidPublicKey(e) => write!(f, "Invalid public key in handshake: {}", e),
 			HandshakeError::CertificateValidationError(e) => write!(f, "Invalid certificate: {}", e),
 			HandshakeError::EcdsaError(e) => write!(f, "ECDSA error: {}", e),
+			HandshakeError::SpkiError(e) => write!(f, "SPKI error: {}", e),
+			HandshakeError::CmsBuilderError(e) => write!(f, "CMS builder error: {}", e),
 			HandshakeError::SignatureVerificationFailed => write!(f, "Handshake signature verification failed"),
 			HandshakeError::KeyDerivationFailed(e) => write!(f, "Handshake key derivation failed: {}", e),
 			HandshakeError::InvalidState => write!(f, "Invalid handshake state"),
@@ -93,7 +188,43 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::MissingClientRandomState => write!(f, "Missing client random"),
 			HandshakeError::MissingServerRandom => write!(f, "Missing server random"),
 			HandshakeError::Timeout => write!(f, "Handshake timeout"),
-			HandshakeError::ProtocolError(msg) => write!(f, "Handshake protocol error: {}", msg),
+			HandshakeError::DerError(e) => write!(f, "DER error: {}", e),
+			HandshakeError::InvalidAttributeArity => write!(f, "Attribute must contain exactly one value"),
+			HandshakeError::DuplicateAttribute => write!(f, "Duplicate attribute present"),
+			HandshakeError::MissingAttribute => write!(f, "Required attribute missing"),
+			HandshakeError::InvalidNonceEncoding => write!(f, "Nonce value not valid OCTET STRING"),
+			HandshakeError::NonceLengthError(e) => write!(f, "Nonce length mismatch: {}", e),
+			HandshakeError::OctetStringLengthError(e) => write!(f, "OCTET STRING length mismatch: {}", e),
+			HandshakeError::InvalidIntegerEncoding => write!(f, "Version/alert value not valid INTEGER"),
+			HandshakeError::IntegerOutOfRange => write!(f, "INTEGER out of range"),
+			HandshakeError::UnknownAlertCode(code) => write!(f, "Unknown alert code: {code}"),
+			HandshakeError::CertificateNotYetValid => write!(f, "Certificate not yet valid"),
+			HandshakeError::CertificateExpired => write!(f, "Certificate expired"),
+			HandshakeError::InvalidTimestamp => write!(f, "Invalid timestamp"),
+			HandshakeError::EciesEncryptionFailed(s) => write!(f, "ECIES encryption failed: {}", s),
+			HandshakeError::InvalidEciesMessage(s) => write!(f, "Invalid ECIES message: {}", s),
+			HandshakeError::EciesDecryptionFailed(s) => write!(f, "ECIES decryption failed: {}", s),
+			HandshakeError::InvalidDecryptedPayloadSize => write!(f, "Invalid decrypted payload size"),
+			HandshakeError::ClientRandomMismatchReplay => write!(f, "client_random mismatch - possible replay attack"),
+			HandshakeError::EcdhFailed => write!(f, "ECDH operation failed"),
+			HandshakeError::KdfError => write!(f, "KDF operation failed"),
+			HandshakeError::InvalidKeySize { expected, received } => {
+				write!(f, "Invalid key size: expected {}, got {}", expected, received)
+			}
+			HandshakeError::Asn1Error(e) => write!(f, "ASN.1 encoding error: {}", e),
+			HandshakeError::InvalidRecipientIndex => write!(f, "Invalid recipient index"),
+			HandshakeError::MissingUkm => write!(f, "Missing UKM in KeyAgreeRecipientInfo"),
+			HandshakeError::InvalidOriginatorPublicKey => write!(f, "Failed to parse originator public key"),
+			HandshakeError::UnsupportedOriginatorIdentifier => write!(f, "Unsupported originator identifier type"),
+			HandshakeError::KariBuilderConsumed => write!(f, "KARI builder already consumed"),
+			HandshakeError::MissingContentEncryptionAlgorithm => write!(f, "Content encryption algorithm not set"),
+			#[cfg(all(feature = "builder", feature = "aead"))]
+			HandshakeError::AesKeyWrap(e) => write!(f, "AES key wrap operation failed: {}", e),
+			HandshakeError::RandomGenerationFailed => write!(f, "Random generation failed"),
+			HandshakeError::InvalidOctetStringLength(m) => write!(f, "Invalid OCTET STRING length: {}", m),
+			HandshakeError::NonceLengthError(e) => write!(f, "Nonce length mismatch: {}", e),
+			HandshakeError::OctetStringLengthError(e) => write!(f, "OCTET STRING length mismatch: {}", e),
+			HandshakeError::UnknownAlertCode(code) => write!(f, "Unknown alert code: {code}"),
 		}
 	}
 }
@@ -105,10 +236,8 @@ impl core::error::Error for HandshakeError {}
 impl From<crate::TightBeamError> for HandshakeError {
 	fn from(e: crate::TightBeamError) -> Self {
 		match e {
-			crate::TightBeamError::InvalidOverflowValue => {
-				HandshakeError::ProtocolError("Invalid random generation".into())
-			}
-			_ => HandshakeError::ProtocolError("Random generation failed".into()),
+			crate::TightBeamError::InvalidOverflowValue => HandshakeError::RandomGenerationFailed,
+			_ => HandshakeError::RandomGenerationFailed,
 		}
 	}
 }

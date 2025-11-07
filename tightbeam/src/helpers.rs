@@ -12,12 +12,14 @@ use crate::matrix::MatrixError;
 use crate::Asn1Matrix;
 
 #[cfg(feature = "signature")]
-use crate::SignerInfo;
+use crate::{SignerInfo, TightBeamError};
 
 #[cfg(feature = "signature")]
-pub type SignatureVerifier = Box<dyn FnOnce(&[u8], &SignerInfo) -> Result<()>>;
+pub type SignatureVerifier<E = TightBeamError> = Box<dyn FnOnce(&[u8], &SignerInfo) -> core::result::Result<(), E>>;
 #[cfg(feature = "digest")]
-pub type Digestor = Box<dyn FnOnce(&[u8]) -> Result<crate::DigestInfo>>;
+pub type Digestor<E = TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::Result<crate::DigestInfo, E>>;
+#[cfg(feature = "kdf")]
+pub type KeyDeriver<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8], &[u8], usize) -> core::result::Result<Vec<u8>, E>>;
 
 impl Asn1Matrix {
 	/// Validate invariants per spec.
