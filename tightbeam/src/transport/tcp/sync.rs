@@ -56,8 +56,11 @@ pub struct TcpTransport<S: ProtocolStream> {
 	#[cfg(feature = "x509")]
 	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
 	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	#[allow(dead_code)]
-	handshake: Option<crate::transport::handshake::TightBeamHandshake>,
+	client_handshake: Option<crate::transport::handshake::ClientHandshakeOrchestrator>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	server_handshake: Option<crate::transport::handshake::ServerHandshakeOrchestrator>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	handshake_protocol_kind: crate::transport::handshake::HandshakeProtocolKind,
 }
 
 impl<S: ProtocolStream> Pingable for TcpTransport<S>
@@ -192,12 +195,11 @@ where
 				WireEnvelope::Cleartext(envelope) => {
 					if has_certificate {
 						match envelope {
-							TransportEnvelope::ClientHello(_) | TransportEnvelope::ClientKeyExchange(_) => {
+							TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 								let handshake_bytes = envelope.to_der()?;
 								self.perform_server_handshake(&handshake_bytes).await?;
 								continue;
 							}
-							TransportEnvelope::ServerHandshake(_) => return Err(TransportError::InvalidMessage),
 							TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
 								if self.handshake_state() == HandshakeState::Complete {
 									self.set_handshake_state(HandshakeState::None);
@@ -226,9 +228,9 @@ where
 			let request = match decoded_envelope {
 				TransportEnvelope::Request(msg) => msg.message,
 				TransportEnvelope::Response(_) => return Err(TransportError::InvalidMessage),
-				TransportEnvelope::ClientHello(_)
-				| TransportEnvelope::ClientKeyExchange(_)
-				| TransportEnvelope::ServerHandshake(_) => return Err(TransportError::InvalidMessage),
+				TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+					return Err(TransportError::InvalidMessage)
+				}
 			};
 
 			let status: TransitStatus = self.collector_gate().evaluate(&request);
@@ -359,9 +361,9 @@ where
 			let (status, response) = match response_envelope {
 				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 				TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
-				TransportEnvelope::ClientHello(_)
-				| TransportEnvelope::ClientKeyExchange(_)
-				| TransportEnvelope::ServerHandshake(_) => return Err(TransportError::InvalidMessage),
+				TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+					return Err(TransportError::InvalidMessage)
+				}
 			};
 
 			let result: TransportResult<&Frame> = if status != TransitStatus::Accepted {

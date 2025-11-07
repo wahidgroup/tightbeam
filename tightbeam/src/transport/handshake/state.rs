@@ -103,6 +103,7 @@ impl StateTransition for ClientStateTransition {
 				| (ClientHelloSent, ServerHelloReceived)
 				| (ServerHelloReceived, KeyExchangeSent)
 				| (KeyExchangeSent, ServerFinishedReceived)
+				| (KeyExchangeSent, Complete) // Direct completion for ECIES-style handshake
 				| (ServerFinishedReceived, ClientFinishedSent)
 				| (ClientFinishedSent, Complete)
 				| (_, Failed)
@@ -151,6 +152,7 @@ impl StateTransition for ServerStateTransition {
 				| (ServerHelloReceived, ServerHelloSent)
 				| (ServerHelloSent, KeyExchangeReceived)
 				| (KeyExchangeReceived, ServerFinishedSent)
+				| (KeyExchangeReceived, Complete) // Direct completion for ECIES-style handshake
 				| (ServerFinishedSent, ClientFinishedReceived)
 				| (ClientFinishedReceived, Complete)
 				| (_, Failed)

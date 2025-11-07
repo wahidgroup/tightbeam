@@ -190,7 +190,11 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					symmetric_key: None,
 					#[cfg(all(feature = "x509", feature = "secp256k1"))]
-					handshake: None,
+					client_handshake: None,
+					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					server_handshake: None,
+					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind::default(),
 				}
 			}
 		}
@@ -230,7 +234,11 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					symmetric_key: None,
 					#[cfg(all(feature = "x509", feature = "secp256k1"))]
-					handshake: None,
+					client_handshake: None,
+					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					server_handshake: None,
+					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind::default(),
 				}
 			}
 		}
@@ -270,29 +278,74 @@ macro_rules! impl_tcp_common {
 		where
 			TransportError: From<S::Error>,
 		{
-			/// Perform client-side handshake with server
+			/// Perform client-side handshake with server using ClientHandshakeProtocol trait.
 			///
 			/// This method:
-			/// 1. Creates a new TightBeamHandshake instance
-			/// 2. Generates and sends ClientKeyExchange
-			/// 3. Receives and validates ServerHandshake
-			/// 4. Derives session key from ECDH
-			/// 5. Stores session key and marks handshake complete
+			/// 1. Creates appropriate handshake orchestrator based on protocol kind
+			/// 2. Calls start() to get initial message and sends it
+			/// 3. Receives server response
+			/// 4. Calls handle_response() to process response and get next message (if any)
+			/// 5. Sends next message if needed (multi-round support)
+			/// 6. Calls complete() to derive session key
+			/// 7. Stores session key and marks handshake complete
 			async fn perform_client_handshake(&mut self) -> TransportResult<()> {
 				use $crate::der::{Decode, Encode};
-				use $crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
+				use $crate::transport::handshake::{
+					ClientHandshakeProtocol, ClientHandshakeOrchestrator, HandshakeProtocolKind,
+				};
 				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
-				// Create handshake instance
-				let mut handshake = TightBeamHandshake::new_client();
+				// Create handshake orchestrator based on protocol kind
+				let mut orchestrator = match self.handshake_protocol_kind {
+					HandshakeProtocolKind::Ecies => {
+						let aad = self.aad_domain_tag.clone();
+						ClientHandshakeOrchestrator::Ecies(
+							$crate::transport::handshake::client::EciesHandshakeClient::new(aad)
+						)
+					}
+					#[cfg(all(
+						feature = "builder",
+						feature = "aead",
+						feature = "signature",
+						feature = "secp256k1"
+					))]
+					HandshakeProtocolKind::Cms => {
+						// TODO: CMS client needs signatory and transcript hash - not yet properly integrated
+						return Err(TransportError::InvalidMessage);
+					}
+				};
 
-				// Step 1: Generate and send ClientHello
-				let client_hello_bytes = handshake.initiate_client().await?;
-				if client_hello_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+				// Step 1: Start handshake - get initial message
+				let initial_message = match &mut orchestrator {
+					ClientHandshakeOrchestrator::Ecies(h) => h.start().await?,
+					#[cfg(all(
+						feature = "builder",
+						feature = "aead",
+						feature = "signature",
+						feature = "secp256k1"
+					))]
+					ClientHandshakeOrchestrator::Cms(h) => h.start().await?,
+				};
+
+				if initial_message.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);
 				}
-				let client_hello_envelope = TransportEnvelope::from_der(&client_hello_bytes)?;
-				let wire_envelope = WireEnvelope::Cleartext(client_hello_envelope);
+
+				// Parse ClientHello and wrap in SignedData → TransportEnvelope
+				use $crate::transport::handshake::ClientHello;
+				let client_hello = ClientHello::from_der(&initial_message)?;
+				#[cfg(test)]
+				eprintln!("Client: Parsed ClientHello, converting to SignedData");
+				let signed_data: $crate::cms::signed_data::SignedData = 
+					(&client_hello).try_into().map_err(|_e| {
+						#[cfg(test)]
+						eprintln!("Client: Failed to convert ClientHello to SignedData: {:?}", _e);
+						TransportError::InvalidMessage
+					})?;
+				#[cfg(test)]
+				eprintln!("Client: Successfully converted to SignedData, wrapping in TransportEnvelope");
+				let initial_envelope = TransportEnvelope::SignedData(signed_data);
+				let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
 				self.write_envelope(&wire_envelope.to_der()?).await?;
 
 				// Update state machine
@@ -304,10 +357,12 @@ macro_rules! impl_tcp_common {
 				}
 				#[cfg(not(feature = "std"))]
 				{
-					self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingServerResponse { initiated_at: 0 });
+					self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingServerResponse {
+						initiated_at: 0,
+					});
 				}
 
-				// Step 2: Receive ServerHandshake response
+				// Step 2: Receive server response
 				let response_wire_bytes = self.read_envelope().await?;
 				if response_wire_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);
@@ -323,24 +378,63 @@ macro_rules! impl_tcp_common {
 					}
 				};
 
-				// Re-encode TransportEnvelope for process_server_response
-				let response_bytes = response_envelope.to_der()?;
+				// Extract SignedData and convert to ServerHandshake
+				use $crate::transport::handshake::ServerHandshake;
+				let signed_data = match response_envelope {
+					TransportEnvelope::SignedData(sd) => sd,
+					_ => return Err(TransportError::InvalidMessage),
+				};
+				let server_handshake: ServerHandshake = 
+					(&signed_data).try_into().map_err(|_| TransportError::InvalidMessage)?;
+				let response_bytes = server_handshake.to_der()?;
 				if response_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);
 				}
 
-				// Step 3: Process ServerHandshake, derive session key, and get ClientKeyExchange to send
-				let session_key = handshake.process_server_response(&response_bytes).await?;
+				// Step 3: Handle server response - may return next message to send
+				let next_message = match &mut orchestrator {
+					ClientHandshakeOrchestrator::Ecies(h) => h.handle_response(&response_bytes).await?,
+					#[cfg(all(
+						feature = "builder",
+						feature = "aead",
+						feature = "signature",
+						feature = "secp256k1"
+					))]
+					ClientHandshakeOrchestrator::Cms(h) => h.handle_response(&response_bytes).await?,
+				};
 
-				// Step 4: Send ClientKeyExchange (if pending)
-				if let Some(client_kex_bytes) = handshake.take_client_key_exchange() {
-					if client_kex_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+				// Step 4: Send next message if any (multi-round support)
+				if let Some(msg_bytes) = next_message {
+					if msg_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 						return Err(TransportError::InvalidMessage);
 					}
-					let client_kex_envelope = TransportEnvelope::from_der(&client_kex_bytes)?;
-					let wire_envelope = WireEnvelope::Cleartext(client_kex_envelope);
+					// Parse ClientKeyExchange and wrap in EnvelopedData
+					use $crate::transport::handshake::ClientKeyExchange;
+					let client_kex = ClientKeyExchange::from_der(&msg_bytes)?;
+					let enveloped_data: $crate::cms::enveloped_data::EnvelopedData = 
+						(&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
+					let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
+					let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
 					self.write_envelope(&wire_envelope.to_der()?).await?;
 				}
+
+				// Step 5: Complete handshake and derive session key
+				let session_key = match &mut orchestrator {
+					ClientHandshakeOrchestrator::Ecies(h) => {
+						// ECIES complete() is synchronous and returns Aes256Gcm directly
+						h.complete()?
+					}
+					#[cfg(all(
+						feature = "builder",
+						feature = "aead",
+						feature = "signature",
+						feature = "secp256k1"
+					))]
+					ClientHandshakeOrchestrator::Cms(_h) => {
+						// CMS client not yet properly supported in TCP transport
+						return Err(TransportError::InvalidMessage);
+					}
+				};
 
 				// Store session key and mark handshake complete
 				self.set_symmetric_key(session_key);
@@ -349,46 +443,123 @@ macro_rules! impl_tcp_common {
 				Ok(())
 			}
 
-			/// Perform server-side handshake with client
+			/// Perform server-side handshake with client using ServerHandshakeProtocol trait.
 			///
-			/// This method handles both:
-			/// 1. ClientHello → responds with ServerHandshake (cert + server_random + sig)
-			/// 2. ClientKeyExchange → decrypts and derives session key, completes handshake
+			/// This method handles multi-round handshakes:
+			/// 1. Creates appropriate handshake orchestrator based on protocol kind (if not exists)
+			/// 2. Calls handle_request() to process client message and get response (if any)
+			/// 3. Sends response message if any (multi-round support)
+			/// 4. Calls complete() when handshake is finished to derive session key
+			/// 5. Stores session key and marks handshake complete
 			///
-			/// The handshake instance is stored in the transport and persists across both calls.
+			/// The orchestrator instance persists across multiple calls for multi-round protocols.
 			async fn perform_server_handshake(&mut self, handshake_bytes: &[u8]) -> TransportResult<()> {
 				use $crate::der::{Decode, Encode};
-				use $crate::transport::handshake::{HandshakeProtocol, TightBeamHandshake};
+				use $crate::transport::handshake::{
+					HandshakeProtocolKind, ServerHandshakeOrchestrator, ServerHandshakeProtocol,
+				};
 				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 				if handshake_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);
 				}
-				// Get server certificate and signatory
+
+				// Parse TransportEnvelope and extract the handshake message
+				let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
+				#[cfg(test)]
+				eprintln!("Server: Parsed TransportEnvelope variant: {:?}", std::mem::discriminant(&transport_envelope));
+				let raw_message = match &transport_envelope {
+					TransportEnvelope::SignedData(sd) => {
+						// This is ClientHello (first message from client)
+						use $crate::transport::handshake::ClientHello;
+						#[cfg(test)]
+						eprintln!("Server: Attempting to extract ClientHello from SignedData");
+						let result = ClientHello::try_from(sd)
+							.map_err(|_e| {
+								#[cfg(test)]
+								eprintln!("Server: Failed to extract ClientHello: {:?}", _e);
+								TransportError::InvalidMessage
+							})?;
+						#[cfg(test)]
+						eprintln!("Server: Successfully extracted ClientHello");
+						result.to_der()?
+					}
+					TransportEnvelope::EnvelopedData(ed) => {
+						// This is ClientKeyExchange (second message from client)
+						use $crate::transport::handshake::ClientKeyExchange;
+						#[cfg(test)]
+						eprintln!("Server: Attempting to extract ClientKeyExchange from EnvelopedData");
+						ClientKeyExchange::try_from(ed)
+							.map_err(|_| TransportError::InvalidMessage)?
+							.to_der()?
+					}
+					_ => {
+						#[cfg(test)]
+						eprintln!("Server: Invalid TransportEnvelope variant for handshake");
+						return Err(TransportError::InvalidMessage);
+					}
+				};
+
+				// Get server certificate and signatory (required for handshake)
 				let cert = self.server_certificate().ok_or(TransportError::Forbidden)?.clone();
 				let signatory = self.signatory.as_ref().ok_or(TransportError::Forbidden)?.clone();
 
-				// Get or create handshake instance (persists state across ClientHello → ClientKeyExchange)
-				if self.handshake.is_none() {
-					// If available in transport, bind AAD domain tag from transport; otherwise let handshake default
+				// Get or create handshake orchestrator (persists state across multiple messages)
+				if self.server_handshake.is_none() {
 					let aad = self.aad_domain_tag.clone();
-					self.handshake = Some(TightBeamHandshake::new_server(cert, signatory, aad));
+
+					self.server_handshake = Some(match self.handshake_protocol_kind {
+						HandshakeProtocolKind::Ecies => {
+							ServerHandshakeOrchestrator::Ecies(
+								$crate::transport::handshake::server::EciesHandshakeServer::new(
+									std::sync::Arc::clone(&signatory),
+									cert,
+									aad
+								)
+							)
+						}
+						#[cfg(all(
+							feature = "builder",
+							feature = "aead",
+							feature = "signature",
+							feature = "secp256k1"
+						))]
+						HandshakeProtocolKind::Cms => {
+							// TODO: CMS server needs proper transcript hash support
+							return Err(TransportError::InvalidMessage);
+						}
+					});
 				}
 
-				let handshake = self.handshake.as_mut().unwrap();
+				let orchestrator = self.server_handshake.as_mut().unwrap();
 
-				// Process handshake message (ClientHello or ClientKeyExchange)
-				let response_bytes = handshake.handle_client_request(handshake_bytes).await?;
-				if !response_bytes.is_empty()
-					&& response_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE
-				{
-					return Err(TransportError::InvalidMessage);
-				}
+				// Process client handshake message - may return response to send
+				let response_bytes = match orchestrator {
+					ServerHandshakeOrchestrator::Ecies(h) => h.handle_request(&raw_message).await?,
+					#[cfg(all(
+						feature = "builder",
+						feature = "aead",
+						feature = "signature",
+						feature = "secp256k1"
+					))]
+					ServerHandshakeOrchestrator::Cms(_h) => {
+						// CMS not yet properly supported
+						return Err(TransportError::InvalidMessage);
+					}
+				};
 
-				// Send response if any (ServerHandshake for ClientHello, empty for ClientKeyExchange)
-				if !response_bytes.is_empty() {
-					// Parse TransportEnvelope, wrap in WireEnvelope, send
-					let server_envelope = TransportEnvelope::from_der(&response_bytes)?;
+				// Send response if any (multi-round support)
+				if let Some(response) = response_bytes {
+					if response.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+						return Err(TransportError::InvalidMessage);
+					}
+
+					// Parse ServerHandshake and wrap in SignedData → TransportEnvelope
+					use $crate::transport::handshake::ServerHandshake;
+					let server_handshake = ServerHandshake::from_der(&response)?;
+					let signed_data: $crate::cms::signed_data::SignedData = 
+						(&server_handshake).try_into().map_err(|_| TransportError::InvalidMessage)?;
+					let server_envelope = TransportEnvelope::SignedData(signed_data);
 					let wire_envelope = WireEnvelope::Cleartext(server_envelope);
 					self.write_envelope(&wire_envelope.to_der()?).await?;
 
@@ -406,13 +577,29 @@ macro_rules! impl_tcp_common {
 						});
 					}
 				} else {
-					// Empty response means ClientKeyExchange was processed - complete handshake
-					let session_key = handshake.complete_server_handshake().await?;
+					// No response means handshake is complete - derive session key
+					let session_key = match orchestrator {
+						ServerHandshakeOrchestrator::Ecies(h) => {
+							// complete() is synchronous, not async
+							h.complete()?
+						}
+						#[cfg(all(
+							feature = "builder",
+							feature = "aead",
+							feature = "signature",
+							feature = "secp256k1"
+						))]
+						ServerHandshakeOrchestrator::Cms(_h) => {
+							// CMS not yet properly supported
+							return Err(TransportError::InvalidMessage);
+						}
+					};
+
 					self.set_symmetric_key(session_key);
 					self.set_handshake_state($crate::transport::handshake::HandshakeState::Complete);
 
 					// Clear handshake instance - no longer needed
-					self.handshake = None;
+					self.server_handshake = None;
 				}
 
 				Ok(())

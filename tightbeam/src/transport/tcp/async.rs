@@ -333,7 +333,11 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
 	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	handshake: Option<crate::transport::handshake::TightBeamHandshake>,
+	client_handshake: Option<crate::transport::handshake::ClientHandshakeOrchestrator>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	server_handshake: Option<crate::transport::handshake::ServerHandshakeOrchestrator>,
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	handshake_protocol_kind: crate::transport::handshake::HandshakeProtocolKind,
 }
 
 impl<S: AsyncProtocolStream> Pingable for TcpTransport<S>
@@ -539,17 +543,13 @@ where
 						// Server with certificate - check for handshakes and enforce encryption after handshake
 						match envelope {
 							// Handshake messages - let perform_server_handshake handle them
-							TransportEnvelope::ClientHello(_) | TransportEnvelope::ClientKeyExchange(_) => {
+							TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 								// Re-encode as TransportEnvelope bytes
 								let handshake_bytes = envelope.to_der()?;
 								self.perform_server_handshake(&handshake_bytes).await?;
 
 								// After processing, loop back to read next message
 								continue;
-							}
-							// ServerHandshake not expected on server (only sent by server)
-							TransportEnvelope::ServerHandshake(_) => {
-								return Err(TransportError::InvalidMessage);
 							}
 							// Regular messages - check if encryption is required
 							TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
@@ -592,9 +592,7 @@ where
 					return Err(TransportError::InvalidMessage);
 				}
 				#[cfg(feature = "x509")]
-				TransportEnvelope::ClientHello(_)
-				| TransportEnvelope::ClientKeyExchange(_)
-				| TransportEnvelope::ServerHandshake(_) => {
+				TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 					// Handshake messages not expected here
 					return Err(TransportError::InvalidMessage);
 				}
@@ -766,9 +764,7 @@ where
 					// Only responses are valid here
 					return Err(TransportError::InvalidMessage);
 				}
-				TransportEnvelope::ClientHello(_)
-				| TransportEnvelope::ClientKeyExchange(_)
-				| TransportEnvelope::ServerHandshake(_) => {
+				TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 					// Handshake messages not expected here
 					return Err(TransportError::InvalidMessage);
 				}

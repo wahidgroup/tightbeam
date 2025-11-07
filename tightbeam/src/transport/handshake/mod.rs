@@ -41,6 +41,8 @@ pub mod client;
 pub mod server;
 
 use crate::asn1::OctetString;
+use crate::cms::content_info::CmsVersion;
+use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
 use crate::crypto::aead::{Aes256Gcm, KeyInit};
 use crate::crypto::ecies::encrypt;
 use crate::crypto::hash::{Digest, Sha3_256};
@@ -219,6 +221,68 @@ pub enum HandshakeAlert {
 // Handshake Protocol Abstraction
 // ============================================================================
 
+/// Client-side handshake protocol trait.
+///
+/// Supports multi-round handshakes where the client may need to send multiple
+/// messages before completing the handshake.
+pub trait ClientHandshakeProtocol: Send {
+	type SessionKey;
+	type Error: Into<TransportError>;
+
+	/// Start the handshake, returns the first message to send to the server.
+	#[allow(async_fn_in_trait)]
+	async fn start(&mut self) -> Result<Vec<u8>, Self::Error>;
+
+	/// Handle a response from the server.
+	///
+	/// Returns `Some(Vec<u8>)` if the client needs to send another message,
+	/// or `None` if the client has no more messages to send.
+	#[allow(async_fn_in_trait)]
+	async fn handle_response(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+
+	/// Complete the handshake and extract the session key.
+	///
+	/// Should be called after the handshake is complete (when `is_complete()` returns true).
+	#[allow(async_fn_in_trait)]
+	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error>;
+
+	/// Check if the handshake is complete.
+	fn is_complete(&self) -> bool;
+}
+
+/// Server-side handshake protocol trait.
+///
+/// Supports multi-round handshakes where the server may need to handle multiple
+/// requests from the client before completing the handshake.
+pub trait ServerHandshakeProtocol: Send {
+	type SessionKey;
+	type Error: Into<TransportError>;
+
+	/// Handle a request from the client.
+	///
+	/// Can be called multiple times for multi-round handshakes.
+	/// Returns `Some(Vec<u8>)` if the server needs to send a response,
+	/// or `None` if the server has no response to send.
+	#[allow(async_fn_in_trait)]
+	async fn handle_request(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+
+	/// Complete the handshake and extract the session key.
+	///
+	/// Should be called after the handshake is complete (when `is_complete()` returns true).
+	#[allow(async_fn_in_trait)]
+	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error>;
+
+	/// Check if the handshake is complete.
+	fn is_complete(&self) -> bool;
+}
+
+/// Legacy trait for backward compatibility.
+///
+/// **Deprecated**: Use `ClientHandshakeProtocol` or `ServerHandshakeProtocol` instead.
+#[deprecated(
+	since = "0.1.3",
+	note = "Use ClientHandshakeProtocol or ServerHandshakeProtocol instead"
+)]
 pub trait HandshakeProtocol: Send {
 	type SessionKey;
 	type Error: Into<TransportError>;
@@ -230,6 +294,53 @@ pub trait HandshakeProtocol: Send {
 	async fn handle_client_request(&mut self, request: &[u8]) -> Result<Vec<u8>, Self::Error>;
 	#[allow(async_fn_in_trait)]
 	async fn complete_server_handshake(&mut self) -> Result<Self::SessionKey, Self::Error>;
+}
+
+// ============================================================================
+// Protocol Selection Enums
+// ============================================================================
+
+/// Specifies which handshake protocol to use (ECIES or CMS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeProtocolKind {
+	/// Use ECIES-based handshake (default, lighter weight)
+	Ecies,
+	/// Use CMS-based handshake (full X.509 PKI support)
+	Cms,
+}
+
+impl Default for HandshakeProtocolKind {
+	fn default() -> Self {
+		Self::Ecies
+	}
+}
+
+/// Client-side handshake orchestrator storage.
+#[cfg(all(feature = "x509", feature = "secp256k1"))]
+pub enum ClientHandshakeOrchestrator {
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	Ecies(client::EciesHandshakeClient),
+	#[cfg(all(
+		feature = "builder",
+		feature = "aead",
+		feature = "signature",
+		feature = "secp256k1"
+	))]
+	Cms(client::CmsHandshakeClient),
+}
+
+/// Server-side handshake orchestrator storage.
+#[cfg(all(feature = "x509", feature = "secp256k1"))]
+pub enum ServerHandshakeOrchestrator {
+	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	Ecies(server::EciesHandshakeServer),
+	#[cfg(all(
+		feature = "builder",
+		feature = "aead",
+		feature = "signature",
+		feature = "secp256k1"
+	))]
+	Cms(server::CmsHandshakeServer),
 }
 
 // ============================================================================
@@ -294,6 +405,129 @@ fn ensure_server_role(role: HandshakeRole) -> Result<(), HandshakeError> {
 	Ok(())
 }
 
+// ============================================================================
+// Idiomatic TryFrom conversions for ECIES <-> CMS types
+// ============================================================================
+
+/// Convert ClientHello to SignedData (opaque wrapper)
+impl TryFrom<&ClientHello> for crate::cms::signed_data::SignedData {
+	type Error = HandshakeError;
+
+	fn try_from(hello: &ClientHello) -> Result<Self, Self::Error> {
+		let message_der = hello.to_der()?;
+		let octet_string = OctetString::new(message_der)?;
+		let econtent = crate::der::Any::from_der(&octet_string.to_der()?)?;
+
+		Ok(SignedData {
+			version: CmsVersion::V1,
+			digest_algorithms: Default::default(),
+			encap_content_info: EncapsulatedContentInfo {
+				econtent_type: crate::asn1::DATA_OID,
+				econtent: Some(econtent),
+			},
+			certificates: None,
+			crls: None,
+			signer_infos: SignerInfos::try_from(Vec::new())?,
+		})
+	}
+}
+
+/// Extract ClientHello from SignedData
+impl TryFrom<&crate::cms::signed_data::SignedData> for ClientHello {
+	type Error = HandshakeError;
+
+	fn try_from(signed_data: &crate::cms::signed_data::SignedData) -> Result<Self, Self::Error> {
+		let econtent_any = signed_data
+			.encap_content_info
+			.econtent
+			.as_ref()
+			.ok_or(HandshakeError::InvalidServerKeyExchange)?;
+
+		// econtent_any is the full DER encoding of an OCTET STRING
+		let octet_string = OctetString::from_der(econtent_any.to_der()?.as_ref())?;
+		Ok(ClientHello::from_der(octet_string.as_bytes())?)
+	}
+}
+
+/// Convert ServerHandshake to SignedData (opaque wrapper)
+impl TryFrom<&ServerHandshake> for crate::cms::signed_data::SignedData {
+	type Error = HandshakeError;
+
+	fn try_from(handshake: &ServerHandshake) -> Result<Self, Self::Error> {
+		let message_der = handshake.to_der()?;
+		let octet_string = OctetString::new(message_der)?;
+		let econtent = crate::der::Any::from_der(&octet_string.to_der()?)?;
+
+		Ok(SignedData {
+			version: CmsVersion::V1,
+			digest_algorithms: Default::default(),
+			encap_content_info: EncapsulatedContentInfo {
+				econtent_type: crate::asn1::DATA_OID,
+				econtent: Some(econtent),
+			},
+			certificates: None,
+			crls: None,
+			signer_infos: SignerInfos::try_from(Vec::new())?,
+		})
+	}
+}
+
+/// Extract ServerHandshake from SignedData
+impl TryFrom<&crate::cms::signed_data::SignedData> for ServerHandshake {
+	type Error = HandshakeError;
+
+	fn try_from(signed_data: &crate::cms::signed_data::SignedData) -> Result<Self, Self::Error> {
+		let econtent_any = signed_data
+			.encap_content_info
+			.econtent
+			.as_ref()
+			.ok_or(HandshakeError::InvalidServerKeyExchange)?;
+
+		// econtent_any is the full DER encoding of an OCTET STRING
+		let octet_string = OctetString::from_der(econtent_any.to_der()?.as_ref())?;
+		Ok(ServerHandshake::from_der(octet_string.as_bytes())?)
+	}
+}
+
+/// Convert ClientKeyExchange to EnvelopedData (opaque wrapper for ECIES ciphertext)
+impl TryFrom<&ClientKeyExchange> for crate::cms::enveloped_data::EnvelopedData {
+	type Error = HandshakeError;
+
+	fn try_from(kex: &ClientKeyExchange) -> Result<Self, Self::Error> {
+		use crate::cms::content_info::CmsVersion;
+		use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
+		use crate::der::asn1::OctetString;
+
+		Ok(EnvelopedData {
+			version: CmsVersion::V0,
+			originator_info: None,
+			recip_infos: RecipientInfos::try_from(Vec::new())?,
+			encrypted_content: EncryptedContentInfo {
+				content_type: crate::asn1::DATA_OID,
+				content_enc_alg: crate::transport::handshake::utils::aes_256_gcm_algorithm(),
+				encrypted_content: Some(OctetString::new(kex.encrypted_data.as_bytes())?),
+			},
+			unprotected_attrs: None,
+		})
+	}
+}
+
+/// Extract ClientKeyExchange from EnvelopedData
+impl TryFrom<&crate::cms::enveloped_data::EnvelopedData> for ClientKeyExchange {
+	type Error = HandshakeError;
+
+	fn try_from(enveloped_data: &crate::cms::enveloped_data::EnvelopedData) -> Result<Self, Self::Error> {
+		let encrypted_bytes = enveloped_data
+			.encrypted_content
+			.encrypted_content
+			.as_ref()
+			.ok_or(HandshakeError::InvalidClientKeyExchange)?
+			.as_bytes();
+
+		Ok(ClientKeyExchange { encrypted_data: OctetString::new(encrypted_bytes)? })
+	}
+}
+
 fn compute_transcript_hash(client_random: &[u8; 32], server_random: &[u8; 32], spki_bytes: &[u8]) -> [u8; 32] {
 	let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len());
 	data.extend_from_slice(client_random);
@@ -341,6 +575,17 @@ fn perform_ecies_encryption(
 	Ok(encrypted_message.to_bytes())
 }
 
+/// Legacy monolithic handshake implementation.
+///
+/// **Deprecated**: Use `EciesHandshakeClient`/`EciesHandshakeServer` or
+/// `CmsHandshakeClient`/`CmsHandshakeServer` instead for cleaner architecture.
+///
+/// This implementation combines both client and server logic with runtime role
+/// checking, which is less type-safe than the separate orchestrator approach.
+#[deprecated(
+	since = "0.1.3",
+	note = "Use EciesHandshakeClient/EciesHandshakeServer or CmsHandshakeClient/CmsHandshakeServer instead"
+)]
 pub struct TightBeamHandshake {
 	role: HandshakeRole,
 	client_random: Option<[u8; 32]>,
@@ -360,6 +605,7 @@ enum HandshakeRole {
 	Server,
 }
 
+#[allow(deprecated)]
 impl TightBeamHandshake {
 	pub fn new_client() -> Self {
 		Self {
@@ -420,6 +666,7 @@ impl TightBeamHandshake {
 	}
 }
 
+#[allow(deprecated)]
 impl HandshakeProtocol for TightBeamHandshake {
 	type SessionKey = Aes256Gcm;
 	type Error = TransportError;
@@ -429,7 +676,8 @@ impl HandshakeProtocol for TightBeamHandshake {
 		let client_random = generate_random_nonce()?;
 		self.client_random = Some(client_random);
 		let client_hello = ClientHello { client_random: OctetString::new(client_random)? };
-		let envelope = TransportEnvelope::ClientHello(client_hello);
+		let signed_data = crate::cms::signed_data::SignedData::try_from(&client_hello)?;
+		let envelope = TransportEnvelope::SignedData(signed_data);
 		encode_envelope(envelope)
 	}
 
@@ -437,7 +685,7 @@ impl HandshakeProtocol for TightBeamHandshake {
 		ensure_client_role(self.role)?;
 		let envelope = decode_envelope(response)?;
 		let server_handshake = match envelope {
-			TransportEnvelope::ServerHandshake(handshake) => handshake,
+			TransportEnvelope::SignedData(ref signed_data) => ServerHandshake::try_from(signed_data)?,
 			_ => return Err(HandshakeError::InvalidServerKeyExchange.into()),
 		};
 		validate_certificate(&server_handshake.certificate)?;
@@ -465,7 +713,8 @@ impl HandshakeProtocol for TightBeamHandshake {
 			self.aad_domain_tag.as_deref(),
 		)?;
 		let client_kex = ClientKeyExchange { encrypted_data: OctetString::new(encrypted_bytes)? };
-		let envelope = TransportEnvelope::ClientKeyExchange(client_kex);
+		let enveloped_data = crate::cms::enveloped_data::EnvelopedData::try_from(&client_kex)?;
+		let envelope = TransportEnvelope::EnvelopedData(enveloped_data);
 		self.pending_client_kex = Some(encode_envelope(envelope)?);
 		Ok(self.derive_final_session_key(&base_key, &client_random, &server_random)?)
 	}
@@ -474,8 +723,12 @@ impl HandshakeProtocol for TightBeamHandshake {
 		ensure_server_role(self.role)?;
 		let envelope = decode_envelope(request)?;
 		match envelope {
-			TransportEnvelope::ClientHello(client_hello) => self.handle_client_hello(client_hello),
-			TransportEnvelope::ClientKeyExchange(client_kex) => {
+			TransportEnvelope::SignedData(ref signed_data) => {
+				let client_hello = ClientHello::try_from(signed_data)?;
+				self.handle_client_hello(client_hello)
+			}
+			TransportEnvelope::EnvelopedData(ref enveloped_data) => {
+				let client_kex = ClientKeyExchange::try_from(enveloped_data)?;
 				let encrypted_bytes = client_kex.encrypted_data.as_bytes();
 				let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)
 					.map_err(|e| HandshakeError::InvalidEciesMessage(format!("{e:?}")))?;
@@ -524,6 +777,7 @@ impl HandshakeProtocol for TightBeamHandshake {
 	}
 }
 
+#[allow(deprecated)]
 impl TightBeamHandshake {
 	pub fn take_client_key_exchange(&mut self) -> Option<Vec<u8>> {
 		self.pending_client_kex.take()
@@ -554,7 +808,8 @@ impl TightBeamHandshake {
 			server_random: OctetString::new(server_random)?,
 			signature: OctetString::new(signature.to_bytes().as_slice())?,
 		};
-		let envelope = TransportEnvelope::ServerHandshake(server_handshake);
+		let signed_data = crate::cms::signed_data::SignedData::try_from(&server_handshake)?;
+		let envelope = TransportEnvelope::SignedData(signed_data);
 		encode_envelope(envelope)
 	}
 }

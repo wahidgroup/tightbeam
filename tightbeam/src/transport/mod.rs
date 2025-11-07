@@ -6,8 +6,6 @@ use alloc::{boxed::Box, vec::Vec};
 
 #[cfg(feature = "x509")]
 use crate::crypto::aead::{Decryptor, Encryptor};
-#[cfg(feature = "x509")]
-use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake};
 #[cfg(feature = "derive")]
 use crate::Beamable;
 
@@ -234,13 +232,10 @@ pub enum TransportEnvelope {
 	Response(ResponsePackage),
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "2", constructed = "true")]
-	ClientHello(ClientHello),
+	EnvelopedData(crate::cms::enveloped_data::EnvelopedData),
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "3", constructed = "true")]
-	ClientKeyExchange(ClientKeyExchange),
-	#[cfg(feature = "x509")]
-	#[asn1(context_specific = "4", constructed = "true")]
-	ServerHandshake(ServerHandshake),
+	SignedData(crate::cms::signed_data::SignedData),
 }
 
 /// Wire-level envelope that can be either cleartext or encrypted
@@ -589,9 +584,7 @@ pub trait MessageEmitter: MessageIO {
 					return Err(TransportError::InvalidMessage);
 				}
 				#[cfg(feature = "x509")]
-				TransportEnvelope::ClientHello(_)
-				| TransportEnvelope::ClientKeyExchange(_)
-				| TransportEnvelope::ServerHandshake(_) => {
+				TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 					// Handshake messages not expected here
 					return Err(TransportError::InvalidMessage);
 				}
@@ -653,9 +646,7 @@ pub trait MessageCollector: MessageIO {
 				return Err(TransportError::InvalidMessage);
 			}
 			#[cfg(feature = "x509")]
-			TransportEnvelope::ClientHello(_)
-			| TransportEnvelope::ClientKeyExchange(_)
-			| TransportEnvelope::ServerHandshake(_) => {
+			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 				// Handshake messages not expected here
 				return Err(TransportError::InvalidMessage);
 			}

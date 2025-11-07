@@ -10,6 +10,7 @@
 	feature = "secp256k1"
 ))]
 
+use crate::crypto::aead::{Aes256Gcm, KeyInit};
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 use crate::crypto::sign::elliptic_curve::SecretKey;
@@ -22,6 +23,7 @@ use crate::transport::handshake::processors::{
 	AesGcmContentDecryptor, TightBeamEnvelopedDataProcessor, TightBeamKariRecipient, TightBeamSignedDataProcessor,
 };
 use crate::transport::handshake::state::{HandshakeState, ServerStateTransition, StateTransition};
+use crate::transport::handshake::ServerHandshakeProtocol;
 use crate::x509::Certificate;
 
 /// Server-side CMS handshake orchestrator.
@@ -207,17 +209,53 @@ impl CmsHandshakeServer {
 	}
 }
 
+// ============================================================================
+// ServerHandshakeProtocol Implementation
+// ============================================================================
+
+impl ServerHandshakeProtocol for CmsHandshakeServer {
+	type SessionKey = Vec<u8>;
+	type Error = HandshakeError;
+
+	async fn handle_request(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+		// Determine which message type this is based on state
+		match self.state() {
+			HandshakeState::Init => {
+				// This is KeyExchange (EnvelopedData) - process and send ServerFinished
+				self.process_key_exchange(msg)?;
+				let server_finished = self.build_server_finished()?;
+				Ok(Some(server_finished))
+			}
+			HandshakeState::ServerFinishedSent => {
+				// This is ClientFinished (SignedData) - no response needed
+				self.process_client_finished(msg)?;
+				Ok(None)
+			}
+			_ => Err(HandshakeError::InvalidState),
+		}
+	}
+
+	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error> {
+		self.complete()?;
+		Ok(self.session_key().ok_or(HandshakeError::InvalidState)?.to_vec())
+	}
+
+	fn is_complete(&self) -> bool {
+		self.is_complete()
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	mod server {
 		use super::super::*;
+		use crate::der::Decode;
 		use crate::random::OsRng;
 		use crate::spki::EncodePublicKey;
 		use crate::transport::handshake::builders::TightBeamEnvelopedDataBuilder;
 		use crate::transport::handshake::TightBeamKariBuilder;
 		use crate::x509::time::Validity;
 		use crate::x509::{name::RdnSequence, TbsCertificate};
-		use der::Decode;
 
 		fn create_test_certificate(signing_key: &Secp256k1SigningKey) -> Certificate {
 			let verifying_key = *signing_key.verifying_key();

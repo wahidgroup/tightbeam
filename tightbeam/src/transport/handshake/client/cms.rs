@@ -11,6 +11,7 @@
 ))]
 
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::crypto::aead::{Aes256Gcm, KeyInit};
 use crate::crypto::hash::Sha3_256;
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 use crate::crypto::sign::elliptic_curve::SecretKey;
@@ -26,6 +27,7 @@ use crate::transport::handshake::builders::{
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::{ClientStateTransition, HandshakeState, StateTransition};
+use crate::transport::handshake::ClientHandshakeProtocol;
 use crate::x509::Certificate;
 
 /// Client-side CMS handshake orchestrator.
@@ -229,6 +231,37 @@ impl CmsHandshakeClient {
 	/// Get the session key (if available).
 	pub fn session_key(&self) -> Option<&[u8]> {
 		self.session_key.as_deref()
+	}
+}
+
+// ============================================================================
+// ClientHandshakeProtocol Implementation
+// ============================================================================
+
+impl ClientHandshakeProtocol for CmsHandshakeClient {
+	type SessionKey = Vec<u8>;
+	type Error = HandshakeError;
+
+	async fn start(&mut self) -> Result<Vec<u8>, Self::Error> {
+		self.build_key_exchange(vec![0u8; 32]) // TODO: Generate proper session key
+	}
+
+	async fn handle_response(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+		// Process server finished
+		self.process_server_finished(msg)?;
+
+		// Build client finished
+		let client_finished = self.build_client_finished()?;
+		Ok(Some(client_finished))
+	}
+
+	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error> {
+		self.complete()?;
+		Ok(self.session_key().ok_or(HandshakeError::InvalidState)?.to_vec())
+	}
+
+	fn is_complete(&self) -> bool {
+		self.is_complete()
 	}
 }
 
