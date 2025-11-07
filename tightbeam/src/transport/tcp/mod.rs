@@ -170,8 +170,6 @@ macro_rules! impl_tcp_common {
 					stream,
 					handler: None,
 					#[cfg(feature = "x509")]
-					server_public_key: None,
-					#[cfg(feature = "x509")]
 					enforce_encryption: false,
 					#[cfg(feature = "x509")]
 					server_certificate: None,
@@ -181,7 +179,7 @@ macro_rules! impl_tcp_common {
 					max_cleartext_envelope: None,
 					#[cfg(feature = "x509")]
 					max_encrypted_envelope: None,
-					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					#[cfg(feature = "x509")]
 									signatory: None,
 					#[cfg(feature = "x509")]
 					handshake_state: $crate::transport::handshake::HandshakeState::None,
@@ -189,11 +187,9 @@ macro_rules! impl_tcp_common {
 					handshake_timeout: std::time::Duration::from_secs(1),
 					#[cfg(feature = "x509")]
 					symmetric_key: None,
-					#[cfg(all(feature = "x509", feature = "secp256k1"))]
-					client_handshake: None,
-					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					#[cfg(feature = "x509")]
 					server_handshake: None,
-					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					#[cfg(feature = "x509")]
 					handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind::default(),
 				}
 			}
@@ -214,8 +210,6 @@ macro_rules! impl_tcp_common {
 					collector_gate: Box::new(AcceptAllGate),
 					handler: None,
 					#[cfg(feature = "x509")]
-					server_public_key: None,
-					#[cfg(feature = "x509")]
 					enforce_encryption: false,
 					#[cfg(feature = "x509")]
 					server_certificate: None,
@@ -225,7 +219,7 @@ macro_rules! impl_tcp_common {
 					max_cleartext_envelope: None,
 					#[cfg(feature = "x509")]
 					max_encrypted_envelope: None,
-					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					#[cfg(feature = "x509")]
 									signatory: None,
 					#[cfg(feature = "x509")]
 					handshake_state: $crate::transport::handshake::HandshakeState::None,
@@ -233,11 +227,9 @@ macro_rules! impl_tcp_common {
 					handshake_timeout: std::time::Duration::from_secs(1),
 					#[cfg(feature = "x509")]
 					symmetric_key: None,
-					#[cfg(all(feature = "x509", feature = "secp256k1"))]
-					client_handshake: None,
-					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					#[cfg(feature = "x509")]
 					server_handshake: None,
-					#[cfg(all(feature = "x509", feature = "secp256k1"))]
+					#[cfg(feature = "x509")]
 					handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind::default(),
 				}
 			}
@@ -273,7 +265,7 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(all(feature = "x509", feature = "secp256k1"))]
+		#[cfg(feature = "x509")]
 		impl<S: $stream_trait> $transport<S>
 		where
 			TransportError: From<S::Error>,
@@ -291,23 +283,22 @@ macro_rules! impl_tcp_common {
 			async fn perform_client_handshake(&mut self) -> TransportResult<()> {
 				use $crate::der::{Decode, Encode};
 				use $crate::transport::handshake::{
-					ClientHandshakeProtocol, ClientHandshakeOrchestrator, HandshakeProtocolKind,
+					ClientHandshakeProtocol, HandshakeProtocolKind,
 				};
 				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 				// Create handshake orchestrator based on protocol kind
-				let mut orchestrator = match self.handshake_protocol_kind {
+				let mut orchestrator: Box<dyn ClientHandshakeProtocol<SessionKey = Vec<u8>, Error = $crate::transport::handshake::HandshakeError>> = match self.handshake_protocol_kind {
 					HandshakeProtocolKind::Ecies => {
 						let aad = self.aad_domain_tag.clone();
-						ClientHandshakeOrchestrator::Ecies(
+						Box::new(
 							$crate::transport::handshake::client::EciesHandshakeClient::new(aad)
 						)
 					}
 					#[cfg(all(
 						feature = "builder",
 						feature = "aead",
-						feature = "signature",
-						feature = "secp256k1"
+						feature = "signature"
 					))]
 					HandshakeProtocolKind::Cms => {
 						// TODO: CMS client needs signatory and transcript hash - not yet properly integrated
@@ -316,16 +307,7 @@ macro_rules! impl_tcp_common {
 				};
 
 				// Step 1: Start handshake - get initial message
-				let initial_message = match &mut orchestrator {
-					ClientHandshakeOrchestrator::Ecies(h) => h.start().await?,
-					#[cfg(all(
-						feature = "builder",
-						feature = "aead",
-						feature = "signature",
-						feature = "secp256k1"
-					))]
-					ClientHandshakeOrchestrator::Cms(h) => h.start().await?,
-				};
+				let initial_message = orchestrator.start().await?;
 
 				if initial_message.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);
@@ -334,16 +316,8 @@ macro_rules! impl_tcp_common {
 				// Parse ClientHello and wrap in SignedData → TransportEnvelope
 				use $crate::transport::handshake::ClientHello;
 				let client_hello = ClientHello::from_der(&initial_message)?;
-				#[cfg(test)]
-				eprintln!("Client: Parsed ClientHello, converting to SignedData");
 				let signed_data: $crate::cms::signed_data::SignedData =
-					(&client_hello).try_into().map_err(|_e| {
-						#[cfg(test)]
-						eprintln!("Client: Failed to convert ClientHello to SignedData: {:?}", _e);
-						TransportError::InvalidMessage
-					})?;
-				#[cfg(test)]
-				eprintln!("Client: Successfully converted to SignedData, wrapping in TransportEnvelope");
+					(&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
 				let initial_envelope = TransportEnvelope::SignedData(signed_data);
 				let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
 				self.write_envelope(&wire_envelope.to_der()?).await?;
@@ -392,16 +366,7 @@ macro_rules! impl_tcp_common {
 				}
 
 				// Step 3: Handle server response - may return next message to send
-				let next_message = match &mut orchestrator {
-					ClientHandshakeOrchestrator::Ecies(h) => h.handle_response(&response_bytes).await?,
-					#[cfg(all(
-						feature = "builder",
-						feature = "aead",
-						feature = "signature",
-						feature = "secp256k1"
-					))]
-					ClientHandshakeOrchestrator::Cms(h) => h.handle_response(&response_bytes).await?,
-				};
+				let next_message = orchestrator.handle_response(&response_bytes).await?;
 
 				// Step 4: Send next message if any (multi-round support)
 				if let Some(msg_bytes) = next_message {
@@ -419,22 +384,12 @@ macro_rules! impl_tcp_common {
 				}
 
 				// Step 5: Complete handshake and derive session key
-				let session_key = match &mut orchestrator {
-					ClientHandshakeOrchestrator::Ecies(h) => {
-						// ECIES complete() is synchronous and returns Aes256Gcm directly
-						h.complete()?
-					}
-					#[cfg(all(
-						feature = "builder",
-						feature = "aead",
-						feature = "signature",
-						feature = "secp256k1"
-					))]
-					ClientHandshakeOrchestrator::Cms(_h) => {
-						// CMS client not yet properly supported in TCP transport
-						return Err(TransportError::InvalidMessage);
-					}
-				};
+				let session_key_bytes = orchestrator.complete().await?;
+
+				// Reconstruct Aes256Gcm from raw key bytes
+				use $crate::crypto::aead::KeyInit;
+				let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&session_key_bytes)
+					.map_err(|_| TransportError::InvalidMessage)?;
 
 				// Store session key and mark handshake complete
 				self.set_symmetric_key(session_key);
@@ -455,9 +410,7 @@ macro_rules! impl_tcp_common {
 			/// The orchestrator instance persists across multiple calls for multi-round protocols.
 			async fn perform_server_handshake(&mut self, handshake_bytes: &[u8]) -> TransportResult<()> {
 				use $crate::der::{Decode, Encode};
-				use $crate::transport::handshake::{
-					HandshakeProtocolKind, ServerHandshakeOrchestrator, ServerHandshakeProtocol,
-				};
+				use $crate::transport::handshake::HandshakeProtocolKind;
 				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 				if handshake_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
@@ -466,38 +419,22 @@ macro_rules! impl_tcp_common {
 
 				// Parse TransportEnvelope and extract the handshake message
 				let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
-				#[cfg(test)]
-				eprintln!("Server: Parsed TransportEnvelope variant: {:?}", std::mem::discriminant(&transport_envelope));
 				let raw_message = match &transport_envelope {
 					TransportEnvelope::SignedData(sd) => {
 						// This is ClientHello (first message from client)
 						use $crate::transport::handshake::ClientHello;
-						#[cfg(test)]
-						eprintln!("Server: Attempting to extract ClientHello from SignedData");
-						let result = ClientHello::try_from(sd)
-							.map_err(|_e| {
-								#[cfg(test)]
-								eprintln!("Server: Failed to extract ClientHello: {:?}", _e);
-								TransportError::InvalidMessage
-							})?;
-						#[cfg(test)]
-						eprintln!("Server: Successfully extracted ClientHello");
-						result.to_der()?
+						ClientHello::try_from(sd)
+							.map_err(|_| TransportError::InvalidMessage)?
+							.to_der()?
 					}
 					TransportEnvelope::EnvelopedData(ed) => {
 						// This is ClientKeyExchange (second message from client)
 						use $crate::transport::handshake::ClientKeyExchange;
-						#[cfg(test)]
-						eprintln!("Server: Attempting to extract ClientKeyExchange from EnvelopedData");
 						ClientKeyExchange::try_from(ed)
 							.map_err(|_| TransportError::InvalidMessage)?
 							.to_der()?
 					}
-					_ => {
-						#[cfg(test)]
-						eprintln!("Server: Invalid TransportEnvelope variant for handshake");
-						return Err(TransportError::InvalidMessage);
-					}
+					_ => return Err(TransportError::InvalidMessage),
 				};
 
 				// Get server certificate and signatory (required for handshake)
@@ -510,7 +447,7 @@ macro_rules! impl_tcp_common {
 
 					self.server_handshake = Some(match self.handshake_protocol_kind {
 						HandshakeProtocolKind::Ecies => {
-							ServerHandshakeOrchestrator::Ecies(
+							Box::new(
 								$crate::transport::handshake::server::EciesHandshakeServer::new(
 									std::sync::Arc::clone(&signatory),
 									cert,
@@ -521,8 +458,7 @@ macro_rules! impl_tcp_common {
 						#[cfg(all(
 							feature = "builder",
 							feature = "aead",
-							feature = "signature",
-							feature = "secp256k1"
+							feature = "signature"
 						))]
 						HandshakeProtocolKind::Cms => {
 							// TODO: CMS server needs proper transcript hash support
@@ -534,19 +470,7 @@ macro_rules! impl_tcp_common {
 				let orchestrator = self.server_handshake.as_mut().unwrap();
 
 				// Process client handshake message - may return response to send
-				let response_bytes = match orchestrator {
-					ServerHandshakeOrchestrator::Ecies(h) => h.handle_request(&raw_message).await?,
-					#[cfg(all(
-						feature = "builder",
-						feature = "aead",
-						feature = "signature",
-						feature = "secp256k1"
-					))]
-					ServerHandshakeOrchestrator::Cms(_h) => {
-						// CMS not yet properly supported
-						return Err(TransportError::InvalidMessage);
-					}
-				};
+				let response_bytes = orchestrator.handle_request(&raw_message).await?;
 
 				// Send response if any (multi-round support)
 				if let Some(response) = response_bytes {
@@ -578,22 +502,12 @@ macro_rules! impl_tcp_common {
 					}
 				} else {
 					// No response means handshake is complete - derive session key
-					let session_key = match orchestrator {
-						ServerHandshakeOrchestrator::Ecies(h) => {
-							// complete() is synchronous, not async
-							h.complete()?
-						}
-						#[cfg(all(
-							feature = "builder",
-							feature = "aead",
-							feature = "signature",
-							feature = "secp256k1"
-						))]
-						ServerHandshakeOrchestrator::Cms(_h) => {
-							// CMS not yet properly supported
-							return Err(TransportError::InvalidMessage);
-						}
-					};
+					let session_key_bytes = orchestrator.complete().await?;
+
+					// Reconstruct Aes256Gcm from raw key bytes
+					use $crate::crypto::aead::KeyInit;
+					let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&session_key_bytes)
+						.map_err(|_| TransportError::InvalidMessage)?;
 
 					self.set_symmetric_key(session_key);
 					self.set_handshake_state($crate::transport::handshake::HandshakeState::Complete);
@@ -627,7 +541,7 @@ macro_rules! impl_tcp_common {
 			}
 		}
 
-		#[cfg(all(feature = "transport-policy", not(all(feature = "x509", feature = "secp256k1"))))]
+		#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
 		impl<S: $stream_trait> $crate::transport::MessageEmitter for $transport<S>
 		where
 			TransportError: From<S::Error>,

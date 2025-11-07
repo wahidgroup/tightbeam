@@ -3,18 +3,12 @@
 //! Implements the client side of the TightBeam handshake protocol using
 //! CMS builders and processors.
 
-#![cfg(all(
-	feature = "builder",
-	feature = "aead",
-	feature = "signature",
-	feature = "secp256k1"
-))]
+#![cfg(all(feature = "builder", feature = "aead", feature = "signature"))]
+
+use core::marker::PhantomData;
 
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
-use crate::crypto::aead::{Aes256Gcm, KeyInit};
-use crate::crypto::hash::Sha3_256;
-use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
-use crate::crypto::sign::elliptic_curve::SecretKey;
+use crate::crypto::sign::elliptic_curve::{CurveArithmetic, SecretKey};
 use crate::crypto::sign::EcdsaSignatureVerifier;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::Decode;
@@ -32,32 +26,47 @@ use crate::x509::Certificate;
 
 /// Client-side CMS handshake orchestrator.
 ///
+/// Generic over curve type `C`, signature type `Sig`, verifying key type `Vk`,
+/// signing key type `Sk`, and digest type `D`.
+///
 /// Manages the complete client handshake flow:
 /// 1. Sends KeyExchange (EnvelopedData with KARI)
 /// 2. Receives and verifies server Finished (SignedData)
 /// 3. Sends client Finished (SignedData)
-pub struct CmsHandshakeClient {
+pub struct CmsHandshakeClient<C, Sig, Vk, Sk, D> {
 	state: ClientStateTransition,
-	client_key: Secp256k1SigningKey,
+	client_key: Sk,
 	server_cert: Certificate,
 	transcript_hash: Vec<u8>,
 	session_key: Option<Vec<u8>>,
+	_phantom: PhantomData<(C, Sig, Vk, D)>,
 }
 
-impl CmsHandshakeClient {
+impl<C, Sig, Vk, Sk, D> CmsHandshakeClient<C, Sig, Vk, Sk, D>
+where
+	C: elliptic_curve::Curve + CurveArithmetic,
+	C::FieldBytesSize: elliptic_curve::sec1::ModulusSize,
+	elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+	elliptic_curve::PublicKey<C>: EncodePublicKey,
+	Sig: signature::SignatureEncoding + Send + Sync + 'static,
+	Vk: signature::Verifier<Sig> + From<elliptic_curve::PublicKey<C>> + EncodePublicKey + Send + Sync + 'static,
+	Sk: signature::Signer<Sig> + signature::Keypair<VerifyingKey = Vk> + Clone + Send + Sync + 'static,
+	D: crate::crypto::hash::Digest + der::oid::AssociatedOid + Send + Sync + 'static,
+{
 	/// Create a new CMS handshake client.
 	///
 	/// # Parameters
 	/// - `client_key`: The client's signing key for authentication
 	/// - `server_cert`: The server's certificate (for key agreement)
 	/// - `transcript_hash`: The handshake transcript hash (from previous handshake messages)
-	pub fn new(client_key: Secp256k1SigningKey, server_cert: Certificate, transcript_hash: Vec<u8>) -> Self {
+	pub fn new(client_key: Sk, server_cert: Certificate, transcript_hash: Vec<u8>) -> Self {
 		Self {
 			state: ClientStateTransition::new(),
 			client_key,
 			server_cert,
 			transcript_hash,
 			session_key: None,
+			_phantom: PhantomData,
 		}
 	}
 
@@ -75,7 +84,7 @@ impl CmsHandshakeClient {
 		}
 
 		// Extract server public key from certificate
-		let server_public_key = crate::crypto::sign::elliptic_curve::PublicKey::<k256::Secp256k1>::from_sec1_bytes(
+		let server_public_key = elliptic_curve::PublicKey::<C>::from_sec1_bytes(
 			self.server_cert
 				.tbs_certificate
 				.subject_public_key_info
@@ -83,7 +92,7 @@ impl CmsHandshakeClient {
 				.raw_bytes(),
 		)?;
 
-		let sender_ephemeral = SecretKey::<k256::Secp256k1>::random(&mut OsRng);
+		let sender_ephemeral = SecretKey::<C>::random(&mut OsRng);
 		let sender_public = sender_ephemeral.public_key();
 		let sender_pub_spki = sender_public.to_public_key_der().map_err(|e| HandshakeError::SpkiError(e))?;
 		let sender_pub_spki = crate::spki::SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes())?;
@@ -103,8 +112,8 @@ impl CmsHandshakeClient {
 			parameters: None,
 		};
 
-		// Create KARI builder
-		let kari_builder = TightBeamKariBuilder::default()
+		// Build KARI (Key Agreement Recipient Info) structure
+		let kari_builder = TightBeamKariBuilder::<C>::new()
 			.with_sender_priv(sender_ephemeral)
 			.with_sender_pub_spki(sender_pub_spki)
 			.with_recipient_pub(server_public_key)
@@ -112,8 +121,9 @@ impl CmsHandshakeClient {
 			.with_ukm(ukm)
 			.with_key_enc_alg(key_enc_alg);
 
-		// Create EnvelopedData builder
-		let enveloped_builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
+		// Create EnvelopedData builder with generic curve type
+		let enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder)
+			.with_content_encryption_alg(crate::transport::handshake::utils::aes_256_gcm_algorithm());
 
 		// Build and encode
 		let enveloped_data_der = enveloped_builder.build_der(&session_key, None)?;
@@ -139,26 +149,35 @@ impl CmsHandshakeClient {
 		}
 
 		// Extract server verifying key from certificate
-		let server_verifying_key = crate::crypto::sign::elliptic_curve::PublicKey::<k256::Secp256k1>::from_sec1_bytes(
+		let server_public_key = elliptic_curve::PublicKey::<C>::from_sec1_bytes(
 			self.server_cert
 				.tbs_certificate
 				.subject_public_key_info
 				.subject_public_key
 				.raw_bytes(),
 		)?;
-		let server_verifying_key = Secp256k1VerifyingKey::from(server_verifying_key);
+		let server_verifying_key = Vk::from(server_public_key);
+
+		// Compute SignerIdentifier (SKI from DER-encoded public key)
+		let public_key_der = server_verifying_key
+			.to_public_key_der()
+			.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+
+		let mut hasher = D::new();
+		crate::crypto::hash::Digest::update(&mut hasher, public_key_der.as_bytes());
+		let skid_bytes = crate::crypto::hash::Digest::finalize(hasher);
+		let octet_string = der::asn1::OctetString::new(&skid_bytes.as_slice()[..20])?;
+		let expected_sid = cms::signed_data::SignerIdentifier::SubjectKeyIdentifier(
+			x509_cert::ext::pkix::SubjectKeyIdentifier::from(octet_string),
+		);
 
 		// Create verifier with proper SID checking
-		let expected_sid = crate::crypto::sign::secp256k1_signer_identifier(&server_verifying_key)?;
 		let verifier =
-			EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_verifying_key_with_sid(
-				server_verifying_key,
-				expected_sid,
-			);
+			EcdsaSignatureVerifier::<Vk, Sig, D>::from_verifying_key_with_sid(server_verifying_key, expected_sid);
 		let processor = TightBeamSignedDataProcessor::new(verifier);
 
 		// Verify signature
-		let digest_oid = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"); // SHA3-256
+		let digest_oid = D::OID;
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
 
 		// Verify content matches our transcript hash
@@ -183,21 +202,15 @@ impl CmsHandshakeClient {
 		}
 
 		// Algorithm identifiers
-		let digest_alg = AlgorithmIdentifierOwned {
-			oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
-			parameters: None,
-		};
+		let digest_alg = AlgorithmIdentifierOwned { oid: D::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned {
-			oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), // ecdsa-with-SHA256
+			oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), // ecdsa-with-SHA256 (TODO: make generic)
 			parameters: None,
 		};
 
 		// Build SignedData
-		let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
-			self.client_key.clone(),
-			digest_alg,
-			signature_alg,
-		)?;
+		let mut builder =
+			TightBeamSignedDataBuilder::<Sig, D>::new(self.client_key.clone(), digest_alg, signature_alg)?;
 		let signed_data_der = builder.build_der(&self.transcript_hash)?;
 
 		// Transition state
@@ -238,26 +251,50 @@ impl CmsHandshakeClient {
 // ClientHandshakeProtocol Implementation
 // ============================================================================
 
-impl ClientHandshakeProtocol for CmsHandshakeClient {
+impl<C, Sig, Vk, Sk, D> ClientHandshakeProtocol for CmsHandshakeClient<C, Sig, Vk, Sk, D>
+where
+	C: elliptic_curve::Curve + CurveArithmetic + Send + Sync,
+	C::FieldBytesSize: elliptic_curve::sec1::ModulusSize,
+	elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+	elliptic_curve::PublicKey<C>: EncodePublicKey,
+	Sig: signature::SignatureEncoding + Send + Sync + 'static,
+	Vk: signature::Verifier<Sig> + From<elliptic_curve::PublicKey<C>> + EncodePublicKey + Send + Sync + 'static,
+	Sk: signature::Signer<Sig> + signature::Keypair<VerifyingKey = Vk> + Clone + Send + Sync + 'static,
+	D: crate::crypto::hash::Digest + der::oid::AssociatedOid + Send + Sync + 'static,
+{
 	type SessionKey = Vec<u8>;
 	type Error = HandshakeError;
 
-	async fn start(&mut self) -> Result<Vec<u8>, Self::Error> {
-		self.build_key_exchange(vec![0u8; 32]) // TODO: Generate proper session key
+	fn start<'a>(
+		&'a mut self,
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>> {
+		Box::pin(async move { self.build_key_exchange(vec![0u8; 32]) })
 	}
 
-	async fn handle_response(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-		// Process server finished
-		self.process_server_finished(msg)?;
+	fn handle_response<'a, 'b>(
+		&'a mut self,
+		msg: &'b [u8],
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	where
+		'b: 'a,
+	{
+		Box::pin(async move {
+			// Process server finished
+			self.process_server_finished(msg)?;
 
-		// Build client finished
-		let client_finished = self.build_client_finished()?;
-		Ok(Some(client_finished))
+			// Build client finished
+			let client_finished = self.build_client_finished()?;
+			Ok(Some(client_finished))
+		})
 	}
 
-	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error> {
-		self.complete()?;
-		Ok(self.session_key().ok_or(HandshakeError::InvalidState)?.to_vec())
+	fn complete<'a>(
+		&'a mut self,
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>> {
+		Box::pin(async move {
+			self.complete()?;
+			Ok(self.session_key().ok_or(HandshakeError::InvalidState)?.to_vec())
+		})
 	}
 
 	fn is_complete(&self) -> bool {
@@ -265,10 +302,25 @@ impl ClientHandshakeProtocol for CmsHandshakeClient {
 	}
 }
 
+/// Type alias for CMS client using secp256k1 curve.
+///
+/// This is the default curve used in TightBeam and is provided as a
+/// convenient alias for the generic `CmsHandshakeClient`.
+#[cfg(feature = "secp256k1")]
+pub type CmsHandshakeClientSecp256k1 = CmsHandshakeClient<
+	k256::Secp256k1,
+	crate::crypto::sign::ecdsa::Secp256k1Signature,
+	crate::crypto::sign::ecdsa::Secp256k1VerifyingKey,
+	crate::crypto::sign::ecdsa::Secp256k1SigningKey,
+	crate::crypto::hash::Sha3_256,
+>;
+
 #[cfg(test)]
 mod tests {
 	mod client {
 		use super::super::*;
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 		use crate::crypto::sign::elliptic_curve::SecretKey;
 		use crate::random::OsRng;
 		use crate::spki::EncodePublicKey;
@@ -327,7 +379,7 @@ mod tests {
 			let transcript_hash = vec![1u8; 32];
 
 			// Create client
-			let mut client = CmsHandshakeClient::new(client_key.clone(), server_cert, transcript_hash.clone());
+			let mut client = CmsHandshakeClientSecp256k1::new(client_key.clone(), server_cert, transcript_hash.clone());
 			assert_eq!(client.state(), HandshakeState::Init);
 
 			// Build KeyExchange
@@ -379,7 +431,7 @@ mod tests {
 			let server_key = Secp256k1SigningKey::random(&mut OsRng);
 			let server_cert = create_test_certificate(&server_key);
 			let transcript_hash = vec![1u8; 32];
-			let mut client = CmsHandshakeClient::new(client_key, server_cert, transcript_hash);
+			let mut client = CmsHandshakeClientSecp256k1::new(client_key, server_cert, transcript_hash);
 
 			// Can't process server finished before sending key exchange
 			let result = client.process_server_finished(&[]);

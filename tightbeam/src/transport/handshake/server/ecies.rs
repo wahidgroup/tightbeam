@@ -2,7 +2,7 @@
 //!
 //! Implements the server side of the TightBeam ECIES handshake protocol.
 
-#![cfg(all(feature = "x509", feature = "secp256k1"))]
+#![cfg(feature = "x509")]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -112,7 +112,10 @@ impl EciesHandshakeServer {
 			signature: OctetString::new(signature_bytes)?,
 		};
 
-		// Note: State doesn't transition yet - we're waiting for ClientKeyExchange
+		// Transition through ServerHelloReceived to ServerHelloSent
+		self.state.transition(HandshakeState::ServerHelloReceived)?;
+		self.state.transition(HandshakeState::ServerHelloSent)?;
+
 		Ok(server_handshake.to_der()?)
 	}
 
@@ -125,24 +128,17 @@ impl EciesHandshakeServer {
 	/// Success (session key stored internally)
 	pub fn process_client_key_exchange(&mut self, client_kex_der: &[u8]) -> Result<(), HandshakeError> {
 		// Validate state
-		if self.state.state() != HandshakeState::Init {
+		if self.state.state() != HandshakeState::ServerHelloSent {
 			return Err(HandshakeError::InvalidState);
 		}
 
 		// Decode ClientKeyExchange
 		let client_kex = ClientKeyExchange::from_der(client_kex_der)?;
-
-		// Parse ECIES message
+		// Get encrypted bytes (ECIES message in serialized form)
 		let encrypted_bytes = client_kex.encrypted_data.as_bytes();
-		let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)
-			.map_err(|e| HandshakeError::InvalidEciesMessage(format!("{e:?}")))?;
 
-		// Decrypt with ECIES using trait method
-		let decrypted = self
-			.server_key
-			.decrypt_ecies(&encrypted_message, self.aad_domain_tag.as_deref())
-			.map_err(|e| HandshakeError::EciesDecryptionFailed(format!("{e:?}")))?;
-
+		// Decrypt with ECIES using trait method (parsing happens inside the trait impl)
+		let decrypted = self.server_key.decrypt_ecies(encrypted_bytes, self.aad_domain_tag.as_deref())?;
 		let decrypted = decrypted.to_insecure();
 		if decrypted.len() != 64 {
 			return Err(HandshakeError::InvalidDecryptedPayloadSize);
@@ -261,6 +257,19 @@ impl EciesHandshakeServer {
 		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, b"tightbeam-session-v1", Some(&salt))?;
 		Ok(Aes256Gcm::new_from_slice(&final_key_bytes[..])?)
 	}
+
+	fn derive_final_session_key_bytes(
+		&self,
+		base_key: &[u8; 32],
+		client_random: &[u8; 32],
+		server_random: &[u8; 32],
+	) -> Result<Vec<u8>, HandshakeError> {
+		let mut salt = [0u8; 64];
+		salt[..32].copy_from_slice(client_random);
+		salt[32..].copy_from_slice(server_random);
+		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, b"tightbeam-session-v1", Some(&salt))?;
+		Ok(final_key_bytes.to_vec())
+	}
 }
 
 // ============================================================================
@@ -268,27 +277,66 @@ impl EciesHandshakeServer {
 // ============================================================================
 
 impl ServerHandshakeProtocol for EciesHandshakeServer {
-	type SessionKey = Aes256Gcm;
+	type SessionKey = Vec<u8>;
 	type Error = HandshakeError;
 
-	async fn handle_request(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-		// Determine which message type this is based on state
-		match self.state() {
-			HandshakeState::Init => {
-				// This is ClientHello - respond with ServerHandshake
-				let server_handshake = self.process_client_hello(msg)?;
-				Ok(Some(server_handshake))
+	fn handle_request<'a, 'b>(
+		&'a mut self,
+		msg: &'b [u8],
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	where
+		'b: 'a,
+	{
+		Box::pin(async move {
+			// Determine which message type this is based on state
+			match self.state() {
+				HandshakeState::Init => {
+					// This is ClientHello - respond with ServerHandshake
+					let server_handshake = self.process_client_hello(msg)?;
+					Ok(Some(server_handshake))
+				}
+				HandshakeState::ServerHelloSent => {
+					// This is ClientKeyExchange - no response needed
+					self.process_client_key_exchange(msg)?;
+					Ok(None)
+				}
+				_ => Err(HandshakeError::InvalidState),
 			}
-			_ => {
-				// This is ClientKeyExchange - no response needed
-				self.process_client_key_exchange(msg)?;
-				Ok(None)
-			}
-		}
+		})
 	}
 
-	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error> {
-		self.complete()
+	fn complete<'a>(
+		&'a mut self,
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>> {
+		Box::pin(async move {
+			// Validate state
+			if self.state.state() != HandshakeState::KeyExchangeReceived {
+				return Err(HandshakeError::InvalidState);
+			}
+
+			// Derive final session key as raw bytes
+			let base_key = self.base_session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
+			let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
+			let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
+
+			let session_key_bytes = self.derive_final_session_key_bytes(base_key, client_random, server_random)?;
+
+			// Transition to complete
+			self.state.transition(HandshakeState::Complete)?;
+
+			// Clear sensitive data
+			if let Some(mut bk) = self.base_session_key.take() {
+				bk.fill(0);
+			}
+			if let Some(mut cr) = self.client_random.take() {
+				cr.fill(0);
+			}
+			if let Some(mut sr) = self.server_random.take() {
+				sr.fill(0);
+			}
+
+			Ok(session_key_bytes)
+		})
 	}
 
 	fn is_complete(&self) -> bool {
@@ -365,7 +413,7 @@ mod tests {
 
 		// Process ClientHello
 		let _server_handshake = server.process_client_hello(&client_hello.to_der()?)?;
-		assert_eq!(server.state(), HandshakeState::Init); // Still waiting for ClientKeyExchange
+		assert_eq!(server.state(), HandshakeState::ServerHelloSent); // Now ready for ClientKeyExchange
 		assert!(server.client_random.is_some());
 		assert!(server.server_random.is_some());
 		assert!(server.transcript_hash.is_some());

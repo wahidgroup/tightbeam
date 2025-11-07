@@ -37,7 +37,6 @@ pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
 #[derive(Clone)]
 pub struct TransportEncryptionConfig {
 	pub certificate: crate::x509::Certificate,
-	#[cfg(feature = "secp256k1")]
 	pub signatory: std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
 	pub aad_domain_tag: Vec<u8>,
 	pub max_cleartext_envelope: usize,
@@ -49,7 +48,6 @@ pub struct TransportEncryptionConfig {
 
 #[cfg(all(feature = "x509", feature = "std"))]
 impl TransportEncryptionConfig {
-	#[cfg(feature = "secp256k1")]
 	pub fn new(
 		certificate: crate::x509::Certificate,
 		signatory: std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
@@ -305,11 +303,8 @@ pub trait Protocol {
 }
 
 #[cfg(feature = "x509")]
-pub trait EncryptedProtocol<O>: Protocol
-where
-	O: der::oid::AssociatedOid,
-{
-	type Encryptor: crate::crypto::aead::Encryptor<O>;
+pub trait EncryptedProtocol: Protocol {
+	type Encryptor: crate::crypto::aead::Encryptor<crate::crypto::aead::Aes256GcmOid>;
 	type Decryptor: crate::crypto::aead::Decryptor;
 
 	/// Bind to an address with transport encryption configuration
@@ -404,11 +399,8 @@ pub trait MessageIO: ResponseHandler {
 	}
 }
 #[cfg(feature = "x509")]
-pub trait EncryptedMessageIO<O>: MessageIO
-where
-	O: der::oid::AssociatedOid,
-{
-	type Encryptor: crate::crypto::aead::Encryptor<O>;
+pub trait EncryptedMessageIO: MessageIO {
+	type Encryptor: crate::crypto::aead::Encryptor<crate::crypto::aead::Aes256GcmOid>;
 	type Decryptor: crate::crypto::aead::Decryptor;
 
 	/// Get the encryptor instance

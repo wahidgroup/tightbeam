@@ -10,8 +10,6 @@ use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
 use crate::{policy::GatePolicy, transport::policy::RestartPolicy};
 
 #[cfg(feature = "x509")]
-use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
-#[cfg(feature = "x509")]
 use crate::transport::handshake::HandshakeState;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
@@ -53,7 +51,7 @@ pub struct TokioListener {
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
 	handshake_timeout: Option<Duration>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	#[cfg(feature = "x509")]
 	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 }
 
@@ -76,7 +74,7 @@ impl TokioListener {
 			max_encrypted_envelope: None,
 			#[cfg(feature = "x509")]
 			handshake_timeout: None,
-			#[cfg(all(feature = "x509", feature = "secp256k1"))]
+			#[cfg(feature = "x509")]
 			signatory: None,
 		})
 	}
@@ -113,7 +111,7 @@ impl TokioListener {
 			transport.handshake_timeout = timeout;
 		}
 
-		#[cfg(feature = "secp256k1")]
+		#[cfg(feature = "x509")]
 		if let Some(signatory) = &self.signatory {
 			transport.signatory = Some(signatory.clone());
 		}
@@ -149,7 +147,7 @@ impl Protocol for TokioListener {
 				max_encrypted_envelope: None,
 				#[cfg(feature = "x509")]
 				handshake_timeout: None,
-				#[cfg(all(feature = "x509", feature = "secp256k1"))]
+				#[cfg(feature = "x509")]
 				signatory: None,
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
@@ -171,7 +169,7 @@ impl Protocol for TokioListener {
 }
 
 #[cfg(feature = "x509")]
-impl EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid> for TokioListener {
+impl EncryptedProtocol for TokioListener {
 	type Encryptor = crate::crypto::aead::Aes256Gcm;
 	type Decryptor = crate::crypto::aead::Aes256Gcm;
 
@@ -194,12 +192,10 @@ impl EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid> for TokioListene
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
 	}
-
-	// Non-secp256k1 builds can be extended later if needed
 }
 
 #[cfg(feature = "x509")]
-impl<S: AsyncProtocolStream> EncryptedMessageIO<crate::crypto::ecies::EciesSecp256k1Oid> for TcpTransport<S>
+impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
@@ -250,7 +246,7 @@ impl AsyncListenerTrait for TokioListener {
 			transport.server_certificate = Some(cert.clone());
 		}
 
-		#[cfg(all(feature = "x509", feature = "secp256k1"))]
+		#[cfg(feature = "x509")]
 		if let Some(ref signatory) = self.signatory {
 			transport.signatory = Some(signatory.clone());
 		}
@@ -280,9 +276,6 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
 	#[cfg(feature = "x509")]
 	#[allow(dead_code)]
-	server_public_key: Option<Secp256k1VerifyingKey>,
-	#[cfg(feature = "x509")]
-	#[allow(dead_code)]
 	enforce_encryption: bool,
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
@@ -292,7 +285,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	max_cleartext_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	#[cfg(feature = "x509")]
 	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
 	handshake_state: HandshakeState,
@@ -312,9 +305,6 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	collector_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "x509")]
 	#[allow(dead_code)]
-	server_public_key: Option<Secp256k1VerifyingKey>,
-	#[cfg(feature = "x509")]
-	#[allow(dead_code)]
 	enforce_encryption: bool,
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
@@ -324,7 +314,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	max_cleartext_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	#[cfg(feature = "x509")]
 	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
 	handshake_state: HandshakeState,
@@ -332,11 +322,16 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
 	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	client_handshake: Option<crate::transport::handshake::ClientHandshakeOrchestrator>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	server_handshake: Option<crate::transport::handshake::ServerHandshakeOrchestrator>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	#[cfg(feature = "x509")]
+	server_handshake: Option<
+		Box<
+			dyn crate::transport::handshake::ServerHandshakeProtocol<
+					SessionKey = Vec<u8>,
+					Error = crate::transport::handshake::HandshakeError,
+				> + Send,
+		>,
+	>,
+	#[cfg(feature = "x509")]
 	handshake_protocol_kind: crate::transport::handshake::HandshakeProtocolKind,
 }
 
@@ -655,7 +650,7 @@ where
 	}
 }
 
-#[cfg(all(feature = "x509", feature = "secp256k1", feature = "transport-policy"))]
+#[cfg(all(feature = "x509", feature = "transport-policy"))]
 impl<S: AsyncProtocolStream> crate::transport::MessageEmitter for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -675,6 +670,7 @@ where
 	///
 	/// # Handshake Flow (when x509 enabled)
 	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
+		use crate::crypto::aead::{Aes256GcmOid, Encryptor};
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
 		use crate::transport::handshake::HandshakeState;
@@ -694,33 +690,28 @@ where
 			// Check if handshake is needed before sending
 			if self.server_certificate().is_some() && self.handshake_state() == HandshakeState::None {
 				// Perform client-side handshake
-				println!("Client: performing handshake");
 				self.perform_client_handshake().await?;
-				println!("Client: handshake complete, state = {:?}", self.handshake_state());
 			}
 
 			// Wrap in envelope and send
 			let envelope = TransportEnvelope::from(current_message.clone());
 
 			// Check if encryption should be used
-			println!("Client: about to send, handshake_state = {:?}", self.handshake_state());
 			let wire_envelope = if self.handshake_state() == HandshakeState::Complete {
 				// Use encryption after handshake complete
-				println!("Client: encrypting message");
-				use crate::crypto::aead::{Aes256GcmOid, Encryptor};
 				let envelope_bytes = envelope.to_der()?;
 				if let Some(max) = self.max_encrypted_envelope {
 					if envelope_bytes.len() > max {
 						return Err(TransportError::InvalidMessage);
 					}
 				}
+
 				let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
 				let encrypted =
 					<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, nonce, None)?;
 				WireEnvelope::Encrypted(encrypted)
 			} else {
 				// Use cleartext before handshake or when no certificate
-				println!("Client: sending cleartext");
 				{
 					let bytes = envelope.to_der()?;
 					if let Some(max) = self.max_cleartext_envelope {
@@ -911,7 +902,6 @@ mod tests {
 
 		let server_handle = tokio::spawn(async move {
 			let (transport, _) = server.accept().await?;
-			println!("Server: accepted connection");
 			let mut transport =
 				transport
 					.with_collector_gate(BusyFirstGate::new())
@@ -922,14 +912,11 @@ mod tests {
 
 			// First handle_request: processes handshake (ClientHello + ClientKeyExchange)
 			// and first application message. Gate returns Busy for first app message.
-			println!("Server: handling first request (handshake + app message)");
 			let result = transport.handle_request().await;
-			println!("Server: first handle_request result: {result:?}");
 			result?;
 
 			// Second handle_request: processes second application message
 			// Gate returns Accepted this time
-			println!("Server: handling second request");
 			transport.handle_request().await
 		});
 
@@ -939,7 +926,6 @@ mod tests {
 		// First emit triggers handshake, then sends encrypted message
 		// Gate policy returns Busy for first application message
 		let first = transport.emit(test_message.clone(), None).await;
-		println!("First attempt: {first:?}");
 		assert!(matches!(first, Err(TransportError::Busy)));
 
 		// Second emit sends encrypted message, gate returns Accepted

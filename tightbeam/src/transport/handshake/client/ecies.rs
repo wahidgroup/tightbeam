@@ -16,7 +16,6 @@ use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::state::{ClientStateTransition, HandshakeState, StateTransition};
 use crate::transport::handshake::{ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake};
-use crate::transport::TransportError;
 use crate::x509::Certificate;
 
 #[cfg(feature = "time")]
@@ -314,6 +313,19 @@ impl EciesHandshakeClient {
 		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, b"tightbeam-session-v1", Some(&salt))?;
 		Ok(Aes256Gcm::new_from_slice(&final_key_bytes[..])?)
 	}
+
+	fn derive_final_session_key_bytes(
+		&self,
+		base_key: &[u8; 32],
+		client_random: &[u8; 32],
+		server_random: &[u8; 32],
+	) -> Result<Vec<u8>, HandshakeError> {
+		let mut salt = [0u8; 64];
+		salt[..32].copy_from_slice(client_random);
+		salt[32..].copy_from_slice(server_random);
+		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, b"tightbeam-session-v1", Some(&salt))?;
+		Ok(final_key_bytes.to_vec())
+	}
 }
 
 // ============================================================================
@@ -321,21 +333,61 @@ impl EciesHandshakeClient {
 // ============================================================================
 
 impl ClientHandshakeProtocol for EciesHandshakeClient {
-	type SessionKey = Aes256Gcm;
+	type SessionKey = Vec<u8>;
 	type Error = HandshakeError;
 
-	async fn start(&mut self) -> Result<Vec<u8>, Self::Error> {
-		self.build_client_hello()
+	fn start<'a>(
+		&'a mut self,
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>> {
+		Box::pin(async move { self.build_client_hello() })
 	}
 
-	async fn handle_response(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-		// Process server handshake and build client key exchange
-		let client_kex = self.process_server_handshake(msg)?;
-		Ok(Some(client_kex))
+	fn handle_response<'a, 'b>(
+		&'a mut self,
+		msg: &'b [u8],
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	where
+		'b: 'a,
+	{
+		Box::pin(async move {
+			// Process server handshake and build client key exchange
+			let client_kex = self.process_server_handshake(msg)?;
+			Ok(Some(client_kex))
+		})
 	}
 
-	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error> {
-		self.complete()
+	fn complete<'a>(
+		&'a mut self,
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>> {
+		Box::pin(async move {
+			// Validate state
+			if self.state.state() != HandshakeState::KeyExchangeSent {
+				return Err(HandshakeError::InvalidState);
+			}
+
+			// Derive final session key as raw bytes
+			let base_key = self.base_session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
+			let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
+			let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
+
+			let session_key_bytes = self.derive_final_session_key_bytes(base_key, client_random, server_random)?;
+
+			// Transition to complete
+			self.state.transition(HandshakeState::Complete)?;
+
+			// Clear sensitive data
+			if let Some(mut bk) = self.base_session_key.take() {
+				bk.fill(0);
+			}
+			if let Some(mut cr) = self.client_random.take() {
+				cr.fill(0);
+			}
+			if let Some(mut sr) = self.server_random.take() {
+				sr.fill(0);
+			}
+
+			Ok(session_key_bytes)
+		})
 	}
 
 	fn is_complete(&self) -> bool {

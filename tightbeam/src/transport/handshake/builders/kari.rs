@@ -34,19 +34,6 @@ use hkdf::Hkdf;
 /// 2. HKDF derivation using UKM as salt to produce KEK.
 /// 3. Key wrapping (e.g., AES Key Wrap RFC 3394) of the content-encryption key.
 /// 4. Construction of CMS `KeyAgreeRecipientInfo` structure.
-///
-/// Generic over elliptic curve type `C` to support secp256k1, P-256, etc.
-///
-/// # Example
-/// ```ignore
-/// let builder = TightBeamKariBuilder::default()
-///     .with_sender_priv(sender_priv)
-///     .with_sender_pub_spki(sender_pub_spki)
-///     .with_recipient_pub(recipient_pub)
-///     .with_recipient_rid(recipient_rid)
-///     .with_ukm(ukm)
-///     .with_key_enc_alg(key_enc_alg);
-/// ```
 #[cfg(all(feature = "builder", feature = "aead"))]
 pub struct TightBeamKariBuilder<C>
 where
@@ -77,6 +64,25 @@ impl<C> TightBeamKariBuilder<C>
 where
 	C: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
 {
+	/// Create a new KARI builder with default KDF (HKDF-SHA3-256) and key wrapper (AES-KW).
+	///
+	/// This constructor provides a generic implementation that works for any curve type.
+	/// The KDF uses SHA3-256 for HKDF derivation, and the key wrapper uses AES Key Wrap (RFC 3394).
+	#[cfg(all(feature = "kdf", feature = "sha3"))]
+	pub fn new() -> Self {
+		Self {
+			sender_priv: None,
+			sender_pub_spki: None,
+			recipient_pub: None,
+			recipient_rid: None,
+			ukm: None,
+			key_enc_alg: None,
+			kdf_info: b"tb-kari-v1",
+			kdf: Box::new(hkdf_sha3_256),
+			key_wrapper: Box::new(aes_key_wrap),
+		}
+	}
+
 	/// Set the sender's ephemeral private key for ECDH.
 	pub fn with_sender_priv(mut self, sender_priv: SecretKey<C>) -> Self {
 		self.sender_priv = Some(sender_priv);

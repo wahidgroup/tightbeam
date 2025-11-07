@@ -33,12 +33,14 @@ words:
   - HMAC
   - keypair
   - Merkle
+  - Morpher
   - morphers
   - nanos
   - nonrep
   - nonrepudiable
   - nonrepudiation
   - oids
+  - Orchestr
   - Pingable
   - pkcs
   - pkix

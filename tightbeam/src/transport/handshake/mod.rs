@@ -142,14 +142,100 @@ fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
 // Server key abstraction for handshake (sign + decrypt)
 // ============================================================================
 
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
+/// Server-side key operations for handshake protocols.
+///
+/// This trait provides curve-agnostic abstractions for cryptographic operations
+/// needed during server-side handshakes. Implementations handle the curve-specific
+/// details internally while exposing a uniform interface.
+///
+/// The trait is designed to keep private key material encapsulated - all operations
+/// that require the private key are performed within the trait methods, and the
+/// key itself is never exposed.
+#[cfg(feature = "x509")]
 pub trait ServerHandshakeKey: Send + Sync {
+	/// Sign a 32-byte server challenge for ECIES handshake.
+	///
+	/// Used during the server handshake to sign the transcript hash (derived from
+	/// client random, server random, and server public key).
+	///
+	/// # Parameters
+	/// - `msg`: 32-byte message to sign (typically a transcript hash)
+	///
+	/// # Returns
+	/// Signature bytes in the curve's native format
 	fn sign_server_challenge(&self, msg: &[u8; 32]) -> core::result::Result<Vec<u8>, HandshakeError>;
+
+	/// Decrypt an ECIES-encrypted message for ECIES handshake.
+	///
+	/// The message format is curve-specific (e.g., for secp256k1, it's a
+	/// Secp256k1EciesMessage containing ephemeral public key, encrypted data,
+	/// and authentication tag).
+	///
+	/// # Parameters
+	/// - `encrypted_bytes`: The complete ECIES message in serialized form
+	/// - `aad`: Optional additional authenticated data
+	///
+	/// # Returns
+	/// Decrypted plaintext wrapped in a Secret for memory safety
 	fn decrypt_ecies(
 		&self,
-		msg: &crate::crypto::ecies::Secp256k1EciesMessage,
+		encrypted_bytes: &[u8],
 		aad: Option<&[u8]>,
-	) -> core::result::Result<crate::crypto::secret::Secret<[u8]>, crate::crypto::ecies::EciesError>;
+	) -> core::result::Result<crate::crypto::secret::Secret<Vec<u8>>, HandshakeError>;
+
+	/// Decrypt a CMS EnvelopedData using KARI (Key Agreement Recipient Info).
+	///
+	/// This performs ECDH with the originator's ephemeral key, derives a KEK,
+	/// and unwraps the encrypted content-encryption key. The curve type is
+	/// determined by the implementation.
+	///
+	/// # Parameters
+	/// - `enveloped_data_der`: DER-encoded CMS EnvelopedData structure
+	/// - `kdf_info`: KDF info string (e.g., b"tb-kari-v1")
+	/// - `recipient_index`: Index of the recipient in recipient_enc_keys (usually 0)
+	///
+	/// # Returns
+	/// The unwrapped content-encryption key (CEK)
+	#[cfg(all(feature = "builder", feature = "aead"))]
+	fn decrypt_kari(
+		&self,
+		enveloped_data_der: &[u8],
+		kdf_info: &[u8],
+		recipient_index: usize,
+	) -> core::result::Result<Vec<u8>, HandshakeError>;
+
+	/// Build a CMS SignedData structure by signing content.
+	///
+	/// This creates a complete CMS SignedData with the server's signature,
+	/// including proper digest and signature algorithm identifiers. The signature
+	/// algorithm is determined by the key type.
+	///
+	/// # Parameters
+	/// - `content`: The data to sign (typically a transcript hash)
+	/// - `digest_alg`: Algorithm identifier for the digest algorithm
+	/// - `signature_alg`: Algorithm identifier for the signature algorithm
+	///
+	/// # Returns
+	/// DER-encoded CMS SignedData structure
+	#[cfg(all(feature = "builder", feature = "signature"))]
+	fn build_cms_signed_data(
+		&self,
+		content: &[u8],
+		digest_alg: &crate::spki::AlgorithmIdentifierOwned,
+		signature_alg: &crate::spki::AlgorithmIdentifierOwned,
+	) -> core::result::Result<Vec<u8>, HandshakeError>;
+
+	/// Get the digest algorithm identifier used by this key.
+	///
+	/// Returns the OID and parameters for the digest algorithm (e.g., SHA3-256).
+	#[cfg(all(feature = "builder", feature = "signature"))]
+	fn digest_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned;
+
+	/// Get the signature algorithm identifier used by this key.
+	///
+	/// Returns the OID and parameters for the signature algorithm (e.g., ecdsa-with-SHA3-256).
+	#[cfg(all(feature = "builder", feature = "signature"))]
+	fn signature_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned;
 }
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
@@ -163,13 +249,132 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 
 	fn decrypt_ecies(
 		&self,
-		msg: &crate::crypto::ecies::Secp256k1EciesMessage,
+		encrypted_bytes: &[u8],
 		aad: Option<&[u8]>,
-	) -> core::result::Result<crate::crypto::secret::Secret<[u8]>, crate::crypto::ecies::EciesError> {
+	) -> core::result::Result<crate::crypto::secret::Secret<Vec<u8>>, HandshakeError> {
 		use crate::crypto::ecies::decrypt;
+		use crate::crypto::secret::ToInsecure;
+
+		// Parse the ECIES message from bytes
+		let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)
+			.map_err(|e| HandshakeError::InvalidEciesMessage(format!("{e:?}")))?;
+
+		// Convert to SecretKey for ECIES decryption
 		let scalar = self.as_nonzero_scalar();
 		let sk = k256::SecretKey::from(scalar);
-		decrypt(&sk, msg, aad)
+
+		// Decrypt
+		let decrypted = decrypt(&sk, &encrypted_message, aad)
+			.map_err(|e| HandshakeError::EciesDecryptionFailed(format!("{e:?}")))?;
+
+		// Convert Secret<[u8]> to Secret<Vec<u8>>
+		let vec = decrypted.to_insecure().to_vec();
+		Ok(crate::crypto::secret::Secret::new(Box::new(vec)))
+	}
+
+	#[cfg(all(feature = "builder", feature = "aead"))]
+	fn decrypt_kari(
+		&self,
+		enveloped_data_der: &[u8],
+		kdf_info: &[u8],
+		recipient_index: usize,
+	) -> core::result::Result<Vec<u8>, HandshakeError> {
+		use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
+		use crate::crypto::sign::elliptic_curve::PublicKey;
+		use crate::transport::handshake::builders::kari::{aes_key_unwrap, hkdf_sha3_256};
+
+		use crate::crypto::sign::elliptic_curve::SecretKey;
+		use crate::der::Decode;
+
+		// Convert to SecretKey (stays encapsulated within this method)
+		let secret = SecretKey::from(self.clone());
+
+		// Decode EnvelopedData
+		let enveloped_data = cms::enveloped_data::EnvelopedData::from_der(enveloped_data_der)?;
+
+		// Get the recipient info
+		let recipient_info = enveloped_data
+			.recip_infos
+			.0
+			.get(recipient_index)
+			.ok_or(HandshakeError::InvalidRecipientIndex)?;
+
+		// Extract KARI
+		let kari = match recipient_info {
+			cms::enveloped_data::RecipientInfo::Kari(k) => k,
+			_ => return Err(HandshakeError::UnsupportedOriginatorIdentifier),
+		};
+
+		// Manually perform KARI processing without requiring 'static lifetime
+		// This duplicates some logic from TightBeamKariRecipient but keeps keys encapsulated
+		// Extract originator's public key
+		let originator_pub = match &kari.originator {
+			cms::enveloped_data::OriginatorIdentifierOrKey::OriginatorKey(orig_key) => {
+				let pub_key_bytes = orig_key.public_key.raw_bytes();
+				PublicKey::<k256::Secp256k1>::from_sec1_bytes(pub_key_bytes)
+					.map_err(|_| HandshakeError::InvalidOriginatorPublicKey)?
+			}
+			_ => return Err(HandshakeError::UnsupportedOriginatorIdentifier),
+		};
+
+		// Perform ECDH
+		let shared_secret = diffie_hellman(secret.to_nonzero_scalar(), originator_pub.as_affine());
+
+		// Derive KEK using UKM as salt
+		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
+		let salt = ukm.as_bytes();
+		let mut kek = hkdf_sha3_256(shared_secret.raw_secret_bytes().as_ref(), salt, kdf_info, 32)?;
+
+		// Validate recipient index for encrypted keys
+		if recipient_index >= kari.recipient_enc_keys.len() {
+			return Err(HandshakeError::InvalidRecipientIndex);
+		}
+
+		// Extract wrapped key
+		let wrapped_key = kari.recipient_enc_keys[0].enc_key.as_bytes();
+		// Unwrap to get CEK
+		let cek = aes_key_unwrap(wrapped_key, &kek)?;
+
+		// Zeroize KEK
+		#[cfg(feature = "zeroize")]
+		{
+			use zeroize::Zeroize;
+			kek.zeroize();
+		}
+
+		Ok(cek)
+	}
+
+	#[cfg(all(feature = "builder", feature = "signature"))]
+	fn build_cms_signed_data(
+		&self,
+		content: &[u8],
+		digest_alg: &crate::spki::AlgorithmIdentifierOwned,
+		signature_alg: &crate::spki::AlgorithmIdentifierOwned,
+	) -> core::result::Result<Vec<u8>, HandshakeError> {
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
+
+		// Create builder with concrete signature and digest types
+		let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
+			self.clone(),
+			digest_alg.clone(),
+			signature_alg.clone(),
+		)?;
+
+		// Build and return DER-encoded SignedData
+		builder.build_der(content)
+	}
+
+	#[cfg(all(feature = "builder", feature = "signature"))]
+	fn digest_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned {
+		crate::spki::AlgorithmIdentifierOwned { oid: crate::HASH_SHA3_256_OID, parameters: None }
+	}
+
+	#[cfg(all(feature = "builder", feature = "signature"))]
+	fn signature_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned {
+		crate::spki::AlgorithmIdentifierOwned { oid: crate::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
 	}
 }
 
@@ -226,25 +431,31 @@ pub enum HandshakeAlert {
 /// Supports multi-round handshakes where the client may need to send multiple
 /// messages before completing the handshake.
 pub trait ClientHandshakeProtocol: Send {
-	type SessionKey;
-	type Error: Into<TransportError>;
+	type SessionKey: Send;
+	type Error: Into<TransportError> + Send;
 
 	/// Start the handshake, returns the first message to send to the server.
-	#[allow(async_fn_in_trait)]
-	async fn start(&mut self) -> Result<Vec<u8>, Self::Error>;
+	fn start<'a>(
+		&'a mut self,
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>>;
 
 	/// Handle a response from the server.
 	///
 	/// Returns `Some(Vec<u8>)` if the client needs to send another message,
 	/// or `None` if the client has no more messages to send.
-	#[allow(async_fn_in_trait)]
-	async fn handle_response(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+	fn handle_response<'a, 'b>(
+		&'a mut self,
+		msg: &'b [u8],
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	where
+		'b: 'a;
 
 	/// Complete the handshake and extract the session key.
 	///
 	/// Should be called after the handshake is complete (when `is_complete()` returns true).
-	#[allow(async_fn_in_trait)]
-	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error>;
+	fn complete<'a>(
+		&'a mut self,
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>>;
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
@@ -255,22 +466,27 @@ pub trait ClientHandshakeProtocol: Send {
 /// Supports multi-round handshakes where the server may need to handle multiple
 /// requests from the client before completing the handshake.
 pub trait ServerHandshakeProtocol: Send {
-	type SessionKey;
-	type Error: Into<TransportError>;
+	type SessionKey: Send;
+	type Error: Into<TransportError> + Send;
 
 	/// Handle a request from the client.
 	///
 	/// Can be called multiple times for multi-round handshakes.
 	/// Returns `Some(Vec<u8>)` if the server needs to send a response,
 	/// or `None` if the server has no response to send.
-	#[allow(async_fn_in_trait)]
-	async fn handle_request(&mut self, msg: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+	fn handle_request<'a, 'b>(
+		&'a mut self,
+		msg: &'b [u8],
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	where
+		'b: 'a;
 
 	/// Complete the handshake and extract the session key.
 	///
 	/// Should be called after the handshake is complete (when `is_complete()` returns true).
-	#[allow(async_fn_in_trait)]
-	async fn complete(&mut self) -> Result<Self::SessionKey, Self::Error>;
+	fn complete<'a>(
+		&'a mut self,
+	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>>;
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
@@ -313,34 +529,6 @@ impl Default for HandshakeProtocolKind {
 	fn default() -> Self {
 		Self::Ecies
 	}
-}
-
-/// Client-side handshake orchestrator storage.
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
-pub enum ClientHandshakeOrchestrator {
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	Ecies(client::EciesHandshakeClient),
-	#[cfg(all(
-		feature = "builder",
-		feature = "aead",
-		feature = "signature",
-		feature = "secp256k1"
-	))]
-	Cms(client::CmsHandshakeClient),
-}
-
-/// Server-side handshake orchestrator storage.
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
-pub enum ServerHandshakeOrchestrator {
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	Ecies(server::EciesHandshakeServer),
-	#[cfg(all(
-		feature = "builder",
-		feature = "aead",
-		feature = "signature",
-		feature = "secp256k1"
-	))]
-	Cms(server::CmsHandshakeServer),
 }
 
 // ============================================================================
@@ -730,12 +918,8 @@ impl HandshakeProtocol for TightBeamHandshake {
 			TransportEnvelope::EnvelopedData(ref enveloped_data) => {
 				let client_kex = ClientKeyExchange::try_from(enveloped_data)?;
 				let encrypted_bytes = client_kex.encrypted_data.as_bytes();
-				let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)
-					.map_err(|e| HandshakeError::InvalidEciesMessage(format!("{e:?}")))?;
 				let server_key = self.server_key.as_ref().ok_or(HandshakeError::MissingServerKey)?;
-				let decrypted = server_key
-					.decrypt_ecies(&encrypted_message, self.aad_domain_tag.as_deref())
-					.map_err(|e| HandshakeError::EciesDecryptionFailed(format!("{e:?}")))?;
+				let decrypted = server_key.decrypt_ecies(encrypted_bytes, self.aad_domain_tag.as_deref())?;
 				let decrypted = decrypted.to_insecure();
 				if decrypted.len() != 64 {
 					return Err(HandshakeError::InvalidDecryptedPayloadSize.into());

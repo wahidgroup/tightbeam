@@ -13,8 +13,6 @@ use crate::{
 };
 
 #[cfg(feature = "x509")]
-use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
-#[cfg(feature = "x509")]
 use crate::transport::handshake::HandshakeState;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
@@ -32,9 +30,6 @@ pub struct TcpTransport<S: ProtocolStream> {
 	collector_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "x509")]
 	#[allow(dead_code)]
-	server_public_key: Option<Secp256k1VerifyingKey>,
-	#[cfg(feature = "x509")]
-	#[allow(dead_code)]
 	enforce_encryption: bool,
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
@@ -45,7 +40,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 	max_cleartext_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	#[cfg(feature = "x509")]
 	#[allow(dead_code)]
 	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
@@ -55,11 +50,16 @@ pub struct TcpTransport<S: ProtocolStream> {
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
 	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	client_handshake: Option<crate::transport::handshake::ClientHandshakeOrchestrator>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
-	server_handshake: Option<crate::transport::handshake::ServerHandshakeOrchestrator>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	#[cfg(feature = "x509")]
+	server_handshake: Option<
+		Box<
+			dyn crate::transport::handshake::ServerHandshakeProtocol<
+				SessionKey = Vec<u8>,
+				Error = crate::transport::handshake::HandshakeError,
+			>,
+		>,
+	>,
+	#[cfg(feature = "x509")]
 	handshake_protocol_kind: crate::transport::handshake::HandshakeProtocolKind,
 }
 
@@ -280,7 +280,7 @@ where
 	}
 }
 
-#[cfg(all(feature = "x509", feature = "secp256k1", feature = "transport-policy"))]
+#[cfg(all(feature = "x509", feature = "transport-policy"))]
 impl<S: ProtocolStream> crate::transport::MessageEmitter for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -401,7 +401,7 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl<S: ProtocolStream> EncryptedMessageIO<crate::crypto::ecies::EciesSecp256k1Oid> for TcpTransport<S>
+impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
@@ -444,7 +444,7 @@ pub struct TcpListener<L: TcpListenerTrait> {
 	max_cleartext_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
-	#[cfg(all(feature = "x509", feature = "secp256k1"))]
+	#[cfg(feature = "x509")]
 	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
 	handshake_timeout: Option<Duration>,
@@ -478,7 +478,7 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 				max_cleartext_envelope: None,
 				#[cfg(feature = "x509")]
 				max_encrypted_envelope: None,
-				#[cfg(all(feature = "x509", feature = "secp256k1"))]
+				#[cfg(feature = "x509")]
 				signatory: None,
 				#[cfg(feature = "x509")]
 				handshake_timeout: None,
@@ -517,7 +517,7 @@ where
 			max_cleartext_envelope: None,
 			#[cfg(feature = "x509")]
 			max_encrypted_envelope: None,
-			#[cfg(all(feature = "x509", feature = "secp256k1"))]
+			#[cfg(feature = "x509")]
 			signatory: None,
 			#[cfg(feature = "x509")]
 			handshake_timeout: None,
@@ -545,7 +545,7 @@ where
 				transport.handshake_timeout = timeout;
 			}
 		}
-		#[cfg(all(feature = "x509", feature = "secp256k1"))]
+		#[cfg(feature = "x509")]
 		if let Some(ref signatory) = self.signatory {
 			transport.signatory = Some(signatory.clone());
 		}
@@ -554,9 +554,7 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl crate::transport::EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid>
-	for TcpListener<std::net::TcpListener>
-{
+impl crate::transport::EncryptedProtocol for TcpListener<std::net::TcpListener> {
 	type Encryptor = crate::crypto::aead::Aes256Gcm;
 	type Decryptor = crate::crypto::aead::Aes256Gcm;
 
@@ -576,7 +574,7 @@ impl crate::transport::EncryptedProtocol<crate::crypto::ecies::EciesSecp256k1Oid
 				aad_domain_tag: Some(config.aad_domain_tag.clone()),
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
-				#[cfg(all(feature = "x509", feature = "secp256k1"))]
+				#[cfg(feature = "x509")]
 				signatory: Some(config.signatory.clone()),
 				handshake_timeout: Some(config.handshake_timeout),
 			},
