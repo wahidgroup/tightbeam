@@ -12,7 +12,7 @@ use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, SecretKey};
 use crate::crypto::sign::EcdsaSignatureVerifier;
 use crate::der::Decode;
-use crate::random::OsRng;
+use crate::random::{generate_nonce, OsRng};
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::spki::EncodePublicKey;
 use crate::transport::handshake::builders::{
@@ -23,6 +23,51 @@ use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::{ClientStateTransition, HandshakeState, StateTransition};
 use crate::transport::handshake::ClientHandshakeProtocol;
 use crate::x509::Certificate;
+
+#[cfg(feature = "time")]
+fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
+	use time::OffsetDateTime;
+
+	let now = OffsetDateTime::now_utc();
+	let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
+	let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
+	let now_duration = time::Duration::seconds(now.unix_timestamp());
+
+	if now_duration < not_before {
+		return Err(HandshakeError::CertificateNotYetValid);
+	}
+
+	if now_duration > not_after {
+		return Err(HandshakeError::CertificateExpired);
+	}
+
+	Ok(())
+}
+
+#[cfg(all(feature = "std", not(feature = "time")))]
+fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
+	let now = std::time::SystemTime::now();
+	let not_before = cert.tbs_certificate.validity.not_before.to_system_time();
+	let not_after = cert.tbs_certificate.validity.not_after.to_system_time();
+
+	if now < not_before {
+		return Err(HandshakeError::CertificateNotYetValid);
+	}
+
+	if now > not_after {
+		return Err(HandshakeError::CertificateExpired);
+	}
+
+	Ok(())
+}
+
+#[cfg(all(not(feature = "std"), not(feature = "time")))]
+fn validate_certificate(_cert: &Certificate) -> Result<(), HandshakeError> {
+	// Without std or time features, we cannot validate timestamps
+	// In production, this should fail closed, but for embedded systems
+	// without clocks, the application layer must handle validation
+	Err(HandshakeError::InvalidTimestamp)
+}
 
 /// Client-side CMS handshake orchestrator.
 ///
@@ -83,6 +128,9 @@ where
 			return Err(HandshakeError::InvalidState);
 		}
 
+		// Validate server certificate (expiry check)
+		validate_certificate(&self.server_cert)?;
+
 		// Extract server public key from certificate
 		let server_public_key = elliptic_curve::PublicKey::<C>::from_sec1_bytes(
 			self.server_cert
@@ -97,8 +145,9 @@ where
 		let sender_pub_spki = sender_public.to_public_key_der().map_err(|e| HandshakeError::SpkiError(e))?;
 		let sender_pub_spki = crate::spki::SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes())?;
 
-		// Create UKM (user keying material) - using a simple nonce for now
-		let ukm = UserKeyingMaterial::new(vec![0u8; 64])?;
+		// Create UKM (user keying material) with random bytes
+		let ukm_bytes = generate_nonce::<64>(None)?;
+		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 
 		// Create recipient identifier
 		let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {

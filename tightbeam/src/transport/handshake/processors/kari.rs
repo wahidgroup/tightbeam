@@ -167,10 +167,9 @@ mod tests {
 		use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, RecipientInfo, UserKeyingMaterial};
 		use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
 		use crate::der::asn1::ObjectIdentifier;
-		use crate::random::OsRng;
+		use crate::random::{generate_nonce, OsRng};
 		use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 		use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
-
 		#[test]
 		fn test_full_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 			// Generate sender and recipient key-pairs
@@ -242,8 +241,9 @@ mod tests {
 
 			let wrong_recipient_key = K256SecretKey::random(&mut OsRng); // Different key
 
-			// Create UKM
-			let ukm = UserKeyingMaterial::new(vec![0xAAu8; 64])?;
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None)?;
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 
 			// Recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {

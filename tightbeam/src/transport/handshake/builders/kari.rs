@@ -598,7 +598,7 @@ mod tests {
 	))]
 	mod builder {
 		use super::*;
-		use crate::random::OsRng;
+		use crate::random::{generate_nonce, OsRng};
 		use der::asn1::ObjectIdentifier;
 		use der::{Decode, Encode};
 		use k256::SecretKey as K256SecretKey;
@@ -709,8 +709,9 @@ mod tests {
 			let recipient_key = K256SecretKey::random(&mut OsRng);
 			let recipient_pubkey = recipient_key.public_key();
 
-			// UKM
-			let ukm = UserKeyingMaterial::new(vec![0xAAu8; 64])?;
+			// UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None)?;
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 
 			// Recipient ID
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {

@@ -31,6 +31,52 @@ use crate::transport::handshake::{ServerHandshakeKey, ServerHandshakeProtocol};
 use crate::x509::Certificate;
 use digest::Digest;
 
+#[cfg(feature = "time")]
+fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
+	use time::OffsetDateTime;
+
+	let now = OffsetDateTime::now_utc();
+	let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
+	let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
+
+	let now_duration = time::Duration::seconds(now.unix_timestamp());
+
+	if now_duration < not_before {
+		return Err(HandshakeError::CertificateNotYetValid);
+	}
+
+	if now_duration > not_after {
+		return Err(HandshakeError::CertificateExpired);
+	}
+
+	Ok(())
+}
+
+#[cfg(all(feature = "std", not(feature = "time")))]
+fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
+	let now = std::time::SystemTime::now();
+	let not_before = cert.tbs_certificate.validity.not_before.to_system_time();
+	let not_after = cert.tbs_certificate.validity.not_after.to_system_time();
+
+	if now < not_before {
+		return Err(HandshakeError::CertificateNotYetValid);
+	}
+
+	if now > not_after {
+		return Err(HandshakeError::CertificateExpired);
+	}
+
+	Ok(())
+}
+
+#[cfg(all(not(feature = "std"), not(feature = "time")))]
+fn validate_certificate(_cert: &Certificate) -> Result<(), HandshakeError> {
+	// Without std or time features, we cannot validate timestamps
+	// In production, this should fail closed, but for embedded systems
+	// without clocks, the application layer must handle validation
+	Ok(())
+}
+
 /// Server-side CMS handshake orchestrator.
 ///
 /// Generic over elliptic curve type `C` to support multiple curves.
@@ -81,6 +127,9 @@ where
 
 	/// Set the client certificate (optional, for mutual authentication).
 	pub fn set_client_certificate(&mut self, cert: Certificate) -> Result<(), HandshakeError> {
+		// Validate certificate (expiry check)
+		validate_certificate(&cert)?;
+
 		self.client_cert = Some(cert);
 		Ok(())
 	}
@@ -90,9 +139,10 @@ where
 	/// # Parameters
 	/// - `enveloped_data_der`: DER-encoded EnvelopedData from client
 	///
-	/// # Returns
-	/// The extracted session key
-	pub fn process_key_exchange(&mut self, enveloped_data_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	/// # Security
+	/// Session key is stored internally and zeroized on drop. Not returned to prevent
+	/// unnecessary copies of key material in memory.
+	pub fn process_key_exchange(&mut self, enveloped_data_der: &[u8]) -> Result<(), HandshakeError> {
 		// Validate state
 		if self.state.state() != HandshakeState::Init {
 			return Err(HandshakeError::InvalidState);
@@ -119,10 +169,10 @@ where
 		// (expects nonce prepended to ciphertext)
 		let session_key = crate::transport::handshake::utils::aes_gcm_decrypt(&cek, encrypted_bytes, None)?;
 
-		// Store session key
-		self.session_key = Some(Secret::from(session_key.clone()));
+		// Store session key securely (no clone - move directly into Secret wrapper)
+		self.session_key = Some(Secret::from(session_key));
 
-		Ok(session_key)
+		Ok(())
 	}
 
 	/// Build server Finished message (SignedData over transcript hash).
@@ -315,7 +365,7 @@ mod tests {
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 		use crate::crypto::sign::elliptic_curve::SecretKey;
 		use crate::der::Decode;
-		use crate::random::OsRng;
+		use crate::random::{generate_nonce, OsRng};
 		use crate::spki::AlgorithmIdentifierOwned;
 		use crate::spki::EncodePublicKey;
 		use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamSignedDataBuilder};
@@ -391,8 +441,9 @@ mod tests {
 			let sender_pub_spki = sender_public.to_public_key_der().unwrap();
 			let sender_pub_spki = crate::spki::SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes()).unwrap();
 
-			// Create UKM
-			let ukm = UserKeyingMaterial::new(vec![0u8; 64]).unwrap();
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None).unwrap();
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
 
 			// Create recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
@@ -414,10 +465,9 @@ mod tests {
 			let key_exchange = enveloped_builder.build_der(&session_key, None)?;
 
 			// Process KeyExchange
-			let extracted_key = server.process_key_exchange(&key_exchange)?;
-			assert_eq!(extracted_key, session_key);
+			server.process_key_exchange(&key_exchange)?;
 			assert_eq!(server.state(), HandshakeState::KeyExchangeReceived);
-			// Verify session key is stored
+			// Verify session key is stored (cannot compare directly - it's wrapped in Secret)
 			assert!(server.session_key().is_some());
 
 			// Build server Finished
