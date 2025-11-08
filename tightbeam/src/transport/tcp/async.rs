@@ -10,7 +10,7 @@ use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
 use crate::{policy::GatePolicy, transport::policy::RestartPolicy};
 
 #[cfg(feature = "x509")]
-use crate::transport::handshake::HandshakeState;
+use crate::transport::handshake::TcpHandshakeState;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
 #[cfg(feature = "x509")]
@@ -210,11 +210,11 @@ where
 		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
 	}
 
-	fn handshake_state(&self) -> HandshakeState {
+	fn handshake_state(&self) -> TcpHandshakeState {
 		self.handshake_state
 	}
 
-	fn set_handshake_state(&mut self, state: HandshakeState) {
+	fn set_handshake_state(&mut self, state: TcpHandshakeState) {
 		self.handshake_state = state;
 	}
 
@@ -288,7 +288,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
-	handshake_state: HandshakeState,
+	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
@@ -317,7 +317,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
-	handshake_state: HandshakeState,
+	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
@@ -326,7 +326,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	server_handshake: Option<
 		Box<
 			dyn crate::transport::handshake::ServerHandshakeProtocol<
-					SessionKey = Vec<u8>,
+					SessionKey = crate::crypto::secret::Secret<Vec<u8>>,
 					Error = crate::transport::handshake::HandshakeError,
 				> + Send,
 		>,
@@ -356,10 +356,10 @@ where
 		// Compute handshake deadline before mutably borrowing the stream
 		#[cfg(feature = "x509")]
 		let handshake_deadline: Option<std::time::Instant> = {
-			use crate::transport::handshake::HandshakeState;
+			use crate::transport::handshake::TcpHandshakeState;
 			match self.handshake_state() {
-				HandshakeState::AwaitingServerResponse { initiated_at }
-				| HandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.handshake_timeout),
+				TcpHandshakeState::AwaitingServerResponse { initiated_at }
+				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.handshake_timeout),
 				_ => None,
 			}
 		};
@@ -496,7 +496,7 @@ where
 		use crate::crypto::aead::Decryptor;
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
-		use crate::transport::handshake::HandshakeState;
+		use crate::transport::handshake::TcpHandshakeState;
 		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 		// Loop until we get an actual message (may need to perform handshake first)
@@ -549,9 +549,9 @@ where
 							// Regular messages - check if encryption is required
 							TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
 								// Only enforce encryption AFTER handshake is complete
-								if self.handshake_state() == HandshakeState::Complete {
+								if self.handshake_state() == TcpHandshakeState::Complete {
 									// Circuit breaker: reset state on protocol violation
-									self.set_handshake_state(HandshakeState::None);
+									self.set_handshake_state(TcpHandshakeState::None);
 									// Drop symmetric key to force re-handshake and zeroize underlying material
 									self.symmetric_key = None;
 									return Err(TransportError::MissingEncryption);
@@ -617,7 +617,7 @@ where
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// Check if encryption should be used
-		let wire_envelope = if self.handshake_state() == HandshakeState::Complete {
+		let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
 			// Use encryption after handshake complete
 			let envelope_bytes = response_envelope.to_der()?;
 			// Enforce size ceiling for encrypted responses
@@ -673,7 +673,7 @@ where
 		use crate::crypto::aead::{Aes256GcmOid, Encryptor};
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
-		use crate::transport::handshake::HandshakeState;
+		use crate::transport::handshake::TcpHandshakeState;
 		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 		let mut current_message: Frame = message;
@@ -688,7 +688,7 @@ where
 			}
 
 			// Check if handshake is needed before sending
-			if self.server_certificate().is_some() && self.handshake_state() == HandshakeState::None {
+			if self.server_certificate().is_some() && self.handshake_state() == TcpHandshakeState::None {
 				// Perform client-side handshake
 				self.perform_client_handshake().await?;
 			}
@@ -697,7 +697,7 @@ where
 			let envelope = TransportEnvelope::from(current_message.clone());
 
 			// Check if encryption should be used
-			let wire_envelope = if self.handshake_state() == HandshakeState::Complete {
+			let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
 				// Use encryption after handshake complete
 				let envelope_bytes = envelope.to_der()?;
 				if let Some(max) = self.max_encrypted_envelope {

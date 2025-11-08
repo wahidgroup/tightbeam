@@ -16,8 +16,11 @@ pub use cms::CmsHandshakeClient;
 ))]
 pub use cms::CmsHandshakeClientSecp256k1;
 
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
+#[cfg(feature = "x509")]
 mod ecies;
 
+#[cfg(feature = "x509")]
+pub use ecies::{EciesHandshakeClient, ExtractVerifyingKey};
+
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
-pub use ecies::EciesHandshakeClient;
+pub use ecies::EciesHandshakeClientSecp256k1;

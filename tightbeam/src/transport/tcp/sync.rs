@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[cfg(feature = "x509")]
-use crate::transport::handshake::HandshakeState;
+use crate::transport::handshake::TcpHandshakeState;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
 #[cfg(feature = "x509")]
@@ -44,7 +44,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 	#[allow(dead_code)]
 	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
-	handshake_state: HandshakeState,
+	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
 	#[allow(dead_code)]
 	handshake_timeout: Duration,
@@ -54,7 +54,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 	server_handshake: Option<
 		Box<
 			dyn crate::transport::handshake::ServerHandshakeProtocol<
-				SessionKey = Vec<u8>,
+				SessionKey = crate::crypto::secret::Secret<Vec<u8>>,
 				Error = crate::transport::handshake::HandshakeError,
 			>,
 		>,
@@ -117,10 +117,10 @@ where
 		// If in handshake waiting state, optionally enforce timeout by short read deadline using std only
 		#[cfg(feature = "x509")]
 		{
-			use crate::transport::handshake::HandshakeState;
+			use crate::transport::handshake::TcpHandshakeState;
 			match self.handshake_state() {
-				HandshakeState::AwaitingServerResponse { initiated_at }
-				| HandshakeState::AwaitingClientFinish { initiated_at } => {
+				TcpHandshakeState::AwaitingServerResponse { initiated_at }
+				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
 					let now = std::time::Instant::now();
 					if now >= initiated_at + self.handshake_timeout {
 						return Err(TransportError::Timeout);
@@ -159,7 +159,7 @@ where
 		use crate::crypto::aead::Decryptor;
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
-		use crate::transport::handshake::HandshakeState;
+		use crate::transport::handshake::TcpHandshakeState;
 		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 		loop {
@@ -201,8 +201,8 @@ where
 								continue;
 							}
 							TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
-								if self.handshake_state() == HandshakeState::Complete {
-									self.set_handshake_state(HandshakeState::None);
+								if self.handshake_state() == TcpHandshakeState::Complete {
+									self.set_handshake_state(TcpHandshakeState::None);
 									self.symmetric_key = None;
 									return Err(TransportError::MissingEncryption);
 								}
@@ -254,7 +254,7 @@ where
 		let response_pkg = ResponsePackage { status, message, length: None };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
-		let wire_envelope = if self.handshake_state() == HandshakeState::Complete {
+		let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
 			let envelope_bytes = response_envelope.to_der()?;
 			if let Some(max) = self.max_encrypted_envelope {
 				if envelope_bytes.len() > max {
@@ -299,7 +299,7 @@ where
 	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
-		use crate::transport::handshake::HandshakeState;
+		use crate::transport::handshake::TcpHandshakeState;
 		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
 		let mut current_message: Frame = message;
@@ -311,12 +311,12 @@ where
 				return Err(TransportError::Unauthorized);
 			}
 
-			if self.server_certificate().is_some() && self.handshake_state() == HandshakeState::None {
+			if self.server_certificate().is_some() && self.handshake_state() == TcpHandshakeState::None {
 				self.perform_client_handshake().await?;
 			}
 
 			let envelope = TransportEnvelope::from(current_message.clone());
-			let wire_envelope = if self.handshake_state() == HandshakeState::Complete {
+			let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
 				use crate::crypto::aead::{Aes256GcmOid, Encryptor};
 				let envelope_bytes = envelope.to_der()?;
 				if let Some(max) = self.max_encrypted_envelope {
@@ -416,11 +416,11 @@ where
 		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
 	}
 
-	fn handshake_state(&self) -> HandshakeState {
+	fn handshake_state(&self) -> TcpHandshakeState {
 		self.handshake_state
 	}
 
-	fn set_handshake_state(&mut self, state: HandshakeState) {
+	fn set_handshake_state(&mut self, state: TcpHandshakeState) {
 		self.handshake_state = state;
 	}
 

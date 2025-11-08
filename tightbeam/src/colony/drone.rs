@@ -1388,7 +1388,7 @@ mod tests {
 	}
 
 	servlet! {
-		name: ConfurableServlet,
+		name: ConfigurableServlet,
 		protocol: Listener,
 		policies: {
 			with_collector_gate: [crate::policy::AcceptAllGate]
@@ -1468,7 +1468,7 @@ mod tests {
 		},
 		servlets: {
 			simple_servlet: SimpleServlet,
-			configurable_servlet: ConfurableServlet,
+			configurable_servlet: ConfigurableServlet,
 			worker_servlet: WorkerServlet
 		}
 	}
@@ -1647,8 +1647,8 @@ mod tests {
 		let list_frame = ListServletsJob::run(b"list-1")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
-		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let list_response = mgmt_response.list.expect("Should have list response");
+		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
+		let list_response = management_response.list.expect("Should have list response");
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
 		assert_eq!(list_response.servlets.len(), 2, "Should have 2 default servlets");
@@ -1666,8 +1666,8 @@ mod tests {
 		let spawn_frame = SpawnServletJob::run(b"spawn-1", b"simple_servlet", None)?;
 
 		let response = transport.emit(spawn_frame, None).await?.unwrap();
-		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let spawn_response = mgmt_response.spawn.expect("Should have spawn response");
+		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
+		let spawn_response = management_response.spawn.expect("Should have spawn response");
 
 		assert_eq!(spawn_response.status, crate::policy::TransitStatus::Accepted);
 		assert!(spawn_response.servlet_address.is_some());
@@ -1687,8 +1687,8 @@ mod tests {
 		let list_frame = ListServletsJob::run(b"list-2")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
-		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let list_response = mgmt_response.list.expect("Should have list response");
+		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
+		let list_response = management_response.list.expect("Should have list response");
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
 		assert_eq!(list_response.servlets.len(), 3, "Should have 3 servlets after spawn");
@@ -1707,8 +1707,8 @@ mod tests {
 		let stop_frame = StopServletJob::run(b"stop-1", new_servlet_id.clone())?;
 
 		let response = transport.emit(stop_frame, None).await?.unwrap();
-		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let stop_response = mgmt_response.stop.expect("Should have stop response");
+		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
+		let stop_response = management_response.stop.expect("Should have stop response");
 
 		if stop_response.status != crate::policy::TransitStatus::Accepted {
 			println!("  ERROR: Stop failed with status: {:?}", stop_response.status);
@@ -1716,8 +1716,8 @@ mod tests {
 			println!("  Current servlets:");
 			let list_frame = ListServletsJob::run(b"list-debug")?;
 			let response = transport.emit(list_frame, None).await?.unwrap();
-			let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
-			let list_response = mgmt_response.list.expect("Should have list response");
+			let management_response: HiveManagementResponse = crate::decode(&response.message)?;
+			let list_response = management_response.list.expect("Should have list response");
 			for servlet in &list_response.servlets {
 				println!("    - ID: {:?}", servlet.servlet_id);
 			}
@@ -1731,8 +1731,8 @@ mod tests {
 		let list_frame = ListServletsJob::run(b"list-3")?;
 
 		let response = transport.emit(list_frame, None).await?.unwrap();
-		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let list_response = mgmt_response.list.expect("Should have list response");
+		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
+		let list_response = management_response.list.expect("Should have list response");
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
 		assert_eq!(list_response.servlets.len(), 2, "Should be back to 2 servlets after stop");
@@ -1750,8 +1750,8 @@ mod tests {
 		let spawn_frame = SpawnServletJob::run(b"spawn-2", b"unknown_servlet", None)?;
 
 		let response = transport.emit(spawn_frame, None).await?.unwrap();
-		let mgmt_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let spawn_response = mgmt_response.spawn.expect("Should have spawn response");
+		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
+		let spawn_response = management_response.spawn.expect("Should have spawn response");
 
 		assert_eq!(spawn_response.status, crate::policy::TransitStatus::Forbidden);
 		assert!(spawn_response.servlet_address.is_none());

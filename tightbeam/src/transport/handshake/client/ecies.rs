@@ -1,16 +1,24 @@
 //! ECIES-based client handshake orchestrator.
 //!
 //! Implements the client side of the TightBeam ECIES handshake protocol.
+//!
+//! Generic over curve type `C`, signature type `Sig`, verifying key type `Vk`,
+//! and ECIES message type `M`.
 
-#![cfg(all(feature = "x509", feature = "secp256k1"))]
+#![cfg(feature = "x509")]
+
+use core::marker::PhantomData;
 
 use crate::asn1::OctetString;
 use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::{Aes256Gcm, KeyInit};
-use crate::crypto::ecies::encrypt;
+use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::kdf::{hkdf, HkdfSha3_256};
-use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+use crate::crypto::secret::Secret;
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic, PublicKey};
+use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::sign::Verifier;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
@@ -64,20 +72,43 @@ fn validate_certificate(_cert: &Certificate) -> Result<(), HandshakeError> {
 
 /// Client-side ECIES handshake orchestrator.
 ///
+/// Generic over curve type `C`, signature type `Sig`, verifying key type `Vk`,
+/// and ECIES message type `M`.
+///
 /// Manages the complete client handshake flow:
 /// 1. Sends ClientHello with random nonce
 /// 2. Receives and verifies ServerHandshake (certificate, random, signature)
 /// 3. Sends ClientKeyExchange with ECIES-encrypted session key
-pub struct EciesHandshakeClient {
+pub struct EciesHandshakeClient<C, Sig, Vk, M> {
 	state: ClientStateTransition,
 	client_random: Option<[u8; 32]>,
 	base_session_key: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: Option<Vec<u8>>,
+	_phantom: PhantomData<(C, Sig, Vk, M)>,
 }
 
-impl EciesHandshakeClient {
+/// Helper trait for extracting verifying keys from certificates.
+/// This trait exists to work around orphan rules when implementing
+/// `TryFrom<&Certificate>` for external types.
+pub trait ExtractVerifyingKey: Sized {
+	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError>;
+}
+
+impl<C, Sig, Vk, M> EciesHandshakeClient<C, Sig, Vk, M>
+where
+	C: Curve + CurveArithmetic,
+	C::FieldBytesSize: ModulusSize,
+	C::AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	PublicKey<C>: EciesPublicKeyOps,
+	<PublicKey<C> as EciesPublicKeyOps>::SecretKey: crate::crypto::ecies::EciesEphemeral<PublicKey = PublicKey<C>>,
+	Sig: SignatureEncoding,
+	for<'a> Sig: TryFrom<&'a [u8]>,
+	for<'a> <Sig as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
+	Vk: Verifier<Sig> + ExtractVerifyingKey,
+	M: EciesMessageOps,
+{
 	/// Create a new ECIES handshake client.
 	///
 	/// # Parameters
@@ -90,6 +121,7 @@ impl EciesHandshakeClient {
 			server_random: None,
 			transcript_hash: None,
 			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
+			_phantom: PhantomData,
 		}
 	}
 	/// Build ClientHello message.
@@ -237,11 +269,8 @@ impl EciesHandshakeClient {
 		Ok(out)
 	}
 
-	fn extract_verifying_key(&self, cert: &Certificate) -> Result<Secp256k1VerifyingKey, HandshakeError> {
-		let spki = &cert.tbs_certificate.subject_public_key_info;
-		let public_key_bytes = spki.subject_public_key.raw_bytes();
-		let public_key = k256::PublicKey::from_sec1_bytes(public_key_bytes)?;
-		Ok(Secp256k1VerifyingKey::from(public_key))
+	fn extract_verifying_key(&self, cert: &Certificate) -> Result<Vk, HandshakeError> {
+		Vk::extract_from_certificate(cert)
 	}
 
 	fn compute_transcript_hash(
@@ -262,11 +291,11 @@ impl EciesHandshakeClient {
 
 	fn verify_server_signature(
 		&self,
-		verifying_key: &Secp256k1VerifyingKey,
+		verifying_key: &Vk,
 		digest: &[u8; 32],
 		signature_bytes: &[u8],
 	) -> Result<(), HandshakeError> {
-		let signature = Secp256k1Signature::try_from(signature_bytes)?;
+		let signature = Sig::try_from(signature_bytes).map_err(|e| e.into())?;
 		verifying_key.verify(digest, &signature)?;
 		Ok(())
 	}
@@ -282,7 +311,7 @@ impl EciesHandshakeClient {
 		plaintext[..32].copy_from_slice(base_key);
 		plaintext[32..].copy_from_slice(client_random);
 
-		let server_pubkey = k256::PublicKey::from_sec1_bytes(
+		let server_pubkey = PublicKey::<C>::from_sec1_bytes(
 			server_certificate
 				.tbs_certificate
 				.subject_public_key_info
@@ -290,13 +319,9 @@ impl EciesHandshakeClient {
 				.raw_bytes(),
 		)?;
 
-		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
-			&server_pubkey,
-			&plaintext,
-			aad_domain_tag,
-			Some(&mut rand_core::OsRng),
-		)
-		.map_err(|e| HandshakeError::EciesEncryptionFailed(format!("{e:?}")))?;
+		let encrypted_message =
+			encrypt::<_, _, _, M>(&server_pubkey, &plaintext, aad_domain_tag, Some(&mut rand_core::OsRng))
+				.map_err(|e| HandshakeError::EciesEncryptionFailed(format!("{e:?}")))?;
 
 		Ok(encrypted_message.to_bytes())
 	}
@@ -326,12 +351,26 @@ impl EciesHandshakeClient {
 		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
 		Ok(final_key_bytes.to_vec())
 	}
-} // ============================================================================
-  // ClientHandshakeProtocol Implementation
-  // ============================================================================
+}
 
-impl ClientHandshakeProtocol for EciesHandshakeClient {
-	type SessionKey = Vec<u8>;
+// ============================================================================
+// ClientHandshakeProtocol Implementation
+// ============================================================================
+
+impl<C, Sig, Vk, M> ClientHandshakeProtocol for EciesHandshakeClient<C, Sig, Vk, M>
+where
+	C: Curve + CurveArithmetic + Send + Sync,
+	C::FieldBytesSize: ModulusSize,
+	C::AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>,
+	PublicKey<C>: EciesPublicKeyOps,
+	<PublicKey<C> as EciesPublicKeyOps>::SecretKey: crate::crypto::ecies::EciesEphemeral<PublicKey = PublicKey<C>>,
+	Sig: SignatureEncoding + Send + Sync,
+	for<'a> Sig: TryFrom<&'a [u8]>,
+	for<'a> <Sig as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
+	Vk: Verifier<Sig> + ExtractVerifyingKey + Send + Sync,
+	M: EciesMessageOps + Send + Sync,
+{
+	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
 
 	fn start<'a>(
@@ -384,25 +423,55 @@ impl ClientHandshakeProtocol for EciesHandshakeClient {
 				sr.fill(0);
 			}
 
-			Ok(session_key_bytes)
+			Ok(Secret::from(session_key_bytes))
 		})
 	}
 
 	fn is_complete(&self) -> bool {
-		self.is_complete()
+		self.state.state() == HandshakeState::Complete
+	}
+}
+
+// ============================================================================
+// Type Alias for secp256k1
+// ============================================================================
+
+/// Type alias for ECIES client using secp256k1 curve.
+///
+/// This is the default curve used in TightBeam and is provided as a
+/// convenient alias for the generic `EciesHandshakeClient`.
+#[cfg(feature = "secp256k1")]
+pub type EciesHandshakeClientSecp256k1 = EciesHandshakeClient<
+	k256::Secp256k1,
+	crate::crypto::sign::ecdsa::Secp256k1Signature,
+	crate::crypto::sign::ecdsa::Secp256k1VerifyingKey,
+	crate::crypto::ecies::Secp256k1EciesMessage,
+>;
+
+// Implement helper trait for secp256k1 verifying key
+#[cfg(feature = "secp256k1")]
+impl ExtractVerifyingKey for crate::crypto::sign::ecdsa::Secp256k1VerifyingKey {
+	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError> {
+		let spki = &cert.tbs_certificate.subject_public_key_info;
+		let public_key_bytes = spki.subject_public_key.raw_bytes();
+		let public_key = k256::PublicKey::from_sec1_bytes(public_key_bytes)?;
+		Ok(Self::from(public_key))
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use crate::crypto::sign::Signer;
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::random::OsRng;
 	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 	use crate::x509::time::Validity;
 	use crate::x509::{name::RdnSequence, TbsCertificate};
+
+	// Type alias for tests
+	type TestClient = EciesHandshakeClientSecp256k1;
 
 	fn create_test_certificate(signing_key: &Secp256k1SigningKey) -> Certificate {
 		let verifying_key = *signing_key.verifying_key();
@@ -452,7 +521,7 @@ mod tests {
 		let server_cert = create_test_certificate(&server_key);
 
 		// Create client
-		let mut client = EciesHandshakeClient::new(Some(b"test-domain".to_vec()));
+		let mut client = TestClient::new(Some(b"test-domain".to_vec()));
 		assert_eq!(client.state(), HandshakeState::Init);
 
 		// Build ClientHello
@@ -501,7 +570,7 @@ mod tests {
 
 	#[test]
 	fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
-		let mut client = EciesHandshakeClient::new(None);
+		let mut client = TestClient::new(None);
 
 		// Can't process server handshake before sending client hello
 		let result = client.process_server_handshake(&[]);

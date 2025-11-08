@@ -292,10 +292,12 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 }
 
 // ============================================================================
-// Handshake State Machine
+// TCP Handshake State Machine
 // ============================================================================
+/// State tracking for TCP connection handshake process with optional timeout tracking.
+/// This is distinct from the protocol-level HandshakeState in state.rs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum HandshakeState {
+pub enum TcpHandshakeState {
 	#[default]
 	None,
 	#[cfg(feature = "std")]
@@ -366,6 +368,7 @@ pub trait ClientHandshakeProtocol: Send {
 	/// Complete the handshake and extract the session key.
 	///
 	/// Should be called after the handshake is complete (when `is_complete()` returns true).
+	/// Returns the session key wrapped in Secret for memory safety.
 	fn complete<'a>(
 		&'a mut self,
 	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>>;
@@ -397,6 +400,7 @@ pub trait ServerHandshakeProtocol: Send {
 	/// Complete the handshake and extract the session key.
 	///
 	/// Should be called after the handshake is complete (when `is_complete()` returns true).
+	/// Returns the session key wrapped in Secret for memory safety.
 	fn complete<'a>(
 		&'a mut self,
 	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>>;

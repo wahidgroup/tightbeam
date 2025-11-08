@@ -411,10 +411,10 @@ pub trait EncryptedMessageIO: MessageIO {
 	fn decryptor(&self) -> TransportResult<&Self::Decryptor>;
 
 	/// Get current handshake state (pure accessor)
-	fn handshake_state(&self) -> crate::transport::handshake::HandshakeState;
+	fn handshake_state(&self) -> crate::transport::handshake::TcpHandshakeState;
 
 	/// Set handshake state (pure mutator)
-	fn set_handshake_state(&mut self, state: crate::transport::handshake::HandshakeState);
+	fn set_handshake_state(&mut self, state: crate::transport::handshake::TcpHandshakeState);
 
 	/// Get server certificate if present (pure accessor)
 	fn server_certificate(&self) -> Option<&crate::x509::Certificate>;

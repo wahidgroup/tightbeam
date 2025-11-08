@@ -20,10 +20,20 @@ pub use signature::*;
 use crate::cms::content_info::CmsVersion;
 use crate::cms::signed_data::{SignatureValue, SignerIdentifier, SignerInfo};
 use crate::crypto::hash::Digest;
-use crate::der::asn1::OctetString;
+use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 use crate::x509::ext::pkix::SubjectKeyIdentifier;
+
+/// Trait for signature types that have an associated algorithm OID.
+///
+/// This allows generic code to work with different signature algorithms
+/// (e.g., ECDSA-SHA256, ECDSA-SHA3-256, Ed25519) without hardcoding OIDs.
+pub trait SignatureAlgorithmIdentifier {
+	/// The OID for this signature algorithm.
+	/// For example, ECDSA with SHA-256 is `1.2.840.10045.4.3.2`.
+	const ALGORITHM_OID: ObjectIdentifier;
+}
 
 /// TODO Petition RustCrypto to adopt AssociatedOid for all
 pub trait Signatory<S>: Signer<S> + Keypair
@@ -258,4 +268,14 @@ where
 
 		Ok(())
 	}
+}
+
+// ============================================================================
+// SignatureAlgorithmIdentifier implementations
+// ============================================================================
+
+#[cfg(feature = "secp256k1")]
+impl SignatureAlgorithmIdentifier for ecdsa::Secp256k1Signature {
+	/// ECDSA with SHA-256: `1.2.840.10045.4.3.2`
+	const ALGORITHM_OID: ObjectIdentifier = crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID;
 }

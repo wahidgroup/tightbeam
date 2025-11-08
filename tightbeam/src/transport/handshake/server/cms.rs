@@ -21,6 +21,7 @@ use core::marker::PhantomData;
 
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::hash::Sha3_256;
+use crate::crypto::secret::Secret;
 use crate::crypto::sign::EcdsaSignatureVerifier;
 use crate::der::Decode;
 use crate::transport::handshake::error::HandshakeError;
@@ -49,7 +50,7 @@ where
 	server_key: Arc<dyn ServerHandshakeKey>,
 	client_cert: Option<Certificate>,
 	transcript_hash: Vec<u8>,
-	session_key: Option<Vec<u8>>,
+	session_key: Option<Secret<Vec<u8>>>,
 	_phantom: PhantomData<(C, Sig, Vk, D)>,
 }
 
@@ -119,7 +120,7 @@ where
 		let session_key = crate::transport::handshake::utils::aes_gcm_decrypt(&cek, encrypted_bytes, None)?;
 
 		// Store session key
-		self.session_key = Some(session_key.clone());
+		self.session_key = Some(Secret::from(session_key.clone()));
 
 		Ok(session_key)
 	}
@@ -232,8 +233,10 @@ where
 	}
 
 	/// Get the session key (if available).
-	pub fn session_key(&self) -> Option<&[u8]> {
-		self.session_key.as_deref()
+	///
+	/// Returns a reference to the Secret-wrapped session key bytes.
+	pub fn session_key(&self) -> Option<&Secret<Vec<u8>>> {
+		self.session_key.as_ref()
 	}
 }
 
@@ -250,7 +253,7 @@ where
 	Vk: signature::Verifier<Sig> + From<elliptic_curve::PublicKey<C>> + spki::EncodePublicKey + Send + Sync,
 	D: digest::Digest + der::oid::AssociatedOid + Send + Sync,
 {
-	type SessionKey = Vec<u8>;
+	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
 
 	fn handle_request<'a, 'b>(
@@ -284,7 +287,7 @@ where
 	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>> {
 		Box::pin(async move {
 			self.complete()?;
-			Ok(self.session_key().ok_or(HandshakeError::InvalidState)?.to_vec())
+			self.session_key.take().ok_or(HandshakeError::InvalidState)
 		})
 	}
 
@@ -313,8 +316,8 @@ mod tests {
 		use crate::crypto::sign::elliptic_curve::SecretKey;
 		use crate::der::Decode;
 		use crate::random::OsRng;
+		use crate::spki::AlgorithmIdentifierOwned;
 		use crate::spki::EncodePublicKey;
-		use crate::spki::{AlgorithmIdentifierOwned, ObjectIdentifier};
 		use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamSignedDataBuilder};
 		use crate::transport::handshake::TightBeamKariBuilder;
 		use crate::x509::time::Validity;
@@ -328,7 +331,7 @@ mod tests {
 				version: crate::x509::Version::V3,
 				serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).unwrap(),
 				signature: AlgorithmIdentifierOwned {
-					oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
+					oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID,
 					parameters: None,
 				},
 				issuer: RdnSequence::default(),
@@ -352,7 +355,7 @@ mod tests {
 			Certificate {
 				tbs_certificate: tbs_cert,
 				signature_algorithm: AlgorithmIdentifierOwned {
-					oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
+					oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID,
 					parameters: None,
 				},
 				signature: crate::der::asn1::BitString::new(0, vec![0; 64]).unwrap(),
@@ -398,10 +401,7 @@ mod tests {
 			});
 
 			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
+			let key_enc_alg = AlgorithmIdentifierOwned { oid: crate::asn1::AES_256_WRAP_OID, parameters: None };
 
 			let kari_builder = TightBeamKariBuilder::default()
 				.with_sender_priv(sender_ephemeral)
@@ -417,19 +417,17 @@ mod tests {
 			let extracted_key = server.process_key_exchange(&key_exchange)?;
 			assert_eq!(extracted_key, session_key);
 			assert_eq!(server.state(), HandshakeState::KeyExchangeReceived);
-			assert_eq!(server.session_key(), Some(session_key.as_slice()));
+			// Verify session key is stored
+			assert!(server.session_key().is_some());
 
 			// Build server Finished
 			let _server_finished = server.build_server_finished()?;
 			assert_eq!(server.state(), HandshakeState::ServerFinishedSent);
 
 			// Build client Finished
-			let digest_alg = AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
-				parameters: None,
-			};
+			let digest_alg = AlgorithmIdentifierOwned { oid: crate::asn1::HASH_SHA3_256_OID, parameters: None };
 			let signature_alg =
-				AlgorithmIdentifierOwned { oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), parameters: None };
+				AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
 			let mut client_finished_builder =
 				TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(client_key, digest_alg, signature_alg)?;
 			let client_finished = client_finished_builder.build_der(&transcript_hash)?;

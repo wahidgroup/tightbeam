@@ -273,6 +273,9 @@ pub trait EciesMessageOps: Sized {
 	/// Parse from wire format: [ephemeral_pubkey || ciphertext_with_tag]
 	fn from_bytes(bytes: &[u8]) -> Result<Self>;
 
+	/// Serialize to wire format: [ephemeral_pubkey || ciphertext_with_tag]
+	fn to_bytes(&self) -> Vec<u8>;
+
 	/// Get ephemeral public key bytes
 	fn ephemeral_pubkey(&self) -> &[u8];
 
@@ -328,6 +331,10 @@ impl EciesMessageOps for Secp256k1EciesMessage {
 
 	fn from_bytes(bytes: &[u8]) -> Result<Self> {
 		Self::from_bytes(bytes)
+	}
+
+	fn to_bytes(&self) -> Vec<u8> {
+		Self::to_bytes(self)
 	}
 
 	fn ephemeral_pubkey(&self) -> &[u8] {

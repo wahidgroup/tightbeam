@@ -38,6 +38,10 @@ pub const HASH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.
 /// ecdsa-with-SHA256
 /// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
 pub const SIGNER_ECDSA_WITH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+/// id-aes256-wrap - AES Key Wrap with 256-bit key
+/// See RFC 3394 - https://datatracker.ietf.org/doc/html/rfc3394
+/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.45>`
+pub const AES_256_WRAP_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45");
 /// id-data
 /// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
 /// See `<https://oid-base.com/get/1.2.840.113549.1.7.1>`

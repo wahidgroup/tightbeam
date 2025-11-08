@@ -182,7 +182,7 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 									signatory: None,
 					#[cfg(feature = "x509")]
-					handshake_state: $crate::transport::handshake::HandshakeState::None,
+					handshake_state: $crate::transport::handshake::TcpHandshakeState::None,
 					#[cfg(feature = "x509")]
 					handshake_timeout: std::time::Duration::from_secs(1),
 					#[cfg(feature = "x509")]
@@ -222,7 +222,7 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 									signatory: None,
 					#[cfg(feature = "x509")]
-					handshake_state: $crate::transport::handshake::HandshakeState::None,
+					handshake_state: $crate::transport::handshake::TcpHandshakeState::None,
 					#[cfg(feature = "x509")]
 					handshake_timeout: std::time::Duration::from_secs(1),
 					#[cfg(feature = "x509")]
@@ -287,12 +287,12 @@ macro_rules! impl_tcp_common {
 				};
 				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
-				// Create handshake orchestrator based on protocol kind
-				let mut orchestrator: Box<dyn ClientHandshakeProtocol<SessionKey = Vec<u8>, Error = $crate::transport::handshake::HandshakeError>> = match self.handshake_protocol_kind {
+				// Create appropriate handshake orchestrator based on protocol kind
+				let mut orchestrator: Box<dyn ClientHandshakeProtocol<SessionKey = $crate::crypto::secret::Secret<Vec<u8>>, Error = $crate::transport::handshake::HandshakeError>> = match self.handshake_protocol_kind {
 					HandshakeProtocolKind::Ecies => {
 						let aad = self.aad_domain_tag.clone();
 						Box::new(
-							$crate::transport::handshake::client::EciesHandshakeClient::new(aad)
+							$crate::transport::handshake::client::EciesHandshakeClientSecp256k1::new(aad)
 						)
 					}
 					#[cfg(all(
@@ -325,13 +325,13 @@ macro_rules! impl_tcp_common {
 				// Update state machine
 				#[cfg(feature = "std")]
 				{
-					self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingServerResponse {
+					self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::AwaitingServerResponse {
 						initiated_at: std::time::Instant::now(),
 					});
 				}
 				#[cfg(not(feature = "std"))]
 				{
-					self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingServerResponse {
+					self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::AwaitingServerResponse {
 						initiated_at: 0,
 					});
 				}
@@ -384,16 +384,20 @@ macro_rules! impl_tcp_common {
 				}
 
 				// Step 5: Complete handshake and derive session key
-				let session_key_bytes = orchestrator.complete().await?;
+				let session_key_secret = orchestrator.complete().await?;
+
+				// Extract raw bytes from Secret for AES key
+				use $crate::crypto::secret::ToInsecure;
+				let session_key_bytes = session_key_secret.to_insecure();
 
 				// Reconstruct Aes256Gcm from raw key bytes
 				use $crate::crypto::aead::KeyInit;
-				let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&session_key_bytes)
+				let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
 					.map_err(|_| TransportError::InvalidMessage)?;
 
 				// Store session key and mark handshake complete
 				self.set_symmetric_key(session_key);
-				self.set_handshake_state($crate::transport::handshake::HandshakeState::Complete);
+				self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
 
 				Ok(())
 			}
@@ -490,27 +494,31 @@ macro_rules! impl_tcp_common {
 					// Set server awaiting state with timeout tracking
 					#[cfg(feature = "std")]
 					{
-						self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingClientFinish {
+						self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::AwaitingClientFinish {
 							initiated_at: std::time::Instant::now(),
 						});
 					}
 					#[cfg(not(feature = "std"))]
 					{
-						self.set_handshake_state($crate::transport::handshake::HandshakeState::AwaitingClientFinish {
+						self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::AwaitingClientFinish {
 							initiated_at: 0,
 						});
 					}
 				} else {
 					// No response means handshake is complete - derive session key
-					let session_key_bytes = orchestrator.complete().await?;
+					let session_key_secret = orchestrator.complete().await?;
+
+					// Extract raw bytes from Secret for AES key
+					use $crate::crypto::secret::ToInsecure;
+					let session_key_bytes = session_key_secret.to_insecure();
 
 					// Reconstruct Aes256Gcm from raw key bytes
 					use $crate::crypto::aead::KeyInit;
-					let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&session_key_bytes)
+					let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
 						.map_err(|_| TransportError::InvalidMessage)?;
 
 					self.set_symmetric_key(session_key);
-					self.set_handshake_state($crate::transport::handshake::HandshakeState::Complete);
+					self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
 
 					// Clear handshake instance - no longer needed
 					self.server_handshake = None;

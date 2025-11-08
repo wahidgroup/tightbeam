@@ -17,7 +17,7 @@ use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::{Aes256Gcm, KeyInit};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::kdf::{hkdf, HkdfSha3_256};
-use crate::crypto::secret::ToInsecure;
+use crate::crypto::secret::{Secret, ToInsecure};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
@@ -278,7 +278,7 @@ impl EciesHandshakeServer {
 // ============================================================================
 
 impl ServerHandshakeProtocol for EciesHandshakeServer {
-	type SessionKey = Vec<u8>;
+	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
 
 	fn handle_request<'a, 'b>(
@@ -336,7 +336,7 @@ impl ServerHandshakeProtocol for EciesHandshakeServer {
 				sr.fill(0);
 			}
 
-			Ok(session_key_bytes)
+			Ok(Secret::from(session_key_bytes))
 		})
 	}
 

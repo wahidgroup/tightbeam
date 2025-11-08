@@ -8,9 +8,9 @@
 use core::marker::PhantomData;
 
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::{CurveArithmetic, SecretKey};
 use crate::crypto::sign::EcdsaSignatureVerifier;
-use crate::der::asn1::ObjectIdentifier;
 use crate::der::Decode;
 use crate::random::OsRng;
 use crate::spki::AlgorithmIdentifierOwned;
@@ -38,7 +38,7 @@ pub struct CmsHandshakeClient<C, Sig, Vk, Sk, D> {
 	client_key: Sk,
 	server_cert: Certificate,
 	transcript_hash: Vec<u8>,
-	session_key: Option<Vec<u8>>,
+	session_key: Option<Secret<Vec<u8>>>,
 	_phantom: PhantomData<(C, Sig, Vk, D)>,
 }
 
@@ -48,7 +48,7 @@ where
 	C::FieldBytesSize: elliptic_curve::sec1::ModulusSize,
 	elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
 	elliptic_curve::PublicKey<C>: EncodePublicKey,
-	Sig: signature::SignatureEncoding + Send + Sync + 'static,
+	Sig: signature::SignatureEncoding + crate::crypto::sign::SignatureAlgorithmIdentifier + Send + Sync + 'static,
 	Vk: signature::Verifier<Sig> + From<elliptic_curve::PublicKey<C>> + EncodePublicKey + Send + Sync + 'static,
 	Sk: signature::Signer<Sig> + signature::Keypair<VerifyingKey = Vk> + Clone + Send + Sync + 'static,
 	D: crate::crypto::hash::Digest + der::oid::AssociatedOid + Send + Sync + 'static,
@@ -107,10 +107,7 @@ where
 		});
 
 		// Key encryption algorithm (ECDH + HKDF + AES wrap)
-		let key_enc_alg = AlgorithmIdentifierOwned {
-			oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"), // dhSinglePass-stdDH-sha256kdf-scheme
-			parameters: None,
-		};
+		let key_enc_alg = AlgorithmIdentifierOwned { oid: crate::asn1::AES_256_WRAP_OID, parameters: None };
 
 		// Build KARI (Key Agreement Recipient Info) structure
 		let kari_builder = TightBeamKariBuilder::<C>::new()
@@ -129,7 +126,7 @@ where
 		let enveloped_data_der = enveloped_builder.build_der(&session_key, None)?;
 
 		// Store session key and transition state
-		self.session_key = Some(session_key);
+		self.session_key = Some(Secret::from(session_key));
 		self.state.transition(HandshakeState::KeyExchangeSent)?;
 
 		Ok(enveloped_data_der)
@@ -203,10 +200,7 @@ where
 
 		// Algorithm identifiers
 		let digest_alg = AlgorithmIdentifierOwned { oid: D::OID, parameters: None };
-		let signature_alg = AlgorithmIdentifierOwned {
-			oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), // ecdsa-with-SHA256 (TODO: make generic)
-			parameters: None,
-		};
+		let signature_alg = AlgorithmIdentifierOwned { oid: Sig::ALGORITHM_OID, parameters: None };
 
 		// Build SignedData
 		let mut builder =
@@ -242,8 +236,10 @@ where
 	}
 
 	/// Get the session key (if available).
-	pub fn session_key(&self) -> Option<&[u8]> {
-		self.session_key.as_deref()
+	///
+	/// Returns a reference to the Secret-wrapped session key bytes.
+	pub fn session_key(&self) -> Option<&Secret<Vec<u8>>> {
+		self.session_key.as_ref()
 	}
 }
 
@@ -257,12 +253,12 @@ where
 	C::FieldBytesSize: elliptic_curve::sec1::ModulusSize,
 	elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
 	elliptic_curve::PublicKey<C>: EncodePublicKey,
-	Sig: signature::SignatureEncoding + Send + Sync + 'static,
+	Sig: signature::SignatureEncoding + crate::crypto::sign::SignatureAlgorithmIdentifier + Send + Sync + 'static,
 	Vk: signature::Verifier<Sig> + From<elliptic_curve::PublicKey<C>> + EncodePublicKey + Send + Sync + 'static,
 	Sk: signature::Signer<Sig> + signature::Keypair<VerifyingKey = Vk> + Clone + Send + Sync + 'static,
 	D: crate::crypto::hash::Digest + der::oid::AssociatedOid + Send + Sync + 'static,
 {
-	type SessionKey = Vec<u8>;
+	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
 
 	fn start<'a>(
@@ -293,7 +289,7 @@ where
 	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>> {
 		Box::pin(async move {
 			self.complete()?;
-			Ok(self.session_key().ok_or(HandshakeError::InvalidState)?.to_vec())
+			self.session_key.take().ok_or(HandshakeError::InvalidState)
 		})
 	}
 
@@ -340,7 +336,7 @@ mod tests {
 				version: crate::x509::Version::V3,
 				serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).unwrap(),
 				signature: AlgorithmIdentifierOwned {
-					oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
+					oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID,
 					parameters: None,
 				},
 				issuer: RdnSequence::default(),
@@ -364,7 +360,7 @@ mod tests {
 			Certificate {
 				tbs_certificate: tbs_cert,
 				signature_algorithm: AlgorithmIdentifierOwned {
-					oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
+					oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID,
 					parameters: None,
 				},
 				signature: crate::der::asn1::BitString::new(0, vec![0; 64]).unwrap(),
@@ -387,7 +383,8 @@ mod tests {
 			let session_key = vec![2u8; 32];
 			let key_exchange = client.build_key_exchange(session_key.clone())?;
 			assert_eq!(client.state(), HandshakeState::KeyExchangeSent);
-			assert_eq!(client.session_key(), Some(session_key.as_slice()));
+			// Verify session key is stored
+			assert!(client.session_key().is_some());
 
 			// Server should be able to decrypt it
 			let enveloped_data = cms::enveloped_data::EnvelopedData::from_der(&key_exchange)?;
@@ -399,12 +396,9 @@ mod tests {
 			assert_eq!(decrypted, session_key);
 
 			// Build server Finished
-			let digest_alg = AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
-				parameters: None,
-			};
+			let digest_alg = AlgorithmIdentifierOwned { oid: crate::asn1::HASH_SHA3_256_OID, parameters: None };
 			let signature_alg =
-				AlgorithmIdentifierOwned { oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), parameters: None };
+				AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
 			let mut server_finished_builder =
 				TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(server_key, digest_alg, signature_alg)?;
 			let server_finished = server_finished_builder.build_der(&transcript_hash)?;
