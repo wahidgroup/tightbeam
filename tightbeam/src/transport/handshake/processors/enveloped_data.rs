@@ -184,15 +184,16 @@ mod tests {
 		feature = "sha3"
 	))]
 	mod processor {
-	use super::*;
-	use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
-	use crate::random::{generate_nonce, OsRng};
-	use crate::spki::SubjectPublicKeyInfoOwned;
-	use crate::transport::handshake::builders::enveloped_data::TightBeamEnvelopedDataBuilder;
-	use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
-	use crate::transport::handshake::processors::kari::TightBeamKariRecipient;
-	use k256::SecretKey as K256SecretKey;
-	use spki::AlgorithmIdentifierOwned;		#[test]
+		use super::*;
+		use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+		use crate::random::{generate_nonce, OsRng};
+		use crate::spki::SubjectPublicKeyInfoOwned;
+		use crate::transport::handshake::builders::enveloped_data::TightBeamEnvelopedDataBuilder;
+		use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
+		use crate::transport::handshake::processors::kari::TightBeamKariRecipient;
+		use k256::SecretKey as K256SecretKey;
+		use spki::AlgorithmIdentifierOwned;
+		#[test]
 		fn test_roundtrip_with_kari_aes_gcm() -> Result<(), Box<dyn std::error::Error>> {
 			// Generate sender and recipient keys
 			let sender_key = K256SecretKey::random(&mut OsRng);
@@ -202,14 +203,14 @@ mod tests {
 			let recipient_key = K256SecretKey::random(&mut OsRng);
 			let recipient_pubkey = recipient_key.public_key();
 
-		// Original plaintext
-		let plaintext = b"Secret handshake message";
+			// Original plaintext
+			let plaintext = b"Secret handshake message";
 
-		// Create UKM with random bytes
-		let ukm_bytes = generate_nonce::<64>(None)?;
-		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None)?;
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 
-		// Recipient identifier
+			// Recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
 				issuer: x509_cert::name::Name::default(),
 				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01])?,
@@ -254,15 +255,15 @@ mod tests {
 			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
 
 			let recipient_key = K256SecretKey::random(&mut OsRng);
-		let recipient_pubkey = recipient_key.public_key();
+			let recipient_pubkey = recipient_key.public_key();
 
-		let plaintext = b"Test message";
+			let plaintext = b"Test message";
 
-		// Create UKM with random bytes
-		let ukm_bytes = generate_nonce::<64>(None)?;
-		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None)?;
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 
-		// Recipient identifier
+			// Recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
 				issuer: x509_cert::name::Name::default(),
 				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01])?,
@@ -327,15 +328,15 @@ mod tests {
 			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
 
 			let recipient_key = K256SecretKey::random(&mut OsRng);
-		let recipient_pubkey = recipient_key.public_key();
+			let recipient_pubkey = recipient_key.public_key();
 
-		let plaintext = b"Test with attributes";
+			let plaintext = b"Test with attributes";
 
-		// Create UKM with random bytes
-		let ukm_bytes = generate_nonce::<64>(None)?;
-		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None)?;
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 
-		// Recipient identifier
+			// Recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
 				issuer: x509_cert::name::Name::default(),
 				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01])?,

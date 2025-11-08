@@ -211,14 +211,14 @@ mod tests {
 			let sender_pubkey = sender_key.public_key();
 			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).unwrap();
 
-		let recipient_key = K256SecretKey::random(&mut OsRng);
-		let recipient_pubkey = recipient_key.public_key();
+			let recipient_key = K256SecretKey::random(&mut OsRng);
+			let recipient_pubkey = recipient_key.public_key();
 
-		// Create UKM with random bytes
-		let ukm_bytes = generate_nonce::<64>(None).unwrap();
-		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None).unwrap();
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
 
-		// Recipient identifier
+			// Recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
 				issuer: x509_cert::name::Name::default(),
 				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01]).unwrap(),
@@ -258,14 +258,14 @@ mod tests {
 			let sender_pubkey = sender_key.public_key();
 			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).unwrap();
 
-		let recipient_key = K256SecretKey::random(&mut OsRng);
-		let recipient_pubkey = recipient_key.public_key();
+			let recipient_key = K256SecretKey::random(&mut OsRng);
+			let recipient_pubkey = recipient_key.public_key();
 
-		// Create UKM with random bytes
-		let ukm_bytes = generate_nonce::<64>(None).unwrap();
-		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None).unwrap();
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
 
-		// Recipient identifier
+			// Recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
 				issuer: x509_cert::name::Name::default(),
 				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01]).unwrap(),
@@ -313,14 +313,14 @@ mod tests {
 			let sender_pubkey = sender_key.public_key();
 			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).unwrap();
 
-		let recipient_key = K256SecretKey::random(&mut OsRng);
-		let recipient_pubkey = recipient_key.public_key();
+			let recipient_key = K256SecretKey::random(&mut OsRng);
+			let recipient_pubkey = recipient_key.public_key();
 
-		// Create UKM with random bytes
-		let ukm_bytes = generate_nonce::<64>(None).unwrap();
-		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None).unwrap();
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
 
-		// Recipient identifier
+			// Recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
 				issuer: x509_cert::name::Name::default(),
 				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01]).unwrap(),
@@ -358,14 +358,14 @@ mod tests {
 			let sender_pubkey = sender_key.public_key();
 			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).unwrap();
 
-		let recipient_key = K256SecretKey::random(&mut OsRng);
-		let recipient_pubkey = recipient_key.public_key();
+			let recipient_key = K256SecretKey::random(&mut OsRng);
+			let recipient_pubkey = recipient_key.public_key();
 
-		// Create UKM with random bytes
-		let ukm_bytes = generate_nonce::<64>(None).unwrap();
-		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
+			// Create UKM with random bytes
+			let ukm_bytes = generate_nonce::<64>(None).unwrap();
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
 
-		// Recipient identifier
+			// Recipient identifier
 			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
 				issuer: x509_cert::name::Name::default(),
 				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01]).unwrap(),
