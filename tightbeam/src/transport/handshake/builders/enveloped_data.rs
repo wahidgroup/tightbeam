@@ -30,7 +30,6 @@ use crate::transport::handshake::utils::{aes_256_gcm_algorithm, aes_gcm_encrypt,
 /// 2. Build KARI using TightBeamKariBuilder to wrap the CEK
 /// 3. Encrypt plaintext content with CEK using AES-GCM
 /// 4. Wrap everything into EnvelopedData structure
-#[cfg(all(feature = "builder", feature = "aead"))]
 pub struct TightBeamEnvelopedDataBuilder<P>
 where
 	P: CryptoProvider,
@@ -41,7 +40,6 @@ where
 	encryptor: Box<dyn Fn(&[u8], &[u8], Option<&[u8]>) -> Result<Vec<u8>, HandshakeError>>,
 }
 
-#[cfg(all(feature = "builder", feature = "aead"))]
 impl<P> TightBeamEnvelopedDataBuilder<P>
 where
 	P: CryptoProvider,
@@ -219,14 +217,7 @@ where
 }
 
 /// Default implementation for secp256k1 + AES-256-GCM.
-#[cfg(all(
-	feature = "builder",
-	feature = "aead",
-	feature = "secp256k1",
-	feature = "kdf",
-	feature = "sha3"
-))]
-impl TightBeamEnvelopedDataBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
+impl TightBeamEnvelopedDataBuilder<DefaultCryptoProvider> {
 	/// Create a builder with default TightBeam settings.
 	///
 	/// Uses:
@@ -234,8 +225,9 @@ impl TightBeamEnvelopedDataBuilder<crate::crypto::profiles::DefaultCryptoProvide
 	/// - HKDF-SHA3-256 for KDF
 	/// - AES-256 key wrap for KEK
 	/// - AES-256-GCM for content encryption
-	pub fn with_defaults(kari_builder: TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider>) -> Self {
-		Self::new(kari_builder).with_content_encryption_alg(aes_256_gcm_algorithm())
+	pub fn with_defaults(kari_builder: TightBeamKariBuilder<DefaultCryptoProvider>) -> Self {
+		let provider = DefaultCryptoProvider::default();
+		Self::new(kari_builder).with_content_encryption_alg(provider.to_aead_algorithm_identifier())
 	}
 }
 
@@ -243,13 +235,6 @@ impl TightBeamEnvelopedDataBuilder<crate::crypto::profiles::DefaultCryptoProvide
 mod tests {
 	use super::*;
 
-	#[cfg(all(
-		feature = "builder",
-		feature = "aead",
-		feature = "secp256k1",
-		feature = "kdf",
-		feature = "sha3"
-	))]
 	mod enveloped_data {
 		use super::*;
 		use crate::der::Decode;
@@ -260,7 +245,7 @@ mod tests {
 
 		// Test helper functions
 
-		fn create_test_kari_builder() -> TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
+		fn create_test_kari_builder() -> TightBeamKariBuilder<DefaultCryptoProvider> {
 			// 1. Create sender keypair
 			let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
 

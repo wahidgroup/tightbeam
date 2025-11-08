@@ -128,7 +128,9 @@ impl Protocol for TokioListener {
 	type Address = crate::transport::tcp::TightBeamSocketAddr;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
-		Ok("127.0.0.1:0".parse().expect("Valid default TCP address"))
+		Ok("127.0.0.1:0"
+			.parse()
+			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?)
 	}
 
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {

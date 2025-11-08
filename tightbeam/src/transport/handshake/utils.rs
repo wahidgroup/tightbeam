@@ -8,7 +8,6 @@ use spki::AlgorithmIdentifierOwned;
 /// Generate a random 32-byte CEK for AES-256-GCM.
 pub fn generate_cek() -> Result<Vec<u8>, HandshakeError> {
 	use rand_core::RngCore;
-
 	let mut cek = vec![0u8; 32];
 	rand_core::OsRng.fill_bytes(&mut cek);
 	Ok(cek)
@@ -42,7 +41,7 @@ pub fn aes_gcm_encrypt(key: &[u8], plaintext: &[u8], aad: Option<&[u8]>) -> Resu
 	// Encrypt
 	let ciphertext = cipher.encrypt(nonce, Payload { msg: plaintext, aad: aad.unwrap_or(&[]) })?;
 
-	// Return: nonce || ciphertext (includes tag)
+	// Preallocate exact required capacity: nonce (12) + ciphertext+tag
 	let mut result = Vec::with_capacity(12 + ciphertext.len());
 	result.extend_from_slice(&nonce_bytes);
 	result.extend_from_slice(&ciphertext);
@@ -143,7 +142,7 @@ mod tests {
 		let cek2 = generate_cek()?;
 		assert_eq!(cek1.len(), 32);
 		assert_eq!(cek2.len(), 32);
-		assert_ne!(cek1, cek2); // Should be random
+		assert_ne!(cek1, cek2);
 		Ok(())
 	}
 }

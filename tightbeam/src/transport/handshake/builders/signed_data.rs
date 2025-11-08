@@ -21,7 +21,6 @@ use crate::x509::ext::pkix::SubjectKeyIdentifier;
 ///
 /// The builder is generic over `P: CryptoProvider` which defines the complete
 /// cryptographic suite (signature algorithm and digest algorithm).
-#[cfg(all(feature = "builder", feature = "signature"))]
 pub struct TightBeamSignedDataBuilder<P>
 where
 	P: crate::crypto::profiles::CryptoProvider,
@@ -39,7 +38,6 @@ where
 	_phantom: core::marker::PhantomData<P>,
 }
 
-#[cfg(all(feature = "builder", feature = "signature"))]
 impl<P> TightBeamSignedDataBuilder<P>
 where
 	P: crate::crypto::profiles::CryptoProvider,
@@ -66,14 +64,7 @@ where
 	{
 		// Generate SKID from public key
 		let verifying_key = signer.verifying_key();
-		let public_key_der = verifying_key.to_public_key_der()?;
-
-		let mut hasher = P::Digest::new();
-		hasher.update(public_key_der.as_bytes());
-
-		let skid_bytes = hasher.finalize();
-		let skid = SubjectKeyIdentifier(OctetString::new(&skid_bytes[..20])?);
-		let signer_id = SignerIdentifier::SubjectKeyIdentifier(skid);
+		let signer_id = crate::crypto::x509::compute_signer_identifier::<P::Digest, _>(verifying_key)?;
 
 		Ok(Self {
 			signer: Box::new(signer),
@@ -152,12 +143,6 @@ where
 mod tests {
 	use super::*;
 
-	#[cfg(all(
-		feature = "builder",
-		feature = "signature",
-		feature = "secp256k1",
-		feature = "sha3"
-	))]
 	mod signed_data {
 		use super::*;
 		use crate::crypto::profiles::DefaultCryptoProvider;

@@ -5,8 +5,6 @@
 //!
 //! Generic over `P: CryptoProvider` for cryptographic operations.
 
-#![cfg(all(feature = "builder", feature = "aead", feature = "signature"))]
-
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
@@ -69,9 +67,6 @@ where
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	P::Signature: SignatureEncoding + 'static,
-	P::VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + 'static,
-	P::Digest: Digest + AssociatedOid + 'static,
 {
 	/// Create a new CMS handshake server.
 	///
@@ -150,17 +145,9 @@ where
 		&self,
 		client_verifying_key: &P::VerifyingKey,
 	) -> Result<SignerIdentifier, HandshakeError> {
-		let public_key_der_bytes = client_verifying_key.to_public_key_der()?;
-
-		let mut hasher = sha3::Sha3_256::new();
-		hasher.update(public_key_der_bytes.as_bytes());
-
-		let subject_key_identifier_bytes = hasher.finalize();
-		let subject_key_identifier_octets = OctetString::new(&subject_key_identifier_bytes[..20])?;
-		let subject_key_identifier = SubjectKeyIdentifier::from(subject_key_identifier_octets);
-
-		let expected_signer_identifier = SignerIdentifier::SubjectKeyIdentifier(subject_key_identifier);
-		Ok(expected_signer_identifier)
+		Ok(crate::crypto::x509::compute_signer_identifier::<P::Digest, _>(
+			client_verifying_key,
+		)?)
 	}
 
 	/// Verify the signature and content of the SignedData.
@@ -348,9 +335,6 @@ where
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	P::Signature: SignatureEncoding + Send + Sync + 'static,
-	P::VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + Send + Sync + 'static,
-	P::Digest: Digest + AssociatedOid + Send + Sync + 'static,
 {
 	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;

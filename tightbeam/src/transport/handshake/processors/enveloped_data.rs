@@ -10,7 +10,6 @@ use crate::transport::handshake::error::HandshakeError;
 ///
 /// Implementations should handle specific recipient types (KARI, KTRI, etc.)
 /// and extract the CEK from the RecipientInfo structure.
-#[cfg(all(feature = "builder", feature = "aead"))]
 pub trait RecipientProcessor {
 	/// Process a RecipientInfo to extract the CEK.
 	///
@@ -27,7 +26,6 @@ pub trait RecipientProcessor {
 ///
 /// Note: This is defined in `crate::crypto::aead` as `Decryptor` but we need
 /// a version that works with raw bytes and algorithm OIDs for the processor.
-#[cfg(all(feature = "builder", feature = "aead"))]
 pub trait ContentDecryptor {
 	/// Decrypt encrypted content using the provided CEK.
 	///
@@ -50,10 +48,8 @@ pub trait ContentDecryptor {
 ///
 /// Decrypts content using AES-256-GCM. The nonce is embedded in the ciphertext
 /// by the `aes_gcm_decrypt` helper function.
-#[cfg(all(feature = "builder", feature = "aead"))]
 pub struct AesGcmContentDecryptor;
 
-#[cfg(all(feature = "builder", feature = "aead"))]
 impl ContentDecryptor for AesGcmContentDecryptor {
 	fn decrypt_content(
 		&self,
@@ -81,7 +77,6 @@ impl ContentDecryptor for AesGcmContentDecryptor {
 ///
 /// This allows flexibility to support different key agreement mechanisms
 /// and content encryption algorithms without hardcoding specific choices.
-#[cfg(all(feature = "builder", feature = "aead"))]
 pub struct TightBeamEnvelopedDataProcessor {
 	/// Processor to extract CEK from RecipientInfo
 	recipient_processor: Box<dyn RecipientProcessor>,
@@ -93,7 +88,6 @@ pub struct TightBeamEnvelopedDataProcessor {
 	recipient_index: usize,
 }
 
-#[cfg(all(feature = "builder", feature = "aead"))]
 impl TightBeamEnvelopedDataProcessor {
 	/// Create a new EnvelopedData processor.
 	///
@@ -176,13 +170,6 @@ impl TightBeamEnvelopedDataProcessor {
 mod tests {
 	use super::*;
 
-	#[cfg(all(
-		feature = "builder",
-		feature = "aead",
-		feature = "secp256k1",
-		feature = "kdf",
-		feature = "sha3"
-	))]
 	mod processor {
 		use super::*;
 		use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;

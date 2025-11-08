@@ -143,25 +143,29 @@ pub mod client;
 pub mod server;
 pub mod state;
 
+#[cfg(feature = "handshake_cms")]
+pub mod kari;
+
 pub use attributes::*;
 pub use error::HandshakeError;
+
+#[cfg(feature = "handshake_cms")]
+pub use kari::{kari_unwrap, kari_wrap};
 pub use state::{
 	ClientStateTransition, HandshakeMessageType, HandshakeState as ProtocolState, ServerStateTransition,
 	StateTransition,
 };
 pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generate_cek};
 
-#[cfg(feature = "builder")]
+#[cfg(feature = "handshake_cms")]
 pub mod builders;
-#[cfg(feature = "builder")]
+#[cfg(feature = "handshake_cms")]
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
 
-#[cfg(feature = "builder")]
+#[cfg(feature = "handshake_cms")]
 pub mod processors;
-#[cfg(all(feature = "builder", feature = "aead"))]
-pub use processors::TightBeamEnvelopedDataProcessor;
-#[cfg(feature = "builder")]
-pub use processors::TightBeamKariRecipient;
+#[cfg(feature = "handshake_cms")]
+pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 
 #[cfg(test)]
 mod tests;
@@ -236,7 +240,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	///
 	/// # Returns
 	/// The unwrapped content-encryption key (CEK)
-	#[cfg(all(feature = "builder", feature = "aead"))]
+	#[cfg(feature = "handshake_cms")]
 	fn decrypt_kari(
 		&self,
 		enveloped_data_der: &[u8],
@@ -257,7 +261,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	///
 	/// # Returns
 	/// DER-encoded CMS SignedData structure
-	#[cfg(all(feature = "builder", feature = "signature"))]
+	#[cfg(feature = "handshake_cms")]
 	fn build_cms_signed_data(
 		&self,
 		content: &[u8],
@@ -268,13 +272,13 @@ pub trait ServerHandshakeKey: Send + Sync {
 	/// Get the digest algorithm identifier used by this key.
 	///
 	/// Returns the OID and parameters for the digest algorithm (e.g., SHA3-256).
-	#[cfg(all(feature = "builder", feature = "signature"))]
+	#[cfg(feature = "handshake_cms")]
 	fn digest_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned;
 
 	/// Get the signature algorithm identifier used by this key.
 	///
 	/// Returns the OID and parameters for the signature algorithm (e.g., ecdsa-with-SHA3-256).
-	#[cfg(all(feature = "builder", feature = "signature"))]
+	#[cfg(feature = "handshake_cms")]
 	fn signature_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned;
 }
 
@@ -310,7 +314,7 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 		Ok(crate::crypto::secret::Secret::new(Box::new(vec)))
 	}
 
-	#[cfg(all(feature = "builder", feature = "aead"))]
+	#[cfg(feature = "handshake_cms")]
 	fn decrypt_kari(
 		&self,
 		enveloped_data_der: &[u8],
@@ -344,7 +348,7 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 		processor.process_recipient(recipient_info, recipient_index)
 	}
 
-	#[cfg(all(feature = "builder", feature = "signature"))]
+	#[cfg(feature = "handshake_cms")]
 	fn build_cms_signed_data(
 		&self,
 		content: &[u8],
@@ -365,12 +369,12 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 		builder.build_der(content)
 	}
 
-	#[cfg(all(feature = "builder", feature = "signature"))]
+	#[cfg(feature = "handshake_cms")]
 	fn digest_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned {
 		crate::spki::AlgorithmIdentifierOwned { oid: crate::HASH_SHA3_256_OID, parameters: None }
 	}
 
-	#[cfg(all(feature = "builder", feature = "signature"))]
+	#[cfg(feature = "handshake_cms")]
 	fn signature_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned {
 		crate::spki::AlgorithmIdentifierOwned { oid: crate::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
 	}

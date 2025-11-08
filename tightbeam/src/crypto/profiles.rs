@@ -117,60 +117,123 @@ pub trait SecurityProfile {
 	}
 }
 
-/// Binds concrete implementations to the metadata in a `SecurityProfile`.
-pub trait CryptoProvider {
-	type Profile: SecurityProfile + Default;
-	#[cfg(feature = "digest")]
+/// Provides digest/hash functionality.
+///
+/// This sub-trait isolates digest operations from the full provider,
+/// making trait bounds clearer and enabling focused testing.
+#[cfg(feature = "digest")]
+pub trait DigestProvider {
 	type Digest: Digest + AssociatedOid + Default;
-	#[cfg(feature = "kdf")]
-	type Kdf: KdfProvider;
-	#[cfg(feature = "aead")]
-	type AeadCipher: Aead;
-	#[cfg(feature = "signature")]
-	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier;
-	#[cfg(feature = "signature")]
-	type SigningKey: Signatory<Self::Signature>;
-	#[cfg(feature = "signature")]
-	type VerifyingKey;
-	#[cfg(feature = "ecdh")]
-	type Curve: elliptic_curve::Curve + elliptic_curve::CurveArithmetic;
 
-	fn profile(&self) -> &Self::Profile;
-
-	#[inline]
 	fn to_digest_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned {
-			oid: <<Self::Profile as SecurityProfile>::DigestOid as AssociatedOid>::OID,
-			parameters: None,
-		}
-	}
-
-	#[cfg(feature = "aead")]
-	#[inline]
-	fn to_aead_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned {
-			oid: <<Self::Profile as SecurityProfile>::AeadOid as AssociatedOid>::OID,
-			parameters: None,
-		}
-	}
-
-	#[cfg(feature = "signature")]
-	#[inline]
-	fn to_signature_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned {
-			oid: <<Self::Profile as SecurityProfile>::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID,
-			parameters: None,
-		}
+		AlgorithmIdentifierOwned { oid: <Self::Digest as AssociatedOid>::OID, parameters: None }
 	}
 
 	/// Convert this provider into a Digestor function.
-	#[cfg(feature = "digest")]
 	fn as_digestor<E>(&self) -> crate::helpers::Digestor<E>
 	where
 		E: From<crate::TightBeamError>,
 	{
 		Box::new(|data: &[u8]| Ok(crate::utils::digest::<Self::Digest>(data)?))
 	}
+}
+
+/// Provides AEAD cipher functionality.
+///
+/// Separates AEAD operations (encryption/decryption) from other crypto primitives.
+#[cfg(feature = "aead")]
+pub trait AeadProvider {
+	type AeadCipher: Aead;
+	type AeadOid: AssociatedOid;
+
+	fn to_aead_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
+		AlgorithmIdentifierOwned { oid: <Self::AeadOid as AssociatedOid>::OID, parameters: None }
+	}
+
+	/// Convert this provider into a KeyWrapper function for AES-128 KEK (16 bytes).
+	#[cfg(feature = "transport")]
+	fn as_key_wrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
+	where
+		E: From<crate::transport::handshake::HandshakeError>,
+	{
+		impl_key_wrapper!(E, aes::Aes128, 16)
+	}
+
+	/// Convert this provider into a KeyWrapper function for AES-192 KEK (24 bytes).
+	#[cfg(feature = "transport")]
+	fn as_key_wrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
+	where
+		E: From<crate::transport::handshake::HandshakeError>,
+	{
+		impl_key_wrapper!(E, aes::Aes192, 24)
+	}
+
+	/// Convert this provider into a KeyWrapper function for AES-256 KEK (32 bytes).
+	#[cfg(feature = "transport")]
+	fn as_key_wrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
+	where
+		E: From<crate::transport::handshake::HandshakeError>,
+	{
+		impl_key_wrapper!(E, aes::Aes256, 32)
+	}
+
+	/// Convert this provider into a KeyUnwrapper function for AES-128 KEK (16 bytes).
+	///
+	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
+	#[cfg(feature = "transport")]
+	fn as_key_unwrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
+	where
+		E: From<crate::transport::handshake::HandshakeError>,
+	{
+		impl_key_unwrapper!(E, aes::Aes128, 16)
+	}
+
+	/// Convert this provider into a KeyUnwrapper function for AES-192 KEK (24 bytes).
+	///
+	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
+	#[cfg(feature = "transport")]
+	fn as_key_unwrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
+	where
+		E: From<crate::transport::handshake::HandshakeError>,
+	{
+		impl_key_unwrapper!(E, aes::Aes192, 24)
+	}
+
+	/// Convert this provider into a KeyUnwrapper function for AES-256 KEK (32 bytes).
+	///
+	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
+	#[cfg(feature = "transport")]
+	fn as_key_unwrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
+	where
+		E: From<crate::transport::handshake::HandshakeError>,
+	{
+		impl_key_unwrapper!(E, aes::Aes256, 32)
+	}
+}
+
+/// Provides signature generation and verification.
+///
+/// Isolates signing operations to reduce generic bounds on types that only sign.
+#[cfg(feature = "signature")]
+pub trait SigningProvider {
+	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier;
+	type SigningKey: Signatory<Self::Signature>;
+	type VerifyingKey;
+
+	fn to_signature_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
+		AlgorithmIdentifierOwned {
+			oid: <Self::Signature as SignatureAlgorithmIdentifier>::ALGORITHM_OID,
+			parameters: None,
+		}
+	}
+}
+
+/// Provides key derivation functionality.
+///
+/// Separates KDF operations (HKDF, etc.) for clearer trait bounds.
+#[cfg(feature = "kdf")]
+pub trait KdfProviderTrait {
+	type Kdf: KdfProvider;
 
 	/// Convert this provider into a KeyDeriver function for a specific output length.
 	///
@@ -183,7 +246,6 @@ pub trait CryptoProvider {
 	/// let deriver = provider.as_key_deriver::<HandshakeError, 32>(); // 32-byte keys
 	/// let key = deriver(ikm, salt, info)?;
 	/// ```
-	#[cfg(feature = "kdf")]
 	fn as_key_deriver<E, const N: usize>(&self) -> Box<dyn Fn(&[u8], &[u8], &[u8]) -> Result<[u8; N], E>>
 	where
 		E: From<crate::crypto::kdf::KdfError>,
@@ -193,66 +255,33 @@ pub trait CryptoProvider {
 			Ok(*arr)
 		})
 	}
+}
 
-	/// Convert this provider into a KeyWrapper function for AES-128 KEK (16 bytes).
-	#[cfg(all(feature = "aead", feature = "transport"))]
-	fn as_key_wrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
-	where
-		E: From<crate::transport::handshake::HandshakeError>,
-	{
-		impl_key_wrapper!(E, aes::Aes128, 16)
-	}
+/// Provides elliptic curve operations.
+///
+/// Isolates curve-specific functionality (ECDH, key generation).
+#[cfg(feature = "ecdh")]
+pub trait CurveProvider {
+	type Curve: elliptic_curve::Curve + elliptic_curve::CurveArithmetic;
+}
 
-	/// Convert this provider into a KeyWrapper function for AES-192 KEK (24 bytes).
-	#[cfg(all(feature = "aead", feature = "transport"))]
-	fn as_key_wrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
-	where
-		E: From<crate::transport::handshake::HandshakeError>,
-	{
-		impl_key_wrapper!(E, aes::Aes192, 24)
-	}
-
-	/// Convert this provider into a KeyWrapper function for AES-256 KEK (32 bytes).
-	#[cfg(all(feature = "aead", feature = "transport"))]
-	fn as_key_wrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
-	where
-		E: From<crate::transport::handshake::HandshakeError>,
-	{
-		impl_key_wrapper!(E, aes::Aes256, 32)
-	}
-
-	/// Convert this provider into a KeyUnwrapper function for AES-128 KEK (16 bytes).
-	///
-	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
-	#[cfg(all(feature = "aead", feature = "transport"))]
-	fn as_key_unwrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
-	where
-		E: From<crate::transport::handshake::HandshakeError>,
-	{
-		impl_key_unwrapper!(E, aes::Aes128, 16)
-	}
-
-	/// Convert this provider into a KeyUnwrapper function for AES-192 KEK (24 bytes).
-	///
-	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
-	#[cfg(all(feature = "aead", feature = "transport"))]
-	fn as_key_unwrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
-	where
-		E: From<crate::transport::handshake::HandshakeError>,
-	{
-		impl_key_unwrapper!(E, aes::Aes192, 24)
-	}
-
-	/// Convert this provider into a KeyUnwrapper function for AES-256 KEK (32 bytes).
-	///
-	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
-	#[cfg(all(feature = "aead", feature = "transport"))]
-	fn as_key_unwrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
-	where
-		E: From<crate::transport::handshake::HandshakeError>,
-	{
-		impl_key_unwrapper!(E, aes::Aes256, 32)
-	}
+/// Binds concrete implementations to the metadata in a `SecurityProfile`.
+///
+/// This is a convenience trait that composes all role-based provider traits.
+/// Components can use specific role traits (e.g., `SigningProvider + DigestProvider`)
+/// instead of requiring the full `CryptoProvider` to reduce trait bound complexity.
+#[cfg(all(
+	feature = "digest",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+pub trait CryptoProvider:
+	Default + Clone + DigestProvider + AeadProvider + SigningProvider + KdfProviderTrait + CurveProvider
+{
+	type Profile: SecurityProfile + Default;
+	fn profile(&self) -> &Self::Profile;
 }
 
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
@@ -279,22 +308,38 @@ pub struct DefaultCryptoProvider {
 	profile: DefaultSecurityProfile,
 }
 
+// Implement role traits for DefaultCryptoProvider
+#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+impl DigestProvider for DefaultCryptoProvider {
+	type Digest = Sha3_256;
+}
+
+#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+impl AeadProvider for DefaultCryptoProvider {
+	type AeadCipher = Aes256Gcm;
+	type AeadOid = Aes256GcmOid;
+}
+
+#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+impl SigningProvider for DefaultCryptoProvider {
+	type Signature = Secp256k1Signature;
+	type SigningKey = Secp256k1SigningKey;
+	type VerifyingKey = Secp256k1VerifyingKey;
+}
+
+#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+impl KdfProviderTrait for DefaultCryptoProvider {
+	type Kdf = HkdfSha3_256;
+}
+
+#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+impl CurveProvider for DefaultCryptoProvider {
+	type Curve = k256::Secp256k1;
+}
+
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 impl CryptoProvider for DefaultCryptoProvider {
 	type Profile = DefaultSecurityProfile;
-	#[cfg(feature = "digest")]
-	type Digest = Sha3_256;
-	#[cfg(feature = "kdf")]
-	type Kdf = HkdfSha3_256;
-	#[cfg(feature = "aead")]
-	type AeadCipher = Aes256Gcm;
-	#[cfg(feature = "signature")]
-	type Signature = Secp256k1Signature;
-	#[cfg(feature = "signature")]
-	type SigningKey = Secp256k1SigningKey;
-	#[cfg(feature = "signature")]
-	type VerifyingKey = Secp256k1VerifyingKey;
-	type Curve = k256::Secp256k1;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile

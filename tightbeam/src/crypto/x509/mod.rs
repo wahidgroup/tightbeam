@@ -6,10 +6,14 @@ pub mod error;
 use core::time::Duration;
 
 use crate::asn1::GeneralizedTime;
+use crate::cms::signed_data::SignerIdentifier;
+use crate::crypto::hash::Digest;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::sign::Verifier;
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::der::Encode;
+use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::der::{asn1::OctetString, Encode};
+use crate::spki::EncodePublicKey;
 
 /// Trait for certificate validation strategies.
 ///
@@ -202,6 +206,41 @@ pub fn validate_certificate_expiry(cert: &Certificate) -> Result<(), Certificate
 #[cfg(all(not(feature = "std"), not(feature = "time")))]
 pub fn validate_certificate_expiry(_cert: &Certificate) -> Result<(), CertificateValidationError> {
 	Err(CertificateValidationError::InvalidTimestamp)
+}
+
+/// Compute a SubjectKeyIdentifier-based SignerIdentifier from a verifying key.
+///
+/// This helper extracts the public key DER encoding, hashes it with the provided
+/// digest algorithm, truncates to 20 bytes (RFC 5280 recommendation), and wraps
+/// it in a SignerIdentifier::SubjectKeyIdentifier variant.
+///
+/// # Type Parameters
+/// - `D`: Digest algorithm (e.g., SHA3-256)
+/// - `V`: Verifying key type that can be DER-encoded
+///
+/// # Returns
+/// `SignerIdentifier::SubjectKeyIdentifier` for use in CMS SignedData structures
+///
+/// # Example
+/// ```ignore
+/// use sha3::Sha3_256;
+/// let signer_id = compute_signer_identifier::<Sha3_256, _>(&verifying_key)?;
+/// ```
+pub fn compute_signer_identifier<D, V>(verifying_key: &V) -> Result<SignerIdentifier, CertificateValidationError>
+where
+	D: Digest,
+	V: EncodePublicKey,
+{
+	let public_key_der = verifying_key.to_public_key_der()?;
+
+	let mut hasher = D::new();
+	Digest::update(&mut hasher, public_key_der.as_bytes());
+	let digest_bytes = Digest::finalize(hasher);
+
+	let skid_octets = OctetString::new(&digest_bytes.as_slice()[..20])?;
+	let skid = SubjectKeyIdentifier::from(skid_octets);
+
+	Ok(SignerIdentifier::SubjectKeyIdentifier(skid))
 }
 
 #[cfg(test)]

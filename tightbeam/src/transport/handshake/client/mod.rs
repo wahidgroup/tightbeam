@@ -2,18 +2,13 @@
 //!
 //! This module contains client-specific handshake implementations and utilities.
 
-#[cfg(all(feature = "builder", feature = "aead", feature = "signature"))]
+#[cfg(feature = "handshake_cms")]
 mod cms;
 
-#[cfg(all(feature = "builder", feature = "aead", feature = "signature"))]
+#[cfg(feature = "handshake_cms")]
 pub use cms::CmsHandshakeClient;
 
-#[cfg(all(
-	feature = "builder",
-	feature = "aead",
-	feature = "signature",
-	feature = "secp256k1"
-))]
+#[cfg(all(feature = "handshake_cms", feature = "secp256k1"))]
 pub use cms::CmsHandshakeClientSecp256k1;
 
 #[cfg(feature = "x509")]

@@ -3,8 +3,6 @@
 //! Implements the client side of the TightBeam handshake protocol using
 //! CMS builders and processors.
 
-#![cfg(all(feature = "builder", feature = "aead", feature = "signature"))]
-
 use core::future::Future;
 use core::pin::Pin;
 
@@ -34,7 +32,6 @@ use crate::transport::handshake::builders::{
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::{ClientStateTransition, HandshakeState, StateTransition};
-use crate::transport::handshake::utils::aes_256_gcm_algorithm;
 use crate::transport::handshake::ClientHandshakeProtocol;
 
 /// Client-side CMS handshake orchestrator.
@@ -64,15 +61,11 @@ where
 
 impl<P> CmsHandshakeClient<P>
 where
-	P: CryptoProvider + Clone,
+	P: CryptoProvider,
 	P::Curve: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
 	<P::Curve as elliptic_curve::Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
-	P::Signature: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync + 'static,
-	P::VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + Send + Sync + 'static,
-	P::SigningKey: Signer<P::Signature> + Keypair<VerifyingKey = P::VerifyingKey> + Clone + Send + Sync + 'static,
-	P::Digest: Digest + AssociatedOid + Send + Sync + 'static,
 {
 	/// Create a new CMS handshake client.
 	///
@@ -174,17 +167,9 @@ where
 		&self,
 		server_verifying_key: &P::VerifyingKey,
 	) -> Result<SignerIdentifier, HandshakeError> {
-		let public_key_der_bytes = server_verifying_key.to_public_key_der()?;
-
-		let mut hasher = P::Digest::new();
-		Digest::update(&mut hasher, public_key_der_bytes.as_bytes());
-
-		let subject_key_identifier_bytes = Digest::finalize(hasher);
-		let subject_key_identifier_octets = OctetString::new(&subject_key_identifier_bytes.as_slice()[..20])?;
-		let subject_key_identifier = SubjectKeyIdentifier::from(subject_key_identifier_octets);
-
-		let expected_signer_identifier = SignerIdentifier::SubjectKeyIdentifier(subject_key_identifier);
-		Ok(expected_signer_identifier)
+		Ok(crate::crypto::x509::compute_signer_identifier::<P::Digest, _>(
+			server_verifying_key,
+		)?)
 	}
 
 	/// Verify the signature and content of the SignedData.
@@ -246,7 +231,7 @@ where
 
 		// 7. Create EnvelopedData builder with generic curve type
 		let mut enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
-		enveloped_builder = enveloped_builder.with_content_encryption_alg(aes_256_gcm_algorithm());
+		enveloped_builder = enveloped_builder.with_content_encryption_alg(self.provider.to_aead_algorithm_identifier());
 
 		// 8. Add SecurityOffer as unprotected attribute if configured
 		if let Some(ref offer) = self.security_offer {
@@ -346,15 +331,11 @@ where
 
 impl<P> ClientHandshakeProtocol for CmsHandshakeClient<P>
 where
-	P: CryptoProvider + Clone + Send + Sync + 'static,
+	P: CryptoProvider + Send + Sync + 'static,
 	P::Curve: Curve + CurveArithmetic + Send + Sync,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
-	P::Signature: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync + 'static,
-	P::VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + Send + Sync + 'static,
-	P::SigningKey: Signer<P::Signature> + Keypair<VerifyingKey = P::VerifyingKey> + Clone + Send + Sync + 'static,
-	P::Digest: Digest + AssociatedOid + Send + Sync + 'static,
 {
 	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;

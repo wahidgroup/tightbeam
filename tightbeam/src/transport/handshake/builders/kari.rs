@@ -5,23 +5,26 @@
 
 use super::error::KariBuilderError;
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
-use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
+use crate::crypto::profiles::DefaultCryptoProvider;
+// Centralized cryptographic operations now live in `handshake::kari`.
+// This builder delegates wrapping to the unified `kari_wrap` function.
 use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 use crate::der::asn1::BitString;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::error::HandshakeError;
 
 #[cfg(all(feature = "builder", feature = "aead"))]
-use cms::builder::{Error as CmsBuilderError, RecipientInfoBuilder, RecipientInfoType};
+use crate::cms::builder::{Error as CmsBuilderError, RecipientInfoBuilder, RecipientInfoType};
 #[cfg(all(feature = "builder", feature = "aead"))]
-use cms::content_info::CmsVersion;
+use crate::cms::content_info::CmsVersion;
 #[cfg(all(feature = "builder", feature = "aead"))]
-use cms::enveloped_data::{
+use crate::cms::enveloped_data::{
 	EncryptedKey, KeyAgreeRecipientIdentifier, KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, OriginatorPublicKey,
 	RecipientEncryptedKey, RecipientInfo, UserKeyingMaterial,
 };
-#[cfg(feature = "zeroize")]
-use zeroize::Zeroize;
+#[cfg(all(feature = "builder", feature = "aead"))]
+use crate::crypto::profiles::CryptoProvider;
+use crate::transport::handshake::kari::kari_wrap;
 
 /// Builder for `KeyAgreeRecipientInfo` using ECDH + HKDF + key wrapping.
 ///
@@ -35,7 +38,7 @@ use zeroize::Zeroize;
 #[cfg(all(feature = "builder", feature = "aead"))]
 pub struct TightBeamKariBuilder<P>
 where
-	P: crate::crypto::profiles::CryptoProvider,
+	P: CryptoProvider,
 {
 	/// Sender's ephemeral private key for ECDH
 	sender_priv: Option<SecretKey<P::Curve>>,
@@ -134,37 +137,6 @@ where
 		self
 	}
 
-	/// Perform ECDH and derive shared secret.
-	fn derive_shared_secret(&self) -> Result<Vec<u8>, KariBuilderError> {
-		let sender_priv = self.sender_priv.as_ref().ok_or(KariBuilderError::MissingSenderPrivateKey)?;
-		let recipient_pub = self.recipient_pub.as_ref().ok_or(KariBuilderError::MissingRecipientPublicKey)?;
-
-		let shared_secret = diffie_hellman(sender_priv.to_nonzero_scalar(), recipient_pub.as_affine());
-		Ok(shared_secret.raw_secret_bytes().as_ref().to_vec())
-	}
-
-	/// Derive key-encryption key (KEK) using provider's KDF.
-	///
-	/// Salt = UKM (clientNonce || serverNonce)
-	/// Info = self.kdf_info (e.g., `TIGHTBEAM_KARI_KDF_INFO`)
-	/// Output = 32 bytes (AES-256 KEK)
-	fn derive_kek(&self, shared_secret: &[u8]) -> Result<[u8; 32], KariBuilderError> {
-		let ukm = self.ukm.as_ref().ok_or(KariBuilderError::MissingUkm)?;
-		let salt = ukm.as_bytes();
-		let kdf = self.provider.as_key_deriver::<HandshakeError, 32>();
-		kdf(shared_secret, salt, self.kdf_info).map_err(|_| KariBuilderError::MissingUkm)
-	}
-
-	/// Wrap content-encryption key using provider's key wrapper function.
-	///
-	/// # Parameters
-	/// - `cek`: Content-encryption key to wrap
-	/// - `kek`: Key-encryption key (32 bytes for AES-256)
-	fn wrap_cek(&self, cek: &[u8], kek: &[u8; 32]) -> Result<Vec<u8>, HandshakeError> {
-		let key_wrapper = self.provider.as_key_wrapper_32::<HandshakeError>();
-		key_wrapper(cek, kek)
-	}
-
 	/// Build originator field from sender's public key SPKI.
 	fn build_originator(&self) -> Result<OriginatorIdentifierOrKey, KariBuilderError> {
 		let sender_pub_spki = self
@@ -210,7 +182,7 @@ where
 	feature = "kdf",
 	feature = "sha3"
 ))]
-impl Default for TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
+impl Default for TightBeamKariBuilder<DefaultCryptoProvider> {
 	fn default() -> Self {
 		Self {
 			sender_priv: None,
@@ -220,7 +192,7 @@ impl Default for TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProv
 			ukm: None,
 			key_enc_alg: None,
 			kdf_info: TIGHTBEAM_KARI_KDF_INFO,
-			provider: crate::crypto::profiles::DefaultCryptoProvider::default(),
+			provider: DefaultCryptoProvider::default(),
 		}
 	}
 }
@@ -228,7 +200,7 @@ impl Default for TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProv
 #[cfg(all(feature = "builder", feature = "aead"))]
 impl<P> RecipientInfoBuilder for TightBeamKariBuilder<P>
 where
-	P: crate::crypto::profiles::CryptoProvider,
+	P: CryptoProvider,
 {
 	fn recipient_info_type(&self) -> RecipientInfoType {
 		RecipientInfoType::Kari
@@ -243,23 +215,28 @@ where
 		self.validate()
 			.map_err(|e| CmsBuilderError::Builder(format!("Validation failed: {:?}", e)))?;
 
-		// 1. Perform ECDH
-		let shared_secret = self
-			.derive_shared_secret()
-			.map_err(|e| CmsBuilderError::Builder(format!("ECDH failed: {:?}", e)))?;
-
-		// 2. Derive KEK via configured KDF
-		let mut kek = self
-			.derive_kek(&shared_secret)
-			.map_err(|e| CmsBuilderError::Builder(format!("HKDF failed: {:?}", e)))?;
-
-		// 3. Wrap CEK with KEK
-		let encrypted_key_bytes = self
-			.wrap_cek(content_encryption_key, &kek)
-			.map_err(|e| CmsBuilderError::Builder(format!("Key wrap failed: {:?}", e)))?;
-
-		#[cfg(feature = "zeroize")]
-		kek.zeroize();
+		// 1-3. Perform ECDH + HKDF + AES Key Wrap via centralized core
+		let sender_priv = self
+			.sender_priv
+			.as_ref()
+			.ok_or_else(|| CmsBuilderError::Builder("sender_priv not set".into()))?;
+		let recipient_pub = self
+			.recipient_pub
+			.as_ref()
+			.ok_or_else(|| CmsBuilderError::Builder("recipient_pub not set".into()))?;
+		let ukm = self
+			.ukm
+			.as_ref()
+			.ok_or_else(|| CmsBuilderError::Builder("ukm not set".into()))?;
+		let encrypted_key_bytes = kari_wrap(
+			&self.provider,
+			sender_priv,
+			recipient_pub,
+			ukm.as_bytes(),
+			self.kdf_info,
+			content_encryption_key,
+		)
+		.map_err(|e| CmsBuilderError::Builder(format!("kari_wrap failed: {:?}", e)))?;
 
 		// 4. Build encrypted key OctetString
 		let encrypted_key = EncryptedKey::new(encrypted_key_bytes).map_err(CmsBuilderError::Asn1)?;
