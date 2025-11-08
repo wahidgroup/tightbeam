@@ -292,7 +292,10 @@ macro_rules! impl_tcp_common {
 					HandshakeProtocolKind::Ecies => {
 						let aad = self.aad_domain_tag.clone();
 						Box::new(
-							$crate::transport::handshake::client::EciesHandshakeClientSecp256k1::new(aad)
+							$crate::transport::handshake::client::EciesHandshakeClientSecp256k1::new(
+								$crate::crypto::profiles::DefaultCryptoProvider::default(),
+								aad,
+							)
 						)
 					}
 					#[cfg(all(
@@ -457,6 +460,7 @@ macro_rules! impl_tcp_common {
 
 							Box::new(
 								$crate::transport::handshake::server::EciesHandshakeServer::new(
+									$crate::crypto::profiles::DefaultCryptoProvider::default(),
 									std::sync::Arc::clone(&signatory),
 									cert,
 									aad

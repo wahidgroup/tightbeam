@@ -3,9 +3,7 @@
 //! Implements the server side of the TightBeam handshake protocol using
 //! CMS builders and processors.
 //!
-//! Generic over elliptic curve type to support multiple curves without
-//! coupling to secp256k1. The curve type is used only for client certificate
-//! verification, while server key operations use the trait abstraction.
+//! Generic over `P: CryptoProvider` for cryptographic operations.
 
 #![cfg(all(feature = "builder", feature = "aead", feature = "signature"))]
 
@@ -17,13 +15,12 @@ use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use core::marker::PhantomData;
-
 use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::hash::digest::Digest;
-use crate::crypto::hash::Sha3_256;
+use crate::crypto::negotiation::select_profile;
+use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -43,50 +40,67 @@ use crate::x509::Certificate;
 
 /// Server-side CMS handshake orchestrator.
 ///
-/// Generic over elliptic curve type `C` to support multiple curves.
+/// Generic over `P: CryptoProvider` for cryptographic operations.
 ///
 /// Manages the complete server handshake flow:
 /// 1. Receives and decrypts KeyExchange (EnvelopedData with KARI)
 /// 2. Sends server Finished (SignedData)
 /// 3. Receives and verifies client Finished (SignedData)
-pub struct CmsHandshakeServer<C, Sig, Vk, D>
+///
+/// Supports cryptographic profile negotiation via `supported_profiles` configuration.
+pub struct CmsHandshakeServer<P>
 where
-	C: Curve + CurveArithmetic,
-	Sig: SignatureEncoding + 'static,
-	Vk: Verifier<Sig> + 'static,
-	D: Digest + AssociatedOid,
+	P: CryptoProvider,
 {
 	state: ServerStateTransition,
 	server_key: Arc<dyn ServerHandshakeKey>,
 	client_cert: Option<Certificate>,
 	transcript_hash: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
-	_phantom: PhantomData<(C, Sig, Vk, D)>,
+	supported_profiles: Vec<SecurityProfileDesc>,
+	selected_profile: Option<SecurityProfileDesc>,
+	#[allow(dead_code)]
+	provider: P,
 }
 
-impl<C, Sig, Vk, D> CmsHandshakeServer<C, Sig, Vk, D>
+impl<P> CmsHandshakeServer<P>
 where
-	C: Curve + CurveArithmetic,
-	C::FieldBytesSize: ModulusSize,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-	Sig: SignatureEncoding,
-	Vk: Verifier<Sig> + From<PublicKey<C>> + EncodePublicKey,
-	D: Digest + AssociatedOid,
+	P: CryptoProvider,
+	P::Curve: Curve + CurveArithmetic,
+	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	P::Signature: SignatureEncoding + 'static,
+	P::VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + 'static,
+	P::Digest: Digest + AssociatedOid + 'static,
 {
 	/// Create a new CMS handshake server.
 	///
 	/// # Parameters
+	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `server_key`: The server's signing key for authentication (trait object)
 	/// - `transcript_hash`: The handshake transcript hash (from previous handshake messages)
-	pub fn new(server_key: Arc<dyn ServerHandshakeKey>, transcript_hash: Vec<u8>) -> Self {
+	pub fn new(provider: P, server_key: Arc<dyn ServerHandshakeKey>, transcript_hash: Vec<u8>) -> Self {
 		Self {
 			state: ServerStateTransition::new(),
 			server_key,
 			client_cert: None,
 			transcript_hash,
 			session_key: None,
-			_phantom: PhantomData,
+			supported_profiles: Vec::new(),
+			selected_profile: None,
+			provider,
 		}
+	}
+
+	/// Configures supported cryptographic profiles for negotiation.
+	///
+	/// When profiles are configured, the server will select the first mutually
+	/// supported profile from client's offer. If no profiles are configured or
+	/// client sends no offer, the server uses dealer's choice mode (default profile).
+	#[must_use]
+	pub fn with_supported_profiles(mut self, profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>) -> Self {
+		self.supported_profiles = profiles;
+		self
 	}
 
 	/// Set the client certificate (optional, for mutual authentication).
@@ -96,6 +110,13 @@ where
 
 		self.client_cert = Some(cert);
 		Ok(())
+	}
+
+	/// Get the selected security profile after negotiation.
+	///
+	/// Returns `None` if no negotiation occurred (no profiles configured).
+	pub fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+		self.selected_profile
 	}
 
 	/// Validate that the current state matches the expected state.
@@ -112,20 +133,23 @@ where
 	}
 
 	/// Extract the client's verifying key from certificate.
-	fn extract_client_verifying_key(&self) -> Result<Vk, HandshakeError> {
+	fn extract_client_verifying_key(&self) -> Result<P::VerifyingKey, HandshakeError> {
 		let client_cert = self.get_client_certificate()?;
-		let client_public_key = PublicKey::<C>::from_sec1_bytes(
+		let client_public_key = PublicKey::<P::Curve>::from_sec1_bytes(
 			client_cert
 				.tbs_certificate
 				.subject_public_key_info
 				.subject_public_key
 				.raw_bytes(),
 		)?;
-		Ok(Vk::from(client_public_key))
+		Ok(P::VerifyingKey::from(client_public_key))
 	}
 
 	/// Compute the signer identifier from the client's verifying key.
-	fn compute_client_signer_identifier(&self, client_verifying_key: &Vk) -> Result<SignerIdentifier, HandshakeError> {
+	fn compute_client_signer_identifier(
+		&self,
+		client_verifying_key: &P::VerifyingKey,
+	) -> Result<SignerIdentifier, HandshakeError> {
 		let public_key_der_bytes = client_verifying_key.to_public_key_der()?;
 
 		let mut hasher = sha3::Sha3_256::new();
@@ -143,17 +167,17 @@ where
 	fn verify_client_signature(
 		&self,
 		signed_data_der: &[u8],
-		client_verifying_key: Vk,
+		client_verifying_key: P::VerifyingKey,
 		expected_sid: SignerIdentifier,
 	) -> Result<Vec<u8>, HandshakeError> {
-		let verifier = EcdsaSignatureVerifier::<Vk, Sig, Sha3_256>::from_verifying_key_with_sid(
+		let verifier = EcdsaSignatureVerifier::<P::VerifyingKey, P::Signature, P::Digest>::from_verifying_key_with_sid(
 			client_verifying_key,
 			expected_sid,
 		);
 		let processor = TightBeamSignedDataProcessor::new(verifier);
 
 		// Verify content matches our transcript hash
-		let digest_oid = D::OID;
+		let digest_oid = P::Digest::OID;
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
 		if verified_content != self.transcript_hash {
 			Err(HandshakeError::SignatureVerificationFailed)
@@ -175,15 +199,52 @@ where
 		self.validate_expected_state(HandshakeState::Init)?;
 
 		// 2. Transition to received state
-		self.state.transition(HandshakeState::KeyExchangeReceived)?;
+		self.state.dispatch(HandshakeState::KeyExchangeReceived)?;
 
 		// 3. Decode EnvelopedData to access encrypted content
 		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 
-		// 4. Decrypt KARI and get CEK (Content Encryption Key)
+		// 4. Extract and process SecurityOffer if present (negotiation)
+		if let Some(unprotected_attrs) = &enveloped_data.unprotected_attrs {
+			// Convert x509_cert::attr::Attributes to HandshakeAttribute
+			let handshake_attrs: Result<Vec<_>, HandshakeError> = unprotected_attrs
+				.iter()
+				.map(|attr| {
+					Ok(crate::transport::handshake::attributes::HandshakeAttribute {
+						attr_type: attr.oid.clone(),
+						attr_values: attr.values.clone().into(),
+					})
+				})
+				.collect();
+			let handshake_attrs = handshake_attrs?;
+
+			// Try to find SecurityOffer
+			if let Ok(offer_attr) = crate::transport::handshake::attributes::find(
+				&handshake_attrs,
+				&crate::asn1::transport::HANDSHAKE_SECURITY_OFFER_OID,
+			) {
+				let offer = crate::transport::handshake::attributes::extract_security_offer(offer_attr)?;
+
+				// Profile negotiation
+				if self.supported_profiles.is_empty() {
+					return Err(HandshakeError::InvalidState); // Server must configure profiles
+				}
+
+				let selected = select_profile(&offer, &self.supported_profiles)?;
+				self.selected_profile = Some(selected);
+			} else if !self.supported_profiles.is_empty() {
+				// No offer from client, use dealer's choice (first profile)
+				self.selected_profile = Some(self.supported_profiles[0]);
+			}
+		} else if !self.supported_profiles.is_empty() {
+			// No unprotected attributes at all, use dealer's choice
+			self.selected_profile = Some(self.supported_profiles[0]);
+		}
+
+		// 5. Decrypt KARI and get CEK (Content Encryption Key)
 		let content_encryption_key = self.server_key.decrypt_kari(enveloped_data_der, TIGHTBEAM_KARI_KDF_INFO, 0)?;
 
-		// 5. Decrypt the actual content using the CEK
+		// 6. Decrypt the actual content using the CEK
 		let encrypted_content_info = &enveloped_data.encrypted_content;
 		let ciphertext_bytes = encrypted_content_info
 			.encrypted_content
@@ -191,10 +252,10 @@ where
 			.ok_or_else(|| HandshakeError::MissingEncryptedContent)?
 			.as_bytes();
 
-		// 6. Use the utility function for AES-GCM decryption
+		// 7. Use the utility function for AES-GCM decryption
 		let session_key_bytes = aes_gcm_decrypt(&content_encryption_key, ciphertext_bytes, None)?;
 
-		// 7. Store session key securely
+		// 8. Store session key securely
 		self.session_key = Some(Secret::from(session_key_bytes));
 
 		Ok(())
@@ -218,7 +279,7 @@ where
 				.build_cms_signed_data(&self.transcript_hash, &digest_alg, &signature_alg)?;
 
 		// 4. Transition state
-		self.state.transition(HandshakeState::ServerFinishedSent)?;
+		self.state.dispatch(HandshakeState::ServerFinishedSent)?;
 
 		Ok(signed_data_der)
 	}
@@ -243,7 +304,7 @@ where
 			self.verify_client_signature(signed_data_der, client_verifying_key, expected_signer_identifier)?;
 
 		// 4. Transition state
-		self.state.transition(HandshakeState::ClientFinishedReceived)?;
+		self.state.dispatch(HandshakeState::ClientFinishedReceived)?;
 
 		Ok(verified_content)
 	}
@@ -254,7 +315,7 @@ where
 		self.validate_expected_state(HandshakeState::ClientFinishedReceived)?;
 
 		// 2. Transition to complete
-		self.state.transition(HandshakeState::Complete)?;
+		self.state.dispatch(HandshakeState::Complete)?;
 
 		Ok(())
 	}
@@ -281,14 +342,15 @@ where
 // ServerHandshakeProtocol Implementation
 // ============================================================================
 
-impl<C, Sig, Vk, D> ServerHandshakeProtocol for CmsHandshakeServer<C, Sig, Vk, D>
+impl<P> ServerHandshakeProtocol for CmsHandshakeServer<P>
 where
-	C: Curve + CurveArithmetic,
-	C::FieldBytesSize: ModulusSize,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-	Sig: SignatureEncoding + Send + Sync,
-	Vk: signature::Verifier<Sig> + From<PublicKey<C>> + EncodePublicKey + Send + Sync,
-	D: Digest + AssociatedOid + Send + Sync,
+	P: CryptoProvider + Send + Sync,
+	P::Curve: Curve + CurveArithmetic,
+	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	P::Signature: SignatureEncoding + Send + Sync + 'static,
+	P::VerifyingKey: Verifier<P::Signature> + From<PublicKey<P::Curve>> + EncodePublicKey + Send + Sync + 'static,
+	P::Digest: Digest + AssociatedOid + Send + Sync + 'static,
 {
 	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
@@ -338,12 +400,7 @@ where
 /// This is the default curve used in TightBeam and is provided as a
 /// convenient alias for the generic `CmsHandshakeServer`.
 #[cfg(feature = "secp256k1")]
-pub type CmsHandshakeServerSecp256k1 = CmsHandshakeServer<
-	crate::crypto::sign::ecdsa::k256::Secp256k1,
-	crate::crypto::sign::ecdsa::Secp256k1Signature,
-	crate::crypto::sign::ecdsa::Secp256k1VerifyingKey,
-	crate::crypto::hash::Sha3_256,
->;
+pub type CmsHandshakeServerSecp256k1 = CmsHandshakeServer<crate::crypto::profiles::DefaultCryptoProvider>;
 
 #[cfg(test)]
 mod tests {
@@ -446,7 +503,11 @@ mod tests {
 		fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
 			let server_key = Secp256k1SigningKey::random(&mut OsRng);
 			let transcript_hash = vec![1u8; 32];
-			let mut server = CmsHandshakeServerSecp256k1::new(Arc::new(server_key), transcript_hash);
+			let mut server = CmsHandshakeServerSecp256k1::new(
+				DefaultCryptoProvider::default(),
+				Arc::new(server_key),
+				transcript_hash,
+			);
 
 			// Can't build server finished before processing key exchange
 			let result = server.build_server_finished();

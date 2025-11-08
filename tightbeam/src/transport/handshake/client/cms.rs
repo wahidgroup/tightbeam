@@ -12,7 +12,8 @@ use crate::asn1::AES_256_WRAP_OID;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
 use crate::crypto::hash::Digest;
-use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::negotiation::SecurityOffer;
+use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
@@ -45,6 +46,8 @@ use crate::transport::handshake::ClientHandshakeProtocol;
 /// 1. Sends KeyExchange (EnvelopedData with KARI)
 /// 2. Receives and verifies server Finished (SignedData)
 /// 3. Sends client Finished (SignedData)
+///
+/// Supports cryptographic profile negotiation via optional `security_offer` field.
 pub struct CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
@@ -54,6 +57,8 @@ where
 	server_cert: Certificate,
 	transcript_hash: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
+	security_offer: Option<SecurityOffer>,
+	selected_profile: Option<SecurityProfileDesc>,
 	provider: P,
 }
 
@@ -83,8 +88,27 @@ where
 			server_cert,
 			transcript_hash,
 			session_key: None,
+			security_offer: None, // No offer = dealer's choice mode
+			selected_profile: None,
 			provider,
 		}
+	}
+
+	/// Configures the security offer for negotiation.
+	///
+	/// When configured, the client will send this offer to the server,
+	/// and the server will select a mutually supported profile.
+	#[must_use]
+	pub fn with_security_offer(mut self, offer: SecurityOffer) -> Self {
+		self.security_offer = Some(offer);
+		self
+	}
+
+	/// Get the selected security profile after negotiation.
+	///
+	/// Returns `None` if no negotiation occurred or not yet determined.
+	pub fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+		self.selected_profile
 	}
 
 	/// Validate that the current state matches the expected state.
@@ -221,15 +245,21 @@ where
 			.with_key_enc_alg(key_enc_alg);
 
 		// 7. Create EnvelopedData builder with generic curve type
-		let enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
-		let enveloped_builder = enveloped_builder.with_content_encryption_alg(aes_256_gcm_algorithm());
+		let mut enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
+		enveloped_builder = enveloped_builder.with_content_encryption_alg(aes_256_gcm_algorithm());
 
-		// 8. Build and encode
+		// 8. Add SecurityOffer as unprotected attribute if configured
+		if let Some(ref offer) = self.security_offer {
+			let offer_attr = crate::transport::handshake::attributes::encode_security_offer(offer)?;
+			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
+		}
+
+		// 9. Build and encode
 		let enveloped_data_der = enveloped_builder.build_der(&session_key, None)?;
 
-		// 9. Store session key and transition state
+		// 10. Store session key and transition state
 		self.session_key = Some(Secret::from(session_key));
-		self.state.transition(HandshakeState::KeyExchangeSent)?;
+		self.state.dispatch(HandshakeState::KeyExchangeSent)?;
 
 		Ok(enveloped_data_der)
 	}
@@ -254,7 +284,7 @@ where
 			self.verify_signature(signed_data_der, server_verifying_key, expected_signer_identifier)?;
 
 		// 4. Transition state
-		self.state.transition(HandshakeState::ServerFinishedReceived)?;
+		self.state.dispatch(HandshakeState::ServerFinishedReceived)?;
 
 		Ok(verified_content)
 	}
@@ -276,7 +306,7 @@ where
 		let signed_data_der = builder.build_der(&self.transcript_hash)?;
 
 		// 4. Transition state
-		self.state.transition(HandshakeState::ClientFinishedSent)?;
+		self.state.dispatch(HandshakeState::ClientFinishedSent)?;
 
 		Ok(signed_data_der)
 	}
@@ -287,7 +317,7 @@ where
 		self.validate_expected_state(HandshakeState::ClientFinishedSent)?;
 
 		// 2. Transition to complete
-		self.state.transition(HandshakeState::Complete)?;
+		self.state.dispatch(HandshakeState::Complete)?;
 
 		Ok(())
 	}

@@ -66,10 +66,10 @@ pub enum HandshakeMessageType {
 /// State transition validation.
 pub trait StateTransition {
 	/// Validate a state transition is allowed.
-	fn can_transition(&self, from: HandshakeState, to: HandshakeState) -> bool;
+	fn can_dispatch(&self, from: HandshakeState, to: HandshakeState) -> bool;
 
 	/// Perform a state transition.
-	fn transition(&mut self, to: HandshakeState) -> Result<(), HandshakeError>;
+	fn dispatch(&mut self, to: HandshakeState) -> Result<(), HandshakeError>;
 
 	/// Get current state.
 	fn state(&self) -> HandshakeState;
@@ -94,24 +94,24 @@ impl Default for ClientStateTransition {
 }
 
 impl StateTransition for ClientStateTransition {
-	fn can_transition(&self, from: HandshakeState, to: HandshakeState) -> bool {
+	fn can_dispatch(&self, from: HandshakeState, to: HandshakeState) -> bool {
 		use HandshakeState::*;
 		matches!(
 			(from, to),
 			(Init, ClientHelloSent)
-				| (Init, KeyExchangeSent) // Direct transition for simplified handshake
+				| (Init, KeyExchangeSent)
 				| (ClientHelloSent, ServerHelloReceived)
 				| (ServerHelloReceived, KeyExchangeSent)
 				| (KeyExchangeSent, ServerFinishedReceived)
-				| (KeyExchangeSent, Complete) // Direct completion for ECIES-style handshake
+				| (KeyExchangeSent, Complete)
 				| (ServerFinishedReceived, ClientFinishedSent)
 				| (ClientFinishedSent, Complete)
 				| (_, Failed)
 		)
 	}
 
-	fn transition(&mut self, to: HandshakeState) -> Result<(), HandshakeError> {
-		if self.can_transition(self.state, to) {
+	fn dispatch(&mut self, to: HandshakeState) -> Result<(), HandshakeError> {
+		if self.can_dispatch(self.state, to) {
 			self.state = to;
 			Ok(())
 		} else {
@@ -143,24 +143,24 @@ impl Default for ServerStateTransition {
 }
 
 impl StateTransition for ServerStateTransition {
-	fn can_transition(&self, from: HandshakeState, to: HandshakeState) -> bool {
+	fn can_dispatch(&self, from: HandshakeState, to: HandshakeState) -> bool {
 		use HandshakeState::*;
 		matches!(
 			(from, to),
 			(Init, ServerHelloReceived)
-				| (Init, KeyExchangeReceived) // Direct transition for simplified handshake
+				| (Init, KeyExchangeReceived)
 				| (ServerHelloReceived, ServerHelloSent)
 				| (ServerHelloSent, KeyExchangeReceived)
 				| (KeyExchangeReceived, ServerFinishedSent)
-				| (KeyExchangeReceived, Complete) // Direct completion for ECIES-style handshake
+				| (KeyExchangeReceived, Complete)
 				| (ServerFinishedSent, ClientFinishedReceived)
 				| (ClientFinishedReceived, Complete)
 				| (_, Failed)
 		)
 	}
 
-	fn transition(&mut self, to: HandshakeState) -> Result<(), HandshakeError> {
-		if self.can_transition(self.state, to) {
+	fn dispatch(&mut self, to: HandshakeState) -> Result<(), HandshakeError> {
+		if self.can_dispatch(self.state, to) {
 			self.state = to;
 			Ok(())
 		} else {
@@ -183,14 +183,14 @@ mod tests {
 
 		// Valid transitions
 		assert_eq!(client.state(), HandshakeState::Init);
-		assert!(client.transition(HandshakeState::ClientHelloSent).is_ok());
+		assert!(client.dispatch(HandshakeState::ClientHelloSent).is_ok());
 		assert_eq!(client.state(), HandshakeState::ClientHelloSent);
 
-		assert!(client.transition(HandshakeState::ServerHelloReceived).is_ok());
-		assert!(client.transition(HandshakeState::KeyExchangeSent).is_ok());
-		assert!(client.transition(HandshakeState::ServerFinishedReceived).is_ok());
-		assert!(client.transition(HandshakeState::ClientFinishedSent).is_ok());
-		assert!(client.transition(HandshakeState::Complete).is_ok());
+		assert!(client.dispatch(HandshakeState::ServerHelloReceived).is_ok());
+		assert!(client.dispatch(HandshakeState::KeyExchangeSent).is_ok());
+		assert!(client.dispatch(HandshakeState::ServerFinishedReceived).is_ok());
+		assert!(client.dispatch(HandshakeState::ClientFinishedSent).is_ok());
+		assert!(client.dispatch(HandshakeState::Complete).is_ok());
 
 		assert!(client.state().is_complete());
 	}
@@ -201,12 +201,12 @@ mod tests {
 
 		// Valid transitions
 		assert_eq!(server.state(), HandshakeState::Init);
-		assert!(server.transition(HandshakeState::ServerHelloReceived).is_ok());
-		assert!(server.transition(HandshakeState::ServerHelloSent).is_ok());
-		assert!(server.transition(HandshakeState::KeyExchangeReceived).is_ok());
-		assert!(server.transition(HandshakeState::ServerFinishedSent).is_ok());
-		assert!(server.transition(HandshakeState::ClientFinishedReceived).is_ok());
-		assert!(server.transition(HandshakeState::Complete).is_ok());
+		assert!(server.dispatch(HandshakeState::ServerHelloReceived).is_ok());
+		assert!(server.dispatch(HandshakeState::ServerHelloSent).is_ok());
+		assert!(server.dispatch(HandshakeState::KeyExchangeReceived).is_ok());
+		assert!(server.dispatch(HandshakeState::ServerFinishedSent).is_ok());
+		assert!(server.dispatch(HandshakeState::ClientFinishedReceived).is_ok());
+		assert!(server.dispatch(HandshakeState::Complete).is_ok());
 
 		assert!(server.state().is_complete());
 	}
@@ -216,7 +216,7 @@ mod tests {
 		let mut client = ClientStateTransition::new();
 
 		// Try to skip to an invalid state (Init can go to ClientHelloSent or KeyExchangeSent, but not ServerFinishedReceived)
-		assert!(client.transition(HandshakeState::ServerFinishedReceived).is_err());
+		assert!(client.dispatch(HandshakeState::ServerFinishedReceived).is_err());
 		assert_eq!(client.state(), HandshakeState::Init); // State unchanged
 	}
 
@@ -225,7 +225,7 @@ mod tests {
 		let mut server = ServerStateTransition::new();
 
 		// Try to skip states
-		assert!(server.transition(HandshakeState::ServerFinishedSent).is_err());
+		assert!(server.dispatch(HandshakeState::ServerFinishedSent).is_err());
 		assert_eq!(server.state(), HandshakeState::Init); // State unchanged
 	}
 
@@ -234,8 +234,8 @@ mod tests {
 		let mut client = ClientStateTransition::new();
 
 		// Can transition to Failed from any state
-		assert!(client.transition(HandshakeState::ClientHelloSent).is_ok());
-		assert!(client.transition(HandshakeState::Failed).is_ok());
+		assert!(client.dispatch(HandshakeState::ClientHelloSent).is_ok());
+		assert!(client.dispatch(HandshakeState::Failed).is_ok());
 		assert!(client.state().is_failed());
 	}
 

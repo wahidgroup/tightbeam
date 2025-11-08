@@ -237,6 +237,10 @@ pub mod transport {
 	pub const HANDSHAKE_SUPPORTED_CURVES_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.9");
 	pub const HANDSHAKE_SELECTED_CURVE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.10");
 
+	// Cryptographic profile negotiation attributes
+	pub const HANDSHAKE_SECURITY_OFFER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.11");
+	pub const HANDSHAKE_SECURITY_ACCEPT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.12");
+
 	/// Composite profile OID (ECIES(secp256k1) + HKDF(SHA3-256) + AES-256-GCM)
 	pub const HANDSHAKE_PROFILE_ECIES_GCM_OID: ObjectIdentifier =
 		ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.100");

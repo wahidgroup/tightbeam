@@ -1,3 +1,127 @@
+//! TightBeam handshake protocols for establishing secure communication channels.
+//!
+//! This module implements two handshake protocols:
+//! - **ECIES-based**: Lightweight elliptic curve integrated encryption
+//! - **CMS-based**: Full X.509 PKI with signed/enveloped data
+//!
+//! Both protocols establish authenticated, encrypted sessions and support
+//! cryptographic algorithm negotiation between client and server.
+//!
+//! # Architecture
+//!
+//! The handshake layer uses a layered architecture with the `CryptoProvider` trait
+//! as the abstraction boundary:
+//!
+//! ```text
+//!                    Client Request Flow
+//!                           │
+//!                           ▼
+//!              ┌────────────────────────┐
+//!              │   TCP Transport Layer  │
+//!              └───────────┬────────────┘
+//!                          │
+//!                          ▼
+//!         ┌─────────────────────────────────┐
+//!         │  Handshake Orchestrators        │
+//!         │  ┌───────────────────────────┐  │
+//!         │  │ EciesHandshakeClient<P>   │  │
+//!         │  │ EciesHandshakeServer<P>   │  │
+//!         │  │ CmsHandshakeClient<P>     │  │
+//!         │  │ CmsHandshakeServer<P>     │  │
+//!         │  └───────────────────────────┘  │
+//!         │  (P: CryptoProvider)            │
+//!         └─────────┬─────────────────┬─────┘
+//!                   │                 │
+//!         ┌─────────┴──────┐  ┌───────┴──────┐
+//!         │ Build Messages │  │ Process Msgs │
+//!         │                │  │              │
+//!         ▼                │  │              ▼
+//!      ┌──────────────┐    │  │    ┌──────────────────┐
+//!      │   Builders   │◄───┘  └───►│   Processors     │
+//!      ├──────────────┤            ├──────────────────┤
+//!      │ • Kari<P>    │            │ • KariRecipient  │
+//!      │ • EnvData<P> │            │ • EnvDataProc    │
+//!      │ • SignedData │            │ • SignedDataProc │
+//!      │   <P>        │            │   (Trait Objs)   │
+//!      └──────┬───────┘            └────────┬─────────┘
+//!             │                             │
+//!             │    ┌────────────────────┐   │
+//!             └───►│  CryptoProvider    │◄──┘
+//!                  ├────────────────────┤
+//!                  │ Associated Types:  │
+//!                  │ • Curve            │
+//!                  │ • Digest           │
+//!                  │ • Kdf              │
+//!                  │ • AeadCipher       │
+//!                  │ • Signature        │
+//!                  │ • SigningKey       │
+//!                  │ • VerifyingKey     │
+//!                  └────────────────────┘
+//!                           │
+//!                           ▼
+//!               Concrete Implementations
+//!              (e.g., DefaultCryptoProvider)
+//! ```
+//!
+//! ## Design Principles
+//!
+//! - **Compile-time abstraction**: Orchestrators and builders are generic over
+//!   `CryptoProvider`, enabling zero-cost algorithm selection at compile time.
+//!
+//! - **Runtime flexibility**: Processors use trait objects for dynamic dispatch,
+//!   allowing protocol handling with heterogeneous implementations.
+//!
+//! - **Type safety**: Associated types in `CryptoProvider` ensure all cryptographic
+//!   components are compatible (e.g., signature algorithm matches curve type).
+//!
+//! - **Memory safety**: Sensitive material (session keys, private keys) is wrapped
+//!   in `Secret<T>` with automatic zeroing on drop.
+//!
+//! ## Protocol Selection
+//!
+//! Choose a protocol based on your requirements:
+//!
+//! | Protocol | Use Case | Overhead | PKI Required |
+//! |----------|----------|----------|--------------|
+//! | ECIES    | IoT, embedded, performance-critical | Low | Optional |
+//! | CMS      | Enterprise PKI, compliance | Higher | Yes |
+//!
+//! ## Cryptographic Negotiation
+//!
+//! Both protocols support negotiation via `SecurityOffer` (client) and
+//! `SecurityAccept` (server) messages. This allows endpoints to agree on:
+//! - Digest algorithm (e.g., SHA3-256)
+//! - AEAD cipher (e.g., AES-256-GCM)
+//! - Signature algorithm (e.g., ECDSA-with-SHA3-256)
+//! - Key wrapping algorithm (for CMS)
+//!
+//! ### ECIES Protocol Negotiation
+//!
+//! ECIES implements full wire-level negotiation:
+//! - Client sends `SecurityOffer` in `ClientHello` message
+//! - Server selects compatible profile from client's offer
+//! - Server responds with `SecurityAccept` in `ServerHandshake` message
+//! - Client validates server's selection matches offered profiles
+//!
+//! ### CMS Protocol Negotiation
+//!
+//! CMS implements wire-level negotiation via EnvelopedData unprotected attributes:
+//! - Client sends `SecurityOffer` in KeyExchange EnvelopedData unprotected attributes
+//! - Server extracts offer and selects compatible profile using `select_profile()`
+//! - Server stores selected profile (accessible via handshake state)
+//! - If no offer provided, server uses dealer's choice mode (first configured profile)
+//!
+//! The server uses `with_supported_profiles()` to configure acceptable profiles.
+//! If no profiles are configured when an offer is received, negotiation fails.
+//!
+//! ## State Machine
+//!
+//! Handshakes follow a strict state machine to prevent protocol violations:
+//! - **Client**: Init → HelloSent → KeyExchangeSent → Complete
+//! - **Server**: Init → ServerHelloSent → KeyExchangeReceived → Complete
+//!
+//! Invalid state transitions return `HandshakeError::InvalidState`.
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 

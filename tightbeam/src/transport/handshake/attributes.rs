@@ -4,15 +4,16 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
 use crate::der::asn1::{ObjectIdentifier, OctetString, UintRef};
 use crate::der::{asn1::Any, Sequence};
 
 use super::{HandshakeAlert, HandshakeError};
 use crate::asn1::transport::{
 	HANDSHAKE_ABORT_ALERT_OID, HANDSHAKE_ALGORITHM_PROFILE_OID, HANDSHAKE_CLIENT_NONCE_OID,
-	HANDSHAKE_PROTOCOL_VERSION_OID, HANDSHAKE_SELECTED_CURVE_OID, HANDSHAKE_SELECT_ALGORITHM_OID,
-	HANDSHAKE_SELECT_VERSION_OID, HANDSHAKE_SERVER_NONCE_OID, HANDSHAKE_SUPPORTED_CURVES_OID,
-	HANDSHAKE_TRANSCRIPT_HASH_OID,
+	HANDSHAKE_PROTOCOL_VERSION_OID, HANDSHAKE_SECURITY_ACCEPT_OID, HANDSHAKE_SECURITY_OFFER_OID,
+	HANDSHAKE_SELECTED_CURVE_OID, HANDSHAKE_SELECT_ALGORITHM_OID, HANDSHAKE_SELECT_VERSION_OID,
+	HANDSHAKE_SERVER_NONCE_OID, HANDSHAKE_SUPPORTED_CURVES_OID, HANDSHAKE_TRANSCRIPT_HASH_OID,
 };
 
 /// CMS Attribute simplified (profile enforces single value only)
@@ -145,6 +146,22 @@ pub fn encode_selected_curve(curve: ObjectIdentifier) -> Result<HandshakeAttribu
 	HandshakeAttribute::new_single(HANDSHAKE_SELECTED_CURVE_OID, any)
 }
 
+/// Encode SecurityOffer for wire transmission.
+///
+/// Client uses this to advertise supported security profiles to server.
+pub fn encode_security_offer(offer: &SecurityOffer) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(offer)?;
+	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER_OID, any)
+}
+
+/// Encode SecurityAccept for wire transmission.
+///
+/// Server uses this to inform client which profile was selected.
+pub fn encode_security_accept(accept: &SecurityAccept) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(accept)?;
+	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT_OID, any)
+}
+
 // -------------------------- Decoders --------------------------
 
 pub fn extract_nonce(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeError> {
@@ -216,6 +233,38 @@ pub fn extract_supported_curves(attr: &HandshakeAttribute) -> Result<Vec<ObjectI
 /// The selected curve OID
 pub fn extract_selected_curve(attr: &HandshakeAttribute) -> Result<ObjectIdentifier, HandshakeError> {
 	if attr.attr_type != HANDSHAKE_SELECTED_CURVE_OID {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let any = attr.value()?;
+	Ok(any.decode_as()?)
+}
+
+/// Extract SecurityOffer from unprotected attributes.
+///
+/// # Parameters
+/// - `attr`: HandshakeAttribute with HANDSHAKE_SECURITY_OFFER_OID type
+///
+/// # Returns
+/// The decoded SecurityOffer
+pub fn extract_security_offer(attr: &HandshakeAttribute) -> Result<SecurityOffer, HandshakeError> {
+	if attr.attr_type != HANDSHAKE_SECURITY_OFFER_OID {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let any = attr.value()?;
+	Ok(any.decode_as()?)
+}
+
+/// Extract SecurityAccept from unprotected attributes.
+///
+/// # Parameters
+/// - `attr`: HandshakeAttribute with HANDSHAKE_SECURITY_ACCEPT_OID type
+///
+/// # Returns
+/// The decoded SecurityAccept
+pub fn extract_security_accept(attr: &HandshakeAttribute) -> Result<SecurityAccept, HandshakeError> {
+	if attr.attr_type != HANDSHAKE_SECURITY_ACCEPT_OID {
 		return Err(HandshakeError::MissingAttribute);
 	}
 

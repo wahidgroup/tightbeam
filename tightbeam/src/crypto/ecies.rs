@@ -1,7 +1,7 @@
 //! ECIES (Elliptic Curve Integrated Encryption Scheme) implementation
 //!
-//! This module provides a generic, trait-based ECIES implementation that can work
-//! with multiple elliptic curves (secp256k1, curve25519, P-256, etc.).
+//! This module provides a generic, trait-based ECIES implementation that can
+//! work with multiple elliptic curves (secp256k1, curve25519, P-256, etc.).
 //!
 //! # Architecture
 //!
@@ -27,7 +27,7 @@
 //!
 //! # Security
 //!
-//! This implementation uses constant-time cryptographic primitives from RustCrypto:
+//! This implementation uses constant-time cryptographic primitives
 //! - ECDH operations (k256): constant-time scalar multiplication
 //! - AES-256-GCM: constant-time encryption and tag verification  
 //! - HKDF-SHA3-256: constant-time key derivation
@@ -42,6 +42,7 @@ use crate::crypto::secret::{Secret, SecretSlice, ToInsecure};
 use crate::crypto::sign::ecdsa::k256::ecdh::EphemeralSecret;
 use crate::crypto::sign::ecdsa::k256::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
+use crate::der::oid::AssociatedOid;
 
 /// KDF info parameter for domain separation and protocol versioning
 const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
@@ -466,7 +467,7 @@ where
 pub struct EciesSecp256k1Oid;
 
 #[cfg(feature = "x509")]
-impl crate::der::oid::AssociatedOid for EciesSecp256k1Oid {
+impl AssociatedOid for EciesSecp256k1Oid {
 	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.1.12.0");
 }
 

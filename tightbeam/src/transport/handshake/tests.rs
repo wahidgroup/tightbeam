@@ -4,21 +4,45 @@
 //! used across all handshake test modules to reduce duplication and improve maintainability.
 #![allow(unused)]
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
 use crate::asn1::{OctetString, AES_256_WRAP_OID, HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_256_OID};
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-use crate::der::{asn1::ObjectIdentifier, Decode, Encode};
+use crate::der::asn1::{BitString, ObjectIdentifier};
+use crate::der::{Decode, Encode};
 use crate::random::OsRng;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
+use crate::transport::handshake::server::EciesHandshakeServer;
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake};
+use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate};
 
+#[cfg(all(feature = "builder", feature = "aead", feature = "signature"))]
+use crate::crypto::sign::elliptic_curve::PublicKey;
+#[cfg(feature = "time")]
+use crate::der::asn1::GeneralizedTime;
+#[cfg(feature = "x509")]
+use crate::transport::handshake::client::EciesHandshakeClientSecp256k1;
+#[cfg(all(feature = "builder", feature = "aead", feature = "signature"))]
+use crate::transport::handshake::server::CmsHandshakeServerSecp256k1;
+#[cfg(feature = "time")]
+use crate::x509::time::Time;
+
 /// Create a default test security profile for handshake tests.
-pub fn create_default_test_profile() -> crate::crypto::profiles::SecurityProfileDesc {
-	crate::crypto::profiles::SecurityProfileDesc {
+pub fn create_default_test_profile() -> SecurityProfileDesc {
+	SecurityProfileDesc {
 		digest: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
 		#[cfg(feature = "aead")]
 		aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")), // AES-256-GCM
@@ -63,29 +87,29 @@ pub fn create_test_certificate_from_key(signing_key: &Secp256k1SigningKey) -> Ce
 }
 
 /// Internal function to create a certificate from a signing key.
+#[cfg(feature = "time")]
 fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Certificate {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key.to_public_key_der().unwrap();
 
 	let tbs_cert = TbsCertificate {
 		version: crate::x509::Version::V3,
-		serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).unwrap(),
+		serial_number: SerialNumber::new(&[1]).unwrap(),
 		signature: AlgorithmIdentifierOwned {
 			oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
 			parameters: None,
 		},
 		issuer: RdnSequence::default(),
 		validity: Validity {
-			not_before: crate::x509::time::Time::GeneralTime(
-				crate::der::asn1::GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(0)).unwrap(),
+			not_before: Time::GeneralTime(
+				GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(0)).unwrap(),
 			),
-			not_after: crate::x509::time::Time::GeneralTime(
-				crate::der::asn1::GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(u32::MAX as u64))
-					.unwrap(),
+			not_after: Time::GeneralTime(
+				GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(u32::MAX as u64)).unwrap(),
 			),
 		},
 		subject: RdnSequence::default(),
-		subject_public_key_info: crate::spki::SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).unwrap(),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).unwrap(),
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		extensions: None,
@@ -97,7 +121,7 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Certifica
 			oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
 			parameters: None,
 		},
-		signature: crate::der::asn1::BitString::new(0, vec![0; 64]).unwrap(),
+		signature: BitString::new(0, vec![0; 64]).unwrap(),
 	}
 }
 
@@ -255,10 +279,7 @@ impl TestEciesServerBuilder {
 	}
 
 	/// Build the ECIES handshake server.
-	pub fn build(self) -> crate::transport::handshake::server::EciesHandshakeServer {
-		use crate::transport::handshake::server::EciesHandshakeServer;
-		use std::sync::Arc;
-
+	pub fn build(self) -> EciesHandshakeServer<DefaultCryptoProvider> {
 		let test_cert_data = if let Some(cert) = self.cert {
 			let key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 			TestCertificate { signing_key: key, certificate: cert }
@@ -272,6 +293,7 @@ impl TestEciesServerBuilder {
 		};
 
 		let mut server = EciesHandshakeServer::new(
+			DefaultCryptoProvider::default(),
 			Arc::new(test_cert_data.signing_key),
 			test_cert_data.certificate,
 			self.aad_domain,
@@ -311,10 +333,8 @@ impl TestEciesClientBuilder {
 	}
 
 	/// Build the ECIES handshake client.
-	pub fn build(self) -> crate::transport::handshake::client::EciesHandshakeClientSecp256k1 {
-		use crate::transport::handshake::client::EciesHandshakeClientSecp256k1;
-
-		EciesHandshakeClientSecp256k1::new(self.aad_domain)
+	pub fn build(self) -> EciesHandshakeClientSecp256k1 {
+		EciesHandshakeClientSecp256k1::new(DefaultCryptoProvider::default(), self.aad_domain)
 	}
 }
 
@@ -355,21 +375,17 @@ impl TestCmsServerBuilder {
 	}
 
 	/// Build the CMS handshake server.
-	pub fn build(
-		self,
-	) -> (
-		crate::transport::handshake::server::CmsHandshakeServerSecp256k1,
-		elliptic_curve::PublicKey<k256::Secp256k1>,
-	) {
-		use crate::transport::handshake::server::CmsHandshakeServerSecp256k1;
+	pub fn build(self) -> (CmsHandshakeServerSecp256k1, PublicKey<k256::Secp256k1>) {
 		use std::sync::Arc;
+		use CmsHandshakeServerSecp256k1;
 
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let verifying_key = *test_key.verifying_key();
-		let public_key = elliptic_curve::PublicKey::<k256::Secp256k1>::from(verifying_key);
+		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
 		let transcript_hash = self.transcript_hash.unwrap_or_else(|| vec![1u8; 32]);
 
-		let server = CmsHandshakeServerSecp256k1::new(Arc::new(test_key), transcript_hash);
+		let server =
+			CmsHandshakeServerSecp256k1::new(DefaultCryptoProvider::default(), Arc::new(test_key), transcript_hash);
 		(server, public_key)
 	}
 }
@@ -426,7 +442,6 @@ impl TestCmsClientBuilder {
 			.unwrap_or_else(|| create_test_certificate_from_key(&create_test_certificate().signing_key));
 		let transcript_hash = self.transcript_hash.unwrap_or_else(|| vec![1u8; 32]);
 
-		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::transport::handshake::client::CmsHandshakeClientSecp256k1;
 		CmsHandshakeClientSecp256k1::new(DefaultCryptoProvider::default(), client_key, server_cert, transcript_hash)
 	}

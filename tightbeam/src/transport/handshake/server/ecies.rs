@@ -1,6 +1,7 @@
 //! ECIES-based server handshake orchestrator.
 //!
 //! Implements the server side of the TightBeam ECIES handshake protocol.
+//! Generic over `P: CryptoProvider` for cryptographic operations.
 
 #![cfg(feature = "x509")]
 
@@ -14,9 +15,12 @@ use std::sync::Arc;
 
 use crate::asn1::OctetString;
 use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_SESSION_KDF_INFO};
-use crate::crypto::aead::{Aes256Gcm, KeyInit};
-use crate::crypto::hash::{Digest, Sha3_256};
-use crate::crypto::kdf::{hkdf, HkdfSha3_256};
+use crate::crypto::aead::KeyInit;
+use crate::crypto::hash::Digest;
+use crate::crypto::kdf::hkdf;
+use crate::crypto::negotiation::select_profile;
+use crate::crypto::negotiation::SecurityAccept;
+use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::secret::{Secret, ToInsecure};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::der::{Decode, Encode};
@@ -34,7 +38,12 @@ use crate::x509::Certificate;
 /// 1. Receives ClientHello with random nonce
 /// 2. Sends ServerHandshake (certificate, random, signature over transcript)
 /// 3. Receives and decrypts ClientKeyExchange with ECIES-encrypted session key
-pub struct EciesHandshakeServer {
+///
+/// Generic over `P: CryptoProvider` for cryptographic operations.
+pub struct EciesHandshakeServer<P>
+where
+	P: CryptoProvider,
+{
 	state: ServerStateTransition,
 	server_key: Arc<dyn ServerHandshakeKey>,
 	server_cert: Certificate,
@@ -45,16 +54,24 @@ pub struct EciesHandshakeServer {
 	aad_domain_tag: Option<Vec<u8>>,
 	supported_profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>,
 	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
+	#[allow(dead_code)]
+	provider: P,
 }
 
-impl EciesHandshakeServer {
+impl<P> EciesHandshakeServer<P>
+where
+	P: CryptoProvider,
+	P::AeadCipher: KeyInit,
+{
 	/// Create a new ECIES handshake server.
 	///
 	/// # Parameters
+	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `server_key`: The server's signing key for authentication (trait object)
 	/// - `server_cert`: The server's certificate
 	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
 	pub fn new(
+		provider: P,
 		server_key: Arc<dyn ServerHandshakeKey>,
 		server_cert: Certificate,
 		aad_domain_tag: Option<Vec<u8>>,
@@ -70,6 +87,7 @@ impl EciesHandshakeServer {
 			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
 			supported_profiles: Vec::new(), // Must be set via with_supported_profiles()
 			selected_profile: None,
+			provider,
 		}
 	}
 
@@ -103,15 +121,15 @@ impl EciesHandshakeServer {
 		let security_accept = match &client_hello.security_offer {
 			Some(offer) => {
 				// Mode 1: Negotiation - client offered, server selects mutual
-				let selected = crate::crypto::negotiation::select_profile(offer, &self.supported_profiles)?;
+				let selected = select_profile(offer, &self.supported_profiles)?;
 				self.selected_profile = Some(selected);
-				crate::crypto::negotiation::SecurityAccept::new(selected)
+				SecurityAccept::new(selected)
 			}
 			None => {
 				// Mode 2: Dealer's choice - client didn't offer, server picks default
 				let selected = self.supported_profiles[0];
 				self.selected_profile = Some(selected);
-				crate::crypto::negotiation::SecurityAccept::new(selected)
+				SecurityAccept::new(selected)
 			}
 		};
 
@@ -140,8 +158,8 @@ impl EciesHandshakeServer {
 			self.build_server_handshake(server_random, signature_bytes, Some(security_accept))?;
 
 		// 9. Transition state through ServerHelloReceived to ServerHelloSent
-		self.state.transition(HandshakeState::ServerHelloReceived)?;
-		self.state.transition(HandshakeState::ServerHelloSent)?;
+		self.state.dispatch(HandshakeState::ServerHelloReceived)?;
+		self.state.dispatch(HandshakeState::ServerHelloSent)?;
 
 		Ok(server_handshake_der)
 	}
@@ -177,7 +195,7 @@ impl EciesHandshakeServer {
 		self.base_session_key = Some(base_session_key);
 
 		// 8. Transition state to KeyExchangeReceived
-		self.state.transition(HandshakeState::KeyExchangeReceived)?;
+		self.state.dispatch(HandshakeState::KeyExchangeReceived)?;
 
 		Ok(())
 	}
@@ -186,7 +204,7 @@ impl EciesHandshakeServer {
 	///
 	/// # Returns
 	/// AES-256-GCM session key
-	pub fn complete(&mut self) -> Result<Aes256Gcm, HandshakeError> {
+	pub fn complete(&mut self) -> Result<P::AeadCipher, HandshakeError> {
 		// 1. Validate current state is KeyExchangeReceived
 		self.validate_expected_state(HandshakeState::KeyExchangeReceived)?;
 
@@ -199,7 +217,7 @@ impl EciesHandshakeServer {
 		let session_key = self.derive_final_session_key(base_session_key, client_random, server_random)?;
 
 		// 4. Transition to complete state
-		self.state.transition(HandshakeState::Complete)?;
+		self.state.dispatch(HandshakeState::Complete)?;
 
 		// 5. Clear sensitive data
 		self.clear_sensitive_data();
@@ -244,7 +262,7 @@ impl EciesHandshakeServer {
 		data.extend_from_slice(client_random);
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
-		let digest_arr = Sha3_256::digest(&data);
+		let digest_arr = P::Digest::digest(&data);
 		let mut digest = [0u8; 32];
 		digest.copy_from_slice(&digest_arr);
 		digest
@@ -255,13 +273,13 @@ impl EciesHandshakeServer {
 		base_key: &[u8; 32],
 		client_random: &[u8; 32],
 		server_random: &[u8; 32],
-	) -> Result<Aes256Gcm, HandshakeError> {
+	) -> Result<P::AeadCipher, HandshakeError> {
 		let mut salt = [0u8; 64];
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 
-		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
-		Ok(Aes256Gcm::new_from_slice(&final_key_bytes[..])?)
+		let final_key_bytes = hkdf::<P::Kdf, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
+		Ok(P::AeadCipher::new_from_slice(&final_key_bytes[..])?)
 	}
 
 	fn derive_final_session_key_bytes(
@@ -274,7 +292,7 @@ impl EciesHandshakeServer {
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 
-		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
+		let final_key_bytes = hkdf::<P::Kdf, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
 		Ok(final_key_bytes.to_vec())
 	}
 
@@ -369,7 +387,11 @@ impl EciesHandshakeServer {
 // ServerHandshakeProtocol Implementation
 // ============================================================================
 
-impl ServerHandshakeProtocol for EciesHandshakeServer {
+impl<P> ServerHandshakeProtocol for EciesHandshakeServer<P>
+where
+	P: CryptoProvider + Send + Sync,
+	P::AeadCipher: KeyInit,
+{
 	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
 
@@ -415,7 +437,7 @@ impl ServerHandshakeProtocol for EciesHandshakeServer {
 				self.derive_final_session_key_bytes(base_session_key, client_random, server_random)?;
 
 			// 4. Transition to complete state
-			self.state.transition(HandshakeState::Complete)?;
+			self.state.dispatch(HandshakeState::Complete)?;
 
 			// 5. Clear sensitive data
 			self.clear_sensitive_data();
@@ -433,12 +455,15 @@ impl ServerHandshakeProtocol for EciesHandshakeServer {
 mod tests {
 	use super::*;
 	use crate::crypto::ecies::encrypt;
+	use crate::crypto::negotiation::SecurityOffer;
+	use crate::crypto::profiles::SecurityProfileDesc;
+	use crate::der::asn1::ObjectIdentifier;
 	use crate::random::OsRng;
 	use crate::transport::handshake::tests::*;
 
 	fn create_test_client_hello_with_offer(
 		client_random: &[u8; 32],
-		offer: Option<crate::crypto::negotiation::SecurityOffer>,
+		offer: Option<SecurityOffer>,
 	) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 		let client_hello = ClientHello {
 			client_random: crate::asn1::OctetString::new(*client_random)?,
@@ -572,10 +597,6 @@ mod tests {
 	/// Test profile negotiation modes
 	#[test]
 	fn test_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::crypto::negotiation::{select_profile, SecurityOffer};
-		use crate::crypto::profiles::SecurityProfileDesc;
-		use crate::der::asn1::ObjectIdentifier;
-
 		let mk_profile = |id: u8| SecurityProfileDesc {
 			digest: match id {
 				1 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
