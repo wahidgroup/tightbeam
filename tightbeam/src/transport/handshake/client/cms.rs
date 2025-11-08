@@ -364,7 +364,6 @@ pub type CmsHandshakeClientSecp256k1 = CmsHandshakeClient<
 mod tests {
 	mod client {
 		use super::super::*;
-		use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 		use crate::crypto::sign::elliptic_curve::SecretKey;
@@ -438,7 +437,7 @@ mod tests {
 			// Server should be able to decrypt it
 			let enveloped_data = cms::enveloped_data::EnvelopedData::from_der(&key_exchange)?;
 			let server_secret = SecretKey::from(server_key.clone());
-			let kari_processor = TightBeamKariRecipient::new(server_secret, TIGHTBEAM_KARI_KDF_INFO);
+			let kari_processor = TightBeamKariRecipient::new(server_secret);
 			let content_decryptor = AesGcmContentDecryptor;
 			let processor = TightBeamEnvelopedDataProcessor::new(kari_processor, content_decryptor);
 			let decrypted = processor.process(&enveloped_data)?;

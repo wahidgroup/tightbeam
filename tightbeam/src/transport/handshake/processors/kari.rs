@@ -44,10 +44,31 @@ where
 {
 	/// Create a new KARI recipient processor.
 	///
+	/// Uses default TightBeam KDF info string (`TIGHTBEAM_KARI_KDF_INFO`).
+	///
+	/// # Parameters
+	/// - `recipient_priv`: Recipient's private key for ECDH
+	pub fn new(recipient_priv: SecretKey<C>) -> Self {
+		Self::with_kdf_info(recipient_priv, TIGHTBEAM_KARI_KDF_INFO)
+	}
+
+	/// Create a new KARI recipient processor with custom KDF info.
+	///
+	/// This allows interoperability with senders using different KDF parameters
+	/// while maintaining HKDF-SHA3-256 algorithm.
+	///
 	/// # Parameters
 	/// - `recipient_priv`: Recipient's private key for ECDH
 	/// - `kdf_info`: Info string for HKDF (must match sender's)
-	pub fn new(recipient_priv: SecretKey<C>, kdf_info: &'static [u8]) -> Self {
+	///
+	/// # Example
+	/// ```ignore
+	/// let processor = TightBeamKariRecipient::with_kdf_info(
+	///     recipient_key,
+	///     b"custom-kdf-info-v1"
+	/// );
+	/// ```
+	pub fn with_kdf_info(recipient_priv: SecretKey<C>, kdf_info: &'static [u8]) -> Self {
 		Self {
 			recipient_priv,
 			kdf_info,
@@ -126,7 +147,7 @@ where
 impl TightBeamKariRecipient<k256::Secp256k1> {
 	/// Create a recipient processor with default TightBeam settings.
 	pub fn with_defaults(recipient_priv: k256::SecretKey) -> Self {
-		Self::new(recipient_priv, TIGHTBEAM_KARI_KDF_INFO)
+		Self::new(recipient_priv)
 	}
 }
 

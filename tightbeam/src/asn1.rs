@@ -233,7 +233,30 @@ pub mod transport {
 	pub const HANDSHAKE_ABORT_ALERT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.7");
 	pub const HANDSHAKE_TRANSCRIPT_HASH_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.8");
 
+	// Algorithm negotiation attributes (added for interoperability)
+	pub const HANDSHAKE_SUPPORTED_CURVES_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.9");
+	pub const HANDSHAKE_SELECTED_CURVE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.10");
+
 	/// Composite profile OID (ECIES(secp256k1) + HKDF(SHA3-256) + AES-256-GCM)
 	pub const HANDSHAKE_PROFILE_ECIES_GCM_OID: ObjectIdentifier =
 		ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.100");
+
+	// Standard elliptic curve OIDs (for interoperability)
+	// These are IANA/ANSI registered OIDs, not TightBeam-specific
+
+	/// secp256k1 curve OID (Bitcoin/Ethereum standard)
+	/// ANSI X9.62: 1.3.132.0.10
+	pub const CURVE_SECP256K1_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.10");
+
+	/// NIST P-256 (secp256r1) curve OID
+	/// ANSI X9.62: 1.2.840.10045.3.1.7
+	pub const CURVE_NIST_P256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+
+	/// NIST P-384 (secp384r1) curve OID
+	/// ANSI X9.62: 1.3.132.0.34
+	pub const CURVE_NIST_P384_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+
+	/// NIST P-521 (secp521r1) curve OID
+	/// ANSI X9.62: 1.3.132.0.35
+	pub const CURVE_NIST_P521_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
 }

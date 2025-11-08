@@ -10,8 +10,9 @@ use crate::der::{asn1::Any, Sequence};
 use super::{HandshakeAlert, HandshakeError};
 use crate::asn1::transport::{
 	HANDSHAKE_ABORT_ALERT_OID, HANDSHAKE_ALGORITHM_PROFILE_OID, HANDSHAKE_CLIENT_NONCE_OID,
-	HANDSHAKE_PROTOCOL_VERSION_OID, HANDSHAKE_SELECT_ALGORITHM_OID, HANDSHAKE_SELECT_VERSION_OID,
-	HANDSHAKE_SERVER_NONCE_OID, HANDSHAKE_TRANSCRIPT_HASH_OID,
+	HANDSHAKE_PROTOCOL_VERSION_OID, HANDSHAKE_SELECTED_CURVE_OID, HANDSHAKE_SELECT_ALGORITHM_OID,
+	HANDSHAKE_SELECT_VERSION_OID, HANDSHAKE_SERVER_NONCE_OID, HANDSHAKE_SUPPORTED_CURVES_OID,
+	HANDSHAKE_TRANSCRIPT_HASH_OID,
 };
 
 /// CMS Attribute simplified (profile enforces single value only)
@@ -109,6 +110,41 @@ pub fn encode_transcript_hash(hash: &[u8; 32]) -> Result<HandshakeAttribute, Han
 	HandshakeAttribute::new_single(HANDSHAKE_TRANSCRIPT_HASH_OID, any)
 }
 
+/// Encode list of supported curves for algorithm negotiation.
+///
+/// This allows clients/servers to advertise which elliptic curves they support.
+/// The list should be in preference order (most preferred first).
+///
+/// # Parameters
+/// - `curves`: Slice of curve OIDs in preference order
+///
+/// # Returns
+/// HandshakeAttribute with multiple values (exception to single-value rule for capabilities)
+pub fn encode_supported_curves(curves: &[ObjectIdentifier]) -> Result<HandshakeAttribute, HandshakeError> {
+	if curves.is_empty() {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let mut values = Vec::with_capacity(curves.len());
+	for curve in curves {
+		values.push(Any::encode_from(curve)?);
+	}
+
+	Ok(HandshakeAttribute { attr_type: HANDSHAKE_SUPPORTED_CURVES_OID, attr_values: values })
+}
+
+/// Encode selected curve for algorithm negotiation.
+///
+/// Server uses this to inform client which curve was selected from the
+/// client's supported curves list.
+///
+/// # Parameters
+/// - `curve`: The selected curve OID
+pub fn encode_selected_curve(curve: ObjectIdentifier) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(&curve)?;
+	HandshakeAttribute::new_single(HANDSHAKE_SELECTED_CURVE_OID, any)
+}
+
 // -------------------------- Decoders --------------------------
 
 pub fn extract_nonce(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeError> {
@@ -145,6 +181,46 @@ pub fn extract_u16(attr: &HandshakeAttribute) -> Result<u16, HandshakeError> {
 
 pub fn extract_transcript_hash(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeError> {
 	extract_nonce(attr) // same structure (OCTET STRING SIZE(32))
+}
+
+/// Extract list of supported curves from a capabilities attribute.
+///
+/// # Parameters
+/// - `attr`: HandshakeAttribute with HANDSHAKE_SUPPORTED_CURVES_OID type
+///
+/// # Returns
+/// Vector of curve OIDs in preference order
+pub fn extract_supported_curves(attr: &HandshakeAttribute) -> Result<Vec<ObjectIdentifier>, HandshakeError> {
+	if attr.attr_type != HANDSHAKE_SUPPORTED_CURVES_OID {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	if attr.attr_values.is_empty() {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let mut curves = Vec::with_capacity(attr.attr_values.len());
+	for any in &attr.attr_values {
+		curves.push(any.decode_as()?);
+	}
+
+	Ok(curves)
+}
+
+/// Extract selected curve from server's response.
+///
+/// # Parameters
+/// - `attr`: HandshakeAttribute with HANDSHAKE_SELECTED_CURVE_OID type
+///
+/// # Returns
+/// The selected curve OID
+pub fn extract_selected_curve(attr: &HandshakeAttribute) -> Result<ObjectIdentifier, HandshakeError> {
+	if attr.attr_type != HANDSHAKE_SELECTED_CURVE_OID {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let any = attr.value()?;
+	Ok(any.decode_as()?)
 }
 
 pub fn extract_alert(attr: &HandshakeAttribute) -> Result<HandshakeAlert, HandshakeError> {
@@ -336,6 +412,58 @@ mod tests {
 		let any = mk_integer(&[0x01, 0x02, 0x03])?;
 		let attr = HandshakeAttribute { attr_type: HANDSHAKE_PROTOCOL_VERSION_OID, attr_values: vec![any] };
 		assert!(matches!(extract_u16(&attr).unwrap_err(), HandshakeError::IntegerOutOfRange));
+		Ok(())
+	}
+
+	#[test]
+	fn supported_curves_encoding() -> Result<(), HandshakeError> {
+		use crate::asn1::transport::{CURVE_NIST_P256_OID, CURVE_NIST_P384_OID, CURVE_SECP256K1_OID};
+
+		// Encode multiple curves in preference order
+		let curves = vec![CURVE_SECP256K1_OID, CURVE_NIST_P256_OID, CURVE_NIST_P384_OID];
+		let attr = encode_supported_curves(&curves)?;
+
+		assert_eq!(attr.attr_type, HANDSHAKE_SUPPORTED_CURVES_OID);
+		assert_eq!(attr.attr_values.len(), 3);
+
+		// Extract and verify
+		let extracted = extract_supported_curves(&attr)?;
+		assert_eq!(extracted, curves);
+
+		Ok(())
+	}
+
+	#[test]
+	fn selected_curve_round_trip() -> Result<(), HandshakeError> {
+		use crate::asn1::transport::CURVE_NIST_P256_OID;
+
+		let attr = encode_selected_curve(CURVE_NIST_P256_OID)?;
+		assert_eq!(attr.attr_type, HANDSHAKE_SELECTED_CURVE_OID);
+
+		let extracted = extract_selected_curve(&attr)?;
+		assert_eq!(extracted, CURVE_NIST_P256_OID);
+
+		Ok(())
+	}
+
+	#[test]
+	fn empty_supported_curves_fails() {
+		let result = encode_supported_curves(&[]);
+		assert!(matches!(result.unwrap_err(), HandshakeError::MissingAttribute));
+	}
+
+	#[test]
+	fn wrong_oid_type_for_curves() -> Result<(), HandshakeError> {
+		use crate::asn1::transport::CURVE_SECP256K1_OID;
+
+		// Create attribute with wrong OID type
+		let any = Any::encode_from(&CURVE_SECP256K1_OID)?;
+		let wrong_attr = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE_OID, attr_values: vec![any] };
+
+		// Should fail because OID doesn't match
+		let result = extract_supported_curves(&wrong_attr);
+		assert!(matches!(result.unwrap_err(), HandshakeError::MissingAttribute));
+
 		Ok(())
 	}
 }

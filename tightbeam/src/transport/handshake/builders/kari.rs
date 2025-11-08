@@ -69,6 +69,8 @@ where
 	///
 	/// This constructor provides a generic implementation that works for any curve type.
 	/// The KDF uses SHA3-256 for HKDF derivation, and the key wrapper uses AES Key Wrap (RFC 3394).
+	///
+	/// Use `with_kdf_info()` to customize the KDF info string for interoperability.
 	#[cfg(all(feature = "kdf", feature = "sha3"))]
 	pub fn new() -> Self {
 		Self {
@@ -121,6 +123,18 @@ where
 	}
 
 	/// Set the HKDF info string for KEK derivation.
+	///
+	/// This allows interoperability with other CMS implementations by using
+	/// custom KDF parameters while maintaining HKDF-SHA3-256 algorithm.
+	///
+	/// # Parameters
+	/// - `kdf_info`: Custom info string for HKDF (default: `TIGHTBEAM_KARI_KDF_INFO`)
+	///
+	/// # Example
+	/// ```ignore
+	/// let builder = TightBeamKariBuilder::new()
+	///     .with_kdf_info(b"custom-kdf-info-v1");
+	/// ```
 	pub fn with_kdf_info(mut self, kdf_info: &'static [u8]) -> Self {
 		self.kdf_info = kdf_info;
 		self

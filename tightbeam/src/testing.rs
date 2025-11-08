@@ -436,6 +436,7 @@ macro_rules! test_container {
 			use std::sync::{mpsc, Arc};
 
 			// Setup protocol with X.509 if present in server policies
+			#[allow(unused_variables)]
 			let (listener, addr, server_cert) = test_container!(@setup_protocol_dispatch $protocol, [$($server_policy_key)*]);
 
 			// Server handler channel: tx for server, rx for container

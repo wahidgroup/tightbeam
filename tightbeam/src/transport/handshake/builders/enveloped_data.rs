@@ -46,6 +46,19 @@ where
 	elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
 {
 	/// Create a new EnvelopedData builder with the given KARI builder.
+	///
+	/// The KARI builder should be fully configured before passing it here,
+	/// including any custom KDF info via `with_kdf_info()` for interoperability.
+	///
+	/// # Example
+	/// ```ignore
+	/// let kari = TightBeamKariBuilder::new()
+	///     .with_kdf_info(b"custom-info")  // Configure KDF before passing
+	///     .with_sender_priv(sender_key)
+	///     .with_recipient_pub(recipient_pub);
+	///
+	/// let builder = TightBeamEnvelopedDataBuilder::new(kari);
+	/// ```
 	pub fn new(kari_builder: TightBeamKariBuilder<C>) -> Self {
 		Self {
 			kari_builder: Some(kari_builder),
