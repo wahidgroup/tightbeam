@@ -201,12 +201,12 @@ mod tests {
 			sender_key: K256SecretKey,
 			sender_spki: SubjectPublicKeyInfoOwned,
 			recipient_pubkey: elliptic_curve::PublicKey<k256::Secp256k1>,
-		) -> TightBeamKariBuilder<k256::Secp256k1> {
+		) -> TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
 			let ukm = create_test_ukm();
 			let rid = create_test_recipient_id();
 			let key_enc_alg = create_test_key_enc_alg();
 
-			TightBeamKariBuilder::<k256::Secp256k1>::default()
+			TightBeamKariBuilder::default()
 				.with_sender_priv(sender_key)
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)

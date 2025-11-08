@@ -43,6 +43,8 @@ pub struct EciesHandshakeServer {
 	base_session_key: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: Option<Vec<u8>>,
+	supported_profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>,
+	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
 }
 
 impl EciesHandshakeServer {
@@ -66,7 +68,16 @@ impl EciesHandshakeServer {
 			base_session_key: None,
 			transcript_hash: None,
 			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
+			supported_profiles: Vec::new(), // Must be set via with_supported_profiles()
+			selected_profile: None,
 		}
+	}
+
+	/// Set the server's supported security profiles for negotiation.
+	/// Server must have at least one supported profile configured.
+	pub fn with_supported_profiles(mut self, profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>) -> Self {
+		self.supported_profiles = profiles;
+		self
 	}
 
 	/// Process ClientHello and build ServerHandshake message.
@@ -83,14 +94,35 @@ impl EciesHandshakeServer {
 		// 2. Decode ClientHello message
 		let client_hello = self.decode_client_hello(client_hello_der)?;
 
-		// 3. Extract and store client random
+		// 3. Profile negotiation (two modes: negotiation or dealer's choice)
+		// Server must have supported_profiles configured
+		if self.supported_profiles.is_empty() {
+			return Err(HandshakeError::InvalidState);
+		}
+
+		let security_accept = match &client_hello.security_offer {
+			Some(offer) => {
+				// Mode 1: Negotiation - client offered, server selects mutual
+				let selected = crate::crypto::negotiation::select_profile(offer, &self.supported_profiles)?;
+				self.selected_profile = Some(selected);
+				crate::crypto::negotiation::SecurityAccept::new(selected)
+			}
+			None => {
+				// Mode 2: Dealer's choice - client didn't offer, server picks default
+				let selected = self.supported_profiles[0];
+				self.selected_profile = Some(selected);
+				crate::crypto::negotiation::SecurityAccept::new(selected)
+			}
+		};
+
+		// 4. Extract and store client random
 		let client_random = self.octet_string_to_array(&client_hello.client_random)?;
 		self.client_random = Some(client_random);
 
-		// 4. Generate and store server random
+		// 5. Generate and store server random
 		let server_random = self.generate_server_random()?;
 
-		// 5. Compute transcript hash
+		// 6. Compute transcript hash
 		let spki_bytes = self
 			.server_cert
 			.tbs_certificate
@@ -100,13 +132,14 @@ impl EciesHandshakeServer {
 		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes);
 		self.transcript_hash = Some(transcript_digest);
 
-		// 6. Sign transcript hash
+		// 7. Sign transcript hash
 		let signature_bytes = self.sign_transcript_hash(&transcript_digest)?;
 
-		// 7. Build and encode ServerHandshake
-		let server_handshake_der = self.build_server_handshake(server_random, signature_bytes)?;
+		// 8. Build and encode ServerHandshake
+		let server_handshake_der =
+			self.build_server_handshake(server_random, signature_bytes, Some(security_accept))?;
 
-		// 8. Transition state through ServerHelloReceived to ServerHelloSent
+		// 9. Transition state through ServerHelloReceived to ServerHelloSent
 		self.state.transition(HandshakeState::ServerHelloReceived)?;
 		self.state.transition(HandshakeState::ServerHelloSent)?;
 
@@ -271,11 +304,13 @@ impl EciesHandshakeServer {
 		&self,
 		server_random: [u8; 32],
 		signature_bytes: Vec<u8>,
+		security_accept: Option<crate::crypto::negotiation::SecurityAccept>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		let server_handshake = ServerHandshake {
 			certificate: self.server_cert.clone(),
 			server_random: OctetString::new(server_random)?,
 			signature: OctetString::new(signature_bytes)?,
+			security_accept,
 		};
 
 		Ok(server_handshake.to_der()?)
@@ -401,6 +436,17 @@ mod tests {
 	use crate::random::OsRng;
 	use crate::transport::handshake::tests::*;
 
+	fn create_test_client_hello_with_offer(
+		client_random: &[u8; 32],
+		offer: Option<crate::crypto::negotiation::SecurityOffer>,
+	) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+		let client_hello = ClientHello {
+			client_random: crate::asn1::OctetString::new(*client_random)?,
+			security_offer: offer,
+		};
+		Ok(client_hello.to_der()?)
+	}
+
 	#[test]
 	fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
 		// Given: A server in init state
@@ -519,6 +565,64 @@ mod tests {
 		// When: Trying to process client hello after key exchange
 		let result = server.process_client_hello(&client_hello_der);
 		assert!(result.is_err());
+
+		Ok(())
+	}
+
+	/// Test profile negotiation modes
+	#[test]
+	fn test_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::crypto::negotiation::{select_profile, SecurityOffer};
+		use crate::crypto::profiles::SecurityProfileDesc;
+		use crate::der::asn1::ObjectIdentifier;
+
+		let mk_profile = |id: u8| SecurityProfileDesc {
+			digest: match id {
+				1 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
+				2 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.9"), // SHA3-384
+				_ => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.10"), // SHA3-512
+			},
+			#[cfg(feature = "aead")]
+			aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")),
+			#[cfg(feature = "signature")]
+			signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")),
+			key_wrap: if id % 2 == 0 {
+				Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"))
+			} else {
+				None
+			},
+		};
+
+		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));
+
+		// Mode 1: Negotiation - client offers [A, B], server supports [B, C] → selects B
+		{
+			let offer = SecurityOffer::new(vec![p_a, p_b]);
+			let selected = select_profile(&offer, &[p_b, p_c])?;
+			assert_eq!(selected, p_b);
+
+			let mut server = TestEciesServerBuilder::new().build().with_supported_profiles(vec![p_b, p_c]);
+			let client_random = [0u8; 32];
+			let client_hello_der = create_test_client_hello_with_offer(&client_random, Some(offer.clone()))?;
+			let _response = server.process_client_hello(&client_hello_der)?;
+			assert_eq!(server.selected_profile, Some(p_b));
+		}
+
+		// Mode 2: Dealer's choice - no client offer, server picks first
+		{
+			let mut server = TestEciesServerBuilder::new().build().with_supported_profiles(vec![p_a, p_b]);
+			let client_random = [1u8; 32];
+			let client_hello_der = create_test_client_hello(&client_random)?;
+			let _response = server.process_client_hello(&client_hello_der)?;
+			assert_eq!(server.selected_profile, Some(p_a)); // First in list
+		}
+
+		// Error case: No mutual profile
+		{
+			let offer = SecurityOffer::new(vec![p_a, p_b]);
+			let result = select_profile(&offer, &[p_c]);
+			assert!(result.is_err());
+		}
 
 		Ok(())
 	}

@@ -350,7 +350,8 @@ mod tests {
 	mod server {
 		use super::super::*;
 		use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
-		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 		use crate::crypto::sign::elliptic_curve::SecretKey;
 		use crate::crypto::x509::name::Name;
 		use crate::crypto::x509::serial_number::SerialNumber;
@@ -421,7 +422,7 @@ mod tests {
 			let digest_alg = AlgorithmIdentifierOwned { oid: crate::asn1::HASH_SHA3_256_OID, parameters: None };
 			let signature_alg =
 				AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
-			let mut client_finished_builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
+			let mut client_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(
 				client_test_cert.signing_key.clone(),
 				digest_alg,
 				signature_alg,

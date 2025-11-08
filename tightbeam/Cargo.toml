@@ -78,6 +78,7 @@ full = [
 	"secp256k1",
 	"kdf",
 	"ecies",
+	"ecdh",
 	"derive",
 	"tokio",
 	"constants",
@@ -130,6 +131,7 @@ digest = ["crypto", "dep:digest", "tightbeam-derive?/digest"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
 ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
+ecdh = []
 
 ## Security features
 random = ["dep:rand_core"]

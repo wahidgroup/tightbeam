@@ -45,6 +45,8 @@ pub struct EciesHandshakeClient<C, Sig, Vk, M> {
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: Option<Vec<u8>>,
+	security_offer: Option<crate::crypto::negotiation::SecurityOffer>,
+	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
 	_phantom: PhantomData<(C, Sig, Vk, M)>,
 }
 
@@ -80,8 +82,17 @@ where
 			server_random: None,
 			transcript_hash: None,
 			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
+			security_offer: None, // No offer = dealer's choice mode
+			selected_profile: None,
 			_phantom: PhantomData,
 		}
+	}
+
+	/// Set the security profile offer for negotiation.
+	/// If not set, server will pick default profile (dealer's choice mode).
+	pub fn with_security_offer(mut self, offer: crate::crypto::negotiation::SecurityOffer) -> Self {
+		self.security_offer = Some(offer);
+		self
 	}
 
 	/// Validate that the current state matches the expected state.
@@ -154,7 +165,10 @@ where
 		self.client_random = Some(client_random);
 
 		// 3. Build ClientHello
-		let client_hello = ClientHello { client_random: OctetString::new(client_random)? };
+		let client_hello = ClientHello {
+			client_random: OctetString::new(client_random)?,
+			security_offer: self.security_offer.clone(),
+		};
 
 		// Note: State doesn't transition yet - we're waiting for server response
 		Ok(client_hello.to_der()?)
@@ -175,20 +189,38 @@ where
 		// 2. Decode and validate server handshake
 		let server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
 
-		// 3. Extract server random
+		// 3. Profile negotiation validation (two modes)
+		// Server must always send security_accept
+		let accept = server_handshake.security_accept.as_ref().ok_or(HandshakeError::InvalidState)?;
+
+		match &self.security_offer {
+			Some(offer) => {
+				// Mode 1: Negotiation - verify server's selection is from our offer
+				if !offer.profiles.contains(&accept.profile) {
+					return Err(HandshakeError::InvalidProfileSelection);
+				}
+				self.selected_profile = Some(accept.profile);
+			}
+			None => {
+				// Mode 2: Dealer's choice - accept whatever server picked
+				self.selected_profile = Some(accept.profile);
+			}
+		}
+
+		// 4. Extract server random
 		self.extract_server_random(&server_handshake)?;
 
-		// 4. Extract verifying key and verify signature
+		// 5. Extract verifying key and verify signature
 		let verifying_key = self.extract_verifying_key(&server_handshake.certificate)?;
 		self.compute_and_store_transcript_hash(&server_handshake)?;
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 		self.verify_server_signature(&verifying_key, &transcript_digest, server_handshake.signature.as_bytes())?;
 
-		// 5. Generate base session key
+		// 6. Generate base session key
 		self.generate_base_session_key()?;
 		let base_key = self.base_session_key.ok_or(HandshakeError::InvalidState)?;
 
-		// 6. Encrypt session key with ECIES
+		// 7. Encrypt session key with ECIES
 		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
 		let encrypted_bytes = self.perform_ecies_encryption(
 			&base_key,
@@ -197,10 +229,10 @@ where
 			self.aad_domain_tag.as_deref(),
 		)?;
 
-		// 7. Build ClientKeyExchange
+		// 8. Build ClientKeyExchange
 		let client_kex = ClientKeyExchange { encrypted_data: OctetString::new(encrypted_bytes)? };
 
-		// 8. Transition state
+		// 9. Transition state
 		self.state.transition(HandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex.to_der()?)
@@ -531,6 +563,136 @@ mod tests {
 		// When: Trying to complete before processing server handshake
 		let result = client.complete();
 		assert!(result.is_err());
+
+		Ok(())
+	}
+
+	/// Test client-side profile validation
+	#[test]
+	fn test_client_profile_validation() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
+		use crate::crypto::profiles::SecurityProfileDesc;
+		use crate::der::asn1::ObjectIdentifier;
+		use crate::der::Encode;
+		use crate::transport::handshake::ServerHandshake;
+
+		let mk_profile = |id: u8| SecurityProfileDesc {
+			digest: match id {
+				1 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
+				2 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.9"), // SHA3-384
+				_ => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.10"), // SHA3-512
+			},
+			#[cfg(feature = "aead")]
+			aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")),
+			#[cfg(feature = "signature")]
+			signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")),
+			key_wrap: if id % 2 == 0 {
+				Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"))
+			} else {
+				None
+			},
+		};
+
+		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));
+		let test_cert = create_test_certificate();
+
+		// Test 1: Client offers [A, B], server accepts B → OK
+		{
+			let mut client = TestEciesClientBuilder::new()
+				.build()
+				.with_security_offer(SecurityOffer::new(vec![p_a, p_b]));
+			let _hello = client.build_client_hello()?;
+
+			// Get the actual client random that was generated
+			let client_random = client.client_random.ok_or("No client random")?;
+			let server_random = [2u8; 32];
+			let transcript_hash = compute_test_transcript_hash(
+				&client_random,
+				&server_random,
+				test_cert
+					.certificate
+					.tbs_certificate
+					.subject_public_key_info
+					.subject_public_key
+					.raw_bytes(),
+			);
+			let signature: crate::crypto::sign::ecdsa::Secp256k1Signature =
+				test_cert.signing_key.try_sign(&transcript_hash)?;
+			let signature_bytes = signature.to_bytes().to_vec();
+
+			let response = ServerHandshake {
+				certificate: test_cert.certificate.clone(),
+				server_random: crate::asn1::OctetString::new(server_random)?,
+				signature: crate::asn1::OctetString::new(signature_bytes)?,
+				security_accept: Some(SecurityAccept::new(p_b)),
+			};
+			let _kex = client.process_server_handshake(&response.to_der()?)?;
+			assert_eq!(client.selected_profile, Some(p_b));
+		}
+
+		// Test 2: Client offers [A, B], server accepts C (not in offer) → FAIL
+		{
+			let mut client = TestEciesClientBuilder::new()
+				.build()
+				.with_security_offer(SecurityOffer::new(vec![p_a, p_b]));
+			let _hello = client.build_client_hello()?;
+
+			let client_random = client.client_random.ok_or("No client random")?;
+			let server_random = [3u8; 32];
+			let transcript_hash = compute_test_transcript_hash(
+				&client_random,
+				&server_random,
+				test_cert
+					.certificate
+					.tbs_certificate
+					.subject_public_key_info
+					.subject_public_key
+					.raw_bytes(),
+			);
+			let signature: crate::crypto::sign::ecdsa::Secp256k1Signature =
+				test_cert.signing_key.try_sign(&transcript_hash)?;
+			let signature_bytes = signature.to_bytes().to_vec();
+
+			let response = ServerHandshake {
+				certificate: test_cert.certificate.clone(),
+				server_random: crate::asn1::OctetString::new(server_random)?,
+				signature: crate::asn1::OctetString::new(signature_bytes)?,
+				security_accept: Some(SecurityAccept::new(p_c)), // Not in offer!
+			};
+			let result = client.process_server_handshake(&response.to_der()?);
+			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
+		}
+
+		// Test 3: No offer, server picks → OK (dealer's choice)
+		{
+			let mut client = TestEciesClientBuilder::new().build();
+			let _hello = client.build_client_hello()?;
+
+			let client_random = client.client_random.ok_or("No client random")?;
+			let server_random = [4u8; 32];
+			let transcript_hash = compute_test_transcript_hash(
+				&client_random,
+				&server_random,
+				test_cert
+					.certificate
+					.tbs_certificate
+					.subject_public_key_info
+					.subject_public_key
+					.raw_bytes(),
+			);
+			let signature: crate::crypto::sign::ecdsa::Secp256k1Signature =
+				test_cert.signing_key.try_sign(&transcript_hash)?;
+			let signature_bytes = signature.to_bytes().to_vec();
+
+			let response = ServerHandshake {
+				certificate: test_cert.certificate.clone(),
+				server_random: crate::asn1::OctetString::new(server_random)?,
+				signature: crate::asn1::OctetString::new(signature_bytes)?,
+				security_accept: Some(SecurityAccept::new(p_a)),
+			};
+			let _kex = client.process_server_handshake(&response.to_der()?)?;
+			assert_eq!(client.selected_profile, Some(p_a));
+		}
 
 		Ok(())
 	}

@@ -93,6 +93,7 @@ mod tests {
 	mod signed_data {
 		use super::*;
 		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 		use crate::crypto::sign::EcdsaSignatureVerifier;
 		use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
@@ -103,11 +104,11 @@ mod tests {
 		/// Helper function to create a test SignedData builder
 		fn create_test_signed_data_builder(
 			signing_key: Secp256k1SigningKey,
-		) -> Result<TightBeamSignedDataBuilder<Secp256k1Signature, Sha3_256>, HandshakeError> {
+		) -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider>, HandshakeError> {
 			let digest_alg = create_sha3_256_digest_alg();
 			let signature_alg = create_ecdsa_sha3_256_signature_alg();
 
-			TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(signing_key, digest_alg, signature_alg)
+			TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(signing_key, digest_alg, signature_alg)
 		}
 
 		/// Helper function to create a test signature verifier

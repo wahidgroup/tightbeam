@@ -20,6 +20,8 @@ pub type SignatureVerifier<E = TightBeamError> = Box<dyn FnOnce(&[u8], &SignerIn
 pub type Digestor<E = TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::Result<crate::DigestInfo, E>>;
 #[cfg(feature = "kdf")]
 pub type KeyDeriver<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8], &[u8], usize) -> core::result::Result<Vec<u8>, E>>;
+#[cfg(feature = "aead")]
+pub type KeyWrapper<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8]) -> core::result::Result<Vec<u8>, E>>;
 
 impl Asn1Matrix {
 	/// Validate invariants per spec.

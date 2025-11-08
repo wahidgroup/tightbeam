@@ -6,8 +6,7 @@ use crate::cms::enveloped_data::KeyAgreeRecipientInfo;
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, FieldBytesSize, PublicKey, SecretKey};
-use crate::transport::handshake::builders::kari::{aes_key_unwrap, hkdf_sha3_256};
+use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
 
 #[cfg(feature = "zeroize")]
@@ -20,61 +19,59 @@ use zeroize::Zeroize;
 /// 2. Perform ECDH with recipient's private key
 /// 3. Derive KEK using same KDF and UKM
 /// 4. Unwrap encrypted key to get CEK
+///
+/// Generic over `P: CryptoProvider` which defines the complete cryptographic suite.
 #[cfg(all(feature = "builder", feature = "aead"))]
-pub struct TightBeamKariRecipient<C>
+pub struct TightBeamKariRecipient<P>
 where
-	C: Curve + CurveArithmetic,
+	P: crate::crypto::profiles::CryptoProvider,
 {
 	/// Recipient's private key for ECDH
-	recipient_priv: SecretKey<C>,
+	recipient_priv: SecretKey<P::Curve>,
 	/// HKDF info string (must match sender's)
 	kdf_info: &'static [u8],
-	/// KDF function (must match sender's)
-	kdf: Box<dyn Fn(&[u8], &[u8], &[u8], usize) -> Result<Vec<u8>, HandshakeError>>,
-	/// Key unwrap function
-	key_unwrapper: Box<dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, HandshakeError>>,
+	/// Cryptographic provider
+	provider: P,
 }
 
 #[cfg(all(feature = "builder", feature = "aead"))]
-impl<C> TightBeamKariRecipient<C>
+impl<P> TightBeamKariRecipient<P>
 where
-	C: Curve + CurveArithmetic,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-	FieldBytesSize<C>: ModulusSize,
+	P: crate::crypto::profiles::CryptoProvider,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	FieldBytesSize<P::Curve>: ModulusSize,
 {
 	/// Create a new KARI recipient processor.
 	///
 	/// Uses default TightBeam KDF info string (`TIGHTBEAM_KARI_KDF_INFO`).
 	///
 	/// # Parameters
+	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `recipient_priv`: Recipient's private key for ECDH
-	pub fn new(recipient_priv: SecretKey<C>) -> Self {
-		Self::with_kdf_info(recipient_priv, TIGHTBEAM_KARI_KDF_INFO)
+	pub fn new(provider: P, recipient_priv: SecretKey<P::Curve>) -> Self {
+		Self::with_kdf_info(provider, recipient_priv, TIGHTBEAM_KARI_KDF_INFO)
 	}
 
 	/// Create a new KARI recipient processor with custom KDF info.
 	///
 	/// This allows interoperability with senders using different KDF parameters
-	/// while maintaining HKDF-SHA3-256 algorithm.
+	/// while maintaining the provider's KDF algorithm.
 	///
 	/// # Parameters
+	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `recipient_priv`: Recipient's private key for ECDH
 	/// - `kdf_info`: Info string for HKDF (must match sender's)
 	///
 	/// # Example
 	/// ```ignore
 	/// let processor = TightBeamKariRecipient::with_kdf_info(
+	///     provider,
 	///     recipient_key,
 	///     b"custom-kdf-info-v1"
 	/// );
 	/// ```
-	pub fn with_kdf_info(recipient_priv: SecretKey<C>, kdf_info: &'static [u8]) -> Self {
-		Self {
-			recipient_priv,
-			kdf_info,
-			kdf: Box::new(hkdf_sha3_256),
-			key_unwrapper: Box::new(aes_key_unwrap),
-		}
+	pub fn with_kdf_info(provider: P, recipient_priv: SecretKey<P::Curve>, kdf_info: &'static [u8]) -> Self {
+		Self { recipient_priv, kdf_info, provider }
 	}
 
 	/// Process a KeyAgreeRecipientInfo to extract the CEK.
@@ -101,16 +98,18 @@ where
 		// 3. Perform ECDH
 		let shared_secret = diffie_hellman(self.recipient_priv.to_nonzero_scalar(), originator_pub.as_affine());
 
-		// 4. Derive KEK using UKM as salt
+		// 4. Derive KEK using UKM as salt and provider's KDF
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let salt = ukm.as_bytes();
-		let mut kek = (self.kdf)(shared_secret.raw_secret_bytes().as_ref(), salt, self.kdf_info, 32)?;
+		let kdf = self.provider.as_key_deriver::<HandshakeError, 32>();
+		let mut kek = kdf(shared_secret.raw_secret_bytes().as_ref(), salt, self.kdf_info)?;
 
 		// 5. Extract wrapped key
 		let wrapped_key = kari.recipient_enc_keys[recipient_index].enc_key.as_bytes();
 
-		// 6. Unwrap to get CEK
-		let cek = (self.key_unwrapper)(wrapped_key, &kek)?;
+		// 6. Unwrap to get CEK using provider's key unwrapper
+		let key_unwrapper = self.provider.as_key_unwrapper_32::<HandshakeError>();
+		let cek = key_unwrapper(wrapped_key, &kek)?;
 
 		// 7. Zeroize KEK
 		#[cfg(feature = "zeroize")]
@@ -120,7 +119,10 @@ where
 	}
 
 	/// Extract originator's public key from KARI.
-	fn extract_originator_public_key(&self, kari: &KeyAgreeRecipientInfo) -> Result<PublicKey<C>, HandshakeError> {
+	fn extract_originator_public_key(
+		&self,
+		kari: &KeyAgreeRecipientInfo,
+	) -> Result<PublicKey<P::Curve>, HandshakeError> {
 		use cms::enveloped_data::OriginatorIdentifierOrKey;
 
 		match &kari.originator {
@@ -129,14 +131,15 @@ where
 				let pub_key_bytes = orig_key.public_key.raw_bytes();
 
 				// Parse as curve-specific public key
-				PublicKey::<C>::from_sec1_bytes(pub_key_bytes).map_err(|_| HandshakeError::InvalidOriginatorPublicKey)
+				PublicKey::<P::Curve>::from_sec1_bytes(pub_key_bytes)
+					.map_err(|_| HandshakeError::InvalidOriginatorPublicKey)
 			}
 			_ => Err(HandshakeError::UnsupportedOriginatorIdentifier),
 		}
 	}
 }
 
-/// Default implementation for secp256k1 + HKDF-SHA3-256 + AES Key Unwrap.
+/// Default implementation for DefaultCryptoProvider.
 #[cfg(all(
 	feature = "builder",
 	feature = "aead",
@@ -144,20 +147,20 @@ where
 	feature = "kdf",
 	feature = "sha3"
 ))]
-impl TightBeamKariRecipient<k256::Secp256k1> {
+impl TightBeamKariRecipient<crate::crypto::profiles::DefaultCryptoProvider> {
 	/// Create a recipient processor with default TightBeam settings.
 	pub fn with_defaults(recipient_priv: k256::SecretKey) -> Self {
-		Self::new(recipient_priv)
+		Self::new(crate::crypto::profiles::DefaultCryptoProvider::default(), recipient_priv)
 	}
 }
 
 /// Implement RecipientProcessor trait for TightBeamKariRecipient
 #[cfg(all(feature = "builder", feature = "aead"))]
-impl<C> super::enveloped_data::RecipientProcessor for TightBeamKariRecipient<C>
+impl<P> super::enveloped_data::RecipientProcessor for TightBeamKariRecipient<P>
 where
-	C: Curve + CurveArithmetic,
-	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
-	FieldBytesSize<C>: ModulusSize,
+	P: crate::crypto::profiles::CryptoProvider,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	FieldBytesSize<P::Curve>: ModulusSize,
 {
 	fn process_recipient(
 		&self,
@@ -225,7 +228,7 @@ mod tests {
 			let original_cek = [0x42u8; 32];
 
 			// SENDER SIDE: Build KARI
-			let mut builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
+			let mut builder = TightBeamKariBuilder::default()
 				.with_sender_priv(sender_key.clone())
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)
@@ -282,7 +285,7 @@ mod tests {
 			let original_cek = [0x42u8; 32];
 
 			// Build KARI for correct recipient
-			let mut builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
+			let mut builder = TightBeamKariBuilder::default()
 				.with_sender_priv(sender_key)
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)

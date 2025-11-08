@@ -1,6 +1,8 @@
 mod utils;
 
+pub mod negotiation;
 pub mod policy;
+pub mod profiles;
 pub mod secret;
 
 #[cfg(feature = "aead")]

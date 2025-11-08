@@ -19,16 +19,15 @@ use crate::x509::ext::pkix::SubjectKeyIdentifier;
 /// Signs content (typically a transcript hash) with the sender's private key
 /// to provide authentication and non-repudiation.
 ///
-/// The builder is algorithm-agnostic and works with any signing key that
-/// implements the required traits.
+/// The builder is generic over `P: CryptoProvider` which defines the complete
+/// cryptographic suite (signature algorithm and digest algorithm).
 #[cfg(all(feature = "builder", feature = "signature"))]
-pub struct TightBeamSignedDataBuilder<S, D>
+pub struct TightBeamSignedDataBuilder<P>
 where
-	S: SignatureEncoding,
-	D: Digest,
+	P: crate::crypto::profiles::CryptoProvider,
 {
 	/// Signer implementing signature creation
-	signer: Box<dyn Signer<S>>,
+	signer: Box<dyn Signer<P::Signature>>,
 	/// Digest algorithm for hashing content
 	digest_alg: AlgorithmIdentifierOwned,
 	/// Signature algorithm identifier
@@ -37,19 +36,20 @@ where
 	signer_id: SignerIdentifier,
 	/// Content type OID (default: id-data)
 	content_type: ObjectIdentifier,
-	_phantom: core::marker::PhantomData<D>,
+	_phantom: core::marker::PhantomData<P>,
 }
 
 #[cfg(all(feature = "builder", feature = "signature"))]
-impl<S, D> TightBeamSignedDataBuilder<S, D>
+impl<P> TightBeamSignedDataBuilder<P>
 where
-	S: SignatureEncoding,
-	D: Digest + der::oid::AssociatedOid,
+	P: crate::crypto::profiles::CryptoProvider,
+	P::Signature: SignatureEncoding,
+	P::Digest: Digest + der::oid::AssociatedOid,
 {
 	/// Create a new SignedData builder.
 	///
 	/// # Parameters
-	/// - `signer`: The signing key (must implement `Signer<S>` and `Keypair`)
+	/// - `signer`: The signing key (must implement `Signer<P::Signature>` and `Keypair`)
 	/// - `digest_alg`: Algorithm identifier for the digest algorithm
 	/// - `signature_alg`: Algorithm identifier for the signature algorithm
 	///
@@ -61,14 +61,14 @@ where
 		signature_alg: AlgorithmIdentifierOwned,
 	) -> Result<Self, HandshakeError>
 	where
-		K: Signer<S> + Keypair + 'static,
+		K: Signer<P::Signature> + Keypair + 'static,
 		K::VerifyingKey: EncodePublicKey,
 	{
 		// Generate SKID from public key
 		let verifying_key = signer.verifying_key();
 		let public_key_der = verifying_key.to_public_key_der()?;
 
-		let mut hasher = D::new();
+		let mut hasher = P::Digest::new();
 		hasher.update(public_key_der.as_bytes());
 
 		let skid_bytes = hasher.finalize();
@@ -102,7 +102,7 @@ where
 	/// A complete CMS SignedData structure with signature
 	pub fn build(&mut self, content: &[u8]) -> Result<SignedData, HandshakeError> {
 		// 1. Hash the content
-		let mut hasher = D::new();
+		let mut hasher = P::Digest::new();
 		hasher.update(content);
 
 		let digest = hasher.finalize();
@@ -160,8 +160,8 @@ mod tests {
 	))]
 	mod signed_data {
 		use super::*;
-		use crate::crypto::hash::Sha3_256;
-		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 		use crate::der::Decode;
 		use crate::random::OsRng;
 
@@ -181,13 +181,13 @@ mod tests {
 		}
 
 		/// Helper function to create a test SignedData builder
-		fn create_test_signed_data_builder(
-		) -> Result<TightBeamSignedDataBuilder<Secp256k1Signature, Sha3_256>, HandshakeError> {
+		fn create_test_signed_data_builder() -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider>, HandshakeError>
+		{
 			let signing_key = create_test_signing_key();
 			let digest_alg = create_sha3_256_digest_alg();
 			let signature_alg = create_ecdsa_sha256_signature_alg();
 
-			TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(signing_key, digest_alg, signature_alg)
+			TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(signing_key, digest_alg, signature_alg)
 		}
 
 		#[test]

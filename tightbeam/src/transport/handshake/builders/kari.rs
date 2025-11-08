@@ -5,9 +5,11 @@
 
 use super::error::KariBuilderError;
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
+use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
+use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
+use crate::der::asn1::BitString;
+use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::error::HandshakeError;
-use der::asn1::BitString;
-use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 
 #[cfg(all(feature = "builder", feature = "aead"))]
 use cms::builder::{Error as CmsBuilderError, RecipientInfoBuilder, RecipientInfoType};
@@ -18,15 +20,8 @@ use cms::enveloped_data::{
 	EncryptedKey, KeyAgreeRecipientIdentifier, KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, OriginatorPublicKey,
 	RecipientEncryptedKey, RecipientInfo, UserKeyingMaterial,
 };
-
 #[cfg(feature = "zeroize")]
 use zeroize::Zeroize;
-
-use elliptic_curve::ecdh::diffie_hellman;
-use elliptic_curve::{PublicKey, SecretKey};
-
-#[cfg(feature = "kdf")]
-use hkdf::Hkdf;
 
 /// Builder for `KeyAgreeRecipientInfo` using ECDH + HKDF + key wrapping.
 ///
@@ -35,17 +30,19 @@ use hkdf::Hkdf;
 /// 2. HKDF derivation using UKM as salt to produce KEK.
 /// 3. Key wrapping (e.g., AES Key Wrap RFC 3394) of the content-encryption key.
 /// 4. Construction of CMS `KeyAgreeRecipientInfo` structure.
+///
+/// Generic over `P: CryptoProvider` to allow pluggable cryptographic implementations.
 #[cfg(all(feature = "builder", feature = "aead"))]
-pub struct TightBeamKariBuilder<C>
+pub struct TightBeamKariBuilder<P>
 where
-	C: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
+	P: crate::crypto::profiles::CryptoProvider,
 {
 	/// Sender's ephemeral private key for ECDH
-	sender_priv: Option<SecretKey<C>>,
+	sender_priv: Option<SecretKey<P::Curve>>,
 	/// Sender's ephemeral public key (originator)
 	sender_pub_spki: Option<SubjectPublicKeyInfoOwned>,
 	/// Recipient's public key for ECDH
-	recipient_pub: Option<PublicKey<C>>,
+	recipient_pub: Option<PublicKey<P::Curve>>,
 	/// Recipient identifier
 	recipient_rid: Option<KeyAgreeRecipientIdentifier>,
 	/// User Keying Material (client nonce || server nonce)
@@ -54,16 +51,14 @@ where
 	key_enc_alg: Option<AlgorithmIdentifierOwned>,
 	/// HKDF info string for KEK derivation
 	kdf_info: &'static [u8],
-	/// KDF function (takes shared secret, salt, info, and output length)
-	kdf: Box<dyn Fn(&[u8], &[u8], &[u8], usize) -> Result<Vec<u8>, HandshakeError>>,
-	/// Key wrap function (takes CEK and KEK, returns wrapped key)
-	key_wrapper: Box<dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, HandshakeError>>,
+	/// Cryptographic provider
+	provider: P,
 }
 
 #[cfg(all(feature = "builder", feature = "aead"))]
-impl<C> TightBeamKariBuilder<C>
+impl<P> TightBeamKariBuilder<P>
 where
-	C: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
+	P: crate::crypto::profiles::CryptoProvider,
 {
 	/// Create a new KARI builder with default KDF (HKDF-SHA3-256) and key wrapper (AES-KW).
 	///
@@ -72,7 +67,7 @@ where
 	///
 	/// Use `with_kdf_info()` to customize the KDF info string for interoperability.
 	#[cfg(all(feature = "kdf", feature = "sha3"))]
-	pub fn new() -> Self {
+	pub fn new(provider: P) -> Self {
 		Self {
 			sender_priv: None,
 			sender_pub_spki: None,
@@ -81,13 +76,12 @@ where
 			ukm: None,
 			key_enc_alg: None,
 			kdf_info: TIGHTBEAM_KARI_KDF_INFO,
-			kdf: Box::new(hkdf_sha3_256),
-			key_wrapper: Box::new(aes_key_wrap),
+			provider,
 		}
 	}
 
 	/// Set the sender's ephemeral private key for ECDH.
-	pub fn with_sender_priv(mut self, sender_priv: SecretKey<C>) -> Self {
+	pub fn with_sender_priv(mut self, sender_priv: SecretKey<P::Curve>) -> Self {
 		self.sender_priv = Some(sender_priv);
 		self
 	}
@@ -99,7 +93,7 @@ where
 	}
 
 	/// Set the recipient's static ECDH public key.
-	pub fn with_recipient_pub(mut self, recipient_pub: PublicKey<C>) -> Self {
+	pub fn with_recipient_pub(mut self, recipient_pub: PublicKey<P::Curve>) -> Self {
 		self.recipient_pub = Some(recipient_pub);
 		self
 	}
@@ -140,21 +134,6 @@ where
 		self
 	}
 
-	/// Set a custom KDF function.
-	pub fn with_kdf(mut self, kdf: Box<dyn Fn(&[u8], &[u8], &[u8], usize) -> Result<Vec<u8>, HandshakeError>>) -> Self {
-		self.kdf = kdf;
-		self
-	}
-
-	/// Set a custom key wrapper function.
-	pub fn with_key_wrapper(
-		mut self,
-		key_wrapper: Box<dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, HandshakeError>>,
-	) -> Self {
-		self.key_wrapper = key_wrapper;
-		self
-	}
-
 	/// Perform ECDH and derive shared secret.
 	fn derive_shared_secret(&self) -> Result<Vec<u8>, KariBuilderError> {
 		let sender_priv = self.sender_priv.as_ref().ok_or(KariBuilderError::MissingSenderPrivateKey)?;
@@ -164,24 +143,26 @@ where
 		Ok(shared_secret.raw_secret_bytes().as_ref().to_vec())
 	}
 
-	/// Derive key-encryption key (KEK) using configured KDF.
+	/// Derive key-encryption key (KEK) using provider's KDF.
 	///
 	/// Salt = UKM (clientNonce || serverNonce)
 	/// Info = self.kdf_info (e.g., `TIGHTBEAM_KARI_KDF_INFO`)
 	/// Output = 32 bytes (AES-256 KEK)
-	fn derive_kek(&self, shared_secret: &[u8]) -> Result<Vec<u8>, KariBuilderError> {
+	fn derive_kek(&self, shared_secret: &[u8]) -> Result<[u8; 32], KariBuilderError> {
 		let ukm = self.ukm.as_ref().ok_or(KariBuilderError::MissingUkm)?;
 		let salt = ukm.as_bytes();
-		(self.kdf)(shared_secret, salt, self.kdf_info, 32).map_err(|_| KariBuilderError::MissingUkm)
+		let kdf = self.provider.as_key_deriver::<HandshakeError, 32>();
+		kdf(shared_secret, salt, self.kdf_info).map_err(|_| KariBuilderError::MissingUkm)
 	}
 
-	/// Wrap content-encryption key using provided key wrapper function.
+	/// Wrap content-encryption key using provider's key wrapper function.
 	///
 	/// # Parameters
 	/// - `cek`: Content-encryption key to wrap
-	/// - `kek`: Key-encryption key
-	fn wrap_cek(&self, cek: &[u8], kek: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		(self.key_wrapper)(cek, kek)
+	/// - `kek`: Key-encryption key (32 bytes for AES-256)
+	fn wrap_cek(&self, cek: &[u8], kek: &[u8; 32]) -> Result<Vec<u8>, HandshakeError> {
+		let key_wrapper = self.provider.as_key_wrapper_32::<HandshakeError>();
+		key_wrapper(cek, kek)
 	}
 
 	/// Build originator field from sender's public key SPKI.
@@ -221,7 +202,7 @@ where
 	}
 }
 
-/// Default implementation for secp256k1 + HKDF-SHA3-256 + AES Key Wrap.
+/// Default implementation for DefaultCryptoProvider (secp256k1 + HKDF-SHA3-256 + AES Key Wrap).
 #[cfg(all(
 	feature = "builder",
 	feature = "aead",
@@ -229,7 +210,7 @@ where
 	feature = "kdf",
 	feature = "sha3"
 ))]
-impl Default for TightBeamKariBuilder<k256::Secp256k1> {
+impl Default for TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
 	fn default() -> Self {
 		Self {
 			sender_priv: None,
@@ -239,134 +220,15 @@ impl Default for TightBeamKariBuilder<k256::Secp256k1> {
 			ukm: None,
 			key_enc_alg: None,
 			kdf_info: TIGHTBEAM_KARI_KDF_INFO,
-			kdf: Box::new(hkdf_sha3_256),
-			key_wrapper: Box::new(aes_key_wrap),
+			provider: crate::crypto::profiles::DefaultCryptoProvider::default(),
 		}
 	}
-}
-
-/// HKDF-SHA3-256 KDF implementation.
-#[cfg(all(feature = "kdf", feature = "sha3"))]
-pub(crate) fn hkdf_sha3_256(
-	shared_secret: &[u8],
-	salt: &[u8],
-	info: &[u8],
-	out_len: usize,
-) -> Result<Vec<u8>, HandshakeError> {
-	let hk = Hkdf::<sha3::Sha3_256>::new(Some(salt), shared_secret);
-	let mut output = vec![0u8; out_len];
-	hk.expand(info, &mut output).map_err(|_| HandshakeError::KdfError)?;
-	Ok(output)
-}
-
-/// AES Key Wrap (RFC 3394) implementation using aes-kw crate.
-#[cfg(all(feature = "builder", feature = "aead"))]
-pub(crate) fn aes_key_wrap(cek: &[u8], kek: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-	use aes_kw::Kek;
-
-	// Validate KEK size (16, 24, or 32 bytes for AES-128/192/256)
-	if ![16, 24, 32].contains(&kek.len()) {
-		return Err(HandshakeError::InvalidKeySize { expected: 32, received: kek.len() });
-	}
-
-	// Validate CEK size (must be multiple of 8, minimum 16 bytes)
-	if cek.len() < 16 || cek.len() % 8 != 0 {
-		return Err(HandshakeError::InvalidKeySize {
-			expected: 16, // minimum
-			received: cek.len(),
-		});
-	}
-
-	// Create KEK based on key size and wrap the CEK
-	let wrapped = match kek.len() {
-		16 => {
-			let kek_array: &[u8; 16] = kek
-				.try_into()
-				.map_err(|_| HandshakeError::InvalidKeySize { expected: 16, received: kek.len() })?;
-			let kek_obj = Kek::<aes::Aes128>::from(*kek_array);
-			kek_obj.wrap_vec(cek)?
-		}
-		24 => {
-			let kek_array: &[u8; 24] = kek
-				.try_into()
-				.map_err(|_| HandshakeError::InvalidKeySize { expected: 24, received: kek.len() })?;
-			let kek_obj = Kek::<aes::Aes192>::from(*kek_array);
-			kek_obj.wrap_vec(cek)?
-		}
-		32 => {
-			let kek_array: &[u8; 32] = kek
-				.try_into()
-				.map_err(|_| HandshakeError::InvalidKeySize { expected: 32, received: kek.len() })?;
-			let kek_obj = Kek::<aes::Aes256>::from(*kek_array);
-			kek_obj.wrap_vec(cek)?
-		}
-		_ => unreachable!("KEK size already validated"),
-	};
-
-	Ok(wrapped)
-}
-
-/// AES Key Unwrap (RFC 3394) implementation using aes-kw crate.
-///
-/// Unwraps a wrapped CEK using the provided KEK. This is the inverse operation
-/// of `aes_key_wrap` and is used by the recipient to extract the CEK.
-///
-/// # Parameters
-/// - `wrapped_cek`: The wrapped content-encryption key (includes 8-byte IV)
-/// - `kek`: Key-encryption key (16, 24, or 32 bytes for AES-128/192/256)
-///
-/// # Returns
-/// The unwrapped CEK on success, or an error if unwrapping fails.
-#[cfg(all(feature = "builder", feature = "aead"))]
-pub(crate) fn aes_key_unwrap(wrapped_cek: &[u8], kek: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-	use aes_kw::Kek;
-
-	// Validate KEK size (16, 24, or 32 bytes for AES-128/192/256)
-	if ![16, 24, 32].contains(&kek.len()) {
-		return Err(HandshakeError::InvalidKeySize { expected: 32, received: kek.len() });
-	}
-
-	// Validate wrapped CEK size (must be at least 24 bytes: 8-byte IV + minimum 16-byte key)
-	if wrapped_cek.len() < 24 || wrapped_cek.len() % 8 != 0 {
-		return Err(HandshakeError::InvalidKeySize {
-			expected: 24, // minimum
-			received: wrapped_cek.len(),
-		});
-	}
-
-	// Create KEK based on key size and unwrap the CEK
-	let unwrapped = match kek.len() {
-		16 => {
-			let kek_array: &[u8; 16] = kek
-				.try_into()
-				.map_err(|_| HandshakeError::InvalidKeySize { expected: 16, received: kek.len() })?;
-			let kek_obj = Kek::<aes::Aes128>::from(*kek_array);
-			kek_obj.unwrap_vec(wrapped_cek)?
-		}
-		24 => {
-			let kek_array: &[u8; 24] = kek
-				.try_into()
-				.map_err(|_| HandshakeError::InvalidKeySize { expected: 24, received: kek.len() })?;
-			let kek_obj = Kek::<aes::Aes192>::from(*kek_array);
-			kek_obj.unwrap_vec(wrapped_cek)?
-		}
-		32 => {
-			let kek_array: &[u8; 32] = kek
-				.try_into()
-				.map_err(|_| HandshakeError::InvalidKeySize { expected: 32, received: kek.len() })?;
-			let kek_obj = Kek::<aes::Aes256>::from(*kek_array);
-			kek_obj.unwrap_vec(wrapped_cek)?
-		}
-		_ => unreachable!("KEK size already validated"),
-	};
-
-	Ok(unwrapped)
 }
 
 #[cfg(all(feature = "builder", feature = "aead"))]
-impl<C> RecipientInfoBuilder for TightBeamKariBuilder<C>
+impl<P> RecipientInfoBuilder for TightBeamKariBuilder<P>
 where
-	C: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
+	P: crate::crypto::profiles::CryptoProvider,
 {
 	fn recipient_info_type(&self) -> RecipientInfoType {
 		RecipientInfoType::Kari
@@ -443,176 +305,9 @@ mod tests {
 		feature = "kdf",
 		feature = "sha3"
 	))]
-	mod aes_key_wrap {
-		use super::*;
-
-		#[test]
-		fn test_basic() {
-			let kek = [
-				0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-				0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
-			];
-			let cek = [
-				0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
-				0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-			];
-
-			let wrapped = aes_key_wrap(&cek, &kek).expect("wrap should succeed");
-			// Wrapped output should be 8 bytes longer than input (IV + input)
-			assert_eq!(wrapped.len(), cek.len() + 8);
-		}
-
-		#[test]
-		fn test_invalid_kek_size() {
-			let kek = [0u8; 15]; // Invalid size
-			let cek = [0u8; 32];
-
-			let result = aes_key_wrap(&cek, &kek);
-			assert!(result.is_err());
-			assert!(matches!(result.unwrap_err(), HandshakeError::InvalidKeySize { .. }));
-		}
-
-		#[test]
-		fn test_invalid_cek_size() {
-			let kek = [0u8; 32];
-			let cek = [0u8; 15]; // Not multiple of 8
-
-			let result = aes_key_wrap(&cek, &kek);
-			assert!(result.is_err());
-			assert!(matches!(result.unwrap_err(), HandshakeError::InvalidKeySize { .. }));
-		}
-
-		#[test]
-		fn test_cek_too_small() {
-			let kek = [0u8; 32];
-			let cek = [0u8; 8]; // Minimum is 16 bytes
-
-			let result = aes_key_wrap(&cek, &kek);
-			assert!(result.is_err());
-			assert!(matches!(result.unwrap_err(), HandshakeError::InvalidKeySize { .. }));
-		}
-
-		#[test]
-		fn test_different_key_sizes() {
-			let cek = [0u8; 32];
-
-			// AES-128 (16-byte KEK)
-			let kek_128 = [0u8; 16];
-			let wrapped_128 = aes_key_wrap(&cek, &kek_128).expect("AES-128 wrap should succeed");
-			assert_eq!(wrapped_128.len(), 40);
-
-			// AES-192 (24-byte KEK)
-			let kek_192 = [0u8; 24];
-			let wrapped_192 = aes_key_wrap(&cek, &kek_192).expect("AES-192 wrap should succeed");
-			assert_eq!(wrapped_192.len(), 40);
-
-			// AES-256 (32-byte KEK)
-			let kek_256 = [0u8; 32];
-			let wrapped_256 = aes_key_wrap(&cek, &kek_256).expect("AES-256 wrap should succeed");
-			assert_eq!(wrapped_256.len(), 40);
-
-			// All should produce different results
-			assert_ne!(wrapped_128, wrapped_192);
-			assert_ne!(wrapped_192, wrapped_256);
-			assert_ne!(wrapped_128, wrapped_256);
-		}
-
-		#[test]
-		fn test_unwrap_basic() {
-			let kek = [
-				0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-				0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
-			];
-			let cek = [
-				0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
-				0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-			];
-
-			// Wrap then unwrap
-			let wrapped = aes_key_wrap(&cek, &kek).expect("wrap should succeed");
-			let unwrapped = aes_key_unwrap(&wrapped, &kek).expect("unwrap should succeed");
-
-			// Should get back original CEK
-			assert_eq!(unwrapped, cek);
-		}
-
-		#[test]
-		fn test_unwrap_invalid_kek_size() {
-			let kek = [0u8; 15]; // Invalid size
-			let wrapped_cek = [0u8; 40]; // Valid wrapped size
-
-			let result = aes_key_unwrap(&wrapped_cek, &kek);
-			assert!(result.is_err());
-			assert!(matches!(result.unwrap_err(), HandshakeError::InvalidKeySize { .. }));
-		}
-
-		#[test]
-		fn test_unwrap_invalid_wrapped_size() {
-			let kek = [0u8; 32];
-			let wrapped_cek = [0u8; 23]; // Not multiple of 8
-
-			let result = aes_key_unwrap(&wrapped_cek, &kek);
-			assert!(result.is_err());
-			assert!(matches!(result.unwrap_err(), HandshakeError::InvalidKeySize { .. }));
-		}
-
-		#[test]
-		fn test_unwrap_wrapped_too_small() {
-			let kek = [0u8; 32];
-			let wrapped_cek = [0u8; 16]; // Minimum is 24 bytes (IV + 16-byte key)
-
-			let result = aes_key_unwrap(&wrapped_cek, &kek);
-			assert!(result.is_err());
-			assert!(matches!(result.unwrap_err(), HandshakeError::InvalidKeySize { .. }));
-		}
-
-		#[test]
-		fn test_unwrap_wrong_kek() {
-			let kek = [0x00u8; 32];
-			let wrong_kek = [0xFFu8; 32];
-			let cek = [0x42u8; 32];
-
-			// Wrap with correct KEK
-			let wrapped = aes_key_wrap(&cek, &kek).expect("wrap should succeed");
-
-			// Try to unwrap with wrong KEK - should fail
-			let result = aes_key_unwrap(&wrapped, &wrong_kek);
-			assert!(result.is_err());
-		}
-
-		#[test]
-		fn test_roundtrip_different_key_sizes() {
-			let cek = [0x42u8; 32];
-
-			// AES-128
-			let kek_128 = [0x11u8; 16];
-			let wrapped_128 = aes_key_wrap(&cek, &kek_128).expect("AES-128 wrap should succeed");
-			let unwrapped_128 = aes_key_unwrap(&wrapped_128, &kek_128).expect("AES-128 unwrap should succeed");
-			assert_eq!(unwrapped_128, cek);
-
-			// AES-192
-			let kek_192 = [0x22u8; 24];
-			let wrapped_192 = aes_key_wrap(&cek, &kek_192).expect("AES-192 wrap should succeed");
-			let unwrapped_192 = aes_key_unwrap(&wrapped_192, &kek_192).expect("AES-192 unwrap should succeed");
-			assert_eq!(unwrapped_192, cek);
-
-			// AES-256
-			let kek_256 = [0x33u8; 32];
-			let wrapped_256 = aes_key_wrap(&cek, &kek_256).expect("AES-256 wrap should succeed");
-			let unwrapped_256 = aes_key_unwrap(&wrapped_256, &kek_256).expect("AES-256 unwrap should succeed");
-			assert_eq!(unwrapped_256, cek);
-		}
-	}
-
-	#[cfg(all(
-		feature = "builder",
-		feature = "aead",
-		feature = "secp256k1",
-		feature = "kdf",
-		feature = "sha3"
-	))]
 	mod builder {
 		use super::*;
+		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
 		use crate::der::asn1::ObjectIdentifier;
 		use crate::der::{Decode, Encode};
@@ -622,13 +317,13 @@ mod tests {
 		};
 
 		/// Helper function to create a fully configured test KARI builder
-		fn create_test_kari_builder() -> TightBeamKariBuilder<k256::Secp256k1> {
+		fn create_test_kari_builder() -> TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
 			let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
 			let ukm = create_test_ukm();
 			let rid = create_test_recipient_id();
 			let key_enc_alg = create_test_key_enc_alg();
 
-			TightBeamKariBuilder::<k256::Secp256k1>::default()
+			TightBeamKariBuilder::default()
 				.with_sender_priv(sender_key)
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)
@@ -639,7 +334,7 @@ mod tests {
 
 		#[test]
 		fn test_validation() {
-			let builder = TightBeamKariBuilder::<k256::Secp256k1>::default();
+			let builder = TightBeamKariBuilder::<crate::crypto::profiles::DefaultCryptoProvider>::default();
 
 			// Should fail validation with all None fields
 			let result = builder.validate();
@@ -651,7 +346,7 @@ mod tests {
 		fn test_fluent_interface() {
 			let sender_key = K256SecretKey::random(&mut OsRng);
 
-			let builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
+			let builder = TightBeamKariBuilder::<crate::crypto::profiles::DefaultCryptoProvider>::default()
 				.with_sender_priv(sender_key.clone())
 				.with_kdf_info(b"test-info");
 
@@ -719,7 +414,7 @@ mod tests {
 			let cek = [0x33u8; 32];
 
 			// 6. Build KARI
-			let mut builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
+			let mut builder = TightBeamKariBuilder::<DefaultCryptoProvider>::default()
 				.with_sender_priv(sender_key)
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)

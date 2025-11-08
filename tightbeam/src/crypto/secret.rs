@@ -7,9 +7,11 @@
 //! - Zeroize on drop for the inner value
 //! - Blanket From<T> for ergonomic construction
 
-use core::{any, convert::Infallible, fmt, str::FromStr};
-use der::{self, Decode, Encode, FixedTag};
+use core::convert::Infallible;
+use core::str::FromStr;
+use core::{any, fmt};
 
+use crate::der::{self, Decode, Encode, FixedTag};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A secret wrapper that zeroizes its inner value on drop.
@@ -24,6 +26,13 @@ impl<S: Zeroize + ?Sized> Secret<S> {
 	/// Construct from a pre-boxed secret value.
 	pub fn new(boxed: Box<S>) -> Self {
 		Self { inner: Some(boxed) }
+	}
+
+	/// Ephemeral immutable access to the inner secret via a closure to allow
+	/// for secure introspection.
+	pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> R {
+		let inner = self.inner.as_ref().expect("secret moved");
+		f(inner.as_ref())
 	}
 }
 
@@ -134,6 +143,7 @@ where
 	[T]: Zeroize,
 {
 	type Raw = Box<[T]>;
+
 	fn to_insecure(self) -> Box<[T]> {
 		let mut this = self;
 		this.inner.take().expect("secret moved")
@@ -142,6 +152,7 @@ where
 
 impl ToInsecure for Secret<str> {
 	type Raw = Box<str>;
+
 	fn to_insecure(self) -> Box<str> {
 		let mut this = self;
 		this.inner.take().expect("secret moved")
@@ -151,7 +162,6 @@ impl ToInsecure for Secret<str> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use core::str::FromStr;
 
 	#[test]
 	fn test_secret_string_from_str() {
@@ -175,5 +185,15 @@ mod tests {
 		let s2: SecretSlice<u8> = Vec::from([9u8, 8u8, 7u8]).into();
 		let raw2: Box<[u8]> = s2.to_insecure();
 		assert_eq!(&*raw2, &[9, 8, 7]);
+	}
+
+	#[test]
+	fn test_with_immutable_access() {
+		let s: SecretString = SecretString::from("abcdef");
+		let len = s.with(|inner| inner.len());
+		assert_eq!(len, 6);
+
+		let raw = s.to_insecure();
+		assert_eq!(&*raw, "abcdef");
 	}
 }

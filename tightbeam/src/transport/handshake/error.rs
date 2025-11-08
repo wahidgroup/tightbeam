@@ -89,6 +89,15 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Handshake timeout"))]
 	Timeout,
 
+	/// Invalid profile selection - server selected profile not in client's offer
+	#[cfg_attr(feature = "derive", error("Server selected profile not in client's offer"))]
+	InvalidProfileSelection,
+
+	/// Negotiation error
+	#[cfg_attr(feature = "derive", error("Profile negotiation failed: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	NegotiationError(crate::crypto::negotiation::NegotiationError),
+
 	// ---------------- Attribute / ASN.1 profile errors ----------------
 	#[cfg_attr(feature = "derive", error("Attribute must contain exactly one value"))]
 	InvalidAttributeArity,
@@ -187,6 +196,8 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::MissingClientRandomState => write!(f, "Missing client random"),
 			HandshakeError::MissingServerRandom => write!(f, "Missing server random"),
 			HandshakeError::Timeout => write!(f, "Handshake timeout"),
+			HandshakeError::InvalidProfileSelection => write!(f, "Server selected profile not in client's offer"),
+			HandshakeError::NegotiationError(e) => write!(f, "Profile negotiation failed: {}", e),
 			HandshakeError::DerError(e) => write!(f, "DER error: {}", e),
 			HandshakeError::InvalidAttributeArity => write!(f, "Attribute must contain exactly one value"),
 			HandshakeError::DuplicateAttribute => write!(f, "Duplicate attribute present"),

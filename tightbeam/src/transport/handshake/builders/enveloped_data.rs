@@ -8,6 +8,9 @@ use crate::asn1::{DATA_OID, ENVELOPED_DATA_OID};
 use crate::cms::builder::RecipientInfoBuilder;
 use crate::cms::content_info::{CmsVersion, ContentInfo};
 use crate::cms::enveloped_data::EnvelopedData;
+use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize};
 use crate::der::asn1::{OctetString, SetOfVec};
 use crate::der::Encode;
 use crate::spki::AlgorithmIdentifierOwned;
@@ -28,22 +31,22 @@ use crate::transport::handshake::utils::{aes_256_gcm_algorithm, aes_gcm_encrypt,
 /// 3. Encrypt plaintext content with CEK using AES-GCM
 /// 4. Wrap everything into EnvelopedData structure
 #[cfg(all(feature = "builder", feature = "aead"))]
-pub struct TightBeamEnvelopedDataBuilder<C>
+pub struct TightBeamEnvelopedDataBuilder<P>
 where
-	C: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
+	P: CryptoProvider,
 {
-	kari_builder: Option<TightBeamKariBuilder<C>>,
+	kari_builder: Option<TightBeamKariBuilder<P>>,
 	content_encryption_alg: Option<AlgorithmIdentifierOwned>,
 	unprotected_attrs: Vec<HandshakeAttribute>,
 	encryptor: Box<dyn Fn(&[u8], &[u8], Option<&[u8]>) -> Result<Vec<u8>, HandshakeError>>,
 }
 
 #[cfg(all(feature = "builder", feature = "aead"))]
-impl<C> TightBeamEnvelopedDataBuilder<C>
+impl<P> TightBeamEnvelopedDataBuilder<P>
 where
-	C: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
-	elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
-	elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
+	P: CryptoProvider,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	FieldBytesSize<P::Curve>: ModulusSize,
 {
 	/// Create a new EnvelopedData builder with the given KARI builder.
 	///
@@ -59,7 +62,7 @@ where
 	///
 	/// let builder = TightBeamEnvelopedDataBuilder::new(kari);
 	/// ```
-	pub fn new(kari_builder: TightBeamKariBuilder<C>) -> Self {
+	pub fn new(kari_builder: TightBeamKariBuilder<P>) -> Self {
 		Self {
 			kari_builder: Some(kari_builder),
 			content_encryption_alg: None,
@@ -214,6 +217,7 @@ where
 		})
 	}
 }
+
 /// Default implementation for secp256k1 + AES-256-GCM.
 #[cfg(all(
 	feature = "builder",
@@ -222,7 +226,7 @@ where
 	feature = "kdf",
 	feature = "sha3"
 ))]
-impl TightBeamEnvelopedDataBuilder<k256::Secp256k1> {
+impl TightBeamEnvelopedDataBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
 	/// Create a builder with default TightBeam settings.
 	///
 	/// Uses:
@@ -230,7 +234,7 @@ impl TightBeamEnvelopedDataBuilder<k256::Secp256k1> {
 	/// - HKDF-SHA3-256 for KDF
 	/// - AES-256 key wrap for KEK
 	/// - AES-256-GCM for content encryption
-	pub fn with_defaults(kari_builder: TightBeamKariBuilder<k256::Secp256k1>) -> Self {
+	pub fn with_defaults(kari_builder: TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider>) -> Self {
 		Self::new(kari_builder).with_content_encryption_alg(aes_256_gcm_algorithm())
 	}
 }
@@ -256,7 +260,7 @@ mod tests {
 
 		// Test helper functions
 
-		fn create_test_kari_builder() -> TightBeamKariBuilder<k256::Secp256k1> {
+		fn create_test_kari_builder() -> TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
 			// 1. Create sender keypair
 			let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
 
@@ -270,7 +274,7 @@ mod tests {
 			let key_enc_alg = create_test_key_enc_alg();
 
 			// 5. Build and return KARI builder
-			TightBeamKariBuilder::<k256::Secp256k1>::default()
+			TightBeamKariBuilder::default()
 				.with_sender_priv(sender_key)
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)

@@ -45,6 +45,7 @@ mod tests;
 use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfos};
+use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
 use crate::der::{Decode, Encode, Enumerated, Sequence};
 use crate::transport::error::TransportError;
 use crate::x509::Certificate;
@@ -189,9 +190,14 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 	fn decrypt_kari(
 		&self,
 		enveloped_data_der: &[u8],
-		kdf_info: &[u8],
+		_kdf_info: &[u8],
 		recipient_index: usize,
 	) -> core::result::Result<Vec<u8>, HandshakeError> {
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::crypto::sign::elliptic_curve::SecretKey;
+		use crate::transport::handshake::processors::enveloped_data::RecipientProcessor;
+		use crate::transport::handshake::processors::kari::TightBeamKariRecipient;
+
 		// 1. Decode the enveloped data
 		let enveloped_data = cms::enveloped_data::EnvelopedData::from_der(enveloped_data_der)
 			.map_err(|e| HandshakeError::DerError(e))?;
@@ -203,53 +209,15 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 			.get(recipient_index)
 			.ok_or(HandshakeError::InvalidRecipientIndex)?;
 
-		let kari = match recipient_info {
-			cms::enveloped_data::RecipientInfo::Kari(k) => k,
-			_ => return Err(HandshakeError::UnsupportedOriginatorIdentifier),
-		};
-
-		// 3. Extract originator's public key
-		use cms::enveloped_data::OriginatorIdentifierOrKey;
-		let originator_pub = match &kari.originator {
-			OriginatorIdentifierOrKey::OriginatorKey(orig_key) => {
-				let pub_key_bytes = orig_key.public_key.raw_bytes();
-				crate::crypto::sign::elliptic_curve::PublicKey::<k256::Secp256k1>::from_sec1_bytes(pub_key_bytes)
-					.map_err(|_| HandshakeError::InvalidOriginatorPublicKey)?
-			}
-			_ => return Err(HandshakeError::UnsupportedOriginatorIdentifier),
-		};
-
-		// 4. Perform ECDH to get shared secret
-		use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
-		use crate::crypto::sign::elliptic_curve::SecretKey;
+		// 3. Convert self to SecretKey
 		let secret = SecretKey::from(self.clone());
-		let shared_secret = diffie_hellman(secret.to_nonzero_scalar(), originator_pub.as_affine());
 
-		// 5. Derive KEK using HKDF
-		use crate::transport::handshake::builders::kari::hkdf_sha3_256;
-		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
-		let salt = ukm.as_bytes();
-		let kek = hkdf_sha3_256(shared_secret.raw_secret_bytes().as_ref(), salt, kdf_info, 32)
-			.map_err(|_| HandshakeError::KdfError)?;
+		// 4. Create processor with default KDF info (TIGHTBEAM_KARI_KDF_INFO)
+		let provider = DefaultCryptoProvider::default();
+		let processor = TightBeamKariRecipient::new(provider, secret);
 
-		// 6. Unwrap the CEK
-		use crate::transport::handshake::builders::kari::aes_key_unwrap;
-		if recipient_index >= kari.recipient_enc_keys.len() {
-			return Err(HandshakeError::InvalidRecipientIndex);
-		}
-		let wrapped_key = kari.recipient_enc_keys[recipient_index].enc_key.as_bytes();
-		let cek = aes_key_unwrap(wrapped_key, &kek)
-			.map_err(|_| HandshakeError::InvalidKeySize { expected: 32, received: 0 })?;
-
-		// 7. Zeroize KEK for security
-		#[cfg(feature = "zeroize")]
-		{
-			use zeroize::Zeroize;
-			let mut kek_vec = kek.to_vec();
-			kek_vec.zeroize();
-		}
-
-		Ok(cek)
+		// 5. Process KARI to extract CEK
+		processor.process_recipient(recipient_info, recipient_index)
 	}
 
 	#[cfg(all(feature = "builder", feature = "signature"))]
@@ -259,12 +227,11 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 		digest_alg: &crate::spki::AlgorithmIdentifierOwned,
 		signature_alg: &crate::spki::AlgorithmIdentifierOwned,
 	) -> core::result::Result<Vec<u8>, HandshakeError> {
-		use crate::crypto::hash::Sha3_256;
-		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 
 		// Create builder with concrete signature and digest types
-		let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
+		let mut builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(
 			self.clone(),
 			digest_alg.clone(),
 			signature_alg.clone(),
@@ -429,6 +396,8 @@ impl Default for HandshakeProtocolKind {
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientHello {
 	pub client_random: OctetString,
+	#[asn1(optional = "true")]
+	pub security_offer: Option<SecurityOffer>,
 }
 
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
@@ -437,6 +406,8 @@ pub struct ServerHandshake {
 	pub certificate: Certificate,
 	pub server_random: OctetString,
 	pub signature: OctetString,
+	#[asn1(optional = "true")]
+	pub security_accept: Option<SecurityAccept>,
 }
 
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]

@@ -2,6 +2,7 @@
 //!
 //! This module provides common test fixtures, helper functions, and data structures
 //! used across all handshake test modules to reduce duplication and improve maintainability.
+#![allow(unused)]
 
 use crate::asn1::{OctetString, AES_256_WRAP_OID, HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_256_OID};
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
@@ -14,6 +15,18 @@ use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshak
 use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate};
+
+/// Create a default test security profile for handshake tests.
+pub fn create_default_test_profile() -> crate::crypto::profiles::SecurityProfileDesc {
+	crate::crypto::profiles::SecurityProfileDesc {
+		digest: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
+		#[cfg(feature = "aead")]
+		aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")), // AES-256-GCM
+		#[cfg(feature = "signature")]
+		signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")), // ECDSA-SHA3-256
+		key_wrap: None,
+	}
+}
 
 /// Test certificate data structure for consistent certificate creation across tests.
 #[derive(Debug, Clone)]
@@ -121,7 +134,7 @@ pub fn compute_test_transcript_hash(client_random: &[u8; 32], server_random: &[u
 
 /// Create a test ClientHello message with the given client random.
 pub fn create_test_client_hello(client_random: &[u8; 32]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-	let client_hello = ClientHello { client_random: OctetString::new(*client_random)? };
+	let client_hello = ClientHello { client_random: OctetString::new(*client_random)?, security_offer: None };
 	Ok(client_hello.to_der()?)
 }
 
@@ -135,6 +148,7 @@ pub fn create_test_server_handshake(
 		certificate: certificate.clone(),
 		server_random: OctetString::new(*server_random)?,
 		signature: OctetString::new(signature)?,
+		security_accept: Some(crate::crypto::negotiation::SecurityAccept::new(create_default_test_profile())),
 	};
 	Ok(server_handshake.to_der()?)
 }
@@ -257,11 +271,16 @@ impl TestEciesServerBuilder {
 				.unwrap_or_else(|| create_test_certificate())
 		};
 
-		EciesHandshakeServer::new(
+		let mut server = EciesHandshakeServer::new(
 			Arc::new(test_cert_data.signing_key),
 			test_cert_data.certificate,
 			self.aad_domain,
-		)
+		);
+
+		// Add default test profile to ensure server always has supported profiles
+		server = server.with_supported_profiles(vec![create_default_test_profile()]);
+
+		server
 	}
 }
 
@@ -407,8 +426,9 @@ impl TestCmsClientBuilder {
 			.unwrap_or_else(|| create_test_certificate_from_key(&create_test_certificate().signing_key));
 		let transcript_hash = self.transcript_hash.unwrap_or_else(|| vec![1u8; 32]);
 
+		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::transport::handshake::client::CmsHandshakeClientSecp256k1;
-		CmsHandshakeClientSecp256k1::new(client_key, server_cert, transcript_hash)
+		CmsHandshakeClientSecp256k1::new(DefaultCryptoProvider::default(), client_key, server_cert, transcript_hash)
 	}
 }
 
