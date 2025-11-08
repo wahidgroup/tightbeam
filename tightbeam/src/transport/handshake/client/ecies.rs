@@ -12,6 +12,7 @@ use core::marker::PhantomData;
 use crate::asn1::OctetString;
 use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::{Aes256Gcm, KeyInit};
+use crate::crypto::ecies::EciesEphemeral;
 use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::kdf::{hkdf, HkdfSha3_256};
@@ -20,55 +21,13 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::sign::Verifier;
+use crate::crypto::x509::validate_certificate_expiry;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::state::{ClientStateTransition, HandshakeState, StateTransition};
 use crate::transport::handshake::{ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake};
 use crate::x509::Certificate;
-
-#[cfg(feature = "time")]
-fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
-	use time::OffsetDateTime;
-
-	let now = OffsetDateTime::now_utc();
-	let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
-	let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
-
-	let now_duration = time::Duration::seconds(now.unix_timestamp());
-
-	if now_duration < not_before {
-		return Err(HandshakeError::CertificateNotYetValid);
-	}
-
-	if now_duration > not_after {
-		return Err(HandshakeError::CertificateExpired);
-	}
-
-	Ok(())
-}
-
-#[cfg(all(feature = "std", not(feature = "time")))]
-fn validate_certificate(cert: &Certificate) -> Result<(), HandshakeError> {
-	let now = std::time::SystemTime::now();
-	let not_before = cert.tbs_certificate.validity.not_before.to_system_time();
-	let not_after = cert.tbs_certificate.validity.not_after.to_system_time();
-
-	if now < not_before {
-		return Err(HandshakeError::CertificateNotYetValid);
-	}
-
-	if now > not_after {
-		return Err(HandshakeError::CertificateExpired);
-	}
-
-	Ok(())
-}
-
-#[cfg(all(not(feature = "std"), not(feature = "time")))]
-fn validate_certificate(_cert: &Certificate) -> Result<(), HandshakeError> {
-	Err(HandshakeError::InvalidTimestamp)
-}
 
 /// Client-side ECIES handshake orchestrator.
 ///
@@ -102,7 +61,7 @@ where
 	C::FieldBytesSize: ModulusSize,
 	C::AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>,
 	PublicKey<C>: EciesPublicKeyOps,
-	<PublicKey<C> as EciesPublicKeyOps>::SecretKey: crate::crypto::ecies::EciesEphemeral<PublicKey = PublicKey<C>>,
+	<PublicKey<C> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<C>>,
 	Sig: SignatureEncoding,
 	for<'a> Sig: TryFrom<&'a [u8]>,
 	for<'a> <Sig as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
@@ -124,21 +83,73 @@ where
 			_phantom: PhantomData,
 		}
 	}
+
+	/// Validate that the current state matches the expected state.
+	fn validate_expected_state(&self, expected: HandshakeState) -> Result<(), HandshakeError> {
+		if self.state.state() != expected {
+			return Err(HandshakeError::InvalidState);
+		}
+		Ok(())
+	}
+
+	/// Validate server handshake and extract components.
+	fn validate_and_extract_server_handshake(
+		&self,
+		server_handshake_der: &[u8],
+	) -> Result<ServerHandshake, HandshakeError> {
+		// Decode ServerHandshake
+		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
+
+		// Validate certificate
+		validate_certificate_expiry(&server_handshake.certificate)?;
+
+		Ok(server_handshake)
+	}
+
+	/// Extract and store server random from handshake.
+	fn extract_server_random(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
+		let server_random = self.octet_string_to_array(&server_handshake.server_random)?;
+		self.server_random = Some(server_random);
+		Ok(())
+	}
+
+	/// Compute and store transcript hash.
+	fn compute_and_store_transcript_hash(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
+		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
+		let server_random = self.server_random.ok_or(HandshakeError::InvalidState)?;
+		let subject_public_key_info_bytes = server_handshake
+			.certificate
+			.tbs_certificate
+			.subject_public_key_info
+			.subject_public_key
+			.raw_bytes();
+
+		let transcript_digest =
+			self.compute_transcript_hash(&client_random, &server_random, subject_public_key_info_bytes);
+		self.transcript_hash = Some(transcript_digest);
+		Ok(())
+	}
+
+	/// Generate and store base session key.
+	fn generate_base_session_key(&mut self) -> Result<(), HandshakeError> {
+		let base_key = generate_nonce::<32>(None)?;
+		self.base_session_key = Some(base_key);
+		Ok(())
+	}
+
 	/// Build ClientHello message.
 	///
 	/// # Returns
 	/// DER-encoded ClientHello
 	pub fn build_client_hello(&mut self) -> Result<Vec<u8>, HandshakeError> {
-		// Validate state
-		if self.state.state() != HandshakeState::Init {
-			return Err(HandshakeError::InvalidState);
-		}
+		// 1. Validation
+		self.validate_expected_state(HandshakeState::Init)?;
 
-		// Generate client random
+		// 2. Generate client random
 		let client_random = generate_nonce::<32>(None)?;
 		self.client_random = Some(client_random);
 
-		// Build ClientHello
+		// 3. Build ClientHello
 		let client_hello = ClientHello { client_random: OctetString::new(client_random)? };
 
 		// Note: State doesn't transition yet - we're waiting for server response
@@ -153,45 +164,28 @@ where
 	/// # Returns
 	/// DER-encoded ClientKeyExchange
 	pub fn process_server_handshake(&mut self, server_handshake_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		// Validate state
-		if self.state.state() != HandshakeState::Init {
-			return Err(HandshakeError::InvalidState);
-		}
-
-		// Require client_random to be set (client hello must have been built)
+		// 1. Validation
+		self.validate_expected_state(HandshakeState::Init)?;
 		let _client_random_check = self.client_random.ok_or(HandshakeError::InvalidState)?;
 
-		// Decode ServerHandshake
-		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
+		// 2. Decode and validate server handshake
+		let server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
 
-		// Validate certificate
-		validate_certificate(&server_handshake.certificate)?;
+		// 3. Extract server random
+		self.extract_server_random(&server_handshake)?;
 
-		// Extract server random
-		let server_random = self.octet_string_to_array(&server_handshake.server_random)?;
-		self.server_random = Some(server_random);
-
-		// Extract verifying key
+		// 4. Extract verifying key and verify signature
 		let verifying_key = self.extract_verifying_key(&server_handshake.certificate)?;
+		self.compute_and_store_transcript_hash(&server_handshake)?;
+		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+		self.verify_server_signature(&verifying_key, &transcript_digest, server_handshake.signature.as_bytes())?;
 
-		// Verify signature
+		// 5. Generate base session key
+		self.generate_base_session_key()?;
+		let base_key = self.base_session_key.ok_or(HandshakeError::InvalidState)?;
+
+		// 6. Encrypt session key with ECIES
 		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
-		let spki_bytes = server_handshake
-			.certificate
-			.tbs_certificate
-			.subject_public_key_info
-			.subject_public_key
-			.raw_bytes();
-		let digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes);
-		self.transcript_hash = Some(digest);
-
-		self.verify_server_signature(&verifying_key, &digest, server_handshake.signature.as_bytes())?;
-
-		// Generate base session key
-		let base_key = generate_nonce::<32>(None)?;
-		self.base_session_key = Some(base_key);
-
-		// Encrypt session key with ECIES
 		let encrypted_bytes = self.perform_ecies_encryption(
 			&base_key,
 			&client_random,
@@ -199,10 +193,10 @@ where
 			self.aad_domain_tag.as_deref(),
 		)?;
 
-		// Build ClientKeyExchange
+		// 7. Build ClientKeyExchange
 		let client_kex = ClientKeyExchange { encrypted_data: OctetString::new(encrypted_bytes)? };
 
-		// Transition state
+		// 8. Transition state
 		self.state.transition(HandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex.to_der()?)
@@ -213,22 +207,20 @@ where
 	/// # Returns
 	/// AES-256-GCM session key
 	pub fn complete(&mut self) -> Result<Aes256Gcm, HandshakeError> {
-		// Validate state
-		if self.state.state() != HandshakeState::KeyExchangeSent {
-			return Err(HandshakeError::InvalidState);
-		}
+		// 1. Validation
+		self.validate_expected_state(HandshakeState::KeyExchangeSent)?;
 
-		// Derive final session key
+		// 2. Derive final session key
 		let base_key = self.base_session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
 		let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 		let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 
 		let session_key = self.derive_final_session_key(base_key, client_random, server_random)?;
 
-		// Transition to complete
+		// 3. Transition to complete
 		self.state.transition(HandshakeState::Complete)?;
 
-		// Clear sensitive data
+		// 4. Clear sensitive data
 		if let Some(mut bk) = self.base_session_key.take() {
 			bk.fill(0);
 		}
@@ -363,7 +355,7 @@ where
 	C::FieldBytesSize: ModulusSize,
 	C::AffinePoint: FromEncodedPoint<C> + ToEncodedPoint<C>,
 	PublicKey<C>: EciesPublicKeyOps,
-	<PublicKey<C> as EciesPublicKeyOps>::SecretKey: crate::crypto::ecies::EciesEphemeral<PublicKey = PublicKey<C>>,
+	<PublicKey<C> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<C>>,
 	Sig: SignatureEncoding + Send + Sync,
 	for<'a> Sig: TryFrom<&'a [u8]>,
 	for<'a> <Sig as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
@@ -442,7 +434,7 @@ where
 /// convenient alias for the generic `EciesHandshakeClient`.
 #[cfg(feature = "secp256k1")]
 pub type EciesHandshakeClientSecp256k1 = EciesHandshakeClient<
-	k256::Secp256k1,
+	crate::crypto::sign::ecdsa::k256::Secp256k1,
 	crate::crypto::sign::ecdsa::Secp256k1Signature,
 	crate::crypto::sign::ecdsa::Secp256k1VerifyingKey,
 	crate::crypto::ecies::Secp256k1EciesMessage,
@@ -462,106 +454,52 @@ impl ExtractVerifyingKey for crate::crypto::sign::ecdsa::Secp256k1VerifyingKey {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use crate::crypto::sign::Signer;
-	use crate::der::asn1::ObjectIdentifier;
-	use crate::random::OsRng;
-	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
-	use crate::x509::time::Validity;
-	use crate::x509::{name::RdnSequence, TbsCertificate};
-
-	// Type alias for tests
-	type TestClient = EciesHandshakeClientSecp256k1;
-
-	fn create_test_certificate(signing_key: &Secp256k1SigningKey) -> Certificate {
-		let verifying_key = *signing_key.verifying_key();
-		let public_key_der = verifying_key.to_public_key_der().unwrap();
-
-		let tbs_cert = TbsCertificate {
-			version: crate::x509::Version::V3,
-			serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).unwrap(),
-			signature: AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
-				parameters: None,
-			},
-			issuer: RdnSequence::default(),
-			validity: Validity {
-				not_before: crate::x509::time::Time::GeneralTime(
-					crate::der::asn1::GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(0)).unwrap(),
-				),
-				not_after: crate::x509::time::Time::GeneralTime(
-					crate::der::asn1::GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(
-						u32::MAX as u64,
-					))
-					.unwrap(),
-				),
-			},
-			subject: RdnSequence::default(),
-			subject_public_key_info: crate::spki::SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())
-				.unwrap(),
-			issuer_unique_id: None,
-			subject_unique_id: None,
-			extensions: None,
-		};
-
-		Certificate {
-			tbs_certificate: tbs_cert,
-			signature_algorithm: AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
-				parameters: None,
-			},
-			signature: crate::der::asn1::BitString::new(0, vec![0; 64]).unwrap(),
-		}
-	}
+	use crate::transport::handshake::tests::*;
 
 	#[test]
 	fn test_client_state_flow() -> Result<(), Box<dyn std::error::Error>> {
-		// Setup
-		let server_key = Secp256k1SigningKey::random(&mut OsRng);
-		let server_cert = create_test_certificate(&server_key);
-
-		// Create client
-		let mut client = TestClient::new(Some(b"test-domain".to_vec()));
+		// Given: A client in init state
+		let mut client = TestEciesClientBuilder::new().build();
 		assert_eq!(client.state(), HandshakeState::Init);
 
-		// Build ClientHello
-		let _client_hello = client.build_client_hello()?;
+		// When: Client builds client hello
+		let _client_hello_der = client.build_client_hello()?;
 		assert_eq!(client.state(), HandshakeState::Init); // Still waiting for server
 		assert!(client.client_random.is_some());
 
-		// Server builds ServerHandshake
+		// And: Server creates a valid server handshake response
+		let test_cert = create_test_certificate();
 		let client_random = client.client_random.unwrap();
-		let server_random = generate_nonce::<32>(None)?;
-		let spki_bytes = server_cert
-			.tbs_certificate
-			.subject_public_key_info
-			.subject_public_key
-			.raw_bytes();
+		let server_random = crate::random::generate_nonce::<32>(None)?;
+		let transcript_hash = compute_test_transcript_hash(
+			&client_random,
+			&server_random,
+			test_cert
+				.certificate
+				.tbs_certificate
+				.subject_public_key_info
+				.subject_public_key
+				.raw_bytes(),
+		);
 
-		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len());
-		data.extend_from_slice(&client_random);
-		data.extend_from_slice(&server_random);
-		data.extend_from_slice(spki_bytes);
-		let digest = Sha3_256::digest(&data);
-		let mut digest_arr = [0u8; 32];
-		digest_arr.copy_from_slice(&digest);
+		let signature_bytes: crate::crypto::sign::ecdsa::Secp256k1Signature =
+			test_cert.signing_key.try_sign(&transcript_hash)?;
+		let server_handshake_der =
+			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
 
-		let signature: Secp256k1Signature = server_key.try_sign(&digest_arr)?;
-
-		let server_handshake = ServerHandshake {
-			certificate: server_cert,
-			server_random: OctetString::new(server_random)?,
-			signature: OctetString::new(signature.to_bytes().as_slice())?,
-		};
-
-		// Process ServerHandshake
-		let _client_kex = client.process_server_handshake(&server_handshake.to_der()?)?;
+		// When: Client processes the server handshake
+		let client_kex_der = client.process_server_handshake(&server_handshake_der)?;
 		assert_eq!(client.state(), HandshakeState::KeyExchangeSent);
 		assert!(client.base_session_key.is_some());
 		assert!(client.transcript_hash.is_some());
 
-		// Complete
+		// And: Client key exchange message is valid
+		let _client_kex = ClientKeyExchange::from_der(&client_kex_der)?;
+		// When: Client completes the handshake
 		let _session_key = client.complete()?;
+
+		// Then: Handshake is complete
 		assert!(client.is_complete());
 		assert_eq!(client.state(), HandshakeState::Complete);
 
@@ -570,16 +508,18 @@ mod tests {
 
 	#[test]
 	fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
-		let mut client = TestClient::new(None);
+		// Given: A fresh client in init state
+		let mut client = TestEciesClientBuilder::new().build();
 
-		// Can't process server handshake before sending client hello
+		// When: Trying to process server handshake before building client hello
 		let result = client.process_server_handshake(&[]);
 		assert!(result.is_err());
 
-		// Build client hello
-		let _hello = client.build_client_hello()?;
+		// When: Client builds client hello
+		let _client_hello = client.build_client_hello()?;
+		assert_eq!(client.state(), HandshakeState::Init);
 
-		// Can't complete before processing server handshake
+		// When: Trying to complete before processing server handshake
 		let result = client.complete();
 		assert!(result.is_err());
 

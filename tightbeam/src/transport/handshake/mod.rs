@@ -11,19 +11,21 @@ pub use std::sync::Arc;
 #[cfg(not(feature = "std"))]
 pub use ArcAlloc as Arc;
 
-mod error;
-pub use error::HandshakeError;
 mod attributes;
-pub use attributes::*;
-
+mod error;
 mod utils;
-pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generate_cek};
 
+pub mod client;
+pub mod server;
 pub mod state;
+
+pub use attributes::*;
+pub use error::HandshakeError;
 pub use state::{
 	ClientStateTransition, HandshakeMessageType, HandshakeState as ProtocolState, ServerStateTransition,
 	StateTransition,
 };
+pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generate_cek};
 
 #[cfg(feature = "builder")]
 pub mod builders;
@@ -37,8 +39,8 @@ pub use processors::TightBeamEnvelopedDataProcessor;
 #[cfg(feature = "builder")]
 pub use processors::TightBeamKariRecipient;
 
-pub mod client;
-pub mod server;
+#[cfg(test)]
+mod tests;
 
 use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;
@@ -192,67 +194,61 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 		kdf_info: &[u8],
 		recipient_index: usize,
 	) -> core::result::Result<Vec<u8>, HandshakeError> {
-		use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
-		use crate::crypto::sign::elliptic_curve::PublicKey;
-		use crate::transport::handshake::builders::kari::{aes_key_unwrap, hkdf_sha3_256};
+		// 1. Decode the enveloped data
+		let enveloped_data = cms::enveloped_data::EnvelopedData::from_der(enveloped_data_der)
+			.map_err(|e| HandshakeError::DerError(e))?;
 
-		use crate::crypto::sign::elliptic_curve::SecretKey;
-		use crate::der::Decode;
-
-		// Convert to SecretKey (stays encapsulated within this method)
-		let secret = SecretKey::from(self.clone());
-
-		// Decode EnvelopedData
-		let enveloped_data = cms::enveloped_data::EnvelopedData::from_der(enveloped_data_der)?;
-
-		// Get the recipient info
+		// 2. Extract the KARI recipient info
 		let recipient_info = enveloped_data
 			.recip_infos
 			.0
 			.get(recipient_index)
 			.ok_or(HandshakeError::InvalidRecipientIndex)?;
 
-		// Extract KARI
 		let kari = match recipient_info {
 			cms::enveloped_data::RecipientInfo::Kari(k) => k,
 			_ => return Err(HandshakeError::UnsupportedOriginatorIdentifier),
 		};
 
-		// Manually perform KARI processing without requiring 'static lifetime
-		// This duplicates some logic from TightBeamKariRecipient but keeps keys encapsulated
-		// Extract originator's public key
+		// 3. Extract originator's public key
+		use cms::enveloped_data::OriginatorIdentifierOrKey;
 		let originator_pub = match &kari.originator {
-			cms::enveloped_data::OriginatorIdentifierOrKey::OriginatorKey(orig_key) => {
+			OriginatorIdentifierOrKey::OriginatorKey(orig_key) => {
 				let pub_key_bytes = orig_key.public_key.raw_bytes();
-				PublicKey::<k256::Secp256k1>::from_sec1_bytes(pub_key_bytes)
+				crate::crypto::sign::elliptic_curve::PublicKey::<k256::Secp256k1>::from_sec1_bytes(pub_key_bytes)
 					.map_err(|_| HandshakeError::InvalidOriginatorPublicKey)?
 			}
 			_ => return Err(HandshakeError::UnsupportedOriginatorIdentifier),
 		};
 
-		// Perform ECDH
+		// 4. Perform ECDH to get shared secret
+		use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
+		use crate::crypto::sign::elliptic_curve::SecretKey;
+		let secret = SecretKey::from(self.clone());
 		let shared_secret = diffie_hellman(secret.to_nonzero_scalar(), originator_pub.as_affine());
 
-		// Derive KEK using UKM as salt
+		// 5. Derive KEK using HKDF
+		use crate::transport::handshake::builders::kari::hkdf_sha3_256;
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let salt = ukm.as_bytes();
-		let mut kek = hkdf_sha3_256(shared_secret.raw_secret_bytes().as_ref(), salt, kdf_info, 32)?;
+		let kek = hkdf_sha3_256(shared_secret.raw_secret_bytes().as_ref(), salt, kdf_info, 32)
+			.map_err(|_| HandshakeError::KdfError)?;
 
-		// Validate recipient index for encrypted keys
+		// 6. Unwrap the CEK
+		use crate::transport::handshake::builders::kari::aes_key_unwrap;
 		if recipient_index >= kari.recipient_enc_keys.len() {
 			return Err(HandshakeError::InvalidRecipientIndex);
 		}
+		let wrapped_key = kari.recipient_enc_keys[recipient_index].enc_key.as_bytes();
+		let cek = aes_key_unwrap(wrapped_key, &kek)
+			.map_err(|_| HandshakeError::InvalidKeySize { expected: 32, received: 0 })?;
 
-		// Extract wrapped key
-		let wrapped_key = kari.recipient_enc_keys[0].enc_key.as_bytes();
-		// Unwrap to get CEK
-		let cek = aes_key_unwrap(wrapped_key, &kek)?;
-
-		// Zeroize KEK
+		// 7. Zeroize KEK for security
 		#[cfg(feature = "zeroize")]
 		{
 			use zeroize::Zeroize;
-			kek.zeroize();
+			let mut kek_vec = kek.to_vec();
+			kek_vec.zeroize();
 		}
 
 		Ok(cek)

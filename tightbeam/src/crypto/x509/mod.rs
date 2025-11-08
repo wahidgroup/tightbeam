@@ -144,6 +144,66 @@ macro_rules! pem {
 	}};
 }
 
+/// Validate certificate expiry (not_before <= current_time <= not_after).
+///
+/// This is a lightweight validation that only checks temporal validity.
+/// For full certificate validation including signatures and trust chains,
+/// use the `CertificateValidation` trait.
+///
+/// # Returns
+/// * `Ok(())` if the certificate is currently valid
+/// * `Err(CertificateValidationError::NotYetValid)` if current time is before not_before
+/// * `Err(CertificateValidationError::Expired)` if current time is after not_after
+/// * `Err(CertificateValidationError::InvalidTimestamp)` if time conversion fails
+#[cfg(feature = "time")]
+pub fn validate_certificate_expiry(cert: &Certificate) -> Result<(), CertificateValidationError> {
+	use ::time::OffsetDateTime;
+
+	let now = OffsetDateTime::now_utc();
+	let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
+	let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
+	let now_duration = GeneralizedTime::from_unix_duration(Duration::from_secs(now.unix_timestamp() as u64))
+		.map_err(|_| CertificateValidationError::InvalidTimestamp)?
+		.to_unix_duration();
+
+	if now_duration < not_before {
+		return Err(CertificateValidationError::NotYetValid);
+	}
+
+	if now_duration > not_after {
+		return Err(CertificateValidationError::Expired);
+	}
+
+	Ok(())
+}
+
+/// Validate certificate expiry using std::time::SystemTime.
+#[cfg(all(feature = "std", not(feature = "time")))]
+pub fn validate_certificate_expiry(cert: &Certificate) -> Result<(), CertificateValidationError> {
+	let now = std::time::SystemTime::now();
+	let not_before = cert.tbs_certificate.validity.not_before.to_system_time();
+	let not_after = cert.tbs_certificate.validity.not_after.to_system_time();
+
+	if now < not_before {
+		return Err(CertificateValidationError::NotYetValid);
+	}
+
+	if now > not_after {
+		return Err(CertificateValidationError::Expired);
+	}
+
+	Ok(())
+}
+
+/// Validate certificate expiry (no-op without time features).
+///
+/// Without std or time features, temporal validation cannot be performed.
+/// Applications should handle this at a higher layer.
+#[cfg(all(not(feature = "std"), not(feature = "time")))]
+pub fn validate_certificate_expiry(_cert: &Certificate) -> Result<(), CertificateValidationError> {
+	Err(CertificateValidationError::InvalidTimestamp)
+}
+
 #[cfg(test)]
 mod tests {
 	#[test]

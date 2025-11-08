@@ -142,6 +142,47 @@ pub fn create_test_signing_key() -> k256::ecdsa::SigningKey {
 	crate::crypto::sign::ecdsa::SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
 }
 
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub fn create_test_certificate(signing_key: &k256::ecdsa::SigningKey) -> crate::x509::Certificate {
+	use crate::der::Decode;
+	use crate::spki::EncodePublicKey;
+
+	let verifying_key = *signing_key.verifying_key();
+	let public_key_der = verifying_key.to_public_key_der().unwrap();
+
+	let tbs_cert = crate::x509::TbsCertificate {
+		version: crate::x509::Version::V3,
+		serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).unwrap(),
+		signature: crate::spki::AlgorithmIdentifierOwned {
+			oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID,
+			parameters: None,
+		},
+		issuer: x509_cert::name::RdnSequence::default(),
+		validity: crate::x509::time::Validity {
+			not_before: crate::x509::time::Time::UtcTime(
+				crate::der::asn1::UtcTime::from_unix_duration(core::time::Duration::from_secs(0)).unwrap(),
+			),
+			not_after: crate::x509::time::Time::UtcTime(
+				crate::der::asn1::UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000)).unwrap(),
+			),
+		},
+		subject: x509_cert::name::RdnSequence::default(),
+		subject_public_key_info: crate::spki::SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).unwrap(),
+		issuer_unique_id: None,
+		subject_unique_id: None,
+		extensions: None,
+	};
+
+	crate::x509::Certificate {
+		tbs_certificate: tbs_cert,
+		signature_algorithm: crate::spki::AlgorithmIdentifierOwned {
+			oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID,
+			parameters: None,
+		},
+		signature: crate::der::asn1::BitString::new(0, vec![0; 64]).unwrap(),
+	}
+}
+
 #[cfg(feature = "aead")]
 pub fn create_test_cipher_key() -> (
 	crate::crypto::common::Key<crate::crypto::aead::Aes256Gcm>,

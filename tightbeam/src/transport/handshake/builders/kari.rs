@@ -603,6 +603,7 @@ mod tests {
 			assert_eq!(unwrapped_256, cek);
 		}
 	}
+
 	#[cfg(all(
 		feature = "builder",
 		feature = "aead",
@@ -612,11 +613,29 @@ mod tests {
 	))]
 	mod builder {
 		use super::*;
+		use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
+		use crate::der::asn1::ObjectIdentifier;
+		use crate::der::{Decode, Encode};
 		use crate::random::{generate_nonce, OsRng};
-		use der::asn1::ObjectIdentifier;
-		use der::{Decode, Encode};
-		use k256::SecretKey as K256SecretKey;
-		use spki::SubjectPublicKeyInfoOwned;
+		use crate::transport::handshake::tests::{
+			create_test_key_enc_alg, create_test_keypair, create_test_recipient_id, create_test_ukm,
+		};
+
+		/// Helper function to create a fully configured test KARI builder
+		fn create_test_kari_builder() -> TightBeamKariBuilder<k256::Secp256k1> {
+			let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
+			let ukm = create_test_ukm();
+			let rid = create_test_recipient_id();
+			let key_enc_alg = create_test_key_enc_alg();
+
+			TightBeamKariBuilder::<k256::Secp256k1>::default()
+				.with_sender_priv(sender_key)
+				.with_sender_pub_spki(sender_spki)
+				.with_recipient_pub(recipient_pubkey)
+				.with_recipient_rid(rid)
+				.with_ukm(ukm)
+				.with_key_enc_alg(key_enc_alg)
+		}
 
 		#[test]
 		fn test_validation() {
@@ -643,106 +662,63 @@ mod tests {
 
 		#[test]
 		fn test_build_complete_kari() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate sender and recipient key-pairs
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
+			// 1. Create test key pairs and cryptographic materials
+			let mut builder = create_test_kari_builder();
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
-
-			// Create UKM (user keying material) - typically client_nonce || server_nonce
-			let client_nonce = [0x01u8; 32];
-			let server_nonce = [0x02u8; 32];
-			let mut ukm_bytes = Vec::new();
-			ukm_bytes.extend_from_slice(&client_nonce);
-			ukm_bytes.extend_from_slice(&server_nonce);
-			let ukm = UserKeyingMaterial::new(ukm_bytes)?;
-
-			// Create recipient identifier (use IssuerAndSerialNumber)
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01])?,
-			});
-
-			// Key encryption algorithm (id-aes256-wrap)
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"), // id-aes256-wrap
-				parameters: None,
-			};
-
-			// Generate a CEK to wrap
+			// 2. Generate a CEK to wrap
 			let cek = [0x42u8; 32]; // 256-bit CEK
 
-			// Build KARI
-			let mut builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
-				.with_sender_priv(sender_key)
-				.with_sender_pub_spki(sender_spki)
-				.with_recipient_pub(recipient_pubkey)
-				.with_recipient_rid(rid)
-				.with_ukm(ukm)
-				.with_key_enc_alg(key_enc_alg);
-
+			// 3. Build KARI
 			let recipient_info = builder.build(&cek).map_err(|e| format!("build failed: {:?}", e))?;
 
-			// Verify the result
-			match recipient_info {
-				RecipientInfo::Kari(kari) => {
-					assert_eq!(kari.version, CmsVersion::V3);
-					assert_eq!(kari.recipient_enc_keys.len(), 1);
+			// 4. Extract Kari variant (Kari builder should always return Kari)
+			let kari = match recipient_info {
+				RecipientInfo::Kari(k) => k,
+				_ => unreachable!("Kari builder should always return Kari"),
+			};
 
-					// Verify originator is set
-					match kari.originator {
-						OriginatorIdentifierOrKey::OriginatorKey(orig_key) => {
-							// Verify it has the right algorithm OID (EC public key)
-							assert_eq!(orig_key.algorithm.oid, ObjectIdentifier::new_unwrap("1.2.840.10045.2.1"));
-						}
-						_ => panic!("Expected OriginatorKey"),
-					}
+			// 5. Verify the result
+			assert_eq!(kari.version, CmsVersion::V3);
+			assert_eq!(kari.recipient_enc_keys.len(), 1);
 
-					// Verify UKM is present
-					assert!(kari.ukm.is_some());
-					assert_eq!(kari.ukm.as_ref().unwrap().as_bytes().len(), 64);
-					// Verify key encryption algorithm
-					assert_eq!(kari.key_enc_alg.oid, ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"));
-					// Verify encrypted key is present and longer than CEK (due to RFC 3394 wrapping)
-					assert!(kari.recipient_enc_keys[0].enc_key.as_bytes().len() > cek.len());
-				}
-				_ => panic!("Expected Kari variant"),
-			}
+			// Verify originator is set (should always be OriginatorKey for our builder)
+			let orig_key = match kari.originator {
+				OriginatorIdentifierOrKey::OriginatorKey(k) => k,
+				_ => unreachable!("Kari builder should always create OriginatorKey"),
+			};
+
+			// Verify it has the right algorithm OID (EC public key)
+			assert_eq!(orig_key.algorithm.oid, ObjectIdentifier::new_unwrap("1.2.840.10045.2.1"));
+
+			// Verify UKM is present
+			assert!(kari.ukm.is_some());
+			assert_eq!(kari.ukm.as_ref().unwrap().as_bytes().len(), 64);
+			// Verify key encryption algorithm
+			assert_eq!(kari.key_enc_alg.oid, ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"));
+			// Verify encrypted key is present and longer than CEK (due to RFC 3394 wrapping)
+			assert!(kari.recipient_enc_keys[0].enc_key.as_bytes().len() > cek.len());
 			Ok(())
 		}
 
 		#[test]
 		fn test_kari_serialization() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate keys
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
+			// 1. Create test key pairs
+			let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
-
-			// UKM with random bytes
+			// 2. Create UKM with random bytes
 			let ukm_bytes = generate_nonce::<64>(None)?;
 			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
 
-			// Recipient ID
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01])?,
-			});
+			// 3. Create recipient identifier
+			let rid = create_test_recipient_id();
 
-			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
+			// 4. Create key encryption algorithm
+			let key_enc_alg = create_test_key_enc_alg();
 
-			// CEK
+			// 5. Generate CEK
 			let cek = [0x33u8; 32];
 
-			// Build KARI
+			// 6. Build KARI
 			let mut builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
 				.with_sender_priv(sender_key)
 				.with_sender_pub_spki(sender_spki)
@@ -753,22 +729,23 @@ mod tests {
 
 			let recipient_info = builder.build(&cek).map_err(|e| format!("build failed: {:?}", e))?;
 
-			// Serialize to DER
+			// 7. Serialize to DER
 			let der_bytes = recipient_info.to_der()?;
 			assert!(!der_bytes.is_empty());
 
-			// Deserialize back
+			// 8. Deserialize back
 			let decoded = RecipientInfo::from_der(&der_bytes)?;
 
-			// Verify round-trip
-			match decoded {
-				RecipientInfo::Kari(kari) => {
-					assert_eq!(kari.version, CmsVersion::V3);
-					assert!(kari.ukm.is_some());
-					assert_eq!(kari.recipient_enc_keys.len(), 1);
-				}
-				_ => panic!("Expected Kari variant after deserialization"),
-			}
+			// 9. Verify round-trip (should deserialize back to Kari)
+			let kari = match decoded {
+				RecipientInfo::Kari(k) => k,
+				_ => unreachable!("Deserialized Kari should be Kari"),
+			};
+
+			assert_eq!(kari.version, CmsVersion::V3);
+			assert!(kari.ukm.is_some());
+			assert_eq!(kari.recipient_enc_keys.len(), 1);
+
 			Ok(())
 		}
 	}

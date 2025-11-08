@@ -3,8 +3,8 @@
 //! Processes received EnvelopedData structures to decrypt content.
 //! Algorithm-agnostic design allows different content encryption algorithms.
 
+use crate::cms::enveloped_data::{EnvelopedData, RecipientInfo};
 use crate::transport::handshake::error::HandshakeError;
-use cms::enveloped_data::{EnvelopedData, RecipientInfo};
 
 /// Trait for processing RecipientInfo to extract the Content Encryption Key (CEK).
 ///
@@ -185,210 +185,143 @@ mod tests {
 	))]
 	mod processor {
 		use super::*;
-		use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
-		use crate::random::{generate_nonce, OsRng};
+		use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
+		use crate::der::asn1::{ObjectIdentifier, OctetStringRef};
 		use crate::spki::SubjectPublicKeyInfoOwned;
+		use crate::transport::handshake::attributes::HandshakeAttribute;
 		use crate::transport::handshake::builders::enveloped_data::TightBeamEnvelopedDataBuilder;
 		use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
 		use crate::transport::handshake::processors::kari::TightBeamKariRecipient;
-		use k256::SecretKey as K256SecretKey;
-		use spki::AlgorithmIdentifierOwned;
-		#[test]
-		fn test_roundtrip_with_kari_aes_gcm() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate sender and recipient keys
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
+		use crate::transport::handshake::tests::{
+			create_test_key_enc_alg, create_test_keypair, create_test_recipient_id, create_test_ukm,
+		};
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
+		/// Helper function to create a test KARI builder with all required fields
+		fn create_test_kari_builder(
+			sender_key: K256SecretKey,
+			sender_spki: SubjectPublicKeyInfoOwned,
+			recipient_pubkey: elliptic_curve::PublicKey<k256::Secp256k1>,
+		) -> TightBeamKariBuilder<k256::Secp256k1> {
+			let ukm = create_test_ukm();
+			let rid = create_test_recipient_id();
+			let key_enc_alg = create_test_key_enc_alg();
 
-			// Original plaintext
-			let plaintext = b"Secret handshake message";
-
-			// Create UKM with random bytes
-			let ukm_bytes = generate_nonce::<64>(None)?;
-			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
-
-			// Recipient identifier
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01])?,
-			});
-
-			// Key encryption algorithm (AES-256 key wrap)
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
-
-			// SENDER SIDE: Build EnvelopedData with KARI
-			let kari_builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
+			TightBeamKariBuilder::<k256::Secp256k1>::default()
 				.with_sender_priv(sender_key)
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)
 				.with_recipient_rid(rid)
 				.with_ukm(ukm)
-				.with_key_enc_alg(key_enc_alg);
+				.with_key_enc_alg(key_enc_alg)
+		}
 
+		/// Dummy recipient processor for testing
+		struct DummyRecipientProcessor;
+		impl RecipientProcessor for DummyRecipientProcessor {
+			fn process_recipient(
+				&self,
+				_info: &RecipientInfo,
+				_recipient_index: usize,
+			) -> Result<Vec<u8>, HandshakeError> {
+				Ok(vec![0u8; 32])
+			}
+		}
+
+		/// Dummy content decryptor for testing
+		struct DummyContentDecryptor;
+		impl ContentDecryptor for DummyContentDecryptor {
+			fn decrypt_content(
+				&self,
+				_encrypted_content: &[u8],
+				_cek: &[u8],
+				_algorithm_oid: &der::asn1::ObjectIdentifier,
+			) -> Result<Vec<u8>, HandshakeError> {
+				Ok(vec![])
+			}
+		}
+
+		#[test]
+		fn test_roundtrip_with_kari_aes_gcm() -> Result<(), Box<dyn std::error::Error>> {
+			// 1. Create test key pairs
+			let (sender_key, sender_spki, recipient_key, recipient_pubkey) = create_test_keypair();
+
+			// 2. Create KARI builder with all required fields
+			let kari_builder = create_test_kari_builder(sender_key, sender_spki, recipient_pubkey);
+
+			// 3. Original plaintext to encrypt
+			let plaintext = b"Secret handshake message";
+
+			// 4. Build EnvelopedData (sender side)
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 			let enveloped_data = builder.build(plaintext, None)?;
 
-			// RECIPIENT SIDE: Process EnvelopedData
+			// 5. Create recipient processor and content decryptor
 			let kari_recipient = TightBeamKariRecipient::with_defaults(recipient_key);
 			let content_decryptor = AesGcmContentDecryptor;
 
+			// 6. Create processor and decrypt (recipient side)
 			let processor = TightBeamEnvelopedDataProcessor::new(kari_recipient, content_decryptor);
-
 			let decrypted = processor.process(&enveloped_data)?;
 
-			// Verify roundtrip
+			// 7. Verify roundtrip success
 			assert_eq!(decrypted, plaintext);
+
 			Ok(())
 		}
 
 		#[test]
 		fn test_invalid_recipient_index() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate keys
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
+			// 1. Create test key pairs
+			let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
-
-			let plaintext = b"Test message";
-
-			// Create UKM with random bytes
-			let ukm_bytes = generate_nonce::<64>(None)?;
-			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
-
-			// Recipient identifier
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01])?,
-			});
-
-			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
-
-			// Build EnvelopedData
-			let kari_builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
-				.with_sender_priv(sender_key)
-				.with_sender_pub_spki(sender_spki)
-				.with_recipient_pub(recipient_pubkey)
-				.with_recipient_rid(rid)
-				.with_ukm(ukm)
-				.with_key_enc_alg(key_enc_alg);
-
+			// 2. Create KARI builder and build EnvelopedData
+			let kari_builder = create_test_kari_builder(sender_key, sender_spki, recipient_pubkey);
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let enveloped_data = builder.build(plaintext, None)?;
+			let enveloped_data = builder.build(b"Test message", None)?;
 
-			// Try to process with invalid index - use dummy processors
-			struct DummyRecipientProcessor;
-			impl RecipientProcessor for DummyRecipientProcessor {
-				fn process_recipient(
-					&self,
-					_info: &RecipientInfo,
-					_recipient_index: usize,
-				) -> Result<Vec<u8>, HandshakeError> {
-					Ok(vec![0u8; 32])
-				}
-			}
-
-			struct DummyContentDecryptor;
-			impl ContentDecryptor for DummyContentDecryptor {
-				fn decrypt_content(
-					&self,
-					_encrypted_content: &[u8],
-					_cek: &[u8],
-					_algorithm_oid: &der::asn1::ObjectIdentifier,
-				) -> Result<Vec<u8>, HandshakeError> {
-					Ok(vec![])
-				}
-			}
-
+			// 3. Create processor with invalid recipient index
 			let processor = TightBeamEnvelopedDataProcessor::new(DummyRecipientProcessor, DummyContentDecryptor)
 				.with_recipient_index(99); // Invalid index
 
+			// 4. Attempt to process with invalid index
 			let result = processor.process(&enveloped_data);
 			assert!(result.is_err());
-			assert!(matches!(result.unwrap_err(), HandshakeError::InvalidRecipientIndex));
+
+			// Verify specific error type (should be InvalidRecipientIndex)
+			match result.unwrap_err() {
+				HandshakeError::InvalidRecipientIndex => {}
+				_ => unreachable!("Expected InvalidRecipientIndex error"),
+			}
+
 			Ok(())
 		}
 
 		#[test]
 		fn test_unprotected_attributes() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate keys
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey)?;
+			// 1. Create test key pairs
+			let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
-
-			let plaintext = b"Test with attributes";
-
-			// Create UKM with random bytes
-			let ukm_bytes = generate_nonce::<64>(None)?;
-			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
-
-			// Recipient identifier
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01])?,
-			});
-
-			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
-
-			// Create a test attribute
-			use crate::transport::handshake::attributes::HandshakeAttribute;
-			use der::asn1::{ObjectIdentifier, OctetStringRef};
+			// 2. Create test attribute
 			let test_oid = ObjectIdentifier::new_unwrap("1.2.3.4.5");
 			let test_value = OctetStringRef::new(b"test-value")?;
 			let test_attr = HandshakeAttribute::new_single(test_oid, der::Any::encode_from(&test_value)?)?;
 
-			// Build KARI
-			let kari_builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
-				.with_sender_priv(sender_key)
-				.with_sender_pub_spki(sender_spki)
-				.with_recipient_pub(recipient_pubkey)
-				.with_recipient_rid(rid)
-				.with_ukm(ukm)
-				.with_key_enc_alg(key_enc_alg);
+			// 3. Create KARI builder and build EnvelopedData with unprotected attributes
+			let kari_builder = create_test_kari_builder(sender_key, sender_spki, recipient_pubkey);
+			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
+			let builder = builder.with_unprotected_attr(test_attr.clone());
+			let enveloped_data = builder.build(b"Test with attributes", None)?;
 
-			// Build EnvelopedData with unprotected attributes
-			let builder =
-				TightBeamEnvelopedDataBuilder::with_defaults(kari_builder).with_unprotected_attr(test_attr.clone());
-
-			let enveloped_data = builder.build(plaintext, None)?;
-
-			// Extract attributes - use dummy processors since we're just testing attribute extraction
-			struct DummyRecipientProcessor;
-			impl RecipientProcessor for DummyRecipientProcessor {
-				fn process_recipient(
-					&self,
-					_info: &RecipientInfo,
-					_recipient_index: usize,
-				) -> Result<Vec<u8>, HandshakeError> {
-					Ok(vec![0u8; 32])
-				}
-			}
-
+			// 4. Extract attributes using processor
 			let processor = TightBeamEnvelopedDataProcessor::new(DummyRecipientProcessor, AesGcmContentDecryptor);
 			let attrs = processor.extract_unprotected_attributes(&enveloped_data);
 
+			// 5. Verify attributes were extracted correctly
 			assert!(attrs.is_some());
 			let attrs = attrs.unwrap();
 			assert_eq!(attrs.len(), 1);
 			assert_eq!(attrs[0].oid, test_oid);
+
 			Ok(())
 		}
 	}

@@ -32,6 +32,7 @@ words:
   - HKDF
   - HMAC
   - keypair
+  - KTRI
   - Merkle
   - Morpher
   - morphers
@@ -60,5 +61,6 @@ words:
   - Wrkr
   - zeekstd
   - zeroize
+  - zeroized
   - zeroizes
   - Zeroizing

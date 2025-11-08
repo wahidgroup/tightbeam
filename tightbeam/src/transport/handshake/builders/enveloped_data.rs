@@ -90,6 +90,70 @@ where
 		self
 	}
 
+	// Helper methods
+
+	fn validate_builder_state(&self) -> Result<(), HandshakeError> {
+		if self.kari_builder.is_none() {
+			return Err(HandshakeError::KariBuilderConsumed);
+		}
+		if self.content_encryption_alg.is_none() {
+			return Err(HandshakeError::MissingContentEncryptionAlgorithm);
+		}
+		Ok(())
+	}
+
+	fn build_kari_with_cek(&mut self, cek: &[u8]) -> Result<cms::enveloped_data::RecipientInfo, HandshakeError> {
+		let mut kari_builder = self.kari_builder.take().ok_or(HandshakeError::KariBuilderConsumed)?;
+		kari_builder.build(cek).map_err(HandshakeError::CmsBuilderError)
+	}
+
+	fn encrypt_plaintext(&self, cek: &[u8], plaintext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>, HandshakeError> {
+		(self.encryptor)(cek, plaintext, aad)
+	}
+
+	fn build_encrypted_content_info(
+		&self,
+		ciphertext: Vec<u8>,
+	) -> Result<cms::enveloped_data::EncryptedContentInfo, HandshakeError> {
+		let content_enc_alg = self
+			.content_encryption_alg
+			.as_ref()
+			.ok_or(HandshakeError::MissingContentEncryptionAlgorithm)?;
+
+		Ok(cms::enveloped_data::EncryptedContentInfo {
+			content_type: DATA_OID,
+			content_enc_alg: content_enc_alg.clone(),
+			encrypted_content: Some(OctetString::new(ciphertext)?),
+		})
+	}
+
+	fn build_unprotected_attributes(&self) -> Result<Option<x509_cert::attr::Attributes>, HandshakeError> {
+		if self.unprotected_attrs.is_empty() {
+			return Ok(None);
+		}
+
+		// Sort attributes for canonical DER encoding
+		let mut attrs = self.unprotected_attrs.clone();
+		attrs.sort();
+
+		// Convert to x509_cert::attr::Attribute
+		let x509_attrs: Result<Vec<_>, der::Error> = attrs
+			.into_iter()
+			.map(|attr| {
+				Ok(x509_cert::attr::Attribute { oid: attr.attr_type, values: SetOfVec::try_from(attr.attr_values)? })
+			})
+			.collect();
+
+		Ok(Some(SetOfVec::try_from(x509_attrs?)?))
+	}
+
+	fn build_recipient_infos(
+		&self,
+		recipient_info: cms::enveloped_data::RecipientInfo,
+	) -> Result<cms::enveloped_data::RecipientInfos, HandshakeError> {
+		cms::enveloped_data::RecipientInfos::try_from(vec![recipient_info]).map_err(HandshakeError::DerError)
+	}
+
 	/// Build the complete EnvelopedData structure.
 	///
 	/// # Parameters
@@ -103,54 +167,28 @@ where
 	/// - Content encryption algorithm identifier
 	/// - Optional unprotected attributes
 	pub fn build(mut self, plaintext: &[u8], aad: Option<&[u8]>) -> Result<EnvelopedData, HandshakeError> {
-		// 1. Generate CEK (content-encryption key)
+		// 1. Validate builder state
+		self.validate_builder_state()?;
+
+		// 2. Generate CEK (content-encryption key)
 		let cek = generate_cek()?;
 
-		// 2. Build KARI with wrapped CEK
-		let mut kari_builder = self.kari_builder.take().ok_or(HandshakeError::KariBuilderConsumed)?;
+		// 3. Build KARI with wrapped CEK
+		let recipient_info = self.build_kari_with_cek(&cek)?;
 
-		let recipient_info = kari_builder.build(&cek)?;
-
-		// 3. Encrypt plaintext with CEK
-		let ciphertext = (self.encryptor)(&cek, plaintext, aad)?;
-
-		// 4. Get content encryption algorithm
-		let content_enc_alg = self
-			.content_encryption_alg
-			.ok_or(HandshakeError::MissingContentEncryptionAlgorithm)?;
+		// 4. Encrypt plaintext with CEK
+		let ciphertext = self.encrypt_plaintext(&cek, plaintext, aad)?;
 
 		// 5. Build EncryptedContentInfo
-		let encrypted_content_info = cms::enveloped_data::EncryptedContentInfo {
-			content_type: DATA_OID,
-			content_enc_alg,
-			encrypted_content: Some(OctetString::new(ciphertext)?),
-		};
+		let encrypted_content_info = self.build_encrypted_content_info(ciphertext)?;
 
 		// 6. Build unprotected attributes if present
-		let unprotected_attrs = if self.unprotected_attrs.is_empty() {
-			None
-		} else {
-			// Sort attributes for canonical DER encoding
-			let mut attrs = self.unprotected_attrs;
-			attrs.sort();
+		let unprotected_attrs = self.build_unprotected_attributes()?;
 
-			// Convert to x509_cert::attr::Attribute
-			let x509_attrs: Result<Vec<_>, der::Error> = attrs
-				.into_iter()
-				.map(|attr| {
-					Ok(x509_cert::attr::Attribute {
-						oid: attr.attr_type,
-						values: SetOfVec::try_from(attr.attr_values)?,
-					})
-				})
-				.collect();
+		// 7. Build RecipientInfos
+		let recip_infos = self.build_recipient_infos(recipient_info)?;
 
-			Some(SetOfVec::try_from(x509_attrs?)?)
-		};
-
-		// 7. Build EnvelopedData
-		let recip_infos = cms::enveloped_data::RecipientInfos::try_from(vec![recipient_info])?;
-
+		// 8. Build final EnvelopedData
 		Ok(EnvelopedData {
 			version: CmsVersion::V3, // V3 for KeyAgreeRecipientInfo
 			originator_info: None,
@@ -210,54 +248,48 @@ mod tests {
 	))]
 	mod enveloped_data {
 		use super::*;
-		use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
-		use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
 		use crate::der::Decode;
-		use crate::random::{generate_nonce, OsRng};
-		use crate::spki::SubjectPublicKeyInfoOwned;
 		use crate::transport::handshake::attributes::{encode_client_nonce, encode_server_nonce};
+		use crate::transport::handshake::tests::{
+			create_test_key_enc_alg, create_test_keypair, create_test_recipient_id, create_test_ukm,
+		};
 
-		#[test]
-		fn test_basic_enveloped_data() {
-			// Setup keys
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).unwrap();
+		// Test helper functions
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
+		fn create_test_kari_builder() -> TightBeamKariBuilder<k256::Secp256k1> {
+			// 1. Create sender keypair
+			let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
 
-			// Create UKM with random bytes
-			let ukm_bytes = generate_nonce::<64>(None).unwrap();
-			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
+			// 2. Create UKM
+			let ukm = create_test_ukm();
 
-			// Recipient identifier
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01]).unwrap(),
-			});
+			// 3. Create recipient identifier
+			let rid = create_test_recipient_id();
 
-			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
+			// 4. Create key encryption algorithm
+			let key_enc_alg = create_test_key_enc_alg();
 
-			// Build KARI
-			let kari_builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
+			// 5. Build and return KARI builder
+			TightBeamKariBuilder::<k256::Secp256k1>::default()
 				.with_sender_priv(sender_key)
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)
 				.with_recipient_rid(rid)
 				.with_ukm(ukm)
-				.with_key_enc_alg(key_enc_alg);
+				.with_key_enc_alg(key_enc_alg)
+		}
 
-			// Build EnvelopedData
+		#[test]
+		fn test_basic_enveloped_data() {
+			// 1. Create test KARI builder
+			let kari_builder = create_test_kari_builder();
+
+			// 2. Build EnvelopedData
 			let plaintext = b"Hello, TightBeam!";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 			let enveloped_data = builder.build(plaintext, None).unwrap();
 
-			// Verify structure
+			// 3. Verify structure
 			assert_eq!(enveloped_data.version, CmsVersion::V3);
 			assert_eq!(enveloped_data.recip_infos.0.len(), 1);
 			assert!(enveloped_data.encrypted_content.encrypted_content.is_some());
@@ -266,46 +298,16 @@ mod tests {
 
 		#[test]
 		fn test_with_unprotected_attributes() {
-			// Setup keys
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).unwrap();
+			// 1. Create test KARI builder
+			let kari_builder = create_test_kari_builder();
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
-
-			// Create UKM with random bytes
-			let ukm_bytes = generate_nonce::<64>(None).unwrap();
-			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
-
-			// Recipient identifier
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01]).unwrap(),
-			});
-
-			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
-
-			// Build KARI
-			let kari_builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
-				.with_sender_priv(sender_key)
-				.with_sender_pub_spki(sender_spki)
-				.with_recipient_pub(recipient_pubkey)
-				.with_recipient_rid(rid)
-				.with_ukm(ukm)
-				.with_key_enc_alg(key_enc_alg);
-
-			// Add unprotected attributes
+			// 2. Create test attributes
 			let client_nonce = [0x11u8; 32];
 			let server_nonce = [0x22u8; 32];
 			let attr1 = encode_client_nonce(&client_nonce).unwrap();
 			let attr2 = encode_server_nonce(&server_nonce).unwrap();
 
-			// Build EnvelopedData with attributes
+			// 3. Build EnvelopedData with attributes
 			let plaintext = b"Authenticated message";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder)
 				.with_unprotected_attr(attr1)
@@ -313,7 +315,7 @@ mod tests {
 
 			let enveloped_data = builder.build(plaintext, None).unwrap();
 
-			// Verify attributes are present
+			// 4. Verify attributes are present
 			assert!(enveloped_data.unprotected_attrs.is_some());
 			let attrs = enveloped_data.unprotected_attrs.unwrap();
 			assert_eq!(attrs.len(), 2);
@@ -321,93 +323,33 @@ mod tests {
 
 		#[test]
 		fn test_der_encoding() {
-			// Setup keys
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).unwrap();
+			// 1. Create test KARI builder
+			let kari_builder = create_test_kari_builder();
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
-
-			// Create UKM with random bytes
-			let ukm_bytes = generate_nonce::<64>(None).unwrap();
-			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
-
-			// Recipient identifier
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01]).unwrap(),
-			});
-
-			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
-
-			// Build KARI
-			let kari_builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
-				.with_sender_priv(sender_key)
-				.with_sender_pub_spki(sender_spki)
-				.with_recipient_pub(recipient_pubkey)
-				.with_recipient_rid(rid)
-				.with_ukm(ukm)
-				.with_key_enc_alg(key_enc_alg);
-
-			// Build and encode
+			// 2. Build and encode
 			let plaintext = b"DER encoding test";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 			let der_bytes = builder.build_der(plaintext, None).unwrap();
 
-			// Verify we can decode it back
+			// 3. Verify we can decode it back
 			let decoded = EnvelopedData::from_der(&der_bytes).unwrap();
 			assert_eq!(decoded.version, CmsVersion::V3);
 		}
 
 		#[test]
 		fn test_content_info_wrapper() {
-			// Setup keys
-			let sender_key = K256SecretKey::random(&mut OsRng);
-			let sender_pubkey = sender_key.public_key();
-			let sender_spki = SubjectPublicKeyInfoOwned::from_key(sender_pubkey).unwrap();
+			// 1. Create test KARI builder
+			let kari_builder = create_test_kari_builder();
 
-			let recipient_key = K256SecretKey::random(&mut OsRng);
-			let recipient_pubkey = recipient_key.public_key();
-
-			// Create UKM with random bytes
-			let ukm_bytes = generate_nonce::<64>(None).unwrap();
-			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
-
-			// Recipient identifier
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
-				issuer: x509_cert::name::Name::default(),
-				serial_number: x509_cert::serial_number::SerialNumber::new(&[0x01]).unwrap(),
-			});
-
-			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
-
-			// Build KARI
-			let kari_builder = TightBeamKariBuilder::<k256::Secp256k1>::default()
-				.with_sender_priv(sender_key)
-				.with_sender_pub_spki(sender_spki)
-				.with_recipient_pub(recipient_pubkey)
-				.with_recipient_rid(rid)
-				.with_ukm(ukm)
-				.with_key_enc_alg(key_enc_alg);
-
-			// Build ContentInfo
+			// 2. Build ContentInfo
 			let plaintext = b"ContentInfo wrapper test";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 			let content_info = builder.build_content_info(plaintext, None).unwrap();
 
-			// Verify ContentInfo structure
+			// 3. Verify ContentInfo structure
 			assert_eq!(content_info.content_type, ENVELOPED_DATA_OID);
 
-			// Decode inner EnvelopedData
+			// 4. Decode inner EnvelopedData
 			let enveloped_data: EnvelopedData = content_info.content.decode_as().unwrap();
 			assert_eq!(enveloped_data.version, CmsVersion::V3);
 		}

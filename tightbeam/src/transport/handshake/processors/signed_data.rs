@@ -95,44 +95,56 @@ mod tests {
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 		use crate::crypto::sign::EcdsaSignatureVerifier;
-		use crate::random::OsRng;
 		use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
+		use crate::transport::handshake::tests::{
+			create_ecdsa_sha3_256_signature_alg, create_sha3_256_digest_alg, create_test_signing_key,
+		};
+
+		/// Helper function to create a test SignedData builder
+		fn create_test_signed_data_builder(
+			signing_key: Secp256k1SigningKey,
+		) -> Result<TightBeamSignedDataBuilder<Secp256k1Signature, Sha3_256>, HandshakeError> {
+			let digest_alg = create_sha3_256_digest_alg();
+			let signature_alg = create_ecdsa_sha3_256_signature_alg();
+
+			TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(signing_key, digest_alg, signature_alg)
+		}
+
+		/// Helper function to create a test signature verifier
+		fn create_test_verifier(
+			signing_key: &Secp256k1SigningKey,
+		) -> Result<
+			EcdsaSignatureVerifier<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>,
+			crate::error::TightBeamError,
+		> {
+			EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_signing_key(signing_key)
+		}
+
+		/// Helper function to create a test processor
+		fn create_test_processor(
+			signing_key: &Secp256k1SigningKey,
+		) -> Result<TightBeamSignedDataProcessor, crate::error::TightBeamError> {
+			let verifier = create_test_verifier(signing_key)?;
+			Ok(TightBeamSignedDataProcessor::new(verifier))
+		}
 
 		#[test]
 		fn test_verify_signed_data() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate signing key
-			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+			// 1. Create test signing key
+			let signing_key = create_test_signing_key();
 
-			// Content to sign
+			// 2. Content to sign
 			let content = b"test_content_to_verify";
 
-			// Algorithm identifiers
-			let digest_alg = crate::spki::AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
-				parameters: None,
-			};
-			let signature_alg = crate::spki::AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), // ecdsa-with-SHA256
-				parameters: None,
-			};
-
-			// Build SignedData
-			let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
-				signing_key.clone(),
-				digest_alg.clone(),
-				signature_alg,
-			)?;
+			// 3. Create SignedData builder and build structure
+			let mut builder = create_test_signed_data_builder(signing_key.clone())?;
 			let signed_data = builder.build(content)?;
 
-			// Create verifier and process
-			let verifier =
-				EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_signing_key(
-					&signing_key,
-				)?;
-			let processor = TightBeamSignedDataProcessor::new(verifier);
+			// 4. Create processor and verify signature
+			let processor = create_test_processor(&signing_key)?;
+			let verified_content = processor.process(&signed_data, &crate::asn1::HASH_SHA3_256_OID)?;
 
-			// Verify
-			let verified_content = processor.process(&signed_data, &digest_alg.oid)?;
+			// 5. Verify content matches original
 			assert_eq!(verified_content, content);
 
 			Ok(())
@@ -140,38 +152,21 @@ mod tests {
 
 		#[test]
 		fn test_verify_der_encoded() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate signing key
-			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+			// 1. Create test signing key
+			let signing_key = create_test_signing_key();
 
-			// Content to sign
+			// 2. Content to sign
 			let content = b"der_encoded_test";
 
-			// Algorithm identifiers
-			let digest_alg = crate::spki::AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
-				parameters: None,
-			};
-			let signature_alg = crate::spki::AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
-				parameters: None,
-			};
-
-			// Build and encode
-			let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
-				signing_key.clone(),
-				digest_alg.clone(),
-				signature_alg,
-			)?;
+			// 3. Create SignedData builder and build DER-encoded structure
+			let mut builder = create_test_signed_data_builder(signing_key.clone())?;
 			let der_bytes = builder.build_der(content)?;
 
-			// Verify from DER
-			let verifier =
-				EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_signing_key(
-					&signing_key,
-				)?;
-			let processor = TightBeamSignedDataProcessor::new(verifier);
-			let verified_content = processor.process_der(&der_bytes, &digest_alg.oid)?;
+			// 4. Create processor and verify from DER
+			let processor = create_test_processor(&signing_key)?;
+			let verified_content = processor.process_der(&der_bytes, &crate::asn1::HASH_SHA3_256_OID)?;
 
+			// 5. Verify content matches original
 			assert_eq!(verified_content, content);
 
 			Ok(())
@@ -179,40 +174,22 @@ mod tests {
 
 		#[test]
 		fn test_wrong_key_fails() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate two different keys
-			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
-			let wrong_key = Secp256k1SigningKey::random(&mut OsRng);
+			// 1. Create two different signing keys
+			let signing_key = create_test_signing_key();
+			let wrong_key = create_test_signing_key();
 
-			// Content to sign
+			// 2. Content to sign
 			let content = b"test_content";
 
-			// Algorithm identifiers
-			let digest_alg = crate::spki::AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
-				parameters: None,
-			};
-			let signature_alg = crate::spki::AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
-				parameters: None,
-			};
-
-			// Build with one key
-			let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
-				signing_key,
-				digest_alg.clone(),
-				signature_alg,
-			)?;
+			// 3. Create SignedData with one key
+			let mut builder = create_test_signed_data_builder(signing_key)?;
 			let signed_data = builder.build(content)?;
 
-			// Try to verify with wrong key (should fail on SID mismatch)
-			let verifier =
-				EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_signing_key(
-					&wrong_key,
-				)?;
-			let processor = TightBeamSignedDataProcessor::new(verifier);
+			// 4. Try to verify with wrong key (should fail)
+			let processor = create_test_processor(&wrong_key)?;
+			let result = processor.process(&signed_data, &crate::asn1::HASH_SHA3_256_OID);
 
-			// Should fail
-			let result = processor.process(&signed_data, &digest_alg.oid);
+			// 5. Verify that verification fails
 			assert!(result.is_err());
 
 			Ok(())
@@ -220,40 +197,22 @@ mod tests {
 
 		#[test]
 		fn test_wrong_digest_algorithm_fails() -> Result<(), Box<dyn std::error::Error>> {
-			// Generate signing key
-			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
+			// 1. Create test signing key
+			let signing_key = create_test_signing_key();
 
-			// Content to sign
+			// 2. Content to sign
 			let content = b"test_content";
 
-			// Algorithm identifiers
-			let digest_alg = crate::spki::AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
-				parameters: None,
-			};
-			let signature_alg = crate::spki::AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
-				parameters: None,
-			};
-
-			// Build SignedData
-			let mut builder = TightBeamSignedDataBuilder::<Secp256k1Signature, Sha3_256>::new(
-				signing_key.clone(),
-				digest_alg,
-				signature_alg,
-			)?;
+			// 3. Create SignedData with SHA3-256
+			let mut builder = create_test_signed_data_builder(signing_key.clone())?;
 			let signed_data = builder.build(content)?;
 
-			// Try to verify with wrong digest OID
-			let wrong_digest_oid = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"); // SHA-256 instead of SHA3-256
-			let verifier =
-				EcdsaSignatureVerifier::<Secp256k1VerifyingKey, Secp256k1Signature, Sha3_256>::from_signing_key(
-					&signing_key,
-				)?;
-			let processor = TightBeamSignedDataProcessor::new(verifier);
-
-			// Should fail
+			// 4. Try to verify with wrong digest OID (SHA-256 instead of SHA3-256)
+			let wrong_digest_oid = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"); // SHA-256
+			let processor = create_test_processor(&signing_key)?;
 			let result = processor.process(&signed_data, &wrong_digest_oid);
+
+			// 5. Verify that verification fails
 			assert!(result.is_err());
 
 			Ok(())
