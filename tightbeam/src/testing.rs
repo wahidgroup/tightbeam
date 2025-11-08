@@ -299,12 +299,83 @@ macro_rules! test_builder {
 
 #[macro_export]
 macro_rules! test_container {
-	// Protocol setup - separate protocol path from identifiers
-	(@setup_protocol $protocol:path, $listener:ident, $addr:ident) => {
+	// Protocol setup with X.509 support
+	(@setup_protocol $protocol:path, $listener:ident, $addr:ident, $cert:ident, with_x509) => {
+		#[cfg(all(feature = "x509", feature = "secp256k1", feature = "signature"))]
+		{
+			use $crate::crypto::sign::ecdsa::SigningKey;
+			use $crate::crypto::sign::ecdsa::signature::Signer;
+			use std::str::FromStr;
+
+			// Generate server signing key
+			let signing_key = $crate::crypto::sign::ecdsa::SigningKey::random(&mut $crate::random::SecureRng);
+			let verifying_key = signing_key.verifying_key();
+			let spki = $crate::x509::SubjectPublicKeyInfo::try_from(verifying_key)?;
+			let sha3_signer = $crate::crypto::sign::ecdsa::Sha3Signer::new(signing_key.clone());
+
+			// Create validity period
+			let not_before = std::time::SystemTime::now();
+			let not_after = not_before + std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+			// Create self-signed root certificate
+			let $cert = $crate::cert!(
+				profile: Root,
+				subject: "CN=Test Root CA,O=Test Org,C=US",
+				serial: 1u32,
+				validity: (not_before, not_after),
+				signer: &sha3_signer,
+				subject_public_key: spki
+			)?;
+
+			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let config = $crate::transport::TransportEncryptionConfig::new(
+				$cert.clone(),
+				std::sync::Arc::new(signing_key.clone())
+					as std::sync::Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
+			);
+			let ($listener, $addr) = <$protocol as $crate::transport::EncryptedProtocol>::bind_with(bind_addr, config).await
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+		}
+	};
+
+	// Protocol setup without X.509
+	(@setup_protocol $protocol:path, $listener:ident, $addr:ident, $cert:ident, no_x509) => {
 		let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 		let ($listener, $addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
+		#[allow(unused_variables)]
+		let $cert: Option<$crate::x509::Certificate> = None;
+	};
+
+	// Helper to detect if with_x509 is in policy list
+	(@has_x509 []) => { no_x509 };
+	(@has_x509 [with_x509 $(, $rest:ident)*]) => { with_x509 };
+	(@has_x509 [$first:ident $(, $rest:ident)*]) => { test_container!(@has_x509 [$($rest),*]) };
+
+	// Generic pattern with arbitrary worker_threads
+	(
+		name: $test_name:ident,
+		$(features: [$($feature:literal),*],)?
+		worker_threads: $threads:literal,
+		protocol: $protocol:path,
+		$(service_policies: { $($server_policy_key:ident: $server_policy_val:tt),* $(,)? },)?
+		$(client_policies: { $($client_policy_key:ident: $client_policy_val:tt),* $(,)? },)?
+		service: |$svc_message:ident, $svc_tx:ident| $service_body:expr,
+		container: |$client:ident, $channels:ident| $container_body:expr
+	) => {
+		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
+		$(#[cfg(all($(feature = $feature),*))])?
+		async fn $test_name() -> Result<(), Box<dyn core::error::Error>> {
+			test_container!(@test_body
+				$protocol,
+				[$($($server_policy_key: $server_policy_val),*)?],
+				[$($($client_policy_key: $client_policy_val),*)?],
+				|$svc_message, $svc_tx| $service_body,
+				|$client, $channels| $container_body
+			)
+		}
 	};
 
 	// Generic pattern with arbitrary worker_threads
@@ -354,17 +425,18 @@ macro_rules! test_container {
 		}
 	};
 
-	// Test body implementation (bind a single `channels` tuple)
+	// Test body implementation with X.509 support
 	(@test_body $protocol:path,
-		[$($server_policy_key:ident: $server_policy_val:tt),*],
-		[$($client_policy_key:ident: $client_policy_val:tt),*],
+		[$($server_policy_key:tt)*],
+		[$($client_policy_key:tt)*],
 		|$svc_message:ident, $svc_tx:ident| $service_body:expr,
 		|$client:ident, $channels:ident| $container_body:expr
 	) => {
 		{
 			use std::sync::{mpsc, Arc};
 
-			test_container!(@setup_protocol $protocol, listener, addr);
+			// Setup protocol with X.509 if present in server policies
+			let (listener, addr, server_cert) = test_container!(@setup_protocol_dispatch $protocol, [$($server_policy_key)*]);
 
 			// Server handler channel: tx for server, rx for container
 			let (server_tx, rx_inner) = mpsc::channel();
@@ -388,13 +460,13 @@ macro_rules! test_container {
 					tx_clone,
 					ok_tx_clone,
 					reject_tx_clone,
-					[$($server_policy_key: $server_policy_val),*],
+					[$($server_policy_key)*],
 					|$svc_message: $crate::Frame, $svc_tx| $service_body
 				)
 			};
 
-			// Build client
-			let mut $client = test_container!(@build_client $protocol, addr, [$($client_policy_key: $client_policy_val),*]);
+			// Build client (pass server_cert which may be None or Some(cert))
+			let mut $client = test_container!(@build_client_x509 $protocol, addr, server_cert, [$($client_policy_key)*]);
 
 			// Expose a single tuple to the container
 			let $channels = (rx_inner, ok_rx_inner, reject_rx_inner);
@@ -405,16 +477,12 @@ macro_rules! test_container {
 			// If the container errors, print a full backtrace to help debugging.
 			#[cfg(feature = "std")]
 			if let Err(ref e) = container_result {
-				eprintln!("test_container! container error: {}", e);
-				// Print error sources chain
+				eprintln!("Container error: {}", e);
 				let mut source = e.source();
-				while let Some(cause) = source {
-					eprintln!("caused by: {}", cause);
-					source = cause.source();
+				while let Some(src) = source {
+					eprintln!("  caused by: {}", src);
+					source = src.source();
 				}
-				// Force-capture a backtrace regardless of error type support
-				let bt = std::backtrace::Backtrace::force_capture();
-				eprintln!("backtrace:\n{}", bt);
 			}
 
 			// Cleanup
@@ -425,18 +493,160 @@ macro_rules! test_container {
 		}
 	};
 
-	// Build client with policies (direct pass-through; client! supports shorthands)
-	(@build_client $protocol:path, $addr:ident, [$($policy_key:ident: $policy_val:tt),+]) => {{
+	// Dispatch to correct setup based on presence of with_x509
+	// Match: with_collector_gate first, then with_x509
+	(@setup_protocol_dispatch $protocol:path,
+		[with_collector_gate: $gate:tt, with_x509: []]) => {
+		test_container!(@setup_protocol_x509_impl $protocol, with_x509: [])
+	};
+	(@setup_protocol_dispatch $protocol:path,
+		[with_collector_gate: $gate:tt, with_x509: [$cert_expr:expr, $key_expr:expr]]) => {
+		test_container!(@setup_protocol_x509_impl $protocol, with_x509: [$cert_expr, $key_expr])
+	};
+	// Match: with_x509 first
+	(@setup_protocol_dispatch $protocol:path,
+		[with_x509: [] $(, $($rest:tt)*)?]) => {
+		test_container!(@setup_protocol_x509_impl $protocol, with_x509: [])
+	};
+	(@setup_protocol_dispatch $protocol:path,
+		[with_x509: [$cert_expr:expr, $key_expr:expr] $(, $($rest:tt)*)?]) => {
+		test_container!(@setup_protocol_x509_impl $protocol, with_x509: [$cert_expr, $key_expr])
+	};
+	// No with_x509 at all
+	(@setup_protocol_dispatch $protocol:path, [$($any:tt)*]) => {
+		test_container!(@setup_protocol_x509_impl $protocol)
+	};
+
+	// X.509 setup helper - with x509 auto-generate certificate
+	(@setup_protocol_x509_impl $protocol:path, with_x509: []) => {{
+		#[cfg(all(feature = "x509", feature = "secp256k1", feature = "signature"))]
+		{
+			use spki::SubjectPublicKeyInfoOwned;
+
+			// Generate server signing key using test helper
+			let signing_key = $crate::testing::create_test_signing_key();
+			let verifying_key = $crate::crypto::sign::ecdsa::Secp256k1VerifyingKey::from(&signing_key);
+			let sha3_signer = $crate::crypto::sign::Sha3Signer::from(&signing_key);
+			let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
+
+			// Create validity period
+			let not_before = std::time::Instant::now();
+			let not_after = not_before + std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+			// Create self-signed root certificate
+			let cert = Some($crate::cert!(
+				profile: Root,
+				subject: "CN=Test Root CA,O=Test Org,C=US",
+				serial: 1u32,
+				validity: (not_before, not_after),
+				signer: &sha3_signer,
+				subject_public_key: spki
+			)?);
+
+			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let config = $crate::transport::TransportEncryptionConfig::new(
+				cert.clone().unwrap(),
+				std::sync::Arc::new(signing_key.clone())
+					as std::sync::Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
+			);
+			let (listener, addr) = <$protocol as $crate::transport::EncryptedProtocol>::bind_with(bind_addr, config).await
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+
+			(listener, addr, cert)
+		}
+		#[cfg(not(all(feature = "x509", feature = "secp256k1", feature = "signature")))]
+		{
+			// Fallback when features not enabled
+			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let cert: Option<$crate::x509::Certificate> = None;
+
+			(listener, addr, cert)
+		}
+	}};
+
+	// X.509 setup helper - with x509 using provided certificate and signing key
+	(@setup_protocol_x509_impl $protocol:path, with_x509: [$cert_expr:expr, $key_expr:expr]) => {{
+		#[cfg(all(feature = "x509", feature = "secp256k1", feature = "signature"))]
+		{
+			let cert = Some($cert_expr);
+			let signing_key = $key_expr;
+
+			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let config = $crate::transport::TransportEncryptionConfig::new(
+				cert.clone().unwrap(),
+				std::sync::Arc::new(signing_key)
+					as std::sync::Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
+			);
+			let (listener, addr) = <$protocol as $crate::transport::EncryptedProtocol>::bind_with(bind_addr, config).await
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+
+			(listener, addr, cert)
+		}
+		#[cfg(not(all(feature = "x509", feature = "secp256k1", feature = "signature")))]
+		{
+			// Fallback when features not enabled
+			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let cert: Option<$crate::x509::Certificate> = None;
+
+			(listener, addr, cert)
+		}
+	}};
+
+	// X.509 setup helper - without x509
+	(@setup_protocol_x509_impl $protocol:path) => {{
+		let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
+			.map_err(|e| $crate::TightBeamError::from(e))?;
+		let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
+			.map_err(|e| $crate::TightBeamError::from(e))?;
+		let cert: Option<$crate::x509::Certificate> = None;
+
+		(listener, addr, cert)
+	}};
+
+	// Build client with X.509 support and policies
+	(@build_client_x509 $protocol:path, $addr:ident, $cert:ident, [$($policy:tt)*]) => {{
 		{
 			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await
 				.map_err(|e| $crate::transport::error::TransportError::from(e))?;
 			let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
-			$(
-				transport = $crate::test_container!(@set_client_policy transport, $policy_key, $policy_val);
-			)*
+
+			// Apply X.509 and other policies
+			transport = test_container!(@apply_client_policies transport, $cert, [$($policy)*]);
+
 			transport
 		}
 	}};
+
+	// Apply client policies - handle with_x509 specially (auto-generate)
+	(@apply_client_policies $transport:expr, $cert:ident, [with_x509: [] $(, $($rest:tt)*)?]) => {{
+		let mut __transport = $transport;
+		if let Some(cert) = $cert {
+			__transport = __transport.with_server_certificate(cert);
+		}
+		$( __transport = test_container!(@apply_client_policies __transport, $cert, [$($rest)*]); )?
+		__transport
+	}};
+	// Apply client policies - handle with_x509 with explicit certificate
+	(@apply_client_policies $transport:expr, $cert:ident, [with_x509: [$cert_expr:expr] $(, $($rest:tt)*)?]) => {{
+		let mut __transport = $transport;
+		__transport = __transport.with_server_certificate($cert_expr);
+		$( __transport = test_container!(@apply_client_policies __transport, $cert, [$($rest)*]); )?
+		__transport
+	}};
+	(@apply_client_policies $transport:expr, $cert:ident, [$policy_key:ident: $policy_val:tt $(, $($rest:tt)*)?]) => {{
+		let __transport = $crate::test_container!(@set_client_policy $transport, $policy_key, $policy_val);
+		$( let __transport = test_container!(@apply_client_policies __transport, $cert, [$($rest)*]); )?
+		__transport
+	}};
+	(@apply_client_policies $transport:expr, $cert:ident, []) => { $transport };
 
 	// Internal helper to set client policies with correct method names
 	// Expects policies in the format: policy_name: [value1, value2, ...]
@@ -460,15 +670,6 @@ macro_rules! test_container {
 			__transport = __transport.with_collector_gate($value);
 		)*
 		__transport
-	}};
-
-	// Build client without policies
-	(@build_client $protocol:path, $addr:ident, []) => {{
-		$crate::client! {
-			$protocol: connect $addr
-		}
-		.await
-		.expect("Failed to create client")
 	}};
 
 	// Build server with policies - wrap with_collector_gate in GateMiddleware for tracking
