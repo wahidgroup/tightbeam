@@ -87,9 +87,10 @@ where
 	/// Validate that the current state matches the expected state.
 	fn validate_expected_state(&self, expected: HandshakeState) -> Result<(), HandshakeError> {
 		if self.state.state() != expected {
-			return Err(HandshakeError::InvalidState);
+			Err(HandshakeError::InvalidState)
+		} else {
+			Ok(())
 		}
-		Ok(())
 	}
 
 	/// Validate server handshake and extract components.
@@ -110,6 +111,7 @@ where
 	fn extract_server_random(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
 		let server_random = self.octet_string_to_array(&server_handshake.server_random)?;
 		self.server_random = Some(server_random);
+
 		Ok(())
 	}
 
@@ -127,6 +129,7 @@ where
 		let transcript_digest =
 			self.compute_transcript_hash(&client_random, &server_random, subject_public_key_info_bytes);
 		self.transcript_hash = Some(transcript_digest);
+
 		Ok(())
 	}
 
@@ -134,6 +137,7 @@ where
 	fn generate_base_session_key(&mut self) -> Result<(), HandshakeError> {
 		let base_key = generate_nonce::<32>(None)?;
 		self.base_session_key = Some(base_key);
+
 		Ok(())
 	}
 
@@ -256,6 +260,7 @@ where
 		if bytes.len() != 32 {
 			return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
 		}
+
 		let mut out = [0u8; 32];
 		out.copy_from_slice(bytes);
 		Ok(out)
@@ -275,8 +280,10 @@ where
 		data.extend_from_slice(client_random);
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
+
 		let digest_arr = Sha3_256::digest(&data);
 		let mut digest = [0u8; 32];
+
 		digest.copy_from_slice(&digest_arr);
 		digest
 	}
@@ -288,7 +295,9 @@ where
 		signature_bytes: &[u8],
 	) -> Result<(), HandshakeError> {
 		let signature = Sig::try_from(signature_bytes).map_err(|e| e.into())?;
+
 		verifying_key.verify(digest, &signature)?;
+
 		Ok(())
 	}
 
@@ -312,8 +321,7 @@ where
 		)?;
 
 		let encrypted_message =
-			encrypt::<_, _, _, M>(&server_pubkey, &plaintext, aad_domain_tag, Some(&mut rand_core::OsRng))
-				.map_err(|e| HandshakeError::EciesEncryptionFailed(format!("{e:?}")))?;
+			encrypt::<_, _, _, M>(&server_pubkey, &plaintext, aad_domain_tag, Some(&mut rand_core::OsRng))?;
 
 		Ok(encrypted_message.to_bytes())
 	}
@@ -340,6 +348,7 @@ where
 		let mut salt = [0u8; 64];
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
+
 		let final_key_bytes = hkdf::<HkdfSha3_256, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
 		Ok(final_key_bytes.to_vec())
 	}

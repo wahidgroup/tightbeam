@@ -2,6 +2,8 @@
 pub use aead::*;
 #[cfg(feature = "aes-gcm")]
 pub use aes_gcm::{Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmNonce};
+#[cfg(feature = "transport")]
+pub use aes_kw;
 
 #[cfg(feature = "aes-gcm")]
 use der::oid::{AssociatedOid, ObjectIdentifier};

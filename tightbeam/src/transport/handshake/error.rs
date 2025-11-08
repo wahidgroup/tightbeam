@@ -17,7 +17,7 @@ pub enum HandshakeError {
 	/// Invalid public key in handshake
 	#[cfg_attr(feature = "derive", error("Invalid public key in handshake: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	InvalidPublicKey(k256::elliptic_curve::Error),
+	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
 
 	/// Invalid certificate
 	#[cfg_attr(feature = "derive", error("Invalid certificate: {0}"))]
@@ -36,7 +36,7 @@ pub enum HandshakeError {
 	/// Underlying DER encode/decode error
 	#[cfg_attr(feature = "derive", error("DER error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	DerError(der::Error),
+	DerError(crate::der::Error),
 
 	/// ECDSA error
 	#[cfg_attr(feature = "derive", error("ECDSA error: {0}"))]
@@ -46,12 +46,12 @@ pub enum HandshakeError {
 	/// SPKI (SubjectPublicKeyInfo) error
 	#[cfg_attr(feature = "derive", error("SPKI error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	SpkiError(spki::Error),
+	SpkiError(crate::spki::Error),
 
 	/// CMS builder error
 	#[cfg_attr(feature = "derive", error("CMS builder error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	CmsBuilderError(cms::builder::Error),
+	CmsBuilderError(crate::cms::builder::Error),
 
 	/// Invalid handshake state
 	#[cfg_attr(feature = "derive", error("Invalid handshake state"))]
@@ -118,12 +118,11 @@ pub enum HandshakeError {
 	InvalidTimestamp,
 
 	// ---------------- ECIES / encryption path ----------------
-	#[cfg_attr(feature = "derive", error("ECIES encryption failed: {0}"))]
-	EciesEncryptionFailed(String),
-	#[cfg_attr(feature = "derive", error("Invalid ECIES message: {0}"))]
-	InvalidEciesMessage(String),
-	#[cfg_attr(feature = "derive", error("ECIES decryption failed: {0}"))]
-	EciesDecryptionFailed(String),
+	#[cfg_attr(feature = "derive", error("ECIES operation failed: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	EciesError(crate::crypto::ecies::EciesError),
+	#[cfg_attr(feature = "derive", error("Missing encrypted content in ECIES message"))]
+	MissingEncryptedContent,
 	#[cfg_attr(feature = "derive", error("Invalid decrypted payload size"))]
 	InvalidDecryptedPayloadSize,
 	#[cfg_attr(feature = "derive", error("client_random mismatch - possible replay attack"))]
@@ -156,7 +155,7 @@ pub enum HandshakeError {
 	#[cfg(all(feature = "builder", feature = "aead"))]
 	#[cfg_attr(feature = "derive", error("AES key wrap operation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	AesKeyWrap(aes_kw::Error),
+	AesKeyWrap(crate::crypto::aead::aes_kw::Error),
 
 	// ---------------- Random generation ----------------
 	#[cfg_attr(feature = "derive", error("Random generation failed"))]
@@ -201,9 +200,8 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::CertificateNotYetValid => write!(f, "Certificate not yet valid"),
 			HandshakeError::CertificateExpired => write!(f, "Certificate expired"),
 			HandshakeError::InvalidTimestamp => write!(f, "Invalid timestamp"),
-			HandshakeError::EciesEncryptionFailed(s) => write!(f, "ECIES encryption failed: {}", s),
-			HandshakeError::InvalidEciesMessage(s) => write!(f, "Invalid ECIES message: {}", s),
-			HandshakeError::EciesDecryptionFailed(s) => write!(f, "ECIES decryption failed: {}", s),
+			HandshakeError::EciesError(e) => write!(f, "ECIES operation failed: {}", e),
+			HandshakeError::MissingEncryptedContent => write!(f, "Missing encrypted content in ECIES message"),
 			HandshakeError::InvalidDecryptedPayloadSize => write!(f, "Invalid decrypted payload size"),
 			HandshakeError::ClientRandomMismatchReplay => write!(f, "client_random mismatch - possible replay attack"),
 			HandshakeError::EcdhFailed => write!(f, "ECDH operation failed"),

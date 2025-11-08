@@ -171,16 +171,14 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 		use crate::crypto::secret::ToInsecure;
 
 		// Parse the ECIES message from bytes
-		let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)
-			.map_err(|e| HandshakeError::InvalidEciesMessage(format!("{e:?}")))?;
+		let encrypted_message = crate::crypto::ecies::Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
 
 		// Convert to SecretKey for ECIES decryption
 		let scalar = self.as_nonzero_scalar();
 		let sk = k256::SecretKey::from(scalar);
 
 		// Decrypt
-		let decrypted = decrypt(&sk, &encrypted_message, aad)
-			.map_err(|e| HandshakeError::EciesDecryptionFailed(format!("{e:?}")))?;
+		let decrypted = decrypt(&sk, &encrypted_message, aad)?;
 
 		// Convert Secret<[u8]> to Secret<Vec<u8>>
 		let vec = decrypted.to_insecure().to_vec();

@@ -188,7 +188,7 @@ where
 		let ciphertext_bytes = encrypted_content_info
 			.encrypted_content
 			.as_ref()
-			.ok_or_else(|| HandshakeError::InvalidEciesMessage("Missing encrypted content".to_string()))?
+			.ok_or_else(|| HandshakeError::MissingEncryptedContent)?
 			.as_bytes();
 
 		// 6. Use the utility function for AES-GCM decryption
