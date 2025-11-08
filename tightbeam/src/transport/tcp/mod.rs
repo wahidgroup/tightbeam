@@ -454,7 +454,7 @@ macro_rules! impl_tcp_common {
 							// Create default security profile for negotiation
 							let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
 							let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
-							
+
 							Box::new(
 								$crate::transport::handshake::server::EciesHandshakeServer::new(
 									std::sync::Arc::clone(&signatory),
