@@ -70,6 +70,21 @@ pub const DOMAIN_SESSION_KDF: &[u8] = b"tb/session/kdf/v1";
 pub const DOMAIN_SIGNED_TRANSCRIPT: &[u8] = b"tb/handshake/transcript/v1";
 pub const DOMAIN_UKM_PREFIX: &[u8] = b"tb/kari/ukm/v1|";
 
+/// Trait to extract key size from AEAD OID types.
+///
+/// This enables compile-time association between algorithm OIDs and their key sizes,
+/// which is then captured in SecurityProfileDesc for runtime key derivation.
+#[cfg(feature = "aead")]
+pub trait AeadKeySize {
+	const KEY_SIZE: usize;
+}
+
+/// AES-256-GCM key size (32 bytes)
+#[cfg(feature = "aes-gcm")]
+impl AeadKeySize for crate::crypto::aead::Aes256GcmOid {
+	const KEY_SIZE: usize = 32;
+}
+
 /// Negotiation descriptor: pure OID set for a security profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "derive", derive(crate::Beamable, crate::der::Sequence))]
@@ -78,6 +93,8 @@ pub struct SecurityProfileDesc {
 	pub digest: ObjectIdentifier,
 	#[cfg(feature = "aead")]
 	pub aead: Option<ObjectIdentifier>,
+	#[cfg(feature = "aead")]
+	pub aead_key_size: Option<u16>,
 	#[cfg(feature = "signature")]
 	pub signature: Option<ObjectIdentifier>,
 	pub key_wrap: Option<ObjectIdentifier>,
@@ -89,6 +106,8 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 			digest: <P::DigestOid as AssociatedOid>::OID,
 			#[cfg(feature = "aead")]
 			aead: Some(<P::AeadOid as AssociatedOid>::OID),
+			#[cfg(feature = "aead")]
+			aead_key_size: Some(<P::AeadOid as AeadKeySize>::KEY_SIZE as u16),
 			#[cfg(feature = "signature")]
 			signature: Some(<P::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID),
 			key_wrap: p.key_wrap_oid(),
@@ -108,7 +127,7 @@ pub trait SecurityProfile {
 	#[cfg(feature = "digest")]
 	type DigestOid: AssociatedOid;
 	#[cfg(feature = "aead")]
-	type AeadOid: AssociatedOid;
+	type AeadOid: AssociatedOid + AeadKeySize;
 	#[cfg(feature = "signature")]
 	type SignatureAlg: SignatureAlgorithmIdentifier; // Provides ALGORITHM_OID
 

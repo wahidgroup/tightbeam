@@ -47,6 +47,8 @@ pub fn create_default_test_profile() -> SecurityProfileDesc {
 		digest: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
 		#[cfg(feature = "aead")]
 		aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")), // AES-256-GCM
+		#[cfg(feature = "aead")]
+		aead_key_size: Some(32),              // AES-256 uses 32-byte keys
 		#[cfg(feature = "signature")]
 		signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")), // ECDSA-SHA3-256
 		key_wrap: None,

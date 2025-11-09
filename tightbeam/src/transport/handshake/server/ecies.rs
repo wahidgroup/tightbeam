@@ -21,11 +21,11 @@ use crate::asn1::OctetString;
 use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
-use crate::crypto::kdf::hkdf;
+use crate::crypto::kdf::KdfProvider;
 use crate::crypto::negotiation::select_profile;
 use crate::crypto::negotiation::SecurityAccept;
 use crate::crypto::profiles::CryptoProvider;
-use crate::crypto::secret::{Secret, ToInsecure};
+use crate::crypto::secret::ToInsecure;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -297,22 +297,15 @@ where
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 
-		let final_key_bytes = hkdf::<P::Kdf, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
+		// Get key size from negotiated profile
+		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
+		let key_size = profile.aead_key_size.ok_or(HandshakeError::InvalidState)? as usize;
+
+		// Derive key with dynamic size based on negotiated cipher
+		// Use provider's KDF with its concrete digest type
+		let final_key_bytes = P::Kdf::derive_dynamic_key(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt), key_size)?;
+
 		Ok(P::AeadCipher::new_from_slice(&final_key_bytes[..])?)
-	}
-
-	fn derive_final_session_key_bytes(
-		&self,
-		base_key: &[u8; 32],
-		client_random: &[u8; 32],
-		server_random: &[u8; 32],
-	) -> Result<Vec<u8>, HandshakeError> {
-		let mut salt = [0u8; 64];
-		salt[..32].copy_from_slice(client_random);
-		salt[32..].copy_from_slice(server_random);
-
-		let final_key_bytes = hkdf::<P::Kdf, 32>(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt))?;
-		Ok(final_key_bytes.to_vec())
 	}
 
 	fn validate_expected_state(&self, expected: HandshakeState) -> Result<(), HandshakeError> {
@@ -399,24 +392,12 @@ where
 		for<'a> P::Signature: TryFrom<&'a [u8]>,
 		P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
-		println!("[SERVER HANDSHAKE] validate_client_certificate called");
-		println!(
-			"[SERVER HANDSHAKE] client_validators present: {}",
-			self.client_validators.is_some()
-		);
-
 		if let Some(validators) = &self.client_validators {
-			println!("[SERVER HANDSHAKE] Have {} validators", validators.len());
 			// Client cert is required when validators are present
 			let client_cert = client_kex
 				.client_certificate
 				.as_ref()
 				.ok_or(HandshakeError::MissingClientCertificate)?;
-
-			println!(
-				"[SERVER HANDSHAKE] Client sent certificate: {:?}",
-				client_cert.tbs_certificate.subject
-			);
 
 			// Check for identity immutability - reject if cert changes on re-handshake
 			if let Some(existing_cert) = &self.validated_client_cert {
@@ -426,11 +407,8 @@ where
 			}
 
 			// Run validator chain (includes expiry, pinning, policy, etc.)
-			println!("[SERVER HANDSHAKE] Running {} validators", validators.len());
-			for (i, validator) in validators.iter().enumerate() {
-				println!("[SERVER HANDSHAKE] Running validator {}", i);
+			for (_, validator) in validators.iter().enumerate() {
 				validator.evaluate(client_cert)?;
-				println!("[SERVER HANDSHAKE] Validator {} passed", i);
 			}
 
 			// Verify client signature over transcript hash
@@ -495,9 +473,8 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
-	P::AeadCipher: KeyInit,
+	P::AeadCipher: KeyInit + Send + Sync + 'static,
 {
-	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
 
 	fn handle_request<'a, 'b>(
@@ -525,9 +502,12 @@ where
 		})
 	}
 
+	#[cfg(feature = "aead")]
 	fn complete<'a>(
 		&'a mut self,
-	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>> {
+	) -> core::pin::Pin<
+		Box<dyn core::future::Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>,
+	> {
 		Box::pin(async move {
 			// 1. Validate current state is KeyExchangeReceived
 			self.validate_expected_state(HandshakeState::KeyExchangeReceived)?;
@@ -537,17 +517,21 @@ where
 			let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 			let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 
-			// 3. Derive final session key as raw bytes
-			let session_key_bytes =
-				self.derive_final_session_key_bytes(base_session_key, client_random, server_random)?;
+			// 3. Get negotiated profile and AEAD OID
+			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
+			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
-			// 4. Transition to complete state
+			// 4. Derive final session key as P::AeadCipher (compile-time type known)
+			let cipher = self.derive_final_session_key(base_session_key, client_random, server_random)?;
+
+			// 5. Transition to complete state
 			self.state.dispatch(HandshakeState::Complete)?;
 
-			// 5. Clear sensitive data
+			// 6. Clear sensitive data
 			self.clear_sensitive_data();
 
-			Ok(Secret::from(session_key_bytes))
+			// 7. Wrap cipher in RuntimeAead with negotiated OID
+			Ok(crate::crypto::aead::RuntimeAead::new(cipher, aead_oid))
 		})
 	}
 
@@ -719,6 +703,8 @@ mod tests {
 			},
 			#[cfg(feature = "aead")]
 			aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")),
+			#[cfg(feature = "aead")]
+			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
 			signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")),
 			key_wrap: if id % 2 == 0 {

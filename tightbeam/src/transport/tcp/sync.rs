@@ -12,7 +12,6 @@ use core::str::FromStr;
 use core::time::Duration;
 
 use crate::crypto::aead::RuntimeAead;
-use crate::crypto::secret::Secret;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::prelude::TightBeamSocketAddr;
 use crate::transport::handshake::{
@@ -65,7 +64,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 
 	symmetric_key: Option<RuntimeAead>,
 
-	server_handshake: Option<Box<dyn ServerHandshakeProtocol<SessionKey = Secret<Vec<u8>>, Error = HandshakeError>>>,
+	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError>>>,
 
 	handshake_protocol_kind: HandshakeProtocolKind,
 }

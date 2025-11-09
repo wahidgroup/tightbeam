@@ -134,6 +134,8 @@ mod tests {
 			digest: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
 			#[cfg(feature = "aead")]
 			aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")),
+			#[cfg(feature = "aead")]
+			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
 			signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")),
 			// Use different key wrap algorithms to differentiate profiles

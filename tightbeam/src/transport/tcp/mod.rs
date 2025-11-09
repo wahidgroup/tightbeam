@@ -331,8 +331,8 @@ macro_rules! impl_tcp_common {
 				};
 				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
-				// Create appropriate handshake orchestrator based on protocol kind
-				let mut orchestrator: Box<dyn ClientHandshakeProtocol<SessionKey = $crate::crypto::secret::Secret<Vec<u8>>, Error = $crate::transport::handshake::HandshakeError>> = match self.handshake_protocol_kind {
+			// Create appropriate handshake orchestrator based on protocol kind
+			let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = $crate::transport::handshake::HandshakeError>> = match self.handshake_protocol_kind {
 				HandshakeProtocolKind::Ecies => {
 					let aad = self.aad_domain_tag.clone();
 					let mut client = $crate::transport::handshake::client::EciesHandshakeClientSecp256k1::new(aad);
@@ -439,27 +439,15 @@ macro_rules! impl_tcp_common {
 					self.write_envelope(&wire_envelope.to_der()?).await?;
 				}
 
-			// Step 5: Complete handshake and derive session key
-			let session_key_secret = orchestrator.complete().await?;
+			// Step 5: Complete handshake and get RuntimeAead
+			let session_key = orchestrator.complete().await?;
 
-			// Extract the negotiated profile to get AEAD OID
-			let profile = orchestrator.selected_profile().ok_or(TransportError::InvalidMessage)?;
-			let aead_oid = profile.aead.ok_or(TransportError::InvalidMessage)?;
+			// Store session key and mark handshake complete
+			self.set_symmetric_key(session_key);
+			self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
 
-			// Extract raw bytes from Secret for AES key
-			use $crate::crypto::secret::ToInsecure;
-			let session_key_bytes = session_key_secret.to_insecure();				// Reconstruct Aes256Gcm from raw key bytes and wrap in RuntimeAead
-				use $crate::crypto::aead::KeyInit;
-				let cipher = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
-					.map_err(|_| TransportError::InvalidMessage)?;
-				let session_key = $crate::crypto::aead::RuntimeAead::new(cipher, aead_oid);
-
-				// Store session key and mark handshake complete
-				self.set_symmetric_key(session_key);
-				self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
-
-				Ok(())
-			}
+			Ok(())
+		}
 
 			/// Perform server-side handshake with client using ServerHandshakeProtocol trait.
 			///
@@ -568,36 +556,24 @@ macro_rules! impl_tcp_common {
 							initiated_at: 0,
 						});
 					}
-				} else {
-					// No response means handshake is complete - derive session key
-					let session_key_secret = orchestrator.complete().await?;
+			} else {
+				// No response means handshake is complete - get RuntimeAead
+				let session_key = orchestrator.complete().await?;
 
-					// Extract the negotiated profile to get AEAD OID
-					let profile = orchestrator.selected_profile().ok_or(TransportError::InvalidMessage)?;
-					let aead_oid = profile.aead.ok_or(TransportError::InvalidMessage)?;
-
-					// Extract peer certificate if mutual auth was performed
-					#[cfg(feature = "x509")]
-					{
-						self.peer_certificate = orchestrator.peer_certificate().cloned();
-					}
-
-					// Extract raw bytes from Secret for AES key
-					use $crate::crypto::secret::ToInsecure;
-					let session_key_bytes = session_key_secret.to_insecure();					// Reconstruct Aes256Gcm from raw key bytes and wrap in RuntimeAead
-					use $crate::crypto::aead::KeyInit;
-					let cipher = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
-						.map_err(|_| TransportError::InvalidMessage)?;
-					let session_key = $crate::crypto::aead::RuntimeAead::new(cipher, aead_oid);
-
-					self.set_symmetric_key(session_key);
-					self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
-
-					// Clear handshake instance - no longer needed
-					self.server_handshake = None;
+				// Extract peer certificate if mutual auth was performed
+				#[cfg(feature = "x509")]
+				{
+					self.peer_certificate = orchestrator.peer_certificate().cloned();
 				}
 
-				Ok(())
+				self.set_symmetric_key(session_key);
+				self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
+
+				// Clear handshake instance - no longer needed
+				self.server_handshake = None;
+			}
+
+			Ok(())
 			}
 		}
 

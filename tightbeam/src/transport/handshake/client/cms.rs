@@ -357,7 +357,6 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
 {
-	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
 
 	fn start<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>> {
@@ -381,10 +380,15 @@ where
 		})
 	}
 
-	fn complete<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>> {
+	#[cfg(feature = "aead")]
+	fn complete<'a>(
+		&'a mut self,
+	) -> Pin<Box<dyn Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>> {
 		Box::pin(async move {
 			self.complete()?;
-			self.session_key.take().ok_or(HandshakeError::InvalidState)
+			// TODO: CMS needs to implement proper RuntimeAead construction with profile negotiation
+			// For now, return error as CMS doesn't support profile negotiation yet
+			Err(HandshakeError::InvalidState)
 		})
 	}
 

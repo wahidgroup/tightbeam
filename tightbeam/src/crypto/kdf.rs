@@ -56,6 +56,24 @@ pub trait KdfProvider {
 	/// Derive a key of the specified length
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>>;
 
+	/// Derive a key with dynamic (runtime-determined) size
+	///
+	/// Used when key size comes from negotiated security profile rather than
+	/// compile-time const generic. Each provider uses its own digest algorithm.
+	///
+	/// # Parameters
+	/// - `ikm`: Input key material
+	/// - `info`: Context/domain separation string
+	/// - `salt`: Optional salt (>= 16 bytes if provided)
+	/// - `key_size`: Desired output key size in bytes
+	///
+	/// # Returns
+	/// Zeroizing vector containing derived key bytes
+	///
+	/// # Errors
+	/// Returns `KdfError::DerivationFailed` if key_size is outside valid range.
+	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<Zeroizing<Vec<u8>>>;
+
 	/// Derive two keys of the specified length (for ECIES encryption + MAC)
 	///
 	/// ECIES standards (e.g., SECG SEC 1, IEEE 1363a, ISO/IEC 18033-2) require
@@ -111,6 +129,18 @@ impl KdfProvider for HkdfSha3_256 {
 		Ok(output)
 	}
 
+	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<Zeroizing<Vec<u8>>> {
+		if key_size < MIN_KEY_SIZE || key_size > MAX_HKDF_OUTPUT_SIZE {
+			return Err(KdfError::DerivationFailed(hkdf::InvalidLength));
+		}
+
+		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
+		let mut okm = vec![0u8; key_size];
+		hk.expand(info, &mut okm).map_err(KdfError::DerivationFailed)?;
+
+		Ok(Zeroizing::new(okm))
+	}
+
 	/// Optimized: single HKDF-Expand to 2*N bytes, then split into (enc, mac).
 	/// Note: bounded by `MAX_HKDF_OUTPUT_SIZE` for the temporary buffer.
 	fn derive_dual_keys<const N: usize>(
@@ -160,6 +190,34 @@ impl KdfProvider for X963Sha3_256 {
 			counter = counter.wrapping_add(1);
 		}
 		Ok(out)
+	}
+
+	fn derive_dynamic_key(
+		ikm: &[u8],
+		info: &[u8],
+		_salt: Option<&[u8]>,
+		key_size: usize,
+	) -> Result<Zeroizing<Vec<u8>>> {
+		if key_size < MIN_KEY_SIZE {
+			return Err(KdfError::DerivationFailed(hkdf::InvalidLength));
+		}
+
+		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
+		let mut out = vec![0u8; key_size];
+		let mut offset = 0usize;
+		let mut counter: u32 = 1;
+		while offset < key_size {
+			let mut hasher = Sha3_256::new();
+			hasher.update(ikm);
+			hasher.update(counter.to_be_bytes());
+			hasher.update(info);
+			let block = hasher.finalize();
+			let take = core::cmp::min(block.len(), key_size - offset);
+			out[offset..offset + take].copy_from_slice(&block[..take]);
+			offset += take;
+			counter = counter.wrapping_add(1);
+		}
+		Ok(Zeroizing::new(out))
 	}
 
 	fn derive_dual_keys<const N: usize>(

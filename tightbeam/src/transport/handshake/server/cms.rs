@@ -367,7 +367,6 @@ where
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 {
-	type SessionKey = Secret<Vec<u8>>;
 	type Error = HandshakeError;
 
 	fn handle_request<'a, 'b>(
@@ -396,12 +395,17 @@ where
 		})
 	}
 
+	#[cfg(feature = "aead")]
 	fn complete<'a>(
 		&'a mut self,
-	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>> {
+	) -> core::pin::Pin<
+		Box<dyn core::future::Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>,
+	> {
 		Box::pin(async move {
 			self.complete()?;
-			self.session_key.take().ok_or(HandshakeError::InvalidState)
+			// TODO: CMS needs to implement proper RuntimeAead construction with profile negotiation
+			// For now, return error as CMS doesn't support profile negotiation yet
+			Err(HandshakeError::InvalidState)
 		})
 	}
 
@@ -412,6 +416,11 @@ where
 	#[cfg(feature = "x509")]
 	fn peer_certificate(&self) -> Option<&Certificate> {
 		self.validated_client_cert.as_ref()
+	}
+
+	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+		// TODO: CMS doesn't support profile negotiation yet
+		None
 	}
 }
 

@@ -9,8 +9,6 @@ use crate::Frame;
 #[cfg(feature = "x509")]
 use crate::crypto::aead::RuntimeAead;
 #[cfg(feature = "x509")]
-use crate::crypto::secret::Secret;
-#[cfg(feature = "x509")]
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
 use crate::transport::handshake::{
@@ -351,8 +349,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	symmetric_key: Option<RuntimeAead>,
 	#[cfg(feature = "x509")]
-	server_handshake:
-		Option<Box<dyn ServerHandshakeProtocol<SessionKey = Secret<Vec<u8>>, Error = HandshakeError> + Send>>,
+	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>>,
 	#[cfg(feature = "x509")]
 	handshake_protocol_kind: HandshakeProtocolKind,
 }

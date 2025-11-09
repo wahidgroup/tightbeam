@@ -435,7 +435,6 @@ pub enum HandshakeAlert {
 /// Supports multi-round handshakes where the client may need to send multiple
 /// messages before completing the handshake.
 pub trait ClientHandshakeProtocol: Send {
-	type SessionKey: Send;
 	type Error: Into<TransportError> + Send;
 
 	/// Start the handshake, returns the first message to send to the server.
@@ -454,13 +453,18 @@ pub trait ClientHandshakeProtocol: Send {
 	where
 		'b: 'a;
 
-	/// Complete the handshake and extract the session key.
+	/// Complete the handshake and extract the session key as RuntimeAead.
 	///
 	/// Should be called after the handshake is complete (when `is_complete()` returns true).
-	/// Returns the session key wrapped in Secret for memory safety.
+	/// Returns a RuntimeAead containing the negotiated cipher with the derived session key.
+	/// The cipher type is determined by the CryptoProvider's AeadCipher associated type,
+	/// and the OID is taken from the negotiated security profile.
+	#[cfg(feature = "aead")]
 	fn complete<'a>(
 		&'a mut self,
-	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>>;
+	) -> core::pin::Pin<
+		Box<dyn core::future::Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>,
+	>;
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
@@ -478,7 +482,6 @@ pub trait ClientHandshakeProtocol: Send {
 /// Supports multi-round handshakes where the server may need to handle multiple
 /// requests from the client before completing the handshake.
 pub trait ServerHandshakeProtocol: Send {
-	type SessionKey: Send;
 	type Error: Into<TransportError> + Send;
 
 	/// Handle a request from the client.
@@ -493,13 +496,18 @@ pub trait ServerHandshakeProtocol: Send {
 	where
 		'b: 'a;
 
-	/// Complete the handshake and extract the session key.
+	/// Complete the handshake and extract the session key as RuntimeAead.
 	///
 	/// Should be called after the handshake is complete (when `is_complete()` returns true).
-	/// Returns the session key wrapped in Secret for memory safety.
+	/// Returns a RuntimeAead containing the negotiated cipher with the derived session key.
+	/// The cipher type is determined by the CryptoProvider's AeadCipher associated type,
+	/// and the OID is taken from the negotiated security profile.
+	#[cfg(feature = "aead")]
 	fn complete<'a>(
 		&'a mut self,
-	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Self::SessionKey, Self::Error>> + Send + 'a>>;
+	) -> core::pin::Pin<
+		Box<dyn core::future::Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>,
+	>;
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
