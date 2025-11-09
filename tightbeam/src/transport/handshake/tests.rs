@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use crate::asn1::{OctetString, AES_256_WRAP_OID, HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_256_OID};
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::crypto::negotiation::SecurityAccept;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
@@ -153,6 +154,7 @@ pub fn compute_test_transcript_hash(client_random: &[u8; 32], server_random: &[u
 	let digest_arr = Sha3_256::digest(&data);
 	let mut digest = [0u8; 32];
 	digest.copy_from_slice(&digest_arr);
+
 	digest
 }
 
@@ -172,14 +174,23 @@ pub fn create_test_server_handshake(
 		certificate: certificate.clone(),
 		server_random: OctetString::new(*server_random)?,
 		signature: OctetString::new(signature)?,
-		security_accept: Some(crate::crypto::negotiation::SecurityAccept::new(create_default_test_profile())),
+		security_accept: Some(SecurityAccept::new(create_default_test_profile())),
+		client_cert_required: false,
 	};
+
 	Ok(server_handshake.to_der()?)
 }
 
 /// Create a test ClientKeyExchange message with the given encrypted data.
 pub fn create_test_client_key_exchange(encrypted_data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-	let client_kex = ClientKeyExchange { encrypted_data: OctetString::new(encrypted_data)? };
+	let client_kex = ClientKeyExchange {
+		encrypted_data: OctetString::new(encrypted_data)?,
+		#[cfg(feature = "x509")]
+		client_certificate: None,
+		#[cfg(feature = "x509")]
+		client_signature: None,
+	};
+
 	Ok(client_kex.to_der()?)
 }
 
@@ -293,10 +304,10 @@ impl TestEciesServerBuilder {
 		};
 
 		let mut server = EciesHandshakeServer::new(
-			DefaultCryptoProvider::default(),
 			Arc::new(test_cert_data.signing_key),
 			test_cert_data.certificate,
 			self.aad_domain,
+			None, // No client validators in tests by default
 		);
 
 		// Add default test profile to ensure server always has supported profiles
@@ -334,7 +345,7 @@ impl TestEciesClientBuilder {
 
 	/// Build the ECIES handshake client.
 	pub fn build(self) -> EciesHandshakeClientSecp256k1 {
-		EciesHandshakeClientSecp256k1::new(DefaultCryptoProvider::default(), self.aad_domain)
+		EciesHandshakeClientSecp256k1::new(self.aad_domain)
 	}
 }
 
@@ -381,11 +392,11 @@ impl TestCmsServerBuilder {
 
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let verifying_key = *test_key.verifying_key();
-		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
 		let transcript_hash = self.transcript_hash.unwrap_or_else(|| vec![1u8; 32]);
+		let provider = DefaultCryptoProvider::default();
 
-		let server =
-			CmsHandshakeServerSecp256k1::new(DefaultCryptoProvider::default(), Arc::new(test_key), transcript_hash);
+		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
+		let server = CmsHandshakeServerSecp256k1::new(provider, Arc::new(test_key), transcript_hash);
 		(server, public_key)
 	}
 }
@@ -435,15 +446,21 @@ impl TestCmsClientBuilder {
 	}
 
 	/// Build the CMS handshake client.
-	pub fn build(self) -> crate::transport::handshake::client::CmsHandshakeClientSecp256k1 {
+	pub fn build(self) -> CmsHandshakeClientSecp256k1 {
 		let client_key = self.client_key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let server_cert = self
 			.server_cert
 			.unwrap_or_else(|| create_test_certificate_from_key(&create_test_certificate().signing_key));
 		let transcript_hash = self.transcript_hash.unwrap_or_else(|| vec![1u8; 32]);
 
-		use crate::transport::handshake::client::CmsHandshakeClientSecp256k1;
-		CmsHandshakeClientSecp256k1::new(DefaultCryptoProvider::default(), client_key, server_cert, transcript_hash)
+		let mut client = CmsHandshakeClientSecp256k1::new(
+			DefaultCryptoProvider::default(),
+			client_key,
+			server_cert,
+			transcript_hash,
+		);
+
+		client
 	}
 }
 

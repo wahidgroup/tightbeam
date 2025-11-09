@@ -6,6 +6,7 @@ use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
+use crate::crypto::x509::policy::CertificateValidation;
 use crate::policy::{GatePolicy, ReceptorPolicy};
 use crate::transport::TransportResult;
 use crate::{Frame, Message};
@@ -26,6 +27,14 @@ where
 	}
 	fn with_receptor_gate<T: Message, R: ReceptorPolicy<T> + 'static>(self, _: R) -> Self {
 		panic!("Receptor policy is not supported on this transport");
+	}
+
+	#[cfg(all(feature = "x509", feature = "std"))]
+	fn with_x509_gate<V>(self, _: V) -> Self
+	where
+		V: CertificateValidation + 'static,
+	{
+		panic!("X.509 certificate validation is not supported on this transport");
 	}
 }
 

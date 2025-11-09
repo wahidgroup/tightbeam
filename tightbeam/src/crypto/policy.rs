@@ -4,7 +4,7 @@ use crate::der::oid::ObjectIdentifier;
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
-/// Errors specific to X.509 certificate validation
+/// Errors specific to cryptographic policy enforcement
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]
 pub enum CryptoPolicyError {

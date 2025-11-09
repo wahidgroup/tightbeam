@@ -1,6 +1,8 @@
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
+pub type Result<T> = core::result::Result<T, CertificateValidationError>;
+
 /// Errors specific to X.509 certificate validation
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]
@@ -54,6 +56,22 @@ pub enum CertificateValidationError {
 	#[cfg_attr(feature = "derive", error("SPKI error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	SpkiError(spki::Error),
+
+	/// Public key not in pinned set
+	#[cfg_attr(feature = "derive", error("Public key not in pinned set"))]
+	PublicKeyNotPinned,
+
+	/// Certificate fingerprint not in pinned set
+	#[cfg_attr(feature = "derive", error("Certificate fingerprint not in pinned set"))]
+	CertificateNotPinned,
+
+	/// Certificate is in denylist
+	#[cfg_attr(feature = "derive", error("Certificate is denied"))]
+	CertificateDenied,
+
+	/// Invalid certificate encoding
+	#[cfg_attr(feature = "derive", error("Invalid certificate encoding"))]
+	InvalidCertificateEncoding,
 }
 
 #[cfg(not(feature = "derive"))]
@@ -77,6 +95,12 @@ impl core::fmt::Display for CertificateValidationError {
 				write!(f, "Signature algorithm mismatch between TBS certificate and certificate")
 			}
 			CertificateValidationError::SpkiError(e) => write!(f, "SPKI error: {}", e),
+			CertificateValidationError::PublicKeyNotPinned => write!(f, "Public key not in pinned set"),
+			CertificateValidationError::CertificateNotPinned => {
+				write!(f, "Certificate fingerprint not in pinned set")
+			}
+			CertificateValidationError::CertificateDenied => write!(f, "Certificate is denied"),
+			CertificateValidationError::InvalidCertificateEncoding => write!(f, "Invalid certificate encoding"),
 		}
 	}
 }

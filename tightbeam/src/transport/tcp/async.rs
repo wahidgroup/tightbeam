@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -5,16 +7,26 @@ use crate::transport::{AsyncListenerTrait, MessageIO, Pingable, Protocol, Transp
 use crate::Frame;
 
 #[cfg(feature = "x509")]
-use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
-#[cfg(feature = "transport-policy")]
-use crate::{policy::GatePolicy, transport::policy::RestartPolicy};
-
+use crate::crypto::aead::Aes256Gcm;
 #[cfg(feature = "x509")]
-use crate::transport::handshake::TcpHandshakeState;
+use crate::crypto::secret::Secret;
+#[cfg(feature = "x509")]
+use crate::crypto::x509::policy::CertificateValidation;
+#[cfg(feature = "x509")]
+use crate::transport::handshake::{
+	HandshakeError, HandshakeProtocolKind, ServerHandshakeKey, ServerHandshakeProtocol, TcpHandshakeState,
+};
+#[cfg(feature = "x509")]
+use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
 #[cfg(feature = "x509")]
 use std::time::Duration;
+
+#[cfg(feature = "transport-policy")]
+use crate::policy::GatePolicy;
+#[cfg(feature = "transport-policy")]
+use crate::transport::policy::RestartPolicy;
 
 pub trait AsyncProtocolStream: Send + Unpin {
 	type Error: Into<TransportError>;
@@ -42,7 +54,9 @@ impl From<TcpStream> for TokioStream {
 pub struct TokioListener {
 	listener: TcpListener,
 	#[cfg(feature = "x509")]
-	certificate: Option<crate::x509::Certificate>,
+	certificate: Option<Certificate>,
+	#[cfg(feature = "x509")]
+	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
 	aad_domain_tag: Option<Vec<u8>>,
 	#[cfg(feature = "x509")]
@@ -52,7 +66,7 @@ pub struct TokioListener {
 	#[cfg(feature = "x509")]
 	handshake_timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
-	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
+	signatory: Option<Arc<dyn ServerHandshakeKey>>,
 }
 
 impl TokioListener {
@@ -66,6 +80,8 @@ impl TokioListener {
 			listener,
 			#[cfg(feature = "x509")]
 			certificate: None,
+			#[cfg(feature = "x509")]
+			client_validators: None,
 			#[cfg(feature = "x509")]
 			aad_domain_tag: None,
 			#[cfg(feature = "x509")]
@@ -92,6 +108,10 @@ impl TokioListener {
 
 		if let Some(cert) = &self.certificate {
 			transport.server_certificate = Some(cert.clone());
+		}
+
+		if let Some(ref validators) = self.client_validators {
+			transport.client_validators = Some(Arc::clone(validators));
 		}
 
 		if let Some(ref aad) = self.aad_domain_tag {
@@ -142,6 +162,8 @@ impl Protocol for TokioListener {
 				#[cfg(feature = "x509")]
 				certificate: None,
 				#[cfg(feature = "x509")]
+				client_validators: None,
+				#[cfg(feature = "x509")]
 				aad_domain_tag: None,
 				#[cfg(feature = "x509")]
 				max_cleartext_envelope: None,
@@ -185,6 +207,7 @@ impl EncryptedProtocol for TokioListener {
 			Self {
 				listener,
 				certificate: Some(config.certificate.clone()),
+				client_validators: config.client_validators.as_ref().map(Arc::clone),
 				aad_domain_tag: Some(config.aad_domain_tag.clone()),
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
@@ -275,12 +298,13 @@ impl crate::transport::Mycelial for TokioListener {
 #[cfg(not(feature = "transport-policy"))]
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
-	#[cfg(feature = "x509")]
-	#[allow(dead_code)]
-	enforce_encryption: bool,
+	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
+	#[cfg(feature = "x509")]
+	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	#[cfg(feature = "x509")]
+	peer_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
 	aad_domain_tag: Option<Vec<u8>>,
 	#[cfg(feature = "x509")]
@@ -288,28 +312,29 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
+	signatory: Option<Arc<dyn ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
-	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
+	symmetric_key: Option<Aes256Gcm>,
 }
 
 // (single Drop impl above covers both feature variants)
 #[cfg(feature = "transport-policy")]
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<crate::Frame> + Send>>,
+	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
 	restart_policy: Box<dyn RestartPolicy>,
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "x509")]
-	#[allow(dead_code)]
-	enforce_encryption: bool,
-	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
+	#[cfg(feature = "x509")]
+	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	#[cfg(feature = "x509")]
+	peer_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
 	aad_domain_tag: Option<Vec<u8>>,
 	#[cfg(feature = "x509")]
@@ -317,24 +342,18 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
+	signatory: Option<Arc<dyn ServerHandshakeKey>>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
-	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
+	symmetric_key: Option<Aes256Gcm>, // TODO Decouple (use aead)
 	#[cfg(feature = "x509")]
-	server_handshake: Option<
-		Box<
-			dyn crate::transport::handshake::ServerHandshakeProtocol<
-					SessionKey = crate::crypto::secret::Secret<Vec<u8>>,
-					Error = crate::transport::handshake::HandshakeError,
-				> + Send,
-		>,
-	>,
+	server_handshake:
+		Option<Box<dyn ServerHandshakeProtocol<SessionKey = Secret<Vec<u8>>, Error = HandshakeError> + Send>>,
 	#[cfg(feature = "x509")]
-	handshake_protocol_kind: crate::transport::handshake::HandshakeProtocolKind,
+	handshake_protocol_kind: HandshakeProtocolKind,
 }
 
 impl<S: AsyncProtocolStream> Pingable for TcpTransport<S>

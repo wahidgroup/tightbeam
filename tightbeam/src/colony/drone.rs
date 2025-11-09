@@ -1483,8 +1483,6 @@ mod tests {
 			drone
 		},
 		assertions: |client, _channels| async move {
-			use crate::transport::MessageEmitter;
-
 			// Note: Gate observation channels not yet implemented for drones
 			// let (ok_rx, reject_rx) = channels;
 
@@ -1532,13 +1530,6 @@ mod tests {
 
 			let invalid_activation: ActivateServletResponse = crate::decode(&invalid_response.message)?;
 			assert_eq!(invalid_activation.status, TransitStatus::Forbidden, "Invalid servlet activation should be rejected");
-
-			// Note: In the current architecture, activated servlets run their own servers
-			// on different addresses. To test the activated servlet, we would need to:
-			// 1. Get the servlet's address from the drone
-			// 2. Connect a new client to that address
-			// 3. Send messages to the servlet
-			// This is a TODO for future enhancement
 
 			Ok(())
 		}
@@ -1588,7 +1579,7 @@ mod tests {
 		hive.establish_hive().await?;
 
 		// Get addresses of all servlets
-		let servlet_addrs = hive.servlet_addresses().await;
+		let servlet_addrs: Vec<(Vec<u8>, crate::prelude::TightBeamSocketAddr)> = hive.servlet_addresses().await;
 
 		// Verify we have the expected number of servlets
 		assert_eq!(servlet_addrs.len(), 2, "Should have 2 servlets");

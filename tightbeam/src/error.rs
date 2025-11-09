@@ -149,6 +149,23 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	OsRngError(rand_core::Error),
 
+	/// Error during SPKI operations
+	#[cfg(feature = "x509")]
+	#[cfg_attr(feature = "derive", error("SPKI error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	SpkiError(crate::spki::Error),
+
+	/// Error during X.509 certificate building
+	#[cfg(feature = "x509")]
+	#[cfg_attr(feature = "derive", error("X.509 builder error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	X509BuilderError(x509_cert::builder::Error),
+
+	/// Error receiving from channel with timeout
+	#[cfg(feature = "std")]
+	#[cfg_attr(feature = "derive", error("Channel receive timeout error"))]
+	RecvTimeoutError,
+
 	/// Error decoding signature from bytes
 	#[cfg(feature = "signature")]
 	#[cfg_attr(feature = "derive", error("Signature encoding error"))]
@@ -243,6 +260,12 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::StandardError(err) => write!(f, "Standard error: {err}"),
 			#[cfg(feature = "random")]
 			TightBeamError::OsRngError(err) => write!(f, "OS random number generator error: {err}"),
+			#[cfg(feature = "x509")]
+			TightBeamError::SpkiError(err) => write!(f, "SPKI error: {err}"),
+			#[cfg(feature = "x509")]
+			TightBeamError::X509BuilderError(err) => write!(f, "X.509 builder error: {err}"),
+			#[cfg(feature = "std")]
+			TightBeamError::RecvTimeoutError => write!(f, "Channel receive timeout error"),
 			#[cfg(feature = "aead")]
 			TightBeamError::EncryptionError(err) => write!(f, "Encryption or decryption error: {err}"),
 			#[cfg(feature = "ecies")]
@@ -294,6 +317,16 @@ crate::impl_from!(der::Error => TightBeamError::SerializationError);
 crate::impl_from!(crate::router::RouterError => TightBeamError::RouterError);
 #[cfg(all(feature = "random", not(feature = "derive")))]
 crate::impl_from!(getrandom::Error => TightBeamError::OsRngError);
+#[cfg(all(feature = "x509", not(feature = "derive")))]
+crate::impl_from!(spki::Error => TightBeamError::SpkiError);
+#[cfg(all(feature = "x509", not(feature = "derive")))]
+crate::impl_from!(x509_cert::builder::Error => TightBeamError::X509BuilderError);
+#[cfg(feature = "std")]
+impl From<std::sync::mpsc::RecvTimeoutError> for TightBeamError {
+	fn from(_: std::sync::mpsc::RecvTimeoutError) -> Self {
+		TightBeamError::RecvTimeoutError
+	}
+}
 #[cfg(all(feature = "std", feature = "compress", not(feature = "derive")))]
 crate::impl_from!(std::io::Error => CompressionError::IO);
 #[cfg(all(feature = "std", feature = "compress", not(feature = "derive")))]

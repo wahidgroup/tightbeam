@@ -313,8 +313,26 @@ pub mod server_runtime {
 macro_rules! server {
 	(@apply_policy $transport:ident, $policy_name:ident, [ $( $policy_expr:expr ),* $(,)? ]) => {{
 		$(
-			$transport = $transport.$policy_name($policy_expr);
+			$transport = $crate::server!(@apply_one_policy $transport, $policy_name, $policy_expr);
 		)*
+	}};
+
+	// Feature-gated x509 policy application (single expression)
+	(@apply_one_policy $transport:ident, with_x509_gate, $policy_expr:expr) => {{
+		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+		{ $transport.with_x509_gate($policy_expr) }
+		#[cfg(not(all(feature = "x509", feature = "signature", feature = "secp256k1")))]
+		{ $transport }
+	}};
+	(@apply_one_policy $transport:ident, x509_gate, $policy_expr:expr) => {{
+		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+		{ $transport.with_x509_gate($policy_expr) }
+		#[cfg(not(all(feature = "x509", feature = "signature", feature = "secp256k1")))]
+		{ $transport }
+	}};
+	// Generic fallback
+	(@apply_one_policy $transport:ident, $other:ident, $policy_expr:expr) => {{
+		$transport.$other($policy_expr)
 	}};
 
 	(@sync_loop_body $protocol:path, $listener:ident, $handler:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
@@ -323,7 +341,7 @@ macro_rules! server {
 				Ok((mut __transport, _addr)) => {
 					$(
 						$(
-							__transport = __transport.$policy_name($policy_expr);
+							__transport = $crate::server!(@apply_one_policy __transport, $policy_name, $policy_expr);
 						)*
 					)*
 					let __handler_clone = $handler.clone();
@@ -373,7 +391,7 @@ macro_rules! server {
 				Ok((mut __transport, _addr)) => {
 					$(
 						$(
-							__transport = __transport.$policy_name($policy_expr);
+							__transport = $crate::server!(@apply_one_policy __transport, $policy_name, $policy_expr);
 						)*
 					)*
 					let __handler_clone = $handler.clone();

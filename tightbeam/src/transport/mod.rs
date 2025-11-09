@@ -4,10 +4,10 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-#[cfg(feature = "x509")]
-use crate::crypto::aead::{Decryptor, Encryptor};
-#[cfg(feature = "derive")]
-use crate::Beamable;
+#[cfg(all(feature = "x509", feature = "std"))]
+use std::sync::Arc;
+#[cfg(all(feature = "x509", feature = "std"))]
+use std::time::Duration;
 
 pub mod error;
 pub mod handshake;
@@ -18,15 +18,27 @@ pub mod policy;
 pub mod tcp;
 
 use crate::asn1::Frame;
-use crate::cms::enveloped_data::EncryptedContentInfo;
+use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData};
+use crate::cms::signed_data::SignedData;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::der::asn1::Uint;
 use crate::der::{Choice, Decode, DecodeValue, Encode, EncodeValue, FixedTag, Header, Length, Reader, Tag, Writer};
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::error::TransportError;
+use crate::{encode, TightBeamError};
 
+#[cfg(feature = "x509")]
+use crate::crypto::aead::{Aes256GcmOid, Decryptor, Encryptor};
+#[cfg(feature = "x509")]
+use crate::crypto::x509::policy::CertificateValidation;
+#[cfg(feature = "x509")]
+use crate::transport::handshake::{ServerHandshakeKey, TcpHandshakeState};
 #[cfg(feature = "transport-policy")]
 use crate::transport::policy::RestartPolicy;
+#[cfg(feature = "x509")]
+use crate::x509::Certificate;
+#[cfg(feature = "derive")]
+use crate::Beamable;
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -37,32 +49,43 @@ pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
 #[cfg(all(feature = "x509", feature = "std"))]
 #[derive(Clone)]
 pub struct TransportEncryptionConfig {
-	pub certificate: crate::x509::Certificate,
-	pub signatory: std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
+	pub certificate: Certificate,
+	pub signatory: Arc<dyn ServerHandshakeKey>,
+	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	pub aad_domain_tag: Vec<u8>,
 	pub max_cleartext_envelope: usize,
 	pub max_encrypted_envelope: usize,
-	pub handshake_timeout: std::time::Duration,
+	pub handshake_timeout: Duration,
 	pub enforce_encryption: bool,
 	pub accept_cleartext_before_handshake: bool,
 }
 
 #[cfg(all(feature = "x509", feature = "std"))]
 impl TransportEncryptionConfig {
-	pub fn new(
-		certificate: crate::x509::Certificate,
-		signatory: std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
-	) -> Self {
+	pub fn new(certificate: Certificate, signatory: Arc<dyn ServerHandshakeKey>) -> Self {
 		Self {
 			certificate,
 			signatory,
+			client_validators: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG.to_vec(),
 			max_cleartext_envelope: 128 * 1024,
 			max_encrypted_envelope: 256 * 1024,
-			handshake_timeout: std::time::Duration::from_secs(10),
+			handshake_timeout: Duration::from_secs(10),
 			enforce_encryption: true,
 			accept_cleartext_before_handshake: true,
 		}
+	}
+
+	pub fn with_client_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
+		self.client_validators = Some(Arc::new(validators));
+		self
+	}
+
+	// Deprecated: Use with_client_validators for validator chains
+	#[deprecated(since = "0.1.0", note = "Use with_client_validators() for mutual authentication")]
+	pub fn with_certificate_validator(mut self, validator: Arc<dyn CertificateValidation>) -> Self {
+		self.client_validators = Some(Arc::new(vec![validator]));
+		self
 	}
 }
 
@@ -231,10 +254,10 @@ pub enum TransportEnvelope {
 	Response(ResponsePackage),
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "2", constructed = "true")]
-	EnvelopedData(crate::cms::enveloped_data::EnvelopedData),
+	EnvelopedData(EnvelopedData),
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "3", constructed = "true")]
-	SignedData(crate::cms::signed_data::SignedData),
+	SignedData(SignedData),
 }
 
 /// Wire-level envelope that can be either cleartext or encrypted
@@ -248,12 +271,12 @@ pub enum WireEnvelope {
 }
 
 #[cfg(not(feature = "derive"))]
-impl crate::Message for TransportEnvelope {
+impl Message for TransportEnvelope {
 	const MUST_BE_NON_REPUDIABLE: bool = false;
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: crate::Version = crate::Version::V0;
+	const MIN_VERSION: Version = Version::V0;
 }
 
 impl From<ResponsePackage> for TransportEnvelope {
@@ -305,8 +328,8 @@ pub trait Protocol {
 
 #[cfg(feature = "x509")]
 pub trait EncryptedProtocol: Protocol {
-	type Encryptor: crate::crypto::aead::Encryptor<crate::crypto::aead::Aes256GcmOid>;
-	type Decryptor: crate::crypto::aead::Decryptor;
+	type Encryptor: Encryptor<Aes256GcmOid>;
+	type Decryptor: Decryptor;
 
 	/// Bind to an address with transport encryption configuration
 	fn bind_with(
@@ -345,7 +368,7 @@ pub trait MessageIO: ResponseHandler {
 
 	/// Encode envelope to DER bytes
 	fn encode_envelope(envelope: &TransportEnvelope) -> TransportResult<Vec<u8>> {
-		crate::encode(envelope).map_err(TransportError::from)
+		encode(envelope).map_err(TransportError::from)
 	}
 
 	/// Read and decode a transport envelope
@@ -401,8 +424,8 @@ pub trait MessageIO: ResponseHandler {
 }
 #[cfg(feature = "x509")]
 pub trait EncryptedMessageIO: MessageIO {
-	type Encryptor: crate::crypto::aead::Encryptor<crate::crypto::aead::Aes256GcmOid>;
-	type Decryptor: crate::crypto::aead::Decryptor;
+	type Encryptor: Encryptor<Aes256GcmOid>;
+	type Decryptor: Decryptor;
 
 	/// Get the encryptor instance
 	fn encryptor(&self) -> TransportResult<&Self::Encryptor>;
@@ -411,13 +434,13 @@ pub trait EncryptedMessageIO: MessageIO {
 	fn decryptor(&self) -> TransportResult<&Self::Decryptor>;
 
 	/// Get current handshake state (pure accessor)
-	fn handshake_state(&self) -> crate::transport::handshake::TcpHandshakeState;
+	fn handshake_state(&self) -> TcpHandshakeState;
 
 	/// Set handshake state (pure mutator)
-	fn set_handshake_state(&mut self, state: crate::transport::handshake::TcpHandshakeState);
+	fn set_handshake_state(&mut self, state: TcpHandshakeState);
 
 	/// Get server certificate if present (pure accessor)
-	fn server_certificate(&self) -> Option<&crate::x509::Certificate>;
+	fn server_certificate(&self) -> Option<&Certificate>;
 
 	/// Set symmetric encryption key (pure mutator)
 	fn set_symmetric_key(&mut self, key: Self::Encryptor);
@@ -428,7 +451,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	async fn relay_message(&mut self) -> TransportResult<TransportEnvelope> {
 		let wire_bytes = self.read_envelope().await?;
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)
-			.map_err(crate::TightBeamError::from)
+			.map_err(TightBeamError::from)
 			.map_err(TransportError::from)?;
 
 		match wire_envelope {
@@ -455,8 +478,8 @@ pub trait EncryptedMessageIO: MessageIO {
 	#[allow(async_fn_in_trait)]
 	async fn read_encrypted_envelope(&mut self) -> TransportResult<TransportEnvelope> {
 		let encrypted_bytes = self.read_envelope().await?;
-		let encrypted_info = crate::EncryptedContentInfo::from_der(&encrypted_bytes)
-			.map_err(crate::TightBeamError::from)
+		let encrypted_info = EncryptedContentInfo::from_der(&encrypted_bytes)
+			.map_err(TightBeamError::from)
 			.map_err(TransportError::from)?;
 
 		let decrypted_bytes = self
@@ -484,7 +507,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		let wire_bytes = wire_envelope
 			.to_der()
-			.map_err(crate::TightBeamError::from)
+			.map_err(TightBeamError::from)
 			.map_err(TransportError::from)?;
 
 		self.write_envelope(&wire_bytes).await
@@ -789,10 +812,10 @@ pub trait ResponseHandler {
 	/// Set a handler that processes incoming messages and generates responses
 	fn with_handler<F>(self, handler: F) -> Self
 	where
-		F: Fn(crate::Frame) -> Option<crate::Frame> + Send + 'static;
+		F: Fn(Frame) -> Option<Frame> + Send + 'static;
 
 	/// Get the current handler if one is set
-	fn handler(&self) -> Option<&(dyn Fn(crate::Frame) -> Option<crate::Frame> + Send)>;
+	fn handler(&self) -> Option<&(dyn Fn(Frame) -> Option<Frame> + Send)>;
 }
 
 #[cfg(test)]
@@ -843,7 +866,7 @@ mod tests {
 		result?;
 
 		// Verify server received the message -- TUNNEL
-		let received = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+		let received = rx.recv_timeout(Duration::from_secs(1)).unwrap();
 		assert_eq!(message, received);
 
 		server_handle.abort();

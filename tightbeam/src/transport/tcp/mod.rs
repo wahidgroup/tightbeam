@@ -174,13 +174,17 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					server_certificate: None,
 					#[cfg(feature = "x509")]
+					client_validators: None,
+					#[cfg(feature = "x509")]
+					peer_certificate: None,
+					#[cfg(feature = "x509")]
 					aad_domain_tag: None,
 					#[cfg(feature = "x509")]
 					max_cleartext_envelope: None,
 					#[cfg(feature = "x509")]
 					max_encrypted_envelope: None,
 					#[cfg(feature = "x509")]
-									signatory: None,
+					signatory: None,
 					#[cfg(feature = "x509")]
 					handshake_state: $crate::transport::handshake::TcpHandshakeState::None,
 					#[cfg(feature = "x509")]
@@ -210,9 +214,11 @@ macro_rules! impl_tcp_common {
 					collector_gate: Box::new(AcceptAllGate),
 					handler: None,
 					#[cfg(feature = "x509")]
-					enforce_encryption: false,
-					#[cfg(feature = "x509")]
 					server_certificate: None,
+					#[cfg(feature = "x509")]
+					client_validators: None,
+					#[cfg(feature = "x509")]
+					peer_certificate: None,
 					#[cfg(feature = "x509")]
 					aad_domain_tag: None,
 					#[cfg(feature = "x509")]
@@ -220,7 +226,7 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					max_encrypted_envelope: None,
 					#[cfg(feature = "x509")]
-									signatory: None,
+					signatory: None,
 					#[cfg(feature = "x509")]
 					handshake_state: $crate::transport::handshake::TcpHandshakeState::None,
 					#[cfg(feature = "x509")]
@@ -263,6 +269,12 @@ macro_rules! impl_tcp_common {
 				self.server_certificate = Some(cert);
 				self
 			}
+
+			/// Get the peer certificate from a completed mutual authentication handshake.
+			/// Returns None if mutual auth was not performed or handshake not complete.
+			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
+				self.peer_certificate.as_ref()
+			}
 		}
 
 		#[cfg(feature = "x509")]
@@ -293,7 +305,6 @@ macro_rules! impl_tcp_common {
 						let aad = self.aad_domain_tag.clone();
 						Box::new(
 							$crate::transport::handshake::client::EciesHandshakeClientSecp256k1::new(
-								$crate::crypto::profiles::DefaultCryptoProvider::default(),
 								aad,
 							)
 						)
@@ -386,14 +397,12 @@ macro_rules! impl_tcp_common {
 					self.write_envelope(&wire_envelope.to_der()?).await?;
 				}
 
-				// Step 5: Complete handshake and derive session key
-				let session_key_secret = orchestrator.complete().await?;
+			// Step 5: Complete handshake and derive session key
+			let session_key_secret = orchestrator.complete().await?;
 
-				// Extract raw bytes from Secret for AES key
-				use $crate::crypto::secret::ToInsecure;
-				let session_key_bytes = session_key_secret.to_insecure();
-
-				// Reconstruct Aes256Gcm from raw key bytes
+			// Extract raw bytes from Secret for AES key
+			use $crate::crypto::secret::ToInsecure;
+			let session_key_bytes = session_key_secret.to_insecure();				// Reconstruct Aes256Gcm from raw key bytes
 				use $crate::crypto::aead::KeyInit;
 				let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
 					.map_err(|_| TransportError::InvalidMessage)?;
@@ -453,21 +462,22 @@ macro_rules! impl_tcp_common {
 					let aad = self.aad_domain_tag.clone();
 
 					self.server_handshake = Some(match self.handshake_protocol_kind {
-						HandshakeProtocolKind::Ecies => {
-							// Create default security profile for negotiation
-							let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
-							let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
+					HandshakeProtocolKind::Ecies => {
+						// Create default security profile for negotiation
+						let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
+						let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
 
-							Box::new(
-								$crate::transport::handshake::server::EciesHandshakeServer::new(
-									$crate::crypto::profiles::DefaultCryptoProvider::default(),
-									std::sync::Arc::clone(&signatory),
-									cert,
-									aad
-								)
-								.with_supported_profiles(vec![profile_desc])
+						Box::new(
+							$crate::transport::handshake::server::EciesHandshakeServer::<$crate::crypto::profiles::DefaultCryptoProvider>::new(
+								std::sync::Arc::clone(&signatory),
+								cert,
+								aad,
+								self.client_validators.as_ref().map(std::sync::Arc::clone)
 							)
+							.with_supported_profiles(vec![profile_desc])
+						)
 						}
+
 						#[cfg(all(
 							feature = "builder",
 							feature = "aead",
@@ -517,11 +527,15 @@ macro_rules! impl_tcp_common {
 					// No response means handshake is complete - derive session key
 					let session_key_secret = orchestrator.complete().await?;
 
+					// Extract peer certificate if mutual auth was performed
+					#[cfg(feature = "x509")]
+					{
+						self.peer_certificate = orchestrator.peer_certificate().cloned();
+					}
+
 					// Extract raw bytes from Secret for AES key
 					use $crate::crypto::secret::ToInsecure;
-					let session_key_bytes = session_key_secret.to_insecure();
-
-					// Reconstruct Aes256Gcm from raw key bytes
+					let session_key_bytes = session_key_secret.to_insecure();					// Reconstruct Aes256Gcm from raw key bytes
 					use $crate::crypto::aead::KeyInit;
 					let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
 						.map_err(|_| TransportError::InvalidMessage)?;
@@ -554,6 +568,15 @@ macro_rules! impl_tcp_common {
 
 			fn with_collector_gate<G: GatePolicy + 'static>(mut self, gate: G) -> Self {
 				self.collector_gate = Box::new(gate);
+				self
+			}
+
+			#[cfg(all(feature = "x509", feature = "std"))]
+			fn with_x509_gate<V>(mut self, validator: V) -> Self
+			where
+				V: $crate::crypto::x509::policy::CertificateValidation + 'static,
+			{
+				self.client_validators = Some(std::sync::Arc::new(vec![std::sync::Arc::new(validator)]));
 				self
 			}
 		}

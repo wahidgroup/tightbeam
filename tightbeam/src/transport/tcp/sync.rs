@@ -1,9 +1,27 @@
-use core::str::FromStr;
+#![cfg(feature = "x509")]
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
+use core::str::FromStr;
+use core::time::Duration;
+
+use crate::crypto::aead::Aes256Gcm;
+use crate::crypto::secret::Secret;
+use crate::crypto::x509::policy::CertificateValidation;
+use crate::prelude::TightBeamSocketAddr;
+use crate::transport::handshake::{
+	HandshakeError, HandshakeProtocolKind, ServerHandshakeKey, ServerHandshakeProtocol, TcpHandshakeState,
+};
 use crate::transport::tcp::TcpListenerTrait;
-#[cfg(feature = "x509")]
-use crate::transport::EncryptedMessageIO;
+use crate::transport::{EncryptedMessageIO, EncryptedProtocol, Protocol, TransportEncryptionConfig};
 use crate::transport::{MessageIO, Pingable, TransportResult};
+use crate::x509::Certificate;
 use crate::Frame;
 
 #[cfg(feature = "transport-policy")]
@@ -11,13 +29,6 @@ use crate::{
 	policy::GatePolicy,
 	transport::{error::TransportError, policy::RestartPolicy, tcp::ProtocolStream},
 };
-
-#[cfg(feature = "x509")]
-use crate::transport::handshake::TcpHandshakeState;
-#[cfg(feature = "x509")]
-use crate::x509::Certificate;
-#[cfg(feature = "x509")]
-use std::time::Duration;
 
 pub struct TcpTransport<S: ProtocolStream> {
 	stream: S,
@@ -28,39 +39,33 @@ pub struct TcpTransport<S: ProtocolStream> {
 	emitter_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "transport-policy")]
 	collector_gate: Box<dyn GatePolicy>,
-	#[cfg(feature = "x509")]
-	#[allow(dead_code)]
-	enforce_encryption: bool,
-	#[cfg(feature = "x509")]
+
 	server_certificate: Option<Certificate>,
-	#[cfg(feature = "x509")]
+
+	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+
+	peer_certificate: Option<Certificate>,
+
 	#[allow(dead_code)]
 	aad_domain_tag: Option<Vec<u8>>,
-	#[cfg(feature = "x509")]
+
 	max_cleartext_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
+
 	max_encrypted_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
+
 	#[allow(dead_code)]
-	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
-	#[cfg(feature = "x509")]
+	signatory: Option<Arc<dyn ServerHandshakeKey>>,
+
 	handshake_state: TcpHandshakeState,
-	#[cfg(feature = "x509")]
+
 	#[allow(dead_code)]
 	handshake_timeout: Duration,
-	#[cfg(feature = "x509")]
-	symmetric_key: Option<crate::crypto::aead::Aes256Gcm>,
-	#[cfg(feature = "x509")]
-	server_handshake: Option<
-		Box<
-			dyn crate::transport::handshake::ServerHandshakeProtocol<
-				SessionKey = crate::crypto::secret::Secret<Vec<u8>>,
-				Error = crate::transport::handshake::HandshakeError,
-			>,
-		>,
-	>,
-	#[cfg(feature = "x509")]
-	handshake_protocol_kind: crate::transport::handshake::HandshakeProtocolKind,
+
+	symmetric_key: Option<Aes256Gcm>,
+
+	server_handshake: Option<Box<dyn ServerHandshakeProtocol<SessionKey = Secret<Vec<u8>>, Error = HandshakeError>>>,
+
+	handshake_protocol_kind: HandshakeProtocolKind,
 }
 
 impl<S: ProtocolStream> Pingable for TcpTransport<S>
@@ -74,7 +79,7 @@ where
 }
 
 // Use the macro to generate common implementations
-crate::impl_tcp_common!(TcpTransport, crate::transport::tcp::ProtocolStream);
+crate::impl_tcp_common!(TcpTransport, ProtocolStream);
 
 impl<S: ProtocolStream> MessageIO for TcpTransport<S>
 where
@@ -103,7 +108,7 @@ where
 		};
 
 		// Enforce size ceilings if configured (pick larger bound conservatively)
-		#[cfg(feature = "x509")]
+
 		{
 			let max_allowed = self
 				.max_encrypted_envelope
@@ -115,9 +120,8 @@ where
 		}
 
 		// If in handshake waiting state, optionally enforce timeout by short read deadline using std only
-		#[cfg(feature = "x509")]
+
 		{
-			use crate::transport::handshake::TcpHandshakeState;
 			match self.handshake_state() {
 				TcpHandshakeState::AwaitingServerResponse { initiated_at }
 				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
@@ -144,7 +148,8 @@ where
 		Ok(())
 	}
 }
-#[cfg(all(feature = "x509", feature = "transport-policy"))]
+
+#[cfg(feature = "transport-policy")]
 impl<S: ProtocolStream> crate::transport::MessageCollector for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -170,7 +175,7 @@ where
 			};
 
 			// Per-envelope size ceilings
-			#[cfg(feature = "x509")]
+
 			{
 				match &wire_envelope {
 					WireEnvelope::Cleartext(_) => {
@@ -280,7 +285,7 @@ where
 	}
 }
 
-#[cfg(all(feature = "x509", feature = "transport-policy"))]
+#[cfg(feature = "transport-policy")]
 impl<S: ProtocolStream> crate::transport::MessageEmitter for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -400,7 +405,6 @@ where
 	}
 }
 
-#[cfg(feature = "x509")]
 impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -436,17 +440,13 @@ where
 /// TCP server using abstract listener trait
 pub struct TcpListener<L: TcpListenerTrait> {
 	listener: L,
-	#[cfg(feature = "x509")]
 	certificate: Option<crate::x509::Certificate>,
 	#[cfg(feature = "x509")]
+	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	aad_domain_tag: Option<Vec<u8>>,
-	#[cfg(feature = "x509")]
 	max_cleartext_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
-	signatory: Option<std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
-	#[cfg(feature = "x509")]
+	signatory: Option<Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	handshake_timeout: Option<Duration>,
 }
 
@@ -470,17 +470,13 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 		Ok((
 			TcpListener {
 				listener,
-				#[cfg(feature = "x509")]
 				certificate: None,
 				#[cfg(feature = "x509")]
+				client_validators: None,
 				aad_domain_tag: None,
-				#[cfg(feature = "x509")]
 				max_cleartext_envelope: None,
-				#[cfg(feature = "x509")]
 				max_encrypted_envelope: None,
-				#[cfg(feature = "x509")]
 				signatory: None,
-				#[cfg(feature = "x509")]
 				handshake_timeout: None,
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
@@ -509,17 +505,13 @@ where
 	pub fn from_listener(listener: L) -> Self {
 		Self {
 			listener,
-			#[cfg(feature = "x509")]
 			certificate: None,
 			#[cfg(feature = "x509")]
+			client_validators: None,
 			aad_domain_tag: None,
-			#[cfg(feature = "x509")]
 			max_cleartext_envelope: None,
-			#[cfg(feature = "x509")]
 			max_encrypted_envelope: None,
-			#[cfg(feature = "x509")]
 			signatory: None,
-			#[cfg(feature = "x509")]
 			handshake_timeout: None,
 		}
 	}
@@ -527,10 +519,13 @@ where
 	pub fn accept(&self) -> TransportResult<TcpTransport<L::Stream>> {
 		let (stream, _) = self.listener.accept()?;
 		let mut transport = TcpTransport::from(stream);
-		#[cfg(feature = "x509")]
+
 		{
 			if let Some(ref cert) = self.certificate {
 				transport.server_certificate = Some(cert.clone());
+			}
+			if let Some(ref validators) = self.client_validators {
+				transport.client_validators = Some(Arc::clone(validators));
 			}
 			if let Some(ref aad) = self.aad_domain_tag {
 				transport.aad_domain_tag = Some(aad.clone());
@@ -545,7 +540,7 @@ where
 				transport.handshake_timeout = timeout;
 			}
 		}
-		#[cfg(feature = "x509")]
+
 		if let Some(ref signatory) = self.signatory {
 			transport.signatory = Some(signatory.clone());
 		}
@@ -553,32 +548,30 @@ where
 	}
 }
 
-#[cfg(feature = "x509")]
-impl crate::transport::EncryptedProtocol for TcpListener<std::net::TcpListener> {
-	type Encryptor = crate::crypto::aead::Aes256Gcm;
-	type Decryptor = crate::crypto::aead::Aes256Gcm;
+impl EncryptedProtocol for TcpListener<std::net::TcpListener> {
+	type Encryptor = Aes256Gcm;
+	type Decryptor = Aes256Gcm;
 
 	async fn bind_with(
-		addr: <Self as crate::transport::Protocol>::Address,
-		config: crate::transport::TransportEncryptionConfig,
-	) -> Result<
-		(Self::Listener, <Self as crate::transport::Protocol>::Address),
-		<Self as crate::transport::Protocol>::Error,
-	> {
+		addr: <Self as Protocol>::Address,
+		config: TransportEncryptionConfig,
+	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
 		let listener = std::net::TcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
 		Ok((
 			TcpListener {
 				listener,
 				certificate: Some(config.certificate.clone()),
+				#[cfg(feature = "x509")]
+				client_validators: config.client_validators.as_ref().map(Arc::clone),
 				aad_domain_tag: Some(config.aad_domain_tag.clone()),
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
-				#[cfg(feature = "x509")]
+
 				signatory: Some(config.signatory.clone()),
 				handshake_timeout: Some(config.handshake_timeout),
 			},
-			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
+			TightBeamSocketAddr(bound_addr),
 		))
 	}
 }

@@ -946,8 +946,6 @@ mod tests {
 	use crate::transport::tcp::r#async::TokioListener as Listener;
 	#[cfg(all(not(feature = "tokio"), feature = "std"))]
 	use crate::transport::tcp::TcpListener;
-	#[cfg(feature = "tokio")]
-	use crate::transport::MessageEmitter;
 
 	#[cfg(all(not(feature = "tokio"), feature = "std"))]
 	type Listener = TcpListener<std::net::TcpListener>;
@@ -1083,6 +1081,8 @@ mod tests {
 			protocol: Listener,
 			policies: {
 				with_collector_gate: [crate::policy::AcceptAllGate],
+				// with_x509: [some_cert]
+				// with_x509_gate: [crate::somewhere::CertificateValidationLike]
 			},
 			config: {
 				lotto_number: u32,

@@ -69,6 +69,20 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Missing client certificate"))]
 	MissingClientCertificate,
 
+	/// Server requires mutual authentication but client has no identity configured
+	#[cfg_attr(
+		feature = "derive",
+		error("Server requires mutual authentication but client has no identity")
+	)]
+	MutualAuthRequired,
+
+	/// Peer identity mismatch during re-handshake (immutable identity violation)
+	#[cfg_attr(
+		feature = "derive",
+		error("Peer identity changed during re-handshake - connection identity is immutable")
+	)]
+	PeerIdentityMismatch,
+
 	/// Missing client random
 	#[cfg_attr(feature = "derive", error("Missing client random from ClientHello"))]
 	MissingClientRandom,
@@ -97,6 +111,11 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Profile negotiation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	NegotiationError(crate::crypto::negotiation::NegotiationError),
+
+	/// Certificate policy rejection
+	#[cfg_attr(feature = "derive", error("Certificate rejected by policy: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	CertificatePolicyError(crate::crypto::policy::CryptoPolicyError),
 
 	// ---------------- Attribute / ASN.1 profile errors ----------------
 	#[cfg_attr(feature = "derive", error("Attribute must contain exactly one value"))]
@@ -198,6 +217,7 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::Timeout => write!(f, "Handshake timeout"),
 			HandshakeError::InvalidProfileSelection => write!(f, "Server selected profile not in client's offer"),
 			HandshakeError::NegotiationError(e) => write!(f, "Profile negotiation failed: {}", e),
+			HandshakeError::CertificatePolicyError(e) => write!(f, "Certificate rejected by policy: {}", e),
 			HandshakeError::DerError(e) => write!(f, "DER error: {}", e),
 			HandshakeError::InvalidAttributeArity => write!(f, "Attribute must contain exactly one value"),
 			HandshakeError::DuplicateAttribute => write!(f, "Duplicate attribute present"),

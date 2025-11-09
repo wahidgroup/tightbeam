@@ -19,7 +19,8 @@ use crate::crypto::sign::EcdsaSignatureVerifier;
 use crate::crypto::sign::SignatureAlgorithmIdentifier;
 use crate::crypto::sign::{Keypair, SignatureEncoding, Signer, Verifier};
 use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
-use crate::crypto::x509::validate_certificate_expiry;
+use crate::crypto::x509::policy::CertificateValidation;
+use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
 use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
@@ -32,7 +33,7 @@ use crate::transport::handshake::builders::{
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::{ClientStateTransition, HandshakeState, StateTransition};
-use crate::transport::handshake::ClientHandshakeProtocol;
+use crate::transport::handshake::{Arc, ClientHandshakeProtocol};
 
 /// Client-side CMS handshake orchestrator.
 ///
@@ -51,12 +52,14 @@ where
 {
 	state: ClientStateTransition,
 	client_key: P::SigningKey,
+	client_certificate: Option<Certificate>,
 	server_cert: Certificate,
 	transcript_hash: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
 	security_offer: Option<SecurityOffer>,
 	selected_profile: Option<SecurityProfileDesc>,
 	provider: P,
+	certificate_validator: Option<Arc<dyn CertificateValidation>>,
 }
 
 impl<P> CmsHandshakeClient<P>
@@ -78,13 +81,27 @@ where
 		Self {
 			state: ClientStateTransition::new(),
 			client_key,
+			client_certificate: None,
 			server_cert,
 			transcript_hash,
 			session_key: None,
-			security_offer: None, // No offer = dealer's choice mode
+			security_offer: None,
 			selected_profile: None,
 			provider,
+			certificate_validator: None,
 		}
+	}
+
+	/// Set a certificate validator for the handshake.
+	pub fn with_certificate_validator(mut self, validator: Arc<dyn CertificateValidation>) -> Self {
+		self.certificate_validator = Some(validator);
+		self
+	}
+
+	/// Set client certificate for mutual authentication.
+	pub fn with_client_certificate(mut self, certificate: Certificate) -> Self {
+		self.client_certificate = Some(certificate);
+		self
 	}
 
 	/// Configures the security offer for negotiation.
@@ -117,7 +134,12 @@ where
 	fn validate_state_and_certificate(&self) -> Result<(), HandshakeError> {
 		self.validate_expected_state(HandshakeState::Init)?;
 
-		validate_certificate_expiry(&self.server_cert)?;
+		// Use provided validator if available, otherwise default to expiry check
+		if let Some(validator) = &self.certificate_validator {
+			validator.evaluate(&self.server_cert)?;
+		} else {
+			validate_certificate_expiry(&self.server_cert)?;
+		}
 
 		Ok(())
 	}
@@ -139,6 +161,7 @@ where
 		let sender_public = sender_ephemeral.public_key();
 		let sender_pub_spki = sender_public.to_public_key_der()?;
 		let sender_pub_spki = SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes())?;
+
 		Ok((sender_ephemeral, sender_pub_spki))
 	}
 
@@ -163,11 +186,8 @@ where
 	}
 
 	/// Compute the signer identifier from the server's verifying key.
-	fn compute_signer_identifier(
-		&self,
-		server_verifying_key: &P::VerifyingKey,
-	) -> Result<SignerIdentifier, HandshakeError> {
-		Ok(crate::crypto::x509::compute_signer_identifier::<P::Digest, _>(
+	fn compute_signer_identifier(&self, verifying_key: &P::VerifyingKey) -> Result<SignerIdentifier, HandshakeError> {
+		Ok(crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(
 			server_verifying_key,
 		)?)
 	}

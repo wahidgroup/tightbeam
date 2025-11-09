@@ -9,7 +9,11 @@
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use core::marker::PhantomData;
 
+#[cfg(feature = "std")]
+use std::marker::PhantomData;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
@@ -22,7 +26,10 @@ use crate::crypto::negotiation::select_profile;
 use crate::crypto::negotiation::SecurityAccept;
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::secret::{Secret, ToInsecure};
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+use crate::crypto::sign::Verifier;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
@@ -54,8 +61,9 @@ where
 	aad_domain_tag: Option<Vec<u8>>,
 	supported_profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>,
 	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
-	#[allow(dead_code)]
-	provider: P,
+	client_validators: Option<Arc<Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>>,
+	validated_client_cert: Option<Certificate>,
+	_phantom: PhantomData<P>,
 }
 
 impl<P> EciesHandshakeServer<P>
@@ -66,15 +74,15 @@ where
 	/// Create a new ECIES handshake server.
 	///
 	/// # Parameters
-	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `server_key`: The server's signing key for authentication (trait object)
-	/// - `server_cert`: The server's certificate
+	/// - `server_cert`: The server's certificate to send to client
 	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
+	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
-		provider: P,
 		server_key: Arc<dyn ServerHandshakeKey>,
 		server_cert: Certificate,
 		aad_domain_tag: Option<Vec<u8>>,
+		client_validators: Option<Arc<Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>>,
 	) -> Self {
 		Self {
 			state: ServerStateTransition::new(),
@@ -87,10 +95,11 @@ where
 			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
 			supported_profiles: Vec::new(), // Must be set via with_supported_profiles()
 			selected_profile: None,
-			provider,
+			client_validators,
+			validated_client_cert: None,
+			_phantom: PhantomData,
 		}
 	}
-
 	/// Set the server's supported security profiles for negotiation.
 	/// Server must have at least one supported profile configured.
 	pub fn with_supported_profiles(mut self, profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>) -> Self {
@@ -171,30 +180,40 @@ where
 	///
 	/// # Returns
 	/// Success (session key stored internally)
-	pub fn process_client_key_exchange(&mut self, client_kex_der: &[u8]) -> Result<(), HandshakeError> {
+	pub fn process_client_key_exchange(&mut self, client_kex_der: &[u8]) -> Result<(), HandshakeError>
+	where
+		P::Curve: Curve + CurveArithmetic,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		for<'a> P::Signature: TryFrom<&'a [u8]>,
+		P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
+	{
 		// 1. Validate current state is ServerHelloSent
 		self.validate_expected_state(HandshakeState::ServerHelloSent)?;
 
 		// 2. Decode ClientKeyExchange message
 		let client_kex = self.decode_client_key_exchange(client_kex_der)?;
 
-		// 3. Get encrypted bytes from the message
+		// 3. Validate client certificate if mutual auth is configured
+		self.validate_client_certificate(&client_kex)?;
+
+		// 4. Get encrypted bytes from the message
 		let encrypted_bytes = client_kex.encrypted_data.as_bytes();
 
-		// 4. Decrypt ECIES payload
+		// 5. Decrypt ECIES payload
 		let decrypted_payload = self.decrypt_ecies_payload(encrypted_bytes)?;
 
-		// 5. Extract base session key and client random from payload
+		// 6. Extract base session key and client random from payload
 		let (base_session_key, client_random_from_payload) =
 			self.extract_session_data_from_payload(&decrypted_payload)?;
 
-		// 6. Verify client random matches stored value (prevents replay attacks)
+		// 7. Verify client random matches stored value (prevents replay attacks)
 		self.verify_client_random(&client_random_from_payload)?;
 
-		// 7. Store base session key
+		// 8. Store base session key
 		self.base_session_key = Some(base_session_key);
 
-		// 8. Transition state to KeyExchangeReceived
+		// 9. Transition state to KeyExchangeReceived
 		self.state.dispatch(HandshakeState::KeyExchangeReceived)?;
 
 		Ok(())
@@ -329,6 +348,7 @@ where
 			server_random: OctetString::new(server_random)?,
 			signature: OctetString::new(signature_bytes)?,
 			security_accept,
+			client_cert_required: self.client_validators.is_some(),
 		};
 
 		Ok(server_handshake.to_der()?)
@@ -370,6 +390,71 @@ where
 		Ok(())
 	}
 
+	#[cfg(feature = "x509")]
+	fn validate_client_certificate(&mut self, client_kex: &ClientKeyExchange) -> Result<(), HandshakeError>
+	where
+		P::Curve: Curve + CurveArithmetic,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		for<'a> P::Signature: TryFrom<&'a [u8]>,
+		P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
+	{
+		if let Some(validators) = &self.client_validators {
+			// Client cert is required when validators are present
+			let client_cert = client_kex
+				.client_certificate
+				.as_ref()
+				.ok_or(HandshakeError::MissingClientCertificate)?;
+
+			// Check for identity immutability - reject if cert changes on re-handshake
+			if let Some(existing_cert) = &self.validated_client_cert {
+				if existing_cert != client_cert {
+					return Err(HandshakeError::PeerIdentityMismatch);
+				}
+			}
+
+			// Run validator chain (includes expiry, pinning, policy, etc.)
+			for validator in validators.iter() {
+				validator.evaluate(client_cert)?;
+			}
+
+			// Verify client signature over transcript hash
+			let client_signature = client_kex
+				.client_signature
+				.as_ref()
+				.ok_or(HandshakeError::SignatureVerificationFailed)?;
+
+			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+
+			// Extract public key from client certificate
+			let pubkey_bytes = client_cert
+				.tbs_certificate
+				.subject_public_key_info
+				.subject_public_key
+				.raw_bytes();
+
+			// Parse public key
+			let public_key = PublicKey::<P::Curve>::from_sec1_bytes(pubkey_bytes)?;
+
+			// Parse signature
+			let signature = P::Signature::try_from(client_signature.as_bytes())
+				.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+
+			// Create verifying key from public key
+			let verifying_key = P::VerifyingKey::from(&public_key);
+
+			// Verify signature over transcript hash
+			verifying_key
+				.verify(&transcript_hash, &signature)
+				.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+
+			// Store validated cert (identity is now locked)
+			self.validated_client_cert = Some(client_cert.clone());
+		}
+
+		Ok(())
+	}
+
 	fn clear_sensitive_data(&mut self) {
 		if let Some(mut bk) = self.base_session_key.take() {
 			bk.fill(0);
@@ -390,6 +475,11 @@ where
 impl<P> ServerHandshakeProtocol for EciesHandshakeServer<P>
 where
 	P: CryptoProvider + Send + Sync,
+	P::Curve: Curve + CurveArithmetic,
+	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	for<'a> P::Signature: TryFrom<&'a [u8]>,
+	P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	P::AeadCipher: KeyInit,
 {
 	type SessionKey = Secret<Vec<u8>>;
@@ -448,6 +538,11 @@ where
 
 	fn is_complete(&self) -> bool {
 		self.is_complete()
+	}
+
+	#[cfg(feature = "x509")]
+	fn peer_certificate(&self) -> Option<&Certificate> {
+		self.validated_client_cert.as_ref()
 	}
 }
 

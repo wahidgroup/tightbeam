@@ -6,9 +6,11 @@
 use crate::cms::content_info::CmsVersion;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::crypto::hash::Digest;
+use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::Signer;
 use crate::crypto::sign::{Keypair, SignatureEncoding};
 use crate::der::asn1::{ObjectIdentifier, OctetString};
+use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 use crate::transport::handshake::error::HandshakeError;
@@ -23,7 +25,7 @@ use crate::x509::ext::pkix::SubjectKeyIdentifier;
 /// cryptographic suite (signature algorithm and digest algorithm).
 pub struct TightBeamSignedDataBuilder<P>
 where
-	P: crate::crypto::profiles::CryptoProvider,
+	P: CryptoProvider,
 {
 	/// Signer implementing signature creation
 	signer: Box<dyn Signer<P::Signature>>,
@@ -40,9 +42,9 @@ where
 
 impl<P> TightBeamSignedDataBuilder<P>
 where
-	P: crate::crypto::profiles::CryptoProvider,
+	P: CryptoProvider,
 	P::Signature: SignatureEncoding,
-	P::Digest: Digest + der::oid::AssociatedOid,
+	P::Digest: Digest + AssociatedOid,
 {
 	/// Create a new SignedData builder.
 	///
@@ -64,7 +66,7 @@ where
 	{
 		// Generate SKID from public key
 		let verifying_key = signer.verifying_key();
-		let signer_id = crate::crypto::x509::compute_signer_identifier::<P::Digest, _>(verifying_key)?;
+		let signer_id = crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(verifying_key)?;
 
 		Ok(Self {
 			signer: Box::new(signer),
@@ -142,111 +144,106 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::der::Decode;
+	use crate::random::OsRng;
 
-	mod signed_data {
-		use super::*;
-		use crate::crypto::profiles::DefaultCryptoProvider;
-		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-		use crate::der::Decode;
-		use crate::random::OsRng;
+	/// Helper function to create a test signing key
+	fn create_test_signing_key() -> Secp256k1SigningKey {
+		Secp256k1SigningKey::random(&mut OsRng)
+	}
 
-		/// Helper function to create a test signing key
-		fn create_test_signing_key() -> Secp256k1SigningKey {
-			Secp256k1SigningKey::random(&mut OsRng)
+	/// Helper function to create SHA3-256 digest algorithm identifier
+	fn create_sha3_256_digest_alg() -> AlgorithmIdentifierOwned {
+		AlgorithmIdentifierOwned { oid: crate::asn1::HASH_SHA3_256_OID, parameters: None }
+	}
+
+	/// Helper function to create ECDSA with SHA256 signature algorithm identifier
+	fn create_ecdsa_sha256_signature_alg() -> AlgorithmIdentifierOwned {
+		AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
+	}
+
+	/// Helper function to create a test SignedData builder
+	fn create_test_signed_data_builder() -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider>, HandshakeError> {
+		let signing_key = create_test_signing_key();
+		let digest_alg = create_sha3_256_digest_alg();
+		let signature_alg = create_ecdsa_sha256_signature_alg();
+
+		TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(signing_key, digest_alg, signature_alg)
+	}
+
+	#[test]
+	fn test_build_signed_data() -> Result<(), Box<dyn std::error::Error>> {
+		// 1. Create test builder
+		let mut builder = create_test_signed_data_builder()?;
+
+		// 2. Content to sign (e.g., transcript hash)
+		let transcript_hash = b"handshake_transcript_hash_placeholder_32bytes";
+
+		// 3. Build SignedData
+		let signed_data = builder.build(transcript_hash)?;
+
+		// 4. Verify SignedData structure
+		assert_eq!(signed_data.version, CmsVersion::V1);
+		assert_eq!(signed_data.digest_algorithms.len(), 1);
+		assert_eq!(signed_data.signer_infos.0.len(), 1);
+		assert_eq!(signed_data.encap_content_info.econtent_type, crate::asn1::DATA_OID);
+		assert!(signed_data.encap_content_info.econtent.is_some());
+
+		// 5. Verify signer info
+		let signer_info = &signed_data.signer_infos.0.as_ref()[0];
+		assert_eq!(signer_info.version, CmsVersion::V1);
+
+		// Verify signer identifier is SubjectKeyIdentifier (expected for our builder)
+		match signer_info.sid {
+			SignerIdentifier::SubjectKeyIdentifier(_) => {}
+			_ => unreachable!("SignedData builder should always create SubjectKeyIdentifier"),
 		}
 
-		/// Helper function to create SHA3-256 digest algorithm identifier
-		fn create_sha3_256_digest_alg() -> AlgorithmIdentifierOwned {
-			AlgorithmIdentifierOwned { oid: crate::asn1::HASH_SHA3_256_OID, parameters: None }
-		}
+		assert!(signer_info.signature.as_bytes().len() > 0);
 
-		/// Helper function to create ECDSA with SHA256 signature algorithm identifier
-		fn create_ecdsa_sha256_signature_alg() -> AlgorithmIdentifierOwned {
-			AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
-		}
+		Ok(())
+	}
 
-		/// Helper function to create a test SignedData builder
-		fn create_test_signed_data_builder() -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider>, HandshakeError>
-		{
-			let signing_key = create_test_signing_key();
-			let digest_alg = create_sha3_256_digest_alg();
-			let signature_alg = create_ecdsa_sha256_signature_alg();
+	#[test]
+	fn test_der_encoding() -> Result<(), Box<dyn std::error::Error>> {
+		// 1. Create test builder
+		let mut builder = create_test_signed_data_builder()?;
 
-			TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(signing_key, digest_alg, signature_alg)
-		}
+		// 2. Content to sign
+		let content = b"test_content";
 
-		#[test]
-		fn test_build_signed_data() -> Result<(), Box<dyn std::error::Error>> {
-			// 1. Create test builder
-			let mut builder = create_test_signed_data_builder()?;
+		// 3. Build and encode to DER
+		let der_bytes = builder.build_der(content)?;
+		assert!(!der_bytes.is_empty());
 
-			// 2. Content to sign (e.g., transcript hash)
-			let transcript_hash = b"handshake_transcript_hash_placeholder_32bytes";
+		// 4. Decode back from DER
+		let decoded = SignedData::from_der(&der_bytes)?;
+		assert_eq!(decoded.version, CmsVersion::V1);
+		assert_eq!(decoded.signer_infos.0.len(), 1);
 
-			// 3. Build SignedData
-			let signed_data = builder.build(transcript_hash)?;
+		Ok(())
+	}
 
-			// 4. Verify SignedData structure
-			assert_eq!(signed_data.version, CmsVersion::V1);
-			assert_eq!(signed_data.digest_algorithms.len(), 1);
-			assert_eq!(signed_data.signer_infos.0.len(), 1);
-			assert_eq!(signed_data.encap_content_info.econtent_type, crate::asn1::DATA_OID);
-			assert!(signed_data.encap_content_info.econtent.is_some());
+	#[test]
+	fn test_custom_content_type() -> Result<(), Box<dyn std::error::Error>> {
+		// 1. Create test builder
+		let mut builder = create_test_signed_data_builder()?;
 
-			// 5. Verify signer info
-			let signer_info = &signed_data.signer_infos.0.as_ref()[0];
-			assert_eq!(signer_info.version, CmsVersion::V1);
+		// 2. Content to sign
+		let content = b"custom_content";
 
-			// Verify signer identifier is SubjectKeyIdentifier (expected for our builder)
-			match signer_info.sid {
-				SignerIdentifier::SubjectKeyIdentifier(_) => {}
-				_ => unreachable!("SignedData builder should always create SubjectKeyIdentifier"),
-			}
+		// 3. Custom content type OID
+		let custom_oid = ObjectIdentifier::new_unwrap("1.2.3.4.5.6");
 
-			assert!(signer_info.signature.as_bytes().len() > 0);
+		// 4. Configure builder with custom content type
+		builder = builder.with_content_type(custom_oid);
 
-			Ok(())
-		}
+		// 5. Build SignedData
+		let signed_data = builder.build(content)?;
+		assert_eq!(signed_data.encap_content_info.econtent_type, custom_oid);
 
-		#[test]
-		fn test_der_encoding() -> Result<(), Box<dyn std::error::Error>> {
-			// 1. Create test builder
-			let mut builder = create_test_signed_data_builder()?;
-
-			// 2. Content to sign
-			let content = b"test_content";
-
-			// 3. Build and encode to DER
-			let der_bytes = builder.build_der(content)?;
-			assert!(!der_bytes.is_empty());
-
-			// 4. Decode back from DER
-			let decoded = SignedData::from_der(&der_bytes)?;
-			assert_eq!(decoded.version, CmsVersion::V1);
-			assert_eq!(decoded.signer_infos.0.len(), 1);
-
-			Ok(())
-		}
-
-		#[test]
-		fn test_custom_content_type() -> Result<(), Box<dyn std::error::Error>> {
-			// 1. Create test builder
-			let mut builder = create_test_signed_data_builder()?;
-
-			// 2. Content to sign
-			let content = b"custom_content";
-
-			// 3. Custom content type OID
-			let custom_oid = ObjectIdentifier::new_unwrap("1.2.3.4.5.6");
-
-			// 4. Configure builder with custom content type
-			builder = builder.with_content_type(custom_oid);
-
-			// 5. Build SignedData
-			let signed_data = builder.build(content)?;
-			assert_eq!(signed_data.encap_content_info.econtent_type, custom_oid);
-
-			Ok(())
-		}
+		Ok(())
 	}
 }

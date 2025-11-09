@@ -22,12 +22,13 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::SignatureEncoding;
 use crate::crypto::sign::Verifier;
-use crate::crypto::x509::validate_certificate_expiry;
+use crate::crypto::x509::policy::CertificateValidation;
+use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::state::{ClientStateTransition, HandshakeState, StateTransition};
-use crate::transport::handshake::{ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake};
+use crate::transport::handshake::{Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake};
 use crate::x509::Certificate;
 
 /// Client-side ECIES handshake orchestrator.
@@ -46,9 +47,11 @@ where
 	aad_domain_tag: Option<Vec<u8>>,
 	security_offer: Option<crate::crypto::negotiation::SecurityOffer>,
 	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
-	#[allow(dead_code)]
-	provider: P,
-	_phantom: PhantomData<M>,
+	certificate_validator: Option<Arc<dyn CertificateValidation>>,
+	client_certificate: Option<Certificate>,
+	client_signing_key: Option<Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
+	_phantom_provider: PhantomData<P>,
+	_phantom_message: PhantomData<M>,
 }
 
 /// Helper trait for extracting verifying keys from certificates.
@@ -76,9 +79,8 @@ where
 	/// Create a new ECIES handshake client.
 	///
 	/// # Parameters
-	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to "tb-v1")
-	pub fn new(provider: P, aad_domain_tag: Option<Vec<u8>>) -> Self {
+	pub fn new(aad_domain_tag: Option<Vec<u8>>) -> Self {
 		Self {
 			state: ClientStateTransition::new(),
 			client_random: None,
@@ -88,9 +90,33 @@ where
 			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
 			security_offer: None, // No offer = dealer's choice mode
 			selected_profile: None,
-			provider,
-			_phantom: PhantomData,
+			certificate_validator: None,
+			client_certificate: None,
+			client_signing_key: None,
+			_phantom_provider: PhantomData,
+			_phantom_message: PhantomData,
 		}
+	}
+
+	/// Set a certificate validator for the handshake.
+	pub fn with_certificate_validator(mut self, validator: Arc<dyn CertificateValidation>) -> Self {
+		self.certificate_validator = Some(validator);
+		self
+	}
+
+	/// Set client identity for mutual authentication.
+	///
+	/// # Parameters
+	/// - `certificate`: The client's X.509 certificate
+	/// - `signing_key`: The client's signing key (must match certificate)
+	pub fn with_client_identity(
+		mut self,
+		certificate: Certificate,
+		signing_key: Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
+	) -> Self {
+		self.client_certificate = Some(certificate);
+		self.client_signing_key = Some(signing_key);
+		self
 	}
 
 	/// Set the security profile offer for negotiation.
@@ -117,8 +143,12 @@ where
 		// Decode ServerHandshake
 		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
 
-		// Validate certificate
-		validate_certificate_expiry(&server_handshake.certificate)?;
+		// Use provided validator if available, otherwise default to expiry check
+		if let Some(validator) = &self.certificate_validator {
+			validator.evaluate(&server_handshake.certificate)?;
+		} else {
+			validate_certificate_expiry(&server_handshake.certificate)?;
+		}
 
 		Ok(server_handshake)
 	}
@@ -234,10 +264,40 @@ where
 			self.aad_domain_tag.as_deref(),
 		)?;
 
-		// 8. Build ClientKeyExchange
-		let client_kex = ClientKeyExchange { encrypted_data: OctetString::new(encrypted_bytes)? };
+		// 8. Handle mutual auth if requested by server
+		let (client_certificate, client_signature) = if server_handshake.client_cert_required {
+			// Server requires mutual auth - ensure we have client identity
+			let cert = self
+				.client_certificate
+				.as_ref()
+				.ok_or(HandshakeError::MutualAuthRequired)?
+				.clone();
+			let signing_key = self.client_signing_key.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 
-		// 9. Transition state
+			// Sign the transcript hash to prove possession of client private key
+			let signature_bytes = signing_key.sign_server_challenge(&transcript_digest)?;
+			(Some(cert), Some(OctetString::new(signature_bytes)?))
+		} else if self.client_certificate.is_some() {
+			// Client wants mutual auth but server doesn't require it - include anyway
+			let cert = self.client_certificate.as_ref().unwrap().clone();
+			let signing_key = self.client_signing_key.as_ref().unwrap();
+			let signature_bytes = signing_key.sign_server_challenge(&transcript_digest)?;
+			(Some(cert), Some(OctetString::new(signature_bytes)?))
+		} else {
+			// No mutual auth
+			(None, None)
+		};
+
+		// 9. Build ClientKeyExchange
+		let client_kex = ClientKeyExchange {
+			encrypted_data: OctetString::new(encrypted_bytes)?,
+			#[cfg(feature = "x509")]
+			client_certificate,
+			#[cfg(feature = "x509")]
+			client_signature,
+		};
+
+		// 10. Transition state
 		self.state.dispatch(HandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex.to_der()?)
@@ -628,6 +688,7 @@ mod tests {
 				server_random: crate::asn1::OctetString::new(server_random)?,
 				signature: crate::asn1::OctetString::new(signature_bytes)?,
 				security_accept: Some(SecurityAccept::new(p_b)),
+				client_cert_required: false,
 			};
 			let _kex = client.process_server_handshake(&response.to_der()?)?;
 			assert_eq!(client.selected_profile, Some(p_b));
@@ -661,6 +722,7 @@ mod tests {
 				server_random: crate::asn1::OctetString::new(server_random)?,
 				signature: crate::asn1::OctetString::new(signature_bytes)?,
 				security_accept: Some(SecurityAccept::new(p_c)), // Not in offer!
+				client_cert_required: false,
 			};
 			let result = client.process_server_handshake(&response.to_der()?);
 			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
@@ -692,6 +754,7 @@ mod tests {
 				server_random: crate::asn1::OctetString::new(server_random)?,
 				signature: crate::asn1::OctetString::new(signature_bytes)?,
 				security_accept: Some(SecurityAccept::new(p_a)),
+				client_cert_required: false,
 			};
 			let _kex = client.process_server_handshake(&response.to_der()?)?;
 			assert_eq!(client.selected_profile, Some(p_a));

@@ -9,7 +9,11 @@
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use core::marker::PhantomData;
 
+#[cfg(feature = "std")]
+use std::marker::PhantomData;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
@@ -25,6 +29,7 @@ use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, P
 use crate::crypto::sign::EcdsaSignatureVerifier;
 use crate::crypto::sign::{SignatureEncoding, Verifier};
 use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
+use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::der::Decode;
@@ -53,12 +58,13 @@ where
 	state: ServerStateTransition,
 	server_key: Arc<dyn ServerHandshakeKey>,
 	client_cert: Option<Certificate>,
+	validated_client_cert: Option<Certificate>,
 	transcript_hash: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
 	supported_profiles: Vec<SecurityProfileDesc>,
 	selected_profile: Option<SecurityProfileDesc>,
-	#[allow(dead_code)]
-	provider: P,
+	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	_phantom: PhantomData<P>,
 }
 
 impl<P> CmsHandshakeServer<P>
@@ -71,19 +77,25 @@ where
 	/// Create a new CMS handshake server.
 	///
 	/// # Parameters
-	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `server_key`: The server's signing key for authentication (trait object)
 	/// - `transcript_hash`: The handshake transcript hash (from previous handshake messages)
-	pub fn new(provider: P, server_key: Arc<dyn ServerHandshakeKey>, transcript_hash: Vec<u8>) -> Self {
+	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
+	pub fn new(
+		server_key: Arc<dyn ServerHandshakeKey>,
+		transcript_hash: Vec<u8>,
+		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	) -> Self {
 		Self {
 			state: ServerStateTransition::new(),
 			server_key,
 			client_cert: None,
+			validated_client_cert: None,
 			transcript_hash,
 			session_key: None,
 			supported_profiles: Vec::new(),
 			selected_profile: None,
-			provider,
+			client_validators,
+			_phantom: PhantomData,
 		}
 	}
 
@@ -99,11 +111,30 @@ where
 	}
 
 	/// Set the client certificate (optional, for mutual authentication).
+	///
+	/// Validates the certificate using the configured validator chain and enforces
+	/// identity immutability (certificate cannot change during re-handshake).
 	pub fn set_client_certificate(&mut self, cert: Certificate) -> Result<(), HandshakeError> {
-		// Validate certificate (expiry check)
-		crate::crypto::x509::validate_certificate_expiry(&cert)?;
+		// Check for identity immutability - reject if cert changes on re-handshake
+		if let Some(existing_cert) = &self.validated_client_cert {
+			if existing_cert != &cert {
+				return Err(HandshakeError::PeerIdentityMismatch);
+			}
+		}
 
-		self.client_cert = Some(cert);
+		// Run validator chain if configured
+		if let Some(validators) = &self.client_validators {
+			for validator in validators.iter() {
+				validator.evaluate(&cert)?;
+			}
+		}
+
+		// Store the cert (used for extracting public key later)
+		self.client_cert = Some(cert.clone());
+
+		// Store as validated cert (identity is now locked)
+		self.validated_client_cert = Some(cert);
+
 		Ok(())
 	}
 
@@ -145,7 +176,7 @@ where
 		&self,
 		client_verifying_key: &P::VerifyingKey,
 	) -> Result<SignerIdentifier, HandshakeError> {
-		Ok(crate::crypto::x509::compute_signer_identifier::<P::Digest, _>(
+		Ok(crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(
 			client_verifying_key,
 		)?)
 	}
@@ -377,6 +408,11 @@ where
 	fn is_complete(&self) -> bool {
 		self.is_complete()
 	}
+
+	#[cfg(feature = "x509")]
+	fn peer_certificate(&self) -> Option<&Certificate> {
+		self.validated_client_cert.as_ref()
+	}
 }
 
 /// Type alias for CMS server using secp256k1 curve.
@@ -384,12 +420,13 @@ where
 /// This is the default curve used in TightBeam and is provided as a
 /// convenient alias for the generic `CmsHandshakeServer`.
 #[cfg(feature = "secp256k1")]
-pub type CmsHandshakeServerSecp256k1 = CmsHandshakeServer<crate::crypto::profiles::DefaultCryptoProvider>;
+pub type CmsHandshakeServerSecp256k1 = CmsHandshakeServer<DefaultCryptoProvider>;
 
 #[cfg(test)]
 mod tests {
 	mod server {
 		use super::super::*;
+		use crate::cms::cert::IssuerAndSerialNumber;
 		use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -398,6 +435,7 @@ mod tests {
 		use crate::crypto::x509::serial_number::SerialNumber;
 		use crate::der::Decode;
 		use crate::random::{generate_nonce, OsRng};
+		use crate::spki::SubjectPublicKeyInfoOwned;
 		use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 		use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamSignedDataBuilder};
 		use crate::transport::handshake::tests::*;
@@ -424,20 +462,21 @@ mod tests {
 			let sender_ephemeral = SecretKey::<k256::Secp256k1>::random(&mut OsRng);
 			let sender_public = sender_ephemeral.public_key();
 			let sender_pub_spki = sender_public.to_public_key_der().unwrap();
-			let sender_pub_spki = crate::spki::SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes()).unwrap();
+			let sender_pub_spki = SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes()).unwrap();
 
 			// Create UKM with random bytes
 			let ukm_bytes = generate_nonce::<64>(None).unwrap();
 			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
 
 			// Create recipient identifier
-			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(cms::cert::IssuerAndSerialNumber {
+			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
 				issuer: Name::default(),
 				serial_number: SerialNumber::new(&[0x01]).unwrap(),
 			});
 
 			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned { oid: crate::asn1::AES_256_WRAP_OID, parameters: None };
+			let oid = crate::asn1::AES_256_WRAP_OID;
+			let key_enc_alg = AlgorithmIdentifierOwned { oid, parameters: None };
 
 			let kari_builder = TightBeamKariBuilder::default()
 				.with_sender_priv(sender_ephemeral)
@@ -460,9 +499,10 @@ mod tests {
 			assert_eq!(server.state(), HandshakeState::ServerFinishedSent);
 
 			// Build client Finished
-			let digest_alg = AlgorithmIdentifierOwned { oid: crate::asn1::HASH_SHA3_256_OID, parameters: None };
-			let signature_alg =
-				AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
+			let oid = crate::asn1::HASH_SHA3_256_OID;
+			let digest_alg = AlgorithmIdentifierOwned { oid, parameters: None };
+			let oid = crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID;
+			let signature_alg = AlgorithmIdentifierOwned { oid, parameters: None };
 			let mut client_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(
 				client_test_cert.signing_key.clone(),
 				digest_alg,

@@ -496,6 +496,17 @@ pub trait ServerHandshakeProtocol: Send {
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
+
+	/// Get the validated peer certificate from mutual authentication.
+	///
+	/// Returns `Some(Certificate)` if the client provided a certificate during the handshake
+	/// and it was successfully validated. Returns `None` if no client certificate was provided
+	/// or mutual authentication was not configured.
+	///
+	/// The peer certificate represents the authenticated identity of the client and should
+	/// be treated as immutable for the lifetime of the connection.
+	#[cfg(feature = "x509")]
+	fn peer_certificate(&self) -> Option<&Certificate>;
 }
 
 // ============================================================================
@@ -536,11 +547,24 @@ pub struct ServerHandshake {
 	pub signature: OctetString,
 	#[asn1(optional = "true")]
 	pub security_accept: Option<SecurityAccept>,
+	/// Indicates if the server requires client certificate for mutual authentication.
+	/// When true, client must provide certificate in ClientKeyExchange.
+	pub client_cert_required: bool,
 }
 
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientKeyExchange {
 	pub encrypted_data: OctetString,
+	/// Optional client certificate for mutual authentication.
+	/// Included when server indicates client_cert in ServerHandshake.
+	#[cfg(feature = "x509")]
+	#[asn1(optional = "true")]
+	pub client_certificate: Option<Certificate>,
+	/// Signature over the handshake transcript (ClientHello || ServerHandshake || encrypted_data)
+	/// proving possession of the client certificate's private key.
+	#[cfg(feature = "x509")]
+	#[asn1(optional = "true")]
+	pub client_signature: Option<OctetString>,
 }
 
 // ============================================================================
@@ -662,6 +686,12 @@ impl TryFrom<&crate::cms::enveloped_data::EnvelopedData> for ClientKeyExchange {
 			.ok_or(HandshakeError::InvalidClientKeyExchange)?
 			.as_bytes();
 
-		Ok(ClientKeyExchange { encrypted_data: OctetString::new(encrypted_bytes)? })
+		Ok(ClientKeyExchange {
+			encrypted_data: OctetString::new(encrypted_bytes)?,
+			#[cfg(feature = "x509")]
+			client_certificate: None,
+			#[cfg(feature = "x509")]
+			client_signature: None,
+		})
 	}
 }
