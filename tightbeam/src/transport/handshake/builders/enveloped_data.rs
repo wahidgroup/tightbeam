@@ -8,7 +8,8 @@ use crate::asn1::{DATA_OID, ENVELOPED_DATA_OID};
 use crate::cms::builder::RecipientInfoBuilder;
 use crate::cms::content_info::{CmsVersion, ContentInfo};
 use crate::cms::enveloped_data::EnvelopedData;
-use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::profiles::AeadProvider;
+use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize};
 use crate::der::asn1::{OctetString, SetOfVec};
@@ -16,7 +17,7 @@ use crate::der::Encode;
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::utils::{aes_256_gcm_algorithm, aes_gcm_encrypt, generate_cek};
+use crate::transport::handshake::utils::{aes_gcm_encrypt, generate_cek};
 
 /// Builder for constructing CMS EnvelopedData messages.
 ///

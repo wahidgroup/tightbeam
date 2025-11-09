@@ -2,13 +2,13 @@
 //!
 //! This module contains server-specific handshake implementations and utilities.
 
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 mod cms;
 
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 pub use cms::CmsHandshakeServer;
 
-#[cfg(all(feature = "handshake_cms", feature = "secp256k1"))]
+#[cfg(all(feature = "transport-cms", feature = "secp256k1"))]
 pub use cms::CmsHandshakeServerSecp256k1;
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]

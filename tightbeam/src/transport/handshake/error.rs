@@ -99,6 +99,13 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Missing server random"))]
 	MissingServerRandom,
 
+	/// CMS salt (transcript hash) below minimum entropy requirement
+	#[cfg_attr(
+		feature = "derive",
+		error("CMS salt too short: {actual} bytes (minimum {minimum} required)")
+	)]
+	InsufficientSaltEntropy { actual: usize, minimum: usize },
+
 	/// Handshake timeout
 	#[cfg_attr(feature = "derive", error("Handshake timeout"))]
 	Timeout,
@@ -214,6 +221,9 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::MissingBaseSessionKey => write!(f, "Missing base session key"),
 			HandshakeError::MissingClientRandomState => write!(f, "Missing client random"),
 			HandshakeError::MissingServerRandom => write!(f, "Missing server random"),
+			HandshakeError::InsufficientSaltEntropy { actual, minimum } => {
+				write!(f, "CMS salt too short: {} bytes (minimum {} required)", actual, minimum)
+			}
 			HandshakeError::Timeout => write!(f, "Handshake timeout"),
 			HandshakeError::InvalidProfileSelection => write!(f, "Server selected profile not in client's offer"),
 			HandshakeError::NegotiationError(e) => write!(f, "Profile negotiation failed: {}", e),

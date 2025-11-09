@@ -127,22 +127,25 @@ pub fn select_profile(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::der::asn1::ObjectIdentifier;
+	use crate::asn1::{
+		AES_128_WRAP_OID, AES_192_WRAP_OID, AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID,
+		SIGNER_ECDSA_WITH_SHA3_512_OID,
+	};
 
 	fn mock_profile(id: u8) -> SecurityProfileDesc {
 		SecurityProfileDesc {
-			digest: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"),
+			digest: HASH_SHA3_256_OID,
 			#[cfg(feature = "aead")]
-			aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")),
+			aead: Some(AES_256_GCM_OID),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
-			signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")),
+			signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
 			// Use different key wrap algorithms to differentiate profiles
 			key_wrap: match id {
-				1 => Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.5")), // AES-128 wrap
-				2 => Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45")), // AES-256 wrap
-				3 => Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.25")), // AES-192 wrap
+				1 => Some(AES_128_WRAP_OID),
+				2 => Some(AES_256_WRAP_OID),
+				3 => Some(AES_192_WRAP_OID),
 				_ => None,
 			},
 		}
@@ -189,5 +192,61 @@ mod tests {
 
 		let result = select_profile(&offer, &supported);
 		assert!(matches!(result, Err(NegotiationError::EmptyOffer)));
+	}
+
+	#[cfg(feature = "aead")]
+	#[test]
+	fn test_select_profile_multiple_aead_ciphers() {
+		use crate::asn1::{
+			AES_128_GCM_OID, AES_128_WRAP_OID, AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA256_OID,
+			SIGNER_ECDSA_WITH_SHA256_OID,
+		};
+
+		// AES-128-GCM profile
+		let aes128_gcm = SecurityProfileDesc {
+			digest: HASH_SHA256_OID,
+			aead: Some(AES_128_GCM_OID),
+			aead_key_size: Some(16),
+			#[cfg(feature = "signature")]
+			signature: Some(SIGNER_ECDSA_WITH_SHA256_OID),
+			key_wrap: Some(AES_128_WRAP_OID),
+		};
+
+		// AES-256-GCM profile
+		let aes256_gcm = SecurityProfileDesc {
+			digest: HASH_SHA256_OID,
+			aead: Some(AES_256_GCM_OID),
+			aead_key_size: Some(32),
+			#[cfg(feature = "signature")]
+			signature: Some(SIGNER_ECDSA_WITH_SHA256_OID),
+			key_wrap: Some(AES_256_WRAP_OID),
+		};
+
+		// Client offers AES-128 first (client preference)
+		let client_offer = SecurityOffer::new(Vec::from([aes128_gcm, aes256_gcm]));
+
+		// Server supports both
+		let server_supported = [aes256_gcm, aes128_gcm];
+
+		// Should select AES-128-GCM (client's first choice)
+		let selected = select_profile(&client_offer, &server_supported).unwrap();
+		assert_eq!(selected.aead, Some(AES_128_GCM_OID));
+		assert_eq!(selected.aead_key_size, Some(16));
+
+		// Client offers AES-256 first
+		let client_offer_256 = SecurityOffer::new(Vec::from([aes256_gcm, aes128_gcm]));
+
+		// Should select AES-256-GCM (client's first choice)
+		let selected_256 = select_profile(&client_offer_256, &server_supported).unwrap();
+		assert_eq!(selected_256.aead, Some(AES_256_GCM_OID));
+		assert_eq!(selected_256.aead_key_size, Some(32));
+
+		// Server only supports AES-256
+		let server_256_only = [aes256_gcm];
+
+		// Client offers AES-128 first, should fallback to AES-256
+		let selected_fallback = select_profile(&client_offer, &server_256_only).unwrap();
+		assert_eq!(selected_fallback.aead, Some(AES_256_GCM_OID));
+		assert_eq!(selected_fallback.aead_key_size, Some(32));
 	}
 }

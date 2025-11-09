@@ -11,7 +11,6 @@ use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::sign::elliptic_curve::{PublicKey, SecretKey};
 use crate::der::asn1::BitString;
 use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
-use crate::transport::handshake::error::HandshakeError;
 
 #[cfg(all(feature = "builder", feature = "aead"))]
 use crate::cms::builder::{Error as CmsBuilderError, RecipientInfoBuilder, RecipientInfoType};
@@ -24,6 +23,10 @@ use crate::cms::enveloped_data::{
 };
 #[cfg(all(feature = "builder", feature = "aead"))]
 use crate::crypto::profiles::CryptoProvider;
+#[cfg(all(feature = "builder", feature = "aead"))]
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+#[cfg(all(feature = "builder", feature = "aead"))]
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic};
 use crate::transport::handshake::kari::kari_wrap;
 
 /// Builder for `KeyAgreeRecipientInfo` using ECDH + HKDF + key wrapping.
@@ -61,7 +64,10 @@ where
 #[cfg(all(feature = "builder", feature = "aead"))]
 impl<P> TightBeamKariBuilder<P>
 where
-	P: crate::crypto::profiles::CryptoProvider,
+	P: CryptoProvider,
+	P::Curve: Curve + CurveArithmetic,
+	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 {
 	/// Create a new KARI builder with default KDF (HKDF-SHA3-256) and key wrapper (AES-KW).
 	///
@@ -201,6 +207,9 @@ impl Default for TightBeamKariBuilder<DefaultCryptoProvider> {
 impl<P> RecipientInfoBuilder for TightBeamKariBuilder<P>
 where
 	P: CryptoProvider,
+	P::Curve: Curve + CurveArithmetic,
+	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 {
 	fn recipient_info_type(&self) -> RecipientInfoType {
 		RecipientInfoType::Kari

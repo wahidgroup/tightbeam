@@ -21,18 +21,15 @@ use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::{TIGHTBEAM_KARI_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::KeyInit;
-use crate::crypto::hash::digest::Digest;
 use crate::crypto::kdf::KdfProvider;
 use crate::crypto::negotiation::select_profile;
+use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::EcdsaSignatureVerifier;
-use crate::crypto::sign::{SignatureEncoding, Verifier};
-use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::der::Decode;
 use crate::spki::EncodePublicKey;
@@ -75,6 +72,10 @@ where
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	P::Signature: 'static,
+	P::Digest: 'static,
+	P::AeadCipher: KeyInit + 'static,
 {
 	/// Create a new CMS handshake server.
 	///
@@ -347,7 +348,7 @@ where
 
 		// Enforce minimum salt length (16 bytes) for secure key derivation
 		if self.transcript_hash.len() < 16 {
-			return Err(HandshakeError::InvalidState);
+			return Err(HandshakeError::InsufficientSaltEntropy { actual: self.transcript_hash.len(), minimum: 16 });
 		}
 
 		// Use transcript hash as salt for session-specific key derivation
@@ -399,6 +400,10 @@ where
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	P::Signature: 'static,
+	P::Digest: 'static,
+	P::AeadCipher: Send + Sync + KeyInit + 'static,
 {
 	type Error = HandshakeError;
 
@@ -446,7 +451,7 @@ where
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
 			// 3. Derive final session key as P::AeadCipher
-			let cipher = self.derive_final_session_key(cek.to_insecure())?;
+			let cipher = cek.with(|key_bytes| self.derive_final_session_key(key_bytes))?;
 
 			// 4. Transition to complete
 			self.state.dispatch(HandshakeState::Complete)?;
@@ -474,7 +479,6 @@ where
 ///
 /// This is the default curve used in TightBeam and is provided as a
 /// convenient alias for the generic `CmsHandshakeServer`.
-#[cfg(feature = "secp256k1")]
 pub type CmsHandshakeServerSecp256k1 = CmsHandshakeServer<DefaultCryptoProvider>;
 
 #[cfg(test)]
@@ -582,11 +586,7 @@ mod tests {
 		fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
 			let server_key = Secp256k1SigningKey::random(&mut OsRng);
 			let transcript_hash = vec![1u8; 32];
-			let mut server = CmsHandshakeServerSecp256k1::new(
-				DefaultCryptoProvider::default(),
-				Arc::new(server_key),
-				transcript_hash,
-			);
+			let mut server = CmsHandshakeServerSecp256k1::new(Arc::new(server_key), transcript_hash, None);
 
 			// Can't build server finished before processing key exchange
 			let result = server.build_server_finished();
@@ -595,6 +595,114 @@ mod tests {
 			// Can't process client finished before sending server finished
 			let result = server.process_client_finished(&[]);
 			assert!(result.is_err());
+
+			Ok(())
+		}
+
+		/// Test CMS end-to-end handshake with profile negotiation and session key derivation
+		#[test]
+		fn test_cms_end_to_end_with_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
+			use crate::crypto::profiles::SecurityProfileDesc;
+
+			// Setup: Create server with profile negotiation support
+			let transcript_hash = vec![1u8; 32];
+			let (mut server, server_public_key) = TestCmsServerBuilder::new()
+				.with_transcript_hash(transcript_hash.clone())
+				.build();
+
+			// Configure server with AES-128-GCM and AES-256-GCM profiles
+			let aes128_profile = SecurityProfileDesc {
+				digest: crate::asn1::HASH_SHA256_OID,
+				aead: Some(crate::asn1::AES_128_GCM_OID),
+				aead_key_size: Some(16),
+				signature: Some(crate::asn1::SIGNER_ECDSA_WITH_SHA256_OID),
+				key_wrap: Some(crate::asn1::AES_128_WRAP_OID),
+			};
+
+			let aes256_profile = SecurityProfileDesc {
+				digest: crate::asn1::HASH_SHA256_OID,
+				aead: Some(crate::asn1::AES_256_GCM_OID),
+				aead_key_size: Some(32),
+				signature: Some(crate::asn1::SIGNER_ECDSA_WITH_SHA256_OID),
+				key_wrap: Some(crate::asn1::AES_256_WRAP_OID),
+			};
+
+			server = server.with_supported_profiles(vec![aes128_profile, aes256_profile]);
+
+			// Set client certificate for mutual auth
+			let client_test_cert = create_test_certificate();
+			server.set_client_certificate(client_test_cert.certificate.clone())?;
+
+			// Step 1: Client sends KeyExchange with session key (without explicit offer)
+			let session_key = vec![2u8; 32];
+
+			let sender_ephemeral = SecretKey::<k256::Secp256k1>::random(&mut OsRng);
+			let sender_public = sender_ephemeral.public_key();
+			let sender_pub_spki = sender_public.to_public_key_der().unwrap();
+			let sender_pub_spki = SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes()).unwrap();
+
+			let ukm_bytes = generate_nonce::<64>(None).unwrap();
+			let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec()).unwrap();
+
+			let rid = KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+				issuer: Name::default(),
+				serial_number: SerialNumber::new(&[0x01]).unwrap(),
+			});
+
+			let oid = crate::asn1::AES_128_WRAP_OID;
+			let key_enc_alg = AlgorithmIdentifierOwned { oid, parameters: None };
+
+			let kari_builder = TightBeamKariBuilder::default()
+				.with_sender_priv(sender_ephemeral)
+				.with_sender_pub_spki(sender_pub_spki)
+				.with_recipient_pub(server_public_key)
+				.with_recipient_rid(rid)
+				.with_ukm(ukm)
+				.with_key_enc_alg(key_enc_alg);
+			let enveloped_builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
+			let key_exchange = enveloped_builder.build_der(&session_key, None)?;
+
+			// Step 2: Server processes KeyExchange
+			server.process_key_exchange(&key_exchange)?;
+			assert_eq!(server.state(), HandshakeState::KeyExchangeReceived);
+			assert!(server.session_key().is_some());
+
+			// Verify a profile was selected (dealer's choice since no client offer)
+			assert!(server.selected_profile.is_some());
+			let selected = server.selected_profile.unwrap();
+			// Verify it's one of our configured profiles
+			assert!(
+				selected.aead == Some(crate::asn1::AES_128_GCM_OID)
+					|| selected.aead == Some(crate::asn1::AES_256_GCM_OID)
+			);
+
+			// Step 3: Server builds ServerFinished
+			let _server_finished = server.build_server_finished()?;
+			assert_eq!(server.state(), HandshakeState::ServerFinishedSent);
+
+			// Step 4: Client sends ClientFinished
+			let oid = crate::asn1::HASH_SHA3_256_OID;
+			let digest_alg = AlgorithmIdentifierOwned { oid, parameters: None };
+			let oid = crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID;
+			let signature_alg = AlgorithmIdentifierOwned { oid, parameters: None };
+			let mut client_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(
+				client_test_cert.signing_key.clone(),
+				digest_alg,
+				signature_alg,
+			)?;
+			let client_finished = client_finished_builder.build_der(&transcript_hash)?;
+
+			// Step 5: Server processes ClientFinished
+			server.process_client_finished(&client_finished)?;
+			assert_eq!(server.state(), HandshakeState::ClientFinishedReceived);
+
+			// Step 6: Complete handshake
+			server.complete()?;
+			assert_eq!(server.state(), HandshakeState::Complete);
+			assert!(server.is_complete());
+
+			// Verify session key is available for key derivation
+			assert!(server.session_key().is_some());
 
 			Ok(())
 		}

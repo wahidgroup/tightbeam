@@ -555,7 +555,6 @@ mod tests {
 	use crate::crypto::ecies::encrypt;
 	use crate::crypto::negotiation::SecurityOffer;
 	use crate::crypto::profiles::SecurityProfileDesc;
-	use crate::der::asn1::ObjectIdentifier;
 	use crate::random::OsRng;
 	use crate::transport::handshake::tests::*;
 
@@ -695,20 +694,25 @@ mod tests {
 	/// Test profile negotiation modes
 	#[test]
 	fn test_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::asn1::{
+			AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, HASH_SHA3_384_OID, HASH_SHA3_512_OID,
+			SIGNER_ECDSA_WITH_SHA3_512_OID,
+		};
+
 		let mk_profile = |id: u8| SecurityProfileDesc {
 			digest: match id {
-				1 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
-				2 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.9"), // SHA3-384
-				_ => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.10"), // SHA3-512
+				1 => HASH_SHA3_256_OID,
+				2 => HASH_SHA3_384_OID,
+				_ => HASH_SHA3_512_OID,
 			},
 			#[cfg(feature = "aead")]
-			aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")),
+			aead: Some(AES_256_GCM_OID),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
-			signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")),
+			signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
 			key_wrap: if id % 2 == 0 {
-				Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"))
+				Some(AES_256_WRAP_OID)
 			} else {
 				None
 			},

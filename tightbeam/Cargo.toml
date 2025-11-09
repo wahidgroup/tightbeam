@@ -68,6 +68,7 @@ full = [
 	"router",
 	"transport",
 	"transport-policy",
+	"transport-cms",
 	"tcp",
 	"aead",
 	"x509",
@@ -143,7 +144,7 @@ sha3 = ["crypto", "dep:sha3"]
 secp256k1 = ["crypto", "dep:k256"]
 
 ## Handshake protocol features
-handshake_cms = [
+transport-cms = [
 	"builder",
 	"aead",
 	"signature",

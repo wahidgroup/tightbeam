@@ -30,13 +30,15 @@ use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate};
 
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 use crate::crypto::sign::elliptic_curve::PublicKey;
 #[cfg(feature = "time")]
 use crate::der::asn1::GeneralizedTime;
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::client::CmsHandshakeClientSecp256k1;
 #[cfg(feature = "x509")]
 use crate::transport::handshake::client::EciesHandshakeClientSecp256k1;
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 use crate::transport::handshake::server::CmsHandshakeServerSecp256k1;
 #[cfg(feature = "time")]
 use crate::x509::time::Time;
@@ -359,13 +361,13 @@ impl Default for TestEciesClientBuilder {
 }
 
 /// Builder for creating test CMS handshake servers with sensible defaults.
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 pub struct TestCmsServerBuilder {
 	key: Option<Secp256k1SigningKey>,
 	transcript_hash: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 impl TestCmsServerBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
@@ -395,15 +397,14 @@ impl TestCmsServerBuilder {
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let verifying_key = *test_key.verifying_key();
 		let transcript_hash = self.transcript_hash.unwrap_or_else(|| vec![1u8; 32]);
-		let provider = DefaultCryptoProvider::default();
 
 		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
-		let server = CmsHandshakeServerSecp256k1::new(provider, Arc::new(test_key), transcript_hash);
+		let server = CmsHandshakeServerSecp256k1::new(Arc::new(test_key), transcript_hash, None);
 		(server, public_key)
 	}
 }
 
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 impl Default for TestCmsServerBuilder {
 	fn default() -> Self {
 		Self::new()
@@ -411,14 +412,14 @@ impl Default for TestCmsServerBuilder {
 }
 
 /// Builder for creating test CMS handshake clients with sensible defaults.
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 pub struct TestCmsClientBuilder {
 	client_key: Option<Secp256k1SigningKey>,
 	server_cert: Option<Certificate>,
 	transcript_hash: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 impl TestCmsClientBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
@@ -466,7 +467,7 @@ impl TestCmsClientBuilder {
 	}
 }
 
-#[cfg(feature = "handshake_cms")]
+#[cfg(feature = "transport-cms")]
 impl Default for TestCmsClientBuilder {
 	fn default() -> Self {
 		Self::new()

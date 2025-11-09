@@ -11,7 +11,6 @@ use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
 use crate::constants::TIGHTBEAM_SESSION_KDF_INFO;
 use crate::crypto::aead::KeyInit;
-use crate::crypto::hash::Digest;
 use crate::crypto::kdf::KdfProvider;
 use crate::crypto::negotiation::SecurityOffer;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
@@ -20,12 +19,9 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
 use crate::crypto::sign::EcdsaSignatureVerifier;
 use crate::crypto::sign::SignatureAlgorithmIdentifier;
-use crate::crypto::sign::{Keypair, SignatureEncoding, Signer, Verifier};
-use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
-use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::der::Decode;
 use crate::random::{generate_nonce, OsRng};
@@ -72,6 +68,12 @@ where
 	<P::Curve as elliptic_curve::Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
+	P::SigningKey: Clone + signature::Keypair + 'static,
+	<P::SigningKey as signature::Keypair>::VerifyingKey: EncodePublicKey,
+	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	P::Signature: 'static,
+	P::Digest: 'static,
+	P::AeadCipher: KeyInit,
 {
 	/// Create a new CMS handshake client.
 	///
@@ -191,7 +193,7 @@ where
 	/// Compute the signer identifier from the server's verifying key.
 	fn compute_signer_identifier(&self, verifying_key: &P::VerifyingKey) -> Result<SignerIdentifier, HandshakeError> {
 		Ok(crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(
-			server_verifying_key,
+			verifying_key,
 		)?)
 	}
 
@@ -337,7 +339,7 @@ where
 
 		// Enforce minimum salt length (16 bytes) for secure key derivation
 		if self.transcript_hash.len() < 16 {
-			return Err(HandshakeError::InvalidState);
+			return Err(HandshakeError::InsufficientSaltEntropy { actual: self.transcript_hash.len(), minimum: 16 });
 		}
 
 		// Use transcript hash as salt for session-specific key derivation
@@ -390,6 +392,12 @@ where
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
+	P::SigningKey: Send + Clone + signature::Keypair + 'static,
+	<P::SigningKey as signature::Keypair>::VerifyingKey: EncodePublicKey,
+	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	P::Signature: 'static,
+	P::Digest: 'static,
+	P::AeadCipher: Send + Sync + KeyInit,
 {
 	type Error = HandshakeError;
 
@@ -430,7 +438,7 @@ where
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
 			// 3. Derive final session key as P::AeadCipher
-			let cipher = self.derive_final_session_key(cek.to_insecure())?;
+			let cipher = cek.with(|key_bytes| self.derive_final_session_key(key_bytes))?;
 
 			// 4. Transition to complete
 			self.state.dispatch(HandshakeState::Complete)?;

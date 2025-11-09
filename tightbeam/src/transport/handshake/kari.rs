@@ -17,7 +17,7 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize, PublicKey, SecretKey};
+use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
 
 #[cfg(feature = "zeroize")]
@@ -48,6 +48,7 @@ where
 	if ukm.is_empty() {
 		return Err(HandshakeError::MissingUkm);
 	}
+
 	let kdf = provider.as_key_deriver::<HandshakeError, 32>();
 	shared_secret
 		.with(|ss| kdf(ss.as_ref(), ukm, kdf_info))
@@ -60,10 +61,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 	if a.len() != b.len() {
 		return false;
 	}
+
 	let mut diff: u8 = 0;
 	for (x, y) in a.iter().zip(b.iter()) {
 		diff |= x ^ y;
 	}
+
 	diff == 0
 }
 
@@ -121,12 +124,16 @@ where
 	let wrapper = provider.as_key_wrapper_32::<HandshakeError>();
 	let rewrapped = wrapper(&cek, &kek)?;
 	let valid = ct_eq(rewrapped.as_slice(), wrapped);
+
 	// Zeroize KEK
 	#[cfg(feature = "zeroize")]
 	kek.zeroize();
 	if !valid {
-		return Err(HandshakeError::AesKeyWrap(crate::crypto::aead::aes_kw::Error));
+		return Err(HandshakeError::AesKeyWrap(
+			crate::crypto::aead::aes_kw::Error::IntegrityCheckFailed,
+		));
 	}
+
 	Ok(cek)
 }
 

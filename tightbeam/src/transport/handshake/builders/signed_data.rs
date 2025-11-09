@@ -9,12 +9,12 @@ use crate::crypto::hash::Digest;
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::Signer;
 use crate::crypto::sign::{Keypair, SignatureEncoding};
+use crate::crypto::x509::utils::compute_signer_identifier;
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 use crate::transport::handshake::error::HandshakeError;
-use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
 /// Builder for CMS `SignedData` structures in TightBeam handshake.
 ///
@@ -66,7 +66,7 @@ where
 	{
 		// Generate SKID from public key
 		let verifying_key = signer.verifying_key();
-		let signer_id = crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(verifying_key)?;
+		let signer_id = compute_signer_identifier::<P::Digest, _>(&verifying_key)?;
 
 		Ok(Self {
 			signer: Box::new(signer),
