@@ -9,7 +9,10 @@ use core::pin::Pin;
 use crate::asn1::AES_256_WRAP_OID;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
+use crate::constants::TIGHTBEAM_SESSION_KDF_INFO;
+use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
+use crate::crypto::kdf::KdfProvider;
 use crate::crypto::negotiation::SecurityOffer;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
@@ -316,6 +319,37 @@ where
 		Ok(signed_data_der)
 	}
 
+	/// Derive the final session key from the CEK using HKDF.
+	///
+	/// Uses the negotiated profile's key size to derive the correct length key
+	/// for the negotiated AEAD cipher. The transcript hash provides session-specific
+	/// context for the derivation.
+	///
+	/// # Parameters
+	/// - `cek`: Content Encryption Key (the session_key used in EnvelopedData)
+	///
+	/// # Returns
+	/// The derived AEAD cipher ready for use
+	fn derive_final_session_key(&self, cek: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
+		// Get key size from negotiated profile
+		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
+		let key_size = profile.aead_key_size.ok_or(HandshakeError::InvalidState)? as usize;
+
+		// Enforce minimum salt length (16 bytes) for secure key derivation
+		if self.transcript_hash.len() < 16 {
+			return Err(HandshakeError::InvalidState);
+		}
+
+		// Use transcript hash as salt for session-specific key derivation
+		let salt = Some(self.transcript_hash.as_slice());
+
+		// Derive key with dynamic size based on negotiated cipher
+		// Use provider's KDF with its concrete digest type
+		let final_key_bytes = P::Kdf::derive_dynamic_key(cek, TIGHTBEAM_SESSION_KDF_INFO, salt, key_size)?;
+
+		Ok(P::AeadCipher::new_from_slice(&final_key_bytes[..])?)
+	}
+
 	/// Complete the handshake.
 	pub fn complete(&mut self) -> Result<(), HandshakeError> {
 		// 1. Validation
@@ -385,10 +419,24 @@ where
 		&'a mut self,
 	) -> Pin<Box<dyn Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>> {
 		Box::pin(async move {
-			self.complete()?;
-			// TODO: CMS needs to implement proper RuntimeAead construction with profile negotiation
-			// For now, return error as CMS doesn't support profile negotiation yet
-			Err(HandshakeError::InvalidState)
+			// 1. Validate state
+			if self.state.state() != HandshakeState::ClientFinishedSent {
+				return Err(HandshakeError::InvalidState);
+			}
+
+			// 2. Get CEK (session_key) and profile
+			let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
+			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
+			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
+
+			// 3. Derive final session key as P::AeadCipher
+			let cipher = self.derive_final_session_key(cek.to_insecure())?;
+
+			// 4. Transition to complete
+			self.state.dispatch(HandshakeState::Complete)?;
+
+			// 5. Wrap cipher in RuntimeAead with negotiated OID
+			Ok(crate::crypto::aead::RuntimeAead::new(cipher, aead_oid))
 		})
 	}
 
@@ -397,8 +445,7 @@ where
 	}
 
 	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
-		// CMS doesn't support profile negotiation yet
-		None
+		self.selected_profile
 	}
 }
 

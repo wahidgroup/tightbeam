@@ -79,6 +79,12 @@ pub trait AeadKeySize {
 	const KEY_SIZE: usize;
 }
 
+/// AES-128-GCM key size (16 bytes)
+#[cfg(feature = "aes-gcm")]
+impl AeadKeySize for crate::crypto::aead::Aes128GcmOid {
+	const KEY_SIZE: usize = 16;
+}
+
 /// AES-256-GCM key size (32 bytes)
 #[cfg(feature = "aes-gcm")]
 impl AeadKeySize for crate::crypto::aead::Aes256GcmOid {
@@ -551,5 +557,48 @@ mod tests {
 			}
 			_ => panic!("wrong error"),
 		}
+	}
+
+	// =======================================================================
+	// AEAD Key Size Tests
+	// =======================================================================
+
+	#[cfg(feature = "aes-gcm")]
+	#[test]
+	fn test_aes128_gcm_key_size() {
+		use crate::crypto::aead::Aes128GcmOid;
+		assert_eq!(<Aes128GcmOid as AeadKeySize>::KEY_SIZE, 16);
+	}
+
+	#[cfg(feature = "aes-gcm")]
+	#[test]
+	fn test_aes256_gcm_key_size() {
+		use crate::crypto::aead::Aes256GcmOid;
+		assert_eq!(<Aes256GcmOid as AeadKeySize>::KEY_SIZE, 32);
+	}
+
+	#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+	#[test]
+	fn test_profile_descriptor_aes128() {
+		// Define a test profile using AES-128-GCM
+		#[derive(Debug, Default, Clone)]
+		struct Aes128Profile;
+
+		impl SecurityProfile for Aes128Profile {
+			type DigestOid = crate::crypto::hash::Sha3_256;
+			type AeadOid = crate::crypto::aead::Aes128GcmOid;
+			type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
+
+			fn key_wrap_oid(&self) -> Option<ObjectIdentifier> {
+				Some(crate::asn1::AES_256_WRAP_OID)
+			}
+		}
+
+		let profile = Aes128Profile;
+		let desc = SecurityProfileDesc::from(&profile);
+
+		// Verify the descriptor captures the 16-byte key size
+		assert_eq!(desc.aead_key_size, Some(16));
+		assert_eq!(desc.aead, Some(crate::crypto::aead::Aes128GcmOid::OID));
 	}
 }

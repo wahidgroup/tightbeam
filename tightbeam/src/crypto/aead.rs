@@ -1,7 +1,7 @@
 // Re-exports
 pub use aead::*;
 #[cfg(feature = "aes-gcm")]
-pub use aes_gcm::{Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmNonce};
+pub use aes_gcm::{Aes128Gcm, Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmNonce};
 #[cfg(feature = "transport")]
 pub use aes_kw;
 
@@ -10,7 +10,16 @@ use crate::der::oid::{AssociatedOid, ObjectIdentifier};
 
 use crate::crypto::common::typenum::Unsigned;
 
-/// Create a wrapper type for AES-256-GCM with the OID
+/// Wrapper type for AES-128-GCM with the OID
+#[cfg(feature = "aes-gcm")]
+pub struct Aes128GcmOid;
+
+#[cfg(feature = "aes-gcm")]
+impl AssociatedOid for Aes128GcmOid {
+	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.6");
+}
+
+/// Wrapper type for AES-256-GCM with the OID
 /// Note: The `aes-gcm` crate does not implement `AssociatedOid` directly.
 #[cfg(feature = "aes-gcm")]
 pub struct Aes256GcmOid;
