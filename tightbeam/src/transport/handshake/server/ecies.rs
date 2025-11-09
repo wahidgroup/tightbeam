@@ -18,13 +18,11 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::asn1::OctetString;
-use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_SESSION_KDF_INFO};
+use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
-use crate::crypto::kdf::KdfProvider;
-use crate::crypto::negotiation::select_profile;
 use crate::crypto::negotiation::SecurityAccept;
-use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::ToInsecure;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
@@ -33,10 +31,12 @@ use crate::crypto::sign::Verifier;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::state::{HandshakeState, ServerStateTransition, StateTransition};
+use crate::transport::handshake::state::HandshakeInvariant;
+use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::{
 	ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeKey, ServerHandshakeProtocol,
 };
+use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::x509::Certificate;
 
 /// Server-side ECIES handshake orchestrator.
@@ -51,7 +51,7 @@ pub struct EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
-	state: ServerStateTransition,
+	state: ServerStateMachine,
 	server_key: Arc<dyn ServerHandshakeKey>,
 	server_cert: Certificate,
 	client_random: Option<[u8; 32]>,
@@ -64,6 +64,7 @@ where
 	client_validators: Option<Arc<Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>>,
 	validated_client_cert: Option<Certificate>,
 	_phantom: PhantomData<P>,
+	invariants: HandshakeInvariant,
 }
 
 impl<P> EciesHandshakeServer<P>
@@ -85,7 +86,7 @@ where
 		client_validators: Option<Arc<Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>>,
 	) -> Self {
 		Self {
-			state: ServerStateTransition::new(),
+			state: ServerStateMachine::new(),
 			server_key,
 			server_cert,
 			client_random: None,
@@ -98,6 +99,7 @@ where
 			client_validators,
 			validated_client_cert: None,
 			_phantom: PhantomData,
+			invariants: HandshakeInvariant::default(),
 		}
 	}
 	/// Set the server's supported security profiles for negotiation.
@@ -116,31 +118,15 @@ where
 	/// DER-encoded ServerHandshake
 	pub fn process_client_hello(&mut self, client_hello_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validate current state is Init
-		self.validate_expected_state(HandshakeState::Init)?;
+		self.validate_expected_state(ServerHandshakeState::Init)?;
 
 		// 2. Decode ClientHello message
 		let client_hello = self.decode_client_hello(client_hello_der)?;
 
-		// 3. Profile negotiation (two modes: negotiation or dealer's choice)
-		// Server must have supported_profiles configured
-		if self.supported_profiles.is_empty() {
-			return Err(HandshakeError::InvalidState);
-		}
-
-		let security_accept = match &client_hello.security_offer {
-			Some(offer) => {
-				// Mode 1: Negotiation - client offered, server selects mutual
-				let selected = select_profile(offer, &self.supported_profiles)?;
-				self.selected_profile = Some(selected);
-				SecurityAccept::new(selected)
-			}
-			None => {
-				// Mode 2: Dealer's choice - client didn't offer, server picks default
-				let selected = self.supported_profiles[0];
-				self.selected_profile = Some(selected);
-				SecurityAccept::new(selected)
-			}
-		};
+		// 3. Profile negotiation using trait method
+		let selected = self.negotiate_profile(client_hello.security_offer.as_ref())?;
+		self.selected_profile = Some(selected);
+		let security_accept = SecurityAccept::new(selected);
 
 		// 4. Extract and store client random
 		let client_random = self.octet_string_to_array(&client_hello.client_random)?;
@@ -156,8 +142,12 @@ where
 			.subject_public_key_info
 			.subject_public_key
 			.raw_bytes();
+
 		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes);
 		self.transcript_hash = Some(transcript_digest);
+		if let Err(e) = self.invariants.lock_transcript() {
+			return Err(e);
+		}
 
 		// 7. Sign transcript hash
 		let signature_bytes = self.sign_transcript_hash(&transcript_digest)?;
@@ -167,8 +157,8 @@ where
 			self.build_server_handshake(server_random, signature_bytes, Some(security_accept))?;
 
 		// 9. Transition state through ServerHelloReceived to ServerHelloSent
-		self.state.dispatch(HandshakeState::ServerHelloReceived)?;
-		self.state.dispatch(HandshakeState::ServerHelloSent)?;
+		self.state.transition(ServerHandshakeState::ClientHelloReceived)?;
+		self.state.transition(ServerHandshakeState::ServerHelloSent)?;
 
 		Ok(server_handshake_der)
 	}
@@ -189,7 +179,7 @@ where
 		P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
 		// 1. Validate current state is ServerHelloSent
-		self.validate_expected_state(HandshakeState::ServerHelloSent)?;
+		self.validate_expected_state(ServerHandshakeState::ServerHelloSent)?;
 
 		// 2. Decode ClientKeyExchange message
 		let client_kex = self.decode_client_key_exchange(client_kex_der)?;
@@ -214,7 +204,7 @@ where
 		self.base_session_key = Some(base_session_key);
 
 		// 9. Transition state to KeyExchangeReceived
-		self.state.dispatch(HandshakeState::KeyExchangeReceived)?;
+		self.state.transition(ServerHandshakeState::KeyExchangeReceived)?;
 
 		Ok(())
 	}
@@ -225,18 +215,24 @@ where
 	/// AES-256-GCM session key
 	pub fn complete(&mut self) -> Result<P::AeadCipher, HandshakeError> {
 		// 1. Validate current state is KeyExchangeReceived
-		self.validate_expected_state(HandshakeState::KeyExchangeReceived)?;
+		self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
 
 		// 2. Get required values for key derivation
 		let base_session_key = self.base_session_key.as_ref().ok_or(HandshakeError::MissingBaseSessionKey)?;
 		let client_random = self.client_random.as_ref().ok_or(HandshakeError::MissingClientRandomState)?;
 		let server_random = self.server_random.as_ref().ok_or(HandshakeError::MissingServerRandom)?;
 
-		// 3. Derive final session key
-		let session_key = self.derive_final_session_key(base_session_key, client_random, server_random)?;
+		// 3. Derive final session key using trait finalization (client_random || server_random)
+		let mut salt = [0u8; 64];
+		salt[..32].copy_from_slice(client_random);
+		salt[32..].copy_from_slice(server_random);
+		let session_key = self.derive_session_aead(base_session_key, &salt)?;
+		if let Err(e) = self.invariants.derive_aead_once() {
+			return Err(e);
+		}
 
 		// 4. Transition to complete state
-		self.state.dispatch(HandshakeState::Complete)?;
+		self.state.transition(ServerHandshakeState::Completed)?;
 
 		// 5. Clear sensitive data
 		self.clear_sensitive_data();
@@ -245,13 +241,13 @@ where
 	}
 
 	/// Get the current handshake state.
-	pub fn state(&self) -> HandshakeState {
+	pub fn state(&self) -> ServerHandshakeState {
 		self.state.state()
 	}
 
 	/// Check if handshake is complete.
 	pub fn is_complete(&self) -> bool {
-		self.state.state().is_complete()
+		self.state.state().is_completed()
 	}
 
 	/// Get the transcript hash (if available).
@@ -287,28 +283,7 @@ where
 		digest
 	}
 
-	fn derive_final_session_key(
-		&self,
-		base_key: &[u8; 32],
-		client_random: &[u8; 32],
-		server_random: &[u8; 32],
-	) -> Result<P::AeadCipher, HandshakeError> {
-		let mut salt = [0u8; 64];
-		salt[..32].copy_from_slice(client_random);
-		salt[32..].copy_from_slice(server_random);
-
-		// Get key size from negotiated profile
-		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-		let key_size = profile.aead_key_size.ok_or(HandshakeError::InvalidState)? as usize;
-
-		// Derive key with dynamic size based on negotiated cipher
-		// Use provider's KDF with its concrete digest type
-		let final_key_bytes = P::Kdf::derive_dynamic_key(base_key, TIGHTBEAM_SESSION_KDF_INFO, Some(&salt), key_size)?;
-
-		Ok(P::AeadCipher::new_from_slice(&final_key_bytes[..])?)
-	}
-
-	fn validate_expected_state(&self, expected: HandshakeState) -> Result<(), HandshakeError> {
+	fn validate_expected_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
 		if self.state.state() != expected {
 			Err(HandshakeError::InvalidState)
 		} else {
@@ -399,7 +374,7 @@ where
 				.as_ref()
 				.ok_or(HandshakeError::MissingClientCertificate)?;
 
-			// Check for identity immutability - reject if cert changes on re-handshake
+			// Check for identity immutability
 			if let Some(existing_cert) = &self.validated_client_cert {
 				if existing_cert != client_cert {
 					return Err(HandshakeError::PeerIdentityMismatch);
@@ -462,6 +437,30 @@ where
 }
 
 // ============================================================================
+// Common Handshake Trait Implementations
+// ============================================================================
+
+impl<P> HandshakeNegotiation for EciesHandshakeServer<P>
+where
+	P: CryptoProvider,
+{
+	fn supported_profiles(&self) -> &[SecurityProfileDesc] {
+		&self.supported_profiles
+	}
+}
+
+impl<P> HandshakeFinalization<P> for EciesHandshakeServer<P>
+where
+	P: CryptoProvider,
+{
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+		self.selected_profile
+	}
+}
+
+impl<P> HandshakeAlertHandler for EciesHandshakeServer<P> where P: CryptoProvider {}
+
+// ============================================================================
 // ServerHandshakeProtocol Implementation
 // ============================================================================
 
@@ -487,12 +486,12 @@ where
 		Box::pin(async move {
 			// Determine which message type this is based on state
 			match self.state() {
-				HandshakeState::Init => {
+				ServerHandshakeState::Init => {
 					// This is ClientHello - respond with ServerHandshake
 					let server_handshake = self.process_client_hello(msg)?;
 					Ok(Some(server_handshake))
 				}
-				HandshakeState::ServerHelloSent => {
+				ServerHandshakeState::ServerHelloSent => {
 					// This is ClientKeyExchange - no response needed
 					self.process_client_key_exchange(msg)?;
 					Ok(None)
@@ -510,7 +509,7 @@ where
 	> {
 		Box::pin(async move {
 			// 1. Validate current state is KeyExchangeReceived
-			self.validate_expected_state(HandshakeState::KeyExchangeReceived)?;
+			self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
 
 			// 2. Get required values for key derivation
 			let base_session_key = self.base_session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
@@ -521,11 +520,14 @@ where
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
-			// 4. Derive final session key as P::AeadCipher (compile-time type known)
-			let cipher = self.derive_final_session_key(base_session_key, client_random, server_random)?;
+			// 4. Derive final session key as P::AeadCipher (client_random || server_random)
+			let mut salt = [0u8; 64];
+			salt[..32].copy_from_slice(client_random);
+			salt[32..].copy_from_slice(server_random);
+			let cipher = self.derive_session_aead(base_session_key, &salt)?;
 
 			// 5. Transition to complete state
-			self.state.dispatch(HandshakeState::Complete)?;
+			self.state.transition(ServerHandshakeState::Completed)?;
 
 			// 6. Clear sensitive data
 			self.clear_sensitive_data();
@@ -552,7 +554,7 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::negotiation::SecurityOffer;
+	use crate::crypto::negotiation::{select_profile, SecurityOffer};
 	use crate::crypto::profiles::SecurityProfileDesc;
 	use crate::random::OsRng;
 	use crate::transport::handshake::tests::*;
@@ -575,14 +577,14 @@ mod tests {
 	#[test]
 	fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
 		let mut server = TestEciesServerBuilder::new().build();
-		assert_eq!(server.state(), HandshakeState::Init);
+		assert_eq!(server.state(), ServerHandshakeState::Init);
 
 		// Process ClientHello
 		let client_random = crate::random::generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
 		let server_handshake_der = server.process_client_hello(&client_hello_der)?;
 
-		assert_eq!(server.state(), HandshakeState::ServerHelloSent);
+		assert_eq!(server.state(), ServerHandshakeState::ServerHelloSent);
 		assert!(server.client_random.is_some());
 		assert!(server.server_random.is_some());
 		assert!(server.transcript_hash.is_some());
@@ -593,13 +595,13 @@ mod tests {
 		// Process ClientKeyExchange
 		let client_kex_der = build_test_client_key_exchange(&server)?;
 		server.process_client_key_exchange(&client_kex_der)?;
-		assert_eq!(server.state(), HandshakeState::KeyExchangeReceived);
+		assert_eq!(server.state(), ServerHandshakeState::KeyExchangeReceived);
 		assert!(server.base_session_key.is_some());
 
 		// Complete handshake
 		let _session_key = server.complete()?;
 		assert!(server.is_complete());
-		assert_eq!(server.state(), HandshakeState::Complete);
+		assert_eq!(server.state(), ServerHandshakeState::Completed);
 
 		Ok(())
 	}

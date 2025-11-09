@@ -18,6 +18,12 @@ pub use crate::crypto::profiles::DOMAIN_SIGNED_TRANSCRIPT as TIGHTBEAM_SIGNED_TR
 /// AAD (Additional Authenticated Data) domain tag prefix
 pub const TIGHTBEAM_AAD_DOMAIN_TAG: &[u8] = b"tb/aead/v1";
 
+/// Minimum salt entropy in bytes for secure key derivation (HKDF)
+///
+/// Used by both CMS and ECIES protocols to ensure sufficient randomness
+/// in the salt parameter when deriving session keys via HKDF.
+pub const MIN_SALT_ENTROPY_BYTES: usize = 16;
+
 // ============================================================================
 // Bitcoin Constants
 // ============================================================================

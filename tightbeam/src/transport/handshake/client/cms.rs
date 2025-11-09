@@ -9,9 +9,7 @@ use core::pin::Pin;
 use crate::asn1::AES_256_WRAP_OID;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
-use crate::constants::TIGHTBEAM_SESSION_KDF_INFO;
 use crate::crypto::aead::KeyInit;
-use crate::crypto::kdf::KdfProvider;
 use crate::crypto::negotiation::SecurityOffer;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
@@ -31,7 +29,8 @@ use crate::transport::handshake::builders::{
 };
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
-use crate::transport::handshake::state::{ClientStateTransition, HandshakeState, StateTransition};
+use crate::transport::handshake::state::HandshakeInvariant;
+use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol};
 
 /// Client-side CMS handshake orchestrator.
@@ -49,7 +48,7 @@ pub struct CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
 {
-	state: ClientStateTransition,
+	state: ClientStateMachine,
 	client_key: P::SigningKey,
 	client_certificate: Option<Certificate>,
 	server_cert: Certificate,
@@ -59,6 +58,7 @@ where
 	selected_profile: Option<SecurityProfileDesc>,
 	provider: P,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
+	invariants: HandshakeInvariant,
 }
 
 impl<P> CmsHandshakeClient<P>
@@ -84,7 +84,7 @@ where
 	/// - `transcript_hash`: The handshake transcript hash (from previous handshake messages)
 	pub fn new(provider: P, client_key: P::SigningKey, server_cert: Certificate, transcript_hash: Vec<u8>) -> Self {
 		Self {
-			state: ClientStateTransition::new(),
+			state: ClientStateMachine::new(),
 			client_key,
 			client_certificate: None,
 			server_cert,
@@ -94,6 +94,7 @@ where
 			selected_profile: None,
 			provider,
 			certificate_validator: None,
+			invariants: HandshakeInvariant::default(),
 		}
 	}
 
@@ -127,7 +128,7 @@ where
 	}
 
 	/// Validate that the current state matches the expected state.
-	fn validate_expected_state(&self, expected: HandshakeState) -> Result<(), HandshakeError> {
+	fn validate_expected_state(&self, expected: ClientHandshakeState) -> Result<(), HandshakeError> {
 		if self.state.state() != expected {
 			Err(HandshakeError::InvalidState)
 		} else {
@@ -137,7 +138,7 @@ where
 
 	/// Validate state and server certificate for key exchange.
 	fn validate_state_and_certificate(&self) -> Result<(), HandshakeError> {
-		self.validate_expected_state(HandshakeState::Init)?;
+		self.validate_expected_state(ClientHandshakeState::Init)?;
 
 		// Use provided validator if available, otherwise default to expiry check
 		if let Some(validator) = &self.certificate_validator {
@@ -229,7 +230,12 @@ where
 	/// DER-encoded EnvelopedData
 	pub fn build_key_exchange(&mut self, session_key: Vec<u8>) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validation
-		self.validate_state_and_certificate()?;
+		// Accept both Init (fresh) or HelloSent (if future hello phase added)
+		if self.state.state() == ClientHandshakeState::Init {
+			self.validate_state_and_certificate()?;
+		} else if self.state.state() != ClientHandshakeState::HelloSent {
+			return Err(HandshakeError::InvalidState);
+		}
 
 		// 2. Extract cryptographic material
 		let server_public_key = self.extract_server_public_key()?;
@@ -269,7 +275,8 @@ where
 
 		// 10. Store session key and transition state
 		self.session_key = Some(Secret::from(session_key));
-		self.state.dispatch(HandshakeState::KeyExchangeSent)?;
+		// Transition directly from Init -> KeyExchangeSent (CMS path) or HelloSent -> KeyExchangeSent
+		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
 		Ok(enveloped_data_der)
 	}
@@ -283,7 +290,7 @@ where
 	/// Verified transcript hash
 	pub fn process_server_finished(&mut self, signed_data_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validation
-		self.validate_expected_state(HandshakeState::KeyExchangeSent)?;
+		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
 		// 2. Extract cryptographic material
 		let server_verifying_key = self.extract_server_verifying_key(&self.server_cert)?;
@@ -293,8 +300,9 @@ where
 		let verified_content =
 			self.verify_signature(signed_data_der, server_verifying_key, expected_signer_identifier)?;
 
-		// 4. Transition state
-		self.state.dispatch(HandshakeState::ServerFinishedReceived)?;
+		// 4. Transition state & lock transcript (transcript hash verified)
+		self.state.transition(ClientHandshakeState::ServerFinishedReceived)?;
+		self.invariants.lock_transcript()?;
 
 		Ok(verified_content)
 	}
@@ -305,7 +313,7 @@ where
 	/// DER-encoded SignedData
 	pub fn build_client_finished(&mut self) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validation
-		self.validate_expected_state(HandshakeState::ServerFinishedReceived)?;
+		self.validate_expected_state(ClientHandshakeState::ServerFinishedReceived)?;
 
 		// 2. Algorithm identifiers
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
@@ -315,62 +323,32 @@ where
 		let mut builder = TightBeamSignedDataBuilder::<P>::new(self.client_key.clone(), digest_alg, signature_alg)?;
 		let signed_data_der = builder.build_der(&self.transcript_hash)?;
 
-		// 4. Transition state
-		self.state.dispatch(HandshakeState::ClientFinishedSent)?;
+		// 4. Transition state & mark finished sent invariant
+		self.state.transition(ClientHandshakeState::ClientFinishedSent)?;
+		self.invariants.mark_finished_sent()?;
 
 		Ok(signed_data_der)
-	}
-
-	/// Derive the final session key from the CEK using HKDF.
-	///
-	/// Uses the negotiated profile's key size to derive the correct length key
-	/// for the negotiated AEAD cipher. The transcript hash provides session-specific
-	/// context for the derivation.
-	///
-	/// # Parameters
-	/// - `cek`: Content Encryption Key (the session_key used in EnvelopedData)
-	///
-	/// # Returns
-	/// The derived AEAD cipher ready for use
-	fn derive_final_session_key(&self, cek: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
-		// Get key size from negotiated profile
-		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-		let key_size = profile.aead_key_size.ok_or(HandshakeError::InvalidState)? as usize;
-
-		// Enforce minimum salt length (16 bytes) for secure key derivation
-		if self.transcript_hash.len() < 16 {
-			return Err(HandshakeError::InsufficientSaltEntropy { actual: self.transcript_hash.len(), minimum: 16 });
-		}
-
-		// Use transcript hash as salt for session-specific key derivation
-		let salt = Some(self.transcript_hash.as_slice());
-
-		// Derive key with dynamic size based on negotiated cipher
-		// Use provider's KDF with its concrete digest type
-		let final_key_bytes = P::Kdf::derive_dynamic_key(cek, TIGHTBEAM_SESSION_KDF_INFO, salt, key_size)?;
-
-		Ok(P::AeadCipher::new_from_slice(&final_key_bytes[..])?)
 	}
 
 	/// Complete the handshake.
 	pub fn complete(&mut self) -> Result<(), HandshakeError> {
 		// 1. Validation
-		self.validate_expected_state(HandshakeState::ClientFinishedSent)?;
+		self.validate_expected_state(ClientHandshakeState::ClientFinishedSent)?;
 
 		// 2. Transition to complete
-		self.state.dispatch(HandshakeState::Complete)?;
+		self.state.transition(ClientHandshakeState::Completed)?;
 
 		Ok(())
 	}
 
 	/// Get the current handshake state.
-	pub fn state(&self) -> HandshakeState {
+	pub fn state(&self) -> ClientHandshakeState {
 		self.state.state()
 	}
 
 	/// Check if handshake is complete.
 	pub fn is_complete(&self) -> bool {
-		self.state.state().is_complete()
+		self.state.state().is_completed()
 	}
 
 	/// Get the session key (if available).
@@ -380,6 +358,21 @@ where
 		self.session_key.as_ref()
 	}
 }
+
+// ============================================================================
+// Common Handshake Trait Implementations
+// ============================================================================
+
+impl<P> crate::transport::handshake::HandshakeFinalization<P> for CmsHandshakeClient<P>
+where
+	P: CryptoProvider,
+{
+	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+		self.selected_profile
+	}
+}
+
+impl<P> crate::transport::handshake::HandshakeAlertHandler for CmsHandshakeClient<P> where P: CryptoProvider {}
 
 // ============================================================================
 // ClientHandshakeProtocol Implementation
@@ -428,7 +421,7 @@ where
 	) -> Pin<Box<dyn Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>> {
 		Box::pin(async move {
 			// 1. Validate state
-			if self.state.state() != HandshakeState::ClientFinishedSent {
+			if self.state.state() != ClientHandshakeState::ClientFinishedSent {
 				return Err(HandshakeError::InvalidState);
 			}
 
@@ -438,10 +431,11 @@ where
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
 			// 3. Derive final session key as P::AeadCipher
-			let cipher = cek.with(|key_bytes| self.derive_final_session_key(key_bytes))?;
+			use crate::transport::handshake::HandshakeFinalization;
+			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, &self.transcript_hash))?;
 
 			// 4. Transition to complete
-			self.state.dispatch(HandshakeState::Complete)?;
+			self.state.transition(ClientHandshakeState::Completed)?;
 
 			// 5. Wrap cipher in RuntimeAead with negotiated OID
 			Ok(crate::crypto::aead::RuntimeAead::new(cipher, aead_oid))
@@ -475,7 +469,7 @@ mod tests {
 	use crate::transport::handshake::processors::{
 		AesGcmContentDecryptor, TightBeamEnvelopedDataProcessor, TightBeamKariRecipient,
 	};
-	use crate::transport::handshake::state::HandshakeState;
+	use crate::transport::handshake::state::ClientHandshakeState;
 	use crate::transport::handshake::tests::*;
 	use crate::{HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_256_OID};
 
@@ -488,12 +482,12 @@ mod tests {
 			.with_server_cert(server_test_cert.certificate.clone())
 			.with_transcript_hash(transcript_hash.clone())
 			.build();
-		assert_eq!(client.state(), HandshakeState::Init);
+		assert_eq!(client.state(), ClientHandshakeState::Init);
 
 		// When: Client builds a valid key exchange
 		let session_key = vec![2u8; 32];
 		let key_exchange = client.build_key_exchange(session_key.clone())?;
-		assert_eq!(client.state(), HandshakeState::KeyExchangeSent);
+		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		// Verify session key is stored
 		assert!(client.session_key().is_some());
 
@@ -519,16 +513,16 @@ mod tests {
 
 		let verified = client.process_server_finished(&server_finished)?;
 		assert_eq!(verified, transcript_hash);
-		assert_eq!(client.state(), HandshakeState::ServerFinishedReceived);
+		assert_eq!(client.state(), ClientHandshakeState::ServerFinishedReceived);
 
 		// Build client Finished
 		let _client_finished = client.build_client_finished()?;
-		assert_eq!(client.state(), HandshakeState::ClientFinishedSent);
+		assert_eq!(client.state(), ClientHandshakeState::ClientFinishedSent);
 
 		// Complete
 		client.complete()?;
 		assert!(client.is_complete());
-		assert_eq!(client.state(), HandshakeState::Complete);
+		assert_eq!(client.state(), ClientHandshakeState::Completed);
 
 		Ok(())
 	}

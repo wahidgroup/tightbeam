@@ -136,39 +136,35 @@ pub use std::sync::Arc;
 pub use ArcAlloc as Arc;
 
 mod attributes;
+mod common;
 mod error;
 mod utils;
+
+#[cfg(test)]
+mod tests;
 
 pub mod client;
 pub mod server;
 pub mod state;
 
 #[cfg(feature = "transport-cms")]
+pub mod builders;
+#[cfg(feature = "transport-cms")]
 pub mod kari;
+#[cfg(feature = "transport-cms")]
+pub mod processors;
 
 pub use attributes::*;
+pub use common::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 pub use error::HandshakeError;
-
-#[cfg(feature = "transport-cms")]
-pub use kari::{kari_unwrap, kari_wrap};
-pub use state::{
-	ClientStateTransition, HandshakeMessageType, HandshakeState as ProtocolState, ServerStateTransition,
-	StateTransition,
-};
 pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generate_cek};
 
 #[cfg(feature = "transport-cms")]
-pub mod builders;
-#[cfg(feature = "transport-cms")]
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
-
 #[cfg(feature = "transport-cms")]
-pub mod processors;
+pub use kari::{kari_unwrap, kari_wrap};
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
-
-#[cfg(test)]
-mod tests;
 
 use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;

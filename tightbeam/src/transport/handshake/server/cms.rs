@@ -19,10 +19,8 @@ use std::sync::Arc;
 
 use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignerIdentifier;
-use crate::constants::{TIGHTBEAM_KARI_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO};
+use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::aead::KeyInit;
-use crate::crypto::kdf::KdfProvider;
-use crate::crypto::negotiation::select_profile;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
@@ -36,8 +34,10 @@ use crate::spki::EncodePublicKey;
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
-use crate::transport::handshake::state::{HandshakeState, ServerStateTransition, StateTransition};
+use crate::transport::handshake::state::HandshakeInvariant;
+use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::aes_gcm_decrypt;
+use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::transport::handshake::{ServerHandshakeKey, ServerHandshakeProtocol};
 use crate::x509::attr::Attributes;
 use crate::x509::Certificate;
@@ -56,7 +56,7 @@ pub struct CmsHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
-	state: ServerStateTransition,
+	state: ServerStateMachine,
 	server_key: Arc<dyn ServerHandshakeKey>,
 	client_cert: Option<Certificate>,
 	validated_client_cert: Option<Certificate>,
@@ -66,6 +66,7 @@ where
 	selected_profile: Option<SecurityProfileDesc>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	_phantom: PhantomData<P>,
+	invariants: HandshakeInvariant,
 }
 
 impl<P> CmsHandshakeServer<P>
@@ -91,7 +92,7 @@ where
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
-			state: ServerStateTransition::new(),
+			state: ServerStateMachine::new(),
 			server_key,
 			client_cert: None,
 			validated_client_cert: None,
@@ -101,6 +102,12 @@ where
 			selected_profile: None,
 			client_validators,
 			_phantom: PhantomData,
+			invariants: {
+				let mut inv = HandshakeInvariant::default();
+				// CMS server receives transcript hash externally (already immutable); locking should never fail here.
+				let _ = inv.lock_transcript();
+				inv
+			},
 		}
 	}
 
@@ -151,7 +158,7 @@ where
 	}
 
 	/// Validate that the current state matches the expected state.
-	fn validate_expected_state(&self, expected: HandshakeState) -> Result<(), HandshakeError> {
+	fn validate_expected_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
 		if self.state.state() != expected {
 			return Err(HandshakeError::InvalidState);
 		}
@@ -176,18 +183,20 @@ where
 			return Ok(());
 		}
 
-		// Extract and convert attributes if present
-		if let Some(attrs) = unprotected_attrs {
-			let handshake_attrs = self.convert_to_handshake_attributes(attrs)?;
-			self.negotiate_or_select_profile(&handshake_attrs)?;
-		} else {
-			// No attributes - check if negotiation is required
-			if !self.supported_profiles.is_empty() {
-				// Profiles configured but no client offer - use dealer's choice
-				self.select_dealers_choice_profile()?;
-			}
-			// If no profiles configured and no attributes, nothing to do
-		}
+		// Extract SecurityOffer from attributes if present
+		let offer = unprotected_attrs.and_then(|attrs| {
+			let handshake_attrs = self.convert_to_handshake_attributes(attrs).ok()?;
+			let offer_attr = crate::transport::handshake::attributes::find(
+				&handshake_attrs,
+				&crate::asn1::transport::HANDSHAKE_SECURITY_OFFER_OID,
+			)
+			.ok()?;
+
+			crate::transport::handshake::attributes::extract_security_offer(offer_attr).ok()
+		});
+
+		// Use trait method for negotiation
+		self.selected_profile = Some(self.negotiate_profile(offer.as_ref())?);
 
 		Ok(())
 	}
@@ -198,32 +207,6 @@ where
 			.iter()
 			.map(|attr| Ok(HandshakeAttribute { attr_type: attr.oid.clone(), attr_values: attr.values.clone().into() }))
 			.collect()
-	}
-
-	/// Perform profile negotiation or dealer's choice based on handshake attributes.
-	fn negotiate_or_select_profile(&mut self, handshake_attrs: &[HandshakeAttribute]) -> Result<(), HandshakeError> {
-		// Try to find SecurityOffer in attributes
-		if let Ok(offer_attr) = crate::transport::handshake::attributes::find(
-			handshake_attrs,
-			&crate::asn1::transport::HANDSHAKE_SECURITY_OFFER_OID,
-		) {
-			// Client sent offer - perform negotiation
-			let offer = crate::transport::handshake::attributes::extract_security_offer(offer_attr)?;
-			self.selected_profile = Some(select_profile(&offer, &self.supported_profiles)?);
-		} else {
-			// No offer from client - use dealer's choice
-			self.select_dealers_choice_profile()?;
-		}
-		Ok(())
-	}
-
-	/// Select profile using dealer's choice (first configured profile).
-	fn select_dealers_choice_profile(&mut self) -> Result<(), HandshakeError> {
-		if self.supported_profiles.is_empty() {
-			return Err(HandshakeError::NoSupportedProfiles);
-		}
-		self.selected_profile = Some(self.supported_profiles[0]);
-		Ok(())
 	}
 
 	/// Get the client certificate, returning an error if not set.
@@ -318,19 +301,25 @@ where
 	/// unnecessary copies of key material in memory.
 	pub fn process_key_exchange(&mut self, enveloped_data_der: &[u8]) -> Result<(), HandshakeError> {
 		// 1. Validation
-		self.validate_expected_state(HandshakeState::Init)?;
+		self.validate_expected_state(ServerHandshakeState::Init)?;
 
 		// 2. Transition to received state
-		self.state.dispatch(HandshakeState::KeyExchangeReceived)?;
+		self.state.transition(ServerHandshakeState::KeyExchangeReceived)?;
 
 		// 3. Decode EnvelopedData to access encrypted content
 		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 
-		// 4. Process SecurityOffer and perform profile negotiation
+		// 4. Early alert detection (abort before heavy crypto or negotiation)
+		self.check_for_alert(enveloped_data.unprotected_attrs.as_ref())?;
+
+		// 5. Process SecurityOffer and perform profile negotiation
 		self.process_security_offer(enveloped_data.unprotected_attrs.as_ref())?;
 
-		// 5. Decrypt and store session key
+		// 6. Decrypt and store session key
 		self.decrypt_session_key(enveloped_data_der)?;
+		// Transcript implicitly locked for CMS (provided externally). Mark AEAD derivation here
+		// as session key material now available.
+		self.invariants.derive_aead_once()?;
 
 		Ok(())
 	}
@@ -341,7 +330,7 @@ where
 	/// DER-encoded SignedData
 	pub fn build_server_finished(&mut self) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validation
-		self.validate_expected_state(HandshakeState::KeyExchangeReceived)?;
+		self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
 
 		// 2. Get algorithm identifiers from the key implementation
 		let digest_alg = self.server_key.digest_algorithm();
@@ -352,8 +341,9 @@ where
 			self.server_key
 				.build_cms_signed_data(&self.transcript_hash, &digest_alg, &signature_alg)?;
 
-		// 4. Transition state
-		self.state.dispatch(HandshakeState::ServerFinishedSent)?;
+		// 4. Transition state & mark finished sent invariant
+		self.state.transition(ServerHandshakeState::ServerFinishedSent)?;
+		self.invariants.mark_finished_sent()?;
 
 		Ok(signed_data_der)
 	}
@@ -367,7 +357,7 @@ where
 	/// Verified transcript hash
 	pub fn process_client_finished(&mut self, signed_data_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validation
-		self.validate_expected_state(HandshakeState::ServerFinishedSent)?;
+		self.validate_expected_state(ServerHandshakeState::ServerFinishedSent)?;
 
 		// 2. Extract cryptographic material
 		let client_verifying_key = self.extract_client_verifying_key()?;
@@ -378,61 +368,30 @@ where
 			self.verify_client_signature(signed_data_der, client_verifying_key, expected_signer_identifier)?;
 
 		// 4. Transition state
-		self.state.dispatch(HandshakeState::ClientFinishedReceived)?;
+		self.state.transition(ServerHandshakeState::ClientFinishedReceived)?;
 
 		Ok(verified_content)
-	}
-
-	/// Derive the final session key from the CEK using HKDF.
-	///
-	/// Uses the negotiated profile's key size to derive the correct length key
-	/// for the negotiated AEAD cipher. The transcript hash provides session-specific
-	/// context for the derivation.
-	///
-	/// # Parameters
-	/// - `cek`: Content Encryption Key (the session_key extracted from EnvelopedData)
-	///
-	/// # Returns
-	/// The derived AEAD cipher ready for use
-	fn derive_final_session_key(&self, cek: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
-		// Get key size from negotiated profile
-		let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
-		let key_size = profile.aead_key_size.ok_or(HandshakeError::InvalidState)? as usize;
-
-		// Enforce minimum salt length (16 bytes) for secure key derivation
-		if self.transcript_hash.len() < 16 {
-			return Err(HandshakeError::InsufficientSaltEntropy { actual: self.transcript_hash.len(), minimum: 16 });
-		}
-
-		// Use transcript hash as salt for session-specific key derivation
-		let salt = Some(self.transcript_hash.as_slice());
-
-		// Derive key with dynamic size based on negotiated cipher
-		// Use provider's KDF with its concrete digest type
-		let final_key_bytes = P::Kdf::derive_dynamic_key(cek, TIGHTBEAM_SESSION_KDF_INFO, salt, key_size)?;
-
-		Ok(P::AeadCipher::new_from_slice(&final_key_bytes[..])?)
 	}
 
 	/// Complete the handshake.
 	pub fn complete(&mut self) -> Result<(), HandshakeError> {
 		// 1. Validation
-		self.validate_expected_state(HandshakeState::ClientFinishedReceived)?;
+		self.validate_expected_state(ServerHandshakeState::ClientFinishedReceived)?;
 
-		// 2. Transition to complete
-		self.state.dispatch(HandshakeState::Complete)?;
+		// 2. Transition to complete (AEAD already derived in finalization stage elsewhere)
+		self.state.transition(ServerHandshakeState::Completed)?;
 
 		Ok(())
 	}
 
 	/// Get the current handshake state.
-	pub fn state(&self) -> HandshakeState {
+	pub fn state(&self) -> ServerHandshakeState {
 		self.state.state()
 	}
 
 	/// Check if handshake is complete.
 	pub fn is_complete(&self) -> bool {
-		self.state.state().is_complete()
+		self.state.state().is_completed()
 	}
 
 	/// Get the session key (if available).
@@ -442,6 +401,30 @@ where
 		self.session_key.as_ref()
 	}
 }
+
+// ============================================================================
+// Common Handshake Trait Implementations
+// ============================================================================
+
+impl<P> HandshakeNegotiation for CmsHandshakeServer<P>
+where
+	P: CryptoProvider,
+{
+	fn supported_profiles(&self) -> &[SecurityProfileDesc] {
+		&self.supported_profiles
+	}
+}
+
+impl<P> HandshakeFinalization<P> for CmsHandshakeServer<P>
+where
+	P: CryptoProvider,
+{
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
+		self.selected_profile
+	}
+}
+
+impl<P> HandshakeAlertHandler for CmsHandshakeServer<P> where P: CryptoProvider {}
 
 // ============================================================================
 // ServerHandshakeProtocol Implementation
@@ -470,13 +453,13 @@ where
 		Box::pin(async move {
 			// Determine which message type this is based on state
 			match self.state() {
-				HandshakeState::Init => {
+				ServerHandshakeState::Init => {
 					// This is KeyExchange (EnvelopedData) - process and send ServerFinished
 					self.process_key_exchange(msg)?;
 					let server_finished = self.build_server_finished()?;
 					Ok(Some(server_finished))
 				}
-				HandshakeState::ServerFinishedSent => {
+				ServerHandshakeState::ServerFinishedSent => {
 					// This is ClientFinished (SignedData) - no response needed
 					self.process_client_finished(msg)?;
 					Ok(None)
@@ -494,7 +477,7 @@ where
 	> {
 		Box::pin(async move {
 			// 1. Validate state
-			if self.state.state() != HandshakeState::ClientFinishedReceived {
+			if self.state.state() != ServerHandshakeState::ClientFinishedReceived {
 				return Err(HandshakeError::InvalidState);
 			}
 
@@ -503,11 +486,12 @@ where
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
-			// 3. Derive final session key as P::AeadCipher
-			let cipher = cek.with(|key_bytes| self.derive_final_session_key(key_bytes))?;
+			// 3. Derive final session key as P::AeadCipher using transcript hash as salt
+			use crate::transport::handshake::HandshakeFinalization;
+			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, &self.transcript_hash))?;
 
 			// 4. Transition to complete
-			self.state.dispatch(HandshakeState::Complete)?;
+			self.state.transition(ServerHandshakeState::Completed)?;
 
 			// 5. Wrap cipher in RuntimeAead with negotiated OID
 			Ok(crate::crypto::aead::RuntimeAead::new(cipher, aead_oid))
@@ -569,28 +553,28 @@ mod tests {
 			server.set_client_certificate(client_test_cert.certificate.clone())?;
 
 			// Verify initial state
-			assert_eq!(server.state(), HandshakeState::Init);
+			assert_eq!(server.state(), ServerHandshakeState::Init);
 
 			// Build and process KeyExchange message
 			let key_exchange = build_test_key_exchange(&server_public_key, &[2u8; 32])?;
 			server.process_key_exchange(&key_exchange)?;
-			assert_eq!(server.state(), HandshakeState::KeyExchangeReceived);
+			assert_eq!(server.state(), ServerHandshakeState::KeyExchangeReceived);
 			assert!(server.session_key().is_some());
 
 			// Build server Finished
 			let _server_finished = server.build_server_finished()?;
-			assert_eq!(server.state(), HandshakeState::ServerFinishedSent);
+			assert_eq!(server.state(), ServerHandshakeState::ServerFinishedSent);
 
 			// Build and process client Finished
 			let client_finished = build_test_client_finished(&client_test_cert.signing_key, &transcript_hash)?;
 			let verified = server.process_client_finished(&client_finished)?;
 			assert_eq!(verified, transcript_hash);
-			assert_eq!(server.state(), HandshakeState::ClientFinishedReceived);
+			assert_eq!(server.state(), ServerHandshakeState::ClientFinishedReceived);
 
 			// Complete handshake
 			server.complete()?;
 			assert!(server.is_complete());
-			assert_eq!(server.state(), HandshakeState::Complete);
+			assert_eq!(server.state(), ServerHandshakeState::Completed);
 
 			Ok(())
 		}
@@ -636,7 +620,7 @@ mod tests {
 			// Process KeyExchange (no explicit SecurityOffer from client)
 			let key_exchange = build_test_key_exchange(&server_public_key, &[2u8; 32])?;
 			server.process_key_exchange(&key_exchange)?;
-			assert_eq!(server.state(), HandshakeState::KeyExchangeReceived);
+			assert_eq!(server.state(), ServerHandshakeState::KeyExchangeReceived);
 			assert!(server.session_key().is_some());
 
 			// Verify a profile was selected (dealer's choice)
@@ -646,14 +630,14 @@ mod tests {
 
 			// Complete handshake flow
 			let _server_finished = server.build_server_finished()?;
-			assert_eq!(server.state(), HandshakeState::ServerFinishedSent);
+			assert_eq!(server.state(), ServerHandshakeState::ServerFinishedSent);
 
 			let client_finished = build_test_client_finished(&client_test_cert.signing_key, &transcript_hash)?;
 			server.process_client_finished(&client_finished)?;
-			assert_eq!(server.state(), HandshakeState::ClientFinishedReceived);
+			assert_eq!(server.state(), ServerHandshakeState::ClientFinishedReceived);
 
 			server.complete()?;
-			assert_eq!(server.state(), HandshakeState::Complete);
+			assert_eq!(server.state(), ServerHandshakeState::Completed);
 			assert!(server.is_complete());
 			assert!(server.session_key().is_some());
 

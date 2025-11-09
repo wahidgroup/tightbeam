@@ -6,6 +6,32 @@ use crate::Errorizable;
 #[derive(Debug)]
 pub enum HandshakeError {
 	// ---------------- Protocol & structure specific ----------------
+	// Invariant violations (non-panicking)
+	#[cfg_attr(
+		feature = "derive",
+		error("Handshake invariant violation: transcript already locked")
+	)]
+	TranscriptAlreadyLocked,
+	#[cfg_attr(
+		feature = "derive",
+		error("Handshake invariant violation: transcript not locked")
+	)]
+	TranscriptNotLocked,
+	#[cfg_attr(
+		feature = "derive",
+		error("Handshake invariant violation: AEAD key already derived")
+	)]
+	AeadAlreadyDerived,
+	#[cfg_attr(
+		feature = "derive",
+		error("Handshake invariant violation: Finished already sent")
+	)]
+	FinishedAlreadySent,
+	#[cfg_attr(
+		feature = "derive",
+		error("Handshake invariant violation: Finished before transcript lock")
+	)]
+	FinishedBeforeTranscriptLock,
 	/// Invalid client key exchange message
 	#[cfg_attr(feature = "derive", error("Invalid client key exchange message"))]
 	InvalidClientKeyExchange,
@@ -105,6 +131,10 @@ pub enum HandshakeError {
 		error("CMS salt too short: {actual} bytes (minimum {minimum} required)")
 	)]
 	InsufficientSaltEntropy { actual: usize, minimum: usize },
+
+	/// Peer sent abort alert during handshake
+	#[cfg_attr(feature = "derive", error("Handshake aborted by peer: {0:?}"))]
+	AbortReceived(crate::transport::handshake::HandshakeAlert),
 
 	/// Handshake timeout
 	#[cfg_attr(feature = "derive", error("Handshake timeout"))]
@@ -242,6 +272,7 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::InsufficientSaltEntropy { actual, minimum } => {
 				write!(f, "CMS salt too short: {} bytes (minimum {} required)", actual, minimum)
 			}
+			HandshakeError::AbortReceived(alert) => write!(f, "Handshake aborted by peer: {:?}", alert),
 			HandshakeError::Timeout => write!(f, "Handshake timeout"),
 			HandshakeError::InvalidProfileSelection => write!(f, "Server selected profile not in client's offer"),
 			HandshakeError::NegotiationError(e) => write!(f, "Profile negotiation failed: {}", e),

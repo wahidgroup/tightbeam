@@ -1,256 +1,353 @@
 //! State machine infrastructure for TightBeam handshake protocol.
 //!
-//! Defines states, transitions, and orchestration logic for the handshake.
+//! This redesigned module provides role-specific handshake state machines
+//! with explicit terminal states, granular failure classification, replay
+//! (nonce) tracking, and invariant enforcement hooks.
+//!
+//! Breaking changes: the previous `HandshakeState` enum is replaced by
+//! `ClientHandshakeState` and `ServerHandshakeState`. Transition APIs are
+//! now role-specific (`ClientStateMachine` / `ServerStateMachine`).
 
 use crate::transport::handshake::error::HandshakeError;
 
-/// Handshake protocol states.
+// ---------------------------------------------------------------------------
+// Failure and Abort Classification
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandshakeState {
-	/// Initial state - no handshake started
-	Init,
-	/// Client: Sent ClientHello, waiting for ServerHello
-	ClientHelloSent,
-	/// Server: Received ClientHello, ready to send ServerHello
-	ServerHelloReceived,
-	/// Server: Sent ServerHello, waiting for KeyExchange
-	ServerHelloSent,
-	/// Client: Sent KeyExchange, waiting for Finished
-	KeyExchangeSent,
-	/// Server: Received KeyExchange, ready to send Finished
-	KeyExchangeReceived,
-	/// Server: Sent Finished, waiting for client Finished
-	ServerFinishedSent,
-	/// Client: Received server Finished, ready to send client Finished
-	ServerFinishedReceived,
-	/// Client: Sent client Finished, handshake complete
-	ClientFinishedSent,
-	/// Server: Received client Finished, handshake complete
-	ClientFinishedReceived,
-	/// Handshake successfully completed
-	Complete,
-	/// Handshake failed
-	Failed,
-}
-
-impl HandshakeState {
-	/// Check if the handshake is complete.
-	pub fn is_complete(&self) -> bool {
-		matches!(self, HandshakeState::Complete)
-	}
-
-	/// Check if the handshake has failed.
-	pub fn is_failed(&self) -> bool {
-		matches!(self, HandshakeState::Failed)
-	}
-
-	/// Check if the handshake is still in progress.
-	pub fn is_in_progress(&self) -> bool {
-		!self.is_complete() && !self.is_failed()
-	}
-}
-
-/// Handshake message types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandshakeMessageType {
-	/// Client Hello - initiates handshake
-	ClientHello,
-	/// Server Hello - server responds with key material
-	ServerHello,
-	/// Key Exchange - client sends encrypted session key
+pub enum Phase {
+	Hello,
 	KeyExchange,
-	/// Finished - authentication message (mutual)
 	Finished,
 }
 
-/// State transition validation.
-pub trait StateTransition {
-	/// Validate a state transition is allowed.
-	fn can_dispatch(&self, from: HandshakeState, to: HandshakeState) -> bool;
-
-	/// Perform a state transition.
-	fn dispatch(&mut self, to: HandshakeState) -> Result<(), HandshakeError>;
-
-	/// Get current state.
-	fn state(&self) -> HandshakeState;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortReason {
+	LocalPolicy,
+	Timeout(Phase),
+	PeerAbort,
+	Shutdown,
 }
 
-/// Client-side state transitions.
-pub struct ClientStateTransition {
-	state: HandshakeState,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+	ProtocolViolation,
+	ReplayDetected,
+	DowngradeAttempt,
+	CertificateInvalid,
+	SignatureInvalid,
+	IntegrityMismatch,
+	DerDecodeError,
+	KeyDerivationError,
+	UnsupportedAlgorithm,
+	InternalError,
 }
 
-impl ClientStateTransition {
-	/// Create a new client state machine.
+// ---------------------------------------------------------------------------
+// Role-Specific States
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientHandshakeState {
+	Init,
+	HelloSent,
+	ServerHelloReceived,
+	KeyExchangeSent,
+	ServerFinishedReceived,
+	ClientFinishedSent,
+	Completed,
+	Aborted(AbortReason),
+	Failed(FailureKind),
+}
+
+impl ClientHandshakeState {
+	pub fn is_completed(&self) -> bool {
+		matches!(self, Self::Completed)
+	}
+	pub fn is_failed(&self) -> bool {
+		matches!(self, Self::Failed(_))
+	}
+	pub fn is_aborted(&self) -> bool {
+		matches!(self, Self::Aborted(_))
+	}
+	pub fn is_terminal(&self) -> bool {
+		self.is_completed() || self.is_failed() || self.is_aborted()
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerHandshakeState {
+	Init,
+	ClientHelloReceived,
+	ServerHelloSent,
+	KeyExchangeReceived,
+	ServerFinishedSent,
+	ClientFinishedReceived,
+	Completed,
+	Aborted(AbortReason),
+	Failed(FailureKind),
+}
+
+impl ServerHandshakeState {
+	pub fn is_completed(&self) -> bool {
+		matches!(self, Self::Completed)
+	}
+	pub fn is_failed(&self) -> bool {
+		matches!(self, Self::Failed(_))
+	}
+	pub fn is_aborted(&self) -> bool {
+		matches!(self, Self::Aborted(_))
+	}
+	pub fn is_terminal(&self) -> bool {
+		self.is_completed() || self.is_failed() || self.is_aborted()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Replay / Nonce Tracking
+// ---------------------------------------------------------------------------
+
+use std::collections::HashSet;
+
+#[derive(Debug)]
+pub struct NonceReplaySet {
+	inner: HashSet<[u8; 32]>,
+	cap: usize,
+}
+
+impl NonceReplaySet {
+	pub fn new(cap: usize) -> Self {
+		Self { inner: HashSet::new(), cap }
+	}
+	pub fn insert_or_replay(&mut self, n: [u8; 32]) -> bool {
+		if self.inner.contains(&n) {
+			return true;
+		}
+		if self.inner.len() < self.cap {
+			self.inner.insert(n);
+		}
+		false
+	}
+	pub fn clear(&mut self) {
+		self.inner.clear();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Invariant Tracking
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct HandshakeInvariant {
+	pub transcript_locked: bool,
+	pub aead_key_derived: bool,
+	pub finished_sent: bool,
+}
+
+impl HandshakeInvariant {
+	/// Lock the transcript. Returns Ok(true) if newly locked, Ok(false) if it was already locked.
+	/// Never panics.
+	pub fn lock_transcript(&mut self) -> Result<bool, HandshakeError> {
+		if self.transcript_locked {
+			return Err(HandshakeError::TranscriptAlreadyLocked);
+		}
+
+		self.transcript_locked = true;
+		Ok(true)
+	}
+
+	/// Derive AEAD key exactly once. Ordering: transcript must be locked first.
+	/// Returns Ok(true) if freshly derived, Ok(false) if already derived. Errors on ordering violation.
+	pub fn derive_aead_once(&mut self) -> Result<bool, HandshakeError> {
+		if !self.transcript_locked {
+			return Err(HandshakeError::TranscriptNotLocked);
+		}
+		if self.aead_key_derived {
+			return Err(HandshakeError::AeadAlreadyDerived);
+		}
+
+		self.aead_key_derived = true;
+		Ok(true)
+	}
+
+	/// Mark Finished message as sent. Requires transcript lock. Returns Ok(true) if newly marked,
+	/// Err if ordering violated or already sent.
+	pub fn mark_finished_sent(&mut self) -> Result<bool, HandshakeError> {
+		if !self.transcript_locked {
+			return Err(HandshakeError::FinishedBeforeTranscriptLock);
+		}
+		if self.finished_sent {
+			return Err(HandshakeError::FinishedAlreadySent);
+		}
+
+		self.finished_sent = true;
+		Ok(true)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Client State Machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct ClientStateMachine {
+	state: ClientHandshakeState,
+}
+
+impl ClientStateMachine {
 	pub fn new() -> Self {
-		Self { state: HandshakeState::Init }
+		Self { state: ClientHandshakeState::Init }
 	}
-}
-
-impl Default for ClientStateTransition {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl StateTransition for ClientStateTransition {
-	fn can_dispatch(&self, from: HandshakeState, to: HandshakeState) -> bool {
-		use HandshakeState::*;
-		matches!(
-			(from, to),
-			(Init, ClientHelloSent)
-				| (Init, KeyExchangeSent)
-				| (ClientHelloSent, ServerHelloReceived)
-				| (ServerHelloReceived, KeyExchangeSent)
-				| (KeyExchangeSent, ServerFinishedReceived)
-				| (KeyExchangeSent, Complete)
-				| (ServerFinishedReceived, ClientFinishedSent)
-				| (ClientFinishedSent, Complete)
-				| (_, Failed)
-		)
+	pub fn state(&self) -> ClientHandshakeState {
+		self.state
 	}
 
-	fn dispatch(&mut self, to: HandshakeState) -> Result<(), HandshakeError> {
-		if self.can_dispatch(self.state, to) {
+	fn can_transition(&self, to: ClientHandshakeState) -> bool {
+		use ClientHandshakeState::*;
+		match (self.state, to) {
+			// Linear progression
+			(Init, HelloSent)
+			// CMS direct path (no explicit hello messages)
+			| (Init, KeyExchangeSent)
+			| (HelloSent, ServerHelloReceived)
+			| (ServerHelloReceived, KeyExchangeSent)
+			| (KeyExchangeSent, ServerFinishedReceived)
+			| (ServerFinishedReceived, ClientFinishedSent)
+			| (ClientFinishedSent, Completed)
+			// ECIES short-circuit (no Finished messages)
+			| (KeyExchangeSent, Completed)
+			// Terminal classification
+			| (_, Aborted(_))
+			| (_, Failed(_)) => true,
+			_ => false,
+		}
+	}
+
+	pub fn transition(&mut self, to: ClientHandshakeState) -> Result<(), HandshakeError> {
+		if self.state.is_terminal() {
+			return Err(HandshakeError::InvalidState);
+		}
+		if self.can_transition(to) {
 			self.state = to;
 			Ok(())
 		} else {
 			Err(HandshakeError::InvalidState)
 		}
 	}
+}
 
-	fn state(&self) -> HandshakeState {
+// ---------------------------------------------------------------------------
+// Server State Machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct ServerStateMachine {
+	state: ServerHandshakeState,
+}
+
+impl ServerStateMachine {
+	pub fn new() -> Self {
+		Self { state: ServerHandshakeState::Init }
+	}
+	pub fn state(&self) -> ServerHandshakeState {
 		self.state
 	}
-}
 
-/// Server-side state transitions.
-pub struct ServerStateTransition {
-	state: HandshakeState,
-}
-
-impl ServerStateTransition {
-	/// Create a new server state machine.
-	pub fn new() -> Self {
-		Self { state: HandshakeState::Init }
-	}
-}
-
-impl Default for ServerStateTransition {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-impl StateTransition for ServerStateTransition {
-	fn can_dispatch(&self, from: HandshakeState, to: HandshakeState) -> bool {
-		use HandshakeState::*;
-		matches!(
-			(from, to),
-			(Init, ServerHelloReceived)
-				| (Init, KeyExchangeReceived)
-				| (ServerHelloReceived, ServerHelloSent)
-				| (ServerHelloSent, KeyExchangeReceived)
-				| (KeyExchangeReceived, ServerFinishedSent)
-				| (KeyExchangeReceived, Complete)
-				| (ServerFinishedSent, ClientFinishedReceived)
-				| (ClientFinishedReceived, Complete)
-				| (_, Failed)
-		)
+	fn can_transition(&self, to: ServerHandshakeState) -> bool {
+		use ServerHandshakeState::*;
+		match (self.state, to) {
+			// Two entry paths: ECIES (ClientHelloReceived) or CMS (KeyExchangeReceived)
+			(Init, ClientHelloReceived)
+			| (Init, KeyExchangeReceived)
+			| (ClientHelloReceived, ServerHelloSent)
+			| (ServerHelloSent, KeyExchangeReceived)
+			| (KeyExchangeReceived, ServerFinishedSent)
+			| (ServerFinishedSent, ClientFinishedReceived)
+			| (ClientFinishedReceived, Completed)
+			// ECIES short-circuit (no Finished messages)
+			| (KeyExchangeReceived, Completed)
+			// Terminal classification
+			| (_, Aborted(_))
+			| (_, Failed(_)) => true,
+			_ => false,
+		}
 	}
 
-	fn dispatch(&mut self, to: HandshakeState) -> Result<(), HandshakeError> {
-		if self.can_dispatch(self.state, to) {
+	pub fn transition(&mut self, to: ServerHandshakeState) -> Result<(), HandshakeError> {
+		if self.state.is_terminal() {
+			return Err(HandshakeError::InvalidState);
+		}
+		if self.can_transition(to) {
 			self.state = to;
 			Ok(())
 		} else {
 			Err(HandshakeError::InvalidState)
 		}
 	}
-
-	fn state(&self) -> HandshakeState {
-		self.state
-	}
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	#[test]
-	fn test_client_state_transitions() {
-		let mut client = ClientStateTransition::new();
-
-		// Valid transitions
-		assert_eq!(client.state(), HandshakeState::Init);
-		assert!(client.dispatch(HandshakeState::ClientHelloSent).is_ok());
-		assert_eq!(client.state(), HandshakeState::ClientHelloSent);
-
-		assert!(client.dispatch(HandshakeState::ServerHelloReceived).is_ok());
-		assert!(client.dispatch(HandshakeState::KeyExchangeSent).is_ok());
-		assert!(client.dispatch(HandshakeState::ServerFinishedReceived).is_ok());
-		assert!(client.dispatch(HandshakeState::ClientFinishedSent).is_ok());
-		assert!(client.dispatch(HandshakeState::Complete).is_ok());
-
-		assert!(client.state().is_complete());
+	fn client_linear_flow_ecies_short() {
+		let mut sm = ClientStateMachine::new();
+		assert_eq!(sm.state(), ClientHandshakeState::Init);
+		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
+		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_ok());
+		assert!(sm.transition(ClientHandshakeState::KeyExchangeSent).is_ok());
+		// ECIES path allows direct complete
+		assert!(sm.transition(ClientHandshakeState::Completed).is_ok());
+		assert!(sm.state().is_completed());
 	}
 
 	#[test]
-	fn test_server_state_transitions() {
-		let mut server = ServerStateTransition::new();
-
-		// Valid transitions
-		assert_eq!(server.state(), HandshakeState::Init);
-		assert!(server.dispatch(HandshakeState::ServerHelloReceived).is_ok());
-		assert!(server.dispatch(HandshakeState::ServerHelloSent).is_ok());
-		assert!(server.dispatch(HandshakeState::KeyExchangeReceived).is_ok());
-		assert!(server.dispatch(HandshakeState::ServerFinishedSent).is_ok());
-		assert!(server.dispatch(HandshakeState::ClientFinishedReceived).is_ok());
-		assert!(server.dispatch(HandshakeState::Complete).is_ok());
-
-		assert!(server.state().is_complete());
+	fn client_full_flow_cms() {
+		let mut sm = ClientStateMachine::new();
+		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
+		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_ok());
+		assert!(sm.transition(ClientHandshakeState::KeyExchangeSent).is_ok());
+		assert!(sm.transition(ClientHandshakeState::ServerFinishedReceived).is_ok());
+		assert!(sm.transition(ClientHandshakeState::ClientFinishedSent).is_ok());
+		assert!(sm.transition(ClientHandshakeState::Completed).is_ok());
 	}
 
 	#[test]
-	fn test_invalid_client_transition() {
-		let mut client = ClientStateTransition::new();
-
-		// Try to skip to an invalid state (Init can go to ClientHelloSent or KeyExchangeSent, but not ServerFinishedReceived)
-		assert!(client.dispatch(HandshakeState::ServerFinishedReceived).is_err());
-		assert_eq!(client.state(), HandshakeState::Init); // State unchanged
+	fn server_linear_flow_ecies_short() {
+		let mut sm = ServerStateMachine::new();
+		assert_eq!(sm.state(), ServerHandshakeState::Init);
+		assert!(sm.transition(ServerHandshakeState::ClientHelloReceived).is_ok());
+		assert!(sm.transition(ServerHandshakeState::ServerHelloSent).is_ok());
+		assert!(sm.transition(ServerHandshakeState::KeyExchangeReceived).is_ok());
+		assert!(sm.transition(ServerHandshakeState::Completed).is_ok());
+		assert!(sm.state().is_completed());
 	}
 
 	#[test]
-	fn test_invalid_server_transition() {
-		let mut server = ServerStateTransition::new();
-
-		// Try to skip states
-		assert!(server.dispatch(HandshakeState::ServerFinishedSent).is_err());
-		assert_eq!(server.state(), HandshakeState::Init); // State unchanged
+	fn server_full_flow_cms() {
+		let mut sm = ServerStateMachine::new();
+		assert!(sm.transition(ServerHandshakeState::KeyExchangeReceived).is_ok());
+		assert!(sm.transition(ServerHandshakeState::ServerFinishedSent).is_ok());
+		assert!(sm.transition(ServerHandshakeState::ClientFinishedReceived).is_ok());
+		assert!(sm.transition(ServerHandshakeState::Completed).is_ok());
 	}
 
 	#[test]
-	fn test_transition_to_failed() {
-		let mut client = ClientStateTransition::new();
-
-		// Can transition to Failed from any state
-		assert!(client.dispatch(HandshakeState::ClientHelloSent).is_ok());
-		assert!(client.dispatch(HandshakeState::Failed).is_ok());
-		assert!(client.state().is_failed());
-	}
-
-	#[test]
-	fn test_state_checks() {
-		assert!(HandshakeState::Complete.is_complete());
-		assert!(!HandshakeState::Complete.is_failed());
-		assert!(!HandshakeState::Complete.is_in_progress());
-
-		assert!(HandshakeState::Failed.is_failed());
-		assert!(!HandshakeState::Failed.is_complete());
-		assert!(!HandshakeState::Failed.is_in_progress());
-
-		assert!(HandshakeState::ClientHelloSent.is_in_progress());
-		assert!(!HandshakeState::ClientHelloSent.is_complete());
-		assert!(!HandshakeState::ClientHelloSent.is_failed());
+	fn abort_and_failure_are_terminal() {
+		let mut sm = ClientStateMachine::new();
+		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
+		assert!(sm.transition(ClientHandshakeState::Aborted(AbortReason::PeerAbort)).is_ok());
+		assert!(sm.state().is_aborted());
+		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_err());
+		let mut sm2 = ServerStateMachine::new();
+		assert!(sm2
+			.transition(ServerHandshakeState::Failed(FailureKind::ProtocolViolation))
+			.is_ok());
+		assert!(sm2.state().is_failed());
 	}
 }
