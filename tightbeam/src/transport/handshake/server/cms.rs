@@ -19,14 +19,13 @@ use std::sync::Arc;
 
 use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignerIdentifier;
-use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
 use crate::crypto::sign::EcdsaSignatureVerifier;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::oid::AssociatedOid;
@@ -34,10 +33,11 @@ use crate::der::Decode;
 use crate::spki::EncodePublicKey;
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::processors::enveloped_data::TightBeamEnvelopedDataProcessor;
+use crate::transport::handshake::processors::kari::TightBeamKariRecipient;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
-use crate::transport::handshake::utils::aes_gcm_decrypt;
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::transport::handshake::{ServerHandshakeKey, ServerHandshakeProtocol};
 use crate::x509::attr::Attributes;
@@ -45,7 +45,9 @@ use crate::x509::Certificate;
 
 /// Server-side CMS handshake orchestrator.
 ///
-/// Generic over `P: CryptoProvider` for cryptographic operations.
+/// Generic over:
+/// - `P: CryptoProvider` for cryptographic operations
+/// - `K: Clone` for the concrete signing key type
 ///
 /// Manages the complete server handshake flow:
 /// 1. Receives and decrypts KeyExchange (EnvelopedData with KARI)
@@ -53,12 +55,13 @@ use crate::x509::Certificate;
 /// 3. Receives and verifies client Finished (SignedData)
 ///
 /// Supports cryptographic profile negotiation via `supported_profiles` configuration.
-pub struct CmsHandshakeServer<P>
+pub struct CmsHandshakeServer<P, K>
 where
 	P: CryptoProvider,
+	K: Clone,
 {
 	state: ServerStateMachine,
-	server_key: Arc<dyn ServerHandshakeKey>,
+	server_signing_key: K,
 	client_cert: Option<Arc<Certificate>>,
 	validated_client_cert: Option<Arc<Certificate>>,
 	transcript_hash: Option<[u8; 32]>,
@@ -71,9 +74,9 @@ where
 	invariants: HandshakeInvariant,
 }
 
-impl<P> CmsHandshakeServer<P>
+impl<P, K> CmsHandshakeServer<P, K>
 where
-	P: CryptoProvider,
+	P: CryptoProvider + 'static,
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
@@ -81,19 +84,17 @@ where
 	P::Signature: 'static,
 	P::Digest: 'static,
 	P::AeadCipher: KeyInit + 'static,
+	K: Clone + Into<SecretKey<P::Curve>> + signature::Signer<P::Signature> + ServerHandshakeKey,
 {
 	/// Create a new CMS handshake server.
 	///
 	/// # Parameters
-	/// - `server_key`: The server's signing key for authentication (trait object)
+	/// - `server_signing_key`: The server's signing key (concrete type)
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
-	pub fn new(
-		server_key: Arc<dyn ServerHandshakeKey>,
-		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Self {
+	pub fn new(server_signing_key: K, client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>) -> Self {
 		Self {
 			state: ServerStateMachine::new(),
-			server_key,
+			server_signing_key,
 			client_cert: None,
 			validated_client_cert: None,
 			transcript_hash: None,
@@ -105,7 +106,6 @@ where
 			_phantom: PhantomData,
 			invariants: {
 				let inv = HandshakeInvariant::default();
-				// CMS server will lock transcript when it's computed
 				inv
 			},
 		}
@@ -117,6 +117,7 @@ where
 	#[must_use]
 	pub fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
 		self.transcript_hash = Some(hash);
+
 		// Lock transcript immediately since it's externally provided
 		let _ = self.invariants.lock_transcript();
 		self
@@ -184,9 +185,10 @@ where
 	/// Validate that the current state matches the expected state.
 	fn validate_expected_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
 		if self.state.state() != expected {
-			return Err(HandshakeError::InvalidState);
+			Err(HandshakeError::InvalidState)
+		} else {
+			Ok(())
 		}
-		Ok(())
 	}
 
 	/// Process SecurityOffer from unprotected attributes and perform profile negotiation.
@@ -293,28 +295,21 @@ where
 	/// Decrypt the session key from the EnvelopedData.
 	///
 	/// This method handles the complete decryption process:
-	/// 1. Decrypt KARI to get the Content Encryption Key (CEK)
-	/// 2. Decrypt the encrypted content using AES-GCM
-	/// 3. Store the session key securely
+	/// 1. Decode EnvelopedData structure
+	/// 2. Extract CEK using KARI decryption
+	/// 3. Decrypt encrypted content using CEK
+	/// 4. Store the session key securely
 	fn decrypt_session_key(&mut self, enveloped_data_der: &[u8]) -> Result<(), HandshakeError> {
-		// 1. Decrypt KARI and get CEK (Content Encryption Key)
-		let content_encryption_key = self.server_key.decrypt_kari(enveloped_data_der, TIGHTBEAM_KARI_KDF_INFO, 0)?;
-
-		// 2. Decode EnvelopedData to access encrypted content
 		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 
-		// 3. Extract ciphertext bytes
-		let encrypted_content_info = &enveloped_data.encrypted_content;
-		let ciphertext_bytes = encrypted_content_info
-			.encrypted_content
-			.as_ref()
-			.ok_or_else(|| HandshakeError::MissingEncryptedContent)?
-			.as_bytes();
+		// Extract secret key from signing key
+		let secret_key = self.server_signing_key.clone().into();
 
-		// 4. Decrypt the actual content using the CEK
-		let session_key_bytes = aes_gcm_decrypt(&content_encryption_key, ciphertext_bytes, None)?;
+		let recipient_processor = TightBeamKariRecipient::new(P::default(), secret_key);
 
-		// 5. Store session key securely
+		let processor = TightBeamEnvelopedDataProcessor::<P>::new(recipient_processor).with_recipient_index(0);
+		let session_key_bytes = processor.process(&enveloped_data)?;
+
 		self.session_key = Some(Secret::from(session_key_bytes));
 
 		Ok(())
@@ -374,12 +369,14 @@ where
 		}
 
 		// 3. Get algorithm identifiers from the key implementation
-		let digest_alg = self.server_key.digest_algorithm();
-		let signature_alg = self.server_key.signature_algorithm();
+		let digest_alg = self.server_signing_key.digest_algorithm();
+		let signature_alg = self.server_signing_key.signature_algorithm();
 
 		// 4. Build SignedData
-		let transcript = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
-		let signed_data_der = self.server_key.build_cms_signed_data(transcript, &digest_alg, &signature_alg)?;
+		let content = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
+		let signed_data_der = self
+			.server_signing_key
+			.build_cms_signed_data(content, &digest_alg, &signature_alg)?;
 
 		// 5. Add to transcript if computing internally
 		if !self.transcript_buffer.is_empty() {
@@ -456,33 +453,40 @@ where
 // Common Handshake Trait Implementations
 // ============================================================================
 
-impl<P> HandshakeNegotiation for CmsHandshakeServer<P>
+impl<P, K> HandshakeNegotiation for CmsHandshakeServer<P, K>
 where
 	P: CryptoProvider,
+	K: Clone,
 {
 	fn supported_profiles(&self) -> &[SecurityProfileDesc] {
 		&self.supported_profiles
 	}
 }
 
-impl<P> HandshakeFinalization<P> for CmsHandshakeServer<P>
+impl<P, K> HandshakeFinalization<P> for CmsHandshakeServer<P, K>
 where
 	P: CryptoProvider,
+	K: Clone,
 {
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
 
-impl<P> HandshakeAlertHandler for CmsHandshakeServer<P> where P: CryptoProvider {}
+impl<P, K> HandshakeAlertHandler for CmsHandshakeServer<P, K>
+where
+	P: CryptoProvider,
+	K: Clone,
+{
+}
 
 // ============================================================================
 // ServerHandshakeProtocol Implementation
 // ============================================================================
 
-impl<P> ServerHandshakeProtocol for CmsHandshakeServer<P>
+impl<P, K> ServerHandshakeProtocol for CmsHandshakeServer<P, K>
 where
-	P: CryptoProvider + Send + Sync,
+	P: CryptoProvider + Send + Sync + 'static,
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
@@ -490,6 +494,7 @@ where
 	P::Signature: 'static,
 	P::Digest: 'static,
 	P::AeadCipher: Send + Sync + KeyInit + 'static,
+	K: Clone + Into<SecretKey<P::Curve>> + signature::Signer<P::Signature> + ServerHandshakeKey + Send,
 {
 	type Error = HandshakeError;
 
@@ -567,7 +572,8 @@ where
 ///
 /// This is the default curve used in TightBeam and is provided as a
 /// convenient alias for the generic `CmsHandshakeServer`.
-pub type CmsHandshakeServerSecp256k1 = CmsHandshakeServer<DefaultCryptoProvider>;
+pub type CmsHandshakeServerSecp256k1 =
+	CmsHandshakeServer<DefaultCryptoProvider, crate::crypto::sign::ecdsa::Secp256k1SigningKey>;
 
 #[cfg(test)]
 mod tests {

@@ -182,6 +182,22 @@ use std::time::Instant;
 // Server key abstraction for handshake (sign + decrypt)
 // ============================================================================
 
+/// Helper trait for cloning boxed ServerHandshakeKey trait objects.
+#[cfg(feature = "x509")]
+pub trait CloneServerHandshakeKey {
+	fn clone_box(&self) -> Box<dyn ServerHandshakeKey>;
+}
+
+#[cfg(feature = "x509")]
+impl<T> CloneServerHandshakeKey for T
+where
+	T: ServerHandshakeKey + Clone + 'static,
+{
+	fn clone_box(&self) -> Box<dyn ServerHandshakeKey> {
+		Box::new(self.clone())
+	}
+}
+
 /// Server-side key operations for handshake protocols.
 ///
 /// This trait provides curve-agnostic abstractions for cryptographic operations
@@ -192,7 +208,7 @@ use std::time::Instant;
 /// that require the private key are performed within the trait methods, and the
 /// key itself is never exposed.
 #[cfg(feature = "x509")]
-pub trait ServerHandshakeKey: Send + Sync {
+pub trait ServerHandshakeKey: Send + Sync + CloneServerHandshakeKey {
 	/// Sign a 32-byte server challenge for ECIES handshake.
 	///
 	/// Used during the server handshake to sign the transcript hash (derived from
@@ -223,32 +239,9 @@ pub trait ServerHandshakeKey: Send + Sync {
 		aad: Option<&[u8]>,
 	) -> core::result::Result<crate::crypto::secret::Secret<Vec<u8>>, HandshakeError>;
 
-	/// Decrypt a CMS EnvelopedData using KARI (Key Agreement Recipient Info).
-	///
-	/// This performs ECDH with the originator's ephemeral key, derives a KEK,
-	/// and unwraps the encrypted content-encryption key. The curve type is
-	/// determined by the implementation.
-	///
-	/// # Parameters
-	/// - `enveloped_data_der`: DER-encoded CMS EnvelopedData structure
-	/// - `kdf_info`: KDF info string (e.g., `TIGHTBEAM_KARI_KDF_INFO`)
-	/// - `recipient_index`: Index of the recipient in recipient_enc_keys (usually 0)
-	///
-	/// # Returns
-	/// The unwrapped content-encryption key (CEK)
-	#[cfg(feature = "transport-cms")]
-	fn decrypt_kari(
-		&self,
-		enveloped_data_der: &[u8],
-		kdf_info: &[u8],
-		recipient_index: usize,
-	) -> core::result::Result<Vec<u8>, HandshakeError>;
-
-	/// Build a CMS SignedData structure by signing content.
-	///
 	/// This creates a complete CMS SignedData with the server's signature,
-	/// including proper digest and signature algorithm identifiers. The signature
-	/// algorithm is determined by the key type.
+	/// including proper digest and signature algorithm identifiers. The
+	/// signature algorithm is determined by the key type.
 	///
 	/// # Parameters
 	/// - `content`: The data to sign (typically a transcript hash)
@@ -295,6 +288,23 @@ pub trait ServerHandshakeKey: Send + Sync {
 		server_cert: Arc<crate::x509::Certificate>,
 		validators: Option<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 	) -> core::result::Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError>>, HandshakeError>;
+
+	/// Create a CMS server handshake orchestrator.
+	///
+	/// This allows the key implementation to instantiate a CMS server with the appropriate
+	/// concrete key type, working around the limitation that the server needs the actual
+	/// signing key type (not a trait object) to extract the secret key for KARI operations.
+	///
+	/// # Parameters
+	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
+	///
+	/// # Returns
+	/// A boxed CMS server handshake orchestrator implementing ServerHandshakeProtocol
+	#[cfg(feature = "transport-cms")]
+	fn create_cms_server(
+		&self,
+		client_validators: Option<Arc<Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>>,
+	) -> core::result::Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError>>, HandshakeError>;
 }
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
@@ -327,40 +337,6 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 		// Convert Secret<[u8]> to Secret<Vec<u8>>
 		let vec = decrypted.to_insecure().to_vec();
 		Ok(crate::crypto::secret::Secret::new(Box::new(vec)))
-	}
-
-	#[cfg(feature = "transport-cms")]
-	fn decrypt_kari(
-		&self,
-		enveloped_data_der: &[u8],
-		_kdf_info: &[u8],
-		recipient_index: usize,
-	) -> core::result::Result<Vec<u8>, HandshakeError> {
-		use crate::crypto::profiles::DefaultCryptoProvider;
-		use crate::crypto::sign::elliptic_curve::SecretKey;
-		use crate::transport::handshake::processors::enveloped_data::RecipientProcessor;
-		use crate::transport::handshake::processors::kari::TightBeamKariRecipient;
-
-		// 1. Decode the enveloped data
-		let enveloped_data = cms::enveloped_data::EnvelopedData::from_der(enveloped_data_der)
-			.map_err(|e| HandshakeError::DerError(e))?;
-
-		// 2. Extract the KARI recipient info
-		let recipient_info = enveloped_data
-			.recip_infos
-			.0
-			.get(recipient_index)
-			.ok_or(HandshakeError::InvalidRecipientIndex)?;
-
-		// 3. Convert self to SecretKey
-		let secret = SecretKey::from(self.clone());
-
-		// 4. Create processor with default KDF info (TIGHTBEAM_KARI_KDF_INFO)
-		let provider = DefaultCryptoProvider::default();
-		let processor = TightBeamKariRecipient::new(provider, secret);
-
-		// 5. Process KARI to extract CEK
-		processor.process_recipient(recipient_info, recipient_index)
 	}
 
 	#[cfg(feature = "transport-cms")]
@@ -412,6 +388,21 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 		}
 
 		Ok(Box::new(client))
+	}
+
+	#[cfg(feature = "transport-cms")]
+	fn create_cms_server(
+		&self,
+		client_validators: Option<Arc<Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>>,
+	) -> core::result::Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError>>, HandshakeError> {
+		use crate::crypto::profiles::DefaultCryptoProvider;
+
+		let server = crate::transport::handshake::server::CmsHandshakeServer::<DefaultCryptoProvider, Self>::new(
+			self.clone(),
+			client_validators,
+		);
+
+		Ok(Box::new(server))
 	}
 }
 

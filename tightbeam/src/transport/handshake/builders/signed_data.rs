@@ -110,7 +110,7 @@ where
 			version: CmsVersion::V1,
 			sid: self.signer_id.clone(),
 			digest_alg: self.digest_alg.clone(),
-			signed_attrs: None, // TightBeam uses simple signature without authenticated attributes
+			signed_attrs: None,
 			signature_algorithm: self.signature_alg.clone(),
 			signature: OctetString::new(signature_bytes.as_ref())?,
 			unsigned_attrs: None,
@@ -183,19 +183,17 @@ mod tests {
 
 		// 3. Build SignedData
 		let signed_data = builder.build(transcript_hash)?;
-
-		// 4. Verify SignedData structure
 		assert_eq!(signed_data.version, CmsVersion::V1);
 		assert_eq!(signed_data.digest_algorithms.len(), 1);
 		assert_eq!(signed_data.signer_infos.0.len(), 1);
 		assert_eq!(signed_data.encap_content_info.econtent_type, crate::asn1::DATA_OID);
 		assert!(signed_data.encap_content_info.econtent.is_some());
 
-		// 5. Verify signer info
+		// 4. Verify signer info
 		let signer_info = &signed_data.signer_infos.0.as_ref()[0];
 		assert_eq!(signer_info.version, CmsVersion::V1);
 
-		// Verify signer identifier is SubjectKeyIdentifier (expected for our builder)
+		// 5. Verify signer identifier is SubjectKeyIdentifier
 		match signer_info.sid {
 			SignerIdentifier::SubjectKeyIdentifier(_) => {}
 			_ => unreachable!("SignedData builder should always create SubjectKeyIdentifier"),

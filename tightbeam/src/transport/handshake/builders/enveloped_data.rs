@@ -51,16 +51,6 @@ where
 	///
 	/// The KARI builder should be fully configured before passing it here,
 	/// including any custom KDF info via `with_kdf_info()` for interoperability.
-	///
-	/// # Example
-	/// ```ignore
-	/// let kari = TightBeamKariBuilder::new()
-	///     .with_kdf_info(b"custom-info")  // Configure KDF before passing
-	///     .with_sender_priv(sender_key)
-	///     .with_recipient_pub(recipient_pub);
-	///
-	/// let builder = TightBeamEnvelopedDataBuilder::new(kari);
-	/// ```
 	pub fn new(kari_builder: TightBeamKariBuilder<P>) -> Self {
 		Self { kari_builder: Some(kari_builder), unprotected_attrs: Vec::new() }
 	}
@@ -91,7 +81,7 @@ where
 
 	fn build_kari_with_cek(&mut self, cek: &[u8]) -> Result<cms::enveloped_data::RecipientInfo, HandshakeError> {
 		let mut kari_builder = self.kari_builder.take().ok_or(HandshakeError::KariBuilderConsumed)?;
-		kari_builder.build(cek).map_err(HandshakeError::CmsBuilderError)
+		Ok(kari_builder.build(cek)?)
 	}
 
 	fn build_unprotected_attributes(&mut self) -> Result<Option<Attributes>, HandshakeError> {

@@ -2,13 +2,12 @@
 //!
 //! Processes received KARI structures to extract the content-encryption key (CEK).
 
-use crate::cms::enveloped_data::KeyAgreeRecipientInfo;
+use crate::cms::enveloped_data::{KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, RecipientInfo};
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
-// Delegate unwrap operations to centralized `kari_unwrap` logic.
+use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
-
 use crate::transport::handshake::kari::kari_unwrap;
 
 /// Recipient-side processor for `KeyAgreeRecipientInfo`.
@@ -22,7 +21,7 @@ use crate::transport::handshake::kari::kari_unwrap;
 /// Generic over `P: CryptoProvider` which defines the complete cryptographic suite.
 pub struct TightBeamKariRecipient<P>
 where
-	P: crate::crypto::profiles::CryptoProvider,
+	P: CryptoProvider,
 {
 	/// Recipient's private key for ECDH
 	recipient_priv: SecretKey<P::Curve>,
@@ -34,7 +33,7 @@ where
 
 impl<P> TightBeamKariRecipient<P>
 where
-	P: crate::crypto::profiles::CryptoProvider,
+	P: CryptoProvider,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	FieldBytesSize<P::Curve>: ModulusSize,
 {
@@ -110,16 +109,11 @@ where
 		&self,
 		kari: &KeyAgreeRecipientInfo,
 	) -> Result<PublicKey<P::Curve>, HandshakeError> {
-		use cms::enveloped_data::OriginatorIdentifierOrKey;
-
 		match &kari.originator {
 			OriginatorIdentifierOrKey::OriginatorKey(orig_key) => {
 				// Extract raw public key bytes from BitString
 				let pub_key_bytes = orig_key.public_key.raw_bytes();
-
-				// Parse as curve-specific public key
-				PublicKey::<P::Curve>::from_sec1_bytes(pub_key_bytes)
-					.map_err(|_| HandshakeError::InvalidOriginatorPublicKey)
+				Ok(PublicKey::<P::Curve>::from_sec1_bytes(pub_key_bytes)?)
 			}
 			_ => Err(HandshakeError::UnsupportedOriginatorIdentifier),
 		}
@@ -127,27 +121,23 @@ where
 }
 
 /// Default implementation for DefaultCryptoProvider.
-impl TightBeamKariRecipient<crate::crypto::profiles::DefaultCryptoProvider> {
+impl TightBeamKariRecipient<DefaultCryptoProvider> {
 	/// Create a recipient processor with default TightBeam settings.
 	pub fn with_defaults(recipient_priv: k256::SecretKey) -> Self {
-		Self::new(crate::crypto::profiles::DefaultCryptoProvider::default(), recipient_priv)
+		Self::new(DefaultCryptoProvider::default(), recipient_priv)
 	}
 }
 
 /// Implement RecipientProcessor trait for TightBeamKariRecipient
 impl<P> super::enveloped_data::RecipientProcessor for TightBeamKariRecipient<P>
 where
-	P: crate::crypto::profiles::CryptoProvider,
+	P: CryptoProvider,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	FieldBytesSize<P::Curve>: ModulusSize,
 {
-	fn process_recipient(
-		&self,
-		info: &cms::enveloped_data::RecipientInfo,
-		recipient_index: usize,
-	) -> Result<Vec<u8>, HandshakeError> {
+	fn process_recipient(&self, info: &RecipientInfo, recipient_index: usize) -> Result<Vec<u8>, HandshakeError> {
 		match info {
-			cms::enveloped_data::RecipientInfo::Kari(kari) => self.process_kari(kari, recipient_index),
+			RecipientInfo::Kari(kari) => self.process_kari(kari, recipient_index),
 			_ => Err(HandshakeError::UnsupportedOriginatorIdentifier),
 		}
 	}

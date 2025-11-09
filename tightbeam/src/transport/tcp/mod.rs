@@ -539,23 +539,16 @@ macro_rules! impl_tcp_common {
 							)
 						}
 
-						#[cfg(all(
-							feature = "aead",
-							feature = "signature"
-						))]
-						HandshakeProtocolKind::Cms => {
-							// Create default security profile for negotiation
-							let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
-							let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
-
-							Box::new(
-								$crate::transport::handshake::server::CmsHandshakeServer::<$crate::crypto::profiles::DefaultCryptoProvider>::new(
-									Arc::clone(&signatory),
-									self.client_validators.as_ref().map(Arc::clone)
-								)
-								.with_supported_profiles(vec![profile_desc])
-							)
-						}
+					#[cfg(all(
+						feature = "aead",
+						feature = "signature"
+					))]
+					HandshakeProtocolKind::Cms => {
+						// Use factory method to create CMS server with concrete key type
+						signatory.create_cms_server(
+							self.client_validators.as_ref().map(Arc::clone)
+						)?
+					}
 					});
 				}
 

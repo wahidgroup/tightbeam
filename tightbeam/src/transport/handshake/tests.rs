@@ -387,7 +387,6 @@ impl TestCmsServerBuilder {
 
 	/// Build the CMS handshake server.
 	pub fn build(self) -> (CmsHandshakeServerSecp256k1, PublicKey<k256::Secp256k1>) {
-		use std::sync::Arc;
 		use CmsHandshakeServerSecp256k1;
 
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
@@ -395,7 +394,7 @@ impl TestCmsServerBuilder {
 
 		// Apply transcript hash if explicitly set
 		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
-		let mut server = CmsHandshakeServerSecp256k1::new(Arc::new(test_key), None);
+		let mut server = CmsHandshakeServerSecp256k1::new(test_key, None);
 		if let Some(hash) = self.transcript_hash {
 			server = server.with_transcript_hash(hash);
 		}
