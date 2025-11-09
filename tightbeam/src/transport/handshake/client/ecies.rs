@@ -48,7 +48,7 @@ where
 	security_offer: Option<crate::crypto::negotiation::SecurityOffer>,
 	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
-	client_certificate: Option<Certificate>,
+	client_certificate: Option<Arc<Certificate>>,
 	client_signing_key: Option<Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
 	_phantom_provider: PhantomData<P>,
 	_phantom_message: PhantomData<M>,
@@ -116,7 +116,7 @@ where
 		certificate: Certificate,
 		signing_key: Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
 	) -> Self {
-		self.client_certificate = Some(certificate);
+		self.client_certificate = Some(Arc::new(certificate));
 		self.client_signing_key = Some(signing_key);
 		self
 	}
@@ -319,26 +319,21 @@ where
 
 		if server_handshake.client_cert_required {
 			// Server requires mutual auth - ensure we have client identity
-			let cert = self
-				.client_certificate
-				.as_ref()
-				.ok_or(HandshakeError::MutualAuthRequired)?
-				.clone();
+			let cert = self.client_certificate.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 			let signing_key = self.client_signing_key.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 
 			let signature_bytes = signing_key.sign_server_challenge(&transcript_digest)?;
-			Ok((Some(cert), Some(OctetString::new(signature_bytes)?)))
+			Ok((Some((**cert).clone()), Some(OctetString::new(signature_bytes)?)))
 		} else if let Some(cert) = &self.client_certificate {
 			// Client wants mutual auth but server doesn't require it - include anyway
 			let signing_key = self.client_signing_key.as_ref().ok_or(HandshakeError::InvalidState)?;
 			let signature_bytes = signing_key.sign_server_challenge(&transcript_digest)?;
-			Ok((Some(cert.clone()), Some(OctetString::new(signature_bytes)?)))
+			Ok((Some((**cert).clone()), Some(OctetString::new(signature_bytes)?)))
 		} else {
 			// No mutual auth
 			Ok((None, None))
 		}
 	}
-
 	/// Complete the handshake and derive the final session key.
 	///
 	/// # Returns
@@ -667,24 +662,27 @@ mod tests {
 	fn test_client_profile_validation() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
 		use crate::crypto::profiles::SecurityProfileDesc;
-		use crate::der::asn1::ObjectIdentifier;
 		use crate::der::Encode;
 		use crate::transport::handshake::ServerHandshake;
 
+		use crate::asn1::{
+			AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, HASH_SHA3_384_OID, HASH_SHA3_512_OID,
+			SIGNER_ECDSA_WITH_SHA3_512_OID,
+		};
 		let mk_profile = |id: u8| SecurityProfileDesc {
 			digest: match id {
-				1 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
-				2 => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.9"), // SHA3-384
-				_ => ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.10"), // SHA3-512
+				1 => HASH_SHA3_256_OID,
+				2 => HASH_SHA3_384_OID,
+				_ => HASH_SHA3_512_OID,
 			},
 			#[cfg(feature = "aead")]
-			aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")),
+			aead: Some(AES_256_GCM_OID),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
-			signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")),
+			signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
 			key_wrap: if id % 2 == 0 {
-				Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"))
+				Some(AES_256_WRAP_OID)
 			} else {
 				None
 			},

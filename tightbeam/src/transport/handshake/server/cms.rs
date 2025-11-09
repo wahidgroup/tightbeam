@@ -58,8 +58,8 @@ where
 {
 	state: ServerStateMachine,
 	server_key: Arc<dyn ServerHandshakeKey>,
-	client_cert: Option<Certificate>,
-	validated_client_cert: Option<Certificate>,
+	client_cert: Option<Arc<Certificate>>,
+	validated_client_cert: Option<Arc<Certificate>>,
 	transcript_hash: Option<[u8; 32]>,
 	session_key: Option<Secret<Vec<u8>>>,
 	supported_profiles: Vec<SecurityProfileDesc>,
@@ -129,7 +129,7 @@ where
 	pub fn set_client_certificate(&mut self, cert: Certificate) -> Result<(), HandshakeError> {
 		// Check for identity immutability - reject if cert changes on re-handshake
 		if let Some(existing_cert) = &self.validated_client_cert {
-			if existing_cert != &cert {
+			if existing_cert.as_ref() != &cert {
 				return Err(HandshakeError::PeerIdentityMismatch);
 			}
 		}
@@ -142,10 +142,11 @@ where
 		}
 
 		// Store the cert (used for extracting public key later)
-		self.client_cert = Some(cert.clone());
+		let cert_arc = Arc::new(cert);
+		self.client_cert = Some(Arc::clone(&cert_arc));
 
 		// Store as validated cert (identity is now locked)
-		self.validated_client_cert = Some(cert);
+		self.validated_client_cert = Some(cert_arc);
 
 		Ok(())
 	}
@@ -211,7 +212,10 @@ where
 
 	/// Get the client certificate, returning an error if not set.
 	fn get_client_certificate(&self) -> Result<&Certificate, HandshakeError> {
-		self.client_cert.as_ref().ok_or(HandshakeError::MissingClientCertificate)
+		self.client_cert
+			.as_ref()
+			.map(|arc| arc.as_ref())
+			.ok_or(HandshakeError::MissingClientCertificate)
 	}
 
 	/// Extract the client's verifying key from certificate.
@@ -506,7 +510,7 @@ where
 
 	#[cfg(feature = "x509")]
 	fn peer_certificate(&self) -> Option<&Certificate> {
-		self.validated_client_cert.as_ref()
+		self.validated_client_cert.as_ref().map(|arc| arc.as_ref())
 	}
 
 	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {

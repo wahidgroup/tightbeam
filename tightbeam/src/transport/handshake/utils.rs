@@ -92,10 +92,8 @@ pub fn aes_gcm_decrypt(key: &[u8], ciphertext: &[u8], aad: Option<&[u8]>) -> Res
 ///
 /// OID: 2.16.840.1.101.3.4.1.46 (aes256-GCM)
 pub fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
-	AlgorithmIdentifierOwned {
-		oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46"),
-		parameters: None,
-	}
+	use crate::asn1::AES_256_GCM_OID;
+	AlgorithmIdentifierOwned { oid: AES_256_GCM_OID, parameters: None }
 }
 
 #[cfg(test)]

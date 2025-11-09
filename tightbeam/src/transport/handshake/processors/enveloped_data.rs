@@ -58,8 +58,8 @@ impl ContentDecryptor for AesGcmContentDecryptor {
 		algorithm_oid: &der::asn1::ObjectIdentifier,
 	) -> Result<Vec<u8>, HandshakeError> {
 		// Verify it's AES-256-GCM
-		let expected_oid = der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46");
-		if algorithm_oid != &expected_oid {
+		use crate::asn1::AES_256_GCM_OID;
+		if algorithm_oid != &AES_256_GCM_OID {
 			return Err(HandshakeError::MissingContentEncryptionAlgorithm);
 		}
 

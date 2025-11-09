@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
+use crate::crypto::x509::attr::Attribute;
 use crate::der::asn1::{ObjectIdentifier, OctetString, UintRef};
 use crate::der::{asn1::Any, Sequence};
 
@@ -51,6 +52,13 @@ impl HandshakeAttribute {
 			return Err(HandshakeError::InvalidAttributeArity);
 		}
 		Ok(&self.attr_values[0])
+	}
+}
+
+/// Convert X.509 Attribute to HandshakeAttribute.
+impl From<&Attribute> for HandshakeAttribute {
+	fn from(attr: &Attribute) -> Self {
+		HandshakeAttribute { attr_type: attr.oid.clone(), attr_values: attr.values.clone().into() }
 	}
 }
 

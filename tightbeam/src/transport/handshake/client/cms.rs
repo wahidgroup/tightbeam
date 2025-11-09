@@ -49,8 +49,8 @@ where
 {
 	state: ClientStateMachine,
 	client_key: P::SigningKey,
-	client_certificate: Option<Certificate>,
-	server_cert: Certificate,
+	client_certificate: Option<Arc<Certificate>>,
+	server_cert: Arc<Certificate>,
 	transcript_hash: Option<[u8; 32]>,
 	session_key: Option<Secret<Vec<u8>>>,
 	security_offer: Option<SecurityOffer>,
@@ -81,7 +81,12 @@ where
 	/// - `client_key`: The client's signing key for authentication
 	/// - `server_cert`: The server's certificate (for key agreement)
 	/// - `transcript_hash`: The handshake transcript hash (32 bytes)
-	pub fn new(provider: P, client_key: P::SigningKey, server_cert: Certificate, transcript_hash: [u8; 32]) -> Self {
+	pub fn new(
+		provider: P,
+		client_key: P::SigningKey,
+		server_cert: Arc<Certificate>,
+		transcript_hash: [u8; 32],
+	) -> Self {
 		Self {
 			state: ClientStateMachine::new(),
 			client_key,
@@ -105,7 +110,7 @@ where
 
 	/// Set client certificate for mutual authentication.
 	pub fn with_client_certificate(mut self, certificate: Certificate) -> Self {
-		self.client_certificate = Some(certificate);
+		self.client_certificate = Some(Arc::new(certificate));
 		self
 	}
 

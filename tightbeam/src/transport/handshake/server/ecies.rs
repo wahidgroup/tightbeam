@@ -28,6 +28,7 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::Verifier;
+use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
@@ -53,16 +54,16 @@ where
 {
 	state: ServerStateMachine,
 	server_key: Arc<dyn ServerHandshakeKey>,
-	server_cert: Certificate,
+	server_cert: Arc<Certificate>,
 	client_random: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
 	base_session_key: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: Option<Vec<u8>>,
-	supported_profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>,
-	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
-	client_validators: Option<Arc<Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>>,
-	validated_client_cert: Option<Certificate>,
+	supported_profiles: Vec<SecurityProfileDesc>,
+	selected_profile: Option<SecurityProfileDesc>,
+	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	validated_client_cert: Option<Arc<Certificate>>,
 	_phantom: PhantomData<P>,
 	invariants: HandshakeInvariant,
 }
@@ -81,9 +82,9 @@ where
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
 		server_key: Arc<dyn ServerHandshakeKey>,
-		server_cert: Certificate,
+		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<Vec<u8>>,
-		client_validators: Option<Arc<Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>>,
+		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
 			state: ServerStateMachine::new(),
@@ -312,7 +313,7 @@ where
 		security_accept: Option<crate::crypto::negotiation::SecurityAccept>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		let server_handshake = ServerHandshake {
-			certificate: self.server_cert.clone(),
+			certificate: (*self.server_cert).clone(),
 			server_random: OctetString::new(server_random)?,
 			signature: OctetString::new(signature_bytes)?,
 			security_accept,
@@ -376,7 +377,7 @@ where
 
 			// Check for identity immutability
 			if let Some(existing_cert) = &self.validated_client_cert {
-				if existing_cert != client_cert {
+				if existing_cert.as_ref() != client_cert {
 					return Err(HandshakeError::PeerIdentityMismatch);
 				}
 			}
@@ -417,7 +418,7 @@ where
 				.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
 
 			// Store validated cert (identity is now locked)
-			self.validated_client_cert = Some(client_cert.clone());
+			self.validated_client_cert = Some(Arc::new(client_cert.clone()));
 		}
 
 		Ok(())
@@ -543,7 +544,7 @@ where
 
 	#[cfg(feature = "x509")]
 	fn peer_certificate(&self) -> Option<&Certificate> {
-		self.validated_client_cert.as_ref()
+		self.validated_client_cert.as_ref().map(|arc| arc.as_ref())
 	}
 
 	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {

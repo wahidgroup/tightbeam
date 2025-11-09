@@ -162,7 +162,6 @@ mod tests {
 		use crate::cms::builder::RecipientInfoBuilder;
 		use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, RecipientInfo, UserKeyingMaterial};
 		use crate::crypto::sign::ecdsa::k256::SecretKey as K256SecretKey;
-		use crate::der::asn1::ObjectIdentifier;
 		use crate::random::{generate_nonce, OsRng};
 		use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 		use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
@@ -192,10 +191,7 @@ mod tests {
 			});
 
 			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
+			let key_enc_alg = AlgorithmIdentifierOwned { oid: crate::asn1::AES_256_WRAP_OID, parameters: None };
 
 			// Original CEK
 			let original_cek = [0x42u8; 32];
@@ -249,10 +245,7 @@ mod tests {
 			});
 
 			// Key encryption algorithm
-			let key_enc_alg = AlgorithmIdentifierOwned {
-				oid: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45"),
-				parameters: None,
-			};
+			let key_enc_alg = AlgorithmIdentifierOwned { oid: crate::asn1::AES_256_WRAP_OID, parameters: None };
 
 			// Original CEK
 			let original_cek = [0x42u8; 32];

@@ -497,21 +497,19 @@ macro_rules! impl_tcp_common {
 					self.server_handshake = Some(match self.handshake_protocol_kind {
 					HandshakeProtocolKind::Ecies => {
 						// Create default security profile for negotiation
-						let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
-						let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
+					let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
+					let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
 
-						Box::new(
-							$crate::transport::handshake::server::EciesHandshakeServer::<$crate::crypto::profiles::DefaultCryptoProvider>::new(
-								std::sync::Arc::clone(&signatory),
-								cert,
-								aad,
-								self.client_validators.as_ref().map(std::sync::Arc::clone)
-							)
-							.with_supported_profiles(vec![profile_desc])
+					Box::new(
+						$crate::transport::handshake::server::EciesHandshakeServer::<$crate::crypto::profiles::DefaultCryptoProvider>::new(
+							std::sync::Arc::clone(&signatory),
+							std::sync::Arc::new(cert),
+							aad,
+							self.client_validators.as_ref().map(std::sync::Arc::clone)
 						)
-						}
-
-						#[cfg(all(
+						.with_supported_profiles(vec![profile_desc])
+					)
+					}						#[cfg(all(
 							feature = "builder",
 							feature = "aead",
 							feature = "signature"

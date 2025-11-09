@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::asn1::{
 	OctetString, AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA256_OID,
-	SIGNER_ECDSA_WITH_SHA3_512_OID,
+	SIGNER_ECDSA_WITH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_512_OID,
 };
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::crypto::negotiation::SecurityAccept;
@@ -33,7 +33,6 @@ use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate};
-use crate::SIGNER_ECDSA_WITH_SHA3_256_OID;
 
 #[cfg(feature = "transport-cms")]
 use crate::crypto::sign::elliptic_curve::PublicKey;
@@ -308,12 +307,10 @@ impl TestEciesServerBuilder {
 
 		let mut server = EciesHandshakeServer::new(
 			Arc::new(test_cert_data.signing_key),
-			test_cert_data.certificate,
+			Arc::new(test_cert_data.certificate),
 			self.aad_domain,
 			None, // No client validators in tests by default
-		);
-
-		// Add default test profile to ensure server always has supported profiles
+		); // Add default test profile to ensure server always has supported profiles
 		server = server.with_supported_profiles(vec![create_default_test_profile()]);
 
 		server
@@ -458,7 +455,7 @@ impl TestCmsClientBuilder {
 		let mut client = CmsHandshakeClientSecp256k1::new(
 			DefaultCryptoProvider::default(),
 			client_key,
-			server_cert,
+			Arc::new(server_cert),
 			transcript_hash,
 		);
 
