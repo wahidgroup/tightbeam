@@ -58,6 +58,7 @@ words:
   - smime
   - spki
   - tightbeam
+  - typenum
   - unwrapper
   - Wrkr
   - zeekstd

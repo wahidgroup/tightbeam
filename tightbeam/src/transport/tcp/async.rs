@@ -7,7 +7,7 @@ use crate::transport::{AsyncListenerTrait, MessageIO, Pingable, Protocol, Transp
 use crate::Frame;
 
 #[cfg(feature = "x509")]
-use crate::crypto::aead::Aes256Gcm;
+use crate::crypto::aead::RuntimeAead;
 #[cfg(feature = "x509")]
 use crate::crypto::secret::Secret;
 #[cfg(feature = "x509")]
@@ -194,8 +194,8 @@ impl Protocol for TokioListener {
 
 #[cfg(feature = "x509")]
 impl EncryptedProtocol for TokioListener {
-	type Encryptor = crate::crypto::aead::Aes256Gcm;
-	type Decryptor = crate::crypto::aead::Aes256Gcm;
+	type Encryptor = RuntimeAead;
+	type Decryptor = RuntimeAead;
 
 	async fn bind_with(
 		addr: Self::Address,
@@ -224,14 +224,11 @@ impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
-	type Encryptor = crate::crypto::aead::Aes256Gcm;
-	type Decryptor = crate::crypto::aead::Aes256Gcm;
-
-	fn encryptor(&self) -> TransportResult<&Self::Encryptor> {
+	fn encryptor(&self) -> TransportResult<&RuntimeAead> {
 		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
 	}
 
-	fn decryptor(&self) -> TransportResult<&Self::Decryptor> {
+	fn decryptor(&self) -> TransportResult<&RuntimeAead> {
 		self.symmetric_key.as_ref().ok_or(TransportError::Forbidden)
 	}
 
@@ -247,7 +244,7 @@ where
 		self.server_certificate.as_ref()
 	}
 
-	fn set_symmetric_key(&mut self, key: Self::Encryptor) {
+	fn set_symmetric_key(&mut self, key: RuntimeAead) {
 		// Replace existing key, ensuring the old key material is dropped immediately
 		let _ = self.symmetric_key.take();
 		self.symmetric_key = Some(key);
@@ -302,6 +299,8 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
+	client_certificate: Option<Certificate>,
+	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
 	peer_certificate: Option<Certificate>,
@@ -318,7 +317,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
-	symmetric_key: Option<Aes256Gcm>,
+	symmetric_key: Option<RuntimeAead>,
 }
 
 // (single Drop impl above covers both feature variants)
@@ -332,6 +331,8 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
+	client_certificate: Option<Certificate>,
+	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
 	peer_certificate: Option<Certificate>,
@@ -348,7 +349,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
-	symmetric_key: Option<Aes256Gcm>, // TODO Decouple (use aead)
+	symmetric_key: Option<RuntimeAead>,
 	#[cfg(feature = "x509")]
 	server_handshake:
 		Option<Box<dyn ServerHandshakeProtocol<SessionKey = Secret<Vec<u8>>, Error = HandshakeError> + Send>>,
@@ -556,29 +557,22 @@ where
 			let decoded_envelope = match wire_envelope {
 				WireEnvelope::Cleartext(envelope) => {
 					if has_certificate {
-						// Server with certificate - check for handshakes and enforce encryption after handshake
+						// Server with certificate - enforce encryption based on handshake state
 						match envelope {
-							// Handshake messages - let perform_server_handshake handle them
+							// Handshake messages - always allowed as cleartext
 							TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-								// Re-encode as TransportEnvelope bytes
 								let handshake_bytes = envelope.to_der()?;
 								self.perform_server_handshake(&handshake_bytes).await?;
-
 								// After processing, loop back to read next message
 								continue;
 							}
-							// Regular messages - check if encryption is required
+							// Application messages - use circuit breaker pattern
 							TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
-								// Only enforce encryption AFTER handshake is complete
-								if self.handshake_state() == TcpHandshakeState::Complete {
-									// Circuit breaker: reset state on protocol violation
-									self.set_handshake_state(TcpHandshakeState::None);
-									// Drop symmetric key to force re-handshake and zeroize underlying material
-									self.symmetric_key = None;
-									return Err(TransportError::MissingEncryption);
-								}
-								// Before handshake or no certificate, allow cleartext requests
-								envelope
+								// Circuit breaker: cleartext application messages not allowed when server has certificate
+								// Reset handshake state and reject
+								self.set_handshake_state(TcpHandshakeState::None);
+								self.symmetric_key = None;
+								return Err(TransportError::MissingEncryption);
 							}
 						}
 					} else {
@@ -587,11 +581,20 @@ where
 					}
 				}
 				WireEnvelope::Encrypted(encrypted_info) => {
-					// Decrypt the envelope (requires certificate/handshake)
+					// Encrypted message - verify handshake is complete
+					if self.handshake_state() != TcpHandshakeState::Complete {
+						// Circuit breaker: encrypted message before handshake complete
+						self.set_handshake_state(TcpHandshakeState::None);
+						self.symmetric_key = None;
+						return Err(TransportError::Forbidden);
+					}
+
+					// Decrypt the envelope
 					let decrypted_bytes = match self.decryptor()?.decrypt_content(&encrypted_info) {
 						Ok(bytes) => bytes,
 						Err(_) => {
-							// Drop symmetric key on decrypt failure
+							// Circuit breaker: decryption failure, reset state
+							self.set_handshake_state(TcpHandshakeState::None);
 							self.symmetric_key = None;
 							return Err(TransportError::Forbidden);
 						}
@@ -630,7 +633,6 @@ where
 		status: crate::policy::TransitStatus,
 		message: Option<crate::Frame>,
 	) -> TransportResult<()> {
-		use crate::crypto::aead::{Aes256GcmOid, Encryptor};
 		use crate::der::Encode;
 		use crate::transport::{ResponsePackage, TransportEnvelope, WireEnvelope};
 
@@ -648,8 +650,7 @@ where
 				}
 			}
 			let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
-			let encrypted =
-				<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, nonce, None)?;
+			let encrypted = self.encryptor()?.encrypt_content(&envelope_bytes, nonce, None)?;
 			WireEnvelope::Encrypted(encrypted)
 		} else {
 			// Use cleartext before handshake or when no certificate
@@ -691,7 +692,6 @@ where
 	///
 	/// # Handshake Flow (when x509 enabled)
 	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-		use crate::crypto::aead::{Aes256GcmOid, Encryptor};
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
 		use crate::transport::handshake::TcpHandshakeState;
@@ -709,12 +709,20 @@ where
 			}
 
 			// Check if handshake is needed before sending
-			if self.server_certificate().is_some() && self.handshake_state() == TcpHandshakeState::None {
+			// Initiate handshake when:
+			// - State is None (no handshake attempted yet) AND
+			// - We have server_certificate (expecting encrypted connection) OR
+			// - We have x509_gate validators (expecting to validate server cert)
+			#[cfg(feature = "x509")]
+			let should_handshake = (self.server_certificate().is_some() || self.client_validators.is_some())
+				&& self.handshake_state() == TcpHandshakeState::None;
+			#[cfg(not(feature = "x509"))]
+			let should_handshake = false;
+
+			if should_handshake {
 				// Perform client-side handshake
 				self.perform_client_handshake().await?;
-			}
-
-			// Wrap in envelope and send
+			} // Wrap in envelope and send
 			let envelope = TransportEnvelope::from(current_message.clone());
 
 			// Check if encryption should be used
@@ -728,8 +736,7 @@ where
 				}
 
 				let nonce = crate::random::generate_nonce::<12>(None)?; // AES-GCM nonce
-				let encrypted =
-					<_ as Encryptor<Aes256GcmOid>>::encrypt_content(self.encryptor()?, &envelope_bytes, nonce, None)?;
+				let encrypted = self.encryptor()?.encrypt_content(&envelope_bytes, nonce, None)?;
 				WireEnvelope::Encrypted(encrypted)
 			} else {
 				// Use cleartext before handshake or when no certificate

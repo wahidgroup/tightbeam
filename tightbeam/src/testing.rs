@@ -206,6 +206,36 @@ pub fn create_test_hash_info() -> crate::DigestInfo {
 	}
 }
 
+/// Create a certificate and key pair that expires soon (within 24 hours).
+/// Returns (certificate, signing_key).
+///
+/// Note: This certificate was generated on 2025-11-09 and expires 2025-11-10.
+/// Tests using this will fail after the expiration date.
+#[cfg(all(feature = "x509", feature = "secp256k1", feature = "signature"))]
+pub fn create_expiring_test_certificate(
+) -> crate::error::Result<(crate::x509::Certificate, crate::crypto::sign::ecdsa::Secp256k1SigningKey)> {
+	// Certificate that expires on 2025-11-10 06:35:40 UTC
+	let cert = crate::pem! {"
+		-----BEGIN CERTIFICATE-----
+		MIIBiTCCAS+gAwIBAgIBATALBglghkgBZQMEAwowLTErMCkGA1UEAwwiRXhwaXJp
+		bmcgVG9tb3Jyb3cgVGVzdCBDZXJ0aWZpY2F0ZTAeFw0yNTExMDkwNjM1NDBaFw0y
+		NTExMTAwNjM1NDBaMC0xKzApBgNVBAMMIkV4cGlyaW5nIFRvbW9ycm93IFRlc3Qg
+		Q2VydGlmaWNhdGUwVjAQBgcqhkjOPQIBBgUrgQQACgNCAAQbhMVWexJkQJldPtWq
+		ugVl1x4YNGBIGf+cF/Xp1d0Hj3C+r49Yi1QVB/7WpkLFq0Lf34Egp/Y53lEi1Hpp
+		qOjRo0IwQDAdBgNVHQ4EFgQUQ65suXrNrzVLgobdsptJLJXpWHAwDwYDVR0TAQH/
+		BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwCwYJYIZIAWUDBAMKA0cAMEQCIA7h0vvv
+		anyhANdtbmk2etj57E5fh1lI3Fg2bePzYq0kAiAL9r2v4pwP8s1uec4FT7HAUYf6
+		T4zOUKsmsdnnAwTztg==
+		-----END CERTIFICATE-----
+	"}?;
+
+	// Corresponding private key (fixed test key)
+	let key_bytes: [u8; 32] = [0x01; 32];
+	let signing_key = crate::crypto::sign::ecdsa::Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
+
+	Ok((cert, signing_key))
+}
+
 pub fn create_test_encryption_info() -> crate::EncryptedContentInfo {
 	crate::EncryptedContentInfo {
 		content_type: crate::asn1::COMPRESSION_CONTENT_OID,

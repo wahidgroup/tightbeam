@@ -19,7 +19,6 @@ macro_rules! pem {
 		use $crate::der::DecodePem;
 		let cleaned_pem = $pem.lines().map(|line| line.trim()).collect::<Vec<_>>().join("\n");
 		$crate::crypto::x509::Certificate::from_pem(cleaned_pem.as_bytes())
-			.map_err(|e| format!("Failed to parse X.509 certificate: {}", e))
 	}};
 }
 

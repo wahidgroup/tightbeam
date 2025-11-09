@@ -391,6 +391,11 @@ where
 	fn is_complete(&self) -> bool {
 		self.is_complete()
 	}
+
+	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+		// CMS doesn't support profile negotiation yet
+		None
+	}
 }
 
 /// Type alias for CMS client using secp256k1 curve.

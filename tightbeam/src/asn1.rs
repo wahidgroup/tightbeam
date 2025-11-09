@@ -241,6 +241,10 @@ pub mod transport {
 	pub const HANDSHAKE_SECURITY_OFFER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.11");
 	pub const HANDSHAKE_SECURITY_ACCEPT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.12");
 
+	// Mutual authentication attributes (for ClientKeyExchange)
+	pub const CLIENT_CERTIFICATE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.13");
+	pub const CLIENT_SIGNATURE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.14");
+
 	/// Composite profile OID (ECIES(secp256k1) + HKDF(SHA3-256) + AES-256-GCM)
 	pub const HANDSHAKE_PROFILE_ECIES_GCM_OID: ObjectIdentifier =
 		ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.100");

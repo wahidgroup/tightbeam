@@ -21,6 +21,25 @@ use crate::transport::{tcp::sync::TcpTransport, Mycelial};
 /// therefore we use a much tighter cap than general envelopes to reduce DoS risk.
 pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
 
+/// Composite validator that runs multiple validators in sequence.
+#[cfg(all(feature = "x509", feature = "std"))]
+struct CompositeValidator {
+	validators: std::sync::Arc<Vec<std::sync::Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>,
+}
+
+#[cfg(all(feature = "x509", feature = "std"))]
+impl crate::crypto::x509::policy::CertificateValidation for CompositeValidator {
+	fn evaluate(
+		&self,
+		cert: &crate::x509::Certificate,
+	) -> core::result::Result<(), crate::crypto::x509::error::CertificateValidationError> {
+		for validator in self.validators.iter() {
+			validator.evaluate(cert)?;
+		}
+		Ok(())
+	}
+}
+
 /// Abstract TCP listener trait for different networking backends.
 pub trait TcpListenerTrait: Protocol + Send {
 	#[cfg(feature = "std")]
@@ -170,9 +189,9 @@ macro_rules! impl_tcp_common {
 					stream,
 					handler: None,
 					#[cfg(feature = "x509")]
-					enforce_encryption: false,
-					#[cfg(feature = "x509")]
 					server_certificate: None,
+					#[cfg(feature = "x509")]
+					client_certificate: None,
 					#[cfg(feature = "x509")]
 					client_validators: None,
 					#[cfg(feature = "x509")]
@@ -215,6 +234,8 @@ macro_rules! impl_tcp_common {
 					handler: None,
 					#[cfg(feature = "x509")]
 					server_certificate: None,
+					#[cfg(feature = "x509")]
+					client_certificate: None,
 					#[cfg(feature = "x509")]
 					client_validators: None,
 					#[cfg(feature = "x509")]
@@ -270,6 +291,17 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
+			/// Set the client's identity (certificate and signing key) for mutual authentication
+			pub fn with_client_identity(
+				mut self,
+				cert: $crate::x509::Certificate,
+				key: std::sync::Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
+			) -> Self {
+				self.client_certificate = Some(cert);
+				self.signatory = Some(key);
+				self
+			}
+
 			/// Get the peer certificate from a completed mutual authentication handshake.
 			/// Returns None if mutual auth was not performed or handshake not complete.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
@@ -301,13 +333,23 @@ macro_rules! impl_tcp_common {
 
 				// Create appropriate handshake orchestrator based on protocol kind
 				let mut orchestrator: Box<dyn ClientHandshakeProtocol<SessionKey = $crate::crypto::secret::Secret<Vec<u8>>, Error = $crate::transport::handshake::HandshakeError>> = match self.handshake_protocol_kind {
-					HandshakeProtocolKind::Ecies => {
-						let aad = self.aad_domain_tag.clone();
-						Box::new(
-							$crate::transport::handshake::client::EciesHandshakeClientSecp256k1::new(
-								aad,
-							)
-						)
+				HandshakeProtocolKind::Ecies => {
+					let aad = self.aad_domain_tag.clone();
+					let mut client = $crate::transport::handshake::client::EciesHandshakeClientSecp256k1::new(aad);
+
+					// Set client identity if available (for mutual authentication)
+					if let (Some(cert), Some(key)) = (&self.client_certificate, &self.signatory) {
+						client = client.with_client_identity(cert.clone(), std::sync::Arc::clone(key));
+					}						// Set certificate validators if available
+						#[cfg(all(feature = "x509", feature = "std"))]
+						if let Some(validators) = &self.client_validators {
+							let composite = $crate::transport::tcp::CompositeValidator {
+								validators: std::sync::Arc::clone(validators),
+							};
+							client = client.with_certificate_validator(std::sync::Arc::new(composite));
+						}
+
+						Box::new(client)
 					}
 					#[cfg(all(
 						feature = "builder",
@@ -400,12 +442,17 @@ macro_rules! impl_tcp_common {
 			// Step 5: Complete handshake and derive session key
 			let session_key_secret = orchestrator.complete().await?;
 
+			// Extract the negotiated profile to get AEAD OID
+			let profile = orchestrator.selected_profile().ok_or(TransportError::InvalidMessage)?;
+			let aead_oid = profile.aead.ok_or(TransportError::InvalidMessage)?;
+
 			// Extract raw bytes from Secret for AES key
 			use $crate::crypto::secret::ToInsecure;
-			let session_key_bytes = session_key_secret.to_insecure();				// Reconstruct Aes256Gcm from raw key bytes
+			let session_key_bytes = session_key_secret.to_insecure();				// Reconstruct Aes256Gcm from raw key bytes and wrap in RuntimeAead
 				use $crate::crypto::aead::KeyInit;
-				let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
+				let cipher = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
 					.map_err(|_| TransportError::InvalidMessage)?;
+				let session_key = $crate::crypto::aead::RuntimeAead::new(cipher, aead_oid);
 
 				// Store session key and mark handshake complete
 				self.set_symmetric_key(session_key);
@@ -433,27 +480,25 @@ macro_rules! impl_tcp_common {
 					return Err(TransportError::InvalidMessage);
 				}
 
-				// Parse TransportEnvelope and extract the handshake message
-				let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
-				let raw_message = match &transport_envelope {
-					TransportEnvelope::SignedData(sd) => {
-						// This is ClientHello (first message from client)
-						use $crate::transport::handshake::ClientHello;
-						ClientHello::try_from(sd)
-							.map_err(|_| TransportError::InvalidMessage)?
-							.to_der()?
-					}
-					TransportEnvelope::EnvelopedData(ed) => {
-						// This is ClientKeyExchange (second message from client)
-						use $crate::transport::handshake::ClientKeyExchange;
-						ClientKeyExchange::try_from(ed)
-							.map_err(|_| TransportError::InvalidMessage)?
-							.to_der()?
-					}
-					_ => return Err(TransportError::InvalidMessage),
-				};
-
-				// Get server certificate and signatory (required for handshake)
+			// Parse TransportEnvelope and extract the handshake message
+			let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
+			let raw_message = match &transport_envelope {
+				TransportEnvelope::SignedData(sd) => {
+					// This is ClientHello (first message from client)
+					use $crate::transport::handshake::ClientHello;
+					ClientHello::try_from(sd)
+						.map_err(|_| TransportError::InvalidMessage)?
+						.to_der()?
+				}
+				TransportEnvelope::EnvelopedData(ed) => {
+					// This is ClientKeyExchange (second message from client)
+					use $crate::transport::handshake::ClientKeyExchange;
+					ClientKeyExchange::try_from(ed)
+						.map_err(|_| TransportError::InvalidMessage)?
+						.to_der()?
+				}
+				_ => return Err(TransportError::InvalidMessage),
+			};				// Get server certificate and signatory (required for handshake)
 				let cert = self.server_certificate().ok_or(TransportError::Forbidden)?.clone();
 				let signatory = self.signatory.as_ref().ok_or(TransportError::Forbidden)?.clone();
 
@@ -527,6 +572,10 @@ macro_rules! impl_tcp_common {
 					// No response means handshake is complete - derive session key
 					let session_key_secret = orchestrator.complete().await?;
 
+					// Extract the negotiated profile to get AEAD OID
+					let profile = orchestrator.selected_profile().ok_or(TransportError::InvalidMessage)?;
+					let aead_oid = profile.aead.ok_or(TransportError::InvalidMessage)?;
+
 					// Extract peer certificate if mutual auth was performed
 					#[cfg(feature = "x509")]
 					{
@@ -535,10 +584,11 @@ macro_rules! impl_tcp_common {
 
 					// Extract raw bytes from Secret for AES key
 					use $crate::crypto::secret::ToInsecure;
-					let session_key_bytes = session_key_secret.to_insecure();					// Reconstruct Aes256Gcm from raw key bytes
+					let session_key_bytes = session_key_secret.to_insecure();					// Reconstruct Aes256Gcm from raw key bytes and wrap in RuntimeAead
 					use $crate::crypto::aead::KeyInit;
-					let session_key = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
+					let cipher = $crate::crypto::aead::Aes256Gcm::new_from_slice(&*session_key_bytes)
 						.map_err(|_| TransportError::InvalidMessage)?;
+					let session_key = $crate::crypto::aead::RuntimeAead::new(cipher, aead_oid);
 
 					self.set_symmetric_key(session_key);
 					self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
@@ -576,7 +626,18 @@ macro_rules! impl_tcp_common {
 			where
 				V: $crate::crypto::x509::policy::CertificateValidation + 'static,
 			{
-				self.client_validators = Some(std::sync::Arc::new(vec![std::sync::Arc::new(validator)]));
+				let new_validator = std::sync::Arc::new(validator);
+				match self.client_validators.as_mut() {
+					Some(validators) => {
+						let mut validators_vec = std::sync::Arc::try_unwrap(std::mem::replace(validators, std::sync::Arc::new(vec![])))
+							.unwrap_or_else(|arc| (*arc).clone());
+						validators_vec.push(new_validator);
+						self.client_validators = Some(std::sync::Arc::new(validators_vec));
+					}
+					None => {
+						self.client_validators = Some(std::sync::Arc::new(vec![new_validator]));
+					}
+				}
 				self
 			}
 		}

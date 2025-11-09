@@ -530,6 +530,10 @@ where
 	fn is_complete(&self) -> bool {
 		self.state.state() == HandshakeState::Complete
 	}
+
+	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+		self.selected_profile
+	}
 }
 
 // ============================================================================

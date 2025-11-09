@@ -464,6 +464,13 @@ pub trait ClientHandshakeProtocol: Send {
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
+
+	/// Get the negotiated security profile.
+	///
+	/// Returns `Some(SecurityProfileDesc)` containing the negotiated algorithm OIDs
+	/// after successful profile negotiation during handshake. Returns `None` if
+	/// negotiation has not occurred yet.
+	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc>;
 }
 
 /// Server-side handshake protocol trait.
@@ -507,6 +514,13 @@ pub trait ServerHandshakeProtocol: Send {
 	/// be treated as immutable for the lifetime of the connection.
 	#[cfg(feature = "x509")]
 	fn peer_certificate(&self) -> Option<&Certificate>;
+
+	/// Get the negotiated security profile.
+	///
+	/// Returns `Some(SecurityProfileDesc)` containing the negotiated algorithm OIDs
+	/// after successful profile negotiation during handshake. Returns `None` if
+	/// negotiation has not occurred yet.
+	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc>;
 }
 
 // ============================================================================
@@ -660,6 +674,42 @@ impl TryFrom<&ClientKeyExchange> for crate::cms::enveloped_data::EnvelopedData {
 		use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
 		use crate::der::asn1::OctetString;
 
+		// Build unprotected attributes for client certificate and signature
+		#[cfg(feature = "x509")]
+		let unprotected_attrs = {
+			use crate::der::asn1::SetOfVec;
+			use x509_cert::attr::{Attribute, AttributeValue, Attributes};
+
+			let mut attrs = Vec::new();
+
+			if let Some(cert) = &kex.client_certificate {
+				let cert_der = cert.to_der()?;
+				// Wrap certificate DER in OCTET STRING since certs are SEQUENCE internally
+				let cert_octet = OctetString::new(cert_der)?;
+				let cert_der_wrapped = cert_octet.to_der()?;
+				let cert_any = crate::der::Any::new(crate::der::Tag::OctetString, cert_der_wrapped)?;
+				let cert_values = SetOfVec::try_from(vec![AttributeValue::from(cert_any)])?;
+				attrs.push(Attribute { oid: crate::asn1::transport::CLIENT_CERTIFICATE_OID, values: cert_values });
+			}
+
+			if let Some(sig) = &kex.client_signature {
+				// Signature is already an OCTET STRING
+				let sig_der = sig.to_der()?;
+				let sig_any = crate::der::Any::new(crate::der::Tag::OctetString, sig_der)?;
+				let sig_values = SetOfVec::try_from(vec![AttributeValue::from(sig_any)])?;
+				attrs.push(Attribute { oid: crate::asn1::transport::CLIENT_SIGNATURE_OID, values: sig_values });
+			}
+
+			if attrs.is_empty() {
+				None
+			} else {
+				Some(Attributes::try_from(attrs)?)
+			}
+		};
+
+		#[cfg(not(feature = "x509"))]
+		let unprotected_attrs = None;
+
 		Ok(EnvelopedData {
 			version: CmsVersion::V0,
 			originator_info: None,
@@ -669,7 +719,7 @@ impl TryFrom<&ClientKeyExchange> for crate::cms::enveloped_data::EnvelopedData {
 				content_enc_alg: crate::transport::handshake::utils::aes_256_gcm_algorithm(),
 				encrypted_content: Some(OctetString::new(kex.encrypted_data.as_bytes())?),
 			},
-			unprotected_attrs: None,
+			unprotected_attrs,
 		})
 	}
 }
@@ -686,12 +736,41 @@ impl TryFrom<&crate::cms::enveloped_data::EnvelopedData> for ClientKeyExchange {
 			.ok_or(HandshakeError::InvalidClientKeyExchange)?
 			.as_bytes();
 
+		// Extract client certificate and signature from unprotected_attrs
+		#[cfg(feature = "x509")]
+		let (client_certificate, client_signature) = {
+			use crate::der::Decode;
+			use x509_cert::Certificate;
+
+			let mut cert = None;
+			let mut sig = None;
+
+			if let Some(attrs) = &enveloped_data.unprotected_attrs {
+				for attr in attrs.iter() {
+					if attr.oid == crate::asn1::transport::CLIENT_CERTIFICATE_OID {
+						if let Some(value) = attr.values.iter().next() {
+							let octet_bytes = value.value();
+							let cert_octet = OctetString::from_der(octet_bytes)?;
+							cert = Some(Certificate::from_der(cert_octet.as_bytes())?);
+						}
+					} else if attr.oid == crate::asn1::transport::CLIENT_SIGNATURE_OID {
+						if let Some(value) = attr.values.iter().next() {
+							let octet_bytes = value.value();
+							sig = Some(OctetString::from_der(octet_bytes)?);
+						}
+					}
+				}
+			}
+
+			(cert, sig)
+		};
+
 		Ok(ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
 			#[cfg(feature = "x509")]
-			client_certificate: None,
+			client_certificate,
 			#[cfg(feature = "x509")]
-			client_signature: None,
+			client_signature,
 		})
 	}
 }

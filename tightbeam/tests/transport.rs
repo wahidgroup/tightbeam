@@ -98,7 +98,7 @@ async fn test_macro_integration_full() -> core::result::Result<(), Box<dyn core:
 	let _client = tb::client! {
 		connect collect::TokioListener: addr,
 		policies: {
-			gate: policy::AcceptAllGate,
+			gate: [policy::AcceptAllGate],
 			restart: policy::RestartLinearBackoff::default(),
 		}
 	};

@@ -28,7 +28,7 @@ use crate::transport::error::TransportError;
 use crate::{encode, TightBeamError};
 
 #[cfg(feature = "x509")]
-use crate::crypto::aead::{Aes256GcmOid, Decryptor, Encryptor};
+use crate::crypto::aead::{Decryptor, RuntimeAead};
 #[cfg(feature = "x509")]
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
@@ -56,8 +56,6 @@ pub struct TransportEncryptionConfig {
 	pub max_cleartext_envelope: usize,
 	pub max_encrypted_envelope: usize,
 	pub handshake_timeout: Duration,
-	pub enforce_encryption: bool,
-	pub accept_cleartext_before_handshake: bool,
 }
 
 #[cfg(all(feature = "x509", feature = "std"))]
@@ -71,20 +69,11 @@ impl TransportEncryptionConfig {
 			max_cleartext_envelope: 128 * 1024,
 			max_encrypted_envelope: 256 * 1024,
 			handshake_timeout: Duration::from_secs(10),
-			enforce_encryption: true,
-			accept_cleartext_before_handshake: true,
 		}
 	}
 
 	pub fn with_client_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
 		self.client_validators = Some(Arc::new(validators));
-		self
-	}
-
-	// Deprecated: Use with_client_validators for validator chains
-	#[deprecated(since = "0.1.0", note = "Use with_client_validators() for mutual authentication")]
-	pub fn with_certificate_validator(mut self, validator: Arc<dyn CertificateValidation>) -> Self {
-		self.client_validators = Some(Arc::new(vec![validator]));
 		self
 	}
 }
@@ -328,8 +317,8 @@ pub trait Protocol {
 
 #[cfg(feature = "x509")]
 pub trait EncryptedProtocol: Protocol {
-	type Encryptor: Encryptor<Aes256GcmOid>;
-	type Decryptor: Decryptor;
+	type Encryptor: Send;
+	type Decryptor: Send;
 
 	/// Bind to an address with transport encryption configuration
 	fn bind_with(
@@ -424,14 +413,11 @@ pub trait MessageIO: ResponseHandler {
 }
 #[cfg(feature = "x509")]
 pub trait EncryptedMessageIO: MessageIO {
-	type Encryptor: Encryptor<Aes256GcmOid>;
-	type Decryptor: Decryptor;
+	/// Get the encryptor instance (RuntimeAead)
+	fn encryptor(&self) -> TransportResult<&RuntimeAead>;
 
-	/// Get the encryptor instance
-	fn encryptor(&self) -> TransportResult<&Self::Encryptor>;
-
-	/// Get the decryptor instance
-	fn decryptor(&self) -> TransportResult<&Self::Decryptor>;
+	/// Get the decryptor instance (RuntimeAead)
+	fn decryptor(&self) -> TransportResult<&RuntimeAead>;
 
 	/// Get current handshake state (pure accessor)
 	fn handshake_state(&self) -> TcpHandshakeState;
@@ -443,7 +429,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	fn server_certificate(&self) -> Option<&Certificate>;
 
 	/// Set symmetric encryption key (pure mutator)
-	fn set_symmetric_key(&mut self, key: Self::Encryptor);
+	fn set_symmetric_key(&mut self, key: RuntimeAead);
 
 	/// Relay a message by detecting whether it's encrypted or cleartext
 	/// Returns the decrypted TransportEnvelope ready for processing

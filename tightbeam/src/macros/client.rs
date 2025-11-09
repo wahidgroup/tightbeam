@@ -1,6 +1,35 @@
 /// Client macro - creates a configured transport for multiple emit calls
 #[macro_export]
 macro_rules! client {
+	// With identity only (mutual auth without policies)
+	(connect $protocol:path: $addr:expr, identity: ($cert:expr, $key:expr)) => {{
+		#[cfg(feature = "std")]
+		{
+			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
+			let __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream)
+				.with_client_identity($cert, $key);
+			#[cfg(feature = "builder")]
+			{ $crate::macros::client::builder::GenericClient::<$protocol>::from_transport(__transport) }
+			#[cfg(not(feature = "builder"))]
+			{ __transport }
+		}
+	}};
+
+	// With identity AND policies (mutual auth with policies)
+	(connect $protocol:path: $addr:expr, identity: ($cert:expr, $key:expr), policies: { $($tt:tt)* }) => {{
+		#[cfg(feature = "std")]
+		{
+			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
+			let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream)
+				.with_client_identity($cert, $key);
+			__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
+			#[cfg(feature = "builder")]
+			{ $crate::macros::client::builder::GenericClient::<$protocol>::from_transport(__transport) }
+			#[cfg(not(feature = "builder"))]
+			{ __transport }
+		}
+	}};
+
 	// Generic sync: protocol: stream
 	($protocol:path: $stream:expr) => {{
 		let __transport = <$protocol as Protocol>::create_transport($stream);
@@ -24,9 +53,9 @@ macro_rules! client {
 	}};
 
 	// Generic sync: protocol: stream, policies: {...}
-	($protocol:path: $stream:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
+	($protocol:path: $stream:expr, policies: { $($tt:tt)* }) => {{
 		let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport($stream);
-		$( __transport = $crate::client!(@set_policy __transport, $policy_name, $policy_value); )*
+		__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
 		#[cfg(feature = "builder")]
 		{ $crate::macros::client::builder::GenericClient::<$protocol>::from_transport(__transport) }
 		#[cfg(not(feature = "builder"))]
@@ -34,12 +63,12 @@ macro_rules! client {
 	}};
 
 	// Generic sync: connect protocol: addr, policies: {...}
-	(connect $protocol:path: $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
+	(connect $protocol:path: $addr:expr, policies: { $($tt:tt)* }) => {{
 		#[cfg(feature = "std")]
 		{
 			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
 			let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
-			$( __transport = $crate::client!(@set_policy __transport, $policy_name, $policy_value); )*
+			__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
 			#[cfg(feature = "builder")]
 			{ $crate::macros::client::builder::GenericClient::<$protocol>::from_transport(__transport) }
 			#[cfg(not(feature = "builder"))]
@@ -73,10 +102,10 @@ macro_rules! client {
 	}};
 
 	// Generic async: async protocol: stream, policies: {...}
-	(async $protocol:path: $stream:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
+	(async $protocol:path: $stream:expr, policies: { $($tt:tt)* }) => {{
 		async {
 			let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport($stream);
-			$( __transport = $crate::client!(@set_policy __transport, $policy_name, $policy_value); )*
+			__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
 			#[cfg(feature = "builder")]
 			{ Ok::<_, $crate::transport::error::TransportError>($crate::macros::client::builder::GenericClient::<$protocol>::from_transport(__transport)) }
 			#[cfg(not(feature = "builder"))]
@@ -85,13 +114,13 @@ macro_rules! client {
 	}};
 
 	// Generic async: async connect protocol: addr, policies: {...}
-	(async connect $protocol:path: $addr:expr, policies: { $($policy_name:ident: $policy_value:expr),* $(,)? }) => {{
+	(async connect $protocol:path: $addr:expr, policies: { $($tt:tt)* }) => {{
 		#[cfg(feature = "tokio")]
 		async {
 			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await
 				.map_err(|e| $crate::transport::error::TransportError::from(e))?;
 			let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
-			$( __transport = $crate::client!(@set_policy __transport, $policy_name, $policy_value); )*
+			__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
 			#[cfg(feature = "builder")]
 			{ Ok::<_, $crate::transport::error::TransportError>($crate::macros::client::__client_policies::GenericClient::<$protocol>::from_transport(__transport)) }
 			#[cfg(not(feature = "builder"))]
@@ -99,60 +128,109 @@ macro_rules! client {
 		}
 	}};
 
-	// Internal helper to set policies
-	(@set_policy $transport:expr, restart_policy, $value:expr) => {
-		$transport.with_restart($value)
-	};
-	// Shorthand: restart -> with_restart(...)
-	(@set_policy $transport:expr, restart, $value:expr) => {
-		$transport.with_restart($value)
-	};
-	(@set_policy $transport:expr, emitter_gate, $value:expr) => {
-		$transport.with_emitter_gate($value)
-	};
-	// Shorthand: gate (client-side) -> with_emitter_gate(...)
-	(@set_policy $transport:expr, gate, $value:expr) => {
-		$transport.with_emitter_gate($value)
-	};
-	(@set_policy $transport:expr, collector_gate, $value:expr) => {
-		$transport.with_collector_gate($value)
-	};
-	// X.509 certificate validation gate (single validator form)
-	(@set_policy $transport:expr, with_x509_gate, $validator:expr) => {{
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		{ $transport.with_x509_gate($validator) }
-		#[cfg(not(all(feature = "x509", feature = "signature", feature = "secp256k1")))]
-		{ $transport }
+	// Policy application helper - processes mixed singular and plural policies
+	(@apply_policies $transport:expr, { $($tt:tt)* }) => {{
+		let mut __t = $transport;
+		$crate::client!(@process_policy __t, $($tt)*);
+		__t
 	}};
-	// Shorthand alias: x509_gate
-	(@set_policy $transport:expr, x509_gate, $validator:expr) => {{
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		{ $transport.with_x509_gate($validator) }
-		#[cfg(not(all(feature = "x509", feature = "signature", feature = "secp256k1")))]
-		{ $transport }
-	}};
-	// Multi-validator list form: with_x509_gate: [ValidatorA, ValidatorB, ...]
-	(@set_policy $transport:expr, with_x509_gate, [$($validator:expr),* $(,)?]) => {{
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		{
-			let mut __t = $transport;
-			$( __t = __t.with_x509_gate($validator); )*
-			__t
-		}
-		#[cfg(not(all(feature = "x509", feature = "signature", feature = "secp256k1")))]
-		{ $transport }
-	}};
-	// Multi-validator list shorthand: x509_gate: [..]
-	(@set_policy $transport:expr, x509_gate, [$($validator:expr),* $(,)?]) => {{
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		{
-			let mut __t = $transport;
-			$( __t = __t.with_x509_gate($validator); )*
-			__t
-		}
-		#[cfg(not(all(feature = "x509", feature = "signature", feature = "secp256k1")))]
-		{ $transport }
-	}};
+
+	// Process individual policies recursively
+	(@process_policy $transport:expr, restart_policy: $value:expr, $($rest:tt)*) => {
+		$transport = $transport.with_restart($value);
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, restart: $value:expr, $($rest:tt)*) => {
+		$transport = $transport.with_restart($value);
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	// emitter_gate can be singular or array
+	(@process_policy $transport:expr, emitter_gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+		$(
+			$transport = $transport.with_emitter_gate($value);
+		)*
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, emitter_gate: [ $( $value:expr ),* $(,)? ] $(,)?) => {
+		$(
+			$transport = $transport.with_emitter_gate($value);
+		)*
+	};
+	(@process_policy $transport:expr, emitter_gate: $value:expr, $($rest:tt)*) => {
+		$transport = $transport.with_emitter_gate($value);
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, emitter_gate: $value:expr $(,)?) => {
+		$transport = $transport.with_emitter_gate($value);
+	};
+	// gate (shorthand for emitter_gate) can be singular or array
+	(@process_policy $transport:expr, gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+		$(
+			$transport = $transport.with_emitter_gate($value);
+		)*
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, gate: [ $( $value:expr ),* $(,)? ] $(,)?) => {
+		$(
+			$transport = $transport.with_emitter_gate($value);
+		)*
+	};
+	(@process_policy $transport:expr, gate: $value:expr, $($rest:tt)*) => {
+		$transport = $transport.with_emitter_gate($value);
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, gate: $value:expr $(,)?) => {
+		$transport = $transport.with_emitter_gate($value);
+	};
+	// collector_gate can be singular or array
+	(@process_policy $transport:expr, collector_gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+		$(
+			$transport = $transport.with_collector_gate($value);
+		)*
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, collector_gate: [ $( $value:expr ),* $(,)? ] $(,)?) => {
+		$(
+			$transport = $transport.with_collector_gate($value);
+		)*
+	};
+	(@process_policy $transport:expr, collector_gate: $value:expr, $($rest:tt)*) => {
+		$transport = $transport.with_collector_gate($value);
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, collector_gate: $value:expr $(,)?) => {
+		$transport = $transport.with_collector_gate($value);
+	};
+	// x509_gate accepts array of validators
+	(@process_policy $transport:expr, x509_gate: [ $( $validator:expr ),* $(,)? ], $($rest:tt)*) => {
+		$(
+			#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+			{ $transport = $transport.with_x509_gate($validator); }
+		)*
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, x509_gate: [ $( $validator:expr ),* $(,)? ] $(,)?) => {
+		$(
+			#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+			{ $transport = $transport.with_x509_gate($validator); }
+		)*
+	};
+	(@process_policy $transport:expr, with_x509_gate: [ $( $validator:expr ),* $(,)? ], $($rest:tt)*) => {
+		$(
+			#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+			{ $transport = $transport.with_x509_gate($validator); }
+		)*
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, with_x509_gate: [ $( $validator:expr ),* $(,)? ] $(,)?) => {
+		$(
+			#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+			{ $transport = $transport.with_x509_gate($validator); }
+		)*
+	};
+	// Base case: no more policies
+	(@process_policy $transport:expr,) => {};
+	(@process_policy $transport:expr) => {};
 }
 
 // Programmatic client policy system (non-macro) enabling external implementors to apply

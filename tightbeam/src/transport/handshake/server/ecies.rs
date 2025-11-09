@@ -354,8 +354,8 @@ where
 		Ok(server_handshake.to_der()?)
 	}
 
-	fn decode_client_key_exchange(&self, client_kex_der: &[u8]) -> Result<ClientKeyExchange, HandshakeError> {
-		Ok(ClientKeyExchange::from_der(client_kex_der)?)
+	pub fn decode_client_key_exchange(&self, der_bytes: &[u8]) -> Result<ClientKeyExchange, HandshakeError> {
+		ClientKeyExchange::from_der(der_bytes).map_err(Into::into)
 	}
 
 	fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError> {
@@ -399,12 +399,24 @@ where
 		for<'a> P::Signature: TryFrom<&'a [u8]>,
 		P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
+		println!("[SERVER HANDSHAKE] validate_client_certificate called");
+		println!(
+			"[SERVER HANDSHAKE] client_validators present: {}",
+			self.client_validators.is_some()
+		);
+
 		if let Some(validators) = &self.client_validators {
+			println!("[SERVER HANDSHAKE] Have {} validators", validators.len());
 			// Client cert is required when validators are present
 			let client_cert = client_kex
 				.client_certificate
 				.as_ref()
 				.ok_or(HandshakeError::MissingClientCertificate)?;
+
+			println!(
+				"[SERVER HANDSHAKE] Client sent certificate: {:?}",
+				client_cert.tbs_certificate.subject
+			);
 
 			// Check for identity immutability - reject if cert changes on re-handshake
 			if let Some(existing_cert) = &self.validated_client_cert {
@@ -414,8 +426,11 @@ where
 			}
 
 			// Run validator chain (includes expiry, pinning, policy, etc.)
-			for validator in validators.iter() {
+			println!("[SERVER HANDSHAKE] Running {} validators", validators.len());
+			for (i, validator) in validators.iter().enumerate() {
+				println!("[SERVER HANDSHAKE] Running validator {}", i);
 				validator.evaluate(client_cert)?;
+				println!("[SERVER HANDSHAKE] Validator {} passed", i);
 			}
 
 			// Verify client signature over transcript hash
@@ -543,6 +558,10 @@ where
 	#[cfg(feature = "x509")]
 	fn peer_certificate(&self) -> Option<&Certificate> {
 		self.validated_client_cert.as_ref()
+	}
+
+	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+		self.selected_profile
 	}
 }
 
