@@ -119,6 +119,24 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", from)]
 	NegotiationError(crate::crypto::negotiation::NegotiationError),
 
+	/// No mutually supported profiles found during negotiation
+	#[cfg_attr(feature = "derive", error("No mutually supported cryptographic profiles found"))]
+	NoMutualProfiles,
+
+	/// Dealer's choice failed - no supported profiles configured
+	#[cfg_attr(
+		feature = "derive",
+		error("Dealer's choice failed: no supported profiles configured")
+	)]
+	NoSupportedProfiles,
+
+	/// Profile negotiation required but no profiles configured
+	#[cfg_attr(
+		feature = "derive",
+		error("Profile negotiation required but no profiles configured on server")
+	)]
+	NegotiationRequired,
+
 	/// Certificate policy rejection
 	#[cfg_attr(feature = "derive", error("Certificate rejected by policy: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -227,6 +245,13 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::Timeout => write!(f, "Handshake timeout"),
 			HandshakeError::InvalidProfileSelection => write!(f, "Server selected profile not in client's offer"),
 			HandshakeError::NegotiationError(e) => write!(f, "Profile negotiation failed: {}", e),
+			HandshakeError::NoMutualProfiles => write!(f, "No mutually supported cryptographic profiles found"),
+			HandshakeError::NoSupportedProfiles => {
+				write!(f, "Dealer's choice failed: no supported profiles configured")
+			}
+			HandshakeError::NegotiationRequired => {
+				write!(f, "Profile negotiation required but no profiles configured on server")
+			}
 			HandshakeError::CertificatePolicyError(e) => write!(f, "Certificate rejected by policy: {}", e),
 			HandshakeError::DerError(e) => write!(f, "DER error: {}", e),
 			HandshakeError::InvalidAttributeArity => write!(f, "Attribute must contain exactly one value"),

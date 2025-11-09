@@ -166,6 +166,7 @@ mod tests {
 		use crate::random::{generate_nonce, OsRng};
 		use crate::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 		use crate::transport::handshake::builders::kari::TightBeamKariBuilder;
+
 		#[test]
 		fn test_full_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 			// Generate sender and recipient key-pairs

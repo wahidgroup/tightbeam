@@ -552,7 +552,6 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::ecies::encrypt;
 	use crate::crypto::negotiation::SecurityOffer;
 	use crate::crypto::profiles::SecurityProfileDesc;
 	use crate::random::OsRng;
@@ -569,57 +568,35 @@ mod tests {
 		Ok(client_hello.to_der()?)
 	}
 
+	/// Test the full server state flow through a complete handshake.
+	///
+	/// Verifies that the server correctly transitions through all states:
+	/// Init → ServerHelloSent → KeyExchangeReceived → Complete
 	#[test]
 	fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
-		// Given: A server in init state
 		let mut server = TestEciesServerBuilder::new().build();
 		assert_eq!(server.state(), HandshakeState::Init);
 
-		// And: A valid client hello message
+		// Process ClientHello
 		let client_random = crate::random::generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
-
-		// When: Server processes the client hello
 		let server_handshake_der = server.process_client_hello(&client_hello_der)?;
+
 		assert_eq!(server.state(), HandshakeState::ServerHelloSent);
 		assert!(server.client_random.is_some());
 		assert!(server.server_random.is_some());
 		assert!(server.transcript_hash.is_some());
 
-		// And: Server handshake message is valid
+		// Verify server handshake message is valid
 		let _server_handshake = ServerHandshake::from_der(&server_handshake_der)?;
 
-		// When: Server processes a valid client key exchange
-		let server_pubkey = k256::PublicKey::from_sec1_bytes(
-			server
-				.server_cert
-				.tbs_certificate
-				.subject_public_key_info
-				.subject_public_key
-				.raw_bytes(),
-		)?;
-
-		// Use the actual client_random that was stored by the server
-		let stored_client_random = server.client_random.unwrap();
-		let base_session_key = crate::random::generate_nonce::<32>(None)?;
-
-		let mut plaintext = [0u8; 64];
-		plaintext[..32].copy_from_slice(&base_session_key);
-		plaintext[32..].copy_from_slice(&stored_client_random);
-
-		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
-			&server_pubkey,
-			&plaintext,
-			Some(b"test-domain"),
-			Some(&mut OsRng),
-		)?;
-
-		let client_kex_der = create_test_client_key_exchange(&encrypted_message.to_bytes())?;
+		// Process ClientKeyExchange
+		let client_kex_der = build_test_client_key_exchange(&server)?;
 		server.process_client_key_exchange(&client_kex_der)?;
 		assert_eq!(server.state(), HandshakeState::KeyExchangeReceived);
 		assert!(server.base_session_key.is_some());
 
-		// When: Server completes the handshake
+		// Complete handshake
 		let _session_key = server.complete()?;
 		assert!(server.is_complete());
 		assert_eq!(server.state(), HandshakeState::Complete);
@@ -627,71 +604,47 @@ mod tests {
 		Ok(())
 	}
 
+	/// Test that state transitions are properly enforced.
+	///
+	/// Verifies that operations fail when called in the wrong state.
 	#[test]
 	fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
-		// Given: A fresh server in init state
 		let mut server = TestEciesServerBuilder::new().build();
 
-		// When: Trying to process client key exchange before client hello
-		let result = server.process_client_key_exchange(&[]);
-		assert!(result.is_err());
+		// Cannot process client key exchange before client hello
+		assert!(server.process_client_key_exchange(&[]).is_err());
 
-		// When: Trying to complete before any handshake steps
-		let result = server.complete();
-		assert!(result.is_err());
+		// Cannot complete before any handshake steps
+		assert!(server.complete().is_err());
 
-		// Given: Server has processed client hello
+		// Process client hello to advance state
 		let client_random = crate::random::generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
 		server.process_client_hello(&client_hello_der)?;
 
-		// When: Trying to process client hello again
-		let result = server.process_client_hello(&client_hello_der);
-		assert!(result.is_err());
+		// Cannot process client hello again
+		assert!(server.process_client_hello(&client_hello_der).is_err());
 
-		// When: Trying to complete before client key exchange
-		let result = server.complete();
-		assert!(result.is_err());
+		// Cannot complete before client key exchange
+		assert!(server.complete().is_err());
 
-		// Given: Server has processed client key exchange
-		let server_pubkey = k256::PublicKey::from_sec1_bytes(
-			server
-				.server_cert
-				.tbs_certificate
-				.subject_public_key_info
-				.subject_public_key
-				.raw_bytes(),
-		)?;
-
-		let stored_client_random = server.client_random.unwrap();
-		let base_session_key = crate::random::generate_nonce::<32>(None)?;
-
-		let mut plaintext = [0u8; 64];
-		plaintext[..32].copy_from_slice(&base_session_key);
-		plaintext[32..].copy_from_slice(&stored_client_random);
-
-		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
-			&server_pubkey,
-			&plaintext,
-			Some(b"test-domain"),
-			Some(&mut OsRng),
-		)?;
-
-		let client_kex_der = create_test_client_key_exchange(&encrypted_message.to_bytes())?;
+		// Process client key exchange to advance state
+		let client_kex_der = build_test_client_key_exchange(&server)?;
 		server.process_client_key_exchange(&client_kex_der)?;
 
-		// When: Trying to process client key exchange again
-		let result = server.process_client_key_exchange(&client_kex_der);
-		assert!(result.is_err());
+		// Cannot process client key exchange again
+		assert!(server.process_client_key_exchange(&client_kex_der).is_err());
 
-		// When: Trying to process client hello after key exchange
-		let result = server.process_client_hello(&client_hello_der);
-		assert!(result.is_err());
+		// Cannot process client hello after key exchange
+		assert!(server.process_client_hello(&client_hello_der).is_err());
 
 		Ok(())
 	}
 
-	/// Test profile negotiation modes
+	/// Test profile negotiation modes (negotiation vs dealer's choice).
+	///
+	/// Verifies that the server correctly handles both explicit client offers
+	/// and dealer's choice mode when no offer is present.
 	#[test]
 	fn test_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::asn1::{
@@ -750,5 +703,52 @@ mod tests {
 		}
 
 		Ok(())
+	}
+
+	// ========================================================================
+	// Test Helper Functions
+	// ========================================================================
+
+	/// Build a test ClientKeyExchange with ECIES-encrypted session key.
+	///
+	/// Extracts the server's public key and stored client random, then creates
+	/// a properly encrypted payload containing [session_key || client_random].
+	fn build_test_client_key_exchange<P>(
+		server: &EciesHandshakeServer<P>,
+	) -> Result<Vec<u8>, Box<dyn std::error::Error>>
+	where
+		P: CryptoProvider,
+	{
+		use crate::crypto::ecies::encrypt;
+
+		// Extract server's public key from certificate
+		let server_pubkey = k256::PublicKey::from_sec1_bytes(
+			server
+				.server_cert
+				.tbs_certificate
+				.subject_public_key_info
+				.subject_public_key
+				.raw_bytes(),
+		)?;
+
+		// Use the stored client_random from the server
+		let stored_client_random = server.client_random.ok_or("Missing client random")?;
+		let base_session_key = crate::random::generate_nonce::<32>(None)?;
+
+		// Build plaintext: [session_key || client_random]
+		let mut plaintext = [0u8; 64];
+		plaintext[..32].copy_from_slice(&base_session_key);
+		plaintext[32..].copy_from_slice(&stored_client_random);
+
+		// Encrypt with ECIES
+		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
+			&server_pubkey,
+			&plaintext,
+			Some(b"test-domain"),
+			Some(&mut OsRng),
+		)?;
+
+		// Build ClientKeyExchange message
+		create_test_client_key_exchange(&encrypted_message.to_bytes())
 	}
 }
