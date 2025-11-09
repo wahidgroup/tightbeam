@@ -95,6 +95,10 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Missing client certificate"))]
 	MissingClientCertificate,
 
+	/// Invalid transcript hash length or format
+	#[cfg_attr(feature = "derive", error("Invalid transcript hash"))]
+	InvalidTranscriptHash,
+
 	/// Server requires mutual authentication but client has no identity configured
 	#[cfg_attr(
 		feature = "derive",
@@ -235,6 +239,11 @@ pub enum HandshakeError {
 	KariBuilderConsumed,
 	#[cfg_attr(feature = "derive", error("Content encryption algorithm not set"))]
 	MissingContentEncryptionAlgorithm,
+	#[cfg_attr(
+		feature = "derive",
+		error("Key wrap algorithm not configured in security profile")
+	)]
+	MissingKeyWrapAlgorithm,
 	#[cfg(all(feature = "builder", feature = "aead"))]
 	#[cfg_attr(feature = "derive", error("AES key wrap operation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -265,6 +274,8 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::InvalidState => write!(f, "Invalid handshake state"),
 			HandshakeError::MissingServerKey => write!(f, "Missing server key"),
 			HandshakeError::MissingServerCertificate => write!(f, "Missing server certificate"),
+			HandshakeError::MissingClientCertificate => write!(f, "Missing client certificate"),
+			HandshakeError::InvalidTranscriptHash => write!(f, "Invalid transcript hash"),
 			HandshakeError::MissingClientRandom => write!(f, "Missing client random from ClientHello"),
 			HandshakeError::MissingBaseSessionKey => write!(f, "Missing base session key"),
 			HandshakeError::MissingClientRandomState => write!(f, "Missing client random"),
@@ -313,6 +324,9 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::UnsupportedOriginatorIdentifier => write!(f, "Unsupported originator identifier type"),
 			HandshakeError::KariBuilderConsumed => write!(f, "KARI builder already consumed"),
 			HandshakeError::MissingContentEncryptionAlgorithm => write!(f, "Content encryption algorithm not set"),
+			HandshakeError::MissingKeyWrapAlgorithm => {
+				write!(f, "Key wrap algorithm not configured in security profile")
+			}
 			#[cfg(all(feature = "builder", feature = "aead"))]
 			HandshakeError::AesKeyWrap(e) => write!(f, "AES key wrap operation failed: {}", e),
 			HandshakeError::RandomGenerationFailed => write!(f, "Random generation failed"),

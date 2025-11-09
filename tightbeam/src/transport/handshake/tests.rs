@@ -12,14 +12,18 @@ use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use crate::asn1::{OctetString, AES_256_WRAP_OID, HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_256_OID};
+use crate::asn1::{
+	OctetString, AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA256_OID,
+	SIGNER_ECDSA_WITH_SHA3_512_OID,
+};
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::crypto::negotiation::SecurityAccept;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-use crate::der::asn1::{BitString, ObjectIdentifier};
+use crate::der::asn1::BitString;
+use crate::der::asn1::ObjectIdentifier;
 use crate::der::{Decode, Encode};
 use crate::random::OsRng;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -29,6 +33,7 @@ use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate};
+use crate::SIGNER_ECDSA_WITH_SHA3_256_OID;
 
 #[cfg(feature = "transport-cms")]
 use crate::crypto::sign::elliptic_curve::PublicKey;
@@ -46,13 +51,13 @@ use crate::x509::time::Time;
 /// Create a default test security profile for handshake tests.
 pub fn create_default_test_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		digest: ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8"), // SHA3-256
+		digest: HASH_SHA3_256_OID,
 		#[cfg(feature = "aead")]
-		aead: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46")), // AES-256-GCM
+		aead: Some(AES_256_GCM_OID),
 		#[cfg(feature = "aead")]
-		aead_key_size: Some(32),              // AES-256 uses 32-byte keys
+		aead_key_size: Some(32), // AES-256 uses 32-byte keys
 		#[cfg(feature = "signature")]
-		signature: Some(ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10")), // ECDSA-SHA3-256
+		signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
 		key_wrap: None,
 	}
 }
@@ -100,10 +105,7 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Certifica
 	let tbs_cert = TbsCertificate {
 		version: crate::x509::Version::V3,
 		serial_number: SerialNumber::new(&[1]).unwrap(),
-		signature: AlgorithmIdentifierOwned {
-			oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
-			parameters: None,
-		},
+		signature: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256_OID, parameters: None },
 		issuer: RdnSequence::default(),
 		validity: Validity {
 			not_before: Time::GeneralTime(
@@ -122,10 +124,7 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Certifica
 
 	Certificate {
 		tbs_certificate: tbs_cert,
-		signature_algorithm: AlgorithmIdentifierOwned {
-			oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
-			parameters: None,
-		},
+		signature_algorithm: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256_OID, parameters: None },
 		signature: BitString::new(0, vec![0; 64]).unwrap(),
 	}
 }
@@ -364,7 +363,7 @@ impl Default for TestEciesClientBuilder {
 #[cfg(feature = "transport-cms")]
 pub struct TestCmsServerBuilder {
 	key: Option<Secp256k1SigningKey>,
-	transcript_hash: Option<Vec<u8>>,
+	transcript_hash: Option<[u8; 32]>,
 }
 
 #[cfg(feature = "transport-cms")]
@@ -373,7 +372,7 @@ impl TestCmsServerBuilder {
 	pub fn new() -> Self {
 		Self {
 			key: None,
-			transcript_hash: Some(vec![1u8; 32]), // Default test transcript
+			transcript_hash: Some([1u8; 32]), // Default test transcript
 		}
 	}
 
@@ -384,7 +383,7 @@ impl TestCmsServerBuilder {
 	}
 
 	/// Set a specific transcript hash.
-	pub fn with_transcript_hash(mut self, hash: Vec<u8>) -> Self {
+	pub fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
 		self.transcript_hash = Some(hash);
 		self
 	}
@@ -396,7 +395,7 @@ impl TestCmsServerBuilder {
 
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let verifying_key = *test_key.verifying_key();
-		let transcript_hash = self.transcript_hash.unwrap_or_else(|| vec![1u8; 32]);
+		let transcript_hash = self.transcript_hash.unwrap_or_else(|| [1u8; 32]);
 
 		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
 		let server = CmsHandshakeServerSecp256k1::new(Arc::new(test_key), transcript_hash, None);
@@ -416,7 +415,7 @@ impl Default for TestCmsServerBuilder {
 pub struct TestCmsClientBuilder {
 	client_key: Option<Secp256k1SigningKey>,
 	server_cert: Option<Certificate>,
-	transcript_hash: Option<Vec<u8>>,
+	transcript_hash: Option<[u8; 32]>,
 }
 
 #[cfg(feature = "transport-cms")]
@@ -426,7 +425,7 @@ impl TestCmsClientBuilder {
 		Self {
 			client_key: None,
 			server_cert: None,
-			transcript_hash: Some(vec![1u8; 32]), // Default test transcript
+			transcript_hash: Some([1u8; 32]), // Default test transcript
 		}
 	}
 
@@ -443,7 +442,7 @@ impl TestCmsClientBuilder {
 	}
 
 	/// Set a specific transcript hash.
-	pub fn with_transcript_hash(mut self, hash: Vec<u8>) -> Self {
+	pub fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
 		self.transcript_hash = Some(hash);
 		self
 	}
@@ -454,7 +453,7 @@ impl TestCmsClientBuilder {
 		let server_cert = self
 			.server_cert
 			.unwrap_or_else(|| create_test_certificate_from_key(&create_test_certificate().signing_key));
-		let transcript_hash = self.transcript_hash.unwrap_or_else(|| vec![1u8; 32]);
+		let transcript_hash = self.transcript_hash.unwrap_or([1u8; 32]);
 
 		let mut client = CmsHandshakeClientSecp256k1::new(
 			DefaultCryptoProvider::default(),

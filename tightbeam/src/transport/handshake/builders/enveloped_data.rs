@@ -172,14 +172,14 @@ where
 		// 1. Validate builder state
 		self.validate_builder_state()?;
 
-		// 2. Generate CEK (content-encryption key)
+		// 2. Generate CEK (content-encryption key) wrapped in Secret
 		let cek = generate_cek()?;
 
-		// 3. Build KARI with wrapped CEK
-		let recipient_info = self.build_kari_with_cek(&cek)?;
+		// 3. Build KARI with wrapped CEK (access via Secret.with())
+		let recipient_info = cek.with(|cek_bytes| self.build_kari_with_cek(cek_bytes))?;
 
-		// 4. Encrypt plaintext with CEK
-		let ciphertext = self.encrypt_plaintext(&cek, plaintext, aad)?;
+		// 4. Encrypt plaintext with CEK (access via Secret.with())
+		let ciphertext = cek.with(|cek_bytes| self.encrypt_plaintext(cek_bytes, plaintext, aad))?;
 
 		// 5. Build EncryptedContentInfo
 		let encrypted_content_info = self.build_encrypted_content_info(ciphertext)?;
@@ -191,6 +191,7 @@ where
 		let recip_infos = self.build_recipient_infos(recipient_info)?;
 
 		// 8. Build final EnvelopedData
+		// CEK is automatically zeroized when it goes out of scope
 		Ok(EnvelopedData {
 			version: CmsVersion::V3, // V3 for KeyAgreeRecipientInfo
 			originator_info: None,

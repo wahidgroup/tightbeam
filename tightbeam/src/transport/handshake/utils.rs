@@ -2,15 +2,18 @@
 //!
 //! Provides common cryptographic utilities used across handshake builders and processors.
 
+use crate::crypto::secret::Secret;
 use crate::transport::handshake::error::HandshakeError;
 use spki::AlgorithmIdentifierOwned;
 
 /// Generate a random 32-byte CEK for AES-256-GCM.
-pub fn generate_cek() -> Result<Vec<u8>, HandshakeError> {
+///
+/// Returns the CEK wrapped in `Secret<[u8; 32]>` for automatic zeroization.
+pub fn generate_cek() -> Result<Secret<[u8; 32]>, HandshakeError> {
 	use rand_core::RngCore;
-	let mut cek = vec![0u8; 32];
+	let mut cek = [0u8; 32];
 	rand_core::OsRng.fill_bytes(&mut cek);
-	Ok(cek)
+	Ok(Secret::from(Box::new(cek)))
 }
 
 /// AES-256-GCM encryption function.
@@ -140,9 +143,16 @@ mod tests {
 	fn test_cek_generation() -> Result<(), HandshakeError> {
 		let cek1 = generate_cek()?;
 		let cek2 = generate_cek()?;
-		assert_eq!(cek1.len(), 32);
-		assert_eq!(cek2.len(), 32);
-		assert_ne!(cek1, cek2);
+
+		// Verify both CEKs are 32 bytes by accessing them via Secret.with()
+		cek1.with(|bytes| assert_eq!(bytes.len(), 32));
+		cek2.with(|bytes| assert_eq!(bytes.len(), 32));
+
+		// Verify they're different (probabilistically)
+		let bytes1 = cek1.with(|b| *b);
+		let bytes2 = cek2.with(|b| *b);
+		assert_ne!(bytes1, bytes2);
+
 		Ok(())
 	}
 }

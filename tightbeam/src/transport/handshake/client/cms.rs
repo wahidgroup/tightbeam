@@ -6,12 +6,11 @@
 use core::future::Future;
 use core::pin::Pin;
 
-use crate::asn1::AES_256_WRAP_OID;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::negotiation::SecurityOffer;
-use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
+use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
@@ -52,7 +51,7 @@ where
 	client_key: P::SigningKey,
 	client_certificate: Option<Certificate>,
 	server_cert: Certificate,
-	transcript_hash: Vec<u8>,
+	transcript_hash: Option<[u8; 32]>,
 	session_key: Option<Secret<Vec<u8>>>,
 	security_offer: Option<SecurityOffer>,
 	selected_profile: Option<SecurityProfileDesc>,
@@ -81,14 +80,14 @@ where
 	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `client_key`: The client's signing key for authentication
 	/// - `server_cert`: The server's certificate (for key agreement)
-	/// - `transcript_hash`: The handshake transcript hash (from previous handshake messages)
-	pub fn new(provider: P, client_key: P::SigningKey, server_cert: Certificate, transcript_hash: Vec<u8>) -> Self {
+	/// - `transcript_hash`: The handshake transcript hash (32 bytes)
+	pub fn new(provider: P, client_key: P::SigningKey, server_cert: Certificate, transcript_hash: [u8; 32]) -> Self {
 		Self {
 			state: ClientStateMachine::new(),
 			client_key,
 			client_certificate: None,
 			server_cert,
-			transcript_hash,
+			transcript_hash: Some(transcript_hash),
 			session_key: None,
 			security_offer: None,
 			selected_profile: None,
@@ -214,7 +213,9 @@ where
 		// Verify content matches our transcript hash
 		let digest_oid = P::Digest::OID;
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
-		if verified_content != self.transcript_hash {
+
+		let expected_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+		if verified_content.len() != 32 || verified_content.as_slice() != &expected_hash {
 			Err(HandshakeError::SignatureVerificationFailed)
 		} else {
 			Ok(verified_content)
@@ -248,8 +249,13 @@ where
 		// 4. Build recipient identifier
 		let rid = self.build_recipient_identifier();
 
-		// 5. Key encryption algorithm (ECDH + HKDF + AES wrap)
-		let key_enc_alg = AlgorithmIdentifierOwned { oid: AES_256_WRAP_OID, parameters: None };
+		// 5. Key encryption algorithm from provider (ECDH + HKDF + key wrap)
+		let key_wrap_oid = self
+			.provider
+			.profile()
+			.key_wrap_oid()
+			.ok_or(HandshakeError::MissingKeyWrapAlgorithm)?;
+		let key_enc_alg = AlgorithmIdentifierOwned { oid: key_wrap_oid, parameters: None };
 
 		// 6. Build KARI (Key Agreement Recipient Info) structure
 		let kari_builder = TightBeamKariBuilder::new(self.provider.clone())
@@ -319,11 +325,14 @@ where
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 
-		// 3. Build SignedData
-		let mut builder = TightBeamSignedDataBuilder::<P>::new(self.client_key.clone(), digest_alg, signature_alg)?;
-		let signed_data_der = builder.build_der(&self.transcript_hash)?;
+		// 3. Get transcript hash
+		let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
-		// 4. Transition state & mark finished sent invariant
+		// 4. Build SignedData
+		let mut builder = TightBeamSignedDataBuilder::<P>::new(self.client_key.clone(), digest_alg, signature_alg)?;
+		let signed_data_der = builder.build_der(&transcript_hash)?;
+
+		// 5. Transition state & mark finished sent invariant
 		self.state.transition(ClientHandshakeState::ClientFinishedSent)?;
 		self.invariants.mark_finished_sent()?;
 
@@ -429,10 +438,11 @@ where
 			let cek = self.session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
+			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 			// 3. Derive final session key as P::AeadCipher
 			use crate::transport::handshake::HandshakeFinalization;
-			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, &self.transcript_hash))?;
+			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, &transcript_hash))?;
 
 			// 4. Transition to complete
 			self.state.transition(ClientHandshakeState::Completed)?;
@@ -476,11 +486,11 @@ mod tests {
 	#[test]
 	fn test_client_state_flow() -> Result<(), Box<dyn std::error::Error>> {
 		// Given: A CMS client in init state with a server certificate
-		let transcript_hash = vec![1u8; 32];
+		let transcript_hash = [1u8; 32];
 		let server_test_cert = create_test_certificate();
 		let mut client = TestCmsClientBuilder::new()
 			.with_server_cert(server_test_cert.certificate.clone())
-			.with_transcript_hash(transcript_hash.clone())
+			.with_transcript_hash(transcript_hash)
 			.build();
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 

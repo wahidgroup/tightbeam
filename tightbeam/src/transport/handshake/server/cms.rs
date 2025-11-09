@@ -60,7 +60,7 @@ where
 	server_key: Arc<dyn ServerHandshakeKey>,
 	client_cert: Option<Certificate>,
 	validated_client_cert: Option<Certificate>,
-	transcript_hash: Vec<u8>,
+	transcript_hash: Option<[u8; 32]>,
 	session_key: Option<Secret<Vec<u8>>>,
 	supported_profiles: Vec<SecurityProfileDesc>,
 	selected_profile: Option<SecurityProfileDesc>,
@@ -84,11 +84,11 @@ where
 	///
 	/// # Parameters
 	/// - `server_key`: The server's signing key for authentication (trait object)
-	/// - `transcript_hash`: The handshake transcript hash (from previous handshake messages)
+	/// - `transcript_hash`: The handshake transcript hash (32 bytes)
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
 		server_key: Arc<dyn ServerHandshakeKey>,
-		transcript_hash: Vec<u8>,
+		transcript_hash: [u8; 32],
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
@@ -96,7 +96,7 @@ where
 			server_key,
 			client_cert: None,
 			validated_client_cert: None,
-			transcript_hash,
+			transcript_hash: Some(transcript_hash),
 			session_key: None,
 			supported_profiles: Vec::new(),
 			selected_profile: None,
@@ -254,7 +254,9 @@ where
 		// Verify content matches our transcript hash
 		let digest_oid = P::Digest::OID;
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
-		if verified_content != self.transcript_hash {
+
+		let expected_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+		if verified_content.len() != 32 || verified_content.as_slice() != &expected_hash {
 			Err(HandshakeError::SignatureVerificationFailed)
 		} else {
 			Ok(verified_content)
@@ -337,9 +339,8 @@ where
 		let signature_alg = self.server_key.signature_algorithm();
 
 		// 3. Build SignedData
-		let signed_data_der =
-			self.server_key
-				.build_cms_signed_data(&self.transcript_hash, &digest_alg, &signature_alg)?;
+		let transcript = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
+		let signed_data_der = self.server_key.build_cms_signed_data(transcript, &digest_alg, &signature_alg)?;
 
 		// 4. Transition state & mark finished sent invariant
 		self.state.transition(ServerHandshakeState::ServerFinishedSent)?;
@@ -488,7 +489,8 @@ where
 
 			// 3. Derive final session key as P::AeadCipher using transcript hash as salt
 			use crate::transport::handshake::HandshakeFinalization;
-			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, &self.transcript_hash))?;
+			let transcript = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
+			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, transcript))?;
 
 			// 4. Transition to complete
 			self.state.transition(ServerHandshakeState::Completed)?;
@@ -543,10 +545,9 @@ mod tests {
 		/// Init → KeyExchangeReceived → ServerFinishedSent → ClientFinishedReceived → Complete
 		#[test]
 		fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
-			let transcript_hash = vec![1u8; 32];
-			let (mut server, server_public_key) = TestCmsServerBuilder::new()
-				.with_transcript_hash(transcript_hash.clone())
-				.build();
+			let transcript_hash = [1u8; 32];
+			let (mut server, server_public_key) =
+				TestCmsServerBuilder::new().with_transcript_hash(transcript_hash).build();
 
 			// Setup client cert for mutual auth
 			let client_test_cert = create_test_certificate();
@@ -601,10 +602,9 @@ mod tests {
 		/// selects a profile from its configured list and completes the handshake.
 		#[test]
 		fn test_cms_end_to_end_with_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
-			let transcript_hash = vec![1u8; 32];
-			let (mut server, server_public_key) = TestCmsServerBuilder::new()
-				.with_transcript_hash(transcript_hash.clone())
-				.build();
+			let transcript_hash = [1u8; 32];
+			let (mut server, server_public_key) =
+				TestCmsServerBuilder::new().with_transcript_hash(transcript_hash).build();
 
 			// Configure server with multiple profiles
 			let profiles = vec![

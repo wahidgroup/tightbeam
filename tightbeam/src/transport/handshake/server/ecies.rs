@@ -212,7 +212,7 @@ where
 	/// Complete the handshake and derive the final session key.
 	///
 	/// # Returns
-	/// AES-256-GCM session key
+	/// AEAD cipher session key from the provider
 	pub fn complete(&mut self) -> Result<P::AeadCipher, HandshakeError> {
 		// 1. Validate current state is KeyExchangeReceived
 		self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
