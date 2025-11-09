@@ -263,14 +263,14 @@ pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
 pub struct TestEciesServerBuilder {
 	key: Option<Secp256k1SigningKey>,
 	cert: Option<Certificate>,
-	aad_domain: Option<Vec<u8>>,
+	aad_domain: Option<&'static [u8]>,
 }
 
 #[cfg(feature = "x509")]
 impl TestEciesServerBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
-		Self { key: None, cert: None, aad_domain: Some(b"test-domain".to_vec()) }
+		Self { key: None, cert: None, aad_domain: None }
 	}
 
 	/// Set a specific signing key for the server.
@@ -286,7 +286,7 @@ impl TestEciesServerBuilder {
 	}
 
 	/// Set the AAD domain tag for ECIES operations.
-	pub fn with_aad_domain(mut self, domain: Vec<u8>) -> Self {
+	pub fn with_aad_domain(mut self, domain: &'static [u8]) -> Self {
 		self.aad_domain = Some(domain);
 		self
 	}
@@ -327,18 +327,18 @@ impl Default for TestEciesServerBuilder {
 /// Builder for creating test ECIES handshake clients with sensible defaults.
 #[cfg(feature = "x509")]
 pub struct TestEciesClientBuilder {
-	aad_domain: Option<Vec<u8>>,
+	aad_domain: Option<&'static [u8]>,
 }
 
 #[cfg(feature = "x509")]
 impl TestEciesClientBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
-		Self { aad_domain: Some(b"test-domain".to_vec()) }
+		Self { aad_domain: None }
 	}
 
 	/// Set the AAD domain tag for ECIES operations.
-	pub fn with_aad_domain(mut self, domain: Vec<u8>) -> Self {
+	pub fn with_aad_domain(mut self, domain: &'static [u8]) -> Self {
 		self.aad_domain = Some(domain);
 		self
 	}
@@ -369,7 +369,7 @@ impl TestCmsServerBuilder {
 	pub fn new() -> Self {
 		Self {
 			key: None,
-			transcript_hash: Some([1u8; 32]), // Default test transcript
+			transcript_hash: None, // Let CMS compute it internally by default
 		}
 	}
 
@@ -392,10 +392,14 @@ impl TestCmsServerBuilder {
 
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let verifying_key = *test_key.verifying_key();
-		let transcript_hash = self.transcript_hash.unwrap_or_else(|| [1u8; 32]);
 
+		// Apply transcript hash if explicitly set
 		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
-		let server = CmsHandshakeServerSecp256k1::new(Arc::new(test_key), transcript_hash, None);
+		let mut server = CmsHandshakeServerSecp256k1::new(Arc::new(test_key), None);
+		if let Some(hash) = self.transcript_hash {
+			server = server.with_transcript_hash(hash);
+		}
+
 		(server, public_key)
 	}
 }
@@ -422,7 +426,7 @@ impl TestCmsClientBuilder {
 		Self {
 			client_key: None,
 			server_cert: None,
-			transcript_hash: Some([1u8; 32]), // Default test transcript
+			transcript_hash: None, // Let CMS compute it internally by default
 		}
 	}
 
@@ -450,14 +454,14 @@ impl TestCmsClientBuilder {
 		let server_cert = self
 			.server_cert
 			.unwrap_or_else(|| create_test_certificate_from_key(&create_test_certificate().signing_key));
-		let transcript_hash = self.transcript_hash.unwrap_or([1u8; 32]);
 
-		let mut client = CmsHandshakeClientSecp256k1::new(
-			DefaultCryptoProvider::default(),
-			client_key,
-			Arc::new(server_cert),
-			transcript_hash,
-		);
+		let mut client =
+			CmsHandshakeClientSecp256k1::new(DefaultCryptoProvider::default(), client_key, Arc::new(server_cert));
+
+		// Apply transcript hash if explicitly set
+		if let Some(hash) = self.transcript_hash {
+			client = client.with_transcript_hash(hash);
+		}
 
 		client
 	}

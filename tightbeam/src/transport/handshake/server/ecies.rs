@@ -59,7 +59,7 @@ where
 	server_random: Option<[u8; 32]>,
 	base_session_key: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
-	aad_domain_tag: Option<Vec<u8>>,
+	aad_domain_tag: Option<&'static [u8]>,
 	supported_profiles: Vec<SecurityProfileDesc>,
 	selected_profile: Option<SecurityProfileDesc>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
@@ -83,7 +83,7 @@ where
 	pub fn new(
 		server_key: Arc<dyn ServerHandshakeKey>,
 		server_cert: Arc<Certificate>,
-		aad_domain_tag: Option<Vec<u8>>,
+		aad_domain_tag: Option<&'static [u8]>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
@@ -94,7 +94,7 @@ where
 			server_random: None,
 			base_session_key: None,
 			transcript_hash: None,
-			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
+			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
 			supported_profiles: Vec::new(), // Must be set via with_supported_profiles()
 			selected_profile: None,
 			client_validators,
@@ -743,11 +743,14 @@ mod tests {
 		plaintext[..32].copy_from_slice(&base_session_key);
 		plaintext[32..].copy_from_slice(&stored_client_random);
 
+		// Use server's AAD domain tag (or default if None)
+		let aad = server.aad_domain_tag.or(Some(crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG));
+
 		// Encrypt with ECIES
 		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
 			&server_pubkey,
 			&plaintext,
-			Some(b"test-domain"),
+			aad,
 			Some(&mut OsRng),
 		)?;
 

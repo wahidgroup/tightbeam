@@ -9,6 +9,7 @@ use core::pin::Pin;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
 use crate::crypto::aead::KeyInit;
+use crate::crypto::hash::Digest;
 use crate::crypto::negotiation::SecurityOffer;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
@@ -52,6 +53,7 @@ where
 	client_certificate: Option<Arc<Certificate>>,
 	server_cert: Arc<Certificate>,
 	transcript_hash: Option<[u8; 32]>,
+	transcript_buffer: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
 	security_offer: Option<SecurityOffer>,
 	selected_profile: Option<SecurityProfileDesc>,
@@ -80,19 +82,19 @@ where
 	/// - `provider`: The cryptographic provider defining the security profile
 	/// - `client_key`: The client's signing key for authentication
 	/// - `server_cert`: The server's certificate (for key agreement)
-	/// - `transcript_hash`: The handshake transcript hash (32 bytes)
-	pub fn new(
-		provider: P,
-		client_key: P::SigningKey,
-		server_cert: Arc<Certificate>,
-		transcript_hash: [u8; 32],
-	) -> Self {
+	///
+	/// # Transcript Hash
+	/// The transcript hash is computed internally from handshake messages.
+	/// If you need to provide an external transcript hash (for testing),
+	/// use `with_transcript_hash()` after construction.
+	pub fn new(provider: P, client_key: P::SigningKey, server_cert: Arc<Certificate>) -> Self {
 		Self {
 			state: ClientStateMachine::new(),
 			client_key,
 			client_certificate: None,
 			server_cert,
-			transcript_hash: Some(transcript_hash),
+			transcript_hash: None,
+			transcript_buffer: Vec::new(),
 			session_key: None,
 			security_offer: None,
 			selected_profile: None,
@@ -100,6 +102,15 @@ where
 			certificate_validator: None,
 			invariants: HandshakeInvariant::default(),
 		}
+	}
+
+	/// Set an external transcript hash (for testing or custom protocols).
+	///
+	/// When set, the internal transcript buffer is not used.
+	#[must_use]
+	pub fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
+		self.transcript_hash = Some(hash);
+		self
 	}
 
 	/// Set a certificate validator for the handshake.
@@ -202,6 +213,18 @@ where
 		)?)
 	}
 
+	/// Compute transcript hash from the accumulated buffer.
+	///
+	/// Uses the provider's digest algorithm for consistency with signatures.
+	fn compute_transcript_hash(&self) -> [u8; 32] {
+		let mut hasher = P::Digest::default();
+		hasher.update(&self.transcript_buffer);
+		let hash_result = hasher.finalize();
+		let mut hash_array = [0u8; 32];
+		hash_array.copy_from_slice(&hash_result);
+		hash_array
+	}
+
 	/// Verify the signature and content of the SignedData.
 	fn verify_signature(
 		&self,
@@ -273,7 +296,6 @@ where
 
 		// 7. Create EnvelopedData builder with generic curve type
 		let mut enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
-		enveloped_builder = enveloped_builder.with_content_encryption_alg(self.provider.to_aead_algorithm_identifier());
 
 		// 8. Add SecurityOffer as unprotected attribute if configured
 		if let Some(ref offer) = self.security_offer {
@@ -284,7 +306,12 @@ where
 		// 9. Build and encode
 		let enveloped_data_der = enveloped_builder.build_der(&session_key, None)?;
 
-		// 10. Store session key and transition state
+		// 10. Add to transcript if we're computing it internally
+		if self.transcript_hash.is_none() {
+			self.transcript_buffer.extend_from_slice(&enveloped_data_der);
+		}
+
+		// 11. Store session key and transition state
 		self.session_key = Some(Secret::from(session_key));
 		// Transition directly from Init -> KeyExchangeSent (CMS path) or HelloSent -> KeyExchangeSent
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
@@ -303,15 +330,21 @@ where
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
-		// 2. Extract cryptographic material
+		// 2. Add server finished to transcript and compute hash if needed
+		if self.transcript_hash.is_none() {
+			self.transcript_buffer.extend_from_slice(signed_data_der);
+			self.transcript_hash = Some(self.compute_transcript_hash());
+		}
+
+		// 3. Extract cryptographic material
 		let server_verifying_key = self.extract_server_verifying_key(&self.server_cert)?;
 		let expected_signer_identifier = self.compute_signer_identifier(&server_verifying_key)?;
 
-		// 3. Verify signature and content
+		// 4. Verify signature and content
 		let verified_content =
 			self.verify_signature(signed_data_der, server_verifying_key, expected_signer_identifier)?;
 
-		// 4. Transition state & lock transcript (transcript hash verified)
+		// 5. Transition state & lock transcript (transcript hash verified)
 		self.state.transition(ClientHandshakeState::ServerFinishedReceived)?;
 		self.invariants.lock_transcript()?;
 
@@ -481,9 +514,7 @@ mod tests {
 	use crate::der::Decode;
 	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
-	use crate::transport::handshake::processors::{
-		AesGcmContentDecryptor, TightBeamEnvelopedDataProcessor, TightBeamKariRecipient,
-	};
+	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	use crate::transport::handshake::state::ClientHandshakeState;
 	use crate::transport::handshake::tests::*;
 	use crate::{HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_256_OID};
@@ -511,8 +542,7 @@ mod tests {
 		let server_secret = SecretKey::from(server_test_cert.signing_key.clone());
 		let provider = DefaultCryptoProvider::default();
 		let kari_processor = TightBeamKariRecipient::new(provider, server_secret);
-		let content_decryptor = AesGcmContentDecryptor;
-		let processor = TightBeamEnvelopedDataProcessor::new(kari_processor, content_decryptor);
+		let processor = TightBeamEnvelopedDataProcessor::<DefaultCryptoProvider>::new(kari_processor);
 		let decrypted = processor.process(&enveloped_data)?;
 		assert_eq!(decrypted, session_key);
 

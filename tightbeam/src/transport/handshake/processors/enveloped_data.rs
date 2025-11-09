@@ -1,9 +1,11 @@
 //! EnvelopedData processor for TightBeam CMS handshake.
 //!
 //! Processes received EnvelopedData structures to decrypt content.
-//! Algorithm-agnostic design allows different content encryption algorithms.
 
-use crate::cms::enveloped_data::{EnvelopedData, RecipientInfo};
+use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo};
+use crate::crypto::aead::{Decryptor, KeyInit};
+use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::der::oid::AssociatedOid;
 use crate::transport::handshake::error::HandshakeError;
 
 /// Trait for processing RecipientInfo to extract the Content Encryption Key (CEK).
@@ -22,86 +24,38 @@ pub trait RecipientProcessor {
 	fn process_recipient(&self, info: &RecipientInfo, recipient_index: usize) -> Result<Vec<u8>, HandshakeError>;
 }
 
-/// Trait for decrypting content from an EncryptedContentInfo structure.
-///
-/// Note: This is defined in `crate::crypto::aead` as `Decryptor` but we need
-/// a version that works with raw bytes and algorithm OIDs for the processor.
-pub trait ContentDecryptor {
-	/// Decrypt encrypted content using the provided CEK.
-	///
-	/// # Parameters
-	/// - `encrypted_content`: The ciphertext to decrypt
-	/// - `cek`: The Content Encryption Key
-	/// - `algorithm_oid`: The content encryption algorithm OID
-	///
-	/// # Returns
-	/// The decrypted plaintext
-	fn decrypt_content(
-		&self,
-		encrypted_content: &[u8],
-		cek: &[u8],
-		algorithm_oid: &der::asn1::ObjectIdentifier,
-	) -> Result<Vec<u8>, HandshakeError>;
-}
-
-/// Simple AES-GCM content decryptor.
-///
-/// Decrypts content using AES-256-GCM. The nonce is embedded in the ciphertext
-/// by the `aes_gcm_decrypt` helper function.
-pub struct AesGcmContentDecryptor;
-
-impl ContentDecryptor for AesGcmContentDecryptor {
-	fn decrypt_content(
-		&self,
-		encrypted_content: &[u8],
-		cek: &[u8],
-		algorithm_oid: &der::asn1::ObjectIdentifier,
-	) -> Result<Vec<u8>, HandshakeError> {
-		// Verify it's AES-256-GCM
-		use crate::asn1::AES_256_GCM_OID;
-		if algorithm_oid != &AES_256_GCM_OID {
-			return Err(HandshakeError::MissingContentEncryptionAlgorithm);
-		}
-
-		// Decrypt using the utils function
-		use crate::transport::handshake::utils::aes_gcm_decrypt;
-		aes_gcm_decrypt(cek, encrypted_content, None)
-	}
-}
-
 /// Processor for CMS `EnvelopedData` structures.
 ///
-/// This is algorithm-agnostic - it delegates:
-/// - Recipient info processing to a `RecipientProcessor` implementation
-/// - Content decryption to a `ContentDecryptor` implementation
-///
-/// This allows flexibility to support different key agreement mechanisms
-/// and content encryption algorithms without hardcoding specific choices.
-pub struct TightBeamEnvelopedDataProcessor {
+/// This delegates recipient info processing to a `RecipientProcessor` implementation
+/// and uses the standard `Decryptor` trait from `crypto::aead` for content decryption.
+pub struct TightBeamEnvelopedDataProcessor<P = DefaultCryptoProvider>
+where
+	P: CryptoProvider,
+{
 	/// Processor to extract CEK from RecipientInfo
 	recipient_processor: Box<dyn RecipientProcessor>,
 
-	/// Decryptor for content
-	content_decryptor: Box<dyn ContentDecryptor>,
-
 	/// Recipient index to use (default: 0)
 	recipient_index: usize,
+
+	/// Phantom data for crypto provider
+	_phantom: core::marker::PhantomData<P>,
 }
 
-impl TightBeamEnvelopedDataProcessor {
+impl<P> TightBeamEnvelopedDataProcessor<P>
+where
+	P: CryptoProvider,
+	P::AeadCipher: KeyInit,
+{
 	/// Create a new EnvelopedData processor.
-	///
-	/// Note: You must set the recipient processor and content decryptor
-	/// before calling `process()`.
-	pub fn new<R, D>(recipient_processor: R, content_decryptor: D) -> Self
+	pub fn new<R>(recipient_processor: R) -> Self
 	where
 		R: RecipientProcessor + 'static,
-		D: ContentDecryptor + 'static,
 	{
 		Self {
 			recipient_processor: Box::new(recipient_processor),
-			content_decryptor: Box::new(content_decryptor),
 			recipient_index: 0,
+			_phantom: core::marker::PhantomData,
 		}
 	}
 
@@ -111,13 +65,51 @@ impl TightBeamEnvelopedDataProcessor {
 		self
 	}
 
+	fn validate_recipient_index(&self, enveloped_data: &EnvelopedData) -> Result<(), HandshakeError> {
+		if self.recipient_index >= enveloped_data.recip_infos.0.len() {
+			Err(HandshakeError::InvalidRecipientIndex)
+		} else {
+			Ok(())
+		}
+	}
+
+	fn extract_cek(&self, recipient_info: &RecipientInfo) -> Result<Vec<u8>, HandshakeError> {
+		self.recipient_processor.process_recipient(recipient_info, self.recipient_index)
+	}
+
+	fn validate_encryption_algorithm(encrypted_content_info: &EncryptedContentInfo) -> Result<(), HandshakeError>
+	where
+		P::AeadOid: AssociatedOid,
+	{
+		if encrypted_content_info.content_enc_alg.oid != P::AeadOid::OID {
+			Err(HandshakeError::MissingContentEncryptionAlgorithm)
+		} else {
+			Ok(())
+		}
+	}
+
+	fn create_cipher_from_cek(cek: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
+		P::AeadCipher::new_from_slice(cek)
+			.map_err(|_| HandshakeError::InvalidKeySize { expected: 32, received: cek.len() })
+	}
+
+	fn decrypt_content(
+		cipher: &P::AeadCipher,
+		encrypted_content_info: &EncryptedContentInfo,
+	) -> Result<Vec<u8>, HandshakeError>
+	where
+		P::AeadCipher: Decryptor,
+	{
+		Ok(cipher.decrypt_content(encrypted_content_info)?)
+	}
+
 	/// Process an EnvelopedData structure to extract and decrypt content.
 	///
 	/// # Steps
-	/// 1. Validate RecipientInfos contains the specified index
+	/// 1. Validate recipient index
 	/// 2. Extract CEK using recipient processor
-	/// 3. Extract encrypted content from EncryptedContentInfo
-	/// 4. Decrypt content using content decryptor
+	/// 3. Validate encryption algorithm
+	/// 4. Decrypt content
 	///
 	/// # Parameters
 	/// - `enveloped_data`: The EnvelopedData structure to process
@@ -126,33 +118,19 @@ impl TightBeamEnvelopedDataProcessor {
 	/// The decrypted plaintext content
 	pub fn process(&self, enveloped_data: &EnvelopedData) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validate recipient index
-		let recip_vec = enveloped_data.recip_infos.0.as_ref();
-		if self.recipient_index >= recip_vec.len() {
-			return Err(HandshakeError::InvalidRecipientIndex);
-		}
+		self.validate_recipient_index(enveloped_data)?;
 
-		// 2. Extract CEK using recipient processor
-		let recipient_info = &recip_vec[self.recipient_index];
-		let cek = self
-			.recipient_processor
-			.process_recipient(recipient_info, self.recipient_index)?;
+		// 2. Extract CEK
+		let recipient_info = &enveloped_data.recip_infos.0.as_ref()[self.recipient_index];
+		let cek = self.extract_cek(recipient_info)?;
 
-		// 3. Get encrypted content
+		// 3. Validate encryption algorithm
 		let encrypted_content_info = &enveloped_data.encrypted_content;
+		Self::validate_encryption_algorithm(encrypted_content_info)?;
 
-		// The encrypted content should be present for EnvelopedData
-		let encrypted_content = encrypted_content_info
-			.encrypted_content
-			.as_ref()
-			.ok_or(HandshakeError::MissingContentEncryptionAlgorithm)?; // Better error needed
-
-		// 4. Decrypt content using the algorithm specified
-		let content_enc_alg = &encrypted_content_info.content_enc_alg;
-		let plaintext =
-			self.content_decryptor
-				.decrypt_content(encrypted_content.as_bytes(), &cek, &content_enc_alg.oid)?;
-
-		Ok(plaintext)
+		// 4. Decrypt content
+		let cipher = Self::create_cipher_from_cek(&cek)?;
+		Self::decrypt_content(&cipher, encrypted_content_info)
 	}
 
 	/// Extract unprotected attributes from the EnvelopedData.
@@ -163,6 +141,17 @@ impl TightBeamEnvelopedDataProcessor {
 		enveloped_data: &'a EnvelopedData,
 	) -> Option<&'a [x509_cert::attr::Attribute]> {
 		enveloped_data.unprotected_attrs.as_ref().map(|attrs| attrs.as_slice())
+	}
+}
+
+/// Default implementation for DefaultCryptoProvider.
+impl TightBeamEnvelopedDataProcessor<DefaultCryptoProvider> {
+	/// Create a processor with default TightBeam settings.
+	pub fn with_defaults<R>(recipient_processor: R) -> Self
+	where
+		R: RecipientProcessor + 'static,
+	{
+		Self::new(recipient_processor)
 	}
 }
 
@@ -214,19 +203,6 @@ mod tests {
 			}
 		}
 
-		/// Dummy content decryptor for testing
-		struct DummyContentDecryptor;
-		impl ContentDecryptor for DummyContentDecryptor {
-			fn decrypt_content(
-				&self,
-				_encrypted_content: &[u8],
-				_cek: &[u8],
-				_algorithm_oid: &der::asn1::ObjectIdentifier,
-			) -> Result<Vec<u8>, HandshakeError> {
-				Ok(vec![])
-			}
-		}
-
 		#[test]
 		fn test_roundtrip_with_kari_aes_gcm() -> Result<(), Box<dyn std::error::Error>> {
 			// 1. Create test key pairs
@@ -242,15 +218,14 @@ mod tests {
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 			let enveloped_data = builder.build(plaintext, None)?;
 
-			// 5. Create recipient processor and content decryptor
+			// 5. Create recipient processor
 			let kari_recipient = TightBeamKariRecipient::with_defaults(recipient_key);
-			let content_decryptor = AesGcmContentDecryptor;
 
 			// 6. Create processor and decrypt (recipient side)
-			let processor = TightBeamEnvelopedDataProcessor::new(kari_recipient, content_decryptor);
-			let decrypted = processor.process(&enveloped_data)?;
+			let processor = TightBeamEnvelopedDataProcessor::with_defaults(kari_recipient);
 
 			// 7. Verify roundtrip success
+			let decrypted = processor.process(&enveloped_data)?;
 			assert_eq!(decrypted, plaintext);
 
 			Ok(())
@@ -267,8 +242,8 @@ mod tests {
 			let enveloped_data = builder.build(b"Test message", None)?;
 
 			// 3. Create processor with invalid recipient index
-			let processor = TightBeamEnvelopedDataProcessor::new(DummyRecipientProcessor, DummyContentDecryptor)
-				.with_recipient_index(99); // Invalid index
+			let processor =
+				TightBeamEnvelopedDataProcessor::with_defaults(DummyRecipientProcessor).with_recipient_index(99);
 
 			// 4. Attempt to process with invalid index
 			let result = processor.process(&enveloped_data);
@@ -300,11 +275,12 @@ mod tests {
 			let enveloped_data = builder.build(b"Test with attributes", None)?;
 
 			// 4. Extract attributes using processor
-			let processor = TightBeamEnvelopedDataProcessor::new(DummyRecipientProcessor, AesGcmContentDecryptor);
-			let attrs = processor.extract_unprotected_attributes(&enveloped_data);
+			let processor = TightBeamEnvelopedDataProcessor::with_defaults(DummyRecipientProcessor);
 
 			// 5. Verify attributes were extracted correctly
+			let attrs = processor.extract_unprotected_attributes(&enveloped_data);
 			assert!(attrs.is_some());
+
 			let attrs = attrs.unwrap();
 			assert_eq!(attrs.len(), 1);
 			assert_eq!(attrs[0].oid, test_oid);

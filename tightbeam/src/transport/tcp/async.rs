@@ -52,11 +52,11 @@ impl From<TcpStream> for TokioStream {
 pub struct TokioListener {
 	listener: TcpListener,
 	#[cfg(feature = "x509")]
-	certificate: Option<Certificate>,
+	certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
-	aad_domain_tag: Option<Vec<u8>>,
+	aad_domain_tag: Option<&'static [u8]>,
 	#[cfg(feature = "x509")]
 	max_cleartext_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
@@ -105,15 +105,15 @@ impl TokioListener {
 		let mut transport = TcpTransport::from(TokioStream::from(stream));
 
 		if let Some(cert) = &self.certificate {
-			transport.server_certificate = Some(cert.clone());
+			transport.server_certificate = Some(Arc::clone(cert));
 		}
 
 		if let Some(ref validators) = self.client_validators {
 			transport.client_validators = Some(Arc::clone(validators));
 		}
 
-		if let Some(ref aad) = self.aad_domain_tag {
-			transport.aad_domain_tag = Some(aad.clone());
+		if let Some(aad) = self.aad_domain_tag {
+			transport.aad_domain_tag = Some(aad);
 		}
 
 		if let Some(max) = self.max_cleartext_envelope {
@@ -131,7 +131,7 @@ impl TokioListener {
 
 		#[cfg(feature = "x509")]
 		if let Some(signatory) = &self.signatory {
-			transport.signatory = Some(signatory.clone());
+			transport.signatory = Some(Arc::clone(signatory));
 		}
 
 		Ok((transport, addr))
@@ -204,13 +204,13 @@ impl EncryptedProtocol for TokioListener {
 		Ok((
 			Self {
 				listener,
-				certificate: Some(config.certificate.clone()),
+				certificate: Some(Arc::new(config.certificate)),
 				client_validators: config.client_validators.as_ref().map(Arc::clone),
-				aad_domain_tag: Some(config.aad_domain_tag.clone()),
+				aad_domain_tag: Some(config.aad_domain_tag),
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 				handshake_timeout: Some(config.handshake_timeout),
-				signatory: Some(config.signatory.clone()),
+				signatory: Some(Arc::clone(&config.signatory)),
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
@@ -239,7 +239,7 @@ where
 	}
 
 	fn server_certificate(&self) -> Option<&Certificate> {
-		self.server_certificate.as_ref()
+		self.server_certificate.as_ref().map(|arc| arc.as_ref())
 	}
 
 	fn set_symmetric_key(&mut self, key: RuntimeAead) {
@@ -263,12 +263,12 @@ impl AsyncListenerTrait for TokioListener {
 
 		#[cfg(feature = "x509")]
 		if let Some(ref cert) = self.certificate {
-			transport.server_certificate = Some(cert.clone());
+			transport.server_certificate = Some(Arc::clone(cert));
 		}
 
 		#[cfg(feature = "x509")]
 		if let Some(ref signatory) = self.signatory {
-			transport.signatory = Some(signatory.clone());
+			transport.signatory = Some(Arc::clone(signatory));
 		}
 
 		#[cfg(feature = "x509")]
@@ -295,15 +295,15 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
 	#[cfg(feature = "x509")]
-	server_certificate: Option<Certificate>,
+	server_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
-	client_certificate: Option<Certificate>,
+	client_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
 	peer_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
-	aad_domain_tag: Option<Vec<u8>>,
+	aad_domain_tag: Option<&'static [u8]>,
 	#[cfg(feature = "x509")]
 	max_cleartext_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
@@ -327,15 +327,15 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "x509")]
-	server_certificate: Option<Certificate>,
+	server_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
-	client_certificate: Option<Certificate>,
+	client_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
 	peer_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
-	aad_domain_tag: Option<Vec<u8>>,
+	aad_domain_tag: Option<&'static [u8]>,
 	#[cfg(feature = "x509")]
 	max_cleartext_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
@@ -720,7 +720,7 @@ where
 				// Perform client-side handshake
 				self.perform_client_handshake().await?;
 			} // Wrap in envelope and send
-			let envelope = TransportEnvelope::from(current_message.clone());
+			let envelope = TransportEnvelope::from(current_message);
 
 			// Check if encryption should be used
 			let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
@@ -796,9 +796,7 @@ where
 				}
 			};
 
-			let policy: Option<Frame> =
-				self.get_restart_policy()
-					.evaluate(current_message.clone(), result, current_attempt);
+			let policy: Option<Frame> = self.get_restart_policy().evaluate(current_message, result, current_attempt);
 			match policy {
 				Some(retry_message) => {
 					if current_attempt == usize::MAX {

@@ -39,16 +39,16 @@ pub struct TcpTransport<S: ProtocolStream> {
 	#[cfg(feature = "transport-policy")]
 	collector_gate: Box<dyn GatePolicy>,
 
-	server_certificate: Option<Certificate>,
+	server_certificate: Option<Arc<Certificate>>,
 
-	client_certificate: Option<Certificate>,
+	client_certificate: Option<Arc<Certificate>>,
 
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 
 	peer_certificate: Option<Certificate>,
 
 	#[allow(dead_code)]
-	aad_domain_tag: Option<Vec<u8>>,
+	aad_domain_tag: Option<&'static [u8]>,
 
 	max_cleartext_envelope: Option<usize>,
 
@@ -342,7 +342,7 @@ where
 				self.perform_client_handshake().await?;
 			}
 
-			let envelope = TransportEnvelope::from(current_message.clone());
+			let envelope = TransportEnvelope::from(current_message);
 			let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
 				// Removed unused imports
 				let envelope_bytes = envelope.to_der()?;
@@ -401,9 +401,7 @@ where
 				}
 			};
 
-			let policy: Option<Frame> =
-				self.get_restart_policy()
-					.evaluate(current_message.clone(), result, current_attempt);
+			let policy: Option<Frame> = self.get_restart_policy().evaluate(current_message, result, current_attempt);
 			match policy {
 				Some(retry_message) => {
 					if current_attempt == usize::MAX {
@@ -447,7 +445,7 @@ where
 	}
 
 	fn server_certificate(&self) -> Option<&Certificate> {
-		self.server_certificate.as_ref()
+		self.server_certificate.as_ref().map(|arc| arc.as_ref())
 	}
 
 	fn set_symmetric_key(&mut self, key: RuntimeAead) {
@@ -460,10 +458,10 @@ where
 /// TCP server using abstract listener trait
 pub struct TcpListener<L: TcpListenerTrait> {
 	listener: L,
-	certificate: Option<crate::x509::Certificate>,
+	certificate: Option<Arc<crate::x509::Certificate>>,
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	aad_domain_tag: Option<Vec<u8>>,
+	aad_domain_tag: Option<&'static [u8]>,
 	max_cleartext_envelope: Option<usize>,
 	max_encrypted_envelope: Option<usize>,
 	signatory: Option<Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
@@ -542,13 +540,13 @@ where
 
 		{
 			if let Some(ref cert) = self.certificate {
-				transport.server_certificate = Some(cert.clone());
+				transport.server_certificate = Some(Arc::clone(cert));
 			}
 			if let Some(ref validators) = self.client_validators {
 				transport.client_validators = Some(Arc::clone(validators));
 			}
-			if let Some(ref aad) = self.aad_domain_tag {
-				transport.aad_domain_tag = Some(aad.clone());
+			if let Some(aad) = self.aad_domain_tag {
+				transport.aad_domain_tag = Some(aad);
 			}
 			if let Some(max) = self.max_cleartext_envelope {
 				transport.max_cleartext_envelope = Some(max);
@@ -581,10 +579,10 @@ impl EncryptedProtocol for TcpListener<std::net::TcpListener> {
 		Ok((
 			TcpListener {
 				listener,
-				certificate: Some(config.certificate.clone()),
+				certificate: Some(Arc::new(config.certificate)),
 				#[cfg(feature = "x509")]
 				client_validators: config.client_validators.as_ref().map(Arc::clone),
-				aad_domain_tag: Some(config.aad_domain_tag.clone()),
+				aad_domain_tag: Some(config.aad_domain_tag),
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 

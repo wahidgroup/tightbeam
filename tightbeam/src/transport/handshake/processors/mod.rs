@@ -7,7 +7,7 @@ pub mod kari;
 pub use kari::TightBeamKariRecipient;
 
 pub mod enveloped_data;
-pub use enveloped_data::{AesGcmContentDecryptor, TightBeamEnvelopedDataProcessor};
+pub use enveloped_data::TightBeamEnvelopedDataProcessor;
 
 pub mod signed_data;
 pub use signed_data::TightBeamSignedDataProcessor;

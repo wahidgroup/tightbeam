@@ -21,6 +21,7 @@ use crate::cms::enveloped_data::EnvelopedData;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::aead::KeyInit;
+use crate::crypto::hash::Digest;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
@@ -61,6 +62,7 @@ where
 	client_cert: Option<Arc<Certificate>>,
 	validated_client_cert: Option<Arc<Certificate>>,
 	transcript_hash: Option<[u8; 32]>,
+	transcript_buffer: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
 	supported_profiles: Vec<SecurityProfileDesc>,
 	selected_profile: Option<SecurityProfileDesc>,
@@ -84,11 +86,9 @@ where
 	///
 	/// # Parameters
 	/// - `server_key`: The server's signing key for authentication (trait object)
-	/// - `transcript_hash`: The handshake transcript hash (32 bytes)
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
 		server_key: Arc<dyn ServerHandshakeKey>,
-		transcript_hash: [u8; 32],
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
@@ -96,19 +96,30 @@ where
 			server_key,
 			client_cert: None,
 			validated_client_cert: None,
-			transcript_hash: Some(transcript_hash),
+			transcript_hash: None,
+			transcript_buffer: Vec::new(),
 			session_key: None,
 			supported_profiles: Vec::new(),
 			selected_profile: None,
 			client_validators,
 			_phantom: PhantomData,
 			invariants: {
-				let mut inv = HandshakeInvariant::default();
-				// CMS server receives transcript hash externally (already immutable); locking should never fail here.
-				let _ = inv.lock_transcript();
+				let inv = HandshakeInvariant::default();
+				// CMS server will lock transcript when it's computed
 				inv
 			},
 		}
+	}
+
+	/// Set an external transcript hash (for testing or custom protocols).
+	///
+	/// When set, the internal transcript buffer is not used.
+	#[must_use]
+	pub fn with_transcript_hash(mut self, hash: [u8; 32]) -> Self {
+		self.transcript_hash = Some(hash);
+		// Lock transcript immediately since it's externally provided
+		let _ = self.invariants.lock_transcript();
+		self
 	}
 
 	/// Configures supported cryptographic profiles for negotiation.
@@ -156,6 +167,18 @@ where
 	/// Returns `None` if no negotiation occurred (no profiles configured).
 	pub fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
+	}
+
+	/// Compute transcript hash from the accumulated buffer.
+	///
+	/// Uses SHA3-256 for consistency with the protocol.
+	fn compute_transcript_hash(&self) -> [u8; 32] {
+		let mut hasher = P::Digest::default();
+		hasher.update(&self.transcript_buffer);
+		let hash_result = hasher.finalize();
+		let mut hash_array = [0u8; 32];
+		hash_array.copy_from_slice(&hash_result);
+		hash_array
 	}
 
 	/// Validate that the current state matches the expected state.
@@ -309,19 +332,24 @@ where
 		// 1. Validation
 		self.validate_expected_state(ServerHandshakeState::Init)?;
 
-		// 2. Transition to received state
+		// 2. Add key exchange to transcript if computing internally
+		if self.transcript_hash.is_none() {
+			self.transcript_buffer.extend_from_slice(enveloped_data_der);
+		}
+
+		// 3. Transition to received state
 		self.state.transition(ServerHandshakeState::KeyExchangeReceived)?;
 
-		// 3. Decode EnvelopedData to access encrypted content
+		// 4. Decode EnvelopedData to access encrypted content
 		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 
-		// 4. Early alert detection (abort before heavy crypto or negotiation)
+		// 5. Early alert detection (abort before heavy crypto or negotiation)
 		self.check_for_alert(enveloped_data.unprotected_attrs.as_ref())?;
 
-		// 5. Process SecurityOffer and perform profile negotiation
+		// 6. Process SecurityOffer and perform profile negotiation
 		self.process_security_offer(enveloped_data.unprotected_attrs.as_ref())?;
 
-		// 6. Decrypt and store session key
+		// 7. Decrypt and store session key
 		self.decrypt_session_key(enveloped_data_der)?;
 		// Transcript implicitly locked for CMS (provided externally). Mark AEAD derivation here
 		// as session key material now available.
@@ -338,15 +366,27 @@ where
 		// 1. Validation
 		self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
 
-		// 2. Get algorithm identifiers from the key implementation
+		// 2. Compute transcript hash if not already set
+		if self.transcript_hash.is_none() {
+			self.transcript_hash = Some(self.compute_transcript_hash());
+			// Lock transcript now that it's computed
+			self.invariants.lock_transcript()?;
+		}
+
+		// 3. Get algorithm identifiers from the key implementation
 		let digest_alg = self.server_key.digest_algorithm();
 		let signature_alg = self.server_key.signature_algorithm();
 
-		// 3. Build SignedData
+		// 4. Build SignedData
 		let transcript = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
 		let signed_data_der = self.server_key.build_cms_signed_data(transcript, &digest_alg, &signature_alg)?;
 
-		// 4. Transition state & mark finished sent invariant
+		// 5. Add to transcript if computing internally
+		if !self.transcript_buffer.is_empty() {
+			self.transcript_buffer.extend_from_slice(&signed_data_der);
+		}
+
+		// 6. Transition state & mark finished sent invariant
 		self.state.transition(ServerHandshakeState::ServerFinishedSent)?;
 		self.invariants.mark_finished_sent()?;
 
@@ -364,15 +404,20 @@ where
 		// 1. Validation
 		self.validate_expected_state(ServerHandshakeState::ServerFinishedSent)?;
 
-		// 2. Extract cryptographic material
+		// 2. Add client finished to transcript if computing internally
+		if !self.transcript_buffer.is_empty() {
+			self.transcript_buffer.extend_from_slice(signed_data_der);
+		}
+
+		// 3. Extract cryptographic material
 		let client_verifying_key = self.extract_client_verifying_key()?;
 		let expected_signer_identifier = self.compute_client_signer_identifier(&client_verifying_key)?;
 
-		// 3. Verify signature and content
+		// 4. Verify signature and content
 		let verified_content =
 			self.verify_client_signature(signed_data_der, client_verifying_key, expected_signer_identifier)?;
 
-		// 4. Transition state
+		// 5. Transition state
 		self.state.transition(ServerHandshakeState::ClientFinishedReceived)?;
 
 		Ok(verified_content)

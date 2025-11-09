@@ -3,6 +3,11 @@ extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 pub mod sync;
 
@@ -11,6 +16,12 @@ pub mod r#async;
 
 use crate::transport::{Protocol, ProtocolStream};
 
+#[cfg(feature = "x509")]
+use crate::crypto::x509::error::CertificateValidationError;
+#[cfg(feature = "x509")]
+use crate::crypto::x509::policy::CertificateValidation;
+#[cfg(feature = "x509")]
+use crate::crypto::x509::Certificate;
 #[cfg(not(feature = "tokio"))]
 use crate::transport::tcp::r#async::TcpTransport;
 #[cfg(feature = "std")]
@@ -22,17 +33,14 @@ use crate::transport::{tcp::sync::TcpTransport, Mycelial};
 pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
 
 /// Composite validator that runs multiple validators in sequence.
-#[cfg(all(feature = "x509", feature = "std"))]
+#[cfg(feature = "x509")]
 struct CompositeValidator {
-	validators: std::sync::Arc<Vec<std::sync::Arc<dyn crate::crypto::x509::policy::CertificateValidation>>>,
+	validators: Arc<Vec<Arc<dyn CertificateValidation>>>,
 }
 
-#[cfg(all(feature = "x509", feature = "std"))]
-impl crate::crypto::x509::policy::CertificateValidation for CompositeValidator {
-	fn evaluate(
-		&self,
-		cert: &crate::x509::Certificate,
-	) -> core::result::Result<(), crate::crypto::x509::error::CertificateValidationError> {
+#[cfg(feature = "x509")]
+impl CertificateValidation for CompositeValidator {
+	fn evaluate(&self, cert: &Certificate) -> ::core::result::Result<(), CertificateValidationError> {
 		for validator in self.validators.iter() {
 			validator.evaluate(cert)?;
 		}
@@ -287,7 +295,7 @@ macro_rules! impl_tcp_common {
 			/// Set the server's certificate on the client transport
 			/// This indicates that the server requires encryption
 			pub fn with_server_certificate(mut self, cert: $crate::x509::Certificate) -> Self {
-				self.server_certificate = Some(cert);
+				self.server_certificate = Some(Arc::new(cert));
 				self
 			}
 
@@ -295,9 +303,9 @@ macro_rules! impl_tcp_common {
 			pub fn with_client_identity(
 				mut self,
 				cert: $crate::x509::Certificate,
-				key: std::sync::Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
+				key: Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
 			) -> Self {
-				self.client_certificate = Some(cert);
+				self.client_certificate = Some(Arc::new(cert));
 				self.signatory = Some(key);
 				self
 			}
@@ -326,55 +334,72 @@ macro_rules! impl_tcp_common {
 			/// 7. Stores session key and marks handshake complete
 			async fn perform_client_handshake(&mut self) -> TransportResult<()> {
 				use $crate::der::{Decode, Encode};
+				use $crate::transport::handshake::ClientHello;
+				use $crate::transport::handshake::HandshakeError;
+				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+				use $crate::transport::handshake::client::EciesHandshakeClientSecp256k1;
+				use $crate::transport::tcp::CompositeValidator;
 				use $crate::transport::handshake::{
 					ClientHandshakeProtocol, HandshakeProtocolKind,
 				};
-				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
-			// Create appropriate handshake orchestrator based on protocol kind
-			let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = $crate::transport::handshake::HandshakeError>> = match self.handshake_protocol_kind {
-				HandshakeProtocolKind::Ecies => {
-					let aad = self.aad_domain_tag.clone();
-					let mut client = $crate::transport::handshake::client::EciesHandshakeClientSecp256k1::new(aad);
+				let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = HandshakeError>> = match self.handshake_protocol_kind {
+					HandshakeProtocolKind::Ecies => {
+						// Set client identity if available
+						let mut client = EciesHandshakeClientSecp256k1::new(None);
+						if let (Some(cert_arc), Some(key)) = (&self.client_certificate, &self.signatory) {
+							client = client.with_client_identity(Arc::clone(cert_arc), Arc::clone(key));
+						}
 
-					// Set client identity if available (for mutual authentication)
-					if let (Some(cert), Some(key)) = (&self.client_certificate, &self.signatory) {
-						client = client.with_client_identity(cert.clone(), std::sync::Arc::clone(key));
-					}						// Set certificate validators if available
+						// Set certificate validators if available
 						#[cfg(all(feature = "x509", feature = "std"))]
 						if let Some(validators) = &self.client_validators {
-							let composite = $crate::transport::tcp::CompositeValidator {
-								validators: std::sync::Arc::clone(validators),
+							let composite = CompositeValidator {
+								validators: Arc::clone(validators),
 							};
-							client = client.with_certificate_validator(std::sync::Arc::new(composite));
+							client = client.with_certificate_validator(Arc::new(composite));
 						}
 
 						Box::new(client)
 					}
-					#[cfg(all(
-						feature = "builder",
-						feature = "aead",
-						feature = "signature"
-					))]
+
+					#[cfg(feature = "transport-cms")]
 					HandshakeProtocolKind::Cms => {
-						// TODO: CMS client needs signatory and transcript hash - not yet properly integrated
-						return Err(TransportError::InvalidMessage);
+						// Get server certificate and signatory for CMS client
+						let server_cert = self.server_certificate.as_ref()
+							.ok_or(TransportError::Forbidden)?;
+						let signatory = self.signatory.as_ref()
+							.ok_or(TransportError::Forbidden)?;
+
+						// Build composite validator if validators are configured
+						#[cfg(all(feature = "x509", feature = "std"))]
+						let validator = self.client_validators.as_ref().map(|validators| {
+							let composite = CompositeValidator {
+								validators: Arc::clone(validators),
+							};
+							Arc::new(composite) as Arc<dyn $crate::crypto::x509::policy::CertificateValidation>
+						});
+
+						#[cfg(not(all(feature = "x509", feature = "std")))]
+						let validator = None;
+
+						// Use trait method to create CMS client with concrete key type
+						signatory.create_cms_client(Arc::clone(server_cert), validator)?
 					}
 				};
 
 				// Step 1: Start handshake - get initial message
 				let initial_message = orchestrator.start().await?;
-
 				if initial_message.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);
 				}
 
 				// Parse ClientHello and wrap in SignedData → TransportEnvelope
-				use $crate::transport::handshake::ClientHello;
 				let client_hello = ClientHello::from_der(&initial_message)?;
 				let signed_data: $crate::cms::signed_data::SignedData =
 					(&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
 				let initial_envelope = TransportEnvelope::SignedData(signed_data);
+
 				let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
 				self.write_envelope(&wire_envelope.to_der()?).await?;
 
@@ -397,9 +422,9 @@ macro_rules! impl_tcp_common {
 				if response_wire_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);
 				}
-				let response_wire = WireEnvelope::from_der(&response_wire_bytes)?;
 
 				// Unwrap WireEnvelope to get TransportEnvelope
+				let response_wire = WireEnvelope::from_der(&response_wire_bytes)?;
 				let response_envelope = match response_wire {
 					WireEnvelope::Cleartext(env) => env,
 					WireEnvelope::Encrypted(_) => {
@@ -416,6 +441,7 @@ macro_rules! impl_tcp_common {
 				};
 				let server_handshake: ServerHandshake =
 					(&signed_data).try_into().map_err(|_| TransportError::InvalidMessage)?;
+
 				let response_bytes = server_handshake.to_der()?;
 				if response_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 					return Err(TransportError::InvalidMessage);
@@ -429,25 +455,27 @@ macro_rules! impl_tcp_common {
 					if msg_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
 						return Err(TransportError::InvalidMessage);
 					}
+
 					// Parse ClientKeyExchange and wrap in EnvelopedData
 					use $crate::transport::handshake::ClientKeyExchange;
 					let client_kex = ClientKeyExchange::from_der(&msg_bytes)?;
 					let enveloped_data: $crate::cms::enveloped_data::EnvelopedData =
 						(&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
 					let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
+
 					let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
 					self.write_envelope(&wire_envelope.to_der()?).await?;
 				}
 
-			// Step 5: Complete handshake and get RuntimeAead
-			let session_key = orchestrator.complete().await?;
+				// Step 5: Complete handshake and get RuntimeAead
+				let session_key = orchestrator.complete().await?;
 
-			// Store session key and mark handshake complete
-			self.set_symmetric_key(session_key);
-			self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
+				// Store session key and mark handshake complete
+				self.set_symmetric_key(session_key);
+				self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
 
-			Ok(())
-		}
+				Ok(())
+			}
 
 			/// Perform server-side handshake with client using ServerHandshakeProtocol trait.
 			///
@@ -468,55 +496,65 @@ macro_rules! impl_tcp_common {
 					return Err(TransportError::InvalidMessage);
 				}
 
-			// Parse TransportEnvelope and extract the handshake message
-			let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
-			let raw_message = match &transport_envelope {
-				TransportEnvelope::SignedData(sd) => {
-					// This is ClientHello (first message from client)
-					use $crate::transport::handshake::ClientHello;
-					ClientHello::try_from(sd)
-						.map_err(|_| TransportError::InvalidMessage)?
-						.to_der()?
-				}
-				TransportEnvelope::EnvelopedData(ed) => {
-					// This is ClientKeyExchange (second message from client)
-					use $crate::transport::handshake::ClientKeyExchange;
-					ClientKeyExchange::try_from(ed)
-						.map_err(|_| TransportError::InvalidMessage)?
-						.to_der()?
-				}
-				_ => return Err(TransportError::InvalidMessage),
-			};				// Get server certificate and signatory (required for handshake)
-				let cert = self.server_certificate().ok_or(TransportError::Forbidden)?.clone();
-				let signatory = self.signatory.as_ref().ok_or(TransportError::Forbidden)?.clone();
+				// Parse TransportEnvelope and extract the handshake message
+				let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
+				let raw_message = match &transport_envelope {
+					TransportEnvelope::SignedData(sd) => {
+						// This is ClientHello (first message from client)
+						use $crate::transport::handshake::ClientHello;
+						ClientHello::try_from(sd)
+							.map_err(|_| TransportError::InvalidMessage)?
+							.to_der()?
+					}
+					TransportEnvelope::EnvelopedData(ed) => {
+						// This is ClientKeyExchange (second message from client)
+						use $crate::transport::handshake::ClientKeyExchange;
+						ClientKeyExchange::try_from(ed)
+							.map_err(|_| TransportError::InvalidMessage)?
+							.to_der()?
+					}
+					_ => return Err(TransportError::InvalidMessage),
+				};
+
+				// Get server certificate and signatory (required for handshake)
+				let cert_arc = self.server_certificate.as_ref().ok_or(TransportError::Forbidden)?;
+				let signatory = self.signatory.as_ref().ok_or(TransportError::Forbidden)?;
 
 				// Get or create handshake orchestrator (persists state across multiple messages)
 				if self.server_handshake.is_none() {
-					let aad = self.aad_domain_tag.clone();
-
 					self.server_handshake = Some(match self.handshake_protocol_kind {
-					HandshakeProtocolKind::Ecies => {
-						// Create default security profile for negotiation
-					let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
-					let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
+						HandshakeProtocolKind::Ecies => {
+							// Create default security profile for negotiation
+							let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
+							let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
 
-					Box::new(
-						$crate::transport::handshake::server::EciesHandshakeServer::<$crate::crypto::profiles::DefaultCryptoProvider>::new(
-							std::sync::Arc::clone(&signatory),
-							std::sync::Arc::new(cert),
-							aad,
-							self.client_validators.as_ref().map(std::sync::Arc::clone)
-						)
-						.with_supported_profiles(vec![profile_desc])
-					)
-					}						#[cfg(all(
-							feature = "builder",
+							Box::new(
+								$crate::transport::handshake::server::EciesHandshakeServer::<$crate::crypto::profiles::DefaultCryptoProvider>::new(
+									Arc::clone(&signatory),
+									Arc::clone(cert_arc),
+									None, // Use default AAD domain tag
+									self.client_validators.as_ref().map(Arc::clone)
+								)
+								.with_supported_profiles(vec![profile_desc])
+							)
+						}
+
+						#[cfg(all(
 							feature = "aead",
 							feature = "signature"
 						))]
 						HandshakeProtocolKind::Cms => {
-							// TODO: CMS server needs proper transcript hash support
-							return Err(TransportError::InvalidMessage);
+							// Create default security profile for negotiation
+							let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
+							let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
+
+							Box::new(
+								$crate::transport::handshake::server::CmsHandshakeServer::<$crate::crypto::profiles::DefaultCryptoProvider>::new(
+									Arc::clone(&signatory),
+									self.client_validators.as_ref().map(Arc::clone)
+								)
+								.with_supported_profiles(vec![profile_desc])
+							)
 						}
 					});
 				}
@@ -538,6 +576,7 @@ macro_rules! impl_tcp_common {
 					let signed_data: $crate::cms::signed_data::SignedData =
 						(&server_handshake).try_into().map_err(|_| TransportError::InvalidMessage)?;
 					let server_envelope = TransportEnvelope::SignedData(signed_data);
+
 					let wire_envelope = WireEnvelope::Cleartext(server_envelope);
 					self.write_envelope(&wire_envelope.to_der()?).await?;
 
@@ -554,24 +593,24 @@ macro_rules! impl_tcp_common {
 							initiated_at: 0,
 						});
 					}
-			} else {
-				// No response means handshake is complete - get RuntimeAead
-				let session_key = orchestrator.complete().await?;
+				} else {
+					// No response means handshake is complete - get RuntimeAead
+					let session_key = orchestrator.complete().await?;
 
-				// Extract peer certificate if mutual auth was performed
-				#[cfg(feature = "x509")]
-				{
-					self.peer_certificate = orchestrator.peer_certificate().cloned();
+					// Extract peer certificate if mutual auth was performed
+					#[cfg(feature = "x509")]
+					{
+						self.peer_certificate = orchestrator.peer_certificate().cloned();
+					}
+
+					self.set_symmetric_key(session_key);
+					self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
+
+					// Clear handshake instance - no longer needed
+					self.server_handshake = None;
 				}
 
-				self.set_symmetric_key(session_key);
-				self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
-
-				// Clear handshake instance - no longer needed
-				self.server_handshake = None;
-			}
-
-			Ok(())
+				Ok(())
 			}
 		}
 
@@ -600,16 +639,16 @@ macro_rules! impl_tcp_common {
 			where
 				V: $crate::crypto::x509::policy::CertificateValidation + 'static,
 			{
-				let new_validator = std::sync::Arc::new(validator);
+				let new_validator = Arc::new(validator);
 				match self.client_validators.as_mut() {
 					Some(validators) => {
-						let mut validators_vec = std::sync::Arc::try_unwrap(std::mem::replace(validators, std::sync::Arc::new(vec![])))
+						let mut validators_vec = Arc::try_unwrap(std::mem::replace(validators, Arc::new(vec![])))
 							.unwrap_or_else(|arc| (*arc).clone());
 						validators_vec.push(new_validator);
-						self.client_validators = Some(std::sync::Arc::new(validators_vec));
+						self.client_validators = Some(Arc::new(validators_vec));
 					}
 					None => {
-						self.client_validators = Some(std::sync::Arc::new(vec![new_validator]));
+						self.client_validators = Some(Arc::new(vec![new_validator]));
 					}
 				}
 				self

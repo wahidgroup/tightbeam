@@ -276,6 +276,25 @@ pub trait ServerHandshakeKey: Send + Sync {
 	/// Returns the OID and parameters for the signature algorithm (e.g., ecdsa-with-SHA3-256).
 	#[cfg(feature = "transport-cms")]
 	fn signature_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned;
+
+	/// Create a CMS client handshake orchestrator.
+	///
+	/// This allows the key implementation to instantiate a CMS client with the appropriate
+	/// concrete key type, working around the limitation that CMS clients need the actual
+	/// signing key type rather than a trait object.
+	///
+	/// # Parameters
+	/// - `server_cert`: The server's certificate for key agreement
+	/// - `validators`: Optional certificate validators to apply during handshake
+	///
+	/// # Returns
+	/// A boxed CMS client handshake orchestrator implementing ClientHandshakeProtocol
+	#[cfg(feature = "transport-cms")]
+	fn create_cms_client(
+		&self,
+		server_cert: Arc<crate::x509::Certificate>,
+		validators: Option<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
+	) -> core::result::Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError>>, HandshakeError>;
 }
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
@@ -373,6 +392,26 @@ impl ServerHandshakeKey for crate::crypto::sign::ecdsa::Secp256k1SigningKey {
 	#[cfg(feature = "transport-cms")]
 	fn signature_algorithm(&self) -> crate::spki::AlgorithmIdentifierOwned {
 		crate::spki::AlgorithmIdentifierOwned { oid: crate::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
+	}
+
+	#[cfg(feature = "transport-cms")]
+	fn create_cms_client(
+		&self,
+		server_cert: Arc<crate::x509::Certificate>,
+		validators: Option<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
+	) -> core::result::Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError>>, HandshakeError> {
+		use crate::crypto::profiles::DefaultCryptoProvider;
+
+		let provider = DefaultCryptoProvider::default();
+		let mut client =
+			crate::transport::handshake::client::CmsHandshakeClient::new(provider, self.clone(), server_cert);
+
+		// Apply validators if provided
+		if let Some(validator) = validators {
+			client = client.with_certificate_validator(validator);
+		}
+
+		Ok(Box::new(client))
 	}
 }
 

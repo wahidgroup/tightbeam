@@ -44,7 +44,7 @@ where
 	base_session_key: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
-	aad_domain_tag: Option<Vec<u8>>,
+	aad_domain_tag: Option<&'static [u8]>,
 	security_offer: Option<crate::crypto::negotiation::SecurityOffer>,
 	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
@@ -80,15 +80,15 @@ where
 	/// Create a new ECIES handshake client.
 	///
 	/// # Parameters
-	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to "tb-v1")
-	pub fn new(aad_domain_tag: Option<Vec<u8>>) -> Self {
+	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
+	pub fn new(aad_domain_tag: Option<&'static [u8]>) -> Self {
 		Self {
 			state: ClientStateMachine::new(),
 			client_random: None,
 			base_session_key: None,
 			server_random: None,
 			transcript_hash: None,
-			aad_domain_tag: aad_domain_tag.or_else(|| Some(TIGHTBEAM_AAD_DOMAIN_TAG.to_vec())),
+			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
 			security_offer: None, // No offer = dealer's choice mode
 			selected_profile: None,
 			certificate_validator: None,
@@ -113,10 +113,10 @@ where
 	/// - `signing_key`: The client's signing key (must match certificate)
 	pub fn with_client_identity(
 		mut self,
-		certificate: Certificate,
+		certificate: Arc<Certificate>,
 		signing_key: Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
 	) -> Self {
-		self.client_certificate = Some(Arc::new(certificate));
+		self.client_certificate = Some(certificate);
 		self.client_signing_key = Some(signing_key);
 		self
 	}
