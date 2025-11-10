@@ -47,8 +47,9 @@ pub enum FailureKind {
 // Role-Specific States
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ClientHandshakeState {
+	#[default]
 	Init,
 	HelloSent,
 	ServerHelloReceived,
@@ -75,8 +76,9 @@ impl ClientHandshakeState {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ServerHandshakeState {
+	#[default]
 	Init,
 	ClientHelloReceived,
 	ServerHelloSent,
@@ -189,15 +191,12 @@ impl HandshakeInvariant {
 // Client State Machine
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ClientStateMachine {
 	state: ClientHandshakeState,
 }
 
 impl ClientStateMachine {
-	pub fn new() -> Self {
-		Self { state: ClientHandshakeState::Init }
-	}
 	pub fn state(&self) -> ClientHandshakeState {
 		self.state
 	}
@@ -240,15 +239,12 @@ impl ClientStateMachine {
 // Server State Machine
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ServerStateMachine {
 	state: ServerHandshakeState,
 }
 
 impl ServerStateMachine {
-	pub fn new() -> Self {
-		Self { state: ServerHandshakeState::Init }
-	}
 	pub fn state(&self) -> ServerHandshakeState {
 		self.state
 	}
@@ -296,7 +292,7 @@ mod tests {
 
 	#[test]
 	fn client_linear_flow_ecies_short() {
-		let mut sm = ClientStateMachine::new();
+		let mut sm = ClientStateMachine::default();
 		assert_eq!(sm.state(), ClientHandshakeState::Init);
 		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
 		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_ok());
@@ -308,7 +304,7 @@ mod tests {
 
 	#[test]
 	fn client_full_flow_cms() {
-		let mut sm = ClientStateMachine::new();
+		let mut sm = ClientStateMachine::default();
 		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
 		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_ok());
 		assert!(sm.transition(ClientHandshakeState::KeyExchangeSent).is_ok());
@@ -319,7 +315,7 @@ mod tests {
 
 	#[test]
 	fn server_linear_flow_ecies_short() {
-		let mut sm = ServerStateMachine::new();
+		let mut sm = ServerStateMachine::default();
 		assert_eq!(sm.state(), ServerHandshakeState::Init);
 		assert!(sm.transition(ServerHandshakeState::ClientHelloReceived).is_ok());
 		assert!(sm.transition(ServerHandshakeState::ServerHelloSent).is_ok());
@@ -330,7 +326,7 @@ mod tests {
 
 	#[test]
 	fn server_full_flow_cms() {
-		let mut sm = ServerStateMachine::new();
+		let mut sm = ServerStateMachine::default();
 		assert!(sm.transition(ServerHandshakeState::KeyExchangeReceived).is_ok());
 		assert!(sm.transition(ServerHandshakeState::ServerFinishedSent).is_ok());
 		assert!(sm.transition(ServerHandshakeState::ClientFinishedReceived).is_ok());
@@ -339,12 +335,12 @@ mod tests {
 
 	#[test]
 	fn abort_and_failure_are_terminal() {
-		let mut sm = ClientStateMachine::new();
+		let mut sm = ClientStateMachine::default();
 		assert!(sm.transition(ClientHandshakeState::HelloSent).is_ok());
 		assert!(sm.transition(ClientHandshakeState::Aborted(AbortReason::PeerAbort)).is_ok());
 		assert!(sm.state().is_aborted());
 		assert!(sm.transition(ClientHandshakeState::ServerHelloReceived).is_err());
-		let mut sm2 = ServerStateMachine::new();
+		let mut sm2 = ServerStateMachine::default();
 		assert!(sm2
 			.transition(ServerHandshakeState::Failed(FailureKind::ProtocolViolation))
 			.is_ok());

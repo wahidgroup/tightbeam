@@ -34,9 +34,7 @@ use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
-use crate::transport::handshake::{
-	ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeKey, ServerHandshakeProtocol,
-};
+use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeProtocol};
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::x509::Certificate;
 
@@ -47,13 +45,15 @@ use crate::x509::Certificate;
 /// 2. Sends ServerHandshake (certificate, random, signature over transcript)
 /// 3. Receives and decrypts ClientKeyExchange with ECIES-encrypted session key
 ///
-/// Generic over `P: CryptoProvider` for cryptographic operations.
-pub struct EciesHandshakeServer<P>
+/// Generic over:
+/// - `P: CryptoProvider` for cryptographic operations
+/// - `K`: Concrete signing key type (must implement Into<SecretKey<P::Curve>> for ECIES and Signer for authentication)
+pub struct EciesHandshakeServer<P, K>
 where
 	P: CryptoProvider,
 {
 	state: ServerStateMachine,
-	server_key: Arc<dyn ServerHandshakeKey>,
+	server_key: Arc<K>,
 	server_cert: Arc<Certificate>,
 	client_random: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
@@ -68,26 +68,28 @@ where
 	invariants: HandshakeInvariant,
 }
 
-impl<P> EciesHandshakeServer<P>
+impl<P, K> EciesHandshakeServer<P, K>
 where
 	P: CryptoProvider,
 	P::AeadCipher: KeyInit,
+	K: Clone + Into<crate::crypto::sign::ecdsa::k256::SecretKey> + crate::crypto::sign::Signer<P::Signature>,
+	P::Signature: crate::crypto::sign::SignatureEncoding,
 {
 	/// Create a new ECIES handshake server.
 	///
 	/// # Parameters
-	/// - `server_key`: The server's signing key for authentication (trait object)
+	/// - `server_key`: The server's signing key for authentication (concrete type)
 	/// - `server_cert`: The server's certificate to send to client
 	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
-		server_key: Arc<dyn ServerHandshakeKey>,
+		server_key: Arc<K>,
 		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<&'static [u8]>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
-			state: ServerStateMachine::new(),
+			state: ServerStateMachine::default(),
 			server_key,
 			server_cert,
 			client_random: None,
@@ -302,8 +304,14 @@ where
 		Ok(server_random)
 	}
 
-	fn sign_transcript_hash(&self, transcript_digest: &[u8; 32]) -> Result<Vec<u8>, HandshakeError> {
-		self.server_key.sign_server_challenge(transcript_digest)
+	fn sign_transcript_hash(&self, transcript_digest: &[u8; 32]) -> Result<Vec<u8>, HandshakeError>
+	where
+		K: crate::crypto::sign::Signer<P::Signature>,
+		P::Signature: crate::crypto::sign::SignatureEncoding,
+	{
+		use crate::crypto::sign::SignatureEncoding;
+		let sig: P::Signature = (*self.server_key).try_sign(transcript_digest)?;
+		Ok(sig.to_bytes().as_ref().to_vec())
 	}
 
 	fn build_server_handshake(
@@ -327,9 +335,22 @@ where
 		ClientKeyExchange::from_der(der_bytes).map_err(Into::into)
 	}
 
-	fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		let decrypted_payload = self.server_key.decrypt_ecies(encrypted_bytes, self.aad_domain_tag.as_deref())?;
-		Ok(decrypted_payload.to_insecure())
+	fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError>
+	where
+		K: Clone + Into<crate::crypto::sign::ecdsa::k256::SecretKey>,
+	{
+		use crate::crypto::ecies::{decrypt, Secp256k1EciesMessage};
+
+		// Parse the ECIES message from bytes
+		let encrypted_message = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
+
+		// Convert signing key to SecretKey for ECIES decryption
+		let secret_key: crate::crypto::sign::ecdsa::k256::SecretKey = (*self.server_key).clone().into();
+
+		// Decrypt
+		let decrypted = decrypt(&secret_key, &encrypted_message, self.aad_domain_tag)?;
+
+		Ok(decrypted.to_insecure().to_vec())
 	}
 
 	fn extract_session_data_from_payload(
@@ -441,31 +462,38 @@ where
 // Common Handshake Trait Implementations
 // ============================================================================
 
-impl<P> HandshakeNegotiation for EciesHandshakeServer<P>
+impl<P, K> HandshakeNegotiation for EciesHandshakeServer<P, K>
 where
 	P: CryptoProvider,
+	K: Clone,
 {
 	fn supported_profiles(&self) -> &[SecurityProfileDesc] {
 		&self.supported_profiles
 	}
 }
 
-impl<P> HandshakeFinalization<P> for EciesHandshakeServer<P>
+impl<P, K> HandshakeFinalization<P> for EciesHandshakeServer<P, K>
 where
 	P: CryptoProvider,
+	K: Clone,
 {
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
 
-impl<P> HandshakeAlertHandler for EciesHandshakeServer<P> where P: CryptoProvider {}
+impl<P, K> HandshakeAlertHandler for EciesHandshakeServer<P, K>
+where
+	P: CryptoProvider,
+	K: Clone,
+{
+}
 
 // ============================================================================
 // ServerHandshakeProtocol Implementation
 // ============================================================================
 
-impl<P> ServerHandshakeProtocol for EciesHandshakeServer<P>
+impl<P, K> ServerHandshakeProtocol for EciesHandshakeServer<P, K>
 where
 	P: CryptoProvider + Send + Sync,
 	P::Curve: Curve + CurveArithmetic,
@@ -474,6 +502,12 @@ where
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
+	K: Clone
+		+ Into<crate::crypto::sign::ecdsa::k256::SecretKey>
+		+ crate::crypto::sign::Signer<P::Signature>
+		+ Send
+		+ Sync,
+	P::Signature: crate::crypto::sign::SignatureEncoding,
 {
 	type Error = HandshakeError;
 
@@ -716,11 +750,12 @@ mod tests {
 	///
 	/// Extracts the server's public key and stored client random, then creates
 	/// a properly encrypted payload containing [session_key || client_random].
-	fn build_test_client_key_exchange<P>(
-		server: &EciesHandshakeServer<P>,
+	fn build_test_client_key_exchange<P, K>(
+		server: &EciesHandshakeServer<P, K>,
 	) -> Result<Vec<u8>, Box<dyn std::error::Error>>
 	where
 		P: CryptoProvider,
+		K: Clone,
 	{
 		use crate::crypto::ecies::encrypt;
 

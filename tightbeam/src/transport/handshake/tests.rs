@@ -292,7 +292,7 @@ impl TestEciesServerBuilder {
 	}
 
 	/// Build the ECIES handshake server.
-	pub fn build(self) -> EciesHandshakeServer<DefaultCryptoProvider> {
+	pub fn build(self) -> EciesHandshakeServer<DefaultCryptoProvider, Secp256k1SigningKey> {
 		let test_cert_data = if let Some(cert) = self.cert {
 			let key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 			TestCertificate { signing_key: key, certificate: cert }
@@ -305,15 +305,14 @@ impl TestEciesServerBuilder {
 				.unwrap_or_else(|| create_test_certificate())
 		};
 
-		let mut server = EciesHandshakeServer::new(
+		let default_profile = create_default_test_profile();
+		EciesHandshakeServer::new(
 			Arc::new(test_cert_data.signing_key),
 			Arc::new(test_cert_data.certificate),
 			self.aad_domain,
 			None, // No client validators in tests by default
-		); // Add default test profile to ensure server always has supported profiles
-		server = server.with_supported_profiles(vec![create_default_test_profile()]);
-
-		server
+		)
+		.with_supported_profiles(vec![default_profile])
 	}
 }
 

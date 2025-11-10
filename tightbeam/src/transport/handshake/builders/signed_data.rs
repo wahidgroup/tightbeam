@@ -21,14 +21,15 @@ use crate::transport::handshake::error::HandshakeError;
 /// Signs content (typically a transcript hash) with the sender's private key
 /// to provide authentication and non-repudiation.
 ///
-/// The builder is generic over `P: CryptoProvider` which defines the complete
-/// cryptographic suite (signature algorithm and digest algorithm).
-pub struct TightBeamSignedDataBuilder<P>
+/// The builder is generic over:
+/// - `P: CryptoProvider` - defines the cryptographic suite (signature and digest algorithms)
+/// - `K` - concrete signing key type
+pub struct TightBeamSignedDataBuilder<P, K>
 where
 	P: CryptoProvider,
 {
-	/// Signer implementing signature creation
-	signer: Box<dyn Signer<P::Signature>>,
+	/// Signer implementing signature creation (concrete type, no boxing)
+	signer: K,
 	/// Digest algorithm for hashing content
 	digest_alg: AlgorithmIdentifierOwned,
 	/// Signature algorithm identifier
@@ -40,11 +41,13 @@ where
 	_phantom: core::marker::PhantomData<P>,
 }
 
-impl<P> TightBeamSignedDataBuilder<P>
+impl<P, K> TightBeamSignedDataBuilder<P, K>
 where
 	P: CryptoProvider,
 	P::Signature: SignatureEncoding,
 	P::Digest: Digest + AssociatedOid,
+	K: Signer<P::Signature> + Keypair,
+	K::VerifyingKey: EncodePublicKey,
 {
 	/// Create a new SignedData builder.
 	///
@@ -55,21 +58,17 @@ where
 	///
 	/// # Returns
 	/// A new builder instance
-	pub fn new<K>(
+	pub fn new(
 		signer: K,
 		digest_alg: AlgorithmIdentifierOwned,
 		signature_alg: AlgorithmIdentifierOwned,
-	) -> Result<Self, HandshakeError>
-	where
-		K: Signer<P::Signature> + Keypair + 'static,
-		K::VerifyingKey: EncodePublicKey,
-	{
+	) -> Result<Self, HandshakeError> {
 		// Generate SKID from public key
 		let verifying_key = signer.verifying_key();
 		let signer_id = compute_signer_identifier::<P::Digest, _>(&verifying_key)?;
 
 		Ok(Self {
-			signer: Box::new(signer),
+			signer,
 			digest_alg,
 			signature_alg,
 			signer_id,
@@ -93,7 +92,7 @@ where
 	///
 	/// # Returns
 	/// A complete CMS SignedData structure with signature
-	pub fn build(&mut self, content: &[u8]) -> Result<SignedData, HandshakeError> {
+	pub fn build(self, content: &[u8]) -> Result<SignedData, HandshakeError> {
 		// 1. Hash the content
 		let mut hasher = P::Digest::new();
 		hasher.update(content);
@@ -105,13 +104,13 @@ where
 		let signature = self.signer.try_sign(digest_bytes)?;
 		let signature_bytes = signature.to_bytes();
 
-		// 3. Create SignerInfo
+		// 3. Create SignerInfo (move values instead of cloning)
 		let signer_info = SignerInfo {
 			version: CmsVersion::V1,
-			sid: self.signer_id.clone(),
+			sid: self.signer_id,
 			digest_alg: self.digest_alg.clone(),
 			signed_attrs: None,
-			signature_algorithm: self.signature_alg.clone(),
+			signature_algorithm: self.signature_alg,
 			signature: OctetString::new(signature_bytes.as_ref())?,
 			unsigned_attrs: None,
 		};
@@ -120,24 +119,19 @@ where
 		let octet_string = OctetString::new(content)?;
 		let econtent_der = octet_string.to_der()?;
 		let econtent_any = der::Any::from_der(&econtent_der)?;
+		let econtent = Some(econtent_any);
 
-		let encap_content = EncapsulatedContentInfo { econtent_type: self.content_type, econtent: Some(econtent_any) };
+		let encap_content = EncapsulatedContentInfo { econtent_type: self.content_type, econtent };
 
-		// 5. Build SignedData
+		// 5. Build SignedData (move digest_alg)
 		Ok(SignedData {
 			version: CmsVersion::V1,
-			digest_algorithms: vec![self.digest_alg.clone()].try_into()?,
+			digest_algorithms: vec![self.digest_alg].try_into()?,
 			encap_content_info: encap_content,
 			certificates: None,
 			crls: None,
 			signer_infos: vec![signer_info].try_into()?,
 		})
-	}
-
-	/// Build and encode SignedData as DER bytes.
-	pub fn build_der(&mut self, content: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		let signed_data = self.build(content)?;
-		Ok(signed_data.to_der()?)
 	}
 }
 
@@ -165,18 +159,19 @@ mod tests {
 	}
 
 	/// Helper function to create a test SignedData builder
-	fn create_test_signed_data_builder() -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider>, HandshakeError> {
+	fn create_test_signed_data_builder(
+	) -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider, Secp256k1SigningKey>, HandshakeError> {
 		let signing_key = create_test_signing_key();
 		let digest_alg = create_sha3_256_digest_alg();
 		let signature_alg = create_ecdsa_sha256_signature_alg();
 
-		TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(signing_key, digest_alg, signature_alg)
+		TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(signing_key, digest_alg, signature_alg)
 	}
 
 	#[test]
 	fn test_build_signed_data() -> Result<(), Box<dyn std::error::Error>> {
 		// 1. Create test builder
-		let mut builder = create_test_signed_data_builder()?;
+		let builder = create_test_signed_data_builder()?;
 
 		// 2. Content to sign (e.g., transcript hash)
 		let transcript_hash = b"handshake_transcript_hash_placeholder_32bytes";
@@ -207,13 +202,14 @@ mod tests {
 	#[test]
 	fn test_der_encoding() -> Result<(), Box<dyn std::error::Error>> {
 		// 1. Create test builder
-		let mut builder = create_test_signed_data_builder()?;
+		let builder = create_test_signed_data_builder()?;
 
 		// 2. Content to sign
 		let content = b"test_content";
 
 		// 3. Build and encode to DER
-		let der_bytes = builder.build_der(content)?;
+		let built = builder.build(content)?;
+		let der_bytes = built.to_der()?;
 		assert!(!der_bytes.is_empty());
 
 		// 4. Decode back from DER
@@ -227,7 +223,7 @@ mod tests {
 	#[test]
 	fn test_custom_content_type() -> Result<(), Box<dyn std::error::Error>> {
 		// 1. Create test builder
-		let mut builder = create_test_signed_data_builder()?;
+		let builder = create_test_signed_data_builder()?;
 
 		// 2. Content to sign
 		let content = b"custom_content";
@@ -236,7 +232,7 @@ mod tests {
 		let custom_oid = ObjectIdentifier::new_unwrap("1.2.3.4.5.6");
 
 		// 4. Configure builder with custom content type
-		builder = builder.with_content_type(custom_oid);
+		let builder = builder.with_content_type(custom_oid);
 
 		// 5. Build SignedData
 		let signed_data = builder.build(content)?;

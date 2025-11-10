@@ -1,6 +1,8 @@
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
+pub type Result<T> = core::result::Result<T, HandshakeError>;
+
 /// Errors specific to handshake operations
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]

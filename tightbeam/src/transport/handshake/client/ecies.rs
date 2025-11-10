@@ -7,8 +7,6 @@
 
 #![cfg(feature = "x509")]
 
-use core::marker::PhantomData;
-
 use crate::asn1::OctetString;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::KeyInit;
@@ -33,9 +31,11 @@ use crate::x509::Certificate;
 
 /// Client-side ECIES handshake orchestrator.
 ///
-/// Generic over `P: CryptoProvider` which defines the complete cryptographic suite
-/// (curve, signature algorithm, digest, AEAD, KDF), and ECIES message type `M`.
-pub struct EciesHandshakeClient<P, M>
+/// Generic over:
+/// - `P: CryptoProvider` which defines the complete cryptographic suite
+/// - `M`: ECIES message type (curve-specific)
+/// - `K`: Optional client signing key type for mutual authentication
+pub struct EciesHandshakeClient<P, M, K = ()>
 where
 	P: CryptoProvider,
 {
@@ -49,9 +49,9 @@ where
 	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
 	client_certificate: Option<Arc<Certificate>>,
-	client_signing_key: Option<Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
-	_phantom_provider: PhantomData<P>,
-	_phantom_message: PhantomData<M>,
+	client_signing_key: Option<Arc<K>>,
+	_phantom_provider: ::core::marker::PhantomData<P>,
+	_phantom_message: ::core::marker::PhantomData<M>,
 	invariants: HandshakeInvariant,
 }
 
@@ -62,7 +62,7 @@ pub trait ExtractVerifyingKey: Sized {
 	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError>;
 }
 
-impl<P, M> EciesHandshakeClient<P, M>
+impl<P, M, K> EciesHandshakeClient<P, M, K>
 where
 	P: CryptoProvider,
 	P::Curve: Curve + CurveArithmetic,
@@ -81,9 +81,12 @@ where
 	///
 	/// # Parameters
 	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
-	pub fn new(aad_domain_tag: Option<&'static [u8]>) -> Self {
+	pub fn new(aad_domain_tag: Option<&'static [u8]>) -> Self
+	where
+		K: Default,
+	{
 		Self {
-			state: ClientStateMachine::new(),
+			state: ClientStateMachine::default(),
 			client_random: None,
 			base_session_key: None,
 			server_random: None,
@@ -94,8 +97,39 @@ where
 			certificate_validator: None,
 			client_certificate: None,
 			client_signing_key: None,
-			_phantom_provider: PhantomData,
-			_phantom_message: PhantomData,
+			_phantom_provider: ::core::marker::PhantomData,
+			_phantom_message: ::core::marker::PhantomData,
+			invariants: HandshakeInvariant::default(),
+		}
+	}
+
+	/// Create a new ECIES handshake client with optional client identity.
+	///
+	/// This constructor doesn't require K: Default, allowing construction with concrete signing key types.
+	///
+	/// # Parameters
+	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
+	/// - `client_certificate`: Optional client certificate for mutual auth
+	/// - `client_signing_key`: Optional client signing key for mutual auth
+	pub fn new_with_identity(
+		aad_domain_tag: Option<&'static [u8]>,
+		client_certificate: Option<Arc<Certificate>>,
+		client_signing_key: Option<Arc<K>>,
+	) -> Self {
+		Self {
+			state: ClientStateMachine::default(),
+			client_random: None,
+			base_session_key: None,
+			server_random: None,
+			transcript_hash: None,
+			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
+			security_offer: None, // No offer = dealer's choice mode
+			selected_profile: None,
+			certificate_validator: None,
+			client_certificate,
+			client_signing_key,
+			_phantom_provider: ::core::marker::PhantomData,
+			_phantom_message: ::core::marker::PhantomData,
 			invariants: HandshakeInvariant::default(),
 		}
 	}
@@ -111,11 +145,7 @@ where
 	/// # Parameters
 	/// - `certificate`: The client's X.509 certificate
 	/// - `signing_key`: The client's signing key (must match certificate)
-	pub fn with_client_identity(
-		mut self,
-		certificate: Arc<Certificate>,
-		signing_key: Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
-	) -> Self {
+	pub fn with_client_identity(mut self, certificate: Arc<Certificate>, signing_key: Arc<K>) -> Self {
 		self.client_certificate = Some(certificate);
 		self.client_signing_key = Some(signing_key);
 		self
@@ -221,7 +251,11 @@ where
 	///
 	/// # Returns
 	/// DER-encoded ClientKeyExchange
-	pub fn process_server_handshake(&mut self, server_handshake_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	pub fn process_server_handshake(&mut self, server_handshake_der: &[u8]) -> Result<Vec<u8>, HandshakeError>
+	where
+		K: crate::crypto::sign::Signer<P::Signature>,
+		P::Signature: crate::crypto::sign::SignatureEncoding,
+	{
 		// 1. Validation: must have sent hello
 		self.validate_expected_state(ClientHandshakeState::HelloSent)?;
 		let _client_random_check = self.client_random.ok_or(HandshakeError::InvalidState)?;
@@ -314,7 +348,12 @@ where
 	fn prepare_client_auth(
 		&self,
 		server_handshake: &ServerHandshake,
-	) -> Result<(Option<Certificate>, Option<OctetString>), HandshakeError> {
+	) -> Result<(Option<Certificate>, Option<OctetString>), HandshakeError>
+	where
+		K: crate::crypto::sign::Signer<P::Signature>,
+		P::Signature: crate::crypto::sign::SignatureEncoding,
+	{
+		use crate::crypto::sign::SignatureEncoding;
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 		if server_handshake.client_cert_required {
@@ -322,12 +361,14 @@ where
 			let cert = self.client_certificate.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 			let signing_key = self.client_signing_key.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 
-			let signature_bytes = signing_key.sign_server_challenge(&transcript_digest)?;
+			let sig: P::Signature = signing_key.try_sign(&transcript_digest)?;
+			let signature_bytes = sig.to_bytes().as_ref().to_vec();
 			Ok((Some((**cert).clone()), Some(OctetString::new(signature_bytes)?)))
 		} else if let Some(cert) = &self.client_certificate {
 			// Client wants mutual auth but server doesn't require it - include anyway
 			let signing_key = self.client_signing_key.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let signature_bytes = signing_key.sign_server_challenge(&transcript_digest)?;
+			let sig: P::Signature = signing_key.try_sign(&transcript_digest)?;
+			let signature_bytes = sig.to_bytes().as_ref().to_vec();
 			Ok((Some((**cert).clone()), Some(OctetString::new(signature_bytes)?)))
 		} else {
 			// No mutual auth
@@ -465,7 +506,7 @@ where
 // Common Handshake Trait Implementations
 // ============================================================================
 
-impl<P, M> crate::transport::handshake::HandshakeFinalization<P> for EciesHandshakeClient<P, M>
+impl<P, M, K> crate::transport::handshake::HandshakeFinalization<P> for EciesHandshakeClient<P, M, K>
 where
 	P: CryptoProvider,
 {
@@ -474,13 +515,16 @@ where
 	}
 }
 
-impl<P, M> crate::transport::handshake::HandshakeAlertHandler for EciesHandshakeClient<P, M> where P: CryptoProvider {}
+impl<P, M, K> crate::transport::handshake::HandshakeAlertHandler for EciesHandshakeClient<P, M, K> where
+	P: CryptoProvider
+{
+}
 
 // ============================================================================
 // ClientHandshakeProtocol Implementation
 // ============================================================================
 
-impl<P, M> ClientHandshakeProtocol for EciesHandshakeClient<P, M>
+impl<P, M, K> ClientHandshakeProtocol for EciesHandshakeClient<P, M, K>
 where
 	P: CryptoProvider + Send + Sync,
 	P::Curve: Curve + CurveArithmetic,
@@ -494,6 +538,7 @@ where
 	P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + Send + Sync,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
 	M: EciesMessageOps + Send + Sync,
+	K: crate::crypto::sign::Signer<P::Signature> + Send + Sync,
 {
 	type Error = HandshakeError;
 
@@ -563,13 +608,59 @@ where
 // Type Alias for secp256k1
 // ============================================================================
 
-/// Type alias for ECIES client using secp256k1 curve.
+/// Type alias for ECIES client using secp256k1 curve without mutual auth.
 ///
 /// This is the default curve used in TightBeam and is provided as a
 /// convenient alias for the generic `EciesHandshakeClient`.
 #[cfg(feature = "secp256k1")]
-pub type EciesHandshakeClientSecp256k1 =
-	EciesHandshakeClient<crate::crypto::profiles::DefaultCryptoProvider, crate::crypto::ecies::Secp256k1EciesMessage>;
+pub type EciesHandshakeClientSecp256k1 = EciesHandshakeClient<
+	crate::crypto::profiles::DefaultCryptoProvider,
+	crate::crypto::ecies::Secp256k1EciesMessage,
+	(),
+>;
+
+// Special impl for clients without mutual auth
+#[cfg(feature = "secp256k1")]
+impl
+	EciesHandshakeClient<crate::crypto::profiles::DefaultCryptoProvider, crate::crypto::ecies::Secp256k1EciesMessage, ()>
+{
+	/// Process ServerHandshake without mutual auth support (K=()).
+	pub fn process_server_handshake_no_auth(&mut self, server_handshake_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+		// 1. Validation
+		self.validate_expected_state(ClientHandshakeState::HelloSent)?;
+		let _client_random_check = self.client_random.ok_or(HandshakeError::InvalidState)?;
+
+		// 2. Decode and validate
+		let server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
+
+		// 3. Profile negotiation
+		self.validate_profile_selection(&server_handshake)?;
+
+		// 4. Extract server random
+		self.extract_server_random(&server_handshake)?;
+
+		// 5. Verify signature
+		self.verify_server_handshake_signature(&server_handshake)?;
+
+		// 6. Generate and encrypt session key
+		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake)?;
+
+		// 7. Build ClientKeyExchange (no mutual auth)
+		let client_kex = ClientKeyExchange {
+			encrypted_data: OctetString::new(encrypted_bytes)?,
+			#[cfg(feature = "x509")]
+			client_certificate: None,
+			#[cfg(feature = "x509")]
+			client_signature: None,
+		};
+
+		// 8. Transition state
+		self.state.transition(ClientHandshakeState::ServerHelloReceived)?;
+		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
+
+		Ok(client_kex.to_der()?)
+	}
+}
 
 // Implement helper trait for secp256k1 verifying key
 #[cfg(feature = "secp256k1")]
@@ -620,7 +711,7 @@ mod tests {
 			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
 
 		// When: Client processes the server handshake
-		let client_kex_der = client.process_server_handshake(&server_handshake_der)?;
+		let client_kex_der = client.process_server_handshake_no_auth(&server_handshake_der)?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		assert!(client.base_session_key.is_some());
 		assert!(client.transcript_hash.is_some());
@@ -643,7 +734,7 @@ mod tests {
 		let mut client = TestEciesClientBuilder::new().build();
 
 		// When: Trying to process server handshake before building client hello
-		let result = client.process_server_handshake(&[]);
+		let result = client.process_server_handshake_no_auth(&[]);
 		assert!(result.is_err());
 
 		// When: Client builds client hello
@@ -722,7 +813,7 @@ mod tests {
 				security_accept: Some(SecurityAccept::new(p_b)),
 				client_cert_required: false,
 			};
-			let _kex = client.process_server_handshake(&response.to_der()?)?;
+			let _kex = client.process_server_handshake_no_auth(&response.to_der()?)?;
 			assert_eq!(client.selected_profile, Some(p_b));
 		}
 
@@ -756,7 +847,7 @@ mod tests {
 				security_accept: Some(SecurityAccept::new(p_c)), // Not in offer!
 				client_cert_required: false,
 			};
-			let result = client.process_server_handshake(&response.to_der()?);
+			let result = client.process_server_handshake_no_auth(&response.to_der()?);
 			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 		}
 
@@ -788,7 +879,7 @@ mod tests {
 				security_accept: Some(SecurityAccept::new(p_a)),
 				client_cert_required: false,
 			};
-			let _kex = client.process_server_handshake(&response.to_der()?)?;
+			let _kex = client.process_server_handshake_no_auth(&response.to_der()?)?;
 			assert_eq!(client.selected_profile, Some(p_a));
 		}
 

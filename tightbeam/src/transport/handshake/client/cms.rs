@@ -15,13 +15,13 @@ use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDe
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
-use crate::crypto::sign::EcdsaSignatureVerifier;
-use crate::crypto::sign::SignatureAlgorithmIdentifier;
+use crate::crypto::sign::{EcdsaSignatureVerifier, Keypair, SignatureAlgorithmIdentifier, Verifier};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
 use crate::der::oid::AssociatedOid;
 use crate::der::Decode;
+use crate::der::Encode;
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::builders::{
@@ -31,7 +31,7 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
-use crate::transport::handshake::{Arc, ClientHandshakeProtocol};
+use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
 
 /// Client-side CMS handshake orchestrator.
 ///
@@ -89,7 +89,7 @@ where
 	/// use `with_transcript_hash()` after construction.
 	pub fn new(provider: P, client_key: P::SigningKey, server_cert: Arc<Certificate>) -> Self {
 		Self {
-			state: ClientStateMachine::new(),
+			state: ClientStateMachine::default(),
 			client_key,
 			client_certificate: None,
 			server_cert,
@@ -367,8 +367,9 @@ where
 		let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 		// 4. Build SignedData
-		let mut builder = TightBeamSignedDataBuilder::<P>::new(self.client_key.clone(), digest_alg, signature_alg)?;
-		let signed_data_der = builder.build_der(&transcript_hash)?;
+		let builder = TightBeamSignedDataBuilder::<P, _>::new(self.client_key.clone(), digest_alg, signature_alg)?;
+		let signed_data = builder.build(&transcript_hash)?;
+		let signed_data_der = signed_data.to_der()?;
 
 		// 5. Transition state & mark finished sent invariant
 		self.state.transition(ClientHandshakeState::ClientFinishedSent)?;
@@ -410,16 +411,16 @@ where
 // Common Handshake Trait Implementations
 // ============================================================================
 
-impl<P> crate::transport::handshake::HandshakeFinalization<P> for CmsHandshakeClient<P>
+impl<P> HandshakeFinalization<P> for CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
 {
-	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
 
-impl<P> crate::transport::handshake::HandshakeAlertHandler for CmsHandshakeClient<P> where P: CryptoProvider {}
+impl<P> HandshakeAlertHandler for CmsHandshakeClient<P> where P: CryptoProvider {}
 
 // ============================================================================
 // ClientHandshakeProtocol Implementation
@@ -432,9 +433,9 @@ where
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
-	P::SigningKey: Send + Clone + signature::Keypair + 'static,
-	<P::SigningKey as signature::Keypair>::VerifyingKey: EncodePublicKey,
-	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	P::SigningKey: Send + Clone + Keypair + 'static,
+	<P::SigningKey as Keypair>::VerifyingKey: EncodePublicKey,
+	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
 	P::Signature: 'static,
 	P::Digest: 'static,
 	P::AeadCipher: Send + Sync + KeyInit,
@@ -511,7 +512,7 @@ mod tests {
 	use crate::cms::enveloped_data::EnvelopedData;
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::elliptic_curve::SecretKey;
-	use crate::der::Decode;
+	use crate::der::{Decode, Encode};
 	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
@@ -549,12 +550,13 @@ mod tests {
 		// When: Client processes server Finished
 		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256_OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
-		let mut server_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(
+		let server_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(
 			server_test_cert.signing_key,
 			digest_alg,
 			signature_alg,
 		)?;
-		let server_finished = server_finished_builder.build_der(&transcript_hash)?;
+		let server_finished = server_finished_builder.build(&transcript_hash)?;
+		let server_finished = server_finished.to_der()?;
 
 		let verified = client.process_server_finished(&server_finished)?;
 		assert_eq!(verified, transcript_hash);

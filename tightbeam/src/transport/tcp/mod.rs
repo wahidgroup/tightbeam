@@ -322,7 +322,109 @@ macro_rules! impl_tcp_common {
 		where
 			TransportError: From<S::Error>,
 		{
+			/// Perform client-side ECIES handshake without mutual authentication (K=() variant).
+			/// This is a separate method because K=() cannot be cast to trait object due to missing Signer bound.
+			async fn perform_client_handshake_no_mutual_auth(
+				&mut self,
+				#[cfg(all(feature = "x509", feature = "std"))]
+				validator: Option<Arc<dyn $crate::crypto::x509::policy::CertificateValidation>>,
+				#[cfg(not(all(feature = "x509", feature = "std")))]
+				validator: Option<()>,
+			) -> TransportResult<()> {
+				use $crate::crypto::profiles::DefaultCryptoProvider;
+				use $crate::transport::handshake::client::EciesHandshakeClient;
+				use $crate::crypto::ecies::Secp256k1EciesMessage;
+				use $crate::der::{Decode, Encode};
+				use $crate::transport::handshake::ClientHello;
+				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+
+				// Create K=() client (cannot be trait object)
+				let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage, ()>::new(None);
+				#[cfg(all(feature = "x509", feature = "std"))]
+				if let Some(val) = validator {
+					client = client.with_certificate_validator(val);
+				}
+
+				// Step 1: Build and send client hello
+				let initial_message = client.build_client_hello()?;
+				if initial_message.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+					return Err(TransportError::InvalidMessage);
+				}
+
+				let client_hello = ClientHello::from_der(&initial_message)?;
+				let signed_data: $crate::cms::signed_data::SignedData =
+					(&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
+				let initial_envelope = TransportEnvelope::SignedData(signed_data);
+				let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
+				self.write_envelope(&wire_envelope.to_der()?).await?;
+
+				// Update state machine
+				#[cfg(feature = "std")]
+				{
+					self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::AwaitingServerResponse {
+						initiated_at: std::time::Instant::now(),
+					});
+				}
+				#[cfg(not(feature = "std"))]
+				{
+					self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::AwaitingServerResponse {
+						initiated_at: 0,
+					});
+				}
+
+				// Step 2: Receive server response
+				let response_wire_bytes = self.read_envelope().await?;
+				if response_wire_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+					return Err(TransportError::InvalidMessage);
+				}
+
+				let response_wire = WireEnvelope::from_der(&response_wire_bytes)?;
+				let response_envelope = match response_wire {
+					WireEnvelope::Cleartext(env) => env,
+					WireEnvelope::Encrypted(_) => return Err(TransportError::InvalidMessage),
+				};
+
+				use $crate::transport::handshake::ServerHandshake;
+				let signed_data = match response_envelope {
+					TransportEnvelope::SignedData(sd) => sd,
+					_ => return Err(TransportError::InvalidMessage),
+				};
+				let server_handshake: ServerHandshake =
+					(&signed_data).try_into().map_err(|_| TransportError::InvalidMessage)?;
+				let response_bytes = server_handshake.to_der()?;
+				if response_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+					return Err(TransportError::InvalidMessage);
+				}
+
+				// Step 3: Process server handshake (no mutual auth)
+				let next_message_bytes = client.process_server_handshake_no_auth(&response_bytes)?;
+				if next_message_bytes.len() > $crate::transport::tcp::HANDSHAKE_MAX_WIRE {
+					return Err(TransportError::InvalidMessage);
+				}
+
+				// Step 4: Send client key exchange
+				use $crate::transport::handshake::ClientKeyExchange;
+				let client_kex = ClientKeyExchange::from_der(&next_message_bytes)?;
+				let enveloped_data: $crate::cms::enveloped_data::EnvelopedData =
+					(&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
+				let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
+				let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
+				self.write_envelope(&wire_envelope.to_der()?).await?;
+
+				// Step 5: Complete handshake and get RuntimeAead
+				let cipher = client.complete()?;
+				use $crate::transport::handshake::HandshakeFinalization;
+				let profile = client.selected_profile().ok_or(TransportError::InvalidMessage)?;
+				let aead_oid = profile.aead.ok_or(TransportError::InvalidMessage)?;
+				let session_key = $crate::crypto::aead::RuntimeAead::new(cipher, aead_oid);
+				self.set_symmetric_key(session_key);
+				self.set_handshake_state($crate::transport::handshake::TcpHandshakeState::Complete);
+
+				Ok(())
+			}
+
 			/// Perform client-side handshake with server using ClientHandshakeProtocol trait.
+			/// For mutual authentication (K != ()).
 			///
 			/// This method:
 			/// 1. Creates appropriate handshake orchestrator based on protocol kind
@@ -335,57 +437,51 @@ macro_rules! impl_tcp_common {
 			async fn perform_client_handshake(&mut self) -> TransportResult<()> {
 				use $crate::der::{Decode, Encode};
 				use $crate::transport::handshake::ClientHello;
-				use $crate::transport::handshake::HandshakeError;
 				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
-				use $crate::transport::handshake::client::EciesHandshakeClientSecp256k1;
 				use $crate::transport::tcp::CompositeValidator;
-				use $crate::transport::handshake::{
-					ClientHandshakeProtocol, HandshakeProtocolKind,
-				};
+				use $crate::transport::handshake::{ClientHandshakeProtocol, HandshakeProtocolKind};
 
-				let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = HandshakeError>> = match self.handshake_protocol_kind {
-					HandshakeProtocolKind::Ecies => {
-						// Set client identity if available
-						let mut client = EciesHandshakeClientSecp256k1::new(None);
-						if let (Some(cert_arc), Some(key)) = (&self.client_certificate, &self.signatory) {
-							client = client.with_client_identity(Arc::clone(cert_arc), Arc::clone(key));
-						}
+				// Build composite validator if validators are configured
+				#[cfg(all(feature = "x509", feature = "std"))]
+				let validator = self.client_validators.as_ref().map(|validators| {
+					let composite = CompositeValidator {
+						validators: Arc::clone(validators),
+					};
+					Arc::new(composite) as Arc<dyn $crate::crypto::x509::policy::CertificateValidation>
+				});
 
-						// Set certificate validators if available
-						#[cfg(all(feature = "x509", feature = "std"))]
-						if let Some(validators) = &self.client_validators {
-							let composite = CompositeValidator {
-								validators: Arc::clone(validators),
-							};
-							client = client.with_certificate_validator(Arc::new(composite));
-						}
+				#[cfg(not(all(feature = "x509", feature = "std")))]
+				let validator = None;
 
-						Box::new(client)
+				// Branch: Handle ECIES without mutual auth separately (K=() cannot be trait object)
+				if matches!(self.handshake_protocol_kind, HandshakeProtocolKind::Ecies) && self.signatory.is_none() {
+					return self.perform_client_handshake_no_mutual_auth(validator).await;
+				}
+
+				// Path: Mutual auth clients - use trait object via factory
+				let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = $crate::transport::handshake::HandshakeError>> = match (self.handshake_protocol_kind, &self.signatory) {
+					(HandshakeProtocolKind::Ecies, Some(key)) => {
+						key.create_ecies_client(
+							self.server_certificate.as_ref().map(Arc::clone),
+							self.client_certificate.as_ref().map(Arc::clone),
+							None, // Use default AAD domain tag
+							validator,
+						)?
 					}
 
 					#[cfg(feature = "transport-cms")]
-					HandshakeProtocolKind::Cms => {
-						// Get server certificate and signatory for CMS client
+					(HandshakeProtocolKind::Cms, Some(signatory)) => {
 						let server_cert = self.server_certificate.as_ref()
 							.ok_or(TransportError::Forbidden)?;
-						let signatory = self.signatory.as_ref()
-							.ok_or(TransportError::Forbidden)?;
-
-						// Build composite validator if validators are configured
-						#[cfg(all(feature = "x509", feature = "std"))]
-						let validator = self.client_validators.as_ref().map(|validators| {
-							let composite = CompositeValidator {
-								validators: Arc::clone(validators),
-							};
-							Arc::new(composite) as Arc<dyn $crate::crypto::x509::policy::CertificateValidation>
-						});
-
-						#[cfg(not(all(feature = "x509", feature = "std")))]
-						let validator = None;
-
-						// Use trait method to create CMS client with concrete key type
 						signatory.create_cms_client(Arc::clone(server_cert), validator)?
 					}
+
+					#[cfg(feature = "transport-cms")]
+					(HandshakeProtocolKind::Cms, None) => {
+						return Err(TransportError::Forbidden); // CMS requires mutual auth
+					}
+
+					_ => return Err(TransportError::Forbidden),
 				};
 
 				// Step 1: Start handshake - get initial message
@@ -528,15 +624,13 @@ macro_rules! impl_tcp_common {
 							let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
 							let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
 
-							Box::new(
-								$crate::transport::handshake::server::EciesHandshakeServer::<$crate::crypto::profiles::DefaultCryptoProvider>::new(
-									Arc::clone(&signatory),
-									Arc::clone(cert_arc),
-									None, // Use default AAD domain tag
-									self.client_validators.as_ref().map(Arc::clone)
-								)
-								.with_supported_profiles(vec![profile_desc])
-							)
+							// Use factory method to create ECIES server with concrete key type
+							signatory.create_ecies_server(
+								Arc::clone(cert_arc),
+								None, // Use default AAD domain tag
+								vec![profile_desc],
+								self.client_validators.as_ref().map(Arc::clone)
+							)?
 						}
 
 					#[cfg(all(

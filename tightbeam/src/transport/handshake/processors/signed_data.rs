@@ -104,11 +104,11 @@ mod tests {
 		/// Helper function to create a test SignedData builder
 		fn create_test_signed_data_builder(
 			signing_key: Secp256k1SigningKey,
-		) -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider>, HandshakeError> {
+		) -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider, Secp256k1SigningKey>, HandshakeError> {
 			let digest_alg = create_sha3_256_digest_alg();
 			let signature_alg = create_ecdsa_sha3_256_signature_alg();
 
-			TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(signing_key, digest_alg, signature_alg)
+			TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(signing_key, digest_alg, signature_alg)
 		}
 
 		/// Helper function to create a test signature verifier
@@ -138,7 +138,7 @@ mod tests {
 			let content = b"test_content_to_verify";
 
 			// 3. Create SignedData builder and build structure
-			let mut builder = create_test_signed_data_builder(signing_key.clone())?;
+			let builder = create_test_signed_data_builder(signing_key.clone())?;
 			let signed_data = builder.build(content)?;
 
 			// 4. Create processor and verify signature
@@ -160,8 +160,9 @@ mod tests {
 			let content = b"der_encoded_test";
 
 			// 3. Create SignedData builder and build DER-encoded structure
-			let mut builder = create_test_signed_data_builder(signing_key.clone())?;
-			let der_bytes = builder.build_der(content)?;
+			let builder = create_test_signed_data_builder(signing_key.clone())?;
+			let signed_data = builder.build(content)?;
+			let der_bytes = signed_data.to_der()?;
 
 			// 4. Create processor and verify from DER
 			let processor = create_test_processor(&signing_key)?;
@@ -183,7 +184,7 @@ mod tests {
 			let content = b"test_content";
 
 			// 3. Create SignedData with one key
-			let mut builder = create_test_signed_data_builder(signing_key)?;
+			let builder = create_test_signed_data_builder(signing_key)?;
 			let signed_data = builder.build(content)?;
 
 			// 4. Try to verify with wrong key (should fail)
@@ -205,7 +206,7 @@ mod tests {
 			let content = b"test_content";
 
 			// 3. Create SignedData with SHA3-256
-			let mut builder = create_test_signed_data_builder(signing_key.clone())?;
+			let builder = create_test_signed_data_builder(signing_key.clone())?;
 			let signed_data = builder.build(content)?;
 
 			// 4. Try to verify with wrong digest OID (SHA-256 instead of SHA3-256)

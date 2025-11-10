@@ -286,7 +286,7 @@ mod tests {
 	};
 
 	/// Helper function to create a fully configured test KARI builder
-	fn create_test_kari_builder() -> TightBeamKariBuilder<crate::crypto::profiles::DefaultCryptoProvider> {
+	fn create_test_kari_builder() -> TightBeamKariBuilder<DefaultCryptoProvider> {
 		let (sender_key, sender_spki, _recipient_key, recipient_pubkey) = create_test_keypair();
 		let ukm = create_test_ukm();
 		let rid = create_test_recipient_id();
@@ -303,7 +303,7 @@ mod tests {
 
 	#[test]
 	fn test_validation() {
-		let builder = TightBeamKariBuilder::<crate::crypto::profiles::DefaultCryptoProvider>::default();
+		let builder = TightBeamKariBuilder::<DefaultCryptoProvider>::default();
 
 		// Should fail validation with all None fields
 		let result = builder.validate();
@@ -316,8 +316,8 @@ mod tests {
 		let sender_key = K256SecretKey::random(&mut OsRng);
 
 		// Builder pattern should work
-		let builder = TightBeamKariBuilder::<crate::crypto::profiles::DefaultCryptoProvider>::default()
-			.with_sender_priv(sender_key.clone())
+		let builder = TightBeamKariBuilder::<DefaultCryptoProvider>::default()
+			.with_sender_priv(sender_key)
 			.with_kdf_info(b"test-info");
 		assert!(builder.sender_priv.is_some());
 		assert_eq!(builder.kdf_info, b"test-info");

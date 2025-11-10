@@ -2,6 +2,8 @@ use crate::policy::TransitStatus;
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
+pub type Result<T> = core::result::Result<T, TransportError>;
+
 /// Transport error types
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]

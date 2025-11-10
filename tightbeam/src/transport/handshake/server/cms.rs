@@ -26,10 +26,12 @@ use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
-use crate::crypto::sign::EcdsaSignatureVerifier;
+use crate::crypto::sign::{EcdsaSignatureVerifier, Keypair, SignatureAlgorithmIdentifier, Signer, Verifier};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::oid::AssociatedOid;
 use crate::der::Decode;
+use crate::der::Encode;
+use crate::spki::AlgorithmIdentifierOwned;
 use crate::spki::EncodePublicKey;
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
@@ -80,11 +82,12 @@ where
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
 	P::Signature: 'static,
 	P::Digest: 'static,
 	P::AeadCipher: KeyInit + 'static,
-	K: Clone + Into<SecretKey<P::Curve>> + signature::Signer<P::Signature> + ServerHandshakeKey,
+	K: Clone + Into<SecretKey<P::Curve>> + Signer<P::Signature> + Keypair + ServerHandshakeKey + 'static,
+	K::VerifyingKey: EncodePublicKey,
 {
 	/// Create a new CMS handshake server.
 	///
@@ -93,7 +96,7 @@ where
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(server_signing_key: K, client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>) -> Self {
 		Self {
-			state: ServerStateMachine::new(),
+			state: ServerStateMachine::default(),
 			server_signing_key,
 			client_cert: None,
 			validated_client_cert: None,
@@ -368,15 +371,19 @@ where
 			self.invariants.lock_transcript()?;
 		}
 
-		// 3. Get algorithm identifiers from the key implementation
-		let digest_alg = self.server_signing_key.digest_algorithm();
-		let signature_alg = self.server_signing_key.signature_algorithm();
+		// 3. Get algorithm identifiers from the crypto provider
+		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
+		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 
-		// 4. Build SignedData
+		// 4. Build SignedData using TightBeamSignedDataBuilder
 		let content = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
-		let signed_data_der = self
-			.server_signing_key
-			.build_cms_signed_data(content, &digest_alg, &signature_alg)?;
+		let builder = crate::transport::handshake::builders::TightBeamSignedDataBuilder::<P, _>::new(
+			self.server_signing_key.clone(),
+			digest_alg,
+			signature_alg,
+		)?;
+		let signed_data = builder.build(content)?;
+		let signed_data_der = signed_data.to_der()?;
 
 		// 5. Add to transcript if computing internally
 		if !self.transcript_buffer.is_empty() {
@@ -490,11 +497,12 @@ where
 	P::Curve: Curve + CurveArithmetic,
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
-	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
 	P::Signature: 'static,
 	P::Digest: 'static,
 	P::AeadCipher: Send + Sync + KeyInit + 'static,
-	K: Clone + Into<SecretKey<P::Curve>> + signature::Signer<P::Signature> + ServerHandshakeKey + Send,
+	K: Clone + Into<SecretKey<P::Curve>> + Signer<P::Signature> + Keypair + ServerHandshakeKey + Send + 'static,
+	K::VerifyingKey: EncodePublicKey,
 {
 	type Error = HandshakeError;
 
@@ -744,12 +752,13 @@ mod tests {
 			let signature_alg =
 				AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
 
-			let mut builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider>::new(
+			let builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(
 				signing_key.clone(),
 				digest_alg,
 				signature_alg,
 			)?;
-			Ok(builder.build_der(transcript_hash)?)
+			let signed_data = builder.build(transcript_hash)?;
+			Ok(signed_data.to_der()?)
 		}
 
 		/// Create a test security profile with the given AEAD key size.
