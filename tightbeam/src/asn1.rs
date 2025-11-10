@@ -248,6 +248,12 @@ pub struct Frame {
 	pub nonrepudiation: Option<SignerInfo>,
 }
 
+impl AsRef<Frame> for Frame {
+	fn as_ref(&self) -> &Frame {
+		self
+	}
+}
+
 // Transport handshake attribute OIDs (FULL_CMS profile)
 // Enterprise arc placeholder: 1.3.6.1.4.1.55555.1.x
 // Replace 55555 with assigned enterprise number before production.

@@ -83,17 +83,68 @@ impl Frame {
 		// Decode the signature
 		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;
 
-		// Recreate TBS (to-be-signed) structure
-		let mut tbs = self.clone();
-		tbs.nonrepudiation = None;
-
-		// Encode TBS to DER
-		let tbs_der = crate::encode(&tbs)?;
+		// Encode TBS (to-be-signed) structure without cloning - skip the signature field
+		let tbs_der = self.encode_tbs()?;
 
 		// Verify signature
 		verifier.verify(&tbs_der, &signature)?;
 
 		Ok(())
+	}
+
+	/// Encode the Frame for signature verification (TBS - to-be-signed)
+	/// This excludes the signature field to avoid cloning the entire structure
+	#[cfg(feature = "signature")]
+	fn encode_tbs(&self) -> Result<Vec<u8>> {
+		use crate::der::Encode;
+
+		// Manually encode the sequence without the signature field
+		let mut tbs_data = Vec::new();
+
+		// Encode version, metadata, and message
+		self.version.encode(&mut tbs_data)?;
+		self.metadata.encode(&mut tbs_data)?;
+		self.message.encode(&mut tbs_data)?;
+
+		// Encode integrity if present (context-specific tag 0)
+		if let Some(ref integrity) = self.integrity {
+			self.encode_tagged_integrity(&mut tbs_data, integrity)?;
+		}
+
+		// Wrap in sequence
+		self.wrap_in_sequence(tbs_data)
+	}
+
+	/// Encode integrity field with context-specific tagging
+	#[cfg(feature = "signature")]
+	fn encode_tagged_integrity(&self, buffer: &mut Vec<u8>, integrity: &crate::DigestInfo) -> Result<()> {
+		use crate::der::Encode;
+
+		let integrity_bytes = integrity.to_der()?;
+
+		let mut tagged_integrity = Vec::new();
+		tagged_integrity.push(0xA0); // Context-specific tag 0
+
+		let len = crate::der::Length::try_from(integrity_bytes.len())?;
+		len.encode(&mut tagged_integrity)?;
+
+		tagged_integrity.extend(integrity_bytes);
+		buffer.extend(tagged_integrity);
+		Ok(())
+	}
+
+	/// Wrap data in a DER sequence
+	#[cfg(feature = "signature")]
+	fn wrap_in_sequence(&self, data: Vec<u8>) -> Result<Vec<u8>> {
+		use crate::der::Encode;
+
+		let mut buffer = Vec::new();
+		let sequence_len = crate::der::Length::try_from(data.len())?;
+
+		buffer.push(crate::der::Tag::Sequence.into());
+		sequence_len.encode(&mut buffer)?;
+		buffer.extend(data);
+		Ok(buffer)
 	}
 
 	/// Decrypt and decode the message body into a typed message T
@@ -554,5 +605,10 @@ mod tests {
 			core::any::TypeId::of::<<TypeProfileMessage as crate::Message>::Profile>(),
 			core::any::TypeId::of::<crate::crypto::profiles::StandardProfile>()
 		);
+
+		// Test HAS_PROFILE values
+		assert!(!NumericProfileMessage::HAS_PROFILE);
+		assert!(TypeProfileMessage::HAS_PROFILE);
+		assert!(!NoProfileMessage::HAS_PROFILE);
 	}
 }

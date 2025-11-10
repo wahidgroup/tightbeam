@@ -691,7 +691,7 @@ macro_rules! servlet {
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: $crate::Frame| {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
 					async move {
@@ -712,7 +712,7 @@ macro_rules! servlet {
 			let workers_arc = $workers;
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
 					async move {
@@ -790,7 +790,7 @@ macro_rules! servlet {
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
 					let router_arc = router_arc.clone();
 					let config_arc = config_arc.clone();
 					async move {
@@ -811,7 +811,7 @@ macro_rules! servlet {
 			let config_arc = ::std::sync::Arc::new($config);
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
 					let router_arc = router_arc.clone();
 					let config_arc = config_arc.clone();
 					async move {
@@ -832,7 +832,7 @@ macro_rules! servlet {
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: $crate::Frame| {
 					let config_arc = config_arc.clone();
 					async move {
 						let $config_param = &config_arc;
@@ -850,7 +850,7 @@ macro_rules! servlet {
 			let config_arc = ::std::sync::Arc::new($config);
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
 					let config_arc = config_arc.clone();
 					async move {
 						let $config_param = &config_arc;
@@ -869,7 +869,7 @@ macro_rules! servlet {
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
 					let router_arc = router_arc.clone();
 					async move {
 						let $router_param = &router_arc;
@@ -887,7 +887,7 @@ macro_rules! servlet {
 			let router_arc = ::std::sync::Arc::new($router);
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
 					let router_arc = router_arc.clone();
 					async move {
 						let $router_param = &router_arc;
@@ -907,7 +907,7 @@ macro_rules! servlet {
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: $crate::Frame| {
 					async move {
 						$body
 					}
@@ -925,7 +925,7 @@ macro_rules! servlet {
 			// which already provides concurrency
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				handle: move |$msg: $msg_ty| {
+				handle: move |$msg: $crate::Frame| {
 					async move {
 						$body
 					}
@@ -975,14 +975,14 @@ mod tests {
 			let decoded: RequestMessage = crate::decode(&message.message).ok()?;
 			let is_winner = decoded.lucky_number == config.lotto_number;
 			if decoded.content == "PING" {
-				 Some(crate::compose! {
+				 Some(std::sync::Arc::new(crate::compose! {
 					V0: id: message.metadata.id.clone(),
 						order: 1_700_000_000u64,
 						message: ResponseMessage {
 							result: "PONG".to_string(),
 							is_winner,
 						}
-				 }.ok()?)
+				 }.ok()?))
 			 } else {
 				 None
 			}
@@ -1116,7 +1116,7 @@ mod tests {
 							result: reply.result,
 							is_winner,
 						}
-				}.ok()
+				}.ok().map(std::sync::Arc::new)
 			}
 		}
 

@@ -1,5 +1,6 @@
 use crate::asn1::Frame;
 use crate::der::Sequence;
+use std::sync::Arc;
 
 #[cfg(feature = "derive")]
 use crate::{compose, Beamable};
@@ -517,8 +518,8 @@ macro_rules! test_container {
 
 			let (server_tx, rx_inner) = mpsc::channel();
 			let tx = Arc::new(server_tx);
-			let (ok_tx_inner, ok_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
-			let (reject_tx_inner, reject_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
+			let (ok_tx_inner, ok_rx_inner): (mpsc::Sender<Arc<$crate::Frame>>, mpsc::Receiver<Arc<$crate::Frame>>) = mpsc::channel();
+			let (reject_tx_inner, reject_rx_inner): (mpsc::Sender<Arc<$crate::Frame>>, mpsc::Receiver<Arc<$crate::Frame>>) = mpsc::channel();
 			let ok_tx_arc = Arc::new(ok_tx_inner);
 			let reject_tx_arc = Arc::new(reject_tx_inner);
 
@@ -563,8 +564,8 @@ macro_rules! test_container {
 			let tx = Arc::new(server_tx);
 
 			// Status channels (container receives ok/reject)
-			let (ok_tx_inner, ok_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
-			let (reject_tx_inner, reject_rx_inner): (mpsc::Sender<$crate::Frame>, mpsc::Receiver<$crate::Frame>) = mpsc::channel();
+			let (ok_tx_inner, ok_rx_inner): (mpsc::Sender<Arc<$crate::Frame>>, mpsc::Receiver<Arc<$crate::Frame>>) = mpsc::channel();
+			let (reject_tx_inner, reject_rx_inner): (mpsc::Sender<Arc<$crate::Frame>>, mpsc::Receiver<Arc<$crate::Frame>>) = mpsc::channel();
 			let ok_tx_arc = Arc::new(ok_tx_inner);
 			let reject_tx_arc = Arc::new(reject_tx_inner);
 
@@ -929,7 +930,7 @@ macro_rules! test_container {
 							let reject_tx_for_gate = $reject_tx.clone();
 							$crate::policy::GateMiddleware::new(
 								$gate,
-								move |message: &$crate::Frame, status: &$crate::policy::TransitStatus| {
+								move |message: &Arc<$crate::Frame>, status: &$crate::policy::TransitStatus| {
 									if *status == $crate::policy::TransitStatus::Accepted {
 										let _ = ok_tx_for_gate.send(message.clone());
 									} else {
@@ -1024,17 +1025,23 @@ macro_rules! assert_channel_ne {
 // - Result<Frame, E> => compare metadata.id from Ok(frame)
 // - Any T: Beamable + PartialEq => decode T from frame.message and compare
 pub trait ExpectedMatcher {
-	fn matches(&self, frame: &crate::Frame) -> bool;
+	fn matches(&self, frame: &Frame) -> bool;
 }
 
 impl ExpectedMatcher for crate::Frame {
-	fn matches(&self, frame: &crate::Frame) -> bool {
+	fn matches(&self, frame: &Frame) -> bool {
 		frame.metadata.id == self.metadata.id
 	}
 }
 
+impl ExpectedMatcher for Arc<crate::Frame> {
+	fn matches(&self, frame: &Frame) -> bool {
+		self.metadata.id == frame.metadata.id
+	}
+}
+
 impl<E> ExpectedMatcher for Result<crate::Frame, E> {
-	fn matches(&self, frame: &crate::Frame) -> bool {
+	fn matches(&self, frame: &Frame) -> bool {
 		match self {
 			Ok(f) => frame.metadata.id == f.metadata.id,
 			Err(_) => false,
@@ -1046,7 +1053,7 @@ impl<T> ExpectedMatcher for T
 where
 	T: crate::Message + PartialEq,
 {
-	fn matches(&self, frame: &crate::Frame) -> bool {
+	fn matches(&self, frame: &Frame) -> bool {
 		if let Ok(decoded) = crate::decode::<T>(&frame.message) {
 			decoded == *self
 		} else {
@@ -1070,7 +1077,7 @@ macro_rules! assert_recv {
 		while __got < ($n as usize) {
 			match $rx.try_recv() {
 				Ok(__m) => {
-					if __expected_ref.matches(&__m) {
+					if __expected_ref.matches(__m.as_ref()) {
 						__got += 1;
 					}
 				}
@@ -1092,7 +1099,7 @@ macro_rules! assert_recv {
 		let __expected_ref = &($expected);
 		let mut __found = false;
 		while let Ok(__m) = $rx.try_recv() {
-			if __expected_ref.matches(&__m) {
+			if __expected_ref.matches(__m.as_ref()) {
 				__found = true;
 				break;
 			}
@@ -1449,7 +1456,7 @@ mod tests {
 	pub struct IdPatternGate;
 
 	impl GatePolicy for IdPatternGate {
-		fn evaluate(&self, msg: &crate::Frame) -> TransitStatus {
+		fn evaluate(&self, msg: &std::sync::Arc<crate::Frame>) -> TransitStatus {
 			let id = &msg.metadata.id;
 			if id.strip_prefix(b"accept-").is_some() {
 				TransitStatus::Accepted
@@ -1467,14 +1474,12 @@ mod tests {
 				TransitStatus::Accepted
 			}
 		}
-	}
-
-	// Client-side gate: block ids starting with "illegal-"
+	} // Client-side gate: block ids starting with "illegal-"
 	#[derive(Default, Clone)]
 	pub struct IllegalEgressGate;
 
 	impl GatePolicy for IllegalEgressGate {
-		fn evaluate(&self, msg: &crate::Frame) -> TransitStatus {
+		fn evaluate(&self, msg: &std::sync::Arc<crate::Frame>) -> TransitStatus {
 			if msg.metadata.id.starts_with(b"illegal-") {
 				TransitStatus::Forbidden
 			} else {
@@ -1482,7 +1487,6 @@ mod tests {
 			}
 		}
 	}
-
 	#[cfg(feature = "std")]
 	test_case! {
 		name: test_create_test_message,
@@ -1529,7 +1533,7 @@ mod tests {
 		},
 		service: |message, tx| async move {
 			let _ = tx.send(message.clone());
-			Some(create_v0_tightbeam(Some("OK"), Some(str::from_utf8(&message.metadata.id).ok()?)))
+			Some(std::sync::Arc::new(create_v0_tightbeam(Some("OK"), Some(str::from_utf8(&message.metadata.id).ok()?))))
 		},
 		container: |client, channels| async move {
 			use crate::transport::MessageEmitter;

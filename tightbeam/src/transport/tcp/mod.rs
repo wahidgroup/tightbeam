@@ -276,13 +276,13 @@ macro_rules! impl_tcp_common {
 		{
 			fn with_handler<F>(mut self, handler: F) -> Self
 			where
-				F: Fn($crate::Frame) -> Option<$crate::Frame> + Send + 'static,
+				F: Fn(std::sync::Arc<$crate::Frame>) -> Option<std::sync::Arc<$crate::Frame>> + Send + 'static,
 			{
 				self.handler = Some(Box::new(handler));
 				self
 			}
 
-			fn handler(&self) -> Option<&(dyn Fn($crate::Frame) -> Option<$crate::Frame> + Send)> {
+			fn handler(&self) -> Option<&(dyn Fn(std::sync::Arc<$crate::Frame>) -> Option<std::sync::Arc<$crate::Frame>> + Send)> {
 				self.handler.as_ref().map(|h| h.as_ref())
 			}
 		}

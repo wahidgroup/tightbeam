@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::transport::policy::RetryAction;
 use crate::transport::{AsyncListenerTrait, MessageIO, Pingable, Protocol, TransportError, TransportResult};
 use crate::Frame;
 
@@ -293,7 +294,7 @@ impl crate::transport::Mycelial for TokioListener {
 #[cfg(not(feature = "transport-policy"))]
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
+	handler: Option<Box<dyn Fn(std::sync::Arc<Frame>) -> Option<std::sync::Arc<Frame>> + Send>>,
 	#[cfg(feature = "x509")]
 	server_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
@@ -322,7 +323,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 #[cfg(feature = "transport-policy")]
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
+	handler: Option<Box<dyn Fn(std::sync::Arc<Frame>) -> Option<std::sync::Arc<Frame>> + Send>>,
 	restart_policy: Box<dyn RestartPolicy>,
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
@@ -511,7 +512,9 @@ where
 		self.collector_gate.as_ref()
 	}
 
-	async fn collect_message(&mut self) -> TransportResult<(crate::Frame, crate::policy::TransitStatus)> {
+	async fn collect_message(
+		&mut self,
+	) -> TransportResult<(std::sync::Arc<crate::Frame>, crate::policy::TransitStatus)> {
 		use crate::crypto::aead::Decryptor;
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
@@ -628,12 +631,12 @@ where
 	async fn send_response(
 		&mut self,
 		status: crate::policy::TransitStatus,
-		message: Option<crate::Frame>,
+		message: Option<std::sync::Arc<crate::Frame>>,
 	) -> TransportResult<()> {
 		use crate::der::Encode;
 		use crate::transport::{ResponsePackage, TransportEnvelope, WireEnvelope};
 
-		let response_pkg = ResponsePackage { status, message, length: None };
+		let response_pkg = ResponsePackage { status, message: message.map(|arc| (*arc).clone()), length: None };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// Check if encryption should be used
@@ -688,13 +691,13 @@ where
 	/// Send a TightBeam message with automatic handshake
 	///
 	/// # Handshake Flow (when x509 enabled)
-	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
+	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<std::sync::Arc<Frame>>> {
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
 		use crate::transport::handshake::TcpHandshakeState;
 		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
-		let mut current_message: Frame = message;
+		let mut current_message: std::sync::Arc<Frame> = std::sync::Arc::new(message);
 		let mut current_attempt = attempt.unwrap_or(0);
 
 		loop {
@@ -719,8 +722,10 @@ where
 			if should_handshake {
 				// Perform client-side handshake
 				self.perform_client_handshake().await?;
-			} // Wrap in envelope and send
-			let envelope = TransportEnvelope::from(current_message);
+			}
+
+			// Wrap in envelope and send
+			let envelope = TransportEnvelope::new_request_ref(&current_message);
 
 			// Check if encryption should be used
 			let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
@@ -744,18 +749,11 @@ where
 							return Err(TransportError::InvalidMessage);
 						}
 					}
-					WireEnvelope::Cleartext(envelope.clone())
+					WireEnvelope::Cleartext(envelope)
 				}
 			};
 
 			self.write_envelope(&wire_envelope.to_der()?).await?;
-
-			// Extract message back from envelope
-			current_message = match envelope {
-				TransportEnvelope::Request(msg) => msg.message,
-				// This should never happen as we just created it
-				_ => unreachable!(),
-			};
 
 			// Wait for receiver's response envelope
 			let response_bytes = self.read_envelope().await?;
@@ -775,7 +773,7 @@ where
 			};
 
 			let (status, response) = match response_envelope {
-				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
+				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message.map(Arc::new)),
 				TransportEnvelope::Request(_) => {
 					// Only responses are valid here
 					return Err(TransportError::InvalidMessage);
@@ -787,7 +785,7 @@ where
 			};
 
 			// Check transport status and handle response
-			let result: TransportResult<&Frame> = if status != TransitStatus::Accepted {
+			let result: TransportResult<&Arc<Frame>> = if status != TransitStatus::Accepted {
 				Err(<TransportError as From<TransitStatus>>::from(status))
 			} else {
 				match &response {
@@ -796,26 +794,35 @@ where
 				}
 			};
 
-			let policy: Option<Frame> = self.get_restart_policy().evaluate(current_message, result, current_attempt);
-			match policy {
-				Some(retry_message) => {
-					if current_attempt == usize::MAX {
-						// Prevent overflow
-						return Err(TransportError::MaxRetriesExceeded);
-					} else {
-						current_message = retry_message;
-						current_attempt += 1;
-						continue;
+			// Evaluate retry policy only on error
+			if let Err(_) = &result {
+				let action = self.get_restart_policy().evaluate(&current_message, &result, current_attempt);
+				match action {
+					RetryAction::RetryWithSame => {
+						if current_attempt == usize::MAX {
+							return Err(TransportError::MaxRetriesExceeded);
+						} else {
+							current_attempt += 1;
+							continue;
+						}
+					}
+					RetryAction::RetryWithModified(retry_message) => {
+						if current_attempt == usize::MAX {
+							return Err(TransportError::MaxRetriesExceeded);
+						} else {
+							current_message = std::sync::Arc::new(retry_message);
+							current_attempt += 1;
+							continue;
+						}
+					}
+					RetryAction::NoRetry => {
+						// Return the error
+						return result.map(|_| None);
 					}
 				}
-				None => {
-					// Return based on the original result construction
-					if status != TransitStatus::Accepted {
-						return Err(<TransportError as From<TransitStatus>>::from(status));
-					} else {
-						return Ok(response);
-					}
-				}
+			} else {
+				// Success case - return response
+				return Ok(response);
 			}
 		}
 	}
@@ -844,9 +851,9 @@ mod tests {
 		let server = listener;
 		let server_handle = tokio::spawn(async move {
 			let (transport, _) = server.accept().await?;
-			let mut transport = transport.with_handler(Box::new(move |msg: Frame| {
-				let _ = tx.try_send(msg.clone());
-				Some(response_msg.clone())
+			let mut transport = transport.with_handler(Box::new(move |msg: std::sync::Arc<Frame>| {
+				let _ = tx.try_send((*msg).clone());
+				Some(std::sync::Arc::new(response_msg.clone()))
 			}));
 
 			transport.handle_request().await
@@ -858,7 +865,7 @@ mod tests {
 
 		let received = rx.recv().await;
 		assert_eq!(Some(test_message), received);
-		assert_eq!(response, Some(expected_response));
+		assert_eq!(response.as_ref().map(|arc| (**arc).clone()), Some(expected_response));
 
 		server_handle.await??;
 		Ok(())
@@ -885,7 +892,7 @@ mod tests {
 		}
 
 		impl GatePolicy for BusyFirstGate {
-			fn evaluate(&self, _msg: &Frame) -> TransitStatus {
+			fn evaluate(&self, _msg: &std::sync::Arc<Frame>) -> TransitStatus {
 				if self.first.swap(false, Ordering::SeqCst) {
 					TransitStatus::Busy
 				} else {
@@ -926,13 +933,12 @@ mod tests {
 
 		let server_handle = tokio::spawn(async move {
 			let (transport, _) = server.accept().await?;
-			let mut transport =
-				transport
-					.with_collector_gate(BusyFirstGate::new())
-					.with_handler(Box::new(move |msg: Frame| {
-						let _ = tx.try_send(msg.clone());
-						Some(msg.clone())
-					}));
+			let mut transport = transport.with_collector_gate(BusyFirstGate::new()).with_handler(Box::new(
+				move |msg: std::sync::Arc<Frame>| {
+					let _ = tx.try_send((*msg).clone());
+					Some(msg.clone())
+				},
+			));
 
 			// First handle_request: processes handshake (ClientHello + ClientKeyExchange)
 			// and first application message. Gate returns Busy for first app message.
@@ -980,7 +986,7 @@ mod tests {
 		service: |message, tx| async move {
 			// Echo the message back as response
 			let _ = tx.send(message.clone());
-			Some(message.clone())
+			Some(std::sync::Arc::new(message))
 		},
 		container: |client, channels| async move {
 			use crate::transport::MessageEmitter;
@@ -1004,7 +1010,7 @@ mod tests {
 			assert!(client.encryptor().is_ok());
 
 			// Verify response matches
-			assert_eq!(response, Some(test_message.clone()));
+			assert_eq!(response.as_ref().map(|arc| (**arc).clone()), Some(test_message.clone()));
 
 			// Verify server received the message
 			assert_recv!(rx, test_message.clone(), 1);
@@ -1017,7 +1023,7 @@ mod tests {
 
 			// Verify still encrypted
 			assert_eq!(client.handshake_state(), TcpHandshakeState::Complete);
-			assert_eq!(response2, Some(test_message2.clone()));
+			assert_eq!(response2.as_ref().map(|arc| (**arc).clone()), Some(test_message2.clone()));
 
 			// Verify second message received
 			assert_recv!(rx, test_message2, 1);

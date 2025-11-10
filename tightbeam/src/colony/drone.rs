@@ -80,7 +80,7 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use core::future::Future;
 
@@ -1001,7 +1001,7 @@ macro_rules! drone {
 												status: $crate::policy::TransitStatus::Accepted,
 												servlet_address: Some(addr_bytes)
 											}
-									}.ok();
+									}.ok().map(std::sync::Arc::new);
 								}
 								Err(_) => {
 									// Return error response
@@ -1011,7 +1011,7 @@ macro_rules! drone {
 												status: $crate::policy::TransitStatus::Forbidden,
 												servlet_address: None
 											}
-									}.ok();
+									}.ok().map(std::sync::Arc::new);
 								}
 							}
 						}
@@ -1024,7 +1024,7 @@ macro_rules! drone {
 								status: $crate::policy::TransitStatus::Forbidden,
 								servlet_address: None
 							}
-					}.ok();
+					}.ok().map(std::sync::Arc::new);
 				}
 
 				// Not an activation request - check if there's an active servlet to handle it
@@ -1077,7 +1077,7 @@ macro_rules! drone {
 													list: None,
 													stop: None,
 												}
-										}.ok();
+										}.ok().map(std::sync::Arc::new);
 									}
 									Err(_) => {
 										return $crate::compose! {
@@ -1091,7 +1091,7 @@ macro_rules! drone {
 													list: None,
 													stop: None,
 												}
-										}.ok();
+										}.ok().map(std::sync::Arc::new);
 									}
 								}
 							}
@@ -1109,7 +1109,7 @@ macro_rules! drone {
 									list: None,
 									stop: None,
 								}
-						}.ok();
+						}.ok().map(std::sync::Arc::new);
 					}
 
 					// Handle list request
@@ -1141,7 +1141,7 @@ macro_rules! drone {
 									}),
 									stop: None,
 								}
-						}.ok();
+						}.ok().map(std::sync::Arc::new);
 					}
 
 					// Handle stop request
@@ -1166,7 +1166,7 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Accepted
 										}),
 									}
-							}.ok();
+							}.ok().map(std::sync::Arc::new);
 						} else {
 							drop(servlets);
 
@@ -1179,7 +1179,7 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Forbidden
 										}),
 									}
-							}.ok();
+							}.ok().map(std::sync::Arc::new);
 						}
 					}
 				}
@@ -1194,6 +1194,9 @@ macro_rules! drone {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(feature = "std")]
+	use std::sync::Arc;
 
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::der::Sequence;
@@ -1322,7 +1325,7 @@ mod tests {
 	}
 
 	impl GatePolicy for SignatureGate {
-		fn evaluate(&self, frame: &crate::Frame) -> TransitStatus {
+		fn evaluate(&self, frame: &Arc<crate::Frame>) -> TransitStatus {
 			// Check if the frame has a nonrepudiation signature
 			if frame.nonrepudiation.is_some() {
 				// Verify the signature using the built-in verify method
@@ -1380,7 +1383,7 @@ mod tests {
 		handle: |message| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
 			if decoded.content == "PING" {
-				Some(DroneResponseJob::run(message.metadata.id.clone(), "PONG".to_string()).ok()?)
+				DroneResponseJob::run(message.metadata.id.clone(), "PONG".to_string()).ok().map(std::sync::Arc::new)
 			} else {
 				None
 			}
@@ -1399,7 +1402,7 @@ mod tests {
 		handle: |message, config| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
 			if decoded.value >= config.threshold {
-				Some(DroneResponseJob::run(message.metadata.id.clone(), "ACCEPTED".to_string()).ok()?)
+				DroneResponseJob::run(message.metadata.id.clone(), "ACCEPTED".to_string()).ok().map(std::sync::Arc::new)
 			} else {
 				None
 			}
@@ -1448,11 +1451,11 @@ mod tests {
 			};
 
 			if is_valid {
-				Some(DroneResponseWithOrderJob::run(
+				DroneResponseWithOrderJob::run(
 					message.metadata.id.clone(),
 					1_700_000_000u64,
 					echo_msg
-				).ok()?)
+				).ok().map(std::sync::Arc::new)
 			} else {
 				None
 			}
@@ -1559,7 +1562,7 @@ mod tests {
 			DroneResponseJob::run(
 				message.metadata.id.clone(),
 				format!("ECHO: {}", decoded.content)
-			).ok()
+			).ok().map(std::sync::Arc::new)
 		}
 	}
 

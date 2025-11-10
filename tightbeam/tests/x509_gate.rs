@@ -83,8 +83,7 @@ fn create_server_config(
 	validators: Vec<Arc<dyn CertificateValidation>>,
 ) -> TransportEncryptionConfig {
 	let key_manager = ServerKeyManager::new(key);
-	TransportEncryptionConfig::new(cert, key_manager)
-		.with_client_validators(validators)
+	TransportEncryptionConfig::new(cert, key_manager).with_client_validators(validators)
 }
 
 /// Test fixture that sets up a server with mutual authentication
@@ -118,10 +117,10 @@ impl MutualAuthServer {
 					let ping: PingMessage = decode(&message.message).ok()?;
 					let pong = PongMessage { echo: ping.data };
 
-					Some(compose! {
+					compose! {
 						V0: id: message.metadata.id.clone(),
 						message: pong
-					}.ok()?)
+					}.ok().map(std::sync::Arc::new)
 				}
 			}
 		};

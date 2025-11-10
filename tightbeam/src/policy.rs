@@ -1,3 +1,11 @@
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
 use crate::der::Enumerated;
 use crate::{Frame, Message};
 
@@ -19,7 +27,7 @@ pub enum TransitStatus {
 /// Gate policies are stateless procedures that evaluate whether a message
 /// should be accepted or rejected.
 pub trait GatePolicy: Send + Sync {
-	fn evaluate(&self, message: &Frame) -> TransitStatus;
+	fn evaluate(&self, message: &std::sync::Arc<Frame>) -> TransitStatus;
 }
 
 /// Policy trait a user implements to decide message acceptance.
@@ -73,7 +81,7 @@ where
 pub struct AcceptAllGate;
 
 impl GatePolicy for AcceptAllGate {
-	fn evaluate(&self, _: &Frame) -> TransitStatus {
+	fn evaluate(&self, _: &std::sync::Arc<Frame>) -> TransitStatus {
 		TransitStatus::Accepted
 	}
 }
@@ -86,7 +94,7 @@ impl GatePolicy for AcceptAllGate {
 #[derive(Debug, Clone)]
 pub struct GateMiddleware<G: GatePolicy, F>
 where
-	F: Fn(&Frame, &TransitStatus) + Send + Sync,
+	F: Fn(&Arc<Frame>, &TransitStatus) + Send + Sync,
 {
 	inner: G,
 	observer: F,
@@ -94,7 +102,7 @@ where
 
 impl<G: GatePolicy, F> GateMiddleware<G, F>
 where
-	F: Fn(&Frame, &TransitStatus) + Send + Sync,
+	F: Fn(&Arc<Frame>, &TransitStatus) + Send + Sync,
 {
 	/// Create a new middleware wrapper around a gate policy.
 	///
@@ -108,9 +116,9 @@ where
 
 impl<G: GatePolicy, F> GatePolicy for GateMiddleware<G, F>
 where
-	F: Fn(&Frame, &TransitStatus) + Send + Sync,
+	F: Fn(&Arc<Frame>, &TransitStatus) + Send + Sync,
 {
-	fn evaluate(&self, message: &Frame) -> TransitStatus {
+	fn evaluate(&self, message: &Arc<Frame>) -> TransitStatus {
 		let status = self.inner.evaluate(message);
 
 		// Observe the evaluation (transparent)

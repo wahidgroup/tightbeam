@@ -7,7 +7,7 @@ macro_rules! policy {
 
 		impl $crate::policy::GatePolicy for $name {
 			#[allow(unused_variables)]
-			fn evaluate(&self, $arg: &$crate::Frame) -> $crate::policy::TransitStatus {
+			fn evaluate(&self, $arg: &std::sync::Arc<$crate::Frame>) -> $crate::policy::TransitStatus {
 				$($body)*
 			}
 		}
@@ -20,7 +20,7 @@ macro_rules! policy {
 
 		impl $crate::policy::GatePolicy for $name {
 			#[allow(unused_variables)]
-			fn evaluate(&self, frame: &$crate::Frame) -> $crate::policy::TransitStatus {
+			fn evaluate(&self, frame: &std::sync::Arc<$crate::Frame>) -> $crate::policy::TransitStatus {
 				$($body)*
 			}
 		}
@@ -61,10 +61,10 @@ macro_rules! policy {
 			#[allow(unused_variables)]
 			fn evaluate(
 				&self,
-				$msg_arg: $crate::Frame,
-				$res_arg: $crate::transport::TransportResult<&$crate::Frame>,
+				$msg_arg: &std::sync::Arc<$crate::Frame>,
+				$res_arg: &$crate::transport::TransportResult<&std::sync::Arc<$crate::Frame>>,
 				$attempt_arg: usize,
-			) -> Option<$crate::Frame> {
+			) -> $crate::transport::policy::RetryAction {
 				$($body)*
 			}
 		}
@@ -79,10 +79,10 @@ macro_rules! policy {
 			#[allow(unused_variables)]
 			fn evaluate(
 				&self,
-				message: $crate::Frame,
-				result: $crate::transport::TransportResult<&$crate::Frame>,
+				message: &std::sync::Arc<$crate::Frame>,
+				result: &$crate::transport::TransportResult<&std::sync::Arc<$crate::Frame>>,
 				attempt: usize,
-			) -> Option<$crate::Frame> {
+			) -> $crate::transport::policy::RetryAction {
 				$($body)*
 			}
 		}
@@ -117,7 +117,7 @@ mod tests {
 			}
 		}
 		RestartPolicy: TestRestart |message, result, attempt| {
-			Some(message)
+			crate::transport::policy::RetryAction::RetryWithSame
 		}
 	}
 
@@ -127,7 +127,7 @@ mod tests {
 		let frame = crate::compose! {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
-		assert_eq!(gate.evaluate(&frame), TransitStatus::Busy);
+		assert_eq!(gate.evaluate(&std::sync::Arc::new(frame)), TransitStatus::Busy);
 
 		Ok(())
 	}

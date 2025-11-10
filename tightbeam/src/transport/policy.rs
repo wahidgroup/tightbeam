@@ -38,7 +38,7 @@ where
 	}
 }
 
-/// Restart policy trait - decides whether to retry and with what message.
+/// Restart policy trait - decides whether to retry.
 ///
 /// Restart policies are stateless procedures that determine retry behavior
 /// after a transport operation.
@@ -51,9 +51,24 @@ pub trait RestartPolicy: Send + Sync {
 	/// * `attempt` - The current attempt number (0-indexed)
 	///
 	/// # Returns
-	/// * `Some(TightBeam)` - Retry with this message (can be modified or same)
-	/// * `None` - Stop attempting, propagate the error
-	fn evaluate(&self, message: Frame, result: TransportResult<&Frame>, attempt: usize) -> Option<Frame>;
+	/// * `RetryAction` - What action to take for retry
+	fn evaluate(
+		&self,
+		message: &std::sync::Arc<Frame>,
+		result: &TransportResult<&std::sync::Arc<Frame>>,
+		attempt: usize,
+	) -> RetryAction;
+}
+
+/// Action to take when evaluating retry policy
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetryAction {
+	/// Retry with the same message
+	RetryWithSame,
+	/// Retry with a modified message
+	RetryWithModified(Frame),
+	/// Do not retry, propagate the error
+	NoRetry,
 }
 
 /// Jitter strategy trait - modifies delay durations to add randomness.
@@ -91,8 +106,13 @@ impl JitterStrategy for DecorrelatedJitter {
 pub struct NoRestart;
 
 impl RestartPolicy for NoRestart {
-	fn evaluate(&self, _: Frame, _: TransportResult<&Frame>, _: usize) -> Option<Frame> {
-		None
+	fn evaluate(
+		&self,
+		_message: &std::sync::Arc<Frame>,
+		_: &TransportResult<&std::sync::Arc<Frame>>,
+		_: usize,
+	) -> RetryAction {
+		RetryAction::NoRetry
 	}
 }
 
@@ -175,27 +195,28 @@ impl Default for RestartLinearBackoff {
 macro_rules! impl_timed_backoff_policy {
 	($policy:ident, $delay_calc:expr) => {
 		impl RestartPolicy for $policy {
-			fn evaluate(&self, message: Frame, result: TransportResult<&Frame>, attempt: usize) -> Option<Frame> {
+			fn evaluate(
+				&self,
+				_message: &std::sync::Arc<Frame>,
+				_result: &TransportResult<&std::sync::Arc<Frame>>,
+				attempt: usize,
+			) -> RetryAction {
 				if attempt >= self.max_attempts {
-					return None;
+					return RetryAction::NoRetry;
 				}
 
-				if result.is_ok() {
-					return None;
-				}
-
-				// Retry only on error
+				// Since this is only called on error, always retry
 				match &self.jitter {
 					Some(jitter_strategy) => {
 						let delay_ms = $delay_calc(self, attempt);
 						let delay_ms = jitter_strategy.apply(delay_ms);
 
 						std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-						Some(message)
+						RetryAction::RetryWithSame
 					}
 					None => {
 						std::thread::sleep(std::time::Duration::from_millis($delay_calc(self, attempt)));
-						Some(message)
+						RetryAction::RetryWithSame
 					}
 				}
 			}

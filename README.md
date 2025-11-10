@@ -10,6 +10,7 @@
 ## Status
 > Warning: This project is under active development. Public APIs and file 
 formats MAY change WITHOUT notice. It is NOT yet production-ready.
+> Warning: Only the `full` feature is currently supported.
 
 ## Copyright Notice
 
@@ -513,7 +514,8 @@ enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
 	SignatureAlgorithm;
 ```
 
-Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms and SHOULD NOT use MD5 or SHA-1 for new deployments.
+Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms 
+and SHOULD NOT use MD5 or SHA-1 for new deployments.
 
 ### 5.6 Encoding Rules
 

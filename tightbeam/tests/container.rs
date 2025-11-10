@@ -49,16 +49,16 @@ test_container! {
 	service: |message, tx| async move {
 		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
 
-		let decoded: RequestMessage = tightbeam::decode(&message.clone().message).ok()?;
+		let decoded: RequestMessage = tightbeam::decode(&message.message).ok()?;
 		if &decoded.content == "PING" {
 			tightbeam::relay!(ServiceAssertChecklist::ContainerPingReceived, tx)?;
 
-			let response = Some(tightbeam::compose! {
+			let response = tightbeam::compose! {
 				V0: id: message.metadata.id.clone(),
 					message: ResponseMessage {
 						result: "PONG".into()
 					}
-			}.ok()?);
+			}.ok().map(std::sync::Arc::new);
 
 			tightbeam::relay!(ServiceAssertChecklist::SentResponse, tx)?;
 			response
