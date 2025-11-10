@@ -52,7 +52,7 @@ const MIN_KEY_SIZE: usize = 16;
 ///
 /// This trait allows consumers to plug in different KDF implementations
 /// from the RustCrypto ecosystem or custom implementations.
-pub trait KdfProvider {
+pub trait KdfFunction {
 	/// Derive a key of the specified length
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>>;
 
@@ -121,7 +121,7 @@ pub trait KdfProvider {
 /// Default HKDF-SHA3-256 provider
 pub struct HkdfSha3_256;
 
-impl KdfProvider for HkdfSha3_256 {
+impl KdfFunction for HkdfSha3_256 {
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
 		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
 		let mut output = Zeroizing::new([0u8; N]);
@@ -172,7 +172,7 @@ impl KdfProvider for HkdfSha3_256 {
 /// ANSI X9.63 Concatenation KDF using SHA3-256
 pub struct X963Sha3_256;
 
-impl KdfProvider for X963Sha3_256 {
+impl KdfFunction for X963Sha3_256 {
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], _salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
 		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
 		let mut out = Zeroizing::new([0u8; N]);
@@ -337,7 +337,7 @@ fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: 
 /// Standards notes
 /// - Uses RFC 5869 (HKDF) with SHA3-256. For strict ECIES profiles that mandate
 ///   X9.63 KDF, provide a custom `KdfProvider`.
-pub fn ecies_kdf<P: KdfProvider>(
+pub fn ecies_kdf<P: KdfFunction>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
 	shared_secret: impl AsRef<[u8]>,
 	info: impl AsRef<[u8]>,
@@ -365,7 +365,7 @@ pub fn ecies_kdf<P: KdfProvider>(
 ///
 /// Safety
 /// - `N` SHOULD be >= 16 bytes for cryptographic use.
-pub fn hkdf<P: KdfProvider, const N: usize>(
+pub fn hkdf<P: KdfFunction, const N: usize>(
 	ikm: impl AsRef<[u8]>,
 	info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
@@ -393,7 +393,7 @@ pub fn hkdf<P: KdfProvider, const N: usize>(
 ///
 /// References
 /// - RFC 5869 (HKDF), NIST SP 800-56C (context/OtherInfo), ECIES profiles (key separation)
-pub fn ecies_kdf_with_size<P: KdfProvider, const N: usize>(
+pub fn ecies_kdf_with_size<P: KdfFunction, const N: usize>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
 	shared_secret: impl AsRef<[u8]>,
 	info: impl AsRef<[u8]>,
@@ -411,7 +411,7 @@ pub fn ecies_kdf_with_size<P: KdfProvider, const N: usize>(
 
 /// ECIES with raw SharedInfo: caller supplies exact SharedInfo/OtherInfo bytes (no EPK auto-append).
 /// IKM is the shared secret Z.
-pub fn ecies_kdf_with_shared_info<P: KdfProvider>(
+pub fn ecies_kdf_with_shared_info<P: KdfFunction>(
 	shared_secret: impl AsRef<[u8]>,
 	shared_info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
@@ -432,7 +432,7 @@ pub fn ecies_kdf_with_shared_info<P: KdfProvider>(
 
 /// ECIES dual-key with raw SharedInfo: caller supplies exact SharedInfo/OtherInfo bytes.
 /// IKM is the shared secret Z. Provider-specific bounds may apply.
-pub fn ecies_kdf_with_shared_info_and_size<P: KdfProvider, const N: usize>(
+pub fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
 	shared_secret: impl AsRef<[u8]>,
 	shared_info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,

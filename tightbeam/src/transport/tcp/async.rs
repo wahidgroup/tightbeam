@@ -634,7 +634,7 @@ where
 		use crate::der::Encode;
 		use crate::transport::{ResponsePackage, TransportEnvelope, WireEnvelope};
 
-		let response_pkg = ResponsePackage { status, message, length: None };
+		let response_pkg = ResponsePackage { status, message };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// Check if encryption should be used

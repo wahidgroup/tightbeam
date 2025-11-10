@@ -121,15 +121,19 @@ impl NonceReplaySet {
 	pub fn new(cap: usize) -> Self {
 		Self { inner: HashSet::new(), cap }
 	}
+
 	pub fn insert_or_replay(&mut self, n: [u8; 32]) -> bool {
 		if self.inner.contains(&n) {
 			return true;
 		}
+
 		if self.inner.len() < self.cap {
 			self.inner.insert(n);
 		}
+
 		false
 	}
+
 	pub fn clear(&mut self) {
 		self.inner.clear();
 	}

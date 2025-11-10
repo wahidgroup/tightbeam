@@ -621,7 +621,7 @@ macro_rules! impl_tcp_common {
 					self.server_handshake = Some(match self.handshake_protocol_kind {
 						HandshakeProtocolKind::Ecies => {
 							// Create default security profile for negotiation
-							let default_profile = $crate::crypto::profiles::DefaultSecurityProfile::default();
+							let default_profile = $crate::crypto::profiles::TightbeamProfile::default();
 							let profile_desc = $crate::crypto::profiles::SecurityProfileDesc::from(&default_profile);
 
 							// Use factory method to create ECIES server with concrete key type

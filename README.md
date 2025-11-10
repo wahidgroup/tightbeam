@@ -11,6 +11,7 @@
 > Warning: This project is under active development. Public APIs and file 
 formats MAY change WITHOUT notice. It is NOT yet production-ready.
 > Warning: Only the `full` feature is currently supported.
+> Info: Information documented in this README is functional but unreleased.
 
 ## Copyright Notice
 
@@ -31,12 +32,13 @@ with versioned metadata structures.
 5. [ASN.1 Formal Specification](#asn1-formal-specification)
 6. [Implementation](#implementation)
 7. [Security Considerations](#security-considerations)
-8. [Network Theory](#network-theory)
-9. [Testing Framework](#testing-framework)
-10. [Examples](#examples)
-11. [References](#references)
-12. [License](#license)
-13. [Implementation Notes](#implementation-notes)
+8. [Transport Layer & Handshake Protocols](#transport-layer--handshake-protocols)
+9. [Network Theory](#network-theory)
+10. [Testing Framework](#testing-framework)
+11. [Examples](#examples)
+12. [References](#references)
+13. [License](#license)
+14. [Implementation Notes](#implementation-notes)
 
 ## 1. Introduction
 
@@ -127,31 +129,94 @@ following properties:
   - OPTIONAL: State chaining (previous message integrity)
   - OPTIONAL: Matrix control (NxN matrix flags)
 
-### 4.1.1 Security Profiles
+### 4.1.1 SecurityProfile Trait Architecture
 
-tightbeam defines standardized security profiles that reference established 
-cryptographic standards:
+tightbeam uses a trait-based security profile system that separates compile-time 
+algorithm constraints from runtime protocol behavior.
 
-- **Profile 0 (Testing)**: No mandatory security features
-  - Use case: Testing, non-sensitive data
-  - Security: Optional per version capabilities
+#### Design Principles
 
-- **Profile 1 (Standard Security)**: TLS 1.3 equivalent security
-  - Reference: RFC 8446 cipher suites
-  - Mandatory: AES-GCM encryption, SHA-256/384
-  - Key Exchange: TLS 1.3 key schedule compatible
+The `SecurityProfile` trait defines a pure metadata layer that declares algorithm 
+identifiers (OIDs) for cryptographic operations:
 
-- **Profile 2 (High Security)**: NSA Suite B equivalent
-  - Reference: RFC 6460, NIST SP 800-56A
-  - Mandatory: AES-256-GCM, SHA-384, ECDSA P-384
-  - Compliance: FIPS 140-2 Level 3 compatible
+```rust
+pub trait SecurityProfile {
+	type DigestOid: AssociatedOid;
+	type AeadOid: AssociatedOid + AeadKeySize;
+	type SignatureAlg: SignatureAlgorithmIdentifier;
+	const KEY_WRAP_OID: Option<ObjectIdentifier>;
+}
+```
 
-- **Profile 3 (Future-Ready)**: Post-quantum resistant
-  - Reference: NIST post-quantum standardization
-  - Mandatory: Hybrid classical/post-quantum
-  - Migration: Smooth transition path from Profile 2
+#### Role-Based Provider Traits
 
-### 4.1.2 Message-Level Security Requirements
+tightbeam separates cryptographic concerns through specialized provider traits:
+
+- **`DigestProvider`**: Hash/digest operations (SHA-256, SHA3-256, etc.)
+- **`AeadProvider`**: Authenticated encryption (AES-GCM variants)
+- **`SigningProvider`**: Signature generation and verification (ECDSA, Ed25519)
+- **`KdfProvider`**: Key derivation functions (HKDF)
+- **`CurveProvider`**: Elliptic curve operations (secp256k1, P-384)
+
+These traits compose into `CryptoProvider`, allowing components to specify only 
+the cryptographic capabilities they require rather than depending on the full provider.
+
+### 4.1.2 Security Profile Types
+
+Applications implement the `SecurityProfile` trait to define their own 
+cryptographic algorithm constraints:
+
+#### Implementing Custom Profiles
+
+```rust
+// Example: Custom application profile
+pub struct MyAppProfile;
+
+impl SecurityProfile for MyAppProfile {
+	type DigestOid = Sha3_256;
+	type AeadOid = Aes256GcmOid;
+	type SignatureAlg = Secp256k1Signature;
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
+}
+```
+
+#### Built-in Default Profile
+
+tightbeam provides `TightbeamProfile` as a reference implementation and default:
+
+```rust
+pub struct TightbeamProfile;
+
+impl SecurityProfile for TightbeamProfile {
+	type DigestOid = Sha3_256;
+	type AeadOid = Aes256GcmOid;
+	type SignatureAlg = Secp256k1Signature;
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
+}
+```
+
+Applications can define multiple profiles for different security contexts (e.g., 
+`HighSecurityProfile`, `LegacyProfile`, `QuantumResistantProfile`) and use them 
+with different message types.
+
+### 4.1.3 Numeric Security Levels
+
+tightbeam supports numeric security levels (separate from SecurityProfile types) 
+that enforce security requirements without algorithm OID validation:
+
+- **Level 1**: Requires confidentiality + non-repudiation (V1+)
+  - Use case: FIPS-compliant deployments
+  - Reference: TLS 1.3 cipher suites (RFC 8446)
+
+- **Level 2**: Requires confidentiality + non-repudiation (V1+)
+  - Use case: High-security applications
+  - Reference: NSA Suite B equivalent (RFC 6460, NIST SP 800-56A)
+
+**Important**: Numeric levels (1, 2) only enforce security requirements 
+(must encrypt, must sign, etc.). They do NOT enable compile-time algorithm OID 
+validation. For OID validation, use type-based profiles (see section 4.1.4).
+
+### 4.1.4 Message-Level Security Requirements
 
 tightbeam supports run-time security profile enforcement at the message type 
 level through the `Message` trait and compile-time security enforcement at 
@@ -166,8 +231,30 @@ pub trait Message: /* trait bounds */ {
 	const MUST_BE_PRIORITIZED: bool = false;
 	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
 	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
+	const HAS_PROFILE: bool = false;
+	type Profile: SecurityProfile;
 }
 ```
+
+#### Profile-Based Algorithm Constraints
+
+**HAS_PROFILE**: Controls whether the message type enforces algorithm constraints
+- When `false` (default): Message uses `TightbeamProfile` but does not enforce algorithm OID matching
+- When `true`: FrameBuilder validates that all cryptographic operations use algorithms from the message's `Profile` type
+
+**Profile Type**: Specifies which `SecurityProfile` implementation constrains algorithm selection
+- Defaults to `TightbeamProfile` if not specified
+- Can be set to any type implementing `SecurityProfile`
+- Affects compile-time validation when `HAS_PROFILE = true`
+
+**Algorithm Validation**: When `HAS_PROFILE = true`, the following validations occur at compile time:
+- Digest algorithms must match `<Profile::DigestOid as AssociatedOid>::OID`
+- AEAD ciphers must match `<Profile::AeadOid as AssociatedOid>::OID`
+- Signature algorithms must match `<Profile::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID`
+
+This ensures that message types with specific security profiles can only be 
+composed with compatible cryptographic algorithms, preventing algorithm 
+substitution attacks.
 
 #### Security Requirement Semantics
 - When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
@@ -176,10 +263,35 @@ pub trait Message: /* trait bounds */ {
 - When a message type specifies `MUST_BE_PRIORITIZED = true`, the Frame's metadata MUST include a `priority` field (V2+ only)
 - The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
 
-#### Profile-Message Type Mapping
-- Security profiles MAY specify approved message types
-- Message types with security requirements SHOULD be used with compatible security profiles
-- Profile 0 (Testing) MAY use message types with security requirements for development purposes only
+#### Profile Validation in FrameBuilder
+
+When composing frames with `FrameBuilder`, profile constraints are enforced at 
+compile time if the message type has `HAS_PROFILE = true`:
+
+```rust
+// Example: Message with custom profile
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(profile(MyAppProfile))]
+struct SecureMessage { data: Vec<u8> }
+
+// FrameBuilder validates algorithm OIDs match MyAppProfile
+let frame = compose::<SecureMessage>(Version::V1)
+	.with_message(msg)
+	.with_id(b"msg-001")
+	.with_order(timestamp)
+	.with_cipher::<Aes256GcmOid, _>(&cipher)        // ✓ Matches MyAppProfile::AeadOid
+	.with_signer::<Secp256k1Signature, _>(&signer)  // ✓ Matches MyAppProfile::SignatureAlg
+	.build()?;
+```
+
+**Validation Rules**:
+- `with_message_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
+- `with_witness_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
+- `with_cipher::<C, _>()` validates `C::OID == Profile::AeadOid::OID`
+- `with_signer::<S, _>()` validates `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`
+
+**Error Handling**: Algorithm mismatches return `TightBeamError::UnexpectedAlgorithmForProfile` with 
+expected and received OIDs for debugging.
 
 #### Implementation Enforcement
 These requirements are enforced at:
@@ -218,10 +330,34 @@ impl Message for PaymentInstruction {
 - `#[beam(compressed)]` - Sets `MUST_BE_COMPRESSED = true`
 - `#[beam(prioritized)]` - Sets `MUST_BE_PRIORITIZED = true`
 - `#[beam(min_version = "V1")]` - Sets minimum protocol version
-- WIP (UNSTABLE)
-	- `#[beam(profile = 1)]` - Added but unsafe
-	- `#[beam(profile = 2)]` - Added but unsafe
-	- `#[beam(profile = 3)]`
+
+**Profile attributes** (STABLE):
+- `#[beam(profile = 1)]` - Numeric security level 1
+  - Automatically sets: `confidential`, `nonrepudiable`, `min_version = "V1"`
+  - Does NOT enable algorithm OID validation
+  - Does NOT set `HAS_PROFILE = true`
+  - Does NOT use any SecurityProfile type
+- `#[beam(profile = 2)]` - Numeric security level 2
+  - Automatically sets: `confidential`, `nonrepudiable`, `min_version = "V1"`
+  - Does NOT enable algorithm OID validation
+  - Does NOT set `HAS_PROFILE = true`
+  - Does NOT use any SecurityProfile type
+- `#[beam(profile(TypeName))]` - Type-based profile with algorithm enforcement
+  - Sets `HAS_PROFILE = true` and `type Profile = TypeName`
+  - Enables compile-time algorithm OID validation in FrameBuilder
+  - `TypeName` must be a type implementing `SecurityProfile` (e.g., `TightbeamProfile`, or your custom profile)
+  - Does NOT automatically set security requirements (must specify separately)
+
+**Critical distinction**:
+- **Numeric levels (1, 2)**: Enforce what security features must be present (encryption, signing, etc.)
+- **Type-based profiles**: Enforce which specific algorithms must be used (based on your SecurityProfile implementation)
+- These are independent but **cannot be mixed**: `#[beam(profile = 1, profile(MyAppProfile))]` is invalid
+- To get both requirement enforcement AND algorithm validation, use: `#[beam(profile(MyAppProfile), confidential, nonrepudiable, min_version = "V1")]`
+
+**Profile attribute rules**:
+- Numeric levels (1-2) override individual security flags
+- Cannot specify both numeric (`profile = N`) and type-based (`profile(Type)`)
+- Type-based profiles DO NOT automatically set security requirements - you must add them explicitly
 
 #### Example Message Types
 
@@ -229,42 +365,77 @@ impl Message for PaymentInstruction {
 use tightbeam::Beamable;
 use der::Sequence;
 
-// High-security financial transaction
+// Example 1: Numeric security level (requirements only, no OID validation)
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[beam(nonrepudiable, confidential, min_version = "V1")]
+#[beam(profile = 1)]
 struct PaymentInstruction {
 	account_from: String,
 	account_to: String,
 	amount: u64,
-	currency: String,
 }
+// Expands to: MUST_BE_CONFIDENTIAL = true, MUST_BE_NON_REPUDIABLE = true, MIN_VERSION = V1
+// HAS_PROFILE = false (default), Profile = TightbeamProfile (default)
+// No compile-time algorithm OID validation
 
-// Bulk data transfer
+// Example 2: Type-based profile (algorithm OID validation, no auto-requirements)
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[beam(compressed, prioritized, min_version = "V2")]
-struct DataTransfer {
-	dataset_id: String,
+#[beam(profile(MyAppProfile))]
+struct SecureMessage {
 	data: Vec<u8>,
-	checksum: [u8; 32],
 }
+// Expands to: HAS_PROFILE = true, type Profile = MyAppProfile
+// No automatic security requirements! Must add separately if needed.
+// Enables compile-time OID validation in FrameBuilder
 
-// Development/testing message (no security requirements)
+// Example 3: Type-based profile + explicit requirements (both enforcement types)
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-struct TestMessage {
-	test_id: u32,
-	content: String,
+#[beam(profile(MyAppProfile), confidential, nonrepudiable, min_version = "V1")]
+struct HighSecurityTransfer {
+	dataset_id: String,
+	encrypted_payload: Vec<u8>,
 }
+// Expands to: HAS_PROFILE = true, type Profile = MyAppProfile
+// MUST_BE_CONFIDENTIAL = true, MUST_BE_NON_REPUDIABLE = true, MIN_VERSION = V1
+// Both requirement enforcement AND algorithm OID validation
+```
 
-// Critical system alert (requires all security features)
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[beam(nonrepudiable, confidential, compressed, prioritized, min_version = "V2")]
-struct SecurityAlert {
-	severity: u8,
-	source: String,
-	description: String,
-	timestamp: u64,
+### 4.1.5 CryptoProvider System
+
+The `CryptoProvider` trait composes role-based provider traits to bind concrete 
+cryptographic implementations to `SecurityProfile` metadata:
+
+```rust
+pub trait CryptoProvider: 
+	Default + Clone + 
+	DigestProvider + 
+	AeadProvider + 
+	SigningProvider + 
+	KdfProvider + 
+	CurveProvider 
+{
+	type Profile: SecurityProfile + Default;
+	fn profile(&self) -> &Self::Profile;
 }
 ```
+
+**DefaultCryptoProvider**: Reference implementation combining:
+- **Digest**: SHA3-256 (Keccak-based hash)
+- **AEAD**: AES-256-GCM (authenticated encryption)
+- **Signature**: secp256k1 ECDSA (Bitcoin/Ethereum curve)
+- **KDF**: HKDF-SHA3-256 (key derivation)
+- **Curve**: secp256k1 (elliptic curve operations)
+
+**Role-based traits** enable flexible bounds:
+```rust
+// Function only requires digest capability
+fn hash_data<P: DigestProvider>(provider: &P, data: &[u8]) -> DigestInfo {
+	let digestor = provider.as_digestor();
+	digestor(data).unwrap()
+}
+```
+
+This design allows components to depend on specific cryptographic capabilities 
+rather than requiring the full `CryptoProvider` interface.
 
 ### 4.2 Frame Structure
 
@@ -977,12 +1148,6 @@ tightbeam integrates with existing key management standards and infrastructure:
 - **Hardware Security**: HSM compatibility for key storage
 - **Key Derivation**: HKDF (RFC 5869) for session key derivation
 
-#### 6.3.4 Enterprise Integration
-- **PKCS#11**: Hardware token and HSM integration
-- **Key Management Systems**: Compatible with enterprise KMS
-- **Directory Services**: LDAP/Active Directory certificate lookup
-- **Policy Enforcement**: Supports organizational key policies
-
 ## 7. Security Considerations
 
 ### 7.1 Cryptographic Requirements
@@ -1021,43 +1186,1340 @@ tightbeam follows established cryptographic standards and maintains algorithm ag
 - **Vulnerability Response**: Rapid algorithm disabling capability
 - **Industry Alignment**: Follow IETF/RFC security considerations
 
-#### 7.4.3 Post-Quantum Cryptography
-- **Preparation**: Monitor NIST post-quantum standardization process
-- **Hybrid Approach**: Classical + post-quantum algorithm combinations
-- **Migration Strategy**: Gradual transition from classical to post-quantum
-- **Interoperability**: Maintain backward compatibility during transition
-
-#### 7.4.4 Algorithm Identifier Management
+#### 7.4.3 Algorithm Identifier Management
 - **OID Registry**: Use standard algorithm OIDs from IANA/ITU-T
 - **Parameter Validation**: Enforce minimum key sizes and parameters
 - **Algorithm Negotiation**: Support for algorithm capability discovery
 - **Security Policy**: Configurable algorithm allow/deny lists
 
-## 8. Network Theory
+## 8. Transport Layer & Handshake Protocols
 
-### 8.1 Network Architecture
+### 8.1 Transport Architecture
+
+The tightbeam transport layer provides a pluggable framework for moving bytes
+between endpoints while enforcing security policies. The transport layer is
+responsible for the following:
+- Establishing connections
+- Sending and receiving messages
+- Enforcing security policies
+- Managing cryptographic state
+
+#### 8.1.1 Concept: Design Principles
+
+
+The transport layer follows a trait-based architecture that separates concerns:
+
+1. **Protocol abstraction**: `Protocol` trait defines bind/connect operations
+2. **Message I/O**: `MessageIO` trait handles frame serialization and wire protocol
+3. **Policy enforcement**: `MessageEmitter` and `MessageCollector` traits add gate and retry policies
+4. **Encryption support**: `EncryptedProtocol` and `EncryptedMessageIO` traits enable secure transports
+
+**Design Goals:**
+- **Transport Independence**: Same application code works over TCP, UDP, Unix sockets, etc.
+- **Composable Policies**: Gate and retry policies attach without modifying transport logic
+- **Security by Default**: Encryption and certificate validation built into the protocol layer
+- **Type Safety**: Rust's type system enforces correct usage patterns at compile time
+- **Zero-Cost Abstractions**: Trait-based design compiles to efficient machine code
+- **Zero-Copy**: No unnecessary data cloning for performance
+
+#### 8.1.2 Specification: Core Transport Traits
+
+```rust
+/// Protocol abstraction for binding and connecting
+pub trait Protocol {
+	type Listener: Send;
+	type Stream: Send;
+	type Transport: Send;
+	type Address: TightBeamAddress;
+	
+	fn bind(addr: Self::Address) 
+		-> impl Future<Output = Result<(Self::Listener, Self::Address)>>;
+	fn connect(addr: Self::Address) 
+		-> impl Future<Output = Result<Self::Stream>>;
+}
+
+/// Base message I/O operations
+pub trait MessageIO {
+	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>>;
+	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()>;
+	async fn read_decoded_envelope(&mut self) -> TransportResult<TransportEnvelope>;
+}
+
+/// Policy-aware message collection (server-side)
+pub trait MessageCollector: MessageIO {
+	type CollectorGate: GatePolicy;
+	
+	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)>;
+	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) 
+		-> TransportResult<()>;
+}
+
+/// Policy-aware message emission (client-side)
+pub trait MessageEmitter: MessageIO {
+	type EmitterGate: GatePolicy;
+	type RestartPolicy: RestartPolicy;
+	
+	async fn emit(&mut self, message: Frame, attempt: Option<usize>) 
+		-> TransportResult<Option<Frame>>;
+}
+```
+
+**Trait Hierarchy:**
+```text
+Protocol
+  └── EncryptedProtocol (adds bind_with for certificates)
+
+MessageIO (read/write envelopes)
+  ├── MessageCollector (server: policies + collect/respond)
+  └── MessageEmitter (client: policies + emit/retry)
+       └── EncryptedMessageIO (adds encryption/decryption)
+```
+
+**Encryption Support Traits:**
+
+```rust
+pub trait EncryptedProtocol: Protocol {
+	/// Bind listener with transport encryption configuration
+	fn bind_with(
+		addr: Self::Address,
+		config: TransportEncryptionConfig,
+	) -> impl Future<Output = Result<(Self::Listener, Self::Address)>>;
+}
+
+pub struct TransportEncryptionConfig {
+	pub certificate: Certificate,
+	pub signatory: ServerKeyManager,
+	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	pub handshake_timeout: Duration,
+	// ... additional configuration fields
+}
+```
+
+The `EncryptedMessageIO` trait adds encryption/decryption operations to message I/O:
+
+```rust
+pub trait EncryptedMessageIO: MessageIO {
+	fn encryptor(&self) -> TransportResult<&RuntimeAead>;
+	fn decryptor(&self) -> TransportResult<&RuntimeAead>;
+	
+	async fn relay_message(&mut self) -> TransportResult<TransportEnvelope>;
+	async fn send_envelope(&mut self, envelope: &TransportEnvelope, encrypt: bool) 
+		-> TransportResult<()>;
+}
+```
+
+**Address Abstraction:**
+
+```rust
+pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
+```
+
+Implementations provide protocol-specific addressing (e.g., `SocketAddr` for TCP,
+custom addressing for other transports).
+
+### 8.2 Message Transport Wire Format
+
+#### 8.2.1 Concept: Framing and Encoding
+
+TightBeam messages traverse the network wrapped in transport envelopes that provide
+framing, encryption support, and protocol demultiplexing. The wire format addresses
+three key challenges:
+
+1. **Stream framing**: TCP provides byte streams without message boundaries. DER's 
+   tag-length-value encoding provides inherent framing.
+2. **Encryption transparency**: WireEnvelope supports both cleartext (testing) and 
+   encrypted (production) modes without changing application code.
+3. **Protocol multiplexing**: TransportEnvelope distinguishes application messages 
+   (Request/Response) from handshake messages (EnvelopedData/SignedData).
+
+**Design Principle**: Rely on ASN.1 DER's battle-tested encoding rather than 
+inventing custom framing. DER provides automatic length prefixing, corruption 
+detection through invalid encoding, and well-understood security properties.
+
+#### 8.2.2 Specification: Wire Envelope Structure
+
+The wire format uses ASN.1 DER encoding with a two-tier envelope structure:
+
+1. **WireEnvelope**: Outer layer that indicates cleartext or encrypted
+2. **TransportEnvelope**: Inner layer that distinguishes request, response, and handshake messages
+
+```rust
+/// Wire-level envelope (cleartext or encrypted)
+#[derive(Choice, Clone, Debug, PartialEq)]
+pub enum WireEnvelope {
+	#[asn1(context_specific = "0", constructed = "true")]
+	Cleartext(TransportEnvelope),
+	#[asn1(context_specific = "1", constructed = "true")]
+	Encrypted(EncryptedContentInfo),
+}
+
+/// Transport envelope wrapping all messages
+#[derive(Choice, Clone, Debug, PartialEq)]
+pub enum TransportEnvelope {
+	#[asn1(context_specific = "0", constructed = "true")]
+	Request(RequestPackage),
+	#[asn1(context_specific = "1", constructed = "true")]
+	Response(ResponsePackage),
+	#[asn1(context_specific = "2", constructed = "true")]
+	EnvelopedData(EnvelopedData),  // For handshakes
+	#[asn1(context_specific = "3", constructed = "true")]
+	SignedData(SignedData),        // For handshakes
+}
+```
+
+**Request and Response Packages:**
+
+```rust
+/// Request package containing a TightBeam message
+#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+pub struct RequestPackage {
+	message: Frame,  // The actual TightBeam message (Section 4)
+}
+
+/// Response package containing status and optional message
+#[derive(Sequence, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResponsePackage {
+	status: TransitStatus,       // Accept/Reject/Retry from policy
+	#[asn1(optional = "true")]
+	message: Option<Frame>,      // Optional response message
+}
+```
+
+**DER Length Encoding (ITU-T X.690):**
+
+**Short form** (0-127 bytes):
+```
+tag | length | content
+0x30  0x05     [5 bytes]
+```
+
+**Long form** (128+ bytes):
+```
+tag | 0x80+num_octets | length_bytes | content
+0x30  0x82              0x01 0x00      [256 bytes]
+```
+
+The transport layer parses DER length on-the-fly to read envelopes incrementally.
+
+**Envelope Size Limits:**
+
+Transport implementations enforce configurable size limits:
+
+- **Cleartext envelopes**: Default 512KB max (`max_cleartext_envelope`)
+- **Encrypted envelopes**: Default 512KB max (`max_encrypted_envelope`)
+- **Handshake messages**: Fixed 128KB max (`HANDSHAKE_MAX_WIRE`)
+
+Size enforcement prevents resource exhaustion attacks and ensures bounded memory usage.
+
+### 8.3 TCP Transport
+
+#### 8.3.1 Concept: TCP as Layer-5 Transport
+
+TCP provides reliable, ordered byte streams between endpoints. TightBeam's TCP 
+transport implementation bridges the byte stream model with the message-oriented 
+Frame API through DER length-prefixed envelopes.
+
+**Key Capabilities:**
+- **Stream framing**: DER length parsing extracts messages from TCP byte streams
+- **Connection management**: Automatic connection handling for client/server patterns
+- **Runtime agnostic**: Works with both `std::net` (sync) and `tokio` (async)
+- **Encryption ready**: Supports certificate-based encryption via `EncryptedProtocol`
+
+#### 8.3.2 Implementation: Basic TCP Usage
+
+**TCP Server:**
+
+```rust
+use std::net::TcpListener;
+use tightbeam::{server, compose, MessageIO};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let listener = TcpListener::bind("127.0.0.1:8080")?;
+	server! {
+		protocol std::net::TcpListener: listener,
+		|message: RequestMessage, tx| async move {
+			// Process message and send response
+			let response = ResponseMessage {
+				data: format!("Received: {}", message.data)
+			};
+			tx.send(response).await.ok();
+		}
+	}
+	
+	Ok(())
+}
+```
+
+**TCP Client:**
+
+```rust
+use std::net::TcpStream;
+use tightbeam::{client, compose, MessageEmitter};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let addr = "127.0.0.1:8080".parse()?;
+	
+	client! {
+		connect std::net::TcpStream: addr,
+		|mut transport| async move {
+			let request = compose! {
+				V0: id: b"req-001",
+					message: RequestMessage { data: "Hello".to_string() }
+			}?;
+			
+			let response = transport.emit(request, None).await?;
+			Ok(())
+		}
+	}
+}
+```
+
+**Async TCP with Tokio:**
+
+TightBeam supports Tokio's async runtime with the `tokio` feature:
+
+```rust
+use tokio::net::TcpListener;
+use tightbeam::{server, MessageCollector};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let listener = TcpListener::bind("127.0.0.1:8080").await?;
+	server! {
+		protocol tokio::net::TcpListener: listener,
+		|message: RequestMessage, tx| async move {
+			// Async processing with Tokio primitives
+			tx.send(ResponseMessage { data: "Async response".to_string() }).await.ok();
+		}
+	}
+	
+	Ok(())
+}
+```
+
+**TCP with Policies:**
+
+```rust
+use std::net::TcpStream;
+use tightbeam::{client, policy, RestartExponentialBackoff};
+
+policy! {
+	GatePolicy: RateLimitGate |frame| {
+		// Implement rate limiting logic
+		TransitStatus::Accepted
+	}
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let addr = "127.0.0.1:8080".parse()?;
+	
+	client! {
+		connect std::net::TcpStream: addr,
+		policies: {
+			with_emitter_gate: [RateLimitGate],
+			with_restart: RestartExponentialBackoff::default(),
+		},
+		|mut transport| async move {
+			// Client with policies applied
+			let request = compose! {
+				V0: id: b"req-001", message: RequestMessage { /* ... */ }
+			}?;
+			
+			transport.emit(request, None).await
+		}
+	}
+}
+```
+
+### 8.3.5 Low-Level Transport Usage
+
+For scenarios requiring direct transport control without macros:
+
+```rust
+use std::net::{TcpListener, TcpStream};
+use tightbeam::transport::{Protocol, MessageIO, MessageCollector};
+
+// Server: manual transport handling
+let listener = TcpListener::bind("127.0.0.1:8080")?;
+let (stream, _addr) = listener.accept()?;
+let mut transport = <std::net::TcpListener as Protocol>::create_transport(stream);
+
+// Read message
+let envelope = transport.read_decoded_envelope().await?;
+// Process and respond
+transport.send_response(TransitStatus::Accepted, Some(response_frame)).await?;
+
+// Client: manual message sending
+let stream = TcpStream::connect("127.0.0.1:8080")?;
+let mut transport = <std::net::TcpListener as Protocol>::create_transport(stream);
+
+let frame = compose! { V0: id: b"req-001", message: my_message }?;
+transport.write_envelope(&frame.to_der()?).await?;
+let response_bytes = transport.read_envelope().await?;
+```
+
+### 8.3.6 Address Handling
+
+TCP addresses use `TightBeamSocketAddr` for protocol-agnostic addressing:
+
+```rust
+use tightbeam::transport::tcp::TightBeamSocketAddr;
+
+// Parse from string
+let addr: TightBeamSocketAddr = "127.0.0.1:8080".parse()?;
+// Convert to bytes for wire encoding
+let addr_bytes: Vec<u8> = addr.into();
+// Access underlying SocketAddr
+let socket_addr: std::net::SocketAddr = *addr;
+```
+
+### 8.4 Transport Policies
+
+#### 8.4.1 Concept: Policy-Driven Message Control
+
+TightBeam provides policy-based control over message flow at the transport 
+layer. Policies are composable, stateless procedures that make decisions about 
+message acceptance and retry behavior without modifying core transport logic.
+
+**Design Philosophy:**
+- **Separation of concerns**: Transport moves bytes, policies make decisions
+- **Composability**: Multiple policies chain together declaratively
+- **Stateless**: Policies are pure functions of current message state
+- **Performance**: Policy evaluation happens at compile-time bounds, no dynamic dispatch overhead
+
+**Policy Types:**
+1. **Gate Policies**: Accept/reject individual messages (rate limiting, authentication, validation)
+2. **Restart Policies**: Decide retry behavior after failures (exponential backoff, circuit breakers)
+3. **Receptor Policies**: Filter messages at worker/servlet level (business logic filtering)
+
+#### 8.4.2 Specification: Gate Policies
+
+```rust
+pub trait GatePolicy: Send + Sync {
+	fn evaluate(&self, message: &Frame) -> TransitStatus;
+}
+
+pub enum TransitStatus {
+	Accepted,      // Message accepted
+	Busy,          // System busy, client may retry
+	Unauthorized,  // Authentication required
+	Forbidden,     // Message rejected
+	Timeout,       // Operation timed out
+}
+```
+
+#### Creating Gate Policies
+
+Use the `policy!` macro for concise policy definitions:
+
+```rust
+policy! {
+	GatePolicy: AuthGate |frame| {
+		if frame.metadata.id.starts_with(b"auth-") {
+			TransitStatus::Accepted
+		} else {
+			TransitStatus::Unauthorized
+		}
+	}
+}
+```
+
+#### Emitter vs Collector Gates
+
+- **Emitter gates**: Applied before sending messages (client-side filtering)
+- **Collector gates**: Applied when receiving messages (server-side filtering)
+
+Attach gates using transport configuration:
+
+```rust
+let transport = TcpTransport::from(stream)
+	.with_emitter_gate(ClientAuthGate)
+	.with_collector_gate(ServerValidationGate);
+```
+
+#### 8.4.3 Specification: Restart Policies
+
+Restart policies determine whether to retry failed message sends, with optional 
+backoff and jitter strategies.
+
+**RestartPolicy Trait:**
+
+```rust
+pub trait RestartPolicy: Send + Sync {
+	fn evaluate(
+		&self,
+		message: &Frame,
+		result: &TransportResult<&Frame>,
+		attempt: usize
+	) -> RetryAction;
+}
+
+pub enum RetryAction {
+	RetryWithSame,              // Retry with original message
+	RetryWithModified(Frame),   // Retry with modified message
+	NoRetry,                    // Stop retrying, return error
+}
+```
+
+#### Built-in Restart Policies:
+```rust
+pub struct RestartExponentialBackoff {
+	max_attempts: usize,
+	scale_factor: u64,  // Base delay in milliseconds
+	jitter: Option<Box<dyn JitterStrategy>>,
+}
+
+// Usage
+let restart = RestartExponentialBackoff::default()
+	.with_jitter(DecorrelatedJitter);
+```
+
+**Linear Backoff** (constant delay):
+```rust
+pub struct RestartLinearBackoff {
+	max_attempts: usize,
+	delay_ms: u64,
+}
+```
+
+#### Jitter Strategies
+
+Jitter prevents thundering herd problems by randomizing retry delays:
+
+```rust
+pub trait JitterStrategy: Send + Sync {
+	fn apply(&self, base_delay: u64) -> u64;
+}
+
+// Decorrelated jitter: random value between base/3 and base_delay
+pub struct DecorrelatedJitter;
+```
+
+#### 8.4.4 Specification: Receptor Policies
+
+Receptor policies operate on typed messages (application-level) rather than 
+frames. They enable type-safe, domain-specific policy logic:
+
+```rust
+pub trait ReceptorPolicy<T: Message>: Send + Sync {
+	fn evaluate(&self, message: &T) -> TransitStatus;
+}
+
+// Example: Validate message content before processing
+policy! {
+	ReceptorPolicy<PingMessage>: ValidPingGate |message| {
+		if message.payload.len() <= 1024 {
+			TransitStatus::Accepted
+		} else {
+			TransitStatus::Forbidden
+		}
+	}
+}
+```
+
+Receptor policies attach to workers and servlets (Section 9.3), providing 
+pre-processing filters.
+
+### 8.4.4 Policy Composition
+
+Multiple policies can be chained on a single transport:
+
+```rust
+let transport = TcpTransport::from(stream)
+	.with_restart(RestartExponentialBackoff::default())
+	.with_emitter_gate(RateLimitGate)
+	.with_emitter_gate(AuthTokenGate)
+	.with_collector_gate(RequestValidationGate)
+	.with_collector_gate(AccessControlGate);
+```
+
+Policies are evaluated in order:
+- **Emitter gates**: All must return `Accepted` for message to be sent
+- **Collector gates**: All must return `Accepted` for message to be processed
+- **Restart policy**: Single policy determines retry behavior
+
+### 8.4.5 Policy Middleware
+
+Policies support transparent middleware for observability:
+
+```rust
+let gate_with_logging = GateMiddleware::new(
+	AuthGate,
+	|frame, status| {
+		eprintln!("Gate evaluated: {:?} -> {:?}", frame.metadata.id, status);
+	}
+);
+
+transport = transport.with_collector_gate(gate_with_logging);
+```
+
+Middleware does not modify policy decisions—it only observes them.
+
+### 8.4.6 Integration with server!/client! Macros
+
+The `server!` and `client!` macros provide ergonomic policy attachment:
+
+```rust
+server! {
+	protocol std::net::TcpListener: listener,
+	policies: {
+		with_collector_gate: [AuthGate, ValidationGate],
+		with_restart: RestartLinearBackoff::new(3, 100),
+	},
+	|message: RequestMessage, tx| {
+		// Handle message
+		tx.send(ResponseMessage { ... }).await
+	}
+}
+
+client! {
+	connect std::net::TcpStream: addr,
+	policies: {
+		with_emitter_gate: [ClientAuthGate],
+		with_restart: RestartExponentialBackoff::default(),
+	},
+	|transport| async move {
+		transport.emit(request, None).await
+	}
+}
+```
+
+### 8.5 Handshake Protocols
+
+#### 8.5.1 Concept: Security Goals and Protocol Selection
+
+TightBeam implements two handshake protocols that establish secure, authenticated 
+communication channels before application-level message exchange begins. These 
+protocols integrate deeply with the SecurityProfile system (Section 4.1) to 
+provide cryptographic agility and forward secrecy.
+
+**Purpose and Security Goals:**
+
+Handshakes serve three critical security functions:
+
+1. **Mutual Authentication**: Both parties verify each other's identities through 
+   cryptographic proofs (certificates for CMS, public keys for ECIES). This 
+   prevents impersonation attacks and ensures messages are exchanged only with 
+   authorized entities.
+
+2. **Key Exchange**: Parties establish a shared session key through key agreement 
+   protocols (ECDH-based) that provides perfect forward secrecy. Even if long-term 
+   keys are compromised later, past session traffic remains secure.
+
+3. **Cryptographic Negotiation**: Client and server agree on a mutually supported 
+   SecurityProfile that defines all cryptographic operations (signature algorithms, 
+   key derivation functions, AEAD ciphers). This ensures both parties use 
+   compatible, strong cryptography.
+
+#### Threat Model
+
+TightBeam handshakes defend against:
+
+- **Passive eavesdropping**: All session traffic is encrypted with ephemeral keys
+- **Active man-in-the-middle**: Transcript integrity prevents tampering
+- **Replay attacks**: Nonce tracking detects and rejects replayed handshakes
+- **Downgrade attacks**: Profile negotiation includes integrity checks
+- **Impersonation**: Certificate/signature verification proves identity
+- **Key compromise**: Forward secrecy limits damage from stolen long-term keys
+
+#### Protocol Selection Criteria
+
+TightBeam offers two handshake protocols optimized for different deployment scenarios:
+
+**CMS-Based Handshake** (`transport-cms` feature):
+- **Use when**: Full PKI infrastructure available, regulatory compliance requires 
+  X.509 certificates, need non-repudiation through signed messages
+- **Provides**: Strong mutual authentication, certificate validation chains, 
+  revocation checking support, detailed audit trails
+- **Security profile**: Fully integrated with Section 4.1 SecurityProfile system, 
+  supports all profile types (Secp256k1Sha3, Ed25519Blake3, etc.)
+
+**ECIES-Based Handshake** (`x509` feature, lightweight):
+- **Use when**: Lightweight deployment, no PKI infrastructure, peer-to-peer 
+  communication, embedded systems with resource constraints
+- **Provides**: Efficient key exchange, optional certificate-based authentication, 
+  minimal message overhead, faster handshake completion
+- **Security profile**: Same cryptographic primitives as CMS but simpler message 
+  structures
+
+Both protocols provide equivalent security properties (authentication, forward 
+secrecy, replay protection) but differ in message complexity and PKI integration depth.
+
+#### Relationship to SecurityProfile System
+
+The SecurityProfile system (Section 4.1) defines cryptographic algorithm suites 
+as type-safe constants. Handshakes leverage this system in three ways:
+
+1. **Algorithm Selection**: Clients offer supported profiles via `SecurityOffer`, 
+   servers select the first mutually supported profile. This negotiation happens 
+   during the initial handshake message exchange.
+
+2. **Generic Implementation**: Handshake builders and processors are generic over 
+   `P: CryptoProvider`, allowing compile-time polymorphism across different 
+   cryptographic suites without runtime overhead or type erasure.
+
+3. **Dealer's Choice Mode**: When client sends no offer, server selects its 
+   preferred profile (first configured profile). This simplifies deployment in 
+   controlled environments where all clients trust the server's cryptographic 
+   decisions.
+
+Example profile negotiation:
+
+```rust
+use tightbeam::crypto::profiles::{Secp256k1Sha3Profile, Ed25519Blake3Profile};
+use tightbeam::crypto::negotiation::SecurityOffer;
+
+// Client offers two profiles (ordered by preference)
+let offer = SecurityOffer::new(vec![
+    Secp256k1Sha3Profile::oid(),
+    Ed25519Blake3Profile::oid(),
+]);
+
+// Server configured with three profiles
+let server_profiles = vec![
+    Ed25519Blake3Profile::descriptor(),    // Server's preference
+    Secp256k1Sha3Profile::descriptor(),
+    // ... other profiles
+];
+
+// Server selects first mutual profile: Secp256k1Sha3
+// (Ed25519Blake3 not supported by client, Secp256k1Sha3 is mutual)
+```
+
+#### Security Properties Summary
+
+All TightBeam handshakes provide:
+
+- **Forward Secrecy**: Ephemeral ECDH keys mean session key compromise doesn't 
+  affect past sessions
+- **Replay Protection**: Nonce tracking prevents replaying captured handshakes
+- **Transcript Integrity**: All handshake messages contribute to a cryptographic 
+  transcript that is signed in the Finished message, detecting any tampering
+- **Identity Verification**: Cryptographic proof that each party controls their 
+  claimed private key
+- **Downgrade Prevention**: Profile negotiation is included in transcript hash, 
+  preventing attackers from forcing weaker algorithms
+
+These properties align with modern protocol security standards (TLS 1.3, Noise 
+Framework) while maintaining tightbeam's ASN.1 DER-based message encoding and 
+type-safe Rust implementation.
+
+#### 8.5.2 Specification: Handshake Flow and State Management
+
+**Generic Handshake Flow:**
+
+Both CMS and ECIES handshakes follow a three-phase message exchange pattern that 
+establishes mutual authentication and session keys:
+
+```text
+┌──────────┐                                             ┌──────────┐
+│  Client  │                                             │  Server  │
+└────┬─────┘                                             └─────┬────┘
+     │                                                         │
+     │  Phase 1: Initiation                                    │
+     │  ───────────────────────────────────────────────────►   │
+     │  ClientHello:                                           │
+     │    - client_nonce (32 bytes random)                     │
+     │    - security_offer? (optional profile OIDs)            │
+     │                                                         │
+     │                                                         │
+     │  Phase 2: Response                                      │
+     │  ◄───────────────────────────────────────────────────   │
+     │                      ServerHandshake:                   │
+     │                        - server_certificate             │
+     │                        - server_nonce (32 bytes)        │
+     │                        - selected_profile? (if offered) │
+     │                        - signature(transcript_hash)     │
+     │                                                         │
+     │                                                         │
+     │  Phase 3: Key Exchange                                  │
+     │  ───────────────────────────────────────────────────►   │
+     │  ClientKeyExchange:                                     │
+     │    - encrypted_session_key (KARI or ECIES)              │
+     │    - client_certificate? (mutual auth)                  │
+     │    - client_finished_sig? (mutual auth)                 │
+     │                                                         │
+     │                                                         │
+     │  Phase 4: Application Data                              │
+     │  ◄──────────────────────────────────────────────────►   │
+     │  All messages encrypted with session AEAD key           │
+     │                                                         │
+```
+
+**Phase 1 - ClientHello (Initiation)**:
+- Client generates cryptographically random 32-byte nonce for replay protection
+- Client optionally sends `SecurityOffer` listing supported profiles (negotiation mode)
+- If no offer sent, server uses dealer's choice mode (selects first configured profile)
+- Nonce immediately added to transcript hash accumulator
+
+**Phase 2 - ServerHandshake (Response)**:
+- Server validates client nonce (checks replay, adds to nonce tracking set)
+- Server selects mutual profile or uses dealer's choice
+- Server generates its own 32-byte nonce
+- Server signs transcript hash (ClientHello || ServerHandshake) to prove possession 
+  of private key and bind server to negotiated parameters
+- Signature algorithm determined by selected SecurityProfile
+
+**Phase 3 - ClientKeyExchange (Session Key Establishment)**:
+- Client generates ephemeral session key (CEK) for AEAD cipher
+- Client encrypts CEK using:
+  - **CMS**: KeyAgreeRecipientInfo with ECDH + HKDF + AES Key Wrap
+  - **ECIES**: Elliptic Curve Integrated Encryption Scheme
+- For mutual authentication, client includes certificate and signs transcript
+- Server decrypts CEK, derives session AEAD key via HKDF
+
+**Phase 4 - Application Data**:
+- Both parties now possess shared session key
+- All subsequent messages encrypted/authenticated with AEAD cipher
+- Transport layer (Section 8.2) handles WireEnvelope encryption automatically
+
+#### State Machine Design
+
+TightBeam uses role-specific state machines (`ClientHandshakeState`, 
+`ServerHandshakeState`) with explicit terminal states and granular failure 
+classification. This design enables:
+
+1. **Type-safe transitions**: State machine ensures messages processed in correct order
+2. **Replay detection**: Nonce tracking prevents accepting duplicate handshakes
+3. **Failure attribution**: Distinguish protocol violations from network errors
+4. **Audit trails**: Each state transition logged for security monitoring
+
+**Client State Machine**:
+
+```rust
+pub enum ClientHandshakeState {
+    #[default]
+    Init,                    // Initial state, ready to send ClientHello
+    WaitingServerHandshake,  // ClientHello sent, awaiting server response
+    WaitingSessionKey,       // ServerHandshake received, sending ClientKeyExchange
+    Completed,               // Handshake successful, session key established
+    Failed(FailureKind),     // Terminal failure state
+    Aborted(AbortReason),    // Intentional abort (policy decision)
+}
+```
+
+State transitions:
+1. `Init` → `WaitingServerHandshake`: Client sends ClientHello
+2. `WaitingServerHandshake` → `WaitingSessionKey`: Receives valid ServerHandshake
+3. `WaitingSessionKey` → `Completed`: ClientKeyExchange accepted by server
+4. Any state → `Failed`: Protocol error, crypto failure, validation failure
+5. Any state → `Aborted`: Policy rejection, explicit cancellation
+
+**Server State Machine**:
+
+```rust
+pub enum ServerHandshakeState {
+    #[default]
+    Init,                    // Listening for ClientHello
+    WaitingClientKeyExchange, // ClientHello processed, ServerHandshake sent
+    Completed,               // ClientKeyExchange received, session established
+    Failed(FailureKind),     // Terminal failure state
+    Aborted(AbortReason),    // Policy-driven rejection
+}
+```
+
+State transitions:
+1. `Init` → `WaitingClientKeyExchange`: Valid ClientHello received
+2. `WaitingClientKeyExchange` → `Completed`: Valid ClientKeyExchange received
+3. Any state → `Failed`: Validation error, crypto error, replay detected
+4. Any state → `Aborted`: Certificate validation failed, policy rejected
+
+#### Failure Classification
+
+The state machine distinguishes three failure categories for targeted error handling:
+
+```rust
+pub enum FailureKind {
+    ProtocolViolation,       // Invalid message format, out-of-order message
+    CryptographicFailure,    // Signature verification failed, decryption failed
+    ValidationFailure,       // Certificate invalid, nonce replay detected
+    NetworkError,            // Connection dropped, timeout
+}
+```
+
+**ProtocolViolation**: Client sent message out of sequence, malformed ASN.1 DER 
+encoding, missing required fields. Indicates potential implementation bug or 
+malicious peer. Server SHOULD terminate connection immediately.
+
+**CryptographicFailure**: Signature doesn't verify, HMAC mismatch, key derivation 
+error. Indicates private key mismatch, corrupted certificate, or active attack. 
+Server MUST terminate and MAY log for security audit.
+
+**ValidationFailure**: Certificate expired, nonce already seen (replay), untrusted 
+CA. Indicates configuration mismatch or policy violation. Server SHOULD send 
+informative error before terminating.
+
+**NetworkError**: TCP connection dropped, timeout waiting for message. Indicates 
+transient network issue. Client MAY retry with backoff per restart policy.
+
+#### Replay Protection with Nonce Tracking
+
+Servers maintain a replay detection set that tracks recently seen nonces:
+
+```rust
+pub struct NonceReplaySet {
+    seen: HashSet<[u8; 32]>,  // Nonces seen in recent time window
+}
+
+impl NonceReplaySet {
+    pub fn check_and_insert(&mut self, nonce: &[u8; 32]) -> bool {
+        if self.seen.contains(nonce) {
+            return false;  // Replay detected
+        }
+        self.seen.insert(*nonce);
+        true
+    }
+}
+```
+
+Properties:
+- **Window-based tracking**: Nonces expire after configurable duration (default: 5 minutes)
+- **Memory efficiency**: Bounded set size prevents memory exhaustion attacks
+- **Constant-time lookup**: HashSet provides O(1) replay detection
+- **Thread-safe**: Wrapped in `Arc<Mutex<>>` for concurrent server operation
+
+Best practices:
+- Servers MUST reject replayed nonces before processing any handshake logic
+- Clients SHOULD use cryptographically strong random number generator (OsRng)
+- Nonce size (32 bytes) provides 2^256 space, making collisions computationally infeasible
+- Consider persisting nonce set across server restarts for long-lived deployments
+
+#### Transcript Integrity
+
+Both protocols maintain a transcript hash that accumulates all handshake messages. 
+This prevents tampering and downgrade attacks:
+
+```rust
+// Transcript starts empty
+let mut transcript = Vec::new();
+
+// Phase 1: Accumulate ClientHello
+transcript.extend_from_slice(&client_hello_der);
+
+// Phase 2: Accumulate ServerHandshake
+transcript.extend_from_slice(&server_handshake_der);
+
+// Server signs transcript at this point
+let transcript_hash = Sha3_256::digest(&transcript);
+let server_signature = server_key.sign(&transcript_hash);
+
+// Phase 3: Client verifies signature, then accumulates ClientKeyExchange
+verify(server_pubkey, &transcript_hash, &server_signature)?;
+transcript.extend_from_slice(&client_key_exchange_der);
+
+// For mutual auth, client signs extended transcript
+let final_hash = Sha3_256::digest(&transcript);
+let client_signature = client_key.sign(&final_hash);
+```
+
+Security properties:
+- **Immutability**: Once message added to transcript, cannot be removed or reordered
+- **Binding**: Signature covers all prior messages, binding server to negotiated parameters
+- **Downgrade prevention**: Profile negotiation included in transcript prevents 
+  attacker from forcing weaker algorithms
+- **Authenticated transcript**: Both parties sign portions of transcript, proving 
+  they witnessed same message sequence
+
+#### Error Handling and Alerts
+
+Handshakes can fail at multiple points. TightBeam provides structured error 
+reporting through alert messages:
+
+```rust
+pub enum HandshakeAlert {
+    CertificateExpired,           // Server/client certificate not in validity period
+    CertificateUntrusted,         // Certificate not signed by trusted CA
+    ProfileMismatch,              // No mutual SecurityProfile available
+    NonceReplay,                  // Nonce seen before (replay attack)
+    SignatureVerificationFailed,  // Transcript signature invalid
+    DecryptionFailed,             // Cannot decrypt session key
+    InvalidMessage,               // Malformed ASN.1 DER
+}
+```
+
+Alerts are encoded as CMS authenticated attributes in the handshake messages, 
+allowing structured error communication without revealing sensitive information 
+to attackers. See `transport/handshake/attributes.rs` for alert encoding.
+
+#### Invariant Enforcement
+
+The handshake state machine enforces critical invariants through runtime checks:
+
+```rust
+pub trait HandshakeInvariant {
+    fn check_transcript_locked(&self) -> Result<(), HandshakeError>;
+    fn check_aead_not_derived(&self) -> Result<(), HandshakeError>;
+    fn check_finished_not_sent(&self) -> Result<(), HandshakeError>;
+}
+```
+
+**Transcript Lock Invariant**: After ClientKeyExchange sent/received, transcript 
+MUST be immutable. Prevents late tampering of handshake messages.
+
+**AEAD Derivation Invariant**: Session key derived exactly once. Prevents 
+accidentally deriving multiple keys from same material.
+
+**Finished Invariant**: Finished message (transcript signature) sent exactly once. 
+Ensures handshake completes atomically.
+
+#### 8.5.3 Implementation: CMS-Based Handshake Protocol
+
+The CMS-based handshake leverages Cryptographic Message Syntax (RFC 5652) to 
+provide standards-compliant authenticated key exchange with full X.509 certificate 
+support. This protocol is ideal for deployments requiring PKI integration, 
+regulatory compliance, and non-repudiation.
+
+**CMS Message Structures:**
+
+TightBeam uses three primary CMS structures in the handshake:
+
+**1. EnvelopedData (RFC 5652 §6)**: Encrypts content for one or more recipients
+
+```asn1
+EnvelopedData ::= SEQUENCE {
+  version                  CMSVersion,
+  recipientInfos           RecipientInfos,         -- How to decrypt
+  encryptedContentInfo     EncryptedContentInfo    -- Encrypted payload
+}
+
+RecipientInfos ::= SET SIZE (1..MAX) OF RecipientInfo
+
+RecipientInfo ::= CHOICE {
+  keyAgreeRecipientInfo [1] KeyAgreeRecipientInfo,  -- ECDH-based (used by TightBeam)
+  -- ... other recipient types omitted ...
+}
+```
+
+TightBeam uses `KeyAgreeRecipientInfo` (KARI) exclusively, which provides:
+- **Key agreement**: ECDH between sender ephemeral key and recipient static key
+- **Key derivation**: HKDF to derive key encryption key (KEK) from ECDH shared secret
+- **Key wrapping**: AES Key Wrap (RFC 3394) to encrypt content encryption key (CEK)
+
+**2. SignedData (RFC 5652 §5)**: Provides digital signatures over content
+
+```asn1
+SignedData ::= SEQUENCE {
+  version           CMSVersion,
+  digestAlgorithms  DigestAlgorithmIdentifiers,  -- Hash algorithms used
+  encapContentInfo  EncapsulatedContentInfo,     -- Content to sign
+  certificates  [0] IMPLICIT CertificateSet OPTIONAL,  -- Signer certificates
+  signerInfos       SignerInfos                  -- Signatures
+}
+```
+
+Used in TightBeam for:
+- Server signs transcript hash in ServerHandshake (proves identity)
+- Client signs transcript hash for mutual authentication (optional)
+
+**3. ContentInfo (RFC 5652 §3)**: Top-level wrapper for all CMS messages
+
+```asn1
+ContentInfo ::= SEQUENCE {
+  contentType     OBJECT IDENTIFIER,  -- id-signedData, id-envelopedData, etc.
+  content     [0] EXPLICIT ANY DEFINED BY contentType
+}
+```
+
+#### ClientKeyExchange: KARI-Based Session Key Encryption
+
+The ClientKeyExchange message establishes the shared session key through a 
+sophisticated multi-step process:
+
+**Step 1: Client Generates Content Encryption Key (CEK)**
+
+```rust
+use tightbeam::crypto::secret::Secret;
+
+// Generate random 32-byte key for AES-256-GCM
+let cek = Secret::from(Box::new({
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    key
+}));
+```
+
+The CEK is the actual session key that will be used for AEAD encryption of 
+application data. It's wrapped in `Secret<>` to ensure automatic zeroization 
+when dropped.
+
+**Step 2: Client Builds KeyAgreeRecipientInfo (KARI)**
+
+KARI construction involves multiple cryptographic operations orchestrated by 
+`TightBeamKariBuilder`:
+
+```rust
+use tightbeam::transport::handshake::builders::TightBeamKariBuilder;
+
+let kari_builder = TightBeamKariBuilder::<Secp256k1Sha3Profile>::new()
+    // Sender's ephemeral keys (generated fresh for this handshake)
+    .with_sender_private_key(client_ephemeral_priv)
+    .with_sender_public_key_spki(client_ephemeral_pub_spki)
+    
+    // Recipient's static public key (from server certificate)
+    .with_recipient_public_key(server_static_pub)
+    .with_recipient_identifier(server_cert_issuer_serial)
+    
+    // User Keying Material (random salt for HKDF)
+    .with_ukm(UserKeyingMaterial::from(ukm_bytes))
+    
+    // Key wrap algorithm (AES-256 Key Wrap)
+    .with_key_encryption_algorithm(AlgorithmIdentifierOwned {
+        oid: KW_AES_256_WRAP_OID,
+        parameters: None,
+    });
+
+// Build RecipientInfo, encrypting CEK for server
+let recipient_info = kari_builder.build(&cek)?;
+```
+
+Internally, `TightBeamKariBuilder` performs:
+
+1. **ECDH**: `shared_secret = ECDH(client_ephemeral_priv, server_static_pub)`
+2. **HKDF**: `KEK = HKDF-Expand(HKDF-Extract(ukm, shared_secret), info, 32)`
+3. **AES Key Wrap**: `wrapped_cek = AES-KW(KEK, cek)`
+
+The wrapped CEK is embedded in the KARI structure along with:
+- Sender's ephemeral public key (for server to perform ECDH)
+- UKM (for server to derive same KEK)
+- Key encryption algorithm OID
+
+**Step 3: Client Builds EnvelopedData**
+
+```rust
+use tightbeam::transport::handshake::builders::TightBeamEnvelopedDataBuilder;
+
+let enveloped_data_builder = TightBeamEnvelopedDataBuilder::<Secp256k1Sha3Profile>::new()
+    .with_kari_builder(kari_builder)
+    .with_plaintext_content(client_key_exchange_plaintext)
+    .with_authenticated_attributes(vec![
+        encode_client_nonce(&client_nonce)?,
+        // ... other attributes
+    ]);
+
+let enveloped_data = enveloped_data_builder.build()?;
+```
+
+This produces a complete CMS EnvelopedData structure containing:
+- `RecipientInfos` with the KARI (encrypted CEK)
+- `EncryptedContentInfo` with AEAD-encrypted plaintext content
+
+**Step 4: Server Decrypts Session Key**
+
+Server uses `TightBeamKariRecipient` processor to reverse the operation:
+
+```rust
+use tightbeam::transport::handshake::processors::TightBeamKariRecipient;
+
+let kari_recipient = TightBeamKariRecipient::<Secp256k1Sha3Profile>::new(
+    server_static_priv,  // Server's long-term private key
+);
+
+// Extract CEK from RecipientInfo
+let cek = kari_recipient.process_recipient(&recipient_info, 0)?;
+```
+
+Internally performs:
+1. **Extract ephemeral key**: Parse sender's ephemeral public key from KARI
+2. **ECDH**: `shared_secret = ECDH(server_static_priv, client_ephemeral_pub)`
+3. **HKDF**: Derive same KEK using UKM from KARI
+4. **AES Key Unwrap**: `cek = AES-KW-Unwrap(KEK, wrapped_cek)`
+5. **Integrity check**: Re-wrap CEK and constant-time compare with original
+
+The constant-time re-wrap check provides defense-in-depth against timing attacks, 
+even though AES Key Wrap already includes an integrity check (RFC 3394).
+
+#### ServerHandshake: Transcript Signature
+
+The server proves possession of its private key by signing the handshake transcript:
+
+```rust
+use tightbeam::transport::handshake::builders::TightBeamSignedDataBuilder;
+
+// Accumulate transcript
+let mut transcript = Vec::new();
+transcript.extend_from_slice(&client_hello_der);
+transcript.extend_from_slice(&server_handshake_der);
+
+// Hash transcript
+let transcript_hash = Sha3_256::digest(&transcript);
+
+// Build SignedData
+let signed_data_builder = TightBeamSignedDataBuilder::<Secp256k1Sha3Profile, _>::new(
+    &server_signing_key,
+    AlgorithmIdentifierOwned::from(Sha3_256::OID),  // Digest algorithm
+    AlgorithmIdentifierOwned::from(Secp256k1Sha3Profile::signature_oid()),
+    compute_signer_identifier(&server_cert)?,
+)?;
+
+let signed_data = signed_data_builder.build(&transcript_hash)?;
+```
+
+The SignedData structure includes:
+- `SignerInfo` with signature over transcript hash
+- `DigestAlgorithm` identifying hash function (SHA3-256)
+- `SignatureAlgorithm` identifying signature scheme (ECDSA-secp256k1)
+- Optionally `certificates` field with server certificate chain
+
+**Transcript Signature Verification (Client Side)**:
+
+```rust
+use tightbeam::transport::handshake::processors::TightBeamSignedDataProcessor;
+
+// Extract verifying key from server certificate
+let verifying_key = server_cert.tbs_certificate.subject_public_key_info
+    .to_verifying_key::<Secp256k1>()?;
+
+// Create signature verifier
+let verifier = EcdsaSignatureVerifier::new(verifying_key);
+
+// Process SignedData
+let processor = TightBeamSignedDataProcessor::new(verifier);
+let verified_content = processor.process(&signed_data, &Sha3_256::OID)?;
+
+// Verify content matches transcript hash
+assert_eq!(verified_content, transcript_hash);
+```
+
+This proves:
+1. Server possesses private key corresponding to certificate public key
+2. Server witnessed same transcript as client (binds server to ClientHello parameters)
+3. Transcript hasn't been tampered with (signature would fail)
+
+#### Mutual Authentication Flow
+
+For mutual authentication, client includes its certificate and signs the extended 
+transcript in ClientKeyExchange:
+
+```rust
+// Client extends transcript with ServerHandshake
+transcript.extend_from_slice(&server_handshake_der);
+transcript.extend_from_slice(&client_key_exchange_der);
+
+// Client signs extended transcript
+let final_hash = Sha3_256::digest(&transcript);
+let client_signed_data = TightBeamSignedDataBuilder::<Secp256k1Sha3Profile, _>::new(
+    &client_signing_key,
+    // ... same parameters as server ...
+)?.build(&final_hash)?;
+
+// Include in ClientKeyExchange as authenticated attribute
+let client_key_exchange = ClientKeyExchange {
+    enveloped_data,  // Contains encrypted CEK
+    client_certificate: Some(client_cert.clone()),
+    client_signature: Some(client_signed_data.to_der()?),
+};
+```
+
+Server verification flow:
+
+```rust
+// 1. Validate client certificate against trust anchors
+validator.validate(&client_cert, &trust_anchors)?;
+
+// 2. Verify certificate is within validity period
+validate_certificate_expiry(&client_cert)?;
+
+// 3. Extract client's public key and verify transcript signature
+let client_verifying_key = client_cert.tbs_certificate
+    .subject_public_key_info.to_verifying_key::<Secp256k1>()?;
+
+let client_verifier = EcdsaSignatureVerifier::new(client_verifying_key);
+let client_processor = TightBeamSignedDataProcessor::new(client_verifier);
+
+let verified_hash = client_processor.process(&client_signed_data, &Sha3_256::OID)?;
+
+// 4. Verify client witnessed same transcript
+let expected_hash = Sha3_256::digest(&transcript);
+if verified_hash != expected_hash.as_slice() {
+    return Err(HandshakeError::TranscriptMismatch);
+}
+```
+
+At this point, both parties have:
+- Proven possession of their private keys through signatures
+- Validated each other's certificates against trust anchors
+- Established a shared CEK through ECDH + HKDF + Key Wrap
+- Bound themselves cryptographically to the negotiated parameters
+
+#### Integration with SecurityProfile System
+
+CMS handshake is fully generic over `P: CryptoProvider`, allowing compile-time 
+polymorphism across different profiles:
+
+```rust
+// Secp256k1 + SHA3-256 + AES-256-GCM + HKDF-SHA3-256
+pub type CmsHandshakeClientSecp256k1 = 
+    CmsHandshakeClient<Secp256k1Sha3Profile, Secp256k1SigningKey>;
+
+// Ed25519 + BLAKE3 + ChaCha20Poly1305 + HKDF-BLAKE3  
+pub type CmsHandshakeClientEd25519 = 
+    CmsHandshakeClient<Ed25519Blake3Profile, Ed25519SigningKey>;
+```
+
+All cryptographic operations (ECDH, HKDF, signature, AEAD) are resolved at 
+compile time through associated types on the `CryptoProvider` trait. This provides:
+
+- **Zero-cost abstraction**: No runtime dispatch or type erasure
+- **Type safety**: Mismatched profiles caught at compile time
+- **Explicit semantics**: Profile choice visible in type signatures
+- **Easy auditing**: Security-critical code paths determined statically
+
+#### CMS Handshake Security Properties
+
+The CMS-based handshake provides:
+
+1. **Forward Secrecy**: Ephemeral ECDH keys ensure session key compromise doesn't 
+   affect past sessions. Even if server's long-term private key is stolen later, 
+   captured session traffic remains secure.
+
+2. **Certificate Validation**: Full X.509 validation including:
+   - Signature chain verification back to trusted root
+   - Validity period checking (notBefore/notAfter)
+   - Optional revocation checking (CRL, OCSP)
+   - Custom policy enforcement through `CertificateValidation` trait
+
+3. **Non-Repudiation**: SignedData structures provide cryptographic proof that 
+   server/client generated specific messages. Useful for audit trails and 
+   compliance requirements.
+
+4. **Key Confirmation**: Both parties prove possession of private keys through 
+   signatures before session established. Prevents key confusion attacks.
+
+5. **Downgrade Protection**: Profile negotiation included in signed transcript 
+   prevents attacker from forcing weaker algorithms even if they can modify 
+   ClientHello in flight.
+
+6. **Replay Protection**: Nonce tracking on server side prevents accepting 
+   duplicate ClientHello messages.
+
+## 9. Network Theory
+
+### 9.1 Network Architecture
 
 - Egress/Ingress policy management
 - Retry and Egress client policy
 - Service orchestration via Colony Monodomy/Polydomy patterns
 
-### 8.2 Efficient Exchange-Compute Interconnect
+### 9.2 Efficient Exchange-Compute Interconnect
 
 The Efficient Exchange-Compute Interconnect or EECI is a software development 
-paradigm inspired by the entymological world. As threads and tunnels underpin 
+paradigm inspired by the entomological world. As threads and tunnels underpin 
 the basics of processing and communication, we can start at these base levels 
 and develop from here. The goal of EECI is to operate on these base layers 
 across any transmission protocol: 
 - thread-thread.
 - thread-port-thread.
 
-### 8.3 Components
+### 9.3 Components
 
 There are four main components to the EECI:
-- **E** [Workers](#831-e-workers) - Efficient processing units
-- **E** [Servlets](#832-e-servlets) - Exchange endpoints
-- **C** [Clusters](#833-c-clusters) - Compute orchestration
-- **I** [Drone/Hive](#834-i-drones--hives) - Interconnected infrastructure
+- **E** [Workers](#931-e-workers) - Efficient processing units
+- **E** [Servlets](#932-e-servlets) - Exchange endpoints
+- **C** [Clusters](#933-c-clusters) - Compute orchestration
+- **I** [Drone/Hive](#934-i-drones--hives) - Interconnected infrastructure
 
 Think of workers as ants, servlets as ant hills, and clusters as ant colonies.
 Insects have specific functions for which they process organic matter 
@@ -1066,7 +2528,7 @@ in large numbers, they can perform complex tasks. The efficiency of each unit
 is attributed to  their fungible nature--how well it can accomplish its 
 singular task. 
 
-#### 8.3.1 E: Workers
+#### 9.3.1 E: Workers
 
 Workers are the smallest unit of computation. They must be single-threaded and
 handle a single message at a time. Workers are the "ants" of the EECI. Insects 
@@ -1134,7 +2596,7 @@ tightbeam::test_worker! {
 }
 ```
 
-#### 8.3.2 E: Servlets
+#### 9.3.2 E: Servlets
 
 Servlets are "anthills" in the sense they operate on a specific protocol. From
 a TCP/IP perspective, an anthill is a port in many ways. Servlets are 
@@ -1226,7 +2688,7 @@ tightbeam::test_servlet! {
 }
 ```
 
-#### 8.3.3 C: Clusters
+#### 9.3.3 C: Clusters
 
 Clusters orchestrate multiple servlets and workers. They are the "ant colonies" 
 of the EECI. Colonies are made up of multiple servlets which command different
@@ -1240,7 +2702,7 @@ the cluster.
 TODO
 ```
 
-#### 8.3.4 I: Drones & Hives
+#### 9.3.4 I: Drones & Hives
 
 Drones are containerized servlet runners that can dynamically morph between 
 different servlet types based on command messages from a cluster. This 
@@ -1271,7 +2733,7 @@ How you wish to model your colonies is beyond the scope of this document.
 However, it is important to understand the basic building blocks and how they
 can be combined to create complex systems. The swarm is yours to command.
 
-## 9. Testing Framework
+## 10. Testing Framework
 
 Full end-to-end containerized testing framework
 - Asynchronous/synchronous containerized end-to-end testing
@@ -1365,9 +2827,9 @@ scope in a single containerized test. Channels are automatically cleaned up.
 
 **See:** [Container Integration Test](tests/container.rs)
 
-## 10. Examples
+## 11. Examples
 
-### 10.1 Basic Test Container
+### 11.1 Basic Test Container
 ```rust
 /// Checklist for container assertions
 #[derive(Enumerated, Beamable, Copy, Clone, Debug, PartialEq)]
@@ -1456,9 +2918,9 @@ test_container! {
 }
 ```
 
-## 11. References
+## 12. References
 
-### 11.1 Normative References
+### 12.1 Normative References
 
 - [RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119): Key words for use in RFCs to Indicate Requirement Levels
 - [ITU-T X.690](https://www.itu.int/rec/T-REC-X.690): ASN.1 Distinguished Encoding Rules (DER)
@@ -1488,7 +2950,7 @@ test_container! {
 - [NIST SP 800-57](https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final): Recommendation for Key Management: Part 1 - General
 - [NIST SP 800-131A](https://csrc.nist.gov/publications/detail/sp/800-131a/rev-2/final): Transitioning the Use of Cryptographic Algorithms and Key Lengths
 
-### 11.3 ASN.1 References
+### 12.3 ASN.1 References
 
 - [ITU-T X.680](https://www.itu.int/rec/T-REC-X.680): ASN.1 Specification of basic notation
 - [ITU-T X.681](https://www.itu.int/rec/T-REC-X.681): ASN.1 Information object specification
@@ -1499,7 +2961,7 @@ test_container! {
 - [ITU-T X.400](https://www.itu.int/rec/T-REC-X.400): Message Handling Systems (MHS): System and service overview
 - [ITU-T X.420](https://www.itu.int/rec/T-REC-X.420): Message Handling Systems (MHS): Interpersonal messaging system
 
-## 12. License
+## 13. License
 
 ### For Users (Outbound Licensing)
 
@@ -1523,7 +2985,7 @@ dual licensed as above, without any additional terms or conditions.
 - MIT's simplicity for users who prefer it
 - Apache-2.0's patent grants for enhanced protection
 
-## 13. Implementation Notes
+## 14. Implementation Notes
 
 #### Project Structure
 
@@ -1550,5 +3012,3 @@ The workspace consists of the following components:
 
 #### Future 
 - tightbeam-os
-- tightbeam-dna
-- tightbeam-gate

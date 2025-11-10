@@ -22,9 +22,11 @@ words:
   - ECDH
   - ecies
   - econtent
+  - EECI
   - EMERG
   - encap
   - Encryptor
+  - eprintln
   - Errorizable
   - FIPS
   - Flaggable
@@ -32,20 +34,26 @@ words:
   - getrandom
   - HKDF
   - HMAC
+  - Keccak
   - keypair
   - KTRI
   - Merkle
+  - millis
+  - Monodomy
   - Morpher
   - morphers
+  - MPSC
   - nanos
   - nonrep
   - nonrepudiable
   - nonrepudiation
+  - OCSP
   - oids
   - Orchestr
   - Pingable
   - pkcs
   - pkix
+  - Polydomy
   - recip
   - repr
   - REPUDIABLE
@@ -57,9 +65,13 @@ words:
   - Secp
   - smime
   - spki
+  - supraorganisms
+  - Tanveer
   - tightbeam
   - typenum
   - unwrapper
+  - usize
+  - Wahid
   - Wrkr
   - zeekstd
   - zeroization
@@ -67,3 +79,4 @@ words:
   - zeroized
   - zeroizes
   - Zeroizing
+  - zstd

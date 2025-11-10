@@ -35,7 +35,7 @@
 //!   Mycelial Network: Workers connect directly to servlets (no routing)
 //!
 //!    ╔═══════════════════════════════════════════════════════════════════╗
-//!    ║  Protocol-Agnostic • Zero-Copy (TODO) • ASN.1 DER • Sign-Then-Encrypt    ║
+//!    ║   Protocol-Agnostic • Zero-Copy • ASN.1 DER • RustCrypto-Native   ║
 //!    ╚═══════════════════════════════════════════════════════════════════╝
 //!
 //!         ┌──────────────────────────────────────────────────────┐
@@ -53,11 +53,11 @@
 //!         └──────────────────────────────────────────────────────┘
 //!
 //!         ┌──────────────────────────────────────────────────────┐
-//!         │  🕸️  Mycelial Architecture                           │
+//!         │  🕸️  Efficient Exchange-Compute Interconnect (EECI)  |
 //!         │  ├─ Hives:    Multi-servlet orchestrators            │
 //!         │  ├─ Drones:   Single-servlet morphers                │
 //!         │  ├─ Servlets: Self-contained message processors      │
-//!         │  └─ Direct:   Client-to-servlet connections          │
+//!         │  └─ Cluster:  Centralized control & routing          │
 //!         └──────────────────────────────────────────────────────┘
 //!
 //!         ┌──────────────────────────────────────────────────────┐
@@ -73,8 +73,9 @@
 //!    │  Quick Start Example                                           │
 //!    ├────────────────────────────────────────────────────────────────┤
 //!    │  use tightbeam::{Message, Beamable, compose};                  │
+//!    │  use tightbeam::der::Sequence;                                 │
 //!    │                                                                │
-//!    │  #[derive(Beamable, Clone, Debug, der::Sequence)]              │
+//!    │  #[derive(Beamable, Clone, Debug, Sequence)]                   │
 //!    │  struct MyMessage { value: u64 }                               │
 //!    │                                                                │
 //!    │  let frame = compose! {                                        │

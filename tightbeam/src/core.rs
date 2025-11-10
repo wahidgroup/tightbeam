@@ -577,7 +577,7 @@ mod tests {
 
 	#[cfg(feature = "derive")]
 	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
-	#[beam(profile(crate::crypto::profiles::StandardProfile))]
+	#[beam(profile(crate::crypto::profiles::TightbeamProfile))]
 	struct TypeProfileMessage {
 		id: u64,
 		data: String,
@@ -603,7 +603,7 @@ mod tests {
 		// Type-based profile should be StandardProfile
 		assert_eq!(
 			core::any::TypeId::of::<<TypeProfileMessage as crate::Message>::Profile>(),
-			core::any::TypeId::of::<crate::crypto::profiles::StandardProfile>()
+			core::any::TypeId::of::<crate::crypto::profiles::TightbeamProfile>()
 		);
 
 		// Test HAS_PROFILE values

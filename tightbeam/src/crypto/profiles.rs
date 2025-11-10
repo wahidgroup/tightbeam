@@ -15,7 +15,7 @@ use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 #[cfg(feature = "sha3")]
 use crate::crypto::hash::Sha3_256;
 #[cfg(feature = "kdf")]
-use crate::crypto::kdf::{HkdfSha3_256, KdfProvider};
+use crate::crypto::kdf::{HkdfSha3_256, KdfFunction};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 #[cfg(feature = "signature")]
@@ -255,8 +255,8 @@ pub trait SigningProvider {
 ///
 /// Separates KDF operations (HKDF, etc.) for clearer trait bounds.
 #[cfg(feature = "kdf")]
-pub trait KdfProviderTrait {
-	type Kdf: KdfProvider;
+pub trait KdfProvider {
+	type Kdf: KdfFunction;
 
 	/// Convert this provider into a KeyDeriver function for a specific output length.
 	///
@@ -301,29 +301,13 @@ pub trait CurveProvider {
 	feature = "ecdh"
 ))]
 pub trait CryptoProvider:
-	Default + Clone + DigestProvider + AeadProvider + SigningProvider + KdfProviderTrait + CurveProvider
+	Default + Clone + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider
 {
 	type Profile: SecurityProfile + Default;
 	fn profile(&self) -> &Self::Profile;
 }
 
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
-#[derive(Debug, Default, Clone)]
-pub struct DefaultSecurityProfile;
-
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
-impl SecurityProfile for DefaultSecurityProfile {
-	#[cfg(feature = "digest")]
-	type DigestOid = Sha3_256;
-	#[cfg(feature = "aead")]
-	type AeadOid = Aes256GcmOid;
-	#[cfg(feature = "signature")]
-	type SignatureAlg = Secp256k1Signature;
-
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
-}
-
-/// FIPS-compliant profile: requires confidentiality and non-repudiation.
+/// Default profile: requires confidentiality and non-repudiation.
 /// Maps to numeric profile = 1.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TightbeamProfile;
@@ -339,26 +323,10 @@ impl SecurityProfile for TightbeamProfile {
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
 }
 
-/// Standard security profile: requires confidentiality, non-repudiation, and integrity.
-/// Maps to numeric profile = 2.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct StandardProfile;
-
-impl SecurityProfile for StandardProfile {
-	#[cfg(feature = "digest")]
-	type DigestOid = Sha3_256;
-	#[cfg(feature = "aead")]
-	type AeadOid = Aes256GcmOid;
-	#[cfg(feature = "signature")]
-	type SignatureAlg = Secp256k1Signature;
-
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
-}
-
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 #[derive(Debug, Default, Clone)]
 pub struct DefaultCryptoProvider {
-	profile: DefaultSecurityProfile,
+	profile: TightbeamProfile,
 }
 
 // Implement role traits for DefaultCryptoProvider
@@ -381,7 +349,7 @@ impl SigningProvider for DefaultCryptoProvider {
 }
 
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
-impl KdfProviderTrait for DefaultCryptoProvider {
+impl KdfProvider for DefaultCryptoProvider {
 	type Kdf = HkdfSha3_256;
 }
 
@@ -392,7 +360,7 @@ impl CurveProvider for DefaultCryptoProvider {
 
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 impl CryptoProvider for DefaultCryptoProvider {
-	type Profile = DefaultSecurityProfile;
+	type Profile = TightbeamProfile;
 
 	fn profile(&self) -> &Self::Profile {
 		&self.profile

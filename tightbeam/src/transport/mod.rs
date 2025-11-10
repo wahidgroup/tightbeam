@@ -21,8 +21,7 @@ use crate::asn1::Frame;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData};
 use crate::cms::signed_data::SignedData;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
-use crate::der::asn1::Uint;
-use crate::der::{Choice, Decode, DecodeValue, Encode, EncodeValue, FixedTag, Header, Length, Reader, Tag, Writer};
+use crate::der::{Choice, Decode, Encode, Sequence};
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::error::TransportError;
 use crate::{encode, TightBeamError};
@@ -78,158 +77,24 @@ impl TransportEncryptionConfig {
 	}
 }
 
-// Remove Sequence derive, implement custom encoding
-#[derive(Debug, Clone)]
+/// Request package containing a TightBeam message
+#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct RequestPackage {
-	/// The length is critical for transport
-	#[allow(dead_code)]
-	length: Option<u64>,
 	message: Frame,
-}
-
-impl PartialEq for RequestPackage {
-	fn eq(&self, other: &Self) -> bool {
-		self.message == other.message
-	}
 }
 
 impl RequestPackage {
 	pub fn new(message: Frame) -> Self {
-		Self { length: None, message }
+		Self { message }
 	}
 }
 
-impl EncodeValue for RequestPackage {
-	fn value_len(&self) -> der::Result<Length> {
-		let message_len = self.message.encoded_len()?;
-		let length_value = u64::from(u32::from(message_len));
-		let length_field = Uint::new(&length_value.to_be_bytes())?;
-
-		length_field.encoded_len()? + message_len
-	}
-
-	fn encode_value(&self, writer: &mut impl Writer) -> der::Result<()> {
-		let message_len = self.message.encoded_len()?;
-		let length_value = u64::from(u32::from(message_len));
-		let length_field = Uint::new(&length_value.to_be_bytes())?;
-
-		length_field.encode(writer)?;
-		self.message.encode(writer)?;
-		Ok(())
-	}
-}
-
-impl<'a> DecodeValue<'a> for RequestPackage {
-	fn decode_value<R: Reader<'a>>(reader: &mut R, _: Header) -> der::Result<Self> {
-		let length_uint = Uint::decode(reader)?;
-		let bytes = length_uint.as_bytes();
-
-		// Convert bytes to u64 (big-endian)
-		let mut length_bytes = [0u8; 8];
-		let offset = 8usize.saturating_sub(bytes.len());
-		length_bytes[offset..].copy_from_slice(bytes);
-		let length = u64::from_be_bytes(length_bytes);
-
-		let message = reader.decode::<Frame>()?;
-		let actual_len = message.encoded_len()?;
-
-		if u64::from(u32::from(actual_len)) != length {
-			// Length mismatch
-			return Err(der::Error::from(der::ErrorKind::Length { tag: Tag::Integer }));
-		}
-
-		Ok(Self { length: Some(length), message })
-	}
-}
-
-impl FixedTag for RequestPackage {
-	const TAG: Tag = Tag::Sequence;
-}
-
-// Remove Sequence derive, implement custom encoding
-#[derive(Debug, Clone, Default)]
+/// Response package containing status and optional message
+#[derive(Sequence, Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResponsePackage {
-	/// The length is critical for transport
-	#[allow(dead_code)]
-	length: Option<u64>,
 	status: TransitStatus,
+	#[asn1(optional = "true")]
 	message: Option<Frame>,
-}
-
-impl PartialEq for ResponsePackage {
-	fn eq(&self, other: &Self) -> bool {
-		self.status == other.status && self.message == other.message
-	}
-}
-
-impl EncodeValue for ResponsePackage {
-	fn value_len(&self) -> der::Result<Length> {
-		let status_len = self.status.encoded_len()?;
-		let message_len = self
-			.message
-			.as_ref()
-			.map(|m| m.encoded_len())
-			.transpose()?
-			.unwrap_or(Length::ZERO);
-		let length_value = u64::from(u32::from(message_len));
-		let length_field = Uint::new(&length_value.to_be_bytes())?;
-
-		status_len + length_field.encoded_len()? + message_len
-	}
-
-	fn encode_value(&self, writer: &mut impl Writer) -> der::Result<()> {
-		self.status.encode(writer)?;
-
-		let message_len = self
-			.message
-			.as_ref()
-			.map(|m| m.encoded_len())
-			.transpose()?
-			.unwrap_or(Length::ZERO);
-		let length_value = u64::from(u32::from(message_len));
-		let length_field = Uint::new(&length_value.to_be_bytes())?;
-		length_field.encode(writer)?;
-
-		if let Some(ref message) = self.message {
-			message.encode(writer)?;
-		}
-
-		Ok(())
-	}
-}
-
-impl<'a> DecodeValue<'a> for ResponsePackage {
-	fn decode_value<R: Reader<'a>>(reader: &mut R, _: Header) -> der::Result<Self> {
-		let status = TransitStatus::decode(reader)?;
-		let length_uint = Uint::decode(reader)?;
-		let bytes = length_uint.as_bytes();
-
-		// Convert bytes to u64 (big-endian)
-		let mut length_bytes = [0u8; 8];
-		let offset = 8usize.saturating_sub(bytes.len());
-		length_bytes[offset..].copy_from_slice(bytes);
-		let length = u64::from_be_bytes(length_bytes);
-
-		let message = if length > 0 {
-			let msg = reader.decode::<Frame>()?;
-			let actual_len = msg.encoded_len()?;
-
-			if u64::from(u32::from(actual_len)) != length {
-				// Length mismatch
-				return Err(der::Error::from(der::ErrorKind::Length { tag: Tag::Integer }));
-			}
-
-			Some(msg)
-		} else {
-			None
-		};
-
-		Ok(Self { length: Some(length), status, message })
-	}
-}
-
-impl FixedTag for ResponsePackage {
-	const TAG: Tag = Tag::Sequence;
 }
 
 /// Transport envelope wrapping all messages at the transport layer.
@@ -276,14 +141,14 @@ impl From<ResponsePackage> for TransportEnvelope {
 
 impl From<Frame> for TransportEnvelope {
 	fn from(msg: Frame) -> Self {
-		Self::Request(RequestPackage { length: None, message: msg })
+		Self::Request(RequestPackage { message: msg })
 	}
 }
 
 impl TransportEnvelope {
 	/// Create a new request envelope from a message
 	pub fn new_request(msg: Frame) -> Self {
-		Self::Request(RequestPackage { length: None, message: msg })
+		Self::Request(RequestPackage { message: msg })
 	}
 }
 
@@ -676,7 +541,7 @@ pub trait MessageCollector: MessageIO {
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message, length: None };
+		let response_pkg = ResponsePackage { status, message };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
@@ -744,7 +609,7 @@ pub trait MessageCollector: MessageIO {
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message, length: None };
+		let response_pkg = ResponsePackage { status, message };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
@@ -881,7 +746,6 @@ mod tests {
 
 		fn create_response(&self) -> ResponsePackage {
 			ResponsePackage {
-				length: None,
 				status: self.expected_status,
 				message: if self.should_have_message {
 					Some(create_v0_tightbeam(Some(self.message_value), None))
@@ -931,7 +795,6 @@ mod tests {
 			let encoded = original.to_der().unwrap();
 			let decoded = RequestPackage::from_der(&encoded).unwrap();
 			assert_eq!(original, decoded);
-			assert!(decoded.length.is_some());
 		}
 	}
 
@@ -944,7 +807,6 @@ mod tests {
 			let decoded = ResponsePackage::from_der(&encoded).unwrap();
 			assert_eq!(original.status, decoded.status);
 			assert_eq!(original.message, decoded.message);
-			assert!(decoded.length.is_some());
 		}
 	}
 
@@ -969,11 +831,8 @@ mod tests {
 
 	#[test]
 	fn test_length_validation_response() {
-		let original = ResponsePackage {
-			length: None,
-			status: TransitStatus::Accepted,
-			message: Some(create_v0_tightbeam(None, None)),
-		};
+		let original =
+			ResponsePackage { status: TransitStatus::Accepted, message: Some(create_v0_tightbeam(None, None)) };
 		let mut encoded = original.to_der().unwrap();
 
 		// Corrupt the length field
@@ -989,13 +848,12 @@ mod tests {
 
 	#[test]
 	fn test_response_empty_message() {
-		let original = ResponsePackage { length: None, status: TransitStatus::Busy, message: None };
+		let original = ResponsePackage { status: TransitStatus::Busy, message: None };
 
 		let encoded = original.to_der().unwrap();
 		let decoded = ResponsePackage::from_der(&encoded).unwrap();
 
 		assert_eq!(original.status, decoded.status);
 		assert_eq!(original.message, decoded.message);
-		assert_eq!(decoded.length.unwrap(), 0);
 	}
 }
