@@ -393,7 +393,7 @@ impl TestCmsServerBuilder {
 
 		// Apply transcript hash if explicitly set
 		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
-		let mut server = CmsHandshakeServerSecp256k1::new(test_key, None);
+		let mut server = CmsHandshakeServerSecp256k1::new(test_key.into(), None);
 		if let Some(hash) = self.transcript_hash {
 			server = server.with_transcript_hash(hash);
 		}
@@ -453,8 +453,11 @@ impl TestCmsClientBuilder {
 			.server_cert
 			.unwrap_or_else(|| create_test_certificate_from_key(&create_test_certificate().signing_key));
 
-		let mut client =
-			CmsHandshakeClientSecp256k1::new(DefaultCryptoProvider::default(), client_key, Arc::new(server_cert));
+		let mut client = CmsHandshakeClientSecp256k1::new(
+			DefaultCryptoProvider::default(),
+			client_key.into(),
+			Arc::new(server_cert),
+		);
 
 		// Apply transcript hash if explicitly set
 		if let Some(hash) = self.transcript_hash {

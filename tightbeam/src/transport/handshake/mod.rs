@@ -185,31 +185,14 @@ use crate::Beamable;
 use std::time::Instant;
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
-use crate::crypto::ecies::Secp256k1EciesMessage;
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
 use crate::crypto::profiles::DefaultCryptoProvider;
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 #[cfg(feature = "x509")]
 use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};
-#[cfg(all(feature = "x509", feature = "secp256k1", feature = "transport-cms"))]
-use crate::transport::handshake::client::CmsHandshakeClient;
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
-use crate::transport::handshake::client::EciesHandshakeClient;
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
-use crate::transport::handshake::server::{CmsHandshakeServer, EciesHandshakeServer};
+
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
-
-// Type aliases for complex generic types to improve readability
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
-type DefaultEciesServer = EciesHandshakeServer<DefaultCryptoProvider, Secp256k1SigningKey>;
-
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
-type DefaultEciesClient = EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage, Secp256k1SigningKey>;
-
-#[cfg(all(feature = "x509", feature = "secp256k1", feature = "transport-cms"))]
-type DefaultCmsServer = CmsHandshakeServer<DefaultCryptoProvider, Secp256k1SigningKey>;
 
 // ============================================================================
 // Server key abstraction for handshake (sign + decrypt)
@@ -244,7 +227,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		aad_domain_tag: Option<&'static [u8]>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>>;
+	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
 
 	/// Create an ECIES client handshake orchestrator.
 	///
@@ -265,7 +248,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		client_cert: Option<Arc<Certificate>>,
 		aad_domain_tag: Option<&'static [u8]>,
 		validator: Option<Arc<dyn CertificateValidation>>,
-	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send>>;
+	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
 
 	/// Create a CMS client handshake orchestrator.
 	///
@@ -283,7 +266,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		&self,
 		server_cert: Arc<Certificate>,
 		validators: Option<Arc<dyn CertificateValidation>>,
-	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send>>;
+	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
 
 	/// Create a CMS server handshake orchestrator.
 	///
@@ -299,7 +282,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	fn create_cms_server(
 		&self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>>;
+	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
 }
 
 /// Encapsulated server key manager for handshake protocols.
@@ -340,19 +323,28 @@ impl ServerKeyManager {
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	///
 	/// # Returns
-	/// An ECIES server handshake orchestrator that borrows the encapsulated key
+	/// A boxed ECIES server handshake orchestrator that borrows the encapsulated key
 	pub fn create_ecies_server<'a>(
 		&'a self,
 		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<&'static [u8]>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<DefaultEciesServer> {
-		let server =
-			DefaultEciesServer::new(Arc::clone(&self.signing_key), server_cert, aad_domain_tag, client_validators)
-				.with_supported_profiles(supported_profiles);
+	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + 'static>> {
+		#[cfg(feature = "secp256k1")]
+		{
+			let server = crate::transport::handshake::server::EciesHandshakeServer::<
+				crate::crypto::profiles::DefaultCryptoProvider,
+				crate::crypto::sign::ecdsa::Secp256k1SigningKey,
+			>::new(Arc::clone(&self.signing_key), server_cert, aad_domain_tag, client_validators)
+			.with_supported_profiles(supported_profiles);
 
-		Ok(server)
+			Ok(Box::new(server))
+		}
+		#[cfg(not(feature = "secp256k1"))]
+		{
+			Err(HandshakeError::UnsupportedAlgorithm)
+		}
 	}
 
 	/// Create an ECIES client handshake orchestrator using the encapsulated key.
@@ -374,19 +366,30 @@ impl ServerKeyManager {
 		client_cert: Option<Arc<Certificate>>,
 		aad_domain_tag: Option<&'static [u8]>,
 		validator: Option<Arc<dyn CertificateValidation>>,
-	) -> Result<DefaultEciesClient> {
-		// Create client with mutual auth (K = Arc reference to encapsulated signing key)
-		let signing_key = client_cert.as_ref().map(|_| Arc::clone(&self.signing_key));
-		let client = DefaultEciesClient::new_with_identity(aad_domain_tag, client_cert.clone(), signing_key);
+	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>> {
+		#[cfg(feature = "secp256k1")]
+		{
+			// Create client with mutual auth (K = encapsulated signing key)
+			let signing_key = client_cert.as_ref().map(|_| Arc::new((*self.signing_key).clone()));
+			let client = crate::transport::handshake::client::EciesHandshakeClient::<
+				crate::crypto::profiles::DefaultCryptoProvider,
+				crate::crypto::ecies::Secp256k1EciesMessage,
+				crate::crypto::sign::ecdsa::SigningKey<crate::crypto::sign::ecdsa::Secp256k1>,
+			>::new_with_identity(aad_domain_tag, client_cert, signing_key);
 
-		// Apply certificate validator if provided
-		let client = if let Some(val) = validator {
-			client.with_certificate_validator(val)
-		} else {
-			client
-		};
+			// Apply certificate validator if provided
+			let client = if let Some(val) = validator {
+				client.with_certificate_validator(val)
+			} else {
+				client
+			};
 
-		Ok(client)
+			Ok(Box::new(client))
+		}
+		#[cfg(not(feature = "secp256k1"))]
+		{
+			Err(HandshakeError::UnsupportedAlgorithm)
+		}
 	}
 
 	/// Create a CMS client handshake orchestrator using the encapsulated key.
@@ -405,16 +408,27 @@ impl ServerKeyManager {
 		&'a self,
 		_server_cert: Arc<Certificate>,
 		validators: Option<Arc<dyn CertificateValidation>>,
-	) -> Result<CmsHandshakeClient<DefaultCryptoProvider>> {
-		let provider = DefaultCryptoProvider::default();
-		let mut client = CmsHandshakeClient::new(provider, (*self.signing_key).clone(), _server_cert);
+	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>> {
+		#[cfg(feature = "secp256k1")]
+		{
+			let provider = DefaultCryptoProvider::default();
+			let mut client = crate::transport::handshake::client::CmsHandshakeClientSecp256k1::new(
+				provider,
+				Arc::clone(&self.signing_key),
+				_server_cert,
+			);
 
-		// Apply validators if provided
-		if let Some(validator) = validators {
-			client = client.with_certificate_validator(validator);
+			// Apply validators if provided
+			if let Some(validator) = validators {
+				client = client.with_certificate_validator(validator);
+			}
+
+			Ok(Box::new(client))
 		}
-
-		Ok(client)
+		#[cfg(not(feature = "secp256k1"))]
+		{
+			Err(HandshakeError::UnsupportedAlgorithm)
+		}
 	}
 
 	/// Create a CMS server handshake orchestrator using the encapsulated key.
@@ -431,69 +445,19 @@ impl ServerKeyManager {
 	pub fn create_cms_server<'a>(
 		&'a self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<DefaultCmsServer> {
-		let server = DefaultCmsServer::new((*self.signing_key).clone(), client_validators);
-		Ok(server)
-	}
-}
-
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
-impl ServerHandshakeKey for Secp256k1SigningKey {
-	fn create_ecies_server(
-		&self,
-		server_cert: Arc<Certificate>,
-		aad_domain_tag: Option<&'static [u8]>,
-		supported_profiles: Vec<SecurityProfileDesc>,
-		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>> {
-		let server = DefaultEciesServer::new(Arc::new(self.clone()), server_cert, aad_domain_tag, client_validators)
-			.with_supported_profiles(supported_profiles);
-
-		Ok(Box::new(server))
-	}
-
-	fn create_ecies_client(
-		&self,
-		_server_cert: Option<Arc<Certificate>>,
-		client_cert: Option<Arc<Certificate>>,
-		aad_domain_tag: Option<&'static [u8]>,
-		validator: Option<Arc<dyn CertificateValidation>>,
-	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send>> {
-		let signing_key = client_cert.as_ref().map(|_| Arc::new(self.clone()));
-		let client = DefaultEciesClient::new_with_identity(aad_domain_tag, client_cert.clone(), signing_key);
-
-		let client = if let Some(val) = validator {
-			client.with_certificate_validator(val)
-		} else {
-			client
-		};
-
-		Ok(Box::new(client))
-	}
-
-	#[cfg(feature = "transport-cms")]
-	fn create_cms_client(
-		&self,
-		server_cert: Arc<Certificate>,
-		validators: Option<Arc<dyn CertificateValidation>>,
-	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send>> {
-		let provider = DefaultCryptoProvider::default();
-		let mut client = CmsHandshakeClient::new(provider, self.clone(), server_cert);
-
-		if let Some(validator) = validators {
-			client = client.with_certificate_validator(validator);
+	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + 'static>> {
+		#[cfg(feature = "secp256k1")]
+		{
+			let server = crate::transport::handshake::server::CmsHandshakeServerSecp256k1::new(
+				Arc::clone(&self.signing_key),
+				client_validators,
+			);
+			Ok(Box::new(server))
 		}
-
-		Ok(Box::new(client))
-	}
-
-	#[cfg(feature = "transport-cms")]
-	fn create_cms_server(
-		&self,
-		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>> {
-		let server = DefaultCmsServer::new(self.clone(), client_validators);
-		Ok(Box::new(server))
+		#[cfg(not(feature = "secp256k1"))]
+		{
+			Err(HandshakeError::UnsupportedAlgorithm)
+		}
 	}
 }
 
@@ -718,7 +682,8 @@ pub struct ClientKeyExchange {
 fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 	let message_der = message.to_der()?;
 	let octet_string = OctetString::new(message_der)?;
-	let econtent = crate::der::Any::from_der(&octet_string.to_der()?)?;
+	// Create der::Any directly from the OctetString's DER encoding
+	let econtent = crate::der::Any::new(crate::der::Tag::OctetString, octet_string.to_der()?)?;
 
 	Ok(SignedData {
 		version: CmsVersion::V1,
@@ -738,8 +703,9 @@ fn signed_data_to_decodable<T: for<'a> Decode<'a>>(signed_data: &SignedData) -> 
 		.as_ref()
 		.ok_or(HandshakeError::InvalidServerKeyExchange)?;
 
-	// econtent_any is the full DER encoding of an OCTET STRING
-	let octet_string = OctetString::from_der(econtent_any.to_der()?.as_ref())?;
+	// econtent_any.value() gives us the raw DER bytes of the OctetString
+	let octet_string_der = econtent_any.value();
+	let octet_string = OctetString::from_der(octet_string_der)?;
 	Ok(T::from_der(octet_string.as_bytes())?)
 }
 

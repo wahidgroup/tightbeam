@@ -15,7 +15,7 @@ use crate::crypto::aead::RuntimeAead;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::prelude::TightBeamSocketAddr;
 use crate::transport::handshake::{
-	HandshakeError, HandshakeProtocolKind, ServerHandshakeKey, ServerHandshakeProtocol, TcpHandshakeState,
+	HandshakeError, HandshakeProtocolKind, ServerHandshakeProtocol, ServerKeyManager, TcpHandshakeState,
 };
 use crate::transport::tcp::TcpListenerTrait;
 use crate::transport::{EncryptedMessageIO, EncryptedProtocol, Protocol, TransportEncryptionConfig};
@@ -55,7 +55,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 	max_encrypted_envelope: Option<usize>,
 
 	#[allow(dead_code)]
-	signatory: Option<Arc<dyn ServerHandshakeKey>>,
+	signatory: Option<ServerKeyManager>,
 
 	handshake_state: TcpHandshakeState,
 
@@ -464,7 +464,7 @@ pub struct TcpListener<L: TcpListenerTrait> {
 	aad_domain_tag: Option<&'static [u8]>,
 	max_cleartext_envelope: Option<usize>,
 	max_encrypted_envelope: Option<usize>,
-	signatory: Option<Arc<dyn crate::transport::handshake::ServerHandshakeKey>>,
+	signatory: Option<ServerKeyManager>,
 	handshake_timeout: Option<Duration>,
 }
 

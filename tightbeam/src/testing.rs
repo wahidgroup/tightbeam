@@ -764,10 +764,10 @@ macro_rules! test_container {
 
 			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
 				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let key_manager = $crate::transport::handshake::ServerKeyManager::new(signing_key.clone());
 			let config = $crate::transport::TransportEncryptionConfig::new(
 				cert.clone().unwrap(),
-				std::sync::Arc::new(signing_key.clone())
-					as std::sync::Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
+				key_manager,
 			);
 			let (listener, addr) = <$protocol as $crate::transport::EncryptedProtocol>::bind_with(bind_addr, config).await
 				.map_err(|e| $crate::TightBeamError::from(e))?;
@@ -796,10 +796,10 @@ macro_rules! test_container {
 
 			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
 				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let key_manager = $crate::transport::handshake::ServerKeyManager::new(signing_key);
 			let config = $crate::transport::TransportEncryptionConfig::new(
 				cert.clone().unwrap(),
-				std::sync::Arc::new(signing_key)
-					as std::sync::Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
+				key_manager,
 			);
 			let (listener, addr) = <$protocol as $crate::transport::EncryptedProtocol>::bind_with(bind_addr, config).await
 				.map_err(|e| $crate::TightBeamError::from(e))?;

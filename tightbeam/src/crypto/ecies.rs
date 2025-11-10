@@ -403,16 +403,18 @@ where
 				None => Payload { msg: plaintext, aad: b"" },
 			};
 
-			// Encrypt (produces ciphertext || tag)
-			let mut ciphertext = cipher.encrypt(&nonce, payload).map_err(EciesError::EncryptionFailed)?;
-
-			// Prepend nonce to ciphertext (for transmission)
-			let mut final_ciphertext = Vec::with_capacity(12 + ciphertext.len());
+			// Encrypt and prepend nonce in a single allocation
+			let ciphertext = cipher.encrypt(&nonce, payload).map_err(EciesError::EncryptionFailed)?;
+			let encrypted_len = ciphertext.len();
+			let mut final_ciphertext = Vec::with_capacity(12 + encrypted_len);
 			final_ciphertext.extend_from_slice(&nonce_bytes);
-			final_ciphertext.append(&mut ciphertext);
+			final_ciphertext.extend_from_slice(&ciphertext);
 
-			// Construct message from concatenated bytes
-			let wire_bytes = [ephemeral_bytes.as_slice(), final_ciphertext.as_slice()].concat();
+			// Construct message from concatenated bytes (avoid extra allocation)
+			let total_len = ephemeral_bytes.len() + final_ciphertext.len();
+			let mut wire_bytes = Vec::with_capacity(total_len);
+			wire_bytes.extend_from_slice(&ephemeral_bytes);
+			wire_bytes.extend_from_slice(&final_ciphertext);
 			M::from_bytes(&wire_bytes)
 		}};
 	}

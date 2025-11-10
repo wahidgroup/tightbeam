@@ -40,8 +40,8 @@ use crate::transport::handshake::processors::kari::TightBeamKariRecipient;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
+use crate::transport::handshake::ServerHandshakeProtocol;
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
-use crate::transport::handshake::{ServerHandshakeKey, ServerHandshakeProtocol};
 use crate::x509::attr::Attributes;
 use crate::x509::Certificate;
 
@@ -63,7 +63,7 @@ where
 	K: Clone,
 {
 	state: ServerStateMachine,
-	server_signing_key: K,
+	server_signing_key: Arc<K>,
 	client_cert: Option<Arc<Certificate>>,
 	validated_client_cert: Option<Arc<Certificate>>,
 	transcript_hash: Option<[u8; 32]>,
@@ -86,7 +86,7 @@ where
 	P::Signature: 'static,
 	P::Digest: 'static,
 	P::AeadCipher: KeyInit + 'static,
-	K: Clone + Into<SecretKey<P::Curve>> + Signer<P::Signature> + Keypair + ServerHandshakeKey + 'static,
+	K: Clone + Into<SecretKey<P::Curve>> + Signer<P::Signature> + Keypair + Send + Sync + 'static,
 	K::VerifyingKey: EncodePublicKey,
 {
 	/// Create a new CMS handshake server.
@@ -94,7 +94,10 @@ where
 	/// # Parameters
 	/// - `server_signing_key`: The server's signing key (concrete type)
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
-	pub fn new(server_signing_key: K, client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>) -> Self {
+	pub fn new(
+		server_signing_key: Arc<K>,
+		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	) -> Self {
 		Self {
 			state: ServerStateMachine::default(),
 			server_signing_key,
@@ -306,7 +309,7 @@ where
 		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 
 		// Extract secret key from signing key
-		let secret_key = self.server_signing_key.clone().into();
+		let secret_key = (*self.server_signing_key).clone().into();
 
 		let recipient_processor = TightBeamKariRecipient::new(P::default(), secret_key);
 
@@ -378,7 +381,7 @@ where
 		// 4. Build SignedData using TightBeamSignedDataBuilder
 		let content = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
 		let builder = crate::transport::handshake::builders::TightBeamSignedDataBuilder::<P, _>::new(
-			self.server_signing_key.clone(),
+			&*self.server_signing_key,
 			digest_alg,
 			signature_alg,
 		)?;
@@ -501,7 +504,7 @@ where
 	P::Signature: 'static,
 	P::Digest: 'static,
 	P::AeadCipher: Send + Sync + KeyInit + 'static,
-	K: Clone + Into<SecretKey<P::Curve>> + Signer<P::Signature> + Keypair + ServerHandshakeKey + Send + 'static,
+	K: Clone + Into<SecretKey<P::Curve>> + Signer<P::Signature> + Keypair + Send + Sync + 'static,
 	K::VerifyingKey: EncodePublicKey,
 {
 	type Error = HandshakeError;
@@ -563,7 +566,7 @@ where
 	}
 
 	fn is_complete(&self) -> bool {
-		self.is_complete()
+		self.state.state().is_completed()
 	}
 
 	#[cfg(feature = "x509")]
@@ -740,7 +743,8 @@ mod tests {
 				.with_key_enc_alg(key_enc_alg);
 
 			let enveloped_builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			Ok(enveloped_builder.build_der(session_key, None)?)
+			let enveloped_data = enveloped_builder.build(session_key, None)?;
+			Ok(enveloped_data.to_der()?)
 		}
 
 		/// Build a test ClientFinished (SignedData) message.
@@ -752,11 +756,9 @@ mod tests {
 			let signature_alg =
 				AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
 
-			let builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(
-				signing_key.clone(),
-				digest_alg,
-				signature_alg,
-			)?;
+			let builder =
+				TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(signing_key, digest_alg, signature_alg)?;
+
 			let signed_data = builder.build(transcript_hash)?;
 			Ok(signed_data.to_der()?)
 		}

@@ -226,16 +226,21 @@ impl KdfProvider for X963Sha3_256 {
 		_salt: Option<&[u8]>,
 	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
 		// Derive two independent keys via distinct SharedInfo labels
-		let mut enc_info = Vec::with_capacity(info.len() + 11);
-		enc_info.extend_from_slice(info);
-		enc_info.extend_from_slice(b"-encryption");
+		// Use stack-allocated arrays where possible to avoid heap allocation
+		let mut enc_info = [0u8; 256]; // Reasonable max size for info + suffix
+		let mut mac_info = [0u8; 256];
 
-		let mut mac_info = Vec::with_capacity(info.len() + 4);
-		mac_info.extend_from_slice(info);
-		mac_info.extend_from_slice(b"-mac");
+		let enc_info_len = core::cmp::min(enc_info.len(), info.len() + 11);
+		let mac_info_len = core::cmp::min(mac_info.len(), info.len() + 4);
 
-		let k_enc = Self::derive_key::<N>(ikm, &enc_info, None)?;
-		let k_mac = Self::derive_key::<N>(ikm, &mac_info, None)?;
+		enc_info[..info.len()].copy_from_slice(info);
+		enc_info[info.len()..info.len() + 11].copy_from_slice(b"-encryption");
+
+		mac_info[..info.len()].copy_from_slice(info);
+		mac_info[info.len()..info.len() + 4].copy_from_slice(b"-mac");
+
+		let k_enc = Self::derive_key::<N>(ikm, &enc_info[..enc_info_len], None)?;
+		let k_mac = Self::derive_key::<N>(ikm, &mac_info[..mac_info_len], None)?;
 		Ok((k_enc, k_mac))
 	}
 }

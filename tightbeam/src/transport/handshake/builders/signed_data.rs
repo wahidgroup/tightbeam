@@ -24,12 +24,12 @@ use crate::transport::handshake::error::HandshakeError;
 /// The builder is generic over:
 /// - `P: CryptoProvider` - defines the cryptographic suite (signature and digest algorithms)
 /// - `K` - concrete signing key type
-pub struct TightBeamSignedDataBuilder<P, K>
+pub struct TightBeamSignedDataBuilder<'a, P, K>
 where
 	P: CryptoProvider,
 {
 	/// Signer implementing signature creation (concrete type, no boxing)
-	signer: K,
+	signer: &'a K,
 	/// Digest algorithm for hashing content
 	digest_alg: AlgorithmIdentifierOwned,
 	/// Signature algorithm identifier
@@ -41,7 +41,7 @@ where
 	_phantom: core::marker::PhantomData<P>,
 }
 
-impl<P, K> TightBeamSignedDataBuilder<P, K>
+impl<'a, P, K> TightBeamSignedDataBuilder<'a, P, K>
 where
 	P: CryptoProvider,
 	P::Signature: SignatureEncoding,
@@ -59,7 +59,7 @@ where
 	/// # Returns
 	/// A new builder instance
 	pub fn new(
-		signer: K,
+		signer: &'a K,
 		digest_alg: AlgorithmIdentifierOwned,
 		signature_alg: AlgorithmIdentifierOwned,
 	) -> Result<Self, HandshakeError> {
@@ -159,9 +159,9 @@ mod tests {
 	}
 
 	/// Helper function to create a test SignedData builder
-	fn create_test_signed_data_builder(
-	) -> Result<TightBeamSignedDataBuilder<DefaultCryptoProvider, Secp256k1SigningKey>, HandshakeError> {
-		let signing_key = create_test_signing_key();
+	fn create_test_signed_data_builder<'a>(
+		signing_key: &'a Secp256k1SigningKey,
+	) -> Result<TightBeamSignedDataBuilder<'a, DefaultCryptoProvider, Secp256k1SigningKey>, HandshakeError> {
 		let digest_alg = create_sha3_256_digest_alg();
 		let signature_alg = create_ecdsa_sha256_signature_alg();
 
@@ -170,8 +170,11 @@ mod tests {
 
 	#[test]
 	fn test_build_signed_data() -> Result<(), Box<dyn std::error::Error>> {
-		// 1. Create test builder
-		let builder = create_test_signed_data_builder()?;
+		// 1. Create test signing key
+		let signing_key = create_test_signing_key();
+
+		// 2. Create test builder
+		let builder = create_test_signed_data_builder(&signing_key)?;
 
 		// 2. Content to sign (e.g., transcript hash)
 		let transcript_hash = b"handshake_transcript_hash_placeholder_32bytes";
@@ -201,8 +204,11 @@ mod tests {
 
 	#[test]
 	fn test_der_encoding() -> Result<(), Box<dyn std::error::Error>> {
-		// 1. Create test builder
-		let builder = create_test_signed_data_builder()?;
+		// 1. Create test signing key
+		let signing_key = create_test_signing_key();
+
+		// 2. Create test builder
+		let builder = create_test_signed_data_builder(&signing_key)?;
 
 		// 2. Content to sign
 		let content = b"test_content";
@@ -222,8 +228,11 @@ mod tests {
 
 	#[test]
 	fn test_custom_content_type() -> Result<(), Box<dyn std::error::Error>> {
-		// 1. Create test builder
-		let builder = create_test_signed_data_builder()?;
+		// 1. Create test signing key
+		let signing_key = create_test_signing_key();
+
+		// 2. Create test builder
+		let builder = create_test_signed_data_builder(&signing_key)?;
 
 		// 2. Content to sign
 		let content = b"custom_content";

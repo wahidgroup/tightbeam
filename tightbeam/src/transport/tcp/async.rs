@@ -12,7 +12,7 @@ use crate::crypto::aead::RuntimeAead;
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
 use crate::transport::handshake::{
-	HandshakeError, HandshakeProtocolKind, ServerHandshakeKey, ServerHandshakeProtocol, TcpHandshakeState,
+	HandshakeError, HandshakeProtocolKind, ServerHandshakeProtocol, ServerKeyManager, TcpHandshakeState,
 };
 #[cfg(feature = "x509")]
 use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
@@ -64,7 +64,7 @@ pub struct TokioListener {
 	#[cfg(feature = "x509")]
 	handshake_timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
-	signatory: Option<Arc<dyn ServerHandshakeKey>>,
+	signatory: Option<ServerKeyManager>,
 }
 
 impl TokioListener {
@@ -131,7 +131,7 @@ impl TokioListener {
 
 		#[cfg(feature = "x509")]
 		if let Some(signatory) = &self.signatory {
-			transport.signatory = Some(Arc::clone(signatory));
+			transport.signatory = Some(signatory.clone());
 		}
 
 		Ok((transport, addr))
@@ -210,7 +210,7 @@ impl EncryptedProtocol for TokioListener {
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 				handshake_timeout: Some(config.handshake_timeout),
-				signatory: Some(Arc::clone(&config.signatory)),
+				signatory: Some(config.signatory),
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
@@ -268,7 +268,7 @@ impl AsyncListenerTrait for TokioListener {
 
 		#[cfg(feature = "x509")]
 		if let Some(ref signatory) = self.signatory {
-			transport.signatory = Some(Arc::clone(signatory));
+			transport.signatory = Some(signatory.clone());
 		}
 
 		#[cfg(feature = "x509")]
@@ -309,7 +309,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	signatory: Option<Arc<dyn ServerHandshakeKey>>,
+	signatory: Option<ServerKeyManager>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
@@ -341,7 +341,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	signatory: Option<Arc<dyn ServerHandshakeKey>>,
+	signatory: Option<ServerKeyManager>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
@@ -915,8 +915,7 @@ mod tests {
 		let addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
 		let config = crate::transport::TransportEncryptionConfig::new(
 			cert.clone(),
-			std::sync::Arc::new(signing_key.clone())
-				as std::sync::Arc<dyn crate::transport::handshake::ServerHandshakeKey>,
+			crate::transport::handshake::ServerKeyManager::new(signing_key.clone()),
 		);
 		let (listener, socket_addr) = TokioListener::bind_with(addr, config).await?;
 		let server = listener;

@@ -15,7 +15,6 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::der::asn1::{Any, SetOfVec};
-use crate::der::Encode;
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::utils::generate_cek;
@@ -175,12 +174,6 @@ where
 		})
 	}
 
-	/// Build and encode the EnvelopedData as DER bytes.
-	pub fn build_der(self, plaintext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>, HandshakeError> {
-		let enveloped_data = self.build(plaintext, aad)?;
-		Ok(enveloped_data.to_der()?)
-	}
-
 	/// Build and wrap in ContentInfo structure.
 	pub fn build_content_info(self, plaintext: &[u8], aad: Option<&[u8]>) -> Result<ContentInfo, HandshakeError> {
 		let enveloped_data = self.build(plaintext, aad)?;
@@ -209,7 +202,7 @@ mod tests {
 
 	mod enveloped_data {
 		use super::*;
-		use crate::der::Decode;
+		use crate::der::{Decode, Encode};
 		use crate::transport::handshake::attributes::{encode_client_nonce, encode_server_nonce};
 		use crate::transport::handshake::tests::{
 			create_test_key_enc_alg, create_test_keypair, create_test_recipient_id, create_test_ukm,
@@ -289,7 +282,8 @@ mod tests {
 			// 2. Build and encode
 			let plaintext = b"DER encoding test";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let der_bytes = builder.build_der(plaintext, None).unwrap();
+			let built = builder.build(plaintext, None).unwrap();
+			let der_bytes = built.to_der().unwrap();
 
 			// 3. Verify we can decode it back
 			let decoded = EnvelopedData::from_der(&der_bytes).unwrap();

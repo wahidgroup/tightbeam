@@ -14,8 +14,8 @@ use crate::crypto::negotiation::SecurityOffer;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
-use crate::crypto::sign::{EcdsaSignatureVerifier, Keypair, SignatureAlgorithmIdentifier, Verifier};
+use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
+use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
@@ -47,9 +47,10 @@ use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHa
 pub struct CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
+	P::SigningKey: Send + Sync,
 {
 	state: ClientStateMachine,
-	client_key: P::SigningKey,
+	client_key: Arc<P::SigningKey>,
 	client_certificate: Option<Arc<Certificate>>,
 	server_cert: Arc<Certificate>,
 	transcript_hash: Option<[u8; 32]>,
@@ -69,7 +70,7 @@ where
 	<P::Curve as elliptic_curve::Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
-	P::SigningKey: Clone + signature::Keypair + 'static,
+	P::SigningKey: Clone + signature::Keypair + Send + Sync + 'static,
 	<P::SigningKey as signature::Keypair>::VerifyingKey: EncodePublicKey,
 	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
 	P::Signature: 'static,
@@ -87,7 +88,7 @@ where
 	/// The transcript hash is computed internally from handshake messages.
 	/// If you need to provide an external transcript hash (for testing),
 	/// use `with_transcript_hash()` after construction.
-	pub fn new(provider: P, client_key: P::SigningKey, server_cert: Arc<Certificate>) -> Self {
+	pub fn new(provider: P, client_key: Arc<P::SigningKey>, server_cert: Arc<Certificate>) -> Self {
 		Self {
 			state: ClientStateMachine::default(),
 			client_key,
@@ -304,7 +305,8 @@ where
 		}
 
 		// 9. Build and encode
-		let enveloped_data_der = enveloped_builder.build_der(&session_key, None)?;
+		let enveloped_data = enveloped_builder.build(&session_key, None)?;
+		let enveloped_data_der = enveloped_data.to_der()?;
 
 		// 10. Add to transcript if we're computing it internally
 		if self.transcript_hash.is_none() {
@@ -367,7 +369,7 @@ where
 		let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 		// 4. Build SignedData
-		let builder = TightBeamSignedDataBuilder::<P, _>::new(self.client_key.clone(), digest_alg, signature_alg)?;
+		let builder = TightBeamSignedDataBuilder::<P, _>::new(&*self.client_key, digest_alg, signature_alg)?;
 		let signed_data = builder.build(&transcript_hash)?;
 		let signed_data_der = signed_data.to_der()?;
 
@@ -414,13 +416,19 @@ where
 impl<P> HandshakeFinalization<P> for CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
+	P::SigningKey: Send + Sync,
 {
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
 
-impl<P> HandshakeAlertHandler for CmsHandshakeClient<P> where P: CryptoProvider {}
+impl<P> HandshakeAlertHandler for CmsHandshakeClient<P>
+where
+	P: CryptoProvider,
+	P::SigningKey: Send + Sync,
+{
+}
 
 // ============================================================================
 // ClientHandshakeProtocol Implementation
@@ -429,13 +437,13 @@ impl<P> HandshakeAlertHandler for CmsHandshakeClient<P> where P: CryptoProvider 
 impl<P> ClientHandshakeProtocol for CmsHandshakeClient<P>
 where
 	P: CryptoProvider + Send + Sync + 'static,
-	P::Curve: Curve + CurveArithmetic + Send + Sync,
-	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+	P::Curve: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
+	<P::Curve as elliptic_curve::Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
-	P::SigningKey: Send + Clone + Keypair + 'static,
-	<P::SigningKey as Keypair>::VerifyingKey: EncodePublicKey,
-	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
+	P::SigningKey: Clone + signature::Keypair + Send + Sync + 'static,
+	<P::SigningKey as signature::Keypair>::VerifyingKey: EncodePublicKey,
+	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
 	P::Signature: 'static,
 	P::Digest: 'static,
 	P::AeadCipher: Send + Sync + KeyInit,
@@ -551,7 +559,7 @@ mod tests {
 		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256_OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
 		let server_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(
-			server_test_cert.signing_key,
+			&server_test_cert.signing_key,
 			digest_alg,
 			signature_alg,
 		)?;

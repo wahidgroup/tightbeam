@@ -303,7 +303,7 @@ macro_rules! impl_tcp_common {
 			pub fn with_client_identity(
 				mut self,
 				cert: $crate::x509::Certificate,
-				key: Arc<dyn $crate::transport::handshake::ServerHandshakeKey>,
+				key: $crate::transport::handshake::ServerKeyManager,
 			) -> Self {
 				self.client_certificate = Some(Arc::new(cert));
 				self.signatory = Some(key);

@@ -34,7 +34,7 @@ use tightbeam::{
 	server,
 	spki::SubjectPublicKeyInfoOwned,
 	testing::{create_expiring_test_certificate, create_test_signing_key},
-	transport::{handshake::ServerHandshakeKey, EncryptedProtocol, TransportEncryptionConfig},
+	transport::{handshake::ServerKeyManager, EncryptedProtocol, TransportEncryptionConfig},
 	x509::Certificate,
 };
 
@@ -82,7 +82,8 @@ fn create_server_config(
 	key: Secp256k1SigningKey,
 	validators: Vec<Arc<dyn CertificateValidation>>,
 ) -> TransportEncryptionConfig {
-	TransportEncryptionConfig::new(cert, Arc::new(key) as Arc<dyn ServerHandshakeKey>)
+	let key_manager = ServerKeyManager::new(key);
+	TransportEncryptionConfig::new(cert, key_manager)
 		.with_client_validators(validators)
 }
 
@@ -230,7 +231,7 @@ async fn test_mutual_auth_with_servlet() -> Result<()> {
 
 	let mut client = client! {
 		connect TokioListener: server.addr,
-		identity: (client_cert, Arc::new(client_key) as Arc<dyn ServerHandshakeKey>),
+		identity: (client_cert, ServerKeyManager::new(client_key)),
 		policies: {
 			x509_gate: [ExpiryValidator, ServerValidator]
 		}
@@ -280,7 +281,7 @@ async fn test_unexpected_client_cert_rejected() -> Result<()> {
 		println!("Attempting to create client with unexpected certificate...");
 		let client = client! {
 			connect TokioListener: server.addr,
-			identity: (client_cert, Arc::new(client_key) as Arc<dyn ServerHandshakeKey>),
+			identity: (client_cert, ServerKeyManager::new(client_key)),
 			policies: {
 				x509_gate: [ExpiryValidator]
 			}
@@ -324,7 +325,7 @@ async fn test_client_rejects_expired_server() -> Result<()> {
 	let server = MutualAuthServer::new(server_cert, server_key, vec![]).await?;
 	let mut client = client! {
 		connect TokioListener: server.addr,
-		identity: (client_cert, Arc::new(client_key) as Arc<dyn ServerHandshakeKey>),
+		identity: (client_cert, ServerKeyManager::new(client_key)),
 		policies: {
 			x509_gate: [ExpiryValidator]
 		}

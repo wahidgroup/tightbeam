@@ -32,7 +32,7 @@ use crate::crypto::aead::{Decryptor, RuntimeAead};
 #[cfg(feature = "x509")]
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
-use crate::transport::handshake::{ServerHandshakeKey, TcpHandshakeState};
+use crate::transport::handshake::{ServerKeyManager, TcpHandshakeState};
 #[cfg(feature = "transport-policy")]
 use crate::transport::policy::RestartPolicy;
 #[cfg(feature = "x509")]
@@ -50,7 +50,7 @@ pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
 #[derive(Clone)]
 pub struct TransportEncryptionConfig {
 	pub certificate: Certificate,
-	pub signatory: Arc<dyn ServerHandshakeKey>,
+	pub signatory: ServerKeyManager,
 	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	pub aad_domain_tag: &'static [u8],
 	pub max_cleartext_envelope: usize,
@@ -60,7 +60,7 @@ pub struct TransportEncryptionConfig {
 
 #[cfg(all(feature = "x509", feature = "std"))]
 impl TransportEncryptionConfig {
-	pub fn new(certificate: Certificate, signatory: Arc<dyn ServerHandshakeKey>) -> Self {
+	pub fn new(certificate: Certificate, signatory: ServerKeyManager) -> Self {
 		Self {
 			certificate,
 			signatory,
