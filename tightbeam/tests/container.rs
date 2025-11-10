@@ -58,7 +58,7 @@ test_container! {
 					message: ResponseMessage {
 						result: "PONG".into()
 					}
-			}.ok().map(std::sync::Arc::new);
+			}.ok();
 
 			tightbeam::relay!(ServiceAssertChecklist::SentResponse, tx)?;
 			response

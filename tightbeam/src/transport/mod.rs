@@ -84,7 +84,7 @@ pub struct RequestPackage {
 	/// The length is critical for transport
 	#[allow(dead_code)]
 	length: Option<u64>,
-	message: std::sync::Arc<Frame>,
+	message: Frame,
 }
 
 impl PartialEq for RequestPackage {
@@ -95,7 +95,7 @@ impl PartialEq for RequestPackage {
 
 impl RequestPackage {
 	pub fn new(message: Frame) -> Self {
-		Self { length: None, message: std::sync::Arc::new(message) }
+		Self { length: None, message }
 	}
 }
 
@@ -138,7 +138,7 @@ impl<'a> DecodeValue<'a> for RequestPackage {
 			return Err(der::Error::from(der::ErrorKind::Length { tag: Tag::Integer }));
 		}
 
-		Ok(Self { length: Some(length), message: std::sync::Arc::new(message) })
+		Ok(Self { length: Some(length), message })
 	}
 }
 
@@ -276,19 +276,14 @@ impl From<ResponsePackage> for TransportEnvelope {
 
 impl From<Frame> for TransportEnvelope {
 	fn from(msg: Frame) -> Self {
-		Self::Request(RequestPackage { length: None, message: std::sync::Arc::new(msg) })
+		Self::Request(RequestPackage { length: None, message: msg })
 	}
 }
 
 impl TransportEnvelope {
 	/// Create a new request envelope from a message
 	pub fn new_request(msg: Frame) -> Self {
-		Self::Request(RequestPackage { length: None, message: std::sync::Arc::new(msg) })
-	}
-
-	/// Create a new request envelope from a shared message reference
-	pub fn new_request_ref(msg: &std::sync::Arc<Frame>) -> Self {
-		Self::Request(RequestPackage { length: None, message: std::sync::Arc::clone(msg) })
+		Self::Request(RequestPackage { length: None, message: msg })
 	}
 }
 
@@ -381,7 +376,7 @@ pub trait MessageIO: ResponseHandler {
 	}
 
 	/// Send a response back to the sender
-	fn handle_message(&self, message: Arc<Frame>) -> Option<Arc<Frame>> {
+	fn handle_message(&self, message: Frame) -> Option<Frame> {
 		// If a handler is set, use it to generate the response
 		self.handler().and_then(|handler| handler(message))
 	}
@@ -538,8 +533,8 @@ pub trait MessageEmitter: MessageIO {
 
 	/// Send a TightBeam message
 	#[allow(async_fn_in_trait)]
-	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Arc<Frame>>> {
-		let mut current_message = Arc::new(message);
+	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
+		let mut current_message = message;
 		let mut current_attempt = attempt.unwrap_or(0);
 
 		loop {
@@ -551,7 +546,7 @@ pub trait MessageEmitter: MessageIO {
 			}
 
 			// Wrap in envelope and send
-			let envelope = TransportEnvelope::new_request_ref(&current_message);
+			let envelope = TransportEnvelope::new_request(current_message.clone());
 
 			// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
 			#[cfg(feature = "x509")]
@@ -585,7 +580,7 @@ pub trait MessageEmitter: MessageIO {
 			let response_envelope = Self::decode_envelope(&response_bytes)?;
 
 			let (status, response) = match response_envelope {
-				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message.map(Arc::new)),
+				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
 				TransportEnvelope::Request(_) => {
 					// Only responses are valid here
 					return Err(TransportError::InvalidMessage);
@@ -623,7 +618,7 @@ pub trait MessageEmitter: MessageIO {
 						if current_attempt == usize::MAX {
 							return Err(TransportError::MaxRetriesExceeded);
 						} else {
-							current_message = std::sync::Arc::new(retry_message);
+							current_message = retry_message;
 							current_attempt += 1;
 							continue;
 						}
@@ -652,7 +647,7 @@ pub trait MessageCollector: MessageIO {
 	/// Read and validate a message without sending a response
 	/// Returns the message and the gate evaluation status
 	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
+	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)> {
 		// Read and decode the envelope (can be overridden for encryption)
 		let decoded_envelope = self.read_decoded_envelope().await?;
 		let request = match decoded_envelope {
@@ -680,8 +675,8 @@ pub trait MessageCollector: MessageIO {
 
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
-	async fn send_response(&mut self, status: TransitStatus, message: Option<Arc<Frame>>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message: message.map(|arc| (*arc).clone()), length: None };
+	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
+		let response_pkg = ResponsePackage { status, message, length: None };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
@@ -732,7 +727,7 @@ pub trait MessageCollector: MessageIO {
 	/// Read and validate a message without sending a response
 	/// Returns the message (status is always Accepted without policies)
 	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
+	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)> {
 		// Read the envelope
 		let request_envelope = self.read_envelope().await?;
 		// Extract message from request
@@ -748,8 +743,8 @@ pub trait MessageCollector: MessageIO {
 
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
-	async fn send_response(&mut self, status: TransitStatus, message: Option<Arc<Frame>>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message: message.map(|arc| (*arc).clone()), length: None };
+	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
+		let response_pkg = ResponsePackage { status, message, length: None };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
@@ -812,10 +807,10 @@ pub trait ResponseHandler {
 	/// Set a handler that processes incoming messages and generates responses
 	fn with_handler<F>(self, handler: F) -> Self
 	where
-		F: Fn(std::sync::Arc<Frame>) -> Option<std::sync::Arc<Frame>> + Send + 'static;
+		F: Fn(Frame) -> Option<Frame> + Send + 'static;
 
 	/// Get the current handler if one is set
-	fn handler(&self) -> Option<&(dyn Fn(std::sync::Arc<Frame>) -> Option<std::sync::Arc<Frame>> + Send)>;
+	fn handler(&self) -> Option<&(dyn Fn(Frame) -> Option<Frame> + Send)>;
 }
 
 #[cfg(test)]

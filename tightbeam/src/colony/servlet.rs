@@ -975,14 +975,14 @@ mod tests {
 			let decoded: RequestMessage = crate::decode(&message.message).ok()?;
 			let is_winner = decoded.lucky_number == config.lotto_number;
 			if decoded.content == "PING" {
-				 Some(std::sync::Arc::new(crate::compose! {
+				 Some(crate::compose! {
 					V0: id: message.metadata.id.clone(),
 						order: 1_700_000_000u64,
 						message: ResponseMessage {
 							result: "PONG".to_string(),
 							is_winner,
 						}
-				 }.ok()?))
+				 }.ok()?)
 			 } else {
 				 None
 			}
@@ -1116,7 +1116,7 @@ mod tests {
 							result: reply.result,
 							is_winner,
 						}
-				}.ok().map(std::sync::Arc::new)
+				}.ok()
 			}
 		}
 

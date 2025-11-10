@@ -52,12 +52,7 @@ pub trait RestartPolicy: Send + Sync {
 	///
 	/// # Returns
 	/// * `RetryAction` - What action to take for retry
-	fn evaluate(
-		&self,
-		message: &std::sync::Arc<Frame>,
-		result: &TransportResult<&std::sync::Arc<Frame>>,
-		attempt: usize,
-	) -> RetryAction;
+	fn evaluate(&self, message: &Frame, result: &TransportResult<&Frame>, attempt: usize) -> RetryAction;
 }
 
 /// Action to take when evaluating retry policy
@@ -106,12 +101,7 @@ impl JitterStrategy for DecorrelatedJitter {
 pub struct NoRestart;
 
 impl RestartPolicy for NoRestart {
-	fn evaluate(
-		&self,
-		_message: &std::sync::Arc<Frame>,
-		_: &TransportResult<&std::sync::Arc<Frame>>,
-		_: usize,
-	) -> RetryAction {
+	fn evaluate(&self, _message: &Frame, _: &TransportResult<&Frame>, _: usize) -> RetryAction {
 		RetryAction::NoRetry
 	}
 }
@@ -195,12 +185,7 @@ impl Default for RestartLinearBackoff {
 macro_rules! impl_timed_backoff_policy {
 	($policy:ident, $delay_calc:expr) => {
 		impl RestartPolicy for $policy {
-			fn evaluate(
-				&self,
-				_message: &std::sync::Arc<Frame>,
-				_result: &TransportResult<&std::sync::Arc<Frame>>,
-				attempt: usize,
-			) -> RetryAction {
+			fn evaluate(&self, _message: &Frame, _result: &TransportResult<&Frame>, attempt: usize) -> RetryAction {
 				if attempt >= self.max_attempts {
 					return RetryAction::NoRetry;
 				}

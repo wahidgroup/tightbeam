@@ -265,8 +265,8 @@ pub mod builder {
 	impl crate::transport::policy::RestartPolicy for DynRestart {
 		fn evaluate(
 			&self,
-			message: &std::sync::Arc<crate::Frame>,
-			result: &crate::transport::TransportResult<&std::sync::Arc<crate::Frame>>,
+			message: &crate::Frame,
+			result: &crate::transport::TransportResult<&crate::Frame>,
 			attempt: usize,
 		) -> crate::transport::policy::RetryAction {
 			self.0.evaluate(message, result, attempt)
@@ -275,7 +275,7 @@ pub mod builder {
 
 	pub struct DynGate(pub std::sync::Arc<dyn crate::policy::GatePolicy + Send + Sync>);
 	impl crate::policy::GatePolicy for DynGate {
-		fn evaluate(&self, message: &std::sync::Arc<crate::Frame>) -> crate::policy::TransitStatus {
+		fn evaluate(&self, message: &crate::Frame) -> crate::policy::TransitStatus {
 			self.0.evaluate(message)
 		}
 	}
@@ -433,7 +433,7 @@ pub mod builder {
 			self.transport
 		}
 		#[allow(async_fn_in_trait)]
-		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Arc<Frame>>>
+		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>>
 		where
 			P::Transport: crate::transport::MessageEmitter,
 		{
@@ -451,7 +451,7 @@ pub mod builder {
 		}
 	}
 	impl crate::policy::GatePolicy for Arc<dyn crate::policy::GatePolicy + Send + Sync> {
-		fn evaluate(&self, message: &Arc<crate::Frame>) -> crate::policy::TransitStatus {
+		fn evaluate(&self, message: &crate::Frame) -> crate::policy::TransitStatus {
 			(**self).evaluate(message)
 		}
 	}

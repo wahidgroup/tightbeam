@@ -930,11 +930,11 @@ macro_rules! test_container {
 							let reject_tx_for_gate = $reject_tx.clone();
 							$crate::policy::GateMiddleware::new(
 								$gate,
-								move |message: &Arc<$crate::Frame>, status: &$crate::policy::TransitStatus| {
+								move |message: &$crate::Frame, status: &$crate::policy::TransitStatus| {
 									if *status == $crate::policy::TransitStatus::Accepted {
-										let _ = ok_tx_for_gate.send(message.clone());
+										let _ = ok_tx_for_gate.send(::std::sync::Arc::new(message.clone()));
 									} else {
-										let _ = reject_tx_for_gate.send(message.clone());
+										let _ = reject_tx_for_gate.send(::std::sync::Arc::new(message.clone()));
 									}
 								}
 							)
@@ -1456,7 +1456,7 @@ mod tests {
 	pub struct IdPatternGate;
 
 	impl GatePolicy for IdPatternGate {
-		fn evaluate(&self, msg: &std::sync::Arc<crate::Frame>) -> TransitStatus {
+		fn evaluate(&self, msg: &Frame) -> TransitStatus {
 			let id = &msg.metadata.id;
 			if id.strip_prefix(b"accept-").is_some() {
 				TransitStatus::Accepted
@@ -1479,7 +1479,7 @@ mod tests {
 	pub struct IllegalEgressGate;
 
 	impl GatePolicy for IllegalEgressGate {
-		fn evaluate(&self, msg: &std::sync::Arc<crate::Frame>) -> TransitStatus {
+		fn evaluate(&self, msg: &Frame) -> TransitStatus {
 			if msg.metadata.id.starts_with(b"illegal-") {
 				TransitStatus::Forbidden
 			} else {
@@ -1532,8 +1532,8 @@ mod tests {
 			with_restart: [RestartLinearBackoff::new(3, 1, 1, None)],
 		},
 		service: |message, tx| async move {
-			let _ = tx.send(message.clone());
-			Some(std::sync::Arc::new(create_v0_tightbeam(Some("OK"), Some(str::from_utf8(&message.metadata.id).ok()?))))
+			let _ = tx.send(::std::sync::Arc::new(message.clone()));
+			Some(create_v0_tightbeam(Some("OK"), Some(str::from_utf8(&message.metadata.id).ok()?)))
 		},
 		container: |client, channels| async move {
 			use crate::transport::MessageEmitter;

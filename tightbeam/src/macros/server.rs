@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use crate::Frame;
 
-pub type HandlerFuture = Pin<Box<dyn Future<Output = Option<std::sync::Arc<Frame>>> + Send>>;
+pub type HandlerFuture = Pin<Box<dyn Future<Output = Option<Frame>> + Send>>;
 pub type SharedHandler = Arc<dyn Fn(Frame) -> HandlerFuture + Send + Sync>;
 
 pub fn into_shared_handler<F, Fut>(handler: F) -> SharedHandler
 where
 	F: Fn(Frame) -> Fut + Send + Sync + 'static,
-	Fut: Future<Output = Option<std::sync::Arc<Frame>>> + Send + 'static,
+	Fut: Future<Output = Option<Frame>> + Send + 'static,
 {
 	Arc::new(move |frame: Frame| -> HandlerFuture { Box::pin(handler(frame)) })
 }
@@ -361,7 +361,7 @@ macro_rules! server {
 
 							// Process message asynchronously
 							let response = if status == $crate::policy::TransitStatus::Accepted {
-								$crate::macros::server::server_runtime::rt::block_on((__handler_clone)((*frame).clone()))
+								$crate::macros::server::server_runtime::rt::block_on((__handler_clone)(frame))
 							} else {
 								None
 							};
@@ -414,7 +414,7 @@ macro_rules! server {
 
 							// Process message asynchronously
 							let response = if status == $crate::policy::TransitStatus::Accepted {
-								(__handler_clone)((*frame).clone()).await
+								(__handler_clone)(frame).await
 							} else {
 								None
 							};

@@ -120,7 +120,7 @@ impl MutualAuthServer {
 					compose! {
 						V0: id: message.metadata.id.clone(),
 						message: pong
-					}.ok().map(std::sync::Arc::new)
+					}.ok()
 				}
 			}
 		};
