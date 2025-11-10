@@ -3,6 +3,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::spki::ObjectIdentifier;
 use crate::Version;
 
 #[cfg(feature = "derive")]
@@ -228,6 +229,17 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Missing compression info"))]
 	MissingCompressedData,
 
+	/// Invalid algorithm for the message profile
+	#[cfg_attr(feature = "derive", error("Invalid algorithm for message profile"))]
+	InvalidAlgorithm,
+
+	/// Unexpected algorithm for the message profile
+	#[cfg_attr(
+		feature = "derive",
+		error("Unexpected algorithm for message profile: expected {expected:?}, got {received:?}")
+	)]
+	UnexpectedAlgorithm(ExpectError<ObjectIdentifier, ObjectIdentifier>),
+
 	/// Missing or invalid configuration
 	#[cfg_attr(feature = "derive", error("Missing configuration"))]
 	MissingConfiguration,
@@ -284,6 +296,14 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingSignature => write!(f, "Missing signature"),
 			#[cfg(feature = "compress")]
 			TightBeamError::MissingCompressedData => write!(f, "Missing compression info"),
+			TightBeamError::InvalidAlgorithm => write!(f, "Invalid algorithm for message profile"),
+			TightBeamError::UnexpectedAlgorithm(err) => {
+				write!(
+					f,
+					"Unexpected algorithm for message profile: expected {:?}, got {:?}",
+					err.expected, err.received
+				)
+			}
 			#[cfg(feature = "compress")]
 			TightBeamError::CompressionError(err) => match err {
 				#[cfg(feature = "zstd")]

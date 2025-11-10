@@ -1,4 +1,7 @@
 use crate::asn1::OctetString;
+use crate::crypto::profiles::SecurityProfile;
+use crate::der::EncodeValue;
+use crate::der::Tagged;
 use crate::error::Result;
 use crate::{Frame, Metadata, TightBeamError, Version};
 
@@ -11,26 +14,39 @@ use crate::EncryptedContentInfo;
 #[cfg(feature = "signature")]
 use crate::SignerInfo;
 
-/// A marker trait for types that can be used as the body of a TightBeam
-/// message.
+/// A marker trait for that can be used as the body of a TightBeam message.
 pub trait Message:
-	der::EncodeValue + der::Tagged + for<'a> der::Decode<'a> + Clone + PartialEq + core::fmt::Debug + Sized + Send + Sync
+	EncodeValue + Tagged + for<'a> crate::der::Decode<'a> + Clone + PartialEq + core::fmt::Debug + Sized + Send + Sync
 {
+	/// Minimum version required to send this message type
+	const MIN_VERSION: Version = Version::V0;
+	/// Whether this message type requires non-repudiation (signing)
 	const MUST_BE_NON_REPUDIABLE: bool = false;
+	/// Whether this message type requires confidentiality (encryption)
 	const MUST_BE_CONFIDENTIAL: bool = false;
+	/// Whether this message type requires compression
 	const MUST_BE_COMPRESSED: bool = false;
+	/// Whether this message type requires prioritization
 	const MUST_BE_PRIORITIZED: bool = false;
+	/// Whether this message type requires message integrity (hashing)
 	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+	/// Whether this message type requires frame integrity (hashing)
 	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
 	// TODO MUST_BE_ORDERED: bool = - with_genesis<hash>
-	const MIN_VERSION: Version = Version::V0;
+
+	/// Whether this message type has a custom security profile that
+	/// constrains algorithms.
+	const HAS_PROFILE: bool = false;
+
+	/// The security profile that constrains which cryptographic algorithms
+	/// can be used with this message type. Defaults to TightbeamProfile.
+	type Profile: SecurityProfile;
 }
 
-/// A trait for types that represent a TightBeam message with metadata and
-/// version
+/// A trait for types that represent a TightBeam message with associated data.
 pub trait TightBeamLike:
-	der::Encode
-	+ for<'a> der::Decode<'a>
+	crate::der::Encode
+	+ for<'a> crate::der::Decode<'a>
 	+ Clone
 	+ core::fmt::Debug
 	+ PartialEq
@@ -165,6 +181,7 @@ mod tests {
 		vec,
 		vec::Vec,
 	};
+	use tightbeam_derive::Beamable;
 
 	use crate::compose;
 	use crate::testing::create_test_cipher_key;
@@ -496,5 +513,46 @@ mod tests {
 					message: message
 			}.unwrap()
 		} => EncryptedContentInfo,
+	}
+
+	// Test data structures for Profile type testing
+	#[cfg(feature = "derive")]
+	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
+	#[beam(profile = 1)]
+	struct NumericProfileMessage {
+		id: u64,
+		data: String,
+	}
+
+	#[cfg(feature = "derive")]
+	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
+	#[beam(profile(crate::crypto::profiles::StandardProfile))]
+	struct TypeProfileMessage {
+		id: u64,
+		data: String,
+	}
+
+	#[cfg(feature = "derive")]
+	#[derive(Beamable, Clone, Debug, PartialEq, der::Sequence)]
+	struct NoProfileMessage {
+		id: u64,
+		data: String,
+	}
+
+	#[cfg(feature = "derive")]
+	#[test]
+	fn test_profile_types() {
+		// All message types should have a Profile type that implements SecurityProfile
+		fn assert_security_profile<P: crate::crypto::profiles::SecurityProfile>() {}
+
+		assert_security_profile::<<NumericProfileMessage as crate::Message>::Profile>();
+		assert_security_profile::<<TypeProfileMessage as crate::Message>::Profile>();
+		assert_security_profile::<<NoProfileMessage as crate::Message>::Profile>();
+
+		// Type-based profile should be StandardProfile
+		assert_eq!(
+			core::any::TypeId::of::<<TypeProfileMessage as crate::Message>::Profile>(),
+			core::any::TypeId::of::<crate::crypto::profiles::StandardProfile>()
+		);
 	}
 }

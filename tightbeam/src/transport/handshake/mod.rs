@@ -7,84 +7,84 @@
 //! Both protocols establish authenticated, encrypted sessions and support
 //! cryptographic algorithm negotiation between client and server.
 //!
-//! # Architecture
+//! # Protocol Capabilities
 //!
-//! The handshake layer uses a layered architecture with the `CryptoProvider` trait
-//! as the abstraction boundary:
+//! TightBeam provides security with flexible deployment options:
 //!
 //! ```text
-//!                    Client Request Flow
-//!                           │
-//!                           ▼
-//!              ┌────────────────────────┐
-//!              │   TCP Transport Layer  │
-//!              └───────────┬────────────┘
-//!                          │
-//!                          ▼
-//!         ┌─────────────────────────────────┐
-//!         │  Handshake Orchestrators        │
-//!         │  ┌───────────────────────────┐  │
-//!         │  │ EciesHandshakeClient<P>   │  │
-//!         │  │ EciesHandshakeServer<P>   │  │
-//!         │  │ CmsHandshakeClient<P>     │  │
-//!         │  │ CmsHandshakeServer<P>     │  │
-//!         │  └───────────────────────────┘  │
-//!         │  (P: CryptoProvider)            │
-//!         └─────────┬─────────────────┬─────┘
-//!                   │                 │
-//!         ┌─────────┴──────┐  ┌───────┴──────┐
-//!         │ Build Messages │  │ Process Msgs │
-//!         │                │  │              │
-//!         ▼                │  │              ▼
-//!      ┌──────────────┐    │  │    ┌──────────────────┐
-//!      │   Builders   │◄───┘  └───►│   Processors     │
-//!      ├──────────────┤            ├──────────────────┤
-//!      │ • Kari<P>    │            │ • KariRecipient  │
-//!      │ • EnvData<P> │            │ • EnvDataProc    │
-//!      │ • SignedData │            │ • SignedDataProc │
-//!      │   <P>        │            │   (Trait Objs)   │
-//!      └──────┬───────┘            └────────┬─────────┘
-//!             │                             │
-//!             │    ┌────────────────────┐   │
-//!             └───►│  CryptoProvider    │◄──┘
-//!                  ├────────────────────┤
-//!                  │ Associated Types:  │
-//!                  │ • Curve            │
-//!                  │ • Digest           │
-//!                  │ • Kdf              │
-//!                  │ • AeadCipher       │
-//!                  │ • Signature        │
-//!                  │ • SigningKey       │
-//!                  │ • VerifyingKey     │
-//!                  └────────────────────┘
-//!                           │
-//!                           ▼
-//!               Concrete Implementations
-//!              (e.g., DefaultCryptoProvider)
+//! ┌────────────────────────────────────────────────────────────────────────┐
+//! │                        TIGHTBEAM HANDSHAKE CAPABILITIES                │
+//! ├────────────────────────────────────────────────────────────────────────┤
+//! │  🔐 AUTHENTICATION      🔒 ENCRYPTION        ⚖️  NEGOTIATION           │
+//! │  • Server authentication  • Session keys      • Algorithm selection    │
+//! │  • Mutual authentication  • Forward secrecy   • Profile negotiation    │
+//! │  • Certificate validation • AEAD ciphers      • Dealer's choice mode   │
+//! │  • Transcript integrity   • Perfect secrecy   • Wire-level protocol    │
+//! └────────────────────────────────────────────────────────────────────────┘
+//!
+//! ┌────────────────────────────────────────────────────────────────────────┐
+//! │                          HANDSHAKE FLOW                                │
+//! ├────────────────────────────────────────────────────────────────────────┤
+//! │                                                                        │
+//! │ Client ─────────────────────────── Server                              │
+//! │  │                           │                                         |
+//! |  │── ClientHello ───────────►│  (client_rand, security_offer?)         |
+//! |  │                           │                                         |
+//! |  │◄─ ServerHandshake ────────│  (server_rand, cert, sig, accept?, ma?) |
+//! |  │                           │                                         |
+//! |  │── ClientKeyExchange ─────►│  (encrypted_key, [cert, sig]?)          |
+//! |  │                           │                                         |
+//! |  │ ◄═ Session Established ═► ║  (AEAD keys derived)                    |
+//! |  │                           │                                         |
+//! │  └───────────────────────────┘                                         │
+//! └────────────────────────────────────────────────────────────────────────┘
+//! **Legend:**
+//! - `[]` = optional fields, only present if mutual authentication is required
+//! - Arrows show message direction and content
+//! - Session establishment occurs after successful key exchange
 //! ```
 //!
-//! ## Design Principles
+//! # Architecture
 //!
-//! - **Compile-time abstraction**: Orchestrators and builders are generic over
-//!   `CryptoProvider`, enabling zero-cost algorithm selection at compile time.
+//! The handshake layer uses a layered architecture with the `CryptoProvider`
+//! trait as the abstraction boundary:
 //!
-//! - **Runtime flexibility**: Processors use trait objects for dynamic dispatch,
-//!   allowing protocol handling with heterogeneous implementations.
+//! ```text
+//! ┌────────────────────────────────────────────────────────────────────────┐
+//! │                          APPLICATION LAYER                             │
+//! │  ┌─────────────────────────────────────────────────────────────────┐   │
+//! │  │                    TCP Transport Layer                          │   │
+//! │  └─────────────────────┬───────────────────────┬───────────────────┘   │
+//! │                        │                       │                       │
+//! │  ┌─────────────────────▼───────┐    ┌──────────▼────────┐              │
+//! │  │   Handshake Orchestrators   │    │   CryptoProvider  │              │
+//! │  │  ┌────────────────────────┐ │    │  ┌─────────────┐  │              │
+//! │  │  │ EciesHandshakeClient<P>│ │    │  │  Curve      │  │              │
+//! │  │  │ EciesHandshakeServer<P>│ │    │  │  Digest     │  │              │
+//! │  │  │ CmsHandshakeClient<P>  │ │    │  │  KDF        │  │              │
+//! │  │  │ CmsHandshakeServer<P>  │ │    │  │  AEAD       │  │              │
+//! │  │  └────────────────────────┘ │    │  │  Signature  │  │              │
+//! │  │         (Generic)           │    │  │  SigningKey │  │              │
+//! │  └─────────────────────────────┘    │  └─────────────┘  │              │
+//! │                                     │    (Associated)   │              │
+//! │  ┌─────────────────────────────┐    └───────────────────┘              │
+//! │  │        Builders &           │                                       │
+//! │  │       Processors            │                                       │
+//! │  │  ┌───────────────────────┐  │                                       │
+//! │  │  │ KariBuilder<P>        │  │                                       │
+//! │  │  │ EnvDataBuilder<P>     │  │                                       │
+//! │  │  │ KariRecipient         │  │                                       │
+//! │  │  │ EnvDataProcessor      │  │                                       │
+//! │  │  └───────────────────────┘  │                                       │
+//! │  │   (Compile-time Generic)    │                                       │
+//! │  └─────────────────────────────┘                                       │
+//! └────────────────────────────────────────────────────────────────────────┘
 //!
-//! - **Type safety**: Associated types in `CryptoProvider` ensure all cryptographic
-//!   components are compatible (e.g., signature algorithm matches curve type).
-//!
-//! - **Memory safety**: Sensitive material (session keys, private keys) is wrapped
-//!   in `Secret<T>` with automatic zeroing on drop.
-//!
-//! ## Protocol Selection
-//!
-//! Choose a protocol based on your requirements:
-//!
-//! | Protocol | Use Case | Overhead | PKI Required |
-//! |----------|----------|----------|--------------|
-//! | ECIES    | IoT, embedded, performance-critical | Low | Optional |
-//! | CMS      | Enterprise PKI, compliance | Higher | Yes |
+//! ## Key:
+//! P = CryptoProvider trait,
+//! <P> = Compile-time generic,
+//! (Trait Obj) = Runtime dispatch
+//! ```
 //!
 //! ## Cryptographic Negotiation
 //!
@@ -109,7 +109,7 @@
 //! - Client sends `SecurityOffer` in KeyExchange EnvelopedData unprotected attributes
 //! - Server extracts offer and selects compatible profile using `select_profile()`
 //! - Server stores selected profile (accessible via handshake state)
-//! - If no offer provided, server uses dealer's choice mode (first configured profile)
+//! - If no offer provided, server uses first configured profile
 //!
 //! The server uses `with_supported_profiles()` to configure acceptable profiles.
 //! If no profiles are configured when an offer is received, negotiation fails.

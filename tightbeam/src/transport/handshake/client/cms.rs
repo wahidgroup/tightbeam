@@ -279,11 +279,8 @@ where
 		let rid = self.build_recipient_identifier();
 
 		// 5. Key encryption algorithm from provider (ECDH + HKDF + key wrap)
-		let key_wrap_oid = self
-			.provider
-			.profile()
-			.key_wrap_oid()
-			.ok_or(HandshakeError::MissingKeyWrapAlgorithm)?;
+		let key_wrap_oid =
+			<P::Profile as SecurityProfile>::KEY_WRAP_OID.ok_or(HandshakeError::MissingKeyWrapAlgorithm)?;
 		let key_enc_alg = AlgorithmIdentifierOwned { oid: key_wrap_oid, parameters: None };
 
 		// 6. Build KARI (Key Agreement Recipient Info) structure

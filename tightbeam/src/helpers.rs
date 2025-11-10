@@ -411,7 +411,7 @@ mod tests {
 						struct TestMsg {
 							content: String,
 						}
-						impl crate::Message for TestMsg {
+						impl $crate::Message for TestMsg {
 							const MUST_BE_CONFIDENTIAL: bool = $conf;
 							const MUST_BE_NON_REPUDIABLE: bool = $nonrep;
 							const MUST_BE_COMPRESSED: bool = false;
@@ -419,6 +419,8 @@ mod tests {
 							const MUST_HAVE_MESSAGE_INTEGRITY: bool = $msg_int;
 							const MUST_HAVE_FRAME_INTEGRITY: bool = $frame_int;
 							const MIN_VERSION: Version = Version::$min_ver;
+
+							type Profile = $crate::crypto::profiles::TightbeamProfile;
 						}
 
 						// Test 1: Verify constants
@@ -447,7 +449,7 @@ mod tests {
 
 						// Test 3: Verify version enforcement
 						if min_version > Version::V0 {
-							let result_v0 = crate::compose! {
+							let result_v0 = $crate::compose! {
 								V0: id: name, order: 1u64, message: message.clone()
 							};
 							assert!(result_v0.is_err());

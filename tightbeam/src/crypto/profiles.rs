@@ -107,7 +107,7 @@ pub struct SecurityProfileDesc {
 }
 
 impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
-	fn from(p: &P) -> Self {
+	fn from(_p: &P) -> Self {
 		SecurityProfileDesc {
 			digest: <P::DigestOid as AssociatedOid>::OID,
 			#[cfg(feature = "aead")]
@@ -116,7 +116,7 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 			aead_key_size: Some(<P::AeadOid as AeadKeySize>::KEY_SIZE as u16),
 			#[cfg(feature = "signature")]
 			signature: Some(<P::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID),
-			key_wrap: p.key_wrap_oid(),
+			key_wrap: P::KEY_WRAP_OID,
 		}
 	}
 }
@@ -137,9 +137,7 @@ pub trait SecurityProfile {
 	#[cfg(feature = "signature")]
 	type SignatureAlg: SignatureAlgorithmIdentifier; // Provides ALGORITHM_OID
 
-	fn key_wrap_oid(&self) -> Option<ObjectIdentifier> {
-		None
-	}
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
 }
 
 /// Provides digest/hash functionality.
@@ -322,9 +320,39 @@ impl SecurityProfile for DefaultSecurityProfile {
 	#[cfg(feature = "signature")]
 	type SignatureAlg = Secp256k1Signature;
 
-	fn key_wrap_oid(&self) -> Option<ObjectIdentifier> {
-		Some(crate::asn1::AES_256_WRAP_OID)
-	}
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
+}
+
+/// FIPS-compliant profile: requires confidentiality and non-repudiation.
+/// Maps to numeric profile = 1.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TightbeamProfile;
+
+impl SecurityProfile for TightbeamProfile {
+	#[cfg(feature = "digest")]
+	type DigestOid = Sha3_256;
+	#[cfg(feature = "aead")]
+	type AeadOid = Aes256GcmOid;
+	#[cfg(feature = "signature")]
+	type SignatureAlg = Secp256k1Signature;
+
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
+}
+
+/// Standard security profile: requires confidentiality, non-repudiation, and integrity.
+/// Maps to numeric profile = 2.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StandardProfile;
+
+impl SecurityProfile for StandardProfile {
+	#[cfg(feature = "digest")]
+	type DigestOid = Sha3_256;
+	#[cfg(feature = "aead")]
+	type AeadOid = Aes256GcmOid;
+	#[cfg(feature = "signature")]
+	type SignatureAlg = Secp256k1Signature;
+
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
 }
 
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
@@ -589,9 +617,7 @@ mod tests {
 			type AeadOid = crate::crypto::aead::Aes128GcmOid;
 			type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
 
-			fn key_wrap_oid(&self) -> Option<ObjectIdentifier> {
-				Some(crate::asn1::AES_256_WRAP_OID)
-			}
+			const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
 		}
 
 		let profile = Aes128Profile;

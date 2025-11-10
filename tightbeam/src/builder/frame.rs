@@ -4,6 +4,8 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
+use crate::crypto::hash::Digest;
+use crate::crypto::profiles::SecurityProfile;
 use crate::der::oid::{AssociatedOid, ObjectIdentifier};
 use crate::der::Sequence;
 use crate::error::Result;
@@ -12,14 +14,14 @@ use crate::matrix::{MatrixDyn, MatrixLike};
 use crate::{Frame, Message, Metadata, Version};
 
 #[cfg(feature = "aead")]
-use crate::crypto::aead::{Aead, Encryptor};
+use crate::crypto::aead::Aead;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::SignatureEncoding;
 
 #[cfg(feature = "compress")]
 use crate::compress::Compressor;
 #[cfg(feature = "signature")]
-use crate::crypto::sign::Signatory;
+use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier};
 #[cfg(feature = "digest")]
 use crate::helpers::Digestor;
 
@@ -110,8 +112,17 @@ impl<T: Message> FrameBuilder<T> {
 	#[cfg(feature = "digest")]
 	pub fn with_message_hasher<D>(mut self) -> Self
 	where
-		D: digest::Digest + crate::der::oid::AssociatedOid,
+		D: Digest + AssociatedOid,
 	{
+		// Validate that the digest algorithm matches the message's profile (only if HAS_PROFILE is true)
+		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
+			self.errors.push(TightBeamError::UnexpectedAlgorithm(ExpectError::from((
+				D::OID,
+				<T::Profile as SecurityProfile>::DigestOid::OID,
+			))));
+			return self;
+		}
+
 		let message = match self.message.as_ref() {
 			Some(m) => m,
 			None => {
@@ -142,8 +153,17 @@ impl<T: Message> FrameBuilder<T> {
 	#[cfg(feature = "digest")]
 	pub fn with_witness_hasher<D>(mut self) -> Self
 	where
-		D: digest::Digest + crate::der::oid::AssociatedOid + 'static,
+		D: Digest + AssociatedOid + 'static,
 	{
+		// Validate that the digest algorithm matches the message's profile (only if HAS_PROFILE is true)
+		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
+			self.errors.push(TightBeamError::UnexpectedAlgorithm(ExpectError::from((
+				D::OID,
+				<T::Profile as SecurityProfile>::DigestOid::OID,
+			))));
+			return self;
+		}
+
 		self.witness = Some(Box::new(|tbs_der: &[u8]| crate::utils::digest::<D>(tbs_der)));
 		self
 	}
@@ -199,6 +219,15 @@ impl<T: Message> FrameBuilder<T> {
 		C: AssociatedOid,
 		Cipher: Aead + Clone + 'static,
 	{
+		// Validate that the cipher OID matches the message's profile (only if HAS_PROFILE is true)
+		if T::HAS_PROFILE && C::OID != <T::Profile as SecurityProfile>::AeadOid::OID {
+			self.errors.push(TightBeamError::UnexpectedAlgorithm(ExpectError::from((
+				C::OID,
+				<T::Profile as SecurityProfile>::AeadOid::OID,
+			))));
+			return self;
+		}
+
 		// Get the concrete RNG or default to OS RNG
 		let rng: &mut dyn rand_core::CryptoRngCore = match self.rng.as_mut() {
 			Some(boxed_rng) => &mut **boxed_rng,
@@ -210,8 +239,12 @@ impl<T: Message> FrameBuilder<T> {
 		let cipher_cloned = cipher.clone();
 		let message_oid = self.message_oid;
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
-			let encrypted_content =
-				<Cipher as Encryptor<C>>::encrypt_content(&cipher_cloned, plaintext, &nonce, message_oid)?;
+			let encrypted_content = <Cipher as crate::crypto::aead::Encryptor<C>>::encrypt_content(
+				&cipher_cloned,
+				plaintext,
+				&nonce,
+				message_oid,
+			)?;
 			Ok(encrypted_content)
 		}));
 
@@ -226,9 +259,18 @@ impl<T: Message> FrameBuilder<T> {
 	#[cfg(feature = "signature")]
 	pub fn with_signer<S, X>(mut self, signer: &X) -> Self
 	where
-		S: SignatureEncoding,
+		S: SignatureEncoding + SignatureAlgorithmIdentifier,
 		X: Signatory<S> + Clone + 'static,
 	{
+		// Validate that the signature algorithm matches the message's profile (only if HAS_PROFILE is true)
+		if T::HAS_PROFILE && S::ALGORITHM_OID != <T::Profile as SecurityProfile>::SignatureAlg::ALGORITHM_OID {
+			self.errors.push(TightBeamError::UnexpectedAlgorithm(ExpectError::from((
+				S::ALGORITHM_OID,
+				<T::Profile as SecurityProfile>::SignatureAlg::ALGORITHM_OID,
+			))));
+			return self;
+		}
+
 		let signer = signer.clone();
 		self.signer = Some(Box::new(move |data: &[u8]| signer.to_signer_info(data)));
 		self
@@ -390,12 +432,15 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 
 #[cfg(test)]
 mod tests {
-	use sha3::Sha3_256;
-
 	use super::*;
 	use crate::compress::ZstdCompression;
 	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
 	use crate::{compose, test_builder, test_case};
+
+	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
+	use crate::crypto::aead::Aes256Gcm;
+	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
+	use crate::crypto::hash::Sha3_256;
 
 	#[cfg(feature = "sha3")]
 	test_builder! {
@@ -651,6 +696,65 @@ mod tests {
 			assert_eq!(tightbeam.version, Version::V0);
 			assert_eq!(tightbeam.metadata.id, b"test-id");
 			assert_eq!(tightbeam.metadata.order, 1696521600);
+			Ok(())
+		}
+	}
+
+	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
+	test_case! {
+		name: test_unexpected_algorithm_validation,
+		setup: || {
+			// Create a message with a profile that expects AES-128-GCM
+			#[derive(Clone, Debug, PartialEq, Sequence)]
+			struct Aes128Message {
+				content: String,
+			}
+
+			impl crate::Message for Aes128Message {
+				const MUST_BE_NON_REPUDIABLE: bool = false;
+				const MUST_BE_CONFIDENTIAL: bool = false;
+				const MUST_BE_COMPRESSED: bool = false;
+				const MUST_BE_PRIORITIZED: bool = false;
+				const HAS_PROFILE: bool = true;
+				const MIN_VERSION: crate::Version = crate::Version::V0;
+
+				type Profile = Aes128Profile;
+			}
+
+			// Define a profile that uses AES-128-GCM
+			#[derive(Debug, Default, Clone, Copy)]
+			struct Aes128Profile;
+
+			impl SecurityProfile for Aes128Profile {
+				type DigestOid = Sha3_256;
+				type AeadOid = crate::crypto::aead::Aes128GcmOid;
+				type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
+			}
+
+			let message = Aes128Message { content: "test".to_string() };
+			let (_, cipher) = create_test_cipher_key(); // This creates an AES-256 key
+
+			// Try to use AES-256-GCM cipher with a message that expects AES-128-GCM
+			let builder: FrameBuilder<Aes128Message> = Version::V1.into();
+			builder
+				.with_message(message)
+				.with_id("test_unexpected_algorithm")
+				.with_order(1696521600)
+				.with_cipher::<crate::crypto::aead::Aes256GcmOid, Aes256Gcm>(&cipher)
+				.build()
+		},
+		assertions: |result: Result<Frame>| {
+			// Should fail with UnexpectedAlgorithm error
+			assert!(result.is_err());
+			if let Err(TightBeamError::Sequence(errors)) = result {
+				assert!(!errors.is_empty());
+				// Check that one of the errors is UnexpectedAlgorithm
+				let has_unexpected_algorithm = errors.iter().any(|e| matches!(e, TightBeamError::UnexpectedAlgorithm(_)));
+				assert!(has_unexpected_algorithm, "Expected UnexpectedAlgorithm error, but got: {:?}", errors);
+			} else {
+				panic!("Expected Sequence error, but got: {:?}", result);
+			}
+
 			Ok(())
 		}
 	}

@@ -81,6 +81,30 @@ fn get_profile_value(attrs: &[Attribute]) -> Option<u8> {
 	None
 }
 
+fn get_profile_type(attrs: &[Attribute]) -> Option<syn::Type> {
+	for attr in attrs {
+		if !attr.path().is_ident("beam") {
+			continue;
+		}
+		if let Meta::List(list) = &attr.meta {
+			let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+			if let Ok(metas) = parser.parse2(list.tokens.clone()) {
+				for meta in metas {
+					if let Meta::List(profile_list) = meta {
+						if profile_list.path.is_ident("profile") {
+							// Parse the content inside profile(...) as a type
+							if let Ok(ty) = syn::parse2::<syn::Type>(profile_list.tokens.clone()) {
+								return Some(ty);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	None
+}
+
 fn has_attr(attrs: &[Attribute], name: &str) -> bool {
 	attrs.iter().any(|attr| attr.path().is_ident(name))
 }
@@ -114,12 +138,30 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	let message_integrity = has_flag(&input.attrs, "message_integrity");
 	let frame_integrity = has_flag(&input.attrs, "frame_integrity");
 	let min_version = get_version_value(&input.attrs);
-	let profile = get_profile_value(&input.attrs);
+	let profile_value = get_profile_value(&input.attrs);
+	let profile_type = get_profile_type(&input.attrs);
+
+	// Validate that we don't have both numeric and type-based profiles
+	if profile_value.is_some() && profile_type.is_some() {
+		return syn::Error::new_spanned(
+			&input,
+			"Cannot specify both numeric profile (= N) and type-based profile (Type) simultaneously",
+		)
+		.to_compile_error()
+		.into();
+	}
+
+	// Future: validate that type-based profiles implement SecurityProfile trait
+	// For now, we just parse and ignore the type to prepare for future extensibility
+	if let Some(_profile_ty) = &profile_type {
+		// TODO: Add compile-time validation that the type implements SecurityProfile
+		// For now, we accept any type but don't use it
+	}
 
 	// Profile-based security requirements
-	let (profile_confidential, profile_nonrep, profile_min_version) = match profile {
-		Some(1) => (true, true, Some(syn::Ident::new("V1", name.span()))),
-		Some(2) => (true, true, Some(syn::Ident::new("V1", name.span()))),
+	let (profile_confidential, profile_nonrep, profile_min_version) = match profile_value {
+		Some(1) => (true, true, Some(syn::Ident::new("V1", name.span()))), // FIPS
+		Some(2) => (true, true, Some(syn::Ident::new("V1", name.span()))), // Standard
 		Some(p) if p > 2 => (false, false, None),
 		_ => (false, false, None),
 	};
@@ -179,6 +221,17 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		quote! { ::tightbeam::Version::V0 }
 	};
 
+	let profile_type_impl = if let Some(profile_ty) = &profile_type {
+		quote! {
+			const HAS_PROFILE: bool = true;
+			type Profile = #profile_ty;
+		}
+	} else {
+		quote! {
+			type Profile = ::tightbeam::crypto::profiles::TightbeamProfile;
+		}
+	};
+
 	let expanded = quote! {
 		const _: () = {
 			#(#feature_checks)*
@@ -192,6 +245,7 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 			const MUST_BE_COMPRESSED: bool = #compressed;
 			const MUST_BE_PRIORITIZED: bool = #prioritized;
 			const MIN_VERSION: ::tightbeam::Version = #min_version_value;
+			#profile_type_impl
 		}
 	};
 

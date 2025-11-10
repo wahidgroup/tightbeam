@@ -760,6 +760,7 @@ mod tests {
 			AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, HASH_SHA3_384_OID, HASH_SHA3_512_OID,
 			SIGNER_ECDSA_WITH_SHA3_512_OID,
 		};
+
 		let mk_profile = |id: u8| SecurityProfileDesc {
 			digest: match id {
 				1 => HASH_SHA3_256_OID,
@@ -782,18 +783,24 @@ mod tests {
 		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));
 		let test_cert = create_test_certificate();
 
-		// Test 1: Client offers [A, B], server accepts B → OK
-		{
-			let mut client = TestEciesClientBuilder::new()
-				.build()
-				.with_security_offer(SecurityOffer::new(vec![p_a, p_b]));
+		// Helper to create client with security offer and build hello
+		let setup_client = |offer: Option<SecurityOffer>| -> Result<(EciesHandshakeClientSecp256k1, [u8; 32]), Box<dyn std::error::Error>> {
+			let mut client = TestEciesClientBuilder::new().build();
+			if let Some(offer) = offer {
+				client = client.with_security_offer(offer);
+			}
 			let _hello = client.build_client_hello()?;
-
-			// Get the actual client random that was generated
 			let client_random = client.client_random.ok_or("No client random")?;
-			let server_random = [2u8; 32];
+			Ok((client, client_random))
+		};
+
+		// Helper to create signed server handshake
+		let create_server_response = |client_random: &[u8; 32],
+		                              server_random: [u8; 32],
+		                              accepted_profile: &SecurityProfileDesc|
+		 -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 			let transcript_hash = compute_test_transcript_hash(
-				&client_random,
+				client_random,
 				&server_random,
 				test_cert
 					.certificate
@@ -810,76 +817,33 @@ mod tests {
 				certificate: test_cert.certificate.clone(),
 				server_random: crate::asn1::OctetString::new(server_random)?,
 				signature: crate::asn1::OctetString::new(signature_bytes)?,
-				security_accept: Some(SecurityAccept::new(p_b)),
+				security_accept: Some(SecurityAccept::new(accepted_profile.clone())),
 				client_cert_required: false,
 			};
-			let _kex = client.process_server_handshake_no_auth(&response.to_der()?)?;
+			Ok(response.to_der()?)
+		};
+
+		// Test 1: Client offers [A, B], server accepts B → OK
+		{
+			let (mut client, client_random) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
+			let server_response = create_server_response(&client_random, [2u8; 32], &p_b)?;
+			let _kex = client.process_server_handshake_no_auth(&server_response)?;
 			assert_eq!(client.selected_profile, Some(p_b));
 		}
 
 		// Test 2: Client offers [A, B], server accepts C (not in offer) → FAIL
 		{
-			let mut client = TestEciesClientBuilder::new()
-				.build()
-				.with_security_offer(SecurityOffer::new(vec![p_a, p_b]));
-			let _hello = client.build_client_hello()?;
-
-			let client_random = client.client_random.ok_or("No client random")?;
-			let server_random = [3u8; 32];
-			let transcript_hash = compute_test_transcript_hash(
-				&client_random,
-				&server_random,
-				test_cert
-					.certificate
-					.tbs_certificate
-					.subject_public_key_info
-					.subject_public_key
-					.raw_bytes(),
-			);
-			let signature: crate::crypto::sign::ecdsa::Secp256k1Signature =
-				test_cert.signing_key.try_sign(&transcript_hash)?;
-			let signature_bytes = signature.to_bytes().to_vec();
-
-			let response = ServerHandshake {
-				certificate: test_cert.certificate.clone(),
-				server_random: crate::asn1::OctetString::new(server_random)?,
-				signature: crate::asn1::OctetString::new(signature_bytes)?,
-				security_accept: Some(SecurityAccept::new(p_c)), // Not in offer!
-				client_cert_required: false,
-			};
-			let result = client.process_server_handshake_no_auth(&response.to_der()?);
+			let (mut client, client_random) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
+			let server_response = create_server_response(&client_random, [3u8; 32], &p_c)?;
+			let result = client.process_server_handshake_no_auth(&server_response);
 			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 		}
 
 		// Test 3: No offer, server picks → OK (dealer's choice)
 		{
-			let mut client = TestEciesClientBuilder::new().build();
-			let _hello = client.build_client_hello()?;
-
-			let client_random = client.client_random.ok_or("No client random")?;
-			let server_random = [4u8; 32];
-			let transcript_hash = compute_test_transcript_hash(
-				&client_random,
-				&server_random,
-				test_cert
-					.certificate
-					.tbs_certificate
-					.subject_public_key_info
-					.subject_public_key
-					.raw_bytes(),
-			);
-			let signature: crate::crypto::sign::ecdsa::Secp256k1Signature =
-				test_cert.signing_key.try_sign(&transcript_hash)?;
-			let signature_bytes = signature.to_bytes().to_vec();
-
-			let response = ServerHandshake {
-				certificate: test_cert.certificate.clone(),
-				server_random: crate::asn1::OctetString::new(server_random)?,
-				signature: crate::asn1::OctetString::new(signature_bytes)?,
-				security_accept: Some(SecurityAccept::new(p_a)),
-				client_cert_required: false,
-			};
-			let _kex = client.process_server_handshake_no_auth(&response.to_der()?)?;
+			let (mut client, client_random) = setup_client(None)?;
+			let server_response = create_server_response(&client_random, [4u8; 32], &p_a)?;
+			let _kex = client.process_server_handshake_no_auth(&server_response)?;
 			assert_eq!(client.selected_profile, Some(p_a));
 		}
 
