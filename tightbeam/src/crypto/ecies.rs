@@ -38,7 +38,7 @@ use crate::asn1::ObjectIdentifier;
 
 use crate::crypto::aead::{Aead, Aes256Gcm, KeyInit, Payload};
 use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256, KdfError};
-use crate::crypto::secret::{Secret, SecretSlice, ToInsecure};
+use crate::crypto::secret::{Secret, SecretSlice};
 use crate::crypto::sign::ecdsa::k256::ecdh::EphemeralSecret;
 use crate::crypto::sign::ecdsa::k256::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
@@ -209,7 +209,7 @@ impl core::convert::TryFrom<SecretSlice<u8>> for SecretKey {
 	type Error = EciesError;
 	fn try_from(bytes: SecretSlice<u8>) -> Result<Self> {
 		use crate::crypto::secret::ToInsecure;
-		let raw = bytes.to_insecure();
+		let raw = bytes.to_insecure().map_err(EciesError::from)?;
 		SecretKey::from_slice(&raw).map_err(EciesError::InvalidSecretKey)
 	}
 }
@@ -385,8 +385,7 @@ where
 			let (ephemeral_bytes, shared_secret) = PK::SecretKey::generate_ephemeral(recipient_pubkey, $rng)?;
 
 			// Derive encryption key using KDF (includes C0 for non-malleability)
-			let k_enc =
-				ecies_kdf::<HkdfSha3_256>(&ephemeral_bytes, &shared_secret.to_insecure(), ECIES_KDF_INFO, None)?;
+			let k_enc = ecies_kdf::<HkdfSha3_256>(&ephemeral_bytes, shared_secret, ECIES_KDF_INFO, None)?;
 
 			// Encrypt using AES-256-GCM
 			let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
@@ -438,8 +437,7 @@ where
 	// 3. Derive encryption key using KDF (includes C0 for non-malleability)
 	// Uses SHA3-256 with protocol versioning via info parameter
 	// Derives 32-byte key for AES-256-GCM authenticated encryption
-	let k_enc =
-		ecies_kdf::<HkdfSha3_256>(message.ephemeral_pubkey(), &shared_secret.to_insecure(), ECIES_KDF_INFO, None)?;
+	let k_enc = ecies_kdf::<HkdfSha3_256>(message.ephemeral_pubkey(), shared_secret, ECIES_KDF_INFO, None)?;
 
 	// 4. Extract nonce and ciphertext
 	let ciphertext_bytes = message.ciphertext();
@@ -476,6 +474,7 @@ impl AssociatedOid for EciesSecp256k1Oid {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::secret::ToInsecure;
 	use rand_core::OsRng;
 
 	// Helper to create a key pair
@@ -491,7 +490,7 @@ mod tests {
 		let (secret, public) = keypair();
 		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, aad, None::<&mut OsRng>)?;
 		let decrypted = decrypt(&secret, &encrypted, aad)?;
-		assert_eq!(plaintext, &decrypted.to_insecure()[..]);
+		assert_eq!(plaintext, &decrypted.to_insecure().map_err(EciesError::from)?[..]);
 		Ok(())
 	}
 
@@ -537,7 +536,7 @@ mod tests {
 			let result = decrypt(&secret, &encrypted, aad);
 			assert_eq!(result.is_ok(), should_succeed);
 			if should_succeed {
-				assert_eq!(&plaintext[..], &result?.to_insecure()[..]);
+				assert_eq!(&plaintext[..], &result?.to_insecure().map_err(EciesError::from)?[..]);
 			}
 		}
 
@@ -554,7 +553,7 @@ mod tests {
 		let bytes = encrypted.to_bytes();
 		let parsed = Secp256k1EciesMessage::from_bytes(&bytes)?;
 		let decrypted = decrypt(&secret, &parsed, None)?;
-		assert_eq!(&plaintext[..], &decrypted.to_insecure()[..]);
+		assert_eq!(&plaintext[..], &decrypted.to_insecure().map_err(EciesError::from)?[..]);
 
 		// Key serialization roundtrip using traits
 		let secret_bytes: SecretSlice<u8> = (&secret).into();
@@ -581,7 +580,7 @@ mod tests {
 		let result = decrypt(&secret2, &encrypted, None);
 
 		if let Ok(decrypted) = result {
-			assert_ne!(&plaintext[..], &decrypted.to_insecure()[..]);
+			assert_ne!(&plaintext[..], &decrypted.to_insecure().map_err(EciesError::from)?[..]);
 		}
 
 		// Tampered ciphertext should fail authentication

@@ -694,8 +694,8 @@ mod tests {
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::tcp::TightBeamSocketAddr;
 
-		let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = TightBeamSocketAddr(listener.local_addr().unwrap());
+		let listener = TokioListener::bind("127.0.0.1:0").await?;
+		let addr = TightBeamSocketAddr(listener.local_addr()?);
 
 		let (tx, rx) = mpsc::channel();
 		let tx = Arc::new(tx);
@@ -726,7 +726,7 @@ mod tests {
 		result?;
 
 		// Verify server received the message -- TUNNEL
-		let received = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+		let received = rx.recv_timeout(Duration::from_secs(1)).map_err(|_| TransportError::Timeout)?;
 		assert_eq!(message, received);
 
 		server_handle.abort();
@@ -788,32 +788,34 @@ mod tests {
 	}
 
 	#[test]
-	fn test_request_package_encode_decode() {
+	fn test_request_package_encode_decode() -> Result<(), Box<dyn std::error::Error>> {
 		for test_case in get_test_cases() {
 			let original = test_case.create_request();
 
-			let encoded = original.to_der().unwrap();
-			let decoded = RequestPackage::from_der(&encoded).unwrap();
+			let encoded = original.to_der()?;
+			let decoded = RequestPackage::from_der(&encoded)?;
 			assert_eq!(original, decoded);
 		}
+		Ok(())
 	}
 
 	#[test]
-	fn test_response_package_encode_decode() {
+	fn test_response_package_encode_decode() -> Result<(), Box<dyn std::error::Error>> {
 		for test_case in get_test_cases() {
 			let original = test_case.create_response();
 
-			let encoded = original.to_der().unwrap();
-			let decoded = ResponsePackage::from_der(&encoded).unwrap();
+			let encoded = original.to_der()?;
+			let decoded = ResponsePackage::from_der(&encoded)?;
 			assert_eq!(original.status, decoded.status);
 			assert_eq!(original.message, decoded.message);
 		}
+		Ok(())
 	}
 
 	#[test]
-	fn test_length_validation_request() {
+	fn test_length_validation_request() -> Result<(), Box<dyn std::error::Error>> {
 		let original = RequestPackage::new(create_v0_tightbeam(None, None));
-		let mut encoded = original.to_der().unwrap();
+		let mut encoded = original.to_der()?;
 
 		// Corrupt the length field by manipulating bytes after encoding
 		// The length is encoded as a Uint at the beginning of the sequence
@@ -827,13 +829,14 @@ mod tests {
 			let result = RequestPackage::from_der(&encoded);
 			assert!(result.is_err(), "Should fail with corrupted length");
 		}
+		Ok(())
 	}
 
 	#[test]
-	fn test_length_validation_response() {
+	fn test_length_validation_response() -> Result<(), Box<dyn std::error::Error>> {
 		let original =
 			ResponsePackage { status: TransitStatus::Accepted, message: Some(create_v0_tightbeam(None, None)) };
-		let mut encoded = original.to_der().unwrap();
+		let mut encoded = original.to_der()?;
 
 		// Corrupt the length field
 		if encoded.len() > 10 {
@@ -844,16 +847,18 @@ mod tests {
 			let result = ResponsePackage::from_der(&encoded);
 			assert!(result.is_err(), "Should fail with corrupted length");
 		}
+		Ok(())
 	}
 
 	#[test]
-	fn test_response_empty_message() {
+	fn test_response_empty_message() -> Result<(), Box<dyn std::error::Error>> {
 		let original = ResponsePackage { status: TransitStatus::Busy, message: None };
 
-		let encoded = original.to_der().unwrap();
-		let decoded = ResponsePackage::from_der(&encoded).unwrap();
+		let encoded = original.to_der()?;
+		let decoded = ResponsePackage::from_der(&encoded)?;
 
 		assert_eq!(original.status, decoded.status);
 		assert_eq!(original.message, decoded.message);
+		Ok(())
 	}
 }

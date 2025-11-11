@@ -37,6 +37,8 @@
 pub use hkdf::Hkdf;
 
 use crate::crypto::hash::{Digest, Sha3_256};
+use crate::crypto::secret::{SecretSlice, ToInsecure};
+use crate::der::oid::{AssociatedOid, ObjectIdentifier};
 use crate::zeroize::Zeroizing;
 use crate::ZeroizingArray;
 
@@ -120,6 +122,15 @@ pub trait KdfFunction {
 }
 /// Default HKDF-SHA3-256 provider
 pub struct HkdfSha3_256;
+
+/// OID wrapper for HKDF-SHA3-256
+/// Note: No standard OID exists for HKDF-SHA3-256, using NIST SHA3-256 base OID
+pub struct HkdfSha3_256Oid;
+
+impl AssociatedOid for HkdfSha3_256Oid {
+	/// HKDF-SHA3-256 OID (NIST SHA3-256 base: 2.16.840.1.101.3.4.2.8)
+	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8");
+}
 
 impl KdfFunction for HkdfSha3_256 {
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
@@ -339,15 +350,19 @@ fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: 
 ///   X9.63 KDF, provide a custom `KdfProvider`.
 pub fn ecies_kdf<P: KdfFunction>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
-	shared_secret: impl AsRef<[u8]>,
+	shared_secret: SecretSlice<u8>,
 	info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
 ) -> Result<ZeroizingArray<32>> {
-	let (ephemeral_pubkey, shared_secret, info) = (ephemeral_pubkey.as_ref(), shared_secret.as_ref(), info.as_ref());
+	let ephemeral_pubkey = ephemeral_pubkey.as_ref();
+	let shared_secret_bytes = shared_secret.to_insecure()?;
+	let shared_secret = shared_secret_bytes.as_ref();
+
 	assert_valid_kdf_inputs(ephemeral_pubkey, shared_secret, salt)?;
+
 	// ECIES: IKM = Z; SharedInfo binds context and the ephemeral public key
-	let mut shared_info = Vec::with_capacity(info.len() + 5 + ephemeral_pubkey.len());
-	shared_info.extend_from_slice(info);
+	let mut shared_info = Vec::with_capacity(info.as_ref().len() + 5 + ephemeral_pubkey.len());
+	shared_info.extend_from_slice(info.as_ref());
 	shared_info.extend_from_slice(b"|epk|");
 	shared_info.extend_from_slice(ephemeral_pubkey);
 	P::derive_key::<32>(shared_secret, &shared_info, salt)
@@ -395,12 +410,16 @@ pub fn hkdf<P: KdfFunction, const N: usize>(
 /// - RFC 5869 (HKDF), NIST SP 800-56C (context/OtherInfo), ECIES profiles (key separation)
 pub fn ecies_kdf_with_size<P: KdfFunction, const N: usize>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
-	shared_secret: impl AsRef<[u8]>,
+	shared_secret: SecretSlice<u8>,
 	info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
 ) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
-	let (ephemeral_pubkey, shared_secret, info) = (ephemeral_pubkey.as_ref(), shared_secret.as_ref(), info.as_ref());
+	let insecure_shared_secret = shared_secret.to_insecure()?;
+	let (ephemeral_pubkey, shared_secret, info) =
+		(ephemeral_pubkey.as_ref(), insecure_shared_secret.as_ref(), info.as_ref());
+
 	assert_valid_kdf_inputs(ephemeral_pubkey, shared_secret, salt)?;
+
 	// ECIES: IKM = Z; SharedInfo binds context and the ephemeral public key
 	let mut shared_info = Vec::with_capacity(info.len() + 5 + ephemeral_pubkey.len());
 	shared_info.extend_from_slice(info);
@@ -412,11 +431,12 @@ pub fn ecies_kdf_with_size<P: KdfFunction, const N: usize>(
 /// ECIES with raw SharedInfo: caller supplies exact SharedInfo/OtherInfo bytes (no EPK auto-append).
 /// IKM is the shared secret Z.
 pub fn ecies_kdf_with_shared_info<P: KdfFunction>(
-	shared_secret: impl AsRef<[u8]>,
+	shared_secret: SecretSlice<u8>,
 	shared_info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
 ) -> Result<ZeroizingArray<32>> {
-	let (shared_secret, shared_info) = (shared_secret.as_ref(), shared_info.as_ref());
+	let insecure_shared_secret = shared_secret.to_insecure()?;
+	let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
 	if shared_secret.len() != 32 {
 		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
 	}
@@ -433,11 +453,12 @@ pub fn ecies_kdf_with_shared_info<P: KdfFunction>(
 /// ECIES dual-key with raw SharedInfo: caller supplies exact SharedInfo/OtherInfo bytes.
 /// IKM is the shared secret Z. Provider-specific bounds may apply.
 pub fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
-	shared_secret: impl AsRef<[u8]>,
+	shared_secret: SecretSlice<u8>,
 	shared_info: impl AsRef<[u8]>,
 	salt: Option<&[u8]>,
 ) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
-	let (shared_secret, shared_info) = (shared_secret.as_ref(), shared_info.as_ref());
+	let insecure_shared_secret = shared_secret.to_insecure()?;
+	let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
 	if shared_secret.len() != 32 {
 		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
 	}
@@ -454,6 +475,7 @@ pub fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::secret::Secret;
 
 	// Test assertion helpers for common patterns
 	#[track_caller]
@@ -499,25 +521,28 @@ mod tests {
 		};
 	}
 
+	fn shared_secret_32() -> SecretSlice<u8> {
+		Secret::from(b"shared_secret_32_bytes__________".to_vec())
+	}
+
 	// Test data constants
 	const EPHEMERAL_PUBKEY_33: &[u8] = b"ephemeral_public_key_33_bytes____";
 	const EPHEMERAL_PUBKEY_33_ALT: &[u8] = b"different_ephemeral_key_33_bytes_";
-	const SHARED_SECRET_32: &[u8] = b"shared_secret_32_bytes__________";
 	const INFO_V1: &[u8] = b"tightbeam-ecies-v1";
 	const INFO_V2: &[u8] = b"protocol-v2";
 	const SALT: &[u8] = b"random_salt_value";
 
-	// Consolidated test for ECIES KDF basic functionality, determinism, input variation, and uncompressed pubkey
+	// Consolidated test for ECIES KDF basic functionality
 	crate::test_case! {
 		name: test_ecies_kdf_basic_functionality,
 		setup: || {
 			// Test cases for basic functionality and determinism
-			let basic_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
-			let same_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let basic_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+			let same_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
 			// Test cases for input variation (different inputs should produce different outputs)
-			let different_pubkey = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33_ALT, SHARED_SECRET_32, INFO_V1, None).unwrap();
-			let different_info = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V2, None).unwrap();
-			let with_salt = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, Some(SALT)).unwrap();
+			let different_pubkey = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33_ALT, shared_secret_32(), INFO_V1, None).unwrap();
+			let different_info = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None).unwrap();
+			let with_salt = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT)).unwrap();
 
 			// Test case for uncompressed pubkey (65 bytes)
 			let mut uncompressed_pubkey = [0u8; 65];
@@ -526,7 +551,7 @@ mod tests {
 				*byte = (i % 256) as u8;
 			}
 
-			let uncompressed_result = ecies_kdf::<HkdfSha3_256>(uncompressed_pubkey, SHARED_SECRET_32, INFO_V1, None);
+			let uncompressed_result = ecies_kdf::<HkdfSha3_256>(uncompressed_pubkey, shared_secret_32(), INFO_V1, None);
 			(basic_key, same_key, different_pubkey, different_info, with_salt, uncompressed_result)
 		},
 		assertions: |(basic_key, same_key, different_pubkey, different_info, with_salt, uncompressed_result)| {
@@ -551,9 +576,9 @@ mod tests {
 		name: test_ecies_kdf_size_variations,
 		setup: || {
 			// Test different key sizes
-			let keys_16 = ecies_kdf_with_size::<HkdfSha3_256, 16>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
-			let keys_32 = ecies_kdf_with_size::<HkdfSha3_256, 32>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
-			let keys_64 = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let keys_16 = ecies_kdf_with_size::<HkdfSha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+			let keys_32 = ecies_kdf_with_size::<HkdfSha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+			let keys_64 = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
 
 			(keys_16, keys_32, keys_64)
 		},
@@ -578,10 +603,10 @@ mod tests {
 		name: test_ecies_kdf_input_validation,
 		setup: || {
 			// Invalid input test cases
-			let short_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"short", SHARED_SECRET_32, INFO_V1, None);
-			let wrong_size_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"wrong_size_ephemeral_key_34_bytes_", SHARED_SECRET_32, INFO_V1, None);
-			let short_secret_result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, b"short", INFO_V1, None);
-			let long_secret_result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, b"shared_secret_that_is_too_long____", INFO_V1, None);
+			let short_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"short", shared_secret_32(), INFO_V1, None);
+			let wrong_size_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"wrong_size_ephemeral_key_34_bytes_", shared_secret_32(), INFO_V1, None);
+			let short_secret_result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, Secret::from(b"short".to_vec()), INFO_V1, None);
+			let long_secret_result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, Secret::from(b"shared_secret_that_is_too_long____".to_vec()), INFO_V1, None);
 
 			(short_pubkey_result, wrong_size_pubkey_result, short_secret_result, long_secret_result)
 		},
@@ -635,9 +660,9 @@ mod tests {
 		name: test_ecies_kdf_bounds_checking,
 		setup: || {
 			// Test maximum allowed key size (64 bytes * 2 = 128 bytes = MAX_HKDF_OUTPUT_SIZE)
-			let max_size_result = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None);
+			let max_size_result = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None);
 			// Test oversized key size that should fail (65 bytes * 2 = 130 bytes > MAX_HKDF_OUTPUT_SIZE)
-			let oversized_result = ecies_kdf_with_size::<HkdfSha3_256, 65>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None);
+			let oversized_result = ecies_kdf_with_size::<HkdfSha3_256, 65>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None);
 
 			(max_size_result, oversized_result)
 		},
@@ -659,11 +684,11 @@ mod tests {
 	crate::test_case! {
 		name: test_x963_ecies_kdf_basic,
 		setup: || {
-			let key1 = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
-			let key1_again = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
-			let key_diff_info = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V2, None).unwrap();
+			let key1 = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+			let key1_again = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+			let key_diff_info = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None).unwrap();
 			// Salt is ignored by X9.63; with vs without salt should be equal
-			let key_with_salt = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, Some(SALT)).unwrap();
+			let key_with_salt = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT)).unwrap();
 			(key1, key1_again, key_diff_info, key_with_salt)
 		},
 		assertions: |(key1, key1_again, key_diff_info, key_with_salt)| {
@@ -679,8 +704,8 @@ mod tests {
 	crate::test_case! {
 		name: test_x963_ecies_kdf_size_variations,
 		setup: || {
-			let keys_16 = ecies_kdf_with_size::<X963Sha3_256, 16>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
-			let keys_32 = ecies_kdf_with_size::<X963Sha3_256, 32>(EPHEMERAL_PUBKEY_33, SHARED_SECRET_32, INFO_V1, None).unwrap();
+			let keys_16 = ecies_kdf_with_size::<X963Sha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+			let keys_32 = ecies_kdf_with_size::<X963Sha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
 			(keys_16, keys_32)
 		},
 		assertions: |(keys_16, keys_32)| {

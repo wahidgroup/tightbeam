@@ -17,6 +17,7 @@ use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
 
@@ -50,24 +51,7 @@ where
 	}
 
 	let kdf = provider.as_key_deriver::<HandshakeError, 32>();
-	shared_secret
-		.with(|ss| kdf(ss.as_ref(), ukm, kdf_info))
-		.map_err(|_| HandshakeError::KdfError)
-}
-
-/// Constant-time equality check.
-#[inline]
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-	if a.len() != b.len() {
-		return false;
-	}
-
-	let mut diff: u8 = 0;
-	for (x, y) in a.iter().zip(b.iter()) {
-		diff |= x ^ y;
-	}
-
-	diff == 0
+	Ok(shared_secret.with(|ss| kdf(ss.as_ref(), ukm, kdf_info))??)
 }
 
 /// Wrap a CEK (sender side) producing RFC 3394 wrapped bytes.
@@ -92,9 +76,11 @@ where
 	// Wrap
 	let wrapper = provider.as_key_wrapper_32::<HandshakeError>();
 	let wrapped = wrapper(cek, &kek)?;
+
 	// Zeroize KEK
 	#[cfg(feature = "zeroize")]
 	kek.zeroize();
+
 	Ok(wrapped)
 }
 
@@ -113,6 +99,7 @@ where
 	<C as elliptic_curve::Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
 {
+	core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 	// ECDH
 	let shared_secret = derive_shared_secret(recipient_priv, originator_pub)?;
 	// HKDF -> KEK
@@ -123,7 +110,9 @@ where
 	// Re-wrap for constant-time validation
 	let wrapper = provider.as_key_wrapper_32::<HandshakeError>();
 	let rewrapped = wrapper(&cek, &kek)?;
-	let valid = ct_eq(rewrapped.as_slice(), wrapped);
+
+	let valid: bool = rewrapped.as_slice().ct_eq(wrapped).into();
+	core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
 	// Zeroize KEK
 	#[cfg(feature = "zeroize")]
@@ -146,7 +135,7 @@ mod tests {
 	use crate::random::OsRng;
 
 	#[test]
-	fn wrap_unwrap_roundtrip() {
+	fn wrap_unwrap_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 		let provider = DefaultCryptoProvider::default();
 		let sender = K256SecretKey::random(&mut OsRng);
 		let recipient = K256SecretKey::random(&mut OsRng);
@@ -155,16 +144,16 @@ mod tests {
 		let ukm = [0x55u8; 64];
 		let cek = [0x42u8; 32];
 
-		let wrapped = kari_wrap(&provider, &sender, &recipient_pub, &ukm, TIGHTBEAM_KARI_KDF_INFO, &cek).unwrap();
+		let wrapped = kari_wrap(&provider, &sender, &recipient_pub, &ukm, TIGHTBEAM_KARI_KDF_INFO, &cek)?;
 		assert!(wrapped.len() > cek.len());
 
-		let unwrapped =
-			kari_unwrap(&provider, &recipient, &sender_pub, &ukm, TIGHTBEAM_KARI_KDF_INFO, &wrapped).unwrap();
+		let unwrapped = kari_unwrap(&provider, &recipient, &sender_pub, &ukm, TIGHTBEAM_KARI_KDF_INFO, &wrapped)?;
 		assert_eq!(unwrapped, cek);
+		Ok(())
 	}
 
 	#[test]
-	fn unwrap_fail_with_wrong_key() {
+	fn unwrap_fail_with_wrong_key() -> Result<(), Box<dyn std::error::Error>> {
 		let provider = DefaultCryptoProvider::default();
 		let sender = K256SecretKey::random(&mut OsRng);
 		let recipient = K256SecretKey::random(&mut OsRng);
@@ -180,8 +169,7 @@ mod tests {
 			&ukm,
 			crate::constants::TIGHTBEAM_KARI_KDF_INFO,
 			&cek,
-		)
-		.unwrap();
+		)?;
 		// Attempt unwrap with wrong recipient key should fail
 		let bad = kari_unwrap(
 			&provider,
@@ -192,5 +180,6 @@ mod tests {
 			&wrapped,
 		);
 		assert!(bad.is_err());
+		Ok(())
 	}
 }

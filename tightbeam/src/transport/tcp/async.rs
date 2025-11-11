@@ -918,10 +918,7 @@ mod tests {
 		)?;
 
 		let addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
-		let config = crate::transport::TransportEncryptionConfig::new(
-			cert.clone(),
-			crate::transport::handshake::ServerKeyManager::new(signing_key.clone()),
-		);
+		let config = crate::transport::TransportEncryptionConfig::new(cert.clone(), signing_key.clone().into());
 		let (listener, socket_addr) = TokioListener::bind_with(addr, config).await?;
 		let server = listener;
 

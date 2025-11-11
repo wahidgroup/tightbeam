@@ -765,7 +765,7 @@ macro_rules! test_container {
 
 			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
 				.map_err(|e| $crate::TightBeamError::from(e))?;
-			let key_manager = $crate::transport::handshake::ServerKeyManager::new(signing_key.clone());
+			let key_manager = signing_key.clone().into();
 			let config = $crate::transport::TransportEncryptionConfig::new(
 				cert.clone().unwrap(),
 				key_manager,
@@ -797,7 +797,7 @@ macro_rules! test_container {
 
 			let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
 				.map_err(|e| $crate::TightBeamError::from(e))?;
-			let key_manager = $crate::transport::handshake::ServerKeyManager::new(signing_key);
+			let key_manager = signing_key.into();
 			let config = $crate::transport::TransportEncryptionConfig::new(
 				cert.clone().unwrap(),
 				key_manager,

@@ -134,6 +134,7 @@ mod tests {
 
 	fn mock_profile(id: u8) -> SecurityProfileDesc {
 		SecurityProfileDesc {
+			#[cfg(feature = "digest")]
 			digest: HASH_SHA3_256_OID,
 			#[cfg(feature = "aead")]
 			aead: Some(AES_256_GCM_OID),
@@ -141,6 +142,10 @@ mod tests {
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
+			#[cfg(feature = "kdf")]
+			kdf: Some(HASH_SHA3_256_OID),
+			#[cfg(feature = "ecdh")]
+			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
 			// Use different key wrap algorithms to differentiate profiles
 			key_wrap: match id {
 				1 => Some(AES_128_WRAP_OID),
@@ -204,21 +209,35 @@ mod tests {
 
 		// AES-128-GCM profile
 		let aes128_gcm = SecurityProfileDesc {
+			#[cfg(feature = "digest")]
 			digest: HASH_SHA256_OID,
+			#[cfg(feature = "aead")]
 			aead: Some(AES_128_GCM_OID),
+			#[cfg(feature = "aead")]
 			aead_key_size: Some(16),
 			#[cfg(feature = "signature")]
 			signature: Some(SIGNER_ECDSA_WITH_SHA256_OID),
+			#[cfg(feature = "kdf")]
+			kdf: Some(HASH_SHA256_OID),
+			#[cfg(feature = "ecdh")]
+			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
 			key_wrap: Some(AES_128_WRAP_OID),
 		};
 
 		// AES-256-GCM profile
 		let aes256_gcm = SecurityProfileDesc {
+			#[cfg(feature = "digest")]
 			digest: HASH_SHA256_OID,
+			#[cfg(feature = "aead")]
 			aead: Some(AES_256_GCM_OID),
+			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
 			signature: Some(SIGNER_ECDSA_WITH_SHA256_OID),
+			#[cfg(feature = "kdf")]
+			kdf: Some(HASH_SHA256_OID),
+			#[cfg(feature = "ecdh")]
+			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
 			key_wrap: Some(AES_256_WRAP_OID),
 		};
 

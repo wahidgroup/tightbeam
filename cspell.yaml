@@ -16,6 +16,7 @@ words:
   - CSPRNG
   - Decorrelated
   - Decryptor
+  - Deque
   - DHAES
   - diffie
   - dsts
@@ -49,6 +50,7 @@ words:
   - nonrepudiation
   - OCSP
   - oids
+  - oipk
   - Orchestr
   - Pingable
   - pkcs

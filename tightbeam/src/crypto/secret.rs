@@ -7,11 +7,11 @@
 //! - Zeroize on drop for the inner value
 //! - Blanket From<T> for ergonomic construction
 
-use core::convert::Infallible;
 use core::str::FromStr;
 use core::{any, fmt};
 
 use crate::der::{self, Decode, Encode, FixedTag};
+use crate::error::TightBeamError;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A secret wrapper that zeroizes its inner value on drop.
@@ -30,9 +30,11 @@ impl<S: Zeroize + ?Sized> Secret<S> {
 
 	/// Ephemeral immutable access to the inner secret via a closure to allow
 	/// for secure introspection.
-	pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> R {
-		let inner = self.inner.as_ref().expect("secret moved");
-		f(inner.as_ref())
+	pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> Result<R, TightBeamError> {
+		match self.inner.as_ref() {
+			Some(inner) => Ok(f(inner.as_ref())),
+			None => Err(TightBeamError::InvalidMetadata),
+		}
 	}
 }
 
@@ -111,7 +113,7 @@ impl From<&str> for SecretString {
 }
 
 impl FromStr for SecretString {
-	type Err = Infallible;
+	type Err = core::convert::Infallible;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		Ok(SecretString::from(s))
@@ -125,15 +127,17 @@ impl FromStr for SecretString {
 ///   `Box<[T]>` or `Box<str>`.
 pub trait ToInsecure {
 	type Raw;
-	fn to_insecure(self) -> Self::Raw;
+	fn to_insecure(self) -> Result<Self::Raw, TightBeamError>;
 }
 
 impl<S: Zeroize> ToInsecure for Secret<S> {
 	type Raw = S;
-	fn to_insecure(self) -> S {
+	fn to_insecure(self) -> Result<S, TightBeamError> {
 		let mut this = self;
-		let inner_box = this.inner.take().expect("secret moved");
-		*inner_box
+		match this.inner.take() {
+			Some(inner_box) => Ok(*inner_box),
+			None => Err(TightBeamError::InvalidMetadata),
+		}
 	}
 }
 
@@ -144,18 +148,24 @@ where
 {
 	type Raw = Box<[T]>;
 
-	fn to_insecure(self) -> Box<[T]> {
+	fn to_insecure(self) -> Result<Box<[T]>, TightBeamError> {
 		let mut this = self;
-		this.inner.take().expect("secret moved")
+		match this.inner.take() {
+			Some(inner) => Ok(inner),
+			None => Err(TightBeamError::InvalidMetadata),
+		}
 	}
 }
 
 impl ToInsecure for Secret<str> {
 	type Raw = Box<str>;
 
-	fn to_insecure(self) -> Box<str> {
+	fn to_insecure(self) -> Result<Box<str>, TightBeamError> {
 		let mut this = self;
-		this.inner.take().expect("secret moved")
+		match this.inner.take() {
+			Some(inner) => Ok(inner),
+			None => Err(TightBeamError::InvalidMetadata),
+		}
 	}
 }
 
@@ -164,36 +174,40 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn test_secret_string_from_str() {
-		let s = SecretString::from_str("test").unwrap();
-		assert_eq!(s.to_insecure(), "test".into());
+	fn test_secret_string_from_str() -> Result<(), Box<dyn std::error::Error>> {
+		let s = SecretString::from_str("test")?;
+		assert_eq!(s.to_insecure()?, "test".into());
+		Ok(())
 	}
 
 	#[test]
-	fn test_to_insecure_sized() {
+	fn test_to_insecure_sized() -> Result<(), Box<dyn std::error::Error>> {
 		let s: Secret<[u8; 2]> = Secret::from([1u8, 2u8]);
-		let raw = s.to_insecure();
+		let raw = s.to_insecure()?;
 		assert_eq!(raw, [1, 2]);
+		Ok(())
 	}
 
 	#[test]
-	fn test_to_insecure_dsts() {
+	fn test_to_insecure_dsts() -> Result<(), Box<dyn std::error::Error>> {
 		let s: SecretString = SecretString::from("abc");
-		let raw: Box<str> = s.to_insecure();
+		let raw: Box<str> = s.to_insecure()?;
 		assert_eq!(&*raw, "abc");
 
 		let s2: SecretSlice<u8> = Vec::from([9u8, 8u8, 7u8]).into();
-		let raw2: Box<[u8]> = s2.to_insecure();
+		let raw2: Box<[u8]> = s2.to_insecure()?;
 		assert_eq!(&*raw2, &[9, 8, 7]);
+		Ok(())
 	}
 
 	#[test]
-	fn test_with_immutable_access() {
+	fn test_with_immutable_access() -> Result<(), Box<dyn std::error::Error>> {
 		let s: SecretString = SecretString::from("abcdef");
-		let len = s.with(|inner| inner.len());
+		let len = s.with(|inner| inner.len())?;
 		assert_eq!(len, 6);
 
-		let raw = s.to_insecure();
+		let raw = s.to_insecure()?;
 		assert_eq!(&*raw, "abcdef");
+		Ok(())
 	}
 }

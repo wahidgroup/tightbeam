@@ -2,7 +2,6 @@
 //!     ╔════════════════════════════════════════════════════════════════╗
 //!     ║                        T I G H T B E A M                       ║
 //!     ║             Efficient Exchange-Compute Interconnect            ║
-//!     ║           Mycelial Networking for Distributed Systems          ║
 //!     ╚════════════════════════════════════════════════════════════════╝
 //!
 //!                              ┌─────────────┐
@@ -32,11 +31,10 @@
 //! ┌──┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌─┐┌──┐
 //! │Wr││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││W││Wr│
 //! └──┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└─┘└──┘
-//!   Mycelial Network: Workers connect directly to servlets (no routing)
 //!
-//!    ╔═══════════════════════════════════════════════════════════════════╗
-//!    ║   Protocol-Agnostic • Zero-Copy • ASN.1 DER • RustCrypto-Native   ║
-//!    ╚═══════════════════════════════════════════════════════════════════╝
+//! ╔════════════════════════════════════════════════════════════════════════╗
+//! ║   Protocol-Agnostic • Zero-Copy • Zero-Panic • ASN.1 DER • RustCrypto  ║
+//! ╚════════════════════════════════════════════════════════════════════════╝
 //!
 //!         ┌──────────────────────────────────────────────────────┐
 //!         │  🔐 Security Model: Sign-Then-Encrypt                │
@@ -180,7 +178,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn frame_size_calc() {
+	fn frame_size_calc() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::asn1::*;
 		use crate::cms::cert::IssuerAndSerialNumber;
 		use crate::cms::compressed_data::CompressedData;
@@ -205,26 +203,23 @@ mod tests {
 				compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB_OID, parameters: None },
 				encap_content_info: EncapsulatedContentInfo {
 					econtent_type: DATA_OID,
-					econtent: Some(
-						der::Any::from_der(&der::asn1::OctetString::new(vec![0; 10]).unwrap().to_der().unwrap())
-							.unwrap(),
-					),
+					econtent: Some(der::Any::from_der(&der::asn1::OctetString::new(vec![0; 10])?.to_der()?)?),
 				},
 			}),
 			integrity: Some(DigestInfo {
 				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
-				digest: der::asn1::OctetString::new(vec![0; 32]).unwrap(),
+				digest: der::asn1::OctetString::new(vec![0; 32])?,
 			}),
 			confidentiality: Some(EncryptedContentInfo {
 				content_type: DATA_OID,
 				content_enc_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB_OID, parameters: None },
-				encrypted_content: Some(der::asn1::OctetString::new(vec![0; 50]).unwrap()),
+				encrypted_content: Some(der::asn1::OctetString::new(vec![0; 50])?),
 			}),
 			priority: Some(MessagePriority::Normal),
 			lifetime: Some(3600),
 			previous_frame: Some(DigestInfo {
 				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
-				digest: der::asn1::OctetString::new(vec![0; 32]).unwrap(),
+				digest: der::asn1::OctetString::new(vec![0; 32])?,
 			}),
 			matrix: Some(matrix),
 		};
@@ -236,25 +231,26 @@ mod tests {
 			message: vec![], // empty message
 			integrity: Some(DigestInfo {
 				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
-				digest: der::asn1::OctetString::new(vec![0; 32]).unwrap(),
+				digest: der::asn1::OctetString::new(vec![0; 32])?,
 			}),
 			nonrepudiation: Some(SignerInfo {
 				version: CmsVersion::V1,
 				sid: SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
 					issuer: Name::default(),
-					serial_number: SerialNumber::new(&[0; 8]).unwrap(),
+					serial_number: SerialNumber::new(&[0; 8])?,
 				}),
 				digest_alg: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
 				signed_attrs: None,
 				signature_algorithm: AlgorithmIdentifier { oid: SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None },
-				signature: der::asn1::OctetString::new(vec![0; 64]).unwrap(),
+				signature: der::asn1::OctetString::new(vec![0; 64])?,
 				unsigned_attrs: None,
 			}),
 		};
 
 		// Encode to DER
-		let der_bytes = der::Encode::to_der(&frame).unwrap();
+		let der_bytes = der::Encode::to_der(&frame)?;
 		println!("DER-encoded frame size: {} bytes", der_bytes.len());
 		assert!(!der_bytes.is_empty());
+		Ok(())
 	}
 }

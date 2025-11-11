@@ -287,34 +287,46 @@ pub trait ServerHandshakeKey: Send + Sync {
 
 /// Encapsulated server key manager for handshake protocols.
 ///
-/// This struct encapsulates a signing key and provides factory methods to create
-/// handshake orchestrators that borrow the key by reference, ensuring zero-copy
-/// key management and proper encapsulation.
+/// This struct encapsulates a key provider and provides factory methods to create
+/// handshake orchestrators that use the provider for cryptographic operations,
+/// ensuring proper encapsulation and enabling HSM/KMS integration.
 ///
 /// The key material is never exposed through the public API - orchestrators
 /// get shared ownership via Arc cloning.
 #[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct ServerKeyManager {
-	signing_key: Arc<Secp256k1SigningKey>,
+	provider: Arc<dyn crate::crypto::key::KeyProvider>,
 }
 
 #[cfg(feature = "x509")]
-impl ServerKeyManager {
-	/// Create a new key manager with the given signing key.
-	///
-	/// The key is encapsulated and will never be exposed through the public API.
-	pub fn new(signing_key: Secp256k1SigningKey) -> Self {
-		Self { signing_key: Arc::new(signing_key) }
+impl From<Secp256k1SigningKey> for ServerKeyManager {
+	fn from(signing_key: Secp256k1SigningKey) -> Self {
+		let provider = crate::crypto::key::InMemoryKeyProvider::from(signing_key);
+		Self { provider: Arc::new(provider) }
+	}
+}
+
+#[cfg(feature = "x509")]
+impl From<crate::crypto::key::InMemoryKeyProvider> for ServerKeyManager {
+	fn from(provider: crate::crypto::key::InMemoryKeyProvider) -> Self {
+		Self { provider: Arc::new(provider) }
+	}
+}
+
+#[cfg(feature = "x509")]
+impl From<Arc<dyn crate::crypto::key::KeyProvider>> for ServerKeyManager {
+	fn from(provider: Arc<dyn crate::crypto::key::KeyProvider>) -> Self {
+		Self { provider }
 	}
 }
 
 #[cfg(feature = "x509")]
 impl ServerKeyManager {
-	/// Create an ECIES server handshake orchestrator using the encapsulated key.
+	/// Create an ECIES server handshake orchestrator using the encapsulated key provider.
 	///
-	/// The orchestrator borrows the signing key by reference, ensuring zero-copy
-	/// key management and proper encapsulation.
+	/// The orchestrator uses the key provider for cryptographic operations,
+	/// ensuring proper encapsulation and enabling HSM/KMS integration.
 	///
 	/// # Parameters
 	/// - `server_cert`: The server's certificate to send to client
@@ -323,7 +335,7 @@ impl ServerKeyManager {
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	///
 	/// # Returns
-	/// A boxed ECIES server handshake orchestrator that borrows the encapsulated key
+	/// A boxed ECIES server handshake orchestrator that uses the encapsulated key provider
 	pub fn create_ecies_server<'a>(
 		&'a self,
 		server_cert: Arc<Certificate>,
@@ -335,8 +347,7 @@ impl ServerKeyManager {
 		{
 			let server = crate::transport::handshake::server::EciesHandshakeServer::<
 				crate::crypto::profiles::DefaultCryptoProvider,
-				crate::crypto::sign::ecdsa::Secp256k1SigningKey,
-			>::new(Arc::clone(&self.signing_key), server_cert, aad_domain_tag, client_validators)
+			>::new(Arc::clone(&self.provider), server_cert, aad_domain_tag, client_validators)
 			.with_supported_profiles(supported_profiles);
 
 			Ok(Box::new(server))
@@ -347,10 +358,10 @@ impl ServerKeyManager {
 		}
 	}
 
-	/// Create an ECIES client handshake orchestrator using the encapsulated key.
+	/// Create an ECIES client handshake orchestrator using the encapsulated key provider.
 	///
-	/// The orchestrator borrows the signing key by reference for mutual authentication,
-	/// ensuring zero-copy key management.
+	/// The orchestrator uses the key provider for cryptographic operations,
+	/// ensuring proper encapsulation and enabling HSM/KMS integration.
 	///
 	/// # Parameters
 	/// - `server_cert`: Optional server certificate to validate
@@ -359,7 +370,7 @@ impl ServerKeyManager {
 	/// - `validator`: Optional certificate validator for server certificate
 	///
 	/// # Returns
-	/// An ECIES client handshake orchestrator that borrows the encapsulated key
+	/// An ECIES client handshake orchestrator that uses the encapsulated key provider
 	pub fn create_ecies_client<'a>(
 		&'a self,
 		_server_cert: Option<Arc<Certificate>>,
@@ -369,13 +380,16 @@ impl ServerKeyManager {
 	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>> {
 		#[cfg(feature = "secp256k1")]
 		{
-			// Create client with mutual auth (K = encapsulated signing key)
-			let signing_key = client_cert.as_ref().map(|_| Arc::new((*self.signing_key).clone()));
+			// Create client with mutual auth using key provider
+			let provider = if client_cert.is_some() {
+				Some(Arc::clone(&self.provider))
+			} else {
+				None
+			};
 			let client = crate::transport::handshake::client::EciesHandshakeClient::<
 				crate::crypto::profiles::DefaultCryptoProvider,
 				crate::crypto::ecies::Secp256k1EciesMessage,
-				crate::crypto::sign::ecdsa::SigningKey<crate::crypto::sign::ecdsa::Secp256k1>,
-			>::new_with_identity(aad_domain_tag, client_cert, signing_key);
+			>::new_with_identity(aad_domain_tag, client_cert, provider);
 
 			// Apply certificate validator if provided
 			let client = if let Some(val) = validator {
@@ -392,17 +406,17 @@ impl ServerKeyManager {
 		}
 	}
 
-	/// Create a CMS client handshake orchestrator using the encapsulated key.
+	/// Create a CMS client handshake orchestrator using the encapsulated key provider.
 	///
-	/// The orchestrator borrows the signing key by reference, ensuring zero-copy
-	/// key management and proper encapsulation.
+	/// The orchestrator uses the key provider for cryptographic operations,
+	/// ensuring proper encapsulation and enabling HSM/KMS integration.
 	///
 	/// # Parameters
 	/// - `server_cert`: The server's certificate for key agreement
 	/// - `validators`: Optional certificate validators to apply during handshake
 	///
 	/// # Returns
-	/// A CMS client handshake orchestrator that borrows the encapsulated key
+	/// A CMS client handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_client<'a>(
 		&'a self,
@@ -414,7 +428,7 @@ impl ServerKeyManager {
 			let provider = DefaultCryptoProvider::default();
 			let mut client = crate::transport::handshake::client::CmsHandshakeClientSecp256k1::new(
 				provider,
-				Arc::clone(&self.signing_key),
+				Arc::clone(&self.provider),
 				_server_cert,
 			);
 
@@ -431,16 +445,16 @@ impl ServerKeyManager {
 		}
 	}
 
-	/// Create a CMS server handshake orchestrator using the encapsulated key.
+	/// Create a CMS server handshake orchestrator using the encapsulated key provider.
 	///
-	/// The orchestrator borrows the signing key by reference, ensuring zero-copy
-	/// key management and proper encapsulation.
+	/// The orchestrator uses the key provider for cryptographic operations,
+	/// ensuring proper encapsulation and enabling HSM/KMS integration.
 	///
 	/// # Parameters
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	///
 	/// # Returns
-	/// A CMS server handshake orchestrator that borrows the encapsulated key
+	/// A CMS server handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_server<'a>(
 		&'a self,
@@ -449,7 +463,7 @@ impl ServerKeyManager {
 		#[cfg(feature = "secp256k1")]
 		{
 			let server = crate::transport::handshake::server::CmsHandshakeServerSecp256k1::new(
-				Arc::clone(&self.signing_key),
+				Arc::clone(&self.provider),
 				client_validators,
 			);
 			Ok(Box::new(server))

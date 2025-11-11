@@ -17,6 +17,7 @@ use crate::asn1::{
 	SIGNER_ECDSA_WITH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_512_OID,
 };
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::crypto::key::{InMemoryKeyProvider, KeyProvider};
 use crate::crypto::negotiation::SecurityAccept;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::SecurityProfileDesc;
@@ -50,6 +51,7 @@ use crate::x509::time::Time;
 /// Create a default test security profile for handshake tests.
 pub fn create_default_test_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
+		#[cfg(feature = "digest")]
 		digest: HASH_SHA3_256_OID,
 		#[cfg(feature = "aead")]
 		aead: Some(AES_256_GCM_OID),
@@ -57,6 +59,10 @@ pub fn create_default_test_profile() -> SecurityProfileDesc {
 		aead_key_size: Some(32), // AES-256 uses 32-byte keys
 		#[cfg(feature = "signature")]
 		signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
+		#[cfg(feature = "kdf")]
+		kdf: Some(HASH_SHA3_256_OID), // Use SHA3-256 OID for HKDF-SHA3-256
+		#[cfg(feature = "ecdh")]
+		curve: Some(crate::asn1::CURVE_SECP256K1_OID),
 		key_wrap: None,
 	}
 }
@@ -83,7 +89,7 @@ pub struct TestHandshakeData {
 /// The certificate uses minimal valid data and a long validity period for testing.
 pub fn create_test_certificate() -> TestCertificate {
 	let signing_key = Secp256k1SigningKey::random(&mut OsRng);
-	let certificate = create_test_certificate_inner(&signing_key);
+	let certificate = create_test_certificate_inner(&signing_key).expect("Test certificate creation should succeed");
 	TestCertificate { signing_key, certificate }
 }
 
@@ -91,55 +97,55 @@ pub fn create_test_certificate() -> TestCertificate {
 ///
 /// This creates a certificate using the provided signing key, ensuring the
 /// certificate's public key matches the private key.
-pub fn create_test_certificate_from_key(signing_key: &Secp256k1SigningKey) -> Certificate {
+pub fn create_test_certificate_from_key(
+	signing_key: &Secp256k1SigningKey,
+) -> Result<Certificate, Box<dyn std::error::Error>> {
 	create_test_certificate_inner(signing_key)
 }
 
 /// Internal function to create a certificate from a signing key.
 #[cfg(feature = "time")]
-fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Certificate {
+fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn std::error::Error>> {
 	let verifying_key = *signing_key.verifying_key();
-	let public_key_der = verifying_key.to_public_key_der().unwrap();
+	let public_key_der = verifying_key.to_public_key_der()?;
 
 	let tbs_cert = TbsCertificate {
 		version: crate::x509::Version::V3,
-		serial_number: SerialNumber::new(&[1]).unwrap(),
+		serial_number: SerialNumber::new(&[1])?,
 		signature: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256_OID, parameters: None },
 		issuer: RdnSequence::default(),
 		validity: Validity {
-			not_before: Time::GeneralTime(
-				GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(0)).unwrap(),
-			),
-			not_after: Time::GeneralTime(
-				GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(u32::MAX as u64)).unwrap(),
-			),
+			not_before: Time::GeneralTime(GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(0))?),
+			not_after: Time::GeneralTime(GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(
+				u32::MAX as u64,
+			))?),
 		},
 		subject: RdnSequence::default(),
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).unwrap(),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())?,
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		extensions: None,
 	};
 
-	Certificate {
+	Ok(Certificate {
 		tbs_certificate: tbs_cert,
 		signature_algorithm: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256_OID, parameters: None },
-		signature: BitString::new(0, vec![0; 64]).unwrap(),
-	}
+		signature: BitString::new(0, vec![0; 64])?,
+	})
 }
 
 /// Generate random test handshake data.
 ///
 /// Creates cryptographically random values for client random, server random,
 /// and base session key, then computes the transcript hash.
-pub fn generate_test_handshake_data() -> TestHandshakeData {
-	let client_random = crate::random::generate_nonce::<32>(None).unwrap();
-	let server_random = crate::random::generate_nonce::<32>(None).unwrap();
-	let base_session_key = crate::random::generate_nonce::<32>(None).unwrap();
+pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn std::error::Error>> {
+	let client_random = crate::random::generate_nonce::<32>(None)?;
+	let server_random = crate::random::generate_nonce::<32>(None)?;
+	let base_session_key = crate::random::generate_nonce::<32>(None)?;
 
 	let transcript_hash = compute_test_transcript_hash(&client_random, &server_random, &[]);
 
-	TestHandshakeData { client_random, server_random, base_session_key, transcript_hash }
+	Ok(TestHandshakeData { client_random, server_random, base_session_key, transcript_hash })
 }
 
 /// Compute a test transcript hash from client random, server random, and SPKI bytes.
@@ -254,6 +260,14 @@ pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
 	AlgorithmIdentifierOwned { oid: AES_256_WRAP_OID, parameters: None }
 }
 
+/// Helper function to convert a SigningKey into an Arc<dyn KeyProvider>.
+///
+/// This is a convenience function for tests and simple use cases where
+/// you want to quickly wrap a signing key in a KeyProvider trait object.
+pub fn into_provider(signing_key: Secp256k1SigningKey) -> std::sync::Arc<dyn KeyProvider> {
+	std::sync::Arc::new(InMemoryKeyProvider::from(signing_key))
+}
+
 // ============================================================================
 // Test Fixture Builders
 // ============================================================================
@@ -292,27 +306,28 @@ impl TestEciesServerBuilder {
 	}
 
 	/// Build the ECIES handshake server.
-	pub fn build(self) -> EciesHandshakeServer<DefaultCryptoProvider, Secp256k1SigningKey> {
+	pub fn build(self) -> Result<EciesHandshakeServer<DefaultCryptoProvider>, Box<dyn std::error::Error>> {
 		let test_cert_data = if let Some(cert) = self.cert {
 			let key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 			TestCertificate { signing_key: key, certificate: cert }
 		} else {
 			self.key
-				.map(|key| {
-					let cert = create_test_certificate_from_key(&key);
-					TestCertificate { signing_key: key, certificate: cert }
+				.map(|key| -> Result<TestCertificate, Box<dyn std::error::Error>> {
+					let cert = create_test_certificate_from_key(&key)?;
+					Ok(TestCertificate { signing_key: key, certificate: cert })
 				})
+				.transpose()?
 				.unwrap_or_else(|| create_test_certificate())
 		};
 
 		let default_profile = create_default_test_profile();
-		EciesHandshakeServer::new(
-			Arc::new(test_cert_data.signing_key),
+		Ok(EciesHandshakeServer::new(
+			into_provider(test_cert_data.signing_key),
 			Arc::new(test_cert_data.certificate),
 			self.aad_domain,
 			None, // No client validators in tests by default
 		)
-		.with_supported_profiles(vec![default_profile])
+		.with_supported_profiles(vec![default_profile]))
 	}
 }
 
@@ -393,7 +408,7 @@ impl TestCmsServerBuilder {
 
 		// Apply transcript hash if explicitly set
 		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
-		let mut server = CmsHandshakeServerSecp256k1::new(test_key.into(), None);
+		let mut server = CmsHandshakeServerSecp256k1::new(into_provider(test_key), None);
 		if let Some(hash) = self.transcript_hash {
 			server = server.with_transcript_hash(hash);
 		}
@@ -447,15 +462,16 @@ impl TestCmsClientBuilder {
 	}
 
 	/// Build the CMS handshake client.
-	pub fn build(self) -> CmsHandshakeClientSecp256k1 {
+	pub fn build(self) -> Result<CmsHandshakeClientSecp256k1, Box<dyn std::error::Error>> {
 		let client_key = self.client_key.unwrap_or_else(|| create_test_certificate().signing_key);
-		let server_cert = self
-			.server_cert
-			.unwrap_or_else(|| create_test_certificate_from_key(&create_test_certificate().signing_key));
+		let server_cert = match self.server_cert {
+			Some(cert) => cert,
+			None => create_test_certificate_from_key(&create_test_certificate().signing_key)?,
+		};
 
 		let mut client = CmsHandshakeClientSecp256k1::new(
 			DefaultCryptoProvider::default(),
-			client_key.into(),
+			into_provider(client_key),
 			Arc::new(server_cert),
 		);
 
@@ -464,7 +480,7 @@ impl TestCmsClientBuilder {
 			client = client.with_transcript_hash(hash);
 		}
 
-		client
+		Ok(client)
 	}
 }
 

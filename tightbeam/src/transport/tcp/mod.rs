@@ -338,8 +338,8 @@ macro_rules! impl_tcp_common {
 				use $crate::transport::handshake::ClientHello;
 				use $crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
-				// Create K=() client (cannot be trait object)
-				let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage, ()>::new(None);
+				// Create client without mutual auth
+				let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None);
 				#[cfg(all(feature = "x509", feature = "std"))]
 				if let Some(val) = validator {
 					client = client.with_certificate_validator(val);

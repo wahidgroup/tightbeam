@@ -16,6 +16,14 @@ pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
 
+/// id-data
+/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
+/// See `<https://oid-base.com/get/1.2.840.113549.1.7.1>`
+pub const DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
+/// id-envelopedData
+/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
+/// See `<https://oid-base.com/get/1.2.840.113549.1.7.3>`
+pub const ENVELOPED_DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.3");
 /// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
 /// id-ct-compressedData OBJECT IDENTIFIER ::= {
 ///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
@@ -73,14 +81,22 @@ pub const AES_192_WRAP_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.1
 /// See RFC 3394 - https://datatracker.ietf.org/doc/html/rfc3394
 /// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.45>`
 pub const AES_256_WRAP_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45");
-/// id-data
-/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
-/// See `<https://oid-base.com/get/1.2.840.113549.1.7.1>`
-pub const DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
-/// id-envelopedData
-/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
-/// See `<https://oid-base.com/get/1.2.840.113549.1.7.3>`
-pub const ENVELOPED_DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.3");
+/// secp256k1 - Elliptic curve for Bitcoin/Ethereum
+/// See `<https://oid-base.com/get/1.3.132.0.10>`
+pub const CURVE_SECP256K1_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.10");
+/// secp256r1 (NIST P-256) - Elliptic curve
+/// See `<https://oid-base.com/get/1.2.840.10045.3.1.7>`
+pub const CURVE_NIST_P256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+/// secp384r1 (NIST P-384) - Elliptic curve
+/// See `<https://oid-base.com/get/1.3.132.0.34>`
+pub const CURVE_NIST_P384_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
+/// secp521r1 (NIST P-521) - Elliptic curve
+/// See `<https://oid-base.com/get/1.3.132.0.35>`
+pub const CURVE_NIST_P521_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
+/// X25519 - Curve25519 for ECDH (used with Ed25519 signatures)
+/// See RFC 8410 - `<https://datatracker.ietf.org/doc/html/rfc8410>`
+/// See `<https://oid-base.com/get/1.3.101.110>`
+pub const CURVE_X25519_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.110");
 
 /// Protocol version determines metadata structure and features
 ///
@@ -285,23 +301,4 @@ pub mod transport {
 	/// Composite profile OID (ECIES(secp256k1) + HKDF(SHA3-256) + AES-256-GCM)
 	pub const HANDSHAKE_PROFILE_ECIES_GCM_OID: ObjectIdentifier =
 		ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.100");
-
-	// Standard elliptic curve OIDs (for interoperability)
-	// These are IANA/ANSI registered OIDs, not TightBeam-specific
-
-	/// secp256k1 curve OID (Bitcoin/Ethereum standard)
-	/// ANSI X9.62: 1.3.132.0.10
-	pub const CURVE_SECP256K1_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.10");
-
-	/// NIST P-256 (secp256r1) curve OID
-	/// ANSI X9.62: 1.2.840.10045.3.1.7
-	pub const CURVE_NIST_P256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
-
-	/// NIST P-384 (secp384r1) curve OID
-	/// ANSI X9.62: 1.3.132.0.34
-	pub const CURVE_NIST_P384_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
-
-	/// NIST P-521 (secp521r1) curve OID
-	/// ANSI X9.62: 1.3.132.0.35
-	pub const CURVE_NIST_P521_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
 }

@@ -5,12 +5,14 @@
 //! - AEAD session key finalization (all orchestrators)
 //! - Alert attribute processing (all orchestrators)
 
+use crate::asn1::transport::HANDSHAKE_ABORT_ALERT_OID;
 use crate::constants::{MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::negotiation::{select_profile, SecurityOffer};
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
-use crate::transport::handshake::attributes::{extract_alert, find, HandshakeAttribute};
+use crate::crypto::x509::attr::{Attribute, Attributes};
+use crate::transport::handshake::attributes::{extract_alert_x509, find_x509};
 use crate::transport::handshake::error::HandshakeError;
 
 #[cfg(not(feature = "std"))]
@@ -105,6 +107,7 @@ where
 		Ok(P::AeadCipher::new_from_slice(&final_key_bytes[..])?)
 	}
 }
+
 /// Provides alert attribute processing for all handshake orchestrators.
 ///
 /// All orchestrators automatically implement this trait via blanket impl.
@@ -131,17 +134,14 @@ pub trait HandshakeAlertHandler {
 	/// - `AbortReceived`: Alert detected with specific alert code
 	/// - `InvalidAttributeArity`: Alert attribute malformed
 	/// - `InvalidIntegerEncoding`: Alert code not valid INTEGER
-	fn check_for_alert(&self, attrs: Option<&crate::x509::attr::Attributes>) -> Result<(), HandshakeError> {
+	fn check_for_alert(&self, attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		if let Some(attrs) = attrs {
-			// Convert x509_cert attributes to HandshakeAttribute format
-			let handshake_attrs: Vec<HandshakeAttribute> = attrs
-				.iter()
-				.map(|attr| HandshakeAttribute { attr_type: attr.oid.clone(), attr_values: attr.values.clone().into() })
-				.collect();
+			// Convert to slice of references to avoid cloning
+			let attr_refs: Vec<&Attribute> = attrs.iter().collect();
 
 			// Check for abort alert attribute
-			if let Ok(alert_attr) = find(&handshake_attrs, &crate::asn1::transport::HANDSHAKE_ABORT_ALERT_OID) {
-				let alert = extract_alert(alert_attr)?;
+			if let Ok(alert_attr) = find_x509(&attr_refs, &HANDSHAKE_ABORT_ALERT_OID) {
+				let alert = extract_alert_x509(alert_attr)?;
 				return Err(HandshakeError::AbortReceived(alert));
 			}
 		}
@@ -152,8 +152,11 @@ pub trait HandshakeAlertHandler {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::{AES_128_GCM_OID, AES_256_GCM_OID, HASH_SHA256_OID, SIGNER_ECDSA_WITH_SHA256_OID};
+	use crate::asn1::{
+		AES_128_GCM_OID, AES_256_GCM_OID, CURVE_SECP256K1_OID, HASH_SHA256_OID, SIGNER_ECDSA_WITH_SHA256_OID,
+	};
 	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::der::asn1::ObjectIdentifier;
 
 	// Mock struct for testing negotiation
 	struct MockServer {
@@ -180,37 +183,47 @@ mod tests {
 		}
 	}
 
-	fn create_test_profile(aead_oid: crate::der::asn1::ObjectIdentifier, key_size: u16) -> SecurityProfileDesc {
+	fn create_test_profile(aead_oid: ObjectIdentifier, key_size: u16) -> SecurityProfileDesc {
 		SecurityProfileDesc {
+			#[cfg(feature = "digest")]
 			digest: HASH_SHA256_OID,
+			#[cfg(feature = "aead")]
 			aead: Some(aead_oid),
+			#[cfg(feature = "aead")]
 			aead_key_size: Some(key_size),
+			#[cfg(feature = "signature")]
 			signature: Some(SIGNER_ECDSA_WITH_SHA256_OID),
+			#[cfg(feature = "kdf")]
+			kdf: Some(HASH_SHA256_OID),
+			#[cfg(feature = "ecdh")]
+			curve: Some(CURVE_SECP256K1_OID),
 			key_wrap: None,
 		}
 	}
 
 	#[test]
-	fn test_negotiate_profile_with_offer() {
-		let p_a = create_test_profile(AES_128_GCM_OID, 16);
-		let p_b = create_test_profile(AES_256_GCM_OID, 32);
-
-		let server = MockServer { profiles: vec![p_b] };
-
-		let offer = SecurityOffer::new(vec![p_a, p_b]);
-		let selected = server.negotiate_profile(Some(&offer)).unwrap();
-		assert_eq!(selected.aead_key_size, Some(32)); // Should select p_b
-	}
-
-	#[test]
-	fn test_negotiate_profile_dealers_choice() {
+	fn test_negotiate_profile_with_offer() -> Result<(), Box<dyn std::error::Error>> {
 		let p_a = create_test_profile(AES_128_GCM_OID, 16);
 		let p_b = create_test_profile(AES_256_GCM_OID, 32);
 
 		let server = MockServer { profiles: vec![p_a, p_b] };
 
-		let selected = server.negotiate_profile(None).unwrap();
+		let offer = SecurityOffer::new(vec![p_a, p_b]);
+		let selected = server.negotiate_profile(Some(&offer))?;
+		assert_eq!(selected.aead_key_size, Some(16)); // Should select p_a (client's first preference)
+		Ok(())
+	}
+
+	#[test]
+	fn test_negotiate_profile_dealers_choice() -> Result<(), Box<dyn std::error::Error>> {
+		let p_a = create_test_profile(AES_128_GCM_OID, 16);
+		let p_b = create_test_profile(AES_256_GCM_OID, 32);
+
+		let server = MockServer { profiles: vec![p_a, p_b] };
+
+		let selected = server.negotiate_profile(None)?;
 		assert_eq!(selected.aead_key_size, Some(16)); // Should select first (p_a)
+		Ok(())
 	}
 
 	#[test]

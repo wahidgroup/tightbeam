@@ -50,19 +50,16 @@ pub struct TcpTransport<S: ProtocolStream> {
 
 	peer_certificate: Option<Certificate>,
 
-	#[allow(dead_code)]
 	aad_domain_tag: Option<&'static [u8]>,
 
 	max_cleartext_envelope: Option<usize>,
 
 	max_encrypted_envelope: Option<usize>,
 
-	#[allow(dead_code)]
 	signatory: Option<ServerKeyManager>,
 
 	handshake_state: TcpHandshakeState,
 
-	#[allow(dead_code)]
 	handshake_timeout: Duration,
 
 	symmetric_key: Option<RuntimeAead>,

@@ -729,6 +729,10 @@ mod tests {
 				type DigestOid = Sha3_256;
 				type AeadOid = crate::crypto::aead::Aes128GcmOid;
 				type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
+				#[cfg(feature = "kdf")]
+				type KdfOid = crate::crypto::kdf::HkdfSha3_256Oid;
+				#[cfg(feature = "ecdh")]
+				type CurveOid = crate::crypto::curves::Secp256k1Oid;
 			}
 
 			let message = Aes128Message { content: "test".to_string() };

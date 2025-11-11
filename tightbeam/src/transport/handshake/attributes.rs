@@ -292,6 +292,38 @@ pub fn extract_alert(attr: &HandshakeAttribute) -> Result<HandshakeAlert, Handsh
 	}
 }
 
+/// Extract alert from X.509 attribute without cloning
+pub fn extract_alert_x509(attr: &Attribute) -> Result<HandshakeAlert, HandshakeError> {
+	// Convert values to Vec<Any> (unavoidable due to SetOfVec API)
+	let values: Vec<Any> = attr.values.clone().into();
+	if values.len() != 1 {
+		return Err(HandshakeError::InvalidAttributeArity);
+	}
+
+	let any = &values[0];
+	let uint_ref: UintRef = any.decode_as().map_err(|_| HandshakeError::InvalidIntegerEncoding)?;
+
+	let b = uint_ref.as_bytes();
+	if b.is_empty() || b.len() > 2 {
+		return Err(HandshakeError::IntegerOutOfRange);
+	}
+
+	let code = if b.len() == 1 {
+		b[0] as u16
+	} else {
+		((b[0] as u16) << 8) | b[1] as u16
+	} as u8;
+
+	match code {
+		1 => Ok(HandshakeAlert::AuthRequired),
+		2 => Ok(HandshakeAlert::VersionMismatch),
+		3 => Ok(HandshakeAlert::AlgorithmMismatch),
+		4 => Ok(HandshakeAlert::DecryptFail),
+		5 => Ok(HandshakeAlert::FinishedIntegrityFail),
+		_ => Err(HandshakeError::UnknownAlertCode(code)),
+	}
+}
+
 // -------------------------- Attribute search --------------------------
 
 pub fn find<'a>(
@@ -301,6 +333,21 @@ pub fn find<'a>(
 	let mut found: Option<&HandshakeAttribute> = None;
 	for a in attrs.iter() {
 		if &a.attr_type == oid {
+			if found.is_some() {
+				return Err(HandshakeError::DuplicateAttribute);
+			}
+			found = Some(a);
+		}
+	}
+
+	found.ok_or(HandshakeError::MissingAttribute)
+}
+
+/// Find an X.509 attribute by OID without cloning
+pub fn find_x509<'a>(attrs: &'a [&Attribute], oid: &ObjectIdentifier) -> Result<&'a Attribute, HandshakeError> {
+	let mut found: Option<&Attribute> = None;
+	for a in attrs.iter() {
+		if &a.oid == oid {
 			if found.is_some() {
 				return Err(HandshakeError::DuplicateAttribute);
 			}
@@ -328,6 +375,7 @@ mod tests {
 		HANDSHAKE_PROTOCOL_VERSION_OID, HANDSHAKE_SELECT_ALGORITHM_OID, HANDSHAKE_SELECT_VERSION_OID,
 		HANDSHAKE_SERVER_NONCE_OID,
 	};
+	use crate::asn1::{CURVE_NIST_P256_OID, CURVE_NIST_P384_OID, CURVE_SECP256K1_OID};
 	use crate::der::asn1::Any;
 	use crate::der::asn1::{OctetString as DerOctetString, UintRef};
 
@@ -474,8 +522,6 @@ mod tests {
 
 	#[test]
 	fn supported_curves_encoding() -> Result<(), HandshakeError> {
-		use crate::asn1::transport::{CURVE_NIST_P256_OID, CURVE_NIST_P384_OID, CURVE_SECP256K1_OID};
-
 		// Encode multiple curves in preference order
 		let curves = vec![CURVE_SECP256K1_OID, CURVE_NIST_P256_OID, CURVE_NIST_P384_OID];
 		let attr = encode_supported_curves(&curves)?;
@@ -492,8 +538,6 @@ mod tests {
 
 	#[test]
 	fn selected_curve_round_trip() -> Result<(), HandshakeError> {
-		use crate::asn1::transport::CURVE_NIST_P256_OID;
-
 		let attr = encode_selected_curve(CURVE_NIST_P256_OID)?;
 		assert_eq!(attr.attr_type, HANDSHAKE_SELECTED_CURVE_OID);
 
@@ -511,8 +555,6 @@ mod tests {
 
 	#[test]
 	fn wrong_oid_type_for_curves() -> Result<(), HandshakeError> {
-		use crate::asn1::transport::CURVE_SECP256K1_OID;
-
 		// Create attribute with wrong OID type
 		let any = Any::encode_from(&CURVE_SECP256K1_OID)?;
 		let wrong_attr = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE_OID, attr_values: vec![any] };

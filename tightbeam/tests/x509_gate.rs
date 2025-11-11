@@ -34,7 +34,7 @@ use tightbeam::{
 	server,
 	spki::SubjectPublicKeyInfoOwned,
 	testing::{create_expiring_test_certificate, create_test_signing_key},
-	transport::{handshake::ServerKeyManager, EncryptedProtocol, TransportEncryptionConfig},
+	transport::{EncryptedProtocol, TransportEncryptionConfig},
 	x509::Certificate,
 };
 
@@ -82,7 +82,7 @@ fn create_server_config(
 	key: Secp256k1SigningKey,
 	validators: Vec<Arc<dyn CertificateValidation>>,
 ) -> TransportEncryptionConfig {
-	let key_manager = ServerKeyManager::new(key);
+	let key_manager = key.into();
 	TransportEncryptionConfig::new(cert, key_manager).with_client_validators(validators)
 }
 
@@ -101,7 +101,11 @@ impl MutualAuthServer {
 	) -> Result<Self> {
 		println!("Creating server with {} client validators", client_validators.len());
 		let server_config = create_server_config(server_cert, server_key, client_validators);
-		let bind_addr = TightBeamSocketAddr("127.0.0.1:0".parse().unwrap());
+		let bind_addr = TightBeamSocketAddr(
+			"127.0.0.1:0"
+				.parse()
+				.map_err(|e| TightBeamError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?,
+		);
 		let (listener, addr) = TokioListener::bind_with(bind_addr, server_config).await?;
 		println!("Server listening on {:?}", addr);
 		let (tx, rx) = tokio::sync::mpsc::channel(8);
@@ -230,7 +234,7 @@ async fn test_mutual_auth_with_servlet() -> Result<()> {
 
 	let mut client = client! {
 		connect TokioListener: server.addr,
-		identity: (client_cert, ServerKeyManager::new(client_key)),
+		identity: (client_cert, client_key.into()),
 		policies: {
 			x509_gate: [ExpiryValidator, ServerValidator]
 		}
@@ -245,7 +249,8 @@ async fn test_mutual_auth_with_servlet() -> Result<()> {
 	let response = client.emit(request, None).await?;
 	assert!(response.is_some(), "Should receive response with mutual auth");
 
-	let pong: PongMessage = decode(&response.unwrap().message)?;
+	let response_frame = response.ok_or(TightBeamError::InvalidMetadata)?;
+	let pong: PongMessage = decode(&response_frame.message)?;
 	assert_eq!(pong.echo, "mutual-auth-test");
 
 	let server_msg = server.expect_message(Duration::from_secs(1)).await;
@@ -273,14 +278,12 @@ async fn test_unexpected_client_cert_rejected() -> Result<()> {
 	)
 	.await?;
 
-	tokio::time::sleep(Duration::from_millis(100)).await;
-
 	// Try to create client and connect - this should fail during handshake
 	let client_result: Result<()> = async {
 		println!("Attempting to create client with unexpected certificate...");
 		let client = client! {
 			connect TokioListener: server.addr,
-			identity: (client_cert, ServerKeyManager::new(client_key)),
+			identity: (client_cert, client_key.into()),
 			policies: {
 				x509_gate: [ExpiryValidator]
 			}
@@ -324,7 +327,7 @@ async fn test_client_rejects_expired_server() -> Result<()> {
 	let server = MutualAuthServer::new(server_cert, server_key, vec![]).await?;
 	let mut client = client! {
 		connect TokioListener: server.addr,
-		identity: (client_cert, ServerKeyManager::new(client_key)),
+		identity: (client_cert, client_key.into()),
 		policies: {
 			x509_gate: [ExpiryValidator]
 		}

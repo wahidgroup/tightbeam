@@ -1,5 +1,6 @@
 mod utils;
 
+pub mod key;
 pub mod negotiation;
 pub mod policy;
 pub mod profiles;
@@ -7,6 +8,8 @@ pub mod secret;
 
 #[cfg(feature = "aead")]
 pub mod aead;
+#[cfg(feature = "ecdh")]
+pub mod curves;
 #[cfg(feature = "ecies")]
 pub mod ecies;
 #[cfg(feature = "digest")]

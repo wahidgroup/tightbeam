@@ -17,16 +17,16 @@ where
 	Self: Sized,
 {
 	fn with_restart<P: RestartPolicy + 'static>(self, _: P) -> Self {
-		panic!("Restart policy is not supported on this transport");
+		unimplemented!("Restart policy is not supported on this transport");
 	}
 	fn with_emitter_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
-		panic!("Emitter gate is not supported on this transport");
+		unimplemented!("Emitter gate is not supported on this transport");
 	}
 	fn with_collector_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
-		panic!("Collector gate is not supported on this transport");
+		unimplemented!("Collector gate is not supported on this transport");
 	}
 	fn with_receptor_gate<T: Message, R: ReceptorPolicy<T> + 'static>(self, _: R) -> Self {
-		panic!("Receptor policy is not supported on this transport");
+		unimplemented!("Receptor policy is not supported on this transport");
 	}
 
 	#[cfg(all(feature = "x509", feature = "std"))]
@@ -34,7 +34,7 @@ where
 	where
 		V: CertificateValidation + 'static,
 	{
-		panic!("X.509 certificate validation is not supported on this transport");
+		unimplemented!("X.509 certificate validation is not supported on this transport");
 	}
 }
 

@@ -740,7 +740,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_random_secp_matrix_points() {
+	fn test_random_secp_matrix_points() -> Result<(), Box<dyn std::error::Error>> {
 		let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 		let sk_bytes = signing_key.to_bytes();
 		println!("signing key hex: {}", to_hex(sk_bytes.as_slice()));
@@ -753,7 +753,7 @@ mod tests {
 		println!("compressed pubkey hex: {}", to_hex(&pubkey));
 
 		let mut matrix = TestMatrix::new(8);
-		map_pubkey_to_matrix(&pubkey, &mut matrix, 0, 0).unwrap();
+		map_pubkey_to_matrix(&pubkey, &mut matrix, 0, 0)?;
 
 		let mut points = Vec::with_capacity(35);
 		for row in 0..5 {
@@ -763,7 +763,8 @@ mod tests {
 		}
 		println!("matrix points: {points:?}");
 
-		let extracted = extract_pubkey_from_matrix(&matrix, 0, 0).unwrap();
+		let extracted = extract_pubkey_from_matrix(&matrix, 0, 0)?;
 		assert_eq!(extracted, pubkey);
+		Ok(())
 	}
 }

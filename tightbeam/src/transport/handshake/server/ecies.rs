@@ -19,15 +19,18 @@ use std::sync::Arc;
 
 use crate::asn1::OctetString;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
-use crate::crypto::aead::KeyInit;
+use crate::crypto::aead::{Aead, Aes256Gcm, Key, KeyInit, Nonce, Payload};
+use crate::crypto::ecies::EciesError;
+use crate::crypto::ecies::{EciesMessageOps, Secp256k1EciesMessage};
 use crate::crypto::hash::Digest;
+use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256};
+use crate::crypto::key::KeyProvider;
 use crate::crypto::negotiation::SecurityAccept;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
-use crate::crypto::secret::ToInsecure;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-use crate::crypto::sign::Verifier;
+use crate::crypto::sign::{SignatureEncoding, Verifier};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
@@ -47,13 +50,12 @@ use crate::x509::Certificate;
 ///
 /// Generic over:
 /// - `P: CryptoProvider` for cryptographic operations
-/// - `K`: Concrete signing key type (must implement Into<SecretKey<P::Curve>> for ECIES and Signer for authentication)
-pub struct EciesHandshakeServer<P, K>
+pub struct EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
 {
 	state: ServerStateMachine,
-	server_key: Arc<K>,
+	server_key_provider: Arc<dyn KeyProvider>,
 	server_cert: Arc<Certificate>,
 	client_random: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
@@ -68,29 +70,28 @@ where
 	invariants: HandshakeInvariant,
 }
 
-impl<P, K> EciesHandshakeServer<P, K>
+impl<P> EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
 	P::AeadCipher: KeyInit,
-	K: Clone + Into<crate::crypto::sign::ecdsa::k256::SecretKey> + crate::crypto::sign::Signer<P::Signature>,
-	P::Signature: crate::crypto::sign::SignatureEncoding,
+	P::Signature: SignatureEncoding,
 {
 	/// Create a new ECIES handshake server.
 	///
 	/// # Parameters
-	/// - `server_key`: The server's signing key for authentication (concrete type)
+	/// - `server_key_provider`: The key provider for cryptographic operations
 	/// - `server_cert`: The server's certificate to send to client
 	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
-		server_key: Arc<K>,
+		server_key_provider: Arc<dyn KeyProvider>,
 		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<&'static [u8]>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
 			state: ServerStateMachine::default(),
-			server_key,
+			server_key_provider,
 			server_cert,
 			client_random: None,
 			server_random: None,
@@ -107,7 +108,7 @@ where
 	}
 	/// Set the server's supported security profiles for negotiation.
 	/// Server must have at least one supported profile configured.
-	pub fn with_supported_profiles(mut self, profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>) -> Self {
+	pub fn with_supported_profiles(mut self, profiles: Vec<SecurityProfileDesc>) -> Self {
 		self.supported_profiles = profiles;
 		self
 	}
@@ -119,7 +120,7 @@ where
 	///
 	/// # Returns
 	/// DER-encoded ServerHandshake
-	pub fn process_client_hello(&mut self, client_hello_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	pub async fn process_client_hello(&mut self, client_hello_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validate current state is Init
 		self.validate_expected_state(ServerHandshakeState::Init)?;
 
@@ -152,8 +153,8 @@ where
 			return Err(e);
 		}
 
-		// 7. Sign transcript hash
-		let signature_bytes = self.sign_transcript_hash(&transcript_digest)?;
+		// 7. Sign transcript hash using KeyProvider
+		let signature_bytes = self.sign_transcript_hash(&transcript_digest).await?;
 
 		// 8. Build and encode ServerHandshake
 		let server_handshake_der =
@@ -173,7 +174,7 @@ where
 	///
 	/// # Returns
 	/// Success (session key stored internally)
-	pub fn process_client_key_exchange(&mut self, client_kex_der: &[u8]) -> Result<(), HandshakeError>
+	pub async fn process_client_key_exchange(&mut self, client_kex_der: &[u8]) -> Result<(), HandshakeError>
 	where
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -193,8 +194,8 @@ where
 		// 4. Get encrypted bytes from the message
 		let encrypted_bytes = client_kex.encrypted_data.as_bytes();
 
-		// 5. Decrypt ECIES payload
-		let decrypted_payload = self.decrypt_ecies_payload(encrypted_bytes)?;
+		// 5. Decrypt ECIES payload (async - uses KeyProvider for ECDH)
+		let decrypted_payload = self.decrypt_ecies_payload(encrypted_bytes).await?;
 
 		// 6. Extract base session key and client random from payload
 		let (base_session_key, client_random_from_payload) =
@@ -304,14 +305,10 @@ where
 		Ok(server_random)
 	}
 
-	fn sign_transcript_hash(&self, transcript_digest: &[u8; 32]) -> Result<Vec<u8>, HandshakeError>
-	where
-		K: crate::crypto::sign::Signer<P::Signature>,
-		P::Signature: crate::crypto::sign::SignatureEncoding,
-	{
-		use crate::crypto::sign::SignatureEncoding;
-		let sig: P::Signature = (*self.server_key).try_sign(transcript_digest)?;
-		Ok(sig.to_bytes().as_ref().to_vec())
+	async fn sign_transcript_hash(&self, transcript_digest: &[u8; 32]) -> Result<Vec<u8>, HandshakeError> {
+		// Use KeyProvider to sign - returns k256::ecdsa::Signature
+		let sig = self.server_key_provider.sign(transcript_digest).await?;
+		Ok(sig.to_vec())
 	}
 
 	fn build_server_handshake(
@@ -335,22 +332,51 @@ where
 		ClientKeyExchange::from_der(der_bytes).map_err(Into::into)
 	}
 
-	fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError>
-	where
-		K: Clone + Into<crate::crypto::sign::ecdsa::k256::SecretKey>,
-	{
-		use crate::crypto::ecies::{decrypt, Secp256k1EciesMessage};
+	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+		const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
 
 		// Parse the ECIES message from bytes
 		let encrypted_message = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
 
-		// Convert signing key to SecretKey for ECIES decryption
-		let secret_key: crate::crypto::sign::ecdsa::k256::SecretKey = (*self.server_key).clone().into();
+		// Get ephemeral public key from message
+		let ephemeral_pubkey = PublicKey::from_sec1_bytes(encrypted_message.ephemeral_pubkey())
+			.map_err(|_| HandshakeError::InvalidPublicKey(crate::crypto::sign::elliptic_curve::Error))?;
 
-		// Decrypt
-		let decrypted = decrypt(&secret_key, &encrypted_message, self.aad_domain_tag)?;
+		// Use KeyProvider to perform ECDH
+		let shared_secret_bytes = self.server_key_provider.ecdh(&ephemeral_pubkey).await?;
 
-		Ok(decrypted.to_insecure().to_vec())
+		// Derive encryption key using KDF
+		let k_enc = ecies_kdf::<HkdfSha3_256>(
+			encrypted_message.ephemeral_pubkey(),
+			shared_secret_bytes.into(),
+			ECIES_KDF_INFO,
+			None,
+		)?;
+
+		// Extract nonce and ciphertext
+		let ciphertext_bytes = encrypted_message.ciphertext();
+		if ciphertext_bytes.len() < 12 + 16 {
+			return Err(HandshakeError::EciesError(EciesError::InvalidCiphertext));
+		}
+
+		let nonce_bytes = &ciphertext_bytes[0..12];
+		let nonce = Nonce::<Aes256Gcm>::from_slice(nonce_bytes);
+		let ciphertext_with_tag = &ciphertext_bytes[12..];
+
+		// Decrypt using AES-256-GCM
+		let key = Key::<Aes256Gcm>::from_slice(&k_enc[..32]);
+		let cipher = Aes256Gcm::new(key);
+
+		let payload = match self.aad_domain_tag {
+			Some(aad) => Payload { msg: ciphertext_with_tag, aad },
+			None => Payload { msg: ciphertext_with_tag, aad: b"" },
+		};
+
+		let plaintext = cipher
+			.decrypt(nonce, payload)
+			.map_err(|_| HandshakeError::EciesError(EciesError::DecryptionFailed(aead::Error)))?;
+
+		Ok(plaintext)
 	}
 
 	fn extract_session_data_from_payload(
@@ -362,6 +388,7 @@ where
 		}
 		let mut base_session_key = [0u8; 32];
 		let mut client_random_from_payload = [0u8; 32];
+
 		base_session_key.copy_from_slice(&decrypted_payload[..32]);
 		client_random_from_payload.copy_from_slice(&decrypted_payload[32..]);
 		Ok((base_session_key, client_random_from_payload))
@@ -370,14 +397,15 @@ where
 	fn verify_client_random(&self, client_random_from_payload: &[u8; 32]) -> Result<(), HandshakeError> {
 		let expected_client_random = self.client_random.ok_or(HandshakeError::MissingClientRandom)?;
 
-		core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+		core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 		let is_equal: bool = client_random_from_payload.ct_eq(&expected_client_random).into();
-		if !is_equal {
-			return Err(HandshakeError::ClientRandomMismatchReplay);
-		}
-		core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+		core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-		Ok(())
+		if !is_equal {
+			Err(HandshakeError::ClientRandomMismatchReplay)
+		} else {
+			Ok(())
+		}
 	}
 
 	#[cfg(feature = "x509")]
@@ -462,38 +490,31 @@ where
 // Common Handshake Trait Implementations
 // ============================================================================
 
-impl<P, K> HandshakeNegotiation for EciesHandshakeServer<P, K>
+impl<P> HandshakeNegotiation for EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
-	K: Clone,
 {
 	fn supported_profiles(&self) -> &[SecurityProfileDesc] {
 		&self.supported_profiles
 	}
 }
 
-impl<P, K> HandshakeFinalization<P> for EciesHandshakeServer<P, K>
+impl<P> HandshakeFinalization<P> for EciesHandshakeServer<P>
 where
 	P: CryptoProvider,
-	K: Clone,
 {
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
 
-impl<P, K> HandshakeAlertHandler for EciesHandshakeServer<P, K>
-where
-	P: CryptoProvider,
-	K: Clone,
-{
-}
+impl<P> HandshakeAlertHandler for EciesHandshakeServer<P> where P: CryptoProvider {}
 
 // ============================================================================
 // ServerHandshakeProtocol Implementation
 // ============================================================================
 
-impl<P, K> ServerHandshakeProtocol for EciesHandshakeServer<P, K>
+impl<P> ServerHandshakeProtocol for EciesHandshakeServer<P>
 where
 	P: CryptoProvider + Send + Sync,
 	P::Curve: Curve + CurveArithmetic,
@@ -502,11 +523,6 @@ where
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
-	K: Clone
-		+ Into<crate::crypto::sign::ecdsa::k256::SecretKey>
-		+ crate::crypto::sign::Signer<P::Signature>
-		+ Send
-		+ Sync,
 	P::Signature: crate::crypto::sign::SignatureEncoding,
 {
 	type Error = HandshakeError;
@@ -523,12 +539,12 @@ where
 			match self.state() {
 				ServerHandshakeState::Init => {
 					// This is ClientHello - respond with ServerHandshake
-					let server_handshake = self.process_client_hello(msg)?;
+					let server_handshake = self.process_client_hello(msg).await?;
 					Ok(Some(server_handshake))
 				}
 				ServerHandshakeState::ServerHelloSent => {
 					// This is ClientKeyExchange - no response needed
-					self.process_client_key_exchange(msg)?;
+					self.process_client_key_exchange(msg).await?;
 					Ok(None)
 				}
 				_ => Err(HandshakeError::InvalidState),
@@ -581,7 +597,7 @@ where
 		self.validated_client_cert.as_ref().map(|arc| arc.as_ref())
 	}
 
-	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
@@ -609,15 +625,15 @@ mod tests {
 	///
 	/// Verifies that the server correctly transitions through all states:
 	/// Init → ServerHelloSent → KeyExchangeReceived → Complete
-	#[test]
-	fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
-		let mut server = TestEciesServerBuilder::new().build();
+	#[tokio::test]
+	async fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
+		let mut server = TestEciesServerBuilder::new().build()?;
 		assert_eq!(server.state(), ServerHandshakeState::Init);
 
 		// Process ClientHello
 		let client_random = crate::random::generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
-		let server_handshake_der = server.process_client_hello(&client_hello_der)?;
+		let server_handshake_der = server.process_client_hello(&client_hello_der).await?;
 
 		assert_eq!(server.state(), ServerHandshakeState::ServerHelloSent);
 		assert!(server.client_random.is_some());
@@ -629,7 +645,7 @@ mod tests {
 
 		// Process ClientKeyExchange
 		let client_kex_der = build_test_client_key_exchange(&server)?;
-		server.process_client_key_exchange(&client_kex_der)?;
+		server.process_client_key_exchange(&client_kex_der).await?;
 		assert_eq!(server.state(), ServerHandshakeState::KeyExchangeReceived);
 		assert!(server.base_session_key.is_some());
 
@@ -644,12 +660,12 @@ mod tests {
 	/// Test that state transitions are properly enforced.
 	///
 	/// Verifies that operations fail when called in the wrong state.
-	#[test]
-	fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
-		let mut server = TestEciesServerBuilder::new().build();
+	#[tokio::test]
+	async fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
+		let mut server = TestEciesServerBuilder::new().build()?;
 
 		// Cannot process client key exchange before client hello
-		assert!(server.process_client_key_exchange(&[]).is_err());
+		assert!(server.process_client_key_exchange(&[]).await.is_err());
 
 		// Cannot complete before any handshake steps
 		assert!(server.complete().is_err());
@@ -657,23 +673,23 @@ mod tests {
 		// Process client hello to advance state
 		let client_random = crate::random::generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
-		server.process_client_hello(&client_hello_der)?;
+		server.process_client_hello(&client_hello_der).await?;
 
 		// Cannot process client hello again
-		assert!(server.process_client_hello(&client_hello_der).is_err());
+		assert!(server.process_client_hello(&client_hello_der).await.is_err());
 
 		// Cannot complete before client key exchange
 		assert!(server.complete().is_err());
 
 		// Process client key exchange to advance state
 		let client_kex_der = build_test_client_key_exchange(&server)?;
-		server.process_client_key_exchange(&client_kex_der)?;
+		server.process_client_key_exchange(&client_kex_der).await?;
 
 		// Cannot process client key exchange again
-		assert!(server.process_client_key_exchange(&client_kex_der).is_err());
+		assert!(server.process_client_key_exchange(&client_kex_der).await.is_err());
 
 		// Cannot process client hello after key exchange
-		assert!(server.process_client_hello(&client_hello_der).is_err());
+		assert!(server.process_client_hello(&client_hello_der).await.is_err());
 
 		Ok(())
 	}
@@ -682,14 +698,15 @@ mod tests {
 	///
 	/// Verifies that the server correctly handles both explicit client offers
 	/// and dealer's choice mode when no offer is present.
-	#[test]
-	fn test_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
+	#[tokio::test]
+	async fn test_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::asn1::{
 			AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, HASH_SHA3_384_OID, HASH_SHA3_512_OID,
 			SIGNER_ECDSA_WITH_SHA3_512_OID,
 		};
 
 		let mk_profile = |id: u8| SecurityProfileDesc {
+			#[cfg(feature = "digest")]
 			digest: match id {
 				1 => HASH_SHA3_256_OID,
 				2 => HASH_SHA3_384_OID,
@@ -701,6 +718,10 @@ mod tests {
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
+			#[cfg(feature = "kdf")]
+			kdf: Some(HASH_SHA3_256_OID), // HKDF-SHA3-256
+			#[cfg(feature = "ecdh")]
+			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
 			key_wrap: if id % 2 == 0 {
 				Some(AES_256_WRAP_OID)
 			} else {
@@ -716,19 +737,19 @@ mod tests {
 			let selected = select_profile(&offer, &[p_b, p_c])?;
 			assert_eq!(selected, p_b);
 
-			let mut server = TestEciesServerBuilder::new().build().with_supported_profiles(vec![p_b, p_c]);
+			let mut server = TestEciesServerBuilder::new().build()?.with_supported_profiles(vec![p_b, p_c]);
 			let client_random = [0u8; 32];
 			let client_hello_der = create_test_client_hello_with_offer(&client_random, Some(offer.clone()))?;
-			let _response = server.process_client_hello(&client_hello_der)?;
+			let _response = server.process_client_hello(&client_hello_der).await?;
 			assert_eq!(server.selected_profile, Some(p_b));
 		}
 
 		// Mode 2: Dealer's choice - no client offer, server picks first
 		{
-			let mut server = TestEciesServerBuilder::new().build().with_supported_profiles(vec![p_a, p_b]);
+			let mut server = TestEciesServerBuilder::new().build()?.with_supported_profiles(vec![p_a, p_b]);
 			let client_random = [1u8; 32];
 			let client_hello_der = create_test_client_hello(&client_random)?;
-			let _response = server.process_client_hello(&client_hello_der)?;
+			let _response = server.process_client_hello(&client_hello_der).await?;
 			assert_eq!(server.selected_profile, Some(p_a)); // First in list
 		}
 
@@ -750,12 +771,11 @@ mod tests {
 	///
 	/// Extracts the server's public key and stored client random, then creates
 	/// a properly encrypted payload containing [session_key || client_random].
-	fn build_test_client_key_exchange<P, K>(
-		server: &EciesHandshakeServer<P, K>,
+	fn build_test_client_key_exchange<P>(
+		server: &EciesHandshakeServer<P>,
 	) -> Result<Vec<u8>, Box<dyn std::error::Error>>
 	where
 		P: CryptoProvider,
-		K: Clone,
 	{
 		use crate::crypto::ecies::encrypt;
 

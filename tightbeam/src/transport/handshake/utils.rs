@@ -138,17 +138,17 @@ mod tests {
 	}
 
 	#[test]
-	fn test_cek_generation() -> Result<(), HandshakeError> {
+	fn test_cek_generation() -> Result<(), Box<dyn std::error::Error>> {
 		let cek1 = generate_cek()?;
 		let cek2 = generate_cek()?;
 
 		// Verify both CEKs are 32 bytes by accessing them via Secret.with()
-		cek1.with(|bytes| assert_eq!(bytes.len(), 32));
-		cek2.with(|bytes| assert_eq!(bytes.len(), 32));
+		cek1.with(|bytes| assert_eq!(bytes.len(), 32))?;
+		cek2.with(|bytes| assert_eq!(bytes.len(), 32))?;
 
 		// Verify they're different (probabilistically)
-		let bytes1 = cek1.with(|b| *b);
-		let bytes2 = cek2.with(|b| *b);
+		let bytes1 = cek1.with(|b| *b)?;
+		let bytes2 = cek2.with(|b| *b)?;
 		assert_ne!(bytes1, bytes2);
 
 		Ok(())

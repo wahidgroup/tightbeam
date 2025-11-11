@@ -347,8 +347,9 @@ impl core::error::Error for HandshakeError {}
 impl From<crate::TightBeamError> for HandshakeError {
 	fn from(e: crate::TightBeamError) -> Self {
 		match e {
+			crate::TightBeamError::InvalidMetadata => HandshakeError::InvalidState,
 			crate::TightBeamError::InvalidOverflowValue => HandshakeError::RandomGenerationFailed,
-			_ => HandshakeError::RandomGenerationFailed,
+			_ => HandshakeError::InvalidState, // Default fallback
 		}
 	}
 }

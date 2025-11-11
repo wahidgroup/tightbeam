@@ -7,6 +7,7 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfo};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
@@ -19,14 +20,12 @@ use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
+use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
-use crate::der::Decode;
-use crate::der::Encode;
+use crate::der::{Decode, Encode};
 use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
-use crate::transport::handshake::builders::{
-	TightBeamEnvelopedDataBuilder, TightBeamKariBuilder, TightBeamSignedDataBuilder,
-};
+use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
@@ -47,10 +46,9 @@ use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHa
 pub struct CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
-	P::SigningKey: Send + Sync,
 {
 	state: ClientStateMachine,
-	client_key: Arc<P::SigningKey>,
+	client_key_provider: Arc<dyn crate::crypto::key::KeyProvider>,
 	client_certificate: Option<Arc<Certificate>>,
 	server_cert: Arc<Certificate>,
 	transcript_hash: Option<[u8; 32]>,
@@ -70,28 +68,30 @@ where
 	<P::Curve as elliptic_curve::Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
-	P::SigningKey: Clone + signature::Keypair + Send + Sync + 'static,
-	<P::SigningKey as signature::Keypair>::VerifyingKey: EncodePublicKey,
 	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
 	P::Signature: 'static,
-	P::Digest: 'static,
+	P::Digest: Send + 'static,
 	P::AeadCipher: KeyInit,
 {
 	/// Create a new CMS handshake client.
 	///
 	/// # Parameters
 	/// - `provider`: The cryptographic provider defining the security profile
-	/// - `client_key`: The client's signing key for authentication
+	/// - `client_key_provider`: The client's key provider for authentication
 	/// - `server_cert`: The server's certificate (for key agreement)
 	///
 	/// # Transcript Hash
 	/// The transcript hash is computed internally from handshake messages.
 	/// If you need to provide an external transcript hash (for testing),
 	/// use `with_transcript_hash()` after construction.
-	pub fn new(provider: P, client_key: Arc<P::SigningKey>, server_cert: Arc<Certificate>) -> Self {
+	pub fn new(
+		provider: P,
+		client_key_provider: Arc<dyn crate::crypto::key::KeyProvider>,
+		server_cert: Arc<Certificate>,
+	) -> Self {
 		Self {
 			state: ClientStateMachine::default(),
-			client_key,
+			client_key_provider,
 			client_certificate: None,
 			server_cert,
 			transcript_hash: None,
@@ -220,7 +220,9 @@ where
 	fn compute_transcript_hash(&self) -> [u8; 32] {
 		let mut hasher = P::Digest::default();
 		hasher.update(&self.transcript_buffer);
+
 		let hash_result = hasher.finalize();
+
 		let mut hash_array = [0u8; 32];
 		hash_array.copy_from_slice(&hash_result);
 		hash_array
@@ -259,61 +261,24 @@ where
 	/// # Returns
 	/// DER-encoded EnvelopedData
 	pub fn build_key_exchange(&mut self, session_key: Vec<u8>) -> Result<Vec<u8>, HandshakeError> {
-		// 1. Validation
-		// Accept both Init (fresh) or HelloSent (if future hello phase added)
-		if self.state.state() == ClientHandshakeState::Init {
-			self.validate_state_and_certificate()?;
-		} else if self.state.state() != ClientHandshakeState::HelloSent {
-			return Err(HandshakeError::InvalidState);
-		}
+		// 1. Validate state and certificate
+		self.validate_key_exchange_prerequisites()?;
 
 		// 2. Extract cryptographic material
-		let server_public_key = self.extract_server_public_key()?;
-		let (sender_ephemeral, sender_pub_spki) = self.create_ephemeral_keypair()?;
+		let (server_public_key, sender_ephemeral, sender_pub_spki) = self.extract_key_exchange_crypto_material()?;
 
-		// 3. Create UKM (user keying material)
-		let ukm_bytes = generate_nonce::<64>(None)?;
-		let ukm = UserKeyingMaterial::new(ukm_bytes.to_vec())?;
-
-		// 4. Build recipient identifier
+		// 3. Create UKM and recipient identifier
+		let ukm = self.create_user_keying_material()?;
 		let rid = self.build_recipient_identifier();
 
-		// 5. Key encryption algorithm from provider (ECDH + HKDF + key wrap)
-		let key_wrap_oid =
-			<P::Profile as SecurityProfile>::KEY_WRAP_OID.ok_or(HandshakeError::MissingKeyWrapAlgorithm)?;
-		let key_enc_alg = AlgorithmIdentifierOwned { oid: key_wrap_oid, parameters: None };
+		// 4. Build KARI structure
+		let kari_builder = self.build_kari_structure(sender_ephemeral, sender_pub_spki, server_public_key, rid, ukm)?;
 
-		// 6. Build KARI (Key Agreement Recipient Info) structure
-		let kari_builder = TightBeamKariBuilder::new(self.provider.clone())
-			.with_sender_priv(sender_ephemeral)
-			.with_sender_pub_spki(sender_pub_spki)
-			.with_recipient_pub(server_public_key)
-			.with_recipient_rid(rid)
-			.with_ukm(ukm)
-			.with_key_enc_alg(key_enc_alg);
+		// 5. Create EnvelopedData with optional security offer
+		let enveloped_data_der = self.build_enveloped_data(kari_builder, &session_key)?;
 
-		// 7. Create EnvelopedData builder with generic curve type
-		let mut enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
-
-		// 8. Add SecurityOffer as unprotected attribute if configured
-		if let Some(ref offer) = self.security_offer {
-			let offer_attr = crate::transport::handshake::attributes::encode_security_offer(offer)?;
-			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
-		}
-
-		// 9. Build and encode
-		let enveloped_data = enveloped_builder.build(&session_key, None)?;
-		let enveloped_data_der = enveloped_data.to_der()?;
-
-		// 10. Add to transcript if we're computing it internally
-		if self.transcript_hash.is_none() {
-			self.transcript_buffer.extend_from_slice(&enveloped_data_der);
-		}
-
-		// 11. Store session key and transition state
-		self.session_key = Some(Secret::from(session_key));
-		// Transition directly from Init -> KeyExchangeSent (CMS path) or HelloSent -> KeyExchangeSent
-		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
+		// 6. Update transcript and state
+		self.finalize_key_exchange(&enveloped_data_der, session_key)?;
 
 		Ok(enveloped_data_der)
 	}
@@ -354,25 +319,25 @@ where
 	///
 	/// # Returns
 	/// DER-encoded SignedData
-	pub fn build_client_finished(&mut self) -> Result<Vec<u8>, HandshakeError> {
-		// 1. Validation
-		self.validate_expected_state(ClientHandshakeState::ServerFinishedReceived)?;
+	pub async fn build_client_finished(&mut self) -> Result<Vec<u8>, HandshakeError> {
+		// 1. Validate state
+		self.validate_client_finished_prerequisites()?;
 
-		// 2. Algorithm identifiers
-		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
-		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
+		// 2. Get transcript hash and prepare digest
+		let (transcript_hash, digest) = self.prepare_finished_digest()?;
 
-		// 3. Get transcript hash
-		let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+		// 3. Sign the digest
+		let signature_bytes = self.sign_finished_digest(&digest).await?;
 
-		// 4. Build SignedData
-		let builder = TightBeamSignedDataBuilder::<P, _>::new(&*self.client_key, digest_alg, signature_alg)?;
-		let signed_data = builder.build(&transcript_hash)?;
-		let signed_data_der = signed_data.to_der()?;
+		// 4. Build cryptographic components
+		let (signer_id, digest_alg, signature_alg) = self.build_finished_crypto_components().await?;
 
-		// 5. Transition state & mark finished sent invariant
-		self.state.transition(ClientHandshakeState::ClientFinishedSent)?;
-		self.invariants.mark_finished_sent()?;
+		// 5. Build SignedData structure
+		let signed_data_der =
+			self.build_signed_data(transcript_hash, &signature_bytes, signer_id, digest_alg, signature_alg)?;
+
+		// 6. Transition state
+		self.finalize_client_finished()?;
 
 		Ok(signed_data_der)
 	}
@@ -404,6 +369,171 @@ where
 	pub fn session_key(&self) -> Option<&Secret<Vec<u8>>> {
 		self.session_key.as_ref()
 	}
+
+	/// Validate state and certificate for key exchange.
+	fn validate_key_exchange_prerequisites(&self) -> Result<(), HandshakeError> {
+		// Accept both Init (fresh) or HelloSent (if future hello phase added)
+		if self.state.state() == ClientHandshakeState::Init {
+			self.validate_state_and_certificate()?;
+		} else if self.state.state() != ClientHandshakeState::HelloSent {
+			return Err(HandshakeError::InvalidState);
+		}
+
+		Ok(())
+	}
+
+	/// Extract cryptographic material needed for key exchange.
+	fn extract_key_exchange_crypto_material(
+		&self,
+	) -> Result<(PublicKey<P::Curve>, SecretKey<P::Curve>, SubjectPublicKeyInfoOwned), HandshakeError> {
+		let server_public_key = self.extract_server_public_key()?;
+		let (sender_ephemeral, sender_pub_spki) = self.create_ephemeral_keypair()?;
+		Ok((server_public_key, sender_ephemeral, sender_pub_spki))
+	}
+
+	/// Create user keying material for the key agreement.
+	fn create_user_keying_material(&self) -> Result<UserKeyingMaterial, HandshakeError> {
+		let ukm_bytes = generate_nonce::<64>(None)?;
+		UserKeyingMaterial::new(ukm_bytes.to_vec()).map_err(Into::into)
+	}
+
+	/// Build KARI structure with all required components.
+	fn build_kari_structure(
+		&self,
+		sender_ephemeral: SecretKey<P::Curve>,
+		sender_pub_spki: SubjectPublicKeyInfoOwned,
+		server_public_key: PublicKey<P::Curve>,
+		rid: KeyAgreeRecipientIdentifier,
+		ukm: UserKeyingMaterial,
+	) -> Result<TightBeamKariBuilder<P>, HandshakeError> {
+		let key_wrap_oid =
+			<P::Profile as SecurityProfile>::KEY_WRAP_OID.ok_or(HandshakeError::MissingKeyWrapAlgorithm)?;
+		let key_enc_alg = AlgorithmIdentifierOwned { oid: key_wrap_oid, parameters: None };
+
+		let kari_builder = TightBeamKariBuilder::new(self.provider.clone())
+			.with_sender_priv(sender_ephemeral)
+			.with_sender_pub_spki(sender_pub_spki)
+			.with_recipient_pub(server_public_key)
+			.with_recipient_rid(rid)
+			.with_ukm(ukm)
+			.with_key_enc_alg(key_enc_alg);
+
+		Ok(kari_builder)
+	}
+
+	/// Build EnvelopedData with optional security offer.
+	fn build_enveloped_data(
+		&self,
+		kari_builder: TightBeamKariBuilder<P>,
+		session_key: &[u8],
+	) -> Result<Vec<u8>, HandshakeError> {
+		let mut enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
+
+		// Add SecurityOffer as unprotected attribute if configured
+		if let Some(ref offer) = self.security_offer {
+			let offer_attr = crate::transport::handshake::attributes::encode_security_offer(offer)?;
+			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
+		}
+
+		let enveloped_data = enveloped_builder.build(session_key, None)?;
+		enveloped_data.to_der().map_err(Into::into)
+	}
+
+	/// Finalize key exchange by updating transcript and state.
+	fn finalize_key_exchange(&mut self, enveloped_data_der: &[u8], session_key: Vec<u8>) -> Result<(), HandshakeError> {
+		// Add to transcript if we're computing it internally
+		if self.transcript_hash.is_none() {
+			self.transcript_buffer.extend_from_slice(enveloped_data_der);
+		}
+
+		// Store session key and transition state
+		self.session_key = Some(Secret::from(session_key));
+		// Transition directly from Init -> KeyExchangeSent (CMS path) or HelloSent -> KeyExchangeSent
+		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
+
+		Ok(())
+	}
+
+	/// Validate prerequisites for building client finished message.
+	fn validate_client_finished_prerequisites(&self) -> Result<(), HandshakeError> {
+		self.validate_expected_state(ClientHandshakeState::ServerFinishedReceived)
+	}
+
+	/// Prepare transcript hash and compute digest for signing.
+	fn prepare_finished_digest(&self) -> Result<([u8; 32], Vec<u8>), HandshakeError> {
+		let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+
+		let mut hasher = P::Digest::new();
+		hasher.update(&transcript_hash);
+		let digest = hasher.finalize();
+		let digest_bytes = digest.to_vec();
+
+		Ok((transcript_hash, digest_bytes))
+	}
+
+	/// Sign the finished digest using the client key provider.
+	async fn sign_finished_digest(&self, digest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+		let signature = self.client_key_provider.sign(digest).await?;
+		Ok(signature.to_bytes().to_vec())
+	}
+
+	/// Build cryptographic components needed for SignedData.
+	async fn build_finished_crypto_components(
+		&self,
+	) -> Result<(SignerIdentifier, AlgorithmIdentifierOwned, AlgorithmIdentifierOwned), HandshakeError> {
+		let public_key = self.client_key_provider.to_public_key().await?;
+		let signer_id = crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(&public_key)?;
+
+		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
+		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
+
+		Ok((signer_id, digest_alg, signature_alg))
+	}
+
+	/// Build the complete SignedData structure.
+	fn build_signed_data(
+		&self,
+		transcript_hash: [u8; 32],
+		signature_bytes: &[u8],
+		signer_id: SignerIdentifier,
+		digest_alg: AlgorithmIdentifierOwned,
+		signature_alg: AlgorithmIdentifierOwned,
+	) -> Result<Vec<u8>, HandshakeError> {
+		let signer_info = SignerInfo {
+			version: crate::cms::content_info::CmsVersion::V1,
+			sid: signer_id,
+			digest_alg: digest_alg.clone(),
+			signed_attrs: None,
+			signature_algorithm: signature_alg,
+			signature: OctetString::new(signature_bytes)?,
+			unsigned_attrs: None,
+		};
+
+		let octet_string = OctetString::new(&transcript_hash)?;
+		let econtent_der = octet_string.to_der()?;
+		let encap_content_info = EncapsulatedContentInfo {
+			econtent_type: crate::asn1::DATA_OID,
+			econtent: Some(crate::der::Any::new(crate::der::Tag::OctetString, econtent_der.as_slice())?),
+		};
+
+		let signed_data = SignedData {
+			version: crate::cms::content_info::CmsVersion::V1,
+			digest_algorithms: vec![digest_alg].try_into()?,
+			encap_content_info,
+			certificates: None,
+			crls: None,
+			signer_infos: vec![signer_info].try_into()?,
+		};
+
+		signed_data.to_der().map_err(Into::into)
+	}
+
+	/// Finalize client finished by transitioning state and marking invariant.
+	fn finalize_client_finished(&mut self) -> Result<(), HandshakeError> {
+		self.state.transition(ClientHandshakeState::ClientFinishedSent)?;
+		self.invariants.mark_finished_sent()?;
+		Ok(())
+	}
 }
 
 // ============================================================================
@@ -413,19 +543,13 @@ where
 impl<P> HandshakeFinalization<P> for CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
-	P::SigningKey: Send + Sync,
 {
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
 
-impl<P> HandshakeAlertHandler for CmsHandshakeClient<P>
-where
-	P: CryptoProvider,
-	P::SigningKey: Send + Sync,
-{
-}
+impl<P> HandshakeAlertHandler for CmsHandshakeClient<P> where P: CryptoProvider {}
 
 // ============================================================================
 // ClientHandshakeProtocol Implementation
@@ -438,11 +562,9 @@ where
 	<P::Curve as elliptic_curve::Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
-	P::SigningKey: Clone + signature::Keypair + Send + Sync + 'static,
-	<P::SigningKey as signature::Keypair>::VerifyingKey: EncodePublicKey,
 	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
 	P::Signature: 'static,
-	P::Digest: 'static,
+	P::Digest: Send + 'static,
 	P::AeadCipher: Send + Sync + KeyInit,
 {
 	type Error = HandshakeError;
@@ -463,7 +585,7 @@ where
 			self.process_server_finished(msg)?;
 
 			// Build client finished
-			let client_finished = self.build_client_finished()?;
+			let client_finished = self.build_client_finished().await?;
 			Ok(Some(client_finished))
 		})
 	}
@@ -485,8 +607,7 @@ where
 			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 			// 3. Derive final session key as P::AeadCipher
-			use crate::transport::handshake::HandshakeFinalization;
-			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, &transcript_hash))?;
+			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, &transcript_hash))??;
 
 			// 4. Transition to complete
 			self.state.transition(ClientHandshakeState::Completed)?;
@@ -525,15 +646,15 @@ mod tests {
 	use crate::transport::handshake::tests::*;
 	use crate::{HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_256_OID};
 
-	#[test]
-	fn test_client_state_flow() -> Result<(), Box<dyn std::error::Error>> {
+	#[tokio::test]
+	async fn test_client_state_flow() -> Result<(), Box<dyn std::error::Error>> {
 		// Given: A CMS client in init state with a server certificate
 		let transcript_hash = [1u8; 32];
 		let server_test_cert = create_test_certificate();
 		let mut client = TestCmsClientBuilder::new()
 			.with_server_cert(server_test_cert.certificate.clone())
 			.with_transcript_hash(transcript_hash)
-			.build();
+			.build()?;
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 
 		// When: Client builds a valid key exchange
@@ -568,7 +689,7 @@ mod tests {
 		assert_eq!(client.state(), ClientHandshakeState::ServerFinishedReceived);
 
 		// Build client Finished
-		let _client_finished = client.build_client_finished()?;
+		let _client_finished = client.build_client_finished().await?;
 		assert_eq!(client.state(), ClientHandshakeState::ClientFinishedSent);
 
 		// Complete
@@ -579,17 +700,17 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
+	#[tokio::test]
+	async fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
 		// Given: A CMS client in init state
-		let mut client = TestCmsClientBuilder::new().build();
+		let mut client = TestCmsClientBuilder::new().build()?;
 
 		// When: Trying to process server finished before sending key exchange
 		let result = client.process_server_finished(&[]);
 		assert!(result.is_err());
 
 		// When: Trying to build client finished before processing server finished
-		let result = client.build_client_finished();
+		let result = client.build_client_finished().await;
 		assert!(result.is_err());
 
 		Ok(())

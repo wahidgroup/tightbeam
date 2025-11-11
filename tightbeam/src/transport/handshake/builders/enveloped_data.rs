@@ -149,14 +149,14 @@ where
 		let cek = generate_cek()?;
 
 		// 3. Build KARI with wrapped CEK
-		let recipient_info = cek.with(|cek_bytes| self.build_kari_with_cek(cek_bytes))?;
+		let recipient_info = cek.with(|cek_bytes| self.build_kari_with_cek(cek_bytes))??;
 
 		// 4. Encrypt plaintext with CEK
 		let encrypted_content = cek.with(|cek_bytes| {
 			let cipher = Self::create_cipher_from_cek(cek_bytes)?;
 			let nonce = Self::generate_nonce();
 			Self::encrypt_content_with_cipher(&cipher, plaintext, &nonce)
-		})?;
+		})??;
 
 		// 5. Build unprotected attributes
 		let unprotected_attrs = self.build_unprotected_attributes()?;

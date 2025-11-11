@@ -105,6 +105,12 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	SignatureError(crate::crypto::sign::Error),
 
+	/// Error from elliptic curve operations
+	#[cfg(feature = "signature")]
+	#[cfg_attr(feature = "derive", error("Elliptic curve error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	EllipticCurveError(crate::crypto::sign::elliptic_curve::Error),
+
 	/// Error during serialization
 	#[cfg_attr(feature = "derive", error("Serialization error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -143,6 +149,10 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Crypto policy error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	CryptoPolicyError(crate::crypto::policy::CryptoPolicyError),
+
+	#[cfg_attr(feature = "derive", error("Key derivation error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	KeyDerivationError(crate::crypto::kdf::KdfError),
 
 	/// Error obtaining random bytes from the OS
 	#[cfg(feature = "random")]
@@ -285,6 +295,8 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureError(err) => write!(f, "Signature verification or generation error: {err}"),
 			#[cfg(feature = "signature")]
+			TightBeamError::EllipticCurveError(_) => write!(f, "Elliptic curve error"),
+			#[cfg(feature = "signature")]
 			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
 			#[cfg(feature = "digest")]
 			TightBeamError::MissingDigestInfo => write!(f, "Missing integrity info"),
@@ -357,6 +369,8 @@ crate::impl_from!(aead::Error => TightBeamError::EncryptionError);
 crate::impl_from!(EciesError => TightBeamError::EciesError);
 #[cfg(all(feature = "signature", not(feature = "derive")))]
 crate::impl_from!(signature::Error => TightBeamError::SignatureError);
+#[cfg(all(feature = "signature", not(feature = "derive")))]
+crate::impl_from!(crate::crypto::sign::elliptic_curve::Error => TightBeamError::EllipticCurveError);
 #[cfg(all(feature = "zstd", not(feature = "derive")))]
 crate::impl_from!(zeekstd::Error => TightBeamError::CompressionError via CompressionError::ZSTD);
 #[cfg(all(feature = "zstd", not(feature = "derive")))]

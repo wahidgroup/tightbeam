@@ -176,7 +176,8 @@ fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
 	assert_eq!(tightbeam.metadata.priority, Some(priority));
 	assert_eq!(tightbeam.metadata.lifetime, Some(ttl));
 	assert_eq!(tightbeam.metadata.previous_frame, Some(previous));
-	assert!(tightbeam.metadata.integrity.clone().unwrap().value_cmp(&message_hash).is_ok());
+	let integrity = tightbeam.metadata.integrity.clone().ok_or("Expected integrity to be Some")?;
+	assert!(integrity.value_cmp(&message_hash).is_ok());
 	assert!(tightbeam.metadata.matrix.is_some());
 	assert!(tightbeam.metadata.previous_frame.is_some());
 

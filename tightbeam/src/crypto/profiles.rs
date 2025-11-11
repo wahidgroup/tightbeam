@@ -12,10 +12,12 @@ use crate::Errorizable;
 use crate::crypto::aead::Aead;
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+#[cfg(feature = "ecdh")]
+use crate::crypto::curves::Secp256k1Oid;
 #[cfg(feature = "sha3")]
 use crate::crypto::hash::Sha3_256;
 #[cfg(feature = "kdf")]
-use crate::crypto::kdf::{HkdfSha3_256, KdfFunction};
+use crate::crypto::kdf::{HkdfSha3_256, HkdfSha3_256Oid, KdfFunction};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 #[cfg(feature = "signature")]
@@ -103,12 +105,17 @@ pub struct SecurityProfileDesc {
 	pub aead_key_size: Option<u16>,
 	#[cfg(feature = "signature")]
 	pub signature: Option<ObjectIdentifier>,
+	#[cfg(feature = "kdf")]
+	pub kdf: Option<ObjectIdentifier>,
+	#[cfg(feature = "ecdh")]
+	pub curve: Option<ObjectIdentifier>,
 	pub key_wrap: Option<ObjectIdentifier>,
 }
 
 impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 	fn from(_p: &P) -> Self {
 		SecurityProfileDesc {
+			#[cfg(feature = "digest")]
 			digest: <P::DigestOid as AssociatedOid>::OID,
 			#[cfg(feature = "aead")]
 			aead: Some(<P::AeadOid as AssociatedOid>::OID),
@@ -116,6 +123,10 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 			aead_key_size: Some(<P::AeadOid as AeadKeySize>::KEY_SIZE as u16),
 			#[cfg(feature = "signature")]
 			signature: Some(<P::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID),
+			#[cfg(feature = "kdf")]
+			kdf: Some(<P::KdfOid as AssociatedOid>::OID),
+			#[cfg(feature = "ecdh")]
+			curve: Some(<P::CurveOid as AssociatedOid>::OID),
 			key_wrap: P::KEY_WRAP_OID,
 		}
 	}
@@ -125,10 +136,13 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 /// negotiated security profile. No concrete key types or implementations.
 ///
 /// Rationale:
-/// - Allows negotiation over a compact descriptor (hash + aead + sig + wrap).
+/// - Allows negotiation over a compact descriptor (hash + aead + sig + wrap + kdf + curve).
 /// - Decouples compile-time algorithm implementation (CryptoProvider) from
 ///   protocol-visible identifiers (SecurityProfile).
 /// - Enables future dynamic dispatch / plugin loading without changing wire format.
+/// - KDF and curve must be negotiated to ensure interoperability:
+///   * Different KDFs produce different keys from the same inputs
+///   * Curve choice affects ECDH operations (e.g., Ed25519 signatures typically use X25519 for ECDH)
 pub trait SecurityProfile {
 	#[cfg(feature = "digest")]
 	type DigestOid: AssociatedOid;
@@ -136,6 +150,10 @@ pub trait SecurityProfile {
 	type AeadOid: AssociatedOid + AeadKeySize;
 	#[cfg(feature = "signature")]
 	type SignatureAlg: SignatureAlgorithmIdentifier; // Provides ALGORITHM_OID
+	#[cfg(feature = "kdf")]
+	type KdfOid: AssociatedOid;
+	#[cfg(feature = "ecdh")]
+	type CurveOid: AssociatedOid;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
 }
@@ -319,6 +337,10 @@ impl SecurityProfile for TightbeamProfile {
 	type AeadOid = Aes256GcmOid;
 	#[cfg(feature = "signature")]
 	type SignatureAlg = Secp256k1Signature;
+	#[cfg(feature = "kdf")]
+	type KdfOid = HkdfSha3_256Oid;
+	#[cfg(feature = "ecdh")]
+	type CurveOid = Secp256k1Oid;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
 }
@@ -506,14 +528,12 @@ mod tests {
 	}
 
 	#[test]
-	fn ukm_extension_encoding() {
+	fn ukm_extension_encoding() -> Result<(), Box<dyn std::error::Error>> {
 		let c = nonce(1);
 		let s = nonce(2);
 		let ukm = UkmBuilder::new(c, s)
-			.with_extension(0x01, b"hello")
-			.unwrap()
-			.with_extension(0x02, b"world")
-			.unwrap()
+			.with_extension(0x01, b"hello")?
+			.with_extension(0x02, b"world")?
 			.finalize();
 		// prefix + nonces + (tag+len+data)*2 = prefix + 64 + (1+2+5)*2 = prefix + 64 + 16
 		assert_eq!(ukm.len(), DOMAIN_UKM_PREFIX.len() + 64 + 16);
@@ -524,10 +544,11 @@ mod tests {
 		assert_eq!(tail[8], 0x02);
 		assert_eq!(&tail[9..11], &(5u16.to_be_bytes()));
 		assert_eq!(&tail[11..16], b"world");
+		Ok(())
 	}
 
 	#[test]
-	fn ukm_duplicate_tag_error() {
+	fn ukm_duplicate_tag_error() -> Result<(), Box<dyn std::error::Error>> {
 		let c = nonce(3);
 		let s = nonce(4);
 		let mut b = UkmBuilder::new(c, s);
@@ -537,10 +558,11 @@ mod tests {
 			UkmBuilderError::DuplicateTag { tag } => assert_eq!(tag, 0x01),
 			_ => panic!("wrong error"),
 		}
+		Ok(())
 	}
 
 	#[test]
-	fn ukm_extension_too_large_error() {
+	fn ukm_extension_too_large_error() -> Result<(), Box<dyn std::error::Error>> {
 		let c = nonce(5);
 		let s = nonce(6);
 		let mut b = UkmBuilder::new(c, s);
@@ -553,6 +575,7 @@ mod tests {
 			}
 			_ => panic!("wrong error"),
 		}
+		Ok(())
 	}
 
 	// =======================================================================
@@ -584,6 +607,8 @@ mod tests {
 			type DigestOid = crate::crypto::hash::Sha3_256;
 			type AeadOid = crate::crypto::aead::Aes128GcmOid;
 			type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
+			type KdfOid = crate::crypto::kdf::HkdfSha3_256Oid;
+			type CurveOid = crate::crypto::curves::Secp256k1Oid;
 
 			const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
 		}
