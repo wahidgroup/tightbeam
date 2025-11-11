@@ -100,11 +100,13 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 pub mod asn1;
+pub mod constants;
 pub mod core;
 pub mod error;
 pub mod flags;
 pub mod helpers;
 pub mod matrix;
+pub mod oids;
 pub mod prelude;
 pub mod utils;
 
@@ -114,8 +116,6 @@ pub mod builder;
 pub mod colony;
 #[cfg(feature = "compress")]
 pub mod compress;
-#[cfg(feature = "constants")]
-pub mod constants;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "doc")]
@@ -186,6 +186,7 @@ mod tests {
 		use crate::cms::enveloped_data::EncryptedContentInfo;
 		use crate::cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier, SignerInfo};
 		use crate::der::{Decode, Encode};
+		use crate::oids::*;
 		use crate::pkcs12::digest_info::DigestInfo;
 		use crate::spki::AlgorithmIdentifier;
 		use crate::x509::name::Name;
@@ -200,25 +201,25 @@ mod tests {
 			order: 0,
 			compactness: Some(CompressedData {
 				version: CmsVersion::V0,
-				compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB_OID, parameters: None },
+				compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB, parameters: None },
 				encap_content_info: EncapsulatedContentInfo {
-					econtent_type: DATA_OID,
+					econtent_type: DATA,
 					econtent: Some(der::Any::from_der(&der::asn1::OctetString::new(vec![0; 10])?.to_der()?)?),
 				},
 			}),
 			integrity: Some(DigestInfo {
-				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
+				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },
 				digest: der::asn1::OctetString::new(vec![0; 32])?,
 			}),
 			confidentiality: Some(EncryptedContentInfo {
-				content_type: DATA_OID,
-				content_enc_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB_OID, parameters: None },
+				content_type: DATA,
+				content_enc_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB, parameters: None },
 				encrypted_content: Some(der::asn1::OctetString::new(vec![0; 50])?),
 			}),
 			priority: Some(MessagePriority::Normal),
 			lifetime: Some(3600),
 			previous_frame: Some(DigestInfo {
-				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
+				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },
 				digest: der::asn1::OctetString::new(vec![0; 32])?,
 			}),
 			matrix: Some(matrix),
@@ -230,7 +231,7 @@ mod tests {
 			metadata,
 			message: vec![], // empty message
 			integrity: Some(DigestInfo {
-				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
+				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },
 				digest: der::asn1::OctetString::new(vec![0; 32])?,
 			}),
 			nonrepudiation: Some(SignerInfo {
@@ -239,9 +240,9 @@ mod tests {
 					issuer: Name::default(),
 					serial_number: SerialNumber::new(&[0; 8])?,
 				}),
-				digest_alg: AlgorithmIdentifier { oid: HASH_SHA3_256_OID, parameters: None },
+				digest_alg: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },
 				signed_attrs: None,
-				signature_algorithm: AlgorithmIdentifier { oid: SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None },
+				signature_algorithm: AlgorithmIdentifier { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None },
 				signature: der::asn1::OctetString::new(vec![0; 64])?,
 				unsigned_attrs: None,
 			}),

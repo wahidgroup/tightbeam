@@ -22,6 +22,7 @@ use crate::cms::signed_data::{SignatureValue, SignerIdentifier, SignerInfo};
 use crate::crypto::hash::Digest;
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
+use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
@@ -87,7 +88,7 @@ impl Signatory<ecdsa::Signature<ecdsa::Secp256k1>> for ecdsa::SigningKey<ecdsa::
 	type DigestAlgorithm = sha3::Sha3_256;
 
 	fn signature_algorithm(&self) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: crate::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
+		AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 	}
 
 	fn signer_identifier(&self) -> crate::error::Result<SignerIdentifier> {
@@ -277,5 +278,5 @@ where
 #[cfg(feature = "secp256k1")]
 impl SignatureAlgorithmIdentifier for ecdsa::Secp256k1Signature {
 	/// ECDSA with SHA-256: `1.2.840.10045.4.3.2`
-	const ALGORITHM_OID: ObjectIdentifier = crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID;
+	const ALGORITHM_OID: ObjectIdentifier = SIGNER_ECDSA_WITH_SHA3_256;
 }

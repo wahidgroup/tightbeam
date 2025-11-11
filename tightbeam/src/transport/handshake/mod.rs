@@ -702,7 +702,7 @@ fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 	Ok(SignedData {
 		version: CmsVersion::V1,
 		digest_algorithms: Default::default(),
-		encap_content_info: EncapsulatedContentInfo { econtent_type: crate::asn1::DATA_OID, econtent: Some(econtent) },
+		encap_content_info: EncapsulatedContentInfo { econtent_type: crate::oids::DATA, econtent: Some(econtent) },
 		certificates: None,
 		crls: None,
 		signer_infos: SignerInfos::try_from(Vec::new())?,
@@ -771,7 +771,7 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 		let cert_der_wrapped = cert_octet.to_der()?;
 		let cert_any = crate::der::Any::new(crate::der::Tag::OctetString, cert_der_wrapped)?;
 		let cert_values = SetOfVec::try_from(vec![AttributeValue::from(cert_any)])?;
-		attrs.push(Attribute { oid: crate::asn1::transport::CLIENT_CERTIFICATE_OID, values: cert_values });
+		attrs.push(Attribute { oid: crate::oids::CLIENT_CERTIFICATE, values: cert_values });
 	}
 
 	if let Some(sig) = &kex.client_signature {
@@ -779,7 +779,7 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 		let sig_der = sig.to_der()?;
 		let sig_any = crate::der::Any::new(crate::der::Tag::OctetString, sig_der)?;
 		let sig_values = SetOfVec::try_from(vec![AttributeValue::from(sig_any)])?;
-		attrs.push(Attribute { oid: crate::asn1::transport::CLIENT_SIGNATURE_OID, values: sig_values });
+		attrs.push(Attribute { oid: crate::oids::CLIENT_SIGNATURE, values: sig_values });
 	}
 
 	if attrs.is_empty() {
@@ -799,13 +799,13 @@ fn parse_client_key_exchange_attrs(
 
 	if let Some(attrs) = &enveloped_data.unprotected_attrs {
 		for attr in attrs.iter() {
-			if attr.oid == crate::asn1::transport::CLIENT_CERTIFICATE_OID {
+			if attr.oid == crate::oids::CLIENT_CERTIFICATE {
 				if let Some(value) = attr.values.iter().next() {
 					let octet_bytes = value.value();
 					let cert_octet = OctetString::from_der(octet_bytes)?;
 					cert = Some(Certificate::from_der(cert_octet.as_bytes())?);
 				}
-			} else if attr.oid == crate::asn1::transport::CLIENT_SIGNATURE_OID {
+			} else if attr.oid == crate::oids::CLIENT_SIGNATURE {
 				if let Some(value) = attr.values.iter().next() {
 					let octet_bytes = value.value();
 					sig = Some(OctetString::from_der(octet_bytes)?);
@@ -834,7 +834,7 @@ impl TryFrom<&ClientKeyExchange> for crate::cms::enveloped_data::EnvelopedData {
 			originator_info: None,
 			recip_infos: RecipientInfos::try_from(Vec::new())?,
 			encrypted_content: EncryptedContentInfo {
-				content_type: crate::asn1::DATA_OID,
+				content_type: crate::oids::DATA,
 				content_enc_alg: crate::transport::handshake::utils::aes_256_gcm_algorithm(),
 				encrypted_content: Some(OctetString::new(kex.encrypted_data.as_bytes())?),
 			},

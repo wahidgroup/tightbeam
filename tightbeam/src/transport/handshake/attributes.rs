@@ -10,11 +10,10 @@ use crate::der::asn1::{ObjectIdentifier, OctetString, UintRef};
 use crate::der::{asn1::Any, Sequence};
 
 use super::{HandshakeAlert, HandshakeError};
-use crate::asn1::transport::{
-	HANDSHAKE_ABORT_ALERT_OID, HANDSHAKE_ALGORITHM_PROFILE_OID, HANDSHAKE_CLIENT_NONCE_OID,
-	HANDSHAKE_PROTOCOL_VERSION_OID, HANDSHAKE_SECURITY_ACCEPT_OID, HANDSHAKE_SECURITY_OFFER_OID,
-	HANDSHAKE_SELECTED_CURVE_OID, HANDSHAKE_SELECT_ALGORITHM_OID, HANDSHAKE_SELECT_VERSION_OID,
-	HANDSHAKE_SERVER_NONCE_OID, HANDSHAKE_SUPPORTED_CURVES_OID, HANDSHAKE_TRANSCRIPT_HASH_OID,
+use crate::oids::{
+	HANDSHAKE_ABORT_ALERT, HANDSHAKE_ALGORITHM_PROFILE, HANDSHAKE_CLIENT_NONCE, HANDSHAKE_PROTOCOL_VERSION,
+	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SELECTED_CURVE, HANDSHAKE_SELECT_ALGORITHM,
+	HANDSHAKE_SELECT_VERSION, HANDSHAKE_SERVER_NONCE, HANDSHAKE_SUPPORTED_CURVES, HANDSHAKE_TRANSCRIPT_HASH,
 };
 
 /// CMS Attribute simplified (profile enforces single value only)
@@ -77,46 +76,46 @@ fn encode_uint_u16(v: u16) -> Result<Any, HandshakeError> {
 
 pub fn encode_protocol_version(version: u16) -> Result<HandshakeAttribute, HandshakeError> {
 	let any = encode_uint_u16(version)?;
-	HandshakeAttribute::new_single(HANDSHAKE_PROTOCOL_VERSION_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_PROTOCOL_VERSION, any)
 }
 
 pub fn encode_algorithm_profile() -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(&HANDSHAKE_ALGORITHM_PROFILE_OID)?;
-	HandshakeAttribute::new_single(HANDSHAKE_ALGORITHM_PROFILE_OID, any)
+	let any = Any::encode_from(&HANDSHAKE_ALGORITHM_PROFILE)?;
+	HandshakeAttribute::new_single(HANDSHAKE_ALGORITHM_PROFILE, any)
 }
 
 pub fn encode_client_nonce(nonce: &[u8; 32]) -> Result<HandshakeAttribute, HandshakeError> {
 	let os = OctetString::new(nonce).map_err(|_| HandshakeError::InvalidNonceEncoding)?;
 	let any = Any::encode_from(&os).map_err(|_| HandshakeError::InvalidNonceEncoding)?;
-	HandshakeAttribute::new_single(HANDSHAKE_CLIENT_NONCE_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_CLIENT_NONCE, any)
 }
 
 pub fn encode_server_nonce(nonce: &[u8; 32]) -> Result<HandshakeAttribute, HandshakeError> {
 	let os = OctetString::new(nonce).map_err(|_| HandshakeError::InvalidNonceEncoding)?;
 	let any = Any::encode_from(&os).map_err(|_| HandshakeError::InvalidNonceEncoding)?;
-	HandshakeAttribute::new_single(HANDSHAKE_SERVER_NONCE_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_SERVER_NONCE, any)
 }
 
 pub fn encode_selected_version(version: u16) -> Result<HandshakeAttribute, HandshakeError> {
 	let any = encode_uint_u16(version)?;
-	HandshakeAttribute::new_single(HANDSHAKE_SELECT_VERSION_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_SELECT_VERSION, any)
 }
 
 pub fn encode_selected_algorithm_profile() -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(&HANDSHAKE_ALGORITHM_PROFILE_OID)
+	let any = Any::encode_from(&HANDSHAKE_ALGORITHM_PROFILE)
 		.map_err(|_| HandshakeError::DerError(der::Error::from(der::ErrorKind::Failed)))?;
-	HandshakeAttribute::new_single(HANDSHAKE_SELECT_ALGORITHM_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_SELECT_ALGORITHM, any)
 }
 
 pub fn encode_abort_alert(alert: HandshakeAlert) -> Result<HandshakeAttribute, HandshakeError> {
 	let any = encode_uint_u16(alert as u16)?;
-	HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_ABORT_ALERT, any)
 }
 
 pub fn encode_transcript_hash(hash: &[u8; 32]) -> Result<HandshakeAttribute, HandshakeError> {
 	let os = OctetString::new(hash).map_err(|_| HandshakeError::InvalidNonceEncoding)?;
 	let any = Any::encode_from(&os).map_err(|_| HandshakeError::InvalidNonceEncoding)?;
-	HandshakeAttribute::new_single(HANDSHAKE_TRANSCRIPT_HASH_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_TRANSCRIPT_HASH, any)
 }
 
 /// Encode list of supported curves for algorithm negotiation.
@@ -139,7 +138,7 @@ pub fn encode_supported_curves(curves: &[ObjectIdentifier]) -> Result<HandshakeA
 		values.push(Any::encode_from(curve)?);
 	}
 
-	Ok(HandshakeAttribute { attr_type: HANDSHAKE_SUPPORTED_CURVES_OID, attr_values: values })
+	Ok(HandshakeAttribute { attr_type: HANDSHAKE_SUPPORTED_CURVES, attr_values: values })
 }
 
 /// Encode selected curve for algorithm negotiation.
@@ -151,7 +150,7 @@ pub fn encode_supported_curves(curves: &[ObjectIdentifier]) -> Result<HandshakeA
 /// - `curve`: The selected curve OID
 pub fn encode_selected_curve(curve: ObjectIdentifier) -> Result<HandshakeAttribute, HandshakeError> {
 	let any = Any::encode_from(&curve)?;
-	HandshakeAttribute::new_single(HANDSHAKE_SELECTED_CURVE_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_SELECTED_CURVE, any)
 }
 
 /// Encode SecurityOffer for wire transmission.
@@ -159,7 +158,7 @@ pub fn encode_selected_curve(curve: ObjectIdentifier) -> Result<HandshakeAttribu
 /// Client uses this to advertise supported security profiles to server.
 pub fn encode_security_offer(offer: &SecurityOffer) -> Result<HandshakeAttribute, HandshakeError> {
 	let any = Any::encode_from(offer)?;
-	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_OFFER, any)
 }
 
 /// Encode SecurityAccept for wire transmission.
@@ -167,7 +166,7 @@ pub fn encode_security_offer(offer: &SecurityOffer) -> Result<HandshakeAttribute
 /// Server uses this to inform client which profile was selected.
 pub fn encode_security_accept(accept: &SecurityAccept) -> Result<HandshakeAttribute, HandshakeError> {
 	let any = Any::encode_from(accept)?;
-	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT_OID, any)
+	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT, any)
 }
 
 // -------------------------- Decoders --------------------------
@@ -216,7 +215,7 @@ pub fn extract_transcript_hash(attr: &HandshakeAttribute) -> Result<[u8; 32], Ha
 /// # Returns
 /// Vector of curve OIDs in preference order
 pub fn extract_supported_curves(attr: &HandshakeAttribute) -> Result<Vec<ObjectIdentifier>, HandshakeError> {
-	if attr.attr_type != HANDSHAKE_SUPPORTED_CURVES_OID {
+	if attr.attr_type != HANDSHAKE_SUPPORTED_CURVES {
 		return Err(HandshakeError::MissingAttribute);
 	}
 
@@ -240,7 +239,7 @@ pub fn extract_supported_curves(attr: &HandshakeAttribute) -> Result<Vec<ObjectI
 /// # Returns
 /// The selected curve OID
 pub fn extract_selected_curve(attr: &HandshakeAttribute) -> Result<ObjectIdentifier, HandshakeError> {
-	if attr.attr_type != HANDSHAKE_SELECTED_CURVE_OID {
+	if attr.attr_type != HANDSHAKE_SELECTED_CURVE {
 		return Err(HandshakeError::MissingAttribute);
 	}
 
@@ -256,7 +255,7 @@ pub fn extract_selected_curve(attr: &HandshakeAttribute) -> Result<ObjectIdentif
 /// # Returns
 /// The decoded SecurityOffer
 pub fn extract_security_offer(attr: &HandshakeAttribute) -> Result<SecurityOffer, HandshakeError> {
-	if attr.attr_type != HANDSHAKE_SECURITY_OFFER_OID {
+	if attr.attr_type != HANDSHAKE_SECURITY_OFFER {
 		return Err(HandshakeError::MissingAttribute);
 	}
 
@@ -272,7 +271,7 @@ pub fn extract_security_offer(attr: &HandshakeAttribute) -> Result<SecurityOffer
 /// # Returns
 /// The decoded SecurityAccept
 pub fn extract_security_accept(attr: &HandshakeAttribute) -> Result<SecurityAccept, HandshakeError> {
-	if attr.attr_type != HANDSHAKE_SECURITY_ACCEPT_OID {
+	if attr.attr_type != HANDSHAKE_SECURITY_ACCEPT {
 		return Err(HandshakeError::MissingAttribute);
 	}
 
@@ -370,14 +369,13 @@ pub fn validate_required(attrs: &[HandshakeAttribute], oids: &[ObjectIdentifier]
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::transport::{
-		HANDSHAKE_ABORT_ALERT_OID, HANDSHAKE_ALGORITHM_PROFILE_OID, HANDSHAKE_CLIENT_NONCE_OID,
-		HANDSHAKE_PROTOCOL_VERSION_OID, HANDSHAKE_SELECT_ALGORITHM_OID, HANDSHAKE_SELECT_VERSION_OID,
-		HANDSHAKE_SERVER_NONCE_OID,
-	};
-	use crate::asn1::{CURVE_NIST_P256_OID, CURVE_NIST_P384_OID, CURVE_SECP256K1_OID};
 	use crate::der::asn1::Any;
 	use crate::der::asn1::{OctetString as DerOctetString, UintRef};
+	use crate::oids::{CURVE_NIST_P256, CURVE_NIST_P384, CURVE_SECP256K1};
+	use crate::oids::{
+		HANDSHAKE_ABORT_ALERT, HANDSHAKE_ALGORITHM_PROFILE, HANDSHAKE_CLIENT_NONCE, HANDSHAKE_PROTOCOL_VERSION,
+		HANDSHAKE_SELECT_ALGORITHM, HANDSHAKE_SELECT_VERSION, HANDSHAKE_SERVER_NONCE,
+	};
 
 	fn mk_integer(bytes: &[u8]) -> Result<Any, der::Error> {
 		let u = UintRef::new(bytes)?;
@@ -404,7 +402,7 @@ mod tests {
 		let a1 = encode_client_nonce(&n)?;
 		let a2 = encode_client_nonce(&n)?;
 		let attrs = vec![a1, a2];
-		let err = find(&attrs, &HANDSHAKE_CLIENT_NONCE_OID).unwrap_err();
+		let err = find(&attrs, &HANDSHAKE_CLIENT_NONCE).unwrap_err();
 		assert!(matches!(err, HandshakeError::DuplicateAttribute));
 		Ok(())
 	}
@@ -414,7 +412,7 @@ mod tests {
 		let n = [0x22u8; 32];
 		let only = encode_client_nonce(&n)?;
 		let attrs = vec![only];
-		let err = find(&attrs, &HANDSHAKE_SERVER_NONCE_OID).unwrap_err();
+		let err = find(&attrs, &HANDSHAKE_SERVER_NONCE).unwrap_err();
 		assert!(matches!(err, HandshakeError::MissingAttribute));
 		Ok(())
 	}
@@ -423,7 +421,7 @@ mod tests {
 	fn invalid_attribute_arity() -> Result<(), der::Error> {
 		let n = [0x33u8; 32];
 		let any = mk_octet(&n)?;
-		let attr = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE_OID, attr_values: vec![any.clone(), any] };
+		let attr = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE, attr_values: vec![any.clone(), any] };
 		assert!(matches!(attr.value().unwrap_err(), HandshakeError::InvalidAttributeArity));
 		Ok(())
 	}
@@ -433,7 +431,7 @@ mod tests {
 		let short = [0x44u8; 16];
 		let any = mk_octet(&short)?;
 
-		let attr = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE_OID, attr_values: vec![any] };
+		let attr = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE, attr_values: vec![any] };
 		if let HandshakeError::NonceLengthError(e) = extract_nonce(&attr).unwrap_err() {
 			assert_eq!(e.received, 16);
 			assert_eq!(e.expected, 32);
@@ -447,7 +445,7 @@ mod tests {
 	fn protocol_version_round_trip() -> Result<(), HandshakeError> {
 		for v in [0u16, 1, 255, 256, 65535] {
 			let attr = encode_protocol_version(v)?;
-			assert_eq!(attr.attr_type, HANDSHAKE_PROTOCOL_VERSION_OID);
+			assert_eq!(attr.attr_type, HANDSHAKE_PROTOCOL_VERSION);
 			let extracted = extract_u16(&attr)?;
 			assert_eq!(extracted, v);
 		}
@@ -458,7 +456,7 @@ mod tests {
 	fn selected_version_round_trip() -> Result<(), HandshakeError> {
 		for v in [0u16, 5, 1024, 65535] {
 			let attr = encode_selected_version(v)?;
-			assert_eq!(attr.attr_type, HANDSHAKE_SELECT_VERSION_OID);
+			assert_eq!(attr.attr_type, HANDSHAKE_SELECT_VERSION);
 			let extracted = extract_u16(&attr)?;
 			assert_eq!(extracted, v);
 		}
@@ -468,9 +466,9 @@ mod tests {
 	#[test]
 	fn algorithm_profile_attributes() -> Result<(), HandshakeError> {
 		let base = encode_algorithm_profile()?;
-		assert_eq!(base.attr_type, HANDSHAKE_ALGORITHM_PROFILE_OID);
+		assert_eq!(base.attr_type, HANDSHAKE_ALGORITHM_PROFILE);
 		let sel = encode_selected_algorithm_profile()?;
-		assert_eq!(sel.attr_type, HANDSHAKE_SELECT_ALGORITHM_OID);
+		assert_eq!(sel.attr_type, HANDSHAKE_SELECT_ALGORITHM);
 		Ok(())
 	}
 
@@ -502,7 +500,7 @@ mod tests {
 
 		// Unknown alert code
 		let unknown_any = mk_integer(&[0x06])?;
-		let unknown_attr = HandshakeAttribute { attr_type: HANDSHAKE_ABORT_ALERT_OID, attr_values: vec![unknown_any] };
+		let unknown_attr = HandshakeAttribute { attr_type: HANDSHAKE_ABORT_ALERT, attr_values: vec![unknown_any] };
 		if let HandshakeError::UnknownAlertCode(c) = extract_alert(&unknown_attr).unwrap_err() {
 			assert_eq!(c, 6u8);
 		} else {
@@ -515,7 +513,7 @@ mod tests {
 	fn integer_out_of_range_error() -> Result<(), der::Error> {
 		// 3-byte integer should be rejected
 		let any = mk_integer(&[0x01, 0x02, 0x03])?;
-		let attr = HandshakeAttribute { attr_type: HANDSHAKE_PROTOCOL_VERSION_OID, attr_values: vec![any] };
+		let attr = HandshakeAttribute { attr_type: HANDSHAKE_PROTOCOL_VERSION, attr_values: vec![any] };
 		assert!(matches!(extract_u16(&attr).unwrap_err(), HandshakeError::IntegerOutOfRange));
 		Ok(())
 	}
@@ -523,10 +521,10 @@ mod tests {
 	#[test]
 	fn supported_curves_encoding() -> Result<(), HandshakeError> {
 		// Encode multiple curves in preference order
-		let curves = vec![CURVE_SECP256K1_OID, CURVE_NIST_P256_OID, CURVE_NIST_P384_OID];
+		let curves = vec![CURVE_SECP256K1, CURVE_NIST_P256, CURVE_NIST_P384];
 		let attr = encode_supported_curves(&curves)?;
 
-		assert_eq!(attr.attr_type, HANDSHAKE_SUPPORTED_CURVES_OID);
+		assert_eq!(attr.attr_type, HANDSHAKE_SUPPORTED_CURVES);
 		assert_eq!(attr.attr_values.len(), 3);
 
 		// Extract and verify
@@ -538,11 +536,11 @@ mod tests {
 
 	#[test]
 	fn selected_curve_round_trip() -> Result<(), HandshakeError> {
-		let attr = encode_selected_curve(CURVE_NIST_P256_OID)?;
-		assert_eq!(attr.attr_type, HANDSHAKE_SELECTED_CURVE_OID);
+		let attr = encode_selected_curve(CURVE_NIST_P256)?;
+		assert_eq!(attr.attr_type, HANDSHAKE_SELECTED_CURVE);
 
 		let extracted = extract_selected_curve(&attr)?;
-		assert_eq!(extracted, CURVE_NIST_P256_OID);
+		assert_eq!(extracted, CURVE_NIST_P256);
 
 		Ok(())
 	}
@@ -556,8 +554,8 @@ mod tests {
 	#[test]
 	fn wrong_oid_type_for_curves() -> Result<(), HandshakeError> {
 		// Create attribute with wrong OID type
-		let any = Any::encode_from(&CURVE_SECP256K1_OID)?;
-		let wrong_attr = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE_OID, attr_values: vec![any] };
+		let any = Any::encode_from(&CURVE_SECP256K1)?;
+		let wrong_attr = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE, attr_values: vec![any] };
 
 		// Should fail because OID doesn't match
 		let result = extract_supported_curves(&wrong_attr);

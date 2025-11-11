@@ -155,7 +155,7 @@ pub fn create_test_certificate(signing_key: &k256::ecdsa::SigningKey) -> crate::
 		version: crate::x509::Version::V3,
 		serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).unwrap(),
 		signature: crate::spki::AlgorithmIdentifierOwned {
-			oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID,
+			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
 			parameters: None,
 		},
 		issuer: x509_cert::name::RdnSequence::default(),
@@ -177,7 +177,7 @@ pub fn create_test_certificate(signing_key: &k256::ecdsa::SigningKey) -> crate::
 	crate::x509::Certificate {
 		tbs_certificate: tbs_cert,
 		signature_algorithm: crate::spki::AlgorithmIdentifierOwned {
-			oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID,
+			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
 			parameters: None,
 		},
 		signature: crate::der::asn1::BitString::new(0, vec![0; 64]).unwrap(),
@@ -239,7 +239,7 @@ pub fn create_expiring_test_certificate(
 
 pub fn create_test_encryption_info() -> crate::EncryptedContentInfo {
 	crate::EncryptedContentInfo {
-		content_type: crate::asn1::COMPRESSION_CONTENT_OID,
+		content_type: crate::oids::COMPRESSION_CONTENT,
 		content_enc_alg: crate::AlgorithmIdentifier {
 			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.42"), // AES-256-GCM
 			parameters: None,
@@ -258,10 +258,10 @@ pub fn create_test_signer_info() -> crate::SignerInfo {
 	let signer_info = crate::SignerInfo {
 		version: CmsVersion::V1,
 		sid: SignerIdentifier::SubjectKeyIdentifier(skid),
-		digest_alg: crate::AlgorithmIdentifierOwned { oid: crate::HASH_SHA3_256_OID, parameters: None },
+		digest_alg: crate::AlgorithmIdentifierOwned { oid: crate::oids::HASH_SHA3_256, parameters: None },
 		signed_attrs: None,
 		signature_algorithm: crate::AlgorithmIdentifierOwned {
-			oid: crate::SIGNER_ECDSA_WITH_SHA3_256_OID,
+			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
 			parameters: None,
 		},
 		signature: OctetString::new([0u8; 64]).unwrap(),

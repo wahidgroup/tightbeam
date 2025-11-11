@@ -1976,14 +1976,9 @@ What happens in one channel (e.g., gate acceptance) is correlated with what you 
 in others (e.g., server handler invocation). These correlations encode the system's 
 causal structure.
 
-**No Faster-Than-Light**: Just as quantum mechanics respects causality, so does CBVOC. 
-Channel synchronization ensures that observations respect the happens-before relationship. 
-A test cannot observe an event before it occurs.
-
-This analogy isn't just poetic—it reflects the formal properties of concurrent observation:
-- **Non-interference**: Observation channels don't alter the primary communication
-- **Causal consistency**: Channel ordering preserves causal relationships
-- **Deterministic collapse**: Once awaited, the system state is fully determined
+**No Faster-Than-Light**: Just as quantum mechanics respects causality, so does 
+CBVOC. Channel synchronization ensures that observations respect the 
+happens-before relationship. A test cannot observe an event before it occurs.
 
 ####  Message Flow Sequence
 1. Client emits a message

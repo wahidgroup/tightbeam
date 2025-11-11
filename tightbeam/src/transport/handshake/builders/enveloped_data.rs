@@ -4,7 +4,6 @@
 //! KeyAgreeRecipientInfo for key transport.
 
 use super::kari::TightBeamKariBuilder;
-use crate::asn1::{DATA_OID, ENVELOPED_DATA_OID};
 use crate::cms::builder::RecipientInfoBuilder;
 use crate::cms::content_info::{CmsVersion, ContentInfo};
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo, RecipientInfos};
@@ -15,6 +14,7 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::der::asn1::{Any, SetOfVec};
+use crate::oids::{DATA, ENVELOPED_DATA};
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::utils::generate_cek;
@@ -126,7 +126,7 @@ where
 	where
 		P::AeadCipher: Encryptor<P::AeadOid>,
 	{
-		Ok(cipher.encrypt_content(plaintext, nonce, Some(DATA_OID))?)
+		Ok(cipher.encrypt_content(plaintext, nonce, Some(DATA))?)
 	}
 
 	/// Build the complete EnvelopedData structure.
@@ -178,7 +178,7 @@ where
 	pub fn build_content_info(self, plaintext: &[u8], aad: Option<&[u8]>) -> Result<ContentInfo, HandshakeError> {
 		let enveloped_data = self.build(plaintext, aad)?;
 		let content = Any::encode_from(&enveloped_data)?;
-		Ok(ContentInfo { content_type: ENVELOPED_DATA_OID, content })
+		Ok(ContentInfo { content_type: ENVELOPED_DATA, content })
 	}
 }
 
@@ -245,7 +245,7 @@ mod tests {
 			assert_eq!(enveloped_data.version, CmsVersion::V3);
 			assert_eq!(enveloped_data.recip_infos.0.len(), 1);
 			assert!(enveloped_data.encrypted_content.encrypted_content.is_some());
-			assert_eq!(enveloped_data.encrypted_content.content_type, DATA_OID);
+			assert_eq!(enveloped_data.encrypted_content.content_type, DATA);
 		}
 
 		#[test]
@@ -301,7 +301,7 @@ mod tests {
 
 			// 3. Verify ContentInfo structure
 			let content_info = builder.build_content_info(plaintext, None).unwrap();
-			assert_eq!(content_info.content_type, ENVELOPED_DATA_OID);
+			assert_eq!(content_info.content_type, ENVELOPED_DATA);
 
 			// 4. Decode inner EnvelopedData
 			let enveloped_data: EnvelopedData = content_info.content.decode_as().unwrap();

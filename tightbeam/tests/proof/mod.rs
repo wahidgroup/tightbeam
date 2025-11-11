@@ -600,7 +600,7 @@ mod tests {
 					nonrepudiation<Secp256k1Signature, _>: &signing_key,
 					previous_frame: DigestInfo {
 						algorithm: AlgorithmIdentifier {
-							oid: tightbeam::HASH_SHA3_256_OID,
+							oid: tightbeam::constants::HASH_SHA3_256_OID,
 							parameters: None,
 						},
 						digest: OctetString::new([0; 32])?

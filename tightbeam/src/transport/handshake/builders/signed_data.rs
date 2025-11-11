@@ -72,7 +72,7 @@ where
 			digest_alg,
 			signature_alg,
 			signer_id,
-			content_type: crate::asn1::DATA_OID,
+			content_type: crate::oids::DATA,
 			_phantom: core::marker::PhantomData,
 		})
 	}
@@ -141,6 +141,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::der::Decode;
+	use crate::oids::{DATA, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 	use crate::random::OsRng;
 
 	/// Helper function to create a test signing key
@@ -150,12 +151,12 @@ mod tests {
 
 	/// Helper function to create SHA3-256 digest algorithm identifier
 	fn create_sha3_256_digest_alg() -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: crate::asn1::HASH_SHA3_256_OID, parameters: None }
+		AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None }
 	}
 
 	/// Helper function to create ECDSA with SHA256 signature algorithm identifier
 	fn create_ecdsa_sha256_signature_alg() -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
+		AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 	}
 
 	/// Helper function to create a test SignedData builder
@@ -184,7 +185,7 @@ mod tests {
 		assert_eq!(signed_data.version, CmsVersion::V1);
 		assert_eq!(signed_data.digest_algorithms.len(), 1);
 		assert_eq!(signed_data.signer_infos.0.len(), 1);
-		assert_eq!(signed_data.encap_content_info.econtent_type, crate::asn1::DATA_OID);
+		assert_eq!(signed_data.encap_content_info.econtent_type, DATA);
 		assert!(signed_data.encap_content_info.econtent.is_some());
 
 		// 4. Verify signer info

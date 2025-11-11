@@ -35,6 +35,7 @@
 use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 
 use crate::asn1::ObjectIdentifier;
+use crate::constants::TIGHTBEAM_ECIES_KDF_INFO;
 
 use crate::crypto::aead::{Aead, Aes256Gcm, KeyInit, Payload};
 use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256, KdfError};
@@ -45,7 +46,6 @@ use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
 use crate::der::oid::AssociatedOid;
 
 /// KDF info parameter for domain separation and protocol versioning
-const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
 
 // ============================================================================
 // Generic ECIES Traits
@@ -385,7 +385,7 @@ where
 			let (ephemeral_bytes, shared_secret) = PK::SecretKey::generate_ephemeral(recipient_pubkey, $rng)?;
 
 			// Derive encryption key using KDF (includes C0 for non-malleability)
-			let k_enc = ecies_kdf::<HkdfSha3_256>(&ephemeral_bytes, shared_secret, ECIES_KDF_INFO, None)?;
+			let k_enc = ecies_kdf::<HkdfSha3_256>(&ephemeral_bytes, shared_secret, TIGHTBEAM_ECIES_KDF_INFO, None)?;
 
 			// Encrypt using AES-256-GCM
 			let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
@@ -437,7 +437,7 @@ where
 	// 3. Derive encryption key using KDF (includes C0 for non-malleability)
 	// Uses SHA3-256 with protocol versioning via info parameter
 	// Derives 32-byte key for AES-256-GCM authenticated encryption
-	let k_enc = ecies_kdf::<HkdfSha3_256>(message.ephemeral_pubkey(), shared_secret, ECIES_KDF_INFO, None)?;
+	let k_enc = ecies_kdf::<HkdfSha3_256>(message.ephemeral_pubkey(), shared_secret, TIGHTBEAM_ECIES_KDF_INFO, None)?;
 
 	// 4. Extract nonce and ciphertext
 	let ciphertext_bytes = message.ciphertext();

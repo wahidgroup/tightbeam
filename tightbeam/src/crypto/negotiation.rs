@@ -127,30 +127,29 @@ pub fn select_profile(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::{
-		AES_128_WRAP_OID, AES_192_WRAP_OID, AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID,
-		SIGNER_ECDSA_WITH_SHA3_512_OID,
+	use crate::oids::{
+		AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
 	};
 
 	fn mock_profile(id: u8) -> SecurityProfileDesc {
 		SecurityProfileDesc {
 			#[cfg(feature = "digest")]
-			digest: HASH_SHA3_256_OID,
+			digest: HASH_SHA3_256,
 			#[cfg(feature = "aead")]
-			aead: Some(AES_256_GCM_OID),
+			aead: Some(AES_256_GCM),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
-			signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
+			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
 			#[cfg(feature = "kdf")]
-			kdf: Some(HASH_SHA3_256_OID),
+			kdf: Some(HASH_SHA3_256),
 			#[cfg(feature = "ecdh")]
-			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
+			curve: Some(crate::oids::CURVE_SECP256K1),
 			// Use different key wrap algorithms to differentiate profiles
 			key_wrap: match id {
-				1 => Some(AES_128_WRAP_OID),
-				2 => Some(AES_256_WRAP_OID),
-				3 => Some(AES_192_WRAP_OID),
+				1 => Some(AES_128_WRAP),
+				2 => Some(AES_256_WRAP),
+				3 => Some(AES_192_WRAP),
 				_ => None,
 			},
 		}
@@ -202,43 +201,43 @@ mod tests {
 	#[cfg(feature = "aead")]
 	#[test]
 	fn test_select_profile_multiple_aead_ciphers() {
-		use crate::asn1::{
-			AES_128_GCM_OID, AES_128_WRAP_OID, AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA256_OID,
-			SIGNER_ECDSA_WITH_SHA256_OID,
+		use crate::oids::{
+			AES_128_GCM, AES_128_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA256,
+			SIGNER_ECDSA_WITH_SHA256,
 		};
 
 		// AES-128-GCM profile
 		let aes128_gcm = SecurityProfileDesc {
 			#[cfg(feature = "digest")]
-			digest: HASH_SHA256_OID,
+			digest: HASH_SHA256,
 			#[cfg(feature = "aead")]
-			aead: Some(AES_128_GCM_OID),
+			aead: Some(AES_128_GCM),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(16),
 			#[cfg(feature = "signature")]
-			signature: Some(SIGNER_ECDSA_WITH_SHA256_OID),
+			signature: Some(SIGNER_ECDSA_WITH_SHA256),
 			#[cfg(feature = "kdf")]
-			kdf: Some(HASH_SHA256_OID),
+			kdf: Some(HASH_SHA256),
 			#[cfg(feature = "ecdh")]
-			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
-			key_wrap: Some(AES_128_WRAP_OID),
+			curve: Some(CURVE_SECP256K1),
+			key_wrap: Some(AES_128_WRAP),
 		};
 
 		// AES-256-GCM profile
 		let aes256_gcm = SecurityProfileDesc {
 			#[cfg(feature = "digest")]
-			digest: HASH_SHA256_OID,
+			digest: HASH_SHA256,
 			#[cfg(feature = "aead")]
-			aead: Some(AES_256_GCM_OID),
+			aead: Some(AES_256_GCM),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
-			signature: Some(SIGNER_ECDSA_WITH_SHA256_OID),
+			signature: Some(SIGNER_ECDSA_WITH_SHA256),
 			#[cfg(feature = "kdf")]
-			kdf: Some(HASH_SHA256_OID),
+			kdf: Some(HASH_SHA256),
 			#[cfg(feature = "ecdh")]
-			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
-			key_wrap: Some(AES_256_WRAP_OID),
+			curve: Some(CURVE_SECP256K1),
+			key_wrap: Some(AES_256_WRAP),
 		};
 
 		// Client offers AES-128 first (client preference)
@@ -249,7 +248,7 @@ mod tests {
 
 		// Should select AES-128-GCM (client's first choice)
 		let selected = select_profile(&client_offer, &server_supported).unwrap();
-		assert_eq!(selected.aead, Some(AES_128_GCM_OID));
+		assert_eq!(selected.aead, Some(AES_128_GCM));
 		assert_eq!(selected.aead_key_size, Some(16));
 
 		// Client offers AES-256 first
@@ -257,7 +256,7 @@ mod tests {
 
 		// Should select AES-256-GCM (client's first choice)
 		let selected_256 = select_profile(&client_offer_256, &server_supported).unwrap();
-		assert_eq!(selected_256.aead, Some(AES_256_GCM_OID));
+		assert_eq!(selected_256.aead, Some(AES_256_GCM));
 		assert_eq!(selected_256.aead_key_size, Some(32));
 
 		// Server only supports AES-256
@@ -265,7 +264,7 @@ mod tests {
 
 		// Client offers AES-128 first, should fallback to AES-256
 		let selected_fallback = select_profile(&client_offer, &server_256_only).unwrap();
-		assert_eq!(selected_fallback.aead, Some(AES_256_GCM_OID));
+		assert_eq!(selected_fallback.aead, Some(AES_256_GCM));
 		assert_eq!(selected_fallback.aead_key_size, Some(32));
 	}
 }

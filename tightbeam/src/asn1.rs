@@ -17,86 +17,6 @@ pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
 
 /// id-data
-/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
-/// See `<https://oid-base.com/get/1.2.840.113549.1.7.1>`
-pub const DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
-/// id-envelopedData
-/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
-/// See `<https://oid-base.com/get/1.2.840.113549.1.7.3>`
-pub const ENVELOPED_DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.3");
-/// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
-/// id-ct-compressedData OBJECT IDENTIFIER ::= {
-///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
-///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
-/// }
-pub const COMPRESSION_CONTENT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
-/// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
-/// id-alg-zlibCompress OBJECT IDENTIFIER ::= {
-///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
-///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
-/// }
-pub const COMPRESSION_ZLIB_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
-/// OID for zstd compression defined in RFC 8878
-/// See `<https://datatracker.ietf.org/doc/html/rfc8878>`
-/// See `<https://oid-base.com/get/1.3.6.1.4.1.50274.1.1>`
-pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3");
-/// sha-256
-/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.2.1>`
-pub const HASH_SHA256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
-/// sha3-256
-/// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
-pub const HASH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8");
-/// sha3-384
-/// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
-pub const HASH_SHA3_384_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.9");
-/// sha3-512
-/// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
-pub const HASH_SHA3_512_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.10");
-/// ecdsa-with-SHA256
-/// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
-pub const SIGNER_ECDSA_WITH_SHA256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-/// ecdsa-with-SHA3-256 (kept for backwards compatibility, maps to same OID as ecdsa-with-SHA256)
-/// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
-pub const SIGNER_ECDSA_WITH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-/// ecdsa-with-SHA3-512
-/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.3.10>`
-pub const SIGNER_ECDSA_WITH_SHA3_512_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10");
-/// id-aes128-gcm - AES-GCM with 128-bit key
-/// See RFC 5084 - https://datatracker.ietf.org/doc/html/rfc5084
-/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.6>`
-pub const AES_128_GCM_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.6");
-/// id-aes256-gcm - AES-GCM with 256-bit key
-/// See RFC 5084 - https://datatracker.ietf.org/doc/html/rfc5084
-/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.46>`
-pub const AES_256_GCM_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46");
-/// id-aes128-wrap - AES Key Wrap with 128-bit key
-/// See RFC 3394 - https://datatracker.ietf.org/doc/html/rfc3394
-/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.5>`
-pub const AES_128_WRAP_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.5");
-/// id-aes192-wrap - AES Key Wrap with 192-bit key
-/// See RFC 3394 - https://datatracker.ietf.org/doc/html/rfc3394
-/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.25>`
-pub const AES_192_WRAP_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.25");
-/// id-aes256-wrap - AES Key Wrap with 256-bit key
-/// See RFC 3394 - https://datatracker.ietf.org/doc/html/rfc3394
-/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.45>`
-pub const AES_256_WRAP_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45");
-/// secp256k1 - Elliptic curve for Bitcoin/Ethereum
-/// See `<https://oid-base.com/get/1.3.132.0.10>`
-pub const CURVE_SECP256K1_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.10");
-/// secp256r1 (NIST P-256) - Elliptic curve
-/// See `<https://oid-base.com/get/1.2.840.10045.3.1.7>`
-pub const CURVE_NIST_P256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
-/// secp384r1 (NIST P-384) - Elliptic curve
-/// See `<https://oid-base.com/get/1.3.132.0.34>`
-pub const CURVE_NIST_P384_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.34");
-/// secp521r1 (NIST P-521) - Elliptic curve
-/// See `<https://oid-base.com/get/1.3.132.0.35>`
-pub const CURVE_NIST_P521_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.35");
-/// X25519 - Curve25519 for ECDH (used with Ed25519 signatures)
-/// See RFC 8410 - `<https://datatracker.ietf.org/doc/html/rfc8410>`
-/// See `<https://oid-base.com/get/1.3.101.110>`
-pub const CURVE_X25519_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.110");
 
 /// Protocol version determines metadata structure and features
 ///
@@ -275,30 +195,5 @@ impl AsRef<Frame> for Frame {
 // Replace 55555 with assigned enterprise number before production.
 #[cfg(feature = "transport")]
 pub mod transport {
-	use super::ObjectIdentifier;
-
-	pub const HANDSHAKE_PROTOCOL_VERSION_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.1");
-	pub const HANDSHAKE_ALGORITHM_PROFILE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.2");
-	pub const HANDSHAKE_CLIENT_NONCE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.3");
-	pub const HANDSHAKE_SELECT_VERSION_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.4");
-	pub const HANDSHAKE_SELECT_ALGORITHM_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.5");
-	pub const HANDSHAKE_SERVER_NONCE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.6");
-	pub const HANDSHAKE_ABORT_ALERT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.7");
-	pub const HANDSHAKE_TRANSCRIPT_HASH_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.8");
-
-	// Algorithm negotiation attributes (added for interoperability)
-	pub const HANDSHAKE_SUPPORTED_CURVES_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.9");
-	pub const HANDSHAKE_SELECTED_CURVE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.10");
-
-	// Cryptographic profile negotiation attributes
-	pub const HANDSHAKE_SECURITY_OFFER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.11");
-	pub const HANDSHAKE_SECURITY_ACCEPT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.12");
-
-	// Mutual authentication attributes (for ClientKeyExchange)
-	pub const CLIENT_CERTIFICATE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.13");
-	pub const CLIENT_SIGNATURE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.14");
-
-	/// Composite profile OID (ECIES(secp256k1) + HKDF(SHA3-256) + AES-256-GCM)
-	pub const HANDSHAKE_PROFILE_ECIES_GCM_OID: ObjectIdentifier =
-		ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.100");
+	// These constants are now defined in constants.rs
 }

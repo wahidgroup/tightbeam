@@ -39,7 +39,7 @@ impl Compressor for ZstdCompression {
 
 		let compression_alg = AlgorithmIdentifierOwned::from(ZstdCompression);
 		let encap_content_info = content_info
-			.unwrap_or(EncapsulatedContentInfo { econtent_type: crate::asn1::COMPRESSION_CONTENT_OID, econtent: None });
+			.unwrap_or(EncapsulatedContentInfo { econtent_type: crate::oids::COMPRESSION_CONTENT, econtent: None });
 		let compressed_data = CompressedData { version: CmsVersion::V0, compression_alg, encap_content_info };
 
 		Ok((output, compressed_data))
@@ -61,7 +61,7 @@ impl Inflator for ZstdCompression {
 
 impl From<&ZstdCompression> for AlgorithmIdentifierOwned {
 	fn from(_: &ZstdCompression) -> AlgorithmIdentifierOwned {
-		AlgorithmIdentifierOwned { oid: crate::asn1::COMPRESSION_ZSTD_OID, parameters: None }
+		AlgorithmIdentifierOwned { oid: crate::oids::COMPRESSION_ZSTD, parameters: None }
 	}
 }
 

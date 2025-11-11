@@ -662,8 +662,17 @@ impl ExtractVerifyingKey for crate::crypto::sign::ecdsa::Secp256k1VerifyingKey {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
+	use crate::crypto::profiles::SecurityProfileDesc;
 	use crate::crypto::sign::Signer;
+	use crate::der::Encode;
 	use crate::transport::handshake::tests::*;
+	use crate::transport::handshake::ServerHandshake;
+
+	use crate::oids::{
+		AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256, HASH_SHA3_384, HASH_SHA3_512,
+		SIGNER_ECDSA_WITH_SHA3_512,
+	};
 
 	#[test]
 	fn test_client_state_flow() -> Result<(), Box<dyn std::error::Error>> {
@@ -737,35 +746,25 @@ mod tests {
 	/// Test client-side profile validation
 	#[test]
 	fn test_client_profile_validation() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
-		use crate::crypto::profiles::SecurityProfileDesc;
-		use crate::der::Encode;
-		use crate::transport::handshake::ServerHandshake;
-
-		use crate::asn1::{
-			AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, HASH_SHA3_384_OID, HASH_SHA3_512_OID,
-			SIGNER_ECDSA_WITH_SHA3_512_OID,
-		};
-
 		let mk_profile = |id: u8| SecurityProfileDesc {
 			#[cfg(feature = "digest")]
 			digest: match id {
-				1 => HASH_SHA3_256_OID,
-				2 => HASH_SHA3_384_OID,
-				_ => HASH_SHA3_512_OID,
+				1 => HASH_SHA3_256,
+				2 => HASH_SHA3_384,
+				_ => HASH_SHA3_512,
 			},
 			#[cfg(feature = "aead")]
-			aead: Some(AES_256_GCM_OID),
+			aead: Some(AES_256_GCM),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
-			signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
+			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
 			#[cfg(feature = "kdf")]
-			kdf: Some(HASH_SHA3_256_OID), // HKDF-SHA3-256
+			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
 			#[cfg(feature = "ecdh")]
-			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
+			curve: Some(CURVE_SECP256K1),
 			key_wrap: if id % 2 == 0 {
-				Some(AES_256_WRAP_OID)
+				Some(AES_256_WRAP)
 			} else {
 				None
 			},
@@ -806,8 +805,8 @@ mod tests {
 
 			let response = ServerHandshake {
 				certificate: test_cert.certificate.clone(),
-				server_random: crate::asn1::OctetString::new(server_random)?,
-				signature: crate::asn1::OctetString::new(signature_bytes)?,
+				server_random: OctetString::new(server_random)?,
+				signature: OctetString::new(signature_bytes)?,
 				security_accept: Some(SecurityAccept::new(accepted_profile.clone())),
 				client_cert_required: false,
 			};

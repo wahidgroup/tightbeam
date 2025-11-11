@@ -146,7 +146,7 @@ where
 	) -> crate::error::Result<crate::EncryptedContentInfo> {
 		let nonce_ref = nonce.as_ref().into();
 		let ciphertext = self.encrypt(nonce_ref, data.as_ref())?;
-		let content_type = content_type.unwrap_or(crate::asn1::DATA_OID);
+		let content_type = content_type.unwrap_or(crate::oids::DATA);
 
 		// Store the nonce in the algorithm parameters as an OctetString
 		let nonce_octet_string = crate::der::asn1::OctetString::new(nonce.as_ref())?;
@@ -201,7 +201,7 @@ impl RuntimeAead {
 		content_type: Option<ObjectIdentifier>,
 	) -> crate::error::Result<crate::EncryptedContentInfo> {
 		let ciphertext = self.cipher.encrypt_bytes(nonce.as_ref(), data.as_ref())?;
-		let content_type = content_type.unwrap_or(crate::asn1::DATA_OID);
+		let content_type = content_type.unwrap_or(crate::oids::DATA);
 
 		// Store the nonce in the algorithm parameters as an OctetString
 		let nonce_octet_string = crate::der::asn1::OctetString::new(nonce.as_ref())?;

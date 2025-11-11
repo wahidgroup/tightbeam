@@ -18,7 +18,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::asn1::OctetString;
-use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
+use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_ECIES_KDF_INFO};
 use crate::crypto::aead::{Aead, Aes256Gcm, Key, KeyInit, Nonce, Payload};
 use crate::crypto::ecies::EciesError;
 use crate::crypto::ecies::{EciesMessageOps, Secp256k1EciesMessage};
@@ -333,8 +333,6 @@ where
 	}
 
 	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		const ECIES_KDF_INFO: &[u8] = b"tightbeam-ecies-v1";
-
 		// Parse the ECIES message from bytes
 		let encrypted_message = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
 
@@ -349,7 +347,7 @@ where
 		let k_enc = ecies_kdf::<HkdfSha3_256>(
 			encrypted_message.ephemeral_pubkey(),
 			shared_secret_bytes.into(),
-			ECIES_KDF_INFO,
+			TIGHTBEAM_ECIES_KDF_INFO,
 			None,
 		)?;
 
@@ -700,30 +698,30 @@ mod tests {
 	/// and dealer's choice mode when no offer is present.
 	#[tokio::test]
 	async fn test_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::asn1::{
-			AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, HASH_SHA3_384_OID, HASH_SHA3_512_OID,
-			SIGNER_ECDSA_WITH_SHA3_512_OID,
+		use crate::oids::{
+			AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256, HASH_SHA3_384, HASH_SHA3_512,
+			SIGNER_ECDSA_WITH_SHA3_512,
 		};
 
 		let mk_profile = |id: u8| SecurityProfileDesc {
 			#[cfg(feature = "digest")]
 			digest: match id {
-				1 => HASH_SHA3_256_OID,
-				2 => HASH_SHA3_384_OID,
-				_ => HASH_SHA3_512_OID,
+				1 => HASH_SHA3_256,
+				2 => HASH_SHA3_384,
+				_ => HASH_SHA3_512,
 			},
 			#[cfg(feature = "aead")]
-			aead: Some(AES_256_GCM_OID),
+			aead: Some(AES_256_GCM),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
 			#[cfg(feature = "signature")]
-			signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
+			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
 			#[cfg(feature = "kdf")]
-			kdf: Some(HASH_SHA3_256_OID), // HKDF-SHA3-256
+			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
 			#[cfg(feature = "ecdh")]
-			curve: Some(crate::asn1::CURVE_SECP256K1_OID),
+			curve: Some(CURVE_SECP256K1),
 			key_wrap: if id % 2 == 0 {
-				Some(AES_256_WRAP_OID)
+				Some(AES_256_WRAP)
 			} else {
 				None
 			},

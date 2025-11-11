@@ -1,8 +1,10 @@
 //! Associated-type based cryptographic provider abstraction.
 
+use crate::constants::TIGHTBEAM_UKM_PREFIX;
 use crate::crypto::hash::Digest;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
+use crate::oids::AES_256_WRAP;
 use crate::spki::AlgorithmIdentifierOwned;
 
 #[cfg(feature = "derive")]
@@ -66,11 +68,6 @@ macro_rules! impl_key_unwrapper {
 		})
 	};
 }
-
-pub const DOMAIN_KARI_KDF: &[u8] = b"tb/kari/kdf/v1";
-pub const DOMAIN_SESSION_KDF: &[u8] = b"tb/session/kdf/v1";
-pub const DOMAIN_SIGNED_TRANSCRIPT: &[u8] = b"tb/handshake/transcript/v1";
-pub const DOMAIN_UKM_PREFIX: &[u8] = b"tb/kari/ukm/v1|";
 
 /// Trait to extract key size from AEAD OID types.
 ///
@@ -342,7 +339,7 @@ impl SecurityProfile for TightbeamProfile {
 	#[cfg(feature = "ecdh")]
 	type CurveOid = Secp256k1Oid;
 
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
 
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
@@ -443,8 +440,8 @@ impl UkmBuilder {
 	pub fn finalize(self) -> Vec<u8> {
 		// layout: DOMAIN_UKM_PREFIX || client || server || [ tag | len(2) | data ]*
 		let ext_cap: usize = self.extensions.iter().map(|(_, d)| 1 + 2 + d.len()).sum();
-		let mut out = Vec::with_capacity(DOMAIN_UKM_PREFIX.len() + 64 + ext_cap);
-		out.extend_from_slice(DOMAIN_UKM_PREFIX);
+		let mut out = Vec::with_capacity(TIGHTBEAM_UKM_PREFIX.len() + 64 + ext_cap);
+		out.extend_from_slice(TIGHTBEAM_UKM_PREFIX);
 		out.extend_from_slice(&self.client);
 		out.extend_from_slice(&self.server);
 		for (tag, data) in self.extensions.into_iter() {
@@ -472,6 +469,9 @@ pub fn apply_domain(label: &[u8], material: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::constants::{
+		TIGHTBEAM_KARI_KDF_INFO, TIGHTBEAM_SESSION_KDF_INFO, TIGHTBEAM_SIGNED_TRANSCRIPT_DOMAIN, TIGHTBEAM_UKM_PREFIX,
+	};
 
 	// ========================================================================
 	// Domain Constant Stability Tests
@@ -482,27 +482,27 @@ mod tests {
 	/// which will invalidate all existing derived keys and signatures.
 	#[test]
 	fn test_domain_constants_stable() {
-		assert_eq!(DOMAIN_KARI_KDF, b"tb/kari/kdf/v1");
-		assert_eq!(DOMAIN_SESSION_KDF, b"tb/session/kdf/v1");
-		assert_eq!(DOMAIN_SIGNED_TRANSCRIPT, b"tb/handshake/transcript/v1");
-		assert_eq!(DOMAIN_UKM_PREFIX, b"tb/kari/ukm/v1|");
+		assert_eq!(TIGHTBEAM_KARI_KDF_INFO, b"tb/kari/kdf/v1");
+		assert_eq!(TIGHTBEAM_SESSION_KDF_INFO, b"tb/session/kdf/v1");
+		assert_eq!(TIGHTBEAM_SIGNED_TRANSCRIPT_DOMAIN, b"tb/handshake/transcript/v1");
+		assert_eq!(TIGHTBEAM_UKM_PREFIX, b"tb/kari/ukm/v1|");
 	}
 
 	/// Verify apply_domain prepends correctly.
 	#[test]
 	fn test_apply_domain() {
-		let result = apply_domain(DOMAIN_SESSION_KDF, b"test_material");
-		assert!(result.starts_with(DOMAIN_SESSION_KDF));
+		let result = apply_domain(TIGHTBEAM_SESSION_KDF_INFO, b"test_material");
+		assert!(result.starts_with(TIGHTBEAM_SESSION_KDF_INFO));
 		assert!(result.ends_with(b"test_material"));
-		assert_eq!(result.len(), DOMAIN_SESSION_KDF.len() + b"test_material".len());
+		assert_eq!(result.len(), TIGHTBEAM_SESSION_KDF_INFO.len() + b"test_material".len());
 	}
 
 	/// Changing a domain constant should produce different output.
 	#[test]
 	fn test_domain_separation_effectiveness() {
 		let material = b"shared_material";
-		let with_kari = apply_domain(DOMAIN_KARI_KDF, material);
-		let with_session = apply_domain(DOMAIN_SESSION_KDF, material);
+		let with_kari = apply_domain(TIGHTBEAM_KARI_KDF_INFO, material);
+		let with_session = apply_domain(TIGHTBEAM_SESSION_KDF_INFO, material);
 		assert_ne!(with_kari, with_session, "Different domains must produce different outputs");
 	}
 
@@ -523,8 +523,8 @@ mod tests {
 		let ukm1 = UkmBuilder::new(c, s).finalize();
 		let ukm2 = UkmBuilder::new(c, s).finalize();
 		assert_eq!(ukm1, ukm2);
-		assert!(ukm1.starts_with(DOMAIN_UKM_PREFIX));
-		assert_eq!(ukm1.len(), DOMAIN_UKM_PREFIX.len() + 64);
+		assert!(ukm1.starts_with(TIGHTBEAM_UKM_PREFIX));
+		assert_eq!(ukm1.len(), TIGHTBEAM_UKM_PREFIX.len() + 64);
 	}
 
 	#[test]
@@ -536,8 +536,8 @@ mod tests {
 			.with_extension(0x02, b"world")?
 			.finalize();
 		// prefix + nonces + (tag+len+data)*2 = prefix + 64 + (1+2+5)*2 = prefix + 64 + 16
-		assert_eq!(ukm.len(), DOMAIN_UKM_PREFIX.len() + 64 + 16);
-		let tail = &ukm[DOMAIN_UKM_PREFIX.len() + 64..];
+		assert_eq!(ukm.len(), TIGHTBEAM_UKM_PREFIX.len() + 64 + 16);
+		let tail = &ukm[TIGHTBEAM_UKM_PREFIX.len() + 64..];
 		assert_eq!(tail[0], 0x01);
 		assert_eq!(&tail[1..3], &(5u16.to_be_bytes()));
 		assert_eq!(&tail[3..8], b"hello");
@@ -610,7 +610,7 @@ mod tests {
 			type KdfOid = crate::crypto::kdf::HkdfSha3_256Oid;
 			type CurveOid = crate::crypto::curves::Secp256k1Oid;
 
-			const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(crate::asn1::AES_256_WRAP_OID);
+			const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 		}
 
 		let profile = Aes128Profile;

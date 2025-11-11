@@ -5,13 +5,13 @@
 //! - AEAD session key finalization (all orchestrators)
 //! - Alert attribute processing (all orchestrators)
 
-use crate::asn1::transport::HANDSHAKE_ABORT_ALERT_OID;
 use crate::constants::{MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::negotiation::{select_profile, SecurityOffer};
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::x509::attr::{Attribute, Attributes};
+use crate::oids::HANDSHAKE_ABORT_ALERT;
 use crate::transport::handshake::attributes::{extract_alert_x509, find_x509};
 use crate::transport::handshake::error::HandshakeError;
 
@@ -140,7 +140,7 @@ pub trait HandshakeAlertHandler {
 			let attr_refs: Vec<&Attribute> = attrs.iter().collect();
 
 			// Check for abort alert attribute
-			if let Ok(alert_attr) = find_x509(&attr_refs, &HANDSHAKE_ABORT_ALERT_OID) {
+			if let Ok(alert_attr) = find_x509(&attr_refs, &HANDSHAKE_ABORT_ALERT) {
 				let alert = extract_alert_x509(alert_attr)?;
 				return Err(HandshakeError::AbortReceived(alert));
 			}
@@ -152,11 +152,9 @@ pub trait HandshakeAlertHandler {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::{
-		AES_128_GCM_OID, AES_256_GCM_OID, CURVE_SECP256K1_OID, HASH_SHA256_OID, SIGNER_ECDSA_WITH_SHA256_OID,
-	};
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::der::asn1::ObjectIdentifier;
+	use crate::oids::{AES_128_GCM, AES_256_GCM, CURVE_SECP256K1, HASH_SHA256, SIGNER_ECDSA_WITH_SHA256};
 
 	// Mock struct for testing negotiation
 	struct MockServer {
@@ -186,25 +184,25 @@ mod tests {
 	fn create_test_profile(aead_oid: ObjectIdentifier, key_size: u16) -> SecurityProfileDesc {
 		SecurityProfileDesc {
 			#[cfg(feature = "digest")]
-			digest: HASH_SHA256_OID,
+			digest: HASH_SHA256,
 			#[cfg(feature = "aead")]
 			aead: Some(aead_oid),
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(key_size),
 			#[cfg(feature = "signature")]
-			signature: Some(SIGNER_ECDSA_WITH_SHA256_OID),
+			signature: Some(SIGNER_ECDSA_WITH_SHA256),
 			#[cfg(feature = "kdf")]
-			kdf: Some(HASH_SHA256_OID),
+			kdf: Some(HASH_SHA256),
 			#[cfg(feature = "ecdh")]
-			curve: Some(CURVE_SECP256K1_OID),
+			curve: Some(CURVE_SECP256K1),
 			key_wrap: None,
 		}
 	}
 
 	#[test]
 	fn test_negotiate_profile_with_offer() -> Result<(), Box<dyn std::error::Error>> {
-		let p_a = create_test_profile(AES_128_GCM_OID, 16);
-		let p_b = create_test_profile(AES_256_GCM_OID, 32);
+		let p_a = create_test_profile(AES_128_GCM, 16);
+		let p_b = create_test_profile(AES_256_GCM, 32);
 
 		let server = MockServer { profiles: vec![p_a, p_b] };
 
@@ -216,8 +214,8 @@ mod tests {
 
 	#[test]
 	fn test_negotiate_profile_dealers_choice() -> Result<(), Box<dyn std::error::Error>> {
-		let p_a = create_test_profile(AES_128_GCM_OID, 16);
-		let p_b = create_test_profile(AES_256_GCM_OID, 32);
+		let p_a = create_test_profile(AES_128_GCM, 16);
+		let p_b = create_test_profile(AES_256_GCM, 32);
 
 		let server = MockServer { profiles: vec![p_a, p_b] };
 
@@ -236,7 +234,7 @@ mod tests {
 
 	#[test]
 	fn test_derive_session_aead_success() {
-		let profile = create_test_profile(AES_256_GCM_OID, 32);
+		let profile = create_test_profile(AES_256_GCM, 32);
 		let client = MockClient { profile: Some(profile) };
 
 		let input_key = [0x42u8; 32];
@@ -250,7 +248,7 @@ mod tests {
 
 	#[test]
 	fn test_derive_session_aead_insufficient_salt() {
-		let profile = create_test_profile(AES_256_GCM_OID, 32);
+		let profile = create_test_profile(AES_256_GCM, 32);
 		let client = MockClient { profile: Some(profile) };
 
 		let input_key = [0x42u8; 32];

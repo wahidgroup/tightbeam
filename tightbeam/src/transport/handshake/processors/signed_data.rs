@@ -96,6 +96,7 @@ mod tests {
 		use crate::crypto::profiles::DefaultCryptoProvider;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 		use crate::crypto::sign::EcdsaSignatureVerifier;
+		use crate::oids::HASH_SHA3_256;
 		use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 		use crate::transport::handshake::tests::{
 			create_ecdsa_sha3_256_signature_alg, create_sha3_256_digest_alg, create_test_signing_key,
@@ -143,7 +144,7 @@ mod tests {
 
 			// 4. Create processor and verify signature
 			let processor = create_test_processor(&signing_key)?;
-			let verified_content = processor.process(&signed_data, &crate::asn1::HASH_SHA3_256_OID)?;
+			let verified_content = processor.process(&signed_data, &HASH_SHA3_256)?;
 
 			// 5. Verify content matches original
 			assert_eq!(verified_content, content);
@@ -166,7 +167,7 @@ mod tests {
 
 			// 4. Create processor and verify from DER
 			let processor = create_test_processor(&signing_key)?;
-			let verified_content = processor.process_der(&der_bytes, &crate::asn1::HASH_SHA3_256_OID)?;
+			let verified_content = processor.process_der(&der_bytes, &HASH_SHA3_256)?;
 
 			// 5. Verify content matches original
 			assert_eq!(verified_content, content);
@@ -189,7 +190,7 @@ mod tests {
 
 			// 4. Try to verify with wrong key (should fail)
 			let processor = create_test_processor(&wrong_key)?;
-			let result = processor.process(&signed_data, &crate::asn1::HASH_SHA3_256_OID);
+			let result = processor.process(&signed_data, &HASH_SHA3_256);
 
 			// 5. Verify that verification fails
 			assert!(result.is_err());

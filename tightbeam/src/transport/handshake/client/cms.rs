@@ -512,7 +512,7 @@ where
 		let octet_string = OctetString::new(&transcript_hash)?;
 		let econtent_der = octet_string.to_der()?;
 		let encap_content_info = EncapsulatedContentInfo {
-			econtent_type: crate::asn1::DATA_OID,
+			econtent_type: crate::oids::DATA,
 			econtent: Some(crate::der::Any::new(crate::der::Tag::OctetString, econtent_der.as_slice())?),
 		};
 
@@ -639,12 +639,12 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::elliptic_curve::SecretKey;
 	use crate::der::{Decode, Encode};
+	use crate::oids::{HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	use crate::transport::handshake::state::ClientHandshakeState;
 	use crate::transport::handshake::tests::*;
-	use crate::{HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_256_OID};
 
 	#[tokio::test]
 	async fn test_client_state_flow() -> Result<(), Box<dyn std::error::Error>> {
@@ -674,8 +674,8 @@ mod tests {
 		assert_eq!(decrypted, session_key);
 
 		// When: Client processes server Finished
-		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256_OID, parameters: None };
-		let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
+		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+		let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
 		let server_finished_builder = TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(
 			&server_test_cert.signing_key,
 			digest_alg,

@@ -12,10 +12,7 @@ use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use crate::asn1::{
-	OctetString, AES_256_GCM_OID, AES_256_WRAP_OID, HASH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA256_OID,
-	SIGNER_ECDSA_WITH_SHA3_256_OID, SIGNER_ECDSA_WITH_SHA3_512_OID,
-};
+use crate::asn1::OctetString;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::crypto::key::{InMemoryKeyProvider, KeyProvider};
 use crate::crypto::negotiation::SecurityAccept;
@@ -26,6 +23,10 @@ use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 use crate::der::asn1::BitString;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::{Decode, Encode};
+use crate::oids::{
+	AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256,
+	SIGNER_ECDSA_WITH_SHA3_512,
+};
 use crate::random::OsRng;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::server::EciesHandshakeServer;
@@ -52,17 +53,17 @@ use crate::x509::time::Time;
 pub fn create_default_test_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
 		#[cfg(feature = "digest")]
-		digest: HASH_SHA3_256_OID,
+		digest: HASH_SHA3_256,
 		#[cfg(feature = "aead")]
-		aead: Some(AES_256_GCM_OID),
+		aead: Some(AES_256_GCM),
 		#[cfg(feature = "aead")]
 		aead_key_size: Some(32), // AES-256 uses 32-byte keys
 		#[cfg(feature = "signature")]
-		signature: Some(SIGNER_ECDSA_WITH_SHA3_512_OID),
+		signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
 		#[cfg(feature = "kdf")]
-		kdf: Some(HASH_SHA3_256_OID), // Use SHA3-256 OID for HKDF-SHA3-256
+		kdf: Some(HASH_SHA3_256), // Use SHA3-256 OID for HKDF-SHA3-256
 		#[cfg(feature = "ecdh")]
-		curve: Some(crate::asn1::CURVE_SECP256K1_OID),
+		curve: Some(CURVE_SECP256K1),
 		key_wrap: None,
 	}
 }
@@ -112,7 +113,7 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 	let tbs_cert = TbsCertificate {
 		version: crate::x509::Version::V3,
 		serial_number: SerialNumber::new(&[1])?,
-		signature: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256_OID, parameters: None },
+		signature: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256, parameters: None },
 		issuer: RdnSequence::default(),
 		validity: Validity {
 			not_before: Time::GeneralTime(GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(0))?),
@@ -129,7 +130,7 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 
 	Ok(Certificate {
 		tbs_certificate: tbs_cert,
-		signature_algorithm: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256_OID, parameters: None },
+		signature_algorithm: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256, parameters: None },
 		signature: BitString::new(0, vec![0; 64])?,
 	})
 }
@@ -211,12 +212,12 @@ pub fn create_test_signing_key() -> Secp256k1SigningKey {
 
 /// Create SHA3-256 digest algorithm identifier for CMS operations.
 pub fn create_sha3_256_digest_alg() -> AlgorithmIdentifierOwned {
-	AlgorithmIdentifierOwned { oid: HASH_SHA3_256_OID, parameters: None }
+	AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None }
 }
 
 /// Create ECDSA with SHA3-256 signature algorithm identifier for CMS operations.
 pub fn create_ecdsa_sha3_256_signature_alg() -> AlgorithmIdentifierOwned {
-	AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None }
+	AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 }
 
 /// Create test key pairs for cryptographic operations.
@@ -257,7 +258,7 @@ pub fn create_test_recipient_id() -> KeyAgreeRecipientIdentifier {
 
 /// Create test key encryption algorithm identifier (AES-256 key wrap).
 pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
-	AlgorithmIdentifierOwned { oid: AES_256_WRAP_OID, parameters: None }
+	AlgorithmIdentifierOwned { oid: AES_256_WRAP, parameters: None }
 }
 
 /// Helper function to convert a SigningKey into an Arc<dyn KeyProvider>.

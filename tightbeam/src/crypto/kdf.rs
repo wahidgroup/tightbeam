@@ -36,6 +36,7 @@
 
 pub use hkdf::Hkdf;
 
+use crate::constants::{MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
 use crate::der::oid::{AssociatedOid, ObjectIdentifier};
@@ -43,12 +44,6 @@ use crate::zeroize::Zeroizing;
 use crate::ZeroizingArray;
 
 pub type Result<T> = ::core::result::Result<T, KdfError>;
-
-/// Temporary buffer limit for optimized dual-key expansion in the default provider.
-/// Ensures `2*N <= 128` when deriving (enc, mac) via a single HKDF-Expand.
-const MAX_HKDF_OUTPUT_SIZE: usize = 128;
-/// Minimum secure key size in bytes
-const MIN_KEY_SIZE: usize = 16;
 
 /// Trait for Key Derivation Function providers
 ///

@@ -216,11 +216,9 @@ where
 		// Extract SecurityOffer from attributes if present
 		let offer = unprotected_attrs.and_then(|attrs| {
 			let handshake_attrs = self.convert_to_handshake_attributes(attrs).ok()?;
-			let offer_attr = crate::transport::handshake::attributes::find(
-				&handshake_attrs,
-				&crate::asn1::transport::HANDSHAKE_SECURITY_OFFER_OID,
-			)
-			.ok()?;
+			let offer_attr =
+				crate::transport::handshake::attributes::find(&handshake_attrs, &crate::oids::HANDSHAKE_SECURITY_OFFER)
+					.ok()?;
 
 			crate::transport::handshake::attributes::extract_security_offer(offer_attr).ok()
 		});
@@ -470,7 +468,7 @@ where
 		let octet_string = OctetString::new(&transcript_hash)?;
 		let econtent_der = octet_string.to_der()?;
 		let encap_content_info = EncapsulatedContentInfo {
-			econtent_type: crate::asn1::DATA_OID,
+			econtent_type: crate::oids::DATA,
 			econtent: Some(crate::der::Any::new(crate::der::Tag::OctetString, econtent_der.as_slice())?),
 		};
 
@@ -715,12 +713,17 @@ mod tests {
 		use crate::crypto::x509::name::Name;
 		use crate::crypto::x509::serial_number::SerialNumber;
 		use crate::der::Decode;
+		use crate::oids::{
+			AES_128_GCM, AES_128_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA256, HASH_SHA3_256,
+			SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256,
+		};
 		use crate::random::{generate_nonce, OsRng};
 		use crate::spki::SubjectPublicKeyInfoOwned;
 		use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
-		use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamSignedDataBuilder};
+		use crate::transport::handshake::builders::{
+			TightBeamEnvelopedDataBuilder, TightBeamKariBuilder, TightBeamSignedDataBuilder,
+		};
 		use crate::transport::handshake::tests::*;
-		use crate::transport::handshake::TightBeamKariBuilder;
 
 		/// Test the full server state flow through a complete handshake.
 		///
@@ -849,7 +852,7 @@ mod tests {
 				serial_number: SerialNumber::new(&[0x01])?,
 			});
 
-			let key_enc_alg = AlgorithmIdentifierOwned { oid: crate::asn1::AES_128_WRAP_OID, parameters: None };
+			let key_enc_alg = AlgorithmIdentifierOwned { oid: AES_128_WRAP, parameters: None };
 
 			let kari_builder = TightBeamKariBuilder::default()
 				.with_sender_priv(sender_ephemeral)
@@ -870,9 +873,8 @@ mod tests {
 			signing_key: &Secp256k1SigningKey,
 			transcript_hash: &[u8],
 		) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-			let digest_alg = AlgorithmIdentifierOwned { oid: crate::asn1::HASH_SHA3_256_OID, parameters: None };
-			let signature_alg =
-				AlgorithmIdentifierOwned { oid: crate::asn1::SIGNER_ECDSA_WITH_SHA3_256_OID, parameters: None };
+			let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+			let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
 
 			use der::Encode;
 			let builder =
@@ -885,29 +887,29 @@ mod tests {
 		/// Create a test security profile with the given AEAD key size.
 		fn create_aes_gcm_profile(key_size: u16) -> crate::crypto::profiles::SecurityProfileDesc {
 			let aead_oid = if key_size == 16 {
-				crate::asn1::AES_128_GCM_OID
+				AES_128_GCM
 			} else {
-				crate::asn1::AES_256_GCM_OID
+				AES_256_GCM
 			};
 			let key_wrap_oid = if key_size == 16 {
-				crate::asn1::AES_128_WRAP_OID
+				AES_128_WRAP
 			} else {
-				crate::asn1::AES_256_WRAP_OID
+				AES_256_WRAP
 			};
 
 			crate::crypto::profiles::SecurityProfileDesc {
 				#[cfg(feature = "digest")]
-				digest: crate::asn1::HASH_SHA256_OID,
+				digest: HASH_SHA256,
 				#[cfg(feature = "aead")]
 				aead: Some(aead_oid),
 				#[cfg(feature = "aead")]
 				aead_key_size: Some(key_size),
 				#[cfg(feature = "signature")]
-				signature: Some(crate::asn1::SIGNER_ECDSA_WITH_SHA256_OID),
+				signature: Some(SIGNER_ECDSA_WITH_SHA256),
 				#[cfg(feature = "kdf")]
-				kdf: Some(crate::asn1::HASH_SHA256_OID), // HKDF-SHA256
+				kdf: Some(HASH_SHA256), // HKDF-SHA256
 				#[cfg(feature = "ecdh")]
-				curve: Some(crate::asn1::CURVE_SECP256K1_OID),
+				curve: Some(CURVE_SECP256K1),
 				key_wrap: Some(key_wrap_oid),
 			}
 		}
