@@ -107,6 +107,7 @@ versioned metadata structures for high-fidelity information transmission.
 10. [Testing Framework](#10-testing-framework)
 	- 10.1. [Quantum Entanglement Testing](#101-quantum-entanglement-testing)
 	- 10.2. [Test Container Example](#102-test-container-example)
+		- 10.3. [AssertSpec Macro Rewrite](#103-assertspec-macro-rewrite)
 11. [End-to-End Examples](#11-end-to-end-examples)
 	- 11.1. [Complete Client-Server Application](#111-complete-client-server-application)
 12. [References](#12-references)
@@ -1663,7 +1664,7 @@ let security_accept = SecurityAccept {
 The tightbeam transport layer and handshake protocols have not yet been
 independently audited. We welcome help in this area.
 
-## 9. Network Theory
+## 10. Network Theory
 
 ### 9.1 Network Architecture
 
@@ -1903,253 +1904,537 @@ can be combined to create complex systems. The swarm is yours to command.
 
 ## 10. Testing Framework
 
-tightbeam implements a novel testing approach called **Concurrent Behavior Verification 
-with Observation Channels** (CBVOC), which enables deterministic testing of concurrent 
-client-server interactions through non-intrusive observation points.
+The tightbeam testing stack is delivered in three progressive layers with feature flags:
 
-### 10.1 Testing Methodology Overview
+| Layer | Feature Flag | Purpose | Model | Primary Macro |
+|-------|--------------|---------|-------|---------------|
+| L1 AssertSpec | `testing` | Fast single‑trace deterministic assertion verification | Outcome + Assertions | `tb_scenario!` + `tb_assert_spec!` |
+| L2 ProcessSpec | `testing-csp` | CSP‑style state machine modeling (external vs hidden internal events) | Labeled Transition System | `tb_process_spec!` |
+| L3 Refinement / FDR | `testing-fdr` | Approximate trace + failures refinement, divergence heuristics, optional CSPM export / FDR bridge | Refinement Checking | `tb_case!` |
 
-Traditional integration testing of concurrent systems faces fundamental challenges:
-- **Race Conditions**: Non-deterministic timing between client and server threads
-- **State Inspection**: Difficulty observing internal state without disrupting execution
-- **Causal Ordering**: Verifying event sequences across concurrent execution contexts
-- **Test Isolation**: Ensuring tests don't interfere with the system under test
+Legacy Macros: `test_container!`, `test_worker!`, and `test_servlet!` are DEPRECATED and WILL be removed after the `tb_scenario!` migration window. Prefer `tb_scenario!` immediately.
 
-CBVOC solves these problems through side-channel observation: auxiliary communication 
-channels that allow tests to observe system behavior without modifying the primary 
-client-server communication path.
+### 10.1 AssertSpec Macro
 
-#### Why This Approach is Superior
+Declarative multi‑version assertion specs with deterministic hashing:
 
-**Compared to Traditional Mocking:**
-- **Real Concurrency**: Tests actual multi-threaded behavior, not mock sequencing
-- **No Stubs Required**: Uses actual transport implementations
-- **Timing Verification**: Observes real async/await state transitions
-
-**Compared to Deterministic Schedulers:**
-- **Production-Like**: Tests run with real OS threading and scheduling
-- **No Custom Runtime**: Works with standard Tokio/async-std executors
-- **Performance Realistic**: Reveals actual timing-dependent bugs
-
-**Compared to Black-Box Integration Tests:**
-- **Internal Visibility**: Observes intermediate states during message processing
-- **Assertion Granularity**: Can verify specific event orderings
-- **Debugging Aid**: Observation channels provide execution traces
-
-**Compared to Time-Based Synchronization:**
-- **No Sleep/Wait**: Uses channel synchronization instead of arbitrary timeouts
-- **Deterministic**: Events occur in predictable order relative to observations
-- **Fast Execution**: No artificial delays bloating test suite runtime
-
-### 10.2 Concurrent Behavior Verification with Observation Channels
-
-The core mechanism uses three MPSC (multi-producer, single-consumer) channels 
-that act as observation points into the concurrent system:
-
-```rust
-// Server handler channel: tx for server, rx for container
-let (tx, rx) = mpsc::channel();
-
-// Status channels (container receives ok/reject)
-let (ok_tx, ok_rx) = mpsc::channel();
-let (reject_tx, reject_rx) = mpsc::channel();
-
-// Exposed in test as single tuple
-let channels = (rx, ok_rx, reject_rx);
 ```
-
-#### The Quantum Entanglement Analogy
-
-While not literally quantum mechanics, the testing pattern exhibits analogous properties 
-that help understand its behavior:
-
-**Superposition**: Before observation (await completion), the system exists in a 
-superposition of possible states—the message may be accepted, rejected, processed, 
-or failed. The test doesn't know which until observation occurs.
-
-**Wave Function Collapse**: When `client.emit(...).await` completes, the "wave function 
-collapses"—the test can now deterministically observe what happened through the 
-observation channels. Causality is preserved because channel receives are ordered.
-
-**Entanglement**: The observation channels are "entangled" with the system under test. 
-What happens in one channel (e.g., gate acceptance) is correlated with what you expect 
-in others (e.g., server handler invocation). These correlations encode the system's 
-causal structure.
-
-**No Faster-Than-Light**: Just as quantum mechanics respects causality, so does 
-CBVOC. Channel synchronization ensures that observations respect the 
-happens-before relationship. A test cannot observe an event before it occurs.
-
-####  Message Flow Sequence
-1. Client emits a message
-2. The server MAY receive the message
-3. The gate MAY reject the message and MUST tell reject_tx
-	- If so, the client SHOULD[^mpsc] hear from reject_rx
-	- If not, the gate tells ok_tx and the client SHOULD hear from ok_rx
-4. The server handles the message and MAY arbitrarily talk to tx
-	- If so, the client SHOULD hear from rx
-5. The server MAY respond with a message
-
-[^mpsc]: MPSC ops MAY return Empty while polling; Disconnect occurs at teardown.
-
-```rust
-service: |message, tx| async move {
-    tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
-
-    let decoded = tightbeam::decode::<RequestMessage, _>(&message.clone().message).ok()?;
-    if &decoded.content == "PING" {
-        tightbeam::relay!(ServiceAssertChecklist::ContainerPingReceived, tx)?;
-
-        let response = Some(tightbeam::compose! {
-            V0: id: message.metadata.id.clone(),
-                message: ResponseMessage {
-                    result: "PONG".into()
-                }
-        }.ok()?);
-
-        tightbeam::relay!(ServiceAssertChecklist::SentResponse, tx)?;
-        response
-    } else {
-        None
-    }
+tb_assert_spec! {
+	pub MySpec,
+	V(1,0,0): { 
+		mode: Accept, 
+		gate: Accepted, 
+		assertions: [ 
+			(HandlerStart, "Received", exactly!(1)) 
+		] 
+	},
+	V(1,1,0): { 
+		mode: Accept, 
+		gate: Accepted, 
+		assertions: [ 
+			(HandlerStart, "Received", exactly!(1)), 
+			(Response, "Responded", exactly!(2)) 
+		] 
+	},
 }
 ```
-6. The client MAY receive a response or error or timeout
-	- If no response, `None`
-	- If response, `Some(Frame)`
-	- If error, `Err(TransportError)`
-7. The client MAY process the response and determine:
-	- What the client sent
-	- What the gate accepted or rejected
-	- What the server wants to assert
-	- What the server responded with
-	- What the client received
 
-The test container is in an indeterminate state before `client.emit().await` completes. 
-When the await resolves, the system state "collapses" to a deterministic outcome—causality 
-intact. The test can now observe the complete execution trace through the channels: 
+Version blocks: `V(maj,min,patch): { mode: <ExecutionMode>, gate: <TransitStatus>, assertions: [ (Phase, label, cardinality), ... ] }` (+ optional `events: [Kind,..]` when instrumentation enabled).
+
+Hash: 32‑byte Sha3‑256 over domain tag `TBSP`, version triple, spec id, mode code, gate (presence + value), normalized assertions (sorted by `(label, phase)`), and optional event kinds.
+
+Accessors:
+- `Type::all()` slice of all versions
+- `Type::get(maj,min,patch)` lookup
+- `Type::latest()` highest semantic version
+
+Cardinality helpers: `exactly!`, `at_least!`, `at_most!`, `between!`, `present!`, `absent!`.
+
+Example:
 ```rust
-let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
-    // Collect checklist items
-    assert_recv!(rx, ServiceAssertChecklist::ContainerMessageReceived);
-    assert_recv!(rx, ServiceAssertChecklist::ContainerPingReceived);
-    assert_recv!(rx, ServiceAssertChecklist::SentResponse);
-    // Verify response metadata
-    assert_eq!(response.metadata.id, message.metadata.id);
-    // Ensure we received the message on the server side
-    assert_recv!(ok_rx, message);
-    // Ensure server did not reject
-    assert_channels_quiet!(reject_rx);
+tb_assert_spec! {
+	pub DemoSpec,
+	V(1,0,0): { 
+		mode: Accept, 
+		gate: Accepted, 
+		assertions: [ 
+			(HandlerStart, "A", exactly!(1)), 
+			(Response, "R", exactly!(1)) 
+		] 
+	},
+	V(1,1,0): { 
+		mode: Accept, 
+		gate: Accepted, 
+		assertions: [ 
+			(HandlerStart, "A", exactly!(1)), 
+			(Response, "R", exactly!(2)) 
+		] 
+	},
+}
+assert_ne!(DemoSpec::get(1,0,0).unwrap().spec_hash(), DemoSpec::get(1,1,0).unwrap().spec_hash());
+assert_eq!(DemoSpec::latest().version(), (1,1,0));
+```
 
-    tightbeam::decode::<ResponseMessage, _>(&response.message).ok()
-} else {
-    panic!("Expected a response from the service");
-};
+Future additions will layer scenario execution and process/refinement modeling atop this core.
+
+### 10.2 Scenario Macro: `tb_scenario!`
+
+`tb_scenario!` is the single entry point for executing an AssertSpec (Layer 1) under a selectable environment. It decouples spec verification from any particular transport or concurrency model.
+
+Environment Variants (initial set):
 
 ```
-This occurs while ensuring each client and server operate within their own
-scope in a single containerized test. Channels are automatically cleaned up.
+environment ServiceClient { /* transport round‑trip */ }
+environment Worker        { /* single local worker relay */ }
+environment Bare          { /* pure logic / function invocation */ }
+```
 
-#### Key Benefits
+Shared Top‑Level Keys:
 
-1. **Happens-Before Verification**: Channel ordering guarantees causal consistency
-2. **No Race Conditions**: Synchronization points prevent non-deterministic failures
-3. **Full Execution Trace**: Observe internal state transitions during message processing
-4. **Minimal Overhead**: Channel operations are lightweight compared to alternatives
-5. **Test Isolation**: Each test container has independent channel instances
+```
+spec: <AssertSpecType>,           // REQUIRED – produced by tb_assert_spec!
+instrumentation: <TbInstrumentationConfig>, // OPTIONAL
+hooks {                           // OPTIONAL
+	on_pass: |trace| { /* ... */ },
+	on_fail: |trace, violations| { /* ... */ }
+}
+assert_policies {                 // OPTIONAL future extension
+	enforce_ordering: true,
+	strict_phases: true,
+}
+environment <Variant> { ... }     // EXACTLY ONE
+```
 
-### 10.3 Test Container Example
+#### ServiceClient Variant
 
-Complete example demonstrating Concurrent Behavior Verification with Observation Channels:
+Fields:
+```
+protocol: Listener | <other>,
+worker_threads: <u16>,
+service_policies: { with_collector_gate: [..] } OPTIONAL,
+client_policies:  { with_emitter_gate:   [..] } OPTIONAL,
+service: |frame, tx| async move { /* business logic emitting tb_assert! */ },
+client: |client| async move { /* compose and send frame */ },
+```
+
+#### Worker Variant
+
+Fields:
+```
+setup: || <WorkerType::start(...)>,
+stimulus: |worker| async move { /* relay messages, call tb_assert! */ },
+```
+
+#### Bare Variant
+
+Fields:
+```
+exec: || async { /* pure logic, may call tb_assert!; return Result */ },
+```
+
+#### Example: Instrumented ServiceClient Scenario
+
+Replaces prior `test_container!` usage; only the environment block changes.
+
 ```rust
-/// Checklist for container assertions
-#[derive(Enumerated, Beamable, Copy, Clone, Debug, PartialEq)]
-#[repr(u8)]
-enum ServiceAssertChecklist {
-	ContainerMessageReceived = 1,
-	ContainerPingReceived = 2,
-	SentResponse = 3,
+#![cfg(all(feature = "testing", feature = "instrument"))]
+use tightbeam::testing::*;
+use tightbeam::instrumentation::*;
+
+tb_labels! { Handler: Received, Validated, Persisted, Responded; Handler(payload): LatencyMs; }
+
+tb_assert_spec! {
+	pub CreateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "Received", exactly!(1)),
+			(HandlerStart, "Validated", exactly!(1)),
+			(HandlerStart, "Persisted", exactly!(1)),
+			(Response, "Responded", exactly!(1)),
+			(Response, "LatencyMs", at_least!(1)),
+		]
+	},
 }
 
-test_container! {
-	name: container_gates_basic,
-	worker_threads: 2,
-	protocol: Listener,
-	service_policies: {
-		with_collector_gate: [policy::AcceptAllGate]
-	},
-	client_policies: {
-		with_emitter_gate: [policy::AcceptAllGate],
-		with_restart: [RestartLinearBackoff::new(3, 1, 1, None)]
-	},
-	service: |message, tx| async move {
-		tightbeam::relay!(ServiceAssertChecklist::ContainerMessageReceived, tx)?;
-
-		let decoded = tightbeam::decode::<RequestMessage, _>(&message.clone().message).ok()?;
-		if &decoded.content == "PING" {
-			tightbeam::relay!(ServiceAssertChecklist::ContainerPingReceived, tx)?;
-
-			let response = Some(tightbeam::compose! {
-				V0: id: message.metadata.id.clone(),
-					message: ResponseMessage {
-						result: "PONG".into()
-					}
-			}.ok()?);
-
-			tightbeam::relay!(ServiceAssertChecklist::SentResponse, tx)?;
-			response
-		} else {
-			None
-		}
-	},
-	container: |client, channels| async move {
-		use tightbeam::transport::MessageEmitter;
-
-		let (rx, ok_rx, reject_rx) = channels;
-
-		// Compose a simple V0 message
-		let message = tightbeam::compose! {
-			V0: id: b"request",
-				message: RequestMessage {
-					content: "PING".into()
-				}
-		}?;
-
-		//# Test message transport
-
-		// Send and expect acceptance + echo response
-		let decoded = if let Some(response) = client.emit(message.clone(), None).await? {
-			// Collect checklist items
-			assert_recv!(rx, ServiceAssertChecklist::ContainerMessageReceived);
-			assert_recv!(rx, ServiceAssertChecklist::ContainerPingReceived);
-			assert_recv!(rx, ServiceAssertChecklist::SentResponse);
-			// Verify response metadata
-			assert_eq!(response.metadata.id, message.metadata.id);
-			// Ensure we received the message on the server side
-			assert_recv!(ok_rx, message);
-			// Ensure server did not reject
-			assert_channels_quiet!(reject_rx);
-
-			tightbeam::decode::<ResponseMessage, _>(&response.message).ok()
-		} else {
-			panic!("Expected a response from the service");
-		};
-
-		//# Test message shape
-
-		match decoded {
-			Some(reply) => {
-				assert_eq!(reply.result, "PONG");
+#[test]
+fn create_flow_instrumented() {
+	let cfg = TbInstrumentationConfig {
+		enable_payloads: true,
+		enable_internal_detail: true,
+		sample_enabled_sets: false,
+		sample_refusals: false,
+		divergence_heuristics: false,
+		max_events: 256,
+		record_durations: true,
+	};
+	tb_scenario! {
+		spec: CreateSpec,
+		instrumentation: cfg,
+		environment ServiceClient {
+			protocol: Listener,
+			worker_threads: 2,
+			service: |frame, _tx| async move {
+				tb_assert!(Received);
+				// validate
+				tb_assert!(Validated);
+				// persist
+				tb_assert!(Persisted);
+				// fabricate response
+				tb_assert!(Responded);
+				tb_assert!(LatencyMs(42u32));
+				Some(frame.clone()) // placeholder response
 			},
-			None => panic!("Expected a PONG")
-		};
-
-		Ok(())
+			client: |_client| async move {
+				tightbeam::compose! { V0: id: b"create-1", message: RequestMessage { content: "MAKE".into() } }
+			},
+		},
+		hooks {
+			on_pass: |trace| { let _ = trace.evidence_hash(); },
+			on_fail: |_trace, _violations| { /* diagnostics */ }
+		}
 	}
 }
 ```
 
-**See:** [Container Integration Test](tests/container.rs)
+#### Example: Worker Scenario
+
+```rust
+tb_scenario! {
+	spec: PingSpec,
+	environment Worker {
+		setup: || PingPongWorker::start(),
+		stimulus: |worker| async move {
+			let ping_msg = RequestMessage { content: "PING".to_string(), lucky_number: 42 };
+			let _response = worker.relay(ping_msg).await?;
+			tb_assert!(ReceivedPing);
+			Ok(())
+		}
+	}
+}
+```
+
+#### Example: Bare Scenario
+
+```rust
+tb_scenario! {
+	spec: LogicSpec,
+	environment Bare {
+		exec: || async {
+			perform_initialization();
+			tb_assert!(Started);
+			let value = compute();
+			tb_assert!(LatencyMs(value));
+			Ok::<_, tightbeam::TightBeamError>(())
+		}
+	}
+}
+```
+
+All higher layers subsume the guarantees of lower layers. If you only need outcome + assertion cardinalities, enable `testing`. If you need formal process modeling and partial refinement reasoning, enable `testing-csp`. For advanced analysis, multi‑seed exploration, CSPM emission, and (optional) external FDR integration, enable `testing-fdr`.
+
+### 10.3 Instrumentation Specification
+
+This subsection normatively specifies the TightBeam instrumentation subsystem. Instrumentation produces a semantic event sequence consumed by verification logic. It is an observation facility, NOT an application logging API. Tests MUST NOT depend on instrumentation events imperatively; verification MUST treat the event stream as authoritative ground truth for one execution.
+
+Feature Gating:
+- Instrumentation can be enabled only by the standalone crate feature `instrument`.
+
+#### 10.3.1 Objectives
+- Emission MUST be amortized O(1) per event.
+- Ordering MUST be strictly increasing by sequence number per trace.
+- Evidence artifacts MUST be deterministic and hash‑stable given identical executions.
+- Detail level MUST be feature‑gated to avoid unnecessary overhead.
+- Payload handling MUST preserve privacy (hash or summarize; never emit secret raw bytes).
+
+#### 10.3.2 Event Kind Taxonomy
+Each event MUST have one kind from a closed, feature‑gated set:
+- External: `gate_accept`, `gate_reject`, `request_recv`, `response_send`
+- Assertion: `assert_label`, `assert_payload`
+- Internal (hidden): `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`
+- Process (requires `testing-csp`): `process_transition`, `process_hidden`
+- Exploration (requires `testing-fdr`): `seed_start`, `seed_end`, `state_expand`, `state_prune`, `divergence_detect`, `refusal_snapshot`, `enabled_set_sample`
+- Meta: `start`, `end`, `warn`, `error`
+
+Hidden/internal events MUST use the internal category.
+
+#### 10.3.3 Event Structure
+Conceptual fixed layout (names illustrative):
+```
+trace_id | seq | kind | label? | payload? | phase? | dur_ns? | flags | extras
+```
+Requirements:
+- `trace_id` MUST uniquely identify the execution instance.
+- `seq` MUST start at 0 and increment by 1 for each emitted event.
+- `kind` MUST be a valid taxonomy member.
+- `label` MUST be present for assertion and labeled process events; otherwise absent.
+- `payload` MAY be present only if the label is declared payload‑capable.
+- `phase` SHOULD map to one of: Gate, Handler, Assertion, Response, Crypto, Compression, Routing, Policy, Process, Exploration.
+- `dur_ns` MAY appear on exit or boundary events and MUST represent a monotonic duration in nanoseconds.
+- `flags` MUST represent a bitset (e.g. ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
+- `extras` MAY supply fixed numeric slots and a bounded byte sketch for extended metrics (e.g. enabled set cardinality).
+
+#### 10.3.4 Payload Representation
+Runtime values captured under `assert_payload` MUST be transformed before emission:
+- Algorithm: SHA3‑256 digest over canonical byte representation.
+- Representation: First 32 bytes (full SHA3‑256 output) MUST be stored; NO truncation below 32 bytes.
+- Literal integers MAY be emitted directly as 64‑bit unsigned values IF NOT sensitive.
+- Structured values SHOULD emit a static schema tag plus digest.
+Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
+
+#### 10.3.5 Configuration
+Instrumentation behavior MUST be controlled by a configuration object (conceptual fields). Configuration existence itself is gated by `instrument`:
+```rust
+TbInstrumentationConfig {
+	enable_payloads: bool,
+	enable_internal_detail: bool,
+	sample_enabled_sets: bool,
+	sample_refusals: bool,
+	divergence_heuristics: bool,
+	max_events: u32,
+	record_durations: bool,
+}
+```
+Defaults (instrument only):
+- `enable_payloads = false`
+- `enable_internal_detail = false`
+- `sample_enabled_sets = false`
+- `sample_refusals = false`
+- `divergence_heuristics = false`
+- `record_durations = false`
+- `max_events = 1024`
+
+Layer Interaction (informative): Enabling testing layers does NOT alter these defaults; tests MAY explicitly override fields per scenario.
+
+If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, emit a single `warn` event, and drop subsequent events.
+
+#### 10.3.6 Evidence Artifact Format
+For every finalized trace an artifact MUST be producible in a canonical binary form (DER). JSON representations are OPTIONAL visual aides and MUST NOT be used for hashing or verification semantics.
+
+Canonical DER Schema (conceptual):
+```
+EvidenceArtifact ::= SEQUENCE {
+	specHash   OCTET STRING,              -- SHA3-256(spec definition)
+	traceId    INTEGER,                   -- Unique per execution
+	seed       INTEGER OPTIONAL,          -- Exploration seed (testing-fdr only)
+	outcome    ENUMERATED { acceptResponse(0), acceptNoResponse(1), reject(2), error(3) },
+	metrics    SEQUENCE {
+		countEvents   INTEGER,
+		durationNs    INTEGER OPTIONAL,
+		overflow      BOOLEAN OPTIONAL
+	},
+	events     SEQUENCE OF Event
+}
+
+Event ::= SEQUENCE {
+	i           INTEGER,                  -- sequence number
+	k           ENUMERATED { start(0), end(1), warn(2), error(3), gate_accept(4), gate_reject(5), request_recv(6), response_send(7), assert_label(8), assert_payload(9), handler_enter(10), handler_exit(11), crypto_step(12), compress_step(13), route_step(14), policy_eval(15), process_transition(16), process_hidden(17), seed_start(18), seed_end(19), state_expand(20), state_prune(21), divergence_detect(22), refusal_snapshot(23), enabled_set_sample(24) },
+	l           UTF8String OPTIONAL,       -- label
+	payloadHash OCTET STRING OPTIONAL,    -- SHA3-256(payload canonical bytes) if captured
+	durationNs  INTEGER OPTIONAL,         -- monotonic duration for boundary/exit events
+	flags       BIT STRING OPTIONAL,      -- ASSERT_FAIL | HIDDEN | DIVERGENCE | OVERFLOW ...
+	extras      OCTET STRING OPTIONAL      -- bounded auxiliary metrics sketch
+}
+```
+
+Binary Serialization Requirements:
+- DER MUST omit absent OPTIONAL fields.
+- Field ordering MUST follow the schema strictly.
+- BIT STRING unused bits MUST be zero.
+- `payloadHash` MUST be 32 bytes when present (SHA3-256).
+
+Artifact Integrity:
+- `trace_hash` MUST be SHA3-256 over the DER encoding of the Events sequence ONLY (excluding surrounding fields).
+- `evidence_hash` SHOULD be SHA3-256(specHash || trace_hash) where `||` denotes raw byte concatenation.
+
+Privacy:
+- Raw payload bytes MUST NOT appear; only hashed representation or numeric scalar (non-sensitive) values MAY be represented.
+
+#### 10.3.9 Failure Handling
+- Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
+- Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
+
+### 10.4 ProcessSpec (Feature: `testing-csp`)
+
+Adds a CSP‑like labeled transition system enabling multiple external traces, 
+internal (hidden) events, and nondeterministic branching.
+
+Key Extensions:
+- Explicit external vs internal event alphabets
+- State identifiers & transition table
+- Nondeterministic choice points (declared)
+- Preferred path extraction to auto‑generate an AssertSpec (for Layer 1 reuse)
+- Enabled set queries for refusal approximation
+
+Example:
+```rust
+tb_process_spec! {
+    pub struct HandshakeSpec;
+    events { external { "start", "send", "ack", "fail" } internal { "serialize", "encrypt", "queue", "dispatch" } }
+    states {
+        S0  => { "start" => S1 }
+        S1  => { "serialize" => S1s, "queue" => S1q }
+        S1s => { "encrypt" => S1e }
+        S1e => { "send" => S2 }
+        S1q => { "dispatch" => S1d }
+        S1d => { "send" => S2 }
+        S2  => { "ack" => S3, "fail" => S3f }
+        S3  => {}
+        S3f => {}
+    }
+    terminal { S3, S3f }
+    nondeterministic { S1 }
+    annotations { description: "Queued or direct send" }
+}
+```
+
+Generated Capabilities:
+- `external_alphabet()`, `internal_alphabet()`
+- `step(state,event)` & `enabled(state)`
+- Promotion: `promote_assert_to_process!(PingPongSpec => PingPongProcessSpec)` synthesizes a linear LTS from an AssertSpec.
+
+### 10.5 Refinement & FDR (Feature: `testing-fdr`)
+
+Performs bounded multi‑seed exploration to approximate refinement properties:
+
+Checks:
+- Trace refinement: every observed external trace is in spec language
+- Failures (refusal) approximation: enabled sets not violating spec expectations
+- Divergence heuristic: internal‑only loop exceeding threshold
+- Determinism: branching only at declared nondeterministic states
+
+Profile:
+```rust
+TBProfile { schedulers, seeds, max_depth, max_internal_run, timeout, mode }
+```
+
+Case Macro:
+```rust
+tb_case! {
+    name: handshake_refinement,
+    spec: HandshakeSpec,
+    profile: { schedulers: 4, seeds: 64, max_depth: 128, max_internal_run: 32, mode: ExhaustiveBounded, timeout_ms: 5000 },
+    exec: || { run_handshake_sequence()?; Ok(()) },
+    assert: |verdict| {
+        assert!(verdict.trace_refines);
+        assert!(verdict.failures_refines);
+        assert!(verdict.divergence_free);
+    }
+}
+```
+
+Verdict Fields:
+`trace_refines, failures_refines, divergence_free, deterministic, missing_traces, unexpected_traces, refusal_diffs, divergence_points, resource_annotation, spec_hash, run_hash`.
+
+CSPM Export:
+- Enabled with `testing-fdr`: emits `target/tb_csp/<test>.cspm`
+- Optional environment `TB_FDR_PATH` triggers batch run & result ingestion.
+
+### 10.6 Hooks & Payload Assertions Summary
+
+- `tb_assert!(Label)` simple marker
+- `tb_assert!(Label(value))` payload capture
+- Specs may constrain or ignore payloads
+- `on_pass` / `on_fail` enable structured diagnostics without altering outcome
+
+### 10.7 Feature Matrix
+
+| Capability | `testing` | `testing-csp` | `testing-fdr` |
+|------------|-----------|---------------|---------------|
+| Single deterministic trace verification | ✓ | ✓ | ✓ |
+| Declarative assertion specs | ✓ | ✓ | ✓ |
+| Payload constraints | ✓ | ✓ | ✓ |
+| Process state machine modeling | – | ✓ | ✓ |
+| Nondeterministic branching | – | ✓ | ✓ |
+| Multi‑seed exploration | – | Partial (manual) | ✓ |
+| Trace refinement check | – | Approx (manual) | ✓ |
+| Failures/refusal approximation | – | Approx (manual) | ✓ |
+| Divergence heuristic | – | – | ✓ |
+| CSPM export | – | – | ✓ |
+| FDR integration (optional) | – | – | ✓ |
+| Evidence artifact | Basic | Extended | Full |
+
+### 10.8 Design Principles
+
+- Zero timing assumptions; causality via channel ordering / event sequence
+- Pure declarative specs – no imperative asserts in container body
+- Separation of concern: business logic vs verification logic
+- Deterministic evidence artifacts (stable hash) for audit & reproducibility
+- Progressive enhancement: opt into more formal rigor only when needed
+
+Further refinement (ProcessSpec / FDR) is additive and does not require 
+altering AssertSpec definitions; you only supply a higher‑order spec and 
+optionally a profile.
+
+---
+
+For practical examples see: `tests/` directory (AssertSpec), forthcoming `tests/csp/` (ProcessSpec), and `tests/refinement/` (FDR layer).
+
+### 10.9 Example: Comprehensive Instrumented Test (Normative Usage Pattern)
+
+This example illustrates a fully instrumented AssertSpec execution. It MUST compile once the corresponding macros and types are implemented.
+```rust
+#![cfg(all(feature = "testing", feature = "instrument"))]
+use tightbeam::testing::*;
+use tightbeam::instrumentation::*;
+
+tb_labels! { Handler: Received, Validated, Persisted, Responded; Handler(payload): LatencyMs; }
+
+tb_assert_spec! {
+	pub CreateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "Received", exactly!(1)),
+			(HandlerStart, "Validated", exactly!(1)),
+			(HandlerStart, "Persisted", exactly!(1)),
+			(Response, "Responded", exactly!(1)),
+			(Response, "LatencyMs", at_least!(1)),
+		]
+	},
+}
+
+#[test]
+fn create_flow_instrumented() {
+	let cfg = TbInstrumentationConfig {
+		enable_payloads: true,
+		enable_internal_detail: true,
+		sample_enabled_sets: false,
+		sample_refusals: false,
+		divergence_heuristics: false,
+		max_events: 256,
+		record_durations: true,
+	};
+	test_container! {
+		spec: CreateSpec,
+		instrumentation: cfg,
+		service: |frame, _tx| async move {
+			tb_assert!(Received);
+			// validate
+			tb_assert!(Validated);
+			// persist
+			tb_assert!(Persisted);
+			// fabricate response
+			tb_assert!(Responded);
+			tb_assert!(LatencyMs(42u32));
+			Some(frame.clone()) // placeholder response
+		},
+		client: |_client| async move {
+			tightbeam::compose! { V0: id: b"create-1", message: RequestMessage { content: "MAKE".into() } }
+		},
+		on_pass: |trace| {
+			// Access deterministic evidence hash (binary artifact based)
+			let _ = trace.evidence_hash();
+		},
+		on_fail: |_trace, _violations| { /* diagnostics */ }
+	}
+}
+```
+
+This pattern MUST: (1) emit events for each assertion label; (2) produce a deterministic evidence artifact; (3) validate cardinalities and payload constraint; (4) finalize without overflow.
+
 
 ## 11. End-to-End Examples
 

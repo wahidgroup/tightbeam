@@ -52,10 +52,10 @@ make build                             # Build all projects
 make clean                             # Clean build artifacts  
 make test                              # Run all tests
 make lint                              # Run linters
-make lint ARGS="--fix --allow-matrixd"  # Run linters with fixes
+make lint ARGS="--fix --allow-matrixd" # Run linters with fixes
 make doc                               # Build documentation
 
-# Feature-specific builds
+# Feature-specific builds (feature gating needs work See: `<issue link>`)
 make build features="std,tcp,tokio"
 make build features="aes-gcm,sha3,secp256k1"
 make build features="zstd,compress"
@@ -139,7 +139,6 @@ For security-related contributions, contributors MUST:
 
 - Follow responsible disclosure practices
 - Consider cryptographic best practices
-- Update security profiles if needed
 - Ensure compliance with relevant standards
 
 ## tightbeam Improvement Proposals (TIPs)
@@ -153,4 +152,5 @@ For significant changes, contributors MUST follow the TIP process:
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the same dual MIT/Apache-2.0 license as the project.
+By contributing, you agree that your contributions will be licensed under the 
+same dual MIT/Apache-2.0 license as the project.

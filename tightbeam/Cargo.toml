@@ -88,6 +88,7 @@ full = [
 	"standards-rfc",
 	"standards-iso",
 	"testing",
+	"instrument",
 	"colony",
 ]
 
@@ -104,6 +105,7 @@ transport-policy = ["transport", "policy"]
 tcp = ["transport"]
 colony = ["full"]
 testing = []
+instrument = ["std", "sha3"]
 
 # TODO
 bitcoin = ["dep:k256"]

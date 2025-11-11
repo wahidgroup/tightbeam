@@ -13,6 +13,7 @@ words:
   - ciphertext
   - ciphertexts
   - crls
+  - CSPM
   - CSPRNG
   - Decorrelated
   - Decryptor

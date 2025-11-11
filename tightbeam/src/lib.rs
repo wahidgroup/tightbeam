@@ -110,6 +110,9 @@ pub mod oids;
 pub mod prelude;
 pub mod utils;
 
+#[cfg(all(feature = "testing", feature = "std"))]
+pub mod instrumentation;
+
 #[cfg(feature = "builder")]
 pub mod builder;
 #[cfg(feature = "colony")]
