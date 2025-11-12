@@ -357,6 +357,7 @@ impl ChainValidator {
 	}
 
 	/// Add a validator to the chain.
+	#[allow(clippy::should_implement_trait)]
 	pub fn add(mut self, validator: Box<dyn CertificateValidation>) -> Self {
 		self.validators.push(validator);
 		self

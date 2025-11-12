@@ -592,6 +592,7 @@ mod tests {
 
 	#[cfg(feature = "derive")]
 	#[test]
+	#[allow(clippy::assertions_on_constants)]
 	fn test_profile_types() {
 		// All message types should have a Profile type that implements SecurityProfile
 		fn assert_security_profile<P: crate::crypto::profiles::SecurityProfile>() {}

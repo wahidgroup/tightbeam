@@ -5,8 +5,6 @@
 //! Generic over `P: CryptoProvider` which defines the complete cryptographic suite,
 //! and ECIES message type `M` which is curve-specific.
 
-#![cfg(feature = "x509")]
-
 use crate::asn1::OctetString;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{KeyInit, RuntimeAead};

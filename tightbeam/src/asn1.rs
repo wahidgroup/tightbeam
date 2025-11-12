@@ -17,7 +17,6 @@ pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
 
 /// id-data
-
 /// Protocol version determines metadata structure and features
 ///
 /// ASN.1 Definition:

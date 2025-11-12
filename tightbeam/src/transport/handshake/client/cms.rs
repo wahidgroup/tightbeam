@@ -383,6 +383,7 @@ where
 	}
 
 	/// Extract cryptographic material needed for key exchange.
+	#[allow(clippy::type_complexity)]
 	fn extract_key_exchange_crypto_material(
 		&self,
 	) -> Result<(PublicKey<P::Curve>, SecretKey<P::Curve>, SubjectPublicKeyInfoOwned), HandshakeError> {

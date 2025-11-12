@@ -407,7 +407,7 @@ where
 						if current_attempt == usize::MAX {
 							return Err(TransportError::MaxRetriesExceeded);
 						} else {
-							current_message = retry_message;
+							current_message = *retry_message;
 							current_attempt += 1;
 							continue;
 						}

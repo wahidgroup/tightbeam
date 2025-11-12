@@ -61,7 +61,7 @@ pub enum RetryAction {
 	/// Retry with the same message
 	RetryWithSame,
 	/// Retry with a modified message
-	RetryWithModified(Frame),
+	RetryWithModified(Box<Frame>),
 	/// Do not retry, propagate the error
 	NoRetry,
 }

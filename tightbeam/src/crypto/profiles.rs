@@ -190,6 +190,7 @@ pub trait AeadProvider {
 
 	/// Convert this provider into a KeyWrapper function for AES-128 KEK (16 bytes).
 	#[cfg(feature = "transport")]
+	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
 	where
 		E: From<crate::transport::handshake::HandshakeError>,
@@ -199,6 +200,7 @@ pub trait AeadProvider {
 
 	/// Convert this provider into a KeyWrapper function for AES-192 KEK (24 bytes).
 	#[cfg(feature = "transport")]
+	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
 	where
 		E: From<crate::transport::handshake::HandshakeError>,
@@ -208,6 +210,7 @@ pub trait AeadProvider {
 
 	/// Convert this provider into a KeyWrapper function for AES-256 KEK (32 bytes).
 	#[cfg(feature = "transport")]
+	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
 	where
 		E: From<crate::transport::handshake::HandshakeError>,
@@ -219,6 +222,7 @@ pub trait AeadProvider {
 	///
 	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
 	#[cfg(feature = "transport")]
+	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
 	where
 		E: From<crate::transport::handshake::HandshakeError>,
@@ -230,6 +234,7 @@ pub trait AeadProvider {
 	///
 	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
 	#[cfg(feature = "transport")]
+	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
 	where
 		E: From<crate::transport::handshake::HandshakeError>,
@@ -241,6 +246,7 @@ pub trait AeadProvider {
 	///
 	/// Used by recipients to unwrap (decrypt) wrapped content-encryption keys.
 	#[cfg(feature = "transport")]
+	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
 	where
 		E: From<crate::transport::handshake::HandshakeError>,
@@ -284,6 +290,7 @@ pub trait KdfProvider {
 	/// let deriver = provider.as_key_deriver::<HandshakeError, 32>(); // 32-byte keys
 	/// let key = deriver(ikm, salt, info)?;
 	/// ```
+	#[allow(clippy::type_complexity)]
 	fn as_key_deriver<E, const N: usize>(&self) -> Box<dyn Fn(&[u8], &[u8], &[u8]) -> Result<[u8; N], E>>
 	where
 		E: From<crate::crypto::kdf::KdfError>,

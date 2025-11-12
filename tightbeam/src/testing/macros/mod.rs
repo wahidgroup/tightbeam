@@ -2,9 +2,9 @@
 //!
 //! This rewrite provides ONLY the multi-version block syntax:
 //! tb_assert_spec! {
-//! 	pub MySpec,
-//! 	V 1.0.0: { mode: Accept, gate: Accepted, assertions: [ (HandlerStart, "A", exactly!(1)) ] },
-//! 	V 1.1.0: { mode: Accept, gate: Accepted, assertions: [ (HandlerStart, "A", exactly!(1)), (Response, "Responded", exactly!(1)) ] },
+//!     pub MySpec,
+//!     V 1.0.0: { mode: Accept, gate: Accepted, assertions: [ (HandlerStart, "A", exactly!(1)) ] },
+//!     V 1.1.0: { mode: Accept, gate: Accepted, assertions: [ (HandlerStart, "A", exactly!(1)), (Response, "Responded", exactly!(1)) ] },
 //! }
 //!
 //! Response semantics are governed solely by Response-phase assertion cardinalities.
@@ -34,8 +34,17 @@ use crate::Errorizable;
 use crate::instrumentation::TbEventKind;
 
 // Re-exports
+pub use crate::testing::assertions::AssertionValue;
 pub use crate::testing::trace::TraceCollector;
 pub use crate::{absent, at_least, at_most, between, exactly, present};
+
+/// Helper macro to wrap values for equality assertions in specs
+#[macro_export]
+macro_rules! equals {
+	($value:expr) => {
+		Some($crate::testing::macros::AssertionValue::from($value))
+	};
+}
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -158,7 +167,7 @@ impl Cardinality {
 			(0, Some(0)) => "absent".into(),
 			(m, Some(n)) if m == n => format!("exactly {m}"),
 			(m, Some(n)) => format!("between {m} and {n}"),
-			(m, None) if m == 0 => "any".into(),
+			(0, None) => "any".into(),
 			(m, None) => format!("at least {m}"),
 		}
 	}
@@ -225,7 +234,6 @@ pub enum SpecBuildError {
 }
 
 /// Builder for programmatic spec construction
-
 pub struct AssertSpecBuilder {
 	id: &'static str,
 	execution_mode: ExecutionMode,
@@ -233,7 +241,7 @@ pub struct AssertSpecBuilder {
 	version_major: u16,
 	version_minor: u16,
 	version_patch: u16,
-	assertions: Vec<(AssertionPhase, &'static str, Cardinality)>,
+	assertions: Vec<(AssertionPhase, &'static str, Cardinality, Option<AssertionValue>)>,
 	ordering: Vec<&'static str>,
 	#[cfg(feature = "instrument")]
 	required_events: Vec<TbEventKind>,
@@ -273,7 +281,7 @@ impl AssertSpecBuilder {
 		label: &'static str,
 		cardinality: Cardinality,
 	) -> Result<Self, SpecBuildError> {
-		if self.assertions.iter().any(|(_, l, _)| *l == label) {
+		if self.assertions.iter().any(|(_, l, _, _)| *l == label) {
 			return Err(SpecBuildError::DuplicateLabel(label));
 		}
 		if let Some(mx) = cardinality.max {
@@ -281,13 +289,32 @@ impl AssertSpecBuilder {
 				return Err(SpecBuildError::InvalidRange(label));
 			}
 		}
-		self.assertions.push((phase, label, cardinality));
+		self.assertions.push((phase, label, cardinality, None));
+		Ok(self)
+	}
+
+	pub fn assertion_with_value(
+		mut self,
+		phase: AssertionPhase,
+		label: &'static str,
+		cardinality: Cardinality,
+		expected_value: Option<AssertionValue>,
+	) -> Result<Self, SpecBuildError> {
+		if self.assertions.iter().any(|(_, l, _, _)| *l == label) {
+			return Err(SpecBuildError::DuplicateLabel(label));
+		}
+		if let Some(mx) = cardinality.max {
+			if mx < cardinality.min {
+				return Err(SpecBuildError::InvalidRange(label));
+			}
+		}
+		self.assertions.push((phase, label, cardinality, expected_value));
 		Ok(self)
 	}
 
 	pub fn ordering(mut self, labels: &[&'static str]) -> Result<Self, SpecBuildError> {
 		for &lbl in labels {
-			if !self.assertions.iter().any(|(_, l, _)| *l == lbl) {
+			if !self.assertions.iter().any(|(_, l, _, _)| *l == lbl) {
 				return Err(SpecBuildError::UnknownOrderingLabel(lbl));
 			}
 			self.ordering.push(lbl);
@@ -323,7 +350,13 @@ impl BuiltAssertSpec {
 		let contracts: Vec<AssertionContract> = builder
 			.assertions
 			.iter()
-			.map(|(phase, label, card)| AssertionContract::new(*phase, AssertionLabel::Custom(label), *card))
+			.map(|(phase, label, card, value)| {
+				if let Some(ref val) = value {
+					AssertionContract::with_value(*phase, AssertionLabel::Custom(label), *card, val.clone())
+				} else {
+					AssertionContract::new(*phase, AssertionLabel::Custom(label), *card)
+				}
+			})
 			.collect();
 		let spec_hash = Self::compute_hash(
 			builder.id,
@@ -339,6 +372,7 @@ impl BuiltAssertSpec {
 		Self { inner: builder, contracts: contracts.into_boxed_slice(), spec_hash }
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn compute_hash(
 		id: &'static str,
 		mode: ExecutionMode,
@@ -603,14 +637,35 @@ macro_rules! tb_labels {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_build {
-	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( ($phase:ident, $label:expr, $card:expr) ),* ], [ $( $ev:ident ),* ]) => {
+	// Entry point - dispatch to appropriate handler
+	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ]) => {
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(stringify!($base), $crate::testing::trace::ExecutionMode::$mode);
 		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
-		$( builder = builder.assertion($crate::testing::assertions::AssertionPhase::$phase, $label, $card).expect("duplicate label or invalid range"); )*
+		$(
+			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
+		)*
 		#[cfg(feature = "instrument")]
 		{ $( builder = builder.required_events(&[$crate::instrumentation::TbEventKind::$ev]); )* }
 		$vec.push(builder.build());
+	};
+}
+
+// Helper to add individual assertions (handles both 3 and 4-element tuples)
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_add_assertion {
+	// 4-element tuple with value
+	($builder:expr, ($phase:ident, $label:expr, $card:expr, $value:expr)) => {
+		$builder
+			.assertion_with_value($crate::testing::assertions::AssertionPhase::$phase, $label, $card, $value)
+			.expect("duplicate label or invalid range")
+	};
+	// 3-element tuple without value
+	($builder:expr, ($phase:ident, $label:expr, $card:expr)) => {
+		$builder
+			.assertion($crate::testing::assertions::AssertionPhase::$phase, $label, $card)
+			.expect("duplicate label or invalid range")
 	};
 }
 
@@ -619,7 +674,7 @@ macro_rules! __tb_assert_spec_build {
 macro_rules! tb_assert_spec {
 	(
 		$vis:vis $base:ident,
-		$( V ( $maj:literal , $min:literal , $patch:literal ) : { mode: $mode:ident, gate: $gate:ident, assertions: [ $( ($phase:ident, $label:expr, $card:expr) ),* $(,)? ] $(, events: [ $( $ev:ident ),* $(,)? ])? } ),+ $(,)?
+		$( V ( $maj:literal , $min:literal , $patch:literal ) : { mode: $mode:ident, gate: $gate:ident, assertions: [ $( $assertion:tt ),* $(,)? ] $(, events: [ $( $ev:ident ),* $(,)? ])? } ),+ $(,)?
 	) => {
 		$vis struct $base;
 		impl $base {
@@ -629,7 +684,7 @@ macro_rules! tb_assert_spec {
 					static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
 					CELL.get_or_init(|| {
 						let mut v = Vec::new();
-						$( $crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( ($phase, $label, $card) ),* ], [ $( $ev ),* ]); )+
+						$( $crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ]); )+
 						v
 					}).as_slice()
 				}
@@ -640,7 +695,7 @@ macro_rules! tb_assert_spec {
 					static mut VEC: Option<Vec<$crate::testing::macros::BuiltAssertSpec>> = None;
 					if !INIT.load(Ordering::Acquire) {
 						let mut v = Vec::new();
-						$( $crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( ($phase, $label, $card) ),* ], [ $( $ev ),* ]); )+
+						$( $crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ]); )+
 						unsafe { VEC = Some(v); }
 						INIT.store(true, Ordering::Release);
 					}
@@ -1835,6 +1890,7 @@ mod tests {
 	use crate::testing::create_test_message;
 	use crate::testing::macros::TraceCollector;
 	use crate::testing::trace::ExecutionMode;
+	use crate::testing::utils::TestMessage;
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;
@@ -1884,7 +1940,8 @@ mod tests {
 			gate: Accepted,
 			assertions: [
 				(HandlerStart, "Received", exactly!(2)),
-				(Response, "Responded", exactly!(2))
+				(Response, "Responded", exactly!(2)),
+				(Response, "message_content", exactly!(1), equals!("Hello TightBeam!"))
 			]
 		},
 	}
@@ -2044,6 +2101,13 @@ mod tests {
 						// Server-side assertions
 						trace.assert(AssertionPhase::HandlerStart, "Received");
 						trace.assert(AssertionPhase::Response, "Responded");
+
+						// Decode message to extract value for assertion
+						let decoded: Result<TestMessage, _> = crate::decode(&frame.message);
+						if let Ok(msg) = decoded {
+							trace.assert_value(AssertionPhase::Response, "message_content", msg.content);
+						}
+
 						Some(frame)
 					}
 				};
@@ -2068,33 +2132,8 @@ mod tests {
 			}
 		},
 		hooks {
-			on_pass: |trace| {
+			on_pass: |_trace| {
 				HOOK_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
-				// Verify we got all 4 assertions (2 server + 2 client)
-				assert_eq!(trace.assertions.len(), 4, "Expected 4 total assertions");
-
-				// Count assertions by phase
-				let handler_starts = trace.assertions.iter()
-					.filter(|a| matches!(a.phase, AssertionPhase::HandlerStart))
-					.count();
-				let responses = trace.assertions.iter()
-					.filter(|a| matches!(a.phase, AssertionPhase::Response))
-					.count();
-
-				assert_eq!(handler_starts, 2, "Expected 2 HandlerStart assertions");
-				assert_eq!(responses, 2, "Expected 2 Response assertions");
-
-				// Verify labels
-				use crate::testing::assertions::AssertionLabel;
-				let received_count = trace.assertions.iter()
-					.filter(|a| matches!(&a.label, AssertionLabel::Custom(s) if *s == "Received"))
-					.count();
-				let responded_count = trace.assertions.iter()
-					.filter(|a| matches!(&a.label, AssertionLabel::Custom(s) if *s == "Responded"))
-					.count();
-
-				assert_eq!(received_count, 2, "Expected 2 'Received' labels");
-				assert_eq!(responded_count, 2, "Expected 2 'Responded' labels");
 			},
 			on_fail: |_trace, violations| {
 				panic!("Test should not fail! Violations: {violations:?}");

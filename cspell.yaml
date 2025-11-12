@@ -10,6 +10,7 @@ ignorePaths:
 words:
   - addrs
   - Beamable
+  - Boulgakov
   - CBVOC
   - ciphertext
   - ciphertexts
@@ -58,6 +59,7 @@ words:
   - oids
   - oipk
   - Orchestr
+  - Pedersen
   - Pingable
   - pkcs
   - pkix
@@ -79,6 +81,7 @@ words:
   - typenum
   - unwrapper
   - usize
+  - Verlag
   - Wahid
   - Wrkr
   - zeekstd

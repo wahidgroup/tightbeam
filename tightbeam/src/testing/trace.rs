@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use alloc::sync::{Arc, Mutex};
 
 use crate::policy::TransitStatus;
-use crate::testing::assertions::{Assertion, AssertionLabel, AssertionPhase};
+use crate::testing::assertions::{Assertion, AssertionLabel, AssertionPhase, AssertionValue};
 use crate::transport::error::TransportError;
 use crate::Frame;
 
@@ -46,6 +46,20 @@ impl TraceCollector {
 		self.assert_with_payload(phase, label, None);
 	}
 
+	/// Record an assertion with a value for equality checking
+	pub fn assert_value<V: Into<AssertionValue>>(&self, phase: AssertionPhase, label: &str, value: V) {
+		let seq = self.assertions.lock().map(|a| a.len()).unwrap_or(0);
+		let assertion_value = value.into();
+
+		// Convert label to 'static lifetime for storage
+		let static_label: &'static str = Box::leak(label.to_string().into_boxed_str());
+
+		let assertion = Assertion::with_value(seq, phase, AssertionLabel::Custom(static_label), None, assertion_value);
+		if let Ok(mut assertions) = self.assertions.lock() {
+			assertions.push(assertion);
+		}
+	}
+
 	/// Record an assertion with payload
 	pub fn assert_with_payload(&self, phase: AssertionPhase, label: &str, payload: Option<&[u8]>) {
 		use sha3::{Digest, Sha3_256};
@@ -64,8 +78,7 @@ impl TraceCollector {
 		// This is fine for test scenarios where we don't expect unbounded label creation
 		let static_label: &'static str = Box::leak(label.to_string().into_boxed_str());
 
-		let assertion = Assertion { seq, phase, label: AssertionLabel::Custom(static_label), payload_hash };
-
+		let assertion = Assertion::new(seq, phase, AssertionLabel::Custom(static_label), payload_hash);
 		if let Ok(mut assertions) = self.assertions.lock() {
 			assertions.push(assertion);
 		}

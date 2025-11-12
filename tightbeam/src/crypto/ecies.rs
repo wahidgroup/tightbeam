@@ -46,11 +46,9 @@ use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
 use crate::der::oid::AssociatedOid;
 
 /// KDF info parameter for domain separation and protocol versioning
-
 // ============================================================================
 // Generic ECIES Traits
 // ============================================================================
-
 /// Trait for ECIES public keys with key exchange capability
 pub trait EciesPublicKeyOps: Clone + PartialEq + Eq {
 	/// Associated secret key type for this public key

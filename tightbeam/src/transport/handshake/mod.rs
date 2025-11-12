@@ -533,6 +533,7 @@ pub trait ClientHandshakeProtocol: Send {
 	type Error: Into<TransportError> + Send;
 
 	/// Start the handshake, returns the first message to send to the server.
+	#[allow(clippy::type_complexity)]
 	fn start<'a>(
 		&'a mut self,
 	) -> core::pin::Pin<Box<dyn core::future::Future<Output = ::core::result::Result<Vec<u8>, Self::Error>> + Send + 'a>>;
@@ -541,6 +542,7 @@ pub trait ClientHandshakeProtocol: Send {
 	///
 	/// Returns `Some(Vec<u8>)` if the client needs to send another message,
 	/// or `None` if the client has no more messages to send.
+	#[allow(clippy::type_complexity)]
 	fn handle_response<'a, 'b>(
 		&'a mut self,
 		msg: &'b [u8],
@@ -586,6 +588,7 @@ pub trait ServerHandshakeProtocol: Send {
 	/// Can be called multiple times for multi-round handshakes.
 	/// Returns `Some(Vec<u8>)` if the server needs to send a response,
 	/// or `None` if the server has no response to send.
+	#[allow(clippy::type_complexity)]
 	fn handle_request<'a, 'b>(
 		&'a mut self,
 		msg: &'b [u8],
