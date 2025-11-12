@@ -1904,15 +1904,15 @@ can be combined to create complex systems. The swarm is yours to command.
 
 ## 10. Testing Framework
 
-The tightbeam testing stack is delivered in three progressive layers with feature flags:
+The tightbeam testing framework provides three progressive verification layers unified under the `tb_scenario!` macro:
 
-| Layer | Feature Flag | Purpose | Model | Primary Macro |
-|-------|--------------|---------|-------|---------------|
-| L1 AssertSpec | `testing` | Fast single‑trace deterministic assertion verification | Outcome + Assertions | `tb_scenario!` + `tb_assert_spec!` |
-| L2 ProcessSpec | `testing-csp` | CSP‑style state machine modeling (external vs hidden internal events) | Labeled Transition System | `tb_process_spec!` |
-| L3 Refinement / FDR | `testing-fdr` | Approximate trace + failures refinement, divergence heuristics, optional CSPM export / FDR bridge | Refinement Checking | `tb_case!` |
+| Layer | Feature Flag | Purpose | Specification | Usage |
+|-------|--------------|---------|---------------|-------|
+| L1 AssertSpec | `testing` | Runtime assertion verification | `tb_assert_spec!` | Required: `spec:` field |
+| L2 ProcessSpec | `testing-csp` | CSP state machine modeling | `tb_process_spec!` | Optional: `csp:` field |
+| L3 Refinement | `testing-fdr` | Trace/failures refinement | Inline config | Optional: `fdr:` field |
 
-Legacy Macros: `test_container!`, `test_worker!`, and `test_servlet!` are DEPRECATED and WILL be removed after the `tb_scenario!` migration window. Prefer `tb_scenario!` immediately.
+All three layers are accessed through `tb_scenario!` with optional fields for progressive enhancement.
 
 ### 10.1 AssertSpec Macro
 
@@ -1941,7 +1941,9 @@ tb_assert_spec! {
 
 Version blocks: `V(maj,min,patch): { mode: <ExecutionMode>, gate: <TransitStatus>, assertions: [ (Phase, label, cardinality), ... ] }` (+ optional `events: [Kind,..]` when instrumentation enabled).
 
-Hash: 32‑byte Sha3‑256 over domain tag `TBSP`, version triple, spec id, mode code, gate (presence + value), normalized assertions (sorted by `(label, phase)`), and optional event kinds.
+Hash: 32‑byte Sha3‑256 over domain tag `TBSP`, version triple, spec id, mode 
+code, gate (presence + value), normalized assertions (sorted by `(label, phase)`), 
+and optional event kinds.
 
 Accessors:
 - `Type::all()` slice of all versions
@@ -1975,180 +1977,542 @@ assert_ne!(DemoSpec::get(1,0,0).unwrap().spec_hash(), DemoSpec::get(1,1,0).unwra
 assert_eq!(DemoSpec::latest().version(), (1,1,0));
 ```
 
-Future additions will layer scenario execution and process/refinement modeling atop this core.
+Future additions will layer scenario execution and process/refinement modeling 
+atop this core.
 
 ### 10.2 Scenario Macro: `tb_scenario!`
 
-`tb_scenario!` is the single entry point for executing an AssertSpec (Layer 1) under a selectable environment. It decouples spec verification from any particular transport or concurrency model.
+`tb_scenario!` is the unified entry point for all testing layers. It executes 
+an AssertSpec under a selectable environment with optional CSP and FDR verification.
 
-Environment Variants (initial set):
-
-```
-environment ServiceClient { /* transport round‑trip */ }
-environment Worker        { /* single local worker relay */ }
-environment Bare          { /* pure logic / function invocation */ }
-```
-
-Shared Top‑Level Keys:
-
-```
-spec: <AssertSpecType>,           // REQUIRED – produced by tb_assert_spec!
-instrumentation: <TbInstrumentationConfig>, // OPTIONAL
-hooks {                           // OPTIONAL
-	on_pass: |trace| { /* ... */ },
-	on_fail: |trace, violations| { /* ... */ }
-}
-assert_policies {                 // OPTIONAL future extension
-	enforce_ordering: true,
-	strict_phases: true,
-}
-environment <Variant> { ... }     // EXACTLY ONE
-```
-
-#### ServiceClient Variant
-
-Fields:
-```
-protocol: Listener | <other>,
-worker_threads: <u16>,
-service_policies: { with_collector_gate: [..] } OPTIONAL,
-client_policies:  { with_emitter_gate:   [..] } OPTIONAL,
-service: |frame, tx| async move { /* business logic emitting tb_assert! */ },
-client: |client| async move { /* compose and send frame */ },
-```
-
-#### Worker Variant
-
-Fields:
-```
-setup: || <WorkerType::start(...)>,
-stimulus: |worker| async move { /* relay messages, call tb_assert! */ },
-```
-
-#### Bare Variant
-
-Fields:
-```
-exec: || async { /* pure logic, may call tb_assert!; return Result */ },
-```
-
-#### Example: Instrumented ServiceClient Scenario
-
-Replaces prior `test_container!` usage; only the environment block changes.
+#### Syntax
 
 ```rust
-#![cfg(all(feature = "testing", feature = "instrument"))]
+tb_scenario! {
+	spec: AssertSpecType,              // REQUIRED: Layer 1 assertion spec
+	csp: ProcessSpecType,              // OPTIONAL: Layer 2 CSP model (requires testing-csp)
+	fdr: FdrConfig { ... },            // OPTIONAL: Layer 3 refinement (requires testing-fdr)
+	instrumentation: Config { ... },   // OPTIONAL: instrumentation config
+	environment <Variant> { ... },     // REQUIRED: execution environment
+	hooks { ... }                      // OPTIONAL: on_pass/on_fail callbacks
+}
+```
+
+#### Consistency Guarantees
+
+When `csp:` is specified, the framework enforces:
+- **Compile Error**: Assertion labels MUST exist in CSP observable alphabet
+- **Runtime Validation**: Observed traces MUST be valid CSP traces
+- **State Tracking**: Framework tracks CSP state transitions during execution
+
+When `fdr:` is specified:
+- **Requirement**: `csp:` MUST also be specified (compile error if missing)
+- **Exploration**: Framework runs multiple seeds with different schedulers
+- **Verification**: Checks trace refinement, failures, divergence properties
+
+#### Environment Variants
+
+**ServiceClient**: Transport round-trip with server and client closures
+```rust
+environment ServiceClient {
+	protocol: Listener | <other>,
+	worker_threads: <u16>,
+	service_policies: { with_collector_gate: [..] } OPTIONAL,
+	client_policies:  { with_emitter_gate:   [..] } OPTIONAL,
+	service: |frame, tx| async move { /* business logic emitting tb_assert! */ },
+	client: |client| async move { /* compose and send frame */ },
+}
+```
+
+**Worker**: Single local worker relay
+```rust
+environment Worker {
+	setup: || <WorkerType::start(...)>,
+	stimulus: |worker| async move { /* relay messages, call tb_assert! */ },
+}
+```
+
+**Bare**: Pure logic/function invocation
+```rust
+environment Bare {
+	exec: || async { /* pure logic, may call tb_assert!; return Result */ },
+}
+```
+
+### 10.3 ProcessSpec (Layer 2: CSP Modeling)
+
+ProcessSpec defines labeled transition systems (LTS) for formal process 
+modeling. Enabled with `testing-csp` feature flag.
+
+#### Syntax
+
+```rust
+tb_process_spec! {
+	pub struct ProcessName;
+	events {
+		observable { "event1", "event2", ... }   // External alphabet
+		hidden { "internal1", "internal2", ... } // Internal alphabet
+	}
+	states {
+		S0 => { "event1" => S1 }                 // State transitions
+		S1 => { "event2" => S2, "event3" => S3 } // Nondeterministic branching
+		S2 => {}                                 // Terminal state
+		S3 => {}
+	}
+	terminal { S2, S3 }                         // Valid end states
+	choice { S1 }                               // Nondeterministic states
+	annotations { description: "..." }          // Optional metadata
+}
+```
+
+#### Validation Rules
+
+When `csp:` is specified in `tb_scenario!`:
+
+1. **Compile-Time**: Assert labels MUST be in CSP observable alphabet
+2. **Runtime**: Observed events MUST form valid CSP trace (framework tracks state)
+3. **Post-Execution**: Trace MUST terminate in valid terminal state
+
+#### Generated API
+
+Each `tb_process_spec!` generates:
+```rust
+impl ProcessName {
+	pub fn process() -> Process;  // Returns LTS structure
+}
+```
+
+### 10.4 Refinement Checking (Layer 3: FDR)
+
+Refinement checking provides multi-seed exploration for trace and failures 
+refinement. Enabled with `testing-fdr` feature flag.
+
+#### Syntax
+
+```rust
+tb_scenario! {
+	spec: MySpec,
+	csp: MyProcess,  // ← REQUIRED when using fdr:
+	fdr: FdrConfig {
+		seeds: 64,               // Number of exploration seeds
+		max_depth: 128,          // Maximum trace depth
+		max_internal_run: 32,    // Divergence detection threshold
+		timeout_ms: 5000,        // Per-seed timeout
+	},
+	environment ServiceClient { ... }
+}
+```
+
+#### Verification Properties
+
+The framework checks:
+- **Trace Refinement**: All observed traces ∈ spec traces
+- **Failures Refinement**: No invalid refusals at choice points
+- **Divergence Freedom**: No internal-only loops exceeding threshold
+- **Determinism**: Branching only at declared nondeterministic states
+
+#### FDR Verdict
+
+Post-execution verdict available in hooks:
+```rust
+hooks {
+	on_pass: |trace| {
+		assert!(trace.fdr_verdict.trace_refines);
+		assert!(trace.fdr_verdict.failures_refines);
+		assert!(trace.fdr_verdict.divergence_free);
+	}
+}
+```
+
+#### CSPM Export
+
+Future: CSPM export for external FDR4 integration.
+
+```rust
+// Planned API (not yet implemented)
+trace.export_cspm("target/tb_csp/test.cspm")?;
+```
+
+### 10.5 Complete Example: Client-Server with All Layers
+
+This example demonstrates all three layers working together:
+
+```rust
+#![cfg(all(feature = "testing-fdr", feature = "tcp", feature = "tokio"))]
 use tightbeam::testing::*;
-use tightbeam::instrumentation::*;
 
-tb_labels! { Handler: Received, Validated, Persisted, Responded; Handler(payload): LatencyMs; }
-
+// Layer 1: Assert spec - defines expected assertions and cardinalities
 tb_assert_spec! {
-	pub CreateSpec,
+	pub ClientServerSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "Received", exactly!(1)),
-			(HandlerStart, "Validated", exactly!(1)),
-			(HandlerStart, "Persisted", exactly!(1)),
-			(Response, "Responded", exactly!(1)),
-			(Response, "LatencyMs", at_least!(1)),
+			(HandlerStart, "connect", exactly!(1)),
+			(HandlerStart, "request", exactly!(1)),
+			(Response, "response", exactly!(1)),
+			(Response, "disconnect", exactly!(1))
 		]
 	},
 }
 
+// Layer 2: CSP process spec - models state machine with internal events
+tb_process_spec! {
+	pub struct ClientServerProcess;
+	events {
+		observable { "connect", "request", "response", "disconnect" }
+		hidden { "serialize", "encrypt", "decrypt", "deserialize" }
+	}
+	states {
+		Idle        => { "connect" => Connected }
+		Connected   => { "request" => Processing, "serialize" => Serializing }
+		Serializing => { "encrypt" => Encrypting }
+		Encrypting  => { "request" => Processing }
+		Processing  => { "decrypt" => Decrypting, "response" => Responded }
+		Decrypting  => { "deserialize" => Processing }
+		Responded   => { "disconnect" => Idle }
+	}
+	terminal { Idle }
+	choice { Connected, Processing }
+	annotations { description: "Client-server with crypto and nondeterminism" }
+}
+
 #[test]
-fn create_flow_instrumented() {
-	let cfg = TbInstrumentationConfig {
-		enable_payloads: true,
-		enable_internal_detail: true,
-		sample_enabled_sets: false,
-		sample_refusals: false,
-		divergence_heuristics: false,
-		max_events: 256,
-		record_durations: true,
-	};
+fn test_client_server_all_layers() {
 	tb_scenario! {
-		spec: CreateSpec,
-		instrumentation: cfg,
+		spec: ClientServerSpec,
+		csp: ClientServerProcess,
+		fdr: FdrConfig {
+			seeds: 64,
+			max_depth: 128,
+			max_internal_run: 32,
+			timeout_ms: 5000,
+		},
 		environment ServiceClient {
-			protocol: Listener,
 			worker_threads: 2,
-			service: |frame, _tx| async move {
-				tb_assert!(Received);
-				// validate
-				tb_assert!(Validated);
-				// persist
-				tb_assert!(Persisted);
-				// fabricate response
-				tb_assert!(Responded);
-				tb_assert!(LatencyMs(42u32));
-				Some(frame.clone()) // placeholder response
+			server: |assertions| async move {
+				let bind_addr = "127.0.0.1:0".parse().unwrap();
+				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+				let handle = crate::server! {
+					protocol TokioListener: listener,
+					assertions: assertions,
+					handle: |frame, assertions| async move {
+						tb_assert!(assertions, HandlerStart, "connect");
+						tb_assert!(assertions, HandlerStart, "request");
+						tb_assert!(assertions, Response, "response");
+						Some(frame)
+					}
+				};
+				Ok((handle, addr))
 			},
-			client: |_client| async move {
-				tightbeam::compose! { V0: id: b"create-1", message: RequestMessage { content: "MAKE".into() } }
-			},
+			client: |assertions, mut client| async move {
+				tb_assert!(assertions, Response, "response");
+				let frame = crate::compose! {
+					V0: id: "test",
+					order: 1u64,
+					message: TestMessage {}
+				}?;
+				let _response = client.emit(frame, None).await?;
+				tb_assert!(assertions, Response, "disconnect");
+				Ok(())
+			}
 		},
 		hooks {
-			on_pass: |trace| { let _ = trace.evidence_hash(); },
-			on_fail: |_trace, _violations| { /* diagnostics */ }
+			on_pass: |trace| {
+				// Layer 1: Assertions verified
+				assert_eq!(trace.assertion_count("connect"), 1);
+				assert_eq!(trace.assertion_count("request"), 1);
+				
+				// Layer 2: CSP trace valid
+				assert!(trace.csp_valid());
+				assert!(trace.terminated_in_valid_state());
+				
+				// Layer 3: Refinement properties hold
+				assert!(trace.fdr_verdict.trace_refines);
+				assert!(trace.fdr_verdict.failures_refines);
+				assert!(trace.fdr_verdict.divergence_free);
+			}
 		}
 	}
 }
 ```
 
-#### Example: Worker Scenario
+This test verifies:
+- **L1**: Correct assertion labels and cardinalities
+- **L2**: Valid CSP state transitions with internal events
+- **L3**: Trace refinement across multiple exploration seeds
+
+### 10.6 Feature Matrix
+
+| Capability | `testing` | `testing-csp` | `testing-fdr` |
+|------------|-----------|---------------|---------------|
+| Single trace verification | ✓ | ✓ | ✓ |
+| Assertion cardinality checks | ✓ | ✓ | ✓ |
+| CSP process modeling | – | ✓ | ✓ |
+| Compile-time label validation | – | ✓ | ✓ |
+| Runtime trace validation | – | ✓ | ✓ |
+| Multi-seed exploration | – | – | ✓ |
+| Trace refinement (⊑T) | – | – | ✓ |
+| Failures refinement (⊑F) | – | – | ✓ |
+| Divergence detection | – | – | ✓ |
+| Determinism checking | – | – | ✓ |
+| Refusal set analysis | – | – | ✓ |
+| Acceptance set queries | – | – | ✓ |
+| CSPM export (FDR4) | – | – | ✓ |
+
+### 10.7 Relationship to Formal CSP Theory
+
+Tightbeam's testing framework implements the three semantic models from 
+Communicating Sequential Processes (CSP) theory, providing rigorous formal 
+verification capabilities:
+
+#### 10.7.1 Three Semantic Models
+
+| CSP Model | Tightbeam Layer | Verification Property | Refinement Check |
+|-----------|-----------------|----------------------|------------------|
+| **Traces (T)** | L1 AssertSpec | Observable event sequences | traces(Impl) ⊆ traces(Spec) |
+| **Stable Failures (F)** | L2 ProcessSpec | Valid refusals at choice points | failures(Impl) ⊆ failures(Spec) |
+| **Failures-Divergences (FD)** | L3 FDR | Livelock freedom (no τ-loops) | divergences(Impl) = ∅ |
+
+**Traces Model**: Verifies that all observable event sequences produced by the 
+implementation are allowed by the specification. This ensures basic behavioral 
+correctness—the system never produces an unexpected sequence of external events.
+
+**Stable Failures Model**: Extends trace verification by checking what events a 
+process can *refuse* after each trace. A stable state is one where no internal 
+progress (τ-transitions) can occur. At choice points, the implementation must 
+not refuse events the specification accepts, preventing incorrect nondeterminism.
+
+**Failures-Divergences Model**: Adds divergence detection to identify processes 
+that can make infinite internal progress without external interaction. A divergence 
+is a τ-loop where the process never becomes stable. The `max_internal_run` 
+parameter bounds consecutive hidden events to detect such livelocks.
+
+#### 10.7.2 Observable vs. Hidden Events
+
+CSP distinguishes between observable events (external alphabet Σ) and hidden 
+events (internal actions τ). This distinction is fundamental to process refinement:
 
 ```rust
-tb_scenario! {
-	spec: PingSpec,
-	environment Worker {
-		setup: || PingPongWorker::start(),
-		stimulus: |worker| async move {
-			let ping_msg = RequestMessage { content: "PING".to_string(), lucky_number: 42 };
-			let _response = worker.relay(ping_msg).await?;
-			tb_assert!(ReceivedPing);
-			Ok(())
-		}
-	}
+tb_process_spec! {
+    pub struct ClientServerProcess;
+    events {
+        // Observable alphabet (Σ): externally visible protocol events
+        observable { "connect", "request", "response", "disconnect" }
+        
+        // Hidden alphabet (τ): internal implementation details
+        hidden { "serialize", "encrypt", "decrypt", "deserialize" }
+    }
+    // ...
 }
 ```
 
-#### Example: Bare Scenario
+**Observable events** represent the process's contract with its environment. 
+These form the basis of trace refinement—implementations and specifications must 
+agree on observable behavior.
+
+**Hidden events** model internal implementation details. They enable refinement 
+checking where implementations contain details absent from abstract specifications. 
+Hidden events are projected away when comparing traces: `trace \ {τ}`.
+
+The instrumentation taxonomy (§10.8.2) maps tightbeam events to CSP categories:
+- **Observable**: `gate_accept`, `gate_reject`, `request_recv`, `response_send`, `assert_label`
+- **Hidden (τ)**: `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`, `process_hidden`
+
+#### 10.7.3 Nondeterministic Choice and Refusal Sets
+
+CSP provides two choice operators:
+- **External choice (□)**: Environment selects which event occurs
+- **Internal choice (⊓)**: Process selects non-deterministically
+
+At choice points, a process has an *acceptance set* (events it can engage) and 
+*refusal set* (events it cannot engage in stable state). Failures refinement 
+ensures implementations don't introduce invalid refusals:
 
 ```rust
-tb_scenario! {
-	spec: LogicSpec,
-	environment Bare {
-		exec: || async {
-			perform_initialization();
-			tb_assert!(Started);
-			let value = compute();
-			tb_assert!(LatencyMs(value));
-			Ok::<_, tightbeam::TightBeamError>(())
-		}
-	}
+states {
+    // External choice: environment determines next event
+    Connected  => { "request" => Processing, "disconnect" => Idle }
+    
+    // Internal choice: process may non-deterministically choose path
+    Processing => { "response" => Responded, "error" => ErrorState }
+}
+choice { Processing }  // Annotate nondeterministic states
+```
+
+The `choice` annotation declares states where internal nondeterminism may occur. 
+FDR exploration uses different seeds to explore all possible nondeterministic 
+branches, ensuring the specification covers all implementation behaviors.
+
+#### 10.7.4 Multi-Seed Exploration and Scheduler Interleaving
+
+Based on research by Pedersen & Chalmers (2024), refinement in cooperatively 
+scheduled systems depends on resource availability. With `n` concurrent processes 
+and `m` schedulers where `m < n`, some traces become impossible due to scheduling 
+constraints.
+
+**Tightbeam addresses this through multi-seed exploration**: Each seed represents 
+a different scheduling strategy, exploring alternative interleaving of concurrent 
+events. This is analogous to testing with different numbers of schedulers to 
+verify behavior across resource constraints:
+
+```rust
+fdr: FdrConfig {
+    seeds: 64,              // Explore 64 different scheduling
+    max_depth: 128,         // Bound trace length
+    max_internal_run: 32,   // Divergence detection threshold
+    timeout_ms: 5000,       // Per-seed timeout
 }
 ```
 
-All higher layers subsume the guarantees of lower layers. If you only need outcome + assertion cardinalities, enable `testing`. If you need formal process modeling and partial refinement reasoning, enable `testing-csp`. For advanced analysis, multi‑seed exploration, CSPM emission, and (optional) external FDR integration, enable `testing-fdr`.
+At nondeterministic choice points, the seed determines which branch to explore. 
+Across all seeds, the framework verifies that:
+1. **Trace refinement**: All observable traces are valid
+2. **Failures refinement**: No invalid refusals at choice points
+3. **Divergence freedom**: No seed produces infinite τ-loops
 
-### 10.3 Instrumentation Specification
+#### 10.7.5 FDR Verification Verdict
+
+After multi-seed exploration, tightbeam produces a comprehensive verdict:
+
+```rust
+pub struct FdrVerdict {
+    // Refinement properties
+    pub trace_refines: bool,           // Spec ⊑T Impl
+    pub failures_refines: bool,        // Spec ⊑F Impl
+    pub divergence_free: bool,         // No τ-loops detected
+    
+    // Determinism analysis
+    pub is_deterministic: bool,        // No nondeterminism witnesses
+    pub determinism_witness: Option<(Trace, Event)>,
+    
+    // Divergence witness
+    pub divergence_witness: Option<Vec<Event>>,  // τ-loop if found
+    
+    // Statistics
+    pub traces_explored: usize,
+    pub states_visited: usize,
+    pub seeds_completed: u32,
+}
+```
+
+**Determinism checking**: FDR searches for witnesses to nondeterminism—a trace 
+and event where the process both accepts and refuses that event. If found, the 
+witness indicates unintended nondeterminism not declared via `choice`.
+
+**Divergence witness**: If a τ-loop is detected (consecutive hidden events 
+exceeding `max_internal_run`), the witness provides the internal event sequence 
+causing livelock.
+
+#### 10.7.6 CSPM Export for FDR4 Integration
+
+Tightbeam can export process specifications as CSPM (CSP Machine-readable) 
+format for verification with external tools like FDR4:
+
+```rust
+use tightbeam::testing::fdr::CspmExporter;
+
+let process = ClientServerProcess::process();
+let exporter = CspmExporter::new(&process);
+
+let mut file = std::fs::File::create("target/tb_csp/client_server.csp")?;
+exporter.export(&mut file)?;
+```
+
+Generated CSPM includes:
+- Observable and hidden alphabet declarations
+- State space enumeration
+- Labeled transition system as CSP processes
+- Main process with τ-hiding: `Process = InitialState \ {| hidden |}`
+
+This enables:
+1. **Independent verification** with FDR4's exhaustive model checker
+2. **Algebraic proofs** using CSP laws and theorems
+3. **Integration** with existing CSP toolchains and specifications
+
+#### 10.7.7 Trace Analysis Extensions
+
+The `FdrTraceExt` trait extends `ConsumedTrace` with CSP-specific analysis:
+
+```rust
+use tightbeam::testing::fdr::FdrTraceExt;
+
+hooks {
+    on_pass: |trace| {
+        // Trace validity
+        assert!(trace.csp_valid());
+        assert!(trace.terminated_in_valid_state());
+        
+        // Assertion counts
+        assert_eq!(trace.assertion_count("connect"), 1);
+        
+        // Event projection
+        let observable = trace.project_to_observable();
+        let hidden = trace.project_to_hidden();
+        
+        // Refinement properties
+        assert!(trace.fdr_verdict.trace_refines);
+        assert!(trace.fdr_verdict.failures_refines);
+        assert!(trace.fdr_verdict.divergence_free);
+        assert!(trace.fdr_verdict.is_deterministic);
+    }
+}
+```
+
+**Projection**: Extract observable or hidden event subsequences for analysis:
+```rust
+let observable = trace.project_to_observable();
+// ["connect", "request", "response", "disconnect"]
+
+let hidden = trace.project_to_hidden();
+// ["serialize", "encrypt", "decrypt", "deserialize"]
+```
+
+**Acceptance/Refusal queries**: Inspect process behavior at specific states:
+```rust
+if let Some(acceptance) = trace.acceptance_at("Connected") {
+    assert!(acceptance.contains(&Event("request")));
+}
+
+assert!(!trace.can_refuse_after("Connected", "request"));
+```
+
+#### 10.7.8 References
+
+This implementation is based on:
+
+- **Hoare, C.A.R. (1978)**: "Communicating Sequential Processes", CACM 21(8):666-677
+  - Original CSP theory with process algebra and event synchronization
+
+- **Hoare, C.A.R. (1985)**: *Communicating Sequential Processes*, Prentice-Hall
+  - Comprehensive treatment of CSP semantics and trace/failures/divergences models
+
+- **Roscoe, A.W. (2010)**: *Understanding Concurrent Systems*, Springer
+  - Modern CSP theory with refinement checking and FDR methodology
+
+- **Gibson-Robinson et al. (2014)**: "FDR3—A Modern Refinement Checker for CSP"
+  - FDR tool implementation and verification algorithms
+
+- **Pedersen & Chalmers (2024)**: "Verifying Cooperatively Scheduled Runtimes Using CSP"
+  - Verification of cooperatively scheduled systems with resource constraints
+  - Multi-seed exploration for different scheduler interleavings
+  - [arxiv.org/abs/2510.11751](https://arxiv.org/abs/2510.11751)
+
+### 10.8 Instrumentation Specification
 
 This subsection normatively specifies the TightBeam instrumentation subsystem. Instrumentation produces a semantic event sequence consumed by verification logic. It is an observation facility, NOT an application logging API. Tests MUST NOT depend on instrumentation events imperatively; verification MUST treat the event stream as authoritative ground truth for one execution.
 
 Feature Gating:
 - Instrumentation can be enabled only by the standalone crate feature `instrument`.
 
-#### 10.3.1 Objectives
+#### 10.7.1 Objectives
 - Emission MUST be amortized O(1) per event.
 - Ordering MUST be strictly increasing by sequence number per trace.
 - Evidence artifacts MUST be deterministic and hash‑stable given identical executions.
 - Detail level MUST be feature‑gated to avoid unnecessary overhead.
 - Payload handling MUST preserve privacy (hash or summarize; never emit secret raw bytes).
 
-#### 10.3.2 Event Kind Taxonomy
+#### 10.7.2 Event Kind Taxonomy
 Each event MUST have one kind from a closed, feature‑gated set:
 - External: `gate_accept`, `gate_reject`, `request_recv`, `response_send`
 - Assertion: `assert_label`, `assert_payload`
@@ -2159,7 +2523,7 @@ Each event MUST have one kind from a closed, feature‑gated set:
 
 Hidden/internal events MUST use the internal category.
 
-#### 10.3.3 Event Structure
+#### 10.7.3 Event Structure
 Conceptual fixed layout (names illustrative):
 ```
 trace_id | seq | kind | label? | payload? | phase? | dur_ns? | flags | extras
@@ -2175,7 +2539,7 @@ Requirements:
 - `flags` MUST represent a bitset (e.g. ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
 - `extras` MAY supply fixed numeric slots and a bounded byte sketch for extended metrics (e.g. enabled set cardinality).
 
-#### 10.3.4 Payload Representation
+#### 10.8.4 Payload Representation
 Runtime values captured under `assert_payload` MUST be transformed before emission:
 - Algorithm: SHA3‑256 digest over canonical byte representation.
 - Representation: First 32 bytes (full SHA3‑256 output) MUST be stored; NO truncation below 32 bytes.
@@ -2183,7 +2547,7 @@ Runtime values captured under `assert_payload` MUST be transformed before emissi
 - Structured values SHOULD emit a static schema tag plus digest.
 Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
 
-#### 10.3.5 Configuration
+#### 10.8.5 Configuration
 Instrumentation behavior MUST be controlled by a configuration object (conceptual fields). Configuration existence itself is gated by `instrument`:
 ```rust
 TbInstrumentationConfig {
@@ -2209,7 +2573,7 @@ Layer Interaction (informative): Enabling testing layers does NOT alter these de
 
 If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, emit a single `warn` event, and drop subsequent events.
 
-#### 10.3.6 Evidence Artifact Format
+#### 10.8.6 Evidence Artifact Format
 For every finalized trace an artifact MUST be producible in a canonical binary form (DER). JSON representations are OPTIONAL visual aides and MUST NOT be used for hashing or verification semantics.
 
 Canonical DER Schema (conceptual):
@@ -2251,193 +2615,9 @@ Artifact Integrity:
 Privacy:
 - Raw payload bytes MUST NOT appear; only hashed representation or numeric scalar (non-sensitive) values MAY be represented.
 
-#### 10.3.9 Failure Handling
+#### 10.8.7 Failure Handling
 - Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
 - Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
-
-### 10.4 ProcessSpec (Feature: `testing-csp`)
-
-Adds a CSP‑like labeled transition system enabling multiple external traces, 
-internal (hidden) events, and nondeterministic branching.
-
-Key Extensions:
-- Explicit external vs internal event alphabets
-- State identifiers & transition table
-- Nondeterministic choice points (declared)
-- Preferred path extraction to auto‑generate an AssertSpec (for Layer 1 reuse)
-- Enabled set queries for refusal approximation
-
-Example:
-```rust
-tb_process_spec! {
-    pub struct HandshakeSpec;
-    events { external { "start", "send", "ack", "fail" } internal { "serialize", "encrypt", "queue", "dispatch" } }
-    states {
-        S0  => { "start" => S1 }
-        S1  => { "serialize" => S1s, "queue" => S1q }
-        S1s => { "encrypt" => S1e }
-        S1e => { "send" => S2 }
-        S1q => { "dispatch" => S1d }
-        S1d => { "send" => S2 }
-        S2  => { "ack" => S3, "fail" => S3f }
-        S3  => {}
-        S3f => {}
-    }
-    terminal { S3, S3f }
-    nondeterministic { S1 }
-    annotations { description: "Queued or direct send" }
-}
-```
-
-Generated Capabilities:
-- `external_alphabet()`, `internal_alphabet()`
-- `step(state,event)` & `enabled(state)`
-- Promotion: `promote_assert_to_process!(PingPongSpec => PingPongProcessSpec)` synthesizes a linear LTS from an AssertSpec.
-
-### 10.5 Refinement & FDR (Feature: `testing-fdr`)
-
-Performs bounded multi‑seed exploration to approximate refinement properties:
-
-Checks:
-- Trace refinement: every observed external trace is in spec language
-- Failures (refusal) approximation: enabled sets not violating spec expectations
-- Divergence heuristic: internal‑only loop exceeding threshold
-- Determinism: branching only at declared nondeterministic states
-
-Profile:
-```rust
-TBProfile { schedulers, seeds, max_depth, max_internal_run, timeout, mode }
-```
-
-Case Macro:
-```rust
-tb_case! {
-    name: handshake_refinement,
-    spec: HandshakeSpec,
-    profile: { schedulers: 4, seeds: 64, max_depth: 128, max_internal_run: 32, mode: ExhaustiveBounded, timeout_ms: 5000 },
-    exec: || { run_handshake_sequence()?; Ok(()) },
-    assert: |verdict| {
-        assert!(verdict.trace_refines);
-        assert!(verdict.failures_refines);
-        assert!(verdict.divergence_free);
-    }
-}
-```
-
-Verdict Fields:
-`trace_refines, failures_refines, divergence_free, deterministic, missing_traces, unexpected_traces, refusal_diffs, divergence_points, resource_annotation, spec_hash, run_hash`.
-
-CSPM Export:
-- Enabled with `testing-fdr`: emits `target/tb_csp/<test>.cspm`
-- Optional environment `TB_FDR_PATH` triggers batch run & result ingestion.
-
-### 10.6 Hooks & Payload Assertions Summary
-
-- `tb_assert!(Label)` simple marker
-- `tb_assert!(Label(value))` payload capture
-- Specs may constrain or ignore payloads
-- `on_pass` / `on_fail` enable structured diagnostics without altering outcome
-
-### 10.7 Feature Matrix
-
-| Capability | `testing` | `testing-csp` | `testing-fdr` |
-|------------|-----------|---------------|---------------|
-| Single deterministic trace verification | ✓ | ✓ | ✓ |
-| Declarative assertion specs | ✓ | ✓ | ✓ |
-| Payload constraints | ✓ | ✓ | ✓ |
-| Process state machine modeling | – | ✓ | ✓ |
-| Nondeterministic branching | – | ✓ | ✓ |
-| Multi‑seed exploration | – | Partial (manual) | ✓ |
-| Trace refinement check | – | Approx (manual) | ✓ |
-| Failures/refusal approximation | – | Approx (manual) | ✓ |
-| Divergence heuristic | – | – | ✓ |
-| CSPM export | – | – | ✓ |
-| FDR integration (optional) | – | – | ✓ |
-| Evidence artifact | Basic | Extended | Full |
-
-### 10.8 Design Principles
-
-- Zero timing assumptions; causality via channel ordering / event sequence
-- Pure declarative specs – no imperative asserts in container body
-- Separation of concern: business logic vs verification logic
-- Deterministic evidence artifacts (stable hash) for audit & reproducibility
-- Progressive enhancement: opt into more formal rigor only when needed
-
-Further refinement (ProcessSpec / FDR) is additive and does not require 
-altering AssertSpec definitions; you only supply a higher‑order spec and 
-optionally a profile.
-
----
-
-For practical examples see: `tests/` directory (AssertSpec), forthcoming 
-`tests/csp/` (ProcessSpec), and `tests/refinement/` (FDR layer).
-
-### 10.9 Example: Comprehensive Instrumented Test (Normative Usage Pattern)
-
-This example illustrates a fully instrumented AssertSpec execution. It MUST 
-compile once the corresponding macros and types are implemented.
-
-```rust
-#![cfg(all(feature = "testing", feature = "instrument"))]
-use tightbeam::testing::*;
-use tightbeam::instrumentation::*;
-
-tb_labels! { Handler: Received, Validated, Persisted, Responded; Handler(payload): LatencyMs; }
-
-tb_assert_spec! {
-	pub CreateSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Accepted,
-		assertions: [
-			(HandlerStart, "Received", exactly!(1)),
-			(HandlerStart, "Validated", exactly!(1)),
-			(HandlerStart, "Persisted", exactly!(1)),
-			(Response, "Responded", exactly!(1)),
-			(Response, "LatencyMs", at_least!(1)),
-		]
-	},
-}
-
-#[test]
-fn create_flow_instrumented() {
-	let cfg = TbInstrumentationConfig {
-		enable_payloads: true,
-		enable_internal_detail: true,
-		sample_enabled_sets: false,
-		sample_refusals: false,
-		divergence_heuristics: false,
-		max_events: 256,
-		record_durations: true,
-	};
-	test_container! {
-		spec: CreateSpec,
-		instrumentation: cfg,
-		service: |frame, _tx| async move {
-			tb_assert!(Received);
-			// validate
-			tb_assert!(Validated);
-			// persist
-			tb_assert!(Persisted);
-			// fabricate response
-			tb_assert!(Responded);
-			tb_assert!(LatencyMs(42u32));
-			Some(frame.clone()) // placeholder response
-		},
-		client: |_client| async move {
-			tightbeam::compose! { V0: id: b"create-1", message: RequestMessage { content: "MAKE".into() } }
-		},
-		on_pass: |trace| {
-			// Access deterministic evidence hash (binary artifact based)
-			let _ = trace.evidence_hash();
-		},
-		on_fail: |_trace, _violations| { /* diagnostics */ }
-	}
-}
-```
-
-This pattern MUST: (1) emit events for each assertion label; (2) produce a deterministic evidence artifact; (3) validate cardinalities and payload constraint; (4) finalize without overflow.
-
 
 ## 11. End-to-End Examples
 

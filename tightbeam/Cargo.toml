@@ -88,6 +88,8 @@ full = [
 	"standards-rfc",
 	"standards-iso",
 	"testing",
+	"testing-csp",
+	"testing-fdr",
 	"instrument",
 	"colony",
 ]

@@ -143,7 +143,7 @@ pub mod active {
 		pub payload_hash: Option<[u8; 32]>,
 		pub duration_ns: Option<u64>,
 		pub flags: u32,
-		extras: Option<Vec<u8>>,
+		pub extras: Option<Vec<u8>>,
 	}
 
 	#[derive(Clone, Copy, Debug)]
@@ -178,6 +178,11 @@ pub mod active {
 
 	thread_local! {
 		static EVENTS: std::cell::RefCell<Vec<TbEvent>> = std::cell::RefCell::new(Vec::new());
+	}
+
+	/// Get next sequence number for event (thread-safe)
+	pub fn next_seq() -> u32 {
+		SEQ.fetch_add(1, Ordering::Relaxed)
 	}
 
 	pub fn init(cfg: TbInstrumentationConfig) -> Result<(), TightBeamError> {

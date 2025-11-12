@@ -10,15 +10,16 @@
 //! - `testing-csp` - L2 (requires `testing`)
 //! - `testing-fdr` - L3 (requires `testing-csp`)
 
-mod l1_spec;
+mod assert;
 
 #[cfg(feature = "testing-csp")]
 pub mod csp;
+
 #[cfg(feature = "testing-fdr")]
 pub mod fdr;
 
 // Re-exports
-pub use l1_spec::{verify_trace, SpecViolation, TBSpec};
+pub use assert::{verify_trace, SpecViolation, TBSpec};
 
 #[cfg(feature = "testing-csp")]
 pub use csp::*;

@@ -503,12 +503,28 @@ macro_rules! server {
 	}};
 
 	(protocol $protocol:path: $listener:expr, assertions: $assertions:expr, handle: $handler:expr) => {{
-		let __assertions = $assertions.clone();
-		let __wrapped_handler = move |frame| {
-			let __assertions = __assertions.clone();
-			$handler(frame, __assertions)
-		};
-		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, __wrapped_handler)
+		#[allow(unused_imports)]
+		use $crate::testing::trace::TraceCollector;
+
+		let __assertions_clone = $assertions.clone();
+
+		// Helper function to enable type inference
+		fn __make_handler<F, Fut>(
+			assertions: TraceCollector,
+			handler: F,
+		) -> impl Fn($crate::Frame) -> Fut
+		where
+			F: Fn($crate::Frame, TraceCollector) -> Fut + Clone,
+			Fut: core::future::Future<Output = Option<$crate::Frame>>,
+		{
+			move |frame| {
+				let assertions = assertions.clone();
+				handler(frame, assertions)
+			}
+		}
+
+		let __wrapped = __make_handler(__assertions_clone, $handler);
+		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, __wrapped)
 	}};
 
 	(protocol $protocol:path: bind $addr:expr, handle: $handler:expr) => {{

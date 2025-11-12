@@ -4,13 +4,130 @@
 //! a fully drained CBVOC execution. The trace captures all channel
 //! events, phase transitions, and outcome state.
 
+#[cfg(feature = "std")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(not(feature = "std"))]
+use alloc::sync::{Arc, Mutex};
+
 use crate::policy::TransitStatus;
-use crate::testing::assertions::Assertion;
+use crate::testing::assertions::{Assertion, AssertionLabel, AssertionPhase};
 use crate::transport::error::TransportError;
 use crate::Frame;
 
 #[cfg(feature = "instrument")]
 use crate::instrumentation::{TbEvent, TbEventKind};
+
+/// Unified trace collector for assertions and instrumentation events.
+///
+/// This type replaces the separate AssertionCollector pattern, unifying
+/// both assertions and instrumentation events into a single explicitly-passed
+/// collector. This ensures async-safety (no thread-local storage) and provides
+/// a consistent API for trace collection.
+#[derive(Clone)]
+pub struct TraceCollector {
+	assertions: Arc<Mutex<Vec<Assertion>>>,
+	#[cfg(feature = "instrument")]
+	events: Arc<Mutex<Vec<TbEvent>>>,
+}
+
+impl TraceCollector {
+	/// Create a new empty trace collector
+	pub fn new() -> Self {
+		Self {
+			assertions: Arc::new(Mutex::new(Vec::new())),
+			#[cfg(feature = "instrument")]
+			events: Arc::new(Mutex::new(Vec::new())),
+		}
+	}
+
+	/// Record an assertion
+	pub fn assert(&self, phase: AssertionPhase, label: &str) {
+		self.assert_with_payload(phase, label, None);
+	}
+
+	/// Record an assertion with payload
+	pub fn assert_with_payload(&self, phase: AssertionPhase, label: &str, payload: Option<&[u8]>) {
+		use sha3::{Digest, Sha3_256};
+
+		let seq = self.assertions.lock().map(|a| a.len()).unwrap_or(0);
+		let payload_hash = payload.map(|p| {
+			let mut hasher = Sha3_256::new();
+			hasher.update(p);
+			let out = hasher.finalize();
+			let mut arr = [0u8; 32];
+			arr.copy_from_slice(&out);
+			arr
+		});
+
+		// Convert label to 'static lifetime for storage
+		// This is fine for test scenarios where we don't expect unbounded label creation
+		let static_label: &'static str = Box::leak(label.to_string().into_boxed_str());
+
+		let assertion = Assertion { seq, phase, label: AssertionLabel::Custom(static_label), payload_hash };
+
+		if let Ok(mut assertions) = self.assertions.lock() {
+			assertions.push(assertion);
+		}
+	}
+	/// Emit an instrumentation event
+	#[cfg(feature = "instrument")]
+	pub fn emit(&self, kind: TbEventKind, label: &str) {
+		self.emit_with_payload(kind, label, None);
+	}
+
+	/// Emit an instrumentation event with payload
+	#[cfg(feature = "instrument")]
+	pub fn emit_with_payload(&self, kind: TbEventKind, label: &str, payload: Option<&[u8]>) {
+		let seq = crate::instrumentation::active::next_seq();
+		let event = TbEvent {
+			seq,
+			kind,
+			label: Some(label.to_string()),
+			payload_hash: payload.map(|p| {
+				use sha3::{Digest, Sha3_256};
+				let mut hasher = Sha3_256::new();
+				hasher.update(p);
+				let out = hasher.finalize();
+				let mut arr = [0u8; 32];
+				arr.copy_from_slice(&out);
+				arr
+			}),
+			duration_ns: None,
+			flags: 0,
+			extras: None,
+		};
+
+		if let Ok(mut events) = self.events.lock() {
+			events.push(event);
+		}
+	}
+
+	/// Drain assertions into a vector
+	pub fn drain_assertions(&self) -> Vec<Assertion> {
+		if let Ok(mut assertions) = self.assertions.lock() {
+			assertions.drain(..).collect()
+		} else {
+			Vec::new()
+		}
+	}
+
+	/// Drain events into a vector
+	#[cfg(feature = "instrument")]
+	pub fn drain_events(&self) -> Vec<TbEvent> {
+		if let Ok(mut events) = self.events.lock() {
+			events.drain(..).collect()
+		} else {
+			Vec::new()
+		}
+	}
+}
+
+impl Default for TraceCollector {
+	fn default() -> Self {
+		Self::new()
+	}
+}
 
 /// Consumed execution trace after await completion.
 ///
@@ -56,13 +173,12 @@ impl ConsumedTrace {
 		}
 	}
 
-	/// Drain any thread-local recorded assertions (via `tb_assert!`) into this trace.
-	/// Safe to call multiple times; subsequent calls after first will be no-ops
-	/// because the underlying buffer is cleared on drain.
-	pub fn drain_recorded_assertions(&mut self) {
-		let drained = crate::testing::assertions::drain_assertions();
-		if !drained.is_empty() {
-			self.assertions.extend(drained);
+	/// Populate trace from TraceCollector
+	pub fn populate_from_collector(&mut self, collector: &TraceCollector) {
+		self.assertions.extend(collector.drain_assertions());
+		#[cfg(feature = "instrument")]
+		{
+			self.instrument_events.extend(collector.drain_events());
 		}
 	}
 

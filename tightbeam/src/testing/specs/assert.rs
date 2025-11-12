@@ -216,5 +216,3 @@ pub fn verify_trace<S: TBSpec>(spec: &S, trace: &ConsumedTrace) -> Result<(), Sp
 
 	Ok(())
 }
-
-// TODO: Reintroduce focused unit tests with stable construction helpers.

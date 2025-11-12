@@ -37,9 +37,12 @@ words:
   - getrandom
   - HKDF
   - HMAC
+  - Hoare
   - Keccak
   - keypair
   - KTRI
+  - Livelock
+  - livelocks
   - Merkle
   - millis
   - Monodomy
@@ -47,6 +50,7 @@ words:
   - morphers
   - MPSC
   - nanos
+  - nondet
   - nonrep
   - nonrepudiable
   - nonrepudiation

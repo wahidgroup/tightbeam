@@ -13,20 +13,15 @@
 //! Hashing domain: b"TBSP" + version triple + spec id + mode code + gate decision presence/value + normalized assertions + optional events.
 //! Normalization: sort by (label, phase_code).
 
+// ProcessSpec macro (Layer 2 - CSP)
+#[cfg(feature = "testing-csp")]
+pub mod process_spec;
+
 #[cfg(not(feature = "std"))]
-extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::{
-	borrow::Cow,
-	string::String,
-	sync::{Arc, Mutex},
-	vec::Vec,
-};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
 #[cfg(feature = "std")]
 use std::borrow::Cow;
-#[cfg(feature = "std")]
-use std::sync::{Arc, Mutex};
 
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::TransitStatus;
@@ -39,14 +34,91 @@ use crate::Errorizable;
 use crate::instrumentation::TbEventKind;
 
 // Re-exports
+pub use crate::testing::trace::TraceCollector;
 pub use crate::{absent, at_least, at_most, between, exactly, present};
 
 // ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "std")]
-pub type AssertionCollector = Arc<Mutex<Vec<crate::testing::assertions::Assertion>>>;
+// Removed: AssertionCollector type alias - use TraceCollector directly
+
+// ---------------------------------------------------------------------------
+// Instrumentation Mode
+// ---------------------------------------------------------------------------
+
+/// Instrumentation mode for tb_scenario!
+#[cfg(feature = "instrument")]
+#[derive(Clone, Debug)]
+pub enum InstrumentationMode {
+	/// Automatic: framework initializes and captures events (default)
+	Auto,
+
+	/// Manual: user controls init/start/end
+	Manual,
+
+	/// Custom: automatic with custom configuration
+	Custom {
+		enable_payloads: bool,
+		enable_internal_detail: bool,
+		sample_enabled_sets: bool,
+		sample_refusals: bool,
+		divergence_heuristics: bool,
+		record_durations: bool,
+		max_events: u32,
+	},
+}
+
+#[cfg(feature = "instrument")]
+impl Default for InstrumentationMode {
+	fn default() -> Self {
+		Self::Auto
+	}
+}
+
+#[cfg(feature = "instrument")]
+impl InstrumentationMode {
+	/// Get the TbInstrumentationConfig for this mode
+	pub fn config(&self) -> crate::instrumentation::TbInstrumentationConfig {
+		match self {
+			Self::Auto => crate::instrumentation::TbInstrumentationConfig {
+				enable_payloads: false,
+				enable_internal_detail: true, // Need hidden events for CSP
+				sample_enabled_sets: false,
+				sample_refusals: false,
+				divergence_heuristics: false,
+				record_durations: false,
+				max_events: 4096,
+			},
+			Self::Manual => {
+				// Manual mode shouldn't call this, but provide safe default
+				crate::instrumentation::TbInstrumentationConfig::default()
+			}
+			Self::Custom {
+				enable_payloads,
+				enable_internal_detail,
+				sample_enabled_sets,
+				sample_refusals,
+				divergence_heuristics,
+				record_durations,
+				max_events,
+			} => crate::instrumentation::TbInstrumentationConfig {
+				enable_payloads: *enable_payloads,
+				enable_internal_detail: *enable_internal_detail,
+				sample_enabled_sets: *sample_enabled_sets,
+				sample_refusals: *sample_refusals,
+				divergence_heuristics: *divergence_heuristics,
+				record_durations: *record_durations,
+				max_events: *max_events,
+			},
+		}
+	}
+
+	/// Should framework auto-initialize?
+	pub fn is_auto(&self) -> bool {
+		matches!(self, Self::Auto | Self::Custom { .. })
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Cardinality core
@@ -616,67 +688,23 @@ macro_rules! tb_assert_spec {
 #[macro_export]
 macro_rules! tb_assert {
 	// Forms WITH explicit assertions collector (for ServiceClient)
-	($assertions:expr, $phase:ident, $label:ident) => {{
-		#[cfg(feature = "std")]
-		$crate::testing::assertions::record_assertion_to(
-			&$assertions,
-			$crate::testing::assertions::AssertionPhase::$phase,
-			stringify!($label),
-			None,
-		);
-		#[cfg(not(feature = "std"))]
-		$crate::testing::assertions::record_assertion(
-			$crate::testing::assertions::AssertionPhase::$phase,
-			stringify!($label),
-			None,
-		);
+	($trace:expr, $phase:ident, $label:ident) => {{
+		$trace.assert($crate::testing::assertions::AssertionPhase::$phase, stringify!($label));
 	}};
-	($assertions:expr, $phase:ident, $label:ident => $payload:expr) => {{
+	($trace:expr, $phase:ident, $label:ident => $payload:expr) => {{
 		let __c = $crate::testing::macros::__encode_payload(&$payload);
-		#[cfg(feature = "std")]
-		$crate::testing::assertions::record_assertion_to(
-			&$assertions,
-			$crate::testing::assertions::AssertionPhase::$phase,
-			stringify!($label),
-			Some(__c.as_ref()),
-		);
-		#[cfg(not(feature = "std"))]
-		$crate::testing::assertions::record_assertion(
+		$trace.assert_with_payload(
 			$crate::testing::assertions::AssertionPhase::$phase,
 			stringify!($label),
 			Some(__c.as_ref()),
 		);
 	}};
-	($assertions:expr, $phase:ident, $label:literal) => {{
-		#[cfg(feature = "std")]
-		$crate::testing::assertions::record_assertion_to(
-			&$assertions,
-			$crate::testing::assertions::AssertionPhase::$phase,
-			$label,
-			None,
-		);
-		#[cfg(not(feature = "std"))]
-		$crate::testing::assertions::record_assertion(
-			$crate::testing::assertions::AssertionPhase::$phase,
-			$label,
-			None,
-		);
+	($trace:expr, $phase:ident, $label:literal) => {{
+		$trace.assert($crate::testing::assertions::AssertionPhase::$phase, $label);
 	}};
-	($assertions:expr, $phase:ident, $label:literal => $payload:expr) => {{
+	($trace:expr, $phase:ident, $label:literal => $payload:expr) => {{
 		let __c = $crate::testing::macros::__encode_payload(&$payload);
-		#[cfg(feature = "std")]
-		$crate::testing::assertions::record_assertion_to(
-			&$assertions,
-			$crate::testing::assertions::AssertionPhase::$phase,
-			$label,
-			Some(__c.as_ref()),
-		);
-		#[cfg(not(feature = "std"))]
-		$crate::testing::assertions::record_assertion(
-			$crate::testing::assertions::AssertionPhase::$phase,
-			$label,
-			Some(__c.as_ref()),
-		);
+		$trace.assert_with_payload($crate::testing::assertions::AssertionPhase::$phase, $label, Some(__c.as_ref()));
 	}};
 
 	// Forms WITHOUT collector (backward compatibility - uses thread-local)
@@ -843,20 +871,30 @@ macro_rules! tb_scenario {
 		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
 		async fn $test_name() {
 			// Execute directly in async context - no runtime.block_on needed
-			#[allow(unused_imports)]
-			use std::sync::{Arc, Mutex};
 
-			// Create shared assertion collector and clone upfront
-			let assertions: $crate::testing::macros::AssertionCollector = Arc::new(Mutex::new(Vec::new()));
-			let assertions_server = assertions.clone();
-			let assertions_client = assertions.clone();
+			// Create shared trace collector and clone upfront
+			let trace_collector = $crate::testing::macros::TraceCollector::new();
+			let trace_server = trace_collector.clone();
+			let trace_client = trace_collector.clone();
 
-			// User's server closure - invoke it with the assertions parameter
-			let server_setup_result: Result<(tokio::task::JoinHandle<()>, _), $crate::TightBeamError> =
-				($server_closure)(assertions_server).await;
+			// Helper function for server closure to enable type inference
+			async fn __call_server_closure<F, Fut>(
+				closure: F,
+				trace: $crate::testing::macros::TraceCollector,
+			) -> Result<(tokio::task::JoinHandle<()>, $crate::transport::tcp::TightBeamSocketAddr), $crate::TightBeamError>
+			where
+				F: FnOnce($crate::testing::macros::TraceCollector) -> Fut,
+				Fut: core::future::Future<Output = Result<(tokio::task::JoinHandle<()>, $crate::transport::tcp::TightBeamSocketAddr), $crate::TightBeamError>>,
+			{
+				closure(trace).await
+			}
+
+			// User's server closure - invoke it with the trace parameter
+			let server_setup_result = __call_server_closure($server_closure, trace_server).await;
 			let (server_handle, server_addr) = server_setup_result.expect("Server setup failed");
 
 			// Default protocol to TokioListener if not specified
+			use crate::tb_scenario;
 			type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
 			// Build client transport using the actual server address
@@ -867,23 +905,20 @@ macro_rules! tb_scenario {
 			// Execute client closure - use helper to enable inference
 			async fn __call_client_closure<F, Fut, T>(
 				closure: F,
-				assertions: $crate::testing::macros::AssertionCollector,
+				trace: $crate::testing::macros::TraceCollector,
 				client: T,
 			) -> Result<(), $crate::TightBeamError>
 			where
-				F: FnOnce($crate::testing::macros::AssertionCollector, T) -> Fut,
+				F: FnOnce($crate::testing::macros::TraceCollector, T) -> Fut,
 				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
 			{
-				closure(assertions, client).await
+				closure(trace, client).await
 			}
-			let client_result = __call_client_closure($client_closure, assertions_client, client).await;
+			let client_result = __call_client_closure($client_closure, trace_client, client).await;
 
-			// Collect trace from shared assertions
+			// Collect trace from shared collector
 			let mut trace = $crate::testing::trace::ConsumedTrace::new();
-			{
-				let collected = assertions.lock().unwrap();
-				trace.assertions.extend(collected.iter().cloned());
-			}
+			trace.populate_from_collector(&trace_collector);
 			trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
 			if client_result.is_err() {
 				trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
@@ -909,12 +944,50 @@ macro_rules! tb_scenario {
 		#[test]
 		fn $test_name() {
 			tb_scenario!(@execute ServiceClient, single_spec, $spec,
+				$(instrumentation: $instr_cfg,)?
 				$(hooks: $hooks,)?
 				protocol: { $($protocol)? },
 				worker_threads: { $threads },
 				server: $server_closure,
 				client: $client_closure
 			).expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for Bare environment =====
+	(
+		name: $test_name:ident,
+		spec: $spec:ty,
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Bare {
+			exec: $exec_closure:expr
+		}
+		$(, hooks $hooks:tt)?
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			let result = tb_scenario!(@execute Bare, single_spec, $spec, $(instrumentation: $instr_cfg,)? $(hooks: $hooks,)? exec: $exec_closure);
+			result.expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for Worker environment =====
+	(
+		name: $test_name:ident,
+		spec: $spec:ty,
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Worker {
+			setup: $setup_closure:expr,
+			stimulus: $stimulus_closure:expr
+		}
+		$(, hooks $hooks:tt)?
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			let result = tb_scenario!(@execute Worker, single_spec, $spec, $(instrumentation: $instr_cfg,)? $(hooks: $hooks,)? setup: $setup_closure, stimulus: $stimulus_closure);
+			result.expect(concat!("Test failed: ", stringify!($test_name)));
 		}
 	};
 
@@ -931,7 +1004,7 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {
-		tb_scenario!(@execute Bare, single_spec, $spec, $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure)
+		tb_scenario!(@execute Bare, single_spec, $spec, $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure)
 	};
 
 	// ===== Bare environment variant (multiple specs: [...] form) =====
@@ -947,7 +1020,7 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {
-		tb_scenario!(@execute Bare, multi_specs, [ $( $spec_expr ),+ ], $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure)
+		tb_scenario!(@execute Bare, multi_specs, [ $( $spec_expr ),+ ], $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure)
 	};
 
 	// ===== Worker environment variant (single spec: Type form) =====
@@ -964,7 +1037,7 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {
-		tb_scenario!(@execute Worker, single_spec, $spec, $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? setup: $setup_closure, stimulus: $stimulus_closure)
+		tb_scenario!(@execute Worker, single_spec, $spec, $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? setup: $setup_closure, stimulus: $stimulus_closure)
 	};
 
 	// ===== Worker environment variant (multiple specs: [...] form) =====
@@ -981,7 +1054,7 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {
-		tb_scenario!(@execute Worker, multi_specs, [ $( $spec_expr ),+ ], $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? setup: $setup_closure, stimulus: $stimulus_closure)
+		tb_scenario!(@execute Worker, multi_specs, [ $( $spec_expr ),+ ], $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? setup: $setup_closure, stimulus: $stimulus_closure)
 	};
 
 	// ===== ServiceClient environment - user provides complete server setup =====
@@ -1002,6 +1075,7 @@ macro_rules! tb_scenario {
 		$(,)?
 	) => {
 		tb_scenario!(@execute ServiceClient, single_spec, $spec,
+			$(instrumentation: $instr_cfg,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			protocol: { $($protocol)? },
 			worker_threads: { $($threads)? },
@@ -1027,6 +1101,7 @@ macro_rules! tb_scenario {
 		$(,)?
 	) => {
 		tb_scenario!(@execute ServiceClient, multi_specs, [ $( $spec_expr ),+ ],
+			$(instrumentation: $instr_cfg,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			protocol: { $($protocol)? },
 			worker_threads: { $($threads)? },
@@ -1035,15 +1110,74 @@ macro_rules! tb_scenario {
 		)
 	};
 
-	// ===== Execution dispatcher for Bare environment =====
-	(@execute Bare, single_spec, $spec:ty, $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
-		let mut trace = $crate::testing::trace::ConsumedTrace::new();
-		let exec_result: Result<(), $crate::TightBeamError> = $exec_closure();
-		trace.drain_recorded_assertions();
-		trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if exec_result.is_err() {
-			trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
+	// ===== Internal: Instrumentation helpers =====
+	(@get_instr_mode) => {
+		$crate::testing::macros::InstrumentationMode::Auto
+	};
+	(@get_instr_mode $mode:expr) => {
+		$mode
+	};
+
+	(@init_instrumentation $mode:expr) => {
+		#[cfg(feature = "instrument")]
+		{
+			let mode = &$mode;
+			if mode.is_auto() {
+				let cfg = mode.config();
+				let _ = $crate::instrumentation::active::init(cfg);
+				$crate::instrumentation::active::start_trace();
+			}
 		}
+	};
+
+	(@finalize_instrumentation $trace:expr, $mode:expr) => {
+		#[cfg(feature = "instrument")]
+		{
+			let mode = &$mode;
+			if mode.is_auto() {
+				let artifact = $crate::instrumentation::active::end_trace();
+				$trace.instrument_events = artifact.events;
+			}
+		}
+	};
+
+	// ===== Internal: Common trace setup/teardown =====
+	(@setup_trace) => {{
+		$crate::testing::trace::ConsumedTrace::new()
+	}};
+
+	(@finalize_trace $trace:expr, $exec_result:expr) => {{
+		$trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
+		if $exec_result.is_err() {
+			$trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
+		}
+	}};
+
+	(@with_instrumentation $instr_mode:expr, $body:block) => {{
+		#[cfg(feature = "instrument")]
+		let instr_mode = $instr_mode;
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@init_instrumentation instr_mode);
+
+		let result = $body;
+
+		result
+	}};
+
+	// ===== Execution dispatcher for Bare environment =====
+	(@execute Bare, single_spec, $spec:ty, $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
+		#[cfg(feature = "instrument")]
+		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@init_instrumentation instr_mode);
+
+		let mut trace = tb_scenario!(@setup_trace);
+		let exec_result: Result<(), $crate::TightBeamError> = $exec_closure();
+
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@finalize_instrumentation trace, instr_mode);
+
+		tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			single_spec: $spec,
@@ -1054,18 +1188,23 @@ macro_rules! tb_scenario {
 		tb_scenario!(@propagate_result exec_result, verification_result)
 	}};
 
-	(@execute Bare, multi_specs, [ $( $spec_expr:expr ),+ ], $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
+	(@execute Bare, multi_specs, [ $( $spec_expr:expr ),+ ], $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
 		let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 		];
 
-		let mut trace = $crate::testing::trace::ConsumedTrace::new();
+		#[cfg(feature = "instrument")]
+		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@init_instrumentation instr_mode);
+
+		let mut trace = tb_scenario!(@setup_trace);
 		let exec_result: Result<(), $crate::TightBeamError> = $exec_closure();
-		trace.drain_recorded_assertions();
-		trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if exec_result.is_err() {
-			trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
+
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@finalize_instrumentation trace, instr_mode);
+
+		tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			multi_specs: specs,
@@ -1077,15 +1216,20 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== Execution dispatcher for Worker environment =====
-	(@execute Worker, single_spec, $spec:ty, $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
-		let mut trace = $crate::testing::trace::ConsumedTrace::new();
+	(@execute Worker, single_spec, $spec:ty, $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
+		#[cfg(feature = "instrument")]
+		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@init_instrumentation instr_mode);
+
+		let mut trace = tb_scenario!(@setup_trace);
 		let mut worker = $setup_closure();
 		let exec_result = $stimulus_closure(&mut worker);
-		trace.drain_recorded_assertions();
-		trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if exec_result.is_err() {
-			trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
+
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@finalize_instrumentation trace, instr_mode);
+
+		tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			single_spec: $spec,
@@ -1096,19 +1240,24 @@ macro_rules! tb_scenario {
 		tb_scenario!(@propagate_result exec_result, verification_result)
 	}};
 
-	(@execute Worker, multi_specs, [ $( $spec_expr:expr ),+ ], $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
+	(@execute Worker, multi_specs, [ $( $spec_expr:expr ),+ ], $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
 		let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 		];
 
-		let mut trace = $crate::testing::trace::ConsumedTrace::new();
+		#[cfg(feature = "instrument")]
+		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@init_instrumentation instr_mode);
+
+		let mut trace = tb_scenario!(@setup_trace);
 		let mut worker = $setup_closure();
 		let exec_result = $stimulus_closure(&mut worker);
-		trace.drain_recorded_assertions();
-		trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if exec_result.is_err() {
-			trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
+
+		#[cfg(feature = "instrument")]
+		tb_scenario!(@finalize_instrumentation trace, instr_mode);
+
+		tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			multi_specs: specs,
@@ -1172,6 +1321,7 @@ macro_rules! tb_scenario {
 
 	// ===== Execution dispatcher for ServiceClient environment =====
 	(@execute ServiceClient, single_spec, $spec:ty,
+		$(instrumentation: $instr_mode:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
 		worker_threads: { $($threads:literal)? },
@@ -1181,10 +1331,8 @@ macro_rules! tb_scenario {
 		#[allow(unused_imports)]
 		use std::sync::{Arc, Mutex};
 
-		// Determine worker threads (default 2)
 		const WORKER_THREADS: usize = tb_scenario!(@default_worker_threads $($threads)?);
 
-		// Build and run tokio runtime
 		let runtime = tokio::runtime::Builder::new_multi_thread()
 			.worker_threads(WORKER_THREADS)
 			.enable_all()
@@ -1192,50 +1340,46 @@ macro_rules! tb_scenario {
 			.expect("Failed to build tokio runtime");
 
 		let exec_result = runtime.block_on(async {
-			// Create shared assertion collector and clone upfront
-			let assertions: $crate::testing::macros::AssertionCollector = Arc::new(Mutex::new(Vec::new()));
-			let assertions_server = assertions.clone();
-			let assertions_client = assertions.clone();
+			#[cfg(feature = "instrument")]
+			let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
+			#[cfg(feature = "instrument")]
+			tb_scenario!(@init_instrumentation instr_mode);
 
-			// User's server closure - invoke it with the assertions parameter
+			let trace_collector = $crate::testing::macros::TraceCollector::new();
+			let trace_server = trace_collector.clone();
+			let trace_client = trace_collector.clone();
+
 			let server_setup_result: Result<(tokio::task::JoinHandle<()>, _), $crate::TightBeamError> =
-				($server_closure)(assertions_server).await;
+				($server_closure)(trace_server).await;
 			let (server_handle, server_addr) = server_setup_result?;
 
-			// Default protocol to TokioListener if not specified
 			type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
-			// Build client transport using the actual server address
 			let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await
 				.map_err(|e| $crate::TightBeamError::from(e))?;
 			let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
-			// Execute client closure - use helper to enable inference
 			async fn __call_client_closure<F, Fut, T>(
 				closure: F,
-				assertions: $crate::testing::macros::AssertionCollector,
+				trace: $crate::testing::macros::TraceCollector,
 				client: T,
 			) -> Result<(), $crate::TightBeamError>
 			where
-				F: FnOnce($crate::testing::macros::AssertionCollector, T) -> Fut,
+				F: FnOnce($crate::testing::macros::TraceCollector, T) -> Fut,
 				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
 			{
-				closure(assertions, client).await
+				closure(trace, client).await
 			}
-			let client_result = __call_client_closure($client_closure, assertions_client, client).await;
+			let client_result = __call_client_closure($client_closure, trace_client, client).await;
 
-			// Collect trace from shared assertions
-			let mut trace = $crate::testing::trace::ConsumedTrace::new();
-			{
-				let collected = assertions.lock().unwrap();
-				trace.assertions.extend(collected.iter().cloned());
-			}
-			trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-			if client_result.is_err() {
-				trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-			}
+			let mut trace = tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
 
-			// Cleanup
+			#[cfg(feature = "instrument")]
+			tb_scenario!(@finalize_instrumentation trace, instr_mode);
+
+			tb_scenario!(@finalize_trace trace, client_result);
+
 			server_handle.abort();
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1251,6 +1395,7 @@ macro_rules! tb_scenario {
 	}};
 
 	(@execute ServiceClient, multi_specs, [ $( $spec_expr:expr ),+ ],
+		$(instrumentation: $instr_mode:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
 		worker_threads: { $($threads:literal)? },
@@ -1264,10 +1409,8 @@ macro_rules! tb_scenario {
 			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 		];
 
-		// Determine worker threads (default 2)
 		const WORKER_THREADS: usize = tb_scenario!(@default_worker_threads $($threads)?);
 
-		// Build and run tokio runtime
 		let runtime = tokio::runtime::Builder::new_multi_thread()
 			.worker_threads(WORKER_THREADS)
 			.enable_all()
@@ -1275,12 +1418,19 @@ macro_rules! tb_scenario {
 			.expect("Failed to build tokio runtime");
 
 		let exec_result = runtime.block_on(async {
-			tb_scenario!(@execute_service_client_async multi_specs, specs,
+			#[cfg(feature = "instrument")]
+			let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
+			#[cfg(feature = "instrument")]
+			tb_scenario!(@init_instrumentation instr_mode);
+
+			let result = tb_scenario!(@execute_service_client_async multi_specs, specs,
 				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 				protocol: { $($protocol)? },
 				server: $server_closure,
 				client: $client_closure
-			)
+			);
+
+			result
 		});
 
 		exec_result
@@ -1293,35 +1443,24 @@ macro_rules! tb_scenario {
 		server: $server_closure:expr,
 		client: $client_closure:expr
 	) => {{
-		// Default protocol to TokioListener if not specified
 		type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
-		// Setup server listener
 		let bind_addr = <ProtocolType as $crate::transport::Protocol>::default_bind_address()
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 		let (listener, addr) = <ProtocolType as $crate::transport::Protocol>::bind(bind_addr).await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 
-		// User provides the server setup - pass them the listener
 		let server_handle = ($server_closure)(listener);
 
-		// Build client transport
 		let stream = <ProtocolType as $crate::transport::Protocol>::connect(addr).await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 		let mut client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
-		// Execute client closure
 		let client_result = ($client_closure)(&mut client).await;
 
-		// Collect trace
-		let mut trace = $crate::testing::trace::ConsumedTrace::new();
-		trace.drain_recorded_assertions();
-		trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if client_result.is_err() {
-			trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
+		let mut trace = tb_scenario!(@setup_trace);
+		tb_scenario!(@finalize_trace trace, client_result);
 
-		// Cleanup
 		server_handle.abort();
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1340,35 +1479,24 @@ macro_rules! tb_scenario {
 		server: $server_closure:expr,
 		client: $client_closure:expr
 	) => {{
-		// Default protocol to TokioListener if not specified
 		type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
-		// Setup server listener
 		let bind_addr = <ProtocolType as $crate::transport::Protocol>::default_bind_address()
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 		let (listener, addr) = <ProtocolType as $crate::transport::Protocol>::bind(bind_addr).await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 
-		// User provides the server setup - pass them the listener
 		let server_handle = ($server_closure)(listener);
 
-		// Build client transport
 		let stream = <ProtocolType as $crate::transport::Protocol>::connect(addr).await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 		let mut client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
-		// Execute client closure
 		let client_result = ($client_closure)(&mut client).await;
 
-		// Collect trace
-		let mut trace = $crate::testing::trace::ConsumedTrace::new();
-		trace.drain_recorded_assertions();
-		trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if client_result.is_err() {
-			trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
+		let mut trace = tb_scenario!(@setup_trace);
+		tb_scenario!(@finalize_trace trace, client_result);
 
-		// Cleanup
 		server_handle.abort();
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1413,7 +1541,7 @@ mod tests {
 	use super::*;
 	use crate::testing::assertions::AssertionPhase;
 	use crate::testing::create_test_message;
-	use crate::testing::macros::AssertionCollector;
+	use crate::testing::macros::TraceCollector;
 	use crate::testing::trace::ExecutionMode;
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
@@ -1599,23 +1727,23 @@ mod tests {
 			spec: DemoSpec,
 			environment ServiceClient {
 				worker_threads: 2,
-				server: |assertions: AssertionCollector| async move {
+				server: |trace: TraceCollector| async move {
 					let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
 					let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 					let handle = crate::server! {
 						protocol TokioListener: listener,
-						assertions: assertions,
-						handle: |frame, assertions| async move {
-							tb_assert!(assertions, HandlerStart, "Received");
-							tb_assert!(assertions, Response, "Responded");
-							tb_assert!(assertions, Response, "Responded");
+						assertions: trace,
+						handle: |frame, trace| async move {
+							tb_assert!(trace, HandlerStart, "Received");
+							tb_assert!(trace, Response, "Responded");
+							tb_assert!(trace, Response, "Responded");
 							Some(frame)
 						}
 					};
 
 					Ok((handle, addr))
 				},
-				client: |_assertions: AssertionCollector, mut client| async move {
+				client: |_trace: TraceCollector, mut client| async move {
 					let test_message = create_test_message(None);
 					let test_frame = crate::compose! {
 						V0: id: "test", order: 1u64, message: test_message
@@ -1640,35 +1768,35 @@ mod tests {
 		spec: ClientServerSpec,
 		environment ServiceClient {
 			worker_threads: 2,
-			server: |assertions: AssertionCollector| async move {
+			server: |trace: TraceCollector| async move {
 				let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
 				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 				let handle = crate::server! {
 					protocol TokioListener: listener,
-					assertions: assertions,
-					handle: |frame, assertions| async move {
+					assertions: trace,
+					handle: |frame, trace| async move {
 						// Server-side assertions
-						tb_assert!(assertions, HandlerStart, "Received");
-						tb_assert!(assertions, Response, "Responded");
+						tb_assert!(trace, HandlerStart, "Received");
+						tb_assert!(trace, Response, "Responded");
 						Some(frame)
 					}
 				};
 
 				Ok((handle, addr))
 			},
-			client: |assertions: AssertionCollector, mut client| async move {
+			client: |trace: TraceCollector, mut client| async move {
 				// Client-side assertion before sending
-				tb_assert!(assertions, Response, "Responded");
+				tb_assert!(trace, Response, "Responded");
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
 					V0: id: "test", order: 1u64, message: test_message
-				}?;
+					}?;
 
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				tb_assert!(assertions, HandlerStart, "Received");
+				tb_assert!(trace, HandlerStart, "Received");
 
 				Ok(())
 			}
