@@ -8,7 +8,7 @@
 [![Project Chat][chat-image]][chat-link]
 
 ## Status
-> Warning: This project is under active development. Public APIs and file 
+> Warning: This project is under active development. Public APIs and file
 formats MAY change WITHOUT notice. It is NOT yet production-ready.
 > Warning: Only the `full` feature is currently supported.
 > Info: Information documented in this README is functional but unreleased.
@@ -21,7 +21,7 @@ formats MAY change WITHOUT notice. It is NOT yet production-ready.
 
 ## Abstract
 
-tightbeam is a Layer-5 messaging framework using ASN.1 DER encoding with 
+tightbeam is a Layer-5 messaging framework using ASN.1 DER encoding with
 versioned metadata structures for high-fidelity information transmission.
 
 ## Table of Contents
@@ -119,13 +119,13 @@ versioned metadata structures for high-fidelity information transmission.
 
 ## 1. Introduction
 
-tightbeam defines a structured, versioned messaging protocol with an 
-information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Sections follow 
+tightbeam defines a structured, versioned messaging protocol with an
+information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Sections follow
 a [concept → specification → implementation → testing] pattern.
 
 ### 1.1 Information Fidelity Constraint
 
-tightbeam's design is based on the principle that information transmission 
+tightbeam's design is based on the principle that information transmission
 maintains bounded fidelity: **I(t) ∈ (0,1)** for all time t.
 
 This means:
@@ -153,7 +153,7 @@ The following project terms MUST be used consistently:
 
 ### 3.1 Information Theory Properties
 
-tightbeam implements high-fidelity information transmission through the 
+tightbeam implements high-fidelity information transmission through the
 following bounds:
 
 - **STRUCTURE**: Perfect encoding via ASN.1 DER
@@ -175,7 +175,7 @@ following bounds:
 
 - VERSION 0
   - REQUIRED: Message identification (idempotence)
-  - REQUIRED: Temporal ordering (64-bit integer)  
+  - REQUIRED: Temporal ordering (64-bit integer)
   - OPTIONAL: Compression (enforceable compactness)
 
 - VERSION 1
@@ -192,12 +192,12 @@ following bounds:
 
 ### 4.1.1 SecurityProfile Trait Architecture
 
-tightbeam uses a trait-based security profile system that separates compile-time 
+tightbeam uses a trait-based security profile system that separates compile-time
 algorithm constraints from runtime protocol behavior.
 
 #### Design Principles
 
-The `SecurityProfile` trait defines a pure metadata layer that declares 
+The `SecurityProfile` trait defines a pure metadata layer that declares
 algorithm identifiers (OIDs) for cryptographic operations:
 
 ```rust
@@ -219,13 +219,13 @@ tightbeam separates cryptographic concerns through specialized provider traits:
 - **`KdfProvider`**: Key derivation functions (HKDF)
 - **`CurveProvider`**: Elliptic curve operations (secp256k1, P-384)
 
-These traits compose into `CryptoProvider`, allowing components to specify only 
-the cryptographic capabilities they require rather than depending on the full 
+These traits compose into `CryptoProvider`, allowing components to specify only
+the cryptographic capabilities they require rather than depending on the full
 provider.
 
 ### 4.1.2 Security Profile Types
 
-Applications implement the `SecurityProfile` trait to define their own 
+Applications implement the `SecurityProfile` trait to define their own
 cryptographic algorithm constraints:
 
 #### Implementing Custom Profiles
@@ -257,8 +257,8 @@ impl SecurityProfile for TightbeamProfile {
 }
 ```
 
-Applications can define multiple profiles for different security contexts (e.g., 
-`HighSecurityProfile`, `LegacyProfile`, `QuantumResistantProfile`) and use them 
+Applications can define multiple profiles for different security contexts (e.g.,
+`HighSecurityProfile`, `LegacyProfile`, `QuantumResistantProfile`) and use them
 with different message types.
 
 ### 4.1.3 Numeric Security Levels
@@ -269,8 +269,8 @@ Numeric security levels are a convenience shorthand:
 
 ### 4.1.4 Message-Level Security Requirements
 
-tightbeam supports run-time security profile enforcement at the message type 
-level through the `Message` trait and compile-time security enforcement at 
+tightbeam supports run-time security profile enforcement at the message type
+level through the `Message` trait and compile-time security enforcement at
 the message composition level:
 
 ```rust
@@ -303,7 +303,7 @@ pub trait Message: /* trait bounds */ {
 - AEAD ciphers must match `<Profile::AeadOid as AssociatedOid>::OID`
 - Signature algorithms must match `<Profile::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID`
 
-This ensures that message types with specific security profiles can only be 
+This ensures that message types with specific security profiles can only be
 composed with compatible cryptographic algorithms.
 
 #### Security Requirement Semantics
@@ -397,17 +397,17 @@ struct HighSecurityTransfer { /* fields */ }
 
 ### 4.1.5 CryptoProvider System
 
-The `CryptoProvider` trait composes role-based provider traits to bind concrete 
+The `CryptoProvider` trait composes role-based provider traits to bind concrete
 cryptographic implementations to `SecurityProfile` metadata:
 
 ```rust
-pub trait CryptoProvider: 
-	Default + Clone + 
-	DigestProvider + 
-	AeadProvider + 
-	SigningProvider + 
-	KdfProvider + 
-	CurveProvider 
+pub trait CryptoProvider:
+	Default + Clone +
+	DigestProvider +
+	AeadProvider +
+	SigningProvider +
+	KdfProvider +
+	CurveProvider
 {
 	type Profile: SecurityProfile + Default;
 	fn profile(&self) -> &Self::Profile;
@@ -489,7 +489,7 @@ pub struct Frame {
 
 ## 5. ASN.1 Formal Specification
 
-This section provides the complete ASN.1 definitions for all tightbeam protocol 
+This section provides the complete ASN.1 definitions for all tightbeam protocol
 structures, encoded using Distinguished Encoding Rules (DER).
 
 ### 5.1 Core Types
@@ -669,7 +669,7 @@ enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
 	SignatureAlgorithm;
 ```
 
-Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms 
+Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms
 and SHOULD NOT use MD5 or SHA-1 for new deployments.
 
 ### 5.5 Encoding Rules
@@ -703,45 +703,45 @@ and SHOULD NOT use MD5 or SHA-1 for new deployments.
 - Duplicate `order` values within the same `id` namespace MUST be rejected
 
 #### 5.7.2 Compression Requirements
-- When `compactness` is present (not `None`), the `message` field MUST contain 
+- When `compactness` is present (not `None`), the `message` field MUST contain
 compressed data encoded as `CompressedData` per RFC 3274
-- The `encapContentInfo` within `CompressedData` MUST use the `id-data` content 
+- The `encapContentInfo` within `CompressedData` MUST use the `id-data` content
 type OID if the compressed data does not conform to any recognized content type
-- Compression algorithm identifiers MUST be valid OIDs (e.g., 
-`id-alg-zlibCompress` for zlib, custom OIDs for zstd -- tightbeam uses 
+- Compression algorithm identifiers MUST be valid OIDs (e.g.,
+`id-alg-zlibCompress` for zlib, custom OIDs for zstd -- tightbeam uses
 1.2.840.113549.1.9.16.3 pending formal assignment)
-- Compression level parameters, when specified in 
+- Compression level parameters, when specified in
 `compressionAlgorithm.parameters`, MUST be within algorithm-specific valid ranges
 
 #### 5.7.3 Integrity Semantics: Order of Operations
 
-This section clarifies the relationship between message integrity and frame 
-integrity. The goals are: (1) unambiguous validation semantics, and (2) clear 
+This section clarifies the relationship between message integrity and frame
+integrity. The goals are: (1) unambiguous validation semantics, and (2) clear
 data retention choices.
 
-- Message Integrity (MI): MI MUST be computed over the message payload bytes. 
-When present at the metadata level (i.e., `Metadata.integrity`), MI MUST bind 
+- Message Integrity (MI): MI MUST be computed over the message payload bytes.
+When present at the metadata level (i.e., `Metadata.integrity`), MI MUST bind
 the message body.
-- Frame Integrity (FI): FI MUST be computed over the envelope only (version + 
-metadata; it MUST exclude the message) using DER-canonical encoding. FI MUST 
+- Frame Integrity (FI): FI MUST be computed over the envelope only (version +
+metadata; it MUST exclude the message) using DER-canonical encoding. FI MUST
 bind the envelope around the message and the metadata itself.
 
 Important properties:
-- FI alone MUST NOT be used to prove message content correctness; it ONLY proves 
+- FI alone MUST NOT be used to prove message content correctness; it ONLY proves
 the integrity of the envelope (version + metadata).
-- MI MUST be used to prove message content correctness. Because MI lives in 
-metadata and FI commits to the envelope that contains that metadata, FI 
-therefore witnesses MI. When FI is authenticated (e.g., covered by a signature 
-via nonrepudiation or finalized via consensus), any tampering with MI MUST cause 
-the authenticated FI validation to fail. Receivers SHOULD treat the pair 
-(valid MI, authenticated FI) as sufficient evidence that both envelope and 
-message are intact. Note: an in-band, unsigned FI MUST NOT be relied upon to 
+- MI MUST be used to prove message content correctness. Because MI lives in
+metadata and FI commits to the envelope that contains that metadata, FI
+therefore witnesses MI. When FI is authenticated (e.g., covered by a signature
+via nonrepudiation or finalized via consensus), any tampering with MI MUST cause
+the authenticated FI validation to fail. Receivers SHOULD treat the pair
+(valid MI, authenticated FI) as sufficient evidence that both envelope and
+message are intact. Note: an in-band, unsigned FI MUST NOT be relied upon to
 prevent an active attacker from changing both MI and FI.
 
 ##### Message Integrity with AEAD
 
-When confidentiality is enabled, tightbeam implementations MUST use Authenticated 
-Encryption with Associated Data (AEAD) ciphers. This requirement is enforced at 
+When confidentiality is enabled, tightbeam implementations MUST use Authenticated
+Encryption with Associated Data (AEAD) ciphers. This requirement is enforced at
 the type system level through trait bounds:
 
 ```rust
@@ -753,16 +753,16 @@ where
 This design ensures MI over plaintext is cryptographically sound:
 
 - **Type-level guarantee**: Non-AEAD ciphers cannot be used (compile-time enforcement)
-- **Ciphertext authentication**: AEAD provides built-in authentication tags that prove 
+- **Ciphertext authentication**: AEAD provides built-in authentication tags that prove
 the ciphertext has not been tampered with (e.g., AES-GCM, ChaCha20-Poly1305)
 - **MI purpose**: Proves the decrypted plaintext matches the original message content
-- **Layered security**: AEAD prevents ciphertext tampering, MI proves plaintext 
+- **Layered security**: AEAD prevents ciphertext tampering, MI proves plaintext
 correctness, FI witnesses MI in metadata, signatures cover the entire frame
 
-This approach is cryptographically equivalent to Encrypt-then-MAC when AEAD is 
-enforced, as AEAD ciphers provide both confidentiality and authenticity of the 
-ciphertext. An attacker cannot modify the ciphertext (AEAD authentication fails), 
-cannot modify MI without breaking FI (when FI is signed/consensus-finalized), 
+This approach is cryptographically equivalent to Encrypt-then-MAC when AEAD is
+enforced, as AEAD ciphers provide both confidentiality and authenticity of the
+ciphertext. An attacker cannot modify the ciphertext (AEAD authentication fails),
+cannot modify MI without breaking FI (when FI is signed/consensus-finalized),
 and cannot decrypt without the key.
 
 #### 5.7.4 Previous Frame Chaining
@@ -780,21 +780,21 @@ and cannot decrypt without the key.
 
 This section specifies what the nonrepudiation signature covers when present.
 
-- Signature scope (MUST): The signature MUST be computed over the canonical 
-DER encoding of the Frame fields EXCLUDING the `nonrepudiation` field itself; 
+- Signature scope (MUST): The signature MUST be computed over the canonical
+DER encoding of the Frame fields EXCLUDING the `nonrepudiation` field itself;
 concretely, it MUST cover:
 	- `version`
 	- `metadata` (including MI when present)
 	- `message`
 	- `integrity` (FI) when present
 
-- Security consequence: Any modification to version, metadata (including MI), 
+- Security consequence: Any modification to version, metadata (including MI),
 message, or FI invalidates the signature. This yields the transitive binding:
 	Signature → FI (envelope) → MI (in metadata) → Message body
 
 #### 5.7.6 Security Property Chain
 
-When all security features are enabled (MI, FI, AEAD encryption, and signatures), 
+When all security features are enabled (MI, FI, AEAD encryption, and signatures),
 the complete security property chain operates as follows:
 
 **Sender operations (in order):**
@@ -807,7 +807,7 @@ the complete security property chain operates as follows:
 - Store ciphertext in Frame.message
 4. Compute FI over envelope (Version + Metadata containing MI)
 - Store DigestInfo in Frame
-5. Sign the complete frame (Version + Metadata + ciphertext + FI) 
+5. Sign the complete frame (Version + Metadata + ciphertext + FI)
 - Store SignerInfo in Frame
 
 **Receiver verification (in order):**
@@ -823,7 +823,7 @@ This layered approach provides defense in depth:
 - MI ensures message integrity (proves plaintext correctness after decryption)
 - Signature ensures nonrepudiation (cryptographically binds sender to entire frame)
 
-Any tampering at any layer causes verification to fail, ensuring end-to-end 
+Any tampering at any layer causes verification to fail, ensuring end-to-end
 integrity and authenticity guarantees.
 
 ### 5.9 What is the Matrix?
@@ -925,8 +925,8 @@ count, or map public keys to coordinate regions).
 
 #### 5.9.6 Advanced: Modeling with Matrix and Previous Frame
 
-The matrix, combined with the `previous_frame` field, enables sophisticated 
-state tracking, modeled as a directed acyclic graph (DAG) of state transitions. 
+The matrix, combined with the `previous_frame` field, enables sophisticated
+state tracking, modeled as a directed acyclic graph (DAG) of state transitions.
 Mathematically, frames form a Markov chain where each matrix **M_t** at time
 t depends on **M_{t-1}**, linked via cryptographic hashes in `previous_frame`.
 
@@ -945,7 +945,7 @@ by hash consistency and partial state recovery.
 
 #### 5.9.7 Summary
 
-The matrix supports flexible state representation, from simple flags to 
+The matrix supports flexible state representation, from simple flags to
 structured data encoding allowing for dynamic computation.
 
 ### 5.10 Complete ASN.1 Module
@@ -1119,7 +1119,7 @@ DER tag-length-value encoding provides inherent framing. Default size limits:
 
 ### 8.3 TCP Transport
 
-TCP transport bridges byte streams with message-oriented Frame API using DER 
+TCP transport bridges byte streams with message-oriented Frame API using DER
 length-prefixed envelopes. Supports both `std::net` (sync) and `tokio` (async).
 
 **Example:**
@@ -1386,7 +1386,7 @@ Uses RFC 5652 Cryptographic Message Syntax with:
 
 **Mutual Authentication Flow:**
 
-For mutual authentication, client includes certificate and signs transcript in 
+For mutual authentication, client includes certificate and signs transcript in
 ClientKeyExchange:
 
 ```
@@ -1437,9 +1437,9 @@ Server Side - Verifying Client Authentication:
 
 **Overview:**
 
-Lightweight alternative using ECIES (Elliptic Curve Integrated Encryption 
-Scheme) for key encapsulation. Compact structures without ASN.1 
-EnvelopedData/SignedData overhead, suitable for resource-constrained 
+Lightweight alternative using ECIES (Elliptic Curve Integrated Encryption
+Scheme) for key encapsulation. Compact structures without ASN.1
+EnvelopedData/SignedData overhead, suitable for resource-constrained
 environments or applications requiring minimal wire format complexity.
 
 **Key Differences from CMS:**
@@ -1450,7 +1450,7 @@ environments or applications requiring minimal wire format complexity.
 
 **Mutual Authentication Flow:**
 
-For mutual authentication, client includes certificate and signs transcript in 
+For mutual authentication, client includes certificate and signs transcript in
 ClientKeyExchange:
 
 ```
@@ -1583,7 +1583,7 @@ Both protocols provide identical security properties:
 
 #### 8.5.5 Security Profile Negotiation
 
-Both CMS and ECIES handshake protocols support cryptographic algorithm 
+Both CMS and ECIES handshake protocols support cryptographic algorithm
 negotiation through `SecurityProfile` descriptors:
 
 **Negotiation Process:**
@@ -1674,11 +1674,11 @@ independently audited. We welcome help in this area.
 
 ### 9.2 Efficient Exchange-Compute Interconnect
 
-The Efficient Exchange-Compute Interconnect or EECI is a software development 
-paradigm inspired by the entomological world. As threads and tunnels underpin 
-the basics of processing and communication, we can start at these base levels 
-and develop from here. The goal of EECI is to operate on these base layers 
-across any transmission protocol: 
+The Efficient Exchange-Compute Interconnect or EECI is a software development
+paradigm inspired by the entomological world. As threads and tunnels underpin
+the basics of processing and communication, we can start at these base levels
+and develop from here. The goal of EECI is to operate on these base layers
+across any transmission protocol:
 - thread-thread.
 - thread-port-thread.
 
@@ -1691,17 +1691,17 @@ There are four main components to the EECI:
 - [Drone/Hive](#934-i-drones--hives) - Interconnected infrastructure
 
 Think of workers as ants, servlets as ant hills, and clusters as ant colonies.
-Insects have specific functions for which they process organic matter 
-using local information. These functions are often simple, but when combined 
-in large numbers, they can perform complex tasks. The efficiency of each unit 
-is attributed to  their fungible nature--how well it can accomplish its 
-singular task. 
+Insects have specific functions for which they process organic matter
+using local information. These functions are often simple, but when combined
+in large numbers, they can perform complex tasks. The efficiency of each unit
+is attributed to  their fungible nature--how well it can accomplish its
+singular task.
 
 #### 9.3.1 E: Workers
 
 Workers are the smallest unit of computation. They must be single-threaded and
-handle a single message at a time. Workers are the "ants" of the EECI. Insects 
-have a head, thorax, and abdomen. Workers have the following similarly 
+handle a single message at a time. Workers are the "ants" of the EECI. Insects
+have a head, thorax, and abdomen. Workers have the following similarly
 inspired structure:
 
 ```rust
@@ -1722,15 +1722,15 @@ tightbeam::worker! {
 ```
 
 Not unlike supraorganisms, we can name them, and their "head" may possess
-a specific configuration (config). They may or may not have receptors which 
+a specific configuration (config). They may or may not have receptors which
 can be used to optionally gate messages. The "thorax" is itself the container
-for which isolates the entity within its own scoped thread--locality. Finally, 
+for which isolates the entity within its own scoped thread--locality. Finally,
 its "abdomen" is the handle which digests the message and produces a response.
 
-The important thing to note is that workers operate on local information 
-within their bounded scope. They are not aware of the larger system and only 
-operate on the message they are given. This is a critical aspect of the EECI 
-and allows for a high degree of parallelism and fault tolerance. As a result, 
+The important thing to note is that workers operate on local information
+within their bounded scope. They are not aware of the larger system and only
+operate on the message they are given. This is a critical aspect of the EECI
+and allows for a high degree of parallelism and fault tolerance. As a result,
 they do not have access to the full Frame nor should they need it.
 
 ##### Testing
@@ -1768,7 +1768,7 @@ tightbeam::test_worker! {
 #### 9.3.2 E: Servlets
 
 Servlets are "anthills" in the sense they operate on a specific protocol. From
-a TCP/IP perspective, an anthill is a port in many ways. Servlets are 
+a TCP/IP perspective, an anthill is a port in many ways. Servlets are
 multi-threaded and must handle messages asynchronously. A servlet may also
 define as many different workers as it needs to accomplish its task as well
 as a set of configurations. Servlets must be provided a relay which is used to
@@ -1815,8 +1815,8 @@ tightbeam::servlet! {
 }
 ```
 
-Workers may process the message in parallel and have the results combined into 
-a single response. 
+Workers may process the message in parallel and have the results combined into
+a single response.
 
 ##### Testing
 Testing servlets is simple and a container is provided:
@@ -1859,13 +1859,13 @@ tightbeam::test_servlet! {
 
 #### 9.3.3 C: Clusters
 
-Clusters orchestrate multiple servlets and workers. They are the "ant colonies" 
+Clusters orchestrate multiple servlets and workers. They are the "ant colonies"
 of the EECI. Colonies are made up of multiple servlets which command different
-workers. Clusters are multi-threaded and must handle messages asynchronously. 
-Clusters may also define a configuration and as many different servlets as it 
-needs to handle its purpose. While servlets are given a relay, clusters must be 
-provided a router. Routers can emit messages to the servlets registered within 
-the cluster. 
+workers. Clusters are multi-threaded and must handle messages asynchronously.
+Clusters may also define a configuration and as many different servlets as it
+needs to handle its purpose. While servlets are given a relay, clusters must be
+provided a router. Routers can emit messages to the servlets registered within
+the cluster.
 
 ```rust
 TODO
@@ -1873,23 +1873,23 @@ TODO
 
 #### 9.3.4 I: Drones & Hives
 
-Drones are containerized servlet runners that can dynamically morph between 
-different servlet types based on command messages from a cluster. This 
+Drones are containerized servlet runners that can dynamically morph between
+different servlet types based on command messages from a cluster. This
 allows you to seed your application over a specific protocol and then morph
 into any known servlet type at runtime.
 
-Hives are an extension of drones that can manage multiple servlets 
-simultaneously. They are useful for managing a pool of servlets that can be 
-activated on demand. Hives must only be available on 
-[Mycelial](src/transport/mod.rs) protocols which support multiple ports 
-per address. Hives should automatically maintain exactly the number of servlets 
+Hives are an extension of drones that can manage multiple servlets
+simultaneously. They are useful for managing a pool of servlets that can be
+activated on demand. Hives must only be available on
+[Mycelial](src/transport/mod.rs) protocols which support multiple ports
+per address. Hives should automatically maintain exactly the number of servlets
 required to efficiently process messages from the cluster.
 
 ##### "Mycelial" Protocols
 
 Protocols such as TCP are considered "mycelial" as they operate over a single
-address but can have multiple ports (SocketAddress). This allows the hive to 
-establish a servlet on different ports and provide the protocol address to the 
+address but can have multiple ports (SocketAddress). This allows the hive to
+establish a servlet on different ports and provide the protocol address to the
 cluster so it can register it under its hive.
 
 ```rust
@@ -1898,7 +1898,7 @@ TODO
 
 ##### Conclusion
 
-How you wish to model your colonies is beyond the scope of this document. 
+How you wish to model your colonies is beyond the scope of this document.
 However, it is important to understand the basic building blocks and how they
 can be combined to create complex systems. The swarm is yours to command.
 
@@ -1921,28 +1921,28 @@ Declarative multi‑version assertion specs with deterministic hashing:
 ```
 tb_assert_spec! {
 	pub MySpec,
-	V(1,0,0): { 
-		mode: Accept, 
-		gate: Accepted, 
-		assertions: [ 
-			(HandlerStart, "Received", exactly!(1)) 
-		] 
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "Received", exactly!(1))
+		]
 	},
-	V(1,1,0): { 
-		mode: Accept, 
-		gate: Accepted, 
-		assertions: [ 
-			(HandlerStart, "Received", exactly!(1)), 
-			(Response, "Responded", exactly!(2)) 
-		] 
+	V(1,1,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "Received", exactly!(1)),
+			(Response, "Responded", exactly!(2))
+		]
 	},
 }
 ```
 
 Version blocks: `V(maj,min,patch): { mode: <ExecutionMode>, gate: <TransitStatus>, assertions: [ (Phase, label, cardinality), ... ] }` (+ optional `events: [Kind,..]` when instrumentation enabled).
 
-Hash: 32‑byte Sha3‑256 over domain tag `TBSP`, version triple, spec id, mode 
-code, gate (presence + value), normalized assertions (sorted by `(label, phase)`), 
+Hash: 32‑byte Sha3‑256 over domain tag `TBSP`, version triple, spec id, mode
+code, gate (presence + value), normalized assertions (sorted by `(label, phase)`),
 and optional event kinds.
 
 Accessors:
@@ -1956,33 +1956,33 @@ Example:
 ```rust
 tb_assert_spec! {
 	pub DemoSpec,
-	V(1,0,0): { 
-		mode: Accept, 
-		gate: Accepted, 
-		assertions: [ 
-			(HandlerStart, "A", exactly!(1)), 
-			(Response, "R", exactly!(1)) 
-		] 
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "A", exactly!(1)),
+			(Response, "R", exactly!(1))
+		]
 	},
-	V(1,1,0): { 
-		mode: Accept, 
-		gate: Accepted, 
-		assertions: [ 
-			(HandlerStart, "A", exactly!(1)), 
-			(Response, "R", exactly!(2)) 
-		] 
+	V(1,1,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "A", exactly!(1)),
+			(Response, "R", exactly!(2))
+		]
 	},
 }
 assert_ne!(DemoSpec::get(1,0,0).unwrap().spec_hash(), DemoSpec::get(1,1,0).unwrap().spec_hash());
 assert_eq!(DemoSpec::latest().version(), (1,1,0));
 ```
 
-Future additions will layer scenario execution and process/refinement modeling 
+Future additions will layer scenario execution and process/refinement modeling
 atop this core.
 
 ### 10.2 Scenario Macro: `tb_scenario!`
 
-`tb_scenario!` is the unified entry point for all testing layers. It executes 
+`tb_scenario!` is the unified entry point for all testing layers. It executes
 an AssertSpec under a selectable environment with optional CSP and FDR verification.
 
 #### Syntax
@@ -2019,29 +2019,29 @@ environment ServiceClient {
 	worker_threads: <u16>,
 	service_policies: { with_collector_gate: [..] } OPTIONAL,
 	client_policies:  { with_emitter_gate:   [..] } OPTIONAL,
-	service: |frame, tx| async move { /* business logic emitting tb_assert! */ },
-	client: |client| async move { /* compose and send frame */ },
+	service: |frame, trace| async move { /* business logic with trace.assert() */ },
+	client: |trace, client| async move { /* compose and send frame */ },
 }
 ```
 
 **Worker**: Single local worker relay
 ```rust
 environment Worker {
-	setup: || <WorkerType::start(...)>,
-	stimulus: |worker| async move { /* relay messages, call tb_assert! */ },
+	setup: |trace| <WorkerType::start(...)>,
+	stimulus: |trace, worker| async move { /* relay messages, call trace.assert() */ },
 }
 ```
 
 **Bare**: Pure logic/function invocation
 ```rust
 environment Bare {
-	exec: || async { /* pure logic, may call tb_assert!; return Result */ },
+	exec: |trace| async { /* pure logic, may call trace.assert(); return Result */ },
 }
 ```
 
 ### 10.3 ProcessSpec (Layer 2: CSP Modeling)
 
-ProcessSpec defines labeled transition systems (LTS) for formal process 
+ProcessSpec defines labeled transition systems (LTS) for formal process
 modeling. Enabled with `testing-csp` feature flag.
 
 #### Syntax
@@ -2084,7 +2084,7 @@ impl ProcessName {
 
 ### 10.4 Refinement Checking (Layer 3: FDR)
 
-Refinement checking provides multi-seed exploration for trace and failures 
+Refinement checking provides multi-seed exploration for trace and failures
 refinement. Enabled with `testing-fdr` feature flag.
 
 #### Syntax
@@ -2190,30 +2190,29 @@ fn test_client_server_all_layers() {
 		},
 		environment ServiceClient {
 			worker_threads: 2,
-			server: |assertions| async move {
+			server: |trace| async move {
 				let bind_addr = "127.0.0.1:0".parse().unwrap();
 				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 				let handle = crate::server! {
 					protocol TokioListener: listener,
-					assertions: assertions,
-					handle: |frame, assertions| async move {
-						tb_assert!(assertions, HandlerStart, "connect");
-						tb_assert!(assertions, HandlerStart, "request");
-						tb_assert!(assertions, Response, "response");
+					handle: |frame, trace| async move {
+						trace.assert(AssertionPhase::HandlerStart, "connect");
+						trace.assert(AssertionPhase::HandlerStart, "request");
+						trace.assert(AssertionPhase::Response, "response");
 						Some(frame)
 					}
 				};
 				Ok((handle, addr))
 			},
-			client: |assertions, mut client| async move {
-				tb_assert!(assertions, Response, "response");
+			client: |trace, mut client| async move {
+				trace.assert(AssertionPhase::Response, "response");
 				let frame = crate::compose! {
 					V0: id: "test",
 					order: 1u64,
 					message: TestMessage {}
 				}?;
 				let _response = client.emit(frame, None).await?;
-				tb_assert!(assertions, Response, "disconnect");
+				trace.assert(AssertionPhase::Response, "disconnect");
 				Ok(())
 			}
 		},
@@ -2222,11 +2221,11 @@ fn test_client_server_all_layers() {
 				// Layer 1: Assertions verified
 				assert_eq!(trace.assertion_count("connect"), 1);
 				assert_eq!(trace.assertion_count("request"), 1);
-				
+
 				// Layer 2: CSP trace valid
 				assert!(trace.csp_valid());
 				assert!(trace.terminated_in_valid_state());
-				
+
 				// Layer 3: Refinement properties hold
 				assert!(trace.fdr_verdict.trace_refines);
 				assert!(trace.fdr_verdict.failures_refines);
@@ -2262,8 +2261,8 @@ This test verifies:
 
 ### 10.7 Relationship to Formal CSP Theory
 
-Tightbeam's testing framework implements the three semantic models from 
-Communicating Sequential Processes (CSP) theory, providing rigorous formal 
+Tightbeam's testing framework implements the three semantic models from
+Communicating Sequential Processes (CSP) theory, providing rigorous formal
 verification capabilities:
 
 #### 10.7.1 Three Semantic Models
@@ -2274,23 +2273,23 @@ verification capabilities:
 | **Stable Failures (F)** | L2 ProcessSpec | Valid refusals at choice points | failures(Impl) ⊆ failures(Spec) |
 | **Failures-Divergences (FD)** | L3 FDR | Livelock freedom (no τ-loops) | divergences(Impl) = ∅ |
 
-**Traces Model**: Verifies that all observable event sequences produced by the 
-implementation are allowed by the specification. This ensures basic behavioral 
+**Traces Model**: Verifies that all observable event sequences produced by the
+implementation are allowed by the specification. This ensures basic behavioral
 correctness—the system never produces an unexpected sequence of external events.
 
-**Stable Failures Model**: Extends trace verification by checking what events a 
-process can *refuse* after each trace. A stable state is one where no internal 
-progress (τ-transitions) can occur. At choice points, the implementation must 
+**Stable Failures Model**: Extends trace verification by checking what events a
+process can *refuse* after each trace. A stable state is one where no internal
+progress (τ-transitions) can occur. At choice points, the implementation must
 not refuse events the specification accepts, preventing incorrect nondeterminism.
 
-**Failures-Divergences Model**: Adds divergence detection to identify processes 
-that can make infinite internal progress without external interaction. A divergence 
-is a τ-loop where the process never becomes stable. The `max_internal_run` 
+**Failures-Divergences Model**: Adds divergence detection to identify processes
+that can make infinite internal progress without external interaction. A divergence
+is a τ-loop where the process never becomes stable. The `max_internal_run`
 parameter bounds consecutive hidden events to detect such livelocks.
 
 #### 10.7.2 Observable vs. Hidden Events
 
-CSP distinguishes between observable events (external alphabet Σ) and hidden 
+CSP distinguishes between observable events (external alphabet Σ) and hidden
 events (internal actions τ). This distinction is fundamental to process refinement:
 
 ```rust
@@ -2299,7 +2298,7 @@ tb_process_spec! {
     events {
         // Observable alphabet (Σ): externally visible protocol events
         observable { "connect", "request", "response", "disconnect" }
-        
+
         // Hidden alphabet (τ): internal implementation details
         hidden { "serialize", "encrypt", "decrypt", "deserialize" }
     }
@@ -2307,12 +2306,12 @@ tb_process_spec! {
 }
 ```
 
-**Observable events** represent the process's contract with its environment. 
-These form the basis of trace refinement—implementations and specifications must 
+**Observable events** represent the process's contract with its environment.
+These form the basis of trace refinement—implementations and specifications must
 agree on observable behavior.
 
-**Hidden events** model internal implementation details. They enable refinement 
-checking where implementations contain details absent from abstract specifications. 
+**Hidden events** model internal implementation details. They enable refinement
+checking where implementations contain details absent from abstract specifications.
 Hidden events are projected away when comparing traces: `trace \ {τ}`.
 
 The instrumentation taxonomy (§10.8.2) maps tightbeam events to CSP categories:
@@ -2325,35 +2324,35 @@ CSP provides two choice operators:
 - **External choice (□)**: Environment selects which event occurs
 - **Internal choice (⊓)**: Process selects non-deterministically
 
-At choice points, a process has an *acceptance set* (events it can engage) and 
-*refusal set* (events it cannot engage in stable state). Failures refinement 
+At choice points, a process has an *acceptance set* (events it can engage) and
+*refusal set* (events it cannot engage in stable state). Failures refinement
 ensures implementations don't introduce invalid refusals:
 
 ```rust
 states {
     // External choice: environment determines next event
     Connected  => { "request" => Processing, "disconnect" => Idle }
-    
+
     // Internal choice: process may non-deterministically choose path
     Processing => { "response" => Responded, "error" => ErrorState }
 }
 choice { Processing }  // Annotate nondeterministic states
 ```
 
-The `choice` annotation declares states where internal nondeterminism may occur. 
-FDR exploration uses different seeds to explore all possible nondeterministic 
+The `choice` annotation declares states where internal nondeterminism may occur.
+FDR exploration uses different seeds to explore all possible nondeterministic
 branches, ensuring the specification covers all implementation behaviors.
 
 #### 10.7.4 Multi-Seed Exploration and Scheduler Interleaving
 
-Based on research by Pedersen & Chalmers (2024), refinement in cooperatively 
-scheduled systems depends on resource availability. With `n` concurrent processes 
-and `m` schedulers where `m < n`, some traces become impossible due to scheduling 
+Based on research by Pedersen & Chalmers (2024), refinement in cooperatively
+scheduled systems depends on resource availability. With `n` concurrent processes
+and `m` schedulers where `m < n`, some traces become impossible due to scheduling
 constraints.
 
-**Tightbeam addresses this through multi-seed exploration**: Each seed represents 
-a different scheduling strategy, exploring alternative interleaving of concurrent 
-events. This is analogous to testing with different numbers of schedulers to 
+**Tightbeam addresses this through multi-seed exploration**: Each seed represents
+a different scheduling strategy, exploring alternative interleaving of concurrent
+events. This is analogous to testing with different numbers of schedulers to
 verify behavior across resource constraints:
 
 ```rust
@@ -2365,7 +2364,7 @@ fdr: FdrConfig {
 }
 ```
 
-At nondeterministic choice points, the seed determines which branch to explore. 
+At nondeterministic choice points, the seed determines which branch to explore.
 Across all seeds, the framework verifies that:
 1. **Trace refinement**: All observable traces are valid
 2. **Failures refinement**: No invalid refusals at choice points
@@ -2381,14 +2380,14 @@ pub struct FdrVerdict {
     pub trace_refines: bool,           // Spec ⊑T Impl
     pub failures_refines: bool,        // Spec ⊑F Impl
     pub divergence_free: bool,         // No τ-loops detected
-    
+
     // Determinism analysis
     pub is_deterministic: bool,        // No nondeterminism witnesses
     pub determinism_witness: Option<(Trace, Event)>,
-    
+
     // Divergence witness
     pub divergence_witness: Option<Vec<Event>>,  // τ-loop if found
-    
+
     // Statistics
     pub traces_explored: usize,
     pub states_visited: usize,
@@ -2396,17 +2395,17 @@ pub struct FdrVerdict {
 }
 ```
 
-**Determinism checking**: FDR searches for witnesses to nondeterminism—a trace 
-and event where the process both accepts and refuses that event. If found, the 
+**Determinism checking**: FDR searches for witnesses to nondeterminism—a trace
+and event where the process both accepts and refuses that event. If found, the
 witness indicates unintended nondeterminism not declared via `choice`.
 
-**Divergence witness**: If a τ-loop is detected (consecutive hidden events 
-exceeding `max_internal_run`), the witness provides the internal event sequence 
+**Divergence witness**: If a τ-loop is detected (consecutive hidden events
+exceeding `max_internal_run`), the witness provides the internal event sequence
 causing livelock.
 
 #### 10.7.6 CSPM Export for FDR4 Integration
 
-Tightbeam can export process specifications as CSPM (CSP Machine-readable) 
+Tightbeam can export process specifications as CSPM (CSP Machine-readable)
 format for verification with external tools like FDR4:
 
 ```rust
@@ -2442,14 +2441,14 @@ hooks {
         // Trace validity
         assert!(trace.csp_valid());
         assert!(trace.terminated_in_valid_state());
-        
+
         // Assertion counts
         assert_eq!(trace.assertion_count("connect"), 1);
-        
+
         // Event projection
         let observable = trace.project_to_observable();
         let hidden = trace.project_to_hidden();
-        
+
         // Refinement properties
         assert!(trace.fdr_verdict.trace_refines);
         assert!(trace.fdr_verdict.failures_refines);
@@ -2719,5 +2718,5 @@ The workspace consists of the following components:
 [chat-image]: https://img.shields.io/badge/chat-Discussions-blue?logo=github
 [chat-link]: https://github.com/wahidgroup/tightbeam/discussions
 
-#### Future 
+#### Future
 - tightbeam-os

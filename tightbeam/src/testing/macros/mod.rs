@@ -674,72 +674,6 @@ macro_rules! tb_assert_spec {
 	};
 }
 
-// Runtime assertion emission macro.
-// Forms:
-// tb_assert!(PhaseIdent, LabelIdent);
-// tb_assert!(PhaseIdent, LabelIdent => payload_expr);
-// tb_assert!(PhaseIdent, "free_label");
-// tb_assert!(PhaseIdent, "free_label" => payload_expr);
-// tb_assert!(assertions, PhaseIdent, LabelIdent);
-// tb_assert!(assertions, PhaseIdent, LabelIdent => payload_expr);
-// tb_assert!(assertions, PhaseIdent, "free_label");
-// tb_assert!(assertions, PhaseIdent, "free_label" => payload_expr);
-// The payload expression MUST implement AsRef<[u8]>.
-#[macro_export]
-macro_rules! tb_assert {
-	// Forms WITH explicit assertions collector (for ServiceClient)
-	($trace:expr, $phase:ident, $label:ident) => {{
-		$trace.assert($crate::testing::assertions::AssertionPhase::$phase, stringify!($label));
-	}};
-	($trace:expr, $phase:ident, $label:ident => $payload:expr) => {{
-		let __c = $crate::testing::macros::__encode_payload(&$payload);
-		$trace.assert_with_payload(
-			$crate::testing::assertions::AssertionPhase::$phase,
-			stringify!($label),
-			Some(__c.as_ref()),
-		);
-	}};
-	($trace:expr, $phase:ident, $label:literal) => {{
-		$trace.assert($crate::testing::assertions::AssertionPhase::$phase, $label);
-	}};
-	($trace:expr, $phase:ident, $label:literal => $payload:expr) => {{
-		let __c = $crate::testing::macros::__encode_payload(&$payload);
-		$trace.assert_with_payload($crate::testing::assertions::AssertionPhase::$phase, $label, Some(__c.as_ref()));
-	}};
-
-	// Forms WITHOUT collector (backward compatibility - uses thread-local)
-	($phase:ident, $label:ident) => {{
-		$crate::testing::assertions::record_assertion(
-			$crate::testing::assertions::AssertionPhase::$phase,
-			stringify!($label),
-			None,
-		);
-	}};
-	($phase:ident, $label:ident => $payload:expr) => {{
-		let __c = $crate::testing::macros::__encode_payload(&$payload);
-		$crate::testing::assertions::record_assertion(
-			$crate::testing::assertions::AssertionPhase::$phase,
-			stringify!($label),
-			Some(__c.as_ref()),
-		);
-	}};
-	($phase:ident, $label:literal) => {{
-		$crate::testing::assertions::record_assertion(
-			$crate::testing::assertions::AssertionPhase::$phase,
-			$label,
-			None,
-		);
-	}};
-	($phase:ident, $label:literal => $payload:expr) => {{
-		let __c = $crate::testing::macros::__encode_payload(&$payload);
-		$crate::testing::assertions::record_assertion(
-			$crate::testing::assertions::AssertionPhase::$phase,
-			$label,
-			Some(__c.as_ref()),
-		);
-	}};
-}
-
 // ---------------------------------------------------------------------------
 // Scenario macro MVP: Worker & Bare variants (ServiceClient stubbed)
 // ---------------------------------------------------------------------------
@@ -1171,8 +1105,26 @@ macro_rules! tb_scenario {
 		#[cfg(feature = "instrument")]
 		tb_scenario!(@init_instrumentation instr_mode);
 
+		// Create TraceCollector for explicit passing
+		let trace_collector = $crate::testing::macros::TraceCollector::new();
+		let trace_exec = trace_collector.clone();
+
+		// Helper function to enable type inference for exec closure (synchronous)
+		fn __call_exec_closure<F>(
+			closure: F,
+			trace: $crate::testing::macros::TraceCollector,
+		) -> Result<(), $crate::TightBeamError>
+		where
+			F: FnOnce($crate::testing::macros::TraceCollector) -> Result<(), $crate::TightBeamError>,
+		{
+			closure(trace)
+		}
+
+		let exec_result = __call_exec_closure($exec_closure, trace_exec);
+
+		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
-		let exec_result: Result<(), $crate::TightBeamError> = $exec_closure();
+		trace.populate_from_collector(&trace_collector);
 
 		#[cfg(feature = "instrument")]
 		tb_scenario!(@finalize_instrumentation trace, instr_mode);
@@ -1198,8 +1150,26 @@ macro_rules! tb_scenario {
 		#[cfg(feature = "instrument")]
 		tb_scenario!(@init_instrumentation instr_mode);
 
+		// Create TraceCollector for explicit passing
+		let trace_collector = $crate::testing::macros::TraceCollector::new();
+		let trace_exec = trace_collector.clone();
+
+		// Helper function to enable type inference
+		fn __call_exec_closure<F>(
+			closure: F,
+			trace: $crate::testing::macros::TraceCollector,
+		) -> Result<(), $crate::TightBeamError>
+		where
+			F: FnOnce($crate::testing::macros::TraceCollector) -> Result<(), $crate::TightBeamError>,
+		{
+			closure(trace)
+		}
+
+		let exec_result = __call_exec_closure($exec_closure, trace_exec);
+
+		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
-		let exec_result: Result<(), $crate::TightBeamError> = $exec_closure();
+		trace.populate_from_collector(&trace_collector);
 
 		#[cfg(feature = "instrument")]
 		tb_scenario!(@finalize_instrumentation trace, instr_mode);
@@ -1222,9 +1192,39 @@ macro_rules! tb_scenario {
 		#[cfg(feature = "instrument")]
 		tb_scenario!(@init_instrumentation instr_mode);
 
+		// Create TraceCollector for explicit passing
+		let trace_collector = $crate::testing::macros::TraceCollector::new();
+		let trace_setup = trace_collector.clone();
+		let trace_stimulus = trace_collector.clone();
+
+		// Helper functions to enable type inference (synchronous)
+		fn __call_setup_closure<F, W>(
+			closure: F,
+			trace: $crate::testing::macros::TraceCollector,
+		) -> W
+		where
+			F: FnOnce($crate::testing::macros::TraceCollector) -> W,
+		{
+			closure(trace)
+		}
+
+		fn __call_stimulus_closure<F, W>(
+			closure: F,
+			trace: $crate::testing::macros::TraceCollector,
+			worker: &mut W,
+		) -> Result<(), $crate::TightBeamError>
+		where
+			F: FnOnce($crate::testing::macros::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
+		{
+			closure(trace, worker)
+		}
+
+		let mut worker = __call_setup_closure($setup_closure, trace_setup);
+		let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
+
+		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
-		let mut worker = $setup_closure();
-		let exec_result = $stimulus_closure(&mut worker);
+		trace.populate_from_collector(&trace_collector);
 
 		#[cfg(feature = "instrument")]
 		tb_scenario!(@finalize_instrumentation trace, instr_mode);
@@ -1250,9 +1250,39 @@ macro_rules! tb_scenario {
 		#[cfg(feature = "instrument")]
 		tb_scenario!(@init_instrumentation instr_mode);
 
+		// Create TraceCollector for explicit passing
+		let trace_collector = $crate::testing::macros::TraceCollector::new();
+		let trace_setup = trace_collector.clone();
+		let trace_stimulus = trace_collector.clone();
+
+		// Helper functions to enable type inference
+		fn __call_setup_closure<F, W>(
+			closure: F,
+			trace: $crate::testing::macros::TraceCollector,
+		) -> W
+		where
+			F: FnOnce($crate::testing::macros::TraceCollector) -> W,
+		{
+			closure(trace)
+		}
+
+		fn __call_stimulus_closure<F, W>(
+			closure: F,
+			trace: $crate::testing::macros::TraceCollector,
+			worker: &mut W,
+		) -> Result<(), $crate::TightBeamError>
+		where
+			F: FnOnce($crate::testing::macros::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
+		{
+			closure(trace, worker)
+		}
+
+		let mut worker = __call_setup_closure($setup_closure, trace_setup);
+		let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
+
+		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
-		let mut worker = $setup_closure();
-		let exec_result = $stimulus_closure(&mut worker);
+		trace.populate_from_collector(&trace_collector);
 
 		#[cfg(feature = "instrument")]
 		tb_scenario!(@finalize_instrumentation trace, instr_mode);
@@ -1618,10 +1648,10 @@ mod tests {
 		let result = tb_scenario! {
 			spec: DemoSpec,
 			environment Bare {
-				exec: || {
-					tb_assert!(HandlerStart, "Received");
-					tb_assert!(Response, "Responded");
-					tb_assert!(Response, "Responded");
+				exec: |trace| {
+					trace.assert(AssertionPhase::HandlerStart, "Received");
+					trace.assert(AssertionPhase::Response, "Responded");
+					trace.assert(AssertionPhase::Response, "Responded");
 					Ok(())
 				}
 			},
@@ -1641,9 +1671,9 @@ mod tests {
 		let result = tb_scenario! {
 			specs: [DemoSpec::get(1, 0, 0)],
 			environment Bare {
-				exec: || {
-					tb_assert!(HandlerStart, "Received");
-					tb_assert!(Response, "Responded");
+				exec: |trace| {
+					trace.assert(AssertionPhase::HandlerStart, "Received");
+					trace.assert(AssertionPhase::Response, "Responded");
 					Ok(())
 				}
 			}
@@ -1662,9 +1692,9 @@ mod tests {
 		let _result = tb_scenario! {
 			specs: [DemoSpec::get(1, 0, 0), DemoSpec::get(1, 1, 0)],
 			environment Bare {
-				exec: || {
-					tb_assert!(HandlerStart, "Received");
-					tb_assert!(Response, "Responded");
+				exec: |trace| {
+					trace.assert(AssertionPhase::HandlerStart, "Received");
+					trace.assert(AssertionPhase::Response, "Responded");
 					Ok(())
 				}
 			}
@@ -1674,18 +1704,19 @@ mod tests {
 	// Simple worker struct for testing
 	struct TestWorker {
 		received_count: usize,
+		trace: TraceCollector,
 	}
 
 	impl TestWorker {
-		fn new() -> Self {
-			Self { received_count: 0 }
+		fn new(trace: TraceCollector) -> Self {
+			Self { received_count: 0, trace }
 		}
 
 		fn process(&mut self) -> Result<(), crate::TightBeamError> {
-			tb_assert!(HandlerStart, "Received");
+			self.trace.assert(AssertionPhase::HandlerStart, "Received");
 			self.received_count += 1;
-			tb_assert!(Response, "Responded");
-			tb_assert!(Response, "Responded");
+			self.trace.assert(AssertionPhase::Response, "Responded");
+			self.trace.assert(AssertionPhase::Response, "Responded");
 			Ok(())
 		}
 	}
@@ -1695,8 +1726,8 @@ mod tests {
 		let result: Result<(), crate::TightBeamError> = tb_scenario! {
 			spec: DemoSpec,
 			environment Worker {
-				setup: || TestWorker::new(),
-				stimulus: |worker: &mut TestWorker| worker.process()
+				setup: |trace| TestWorker::new(trace),
+				stimulus: |_trace, worker: &mut TestWorker| worker.process()
 			}
 		};
 		assert!(result.is_ok());
@@ -1707,11 +1738,11 @@ mod tests {
 		let result: Result<(), crate::TightBeamError> = tb_scenario! {
 			specs: [DemoSpec::get(1, 0, 0)],
 			environment Worker {
-				setup: || TestWorker::new(),
-				stimulus: |worker: &mut TestWorker| {
-					tb_assert!(HandlerStart, "Received");
+				setup: |trace| TestWorker::new(trace),
+				stimulus: |trace, worker: &mut TestWorker| {
+					trace.assert(AssertionPhase::HandlerStart, "Received");
 					worker.received_count += 1;
-					tb_assert!(Response, "Responded");
+					trace.assert(AssertionPhase::Response, "Responded");
 					Ok(())
 				}
 			}
@@ -1734,9 +1765,9 @@ mod tests {
 						protocol TokioListener: listener,
 						assertions: trace,
 						handle: |frame, trace| async move {
-							tb_assert!(trace, HandlerStart, "Received");
-							tb_assert!(trace, Response, "Responded");
-							tb_assert!(trace, Response, "Responded");
+							trace.assert(AssertionPhase::HandlerStart, "Received");
+							trace.assert(AssertionPhase::Response, "Responded");
+							trace.assert(AssertionPhase::Response, "Responded");
 							Some(frame)
 						}
 					};
@@ -1776,8 +1807,8 @@ mod tests {
 					assertions: trace,
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						tb_assert!(trace, HandlerStart, "Received");
-						tb_assert!(trace, Response, "Responded");
+						trace.assert(AssertionPhase::HandlerStart, "Received");
+						trace.assert(AssertionPhase::Response, "Responded");
 						Some(frame)
 					}
 				};
@@ -1786,7 +1817,7 @@ mod tests {
 			},
 			client: |trace: TraceCollector, mut client| async move {
 				// Client-side assertion before sending
-				tb_assert!(trace, Response, "Responded");
+				trace.assert(AssertionPhase::Response, "Responded");
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -1796,7 +1827,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				tb_assert!(trace, HandlerStart, "Received");
+				trace.assert(AssertionPhase::HandlerStart, "Received");
 
 				Ok(())
 			}

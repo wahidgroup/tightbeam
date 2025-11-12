@@ -5,6 +5,7 @@
 #![cfg(feature = "testing")]
 #![cfg(feature = "instrument")]
 
+use tightbeam::testing::assertions::AssertionPhase;
 use tightbeam::{tb_assert_spec, tb_scenario};
 
 tb_assert_spec! {
@@ -20,13 +21,9 @@ tb_scenario! {
 	name: test_auto_instrumentation_capture,
 	spec: AutoInstrSpec,
 	environment Bare {
-		exec: || {
-			use tightbeam::instrumentation::{emit, TbEventKind};
-
+		exec: |trace| {
 			// Framework automatically initialized instrumentation before this
-
-			// Emit a custom event
-			let _ = emit(TbEventKind::ProcessTransition, Some("test_event"), None, None, 0, None);
+			trace.assert(AssertionPhase::HandlerStart, "test_event");
 
 			Ok(())
 		}
