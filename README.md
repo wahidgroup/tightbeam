@@ -57,7 +57,6 @@ versioned metadata structures for high-fidelity information transmission.
 		- 5.7.5. [Nonrepudiation Coverage and Binding](#575-nonrepudiation-coverage-and-binding)
 		- 5.7.6. [Security Property Chain](#576-security-property-chain)
 	- 5.8. [What is the Matrix?](#58-what-is-the-matrix)
-	- 5.8. [What is the Matrix?](#58-what-is-the-matrix)
 		- 5.8.1. [Why Use the Matrix?](#581-why-use-the-matrix)
 		- 5.8.2. [The Simple View](#582-the-simple-view)
 		- 5.8.3. [Wire Format (Technical Details)](#583-wire-format-technical-details)
@@ -75,7 +74,7 @@ versioned metadata structures for high-fidelity information transmission.
 	- 7.1. [Cryptographic Requirements](#71-cryptographic-requirements)
 	- 7.2. [Version Security](#72-version-security)
 	- 7.3. [ASN.1 Security Considerations](#73-asn1-security-considerations)
-8. [Transport Layer & Handshake Protocols](#8-transport-layer--handshake-protocols)
+8. [Transport Layer](#8-transport-layer)
 	- 8.1. [Transport Architecture](#81-transport-architecture)
 		- 8.1.1. [Design Principles](#811-design-principles)
 		- 8.1.2. [Core Transport Traits](#812-core-transport-traits)
@@ -104,14 +103,48 @@ versioned metadata structures for high-fidelity information transmission.
 		- 9.3.4. [I: Drones & Hives](#934-i-drones--hives)
 10. [Testing Framework](#10-testing-framework)
 	- 10.1. [Architecture and Concepts](#101-architecture-and-concepts)
+		- 10.1.1. [Three-Layer Progressive Verification](#1011-three-layer-progressive-verification)
+		- 10.1.2. [Unified Entry Point: tb_scenario!](#1012-unified-entry-point-tb_scenario)
+		- 10.1.3. [Feature Flag Architecture](#1013-feature-flag-architecture)
 	- 10.2. [Layer 1: Assertion Specifications](#102-layer-1-assertion-specifications)
+		- 10.2.1. [Concept](#1021-concept)
+		- 10.2.2. [Specification: tb_assert_spec! Syntax](#1022-specification-tb_assert_spec-syntax)
+		- 10.2.3. [Implementation Examples](#1023-implementation-examples)
+		- 10.2.4. [Generated API](#1024-generated-api)
+		- 10.2.5. [Cardinality Helpers](#1025-cardinality-helpers)
 	- 10.3. [Layer 2: Process Specifications (CSP)](#103-layer-2-process-specifications-csp)
-	- 10.4. [Complete Example: All Three Layers](#104-complete-example-all-three-layers)
-	- 10.5. [Layer 3: Refinement Checking (FDR)](#105-layer-3-refinement-checking-fdr)
+		- 10.3.1. [Concept](#1031-concept)
+		- 10.3.2. [Specification: tb_process_spec! Syntax](#1032-specification-tb_process_spec-syntax)
+		- 10.3.3. [Validation Rules](#1033-validation-rules)
+		- 10.3.4. [Example: CSP Process Specification](#1034-example-csp-process-specification)
+		- 10.3.5. [Generated API](#1035-generated-api)
+	- 10.4. [Layer 3: Refinement Checking (FDR)](#104-layer-3-refinement-checking-fdr)
+		- 10.4.1. [Concept](#1041-concept)
+		- 10.4.2. [Specification: FdrConfig Syntax](#1042-specification-fdrconfig-syntax)
+		- 10.4.3. [Implementation Examples](#1043-implementation-examples)
+		- 10.4.4. [Multi-Seed Exploration](#1044-multi-seed-exploration)
+		- 10.4.5. [FDR Verdict Structure](#1045-fdr-verdict-structure)
+	- 10.5. [Formal CSP Theory](#105-formal-csp-theory)
+		- 10.5.1. [Three Semantic Models](#1051-three-semantic-models)
+		- 10.5.2. [Observable vs. Hidden Events](#1052-observable-vs-hidden-events)
+		- 10.5.3. [Nondeterministic Choice and Refusal Sets](#1053-nondeterministic-choice-and-refusal-sets)
+		- 10.5.4. [Multi-Seed Exploration and Scheduler Interleaving](#1054-multi-seed-exploration-and-scheduler-interleaving)
+		- 10.5.5. [FDR Verification Verdict](#1055-fdr-verification-verdict)
+		- 10.5.6. [CSPM Export for FDR4 Integration](#1056-cspm-export-for-fdr4-integration)
+		- 10.5.7. [Trace Analysis Extensions](#1057-trace-analysis-extensions)
 	- 10.6. [Unified Testing: tb_scenario! Macro](#106-unified-testing-tb_scenario-macro)
-	- 10.7. [Formal CSP Theory](#107-formal-csp-theory)
-	- 10.8. [Instrumentation Specification](#108-instrumentation-specification)
-	- 10.9. [Feature Matrix](#109-feature-matrix)
+		- 10.6.1. [Concept](#1061-concept)
+		- 10.6.2. [Specification: Syntax](#1062-specification-syntax)
+		- 10.6.3. [Complete Examples](#1063-complete-examples)
+	- 10.7. [Instrumentation Specification](#107-instrumentation-specification)
+		- 10.7.1. [Objectives](#1071-objectives)
+		- 10.7.2. [Event Kind Taxonomy](#1072-event-kind-taxonomy)
+		- 10.7.3. [Event Structure](#1073-event-structure)
+		- 10.7.4. [Payload Representation](#1074-payload-representation)
+		- 10.7.5. [Configuration](#1075-configuration)
+		- 10.7.6. [Evidence Artifact Format](#1076-evidence-artifact-format)
+		- 10.7.7. [Failure Handling](#1077-failure-handling)
+	- 10.8. [Feature Matrix](#108-feature-matrix)
 11. [End-to-End Examples](#11-end-to-end-examples)
 	- 11.1. [Complete Client-Server Application](#111-complete-client-server-application)
 12. [References](#12-references)
@@ -148,7 +181,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 The following project terms MUST be used consistently:
 - [tightbeam](https://docs.rs/tightbeam-rs/latest): The project name. Lowercase as tightbeam.
 - [Frame](#42-frame-structure): A versioned snapshot (state) at time t.
-- [Message](#54-message-structure): A typed application payload serialized within a Frame.
+- [Message](#53-message-structure): A typed application payload serialized within a Frame.
 - [Metadata](#43-metadata-specification): Per-message metadata as defined by the protocol.
 - [Version](#41-version-evolution): The protocol version identifier.
 - [TIP](tips/tip-0001.md): tightbeam Improvement Proposal.
@@ -1081,7 +1114,7 @@ and delegates key lifecycle management to applications:
 - Explicit versioning prevents downgrade attacks
 - Optional field handling prevents injection attacks
 
-## 8. Transport Layer & Handshake Protocols
+## 8. Transport Layer
 
 ### 8.1 Transport Architecture
 
@@ -1966,7 +1999,7 @@ provided a router. Routers can emit messages to the servlets registered within
 the cluster.
 
 ```rust
-TODO
+// TODO
 ```
 
 #### 9.3.4 I: Drones & Hives
@@ -1991,7 +2024,7 @@ establish a servlet on different ports and provide the protocol address to the
 cluster so it can register it under its hive.
 
 ```rust
-TODO
+// TODO
 ```
 
 ##### Conclusion
@@ -2013,9 +2046,9 @@ formal methods and statistical testing theory:
 #### Communicating Sequential Processes (CSP)
 
 CSP is a formal language for describing patterns of interaction in concurrent
-systems, developed by Tony Hoare.[^hoare1978] In tightbeam, CSP provides the
-mathematical foundation for modeling protocol behavior as labeled transition
-systems (LTS). Each process specification defines:
+systems, developed by Tony Hoare.[^hoare1978][^roscoe2010] In tightbeam, CSP
+provides the mathematical foundation for modeling protocol behavior as labeled
+transition systems (LTS). Each process specification defines:
 
 - **Alphabet (Σ, τ)**: Observable events visible to the environment (Σ) and hidden internal events (τ)
 - **State Space**: Named states representing protocol phases
@@ -2029,7 +2062,8 @@ failures refinement (⊑F).
 #### Failures-Divergences Refinement (FDR)
 
 FDR is a model checking methodology that verifies CSP refinement relations
-through exhaustive exploration.[^fdr2] The framework checks three key properties:
+through exhaustive exploration.[^fdr4] The framework checks three key
+properties:
 
 1. **Trace Refinement (⊑T)**: Every observable trace of the implementation is a valid trace of the specification
 2. **Failures Refinement (⊑F)**: The implementation cannot refuse events that the specification accepts at any state
@@ -2110,10 +2144,6 @@ produce deterministic SHA3-256 hashes over their canonical representation.
 
 #### 10.2.2 Specification: tb_assert_spec! Syntax
 
-Declarative multi‑version assertion specs with deterministic hashing:
-
-#### 10.2.2 Specification: tb_assert_spec! Syntax
-
 ```rust
 tb_assert_spec! {
 	pub MySpec,
@@ -2180,13 +2210,6 @@ tb_assert_spec! {
 		]
 	},
 }
-
-// Generated API usage
-assert_ne!(
-	DemoSpec::get(1,0,0).unwrap().spec_hash(),
-	DemoSpec::get(1,1,0).unwrap().spec_hash()
-);
-assert_eq!(DemoSpec::latest().version(), (1,1,0));
 ```
 
 #### 10.2.4 Generated API
@@ -2282,7 +2305,7 @@ tb_process_spec! {
 }
 ```
 
-#### 10.3.6 Generated API
+#### 10.3.5 Generated API
 
 Each `tb_process_spec!` generates:
 ```rust
@@ -2389,9 +2412,9 @@ pub struct FdrVerdict {
 - **determinism_witness**: Evidence of unintended nondeterminism (if found)
 - **divergence_witness**: Internal event sequence causing livelock (if found)
 
-### 10.7 Formal CSP Theory
+### 10.5 Formal CSP Theory
 
-#### 10.7.1 Three Semantic Models
+#### 10.5.1 Three Semantic Models
 
 | CSP Model | Tightbeam Layer | Verification Property | Refinement Check |
 |-----------|-----------------|----------------------|------------------|
@@ -2413,7 +2436,7 @@ that can make infinite internal progress without external interaction. A diverge
 is a τ-loop where the process never becomes stable. The `max_internal_run`
 parameter bounds consecutive hidden events to detect such livelocks.
 
-#### 10.7.2 Observable vs. Hidden Events
+#### 10.5.2 Observable vs. Hidden Events
 
 CSP distinguishes between observable events (external alphabet Σ) and hidden
 events (internal actions τ). This distinction is fundamental to process refinement:
@@ -2444,7 +2467,7 @@ The instrumentation taxonomy (§10.7.2) maps tightbeam events to CSP categories:
 - **Observable**: `gate_accept`, `gate_reject`, `request_recv`, `response_send`, `assert_label`
 - **Hidden (τ)**: `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`, `process_hidden`
 
-#### 10.7.3 Nondeterministic Choice and Refusal Sets
+#### 10.5.3 Nondeterministic Choice and Refusal Sets
 
 CSP provides two choice operators:
 - **External choice (□)**: Environment selects which event occurs
@@ -2469,7 +2492,7 @@ The `choice` annotation declares states where internal nondeterminism may occur.
 FDR exploration uses different seeds to explore all possible nondeterministic
 branches, ensuring the specification covers all implementation behaviors.
 
-#### 10.7.4 Multi-Seed Exploration and Scheduler Interleaving
+#### 10.5.4 Multi-Seed Exploration and Scheduler Interleaving
 
 Based on research by Pedersen & Chalmers (2024), refinement in cooperatively
 scheduled systems depends on resource availability. With `n` concurrent processes
@@ -2496,7 +2519,7 @@ Across all seeds, the framework verifies that:
 2. **Failures refinement**: No invalid refusals at choice points
 3. **Divergence freedom**: No seed produces infinite τ-loops
 
-#### 10.7.5 FDR Verification Verdict
+#### 10.5.5 FDR Verification Verdict
 
 After multi-seed exploration, tightbeam produces a comprehensive verdict:
 
@@ -2529,10 +2552,10 @@ witness indicates unintended nondeterminism not declared via `choice`.
 exceeding `max_internal_run`), the witness provides the internal event sequence
 causing livelock.
 
-#### 10.7.6 CSPM Export for FDR4 Integration
+#### 10.5.6 CSPM Export for FDR4 Integration
 
 Tightbeam can export process specifications as CSPM (CSP Machine-readable)
-format for verification with external tools like FDR4:
+format for verification with external tools like FDR4:[^fdr4]
 
 ```rust
 use tightbeam::testing::fdr::CspmExporter;
@@ -2555,7 +2578,7 @@ This enables:
 2. **Algebraic proofs** using CSP laws and theorems
 3. **Integration** with existing CSP toolchains and specifications
 
-#### 10.7.7 Trace Analysis Extensions
+#### 10.5.7 Trace Analysis Extensions
 
 The `FdrTraceExt` trait extends `ConsumedTrace` with CSP-specific analysis:
 
@@ -2564,17 +2587,6 @@ use tightbeam::testing::fdr::FdrTraceExt;
 
 hooks {
     on_pass: |trace| {
-        // Trace validity
-        assert!(trace.csp_valid());
-        assert!(trace.terminated_in_valid_state());
-
-        // Assertion counts
-        assert_eq!(trace.assertion_count("connect"), 1);
-
-        // Event projection
-        let observable = trace.project_to_observable();
-        let hidden = trace.project_to_hidden();
-
         // Refinement properties
         assert!(trace.fdr_verdict.trace_refines);
         assert!(trace.fdr_verdict.failures_refines);
@@ -2602,9 +2614,9 @@ if let Some(acceptance) = trace.acceptance_at("Connected") {
 assert!(!trace.can_refuse_after("Connected", "request"));
 ```
 
-### 10.8 Unified Testing: tb_scenario! Macro
+### 10.6 Unified Testing: tb_scenario! Macro
 
-#### 10.8.1 Concept
+#### 10.6.1 Concept
 
 `tb_scenario!` is the unified entry point for all testing layers. It executes
 an AssertSpec under a selectable environment with optional CSP and FDR verification.
@@ -2615,7 +2627,7 @@ an AssertSpec under a selectable environment with optional CSP and FDR verificat
 - Environment abstraction for different testing contexts
 - Hooks for custom validation and debugging
 
-#### 10.8.2 Specification: Syntax
+#### 10.6.2 Specification: Syntax
 
 ```rust
 tb_scenario! {
@@ -2639,7 +2651,7 @@ tb_scenario! {
 
 See sections 10.3.4 and 10.4 for detailed environment examples.
 
-#### 10.8.3 Complete Examples
+#### 10.6.3 Complete Examples
 
 **Bare Environment Example**: Pure logic/function invocation
 
@@ -2707,7 +2719,8 @@ tb_assert_spec! {
 			(HandlerStart, "connect", exactly!(1)),
 			(HandlerStart, "request", exactly!(1)),
 			(Response, "response", exactly!(2)),
-			(Response, "disconnect", exactly!(1))
+			(Response, "disconnect", exactly!(1)),
+			(Response, "message_content", exactly!(1), equals!("test"))
 		]
 	},
 }
@@ -2733,54 +2746,58 @@ tb_process_spec! {
 	annotations { description: "Client-server with crypto and nondeterminism" }
 }
 
-#[test]
-fn test_client_server_all_layers() {
-	tb_scenario! {
-		name: test_client_server_all_layers,
-		spec: ClientServerSpec,
-		csp: ClientServerProcess,
-		fdr: FdrConfig {
-			seeds: 64,
-			max_depth: 128,
-			max_internal_run: 32,
-			timeout_ms: 5000,
+tb_scenario! {
+	name: test_client_server_all_layers,
+	spec: ClientServerSpec,
+	csp: ClientServerProcess,
+	fdr: FdrConfig {
+		seeds: 64,
+		max_depth: 128,
+		max_internal_run: 32,
+		timeout_ms: 5000,
+	},
+	environment ServiceClient {
+		worker_threads: 2,
+		server: |trace: TraceCollector| async move {
+			let bind_addr = "127.0.0.1:0".parse().unwrap();
+			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+			let handle = server! {
+				protocol TokioListener: listener,
+				assertions: trace,
+				handle: |frame, trace| async move {
+					trace.assert(AssertionPhase::HandlerStart, "connect");
+					trace.assert(AssertionPhase::HandlerStart, "request");
+					trace.assert(AssertionPhase::Response, "response");
+					Some(frame)
+				}
+			};
+			Ok((handle, addr))
 		},
-		environment ServiceClient {
-			worker_threads: 2,
-			server: |trace: TraceCollector| async move {
-				let bind_addr = "127.0.0.1:0".parse().unwrap();
-				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
-				let handle = server! {
-					protocol TokioListener: listener,
-					assertions: trace,
-					handle: |frame, trace| async move {
-						trace.assert(AssertionPhase::HandlerStart, "connect");
-						trace.assert(AssertionPhase::HandlerStart, "request");
-						trace.assert(AssertionPhase::Response, "response");
-						Some(frame)
-					}
-				};
-				Ok((handle, addr))
-			},
-			client: |trace: TraceCollector, mut client| async move {
-				trace.assert(AssertionPhase::Response, "response");
-				let frame = compose! {
-					V0: id: "test",
-					order: 1u64,
-					message: TestMessage { content: "test".to_string() }
-				}?;
-				let _response = client.emit(frame, None).await?;
-				trace.assert(AssertionPhase::Response, "disconnect");
-				Ok(())
+		client: |trace: TraceCollector, mut client| async move {
+			trace.assert(AssertionPhase::Response, "response");
+			let frame = compose! {
+				V0: id: "test",
+				order: 1u64,
+				message: TestMessage { content: "test".to_string() }
+			}?;
+			let response = client.emit(frame, None).await?;
+
+			// Decode response and emit value assertion
+			if let Some(resp_frame) = response {
+				let decoded: TestMessage = crate::decode(&resp_frame.message)?;
+				trace.assert_value(AssertionPhase::Response, "message_content", decoded.content);
 			}
+
+			trace.assert(AssertionPhase::Response, "disconnect");
+			Ok(())
+		}
+	},
+	hooks {
+		on_pass: |trace| {
+			// Optional: custom logic on test pass
 		},
-		hooks {
-			on_pass: |trace| {
-				// Optional: custom logic on test pass
-			},
-			on_fail: |_trace, violations| {
-				// Optional: custom logic on test fail
-			}
+		on_fail: |_trace, violations| {
+			// Optional: custom logic on test fail
 		}
 	}
 }
@@ -2798,21 +2815,21 @@ This test verifies:
 - **Client signature**: `|trace: TraceCollector, mut client|` receives both trace and client
 - **Progressive verification**: L1 assertions → L2 CSP validation → L3 refinement checking
 
-### 10.9 Instrumentation Specification
+### 10.7 Instrumentation Specification
 
 This subsection normatively specifies the TightBeam instrumentation subsystem. Instrumentation produces a semantic event sequence consumed by verification logic. It is an observation facility, NOT an application logging API. Tests MUST NOT depend on instrumentation events imperatively; verification MUST treat the event stream as authoritative ground truth for one execution.
 
 Feature Gating:
 - Instrumentation can be enabled only by the standalone crate feature `instrument`.
 
-#### 10.9.1 Objectives
+#### 10.7.1 Objectives
 - Emission MUST be amortized O(1) per event.
 - Ordering MUST be strictly increasing by sequence number per trace.
 - Evidence artifacts MUST be deterministic and hash‑stable given identical executions.
 - Detail level MUST be feature‑gated to avoid unnecessary overhead.
 - Payload handling MUST preserve privacy (hash or summarize; never emit secret raw bytes).
 
-#### 10.9.2 Event Kind Taxonomy
+#### 10.7.2 Event Kind Taxonomy
 Each event MUST have one kind from a closed, feature‑gated set:
 - External: `gate_accept`, `gate_reject`, `request_recv`, `response_send`
 - Assertion: `assert_label`, `assert_payload`
@@ -2823,7 +2840,7 @@ Each event MUST have one kind from a closed, feature‑gated set:
 
 Hidden/internal events MUST use the internal category.
 
-#### 10.9.3 Event Structure
+#### 10.7.3 Event Structure
 Conceptual fixed layout (names illustrative):
 ```
 trace_id | seq | kind | label? | payload? | phase? | dur_ns? | flags | extras
@@ -2839,7 +2856,7 @@ Requirements:
 - `flags` MUST represent a bitset (e.g. ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
 - `extras` MAY supply fixed numeric slots and a bounded byte sketch for extended metrics (e.g. enabled set cardinality).
 
-#### 10.9.4 Payload Representation
+#### 10.7.4 Payload Representation
 Runtime values captured under `assert_payload` MUST be transformed before emission:
 - Algorithm: SHA3‑256 digest over canonical byte representation.
 - Representation: First 32 bytes (full SHA3‑256 output) MUST be stored; NO truncation below 32 bytes.
@@ -2847,7 +2864,7 @@ Runtime values captured under `assert_payload` MUST be transformed before emissi
 - Structured values SHOULD emit a static schema tag plus digest.
 Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
 
-#### 10.9.5 Configuration
+#### 10.7.5 Configuration
 Instrumentation behavior MUST be controlled by a configuration object (conceptual fields). Configuration existence itself is gated by `instrument`:
 ```rust
 TbInstrumentationConfig {
@@ -2873,15 +2890,15 @@ Layer Interaction (informative): Enabling testing layers does NOT alter these de
 
 If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, emit a single `warn` event, and drop subsequent events.
 
-#### 10.9.6 Evidence Artifact Format
-For every finalized trace an artifact MUST be producible in a canonical binary form (DER). JSON representations are OPTIONAL visual aides and MUST NOT be used for hashing or verification semantics.
+#### 10.7.6 Evidence Artifact Format
+For every finalized trace an artifact MUST be producible in a canonical binary form (DER).
 
 Canonical DER Schema (conceptual):
 ```
 EvidenceArtifact ::= SEQUENCE {
-	specHash   OCTET STRING,              -- SHA3-256(spec definition)
-	traceId    INTEGER,                   -- Unique per execution
-	seed       INTEGER OPTIONAL,          -- Exploration seed (testing-fdr only)
+	specHash   OCTET STRING,               -- SHA3-256(spec definition)
+	traceId    INTEGER,                    -- Unique per execution
+	seed       INTEGER OPTIONAL,           -- Exploration seed (testing-fdr only)
 	outcome    ENUMERATED { acceptResponse(0), acceptNoResponse(1), reject(2), error(3) },
 	metrics    SEQUENCE {
 		countEvents   INTEGER,
@@ -2892,12 +2909,12 @@ EvidenceArtifact ::= SEQUENCE {
 }
 
 Event ::= SEQUENCE {
-	i           INTEGER,                  -- sequence number
+	i           INTEGER,                   -- sequence number
 	k           ENUMERATED { start(0), end(1), warn(2), error(3), gate_accept(4), gate_reject(5), request_recv(6), response_send(7), assert_label(8), assert_payload(9), handler_enter(10), handler_exit(11), crypto_step(12), compress_step(13), route_step(14), policy_eval(15), process_transition(16), process_hidden(17), seed_start(18), seed_end(19), state_expand(20), state_prune(21), divergence_detect(22), refusal_snapshot(23), enabled_set_sample(24) },
 	l           UTF8String OPTIONAL,       -- label
-	payloadHash OCTET STRING OPTIONAL,    -- SHA3-256(payload canonical bytes) if captured
-	durationNs  INTEGER OPTIONAL,         -- monotonic duration for boundary/exit events
-	flags       BIT STRING OPTIONAL,      -- ASSERT_FAIL | HIDDEN | DIVERGENCE | OVERFLOW ...
+	payloadHash OCTET STRING OPTIONAL,     -- SHA3-256(payload canonical bytes) if captured
+	durationNs  INTEGER OPTIONAL,          -- monotonic duration for boundary/exit events
+	flags       BIT STRING OPTIONAL,       -- ASSERT_FAIL | HIDDEN | DIVERGENCE | OVERFLOW ...
 	extras      OCTET STRING OPTIONAL      -- bounded auxiliary metrics sketch
 }
 ```
@@ -2915,11 +2932,11 @@ Artifact Integrity:
 Privacy:
 - Raw payload bytes MUST NOT appear; only hashed representation or numeric scalar (non-sensitive) values MAY be represented.
 
-#### 10.9.7 Failure Handling
+#### 10.7.7 Failure Handling
 - Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
 - Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
 
-### 10.10 Feature Matrix
+### 10.8 Feature Matrix
 
 The following table summarizes capabilities available across the three testing layers:
 
@@ -2945,9 +2962,19 @@ This section contains complete, runnable examples demonstrating real-world usage
 
 ### 11.1 Complete Client-Server Application
 
-Coming soon.
+```rust
+// TODO
+```
 
 ## 12. References
+
+[^hoare1978]: C.A.R. Hoare, "Communicating sequential processes," *Communications of the ACM*, vol. 21, no. 8, pp. 666-677, August 1978. DOI: [10.1145/359576.359585](https://doi.org/10.1145/359576.359585)
+
+[^roscoe2010]: A.W. Roscoe, *Understanding Concurrent Systems*. Springer-Verlag, 2010. ISBN: 978-1-84882-257-3. DOI: [10.1007/978-1-84882-258-0](https://doi.org/10.1007/978-1-84882-258-0)
+
+[^fdr4]: University of Oxford, *FDR4 User Manual*, Version 4.2.7, 2020. Available: [https://www.cs.ox.ac.uk/projects/fdr/](https://www.cs.ox.ac.uk/projects/fdr/)
+
+[^pedersen2024]: M. Pedersen and K. Chalmers, "Refinement Checking of Cooperatively Scheduled Concurrent Systems," in *Formal Methods: Foundations and Applications (SBMF 2024)*, pp. 3-21, 2024. DOI: [10.1007/978-3-031-78561-1_1](https://doi.org/10.1007/978-3-031-78561-1_1)
 
 ### 12.1 Normative References
 
@@ -2989,20 +3016,6 @@ Coming soon.
 - [RFC 3246](https://datatracker.ietf.org/doc/html/rfc3246): An Expedited Forwarding PHB (Per-Hop Behavior)
 - [ITU-T X.400](https://www.itu.int/rec/T-REC-X.400): Message Handling Systems (MHS): System and service overview
 - [ITU-T X.420](https://www.itu.int/rec/T-REC-X.420): Message Handling Systems (MHS): Interpersonal messaging system
-
-### 12.4 Academic References
-
-[^hoare1978]: C.A.R. Hoare, "Communicating sequential processes," *Communications of the ACM*, vol. 21, no. 8, pp. 666-677, August 1978. DOI: [10.1145/359576.359585](https://doi.org/10.1145/359576.359585)
-
-[^hoare1985]: C.A.R. Hoare, *Communicating Sequential Processes*. Prentice Hall, 1985. ISBN: 0-13-153289-8. Available: [http://www.usingcsp.com/cspbook.pdf](http://www.usingcsp.com/cspbook.pdf)
-
-[^roscoe2010]: A.W. Roscoe, *Understanding Concurrent Systems*. Springer-Verlag, 2010. ISBN: 978-1-84882-257-3. DOI: [10.1007/978-1-84882-258-0](https://doi.org/10.1007/978-1-84882-258-0)
-
-[^gibson2014]: T. Gibson-Robinson, P. Armstrong, A. Boulgakov, and A.W. Roscoe, "FDR3 — A Modern Refinement Checker for CSP," in *Tools and Algorithms for the Construction and Analysis of Systems (TACAS 2014)*, pp. 187-201, 2014. DOI: [10.1007/978-3-642-54862-8_13](https://doi.org/10.1007/978-3-642-54862-8_13)
-
-[^pedersen2024]: M. Pedersen and K. Chalmers, "Refinement Checking of Cooperatively Scheduled Concurrent Systems," in *Formal Methods: Foundations and Applications (SBMF 2024)*, pp. 3-21, 2024. DOI: [10.1007/978-3-031-78561-1_1](https://doi.org/10.1007/978-3-031-78561-1_1)
-
-[^fdr2]: Formal Systems (Europe) Ltd., "Failures-Divergence Refinement: FDR2 User Manual," October 1997. Available: [https://www.cs.ox.ac.uk/projects/fdr/manual/](https://www.cs.ox.ac.uk/projects/fdr/manual/)
 
 ## 13. License
 
