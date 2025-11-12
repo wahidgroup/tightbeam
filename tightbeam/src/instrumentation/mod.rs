@@ -177,7 +177,7 @@ pub mod active {
 	static CONFIG: std::sync::OnceLock<TbInstrumentationConfig> = std::sync::OnceLock::new();
 
 	thread_local! {
-		static EVENTS: std::cell::RefCell<Vec<TbEvent>> = std::cell::RefCell::new(Vec::new());
+		static EVENTS: std::cell::RefCell<Vec<TbEvent>> = const { std::cell::RefCell::new(Vec::new()) };
 	}
 
 	/// Get next sequence number for event (thread-safe)
@@ -297,8 +297,8 @@ pub mod active {
 			let mut trace_hash = [0u8; 32];
 			trace_hash.copy_from_slice(&trace_hash_vec);
 			let mut h2 = Sha3_256::new();
-			h2.update(&spec_hash);
-			h2.update(&trace_hash);
+			h2.update(spec_hash);
+			h2.update(trace_hash);
 			let evidence_hash_vec = h2.finalize();
 			let mut evidence_hash = [0u8; 32];
 			evidence_hash.copy_from_slice(&evidence_hash_vec);

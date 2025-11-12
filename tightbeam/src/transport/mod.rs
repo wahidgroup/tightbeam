@@ -468,7 +468,7 @@ pub trait MessageEmitter: MessageIO {
 			};
 
 			// Evaluate retry policy only on error
-			if let Err(_) = &result {
+			if result.is_err() {
 				let action = self.get_restart_policy().evaluate(&current_message, &result, current_attempt);
 				match action {
 					crate::transport::policy::RetryAction::RetryWithSame => {

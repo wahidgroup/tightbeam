@@ -754,9 +754,9 @@ mod tests {
 				assert!(!errors.is_empty());
 				// Check that one of the errors is UnexpectedAlgorithm
 				let has_unexpected_algorithm = errors.iter().any(|e| matches!(e, TightBeamError::UnexpectedAlgorithm(_)));
-				assert!(has_unexpected_algorithm, "Expected UnexpectedAlgorithm error, but got: {:?}", errors);
+				assert!(has_unexpected_algorithm, "Expected UnexpectedAlgorithm error, but got: {errors:?}");
 			} else {
-				panic!("Expected Sequence error, but got: {:?}", result);
+				panic!("Expected Sequence error, but got: {result:?}");
 			}
 
 			Ok(())

@@ -136,7 +136,7 @@ impl KdfFunction for HkdfSha3_256 {
 	}
 
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<Zeroizing<Vec<u8>>> {
-		if key_size < MIN_KEY_SIZE || key_size > MAX_HKDF_OUTPUT_SIZE {
+		if !(MIN_KEY_SIZE..=MAX_HKDF_OUTPUT_SIZE).contains(&key_size) {
 			return Err(KdfError::DerivationFailed(hkdf::InvalidLength));
 		}
 

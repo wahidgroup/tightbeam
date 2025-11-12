@@ -14,8 +14,8 @@
 //!
 //! Feature gated: requires `testing-fdr`
 
-use std::io::Write;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
 
 use super::csp::{Event, Process, State};
 use crate::testing::assertions::AssertionLabel;
@@ -290,10 +290,7 @@ impl<'a> FdrExplorer<'a> {
 			// Acceptance = Observable - Refusal
 			let acceptance: AcceptanceSet = self.process.observable.difference(refusal).cloned().collect();
 
-			trace_acceptance
-				.entry(trace.clone())
-				.or_insert_with(HashSet::new)
-				.extend(acceptance);
+			trace_acceptance.entry(trace.clone()).or_default().extend(acceptance);
 		}
 
 		// Check for nondeterminism: same trace, event both accepted and refused
@@ -346,7 +343,7 @@ impl<'a> CspmExporter<'a> {
 		writeln!(writer, "-- Process: {}", self.process.name)?;
 
 		if let Some(desc) = self.process.description {
-			writeln!(writer, "-- Description: {}", desc)?;
+			writeln!(writer, "-- Description: {desc}")?;
 		}
 
 		writeln!(writer)?;
@@ -556,7 +553,7 @@ impl FdrTraceExt for ConsumedTrace {
 				if idx > 0 {
 					write!(writer, ", ")?;
 				}
-				write!(writer, "{}", event)?;
+				write!(writer, "{event}")?;
 			}
 		}
 

@@ -149,9 +149,7 @@ where
 
 		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes);
 		self.transcript_hash = Some(transcript_digest);
-		if let Err(e) = self.invariants.lock_transcript() {
-			return Err(e);
-		}
+		self.invariants.lock_transcript()?;
 
 		// 7. Sign transcript hash using KeyProvider
 		let signature_bytes = self.sign_transcript_hash(&transcript_digest).await?;
@@ -231,9 +229,7 @@ where
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 		let session_key = self.derive_session_aead(base_session_key, &salt)?;
-		if let Err(e) = self.invariants.derive_aead_once() {
-			return Err(e);
-		}
+		self.invariants.derive_aead_once()?;
 
 		// 4. Transition to complete state
 		self.state.transition(ServerHandshakeState::Completed)?;
@@ -430,7 +426,7 @@ where
 			}
 
 			// Run validator chain (includes expiry, pinning, policy, etc.)
-			for (_, validator) in validators.iter().enumerate() {
+			for validator in validators.iter() {
 				validator.evaluate(client_cert)?;
 			}
 

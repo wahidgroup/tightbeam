@@ -47,6 +47,12 @@ macro_rules! tb_process_spec {
 		$(#[$meta])*
 		$vis struct $name;
 
+		impl Default for $name {
+			fn default() -> Self {
+				Self
+			}
+		}
+
 		impl $name {
 			#[allow(clippy::vec_init_then_push)]
 			pub fn process() -> $crate::testing::specs::csp::Process {
@@ -103,6 +109,13 @@ macro_rules! tb_process_spec {
 				)?
 
 				builder.build().expect("Failed to build Process")
+			}
+		}
+
+		#[cfg(feature = "testing-csp")]
+		impl $crate::testing::specs::csp::ProcessSpec for $name {
+			fn validate_trace(&self, trace: &$crate::testing::trace::ConsumedTrace) -> $crate::testing::specs::csp::CspValidationResult {
+				Self::process().validate_trace(trace)
 			}
 		}
 	};

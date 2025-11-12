@@ -107,7 +107,7 @@ impl MutualAuthServer {
 				.map_err(|e| TightBeamError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?,
 		);
 		let (listener, addr) = TokioListener::bind_with(bind_addr, server_config).await?;
-		println!("Server listening on {:?}", addr);
+		println!("Server listening on {addr:?}");
 		let (tx, rx) = tokio::sync::mpsc::channel(8);
 
 		let handle = server! {
@@ -182,7 +182,7 @@ impl CertificateValidation for ClientValidator {
 	fn evaluate(&self, cert: &Certificate) -> core::result::Result<(), CertificateValidationError> {
 		println!("ClientValidator: Starting evaluation");
 		if let Some(cn) = extract_cn(cert) {
-			println!("ClientValidator: Extracted CN: '{}'", cn);
+			println!("ClientValidator: Extracted CN: '{cn}'");
 			if cn == "Test Client" {
 				println!("ClientValidator: ACCEPTED");
 				Ok(())
@@ -302,15 +302,14 @@ async fn test_unexpected_client_cert_rejected() -> Result<()> {
 		Ok(())
 	}
 	.await;
-	println!("Final result: {:?}", client_result);
+	println!("Final result: {client_result:?}");
 	if let Err(e) = &client_result {
-		println!("Error details: {:?}", e);
+		println!("Error details: {e:?}");
 	}
 
 	assert!(
 		client_result.is_err(),
-		"Should reject client certificate that doesn't contain 'Test Client', but got: {:?}",
-		client_result
+		"Should reject client certificate that doesn't contain 'Test Client', but got: {client_result:?}"
 	);
 
 	server.abort();

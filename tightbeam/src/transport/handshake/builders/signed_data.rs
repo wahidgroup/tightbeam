@@ -198,7 +198,7 @@ mod tests {
 			_ => unreachable!("SignedData builder should always create SubjectKeyIdentifier"),
 		}
 
-		assert!(signer_info.signature.as_bytes().len() > 0);
+		assert!(!signer_info.signature.as_bytes().is_empty());
 
 		Ok(())
 	}

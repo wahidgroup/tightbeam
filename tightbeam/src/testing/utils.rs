@@ -255,7 +255,8 @@ pub fn create_test_signer_info() -> crate::SignerInfo {
 	use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
 	let skid = SubjectKeyIdentifier::from(OctetString::new([0u8; 20]).unwrap());
-	let signer_info = crate::SignerInfo {
+
+	crate::SignerInfo {
 		version: CmsVersion::V1,
 		sid: SignerIdentifier::SubjectKeyIdentifier(skid),
 		digest_alg: crate::AlgorithmIdentifierOwned { oid: crate::oids::HASH_SHA3_256, parameters: None },
@@ -266,9 +267,7 @@ pub fn create_test_signer_info() -> crate::SignerInfo {
 		},
 		signature: OctetString::new([0u8; 64]).unwrap(),
 		unsigned_attrs: None,
-	};
-
-	signer_info
+	}
 }
 
 /// Generic test macro for data-driven test cases

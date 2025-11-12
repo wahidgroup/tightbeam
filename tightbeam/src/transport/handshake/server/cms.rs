@@ -108,10 +108,7 @@ where
 			selected_profile: None,
 			client_validators,
 			_phantom: PhantomData,
-			invariants: {
-				let inv = HandshakeInvariant::default();
-				inv
-			},
+			invariants: { HandshakeInvariant::default() },
 		}
 	}
 
@@ -233,7 +230,7 @@ where
 	fn convert_to_handshake_attributes(&self, attrs: &Attributes) -> Result<Vec<HandshakeAttribute>, HandshakeError> {
 		attrs
 			.iter()
-			.map(|attr| Ok(HandshakeAttribute { attr_type: attr.oid.clone(), attr_values: attr.values.clone().into() }))
+			.map(|attr| Ok(HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() }))
 			.collect()
 	}
 
@@ -287,7 +284,7 @@ where
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
 
 		let expected_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
-		if verified_content.len() != 32 || verified_content.as_slice() != &expected_hash {
+		if verified_content.len() != 32 || verified_content.as_slice() != expected_hash {
 			Err(HandshakeError::SignatureVerificationFailed)
 		} else {
 			Ok(verified_content)
@@ -465,7 +462,7 @@ where
 			unsigned_attrs: None,
 		};
 
-		let octet_string = OctetString::new(&transcript_hash)?;
+		let octet_string = OctetString::new(transcript_hash)?;
 		let econtent_der = octet_string.to_der()?;
 		let encap_content_info = EncapsulatedContentInfo {
 			econtent_type: crate::oids::DATA,

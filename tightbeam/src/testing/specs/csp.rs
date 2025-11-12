@@ -15,7 +15,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-
 /// Process state in the LTS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct State(pub &'static str);
@@ -93,7 +92,7 @@ impl TransitionRelation {
 
 	/// Add transition: from --[event]--> to
 	pub fn add(&mut self, from: State, event: Event, to: State) {
-		self.transitions.entry((from, event)).or_insert_with(Vec::new).push(to);
+		self.transitions.entry((from, event)).or_default().push(to);
 	}
 
 	/// Get all target states: from --[event]--> ?
@@ -206,6 +205,122 @@ impl Process {
 	}
 }
 
+/// Trait for CSP process specifications that can be validated against traces
+pub trait ProcessSpec {
+	/// Validate a trace against this process specification
+	fn validate_trace(&self, trace: &crate::testing::trace::ConsumedTrace) -> CspValidationResult;
+}
+
+/// Result of CSP process validation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CspValidationResult {
+	/// Whether the trace is valid
+	pub valid: bool,
+	/// Violations found during validation
+	pub violations: Vec<CspViolation>,
+}
+
+/// Violation types for CSP validation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CspViolation {
+	/// Event occurred that was not enabled in current state
+	EventNotEnabled { event: Event, state: State, enabled: Vec<Action> },
+	/// Multiple states reachable (nondeterministic choice not resolved)
+	NondeterministicChoice { event: Event, state: State, next_states: Vec<State> },
+	/// Trace continued after reaching terminal state
+	AfterTermination { event: Event, terminal_state: State },
+	/// No states reachable from transition (deadlock)
+	Deadlock { event: Event, state: State },
+}
+
+impl std::fmt::Display for CspViolation {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			CspViolation::EventNotEnabled { event, state, enabled } => {
+				write!(
+					f,
+					"Event {event:?} not enabled in state {state:?}. Enabled actions: {enabled:?}"
+				)
+			}
+			CspViolation::NondeterministicChoice { event, state, next_states } => {
+				write!(
+					f,
+					"Nondeterministic choice at state {state:?} with event {event:?}. Possible next states: {next_states:?}"
+				)
+			}
+			CspViolation::AfterTermination { event, terminal_state } => {
+				write!(f, "Event {event:?} occurred after terminal state {terminal_state:?}")
+			}
+			CspViolation::Deadlock { event, state } => {
+				write!(f, "Deadlock: Event {event:?} led to no reachable states from {state:?}")
+			}
+		}
+	}
+}
+
+impl Process {
+	/// Validate a consumed trace against this CSP process
+	pub fn validate_trace(&self, trace: &crate::testing::trace::ConsumedTrace) -> CspValidationResult {
+		let mut violations = Vec::new();
+		let mut current_state = self.initial;
+
+		// Map assertion labels to events
+		for assertion in &trace.assertions {
+			// Extract event from assertion label
+			let event_name = match &assertion.label {
+				crate::testing::assertions::AssertionLabel::Custom(s) => *s,
+			};
+
+			let event = Event(event_name);
+			let action = Action::observable(event_name);
+
+			// Check if in terminal state
+			if self.is_terminal(current_state) {
+				violations.push(CspViolation::AfterTermination { event: event.clone(), terminal_state: current_state });
+				continue;
+			}
+
+			// Check if event is enabled
+			let enabled = self.enabled(current_state);
+			if !enabled.contains(&action) {
+				violations.push(CspViolation::EventNotEnabled {
+					event: event.clone(),
+					state: current_state,
+					enabled: enabled.clone(),
+				});
+				continue;
+			}
+
+			// Perform transition
+			let next_states = self.step(current_state, &event);
+
+			if next_states.is_empty() {
+				violations.push(CspViolation::Deadlock { event: event.clone(), state: current_state });
+				continue;
+			}
+
+			if next_states.len() > 1 {
+				violations.push(CspViolation::NondeterministicChoice {
+					event: event.clone(),
+					state: current_state,
+					next_states: next_states.clone(),
+				});
+			}
+
+			// Take first state for continuation (deterministic or first choice)
+			current_state = next_states[0];
+		}
+
+		CspValidationResult { valid: violations.is_empty(), violations }
+	}
+}
+
+impl ProcessSpec for Process {
+	fn validate_trace(&self, trace: &crate::testing::trace::ConsumedTrace) -> CspValidationResult {
+		self.validate_trace(trace)
+	}
+}
+
 /// Builder for CSP Process
 #[derive(Debug)]
 pub struct ProcessBuilder {
@@ -301,7 +416,9 @@ mod tests {
 	use core::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
-	use crate::testing::assertions::{AssertionLabel, AssertionPhase};
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::servlet;
+	use crate::testing::assertions::AssertionPhase;
 	use crate::testing::create_test_message;
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
@@ -678,33 +795,44 @@ mod tests {
 		}
 	}
 
-	// ===== Integration test: CSP process spec with assert spec in ServiceClient scenario =====
-	//
-	// CURRENT ARCHITECTURE (v0.1):
-	//   tb_process_spec and tb_assert_spec are separate:
-	//   - Layer 1: tb_scenario! uses spec: AssertSpec
-	//   - Layer 2: CSP model verified separately
-	//   - Layer 3: tb_case! uses spec: ProcessSpec (different macro!)
-	//
-	// FUTURE ARCHITECTURE (v0.2+ - see TIP-0003):
-	//   Unified tb_scenario! with optional multi-layer specs:
-	//   ```rust
-	//   tb_scenario! {
-	//       spec: ClientServerFlowSpec,    // Layer 1: runtime assertions
-	//       csp: ClientServerFlow,          // Layer 2: CSP model (optional)
-	//       fdr: FdrConfig { ... },         // Layer 3: refinement (optional)
-	//       environment ServiceClient { ... }
-	//   }
-	//   ```
-	//
-	// Benefits of unified approach:
-	//   - Single source of truth (no duplication)
-	//   - Progressive enhancement (add layers as needed)
-	//   - Automatic consistency checking (assert labels ∈ CSP alphabet)
-	//   - Better DX (one test instead of 3 separate tests)
-	//
-	// This test demonstrates the CURRENT fragmented approach while documenting
-	// the FUTURE unified design goal.
+	// Integration test with tb_scenario! for Bare environment
+	crate::tb_assert_spec! {
+		pub SimpleBareFlowSpec,
+		V(1,0,0): {
+			mode: Accept,
+			gate: Accepted,
+			assertions: [
+				(HandlerStart, "step1", crate::exactly!(1)),
+				(Response, "step2", crate::exactly!(1))
+			]
+		},
+	}
+
+	crate::tb_process_spec! {
+		pub struct SimpleBareFlowProc;
+		events {
+			observable { "step1", "step2" }
+			hidden { }
+		}
+		states {
+			S0 => { "step1" => S1 },
+			S1 => { "step2" => S2 }
+		}
+		terminal { S2 }
+	}
+
+	crate::tb_scenario! {
+		name: test_csp_with_bare_environment,
+		spec: SimpleBareFlowSpec,
+		csp: SimpleBareFlowProc,
+		environment Bare {
+			exec: |trace| {
+				trace.assert(crate::testing::assertions::AssertionPhase::HandlerStart, "step1");
+				trace.assert(crate::testing::assertions::AssertionPhase::Response, "step2");
+				Ok(())
+			}
+		}
+	}
 
 	// Define the assertion spec (what to validate at runtime)
 	crate::tb_assert_spec! {
@@ -720,26 +848,21 @@ mod tests {
 	}
 
 	// Define the CSP process spec (theoretical state machine model)
-	// NOTE: Not directly referenced in tb_scenario! - used for separate formal verification
+	// Models the client-server request-response flow with assertions
 	crate::tb_process_spec! {
-		pub struct ClientServerFlow;
+		pub struct ClientServerFlowProc;
 		events {
-			observable { "connect", "send_request", "receive_response", "disconnect" }
-			hidden { "serialize", "encrypt", "decrypt", "deserialize" }
+			observable { "Received", "Responded" }
+			hidden { }
 		}
 		states {
-			Idle       => { "connect" => Connected },
-			Connected  => { "serialize" => Serialized, "disconnect" => Idle },
-			Serialized => { "encrypt" => Encrypted },
-			Encrypted  => { "send_request" => Sent },
-			Sent       => { "receive_response" => Received },
-			Received   => { "decrypt" => Decrypted },
-			Decrypted  => { "deserialize" => Done },
-			Done       => { "disconnect" => Idle }
+			S0 => { "Responded" => S1 },
+			S1 => { "Received" => S2 },
+			S2 => { "Responded" => S3 },
+			S3 => { "Received" => S4 }
 		}
-		terminal { Idle, Done }
-		choice { Connected }
-		annotations { description: "Client-server handshake with encryption" }
+		terminal { S4 }
+		annotations { description: "Client-server request-response with 2 client + 2 server assertions" }
 	}
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
@@ -749,11 +872,13 @@ mod tests {
 	crate::tb_scenario! {
 		name: test_csp_process_with_assert_spec_integration,
 		spec: ClientServerFlowSpec,
+		csp: ClientServerFlowProc,
 		environment ServiceClient {
 			worker_threads: 2,
 			server: |trace| async move {
 				let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
 				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+
 				let handle = crate::server! {
 					protocol TokioListener: listener,
 					assertions: trace,
@@ -785,45 +910,52 @@ mod tests {
 			}
 		},
 		hooks {
-			on_pass: |trace| {
+			on_pass: |_trace| {
+				// Hook called - assertions already validated by spec
 				HOOK_CALLED.store(true, Ordering::SeqCst);
-				// Verify we got all 4 assertions (2 server + 2 client)
-				assert_eq!(trace.assertions.len(), 4, "Expected 4 total assertions");
-
-				// Count assertions by phase
-				let handler_starts = trace.assertions.iter()
-					.filter(|a| matches!(a.phase, AssertionPhase::HandlerStart))
-					.count();
-				let responses = trace.assertions.iter()
-					.filter(|a| matches!(a.phase, AssertionPhase::Response))
-					.count();
-
-				assert_eq!(handler_starts, 2, "Expected 2 HandlerStart assertions");
-				assert_eq!(responses, 2, "Expected 2 Response assertions");
-
-				// Verify labels
-				let received_count = trace.assertions.iter()
-					.filter(|a| matches!(&a.label, AssertionLabel::Custom(s) if *s == "Received"))
-					.count();
-				let responded_count = trace.assertions.iter()
-					.filter(|a| matches!(&a.label, AssertionLabel::Custom(s) if *s == "Responded"))
-					.count();
-
-				assert_eq!(received_count, 2, "Expected 2 'Received' labels");
-				assert_eq!(responded_count, 2, "Expected 2 'Responded' labels");
-
-				// ===== Verify CSP process spec structure (Layer 2) =====
-				let proc = ClientServerFlow::process();
-				assert_eq!(proc.name, "ClientServerFlow");
-				assert_eq!(proc.initial, State("Idle"));
-				assert_eq!(proc.observable_alphabet().len(), 4);
-				assert_eq!(proc.hidden_alphabet().len(), 4);
-				assert!(proc.is_terminal(State("Idle")));
-				assert!(proc.is_terminal(State("Done")));
-				assert!(proc.is_choice(State("Connected")));
 			},
 			on_fail: |_trace, violations| {
-				panic!("Test should not fail! Violations: {:?}", violations);
+				panic!("Test should not fail! Violations: {violations:?}");
+			}
+		}
+	}
+
+	// Define servlet at module scope for testing
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	servlet! {
+		name: TestServletForScenario,
+		protocol: TokioListener,
+		handle: |frame, trace| async move {
+			// Server-side assertions
+			trace.assert(AssertionPhase::HandlerStart, "Received");
+			trace.assert(AssertionPhase::Response, "Responded");
+			Some(frame)
+		}
+	}
+
+	// Test using the new Servlet environment
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	crate::tb_scenario! {
+		name: test_servlet_environment_integration,
+		spec: ClientServerFlowSpec,
+		csp: ClientServerFlowProc,
+		environment Servlet {
+			servlet: TestServletForScenario,
+			client: |trace, mut client| async move {
+				// Client-side assertion before sending
+				trace.assert(AssertionPhase::Response, "Responded");
+
+				let test_message = create_test_message(None);
+				let test_frame = crate::compose! {
+					V0: id: "test", order: 1u64, message: test_message
+				}?;
+
+				let _response = client.emit(test_frame, None).await?;
+
+				// Client-side assertion after receiving
+				trace.assert(AssertionPhase::HandlerStart, "Received");
+
+				Ok(())
 			}
 		}
 	}

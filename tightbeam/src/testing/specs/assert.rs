@@ -114,29 +114,24 @@ impl fmt::Display for SpecViolation {
 			Self::ResponseUnexpectedPresence => write!(f, "Response present but spec forbids it"),
 			Self::ResponseUnexpectedAbsence => write!(f, "Response absent but spec requires it"),
 			Self::GateDecisionMismatch { expected, actual } => {
-				write!(f, "Gate decision mismatch: expected {:?}, got {:?}", expected, actual)
+				write!(f, "Gate decision mismatch: expected {expected:?}, got {actual:?}")
 			}
 			Self::AssertionViolation { phase, label, expected, actual } => {
 				write!(
 					f,
-					"Assertion contract violated: {:?} @ {:?} expected {}, found {}",
-					label, phase, expected, actual
+					"Assertion contract violated: {label:?} @ {phase:?} expected {expected}, found {actual}"
 				)
 			}
 			#[cfg(feature = "instrument")]
 			Self::EventOrderViolation { expected_kind, position } => {
-				write!(
-					f,
-					"Event order violation: expected {:?} at position {}",
-					expected_kind, position
-				)
+				write!(f, "Event order violation: expected {expected_kind:?} at position {position}")
 			}
 			#[cfg(feature = "instrument")]
 			Self::EventCountMismatch { kind, expected, actual } => {
-				write!(f, "Event count mismatch: {:?} expected {}, found {}", kind, expected, actual)
+				write!(f, "Event count mismatch: {kind:?} expected {expected}, found {actual}")
 			}
 			Self::CustomValidationFailed { reason } => {
-				write!(f, "Custom validation failed: {}", reason)
+				write!(f, "Custom validation failed: {reason}")
 			}
 			Self::ResponseValidationFailed => {
 				write!(f, "Response validation failed")

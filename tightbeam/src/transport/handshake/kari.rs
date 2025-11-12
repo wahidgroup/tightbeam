@@ -51,7 +51,7 @@ where
 	}
 
 	let kdf = provider.as_key_deriver::<HandshakeError, 32>();
-	Ok(shared_secret.with(|ss| kdf(ss.as_ref(), ukm, kdf_info))??)
+	shared_secret.with(|ss| kdf(ss.as_ref(), ukm, kdf_info))?
 }
 
 /// Wrap a CEK (sender side) producing RFC 3394 wrapped bytes.

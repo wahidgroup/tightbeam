@@ -232,7 +232,7 @@ mod tests {
 			Err(CertificateValidationError::Expired) => {
 				// Expected error
 			}
-			other => panic!("Expected Expired error, got: {:?}", other),
+			other => panic!("Expected Expired error, got: {other:?}"),
 		}
 	}
 }

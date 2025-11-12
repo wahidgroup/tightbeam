@@ -332,7 +332,7 @@ mod tests {
 		let cek = [0x42u8; 32]; // 256-bit CEK
 
 		// 3. Build KARI
-		let recipient_info = builder.build(&cek).map_err(|e| format!("build failed: {:?}", e))?;
+		let recipient_info = builder.build(&cek).map_err(|e| format!("build failed: {e:?}"))?;
 
 		// 4. Extract Kari variant (Kari builder should always return Kari)
 		let kari = match recipient_info {
@@ -390,7 +390,7 @@ mod tests {
 			.with_ukm(ukm)
 			.with_key_enc_alg(key_enc_alg);
 
-		let recipient_info = builder.build(&cek).map_err(|e| format!("build failed: {:?}", e))?;
+		let recipient_info = builder.build(&cek).map_err(|e| format!("build failed: {e:?}"))?;
 
 		// 7. Serialize to DER
 		let der_bytes = recipient_info.to_der()?;

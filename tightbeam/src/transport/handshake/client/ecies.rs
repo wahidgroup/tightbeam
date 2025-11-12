@@ -330,12 +330,7 @@ where
 		let base_key = self.base_session_key.ok_or(HandshakeError::InvalidState)?;
 		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
 
-		self.perform_ecies_encryption(
-			&base_key,
-			&client_random,
-			&server_handshake.certificate,
-			self.aad_domain_tag.as_deref(),
-		)
+		self.perform_ecies_encryption(&base_key, &client_random, &server_handshake.certificate, self.aad_domain_tag)
 	}
 
 	/// Prepare client authentication materials if required or available.
@@ -807,7 +802,7 @@ mod tests {
 				certificate: test_cert.certificate.clone(),
 				server_random: OctetString::new(server_random)?,
 				signature: OctetString::new(signature_bytes)?,
-				security_accept: Some(SecurityAccept::new(accepted_profile.clone())),
+				security_accept: Some(SecurityAccept::new(*accepted_profile)),
 				client_cert_required: false,
 			};
 			Ok(response.to_der()?)

@@ -318,7 +318,7 @@ impl TestEciesServerBuilder {
 					Ok(TestCertificate { signing_key: key, certificate: cert })
 				})
 				.transpose()?
-				.unwrap_or_else(|| create_test_certificate())
+				.unwrap_or_else(create_test_certificate)
 		};
 
 		let default_profile = create_default_test_profile();

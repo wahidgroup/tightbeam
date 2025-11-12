@@ -21,6 +21,7 @@ macro_rules! __tightbeam_servlet_common_methods {
 			}
 		}
 
+		#[allow(dead_code)]
 		pub async fn join(mut self) -> ::core::result::Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
 			if let Some(handle) = self.server_handle.take() {
 				$crate::colony::servlet_runtime::rt::join(handle).await
@@ -314,6 +315,19 @@ macro_rules! servlet {
 				|$message, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body);
 	};
 
+	// Basic servlet with trace parameter in handler (trace provided at start())
+	(
+		name: $worker_name:ident,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		handle: |$message:ident, $trace:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				basic_with_trace, {}, {},
+				|$message, $trace| $handler_body);
+	};
+
 	// Basic worker with just message
 	(
 		name: $worker_name:ident,
@@ -366,6 +380,16 @@ macro_rules! servlet {
 				config_only_with_init, {}, { $($config_field: $config_type,)* },
 				|$message, $config_param| $handler_body, $init_config, $init_body);
 		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
+	};
+
+	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  basic_with_trace, {}, {},
+			  |$message:ident, $trace:ident| $handler_body:expr) => {
+		servlet!(@impl_struct $worker_name, $protocol, {});
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				basic_with_trace, {}, {},
+				|$message, $trace| $handler_body);
+		// Note: basic_with_trace servlets have start(TraceCollector) signature, not Servlet trait
 	};
 
 	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
@@ -511,6 +535,42 @@ macro_rules! servlet {
 
 			servlet!(@drop_impl $worker_name);
 		}
+	};
+
+	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
+				   basic_with_trace, {}, {},
+				   |$message:ident, $trace:ident| $handler_body:expr) => {
+		impl $worker_name {
+			pub async fn start(assertions: $crate::testing::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
+				servlet!(@setup_protocol $protocol, listener, addr);
+				let (server_handle, server_pool_handles) = servlet!(@build_server_with_assertions
+					$protocol, listener, [$($policy_key: $policy_val),*], assertions,
+					(|$message: $crate::Frame, $trace| async move { $handler_body }));
+				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+			}
+
+			servlet!(@common_methods $protocol);
+		}
+
+		servlet!(@drop_impl $worker_name);
+	};
+
+	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
+				   basic_with_assertions, {}, {},
+				   |$message:ident, $trace:ident| $handler_body:expr, $assertions:expr) => {
+		impl $worker_name {
+			pub async fn start(assertions: $crate::testing::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
+				servlet!(@setup_protocol $protocol, listener, addr);
+				let (server_handle, server_pool_handles) = servlet!(@build_server_with_assertions
+					$protocol, listener, [$($policy_key: $policy_val),*], assertions,
+					(|$message: $crate::Frame, $trace| async move { $handler_body }));
+				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+			}
+
+			servlet!(@common_methods $protocol);
+		}
+
+		servlet!(@drop_impl $worker_name);
 	};
 
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
@@ -895,6 +955,41 @@ macro_rules! servlet {
 					}
 				}
 			};
+			(server_handle, Vec::new())
+		}
+	};
+
+	// Build server with assertions (non-empty policies)
+	(@build_server_with_assertions $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $assertions:expr, (|$msg:ident: $msg_ty:ty, $trace:ident| async move $body:block)) => {
+		{
+			let server_handle = $crate::server! {
+				protocol $protocol: $listener,
+				policies: { $($policy_key: $policy_val),* },
+				assertions: $assertions,
+				handle: move |$msg: $crate::Frame, $trace| {
+					async move {
+						$body
+					}
+				}
+			};
+
+			(server_handle, Vec::new())
+		}
+	};
+
+	// Build server with assertions (empty policies)
+	(@build_server_with_assertions $protocol:path, $listener:ident, [], $assertions:expr, (|$msg:ident: $msg_ty:ty, $trace:ident| async move $body:block)) => {
+		{
+			let server_handle = $crate::server! {
+				protocol $protocol: $listener,
+				assertions: $assertions,
+				handle: move |$msg: $crate::Frame, $trace| {
+					async move {
+						$body
+					}
+				}
+			};
+
 			(server_handle, Vec::new())
 		}
 	};

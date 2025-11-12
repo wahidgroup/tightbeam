@@ -196,7 +196,7 @@ mod tests {
 				.with_ukm(ukm)
 				.with_key_enc_alg(key_enc_alg);
 
-			let recipient_info = builder.build(&original_cek).map_err(|e| format!("build failed: {:?}", e))?;
+			let recipient_info = builder.build(&original_cek).map_err(|e| format!("build failed: {e:?}"))?;
 
 			// Extract KARI from RecipientInfo
 			let kari = match recipient_info {
@@ -250,7 +250,7 @@ mod tests {
 				.with_ukm(ukm)
 				.with_key_enc_alg(key_enc_alg);
 
-			let recipient_info = builder.build(&original_cek).map_err(|e| format!("build failed: {:?}", e))?;
+			let recipient_info = builder.build(&original_cek).map_err(|e| format!("build failed: {e:?}"))?;
 
 			let kari = match recipient_info {
 				RecipientInfo::Kari(k) => k,

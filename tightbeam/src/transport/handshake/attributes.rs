@@ -57,7 +57,7 @@ impl HandshakeAttribute {
 /// Convert X.509 Attribute to HandshakeAttribute.
 impl From<&Attribute> for HandshakeAttribute {
 	fn from(attr: &Attribute) -> Self {
-		HandshakeAttribute { attr_type: attr.oid.clone(), attr_values: attr.values.clone().into() }
+		HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() }
 	}
 }
 

@@ -153,8 +153,7 @@ pub fn secp256k1_signer_identifier(
 	let mut hasher = sha3::Sha3_256::new();
 	hasher.update(public_key_der.as_bytes());
 	let skid_bytes = hasher.finalize();
-	let octet_string =
-		OctetString::new(&skid_bytes[..20]).map_err(|e| crate::error::TightBeamError::SerializationError(e))?;
+	let octet_string = OctetString::new(&skid_bytes[..20]).map_err(crate::error::TightBeamError::SerializationError)?;
 	Ok(SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier::from(octet_string)))
 }
 

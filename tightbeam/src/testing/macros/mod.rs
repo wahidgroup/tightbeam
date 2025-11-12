@@ -156,10 +156,10 @@ impl Cardinality {
 	pub fn describe(&self) -> String {
 		match (self.min, self.max) {
 			(0, Some(0)) => "absent".into(),
-			(m, Some(n)) if m == n => format!("exactly {}", m),
-			(m, Some(n)) => format!("between {} and {}", m, n),
+			(m, Some(n)) if m == n => format!("exactly {m}"),
+			(m, Some(n)) => format!("between {m} and {n}"),
 			(m, None) if m == 0 => "any".into(),
-			(m, None) => format!("at least {}", m),
+			(m, None) => format!("at least {m}"),
 		}
 	}
 	pub fn is_satisfied_by(&self, count: usize) -> bool {
@@ -323,7 +323,7 @@ impl BuiltAssertSpec {
 		let contracts: Vec<AssertionContract> = builder
 			.assertions
 			.iter()
-			.map(|(phase, label, card)| AssertionContract::new(*phase, AssertionLabel::Custom(*label), *card))
+			.map(|(phase, label, card)| AssertionContract::new(*phase, AssertionLabel::Custom(label), *card))
 			.collect();
 		let spec_hash = Self::compute_hash(
 			builder.id,
@@ -352,22 +352,22 @@ impl BuiltAssertSpec {
 		let mut h = Sha3_256::new();
 		// Domain tag + version triple
 		h.update(b"TBSP");
-		h.update(&version_major.to_be_bytes());
-		h.update(&version_minor.to_be_bytes());
-		h.update(&version_patch.to_be_bytes());
+		h.update(version_major.to_be_bytes());
+		h.update(version_minor.to_be_bytes());
+		h.update(version_patch.to_be_bytes());
 		h.update(id.as_bytes());
 		let mode_code = match mode {
 			ExecutionMode::Accept => 0u8,
 			ExecutionMode::Reject => 1u8,
 			ExecutionMode::Error => 2u8,
 		};
-		h.update(&[mode_code]);
+		h.update([mode_code]);
 		match gate {
 			Some(g) => {
-				h.update(&[1u8]);
-				h.update(&[g as u8]);
+				h.update([1u8]);
+				h.update([g as u8]);
 			}
-			None => h.update(&[0u8]),
+			None => h.update([0u8]),
 		}
 		// Normalize assertion order independent of insertion sequence
 		let mut norm: Vec<(&'static str, u8, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
@@ -390,21 +390,21 @@ impl BuiltAssertSpec {
 		norm.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1))); // label then phase
 		for (lbl, phase_code, min, max, must) in norm {
 			h.update(lbl.as_bytes());
-			h.update(&[phase_code]);
-			h.update(&min.to_be_bytes());
+			h.update([phase_code]);
+			h.update(min.to_be_bytes());
 			match max {
 				Some(m) => {
-					h.update(&[1u8]);
-					h.update(&m.to_be_bytes());
+					h.update([1u8]);
+					h.update(m.to_be_bytes());
 				}
-				None => h.update(&[0u8]),
+				None => h.update([0u8]),
 			}
-			h.update(&[must as u8]);
+			h.update([must as u8]);
 		}
 		#[cfg(feature = "instrument")]
 		{
 			for ev in events {
-				h.update(&[*ev as u8]);
+				h.update([*ev as u8]);
 			}
 		}
 		let out = h.finalize();
@@ -682,10 +682,11 @@ macro_rules! tb_assert_spec {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_scenario_verify_impl {
-	// Single spec variant
+	// Single spec variant with optional CSP
 	(
 		single_spec: $spec:ty,
 		trace: $trace:expr,
+		$(csp: $csp:ty,)?
 		$(hooks: {
 			$(on_pass: $on_pass:expr,)?
 			$(on_fail: $on_fail:expr)?
@@ -693,8 +694,29 @@ macro_rules! __tb_scenario_verify_impl {
 	) => {{
 		let spec = <$spec>::latest();
 		let verification_result = $crate::testing::specs::verify_trace(spec, &$trace);
+
+		// CSP validation if provided
+		#[cfg(feature = "testing-csp")]
+		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = {
+			$crate::tb_scenario!(@csp_validate $trace, $($csp)?)
+		};
+
+		#[cfg(not(feature = "testing-csp"))]
+		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = None;
+
+		// Check if CSP validation failed
+		#[cfg(feature = "testing-csp")]
+		let csp_failed = csp_result.as_ref().map(|r| !r.valid).unwrap_or(false);
+		#[cfg(not(feature = "testing-csp"))]
+		let csp_failed = false;
+
 		match &verification_result {
 			Ok(()) => {
+				// L1 passed, check L2 (CSP)
+				if csp_failed {
+					panic!("Layer 1 (assertions) passed but Layer 2 (CSP) failed: {:?}", csp_result);
+				}
+
 				$( $( {
 					fn __call_on_pass<F>(f: F, trace: &$crate::testing::trace::ConsumedTrace)
 					where
@@ -706,6 +728,11 @@ macro_rules! __tb_scenario_verify_impl {
 				} )? )?
 			}
 			Err(_violations) => {
+				// L1 failed - also report L2 if it failed
+				if csp_failed {
+					eprintln!("Layer 1 (assertions) failed AND Layer 2 (CSP) failed: {:?}", csp_result);
+				}
+
 				$( $( {
 					fn __call_on_fail<F>(f: F, trace: &$crate::testing::trace::ConsumedTrace, violations: &$crate::testing::specs::SpecViolation)
 					where
@@ -720,10 +747,11 @@ macro_rules! __tb_scenario_verify_impl {
 		verification_result
 	}};
 
-	// Multiple specs variant
+	// Multiple specs variant with optional CSP
 	(
 		multi_specs: $specs:expr,
 		trace: $trace:expr,
+		$(csp: $csp:ty,)?
 		$(hooks: {
 			$(on_pass: $on_pass:expr,)?
 			$(on_fail: $on_fail:expr)?
@@ -731,6 +759,17 @@ macro_rules! __tb_scenario_verify_impl {
 	) => {{
 		let mut all_passed = true;
 		let mut first_violation = None;
+
+		// CSP validation if provided
+		#[cfg(feature = "testing-csp")]
+		#[allow(unused_variables)]
+		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = {
+			$crate::tb_scenario!(@csp_validate $trace, $($csp)?)
+		};
+
+		#[cfg(not(feature = "testing-csp"))]
+		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = None;
+
 		for spec in &$specs {
 			let verification_result = $crate::testing::specs::verify_trace(*spec, &$trace);
 			match &verification_result {
@@ -762,6 +801,7 @@ macro_rules! __tb_scenario_verify_impl {
 				}
 			}
 		}
+
 		if all_passed {
 			Ok(())
 		} else {
@@ -791,6 +831,7 @@ macro_rules! tb_scenario {
 	(
 		name: $test_name:ident,
 		spec: $spec:ty,
+		$(csp: $csp:ty,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
@@ -828,7 +869,7 @@ macro_rules! tb_scenario {
 			let (server_handle, server_addr) = server_setup_result.expect("Server setup failed");
 
 			// Default protocol to TokioListener if not specified
-			use crate::tb_scenario;
+			use $crate::tb_scenario;
 			type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
 			// Build client transport using the actual server address
@@ -864,6 +905,7 @@ macro_rules! tb_scenario {
 			let verification_result = $crate::__tb_scenario_verify_impl! {
 				single_spec: $spec,
 				trace: trace,
+				$(csp: $csp,)?
 				$(hooks: $hooks,)?
 			};
 
@@ -878,6 +920,7 @@ macro_rules! tb_scenario {
 		#[test]
 		fn $test_name() {
 			tb_scenario!(@execute ServiceClient, single_spec, $spec,
+				$(csp: $csp,)?
 				$(instrumentation: $instr_cfg,)?
 				$(hooks: $hooks,)?
 				protocol: { $($protocol)? },
@@ -892,16 +935,42 @@ macro_rules! tb_scenario {
 	(
 		name: $test_name:ident,
 		spec: $spec:ty,
+		$(csp: $csp:ty,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
-		$(, hooks $hooks:tt)?
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
 		$(,)?
 	) => {
 		#[test]
 		fn $test_name() {
-			let result = tb_scenario!(@execute Bare, single_spec, $spec, $(instrumentation: $instr_cfg,)? $(hooks: $hooks,)? exec: $exec_closure);
+			use $crate::tb_scenario;
+			let result = tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure);
+			result.expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for Bare environment (multiple specs) =====
+	(
+		name: $test_name:ident,
+		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Bare {
+			exec: $exec_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			let result = tb_scenario!(@execute Bare, multi_specs, [ $( $spec_expr ),+ ], $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure);
 			result.expect(concat!("Test failed: ", stringify!($test_name)));
 		}
 	};
@@ -915,12 +984,101 @@ macro_rules! tb_scenario {
 			setup: $setup_closure:expr,
 			stimulus: $stimulus_closure:expr
 		}
-		$(, hooks $hooks:tt)?
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
 		$(,)?
 	) => {
 		#[test]
 		fn $test_name() {
-			let result = tb_scenario!(@execute Worker, single_spec, $spec, $(instrumentation: $instr_cfg,)? $(hooks: $hooks,)? setup: $setup_closure, stimulus: $stimulus_closure);
+			let result = tb_scenario!(@execute Worker, single_spec, $spec, $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? setup: $setup_closure, stimulus: $stimulus_closure);
+			result.expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for Worker environment (multiple specs) =====
+	(
+		name: $test_name:ident,
+		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Worker {
+			setup: $setup_closure:expr,
+			stimulus: $stimulus_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			let result = tb_scenario!(@execute Worker, multi_specs, [ $( $spec_expr ),+ ], $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? setup: $setup_closure, stimulus: $stimulus_closure);
+			result.expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for ServiceClient environment (single spec) =====
+	(
+		name: $test_name:ident,
+		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(instrumentation: $instr_cfg:expr,)?
+		environment ServiceClient {
+			$(protocol: $protocol:path,)?
+			$(worker_threads: $threads:literal,)?
+			server: $server_closure:expr,
+			client: $client_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			let result = tb_scenario!(@execute ServiceClient, single_spec, $spec,
+				$(csp: $csp,)?
+				$(instrumentation: $instr_cfg,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+				protocol: { $($protocol)? },
+				worker_threads: { $($threads)? },
+				server: $server_closure,
+				client: $client_closure
+			);
+			result.expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for ServiceClient environment (multiple specs) =====
+	(
+		name: $test_name:ident,
+		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(instrumentation: $instr_cfg:expr,)?
+		environment ServiceClient {
+			$(protocol: $protocol:path,)?
+			$(worker_threads: $threads:literal,)?
+			server: $server_closure:expr,
+			client: $client_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			let result = tb_scenario!(@execute ServiceClient, multi_specs, [ $( $spec_expr ),+ ],
+				$(instrumentation: $instr_cfg,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+				protocol: { $($protocol)? },
+				worker_threads: { $($threads)? },
+				server: $server_closure,
+				client: $client_closure
+			);
 			result.expect(concat!("Test failed: ", stringify!($test_name)));
 		}
 	};
@@ -1099,7 +1257,7 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== Execution dispatcher for Bare environment =====
-	(@execute Bare, single_spec, $spec:ty, $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
+	(@execute Bare, single_spec, $spec:ty, $(csp: $csp:ty,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
 		#[cfg(feature = "instrument")]
 		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
 		#[cfg(feature = "instrument")]
@@ -1134,6 +1292,7 @@ macro_rules! tb_scenario {
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			single_spec: $spec,
 			trace: trace,
+			$(csp: $csp,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
@@ -1351,6 +1510,7 @@ macro_rules! tb_scenario {
 
 	// ===== Execution dispatcher for ServiceClient environment =====
 	(@execute ServiceClient, single_spec, $spec:ty,
+		$(csp: $csp:ty,)?
 		$(instrumentation: $instr_mode:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
@@ -1415,6 +1575,7 @@ macro_rules! tb_scenario {
 			let verification_result = $crate::__tb_scenario_verify_impl! {
 				single_spec: $spec,
 				trace: trace,
+				$(csp: $csp,)?
 				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			};
 
@@ -1538,12 +1699,99 @@ macro_rules! tb_scenario {
 		tb_scenario!(@propagate_result client_result, verification_result)
 	}};
 
-	// ===== Helper dispatchers for defaults =====
+	// ===== Servlet environment variant =====
+	// Servlet is defined at module scope, test environment starts it
+	(
+		name: $test_name:ident,
+		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Servlet {
+			servlet: $servlet_name:ident,
+			$(start: $start_expr:expr,)?
+			client: $client_closure:expr
+		}
+		$(, hooks $hooks:tt)?
+		$(,)?
+	) => {
+		#[cfg(feature = "tokio")]
+		#[tokio::test]
+		async fn $test_name() {
+			// Create trace collector
+			let trace_collector = $crate::testing::macros::TraceCollector::new();
+			let trace_client = trace_collector.clone();
+			let trace_server = trace_collector.clone();
+
+			// Start servlet - use custom start expression or default start(trace_server)
+			let servlet_instance = $crate::__tb_scenario_servlet_start!(
+				$servlet_name,
+				trace_server,
+				$($start_expr)?
+			);
+
+			// Get servlet address and create client
+			let server_addr = servlet_instance.addr();
+
+			// Wrap client creation in an async block that returns Result
+			let client = async {
+				Ok::<_, $crate::TightBeamError>($crate::client! {
+					connect $crate::transport::tcp::r#async::TokioListener: server_addr
+				})
+			}.await.expect("Failed to connect client");
+
+			// Execute client closure
+			async fn __call_client_closure<F, Fut, T>(
+				closure: F,
+				trace: $crate::testing::macros::TraceCollector,
+				client: T,
+			) -> Result<(), $crate::TightBeamError>
+			where
+				F: FnOnce($crate::testing::macros::TraceCollector, T) -> Fut,
+				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+			{
+				closure(trace, client).await
+			}
+			let client_result = __call_client_closure($client_closure, trace_client, client).await;
+
+			// Stop servlet
+			servlet_instance.stop();
+
+			// Collect trace
+			let mut trace = $crate::testing::trace::ConsumedTrace::new();
+			trace.populate_from_collector(&trace_collector);
+			trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
+			if client_result.is_err() {
+				trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
+			}
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				single_spec: $spec,
+				trace: trace,
+				$(csp: $csp,)?
+				$(hooks: $hooks,)?
+			};
+
+			if let Err(e) = client_result {
+				panic!("Client execution failed: {:?}", e);
+			} else if let Err(v) = verification_result {
+				panic!("Spec verification failed: {:?}", v);
+			}
+		}
+	};	// ===== Helper dispatchers for defaults =====
 	(@default_worker_threads) => { 2 };
 	(@default_worker_threads $threads:literal) => { $threads };
 
 	(@default_protocol) => { $crate::transport::tcp::r#async::TokioListener };
 	(@default_protocol $protocol:path) => { $protocol };
+
+	// ===== CSP validation helper =====
+	(@csp_validate $trace:expr, $csp:ty) => {{
+		let csp_spec = <$csp>::default();
+		Some(<$csp as $crate::testing::specs::csp::ProcessSpec>::validate_trace(&csp_spec, &$trace))
+	}};
+	(@csp_validate $trace:expr,) => {{
+		None::<$crate::testing::specs::csp::CspValidationResult>
+	}};
 
 	// ===== Shared result propagation logic =====
 	(@propagate_result $exec_result:ident, $verification_result:ident) => {
@@ -1562,6 +1810,20 @@ macro_rules! tb_scenario {
 	};
 }
 
+/// Helper macro for starting servlets in tb_scenario!
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_scenario_servlet_start {
+	// Custom start expression provided
+	($servlet:ident, $trace:expr, $start:expr) => {
+		$start.await.expect("Failed to start servlet")
+	};
+	// Default: call start with trace collector
+	($servlet:ident, $trace:expr,) => {
+		$servlet::start($trace).await.expect("Failed to start servlet")
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1577,7 +1839,6 @@ mod tests {
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;
 	use crate::transport::Protocol;
-	use crate::TightBeamError;
 
 	#[test]
 	fn cardinality_basic() {
@@ -1640,45 +1901,29 @@ mod tests {
 		assert_eq!(DemoSpec::latest().version(), (1, 1, 0));
 	}
 
-	#[test]
-	fn scenario_bare_with_hooks() {
-		use std::sync::atomic::{AtomicBool, Ordering};
-		static PASS_CALLED: AtomicBool = AtomicBool::new(false);
-
-		let result = tb_scenario! {
-			spec: DemoSpec,
-			environment Bare {
-				exec: |trace| {
-					trace.assert(AssertionPhase::HandlerStart, "Received");
-					trace.assert(AssertionPhase::Response, "Responded");
-					trace.assert(AssertionPhase::Response, "Responded");
-					Ok(())
-				}
-			},
-			hooks {
-				on_pass: |_trace| {
-					PASS_CALLED.store(true, Ordering::SeqCst);
-				},
-				on_fail: |_trace, _v| {}
+	tb_scenario! {
+		name: scenario_bare_with_hooks,
+		spec: DemoSpec,
+		environment Bare {
+			exec: |trace| {
+				trace.assert(AssertionPhase::HandlerStart, "Received");
+				trace.assert(AssertionPhase::Response, "Responded");
+				trace.assert(AssertionPhase::Response, "Responded");
+				Ok(())
 			}
-		};
-		assert!(result.is_ok());
-		assert!(PASS_CALLED.load(Ordering::SeqCst), "on_pass hook should have been called");
+		}
 	}
 
-	#[test]
-	fn scenario_bare_specific_version() {
-		let result = tb_scenario! {
-			specs: [DemoSpec::get(1, 0, 0)],
-			environment Bare {
-				exec: |trace| {
-					trace.assert(AssertionPhase::HandlerStart, "Received");
-					trace.assert(AssertionPhase::Response, "Responded");
-					Ok(())
-				}
+	tb_scenario! {
+		name: scenario_bare_specific_version,
+		specs: [DemoSpec::get(1, 0, 0)],
+		environment Bare {
+			exec: |trace| {
+				trace.assert(AssertionPhase::HandlerStart, "Received");
+				trace.assert(AssertionPhase::Response, "Responded");
+				Ok(())
 			}
-		};
-		assert!(result.is_ok());
+		}
 	}
 
 	#[test]
@@ -1721,73 +1966,63 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn scenario_worker_basic() {
-		let result: Result<(), crate::TightBeamError> = tb_scenario! {
-			spec: DemoSpec,
-			environment Worker {
-				setup: |trace| TestWorker::new(trace),
-				stimulus: |_trace, worker: &mut TestWorker| worker.process()
-			}
-		};
-		assert!(result.is_ok());
+	tb_scenario! {
+		name: scenario_worker_basic,
+		spec: DemoSpec,
+		environment Worker {
+			setup: TestWorker::new,
+			stimulus: |_trace, worker: &mut TestWorker| worker.process()
+		}
 	}
 
-	#[test]
-	fn scenario_worker_specific_version() {
-		let result: Result<(), crate::TightBeamError> = tb_scenario! {
-			specs: [DemoSpec::get(1, 0, 0)],
-			environment Worker {
-				setup: |trace| TestWorker::new(trace),
-				stimulus: |trace, worker: &mut TestWorker| {
-					trace.assert(AssertionPhase::HandlerStart, "Received");
-					worker.received_count += 1;
-					trace.assert(AssertionPhase::Response, "Responded");
-					Ok(())
-				}
+	tb_scenario! {
+		name: scenario_worker_specific_version,
+		specs: [DemoSpec::get(1, 0, 0)],
+		environment Worker {
+			setup: TestWorker::new,
+			stimulus: |trace, worker: &mut TestWorker| {
+				trace.assert(AssertionPhase::HandlerStart, "Received");
+				worker.received_count += 1;
+				trace.assert(AssertionPhase::Response, "Responded");
+				Ok(())
 			}
-		};
-		assert!(result.is_ok());
+		}
 	}
 
 	// ServiceClient tests require async runtime and transport features
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	#[test]
-	fn scenario_service_client_basic() {
-		let result: Result<(), TightBeamError> = tb_scenario! {
-			spec: DemoSpec,
-			environment ServiceClient {
-				worker_threads: 2,
-				server: |trace: TraceCollector| async move {
-					let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
-					let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
-					let handle = crate::server! {
-						protocol TokioListener: listener,
-						assertions: trace,
-						handle: |frame, trace| async move {
-							trace.assert(AssertionPhase::HandlerStart, "Received");
-							trace.assert(AssertionPhase::Response, "Responded");
-							trace.assert(AssertionPhase::Response, "Responded");
-							Some(frame)
-						}
-					};
+	tb_scenario! {
+		name: scenario_service_client_basic,
+		spec: DemoSpec,
+		environment ServiceClient {
+			worker_threads: 2,
+			server: |trace: TraceCollector| async move {
+				let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
+				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+				let handle = crate::server! {
+					protocol TokioListener: listener,
+					assertions: trace,
+					handle: |frame, trace| async move {
+						trace.assert(AssertionPhase::HandlerStart, "Received");
+						trace.assert(AssertionPhase::Response, "Responded");
+						trace.assert(AssertionPhase::Response, "Responded");
+						Some(frame)
+					}
+				};
 
-					Ok((handle, addr))
-				},
-				client: |_trace: TraceCollector, mut client| async move {
-					let test_message = create_test_message(None);
-					let test_frame = crate::compose! {
-						V0: id: "test", order: 1u64, message: test_message
-					}?;
+				Ok((handle, addr))
+			},
+			client: |_trace: TraceCollector, mut client| async move {
+				let test_message = create_test_message(None);
+				let test_frame = crate::compose! {
+					V0: id: "test", order: 1u64, message: test_message
+				}?;
 
-					let _response = client.emit(test_frame, None).await?;
+				let _response = client.emit(test_frame, None).await?;
 
-					Ok(())
-				}
+				Ok(())
 			}
-		};
-
-		assert!(result.is_ok());
+		}
 	}
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
@@ -1862,7 +2097,7 @@ mod tests {
 				assert_eq!(responded_count, 2, "Expected 2 'Responded' labels");
 			},
 			on_fail: |_trace, violations| {
-				panic!("Test should not fail! Violations: {:?}", violations);
+				panic!("Test should not fail! Violations: {violations:?}");
 			}
 		}
 	}
