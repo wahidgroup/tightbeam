@@ -10,6 +10,7 @@ ignorePaths:
 words:
   - addrs
   - Beamable
+  - CBVOC
   - ciphertext
   - ciphertexts
   - crls

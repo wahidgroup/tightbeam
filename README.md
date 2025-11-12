@@ -2369,11 +2369,14 @@ optionally a profile.
 
 ---
 
-For practical examples see: `tests/` directory (AssertSpec), forthcoming `tests/csp/` (ProcessSpec), and `tests/refinement/` (FDR layer).
+For practical examples see: `tests/` directory (AssertSpec), forthcoming 
+`tests/csp/` (ProcessSpec), and `tests/refinement/` (FDR layer).
 
 ### 10.9 Example: Comprehensive Instrumented Test (Normative Usage Pattern)
 
-This example illustrates a fully instrumented AssertSpec execution. It MUST compile once the corresponding macros and types are implemented.
+This example illustrates a fully instrumented AssertSpec execution. It MUST 
+compile once the corresponding macros and types are implemented.
+
 ```rust
 #![cfg(all(feature = "testing", feature = "instrument"))]
 use tightbeam::testing::*;

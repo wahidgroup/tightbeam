@@ -8,12 +8,14 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-#[cfg(feature = "instrument")]
-use crate::instrumentation; // for event emission when feature enabled
-use crate::testing::macros::Cardinality;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use sha3::{Digest, Sha3_256};
+
+use crate::crypto::hash::{Digest, Sha3_256};
+use crate::testing::macros::Cardinality;
+
+#[cfg(feature = "instrument")]
+use crate::instrumentation; // for event emission when feature enabled
 
 thread_local! { static ASSERT_BUF: RefCell<Vec<Assertion>> = RefCell::new(Vec::new()); }
 static ASSERT_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -96,6 +98,30 @@ pub fn record_assertion(phase: AssertionPhase, label: &'static str, payload: Opt
 		buf.borrow_mut()
 			.push(Assertion::new(seq, phase, AssertionLabel::Custom(label), payload_hash))
 	});
+	#[cfg(feature = "instrument")]
+	{
+		let _ = instrumentation::emit(instrumentation::TbEventKind::AssertLabel, Some(label), None, None, 0, None);
+		if let Some(p) = payload {
+			let _ =
+				instrumentation::emit(instrumentation::TbEventKind::AssertPayload, Some(label), Some(p), None, 0, None);
+		}
+	}
+}
+
+/// Record an assertion to an explicit collector (for ServiceClient testing).
+#[cfg(feature = "std")]
+pub fn record_assertion_to(
+	collector: &std::sync::Arc<std::sync::Mutex<Vec<Assertion>>>,
+	phase: AssertionPhase,
+	label: &'static str,
+	payload: Option<&[u8]>,
+) {
+	let seq = ASSERT_SEQ.fetch_add(1, Ordering::Relaxed);
+	let payload_hash = payload.map(hash_payload);
+	collector
+		.lock()
+		.unwrap()
+		.push(Assertion::new(seq, phase, AssertionLabel::Custom(label), payload_hash));
 	#[cfg(feature = "instrument")]
 	{
 		let _ = instrumentation::emit(instrumentation::TbEventKind::AssertLabel, Some(label), None, None, 0, None);

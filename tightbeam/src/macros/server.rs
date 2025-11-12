@@ -502,6 +502,15 @@ macro_rules! server {
 		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, $handler)
 	}};
 
+	(protocol $protocol:path: $listener:expr, assertions: $assertions:expr, handle: $handler:expr) => {{
+		let __assertions = $assertions.clone();
+		let __wrapped_handler = move |frame| {
+			let __assertions = __assertions.clone();
+			$handler(frame, __assertions)
+		};
+		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, __wrapped_handler)
+	}};
+
 	(protocol $protocol:path: bind $addr:expr, handle: $handler:expr) => {{
 		$crate::__tightbeam_server_protocol_bind_handle!($protocol, $addr, $handler)
 	}};

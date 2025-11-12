@@ -3,20 +3,23 @@
 //! Aggregates submodules and provides demo macro usage to surface
 //! compilation errors early when introducing new declarative APIs.
 
-pub mod assertions; // currently placeholder
+pub mod assertions;
 pub mod macros;
-pub mod spec;
+pub mod specs;
 pub mod trace;
 pub mod utils;
 
 pub use utils::*;
+
+// Re-export commonly used items from specs module for convenience
+pub use specs::{verify_trace, SpecViolation, TBSpec};
 
 // Demo labels using tb_labels! macro (payload + non-payload)
 crate::tb_labels! { pub enum TbDemoLabels { MessageReceived => payload, HandlerStart } }
 
 #[cfg(test)]
 mod tests {
-	use crate::testing::spec::TBSpec;
+	use crate::testing::TBSpec;
 
 	crate::tb_assert_spec! {
 		pub DemoSpec,

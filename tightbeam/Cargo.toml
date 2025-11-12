@@ -105,6 +105,8 @@ transport-policy = ["transport", "policy"]
 tcp = ["transport"]
 colony = ["full"]
 testing = []
+testing-csp = ["testing"]
+testing-fdr = ["testing", "testing-csp"]
 instrument = ["std", "sha3"]
 
 # TODO
