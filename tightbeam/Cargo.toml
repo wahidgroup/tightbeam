@@ -50,11 +50,13 @@ paste = { workspace = true }
 ## Compression dependencies
 zeekstd = { workspace = true, optional = true }
 
+## Fuzzing dependencies
+afl = { workspace = true, optional = true }
+
 [dev-dependencies]
 rand = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 fake = { workspace = true }
-afl = "0.17.0"
 
 [features]
 default = ["full"]
@@ -111,7 +113,8 @@ colony = ["full"]
 testing = []
 testing-csp = ["testing"]
 testing-fdr = ["testing", "testing-csp"]
-testing-fuzz = ["testing"]
+testing-fuzz = ["testing", "dep:afl"]
+testing-fuzz-ijon = ["testing-fuzz"]
 instrument = ["std", "sha3"]
 
 # TODO

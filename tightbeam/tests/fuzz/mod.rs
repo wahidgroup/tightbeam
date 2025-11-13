@@ -8,3 +8,6 @@ pub mod simple_workflow;
 
 #[cfg(fuzzing)]
 pub mod complex_workflow;
+
+#[cfg(fuzzing)]
+pub mod verification;

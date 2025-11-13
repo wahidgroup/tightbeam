@@ -112,6 +112,7 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.2.3. [Implementation Examples](#1023-implementation-examples)
 		- 10.2.4. [Generated API](#1024-generated-api)
 		- 10.2.5. [Cardinality Helpers](#1025-cardinality-helpers)
+		- 10.2.6. [Value Assertion Helpers](#1026-value-assertion-helpers)
 	- 10.3. [Layer 2: Process Specifications (CSP)](#103-layer-2-process-specifications-csp)
 		- 10.3.1. [Concept](#1031-concept)
 		- 10.3.2. [Specification: tb_process_spec! Syntax](#1032-specification-tb_process_spec-syntax)
@@ -133,27 +134,31 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.5.6. [CSPM Export for FDR4 Integration](#1056-cspm-export-for-fdr4-integration)
 		- 10.5.7. [Trace Analysis Extensions](#1057-trace-analysis-extensions)
 	- 10.6. [Unified Testing: tb_scenario! Macro](#106-unified-testing-tb_scenario-macro)
-		- 10.6.1. [Concept](#1061-concept)
-		- 10.6.2. [Specification: Syntax](#1062-specification-syntax)
-		- 10.6.3. [Complete Examples](#1063-complete-examples)
-	- 10.7. [Instrumentation Specification](#107-instrumentation-specification)
-		- 10.7.1. [Objectives](#1071-objectives)
-		- 10.7.2. [Event Kind Taxonomy](#1072-event-kind-taxonomy)
-		- 10.7.3. [Event Structure](#1073-event-structure)
-		- 10.7.4. [Payload Representation](#1074-payload-representation)
-		- 10.7.5. [Configuration](#1075-configuration)
-		- 10.7.6. [Evidence Artifact Format](#1076-evidence-artifact-format)
-		- 10.7.7. [Failure Handling](#1077-failure-handling)
+		- 10.6.1. [Syntax](#1061-syntax)
+		- 10.6.2. [Examples](#1062-examples)
+	- 10.7. [Coverage-Guided Fuzzing with AFL](#107-coverage-guided-fuzzing-with-afl)
+		- 10.7.1. [Concept](#1071-concept)
+		- 10.7.2. [Creating Fuzz Targets](#1072-creating-fuzz-targets)
+		- 10.7.3. [Building and Running Fuzz Targets](#1073-building-and-running-fuzz-targets)
+		- 10.7.4. [Advanced: CSP Oracle Integration](#1074-advanced-csp-oracle-integration)
+		- 10.7.5. [IJON Integration: Input-to-State Correspondence](#1075-ijon-integration-input-to-state-correspondence)
 	- 10.8. [Feature Matrix](#108-feature-matrix)
-11. [End-to-End Examples](#11-end-to-end-examples)
-	- 11.1. [Complete Client-Server Application](#111-complete-client-server-application)
-12. [References](#12-references)
-	- 12.1. [Normative References](#121-normative-references)
-	- 12.2. [Standards References](#122-standards-references)
-	- 12.3. [ASN.1 References](#123-asn1-references)
-	- 12.4. [Academic References](#124-academic-references)
-13. [License](#13-license)
-14. [Implementation Notes](#14-implementation-notes)
+11. [Instrumentation](#11-instrumentation)
+	- 11.1. [Objectives](#111-objectives)
+	- 11.2. [Event Kind Taxonomy](#112-event-kind-taxonomy)
+	- 11.3. [Event Structure](#113-event-structure)
+	- 11.4. [Payload Representation](#114-payload-representation)
+	- 11.5. [Configuration](#115-configuration)
+	- 11.6. [Evidence Artifact Format](#116-evidence-artifact-format)
+	- 11.7. [Failure Handling](#117-failure-handling)
+12. [End-to-End Examples](#12-end-to-end-examples)
+	- 12.1. [Complete Client-Server Application](#121-complete-client-server-application)
+13. [References](#13-references)
+	- 13.1. [Normative References](#131-normative-references)
+	- 13.2. [Standards References](#132-standards-references)
+	- 13.3. [ASN.1 References](#133-asn1-references)
+14. [License](#14-license)
+15. [Implementation Notes](#15-implementation-notes)
 
 ## 1. Introduction
 
@@ -1787,6 +1792,7 @@ tb_assert_spec! {
 		assertions: [
 			(HandlerStart, "relay_start", exactly!(2)),
 			(Response, "relay_success", exactly!(1)),
+			(Response, "response_result", exactly!(1), equals!("PONG")),
 			(Gate, "relay_rejected", exactly!(1))
 		]
 	},
@@ -1822,8 +1828,12 @@ tb_scenario! {
 				content: "PING".to_string(),
 				lucky_number: 42,
 			};
+
 			let response = worker.relay(ping_msg)?;
-			assert_eq!(response, Some(PongMessage { result: "PONG".to_string() }));
+			if let Some(pong) = response {
+				trace.assert_value(AssertionPhase::Response, "response_result", pong.result);
+			}
+
 			trace.assert(AssertionPhase::Response, "relay_success");
 
 			// Test rejected message
@@ -1832,9 +1842,11 @@ tb_scenario! {
 				content: "PONG".to_string(),
 				lucky_number: 42,
 			};
+
 			let result = worker.relay(pong_msg);
-			assert!(matches!(result, Err(WorkerRelayError::Rejected(_))));
-			trace.assert(AssertionPhase::Gate, "relay_rejected");
+			if result.is_err() {
+				trace.assert(AssertionPhase::Gate, "relay_rejected");
+			}
 
 			Ok(())
 		}
@@ -2114,7 +2126,7 @@ Based on FDR (Failures-Divergences Refinement) model checking methodology.
 All three layers are accessed through the `tb_scenario!` macro, which provides:
 - Consistent syntax across all verification layers
 - Progressive enhancement (L1 → L1+L2 → L1+L2+L3)
-- Environment abstraction (ServiceClient, Worker, Bare)
+- Environment abstraction (ServiceClient, Servlet, Worker, Bare)
 - Instrumentation integration
 - Policy enforcement
 
@@ -2136,6 +2148,7 @@ AssertSpec defines expected behavioral invariants through declarative assertion
 specifications. Each specification version declares:
 - Expected assertion labels (event identifiers)
 - Cardinality constraints (exactly, at_least, at_most, between)
+- Value assertions (equals) for verifying assertion payload values
 - Execution mode (Accept, Reject)
 - Gate policy (Accepted, Rejected, etc.)
 
@@ -2238,6 +2251,10 @@ The framework provides cardinality constraint macros:
 - `between!(min, max)`: Range [min, max] occurrences
 - `present!()`: At least one occurrence
 - `absent!()`: Zero occurrences
+
+#### 10.2.6 Value Assertion Helpers
+
+The framework provides value assertion helpers for verifying assertion payload values:
 - `equals!(value)`: Verify assertion value equality (supports String, bool, u8, u32, u64, i32, i64)
 
 ### 10.3 Layer 2: Process Specifications (CSP)
@@ -2366,19 +2383,25 @@ tb_scenario! {
 
 #### 10.4.4 Multi-Seed Exploration
 
-Based on research by Pedersen & Chalmers (2024), refinement in cooperatively
-scheduled systems depends on resource availability. With `n` concurrent processes
-and `m` schedulers where `m < n`, some traces become impossible due to scheduling
-constraints.
+The `seeds` parameter controls how many different execution paths are explored
+during verification. Each seed produces a different scheduling of concurrent
+operations, uncovering race conditions and nondeterministic behavior:
 
-**Multi-seed exploration addresses this**: Each seed represents a different
-scheduling strategy, exploring alternative interleavings of concurrent events.
-At nondeterministic choice points, the seed determines which branch to explore.
+```rust
+fdr: FdrConfig {
+	seeds: 64,  // Try 64 different execution orderings
+	// ...
+}
+```
 
-Across all seeds, the framework verifies:
-1. **Trace refinement**: All observable traces are valid
-2. **Failures refinement**: No invalid refusals at choice points
-3. **Divergence freedom**: No seed produces infinite τ-loops
+Higher seed counts increase confidence but also test execution time. Typical values:
+- **Development**: 16-32 seeds for quick feedback
+- **CI Pipeline**: 64-128 seeds for thorough verification
+- **Release**: 256+ seeds for critical protocols
+
+Each seed explores different interleaving at nondeterministic choice points,
+verifying trace refinement, failures refinement, and divergence freedom across
+all executions.
 
 #### 10.4.5 FDR Verdict Structure
 
@@ -2494,7 +2517,7 @@ branches, ensuring the specification covers all implementation behaviors.
 
 #### 10.5.4 Multi-Seed Exploration and Scheduler Interleaving
 
-Based on research by Pedersen & Chalmers (2024), refinement in cooperatively
+Based on research by Pedersen & Chalmers,[^pedersen2024] refinement in cooperatively
 scheduled systems depends on resource availability. With `n` concurrent processes
 and `m` schedulers where `m < n`, some traces become impossible due to scheduling
 constraints.
@@ -2616,18 +2639,18 @@ assert!(!trace.can_refuse_after("Connected", "request"));
 
 ### 10.6 Unified Testing: tb_scenario! Macro
 
-#### 10.6.1 Concept
-
-`tb_scenario!` is the unified entry point for all testing layers. It executes
-an AssertSpec under a selectable environment with optional CSP and FDR verification.
+The `tb_scenario!` macro is the unified entry point for all testing layers,
+executing AssertSpec verifications under selectable environments with optional
+CSP and FDR verification.
 
 **Design Principles**:
 - Single consistent syntax across all verification layers
 - Progressive enhancement (L1 → L1+L2 → L1+L2+L3)
-- Environment abstraction for different testing contexts
-- Hooks for custom validation and debugging
+- Environment abstraction (ServiceClient, Servlet, Worker, Bare)
+- Instrumentation integration
+- Policy enforcement
 
-#### 10.6.2 Specification: Syntax
+#### 10.6.1 Syntax
 
 ```rust
 tb_scenario! {
@@ -2642,18 +2665,9 @@ tb_scenario! {
 }
 ```
 
-**Field Requirements**:
-- `name`: Optional, generates a standalone `#[test]` function
-- `spec`: Always required (Layer 1 foundation)
-- `csp`: Optional, enables Layer 2 verification
-- `fuzz`: Optional, requires `csp` to be present (enables CSP-guided fuzzing)
-- `fdr`: Optional, requires `csp` to be present (compile error if missing)
-- `environment`: Required, defines execution context
-- `hooks`: Optional, for custom validation
-
 See sections 10.3.4 and 10.4 for detailed environment examples.
 
-#### 10.6.3 Complete Examples
+#### 10.6.2 Examples
 
 **Bare Environment Example**: Pure logic/function invocation
 
@@ -2775,7 +2789,7 @@ tb_scenario! {
 			};
 			Ok((handle, addr))
 		},
-		client: |trace: TraceCollector, mut client| async move {
+		client: |trace, mut client| async move {
 			trace.assert(AssertionPhase::Response, "response");
 			let frame = compose! {
 				V0: id: "test",
@@ -2810,28 +2824,274 @@ This test verifies:
 - **L2**: Valid CSP state transitions with internal events
 - **L3**: Trace refinement across multiple exploration seeds
 
-**Key Framework Features Demonstrated**:
-- **TraceCollector**: Explicitly passed to server and client closures
-- **server! macro**: Uses `assertions: trace` to pass TraceCollector to handlers
-- **Handler signature**: `|frame, trace|` receives trace for assertions
-- **Client signature**: `|trace: TraceCollector, mut client|` receives both trace and client
-- **Progressive verification**: L1 assertions → L2 CSP validation → L3 refinement checking
+### 10.7 Coverage-Guided Fuzzing with AFL
 
-### 10.7 Instrumentation Specification
+#### 10.7.1 Concept
 
-This subsection normatively specifies the TightBeam instrumentation subsystem. Instrumentation produces a semantic event sequence consumed by verification logic. It is an observation facility, NOT an application logging API. Tests MUST NOT depend on instrumentation events imperatively; verification MUST treat the event stream as authoritative ground truth for one execution.
+TightBeam integrates [AFL.rs](https://github.com/rust-fuzz/afl.rs), a Rust port
+of American Fuzzy Lop, for coverage-guided fuzzing of protocol implementations.
+Unlike deterministic random testing, AFL uses evolutionary algorithms with
+compile-time instrumentation to discover inputs that trigger new code paths.
+
+**How AFL Works**:
+1. **Instrumentation**: Code is compiled with coverage tracking (edge counters)
+2. **Input Corpus**: Starts with seed inputs, mutates them intelligently
+3. **Feedback Loop**: Monitors code coverage, keeps inputs that discover new paths
+4. **Crash Detection**: Automatically detects crashes, hangs, and assertion failures
+
+**Integration with tb_scenario!**: The `fuzz: afl` parameter generates AFL-compatible
+fuzz targets that leverage the CSP oracle for guided exploration:
+
+```rust
+tb_scenario! {
+	fuzz: afl,              // ← AFL fuzzing mode
+	spec: MySpec,
+	csp: MyProcess,         // ← CSP oracle for valid state navigation
+	environment Bare {
+		exec: |trace| {
+			// AFL provides random bytes, oracle navigates state machine
+			match trace.oracle().fuzz_from_bytes() {
+				Ok(()) => {
+					for event in trace.oracle().trace() {
+						trace.assert(AssertionPhase::HandlerStart, event.0);
+					}
+					Ok(())
+				}
+				Err(_) => Err(TestingError::FuzzInputExhausted.into())
+			}
+		}
+	}
+}
+```
+
+**Feature Requirements**:
+- `testing-fuzz` feature flag
+- `cargo-afl` installed: `cargo install cargo-afl`
+- Fuzz targets gated by `#[cfg(fuzzing)]` to avoid compilation during normal tests
+
+#### 10.7.2 Creating Fuzz Targets
+
+**Example Fuzz Target**:
+
+```rust
+//! Simple 3-state workflow fuzz target for AFL
+
+#![cfg(all(feature = "std", feature = "testing-csp"))]
+
+use tightbeam::testing::{assertions::AssertionPhase, error::TestingError};
+use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+
+// Layer 1: Assertion spec
+tb_assert_spec! {
+	pub SimpleFuzzSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "start", exactly!(1)),
+			(HandlerStart, "action_a", at_least!(0)),
+			(HandlerStart, "action_b", at_least!(0)),
+			(HandlerStart, "done", exactly!(1))
+		]
+	},
+}
+
+// Layer 2: CSP process with nondeterministic choices
+tb_process_spec! {
+	pub struct SimpleFuzzProc;
+	events {
+		observable { "start", "action_a", "action_b", "done" }
+		hidden { }
+	}
+	states {
+		S0 => { "start" => S1 },
+		S1 => { "action_a" => S1, "action_b" => S1, "done" => S2 }
+	}
+	terminal { S2 }
+}
+
+// AFL fuzz target - compiled with `cargo afl build`
+#[cfg(fuzzing)]
+tb_scenario! {
+	fuzz: afl,
+	spec: SimpleFuzzSpec,
+	csp: SimpleFuzzProc,
+	environment Bare {
+		exec: |trace| {
+			// AFL provides bytes, oracle interprets as state machine choices
+			match trace.oracle().fuzz_from_bytes() {
+				Ok(()) => {
+					for event in trace.oracle().trace() {
+						trace.assert(AssertionPhase::HandlerStart, event.0);
+					}
+					Ok(())
+				}
+				Err(_) => Err(TestingError::FuzzInputExhausted.into())
+			}
+		}
+	}
+}
+```
+
+#### 10.7.3 Building and Running Fuzz Targets
+
+**Prerequisites**:
+```bash
+cargo install cargo-afl
+```
+
+**Run AFL Fuzzer**:
+```bash
+mkdir -p fuzz_in
+echo "seed" > fuzz_in/seed.txt
+
+cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/deps/fuzzing-*
+```
+
+#### 10.7.4 Advanced: CSP Oracle Integration
+
+The `CspOracle` interprets AFL's random bytes as state machine navigation choices,
+ensuring fuzz inputs trigger valid protocol behavior:
+
+**How It Works**:
+```
+AFL Random Bytes          CspOracle                State Machine
+─────────────────  ───►  ───────────────  ───►  ─────────────────
+[0x7A, 0x3F, ...]        byte % events.len()     S0 → S1 → S2 → ...
+                         selects valid event      (valid trace)
+```
+
+**Benefits**:
+1. **Valid Traces Only**: Oracle ensures all fuzz inputs produce valid CSP traces
+2. **Nondeterminism Exploration**: AFL discovers which byte patterns lead to different branches
+3. **Coverage Feedback**: AFL learns which choices uncover new code paths
+4. **Crash Attribution**: Crashes map to specific state sequences
+
+**Example Trace** (from crash analysis):
+```
+Input: [0x00, 0x01, 0x00, 0x02]
+Trace: "start" → "action_a" → "action_b" → "done"
+State: S0 → S1 → S1 → S2
+Result: Crash at state S1 after "action_b"
+```
+
+#### 10.7.5 IJON Integration: Input-to-State Correspondence
+
+TightBeam optionally integrates with AFL's IJON extension[^ijon2020] for
+state-aware fuzzing. IJON enables "input-to-state correspondence" - bridging
+the semantic gap between fuzzer input mutations and program state exploration.
+
+**IJON Core Concepts**:
+- **Annotation-Based Guidance**: Developers annotate interesting state variables
+- **Maximization**: `ijon_max(label, value)` - fuzzer tries to maximize value
+- **Set Tracking**: `ijon_set(label, value)` - fuzzer discovers unique values
+- **Hash Tracking**: `ijon_hashint(label, value)` - track integer distributions
+
+**TightBeam's CSP-Based Approach**:
+
+TightBeam automatically derives IJON annotations from CSP process specifications,
+eliminating manual annotation while providing formal state coverage guarantees:
+
+| Aspect | Standard IJON | TightBeam CSP Oracle |
+|--------|---------------|---------------------|
+| **State Definition** | Manual annotations of raw variables | Formal CSP process states (automatic) |
+| **Annotation Burden** | Developer must identify & annotate | Derived from `tb_process_spec!` |
+| **Coverage Metric** | Arbitrary program values | State + transition coverage (provable) |
+| **State Abstraction** | Low-level (memory, counters, etc.) | High-level (protocol semantics) |
+| **Validation** | None (annotations may be incorrect) | CSP trace validation (runtime checking) |
+| **Integration** | Explicit `IJON_MAX`/`IJON_SET` calls | Automatic when `testing-fuzz-ijon` enabled |
+
+**Automatic IJON Integration**:
+
+When built with `--features testing-fuzz-ijon`, tightbeam's `tb_scenario!` macro
+automatically inserts IJON calls after each successful fuzz execution
+
+**Comparison with Pure AFL**:
+
+Without IJON, AFL relies solely on code coverage (edge hit counts). With
+tightbeam's CSP oracle + IJON:
+
+- **AFL alone**: Discovers `branch_A`, `branch_B`, `branch_C` (syntax)
+- **AFL + CSP oracle**: Discovers `State_Init → State_Processing → State_Done` (semantics)
+- **AFL + CSP + IJON**: Prioritizes inputs that maximize unique states visited
+
+**Example: Magic Value Discovery**:
+
+Traditional IJON use case - finding magic values in parsers:
+
+```c
+// Standard IJON annotation
+if (input[0] == 0xDEADBEEF) {
+    IJON_MAX("magic_value", input[0]);  // Manual annotation
+    enter_special_state();
+}
+```
+
+TightBeam equivalent - no manual annotation needed:
+
+```rust
+tb_process_spec! {
+    pub struct ParserProcess;
+    events { observable { "magic_detected", "parse_continue" } }
+    states {
+        Init   => { "magic_detected" => SpecialState, "parse_continue" => Parsing }
+        SpecialState => { /* ... */ }
+    }
+    // IJON automatically reports when SpecialState is reached
+}
+```
+
+### 10.8 Feature Matrix
+
+The following table summarizes capabilities available across the testing layers:
+
+| Capability | `testing` | `testing-csp` | `testing-fdr` | `testing-fuzz` |
+|------------|-----------|---------------|---------------|----------------|
+| **Basic Verification** | | | | |
+| Single trace verification | ✓ | ✓ | ✓ | ✓ |
+| Assertion cardinality checks | ✓ | ✓ | ✓ | ✓ |
+| Crash/panic detection | ✓ | ✓ | ✓ | ✓ |
+| **CSP Modeling** | | | | |
+| CSP process modeling | – | ✓ | ✓ | – |
+| Compile-time label validation | – | ✓ | ✓ | – |
+| Runtime trace validation | – | ✓ | ✓ | – |
+| Terminal state verification | – | ✓ | ✓ | – |
+| **FDR Refinement** | | | | |
+| Multi-seed exploration | – | – | ✓ | – |
+| Trace refinement (⊑T) | – | – | ✓ | – |
+| Failures refinement (⊑F) | – | – | ✓ | – |
+| Divergence detection (τ-loops) | – | – | ✓ | – |
+| Determinism checking | – | – | ✓ | – |
+| Refusal set analysis | – | – | ✓ | – |
+| Acceptance set queries | – | – | ✓ | – |
+| CSPM export (FDR4) | – | – | ✓ | – |
+| **AFL Fuzzing** | | | | |
+| Coverage-guided fuzzing | – | – | – | ✓ |
+| Edge coverage tracking | – | – | – | ✓ |
+| Input corpus evolution | – | – | – | ✓ |
+| **Combined Capabilities** | | | | |
+| CSP oracle for fuzzing | – | – | – | `csp` + `fuzz` |
+| IJON state annotations | – | – | – | `csp` + `fuzz-ijon` |
+
+## 11. Instrumentation
+
+This section normatively specifies the TightBeam instrumentation subsystem.
+Instrumentation produces a semantic event sequence consumed by verification
+logic. It is an observation facility, NOT an application logging API. Tests
+MUST NOT depend on instrumentation events imperatively; verification MUST treat
+the event stream as authoritative ground truth for one execution.
 
 Feature Gating:
 - Instrumentation can be enabled only by the standalone crate feature `instrument`.
 
-#### 10.7.1 Objectives
+### 11.1 Objectives
 - Emission MUST be amortized O(1) per event.
 - Ordering MUST be strictly increasing by sequence number per trace.
 - Evidence artifacts MUST be deterministic and hash‑stable given identical executions.
 - Detail level MUST be feature‑gated to avoid unnecessary overhead.
 - Payload handling MUST preserve privacy (hash or summarize; never emit secret raw bytes).
 
-#### 10.7.2 Event Kind Taxonomy
+### 11.2 Event Kind Taxonomy
 Each event MUST have one kind from a closed, feature‑gated set:
 - External: `gate_accept`, `gate_reject`, `request_recv`, `response_send`
 - Assertion: `assert_label`, `assert_payload`
@@ -2842,7 +3102,7 @@ Each event MUST have one kind from a closed, feature‑gated set:
 
 Hidden/internal events MUST use the internal category.
 
-#### 10.7.3 Event Structure
+### 11.3 Event Structure
 Conceptual fixed layout (names illustrative):
 ```
 trace_id | seq | kind | label? | payload? | phase? | dur_ns? | flags | extras
@@ -2858,7 +3118,7 @@ Requirements:
 - `flags` MUST represent a bitset (e.g. ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
 - `extras` MAY supply fixed numeric slots and a bounded byte sketch for extended metrics (e.g. enabled set cardinality).
 
-#### 10.7.4 Payload Representation
+### 11.4 Payload Representation
 Runtime values captured under `assert_payload` MUST be transformed before emission:
 - Algorithm: SHA3‑256 digest over canonical byte representation.
 - Representation: First 32 bytes (full SHA3‑256 output) MUST be stored; NO truncation below 32 bytes.
@@ -2866,7 +3126,7 @@ Runtime values captured under `assert_payload` MUST be transformed before emissi
 - Structured values SHOULD emit a static schema tag plus digest.
 Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
 
-#### 10.7.5 Configuration
+### 11.5 Configuration
 Instrumentation behavior MUST be controlled by a configuration object (conceptual fields). Configuration existence itself is gated by `instrument`:
 ```rust
 TbInstrumentationConfig {
@@ -2892,7 +3152,7 @@ Layer Interaction (informative): Enabling testing layers does NOT alter these de
 
 If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, emit a single `warn` event, and drop subsequent events.
 
-#### 10.7.6 Evidence Artifact Format
+### 11.6 Evidence Artifact Format
 For every finalized trace an artifact MUST be producible in a canonical binary form (DER).
 
 Canonical DER Schema (conceptual):
@@ -2934,409 +3194,21 @@ Artifact Integrity:
 Privacy:
 - Raw payload bytes MUST NOT appear; only hashed representation or numeric scalar (non-sensitive) values MAY be represented.
 
-#### 10.7.7 Failure Handling
+### 11.7 Failure Handling
 - Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
 - Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
 
-### 10.8 CSP-Guided Fuzzing
-
-#### 10.8.1 Concept
-
-CSP-guided fuzzing uses random byte sequences to explore protocol behavior through
-CSP process models. Unlike traditional fuzzing that blindly mutates inputs, the
-`CspOracle` navigates the state machine intelligently, interpreting input bytes
-as decisions for which valid events to take at each state.
-
-**Traditional Fuzzing**: Random bytes → Parse/Execute → Crash detection
-
-**CSP-Guided Fuzzing**: Random bytes → Oracle decisions → Valid state transitions → Statistical validation
-
-The oracle consumes input bytes to make choices at nondeterministic points,
-ensuring exploration follows valid protocol traces. This approach:
-- Tests protocol implementations with diverse valid inputs
-- Validates statistical properties (e.g., "90% of random inputs should succeed")
-- Complements FDR exhaustive exploration with randomized testing
-- Integrates seamlessly with Layer 1 (assertions) and Layer 2 (CSP validation)
-
-**Feature Flag**: Requires `testing-csp` feature flag.
-
-#### 10.8.2 Specification: tb_fuzz_spec! Syntax
-
-The `tb_fuzz_spec!` macro generates deterministic random input sequences for
-fuzz testing:
-
-```rust
-tb_fuzz_spec! {
-	pub InputSpecName,
-	test_cases: 100,           // Number of random inputs to generate
-	input_length: 5, 20,       // Min and max bytes per input
-	seed: 0xDEADBEEF,          // RNG seed for reproducibility
-	min_success_rate: 0.01,    // Expected minimum success rate
-	print_stats: true          // Display success/failure statistics
-}
-```
-
-**Parameters**:
-- `test_cases`: Number of random byte sequences to generate
-- `input_length`: Range for input size (min, max) in bytes
-- `seed`: Deterministic seed for reproducible test runs
-- `min_success_rate`: Expected minimum success rate for test cases
-- `print_stats`: Whether to print test statistics (successes, failures, rate)
-
-**Generated API**:
-```rust
-impl InputSpecName {
-	pub fn inputs() -> Vec<Vec<u8>>;  // Returns all test case inputs
-}
-```
-
-#### 10.8.3 Integration with tb_scenario!
-
-Fuzzing integrates with `tb_scenario!` through the `fuzz:` parameter. The
-framework automatically creates a `FuzzContext` that combines the input buffer
-with a `CspOracle` for the specified process.
-
-**Requirements**:
-- The `csp:` parameter MUST be present (compile error otherwise)
-- The `testing-csp` feature flag MUST be enabled
-- Fuzz input is accessed via `trace.oracle().*` methods
-
-**Example Integration**:
-```rust
-tb_scenario! {
-	name: test_with_fuzzing,
-	spec: MySpec,
-	csp: MyProcess,           // ← REQUIRED for fuzzing
-	fuzz: MyFuzzInputs,       // ← Provides random byte sequences
-	environment Bare {
-		exec: |trace| {
-			// Oracle automatically configured with fuzz input and CSP process
-			match trace.oracle().fuzz_from_bytes() {
-				Ok(()) => {
-					// Successfully navigated to terminal state
-					// Record events for Layer 1 validation
-					for event in trace.oracle().trace() {
-						trace.assert(AssertionPhase::HandlerStart, event.0);
-					}
-					Ok(())
-				}
-				Err(_) => {
-					// Failed to reach terminal state
-					Err(TestingError::FuzzInputExhausted.into())
-				}
-			}
-		}
-	}
-}
-```
-
-The macro generates one test execution per input from the fuzz spec. Each
-execution:
-1. Initializes `TraceCollector` with `FuzzContext`
-2. Runs the exec closure with oracle-guided fuzzing
-3. Validates Layer 1 assertions
-4. Validates Layer 2 CSP trace (if events were asserted)
-5. Tracks success/failure statistics
-
-#### 10.8.4 CspOracle and State Exploration
-
-The `CspOracle` provides the core fuzzing engine. It maintains the current CSP
-state and uses input bytes to navigate through valid transitions.
-
-**Primary Methods**:
-
-```rust
-// Main fuzzing entry point
-pub fn fuzz_from_bytes(&mut self) -> Result<(), &'static str>
-
-// Get execution trace of events taken
-pub fn trace(&self) -> &[Event]
-
-// Query current state
-pub fn current_state(&self) -> State
-pub fn is_terminal(&self) -> bool
-pub fn valid_events(&self) -> Vec<Event>
-```
-
-**Input Consumption Methods**:
-```rust
-pub fn fuzz_u8(&self) -> Result<u8, TestingError>
-pub fn fuzz_u16(&self) -> Result<u16, TestingError>
-pub fn fuzz_u32(&self) -> Result<u32, TestingError>
-pub fn fuzz_u64(&self) -> Result<u64, TestingError>
-pub fn fuzz_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError>
-
-// Peeking without consuming
-pub fn fuzz_peek_u8(&self) -> Result<u8, TestingError>
-pub fn fuzz_peek_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError>
-```
-
-**How It Works**:
-
-1. **Initialization**: Oracle starts at the process initial state
-2. **Event Selection**: At each state, oracle queries valid events
-3. **Input Interpretation**: Consumes one byte: `choice = input_byte % valid_events.len()`
-4. **Transition**: Takes the selected event, updates state
-5. **Iteration**: Repeats until terminal state or input exhausted
-6. **Validation**: Returns `Ok(())` if terminal state reached
-
-**Example**: Manual oracle usage (typically handled by `fuzz_from_bytes`):
-
-```rust
-let proc = MyProcess::process();
-let mut oracle = CspOracle::new(proc);
-
-// Navigate manually
-while !oracle.is_terminal() && has_input() {
-	let valid = oracle.valid_events();
-	if valid.is_empty() {
-		break; // Deadlock
-	}
-
-	let byte = consume_input_byte();
-	let choice = (byte as usize) % valid.len();
-	oracle.step(&valid[choice]);
-}
-
-// Check if succeeded
-if oracle.is_terminal() {
-	println!("Trace: {:?}", oracle.trace());
-}
-```
-
-#### 10.8.5 Complete Examples
-
-**Simple 3-State Process**:
-
-```rust
-use tightbeam::testing::*;
-use tightbeam::testing::assertions::AssertionPhase;
-
-// Layer 1: Assertion spec
-tb_assert_spec! {
-	pub SimpleFuzzSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Accepted,
-		assertions: [
-			(HandlerStart, "start", exactly!(1)),
-			(HandlerStart, "done", exactly!(1))
-		]
-	},
-}
-
-// Layer 2: CSP process with 3 states
-tb_process_spec! {
-	pub struct SimpleFuzzProcess;
-	events {
-		observable { "start", "action_a", "action_b", "done" }
-	}
-	states {
-		S0 => { "start" => S1 },
-		S1 => { "action_a" => S1, "action_b" => S1, "done" => S2 }
-	}
-	terminal { S2 }
-}
-
-// Fuzz input generator: 100 test cases with 2-10 bytes each
-tb_fuzz_spec! {
-	pub SimpleFuzzInputs,
-	test_cases: 100,
-	input_length: 2, 10,
-	seed: 0x12345678,
-	print_stats: true
-}
-
-// Fuzz test scenario
-tb_scenario! {
-	name: test_simple_fuzzing,
-	spec: SimpleFuzzSpec,
-	csp: SimpleFuzzProcess,
-	fuzz: SimpleFuzzInputs,
-	environment Bare {
-		exec: |trace| {
-			// Oracle-guided fuzzing through state machine
-			match trace.oracle().fuzz_from_bytes() {
-				Ok(()) => {
-					// Record trace events for assertion validation
-					for event in trace.oracle().trace() {
-						trace.assert(AssertionPhase::HandlerStart, event.0);
-					}
-					Ok(())
-				}
-				Err(_) => {
-					// Input exhausted before reaching terminal state
-					Err(TestingError::FuzzInputExhausted.into())
-				}
-			}
-		}
-	}
-}
-```
-
-**Output** (with `print_stats: true`):
-```
-Fuzz test results:
-  Test cases: 100
-  Successes: 73 (73.0%)
-  Failures: 27 (27.0%)
-  Required: >= 0.0%
-test test_simple_fuzzing ... ok
-```
-
-**Complex Workflow with Branching**:
-
-```rust
-// Multi-stage workflow: init → auth → operations → commit/rollback → complete
-tb_assert_spec! {
-	pub WorkflowFuzzSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Accepted,
-		assertions: [
-			(HandlerStart, "init", exactly!(1)),
-			(HandlerStart, "authenticate", exactly!(1)),
-			(HandlerStart, "complete", exactly!(1))
-		]
-	},
-}
-
-tb_process_spec! {
-	pub struct WorkflowFuzzProcess;
-	events {
-		observable {
-			"init",
-			"authenticate",
-			"read",
-			"write",
-			"delete",
-			"commit",
-			"rollback",
-			"complete"
-		}
-	}
-	states {
-		S0 => { "init" => S1 },
-		S1 => { "authenticate" => S2 },
-		S2 => { "read" => S3, "write" => S3, "delete" => S3 },
-		S3 => {
-			"read" => S3,        // Self-loop: can perform multiple operations
-			"write" => S3,
-			"delete" => S3,
-			"commit" => S4,      // Branch: commit or rollback
-			"rollback" => S5
-		},
-		S4 => { "complete" => S6 },
-		S5 => { "complete" => S6 }
-	}
-	terminal { S6 }
-}
-
-tb_fuzz_spec! {
-	pub WorkflowFuzzInputs,
-	test_cases: 100,
-	input_length: 5, 20,      // Longer inputs for complex paths
-	seed: 0xDEADBEEF,
-	print_stats: true
-}
-
-tb_scenario! {
-	name: test_workflow_fuzzing,
-	spec: WorkflowFuzzSpec,
-	csp: WorkflowFuzzProcess,
-	fuzz: WorkflowFuzzInputs,
-	environment Bare {
-		exec: |trace| {
-			match trace.oracle().fuzz_from_bytes() {
-				Ok(()) => {
-					// Successful workflow completion
-					for event in trace.oracle().trace() {
-						trace.assert(AssertionPhase::HandlerStart, event.0);
-					}
-					Ok(())
-				}
-				Err(_) => Err(TestingError::FuzzInputExhausted.into())
-			}
-		}
-	}
-}
-```
-
-**Output**:
-```
-Fuzz test results:
-  Test cases: 100
-  Successes: 89 (89.0%)
-  Failures: 11 (11.0%)
-  Required: >= 0.0%
-test test_workflow_fuzzing ... ok
-```
-
-**Interpreting Results**:
-
-- **Successes**: Inputs that navigated to terminal state and passed all validations
-- **Failures**: Inputs exhausted before reaching terminal state
-- **Success Rate**: Indicates how "reachable" terminal states are with random choices
-
-Higher success rates (>80%) suggest the process is well-designed with most paths
-leading to completion. Lower rates may indicate:
-- Many self-loops or cycles requiring specific input patterns
-- Deep nesting requiring longer input sequences
-- Narrow paths to terminal states
-
-**When to Use Fuzzing vs FDR**:
-
-| Technique | Use When | Strengths | Limitations |
-|-----------|----------|-----------|-------------|
-| **Fuzzing** | Testing with diverse inputs | Fast, scalable, finds statistical patterns | Non-exhaustive, may miss edge cases |
-| **FDR (§10.4)** | Formal verification | Exhaustive, proves correctness | Slower, state explosion for large systems |
-
-Use fuzzing for:
-- Testing with realistic input distributions
-- Statistical validation (e.g., success rate thresholds)
-- Performance testing with many iterations
-- Complement to exhaustive verification
-
-Use FDR for:
-- Proving refinement properties hold
-- Detecting all nondeterminism
-- Verifying divergence freedom
-- Critical protocol correctness proofs
-
-Both can be combined in the same test suite for comprehensive validation.
-
-### 10.8 Feature Matrix
-
-The following table summarizes capabilities available across the three testing layers:
-
-| Capability | `testing` | `testing-csp` | `testing-fdr` |
-|------------|-----------|---------------|---------------|
-| Single trace verification | ✓ | ✓ | ✓ |
-| Assertion cardinality checks | ✓ | ✓ | ✓ |
-| CSP process modeling | – | ✓ | ✓ |
-| Compile-time label validation | – | ✓ | ✓ |
-| Runtime trace validation | – | ✓ | ✓ |
-| CSP oracle for fuzzing | – | ✓ | ✓ |
-| Multi-seed exploration | – | – | ✓ |
-| Trace refinement (⊑T) | – | – | ✓ |
-| Failures refinement (⊑F) | – | – | ✓ |
-| Divergence detection | – | – | ✓ |
-| Determinism checking | – | – | ✓ |
-| Refusal set analysis | – | – | ✓ |
-| Acceptance set queries | – | – | ✓ |
-| CSPM export (FDR4) | – | – | ✓ |
-
-## 11. End-to-End Examples
+## 12. End-to-End Examples
 
 This section contains complete, runnable examples demonstrating real-world usage patterns.
 
-### 11.1 Complete Client-Server Application
+### 12.1 Complete Client-Server Application
 
 ```rust
 // TODO
 ```
 
-## 12. References
+## 13. References
 
 [^hoare1978]: C.A.R. Hoare, "Communicating sequential processes," *Communications of the ACM*, vol. 21, no. 8, pp. 666-677, August 1978. DOI: [10.1145/359576.359585](https://doi.org/10.1145/359576.359585)
 
@@ -3346,7 +3218,9 @@ This section contains complete, runnable examples demonstrating real-world usage
 
 [^pedersen2024]: M. Pedersen and K. Chalmers, "Refinement Checking of Cooperatively Scheduled Concurrent Systems," in *Formal Methods: Foundations and Applications (SBMF 2024)*, pp. 3-21, 2024. DOI: [10.1007/978-3-031-78561-1_1](https://doi.org/10.1007/978-3-031-78561-1_1)
 
-### 12.1 Normative References
+[^ijon2020]: C. Aschermann, S. Schumilo, A. Abbasi, and T. Holz, "IJON: Exploring Deep State Spaces via Fuzzing," in *2020 IEEE Symposium on Security and Privacy (SP)*, San Francisco, CA, USA, 2020, pp. 1597-1612. DOI: [10.1109/SP40000.2020.00117](https://doi.org/10.1109/SP40000.2020.00117)
+
+### 13.1 Normative References
 
 - [RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119): Key words for use in RFCs to Indicate Requirement Levels
 - [ITU-T X.690](https://www.itu.int/rec/T-REC-X.690): ASN.1 Distinguished Encoding Rules (DER)
@@ -3364,7 +3238,7 @@ This section contains complete, runnable examples demonstrating real-world usage
 - [RFC 8439](https://datatracker.ietf.org/doc/html/rfc8439): ChaCha20 and Poly1305 for IETF Protocols
 - [RFC 8446](https://datatracker.ietf.org/doc/html/rfc8446): The Transport Layer Security (TLS) Protocol Version 1.3
 
-### 12.2 Standards References
+### 13.2 Standards References
 
 - [FIPS 140-2](https://csrc.nist.gov/publications/detail/fips/140/2/final): Security Requirements for Cryptographic Modules
 - [FIPS 140-3](https://csrc.nist.gov/publications/detail/fips/140/3/final): Security Requirements for Cryptographic Modules
@@ -3376,7 +3250,7 @@ This section contains complete, runnable examples demonstrating real-world usage
 - [NIST SP 800-57](https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final): Recommendation for Key Management: Part 1 - General
 - [NIST SP 800-131A](https://csrc.nist.gov/publications/detail/sp/800-131a/rev-2/final): Transitioning the Use of Cryptographic Algorithms and Key Lengths
 
-### 12.3 ASN.1 References
+### 13.3 ASN.1 References
 
 - [ITU-T X.680](https://www.itu.int/rec/T-REC-X.680): ASN.1 Specification of basic notation
 - [ITU-T X.681](https://www.itu.int/rec/T-REC-X.681): ASN.1 Information object specification
@@ -3387,7 +3261,7 @@ This section contains complete, runnable examples demonstrating real-world usage
 - [ITU-T X.400](https://www.itu.int/rec/T-REC-X.400): Message Handling Systems (MHS): System and service overview
 - [ITU-T X.420](https://www.itu.int/rec/T-REC-X.420): Message Handling Systems (MHS): Interpersonal messaging system
 
-## 13. License
+## 14. License
 
 ### For Users (Outbound Licensing)
 
@@ -3411,7 +3285,7 @@ dual licensed as above, without any additional terms or conditions.
 - MIT's simplicity for users who prefer it
 - Apache-2.0's patent grants for enhanced protection
 
-## 14. Implementation Notes
+## 15. Implementation Notes
 
 #### Project Structure
 

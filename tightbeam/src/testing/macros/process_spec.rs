@@ -12,14 +12,14 @@
 ///         hidden { "serialize", "encrypt", "queue", "dispatch" }
 ///     }
 ///     states {
-///         S0  => { "start" => S1 }
-///         S1  => { "serialize" => S1s, "queue" => S1q }
-///         S1s => { "encrypt" => S1e }
-///         S1e => { "send" => S2 }
-///         S1q => { "dispatch" => S1d }
-///         S1d => { "send" => S2 }
-///         S2  => { "ack" => S3, "fail" => S3f }
-///         S3  => {}
+///         S0  => { "start" => S1 },
+///         S1  => { "serialize" => S1s, "queue" => S1q },
+///         S1s => { "encrypt" => S1e },
+///         S1e => { "send" => S2 },
+///         S1q => { "dispatch" => S1d },
+///         S1d => { "send" => S2 },
+///         S2  => { "ack" => S3, "fail" => S3f },
+///         S3  => {},
 ///         S3f => {}
 ///     }
 ///     terminal { S3, S3f }
@@ -27,6 +27,8 @@
 ///     annotations { description: "Queued or direct send" }
 /// }
 /// ```
+///
+/// **Note**: State definitions must be separated by commas.
 #[macro_export]
 macro_rules! tb_process_spec {
 	// Main pattern with all sections

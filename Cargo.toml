@@ -93,3 +93,6 @@ fake = { version = "=4.3.0", features = [
 proc-macro2 = "1.0.103"
 quote = "1.0.41"
 syn = { version = "2.0.108", features = ["full", "derive"] }
+
+## Fuzzing dependencies
+afl = { version = "0.17.0" }

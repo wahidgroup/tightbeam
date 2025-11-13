@@ -116,6 +116,8 @@ build-fuzz:
 #   skip-missing-crashes=1  - Skip crash reporting config check (AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1)
 #   skip-cpu-freq=1         - Skip CPU frequency scaling check (AFL_SKIP_CPUFREQ=1)
 test-fuzz: build-fuzz
+	@echo "Cleaning previous fuzz output..."
+	@rm -rf built/fuzz/out
 	@echo "Running AFL fuzz testing for 60 seconds..."
 	@mkdir -p built/fuzz/in built/fuzz/out
 	@echo "seed" > built/fuzz/in/seed.txt
@@ -152,20 +154,35 @@ test-fuzz: build-fuzz
 		echo "  Test cases generated: $$QUEUE"; \
 		echo "  Crashes found: $$CRASHES"; \
 		echo "  Hangs found: $$HANGS"; \
+		echo ""; \
+		if [ -f "built/fuzz/out/default/fuzzer_stats" ]; then \
+			echo "Fuzzing Statistics:"; \
+			EXECS=$$(grep "^execs_done" built/fuzz/out/default/fuzzer_stats | awk '{print $$3}'); \
+			EXECS_SEC=$$(grep "^execs_per_sec" built/fuzz/out/default/fuzzer_stats | awk '{print $$3}'); \
+			STABILITY=$$(grep "^stability" built/fuzz/out/default/fuzzer_stats | awk '{print $$3}'); \
+			BITMAP=$$(grep "^bitmap_cvg" built/fuzz/out/default/fuzzer_stats | awk '{print $$3}'); \
+			EDGES=$$(grep "^edges_found" built/fuzz/out/default/fuzzer_stats | awk '{print $$3}'); \
+			TOTAL_EDGES=$$(grep "^total_edges" built/fuzz/out/default/fuzzer_stats | awk '{print $$3}'); \
+			CYCLES=$$(grep "^cycles_done" built/fuzz/out/default/fuzzer_stats | awk '{print $$3}'); \
+			echo "  Executions: $$EXECS ($$EXECS_SEC/sec)"; \
+			echo "  Stability: $$STABILITY"; \
+			echo "  Coverage: $$BITMAP ($$EDGES/$$TOTAL_EDGES edges)"; \
+			echo "  Cycles: $$CYCLES"; \
+		fi; \
+		echo ""; \
 		if [ "$$CRASHES" -gt 0 ]; then \
-			echo ""; \
 			echo "⚠️  Crashes detected! Review them at:"; \
-			echo "     built/fuzz/out/default/crashes/"; \
+			echo "   built/fuzz/out/default/crashes/"; \
+			echo ""; \
 		fi; \
 		if [ "$$HANGS" -gt 0 ]; then \
-			echo ""; \
 			echo "⚠️  Hangs detected! Review them at:"; \
-			echo "     built/fuzz/out/default/hangs/"; \
+			echo "   built/fuzz/out/default/hangs/"; \
+			echo ""; \
 		fi; \
 	else \
 		echo "No output generated - fuzzer may have exited early"; \
 	fi; \
-	echo ""; \
 	echo "To run longer fuzzing sessions manually:"; \
 	echo "  cargo afl fuzz -i built/fuzz/in -o built/fuzz/out $$FUZZ_TARGET"; \
 	echo ""; \

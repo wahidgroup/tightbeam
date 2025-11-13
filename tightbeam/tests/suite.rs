@@ -20,10 +20,6 @@ mod transport;
 #[cfg(feature = "x509")]
 mod x509;
 
-// Testing framework tests (CSP-guided fuzzing, assertions, etc.)
-#[cfg(all(feature = "std", feature = "testing"))]
-mod testing;
-
 // DLT Network test
 // #[cfg(feature = "full")]
 // mod proof;

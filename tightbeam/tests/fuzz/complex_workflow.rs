@@ -61,15 +61,15 @@ tb_scenario! {
     csp: WorkflowFuzzProc,
     environment Bare {
         exec: |trace| {
-            match trace.oracle().fuzz_from_bytes() {
-                Ok(()) => {
-                    for event in trace.oracle().trace() {
-                        trace.assert(AssertionPhase::HandlerStart, event.0);
-                    }
-                    Ok(())
-                }
-                Err(_) => Err(TestingError::FuzzInputExhausted.into())
+            // Oracle-guided fuzzing through complex 6-state workflow
+            // IJON state tracking is automatic when built with testing-fuzz-ijon feature
+            trace.oracle().fuzz_from_bytes()?;
+
+            // Make assertions based on execution trace
+            for event in trace.oracle().trace() {
+                trace.assert(AssertionPhase::HandlerStart, event.0);
             }
+            Ok(())
         }
     }
 }

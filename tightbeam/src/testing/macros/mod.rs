@@ -36,13 +36,31 @@ use crate::instrumentation::TbEventKind;
 // Re-exports
 pub use crate::testing::assertions::AssertionValue;
 pub use crate::testing::trace::TraceCollector;
-pub use crate::{absent, at_least, at_most, between, exactly, present};
+pub use crate::{absent, at_least, at_most, between, equals, exactly, falsy, present, truthy};
 
 /// Helper macro to wrap values for equality assertions in specs
 #[macro_export]
 macro_rules! equals {
     ($value:expr) => {
         Some($crate::testing::macros::AssertionValue::from($value))
+    };
+}
+
+/// Helper macro for boolean true assertions in specs
+/// Checks that the value is truthy (non-zero, true, non-empty)
+#[macro_export]
+macro_rules! truthy {
+    ($value:expr) => {
+        Some($crate::testing::macros::AssertionValue::Bool($value != 0))
+    };
+}
+
+/// Helper macro for boolean false assertions in specs
+/// Checks that the value is falsy (zero, false, empty)
+#[macro_export]
+macro_rules! falsy {
+    ($value:expr) => {
+        Some($crate::testing::macros::AssertionValue::Bool($value == 0))
     };
 }
 
@@ -1142,6 +1160,21 @@ macro_rules! tb_scenario {
 				}
 				let exec_result = __call_exec_closure($exec_closure, trace_exec);
 
+				// Report CSP exploration to IJON (if feature enabled)
+				#[cfg(feature = "testing-fuzz-ijon")]
+				{
+					if exec_result.is_ok() {
+						// Use public oracle() method to access oracle context
+						let oracle_ctx = trace_collector.oracle();
+						::afl::ijon_stack_max!(oracle_ctx.coverage_score());
+						::afl::ijon_set!(oracle_ctx.track_state());
+						// Track state hash distribution across trace depth
+						// old = trace length (how deep), val = current state (where we are)
+						let trace_depth = oracle_ctx.trace().len() as u32;
+						let state_hash = oracle_ctx.track_state();
+						unsafe { ::afl::ijon_hashint(trace_depth, state_hash); }
+					}
+				}
 				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
@@ -3070,7 +3103,7 @@ mod tests {
 
                 Ok((handle, addr))
             },
-            client: |trace: TraceCollector, mut client| async move {
+            client: |trace, mut client| async move {
                 // Client-side assertion before sending
                 trace.assert(AssertionPhase::Response, "Responded");
 

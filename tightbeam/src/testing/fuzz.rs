@@ -1,9 +1,122 @@
 //! AFL-powered fuzzing support
 //!
 //! CSP-guided fuzzing using `CspOracle` for intelligent state exploration.
-//! All fuzzing is powered by AFL.rs for coverage-guided mutation.
+//! All fuzzing is powered by AFL.rs (https://github.com/rust-fuzz/afl.rs).
 //!
-//! Use `tb_scenario!` with `fuzz: afl` to create fuzz targets.
+//! # AFL Integration Architecture
+//!
+//! 1. **tb_scenario! with fuzz: afl** generates `fn main() { afl::fuzz!(|data: &[u8]| { ... }) }`
+//! 2. **AFL.rs** provides mutated byte arrays and tracks code coverage automatically
+//! 3. **CspOracle** interprets bytes as event choices, guiding AFL toward valid protocol states
+//! 4. **Coverage feedback** (automatic): AFL discovers new code paths without manual instrumentation
+//! 5. **IJON integration** (automatic with feature): Enable `testing-fuzz-ijon` for state-aware guidance
+//!
+//! # How AFL Discovers Coverage
+//!
+//! AFL.rs uses compile-time instrumentation (via LLVM) to track:
+//! - Basic block transitions (edge coverage)
+//! - Hit counts for each edge (frequency analysis)
+//! - New execution paths through code
+//!
+//! # Optional: IJON State-Space Guidance
+//!
+//! Enable the `testing-fuzz-ijon` feature to guide AFL toward unexplored CSP states:
+//!
+//! ```bash
+//! cargo afl build --test fuzzing --features "std,testing-fuzz,testing-fuzz-ijon"
+//! ```
+//!
+//! When enabled, the oracle automatically calls:
+//! - `afl::ijon_max!("csp_coverage", ...)` - maximize state+transition coverage
+//! - `afl::ijon_set!("csp_state", ...)` - track unique states visited
+//!
+//! This helps AFL prioritize inputs that explore new protocol states beyond
+//! code coverage.
+//!
+//! # Verifying AFL Integration
+//!
+//! ## Unit Tests
+//! Run the oracle unit tests to verify core functionality:
+//! ```bash
+//! cargo test --features "std,testing-fuzz,testing-csp" fuzz::tests
+//! ```
+//!
+//! Key verification tests:
+//! - `oracle_fuzz_from_bytes_reaches_terminal` - oracle interprets bytes correctly
+//! - `oracle_coverage_increases_during_fuzzing` - coverage tracking works
+//! - `oracle_track_state_differs_between_states` - state hashing is unique
+//! - `oracle_crash_context_provides_debug_info` - debugging info available
+//!
+//! ## IJON Feature Test
+//! Verify IJON feature compiles correctly:
+//! ```bash
+//! cargo test --features "std,testing-fuzz,testing-fuzz-ijon,testing-csp" oracle_ijon_feature_enabled
+//! ```
+//!
+//! Note: IJON macros (`afl::ijon_max!`, `afl::ijon_set!`) require AFL runtime
+//! and cannot be tested with `cargo check` or `cargo test`. They only work when
+//! code is executed inside `afl::fuzz!()` under AFL's runtime. The unit test
+//! verifies the oracle's coverage methods work correctly.
+//!
+//! ## AFL Runtime Verification
+//! To verify AFL actually sees IJON data at runtime:
+//!
+//! 1. Build with IJON enabled:
+//!    ```bash
+//!    RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing \
+//!      --features "std,testing-fuzz,testing-fuzz-ijon,testing-csp"
+//!    ```
+//!
+//! 2. Run AFL with verbose output:
+//!    ```bash
+//!    cargo afl fuzz -i built/fuzz/in -o built/fuzz/out \
+//!      target/debug/deps/fuzzing-* -- -V
+//!    ```
+//!
+//! 3. Check AFL UI for IJON metrics:
+//!    - Look for "csp_coverage" in maximization targets
+//!    - Look for "csp_state" in state tracking
+//!    - Coverage should increase faster with IJON enabled
+//!
+//! 4. Compare with/without IJON:
+//!    ```bash
+//!    # Without IJON (baseline)
+//!    RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing \
+//!      --features "std,testing-fuzz,testing-csp"
+//!    # Run for 60 seconds, note coverage
+//!
+//!    # With IJON (should find more states)
+//!    RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing \
+//!      --features "std,testing-fuzz,testing-fuzz-ijon,testing-csp"
+//!    # Run for 60 seconds, compare coverage
+//!    ```
+//!
+//! Expected: IJON build should discover more unique test cases and reach
+//! higher state coverage in the same time period.
+//!
+//! # Creating Fuzz Targets
+//!
+//! Simple usage - no manual IJON calls needed:
+//!
+//! ```ignore
+//! tb_scenario! {
+//!     fuzz: afl,
+//!     spec: MySpec,
+//!     csp: MyProcess,
+//!     environment Bare {
+//!         exec: |trace| {
+//!             // Oracle-guided fuzzing - IJON automatic with feature flag
+//!             trace.oracle().fuzz_from_bytes()?;
+//!
+//!             // Make assertions based on execution trace
+//!             for event in trace.oracle().trace() {
+//!                 trace.assert(AssertionPhase::HandlerStart, event.0);
+//!             }
+//!             Ok(())
+//!         }
+//!     }
+//! }
+//! ```
 
 #![cfg(all(feature = "std", feature = "testing-fuzz"))]
 
@@ -13,12 +126,28 @@ use std::sync::{Arc, Mutex};
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
 
-/// CSP state oracle for guided fuzzing
+/// CSP state oracle for AFL-guided fuzzing
 ///
-/// Tracks execution through a CSP process state machine, providing:
-/// - Valid next events at each state
-/// - State exploration coverage metrics
-/// - State hashing for IJON-guided fuzzing
+/// The oracle bridges AFL's byte-level mutation with CSP protocol semantics:
+///
+/// ## Core Functionality
+/// - **State Machine Tracking**: Maintains current state in CSP process
+/// - **Event Interpretation**: Maps input bytes → valid event choices
+/// - **Coverage Metrics**: Tracks visited states/transitions for analysis
+/// - **Crash Triage**: Provides execution context when fuzz targets fail
+///
+/// ## AFL Integration
+/// - AFL automatically discovers code coverage (no manual instrumentation needed)
+/// - Oracle guides AFL toward valid protocol states (prevents random noise)
+/// - IJON-compatible methods available for state-space exploration
+///
+/// ## Usage Pattern
+/// ```ignore
+/// // In fuzz target (generated by tb_scenario! fuzz: afl):
+/// let trace = TraceCollector::with_fuzz_oracle(data, process);
+/// trace.oracle().fuzz_from_bytes()?;  // Run oracle-guided execution
+/// // AFL sees the code paths taken and mutates input accordingly
+/// ```
 #[derive(Debug, Clone)]
 pub struct CspOracle {
     process: Process,
@@ -121,8 +250,28 @@ impl CspOracle {
 
     /// Get hash of current state for IJON tracking
     ///
-    /// Returns a stable hash that can be used with `afl::ijon_set!()` to guide
-    /// AFL toward unexplored states.
+    /// Returns a stable 32-bit hash of the current CSP state that can be used
+    /// with AFL's IJON `ijon_set!()` macro to guide fuzzing toward unexplored states.
+    ///
+    /// ## IJON Integration
+    /// ```ignore
+    /// // In fuzz target:
+    /// if oracle.fuzz_from_bytes(data).is_ok() {
+    ///     afl::ijon_set!("state", oracle.track_state());
+    /// }
+    /// ```
+    ///
+    /// This tells AFL: "I'm interested in reaching different state hash values."
+    /// AFL will prioritize inputs that produce new state hashes.
+    ///
+    /// ## When to Use
+    /// - Protocol has large state space (many states)
+    /// - Code coverage alone doesn't distinguish states well
+    /// - Want to maximize state exploration beyond code paths
+    ///
+    /// ## Note
+    /// IJON requires `cargo install afl` with IJON support and setting
+    /// `AFL_PRELOAD` environment variable. Standard AFL.rs works without this.
     pub fn track_state(&self) -> u32 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -134,11 +283,29 @@ impl CspOracle {
 
     /// Get coverage score for IJON maximization
     ///
-    /// Returns combined metric of state and transition coverage.
-    /// Upper 32 bits: number of visited states
-    /// Lower 32 bits: number of visited transitions
+    /// Returns a 64-bit score combining state and transition coverage:
+    /// - **Upper 32 bits**: Number of unique states visited
+    /// - **Lower 32 bits**: Number of unique transitions taken
     ///
-    /// Use with `afl::ijon_max!()` to guide AFL toward maximum coverage.
+    /// ## IJON Integration
+    /// ```ignore
+    /// // In fuzz target:
+    /// if oracle.fuzz_from_bytes(data).is_ok() {
+    ///     afl::ijon_max!("coverage", oracle.coverage_score());
+    /// }
+    /// ```
+    ///
+    /// This tells AFL: "Maximize this coverage score."
+    /// AFL will prioritize inputs that increase the score (explore new states/transitions).
+    ///
+    /// ## When to Use
+    /// - Want AFL to explicitly optimize for CSP coverage
+    /// - Protocol has complex state machine with many paths
+    /// - Code coverage metrics don't capture semantic coverage
+    ///
+    /// ## Note
+    /// IJON requires `cargo install afl` with IJON support. Standard AFL.rs
+    /// discovers coverage automatically through code instrumentation.
     pub fn coverage_score(&self) -> u64 {
         ((self.visited_states.len() as u64) << 32) | (self.visited_transitions.len() as u64)
     }
@@ -167,27 +334,92 @@ impl CspOracle {
         (self.visited_transitions.len(), total_transitions)
     }
 
+    /// Get crash triage information for debugging failed fuzz runs
+    ///
+    /// Returns a formatted string with execution context useful for understanding
+    /// why a fuzz target crashed or failed. Includes:
+    /// - Current state (where execution stopped)
+    /// - Event trace (sequence of events taken)
+    /// - Coverage statistics (states/transitions explored)
+    /// - Valid events (what could have been done at crash point)
+    ///
+    /// ## Usage
+    /// ```ignore
+    /// // In fuzz target:
+    /// if let Err(e) = oracle.fuzz_from_bytes(data) {
+    ///     eprintln!("Fuzz failure: {}", e);
+    ///     eprintln!("{}", oracle.crash_context());
+    ///     panic!("Fuzzing failed");
+    /// }
+    /// ```
+    pub fn crash_context(&self) -> String {
+        let (visited_trans, total_trans) = self.transition_coverage();
+        format!(
+            "AFL Crash Context:\n\
+             Current State: {:?}\n\
+             Terminal: {}\n\
+             Trace: {:?}\n\
+             State Coverage: {:.1}% ({}/{})\n\
+             Transition Coverage: {:.1}% ({}/{})\n\
+             Valid Events: {:?}",
+            self.current_state,
+            self.is_terminal(),
+            self.trace,
+            self.state_coverage(),
+            self.visited_states.len(),
+            self.process.states.len(),
+            if total_trans > 0 {
+                (visited_trans as f64 / total_trans as f64) * 100.0
+            } else {
+                0.0
+            },
+            visited_trans,
+            total_trans,
+            self.valid_events()
+        )
+    }
+
     /// Run oracle-guided fuzzing from arbitrary byte input
     ///
-    /// Interprets input bytes as choices for which events to take at each state.
-    /// This is the core fuzzing harness for AFL.rs integration.
+    /// **Core AFL Integration Point**: This method interprets AFL-provided bytes
+    /// as choices for which events to take at each state in the CSP process.
     ///
-    /// Returns `Ok(())` if execution reaches terminal state, `Err` otherwise.
+    /// ## How It Works
+    /// 1. Reset oracle to initial state
+    /// 2. For each input byte:
+    ///    - Get valid events at current state
+    ///    - Use byte value to choose event: `choice = byte % valid_events.len()`
+    ///    - Take transition with chosen event
+    ///    - Update state and coverage tracking
+    ///    - Report to IJON (if `testing-fuzz-ijon` feature enabled)
+    /// 3. Return `Ok(())` if terminal state reached, `Err` otherwise
     ///
-    /// # Example
+    /// ## AFL Coverage Discovery
+    /// AFL automatically sees:
+    /// - Which code paths are taken (edge coverage)
+    /// - How many valid events were at each state
+    /// - Whether execution reached terminal state
+    /// - Any panics/crashes during execution
     ///
-    /// ```ignore
-    /// // In AFL.rs fuzz target:
-    /// afl::fuzz!(|data: &[u8]| {
-    ///     let proc = MyProcess::process();
-    ///     let mut oracle = CspOracle::new(proc);
+    /// ## IJON Integration (Automatic)
+    /// When built with `--features testing-fuzz-ijon`, the oracle automatically
+    /// reports CSP state exploration to AFL's IJON system:
+    /// - `ijon_max!("csp_coverage", ...)` - maximize state+transition coverage
+    /// - `ijon_set!("csp_state", ...)` - track unique states visited
     ///
-    ///     if oracle.fuzz_from_bytes(data).is_ok() {
-    ///         // Track coverage for IJON
-    ///         afl::ijon_max!("coverage", oracle.coverage_score());
-    ///     }
-    /// });
-    /// ```
+    /// This guides AFL toward unexplored protocol states beyond code coverage.
+    ///
+    /// ## Returns
+    /// - `Ok(())`: Execution reached terminal state successfully
+    /// - `Err("deadlock")`: No valid events available (stuck in non-terminal state)
+    /// - `Err("oracle rejected")`: Internal oracle error (should not happen)
+    /// - `Err("input exhausted")`: Ran out of input bytes before terminal state
+    ///
+    /// ## Crash Triage
+    /// If this panics, check:
+    /// - `self.current_state()` - where execution stopped
+    /// - `self.trace()` - sequence of events taken
+    /// - `self.visited_states()` - states explored
     pub fn fuzz_from_bytes(&mut self, input: &[u8]) -> Result<(), &'static str> {
         self.reset();
         let mut byte_idx = 0;
@@ -217,10 +449,42 @@ impl CspOracle {
     }
 }
 
-/// Fuzz context integrating input buffer and CSP oracle
+/// Fuzz context for integration with tb_scenario! macro
 ///
-/// Provides clean ergonomic access to fuzzing operations with internal
-/// mutex handling. Access via `trace.oracle().method()` in tests.
+/// Provides ergonomic access to `CspOracle` within test scenarios.
+/// Created by `TraceCollector::with_fuzz_oracle()` and accessed via `trace.oracle()`.
+///
+/// ## Architecture
+/// - **TraceCollector** manages test assertions
+/// - **FuzzContext** wraps `CspOracle` with mutex for thread-safe access
+/// - **CspOracle** performs actual CSP-guided fuzzing
+///
+/// ## Usage
+/// ```ignore
+/// tb_scenario! {
+///     fuzz: afl,
+///     spec: MySpec,
+///     csp: MyProcess,
+///     environment Bare {
+///         exec: |trace| {
+///             // FuzzContext provides oracle access
+///             trace.oracle().fuzz_from_bytes()?;
+///
+///             // Can also query oracle state
+///             let events = trace.oracle().trace();
+///             for event in events {
+///                 trace.assert(AssertionPhase::HandlerStart, event.0);
+///             }
+///             Ok(())
+///         }
+///     }
+/// }
+/// ```
+///
+/// ## Advanced: Direct Byte Consumption
+/// The `fuzz_u8()`, `fuzz_u16()`, etc. methods are provided for custom
+/// fuzzing logic that needs structured data beyond oracle-guided execution.
+/// Most fuzz targets should use `fuzz_from_bytes()` instead.
 #[derive(Clone)]
 pub struct FuzzContext {
     inner: Arc<Mutex<FuzzContextInner>>,
@@ -287,6 +551,39 @@ impl FuzzContext {
     /// Get current state
     pub fn current_state(&self) -> Option<State> {
         self.inner.lock().ok().map(|g| g.oracle.current_state())
+    }
+
+    /// Get crash context for debugging
+    ///
+    /// Returns formatted debugging information about the current oracle state.
+    /// Useful when a fuzz target fails to understand what happened.
+    pub fn crash_context(&self) -> String {
+        self.inner
+            .lock()
+            .map(|g| g.oracle.crash_context())
+            .unwrap_or_else(|_| "Failed to acquire oracle lock".to_string())
+    }
+
+    /// Get current coverage score for IJON integration
+    ///
+    /// Returns combined state+transition coverage metric. Used by `tb_scenario!`
+    /// macro when `testing-fuzz-ijon` feature is enabled.
+    pub fn coverage_score(&self) -> u64 {
+        self.inner
+            .lock()
+            .map(|g| g.oracle.coverage_score())
+            .unwrap_or(0)
+    }
+
+    /// Get current state hash for IJON integration
+    ///
+    /// Returns stable hash of current CSP state. Used by `tb_scenario!`
+    /// macro when `testing-fuzz-ijon` feature is enabled.
+    pub fn track_state(&self) -> u32 {
+        self.inner
+            .lock()
+            .map(|g| g.oracle.track_state())
+            .unwrap_or(0)
     }
 
     /// Consume and return a u8 from fuzz input
@@ -601,5 +898,484 @@ mod tests {
         // Step should succeed (takes first choice)
         assert!(oracle.step(&Event("choice")));
         assert_eq!(oracle.current_state(), State("S1"));
+    }
+
+    #[test]
+    fn oracle_fuzz_from_bytes_reaches_terminal() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+
+        // Single byte input chooses first (and only) valid event
+        let input = vec![0];
+        assert!(oracle.fuzz_from_bytes(&input).is_ok());
+        assert_eq!(oracle.current_state(), State("S1"));
+        assert!(oracle.is_terminal());
+    }
+
+    #[test]
+    fn oracle_fuzz_from_bytes_multiple_transitions() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("a")
+            .add_observable("b")
+            .add_transition(State("S0"), "a", State("S1"))
+            .add_transition(State("S1"), "b", State("S2"))
+            .add_terminal(State("S2"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+
+        // Two bytes for two transitions
+        let input = vec![0, 0];
+        assert!(oracle.fuzz_from_bytes(&input).is_ok());
+        assert_eq!(oracle.current_state(), State("S2"));
+        assert_eq!(oracle.trace().len(), 2);
+    }
+
+    #[test]
+    fn oracle_fuzz_from_bytes_fails_on_insufficient_input() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("a")
+            .add_observable("b")
+            .add_transition(State("S0"), "a", State("S1"))
+            .add_transition(State("S1"), "b", State("S2"))
+            .add_terminal(State("S2"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+
+        // Only one byte, but need two transitions
+        let input = vec![0];
+        assert_eq!(
+            oracle.fuzz_from_bytes(&input),
+            Err("input exhausted before terminal state")
+        );
+    }
+
+    #[test]
+    fn oracle_coverage_increases_during_fuzzing() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("a")
+            .add_observable("b")
+            .add_transition(State("S0"), "a", State("S1"))
+            .add_transition(State("S1"), "b", State("S2"))
+            .add_terminal(State("S2"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+        let initial_score = oracle.coverage_score();
+
+        // After fuzzing, coverage should increase
+        let input = vec![0, 0];
+        let _ = oracle.fuzz_from_bytes(&input);
+
+        let final_score = oracle.coverage_score();
+        assert!(
+            final_score > initial_score,
+            "Coverage should increase: {} -> {}",
+            initial_score,
+            final_score
+        );
+
+        // Verify components
+        assert_eq!(oracle.visited_states().len(), 3); // S0, S1, S2
+        assert_eq!(oracle.visited_transitions().len(), 2); // S0->S1, S1->S2
+    }
+
+    #[test]
+    fn oracle_track_state_differs_between_states() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+
+        let hash_s0 = oracle.track_state();
+        oracle.step(&Event("go"));
+        let hash_s1 = oracle.track_state();
+
+        assert_ne!(
+            hash_s0, hash_s1,
+            "Different states should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn oracle_crash_context_provides_debug_info() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+        oracle.step(&Event("go"));
+
+        let context = oracle.crash_context();
+
+        // Verify context contains expected information
+        assert!(context.contains("Current State:"));
+        assert!(context.contains("S1"));
+        assert!(context.contains("Terminal: true"));
+        assert!(context.contains("Trace:"));
+        assert!(context.contains("Coverage:"));
+    }
+
+    #[cfg(feature = "testing-fuzz-ijon")]
+    #[test]
+    fn oracle_ijon_feature_enabled() {
+        // This test verifies that the IJON feature flag compiles correctly.
+        // IJON macros only execute inside afl::fuzz!() at runtime, so we verify
+        // the feature enables the right code paths without actually calling IJON.
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+
+        // fuzz_from_bytes will skip IJON calls in test mode (cfg(test) is true)
+        let input = vec![0];
+        let result = oracle.fuzz_from_bytes(&input);
+
+        assert!(result.is_ok(), "IJON feature should not break fuzzing");
+        assert_eq!(oracle.visited_states().len(), 2);
+        assert_eq!(oracle.visited_transitions().len(), 1);
+
+        // Verify IJON-related methods work
+        let _ = oracle.track_state();
+        let _ = oracle.coverage_score();
+    }
+
+    // FuzzContext Integration Tests - Critical AFL User-Facing API
+
+    #[test]
+    fn fuzz_context_executes_oracle() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let ctx = FuzzContext::new(vec![0], proc);
+
+        // FuzzContext should execute oracle successfully
+        assert!(
+            ctx.fuzz_from_bytes().is_ok(),
+            "FuzzContext::fuzz_from_bytes() should succeed"
+        );
+        assert!(ctx.is_terminal(), "Should reach terminal state");
+        assert_eq!(ctx.trace().len(), 1, "Should record event trace");
+    }
+
+    #[test]
+    fn fuzz_context_ijon_accessors() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("a")
+            .add_observable("b")
+            .add_transition(State("S0"), "a", State("S1"))
+            .add_transition(State("S1"), "b", State("S2"))
+            .add_terminal(State("S2"))
+            .build()
+            .unwrap();
+
+        let ctx = FuzzContext::new(vec![0, 0], proc);
+
+        // Initial IJON values
+        let initial_score = ctx.coverage_score();
+        let initial_hash = ctx.track_state();
+
+        // Execute fuzzing
+        let _ = ctx.fuzz_from_bytes();
+
+        // IJON values should change after execution
+        let final_score = ctx.coverage_score();
+        let final_hash = ctx.track_state();
+
+        assert!(
+            final_score > initial_score,
+            "coverage_score() should increase: {} -> {}",
+            initial_score,
+            final_score
+        );
+        assert_ne!(
+            initial_hash, final_hash,
+            "track_state() should change after state transition"
+        );
+    }
+
+    #[test]
+    fn fuzz_context_crash_context() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let ctx = FuzzContext::new(vec![0], proc);
+        let _ = ctx.fuzz_from_bytes();
+
+        let context = ctx.crash_context();
+
+        // Verify crash context contains debugging information
+        assert!(
+            context.contains("AFL Crash Context"),
+            "Should have crash context header"
+        );
+        assert!(
+            context.contains("Current State:"),
+            "Should show current state"
+        );
+        assert!(context.contains("S1"), "Should show state name");
+        assert!(
+            context.contains("Coverage:"),
+            "Should show coverage metrics"
+        );
+    }
+
+    #[test]
+    fn fuzz_context_thread_safe_clone() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let ctx1 = FuzzContext::new(vec![0], proc);
+        let ctx2 = ctx1.clone();
+
+        // Both contexts should share the same oracle (Arc)
+        let _ = ctx1.fuzz_from_bytes();
+
+        // ctx2 should see the same state (shared oracle)
+        assert_eq!(
+            ctx1.current_state(),
+            ctx2.current_state(),
+            "Cloned contexts share the same oracle state"
+        );
+    }
+
+    #[test]
+    fn oracle_input_modulo_selection() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("a")
+            .add_observable("b")
+            .add_observable("c")
+            .add_transition(State("S0"), "a", State("S1"))
+            .add_transition(State("S0"), "b", State("S2"))
+            .add_transition(State("S0"), "c", State("S3"))
+            .add_terminal(State("S1"))
+            .add_terminal(State("S2"))
+            .add_terminal(State("S3"))
+            .build()
+            .unwrap();
+
+        // Test byte modulo selection: byte % valid_events.len()
+        // With 3 valid events, byte values should wrap around
+
+        // Create oracle to get stable event ordering
+        let oracle_ref = CspOracle::new(proc.clone());
+        let valid = oracle_ref.valid_events();
+        assert_eq!(valid.len(), 3, "Should have 3 valid events");
+
+        // Get states for each event choice
+        let state_for_choice: Vec<State> = (0..3)
+            .map(|choice| {
+                let mut oracle = CspOracle::new(proc.clone());
+                oracle.fuzz_from_bytes(&[choice as u8]).unwrap();
+                oracle.current_state()
+            })
+            .collect();
+
+        // Verify byte modulo wrapping
+        // byte=0: 0 % 3 = 0 -> first event in ordering
+        let mut oracle1 = CspOracle::new(proc.clone());
+        assert!(oracle1.fuzz_from_bytes(&[0]).is_ok());
+        assert_eq!(oracle1.current_state(), state_for_choice[0]);
+
+        // byte=1: 1 % 3 = 1 -> second event in ordering
+        let mut oracle2 = CspOracle::new(proc.clone());
+        assert!(oracle2.fuzz_from_bytes(&[1]).is_ok());
+        assert_eq!(oracle2.current_state(), state_for_choice[1]);
+
+        // byte=2: 2 % 3 = 2 -> third event in ordering
+        let mut oracle3 = CspOracle::new(proc.clone());
+        assert!(oracle3.fuzz_from_bytes(&[2]).is_ok());
+        assert_eq!(oracle3.current_state(), state_for_choice[2]);
+
+        // byte=3: 3 % 3 = 0 -> wraps to first event
+        let mut oracle4 = CspOracle::new(proc.clone());
+        assert!(oracle4.fuzz_from_bytes(&[3]).is_ok());
+        assert_eq!(
+            oracle4.current_state(),
+            state_for_choice[0],
+            "byte=3 should wrap to same state as byte=0"
+        );
+
+        // byte=255: 255 % 3 = 0 -> wraps to first event
+        let mut oracle5 = CspOracle::new(proc);
+        assert!(oracle5.fuzz_from_bytes(&[255]).is_ok());
+        assert_eq!(
+            oracle5.current_state(),
+            state_for_choice[0],
+            "byte=255 should wrap to same state as byte=0"
+        );
+    }
+
+    #[test]
+    fn oracle_choice_point_fuzzing() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("choice")
+            .add_transition(State("S0"), "choice", State("S1"))
+            .add_transition(State("S0"), "choice", State("S2"))
+            .add_choice(State("S0"))
+            .add_terminal(State("S1"))
+            .add_terminal(State("S2"))
+            .build()
+            .unwrap();
+
+        // Choice point should always take first path (deterministic for fuzzing)
+        let mut oracle = CspOracle::new(proc);
+        assert!(oracle.fuzz_from_bytes(&[0]).is_ok());
+
+        // Oracle always takes first choice for deterministic fuzzing
+        assert_eq!(
+            oracle.current_state(),
+            State("S1"),
+            "Choice point should take first transition"
+        );
+    }
+
+    #[test]
+    fn oracle_reset_between_fuzz_runs() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+
+        // First fuzz run
+        assert!(oracle.fuzz_from_bytes(&[0]).is_ok());
+        assert_eq!(oracle.current_state(), State("S1"));
+        assert_eq!(oracle.trace().len(), 1);
+
+        // Second fuzz run - should reset automatically
+        assert!(oracle.fuzz_from_bytes(&[0]).is_ok());
+        assert_eq!(oracle.current_state(), State("S1"));
+        assert_eq!(
+            oracle.trace().len(),
+            1,
+            "Trace should be reset for new fuzz run"
+        );
+    }
+
+    #[test]
+    fn oracle_exhaustive_state_exploration() {
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("a")
+            .add_observable("b")
+            .add_observable("c")
+            .add_transition(State("S0"), "a", State("S1"))
+            .add_transition(State("S1"), "b", State("S2"))
+            .add_transition(State("S2"), "c", State("S3"))
+            .add_terminal(State("S3"))
+            .build()
+            .unwrap();
+
+        let mut oracle = CspOracle::new(proc);
+
+        // Given enough input bytes, should reach terminal state
+        let input = vec![0, 0, 0]; // Enough for 3 transitions
+        assert!(
+            oracle.fuzz_from_bytes(&input).is_ok(),
+            "Should reach terminal with sufficient input"
+        );
+
+        // Should have explored all 4 states
+        assert_eq!(
+            oracle.visited_states().len(),
+            4,
+            "Should visit all states in linear path"
+        );
+        assert_eq!(
+            oracle.visited_transitions().len(),
+            3,
+            "Should record all transitions"
+        );
+        assert_eq!(
+            oracle.state_coverage(),
+            100.0,
+            "Should achieve 100% coverage"
+        );
+    }
+
+    #[test]
+    fn fuzz_context_concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let proc = Process::builder("TestProc")
+            .initial_state(State("S0"))
+            .add_observable("go")
+            .add_transition(State("S0"), "go", State("S1"))
+            .add_terminal(State("S1"))
+            .build()
+            .unwrap();
+
+        let ctx = Arc::new(FuzzContext::new(vec![0], proc));
+
+        // Spawn multiple threads accessing FuzzContext
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let ctx_clone = Arc::clone(&ctx);
+                thread::spawn(move || {
+                    // Should not panic on concurrent access
+                    let _ = ctx_clone.coverage_score();
+                    let _ = ctx_clone.track_state();
+                    let _ = ctx_clone.is_terminal();
+                    let _ = ctx_clone.current_state();
+                })
+            })
+            .collect();
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
     }
 }

@@ -12,6 +12,7 @@ words:
   - Beamable
   - Boulgakov
   - CBVOC
+  - cfgs
   - ciphertext
   - ciphertexts
   - crls
@@ -36,6 +37,8 @@ words:
   - Flaggable
   - flagset
   - getrandom
+  - hashint
+  - hashstack
   - HKDF
   - HMAC
   - Hoare
