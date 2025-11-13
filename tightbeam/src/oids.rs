@@ -27,7 +27,7 @@ pub const ENVELOPED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.8
 ///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
 /// }
 /// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
-pub const COMPRESSION_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
+pub const COMPRESSION_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.9");
 
 /// id-alg-zlibCompress OBJECT IDENTIFIER ::= {
 ///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
@@ -63,11 +63,11 @@ pub const SIGNER_ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unw
 
 /// ecdsa-with-SHA3-256 (kept for backwards compatibility, maps to same OID as ecdsa-with-SHA256)
 /// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
-pub const SIGNER_ECDSA_WITH_SHA3_256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+pub const SIGNER_ECDSA_WITH_SHA3_256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10");
 
 /// ecdsa-with-SHA3-512
 /// See `<https://oid-base.com/get/2.16.840.1.101.3.4.3.10>`
-pub const SIGNER_ECDSA_WITH_SHA3_512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10");
+pub const SIGNER_ECDSA_WITH_SHA3_512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.12");
 
 /// id-aes128-gcm - AES-GCM with 128-bit key
 /// See RFC 5084 - https://datatracker.ietf.org/doc/html/rfc5084

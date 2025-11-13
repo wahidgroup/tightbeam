@@ -134,6 +134,12 @@ pub enum TightBeamError {
 	)]
 	UnsupportedVersion(ExpectError<Version, Version>),
 
+	/// Error during testing operations
+	#[cfg(feature = "testing-csp")]
+	#[cfg_attr(feature = "derive", error("Testing error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	TestingError(crate::testing::error::TestingError),
+
 	/// Error during encryption or decryption
 	#[cfg(feature = "aead")]
 	#[cfg_attr(feature = "derive", error("Encryption or decryption error: {0}"))]
@@ -339,6 +345,8 @@ impl core::fmt::Display for TightBeamError {
 					err.expected, err.received
 				)
 			}
+			#[cfg(feature = "testing-csp")]
+			TightBeamError::TestingError(err) => write!(f, "Testing error: {err}"),
 		}
 	}
 }
@@ -375,6 +383,8 @@ crate::impl_from!(crate::crypto::sign::elliptic_curve::Error => TightBeamError::
 crate::impl_from!(zeekstd::Error => TightBeamError::CompressionError via CompressionError::ZSTD);
 #[cfg(all(feature = "zstd", not(feature = "derive")))]
 crate::impl_from!(zeekstd::Error => CompressionError::ZSTD);
+#[cfg(all(feature = "testing-csp", not(feature = "derive")))]
+crate::impl_from!(crate::testing::error::TestingError => TightBeamError::TestingError);
 
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for TightBeamError {}

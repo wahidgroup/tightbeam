@@ -4,10 +4,14 @@
 //! compilation errors early when introducing new declarative APIs.
 
 pub mod assertions;
+pub mod error;
 pub mod macros;
 pub mod specs;
 pub mod trace;
 pub mod utils;
+
+#[cfg(feature = "testing-csp")]
+pub mod fuzz;
 
 pub use utils::*;
 

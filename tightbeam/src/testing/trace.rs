@@ -12,6 +12,7 @@ use alloc::sync::{Arc, Mutex};
 
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{Assertion, AssertionLabel, AssertionPhase, AssertionValue};
+use crate::testing::error::TestingError;
 use crate::transport::error::TransportError;
 use crate::Frame;
 
@@ -22,13 +23,15 @@ use crate::instrumentation::{TbEvent, TbEventKind};
 ///
 /// This type replaces the separate AssertionCollector pattern, unifying
 /// both assertions and instrumentation events into a single explicitly-passed
-/// collector. This ensures async-safety (no thread-local storage) and provides
-/// a consistent API for trace collection.
+/// collector. This ensures async-safety and provides a consistent API for
+/// trace collection.
 #[derive(Clone)]
 pub struct TraceCollector {
 	assertions: Arc<Mutex<Vec<Assertion>>>,
 	#[cfg(feature = "instrument")]
 	events: Arc<Mutex<Vec<TbEvent>>>,
+	#[cfg(feature = "testing-csp")]
+	fuzz_input: Arc<Mutex<Option<(Vec<u8>, usize)>>>, // (bytes, cursor position)
 }
 
 impl TraceCollector {
@@ -38,6 +41,19 @@ impl TraceCollector {
 			assertions: Arc::new(Mutex::new(Vec::new())),
 			#[cfg(feature = "instrument")]
 			events: Arc::new(Mutex::new(Vec::new())),
+			#[cfg(feature = "testing-csp")]
+			fuzz_input: Arc::new(Mutex::new(None)),
+		}
+	}
+
+	/// Create a trace collector with fuzz input
+	#[cfg(feature = "testing-csp")]
+	pub fn with_fuzz_input(input: Vec<u8>) -> Self {
+		Self {
+			assertions: Arc::new(Mutex::new(Vec::new())),
+			#[cfg(feature = "instrument")]
+			events: Arc::new(Mutex::new(Vec::new())),
+			fuzz_input: Arc::new(Mutex::new(Some((input, 0)))),
 		}
 	}
 
@@ -133,6 +149,136 @@ impl TraceCollector {
 		} else {
 			Vec::new()
 		}
+	}
+
+	// ===== Fuzz Input API =====
+
+	/// Get raw fuzz input bytes
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_input(&self) -> Result<Vec<u8>, TestingError> {
+		let guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, _) = guard.as_ref().ok_or(TestingError::FuzzInputUnavailable)?;
+		Ok(input.clone())
+	}
+
+	/// Consume and return a u8 from fuzz input (big-endian)
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_u8(&self) -> Result<u8, TestingError> {
+		let mut guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_mut().ok_or(TestingError::FuzzInputUnavailable)?;
+		if *offset + 1 > input.len() {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		let value = input[*offset];
+		*offset += 1;
+		Ok(value)
+	}
+
+	/// Consume and return a u16 from fuzz input (big-endian)
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_u16(&self) -> Result<u16, TestingError> {
+		let mut guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_mut().ok_or(TestingError::FuzzInputUnavailable)?;
+		if *offset + 2 > input.len() {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		let bytes = [input[*offset], input[*offset + 1]];
+		*offset += 2;
+		Ok(u16::from_be_bytes(bytes))
+	}
+
+	/// Consume and return a u32 from fuzz input (big-endian)
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_u32(&self) -> Result<u32, TestingError> {
+		let mut guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_mut().ok_or(TestingError::FuzzInputUnavailable)?;
+		if *offset + 4 > input.len() {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		let bytes = [input[*offset], input[*offset + 1], input[*offset + 2], input[*offset + 3]];
+		*offset += 4;
+		Ok(u32::from_be_bytes(bytes))
+	}
+
+	/// Consume and return a u64 from fuzz input (big-endian)
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_u64(&self) -> Result<u64, TestingError> {
+		let mut guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_mut().ok_or(TestingError::FuzzInputUnavailable)?;
+		if *offset + 8 > input.len() {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		let bytes = [
+			input[*offset],
+			input[*offset + 1],
+			input[*offset + 2],
+			input[*offset + 3],
+			input[*offset + 4],
+			input[*offset + 5],
+			input[*offset + 6],
+			input[*offset + 7],
+		];
+
+		*offset += 8;
+		Ok(u64::from_be_bytes(bytes))
+	}
+
+	/// Consume and return N bytes from fuzz input
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
+		let mut guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_mut().ok_or(TestingError::FuzzInputUnavailable)?;
+		if *offset + n > input.len() {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		let bytes = input[*offset..*offset + n].to_vec();
+		*offset += n;
+		Ok(bytes)
+	}
+
+	/// Peek at next u8 from fuzz input without consuming
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_peek_u8(&self) -> Result<u8, TestingError> {
+		let guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_ref().ok_or(TestingError::FuzzInputUnavailable)?;
+		if *offset + 1 > input.len() {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		Ok(input[*offset])
+	}
+
+	/// Peek at next N bytes from fuzz input without consuming
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_peek_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
+		let guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_ref().ok_or(TestingError::FuzzInputUnavailable)?;
+		if *offset + n > input.len() {
+			return Err(TestingError::FuzzInputExhausted);
+		}
+
+		Ok(input[*offset..*offset + n].to_vec())
+	}
+
+	/// Check if N bytes are available in fuzz input
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_has_bytes(&self, n: usize) -> Result<bool, TestingError> {
+		let guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_ref().ok_or(TestingError::FuzzInputUnavailable)?;
+		Ok(*offset + n <= input.len())
+	}
+
+	/// Get remaining byte count in fuzz input
+	#[cfg(feature = "testing-csp")]
+	pub fn fuzz_remaining(&self) -> Result<usize, TestingError> {
+		let guard = self.fuzz_input.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let (input, offset) = guard.as_ref().ok_or(TestingError::FuzzInputUnavailable)?;
+		Ok(input.len() - *offset)
 	}
 }
 

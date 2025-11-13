@@ -2947,6 +2947,7 @@ The following table summarizes capabilities available across the three testing l
 | CSP process modeling | – | ✓ | ✓ |
 | Compile-time label validation | – | ✓ | ✓ |
 | Runtime trace validation | – | ✓ | ✓ |
+| CSP oracle for fuzzing | – | ✓ | ✓ |
 | Multi-seed exploration | – | – | ✓ |
 | Trace refinement (⊑T) | – | – | ✓ |
 | Failures refinement (⊑F) | – | – | ✓ |

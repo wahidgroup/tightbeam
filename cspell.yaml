@@ -39,6 +39,7 @@ words:
   - HKDF
   - HMAC
   - Hoare
+  - ijon
   - Keccak
   - keypair
   - KTRI
@@ -64,6 +65,7 @@ words:
   - pkcs
   - pkix
   - Polydomy
+  - PRNG
   - recip
   - repr
   - REPUDIABLE
@@ -84,6 +86,7 @@ words:
   - Verlag
   - Wahid
   - Wrkr
+  - Xorshift
   - zeekstd
   - zeroization
   - zeroize

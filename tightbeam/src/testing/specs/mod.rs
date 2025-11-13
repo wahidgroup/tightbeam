@@ -15,6 +15,9 @@ mod assert;
 #[cfg(feature = "testing-csp")]
 pub mod csp;
 
+#[cfg(feature = "testing-csp")]
+pub mod fuzz;
+
 #[cfg(feature = "testing-fdr")]
 pub mod fdr;
 
@@ -23,5 +26,9 @@ pub use assert::{verify_trace, SpecViolation, TBSpec};
 
 #[cfg(feature = "testing-csp")]
 pub use csp::*;
+
+#[cfg(feature = "testing-csp")]
+pub use fuzz::*;
+
 #[cfg(feature = "testing-fdr")]
 pub use fdr::*;
