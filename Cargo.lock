@@ -1173,7 +1173,7 @@ version = "0.0.2"
 
 [[package]]
 name = "tightbeam-rs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aead",
  "aes-gcm",
