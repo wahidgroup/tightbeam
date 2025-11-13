@@ -2634,6 +2634,7 @@ tb_scenario! {
 	name: test_function_name,              // OPTIONAL: creates standalone #[test] function
 	spec: AssertSpecType,                  // REQUIRED: Layer 1 assertion spec
 	csp: ProcessSpecType,                  // OPTIONAL: Layer 2 CSP model (requires testing-csp)
+	fuzz: FuzzInputSpec,                   // OPTIONAL: input generator (requires csp + testing-csp)
 	fdr: FdrConfig { ... },                // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
 	instrumentation: Config { ... },       // OPTIONAL: instrumentation config
 	environment <Variant> { ... },         // REQUIRED: execution environment
@@ -2645,6 +2646,7 @@ tb_scenario! {
 - `name`: Optional, generates a standalone `#[test]` function
 - `spec`: Always required (Layer 1 foundation)
 - `csp`: Optional, enables Layer 2 verification
+- `fuzz`: Optional, requires `csp` to be present (enables CSP-guided fuzzing)
 - `fdr`: Optional, requires `csp` to be present (compile error if missing)
 - `environment`: Required, defines execution context
 - `hooks`: Optional, for custom validation
@@ -2935,6 +2937,373 @@ Privacy:
 #### 10.7.7 Failure Handling
 - Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
 - Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
+
+### 10.8 CSP-Guided Fuzzing
+
+#### 10.8.1 Concept
+
+CSP-guided fuzzing uses random byte sequences to explore protocol behavior through
+CSP process models. Unlike traditional fuzzing that blindly mutates inputs, the
+`CspOracle` navigates the state machine intelligently, interpreting input bytes
+as decisions for which valid events to take at each state.
+
+**Traditional Fuzzing**: Random bytes → Parse/Execute → Crash detection
+
+**CSP-Guided Fuzzing**: Random bytes → Oracle decisions → Valid state transitions → Statistical validation
+
+The oracle consumes input bytes to make choices at nondeterministic points,
+ensuring exploration follows valid protocol traces. This approach:
+- Tests protocol implementations with diverse valid inputs
+- Validates statistical properties (e.g., "90% of random inputs should succeed")
+- Complements FDR exhaustive exploration with randomized testing
+- Integrates seamlessly with Layer 1 (assertions) and Layer 2 (CSP validation)
+
+**Feature Flag**: Requires `testing-csp` feature flag.
+
+#### 10.8.2 Specification: tb_fuzz_spec! Syntax
+
+The `tb_fuzz_spec!` macro generates deterministic random input sequences for
+fuzz testing:
+
+```rust
+tb_fuzz_spec! {
+	pub InputSpecName,
+	test_cases: 100,           // Number of random inputs to generate
+	input_length: 5, 20,       // Min and max bytes per input
+	seed: 0xDEADBEEF,          // RNG seed for reproducibility
+	min_success_rate: 0.01,    // Expected minimum success rate
+	print_stats: true          // Display success/failure statistics
+}
+```
+
+**Parameters**:
+- `test_cases`: Number of random byte sequences to generate
+- `input_length`: Range for input size (min, max) in bytes
+- `seed`: Deterministic seed for reproducible test runs
+- `min_success_rate`: Expected minimum success rate for test cases
+- `print_stats`: Whether to print test statistics (successes, failures, rate)
+
+**Generated API**:
+```rust
+impl InputSpecName {
+	pub fn inputs() -> Vec<Vec<u8>>;  // Returns all test case inputs
+}
+```
+
+#### 10.8.3 Integration with tb_scenario!
+
+Fuzzing integrates with `tb_scenario!` through the `fuzz:` parameter. The
+framework automatically creates a `FuzzContext` that combines the input buffer
+with a `CspOracle` for the specified process.
+
+**Requirements**:
+- The `csp:` parameter MUST be present (compile error otherwise)
+- The `testing-csp` feature flag MUST be enabled
+- Fuzz input is accessed via `trace.oracle().*` methods
+
+**Example Integration**:
+```rust
+tb_scenario! {
+	name: test_with_fuzzing,
+	spec: MySpec,
+	csp: MyProcess,           // ← REQUIRED for fuzzing
+	fuzz: MyFuzzInputs,       // ← Provides random byte sequences
+	environment Bare {
+		exec: |trace| {
+			// Oracle automatically configured with fuzz input and CSP process
+			match trace.oracle().fuzz_from_bytes() {
+				Ok(()) => {
+					// Successfully navigated to terminal state
+					// Record events for Layer 1 validation
+					for event in trace.oracle().trace() {
+						trace.assert(AssertionPhase::HandlerStart, event.0);
+					}
+					Ok(())
+				}
+				Err(_) => {
+					// Failed to reach terminal state
+					Err(TestingError::FuzzInputExhausted.into())
+				}
+			}
+		}
+	}
+}
+```
+
+The macro generates one test execution per input from the fuzz spec. Each
+execution:
+1. Initializes `TraceCollector` with `FuzzContext`
+2. Runs the exec closure with oracle-guided fuzzing
+3. Validates Layer 1 assertions
+4. Validates Layer 2 CSP trace (if events were asserted)
+5. Tracks success/failure statistics
+
+#### 10.8.4 CspOracle and State Exploration
+
+The `CspOracle` provides the core fuzzing engine. It maintains the current CSP
+state and uses input bytes to navigate through valid transitions.
+
+**Primary Methods**:
+
+```rust
+// Main fuzzing entry point
+pub fn fuzz_from_bytes(&mut self) -> Result<(), &'static str>
+
+// Get execution trace of events taken
+pub fn trace(&self) -> &[Event]
+
+// Query current state
+pub fn current_state(&self) -> State
+pub fn is_terminal(&self) -> bool
+pub fn valid_events(&self) -> Vec<Event>
+```
+
+**Input Consumption Methods**:
+```rust
+pub fn fuzz_u8(&self) -> Result<u8, TestingError>
+pub fn fuzz_u16(&self) -> Result<u16, TestingError>
+pub fn fuzz_u32(&self) -> Result<u32, TestingError>
+pub fn fuzz_u64(&self) -> Result<u64, TestingError>
+pub fn fuzz_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError>
+
+// Peeking without consuming
+pub fn fuzz_peek_u8(&self) -> Result<u8, TestingError>
+pub fn fuzz_peek_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError>
+```
+
+**How It Works**:
+
+1. **Initialization**: Oracle starts at the process initial state
+2. **Event Selection**: At each state, oracle queries valid events
+3. **Input Interpretation**: Consumes one byte: `choice = input_byte % valid_events.len()`
+4. **Transition**: Takes the selected event, updates state
+5. **Iteration**: Repeats until terminal state or input exhausted
+6. **Validation**: Returns `Ok(())` if terminal state reached
+
+**Example**: Manual oracle usage (typically handled by `fuzz_from_bytes`):
+
+```rust
+let proc = MyProcess::process();
+let mut oracle = CspOracle::new(proc);
+
+// Navigate manually
+while !oracle.is_terminal() && has_input() {
+	let valid = oracle.valid_events();
+	if valid.is_empty() {
+		break; // Deadlock
+	}
+
+	let byte = consume_input_byte();
+	let choice = (byte as usize) % valid.len();
+	oracle.step(&valid[choice]);
+}
+
+// Check if succeeded
+if oracle.is_terminal() {
+	println!("Trace: {:?}", oracle.trace());
+}
+```
+
+#### 10.8.5 Complete Examples
+
+**Simple 3-State Process**:
+
+```rust
+use tightbeam::testing::*;
+use tightbeam::testing::assertions::AssertionPhase;
+
+// Layer 1: Assertion spec
+tb_assert_spec! {
+	pub SimpleFuzzSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "start", exactly!(1)),
+			(HandlerStart, "done", exactly!(1))
+		]
+	},
+}
+
+// Layer 2: CSP process with 3 states
+tb_process_spec! {
+	pub struct SimpleFuzzProcess;
+	events {
+		observable { "start", "action_a", "action_b", "done" }
+	}
+	states {
+		S0 => { "start" => S1 },
+		S1 => { "action_a" => S1, "action_b" => S1, "done" => S2 }
+	}
+	terminal { S2 }
+}
+
+// Fuzz input generator: 100 test cases with 2-10 bytes each
+tb_fuzz_spec! {
+	pub SimpleFuzzInputs,
+	test_cases: 100,
+	input_length: 2, 10,
+	seed: 0x12345678,
+	print_stats: true
+}
+
+// Fuzz test scenario
+tb_scenario! {
+	name: test_simple_fuzzing,
+	spec: SimpleFuzzSpec,
+	csp: SimpleFuzzProcess,
+	fuzz: SimpleFuzzInputs,
+	environment Bare {
+		exec: |trace| {
+			// Oracle-guided fuzzing through state machine
+			match trace.oracle().fuzz_from_bytes() {
+				Ok(()) => {
+					// Record trace events for assertion validation
+					for event in trace.oracle().trace() {
+						trace.assert(AssertionPhase::HandlerStart, event.0);
+					}
+					Ok(())
+				}
+				Err(_) => {
+					// Input exhausted before reaching terminal state
+					Err(TestingError::FuzzInputExhausted.into())
+				}
+			}
+		}
+	}
+}
+```
+
+**Output** (with `print_stats: true`):
+```
+Fuzz test results:
+  Test cases: 100
+  Successes: 73 (73.0%)
+  Failures: 27 (27.0%)
+  Required: >= 0.0%
+test test_simple_fuzzing ... ok
+```
+
+**Complex Workflow with Branching**:
+
+```rust
+// Multi-stage workflow: init → auth → operations → commit/rollback → complete
+tb_assert_spec! {
+	pub WorkflowFuzzSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(HandlerStart, "init", exactly!(1)),
+			(HandlerStart, "authenticate", exactly!(1)),
+			(HandlerStart, "complete", exactly!(1))
+		]
+	},
+}
+
+tb_process_spec! {
+	pub struct WorkflowFuzzProcess;
+	events {
+		observable {
+			"init",
+			"authenticate",
+			"read",
+			"write",
+			"delete",
+			"commit",
+			"rollback",
+			"complete"
+		}
+	}
+	states {
+		S0 => { "init" => S1 },
+		S1 => { "authenticate" => S2 },
+		S2 => { "read" => S3, "write" => S3, "delete" => S3 },
+		S3 => {
+			"read" => S3,        // Self-loop: can perform multiple operations
+			"write" => S3,
+			"delete" => S3,
+			"commit" => S4,      // Branch: commit or rollback
+			"rollback" => S5
+		},
+		S4 => { "complete" => S6 },
+		S5 => { "complete" => S6 }
+	}
+	terminal { S6 }
+}
+
+tb_fuzz_spec! {
+	pub WorkflowFuzzInputs,
+	test_cases: 100,
+	input_length: 5, 20,      // Longer inputs for complex paths
+	seed: 0xDEADBEEF,
+	print_stats: true
+}
+
+tb_scenario! {
+	name: test_workflow_fuzzing,
+	spec: WorkflowFuzzSpec,
+	csp: WorkflowFuzzProcess,
+	fuzz: WorkflowFuzzInputs,
+	environment Bare {
+		exec: |trace| {
+			match trace.oracle().fuzz_from_bytes() {
+				Ok(()) => {
+					// Successful workflow completion
+					for event in trace.oracle().trace() {
+						trace.assert(AssertionPhase::HandlerStart, event.0);
+					}
+					Ok(())
+				}
+				Err(_) => Err(TestingError::FuzzInputExhausted.into())
+			}
+		}
+	}
+}
+```
+
+**Output**:
+```
+Fuzz test results:
+  Test cases: 100
+  Successes: 89 (89.0%)
+  Failures: 11 (11.0%)
+  Required: >= 0.0%
+test test_workflow_fuzzing ... ok
+```
+
+**Interpreting Results**:
+
+- **Successes**: Inputs that navigated to terminal state and passed all validations
+- **Failures**: Inputs exhausted before reaching terminal state
+- **Success Rate**: Indicates how "reachable" terminal states are with random choices
+
+Higher success rates (>80%) suggest the process is well-designed with most paths
+leading to completion. Lower rates may indicate:
+- Many self-loops or cycles requiring specific input patterns
+- Deep nesting requiring longer input sequences
+- Narrow paths to terminal states
+
+**When to Use Fuzzing vs FDR**:
+
+| Technique | Use When | Strengths | Limitations |
+|-----------|----------|-----------|-------------|
+| **Fuzzing** | Testing with diverse inputs | Fast, scalable, finds statistical patterns | Non-exhaustive, may miss edge cases |
+| **FDR (§10.4)** | Formal verification | Exhaustive, proves correctness | Slower, state explosion for large systems |
+
+Use fuzzing for:
+- Testing with realistic input distributions
+- Statistical validation (e.g., success rate thresholds)
+- Performance testing with many iterations
+- Complement to exhaustive verification
+
+Use FDR for:
+- Proving refinement properties hold
+- Detecting all nondeterminism
+- Verifying divergence freedom
+- Critical protocol correctness proofs
+
+Both can be combined in the same test suite for comprehensive validation.
 
 ### 10.8 Feature Matrix
 

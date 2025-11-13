@@ -41,9 +41,9 @@ pub use crate::{absent, at_least, at_most, between, exactly, present};
 /// Helper macro to wrap values for equality assertions in specs
 #[macro_export]
 macro_rules! equals {
-	($value:expr) => {
-		Some($crate::testing::macros::AssertionValue::from($value))
-	};
+    ($value:expr) => {
+        Some($crate::testing::macros::AssertionValue::from($value))
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -60,73 +60,73 @@ macro_rules! equals {
 #[cfg(feature = "instrument")]
 #[derive(Clone, Debug)]
 pub enum InstrumentationMode {
-	/// Automatic: framework initializes and captures events (default)
-	Auto,
+    /// Automatic: framework initializes and captures events (default)
+    Auto,
 
-	/// Manual: user controls init/start/end
-	Manual,
+    /// Manual: user controls init/start/end
+    Manual,
 
-	/// Custom: automatic with custom configuration
-	Custom {
-		enable_payloads: bool,
-		enable_internal_detail: bool,
-		sample_enabled_sets: bool,
-		sample_refusals: bool,
-		divergence_heuristics: bool,
-		record_durations: bool,
-		max_events: u32,
-	},
+    /// Custom: automatic with custom configuration
+    Custom {
+        enable_payloads: bool,
+        enable_internal_detail: bool,
+        sample_enabled_sets: bool,
+        sample_refusals: bool,
+        divergence_heuristics: bool,
+        record_durations: bool,
+        max_events: u32,
+    },
 }
 
 #[cfg(feature = "instrument")]
 impl Default for InstrumentationMode {
-	fn default() -> Self {
-		Self::Auto
-	}
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 #[cfg(feature = "instrument")]
 impl InstrumentationMode {
-	/// Get the TbInstrumentationConfig for this mode
-	pub fn config(&self) -> crate::instrumentation::TbInstrumentationConfig {
-		match self {
-			Self::Auto => crate::instrumentation::TbInstrumentationConfig {
-				enable_payloads: false,
-				enable_internal_detail: true, // Need hidden events for CSP
-				sample_enabled_sets: false,
-				sample_refusals: false,
-				divergence_heuristics: false,
-				record_durations: false,
-				max_events: 4096,
-			},
-			Self::Manual => {
-				// Manual mode shouldn't call this, but provide safe default
-				crate::instrumentation::TbInstrumentationConfig::default()
-			}
-			Self::Custom {
-				enable_payloads,
-				enable_internal_detail,
-				sample_enabled_sets,
-				sample_refusals,
-				divergence_heuristics,
-				record_durations,
-				max_events,
-			} => crate::instrumentation::TbInstrumentationConfig {
-				enable_payloads: *enable_payloads,
-				enable_internal_detail: *enable_internal_detail,
-				sample_enabled_sets: *sample_enabled_sets,
-				sample_refusals: *sample_refusals,
-				divergence_heuristics: *divergence_heuristics,
-				record_durations: *record_durations,
-				max_events: *max_events,
-			},
-		}
-	}
+    /// Get the TbInstrumentationConfig for this mode
+    pub fn config(&self) -> crate::instrumentation::TbInstrumentationConfig {
+        match self {
+            Self::Auto => crate::instrumentation::TbInstrumentationConfig {
+                enable_payloads: false,
+                enable_internal_detail: true, // Need hidden events for CSP
+                sample_enabled_sets: false,
+                sample_refusals: false,
+                divergence_heuristics: false,
+                record_durations: false,
+                max_events: 4096,
+            },
+            Self::Manual => {
+                // Manual mode shouldn't call this, but provide safe default
+                crate::instrumentation::TbInstrumentationConfig::default()
+            }
+            Self::Custom {
+                enable_payloads,
+                enable_internal_detail,
+                sample_enabled_sets,
+                sample_refusals,
+                divergence_heuristics,
+                record_durations,
+                max_events,
+            } => crate::instrumentation::TbInstrumentationConfig {
+                enable_payloads: *enable_payloads,
+                enable_internal_detail: *enable_internal_detail,
+                sample_enabled_sets: *sample_enabled_sets,
+                sample_refusals: *sample_refusals,
+                divergence_heuristics: *divergence_heuristics,
+                record_durations: *record_durations,
+                max_events: *max_events,
+            },
+        }
+    }
 
-	/// Should framework auto-initialize?
-	pub fn is_auto(&self) -> bool {
-		matches!(self, Self::Auto | Self::Custom { .. })
-	}
+    /// Should framework auto-initialize?
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto | Self::Custom { .. })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,73 +135,101 @@ impl InstrumentationMode {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Cardinality {
-	min: u32,
-	max: Option<u32>,
-	must_be_present: bool,
+    min: u32,
+    max: Option<u32>,
+    must_be_present: bool,
 }
 
 impl Cardinality {
-	pub const fn new(min: u32, max: Option<u32>, must_be_present: bool) -> Self {
-		Self { min, max, must_be_present }
-	}
-	pub const fn exactly(n: u32) -> Self {
-		Self { min: n, max: Some(n), must_be_present: n > 0 }
-	}
-	pub const fn at_least(n: u32) -> Self {
-		Self { min: n, max: None, must_be_present: n > 0 }
-	}
-	pub const fn at_most(n: u32) -> Self {
-		Self { min: 0, max: Some(n), must_be_present: false }
-	}
-	pub const fn between(min: u32, max: u32) -> Self {
-		Self { min, max: Some(max), must_be_present: min > 0 }
-	}
-	pub const fn present() -> Self {
-		Self { min: 1, max: None, must_be_present: true }
-	}
-	pub const fn absent() -> Self {
-		Self { min: 0, max: Some(0), must_be_present: false }
-	}
-	pub fn describe(&self) -> String {
-		match (self.min, self.max) {
-			(0, Some(0)) => "absent".into(),
-			(m, Some(n)) if m == n => format!("exactly {m}"),
-			(m, Some(n)) => format!("between {m} and {n}"),
-			(0, None) => "any".into(),
-			(m, None) => format!("at least {m}"),
-		}
-	}
-	pub fn is_satisfied_by(&self, count: usize) -> bool {
-		let c = count as u32;
-		if c < self.min {
-			return false;
-		}
-		if let Some(mx) = self.max {
-			if c > mx {
-				return false;
-			}
-		}
-		true
-	}
-	pub fn min(&self) -> u32 {
-		self.min
-	}
-	pub fn max(&self) -> Option<u32> {
-		self.max
-	}
-	pub fn must_be_present(&self) -> bool {
-		self.must_be_present
-	}
+    pub const fn new(min: u32, max: Option<u32>, must_be_present: bool) -> Self {
+        Self {
+            min,
+            max,
+            must_be_present,
+        }
+    }
+    pub const fn exactly(n: u32) -> Self {
+        Self {
+            min: n,
+            max: Some(n),
+            must_be_present: n > 0,
+        }
+    }
+    pub const fn at_least(n: u32) -> Self {
+        Self {
+            min: n,
+            max: None,
+            must_be_present: n > 0,
+        }
+    }
+    pub const fn at_most(n: u32) -> Self {
+        Self {
+            min: 0,
+            max: Some(n),
+            must_be_present: false,
+        }
+    }
+    pub const fn between(min: u32, max: u32) -> Self {
+        Self {
+            min,
+            max: Some(max),
+            must_be_present: min > 0,
+        }
+    }
+    pub const fn present() -> Self {
+        Self {
+            min: 1,
+            max: None,
+            must_be_present: true,
+        }
+    }
+    pub const fn absent() -> Self {
+        Self {
+            min: 0,
+            max: Some(0),
+            must_be_present: false,
+        }
+    }
+    pub fn describe(&self) -> String {
+        match (self.min, self.max) {
+            (0, Some(0)) => "absent".into(),
+            (m, Some(n)) if m == n => format!("exactly {m}"),
+            (m, Some(n)) => format!("between {m} and {n}"),
+            (0, None) => "any".into(),
+            (m, None) => format!("at least {m}"),
+        }
+    }
+    pub fn is_satisfied_by(&self, count: usize) -> bool {
+        let c = count as u32;
+        if c < self.min {
+            return false;
+        }
+        if let Some(mx) = self.max {
+            if c > mx {
+                return false;
+            }
+        }
+        true
+    }
+    pub fn min(&self) -> u32 {
+        self.min
+    }
+    pub fn max(&self) -> Option<u32> {
+        self.max
+    }
+    pub fn must_be_present(&self) -> bool {
+        self.must_be_present
+    }
 }
 
 pub const fn between(min: u32, max: u32) -> Cardinality {
-	Cardinality::between(min, max)
+    Cardinality::between(min, max)
 }
 pub const fn present() -> Cardinality {
-	Cardinality::present()
+    Cardinality::present()
 }
 pub const fn absent() -> Cardinality {
-	Cardinality::absent()
+    Cardinality::absent()
 }
 
 // ---------------------------------------------------------------------------
@@ -209,10 +237,10 @@ pub const fn absent() -> Cardinality {
 // ---------------------------------------------------------------------------
 
 pub trait TbAssertLabelTrait {
-	fn name(&self) -> &'static str;
-	fn payload_capable(&self) -> bool {
-		false
-	}
+    fn name(&self) -> &'static str;
+    fn payload_capable(&self) -> bool {
+        false
+    }
 }
 
 // (Dynamic label builder retained for potential future use)
@@ -225,256 +253,276 @@ pub trait TbAssertLabelTrait {
 #[derive(Debug)]
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 pub enum SpecBuildError {
-	#[cfg_attr(feature = "derive", error("Duplicate label: {0}"))]
-	DuplicateLabel(&'static str),
-	#[cfg_attr(feature = "derive", error("Unknown ordering label: {0}"))]
-	UnknownOrderingLabel(&'static str),
-	#[cfg_attr(feature = "derive", error("Invalid range: {0}"))]
-	InvalidRange(&'static str),
+    #[cfg_attr(feature = "derive", error("Duplicate label: {0}"))]
+    DuplicateLabel(&'static str),
+    #[cfg_attr(feature = "derive", error("Unknown ordering label: {0}"))]
+    UnknownOrderingLabel(&'static str),
+    #[cfg_attr(feature = "derive", error("Invalid range: {0}"))]
+    InvalidRange(&'static str),
 }
 
 /// Builder for programmatic spec construction
 pub struct AssertSpecBuilder {
-	id: &'static str,
-	execution_mode: ExecutionMode,
-	gate_decision: Option<TransitStatus>,
-	version_major: u16,
-	version_minor: u16,
-	version_patch: u16,
-	assertions: Vec<(AssertionPhase, &'static str, Cardinality, Option<AssertionValue>)>,
-	ordering: Vec<&'static str>,
-	#[cfg(feature = "instrument")]
-	required_events: Vec<TbEventKind>,
+    id: &'static str,
+    execution_mode: ExecutionMode,
+    gate_decision: Option<TransitStatus>,
+    version_major: u16,
+    version_minor: u16,
+    version_patch: u16,
+    assertions: Vec<(
+        AssertionPhase,
+        &'static str,
+        Cardinality,
+        Option<AssertionValue>,
+    )>,
+    ordering: Vec<&'static str>,
+    #[cfg(feature = "instrument")]
+    required_events: Vec<TbEventKind>,
 }
 
 impl AssertSpecBuilder {
-	pub fn new(id: &'static str, execution_mode: ExecutionMode) -> Self {
-		Self {
-			id,
-			execution_mode,
-			gate_decision: None,
-			version_major: 1,
-			version_minor: 0,
-			version_patch: 0,
-			assertions: Vec::new(),
-			ordering: Vec::new(),
-			#[cfg(feature = "instrument")]
-			required_events: Vec::new(),
-		}
-	}
+    pub fn new(id: &'static str, execution_mode: ExecutionMode) -> Self {
+        Self {
+            id,
+            execution_mode,
+            gate_decision: None,
+            version_major: 1,
+            version_minor: 0,
+            version_patch: 0,
+            assertions: Vec::new(),
+            ordering: Vec::new(),
+            #[cfg(feature = "instrument")]
+            required_events: Vec::new(),
+        }
+    }
 
-	pub fn version(mut self, maj: u16, min: u16, patch: u16) -> Self {
-		self.version_major = maj;
-		self.version_minor = min;
-		self.version_patch = patch;
-		self
-	}
+    pub fn version(mut self, maj: u16, min: u16, patch: u16) -> Self {
+        self.version_major = maj;
+        self.version_minor = min;
+        self.version_patch = patch;
+        self
+    }
 
-	pub fn gate_decision(mut self, decision: TransitStatus) -> Self {
-		self.gate_decision = Some(decision);
-		self
-	}
+    pub fn gate_decision(mut self, decision: TransitStatus) -> Self {
+        self.gate_decision = Some(decision);
+        self
+    }
 
-	pub fn assertion(
-		mut self,
-		phase: AssertionPhase,
-		label: &'static str,
-		cardinality: Cardinality,
-	) -> Result<Self, SpecBuildError> {
-		if self.assertions.iter().any(|(_, l, _, _)| *l == label) {
-			return Err(SpecBuildError::DuplicateLabel(label));
-		}
-		if let Some(mx) = cardinality.max {
-			if mx < cardinality.min {
-				return Err(SpecBuildError::InvalidRange(label));
-			}
-		}
-		self.assertions.push((phase, label, cardinality, None));
-		Ok(self)
-	}
+    pub fn assertion(
+        mut self,
+        phase: AssertionPhase,
+        label: &'static str,
+        cardinality: Cardinality,
+    ) -> Result<Self, SpecBuildError> {
+        if self.assertions.iter().any(|(_, l, _, _)| *l == label) {
+            return Err(SpecBuildError::DuplicateLabel(label));
+        }
+        if let Some(mx) = cardinality.max {
+            if mx < cardinality.min {
+                return Err(SpecBuildError::InvalidRange(label));
+            }
+        }
+        self.assertions.push((phase, label, cardinality, None));
+        Ok(self)
+    }
 
-	pub fn assertion_with_value(
-		mut self,
-		phase: AssertionPhase,
-		label: &'static str,
-		cardinality: Cardinality,
-		expected_value: Option<AssertionValue>,
-	) -> Result<Self, SpecBuildError> {
-		if self.assertions.iter().any(|(_, l, _, _)| *l == label) {
-			return Err(SpecBuildError::DuplicateLabel(label));
-		}
-		if let Some(mx) = cardinality.max {
-			if mx < cardinality.min {
-				return Err(SpecBuildError::InvalidRange(label));
-			}
-		}
-		self.assertions.push((phase, label, cardinality, expected_value));
-		Ok(self)
-	}
+    pub fn assertion_with_value(
+        mut self,
+        phase: AssertionPhase,
+        label: &'static str,
+        cardinality: Cardinality,
+        expected_value: Option<AssertionValue>,
+    ) -> Result<Self, SpecBuildError> {
+        if self.assertions.iter().any(|(_, l, _, _)| *l == label) {
+            return Err(SpecBuildError::DuplicateLabel(label));
+        }
+        if let Some(mx) = cardinality.max {
+            if mx < cardinality.min {
+                return Err(SpecBuildError::InvalidRange(label));
+            }
+        }
+        self.assertions
+            .push((phase, label, cardinality, expected_value));
+        Ok(self)
+    }
 
-	pub fn ordering(mut self, labels: &[&'static str]) -> Result<Self, SpecBuildError> {
-		for &lbl in labels {
-			if !self.assertions.iter().any(|(_, l, _, _)| *l == lbl) {
-				return Err(SpecBuildError::UnknownOrderingLabel(lbl));
-			}
-			self.ordering.push(lbl);
-		}
-		Ok(self)
-	}
+    pub fn ordering(mut self, labels: &[&'static str]) -> Result<Self, SpecBuildError> {
+        for &lbl in labels {
+            if !self.assertions.iter().any(|(_, l, _, _)| *l == lbl) {
+                return Err(SpecBuildError::UnknownOrderingLabel(lbl));
+            }
+            self.ordering.push(lbl);
+        }
+        Ok(self)
+    }
 
-	#[cfg(feature = "instrument")]
-	pub fn required_events(mut self, kinds: &[TbEventKind]) -> Self {
-		use std::collections::HashSet;
-		let mut seen = HashSet::new();
-		for &k in kinds {
-			if seen.insert(k) {
-				self.required_events.push(k);
-			}
-		}
-		self
-	}
+    #[cfg(feature = "instrument")]
+    pub fn required_events(mut self, kinds: &[TbEventKind]) -> Self {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for &k in kinds {
+            if seen.insert(k) {
+                self.required_events.push(k);
+            }
+        }
+        self
+    }
 
-	pub fn build(self) -> BuiltAssertSpec {
-		BuiltAssertSpec::from_builder(self)
-	}
+    pub fn build(self) -> BuiltAssertSpec {
+        BuiltAssertSpec::from_builder(self)
+    }
 }
 
 pub struct BuiltAssertSpec {
-	inner: AssertSpecBuilder,
-	contracts: Box<[AssertionContract]>,
-	spec_hash: [u8; 32],
+    inner: AssertSpecBuilder,
+    contracts: Box<[AssertionContract]>,
+    spec_hash: [u8; 32],
 }
 
 impl BuiltAssertSpec {
-	fn from_builder(builder: AssertSpecBuilder) -> Self {
-		let contracts: Vec<AssertionContract> = builder
-			.assertions
-			.iter()
-			.map(|(phase, label, card, value)| {
-				if let Some(ref val) = value {
-					AssertionContract::with_value(*phase, AssertionLabel::Custom(label), *card, val.clone())
-				} else {
-					AssertionContract::new(*phase, AssertionLabel::Custom(label), *card)
-				}
-			})
-			.collect();
-		let spec_hash = Self::compute_hash(
-			builder.id,
-			builder.execution_mode,
-			builder.gate_decision,
-			builder.version_major,
-			builder.version_minor,
-			builder.version_patch,
-			&contracts,
-			#[cfg(feature = "instrument")]
-			&builder.required_events,
-		);
-		Self { inner: builder, contracts: contracts.into_boxed_slice(), spec_hash }
-	}
+    fn from_builder(builder: AssertSpecBuilder) -> Self {
+        let contracts: Vec<AssertionContract> = builder
+            .assertions
+            .iter()
+            .map(|(phase, label, card, value)| {
+                if let Some(ref val) = value {
+                    AssertionContract::with_value(
+                        *phase,
+                        AssertionLabel::Custom(label),
+                        *card,
+                        val.clone(),
+                    )
+                } else {
+                    AssertionContract::new(*phase, AssertionLabel::Custom(label), *card)
+                }
+            })
+            .collect();
+        let spec_hash = Self::compute_hash(
+            builder.id,
+            builder.execution_mode,
+            builder.gate_decision,
+            builder.version_major,
+            builder.version_minor,
+            builder.version_patch,
+            &contracts,
+            #[cfg(feature = "instrument")]
+            &builder.required_events,
+        );
+        Self {
+            inner: builder,
+            contracts: contracts.into_boxed_slice(),
+            spec_hash,
+        }
+    }
 
-	#[allow(clippy::too_many_arguments)]
-	fn compute_hash(
-		id: &'static str,
-		mode: ExecutionMode,
-		gate: Option<TransitStatus>,
-		version_major: u16,
-		version_minor: u16,
-		version_patch: u16,
-		contracts: &[AssertionContract],
-		#[cfg(feature = "instrument")] events: &[TbEventKind],
-	) -> [u8; 32] {
-		let mut h = Sha3_256::new();
-		// Domain tag + version triple
-		h.update(b"TBSP");
-		h.update(version_major.to_be_bytes());
-		h.update(version_minor.to_be_bytes());
-		h.update(version_patch.to_be_bytes());
-		h.update(id.as_bytes());
-		let mode_code = match mode {
-			ExecutionMode::Accept => 0u8,
-			ExecutionMode::Reject => 1u8,
-			ExecutionMode::Error => 2u8,
-		};
-		h.update([mode_code]);
-		match gate {
-			Some(g) => {
-				h.update([1u8]);
-				h.update([g as u8]);
-			}
-			None => h.update([0u8]),
-		}
-		// Normalize assertion order independent of insertion sequence
-		let mut norm: Vec<(&'static str, u8, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
-		for c in contracts {
-			let phase_code = match c.phase {
-				AssertionPhase::HandlerStart => 0u8,
-				AssertionPhase::HandlerEnd => 1u8,
-				AssertionPhase::Gate => 2u8,
-				AssertionPhase::Response => 3u8,
-			};
-			let AssertionLabel::Custom(lbl) = c.label;
-			norm.push((
-				lbl,
-				phase_code,
-				c.cardinality.min,
-				c.cardinality.max,
-				c.cardinality.must_be_present,
-			));
-		}
-		norm.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1))); // label then phase
-		for (lbl, phase_code, min, max, must) in norm {
-			h.update(lbl.as_bytes());
-			h.update([phase_code]);
-			h.update(min.to_be_bytes());
-			match max {
-				Some(m) => {
-					h.update([1u8]);
-					h.update(m.to_be_bytes());
-				}
-				None => h.update([0u8]),
-			}
-			h.update([must as u8]);
-		}
-		#[cfg(feature = "instrument")]
-		{
-			for ev in events {
-				h.update([*ev as u8]);
-			}
-		}
-		let out = h.finalize();
-		let mut arr = [0u8; 32];
-		arr.copy_from_slice(&out);
-		arr
-	}
+    #[allow(clippy::too_many_arguments)]
+    fn compute_hash(
+        id: &'static str,
+        mode: ExecutionMode,
+        gate: Option<TransitStatus>,
+        version_major: u16,
+        version_minor: u16,
+        version_patch: u16,
+        contracts: &[AssertionContract],
+        #[cfg(feature = "instrument")] events: &[TbEventKind],
+    ) -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        // Domain tag + version triple
+        h.update(b"TBSP");
+        h.update(version_major.to_be_bytes());
+        h.update(version_minor.to_be_bytes());
+        h.update(version_patch.to_be_bytes());
+        h.update(id.as_bytes());
+        let mode_code = match mode {
+            ExecutionMode::Accept => 0u8,
+            ExecutionMode::Reject => 1u8,
+            ExecutionMode::Error => 2u8,
+        };
+        h.update([mode_code]);
+        match gate {
+            Some(g) => {
+                h.update([1u8]);
+                h.update([g as u8]);
+            }
+            None => h.update([0u8]),
+        }
+        // Normalize assertion order independent of insertion sequence
+        let mut norm: Vec<(&'static str, u8, u32, Option<u32>, bool)> =
+            Vec::with_capacity(contracts.len());
+        for c in contracts {
+            let phase_code = match c.phase {
+                AssertionPhase::HandlerStart => 0u8,
+                AssertionPhase::HandlerEnd => 1u8,
+                AssertionPhase::Gate => 2u8,
+                AssertionPhase::Response => 3u8,
+            };
+            let AssertionLabel::Custom(lbl) = c.label;
+            norm.push((
+                lbl,
+                phase_code,
+                c.cardinality.min,
+                c.cardinality.max,
+                c.cardinality.must_be_present,
+            ));
+        }
+        norm.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1))); // label then phase
+        for (lbl, phase_code, min, max, must) in norm {
+            h.update(lbl.as_bytes());
+            h.update([phase_code]);
+            h.update(min.to_be_bytes());
+            match max {
+                Some(m) => {
+                    h.update([1u8]);
+                    h.update(m.to_be_bytes());
+                }
+                None => h.update([0u8]),
+            }
+            h.update([must as u8]);
+        }
+        #[cfg(feature = "instrument")]
+        {
+            for ev in events {
+                h.update([*ev as u8]);
+            }
+        }
+        let out = h.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&out);
+        arr
+    }
 
-	pub fn spec_hash(&self) -> [u8; 32] {
-		self.spec_hash
-	}
-	pub fn version(&self) -> (u16, u16, u16) {
-		(self.inner.version_major, self.inner.version_minor, self.inner.version_patch)
-	}
+    pub fn spec_hash(&self) -> [u8; 32] {
+        self.spec_hash
+    }
+    pub fn version(&self) -> (u16, u16, u16) {
+        (
+            self.inner.version_major,
+            self.inner.version_minor,
+            self.inner.version_patch,
+        )
+    }
 }
 
 impl TBSpec for BuiltAssertSpec {
-	fn id(&self) -> &'static str {
-		self.inner.id
-	}
-	fn mode(&self) -> ExecutionMode {
-		self.inner.execution_mode
-	}
-	fn required_assertions(&self) -> &[AssertionContract] {
-		&self.contracts
-	}
-	fn expected_gate_decision(&self) -> Option<TransitStatus> {
-		self.inner.gate_decision
-	}
-	#[cfg(feature = "instrument")]
-	fn required_event_kinds(&self) -> &[TbEventKind] {
-		&self.inner.required_events
-	}
-	fn validate_trace(&self, _trace: &ConsumedTrace) -> Result<(), SpecViolation> {
-		Ok(())
-	}
+    fn id(&self) -> &'static str {
+        self.inner.id
+    }
+    fn mode(&self) -> ExecutionMode {
+        self.inner.execution_mode
+    }
+    fn required_assertions(&self) -> &[AssertionContract] {
+        &self.contracts
+    }
+    fn expected_gate_decision(&self) -> Option<TransitStatus> {
+        self.inner.gate_decision
+    }
+    #[cfg(feature = "instrument")]
+    fn required_event_kinds(&self) -> &[TbEventKind] {
+        &self.inner.required_events
+    }
+    fn validate_trace(&self, _trace: &ConsumedTrace) -> Result<(), SpecViolation> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -483,90 +531,90 @@ impl TBSpec for BuiltAssertSpec {
 /// Trait converting payload values into a canonical byte representation.
 /// Numeric primitives are big-endian; &str/&[u8]/Vec<u8> zero-copy.
 pub trait AssertEncode {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]>;
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]>;
 }
 // Unsigned primitives
 impl AssertEncode for u8 {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned(vec![*self])
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned(vec![*self])
+    }
 }
 impl AssertEncode for u16 {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned(self.to_be_bytes().to_vec())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned(self.to_be_bytes().to_vec())
+    }
 }
 impl AssertEncode for u32 {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned(self.to_be_bytes().to_vec())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned(self.to_be_bytes().to_vec())
+    }
 }
 impl AssertEncode for u64 {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned(self.to_be_bytes().to_vec())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned(self.to_be_bytes().to_vec())
+    }
 }
 // Signed primitives (cast)
 impl AssertEncode for i8 {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned(vec![*self as u8])
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned(vec![*self as u8])
+    }
 }
 impl AssertEncode for i16 {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned((*self as u16).to_be_bytes().to_vec())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned((*self as u16).to_be_bytes().to_vec())
+    }
 }
 impl AssertEncode for i32 {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned((*self as u32).to_be_bytes().to_vec())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned((*self as u32).to_be_bytes().to_vec())
+    }
 }
 impl AssertEncode for i64 {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned((*self as u64).to_be_bytes().to_vec())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned((*self as u64).to_be_bytes().to_vec())
+    }
 }
 // usize/isize canonical to 64-bit
 impl AssertEncode for usize {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned((*self as u64).to_be_bytes().to_vec())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned((*self as u64).to_be_bytes().to_vec())
+    }
 }
 impl AssertEncode for isize {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Owned((*self as u64).to_be_bytes().to_vec())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Owned((*self as u64).to_be_bytes().to_vec())
+    }
 }
 // Text / bytes
 impl AssertEncode for &str {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Borrowed(self.as_bytes())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.as_bytes())
+    }
 }
 impl AssertEncode for str {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Borrowed(self.as_bytes())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.as_bytes())
+    }
 }
 impl AssertEncode for &[u8] {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Borrowed(self)
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self)
+    }
 }
 impl AssertEncode for Vec<u8> {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Borrowed(self.as_slice())
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self.as_slice())
+    }
 }
 impl AssertEncode for [u8; 32] {
-	fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
-		Cow::Borrowed(self)
-	}
+    fn tb_payload_bytes(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(self)
+    }
 }
 
 pub fn __encode_payload<T: AssertEncode + ?Sized>(v: &T) -> Cow<'_, [u8]> {
-	T::tb_payload_bytes(v)
+    T::tb_payload_bytes(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,39 +624,39 @@ pub fn __encode_payload<T: AssertEncode + ?Sized>(v: &T) -> Cow<'_, [u8]> {
 // Cardinality helper macros (thin wrappers over const fns)
 #[macro_export]
 macro_rules! exactly {
-	($n:expr) => {
-		$crate::testing::macros::Cardinality::exactly($n)
-	};
+    ($n:expr) => {
+        $crate::testing::macros::Cardinality::exactly($n)
+    };
 }
 #[macro_export]
 macro_rules! at_least {
-	($n:expr) => {
-		$crate::testing::macros::Cardinality::at_least($n)
-	};
+    ($n:expr) => {
+        $crate::testing::macros::Cardinality::at_least($n)
+    };
 }
 #[macro_export]
 macro_rules! at_most {
-	($n:expr) => {
-		$crate::testing::macros::Cardinality::at_most($n)
-	};
+    ($n:expr) => {
+        $crate::testing::macros::Cardinality::at_most($n)
+    };
 }
 #[macro_export]
 macro_rules! between {
-	($min:expr, $max:expr) => {
-		$crate::testing::macros::Cardinality::between($min, $max)
-	};
+    ($min:expr, $max:expr) => {
+        $crate::testing::macros::Cardinality::between($min, $max)
+    };
 }
 #[macro_export]
 macro_rules! present {
-	() => {
-		$crate::testing::macros::Cardinality::present()
-	};
+    () => {
+        $crate::testing::macros::Cardinality::present()
+    };
 }
 #[macro_export]
 macro_rules! absent {
-	() => {
-		$crate::testing::macros::Cardinality::absent()
-	};
+    () => {
+        $crate::testing::macros::Cardinality::absent()
+    };
 }
 
 // Label declaration macro
@@ -655,18 +703,27 @@ macro_rules! __tb_assert_spec_build {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_add_assertion {
-	// 4-element tuple with value
-	($builder:expr, ($phase:ident, $label:expr, $card:expr, $value:expr)) => {
-		$builder
-			.assertion_with_value($crate::testing::assertions::AssertionPhase::$phase, $label, $card, $value)
-			.expect("duplicate label or invalid range")
-	};
-	// 3-element tuple without value
-	($builder:expr, ($phase:ident, $label:expr, $card:expr)) => {
-		$builder
-			.assertion($crate::testing::assertions::AssertionPhase::$phase, $label, $card)
-			.expect("duplicate label or invalid range")
-	};
+    // 4-element tuple with value
+    ($builder:expr, ($phase:ident, $label:expr, $card:expr, $value:expr)) => {
+        $builder
+            .assertion_with_value(
+                $crate::testing::assertions::AssertionPhase::$phase,
+                $label,
+                $card,
+                $value,
+            )
+            .expect("duplicate label or invalid range")
+    };
+    // 3-element tuple without value
+    ($builder:expr, ($phase:ident, $label:expr, $card:expr)) => {
+        $builder
+            .assertion(
+                $crate::testing::assertions::AssertionPhase::$phase,
+                $label,
+                $card,
+            )
+            .expect("duplicate label or invalid range")
+    };
 }
 
 // Multi-version macro ONLY (full semantic version required maj.min.patch)
@@ -1043,12 +1100,11 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Standalone test with name for Bare environment + fuzz =====
+	// ===== AFL fuzz target for Bare environment (NO #[test], generates fuzz!) =====
 	(
-		name: $test_name:ident,
+		fuzz: afl,
 		spec: $spec:ty,
-		$(csp: $csp:ty,)?
-		fuzz: $fuzz:ty,
+		csp: $csp:ty,
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
@@ -1059,17 +1115,19 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {
-		#[test]
-		fn $test_name() {
-			// Common setup
-			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
+		fn main() {
+			::afl::fuzz!(|data: &[u8]| {
+				// Common setup
+				#[cfg(feature = "instrument")]
+				let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
+				#[cfg(feature = "instrument")]
+				$crate::tb_scenario!(@init_instrumentation instr_mode);
 
-			// Fuzz wrapper handles iteration
-			let result = $crate::tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
-				let trace_collector = $crate::testing::trace::TraceCollector::with_fuzz_input(fuzz_input);
+				// AFL provides the data - use it directly with FuzzContext
+				let trace_collector = $crate::testing::trace::TraceCollector::with_fuzz_oracle(
+					data.to_vec(),
+					<$csp>::process()
+				);
 
 				// Environment-specific execution
 				let trace_exec = trace_collector.clone();
@@ -1094,7 +1152,71 @@ macro_rules! tb_scenario {
 				let verification_result = $crate::__tb_scenario_verify_impl! {
 					single_spec: $spec,
 					trace: trace,
-					$(csp: $csp,)?
+					csp: $csp,
+					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+				};
+
+				// AFL fuzz targets should not panic on failure - just return
+				let _ = $crate::tb_scenario!(@propagate_result exec_result, verification_result);
+			});
+		}
+	};
+
+	// ===== Standalone test with name for Bare environment + fuzz =====
+	(
+		name: $test_name:ident,
+		spec: $spec:ty,
+		csp: $csp:ty,
+		fuzz: $fuzz:ty,
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Bare {
+			exec: $exec_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			// Common setup
+			#[cfg(feature = "instrument")]
+			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
+			#[cfg(feature = "instrument")]
+			$crate::tb_scenario!(@init_instrumentation instr_mode);
+
+			// Fuzz wrapper handles iteration
+			let result = $crate::tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
+				let trace_collector = $crate::testing::trace::TraceCollector::with_fuzz_oracle(
+					fuzz_input,
+					<$csp>::process()
+				);
+
+				// Environment-specific execution
+				let trace_exec = trace_collector.clone();
+				fn __call_exec_closure<F>(
+					closure: F,
+					trace: $crate::testing::macros::TraceCollector,
+				) -> Result<(), $crate::TightBeamError>
+				where
+					F: FnOnce($crate::testing::macros::TraceCollector) -> Result<(), $crate::TightBeamError>,
+				{
+					closure(trace)
+				}
+				let exec_result = __call_exec_closure($exec_closure, trace_exec);
+
+				// Common finalization
+				let mut trace = $crate::tb_scenario!(@setup_trace);
+				trace.populate_from_collector(&trace_collector);
+				#[cfg(feature = "instrument")]
+				$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
+				$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+				let verification_result = $crate::__tb_scenario_verify_impl! {
+					single_spec: $spec,
+					trace: trace,
+					csp: $csp,
 					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 				};
 
@@ -1386,29 +1508,6 @@ macro_rules! tb_scenario {
 			};
 
 			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
-		}
-	};
-
-	// ===== Standalone test with name for Fuzz environment =====
-	(
-		name: $test_name:ident,
-		spec: $spec:ty,
-		csp: $csp:ty,
-		$(instrumentation: $instr_cfg:expr,)?
-		environment Fuzz {
-			input: $fuzz_input:expr
-		}
-		$(, hooks {
-			$(on_pass: $on_pass:expr,)?
-			$(on_fail: $on_fail:expr)?
-		})?
-		$(,)?
-	) => {
-		#[test]
-		fn $test_name() {
-			use $crate::tb_scenario;
-			let result = tb_scenario!(@execute Fuzz, single_spec, $spec, csp: $csp, $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? input: $fuzz_input);
-			result.expect(concat!("Test failed: ", stringify!($test_name)));
 		}
 	};
 
@@ -1842,23 +1941,6 @@ macro_rules! tb_scenario {
 		)
 	};
 
-	// ===== Fuzz environment variant (single spec: Type form) =====
-	(
-		spec: $spec:ty,
-		csp: $csp:ty,
-		$(instrumentation: $instr_cfg:expr,)?
-		environment Fuzz {
-			input: $fuzz_input:expr
-		}
-		$(, hooks {
-			$(on_pass: $on_pass:expr,)?
-			$(on_fail: $on_fail:expr)?
-		})?
-		$(,)?
-	) => {
-		tb_scenario!(@execute Fuzz, single_spec, $spec, csp: $csp, $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? input: $fuzz_input)
-	};
-
 	// ===== Internal: Instrumentation helpers =====
 	(@get_instr_mode) => {
 		$crate::testing::macros::InstrumentationMode::Auto
@@ -2268,163 +2350,6 @@ macro_rules! tb_scenario {
 		Ok::<(), $crate::TightBeamError>(())
 	}};
 
-	// ===== Execution dispatcher for Bare environment with fuzz =====
-	(@execute_fuzz Bare, $fuzz:ty, single_spec, $spec:ty, $(csp: $csp:ty,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
-		tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
-			#[cfg(feature = "instrument")]
-			let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-			#[cfg(feature = "instrument")]
-			tb_scenario!(@init_instrumentation instr_mode);
-
-			// Create TraceCollector with fuzz input
-			let trace_collector = $crate::testing::trace::TraceCollector::with_fuzz_input(fuzz_input);
-			let trace_exec = trace_collector.clone();
-
-			// Helper function to enable type inference for exec closure
-			fn __call_exec_closure<F>(
-				closure: F,
-				trace: $crate::testing::macros::TraceCollector,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce($crate::testing::macros::TraceCollector) -> Result<(), $crate::TightBeamError>,
-			{
-				closure(trace)
-			}
-
-			let exec_result = __call_exec_closure($exec_closure, trace_exec);
-
-			// Populate trace from collector
-			let mut trace = tb_scenario!(@setup_trace);
-			trace.populate_from_collector(&trace_collector);
-
-			#[cfg(feature = "instrument")]
-			tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
-			tb_scenario!(@finalize_trace trace, &exec_result);
-
-			// Validate trace
-			let verification_result = $crate::__tb_scenario_verify_impl! {
-				single_spec: $spec,
-				trace: trace,
-				$(csp: $csp,)?
-				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
-			};
-
-			// Return combined result
-			tb_scenario!(@propagate_result exec_result, verification_result)
-		})
-	}};
-
-	(@execute Bare, multi_specs, [ $( $spec_expr:expr ),+ ], $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
-		let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
-			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
-		];
-
-		#[cfg(feature = "instrument")]
-		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@init_instrumentation instr_mode);
-
-		// Create TraceCollector for explicit passing
-		let trace_collector = $crate::testing::macros::TraceCollector::new();
-		let trace_exec = trace_collector.clone();
-
-		// Helper function to enable type inference
-		fn __call_exec_closure<F>(
-			closure: F,
-			trace: $crate::testing::macros::TraceCollector,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce($crate::testing::macros::TraceCollector) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace)
-		}
-
-		let exec_result = __call_exec_closure($exec_closure, trace_exec);
-
-		// Populate trace from collector
-		let mut trace = tb_scenario!(@setup_trace);
-		trace.populate_from_collector(&trace_collector);
-
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
-		tb_scenario!(@finalize_trace trace, exec_result);
-
-		let verification_result = $crate::__tb_scenario_verify_impl! {
-			multi_specs: specs,
-			trace: trace,
-			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
-		};
-
-		tb_scenario!(@propagate_result exec_result, verification_result)
-	}};
-
-	// ===== Fuzz dispatcher for Worker environment =====
-	(@execute_fuzz Worker, $fuzz:ty, $spec:ty, $(instrumentation: $instr_mode:expr,)? $(csp: $csp_process:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
-		tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
-			#[cfg(feature = "instrument")]
-			let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-			#[cfg(feature = "instrument")]
-			tb_scenario!(@init_instrumentation instr_mode);
-
-			let trace_collector = $crate::testing::macros::TraceCollector::new();
-			let trace_setup = trace_collector.clone();
-			let trace_stimulus = trace_collector.clone();
-			let fuzz_for_setup = fuzz_input.clone();
-			let fuzz_for_stimulus = fuzz_input.clone();
-
-			// Helper functions to enable type inference
-			fn __call_setup_closure<F, W>(
-				closure: F,
-				trace: $crate::testing::macros::TraceCollector,
-				fuzz_input: Vec<u8>,
-			) -> W
-			where
-				F: FnOnce($crate::testing::macros::TraceCollector, Vec<u8>) -> W,
-			{
-				closure(trace, fuzz_input)
-			}
-
-			fn __call_stimulus_closure<F, W>(
-				closure: F,
-				trace: $crate::testing::macros::TraceCollector,
-				worker: &mut W,
-				fuzz_input: Vec<u8>,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce($crate::testing::macros::TraceCollector, &mut W, Vec<u8>) -> Result<(), $crate::TightBeamError>,
-			{
-				closure(trace, worker, fuzz_input)
-			}
-
-			let mut worker = __call_setup_closure($setup_closure, trace_setup, fuzz_for_setup);
-			let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker, fuzz_for_stimulus);
-
-			let mut trace = tb_scenario!(@setup_trace);
-			trace.populate_from_collector(&trace_collector);
-
-			#[cfg(feature = "instrument")]
-			tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
-			tb_scenario!(@finalize_trace trace, exec_result);
-
-			let verification_result = $crate::__tb_scenario_verify_impl! {
-				single_spec: $spec,
-				trace: trace,
-				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
-			};
-
-			$(
-				if let Err(e) = $crate::testing::csp::verify_trace_against_process(&trace, &$csp_process) {
-					panic!("CSP verification failed: {:?}", e);
-				}
-			)?
-
-			tb_scenario!(@propagate_result exec_result, verification_result)
-		})
-	}};
-
 	// ===== Execution dispatcher for Worker environment =====
 	(@execute Worker, single_spec, $spec:ty, $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
 		#[cfg(feature = "instrument")]
@@ -2588,158 +2513,6 @@ macro_rules! tb_scenario {
 			client: $client_closure
 		)
 	};
-
-	// ===== Execution dispatcher for Fuzz environment =====
-	(@execute Fuzz, single_spec, $spec:ty, csp: $csp:ty, $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? input: $fuzz_input:expr) => {{
-		#[cfg(feature = "instrument")]
-		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@init_instrumentation instr_mode);
-
-		// Create TraceCollector for assertions
-		let trace_collector = $crate::testing::macros::TraceCollector::new();
-
-		// Create oracle from CSP process
-		let proc = <$csp>::process();
-		let mut oracle = $crate::testing::fuzz::CspOracle::new(proc);
-
-		// Run fuzz harness with input
-		let fuzz_result = oracle.fuzz_from_bytes($fuzz_input);
-
-		// Convert fuzz result to TightBeamError
-		let exec_result: Result<(), $crate::TightBeamError> = match fuzz_result {
-			Ok(_) => {
-				// Record oracle events as assertions
-				for event in oracle.trace() {
-					trace_collector.assert(
-						$crate::testing::assertions::AssertionPhase::HandlerStart,
-						event.0
-					);
-				}
-				Ok(())
-			}
-			Err(e) => {
-				// Return IO error with message
-				Err($crate::TightBeamError::IoError(
-					std::io::Error::new(std::io::ErrorKind::Other, format!("Fuzz harness failed: {}", e))
-				))
-			}
-		};
-
-		// Build trace from collector
-		let mut trace = tb_scenario!(@setup_trace);
-		trace.populate_from_collector(&trace_collector);
-
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
-		tb_scenario!(@finalize_trace trace, &exec_result);
-
-		let verification_result = $crate::__tb_scenario_verify_impl! {
-			single_spec: $spec,
-			trace: trace,
-			csp: $csp,
-			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
-		};
-
-		tb_scenario!(@propagate_result exec_result, verification_result)
-	}};
-
-	// ===== Fuzz dispatcher for ServiceClient environment =====
-	(@execute_fuzz ServiceClient, $fuzz:ty, $spec:ty,
-		$(csp: $csp_process:expr,)?
-		$(instrumentation: $instr_mode:expr,)?
-		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
-		protocol: { $($protocol:path)? },
-		worker_threads: { $($threads:literal)? },
-		server: $server_closure:expr,
-		client: $client_closure:expr
-	) => {{
-		tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
-			#[allow(unused_imports)]
-			use std::sync::{Arc, Mutex};
-
-			const WORKER_THREADS: usize = tb_scenario!(@default_worker_threads $($threads)?);
-
-			let runtime = tokio::runtime::Builder::new_multi_thread()
-				.worker_threads(WORKER_THREADS)
-				.enable_all()
-				.build()
-				.expect("Failed to build tokio runtime");
-
-			runtime.block_on(async {
-				#[cfg(feature = "instrument")]
-				let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-				#[cfg(feature = "instrument")]
-				tb_scenario!(@init_instrumentation instr_mode);
-
-				let trace_collector = $crate::testing::macros::TraceCollector::new();
-				let trace_server = trace_collector.clone();
-				let trace_client = trace_collector.clone();
-				let fuzz_for_server = fuzz_input.clone();
-				let fuzz_for_client = fuzz_input.clone();
-
-				async fn __call_server_closure<F, Fut>(
-					closure: F,
-					trace: $crate::testing::macros::TraceCollector,
-					fuzz_input: Vec<u8>,
-				) -> Result<(tokio::task::JoinHandle<()>, std::net::SocketAddr), $crate::TightBeamError>
-				where
-					F: FnOnce($crate::testing::macros::TraceCollector, Vec<u8>) -> Fut,
-					Fut: core::future::Future<Output = Result<(tokio::task::JoinHandle<()>, std::net::SocketAddr), $crate::TightBeamError>>,
-				{
-					closure(trace, fuzz_input).await
-				}
-
-				let server_setup_result = __call_server_closure($server_closure, trace_server, fuzz_for_server).await;
-				let (server_handle, server_addr) = server_setup_result?;
-
-				type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
-
-				let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await
-					.map_err(|e| $crate::TightBeamError::from(e))?;
-				let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
-
-				async fn __call_client_closure<F, Fut, T>(
-					closure: F,
-					trace: $crate::testing::macros::TraceCollector,
-					client: T,
-					fuzz_input: Vec<u8>,
-				) -> Result<(), $crate::TightBeamError>
-				where
-					F: FnOnce($crate::testing::macros::TraceCollector, T, Vec<u8>) -> Fut,
-					Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
-				{
-					closure(trace, client, fuzz_input).await
-				}
-				let client_result = __call_client_closure($client_closure, trace_client, client, fuzz_for_client).await;
-
-				let mut trace = tb_scenario!(@setup_trace);
-				trace.populate_from_collector(&trace_collector);
-
-				#[cfg(feature = "instrument")]
-				tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
-				tb_scenario!(@finalize_trace trace, client_result);
-
-				server_handle.abort();
-
-				let verification_result = $crate::__tb_scenario_verify_impl! {
-					single_spec: $spec,
-					trace: trace,
-					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
-				};
-
-				$(
-					if let Err(e) = $crate::testing::csp::verify_trace_against_process(&trace, &$csp_process) {
-						panic!("CSP verification failed: {:?}", e);
-					}
-				)?
-
-				tb_scenario!(@propagate_result client_result, verification_result)
-			})
-		})
-	}};
 
 	// ===== Execution dispatcher for ServiceClient environment =====
 	(@execute ServiceClient, single_spec, $spec:ty,
@@ -3047,14 +2820,16 @@ macro_rules! tb_scenario {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_scenario_servlet_start {
-	// Custom start expression provided
-	($servlet:ident, $trace:expr, $start:expr) => {
-		$start.await.expect("Failed to start servlet")
-	};
-	// Default: call start with trace collector
-	($servlet:ident, $trace:expr,) => {
-		$servlet::start($trace).await.expect("Failed to start servlet")
-	};
+    // Custom start expression provided
+    ($servlet:ident, $trace:expr, $start:expr) => {
+        $start.await.expect("Failed to start servlet")
+    };
+    // Default: call start with trace collector
+    ($servlet:ident, $trace:expr,) => {
+        $servlet::start($trace)
+            .await
+            .expect("Failed to start servlet")
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -3063,259 +2838,344 @@ macro_rules! __tb_scenario_servlet_start {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::testing::assertions::AssertionPhase;
-	use crate::testing::create_test_message;
-	use crate::testing::macros::TraceCollector;
-	use crate::testing::trace::ExecutionMode;
-	use crate::testing::utils::TestMessage;
-	use crate::transport::tcp::r#async::TokioListener;
-	use crate::transport::tcp::TightBeamSocketAddr;
-	use crate::transport::MessageEmitter;
-	use crate::transport::Protocol;
+    use super::*;
+    use crate::testing::assertions::AssertionPhase;
+    use crate::testing::create_test_message;
+    use crate::testing::macros::TraceCollector;
+    use crate::testing::trace::ExecutionMode;
+    use crate::testing::utils::TestMessage;
+    use crate::transport::tcp::r#async::TokioListener;
+    use crate::transport::tcp::TightBeamSocketAddr;
+    use crate::transport::MessageEmitter;
+    use crate::transport::Protocol;
 
-	#[test]
-	fn cardinality_basic() {
-		let c = Cardinality::between(1, 3);
-		assert!(c.is_satisfied_by(2));
-		assert!(!c.is_satisfied_by(0));
-		assert!(!c.is_satisfied_by(4));
-	}
+    #[test]
+    fn cardinality_basic() {
+        let c = Cardinality::between(1, 3);
+        assert!(c.is_satisfied_by(2));
+        assert!(!c.is_satisfied_by(0));
+        assert!(!c.is_satisfied_by(4));
+    }
 
-	#[test]
-	fn builder_duplicate_label() -> Result<(), Box<dyn std::error::Error>> {
-		let b = AssertSpecBuilder::new("spec", ExecutionMode::Accept)
-			.assertion(AssertionPhase::HandlerStart, "L1", Cardinality::exactly(1))?
-			.assertion(AssertionPhase::HandlerStart, "L1", Cardinality::exactly(2));
-		assert!(matches!(b, Err(SpecBuildError::DuplicateLabel("L1"))));
-		Ok(())
-	}
+    #[test]
+    fn builder_duplicate_label() -> Result<(), Box<dyn std::error::Error>> {
+        let b = AssertSpecBuilder::new("spec", ExecutionMode::Accept)
+            .assertion(AssertionPhase::HandlerStart, "L1", Cardinality::exactly(1))?
+            .assertion(AssertionPhase::HandlerStart, "L1", Cardinality::exactly(2));
+        assert!(matches!(b, Err(SpecBuildError::DuplicateLabel("L1"))));
+        Ok(())
+    }
 
-	tb_assert_spec! {
-		pub DemoSpec,
-		V(1,0,0): {
-			mode: Accept,
-			gate: Accepted,
-			assertions: [
-				(HandlerStart, "Received", exactly!(1)),
-				(Response, "Responded", exactly!(1))
-			]
+    tb_assert_spec! {
+        pub DemoSpec,
+        V(1,0,0): {
+            mode: Accept,
+            gate: Accepted,
+            assertions: [
+                (HandlerStart, "Received", exactly!(1)),
+                (Response, "Responded", exactly!(1))
+            ]
+        },
+        V(1,1,0): {
+            mode: Accept,
+            gate: Accepted,
+            assertions: [
+                (HandlerStart, "Received", exactly!(1)),
+                (Response, "Responded", exactly!(2))
+            ]
+        },
+    }
+
+    tb_assert_spec! {
+        pub ClientServerSpec,
+        V(1,0,0): {
+            mode: Accept,
+            gate: Accepted,
+            assertions: [
+                (HandlerStart, "Received", exactly!(2)),
+                (Response, "Responded", exactly!(2)),
+                (Response, "message_content", exactly!(1), equals!("Hello TightBeam!"))
+            ]
+        },
+    }
+
+    #[test]
+    fn hash_differs_across_versions() {
+        let h1 = DemoSpec::get(1, 0, 0).unwrap().spec_hash();
+        let h2 = DemoSpec::get(1, 1, 0).unwrap().spec_hash();
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn latest_points_to_highest() {
+        assert_eq!(DemoSpec::latest().version(), (1, 1, 0));
+    }
+
+    tb_scenario! {
+        name: scenario_bare_with_hooks,
+        spec: DemoSpec,
+        environment Bare {
+            exec: |trace| {
+                trace.assert(AssertionPhase::HandlerStart, "Received");
+                trace.assert(AssertionPhase::Response, "Responded");
+                trace.assert(AssertionPhase::Response, "Responded");
+                Ok(())
+            }
+        }
+    }
+
+    tb_scenario! {
+        name: scenario_bare_specific_version,
+        specs: [DemoSpec::get(1, 0, 0)],
+        environment Bare {
+            exec: |trace| {
+                trace.assert(AssertionPhase::HandlerStart, "Received");
+                trace.assert(AssertionPhase::Response, "Responded");
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Spec verification failed")]
+    fn scenario_bare_multiple_versions() {
+        // Suppress panic output for cleaner test output
+        std::panic::set_hook(Box::new(|_| {}));
+
+        // Test against both versions - v1.1.0 expects exactly 2 Responded, we only emit 1
+        // Should panic because v1.1.0 expects 2 Response but we only emitted 1
+        let _result = tb_scenario! {
+            specs: [DemoSpec::get(1, 0, 0), DemoSpec::get(1, 1, 0)],
+            environment Bare {
+                exec: |trace| {
+                    trace.assert(AssertionPhase::HandlerStart, "Received");
+                    trace.assert(AssertionPhase::Response, "Responded");
+                    Ok(())
+                }
+            }
+        };
+    }
+
+    // Simple worker struct for testing
+    struct TestWorker {
+        received_count: usize,
+        trace: TraceCollector,
+    }
+
+    impl TestWorker {
+        fn new(trace: TraceCollector) -> Self {
+            Self {
+                received_count: 0,
+                trace,
+            }
+        }
+
+        fn process(&mut self) -> Result<(), crate::TightBeamError> {
+            self.trace.assert(AssertionPhase::HandlerStart, "Received");
+            self.received_count += 1;
+            self.trace.assert(AssertionPhase::Response, "Responded");
+            self.trace.assert(AssertionPhase::Response, "Responded");
+            Ok(())
+        }
+    }
+
+    tb_scenario! {
+        name: scenario_worker_basic,
+        spec: DemoSpec,
+        environment Worker {
+            setup: TestWorker::new,
+            stimulus: |_trace, worker: &mut TestWorker| worker.process()
+        }
+    }
+
+    tb_scenario! {
+        name: scenario_worker_specific_version,
+        specs: [DemoSpec::get(1, 0, 0)],
+        environment Worker {
+            setup: TestWorker::new,
+            stimulus: |trace, worker: &mut TestWorker| {
+                trace.assert(AssertionPhase::HandlerStart, "Received");
+                worker.received_count += 1;
+                trace.assert(AssertionPhase::Response, "Responded");
+                Ok(())
+            }
+        }
+    }
+
+    // ServiceClient tests require async runtime and transport features
+    #[cfg(all(feature = "tcp", feature = "tokio"))]
+    tb_scenario! {
+        name: scenario_service_client_basic,
+        spec: DemoSpec,
+        environment ServiceClient {
+            worker_threads: 2,
+            server: |trace: TraceCollector| async move {
+                let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
+                let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+                let handle = crate::server! {
+                    protocol TokioListener: listener,
+                    assertions: trace,
+                    handle: |frame, trace| async move {
+                        trace.assert(AssertionPhase::HandlerStart, "Received");
+                        trace.assert(AssertionPhase::Response, "Responded");
+                        trace.assert(AssertionPhase::Response, "Responded");
+                        Some(frame)
+                    }
+                };
+
+                Ok((handle, addr))
+            },
+            client: |_trace: TraceCollector, mut client| async move {
+                let test_message = create_test_message(None);
+                let test_frame = crate::compose! {
+                    V0: id: "test", order: 1u64, message: test_message
+                }?;
+
+                let _response = client.emit(test_frame, None).await?;
+
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tcp", feature = "tokio"))]
+    static HOOK_CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(all(feature = "tcp", feature = "tokio"))]
+    tb_scenario! {
+        name: scenario_service_client_with_client_assertions_and_hooks,
+        spec: ClientServerSpec,
+        environment ServiceClient {
+            worker_threads: 2,
+            server: |trace: TraceCollector| async move {
+                let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
+                let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+                let handle = crate::server! {
+                    protocol TokioListener: listener,
+                    assertions: trace,
+                    handle: |frame, trace| async move {
+                        // Server-side assertions
+                        trace.assert(AssertionPhase::HandlerStart, "Received");
+                        trace.assert(AssertionPhase::Response, "Responded");
+
+                        // Decode message to extract value for assertion
+                        let decoded: Result<TestMessage, _> = crate::decode(&frame.message);
+                        if let Ok(msg) = decoded {
+                            trace.assert_value(AssertionPhase::Response, "message_content", msg.content);
+                        }
+
+                        Some(frame)
+                    }
+                };
+
+                Ok((handle, addr))
+            },
+            client: |trace: TraceCollector, mut client| async move {
+                // Client-side assertion before sending
+                trace.assert(AssertionPhase::Response, "Responded");
+
+                let test_message = create_test_message(None);
+                let test_frame = crate::compose! {
+                    V0: id: "test", order: 1u64, message: test_message
+                    }?;
+
+                let _response = client.emit(test_frame, None).await?;
+
+                // Client-side assertion after receiving
+                trace.assert(AssertionPhase::HandlerStart, "Received");
+
+                Ok(())
+            }
+        },
+        hooks {
+            on_pass: |_trace| {
+                HOOK_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            on_fail: |_trace, violations| {
+                panic!("Test should not fail! Violations: {violations:?}");
+            }
+        }
+    }
+}
+
+/// AFL-powered fuzz target macro
+///
+/// This macro is a wrapper around tb_scenario! that generates a complete AFL fuzz target.
+/// It defines the assertion spec and CSP process, then calls tb_scenario! with fuzz: afl.
+///
+/// Must be used in a file with `#![no_main]` at the top.
+///
+/// # Example
+///
+/// ```ignore
+/// #![no_main]
+///
+/// tightbeam::tb_fuzz_scenario! {
+///     spec: {
+///         pub MyFuzzSpec,
+///         V(1,0,0): {
+///             mode: Accept,
+///             gate: Accepted,
+///             assertions: [ (HandlerStart, "event", tightbeam::exactly!(1)) ]
+///         },
+///     },
+///     csp: {
+///         pub struct MyFuzzProc;
+///         events {
+///             observable { "event" }
+///             hidden { }
+///         }
+///         states {
+///             S0 => { "event" => S1 }
+///         }
+///         terminal { S1 }
+///     },
+///     environment Bare {
+///         exec: |trace| {
+///             // Scenario logic using AFL-provided input via trace.oracle()
+///             trace.oracle().fuzz_from_bytes()?;
+///             Ok(())
+///         }
+///     }
+/// }
+/// ```
+#[macro_export]
+#[cfg(all(feature = "std", feature = "testing-csp"))]
+macro_rules! tb_fuzz_scenario {
+	(
+		spec: {
+			$spec_vis:vis $spec_name:ident,
+			$( $spec_body:tt )*
 		},
-		V(1,1,0): {
-			mode: Accept,
-			gate: Accepted,
-			assertions: [
-				(HandlerStart, "Received", exactly!(1)),
-				(Response, "Responded", exactly!(2))
-			]
+		csp: {
+			$csp_vis:vis struct $csp_name:ident;
+			$( $csp_body:tt )*
 		},
-	}
+		environment $env:ident {
+			$( $env_body:tt )*
+		}
+		$(,)?
+	) => {
+		// Define the assertion spec
+		$crate::tb_assert_spec! {
+			$spec_vis $spec_name,
+			$( $spec_body )*
+		}
 
-	tb_assert_spec! {
-		pub ClientServerSpec,
-		V(1,0,0): {
-			mode: Accept,
-			gate: Accepted,
-			assertions: [
-				(HandlerStart, "Received", exactly!(2)),
-				(Response, "Responded", exactly!(2)),
-				(Response, "message_content", exactly!(1), equals!("Hello TightBeam!"))
-			]
-		},
-	}
+		// Define the CSP process
+		$crate::tb_process_spec! {
+			$csp_vis struct $csp_name;
+			$( $csp_body )*
+		}
 
-	#[test]
-	fn hash_differs_across_versions() {
-		let h1 = DemoSpec::get(1, 0, 0).unwrap().spec_hash();
-		let h2 = DemoSpec::get(1, 1, 0).unwrap().spec_hash();
-		assert_ne!(h1, h2);
-	}
-
-	#[test]
-	fn latest_points_to_highest() {
-		assert_eq!(DemoSpec::latest().version(), (1, 1, 0));
-	}
-
-	tb_scenario! {
-		name: scenario_bare_with_hooks,
-		spec: DemoSpec,
-		environment Bare {
-			exec: |trace| {
-				trace.assert(AssertionPhase::HandlerStart, "Received");
-				trace.assert(AssertionPhase::Response, "Responded");
-				trace.assert(AssertionPhase::Response, "Responded");
-				Ok(())
+		// Use tb_scenario! with fuzz: afl to generate the AFL wrapper
+		$crate::tb_scenario! {
+			fuzz: afl,
+			spec: $spec_name,
+			csp: $csp_name,
+			environment $env {
+				$( $env_body )*
 			}
 		}
-	}
-
-	tb_scenario! {
-		name: scenario_bare_specific_version,
-		specs: [DemoSpec::get(1, 0, 0)],
-		environment Bare {
-			exec: |trace| {
-				trace.assert(AssertionPhase::HandlerStart, "Received");
-				trace.assert(AssertionPhase::Response, "Responded");
-				Ok(())
-			}
-		}
-	}
-
-	#[test]
-	#[should_panic(expected = "Spec verification failed")]
-	fn scenario_bare_multiple_versions() {
-		// Suppress panic output for cleaner test output
-		std::panic::set_hook(Box::new(|_| {}));
-
-		// Test against both versions - v1.1.0 expects exactly 2 Responded, we only emit 1
-		// Should panic because v1.1.0 expects 2 Response but we only emitted 1
-		let _result = tb_scenario! {
-			specs: [DemoSpec::get(1, 0, 0), DemoSpec::get(1, 1, 0)],
-			environment Bare {
-				exec: |trace| {
-					trace.assert(AssertionPhase::HandlerStart, "Received");
-					trace.assert(AssertionPhase::Response, "Responded");
-					Ok(())
-				}
-			}
-		};
-	}
-
-	// Simple worker struct for testing
-	struct TestWorker {
-		received_count: usize,
-		trace: TraceCollector,
-	}
-
-	impl TestWorker {
-		fn new(trace: TraceCollector) -> Self {
-			Self { received_count: 0, trace }
-		}
-
-		fn process(&mut self) -> Result<(), crate::TightBeamError> {
-			self.trace.assert(AssertionPhase::HandlerStart, "Received");
-			self.received_count += 1;
-			self.trace.assert(AssertionPhase::Response, "Responded");
-			self.trace.assert(AssertionPhase::Response, "Responded");
-			Ok(())
-		}
-	}
-
-	tb_scenario! {
-		name: scenario_worker_basic,
-		spec: DemoSpec,
-		environment Worker {
-			setup: TestWorker::new,
-			stimulus: |_trace, worker: &mut TestWorker| worker.process()
-		}
-	}
-
-	tb_scenario! {
-		name: scenario_worker_specific_version,
-		specs: [DemoSpec::get(1, 0, 0)],
-		environment Worker {
-			setup: TestWorker::new,
-			stimulus: |trace, worker: &mut TestWorker| {
-				trace.assert(AssertionPhase::HandlerStart, "Received");
-				worker.received_count += 1;
-				trace.assert(AssertionPhase::Response, "Responded");
-				Ok(())
-			}
-		}
-	}
-
-	// ServiceClient tests require async runtime and transport features
-	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	tb_scenario! {
-		name: scenario_service_client_basic,
-		spec: DemoSpec,
-		environment ServiceClient {
-			worker_threads: 2,
-			server: |trace: TraceCollector| async move {
-				let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
-				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
-				let handle = crate::server! {
-					protocol TokioListener: listener,
-					assertions: trace,
-					handle: |frame, trace| async move {
-						trace.assert(AssertionPhase::HandlerStart, "Received");
-						trace.assert(AssertionPhase::Response, "Responded");
-						trace.assert(AssertionPhase::Response, "Responded");
-						Some(frame)
-					}
-				};
-
-				Ok((handle, addr))
-			},
-			client: |_trace: TraceCollector, mut client| async move {
-				let test_message = create_test_message(None);
-				let test_frame = crate::compose! {
-					V0: id: "test", order: 1u64, message: test_message
-				}?;
-
-				let _response = client.emit(test_frame, None).await?;
-
-				Ok(())
-			}
-		}
-	}
-
-	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	static HOOK_CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	tb_scenario! {
-		name: scenario_service_client_with_client_assertions_and_hooks,
-		spec: ClientServerSpec,
-		environment ServiceClient {
-			worker_threads: 2,
-			server: |trace: TraceCollector| async move {
-				let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
-				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
-				let handle = crate::server! {
-					protocol TokioListener: listener,
-					assertions: trace,
-					handle: |frame, trace| async move {
-						// Server-side assertions
-						trace.assert(AssertionPhase::HandlerStart, "Received");
-						trace.assert(AssertionPhase::Response, "Responded");
-
-						// Decode message to extract value for assertion
-						let decoded: Result<TestMessage, _> = crate::decode(&frame.message);
-						if let Ok(msg) = decoded {
-							trace.assert_value(AssertionPhase::Response, "message_content", msg.content);
-						}
-
-						Some(frame)
-					}
-				};
-
-				Ok((handle, addr))
-			},
-			client: |trace: TraceCollector, mut client| async move {
-				// Client-side assertion before sending
-				trace.assert(AssertionPhase::Response, "Responded");
-
-				let test_message = create_test_message(None);
-				let test_frame = crate::compose! {
-					V0: id: "test", order: 1u64, message: test_message
-					}?;
-
-				let _response = client.emit(test_frame, None).await?;
-
-				// Client-side assertion after receiving
-				trace.assert(AssertionPhase::HandlerStart, "Received");
-
-				Ok(())
-			}
-		},
-		hooks {
-			on_pass: |_trace| {
-				HOOK_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
-			},
-			on_fail: |_trace, violations| {
-				panic!("Test should not fail! Violations: {violations:?}");
-			}
-		}
-	}
+	};
 }

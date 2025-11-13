@@ -1,4 +1,4 @@
-.PHONY: help help-ref version setup check build clean test lint doc test-all
+.PHONY: help help-ref version setup check build clean test lint doc test-all build-fuzz test-fuzz analyze-fuzz clean-fuzz
 
 # Project metadata for help/version
 PROJECT := tightbeam
@@ -30,6 +30,10 @@ help-body:
 	@printf '    clean           Clean build artifacts\n'
 	@printf '    test            Run all tests (honors cargo features and no-default)\n'
 	@printf '    test-all        Run tests with all feature combinations\n'
+	@printf '    build-fuzz      Build AFL-instrumented fuzz targets (requires cargo-afl)\n'
+	@printf '    test-fuzz       Build and run AFL fuzz testing for 60 seconds\n'
+	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
+	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
 	@printf '    lint            Run linters (pass extra clippy args via ARGS)\n'
 	@printf '    doc             Build documentation (all features)\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
@@ -90,6 +94,114 @@ test: build
 test-all: build
 	@echo "Running tests with all feature combinations..."
 	./built/test_all_features.sh
+
+# Build AFL-instrumented fuzz targets
+build-fuzz:
+	@echo "Building AFL-instrumented fuzz targets..."
+	@which cargo-afl >/dev/null 2>&1 || { \
+		echo "Error: cargo-afl not found. Install with: cargo install cargo-afl"; \
+		exit 1; \
+	}
+	@echo "Instrumenting code with AFL coverage tracking..."
+	RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing --features "std,testing-csp"
+	@echo ""
+	@echo "Fuzz targets built successfully!"
+	@echo ""
+	@echo "Available fuzz targets in tightbeam/tests/fuzz/:"
+	@ls -1 tightbeam/tests/fuzz/*.rs | sed 's/.*\//  - /' | sed 's/\.rs//'
+	@echo ""
+
+# Run AFL fuzz testing for a short time (60 seconds for CI/smoke testing)
+# Options:
+#   skip-missing-crashes=1  - Skip crash reporting config check (AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1)
+#   skip-cpu-freq=1         - Skip CPU frequency scaling check (AFL_SKIP_CPUFREQ=1)
+test-fuzz: build-fuzz
+	@echo "Running AFL fuzz testing for 60 seconds..."
+	@mkdir -p built/fuzz/in built/fuzz/out
+	@echo "seed" > built/fuzz/in/seed.txt
+	@echo ""
+	@echo "Locating fuzz target binary..."
+	@FUZZ_TARGET=$$(ls target/debug/deps/fuzzing-* 2>/dev/null | grep -v '\.d$$' | head -1); \
+	if [ -z "$$FUZZ_TARGET" ]; then \
+		echo "Error: Could not find fuzzing binary in target/debug/deps/"; \
+		echo "Available binaries:"; \
+		ls -1 target/debug/deps/ | grep -E "^[^\.]+$$" | head -10; \
+		exit 1; \
+	fi; \
+	echo "Found: $$FUZZ_TARGET"; \
+	echo ""; \
+	AFL_ENV=""; \
+	if [ "$(skip-missing-crashes)" = "1" ]; then \
+		AFL_ENV="$$AFL_ENV AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1"; \
+		echo "Note: Skipping crash reporting config check"; \
+	fi; \
+	if [ "$(skip-cpu-freq)" = "1" ]; then \
+		AFL_ENV="$$AFL_ENV AFL_SKIP_CPUFREQ=1"; \
+		echo "Note: Skipping CPU frequency scaling check"; \
+	fi; \
+	echo "Starting fuzzer (60 second timeout)..."; \
+	echo ""; \
+	eval "$$AFL_ENV timeout 60 cargo afl fuzz -i built/fuzz/in -o built/fuzz/out \"$$FUZZ_TARGET\" > /dev/null 2>&1" || true; \
+	echo ""; \
+	echo "Fuzz testing completed!"; \
+	if [ -d "built/fuzz/out/default" ]; then \
+		echo "Results saved to built/fuzz/out/"; \
+		CRASHES=$$(ls -1 built/fuzz/out/default/crashes/ 2>/dev/null | grep -v README | wc -l); \
+		HANGS=$$(ls -1 built/fuzz/out/default/hangs/ 2>/dev/null | grep -v README | wc -l); \
+		QUEUE=$$(ls -1 built/fuzz/out/default/queue/ 2>/dev/null | grep -v '^\.synced$$' | wc -l); \
+		echo "  Test cases generated: $$QUEUE"; \
+		echo "  Crashes found: $$CRASHES"; \
+		echo "  Hangs found: $$HANGS"; \
+		if [ "$$CRASHES" -gt 0 ]; then \
+			echo ""; \
+			echo "⚠️  Crashes detected! Review them at:"; \
+			echo "     built/fuzz/out/default/crashes/"; \
+		fi; \
+		if [ "$$HANGS" -gt 0 ]; then \
+			echo ""; \
+			echo "⚠️  Hangs detected! Review them at:"; \
+			echo "     built/fuzz/out/default/hangs/"; \
+		fi; \
+	else \
+		echo "No output generated - fuzzer may have exited early"; \
+	fi; \
+	echo ""; \
+	echo "To run longer fuzzing sessions manually:"; \
+	echo "  cargo afl fuzz -i built/fuzz/in -o built/fuzz/out $$FUZZ_TARGET"; \
+	echo ""; \
+	echo "For production fuzzing, configure system properly with: cargo afl system-config"; \
+	echo ""
+
+# Analyze a specific fuzz crash or hang
+# Usage: make analyze-fuzz file=built/fuzz/out/default/crashes/id:000000...
+analyze-fuzz:
+	@if [ -z "$(file)" ]; then \
+		echo "Error: Please specify a file to analyze"; \
+		echo "Usage: make analyze-fuzz file=built/fuzz/out/default/crashes/id:000000..."; \
+		echo ""; \
+		echo "Available crashes:"; \
+		ls -1 built/fuzz/out/default/crashes/ 2>/dev/null | grep -v README || echo "  (none)"; \
+		echo ""; \
+		echo "Available hangs:"; \
+		ls -1 built/fuzz/out/default/hangs/ 2>/dev/null | grep -v README || echo "  (none)"; \
+		exit 1; \
+	fi; \
+	echo "Analyzing: $(file)"; \
+	echo ""; \
+	FUZZ_TARGET=$$(ls target/debug/deps/fuzzing-* 2>/dev/null | grep -v '\.d$$' | head -1); \
+	if [ -z "$$FUZZ_TARGET" ]; then \
+		echo "Error: Fuzz target not built. Run 'make build-fuzz' first."; \
+		exit 1; \
+	fi; \
+	echo "Running with input from $(file)..."; \
+	echo ""; \
+	$$FUZZ_TARGET < "$(file)" || echo "Exit code: $$?"
+
+# Clean fuzz artifacts
+clean-fuzz:
+	@echo "Cleaning fuzz artifacts..."
+	rm -rf built/fuzz/out
+	@echo "Fuzz output directory cleaned."
 
 # Collect extra args passed after the target (e.g., `make lint -- --fix ...`)
 # Strip the target name and the bare `--` separator

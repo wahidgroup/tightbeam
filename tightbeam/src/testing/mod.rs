@@ -10,7 +10,7 @@ pub mod specs;
 pub mod trace;
 pub mod utils;
 
-#[cfg(feature = "testing-csp")]
+#[cfg(feature = "testing-fuzz")]
 pub mod fuzz;
 
 pub use utils::*;
@@ -23,22 +23,22 @@ crate::tb_labels! { pub enum TbDemoLabels { MessageReceived => payload, HandlerS
 
 #[cfg(test)]
 mod tests {
-	use crate::testing::TBSpec;
+    use crate::testing::TBSpec;
 
-	crate::tb_assert_spec! {
-		pub DemoSpec,
-		V(1,0,0): {
-			mode: Accept,
-			gate: Accepted,
-			assertions: [
-				(HandlerStart, "MessageReceived", crate::exactly!(1))
-			]
-		}
-	}
+    crate::tb_assert_spec! {
+        pub DemoSpec,
+        V(1,0,0): {
+            mode: Accept,
+            gate: Accepted,
+            assertions: [
+                (HandlerStart, "MessageReceived", crate::exactly!(1))
+            ]
+        }
+    }
 
-	#[test]
-	fn build_demo_spec() {
-		let s = DemoSpec::get(1, 0, 0).expect("version exists");
-		assert_eq!(s.id(), "DemoSpec");
-	}
+    #[test]
+    fn build_demo_spec() {
+        let s = DemoSpec::get(1, 0, 0).expect("version exists");
+        assert_eq!(s.id(), "DemoSpec");
+    }
 }

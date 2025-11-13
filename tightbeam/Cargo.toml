@@ -54,6 +54,7 @@ zeekstd = { workspace = true, optional = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 fake = { workspace = true }
+afl = "0.17.0"
 
 [features]
 default = ["full"]
@@ -90,6 +91,7 @@ full = [
 	"testing",
 	"testing-csp",
 	"testing-fdr",
+	"testing-fuzz",
 	"instrument",
 	"colony",
 ]
@@ -109,6 +111,7 @@ colony = ["full"]
 testing = []
 testing-csp = ["testing"]
 testing-fdr = ["testing", "testing-csp"]
+testing-fuzz = ["testing"]
 instrument = ["std", "sha3"]
 
 # TODO

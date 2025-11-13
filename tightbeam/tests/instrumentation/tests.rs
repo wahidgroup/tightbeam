@@ -5,6 +5,7 @@
 #![cfg(feature = "testing")]
 #![cfg(feature = "instrument")]
 
+use tightbeam::instrumentation::TbEventKind;
 use tightbeam::testing::assertions::AssertionPhase;
 use tightbeam::{tb_assert_spec, tb_scenario};
 
@@ -30,8 +31,6 @@ tb_scenario! {
 	},
 	hooks {
 		on_pass: |trace| {
-			use tightbeam::instrumentation::TbEventKind;
-
 			// Verify events were automatically captured
 			assert!(!trace.instrument_events.is_empty(), "Should have captured events automatically");
 

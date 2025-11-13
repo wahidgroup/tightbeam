@@ -1,0 +1,29 @@
+//! Integration tests for TightBeam
+//!
+//! Organized test suites for various components of the TightBeam protocol.
+
+// Common test helpers
+mod common;
+
+// Instrumentation tests
+#[cfg(feature = "instrument")]
+mod instrumentation;
+
+// Core protocol tests
+#[cfg(feature = "full")]
+mod tightbeam_core;
+
+#[cfg(feature = "transport")]
+mod transport;
+
+// X.509 tests
+#[cfg(feature = "x509")]
+mod x509;
+
+// Testing framework tests (CSP-guided fuzzing, assertions, etc.)
+#[cfg(all(feature = "std", feature = "testing"))]
+mod testing;
+
+// DLT Network test
+// #[cfg(feature = "full")]
+// mod proof;

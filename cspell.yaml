@@ -39,12 +39,14 @@ words:
   - HKDF
   - HMAC
   - Hoare
+  - I_DONT_CARE
   - ijon
   - Keccak
   - keypair
   - KTRI
   - Livelock
   - livelocks
+  - matrixd
   - Merkle
   - millis
   - Monodomy
@@ -70,11 +72,14 @@ words:
   - repr
   - REPUDIABLE
   - rsadsi
+  - RUSTFLAGS
+  - rustup
   - rwlock
   - schnorr
   - SECG
   - seckey
   - Secp
+  - SKIP_CPUFREQ
   - smime
   - spki
   - supraorganisms

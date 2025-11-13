@@ -1,0 +1,59 @@
+//! Simple 3-state workflow fuzz target for AFL
+//!
+//! Run with:
+//!   cargo install cargo-afl
+//!   cargo afl build --test simple_workflow --features "std,testing-csp"
+//!   mkdir -p fuzz_in && echo "seed" > fuzz_in/seed.txt
+//!   cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/deps/simple_workflow-*
+
+#![cfg(all(feature = "std", feature = "testing-csp"))]
+
+use tightbeam::testing::{assertions::AssertionPhase, error::TestingError};
+use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+
+tb_assert_spec! {
+    pub SimpleFuzzSpec,
+    V(1,0,0): {
+        mode: Accept,
+        gate: Accepted,
+        assertions: [
+            (HandlerStart, "start", exactly!(1)),
+            (HandlerStart, "action_a", at_least!(0)),
+            (HandlerStart, "action_b", at_least!(0)),
+            (HandlerStart, "done", exactly!(1))
+        ]
+    },
+}
+
+tb_process_spec! {
+    pub struct SimpleFuzzProc;
+    events {
+        observable { "start", "action_a", "action_b", "done" }
+        hidden { }
+    }
+    states {
+        S0 => { "start" => S1 },
+        S1 => { "action_a" => S1, "action_b" => S1, "done" => S2 }
+    }
+    terminal { S2 }
+}
+
+#[cfg(fuzzing)]
+tb_scenario! {
+    fuzz: afl,
+    spec: SimpleFuzzSpec,
+    csp: SimpleFuzzProc,
+    environment Bare {
+        exec: |trace| {
+            match trace.oracle().fuzz_from_bytes() {
+                Ok(()) => {
+                    for event in trace.oracle().trace() {
+                        trace.assert(AssertionPhase::HandlerStart, event.0);
+                    }
+                    Ok(())
+                }
+                Err(_) => Err(TestingError::FuzzInputExhausted.into())
+            }
+        }
+    }
+}

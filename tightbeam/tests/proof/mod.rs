@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use tightbeam::asn1::{Metadata, Version};
 use tightbeam::error::Result;
 use tightbeam::{encode, job, policy, worker, Frame, TightBeamError};
@@ -600,7 +602,7 @@ mod tests {
 					nonrepudiation<Secp256k1Signature, _>: &signing_key,
 					previous_frame: DigestInfo {
 						algorithm: AlgorithmIdentifier {
-							oid: tightbeam::constants::HASH_SHA3_256_OID,
+							oid: tightbeam::oids::HASH_SHA3_256,
 							parameters: None,
 						},
 						digest: OctetString::new([0; 32])?
@@ -740,7 +742,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_random_secp_matrix_points() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_random_secp_matrix_points() -> ::core::result::Result<(), Box<dyn std::error::Error>> {
 		let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 		let sk_bytes = signing_key.to_bytes();
 		println!("signing key hex: {}", to_hex(sk_bytes.as_slice()));
