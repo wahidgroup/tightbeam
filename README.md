@@ -2486,7 +2486,7 @@ agree on observable behavior.
 checking where implementations contain details absent from abstract specifications.
 Hidden events are projected away when comparing traces: `trace \ {τ}`.
 
-The instrumentation taxonomy (§10.7.2) maps tightbeam events to CSP categories:
+The instrumentation taxonomy (§11.2) maps tightbeam events to CSP categories:
 - **Observable**: `gate_accept`, `gate_reject`, `request_recv`, `response_send`, `assert_label`
 - **Hidden (τ)**: `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`, `process_hidden`
 
