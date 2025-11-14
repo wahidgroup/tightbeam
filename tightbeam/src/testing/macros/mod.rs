@@ -1337,6 +1337,7 @@ macro_rules! tb_scenario {
 	(
 		name: $test_name:ident,
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
@@ -1383,6 +1384,7 @@ macro_rules! tb_scenario {
 			let verification_result = $crate::__tb_scenario_verify_impl! {
 				multi_specs: specs,
 				trace: trace,
+				$(fdr: $fdr_config,)?
 				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			};
 
@@ -1477,6 +1479,7 @@ macro_rules! tb_scenario {
 	(
 		name: $test_name:ident,
 		spec: $spec:ty,
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
@@ -1536,6 +1539,7 @@ macro_rules! tb_scenario {
 			let verification_result = $crate::__tb_scenario_verify_impl! {
 				single_spec: $spec,
 				trace: trace,
+				$(fdr: $fdr_config,)?
 				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			};
 
@@ -1547,6 +1551,7 @@ macro_rules! tb_scenario {
 	(
 		name: $test_name:ident,
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
@@ -1610,6 +1615,7 @@ macro_rules! tb_scenario {
 			let verification_result = $crate::__tb_scenario_verify_impl! {
 				multi_specs: specs,
 				trace: trace,
+				$(fdr: $fdr_config,)?
 				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			};
 
@@ -1622,6 +1628,7 @@ macro_rules! tb_scenario {
 		name: $test_name:ident,
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
@@ -1692,6 +1699,7 @@ macro_rules! tb_scenario {
 					single_spec: $spec,
 					trace: trace,
 					$(csp: $csp,)?
+					$(fdr: $fdr_config,)?
 					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 				};
 
@@ -1706,6 +1714,7 @@ macro_rules! tb_scenario {
 	(
 		name: $test_name:ident,
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
@@ -1779,6 +1788,7 @@ macro_rules! tb_scenario {
 				let verification_result = $crate::__tb_scenario_verify_impl! {
 					multi_specs: specs,
 					trace: trace,
+					$(fdr: $fdr_config,)?
 					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 				};
 
@@ -1792,6 +1802,8 @@ macro_rules! tb_scenario {
 	// ===== Bare environment variant (single spec: Type form) =====
 	(
 		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
@@ -1802,12 +1814,13 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {
-		tb_scenario!(@execute Bare, single_spec, $spec, $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure)
+		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure)
 	};
 
 	// ===== Bare environment variant (multiple specs: [...] form) =====
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
@@ -1852,6 +1865,7 @@ macro_rules! tb_scenario {
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			multi_specs: specs,
 			trace: trace,
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
@@ -1861,6 +1875,7 @@ macro_rules! tb_scenario {
 	// ===== Worker environment variant (single spec: Type form) =====
 	(
 		spec: $spec:ty,
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
@@ -1918,6 +1933,7 @@ macro_rules! tb_scenario {
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			single_spec: $spec,
 			trace: trace,
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
@@ -1927,6 +1943,7 @@ macro_rules! tb_scenario {
 	// ===== Worker environment variant (multiple specs: [...] form) =====
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
@@ -1988,6 +2005,7 @@ macro_rules! tb_scenario {
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			multi_specs: specs,
 			trace: trace,
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
@@ -1998,6 +2016,8 @@ macro_rules! tb_scenario {
 	// User receives assertions collector for both server and client
 	(
 		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
@@ -2012,6 +2032,8 @@ macro_rules! tb_scenario {
 		$(,)?
 	) => {
 		tb_scenario!(@execute ServiceClient, single_spec, $spec,
+			$(csp: $csp,)?
+			$(fdr: $fdr_config,)?
 			$(instrumentation: $instr_cfg,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			protocol: { $($protocol)? },
@@ -2024,6 +2046,7 @@ macro_rules! tb_scenario {
 	// ===== ServiceClient environment variant (multiple specs: [...] form) =====
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
@@ -2038,6 +2061,7 @@ macro_rules! tb_scenario {
 		$(,)?
 	) => {
 		tb_scenario!(@execute ServiceClient, multi_specs, [ $( $spec_expr ),+ ],
+			$(fdr: $fdr_config,)?
 			$(instrumentation: $instr_cfg,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			protocol: { $($protocol)? },
@@ -2362,7 +2386,7 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== Execution dispatcher for Bare environment =====
-	(@execute Bare, single_spec, $spec:ty, $(csp: $csp:ty,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
+	(@execute Bare, single_spec, $spec:ty, $(csp: $csp:ty,)? $(fdr: $fdr_config:expr,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
 		#[cfg(feature = "instrument")]
 		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
 		#[cfg(feature = "instrument")]
@@ -2398,6 +2422,7 @@ macro_rules! tb_scenario {
 			single_spec: $spec,
 			trace: trace,
 			$(csp: $csp,)?
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
@@ -2457,7 +2482,7 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== Execution dispatcher for Worker environment =====
-	(@execute Worker, single_spec, $spec:ty, $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
+	(@execute Worker, single_spec, $spec:ty, $(fdr: $fdr_config:expr,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
 		#[cfg(feature = "instrument")]
 		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
 		#[cfg(feature = "instrument")]
@@ -2505,13 +2530,14 @@ macro_rules! tb_scenario {
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			single_spec: $spec,
 			trace: trace,
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
 		tb_scenario!(@propagate_result exec_result, verification_result)
 	}};
 
-	(@execute Worker, multi_specs, [ $( $spec_expr:expr ),+ ], $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
+	(@execute Worker, multi_specs, [ $( $spec_expr:expr ),+ ], $(fdr: $fdr_config:expr,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
 		let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 		];
@@ -2563,6 +2589,7 @@ macro_rules! tb_scenario {
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			multi_specs: specs,
 			trace: trace,
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
@@ -2587,6 +2614,8 @@ macro_rules! tb_scenario {
 		$(,)?
 	) => {
 		tb_scenario!(@execute ServiceClient, single_spec, $spec,
+			$(csp: $csp,)?
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			protocol: { $($protocol)? },
 			worker_threads: { $($threads)? },
@@ -2598,6 +2627,7 @@ macro_rules! tb_scenario {
 	// ===== ServiceClient environment variant (multiple specs: [...] form) =====
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
@@ -2612,6 +2642,7 @@ macro_rules! tb_scenario {
 		$(,)?
 	) => {
 		tb_scenario!(@execute ServiceClient, multi_specs, [ $( $spec_expr ),+ ],
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			protocol: { $($protocol)? },
 			worker_threads: { $($threads)? },
@@ -2623,6 +2654,7 @@ macro_rules! tb_scenario {
 	// ===== Execution dispatcher for ServiceClient environment =====
 	(@execute ServiceClient, single_spec, $spec:ty,
 		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_mode:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
@@ -2688,6 +2720,7 @@ macro_rules! tb_scenario {
 				single_spec: $spec,
 				trace: trace,
 				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
 				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			};
 
@@ -2698,6 +2731,7 @@ macro_rules! tb_scenario {
 	}};
 
 	(@execute ServiceClient, multi_specs, [ $( $spec_expr:expr ),+ ],
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_mode:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
@@ -2727,6 +2761,7 @@ macro_rules! tb_scenario {
 			tb_scenario!(@init_instrumentation instr_mode);
 
 			let result = tb_scenario!(@execute_service_client_async multi_specs, specs,
+				$(fdr: $fdr_config,)?
 				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 				protocol: { $($protocol)? },
 				server: $server_closure,
@@ -2741,6 +2776,7 @@ macro_rules! tb_scenario {
 
 	// ===== Async ServiceClient execution (single spec) =====
 	(@execute_service_client_async single_spec, $spec:ty,
+		$(fdr: $fdr_config:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
 		server: $server_closure:expr,
@@ -2769,6 +2805,7 @@ macro_rules! tb_scenario {
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			single_spec: $spec,
 			trace: trace,
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
@@ -2777,6 +2814,7 @@ macro_rules! tb_scenario {
 
 	// ===== Async ServiceClient execution (multi specs) =====
 	(@execute_service_client_async multi_specs, $specs:expr,
+		$(fdr: $fdr_config:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
 		server: $server_closure:expr,
@@ -2805,6 +2843,7 @@ macro_rules! tb_scenario {
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			multi_specs: $specs,
 			trace: trace,
+			$(fdr: $fdr_config,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 		};
 
@@ -2817,6 +2856,7 @@ macro_rules! tb_scenario {
 		name: $test_name:ident,
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
 		$(instrumentation: $instr_cfg:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
@@ -2880,6 +2920,7 @@ macro_rules! tb_scenario {
 				single_spec: $spec,
 				trace: trace,
 				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
 				$(hooks: $hooks,)?
 			};
 
