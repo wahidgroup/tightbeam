@@ -7,6 +7,9 @@ use crate::{
 	CompressedData,
 };
 
+// Submodules
+pub mod urn;
+
 // Re-exports
 pub use ::hex_literal::hex;
 

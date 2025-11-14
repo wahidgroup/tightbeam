@@ -13,10 +13,16 @@ pub mod utils;
 #[cfg(feature = "testing-fuzz")]
 pub mod fuzz;
 
+#[cfg(feature = "testing-fdr")]
+pub mod fdr;
+
 pub use utils::*;
 
 // Re-export commonly used items from specs module for convenience
 pub use specs::{verify_trace, SpecViolation, TBSpec};
+
+#[cfg(feature = "testing-fdr")]
+pub use fdr::*;
 
 // Demo labels using tb_labels! macro (payload + non-payload)
 crate::tb_labels! { pub enum TbDemoLabels { MessageReceived => payload, HandlerStart } }

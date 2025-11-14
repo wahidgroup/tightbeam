@@ -690,6 +690,19 @@ where
 	///
 	/// # Handshake Flow (when x509 enabled)
 	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
+		// Instrument message emit event
+		#[cfg(feature = "instrument")]
+		{
+			let _ = crate::instrumentation::emit(
+				crate::instrumentation::TbEventKind::RequestRecv,
+				Some("message_emit"),
+				None,
+				None,
+				0,
+				None,
+			);
+		}
+
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
 		use crate::transport::handshake::TcpHandshakeState;

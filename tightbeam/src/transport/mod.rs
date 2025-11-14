@@ -399,6 +399,19 @@ pub trait MessageEmitter: MessageIO {
 	/// Send a TightBeam message
 	#[allow(async_fn_in_trait)]
 	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
+		// Instrument message emit event
+		#[cfg(feature = "instrument")]
+		{
+			let _ = crate::instrumentation::emit(
+				crate::instrumentation::TbEventKind::RequestRecv,
+				Some("message_emit"),
+				None,
+				None,
+				0,
+				None,
+			);
+		}
+
 		let mut current_message = message;
 		let mut current_attempt = attempt.unwrap_or(0);
 
@@ -527,6 +540,19 @@ pub trait MessageCollector: MessageIO {
 				return Err(TransportError::InvalidMessage);
 			}
 		};
+
+		// Instrument message collect event
+		#[cfg(feature = "instrument")]
+		{
+			let _ = crate::instrumentation::emit(
+				crate::instrumentation::TbEventKind::ResponseSend,
+				Some("message_collect"),
+				None,
+				None,
+				0,
+				None,
+			);
+		}
 
 		// Evaluate gate policy
 		let status = self.collector_gate().evaluate(&request);
