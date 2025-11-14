@@ -2725,14 +2725,14 @@ CSP and FDR verification.
 
 ```rust
 tb_scenario! {
-	name: test_function_name,              // OPTIONAL: creates standalone #[test] function
-	spec: AssertSpecType,                  // REQUIRED: Layer 1 assertion spec
-	csp: ProcessSpecType,                  // OPTIONAL: Layer 2 CSP model (requires testing-csp)
-	fuzz: FuzzInputSpec,                   // OPTIONAL: input generator (requires csp + testing-csp)
-	fdr: FdrConfig { ... },                // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-	instrumentation: Config { ... },       // OPTIONAL: instrumentation config
-	environment <Variant> { ... },         // REQUIRED: execution environment
-	hooks { ... }                          // OPTIONAL: on_pass/on_fail callbacks
+	name: test_function_name,        // OPTIONAL: creates standalone #[test] function NOTE: Do NOT use with `fuzz: afl`
+	spec: AssertSpecType,            // REQUIRED: Layer 1 assertion spec
+	csp: ProcessSpecType,            // OPTIONAL: Layer 2 CSP model (requires testing-csp)
+	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
+	fdr: FdrConfig { ... },          // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
+	instrumentation: Config { ... }, // OPTIONAL: instrumentation config
+	environment <Variant> { ... },   // REQUIRED: execution environment
+	hooks { ... }                    // OPTIONAL: on_pass/on_fail callbacks
 }
 ```
 
@@ -2939,9 +2939,10 @@ tb_scenario! {
 ```
 
 **Feature Requirements**:
-- `testing-fuzz` feature flag
+- `testing-csp` feature flag (required for CSP oracle)
 - `cargo-afl` installed: `cargo install cargo-afl`
 - Fuzz targets gated by `#[cfg(fuzzing)]` to avoid compilation during normal tests
+- `std` feature flag (required for most fuzz targets)
 
 #### 10.7.2 Creating Fuzz Targets
 
@@ -2985,6 +2986,7 @@ tb_process_spec! {
 }
 
 // AFL fuzz target - compiled with `cargo afl build`
+// Note: AFL fuzz targets generate `fn main()` - do NOT include `name:` parameter
 #[cfg(fuzzing)]
 tb_scenario! {
 	fuzz: afl,
@@ -3016,10 +3018,17 @@ cargo install cargo-afl
 
 **Run AFL Fuzzer**:
 ```bash
+# Build fuzz targets first
+# Note: Some fuzz targets may require additional features
+RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing --features "std,testing-csp"
+
+# Create seed input directory
 mkdir -p fuzz_in
 echo "seed" > fuzz_in/seed.txt
 
-cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/deps/fuzzing-*
+# Run AFL fuzzer (find the actual binary name)
+FUZZ_TARGET=$(ls target/debug/deps/fuzzing-* 2>/dev/null | grep -v '\.d$' | head -1)
+cargo afl fuzz -i fuzz_in -o fuzz_out "$FUZZ_TARGET"
 ```
 
 #### 10.7.4 Advanced: CSP Oracle Integration

@@ -22,13 +22,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use tightbeam::colony::Servlet;
 use tightbeam::der::Enumerated;
 use tightbeam::matrix::{Matrix, MatrixLike};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{
-	at_least, at_most, compose, decode, exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario, Beamable,
-	Sequence,
+	at_least, compose, decode, exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario, Beamable, Sequence,
 };
 
 // ============================================================================
@@ -204,7 +202,7 @@ impl ChessGameState {
 
 		match piece {
 			piece::WHITE_PAWN | piece::BLACK_PAWN => {
-				let forward = if is_white_piece {
+				let _forward = if is_white_piece {
 					-1i8
 				} else {
 					1i8
@@ -569,7 +567,6 @@ servlet! {
 
 				// Check again after server move (increment move count for server move)
 				let server_move_count = move_count + 1;
-
 				if game_state.is_checkmate(is_server_white_turn, server_move_count) {
 					GameStatusCode::Checkmate
 				} else if game_state.is_stalemate(is_server_white_turn, server_move_count) {
@@ -627,63 +624,101 @@ tb_scenario! {
 			// Initialize client-side game state (starts with standard chess position)
 			let mut client_game_state = ChessGameState::new();
 
-			// Extract move coordinates from AFL input bytes
-			// Use fuzz_u8() to get move coordinates (0-7 for chess board positions)
-			let from_row = trace.oracle().fuzz_u8().unwrap_or(1) % 8;
-			let from_col = trace.oracle().fuzz_u8().unwrap_or(0) % 8;
-			let to_row = trace.oracle().fuzz_u8().unwrap_or(2) % 8;
-			let to_col = trace.oracle().fuzz_u8().unwrap_or(0) % 8;
-
-			// Create move request
-			let move_req = ChessMoveRequest {
-				from_row,
-				from_col,
-				to_row,
-				to_col,
+			// Structured input format:
+			// - First byte: number of moves to attempt (1-10, 0 = 1 move)
+			// - For each move: 4 bytes (from_row, from_col, to_row, to_col)
+			let move_count = match trace.oracle().fuzz_u8() {
+				Ok(b) => (b % 10).max(1), // 1-10 moves
+				Err(_) => 1, // If no input, do 1 move
 			};
 
-			trace.event("move_sent");
+			let mut order = 1u64;
 
-			// Send move request to server with current board state in matrix
-			let board_matrix = tightbeam::Asn1Matrix::from(&client_game_state);
-			// Convert Asn1Matrix to MatrixDyn (can fail with MatrixError)
-			let matrix_dyn = tightbeam::matrix::MatrixDyn::try_from(board_matrix)?;
-			let frame = compose! {
-				V0: id: "chess-client",
-				order: 1u64,
-				message: move_req,
-				matrix: matrix_dyn
-			}?;
+			// Attempt multiple moves to explore more state space
+			for _ in 0..move_count {
+				// Extract move coordinates from AFL input bytes
+				// No defaults - let AFL mutations directly affect values
+				let from_row = match trace.oracle().fuzz_u8() {
+					Ok(b) => b % 8,
+					Err(_) => break, // Out of input bytes
+				};
+				let from_col = match trace.oracle().fuzz_u8() {
+					Ok(b) => b % 8,
+					Err(_) => break,
+				};
+				let to_row = match trace.oracle().fuzz_u8() {
+					Ok(b) => b % 8,
+					Err(_) => break,
+				};
+				let to_col = match trace.oracle().fuzz_u8() {
+					Ok(b) => b % 8,
+					Err(_) => break,
+				};
 
-			// Get response frame
-			let response_frame = match client.emit(frame, None).await? {
-				Some(frame) => frame,
-				None => return Err(tightbeam::TightBeamError::InvalidBody),
-			};
+				// Create move request
+				let move_req = ChessMoveRequest {
+					from_row,
+					from_col,
+					to_row,
+					to_col,
+				};
 
-			// Decode response
-			let response: ChessMoveResponse = decode(&response_frame.message)?;
+				trace.event("move_sent");
 
-			// Update client game state from response matrix if present
-			if let Some(ref asn1_matrix) = response_frame.metadata.matrix {
-				if let Ok(updated_state) = ChessGameState::try_from(asn1_matrix) {
-					client_game_state.board = updated_state.board;
+				// Send move request to server with current board state in matrix
+				let board_matrix = tightbeam::Asn1Matrix::from(&client_game_state);
+				// Convert Asn1Matrix to MatrixDyn (can fail with MatrixError)
+				let matrix_dyn = tightbeam::matrix::MatrixDyn::try_from(board_matrix)?;
+				let frame = compose! {
+					V0: id: "chess-client",
+					order: order,
+					message: move_req,
+					matrix: matrix_dyn
+				}?;
+
+				// Get response frame
+				let response_frame = match client.emit(frame, None).await? {
+					Some(frame) => frame,
+					None => {
+						trace.event("no_response");
+						break;
+					}
+				};
+
+				// Decode response
+				let response: ChessMoveResponse = match decode(&response_frame.message) {
+					Ok(r) => r,
+					Err(_) => {
+						trace.event("decode_error");
+						break;
+					}
+				};
+
+				// Update client game state from response matrix if present
+				if let Some(ref asn1_matrix) = response_frame.metadata.matrix {
+					if let Ok(updated_state) = ChessGameState::try_from(asn1_matrix) {
+						client_game_state.board = updated_state.board;
+					}
 				}
-			}
 
-			// Assert based on response
-			match response.game_status {
-				GameStatusCode::InvalidMove => {
-					trace.event("move_rejected");
-				}
-				GameStatusCode::InProgress => {
-					trace.event("move_validated");
-					trace.event("server_move");
-				}
-				GameStatusCode::Checkmate | GameStatusCode::Stalemate => {
-					trace.event("move_validated");
-					trace.event("server_move");
-					trace.event("game_ended");
+				// Track response type for coverage feedback
+				match response.game_status {
+					GameStatusCode::InvalidMove => {
+						trace.event("move_rejected");
+						// Continue to next move even if invalid
+					}
+					GameStatusCode::InProgress => {
+						trace.event("move_validated");
+						trace.event("server_move");
+						order += 2; // Client move + server move
+					}
+					GameStatusCode::Checkmate | GameStatusCode::Stalemate => {
+						trace.event("move_validated");
+						trace.event("server_move");
+						trace.event("game_ended");
+						// Game ended, stop making moves
+						break;
+					}
 				}
 			}
 
