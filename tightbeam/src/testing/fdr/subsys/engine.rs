@@ -5,6 +5,8 @@
 
 #[cfg(feature = "rayon")]
 use std::collections::HashSet;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::testing::fdr::config::{FdrConfig, FdrVerdict, Trace, Failure};
 use crate::testing::fdr::explorer::{ExplorationCore, MemoizationCache, RefinementChecker, SeedResult};
@@ -41,21 +43,15 @@ where
 	/// Refinement checker
 	refinement: R,
 
-	/// Memoization cache
-	/// 
-	/// Note: Currently unused. The `DefaultRefinementChecker` implements
-	/// `MemoizationCache` itself and maintains its own internal cache.
-	/// This field is kept for extensibility - custom refinement checkers
-	/// may use the shared cache instead of maintaining their own.
-	#[allow(dead_code)]
-	cache: M,
+	/// Memoization cache (shared with refinement checker via Rc<RefCell<>>)
+	cache: Rc<RefCell<M>>,
 
 	/// Verdict accumulator
 	verdict: FdrVerdict,
 }
 
 /// Default FDR explorer using default subsystem implementations
-pub type DefaultFdrExplorer<'a> = FdrExplorer<'a, DefaultExplorationEngine<'a>, DefaultRefinementChecker<'a>, DefaultCache>;
+pub type DefaultFdrExplorer<'a> = FdrExplorer<'a, DefaultExplorationEngine<'a>, DefaultRefinementChecker<'a, DefaultCache>, DefaultCache>;
 
 impl<'a, E, R, M> FdrExplorer<'a, E, R, M>
 where
@@ -64,7 +60,7 @@ where
 	M: MemoizationCache,
 {
 	/// Create new FDR explorer with custom subsystems
-	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R, cache: M) -> Self {
+	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R, cache: Rc<RefCell<M>>) -> Self {
 		Self {
 			process,
 			config,
@@ -245,8 +241,8 @@ impl<'a> DefaultFdrExplorer<'a> {
 	/// of all subsystems. For custom subsystems, use `FdrExplorer::new` directly.
 	pub fn with_defaults(process: &'a Process, config: FdrConfig) -> Self {
 		let explorer = DefaultExplorationEngine::new(process, config.clone());
-		let refinement = DefaultRefinementChecker::new(process, config.clone());
-		let cache = DefaultCache::new();
+		let cache = Rc::new(RefCell::new(DefaultCache::new()));
+		let refinement = DefaultRefinementChecker::new(process, config.clone(), Rc::clone(&cache));
 		FdrExplorer::new(process, config, explorer, refinement, cache)
 	}
 }

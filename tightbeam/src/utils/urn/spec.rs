@@ -33,7 +33,7 @@ pub trait UrnSpec {
 	/// Transform builder (apply defaults, normalizations)
 	///
 	/// Called before validation to allow specs to apply transformations like
-	/// uppercasing, default values, etc.
+	/// upper-casing, default values, etc.
 	fn transform(builder: UrnBuilder) -> UrnBuilder {
 		builder
 	}
@@ -44,4 +44,3 @@ pub trait UrnSpec {
 	/// according to the spec's defined structure.
 	fn build_nss(builder: &UrnBuilder) -> Result<Cow<'static, str>, ValidationError>;
 }
-

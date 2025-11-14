@@ -3,36 +3,33 @@
 //! This module contains the RefinementChecker trait implementation.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
+use std::rc::Rc;
 
 use crate::testing::fdr::config::{FdrConfig, Failure, Trace};
 use crate::testing::fdr::explorer::{MemoizationCache, RefinementChecker};
 use crate::testing::specs::csp::{Event, Process, State};
 
 /// Default refinement checker implementation
-pub struct DefaultRefinementChecker<'a> {
+pub struct DefaultRefinementChecker<'a, M>
+where
+	M: MemoizationCache,
+{
 	/// Configuration
 	config: FdrConfig,
 	/// Process being verified
 	process: &'a Process,
-	/// Memoization cache: process name -> traces
-	traces_cache: RefCell<HashMap<String, Vec<Trace>>>,
-	/// Memoization cache: process name -> failures
-	failures_cache: RefCell<HashMap<String, Vec<Failure>>>,
-	/// Memoization cache: process name -> divergences
-	divergences_cache: RefCell<HashMap<String, Vec<Trace>>>,
+	/// Shared memoization cache
+	cache: Rc<RefCell<M>>,
 }
 
-impl<'a> DefaultRefinementChecker<'a> {
-	/// Create new refinement checker
-	pub fn new(process: &'a Process, config: FdrConfig) -> Self {
-		Self {
-			config,
-			process,
-			traces_cache: RefCell::new(HashMap::new()),
-			failures_cache: RefCell::new(HashMap::new()),
-			divergences_cache: RefCell::new(HashMap::new()),
-		}
+impl<'a, M> DefaultRefinementChecker<'a, M>
+where
+	M: MemoizationCache,
+{
+	/// Create new refinement checker with shared cache
+	pub fn new(process: &'a Process, config: FdrConfig, cache: Rc<RefCell<M>>) -> Self {
+		Self { config, process, cache }
 	}
 
 
@@ -89,7 +86,10 @@ impl<'a> DefaultRefinementChecker<'a> {
 	}
 }
 
-impl<'a> RefinementChecker for DefaultRefinementChecker<'a> {
+impl<'a, M> RefinementChecker for DefaultRefinementChecker<'a, M>
+where
+	M: MemoizationCache,
+{
 	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> (bool, Option<Trace>) {
 		let spec_traces = self.compute_traces(spec, self.config.max_depth);
 		let impl_traces = self.compute_traces(impl_process, self.config.max_depth);
@@ -131,7 +131,7 @@ impl<'a> RefinementChecker for DefaultRefinementChecker<'a> {
 
 	fn compute_traces(&mut self, process: &Process, max_depth: usize) -> HashSet<Trace> {
 		// Check cache first
-		if let Some(cached) = self.get_cached_traces(process.name) {
+		if let Some(cached) = self.cache.borrow().get_cached_traces(process.name) {
 			return cached.into_iter().collect();
 		}
 
@@ -161,14 +161,14 @@ impl<'a> RefinementChecker for DefaultRefinementChecker<'a> {
 
 		// Cache the result
 		let traces_vec: Vec<Trace> = traces.iter().cloned().collect();
-		self.cache_traces(process.name.to_string(), traces_vec);
+		self.cache.borrow_mut().cache_traces(process.name.to_string(), traces_vec);
 
 		traces
 	}
 
 	fn compute_failures(&mut self, process: &Process, max_depth: usize) -> Vec<Failure> {
 		// Check cache first
-		if let Some(cached) = self.get_cached_failures(process.name) {
+		if let Some(cached) = self.cache.borrow().get_cached_failures(process.name) {
 			return cached;
 		}
 
@@ -210,14 +210,14 @@ impl<'a> RefinementChecker for DefaultRefinementChecker<'a> {
 		);
 
 		// Cache the result
-		self.cache_failures(process.name.to_string(), failures.clone());
+		self.cache.borrow_mut().cache_failures(process.name.to_string(), failures.clone());
 
 		failures
 	}
 
 	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> HashSet<Trace> {
 		// Check cache first
-		if let Some(cached) = self.get_cached_divergences(process.name) {
+		if let Some(cached) = self.cache.borrow().get_cached_divergences(process.name) {
 			return cached.into_iter().collect();
 		}
 
@@ -279,7 +279,7 @@ impl<'a> RefinementChecker for DefaultRefinementChecker<'a> {
 
 		// Cache the result
 		let divergences_vec: Vec<Trace> = divergences.iter().cloned().collect();
-		self.cache_divergences(process.name.to_string(), divergences_vec);
+		self.cache.borrow_mut().cache_divergences(process.name.to_string(), divergences_vec);
 
 		divergences
 	}
@@ -293,31 +293,5 @@ impl<'a> RefinementChecker for DefaultRefinementChecker<'a> {
 			}
 		}
 		refusals
-	}
-}
-
-impl<'a> MemoizationCache for DefaultRefinementChecker<'a> {
-	fn get_cached_traces(&self, process_name: &str) -> Option<Vec<Trace>> {
-		self.traces_cache.borrow().get(process_name).cloned()
-	}
-
-	fn cache_traces(&mut self, process_name: String, traces: Vec<Trace>) {
-		self.traces_cache.borrow_mut().insert(process_name, traces);
-	}
-
-	fn get_cached_failures(&self, process_name: &str) -> Option<Vec<Failure>> {
-		self.failures_cache.borrow().get(process_name).cloned()
-	}
-
-	fn cache_failures(&mut self, process_name: String, failures: Vec<Failure>) {
-		self.failures_cache.borrow_mut().insert(process_name, failures);
-	}
-
-	fn get_cached_divergences(&self, process_name: &str) -> Option<Vec<Trace>> {
-		self.divergences_cache.borrow().get(process_name).cloned()
-	}
-
-	fn cache_divergences(&mut self, process_name: String, divergences: Vec<Trace>) {
-		self.divergences_cache.borrow_mut().insert(process_name, divergences);
 	}
 }
