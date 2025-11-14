@@ -1,15 +1,15 @@
 //! Extension Trait for ConsumedTrace with FDR Analysis
 //!
 //! Provides CSP-specific analysis capabilities for execution traces.
+#![cfg(feature = "std")]
 
 use std::io::Write;
 
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{AssertionLabel, AssertionPhase};
+use crate::testing::fdr::config::AcceptanceSet;
 use crate::testing::specs::csp::Event;
 use crate::testing::trace::ConsumedTrace;
-
-use crate::testing::fdr::config::AcceptanceSet;
 
 /// State labels used in FDR trace analysis
 mod state_labels {

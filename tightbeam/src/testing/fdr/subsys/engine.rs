@@ -3,12 +3,12 @@
 //! This module contains the core FdrExplorer struct that orchestrates exploration
 //! and refinement checking by delegating to pluggable subsystems.
 
+use std::cell::RefCell;
 #[cfg(feature = "rayon")]
 use std::collections::HashSet;
-use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::testing::fdr::config::{FdrConfig, FdrVerdict, Trace, Failure};
+use crate::testing::fdr::config::{Failure, FdrConfig, FdrVerdict, Trace};
 use crate::testing::fdr::explorer::{ExplorationCore, MemoizationCache, RefinementChecker, SeedResult};
 use crate::testing::specs::csp::Process;
 
@@ -43,7 +43,7 @@ where
 	/// Refinement checker
 	refinement: R,
 
-	/// Memoization cache (shared with refinement checker via Rc<RefCell<>>)
+	/// Memoization cache
 	cache: Rc<RefCell<M>>,
 
 	/// Verdict accumulator
@@ -51,7 +51,8 @@ where
 }
 
 /// Default FDR explorer using default subsystem implementations
-pub type DefaultFdrExplorer<'a> = FdrExplorer<'a, DefaultExplorationEngine<'a>, DefaultRefinementChecker<'a, DefaultCache>, DefaultCache>;
+pub type DefaultFdrExplorer<'a> =
+	FdrExplorer<'a, DefaultExplorationEngine<'a>, DefaultRefinementChecker<'a, DefaultCache>, DefaultCache>;
 
 impl<'a, E, R, M> FdrExplorer<'a, E, R, M>
 where
@@ -61,14 +62,7 @@ where
 {
 	/// Create new FDR explorer with custom subsystems
 	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R, cache: Rc<RefCell<M>>) -> Self {
-		Self {
-			process,
-			config,
-			explorer,
-			refinement,
-			cache,
-			verdict: FdrVerdict::default(),
-		}
+		Self { process, config, explorer, refinement, cache, verdict: FdrVerdict::default() }
 	}
 
 	/// Run multi-seed exploration
@@ -184,20 +178,32 @@ where
 		let specs = self.config.specs.clone();
 
 		// Check each refinement type
-		self.check_refinement_for_specs(&specs, |r, s| r.check_trace_refinement(s, self.process), |v, w| {
-			v.trace_refines = false;
-			v.trace_refinement_witness = w;
-		});
+		self.check_refinement_for_specs(
+			&specs,
+			|r, s| r.check_trace_refinement(s, self.process),
+			|v, w| {
+				v.trace_refines = false;
+				v.trace_refinement_witness = w;
+			},
+		);
 
-		self.check_refinement_for_specs(&specs, |r, s| r.check_failures_refinement(s, self.process), |v, w| {
-			v.failures_refines = false;
-			v.failures_refinement_witness = w;
-		});
+		self.check_refinement_for_specs(
+			&specs,
+			|r, s| r.check_failures_refinement(s, self.process),
+			|v, w| {
+				v.failures_refines = false;
+				v.failures_refinement_witness = w;
+			},
+		);
 
-		self.check_refinement_for_specs(&specs, |r, s| r.check_divergence_refinement(s, self.process), |v, w| {
-			v.divergence_refines = false;
-			v.divergence_refinement_witness = w;
-		});
+		self.check_refinement_for_specs(
+			&specs,
+			|r, s| r.check_divergence_refinement(s, self.process),
+			|v, w| {
+				v.divergence_refines = false;
+				v.divergence_refinement_witness = w;
+			},
+		);
 
 		// All refinement checks passed
 		if self.verdict.trace_refines && self.verdict.failures_refines && self.verdict.divergence_refines {
