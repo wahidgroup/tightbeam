@@ -1,3 +1,5 @@
+//! Utility modules and functions
+
 use crate::error::TightBeamError;
 
 #[cfg(feature = "compress")]
@@ -6,6 +8,9 @@ use crate::{
 	error::CompressionError,
 	CompressedData,
 };
+
+// Submodules
+pub mod urn;
 
 // Re-exports
 pub use ::hex_literal::hex;
