@@ -5,10 +5,12 @@
 
 use std::io::Write;
 
+use std::collections::HashSet;
+
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{AssertionLabel, AssertionPhase};
 use crate::testing::fdr::config::AcceptanceSet;
-use crate::testing::specs::csp::Event;
+use crate::testing::specs::csp::{Event, Process, State, TransitionRelation};
 use crate::testing::trace::ConsumedTrace;
 
 /// State labels used in FDR trace analysis
@@ -47,6 +49,9 @@ pub trait FdrTraceExt {
 
 	/// Export trace as CSPM
 	fn export_cspm<W: Write>(&self, writer: &mut W) -> std::io::Result<()>;
+
+	/// Convert ConsumedTrace to CSP Process for FDR refinement checking
+	fn to_process(&self) -> Process;
 }
 
 impl FdrTraceExt for ConsumedTrace {
@@ -213,5 +218,102 @@ impl FdrTraceExt for ConsumedTrace {
 
 		writeln!(writer, ">")?;
 		Ok(())
+	}
+
+	/// Convert ConsumedTrace to CSP Process for FDR refinement checking
+	///
+	/// Creates a linear process model representing the execution trace:
+	/// - States correspond to execution stages (initial, gate_accept, handler, terminal)
+	/// - Observable events are derived from assertion labels
+	/// - Hidden events represent internal operations
+	fn to_process(&self) -> Process {
+		use state_labels::*;
+
+		let mut states = HashSet::new();
+		let mut terminal = HashSet::new();
+		let mut observable = HashSet::new();
+		let mut hidden = HashSet::new();
+		let mut transitions = TransitionRelation::new();
+
+		// Define states based on execution stages
+		let s_initial = State(INITIAL);
+		let s_gate_accept = State(GATE_ACCEPT);
+		let s_handler = State(HANDLER);
+		let s_gate_reject = State(GATE_REJECT);
+		let s_terminal = State(TERMINAL);
+
+		states.insert(s_initial.clone());
+		states.insert(s_gate_accept.clone());
+		states.insert(s_handler.clone());
+		states.insert(s_gate_reject.clone());
+		states.insert(s_terminal.clone());
+
+		// Terminal state is always terminal
+		terminal.insert(s_terminal.clone());
+
+		// Build transitions based on trace execution path
+		match self.gate_decision {
+			Some(TransitStatus::Accepted) => {
+				// Path: initial -> gate_accept -> handler -> terminal
+				let request_event = Event("request");
+				observable.insert(request_event.clone());
+				transitions.add(s_initial.clone(), request_event, s_gate_accept.clone());
+
+				let handler_enter_event = Event("handler_enter");
+				hidden.insert(handler_enter_event.clone());
+				transitions.add(s_gate_accept.clone(), handler_enter_event, s_handler.clone());
+
+				// Add transitions for each assertion as observable event
+				for assertion in &self.assertions {
+					if let AssertionLabel::Custom(label) = &assertion.label {
+						let event = Event(*label);
+						observable.insert(event.clone());
+						transitions.add(s_handler.clone(), event, s_handler.clone());
+					}
+				}
+
+				// Handler exit -> terminal
+				let handler_exit_event = Event("handler_exit");
+				hidden.insert(handler_exit_event.clone());
+				transitions.add(s_handler.clone(), handler_exit_event, s_terminal.clone());
+
+				// Response event if present
+				if self.response.is_some() {
+					let response_event = Event("response");
+					observable.insert(response_event.clone());
+					transitions.add(s_handler.clone(), response_event, s_terminal.clone());
+				}
+			}
+			Some(_) => {
+				// Rejection path: initial -> gate_reject -> terminal
+				let request_event = Event("request");
+				observable.insert(request_event.clone());
+				transitions.add(s_initial.clone(), request_event, s_gate_reject.clone());
+				transitions.add(s_gate_reject.clone(), Event("reject"), s_terminal.clone());
+				observable.insert(Event("reject"));
+			}
+			None => {
+				// No gate decision - just initial state, no transitions
+			}
+		}
+
+		Process {
+			name: "TraceProcess",
+			initial: s_initial,
+			states,
+			terminal,
+			choice: HashSet::new(), // No nondeterminism in a single trace
+			observable,
+			hidden,
+			transitions,
+			description: Some("Process derived from ConsumedTrace"),
+		}
+	}
+}
+
+impl ConsumedTrace {
+	/// Convert this trace to a CSP Process for FDR refinement checking
+	pub fn to_process(&self) -> Process {
+		<Self as FdrTraceExt>::to_process(self)
 	}
 }
