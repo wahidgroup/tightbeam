@@ -2810,6 +2810,122 @@ macro_rules! tb_scenario {
 		tb_scenario!(@propagate_result client_result, verification_result)
 	}};
 
+	// ===== AFL fuzz target for Servlet environment (NO #[test], generates fuzz!) =====
+	(
+		spec: $spec:ty,
+		csp: $csp:ty,
+		fuzz: afl,
+		$(fdr: $fdr_config:expr,)?
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Servlet {
+			servlet: $servlet_name:ident,
+			$(start: $start_expr:expr,)?
+			client: $client_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		fn main() {
+			::afl::fuzz!(|data: &[u8]| {
+				// Common setup
+				#[cfg(feature = "instrument")]
+				let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
+				#[cfg(feature = "instrument")]
+				$crate::tb_scenario!(@init_instrumentation instr_mode);
+
+				// AFL provides the data - use it directly with FuzzContext
+				let trace_collector = $crate::testing::trace::TraceCollector::with_fuzz_oracle(
+					data.to_vec(),
+					<$csp>::process()
+				);
+
+				// Servlet environment execution
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(2)
+					.enable_all()
+					.build()
+					.expect("Failed to build tokio runtime");
+
+				let exec_result = runtime.block_on(async {
+					let trace_client = trace_collector.clone();
+					let trace_server = trace_collector.clone();
+
+					// Start servlet - use custom start expression or default start(trace_server)
+					let servlet_instance = $crate::__tb_scenario_servlet_start!(
+						$servlet_name,
+						trace_server,
+						$($start_expr)?
+					);
+
+					// Get servlet address and create client
+					let server_addr = servlet_instance.addr();
+
+					// Wrap client creation in an async block that returns Result
+					let client = async {
+						Ok::<_, $crate::TightBeamError>($crate::client! {
+							connect $crate::transport::tcp::r#async::TokioListener: server_addr
+						})
+					}.await.expect("Failed to connect client");
+
+					// Execute client closure
+					async fn __call_client_closure<F, Fut, T>(
+						closure: F,
+						trace: $crate::testing::macros::TraceCollector,
+						client: T,
+					) -> Result<(), $crate::TightBeamError>
+					where
+						F: FnOnce($crate::testing::macros::TraceCollector, T) -> Fut,
+						Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+					{
+						closure(trace, client).await
+					}
+					let client_result = __call_client_closure($client_closure, trace_client, client).await;
+
+					// Stop servlet
+					servlet_instance.stop();
+
+					client_result
+				});
+
+				// Report CSP exploration to IJON (if feature enabled)
+				#[cfg(feature = "testing-fuzz-ijon")]
+				{
+					if exec_result.is_ok() {
+						// Use public oracle() method to access oracle context
+						let oracle_ctx = trace_collector.oracle();
+						::afl::ijon_stack_max!(oracle_ctx.coverage_score());
+						::afl::ijon_set!(oracle_ctx.track_state());
+						// Track state hash distribution across trace depth
+						let trace_depth = oracle_ctx.trace().len() as u32;
+						let state_hash = oracle_ctx.track_state();
+						unsafe { ::afl::ijon_hashint(trace_depth, state_hash); }
+					}
+				}
+
+				// Common finalization
+				let mut trace = $crate::tb_scenario!(@setup_trace);
+				trace.populate_from_collector(&trace_collector);
+				#[cfg(feature = "instrument")]
+				$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
+				$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+				let verification_result = $crate::__tb_scenario_verify_impl! {
+					single_spec: $spec,
+					trace: trace,
+					csp: $csp,
+					$(fdr: $fdr_config,)?
+					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+				};
+
+				// AFL fuzz targets should not panic on failure - just return
+				let _ = $crate::tb_scenario!(@propagate_result exec_result, verification_result);
+			});
+		}
+	};
+
 	// ===== Servlet environment variant =====
 	// Servlet is defined at module scope, test environment starts it
 	(

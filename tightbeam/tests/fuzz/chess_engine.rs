@@ -22,10 +22,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use tightbeam::colony::Servlet;
 use tightbeam::der::Enumerated;
 use tightbeam::matrix::{Matrix, MatrixLike};
-use tightbeam::testing::assertions::AssertionPhase;
-use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{
 	at_least, at_most, compose, decode, exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario, Beamable,
@@ -395,14 +394,14 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(AssertionPhase::Any, "move_sent", exactly!(1)),
+			(Any, "move_sent", exactly!(1)),
 			// Either move_validated or move_rejected (mutually exclusive)
-			(AssertionPhase::Any, "move_validated", at_least!(0)),
-			(AssertionPhase::Any, "move_rejected", at_least!(0)),
+			(Any, "move_validated", at_least!(0)),
+			(Any, "move_rejected", at_least!(0)),
 			// server_move only if move was validated
-			(AssertionPhase::Any, "server_move", at_least!(0)),
+			(Any, "server_move", at_least!(0)),
 			// game_ended only if game terminates
-			(AssertionPhase::Any, "game_ended", at_least!(0)),
+			(Any, "game_ended", at_least!(0)),
 		]
 	},
 }
@@ -459,11 +458,6 @@ servlet! {
 	config: {
 		game_state: Arc<Mutex<ChessGameState>>,
 	},
-	init: |config| {
-		// Initialize game state (config is a reference to ChessEngineServletConf)
-		*config.game_state = Arc::new(Mutex::new(ChessGameState::new()));
-		Ok(())
-	},
 	handle: |message, config| async move {
 		// Decode ChessMoveRequest from message
 		let move_req: ChessMoveRequest = match decode(&message.message) {
@@ -475,8 +469,8 @@ servlet! {
 				};
 				return Ok(Some(compose! {
 					V0: id: message.metadata.id.clone(),
-					order: message.metadata.order + 1,
-					message: response
+						order: message.metadata.order + 1,
+						message: response
 				}?));
 			}
 		};
@@ -503,8 +497,8 @@ servlet! {
 
 				return Ok(Some(compose! {
 					V0: id: message.metadata.id.clone(),
-					order: message.metadata.order + 1,
-					message: response
+						order: message.metadata.order + 1,
+						message: response
 				}?));
 			}
 		};
@@ -535,8 +529,8 @@ servlet! {
 			};
 			return Ok(Some(compose! {
 				V0: id: message.metadata.id.clone(),
-				order: move_count + 1,
-				message: response
+					order: move_count + 1,
+					message: response
 			}?));
 		}
 
@@ -590,7 +584,7 @@ servlet! {
 		// Increment order for next move (monotonically incrementing)
 		let response = ChessMoveResponse { game_status };
 		let updated_matrix = tightbeam::Asn1Matrix::from(&*game_state);
-		// Convert Asn1Matrix to MatrixDyn (which implements MatrixLike)
+		// Convert Asn1Matrix to MatrixDyn
 		let matrix_dyn = tightbeam::matrix::MatrixDyn::try_from(updated_matrix)?;
 
 		Ok(Some(compose! {
@@ -608,9 +602,9 @@ servlet! {
 
 #[cfg(fuzzing)]
 tb_scenario! {
-	name: test_chess_engine_fuzz,
 	spec: ChessAssertSpec,
 	csp: ChessGameFlow,
+	fuzz: afl,
 	fdr: FdrConfig {
 		seeds: 4,
 		max_depth: 100,
@@ -622,16 +616,23 @@ tb_scenario! {
 	},
 	environment Servlet {
 		servlet: ChessEngineServlet,
-		client: |trace, client| async move {
+		start: async move {
+			let config = ChessEngineServletConf {
+				game_state: Arc::new(Mutex::new(ChessGameState::new())),
+			};
+
+			ChessEngineServlet::start(config).await
+		},
+		client: |trace, mut client| async move {
 			// Initialize client-side game state (starts with standard chess position)
 			let mut client_game_state = ChessGameState::new();
 
-			// For fuzzing, use deterministic test input (can be replaced with AFL input later)
-			// Simulate a simple move: pawn from (1,0) to (2,0)
-			let from_row = 1u8;
-			let from_col = 0u8;
-			let to_row = 2u8;
-			let to_col = 0u8;
+			// Extract move coordinates from AFL input bytes
+			// Use fuzz_u8() to get move coordinates (0-7 for chess board positions)
+			let from_row = trace.oracle().fuzz_u8().unwrap_or(1) % 8;
+			let from_col = trace.oracle().fuzz_u8().unwrap_or(0) % 8;
+			let to_row = trace.oracle().fuzz_u8().unwrap_or(2) % 8;
+			let to_col = trace.oracle().fuzz_u8().unwrap_or(0) % 8;
 
 			// Create move request
 			let move_req = ChessMoveRequest {
@@ -645,7 +646,7 @@ tb_scenario! {
 
 			// Send move request to server with current board state in matrix
 			let board_matrix = tightbeam::Asn1Matrix::from(&client_game_state);
-			// Convert Asn1Matrix to MatrixDyn (which implements MatrixLike)
+			// Convert Asn1Matrix to MatrixDyn (can fail with MatrixError)
 			let matrix_dyn = tightbeam::matrix::MatrixDyn::try_from(board_matrix)?;
 			let frame = compose! {
 				V0: id: "chess-client",

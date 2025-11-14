@@ -910,7 +910,7 @@ macro_rules! servlet {
 			let config_arc = ::std::sync::Arc::new($config);
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
+				handle: move |$msg: $crate::Frame| {
 					let config_arc = config_arc.clone();
 				async move {
 					let $config_param = &config_arc;

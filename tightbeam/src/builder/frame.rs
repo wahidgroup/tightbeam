@@ -10,7 +10,7 @@ use crate::der::oid::{AssociatedOid, ObjectIdentifier};
 use crate::der::Sequence;
 use crate::error::Result;
 use crate::error::{ExpectError, TightBeamError};
-use crate::matrix::{MatrixDyn, MatrixLike};
+use crate::matrix::{IntoMatrixDyn, MatrixDyn};
 use crate::{Frame, Message, Metadata, Version};
 
 #[cfg(feature = "aead")]
@@ -192,19 +192,14 @@ impl<T: Message> FrameBuilder<T> {
 	/// Set a custom reality (V2+ only)
 	pub fn with_matrix<M>(mut self, matrix: M) -> Self
 	where
-		M: MatrixLike,
-		MatrixDyn: TryFrom<M>,
-		<MatrixDyn as TryFrom<M>>::Error: Into<TightBeamError>,
+		M: IntoMatrixDyn,
 	{
-		// Handle Infallible errors (from TryFrom<T> for T) - these can never occur
-		match MatrixDyn::try_from(matrix) {
+		match matrix.into_matrix_dyn() {
 			Ok(matrix_dyn) => {
 				self.metadata_builder = self.metadata_builder.with_matrix(matrix_dyn);
 			}
 			Err(e) => {
-				// For Infallible, this branch is unreachable, but we need it for type checking
-				#[allow(unreachable_code)]
-				self.errors.push(e.into());
+				self.errors.push(TightBeamError::MatrixError(e));
 			}
 		}
 		self

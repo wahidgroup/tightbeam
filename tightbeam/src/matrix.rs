@@ -49,6 +49,30 @@ pub trait MatrixLike {
 	}
 }
 
+/// Trait for converting matrix types to MatrixDyn.
+/// This avoids the Infallible error type when MatrixDyn is converted to itself.
+pub trait IntoMatrixDyn {
+	fn into_matrix_dyn(self) -> Result<MatrixDyn, MatrixError>;
+}
+
+// Identity conversion for MatrixDyn (no error possible)
+impl IntoMatrixDyn for MatrixDyn {
+	fn into_matrix_dyn(self) -> Result<MatrixDyn, MatrixError> {
+		Ok(self)
+	}
+}
+
+// Conversion for other MatrixLike types via TryFrom
+impl<M> IntoMatrixDyn for M
+where
+	M: MatrixLike,
+	MatrixDyn: TryFrom<M, Error = MatrixError>,
+{
+	fn into_matrix_dyn(self) -> Result<MatrixDyn, MatrixError> {
+		MatrixDyn::try_from(self)
+	}
+}
+
 /// Runtime-sized N×N matrix of u8 flags (row-major).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixDyn {
