@@ -228,10 +228,10 @@ impl FdrTraceExt for ConsumedTrace {
 	fn to_process(&self) -> Process {
 		use state_labels::*;
 
-		let hidden = HashSet::new();
 		let mut states = HashSet::new();
 		let mut terminal = HashSet::new();
 		let mut observable = HashSet::new();
+		let hidden = HashSet::new();
 		let mut transitions = TransitionRelation::new();
 
 		// Define states: initial and terminal only (simple linear process)

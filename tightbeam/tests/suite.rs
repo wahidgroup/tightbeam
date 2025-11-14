@@ -20,6 +20,10 @@ mod transport;
 #[cfg(feature = "x509")]
 mod x509;
 
+// FDR refinement checking tests
+#[cfg(feature = "testing-fdr")]
+mod fdr;
+
 // DLT Network test
 // #[cfg(feature = "full")]
 // mod proof;
