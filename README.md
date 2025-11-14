@@ -248,6 +248,7 @@ pub trait SecurityProfile {
 	type DigestOid: AssociatedOid;
 	type AeadOid: AssociatedOid + AeadKeySize;
 	type SignatureAlg: SignatureAlgorithmIdentifier;
+	type CurveOid: AssociatedOid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier>;
 }
 ```

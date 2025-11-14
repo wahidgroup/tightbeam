@@ -15,6 +15,7 @@ words:
   - cfgs
   - ciphertext
   - ciphertexts
+  - congruential
   - crls
   - CSPM
   - CSPRNG
