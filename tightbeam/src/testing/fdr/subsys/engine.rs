@@ -42,6 +42,12 @@ where
 	refinement: R,
 
 	/// Memoization cache
+	/// 
+	/// Note: Currently unused. The `DefaultRefinementChecker` implements
+	/// `MemoizationCache` itself and maintains its own internal cache.
+	/// This field is kept for extensibility - custom refinement checkers
+	/// may use the shared cache instead of maintaining their own.
+	#[allow(dead_code)]
 	cache: M,
 
 	/// Verdict accumulator

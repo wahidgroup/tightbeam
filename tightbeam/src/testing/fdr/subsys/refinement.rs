@@ -35,6 +35,7 @@ impl<'a> DefaultRefinementChecker<'a> {
 		}
 	}
 
+
 	/// Get configuration
 	pub fn config(&self) -> &FdrConfig {
 		&self.config
