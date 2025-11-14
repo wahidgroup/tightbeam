@@ -248,6 +248,7 @@ pub trait SecurityProfile {
 	type DigestOid: AssociatedOid;
 	type AeadOid: AssociatedOid + AeadKeySize;
 	type SignatureAlg: SignatureAlgorithmIdentifier;
+	type CurveOid: AssociatedOid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier>;
 }
 ```
@@ -2345,7 +2346,9 @@ methodology from CSP theory. Enabled with `testing-fdr` feature flag.
 - **Divergence Freedom**: No internal-only loops exceeding threshold
 - **Determinism**: Branching only at declared nondeterministic states
 
-**Requirements**: Layer 3 REQUIRES Layer 2 (`csp:` field must be present).
+**Requirements**: Layer 3 requires `testing-fdr` feature flag. Refinement
+checking requires the `specs` field in `FdrConfig` to be populated with
+specification processes.
 
 #### 10.4.2 Specification: FdrConfig Syntax
 
@@ -2355,23 +2358,76 @@ fdr: FdrConfig {
 	max_depth: 128,          // Maximum trace depth
 	max_internal_run: 32,    // Divergence detection threshold
 	timeout_ms: 5000,        // Per-seed timeout
+	specs: vec![],           // Processes for refinement checking (empty = exploration mode)
+	fail_fast: true,         // Stop on first violation (default: true)
+	expect_failure: false,   // Expect refinement to fail (default: false)
 }
 ```
 
+**Configuration Parameters**:
+- `seeds`: Number of different scheduler strategies to explore
+- `max_depth`: Maximum length of observable trace
+- `max_internal_run`: Consecutive hidden events before divergence detection
+- `timeout_ms`: Timeout for each seed exploration
+- `specs`: Specification processes for refinement checking (empty vector = exploration mode)
+- `fail_fast`: Stop on first refinement violation (default: true)
+- `expect_failure`: Expect refinement to fail for negative tests (default: false)
+
+**Operational Modes**:
+- **Mode 1** (specs empty): Single-process exploration - verifies determinism, deadlock freedom, divergence freedom
+- **Mode 2** (specs provided): Refinement checking - verifies Spec ⊑ Impl (trace/failures/divergence refinement)
+
 #### 10.4.3 Implementation Examples
 
-**Basic Refinement Check**:
+**Simple Working Example**:
 ```rust
-tb_scenario! {
-	spec: MySpec,
-	csp: MyProcess,  // ← REQUIRED when using fdr:
-	fdr: FdrConfig {
-		seeds: 64,
-		max_depth: 128,
-		max_internal_run: 32,
-		timeout_ms: 5000,
+// Define a simple two-state process
+tb_process_spec! {
+	pub struct SimpleProcess;
+	events {
+		observable { "start", "finish" }
+		hidden { }
+	}
+	states {
+		Idle => { "start" => Working },
+		Working => { "finish" => Idle }
+	}
+	terminal { Idle }
+}
+
+// Define assertion spec
+tb_assert_spec! {
+	pub SimpleSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(Any, "start", exactly!(1)),
+			(Any, "finish", exactly!(1))
+		]
 	},
-	environment ServiceClient { ... }
+}
+
+// Test with refinement checking
+tb_scenario! {
+	name: test_simple_refinement,
+	spec: SimpleSpec,
+	fdr: FdrConfig {
+		seeds: 4,
+		max_depth: 10,
+		max_internal_run: 8,
+		timeout_ms: 500,
+		specs: vec![SimpleProcess::process()],
+		fail_fast: true,
+		expect_failure: false,
+	},
+	environment Bare {
+		exec: |trace| {
+			trace.event("start");
+			trace.event("finish");
+			Ok(())
+		}
+	}
 }
 ```
 
@@ -2388,6 +2444,11 @@ fdr: FdrConfig {
 }
 ```
 
+Higher seed counts increase confidence but also test execution time. Typical values:
+- **Development**: 16-32 seeds for quick feedback
+- **CI Pipeline**: 64-128 seeds for thorough verification
+- **Release**: 256+ seeds for critical protocols
+
 Each seed explores different interleaving at nondeterministic choice points,
 verifying trace refinement, failures refinement, and divergence freedom across
 all executions.
@@ -2398,31 +2459,52 @@ After multi-seed exploration, tightbeam produces a comprehensive verdict:
 
 ```rust
 pub struct FdrVerdict {
-	// Refinement properties
-	pub trace_refines: bool,           // Spec ⊑T Impl
-	pub failures_refines: bool,        // Spec ⊑F Impl
-	pub divergence_free: bool,         // No τ-loops detected
+	// Overall status
+	pub passed: bool,
 
-	// Determinism analysis
-	pub is_deterministic: bool,        // No nondeterminism witnesses
-	pub determinism_witness: Option<(Trace, Event)>,
+	// Single-process properties
+	pub divergence_free: bool,
+	pub deadlock_free: bool,
+	pub is_deterministic: bool,
 
-	// Divergence witness
-	pub divergence_witness: Option<Vec<Event>>,  // τ-loop if found
+	// Refinement properties (only when specs provided)
+	pub trace_refines: bool,
+	pub failures_refines: bool,
+	pub divergence_refines: bool,
+
+	// Witnesses to violations
+	pub trace_refinement_witness: Option<Trace>,
+	pub failures_refinement_witness: Option<Failure>,
+	pub divergence_refinement_witness: Option<Trace>,
+	pub determinism_witness: Option<(u64, Trace, Event)>,
+	pub divergence_witness: Option<(u64, Vec<Event>)>,
+	pub deadlock_witness: Option<(u64, Trace, State)>,
 
 	// Statistics
 	pub traces_explored: usize,
 	pub states_visited: usize,
 	pub seeds_completed: u32,
+	pub failing_seed: Option<u64>,
 }
 ```
 
 **Verdict Fields**:
-- **trace_refines**: All observed traces are permitted by specification
-- **failures_refines**: No invalid refusals detected at choice points
-- **divergence_free**: No infinite internal-only loops detected
-- **determinism_witness**: Evidence of unintended nondeterminism (if found)
-- **divergence_witness**: Internal event sequence causing livelock (if found)
+- **passed**: Overall pass/fail status
+- **divergence_free**: No infinite τ-loops detected
+- **deadlock_free**: No unexpected STOP states reached
+- **is_deterministic**: No nondeterminism witnesses found
+- **trace_refines**: traces(Impl) ⊆ traces(Spec) - only meaningful when specs provided
+- **failures_refines**: failures(Impl) ⊆ failures(Spec) - only meaningful when specs provided
+- **divergence_refines**: divergences(Impl) ⊆ divergences(Spec) - only meaningful when specs provided
+- **trace_refinement_witness**: Trace in Impl but not in Spec (if found)
+- **failures_refinement_witness**: (trace, refusal) in Impl but not in Spec (if found)
+- **divergence_refinement_witness**: Divergent trace in Impl but not in Spec (if found)
+- **determinism_witness**: (seed, trace, event) where different seeds diverge
+- **divergence_witness**: (seed, τ-loop sequence) if found
+- **deadlock_witness**: (seed, trace, state) if found
+- **failing_seed**: Seed that caused failure, if any
+
+**Note**: Refinement properties (trace_refines, failures_refines, divergence_refines) are only meaningful when specs are provided in FdrConfig.
 
 ### 10.5 Formal CSP Theory
 
@@ -2643,14 +2725,14 @@ CSP and FDR verification.
 
 ```rust
 tb_scenario! {
-	name: test_function_name,              // OPTIONAL: creates standalone #[test] function
-	spec: AssertSpecType,                  // REQUIRED: Layer 1 assertion spec
-	csp: ProcessSpecType,                  // OPTIONAL: Layer 2 CSP model (requires testing-csp)
-	fuzz: FuzzInputSpec,                   // OPTIONAL: input generator (requires csp + testing-csp)
-	fdr: FdrConfig { ... },                // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-	instrumentation: Config { ... },       // OPTIONAL: instrumentation config
-	environment <Variant> { ... },         // REQUIRED: execution environment
-	hooks { ... }                          // OPTIONAL: on_pass/on_fail callbacks
+	name: test_function_name,        // OPTIONAL: creates standalone #[test] function NOTE: Do NOT use with `fuzz: afl`
+	spec: AssertSpecType,            // REQUIRED: Layer 1 assertion spec
+	csp: ProcessSpecType,            // OPTIONAL: Layer 2 CSP model (requires testing-csp)
+	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
+	fdr: FdrConfig { ... },          // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
+	instrumentation: Config { ... }, // OPTIONAL: instrumentation config
+	environment <Variant> { ... },   // REQUIRED: execution environment
+	hooks { ... }                    // OPTIONAL: on_pass/on_fail callbacks
 }
 ```
 
@@ -2760,6 +2842,9 @@ tb_scenario! {
 		max_depth: 128,
 		max_internal_run: 32,
 		timeout_ms: 5000,
+		specs: vec![ClientServerProcess::process()],
+		fail_fast: true,
+		expect_failure: false,
 	},
 	environment ServiceClient {
 		worker_threads: 2,
@@ -2854,9 +2939,10 @@ tb_scenario! {
 ```
 
 **Feature Requirements**:
-- `testing-fuzz` feature flag
+- `testing-csp` feature flag (required for CSP oracle)
 - `cargo-afl` installed: `cargo install cargo-afl`
 - Fuzz targets gated by `#[cfg(fuzzing)]` to avoid compilation during normal tests
+- `std` feature flag (required for most fuzz targets)
 
 #### 10.7.2 Creating Fuzz Targets
 
@@ -2900,6 +2986,7 @@ tb_process_spec! {
 }
 
 // AFL fuzz target - compiled with `cargo afl build`
+// Note: AFL fuzz targets generate `fn main()` - do NOT include `name:` parameter
 #[cfg(fuzzing)]
 tb_scenario! {
 	fuzz: afl,
@@ -2931,10 +3018,17 @@ cargo install cargo-afl
 
 **Run AFL Fuzzer**:
 ```bash
+# Build fuzz targets first
+# Note: Some fuzz targets may require additional features
+RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing --features "std,testing-csp"
+
+# Create seed input directory
 mkdir -p fuzz_in
 echo "seed" > fuzz_in/seed.txt
 
-cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/deps/fuzzing-*
+# Run AFL fuzzer (find the actual binary name)
+FUZZ_TARGET=$(ls target/debug/deps/fuzzing-* 2>/dev/null | grep -v '\.d$' | head -1)
+cargo afl fuzz -i fuzz_in -o fuzz_out "$FUZZ_TARGET"
 ```
 
 #### 10.7.4 Advanced: CSP Oracle Integration
