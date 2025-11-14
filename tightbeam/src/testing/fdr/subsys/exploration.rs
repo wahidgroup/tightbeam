@@ -6,9 +6,9 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use crate::testing::fdr::config::{FdrConfig, Failure, RefusalSet, Trace};
+use crate::testing::fdr::config::{Failure, FdrConfig, RefusalSet, Trace};
 use crate::testing::fdr::explorer::{ExplorationCore, ExplorationState, SeedResult, SeededRng};
-use crate::testing::specs::csp::{Action, Process, State};
+use crate::testing::specs::csp::{Action, Event, Process, State};
 
 /// Default exploration engine implementation
 pub struct DefaultExplorationEngine<'a> {
@@ -25,12 +25,7 @@ pub struct DefaultExplorationEngine<'a> {
 impl<'a> DefaultExplorationEngine<'a> {
 	/// Create new exploration engine
 	pub fn new(process: &'a Process, config: FdrConfig) -> Self {
-		Self {
-			process,
-			config,
-			seed_results: Vec::new(),
-			visited_states: HashSet::new(),
-		}
+		Self { process, config, seed_results: Vec::new(), visited_states: HashSet::new() }
 	}
 
 	/// Get seed results (for use by FdrExplorer)
@@ -55,14 +50,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 	/// Explore single seed (different scheduling)
 	fn explore_seed_internal(&mut self, seed: u64) -> SeedResult {
-		let result = Self::explore_seed_core(
-			self.process,
-			&self.config,
-			seed,
-			|state| {
-				self.visited_states.insert(state);
-			},
-		);
+		let result = Self::explore_seed_core(self.process, &self.config, seed, |state| {
+			self.visited_states.insert(state);
+		});
 		result
 	}
 
@@ -71,14 +61,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 	#[cfg(feature = "rayon")]
 	pub fn explore_seed_static(process: &Process, config: &FdrConfig, seed: u64) -> (SeedResult, HashSet<State>) {
 		let mut visited_states = HashSet::new();
-		let result = Self::explore_seed_core(
-			process,
-			config,
-			seed,
-			|state| {
-				visited_states.insert(state);
-			},
-		);
+		let result = Self::explore_seed_core(process, config, seed, |state| {
+			visited_states.insert(state);
+		});
 		(result, visited_states)
 	}
 
@@ -109,7 +94,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 				}
 
 				// Record failure at depth limit
-				let refusals = compute_refusals(process, state.process_state);
+				let refusals = Self::compute_refusals_helper(process, state.process_state);
 				failures.push((state.trace.clone(), refusals));
 
 				continue;
@@ -142,15 +127,15 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 			// Record stable state refusals before taking action
 			if state.internal_run == 0 {
-				let refusals = compute_refusals(process, state.process_state);
+				let refusals = Self::compute_refusals_helper(process, state.process_state);
 				failures.push((state.trace.clone(), refusals));
 			}
 
 			// Select action using seeded RNG at choice points
-			let action = select_action(&mut rng, process, state.process_state, &actions);
+			let action = Self::select_action_helper(&mut rng, process, state.process_state, &actions);
 
 			// Execute transition
-			execute_transition(process, &state, action, &mut queue);
+			Self::execute_transition_helper(process, &state, action, &mut queue);
 		}
 
 		// Return success with longest trace found and collected failures
@@ -213,59 +198,80 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 	fn update_visited_states(&mut self, visited: &HashSet<State>) {
 		self.visited_states.extend(visited.iter().cloned());
 	}
-}
 
-/// Select action at a choice point using RNG
-pub(super) fn select_action<'b>(
-	rng: &mut SeededRng,
-	process: &'b Process,
-	process_state: State,
-	actions: &'b [Action],
-) -> &'b Action {
-	if process.choice.contains(&process_state) {
-		// Nondeterministic choice point: use RNG to select
-		rng.choose(actions).expect("actions not empty")
-	} else if actions.len() == 1 {
-		// Deterministic: only one choice
-		&actions[0]
-	} else {
-		// Multiple actions but not marked as choice state: use RNG anyway
-		rng.choose(actions).expect("actions not empty")
+	fn compute_refusals(&self, process: &Process, state: State) -> HashSet<Event> {
+		Self::compute_refusals_helper(process, state)
 	}
 }
 
-/// Execute transition and enqueue next states
-pub(super) fn execute_transition(
-	process: &Process,
-	state: &ExplorationState,
-	action: &Action,
-	queue: &mut VecDeque<ExplorationState>,
-) {
-	let next_states = process.step(state.process_state, &action.event);
-	for next_state in next_states {
-		let mut next_exploration = state.branch();
-		if process.hidden.contains(&action.event) {
-			// Hidden (τ) transition
-			next_exploration.record_hidden(action.event.clone(), next_state);
+impl<'a> DefaultExplorationEngine<'a> {
+	/// Compute refusal set at a given state
+	///
+	/// Refusal set = all observable events minus enabled observable events.
+	/// Hidden events (τ-transitions) are filtered out as they cannot be refused.
+	/// Reference: Roscoe (1998, 2010)
+	fn compute_refusals_helper(process: &Process, state: State) -> RefusalSet {
+		use std::collections::HashSet;
+		// Only consider observable events (filter out hidden τ-transitions)
+		let enabled_events: HashSet<_> = process
+			.enabled(state)
+			.iter()
+			.filter_map(|action| {
+				if !process.hidden.contains(&action.event) {
+					Some(action.event.clone())
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		// Refusal set = all observable events minus enabled observable events
+		process
+			.observable
+			.iter()
+			.cloned()
+			.filter(|event| !enabled_events.contains(event))
+			.collect()
+	}
+
+	/// Select action at a choice point using RNG
+	fn select_action_helper<'b>(
+		rng: &mut SeededRng,
+		process: &'b Process,
+		process_state: State,
+		actions: &'b [Action],
+	) -> &'b Action {
+		if process.choice.contains(&process_state) {
+			// Nondeterministic choice point: use RNG to select
+			rng.choose(actions).expect("actions not empty")
+		} else if actions.len() == 1 {
+			// Deterministic: only one choice
+			&actions[0]
 		} else {
-			// Observable transition
-			next_exploration.record_observable(action.event.clone(), next_state);
-		}
-
-		queue.push_back(next_exploration);
-	}
-}
-
-/// Compute refusal set at a given state
-pub(super) fn compute_refusals(process: &Process, state: State) -> RefusalSet {
-	let mut refusals = RefusalSet::new();
-
-	for event in &process.observable {
-		let enabled = process.enabled(state).iter().any(|action| &action.event == event);
-		if !enabled {
-			refusals.insert(event.clone());
+			// Multiple actions but not marked as choice state: use RNG anyway
+			rng.choose(actions).expect("actions not empty")
 		}
 	}
 
-	refusals
+	/// Execute transition and enqueue next states
+	fn execute_transition_helper(
+		process: &Process,
+		state: &ExplorationState,
+		action: &Action,
+		queue: &mut VecDeque<ExplorationState>,
+	) {
+		let next_states = process.step(state.process_state, &action.event);
+		for next_state in next_states {
+			let mut next_exploration = state.branch();
+			if process.hidden.contains(&action.event) {
+				// Hidden (τ) transition
+				next_exploration.record_hidden(action.event.clone(), next_state);
+			} else {
+				// Observable transition
+				next_exploration.record_observable(action.event.clone(), next_state);
+			}
+
+			queue.push_back(next_exploration);
+		}
+	}
 }

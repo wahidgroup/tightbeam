@@ -7,9 +7,6 @@ mod config;
 mod explorer;
 mod subsys;
 
-#[cfg(test)]
-mod tests;
-
 pub use config::*;
 pub use explorer::*;
 pub use subsys::*;

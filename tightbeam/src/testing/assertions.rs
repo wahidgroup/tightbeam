@@ -17,6 +17,8 @@ pub enum AssertionPhase {
 	HandlerEnd,
 	Gate,
 	Response,
+	/// Matches any phase - useful for FDR/CSP scenarios where lifecycle phase doesn't matter
+	Any,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -137,7 +139,18 @@ impl AssertionContract {
 	pub fn is_satisfied_by(&self, assertions: &[Assertion]) -> bool {
 		let matching: Vec<_> = assertions
 			.iter()
-			.filter(|a| a.phase == self.phase && a.label == self.label)
+			.filter(|a| {
+				// Match label first
+				if a.label != self.label {
+					return false;
+				}
+				// Phase matching: Any matches any phase, or exact match
+				match (self.phase, a.phase) {
+					(AssertionPhase::Any, _) => true,
+					(_, AssertionPhase::Any) => true,
+					_ => a.phase == self.phase,
+				}
+			})
 			.collect();
 
 		// Check cardinality

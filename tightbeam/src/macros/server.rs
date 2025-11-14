@@ -12,15 +12,19 @@ use std::sync::Arc;
 
 use crate::Frame;
 
-pub type HandlerFuture = Pin<Box<dyn Future<Output = Option<Frame>> + Send>>;
+pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Option<Frame>, crate::TightBeamError>> + Send>>;
 pub type SharedHandler = Arc<dyn Fn(Frame) -> HandlerFuture + Send + Sync>;
 
 pub fn into_shared_handler<F, Fut>(handler: F) -> SharedHandler
 where
-	F: Fn(Frame) -> Fut + Send + Sync + 'static,
-	Fut: Future<Output = Option<Frame>> + Send + 'static,
+	F: Fn(Frame) -> Fut + Send + Sync + Clone + 'static,
+	Fut: Future<Output = Result<Option<Frame>, crate::TightBeamError>> + Send + 'static,
 {
-	Arc::new(move |frame: Frame| -> HandlerFuture { Box::pin(handler(frame)) })
+	let handler = Arc::new(handler);
+	Arc::new(move |frame: Frame| -> HandlerFuture {
+		let handler = handler.clone();
+		Box::pin(async move { handler(frame).await })
+	})
 }
 
 #[cfg(feature = "tokio")]
@@ -32,6 +36,19 @@ macro_rules! __tightbeam_server_protocol_handle {
 			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
 			let __ok_tx = $crate::macros::server::server_runtime::rt::empty_ok_channel();
 			$crate::server!(@async_loop $protocol, __listener, $handler, __error_tx, __ok_tx,)
+		})
+	}};
+
+	($protocol:path, $listener:expr, assertions: $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
+		#[allow(unused_imports)]
+		use $crate::testing::trace::TraceCollector;
+
+		let __listener = $listener;
+		let __assertions = $assertions;
+		$crate::macros::server::server_runtime::rt::spawn(async move {
+			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
+			let __ok_tx = $crate::macros::server::server_runtime::rt::empty_ok_channel();
+			$crate::server!(@async_loop_assertions $protocol, __listener, __assertions, ($param1, $param2, $handler_body), __error_tx, __ok_tx,)
 		})
 	}};
 }
@@ -412,12 +429,18 @@ macro_rules! server {
 								}
 							};
 
-							// Process message asynchronously
-							let response = if status == $crate::policy::TransitStatus::Accepted {
-								(__handler_clone)(frame).await
-							} else {
-								None
-							};
+						// Process message asynchronously
+						let response = if status == $crate::policy::TransitStatus::Accepted {
+							match (__handler_clone)(frame).await {
+								Ok(opt) => opt,
+								Err(e) => {
+									eprintln!("Handler error: {:?}", e);
+									None
+								}
+							}
+						} else {
+							None
+						};
 
 							// Send response
 							match __transport.send_response(status, response).await {
@@ -453,6 +476,18 @@ macro_rules! server {
 		let __handler = $crate::macros::server::into_shared_handler($handler);
 
 		$crate::server!(@sync_loop_body $protocol, __listener, __handler, $($policy_name: [ $( $policy_expr ),* ]),*);
+	}};
+
+	(@async_loop_assertions $protocol:path, $listener:expr, $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr), $error_tx:expr, $ok_tx:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
+		#[allow(unused_imports)]
+		use $crate::testing::trace::TraceCollector;
+
+		let __handler_with_trace = move |$param1: $crate::Frame| {
+			let $param2: TraceCollector = $assertions.clone();
+			$handler_body
+		};
+
+		$crate::server!(@async_loop $protocol, $listener, __handler_with_trace, $error_tx, $ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*);
 	}};
 
 	(@async_loop $protocol:path, $listener:expr, $handler:expr, $error_tx:expr, $ok_tx:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
@@ -502,29 +537,12 @@ macro_rules! server {
 		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, $handler)
 	}};
 
-	(protocol $protocol:path: $listener:expr, assertions: $assertions:expr, handle: $handler:expr) => {{
-		#[allow(unused_imports)]
-		use $crate::testing::trace::TraceCollector;
+	(protocol $protocol:path: $listener:expr, assertions: $assertions:expr, handle: move |$param1:ident, $param2:ident| $handler_body:expr) => {{
+		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, assertions: $assertions, ($param1, $param2, $handler_body))
+	}};
 
-		let __assertions_clone = $assertions.clone();
-
-		// Helper function to enable type inference
-		fn __make_handler<F, Fut>(
-			assertions: TraceCollector,
-			handler: F,
-		) -> impl Fn($crate::Frame) -> Fut
-		where
-			F: Fn($crate::Frame, TraceCollector) -> Fut + Clone,
-			Fut: core::future::Future<Output = Option<$crate::Frame>>,
-		{
-			move |frame| {
-				let assertions = assertions.clone();
-				handler(frame, assertions)
-			}
-		}
-
-		let __wrapped = __make_handler(__assertions_clone, $handler);
-		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, __wrapped)
+	(protocol $protocol:path: $listener:expr, assertions: $assertions:expr, handle: |$param1:ident, $param2:ident| $handler_body:expr) => {{
+		$crate::__tightbeam_server_protocol_handle!($protocol, $listener, assertions: $assertions, ($param1, $param2, $handler_body))
 	}};
 
 	(protocol $protocol:path: bind $addr:expr, handle: $handler:expr) => {{

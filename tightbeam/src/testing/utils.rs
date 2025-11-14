@@ -1532,7 +1532,7 @@ mod tests {
 		},
 		service: |message, tx| async move {
 			let _ = tx.send(::std::sync::Arc::new(message.clone()));
-			Some(create_v0_tightbeam(Some("OK"), Some(str::from_utf8(&message.metadata.id).ok()?)))
+			Ok(Some(create_v0_tightbeam(Some("OK"), Some(str::from_utf8(&message.metadata.id).map_err(|_| crate::TightBeamError::InvalidBody)?))))
 		},
 		container: |client, channels| async move {
 			use crate::transport::MessageEmitter;

@@ -11,3 +11,6 @@ pub mod complex_workflow;
 
 #[cfg(fuzzing)]
 pub mod verification;
+
+#[cfg(fuzzing)]
+pub mod chess_engine;

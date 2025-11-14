@@ -196,14 +196,23 @@ impl<T: Message> FrameBuilder<T> {
 		MatrixDyn: TryFrom<M>,
 		<MatrixDyn as TryFrom<M>>::Error: Into<TightBeamError>,
 	{
+		// Handle Infallible errors (from TryFrom<T> for T) - these can never occur
 		match MatrixDyn::try_from(matrix) {
 			Ok(matrix_dyn) => {
 				self.metadata_builder = self.metadata_builder.with_matrix(matrix_dyn);
 			}
 			Err(e) => {
+				// For Infallible, this branch is unreachable, but we need it for type checking
+				#[allow(unreachable_code)]
 				self.errors.push(e.into());
 			}
 		}
+		self
+	}
+
+	/// Set a custom reality (V2+ only) - convenience method for MatrixDyn
+	pub fn with_matrix_dyn(mut self, matrix: MatrixDyn) -> Self {
+		self.metadata_builder = self.metadata_builder.with_matrix(matrix);
 		self
 	}
 

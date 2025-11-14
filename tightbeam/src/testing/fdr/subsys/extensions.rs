@@ -1,10 +1,11 @@
 //! Extension Trait for ConsumedTrace with FDR Analysis
 //!
-//! Provides CSP-specific analysis capabilities for execution traces.
-
-use std::io::Write;
+//! Provides FDR-specific analysis capabilities for execution traces.
+//! This module is FDR-specific: trace-to-process conversion is used for refinement checking
+//! (comparing trace_process ⊑ spec_process), not for general CSP validation.
 
 use std::collections::HashSet;
+use std::io::Write;
 
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{AssertionLabel, AssertionPhase};
@@ -19,6 +20,34 @@ mod state_labels {
 	pub const HANDLER: &str = "handler";
 	pub const GATE_REJECT: &str = "gate_reject";
 	pub const TERMINAL: &str = "terminal";
+}
+
+/// Mode for converting trace to CSP process (FDR-specific)
+///
+/// Controls which events are included when converting a `ConsumedTrace` to a
+/// `Process` for FDR refinement checking. This is distinct from
+/// `InstrumentationMode` which controls runtime capture; this controls
+/// post-processing selection.
+///
+/// Note: Requires `enable_internal_detail: true` in
+/// `InstrumentationMode::Custom` to capture hidden events for
+/// `FullInstrumentation` mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceProcessMode {
+	/// Only include assertion events (default, backward compatible)
+	AssertionsOnly,
+	/// Include assertions + observable instrumentation events
+	///
+	/// Observable events: GateAccept, GateReject, RequestRecv, ResponseSend, AssertLabel
+	/// Useful when your CSP spec models the full protocol flow including gate decisions
+	#[cfg(feature = "instrument")]
+	WithObservableInstrumentation,
+	/// Include all events: assertions + observable + hidden instrumentation
+	///
+	/// Hidden events: HandlerEnter, HandlerExit, CryptoStep, CompressStep, RouteStep, PolicyEval
+	/// Requires `enable_internal_detail: true` in instrumentation config
+	#[cfg(feature = "instrument")]
+	FullInstrumentation,
 }
 
 /// Extension trait for ConsumedTrace with FDR analysis
@@ -50,7 +79,21 @@ pub trait FdrTraceExt {
 	fn export_cspm<W: Write>(&self, writer: &mut W) -> std::io::Result<()>;
 
 	/// Convert ConsumedTrace to CSP Process for FDR refinement checking
-	fn to_process(&self) -> Process;
+	///
+	/// Creates a linear process model representing the execution trace. This is used for
+	/// refinement checking: `trace_process ⊑ spec_process`.
+	///
+	/// By default, only includes assertion events. Use `to_process_with_mode()` to include
+	/// instrumentation events (requires `instrument` feature).
+	fn to_process(&self) -> Process {
+		self.to_process_with_mode(TraceProcessMode::AssertionsOnly)
+	}
+
+	/// Convert ConsumedTrace to CSP Process with specified event inclusion mode
+	///
+	/// See `TraceProcessMode` for available modes. Note that `FullInstrumentation` requires
+	/// `enable_internal_detail: true` in the instrumentation configuration.
+	fn to_process_with_mode(&self, mode: TraceProcessMode) -> Process;
 }
 
 impl FdrTraceExt for ConsumedTrace {
@@ -221,20 +264,129 @@ impl FdrTraceExt for ConsumedTrace {
 
 	/// Convert ConsumedTrace to CSP Process for FDR refinement checking
 	///
-	/// Creates a linear process model representing the execution trace:
-	/// - Only includes observable assertion events (skips instrumentation/protocol events)
-	/// - Creates a strictly linear, acyclic chain to avoid infinite BFS exploration
-	/// - The trace process represents a single execution path
-	fn to_process(&self) -> Process {
+	/// Creates a linear process model representing the execution trace.
+	/// Creates a strictly linear, acyclic chain to avoid infinite BFS exploration.
+	/// The trace process represents a single execution path.
+	fn to_process_with_mode(&self, mode: TraceProcessMode) -> Process {
 		use state_labels::*;
+
+		// Macro to generate const array of intermediate state names
+		// (State uses &'static str, so we need compile-time string literals)
+		macro_rules! generate_intermediate_states {
+			() => {
+				&[
+					"assertion_1",
+					"assertion_2",
+					"assertion_3",
+					"assertion_4",
+					"assertion_5",
+					"assertion_6",
+					"assertion_7",
+					"assertion_8",
+					"assertion_9",
+					"assertion_10",
+					"assertion_11",
+					"assertion_12",
+					"assertion_13",
+					"assertion_14",
+					"assertion_15",
+					"assertion_16",
+					"assertion_17",
+					"assertion_18",
+					"assertion_19",
+					"assertion_20",
+					"assertion_21",
+					"assertion_22",
+					"assertion_23",
+					"assertion_24",
+					"assertion_25",
+					"assertion_26",
+					"assertion_27",
+					"assertion_28",
+					"assertion_29",
+					"assertion_30",
+					"assertion_31",
+					"assertion_32",
+					"assertion_33",
+					"assertion_34",
+					"assertion_35",
+					"assertion_36",
+					"assertion_37",
+					"assertion_38",
+					"assertion_39",
+					"assertion_40",
+					"assertion_41",
+					"assertion_42",
+					"assertion_43",
+					"assertion_44",
+					"assertion_45",
+					"assertion_46",
+					"assertion_47",
+					"assertion_48",
+					"assertion_49",
+					"assertion_50",
+					"assertion_51",
+					"assertion_52",
+					"assertion_53",
+					"assertion_54",
+					"assertion_55",
+					"assertion_56",
+					"assertion_57",
+					"assertion_58",
+					"assertion_59",
+					"assertion_60",
+					"assertion_61",
+					"assertion_62",
+					"assertion_63",
+					"assertion_64",
+					"assertion_65",
+					"assertion_66",
+					"assertion_67",
+					"assertion_68",
+					"assertion_69",
+					"assertion_70",
+					"assertion_71",
+					"assertion_72",
+					"assertion_73",
+					"assertion_74",
+					"assertion_75",
+					"assertion_76",
+					"assertion_77",
+					"assertion_78",
+					"assertion_79",
+					"assertion_80",
+					"assertion_81",
+					"assertion_82",
+					"assertion_83",
+					"assertion_84",
+					"assertion_85",
+					"assertion_86",
+					"assertion_87",
+					"assertion_88",
+					"assertion_89",
+					"assertion_90",
+					"assertion_91",
+					"assertion_92",
+					"assertion_93",
+					"assertion_94",
+					"assertion_95",
+					"assertion_96",
+					"assertion_97",
+					"assertion_98",
+					"assertion_99",
+					"assertion_100",
+				]
+			};
+		}
+
+		const INTERMEDIATE_STATES: &[&str] = generate_intermediate_states!();
 
 		let mut states = HashSet::new();
 		let mut terminal = HashSet::new();
 		let mut observable = HashSet::new();
-		let hidden = HashSet::new();
+		let mut hidden = HashSet::new();
 		let mut transitions = TransitionRelation::new();
 
-		// Define states: initial and terminal only (simple linear process)
 		let s_initial = State(INITIAL);
 		let s_terminal = State(TERMINAL);
 
@@ -242,45 +394,161 @@ impl FdrTraceExt for ConsumedTrace {
 		states.insert(s_terminal.clone());
 		terminal.insert(s_terminal.clone());
 
-		// Build transitions based on assertion events only
-		// Skip all instrumentation/protocol events (request, handler_enter, handler_exit, response, etc.)
-		// as they're not part of the spec and cause refinement failures
-		if !self.assertions.is_empty() {
-			// Create a linear chain of assertion events only
-			let mut from_state = s_initial.clone();
-			for (idx, assertion) in self.assertions.iter().enumerate() {
-				let AssertionLabel::Custom(label) = &assertion.label;
-				let event = Event(*label);
-				observable.insert(event.clone());
+		// Collect events based on mode
+		#[derive(Clone)]
+		enum TraceEvent {
+			Assertion {
+				seq: usize,
+				label: &'static str,
+			},
+			#[cfg(feature = "instrument")]
+			ObservableInstrumentation {
+				seq: u32,
+				label: String,
+			},
+			#[cfg(feature = "instrument")]
+			HiddenInstrumentation {
+				seq: u32,
+				label: String,
+			},
+		}
 
-				if idx == self.assertions.len() - 1 {
-					// Last assertion: go directly to terminal
-					transitions.add(from_state.clone(), event, s_terminal.clone());
-				} else {
-					// Intermediate assertion: create unique intermediate state
-					// Use index-based naming to ensure uniqueness and avoid cycles
-					// For small traces, we use predefined labels
-					// For larger traces, we'd need a different approach, but for now
-					// this should handle most test cases
-					let to_state = if idx == 0 {
-						State("assertion_1")
-					} else if idx == 1 {
-						State("assertion_2")
-					} else if idx == 2 {
-						State("assertion_3")
-					} else {
-						// For more than 3 assertions, we need a better approach
-						// But for now, this should handle most test cases
-						State("assertion_mid")
-					};
-					states.insert(to_state.clone());
-					transitions.add(from_state.clone(), event, to_state.clone());
-					from_state = to_state;
+		let mut events: Vec<TraceEvent> = Vec::new();
+
+		// Always include assertions
+		for assertion in &self.assertions {
+			let AssertionLabel::Custom(label) = &assertion.label;
+			events.push(TraceEvent::Assertion { seq: assertion.seq, label: *label });
+		}
+
+		// Include instrumentation events based on mode
+		#[cfg(feature = "instrument")]
+		{
+			use crate::instrumentation::TbEventKind;
+
+			match mode {
+				TraceProcessMode::AssertionsOnly => {
+					// No instrumentation events
+				}
+				TraceProcessMode::WithObservableInstrumentation | TraceProcessMode::FullInstrumentation => {
+					// Include observable instrumentation events
+					for event in &self.instrument_events {
+						if matches!(
+							event.kind,
+							TbEventKind::GateAccept
+								| TbEventKind::GateReject
+								| TbEventKind::RequestRecv
+								| TbEventKind::ResponseSend
+								| TbEventKind::AssertLabel
+						) {
+							if let Some(label) = &event.label {
+								events.push(TraceEvent::ObservableInstrumentation {
+									seq: event.seq,
+									label: label.clone(),
+								});
+							}
+						}
+					}
+				}
+			}
+
+			if matches!(mode, TraceProcessMode::FullInstrumentation) {
+				// Include hidden instrumentation events
+				for event in &self.instrument_events {
+					if matches!(
+						event.kind,
+						TbEventKind::HandlerEnter
+							| TbEventKind::HandlerExit
+							| TbEventKind::CryptoStep
+							| TbEventKind::CompressStep
+							| TbEventKind::RouteStep
+							| TbEventKind::PolicyEval
+							| TbEventKind::ProcessHidden
+					) {
+						if let Some(label) = &event.label {
+							events.push(TraceEvent::HiddenInstrumentation { seq: event.seq, label: label.clone() });
+						}
+					}
 				}
 			}
 		}
-		// If no assertions, the process is just initial -> terminal with no events
+
+		// Sort events by sequence number to preserve execution order
+		events.sort_by(|a, b| {
+			let seq_a = match a {
+				TraceEvent::Assertion { seq, .. } => *seq as u64,
+				#[cfg(feature = "instrument")]
+				TraceEvent::ObservableInstrumentation { seq, .. } | TraceEvent::HiddenInstrumentation { seq, .. } => *seq as u64,
+			};
+			let seq_b = match b {
+				TraceEvent::Assertion { seq, .. } => *seq as u64,
+				#[cfg(feature = "instrument")]
+				TraceEvent::ObservableInstrumentation { seq, .. } | TraceEvent::HiddenInstrumentation { seq, .. } => *seq as u64,
+			};
+			seq_a.cmp(&seq_b)
+		});
+
+		// Build transitions from sorted events
+		if !events.is_empty() {
+			if events.len() > 100 {
+				panic!(
+					"Trace too long: {} events (max 100 supported for unique state names)",
+					events.len()
+				);
+			}
+
+			let mut from_state = s_initial.clone();
+			for (idx, event) in events.iter().enumerate() {
+				let (event, is_hidden) = match event {
+					TraceEvent::Assertion { label, .. } => (Event(*label), false),
+					#[cfg(feature = "instrument")]
+					TraceEvent::ObservableInstrumentation { label, .. } => {
+						let static_label: &'static str = Box::leak(label.clone().into_boxed_str());
+						(Event(static_label), false)
+					}
+					#[cfg(feature = "instrument")]
+					TraceEvent::HiddenInstrumentation { label, .. } => {
+						let static_label: &'static str = Box::leak(label.clone().into_boxed_str());
+						(Event(static_label), true)
+					}
+				};
+
+				// Add to appropriate alphabet
+				if is_hidden {
+					hidden.insert(event.clone());
+				} else {
+					observable.insert(event.clone());
+				}
+
+				// Add transition: last event goes to terminal, others use intermediate states
+				let to_state = if idx == events.len() - 1 {
+					s_terminal.clone()
+				} else {
+					let state_name = INTERMEDIATE_STATES[idx];
+					let to_state = State(state_name);
+					states.insert(to_state.clone());
+					to_state
+				};
+
+				transitions.add(from_state.clone(), event, to_state.clone());
+				from_state = to_state;
+			}
+		}
+
+		// If no events, the process is just initial -> terminal with no events
 		// This represents SKIP/STOP - a process that can do nothing
+
+		let description = match mode {
+			TraceProcessMode::AssertionsOnly => "Process derived from ConsumedTrace (assertion events only)",
+			#[cfg(feature = "instrument")]
+			TraceProcessMode::WithObservableInstrumentation => {
+				"Process derived from ConsumedTrace (assertions + observable instrumentation)"
+			}
+			#[cfg(feature = "instrument")]
+			TraceProcessMode::FullInstrumentation => {
+				"Process derived from ConsumedTrace (all events including hidden instrumentation)"
+			}
+		};
 
 		Process {
 			name: "TraceProcess",
@@ -291,14 +559,26 @@ impl FdrTraceExt for ConsumedTrace {
 			observable,
 			hidden,
 			transitions,
-			description: Some("Process derived from ConsumedTrace (assertion events only)"),
+			description: Some(description),
 		}
 	}
 }
 
+// Convenience implementation on ConsumedTrace for FDR refinement checking
 impl ConsumedTrace {
 	/// Convert this trace to a CSP Process for FDR refinement checking
+	///
+	/// This is a convenience wrapper around `FdrTraceExt::to_process()`.
+	/// See `FdrTraceExt` trait for details.
 	pub fn to_process(&self) -> Process {
 		<Self as FdrTraceExt>::to_process(self)
+	}
+
+	/// Convert this trace to a CSP Process with specified event inclusion mode
+	///
+	/// This is a convenience wrapper around `FdrTraceExt::to_process_with_mode()`.
+	/// See `FdrTraceExt` trait for details.
+	pub fn to_process_with_mode(&self, mode: TraceProcessMode) -> Process {
+		<Self as FdrTraceExt>::to_process_with_mode(self, mode)
 	}
 }

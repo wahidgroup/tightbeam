@@ -48,7 +48,7 @@ tb_scenario! {
 				protocol TokioListener: listener,
 				assertions: trace,
 				handle: |frame, _trace| async move {
-					Some(frame)
+					Ok(Some(frame))
 				}
 			};
 			Ok((handle, addr))

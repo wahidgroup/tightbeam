@@ -904,9 +904,9 @@ macro_rules! drone {
 				policies: { $($policy_key: $policy_val),+ },
 				handle: move |frame: $crate::Frame| {
 					let active_servlet = $active_servlet.clone();
-					async move {
-						drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_type),*)
-					}
+				async move {
+					drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_type),*)
+				}
 				}
 			}
 		}
@@ -919,9 +919,9 @@ macro_rules! drone {
 				protocol $protocol: $listener,
 				handle: move |frame: $crate::Frame| {
 					let active_servlet = $active_servlet.clone();
-					async move {
-						drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_type),*)
-					}
+				async move {
+					drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_type),*)
+				}
 				}
 			}
 		}
@@ -935,9 +935,9 @@ macro_rules! drone {
 				policies: { $($policy_key: $policy_val),+ },
 				handle: move |frame: $crate::Frame| {
 					let servlets = $servlets.clone();
-					async move {
-						drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_type),*)
-					}
+				async move {
+					drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_type),*)
+				}
 				}
 			}
 		}
@@ -950,9 +950,9 @@ macro_rules! drone {
 				protocol $protocol: $listener,
 				handle: move |frame: $crate::Frame| {
 					let servlets = $servlets.clone();
-					async move {
-						drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_type),*)
-					}
+				async move {
+					drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_type),*)
+				}
 				}
 			}
 		}
@@ -995,43 +995,43 @@ macro_rules! drone {
 									stop_old_servlet(old_servlet);
 
 									// Return success response with servlet address
-									return $crate::compose! {
+									return Ok(Some($crate::compose! {
 										V0: id: $frame.metadata.id.clone(),
 											message: $crate::colony::drone::ActivateServletResponse {
 												status: $crate::policy::TransitStatus::Accepted,
 												servlet_address: Some(addr_bytes)
 											}
-									}.ok();
+									}?));
 								}
 								Err(_) => {
 									// Return error response
-									return $crate::compose! {
+									return Ok(Some($crate::compose! {
 										V0: id: $frame.metadata.id.clone(),
 											message: $crate::colony::drone::ActivateServletResponse {
 												status: $crate::policy::TransitStatus::Forbidden,
 												servlet_address: None
 											}
-									}.ok();
+									}?));
 								}
 							}
 						}
 					)*
 
 					// Unknown servlet ID - return error
-					return $crate::compose! {
+					return Ok(Some($crate::compose! {
 						V0: id: $frame.metadata.id.clone(),
 							message: $crate::colony::drone::ActivateServletResponse {
 								status: $crate::policy::TransitStatus::Forbidden,
 								servlet_address: None
 							}
-					}.ok();
+					}?));
 				}
 
 				// Not an activation request - check if there's an active servlet to handle it
 				// Note: Servlets don't have a handle() method we can call directly
 				// This is a design limitation - servlets run their own servers
 				// For now, return None to indicate the message wasn't handled
-				None
+				Ok(None)
 			}
 		}
 	};
@@ -1066,7 +1066,7 @@ macro_rules! drone {
 										servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
 										drop(servlets);
 
-										return $crate::compose! {
+										return Ok(Some($crate::compose! {
 											V0: id: $frame.metadata.id.clone(),
 												message: $crate::colony::drone::HiveManagementResponse {
 													spawn: Some($crate::colony::drone::SpawnServletResult {
@@ -1077,10 +1077,10 @@ macro_rules! drone {
 													list: None,
 													stop: None,
 												}
-										}.ok();
+										}?));
 									}
 									Err(_) => {
-										return $crate::compose! {
+										return Ok(Some($crate::compose! {
 											V0: id: $frame.metadata.id.clone(),
 												message: $crate::colony::drone::HiveManagementResponse {
 													spawn: Some($crate::colony::drone::SpawnServletResult {
@@ -1091,14 +1091,14 @@ macro_rules! drone {
 													list: None,
 													stop: None,
 												}
-										}.ok();
+										}?));
 									}
 								}
 							}
 						)*
 
 						// Unknown servlet type
-						return $crate::compose! {
+						return Ok(Some($crate::compose! {
 							V0: id: $frame.metadata.id.clone(),
 								message: $crate::colony::drone::HiveManagementResponse {
 									spawn: Some($crate::colony::drone::SpawnServletResult {
@@ -1109,7 +1109,7 @@ macro_rules! drone {
 									list: None,
 									stop: None,
 								}
-						}.ok();
+						}?));
 					}
 
 					// Handle list request
@@ -1131,7 +1131,7 @@ macro_rules! drone {
 						}
 						drop(servlets);
 
-						return $crate::compose! {
+						return Ok(Some($crate::compose! {
 							V0: id: $frame.metadata.id.clone(),
 								message: $crate::colony::drone::HiveManagementResponse {
 									spawn: None,
@@ -1141,7 +1141,7 @@ macro_rules! drone {
 									}),
 									stop: None,
 								}
-						}.ok();
+						}?));
 					}
 
 					// Handle stop request
@@ -1157,7 +1157,7 @@ macro_rules! drone {
 							}
 							drop(servlets);
 
-							return $crate::compose! {
+							return Ok(Some($crate::compose! {
 								V0: id: $frame.metadata.id.clone(),
 									message: $crate::colony::drone::HiveManagementResponse {
 										spawn: None,
@@ -1166,11 +1166,11 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Accepted
 										}),
 									}
-							}.ok();
+							}?));
 						} else {
 							drop(servlets);
 
-							return $crate::compose! {
+							return Ok(Some($crate::compose! {
 								V0: id: $frame.metadata.id.clone(),
 									message: $crate::colony::drone::HiveManagementResponse {
 										spawn: None,
@@ -1179,13 +1179,13 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Forbidden
 										}),
 									}
-							}.ok();
+							}?));
 						}
 					}
 				}
 
 				// Unknown message type
-				None
+				Ok(None)
 			}
 		}
 	};
@@ -1378,11 +1378,11 @@ mod tests {
 			with_collector_gate: [crate::policy::AcceptAllGate]
 		},
 		handle: |message| async move {
-			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
+			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			if decoded.content == "PING" {
-				DroneResponseJob::run(message.metadata.id.clone(), "PONG".to_string()).ok()
+				Ok(Some(DroneResponseJob::run(message.metadata.id.clone(), "PONG".to_string())?))
 			} else {
-				None
+				Ok(None)
 			}
 		}
 	}
@@ -1397,11 +1397,11 @@ mod tests {
 			threshold: u32,
 		},
 		handle: |message, config| async move {
-			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
+			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			if decoded.value >= config.threshold {
-				DroneResponseJob::run(message.metadata.id.clone(), "ACCEPTED".to_string()).ok()
+				Ok(Some(DroneResponseJob::run(message.metadata.id.clone(), "ACCEPTED".to_string())?))
 			} else {
-				None
+				Ok(None)
 			}
 		}
 	}
@@ -1422,7 +1422,7 @@ mod tests {
 			})
 		},
 		handle: |message, _config, workers| async move {
-			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
+			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 
 			#[cfg(feature = "tokio")]
 			let (echo_result, check_result) = tokio::join!(
@@ -1439,15 +1439,15 @@ mod tests {
 
 			let echo_msg = match echo_result {
 				Ok(msg) => msg,
-				Err(_) => return None,
+				Err(_) => return Ok(None),
 			};
 
 			let is_valid = match check_result {
 				Ok(valid) => valid,
-				Err(_) => return None,
+				Err(_) => return Ok(None),
 			};
 
-			if is_valid {
+			Ok(if is_valid {
 				DroneResponseWithOrderJob::run(
 					message.metadata.id.clone(),
 					1_700_000_000u64,
@@ -1455,7 +1455,7 @@ mod tests {
 				).ok()
 			} else {
 				None
-			}
+			})
 		}
 	}
 
@@ -1555,11 +1555,11 @@ mod tests {
 			with_collector_gate: [crate::policy::AcceptAllGate]
 		},
 		handle: |message| async move {
-			let decoded: DroneTestMessage = crate::decode(&message.message).ok()?;
-			DroneResponseJob::run(
+			let decoded: DroneTestMessage = crate::decode(&message.message)?;
+			Ok(Some(DroneResponseJob::run(
 				message.metadata.id.clone(),
 				format!("ECHO: {}", decoded.content)
-			).ok()
+			)?))
 		}
 	}
 

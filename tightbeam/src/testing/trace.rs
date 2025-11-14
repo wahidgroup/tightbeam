@@ -69,6 +69,15 @@ impl TraceCollector {
 		self.assert_with_payload(phase, label, None);
 	}
 
+	/// Record an assertion without caring about phase (convenience for FDR/CSP scenarios)
+	///
+	/// This is a convenience method for scenarios where the lifecycle phase doesn't matter,
+	/// such as FDR refinement checking or CSP process modeling. It uses `AssertionPhase::Any`
+	/// which matches any phase during validation.
+	pub fn event(&self, label: &str) {
+		self.assert(AssertionPhase::Any, label);
+	}
+
 	/// Record an assertion with a value for equality checking
 	pub fn assert_value<V: Into<AssertionValue>>(&self, phase: AssertionPhase, label: &str, value: V) {
 		let seq = self.assertions.lock().map(|a| a.len()).unwrap_or(0);

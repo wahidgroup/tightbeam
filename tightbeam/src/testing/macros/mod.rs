@@ -429,6 +429,7 @@ impl BuiltAssertSpec {
 				AssertionPhase::HandlerEnd => 1u8,
 				AssertionPhase::Gate => 2u8,
 				AssertionPhase::Response => 3u8,
+				AssertionPhase::Any => 4u8,
 			};
 			let AssertionLabel::Custom(lbl) = c.label;
 			norm.push((
@@ -786,18 +787,24 @@ macro_rules! __tb_scenario_verify_impl {
 
 		// FDR validation if provided
 		#[cfg(feature = "testing-fdr")]
-		let fdr_result: Option<$crate::testing::fdr::FdrVerdict> = {
-			$crate::tb_scenario!(@fdr_validate $trace, $($fdr_config)?)
+		let (fdr_result, fdr_config): (Option<$crate::testing::fdr::FdrVerdict>, Option<$crate::testing::fdr::FdrConfig>) = {
+			$crate::tb_scenario!(@fdr_validate_with_config $trace, $($fdr_config)?)
 		};
 
 		#[cfg(not(feature = "testing-fdr"))]
-		let fdr_result: Option<$crate::testing::fdr::FdrVerdict> = None;
+		let (fdr_result, fdr_config): (Option<$crate::testing::fdr::FdrVerdict>, Option<$crate::testing::fdr::FdrConfig>) = (None, None);
 
 		// Check if FDR validation failed
 		#[cfg(feature = "testing-fdr")]
 		let fdr_failed = fdr_result.as_ref().map(|v| !v.passed).unwrap_or(false);
 		#[cfg(not(feature = "testing-fdr"))]
 		let fdr_failed = false;
+
+		// Check if FDR failure is expected (for negative tests)
+		#[cfg(feature = "testing-fdr")]
+		let expect_failure = fdr_config.as_ref().map(|c| c.expect_failure).unwrap_or(false);
+		#[cfg(not(feature = "testing-fdr"))]
+		let expect_failure = false;
 
 		match &verification_result {
 			Ok(()) => {
@@ -807,11 +814,21 @@ macro_rules! __tb_scenario_verify_impl {
 				}
 
 				if fdr_failed {
-					// Compile full FDR report, then panic
-					// Note: on_fail hook signature expects SpecViolation, not FdrVerdict
-					// For FDR analysis, users can inspect the panic message or add FDR-specific hooks
-					let verdict = fdr_result.as_ref().unwrap();
-					panic!("Layer 1 (assertions) passed but Layer 3 (FDR) failed: {:?}", verdict);
+					// Check if failure is expected (for negative tests)
+					if expect_failure {
+						// Failure is expected - test passes
+						// Verify that we have a witness to prove the failure
+						let verdict = fdr_result.as_ref().unwrap();
+						if !verdict.trace_refines && verdict.trace_refinement_witness.is_some() {
+							// Expected failure confirmed - test passes
+						} else {
+							panic!("Expected FDR failure but verdict doesn't show refinement failure: {:?}", verdict);
+						}
+					} else {
+						// Failure is unexpected - test fails
+						let verdict = fdr_result.as_ref().unwrap();
+						panic!("Layer 1 (assertions) passed but Layer 3 (FDR) failed: {:?}", verdict);
+					}
 				}
 
 				$( $( {
@@ -2890,6 +2907,29 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== FDR validation helper =====
+	(@fdr_validate_with_config $trace:expr, $fdr_config:expr) => {{
+		#[cfg(feature = "testing-fdr")]
+		{
+			use $crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+
+			let config: FdrConfig = $fdr_config;
+			let trace_process = $trace.to_process();
+
+			// FdrExplorer checks: config.specs ⊑ process (spec ⊑ impl)
+			// We want to check: spec_process ⊑ trace_process
+			// So we set trace_process as the main process and config.specs as the spec
+			// The config.specs should already contain the specification processes
+			let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, config.clone());
+			(Some(explorer.explore()), Some(config))
+		}
+		#[cfg(not(feature = "testing-fdr"))]
+		{
+			compile_error!("FDR validation requires testing-fdr feature");
+		}
+	}};
+	(@fdr_validate_with_config $trace:expr,) => {{
+		(None::<$crate::testing::fdr::FdrVerdict>, None::<$crate::testing::fdr::FdrConfig>)
+	}};
 	(@fdr_validate $trace:expr, $fdr_config:expr) => {{
 		#[cfg(feature = "testing-fdr")]
 		{
@@ -3129,7 +3169,7 @@ mod tests {
 						trace.assert(AssertionPhase::HandlerStart, "Received");
 						trace.assert(AssertionPhase::Response, "Responded");
 						trace.assert(AssertionPhase::Response, "Responded");
-						Some(frame)
+						Ok(Some(frame))
 					}
 				};
 
@@ -3174,7 +3214,7 @@ mod tests {
 							trace.assert_value(AssertionPhase::Response, "message_content", msg.content);
 						}
 
-						Some(frame)
+						Ok(Some(frame))
 					}
 				};
 

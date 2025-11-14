@@ -83,8 +83,8 @@ fn test_tennis_valid_trace_refinement() {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				(HandlerStart, "pointA", tightbeam::exactly!(4)),
-				(HandlerStart, "pointB", tightbeam::exactly!(1))
+				(Any, "pointA", tightbeam::exactly!(4)),
+				(Any, "pointB", tightbeam::exactly!(1))
 			]
 		},
 	}
@@ -99,15 +99,16 @@ fn test_tennis_valid_trace_refinement() {
 			timeout_ms: 500,
 			specs: vec![TennisScorer::process()],
 			fail_fast: true,
+			expect_failure: false,
 		},
 		environment Bare {
 			exec: |trace| {
 				// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
-				trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-				trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-				trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
-				trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-				trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
+				trace.event("pointA");
+				trace.event("pointA");
+				trace.event("pointB");
+				trace.event("pointA");
+				trace.event("pointA");
 				Ok(())
 			}
 		}
@@ -124,8 +125,8 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "pointA", tightbeam::exactly!(1)),
-			(HandlerStart, "pointB", tightbeam::exactly!(4))
+			(Any, "pointA", tightbeam::exactly!(1)),
+			(Any, "pointB", tightbeam::exactly!(4))
 		]
 	},
 }
@@ -133,23 +134,24 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_tennis_invalid_trace_refinement,
 	spec: InvalidTennisSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 16,
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![TennisScorer::process()],
-		fail_fast: true,
-	},
+		fdr: FdrConfig {
+			seeds: 4,
+			max_depth: 16,
+			max_internal_run: 8,
+			timeout_ms: 500,
+			specs: vec![TennisScorer::process()],
+			fail_fast: true,
+			expect_failure: false,
+		},
 	environment Bare {
 		exec: |trace| {
 			// Invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
 			// This violates the tennis scoring rules - after (0,40), B should win
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
+			trace.event("pointA");
+			trace.event("pointB");
+			trace.event("pointB");
+			trace.event("pointB");
+			trace.event("pointB");
 			Ok(())
 		}
 	}
@@ -166,8 +168,8 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "pointA", tightbeam::exactly!(5)),
-			(HandlerStart, "pointB", tightbeam::exactly!(3))
+			(Any, "pointA", tightbeam::exactly!(5)),
+			(Any, "pointB", tightbeam::exactly!(3))
 		]
 	},
 }
@@ -175,25 +177,26 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_tennis_deuce_to_advantage,
 	spec: DeuceTennisSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 16,
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![TennisScorer::process()],
-		fail_fast: true,
-	},
+		fdr: FdrConfig {
+			seeds: 4,
+			max_depth: 16,
+			max_internal_run: 8,
+			timeout_ms: 500,
+			specs: vec![TennisScorer::process()],
+			fail_fast: true,
+			expect_failure: false,
+		},
 	environment Bare {
 		exec: |trace| {
 			// Valid trace going through deuce: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
+			trace.event("pointA");
+			trace.event("pointB");
+			trace.event("pointA");
+			trace.event("pointB");
+			trace.event("pointA");
+			trace.event("pointB");
+			trace.event("pointA");
+			trace.event("pointA");
 			Ok(())
 		}
 	}
@@ -208,8 +211,8 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "pointA", tightbeam::exactly!(2)),
-			(HandlerStart, "pointB", tightbeam::exactly!(1))
+			(Any, "pointA", tightbeam::exactly!(2)),
+			(Any, "pointB", tightbeam::exactly!(1))
 		]
 	},
 }
@@ -217,22 +220,22 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_failures_refinement,
 	spec: FailuresTennisSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 16,
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![TennisScorer::process()],
-		fail_fast: true,
-	},
+		fdr: FdrConfig {
+			seeds: 4,
+			max_depth: 16,
+			max_internal_run: 8,
+			timeout_ms: 500,
+			specs: vec![TennisScorer::process()],
+			fail_fast: true,
+			expect_failure: false,
+		},
 	environment Bare {
 		exec: |trace| {
 			// Create a trace that should pass failures refinement
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointB");
-			trace.assert(tightbeam::testing::assertions::AssertionPhase::HandlerStart, "pointA");
+			trace.event("pointA");
+			trace.event("pointB");
+			trace.event("pointA");
 			Ok(())
 		}
 	}
 }
-

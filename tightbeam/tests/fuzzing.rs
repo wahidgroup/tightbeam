@@ -9,4 +9,5 @@ mod fuzz {
     pub mod complex_workflow;
     pub mod simple_workflow;
     pub mod verification;
+    pub mod chess_engine;
 }

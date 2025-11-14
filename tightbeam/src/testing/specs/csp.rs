@@ -886,7 +886,7 @@ mod tests {
 						// Server-side assertions
 						trace.assert(AssertionPhase::HandlerStart, "Received");
 						trace.assert(AssertionPhase::Response, "Responded");
-						Some(frame)
+						Ok(Some(frame))
 					}
 				};
 
@@ -929,7 +929,7 @@ mod tests {
 			// Server-side assertions
 			trace.assert(AssertionPhase::HandlerStart, "Received");
 			trace.assert(AssertionPhase::Response, "Responded");
-			Some(frame)
+			Ok(Some(frame))
 		}
 	}
 

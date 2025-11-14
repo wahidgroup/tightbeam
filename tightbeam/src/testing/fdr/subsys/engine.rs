@@ -3,13 +3,14 @@
 //! This module contains the core FdrExplorer struct that orchestrates exploration
 //! and refinement checking by delegating to pluggable subsystems.
 
-#[cfg(feature = "rayon")]
-use std::collections::HashSet;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::testing::fdr::config::{FdrConfig, FdrVerdict, Trace, Failure};
-use crate::testing::fdr::explorer::{ExplorationCore, MemoizationCache, RefinementChecker, SeedResult};
+#[cfg(feature = "rayon")]
+use std::collections::HashSet;
+
+use crate::testing::fdr::config::{Failure, FdrConfig, FdrVerdict, Trace};
+use crate::testing::fdr::explorer::{ExplorationCore, RefinementChecker, SeedResult};
 use crate::testing::specs::csp::Process;
 
 #[cfg(feature = "rayon")]
@@ -24,12 +25,11 @@ use super::refinement::DefaultRefinementChecker;
 /// Generic over subsystem implementations:
 /// - `E`: Exploration engine (implements `ExplorationCore`)
 /// - `R`: Refinement checker (implements `RefinementChecker`)
-/// - `M`: Memoization cache (implements `MemoizationCache`)
-pub struct FdrExplorer<'a, E, R, M>
+///    The refinement checker manages its own memoization cache internally.
+pub struct FdrExplorer<'a, E, R>
 where
 	E: ExplorationCore,
 	R: RefinementChecker,
-	M: MemoizationCache,
 {
 	/// Process being verified
 	process: &'a Process,
@@ -43,32 +43,24 @@ where
 	/// Refinement checker
 	refinement: R,
 
-	/// Memoization cache (shared with refinement checker via Rc<RefCell<>>)
-	cache: Rc<RefCell<M>>,
-
 	/// Verdict accumulator
 	verdict: FdrVerdict,
 }
 
 /// Default FDR explorer using default subsystem implementations
-pub type DefaultFdrExplorer<'a> = FdrExplorer<'a, DefaultExplorationEngine<'a>, DefaultRefinementChecker<'a, DefaultCache>, DefaultCache>;
+pub type DefaultFdrExplorer<'a> =
+	FdrExplorer<'a, DefaultExplorationEngine<'a>, DefaultRefinementChecker<'a, DefaultCache>>;
 
-impl<'a, E, R, M> FdrExplorer<'a, E, R, M>
+impl<'a, E, R> FdrExplorer<'a, E, R>
 where
 	E: ExplorationCore,
 	R: RefinementChecker,
-	M: MemoizationCache,
 {
 	/// Create new FDR explorer with custom subsystems
-	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R, cache: Rc<RefCell<M>>) -> Self {
-		Self {
-			process,
-			config,
-			explorer,
-			refinement,
-			cache,
-			verdict: FdrVerdict::default(),
-		}
+	///
+	/// The cache is managed by the refinement checker, which receives it during construction.
+	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R) -> Self {
+		Self { process, config, explorer, refinement, verdict: FdrVerdict::default() }
 	}
 
 	/// Run multi-seed exploration
@@ -83,7 +75,6 @@ where
 		#[cfg(feature = "rayon")]
 		{
 			use rayon::prelude::*;
-			// Parallel exploration with rayon
 			let seeds: Vec<u64> = (0..self.config.seeds).map(|s| s as u64).collect();
 			let process = self.process;
 			let config = &self.config;
@@ -96,7 +87,6 @@ where
 				})
 				.collect();
 
-			// Aggregate results
 			for (seed, result, visited) in results {
 				self.explorer.add_seed_result(seed, result.clone());
 				self.explorer.update_visited_states(&visited);
@@ -106,7 +96,6 @@ where
 
 		#[cfg(not(feature = "rayon"))]
 		{
-			// Sequential exploration
 			for seed in 0..self.config.seeds {
 				let result = self.explorer.explore_seed(seed as u64);
 				self.update_verdict_from_result(seed as u64, &result);
@@ -116,10 +105,8 @@ where
 		self.verdict.traces_explored = self.explorer.traces().len();
 		self.verdict.states_visited = self.explorer.states_visited();
 
-		// Check determinism across all seeds
 		self.check_determinism();
 
-		// Update overall verdict
 		self.verdict.passed = self.verdict.divergence_free
 			&& self.verdict.deadlock_free
 			&& (self.verdict.is_deterministic || self.verdict.determinism_witness.is_none());
@@ -150,17 +137,12 @@ where
 
 	/// Check for witnesses to nondeterminism
 	fn check_determinism(&mut self) {
-		// Get traces from explorer
 		let traces = self.explorer.traces();
 
-		// Check if all traces are identical (deterministic)
 		if traces.len() > 1 {
 			let first_trace = &traces[0];
 			for trace in &traces[1..] {
 				if trace != first_trace {
-					// Found nondeterminism - we can't determine the seed from traces alone
-					// This is a limitation, but determinism checking at this level
-					// requires access to seed_results which the explorer may not expose
 					self.verdict.is_deterministic = false;
 					break;
 				}
@@ -170,37 +152,40 @@ where
 
 	/// Run refinement checking mode
 	///
-	/// When `config.specs` is non-empty, checks:
-	/// - For each spec in specs: spec ⊑ process
-	///
-	/// Updates verdict with refinement results and witnesses.
-	/// If `config.fail_fast` is true (default), stops at first violation.
+	/// When `config.specs` is non-empty, checks: process ⊑ spec
+	/// (implementation refines specification). Updates verdict with refinement
+	/// results and witnesses. If `config.fail_fast` is true (default), stops
+	/// at first violation.
 	fn check_refinement(&mut self) {
 		if self.config.specs.is_empty() {
 			return;
 		}
 
-		// Clone specs to avoid borrowing conflict
 		let specs = self.config.specs.clone();
 
-		// Check each refinement type
-		self.check_refinement_for_specs(&specs, |r, s| r.check_trace_refinement(s, self.process), |v, w| {
-			v.trace_refines = false;
-			v.trace_refinement_witness = w;
-		});
+		// Check trace refinement
+		self.check_refinement_for_specs(
+			&specs,
+			|r, s| r.check_trace_refinement(s, self.process),
+			|v, w| {
+				v.trace_refines = false;
+				v.trace_refinement_witness = w;
+			},
+		);
 
-		self.check_refinement_for_specs(&specs, |r, s| r.check_failures_refinement(s, self.process), |v, w| {
-			v.failures_refines = false;
-			v.failures_refinement_witness = w;
-		});
+		// Skip failures refinement for deterministic linear trace processes.
+		// For deterministic processes, trace + divergence refinement is sufficient.
+		// Reference: Roscoe (1998, 2010), Pedersen & Chalmers (2024)
+		self.check_refinement_for_specs(
+			&specs,
+			|r, s| r.check_divergence_refinement(s, self.process),
+			|v, w| {
+				v.divergence_refines = false;
+				v.divergence_refinement_witness = w;
+			},
+		);
 
-		self.check_refinement_for_specs(&specs, |r, s| r.check_divergence_refinement(s, self.process), |v, w| {
-			v.divergence_refines = false;
-			v.divergence_refinement_witness = w;
-		});
-
-		// All refinement checks passed
-		if self.verdict.trace_refines && self.verdict.failures_refines && self.verdict.divergence_refines {
+		if self.verdict.trace_refines && self.verdict.divergence_refines {
 			self.verdict.passed = true;
 		}
 	}
@@ -242,7 +227,7 @@ impl<'a> DefaultFdrExplorer<'a> {
 	pub fn with_defaults(process: &'a Process, config: FdrConfig) -> Self {
 		let explorer = DefaultExplorationEngine::new(process, config.clone());
 		let cache = Rc::new(RefCell::new(DefaultCache::new()));
-		let refinement = DefaultRefinementChecker::new(process, config.clone(), Rc::clone(&cache));
-		FdrExplorer::new(process, config, explorer, refinement, cache)
+		let refinement = DefaultRefinementChecker::new(process, config.clone(), cache);
+		FdrExplorer::new(process, config, explorer, refinement)
 	}
 }

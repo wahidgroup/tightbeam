@@ -44,6 +44,11 @@ pub struct FdrConfig {
 	/// When true (default), returns immediately after finding first counter-example
 	/// When false, checks all specs and collects all violations
 	pub fail_fast: bool,
+
+	/// Expect FDR refinement to fail (for negative tests)
+	/// When true, the test passes if refinement fails (proving the trace violates the spec)
+	/// When false (default), the test fails if refinement fails
+	pub expect_failure: bool,
 }
 
 impl Default for FdrConfig {
@@ -55,6 +60,7 @@ impl Default for FdrConfig {
 			timeout_ms: 5000,
 			specs: Vec::new(),
 			fail_fast: true,
+			expect_failure: false,
 		}
 	}
 }

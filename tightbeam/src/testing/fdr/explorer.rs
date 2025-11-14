@@ -45,6 +45,35 @@ pub trait ExplorationCore {
 
 	/// Update visited states (for use when aggregating parallel results)
 	fn update_visited_states(&mut self, visited: &HashSet<State>);
+
+	/// Compute refusal set at a given state
+	///
+	/// Refusal set = all observable events minus enabled observable events.
+	/// Hidden events (τ-transitions) are filtered out as they cannot be refused.
+	/// Reference: Roscoe (1998, 2010)
+	fn compute_refusals(&self, process: &Process, state: State) -> HashSet<Event> {
+		use std::collections::HashSet;
+		// Only consider observable events (filter out hidden τ-transitions)
+		let enabled_events: HashSet<Event> = process
+			.enabled(state)
+			.iter()
+			.filter_map(|action| {
+				if !process.hidden.contains(&action.event) {
+					Some(action.event.clone())
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		// Refusal set = all observable events minus enabled observable events
+		process
+			.observable
+			.iter()
+			.cloned()
+			.filter(|event| !enabled_events.contains(event))
+			.collect()
+	}
 }
 
 /// Refinement checking algorithms
@@ -54,6 +83,18 @@ pub trait ExplorationCore {
 /// - Failures refinement: failures(Impl) ⊆ failures(Spec)
 /// - Divergence refinement: divergences(Impl) ⊆ divergences(Spec)
 pub trait RefinementChecker {
+	/// Maximum number of traces to compute before early termination
+	/// Prevents exponential explosion for large specs
+	const MAX_TRACES: usize = 5000;
+
+	/// Maximum queue size in BFS exploration before early termination
+	/// Prevents memory exhaustion for large state spaces
+	const MAX_QUEUE_SIZE: usize = 10000;
+
+	/// Maximum visited states before early termination
+	/// Prevents excessive memory usage during exploration
+	const MAX_VISITED: usize = 20000;
+
 	/// Check trace refinement: traces(impl_process) ⊆ traces(spec_process)
 	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> (bool, Option<Trace>);
 

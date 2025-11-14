@@ -754,11 +754,11 @@ macro_rules! servlet {
 				handle: move |$msg: $crate::Frame| {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
-					async move {
-						let $config_param = &config_arc;
-						let $workers_param = &workers_arc;
-						$body
-					}
+				async move {
+					let $config_param = &config_arc;
+					let $workers_param = &workers_arc;
+					$body
+				}
 				}
 			};
 			(server_handle, Vec::new())
@@ -775,11 +775,11 @@ macro_rules! servlet {
 				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
-					async move {
-						let $config_param = &config_arc;
-						let $workers_param = &workers_arc;
-						$body
-					}
+				async move {
+					let $config_param = &config_arc;
+					let $workers_param = &workers_arc;
+					$body
+				}
 				}
 			};
 			(server_handle, Vec::new())
@@ -894,10 +894,10 @@ macro_rules! servlet {
 				policies: { $($policy_key: $policy_val),* },
 				handle: move |$msg: $crate::Frame| {
 					let config_arc = config_arc.clone();
-					async move {
-						let $config_param = &config_arc;
-						$body
-					}
+				async move {
+					let $config_param = &config_arc;
+					$body
+				}
 				}
 			};
 			(server_handle, Vec::new())
@@ -912,10 +912,10 @@ macro_rules! servlet {
 				protocol $protocol: $listener,
 				handle: move |$msg: std::sync::Arc<$crate::Frame>| {
 					let config_arc = config_arc.clone();
-					async move {
-						let $config_param = &config_arc;
-						$body
-					}
+				async move {
+					let $config_param = &config_arc;
+					$body
+				}
 				}
 			};
 			(server_handle, Vec::new())
@@ -966,9 +966,14 @@ macro_rules! servlet {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
 				assertions: $assertions,
-				handle: move |$msg: $crate::Frame, $trace| {
+				handle: move |$msg, $trace| {
 					async move {
-						$body
+						// Wrap Option<Frame> in Ok() to convert to Result<Option<Frame>>
+						// If handler already returns Result, this will be a type error that the user must fix
+						match $body {
+							opt @ Some(_) | opt @ None => Ok(opt),
+							result @ Ok(_) | result @ Err(_) => result,
+						}
 					}
 				}
 			};
@@ -983,7 +988,7 @@ macro_rules! servlet {
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				assertions: $assertions,
-				handle: move |$msg: $crate::Frame, $trace| {
+				handle: move |$msg, $trace| {
 					async move {
 						$body
 					}
@@ -1003,9 +1008,9 @@ macro_rules! servlet {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
 				handle: move |$msg: $crate::Frame| {
-					async move {
-						$body
-					}
+				async move {
+					$body
+				}
 				}
 			};
 
@@ -1021,9 +1026,9 @@ macro_rules! servlet {
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				handle: move |$msg: $crate::Frame| {
-					async move {
-						$body
-					}
+				async move {
+					$body
+				}
 				}
 			};
 
@@ -1067,19 +1072,19 @@ mod tests {
 			lotto_number: u32,
 		},
 		handle: |message, config| async move {
-			let decoded: RequestMessage = crate::decode(&message.message).ok()?;
+			let decoded: RequestMessage = crate::decode(&message.message)?;
 			let is_winner = decoded.lucky_number == config.lotto_number;
 			if decoded.content == "PING" {
-				 Some(crate::compose! {
+				 Ok(Some(crate::compose! {
 					V0: id: message.metadata.id.clone(),
 						order: 1_700_000_000u64,
 						message: ResponseMessage {
 							result: "PONG".to_string(),
 							is_winner,
 						}
-				 }.ok()?)
+				 }?))
 			 } else {
-				 None
+				 Ok(None)
 			}
 		}
 	}
@@ -1189,7 +1194,7 @@ mod tests {
 				})
 			},
 			handle: |message, _config, workers| async move {
-				let decoded: RequestMessage = crate::decode(&message.message).ok()?;
+				let decoded: RequestMessage = crate::decode(&message.message)?;
 				let (ping_result, lucky_result) = tokio::join!(
 					workers.ping_pong.relay(decoded.clone()),
 					workers.lucky_number.relay(decoded.clone())
@@ -1197,21 +1202,21 @@ mod tests {
 
 				let reply = match ping_result {
 					Ok(reply) => reply,
-					Err(_) => return None,
+					Err(_) => return Ok(None),
 				};
 
 				let is_winner = match lucky_result {
 					Ok(is_winner) => is_winner,
-					Err(_) => return None,
+					Err(_) => return Ok(None),
 				};
 
-				crate::compose! {
+				Ok(crate::compose! {
 					V0: id: message.metadata.id.clone(),
 						message: ResponseMessage {
 							result: reply.result,
 							is_winner,
 						}
-				}.ok()
+				}?.into())
 			}
 		}
 

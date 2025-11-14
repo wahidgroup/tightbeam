@@ -995,7 +995,7 @@ mod tests {
 		service: |message, tx| async move {
 			// Echo the message back as response
 			let _ = tx.send(message.clone());
-			Some(message)
+			Ok(Some(message))
 		},
 		container: |client, channels| async move {
 			use crate::transport::MessageEmitter;

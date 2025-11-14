@@ -734,7 +734,7 @@ mod tests {
 				async move {
 					// Quantum tunnel testing channel -- TUNNEL
 					let _ = tx.send(message);
-					None
+					Ok(None)
 				}
 			}
 		};
