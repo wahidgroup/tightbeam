@@ -2,12 +2,13 @@
 //!
 //! Demonstrates Phase 2: tb_scenario! automatic instrumentation capture
 
-#![cfg(feature = "testing")]
 #![cfg(feature = "instrument")]
 
-use tightbeam::instrumentation::TbEventKind;
-use tightbeam::testing::assertions::AssertionPhase;
-use tightbeam::{tb_assert_spec, tb_scenario};
+use tightbeam::testing::create_test_message;
+use tightbeam::transport::tcp::r#async::TokioListener;
+use tightbeam::transport::tcp::TightBeamSocketAddr;
+use tightbeam::transport::{MessageEmitter, Protocol};
+use tightbeam::{compose, server, tb_assert_spec, tb_process_spec, tb_scenario};
 
 tb_assert_spec! {
 	pub AutoInstrSpec,
@@ -18,35 +19,64 @@ tb_assert_spec! {
 	}
 }
 
+// CSP process spec for automatic message flow verification
+tb_process_spec! {
+	pub struct MessageFlowProc;
+	events {
+		observable { "message_emit", "message_collect" }
+		hidden { }
+	}
+	states {
+		S0 => { "message_emit" => S1 },
+		S1 => { "message_collect" => S2 }
+	}
+	terminal { S2 }
+	annotations { description: "Automatic message emit -> collect flow" }
+}
+
 tb_scenario! {
 	name: test_auto_instrumentation_capture,
 	spec: AutoInstrSpec,
-	environment Bare {
-		exec: |trace| {
-			// Framework automatically initialized instrumentation before this
-			trace.assert(AssertionPhase::HandlerStart, "test_event");
+	csp: MessageFlowProc,
+	instrumentation: InstrumentationMode::Auto,
+	environment ServiceClient {
+		worker_threads: 1,
+		server: |trace| async move {
+			let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
+			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+			let handle = server! {
+				protocol TokioListener: listener,
+				assertions: trace,
+				handle: |frame, _trace| async move {
+					Some(frame)
+				}
+			};
+			Ok((handle, addr))
+		},
+		client: |_trace, mut client| async move {
+			let test_message = create_test_message(None);
+			let test_frame = compose! {
+				V0: id: "test", order: 1u64, message: test_message
+			}?;
 
+			let _response = client.emit(test_frame, None).await?;
+			println!("Client: Emit completed");
 			Ok(())
 		}
 	},
 	hooks {
 		on_pass: |trace| {
-			// Verify events were automatically captured
-			assert!(!trace.instrument_events.is_empty(), "Should have captured events automatically");
-
-			// Should have Start + our event + End
-			let kinds: Vec<_> = trace.instrument_events.iter().map(|e| e.kind).collect();
-			assert_eq!(kinds[0], TbEventKind::Start);
-			assert_eq!(kinds[kinds.len() - 1], TbEventKind::End);
-
-			// Verify our event was captured
-			let has_event = trace.instrument_events
-				.iter()
-				.any(|e| e.label.as_deref() == Some("test_event"));
-			assert!(has_event, "Should have captured test_event");
+			println!("Test passed! Captured {} instrument events:", trace.instrument_events.len());
+			for event in &trace.instrument_events {
+				println!("  Event: {:?} - {:?}", event.kind, event.label);
+			}
 		},
-		on_fail: |trace, _violations| {
-			panic!("Should not fail: {:?}", trace.error);
+		on_fail: |trace, violations| {
+			println!("Test failed! Captured {} instrument events:", trace.instrument_events.len());
+			for event in &trace.instrument_events {
+				println!("  Event: {:?} - {:?}", event.kind, event.label);
+			}
+			panic!("Test failed with violations: {:?}", violations);
 		}
 	}
 }

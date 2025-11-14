@@ -135,6 +135,8 @@ pub mod router;
 pub mod standards;
 #[cfg(feature = "transport")]
 pub mod transport;
+#[cfg(feature = "rayon")]
+pub use rayon;
 #[cfg(feature = "zeroize")]
 pub use zeroize;
 

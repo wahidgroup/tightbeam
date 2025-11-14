@@ -102,9 +102,11 @@ pub mod stub {
 
 #[cfg(feature = "instrument")]
 pub mod active {
-	use crate::TightBeamError;
 	use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-	use sha3::{Digest, Sha3_256};
+	use std::sync::{Arc, Mutex, OnceLock};
+
+	use crate::crypto::hash::{Digest, Sha3_256};
+	use crate::TightBeamError;
 
 	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 	pub enum TbEventKind {
@@ -174,11 +176,8 @@ pub mod active {
 	static ACTIVE: AtomicBool = AtomicBool::new(false);
 	static OVERFLOW: AtomicBool = AtomicBool::new(false);
 	static SEQ: AtomicU32 = AtomicU32::new(0);
-	static CONFIG: std::sync::OnceLock<TbInstrumentationConfig> = std::sync::OnceLock::new();
-
-	thread_local! {
-		static EVENTS: std::cell::RefCell<Vec<TbEvent>> = const { std::cell::RefCell::new(Vec::new()) };
-	}
+	static CONFIG: OnceLock<TbInstrumentationConfig> = OnceLock::new();
+	static EVENTS: OnceLock<Arc<Mutex<Vec<TbEvent>>>> = OnceLock::new();
 
 	/// Get next sequence number for event (thread-safe)
 	pub fn next_seq() -> u32 {
@@ -187,9 +186,12 @@ pub mod active {
 
 	pub fn init(cfg: TbInstrumentationConfig) -> Result<(), TightBeamError> {
 		let _ = CONFIG.set(cfg);
+		let _ = EVENTS.set(Arc::new(Mutex::new(Vec::new())));
+
 		ACTIVE.store(true, Ordering::Relaxed);
 		SEQ.store(0, Ordering::Relaxed);
 		OVERFLOW.store(false, Ordering::Relaxed);
+
 		Ok(())
 	}
 
@@ -201,7 +203,11 @@ pub mod active {
 	pub fn start_trace() {
 		SEQ.store(0, Ordering::Relaxed);
 		OVERFLOW.store(false, Ordering::Relaxed);
-		EVENTS.with(|v| v.borrow_mut().clear());
+		if let Some(events) = EVENTS.get() {
+			let mut events = events.lock().unwrap();
+			events.clear();
+		}
+
 		let _ = emit(TbEventKind::Start, None, None, None, 0, None);
 	}
 
@@ -216,14 +222,16 @@ pub mod active {
 		if !is_active() {
 			return Ok(());
 		}
+
 		let cfg = CONFIG.get().copied().unwrap_or_default();
 		let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-		EVENTS.with(|cell| {
-			let mut buf = cell.borrow_mut();
+		if let Some(events) = EVENTS.get() {
+			let mut buf = events.lock().unwrap();
 			if (buf.len() as u32) >= cfg.max_events {
 				OVERFLOW.store(true, Ordering::Relaxed);
-				return;
+				return Ok(());
 			}
+
 			let payload_hash = if cfg.enable_payloads {
 				payload.map(|p| {
 					let mut hasher = Sha3_256::new();
@@ -236,6 +244,7 @@ pub mod active {
 			} else {
 				None
 			};
+
 			buf.push(TbEvent {
 				seq,
 				kind,
@@ -249,7 +258,7 @@ pub mod active {
 				flags,
 				extras: extras.map(|e| e.to_vec()),
 			});
-		});
+		}
 		Ok(())
 	}
 
@@ -263,7 +272,12 @@ pub mod active {
 
 	impl EvidenceArtifact {
 		pub fn finalize(spec_hash: [u8; 32]) -> Self {
-			let events = EVENTS.with(|c| c.borrow().clone());
+			let events = if let Some(events) = EVENTS.get() {
+				events.lock().unwrap().clone()
+			} else {
+				Vec::new()
+			};
+
 			// Canonical byte representation (stable ordering) for trace hash
 			let mut bytes = Vec::with_capacity(events.len() * 64);
 			for ev in &events {
@@ -291,17 +305,22 @@ pub mod active {
 					None => bytes.extend_from_slice(&0u32.to_be_bytes()),
 				}
 			}
+
 			let mut h1 = Sha3_256::new();
 			h1.update(&bytes);
+
 			let trace_hash_vec = h1.finalize();
 			let mut trace_hash = [0u8; 32];
 			trace_hash.copy_from_slice(&trace_hash_vec);
+
 			let mut h2 = Sha3_256::new();
 			h2.update(spec_hash);
 			h2.update(trace_hash);
+
 			let evidence_hash_vec = h2.finalize();
 			let mut evidence_hash = [0u8; 32];
 			evidence_hash.copy_from_slice(&evidence_hash_vec);
+
 			Self {
 				spec_hash,
 				trace_hash,

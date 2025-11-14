@@ -15,14 +15,8 @@ mod assert;
 #[cfg(feature = "testing-csp")]
 pub mod csp;
 
-#[cfg(feature = "testing-fdr")]
-pub mod fdr;
-
 // Re-exports
 pub use assert::{verify_trace, SpecViolation, TBSpec};
 
 #[cfg(feature = "testing-csp")]
 pub use csp::*;
-
-#[cfg(feature = "testing-fdr")]
-pub use fdr::*;
