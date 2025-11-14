@@ -1,3 +1,5 @@
+//! Utility modules and functions
+
 use crate::error::TightBeamError;
 
 #[cfg(feature = "compress")]
