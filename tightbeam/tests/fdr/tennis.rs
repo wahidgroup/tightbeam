@@ -73,44 +73,41 @@ tightbeam::tb_process_spec! {
 
 // ===== Test 1: Tennis Game - Valid Trace Refinement =====
 
-#[test]
-fn test_tennis_valid_trace_refinement() {
-	// Define assertion spec for valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
-	// Score progression: (0,0) -> (15,0) -> (30,0) -> (30,15) -> (40,15) -> GameA
-	tightbeam::tb_assert_spec! {
-		pub ValidTennisSpec,
-		V(1,0,0): {
-			mode: Accept,
-			gate: Accepted,
-			assertions: [
-				(Any, "pointA", tightbeam::exactly!(4)),
-				(Any, "pointB", tightbeam::exactly!(1))
-			]
-		},
-	}
+// Define assertion spec for valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
+// Score progression: (0,0) -> (15,0) -> (30,0) -> (30,15) -> (40,15) -> GameA
+tightbeam::tb_assert_spec! {
+	pub ValidTennisSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(Any, "pointA", tightbeam::exactly!(4)),
+			(Any, "pointB", tightbeam::exactly!(1))
+		]
+	},
+}
 
-	tightbeam::tb_scenario! {
-		name: test_tennis_valid_trace_refinement,
-		spec: ValidTennisSpec,
-		fdr: FdrConfig {
-			seeds: 4,
-			max_depth: 16,
-			max_internal_run: 8,
-			timeout_ms: 500,
-			specs: vec![TennisScorer::process()],
-			fail_fast: true,
-			expect_failure: false,
-		},
-		environment Bare {
-			exec: |trace| {
-				// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
-				trace.event("pointA");
-				trace.event("pointA");
-				trace.event("pointB");
-				trace.event("pointA");
-				trace.event("pointA");
-				Ok(())
-			}
+tightbeam::tb_scenario! {
+	name: test_tennis_valid_trace_refinement,
+	spec: ValidTennisSpec,
+	fdr: FdrConfig {
+		seeds: 4,
+		max_depth: 16,
+		max_internal_run: 8,
+		timeout_ms: 500,
+		specs: vec![TennisScorer::process()],
+		fail_fast: true,
+		expect_failure: false,
+	},
+	environment Bare {
+		exec: |trace| {
+			// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
+			trace.event("pointA");
+			trace.event("pointA");
+			trace.event("pointB");
+			trace.event("pointA");
+			trace.event("pointA");
+			Ok(())
 		}
 	}
 }

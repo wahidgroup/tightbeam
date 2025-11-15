@@ -204,3 +204,31 @@ gzip = ["compress"]
 standards = []
 standards-rfc = ["standards"]
 standards-iso = ["standards"]
+
+# AFL fuzz targets - each as a separate binary
+# These are built with: RUSTFLAGS="--cfg fuzzing" cargo afl build --bin <name> --features "std,testing-fuzz"
+# Standard AFL.rs organization: fuzz targets are separate binaries, not tests
+[[bin]]
+name = "fuzz_simple_workflow"
+path = "fuzz/simple_workflow.rs"
+required-features = ["std", "testing-fuzz"]
+
+[[bin]]
+name = "fuzz_simple_servlet"
+path = "fuzz/simple_servlet.rs"
+required-features = ["std", "testing-fuzz"]
+
+[[bin]]
+name = "fuzz_complex_workflow"
+path = "fuzz/complex_workflow.rs"
+required-features = ["std", "testing-fuzz"]
+
+[[bin]]
+name = "fuzz_verification"
+path = "fuzz/verification.rs"
+required-features = ["std", "testing-fuzz"]
+
+[[bin]]
+name = "fuzz_chess"
+path = "fuzz/chess/mod.rs"
+required-features = ["std", "testing-fuzz"]

@@ -74,8 +74,44 @@ impl TraceCollector {
 	/// This is a convenience method for scenarios where the lifecycle phase doesn't matter,
 	/// such as FDR refinement checking or CSP process modeling. It uses `AssertionPhase::Any`
 	/// which matches any phase during validation.
+	///
+	/// ## Automatic CSP Stepping
+	/// When a CSP oracle is configured (via `with_fuzz_oracle`), this method automatically
+	/// attempts to step the CSP state machine if the event label matches a CSP event.
+	/// Common mappings:
+	/// - `"move_sent"` → `"move_request"`
+	/// - `"move_validated"` → `"move_valid"`
+	/// - `"move_rejected"` → `"move_invalid"`
+	/// - `"game_ended"` → `"game_over"`
+	///
+	/// If automatic stepping fails (event not enabled or no mapping), the trace event
+	/// is still recorded. Use `oracle().step_event()` for manual CSP stepping.
 	pub fn event(&self, label: &str) {
 		self.assert(AssertionPhase::Any, label);
+
+		// Automatically step CSP oracle if configured and event matches CSP event
+		#[cfg(feature = "testing-fuzz")]
+		if let Some(ref oracle) = self.oracle {
+			// Try to map trace event label to CSP event
+			// Only map known trace events to CSP events (using static string literals)
+			let csp_event_label: Option<&'static str> = match label {
+				"move_sent" => Some("move_request"),
+				"move_validated" => Some("move_valid"),
+				"move_rejected" => Some("move_invalid"),
+				"game_ended" => Some("game_over"),
+				// Note: "move_response" should be stepped manually after receiving response
+				// "server_move" is not a CSP event (it's a trace event for coverage)
+				// For unknown events, skip automatic stepping (use step_event() manually)
+				_ => None,
+			};
+
+			if let Some(csp_label) = csp_event_label {
+				use crate::testing::specs::csp::Event;
+				let event = Event(csp_label);
+				// Try to step CSP - ignore errors (event might not be enabled or not match)
+				let _ = oracle.step_event(&event);
+			}
+		}
 	}
 
 	/// Record an assertion with a value for equality checking

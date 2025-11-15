@@ -37,6 +37,7 @@ words:
   - FIPS
   - Flaggable
   - flagset
+  - getopt
   - getrandom
   - hashint
   - hashstack
@@ -50,6 +51,7 @@ words:
   - KTRI
   - Livelock
   - livelocks
+  - makedirs
   - matrixd
   - Merkle
   - millis

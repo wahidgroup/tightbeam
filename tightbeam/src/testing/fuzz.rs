@@ -566,6 +566,24 @@ impl FuzzContext {
 		self.inner.lock().map(|g| g.oracle.track_state()).unwrap_or(0)
 	}
 
+	/// Manually step CSP oracle with an event
+	///
+	/// Attempts to take a transition with the given event in the CSP state machine.
+	/// Returns `Ok(true)` if transition succeeded, `Ok(false)` if event not enabled.
+	///
+	/// ## Usage
+	/// ```ignore
+	/// // Manually step CSP state machine
+	/// trace.oracle().step_event(&Event::new("move_request"))?;
+	/// ```
+	///
+	/// ## Errors
+	/// Returns `Err(TestingError::FuzzInputLockPoisoned)` if mutex is poisoned.
+	pub fn step_event(&self, event: &Event) -> Result<bool, TestingError> {
+		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		Ok(guard.oracle.step(event))
+	}
+
 	/// Consume and return a u8 from fuzz input
 	pub fn fuzz_u8(&self) -> Result<u8, TestingError> {
 		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
