@@ -188,9 +188,9 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Nonce value not valid OCTET STRING"))]
 	InvalidNonceEncoding,
 	#[cfg_attr(feature = "derive", error("Nonce length mismatch: {0}"))]
-	NonceLengthError(crate::error::ExpectError<usize, usize>),
+	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 	#[cfg_attr(feature = "derive", error("OCTET STRING length mismatch: {0}"))]
-	OctetStringLengthError(crate::error::ExpectError<usize, usize>),
+	OctetStringLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 	#[cfg_attr(feature = "derive", error("Version/alert value not valid INTEGER"))]
 	InvalidIntegerEncoding,
 	#[cfg_attr(feature = "derive", error("INTEGER out of range"))]

@@ -17,18 +17,20 @@ pub type CompressionResult<T> = core::result::Result<T, CompressionError>;
 
 /// Error indicating a mismatch between received and expected values
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ExpectError<Received, Expected> {
+pub struct ReceivedExpectedError<Received, Expected> {
 	pub received: Received,
 	pub expected: Expected,
 }
 
-impl<Received, Expected> From<(Received, Expected)> for ExpectError<Received, Expected> {
+impl<Received, Expected> From<(Received, Expected)> for ReceivedExpectedError<Received, Expected> {
 	fn from((received, expected): (Received, Expected)) -> Self {
 		Self { received, expected }
 	}
 }
 
-impl<Received: core::fmt::Debug, Expected: core::fmt::Debug> core::fmt::Display for ExpectError<Received, Expected> {
+impl<Received: core::fmt::Debug, Expected: core::fmt::Debug> core::fmt::Display
+	for ReceivedExpectedError<Received, Expected>
+{
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		write!(f, "expected {:?}, got {:?}", self.expected, self.received)
 	}
@@ -132,7 +134,7 @@ pub enum TightBeamError {
 		feature = "derive",
 		error("Unsupported protocol version: expected {expected:?}, got {received:?}")
 	)]
-	UnsupportedVersion(ExpectError<Version, Version>),
+	UnsupportedVersion(ReceivedExpectedError<Version, Version>),
 
 	/// Error during testing operations
 	#[cfg(feature = "testing")]
@@ -254,7 +256,7 @@ pub enum TightBeamError {
 		feature = "derive",
 		error("Unexpected algorithm for message profile: expected {expected:?}, got {received:?}")
 	)]
-	UnexpectedAlgorithm(ExpectError<ObjectIdentifier, ObjectIdentifier>),
+	UnexpectedAlgorithm(ReceivedExpectedError<ObjectIdentifier, ObjectIdentifier>),
 
 	/// Missing or invalid configuration
 	#[cfg_attr(feature = "derive", error("Missing configuration"))]

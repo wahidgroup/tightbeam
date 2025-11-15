@@ -29,11 +29,11 @@ use tightbeam::{equals, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 // ASSERTION SPEC - Defines Expected Event Sequences
 // ============================================================================
 
-/// Assertion spec that verifies each proof point in the AFL+IJON integration.
-///
-/// Uses equals!, truthy!, and falsy! macros with actual runtime values
-/// to prove concrete evidence of integration working correctly.
 tb_assert_spec! {
+	/// Assertion spec that verifies each proof point in the AFL+IJON integration.
+	///
+	/// Uses equals!, truthy!, and falsy! macros with actual runtime values
+	/// to prove concrete evidence of integration working correctly.
 	pub VerificationSpec,
 	V(1,0,0): {
 		mode: Accept,
@@ -60,23 +60,23 @@ tb_assert_spec! {
 // CSP PROCESS - Models Verification State Machine
 // ============================================================================
 
-/// CSP process that models the AFL+IJON verification protocol.
-///
-/// The process flows through verification checkpoints matching the evidence chain:
-///
-/// ```text
-/// Initial → Compiled → WorkspaceConfigured → FeaturesOk → BinaryVerified
-///   → OracleVerified → FullyVerified
-/// ```
-///
-/// Each transition validates a specific aspect of the integration:
-/// 1. **Initial → Compiled**: Code compiles without errors
-/// 2. **Compiled → WorkspaceConfigured**: AFL dependency properly configured in Cargo.toml
-/// 3. **WorkspaceConfigured → FeaturesOk**: Feature flags enable correct code paths
-/// 4. **FeaturesOk → BinaryVerified**: IJON and AFL symbols present in binary
-/// 5. **BinaryVerified → OracleVerified**: Oracle methods work correctly
-/// 6. **OracleVerified → FullyVerified**: All proofs complete
 tb_process_spec! {
+	/// CSP process that models the AFL+IJON verification protocol.
+	///
+	/// The process flows through verification checkpoints matching the evidence chain:
+	///
+	/// ```text
+	/// Initial → Compiled → WorkspaceConfigured → FeaturesOk → BinaryVerified
+	///   → OracleVerified → FullyVerified
+	/// ```
+	///
+	/// Each transition validates a specific aspect of the integration:
+	/// 1. **Initial → Compiled**: Code compiles without errors
+	/// 2. **Compiled → WorkspaceConfigured**: AFL dependency properly configured in Cargo.toml
+	/// 3. **WorkspaceConfigured → FeaturesOk**: Feature flags enable correct code paths
+	/// 4. **FeaturesOk → BinaryVerified**: IJON and AFL symbols present in binary
+	/// 5. **BinaryVerified → OracleVerified**: Oracle methods work correctly
+	/// 6. **OracleVerified → FullyVerified**: All proofs complete
 	pub struct VerificationProcess;
 
 	events {

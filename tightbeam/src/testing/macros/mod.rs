@@ -266,6 +266,7 @@ pub struct AssertSpecBuilder {
 	ordering: Vec<&'static str>,
 	#[cfg(feature = "instrument")]
 	required_events: Vec<TbEventKind>,
+	description: Option<&'static str>,
 }
 
 impl AssertSpecBuilder {
@@ -281,6 +282,7 @@ impl AssertSpecBuilder {
 			ordering: Vec::new(),
 			#[cfg(feature = "instrument")]
 			required_events: Vec::new(),
+			description: None,
 		}
 	}
 
@@ -352,6 +354,11 @@ impl AssertSpecBuilder {
 				self.required_events.push(k);
 			}
 		}
+		self
+	}
+
+	pub fn description(mut self, desc: &'static str) -> Self {
+		self.description = Some(desc);
 		self
 	}
 
@@ -660,6 +667,19 @@ macro_rules! tb_labels {
 #[macro_export]
 macro_rules! __tb_assert_spec_build {
 	// Entry point - dispatch to appropriate handler
+	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ], $desc:expr) => {
+		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
+		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(stringify!($base), $crate::testing::trace::ExecutionMode::$mode);
+		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
+		$(
+			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
+		)*
+		#[cfg(feature = "instrument")]
+		{ $( builder = builder.required_events(&[$crate::instrumentation::TbEventKind::$ev]); )* }
+		builder = builder.description($desc);
+		$vec.push(builder.build());
+	};
+	// Entry point without description
 	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ]) => {
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(stringify!($base), $crate::testing::trace::ExecutionMode::$mode);
@@ -691,13 +711,28 @@ macro_rules! __tb_assert_spec_add_assertion {
 	};
 }
 
+// Helper macro to handle optional description
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_build_with_desc {
+	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ], $desc:expr) => {
+		$crate::__tb_assert_spec_build!($vec, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ], $desc);
+	};
+	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ]) => {
+		$crate::__tb_assert_spec_build!($vec, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ]);
+	};
+}
+
 // Multi-version macro ONLY (full semantic version required maj.min.patch)
 #[macro_export]
 macro_rules! tb_assert_spec {
+	// Without annotations (must come first)
 	(
+		$(#[$meta:meta])*
 		$vis:vis $base:ident,
 		$( V ( $maj:literal , $min:literal , $patch:literal ) : { mode: $mode:ident, gate: $gate:ident, assertions: [ $( $assertion:tt ),* $(,)? ] $(, events: [ $( $ev:ident ),* $(,)? ])? } ),+ $(,)?
 	) => {
+		$(#[$meta])*
 		$vis struct $base;
 		impl $base {
 			pub fn all() -> &'static [$crate::testing::macros::BuiltAssertSpec] {
@@ -706,7 +741,9 @@ macro_rules! tb_assert_spec {
 					static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
 					CELL.get_or_init(|| {
 						let mut v = Vec::new();
-						$( $crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ]); )+
+						$(
+							$crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ]);
+						)+
 						v
 					}).as_slice()
 				}
@@ -717,7 +754,72 @@ macro_rules! tb_assert_spec {
 					static mut VEC: Option<Vec<$crate::testing::macros::BuiltAssertSpec>> = None;
 					if !INIT.load(Ordering::Acquire) {
 						let mut v = Vec::new();
-						$( $crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ]); )+
+						$(
+							$crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ]);
+						)+
+						unsafe { VEC = Some(v); }
+						INIT.store(true, Ordering::Release);
+					}
+					unsafe { VEC.as_ref().unwrap().as_slice() }
+				}
+			}
+
+			#[allow(dead_code)]
+			pub fn get(maj: u16, min: u16, patch: u16) -> Option<&'static $crate::testing::macros::BuiltAssertSpec> {
+				for s in Self::all() {
+					let (maj_ver, min_ver, patch_ver) = s.version();
+					if maj_ver == maj && min_ver == min && patch_ver == patch {
+						return Some(s);
+					}
+				}
+				None
+			}
+
+			#[allow(dead_code)]
+			pub fn latest() -> &'static $crate::testing::macros::BuiltAssertSpec {
+				let mut best: Option<&'static $crate::testing::macros::BuiltAssertSpec> = None;
+				for s in Self::all() {
+					match best {
+						Some(b) => if s.version() > b.version() { best = Some(s); },
+						None => best = Some(s)
+					}
+				}
+				best.expect("no versions defined")
+			}
+		}
+	};
+	// With annotations
+	(
+		$(#[$meta:meta])*
+		$vis:vis $base:ident,
+		$( V ( $maj:literal , $min:literal , $patch:literal ) : { mode: $mode:ident, gate: $gate:ident, assertions: [ $( $assertion:tt ),* $(,)? ] $(, events: [ $( $ev:ident ),* $(,)? ])? } ),+ $(,)?
+		annotations { description: $desc:expr }
+	) => {
+		$(#[$meta])*
+		$vis struct $base;
+		impl $base {
+			pub fn all() -> &'static [$crate::testing::macros::BuiltAssertSpec] {
+				#[cfg(feature = "std")]
+				{
+					static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
+					CELL.get_or_init(|| {
+						let mut v = Vec::new();
+						$(
+							$crate::__tb_assert_spec_build_with_desc!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ], $desc);
+						)+
+						v
+					}).as_slice()
+				}
+				#[cfg(not(feature = "std"))]
+				{
+					use core::sync::atomic::{AtomicBool, Ordering};
+					static INIT: AtomicBool = AtomicBool::new(false);
+					static mut VEC: Option<Vec<$crate::testing::macros::BuiltAssertSpec>> = None;
+					if !INIT.load(Ordering::Acquire) {
+						let mut v = Vec::new();
+						$(
+							$crate::__tb_assert_spec_build_with_desc!(v, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ], $desc);
+						)+
 						unsafe { VEC = Some(v); }
 						INIT.store(true, Ordering::Release);
 					}

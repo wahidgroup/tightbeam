@@ -9,7 +9,7 @@ use crate::crypto::profiles::SecurityProfile;
 use crate::der::oid::{AssociatedOid, ObjectIdentifier};
 use crate::der::Sequence;
 use crate::error::Result;
-use crate::error::{ExpectError, TightBeamError};
+use crate::error::{ReceivedExpectedError, TightBeamError};
 use crate::matrix::{IntoMatrixDyn, MatrixDyn};
 use crate::{Frame, Message, Metadata, Version};
 
@@ -116,10 +116,11 @@ impl<T: Message> FrameBuilder<T> {
 	{
 		// Validate that the digest algorithm matches the message's profile (only if HAS_PROFILE is true)
 		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
-			self.errors.push(TightBeamError::UnexpectedAlgorithm(ExpectError::from((
-				D::OID,
-				<T::Profile as SecurityProfile>::DigestOid::OID,
-			))));
+			self.errors
+				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+					D::OID,
+					<T::Profile as SecurityProfile>::DigestOid::OID,
+				))));
 			return self;
 		}
 
@@ -157,10 +158,11 @@ impl<T: Message> FrameBuilder<T> {
 	{
 		// Validate that the digest algorithm matches the message's profile (only if HAS_PROFILE is true)
 		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
-			self.errors.push(TightBeamError::UnexpectedAlgorithm(ExpectError::from((
-				D::OID,
-				<T::Profile as SecurityProfile>::DigestOid::OID,
-			))));
+			self.errors
+				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+					D::OID,
+					<T::Profile as SecurityProfile>::DigestOid::OID,
+				))));
 			return self;
 		}
 
@@ -225,10 +227,11 @@ impl<T: Message> FrameBuilder<T> {
 	{
 		// Validate that the cipher OID matches the message's profile (only if HAS_PROFILE is true)
 		if T::HAS_PROFILE && C::OID != <T::Profile as SecurityProfile>::AeadOid::OID {
-			self.errors.push(TightBeamError::UnexpectedAlgorithm(ExpectError::from((
-				C::OID,
-				<T::Profile as SecurityProfile>::AeadOid::OID,
-			))));
+			self.errors
+				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+					C::OID,
+					<T::Profile as SecurityProfile>::AeadOid::OID,
+				))));
 			return self;
 		}
 
@@ -268,10 +271,11 @@ impl<T: Message> FrameBuilder<T> {
 	{
 		// Validate that the signature algorithm matches the message's profile (only if HAS_PROFILE is true)
 		if T::HAS_PROFILE && S::ALGORITHM_OID != <T::Profile as SecurityProfile>::SignatureAlg::ALGORITHM_OID {
-			self.errors.push(TightBeamError::UnexpectedAlgorithm(ExpectError::from((
-				S::ALGORITHM_OID,
-				<T::Profile as SecurityProfile>::SignatureAlg::ALGORITHM_OID,
-			))));
+			self.errors
+				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+					S::ALGORITHM_OID,
+					<T::Profile as SecurityProfile>::SignatureAlg::ALGORITHM_OID,
+				))));
 			return self;
 		}
 
@@ -283,7 +287,7 @@ impl<T: Message> FrameBuilder<T> {
 	fn validate(&self) -> Result<()> {
 		// Check minimum version requirement
 		if self.version < T::MIN_VERSION {
-			return Err(TightBeamError::UnsupportedVersion(ExpectError::from((
+			return Err(TightBeamError::UnsupportedVersion(ReceivedExpectedError::from((
 				self.version,
 				T::MIN_VERSION,
 			))));
@@ -405,6 +409,15 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 		// Final assembled frame
 		let metadata = metadata_builder.build()?;
 		let mut tbs = Frame { version, metadata, message, integrity: None, nonrepudiation: None };
+
+		// Runtime validation: ensure version is compatible with metadata fields
+		// Note: MetadataBuilder already enforces version constraints, so this is defensive
+		// This catches any edge cases where fields might have been set incorrectly
+		if !tbs.validate_version_compatibility() {
+			return Err(TightBeamError::UnsupportedVersion(ReceivedExpectedError::from((
+				version, version,
+			))));
+		}
 
 		// 4. Optional witness: compute FI over envelope only (version + metadata; excludes message)
 		#[cfg(feature = "digest")]
@@ -579,9 +592,6 @@ mod tests {
 			let previous_hash = crate::utils::digest::<Sha3_256>(b"previous-message-data")?;
 			let rng = rand_core::OsRng;
 
-			// Create custom flags
-			let flags = crate::flags::Flags::<2>::from([0x01, 0x02]);
-
 			builder
 				.with_message(msg)
 				.with_id("test_v2_full")
@@ -595,7 +605,7 @@ mod tests {
 				.with_priority(crate::MessagePriority::High)
 				.with_lifetime(3600)
 				.with_previous_hash(previous_hash)
-				.with_matrix(flags)
+				// Matrix removed - V2 doesn't support it (V3+ only)
 				.build()
 		},
 		assertions: |message, result| {
@@ -609,7 +619,7 @@ mod tests {
 			assert!(tightbeam.metadata.confidentiality.is_some());
 			assert!(tightbeam.metadata.compactness.is_some());
 			assert!(tightbeam.metadata.previous_frame.is_some());
-			assert!(tightbeam.metadata.matrix.is_some());
+			assert!(tightbeam.metadata.matrix.is_none()); // Matrix is V3+ only
 			assert!(tightbeam.integrity.is_some());
 			assert!(tightbeam.nonrepudiation.is_some());
 

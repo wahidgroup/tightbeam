@@ -180,7 +180,9 @@ The I(t) constraint informs all protocol design decisions.
 
 ### 1.2 Requirements Language
 
-The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC2119](https://datatracker.ietf.org/doc/html/rfc2119).
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
+"SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
+interpreted as described in [RFC2119](https://datatracker.ietf.org/doc/html/rfc2119).
 
 ## 2. Terminology
 The following project terms MUST be used consistently:
@@ -231,6 +233,9 @@ following bounds:
   - OPTIONAL: Priority levels (7-level enumeration)
   - OPTIONAL: Message lifetime (64-bit TTL)
   - OPTIONAL: State chaining (previous message integrity)
+
+- VERSION 3
+  - Inherits: All V2 features
   - OPTIONAL: Matrix control (NxN matrix flags)
 
 ### 4.1.1 SecurityProfile Trait Architecture
@@ -507,6 +512,8 @@ pub struct Metadata {
 	#[asn1(context_specific = "4", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub previous_frame: Option<DigestInfo>,
+
+	// V3+ fields
 	#[asn1(context_specific = "5", optional = "true")]
 	pub matrix: Option<Asn1Matrix>,
 }
@@ -650,6 +657,8 @@ Metadata ::= SEQUENCE {
 	priority         [2] MessagePriority OPTIONAL,
 	lifetime         [3] INTEGER OPTIONAL,
 	previous_frame   [4] DigestInfo OPTIONAL,
+
+	-- V3+ fields (context-specific tags)
 	matrix           [5] Matrix OPTIONAL
 }
 ```
@@ -737,7 +746,12 @@ and SHOULD NOT use MD5 or SHA-1 for new deployments.
 
 #### Version 2 (V2)
 - INHERITS: All V1 requirements
-- OPTIONAL: `priority`, `lifetime`, ``previous_frame``, `matrix`
+- OPTIONAL: `priority`, `lifetime`, ``previous_frame``
+- FORBIDDEN: All V3+ specific fields
+
+#### Version 3 (V3)
+- INHERITS: All V2 requirements
+- OPTIONAL: `matrix`
 
 ### 5.7 Semantic Constraints
 
@@ -1012,7 +1026,8 @@ IMPORTS
 Version ::= ENUMERATED {
 	v0(0),
 	v1(1),
-	v2(2)
+	v2(2),
+	v3(3)
 }
 
 -- Message priority enumeration
@@ -1111,7 +1126,8 @@ and delegates key lifecycle management to applications:
 
 - V0: No security features
 - V1: Optional integrity and confidentiality support
-- V2: Enhanced with priority, lifetime, state chaining, and matrix controls
+- V2: Enhanced with priority, lifetime, and state chaining
+- V3: Enhanced with matrix controls
 
 ### 7.3 ASN.1 Security Considerations
 

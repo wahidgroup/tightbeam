@@ -123,41 +123,43 @@ impl MetadataBuilder {
 			None
 		};
 
-		match version {
-			Version::V0 => Ok(Metadata {
-				id,
-				order,
-				compactness,
-				integrity: None,
-				confidentiality: None,
-				priority: None,
-				lifetime: None,
-				previous_frame: None,
-				matrix: None,
-			}),
-			Version::V1 => Ok(Metadata {
-				id,
-				order,
-				compactness,
-				confidentiality,
-				integrity,
-				priority: None,
-				lifetime: None,
-				previous_frame: None,
-				matrix: None,
-			}),
-			Version::V2 => Ok(Metadata {
-				id,
-				order,
-				compactness,
-				integrity,
-				confidentiality,
-				priority,
-				lifetime,
-				previous_frame,
-				matrix,
-			}),
-		}
+		// Use VersionCapabilities trait to determine which fields are allowed
+		// This keeps the specification with Version and instruments the builder
+		Ok(Metadata {
+			id,
+			order,
+			compactness,
+			integrity: if version.allows_integrity() {
+				integrity
+			} else {
+				None
+			},
+			confidentiality: if version.allows_confidentiality() {
+				confidentiality
+			} else {
+				None
+			},
+			priority: if version.allows_priority() {
+				priority
+			} else {
+				None
+			},
+			lifetime: if version.allows_lifetime() {
+				lifetime
+			} else {
+				None
+			},
+			previous_frame: if version.allows_previous_frame() {
+				previous_frame
+			} else {
+				None
+			},
+			matrix: if version.allows_matrix() {
+				matrix
+			} else {
+				None
+			},
+		})
 	}
 
 	/// Check if ID is set
@@ -230,6 +232,11 @@ mod tests {
 					}
 					Version::V2 => {
 						assert!(metadata.priority.is_some());
+						assert!(metadata.matrix.is_none());
+					}
+					Version::V3 => {
+						assert!(metadata.priority.is_some());
+						assert!(metadata.matrix.is_some());
 					}
 				}
 			}
@@ -263,6 +270,18 @@ mod tests {
 			.with_integrity_info(create_test_hash_info())
 			.with_priority(MessagePriority::High)
 			.with_lifetime(3600)
+	);
+
+	test_metadata_builder!(
+		test_metadata_builder_v3,
+		Version::V3,
+		MetadataBuilder::from(Version::V3)
+			.with_id("test-id-v3")
+			.with_order(1696521600u64)
+			.with_integrity_info(create_test_hash_info())
+			.with_priority(MessagePriority::High)
+			.with_lifetime(3600)
+			.with_matrix(MatrixDyn::try_from(2u8).unwrap())
 	);
 
 	#[test]

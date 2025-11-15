@@ -91,64 +91,6 @@ pub(crate) fn restart_game(
 }
 
 // ============================================================================
-// ASSERTION SPEC
-// ============================================================================
-
-tb_assert_spec! {
-	pub ChessAssertSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Accepted,
-		assertions: [
-			(Any, "move_sent", exactly!(1)),
-			// Either move_validated or move_rejected (mutually exclusive)
-			(Any, "move_validated", at_least!(0)),
-			(Any, "move_rejected", at_least!(0)),
-			// server_move only if move was validated
-			(Any, "server_move", at_least!(0)),
-			// game_ended only if game terminates
-			(Any, "game_ended", at_least!(0)),
-		]
-	},
-}
-
-// ============================================================================
-// CSP PROCESS SPECS (LAYERED)
-// ============================================================================
-
-tb_process_spec! {
-	pub struct ChessGameFlow;
-	events {
-		observable { "move_request", "move_valid", "move_invalid", "move_response", "game_over" }
-		hidden { }
-	}
-	states {
-		WaitingForMove => { "move_request" => ValidatingMove },
-		ValidatingMove => { "move_valid" => ProcessingMove, "move_invalid" => WaitingForMove },
-		ProcessingMove => { "move_response" => WaitingForMove, "game_over" => GameOver },
-		GameOver => {}
-	}
-	terminal { GameOver }
-	annotations { description: "High-level chess game protocol flow" }
-}
-
-tb_process_spec! {
-	pub struct ChessRules;
-	events {
-		observable { "pawn_move", "rook_move", "knight_move", "bishop_move", "queen_move", "king_move", "check", "checkmate", "stalemate" }
-		hidden { }
-	}
-	states {
-		GameStart => { "pawn_move" => InGame, "rook_move" => InGame, "knight_move" => InGame, "bishop_move" => InGame, "queen_move" => InGame, "king_move" => InGame },
-		InGame => { "pawn_move" => InGame, "rook_move" => InGame, "knight_move" => InGame, "bishop_move" => InGame, "queen_move" => InGame, "king_move" => InGame, "check" => InCheck, "stalemate" => GameEnd },
-		InCheck => { "king_move" => InGame, "checkmate" => GameEnd },
-		GameEnd => {}
-	}
-	terminal { GameEnd }
-	annotations { description: "Detailed chess rules state machine" }
-}
-
-// ============================================================================
 // CHESS ENGINE SERVLET
 // ============================================================================
 

@@ -99,6 +99,10 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+pub(crate) mod frame;
+/// The Version is a fundamental constraint
+pub(crate) mod version;
+
 pub mod asn1;
 pub mod constants;
 pub mod core;
@@ -197,8 +201,8 @@ mod tests {
 		use crate::x509::name::Name;
 		use crate::x509::serial_number::SerialNumber;
 
-		// Create a 6x6 matrix with all zeros
-		let matrix = Asn1Matrix { n: 6, data: vec![0; 36] };
+		// Create a 255x255 matrix with all zeros
+		let matrix = Asn1Matrix { n: 6, data: vec![0; 255] };
 
 		// Create metadata with all optional fields
 		let metadata = Metadata {
@@ -231,8 +235,16 @@ mod tests {
 		};
 
 		// Create frame with empty message
+		// Compile-time validation built into Frame: V3 must support matrix since metadata has matrix
+		// This will fail to compile if V3 doesn't support matrix
+		const _: () = {
+			const VERSION: Version = Version::V3;
+			const HAS_MATRIX: bool = true; // metadata has matrix
+								  // Use Frame's built-in compile-time validation method
+			let _ = [(); 1][!Frame::const_validate_version_fields(VERSION, HAS_MATRIX) as usize];
+		};
 		let frame = Frame {
-			version: Version::V2,
+			version: Version::V3,
 			metadata,
 			message: vec![], // empty message
 			integrity: Some(DigestInfo {

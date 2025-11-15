@@ -72,7 +72,7 @@ build:
 	cargo build --release $(if $(features),--features "$(features)")
 	@echo "Generating feature test scripts..."
 	mkdir -p built
-	rustc scripts/generate_feature_tests.rs -o built/generate_feature_tests
+	rustc utils/generate_feature_tests.rs -o built/generate_feature_tests
 	./built/generate_feature_tests --output-dir built
 
 # Clean build artifacts
@@ -171,13 +171,13 @@ test-fuzz: build-fuzz
 		fi; \
 		echo ""; \
 		if [ "$$CRASHES" -gt 0 ]; then \
-			echo "⚠️  Crashes detected! Review them at:"; \
-			echo "   built/fuzz/out/default/crashes/"; \
+			echo "[!] Crashes detected! Review them at:"; \
+			echo "    built/fuzz/out/default/crashes/"; \
 			echo ""; \
 		fi; \
 		if [ "$$HANGS" -gt 0 ]; then \
-			echo "⚠️  Hangs detected! Review them at:"; \
-			echo "   built/fuzz/out/default/hangs/"; \
+			echo "[!] Hangs detected! Review them at:"; \
+			echo "    built/fuzz/out/default/hangs/"; \
 			echo ""; \
 		fi; \
 	else \

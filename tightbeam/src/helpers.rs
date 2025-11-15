@@ -9,12 +9,11 @@ use crate::der::{Decode, Encode};
 use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
 use crate::error::Result;
 use crate::matrix::MatrixError;
-use crate::Asn1Matrix;
+use crate::{Asn1Matrix, Frame};
 
 #[cfg(feature = "signature")]
 use crate::{SignerInfo, TightBeamError};
 
-#[cfg(feature = "signature")]
 pub type SignatureVerifier<E = TightBeamError> = Box<dyn FnOnce(&[u8], &SignerInfo) -> core::result::Result<(), E>>;
 #[cfg(feature = "digest")]
 pub type Digestor<E = TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::Result<crate::DigestInfo, E>>;
@@ -22,6 +21,12 @@ pub type Digestor<E = TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::R
 pub type KeyDeriver<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8], &[u8], usize) -> core::result::Result<Vec<u8>, E>>;
 #[cfg(feature = "aead")]
 pub type KeyWrapper<E = TightBeamError> = Box<dyn Fn(&[u8], &[u8]) -> core::result::Result<Vec<u8>, E>>;
+
+impl AsRef<Frame> for Frame {
+	fn as_ref(&self) -> &Frame {
+		self
+	}
+}
 
 impl Asn1Matrix {
 	/// Validate invariants per spec.

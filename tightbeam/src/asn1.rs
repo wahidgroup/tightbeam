@@ -24,7 +24,8 @@ pub use crate::x509::ext::pkix::SignatureAlgorithm;
 /// Version ::= ENUMERATED {
 ///     v0(0),
 ///     v1(1),
-///     v2(2)
+///     v2(2),
+///     v3(3)
 /// }
 /// ```
 #[repr(u8)]
@@ -33,6 +34,7 @@ pub enum Version {
 	V0 = 0,
 	V1 = 1,
 	V2 = 2,
+	V3 = 3,
 }
 
 /// Message priority levels (V2+)
@@ -181,18 +183,4 @@ pub struct Frame {
 	#[asn1(context_specific = "1", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub nonrepudiation: Option<SignerInfo>,
-}
-
-impl AsRef<Frame> for Frame {
-	fn as_ref(&self) -> &Frame {
-		self
-	}
-}
-
-// Transport handshake attribute OIDs (FULL_CMS profile)
-// Enterprise arc placeholder: 1.3.6.1.4.1.55555.1.x
-// Replace 55555 with assigned enterprise number before production.
-#[cfg(feature = "transport")]
-pub mod transport {
-	// These constants are now defined in constants.rs
 }
