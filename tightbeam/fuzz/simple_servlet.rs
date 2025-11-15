@@ -52,7 +52,7 @@ servlet! {
 		let doubled = (req.value as u16) * 2;
 
 		// DEBUG: Track response creation
-		let _ = std::fs::write("/tmp/simple_servlet_response_created.txt", format!("response_created: doubled={}\n", doubled));
+		let _ = std::fs::write("/tmp/simple_servlet_response_created.txt", format!("response_created: doubled={doubled}\n"));
 
 		let response = NumberResponse { doubled };
 
@@ -81,7 +81,7 @@ tb_assert_spec! {
 }
 
 tb_process_spec! {
-	pub struct SimpleServletFlow;
+	pub SimpleServletFlow,
 	events {
 		observable { "request_sent", "response_received" }
 		hidden { }

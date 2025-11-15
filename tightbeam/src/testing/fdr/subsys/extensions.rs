@@ -112,10 +112,11 @@ impl FdrTraceExt for ConsumedTrace {
 		}
 
 		// If gate accepted, we expect handler evidence (assertions or response)
-		if matches!(self.gate_decision, Some(TransitStatus::Accepted)) {
-			if self.assertions.is_empty() && self.response.is_none() {
-				return false; // Handler should have done something
-			}
+		if matches!(self.gate_decision, Some(TransitStatus::Accepted))
+			&& self.assertions.is_empty()
+			&& self.response.is_none()
+		{
+			return false; // Handler should have done something
 		}
 
 		true
@@ -390,9 +391,9 @@ impl FdrTraceExt for ConsumedTrace {
 		let s_initial = State(INITIAL);
 		let s_terminal = State(TERMINAL);
 
-		states.insert(s_initial.clone());
-		states.insert(s_terminal.clone());
-		terminal.insert(s_terminal.clone());
+		states.insert(s_initial);
+		states.insert(s_terminal);
+		terminal.insert(s_terminal);
 
 		// Collect events based on mode
 		#[derive(Clone)]
@@ -418,7 +419,7 @@ impl FdrTraceExt for ConsumedTrace {
 		// Always include assertions
 		for assertion in &self.assertions {
 			let AssertionLabel::Custom(label) = &assertion.label;
-			events.push(TraceEvent::Assertion { seq: assertion.seq, label: *label });
+			events.push(TraceEvent::Assertion { seq: assertion.seq, label });
 		}
 
 		// Include instrumentation events based on mode
@@ -497,10 +498,10 @@ impl FdrTraceExt for ConsumedTrace {
 				);
 			}
 
-			let mut from_state = s_initial.clone();
+			let mut from_state = s_initial;
 			for (idx, event) in events.iter().enumerate() {
 				let (event, is_hidden) = match event {
-					TraceEvent::Assertion { label, .. } => (Event(*label), false),
+					TraceEvent::Assertion { label, .. } => (Event(label), false),
 					#[cfg(feature = "instrument")]
 					TraceEvent::ObservableInstrumentation { label, .. } => {
 						let static_label: &'static str = Box::leak(label.clone().into_boxed_str());
@@ -522,15 +523,15 @@ impl FdrTraceExt for ConsumedTrace {
 
 				// Add transition: last event goes to terminal, others use intermediate states
 				let to_state = if idx == events.len() - 1 {
-					s_terminal.clone()
+					s_terminal
 				} else {
 					let state_name = INTERMEDIATE_STATES[idx];
 					let to_state = State(state_name);
-					states.insert(to_state.clone());
+					states.insert(to_state);
 					to_state
 				};
 
-				transitions.add(from_state.clone(), event, to_state.clone());
+				transitions.add(from_state, event, to_state);
 				from_state = to_state;
 			}
 		}

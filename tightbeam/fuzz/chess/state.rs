@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 use super::piece;
 use tightbeam::matrix::{Matrix, MatrixLike};
 
@@ -83,8 +85,8 @@ impl ChessGameState {
 		// Piece-specific movement validation
 		let row_diff = to_row as i8 - from_row as i8;
 		let col_diff = to_col as i8 - from_col as i8;
-		let row_diff_abs = row_diff.abs() as u8;
-		let col_diff_abs = col_diff.abs() as u8;
+		let row_diff_abs = row_diff.unsigned_abs();
+		let col_diff_abs = col_diff.unsigned_abs();
 
 		match piece {
 			piece::WHITE_PAWN | piece::BLACK_PAWN => {
@@ -255,7 +257,6 @@ impl ChessGameState {
 		}
 
 		// Prefer moves that put opponent in check (creates checkmate opportunities)
-		let piece = self.board.get(from_row, from_col);
 		let mut test_state = self.clone();
 		test_state.make_move(from_row, from_col, to_row, to_col);
 		if test_state.is_in_check(!is_white_turn) {
@@ -268,10 +269,8 @@ impl ChessGameState {
 			if to_row < 4 {
 				score += 5; // Moving toward black's side
 			}
-		} else {
-			if to_row > 3 {
-				score += 5; // Moving toward white's side
-			}
+		} else if to_row > 3 {
+			score += 5; // Moving toward white's side
 		}
 
 		score
@@ -322,19 +321,16 @@ impl ChessGameState {
 		// This is similar to validate_move but doesn't check turn or destination occupancy
 		let row_diff = to_row as i8 - from_row as i8;
 		let col_diff = to_col as i8 - from_col as i8;
-		let row_diff_abs = row_diff.abs() as u8;
-		let col_diff_abs = col_diff.abs() as u8;
+		let row_diff_abs = row_diff.unsigned_abs();
+		let col_diff_abs = col_diff.unsigned_abs();
 
 		match piece {
 			piece::WHITE_PAWN | piece::BLACK_PAWN => {
 				let is_white_piece = piece::is_white(piece);
 				// Pawns attack diagonally forward
-				if (is_white_piece && row_diff < 0 && row_diff_abs == 1 && col_diff_abs == 1)
-					|| (!is_white_piece && row_diff > 0 && row_diff_abs == 1 && col_diff_abs == 1)
-				{
-					return true;
-				}
-				false
+				row_diff_abs == 1
+					&& col_diff_abs == 1
+					&& ((is_white_piece && row_diff < 0) || (!is_white_piece && row_diff > 0))
 			}
 			piece::WHITE_ROOK | piece::BLACK_ROOK => {
 				// Rook attacks horizontally or vertically
@@ -508,4 +504,3 @@ impl TryFrom<&tightbeam::Asn1Matrix> for ChessGameState {
 		})
 	}
 }
-

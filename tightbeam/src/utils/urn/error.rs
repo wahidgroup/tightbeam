@@ -17,10 +17,7 @@ pub enum ValidationError {
 	RequiredFieldMissing(&'static str),
 
 	/// A field has an invalid format
-	InvalidFormat {
-		field: &'static str,
-		pattern: &'static str,
-	},
+	InvalidFormat { field: &'static str, pattern: &'static str },
 
 	/// Cross-field validation rule violated
 	CrossFieldViolation(&'static str),
@@ -35,17 +32,16 @@ pub enum ValidationError {
 impl fmt::Display for ValidationError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::RequiredFieldMissing(field) => write!(f, "Required field missing: {}", field),
+			Self::RequiredFieldMissing(field) => write!(f, "Required field missing: {field}"),
 			Self::InvalidFormat { field, pattern } => {
-				write!(f, "Invalid format for field '{}': expected pattern {}", field, pattern)
+				write!(f, "Invalid format for field '{field}': expected pattern {pattern}")
 			}
-			Self::CrossFieldViolation(msg) => write!(f, "Cross-field validation failed: {}", msg),
-			Self::ForbiddenFieldPresent(field) => write!(f, "Forbidden field present: {}", field),
-			Self::InvalidNid(msg) => write!(f, "Invalid NID: {}", msg),
+			Self::CrossFieldViolation(msg) => write!(f, "Cross-field validation failed: {msg}"),
+			Self::ForbiddenFieldPresent(field) => write!(f, "Forbidden field present: {field}"),
+			Self::InvalidNid(msg) => write!(f, "Invalid NID: {msg}"),
 		}
 	}
 }
 
 #[cfg(feature = "std")]
 impl std::error::Error for ValidationError {}
-

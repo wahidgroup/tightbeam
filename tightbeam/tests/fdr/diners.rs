@@ -14,7 +14,7 @@ tightbeam::tb_process_spec! {
 	/// Fork sharing: P1's right fork = P2's left fork, P1's left fork = P2's right fork
 	/// Deadlock occurs when both pick their left fork - neither can pick right fork.
 	/// Events: thinks, sits, picks_left, picks_right, eats, puts_down_left, puts_down_right, gets_up
-	pub struct DiningPhilosophers;
+	pub DiningPhilosophers,
 	events {
 		observable { "thinks", "sits", "picks_left", "picks_right", "eats", "puts_down_left", "puts_down_right", "gets_up" }
 		hidden { }
@@ -110,7 +110,7 @@ tightbeam::tb_process_spec! {
 	/// The butler ensures at most N-1 philosophers can sit, preventing deadlock.
 	/// With 2 philosophers, at most 1 can sit at a time.
 	/// This prevents the deadlock scenario where both pick their left fork.
-	pub struct DeadlockFreePhilosophers;
+	pub DeadlockFreePhilosophers,
 	events {
 		observable { "thinks", "sits", "picks_left", "picks_right", "eats", "puts_down_left", "puts_down_right", "gets_up" }
 		hidden { }

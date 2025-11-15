@@ -41,11 +41,11 @@ impl PartialEq for AssertionValue {
 			// NotNone matches any Some(_) value
 			(Self::NotNone, Self::Some(_)) => true,
 			(Self::Some(_), Self::NotNone) => true,
+			// NotNone matches NotNone (both represent "some value exists")
+			(Self::NotNone, Self::NotNone) => true,
 			// NotNone does not match None
 			(Self::NotNone, Self::None) => false,
 			(Self::None, Self::NotNone) => false,
-			// NotNone does not match NotNone (we want it to match Some(_), not itself)
-			(Self::NotNone, Self::NotNone) => false,
 			// Standard comparisons for other variants
 			(Self::String(a), Self::String(b)) => a == b,
 			(Self::Bool(a), Self::Bool(b)) => a == b,
@@ -245,14 +245,14 @@ impl AssertionContract {
 	pub fn describe(&self) -> String {
 		let cardinality_desc = self.cardinality.describe();
 		let tag_desc = if let Some(ref tags) = self.tag_filter {
-			format!(" with tags {:?}", tags)
+			format!(" with tags {tags:?}")
 		} else {
 			String::new()
 		};
 		if let Some(ref expected) = self.expected_value {
-			format!("{} with value {:?}{}", cardinality_desc, expected, tag_desc)
+			format!("{cardinality_desc} with value {expected:?}{tag_desc}")
 		} else {
-			format!("{}{}", cardinality_desc, tag_desc)
+			format!("{cardinality_desc}{tag_desc}")
 		}
 	}
 }

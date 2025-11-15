@@ -4,7 +4,7 @@ use super::state::ChessGameState;
 use tightbeam::der::Enumerated;
 use tightbeam::testing::macros::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::{at_least, compose, decode, exactly, servlet, tb_assert_spec, tb_process_spec, Beamable, Sequence};
+use tightbeam::{compose, decode, servlet, Beamable, Sequence};
 
 // ============================================================================
 // MESSAGE TYPES
@@ -46,6 +46,7 @@ pub(crate) enum GameStatusCode {
 /// Turn is derived from Frame.metadata.order:
 /// - Even order (0, 2, 4, ...) = White's turn
 /// - Odd order (1, 3, 5, ...) = Black's turn
+///
 /// Move count = order (monotonically incrementing)
 pub(crate) fn is_white_turn(order: u64) -> bool {
 	order % 2 == 0
@@ -154,7 +155,7 @@ servlet! {
 		// Sync client board state if provided (preserve capture tracking)
 		if let Some(client_state) = client_state {
 			let server_piece_count_before = game_state.count_pieces();
-			*game_state.board_mut() = client_state.board().clone();
+			*game_state.board_mut() = *client_state.board();
 			let client_piece_count = client_state.count_pieces();
 			// Detect captures by comparing piece counts
 			if client_piece_count < server_piece_count_before {

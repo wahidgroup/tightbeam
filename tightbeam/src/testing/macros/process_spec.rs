@@ -6,7 +6,7 @@
 ///
 /// ```ignore
 /// tb_process_spec! {
-///     pub struct HandshakeSpec;
+///     pub HandshakeSpec,
 ///     events {
 ///         observable { "start", "send", "ack", "fail" }
 ///         hidden { "serialize", "encrypt", "queue", "dispatch" }
@@ -34,7 +34,7 @@ macro_rules! tb_process_spec {
 	// Main pattern with all sections
 	(
 		$(#[$meta:meta])*
-		$vis:vis struct $name:ident;
+		$vis:vis $name:ident,
 		events {
 			observable { $($obs_event:expr),* $(,)? }
 			hidden { $($hid_event:expr),* $(,)? }

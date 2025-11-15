@@ -8,7 +8,9 @@ ignorePaths:
   - "**/*.toml"
   - "**/*.json"
 words:
+  - Abbasi
   - addrs
+  - Aschermann
   - Beamable
   - Boulgakov
   - CBVOC
@@ -44,6 +46,7 @@ words:
   - HKDF
   - HMAC
   - Hoare
+  - Holz
   - I_DONT_CARE
   - ijon
   - Keccak
@@ -81,7 +84,9 @@ words:
   - RUSTFLAGS
   - rustup
   - rwlock
+  - SBMF
   - schnorr
+  - Schumilo
   - SECG
   - seckey
   - Secp

@@ -6,6 +6,7 @@
 //!   mkdir -p fuzz_in && echo "seed" > fuzz_in/seed.txt
 //!   cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/deps/simple_workflow-*
 
+#![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
@@ -25,7 +26,7 @@ tb_assert_spec! {
 }
 
 tb_process_spec! {
-	pub struct SimpleFuzzProc;
+	pub SimpleFuzzProc,
 	events {
 		observable { "start", "action_a", "action_b", "done" }
 		hidden { }

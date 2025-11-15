@@ -100,10 +100,7 @@ impl<'a> Urn<'a> {
 	/// Convert the URN to an owned version with 'static lifetime
 	#[inline]
 	pub fn into_owned(self) -> Urn<'static> {
-		Urn {
-			nid: Cow::Owned(self.nid.into_owned()),
-			nss: Cow::Owned(self.nss.into_owned()),
-		}
+		Urn { nid: Cow::Owned(self.nid.into_owned()), nss: Cow::Owned(self.nss.into_owned()) }
 	}
 
 	/// Validate that the NID conforms to RFC 8141
@@ -111,7 +108,7 @@ impl<'a> Urn<'a> {
 	/// NID must be 2-32 characters, alphanumeric plus hyphens, starting with a letter.
 	pub fn validate_nid(nid: &str) -> Result<(), ValidationError> {
 		let len = nid.len();
-		if len < 2 || len > 32 {
+		if !(2..=32).contains(&len) {
 			return Err(ValidationError::InvalidNid("NID must be 2-32 characters"));
 		}
 
@@ -270,7 +267,7 @@ mod tests {
 			.build_with(|builder| {
 				let type_val = builder.get("type").ok_or(ValidationError::RequiredFieldMissing("type"))?;
 				let id_val = builder.get("id").ok_or(ValidationError::RequiredFieldMissing("id"))?;
-				Ok(format!("{}:{}", type_val, id_val).into())
+				Ok(format!("{type_val}:{id_val}").into())
 			})
 			.unwrap();
 
@@ -289,10 +286,7 @@ mod tests {
 		let borrowed_nid = "tightbeam";
 		let borrowed_nss = "test:resource";
 
-		let urn = Urn {
-			nid: Cow::Borrowed(borrowed_nid),
-			nss: Cow::Borrowed(borrowed_nss),
-		};
+		let urn = Urn { nid: Cow::Borrowed(borrowed_nid), nss: Cow::Borrowed(borrowed_nss) };
 
 		let owned_urn = urn.into_owned();
 
@@ -302,4 +296,3 @@ mod tests {
 		assert_eq!(owned_urn.nss, "test:resource");
 	}
 }
-

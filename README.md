@@ -1797,7 +1797,6 @@ Testing workers uses the `tb_scenario!` macro with the Worker environment:
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::testing::assertions::AssertionPhase;
 use tightbeam::testing::macros::TraceCollector;
 
 // Define assertion spec for worker behavior
@@ -1807,17 +1806,17 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "relay_start", exactly!(2)),
-			(Response, "relay_success", exactly!(1)),
-			(Response, "response_result", exactly!(1), equals!("PONG")),
-			(Gate, "relay_rejected", exactly!(1))
+			("relay_start", exactly!(2)),
+			("relay_success", exactly!(1)),
+			("response_result", exactly!(1), equals!("PONG")),
+			("relay_rejected", exactly!(1))
 		]
 	},
 }
 
 // Define CSP process spec for worker state machine
 tb_process_spec! {
-	pub struct PingPongWorkerProcess;
+	pub PingPongWorkerProcess,
 	events {
 		observable { "relay_start", "relay_success", "relay_rejected" }
 		hidden { "validate_message", "process_message" }
@@ -1840,7 +1839,7 @@ tb_scenario! {
 		setup: PingPongWorker::new,
 		stimulus: |trace, worker: &mut PingPongWorker| {
 			// Test accepted message
-			trace.assert(AssertionPhase::HandlerStart, "relay_start");
+			trace.assert("relay_start", &[]);
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
@@ -1848,13 +1847,13 @@ tb_scenario! {
 
 			let response = worker.relay(ping_msg)?;
 			if let Some(pong) = response {
-				trace.assert_value(AssertionPhase::Response, "response_result", pong.result);
+				trace.assert_value("response_result", &[], pong.result);
 			}
 
-			trace.assert(AssertionPhase::Response, "relay_success");
+			trace.assert("relay_success", &[]);
 
 			// Test rejected message
-			trace.assert(AssertionPhase::HandlerStart, "relay_start");
+			trace.assert("relay_start", &[]);
 			let pong_msg = RequestMessage {
 				content: "PONG".to_string(),
 				lucky_number: 42,
@@ -1862,7 +1861,7 @@ tb_scenario! {
 
 			let result = worker.relay(pong_msg);
 			if result.is_err() {
-				trace.assert(AssertionPhase::Gate, "relay_rejected");
+				trace.assert("relay_rejected", &[]);
 			}
 
 			Ok(())
@@ -1885,11 +1884,12 @@ a protocol perspective, an anthill is a port in many ways. Servlets are
 multi-threaded and must handle messages asynchronously. A servlet may also
 define as many different workers as it needs to accomplish its task as well
 as a set of configurations. Servlets must be provided a relay which is used to
-relay `Message` types to the worker without the entire Frame.
+relay `Message` types to the worker without the entire Frame. A servlet must
+only be responsible for a single message type.
 
 ```rust
 tightbeam::servlet! {
-	name: PingPongServletWithWorker,
+	pub PingPongServletWithWorker<RequestMessage>,
 	protocol: Listener,
 	config: {
 		lotto_number: u32
@@ -1931,7 +1931,9 @@ tightbeam::servlet! {
 
 **Efficient Parallel Worker Processing**
 
-Workers accept `Arc<Input>` instead of owned `Input` to enable efficient parallel processing without cloning message data. When calling multiple workers in parallel:
+Workers accept `Arc<Input>` instead of owned `Input` to enable efficient
+parallel processing without cloning message data. When calling multiple workers
+in parallel:
 
 - `Arc::new(decoded)` creates a single shared reference-counted pointer to the message
 - `Arc::clone(&decoded_arc)` increments the reference count (cheap operation, no data copying)
@@ -1947,20 +1949,11 @@ let (result1, result2) = tokio::join!(
 );
 ```
 
-**Example using `parallelize()` (requires explicit type annotation):**
-```rust
-let decoded_arc = Arc::new(decoded);
-let (result1, result2) = workers.parallelize::<RequestMessage>(decoded_arc).await;
-```
-
-The `parallelize()` method requires an explicit type parameter because Rust cannot infer the input type that all workers expect. Using `tokio::join!` directly provides better type inference and is the recommended approach.
-
 ##### Testing
 Testing servlets uses the `tb_scenario!` macro with the Servlet environment:
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::testing::assertions::AssertionPhase;
 use tightbeam::testing::macros::TraceCollector;
 
 // Define assertion spec for servlet behavior
@@ -1970,17 +1963,17 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "request_received", exactly!(1)),
-			(Response, "pong_sent", exactly!(1)),
-			(Response, "response_result", exactly!(1), equals!("PONG")),
-			(Response, "is_winner", exactly!(1), equals!(true))
+			("request_received", exactly!(1)),
+			("pong_sent", exactly!(1)),
+			("response_result", exactly!(1), equals!("PONG")),
+			("is_winner", exactly!(1), equals!(true))
 		]
 	},
 }
 
 // Define CSP process spec for servlet state machine
 tb_process_spec! {
-	pub struct PingPongProcess;
+	pub PingPongProcess,
 	events {
 		observable { "request_received", "pong_sent" }
 		hidden { "validate_lucky_number", "format_response" }
@@ -2010,23 +2003,24 @@ tb_scenario! {
 					content: content.unwrap_or_else(|| "PING".to_string()),
 					lucky_number,
 				};
+
 				crate::compose! { V0: id: b"test-ping", message: message }
 			}
 
 			// Client-side assertion before sending
-			trace.assert(AssertionPhase::HandlerStart, "request_received");
+			trace.assert("request_received", &[]);
 
 			// Test winning case
 			let ping_message = generate_message(42, None)?;
 			let response = client.emit(ping_message, None).await?;
-			let response_message = crate::decode::<ResponseMessage, _>(&response.unwrap().message)?;
+			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
 
 			// Emit value assertions for spec verification
-			trace.assert_value(AssertionPhase::Response, "response_result", response_message.result);
-			trace.assert_value(AssertionPhase::Response, "is_winner", response_message.is_winner);
+			trace.assert_value("response_result", &[], response_message.result);
+			trace.assert_value("is_winner", &[], response_message.is_winner);
 
 			// Client-side assertion after receiving
-			trace.assert(AssertionPhase::Response, "pong_sent");
+			trace.assert("pong_sent", &[]);
 
 			Ok(())
 		}
@@ -2041,7 +2035,7 @@ The Servlet environment automatically:
 - Collects assertions from both servlet handlers and client code
 - Verifies against the spec and CSP after execution
 
-#### 9.3.3 C: Clusters
+#### 9.3.3 C: Clusters - WIP
 
 Clusters orchestrate multiple servlets and workers. They are the "ant colonies"
 of the EECI. Colonies are made up of multiple servlets which command different
@@ -2055,7 +2049,7 @@ the cluster.
 // TODO
 ```
 
-#### 9.3.4 I: Drones & Hives
+#### 9.3.4 I: Drones & Hives - WIP
 
 Drones are containerized servlet runners that can dynamically morph between
 different servlet types based on command messages from a cluster. This
@@ -2076,8 +2070,56 @@ address but can have multiple ports (SocketAddress). This allows the hive to
 establish a servlet on different ports and provide the protocol address to the
 cluster so it can register it under its hive.
 
+**Regular Drone Example** (morphs between servlets one at a time):
+
 ```rust
-// TODO
+tightbeam::drone! {
+	pub RegularDrone,
+	protocol: Listener,
+	servlets: {
+		ping_pong: PingPongServletWithWorker<RequestMessage>,
+		other_servlet: OtherServlet<RequestMessage>
+	}
+}
+
+// Start the drone
+let drone = RegularDrone::start(None).await?;
+
+// Register with cluster
+let cluster_addr = "127.0.0.1:8888".parse()?;
+let response = drone.register_with_cluster(cluster_addr).await?;
+```
+
+**Hive Example** (manages multiple servlets simultaneously on different ports):
+
+```rust
+tightbeam::drone! {
+	pub MyHive,
+	protocol: TokioListener,
+	hive: true,
+	servlets: {
+		ping_pong: PingPongServletWithWorker<RequestMessage>,
+		other_servlet: OtherServlet<RequestMessage>
+	}
+}
+
+// Start the hive
+let hive = MyHive::start(None).await?;
+```
+
+**Drone with Policies**:
+
+```rust
+tightbeam::drone! {
+	pub SecureDrone,
+	protocol: Listener,
+	policies: {
+		with_collector_gate: [SignatureGate::new(verifying_key)]
+	},
+	servlets: {
+		ping_pong: PingPongServletWithWorker<RequestMessage>
+	}
+}
 ```
 
 ##### Conclusion
@@ -2204,16 +2246,19 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
+		tag_filter: ["v1"],
 		assertions: [
-			(HandlerStart, "Received", exactly!(1))
+			("Received", exactly!(1)),
+			("Responded", exactly!(1), equals!("ok"))
 		]
 	},
 	V(1,1,0): {
 		mode: Accept,
 		gate: Accepted,
+		tag_filter: ["v1.1"],
 		assertions: [
-			(HandlerStart, "Received", exactly!(1)),
-			(Response, "Responded", exactly!(2))
+			("Received", exactly!(1)),
+			("Responded", exactly!(2))
 		]
 	},
 }
@@ -2224,8 +2269,10 @@ tb_assert_spec! {
 V(major, minor, patch): {
 	mode: <ExecutionMode>,              // Accept or Reject
 	gate: <TransitStatus>,              // Accepted, Rejected, etc.
-	assertions: [                       // Array of (Phase, label, cardinality)
-		(Phase, "label", cardinality),
+	tag_filter: ["tag1", "tag2"],       // Optional: filter assertions by tags
+	assertions: [                       // Array of (label, cardinality) or (label, cardinality, equals!(value))
+		("label", cardinality),
+		("label", cardinality, equals!(value)),
 		...
 	],
 	events: [Kind, ...]                 // Optional: when instrumentation enabled
@@ -2238,7 +2285,8 @@ V(major, minor, patch): {
 - Spec identifier
 - Mode code
 - Gate presence and value
-- Normalized assertions (sorted by `(label, phase)`)
+- Tag filter (if present)
+- Normalized assertions (sorted by label)
 - Optional event kinds
 
 #### 10.2.3 Implementation Examples
@@ -2250,17 +2298,19 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
+		tag_filter: ["v1"],
 		assertions: [
-			(HandlerStart, "A", exactly!(1)),
-			(Response, "R", exactly!(1))
+			("A", exactly!(1)),
+			("R", exactly!(1))
 		]
 	},
 	V(1,1,0): {
 		mode: Accept,
 		gate: Accepted,
+		tag_filter: ["v1.1"],
 		assertions: [
-			(HandlerStart, "A", exactly!(1)),
-			(Response, "R", exactly!(2))
+			("A", exactly!(1)),
+			("R", exactly!(2))
 		]
 	},
 }
@@ -2296,7 +2346,69 @@ The framework provides cardinality constraint macros:
 #### 10.2.6 Value Assertion Helpers
 
 The framework provides value assertion helpers for verifying assertion payload values:
-- `equals!(value)`: Verify assertion value equality (supports String, bool, u8, u32, u64, i32, i64)
+- `equals!(value)`: Verify assertion value equality
+
+**Supported Types**:
+- **Primitives**: `String`, `&str`, `bool`, `u8`, `u32`, `u64`, `i32`, `i64`, `f64`
+- **Numeric literals**: `equals!(3_600)`, `equals!(42u32)`
+- **Enums**: `MessagePriority`, `Version` (e.g., `equals!(MessagePriority::High)`, `equals!(Version::V2)`)
+- **Options**: `equals!(Some(value))`, `equals!(None)`
+- **Option presence**: `equals!(IsSome)` (matches any `Some(_)`), `equals!(IsNone)` (matches `None`)
+
+**Examples**:
+```rust
+assertions: [
+	("priority", exactly!(1), equals!(MessagePriority::High)),
+	("lifetime", exactly!(1), equals!(3_600)),
+	("version", exactly!(1), equals!(Version::V2)),
+	("confidentiality", exactly!(1), equals!(IsSome)),
+	("optional_field", exactly!(1), equals!(None))
+]
+```
+
+#### 10.2.7 Tag-Based Assertion Filtering
+
+Assertions can be tagged with arbitrary string labels for flexible categorization and filtering. Tags enable version-scoped testing where a single scenario can validate multiple protocol versions.
+
+**How Tags Work**:
+- Assertions are emitted with tags: `trace.assert("label", &["tag1", "tag2"])`
+- Specs filter assertions using `tag_filter: ["tag1"]` - only assertions with matching tags are validated
+- A single assertion can satisfy multiple specs by including multiple tags
+
+**Example: Version-Scoped Testing**:
+```rust
+tb_assert_spec! {
+	pub VersionSpec,
+	V(0,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		tag_filter: ["v0"],
+		assertions: [
+			("feature", exactly!(1), equals!(IsNone))
+		]
+	},
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		tag_filter: ["v1"],
+		assertions: [
+			("feature", exactly!(1), equals!(IsSome))
+		]
+	}
+}
+
+tb_scenario! {
+	name: test_all_versions,
+	specs: [VersionSpec::get(0, 0, 0), VersionSpec::get(1, 0, 0)],
+	environment Bare {
+		exec: |trace| {
+			// Single assertion satisfies both version specs via tags
+			trace.assert_option("feature", &["v0", "v1"], &some_option);
+			Ok(())
+		}
+	}
+}
+```
 
 ### 10.3 Layer 2: Process Specifications (CSP)
 
@@ -2317,7 +2429,7 @@ Enabled with `testing-csp` feature flag.
 
 ```rust
 tb_process_spec! {
-	pub struct ProcessName;
+	pub ProcessName,
 	events {
 		observable { "event1", "event2", ... }   // External alphabet (Σ)
 		hidden { "internal1", "internal2", ... } // Internal alphabet (τ)
@@ -2348,7 +2460,7 @@ When `csp:` is specified in `tb_scenario!`:
 use tightbeam::testing::*;
 
 tb_process_spec! {
-	pub struct SimpleProcess;
+	pub SimpleProcess,
 	events {
 		observable { "Received", "Responded" }
 		hidden { "internal_processing" }
@@ -2423,7 +2535,7 @@ fdr: FdrConfig {
 ```rust
 // Define a simple two-state process
 tb_process_spec! {
-	pub struct SimpleProcess;
+	pub SimpleProcess,
 	events {
 		observable { "start", "finish" }
 		hidden { }
@@ -2577,7 +2689,7 @@ events (internal actions τ). This distinction is fundamental to process refinem
 
 ```rust
 tb_process_spec! {
-	pub struct ClientServerProcess;
+	pub ClientServerProcess,
 	events {
 		// Observable alphabet (Σ): externally visible protocol events
 		observable { "connect", "request", "response", "disconnect" }
@@ -2784,7 +2896,6 @@ See sections 10.3.4 and 10.4 for detailed environment examples.
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::testing::assertions::AssertionPhase;
 
 tb_assert_spec! {
 	pub BareSpec,
@@ -2792,14 +2903,14 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "Received", exactly!(1)),
-			(Response, "Responded", exactly!(1))
+			("Received", exactly!(1)),
+			("Responded", exactly!(1))
 		]
 	},
 }
 
 tb_process_spec! {
-	pub struct BareProcess;
+	pub BareProcess,
 	events {
 		observable { "Received", "Responded" }
 	}
@@ -2816,8 +2927,8 @@ tb_scenario! {
 	csp: BareProcess,
 	environment Bare {
 		exec: |trace| {
-			trace.assert(AssertionPhase::HandlerStart, "Received");
-			trace.assert(AssertionPhase::Response, "Responded");
+			trace.assert("Received", &[]);
+			trace.assert("Responded", &[]);
 			Ok(())
 		}
 	}
@@ -2831,7 +2942,6 @@ This example demonstrates progressive verification from L1 through L3:
 ```rust
 #![cfg(all(feature = "testing-fdr", feature = "tcp", feature = "tokio"))]
 use tightbeam::testing::*;
-use tightbeam::testing::assertions::AssertionPhase;
 use tightbeam::testing::macros::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::Protocol;
@@ -2843,18 +2953,18 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "connect", exactly!(1)),
-			(HandlerStart, "request", exactly!(1)),
-			(Response, "response", exactly!(2)),
-			(Response, "disconnect", exactly!(1)),
-			(Response, "message_content", exactly!(1), equals!("test"))
+			("connect", exactly!(1)),
+			("request", exactly!(1)),
+			("response", exactly!(2)),
+			("disconnect", exactly!(1)),
+			("message_content", exactly!(1), equals!("test"))
 		]
 	},
 }
 
 // Layer 2: CSP process spec - models state machine with internal events
 tb_process_spec! {
-	pub struct ClientServerProcess;
+	pub ClientServerProcess,
 	events {
 		observable { "connect", "request", "response", "disconnect" }
 		hidden { "serialize", "encrypt", "decrypt", "deserialize" }
@@ -2895,16 +3005,16 @@ tb_scenario! {
 				protocol TokioListener: listener,
 				assertions: trace,
 				handle: |frame, trace| async move {
-					trace.assert(AssertionPhase::HandlerStart, "connect");
-					trace.assert(AssertionPhase::HandlerStart, "request");
-					trace.assert(AssertionPhase::Response, "response");
+					trace.assert("connect", &[]);
+					trace.assert("request", &[]);
+					trace.assert("response", &[]);
 					Some(frame)
 				}
 			};
 			Ok((handle, addr))
 		},
 		client: |trace, mut client| async move {
-			trace.assert(AssertionPhase::Response, "response");
+			trace.assert("response", &[]);
 			let frame = compose! {
 				V0: id: "test",
 				order: 1u64,
@@ -2915,10 +3025,10 @@ tb_scenario! {
 			// Decode response and emit value assertion
 			if let Some(resp_frame) = response {
 				let decoded: TestMessage = crate::decode(&resp_frame.message)?;
-				trace.assert_value(AssertionPhase::Response, "message_content", decoded.content);
+				trace.assert_value("message_content", &[], decoded.content);
 			}
 
-			trace.assert(AssertionPhase::Response, "disconnect");
+			trace.assert("disconnect", &[]);
 			Ok(())
 		}
 	},
@@ -2967,7 +3077,7 @@ tb_scenario! {
 			match trace.oracle().fuzz_from_bytes() {
 				Ok(()) => {
 					for event in trace.oracle().trace() {
-						trace.assert(AssertionPhase::HandlerStart, event.0);
+						trace.assert(event.0, &[]);
 					}
 					Ok(())
 				}
@@ -2993,7 +3103,7 @@ tb_scenario! {
 
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
-use tightbeam::testing::{assertions::AssertionPhase, error::TestingError};
+use tightbeam::testing::error::TestingError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 // Layer 1: Assertion spec
@@ -3003,17 +3113,17 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "start", exactly!(1)),
-			(HandlerStart, "action_a", at_least!(0)),
-			(HandlerStart, "action_b", at_least!(0)),
-			(HandlerStart, "done", exactly!(1))
+			("start", exactly!(1)),
+			("action_a", at_least!(0)),
+			("action_b", at_least!(0)),
+			("done", exactly!(1))
 		]
 	},
 }
 
 // Layer 2: CSP process with nondeterministic choices
 tb_process_spec! {
-	pub struct SimpleFuzzProc;
+	pub SimpleFuzzProc,
 	events {
 		observable { "start", "action_a", "action_b", "done" }
 		hidden { }
@@ -3038,7 +3148,7 @@ tb_scenario! {
 			match trace.oracle().fuzz_from_bytes() {
 				Ok(()) => {
 					for event in trace.oracle().trace() {
-						trace.assert(AssertionPhase::HandlerStart, event.0);
+						trace.assert(event.0, &[]);
 					}
 					Ok(())
 				}
@@ -3154,7 +3264,7 @@ TightBeam equivalent - no manual annotation needed:
 
 ```rust
 tb_process_spec! {
-    pub struct ParserProcess;
+    pub ParserProcess,
     events { observable { "magic_detected", "parse_continue" } }
     states {
         Init   => { "magic_detected" => SpecialState, "parse_continue" => Parsing }

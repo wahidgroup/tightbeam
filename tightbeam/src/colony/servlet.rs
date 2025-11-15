@@ -15,6 +15,7 @@ macro_rules! __tightbeam_servlet_common_methods {
 			self.addr.clone()
 		}
 
+		#[allow(dead_code)]
 		pub fn stop(mut self) {
 			if let Some(handle) = self.server_handle.take() {
 				$crate::colony::servlet_runtime::rt::abort(handle);

@@ -123,7 +123,7 @@ where
 				continue;
 			}
 
-			let visit_key = (state.clone(), trace.clone());
+			let visit_key = (state, trace.clone());
 			if visited.contains(&visit_key) {
 				continue;
 			}
@@ -166,7 +166,7 @@ where
 		let timeout_checker = TimeoutChecker::new(timeout_ms);
 		let mut queue = VecDeque::new();
 		let mut visited = HashSet::new();
-		queue.push_back((spec.initial.clone(), 0usize));
+		queue.push_back((spec.initial, 0usize));
 
 		while let Some((state, trace_idx)) = queue.pop_front() {
 			if timeout_checker.is_expired() {
@@ -177,7 +177,7 @@ where
 				return false;
 			}
 
-			let visit_key = (state.clone(), trace_idx);
+			let visit_key = (state, trace_idx);
 			if visited.contains(&visit_key) {
 				continue;
 			}
@@ -312,7 +312,7 @@ where
 				continue;
 			}
 
-			let visit_key = (state.clone(), trace.clone());
+			let visit_key = (state, trace.clone());
 			if visited.contains(&visit_key) {
 				continue;
 			}
@@ -458,8 +458,8 @@ where
 		process
 			.observable
 			.iter()
+			.filter(|&event| !enabled_events.contains(event))
 			.cloned()
-			.filter(|event| !enabled_events.contains(event))
 			.collect()
 	}
 }

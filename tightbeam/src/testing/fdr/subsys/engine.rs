@@ -25,7 +25,8 @@ use super::refinement::DefaultRefinementChecker;
 /// Generic over subsystem implementations:
 /// - `E`: Exploration engine (implements `ExplorationCore`)
 /// - `R`: Refinement checker (implements `RefinementChecker`)
-///    The refinement checker manages its own memoization cache internally.
+///
+/// The refinement checker manages its own memoization cache internally.
 pub struct FdrExplorer<'a, E, R>
 where
 	E: ExplorationCore,

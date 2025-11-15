@@ -144,9 +144,9 @@ impl TraceCollector {
 				AssertionValue::I32(n) => n.to_string(),
 				AssertionValue::I64(n) => n.to_string(),
 				AssertionValue::F64(n) => n.to_string(),
-				AssertionValue::MessagePriority(p) => format!("{:?}", p),
-				AssertionValue::Version(v) => format!("{:?}", v),
-				AssertionValue::Some(inner) => format!("Some({:?})", inner),
+				AssertionValue::MessagePriority(p) => format!("{p:?}"),
+				AssertionValue::Version(v) => format!("{v:?}"),
+				AssertionValue::Some(inner) => format!("Some({inner:?})"),
 				AssertionValue::None => "none".to_string(),
 				AssertionValue::NotNone => "some".to_string(),
 			};

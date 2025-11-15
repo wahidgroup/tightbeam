@@ -13,6 +13,6 @@ pub mod refinement;
 pub use cache::DefaultCache;
 pub use engine::{DefaultFdrExplorer, FdrExplorer};
 pub use exploration::DefaultExplorationEngine;
-pub use refinement::DefaultRefinementChecker;
 pub use export::*;
 pub use extensions::*;
+pub use refinement::DefaultRefinementChecker;

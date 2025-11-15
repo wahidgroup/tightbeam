@@ -1,5 +1,6 @@
 //! Complex multi-stage workflow fuzz target for AFL
 
+#![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-fuzz"))]
 
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
@@ -18,7 +19,7 @@ tb_assert_spec! {
 }
 
 tb_process_spec! {
-	pub struct WorkflowFuzzProc;
+	pub WorkflowFuzzProc,
 	events {
 		observable {
 			"init",

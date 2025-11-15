@@ -19,7 +19,7 @@ tightbeam::tb_process_spec! {
 	/// - Terminal states: GameA (A wins), GameB (B wins)
 	///
 	/// Events: pointA, pointB
-	pub struct TennisScorer;
+	pub TennisScorer,
 	events {
 		observable { "pointA", "pointB" }
 		hidden { }

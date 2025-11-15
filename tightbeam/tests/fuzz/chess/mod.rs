@@ -636,7 +636,7 @@ tb_assert_spec! {
 
 /// High-level protocol flow spec
 tb_process_spec! {
-	pub struct ChessGameFlow;
+	pub ChessGameFlow,
 	events {
 		observable { "move_request", "move_valid", "move_invalid", "move_response", "game_over" }
 		hidden { }
@@ -653,7 +653,7 @@ tb_process_spec! {
 
 /// Detailed chess rules spec
 tb_process_spec! {
-	pub struct ChessRules;
+	pub ChessRules,
 	events {
 		observable { "pawn_move", "rook_move", "knight_move", "bishop_move", "queen_move", "king_move", "check", "checkmate", "stalemate" }
 		hidden { }

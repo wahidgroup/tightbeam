@@ -82,7 +82,7 @@ tb_assert_spec! {
 }
 
 tb_process_spec! {
-	pub struct SimpleServletFlow;
+	pub SimpleServletFlow,
 	events {
 		observable { "request_sent", "response_received" }
 		hidden { }

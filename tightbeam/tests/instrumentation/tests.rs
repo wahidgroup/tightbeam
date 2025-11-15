@@ -21,7 +21,7 @@ tb_assert_spec! {
 
 // CSP process spec for automatic message flow verification
 tb_process_spec! {
-	pub struct MessageFlowProc;
+	pub MessageFlowProc,
 	events {
 		observable { "message_emit", "message_collect" }
 		hidden { }
@@ -76,7 +76,7 @@ tb_scenario! {
 			for event in &trace.instrument_events {
 				println!("  Event: {:?} - {:?}", event.kind, event.label);
 			}
-			panic!("Test failed with violations: {:?}", violations);
+			panic!("Test failed with violations: {violations:?}");
 		}
 	}
 }

@@ -26,11 +26,6 @@ pub fn is_white(piece: u8) -> bool {
 	(1..=6).contains(&piece)
 }
 
-pub fn is_black(piece: u8) -> bool {
-	(7..=12).contains(&piece)
-}
-
 pub fn is_empty(piece: u8) -> bool {
 	piece == EMPTY
 }
-

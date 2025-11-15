@@ -20,9 +20,10 @@
 //!   target/debug/deps/fuzzing-*
 //! ```
 
+#![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
-use tightbeam::{equals, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 // ============================================================================
 // ASSERTION SPEC - Defines Expected Event Sequences
@@ -76,8 +77,7 @@ tb_process_spec! {
 	/// 4. **FeaturesOk → BinaryVerified**: IJON and AFL symbols present in binary
 	/// 5. **BinaryVerified → OracleVerified**: Oracle methods work correctly
 	/// 6. **OracleVerified → FullyVerified**: All proofs complete
-	pub struct VerificationProcess;
-
+	pub VerificationProcess,
 	events {
 		observable {
 			"compilation_check",

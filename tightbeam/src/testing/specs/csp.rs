@@ -571,8 +571,8 @@ mod tests {
 		// Define CSP process using tb_process_spec! macro
 		// This models the theoretical state machine behavior
 		crate::tb_process_spec! {
-			pub struct ComprehensiveHandshake;
-			events {
+		pub ComprehensiveHandshake,
+		events {
 				observable { "start", "send", "ack", "fail" }
 				hidden { "serialize", "encrypt", "queue", "dispatch" }
 			}
@@ -809,7 +809,7 @@ mod tests {
 	}
 
 	crate::tb_process_spec! {
-		pub struct SimpleBareFlowProc;
+		pub SimpleBareFlowProc,
 		events {
 			observable { "step1", "step2" }
 			hidden { }
@@ -850,7 +850,7 @@ mod tests {
 	// Define the CSP process spec (theoretical state machine model)
 	// Models the client-server request-response flow with assertions
 	crate::tb_process_spec! {
-		pub struct ClientServerFlowProc;
+		pub ClientServerFlowProc,
 		events {
 			observable { "Received", "Responded" }
 			hidden { }

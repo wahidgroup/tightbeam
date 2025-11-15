@@ -4,6 +4,8 @@
 //! Scenarios are defined declaratively so that each protocol version is
 //! validated with the metadata it permits (and rejects).
 
+#![allow(unexpected_cfgs)]
+
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
 use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid, Key, KeyInit};
 use tightbeam::crypto::hash::Sha3_256;
@@ -99,6 +101,43 @@ fn build_crypto(seed: u8) -> Result<TestCrypto, TightBeamError> {
 	Ok(TestCrypto { cipher, signing_key, verifying_key })
 }
 
+/// Build a test frame for the given version with appropriate capabilities
+fn build_version_frame(
+	version: tb::Version,
+	message: &TestMessage,
+	crypto: &TestCrypto,
+	message_hash: &tightbeam::DigestInfo,
+) -> Result<tightbeam::Frame, TightBeamError> {
+	let mut builder = FrameBuilder::from(version)
+		.with_id("test")
+		.with_order(1_696_521_700)
+		.with_message(message.clone());
+
+	if version >= tb::Version::V1 {
+		builder = builder
+			.with_message_hasher::<Sha3_256>()
+			.with_cipher::<Aes256GcmOid, _>(&crypto.cipher)
+			.with_signer::<Secp256k1Signature, _>(&crypto.signing_key);
+	}
+
+	if version >= tb::Version::V2 {
+		builder = builder
+			.with_priority(tb::MessagePriority::Top)
+			.with_lifetime(3_600)
+			.with_previous_hash(message_hash.clone());
+	}
+
+	if version == tb::Version::V3 {
+		builder = builder.with_matrix(tightbeam::flags![
+			TestFlagSet:
+				FlagTestDevelopmentMode::IsMaintenanceMode,
+				FlagTestDebugLevel::Basic
+		]);
+	}
+
+	builder.build()
+}
+
 tb_assert_spec! {
 	pub VersionSpec,
 	V(0,0,0): {
@@ -142,8 +181,8 @@ tb_assert_spec! {
 			("sig_valid", exactly!(1), equals!(true)),
 			("integrity_ok", exactly!(1), equals!(true)),
 			("confidentiality", exactly!(1), equals!(IsSome)),
-			("priority", exactly!(1), equals!(Some(tb::MessagePriority::High))),
-			("lifetime", exactly!(1), equals!(Some(3_600))),
+			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Top))),
+			("lifetime", exactly!(1), equals!(Some(3_600u64))),
 			("previous_frame", exactly!(1), equals!(IsSome)),
 			("matrix", exactly!(1), equals!(IsNone)),
 			("version", exactly!(1), equals!(tb::Version::V2))
@@ -159,7 +198,7 @@ tb_assert_spec! {
 			("integrity_ok", exactly!(1), equals!(true)),
 			("confidentiality", exactly!(1), equals!(IsSome)),
 			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Top))),
-			("lifetime", exactly!(1), equals!(Some(3_600))),
+			("lifetime", exactly!(1), equals!(Some(3_600u64))),
 			("previous_frame", exactly!(1), equals!(IsSome)),
 			("matrix", exactly!(1), equals!(IsSome)),
 			("version", exactly!(1), equals!(tb::Version::V3))
@@ -181,40 +220,60 @@ tb_scenario! {
 			let crypto = build_crypto(0x44)?;
 			let message_hash = utils::digest::<Sha3_256>(&message)?;
 
-			// Build ONE V3 frame with all capabilities
-			let builder: FrameBuilder<TestMessage> = FrameBuilder::from(tb::Version::V3);
-			let frame = builder
-				.with_id("workflow")
-				.with_order(1_696_521_700)
-				.with_message(message.clone())
-				.with_message_hasher::<Sha3_256>()
-				.with_cipher::<Aes256GcmOid, _>(&crypto.cipher)
-				.with_signer::<Secp256k1Signature, _>(&crypto.signing_key)
-				.with_priority(tb::MessagePriority::Top)
-				.with_lifetime(3_600)
-				.with_previous_hash(message_hash.clone())
-				.with_matrix(tightbeam::flags![
-					TestFlagSet:
-						FlagTestDevelopmentMode::IsMaintenanceMode,
-						FlagTestDebugLevel::Basic
-				]).build()?;
+			// Build frames for each version
+			let v0_frame = build_version_frame(tb::Version::V0, &message, &crypto, &message_hash)?;
+			let v1_frame = build_version_frame(tb::Version::V1, &message, &crypto, &message_hash)?;
+			let v2_frame = build_version_frame(tb::Version::V2, &message, &crypto, &message_hash)?;
+			let v3_frame = build_version_frame(tb::Version::V3, &message, &crypto, &message_hash)?;
 
-			let roundtrip = frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
-			let sig_valid = frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok();
-			let integrity = frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
-			let integrity_ok = integrity.value_cmp(&message_hash).is_ok();
+			// Roundtrip checks
+			let v0_roundtrip: TestMessage = tightbeam::decode(&v0_frame.message)?;
+			trace.assert_value("roundtrip_ok", &["v0"], v0_roundtrip == message);
+			let v1_roundtrip = v1_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
+			let v2_roundtrip = v2_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
+			let v3_roundtrip = v3_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
+			trace.assert_value("roundtrip_ok", &["v1"], v1_roundtrip == message);
+			trace.assert_value("roundtrip_ok", &["v2"], v2_roundtrip == message);
+			trace.assert_value("roundtrip_ok", &["v3"], v3_roundtrip == message);
 
-			trace.assert_value("roundtrip_ok", &["v0", "v1", "v2", "v3"], roundtrip == message);
-			trace.assert_option("nonrepudiation", &["v0"], &frame.nonrepudiation);
-			trace.assert_option("integrity", &["v0"], &frame.metadata.integrity);
-			trace.assert_option("confidentiality", &["v0", "v1", "v2", "v3"], &frame.metadata.confidentiality);
-			trace.assert_value("priority", &["v0", "v1", "v2", "v3"], frame.metadata.priority);
-			trace.assert_value("lifetime", &["v0", "v1", "v2", "v3"], frame.metadata.lifetime);
-			trace.assert_option("previous_frame", &["v0", "v1", "v2", "v3"], &frame.metadata.previous_frame);
-			trace.assert_option("matrix", &["v0", "v1", "v2", "v3"], &frame.metadata.matrix);
-			trace.assert_value("version", &["v0", "v1", "v2", "v3"], frame.version);
-			trace.assert_value("sig_valid", &["v1", "v2", "v3"], sig_valid);
-			trace.assert_value("integrity_ok", &["v1", "v2", "v3"], integrity_ok);
+			// V1+ signature checks
+			trace.assert_value("sig_valid", &["v1"], v1_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
+			trace.assert_value("sig_valid", &["v2"], v2_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
+			trace.assert_value("sig_valid", &["v3"], v3_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
+
+			// V1+ integrity checks
+			let v1_integrity = v1_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
+			let v2_integrity = v2_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
+			let v3_integrity = v3_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
+			trace.assert_value("integrity_ok", &["v1"], v1_integrity.value_cmp(&message_hash).is_ok());
+			trace.assert_value("integrity_ok", &["v2"], v2_integrity.value_cmp(&message_hash).is_ok());
+			trace.assert_value("integrity_ok", &["v3"], v3_integrity.value_cmp(&message_hash).is_ok());
+
+			// Frame-level fields
+			trace.assert_option("nonrepudiation", &["v0"], &v0_frame.nonrepudiation);
+			trace.assert_option("nonrepudiation", &["v1", "v2", "v3"], &v1_frame.nonrepudiation);
+			trace.assert_option("integrity", &["v0"], &v0_frame.integrity);
+			trace.assert_option("integrity", &["v1", "v2", "v3"], &v1_frame.integrity);
+
+			// Metadata fields
+			trace.assert_option("confidentiality", &["v0"], &v0_frame.metadata.confidentiality);
+			trace.assert_option("confidentiality", &["v1", "v2", "v3"], &v1_frame.metadata.confidentiality);
+			trace.assert_value("priority", &["v0", "v1"], v0_frame.metadata.priority);
+			trace.assert_value("priority", &["v2"], v2_frame.metadata.priority);
+			trace.assert_value("priority", &["v3"], v3_frame.metadata.priority);
+			trace.assert_value("lifetime", &["v0", "v1"], v0_frame.metadata.lifetime);
+			trace.assert_value("lifetime", &["v2"], v2_frame.metadata.lifetime);
+			trace.assert_value("lifetime", &["v3"], v3_frame.metadata.lifetime);
+			trace.assert_option("previous_frame", &["v0", "v1"], &v0_frame.metadata.previous_frame);
+			trace.assert_option("previous_frame", &["v2", "v3"], &v2_frame.metadata.previous_frame);
+			trace.assert_option("matrix", &["v0", "v1", "v2"], &v0_frame.metadata.matrix);
+			trace.assert_option("matrix", &["v3"], &v3_frame.metadata.matrix);
+
+			// Version checks - each version is unique
+			trace.assert_value("version", &["v0"], v0_frame.version);
+			trace.assert_value("version", &["v1"], v1_frame.version);
+			trace.assert_value("version", &["v2"], v2_frame.version);
+			trace.assert_value("version", &["v3"], v3_frame.version);
 
 			Ok(())
 		}

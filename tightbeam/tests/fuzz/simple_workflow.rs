@@ -26,7 +26,7 @@ tb_assert_spec! {
 }
 
 tb_process_spec! {
-	pub struct SimpleFuzzProc;
+	pub SimpleFuzzProc,
 	events {
 		observable { "start", "action_a", "action_b", "done" }
 		hidden { }

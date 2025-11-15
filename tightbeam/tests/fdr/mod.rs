@@ -5,7 +5,5 @@
 //! - Tennis Game Scoring System (state transitions, trace refinement)
 //! - Dining Philosophers (deadlock detection)
 
-#![cfg(feature = "testing-fdr")]
-
 mod diners;
 mod tennis;

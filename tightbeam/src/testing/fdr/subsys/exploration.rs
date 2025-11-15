@@ -50,10 +50,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 	/// Explore single seed (different scheduling)
 	fn explore_seed_internal(&mut self, seed: u64) -> SeedResult {
-		let result = Self::explore_seed_core(self.process, &self.config, seed, |state| {
+		Self::explore_seed_core(self.process, &self.config, seed, |state| {
 			self.visited_states.insert(state);
-		});
-		result
+		})
 	}
 
 	/// Static version of explore_seed for parallel execution
@@ -229,8 +228,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 		process
 			.observable
 			.iter()
+			.filter(|&event| !enabled_events.contains(event))
 			.cloned()
-			.filter(|event| !enabled_events.contains(event))
 			.collect()
 	}
 

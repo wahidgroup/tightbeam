@@ -118,7 +118,7 @@ impl fmt::Display for SpecViolation {
 			}
 			Self::AssertionViolation { label, tags, expected, actual } => {
 				let tag_desc = if let Some(ref t) = tags {
-					format!(" with tags {:?}", t)
+					format!(" with tags {t:?}")
 				} else {
 					String::new()
 				};

@@ -242,7 +242,7 @@ mod tests {
 			const VERSION: Version = Version::V3;
 			const HAS_MATRIX: bool = true; // metadata has matrix
 								  // Use Frame's built-in compile-time validation method
-			let _ = [(); 1][!Frame::const_validate_version_fields(VERSION, HAS_MATRIX) as usize];
+			[(); 1][!Frame::const_validate_version_fields(VERSION, HAS_MATRIX) as usize];
 		};
 
 		let frame = Frame {

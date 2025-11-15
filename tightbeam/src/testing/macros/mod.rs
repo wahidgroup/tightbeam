@@ -3134,6 +3134,7 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {
+		#[allow(unexpected_cfgs)]
 		#[cfg(fuzzing)]
 		fn main() {
 			// Reuse runtime and servlet across AFL iterations to reduce setup overhead

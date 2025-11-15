@@ -70,8 +70,8 @@ pub trait ExplorationCore {
 		process
 			.observable
 			.iter()
+			.filter(|&event| !enabled_events.contains(event))
 			.cloned()
-			.filter(|event| !enabled_events.contains(event))
 			.collect()
 	}
 }
@@ -218,7 +218,7 @@ impl SeededRng {
 	}
 
 	/// Generate next pseudo-random number (LCG algorithm)
-	pub fn next(&mut self) -> u64 {
+	pub fn get_next(&mut self) -> u64 {
 		// Linear Congruential Generator constants from Numerical Recipes
 		const A: u64 = 6364136223846793005;
 		const C: u64 = 1442695040888963407;
@@ -231,7 +231,7 @@ impl SeededRng {
 		if items.is_empty() {
 			None
 		} else {
-			let index = (self.next() as usize) % items.len();
+			let index = (self.get_next() as usize) % items.len();
 			Some(&items[index])
 		}
 	}
@@ -251,7 +251,7 @@ mod tests {
 			let mut rng2 = SeededRng::new(42);
 
 			for _ in 0..10 {
-				assert_eq!(rng1.next(), rng2.next());
+				assert_eq!(rng1.get_next(), rng2.get_next());
 			}
 		}
 
@@ -260,7 +260,7 @@ mod tests {
 			let mut rng1 = SeededRng::new(42);
 			let mut rng2 = SeededRng::new(43);
 
-			let same_count = (0..10).filter(|_| rng1.next() == rng2.next()).count();
+			let same_count = (0..10).filter(|_| rng1.get_next() == rng2.get_next()).count();
 			assert!(same_count < 10, "All values should not be identical");
 		}
 
