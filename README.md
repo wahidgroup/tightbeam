@@ -288,6 +288,7 @@ impl SecurityProfile for MyAppProfile {
 	type DigestOid = Sha3_256;
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
+	type CurveOid = Secp256k1Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
 }
 ```
@@ -303,6 +304,7 @@ impl SecurityProfile for TightbeamProfile {
 	type DigestOid = Sha3_256;
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
+	type CurveOid = Secp256k1Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
 }
 ```
@@ -552,6 +554,7 @@ Version ::= ENUMERATED {
 	v0(0),
 	v1(1),
 	v2(2)
+	v3(3)
 }
 ```
 
@@ -1653,10 +1656,14 @@ Client                              Server
   │                                   │
   │─── SecurityOffer ───────────────► │
   │    supported_profiles: [          │
-  │      Profile1: SHA3-256+          │  ◄─ Select first
-  │               AES-256-GCM,        │     mutual profile
-  │      Profile2: SHA-256+           │
-  │               AES-128-GCM         │
+  │      Profile1: SHA3-256           │  ◄─ Select first
+  │                AES-128-GCM,       │     mutual profile
+  |                secp256k1          │
+  |                secp256k1          │
+  │      Profile2: SHA3-512           │
+  │                AES-256-GCM        │
+  |                ed25519            │
+  |                x25519             │
   │    ]                              │
   │                                   │
   │ ◄── SecurityAccept ─────────────  │
@@ -2878,7 +2885,7 @@ CSP and FDR verification.
 
 ```rust
 tb_scenario! {
-	name: test_function_name,        // OPTIONAL: creates standalone #[test] NOTE: Do NOT use with `fuzz: afl`
+	name: test_function_name,        // OPTIONAL: creates standalone #[test] function NOTE: Do NOT use with `fuzz: afl`
 	spec: AssertSpecType,            // REQUIRED: Layer 1 assertion spec
 	csp: ProcessSpecType,            // OPTIONAL: Layer 2 CSP model (requires testing-csp)
 	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
@@ -3151,7 +3158,6 @@ tb_scenario! {
 					for event in trace.oracle().trace() {
 						trace.assert(event.0, &[]);
 					}
-
 					Ok(())
 				}
 				Err(_) => Err(TestingError::FuzzInputExhausted.into())
