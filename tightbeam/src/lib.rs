@@ -201,8 +201,9 @@ mod tests {
 		use crate::x509::name::Name;
 		use crate::x509::serial_number::SerialNumber;
 
-		// Create a 255x255 matrix with all zeros
-		let matrix = Asn1Matrix { n: 6, data: vec![0; 255] };
+		// Create a square matrix with all zeros (data length must equal n*n)
+		let matrix_size: u8 = 16;
+		let matrix = Asn1Matrix { n: matrix_size, data: vec![0; (matrix_size as usize) * (matrix_size as usize)] };
 
 		// Create metadata with all optional fields
 		let metadata = Metadata {
@@ -243,6 +244,7 @@ mod tests {
 								  // Use Frame's built-in compile-time validation method
 			let _ = [(); 1][!Frame::const_validate_version_fields(VERSION, HAS_MATRIX) as usize];
 		};
+
 		let frame = Frame {
 			version: Version::V3,
 			metadata,

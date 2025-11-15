@@ -108,7 +108,8 @@ pub(crate) fn reset_chess_game_state() {
 }
 
 servlet! {
-	name: ChessEngineServlet,
+	/// Chess engine servlet for processing chess moves
+	pub ChessEngineServlet<ChessMoveRequest>,
 	protocol: TokioListener,
 	policies: {
 		// TODO: Add mutual authentication policies

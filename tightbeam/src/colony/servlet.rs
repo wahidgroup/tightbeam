@@ -65,6 +65,60 @@ macro_rules! __tightbeam_servlet_common_methods {
 	};
 }
 
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_servlet_parallelize_methods {
+	($servlets_name:tt, $input:ty, $($worker_field:ident: $worker_type:ty),*) => {
+		impl<$input> $servlets_name<$input> {
+			/// Parallelize a message across all workers
+			/// Returns a tuple of results in the same order as worker fields
+			/// The input type matches the servlet's input type parameter
+			pub fn parallelize(
+				&self,
+				message: ::std::sync::Arc<$input>,
+			) -> impl ::core::future::Future + '_
+			where
+				$input: Send + Sync + 'static,
+			{
+				async move {
+					$crate::paste::paste! {
+						$(
+							let msg_arc = ::std::sync::Arc::clone(&message);
+							let [<r $worker_field>] = self.$worker_field.relay(msg_arc);
+						)*
+						tokio::join!($([<r $worker_field>],)*)
+					}
+				}
+			}
+		}
+	};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_servlet_parallelize_methods {
+	($servlets_name:tt, $input:ty, $($worker_field:ident: $worker_type:ty),*) => {
+		impl<$input> $servlets_name<$input> {
+			/// Parallelize a message across all workers (sequential in std-only mode)
+			/// Returns a tuple of results in the same order as worker fields
+			pub async fn parallelize(
+				&self,
+				message: ::std::sync::Arc<$input>,
+			)
+			where
+				$input: 'static,
+			{
+				$crate::paste::paste! {
+					$(
+						let [<r $worker_field>] = self.$worker_field.relay(::std::sync::Arc::clone(&message)).await;
+					)*
+					($([<r $worker_field>],)*)
+				}
+			}
+		}
+	};
+}
+
 pub mod servlet_runtime {
 	#[cfg(feature = "tokio")]
 	pub mod rt {
@@ -195,7 +249,10 @@ pub mod servlet_runtime {
 /// Provides a common interface for all colony created with the `servlet!`
 /// macro. Servlets are containerized applications that process TightBeam
 /// messages.
-pub trait Servlet {
+///
+/// The servlet is generic over the input message type `I` that it processes.
+/// All workers in a servlet must share the same input type.
+pub trait Servlet<I> {
 	/// Configuration type for this worker (use () for no config)
 	type Conf;
 
@@ -224,9 +281,122 @@ pub trait Servlet {
 /// Servlet macro for creating containerized tightbeam applications
 #[macro_export]
 macro_rules! servlet {
-	// Full worker with router, policies, and config
+	// New syntax: Servlet with config only (with attributes/doc comments and visibility)
 	(
-		name: $worker_name:ident,
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		handle: |$message:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				config_only, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body, [$input], pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		handle: |$message:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				config_only, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body, [$input], , [$(#[$meta])*]);
+	};
+
+	// New syntax: Servlet with config and init (with attributes/doc comments and visibility)
+	(
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		init: |$init_config:ident| $init_body:block,
+		handle: |$message:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				config_only_with_init, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body, $init_config, $init_body, [$input], pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		init: |$init_config:ident| $init_body:block,
+		handle: |$message:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				config_only_with_init, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body, $init_config, $init_body, [$input], , [$(#[$meta])*]);
+	};
+
+	// New syntax: Basic servlet with trace parameter (with attributes/doc comments and visibility)
+	(
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		handle: |$message:ident, $trace:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				basic_with_trace, {}, {},
+				|$message, $trace| $handler_body, [$input], pub, [$(#[$meta])*]);
+		// Note: basic_with_trace servlets have start(TraceCollector) signature, not Servlet trait
+	};
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		handle: |$message:ident, $trace:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				basic_with_trace, {}, {},
+				|$message, $trace| $handler_body, [$input], , [$(#[$meta])*]);
+		// Note: basic_with_trace servlets have start(TraceCollector) signature, not Servlet trait
+	};
+
+	// New syntax: Basic servlet without trace (with attributes/doc comments and visibility)
+	(
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		handle: |$message:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				basic, {}, {},
+				|$message| $handler_body, [$input], pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		handle: |$message:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				basic, {}, {},
+				|$message| $handler_body, [$input], , [$(#[$meta])*]);
+	};
+
+	// New syntax: Servlet with router and config (with attributes/doc comments and visibility)
+	(
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
 		$(worker_threads: $threads:literal,)?
 		protocol: $protocol:path,
 		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
@@ -234,57 +404,57 @@ macro_rules! servlet {
 		config: { $($config_field:ident: $config_type:ty),* $(,)? },
 		handle: |$message:ident, $router_param:ident, $config_param:ident| async move $handler_body:block
 	) => {
-		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
 				 router_and_config, $router, { $($config_field: $config_type,)* },
-				 |$message, $router_param, $config_param| $handler_body);
+				 |$message, $router_param, $config_param| $handler_body, [$input], pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		router: $router:expr,
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		handle: |$message:ident, $router_param:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				 router_and_config, $router, { $($config_field: $config_type,)* },
+				 |$message, $router_param, $config_param| $handler_body, [$input], , [$(#[$meta])*]);
 	};
 
-	// Servlet with router only
+	// New syntax: Servlet with router only (with attributes/doc comments and visibility)
 	(
-		name: $worker_name:ident,
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
 		$(worker_threads: $threads:literal,)?
 		protocol: $protocol:path,
 		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
 		router: $router:expr,
 		handle: |$message:ident, $router_param:ident| async move $handler_body:block
 	) => {
-		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
 				router_only, $router, {},
-				|$message, $router_param| $handler_body);
+				|$message, $router_param| $handler_body, [$input], pub, [$(#[$meta])*]);
 	};
-
-	// Servlet with config only
 	(
-		name: $worker_name:ident,
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
 		$(worker_threads: $threads:literal,)?
 		protocol: $protocol:path,
 		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
-		config: { $($config_field:ident: $config_type:ty),* $(,)? },
-		handle: |$message:ident, $config_param:ident| async move $handler_body:block
+		router: $router:expr,
+		handle: |$message:ident, $router_param:ident| async move $handler_body:block
 	) => {
-		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-				config_only, {}, { $($config_field: $config_type,)* },
-				|$message, $config_param| $handler_body);
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				router_only, $router, {},
+				|$message, $router_param| $handler_body, [$input], , [$(#[$meta])*]);
 	};
 
-	// Servlet with config and init (no workers)
+	// New syntax: Servlet with config and workers (with attributes/doc comments and visibility)
 	(
-		name: $worker_name:ident,
-		$(worker_threads: $threads:literal,)?
-		protocol: $protocol:path,
-		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
-		config: { $($config_field:ident: $config_type:ty),* $(,)? },
-		init: |$init_config:ident| $init_body:block,
-		handle: |$message:ident, $config_param:ident| async move $handler_body:block
-	) => {
-		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-				config_only_with_init, {}, { $($config_field: $config_type,)* },
-				|$message, $config_param| $handler_body, $init_config, $init_body);
-	};
-
-	// Servlet with config and workers
-	(
-		name: $worker_name:ident,
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
 		$(worker_threads: $threads:literal,)?
 		protocol: $protocol:path,
 		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
@@ -292,15 +462,31 @@ macro_rules! servlet {
 		workers: |$worker_config:ident| { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* $(,)? },
 		handle: |$message:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
 	) => {
-		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
 				config_and_workers, {}, { $($config_field: $config_type,)* },
 				{ $($worker_field: $worker_type = $worker_init),* },
-				|$message, $config_param, $workers_param| $handler_body, $worker_config);
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, [$input], pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		workers: |$worker_config:ident| { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* $(,)? },
+		handle: |$message:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				config_and_workers, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, [$input], , [$(#[$meta])*]);
 	};
 
-	// Servlet with config, workers, and init
+	// New syntax: Servlet with config, workers, and init (with attributes/doc comments and visibility)
 	(
-		name: $worker_name:ident,
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
 		$(worker_threads: $threads:literal,)?
 		protocol: $protocol:path,
 		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
@@ -309,127 +495,204 @@ macro_rules! servlet {
 		init: |$init_config:ident| $init_body:block,
 		handle: |$message:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
 	) => {
-		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
 				config_and_workers_with_init, {}, { $($config_field: $config_type,)* },
 				{ $($worker_field: $worker_type = $worker_init),* },
-				|$message, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body);
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body, [$input], pub, [$(#[$meta])*]);
 	};
-
-	// Basic servlet with trace parameter in handler (trace provided at start())
 	(
-		name: $worker_name:ident,
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
 		$(worker_threads: $threads:literal,)?
 		protocol: $protocol:path,
 		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
-		handle: |$message:ident, $trace:ident| async move $handler_body:block
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		workers: |$worker_config:ident| { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* $(,)? },
+		init: |$init_config:ident| $init_body:block,
+		handle: |$message:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
 	) => {
-		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-				basic_with_trace, {}, {},
-				|$message, $trace| $handler_body);
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?],
+				config_and_workers_with_init, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body, [$input], , [$(#[$meta])*]);
 	};
 
-	// Basic worker with just message
-	(
-		name: $worker_name:ident,
-		$(worker_threads: $threads:literal,)?
-		protocol: $protocol:path,
-		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
-		handle: |$message:ident| async move $handler_body:block
-	) => {
-		servlet!(@generate $worker_name, $protocol, [$($($policy_key: $policy_val,)*)?],
-				basic, {}, {},
-				|$message| $handler_body);
-	};
-
-	// Main implementation generator
-	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
-			  router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
-			  |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
-		servlet!(@impl_struct $worker_name, $protocol, { $($config_field: $config_type,)* });
-		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
-				router_and_config, $router, { $($config_field: $config_type,)* },
-				|$message, $router_param, $config_param| $handler_body);
-		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
-	};
-
-	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
-			  router_only, $router:tt, {},
-			  |$message:ident, $router_param:ident| $handler_body:expr) => {
-		servlet!(@impl_struct $worker_name, $protocol, {});
-		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
-				router_only, $router, {},
-				|$message, $router_param| $handler_body);
-		servlet!(@impl_trait $worker_name, $protocol, {});
-	};
-
-	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
-			  config_only, {}, { $( $config_field:ident : $config_type:ty, )* },
-			  |$message:ident, $config_param:ident| $handler_body:expr) => {
-		servlet!(@impl_struct $worker_name, $protocol, { $($config_field: $config_type,)* });
+	// Generate with attributes and visibility (new syntax)
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_only, {}, { $($config_field:ident: $config_type:ty,)* },
+			  |$message:ident, $config_param:ident| $handler_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, pub, [$(#[$meta])*]);
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
 				config_only, {}, { $($config_field: $config_type,)* },
 				|$message, $config_param| $handler_body);
-		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
+	};
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_only, {}, { $($config_field:ident: $config_type:ty,)* },
+			  |$message:ident, $config_param:ident| $handler_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, , [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				config_only, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
 	};
 
-	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
-			  config_only_with_init, {}, { $( $config_field:ident : $config_type:ty, )* },
-			  |$message:ident, $config_param:ident| $handler_body:expr, $init_config:ident, $init_body:expr) => {
-		servlet!(@impl_struct $worker_name, $protocol, { $($config_field: $config_type,)* });
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_only_with_init, {}, { $($config_field:ident: $config_type:ty,)* },
+			  |$message:ident, $config_param:ident| $handler_body:expr, $init_config:ident, $init_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, pub, [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				config_only_with_init, {}, { $($config_field: $config_type,)* },
+				|$message, $config_param| $handler_body, $init_config, $init_body);
+		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
+	};
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_only_with_init, {}, { $($config_field:ident: $config_type:ty,)* },
+			  |$message:ident, $config_param:ident| $handler_body:expr, $init_config:ident, $init_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, , [$(#[$meta])*]);
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
 				config_only_with_init, {}, { $($config_field: $config_type,)* },
 				|$message, $config_param| $handler_body, $init_config, $init_body);
 		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
 	};
 
-	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
 			  basic_with_trace, {}, {},
-			  |$message:ident, $trace:ident| $handler_body:expr) => {
-		servlet!(@impl_struct $worker_name, $protocol, {});
+			  |$message:ident, $trace:ident| $handler_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, {}, pub, [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				basic_with_trace, {}, {},
+				|$message, $trace| $handler_body);
+		// Note: basic_with_trace servlets have start(TraceCollector) signature, not Servlet trait
+	};
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  basic_with_trace, {}, {},
+			  |$message:ident, $trace:ident| $handler_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, {}, , [$(#[$meta])*]);
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
 				basic_with_trace, {}, {},
 				|$message, $trace| $handler_body);
 		// Note: basic_with_trace servlets have start(TraceCollector) signature, not Servlet trait
 	};
 
-	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
 			  basic, {}, {},
-			  |$message:ident| $handler_body:expr) => {
-		servlet!(@impl_struct $worker_name, $protocol, {});
+			  |$message:ident| $handler_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, {}, pub, [$(#[$meta])*]);
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
 				basic, {}, {},
 				|$message| $handler_body);
-		servlet!(@impl_trait $worker_name, $protocol, {});
+		servlet!(@impl_trait_basic_with_input $worker_name, $protocol, $input);
 	};
-
-	// Servlet with config and workers
-	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
-			config_and_workers, {}, { $( $config_field:ident : $config_type:ty, )* },
-			{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
-			|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident) => {
-		servlet!(@impl_struct_with_workers $worker_name, $protocol, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* });
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  basic, {}, {},
+			  |$message:ident| $handler_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, {}, , [$(#[$meta])*]);
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
-				config_and_workers, {}, { $($config_field: $config_type,)* },
-				{ $($worker_field: $worker_type = $worker_init),* },
-				|$message, $config_param, $workers_param| $handler_body, $worker_config);
-		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
+				basic, {}, {},
+				|$message| $handler_body);
+		servlet!(@impl_trait_basic_with_input $worker_name, $protocol, $input);
 	};
 
-	// Servlet with config, workers, and init
-	(@generate $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
-			config_and_workers_with_init, {}, { $( $config_field:ident : $config_type:ty, )* },
-			{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
-			|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $init_config:ident, $init_body:expr) => {
-		servlet!(@impl_struct_with_workers $worker_name, $protocol, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* });
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
+			  |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, pub, [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				router_and_config, $router, { $($config_field: $config_type,)* },
+				|$message, $router_param, $config_param| $handler_body);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
+	};
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  router_and_config, $router:tt, { $($config_field:ident: $config_type:ty,)* },
+			  |$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, , [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				router_and_config, $router, { $($config_field: $config_type,)* },
+				|$message, $router_param, $config_param| $handler_body);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
+	};
+
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  router_only, $router:tt, {},
+			  |$message:ident, $router_param:ident| $handler_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, {}, pub, [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				router_only, $router, {},
+				|$message, $router_param| $handler_body);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, {});
+	};
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  router_only, $router:tt, {},
+			  |$message:ident, $router_param:ident| $handler_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, {}, , [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				router_only, $router, {},
+				|$message, $router_param| $handler_body);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, {});
+	};
+
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_and_workers, {}, { $($config_field:ident: $config_type:ty,)* },
+			  { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+			  |$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@get_input_type_with_attrs [$input], $worker_name, $protocol, [$($policy_key: $policy_val),*], { $($config_field: $config_type,)* }, { $($worker_field: $worker_type = $worker_init),* }, |$message, $config_param, $workers_param| $handler_body, $worker_config, pub, [$(#[$meta])*]);
+	};
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_and_workers, {}, { $($config_field:ident: $config_type:ty,)* },
+			  { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+			  |$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@get_input_type_with_attrs [$input], $worker_name, $protocol, [$($policy_key: $policy_val),*], { $($config_field: $config_type,)* }, { $($worker_field: $worker_type = $worker_init),* }, |$message, $config_param, $workers_param| $handler_body, $worker_config, , [$(#[$meta])*]);
+	};
+
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_and_workers_with_init, {}, { $($config_field:ident: $config_type:ty,)* },
+			  { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+			  |$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $init_config:ident, $init_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_workers_and_attrs $worker_name, $protocol, $input, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* }, pub, [$(#[$meta])*]);
 		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
 				config_and_workers_with_init, {}, { $($config_field: $config_type,)* },
 				{ $($worker_field: $worker_type = $worker_init),* },
 				|$message, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body);
 		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
 	};
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*],
+			  config_and_workers_with_init, {}, { $($config_field:ident: $config_type:ty,)* },
+			  { $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
+			  |$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $init_config:ident, $init_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_workers_and_attrs $worker_name, $protocol, $input, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* }, , [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				config_and_workers_with_init, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body);
+		servlet!(@impl_trait $worker_name, $protocol, { $($config_field: $config_type,)* });
+	};
+	// Extract input type with attributes - use provided or default to ()
+	(@get_input_type_with_attrs [$input:ty], $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:tt = $worker_init:expr),* }, |$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_workers_and_attrs $worker_name, $protocol, $input, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* }, pub, [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				config_and_workers, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, $input);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
+	};
+	(@get_input_type_with_attrs [$input:ty], $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:tt = $worker_init:expr),* }, |$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_workers_and_attrs $worker_name, $protocol, $input, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* }, , [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*],
+				config_and_workers, {}, { $($config_field: $config_type,)* },
+				{ $($worker_field: $worker_type = $worker_init),* },
+				|$message, $config_param, $workers_param| $handler_body, $worker_config, $input);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
+	};
 
-	// Generate struct and optional config struct
-	(@impl_struct $worker_name:ident, $protocol:path, {}) => {
+	// No parallelize method - users should use tokio::join! directly for parallel execution
+	(@impl_parallelize $worker_name:ident, $input:ty, $($worker_field:ident: $worker_type:tt),*) => {
+		// Intentionally empty - users use tokio::join! directly
+	};
+
+	// Generate struct with attributes and visibility (new syntax)
+	(@impl_struct_with_attrs $worker_name:ident, $protocol:path, {}, pub, [$(#[$meta:meta])*]) => {
+		$(#[$meta])*
 		pub struct $worker_name {
 			server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 			server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
@@ -437,8 +700,17 @@ macro_rules! servlet {
 		}
 	};
 
-	(@impl_struct $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }) => {
+	(@impl_struct_with_attrs $worker_name:ident, $protocol:path, {}, , [$(#[$meta:meta])*]) => {
+		$(#[$meta])*
+		struct $worker_name {
+			server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+			server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
+			addr: <$protocol as $crate::transport::Protocol>::Address,
+		}
+	};
+	(@impl_struct_with_attrs $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }, pub, [$(#[$meta:meta])*]) => {
 		$crate::paste::paste! {
+			$(#[$meta])*
 			pub struct $worker_name {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
@@ -449,6 +721,73 @@ macro_rules! servlet {
 			pub struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
+		}
+	};
+	(@impl_struct_with_attrs $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }, , [$(#[$meta:meta])*]) => {
+		$crate::paste::paste! {
+			$(#[$meta])*
+			struct $worker_name {
+				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				addr: <$protocol as $crate::transport::Protocol>::Address,
+			}
+
+			#[derive(Clone)]
+			struct [<$worker_name Conf>] {
+				$(pub $config_field: $config_type,)*
+			}
+		}
+	};
+
+	// Generate struct with workers and attributes
+	(@impl_struct_with_workers_and_attrs $worker_name:ident, $protocol:path, $input:ty, { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:tt),* }, pub, [$(#[$meta:meta])*]) => {
+		$crate::paste::paste! {
+			$(#[$meta])*
+			pub struct $worker_name {
+				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				addr: <$protocol as $crate::transport::Protocol>::Address,
+				#[allow(dead_code)]
+				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
+			}
+
+			#[derive(Clone)]
+			pub struct [<$worker_name Conf>] {
+				$(pub $config_field: $config_type,)*
+			}
+
+			pub struct [<$worker_name Servlets>]<I> {
+				$(pub $worker_field: $worker_type,)*
+				#[allow(dead_code)]
+				_phantom: ::std::marker::PhantomData<I>,
+			}
+
+			servlet!(@impl_parallelize $worker_name, $input, $($worker_field: $worker_type),*);
+		}
+	};
+	(@impl_struct_with_workers_and_attrs $worker_name:ident, $protocol:path, $input:ty, { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:tt),* }, , [$(#[$meta:meta])*]) => {
+		$crate::paste::paste! {
+			$(#[$meta])*
+			struct $worker_name {
+				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				addr: <$protocol as $crate::transport::Protocol>::Address,
+				#[allow(dead_code)]
+				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
+			}
+
+			#[derive(Clone)]
+			struct [<$worker_name Conf>] {
+				$(pub $config_field: $config_type,)*
+			}
+
+			struct [<$worker_name Servlets>]<I> {
+				$(pub $worker_field: $worker_type,)*
+				#[allow(dead_code)]
+				_phantom: ::std::marker::PhantomData<I>,
+			}
+
+			servlet!(@impl_parallelize $worker_name, $input, $($worker_field: $worker_type),*);
 		}
 	};
 
@@ -593,7 +932,9 @@ macro_rules! servlet {
 
 	// Generate trait implementation (without config) - MUST come first to match before the with-config pattern
 	(@impl_trait $worker_name:ident, $protocol:path, {}) => {
-		impl $crate::colony::Servlet for $worker_name {
+		// For servlets without workers, we can't extract input type, so use a placeholder
+		// This case is for servlets that don't use workers
+		impl $crate::colony::Servlet<()> for $worker_name {
 			type Conf = ();
 			type Address = <$protocol as $crate::transport::Protocol>::Address;
 
@@ -616,10 +957,36 @@ macro_rules! servlet {
 		}
 	};
 
-	// Generate trait implementation (with config)
+	// Generate trait implementation for basic servlets with explicit input
+	(@impl_trait_basic_with_input $worker_name:ident, $protocol:path, $input:ty) => {
+		impl $crate::colony::Servlet<$input> for $worker_name {
+			type Conf = ();
+			type Address = <$protocol as $crate::transport::Protocol>::Address;
+
+			async fn start(config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
+				let _ = config;
+				Self::start().await
+			}
+
+			fn addr(&self) -> Self::Address {
+				self.addr.clone()
+			}
+
+			fn stop(self) {
+				self.stop()
+			}
+
+			async fn join(self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+				self.join().await
+			}
+		}
+	};
+
+	// Generate trait implementation (with config, no workers)
 	(@impl_trait $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)+ }) => {
 		$crate::paste::paste! {
-			impl $crate::colony::Servlet for $worker_name {
+			// For servlets without workers, use () as input type
+			impl $crate::colony::Servlet<()> for $worker_name {
 				type Conf = [<$worker_name Conf>];
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
@@ -643,14 +1010,81 @@ macro_rules! servlet {
 		}
 	};
 
-	(@impl_struct_with_workers $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:ty),* }) => {
+
+	// Generate trait implementation (with workers - has input type)
+	(@impl_trait_with_input $worker_name:ident, $protocol:path, $input:ty, { $($config_field:ident: $config_type:ty,)* }) => {
+		$crate::paste::paste! {
+			impl $crate::colony::Servlet<$input> for $worker_name {
+				type Conf = [<$worker_name Conf>];
+				type Address = <$protocol as $crate::transport::Protocol>::Address;
+
+				async fn start(config: Option<Self::Conf>) -> $crate::error::Result<Self> {
+					let cfg = config.ok_or_else(|| $crate::TightBeamError::MissingConfiguration)?;
+					Self::start(cfg).await
+				}
+
+				fn addr(&self) -> Self::Address {
+					self.addr.clone()
+				}
+
+				fn stop(self) {
+					self.stop()
+				}
+
+				async fn join(self) -> ::core::result::Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+					self.join().await
+				}
+			}
+		}
+	};
+
+
+	// Generate struct with provided input type
+	(@impl_struct_with_workers $worker_name:ident, $protocol:path, $input:ty, { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:tt),* }) => {
+		servlet!(@build_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* }, { $($worker_field: $worker_type),* });
+	};
+
+	// Extract input type from first worker: WorkerName<Input, Output>
+	(@extract_and_build $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }, { $first_worker_field:ident: $first_worker_type:tt, $($rest_worker_field:ident: $rest_worker_type:tt),* }) => {
+		servlet!(@parse_first_worker $first_worker_type, $worker_name, $protocol, { $($config_field: $config_type,)* }, { $first_worker_field: $first_worker_type, $($rest_worker_field: $rest_worker_type),* });
+	};
+
+	// Parse first worker type and extract input
+	(@parse_first_worker $worker_name:ident < $input:ty, $output:ty >, $servlet_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }, { $first_worker_field:ident: $first_worker_type:tt, $($rest_worker_field:ident: $rest_worker_type:tt),* }) => {
+		// Validate all workers have same input type
+		servlet!(@validate_all_workers $input, $first_worker_type, $($rest_worker_type),*);
+		// Generate struct with extracted input type
+		servlet!(@build_with_input $servlet_name, $protocol, $input, { $($config_field: $config_type,)* }, { $first_worker_field: $first_worker_type, $($rest_worker_field: $rest_worker_type),* });
+	};
+
+	// Validate all workers share the same input type
+	(@validate_all_workers $expected_input:ty, $first:tt, $next:tt, $($rest:tt),*) => {
+		servlet!(@check_worker_input $expected_input, $next);
+		servlet!(@validate_all_workers $expected_input, $first, $($rest),*);
+	};
+
+	(@validate_all_workers $expected_input:ty, $first:tt,) => {};
+
+	// Check a single worker's input type matches expected
+	(@check_worker_input $expected_input:ty, $worker_name:ident < $input:ty, $output:ty >) => {
+		const _: () = {
+			fn assert_same<T>() {}
+			fn check() {
+				assert_same::<$expected_input>();
+				assert_same::<$input>();
+			}
+		};
+	};
+
+	// Build struct with known input type
+	(@build_with_input $worker_name:ident, $protocol:path, $input:ty, { $($config_field:ident: $config_type:ty,)* }, { $($worker_field:ident: $worker_type:tt),* }) => {
 		$crate::paste::paste! {
 			pub struct $worker_name {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
 				#[allow(dead_code)]
-				workers: ::std::sync::Arc<[<$worker_name Servlets>]>,
+				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
 
 			#[derive(Clone)]
@@ -658,16 +1092,29 @@ macro_rules! servlet {
 				$(pub $config_field: $config_type,)*
 			}
 
-			pub struct [<$worker_name Servlets>] {
+			pub struct [<$worker_name Servlets>]<I> {
 				$(pub $worker_field: $worker_type,)*
+				#[allow(dead_code)]
+				_phantom: ::std::marker::PhantomData<I>,
 			}
+
+			servlet!(@impl_parallelize $worker_name, $input, $($worker_field: $worker_type),*);
 		}
+	};
+
+	// Extract input type for trait implementation
+	(@extract_input_for_trait $worker_type:tt, $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }) => {
+		servlet!(@parse_first_worker_for_trait $worker_type, $worker_name, $protocol, { $($config_field: $config_type,)* });
+	};
+
+	(@parse_first_worker_for_trait $worker_name:ident < $input:ty, $output:ty >, $servlet_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }) => {
+		servlet!(@impl_trait_with_input $servlet_name, $protocol, $input, { $($config_field: $config_type,)* });
 	};
 
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*],
 		config_and_workers, {}, { $($config_field:ident: $config_type:ty,)* },
-		{ $($worker_field:ident: $worker_type:ty = $worker_init:expr),* },
-		|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident) => {
+		{ $($worker_field:ident: $worker_type:tt = $worker_init:expr),* },
+		|$message:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $input:ty) => {
 		$crate::paste::paste! {
 			impl $worker_name {
 				pub async fn start(config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
@@ -677,10 +1124,13 @@ macro_rules! servlet {
 					$(
 						let $worker_field = $worker_init?;
 					)*
-					let workers = [<$worker_name Servlets>] {
-						$($worker_field,)*
-					};
-					let workers = ::std::sync::Arc::new(workers);
+					$crate::paste::paste! {
+						let workers_val = [<$worker_name Servlets>]::<$input> {
+							$($worker_field,)*
+							_phantom: ::std::marker::PhantomData,
+						};
+					}
+					let workers = ::std::sync::Arc::new(workers_val);
 
 					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config_and_workers
 						$protocol, listener, [$($policy_key: $policy_val),*], config, workers.clone(),
@@ -719,8 +1169,9 @@ macro_rules! servlet {
 					$(
 						let $worker_field = $worker_init?;
 					)*
-					let workers = [<$worker_name Servlets>] {
+					let workers = [<$worker_name Servlets>]::<$input> {
 						$($worker_field,)*
+						_phantom: ::std::marker::PhantomData,
 					};
 					let workers = ::std::sync::Arc::new(workers);
 
@@ -960,20 +1411,16 @@ macro_rules! servlet {
 	};
 
 	// Build server with assertions (non-empty policies)
+	// Note: server! macro doesn't support both policies and assertions, so we drop policies for assertions
 	(@build_server_with_assertions $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $assertions:expr, (|$msg:ident: $msg_ty:ty, $trace:ident| async move $body:block)) => {
 		{
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				policies: { $($policy_key: $policy_val),* },
 				assertions: $assertions,
 				handle: move |$msg, $trace| {
 					async move {
-						// Wrap Option<Frame> in Ok() to convert to Result<Option<Frame>>
-						// If handler already returns Result, this will be a type error that the user must fix
-						match $body {
-							opt @ Some(_) | opt @ None => Ok(opt),
-							result @ Ok(_) | result @ Err(_) => result,
-						}
+						// Handler body already returns Result<Option<Frame>>
+						$body
 					}
 				}
 			};
@@ -990,6 +1437,7 @@ macro_rules! servlet {
 				assertions: $assertions,
 				handle: move |$msg, $trace| {
 					async move {
+						// Handler body already returns Result<Option<Frame>>
 						$body
 					}
 				}
@@ -1063,7 +1511,7 @@ mod tests {
 	}
 
 	servlet! {
-		name: PingPongServlet,
+		PingPongServlet<RequestMessage>,
 		protocol: Listener,
 		policies: {
 			with_collector_gate: [crate::policy::AcceptAllGate]
@@ -1177,7 +1625,7 @@ mod tests {
 		}
 
 		crate::servlet! {
-			name: PingPongServletWithWorker,
+			PingPongServletWithWorker<RequestMessage>,
 			protocol: Listener,
 			policies: {
 				with_collector_gate: [crate::policy::AcceptAllGate],
@@ -1195,9 +1643,10 @@ mod tests {
 			},
 			handle: |message, _config, workers| async move {
 				let decoded: RequestMessage = crate::decode(&message.message)?;
+				let decoded_arc = ::std::sync::Arc::new(decoded);
 				let (ping_result, lucky_result) = tokio::join!(
-					workers.ping_pong.relay(decoded.clone()),
-					workers.lucky_number.relay(decoded.clone())
+					workers.ping_pong.relay(::std::sync::Arc::clone(&decoded_arc)),
+					workers.lucky_number.relay(::std::sync::Arc::clone(&decoded_arc))
 				);
 
 				let reply = match ping_result {

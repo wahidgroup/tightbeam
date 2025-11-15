@@ -2,7 +2,6 @@
 
 #![cfg(all(feature = "std", feature = "testing-fuzz"))]
 
-use tightbeam::testing::{assertions::AssertionPhase, error::TestingError};
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 tb_assert_spec! {
@@ -66,7 +65,7 @@ tb_scenario! {
 
 			// Make assertions based on execution trace
 			for event in trace.oracle().trace() {
-				trace.assert(AssertionPhase::HandlerStart, event.0);
+				trace.assert(event.0, &[]);
 			}
 			Ok(())
 		}

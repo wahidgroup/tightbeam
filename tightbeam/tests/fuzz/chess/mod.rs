@@ -769,7 +769,7 @@ fn forced_win_nuclear_debug(move_count: u64) -> u64 {
 }
 
 servlet! {
-	name: ChessEngineServlet,
+	ChessEngineServlet<ChessMoveRequest>,
 	protocol: TokioListener,
 	policies: {
 		// TODO: Add mutual authentication policies
@@ -1015,7 +1015,7 @@ tb_scenario! {
 		expect_failure: false,
 	},
 	environment Servlet {
-		servlet: ChessEngineServlet,
+		servlet: ChessEngineServlet<ChessMoveRequest>,
 		start: async move {
 			// DEBUG: Track servlet start - this should execute on first AFL iteration
 			let _ = std::fs::write("/tmp/chess_servlet_start.txt", format!("servlet_start_called: pid={}\n", std::process::id()));
@@ -1033,7 +1033,7 @@ tb_scenario! {
 			};
 
 			let _ = std::fs::write("/tmp/chess_servlet_start_calling.txt", "calling_servlet_start\n");
-			let servlet = ChessEngineServlet::start(config).await;
+			let servlet = ChessEngineServlet::<ChessMoveRequest>::start(Some(config)).await;
 
 			// DEBUG: Track servlet started
 			if let Ok(ref s) = servlet {

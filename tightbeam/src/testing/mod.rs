@@ -29,6 +29,7 @@ crate::tb_labels! { pub enum TbDemoLabels { MessageReceived => payload, HandlerS
 
 #[cfg(test)]
 mod tests {
+	use crate::exactly;
 	use crate::testing::TBSpec;
 
 	crate::tb_assert_spec! {
@@ -37,7 +38,7 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				(HandlerStart, "MessageReceived", crate::exactly!(1))
+				("MessageReceived", exactly!(1))
 			]
 		}
 	}

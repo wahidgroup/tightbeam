@@ -18,7 +18,7 @@ macro_rules! __tightbeam_worker_common_methods {
 		/// Relay a message to the worker
 		pub async fn relay(
 			&self,
-			message: $input,
+			message: ::std::sync::Arc<$input>,
 		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
 			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
 			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
@@ -64,7 +64,7 @@ macro_rules! __tightbeam_worker_common_methods {
 		/// Relay a message to the worker
 		pub async fn relay(
 			&self,
-			message: $input,
+			message: ::std::sync::Arc<$input>,
 		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
 			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
 			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
@@ -226,7 +226,7 @@ pub mod worker_runtime {
 }
 
 pub struct WorkerRequest<I: Send, O> {
-	pub message: I,
+	pub message: Arc<I>,
 	pub respond_to: worker_runtime::rt::ResponseSender<Result<O, TransitStatus>>,
 }
 
@@ -589,7 +589,7 @@ macro_rules! worker {
 					let _ = respond_to.send(Err(status));
 					continue;
 				}
-				let $message_ident = message;
+				let $message_ident = (*message).clone();
 				let $config_ident = config_arc.as_ref();
 				let output = (async move $handler_block).await;
 				let _ = respond_to.send(Ok(output));
@@ -607,7 +607,7 @@ macro_rules! worker {
 					let _ = respond_to.send(Err(status));
 					continue;
 				}
-				let $message_ident = message;
+				let $message_ident = (*message).clone();
 				let output = (async move $handler_block).await;
 				let _ = respond_to.send(Ok(output));
 			}
@@ -617,7 +617,7 @@ macro_rules! worker {
 	(@evaluate_policies $policies:expr, $message:expr) => {{
         let __result: ::core::result::Result<(), $crate::policy::TransitStatus> = (|| {
             for gate in $policies.receptor_gates().iter() {
-                let status = gate.evaluate($message);
+                let status = gate.evaluate($message.as_ref());
                 if status != $crate::policy::TransitStatus::Accepted {
                     return Err(status);
                 }
@@ -719,16 +719,16 @@ mod tests {
 		assertions: |worker| async move {
 			assert_eq!(worker.queue_capacity(), 64);
 
-			let winner = worker.relay(RequestMessage {
+			let winner = worker.relay(::std::sync::Arc::new(RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
-			}).await?;
+			})).await?;
 			assert!(winner);
 
-			let loser = worker.relay(RequestMessage {
+			let loser = worker.relay(::std::sync::Arc::new(RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 7,
-			}).await?;
+			})).await?;
 			assert!(!loser);
 
 			Ok(())
@@ -747,7 +747,7 @@ mod tests {
 				content: "PING".to_string(),
 				lucky_number: 42,
 			};
-			let response = worker.relay(ping_msg).await?;
+			let response = worker.relay(::std::sync::Arc::new(ping_msg)).await?;
 			assert_eq!(response, PongMessage { result: "PONG".to_string() });
 
 			// Test rejected message
@@ -756,7 +756,7 @@ mod tests {
 				lucky_number: 42,
 			};
 
-			let result = worker.relay(pong_msg).await;
+			let result = worker.relay(::std::sync::Arc::new(pong_msg)).await;
 			assert!(matches!(result, Err(WorkerRelayError::Rejected(_))));
 
 			Ok(())

@@ -28,7 +28,7 @@ use std::borrow::Cow;
 
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::TransitStatus;
-use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionPhase};
+use crate::testing::assertions::{AssertionContract, AssertionLabel};
 use crate::testing::specs::{SpecViolation, TBSpec};
 use crate::testing::trace::{ConsumedTrace, ExecutionMode};
 use crate::Errorizable;
@@ -37,7 +37,7 @@ use crate::Errorizable;
 use crate::instrumentation::TbEventKind;
 
 // Re-exports
-pub use crate::testing::assertions::AssertionValue;
+pub use crate::testing::assertions::{AssertionValue, IsNone, IsSome};
 pub use crate::testing::trace::TraceCollector;
 pub use crate::{absent, at_least, at_most, between, equals, exactly, falsy, present, truthy};
 
@@ -262,7 +262,8 @@ pub struct AssertSpecBuilder {
 	version_major: u16,
 	version_minor: u16,
 	version_patch: u16,
-	assertions: Vec<(AssertionPhase, &'static str, Cardinality, Option<AssertionValue>)>,
+	assertions: Vec<(&'static str, Vec<&'static str>, Cardinality, Option<AssertionValue>)>,
+	tag_filter: Option<Vec<&'static str>>,
 	ordering: Vec<&'static str>,
 	#[cfg(feature = "instrument")]
 	required_events: Vec<TbEventKind>,
@@ -279,6 +280,7 @@ impl AssertSpecBuilder {
 			version_minor: 0,
 			version_patch: 0,
 			assertions: Vec::new(),
+			tag_filter: None,
 			ordering: Vec::new(),
 			#[cfg(feature = "instrument")]
 			required_events: Vec::new(),
@@ -298,13 +300,18 @@ impl AssertSpecBuilder {
 		self
 	}
 
+	pub fn tag_filter(mut self, tags: Vec<&'static str>) -> Self {
+		self.tag_filter = Some(tags);
+		self
+	}
+
 	pub fn assertion(
 		mut self,
-		phase: AssertionPhase,
 		label: &'static str,
+		tags: Vec<&'static str>,
 		cardinality: Cardinality,
 	) -> Result<Self, SpecBuildError> {
-		if self.assertions.iter().any(|(_, l, _, _)| *l == label) {
+		if self.assertions.iter().any(|(l, _, _, _)| *l == label) {
 			return Err(SpecBuildError::DuplicateLabel(label));
 		}
 		if let Some(mx) = cardinality.max {
@@ -312,18 +319,18 @@ impl AssertSpecBuilder {
 				return Err(SpecBuildError::InvalidRange(label));
 			}
 		}
-		self.assertions.push((phase, label, cardinality, None));
+		self.assertions.push((label, tags, cardinality, None));
 		Ok(self)
 	}
 
 	pub fn assertion_with_value(
 		mut self,
-		phase: AssertionPhase,
 		label: &'static str,
+		tags: Vec<&'static str>,
 		cardinality: Cardinality,
 		expected_value: Option<AssertionValue>,
 	) -> Result<Self, SpecBuildError> {
-		if self.assertions.iter().any(|(_, l, _, _)| *l == label) {
+		if self.assertions.iter().any(|(l, _, _, _)| *l == label) {
 			return Err(SpecBuildError::DuplicateLabel(label));
 		}
 		if let Some(mx) = cardinality.max {
@@ -331,13 +338,13 @@ impl AssertSpecBuilder {
 				return Err(SpecBuildError::InvalidRange(label));
 			}
 		}
-		self.assertions.push((phase, label, cardinality, expected_value));
+		self.assertions.push((label, tags, cardinality, expected_value));
 		Ok(self)
 	}
 
 	pub fn ordering(mut self, labels: &[&'static str]) -> Result<Self, SpecBuildError> {
 		for &lbl in labels {
-			if !self.assertions.iter().any(|(_, l, _, _)| *l == lbl) {
+			if !self.assertions.iter().any(|(l, _, _, _)| *l == lbl) {
 				return Err(SpecBuildError::UnknownOrderingLabel(lbl));
 			}
 			self.ordering.push(lbl);
@@ -375,15 +382,20 @@ pub struct BuiltAssertSpec {
 
 impl BuiltAssertSpec {
 	fn from_builder(builder: AssertSpecBuilder) -> Self {
+		let tag_filter = builder.tag_filter.clone();
 		let contracts: Vec<AssertionContract> = builder
 			.assertions
 			.iter()
-			.map(|(phase, label, card, value)| {
-				if let Some(ref val) = value {
-					AssertionContract::with_value(*phase, AssertionLabel::Custom(label), *card, val.clone())
+			.map(|(label, _tags, card, value)| {
+				let mut contract = if let Some(ref val) = value {
+					AssertionContract::new(AssertionLabel::Custom(label), *card).with_value(val.clone())
 				} else {
-					AssertionContract::new(*phase, AssertionLabel::Custom(label), *card)
+					AssertionContract::new(AssertionLabel::Custom(label), *card)
+				};
+				if let Some(ref filter) = tag_filter {
+					contract = contract.with_tag_filter(filter.clone());
 				}
+				contract
 			})
 			.collect();
 		let spec_hash = Self::compute_hash(
@@ -394,6 +406,7 @@ impl BuiltAssertSpec {
 			builder.version_minor,
 			builder.version_patch,
 			&contracts,
+			builder.tag_filter.as_deref(),
 			#[cfg(feature = "instrument")]
 			&builder.required_events,
 		);
@@ -409,6 +422,7 @@ impl BuiltAssertSpec {
 		version_minor: u16,
 		version_patch: u16,
 		contracts: &[AssertionContract],
+		tag_filter: Option<&[&'static str]>,
 		#[cfg(feature = "instrument")] events: &[TbEventKind],
 	) -> [u8; 32] {
 		let mut h = Sha3_256::new();
@@ -431,29 +445,25 @@ impl BuiltAssertSpec {
 			}
 			None => h.update([0u8]),
 		}
-		// Normalize assertion order independent of insertion sequence
-		let mut norm: Vec<(&'static str, u8, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
-		for c in contracts {
-			let phase_code = match c.phase {
-				AssertionPhase::HandlerStart => 0u8,
-				AssertionPhase::HandlerEnd => 1u8,
-				AssertionPhase::Gate => 2u8,
-				AssertionPhase::Response => 3u8,
-				AssertionPhase::Any => 4u8,
-			};
-			let AssertionLabel::Custom(lbl) = c.label;
-			norm.push((
-				lbl,
-				phase_code,
-				c.cardinality.min,
-				c.cardinality.max,
-				c.cardinality.must_be_present,
-			));
+		// Include tag_filter in hash if present
+		if let Some(tags) = tag_filter {
+			h.update([1u8]);
+			h.update((tags.len() as u32).to_be_bytes());
+			for tag in tags {
+				h.update(tag.as_bytes());
+			}
+		} else {
+			h.update([0u8]);
 		}
-		norm.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1))); // label then phase
-		for (lbl, phase_code, min, max, must) in norm {
+		// Normalize assertion order independent of insertion sequence
+		let mut norm: Vec<(&'static str, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
+		for c in contracts {
+			let AssertionLabel::Custom(lbl) = c.label;
+			norm.push((lbl, c.cardinality.min, c.cardinality.max, c.cardinality.must_be_present));
+		}
+		norm.sort_by(|a, b| a.0.cmp(b.0)); // label only
+		for (lbl, min, max, must) in norm {
 			h.update(lbl.as_bytes());
-			h.update([phase_code]);
 			h.update(min.to_be_bytes());
 			match max {
 				Some(m) => {
@@ -666,7 +676,32 @@ macro_rules! tb_labels {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_build {
-	// Entry point - dispatch to appropriate handler
+	// Entry point with tag_filter and description
+	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, tag_filter: [ $($tag:expr),* $(,)? ], [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ], $desc:expr) => {
+		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
+		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(stringify!($base), $crate::testing::trace::ExecutionMode::$mode);
+		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate).tag_filter(vec![ $($tag),* ]);
+		$(
+			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
+		)*
+		#[cfg(feature = "instrument")]
+		{ $( builder = builder.required_events(&[$crate::instrumentation::TbEventKind::$ev]); )* }
+		builder = builder.description($desc);
+		$vec.push(builder.build());
+	};
+	// Entry point with tag_filter, no description
+	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, tag_filter: [ $($tag:expr),* $(,)? ], [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ]) => {
+		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
+		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(stringify!($base), $crate::testing::trace::ExecutionMode::$mode);
+		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate).tag_filter(vec![ $($tag),* ]);
+		$(
+			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
+		)*
+		#[cfg(feature = "instrument")]
+		{ $( builder = builder.required_events(&[$crate::instrumentation::TbEventKind::$ev]); )* }
+		$vec.push(builder.build());
+	};
+	// Entry point without tag_filter, with description
 	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ], $desc:expr) => {
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(stringify!($base), $crate::testing::trace::ExecutionMode::$mode);
@@ -679,7 +714,7 @@ macro_rules! __tb_assert_spec_build {
 		builder = builder.description($desc);
 		$vec.push(builder.build());
 	};
-	// Entry point without description
+	// Entry point without tag_filter, without description
 	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ]) => {
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(stringify!($base), $crate::testing::trace::ExecutionMode::$mode);
@@ -693,20 +728,44 @@ macro_rules! __tb_assert_spec_build {
 	};
 }
 
-// Helper to add individual assertions (handles both 3 and 4-element tuples)
+// Helper to add individual assertions (handles tags and values)
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_add_assertion {
-	// 4-element tuple with value
-	($builder:expr, ($phase:ident, $label:expr, $card:expr, $value:expr)) => {
+	// NEW SYNTAX: With value and tags - match equals! specifically
+	($builder:expr, ($label:expr, $card:expr, equals!($value:expr), tags: [ $($tag:expr),* $(,)? ])) => {
 		$builder
-			.assertion_with_value($crate::testing::assertions::AssertionPhase::$phase, $label, $card, $value)
+			.assertion_with_value($label, vec![ $($tag),* ], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
 			.expect("duplicate label or invalid range")
 	};
-	// 3-element tuple without value
+	// NEW SYNTAX: With value, no tags - match equals! specifically
+	($builder:expr, ($label:expr, $card:expr, equals!($value:expr))) => {
+		$builder
+			.assertion_with_value($label, vec![], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
+			.expect("duplicate label or invalid range")
+	};
+	// NEW SYNTAX: With tags, no value
+	($builder:expr, ($label:expr, $card:expr, tags: [ $($tag:expr),* $(,)? ])) => {
+		$builder
+			.assertion($label, vec![ $($tag),* ], $card)
+			.expect("duplicate label or invalid range")
+	};
+	// NEW SYNTAX: No tags, no value (2-element tuple)
+	($builder:expr, ($label:expr, $card:expr)) => {
+		$builder
+			.assertion($label, vec![], $card)
+			.expect("duplicate label or invalid range")
+	};
+	// OLD SYNTAX: (Phase, label, cardinality, equals!(value)) - ignore phase, convert to new syntax
+	($builder:expr, ($phase:ident, $label:expr, $card:expr, equals!($value:expr))) => {
+		$builder
+			.assertion_with_value($label, vec![], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
+			.expect("duplicate label or invalid range")
+	};
+	// OLD SYNTAX: (Phase, label, cardinality) - ignore phase, convert to new syntax
 	($builder:expr, ($phase:ident, $label:expr, $card:expr)) => {
 		$builder
-			.assertion($crate::testing::assertions::AssertionPhase::$phase, $label, $card)
+			.assertion($label, vec![], $card)
 			.expect("duplicate label or invalid range")
 	};
 }
@@ -715,8 +774,14 @@ macro_rules! __tb_assert_spec_add_assertion {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_build_with_desc {
+	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, tag_filter: [ $($tag:expr),* $(,)? ], [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ], $desc:expr) => {
+		$crate::__tb_assert_spec_build!($vec, $base, $maj, $min, $patch, $mode, $gate, tag_filter: [ $($tag),* ], [ $( $assertion ),* ], [ $( $ev ),* ], $desc);
+	};
 	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ], $desc:expr) => {
 		$crate::__tb_assert_spec_build!($vec, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ], $desc);
+	};
+	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, tag_filter: [ $($tag:expr),* $(,)? ], [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ]) => {
+		$crate::__tb_assert_spec_build!($vec, $base, $maj, $min, $patch, $mode, $gate, tag_filter: [ $($tag),* ], [ $( $assertion ),* ], [ $( $ev ),* ]);
 	};
 	($vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident, [ $( $assertion:tt ),* ], [ $( $ev:ident ),* ]) => {
 		$crate::__tb_assert_spec_build!($vec, $base, $maj, $min, $patch, $mode, $gate, [ $( $assertion ),* ], [ $( $ev ),* ]);
@@ -726,7 +791,69 @@ macro_rules! __tb_assert_spec_build_with_desc {
 // Multi-version macro ONLY (full semantic version required maj.min.patch)
 #[macro_export]
 macro_rules! tb_assert_spec {
-	// Without annotations (must come first)
+	// Without annotations, with tag_filter (must come first)
+	(
+		$(#[$meta:meta])*
+		$vis:vis $base:ident,
+		$( V ( $maj:literal , $min:literal , $patch:literal ) : { mode: $mode:ident, gate: $gate:ident, tag_filter: [ $($tag:expr),* $(,)? ], assertions: [ $( $assertion:tt ),* $(,)? ] $(, events: [ $( $ev:ident ),* $(,)? ])? } ),+ $(,)?
+	) => {
+		$(#[$meta])*
+		$vis struct $base;
+		impl $base {
+			pub fn all() -> &'static [$crate::testing::macros::BuiltAssertSpec] {
+				#[cfg(feature = "std")]
+				{
+					static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
+					CELL.get_or_init(|| {
+						let mut v = Vec::new();
+						$(
+							$crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, tag_filter: [ $($tag),* ], [ $( $assertion ),* ], [ $( $ev ),* ]);
+						)+
+						v
+					}).as_slice()
+				}
+				#[cfg(not(feature = "std"))]
+				{
+					use core::sync::atomic::{AtomicBool, Ordering};
+					static INIT: AtomicBool = AtomicBool::new(false);
+					static mut VEC: Option<Vec<$crate::testing::macros::BuiltAssertSpec>> = None;
+					if !INIT.load(Ordering::Acquire) {
+						let mut v = Vec::new();
+						$(
+							$crate::__tb_assert_spec_build!(v, $base, $maj, $min, $patch, $mode, $gate, tag_filter: [ $($tag),* ], [ $( $assertion ),* ], [ $( $ev ),* ]);
+						)+
+						unsafe { VEC = Some(v); }
+						INIT.store(true, Ordering::Release);
+					}
+					unsafe { VEC.as_ref().unwrap().as_slice() }
+				}
+			}
+
+			#[allow(dead_code)]
+			pub fn get(maj: u16, min: u16, patch: u16) -> Option<&'static $crate::testing::macros::BuiltAssertSpec> {
+				for s in Self::all() {
+					let (maj_ver, min_ver, patch_ver) = s.version();
+					if maj_ver == maj && min_ver == min && patch_ver == patch {
+						return Some(s);
+					}
+				}
+				None
+			}
+
+			#[allow(dead_code)]
+			pub fn latest() -> &'static $crate::testing::macros::BuiltAssertSpec {
+				let mut best: Option<&'static $crate::testing::macros::BuiltAssertSpec> = None;
+				for s in Self::all() {
+					match best {
+						Some(b) => if s.version() > b.version() { best = Some(s); },
+						None => best = Some(s)
+					}
+				}
+				best.expect("no versions defined")
+			}
+		}
+	};
+	// Without annotations, without tag_filter (must come first)
 	(
 		$(#[$meta:meta])*
 		$vis:vis $base:ident,
@@ -788,7 +915,70 @@ macro_rules! tb_assert_spec {
 			}
 		}
 	};
-	// With annotations
+	// With annotations, with tag_filter
+	(
+		$(#[$meta:meta])*
+		$vis:vis $base:ident,
+		$( V ( $maj:literal , $min:literal , $patch:literal ) : { mode: $mode:ident, gate: $gate:ident, tag_filter: [ $($tag:expr),* $(,)? ], assertions: [ $( $assertion:tt ),* $(,)? ] $(, events: [ $( $ev:ident ),* $(,)? ])? } ),+ $(,)?
+		annotations { description: $desc:expr }
+	) => {
+		$(#[$meta])*
+		$vis struct $base;
+		impl $base {
+			pub fn all() -> &'static [$crate::testing::macros::BuiltAssertSpec] {
+				#[cfg(feature = "std")]
+				{
+					static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
+					CELL.get_or_init(|| {
+						let mut v = Vec::new();
+						$(
+							$crate::__tb_assert_spec_build_with_desc!(v, $base, $maj, $min, $patch, $mode, $gate, tag_filter: [ $($tag),* ], [ $( $assertion ),* ], [ $( $ev ),* ], $desc);
+						)+
+						v
+					}).as_slice()
+				}
+				#[cfg(not(feature = "std"))]
+				{
+					use core::sync::atomic::{AtomicBool, Ordering};
+					static INIT: AtomicBool = AtomicBool::new(false);
+					static mut VEC: Option<Vec<$crate::testing::macros::BuiltAssertSpec>> = None;
+					if !INIT.load(Ordering::Acquire) {
+						let mut v = Vec::new();
+						$(
+							$crate::__tb_assert_spec_build_with_desc!(v, $base, $maj, $min, $patch, $mode, $gate, tag_filter: [ $($tag),* ], [ $( $assertion ),* ], [ $( $ev ),* ], $desc);
+						)+
+						unsafe { VEC = Some(v); }
+						INIT.store(true, Ordering::Release);
+					}
+					unsafe { VEC.as_ref().unwrap().as_slice() }
+				}
+			}
+
+			#[allow(dead_code)]
+			pub fn get(maj: u16, min: u16, patch: u16) -> Option<&'static $crate::testing::macros::BuiltAssertSpec> {
+				for s in Self::all() {
+					let (maj_ver, min_ver, patch_ver) = s.version();
+					if maj_ver == maj && min_ver == min && patch_ver == patch {
+						return Some(s);
+					}
+				}
+				None
+			}
+
+			#[allow(dead_code)]
+			pub fn latest() -> &'static $crate::testing::macros::BuiltAssertSpec {
+				let mut best: Option<&'static $crate::testing::macros::BuiltAssertSpec> = None;
+				for s in Self::all() {
+					match best {
+						Some(b) => if s.version() > b.version() { best = Some(s); },
+						None => best = Some(s)
+					}
+				}
+				best.expect("no versions defined")
+			}
+		}
+	};
+	// With annotations, without tag_filter
 	(
 		$(#[$meta:meta])*
 		$vis:vis $base:ident,
@@ -1336,6 +1526,7 @@ macro_rules! tb_scenario {
 
 		// Stub main() for IDE - rust-analyzer needs this to see a main() function
 		// This is only compiled when NOT fuzzing, so it won't conflict with the generated main() above
+		#[allow(unexpected_cfgs)]
 		#[cfg(not(fuzzing))]
 		#[allow(dead_code)]
 		fn main() {
@@ -3271,7 +3462,7 @@ macro_rules! tb_scenario {
 
 	// Catch-all for unrecognized syntax
 	($($tt:tt)*) => {
-		compile_error!("Unrecognized tb_scenario! syntax; expected: name: test_name, spec: Type, environment <Variant> { ... }")
+		compile_error!("Unrecognized tb_scenario! syntax; expected: name: test_name, spec: Type, environment <Variant> { ... }");
 	};
 }
 
@@ -3296,7 +3487,6 @@ macro_rules! __tb_scenario_servlet_start {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::assertions::AssertionPhase;
 	use crate::testing::create_test_message;
 	use crate::testing::macros::TraceCollector;
 	use crate::testing::trace::ExecutionMode;
@@ -3317,8 +3507,8 @@ mod tests {
 	#[test]
 	fn builder_duplicate_label() -> Result<(), Box<dyn std::error::Error>> {
 		let b = AssertSpecBuilder::new("spec", ExecutionMode::Accept)
-			.assertion(AssertionPhase::HandlerStart, "L1", Cardinality::exactly(1))?
-			.assertion(AssertionPhase::HandlerStart, "L1", Cardinality::exactly(2));
+			.assertion("L1", vec![], Cardinality::exactly(1))?
+			.assertion("L1", vec![], Cardinality::exactly(2));
 		assert!(matches!(b, Err(SpecBuildError::DuplicateLabel("L1"))));
 		Ok(())
 	}
@@ -3329,16 +3519,16 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				(HandlerStart, "Received", exactly!(1)),
-				(Response, "Responded", exactly!(1))
+				("Received", exactly!(1)),
+				("Responded", exactly!(1))
 			]
 		},
 		V(1,1,0): {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				(HandlerStart, "Received", exactly!(1)),
-				(Response, "Responded", exactly!(2))
+				("Received", exactly!(1)),
+				("Responded", exactly!(2))
 			]
 		},
 	}
@@ -3349,9 +3539,9 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				(HandlerStart, "Received", exactly!(2)),
-				(Response, "Responded", exactly!(2)),
-				(Response, "message_content", exactly!(1), equals!("Hello TightBeam!"))
+				("Received", exactly!(2)),
+				("Responded", exactly!(2)),
+				("message_content", exactly!(1), equals!("Hello TightBeam!"))
 			]
 		},
 	}
@@ -3373,9 +3563,9 @@ mod tests {
 		spec: DemoSpec,
 		environment Bare {
 			exec: |trace| {
-				trace.assert(AssertionPhase::HandlerStart, "Received");
-				trace.assert(AssertionPhase::Response, "Responded");
-				trace.assert(AssertionPhase::Response, "Responded");
+				trace.assert("Received", &[]);
+				trace.assert("Responded", &[]);
+				trace.assert("Responded", &[]);
 				Ok(())
 			}
 		}
@@ -3386,8 +3576,8 @@ mod tests {
 		specs: [DemoSpec::get(1, 0, 0)],
 		environment Bare {
 			exec: |trace| {
-				trace.assert(AssertionPhase::HandlerStart, "Received");
-				trace.assert(AssertionPhase::Response, "Responded");
+				trace.assert("Received", &[]);
+				trace.assert("Responded", &[]);
 				Ok(())
 			}
 		}
@@ -3405,8 +3595,8 @@ mod tests {
 			specs: [DemoSpec::get(1, 0, 0), DemoSpec::get(1, 1, 0)],
 			environment Bare {
 				exec: |trace| {
-					trace.assert(AssertionPhase::HandlerStart, "Received");
-					trace.assert(AssertionPhase::Response, "Responded");
+					trace.assert("Received", &[]);
+					trace.assert("Responded", &[]);
 					Ok(())
 				}
 			}
@@ -3425,10 +3615,10 @@ mod tests {
 		}
 
 		fn process(&mut self) -> Result<(), crate::TightBeamError> {
-			self.trace.assert(AssertionPhase::HandlerStart, "Received");
+			self.trace.assert("Received", &[]);
 			self.received_count += 1;
-			self.trace.assert(AssertionPhase::Response, "Responded");
-			self.trace.assert(AssertionPhase::Response, "Responded");
+			self.trace.assert("Responded", &[]);
+			self.trace.assert("Responded", &[]);
 			Ok(())
 		}
 	}
@@ -3448,9 +3638,9 @@ mod tests {
 		environment Worker {
 			setup: TestWorker::new,
 			stimulus: |trace, worker: &mut TestWorker| {
-				trace.assert(AssertionPhase::HandlerStart, "Received");
+				trace.assert("Received", &[]);
 				worker.received_count += 1;
-				trace.assert(AssertionPhase::Response, "Responded");
+				trace.assert("Responded", &[]);
 				Ok(())
 			}
 		}
@@ -3470,9 +3660,9 @@ mod tests {
 					protocol TokioListener: listener,
 					assertions: trace,
 					handle: |frame, trace| async move {
-						trace.assert(AssertionPhase::HandlerStart, "Received");
-						trace.assert(AssertionPhase::Response, "Responded");
-						trace.assert(AssertionPhase::Response, "Responded");
+						trace.assert("Received", &[]);
+						trace.assert("Responded", &[]);
+						trace.assert("Responded", &[]);
 						Ok(Some(frame))
 					}
 				};
@@ -3509,13 +3699,13 @@ mod tests {
 					assertions: trace,
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.assert(AssertionPhase::HandlerStart, "Received");
-						trace.assert(AssertionPhase::Response, "Responded");
+						trace.assert("Received", &[]);
+						trace.assert("Responded", &[]);
 
 						// Decode message to extract value for assertion
 						let decoded: Result<TestMessage, _> = crate::decode(&frame.message);
 						if let Ok(msg) = decoded {
-							trace.assert_value(AssertionPhase::Response, "message_content", msg.content);
+							trace.assert_value("message_content", &[], msg.content);
 						}
 
 						Ok(Some(frame))
@@ -3526,7 +3716,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.assert(AssertionPhase::Response, "Responded");
+				trace.assert("Responded", &[]);
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -3536,7 +3726,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.assert(AssertionPhase::HandlerStart, "Received");
+				trace.assert("Received", &[]);
 
 				Ok(())
 			}
@@ -3550,86 +3740,4 @@ mod tests {
 			}
 		}
 	}
-}
-
-/// AFL-powered fuzz target macro
-///
-/// This macro is a wrapper around tb_scenario! that generates a complete AFL fuzz target.
-/// It defines the assertion spec and CSP process, then calls tb_scenario! with fuzz: afl.
-///
-/// Must be used in a file with `#![no_main]` at the top.
-///
-/// # Example
-///
-/// ```ignore
-/// #![no_main]
-///
-/// tightbeam::tb_fuzz_scenario! {
-///     spec: {
-///         pub MyFuzzSpec,
-///         V(1,0,0): {
-///             mode: Accept,
-///             gate: Accepted,
-///             assertions: [ (HandlerStart, "event", tightbeam::exactly!(1)) ]
-///         },
-///     },
-///     csp: {
-///         pub struct MyFuzzProc;
-///         events {
-///             observable { "event" }
-///             hidden { }
-///         }
-///         states {
-///             S0 => { "event" => S1 }
-///         }
-///         terminal { S1 }
-///     },
-///     environment Bare {
-///         exec: |trace| {
-///             // Scenario logic using AFL-provided input via trace.oracle()
-///             trace.oracle().fuzz_from_bytes()?;
-///             Ok(())
-///         }
-///     }
-/// }
-/// ```
-#[macro_export]
-#[cfg(all(feature = "std", feature = "testing-csp"))]
-macro_rules! tb_fuzz_scenario {
-	(
-		spec: {
-			$spec_vis:vis $spec_name:ident,
-			$( $spec_body:tt )*
-		},
-		csp: {
-			$csp_vis:vis struct $csp_name:ident;
-			$( $csp_body:tt )*
-		},
-		environment $env:ident {
-			$( $env_body:tt )*
-		}
-		$(,)?
-	) => {
-		// Define the assertion spec
-		$crate::tb_assert_spec! {
-			$spec_vis $spec_name,
-			$( $spec_body )*
-		}
-
-		// Define the CSP process
-		$crate::tb_process_spec! {
-			$csp_vis struct $csp_name;
-			$( $csp_body )*
-		}
-
-		// Use tb_scenario! with fuzz: afl to generate the AFL wrapper
-		$crate::tb_scenario! {
-			fuzz: afl,
-			spec: $spec_name,
-			csp: $csp_name,
-			environment $env {
-				$( $env_body )*
-			}
-		}
-	};
 }

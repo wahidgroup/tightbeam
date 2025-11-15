@@ -29,7 +29,7 @@ pub struct NumberResponse {
 // ============================================================================
 
 servlet! {
-	name: EchoServlet,
+	EchoServlet<NumberRequest>,
 	protocol: TokioListener,
 	policies: {},
 	config: {},
@@ -104,11 +104,11 @@ tb_scenario! {
 	csp: SimpleServletFlow,
 	fuzz: afl,
 	environment Servlet {
-		servlet: EchoServlet,
+		servlet: EchoServlet<NumberRequest>,
 		start: async move {
 			// DEBUG: Track servlet start
 			let _ = std::fs::write("/tmp/simple_servlet_start.txt", "servlet_starting\n");
-			let servlet = EchoServlet::start(()).await?;
+			let servlet = EchoServlet::<NumberRequest>::start(None).await?;
 			let _ = std::fs::write("/tmp/simple_servlet_started.txt", format!("servlet_started: addr={:?}\n", servlet.addr()));
 			Ok(servlet)
 		},

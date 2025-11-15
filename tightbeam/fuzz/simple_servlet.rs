@@ -29,10 +29,10 @@ pub struct NumberResponse {
 // ============================================================================
 
 servlet! {
-	name: EchoServlet,
+	EchoServlet<NumberRequest>,
 	protocol: TokioListener,
 	policies: {},
-	handle: |message| async move {
+	handle: |message, _trace| async move {
 		// DEBUG: Track handler entry
 		let _ = std::fs::write("/tmp/simple_servlet_handler_entry.txt", format!("handler_called: order={}\n", message.metadata.order));
 
@@ -110,9 +110,9 @@ tb_scenario! {
 		start: async move {
 			// DEBUG: Track servlet start
 			let _ = std::fs::write("/tmp/simple_servlet_start.txt", "servlet_starting\n");
-			let servlet = EchoServlet::start().await?;
+			let servlet = EchoServlet::<NumberRequest>::start(None).await?;
 			let _ = std::fs::write("/tmp/simple_servlet_started.txt", format!("servlet_started: addr={:?}\n", servlet.addr()));
-			Ok::<EchoServlet, tightbeam::TightBeamError>(servlet)
+			Ok::<EchoServlet<NumberRequest>, tightbeam::TightBeamError>(servlet)
 		},
 		client: |trace, mut client| async move {
 			// DEBUG: Track client entry

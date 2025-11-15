@@ -1,13 +1,18 @@
-//! Integration test for TightBeam protocol
+//! Integration tests for TightBeam protocol workflows.
+//! TODO Enhance with instrumentation when available.
 //!
-//! Demonstrates full V2 protocol capabilities using the compose! macro.
+//! Scenarios are defined declaratively so that each protocol version is
+//! validated with the metadata it permits (and rejects).
 
-use der::ValueOrd;
-use tightbeam::compose;
-use tightbeam::matrix::{MatrixDyn, MatrixLike};
+use tightbeam::builder::{FrameBuilder, TypeBuilder};
+use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid, Key, KeyInit};
+use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey, VerifyingKey};
+use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
-
-use tightbeam::crypto::aead::KeyInit;
+use tightbeam::testing::macros::{IsNone, IsSome};
+use tightbeam::utils;
+use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
 /// Simple test message
 #[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
@@ -28,7 +33,7 @@ impl tightbeam::Message for TestMessage {
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: tightbeam::Version = tightbeam::Version::V0;
+	const MIN_VERSION: tb::Version = tb::Version::V0;
 }
 
 /// Custom test matrix for message metadata
@@ -37,7 +42,6 @@ impl tightbeam::Message for TestMessage {
 enum FlagTestDevelopmentMode {
 	#[default]
 	Default = 0,
-	IsDevelopment = 1,
 	IsMaintenanceMode = 2,
 }
 
@@ -81,114 +85,138 @@ impl PartialEq<u8> for FlagTestDebugLevel {
 // Define the flag set with automatic position assignment
 tightbeam::flagset!(TestFlagSet: FlagTestDevelopmentMode, FlagTestDebugLevel);
 
-#[test]
-fn test_workflow_v0() -> Result<(), Box<dyn core::error::Error>> {
-	// Create a test message
-	let message = TestMessage { content: "Hello, basic world!".to_string() };
-
-	// Create basic V0 message with just hash verification
-	let tightbeam = compose! {
-		V0: id: "basic-test",
-			order: 1696521500,
-			message: message.clone()
-	}?;
-
-	// Decode the message (no decryption needed for V0)
-	let decoded: TestMessage = tightbeam::decode(&tightbeam.message)?;
-	assert_eq!(decoded, message);
-
-	// Verify basic metadata
-	assert_eq!(str::from_utf8(&tightbeam.metadata.id), Ok("basic-test"));
-	assert_eq!(tightbeam.version, tightbeam::Version::V0);
-
-	// V0 doesn't have encryption, signatures, priority, TTL, or matrix
-	assert!(tightbeam.nonrepudiation.is_none());
-	assert!(tightbeam.metadata.priority.is_none());
-	assert!(tightbeam.metadata.lifetime.is_none());
-	assert!(tightbeam.metadata.matrix.is_none());
-
-	Ok(())
+struct TestCrypto {
+	cipher: Aes256Gcm,
+	signing_key: Secp256k1SigningKey,
+	verifying_key: VerifyingKey<Secp256k1>,
 }
 
-#[test]
-fn test_workflow_v2() -> Result<(), Box<dyn core::error::Error>> {
-	// Create a test message
-	let message = TestMessage { content: "Hello, secure world!".to_string() };
-	// Hash the message
-	let message_hash = tightbeam::utils::digest::<crypto::hash::Sha3_256>(&message)?;
+fn build_crypto(seed: u8) -> Result<TestCrypto, TightBeamError> {
+	let key_bytes = [seed; 32];
+	let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+	let signing_key = Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
+	let verifying_key = *signing_key.verifying_key();
+	Ok(TestCrypto { cipher, signing_key, verifying_key })
+}
 
-	// Setup metadata
-	let order = 1696521600;
-	let ttl = 3600;
-	let priority = tb::MessagePriority::High;
+tb_assert_spec! {
+	pub VersionSpec,
+	V(0,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		tag_filter: ["v0"],
+		assertions: [
+			("roundtrip_ok", exactly!(1), equals!(true)),
+			("nonrepudiation", exactly!(1), equals!(IsNone)),
+			("integrity", exactly!(1), equals!(IsNone)),
+			("confidentiality", exactly!(1), equals!(IsNone)),
+			("priority", exactly!(1), equals!(IsNone)),
+			("lifetime", exactly!(1), equals!(IsNone)),
+			("previous_frame", exactly!(1), equals!(IsNone)),
+			("matrix", exactly!(1), equals!(IsNone)),
+			("version", exactly!(1), equals!(tb::Version::V0))
+		]
+	},
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		tag_filter: ["v1"],
+		assertions: [
+			("roundtrip_ok", exactly!(1), equals!(true)),
+			("sig_valid", exactly!(1), equals!(true)),
+			("integrity_ok", exactly!(1), equals!(true)),
+			("confidentiality", exactly!(1), equals!(IsSome)),
+			("priority", exactly!(1), equals!(IsNone)),
+			("lifetime", exactly!(1), equals!(IsNone)),
+			("previous_frame", exactly!(1), equals!(IsNone)),
+			("matrix", exactly!(1), equals!(IsNone)),
+			("version", exactly!(1), equals!(tb::Version::V1))
+		]
+	},
+	V(2,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		tag_filter: ["v2"],
+		assertions: [
+			("roundtrip_ok", exactly!(1), equals!(true)),
+			("sig_valid", exactly!(1), equals!(true)),
+			("integrity_ok", exactly!(1), equals!(true)),
+			("confidentiality", exactly!(1), equals!(IsSome)),
+			("priority", exactly!(1), equals!(Some(tb::MessagePriority::High))),
+			("lifetime", exactly!(1), equals!(Some(3_600))),
+			("previous_frame", exactly!(1), equals!(IsSome)),
+			("matrix", exactly!(1), equals!(IsNone)),
+			("version", exactly!(1), equals!(tb::Version::V2))
+		]
+	},
+	V(3,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		tag_filter: ["v3"],
+		assertions: [
+			("roundtrip_ok", exactly!(1), equals!(true)),
+			("sig_valid", exactly!(1), equals!(true)),
+			("integrity_ok", exactly!(1), equals!(true)),
+			("confidentiality", exactly!(1), equals!(IsSome)),
+			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Top))),
+			("lifetime", exactly!(1), equals!(Some(3_600))),
+			("previous_frame", exactly!(1), equals!(IsSome)),
+			("matrix", exactly!(1), equals!(IsSome)),
+			("version", exactly!(1), equals!(tb::Version::V3))
+		]
+	}
+}
 
-	// Setup crypto
-	let key = crypto::aead::Key::<crypto::aead::Aes256Gcm>::from_slice(&[0x42; 32]);
-	let cipher = crypto::aead::Aes256Gcm::new(key);
-	let signing_key = crypto::sign::ecdsa::Secp256k1SigningKey::from_bytes(&[0x33; 32].into())?;
-	let verifying_key = signing_key.verifying_key();
+tb_scenario! {
+	name: version_check_all,
+	specs: [
+		VersionSpec::get(0, 0, 0),
+		VersionSpec::get(1, 0, 0),
+		VersionSpec::get(2, 0, 0),
+		VersionSpec::get(3, 0, 0)
+	],
+	environment Bare {
+		exec: |trace| {
+			let message = TestMessage { content: "Hello from workflow".to_string() };
+			let crypto = build_crypto(0x44)?;
+			let message_hash = utils::digest::<Sha3_256>(&message)?;
 
-	// Create V1 previous message (V1 has hash support)
-	let previous_msg = compose! {
-		V1: id: "integration-test-previous",
-			order: 1696521500,
-			message: message.clone(),
-			message_integrity: type crypto::hash::Sha3_256,
-			confidentiality<crypto::aead::Aes256GcmOid, _>: &cipher
-	}?;
+			// Build ONE V3 frame with all capabilities
+			let builder: FrameBuilder<TestMessage> = FrameBuilder::from(tb::Version::V3);
+			let frame = builder
+				.with_id("workflow")
+				.with_order(1_696_521_700)
+				.with_message(message.clone())
+				.with_message_hasher::<Sha3_256>()
+				.with_cipher::<Aes256GcmOid, _>(&crypto.cipher)
+				.with_signer::<Secp256k1Signature, _>(&crypto.signing_key)
+				.with_priority(tb::MessagePriority::Top)
+				.with_lifetime(3_600)
+				.with_previous_hash(message_hash.clone())
+				.with_matrix(tightbeam::flags![
+					TestFlagSet:
+						FlagTestDevelopmentMode::IsMaintenanceMode,
+						FlagTestDebugLevel::Basic
+				]).build()?;
 
-	// Get the hash of the previous message for linking
-	let previous = previous_msg.metadata.integrity.clone().expect("V1 message should have hash");
+			let roundtrip = frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
+			let sig_valid = frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok();
+			let integrity = frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
+			let integrity_ok = integrity.value_cmp(&message_hash).is_ok();
 
-	// Create custom flags for this message using the flagset
-	let flags = tightbeam::flags![
-		TestFlagSet:
-			FlagTestDevelopmentMode::IsMaintenanceMode,
-			FlagTestDebugLevel::Basic
-	];
+			trace.assert_value("roundtrip_ok", &["v0", "v1", "v2", "v3"], roundtrip == message);
+			trace.assert_option("nonrepudiation", &["v0"], &frame.nonrepudiation);
+			trace.assert_option("integrity", &["v0"], &frame.metadata.integrity);
+			trace.assert_option("confidentiality", &["v0", "v1", "v2", "v3"], &frame.metadata.confidentiality);
+			trace.assert_value("priority", &["v0", "v1", "v2", "v3"], frame.metadata.priority);
+			trace.assert_value("lifetime", &["v0", "v1", "v2", "v3"], frame.metadata.lifetime);
+			trace.assert_option("previous_frame", &["v0", "v1", "v2", "v3"], &frame.metadata.previous_frame);
+			trace.assert_option("matrix", &["v0", "v1", "v2", "v3"], &frame.metadata.matrix);
+			trace.assert_value("version", &["v0", "v1", "v2", "v3"], frame.version);
+			trace.assert_value("sig_valid", &["v1", "v2", "v3"], sig_valid);
+			trace.assert_value("integrity_ok", &["v1", "v2", "v3"], integrity_ok);
 
-	// Create full V2 message with all features including custom flags
-	let tightbeam = compose! {
-		V2: id: "integration-test",
-			order: order,
-			message: message.clone(),
-			message_integrity: type crypto::hash::Sha3_256,
-			confidentiality<crypto::aead::Aes256GcmOid, _>: &cipher,
-			nonrepudiation<crypto::sign::ecdsa::Secp256k1Signature, _>: &signing_key,
-			priority: priority,
-			lifetime: ttl,
-			previous_frame: previous.clone(),
-			matrix: flags
-	}?;
-
-	// Decrypt and verify the message was correctly processed
-	let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, None)?;
-	assert_eq!(decrypted, message);
-
-	// Verify signature
-	let result = tightbeam.verify::<crypto::sign::ecdsa::Secp256k1Signature>(verifying_key);
-	assert!(result.is_ok());
-
-	// Verify metadata
-	assert_eq!(str::from_utf8(&tightbeam.metadata.id), Ok("integration-test"));
-	assert_eq!(tightbeam.version, tightbeam::Version::V2);
-	assert_eq!(tightbeam.metadata.order, order);
-	assert_eq!(tightbeam.metadata.priority, Some(priority));
-	assert_eq!(tightbeam.metadata.lifetime, Some(ttl));
-	assert_eq!(tightbeam.metadata.previous_frame, Some(previous));
-	let integrity = tightbeam.metadata.integrity.clone().ok_or("Expected integrity to be Some")?;
-	assert!(integrity.value_cmp(&message_hash).is_ok());
-	assert!(tightbeam.metadata.matrix.is_some());
-	assert!(tightbeam.metadata.previous_frame.is_some());
-
-	// Check flag switches using position-aware contains method
-	let matrix = MatrixDyn::try_from(tightbeam.metadata.matrix.clone())?;
-	let flags = TestFlagSet::from(matrix);
-	assert!(flags.contains(FlagTestDevelopmentMode::IsMaintenanceMode));
-	assert!(flags.contains(FlagTestDebugLevel::Basic));
-	// Negative checks
-	assert!(!flags.contains(FlagTestDebugLevel::Default));
-	assert!(!flags.contains(FlagTestDevelopmentMode::IsDevelopment));
-
-	Ok(())
+			Ok(())
+		}
+	}
 }

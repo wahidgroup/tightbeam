@@ -110,7 +110,7 @@
 //!
 //!             // Make assertions based on execution trace
 //!             for event in trace.oracle().trace() {
-//!                 trace.assert(AssertionPhase::HandlerStart, event.0);
+//!                 trace.assert(event.0, &[]);
 //!             }
 //!             Ok(())
 //!         }

@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		id: b"regular-drone",
 		servlets: {
 			simple_servlet: SimpleServlet,
-			configurable_servlet: ConfurableServlet,
+			configurable_servlet: ConfigurableServlet,
 			worker_servlet: WorkerServlet
 		}
 	}.start().await?)
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		},
 		servlets: {
 			simple_servlet: SimpleServlet,
-			configurable_servlet: ConfurableServlet,
+			configurable_servlet: ConfigurableServlet,
 			worker_servlet: WorkerServlet
 		}
 		router: {

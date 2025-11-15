@@ -66,6 +66,7 @@ pub mod tb {
 	pub use crate::{notarize, sign};
 
 	pub use crate::asn1::MessagePriority;
+	pub use crate::asn1::Version;
 }
 
 /// Message emission and creation

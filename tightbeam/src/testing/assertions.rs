@@ -9,17 +9,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
+use crate::asn1::{MessagePriority, Version};
 use crate::testing::macros::Cardinality;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AssertionPhase {
-	HandlerStart,
-	HandlerEnd,
-	Gate,
-	Response,
-	/// Matches any phase - useful for FDR/CSP scenarios where lifecycle phase doesn't matter
-	Any,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AssertionLabel {
@@ -27,7 +18,7 @@ pub enum AssertionLabel {
 }
 
 /// Type-safe wrapper for assertion values supporting PartialEq comparison
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum AssertionValue {
 	String(String),
 	Bool(bool),
@@ -37,7 +28,40 @@ pub enum AssertionValue {
 	I32(i32),
 	I64(i64),
 	F64(f64),
+	MessagePriority(MessagePriority),
+	Version(Version),
+	Some(Box<AssertionValue>),
 	None,
+	NotNone,
+}
+
+impl PartialEq for AssertionValue {
+	fn eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			// NotNone matches any Some(_) value
+			(Self::NotNone, Self::Some(_)) => true,
+			(Self::Some(_), Self::NotNone) => true,
+			// NotNone does not match None
+			(Self::NotNone, Self::None) => false,
+			(Self::None, Self::NotNone) => false,
+			// NotNone does not match NotNone (we want it to match Some(_), not itself)
+			(Self::NotNone, Self::NotNone) => false,
+			// Standard comparisons for other variants
+			(Self::String(a), Self::String(b)) => a == b,
+			(Self::Bool(a), Self::Bool(b)) => a == b,
+			(Self::U8(a), Self::U8(b)) => a == b,
+			(Self::U32(a), Self::U32(b)) => a == b,
+			(Self::U64(a), Self::U64(b)) => a == b,
+			(Self::I32(a), Self::I32(b)) => a == b,
+			(Self::I64(a), Self::I64(b)) => a == b,
+			(Self::F64(a), Self::F64(b)) => a == b,
+			(Self::MessagePriority(a), Self::MessagePriority(b)) => a == b,
+			(Self::Version(a), Self::Version(b)) => a == b,
+			(Self::Some(a), Self::Some(b)) => a == b,
+			(Self::None, Self::None) => true,
+			_ => false,
+		}
+	}
 }
 
 // From implementations for ergonomic conversion
@@ -89,51 +113,99 @@ impl From<i64> for AssertionValue {
 	}
 }
 
+impl From<MessagePriority> for AssertionValue {
+	fn from(p: MessagePriority) -> Self {
+		Self::MessagePriority(p)
+	}
+}
+
+impl From<Version> for AssertionValue {
+	fn from(v: Version) -> Self {
+		Self::Version(v)
+	}
+}
+
+// Option support - convert Some(x) to Some(Box<AssertionValue>) and None to None
+impl<T> From<Option<T>> for AssertionValue
+where
+	T: Into<AssertionValue>,
+{
+	fn from(opt: Option<T>) -> Self {
+		match opt {
+			Some(val) => Self::Some(Box::new(val.into())),
+			None => Self::None,
+		}
+	}
+}
+
+/// Marker type for asserting that an Option is Some(_) without checking the inner value
+/// Use with `equals!(NotNone)` in assertion specs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsSome;
+
+impl From<IsSome> for AssertionValue {
+	fn from(_: IsSome) -> Self {
+		Self::NotNone
+	}
+}
+
+/// Marker type for asserting that an Option is None
+/// Use with `equals!(IsNone)` in assertion specs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsNone;
+
+impl From<IsNone> for AssertionValue {
+	fn from(_: IsNone) -> Self {
+		Self::None
+	}
+}
+
 #[derive(Clone, Debug)]
 pub struct Assertion {
 	pub seq: usize,
-	pub phase: AssertionPhase,
 	pub label: AssertionLabel,
+	pub tags: Vec<&'static str>,
 	pub payload_hash: Option<[u8; 32]>,
 	pub value: Option<AssertionValue>,
 }
 
 impl Assertion {
-	pub fn new(seq: usize, phase: AssertionPhase, label: AssertionLabel, payload_hash: Option<[u8; 32]>) -> Self {
-		Self { seq, phase, label, payload_hash, value: None }
+	pub fn new(seq: usize, label: AssertionLabel, tags: Vec<&'static str>, payload_hash: Option<[u8; 32]>) -> Self {
+		Self { seq, label, tags, payload_hash, value: None }
 	}
 
 	pub fn with_value(
 		seq: usize,
-		phase: AssertionPhase,
 		label: AssertionLabel,
+		tags: Vec<&'static str>,
 		payload_hash: Option<[u8; 32]>,
 		value: AssertionValue,
 	) -> Self {
-		Self { seq, phase, label, payload_hash, value: Some(value) }
+		Self { seq, label, tags, payload_hash, value: Some(value) }
 	}
 }
 
 #[derive(Clone, Debug)]
 pub struct AssertionContract {
-	pub phase: AssertionPhase,
 	pub label: AssertionLabel,
+	pub tag_filter: Option<Vec<&'static str>>,
 	pub cardinality: Cardinality,
 	pub expected_value: Option<AssertionValue>,
 }
 
 impl AssertionContract {
-	pub fn new(phase: AssertionPhase, label: AssertionLabel, cardinality: Cardinality) -> Self {
-		Self { phase, label, cardinality, expected_value: None }
+	pub fn new(label: AssertionLabel, cardinality: Cardinality) -> Self {
+		Self { label, tag_filter: None, cardinality, expected_value: None }
 	}
 
-	pub fn with_value(
-		phase: AssertionPhase,
-		label: AssertionLabel,
-		cardinality: Cardinality,
-		expected_value: AssertionValue,
-	) -> Self {
-		Self { phase, label, cardinality, expected_value: Some(expected_value) }
+	pub fn with_tag_filter(mut self, tags: Vec<&'static str>) -> Self {
+		self.tag_filter = Some(tags);
+		self
+	}
+
+	pub fn with_value(mut self, expected_value: AssertionValue) -> Self {
+		self.expected_value = Some(expected_value);
+		self
 	}
 
 	pub fn is_satisfied_by(&self, assertions: &[Assertion]) -> bool {
@@ -144,12 +216,15 @@ impl AssertionContract {
 				if a.label != self.label {
 					return false;
 				}
-				// Phase matching: Any matches any phase, or exact match
-				match (self.phase, a.phase) {
-					(AssertionPhase::Any, _) => true,
-					(_, AssertionPhase::Any) => true,
-					_ => a.phase == self.phase,
+				// Tag matching: if spec has tag_filter, assertion must have all those tags
+				if let Some(ref filter_tags) = self.tag_filter {
+					for filter_tag in filter_tags {
+						if !a.tags.contains(filter_tag) {
+							return false;
+						}
+					}
 				}
+				true
 			})
 			.collect();
 
@@ -169,10 +244,15 @@ impl AssertionContract {
 
 	pub fn describe(&self) -> String {
 		let cardinality_desc = self.cardinality.describe();
-		if let Some(ref expected) = self.expected_value {
-			format!("{} with value {:?}", cardinality_desc, expected)
+		let tag_desc = if let Some(ref tags) = self.tag_filter {
+			format!(" with tags {:?}", tags)
 		} else {
-			cardinality_desc
+			String::new()
+		};
+		if let Some(ref expected) = self.expected_value {
+			format!("{} with value {:?}{}", cardinality_desc, expected, tag_desc)
+		} else {
+			format!("{}{}", cardinality_desc, tag_desc)
 		}
 	}
 }

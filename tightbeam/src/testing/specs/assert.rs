@@ -5,7 +5,7 @@
 //! expected behavior; the framework automatically verifies traces.
 
 use crate::policy::TransitStatus;
-use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionPhase};
+use crate::testing::assertions::{AssertionContract, AssertionLabel};
 use crate::testing::trace::{ConsumedTrace, ExecutionMode};
 use crate::Frame;
 
@@ -74,8 +74,8 @@ pub enum SpecViolation {
 	},
 	/// Assertion contract violated
 	AssertionViolation {
-		phase: AssertionPhase,
 		label: AssertionLabel,
+		tags: Option<Vec<&'static str>>,
 		expected: String,
 		actual: usize,
 	},
@@ -116,10 +116,15 @@ impl fmt::Display for SpecViolation {
 			Self::GateDecisionMismatch { expected, actual } => {
 				write!(f, "Gate decision mismatch: expected {expected:?}, got {actual:?}")
 			}
-			Self::AssertionViolation { phase, label, expected, actual } => {
+			Self::AssertionViolation { label, tags, expected, actual } => {
+				let tag_desc = if let Some(ref t) = tags {
+					format!(" with tags {:?}", t)
+				} else {
+					String::new()
+				};
 				write!(
 					f,
-					"Assertion contract violated: {label:?} @ {phase:?} expected {expected}, found {actual}"
+					"Assertion contract violated: {label:?}{tag_desc} expected {expected}, found {actual}"
 				)
 			}
 			#[cfg(feature = "instrument")]
@@ -172,10 +177,10 @@ pub fn verify_trace<S: TBSpec>(spec: &S, trace: &ConsumedTrace) -> Result<(), Sp
 	// 3. Verify all assertion contracts
 	for contract in spec.required_assertions() {
 		if !contract.is_satisfied_by(&trace.assertions) {
-			let actual_count = trace.count_assertions(contract.phase, &contract.label);
+			let actual_count = trace.count_assertions(&contract.label, contract.tag_filter.as_deref());
 			return Err(SpecViolation::AssertionViolation {
-				phase: contract.phase,
 				label: contract.label.clone(),
+				tags: contract.tag_filter.clone(),
 				expected: contract.cardinality.describe(),
 				actual: actual_count,
 			});

@@ -280,7 +280,7 @@ pub struct StopServletResult {
 /// Drones extend the `Servlet` trait, inheriting the standard lifecycle methods
 /// (start, addr, stop, join) and adding drone-specific capabilities for morphing
 /// between different servlet types.
-pub trait Drone: Servlet {
+pub trait Drone<I>: Servlet<I> {
 	/// The protocol type this drone uses
 	type Protocol: Protocol;
 
@@ -347,7 +347,7 @@ impl Default for HiveConf {
 ///
 /// This trait can only be implemented by drones whose protocol implements both `Mycelial`
 /// and `AsyncListenerTrait` (hives require async protocols for concurrent servlet management).
-pub trait Hive: Drone
+pub trait Hive<I>: Drone<I>
 where
 	Self::Protocol: Mycelial + AsyncListenerTrait,
 {
@@ -366,72 +366,174 @@ where
 /// Macro for creating drones with pre-registered servlets
 #[macro_export]
 macro_rules! drone {
-	// Drone with policies and hive support
+	// New syntax: Drone with policies and hive support (with attributes/doc comments and visibility)
 	(
-		name: $drone_name:ident,
+		$(#[$meta:meta])*
+		pub $drone_name:ident,
 		protocol: $protocol:path,
 		hive: true,
 		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
-		servlets: { $($servlet_id:ident: $servlet_type:ty),* $(,)? }
+		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
 	) => {
-		drone!(@generate $drone_name, $protocol, [hive], [$($policy_key: $policy_val),+], $($servlet_id: $servlet_type),*);
+		drone!(@generate_with_attrs $drone_name, $protocol, [hive], [$($policy_key: $policy_val),+], $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
 	};
-
-	// Drone with policies (no hive)
 	(
-		name: $drone_name:ident,
-		protocol: $protocol:path,
-		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
-		servlets: { $($servlet_id:ident: $servlet_type:ty),* $(,)? }
-	) => {
-		drone!(@generate $drone_name, $protocol, [], [$($policy_key: $policy_val),+], $($servlet_id: $servlet_type),*);
-	};
-
-	// Drone with hive support (no policies)
-	(
-		name: $drone_name:ident,
+		$(#[$meta:meta])*
+		$drone_name:ident,
 		protocol: $protocol:path,
 		hive: true,
-		servlets: { $($servlet_id:ident: $servlet_type:ty),* $(,)? }
+		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
+		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
 	) => {
-		drone!(@generate $drone_name, $protocol, [hive], [], $($servlet_id: $servlet_type),*);
+		drone!(@generate_with_attrs $drone_name, $protocol, [hive], [$($policy_key: $policy_val),+], $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
 	};
 
-	// Drone without policies or hive
+	// New syntax: Drone with policies (no hive)
 	(
-		name: $drone_name:ident,
+		$(#[$meta:meta])*
+		pub $drone_name:ident,
 		protocol: $protocol:path,
-		servlets: { $($servlet_id:ident: $servlet_type:ty),* $(,)? }
+		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
+		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
 	) => {
-		drone!(@generate $drone_name, $protocol, [], [], $($servlet_id: $servlet_type),*);
+		drone!(@generate_with_attrs $drone_name, $protocol, [], [$($policy_key: $policy_val),+], $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$drone_name:ident,
+		protocol: $protocol:path,
+		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
+		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
+	) => {
+		drone!(@generate_with_attrs $drone_name, $protocol, [], [$($policy_key: $policy_val),+], $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
 	};
 
-	// Main implementation generator with hive flag
-	(@generate $drone_name:ident, $protocol:path, [hive], [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_type:ty),*) => {
-		drone!(@impl_hive_struct $drone_name, $protocol, $($servlet_id: $servlet_type),*);
-		drone!(@impl_servlet_trait_for_hive $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_type),*);
-		drone!(@impl_drone_trait_for_hive $drone_name, $protocol, $($servlet_id: $servlet_type),*);
-		drone!(@impl_hive_trait $drone_name, $protocol, $($servlet_id: $servlet_type),*);
+	// New syntax: Drone with hive support (no policies)
+	(
+		$(#[$meta:meta])*
+		pub $drone_name:ident,
+		protocol: $protocol:path,
+		hive: true,
+		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
+	) => {
+		drone!(@generate_with_attrs $drone_name, $protocol, [hive], [], $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$drone_name:ident,
+		protocol: $protocol:path,
+		hive: true,
+		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
+	) => {
+		drone!(@generate_with_attrs $drone_name, $protocol, [hive], [], $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
+	};
+
+	// New syntax: Drone without policies or hive
+	(
+		$(#[$meta:meta])*
+		pub $drone_name:ident,
+		protocol: $protocol:path,
+		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
+	) => {
+		drone!(@generate_with_attrs $drone_name, $protocol, [], [], $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$drone_name:ident,
+		protocol: $protocol:path,
+		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
+	) => {
+		drone!(@generate_with_attrs $drone_name, $protocol, [], [], $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
+	};
+
+	// Generate with attributes and visibility (new syntax)
+	(@generate_with_attrs $drone_name:ident, $protocol:path, [hive], [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_name:ident<$input:ty>),*, pub, [$(#[$meta:meta])*]) => {
+		drone!(@impl_hive_struct_with_attrs $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
+		drone!(@impl_servlet_trait_for_hive $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_drone_trait_for_hive $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_hive_trait $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
 		drone!(@impl_drop_for_hive $drone_name);
 	};
-
-	// Main implementation generator without hive
-	(@generate $drone_name:ident, $protocol:path, [], [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_type:ty),*) => {
-		drone!(@impl_enum $drone_name, $($servlet_id: $servlet_type),*);
-		drone!(@impl_struct $drone_name, $protocol);
-		drone!(@impl_servlet_trait $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_type),*);
-		drone!(@impl_drone_trait $drone_name, $protocol, $($servlet_id: $servlet_type),*);
+	(@generate_with_attrs $drone_name:ident, $protocol:path, [hive], [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_name:ident<$input:ty>),*, , [$(#[$meta:meta])*]) => {
+		drone!(@impl_hive_struct_with_attrs $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
+		drone!(@impl_servlet_trait_for_hive $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_drone_trait_for_hive $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_hive_trait $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_drop_for_hive $drone_name);
+	};
+	(@generate_with_attrs $drone_name:ident, $protocol:path, [], [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_name:ident<$input:ty>),*, pub, [$(#[$meta:meta])*]) => {
+		drone!(@impl_enum $drone_name, $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_struct_with_attrs $drone_name, $protocol, pub, [$(#[$meta])*]);
+		drone!(@impl_servlet_trait $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_drone_trait $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_drop $drone_name);
+	};
+	(@generate_with_attrs $drone_name:ident, $protocol:path, [], [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_name:ident<$input:ty>),*, , [$(#[$meta:meta])*]) => {
+		drone!(@impl_enum $drone_name, $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_struct_with_attrs $drone_name, $protocol, , [$(#[$meta])*]);
+		drone!(@impl_servlet_trait $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
+		drone!(@impl_drone_trait $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
 		drone!(@impl_drop $drone_name);
 	};
 
+	// Start servlet
+	(@start_servlet $servlet_name:ident<$input:ty>, $instance:ident, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr) => {
+		paste::paste! {
+			let servlet = <$servlet_name as $crate::colony::Servlet<$input>>::start(None).await
+				.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId($error_id))?;
+			let mut active = $instance.active_servlet.lock().unwrap();
+			*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
+			return Ok($crate::policy::TransitStatus::Accepted);
+		}
+	};
+
+	// Start servlet with response (for control server)
+	(@start_servlet_with_response $servlet_name:ident<$input:ty>, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr, $active_servlet:ident, $stop_old:ident, $frame:ident) => {
+		paste::paste! {
+			// Stop old servlet if any
+			let old_servlet = {
+				let mut active = $active_servlet.lock().unwrap();
+				core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None)
+			};
+			$stop_old(old_servlet);
+
+			// Start new servlet
+			match <$servlet_name as $crate::colony::Servlet<$input>>::start(None).await {
+				Ok(servlet) => {
+					let servlet_addr = servlet.addr();
+					let addr_str: Vec<u8> = servlet_addr.clone().into();
+					let mut active = $active_servlet.lock().unwrap();
+					*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
+					drop(active);
+					return Ok(Some($crate::compose! {
+						V0: id: $frame.metadata.id.clone(),
+							message: $crate::colony::drone::ActivateServletResponse {
+								status: $crate::policy::TransitStatus::Accepted,
+								servlet_address: Some(addr_str)
+							}
+					}?));
+				}
+				Err(_) => {
+					return Ok(Some($crate::compose! {
+						V0: id: $frame.metadata.id.clone(),
+							message: $crate::colony::drone::ActivateServletResponse {
+								status: $crate::policy::TransitStatus::Forbidden,
+								servlet_address: None
+							}
+					}?));
+				}
+			}
+		}
+	};
+
 	// Generate the enum for holding different servlet types
-	(@impl_enum $drone_name:ident, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@impl_enum $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			// Generate an enum to hold any of the possible servlet types
 			enum [<$drone_name ActiveServlet>] {
 				None,
 				$(
-					[<$servlet_id:camel>]($servlet_type),
+					[<$servlet_id:camel>]($servlet_name),
 				)*
 			}
 
@@ -445,8 +547,24 @@ macro_rules! drone {
 
 	// Generate the drone struct
 	(@impl_struct $drone_name:ident, $protocol:path) => {
+		drone!(@impl_struct_with_attrs $drone_name, $protocol, pub, []);
+	};
+
+	// Generate the drone struct with attributes and visibility
+	(@impl_struct_with_attrs $drone_name:ident, $protocol:path, pub, [$(#[$meta:meta])*]) => {
 		paste::paste! {
+			$(#[$meta])*
 			pub struct $drone_name {
+				active_servlet: ::std::sync::Arc<::std::sync::Mutex<[<$drone_name ActiveServlet>]>>,
+				control_server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				addr: <$protocol as $crate::transport::Protocol>::Address,
+			}
+		}
+	};
+	(@impl_struct_with_attrs $drone_name:ident, $protocol:path, , [$(#[$meta:meta])*]) => {
+		paste::paste! {
+			$(#[$meta])*
+			struct $drone_name {
 				active_servlet: ::std::sync::Arc<::std::sync::Mutex<[<$drone_name ActiveServlet>]>>,
 				control_server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
@@ -455,9 +573,9 @@ macro_rules! drone {
 	};
 
 	// Implement Servlet trait
-	(@impl_servlet_trait $drone_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@impl_servlet_trait $drone_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
-			impl $crate::colony::Servlet for $drone_name {
+			impl $crate::colony::Servlet<()> for $drone_name {
 				type Conf = ();
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
@@ -473,7 +591,7 @@ macro_rules! drone {
 					let active_servlet_clone = active_servlet.clone();
 
 					// Start the control server that listens for ActivateServletRequest messages
-					let control_server_handle = drone!(@build_control_server $protocol, listener, [$($policy_key: $policy_val),*], active_servlet_clone, $drone_name, $($servlet_id: $servlet_type),*);
+					let control_server_handle = drone!(@build_control_server $protocol, listener, [$($policy_key: $policy_val),*], active_servlet_clone, $drone_name, $($servlet_id: $servlet_name<$input>),*);
 
 					Ok(Self {
 						active_servlet,
@@ -525,10 +643,72 @@ macro_rules! drone {
 		}
 	};
 
-	// Implement Drone trait
-	(@impl_drone_trait $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_type:ty),*) => {
+	// Start servlet for hive establishment (no response needed)
+	(@start_servlet_for_hive_establish_impl $servlet_name:ident<$input:ty>, $instance:ident, $drone_name:ident, $servlet_id:ident) => {
 		paste::paste! {
-			impl $crate::colony::drone::Drone for $drone_name {
+			if let Ok(servlet) = <$servlet_name as $crate::colony::Servlet<$input>>::start(None).await {
+				let servlet_addr = servlet.addr();
+				let addr_str: Vec<u8> = servlet_addr.clone().into();
+				let mut servlet_id: Vec<u8> = Vec::new();
+				servlet_id.extend_from_slice(stringify!($servlet_id).as_bytes());
+				servlet_id.push(b'_');
+				servlet_id.extend_from_slice(&addr_str);
+				let mut servlets = $instance.servlets.lock().unwrap();
+				servlets.insert(servlet_id, [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
+				drop(servlets);
+			}
+		}
+	};
+
+	// Start servlet for hive (with response)
+	(@start_servlet_for_hive $servlet_name:ident<$input:ty>, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr, $servlets:ident, $frame:ident) => {
+		paste::paste! {
+			match <$servlet_name as $crate::colony::Servlet<$input>>::start(None).await {
+				Ok(servlet) => {
+					let servlet_addr = servlet.addr();
+					let addr_str: Vec<u8> = servlet_addr.clone().into();
+					let mut servlet_id: Vec<u8> = Vec::new();
+					servlet_id.extend_from_slice(stringify!($servlet_id).as_bytes());
+					servlet_id.push(b'_');
+					servlet_id.extend_from_slice(&addr_str);
+					let mut servlets = $servlets.lock().unwrap();
+					servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
+					drop(servlets);
+					return Ok(Some($crate::compose! {
+						V0: id: $frame.metadata.id.clone(),
+							message: $crate::colony::drone::HiveManagementResponse {
+								spawn: Some($crate::colony::drone::SpawnServletResult {
+									status: $crate::policy::TransitStatus::Accepted,
+									servlet_address: Some(addr_str),
+									servlet_id: Some(servlet_id)
+								}),
+								list: None,
+								stop: None,
+							}
+					}?));
+				}
+				Err(_) => {
+					return Ok(Some($crate::compose! {
+						V0: id: $frame.metadata.id.clone(),
+							message: $crate::colony::drone::HiveManagementResponse {
+								spawn: Some($crate::colony::drone::SpawnServletResult {
+									status: $crate::policy::TransitStatus::Forbidden,
+									servlet_address: None,
+									servlet_id: None
+								}),
+								list: None,
+								stop: None,
+							}
+					}?));
+				}
+			}
+		}
+	};
+
+	// Implement Drone trait
+	(@impl_drone_trait $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+		paste::paste! {
+			impl $crate::colony::drone::Drone<()> for $drone_name {
 				type Protocol = $protocol;
 
 				async fn morph(
@@ -543,15 +723,7 @@ macro_rules! drone {
 					// Match servlet_id and activate the corresponding servlet
 					$(
 						if msg.servlet_id == stringify!($servlet_id).as_bytes() {
-							// Start the servlet with optional config
-							let servlet = <$servlet_type as $crate::colony::Servlet>::start(None).await
-								.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(msg.servlet_id.clone()))?;
-
-							// Store the servlet
-							let mut active = self.active_servlet.lock().unwrap();
-							*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
-
-							return Ok($crate::policy::TransitStatus::Accepted);
+							drone!(@start_servlet $servlet_name<$input>, self, $drone_name, $servlet_id, stringify!($servlet_id), msg.servlet_id.clone());
 						}
 					)*
 
@@ -634,8 +806,14 @@ macro_rules! drone {
 	};
 
 	// Generate hive struct (stores multiple servlet instances)
-	(@impl_hive_struct $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@impl_hive_struct $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+		drone!(@impl_hive_struct_with_attrs $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, []);
+	};
+
+	// Generate hive struct with attributes and visibility
+	(@impl_hive_struct_with_attrs $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*, pub, [$(#[$meta:meta])*]) => {
 		paste::paste! {
+			$(#[$meta])*
 			pub struct $drone_name {
 				// Map of servlet IDs to their instances
 				// Key format: "servlet_type_address" (e.g., "worker_servlet_127.0.0.1:8080")
@@ -650,16 +828,38 @@ macro_rules! drone {
 			// Enum to hold any servlet type
 			enum [<$drone_name Servlet>] {
 				$(
-					[<$servlet_id:camel>]($servlet_type),
+					[<$servlet_id:camel>]($servlet_name),
+				)*
+			}
+		}
+	};
+	(@impl_hive_struct_with_attrs $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*, , [$(#[$meta:meta])*]) => {
+		paste::paste! {
+			$(#[$meta])*
+			struct $drone_name {
+				// Map of servlet IDs to their instances
+				// Key format: "servlet_type_address" (e.g., "worker_servlet_127.0.0.1:8080")
+				servlets: ::std::sync::Arc<::std::sync::Mutex<::std::collections::HashMap<Vec<u8>, [<$drone_name Servlet>]>>>,
+				// Configuration
+				#[allow(dead_code)]
+				config: $crate::colony::drone::HiveConf,
+				control_server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
+				addr: <$protocol as $crate::transport::Protocol>::Address,
+			}
+
+			// Enum to hold any servlet type
+			enum [<$drone_name Servlet>] {
+				$(
+					[<$servlet_id:camel>]($servlet_name),
 				)*
 			}
 		}
 	};
 
 	// Implement Servlet trait for hive
-	(@impl_servlet_trait_for_hive $drone_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@impl_servlet_trait_for_hive $drone_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
-			impl $crate::colony::Servlet for $drone_name {
+			impl $crate::colony::Servlet<()> for $drone_name {
 				type Conf = $crate::colony::drone::HiveConf;
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
@@ -678,7 +878,7 @@ macro_rules! drone {
 					let servlets_clone = servlets.clone();
 
 					// Start the control server that listens for management commands
-					let control_server_handle = drone!(@build_hive_control_server $protocol, listener, [$($policy_key: $policy_val),*], servlets_clone, $drone_name, $($servlet_id: $servlet_type),*);
+					let control_server_handle = drone!(@build_hive_control_server $protocol, listener, [$($policy_key: $policy_val),*], servlets_clone, $drone_name, $($servlet_id: $servlet_name<$input>),*);
 
 					Ok(Self {
 						servlets,
@@ -731,9 +931,9 @@ macro_rules! drone {
 	};
 
 	// Implement Drone trait for hive (minimal implementation)
-	(@impl_drone_trait_for_hive $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@impl_drone_trait_for_hive $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
-			impl $crate::colony::drone::Drone for $drone_name {
+			impl $crate::colony::drone::Drone<()> for $drone_name {
 				type Protocol = $protocol;
 
 				async fn morph(
@@ -816,9 +1016,9 @@ macro_rules! drone {
 	};
 
 	// Implement Hive trait for mycelial async protocols
-	(@impl_hive_trait $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@impl_hive_trait $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
-			impl $crate::colony::drone::Hive for $drone_name
+			impl $crate::colony::drone::Hive<()> for $drone_name
 			where
 				$protocol: $crate::transport::Mycelial + $crate::transport::AsyncListenerTrait,
 			{
@@ -830,25 +1030,7 @@ macro_rules! drone {
 					$(
 						{
 							// Start the servlet - it will bind to its own unique port
-							let servlet = <$servlet_type as $crate::colony::Servlet>::start(None).await
-								.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId(stringify!($servlet_id).as_bytes().to_vec()))?;
-
-							// Get the servlet's address
-							let servlet_addr = servlet.addr();
-
-							// Generate servlet ID: "servlet_type_address"
-							let addr_str: Vec<u8> = servlet_addr.into();
-							let mut servlet_id = Vec::new();
-							servlet_id.extend_from_slice(stringify!($servlet_id).as_bytes());
-							servlet_id.push(b'_');
-							servlet_id.extend_from_slice(&addr_str);
-
-							// Store the servlet in the hive's registry
-							let mut servlets = self.servlets.lock().unwrap();
-							servlets.insert(
-								servlet_id,
-								[<$drone_name Servlet>]::[<$servlet_id:camel>](servlet)
-							);
+							drone!(@start_servlet_for_hive_establish_impl $servlet_name<$input>, self, $drone_name, $servlet_id);
 						}
 					)*
 					Ok(())
@@ -897,7 +1079,7 @@ macro_rules! drone {
 	};
 
 	// Helper to build control server with policies
-	(@build_control_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@build_control_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			$crate::server! {
 				protocol $protocol: $listener,
@@ -905,7 +1087,7 @@ macro_rules! drone {
 				handle: move |frame: $crate::Frame| {
 					let active_servlet = $active_servlet.clone();
 				async move {
-					drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_type),*)
+					drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 				}
 				}
 			}
@@ -913,14 +1095,14 @@ macro_rules! drone {
 	};
 
 	// Helper to build control server without policies
-	(@build_control_server $protocol:path, $listener:ident, [], $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@build_control_server $protocol:path, $listener:ident, [], $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			$crate::server! {
 				protocol $protocol: $listener,
 				handle: move |frame: $crate::Frame| {
 					let active_servlet = $active_servlet.clone();
 				async move {
-					drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_type),*)
+					drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 				}
 				}
 			}
@@ -928,7 +1110,7 @@ macro_rules! drone {
 	};
 
 	// Helper to build hive control server with policies
-	(@build_hive_control_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@build_hive_control_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			$crate::server! {
 				protocol $protocol: $listener,
@@ -936,7 +1118,7 @@ macro_rules! drone {
 				handle: move |frame: $crate::Frame| {
 					let servlets = $servlets.clone();
 				async move {
-					drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_type),*)
+					drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 				}
 				}
 			}
@@ -944,14 +1126,14 @@ macro_rules! drone {
 	};
 
 	// Helper to build hive control server without policies
-	(@build_hive_control_server $protocol:path, $listener:ident, [], $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@build_hive_control_server $protocol:path, $listener:ident, [], $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			$crate::server! {
 				protocol $protocol: $listener,
 				handle: move |frame: $crate::Frame| {
 					let servlets = $servlets.clone();
 				async move {
-					drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_type),*)
+					drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 				}
 				}
 			}
@@ -959,7 +1141,7 @@ macro_rules! drone {
 	};
 
 	// Helper to handle activation requests and route messages to active servlet
-	(@handle_activation_request $frame:ident, $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@handle_activation_request $frame:ident, $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			{
 				// Define a helper function to stop old servlets
@@ -980,39 +1162,9 @@ macro_rules! drone {
 					// Match servlet_id and activate the corresponding servlet
 					$(
 						if request.servlet_id == stringify!($servlet_id).as_bytes() {
-							// Start the servlet with optional config
-							match <$servlet_type as $crate::colony::Servlet>::start(None).await {
-								Ok(servlet) => {
-									let servlet_addr = servlet.addr();
-									let addr_bytes: Vec<u8> = servlet_addr.clone().into();
-
-									// Store the new servlet and get the old one
-									let mut active = $active_servlet.lock().unwrap();
-									let old_servlet = core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet));
-									drop(active);
-
-									// Stop the old servlet if there was one
-									stop_old_servlet(old_servlet);
-
-									// Return success response with servlet address
-									return Ok(Some($crate::compose! {
-										V0: id: $frame.metadata.id.clone(),
-											message: $crate::colony::drone::ActivateServletResponse {
-												status: $crate::policy::TransitStatus::Accepted,
-												servlet_address: Some(addr_bytes)
-											}
-									}?));
-								}
-								Err(_) => {
-									// Return error response
-									return Ok(Some($crate::compose! {
-										V0: id: $frame.metadata.id.clone(),
-											message: $crate::colony::drone::ActivateServletResponse {
-												status: $crate::policy::TransitStatus::Forbidden,
-												servlet_address: None
-											}
-									}?));
-								}
+							// Start the servlet with correct generic parameter (handles both generic and non-generic)
+							paste::paste! {
+							drone!(@start_servlet_with_response $servlet_name<$input>, $drone_name, $servlet_id, stringify!($servlet_id), request.servlet_id.clone(), $active_servlet, stop_old_servlet, $frame);
 							}
 						}
 					)*
@@ -1037,7 +1189,7 @@ macro_rules! drone {
 	};
 
 	// Helper to handle management commands for hives
-	(@handle_hive_management $frame:ident, $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_type:ty),*) => {
+	(@handle_hive_management $frame:ident, $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			{
 				// Decode the management request
@@ -1050,49 +1202,9 @@ macro_rules! drone {
 						// Try to spawn the requested servlet type
 						$(
 							if servlet_type_name == stringify!($servlet_id).as_bytes() {
-								match <$servlet_type as $crate::colony::Servlet>::start(None).await {
-									Ok(servlet) => {
-										let servlet_addr = servlet.addr();
-
-										// Generate servlet ID: "servlet_type_address"
-										let addr_str: Vec<u8> = servlet_addr.clone().into();
-										let mut servlet_id = Vec::new();
-										servlet_id.extend_from_slice(stringify!($servlet_id).as_bytes());
-										servlet_id.push(b'_');
-										servlet_id.extend_from_slice(&addr_str);
-
-										// Store the servlet
-										let mut servlets = $servlets.lock().unwrap();
-										servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
-										drop(servlets);
-
-										return Ok(Some($crate::compose! {
-											V0: id: $frame.metadata.id.clone(),
-												message: $crate::colony::drone::HiveManagementResponse {
-													spawn: Some($crate::colony::drone::SpawnServletResult {
-														status: $crate::policy::TransitStatus::Accepted,
-														servlet_address: Some(addr_str),
-														servlet_id: Some(servlet_id)
-													}),
-													list: None,
-													stop: None,
-												}
-										}?));
-									}
-									Err(_) => {
-										return Ok(Some($crate::compose! {
-											V0: id: $frame.metadata.id.clone(),
-												message: $crate::colony::drone::HiveManagementResponse {
-													spawn: Some($crate::colony::drone::SpawnServletResult {
-														status: $crate::policy::TransitStatus::Forbidden,
-														servlet_address: None,
-														servlet_id: None
-													}),
-													list: None,
-													stop: None,
-												}
-										}?));
-									}
+								// Start the servlet with correct generic parameter (handles both generic and non-generic)
+								paste::paste! {
+							drone!(@start_servlet_for_hive $servlet_name<$input>, $drone_name, $servlet_id, stringify!($servlet_id), servlet_type_name.to_vec(), $servlets, $frame);
 								}
 							}
 						)*
@@ -1203,6 +1315,11 @@ mod tests {
 	use crate::{job, mutex, policy, servlet, worker};
 	use crate::{Beamable, Frame};
 
+	#[cfg(feature = "tokio")]
+	type Listener = crate::transport::tcp::r#async::TokioListener;
+	#[cfg(all(not(feature = "tokio"), feature = "std"))]
+	type Listener = crate::transport::tcp::sync::TcpListener<std::net::TcpListener>;
+
 	// Jobs for hive management operations
 	job! {
 		name: ListServletsJob,
@@ -1291,11 +1408,6 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "tokio")]
-	type Listener = crate::transport::tcp::r#async::TokioListener;
-	#[cfg(all(not(feature = "tokio"), feature = "std"))]
-	type Listener = crate::transport::tcp::sync::TcpListener<std::net::TcpListener>;
-
 	mutex! { SIGNING_KEY: Secp256k1SigningKey = crate::testing::create_test_signing_key() }
 
 	// Test message types
@@ -1372,7 +1484,7 @@ mod tests {
 
 	// Create test servlets
 	servlet! {
-		name: SimpleServlet,
+		pub SimpleServlet<DroneTestMessage>,
 		protocol: Listener,
 		policies: {
 			with_collector_gate: [crate::policy::AcceptAllGate]
@@ -1388,7 +1500,7 @@ mod tests {
 	}
 
 	servlet! {
-		name: ConfigurableServlet,
+		pub ConfigurableServlet<DroneTestMessage>,
 		protocol: Listener,
 		policies: {
 			with_collector_gate: [crate::policy::AcceptAllGate]
@@ -1407,7 +1519,7 @@ mod tests {
 	}
 
 	servlet! {
-		name: WorkerServlet,
+		pub WorkerServlet<DroneTestMessage>,
 		protocol: Listener,
 		policies: {
 			with_collector_gate: [crate::policy::AcceptAllGate]
@@ -1423,19 +1535,11 @@ mod tests {
 		},
 		handle: |message, _config, workers| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
-
-			#[cfg(feature = "tokio")]
+			let decoded_arc = ::std::sync::Arc::new(decoded);
 			let (echo_result, check_result) = tokio::join!(
-				workers.echo.relay(decoded.clone()),
-				workers.checker.relay(decoded.clone())
+				workers.echo.relay(::std::sync::Arc::clone(&decoded_arc)),
+				workers.checker.relay(::std::sync::Arc::clone(&decoded_arc))
 			);
-
-			#[cfg(not(feature = "tokio"))]
-			let (echo_result, check_result) = {
-				let echo = workers.echo.relay(decoded.clone()).await;
-				let check = workers.checker.relay(decoded.clone()).await;
-				(echo, check)
-			};
 
 			let echo_msg = match echo_result {
 				Ok(msg) => msg,
@@ -1461,15 +1565,15 @@ mod tests {
 
 	// Regular drone with multiple servlets
 	drone! {
-		name: RegularDrone,
+		RegularDrone,
 		protocol: Listener,
 		policies: {
 			with_collector_gate: [SignatureGate::new(*SIGNING_KEY().lock().unwrap().verifying_key())]
 		},
 		servlets: {
-			simple_servlet: SimpleServlet,
-			configurable_servlet: ConfigurableServlet,
-			worker_servlet: WorkerServlet
+			simple_servlet: SimpleServlet<DroneTestMessage>,
+			configurable_servlet: ConfigurableServlet<DroneTestMessage>,
+			worker_servlet: WorkerServlet<DroneTestMessage>
 		}
 	}
 
@@ -1538,18 +1642,18 @@ mod tests {
 	// Test hive with mycelial port allocation using TokioListener
 	#[cfg(feature = "tokio")]
 	drone! {
-		name: TestHive,
+		TestHive,
 		protocol: crate::transport::tcp::r#async::TokioListener,
 		hive: true,
 		servlets: {
-			simple_servlet: SimpleServlet,
-			echo_servlet: EchoServlet
+			simple_servlet: SimpleServlet<DroneTestMessage>,
+			echo_servlet: EchoServlet<DroneTestMessage>
 		}
 	}
 
 	#[cfg(feature = "tokio")]
 	servlet! {
-		name: EchoServlet,
+		EchoServlet<DroneTestMessage>,
 		protocol: crate::transport::tcp::r#async::TokioListener,
 		policies: {
 			with_collector_gate: [crate::policy::AcceptAllGate]

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use alloc::sync::{Arc, Mutex};
 
 use crate::policy::TransitStatus;
-use crate::testing::assertions::{Assertion, AssertionLabel, AssertionPhase, AssertionValue};
+use crate::testing::assertions::{Assertion, AssertionLabel, AssertionValue};
 use crate::transport::error::TransportError;
 use crate::Frame;
 
@@ -64,16 +64,15 @@ impl TraceCollector {
 			.expect("Oracle not configured - did you provide csp: parameter in tb_scenario!?")
 	}
 
-	/// Record an assertion
-	pub fn assert(&self, phase: AssertionPhase, label: &str) {
-		self.assert_with_payload(phase, label, None);
+	/// Record an assertion with optional tags
+	pub fn assert(&self, label: &str, tags: &[&'static str]) {
+		self.assert_with_payload(label, tags, None);
 	}
 
-	/// Record an assertion without caring about phase (convenience for FDR/CSP scenarios)
+	/// Record an assertion without tags (convenience for FDR/CSP scenarios)
 	///
-	/// This is a convenience method for scenarios where the lifecycle phase doesn't matter,
-	/// such as FDR refinement checking or CSP process modeling. It uses `AssertionPhase::Any`
-	/// which matches any phase during validation.
+	/// This is a convenience method for scenarios where tags don't matter,
+	/// such as FDR refinement checking or CSP process modeling.
 	///
 	/// ## Automatic CSP Stepping
 	/// When a CSP oracle is configured (via `with_fuzz_oracle`), this method automatically
@@ -87,7 +86,7 @@ impl TraceCollector {
 	/// If automatic stepping fails (event not enabled or no mapping), the trace event
 	/// is still recorded. Use `oracle().step_event()` for manual CSP stepping.
 	pub fn event(&self, label: &str) {
-		self.assert(AssertionPhase::Any, label);
+		self.assert(label, &[]);
 
 		// Automatically step CSP oracle if configured and event matches CSP event
 		#[cfg(feature = "testing-fuzz")]
@@ -114,8 +113,21 @@ impl TraceCollector {
 		}
 	}
 
+	/// Record an assertion with an Option value, converting to IsSome/IsNone
+	/// This allows checking Option<T> where T doesn't implement Into<AssertionValue>
+	/// Accepts &Option<T> to avoid moving out of the Option
+	pub fn assert_option<T>(&self, label: &str, tags: &[&'static str], opt: &Option<T>) {
+		use crate::testing::assertions::{AssertionValue, IsNone, IsSome};
+		let assertion_value = if opt.is_some() {
+			AssertionValue::from(IsSome)
+		} else {
+			AssertionValue::from(IsNone)
+		};
+		self.assert_value(label, tags, assertion_value);
+	}
+
 	/// Record an assertion with a value for equality checking
-	pub fn assert_value<V: Into<AssertionValue>>(&self, phase: AssertionPhase, label: &str, value: V) {
+	pub fn assert_value<V: Into<AssertionValue>>(&self, label: &str, tags: &[&'static str], value: V) {
 		let seq = self.assertions.lock().map(|a| a.len()).unwrap_or(0);
 		let assertion_value = value.into();
 
@@ -132,7 +144,11 @@ impl TraceCollector {
 				AssertionValue::I32(n) => n.to_string(),
 				AssertionValue::I64(n) => n.to_string(),
 				AssertionValue::F64(n) => n.to_string(),
+				AssertionValue::MessagePriority(p) => format!("{:?}", p),
+				AssertionValue::Version(v) => format!("{:?}", v),
+				AssertionValue::Some(inner) => format!("Some({:?})", inner),
 				AssertionValue::None => "none".to_string(),
+				AssertionValue::NotNone => "some".to_string(),
 			};
 			self.emit_with_payload(TbEventKind::AssertPayload, label, Some(value_str.as_bytes()));
 		}
@@ -140,13 +156,14 @@ impl TraceCollector {
 		// Convert label to 'static lifetime for storage
 		let static_label: &'static str = Box::leak(label.to_string().into_boxed_str());
 
-		let assertion = Assertion::with_value(seq, phase, AssertionLabel::Custom(static_label), None, assertion_value);
+		let assertion =
+			Assertion::with_value(seq, AssertionLabel::Custom(static_label), tags.to_vec(), None, assertion_value);
 		if let Ok(mut assertions) = self.assertions.lock() {
 			assertions.push(assertion);
 		}
 	}
 	/// Record an assertion with payload
-	pub fn assert_with_payload(&self, phase: AssertionPhase, label: &str, payload: Option<&[u8]>) {
+	pub fn assert_with_payload(&self, label: &str, tags: &[&'static str], payload: Option<&[u8]>) {
 		use sha3::{Digest, Sha3_256};
 
 		let seq = self.assertions.lock().map(|a| a.len()).unwrap_or(0);
@@ -163,7 +180,7 @@ impl TraceCollector {
 		// This is fine for test scenarios where we don't expect unbounded label creation
 		let static_label: &'static str = Box::leak(label.to_string().into_boxed_str());
 
-		let assertion = Assertion::new(seq, phase, AssertionLabel::Custom(static_label), payload_hash);
+		let assertion = Assertion::new(seq, AssertionLabel::Custom(static_label), tags.to_vec(), payload_hash);
 		if let Ok(mut assertions) = self.assertions.lock() {
 			assertions.push(assertion);
 		}
@@ -312,13 +329,23 @@ impl ConsumedTrace {
 		self.response.is_some()
 	}
 
-	/// Count assertions matching phase and label
+	/// Count assertions matching label and optional tags
 	pub fn count_assertions(
 		&self,
-		phase: crate::testing::assertions::AssertionPhase,
 		label: &crate::testing::assertions::AssertionLabel,
+		tags: Option<&[&'static str]>,
 	) -> usize {
-		self.assertions.iter().filter(|a| a.phase == phase && &a.label == label).count()
+		self.assertions
+			.iter()
+			.filter(|a| {
+				&a.label == label
+					&& if let Some(filter_tags) = tags {
+						filter_tags.iter().all(|tag| a.tags.contains(tag))
+					} else {
+						true
+					}
+			})
+			.count()
 	}
 
 	#[cfg(feature = "instrument")]

@@ -613,7 +613,7 @@ mod tests {
 
 	// 538e0b06dc8f91e125660f582510f7edef7f0043fe452fe9950fd15f053bbde2
 	servlet! {
-		name: BFTLedgerServlet,
+		BFTLedgerServlet,
 		protocol: Listener,
 		policies: {
 			with_collector_gate: [

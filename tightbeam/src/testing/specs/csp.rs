@@ -416,14 +416,14 @@ mod tests {
 	use core::sync::atomic::{AtomicBool, Ordering};
 
 	use super::*;
-	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	use crate::servlet;
-	use crate::testing::assertions::AssertionPhase;
 	use crate::testing::create_test_message;
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;
 	use crate::transport::Protocol;
+
+	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	use crate::servlet;
 
 	#[test]
 	fn builder_creates_valid_process() {
@@ -802,8 +802,8 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				(HandlerStart, "step1", crate::exactly!(1)),
-				(Response, "step2", crate::exactly!(1))
+				("step1", crate::exactly!(1)),
+				("step2", crate::exactly!(1))
 			]
 		},
 	}
@@ -827,8 +827,8 @@ mod tests {
 		csp: SimpleBareFlowProc,
 		environment Bare {
 			exec: |trace| {
-				trace.assert(crate::testing::assertions::AssertionPhase::HandlerStart, "step1");
-				trace.assert(crate::testing::assertions::AssertionPhase::Response, "step2");
+				trace.assert("step1", &[]);
+				trace.assert("step2", &[]);
 				Ok(())
 			}
 		}
@@ -841,8 +841,8 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				(HandlerStart, "Received", crate::exactly!(2)),
-				(Response, "Responded", crate::exactly!(2))
+				("Received", crate::exactly!(2)),
+				("Responded", crate::exactly!(2))
 			]
 		},
 	}
@@ -884,8 +884,8 @@ mod tests {
 					assertions: trace,
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.assert(AssertionPhase::HandlerStart, "Received");
-						trace.assert(AssertionPhase::Response, "Responded");
+						trace.assert("Received", &[]);
+						trace.assert("Responded", &[]);
 						Ok(Some(frame))
 					}
 				};
@@ -894,7 +894,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.assert(AssertionPhase::Response, "Responded");
+				trace.assert("Responded", &[]);
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -904,7 +904,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.assert(AssertionPhase::HandlerStart, "Received");
+				trace.assert("Received", &[]);
 
 				Ok(())
 			}
@@ -921,29 +921,37 @@ mod tests {
 	}
 
 	// Define servlet at module scope for testing
-	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	servlet! {
-		name: TestServletForScenario,
+		pub TestServletForScenario<()>,
 		protocol: TokioListener,
 		handle: |frame, trace| async move {
 			// Server-side assertions
-			trace.assert(AssertionPhase::HandlerStart, "Received");
-			trace.assert(AssertionPhase::Response, "Responded");
+			trace.assert("Received", &[]);
+			trace.assert("Responded", &[]);
 			Ok(Some(frame))
 		}
 	}
 
 	// Test using the new Servlet environment
-	#[cfg(all(feature = "tcp", feature = "tokio"))]
+	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	crate::tb_scenario! {
 		name: test_servlet_environment_integration,
 		spec: ClientServerFlowSpec,
 		csp: ClientServerFlowProc,
-		environment Servlet {
-			servlet: TestServletForScenario,
+		environment ServiceClient {
+			worker_threads: 1,
+			server: |trace| async move {
+				let servlet = TestServletForScenario::start(trace).await?;
+				let addr = servlet.addr();
+				let server_handle = tokio::spawn(async move {
+					let _ = servlet.join().await;
+				});
+				Ok((server_handle, addr))
+			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.assert(AssertionPhase::Response, "Responded");
+				trace.assert("Responded", &[]);
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -953,7 +961,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.assert(AssertionPhase::HandlerStart, "Received");
+				trace.assert("Received", &[]);
 
 				Ok(())
 			}

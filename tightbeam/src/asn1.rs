@@ -152,6 +152,8 @@ pub struct Metadata {
 	#[asn1(context_specific = "4", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub previous_frame: Option<DigestInfo>,
+
+	// V3+ fields
 	#[asn1(context_specific = "5", optional = "true")]
 	pub matrix: Option<Asn1Matrix>,
 }

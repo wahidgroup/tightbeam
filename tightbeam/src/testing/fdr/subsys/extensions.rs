@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::io::Write;
 
 use crate::policy::TransitStatus;
-use crate::testing::assertions::{AssertionLabel, AssertionPhase};
+use crate::testing::assertions::AssertionLabel;
 use crate::testing::fdr::config::AcceptanceSet;
 use crate::testing::specs::csp::{Event, Process, State, TransitionRelation};
 use crate::testing::trace::ConsumedTrace;
@@ -132,8 +132,8 @@ impl FdrTraceExt for ConsumedTrace {
 
 		match self.gate_decision {
 			Some(TransitStatus::Accepted) => {
-				// Accepted path: should have response or handler-end assertions
-				self.response.is_some() || self.assertions.iter().any(|a| a.phase == AssertionPhase::HandlerEnd)
+				// Accepted path: should have response or assertions (indicating handler execution)
+				self.response.is_some() || !self.assertions.is_empty()
 			}
 			Some(TransitStatus::Busy)
 			| Some(TransitStatus::Unauthorized)

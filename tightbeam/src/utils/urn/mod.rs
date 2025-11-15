@@ -15,23 +15,32 @@
 //!
 //! # Examples
 //!
-//! ```
-//! use tightbeam::utils::urn::{Urn, UrnBuilder};
+//! ```rust
+//! use tightbeam::utils::urn::{Urn, UrnBuilder, ValidationError};
 //!
-//! // Build a URN manually
-//! let urn = UrnBuilder::new()
-//!     .nid("tightbeam")
-//!     .set("category", "instrumentation")
-//!     .set("resource.type", "trace")
-//!     .set("resource.id", "123")
-//!     .build_with(|builder| {
-//!         let category = builder.get("category").ok_or("missing category")?;
-//!         let res_type = builder.get("resource.type").ok_or("missing type")?;
-//!         let res_id = builder.get("resource.id").ok_or("missing id")?;
-//!         Ok(format!("{}:{}:{}", category, res_type, res_id).into())
-//!     })?;
+//! fn main() -> Result<(), ValidationError> {
+//!     // Build a URN manually
+//!     let urn = UrnBuilder::new()
+//!         .nid("tightbeam")
+//!         .set("category", "instrumentation")
+//!         .set("resource.type", "trace")
+//!         .set("resource.id", "123")
+//!         .build_with(|builder| {
+//!             let category = builder
+//!                 .get("category")
+//!                 .ok_or(ValidationError::RequiredFieldMissing("category"))?;
+//!             let res_type = builder
+//!                 .get("resource.type")
+//!                 .ok_or(ValidationError::RequiredFieldMissing("resource.type"))?;
+//!             let res_id = builder
+//!                 .get("resource.id")
+//!                 .ok_or(ValidationError::RequiredFieldMissing("resource.id"))?;
+//!             Ok(format!("{}:{}:{}", category, res_type, res_id).into())
+//!         })?;
 //!
-//! assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:trace:123");
+//!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:trace:123");
+//!     Ok(())
+//! }
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]

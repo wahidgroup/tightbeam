@@ -1881,7 +1881,7 @@ The Worker environment:
 #### 9.3.2 E: Servlets
 
 Servlets are "anthills" in the sense they operate on a specific protocol. From
-a TCP/IP perspective, an anthill is a port in many ways. Servlets are
+a protocol perspective, an anthill is a port in many ways. Servlets are
 multi-threaded and must handle messages asynchronously. A servlet may also
 define as many different workers as it needs to accomplish its task as well
 as a set of configurations. Servlets must be provided a relay which is used to
@@ -1902,9 +1902,10 @@ tightbeam::servlet! {
 	},
 	handle: |message, _config, workers| async move {
 		let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
+		let decoded_arc = Arc::new(decoded);
 		let (ping_result, lucky_result) = tokio::join!(
-			workers.ping_pong.relay(decoded.clone()),
-			workers.lucky_number.relay(decoded.clone())
+			workers.ping_pong.relay(Arc::clone(&decoded_arc)),
+			workers.lucky_number.relay(Arc::clone(&decoded_arc))
 		);
 
 		let reply = match ping_result {
@@ -1918,7 +1919,7 @@ tightbeam::servlet! {
 		};
 
 		crate::compose! {
-			V0: id: message.metadata.id.clone(),
+			V0: id: std::sync::Arc::new(message.metadata.id.clone()),
 				message: ResponseMessage {
 					result: reply.result,
 					is_winner,
@@ -1928,8 +1929,31 @@ tightbeam::servlet! {
 }
 ```
 
-Workers may process the message in parallel and have the results combined into
-a single response.
+**Efficient Parallel Worker Processing**
+
+Workers accept `Arc<Input>` instead of owned `Input` to enable efficient parallel processing without cloning message data. When calling multiple workers in parallel:
+
+- `Arc::new(decoded)` creates a single shared reference-counted pointer to the message
+- `Arc::clone(&decoded_arc)` increments the reference count (cheap operation, no data copying)
+- Multiple workers can process the same message data concurrently
+- `tokio::join!` executes all worker relays in parallel
+
+**Example using `tokio::join!`:**
+```rust
+let decoded_arc = Arc::new(decoded);
+let (result1, result2) = tokio::join!(
+    workers.worker1.relay(Arc::clone(&decoded_arc)),
+    workers.worker2.relay(Arc::clone(&decoded_arc))
+);
+```
+
+**Example using `parallelize()` (requires explicit type annotation):**
+```rust
+let decoded_arc = Arc::new(decoded);
+let (result1, result2) = workers.parallelize::<RequestMessage>(decoded_arc).await;
+```
+
+The `parallelize()` method requires an explicit type parameter because Rust cannot infer the input type that all workers expect. Using `tokio::join!` directly provides better type inference and is the recommended approach.
 
 ##### Testing
 Testing servlets uses the `tb_scenario!` macro with the Servlet environment:
@@ -3315,7 +3339,7 @@ This section contains complete, runnable examples demonstrating real-world usage
 
 [^fdr4]: University of Oxford, *FDR4 User Manual*, Version 4.2.7, 2020. Available: [https://www.cs.ox.ac.uk/projects/fdr/](https://www.cs.ox.ac.uk/projects/fdr/)
 
-[^pedersen2024]: M. Pedersen and K. Chalmers, "Refinement Checking of Cooperatively Scheduled Concurrent Systems," in *Formal Methods: Foundations and Applications (SBMF 2024)*, pp. 3-21, 2024. DOI: [10.1007/978-3-031-78561-1_1](https://doi.org/10.1007/978-3-031-78561-1_1)
+[^pedersen2024]: M. Pedersen and K. Chalmers, "Refinement Checking of Cooperatively Scheduled Concurrent Systems," in *Formal Methods: Foundations and Applications (SBMF 2024)*, pp. 3-21, 2024. DOI: [10.1007/978-3-031-78561-1_1](https://doi.org/10.48550/arXiv.2510.11751)
 
 [^ijon2020]: C. Aschermann, S. Schumilo, A. Abbasi, and T. Holz, "IJON: Exploring Deep State Spaces via Fuzzing," in *2020 IEEE Symposium on Security and Privacy (SP)*, San Francisco, CA, USA, 2020, pp. 1597-1612. DOI: [10.1109/SP40000.2020.00117](https://doi.org/10.1109/SP40000.2020.00117)
 
