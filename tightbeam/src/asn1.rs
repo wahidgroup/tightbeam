@@ -16,33 +16,7 @@ pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
 
-/// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
-/// id-ct-compressedData OBJECT IDENTIFIER ::= {
-///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
-///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
-/// }
-pub const COMPRESSION_CONTENT_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
-/// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
-/// id-alg-zlibCompress OBJECT IDENTIFIER ::= {
-///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
-///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
-/// }
-pub const COMPRESSION_ZLIB_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
-/// OID for zstd compression defined in RFC 8878
-/// See `<https://datatracker.ietf.org/doc/html/rfc8878>`
-/// See `<https://oid-base.com/get/1.3.6.1.4.1.50274.1.1>`
-pub const COMPRESSION_ZSTD_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3");
-/// sha3-256
-/// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
-pub const HASH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8");
-/// ecdsa-with-SHA256
-/// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
-pub const SIGNER_ECDSA_WITH_SHA3_256_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 /// id-data
-/// See `<https://datatracker.ietf.org/doc/html/rfc5652>`
-/// See `<https://oid-base.com/get/1.2.840.113549.1.7.1>`
-pub const DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
-
 /// Protocol version determines metadata structure and features
 ///
 /// ASN.1 Definition:
@@ -50,7 +24,8 @@ pub const DATA_OID: der::asn1::ObjectIdentifier = ObjectIdentifier::new_unwrap("
 /// Version ::= ENUMERATED {
 ///     v0(0),
 ///     v1(1),
-///     v2(2)
+///     v2(2),
+///     v3(3)
 /// }
 /// ```
 #[repr(u8)]
@@ -59,6 +34,7 @@ pub enum Version {
 	V0 = 0,
 	V1 = 1,
 	V2 = 2,
+	V3 = 3,
 }
 
 /// Message priority levels (V2+)
@@ -176,6 +152,8 @@ pub struct Metadata {
 	#[asn1(context_specific = "4", optional = "true")]
 	#[cfg_attr(feature = "zeroize", zeroize(skip))]
 	pub previous_frame: Option<DigestInfo>,
+
+	// V3+ fields
 	#[asn1(context_specific = "5", optional = "true")]
 	pub matrix: Option<Asn1Matrix>,
 }
