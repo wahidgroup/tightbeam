@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use super::state::ChessGameState;
+use super::state::{piece_kind_for_move, ChessGameState};
 use super::utils::is_white_turn;
 use tightbeam::der::Enumerated;
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{compose, decode, servlet, Beamable, Sequence};
 
@@ -66,18 +67,22 @@ servlet! {
 		game_state: Arc<Mutex<ChessGameState>>,
 	},
 	handle: |message, trace, config| async move {
+		let message_id = message.metadata.id.clone();
+		let invalid_move = |trace: TraceCollector, id: Vec<u8>, order: u64|
+			-> Result<Option<tightbeam::Frame>, tightbeam::TightBeamError> {
+			trace.event("server_response_emitted");
+			Ok(Some(create_invalid_move_response(id, order)?))
+		};
+
 		trace.event("server_move_received");
+
 		// Decode ChessMoveRequest from message
 		let move_req: ChessMoveRequest = match decode(&message.message) {
 			Ok(req) => req,
 			Err(_) => {
-				trace.event("server_decode_failure");
-				trace.event("server_response_emitted");
 				// Invalid message format - return invalid move response
-				return Ok(Some(create_invalid_move_response(
-					message.metadata.id.clone(),
-					message.metadata.order,
-				)?));
+				trace.event("server_decode_failure");
+				return invalid_move(trace, message_id, message.metadata.order);
 			}
 		};
 
@@ -93,13 +98,9 @@ servlet! {
 		let mut game_state = match config.game_state.lock() {
 			Ok(gs) => gs,
 			Err(_) => {
-				trace.event("server_state_lock_poisoned");
-				trace.event("server_response_emitted");
 				// Lock poisoned - return invalid move response
-				return Ok(Some(create_invalid_move_response(
-					message.metadata.id.clone(),
-					message.metadata.order,
-				)?));
+				trace.event("server_state_lock_poisoned");
+				return invalid_move(trace, message_id, message.metadata.order);
 			}
 		};
 
@@ -107,8 +108,9 @@ servlet! {
 		if let Some(client_state) = client_state {
 			let server_piece_count_before = game_state.count_pieces();
 			*game_state.board_mut() = *client_state.board();
-			let client_piece_count = client_state.count_pieces();
+
 			// Detect captures by comparing piece counts
+			let client_piece_count = client_state.count_pieces();
 			if client_piece_count < server_piece_count_before {
 				// A capture occurred - update tracking
 				game_state.set_last_capture_move(message.metadata.order.saturating_sub(1));
@@ -130,16 +132,16 @@ servlet! {
 		);
 
 		if !is_valid {
-			trace.event("server_move_invalid");
-			trace.event("server_response_emitted");
 			// Invalid move - return invalid move response
-			return Ok(Some(create_invalid_move_response(
-				message.metadata.id.clone(),
-				move_count,
-			)?));
+			trace.event("server_move_invalid");
+			return invalid_move(trace, message_id, move_count);
 		}
 
 		trace.event("server_move_validated");
+
+		if let Some(kind) = piece_kind_for_move(&game_state, move_req.from_row, move_req.from_col) {
+			trace.event(kind);
+		}
 
 		// Make the client's move (track captures)
 		game_state.make_move_with_count(
@@ -198,7 +200,12 @@ servlet! {
 					server_move.3,
 					move_count + 1,
 				);
+
 				trace.event("server_move_generated");
+
+				if let Some(kind) = piece_kind_for_move(&game_state, server_move.0, server_move.1) {
+					trace.event(kind);
+				}
 
 				// Check again after server move (increment move count for server move)
 				let server_move_count = move_count + 1;
@@ -226,7 +233,7 @@ servlet! {
 		trace.event("server_response_emitted");
 
 		Ok(Some(compose! {
-			V0: id: message.metadata.id.clone(),
+			V0: id: message_id,
 			order: move_count + 1,
 			message: response,
 			matrix: matrix_dyn

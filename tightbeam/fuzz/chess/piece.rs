@@ -29,3 +29,15 @@ pub fn is_white(piece: u8) -> bool {
 pub fn is_empty(piece: u8) -> bool {
 	piece == EMPTY
 }
+
+pub fn kind_label(piece: u8) -> Option<&'static str> {
+	match piece {
+		WHITE_PAWN | BLACK_PAWN => Some("pawn_move"),
+		WHITE_ROOK | BLACK_ROOK => Some("rook_move"),
+		WHITE_KNIGHT | BLACK_KNIGHT => Some("knight_move"),
+		WHITE_BISHOP | BLACK_BISHOP => Some("bishop_move"),
+		WHITE_QUEEN | BLACK_QUEEN => Some("queen_move"),
+		WHITE_KING | BLACK_KING => Some("king_move"),
+		_ => None,
+	}
+}

@@ -50,7 +50,7 @@ tb_scenario! {
 
 			// Make assertions based on execution trace
 			for event in trace.oracle().trace() {
-				trace.assert(event.0, &[]);
+				trace.event(event.0);
 			}
 			Ok(())
 		}

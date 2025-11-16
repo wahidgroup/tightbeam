@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex};
 
@@ -38,6 +40,7 @@ impl TraceState {
 		}
 	}
 
+	#[cfg(fuzzing)]
 	#[cfg(feature = "testing-fuzz")]
 	fn with_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
 		Self {
@@ -56,12 +59,14 @@ impl TraceCollector {
 	}
 
 	/// Create a trace collector with fuzz oracle (CSP-guided fuzzing)
+	#[cfg(fuzzing)]
 	#[cfg(feature = "testing-fuzz")]
 	pub fn with_fuzz_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
 		Self { state: Arc::new(TraceState::with_oracle(input, process)) }
 	}
 
 	/// Get the fuzz oracle, panicking if not configured
+	#[cfg(fuzzing)]
 	#[cfg(feature = "testing-fuzz")]
 	pub fn oracle(&self) -> &crate::testing::fuzz::FuzzContext {
 		self.state
@@ -70,31 +75,49 @@ impl TraceCollector {
 			.expect("Oracle not configured - did you provide csp: parameter in tb_scenario!?")
 	}
 
-	/// Record an assertion with optional tags
-	pub fn assert(&self, label: &str, tags: &[&'static str]) {
-		self.assert_with_payload(label, tags, None);
+	/// Record an event with no tags or value.
+	pub fn event(&self, label: impl AsRef<str>) {
+		self.event_with(label.as_ref(), &[], ());
 	}
 
-	/// Record an assertion without tags (convenience for FDR/CSP scenarios)
-	pub fn event(&self, label: &str) {
-		self.event_with_tags(label, &[]);
-	}
+	/// Record an event with explicit tags and optional value.
+	pub fn event_with<V>(&self, label: &str, tags: &[&'static str], value: V)
+	where
+		V: Into<EventValue>,
+	{
+		let seq = self.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
+		let static_label: &'static str = leak_label(label);
+		let event_value = value.into();
+		let assertion = match event_value {
+			EventValue::None => {
+				#[cfg(feature = "instrument")]
+				self.emit_with_payload(TbEventKind::AssertLabel, label, None);
 
-	/// Record an assertion event with tags
-	pub fn event_with_tags(&self, label: &str, tags: &[&'static str]) {
-		self.assert(label, tags);
+				Assertion::new(seq, AssertionLabel::Custom(static_label), tags.to_vec(), None)
+			}
+			EventValue::Value(assertion_value) => {
+				#[cfg(feature = "instrument")]
+				{
+					let value_str = format_assertion_value(&assertion_value);
+					self.emit_with_payload(TbEventKind::AssertPayload, label, Some(value_str.as_bytes()));
+				}
+
+				Assertion::with_value(seq, AssertionLabel::Custom(static_label), tags.to_vec(), None, assertion_value)
+			}
+		};
+
+		if let Ok(mut assertions) = self.state.assertions.lock() {
+			assertions.push(assertion);
+		}
 
 		#[cfg(feature = "testing-fuzz")]
-		if let Some(ref oracle) = self.state.oracle {
-			let csp_event_label: Option<&'static str> = match label {
-				"client_move_sent" => Some("move_request"),
-				"client_move_validated" => Some("move_valid"),
-				"client_move_rejected" => Some("move_invalid"),
-				"client_game_ended" => Some("game_over"),
-				_ => None,
-			};
+		self.dispatch_csp_event(label);
+	}
 
-			if let Some(csp_label) = csp_event_label {
+	#[cfg(feature = "testing-fuzz")]
+	fn dispatch_csp_event(&self, label: &str) {
+		if let Some(ref oracle) = self.state.oracle {
+			if let Some(csp_label) = Self::map_csp_label(label) {
 				use crate::testing::specs::csp::Event;
 				let event = Event(csp_label);
 				let _ = oracle.step_event(&event);
@@ -102,83 +125,25 @@ impl TraceCollector {
 		}
 	}
 
-	/// Record an assertion with an Option value, converting to IsSome/IsNone
-	pub fn assert_option<T>(&self, label: &str, tags: &[&'static str], opt: &Option<T>) {
-		use crate::testing::assertions::{AssertionValue, IsNone, IsSome};
-		let assertion_value = if opt.is_some() {
-			AssertionValue::from(IsSome)
-		} else {
-			AssertionValue::from(IsNone)
-		};
-		self.assert_value(label, tags, assertion_value);
-	}
-
-	/// Record an assertion with a value for equality checking
-	pub fn assert_value<V: Into<AssertionValue>>(&self, label: &str, tags: &[&'static str], value: V) {
-		let seq = self.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
-		let assertion_value = value.into();
-
-		#[cfg(feature = "instrument")]
-		{
-			let value_str = match &assertion_value {
-				AssertionValue::String(s) => s.clone(),
-				AssertionValue::Bool(b) => b.to_string(),
-				AssertionValue::U8(n) => n.to_string(),
-				AssertionValue::U32(n) => n.to_string(),
-				AssertionValue::U64(n) => n.to_string(),
-				AssertionValue::I32(n) => n.to_string(),
-				AssertionValue::I64(n) => n.to_string(),
-				AssertionValue::F64(n) => n.to_string(),
-				AssertionValue::MessagePriority(p) => format!("{p:?}"),
-				AssertionValue::Version(v) => format!("{v:?}"),
-				AssertionValue::Some(inner) => format!("Some({inner:?})"),
-				AssertionValue::None => "none".to_string(),
-				AssertionValue::NotNone => "some".to_string(),
-				AssertionValue::RatioActual(n, d) => format!("{n}/{d}"),
-				AssertionValue::RatioLimit(n, d) => format!("≤{n}/{d}"),
-			};
-			self.emit_with_payload(TbEventKind::AssertPayload, label, Some(value_str.as_bytes()));
-		}
-
-		let static_label: &'static str = leak_label(label);
-
-		let assertion =
-			Assertion::with_value(seq, AssertionLabel::Custom(static_label), tags.to_vec(), None, assertion_value);
-		if let Ok(mut assertions) = self.state.assertions.lock() {
-			assertions.push(assertion);
-		}
-	}
-
-	/// Record an assertion with payload
-	pub fn assert_with_payload(&self, label: &str, tags: &[&'static str], payload: Option<&[u8]>) {
-		let seq = self.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
-		let payload_hash = payload.map(hash_payload);
-
-		let static_label: &'static str = leak_label(label);
-
-		let assertion = Assertion::new(seq, AssertionLabel::Custom(static_label), tags.to_vec(), payload_hash);
-		if let Ok(mut assertions) = self.state.assertions.lock() {
-			assertions.push(assertion);
-		}
-
-		#[cfg(feature = "instrument")]
-		{
-			let event_kind = if payload.is_some() {
-				TbEventKind::AssertPayload
-			} else {
-				TbEventKind::AssertLabel
-			};
-			self.emit_with_payload(event_kind, label, payload);
+	#[cfg(feature = "testing-fuzz")]
+	fn map_csp_label(label: &str) -> Option<&'static str> {
+		match label {
+			"client_move_sent" => Some("move_request"),
+			"client_move_validated" => Some("move_valid"),
+			"client_move_rejected" => Some("move_invalid"),
+			"client_game_ended" => Some("game_over"),
+			_ => None,
 		}
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn emit(&self, kind: TbEventKind, label: &str) {
-		self.emit_with_payload(kind, label, None);
+	pub fn emit(&self, kind: TbEventKind, label: impl AsRef<str>) {
+		self.emit_with_payload(kind, label.as_ref(), None);
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn emit_with_payload(&self, kind: TbEventKind, label: &str, payload: Option<&[u8]>) {
+	pub fn emit_with_payload(&self, kind: TbEventKind, label: impl AsRef<str>, payload: Option<&[u8]>) {
+		let label = label.as_ref();
 		let seq = crate::instrumentation::active::next_seq();
 		let event = TbEvent {
 			seq,
@@ -231,9 +196,31 @@ fn hash_payload(payload: &[u8]) -> [u8; 32] {
 	let mut hasher = Sha3_256::new();
 	hasher.update(payload);
 	let out = hasher.finalize();
+
 	let mut arr = [0u8; 32];
 	arr.copy_from_slice(&out);
 	arr
+}
+
+#[cfg(feature = "instrument")]
+fn format_assertion_value(value: &AssertionValue) -> String {
+	match value {
+		AssertionValue::String(s) => s.clone(),
+		AssertionValue::Bool(b) => b.to_string(),
+		AssertionValue::U8(n) => n.to_string(),
+		AssertionValue::U32(n) => n.to_string(),
+		AssertionValue::U64(n) => n.to_string(),
+		AssertionValue::I32(n) => n.to_string(),
+		AssertionValue::I64(n) => n.to_string(),
+		AssertionValue::F64(n) => n.to_string(),
+		AssertionValue::MessagePriority(p) => format!("{p:?}"),
+		AssertionValue::Version(v) => format!("{v:?}"),
+		AssertionValue::Some(inner) => format!("Some({inner:?})"),
+		AssertionValue::IsNone => "none".to_string(),
+		AssertionValue::IsSome => "some".to_string(),
+		AssertionValue::RatioActual(n, d) => format!("{n}/{d}"),
+		AssertionValue::RatioLimit(n, d) => format!("≤{n}/{d}"),
+	}
 }
 
 /// Consumed execution trace after await completion.
@@ -313,6 +300,27 @@ impl ConsumedTrace {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub enum EventValue {
+	None,
+	Value(AssertionValue),
+}
+
+impl From<()> for EventValue {
+	fn from(_: ()) -> Self {
+		Self::None
+	}
+}
+
+impl<T> From<T> for EventValue
+where
+	AssertionValue: From<T>,
+{
+	fn from(value: T) -> Self {
+		Self::Value(AssertionValue::from(value))
+	}
+}
+
 /// Execution mode classification for specs
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -353,7 +361,7 @@ mod tests {
 		environment Bare {
 			exec: |trace| {
 				let other = trace.clone();
-				trace.assert("alpha", &[]);
+				trace.event("alpha");
 				other.event("beta");
 				Ok(())
 			}

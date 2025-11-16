@@ -844,8 +844,8 @@ mod tests {
 		csp: SimpleBareFlowProc,
 		environment Bare {
 			exec: |trace| {
-				trace.assert("step1", &[]);
-				trace.assert("step2", &[]);
+				trace.event("step1");
+				trace.event("step2");
 				Ok(())
 			}
 		}
@@ -901,8 +901,8 @@ mod tests {
 					assertions: trace,
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.assert("Received", &[]);
-						trace.assert("Responded", &[]);
+						trace.event("Received");
+						trace.event("Responded");
 						Ok(Some(frame))
 					}
 				};
@@ -911,7 +911,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.assert("Responded", &[]);
+				trace.event("Responded");
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -921,7 +921,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.assert("Received", &[]);
+				trace.event("Received");
 
 				Ok(())
 			}
@@ -944,8 +944,8 @@ mod tests {
 		protocol: TokioListener,
 		handle: |frame, trace| async move {
 			// Server-side assertions
-			trace.assert("Received", &[]);
-			trace.assert("Responded", &[]);
+			trace.event("Received");
+			trace.event("Responded");
 			Ok(Some(frame))
 		}
 	}
@@ -968,7 +968,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.assert("Responded", &[]);
+				trace.event("Responded");
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -978,7 +978,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.assert("Received", &[]);
+				trace.event("Received");
 
 				Ok(())
 			}

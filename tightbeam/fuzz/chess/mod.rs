@@ -29,11 +29,12 @@ mod utils;
 
 use std::sync::{Arc, Mutex};
 
+use tightbeam::matrix::MatrixLike;
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 use board::{ChessEngineServlet, ChessEngineServletConf, ChessMoveRequest, ChessMoveResponse, GameStatusCode};
 use state::ChessGameState;
-use utils::{is_white_turn, reset_chess_game_state, restart_game};
+use utils::{reset_chess_game_state, restart_game};
 
 // ============================================================================
 // ASSERTION SPEC
@@ -180,20 +181,20 @@ tb_scenario! {
 	fuzz: afl,
 	spec: ChessAssertSpec,
 	csp: ChessGameFlow,
-	// fdr: FdrConfig {
-	// 	seeds: 4,
-	// 	max_depth: 100,
-	// 	max_internal_run: 8,
-	// 	timeout_ms: 5000,
-	// 	specs: vec![ChessGameFlow::process(), ChessRules::process()],
-	// 	fail_fast: true,
-	// 	expect_failure: false,
-	// 	scheduler_count: None,
-	// 	process_count: None,
-	// 	scheduler_model: None,
-	// 	fault_model: None,
-	// 	fmea: None,
-	// },
+	fdr: FdrConfig {
+		seeds: 4,
+		max_depth: 100,
+		max_internal_run: 8,
+		timeout_ms: 5000,
+		specs: vec![ChessGameFlow::process(), ChessRules::process()],
+		fail_fast: true,
+		expect_failure: false,
+		scheduler_count: None,
+		process_count: None,
+		scheduler_model: None,
+		fault_model: None,
+		fmea: None,
+	},
 	environment Servlet {
 		servlet: ChessEngineServlet,
 		start: |trace| async move {
@@ -204,12 +205,9 @@ tb_scenario! {
 			ChessEngineServlet::start(trace, config).await
 		},
 		client: |trace, mut client| async move {
-			// Initialize client-side game state (starts with standard chess position)
+			// Initialize client-side game state
 			let mut client_game_state = ChessGameState::new();
 			let mut order = 1u64;
-			let mut seed_mode = true; // Start in seed mode (direct coordinates)
-			let mut seed_move_index = 0u8;
-			let mut seed_move_count = 0u8;
 
 			let mut move_validated_count = 0u64;
 			let mut move_rejected_count = 0u64;
@@ -219,169 +217,44 @@ tb_scenario! {
 			let mut no_response_count = 0u64;
 			let mut decode_error_count = 0u64;
 
-			// Continuous fuzzing: play multiple games until input bytes are exhausted
-			// This maximizes state space exploration across different game scenarios
-			// Track if we've sent at least one move to satisfy assertion requirement
+			// Continuous: Play multiple games until input bytes are exhausted
+			// This maximizes state exploration across different game scenarios
 			let mut move_sent_count = 0u32;
 			loop {
-				// Determine turn from order (even = white, odd = black)
-				let is_white_turn_val = is_white_turn(order);
-
-				// Try to read as seed format first (direct coordinates)
-				// Format: [move_count, from_row, from_col, to_row, to_col, ...]
-				if seed_mode && seed_move_index == 0 {
-					// Read move count (first byte of seed)
-					match trace.oracle().fuzz_u8() {
-						Ok(count) => {
-							if count > 0 && count < 100 {
-								// Reasonable move count - treat as seed format
-								seed_move_count = count;
-								seed_move_index = 1;
-							} else {
-								// Not a seed format - switch to dynamic mode
-								seed_mode = false;
-							}
-						}
-						Err(_) => {
-							// Out of input bytes - if we haven't sent any moves yet,
-							// try to send at least one with minimal/default input
-							if move_sent_count == 0 {
-								seed_mode = false; // Switch to dynamic mode to try one more time
-							} else {
-								break;
-							}
-						}
-					}
-				}
-
-				let move_req = if seed_mode && seed_move_index > 0 && seed_move_index <= seed_move_count {
-					// Reading direct coordinates from seed
-					let from_row = match trace.oracle().fuzz_u8() {
-						Ok(b) => b % 8,
-						Err(_) => {
-							// Out of input - use defaults if we haven't sent any moves yet
-							if move_sent_count == 0 { 0 } else { break; }
-						}
-					};
-					let from_col = match trace.oracle().fuzz_u8() {
-						Ok(b) => b % 8,
-						Err(_) => {
-							if move_sent_count == 0 { 0 } else { break; }
-						}
-					};
-					let to_row = match trace.oracle().fuzz_u8() {
-						Ok(b) => b % 8,
-						Err(_) => {
-							if move_sent_count == 0 { 0 } else { break; }
-						}
-					};
-					let to_col = match trace.oracle().fuzz_u8() {
-						Ok(b) => b % 8,
-						Err(_) => {
-							if move_sent_count == 0 { 0 } else { break; }
-						}
-					};
-
-					seed_move_index += 1;
-					if seed_move_index > seed_move_count {
-						// Finished reading seed - switch to dynamic mode
-						seed_mode = false;
-					}
-
-					ChessMoveRequest {
-						from_row,
-						from_col,
-						to_row,
-						to_col,
-					}
-				} else {
-					// Dynamic mode: CSP-guided valid moves + random invalid moves
-					// Use CSP byte to decide strategy (80% valid moves, 20% invalid for error testing)
-					let strategy_byte = match trace.oracle().fuzz_u8() {
-						Ok(b) => b,
-						Err(_) => {
-							// Out of input bytes - if we haven't sent any moves yet, use default
-							if move_sent_count == 0 { 0 } else { break; }
-						}
-					};
-
-					// Extract move coordinates based on strategy
-					let use_valid_moves = (strategy_byte % 10) < 8; // 80% valid, 20% invalid
-					if use_valid_moves {
-						// CSP-guided: choose from valid moves
-						let valid_moves = client_game_state.get_valid_moves(is_white_turn_val);
-						if valid_moves.is_empty() {
-							// No valid moves - game over (stalemate/checkmate)
-							// Break to end fuzzing for this game
-							break;
-						}
-
-						// Use CSP byte to choose which valid move
-						let choice_byte = match trace.oracle().fuzz_u8() {
-							Ok(b) => b,
-							Err(_) => {
-								// Out of input bytes - use first move if we haven't sent any yet
-								if move_sent_count == 0 { 0 } else { break; }
-							}
-						};
-						let chosen_move = valid_moves[choice_byte as usize % valid_moves.len()];
-
-						// Create move request from chosen valid move
-						ChessMoveRequest {
-							from_row: chosen_move.0,
-							from_col: chosen_move.1,
-							to_row: chosen_move.2,
-							to_col: chosen_move.3,
-						}
-					} else {
-						// Random: extract raw bytes (may be invalid - tests error handling)
-						let from_row = match trace.oracle().fuzz_u8() {
-							Ok(b) => b % 8,
-							Err(_) => {
-								if move_sent_count == 0 { 0 } else { break; }
-							}
-						};
-						let from_col = match trace.oracle().fuzz_u8() {
-							Ok(b) => b % 8,
-							Err(_) => {
-								if move_sent_count == 0 { 0 } else { break; }
-							}
-						};
-						let to_row = match trace.oracle().fuzz_u8() {
-							Ok(b) => b % 8,
-							Err(_) => {
-								if move_sent_count == 0 { 0 } else { break; }
-							}
-						};
-						let to_col = match trace.oracle().fuzz_u8() {
-							Ok(b) => b % 8,
-							Err(_) => {
-								if move_sent_count == 0 { 0 } else { break; }
-							}
-						};
-
-						// Create move request from raw bytes
-						ChessMoveRequest {
-							from_row,
-							from_col,
-							to_row,
-							to_col,
-						}
-					}
+				let move_req = match (
+					trace.oracle().fuzz_u8(),
+					trace.oracle().fuzz_u8(),
+					trace.oracle().fuzz_u8(),
+					trace.oracle().fuzz_u8(),
+				) {
+					(Ok(fr), Ok(fc), Ok(tr), Ok(tc)) => ChessMoveRequest {
+						from_row: fr % 8,
+						from_col: fc % 8,
+						to_row: tr % 8,
+						to_col: tc % 8,
+					},
+					_ if move_sent_count == 0 => ChessMoveRequest {
+						from_row: 0,
+						from_col: 0,
+						to_row: 0,
+						to_col: 0,
+					},
+					_ => break,
 				};
 
 				trace.event("client_move_sent");
+				if let Some(kind) = piece::kind_label(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
+					trace.event(kind);
+				}
 				move_sent_count += 1;
 
 				// Send move request to server with current board state in matrix
-				let board_matrix = tightbeam::Asn1Matrix::from(&client_game_state);
-				// Convert Asn1Matrix to MatrixDyn (can fail with MatrixError)
-				let matrix_dyn = tightbeam::matrix::MatrixDyn::try_from(board_matrix)?;
+				let matrix = tightbeam::matrix::MatrixDyn::try_from(&client_game_state)?;
 				let frame = compose! {
 					V0: id: "chess-client",
 					order: order,
 					message: move_req,
-					matrix: matrix_dyn
+					matrix: matrix
 				}?;
 
 				// Get response frame
@@ -426,14 +299,7 @@ tb_scenario! {
 						order += 2; // Client move + server move
 					}
 					GameStatusCode::Checkmate | GameStatusCode::Stalemate => {
-						restart_game(
-							&mut client_game_state,
-							&mut order,
-							&mut seed_mode,
-							&mut seed_move_index,
-							&mut seed_move_count,
-							&trace,
-						);
+						restart_game(&mut client_game_state, &mut order, &trace);
 						move_validated_count += 1;
 						server_move_count += 1;
 						game_ended_count += 1;
@@ -447,9 +313,9 @@ tb_scenario! {
 			let moves_processed_balance = (move_sent_count as i64) - (processed_moves as i64);
 			let server_move_balance = (move_validated_count as i64) - (server_move_count as i64);
 			let game_restart_balance = (game_restarted_count as i64) - (game_ended_count as i64);
-			trace.assert_value("client_moves_processed_balance", &["balance"], moves_processed_balance);
-			trace.assert_value("client_server_move_balance", &["balance"], server_move_balance);
-			trace.assert_value("client_game_restart_balance", &["lifecycle"], game_restart_balance);
+			trace.event_with("client_moves_processed_balance", &["balance"], moves_processed_balance);
+			trace.event_with("client_server_move_balance", &["balance"], server_move_balance);
+			trace.event_with("client_game_restart_balance", &["lifecycle"], game_restart_balance);
 
 			Ok(())
 		}

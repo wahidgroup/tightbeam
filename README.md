@@ -1804,7 +1804,6 @@ Testing workers uses the `tb_scenario!` macro with the Worker environment:
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::trace::TraceCollector;
 
 // Define assertion spec for worker behavior
 tb_assert_spec! {
@@ -1846,7 +1845,7 @@ tb_scenario! {
 		setup: PingPongWorker::new,
 		stimulus: |trace, worker: &mut PingPongWorker| {
 			// Test accepted message
-			trace.assert("relay_start", &[]);
+			trace.event("relay_start");
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
@@ -1854,13 +1853,13 @@ tb_scenario! {
 
 			let response = worker.relay(trace.clone(), std::sync::Arc::new(ping_msg))?;
 			if let Some(pong) = response {
-				trace.assert_value("response_result", &[], pong.result);
+				trace.event_with("response_result", &[], pong.result);
 			}
 
-			trace.assert("relay_success", &[]);
+			trace.event("relay_success");
 
 			// Test rejected message
-			trace.assert("relay_start", &[]);
+			trace.event("relay_start");
 			let pong_msg = RequestMessage {
 				content: "PONG".to_string(),
 				lucky_number: 42,
@@ -1868,7 +1867,7 @@ tb_scenario! {
 
 			let result = worker.relay(trace.clone(), std::sync::Arc::new(pong_msg));
 			if result.is_err() {
-				trace.assert("relay_rejected", &[]);
+				trace.event("relay_rejected");
 			}
 
 			Ok(())
@@ -1950,10 +1949,9 @@ in parallel:
 **Example using `tokio::join!`:**
 ```rust
 let decoded_arc = Arc::new(decoded);
-let trace = TraceCollector::new();
 let (result1, result2) = tokio::join!(
-    workers.worker1.relay(trace.clone(), Arc::clone(&decoded_arc)),
-    workers.worker2.relay(trace.clone(), Arc::clone(&decoded_arc))
+    workers.worker1.relay(Arc::clone(trace), Arc::clone(&decoded_arc)),
+    workers.worker2.relay(Arc::clone(trace), Arc::clone(&decoded_arc))
 );
 ```
 
@@ -1962,7 +1960,6 @@ Testing servlets uses the `tb_scenario!` macro with the Servlet environment:
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::trace::TraceCollector;
 
 // Define assertion spec for servlet behavior
 tb_assert_spec! {
@@ -2016,7 +2013,7 @@ tb_scenario! {
 			}
 
 			// Client-side assertion before sending
-			trace.assert("request_received", &[]);
+			trace.event("request_received");
 
 			// Test winning case
 			let ping_message = generate_message(42, None)?;
@@ -2024,11 +2021,11 @@ tb_scenario! {
 			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
 
 			// Emit value assertions for spec verification
-			trace.assert_value("response_result", &[], response_message.result);
-			trace.assert_value("is_winner", &[], response_message.is_winner);
+			trace.event_with("response_result", &[], response_message.result);
+			trace.event_with("is_winner", &[], response_message.is_winner);
 
 			// Client-side assertion after receiving
-			trace.assert("pong_sent", &[]);
+			trace.event("pong_sent");
 
 			Ok(())
 		}
@@ -2091,7 +2088,7 @@ tightbeam::drone! {
 }
 
 // Start the drone
-let drone = RegularDrone::start(tightbeam::trace::TraceCollector::new(), None).await?;
+let drone = RegularDrone::start(TraceCollector::new(), None).await?;
 
 // Register with cluster
 let cluster_addr = "127.0.0.1:8888".parse()?;
@@ -2112,7 +2109,7 @@ tightbeam::drone! {
 }
 
 // Start the hive
-let hive = MyHive::start(tightbeam::trace::TraceCollector::new(), None).await?;
+let hive = MyHive::start(TraceCollector::new(), None).await?;
 ```
 
 **Drone with Policies**:
@@ -2378,8 +2375,20 @@ assertions: [
 
 Assertions can be tagged with arbitrary string labels for flexible categorization and filtering. Tags enable version-scoped testing where a single scenario can validate multiple protocol versions.
 
+#### 10.2.8 Recording Trace Events
+
+`TraceCollector` exposes two entry points:
+
+- `trace.event("label")` records a label-only event (no tags/value) and advances the CSP oracle.
+- `trace.event_with("label", &["tag"], value)` records the label with tags plus an optional value (anything implementing `Into<AssertionValue>`, e.g. `bool`, `u64`, `Version`, etc.).:
+
+```rust
+trace.event("relay_start");
+trace.event_with("response_ok", &["tag_a"], true);
+```
+
 **How Tags Work**:
-- Assertions are emitted with tags: `trace.assert("label", &["tag1", "tag2"])`
+- Assertions are emitted with tags: `trace.event_with("label", &["tag1", "tag2"], ())`
 - Specs filter assertions using `tag_filter: ["tag1"]` - only assertions with matching tags are validated
 - A single assertion can satisfy multiple specs by including multiple tags
 
@@ -2412,8 +2421,8 @@ tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Single assertion satisfies both version specs via tags
-			trace.assert_option("feature", &["v0", "v1"], &some_option);
-			trace.assert("v2_specific", &["v1"]);
+			trace.event_with("feature", &["v0", "v1"], tightbeam::testing::macros::Presence::of_option(&some_option));
+			trace.event_with("v2_specific", &["v1"], ());
 			Ok(())
 		}
 	}
@@ -2585,8 +2594,8 @@ tb_scenario! {
 	},
 	environment Bare {
 		exec: |trace| {
-			trace.assert("start", &[]);
-			trace.assert("finish", &[]);
+			trace.event("start");
+			trace.event("finish");
 			Ok(())
 		}
 	}
@@ -2938,8 +2947,8 @@ tb_scenario! {
 	csp: BareProcess,
 	environment Bare {
 		exec: |trace| {
-			trace.assert("Received", &[]);
-			trace.assert("Responded", &[]);
+			trace.event("Received");
+			trace.event("Responded");
 			Ok(())
 		}
 	}
@@ -3009,23 +3018,23 @@ tb_scenario! {
 	},
 	environment ServiceClient {
 		worker_threads: 2,
-		server: |trace: TraceCollector| async move {
+		server: |trace| async move {
 			let bind_addr = "127.0.0.1:0".parse().unwrap();
 			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 			let handle = server! {
 				protocol TokioListener: listener,
 				assertions: trace,
 				handle: |frame, trace| async move {
-					trace.assert("connect", &[]);
-					trace.assert("request", &[]);
-					trace.assert("response", &[]);
+					trace.event("connect");
+					trace.event("request");
+					trace.event("response");
 					Some(frame)
 				}
 			};
 			Ok((handle, addr))
 		},
 		client: |trace, mut client| async move {
-			trace.assert("response", &[]);
+			trace.event("response");
 			let frame = compose! {
 				V0: id: "test",
 				order: 1u64,
@@ -3036,10 +3045,10 @@ tb_scenario! {
 			// Decode response and emit value assertion
 			if let Some(resp_frame) = response {
 				let decoded: TestMessage = crate::decode(&resp_frame.message)?;
-				trace.assert_value("message_content", &[], decoded.content);
+				trace.event_with("message_content", &[], decoded.content);
 			}
 
-			trace.assert("disconnect", &[]);
+			trace.event("disconnect");
 			Ok(())
 		}
 	},
@@ -3088,7 +3097,7 @@ tb_scenario! {
 			match trace.oracle().fuzz_from_bytes() {
 				Ok(()) => {
 					for event in trace.oracle().trace() {
-						trace.assert(event.0, &[]);
+						trace.event(event.0);
 					}
 					Ok(())
 				}
@@ -3159,7 +3168,7 @@ tb_scenario! {
 			match trace.oracle().fuzz_from_bytes() {
 				Ok(()) => {
 					for event in trace.oracle().trace() {
-						trace.assert(event.0, &[]);
+						trace.event(event.0);
 					}
 					Ok(())
 				}

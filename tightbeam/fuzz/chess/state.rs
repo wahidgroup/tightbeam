@@ -1,7 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 use super::piece;
-use tightbeam::matrix::{Matrix, MatrixLike};
+use tightbeam::matrix::{Matrix, MatrixDyn, MatrixError, MatrixLike};
 
 /// Chess game state management
 ///
@@ -503,4 +503,24 @@ impl TryFrom<&tightbeam::Asn1Matrix> for ChessGameState {
 			last_capture_move: 0, // Initialize - will be updated as moves are made
 		})
 	}
+}
+
+impl TryFrom<&ChessGameState> for MatrixDyn {
+	type Error = MatrixError;
+
+	fn try_from(state: &ChessGameState) -> Result<Self, Self::Error> {
+		let mut matrix = MatrixDyn::try_from(8u8)?;
+		for row in 0..8 {
+			for col in 0..8 {
+				matrix.set(row, col, state.board().get(row, col));
+			}
+		}
+
+		Ok(matrix)
+	}
+}
+
+pub fn piece_kind_for_move(state: &ChessGameState, row: u8, col: u8) -> Option<&'static str> {
+	let piece = state.board().get(row, col);
+	super::piece::kind_label(piece)
 }

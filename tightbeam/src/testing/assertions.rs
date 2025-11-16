@@ -31,8 +31,8 @@ pub enum AssertionValue {
 	MessagePriority(MessagePriority),
 	Version(Version),
 	Some(Box<AssertionValue>),
-	None,
-	NotNone,
+	IsNone,
+	IsSome,
 	RatioActual(u64, u64),
 	RatioLimit(u64, u64),
 }
@@ -40,14 +40,14 @@ pub enum AssertionValue {
 impl PartialEq for AssertionValue {
 	fn eq(&self, other: &Self) -> bool {
 		match (self, other) {
-			// NotNone matches any Some(_) value
-			(Self::NotNone, Self::Some(_)) => true,
-			(Self::Some(_), Self::NotNone) => true,
-			// NotNone matches NotNone (both represent "some value exists")
-			(Self::NotNone, Self::NotNone) => true,
-			// NotNone does not match None
-			(Self::NotNone, Self::None) => false,
-			(Self::None, Self::NotNone) => false,
+			// IsSome matches any Some(_) value
+			(Self::IsSome, Self::Some(_)) => true,
+			(Self::Some(_), Self::IsSome) => true,
+			// IsSome matches IsSome (both represent "some value exists")
+			(Self::IsSome, Self::IsSome) => true,
+			// IsSome does not match None
+			(Self::IsSome, Self::IsNone) => false,
+			(Self::IsNone, Self::IsSome) => false,
 			// Standard comparisons for other variants
 			(Self::String(a), Self::String(b)) => a == b,
 			(Self::Bool(a), Self::Bool(b)) => a == b,
@@ -60,7 +60,7 @@ impl PartialEq for AssertionValue {
 			(Self::MessagePriority(a), Self::MessagePriority(b)) => a == b,
 			(Self::Version(a), Self::Version(b)) => a == b,
 			(Self::Some(a), Self::Some(b)) => a == b,
-			(Self::None, Self::None) => true,
+			(Self::IsNone, Self::IsNone) => true,
 			(Self::RatioActual(an, ad), Self::RatioActual(bn, bd)) => ratio_equal(*an, *ad, *bn, *bd),
 			(Self::RatioLimit(an, ad), Self::RatioLimit(bn, bd)) => ratio_equal(*an, *ad, *bn, *bd),
 			(Self::RatioActual(an, ad), Self::RatioLimit(bn, bd)) => ratio_less_equal(*an, *ad, *bn, *bd),
@@ -153,19 +153,19 @@ where
 	fn from(opt: Option<T>) -> Self {
 		match opt {
 			Some(val) => Self::Some(Box::new(val.into())),
-			None => Self::None,
+			None => Self::IsNone,
 		}
 	}
 }
 
 /// Marker type for asserting that an Option is Some(_) without checking the inner value
-/// Use with `equals!(NotNone)` in assertion specs.
+/// Use with `equals!(IsSome)` in assertion specs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IsSome;
 
 impl From<IsSome> for AssertionValue {
 	fn from(_: IsSome) -> Self {
-		Self::NotNone
+		Self::IsSome
 	}
 }
 
@@ -176,7 +176,32 @@ pub struct IsNone;
 
 impl From<IsNone> for AssertionValue {
 	fn from(_: IsNone) -> Self {
-		Self::None
+		Self::IsNone
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+	Present,
+	Absent,
+}
+
+impl Presence {
+	pub fn of_option<T>(opt: &Option<T>) -> Self {
+		if opt.is_some() {
+			Self::Present
+		} else {
+			Self::Absent
+		}
+	}
+}
+
+impl From<Presence> for AssertionValue {
+	fn from(presence: Presence) -> Self {
+		match presence {
+			Presence::Present => AssertionValue::IsSome,
+			Presence::Absent => AssertionValue::IsNone,
+		}
 	}
 }
 

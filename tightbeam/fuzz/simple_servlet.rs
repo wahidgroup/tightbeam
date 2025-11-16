@@ -33,27 +33,18 @@ servlet! {
 	protocol: TokioListener,
 	policies: {},
 	handle: |message, _trace| async move {
-		// DEBUG: Track handler entry
-		let _ = std::fs::write("/tmp/simple_servlet_handler_entry.txt", format!("handler_called: order={}\n", message.metadata.order));
-
 		// Decode request
 		let req = match decode::<NumberRequest>(&message.message) {
 			Ok(r) => {
-				let _ = std::fs::write("/tmp/simple_servlet_decode_success.txt", format!("decode_success: value={}\n", r.value));
 				r
 			},
 			Err(_) => {
-				let _ = std::fs::write("/tmp/simple_servlet_decode_failed.txt", "decode_failed\n");
 				return Ok(None);
 			}
 		};
 
 		// Double the value
 		let doubled = (req.value as u16) * 2;
-
-		// DEBUG: Track response creation
-		let _ = std::fs::write("/tmp/simple_servlet_response_created.txt", format!("response_created: doubled={doubled}\n"));
-
 		let response = NumberResponse { doubled };
 
 		Ok(Some(compose! {
@@ -75,7 +66,7 @@ tb_assert_spec! {
 		gate: Accepted,
 		assertions: [
 			("request_sent", at_least!(0)),
-			("response_received", at_least!(0)),
+			("response_received", at_least!(0), equals!(true)),
 		]
 	},
 }
@@ -108,26 +99,16 @@ tb_scenario! {
 	environment Servlet {
 		servlet: EchoServlet,
 		client: |trace, mut client| async move {
-			// DEBUG: Track client entry
-			let _ = std::fs::write("/tmp/simple_servlet_client_entry.txt", "client_started\n");
-
 			// Read a byte from fuzz input
 			let value = match trace.oracle().fuzz_u8() {
 				Ok(v) => v,
 				Err(_) => {
-					let _ = std::fs::write("/tmp/simple_servlet_no_input.txt", "no_input_bytes\n");
 					return Ok(());
 				}
 			};
 
-			// DEBUG: Track request creation
-			let _ = std::fs::write("/tmp/simple_servlet_request_creating.txt", format!("creating_request: value={}\n", value));
-
 			let request = NumberRequest { value };
 			trace.event("request_sent");
-
-			// DEBUG: Track frame composition
-			let _ = std::fs::write("/tmp/simple_servlet_frame_composing.txt", "composing_frame\n");
 
 			let frame = compose! {
 				V0: id: "simple-client",
@@ -135,17 +116,12 @@ tb_scenario! {
 				message: request
 			}?;
 
-			// DEBUG: Track before emit
-			let _ = std::fs::write("/tmp/simple_servlet_before_emit.txt", "before_emit\n");
-
 			// Send request
 			let response_frame = match client.emit(frame, None).await? {
 				Some(f) => {
-					let _ = std::fs::write("/tmp/simple_servlet_response_received.txt", "response_received\n");
 					f
 				},
 				None => {
-					let _ = std::fs::write("/tmp/simple_servlet_no_response.txt", "no_response\n");
 					return Ok(());
 				}
 			};
@@ -153,21 +129,14 @@ tb_scenario! {
 			// Decode response
 			let response = match decode::<NumberResponse>(&response_frame.message) {
 				Ok(r) => {
-					let _ = std::fs::write("/tmp/simple_servlet_response_decoded.txt", format!("response_decoded: doubled={}\n", r.doubled));
 					r
 				},
 				Err(_) => {
-					let _ = std::fs::write("/tmp/simple_servlet_response_decode_failed.txt", "response_decode_failed\n");
 					return Ok(());
 				}
 			};
 
-			trace.event("response_received");
-
-			// Verify response is correct (value * 2)
-			assert_eq!(response.doubled, (value as u16) * 2);
-
-			let _ = std::fs::write("/tmp/simple_servlet_success.txt", format!("success: value={}, doubled={}\n", value, response.doubled));
+			trace.event_with("response_received", &[], response.doubled == (value as u16) * 2);
 
 			Ok(())
 		}

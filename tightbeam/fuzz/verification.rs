@@ -135,7 +135,7 @@ tb_scenario! {
 			use std::path::Path;
 
 			// Proof 1: Compilation succeeded (executing proves it compiled)
-			trace.assert("compilation_check", &[]);
+			trace.event("compilation_check");
 
 			// Proof 2: AFL Dependency Configuration - Check actual Cargo.toml files
 			let workspace_cargo = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -143,21 +143,21 @@ tb_scenario! {
 				.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No grandparent directory"))?
 				.join("Cargo.toml");
 			let cargo_content = fs::read_to_string(&workspace_cargo)?;
-			trace.assert_value("workspace_has_afl", &[], cargo_content.contains("afl"));
+			trace.event_with("workspace_has_afl", &[], cargo_content.contains("afl"));
 
 			let package_cargo = Path::new(env!("CARGO_MANIFEST_DIR"))
 				.parent().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No parent directory"))?
 				.join("Cargo.toml");
 			let pkg_content = fs::read_to_string(&package_cargo)?;
 			let enables_afl = pkg_content.contains("testing-fuzz") && pkg_content.contains("dep:afl");
-			trace.assert_value("package_enables_afl", &[], enables_afl);
+			trace.event_with("package_enables_afl", &[], enables_afl);
 
 			// Proof 3: Feature Flags - Actually check if IJON feature is active
 			#[cfg(feature = "testing-fuzz-ijon")]
 			let ijon_enabled = true;
 			#[cfg(not(feature = "testing-fuzz-ijon"))]
 			let ijon_enabled = false;
-			trace.assert_value("ijon_feature_enabled", &[], ijon_enabled);
+			trace.event_with("ijon_feature_enabled", &[], ijon_enabled);
 
 			// Proof 4: Binary Symbol Analysis - Check actual binary for IJON symbols
 			let current_exe = std::env::current_exe()?;
@@ -171,27 +171,27 @@ tb_scenario! {
 			let has_ijon_hashint = symbols.contains("ijon_hashint") || symbols.contains("ijon_hashstack");
 			let has_ijon_map_size = symbols.contains("__afl_ijon_map_size") || symbols.contains("__afl_ijon_enabled");
 			let has_afl_runtime = symbols.contains("__afl_area_ptr") || symbols.contains("__afl_prev_loc");
-			trace.assert_value("binary_has_ijon_max", &[], has_ijon_max);
-			trace.assert_value("binary_has_ijon_set", &[], has_ijon_set);
-			trace.assert_value("binary_has_ijon_hashint", &[], has_ijon_hashint);
-			trace.assert_value("binary_has_ijon_map_size", &[], has_ijon_map_size);
-			trace.assert_value("binary_has_afl_runtime", &[], has_afl_runtime);
+			trace.event_with("binary_has_ijon_max", &[], has_ijon_max);
+			trace.event_with("binary_has_ijon_set", &[], has_ijon_set);
+			trace.event_with("binary_has_ijon_hashint", &[], has_ijon_hashint);
+			trace.event_with("binary_has_ijon_map_size", &[], has_ijon_map_size);
+			trace.event_with("binary_has_afl_runtime", &[], has_afl_runtime);
 
 			// Proof 5: Oracle Methods - Test actual oracle functionality
 			let oracle = trace.oracle();
 			let coverage = oracle.coverage_score();
-			trace.assert_value("coverage_score", &[], coverage > 0);
+			trace.event_with("coverage_score", &[], coverage > 0);
 
 			let state_hash1 = oracle.track_state();
 			let state_hash2 = oracle.track_state();
-			trace.assert_value("track_state_stable", &[], state_hash1 == state_hash2);
+			trace.event_with("track_state_stable", &[], state_hash1 == state_hash2);
 
 			oracle.fuzz_from_bytes()?;
 			let coverage_after = oracle.coverage_score();
-			trace.assert_value("fuzz_advances_coverage", &[], coverage_after >= coverage);
+			trace.event_with("fuzz_advances_coverage", &[], coverage_after >= coverage);
 
 			// Complete
-			trace.assert("verification_complete", &[]);
+			trace.event("verification_complete");
 
 			Ok(())
 		}

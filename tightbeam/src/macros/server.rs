@@ -163,9 +163,7 @@ macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
 	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
-		compile_error!(
-			"server!(protocol …, policies: …, assertions: …) requires the `tokio` feature"
-		);
+		compile_error!("server!(protocol …, policies: …, assertions: …) requires the `tokio` feature");
 	}};
 }
 
@@ -408,7 +406,6 @@ macro_rules! server {
 							let (frame, status) = match $crate::macros::server::server_runtime::rt::block_on(__transport.collect_message()) {
 								Ok(result) => result,
 								Err(err) => {
-									eprintln!("Server connection closed: {:?}", err);
 									break;
 								}
 							};
@@ -424,15 +421,13 @@ macro_rules! server {
 							match $crate::macros::server::server_runtime::rt::block_on(__transport.send_response(status, response)) {
 								Ok(()) => continue,
 								Err(err) => {
-									eprintln!("Server connection closed: {:?}", err);
 									break;
 								}
 							}
 						}
 					});
 				}
-				Err(e) => {
-					eprintln!("Server accept error: {:?}", e);
+				Err(_err) => {
 					break;
 				}
 			}
@@ -470,8 +465,7 @@ macro_rules! server {
 						let response = if status == $crate::policy::TransitStatus::Accepted {
 							match (__handler_clone)(frame).await {
 								Ok(opt) => opt,
-								Err(e) => {
-									eprintln!("Handler error: {:?}", e);
+								Err(_err) => {
 									None
 								}
 							}
@@ -497,11 +491,10 @@ macro_rules! server {
 					});
 				}
 				Err(e) => {
-					let err_msg = format!("Server accept error: {:?}", e);
 					if let Some(tx) = $error_tx.as_mut() {
 						let _ = tx.send(e.into()).await;
 					}
-					eprintln!("{}", err_msg);
+
 					break;
 				}
 			}

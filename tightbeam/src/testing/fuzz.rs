@@ -110,7 +110,7 @@
 //!
 //!             // Make assertions based on execution trace
 //!             for event in trace.oracle().trace() {
-//!                 trace.assert(event.0, &[]);
+//!                 trace.event(event.0);
 //!             }
 //!             Ok(())
 //!         }
@@ -340,16 +340,6 @@ impl CspOracle {
 	/// - Event trace (sequence of events taken)
 	/// - Coverage statistics (states/transitions explored)
 	/// - Valid events (what could have been done at crash point)
-	///
-	/// ## Usage
-	/// ```ignore
-	/// // In fuzz target:
-	/// if let Err(e) = oracle.fuzz_from_bytes(data) {
-	///     eprintln!("Fuzz failure: {}", e);
-	///     eprintln!("{}", oracle.crash_context());
-	///     panic!("Fuzzing failed");
-	/// }
-	/// ```
 	pub fn crash_context(&self) -> String {
 		let (visited_trans, total_trans) = self.transition_coverage();
 		format!(

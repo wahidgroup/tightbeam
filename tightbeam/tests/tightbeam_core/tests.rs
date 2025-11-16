@@ -12,6 +12,7 @@ use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1, Secp256k1Signature, Secp256k1SigningKey, VerifyingKey};
 use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
+use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
 use tightbeam::utils;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
@@ -228,52 +229,52 @@ tb_scenario! {
 
 			// Roundtrip checks
 			let v0_roundtrip: TestMessage = tightbeam::decode(&v0_frame.message)?;
-			trace.assert_value("roundtrip_ok", &["v0"], v0_roundtrip == message);
+			trace.event_with("roundtrip_ok", &["v0"], v0_roundtrip == message);
 			let v1_roundtrip = v1_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
 			let v2_roundtrip = v2_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
 			let v3_roundtrip = v3_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
-			trace.assert_value("roundtrip_ok", &["v1"], v1_roundtrip == message);
-			trace.assert_value("roundtrip_ok", &["v2"], v2_roundtrip == message);
-			trace.assert_value("roundtrip_ok", &["v3"], v3_roundtrip == message);
+			trace.event_with("roundtrip_ok", &["v1"], v1_roundtrip == message);
+			trace.event_with("roundtrip_ok", &["v2"], v2_roundtrip == message);
+			trace.event_with("roundtrip_ok", &["v3"], v3_roundtrip == message);
 
 			// V1+ signature checks
-			trace.assert_value("sig_valid", &["v1"], v1_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
-			trace.assert_value("sig_valid", &["v2"], v2_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
-			trace.assert_value("sig_valid", &["v3"], v3_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
+			trace.event_with("sig_valid", &["v1"], v1_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
+			trace.event_with("sig_valid", &["v2"], v2_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
+			trace.event_with("sig_valid", &["v3"], v3_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
 
 			// V1+ integrity checks
 			let v1_integrity = v1_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
 			let v2_integrity = v2_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
 			let v3_integrity = v3_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
-			trace.assert_value("integrity_ok", &["v1"], v1_integrity.value_cmp(&message_hash).is_ok());
-			trace.assert_value("integrity_ok", &["v2"], v2_integrity.value_cmp(&message_hash).is_ok());
-			trace.assert_value("integrity_ok", &["v3"], v3_integrity.value_cmp(&message_hash).is_ok());
+			trace.event_with("integrity_ok", &["v1"], v1_integrity.value_cmp(&message_hash).is_ok());
+			trace.event_with("integrity_ok", &["v2"], v2_integrity.value_cmp(&message_hash).is_ok());
+			trace.event_with("integrity_ok", &["v3"], v3_integrity.value_cmp(&message_hash).is_ok());
 
 			// Frame-level fields
-			trace.assert_option("nonrepudiation", &["v0"], &v0_frame.nonrepudiation);
-			trace.assert_option("nonrepudiation", &["v1", "v2", "v3"], &v1_frame.nonrepudiation);
-			trace.assert_option("integrity", &["v0"], &v0_frame.integrity);
-			trace.assert_option("integrity", &["v1", "v2", "v3"], &v1_frame.integrity);
+			trace.event_with("nonrepudiation", &["v0"], Presence::of_option(&v0_frame.nonrepudiation));
+			trace.event_with("nonrepudiation", &["v1", "v2", "v3"], Presence::of_option(&v1_frame.nonrepudiation));
+			trace.event_with("integrity", &["v0"], Presence::of_option(&v0_frame.integrity));
+			trace.event_with("integrity", &["v1", "v2", "v3"], Presence::of_option(&v1_frame.integrity));
 
 			// Metadata fields
-			trace.assert_option("confidentiality", &["v0"], &v0_frame.metadata.confidentiality);
-			trace.assert_option("confidentiality", &["v1", "v2", "v3"], &v1_frame.metadata.confidentiality);
-			trace.assert_value("priority", &["v0", "v1"], v0_frame.metadata.priority);
-			trace.assert_value("priority", &["v2"], v2_frame.metadata.priority);
-			trace.assert_value("priority", &["v3"], v3_frame.metadata.priority);
-			trace.assert_value("lifetime", &["v0", "v1"], v0_frame.metadata.lifetime);
-			trace.assert_value("lifetime", &["v2"], v2_frame.metadata.lifetime);
-			trace.assert_value("lifetime", &["v3"], v3_frame.metadata.lifetime);
-			trace.assert_option("previous_frame", &["v0", "v1"], &v0_frame.metadata.previous_frame);
-			trace.assert_option("previous_frame", &["v2", "v3"], &v2_frame.metadata.previous_frame);
-			trace.assert_option("matrix", &["v0", "v1", "v2"], &v0_frame.metadata.matrix);
-			trace.assert_option("matrix", &["v3"], &v3_frame.metadata.matrix);
+			trace.event_with("confidentiality", &["v0"], Presence::of_option(&v0_frame.metadata.confidentiality));
+			trace.event_with("confidentiality", &["v1", "v2", "v3"], Presence::of_option(&v1_frame.metadata.confidentiality));
+			trace.event_with("priority", &["v0", "v1"], v0_frame.metadata.priority);
+			trace.event_with("priority", &["v2"], v2_frame.metadata.priority);
+			trace.event_with("priority", &["v3"], v3_frame.metadata.priority);
+			trace.event_with("lifetime", &["v0", "v1"], v0_frame.metadata.lifetime);
+			trace.event_with("lifetime", &["v2"], v2_frame.metadata.lifetime);
+			trace.event_with("lifetime", &["v3"], v3_frame.metadata.lifetime);
+			trace.event_with("previous_frame", &["v0", "v1"], Presence::of_option(&v0_frame.metadata.previous_frame));
+			trace.event_with("previous_frame", &["v2", "v3"], Presence::of_option(&v2_frame.metadata.previous_frame));
+			trace.event_with("matrix", &["v0", "v1", "v2"], Presence::of_option(&v0_frame.metadata.matrix));
+			trace.event_with("matrix", &["v3"], Presence::of_option(&v3_frame.metadata.matrix));
 
 			// Version checks - each version is unique
-			trace.assert_value("version", &["v0"], v0_frame.version);
-			trace.assert_value("version", &["v1"], v1_frame.version);
-			trace.assert_value("version", &["v2"], v2_frame.version);
-			trace.assert_value("version", &["v3"], v3_frame.version);
+			trace.event_with("version", &["v0"], v0_frame.version);
+			trace.event_with("version", &["v1"], v1_frame.version);
+			trace.event_with("version", &["v2"], v2_frame.version);
+			trace.event_with("version", &["v3"], v3_frame.version);
 
 			Ok(())
 		}

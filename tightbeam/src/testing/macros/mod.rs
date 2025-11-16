@@ -17,7 +17,7 @@ pub use verification_spec::{
 use alloc::vec::Vec;
 
 // Re-exports
-pub use crate::testing::assertions::{AssertionValue, IsNone, IsSome, RatioLimit};
+pub use crate::testing::assertions::{AssertionValue, IsNone, IsSome, Presence, RatioLimit};
 pub use crate::trace::TraceCollector;
 pub use crate::{absent, at_least, at_most, between, equals, exactly, falsy, present, truthy};
 
@@ -1433,52 +1433,15 @@ macro_rules! tb_scenario {
 	) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let runtime = tokio::runtime::Builder::new_multi_thread()
-				.worker_threads($threads)
-				.enable_all()
-				.build()
-				.expect("Failed to build tokio runtime");
+			let runtime = $crate::testing::macros::__tb_build_multi_thread_runtime($threads)?;
 
-			runtime.block_on(async {
-				let trace_server = $trace_collector.clone();
-				let trace_client = $trace_collector.clone();
-
-				async fn __call_server_closure<F, Fut>(
-					closure: F,
-					trace: $crate::trace::TraceCollector,
-				) -> Result<(tokio::task::JoinHandle<()>, $crate::transport::tcp::TightBeamSocketAddr), $crate::TightBeamError>
-				where
-					F: FnOnce($crate::trace::TraceCollector) -> Fut,
-					Fut: core::future::Future<Output = Result<(tokio::task::JoinHandle<()>, $crate::transport::tcp::TightBeamSocketAddr), $crate::TightBeamError>>,
-				{
-					closure(trace).await
-				}
-
-				let server_setup_result = __call_server_closure($server_closure, trace_server).await;
-				let (server_handle, server_addr) = server_setup_result?;
-
-				type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
-
-				let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await?;
-				let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
-
-				async fn __call_client_closure<F, Fut, T>(
-					closure: F,
-					trace: $crate::trace::TraceCollector,
-					client: T,
-				) -> Result<(), $crate::TightBeamError>
-				where
-					F: FnOnce($crate::trace::TraceCollector, T) -> Fut,
-					Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
-				{
-					closure(trace, client).await
-				}
-				let client_result = __call_client_closure($client_closure, trace_client, client).await;
-
-				server_handle.abort();
-
-				Ok(client_result)
-			})
+			runtime.block_on($crate::testing::macros::__tb_run_service_client_session::<
+				tb_scenario!(@default_protocol $($protocol)?)
+			>(
+				$trace_collector.clone(),
+				$server_closure,
+				$client_closure,
+			))
 		}
 
 		#[cfg(not(feature = "tokio"))]
@@ -1845,11 +1808,7 @@ macro_rules! tb_scenario {
 
 		const WORKER_THREADS: usize = tb_scenario!(@default_worker_threads $($threads)?);
 
-		let runtime = tokio::runtime::Builder::new_multi_thread()
-			.worker_threads(WORKER_THREADS)
-			.enable_all()
-			.build()
-			.expect("Failed to build tokio runtime");
+		let runtime = $crate::testing::macros::__tb_build_multi_thread_runtime(WORKER_THREADS)?;
 
 		let exec_result = runtime.block_on(async {
 			#[cfg(feature = "instrument")]
@@ -1858,30 +1817,15 @@ macro_rules! tb_scenario {
 			tb_scenario!(@init_instrumentation instr_mode);
 
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_server = trace_collector.clone();
-			let trace_client = trace_collector.clone();
 
-			let server_setup_result: Result<(tokio::task::JoinHandle<()>, _), $crate::TightBeamError> =
-				($server_closure)(trace_server).await;
-			let (server_handle, server_addr) = server_setup_result?;
-
-			type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
-
-			let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await?;
-			let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
-
-			async fn __call_client_closure<F, Fut, T>(
-				closure: F,
-				trace: $crate::trace::TraceCollector,
-				client: T,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce($crate::trace::TraceCollector, T) -> Fut,
-				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
-			{
-				closure(trace, client).await
-			}
-			let client_result = __call_client_closure($client_closure, trace_client, client).await;
+			let client_result = $crate::testing::macros::__tb_run_service_client_session::<
+				tb_scenario!(@default_protocol $($protocol)?)
+			>(
+				trace_collector.clone(),
+				$server_closure,
+				$client_closure,
+			)
+			.await;
 
 			let mut trace = tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
@@ -1890,8 +1834,6 @@ macro_rules! tb_scenario {
 			tb_scenario!(@finalize_instrumentation trace, instr_mode);
 
 			tb_scenario!(@finalize_trace trace, client_result);
-
-			server_handle.abort();
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
 				single_spec: $spec,
@@ -1925,11 +1867,7 @@ macro_rules! tb_scenario {
 
 		const WORKER_THREADS: usize = tb_scenario!(@default_worker_threads $($threads)?);
 
-		let runtime = tokio::runtime::Builder::new_multi_thread()
-			.worker_threads(WORKER_THREADS)
-			.enable_all()
-			.build()
-			.expect("Failed to build tokio runtime");
+		let runtime = $crate::testing::macros::__tb_build_multi_thread_runtime(WORKER_THREADS)?;
 
 		let exec_result = runtime.block_on(async {
 			#[cfg(feature = "instrument")]
@@ -2077,10 +2015,6 @@ macro_rules! tb_scenario {
 		#[cfg(fuzzing)]
 		fn main() {
 			::afl::fuzz!(|data: &[u8]| {
-				// DEBUG: Track AFL fuzz closure entry
-				eprintln!("[DEBUG] AFL fuzz closure called: data_len={}", data.len());
-				let _ = std::fs::write("/tmp/afl_fuzz_closure_entry.txt", format!("afl_fuzz_closure_called: data_len={}\n", data.len()));
-
 				// Common setup
 				#[cfg(feature = "instrument")]
 				let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
@@ -2098,9 +2032,7 @@ macro_rules! tb_scenario {
 					.build()
 					.expect("Failed to create tokio runtime");
 
-				let _ = std::fs::write("/tmp/afl_block_on_start.txt", "afl_block_on_starting\n");
 				let exec_result = runtime.block_on(async {
-				let _ = std::fs::write("/tmp/afl_async_block_entry.txt", "afl_async_block_entered\n");
 				let trace_client = trace_collector.clone();
 				let trace_server = trace_collector.clone();
 
@@ -2381,6 +2313,55 @@ macro_rules! __tb_scenario_servlet_start {
 	}};
 }
 
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub fn __tb_build_multi_thread_runtime(
+	worker_threads: usize,
+) -> Result<tokio::runtime::Runtime, crate::TightBeamError> {
+	let runtime = tokio::runtime::Builder::new_multi_thread()
+		.worker_threads(worker_threads)
+		.enable_all()
+		.build()?;
+
+	Ok(runtime)
+}
+
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub async fn __tb_run_service_client_session<Protocol, ServerFn, ServerFut, ClientFn, ClientFut>(
+	trace_collector: crate::trace::TraceCollector,
+	server_closure: ServerFn,
+	client_closure: ClientFn,
+) -> Result<(), crate::TightBeamError>
+where
+	Protocol: crate::transport::Protocol<Address = crate::transport::tcp::TightBeamSocketAddr>,
+	ServerFn: FnOnce(crate::trace::TraceCollector) -> ServerFut,
+	ServerFut: core::future::Future<
+		Output = Result<
+			(tokio::task::JoinHandle<()>, crate::transport::tcp::TightBeamSocketAddr),
+			crate::TightBeamError,
+		>,
+	>,
+	ClientFn: FnOnce(crate::trace::TraceCollector, <Protocol as crate::transport::Protocol>::Transport) -> ClientFut,
+	ClientFut: core::future::Future<Output = Result<(), crate::TightBeamError>>,
+{
+	let trace_server = trace_collector.clone();
+	let trace_client = trace_collector;
+
+	let (server_handle, server_addr) = server_closure(trace_server).await?;
+
+	let stream = <Protocol as crate::transport::Protocol>::connect(server_addr)
+		.await
+		.map_err(|err| crate::TightBeamError::from(err.into()))?;
+	let client = <Protocol as crate::transport::Protocol>::create_transport(stream);
+
+	let client_result = client_closure(trace_client, client).await;
+
+	server_handle.abort();
+
+	client_result
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2466,9 +2447,9 @@ mod tests {
 		spec: DemoSpec,
 		environment Bare {
 			exec: |trace| {
-				trace.assert("Received", &[]);
-				trace.assert("Responded", &[]);
-				trace.assert("Responded", &[]);
+				trace.event("Received");
+				trace.event("Responded");
+				trace.event("Responded");
 				Ok(())
 			}
 		}
@@ -2479,8 +2460,8 @@ mod tests {
 		specs: [DemoSpec::get(1, 0, 0)],
 		environment Bare {
 			exec: |trace| {
-				trace.assert("Received", &[]);
-				trace.assert("Responded", &[]);
+				trace.event("Received");
+				trace.event("Responded");
 				Ok(())
 			}
 		}
@@ -2498,8 +2479,8 @@ mod tests {
 			specs: [DemoSpec::get(1, 0, 0), DemoSpec::get(1, 1, 0)],
 			environment Bare {
 				exec: |trace| {
-					trace.assert("Received", &[]);
-					trace.assert("Responded", &[]);
+					trace.event("Received");
+					trace.event("Responded");
 					Ok(())
 				}
 			}
@@ -2518,10 +2499,10 @@ mod tests {
 		}
 
 		fn process(&mut self) -> Result<(), crate::TightBeamError> {
-			self.trace.assert("Received", &[]);
+			self.trace.event("Received");
 			self.received_count += 1;
-			self.trace.assert("Responded", &[]);
-			self.trace.assert("Responded", &[]);
+			self.trace.event("Responded");
+			self.trace.event("Responded");
 			Ok(())
 		}
 	}
@@ -2541,9 +2522,9 @@ mod tests {
 		environment Worker {
 			setup: TestWorker::new,
 			stimulus: |trace, worker: &mut TestWorker| {
-				trace.assert("Received", &[]);
+				trace.event("Received");
 				worker.received_count += 1;
-				trace.assert("Responded", &[]);
+				trace.event("Responded");
 				Ok(())
 			}
 		}
@@ -2563,9 +2544,9 @@ mod tests {
 					protocol TokioListener: listener,
 					assertions: trace,
 					handle: |frame, trace| async move {
-						trace.assert("Received", &[]);
-						trace.assert("Responded", &[]);
-						trace.assert("Responded", &[]);
+						trace.event("Received");
+						trace.event("Responded");
+						trace.event("Responded");
 						Ok(Some(frame))
 					}
 				};
@@ -2602,13 +2583,13 @@ mod tests {
 					assertions: trace,
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.assert("Received", &[]);
-						trace.assert("Responded", &[]);
+						trace.event("Received");
+						trace.event("Responded");
 
 						// Decode message to extract value for assertion
 						let decoded: Result<TestMessage, _> = crate::decode(&frame.message);
 						if let Ok(msg) = decoded {
-							trace.assert_value("message_content", &[], msg.content);
+							trace.event_with("message_content", &[], msg.content);
 						}
 
 						Ok(Some(frame))
@@ -2619,7 +2600,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.assert("Responded", &[]);
+				trace.event("Responded");
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -2629,7 +2610,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.assert("Received", &[]);
+				trace.event("Received");
 
 				Ok(())
 			}
