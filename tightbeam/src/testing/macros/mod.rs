@@ -2425,13 +2425,13 @@ macro_rules! tb_scenario {
 #[macro_export]
 macro_rules! __tb_scenario_servlet_start {
 	// Custom start expression provided
-	($servlet:ident, $trace:expr, $start:expr) => {
-		$start.await.expect("Failed to start servlet")
-	};
+	($servlet:ident, $trace:expr, $start:expr) => {{
+		($start)($trace).await.expect("Failed to start servlet")
+	}};
 	// Default: call start with trace collector
-	($servlet:ident, $trace:expr,) => {
+	($servlet:ident, $trace:expr,) => {{
 		$servlet::start($trace).await.expect("Failed to start servlet")
-	};
+	}};
 }
 
 // ---------------------------------------------------------------------------

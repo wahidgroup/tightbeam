@@ -66,11 +66,15 @@ servlet! {
 		game_state: Arc<Mutex<ChessGameState>>,
 	},
 	handle: |message, trace, config| async move {
-		let _ = trace;
 		// Decode ChessMoveRequest from message
 		let move_req: ChessMoveRequest = match decode(&message.message) {
-			Ok(req) => req,
+			Ok(req) => {
+				trace.event("server_move_received");
+				req
+			}
 			Err(_) => {
+				trace.event("server_decode_failure");
+				trace.event("server_response_emitted");
 				// Invalid message format - return invalid move response
 				return Ok(Some(create_invalid_move_response(
 					message.metadata.id.clone(),
@@ -91,6 +95,8 @@ servlet! {
 		let mut game_state = match config.game_state.lock() {
 			Ok(gs) => gs,
 			Err(_) => {
+				trace.event("server_state_lock_poisoned");
+				trace.event("server_response_emitted");
 				// Lock poisoned - return invalid move response
 				return Ok(Some(create_invalid_move_response(
 					message.metadata.id.clone(),
@@ -126,12 +132,16 @@ servlet! {
 		);
 
 		if !is_valid {
+			trace.event("server_move_invalid");
+			trace.event("server_response_emitted");
 			// Invalid move - return invalid move response
 			return Ok(Some(create_invalid_move_response(
 				message.metadata.id.clone(),
 				move_count,
 			)?));
 		}
+
+		trace.event("server_move_validated");
 
 		// Make the client's move (track captures)
 		game_state.make_move_with_count(
@@ -190,6 +200,7 @@ servlet! {
 					server_move.3,
 					move_count + 1,
 				);
+				trace.event("server_move_generated");
 
 				// Check again after server move (increment move count for server move)
 				let server_move_count = move_count + 1;
@@ -203,12 +214,18 @@ servlet! {
 			}
 		};
 
+		if matches!(game_status, GameStatusCode::Checkmate | GameStatusCode::Stalemate) {
+			trace.event("server_game_ended");
+		}
+
 		// Return response with game status and updated board state in matrix
 		// Increment order for next move (monotonically incrementing)
 		let response = ChessMoveResponse { game_status };
 		let updated_matrix = tightbeam::Asn1Matrix::from(&*game_state);
 		// Convert Asn1Matrix to MatrixDyn
 		let matrix_dyn = tightbeam::matrix::MatrixDyn::try_from(updated_matrix)?;
+
+		trace.event("server_response_emitted");
 
 		Ok(Some(compose! {
 			V0: id: message.metadata.id.clone(),

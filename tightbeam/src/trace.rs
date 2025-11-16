@@ -87,10 +87,10 @@ impl TraceCollector {
 		#[cfg(feature = "testing-fuzz")]
 		if let Some(ref oracle) = self.state.oracle {
 			let csp_event_label: Option<&'static str> = match label {
-				"move_sent" => Some("move_request"),
-				"move_validated" => Some("move_valid"),
-				"move_rejected" => Some("move_invalid"),
-				"game_ended" => Some("game_over"),
+				"client_move_sent" => Some("move_request"),
+				"client_move_validated" => Some("move_valid"),
+				"client_move_rejected" => Some("move_invalid"),
+				"client_game_ended" => Some("game_over"),
 				_ => None,
 			};
 

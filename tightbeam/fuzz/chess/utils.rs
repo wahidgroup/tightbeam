@@ -25,13 +25,13 @@ pub(crate) fn restart_game(
 	seed_move_count: &mut u8,
 	trace: &TraceCollector,
 ) {
-	trace.event("move_validated");
-	trace.event("server_move");
-	trace.event("game_ended");
+	trace.event("client_move_validated");
+	trace.event("client_server_move");
+	trace.event("client_game_ended");
 	*client_game_state = ChessGameState::new();
 	*order = 1;
 	*seed_mode = true;
 	*seed_move_index = 0;
 	*seed_move_count = 0;
-	trace.event("game_restarted");
+	trace.event("client_game_restarted");
 }

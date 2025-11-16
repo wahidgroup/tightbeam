@@ -53,16 +53,20 @@ tb_assert_spec! {
 		gate: Accepted,
 		assertions: [
 			// Core requirement: at least one move must be sent
-			("move_sent", at_least!(1)),
+			("client_move_sent", at_least!(1)),
+			("client_moves_processed_balance", exactly!(1), equals!(0i64), tags: ["balance"]),
+			("client_server_move_balance", exactly!(1), equals!(0i64), tags: ["balance"]),
+			("client_game_restart_balance", exactly!(1), equals!(0i64), tags: ["lifecycle"]),
 
-			// Move processing and server behavior invariants
-			("moves_processed_balance", exactly!(1), equals!(0i64), tags: ["balance"]),
-			("server_move_balance", exactly!(1), equals!(0i64), tags: ["balance"]),
-			("game_restart_balance", exactly!(1), equals!(0i64), tags: ["lifecycle"]),
+			// Server-side servlet instrumentation guarantees
+			("server_move_received", at_least!(1)),
+			("server_response_emitted", at_least!(1)),
+			("server_decode_failure", exactly!(0)),
+			("server_state_lock_poisoned", exactly!(0)),
 
 			// Individual error bounds remain for diagnostics
-			("no_response", at_most!(5)),
-			("decode_error", at_most!(5)),
+			("client_no_response", at_most!(5)),
+			("client_decode_error", at_most!(5)),
 		]
 	},
 	annotations { description: "Comprehensive chess game assertion specification" }
@@ -76,38 +80,38 @@ tb_process_spec! {
 	pub ChessGameFlow,
 	events {
 		observable {
-			"move_sent",  "move_rejected",  "move_validated", "server_move",
-			"game_ended", "game_restarted", "no_response",    "decode_error",
-			"moves_processed_balance", "server_move_balance", "game_restart_balance",
+			"client_move_sent",  "client_move_rejected",  "client_move_validated", "client_server_move",
+			"client_game_ended", "client_game_restarted", "client_no_response",    "client_decode_error",
+			"client_moves_processed_balance", "client_server_move_balance", "client_game_restart_balance",
 			"errors_within_limit", "rejection_ratio"
 		}
 		hidden { }
 	}
 	states {
 		WaitingForMove => {
-			"move_sent"                => ValidatingMove,
-			"game_ended"               => GameOver,
-			"moves_processed_balance"  => WaitingForMove,
-			"server_move_balance"      => WaitingForMove,
-			"game_restart_balance"     => WaitingForMove,
+			"client_move_sent"                => ValidatingMove,
+			"client_game_ended"               => GameOver,
+			"client_moves_processed_balance"  => WaitingForMove,
+			"client_server_move_balance"      => WaitingForMove,
+			"client_game_restart_balance"     => WaitingForMove,
 			"errors_within_limit"      => WaitingForMove,
 			"rejection_ratio"          => WaitingForMove,
 		},
 		ValidatingMove => {
-			"move_validated" => ProcessingMove,
-			"move_rejected"  => WaitingForMove,
-			"no_response"    => WaitingForMove,
-			"decode_error"   => WaitingForMove
+			"client_move_validated" => ProcessingMove,
+			"client_move_rejected"  => WaitingForMove,
+			"client_no_response"    => WaitingForMove,
+			"client_decode_error"   => WaitingForMove
 		},
 		ProcessingMove => {
-			"server_move"    => WaitingForMove,
-			"game_ended"     => GameOver,
-			"move_validated" => ProcessingMove,
+			"client_server_move"    => WaitingForMove,
+			"client_game_ended"     => GameOver,
+			"client_move_validated" => ProcessingMove,
 		},
 		GameOver => {
-			"game_restarted" => WaitingForMove,
-			"server_move"    => GameOver,
-			"move_validated" => GameOver,
+			"client_game_restarted" => WaitingForMove,
+			"client_server_move"    => GameOver,
+			"client_move_validated" => GameOver,
 		}
 	}
 	terminal { GameOver }
@@ -176,7 +180,7 @@ tb_scenario! {
 	// },
 	environment Servlet {
 		servlet: ChessEngineServlet,
-		start: async move {
+		start: |trace| async move {
 			// Get or create shared game state (created once, reset before each iteration)
 			// Reset happens before each iteration via reset_chess_game_state() called by macro
 			let game_state = GAME_STATE.get_or_init(|| {
@@ -187,7 +191,6 @@ tb_scenario! {
 				game_state: game_state.clone(),
 			};
 
-			let trace = trace_server.clone();
 			ChessEngineServlet::start(trace, config).await
 		},
 		client: |trace, mut client| async move {
@@ -357,7 +360,7 @@ tb_scenario! {
 					}
 				};
 
-				trace.event("move_sent");
+				trace.event("client_move_sent");
 				move_sent_count += 1;
 
 				// Send move request to server with current board state in matrix
@@ -375,7 +378,7 @@ tb_scenario! {
 				let response_frame = match client.emit(frame, None).await? {
 					Some(frame) => frame,
 					None => {
-						trace.event("no_response");
+						trace.event("client_no_response");
 						no_response_count += 1;
 						break;
 					}
@@ -385,7 +388,7 @@ tb_scenario! {
 				let response: ChessMoveResponse = match decode(&response_frame.message) {
 					Ok(r) => r,
 					Err(_) => {
-						trace.event("decode_error");
+						trace.event("client_decode_error");
 						decode_error_count += 1;
 						break;
 					}
@@ -401,13 +404,13 @@ tb_scenario! {
 				// Track response type for coverage feedback
 				match response.game_status {
 					GameStatusCode::InvalidMove => {
-						trace.event("move_rejected");
+						trace.event("client_move_rejected");
 						move_rejected_count += 1;
 						// Continue to next move even if invalid
 					}
 					GameStatusCode::InProgress => {
-						trace.event("move_validated");
-						trace.event("server_move");
+						trace.event("client_move_validated");
+						trace.event("client_server_move");
 						move_validated_count += 1;
 						server_move_count += 1;
 						order += 2; // Client move + server move
@@ -434,9 +437,9 @@ tb_scenario! {
 			let moves_processed_balance = (move_sent_count as i64) - (processed_moves as i64);
 			let server_move_balance = (move_validated_count as i64) - (server_move_count as i64);
 			let game_restart_balance = (game_restarted_count as i64) - (game_ended_count as i64);
-			trace.assert_value("moves_processed_balance", &["balance"], moves_processed_balance);
-			trace.assert_value("server_move_balance", &["balance"], server_move_balance);
-			trace.assert_value("game_restart_balance", &["lifecycle"], game_restart_balance);
+			trace.assert_value("client_moves_processed_balance", &["balance"], moves_processed_balance);
+			trace.assert_value("client_server_move_balance", &["balance"], server_move_balance);
+			trace.assert_value("client_game_restart_balance", &["lifecycle"], game_restart_balance);
 
 			Ok(())
 		}
