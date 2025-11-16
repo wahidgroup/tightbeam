@@ -149,7 +149,7 @@ tb_scenario! {
 		servlet: ChessEngineServlet,
 		start: |trace| async move {
 			let config = Arc::new(ChessEngineServletConf {
-				manager: ChessMatchManager::new(),
+				manager: ChessMatchManager::default(),
 			});
 
 			ChessEngineServlet::start(trace, config).await
@@ -207,7 +207,7 @@ tb_scenario! {
 
 				// Emit piece kind event only after move is sent (not before validation)
 				if let Some(piece) = piece::Piece::from_u8(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
-					trace.event(piece.to_kind_label());
+					trace.event(piece.as_kind_label());
 				}
 
 				// Send move request to server with current board state in matrix

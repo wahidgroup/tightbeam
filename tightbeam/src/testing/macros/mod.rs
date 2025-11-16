@@ -2265,23 +2265,6 @@ macro_rules! tb_scenario {
 		None::<$crate::testing::fdr::FdrVerdict>
 	}};
 
-	// ===== Servlet state reset helper (for fuzzing) =====
-	// This macro resets servlet state before each fuzz iteration
-	// For chess servlet: resets game_state in shared Arc
-	// For other servlets: may need servlet-specific reset logic
-	(@reset_servlet_state ChessEngineServlet, $servlet:expr) => {
-		// Chess servlet: reset shared GAME_STATE Arc
-		// Calls reset_chess_game_state() function defined at module level in chess/test.rs
-		let _ = $servlet; // Suppress unused warning
-		// The reset_chess_game_state() function must be defined at module level in the test file
-		// This macro expansion will call it - compilation will fail if function doesn't exist
-		reset_chess_game_state();
-	};
-	(@reset_servlet_state $servlet_name:ident, $servlet:expr) => {
-		// Default: no-op (servlet-specific resets can be added)
-		let _ = $servlet; // Suppress unused warning
-	};
-
 	// ===== Shared result propagation logic =====
 	(@propagate_result $exec_result:ident, $verification_result:ident) => {
 		if let Err(e) = $exec_result {
