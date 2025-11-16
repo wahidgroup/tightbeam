@@ -850,8 +850,7 @@ macro_rules! tb_scenario {
 
 				type ProtocolType = $crate::tb_scenario!(@default_protocol $($protocol)?);
 
-				let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await
-					.map_err(|e| $crate::TightBeamError::from(e))?;
+				let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await?;
 				let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
 				async fn __call_client_closure<F, Fut, T>(
@@ -940,8 +939,7 @@ macro_rules! tb_scenario {
 
 				type ProtocolType = $crate::tb_scenario!(@default_protocol $($protocol)?);
 
-				let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await
-					.map_err(|e| $crate::TightBeamError::from(e))?;
+				let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await?;
 				let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
 				async fn __call_client_closure<F, Fut, T>(
@@ -1461,8 +1459,7 @@ macro_rules! tb_scenario {
 
 				type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
-				let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await
-					.map_err(|e| $crate::TightBeamError::from(e))?;
+				let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await?;
 				let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
 				async fn __call_client_closure<F, Fut, T>(
@@ -1870,8 +1867,7 @@ macro_rules! tb_scenario {
 
 			type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
-			let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await
-				.map_err(|e| $crate::TightBeamError::from(e))?;
+			let stream = <ProtocolType as $crate::transport::Protocol>::connect(server_addr).await?;
 			let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
 			async fn __call_client_closure<F, Fut, T>(
@@ -1965,15 +1961,12 @@ macro_rules! tb_scenario {
 	) => {{
 		type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
-		let bind_addr = <ProtocolType as $crate::transport::Protocol>::default_bind_address()
-			.map_err(|e| $crate::TightBeamError::from(e))?;
-		let (listener, addr) = <ProtocolType as $crate::transport::Protocol>::bind(bind_addr).await
-			.map_err(|e| $crate::TightBeamError::from(e))?;
+		let bind_addr = <ProtocolType as $crate::transport::Protocol>::default_bind_address()?;
+		let (listener, addr) = <ProtocolType as $crate::transport::Protocol>::bind(bind_addr).await?;
 
 		let server_handle = ($server_closure)(listener);
 
-		let stream = <ProtocolType as $crate::transport::Protocol>::connect(addr).await
-			.map_err(|e| $crate::TightBeamError::from(e))?;
+		let stream = <ProtocolType as $crate::transport::Protocol>::connect(addr).await?;
 		let mut client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
 		let client_result = ($client_closure)(&mut client).await;
@@ -2003,15 +1996,12 @@ macro_rules! tb_scenario {
 	) => {{
 		type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
-		let bind_addr = <ProtocolType as $crate::transport::Protocol>::default_bind_address()
-			.map_err(|e| $crate::TightBeamError::from(e))?;
-		let (listener, addr) = <ProtocolType as $crate::transport::Protocol>::bind(bind_addr).await
-			.map_err(|e| $crate::TightBeamError::from(e))?;
+		let bind_addr = <ProtocolType as $crate::transport::Protocol>::default_bind_address()?;
+		let (listener, addr) = <ProtocolType as $crate::transport::Protocol>::bind(bind_addr).await?;
 
 		let server_handle = ($server_closure)(listener);
 
-		let stream = <ProtocolType as $crate::transport::Protocol>::connect(addr).await
-			.map_err(|e| $crate::TightBeamError::from(e))?;
+		let stream = <ProtocolType as $crate::transport::Protocol>::connect(addr).await?;
 		let mut client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
 		let client_result = ($client_closure)(&mut client).await;
@@ -2086,13 +2076,6 @@ macro_rules! tb_scenario {
 		#[allow(unexpected_cfgs)]
 		#[cfg(fuzzing)]
 		fn main() {
-			// Reuse runtime and servlet across AFL iterations to reduce setup overhead
-			// Runtime is created once and reused - servlet tasks run in this persistent runtime
-			// Servlet is created once and reused, with state reset before each iteration
-			// Use Mutex<Option> to allow async initialization
-			static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-			static SERVLET: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<$servlet_name>>>> = std::sync::Mutex::new(None);
-
 			::afl::fuzz!(|data: &[u8]| {
 				// DEBUG: Track AFL fuzz closure entry
 				eprintln!("[DEBUG] AFL fuzz closure called: data_len={}", data.len());
@@ -2110,67 +2093,27 @@ macro_rules! tb_scenario {
 					<$csp>::process()
 				);
 
-				// Servlet environment execution - reuse runtime and servlet
-				// Get or create runtime (created once, reused for all iterations)
-				let runtime = RUNTIME.get_or_init(|| {
-					eprintln!("[DEBUG] Creating persistent runtime");
-					let _ = std::fs::write("/tmp/afl_runtime_init.txt", "afl_runtime_initializing\n");
-					tokio::runtime::Builder::new_current_thread()
-						.enable_all()
-						.build()
-						.expect("Failed to create tokio runtime")
-				});
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("Failed to create tokio runtime");
 
 				let _ = std::fs::write("/tmp/afl_block_on_start.txt", "afl_block_on_starting\n");
-				// Use runtime.block_on() - it completes when the future completes, not when all tasks complete
-				// The servlet's server task runs in background and doesn't block this
 				let exec_result = runtime.block_on(async {
 				let _ = std::fs::write("/tmp/afl_async_block_entry.txt", "afl_async_block_entered\n");
 				let trace_client = trace_collector.clone();
 				let trace_server = trace_collector.clone();
 
-				// Get or initialize servlet (created once, reused for all iterations)
-				// Since we're already in an async context (runtime.block_on), we can await directly
-				// Check if servlet needs initialization (drop lock before await)
-				let needs_init = {
-					let servlet_guard = SERVLET.lock().unwrap();
-					servlet_guard.is_none()
-				};
+				let mut servlet_instance = $crate::__tb_scenario_servlet_start!(
+					$servlet_name,
+					trace_server.clone(),
+					$($start_expr)?
+				);
+				servlet_instance.set_trace(trace_server.clone());
 
-				if needs_init {
-					let _ = std::fs::write("/tmp/afl_servlet_init_start.txt", "afl_servlet_init_starting\n");
-					let _ = std::fs::write("/tmp/afl_servlet_start_macro_call.txt", "calling_servlet_start_macro\n");
-					let servlet_instance = $crate::__tb_scenario_servlet_start!(
-						$servlet_name,
-						trace_server.clone(),
-						$($start_expr)?
-					);
-					let _ = std::fs::write("/tmp/afl_servlet_start_macro_done.txt", "servlet_start_macro_completed\n");
-					let _ = std::fs::write("/tmp/afl_servlet_init_done.txt", "afl_servlet_init_completed\n");
-					let mut servlet_guard = SERVLET.lock().unwrap();
-					*servlet_guard = Some(std::sync::Arc::new(std::sync::Mutex::new(servlet_instance)));
-				}
+				$crate::tb_scenario!(@reset_servlet_state $servlet_name, &servlet_instance);
 
-				let servlet = {
-					let servlet_guard = SERVLET.lock().unwrap();
-					servlet_guard.as_ref().unwrap().clone()
-				};
-
-				{
-					let servlet_guard = servlet.lock().unwrap();
-					servlet_guard.set_trace(trace_server.clone());
-				}
-
-				// Reset servlet state before each iteration
-				// For chess servlet: calls reset_chess_game_state() function
-				// Note: reset_chess_game_state() must be defined at module level in test file
-				$crate::tb_scenario!(@reset_servlet_state $servlet_name, servlet);
-
-				// Get servlet address (need to lock to access)
-				let server_addr = {
-					let servlet_guard = servlet.lock().unwrap();
-					servlet_guard.addr()
-				};
+				let server_addr = servlet_instance.addr();
 
 				// Wrap client creation in an async block that returns Result
 				let client = async {
@@ -2193,8 +2136,7 @@ macro_rules! tb_scenario {
 				}
 				let client_result = __call_client_closure($client_closure, trace_client, client).await;
 
-				// Don't stop servlet - keep it alive for reuse
-				// servlet_instance.stop(); // REMOVED: servlet stays alive
+				servlet_instance.stop();
 
 				client_result
 			});
@@ -2449,9 +2391,9 @@ mod tests {
 	use crate::tb_assert_spec;
 	use crate::tb_scenario;
 	use crate::testing::create_test_message;
-	use crate::trace::TraceCollector;
-	use crate::trace::ExecutionMode;
 	use crate::testing::utils::TestMessage;
+	use crate::trace::ExecutionMode;
+	use crate::trace::TraceCollector;
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;

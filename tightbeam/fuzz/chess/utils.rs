@@ -1,9 +1,5 @@
-use std::sync::{Arc, Mutex, OnceLock};
-
 use super::state::ChessGameState;
 use tightbeam::trace::TraceCollector;
-
-pub(crate) static GAME_STATE: OnceLock<Arc<Mutex<ChessGameState>>> = OnceLock::new();
 
 pub(crate) fn is_white_turn(order: u64) -> bool {
 	order % 2 == 0
@@ -11,9 +7,7 @@ pub(crate) fn is_white_turn(order: u64) -> bool {
 
 #[allow(dead_code)]
 pub(crate) fn reset_chess_game_state() {
-	if let Some(game_state) = GAME_STATE.get() {
-		*game_state.lock().unwrap() = ChessGameState::new();
-	}
+	let _ = ChessGameState::new();
 }
 
 #[allow(dead_code)]

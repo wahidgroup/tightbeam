@@ -18,6 +18,7 @@
 //! cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/fuzz_chess
 //! ```
 
+#![allow(unused_imports)]
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "full"))]
 
@@ -28,11 +29,11 @@ mod utils;
 
 use std::sync::{Arc, Mutex};
 
+use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+
 use board::{ChessEngineServlet, ChessEngineServletConf, ChessMoveRequest, ChessMoveResponse, GameStatusCode};
 use state::ChessGameState;
-use utils::{is_white_turn, reset_chess_game_state, restart_game, GAME_STATE};
-
-use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+use utils::{is_white_turn, reset_chess_game_state, restart_game};
 
 // ============================================================================
 // ASSERTION SPEC
@@ -196,14 +197,8 @@ tb_scenario! {
 	environment Servlet {
 		servlet: ChessEngineServlet,
 		start: |trace| async move {
-			// Get or create shared game state (created once, reset before each iteration)
-			// Reset happens before each iteration via reset_chess_game_state() called by macro
-			let game_state = GAME_STATE.get_or_init(|| {
-				Arc::new(Mutex::new(ChessGameState::new()))
-			});
-
 			let config = ChessEngineServletConf {
-				game_state: game_state.clone(),
+				game_state: Arc::new(Mutex::new(ChessGameState::new())),
 			};
 
 			ChessEngineServlet::start(trace, config).await
