@@ -427,7 +427,12 @@ impl ChessGameState {
 
 		let mut current_row = from_row as i8 + row_step;
 		let mut current_col = from_col as i8 + col_step;
-		while current_row != to_row as i8 || current_col != to_col as i8 {
+		let mut iterations = 0;
+		const MAX_ITERATIONS: i32 = 8; // Maximum distance on 8x8 board
+
+		while (current_row != to_row as i8 || current_col != to_col as i8) && iterations < MAX_ITERATIONS {
+			iterations += 1;
+
 			// Use safe coordinate conversion to prevent out-of-bounds access
 			let Some(cr) = Self::to_valid_coord(current_row) else {
 				return false; // Out of bounds - path not clear
@@ -441,6 +446,11 @@ impl ChessGameState {
 			}
 			current_row += row_step;
 			current_col += col_step;
+		}
+
+		// If loop terminated due to iteration limit, path is not clear
+		if iterations >= MAX_ITERATIONS {
+			return false;
 		}
 
 		true
@@ -637,7 +647,12 @@ impl ChessGameState {
 
 		let mut current_row = from_row as i8 + row_step;
 		let mut current_col = from_col as i8 + col_step;
-		while current_row != to_row as i8 || current_col != to_col as i8 {
+		let mut iterations = 0;
+		const MAX_ITERATIONS: i32 = 8; // Maximum distance on 8x8 board
+
+		while (current_row != to_row as i8 || current_col != to_col as i8) && iterations < MAX_ITERATIONS {
+			iterations += 1;
+
 			// Use safe coordinate conversion to prevent out-of-bounds access
 			let Some(cr) = Self::to_valid_coord(current_row) else {
 				return false; // Out of bounds - path not clear
@@ -660,6 +675,11 @@ impl ChessGameState {
 			}
 			current_row += row_step;
 			current_col += col_step;
+		}
+
+		// If loop terminated due to iteration limit, path is not clear
+		if iterations >= MAX_ITERATIONS {
+			return false;
 		}
 
 		true
