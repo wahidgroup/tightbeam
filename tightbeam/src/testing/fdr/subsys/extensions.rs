@@ -14,13 +14,11 @@ use crate::testing::specs::csp::{Event, Process, State, TransitionRelation};
 use crate::trace::ConsumedTrace;
 
 /// State labels used in FDR trace analysis
-mod state_labels {
-	pub const INITIAL: &str = "initial";
-	pub const GATE_ACCEPT: &str = "gate_accept";
-	pub const HANDLER: &str = "handler";
-	pub const GATE_REJECT: &str = "gate_reject";
-	pub const TERMINAL: &str = "terminal";
-}
+pub const INITIAL: &str = "initial";
+pub const GATE_ACCEPT: &str = "gate_accept";
+pub const HANDLER: &str = "handler";
+pub const GATE_REJECT: &str = "gate_reject";
+pub const TERMINAL: &str = "terminal";
 
 /// Mode for converting trace to CSP process (FDR-specific)
 ///
@@ -154,10 +152,7 @@ impl FdrTraceExt for ConsumedTrace {
 		// - "gate_accept": after gate accepts
 		// - "handler": during handler execution
 		// - "terminal": after response/rejection
-		use state_labels::*;
-
 		let mut acceptance = AcceptanceSet::new();
-
 		match state_label {
 			INITIAL => {
 				// At initial state, we can accept request frame
@@ -269,119 +264,6 @@ impl FdrTraceExt for ConsumedTrace {
 	/// Creates a strictly linear, acyclic chain to avoid infinite BFS exploration.
 	/// The trace process represents a single execution path.
 	fn to_process_with_mode(&self, mode: TraceProcessMode) -> Process {
-		use state_labels::*;
-
-		// Macro to generate const array of intermediate state names
-		// (State uses &'static str, so we need compile-time string literals)
-		macro_rules! generate_intermediate_states {
-			() => {
-				&[
-					"assertion_1",
-					"assertion_2",
-					"assertion_3",
-					"assertion_4",
-					"assertion_5",
-					"assertion_6",
-					"assertion_7",
-					"assertion_8",
-					"assertion_9",
-					"assertion_10",
-					"assertion_11",
-					"assertion_12",
-					"assertion_13",
-					"assertion_14",
-					"assertion_15",
-					"assertion_16",
-					"assertion_17",
-					"assertion_18",
-					"assertion_19",
-					"assertion_20",
-					"assertion_21",
-					"assertion_22",
-					"assertion_23",
-					"assertion_24",
-					"assertion_25",
-					"assertion_26",
-					"assertion_27",
-					"assertion_28",
-					"assertion_29",
-					"assertion_30",
-					"assertion_31",
-					"assertion_32",
-					"assertion_33",
-					"assertion_34",
-					"assertion_35",
-					"assertion_36",
-					"assertion_37",
-					"assertion_38",
-					"assertion_39",
-					"assertion_40",
-					"assertion_41",
-					"assertion_42",
-					"assertion_43",
-					"assertion_44",
-					"assertion_45",
-					"assertion_46",
-					"assertion_47",
-					"assertion_48",
-					"assertion_49",
-					"assertion_50",
-					"assertion_51",
-					"assertion_52",
-					"assertion_53",
-					"assertion_54",
-					"assertion_55",
-					"assertion_56",
-					"assertion_57",
-					"assertion_58",
-					"assertion_59",
-					"assertion_60",
-					"assertion_61",
-					"assertion_62",
-					"assertion_63",
-					"assertion_64",
-					"assertion_65",
-					"assertion_66",
-					"assertion_67",
-					"assertion_68",
-					"assertion_69",
-					"assertion_70",
-					"assertion_71",
-					"assertion_72",
-					"assertion_73",
-					"assertion_74",
-					"assertion_75",
-					"assertion_76",
-					"assertion_77",
-					"assertion_78",
-					"assertion_79",
-					"assertion_80",
-					"assertion_81",
-					"assertion_82",
-					"assertion_83",
-					"assertion_84",
-					"assertion_85",
-					"assertion_86",
-					"assertion_87",
-					"assertion_88",
-					"assertion_89",
-					"assertion_90",
-					"assertion_91",
-					"assertion_92",
-					"assertion_93",
-					"assertion_94",
-					"assertion_95",
-					"assertion_96",
-					"assertion_97",
-					"assertion_98",
-					"assertion_99",
-					"assertion_100",
-				]
-			};
-		}
-
-		const INTERMEDIATE_STATES: &[&str] = generate_intermediate_states!();
-
 		let mut states = HashSet::new();
 		let mut terminal = HashSet::new();
 		let mut observable = HashSet::new();
@@ -491,13 +373,6 @@ impl FdrTraceExt for ConsumedTrace {
 
 		// Build transitions from sorted events
 		if !events.is_empty() {
-			if events.len() > 100 {
-				panic!(
-					"Trace too long: {} events (max 100 supported for unique state names)",
-					events.len()
-				);
-			}
-
 			let mut from_state = s_initial;
 			for (idx, event) in events.iter().enumerate() {
 				let (event, is_hidden) = match event {
@@ -525,7 +400,7 @@ impl FdrTraceExt for ConsumedTrace {
 				let to_state = if idx == events.len() - 1 {
 					s_terminal
 				} else {
-					let state_name = INTERMEDIATE_STATES[idx];
+					let state_name: &'static str = Box::leak(format!("trace_state_{idx}").into_boxed_str());
 					let to_state = State(state_name);
 					states.insert(to_state);
 					to_state

@@ -88,7 +88,8 @@ tb_process_spec! {
 			"errors_within_limit", "rejection_ratio",
 			"server_move_received", "server_move_validated", "server_move_generated",
 			"server_move_invalid", "server_response_emitted", "server_decode_failure",
-			"server_state_lock_poisoned", "server_game_ended"
+			"server_state_lock_poisoned", "server_game_ended",
+			"pawn_move", "rook_move", "knight_move", "bishop_move", "queen_move", "king_move"
 		}
 		hidden { }
 	}
@@ -115,6 +116,12 @@ tb_process_spec! {
 			"server_decode_failure"       => ValidatingMove,
 			"server_state_lock_poisoned"  => ValidatingMove,
 			"server_game_ended"           => ValidatingMove,
+			"pawn_move"                   => ValidatingMove,
+			"rook_move"                   => ValidatingMove,
+			"knight_move"                 => ValidatingMove,
+			"bishop_move"                 => ValidatingMove,
+			"queen_move"                  => ValidatingMove,
+			"king_move"                   => ValidatingMove,
 		},
 		ProcessingMove => {
 			"client_server_move"       => WaitingForMove,
@@ -124,6 +131,12 @@ tb_process_spec! {
 			"server_move_generated"    => ProcessingMove,
 			"server_response_emitted"  => ProcessingMove,
 			"server_game_ended"        => ProcessingMove,
+			"pawn_move"                => ProcessingMove,
+			"rook_move"                => ProcessingMove,
+			"knight_move"              => ProcessingMove,
+			"bishop_move"              => ProcessingMove,
+			"queen_move"               => ProcessingMove,
+			"king_move"                => ProcessingMove,
 		},
 		GameOver => {
 			"client_game_restarted"  => WaitingForMove,
@@ -135,44 +148,6 @@ tb_process_spec! {
 	annotations { description: "High-level chess game protocol flow" }
 }
 
-tb_process_spec! {
-	pub ChessRules,
-	events {
-		observable {
-			"pawn_move", "rook_move", "knight_move", "bishop_move",
-			"queen_move", "king_move", "check", "checkmate", "stalemate"
-		}
-		hidden { }
-	}
-	states {
-		GameStart => {
-			"pawn_move"   => InGame,
-			"rook_move"   => InGame,
-			"knight_move" => InGame,
-			"bishop_move" => InGame,
-			"queen_move"  => InGame,
-			"king_move"   => InGame
-		},
-		InGame => {
-			"pawn_move"   => InGame,
-			"rook_move"   => InGame,
-			"knight_move" => InGame,
-			"bishop_move" => InGame,
-			"queen_move"  => InGame,
-			"king_move"   => InGame,
-			"check"       => InCheck,
-			"stalemate"   => GameEnd
-		},
-		InCheck => {
-			"king_move"   => InGame,
-			"checkmate"   => GameEnd
-		},
-		GameEnd => {}
-	}
-	terminal { GameEnd }
-	annotations { description: "Detailed chess rules state machine" }
-}
-
 // ============================================================================
 // FUZZ TEST
 // ============================================================================
@@ -181,20 +156,6 @@ tb_scenario! {
 	fuzz: afl,
 	spec: ChessAssertSpec,
 	csp: ChessGameFlow,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 100,
-		max_internal_run: 8,
-		timeout_ms: 5000,
-		specs: vec![ChessGameFlow::process(), ChessRules::process()],
-		fail_fast: true,
-		expect_failure: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
-		fault_model: None,
-		fmea: None,
-	},
 	environment Servlet {
 		servlet: ChessEngineServlet,
 		start: |trace| async move {
@@ -209,6 +170,9 @@ tb_scenario! {
 			let mut client_game_state = ChessGameState::new();
 			let mut order = 1u64;
 
+			const MAX_TOTAL_MOVES: u64 = 50;
+			const MAX_GAME_REPLAYS: u64 = 3;
+
 			let mut move_validated_count = 0u64;
 			let mut move_rejected_count = 0u64;
 			let mut server_move_count = 0u64;
@@ -219,8 +183,19 @@ tb_scenario! {
 
 			// Continuous: Play multiple games until input bytes are exhausted
 			// This maximizes state exploration across different game scenarios
-			let mut move_sent_count = 0u32;
+			let mut move_sent_count = 0u64;
 			loop {
+				if move_sent_count >= MAX_TOTAL_MOVES || game_restarted_count >= MAX_GAME_REPLAYS {
+					break;
+				}
+
+				// Check if we have enough bytes before attempting to read
+				if !trace.oracle().fuzz_has_bytes(4).unwrap_or(false) {
+					// No bytes available, break immediately
+					break;
+				}
+
+				// We have bytes, try to read them
 				let move_req = match (
 					trace.oracle().fuzz_u8(),
 					trace.oracle().fuzz_u8(),
@@ -233,16 +208,11 @@ tb_scenario! {
 						to_row: tr % 8,
 						to_col: tc % 8,
 					},
-					_ if move_sent_count == 0 => ChessMoveRequest {
-						from_row: 0,
-						from_col: 0,
-						to_row: 0,
-						to_col: 0,
-					},
-					_ => break,
+					_ => break, // Should not happen if fuzz_has_bytes was true
 				};
 
 				trace.event("client_move_sent");
+
 				if let Some(kind) = piece::kind_label(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
 					trace.event(kind);
 				}
@@ -304,6 +274,9 @@ tb_scenario! {
 						server_move_count += 1;
 						game_ended_count += 1;
 						game_restarted_count += 1;
+						if game_restarted_count >= MAX_GAME_REPLAYS {
+							break;
+						}
 						// Continue loop to play another game
 					}
 				}

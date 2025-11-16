@@ -154,68 +154,69 @@ servlet! {
 
 		let is_server_white_turn = !is_white_turn;
 
+		// Compute valid moves once and reuse for checkmate/stalemate checks
+		let valid_moves = game_state.get_valid_moves(is_server_white_turn);
+		let is_in_check = game_state.is_in_check(is_server_white_turn);
+
 		// Check game status after client move
-		let game_status = if game_state.is_checkmate(is_server_white_turn, move_count) {
+		let game_status = if valid_moves.is_empty() && is_in_check {
 			GameStatusCode::Checkmate
-		} else if game_state.is_stalemate(is_server_white_turn, move_count) {
+		} else if valid_moves.is_empty() {
 			GameStatusCode::Stalemate
 		} else {
-			// Make a valid server move (server is opposite color)
-			let valid_moves = game_state.get_valid_moves(is_server_white_turn);
-			if valid_moves.is_empty() {
+			// Choose move: prefer endgame-forcing moves if game is dragging
+			// Always prefer captures to simplify the board (more aggressive)
+			// Use move_count as deterministic seed for reproducible fuzzing
+			let server_move = if game_state.should_force_endgame(move_count) || game_state.count_pieces() > 12 {
+				// Score moves and pick from top-scoring moves
+				let mut scored_moves: Vec<(u32, (u8, u8, u8, u8))> = valid_moves
+					.iter()
+					.map(|&m| {
+						let score = game_state.evaluate_move_for_endgame(
+							m.0, m.1, m.2, m.3, is_server_white_turn,
+						);
+						(score, m)
+					})
+					.collect();
+				// Sort by score (descending) and pick from top 25% or at least top 3
+				scored_moves.sort_by(|a, b| b.0.cmp(&a.0));
+				let top_count = (scored_moves.len() / 4).max(3).min(scored_moves.len());
+				let top_moves: Vec<_> = scored_moves.iter().take(top_count).map(|(_, m)| *m).collect();
+				// Deterministic selection based on move_count for reproducible fuzzing
+				let index = (move_count as usize) % top_moves.len();
+				top_moves[index]
+			} else {
+				// Deterministic selection based on move_count for reproducible fuzzing
+				let index = (move_count as usize) % valid_moves.len();
+				valid_moves[index]
+			};
+
+			// Make the server move (track captures)
+			game_state.make_move_with_count(
+				server_move.0,
+				server_move.1,
+				server_move.2,
+				server_move.3,
+				move_count + 1,
+			);
+
+			trace.event("server_move_generated");
+
+			if let Some(kind) = piece_kind_for_move(&game_state, server_move.0, server_move.1) {
+				trace.event(kind);
+			}
+
+			// Check again after server move (increment move count for server move)
+			// Check if client (opposite of server) is in checkmate/stalemate
+			let client_is_white_turn = is_white_turn; // Client is original turn
+			let client_valid_moves = game_state.get_valid_moves(client_is_white_turn);
+			let client_is_in_check = game_state.is_in_check(client_is_white_turn);
+			if client_valid_moves.is_empty() && client_is_in_check {
+				GameStatusCode::Checkmate
+			} else if client_valid_moves.is_empty() {
 				GameStatusCode::Stalemate
 			} else {
-				// Choose move: prefer endgame-forcing moves if game is dragging
-				// Always prefer captures to simplify the board (more aggressive)
-				// Use move_count as deterministic seed for reproducible fuzzing
-				let server_move = if game_state.should_force_endgame(move_count) || game_state.count_pieces() > 12 {
-					// Score moves and pick from top-scoring moves
-					let mut scored_moves: Vec<(u32, (u8, u8, u8, u8))> = valid_moves
-						.iter()
-						.map(|&m| {
-							let score = game_state.evaluate_move_for_endgame(
-								m.0, m.1, m.2, m.3, is_server_white_turn,
-							);
-							(score, m)
-						})
-						.collect();
-					// Sort by score (descending) and pick from top 25% or at least top 3
-					scored_moves.sort_by(|a, b| b.0.cmp(&a.0));
-					let top_count = (scored_moves.len() / 4).max(3).min(scored_moves.len());
-					let top_moves: Vec<_> = scored_moves.iter().take(top_count).map(|(_, m)| *m).collect();
-					// Deterministic selection based on move_count for reproducible fuzzing
-					let index = (move_count as usize) % top_moves.len();
-					top_moves[index]
-				} else {
-					// Deterministic selection based on move_count for reproducible fuzzing
-					let index = (move_count as usize) % valid_moves.len();
-					valid_moves[index]
-				};
-
-				// Make the server move (track captures)
-				game_state.make_move_with_count(
-					server_move.0,
-					server_move.1,
-					server_move.2,
-					server_move.3,
-					move_count + 1,
-				);
-
-				trace.event("server_move_generated");
-
-				if let Some(kind) = piece_kind_for_move(&game_state, server_move.0, server_move.1) {
-					trace.event(kind);
-				}
-
-				// Check again after server move (increment move count for server move)
-				let server_move_count = move_count + 1;
-				if game_state.is_checkmate(is_server_white_turn, server_move_count) {
-					GameStatusCode::Checkmate
-				} else if game_state.is_stalemate(is_server_white_turn, server_move_count) {
-					GameStatusCode::Stalemate
-				} else {
-					GameStatusCode::InProgress
-				}
+				GameStatusCode::InProgress
 			}
 		};
 
@@ -226,9 +227,7 @@ servlet! {
 		// Return response with game status and updated board state in matrix
 		// Increment order for next move (monotonically incrementing)
 		let response = ChessMoveResponse { game_status };
-		let updated_matrix = tightbeam::Asn1Matrix::from(&*game_state);
-		// Convert Asn1Matrix to MatrixDyn
-		let matrix_dyn = tightbeam::matrix::MatrixDyn::try_from(updated_matrix)?;
+		let matrix = tightbeam::matrix::MatrixDyn::try_from(&*game_state)?;
 
 		trace.event("server_response_emitted");
 
@@ -236,7 +235,7 @@ servlet! {
 			V0: id: message_id,
 			order: move_count + 1,
 			message: response,
-			matrix: matrix_dyn
+			matrix: matrix
 		}?))
 	}
 }

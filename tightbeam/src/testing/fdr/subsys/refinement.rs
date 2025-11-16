@@ -97,6 +97,99 @@ where
 		}
 	}
 
+	/// Extract trace from a linear process (single deterministic path)
+	/// Returns None if the process is not linear (has branching)
+	fn extract_linear_trace(process: &Process, max_depth: usize) -> Option<Trace> {
+		let mut trace = Vec::new();
+		let mut current_state = process.initial;
+		let mut visited_states = HashSet::new();
+		visited_states.insert(current_state);
+
+		loop {
+			// Check if we've reached a terminal state
+			if process.terminal.contains(&current_state) {
+				return Some(trace);
+			}
+
+			// Check depth limit
+			if trace.len() >= max_depth {
+				return None; // Not linear if we hit depth limit
+			}
+
+			// Check for cycles
+			if visited_states.len() > 1000 {
+				return None; // Likely not linear if we've visited many states
+			}
+
+			// First, follow any τ-transitions (hidden events) - they don't extend the trace
+			// Process all τ-transitions in sequence until we reach a state with no τ-transitions
+			let mut has_tau_transitions = true;
+			while has_tau_transitions {
+				has_tau_transitions = false;
+				let current_enabled = process.enabled(current_state);
+				for action in &current_enabled {
+					if process.hidden.contains(&action.event) {
+						let next_states = process.step(current_state, &action.event);
+						if next_states.len() != 1 {
+							return None; // Non-deterministic τ-transition
+						}
+						current_state = next_states[0];
+
+						// Check for cycles
+						if !visited_states.insert(current_state) {
+							return None; // Cycle detected
+						}
+
+						has_tau_transitions = true;
+						break; // Restart check from new state
+					}
+				}
+
+				// Check terminal after τ-transitions
+				if process.terminal.contains(&current_state) {
+					return Some(trace);
+				}
+			}
+
+			// Now check for observable actions at the stable state
+			let stable_enabled = process.enabled(current_state);
+			let observable_actions: Vec<_> = stable_enabled
+				.iter()
+				.filter(|action| !process.hidden.contains(&action.event))
+				.collect();
+
+			// Linear process: at most one observable action
+			if observable_actions.len() > 1 {
+				return None; // Not linear - has branching in observable events
+			}
+
+			// If we have an observable action, follow it
+			if let Some(action) = observable_actions.first() {
+				let next_states = process.step(current_state, &action.event);
+
+				// Linear process must have exactly one next state
+				if next_states.len() != 1 {
+					return None; // Not linear - has non-determinism
+				}
+
+				// Add event to trace
+				trace.push(action.event.clone());
+				current_state = next_states[0];
+
+				// Check for cycles
+				if !visited_states.insert(current_state) {
+					return None; // Cycle detected - not a simple linear trace
+				}
+			} else {
+				// No enabled actions - deadlock or terminal state
+				if process.terminal.contains(&current_state) {
+					return Some(trace);
+				}
+				return None; // Deadlock - not a valid linear trace
+			}
+		}
+	}
+
 	/// Generic BFS helper for trace and failure computation
 	fn bfs_with_callbacks<T, FState, FTransition>(
 		&self,
@@ -187,12 +280,18 @@ where
 				return true;
 			}
 
-			// Process observable events first
+			// Process observable events first (matching the next event in target trace)
 			let next_event = &target_trace[trace_idx];
 			let enabled_actions = spec.enabled(state);
 			for action in &enabled_actions {
+				if timeout_checker.is_expired() {
+					return false;
+				}
 				if &action.event == next_event {
 					for next_state in spec.step(state, &action.event) {
+						if timeout_checker.is_expired() {
+							return false;
+						}
 						if queue.len() >= max_queue_size || visited.len() >= max_visited {
 							break;
 						}
@@ -201,10 +300,22 @@ where
 				}
 			}
 
-			// Explore τ-transitions
+			// Explore τ-transitions (limit exploration to avoid state explosion)
+			let mut tau_count = 0;
+			const MAX_TAU_PER_STATE: usize = 10; // Limit τ-transition exploration
 			for action in &enabled_actions {
+				if timeout_checker.is_expired() {
+					return false;
+				}
 				if spec.hidden.contains(&action.event) {
+					if tau_count >= MAX_TAU_PER_STATE {
+						break; // Limit τ-transition exploration
+					}
+					tau_count += 1;
 					for next_state in spec.step(state, &action.event) {
+						if timeout_checker.is_expired() {
+							return false;
+						}
 						if queue.len() >= max_queue_size || visited.len() >= max_visited {
 							break;
 						}
@@ -289,6 +400,13 @@ where
 	fn compute_traces(&mut self, process: &Process, max_depth: usize) -> HashSet<Trace> {
 		if let Some(cached) = self.cache.borrow().get_cached_traces(process.name) {
 			return cached.into_iter().collect();
+		}
+
+		// Fast path: For linear trace processes, extract trace directly
+		if let Some(linear_trace) = Self::extract_linear_trace(process, max_depth) {
+			let mut traces = HashSet::new();
+			traces.insert(linear_trace);
+			return traces;
 		}
 
 		let timeout_checker = TimeoutChecker::new(self.config.timeout_ms);
