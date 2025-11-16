@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::state::ChessGameState;
-use super::utils::{is_white_turn, GAME_STATE};
+use super::utils::is_white_turn;
 use tightbeam::der::Enumerated;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{compose, decode, servlet, Beamable, Sequence};
@@ -66,12 +66,10 @@ servlet! {
 		game_state: Arc<Mutex<ChessGameState>>,
 	},
 	handle: |message, trace, config| async move {
+		trace.event("server_move_received");
 		// Decode ChessMoveRequest from message
 		let move_req: ChessMoveRequest = match decode(&message.message) {
-			Ok(req) => {
-				trace.event("server_move_received");
-				req
-			}
+			Ok(req) => req,
 			Err(_) => {
 				trace.event("server_decode_failure");
 				trace.event("server_response_emitted");

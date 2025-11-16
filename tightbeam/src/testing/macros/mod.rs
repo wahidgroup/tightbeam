@@ -2156,6 +2156,11 @@ macro_rules! tb_scenario {
 					servlet_guard.as_ref().unwrap().clone()
 				};
 
+				{
+					let servlet_guard = servlet.lock().unwrap();
+					servlet_guard.set_trace(trace_server.clone());
+				}
+
 				// Reset servlet state before each iteration
 				// For chess servlet: calls reset_chess_game_state() function
 				// Note: reset_chess_game_state() must be defined at module level in test file

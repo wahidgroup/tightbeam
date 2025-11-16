@@ -16,6 +16,13 @@ macro_rules! __tightbeam_servlet_common_methods {
 		}
 
 		#[allow(dead_code)]
+		pub fn set_trace(&self, trace: $crate::trace::TraceCollector) {
+			if let Ok(mut guard) = self.trace_handle.lock() {
+				*guard = trace;
+			}
+		}
+
+		#[allow(dead_code)]
 		pub fn stop(mut self) {
 			if let Some(handle) = self.server_handle.take() {
 				$crate::colony::servlet_runtime::rt::abort(handle);
@@ -40,6 +47,12 @@ macro_rules! __tightbeam_servlet_common_methods {
 		#[allow(dead_code)]
 		pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
 			self.addr.clone()
+		}
+
+		pub fn set_trace(&self, trace: $crate::trace::TraceCollector) {
+			if let Ok(mut guard) = self.trace_handle.lock() {
+				*guard = trace;
+			}
 		}
 
 		pub fn stop(mut self) {
@@ -701,6 +714,7 @@ macro_rules! servlet {
 			server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 			server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 		}
 	};
 
@@ -710,6 +724,7 @@ macro_rules! servlet {
 			server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 			server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 		}
 	};
 	(@impl_struct_with_attrs $worker_name:ident, $protocol:path, { $($config_field:ident: $config_type:ty,)* }, pub, [$(#[$meta:meta])*]) => {
@@ -719,6 +734,7 @@ macro_rules! servlet {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 			}
 
 			#[derive(Clone)]
@@ -734,6 +750,7 @@ macro_rules! servlet {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 			}
 
 			#[derive(Clone)]
@@ -751,6 +768,7 @@ macro_rules! servlet {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 				#[allow(dead_code)]
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
@@ -776,6 +794,7 @@ macro_rules! servlet {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 				#[allow(dead_code)]
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
@@ -803,10 +822,15 @@ macro_rules! servlet {
 			impl $worker_name {
 				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
-						$protocol, listener, [$($policy_key: $policy_val),*], trace, $router, config,
+						$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(), $router, config,
 						(|$message: $crate::Frame, $trace_param, $router_param, $config_param| async move { $handler_body }));
-					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr, trace_handle })
 				}
 
 				servlet!(@common_methods $protocol);
@@ -822,10 +846,11 @@ macro_rules! servlet {
 		impl $worker_name {
 			pub async fn start(trace: $crate::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
 				servlet!(@setup_protocol $protocol, listener, addr);
+				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 				let (server_handle, server_pool_handles) = servlet!(@build_server
-					$protocol, listener, [$($policy_key: $policy_val),*], trace, $router,
+					$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(), $router,
 					(|$message: $crate::Frame, $trace_param, $router_param| async move { $handler_body }));
-				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr, trace_handle })
 			}
 
 			servlet!(@common_methods $protocol);
@@ -841,10 +866,11 @@ macro_rules! servlet {
 			impl $worker_name {
 				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
-						$protocol, listener, [$($policy_key: $policy_val),*], trace, config,
+						$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(), config,
 						(|$message: $crate::Frame, $trace_param, $config_param| async move { $handler_body }));
-					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr, trace_handle })
 				}
 
 				servlet!(@common_methods $protocol);
@@ -861,6 +887,11 @@ macro_rules! servlet {
 			impl $worker_name {
 				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
 					servlet!(@setup_protocol $protocol, listener, addr);
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 
 					// Run init block - must return Result<(), TightBeamError>
 					let $init_config = &config;
@@ -868,9 +899,9 @@ macro_rules! servlet {
 					init_result?;
 
 					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
-						$protocol, listener, [$($policy_key: $policy_val),*], trace, config,
+						$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(), config,
 						(|$message: $crate::Frame, $trace_param, $config_param| async move { $handler_body }));
-					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr, trace_handle })
 				}
 
 				servlet!(@common_methods $protocol);
@@ -886,10 +917,11 @@ macro_rules! servlet {
 		impl $worker_name {
 			pub async fn start(assertions: $crate::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
 				servlet!(@setup_protocol $protocol, listener, addr);
+				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(assertions));
 				let (server_handle, server_pool_handles) = servlet!(@build_server_with_assertions
-					$protocol, listener, [$($policy_key: $policy_val),*], assertions,
+					$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(),
 					(|$message: $crate::Frame, $trace| async move { $handler_body }));
-				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr, trace_handle })
 			}
 
 			servlet!(@common_methods $protocol);
@@ -904,10 +936,11 @@ macro_rules! servlet {
 		impl $worker_name {
 			pub async fn start(assertions: $crate::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
 				servlet!(@setup_protocol $protocol, listener, addr);
+				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(assertions));
 				let (server_handle, server_pool_handles) = servlet!(@build_server_with_assertions
-					$protocol, listener, [$($policy_key: $policy_val),*], assertions,
+					$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(),
 					(|$message: $crate::Frame, $trace| async move { $handler_body }));
-				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr, trace_handle })
 			}
 
 			servlet!(@common_methods $protocol);
@@ -922,10 +955,11 @@ macro_rules! servlet {
 		impl $worker_name {
 			pub async fn start(trace: $crate::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
 				servlet!(@setup_protocol $protocol, listener, addr);
+				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 				let (server_handle, server_pool_handles) = servlet!(@build_server
-					$protocol, listener, [$($policy_key: $policy_val),*], trace,
+					$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(),
 					(|$message: $crate::Frame, $trace_param| async move { $handler_body }));
-				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr })
+				Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr, trace_handle })
 			}
 
 			servlet!(@common_methods $protocol);
@@ -1087,6 +1121,7 @@ macro_rules! servlet {
 				server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				server_pool_handles: Vec<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 				#[allow(dead_code)]
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
@@ -1123,6 +1158,7 @@ macro_rules! servlet {
 			impl $worker_name {
 				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 
 					let $worker_config = &config;
 					$(
@@ -1137,7 +1173,7 @@ macro_rules! servlet {
 					let workers = ::std::sync::Arc::new(workers_val);
 
 					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config_and_workers
-						$protocol, listener, [$($policy_key: $policy_val),*], trace, config, workers.clone(),
+						$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(), config, workers.clone(),
 					(|$message: $crate::Frame, $trace_param, $config_param, $workers_param| async move { $handler_body }));
 
 					Ok(Self {
@@ -1145,6 +1181,7 @@ macro_rules! servlet {
 						server_pool_handles,
 						addr,
 						workers,
+						trace_handle,
 					})
 				}
 
@@ -1163,6 +1200,7 @@ macro_rules! servlet {
 			impl $worker_name {
 				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
 					servlet!(@setup_protocol $protocol, listener, addr);
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 
 					// Run init block - must return Result<(), TightBeamError>
 					let $init_config = &config;
@@ -1180,7 +1218,7 @@ macro_rules! servlet {
 					let workers = ::std::sync::Arc::new(workers);
 
 					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config_and_workers
-						$protocol, listener, [$($policy_key: $policy_val),*], trace, config, workers.clone(),
+						$protocol, listener, [$($policy_key: $policy_val),*], trace_handle.clone(), config, workers.clone(),
 						(|$message: $crate::Frame, $trace_param, $config_param, $workers_param| async move { $handler_body }));
 
 					Ok(Self {
@@ -1188,6 +1226,7 @@ macro_rules! servlet {
 						server_pool_handles,
 						addr,
 						workers,
+						trace_handle,
 					})
 				}
 
@@ -1203,15 +1242,16 @@ macro_rules! servlet {
 		{
 			let config_arc = ::std::sync::Arc::new($config);
 			let workers_arc = $workers;
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				assertions: $trace.clone(),
-				handle: move |$msg, trace| {
+				handle: move |$msg| {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
+					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace.clone();
+					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
 					let $config_param = &config_arc;
 					let $workers_param = &workers_arc;
 					$body
@@ -1227,14 +1267,15 @@ macro_rules! servlet {
 		{
 			let config_arc = ::std::sync::Arc::new($config);
 			let workers_arc = $workers;
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				assertions: $trace.clone(),
-				handle: move |$msg, trace| {
+				handle: move |$msg| {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
+					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace.clone();
+					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
 					let $config_param = &config_arc;
 					let $workers_param = &workers_arc;
 					$body
@@ -1306,15 +1347,16 @@ macro_rules! servlet {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
 			let config_arc = ::std::sync::Arc::new($config);
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				assertions: $trace.clone(),
-				handle: move |$msg, trace| {
+				handle: move |$msg| {
 					let router_arc = router_arc.clone();
 					let config_arc = config_arc.clone();
+					let trace_handle = trace_handle.clone();
 					async move {
-						let $trace_param = trace.clone();
+						let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
 						let $router_param = &router_arc;
 						let $config_param = &config_arc;
 						$body
@@ -1330,14 +1372,15 @@ macro_rules! servlet {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
 			let config_arc = ::std::sync::Arc::new($config);
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				assertions: $trace.clone(),
-				handle: move |$msg, trace| {
+				handle: move |$msg| {
 					let router_arc = router_arc.clone();
 					let config_arc = config_arc.clone();
+					let trace_handle = trace_handle.clone();
 					async move {
-						let $trace_param = trace.clone();
+						let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
 						let $router_param = &router_arc;
 						let $config_param = &config_arc;
 						$body
@@ -1352,14 +1395,15 @@ macro_rules! servlet {
 	(@build_server_config_only $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $trace:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident| async move $body:block)) => {
 		{
 			let config_arc = ::std::sync::Arc::new($config);
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				assertions: $trace.clone(),
-				handle: move |$msg, trace| {
+				handle: move |$msg| {
 					let config_arc = config_arc.clone();
+					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace.clone();
+					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
 					let $config_param = &config_arc;
 					$body
 				}
@@ -1373,13 +1417,14 @@ macro_rules! servlet {
 	(@build_server_config_only $protocol:path, $listener:ident, [], $trace:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident| async move $body:block)) => {
 		{
 			let config_arc = ::std::sync::Arc::new($config);
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				assertions: $trace.clone(),
-				handle: move |$msg, trace| {
+				handle: move |$msg| {
 					let config_arc = config_arc.clone();
+					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace.clone();
+					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
 					let $config_param = &config_arc;
 					$body
 				}
@@ -1393,17 +1438,18 @@ macro_rules! servlet {
 	(@build_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $trace:expr, $router:expr, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $router_param:ident| async move $body:block)) => {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
-				assertions: $trace.clone(),
-				handle: move |$msg, trace| {
+				handle: move |$msg| {
 					let router_arc = router_arc.clone();
-					async move {
-						let $trace_param = trace.clone();
-						let $router_param = &router_arc;
-						$body
-					}
+					let trace_handle = trace_handle.clone();
+				async move {
+					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+					let $router_param = &router_arc;
+					$body
+				}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1414,16 +1460,17 @@ macro_rules! servlet {
 	(@build_server $protocol:path, $listener:ident, [], $trace:expr, $router:expr, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $router_param:ident| async move $body:block)) => {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				assertions: $trace.clone(),
-				handle: move |$msg, trace| {
+				handle: move |$msg| {
 					let router_arc = router_arc.clone();
-					async move {
-						let $trace_param = trace.clone();
-						let $router_param = &router_arc;
-						$body
-					}
+					let trace_handle = trace_handle.clone();
+				async move {
+					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+					let $router_param = &router_arc;
+					$body
+				}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1431,15 +1478,16 @@ macro_rules! servlet {
 	};
 
 	// Build server with assertions (non-empty policies)
-	// Note: server! macro doesn't support both policies and assertions, so we drop policies for assertions
 	(@build_server_with_assertions $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $assertions:expr, (|$msg:ident: $msg_ty:ty, $trace:ident| async move $body:block)) => {
 		{
+			let trace_handle = $assertions;
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				assertions: $assertions,
-				handle: move |$msg, $trace| {
+				policies: { $($policy_key: $policy_val),* },
+				handle: move |$msg: $crate::Frame| {
+					let trace_handle = trace_handle.clone();
 					async move {
-						// Handler body already returns Result<Option<Frame>>
+						let $trace = trace_handle.lock().expect("trace poisoned").clone();
 						$body
 					}
 				}
@@ -1452,12 +1500,13 @@ macro_rules! servlet {
 	// Build server with assertions (empty policies)
 	(@build_server_with_assertions $protocol:path, $listener:ident, [], $assertions:expr, (|$msg:ident: $msg_ty:ty, $trace:ident| async move $body:block)) => {
 		{
+			let trace_handle = $assertions;
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
-				assertions: $assertions,
-				handle: move |$msg, $trace| {
+				handle: move |$msg: $crate::Frame| {
+					let trace_handle = trace_handle.clone();
 					async move {
-						// Handler body already returns Result<Option<Frame>>
+						let $trace = trace_handle.lock().expect("trace poisoned").clone();
 						$body
 					}
 				}
@@ -1472,14 +1521,14 @@ macro_rules! servlet {
 		{
 			// For now, return empty pool - the server macro spawns tasks per connection
 			// which already provides concurrency
-			let trace_arc = $trace.clone();
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),* },
 				handle: move |$msg: $crate::Frame| {
-					let trace_arc = trace_arc.clone();
+					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace_arc.clone();
+					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
 					$body
 				}
 				}
@@ -1494,13 +1543,13 @@ macro_rules! servlet {
 		{
 			// For now, return empty pool - the server macro spawns tasks per connection
 			// which already provides concurrency
-			let trace_arc = $trace.clone();
+			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
 				handle: move |$msg: $crate::Frame| {
-					let trace_arc = trace_arc.clone();
+					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace_arc.clone();
+					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
 					$body
 				}
 				}

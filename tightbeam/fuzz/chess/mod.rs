@@ -18,7 +18,6 @@
 //! cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/fuzz_chess
 //! ```
 
-#![allow(unused_imports)]
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "full"))]
 
@@ -80,10 +79,14 @@ tb_process_spec! {
 	pub ChessGameFlow,
 	events {
 		observable {
-			"client_move_sent",  "client_move_rejected",  "client_move_validated", "client_server_move",
-			"client_game_ended", "client_game_restarted", "client_no_response",    "client_decode_error",
-			"client_moves_processed_balance", "client_server_move_balance", "client_game_restart_balance",
-			"errors_within_limit", "rejection_ratio"
+			"client_move_sent", "client_move_rejected", "client_move_validated",
+			"client_server_move", "client_game_ended", "client_game_restarted",
+			"client_no_response", "client_decode_error", "client_moves_processed_balance",
+			"client_server_move_balance", "client_game_restart_balance",
+			"errors_within_limit", "rejection_ratio",
+			"server_move_received", "server_move_validated", "server_move_generated",
+			"server_move_invalid", "server_response_emitted", "server_decode_failure",
+			"server_state_lock_poisoned", "server_game_ended"
 		}
 		hidden { }
 	}
@@ -94,24 +97,36 @@ tb_process_spec! {
 			"client_moves_processed_balance"  => WaitingForMove,
 			"client_server_move_balance"      => WaitingForMove,
 			"client_game_restart_balance"     => WaitingForMove,
-			"errors_within_limit"      => WaitingForMove,
-			"rejection_ratio"          => WaitingForMove,
+			"errors_within_limit"             => WaitingForMove,
+			"rejection_ratio"                 => WaitingForMove,
 		},
 		ValidatingMove => {
-			"client_move_validated" => ProcessingMove,
-			"client_move_rejected"  => WaitingForMove,
-			"client_no_response"    => WaitingForMove,
-			"client_decode_error"   => WaitingForMove
+			"client_move_validated"       => ProcessingMove,
+			"client_move_rejected"        => WaitingForMove,
+			"client_no_response"          => WaitingForMove,
+			"client_decode_error"         => WaitingForMove,
+			"server_move_received"        => ValidatingMove,
+			"server_move_validated"       => ValidatingMove,
+			"server_move_generated"       => ValidatingMove,
+			"server_move_invalid"         => ValidatingMove,
+			"server_response_emitted"     => ValidatingMove,
+			"server_decode_failure"       => ValidatingMove,
+			"server_state_lock_poisoned"  => ValidatingMove,
+			"server_game_ended"           => ValidatingMove,
 		},
 		ProcessingMove => {
-			"client_server_move"    => WaitingForMove,
-			"client_game_ended"     => GameOver,
-			"client_move_validated" => ProcessingMove,
+			"client_server_move"       => WaitingForMove,
+			"client_game_ended"        => GameOver,
+			"client_move_validated"    => ProcessingMove,
+			"server_move_validated"    => ProcessingMove,
+			"server_move_generated"    => ProcessingMove,
+			"server_response_emitted"  => ProcessingMove,
+			"server_game_ended"        => ProcessingMove,
 		},
 		GameOver => {
-			"client_game_restarted" => WaitingForMove,
-			"client_server_move"    => GameOver,
-			"client_move_validated" => GameOver,
+			"client_game_restarted"  => WaitingForMove,
+			"client_server_move"     => GameOver,
+			"client_move_validated"  => GameOver,
 		}
 	}
 	terminal { GameOver }
