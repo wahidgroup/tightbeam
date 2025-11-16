@@ -428,7 +428,15 @@ impl ChessGameState {
 		let mut current_row = from_row as i8 + row_step;
 		let mut current_col = from_col as i8 + col_step;
 		while current_row != to_row as i8 || current_col != to_col as i8 {
-			if piece::Piece::from_u8(self.board.get(current_row as u8, current_col as u8)).is_some() {
+			// Use safe coordinate conversion to prevent out-of-bounds access
+			let Some(cr) = Self::to_valid_coord(current_row) else {
+				return false; // Out of bounds - path not clear
+			};
+			let Some(cc) = Self::to_valid_coord(current_col) else {
+				return false; // Out of bounds - path not clear
+			};
+
+			if piece::Piece::from_u8(self.board.get(cr, cc)).is_some() {
 				return false; // Path blocked
 			}
 			current_row += row_step;
@@ -630,8 +638,13 @@ impl ChessGameState {
 		let mut current_row = from_row as i8 + row_step;
 		let mut current_col = from_col as i8 + col_step;
 		while current_row != to_row as i8 || current_col != to_col as i8 {
-			let cr = current_row as u8;
-			let cc = current_col as u8;
+			// Use safe coordinate conversion to prevent out-of-bounds access
+			let Some(cr) = Self::to_valid_coord(current_row) else {
+				return false; // Out of bounds - path not clear
+			};
+			let Some(cc) = Self::to_valid_coord(current_col) else {
+				return false; // Out of bounds - path not clear
+			};
 
 			// Determine what piece is actually on this square (accounting for the move)
 			let piece_opt = if cr == move_from_row && cc == move_from_col {
