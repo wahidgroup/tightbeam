@@ -1,28 +1,16 @@
-//! Chess Engine Fuzz Test with FDR Integration
-//!
-//! Comprehensive fuzz target demonstrating tightbeam's full capabilities:
+//! Chess Engine Fuzz Test
 //! - ChessEngine servlet handling moves and game state
 //! - Matrix<8> storing chess board state (8x8 grid)
-//! - Mutual authentication between client and server
 //! - Layered CSP specs (high-level flow + detailed chess rules)
-//! - FDR refinement checking for valid game flows
 //! - AFL fuzzing with invalid move testing
-//!
-//! ## Usage
-//!
-//! ```sh
-//! cargo install cargo-afl
-//! RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_chess \
-//!   --features "std,testing-fuzz,testing-fdr,testing-csp"
-//! mkdir -p fuzz_in && echo "seed" > fuzz_in/seed.txt
-//! cargo afl fuzz -i fuzz_in -o fuzz_out target/debug/fuzz_chess
-//! ```
 
 #![allow(unused_imports)]
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "full"))]
 
 mod board;
+mod constants;
+mod r#move;
 mod piece;
 mod state;
 mod utils;
@@ -32,9 +20,12 @@ use std::sync::{Arc, Mutex};
 use tightbeam::matrix::MatrixLike;
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-use board::{ChessEngineServlet, ChessEngineServletConf, ChessMoveRequest, ChessMoveResponse, GameStatusCode};
+use board::{
+	ChessEngineServlet, ChessEngineServletConf, ChessMatchManager, ChessMoveRequest, ChessMoveResponse, GameStatusCode,
+};
+use r#move::ChessMove;
 use state::ChessGameState;
-use utils::{reset_chess_game_state, restart_game};
+use utils::restart_game;
 
 // ============================================================================
 // ASSERTION SPEC
@@ -46,8 +37,6 @@ tb_assert_spec! {
 	/// Tests chess game behavior:
 	/// - Ensures moves are sent and the system processes them
 	/// - Validates that validated moves trigger server responses
-	/// - Ensures reasonable ratio of validated vs rejected moves
-	/// - Bounds error conditions to detect system failures
 	pub ChessAssertSpec,
 	V(1,0,0): {
 		mode: Accept,
@@ -159,33 +148,37 @@ tb_scenario! {
 	environment Servlet {
 		servlet: ChessEngineServlet,
 		start: |trace| async move {
-			let config = ChessEngineServletConf {
-				game_state: Arc::new(Mutex::new(ChessGameState::new())),
-			};
+			let config = Arc::new(ChessEngineServletConf {
+				manager: ChessMatchManager::new(),
+			});
 
 			ChessEngineServlet::start(trace, config).await
 		},
 		client: |trace, mut client| async move {
+			#[derive(Default)]
+			struct GameStats {
+				move_sent_count: u64,
+				move_validated_count: u64,
+				move_rejected_count: u64,
+				server_move_count: u64,
+				game_ended_count: u64,
+				game_restarted_count: u64,
+				no_response_count: u64,
+				decode_error_count: u64,
+			}
+
 			// Initialize client-side game state
 			let mut client_game_state = ChessGameState::new();
+			let mut stats = GameStats::default();
 			let mut order = 1u64;
 
 			const MAX_TOTAL_MOVES: u64 = 50;
 			const MAX_GAME_REPLAYS: u64 = 3;
 
-			let mut move_validated_count = 0u64;
-			let mut move_rejected_count = 0u64;
-			let mut server_move_count = 0u64;
-			let mut game_ended_count = 0u64;
-			let mut game_restarted_count = 0u64;
-			let mut no_response_count = 0u64;
-			let mut decode_error_count = 0u64;
-
 			// Continuous: Play multiple games until input bytes are exhausted
 			// This maximizes state exploration across different game scenarios
-			let mut move_sent_count = 0u64;
 			loop {
-				if move_sent_count >= MAX_TOTAL_MOVES || game_restarted_count >= MAX_GAME_REPLAYS {
+				if stats.move_sent_count >= MAX_TOTAL_MOVES || stats.game_restarted_count >= MAX_GAME_REPLAYS {
 					break;
 				}
 
@@ -202,21 +195,20 @@ tb_scenario! {
 					trace.oracle().fuzz_u8(),
 					trace.oracle().fuzz_u8(),
 				) {
-					(Ok(fr), Ok(fc), Ok(tr), Ok(tc)) => ChessMoveRequest {
-						from_row: fr % 8,
-						from_col: fc % 8,
-						to_row: tr % 8,
-						to_col: tc % 8,
+					(Ok(fr), Ok(fc), Ok(tr), Ok(tc)) => {
+						// Generate move from fuzz bytes (no validation - we want to test invalid moves too)
+						ChessMove::from((fr, fc, tr, tc)).to_request()
 					},
 					_ => break, // Should not happen if fuzz_has_bytes was true
 				};
 
 				trace.event("client_move_sent");
+				stats.move_sent_count += 1;
 
-				if let Some(kind) = piece::kind_label(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
-					trace.event(kind);
+				// Emit piece kind event only after move is sent (not before validation)
+				if let Some(piece) = piece::Piece::from_u8(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
+					trace.event(piece.to_kind_label());
 				}
-				move_sent_count += 1;
 
 				// Send move request to server with current board state in matrix
 				let matrix = tightbeam::matrix::MatrixDyn::try_from(&client_game_state)?;
@@ -232,7 +224,7 @@ tb_scenario! {
 					Some(frame) => frame,
 					None => {
 						trace.event("client_no_response");
-						no_response_count += 1;
+						stats.no_response_count += 1;
 						break;
 					}
 				};
@@ -242,15 +234,16 @@ tb_scenario! {
 					Ok(r) => r,
 					Err(_) => {
 						trace.event("client_decode_error");
-						decode_error_count += 1;
+						stats.decode_error_count += 1;
 						break;
 					}
 				};
 
 				// Update client game state from response matrix if present
+				// Only update board, preserve client's own move tracking
 				if let Some(ref asn1_matrix) = response_frame.metadata.matrix {
-					if let Ok(updated_state) = ChessGameState::try_from(asn1_matrix) {
-						*client_game_state.board_mut() = updated_state.board().clone();
+					if client_game_state.update_board_from_matrix(asn1_matrix).is_err() {
+						// Invalid matrix format - ignore and continue
 					}
 				}
 
@@ -258,23 +251,27 @@ tb_scenario! {
 				match response.game_status {
 					GameStatusCode::InvalidMove => {
 						trace.event("client_move_rejected");
-						move_rejected_count += 1;
+						stats.move_rejected_count += 1;
 						// Continue to next move even if invalid
 					}
 					GameStatusCode::InProgress => {
 						trace.event("client_move_validated");
 						trace.event("client_server_move");
-						move_validated_count += 1;
-						server_move_count += 1;
+						stats.move_validated_count += 1;
+						stats.server_move_count += 1;
 						order += 2; // Client move + server move
 					}
 					GameStatusCode::Checkmate | GameStatusCode::Stalemate => {
+						// Move was validated (we got a response), emit events
+						trace.event("client_move_validated");
+						trace.event("client_server_move");
+						stats.move_validated_count += 1;
+						stats.server_move_count += 1;
+						stats.game_ended_count += 1;
+						stats.game_restarted_count += 1;
+
 						restart_game(&mut client_game_state, &mut order, &trace);
-						move_validated_count += 1;
-						server_move_count += 1;
-						game_ended_count += 1;
-						game_restarted_count += 1;
-						if game_restarted_count >= MAX_GAME_REPLAYS {
+						if stats.game_restarted_count >= MAX_GAME_REPLAYS {
 							break;
 						}
 						// Continue loop to play another game
@@ -282,10 +279,13 @@ tb_scenario! {
 				}
 			}
 
-			let processed_moves = move_validated_count + move_rejected_count + no_response_count + decode_error_count;
-			let moves_processed_balance = (move_sent_count as i64) - (processed_moves as i64);
-			let server_move_balance = (move_validated_count as i64) - (server_move_count as i64);
-			let game_restart_balance = (game_restarted_count as i64) - (game_ended_count as i64);
+			let processed_moves = stats.move_validated_count
+				+ stats.move_rejected_count
+				+ stats.no_response_count
+				+ stats.decode_error_count;
+			let moves_processed_balance = (stats.move_sent_count as i64) - (processed_moves as i64);
+			let server_move_balance = (stats.move_validated_count as i64) - (stats.server_move_count as i64);
+			let game_restart_balance = (stats.game_restarted_count as i64) - (stats.game_ended_count as i64);
 			trace.event_with("client_moves_processed_balance", &["balance"], moves_processed_balance);
 			trace.event_with("client_server_move_balance", &["balance"], server_move_balance);
 			trace.event_with("client_game_restart_balance", &["lifecycle"], game_restart_balance);

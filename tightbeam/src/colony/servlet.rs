@@ -737,7 +737,6 @@ macro_rules! servlet {
 				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 			}
 
-			#[derive(Clone)]
 			pub struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -753,7 +752,6 @@ macro_rules! servlet {
 				trace_handle: ::std::sync::Arc<::std::sync::Mutex<$crate::trace::TraceCollector>>,
 			}
 
-			#[derive(Clone)]
 			struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -773,7 +771,6 @@ macro_rules! servlet {
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
 
-			#[derive(Clone)]
 			pub struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -799,7 +796,6 @@ macro_rules! servlet {
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
 
-			#[derive(Clone)]
 			struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -820,7 +816,7 @@ macro_rules! servlet {
 				|$message:ident, $router_param:ident, $config_param:ident| $handler_body:expr) => {
 		$crate::paste::paste! {
 			impl $worker_name {
-				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
+				pub async fn start(trace: $crate::trace::TraceCollector, config: ::std::sync::Arc<[<$worker_name Conf>]>) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
@@ -864,7 +860,7 @@ macro_rules! servlet {
 				   |$message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr) => {
 		$crate::paste::paste! {
 			impl $worker_name {
-				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
+				pub async fn start(trace: $crate::trace::TraceCollector, config: ::std::sync::Arc<[<$worker_name Conf>]>) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
@@ -885,7 +881,7 @@ macro_rules! servlet {
 				   |$message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr, $init_config:ident, $init_body:expr) => {
 		$crate::paste::paste! {
 			impl $worker_name {
-				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
+				pub async fn start(trace: $crate::trace::TraceCollector, config: ::std::sync::Arc<[<$worker_name Conf>]>) -> $crate::error::Result<Self> {
 					servlet!(@setup_protocol $protocol, listener, addr);
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
@@ -894,7 +890,7 @@ macro_rules! servlet {
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 
 					// Run init block - must return Result<(), TightBeamError>
-					let $init_config = &config;
+					let $init_config = &*config;
 					let init_result: core::result::Result<(), $crate::TightBeamError> = (|| $init_body)();
 					init_result?;
 
@@ -1025,7 +1021,7 @@ macro_rules! servlet {
 		$crate::paste::paste! {
 			// For servlets without workers, use () as input type
 			impl $crate::colony::Servlet<()> for $worker_name {
-				type Conf = [<$worker_name Conf>];
+				type Conf = ::std::sync::Arc<[<$worker_name Conf>]>;
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
 				async fn start(trace: $crate::trace::TraceCollector, config: Option<Self::Conf>) -> $crate::error::Result<Self> {
@@ -1053,7 +1049,7 @@ macro_rules! servlet {
 	(@impl_trait_with_input $worker_name:ident, $protocol:path, $input:ty, { $($config_field:ident: $config_type:ty,)* }) => {
 		$crate::paste::paste! {
 			impl $crate::colony::Servlet<$input> for $worker_name {
-				type Conf = [<$worker_name Conf>];
+				type Conf = ::std::sync::Arc<[<$worker_name Conf>]>;
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
 				async fn start(trace: $crate::trace::TraceCollector, config: Option<Self::Conf>) -> $crate::error::Result<Self> {
@@ -1126,7 +1122,6 @@ macro_rules! servlet {
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
 
-			#[derive(Clone)]
 			pub struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -1156,11 +1151,11 @@ macro_rules! servlet {
 		|$message:ident, $trace_param:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $input:ty) => {
 		$crate::paste::paste! {
 			impl $worker_name {
-				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> Result<Self, $crate::TightBeamError> {
+				pub async fn start(trace: $crate::trace::TraceCollector, config: ::std::sync::Arc<[<$worker_name Conf>]>) -> Result<Self, $crate::TightBeamError> {
 					servlet!(@setup_protocol $protocol, listener, addr);
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 
-					let $worker_config = &config;
+					let $worker_config = &*config;
 					$(
 						let $worker_field = $worker_init?;
 					)*
@@ -1198,16 +1193,16 @@ macro_rules! servlet {
 		|$message:ident, $trace_param:ident, $config_param:ident, $workers_param:ident| $handler_body:expr, $worker_config:ident, $init_config:ident, $init_body:expr) => {
 		$crate::paste::paste! {
 			impl $worker_name {
-				pub async fn start(trace: $crate::trace::TraceCollector, config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
+				pub async fn start(trace: $crate::trace::TraceCollector, config: ::std::sync::Arc<[<$worker_name Conf>]>) -> $crate::error::Result<Self> {
 					servlet!(@setup_protocol $protocol, listener, addr);
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 
 					// Run init block - must return Result<(), TightBeamError>
-					let $init_config = &config;
+					let $init_config = &*config;
 					let init_result: $crate::error::Result<()> = (|| $init_body)();
 					init_result?;
 
-					let $worker_config = &config;
+					let $worker_config = &*config;
 					$(
 						let $worker_field = $worker_init?;
 					)*
@@ -1240,7 +1235,7 @@ macro_rules! servlet {
 	// Build server with config and workers (non-empty policies)
 	(@build_server_with_config_and_workers $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $trace:expr, $config:ident, $workers:expr, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident, $workers_param:ident| async move $body:block)) => {
 		{
-			let config_arc = ::std::sync::Arc::new($config);
+			let config_arc = $config;
 			let workers_arc = $workers;
 			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
@@ -1265,7 +1260,7 @@ macro_rules! servlet {
 	// Build server with config and workers (empty policies)
 	(@build_server_with_config_and_workers $protocol:path, $listener:ident, [], $trace:expr, $config:ident, $workers:expr, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident, $workers_param:ident| async move $body:block)) => {
 		{
-			let config_arc = ::std::sync::Arc::new($config);
+			let config_arc = $config;
 			let workers_arc = $workers;
 			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
@@ -1346,7 +1341,7 @@ macro_rules! servlet {
 	(@build_server_router_config $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $trace:expr, $router:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $router_param:ident, $config_param:ident| async move $body:block)) => {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
-			let config_arc = ::std::sync::Arc::new($config);
+			let config_arc = $config;
 			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
@@ -1371,7 +1366,7 @@ macro_rules! servlet {
 	(@build_server_router_config $protocol:path, $listener:ident, [], $trace:expr, $router:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $router_param:ident, $config_param:ident| async move $body:block)) => {
 		{
 			let router_arc = ::std::sync::Arc::new($router);
-			let config_arc = ::std::sync::Arc::new($config);
+			let config_arc = $config;
 			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
@@ -1394,7 +1389,7 @@ macro_rules! servlet {
 	// Build server with config only (non-empty policies)
 	(@build_server_config_only $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $trace:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident| async move $body:block)) => {
 		{
-			let config_arc = ::std::sync::Arc::new($config);
+			let config_arc = $config;
 			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
@@ -1416,7 +1411,7 @@ macro_rules! servlet {
 	// Build server with config only (empty policies)
 	(@build_server_config_only $protocol:path, $listener:ident, [], $trace:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident| async move $body:block)) => {
 		{
-			let config_arc = ::std::sync::Arc::new($config);
+			let config_arc = $config;
 			let trace_handle = $trace.clone();
 			let server_handle = $crate::server! {
 				protocol $protocol: $listener,
@@ -1620,7 +1615,7 @@ mod tests {
 		setup: || {
 				PingPongServlet::start(
 					crate::trace::TraceCollector::new(),
-					PingPongServletConf { lotto_number: 42 },
+					::std::sync::Arc::new(PingPongServletConf { lotto_number: 42 }),
 			)
 		},
 		assertions: |client| async move {
@@ -1755,9 +1750,9 @@ mod tests {
 			setup: || {
 				PingPongServletWithWorker::start(
 					crate::trace::TraceCollector::new(),
-					PingPongServletWithWorkerConf {
+					::std::sync::Arc::new(PingPongServletWithWorkerConf {
 					lotto_number: 42,
-				})
+				}))
 			},
 			assertions: |client| async move {
 				fn generate_message(

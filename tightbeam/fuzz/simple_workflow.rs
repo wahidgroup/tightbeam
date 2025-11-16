@@ -45,7 +45,6 @@ tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Oracle-guided fuzzing: interprets AFL input as event choices
-			// IJON state tracking is automatic when built with testing-fuzz-ijon feature
 			trace.oracle().fuzz_from_bytes()?;
 
 			// Make assertions based on execution trace

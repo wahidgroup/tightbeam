@@ -61,7 +61,7 @@ tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Oracle-guided fuzzing through complex 6-state workflow
-			// IJON state tracking is automatic when built with testing-fuzz-ijon feature
+			// IJON state tracking is automatic
 			trace.oracle().fuzz_from_bytes()?;
 
 			// Make assertions based on execution trace

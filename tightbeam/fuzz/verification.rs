@@ -8,17 +8,6 @@
 //! 3. **Features** - Feature flags activate correct code paths
 //! 4. **Binary Symbols** - IJON and AFL runtime symbols present (ijon_max, ijon_set, __afl_area_ptr, etc.)
 //! 5. **Oracle Methods** - CspOracle methods return valid data
-//!
-//! ## Usage
-//!
-//! ```sh
-//! cargo install cargo-afl
-//! RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing \
-//!   --features "std,testing-fuzz,testing-fuzz-ijon,testing-csp"
-//! mkdir -p built/fuzz/in && echo "verification" > built/fuzz/in/seed.txt
-//! cargo afl fuzz -i built/fuzz/in -o built/fuzz/out \
-//!   target/debug/deps/fuzzing-*
-//! ```
 
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
