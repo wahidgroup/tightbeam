@@ -109,6 +109,8 @@ pub mod core;
 pub mod error;
 pub mod flags;
 pub mod helpers;
+#[cfg(any(test, feature = "testing"))]
+pub mod trace;
 pub mod matrix;
 pub mod oids;
 pub mod prelude;

@@ -145,7 +145,7 @@ macro_rules! tb_process_spec {
 
 		#[cfg(feature = "testing-csp")]
 		impl $crate::testing::specs::csp::ProcessSpec for $name {
-			fn validate_trace(&self, trace: &$crate::testing::trace::ConsumedTrace) -> $crate::testing::specs::csp::CspValidationResult {
+			fn validate_trace(&self, trace: &$crate::trace::ConsumedTrace) -> $crate::testing::specs::csp::CspValidationResult {
 				Self::process().validate_trace(trace)
 			}
 		}

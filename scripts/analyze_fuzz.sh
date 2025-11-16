@@ -28,6 +28,7 @@ SHOW_UI=true
 SKIP_CRASH_CHECK=true
 SKIP_CPU_FREQ=true
 KEEP_OUTPUT=false
+CUSTOM_FUZZ_BASE=""
 TEST_NAME=""
 SEED_DIR=""
 VERIFY_CODE=false
@@ -115,7 +116,7 @@ EOF
 }
 
 # Parse arguments using getopt (GNU/POSIX compliant)
-if ! OPTS=$(getopt -o hVncCFks:vp: --long help,version,no-ui,skip-checks,skip-crash-check,skip-cpu-freq,keep-output,seeds:,verify,pattern: -n "$PROJECT" -- "$@"); then
+if ! OPTS=$(getopt -o hVncCFkP:s:vp: --long help,version,no-ui,skip-checks,skip-crash-check,skip-cpu-freq,keep-output,path:,seeds:,verify,pattern: -n "$PROJECT" -- "$@"); then
     echo "Error: Failed to parse options" >&2
     usage >&2
     exit 1
@@ -153,6 +154,10 @@ while true; do
         -k|--keep-output)
             KEEP_OUTPUT=true
             shift
+            ;;
+        -P|--path)
+            CUSTOM_FUZZ_BASE="$2"
+            shift 2
             ;;
         -s|--seeds)
             SEED_DIR="$2"
@@ -212,8 +217,16 @@ if [ "$VERIFY_CODE" = true ] && [ ${#VERIFY_PATTERNS[@]} -eq 0 ]; then
     exit 1
 fi
 
-# Auto-detect fuzz base directory
-FUZZ_BASE=$(detect_fuzz_base "$TEST_NAME")
+# Determine fuzz base directory
+if [ -n "$CUSTOM_FUZZ_BASE" ]; then
+	if [ ! -d "$CUSTOM_FUZZ_BASE" ]; then
+		echo "Error: Provided path does not exist: $CUSTOM_FUZZ_BASE" >&2
+		exit 1
+	fi
+	FUZZ_BASE="$CUSTOM_FUZZ_BASE"
+else
+	FUZZ_BASE=$(detect_fuzz_base "$TEST_NAME")
+fi
 
 # Set default seed directory if not provided
 if [ -z "$SEED_DIR" ]; then
@@ -281,19 +294,32 @@ echo ""
 
 # Build fuzz target
 echo "[*] Building fuzz target..."
-# Try make build-fuzz first, fallback to cargo afl build
-if command -v make &> /dev/null && make -n build-fuzz &> /dev/null 2>&1; then
-    if ! make build-fuzz > /dev/null 2>&1; then
-        echo "[!] ERROR: Failed to build fuzz target with make" >&2
-        exit 1
-    fi
-else
-    # Fallback: try cargo afl build directly
-    echo "    Note: make build-fuzz not available, trying cargo afl build..."
-    if ! RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing 2>&1 | grep -v "^    " | grep -v "^Compiling" | grep -v "^Finished" | grep -v "^$" || true; then
-        echo "[!] ERROR: Failed to build fuzz target" >&2
-        exit 1
-    fi
+BUILD_OK=false
+TARGET_HINT="fuzz_${TEST_NAME}"
+if command -v make &> /dev/null && make -n fuzz-build &> /dev/null 2>&1; then
+	if make fuzz-build > /dev/null 2>&1; then
+		BUILD_OK=true
+	else
+		echo "    [!] make fuzz-build failed, falling back to direct cargo-afl build..."
+	fi
+fi
+if [ "$BUILD_OK" = false ]; then
+	for CANDIDATE_BIN in "fuzz_${TEST_NAME}" "${TEST_NAME}"; do
+		if RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "$CANDIDATE_BIN" > /dev/null 2>&1; then
+			BUILD_OK=true
+			TARGET_HINT="$CANDIDATE_BIN"
+			break
+		fi
+	done
+fi
+if [ "$BUILD_OK" = false ]; then
+	if RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing > /dev/null 2>&1; then
+		BUILD_OK=true
+		TARGET_HINT=""
+	else
+		echo "[!] ERROR: Failed to build fuzz target" >&2
+		exit 1
+	fi
 fi
 echo "[+] Fuzz target built successfully"
 echo ""
@@ -301,11 +327,26 @@ echo ""
 # Locate fuzz target binary
 # Try common binary locations and patterns
 FUZZ_TARGET=""
-for pattern in "target/debug/deps/fuzzing-*" "target/debug/deps/*fuzz*" "target/debug/fuzz_*" "target/debug/*fuzz*"; do
-    FUZZ_TARGET=$(ls $pattern 2>/dev/null | grep -v '\.d$' | grep -v '\.rlib$' | head -1)
-    if [ -n "$FUZZ_TARGET" ] && [ -f "$FUZZ_TARGET" ] && [ -x "$FUZZ_TARGET" ]; then
-        break
-    fi
+SEARCH_PATTERNS=()
+if [ -n "$TARGET_HINT" ]; then
+	SEARCH_PATTERNS+=("target/debug/${TARGET_HINT}")
+	SEARCH_PATTERNS+=("target/debug/${TARGET_HINT}-*")
+	SEARCH_PATTERNS+=("target/debug/deps/${TARGET_HINT}-*")
+fi
+SEARCH_PATTERNS+=("target/debug/fuzz_${TEST_NAME}")
+SEARCH_PATTERNS+=("target/debug/${TEST_NAME}")
+SEARCH_PATTERNS+=("target/debug/deps/fuzzing-*")
+SEARCH_PATTERNS+=("target/debug/deps/*fuzz*")
+SEARCH_PATTERNS+=("target/debug/fuzz_*")
+SEARCH_PATTERNS+=("target/debug/*fuzz*")
+
+for pattern in "${SEARCH_PATTERNS[@]}"; do
+	while IFS= read -r candidate; do
+		if [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ]; then
+			FUZZ_TARGET="$candidate"
+			break 2
+		fi
+	done < <(compgen -G "$pattern" 2>/dev/null || true)
 done
 
 if [ -z "$FUZZ_TARGET" ] || [ ! -f "$FUZZ_TARGET" ]; then
@@ -315,6 +356,16 @@ if [ -z "$FUZZ_TARGET" ] || [ ! -f "$FUZZ_TARGET" ]; then
     exit 1
 fi
 echo "[+] Found fuzz target: $(basename "$FUZZ_TARGET")"
+echo ""
+
+# Determine afl-fuzz runner (prefer native afl-fuzz if available to avoid rebuilds)
+if AFL_FUZZ_BIN=$(command -v afl-fuzz 2>/dev/null); then
+	echo "[+] Using afl-fuzz binary: $AFL_FUZZ_BIN"
+	USE_CARGO_AFL=false
+else
+	echo "[!] afl-fuzz not found in PATH, falling back to cargo afl fuzz (may rebuild)"
+	USE_CARGO_AFL=true
+fi
 echo ""
 
 # Prepare seed inputs
@@ -448,7 +499,12 @@ if [ "$SHOW_UI" = true ]; then
     # The UI shows real-time stats: cycles, corpus count, coverage, exec speed, etc.
     # Use timeout with SIGTERM (default) - AFL will handle it gracefully
     # Exit code 124 means timeout occurred (expected), other codes are errors
-    if eval "$AFL_ENV timeout $DURATION cargo afl fuzz -i built/fuzz/in -o built/fuzz/out $AFL_ARGS \"$FUZZ_TARGET\""; then
+	if [ "$USE_CARGO_AFL" = false ]; then
+		RUN_CMD="$AFL_ENV timeout $DURATION \"$AFL_FUZZ_BIN\" -i built/fuzz/in -o built/fuzz/out $AFL_ARGS -- \"$FUZZ_TARGET\""
+	else
+		RUN_CMD="$AFL_ENV timeout $DURATION cargo afl fuzz -i built/fuzz/in -o built/fuzz/out $AFL_ARGS -- \"$FUZZ_TARGET\""
+	fi
+	if eval "$RUN_CMD"; then
         TIMEOUT_OCCURRED=false
     else
         EXIT_CODE=$?
@@ -462,7 +518,12 @@ if [ "$SHOW_UI" = true ]; then
 else
     echo "[*] Running in background (UI hidden)..."
     echo "    Note: Use --no-ui=false to see AFL's real-time TUI display"
-    if eval "$AFL_ENV timeout $DURATION cargo afl fuzz -i built/fuzz/in -o built/fuzz/out $AFL_ARGS \"$FUZZ_TARGET\" > /dev/null 2>&1"; then
+	if [ "$USE_CARGO_AFL" = false ]; then
+		RUN_CMD="$AFL_ENV timeout $DURATION \"$AFL_FUZZ_BIN\" -i built/fuzz/in -o built/fuzz/out $AFL_ARGS -- \"$FUZZ_TARGET\" > /dev/null 2>&1"
+	else
+		RUN_CMD="$AFL_ENV timeout $DURATION cargo afl fuzz -i built/fuzz/in -o built/fuzz/out $AFL_ARGS -- \"$FUZZ_TARGET\" > /dev/null 2>&1"
+	fi
+	if eval "$RUN_CMD"; then
         TIMEOUT_OCCURRED=false
     else
         EXIT_CODE=$?

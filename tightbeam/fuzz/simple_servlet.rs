@@ -74,8 +74,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "request_sent", at_least!(0)),
-			(HandlerStart, "response_received", at_least!(0)),
+			("request_sent", at_least!(0)),
+			("response_received", at_least!(0)),
 		]
 	},
 }

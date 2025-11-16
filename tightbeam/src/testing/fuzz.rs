@@ -469,9 +469,8 @@ impl CspOracle {
 ///             trace.oracle().fuzz_from_bytes()?;
 ///
 ///             // Can also query oracle state
-///             let events = trace.oracle().trace();
-///             for event in events {
-///                 trace.assert(AssertionPhase::HandlerStart, event.0);
+///             for (label, _) in trace.oracle().trace() {
+///                 trace.event(label);
 ///             }
 ///             Ok(())
 ///         }

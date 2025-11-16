@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use super::state::ChessGameState;
+use super::utils::{is_white_turn, GAME_STATE};
 use tightbeam::der::Enumerated;
-use tightbeam::testing::macros::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{compose, decode, servlet, Beamable, Sequence};
 
@@ -41,17 +41,6 @@ pub(crate) enum GameStatusCode {
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Turn determination from order field
-///
-/// Turn is derived from Frame.metadata.order:
-/// - Even order (0, 2, 4, ...) = White's turn
-/// - Odd order (1, 3, 5, ...) = Black's turn
-///
-/// Move count = order (monotonically incrementing)
-pub(crate) fn is_white_turn(order: u64) -> bool {
-	order % 2 == 0
-}
-
 /// Helper function to create an invalid move response
 pub(crate) fn create_invalid_move_response(
 	id: Vec<u8>,
@@ -62,49 +51,6 @@ pub(crate) fn create_invalid_move_response(
 		V0: id: id,
 		order: order + 1,
 		message: response
-	}
-}
-
-/// Reset game state and tracking variables for a new game
-#[allow(dead_code)]
-pub(crate) fn restart_game(
-	client_game_state: &mut ChessGameState,
-	order: &mut u64,
-	seed_mode: &mut bool,
-	seed_move_index: &mut u8,
-	seed_move_count: &mut u8,
-	trace: &TraceCollector,
-) {
-	trace.event("move_validated");
-	trace.event("server_move");
-	trace.event("game_ended");
-	// Reset game state and start a new game
-	// Server will sync to new board state on next move
-	*client_game_state = ChessGameState::new();
-	// Reset order to 1 for new game (white's turn)
-	// This ensures proper turn alternation for the new game
-	*order = 1;
-	// Reset seed tracking to allow reading a new seed for the next game
-	*seed_mode = true;
-	*seed_move_index = 0;
-	*seed_move_count = 0;
-	trace.event("game_restarted");
-}
-
-// ============================================================================
-// CHESS ENGINE SERVLET
-// ============================================================================
-
-// Shared game state for servlet reuse in fuzzing. This allows the servlet to
-// be reused across AFL iterations, reducing setup overhead.
-pub(crate) static GAME_STATE: OnceLock<Arc<Mutex<ChessGameState>>> = OnceLock::new();
-
-/// Reset chess game state before each fuzz iteration
-/// Called by tb_scenario! macro's @reset_servlet_state helper
-#[allow(dead_code)]
-pub(crate) fn reset_chess_game_state() {
-	if let Some(game_state) = GAME_STATE.get() {
-		*game_state.lock().unwrap() = ChessGameState::new();
 	}
 }
 
@@ -119,7 +65,8 @@ servlet! {
 	config: {
 		game_state: Arc<Mutex<ChessGameState>>,
 	},
-	handle: |message, config| async move {
+	handle: |message, trace, config| async move {
+		let _ = trace;
 		// Decode ChessMoveRequest from message
 		let move_req: ChessMoveRequest = match decode(&message.message) {
 			Ok(req) => req,
@@ -210,6 +157,7 @@ servlet! {
 			} else {
 				// Choose move: prefer endgame-forcing moves if game is dragging
 				// Always prefer captures to simplify the board (more aggressive)
+				// Use move_count as deterministic seed for reproducible fuzzing
 				let server_move = if game_state.should_force_endgame(move_count) || game_state.count_pieces() > 12 {
 					// Score moves and pick from top-scoring moves
 					let mut scored_moves: Vec<(u32, (u8, u8, u8, u8))> = valid_moves
@@ -225,19 +173,13 @@ servlet! {
 					scored_moves.sort_by(|a, b| b.0.cmp(&a.0));
 					let top_count = (scored_moves.len() / 4).max(3).min(scored_moves.len());
 					let top_moves: Vec<_> = scored_moves.iter().take(top_count).map(|(_, m)| *m).collect();
-					// Randomly pick from top moves
-					let random_index = match tightbeam::random::generate_random_number::<8>(None) {
-						Ok(n) => n % top_moves.len(),
-						Err(_) => 0,
-					};
-					top_moves[random_index]
+					// Deterministic selection based on move_count for reproducible fuzzing
+					let index = (move_count as usize) % top_moves.len();
+					top_moves[index]
 				} else {
-					// Normal random selection
-					let random_index = match tightbeam::random::generate_random_number::<8>(None) {
-						Ok(n) => n % valid_moves.len(),
-						Err(_) => 0, // Fallback to first move if random generation fails
-					};
-					valid_moves[random_index]
+					// Deterministic selection based on move_count for reproducible fuzzing
+					let index = (move_count as usize) % valid_moves.len();
+					valid_moves[index]
 				};
 
 				// Make the server move (track captures)

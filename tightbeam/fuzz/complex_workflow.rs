@@ -11,9 +11,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "init", exactly!(1)),
-			(HandlerStart, "authenticate", exactly!(1)),
-			(HandlerStart, "complete", exactly!(1))
+			("init", exactly!(1)),
+			("authenticate", exactly!(1)),
+			("complete", exactly!(1))
 		]
 	},
 }

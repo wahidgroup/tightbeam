@@ -221,14 +221,14 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(Any, "thinks", tightbeam::exactly!(1)),
-			(Any, "sits", tightbeam::exactly!(1)),
-			(Any, "picks_left", tightbeam::exactly!(1)),
-			(Any, "picks_right", tightbeam::exactly!(1)),
-			(Any, "eats", tightbeam::exactly!(1)),
-			(Any, "puts_down_left", tightbeam::exactly!(1)),
-			(Any, "puts_down_right", tightbeam::exactly!(1)),
-			(Any, "gets_up", tightbeam::exactly!(1))
+			("thinks", tightbeam::exactly!(1)),
+			("sits", tightbeam::exactly!(1)),
+			("picks_left", tightbeam::exactly!(1)),
+			("picks_right", tightbeam::exactly!(1)),
+			("eats", tightbeam::exactly!(1)),
+			("puts_down_left", tightbeam::exactly!(1)),
+			("puts_down_right", tightbeam::exactly!(1)),
+			("gets_up", tightbeam::exactly!(1))
 		]
 	},
 }
@@ -270,9 +270,9 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(Any, "thinks", tightbeam::exactly!(2)),
-			(Any, "sits", tightbeam::exactly!(2)),
-			(Any, "picks_left", tightbeam::exactly!(2))
+			("thinks", tightbeam::exactly!(2)),
+			("sits", tightbeam::exactly!(2)),
+			("picks_left", tightbeam::exactly!(2))
 		]
 	},
 }
@@ -311,14 +311,14 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(Any, "thinks", tightbeam::exactly!(2)),
-			(Any, "sits", tightbeam::exactly!(2)),
-			(Any, "picks_left", tightbeam::exactly!(2)),
-			(Any, "picks_right", tightbeam::exactly!(2)),
-			(Any, "eats", tightbeam::exactly!(2)),
-			(Any, "puts_down_left", tightbeam::exactly!(2)),
-			(Any, "puts_down_right", tightbeam::exactly!(2)),
-			(Any, "gets_up", tightbeam::exactly!(2))
+			("thinks", tightbeam::exactly!(2)),
+			("sits", tightbeam::exactly!(2)),
+			("picks_left", tightbeam::exactly!(2)),
+			("picks_right", tightbeam::exactly!(2)),
+			("eats", tightbeam::exactly!(2)),
+			("puts_down_left", tightbeam::exactly!(2)),
+			("puts_down_right", tightbeam::exactly!(2)),
+			("gets_up", tightbeam::exactly!(2))
 		]
 	},
 }

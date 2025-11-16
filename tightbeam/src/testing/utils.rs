@@ -1304,7 +1304,11 @@ macro_rules! test_drone {
 		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Start the drone
-			let drone = <$drone_type as $crate::colony::Servlet<()>>::start($config).await?;
+			let drone = <$drone_type as $crate::colony::Servlet<()>>::start(
+				$crate::trace::TraceCollector::new(),
+				$config,
+			)
+			.await?;
 
 			// Call the setup closure and await the resulting future
 			let $setup_drone = drone;
@@ -1343,7 +1347,11 @@ macro_rules! test_drone {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Start the drone
-			let drone = <$drone_type as $crate::colony::Servlet<()>>::start($config).await?;
+			let drone = <$drone_type as $crate::colony::Servlet<()>>::start(
+				$crate::trace::TraceCollector::new(),
+				$config,
+			)
+			.await?;
 
 			// Call the setup closure and await the resulting future
 			let $setup_drone = drone;
@@ -1382,7 +1390,11 @@ macro_rules! test_drone {
 		#[tokio::test(flavor = "multi_thread", worker_threads = $threads)]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Start the drone
-			let drone = <$drone_type as $crate::colony::Servlet<()>>::start($config).await?;
+			let drone = <$drone_type as $crate::colony::Servlet<()>>::start(
+				$crate::trace::TraceCollector::new(),
+				$config,
+			)
+			.await?;
 
 			// Get the drone address
 			let addr = drone.addr();
@@ -1416,7 +1428,11 @@ macro_rules! test_drone {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Start the drone
-			let drone = <$drone_type as $crate::colony::Servlet<()>>::start($config).await?;
+			let drone = <$drone_type as $crate::colony::Servlet<()>>::start(
+				$crate::trace::TraceCollector::new(),
+				$config,
+			)
+			.await?;
 
 			// Get the drone address
 			let addr = drone.addr();

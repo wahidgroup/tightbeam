@@ -41,7 +41,7 @@ macro_rules! __tightbeam_server_protocol_handle {
 
 	($protocol:path, $listener:expr, assertions: $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
 		#[allow(unused_imports)]
-		use $crate::testing::trace::TraceCollector;
+		use $crate::trace::TraceCollector;
 
 		let __listener = $listener;
 		let __assertions = $assertions;
@@ -140,6 +140,43 @@ macro_rules! __tightbeam_server_protocol_policies_handle {
 			"server!(protocol …, policies: …) requires tightbeam to be built with either the `tokio` or `std` feature"
 		);
 	};
+}
+
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
+	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
+		#[allow(unused_imports)]
+		use $crate::trace::TraceCollector;
+
+		let __listener = $listener;
+		let __assertions = $assertions;
+		$crate::macros::server::server_runtime::rt::spawn(async move {
+			let __error_tx = $crate::macros::server::server_runtime::rt::empty_error_channel();
+			let __ok_tx = $crate::macros::server::server_runtime::rt::empty_ok_channel();
+			$crate::server!(@async_loop_assertions $protocol, __listener, __assertions, ($param1, $param2, $handler_body), __error_tx, __ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*)
+		})
+	}};
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
+	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
+		compile_error!(
+			"server!(protocol …, policies: …, assertions: …) requires the `tokio` feature"
+		);
+	}};
+}
+
+#[cfg(not(any(feature = "tokio", feature = "std")))]
+#[macro_export]
+macro_rules! __tightbeam_server_protocol_policies_assertions_handle {
+	($protocol:path, $listener:expr, [$($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?], $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr)) => {{
+		compile_error!(
+			"server!(protocol …, policies: …, assertions: …) requires tightbeam to be built with either the `tokio` or `std` feature"
+		);
+	}};
 }
 
 #[cfg(feature = "tokio")]
@@ -480,7 +517,7 @@ macro_rules! server {
 
 	(@async_loop_assertions $protocol:path, $listener:expr, $assertions:expr, ($param1:ident, $param2:ident, $handler_body:expr), $error_tx:expr, $ok_tx:expr, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		#[allow(unused_imports)]
-		use $crate::testing::trace::TraceCollector;
+		use $crate::trace::TraceCollector;
 
 		let __handler_with_trace = move |$param1: $crate::Frame| {
 			let $param2: TraceCollector = $assertions.clone();
@@ -551,6 +588,46 @@ macro_rules! server {
 
 	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
 		$crate::__tightbeam_server_protocol_policies_handle!($protocol, $listener, [ $($policy_name: [ $( $policy_expr ),* ]),* ], $handler)
+	}};
+
+	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, assertions: $assertions:expr, handle: move |$param1:ident, $param2:ident| $handler_body:expr) => {{
+		$crate::__tightbeam_server_protocol_policies_assertions_handle!(
+			$protocol,
+			$listener,
+			[ $($policy_name: [ $( $policy_expr ),* ]),* ],
+			$assertions,
+			($param1, $param2, $handler_body)
+		)
+	}};
+
+	(protocol $protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, assertions: $assertions:expr, handle: |$param1:ident, $param2:ident| $handler_body:expr) => {{
+		$crate::__tightbeam_server_protocol_policies_assertions_handle!(
+			$protocol,
+			$listener,
+			[ $($policy_name: [ $( $policy_expr ),* ]),* ],
+			$assertions,
+			($param1, $param2, $handler_body)
+		)
+	}};
+
+	(protocol $protocol:path: $listener:expr, assertions: $assertions:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: move |$param1:ident, $param2:ident| $handler_body:expr) => {{
+		$crate::__tightbeam_server_protocol_policies_assertions_handle!(
+			$protocol,
+			$listener,
+			[ $($policy_name: [ $( $policy_expr ),* ]),* ],
+			$assertions,
+			($param1, $param2, $handler_body)
+		)
+	}};
+
+	(protocol $protocol:path: $listener:expr, assertions: $assertions:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: |$param1:ident, $param2:ident| $handler_body:expr) => {{
+		$crate::__tightbeam_server_protocol_policies_assertions_handle!(
+			$protocol,
+			$listener,
+			[ $($policy_name: [ $( $policy_expr ),* ]),* ],
+			$assertions,
+			($param1, $param2, $handler_body)
+		)
 	}};
 
 	(protocol $protocol:path: $listener:expr, channels: { error: $error_tx:expr, ok: $ok_tx:expr }, handle: $handler:expr) => {{

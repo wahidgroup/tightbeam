@@ -6,7 +6,7 @@
 
 use crate::instrumentation::{TbEvent, TbEventKind};
 use crate::testing::specs::csp::{Event, Process};
-use crate::testing::trace::ConsumedTrace;
+use crate::trace::ConsumedTrace;
 use crate::TightBeamError;
 
 use std::collections::HashMap;

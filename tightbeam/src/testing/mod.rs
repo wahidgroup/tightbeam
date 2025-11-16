@@ -28,7 +28,7 @@ pub use specs::{verify_trace, SpecViolation, TBSpec};
 pub use fdr::*;
 
 // Demo labels using tb_labels! macro (payload + non-payload)
-crate::tb_labels! { pub enum TbDemoLabels { MessageReceived => payload, HandlerStart } }
+crate::tb_labels! { pub enum TbDemoLabels { MessageReceived => payload, TestEvent } }
 
 #[cfg(test)]
 mod tests {

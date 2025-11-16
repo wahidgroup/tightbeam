@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::Errorizable;
 
 use crate::policy::{ReceptorPolicy, TransitStatus};
+use crate::trace::TraceCollector;
 use crate::Message;
 
 #[cfg(feature = "tokio")]
@@ -18,13 +19,14 @@ macro_rules! __tightbeam_worker_common_methods {
 		/// Relay a message to the worker
 		pub async fn relay(
 			&self,
+			trace: crate::trace::TraceCollector,
 			message: ::std::sync::Arc<$input>,
 		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
 			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
 			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
 			let result = $crate::colony::worker_runtime::rt::send(
 				sender,
-				$crate::colony::WorkerRequest { message, respond_to: tx },
+				$crate::colony::WorkerRequest { message, respond_to: tx, trace },
 			)
 			.await;
 			result.map_err(|_| $crate::colony::WorkerRelayError::QueueClosed)?;
@@ -64,11 +66,12 @@ macro_rules! __tightbeam_worker_common_methods {
 		/// Relay a message to the worker
 		pub async fn relay(
 			&self,
+			trace: crate::trace::TraceCollector,
 			message: ::std::sync::Arc<$input>,
 		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
 			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
 			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
-			$crate::colony::worker_runtime::rt::send(sender, $crate::colony::WorkerRequest { message, respond_to: tx })
+			$crate::colony::worker_runtime::rt::send(sender, $crate::colony::WorkerRequest { message, respond_to: tx, trace })
 				.map_err(|_| $crate::colony::WorkerRelayError::QueueClosed)?;
 
 			let response = $crate::colony::worker_runtime::rt::wait_response(rx);
@@ -228,6 +231,7 @@ pub mod worker_runtime {
 pub struct WorkerRequest<I: Send, O> {
 	pub message: Arc<I>,
 	pub respond_to: worker_runtime::rt::ResponseSender<Result<O, TransitStatus>>,
+	pub trace: TraceCollector,
 }
 
 #[cfg_attr(feature = "derive", derive(Errorizable))]
@@ -311,14 +315,14 @@ macro_rules! worker {
 		$(queue: $queue:expr,)?
 		config: { $($cfg_field:ident : $cfg_ty:ty),* $(,)? },
 		policies: { $( $policy_method:ident : $policy_value:tt ),* $(,)? },
-		handle: |$message_ident:ident, $config_ident:ident| async move $handler_block:block
+		handle: |$message_ident:ident, $trace_ident:ident, $config_ident:ident| async move $handler_block:block
 	) => {
 		$crate::worker!(@generate
 			$worker_name, $input, $output, [$($queue)?],
 			config,
 			{ $($cfg_field: $cfg_ty,)* },
 			{ $( $policy_method : $policy_value ),* },
-			(|$message_ident, $config_ident| async move $handler_block)
+			(|$message_ident, $trace_ident, $config_ident| async move $handler_block)
 		);
 	};
 
@@ -326,14 +330,44 @@ macro_rules! worker {
 		name: $worker_name:ident < $input:ty, $output:ty >,
 		$(queue: $queue:expr,)?
 		policies: { $( $policy_method:ident : $policy_value:tt ),* $(,)? },
-		handle: |$message_ident:ident| async move $handler_block:block
+		handle: |$message_ident:ident, $trace_ident:ident| async move $handler_block:block
 	) => {
 		$crate::worker!(@generate
 			$worker_name, $input, $output, [$($queue)?],
 			no_config,
 			{},
 			{ $( $policy_method : $policy_value ),* },
-			(|$message_ident| async move $handler_block)
+			(|$message_ident, $trace_ident, _config| async move $handler_block)
+		);
+	};
+
+	(
+		name: $worker_name:ident < $input:ty, $output:ty >,
+		$(queue: $queue:expr,)?
+		handle: |$message_ident:ident, $trace_ident:ident| async move $handler_block:block
+	) => {
+		$crate::worker!(@generate
+			$worker_name, $input, $output, [$($queue)?],
+			no_config,
+			{},
+			{},
+			(|$message_ident, $trace_ident, _config| async move $handler_block)
+		);
+	};
+
+	(
+		name: $worker_name:ident < $input:ty, $output:ty >,
+		$(queue: $queue:expr,)?
+		policies: { $( $policy_method:ident : $policy_value:tt ),* $(,)? },
+		config: { $($cfg_field:ident : $cfg_ty:ty),* $(,)? },
+		handle: |$message_ident:ident, $trace_ident:ident, $config_ident:ident| async move $handler_block:block
+	) => {
+		$crate::worker!(@generate
+			$worker_name, $input, $output, [$($queue)?],
+			config,
+			{ $($cfg_field: $cfg_ty,)* },
+			{},
+			(|$message_ident, $trace_ident, $config_ident| async move $handler_block)
 		);
 	};
 
@@ -341,28 +375,14 @@ macro_rules! worker {
 		name: $worker_name:ident < $input:ty, $output:ty >,
 		$(queue: $queue:expr,)?
 		config: { $($cfg_field:ident : $cfg_ty:ty),* $(,)? },
-		handle: |$message_ident:ident, $config_ident:ident| async move $handler_block:block
+		handle: |$message_ident:ident, $trace_ident:ident, $config_ident:ident| async move $handler_block:block
 	) => {
 		$crate::worker!(@generate
 			$worker_name, $input, $output, [$($queue)?],
 			config,
 			{ $($cfg_field: $cfg_ty,)* },
 			{},
-			(|$message_ident, $config_ident| async move $handler_block)
-		);
-	};
-
-	(
-		name: $worker_name:ident < $input:ty, $output:ty >,
-		$(queue: $queue:expr,)?
-		handle: |$message_ident:ident| async move $handler_block:block
-	) => {
-		$crate::worker!(@generate
-			$worker_name, $input, $output, [$($queue)?],
-			no_config,
-			{},
-			{},
-			(|$message_ident| async move $handler_block)
+			(|$message_ident, $trace_ident, $config_ident| async move $handler_block)
 		);
 	};
 
@@ -578,18 +598,19 @@ macro_rules! worker {
 		}
 	};
 
-	(@run_loop $rx:ident, (config Some($config_arc:ident)), $policies:ident, (|$message_ident:ident, $config_ident:ident| async move $handler_block:block)) => {{
+	(@run_loop $rx:ident, (config Some($config_arc:ident)), $policies:ident, (|$message_ident:ident, $trace_ident:ident, $config_ident:ident| async move $handler_block:block)) => {{
 		let mut receiver = $rx;
 		let config_arc = $config_arc;
 		let policies = $policies;
 		async move {
 			while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver).await {
-				let $crate::colony::worker::WorkerRequest { message, respond_to } = request;
+				let $crate::colony::worker::WorkerRequest { message, respond_to, trace } = request;
 				if let Err(status) = $crate::worker!(@evaluate_policies policies, &message) {
 					let _ = respond_to.send(Err(status));
 					continue;
 				}
 				let $message_ident = (*message).clone();
+				let $trace_ident = trace;
 				let $config_ident = config_arc.as_ref();
 				let output = (async move $handler_block).await;
 				let _ = respond_to.send(Ok(output));
@@ -597,17 +618,19 @@ macro_rules! worker {
 		}
 	}};
 
-	(@run_loop $rx:ident, (config None), $policies:ident, (|$message_ident:ident| async move $handler_block:block)) => {{
+	(@run_loop $rx:ident, (config None), $policies:ident, (|$message_ident:ident, $trace_ident:ident, $config_ident:ident| async move $handler_block:block)) => {{
 		let mut receiver = $rx;
 		let policies = $policies;
 		async move {
 			while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver).await {
-				let $crate::colony::WorkerRequest { message, respond_to } = request;
+				let $crate::colony::WorkerRequest { message, respond_to, trace } = request;
 				if let Err(status) = $crate::worker!(@evaluate_policies policies, &message) {
 					let _ = respond_to.send(Err(status));
 					continue;
 				}
 				let $message_ident = (*message).clone();
+				let $trace_ident = trace;
+				let $config_ident = ();
 				let output = (async move $handler_block).await;
 				let _ = respond_to.send(Ok(output));
 			}
@@ -692,7 +715,7 @@ mod tests {
 		config: {
 			lotto_number: u32,
 		},
-		handle: |message, config| async move {
+		handle: |message, _trace, config| async move {
 
 			message.lucky_number == config.lotto_number
 		}
@@ -703,7 +726,7 @@ mod tests {
 		policies: {
 			with_receptor_gate: [PingGate]
 		},
-		handle: |_message| async move {
+		handle: |_message, _trace| async move {
 			PongMessage {
 				result: "PONG".to_string(),
 			}
@@ -719,13 +742,15 @@ mod tests {
 		assertions: |worker| async move {
 			assert_eq!(worker.queue_capacity(), 64);
 
-			let winner = worker.relay(::std::sync::Arc::new(RequestMessage {
+			let trace = crate::trace::TraceCollector::new();
+
+			let winner = worker.relay(trace.clone(), ::std::sync::Arc::new(RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
 			})).await?;
 			assert!(winner);
 
-			let loser = worker.relay(::std::sync::Arc::new(RequestMessage {
+			let loser = worker.relay(trace.clone(), ::std::sync::Arc::new(RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 7,
 			})).await?;
@@ -743,11 +768,12 @@ mod tests {
 		},
 		assertions: |worker| async move {
 			// Test accepted message
+			let trace = crate::trace::TraceCollector::new();
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
 			};
-			let response = worker.relay(::std::sync::Arc::new(ping_msg)).await?;
+			let response = worker.relay(trace.clone(), ::std::sync::Arc::new(ping_msg)).await?;
 			assert_eq!(response, PongMessage { result: "PONG".to_string() });
 
 			// Test rejected message
@@ -756,7 +782,7 @@ mod tests {
 				lucky_number: 42,
 			};
 
-			let result = worker.relay(::std::sync::Arc::new(pong_msg)).await;
+			let result = worker.relay(trace, ::std::sync::Arc::new(pong_msg)).await;
 			assert!(matches!(result, Err(WorkerRelayError::Rejected(_))));
 
 			Ok(())

@@ -17,10 +17,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(HandlerStart, "start", exactly!(1)),
-			(HandlerStart, "action_a", at_least!(0)),
-			(HandlerStart, "action_b", at_least!(0)),
-			(HandlerStart, "done", exactly!(1))
+			("start", exactly!(1)),
+			("action_a", at_least!(0)),
+			("action_b", at_least!(0)),
+			("done", exactly!(1))
 		]
 	},
 }

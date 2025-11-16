@@ -3,6 +3,7 @@
 use tightbeam::asn1::{Metadata, Version};
 use tightbeam::error::Result;
 use tightbeam::{encode, job, policy, worker, Frame, TightBeamError};
+use tightbeam::trace::TraceCollector;
 use tightbeam::{prelude::*, Null};
 
 /// Compressed public key (33 bytes)
@@ -416,7 +417,7 @@ job! {
 
 worker! {
 	name: MerkleWorker<MerkleRequest, MerkleResponse>,
-	handle: |message| async move {
+	handle: |message, _trace| async move {
 		match message {
 			MerkleRequest::ComputeRoot(sequence) => MerkleComputeRootJob::run(sequence),
 			MerkleRequest::VerifyPath(params) => MerkleVerifyPathJob::run(params),
@@ -658,7 +659,7 @@ mod tests {
 
 			Ok(())
 		},
-		handle: |message, config| async move {
+		handle: |message, _trace, config| async move {
 			// Add frame to current epoch
 			let epochs = EPOCHS();
 			let Ok(mut epochs) = epochs.write() else {
@@ -691,7 +692,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_basic() -> Result<()> {
-		BFTLedgerServlet::start(BFTLedgerServletConf { ledger_state: Default::default(), epoch_size: 1000 }).await?;
+		BFTLedgerServlet::start(
+			TraceCollector::new(),
+			BFTLedgerServletConf { ledger_state: Default::default(), epoch_size: 1000 },
+		).await?;
 
 		Ok(())
 	}

@@ -47,7 +47,7 @@
 //! }
 //!
 //! // Start the drone
-//! let drone = RegularDrone::start(None).await?;
+//! let drone = RegularDrone::start(tightbeam::trace::TraceCollector::new(), None).await?;
 //!
 //! // Register with cluster
 //! let cluster_addr = "127.0.0.1:8888".parse()?;
@@ -69,10 +69,10 @@
 //! }
 //!
 //! // Only mycelial drones can call establish_hive()
-//! let mut mycelial_drone = MycelialDrone::start(None).await?;
+//! let mut mycelial_drone = MycelialDrone::start(tightbeam::trace::TraceCollector::new(), None).await?;
 //! mycelial_drone.establish_hive();  // ✓ Compiles
 //!
-//! let mut regular_drone = RegularDrone::start(None).await?;
+//! let mut regular_drone = RegularDrone::start(tightbeam::trace::TraceCollector::new(), None).await?;
 //! // regular_drone.establish_hive();  // ✗ Compile error: Hive trait not implemented
 //! ```
 
@@ -479,7 +479,10 @@ macro_rules! drone {
 	// Start servlet
 	(@start_servlet $servlet_name:ident<$input:ty>, $instance:ident, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr) => {
 		paste::paste! {
-			let servlet = <$servlet_name as $crate::colony::Servlet<$input>>::start(None).await
+			let servlet = <$servlet_name as $crate::colony::Servlet<$input>>::start(
+				$crate::trace::TraceCollector::new(),
+				None,
+			).await
 				.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId($error_id))?;
 			let mut active = $instance.active_servlet.lock().unwrap();
 			*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
@@ -498,7 +501,10 @@ macro_rules! drone {
 			$stop_old(old_servlet);
 
 			// Start new servlet
-			match <$servlet_name as $crate::colony::Servlet<$input>>::start(None).await {
+			match <$servlet_name as $crate::colony::Servlet<$input>>::start(
+				$crate::trace::TraceCollector::new(),
+				None,
+			).await {
 				Ok(servlet) => {
 					let servlet_addr = servlet.addr();
 					let addr_str: Vec<u8> = servlet_addr.clone().into();
@@ -579,7 +585,7 @@ macro_rules! drone {
 				type Conf = ();
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
-				async fn start(_config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
+				async fn start(_trace: $crate::trace::TraceCollector, _config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
 					// Bind to a port for the control server
 					let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
 						.map_err(|e| $crate::TightBeamError::from(e))?;
@@ -646,7 +652,10 @@ macro_rules! drone {
 	// Start servlet for hive establishment (no response needed)
 	(@start_servlet_for_hive_establish_impl $servlet_name:ident<$input:ty>, $instance:ident, $drone_name:ident, $servlet_id:ident) => {
 		paste::paste! {
-			if let Ok(servlet) = <$servlet_name as $crate::colony::Servlet<$input>>::start(None).await {
+			if let Ok(servlet) = <$servlet_name as $crate::colony::Servlet<$input>>::start(
+				$crate::trace::TraceCollector::new(),
+				None,
+			).await {
 				let servlet_addr = servlet.addr();
 				let addr_str: Vec<u8> = servlet_addr.clone().into();
 				let mut servlet_id: Vec<u8> = Vec::new();
@@ -663,7 +672,10 @@ macro_rules! drone {
 	// Start servlet for hive (with response)
 	(@start_servlet_for_hive $servlet_name:ident<$input:ty>, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr, $servlets:ident, $frame:ident) => {
 		paste::paste! {
-			match <$servlet_name as $crate::colony::Servlet<$input>>::start(None).await {
+			match <$servlet_name as $crate::colony::Servlet<$input>>::start(
+				$crate::trace::TraceCollector::new(),
+				None,
+			).await {
 				Ok(servlet) => {
 					let servlet_addr = servlet.addr();
 					let addr_str: Vec<u8> = servlet_addr.clone().into();
@@ -863,7 +875,7 @@ macro_rules! drone {
 				type Conf = $crate::colony::drone::HiveConf;
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
-				async fn start(config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
+				async fn start(_trace: $crate::trace::TraceCollector, config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
 					// Bind to a port for the control server
 					let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
 						.map_err(|e| $crate::TightBeamError::from(e))?;
@@ -1465,7 +1477,7 @@ mod tests {
 		config: {
 			threshold: u32,
 		},
-		handle: |message, config| async move {
+		handle: |message, _trace, config| async move {
 			message.value >= config.threshold
 		}
 	}
@@ -1475,7 +1487,7 @@ mod tests {
 		policies: {
 			with_receptor_gate: [TestGate]
 		},
-		handle: |message| async move {
+		handle: |message, _trace| async move {
 			DroneResponseMessage {
 				result: message.content.clone(),
 			}
@@ -1489,13 +1501,40 @@ mod tests {
 		policies: {
 			with_collector_gate: [crate::policy::AcceptAllGate]
 		},
-		handle: |message| async move {
+		handle: |message, _trace| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			if decoded.content == "PING" {
 				Ok(Some(DroneResponseJob::run(message.metadata.id.clone(), "PONG".to_string())?))
 			} else {
 				Ok(None)
 			}
+		}
+	}
+
+	use crate::colony::servlet::Servlet;
+
+	impl Servlet<DroneTestMessage> for SimpleServlet {
+		type Conf = ();
+		type Address = <Listener as crate::transport::Protocol>::Address;
+
+		async fn start(
+			trace: crate::trace::TraceCollector,
+			config: Option<Self::Conf>,
+		) -> Result<Self, crate::TightBeamError> {
+			let _ = config;
+			SimpleServlet::start(trace).await
+		}
+
+		fn addr(&self) -> Self::Address {
+			self.addr.clone()
+		}
+
+		fn stop(self) {
+			self.stop()
+		}
+
+		async fn join(self) -> Result<(), crate::colony::servlet_runtime::rt::JoinError> {
+			self.join().await
 		}
 	}
 
@@ -1508,7 +1547,7 @@ mod tests {
 		config: {
 			threshold: u32,
 		},
-		handle: |message, config| async move {
+		handle: |message, _trace, config| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			if decoded.value >= config.threshold {
 				Ok(Some(DroneResponseJob::run(message.metadata.id.clone(), "ACCEPTED".to_string())?))
@@ -1533,12 +1572,12 @@ mod tests {
 				threshold: config.threshold,
 			})
 		},
-		handle: |message, _config, workers| async move {
+		handle: |message, trace, _config, workers| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			let decoded_arc = ::std::sync::Arc::new(decoded);
 			let (echo_result, check_result) = tokio::join!(
-				workers.echo.relay(::std::sync::Arc::clone(&decoded_arc)),
-				workers.checker.relay(::std::sync::Arc::clone(&decoded_arc))
+				workers.echo.relay(trace.clone(), ::std::sync::Arc::clone(&decoded_arc)),
+				workers.checker.relay(trace.clone(), ::std::sync::Arc::clone(&decoded_arc))
 			);
 
 			let echo_msg = match echo_result {
@@ -1658,7 +1697,7 @@ mod tests {
 		policies: {
 			with_collector_gate: [crate::policy::AcceptAllGate]
 		},
-		handle: |message| async move {
+		handle: |message, _trace| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			Ok(Some(DroneResponseJob::run(
 				message.metadata.id.clone(),
@@ -1668,12 +1707,38 @@ mod tests {
 	}
 
 	#[cfg(feature = "tokio")]
+	impl Servlet<DroneTestMessage> for EchoServlet {
+		type Conf = ();
+		type Address = <Listener as crate::transport::Protocol>::Address;
+
+		async fn start(
+			trace: crate::trace::TraceCollector,
+			config: Option<Self::Conf>,
+		) -> Result<Self, crate::TightBeamError> {
+			let _ = config;
+			EchoServlet::start(trace).await
+		}
+
+		fn addr(&self) -> Self::Address {
+			self.addr.clone()
+		}
+
+		fn stop(self) {
+			self.stop()
+		}
+
+		async fn join(self) -> Result<(), crate::colony::servlet_runtime::rt::JoinError> {
+			self.join().await
+		}
+	}
+
+	#[cfg(feature = "tokio")]
 	#[tokio::test]
 	async fn test_hive_mycelial_port_allocation() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::colony::drone::Hive;
 
 		// Start the hive
-		let mut hive = TestHive::start(None).await?;
+		let mut hive = TestHive::start(crate::trace::TraceCollector::new(), None).await?;
 
 		// Get the hive's control server address
 		let control_addr = hive.addr();
@@ -1726,7 +1791,7 @@ mod tests {
 		use crate::transport::{MessageEmitter, Protocol};
 
 		// Start the hive
-		let mut hive = TestHive::start(None).await?;
+		let mut hive = TestHive::start(crate::trace::TraceCollector::new(), None).await?;
 		let control_addr = hive.addr();
 		println!("Hive control server at: {control_addr:?}");
 

@@ -1779,7 +1779,7 @@ tightbeam::worker! {
 	policies: {
 		with_receptor_gate: [PingGate]
 	},
-	handle: |_message, config| async move {
+	handle: |_message, _trace, config| async move {
 		PongMessage {
 			result: config.response.to_string(),
 		}
@@ -1804,7 +1804,7 @@ Testing workers uses the `tb_scenario!` macro with the Worker environment:
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::testing::macros::TraceCollector;
+use tightbeam::trace::TraceCollector;
 
 // Define assertion spec for worker behavior
 tb_assert_spec! {
@@ -1852,7 +1852,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let response = worker.relay(ping_msg)?;
+			let response = worker.relay(trace.clone(), std::sync::Arc::new(ping_msg))?;
 			if let Some(pong) = response {
 				trace.assert_value("response_result", &[], pong.result);
 			}
@@ -1866,7 +1866,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let result = worker.relay(pong_msg);
+			let result = worker.relay(trace.clone(), std::sync::Arc::new(pong_msg));
 			if result.is_err() {
 				trace.assert("relay_rejected", &[]);
 			}
@@ -1907,12 +1907,12 @@ tightbeam::servlet! {
 			lotto_number: config.lotto_number,
 		})
 	},
-	handle: |message, _config, workers| async move {
+	handle: |message, _trace, _config, workers| async move {
 		let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
 		let decoded_arc = Arc::new(decoded);
-		let (ping_result, lucky_result) = tokio::join!(
-			workers.ping_pong.relay(Arc::clone(&decoded_arc)),
-			workers.lucky_number.relay(Arc::clone(&decoded_arc))
+			let (ping_result, lucky_result) = tokio::join!(
+			workers.ping_pong.relay(trace.clone(), Arc::clone(&decoded_arc)),
+			workers.lucky_number.relay(trace.clone(), Arc::clone(&decoded_arc))
 		);
 
 		let reply = match ping_result {
@@ -1950,9 +1950,10 @@ in parallel:
 **Example using `tokio::join!`:**
 ```rust
 let decoded_arc = Arc::new(decoded);
+let trace = TraceCollector::new();
 let (result1, result2) = tokio::join!(
-    workers.worker1.relay(Arc::clone(&decoded_arc)),
-    workers.worker2.relay(Arc::clone(&decoded_arc))
+    workers.worker1.relay(trace.clone(), Arc::clone(&decoded_arc)),
+    workers.worker2.relay(trace.clone(), Arc::clone(&decoded_arc))
 );
 ```
 
@@ -1961,7 +1962,7 @@ Testing servlets uses the `tb_scenario!` macro with the Servlet environment:
 
 ```rust
 use tightbeam::testing::*;
-use tightbeam::testing::macros::TraceCollector;
+use tightbeam::trace::TraceCollector;
 
 // Define assertion spec for servlet behavior
 tb_assert_spec! {
@@ -2090,7 +2091,7 @@ tightbeam::drone! {
 }
 
 // Start the drone
-let drone = RegularDrone::start(None).await?;
+let drone = RegularDrone::start(tightbeam::trace::TraceCollector::new(), None).await?;
 
 // Register with cluster
 let cluster_addr = "127.0.0.1:8888".parse()?;
@@ -2111,7 +2112,7 @@ tightbeam::drone! {
 }
 
 // Start the hive
-let hive = MyHive::start(None).await?;
+let hive = MyHive::start(tightbeam::trace::TraceCollector::new(), None).await?;
 ```
 
 **Drone with Policies**:
@@ -2563,8 +2564,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(Any, "start", exactly!(1)),
-			(Any, "finish", exactly!(1))
+			("start", exactly!(1)),
+			("finish", exactly!(1))
 		]
 	},
 }
@@ -2952,7 +2953,7 @@ This example demonstrates progressive verification from L1 through L3:
 ```rust
 #![cfg(all(feature = "testing-fdr", feature = "tcp", feature = "tokio"))]
 use tightbeam::testing::*;
-use tightbeam::testing::macros::TraceCollector;
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::Protocol;
 

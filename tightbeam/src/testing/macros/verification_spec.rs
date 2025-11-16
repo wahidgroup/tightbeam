@@ -6,7 +6,7 @@ use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionValue};
 use crate::testing::specs::{SpecViolation, TBSpec};
-use crate::testing::trace::{ConsumedTrace, ExecutionMode};
+use crate::trace::{ConsumedTrace, ExecutionMode};
 use crate::Errorizable;
 
 #[cfg(feature = "instrument")]
@@ -557,7 +557,7 @@ macro_rules! __tb_assert_spec_build {
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
 			stringify!($base),
-			$crate::testing::trace::ExecutionMode::$mode,
+			$crate::trace::ExecutionMode::$mode,
 		);
 		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
 		$(
@@ -605,18 +605,6 @@ macro_rules! __tb_assert_spec_add_assertion {
 	};
 	// NEW SYNTAX: No tags, no value (2-element tuple)
 	($builder:expr, ($label:expr, $card:expr)) => {
-		$builder
-			.assertion($label, vec![], $card)
-			.expect("duplicate label or invalid range")
-	};
-	// OLD SYNTAX: (Phase, label, cardinality, equals!(value)) - ignore phase, convert to new syntax
-	($builder:expr, ($phase:ident, $label:expr, $card:expr, equals!($value:expr))) => {
-		$builder
-			.assertion_with_value($label, vec![], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
-			.expect("duplicate label or invalid range")
-	};
-	// OLD SYNTAX: (Phase, label, cardinality) - ignore phase, convert to new syntax
-	($builder:expr, ($phase:ident, $label:expr, $card:expr)) => {
 		$builder
 			.assertion($label, vec![], $card)
 			.expect("duplicate label or invalid range")
@@ -797,9 +785,9 @@ macro_rules! __tb_scenario_verify_impl {
 				}
 
 				$( $( {
-					fn __call_on_pass<F>(f: F, trace: &$crate::testing::trace::ConsumedTrace)
+					fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace)
 					where
-						F: FnOnce(&$crate::testing::trace::ConsumedTrace),
+						F: FnOnce(&$crate::trace::ConsumedTrace),
 					{
 						f(trace)
 					}
@@ -819,9 +807,9 @@ macro_rules! __tb_scenario_verify_impl {
 				}
 
 				$( $( {
-					fn __call_on_fail<F>(f: F, trace: &$crate::testing::trace::ConsumedTrace, violations: &$crate::testing::specs::SpecViolation)
+					fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, violations: &$crate::testing::specs::SpecViolation)
 					where
-						F: FnOnce(&$crate::testing::trace::ConsumedTrace, &$crate::testing::specs::SpecViolation),
+						F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::specs::SpecViolation),
 					{
 						f(trace, violations)
 					}
@@ -882,9 +870,9 @@ macro_rules! __tb_scenario_verify_impl {
 			match &verification_result {
 				Ok(()) => {
 					$( $( {
-						fn __call_on_pass<F>(f: F, trace: &$crate::testing::trace::ConsumedTrace)
+						fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace)
 						where
-							F: FnOnce(&$crate::testing::trace::ConsumedTrace),
+							F: FnOnce(&$crate::trace::ConsumedTrace),
 						{
 							f(trace)
 						}
@@ -893,9 +881,9 @@ macro_rules! __tb_scenario_verify_impl {
 				}
 				Err(_violations) => {
 					$( $( {
-						fn __call_on_fail<F>(f: F, trace: &$crate::testing::trace::ConsumedTrace, violations: &$crate::testing::spec::SpecViolation)
+						fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, violations: &$crate::testing::spec::SpecViolation)
 						where
-							F: FnOnce(&$crate::testing::trace::ConsumedTrace, &$crate::testing::spec::SpecViolation),
+							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::spec::SpecViolation),
 						{
 							f(trace, violations)
 						}

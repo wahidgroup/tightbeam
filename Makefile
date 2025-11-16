@@ -1,4 +1,4 @@
-.PHONY: help help-ref version setup check build clean test lint doc test-all build-fuzz test-fuzz analyze-fuzz clean-fuzz
+.PHONY: help help-ref version setup check build clean test lint doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz
 
 # Project metadata for help/version
 PROJECT := tightbeam
@@ -30,8 +30,8 @@ help-body:
 	@printf '    clean           Clean build artifacts\n'
 	@printf '    test            Run all tests (honors cargo features and no-default)\n'
 	@printf '    test-all        Run tests with all feature combinations\n'
-	@printf '    build-fuzz      Build AFL-instrumented fuzz targets (requires cargo-afl)\n'
-	@printf '    test-fuzz       Build and run AFL fuzz testing for 60 seconds\n'
+	@printf '    fuzz-build      Build AFL-instrumented fuzz targets (requires cargo-afl)\n'
+	@printf '    fuzz-test       Build and run AFL fuzz testing for 60 seconds\n'
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
 	@printf '    lint            Run linters (pass extra clippy args via ARGS)\n'
@@ -79,6 +79,8 @@ build:
 clean:
 	@echo "Cleaning build artifacts..."
 	cargo clean
+	rm -rf built
+	rm -rf target
 
 # Check
 check:
@@ -96,26 +98,35 @@ test-all: build
 	./built/test_all_features.sh
 
 # Build AFL-instrumented fuzz targets
-build-fuzz:
+fuzz-build:
 	@echo "Building AFL-instrumented fuzz targets..."
 	@which cargo-afl >/dev/null 2>&1 || { \
 		echo "Error: cargo-afl not found. Install with: cargo install cargo-afl"; \
 		exit 1; \
 	}
-	@echo "Instrumenting code with AFL coverage tracking..."
-	RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing --features "std,testing-csp"
+	@set -e; \
+	for target in simple_workflow simple_servlet complex_workflow verification; do \
+		echo "  - fuzz_$$target"; \
+		RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_$$target --features "std,testing-fuzz"; \
+	done
+	@echo "  - fuzz_chess"
+	RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_chess --features "std,testing-fuzz,testing-fdr,testing-csp"
 	@echo ""
 	@echo "Fuzz targets built successfully!"
 	@echo ""
-	@echo "Available fuzz targets in tightbeam/tests/fuzz/:"
-	@ls -1 tightbeam/tests/fuzz/*.rs | sed 's/.*\//  - /' | sed 's/\.rs//'
+	@if [ -d tightbeam/fuzz ]; then \
+		echo "Available fuzz targets in tightbeam/fuzz/:"; \
+		ls -1 tightbeam/fuzz | sed 's/^/  - /'; \
+	else \
+		echo "No fuzz directory found at tightbeam/fuzz."; \
+	fi
 	@echo ""
 
 # Run AFL fuzz testing for a short time (60 seconds for CI/smoke testing)
 # Options:
 #   skip-missing-crashes=1  - Skip crash reporting config check (AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1)
 #   skip-cpu-freq=1         - Skip CPU frequency scaling check (AFL_SKIP_CPUFREQ=1)
-test-fuzz: build-fuzz
+fuzz-test: fuzz-build
 	@echo "Cleaning previous fuzz output..."
 	@rm -rf built/fuzz/out
 	@echo "Running AFL fuzz testing for 60 seconds..."
@@ -207,7 +218,7 @@ analyze-fuzz:
 	echo ""; \
 	FUZZ_TARGET=$$(ls target/debug/deps/fuzzing-* 2>/dev/null | grep -v '\.d$$' | head -1); \
 	if [ -z "$$FUZZ_TARGET" ]; then \
-		echo "Error: Fuzz target not built. Run 'make build-fuzz' first."; \
+		echo "Error: Fuzz target not built. Run 'make fuzz-build' first."; \
 		exit 1; \
 	fi; \
 	echo "Running with input from $(file)..."; \

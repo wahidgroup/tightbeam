@@ -6,7 +6,7 @@
 
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{AssertionContract, AssertionLabel};
-use crate::testing::trace::{ConsumedTrace, ExecutionMode};
+use crate::trace::{ConsumedTrace, ExecutionMode};
 use crate::Frame;
 
 #[cfg(feature = "instrument")]

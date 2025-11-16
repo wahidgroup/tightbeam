@@ -11,7 +11,7 @@ use crate::policy::TransitStatus;
 use crate::testing::assertions::AssertionLabel;
 use crate::testing::fdr::config::AcceptanceSet;
 use crate::testing::specs::csp::{Event, Process, State, TransitionRelation};
-use crate::testing::trace::ConsumedTrace;
+use crate::trace::ConsumedTrace;
 
 /// State labels used in FDR trace analysis
 mod state_labels {

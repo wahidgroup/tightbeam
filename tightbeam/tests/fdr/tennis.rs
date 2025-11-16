@@ -107,8 +107,8 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(Any, "pointA", tightbeam::exactly!(4)),
-			(Any, "pointB", tightbeam::exactly!(1))
+			("pointA", tightbeam::exactly!(4)),
+			("pointB", tightbeam::exactly!(1))
 		]
 	},
 }
@@ -146,8 +146,8 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(Any, "pointA", tightbeam::exactly!(1)),
-			(Any, "pointB", tightbeam::exactly!(4))
+			("pointA", tightbeam::exactly!(1)),
+			("pointB", tightbeam::exactly!(4))
 		]
 	},
 }
@@ -187,8 +187,8 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(Any, "pointA", tightbeam::exactly!(5)),
-			(Any, "pointB", tightbeam::exactly!(3))
+			("pointA", tightbeam::exactly!(5)),
+			("pointB", tightbeam::exactly!(3))
 		]
 	},
 }
@@ -228,8 +228,8 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			(Any, "pointA", tightbeam::exactly!(2)),
-			(Any, "pointB", tightbeam::exactly!(1))
+			("pointA", tightbeam::exactly!(2)),
+			("pointB", tightbeam::exactly!(1))
 		]
 	},
 }

@@ -213,7 +213,7 @@ impl Process {
 /// Trait for CSP process specifications that can be validated against traces
 pub trait ProcessSpec {
 	/// Validate a trace against this process specification
-	fn validate_trace(&self, trace: &crate::testing::trace::ConsumedTrace) -> CspValidationResult;
+	fn validate_trace(&self, trace: &crate::trace::ConsumedTrace) -> CspValidationResult;
 }
 
 /// Result of CSP process validation
@@ -265,7 +265,7 @@ impl std::fmt::Display for CspViolation {
 
 impl Process {
 	/// Validate a consumed trace against this CSP process
-	pub fn validate_trace(&self, trace: &crate::testing::trace::ConsumedTrace) -> CspValidationResult {
+	pub fn validate_trace(&self, trace: &crate::trace::ConsumedTrace) -> CspValidationResult {
 		let mut violations = Vec::new();
 		let mut current_state = self.initial;
 
@@ -321,7 +321,7 @@ impl Process {
 }
 
 impl ProcessSpec for Process {
-	fn validate_trace(&self, trace: &crate::testing::trace::ConsumedTrace) -> CspValidationResult {
+	fn validate_trace(&self, trace: &crate::trace::ConsumedTrace) -> CspValidationResult {
 		self.validate_trace(trace)
 	}
 }

@@ -33,6 +33,8 @@ pub enum AssertionValue {
 	Some(Box<AssertionValue>),
 	None,
 	NotNone,
+	RatioActual(u64, u64),
+	RatioLimit(u64, u64),
 }
 
 impl PartialEq for AssertionValue {
@@ -59,9 +61,27 @@ impl PartialEq for AssertionValue {
 			(Self::Version(a), Self::Version(b)) => a == b,
 			(Self::Some(a), Self::Some(b)) => a == b,
 			(Self::None, Self::None) => true,
+			(Self::RatioActual(an, ad), Self::RatioActual(bn, bd)) => ratio_equal(*an, *ad, *bn, *bd),
+			(Self::RatioLimit(an, ad), Self::RatioLimit(bn, bd)) => ratio_equal(*an, *ad, *bn, *bd),
+			(Self::RatioActual(an, ad), Self::RatioLimit(bn, bd)) => ratio_less_equal(*an, *ad, *bn, *bd),
+			(Self::RatioLimit(an, ad), Self::RatioActual(bn, bd)) => ratio_less_equal(*bn, *bd, *an, *ad),
 			_ => false,
 		}
 	}
+}
+
+fn ratio_equal(an: u64, ad: u64, bn: u64, bd: u64) -> bool {
+	if ad == 0 || bd == 0 {
+		return false;
+	}
+	an.saturating_mul(bd) == bn.saturating_mul(ad)
+}
+
+fn ratio_less_equal(an: u64, ad: u64, bn: u64, bd: u64) -> bool {
+	if ad == 0 || bd == 0 {
+		return false;
+	}
+	an.saturating_mul(bd) <= bn.saturating_mul(ad)
 }
 
 // From implementations for ergonomic conversion
@@ -157,6 +177,21 @@ pub struct IsNone;
 impl From<IsNone> for AssertionValue {
 	fn from(_: IsNone) -> Self {
 		Self::None
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RatioLimit(pub u64, pub u64);
+
+impl From<(u64, u64)> for AssertionValue {
+	fn from(pair: (u64, u64)) -> Self {
+		Self::RatioActual(pair.0, pair.1)
+	}
+}
+
+impl From<RatioLimit> for AssertionValue {
+	fn from(limit: RatioLimit) -> Self {
+		Self::RatioLimit(limit.0, limit.1)
 	}
 }
 
