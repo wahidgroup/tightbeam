@@ -2043,8 +2043,6 @@ macro_rules! tb_scenario {
 				);
 				servlet_instance.set_trace(trace_server.clone());
 
-				$crate::tb_scenario!(@reset_servlet_state $servlet_name, &servlet_instance);
-
 				let server_addr = servlet_instance.addr();
 
 				// Wrap client creation in an async block that returns Result

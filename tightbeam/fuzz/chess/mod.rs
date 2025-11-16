@@ -17,12 +17,13 @@ mod utils;
 
 use std::sync::{Arc, Mutex};
 
-use tightbeam::matrix::MatrixLike;
+use tightbeam::matrix::{MatrixDyn, MatrixLike};
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 use board::{
 	ChessEngineServlet, ChessEngineServletConf, ChessMatchManager, ChessMoveRequest, ChessMoveResponse, GameStatusCode,
 };
+use piece::Piece;
 use r#move::ChessMove;
 use state::ChessGameState;
 use utils::restart_game;
@@ -206,12 +207,12 @@ tb_scenario! {
 				stats.move_sent_count += 1;
 
 				// Emit piece kind event only after move is sent (not before validation)
-				if let Some(piece) = piece::Piece::from_u8(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
+				if let Some(piece) = Piece::from_u8(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
 					trace.event(piece.as_kind_label());
 				}
 
 				// Send move request to server with current board state in matrix
-				let matrix = tightbeam::matrix::MatrixDyn::try_from(&client_game_state)?;
+				let matrix = MatrixDyn::try_from(&client_game_state)?;
 				let frame = compose! {
 					V0: id: "chess-client",
 					order: order,
