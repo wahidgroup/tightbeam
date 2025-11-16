@@ -8,6 +8,32 @@
 
 #![cfg(feature = "testing-fdr")]
 
+use tightbeam::testing::fdr::FdrConfig;
+use tightbeam::testing::specs::csp::Process;
+
+fn build_fdr_config(
+	specs: Vec<Process>,
+	seeds: u32,
+	max_depth: usize,
+	max_internal_run: usize,
+	timeout_ms: u64,
+) -> FdrConfig {
+	FdrConfig {
+		seeds,
+		max_depth,
+		max_internal_run,
+		timeout_ms,
+		specs,
+		fail_fast: true,
+		expect_failure: false,
+		scheduler_count: None,
+		process_count: None,
+		scheduler_model: None,
+		fault_model: None,
+		fmea: None,
+	}
+}
+
 // ===== Tennis Game Scoring System =====
 
 tightbeam::tb_process_spec! {
@@ -90,15 +116,13 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_tennis_valid_trace_refinement,
 	spec: ValidTennisSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 16,
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![TennisScorer::process()],
-		fail_fast: true,
-		expect_failure: false,
-	},
+	fdr: build_fdr_config(
+		vec![TennisScorer::process()],
+		4,
+		16,
+		8,
+		500,
+	),
 	environment Bare {
 		exec: |trace| {
 			// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
@@ -131,15 +155,13 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_tennis_invalid_trace_refinement,
 	spec: InvalidTennisSpec,
-		fdr: FdrConfig {
-			seeds: 4,
-			max_depth: 16,
-			max_internal_run: 8,
-			timeout_ms: 500,
-			specs: vec![TennisScorer::process()],
-			fail_fast: true,
-			expect_failure: false,
-		},
+	fdr: build_fdr_config(
+		vec![TennisScorer::process()],
+		4,
+		16,
+		8,
+		500,
+	),
 	environment Bare {
 		exec: |trace| {
 			// Invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
@@ -174,15 +196,13 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_tennis_deuce_to_advantage,
 	spec: DeuceTennisSpec,
-		fdr: FdrConfig {
-			seeds: 4,
-			max_depth: 16,
-			max_internal_run: 8,
-			timeout_ms: 500,
-			specs: vec![TennisScorer::process()],
-			fail_fast: true,
-			expect_failure: false,
-		},
+	fdr: build_fdr_config(
+		vec![TennisScorer::process()],
+		4,
+		16,
+		8,
+		500,
+	),
 	environment Bare {
 		exec: |trace| {
 			// Valid trace going through deuce: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
@@ -217,15 +237,13 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_failures_refinement,
 	spec: FailuresTennisSpec,
-		fdr: FdrConfig {
-			seeds: 4,
-			max_depth: 16,
-			max_internal_run: 8,
-			timeout_ms: 500,
-			specs: vec![TennisScorer::process()],
-			fail_fast: true,
-			expect_failure: false,
-		},
+	fdr: build_fdr_config(
+		vec![TennisScorer::process()],
+		4,
+		16,
+		8,
+		500,
+	),
 	environment Bare {
 		exec: |trace| {
 			// Create a trace that should pass failures refinement

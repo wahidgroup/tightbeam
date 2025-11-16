@@ -16,39 +16,58 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TbEventKind {
+	Start,
+	End,
+	GateAccept,
+	GateReject,
+	RequestRecv,
+	ResponseSend,
+	AssertLabel,
+	AssertPayload,
+	HandlerEnter,
+	HandlerExit,
+	CryptoStep,
+	CompressStep,
+	RouteStep,
+	PolicyEval,
+	ProcessTransition,
+	ProcessHidden,
+	SeedStart,
+	SeedEnd,
+	StateExpand,
+	StatePrune,
+	DivergenceDetect,
+	RefusalSnapshot,
+	EnabledSetSample,
+	Warn,
+	Error,
+	// Timing events
+	TimingWcet,
+	TimingDeadline,
+	TimingJitter,
+	TimingSlack,
+	// Fault events
+	FaultInjected,
+	FaultRecovered,
+	FaultDetected,
+	// Schedulability events
+	TaskRelease,
+	TaskComplete,
+	TaskMissedDeadline,
+	// Scheduler events
+	SchedulerAllocate,
+	SchedulerRelease,
+	SchedulerBlocked,
+}
 #[cfg(not(feature = "instrument"))]
 pub mod stub {
-	use crate::TightBeamError;
+	use super::*;
+
 	use core::time::Duration;
 
-	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-	pub enum TbEventKind {
-		Start,
-		End,
-		GateAccept,
-		GateReject,
-		RequestRecv,
-		ResponseSend,
-		AssertLabel,
-		AssertPayload,
-		HandlerEnter,
-		HandlerExit,
-		CryptoStep,
-		CompressStep,
-		RouteStep,
-		PolicyEval,
-		ProcessTransition,
-		ProcessHidden,
-		SeedStart,
-		SeedEnd,
-		StateExpand,
-		StatePrune,
-		DivergenceDetect,
-		RefusalSnapshot,
-		EnabledSetSample,
-		Warn,
-		Error,
-	}
+	use crate::TightBeamError;
 
 	#[derive(Clone, Debug)]
 	pub struct TbEvent {
@@ -102,40 +121,13 @@ pub mod stub {
 
 #[cfg(feature = "instrument")]
 pub mod active {
+	use super::*;
+
 	use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 	use std::sync::{Arc, Mutex, OnceLock};
 
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::TightBeamError;
-
-	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-	pub enum TbEventKind {
-		Start,
-		End,
-		GateAccept,
-		GateReject,
-		RequestRecv,
-		ResponseSend,
-		AssertLabel,
-		AssertPayload,
-		HandlerEnter,
-		HandlerExit,
-		CryptoStep,
-		CompressStep,
-		RouteStep,
-		PolicyEval,
-		ProcessTransition,
-		ProcessHidden,
-		SeedStart,
-		SeedEnd,
-		StateExpand,
-		StatePrune,
-		DivergenceDetect,
-		RefusalSnapshot,
-		EnabledSetSample,
-		Warn,
-		Error,
-	}
 
 	#[derive(Clone, Debug)]
 	pub struct TbEvent {

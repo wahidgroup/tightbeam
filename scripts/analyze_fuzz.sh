@@ -74,25 +74,25 @@ ARGUMENTS:
     AFL_ARGS             Additional arguments passed to AFL (after --)
 
 OPTIONS:
-    -h, --help            Show this help message and exit
-    -V, --version         Show version information and exit
-    -n, --no-ui           Run without showing AFL UI (output redirected)
-    -c, --skip-checks     Skip AFL system configuration checks (sets both flags)
+    -h, --help                Show this help message and exit
+    -V, --version             Show version information and exit
+    -n, --no-ui               Run without showing AFL UI (output redirected)
+    -c, --skip-checks         Skip AFL system configuration checks (sets both flags)
     -C, --skip-crash-check    Skip crash reporting config check
     -F, --skip-cpu-freq       Skip CPU frequency scaling check
-    -k, --keep-output     Don't clean previous fuzz output
-    -s, --seeds DIR       Custom seed directory (auto-detected if not specified)
-    -v, --verify          Enable code verification (requires verify-pattern option)
-    -p, --pattern PAT     Add a code verification pattern (format: "feature:pattern")
-                         Can be specified multiple times. Requires --verify.
+    -k, --keep-output         Don't clean previous fuzz output
+    -s, --seeds DIR           Custom seed directory (auto-detected if not specified)
+    -v, --verify              Enable code verification (requires verify-pattern option)
+    -p, --pattern PAT         Add a code verification pattern (format: "feature:pattern")
+                              Can be specified multiple times. Requires --verify.
 
 EXAMPLES:
     $PROJECT chess 60                    Run chess fuzz test for 60 seconds
-    $PROJECT chess 300 -n               Run chess fuzz test for 5 minutes without UI
-    $PROJECT simple_workflow 120        Run simple_workflow test for 2 minutes
-    $PROJECT chess 60 -s custom/seeds  Use custom seed directory
+    $PROJECT chess 300 -n                Run chess fuzz test for 5 minutes without UI
+    $PROJECT simple_workflow 120         Run simple_workflow test for 2 minutes
+    $PROJECT chess 60 -s custom/seeds    Use custom seed directory
     $PROJECT chess 60 --verify -p "Game restart:game_restarted" -p "Loop:loop {"
-    $PROJECT chess 60 -- -- -m none     Pass AFL arguments (e.g., memory limit)
+    $PROJECT chess 60 -- -- -m none      Pass AFL arguments (e.g., memory limit)
 
 EXIT STATUS:
     0    Success

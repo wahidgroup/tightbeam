@@ -61,6 +61,7 @@ where
 	///
 	/// The cache is managed by the refinement checker, which receives it during construction.
 	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R) -> Self {
+		config.validate_features();
 		Self { process, config, explorer, refinement, verdict: FdrVerdict::default() }
 	}
 

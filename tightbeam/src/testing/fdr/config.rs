@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+use crate::testing::specs::csp::Process;
+
 /// CSP trace: sequence of observable events
 pub type Trace = Vec<crate::testing::specs::csp::Event>;
 
@@ -16,6 +18,56 @@ pub type Failure = (Trace, RefusalSet);
 
 /// Acceptance set: events accepted after trace
 pub type AcceptanceSet = HashSet<crate::testing::specs::csp::Event>;
+
+/// Scheduler model type
+/// Panics if used when `testing-fault` feature is not enabled
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerModel {
+	/// Cooperative scheduling (yield-based)
+	Cooperative,
+	/// Preemptive scheduling (time-sliced)
+	Preemptive,
+}
+
+/// Fault injection strategy
+/// Panics if used when `testing-fault` feature is not enabled
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionStrategy {
+	/// Deterministic fault injection (seed-based)
+	Deterministic,
+	/// Random fault injection
+	Random,
+}
+
+/// Fault type for injection
+/// Panics if used when `testing-fault` feature is not enabled
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fault {
+	/// Network packet drop
+	NetworkDrop { probability: f64 },
+	/// Message corruption
+	MessageCorruption { probability: f64 },
+	/// Node crash
+	NodeCrash { probability: f64 },
+}
+
+/// Fault model configuration
+/// Panics if used when `testing-fault` feature is not enabled
+#[derive(Debug, Clone)]
+pub struct FaultModel {
+	/// List of faults to inject
+	pub faults: Vec<Fault>,
+	/// Injection strategy
+	pub injection_strategy: InjectionStrategy,
+}
+
+/// FMEA configuration (automatic analysis only)
+/// Panics if used when `testing-fmea` feature is not enabled
+#[derive(Debug, Clone)]
+pub struct FmeaConfig {
+	/// Enable automatic FMEA analysis
+	pub enabled: bool,
+}
 
 /// FDR configuration for refinement checking and multi-seed exploration
 ///
@@ -38,7 +90,7 @@ pub struct FdrConfig {
 
 	/// Additional processes for refinement checking
 	/// If provided, check: specs[0] ⊑ main_process
-	pub specs: Vec<crate::testing::specs::csp::Process>,
+	pub specs: Vec<Process>,
 
 	/// Stop refinement checking on first violation (fast-fail mode)
 	/// When true (default), returns immediately after finding first counter-example
@@ -49,6 +101,27 @@ pub struct FdrConfig {
 	/// When true, the test passes if refinement fails (proving the trace violates the spec)
 	/// When false (default), the test fails if refinement fails
 	pub expect_failure: bool,
+
+	/// Number of schedulers (m) - for resource constraint modeling
+	/// When m < n (process_count), some traces become impossible
+	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
+	pub scheduler_count: Option<u32>,
+
+	/// Number of concurrent processes (n) - for resource constraint modeling
+	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
+	pub process_count: Option<u32>,
+
+	/// Scheduler model type (Cooperative or Preemptive)
+	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
+	pub scheduler_model: Option<SchedulerModel>,
+
+	/// Fault injection model
+	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
+	pub fault_model: Option<FaultModel>,
+
+	/// FMEA analysis configuration
+	/// Panics if set to Some(_) when `testing-fmea` feature is not enabled
+	pub fmea: Option<FmeaConfig>,
 }
 
 impl Default for FdrConfig {
@@ -61,8 +134,48 @@ impl Default for FdrConfig {
 			specs: Vec::new(),
 			fail_fast: true,
 			expect_failure: false,
+			scheduler_count: None,
+			process_count: None,
+			scheduler_model: None,
+			fault_model: None,
+			fmea: None,
 		}
 	}
+}
+
+impl FdrConfig {
+	/// Validate that feature-gated fields are only set when features are enabled
+	/// Panics if any feature-gated field is set but the required feature is not enabled
+	pub fn validate_features(&self) {
+		if self.scheduler_count.is_some()
+			|| self.process_count.is_some()
+			|| self.scheduler_model.is_some()
+			|| self.fault_model.is_some()
+		{
+			#[cfg(not(feature = "testing-fault"))]
+			panic!(
+				"FdrConfig: scheduler_count, process_count, scheduler_model, or fault_model set but `testing-fault` feature is not enabled"
+			);
+		}
+
+		if self.fmea.is_some() {
+			#[cfg(not(feature = "testing-fmea"))]
+			panic!("FdrConfig: fmea set but `testing-fmea` feature is not enabled");
+		}
+	}
+}
+
+/// Validate probability is in range [0.0, 1.0] at compile time
+/// Helper macro for validating probabilities (must be used in const context)
+#[cfg(feature = "testing-fault")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __validate_probability {
+	($p:expr) => {{
+		// Compile-time assertion: probability must be in [0.0, 1.0]
+		const _: () = assert!($p >= 0.0 && $p <= 1.0, "Probability must be in range [0.0, 1.0]");
+		$p
+	}};
 }
 
 /// FDR verification verdict
@@ -154,7 +267,7 @@ impl Default for FdrVerdict {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
+	use crate::testing::specs::csp::{State, TransitionRelation};
 	// Tests for FdrConfig
 	mod config {
 		use super::*;
@@ -177,16 +290,18 @@ mod tests {
 			assert!(config_exploration.specs.is_empty());
 
 			// Mode 2: Refinement checking
-			let spec = crate::testing::specs::csp::Process {
+			let spec = Process {
 				name: "Spec",
 				description: Some("Test spec"),
-				initial: crate::testing::specs::csp::State("S0"),
-				states: vec![crate::testing::specs::csp::State("S0")].into_iter().collect(),
+				initial: State("S0"),
+				states: vec![State("S0")].into_iter().collect(),
 				observable: HashSet::new(),
 				hidden: HashSet::new(),
 				choice: HashSet::new(),
-				terminal: vec![crate::testing::specs::csp::State("S0")].into_iter().collect(),
-				transitions: crate::testing::specs::csp::TransitionRelation::new(),
+				terminal: vec![State("S0")].into_iter().collect(),
+				transitions: TransitionRelation::new(),
+				#[cfg(feature = "testing-timing")]
+				timing_constraints: None,
 			};
 			let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
 			assert!(!config_refinement.specs.is_empty());

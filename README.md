@@ -382,7 +382,6 @@ struct SecureMessage { data: Vec<u8> }
 let frame = compose! {
 	V1: id: b"msg-001",
 		order: 1696521900,
-		lifetime: 3600,
 		message_integrity: type Sha3_256,
 		confidentiality<Aes256GcmOid, _>: &cipher,
 		nonrepudiation<Secp256k1Signature, _>: &signing_key,
@@ -1669,7 +1668,7 @@ Client                              Server
   │ ◄── SecurityAccept ─────────────  │
   │     selected_profile:             │
   │       Profile1 (SHA3-256+         │
-  │       AES-256-GCM+secp256k1)      │
+  │       AES-128-GCM+secp256k1)      │
   │                                   │
   ├═══════════════════════════════════┤
   │ All subsequent operations use     │
@@ -1882,7 +1881,7 @@ The Worker environment:
 - Calls `setup` constructor with TraceCollector to create worker instance
 - Executes `stimulus` closure with trace and mutable worker reference
 - Collects assertions from worker operations
-- Verifies against spec and CSP after execution
+- Verifies against spec and process after execution
 - Does not involve transport layer (workers operate on local data)
 
 #### 9.3.2 E: Servlets
@@ -1979,7 +1978,7 @@ tb_assert_spec! {
 	},
 }
 
-// Define CSP process spec for servlet state machine
+// Define process spec for servlet state machine
 tb_process_spec! {
 	pub PingPongProcess,
 	events {
@@ -2041,7 +2040,7 @@ The Servlet environment automatically:
 - Manages the servlet lifecycle
 - Provides a client connected to the servlet
 - Collects assertions from both servlet handlers and client code
-- Verifies against the spec and CSP after execution
+- Verifies against the spec and process model after execution
 
 #### 9.3.3 C: Clusters - WIP
 
@@ -2370,7 +2369,7 @@ assertions: [
 	("lifetime", exactly!(1), equals!(3_600)),
 	("version", exactly!(1), equals!(Version::V2)),
 	("confidentiality", exactly!(1), equals!(IsSome)),
-	("optional_field", exactly!(1), equals!(None))
+	("optional_field", exactly!(1), equals!(IsNone))
 ]
 ```
 
@@ -2392,7 +2391,7 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v0"],
 		assertions: [
-			("feature", exactly!(1), equals!(IsNone))
+			("feature", exactly!(1), equals!(IsNone)),
 		]
 	},
 	V(1,0,0): {
@@ -2400,7 +2399,8 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v1"],
 		assertions: [
-			("feature", exactly!(1), equals!(IsSome))
+			("feature", exactly!(1), equals!(IsNone)),
+			("v1_specific", exactly!(1))
 		]
 	}
 }
@@ -2412,6 +2412,7 @@ tb_scenario! {
 		exec: |trace| {
 			// Single assertion satisfies both version specs via tags
 			trace.assert_option("feature", &["v0", "v1"], &some_option);
+			trace.assert("v2_specific", &["v1"]);
 			Ok(())
 		}
 	}
@@ -2583,8 +2584,8 @@ tb_scenario! {
 	},
 	environment Bare {
 		exec: |trace| {
-			trace.event("start");
-			trace.event("finish");
+			trace.assert("start", &[]);
+			trace.assert("finish", &[]);
 			Ok(())
 		}
 	}
@@ -2664,7 +2665,8 @@ pub struct FdrVerdict {
 - **deadlock_witness**: (seed, trace, state) if found
 - **failing_seed**: Seed that caused failure, if any
 
-**Note**: Refinement properties (trace_refines, failures_refines, divergence_refines) are only meaningful when specs are provided in FdrConfig.
+**Note**: Refinement properties (trace_refines, failures_refines,
+divergence_refines) are only meaningful when specs are provided in FdrConfig.
 
 ### 10.5 Formal CSP Theory
 
@@ -2717,7 +2719,7 @@ agree on observable behavior.
 checking where implementations contain details absent from abstract specifications.
 Hidden events are projected away when comparing traces: `trace \ {τ}`.
 
-The instrumentation taxonomy (§11.2) maps tightbeam events to CSP categories:
+The instrumentation taxonomy (§11.2) maps tightbeam events to categories:
 - **Observable**: `gate_accept`, `gate_reject`, `request_recv`, `response_send`, `assert_label`
 - **Hidden (τ)**: `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`, `process_hidden`
 
@@ -3053,7 +3055,7 @@ tb_scenario! {
 
 This test verifies:
 - **L1**: Correct assertion labels and cardinalities
-- **L2**: Valid CSP state transitions with internal events
+- **L2**: Valid state transitions with internal events
 - **L3**: Trace refinement across multiple exploration seeds
 
 ### 10.7 Coverage-Guided Fuzzing with AFL
@@ -3071,14 +3073,14 @@ compile-time instrumentation to discover inputs that trigger new code paths.
 3. **Feedback Loop**: Monitors code coverage, keeps inputs that discover new paths
 4. **Crash Detection**: Automatically detects crashes, hangs, and assertion failures
 
-**Integration with tb_scenario!**: The `fuzz: afl` parameter generates AFL-compatible
-fuzz targets that leverage the CSP oracle for guided exploration:
+**Integration with tb_scenario!**: The `fuzz: afl` parameter generates
+AFL-compatible fuzz targets that leverage the oracle for guided exploration:
 
 ```rust
 tb_scenario! {
 	fuzz: afl,              // ← AFL fuzzing mode
 	spec: MySpec,
-	csp: MyProcess,         // ← CSP oracle for valid state navigation
+	csp: MyProcess,         // ← oracle for valid state navigation
 	environment Bare {
 		exec: |trace| {
 			// AFL provides random bytes, oracle navigates state machine
@@ -3203,7 +3205,7 @@ AFL Random Bytes          CspOracle                State Machine
 ```
 
 **Benefits**:
-1. **Valid Traces Only**: Oracle ensures all fuzz inputs produce valid CSP traces
+1. **Valid Traces Only**: Oracle ensures all fuzz inputs produce valid traces
 2. **Nondeterminism Exploration**: AFL discovers which byte patterns lead to different branches
 3. **Coverage Feedback**: AFL learns which choices uncover new code paths
 4. **Crash Attribution**: Crashes map to specific state sequences
@@ -3239,7 +3241,7 @@ eliminating manual annotation while providing formal state coverage guarantees:
 | **Annotation Burden** | Developer must identify & annotate | Derived from `tb_process_spec!` |
 | **Coverage Metric** | Arbitrary program values | State + transition coverage (provable) |
 | **State Abstraction** | Low-level (memory, counters, etc.) | High-level (protocol semantics) |
-| **Validation** | None (annotations may be incorrect) | CSP trace validation (runtime checking) |
+| **Validation** | None (annotations may be incorrect) | Trace validation (runtime checking) |
 | **Integration** | Explicit `IJON_MAX`/`IJON_SET` calls | Automatic when `testing-fuzz-ijon` enabled |
 
 **Automatic IJON Integration**:
@@ -3250,7 +3252,7 @@ automatically inserts IJON calls after each successful fuzz execution
 **Comparison with Pure AFL**:
 
 Without IJON, AFL relies solely on code coverage (edge hit counts). With
-tightbeam's CSP oracle + IJON:
+tightbeam's oracle + IJON:
 
 - **AFL alone**: Discovers `branch_A`, `branch_B`, `branch_C` (syntax)
 - **AFL + CSP oracle**: Discovers `State_Init → State_Processing → State_Done` (semantics)

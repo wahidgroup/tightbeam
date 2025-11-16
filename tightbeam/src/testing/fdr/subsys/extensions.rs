@@ -561,6 +561,8 @@ impl FdrTraceExt for ConsumedTrace {
 			hidden,
 			transitions,
 			description: Some(description),
+			#[cfg(feature = "testing-timing")]
+			timing_constraints: None,
 		}
 	}
 }

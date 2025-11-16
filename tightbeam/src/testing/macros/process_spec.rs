@@ -1,37 +1,9 @@
 //! tb_process_spec! macro for defining CSP processes
 
-/// Define a CSP Process with declarative syntax
-///
-/// # Syntax
-///
-/// ```ignore
-/// tb_process_spec! {
-///     pub HandshakeSpec,
-///     events {
-///         observable { "start", "send", "ack", "fail" }
-///         hidden { "serialize", "encrypt", "queue", "dispatch" }
-///     }
-///     states {
-///         S0  => { "start" => S1 },
-///         S1  => { "serialize" => S1s, "queue" => S1q },
-///         S1s => { "encrypt" => S1e },
-///         S1e => { "send" => S2 },
-///         S1q => { "dispatch" => S1d },
-///         S1d => { "send" => S2 },
-///         S2  => { "ack" => S3, "fail" => S3f },
-///         S3  => {},
-///         S3f => {}
-///     }
-///     terminal { S3, S3f }
-///     choice { S1 }
-///     annotations { description: "Queued or direct send" }
-/// }
-/// ```
-///
-/// **Note**: State definitions must be separated by commas.
+/// Define a CSP Process with declarative syntax.
 #[macro_export]
 macro_rules! tb_process_spec {
-	// Main pattern with all sections
+	// Pattern with timing block
 	(
 		$(#[$meta:meta])*
 		$vis:vis $name:ident,
@@ -45,6 +17,46 @@ macro_rules! tb_process_spec {
 		terminal { $($term_state:ident),* $(,)? }
 		$(choice { $($choice_state:ident),* $(,)? })?
 		$(annotations { description: $desc:expr })?
+		$(timing {
+			$($timing_event:expr => $timing_constraint:expr),* $(,)?
+		})?
+	) => {
+		$crate::tb_process_spec! {
+			@impl
+			$(#[$meta])*
+			$vis $name,
+			events {
+				observable { $($obs_event),* }
+				hidden { $($hid_event),* }
+			}
+			states {
+				$($from_state => { $($event => $to_state),* }),*
+			}
+			terminal { $($term_state),* }
+			$(choice { $($choice_state),* })?
+			$(annotations { description: $desc })?
+			$(timing {
+				$($timing_event => $timing_constraint),*
+			})?
+		}
+	};
+	// Implementation pattern
+	(@impl
+		$(#[$meta:meta])*
+		$vis:vis $name:ident,
+		events {
+			observable { $($obs_event:expr),* }
+			hidden { $($hid_event:expr),* }
+		}
+		states {
+			$($from_state:ident => { $($event:expr => $to_state:ident),* }),*
+		}
+		terminal { $($term_state:ident),* }
+		$(choice { $($choice_state:ident),* })?
+		$(annotations { description: $desc:expr })?
+		$(timing {
+			$($timing_event:expr => $timing_constraint:expr),*
+		})?
 	) => {
 		$(#[$meta])*
 		$vis struct $name;
@@ -108,6 +120,23 @@ macro_rules! tb_process_spec {
 				// Add description if present
 				$(
 					builder = builder.description($desc);
+				)?
+
+				// Build timing constraints if present
+				$(
+					#[cfg(feature = "testing-timing")]
+					{
+						use $crate::testing::specs::csp::Event;
+						use $crate::testing::timing::TimingConstraints;
+						let mut timing_constraints = TimingConstraints::new();
+						$(
+							timing_constraints.add(
+								Event($timing_event),
+								$timing_constraint
+							);
+						)*
+						builder = builder.timing_constraints(timing_constraints);
+					}
 				)?
 
 				builder.build().expect("Failed to build Process")

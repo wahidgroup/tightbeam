@@ -39,6 +39,7 @@ words:
   - FIPS
   - Flaggable
   - flagset
+  - fmea
   - getopt
   - getrandom
   - hashint
@@ -85,11 +86,13 @@ words:
   - rustup
   - rwlock
   - SBMF
+  - Schedulability
   - schnorr
   - Schumilo
   - SECG
   - seckey
   - Secp
+  - seqs
   - SKIP_CPUFREQ
   - smime
   - spki
@@ -102,6 +105,7 @@ words:
   - usize
   - Verlag
   - Wahid
+  - Wcet
   - Wrkr
   - Xorshift
   - zeekstd

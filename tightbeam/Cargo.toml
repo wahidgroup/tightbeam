@@ -95,6 +95,10 @@ full = [
 	"testing-csp",
 	"testing-fdr",
 	"testing-fuzz",
+	"testing-timing",
+	"testing-schedulability",
+	"testing-fault",
+	"testing-fmea",
 	"instrument",
 	"rayon",
 	"colony",
@@ -115,6 +119,10 @@ colony = ["full"]
 testing = []
 testing-csp = ["testing"]
 testing-fdr = ["testing", "testing-csp"]
+testing-timing = ["testing", "time"]
+testing-schedulability = ["testing", "testing-timing"]
+testing-fault = ["testing", "testing-fdr"]
+testing-fmea = ["testing", "testing-fault"]
 testing-fuzz = ["testing", "dep:afl"]
 testing-fuzz-ijon = ["testing-fuzz"]
 instrument = ["std", "sha3"]

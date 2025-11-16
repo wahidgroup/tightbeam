@@ -107,13 +107,6 @@ tb_scenario! {
 	fuzz: afl,
 	environment Servlet {
 		servlet: EchoServlet,
-		start: async move {
-			// DEBUG: Track servlet start
-			let _ = std::fs::write("/tmp/simple_servlet_start.txt", "servlet_starting\n");
-			let servlet = EchoServlet::<NumberRequest>::start(None).await?;
-			let _ = std::fs::write("/tmp/simple_servlet_started.txt", format!("servlet_started: addr={:?}\n", servlet.addr()));
-			Ok::<EchoServlet<NumberRequest>, tightbeam::TightBeamError>(servlet)
-		},
 		client: |trace, mut client| async move {
 			// DEBUG: Track client entry
 			let _ = std::fs::write("/tmp/simple_servlet_client_entry.txt", "client_started\n");

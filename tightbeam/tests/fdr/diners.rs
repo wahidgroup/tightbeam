@@ -5,6 +5,33 @@
 
 #![cfg(feature = "testing-fdr")]
 
+use tightbeam::testing::fdr::FdrConfig;
+use tightbeam::testing::specs::csp::Process;
+
+fn build_fdr_config(
+	specs: Vec<Process>,
+	seeds: u32,
+	max_depth: usize,
+	max_internal_run: usize,
+	timeout_ms: u64,
+	expect_failure: bool,
+) -> FdrConfig {
+	FdrConfig {
+		seeds,
+		max_depth,
+		max_internal_run,
+		timeout_ms,
+		specs,
+		fail_fast: true,
+		expect_failure,
+		scheduler_count: None,
+		process_count: None,
+		scheduler_model: None,
+		fault_model: None,
+		fmea: None,
+	}
+}
+
 // ===== Dining Philosophers (Simplified - 2 philosophers) =====
 
 tightbeam::tb_process_spec! {
@@ -209,15 +236,14 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_philosophers_valid_trace_refinement,
 	spec: ValidPhilosopherSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 16,
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![DiningPhilosophers::process()],
-		fail_fast: true,
-		expect_failure: false,
-	},
+	fdr: build_fdr_config(
+		vec![DiningPhilosophers::process()],
+		4,
+		16,
+		8,
+		500,
+		false,
+	),
 	environment Bare {
 		exec: |trace| {
 			// Valid trace: one philosopher completes full cycle
@@ -254,15 +280,14 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_trace_refinement,
 	spec: DeadlockPhilosopherSpec,
-	fdr: FdrConfig {
-		seeds: 1, // Not used for refinement checking
-		max_depth: 10, // Reduced depth - trace is only 6 events
-		max_internal_run: 8,
-		timeout_ms: 2000, // Increased timeout for complex spec
-		specs: vec![DiningPhilosophers::process()],
-		fail_fast: true,
-		expect_failure: false,
-	},
+	fdr: build_fdr_config(
+		vec![DiningPhilosophers::process()],
+		1,
+		10,
+		8,
+		2000,
+		false,
+	),
 	environment Bare {
 		exec: |trace| {
 			// Trace: Philosopher 1 picks left, Philosopher 2 picks left (deadlock)
@@ -301,15 +326,14 @@ tightbeam::tb_assert_spec! {
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_free_refinement,
 	spec: DeadlockFreePhilosopherSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 18, // Reduced depth - trace is only 16 events, but spec has cycles
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![DeadlockFreePhilosophers::process()],
-		fail_fast: true,
-		expect_failure: false,
-	},
+	fdr: build_fdr_config(
+		vec![DeadlockFreePhilosophers::process()],
+		4,
+		18,
+		8,
+		500,
+		false,
+	),
 	environment Bare {
 		exec: |trace| {
 			// Valid deadlock-free trace: P1 completes cycle, then P2 completes cycle
@@ -344,16 +368,14 @@ tightbeam::tb_scenario! {
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_violates_deadlock_free,
 	spec: DeadlockPhilosopherSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 16,
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![DeadlockFreePhilosophers::process()],
-		fail_fast: true,
-		// This test expects refinement to fail (deadlock violates deadlock-free spec)
-		expect_failure: true,
-	},
+	fdr: build_fdr_config(
+		vec![DeadlockFreePhilosophers::process()],
+		4,
+		16,
+		8,
+		500,
+		true,
+	),
 	environment Bare {
 		exec: |trace| {
 			// Trace: Philosopher 1 picks left, Philosopher 2 picks left (deadlock)

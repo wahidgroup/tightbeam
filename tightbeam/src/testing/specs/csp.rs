@@ -122,6 +122,7 @@ impl Default for TransitionRelation {
 /// - Hidden alphabet (internal τ events)
 /// - Transition relation
 /// - Nondeterministic choice points
+/// - Timing constraints (optional, for real-time verification)
 #[derive(Debug, Clone)]
 pub struct Process {
 	/// Human-readable name
@@ -150,6 +151,10 @@ pub struct Process {
 
 	/// Optional description
 	pub description: Option<&'static str>,
+
+	/// Timing constraints for real-time verification
+	#[cfg(feature = "testing-timing")]
+	pub timing_constraints: Option<crate::testing::timing::TimingConstraints>,
 }
 
 impl Process {
@@ -333,6 +338,8 @@ pub struct ProcessBuilder {
 	hidden: HashSet<Event>,
 	transitions: TransitionRelation,
 	description: Option<&'static str>,
+	#[cfg(feature = "testing-timing")]
+	timing_constraints: Option<crate::testing::timing::TimingConstraints>,
 }
 
 impl ProcessBuilder {
@@ -347,6 +354,8 @@ impl ProcessBuilder {
 			hidden: HashSet::new(),
 			transitions: TransitionRelation::new(),
 			description: None,
+			#[cfg(feature = "testing-timing")]
+			timing_constraints: None,
 		}
 	}
 
@@ -394,6 +403,12 @@ impl ProcessBuilder {
 		self
 	}
 
+	#[cfg(feature = "testing-timing")]
+	pub fn timing_constraints(mut self, constraints: crate::testing::timing::TimingConstraints) -> Self {
+		self.timing_constraints = Some(constraints);
+		self
+	}
+
 	pub fn build(self) -> Result<Process, &'static str> {
 		let initial = self.initial.ok_or("Initial state not set")?;
 
@@ -407,6 +422,8 @@ impl ProcessBuilder {
 			hidden: self.hidden,
 			transitions: self.transitions,
 			description: self.description,
+			#[cfg(feature = "testing-timing")]
+			timing_constraints: self.timing_constraints,
 		})
 	}
 }
