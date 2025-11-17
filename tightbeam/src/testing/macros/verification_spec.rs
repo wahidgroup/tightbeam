@@ -553,6 +553,7 @@ macro_rules! __tb_assert_spec_build {
 		events: [ $( $ev:ident ),* $(,)? ]
 		$(, tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
+		$(, schedulability: { $($sched_content:tt)* })?
 	) => {{
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
@@ -577,8 +578,37 @@ macro_rules! __tb_assert_spec_build {
 				builder = builder.required_events(&[$crate::instrumentation::TbEventKind::$ev]);
 			)*
 		}
+		$(
+			#[cfg(feature = "testing-timing")]
+			{
+				$crate::__tb_assert_spec_parse_schedulability!(builder, $($sched_content)*);
+			}
+		)?
 		$vec.push(builder.build());
 	}};
+}
+
+// Helper to parse schedulability assertions
+#[doc(hidden)]
+#[cfg(feature = "testing-timing")]
+#[macro_export]
+macro_rules! __tb_assert_spec_parse_schedulability {
+	(
+		$builder:ident,
+		task_set: $task_set:expr,
+		scheduler: $scheduler:ident,
+		must_be_schedulable: $must_be:expr,
+	) => {
+		// Schedulability is checked during verification, not at build time
+		// Store it in the spec for later validation
+		// For now, we'll add it as metadata that can be checked during verification
+		// This requires extending BuiltAssertSpec to store schedulability info
+		// For now, we'll just ensure the task set is valid
+		let _task_set = $task_set;
+		let _scheduler = $crate::testing::schedulability::SchedulerType::$scheduler;
+		let _must_be = $must_be;
+		// TODO: Store in spec for verification
+	};
 }
 
 // Helper to add individual assertions (handles tags and values)
@@ -623,6 +653,7 @@ macro_rules! tb_assert_spec {
 			$( tag_filter: [ $( $tag:expr ),* $(,)? ], )?
 			assertions: [ $( $assertion:tt ),* $(,)? ]
 			$(, events: [ $( $ev:ident ),* $(,)? ])?
+			$(, schedulability: { $($sched_content:tt)* })?
 		} ),+ $(,)?
 		$(, annotations { description: $desc:expr })?
 	) => {
@@ -643,6 +674,7 @@ macro_rules! tb_assert_spec {
 								events: [ $( $( $ev ),* )? ]
 								$(, tag_filter: [ $( $tag ),* ])?,
 								description: desc_opt
+								$(, schedulability: { $($sched_content)* })?
 							);
 						)+
 						v
@@ -663,6 +695,7 @@ macro_rules! tb_assert_spec {
 								events: [ $( $( $ev ),* )? ]
 								$(, tag_filter: [ $( $tag ),* ])?,
 								description: desc_opt
+								$(, schedulability: { $($sched_content)* })?
 							);
 						)+
 						unsafe { VEC = Some(v); }

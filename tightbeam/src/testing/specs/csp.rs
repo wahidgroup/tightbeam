@@ -687,8 +687,8 @@ mod tests {
 		// Define CSP process using tb_process_spec! macro
 		// This models the theoretical state machine behavior
 		crate::tb_process_spec! {
-		pub ComprehensiveHandshake,
-		events {
+			pub ComprehensiveHandshake,
+			events {
 				observable { "start", "send", "ack", "fail" }
 				hidden { "serialize", "encrypt", "queue", "dispatch" }
 			}

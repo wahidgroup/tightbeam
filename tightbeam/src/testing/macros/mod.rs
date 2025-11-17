@@ -156,6 +156,63 @@ macro_rules! deadline {
 	};
 }
 
+/// Helper macro for timing guard expressions in tb_process_spec!
+///
+/// Usage:
+///   guard!(x < 10ms)  -> ClockLessThan
+///   guard!(x <= 5ms)  -> ClockLessEqual
+///   guard!(x > 20ms)  -> ClockGreaterThan
+///   guard!(x >= 15ms) -> ClockGreaterEqual
+///   guard!(x == 10ms) -> ClockEquals
+///   guard!(5ms <= x <= 10ms) -> ClockInRange
+#[cfg(feature = "testing-timing")]
+#[macro_export]
+macro_rules! guard {
+	// Less than: x < 10ms
+	($clock:ident < $dur:expr) => {
+		$crate::testing::timing::TimingGuard::ClockLessThan(
+			stringify!($clock).to_string(),
+			$dur,
+		)
+	};
+	// Less than or equal: x <= 5ms
+	($clock:ident <= $dur:expr) => {
+		$crate::testing::timing::TimingGuard::ClockLessEqual(
+			stringify!($clock).to_string(),
+			$dur,
+		)
+	};
+	// Greater than: x > 20ms
+	($clock:ident > $dur:expr) => {
+		$crate::testing::timing::TimingGuard::ClockGreaterThan(
+			stringify!($clock).to_string(),
+			$dur,
+		)
+	};
+	// Greater than or equal: x >= 15ms
+	($clock:ident >= $dur:expr) => {
+		$crate::testing::timing::TimingGuard::ClockGreaterEqual(
+			stringify!($clock).to_string(),
+			$dur,
+		)
+	};
+	// Equals: x == 10ms
+	($clock:ident == $dur:expr) => {
+		$crate::testing::timing::TimingGuard::ClockEquals(
+			stringify!($clock).to_string(),
+			$dur,
+		)
+	};
+	// Range: 5ms <= x <= 10ms
+	($min_dur:tt <= $clock:ident <= $max_dur:tt) => {
+		$crate::testing::timing::TimingGuard::ClockInRange(
+			stringify!($clock).to_string(),
+			$min_dur,
+			$max_dur,
+		)
+	};
+}
+
 /// Helper macro for jitter timing constraint
 /// Usage:
 ///   jitter!(5ms)  (default MinMaxJitter calculator)

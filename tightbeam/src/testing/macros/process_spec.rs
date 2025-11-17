@@ -17,6 +17,7 @@ macro_rules! tb_process_spec {
 		terminal { $($term_state:ident),* $(,)? }
 		$(choice { $($choice_state:ident),* $(,)? })?
 		$(annotations { description: $desc:expr })?
+		$(clocks: { $($clock_name:expr),* $(,)? })?
 		$(timing {
 			$($timing_content:tt)*
 		})?
@@ -29,15 +30,16 @@ macro_rules! tb_process_spec {
 				observable { $($obs_event),* }
 				hidden { $($hid_event),* }
 			}
-			states {
-				$($from_state => { $($event => $to_state),* }),*
-			}
-			terminal { $($term_state),* }
-			$(choice { $($choice_state),* })?
-			$(annotations { description: $desc })?
-			$(timing {
-				$($timing_content)*
-			})?
+		states {
+			$($from_state => { $($event => $to_state),* }),*
+		}
+		terminal { $($term_state),* }
+		$(choice { $($choice_state),* })?
+		$(annotations { description: $desc })?
+		$(timing {
+			$($timing_content)*
+		})?
+		$(clocks: { $($clock_name:expr),* $(,)? })?
 		}
 	};
 	// Implementation pattern
@@ -49,11 +51,12 @@ macro_rules! tb_process_spec {
 			hidden { $($hid_event:expr),* }
 		}
 		states {
-			$($from_state:ident => { $($event:expr => $to_state:ident),* }),*
+			$($from_state:ident => { $($event:expr => $to_state:ident),* $(,)? }),* $(,)?
 		}
 		terminal { $($term_state:ident),* }
 		$(choice { $($choice_state:ident),* })?
 		$(annotations { description: $desc:expr })?
+		$(clocks: { $($clock_name:expr),* $(,)? })?
 		$(timing {
 			$($timing_content:tt)*
 		})?
@@ -121,6 +124,7 @@ macro_rules! tb_process_spec {
 				$(
 					builder = builder.description($desc);
 				)?
+
 
 				// Build timing constraints if present
 				$(
@@ -247,4 +251,106 @@ macro_rules! tb_process_spec {
 
 	// Fallback: empty timing block
 	(@parse_timing $constraints:ident,) => {};
+
+	// Parse transitions from a state - handle multiple transitions
+	// Recursively parse each transition
+	(@parse_transitions
+		$builder:ident,
+		$from_state:expr,
+		$($transitions:tt)*
+	) => {
+		$crate::tb_process_spec! {
+			@parse_transitions_inner
+			$builder,
+			$from_state,
+			$($transitions)*
+		}
+	};
+
+	// Inner helper to parse transitions recursively
+	(@parse_transitions_inner
+		$builder:ident,
+		$from_state:expr,
+		$transition:tt $(, $($rest:tt),*)?
+	) => {
+		$crate::tb_process_spec! {
+			@parse_transition
+			$builder,
+			$from_state,
+			$transition
+		}
+		$(
+			$crate::tb_process_spec! {
+				@parse_transitions_inner
+				$builder,
+				$from_state,
+				$($rest),*
+			}
+		)?
+	};
+	// Fallback: empty transitions
+	(@parse_transitions_inner
+		$builder:ident,
+		$from_state:expr,
+	) => {};
+
+	// Parse transition - simple case (backward compatible)
+	(@parse_transition
+		$builder:ident,
+		$from_state:expr,
+		$event:expr => $to_state:ident
+	) => {
+		$builder = $builder.add_transition($from_state, $event, $crate::testing::specs::csp::State(stringify!($to_state)));
+	};
+
+	// Parse transition - with timing guard
+	(@parse_transition
+		$builder:ident,
+		$from_state:expr,
+		$event:tt [ $guard_expr:tt ] => $to_state:ident
+	) => {
+		#[cfg(feature = "testing-timing")]
+		{
+			use $crate::testing::specs::csp::{Event, State};
+			use $crate::testing::timing::TimingGuard;
+			let guard: TimingGuard = $crate::guard!($guard_expr);
+			$builder = $builder.add_timed_transition(
+				$from_state,
+				Event($event),
+				State(stringify!($to_state)),
+				Some(guard),
+				Vec::new(),
+			);
+		}
+		#[cfg(not(feature = "testing-timing"))]
+		{
+			$builder = $builder.add_transition($from_state, $event, $crate::testing::specs::csp::State(stringify!($to_state)));
+		}
+	};
+
+	// Parse transition - with timing guard and clock resets
+	(@parse_transition
+		$builder:ident,
+		$from_state:expr,
+		$event:tt [ $guard_expr:tt, reset: [ $($reset_clock:expr),* $(,)? ] ] => $to_state:ident
+	) => {
+		#[cfg(feature = "testing-timing")]
+		{
+			use $crate::testing::specs::csp::{Event, State};
+			use $crate::testing::timing::TimingGuard;
+			let guard: TimingGuard = $crate::guard!($guard_expr);
+			let reset_clocks: Vec<String> = vec![$( $reset_clock.to_string() ),*];
+			$builder = $builder.add_timed_transition(
+				$from_state,
+				Event($event),
+				State(stringify!($to_state)),
+				Some(guard),
+				reset_clocks,
+			);
+		}
+		#[cfg(not(feature = "testing-timing"))]
+		{
+			$builder = $builder.add_transition($from_state, $event, $crate::testing::specs::csp::State(stringify!($to_state)));
+		}
+	};
 }
