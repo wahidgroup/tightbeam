@@ -13,6 +13,9 @@ pub mod utils;
 #[cfg(feature = "testing-timing")]
 pub mod timing;
 
+#[cfg(feature = "testing-timing")]
+pub mod schedulability;
+
 #[cfg(feature = "testing-fuzz")]
 pub mod fuzz;
 

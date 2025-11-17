@@ -403,6 +403,8 @@ mod tests {
 			transitions: TransitionRelation::new(),
 			#[cfg(feature = "testing-timing")]
 			timing_constraints: None,
+			#[cfg(feature = "testing-timing")]
+			timed_transitions: None,
 		};
 
 		let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };

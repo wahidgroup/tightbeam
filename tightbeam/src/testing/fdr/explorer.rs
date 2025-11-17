@@ -6,7 +6,7 @@
 //! - `MemoizationCache`: Caching layer for expensive computations
 
 use core::time::Duration;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::config::{Failure, FdrConfig, Trace};
 use crate::testing::specs::csp::{Event, Process, State};
@@ -177,6 +177,10 @@ pub struct ExplorationState {
 	/// Event timestamps: (event, cumulative_time_when_event_occurred)
 	#[cfg(feature = "testing-timing")]
 	pub event_times: Vec<(Event, Duration)>,
+
+	/// Clock values (for timed CSP)
+	#[cfg(feature = "testing-timing")]
+	pub clock_values: HashMap<String, Duration>,
 }
 
 impl ExplorationState {
@@ -192,6 +196,8 @@ impl ExplorationState {
 			elapsed_time: Duration::ZERO,
 			#[cfg(feature = "testing-timing")]
 			event_times: Vec::new(),
+			#[cfg(feature = "testing-timing")]
+			clock_values: HashMap::new(),
 		}
 	}
 
@@ -230,6 +236,22 @@ impl ExplorationState {
 	pub fn update_timing(&mut self, event: &Event, wcet: Duration) {
 		self.elapsed_time += wcet;
 		self.event_times.push((event.clone(), self.elapsed_time));
+	}
+
+	/// Advance all clocks by elapsed time
+	#[cfg(feature = "testing-timing")]
+	pub fn update_clocks(&mut self, elapsed: Duration) {
+		for clock_value in self.clock_values.values_mut() {
+			*clock_value = clock_value.saturating_add(elapsed);
+		}
+	}
+
+	/// Reset specific clocks to zero
+	#[cfg(feature = "testing-timing")]
+	pub fn reset_clocks(&mut self, clock_names: &[String]) {
+		for name in clock_names {
+			self.clock_values.insert(name.clone(), Duration::ZERO);
+		}
 	}
 }
 

@@ -15,6 +15,8 @@ use crate::testing::fdr::subsys::timing::check_timing_violations;
 use crate::testing::specs::csp::{Action, Event, Process, State};
 
 #[cfg(feature = "testing-timing")]
+use crate::testing::fdr::subsys::timing::check_event_wcet_violation;
+#[cfg(feature = "testing-timing")]
 use crate::testing::timing::{TimingConstraint, TimingConstraints};
 
 /// Default exploration engine implementation
@@ -248,13 +250,13 @@ impl<'a> DefaultExplorationEngine<'a> {
 	) -> &'b Action {
 		if process.choice.contains(&process_state) {
 			// Nondeterministic choice point: use RNG to select
-			rng.choose(actions).expect("actions not empty")
+			rng.choose(actions).unwrap_or(&actions[0])
 		} else if actions.len() == 1 {
 			// Deterministic: only one choice
 			&actions[0]
 		} else {
 			// Multiple actions but not marked as choice state: use RNG anyway
-			rng.choose(actions).expect("actions not empty")
+			rng.choose(actions).unwrap_or(&actions[0])
 		}
 	}
 
@@ -265,6 +267,73 @@ impl<'a> DefaultExplorationEngine<'a> {
 		action: &Action,
 		queue: &mut VecDeque<ExplorationState>,
 	) {
+		#[cfg(feature = "testing-timing")]
+		{
+			use crate::testing::fdr::subsys::timing::check_timed_transition_guard;
+
+			// Check timing guards if timed transitions exist
+			if let Some(ref timed_transitions) = process.timed_transitions {
+				if let Some(transitions) = timed_transitions.get(&(state.process_state, action.event.clone())) {
+					// Filter transitions by guard satisfaction
+					let valid_transitions: Vec<_> = transitions
+						.iter()
+						.filter(|tt| check_timed_transition_guard(tt, &state.clock_values))
+						.collect();
+
+					if valid_transitions.is_empty() {
+						// Prune branch: no valid transitions (guards not satisfied)
+						return;
+					}
+
+					// Process each valid timed transition
+					for timed_trans in valid_transitions {
+						let mut next_exploration = state.branch();
+						let next_state = timed_trans.to;
+
+						// Reset clocks if specified
+						next_exploration.reset_clocks(&timed_trans.reset_clocks);
+
+						if process.hidden.contains(&action.event) {
+							// Hidden (τ) transition
+							next_exploration.record_hidden(action.event.clone(), next_state);
+						} else {
+							// Observable transition
+							next_exploration.record_observable(action.event.clone(), next_state);
+
+							// Update timing if timing constraints exist
+							if let Some(ref constraints) = process.timing_constraints {
+								// Look up WCET for this event
+								let wcet = Self::lookup_wcet(&action.event, constraints);
+								if check_event_wcet_violation(&action.event, wcet, constraints) {
+									// Prune this branch: WCET violation
+									continue;
+								}
+
+								next_exploration.update_timing(&action.event, wcet);
+								// Advance clocks by WCET
+								next_exploration.update_clocks(wcet);
+
+								// Check other timing violations (deadline, path WCET) before adding to queue
+								if Self::check_timing_violations(&next_exploration, constraints) {
+									// Prune this branch: timing violation
+									continue;
+								}
+							} else {
+								// No timing constraints: advance clocks by zero (or skip)
+								// For now, we skip clock advancement if no timing constraints
+							}
+						}
+
+						queue.push_back(next_exploration);
+					}
+
+					// Return early since we handled timed transitions
+					return;
+				}
+			}
+		}
+
+		// Regular transitions (no timed transitions or no match)
 		let next_states = process.step(state.process_state, &action.event);
 		for next_state in next_states {
 			let mut next_exploration = state.branch();
@@ -278,8 +347,6 @@ impl<'a> DefaultExplorationEngine<'a> {
 				// Update timing if timing constraints exist
 				#[cfg(feature = "testing-timing")]
 				{
-					use crate::testing::fdr::subsys::timing::check_event_wcet_violation;
-
 					if let Some(ref constraints) = process.timing_constraints {
 						// Look up WCET for this event
 						// Check if this event's WCET violates its constraint
@@ -290,6 +357,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 						}
 
 						next_exploration.update_timing(&action.event, wcet);
+						// Advance clocks by WCET
+						next_exploration.update_clocks(wcet);
 
 						// Check other timing violations (deadline, path WCET) before adding to queue
 						if Self::check_timing_violations(&next_exploration, constraints) {

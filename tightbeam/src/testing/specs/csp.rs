@@ -20,6 +20,9 @@ use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
 use crate::der::{Header, Length, Reader, Writer};
 use crate::trace::ConsumedTrace;
 
+#[cfg(feature = "testing-timing")]
+use crate::testing::timing::{TimedTransition, TimingConstraints, TimingGuard};
+
 /// Process state in the LTS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct State(pub &'static str);
@@ -204,7 +207,11 @@ pub struct Process {
 
 	/// Timing constraints for real-time verification
 	#[cfg(feature = "testing-timing")]
-	pub timing_constraints: Option<crate::testing::timing::TimingConstraints>,
+	pub timing_constraints: Option<TimingConstraints>,
+
+	/// Optional timed transitions with timing guards
+	#[cfg(feature = "testing-timing")]
+	pub timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
 }
 
 impl Process {
@@ -389,7 +396,9 @@ pub struct ProcessBuilder {
 	transitions: TransitionRelation,
 	description: Option<&'static str>,
 	#[cfg(feature = "testing-timing")]
-	timing_constraints: Option<crate::testing::timing::TimingConstraints>,
+	timing_constraints: Option<TimingConstraints>,
+	#[cfg(feature = "testing-timing")]
+	timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
 }
 
 impl ProcessBuilder {
@@ -406,6 +415,8 @@ impl ProcessBuilder {
 			description: None,
 			#[cfg(feature = "testing-timing")]
 			timing_constraints: None,
+			#[cfg(feature = "testing-timing")]
+			timed_transitions: None,
 		}
 	}
 
@@ -454,8 +465,44 @@ impl ProcessBuilder {
 	}
 
 	#[cfg(feature = "testing-timing")]
-	pub fn timing_constraints(mut self, constraints: crate::testing::timing::TimingConstraints) -> Self {
+	pub fn timing_constraints(mut self, constraints: TimingConstraints) -> Self {
 		self.timing_constraints = Some(constraints);
+		self
+	}
+
+	#[cfg(feature = "testing-timing")]
+	pub fn add_timed_transition(
+		mut self,
+		from: State,
+		event: Event,
+		to: State,
+		guard: Option<TimingGuard>,
+		reset_clocks: Vec<String>,
+	) -> Self {
+		if self.timed_transitions.is_none() {
+			self.timed_transitions = Some(HashMap::new());
+		}
+
+		if let Some(ref mut transitions) = self.timed_transitions {
+			let key = (from, event.clone());
+			let action = Action {
+				event: event.clone(),
+				alphabet: if self.observable.contains(&event) {
+					Alphabet::Observable
+				} else {
+					Alphabet::Hidden
+				},
+			};
+
+			let timed_trans = TimedTransition::new(from, action, to).with_reset_clocks(reset_clocks);
+			let timed_trans = if let Some(g) = guard {
+				timed_trans.with_guard(g)
+			} else {
+				timed_trans
+			};
+
+			transitions.entry(key).or_insert_with(Vec::new).push(timed_trans);
+		}
 		self
 	}
 
@@ -474,6 +521,8 @@ impl ProcessBuilder {
 			description: self.description,
 			#[cfg(feature = "testing-timing")]
 			timing_constraints: self.timing_constraints,
+			#[cfg(feature = "testing-timing")]
+			timed_transitions: self.timed_transitions,
 		})
 	}
 }

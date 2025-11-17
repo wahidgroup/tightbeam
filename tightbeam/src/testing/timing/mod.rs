@@ -4,6 +4,8 @@
 //! for real-time systems. Integrates with CSP process specifications and
 //! instrumentation events.
 
+#[cfg(feature = "testing-timing")]
+mod csp;
 mod constraints;
 mod deadline;
 mod export;
@@ -12,6 +14,8 @@ mod verification;
 mod violations;
 mod wcet;
 
+#[cfg(feature = "testing-timing")]
+pub use csp::{ClockVariable, TimedTransition, TimingGuard};
 pub use constraints::{TimingConstraint, TimingConstraints};
 pub use deadline::{Deadline, DeadlineBuilder};
 pub use export::TimingVerificationArtifact;

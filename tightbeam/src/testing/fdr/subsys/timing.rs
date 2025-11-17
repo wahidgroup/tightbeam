@@ -6,9 +6,11 @@
 
 use core::time::Duration;
 
+use std::collections::HashMap;
+
 use crate::testing::fdr::config::Trace;
 use crate::testing::specs::csp::Event;
-use crate::testing::timing::{TimingConstraint, TimingConstraints};
+use crate::testing::timing::{TimedTransition, TimingConstraint, TimingConstraints, TimingGuard};
 
 /// Check if current trace violates any timing constraints
 ///
@@ -114,6 +116,54 @@ fn matches_path_pattern(trace: &Trace, pattern: &[Event]) -> bool {
 	}
 
 	trace.iter().zip(pattern.iter()).all(|(a, b)| a == b)
+}
+
+/// Evaluate a timing guard against current clock values
+///
+/// Returns `true` if the guard is satisfied, `false` otherwise.
+/// If the clock is not found in clock_values, returns `false` (guard not satisfied).
+#[cfg(feature = "testing-timing")]
+pub fn evaluate_timing_guard(guard: &TimingGuard, clock_values: &HashMap<String, Duration>) -> bool {
+	match guard {
+		TimingGuard::ClockLessThan(name, duration) => {
+			clock_values.get(name).map_or(false, |v| *v < *duration)
+		}
+		TimingGuard::ClockLessEqual(name, duration) => {
+			clock_values.get(name).map_or(false, |v| *v <= *duration)
+		}
+		TimingGuard::ClockGreaterThan(name, duration) => {
+			clock_values.get(name).map_or(false, |v| *v > *duration)
+		}
+		TimingGuard::ClockGreaterEqual(name, duration) => {
+			clock_values.get(name).map_or(false, |v| *v >= *duration)
+		}
+		TimingGuard::ClockEquals(name, duration) => {
+			clock_values.get(name).map_or(false, |v| *v == *duration)
+		}
+		TimingGuard::ClockInRange(name, d1, d2) => {
+			clock_values.get(name).map_or(false, |v| *v >= *d1 && *v <= *d2)
+		}
+	}
+}
+
+/// Check if a timed transition's guard is satisfied
+///
+/// Returns `true` if:
+/// - The transition has no guard (backward compatible)
+/// - The transition has a guard and it is satisfied
+///
+/// Returns `false` if the guard exists and is not satisfied.
+#[cfg(feature = "testing-timing")]
+pub fn check_timed_transition_guard(
+	transition: &TimedTransition,
+	clock_values: &HashMap<String, Duration>,
+) -> bool {
+	// If no guard, transition is always enabled (backward compatible)
+	if let Some(ref guard) = transition.guard {
+		evaluate_timing_guard(guard, clock_values)
+	} else {
+		true
+	}
 }
 
 #[cfg(test)]

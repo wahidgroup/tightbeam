@@ -10,6 +10,9 @@ use super::wcet::WcetConfig;
 use crate::testing::specs::csp::Event;
 use crate::utils::jitter::JitterCalculator;
 
+#[cfg(feature = "testing-timing")]
+use crate::testing::schedulability::{SchedulabilityError, SchedulerType, Task, TaskSet};
+
 /// Timing constraint for an event
 #[derive(Debug, Clone)]
 pub enum TimingConstraint {
@@ -74,5 +77,52 @@ impl TimingConstraints {
 	/// Get all path-based WCET constraints
 	pub fn path_wcets(&self) -> &[PathWcet] {
 		&self.path_wcets
+	}
+
+	/// Convert timing constraints to task set for schedulability analysis
+	///
+	/// Requires period mapping (event -> period) since periods are not
+	/// part of timing constraints.
+	#[cfg(feature = "testing-timing")]
+	pub fn to_task_set(
+		&self,
+		periods: &HashMap<Event, Duration>,
+		scheduler: SchedulerType,
+	) -> Result<TaskSet, SchedulabilityError> {
+		let mut tasks = Vec::new();
+
+		// Extract tasks from WCET constraints
+		for (event, constraint) in &self.constraints {
+			if let TimingConstraint::Wcet(wcet_config) = constraint {
+				let period = periods
+					.get(event)
+					.ok_or_else(|| SchedulabilityError::MissingPeriod(event.0.to_string()))?;
+
+				// Find deadline for this event (if exists)
+				let deadline = self
+					.deadlines
+					.iter()
+					.find(|d| &d.start_event == event || &d.end_event == event)
+					.map(|d| d.duration)
+					.unwrap_or(*period); // Default: deadline = period
+
+				// Calculate priority for RMA (shorter period = higher priority)
+				let priority = if matches!(scheduler, SchedulerType::RateMonotonic) {
+					Some(period.as_nanos() as u32) // Use period as priority (lower = higher priority)
+				} else {
+					None
+				};
+
+				tasks.push(Task {
+					id: event.0.to_string(),
+					period: *period,
+					deadline,
+					wcet: wcet_config.duration,
+					priority,
+				});
+			}
+		}
+
+		Ok(TaskSet { tasks, scheduler })
 	}
 }
