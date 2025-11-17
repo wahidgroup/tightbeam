@@ -53,13 +53,7 @@ pub struct TimedTransition {
 impl TimedTransition {
 	/// Create new timed transition
 	pub fn new(from: State, action: Action, to: State) -> Self {
-		Self {
-			from,
-			action,
-			to,
-			guard: None,
-			reset_clocks: Vec::new(),
-		}
+		Self { from, action, to, guard: None, reset_clocks: Vec::new() }
 	}
 
 	/// Add timing guard to transition
@@ -74,4 +68,3 @@ impl TimedTransition {
 		self
 	}
 }
-
