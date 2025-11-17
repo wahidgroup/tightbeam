@@ -5,19 +5,21 @@
 
 use std::collections::HashSet;
 
-use crate::testing::specs::csp::Process;
+use crate::builder::TypeBuilder;
+use crate::testing::error::TestingError;
+use crate::testing::specs::csp::{Event, Process, State};
 
 /// CSP trace: sequence of observable events
-pub type Trace = Vec<crate::testing::specs::csp::Event>;
+pub type Trace = Vec<Event>;
 
 /// Refusal set: events refused in stable state
-pub type RefusalSet = HashSet<crate::testing::specs::csp::Event>;
+pub type RefusalSet = HashSet<Event>;
 
 /// Failure: (trace, refusal_set)
 pub type Failure = (Trace, RefusalSet);
 
 /// Acceptance set: events accepted after trace
-pub type AcceptanceSet = HashSet<crate::testing::specs::csp::Event>;
+pub type AcceptanceSet = HashSet<Event>;
 
 /// Scheduler model type
 /// Panics if used when `testing-fault` feature is not enabled
@@ -59,6 +61,62 @@ pub struct FaultModel {
 	pub faults: Vec<Fault>,
 	/// Injection strategy
 	pub injection_strategy: InjectionStrategy,
+}
+
+/// Builder for creating `FaultModel` instances with auto-prefixed fault syntax.
+///
+/// Allows users to write `NetworkDrop { probability: 0.1 }` instead of
+/// `Fault::NetworkDrop { probability: 0.1 }` for better ergonomics.
+#[cfg(feature = "testing-fault")]
+#[derive(Debug, Default, Clone)]
+pub struct FaultModelBuilder {
+	faults: Vec<Fault>,
+	injection_strategy: Option<InjectionStrategy>,
+}
+
+#[cfg(feature = "testing-fault")]
+impl FaultModelBuilder {
+	/// Add a [multiple] network drop fault (auto-prefixes `Fault::`).
+	pub fn with_network_drop(mut self, probability: f64) -> Self {
+		self.faults.push(Fault::NetworkDrop { probability });
+		self
+	}
+
+	/// Add a [multiple] message corruption fault (auto-prefixes `Fault::`).
+	pub fn with_message_corruption(mut self, probability: f64) -> Self {
+		self.faults.push(Fault::MessageCorruption { probability });
+		self
+	}
+
+	/// Add a [multiple] node crash fault (auto-prefixes `Fault::`).
+	pub fn with_node_crash(mut self, probability: f64) -> Self {
+		self.faults.push(Fault::NodeCrash { probability });
+		self
+	}
+
+	/// Add a [multiple] fault directly (for advanced use cases).
+	///
+	/// This method allows adding a `Fault` enum variant directly if needed.
+	pub fn with_fault(mut self, fault: Fault) -> Self {
+		self.faults.push(fault);
+		self
+	}
+
+	/// Set the injection strategy.
+	pub fn with_strategy(mut self, strategy: InjectionStrategy) -> Self {
+		self.injection_strategy = Some(strategy);
+		self
+	}
+}
+
+#[cfg(feature = "testing-fault")]
+impl TypeBuilder<FaultModel> for FaultModelBuilder {
+	type Error = TestingError;
+
+	fn build(self) -> Result<FaultModel, Self::Error> {
+		let injection_strategy = self.injection_strategy.unwrap_or(InjectionStrategy::Deterministic);
+		Ok(FaultModel { faults: self.faults, injection_strategy })
+	}
 }
 
 /// FMEA configuration (automatic analysis only)
@@ -104,12 +162,14 @@ pub struct FdrConfig {
 
 	/// Number of schedulers (m) - for resource constraint modeling
 	/// When m < n (process_count), some traces become impossible
-	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
-	pub scheduler_count: Option<u32>,
+	/// Required when using scheduler modeling. Must be <= process_count.
+	#[cfg(feature = "testing-fault")]
+	pub scheduler_count: u32,
 
 	/// Number of concurrent processes (n) - for resource constraint modeling
-	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
-	pub process_count: Option<u32>,
+	/// Required when using scheduler modeling. Must be >= scheduler_count.
+	#[cfg(feature = "testing-fault")]
+	pub process_count: u32,
 
 	/// Scheduler model type (Cooperative or Preemptive)
 	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
@@ -134,34 +194,66 @@ impl Default for FdrConfig {
 			specs: Vec::new(),
 			fail_fast: true,
 			expect_failure: false,
-			scheduler_count: None,
-			process_count: None,
+			#[cfg(feature = "testing-fault")]
+			scheduler_count: 1,
+			#[cfg(feature = "testing-fault")]
+			process_count: 1,
+			#[cfg(feature = "testing-fault")]
 			scheduler_model: None,
+			#[cfg(feature = "testing-fault")]
 			fault_model: None,
+			#[cfg(feature = "testing-fmea")]
 			fmea: None,
 		}
 	}
 }
 
 impl FdrConfig {
-	/// Validate that feature-gated fields are only set when features are enabled
-	/// Panics if any feature-gated field is set but the required feature is not enabled
-	pub fn validate_features(&self) {
-		if self.scheduler_count.is_some()
-			|| self.process_count.is_some()
-			|| self.scheduler_model.is_some()
-			|| self.fault_model.is_some()
-		{
-			#[cfg(not(feature = "testing-fault"))]
-			panic!(
-				"FdrConfig: scheduler_count, process_count, scheduler_model, or fault_model set but `testing-fault` feature is not enabled"
-			);
+	/// Validate scheduler model constraints with detailed error messages.
+	///
+	/// Checks:
+	/// - scheduler_count must be <= process_count
+	/// - scheduler_count and process_count must be > 0
+	///
+	/// Returns `Ok(())` if validation passes, or a `TestingError` if validation fails.
+	#[cfg(feature = "testing-fault")]
+	pub fn validate_scheduler_model(&self) -> Result<(), TestingError> {
+		if self.scheduler_count > self.process_count {
+			return Err(TestingError::InvalidFdrConfig(format!(
+				"scheduler_count ({}) cannot exceed process_count ({}). \
+				When m > n, all processes can run simultaneously, making \
+				resource constraint modeling meaningless.",
+				self.scheduler_count, self.process_count
+			)));
+		}
+		if self.scheduler_count == 0 {
+			return Err(TestingError::InvalidFdrConfig(format!(
+				"scheduler_count must be > 0. Got {}.",
+				self.scheduler_count
+			)));
+		}
+		if self.process_count == 0 {
+			return Err(TestingError::InvalidFdrConfig(format!(
+				"process_count must be > 0. Got {}.",
+				self.process_count
+			)));
 		}
 
-		if self.fmea.is_some() {
-			#[cfg(not(feature = "testing-fmea"))]
-			panic!("FdrConfig: fmea set but `testing-fmea` feature is not enabled");
-		}
+		Ok(())
+	}
+
+	/// Validate all constraints (scheduler model).
+	///
+	/// This is a convenience method that calls `validate_scheduler_model()`.
+	#[cfg(feature = "testing-fault")]
+	pub fn validate(&self) -> Result<(), TestingError> {
+		self.validate_scheduler_model()
+	}
+
+	/// Validate all constraints (no-op when testing-fault is not enabled).
+	#[cfg(not(feature = "testing-fault"))]
+	pub fn validate(&self) -> Result<(), TestingError> {
+		Ok(())
 	}
 }
 
@@ -219,13 +311,13 @@ pub struct FdrVerdict {
 	pub divergence_refinement_witness: Option<Trace>,
 
 	/// Witness to nondeterminism: (seed, trace, event) where different seeds diverge
-	pub determinism_witness: Option<(u64, Trace, crate::testing::specs::csp::Event)>,
+	pub determinism_witness: Option<(u64, Trace, Event)>,
 
 	/// Witness to divergence: (seed, τ-loop sequence) if found
-	pub divergence_witness: Option<(u64, Vec<crate::testing::specs::csp::Event>)>,
+	pub divergence_witness: Option<(u64, Vec<Event>)>,
 
 	/// Witness to deadlock: (seed, trace, state) if found
-	pub deadlock_witness: Option<(u64, Trace, crate::testing::specs::csp::State)>,
+	pub deadlock_witness: Option<(u64, Trace, State)>,
 
 	/// Traces explored across all seeds
 	pub traces_explored: usize,
@@ -267,45 +359,42 @@ impl Default for FdrVerdict {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::specs::csp::{State, TransitionRelation};
-	// Tests for FdrConfig
-	mod config {
-		use super::*;
+	use crate::testing::specs::csp::TransitionRelation;
 
-		#[test]
-		fn default_configuration() {
-			let config = FdrConfig::default();
-			assert_eq!(config.seeds, 64);
-			assert_eq!(config.max_depth, 128);
-			assert_eq!(config.max_internal_run, 32);
-			assert_eq!(config.timeout_ms, 5000);
-			assert!(config.specs.is_empty());
-			assert!(config.fail_fast, "Default should be fail_fast mode");
-		}
+	#[test]
+	fn default_configuration() {
+		let config = FdrConfig::default();
+		assert_eq!(config.seeds, 64);
+		assert_eq!(config.max_depth, 128);
+		assert_eq!(config.max_internal_run, 32);
+		assert_eq!(config.timeout_ms, 5000);
+		assert!(config.specs.is_empty());
+		assert!(config.fail_fast);
+	}
 
-		#[test]
-		fn dual_mode_support() {
-			// Mode 1: Single-process exploration
-			let config_exploration = FdrConfig::default();
-			assert!(config_exploration.specs.is_empty());
+	#[test]
+	fn dual_mode_support() {
+		// Mode 1: Single-process exploration
+		let config_exploration = FdrConfig::default();
+		assert!(config_exploration.specs.is_empty());
 
-			// Mode 2: Refinement checking
-			let spec = Process {
-				name: "Spec",
-				description: Some("Test spec"),
-				initial: State("S0"),
-				states: vec![State("S0")].into_iter().collect(),
-				observable: HashSet::new(),
-				hidden: HashSet::new(),
-				choice: HashSet::new(),
-				terminal: vec![State("S0")].into_iter().collect(),
-				transitions: TransitionRelation::new(),
-				#[cfg(feature = "testing-timing")]
-				timing_constraints: None,
-			};
-			let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
-			assert!(!config_refinement.specs.is_empty());
-		}
+		// Mode 2: Refinement checking
+		let spec = Process {
+			name: "Spec",
+			description: Some("Test spec"),
+			initial: State("S0"),
+			states: vec![State("S0")].into_iter().collect(),
+			observable: HashSet::new(),
+			hidden: HashSet::new(),
+			choice: HashSet::new(),
+			terminal: vec![State("S0")].into_iter().collect(),
+			transitions: TransitionRelation::new(),
+			#[cfg(feature = "testing-timing")]
+			timing_constraints: None,
+		};
+
+		let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
+		assert!(!config_refinement.specs.is_empty());
 	}
 
 	// Tests for FdrVerdict
@@ -340,7 +429,7 @@ mod tests {
 			let mut verdict = FdrVerdict::default();
 
 			// Trace refinement violation
-			let bad_trace = vec![crate::testing::specs::csp::Event("unexpected")];
+			let bad_trace = vec![Event("unexpected")];
 			verdict.trace_refines = false;
 			verdict.trace_refinement_witness = Some(bad_trace.clone());
 			verdict.passed = false;
@@ -348,10 +437,8 @@ mod tests {
 			assert_eq!(verdict.trace_refinement_witness, Some(bad_trace));
 
 			// Failures refinement violation
-			let bad_failure_trace =
-				vec![crate::testing::specs::csp::Event("a"), crate::testing::specs::csp::Event("b")];
-			let bad_refusal: HashSet<crate::testing::specs::csp::Event> =
-				vec![crate::testing::specs::csp::Event("c")].into_iter().collect();
+			let bad_failure_trace = vec![Event("a"), Event("b")];
+			let bad_refusal: HashSet<Event> = vec![Event("c")].into_iter().collect();
 			verdict.failures_refines = false;
 			verdict.failures_refinement_witness = Some((bad_failure_trace.clone(), bad_refusal.clone()));
 			assert!(!verdict.failures_refines);
@@ -372,6 +459,127 @@ mod tests {
 			let verdict = FdrVerdict::default();
 			assert!(verdict.failures_refines);
 			assert!(verdict.failures_refinement_witness.is_none());
+		}
+	}
+
+	// Tests for FaultModelBuilder
+	#[cfg(feature = "testing-fault")]
+	mod builder {
+		use super::*;
+
+		#[test]
+		fn fault_model_builder_single_fault() -> Result<(), TestingError> {
+			let model = FaultModelBuilder::default().with_network_drop(0.1).build()?;
+			assert_eq!(model.faults.len(), 1);
+
+			match &model.faults[0] {
+				Fault::NetworkDrop { probability } => assert_eq!(probability, &0.1),
+				_ => return Err(TestingError::InvalidFaultModel),
+			}
+			assert_eq!(model.injection_strategy, InjectionStrategy::Deterministic);
+			Ok(())
+		}
+
+		#[test]
+		fn fault_model_builder_multiple_faults() -> Result<(), TestingError> {
+			let model = FaultModelBuilder::default()
+				.with_network_drop(0.1)
+				.with_message_corruption(0.05)
+				.with_node_crash(0.01)
+				.build()?;
+
+			assert_eq!(model.faults.len(), 3);
+			match &model.faults[0] {
+				Fault::NetworkDrop { probability } => assert_eq!(probability, &0.1),
+				_ => return Err(TestingError::InvalidFaultModel),
+			}
+			match &model.faults[1] {
+				Fault::MessageCorruption { probability } => assert_eq!(probability, &0.05),
+				_ => return Err(TestingError::InvalidFaultModel),
+			}
+			match &model.faults[2] {
+				Fault::NodeCrash { probability } => assert_eq!(probability, &0.01),
+				_ => return Err(TestingError::InvalidFaultModel),
+			}
+			Ok(())
+		}
+
+		#[test]
+		fn fault_model_builder_with_strategy() -> Result<(), TestingError> {
+			let model = FaultModelBuilder::default()
+				.with_network_drop(0.1)
+				.with_strategy(InjectionStrategy::Random)
+				.build()?;
+			assert_eq!(model.injection_strategy, InjectionStrategy::Random);
+			Ok(())
+		}
+
+		#[test]
+		fn fault_model_builder_add_fault_directly() -> Result<(), TestingError> {
+			let fault = Fault::NetworkDrop { probability: 0.2 };
+			let model = FaultModelBuilder::default().with_fault(fault).build()?;
+			assert_eq!(model.faults.len(), 1);
+			Ok(())
+		}
+	}
+
+	// Tests for scheduler model validation
+	#[cfg(feature = "testing-fault")]
+	mod validation {
+		use super::*;
+
+		/// Helper to assert validation error is InvalidFdrConfig variant
+		fn assert_validation_error(result: Result<(), TestingError>) -> Result<(), TestingError> {
+			match result {
+				Ok(()) => Err(TestingError::InvalidFdrConfig(String::new())),
+				Err(TestingError::InvalidFdrConfig(_)) => Ok(()),
+				Err(e) => Err(e),
+			}
+		}
+
+		#[test]
+		fn scheduler_validation_valid_config() -> Result<(), TestingError> {
+			let config = FdrConfig {
+				scheduler_count: 2,
+				process_count: 5,
+				scheduler_model: Some(SchedulerModel::Cooperative),
+				..FdrConfig::default()
+			};
+
+			config.validate_scheduler_model()?;
+			Ok(())
+		}
+
+		#[test]
+		fn scheduler_validation_scheduler_exceeds_process_count() -> Result<(), TestingError> {
+			let config = FdrConfig { scheduler_count: 5, process_count: 2, ..FdrConfig::default() };
+			assert_validation_error(config.validate_scheduler_model())
+		}
+
+		#[test]
+		fn scheduler_validation_zero_scheduler_count() -> Result<(), TestingError> {
+			let config = FdrConfig { scheduler_count: 0, process_count: 5, ..FdrConfig::default() };
+			assert_validation_error(config.validate_scheduler_model())
+		}
+
+		#[test]
+		fn scheduler_validation_zero_process_count() -> Result<(), TestingError> {
+			let config = FdrConfig { scheduler_count: 2, process_count: 0, ..FdrConfig::default() };
+			assert_validation_error(config.validate_scheduler_model())
+		}
+
+		#[test]
+		fn scheduler_validation_equal_counts() -> Result<(), TestingError> {
+			let config = FdrConfig { scheduler_count: 3, process_count: 3, ..FdrConfig::default() };
+			config.validate_scheduler_model()?;
+			Ok(())
+		}
+
+		#[test]
+		fn scheduler_validation_default_values() -> Result<(), TestingError> {
+			let config = FdrConfig::default();
+			config.validate_scheduler_model()?;
+			Ok(())
 		}
 	}
 }

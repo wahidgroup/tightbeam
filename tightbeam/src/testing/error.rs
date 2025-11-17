@@ -17,6 +17,10 @@ pub enum TestingError {
 	InvalidTimingConstraint,
 	#[cfg_attr(feature = "derive", error("Slack exceeds deadline duration"))]
 	InvalidSlack,
+	#[cfg_attr(feature = "derive", error("Invalid FDR configuration: {0}"))]
+	InvalidFdrConfig(String),
+	#[cfg_attr(feature = "derive", error("Invalid fault model configuration"))]
+	InvalidFaultModel,
 }
 
 #[cfg(not(feature = "derive"))]
