@@ -157,21 +157,21 @@ macro_rules! tb_process_spec {
 		}
 	};
 
-	// Parse grouped timing syntax
+	// Parse grouped timing syntax - unified pattern
 	(@parse_timing
 		$constraints:ident,
-		wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? }
+		$(wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? })?
 		$(, jitter: { $($jitter_event:expr => $jitter_constraint:expr),* $(,)? })?
 		$(, deadline: { $($deadline_start:expr => $deadline_end:expr, $deadline_params:expr),* $(,)? })?
 		$(,)?
 	) => {
 		// Parse WCET constraints
-		$(
+		$($(
 			$constraints.add(
 				Event($wcet_event),
 				$wcet_constraint
 			);
-		)*
+		)*)?
 
 		// Parse Jitter constraints
 		$($(
@@ -183,70 +183,37 @@ macro_rules! tb_process_spec {
 
 		// Parse Deadline constraints
 		$($(
-			{
-				let params: DeadlineParams = $deadline_params;
-				let mut builder = DeadlineBuilder::default()
-					.with_duration(params.duration)
-					.with_start_event(Event($deadline_start))
-					.with_end_event(Event($deadline_end));
-				if let Some(slack) = params.min_slack {
-					builder = builder.with_min_slack(slack);
-				}
-				let deadline = builder
-					.build()
-					.expect("Failed to build deadline");
-				$constraints.add_deadline(deadline);
+			$crate::tb_process_spec! {
+				@parse_deadline
+				$constraints,
+				$deadline_start,
+				$deadline_end,
+				$deadline_params
 			}
 		)*)?
 	};
 
-	// Parse timing with only wcet
-	(@parse_timing
+	// Helper to parse a single deadline constraint
+	(@parse_deadline
 		$constraints:ident,
-		wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? }
+		$deadline_start:expr,
+		$deadline_end:expr,
+		$deadline_params:expr
 	) => {
-		$(
-			$constraints.add(
-				Event($wcet_event),
-				$wcet_constraint
-			);
-		)*
-	};
-
-	// Parse timing with only jitter
-	(@parse_timing
-		$constraints:ident,
-		jitter: { $($jitter_event:expr => $jitter_constraint:expr),* $(,)? }
-	) => {
-		$(
-			$constraints.add(
-				Event($jitter_event),
-				$jitter_constraint
-			);
-		)*
-	};
-
-	// Parse timing with only deadline
-	(@parse_timing
-		$constraints:ident,
-		deadline: { $($deadline_start:expr => $deadline_end:expr, $deadline_params:expr),* $(,)? }
-	) => {
-		$(
-			{
-				let params: DeadlineParams = $deadline_params;
-				let mut builder = DeadlineBuilder::default()
-					.with_duration(params.duration)
-					.with_start_event(Event($deadline_start))
-					.with_end_event(Event($deadline_end));
-				if let Some(slack) = params.min_slack {
-					builder = builder.with_min_slack(slack);
-				}
-				let deadline = builder
-					.build()
-					.expect("Failed to build deadline");
-				$constraints.add_deadline(deadline);
+		{
+			let params: DeadlineParams = $deadline_params;
+			let mut builder = DeadlineBuilder::default()
+				.with_duration(params.duration)
+				.with_start_event(Event($deadline_start))
+				.with_end_event(Event($deadline_end));
+			if let Some(slack) = params.min_slack {
+				builder = builder.with_min_slack(slack);
 			}
-		)*
+			let deadline = builder
+				.build()
+				.expect("Failed to build deadline");
+			$constraints.add_deadline(deadline);
+		}
 	};
 
 	// Fallback: empty timing block
@@ -309,22 +276,13 @@ macro_rules! tb_process_spec {
 		$from_state:expr,
 		$event:tt [ $guard_expr:tt ] => $to_state:ident
 	) => {
-		#[cfg(feature = "testing-timing")]
-		{
-			use $crate::testing::specs::csp::{Event, State};
-			use $crate::testing::timing::TimingGuard;
-			let guard: TimingGuard = $crate::guard!($guard_expr);
-			$builder = $builder.add_timed_transition(
-				$from_state,
-				Event($event),
-				State(stringify!($to_state)),
-				Some(guard),
-				Vec::new(),
-			);
-		}
-		#[cfg(not(feature = "testing-timing"))]
-		{
-			$builder = $builder.add_transition($from_state, $event, $crate::testing::specs::csp::State(stringify!($to_state)));
+		$crate::tb_process_spec! {
+			@parse_timed_transition
+			$builder,
+			$from_state,
+			$event,
+			$guard_expr,
+			$to_state,
 		}
 	};
 
@@ -333,6 +291,61 @@ macro_rules! tb_process_spec {
 		$builder:ident,
 		$from_state:expr,
 		$event:tt [ $guard_expr:tt, reset: [ $($reset_clock:expr),* $(,)? ] ] => $to_state:ident
+	) => {
+		$crate::tb_process_spec! {
+			@parse_timed_transition
+			$builder,
+			$from_state,
+			$event,
+			$guard_expr,
+			$to_state,
+			$( $reset_clock ),*
+		}
+	};
+
+	// Helper to parse timed transition (with optional clock resets)
+	(@parse_timed_transition
+		$builder:ident,
+		$from_state:expr,
+		$event:tt,
+		$guard_expr:tt,
+		$to_state:ident,
+	) => {
+		$crate::tb_process_spec! {
+			@parse_timed_transition_impl
+			$builder,
+			$from_state,
+			$event,
+			$guard_expr,
+			$to_state,
+		}
+	};
+	(@parse_timed_transition
+		$builder:ident,
+		$from_state:expr,
+		$event:tt,
+		$guard_expr:tt,
+		$to_state:ident,
+		$($reset_clock:expr),* $(,)?
+	) => {
+		$crate::tb_process_spec! {
+			@parse_timed_transition_impl
+			$builder,
+			$from_state,
+			$event,
+			$guard_expr,
+			$to_state,
+			$($reset_clock),*
+		}
+	};
+	// Implementation helper for timed transition
+	(@parse_timed_transition_impl
+		$builder:ident,
+		$from_state:expr,
+		$event:tt,
+		$guard_expr:tt,
+		$to_state:ident,
+		$( $reset_clock:expr ),* $(,)?
 	) => {
 		#[cfg(feature = "testing-timing")]
 		{

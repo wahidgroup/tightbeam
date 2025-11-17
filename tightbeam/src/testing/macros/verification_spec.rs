@@ -9,6 +9,9 @@ use crate::testing::specs::{SpecViolation, TBSpec};
 use crate::trace::{ConsumedTrace, ExecutionMode};
 use crate::Errorizable;
 
+#[cfg(feature = "testing-timing")]
+use crate::testing::schedulability::{SchedulerType, TaskSet};
+
 #[cfg(feature = "instrument")]
 use crate::instrumentation::TbEventKind;
 #[cfg(not(feature = "std"))]
@@ -136,6 +139,8 @@ pub struct AssertSpecBuilder {
 	#[cfg(feature = "instrument")]
 	required_events: Vec<TbEventKind>,
 	description: Option<&'static str>,
+	#[cfg(feature = "testing-timing")]
+	schedulability: Option<SchedulabilityAssertion>,
 }
 
 impl AssertSpecBuilder {
@@ -153,6 +158,8 @@ impl AssertSpecBuilder {
 			#[cfg(feature = "instrument")]
 			required_events: Vec::new(),
 			description: None,
+			#[cfg(feature = "testing-timing")]
+			schedulability: None,
 		}
 	}
 
@@ -237,9 +244,25 @@ impl AssertSpecBuilder {
 		self
 	}
 
+	#[cfg(feature = "testing-timing")]
+	pub fn schedulability(mut self, assertion: SchedulabilityAssertion) -> Self {
+		self.schedulability = Some(assertion);
+		self
+	}
+
 	pub fn build(self) -> BuiltAssertSpec {
 		BuiltAssertSpec::from_builder(self)
 	}
+}
+
+/// Schedulability assertion for verification
+#[cfg(feature = "testing-timing")]
+#[derive(Debug, Clone)]
+pub struct SchedulabilityAssertion {
+	/// Task set to check
+	pub task_set: TaskSet,
+	/// Whether the task set must be schedulable
+	pub must_be_schedulable: bool,
 }
 
 pub struct BuiltAssertSpec {
@@ -277,6 +300,8 @@ impl BuiltAssertSpec {
 			builder.tag_filter.as_deref(),
 			#[cfg(feature = "instrument")]
 			&builder.required_events,
+			#[cfg(feature = "testing-timing")]
+			builder.schedulability.as_ref(),
 		);
 		Self { inner: builder, contracts: contracts.into_boxed_slice(), spec_hash }
 	}
@@ -292,6 +317,7 @@ impl BuiltAssertSpec {
 		contracts: &[AssertionContract],
 		tag_filter: Option<&[&'static str]>,
 		#[cfg(feature = "instrument")] events: &[TbEventKind],
+		#[cfg(feature = "testing-timing")] schedulability: Option<&SchedulabilityAssertion>,
 	) -> [u8; 32] {
 		let mut h = Sha3_256::new();
 		// Domain tag + version triple
@@ -348,6 +374,26 @@ impl BuiltAssertSpec {
 				h.update([*ev as u8]);
 			}
 		}
+		#[cfg(feature = "testing-timing")]
+		{
+			if let Some(sched) = schedulability {
+				h.update([1u8]); // Has schedulability
+				h.update([sched.task_set.scheduler as u8]);
+				h.update([sched.must_be_schedulable as u8]);
+				h.update((sched.task_set.tasks.len() as u32).to_be_bytes());
+				// Hash task set: sort tasks by ID for deterministic hashing
+				let mut tasks: Vec<_> = sched.task_set.tasks.iter().collect();
+				tasks.sort_by(|a, b| a.id.cmp(&b.id));
+				for task in tasks {
+					h.update(task.id.as_bytes());
+					h.update(task.period.as_nanos().to_be_bytes());
+					h.update(task.deadline.as_nanos().to_be_bytes());
+					h.update(task.wcet.as_nanos().to_be_bytes());
+				}
+			} else {
+				h.update([0u8]); // No schedulability
+			}
+		}
 		let out = h.finalize();
 		let mut arr = [0u8; 32];
 		arr.copy_from_slice(&out);
@@ -380,7 +426,60 @@ impl TBSpec for BuiltAssertSpec {
 		&self.inner.required_events
 	}
 	fn validate_trace(&self, _trace: &ConsumedTrace) -> Result<(), SpecViolation> {
+		#[cfg(feature = "testing-timing")]
+		{
+			if let Some(ref sched) = self.inner.schedulability {
+				return Self::check_schedulability(sched);
+			}
+		}
 		Ok(())
+	}
+}
+
+#[cfg(feature = "testing-timing")]
+impl BuiltAssertSpec {
+	/// Check schedulability assertion
+	fn check_schedulability(assertion: &SchedulabilityAssertion) -> Result<(), SpecViolation> {
+		use crate::testing::schedulability::{is_edf_schedulable, is_rm_schedulable};
+
+		let result = match assertion.task_set.scheduler {
+			SchedulerType::RateMonotonic => is_rm_schedulable(&assertion.task_set),
+			SchedulerType::EarliestDeadlineFirst => is_edf_schedulable(&assertion.task_set),
+		};
+
+		match result {
+			Ok(sched_result) => {
+				let is_schedulable = sched_result.is_schedulable;
+				if assertion.must_be_schedulable && !is_schedulable {
+					// Task set must be schedulable but isn't
+					let violations_msg = sched_result
+						.violations
+						.iter()
+						.map(|v| format!("{}: {}", v.task_id, v.message))
+						.collect::<Vec<_>>()
+						.join("; ");
+					Err(SpecViolation::SchedulabilityViolation {
+						expected: "schedulable".to_string(),
+						actual: "not schedulable".to_string(),
+						utilization: sched_result.utilization,
+						utilization_bound: sched_result.utilization_bound,
+						violations: violations_msg,
+					})
+				} else if !assertion.must_be_schedulable && is_schedulable {
+					// Task set must NOT be schedulable but is
+					Err(SpecViolation::SchedulabilityViolation {
+						expected: "not schedulable".to_string(),
+						actual: "schedulable".to_string(),
+						utilization: sched_result.utilization,
+						utilization_bound: sched_result.utilization_bound,
+						violations: String::new(),
+					})
+				} else {
+					Ok(())
+				}
+			}
+			Err(e) => Err(SpecViolation::SchedulabilityError { error: format!("{}", e) }),
+		}
 	}
 }
 
@@ -540,6 +639,129 @@ macro_rules! tb_labels {
 	(@flag) => { false };
 }
 
+// Helper to build all specs (handles std vs non-std)
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_build_all {
+	(
+		$base:ident,
+		$desc_opt:expr,
+		$(
+			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+			assertions: [ $( $assertion:tt ),* ],
+			$(
+				events: [ $($events_tt:tt)* ],
+			)?
+			$(, tag_filter: [ $( $tag:expr ),* $(,)? ])?
+			$(, schedulability: { $($sched_content:tt)* })?
+		)+
+	) => {{
+		#[cfg(feature = "std")]
+		{
+			static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
+			CELL.get_or_init(|| {
+				let mut v = Vec::new();
+				$crate::__tb_assert_spec_build_all_impl!(
+					v, $base, $desc_opt,
+					$(
+						$maj, $min, $patch, $mode, $gate,
+						assertions: [ $( $assertion ),* ],
+						$(
+							events: [ $($events_tt)* ],
+						)?
+						$(, tag_filter: [ $( $tag ),* ])?
+						$(, schedulability: { $($sched_content)* })?
+					)+
+				);
+				v
+			}).as_slice()
+		}
+		#[cfg(not(feature = "std"))]
+		{
+			use core::sync::atomic::{AtomicBool, Ordering};
+			static INIT: AtomicBool = AtomicBool::new(false);
+			static mut VEC: Option<Vec<$crate::testing::macros::BuiltAssertSpec>> = None;
+			if !INIT.load(Ordering::Acquire) {
+				let desc_opt = $desc_opt;
+				let mut v = Vec::new();
+				$crate::__tb_assert_spec_build_all_impl!(
+					v, $base, desc_opt,
+					$(
+						$maj, $min, $patch, $mode, $gate,
+						assertions: [ $( $assertion ),* ],
+						$(
+							events: [ $($events_tt)* ],
+						)?
+						$(, tag_filter: [ $( $tag ),* ])?
+						$(, schedulability: { $($sched_content)* })?
+					)+
+				);
+				unsafe { VEC = Some(v); }
+				INIT.store(true, Ordering::Release);
+			}
+			unsafe { VEC.as_ref().unwrap().as_slice() }
+		}
+	}};
+}
+
+// Implementation helper to avoid nested repetition issues
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_build_all_impl {
+	(
+		$vec:ident, $base:ident, $desc_opt:expr,
+		$(
+			$maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+			assertions: [ $( $assertion:tt ),* ],
+			$(
+				events: [ $($events_tt:tt)* ],
+			)?
+			$(, tag_filter: [ $( $tag:expr ),* $(,)? ])?
+			$(, schedulability: { $($sched_content:tt)* })?
+		)+
+	) => {
+		$(
+			$crate::__tb_assert_spec_build_all_impl_with_events!(
+				$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
+				assertions: [ $( $assertion ),* ],
+				$(
+					events: [ $($events_tt:tt)* ],
+				)?
+				$(, tag_filter: [ $( $tag ),* ])?
+				$(, schedulability: { $($sched_content)* })?
+			);
+		)+
+	};
+}
+
+// Helper to handle events in __tb_assert_spec_build_all_impl (avoids nested repetition)
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_build_all_impl_with_events {
+	(
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		$(
+			events: [ $($events_tt:tt)* ],
+		)?
+		$(, tag_filter: [ $( $tag:expr ),* ])?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {{
+		// Use @expand_events which handles nested repetition correctly
+		// Description is handled separately in @build_with_events via $desc_opt parameter
+		$crate::__tb_assert_spec_build! {
+			@expand_events
+			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
+			assertions: [ $( $assertion ),* ],
+			$(
+				events_tt: [ $($events_tt:tt)* ],
+			)?
+			$( tag_filter: [ $( $tag ),* ])?
+			$(, schedulability: { $($sched_content)* })?
+		}
+	}};
+}
+
 // Helper macro for common spec building logic (single implementation)
 #[doc(hidden)]
 #[macro_export]
@@ -550,8 +772,160 @@ macro_rules! __tb_assert_spec_build {
 		$maj:literal, $min:literal, $patch:literal,
 		$mode:ident, $gate:ident,
 		assertions: [ $( $assertion:tt ),* $(,)? ],
-		events: [ $( $ev:ident ),* $(,)? ]
-		$(, tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(
+			events: [ $($events_tt:tt)* ],
+		)?
+		$(tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(, description: $desc:expr)?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {{
+		// Expand events token tree to avoid nested repetition issues
+		$crate::__tb_assert_spec_build! {
+			@expand_events
+			$vec, $base, $maj, $min, $patch, $mode, $gate,
+			assertions: [ $( $assertion ),* ],
+			$(
+				events_tt: [ $($events_tt:tt)* ],
+			)?
+			$( tag_filter: [ $( $tag ),* $(,)? ])?
+			$(, description: $desc)?
+			$(, schedulability: { $($sched_content)* })?
+		}
+	}};
+	// Expand events and build - separate arms for events vs no events
+	// Pattern with desc_opt parameter (from __tb_assert_spec_build_all_impl_with_events)
+	// Has events case
+	(@expand_events
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		events_tt: [ $($events_tt:tt)* ],
+		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {
+		$crate::__tb_assert_spec_build! {
+			@build_with_events_expanded
+			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
+			assertions: [ $( $assertion ),* ],
+			events_tt: [ $($events_tt:tt)* ],
+			$( tag_filter: [ $( $tag ),* $(,)? ])?
+			$(, schedulability: { $($sched_content)* })?
+		}
+	};
+	// No events case
+	(@expand_events
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {
+		$crate::__tb_assert_spec_build! {
+			@build_with_events
+			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
+			assertions: [ $( $assertion ),* ],
+			events: [ ],
+			$( tag_filter: [ $( $tag ),* ])?
+			$(, schedulability: { $($sched_content)* })?
+		}
+	};
+	// Legacy pattern without desc_opt (for backward compatibility)
+	(@expand_events
+		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		$(
+			events_tt: [ $($events_tt:tt)* ],
+		)?
+		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(, description: $desc:expr)?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {
+		$(
+			// Has events - expand events_tt here
+			$crate::__tb_assert_spec_build! {
+				@build_with_events_expanded
+				$vec, $base, None, $maj, $min, $patch, $mode, $gate,
+				assertions: [ $( $assertion ),* ],
+				events_tt: [ $($events_tt:tt)* ],
+				$( tag_filter: [ $( $tag ),* $(,)? ])?
+				$(, description: $desc)?
+				$(, schedulability: { $($sched_content)* })?
+			}
+		)?
+		$(
+			// No events case
+			$crate::__tb_assert_spec_build! {
+				@build_with_events
+				$vec, $base, None, $maj, $min, $patch, $mode, $gate,
+				assertions: [ $( $assertion ),* ],
+				events: [ ],
+				$( tag_filter: [ $( $tag ),* $(,)? ])?
+				$(, description: $desc)?
+				$(, schedulability: { $($sched_content)* })?
+			}
+		)?
+	};
+	(@build_with_events_expanded
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		events_tt: [ $( $ev:ident ),* $(,)? ],
+		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(, description: $desc:expr)?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {{
+		$crate::__tb_assert_spec_build! {
+			@build_with_events
+			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
+			assertions: [ $( $assertion ),* ],
+			events: [ $( $ev ),* $(,)? ],
+			$( tag_filter: [ $( $tag ),* $(,)? ])?
+			$(, description: $desc)?
+			$(, schedulability: { $($sched_content)* })?
+		}
+	}};
+	// Handle token tree events (from __tb_assert_spec_build_all_impl_with_events)
+	(@build_with_events_expanded
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		events_tt: [ $($events_tt:tt)* ],
+		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(, description: $desc:expr)?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {{
+		// Recursively expand token tree to identifiers
+		$crate::__tb_assert_spec_build! {
+			@build_with_events_expanded
+			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
+			assertions: [ $( $assertion ),* ],
+			events_tt: [ $($events_tt)* ],
+			$( tag_filter: [ $( $tag ),* $(,)? ])?
+			$(, description: $desc)?
+			$(, schedulability: { $($sched_content)* })?
+		}
+	}};
+	// Legacy pattern without desc_opt (for backward compatibility)
+	(@build_with_events_expanded
+		$vec:ident, $base:ident, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		events_tt: [ $($events_tt:tt)* ],
+		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(, description: $desc:expr)?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {{
+		// Recursively expand token tree to identifiers
+		$crate::__tb_assert_spec_build! {
+			@build_with_events_expanded
+			$vec, $base, None, $maj, $min, $patch, $mode, $gate,
+			assertions: [ $( $assertion ),* ],
+			events_tt: [ $($events_tt)* ],
+			$( tag_filter: [ $( $tag ),* $(,)? ])?
+			$(, description: $desc)?
+			$(, schedulability: { $($sched_content)* })?
+		}
+	}};
+	(@build_with_events
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		events: [ $( $ev:ident ),* $(,)? ],
+		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
 		$(, schedulability: { $($sched_content:tt)* })?
 	) => {{
@@ -569,6 +943,10 @@ macro_rules! __tb_assert_spec_build {
 				builder = builder.description(desc);
 			}
 		)?
+		// Handle description from desc_opt parameter (not part of repetition)
+		if let Some(desc) = $desc_opt {
+			builder = builder.description(desc);
+		}
 		$(
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
@@ -578,6 +956,44 @@ macro_rules! __tb_assert_spec_build {
 				builder = builder.required_events(&[$crate::instrumentation::TbEventKind::$ev]);
 			)*
 		}
+		$(
+			#[cfg(feature = "testing-timing")]
+			{
+				$crate::__tb_assert_spec_parse_schedulability!(builder, $($sched_content)*);
+			}
+		)?
+		$vec.push(builder.build());
+	}};
+	// Empty events case
+	(@expand_events
+		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
+		assertions: [ $( $assertion:tt ),* ],
+		events_tt: [ ],
+		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
+		$(, description: $desc:expr)?
+		$(, schedulability: { $($sched_content:tt)* })?
+	) => {{
+		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
+		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
+			stringify!($base),
+			$crate::trace::ExecutionMode::$mode,
+		);
+		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
+		$(
+			builder = builder.tag_filter(vec![ $( $tag ),* ]);
+		)?
+		$(
+			if let Some(desc) = $desc {
+				builder = builder.description(desc);
+			}
+		)?
+		// Handle description from desc_opt parameter (not part of repetition)
+		if let Some(desc) = $desc_opt {
+			builder = builder.description(desc);
+		}
+		$(
+			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
+		)*
 		$(
 			#[cfg(feature = "testing-timing")]
 			{
@@ -598,17 +1014,19 @@ macro_rules! __tb_assert_spec_parse_schedulability {
 		task_set: $task_set:expr,
 		scheduler: $scheduler:ident,
 		must_be_schedulable: $must_be:expr,
-	) => {
-		// Schedulability is checked during verification, not at build time
-		// Store it in the spec for later validation
-		// For now, we'll add it as metadata that can be checked during verification
-		// This requires extending BuiltAssertSpec to store schedulability info
-		// For now, we'll just ensure the task set is valid
-		let _task_set = $task_set;
-		let _scheduler = $crate::testing::schedulability::SchedulerType::$scheduler;
-		let _must_be = $must_be;
-		// TODO: Store in spec for verification
-	};
+	) => {{
+		use $crate::testing::schedulability::SchedulerType;
+		let task_set_with_scheduler = {
+			let mut ts = $task_set.clone();
+			ts.scheduler = SchedulerType::$scheduler;
+			ts
+		};
+		let assertion = $crate::testing::macros::SchedulabilityAssertion {
+			task_set: task_set_with_scheduler,
+			must_be_schedulable: $must_be,
+		};
+		$builder = $builder.schedulability(assertion);
+	}};
 }
 
 // Helper to add individual assertions (handles tags and values)
@@ -652,7 +1070,7 @@ macro_rules! tb_assert_spec {
 			gate: $gate:ident,
 			$( tag_filter: [ $( $tag:expr ),* $(,)? ], )?
 			assertions: [ $( $assertion:tt ),* $(,)? ]
-			$(, events: [ $( $ev:ident ),* $(,)? ])?
+			$(, events: [ $($events_tt:tt)* ])?
 			$(, schedulability: { $($sched_content:tt)* })?
 		} ),+ $(,)?
 		$(, annotations { description: $desc:expr })?
@@ -662,47 +1080,19 @@ macro_rules! tb_assert_spec {
 		impl $base {
 			pub fn all() -> &'static [$crate::testing::macros::BuiltAssertSpec] {
 				let desc_opt: Option<&'static str> = None::<&'static str> $(.or(Some($desc)))?;
-				#[cfg(feature = "std")]
-				{
-					static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
-					CELL.get_or_init(|| {
-						let mut v = Vec::new();
+				$crate::__tb_assert_spec_build_all!(
+					$base,
+					desc_opt,
+					$(
+						$maj, $min, $patch, $mode, $gate,
+						assertions: [ $( $assertion ),* ],
 						$(
-							$crate::__tb_assert_spec_build!(
-								v, $base, $maj, $min, $patch, $mode, $gate,
-								assertions: [ $( $assertion ),* ],
-								events: [ $( $( $ev ),* )? ]
-								$(, tag_filter: [ $( $tag ),* ])?,
-								description: desc_opt
-								$(, schedulability: { $($sched_content)* })?
-							);
-						)+
-						v
-					}).as_slice()
-				}
-				#[cfg(not(feature = "std"))]
-				{
-					use core::sync::atomic::{AtomicBool, Ordering};
-					static INIT: AtomicBool = AtomicBool::new(false);
-					static mut VEC: Option<Vec<$crate::testing::macros::BuiltAssertSpec>> = None;
-					if !INIT.load(Ordering::Acquire) {
-						let desc_opt = desc_opt;
-						let mut v = Vec::new();
-						$(
-							$crate::__tb_assert_spec_build!(
-								v, $base, $maj, $min, $patch, $mode, $gate,
-								assertions: [ $( $assertion ),* ],
-								events: [ $( $( $ev ),* )? ]
-								$(, tag_filter: [ $( $tag ),* ])?,
-								description: desc_opt
-								$(, schedulability: { $($sched_content)* })?
-							);
-						)+
-						unsafe { VEC = Some(v); }
-						INIT.store(true, Ordering::Release);
-					}
-					unsafe { VEC.as_ref().unwrap().as_slice() }
-				}
+							events: [ $($events_tt:tt)* ],
+						)?
+						$(, tag_filter: [ $( $tag ),* ])?
+						$(, schedulability: { $($sched_content)* })?
+					)+
+				)
 			}
 
 			#[allow(dead_code)]
@@ -737,24 +1127,15 @@ macro_rules! tb_assert_spec {
 // Scenario macro MVP: Worker & Bare variants (ServiceClient stubbed)
 // ---------------------------------------------------------------------------
 
-/// Helper macro for common trace verification logic (reduces duplication)
+// Helper to validate CSP and FDR (reduces duplication)
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __tb_scenario_verify_impl {
-	// Single spec variant with optional CSP and FDR
+macro_rules! __tb_scenario_validate_csp_fdr {
 	(
-		single_spec: $spec:ty,
-		trace: $trace:expr,
+		$trace:expr,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(hooks: {
-			$(on_pass: $on_pass:expr,)?
-			$(on_fail: $on_fail:expr)?
-		},)?
 	) => {{
-		let spec = <$spec>::latest();
-		let verification_result = $crate::testing::specs::verify_trace(spec, &$trace);
-
 		// CSP validation if provided
 		#[cfg(feature = "testing-csp")]
 		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = {
@@ -790,6 +1171,34 @@ macro_rules! __tb_scenario_verify_impl {
 		let expect_failure = fdr_config.as_ref().map(|c| c.expect_failure).unwrap_or(false);
 		#[cfg(not(feature = "testing-fdr"))]
 		let expect_failure = false;
+
+		(csp_result, csp_failed, fdr_result, fdr_config, fdr_failed, expect_failure)
+	}};
+}
+
+/// Helper macro for common trace verification logic (reduces duplication)
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_scenario_verify_impl {
+	// Single spec variant with optional CSP and FDR
+	(
+		single_spec: $spec:ty,
+		trace: $trace:expr,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(hooks: {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		},)?
+	) => {{
+		let spec = <$spec>::latest();
+		let verification_result = $crate::testing::specs::verify_trace(spec, &$trace);
+
+		let (csp_result, csp_failed, fdr_result, _fdr_config, fdr_failed, expect_failure) = $crate::__tb_scenario_validate_csp_fdr!(
+			$trace,
+			$(csp: $csp,)?
+			$(fdr: $fdr_config,)?
+		);
 
 		match &verification_result {
 			Ok(()) => {
@@ -866,36 +1275,11 @@ macro_rules! __tb_scenario_verify_impl {
 		let mut all_passed = true;
 		let mut first_violation = None;
 
-		// CSP validation if provided
-		#[cfg(feature = "testing-csp")]
-		#[allow(unused_variables)]
-		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = {
-			$crate::tb_scenario!(@csp_validate $trace, $($csp)?)
-		};
-
-		#[cfg(not(feature = "testing-csp"))]
-		let csp_result: Option<$crate::testing::specs::csp::CspValidationResult> = None;
-
-		// Check if CSP validation failed
-		#[cfg(feature = "testing-csp")]
-		let csp_failed = csp_result.as_ref().map(|r| !r.valid).unwrap_or(false);
-		#[cfg(not(feature = "testing-csp"))]
-		let csp_failed = false;
-
-		// FDR validation if provided
-		#[cfg(feature = "testing-fdr")]
-		let fdr_result: Option<$crate::testing::fdr::FdrVerdict> = {
-			$crate::tb_scenario!(@fdr_validate $trace, $($fdr_config)?)
-		};
-
-		#[cfg(not(feature = "testing-fdr"))]
-		let fdr_result: Option<$crate::testing::fdr::FdrVerdict> = None;
-
-		// Check if FDR validation failed
-		#[cfg(feature = "testing-fdr")]
-		let fdr_failed = fdr_result.as_ref().map(|v| !v.passed).unwrap_or(false);
-		#[cfg(not(feature = "testing-fdr"))]
-		let fdr_failed = false;
+		let (csp_result, csp_failed, fdr_result, _fdr_config, fdr_failed, _expect_failure) = $crate::__tb_scenario_validate_csp_fdr!(
+			$trace,
+			$(csp: $csp,)?
+			$(fdr: $fdr_config,)?
+		);
 
 		for spec in &$specs {
 			let verification_result = $crate::testing::specs::verify_trace(*spec, &$trace);

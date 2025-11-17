@@ -98,6 +98,20 @@ pub enum SpecViolation {
 	},
 	/// Response validation failed
 	ResponseValidationFailed,
+	/// Schedulability violation
+	#[cfg(feature = "testing-timing")]
+	SchedulabilityViolation {
+		expected: String,
+		actual: String,
+		utilization: f64,
+		utilization_bound: f64,
+		violations: String,
+	},
+	/// Schedulability analysis error
+	#[cfg(feature = "testing-timing")]
+	SchedulabilityError {
+		error: String,
+	},
 }
 
 impl fmt::Display for SpecViolation {
@@ -140,6 +154,26 @@ impl fmt::Display for SpecViolation {
 			}
 			Self::ResponseValidationFailed => {
 				write!(f, "Response validation failed")
+			}
+			#[cfg(feature = "testing-timing")]
+			Self::SchedulabilityViolation { expected, actual, utilization, utilization_bound, violations } => {
+				write!(
+					f,
+					"Schedulability violation: expected {}, got {} (utilization: {:.3}, bound: {:.3}){}",
+					expected,
+					actual,
+					utilization,
+					utilization_bound,
+					if violations.is_empty() {
+						String::new()
+					} else {
+						format!("; violations: {}", violations)
+					}
+				)
+			}
+			#[cfg(feature = "testing-timing")]
+			Self::SchedulabilityError { error } => {
+				write!(f, "Schedulability analysis error: {}", error)
 			}
 		}
 	}

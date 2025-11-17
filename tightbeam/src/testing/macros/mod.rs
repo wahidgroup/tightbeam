@@ -170,46 +170,27 @@ macro_rules! deadline {
 macro_rules! guard {
 	// Less than: x < 10ms
 	($clock:ident < $dur:expr) => {
-		$crate::testing::timing::TimingGuard::ClockLessThan(
-			stringify!($clock).to_string(),
-			$dur,
-		)
+		$crate::testing::timing::TimingGuard::ClockLessThan(stringify!($clock).to_string(), $dur)
 	};
 	// Less than or equal: x <= 5ms
 	($clock:ident <= $dur:expr) => {
-		$crate::testing::timing::TimingGuard::ClockLessEqual(
-			stringify!($clock).to_string(),
-			$dur,
-		)
+		$crate::testing::timing::TimingGuard::ClockLessEqual(stringify!($clock).to_string(), $dur)
 	};
 	// Greater than: x > 20ms
 	($clock:ident > $dur:expr) => {
-		$crate::testing::timing::TimingGuard::ClockGreaterThan(
-			stringify!($clock).to_string(),
-			$dur,
-		)
+		$crate::testing::timing::TimingGuard::ClockGreaterThan(stringify!($clock).to_string(), $dur)
 	};
 	// Greater than or equal: x >= 15ms
 	($clock:ident >= $dur:expr) => {
-		$crate::testing::timing::TimingGuard::ClockGreaterEqual(
-			stringify!($clock).to_string(),
-			$dur,
-		)
+		$crate::testing::timing::TimingGuard::ClockGreaterEqual(stringify!($clock).to_string(), $dur)
 	};
 	// Equals: x == 10ms
 	($clock:ident == $dur:expr) => {
-		$crate::testing::timing::TimingGuard::ClockEquals(
-			stringify!($clock).to_string(),
-			$dur,
-		)
+		$crate::testing::timing::TimingGuard::ClockEquals(stringify!($clock).to_string(), $dur)
 	};
 	// Range: 5ms <= x <= 10ms
 	($min_dur:tt <= $clock:ident <= $max_dur:tt) => {
-		$crate::testing::timing::TimingGuard::ClockInRange(
-			stringify!($clock).to_string(),
-			$min_dur,
-			$max_dur,
-		)
+		$crate::testing::timing::TimingGuard::ClockInRange(stringify!($clock).to_string(), $min_dur, $max_dur)
 	};
 }
 
