@@ -133,9 +133,8 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.5.2. [Observable vs. Hidden Events](#1052-observable-vs-hidden-events)
 		- 10.5.3. [Nondeterministic Choice and Refusal Sets](#1053-nondeterministic-choice-and-refusal-sets)
 		- 10.5.4. [Multi-Seed Exploration and Scheduler Interleaving](#1054-multi-seed-exploration-and-scheduler-interleaving)
-		- 10.5.5. [FDR Verification Verdict](#1055-fdr-verification-verdict)
-		- 10.5.6. [CSPM Export for FDR4 Integration](#1056-cspm-export-for-fdr4-integration)
-		- 10.5.7. [Trace Analysis Extensions](#1057-trace-analysis-extensions)
+		- 10.5.5. [CSPM Export for FDR4 Integration](#1055-cspm-export-for-fdr4-integration)
+		- 10.5.6. [Trace Analysis Extensions](#1056-trace-analysis-extensions)
 	- 10.6. [Unified Testing: tb_scenario! Macro](#106-unified-testing-tb_scenario-macro)
 		- 10.6.1. [Syntax](#1061-syntax)
 		- 10.6.2. [Examples](#1062-examples)
@@ -2699,7 +2698,7 @@ all executions.
 
 #### 10.4.5 FDR Verdict Structure
 
-After multi-seed exploration, tightbeam produces a comprehensive verdict:
+After multi-seed exploration, tightbeam produces a verdict:
 
 ```rust
 pub struct FdrVerdict {
@@ -2858,40 +2857,7 @@ Across all seeds, the framework verifies that:
 2. **Failures refinement**: No invalid refusals at choice points
 3. **Divergence freedom**: No seed produces infinite τ-loops
 
-#### 10.5.5 FDR Verification Verdict
-
-After multi-seed exploration, tightbeam produces a comprehensive verdict:
-
-```rust
-pub struct FdrVerdict {
-    // Refinement properties
-    pub trace_refines: bool,           // Spec ⊑T Impl
-    pub failures_refines: bool,        // Spec ⊑F Impl
-    pub divergence_free: bool,         // No τ-loops detected
-
-    // Determinism analysis
-    pub is_deterministic: bool,        // No nondeterminism witnesses
-    pub determinism_witness: Option<(Trace, Event)>,
-
-    // Divergence witness
-    pub divergence_witness: Option<Vec<Event>>,  // τ-loop if found
-
-    // Statistics
-    pub traces_explored: usize,
-    pub states_visited: usize,
-    pub seeds_completed: u32,
-}
-```
-
-**Determinism checking**: FDR searches for witnesses to nondeterminism—a trace
-and event where the process both accepts and refuses that event. If found, the
-witness indicates unintended nondeterminism not declared via `choice`.
-
-**Divergence witness**: If a τ-loop is detected (consecutive hidden events
-exceeding `max_internal_run`), the witness provides the internal event sequence
-causing livelock.
-
-#### 10.5.6 CSPM Export for FDR4 Integration
+#### 10.5.5 CSPM Export for FDR4 Integration
 
 Tightbeam can export process specifications as CSPM (CSP Machine-readable)
 format for verification with external tools like FDR4:[^fdr4]
