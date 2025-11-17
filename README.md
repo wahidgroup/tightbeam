@@ -114,6 +114,8 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.2.5. [Cardinality Helpers](#1025-cardinality-helpers)
 		- 10.2.6. [Value Assertion Helpers](#1026-value-assertion-helpers)
 		- 10.2.7. [Tag-Based Assertion Filtering](#1027-tag-based-assertion-filtering)
+		- 10.2.8. [Recording Trace Events](#1028-recording-trace-events)
+		- 10.2.9. [Timing Verification and Schedulability](#1029-timing-verification-and-schedulability)
 	- 10.3. [Layer 2: Process Specifications (CSP)](#103-layer-2-process-specifications-csp)
 		- 10.3.1. [Concept](#1031-concept)
 		- 10.3.2. [Specification: tb_process_spec! Syntax](#1032-specification-tb_process_spec-syntax)
@@ -2224,6 +2226,7 @@ The testing framework uses progressive feature flags:
 - `testing`: Enables L1 assertion verification (foundation)
 - `testing-csp`: Enables L1+L2 CSP process modeling
 - `testing-fdr`: Enables L1+L2+L3 refinement checking (requires `testing-csp`)
+- `testing-timing`: Enables timing verification and schedulability analysis (requires `testing`)
 
 Each layer builds on the previous, ensuring consistent semantics across
 verification levels.
@@ -2281,6 +2284,11 @@ V(major, minor, patch): {
 		...
 	],
 	events: [Kind, ...]                 // Optional: when instrumentation enabled
+	schedulability: {                   // Optional: when testing-timing enabled
+		task_set: <TaskSet>,
+		scheduler: RateMonotonic | EarliestDeadlineFirst,
+		must_be_schedulable: <bool>
+	}
 }
 ```
 
@@ -2293,6 +2301,7 @@ V(major, minor, patch): {
 - Tag filter (if present)
 - Normalized assertions (sorted by label)
 - Optional event kinds
+- Optional schedulability parameters (when `testing-timing` enabled)
 
 #### 10.2.3 Implementation Examples
 
@@ -2429,6 +2438,65 @@ tb_scenario! {
 }
 ```
 
+#### 10.2.9 Timing Verification and Schedulability
+
+The `testing-timing` feature enables timing verification for real-time systems, 
+including timing constraints, timed CSP semantics, and schedulability analysis. 
+All timing features integrate seamlessly with the existing CSP and FDR 
+verification layers.
+
+**Timing Constraints in Process Specs:**
+
+Process specs support four types of timing constraints via the `timing: { }` block:
+
+- **WCET (Worst-Case Execution Time)**: `wcet: { "event" => wcet!(10ms) }` - Maximum allowed execution time per event
+- **Deadline**: `deadline: { "start" => "end", deadline!(duration: 100ms) }` - Maximum latency between start and end events
+- **Jitter**: `jitter: { "event" => jitter!(5ms) }` - Maximum timing variation for an event
+- **Slack**: Specified via `deadline!(duration: 100ms, slack: 5ms)` - Minimum safety margin
+
+**Timed CSP Semantics:**
+
+Process specs support timed automata semantics with clock variables and timing guards:
+
+- **Clock Variables**: `clocks: { "clock1", "clock2" }` - Named clocks that advance during execution
+- **Timing Guards**: `"event" [ guard!(clock1 < 10ms) ] => State` - Transitions enabled only when guard conditions are satisfied
+- **Clock Resets**: `"event" [ guard!(clock2 >= 5ms), reset: ["clock1"] ] => State` - Reset clocks when transition is taken
+
+Guard expressions support: `<`, `<=`, `>`, `>=`, `==`, and ranges (`5ms <= x <= 10ms`).
+
+**Schedulability Analysis in Assertion Specs:**
+
+Assertion specs support schedulability verification via the `schedulability: { }` block:
+
+```rust
+schedulability: {
+	task_set: my_task_set,
+	scheduler: RateMonotonic | EarliestDeadlineFirst,
+	must_be_schedulable: true
+}
+```
+
+Supported schedulers:
+- **Rate Monotonic Analysis (RMA)**: Fixed-priority scheduling with utilization bounds
+- **Earliest Deadline First (EDF)**: Dynamic priority scheduling with utilization bound ≤ 1.0
+- **Response Time Analysis (RTA)**: Exact schedulability test for both RMA and EDF
+
+**Early Pruning and FDR Integration:**
+
+Timing violations automatically prune traces during FDR exploration, improving verification efficiency:
+- Per-event WCET violations prune immediately
+- Deadline violations prune when detected
+- Path-based WCET violations prune compositional violations
+- Timed transitions filter based on guard satisfaction
+
+**Additional Features:**
+
+- **Statistical Analysis**: Percentile-based WCET (P50-P99.99) and confidence intervals
+- **Path-Based WCET**: Compositional WCET analysis along execution paths
+- **Integer-Only Math**: Fixed-point arithmetic for deterministic schedulability calculations
+
+See `TIMING_VERIFICATION_ANALYSIS.md` for comprehensive details, industry standards alignment, and academic references.
+
 ### 10.3 Layer 2: Process Specifications (CSP)
 
 #### 10.3.1 Concept
@@ -2450,18 +2518,25 @@ Enabled with `testing-csp` feature flag.
 tb_process_spec! {
 	pub ProcessName,
 	events {
-		observable { "event1", "event2", ... }   // External alphabet (Σ)
-		hidden { "internal1", "internal2", ... } // Internal alphabet (τ)
+		observable { "event1", "event2", ... }    // External alphabet (Σ)
+		hidden { "internal1", "internal2", ... }  // Internal alphabet (τ)
 	}
 	states {
-		S0 => { "event1" => S1 }                 // State transitions
-		S1 => { "event2" => S2, "event3" => S3 } // Nondeterministic branching
-		S2 => {}                                 // Terminal state
-		S3 => {}
+		S0 => { "event1" => S1 }                  // State transitions
+		S1 => { "event2" => S2, "event3" => S3 }  // Nondeterministic branching
+		S2 => { "event4" [ guard!(clock1 < 10ms) ] => S3 }  // Timed transition with guard
+		S3 => { "event5" [ guard!(clock2 >= 5ms), reset: ["clock1"] ] => S4 }  // Guard with clock reset
+		S4 => {}                                  // Terminal state
 	}
-	terminal { S2, S3 }                         // Valid end states
-	choice { S1 }                               // Nondeterministic states
-	annotations { description: "..." }          // Optional metadata
+	terminal { S4 }                               // Valid end states
+	choice { S1 }                                 // Nondeterministic states
+	timing {                                      // Optional: when testing-timing enabled
+		wcet: { "event1" => wcet!(10ms) },
+		jitter: { "event2" => jitter!(5ms) },
+		deadline: { "start" => "end", deadline!(duration: 100ms) }
+	}
+	clocks: { "clock1", "clock2" }               // Optional: when testing-timing enabled
+	annotations { description: "..." }           // Optional metadata
 }
 ```
 
@@ -3322,6 +3397,11 @@ The following table summarizes capabilities available across the testing layers:
 | Coverage-guided fuzzing | – | – | – | ✓ |
 | Edge coverage tracking | – | – | – | ✓ |
 | Input corpus evolution | – | – | – | ✓ |
+| **Timing Verification** | | | | |
+| Timing constraints (WCET/Deadline/Jitter) | – | `timing` | `timing` | – |
+| Timed CSP (clocks, guards) | – | `timing` | `timing` | – |
+| Schedulability analysis (RMA/EDF) | – | – | `timing` | – |
+| Early pruning (timing violations) | – | – | `timing` | – |
 | **Combined Capabilities** | | | | |
 | CSP oracle for fuzzing | – | – | – | `csp` + `fuzz` |
 | IJON state annotations | – | – | – | `csp` + `fuzz-ijon` |
