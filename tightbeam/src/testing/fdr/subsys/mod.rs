@@ -9,6 +9,9 @@ pub mod export;
 pub mod extensions;
 pub mod refinement;
 
+#[cfg(feature = "testing-timing")]
+pub mod timing;
+
 // Re-export main types and traits
 pub use cache::DefaultCache;
 pub use engine::{DefaultFdrExplorer, FdrExplorer};

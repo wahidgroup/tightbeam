@@ -1,14 +1,21 @@
 //! Exploration subsystem
 //!
-//! This module contains the exploration engine implementation and helper functions
-//! for the FDR exploration loop. These handle state space traversal, seed management,
-//! and basic property verification.
+//! This module contains the exploration engine implementation and helper
+//! functions for the FDR exploration loop. These handle state space traversal,
+//! seed management, and basic property verification.
 
 use std::collections::{HashSet, VecDeque};
 
+#[cfg(feature = "testing-timing")]
+use core::time::Duration;
+
 use crate::testing::fdr::config::{Failure, FdrConfig, RefusalSet, Trace};
 use crate::testing::fdr::explorer::{ExplorationCore, ExplorationState, SeedResult, SeededRng};
+use crate::testing::fdr::subsys::timing::check_timing_violations;
 use crate::testing::specs::csp::{Action, Event, Process, State};
+
+#[cfg(feature = "testing-timing")]
+use crate::testing::timing::{TimingConstraint, TimingConstraints};
 
 /// Default exploration engine implementation
 pub struct DefaultExplorationEngine<'a> {
@@ -132,7 +139,6 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 			// Select action using seeded RNG at choice points
 			let action = Self::select_action_helper(&mut rng, process, state.process_state, &actions);
-
 			// Execute transition
 			Self::execute_transition_helper(process, &state, action, &mut queue);
 		}
@@ -268,9 +274,52 @@ impl<'a> DefaultExplorationEngine<'a> {
 			} else {
 				// Observable transition
 				next_exploration.record_observable(action.event.clone(), next_state);
+
+				// Update timing if timing constraints exist
+				#[cfg(feature = "testing-timing")]
+				{
+					use crate::testing::fdr::subsys::timing::check_event_wcet_violation;
+
+					if let Some(ref constraints) = process.timing_constraints {
+						// Look up WCET for this event
+						// Check if this event's WCET violates its constraint
+						let wcet = Self::lookup_wcet(&action.event, constraints);
+						if check_event_wcet_violation(&action.event, wcet, constraints) {
+							// Prune this branch: WCET violation
+							continue;
+						}
+
+						next_exploration.update_timing(&action.event, wcet);
+
+						// Check other timing violations (deadline, path WCET) before adding to queue
+						if Self::check_timing_violations(&next_exploration, constraints) {
+							// Prune this branch: timing violation
+							continue;
+						}
+					}
+				}
 			}
 
 			queue.push_back(next_exploration);
 		}
+	}
+
+	/// Look up WCET for an event from timing constraints
+	#[cfg(feature = "testing-timing")]
+	fn lookup_wcet(event: &Event, constraints: &TimingConstraints) -> Duration {
+		if let Some(constraint) = constraints.get(event) {
+			match constraint {
+				TimingConstraint::Wcet(wcet_config) => wcet_config.duration,
+				_ => Duration::ZERO, // Jitter/deadline don't contribute to WCET
+			}
+		} else {
+			Duration::ZERO // No constraint = zero time (conservative)
+		}
+	}
+
+	/// Check if exploration state violates timing constraints
+	#[cfg(feature = "testing-timing")]
+	fn check_timing_violations(state: &ExplorationState, constraints: &TimingConstraints) -> bool {
+		check_timing_violations(&state.trace, state.elapsed_time, &state.event_times, constraints)
 	}
 }

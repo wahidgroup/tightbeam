@@ -459,7 +459,8 @@ where
 		// Enforce size ceilings if configured
 		#[cfg(feature = "x509")]
 		{
-			// We can’t tell encrypted vs cleartext at this point, so choose the larger cap conservatively
+			// We can’t tell encrypted vs cleartext at this point,
+			// so choose the larger cap conservatively
 			let max_allowed = self
 				.max_encrypted_envelope
 				.or(self.max_cleartext_envelope)

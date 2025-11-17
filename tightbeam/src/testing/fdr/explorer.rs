@@ -5,11 +5,11 @@
 //! - `RefinementChecker`: Refinement checking algorithms (trace, failures, divergence)
 //! - `MemoizationCache`: Caching layer for expensive computations
 
+use core::time::Duration;
 use std::collections::HashSet;
 
-use crate::testing::specs::csp::{Event, Process, State};
-
 use super::config::{Failure, FdrConfig, Trace};
+use crate::testing::specs::csp::{Event, Process, State};
 
 /// Core exploration functionality
 ///
@@ -169,6 +169,14 @@ pub struct ExplorationState {
 
 	/// Hidden events executed (for divergence witness)
 	pub hidden_events: Vec<Event>,
+
+	/// Cumulative elapsed time (worst-case using WCET)
+	#[cfg(feature = "testing-timing")]
+	pub elapsed_time: Duration,
+
+	/// Event timestamps: (event, cumulative_time_when_event_occurred)
+	#[cfg(feature = "testing-timing")]
+	pub event_times: Vec<(Event, Duration)>,
 }
 
 impl ExplorationState {
@@ -180,6 +188,10 @@ impl ExplorationState {
 			internal_run: 0,
 			state_path: vec![process_state],
 			hidden_events: Vec::new(),
+			#[cfg(feature = "testing-timing")]
+			elapsed_time: Duration::ZERO,
+			#[cfg(feature = "testing-timing")]
+			event_times: Vec::new(),
 		}
 	}
 
@@ -190,10 +202,14 @@ impl ExplorationState {
 
 	/// Record observable event
 	pub fn record_observable(&mut self, event: Event, next_state: State) {
-		self.trace.push(event);
+		self.trace.push(event.clone());
 		self.process_state = next_state;
 		self.state_path.push(next_state);
 		self.internal_run = 0; // Reset τ counter
+		#[cfg(feature = "testing-timing")]
+		{
+			// Timing will be updated by caller after WCET lookup
+		}
 	}
 
 	/// Record hidden (τ) event
@@ -202,6 +218,18 @@ impl ExplorationState {
 		self.process_state = next_state;
 		self.state_path.push(next_state);
 		self.internal_run += 1;
+		#[cfg(feature = "testing-timing")]
+		{
+			// Hidden events don't contribute to timing (or use zero time)
+		}
+	}
+
+	/// Update timing after recording an observable event
+	/// Called after WCET lookup to add event time
+	#[cfg(feature = "testing-timing")]
+	pub fn update_timing(&mut self, event: &Event, wcet: Duration) {
+		self.elapsed_time += wcet;
+		self.event_times.push((event.clone(), self.elapsed_time));
 	}
 }
 
@@ -249,7 +277,6 @@ mod tests {
 		fn deterministic_sequences() {
 			let mut rng1 = SeededRng::new(42);
 			let mut rng2 = SeededRng::new(42);
-
 			for _ in 0..10 {
 				assert_eq!(rng1.get_next(), rng2.get_next());
 			}
@@ -331,6 +358,30 @@ mod tests {
 			assert!(exp_state.internal_run > 32);
 			assert_eq!(exp_state.hidden_events.len(), 35);
 			assert!(exp_state.trace.is_empty()); // Observable trace stays empty
+		}
+
+		#[cfg(feature = "testing-timing")]
+		#[test]
+		fn update_timing() {
+			let state = State("S1");
+			let event = Event("evt");
+			let mut exp_state = ExplorationState::initial(state);
+
+			exp_state.record_observable(event.clone(), state);
+			exp_state.update_timing(&event, Duration::from_millis(10));
+			assert_eq!(exp_state.elapsed_time, Duration::from_millis(10));
+			assert_eq!(exp_state.event_times.len(), 1);
+			assert_eq!(exp_state.event_times[0].0, event);
+			assert_eq!(exp_state.event_times[0].1, Duration::from_millis(10));
+
+			// Add another event
+			let event2 = Event("evt2");
+			exp_state.record_observable(event2.clone(), state);
+			exp_state.update_timing(&event2, Duration::from_millis(5));
+			assert_eq!(exp_state.elapsed_time, Duration::from_millis(15));
+			assert_eq!(exp_state.event_times.len(), 2);
+			assert_eq!(exp_state.event_times[1].0, event2);
+			assert_eq!(exp_state.event_times[1].1, Duration::from_millis(15));
 		}
 	}
 }

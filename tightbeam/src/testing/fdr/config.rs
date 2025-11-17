@@ -162,14 +162,16 @@ pub struct FdrConfig {
 
 	/// Number of schedulers (m) - for resource constraint modeling
 	/// When m < n (process_count), some traces become impossible
-	/// Required when using scheduler modeling. Must be <= process_count.
+	/// Optional: set to Some(_) to enable scheduler modeling, None to disable.
+	/// When set, both scheduler_count and process_count must be Some(_).
 	#[cfg(feature = "testing-fault")]
-	pub scheduler_count: u32,
+	pub scheduler_count: Option<u32>,
 
 	/// Number of concurrent processes (n) - for resource constraint modeling
-	/// Required when using scheduler modeling. Must be >= scheduler_count.
+	/// Optional: set to Some(_) to enable scheduler modeling, None to disable.
+	/// When set, both scheduler_count and process_count must be Some(_).
 	#[cfg(feature = "testing-fault")]
-	pub process_count: u32,
+	pub process_count: Option<u32>,
 
 	/// Scheduler model type (Cooperative or Preemptive)
 	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
@@ -195,9 +197,9 @@ impl Default for FdrConfig {
 			fail_fast: true,
 			expect_failure: false,
 			#[cfg(feature = "testing-fault")]
-			scheduler_count: 1,
+			scheduler_count: None,
 			#[cfg(feature = "testing-fault")]
-			process_count: 1,
+			process_count: None,
 			#[cfg(feature = "testing-fault")]
 			scheduler_model: None,
 			#[cfg(feature = "testing-fault")]
@@ -212,34 +214,44 @@ impl FdrConfig {
 	/// Validate scheduler model constraints with detailed error messages.
 	///
 	/// Checks:
-	/// - scheduler_count must be <= process_count
-	/// - scheduler_count and process_count must be > 0
+	/// - scheduler_count and process_count must both be Some(_) or both be None
+	/// - If set, scheduler_count must be <= process_count
+	/// - If set, scheduler_count and process_count must be > 0
 	///
 	/// Returns `Ok(())` if validation passes, or a `TestingError` if validation fails.
 	#[cfg(feature = "testing-fault")]
 	pub fn validate_scheduler_model(&self) -> Result<(), TestingError> {
-		if self.scheduler_count > self.process_count {
-			return Err(TestingError::InvalidFdrConfig(format!(
-				"scheduler_count ({}) cannot exceed process_count ({}). \
-				When m > n, all processes can run simultaneously, making \
-				resource constraint modeling meaningless.",
-				self.scheduler_count, self.process_count
-			)));
+		match (self.scheduler_count, self.process_count) {
+			(None, None) => Ok(()), // Scheduler modeling disabled - valid
+			(Some(_), None) | (None, Some(_)) => Err(TestingError::InvalidFdrConfig(
+				"scheduler_count and process_count must both be set or both be None. \
+					Resource constraint modeling requires both values."
+					.to_string(),
+			)),
+			(Some(scheduler_count), Some(process_count)) => {
+				if scheduler_count > process_count {
+					return Err(TestingError::InvalidFdrConfig(format!(
+						"scheduler_count ({}) cannot exceed process_count ({}). \
+						When m > n, all processes can run simultaneously, making \
+						resource constraint modeling meaningless.",
+						scheduler_count, process_count
+					)));
+				}
+				if scheduler_count == 0 {
+					return Err(TestingError::InvalidFdrConfig(format!(
+						"scheduler_count must be > 0. Got {}.",
+						scheduler_count
+					)));
+				}
+				if process_count == 0 {
+					return Err(TestingError::InvalidFdrConfig(format!(
+						"process_count must be > 0. Got {}.",
+						process_count
+					)));
+				}
+				Ok(())
+			}
 		}
-		if self.scheduler_count == 0 {
-			return Err(TestingError::InvalidFdrConfig(format!(
-				"scheduler_count must be > 0. Got {}.",
-				self.scheduler_count
-			)));
-		}
-		if self.process_count == 0 {
-			return Err(TestingError::InvalidFdrConfig(format!(
-				"process_count must be > 0. Got {}.",
-				self.process_count
-			)));
-		}
-
-		Ok(())
 	}
 
 	/// Validate all constraints (scheduler model).
@@ -540,8 +552,8 @@ mod tests {
 		#[test]
 		fn scheduler_validation_valid_config() -> Result<(), TestingError> {
 			let config = FdrConfig {
-				scheduler_count: 2,
-				process_count: 5,
+				scheduler_count: Some(2),
+				process_count: Some(5),
 				scheduler_model: Some(SchedulerModel::Cooperative),
 				..FdrConfig::default()
 			};
@@ -552,25 +564,25 @@ mod tests {
 
 		#[test]
 		fn scheduler_validation_scheduler_exceeds_process_count() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: 5, process_count: 2, ..FdrConfig::default() };
+			let config = FdrConfig { scheduler_count: Some(5), process_count: Some(2), ..FdrConfig::default() };
 			assert_validation_error(config.validate_scheduler_model())
 		}
 
 		#[test]
 		fn scheduler_validation_zero_scheduler_count() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: 0, process_count: 5, ..FdrConfig::default() };
+			let config = FdrConfig { scheduler_count: Some(0), process_count: Some(5), ..FdrConfig::default() };
 			assert_validation_error(config.validate_scheduler_model())
 		}
 
 		#[test]
 		fn scheduler_validation_zero_process_count() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: 2, process_count: 0, ..FdrConfig::default() };
+			let config = FdrConfig { scheduler_count: Some(2), process_count: Some(0), ..FdrConfig::default() };
 			assert_validation_error(config.validate_scheduler_model())
 		}
 
 		#[test]
 		fn scheduler_validation_equal_counts() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: 3, process_count: 3, ..FdrConfig::default() };
+			let config = FdrConfig { scheduler_count: Some(3), process_count: Some(3), ..FdrConfig::default() };
 			config.validate_scheduler_model()?;
 			Ok(())
 		}
@@ -580,6 +592,18 @@ mod tests {
 			let config = FdrConfig::default();
 			config.validate_scheduler_model()?;
 			Ok(())
+		}
+
+		#[test]
+		fn scheduler_validation_only_scheduler_count_set() -> Result<(), TestingError> {
+			let config = FdrConfig { scheduler_count: Some(2), process_count: None, ..FdrConfig::default() };
+			assert_validation_error(config.validate_scheduler_model())
+		}
+
+		#[test]
+		fn scheduler_validation_only_process_count_set() -> Result<(), TestingError> {
+			let config = FdrConfig { scheduler_count: None, process_count: Some(5), ..FdrConfig::default() };
+			assert_validation_error(config.validate_scheduler_model())
 		}
 	}
 }

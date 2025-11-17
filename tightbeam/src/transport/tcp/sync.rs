@@ -108,7 +108,7 @@ where
 			(length_octets, length)
 		};
 
-		// Enforce size ceilings if configured (pick larger bound conservatively)
+		// Enforce size ceilings if configured
 
 		{
 			let max_allowed = self
