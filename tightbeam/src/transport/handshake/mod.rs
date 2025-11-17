@@ -638,18 +638,13 @@ pub trait ServerHandshakeProtocol: Send {
 // ============================================================================
 
 /// Specifies which handshake protocol to use (ECIES or CMS).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HandshakeProtocolKind {
 	/// Use ECIES-based handshake (default, lighter weight)
+	#[default]
 	Ecies,
 	/// Use CMS-based handshake (full X.509 PKI support)
 	Cms,
-}
-
-impl Default for HandshakeProtocolKind {
-	fn default() -> Self {
-		Self::Ecies
-	}
 }
 
 // ============================================================================

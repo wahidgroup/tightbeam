@@ -128,6 +128,7 @@ pub mod active {
 	use std::sync::{Arc, Mutex, OnceLock};
 
 	use crate::crypto::hash::{Digest, Sha3_256};
+	use crate::der::asn1::OctetString;
 	use crate::TightBeamError;
 
 	#[derive(Clone, Debug, crate::der::Sequence)]
@@ -261,15 +262,15 @@ pub mod active {
 
 	#[derive(Debug, Clone, crate::der::Sequence)]
 	pub struct EvidenceArtifact {
-		pub spec_hash: [u8; 32],
-		pub trace_hash: [u8; 32],
-		pub evidence_hash: [u8; 32],
+		pub spec_hash: OctetString,
+		pub trace_hash: OctetString,
+		pub evidence_hash: OctetString,
 		pub events: Vec<TbEvent>,
 		pub overflow: bool,
 	}
 
 	impl EvidenceArtifact {
-		pub fn finalize(spec_hash: [u8; 32]) -> Self {
+		pub fn finalize(spec_hash: [u8; 32]) -> Result<Self, TightBeamError> {
 			let events = if let Some(events) = EVENTS.get() {
 				events.lock().unwrap().clone()
 			} else {
@@ -308,35 +309,34 @@ pub mod active {
 			h1.update(&bytes);
 
 			let trace_hash_vec = h1.finalize();
-			let mut trace_hash = [0u8; 32];
-			trace_hash.copy_from_slice(&trace_hash_vec);
+			let trace_hash = OctetString::new(trace_hash_vec.as_slice())?;
 
 			let mut h2 = Sha3_256::new();
 			h2.update(spec_hash);
-			h2.update(trace_hash);
+			h2.update(trace_hash.as_bytes());
 
 			let evidence_hash_vec = h2.finalize();
-			let mut evidence_hash = [0u8; 32];
-			evidence_hash.copy_from_slice(&evidence_hash_vec);
+			let evidence_hash = OctetString::new(evidence_hash_vec.as_slice())?;
+			let spec_hash_os = OctetString::new(spec_hash)?;
 
-			Self {
-				spec_hash,
+			Ok(Self {
+				spec_hash: spec_hash_os,
 				trace_hash,
 				evidence_hash,
 				events,
 				overflow: OVERFLOW.load(Ordering::Relaxed),
-			}
+			})
 		}
 	}
 
-	pub fn end_trace() -> EvidenceArtifact {
+	pub fn end_trace() -> Result<EvidenceArtifact, TightBeamError> {
 		let zero_spec = [0u8; 32];
 		let _ = emit(TbEventKind::End, None, None, None, 0, None);
 		EvidenceArtifact::finalize(zero_spec)
 	}
 
 	/// End trace using a real spec hash (preferred API once spec built).
-	pub fn end_trace_with_spec(spec_hash: [u8; 32]) -> EvidenceArtifact {
+	pub fn end_trace_with_spec(spec_hash: [u8; 32]) -> Result<EvidenceArtifact, TightBeamError> {
 		let _ = emit(TbEventKind::End, None, None, None, 0, None);
 		EvidenceArtifact::finalize(spec_hash)
 	}

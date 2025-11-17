@@ -19,7 +19,7 @@ pub fn integer_sqrt(value: u128) -> u128 {
 		let mut low = 1u128;
 		let mut high = value.min(1u128 << 64); // sqrt(u128::MAX) < 2^64
 		while low < high {
-			let mid = (low + high + 1) / 2;
+			let mid = (low + high).div_ceil(2);
 			// Check if mid^2 <= value without overflow
 			if let Some(squared) = mid.checked_mul(mid) {
 				if squared <= value {

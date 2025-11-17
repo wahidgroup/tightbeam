@@ -174,7 +174,7 @@ impl ChessGameState {
 
 	/// Convert i8 coordinate to valid u8 if in bounds [0, 8)
 	fn to_valid_coord(coord: i8) -> Option<u8> {
-		if coord >= 0 && coord < 8 {
+		if (0..8).contains(&coord) {
 			Some(coord as u8)
 		} else {
 			None

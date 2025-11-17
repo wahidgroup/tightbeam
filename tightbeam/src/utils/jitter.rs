@@ -76,11 +76,7 @@ impl JitterCalculator for VarianceJitter {
 		let variance_sum: u128 = durations
 			.iter()
 			.map(|&d| {
-				let diff = if d > mean {
-					d - mean
-				} else {
-					mean - d
-				};
+				let diff = d.abs_diff(mean);
 				(diff as u128).saturating_pow(2)
 			})
 			.sum();
@@ -118,11 +114,7 @@ impl JitterCalculator for StdDevJitter {
 		let variance_sum: u128 = durations
 			.iter()
 			.map(|&d| {
-				let diff = if d > mean {
-					d - mean
-				} else {
-					mean - d
-				};
+				let diff = d.abs_diff(mean);
 				(diff as u128).saturating_pow(2)
 			})
 			.sum();

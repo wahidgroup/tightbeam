@@ -185,9 +185,10 @@ macro_rules! jitter {
 
 /// Instrumentation mode for tb_scenario!
 #[cfg(feature = "instrument")]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum InstrumentationMode {
 	/// Automatic: framework initializes and captures events (default)
+	#[default]
 	Auto,
 
 	/// Manual: user controls init/start/end
@@ -203,13 +204,6 @@ pub enum InstrumentationMode {
 		record_durations: bool,
 		max_events: u32,
 	},
-}
-
-#[cfg(feature = "instrument")]
-impl Default for InstrumentationMode {
-	fn default() -> Self {
-		Self::Auto
-	}
 }
 
 #[cfg(feature = "instrument")]
@@ -316,6 +310,7 @@ macro_rules! tb_scenario {
 			let (server_handle, server_addr) = server_setup_result.expect("Server setup failed");
 
 			// Default protocol to TokioListener if not specified
+			#[allow(unused_imports)]
 			use $crate::tb_scenario;
 			type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
 
@@ -1353,7 +1348,7 @@ macro_rules! tb_scenario {
 		{
 			let mode = &$mode;
 			if mode.is_auto() {
-				let artifact = $crate::instrumentation::active::end_trace();
+				let artifact = $crate::instrumentation::active::end_trace().expect("Failed to finalize trace");
 				$trace.instrument_events = artifact.events;
 			}
 		}
@@ -2429,7 +2424,6 @@ where
 mod tests {
 	use super::*;
 	use crate::tb_assert_spec;
-	use crate::tb_scenario;
 	use crate::testing::create_test_message;
 	use crate::testing::utils::TestMessage;
 	use crate::trace::ExecutionMode;

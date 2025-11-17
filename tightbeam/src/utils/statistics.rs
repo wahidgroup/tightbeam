@@ -192,11 +192,7 @@ impl StatisticalAnalyzer for DefaultStatisticalAnalyzer {
 			let variance: u64 = durations
 				.iter()
 				.map(|&x| {
-					let diff = if x > mean {
-						x - mean
-					} else {
-						mean - x
-					};
+					let diff = x.abs_diff(mean);
 					diff.saturating_mul(diff)
 				})
 				.sum::<u64>()

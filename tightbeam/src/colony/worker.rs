@@ -19,7 +19,7 @@ macro_rules! __tightbeam_worker_common_methods {
 		/// Relay a message to the worker
 		pub async fn relay(
 			&self,
-			trace: crate::trace::TraceCollector,
+			trace: $crate::trace::TraceCollector,
 			message: ::std::sync::Arc<$input>,
 		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
 			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
@@ -71,8 +71,11 @@ macro_rules! __tightbeam_worker_common_methods {
 		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
 			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
 			let (tx, rx) = $crate::colony::worker_runtime::rt::oneshot();
-			$crate::colony::worker_runtime::rt::send(sender, $crate::colony::WorkerRequest { message, respond_to: tx, trace })
-				.map_err(|_| $crate::colony::WorkerRelayError::QueueClosed)?;
+			$crate::colony::worker_runtime::rt::send(
+				sender,
+				$crate::colony::WorkerRequest { message, respond_to: tx, trace },
+			)
+			.map_err(|_| $crate::colony::WorkerRelayError::QueueClosed)?;
 
 			let response = $crate::colony::worker_runtime::rt::wait_response(rx);
 			match response {

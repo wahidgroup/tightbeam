@@ -3,18 +3,12 @@
 use super::board::ChessMoveRequest;
 
 /// Represents a chess move (pure data structure)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ChessMove {
 	pub(crate) from_row: u8,
 	pub(crate) from_col: u8,
 	pub(crate) to_row: u8,
 	pub(crate) to_col: u8,
-}
-
-impl Default for ChessMove {
-	fn default() -> Self {
-		Self { from_row: 0, from_col: 0, to_row: 0, to_col: 0 }
-	}
 }
 
 impl From<(u8, u8, u8, u8)> for ChessMove {

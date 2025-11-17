@@ -414,7 +414,9 @@ where
 					}
 					RetryAction::NoRetry => {
 						// Return the error
-						return Err(result.unwrap_err());
+						if let Err(e) = result {
+							return Err(e);
+						}
 					}
 				}
 			} else {

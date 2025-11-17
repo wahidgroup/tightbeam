@@ -89,7 +89,7 @@ macro_rules! __tightbeam_servlet_parallelize_methods {
 			/// The input type matches the servlet's input type parameter
 			pub fn parallelize(
 				&self,
-				trace: crate::trace::TraceCollector,
+				trace: $crate::trace::TraceCollector,
 				message: ::std::sync::Arc<$input>,
 			) -> impl ::core::future::Future + '_
 			where

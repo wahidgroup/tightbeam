@@ -16,8 +16,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::der::Reader;
 use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
+use crate::der::{Header, Length, Reader, Writer};
 
 /// Process state in the LTS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,13 +53,13 @@ impl Tagged for Event {
 }
 
 impl EncodeValue for Event {
-	fn value_len(&self) -> crate::der::Result<crate::der::Length> {
+	fn value_len(&self) -> crate::der::Result<Length> {
 		// Convert &'static str to String for encoding
 		let s: String = self.0.to_string();
 		s.value_len()
 	}
 
-	fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
+	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
 		// Convert &'static str to String for encoding
 		let s: String = self.0.to_string();
 		s.encode_value(encoder)
@@ -67,7 +67,7 @@ impl EncodeValue for Event {
 }
 
 impl<'a> DecodeValue<'a> for Event {
-	fn decode_value<R: crate::der::Reader<'a>>(reader: &mut R, header: crate::der::Header) -> crate::der::Result<Self> {
+	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> crate::der::Result<Self> {
 		// Decode as String first
 		let s = String::decode_value(reader, header)?;
 		// Convert String to &'static str by leaking (only for decoded data)
