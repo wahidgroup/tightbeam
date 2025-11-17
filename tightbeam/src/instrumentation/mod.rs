@@ -16,50 +16,51 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crate::der::Enumerated)]
+#[repr(u8)]
 pub enum TbEventKind {
-	Start,
-	End,
-	GateAccept,
-	GateReject,
-	RequestRecv,
-	ResponseSend,
-	AssertLabel,
-	AssertPayload,
-	HandlerEnter,
-	HandlerExit,
-	CryptoStep,
-	CompressStep,
-	RouteStep,
-	PolicyEval,
-	ProcessTransition,
-	ProcessHidden,
-	SeedStart,
-	SeedEnd,
-	StateExpand,
-	StatePrune,
-	DivergenceDetect,
-	RefusalSnapshot,
-	EnabledSetSample,
-	Warn,
-	Error,
+	Start = 0,
+	End = 1,
+	GateAccept = 2,
+	GateReject = 3,
+	RequestRecv = 4,
+	ResponseSend = 5,
+	AssertLabel = 6,
+	AssertPayload = 7,
+	HandlerEnter = 8,
+	HandlerExit = 9,
+	CryptoStep = 10,
+	CompressStep = 11,
+	RouteStep = 12,
+	PolicyEval = 13,
+	ProcessTransition = 14,
+	ProcessHidden = 15,
+	SeedStart = 16,
+	SeedEnd = 17,
+	StateExpand = 18,
+	StatePrune = 19,
+	DivergenceDetect = 20,
+	RefusalSnapshot = 21,
+	EnabledSetSample = 22,
+	Warn = 23,
+	Error = 24,
 	// Timing events
-	TimingWcet,
-	TimingDeadline,
-	TimingJitter,
-	TimingSlack,
+	TimingWcet = 25,
+	TimingDeadline = 26,
+	TimingJitter = 27,
+	TimingSlack = 28,
 	// Fault events
-	FaultInjected,
-	FaultRecovered,
-	FaultDetected,
+	FaultInjected = 29,
+	FaultRecovered = 30,
+	FaultDetected = 31,
 	// Schedulability events
-	TaskRelease,
-	TaskComplete,
-	TaskMissedDeadline,
+	TaskRelease = 32,
+	TaskComplete = 33,
+	TaskMissedDeadline = 34,
 	// Scheduler events
-	SchedulerAllocate,
-	SchedulerRelease,
-	SchedulerBlocked,
+	SchedulerAllocate = 35,
+	SchedulerRelease = 36,
+	SchedulerBlocked = 37,
 }
 #[cfg(not(feature = "instrument"))]
 pub mod stub {
@@ -129,14 +130,18 @@ pub mod active {
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::TightBeamError;
 
-	#[derive(Clone, Debug)]
+	#[derive(Clone, Debug, crate::der::Sequence)]
 	pub struct TbEvent {
 		pub seq: u32,
 		pub kind: TbEventKind,
+		#[asn1(optional = "true")]
 		pub label: Option<String>,
+		#[asn1(optional = "true")]
 		pub payload_hash: Option<[u8; 32]>,
+		#[asn1(optional = "true")]
 		pub duration_ns: Option<u64>,
 		pub flags: u32,
+		#[asn1(optional = "true")]
 		pub extras: Option<Vec<u8>>,
 	}
 
@@ -254,6 +259,7 @@ pub mod active {
 		Ok(())
 	}
 
+	#[derive(Debug, Clone, crate::der::Sequence)]
 	pub struct EvidenceArtifact {
 		pub spec_hash: [u8; 32],
 		pub trace_hash: [u8; 32],

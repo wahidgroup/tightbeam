@@ -3,7 +3,7 @@
 use crate::testing::specs::csp::Event;
 
 /// WCET violation: observed duration exceeded WCET
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, crate::der::Sequence)]
 pub struct TimingViolation {
 	/// Event label that violated WCET
 	pub event: Event,
@@ -16,7 +16,7 @@ pub struct TimingViolation {
 }
 
 /// Deadline miss: event-to-event latency exceeded deadline
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, crate::der::Sequence)]
 pub struct DeadlineMiss {
 	/// Start event label
 	pub start_event: Event,
@@ -32,7 +32,7 @@ pub struct DeadlineMiss {
 }
 
 /// Jitter violation: timing variation exceeded maximum jitter
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, crate::der::Sequence)]
 pub struct JitterViolation {
 	/// Event label that violated jitter
 	pub event: Event,
@@ -45,7 +45,7 @@ pub struct JitterViolation {
 }
 
 /// Slack violation: observed slack below minimum required slack
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, crate::der::Sequence)]
 pub struct TimingSlackViolation {
 	/// Start event label
 	pub start_event: Event,

@@ -15,6 +15,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+
+use crate::der::Reader;
+use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
+
 /// Process state in the LTS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct State(pub &'static str);
@@ -25,13 +29,58 @@ impl fmt::Display for State {
 	}
 }
 
-/// CSP event
+/// CSP event identifier
+///
+/// Represents a named event in a CSP process specification. Also used by
+/// timing verification to identify events with timing constraints (WCET,
+/// deadlines, jitter) and in violation reports.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Event(pub &'static str);
 
 impl fmt::Display for Event {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "{}", self.0)
+	}
+}
+
+// Manual ASN.1 encoding/decoding for Event
+// Encodes &'static str as UTF8String, decodes as String (which can be
+// converted to Event via From<String>)
+impl Tagged for Event {
+	fn tag(&self) -> Tag {
+		Tag::Utf8String
+	}
+}
+
+impl EncodeValue for Event {
+	fn value_len(&self) -> crate::der::Result<crate::der::Length> {
+		// Convert &'static str to String for encoding
+		let s: String = self.0.to_string();
+		s.value_len()
+	}
+
+	fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
+		// Convert &'static str to String for encoding
+		let s: String = self.0.to_string();
+		s.encode_value(encoder)
+	}
+}
+
+impl<'a> DecodeValue<'a> for Event {
+	fn decode_value<R: crate::der::Reader<'a>>(reader: &mut R, header: crate::der::Header) -> crate::der::Result<Self> {
+		// Decode as String first
+		let s = String::decode_value(reader, header)?;
+		// Convert String to &'static str by leaking (only for decoded data)
+		// This is safe because decoded Events are typically short-lived
+		let leaked = Box::leak(s.into_boxed_str());
+		Ok(Event(leaked))
+	}
+}
+
+impl<'a> Decode<'a> for Event {
+	fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+		let header = reader.peek_header()?;
+		Self::decode_value(reader, header)
 	}
 }
 

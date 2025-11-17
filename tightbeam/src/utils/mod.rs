@@ -11,6 +11,7 @@ use crate::{
 
 // Submodules
 pub mod jitter;
+pub mod math;
 pub mod statistics;
 pub mod urn;
 

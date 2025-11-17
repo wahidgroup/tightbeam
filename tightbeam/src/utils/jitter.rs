@@ -3,6 +3,7 @@
 //! Provides traits and implementations for calculating jitter from observed durations.
 //! Used by both timing verification and restart policies.
 
+use crate::utils::math::integer_sqrt;
 use crate::TightBeamError;
 
 /// Trait for calculating jitter from a collection of observed durations.
@@ -169,30 +170,6 @@ impl JitterCalculator for DecorrelatedJitterCalculator {
 	}
 }
 
-/// Integer square root approximation using Newton's method.
-///
-/// Returns the largest integer n such that n² ≤ value.
-fn integer_sqrt(value: u128) -> u128 {
-	if value == 0 {
-		return 0;
-	}
-	if value == 1 {
-		return 1;
-	}
-
-	// Initial guess: value / 2
-	let mut x = value / 2;
-	let mut prev = 0;
-
-	// Newton's method: x_{n+1} = (x_n + value/x_n) / 2
-	while x != prev {
-		prev = x;
-		x = (x + value / x) / 2;
-	}
-
-	x
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -241,16 +218,5 @@ mod tests {
 
 		// Test with max = 150: range = 150 - (150/3) = 150 - 50 = 100
 		assert_eq!(calculator.calculate(&[50, 100, 150]).unwrap(), 100);
-	}
-
-	#[test]
-	fn test_integer_sqrt() {
-		assert_eq!(integer_sqrt(0), 0);
-		assert_eq!(integer_sqrt(1), 1);
-		assert_eq!(integer_sqrt(4), 2);
-		assert_eq!(integer_sqrt(9), 3);
-		assert_eq!(integer_sqrt(16), 4);
-		assert_eq!(integer_sqrt(25), 5);
-		assert_eq!(integer_sqrt(2500), 50);
 	}
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::constraints::{TimingConstraint, TimingConstraints};
 use super::deadline::Deadline;
 use super::violations::{DeadlineMiss, JitterViolation, TimingSlackViolation, TimingViolation};
+use crate::der::Sequence;
 use crate::instrumentation::{TbEvent, TbEventKind};
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::Event;
@@ -14,7 +15,7 @@ use crate::utils::jitter::{JitterCalculator, MinMaxJitter};
 use crate::utils::statistics::{DefaultStatisticalAnalyzer, Percentile, StatisticalAnalyzer};
 
 /// Timing verification result
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Sequence)]
 pub struct TimingVerificationResult {
 	/// Whether all timing constraints were satisfied
 	pub passed: bool,
@@ -133,8 +134,8 @@ impl TimingConstraints {
 		};
 
 		// Get percentile value
-		let percentile_value = match measures.percentiles.get(&percentile) {
-			Some(&val) => val,
+		let percentile_value = match measures.percentiles.iter().find(|pv| pv.percentile == percentile) {
+			Some(pv) => pv.value,
 			None => return, // Percentile not available
 		};
 
@@ -152,7 +153,7 @@ impl TimingConstraints {
 				if observed_ns > wcet_ns {
 					result.passed = false;
 					result.wcet_violations.push(TimingViolation {
-						event: event.clone(),
+						event: Event(event.0),
 						wcet_ns,
 						observed_ns,
 						seq: ev.seq,
@@ -235,8 +236,8 @@ impl TimingConstraints {
 		if latency_ns > deadline_ns {
 			result.passed = false;
 			result.deadline_misses.push(DeadlineMiss {
-				start_event: deadline.start_event.clone(),
-				end_event: deadline.end_event.clone(),
+				start_event: Event(deadline.start_event.0),
+				end_event: Event(deadline.end_event.0),
 				deadline_ns,
 				observed_ns: latency_ns,
 				start_seq: start_event.seq,
@@ -260,8 +261,8 @@ impl TimingConstraints {
 			if observed_slack_ns < required_slack_ns {
 				result.passed = false;
 				result.slack_violations.push(TimingSlackViolation {
-					start_event: deadline.start_event.clone(),
-					end_event: deadline.end_event.clone(),
+					start_event: Event(deadline.start_event.0),
+					end_event: Event(deadline.end_event.0),
 					required_slack_ns,
 					observed_slack_ns,
 					deadline_ns,
@@ -307,7 +308,7 @@ impl TimingConstraints {
 				if observed_jitter > max_jitter_ns {
 					result.passed = false;
 					result.jitter_violations.push(JitterViolation {
-						event: event.clone(),
+						event: Event(event.0),
 						max_jitter_ns,
 						observed_jitter_ns: observed_jitter,
 						seqs: events.iter().map(|ev| ev.seq).collect(),
