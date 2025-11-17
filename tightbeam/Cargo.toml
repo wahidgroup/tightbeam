@@ -95,10 +95,10 @@ full = [
 	"testing-csp",
 	"testing-fdr",
 	"testing-fuzz",
-	"testing-timing",
 	"testing-schedulability",
 	"testing-fault",
 	"testing-fmea",
+	"testing-timing",
 	"instrument",
 	"rayon",
 	"colony",
@@ -116,7 +116,7 @@ compress = ["tightbeam-derive?/compress"]
 transport-policy = ["transport", "policy"]
 tcp = ["transport"]
 colony = ["full"]
-testing = []
+testing = ["std"]
 testing-csp = ["testing"]
 testing-fdr = ["testing", "testing-csp"]
 testing-timing = ["testing", "time"]

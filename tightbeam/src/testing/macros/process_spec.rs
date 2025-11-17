@@ -18,7 +18,7 @@ macro_rules! tb_process_spec {
 		$(choice { $($choice_state:ident),* $(,)? })?
 		$(annotations { description: $desc:expr })?
 		$(timing {
-			$($timing_event:expr => $timing_constraint:expr),* $(,)?
+			$($timing_content:tt)*
 		})?
 	) => {
 		$crate::tb_process_spec! {
@@ -36,7 +36,7 @@ macro_rules! tb_process_spec {
 			$(choice { $($choice_state),* })?
 			$(annotations { description: $desc })?
 			$(timing {
-				$($timing_event => $timing_constraint),*
+				$($timing_content)*
 			})?
 		}
 	};
@@ -55,7 +55,7 @@ macro_rules! tb_process_spec {
 		$(choice { $($choice_state:ident),* })?
 		$(annotations { description: $desc:expr })?
 		$(timing {
-			$($timing_event:expr => $timing_constraint:expr),*
+			$($timing_content:tt)*
 		})?
 	) => {
 		$(#[$meta])*
@@ -127,14 +127,16 @@ macro_rules! tb_process_spec {
 					#[cfg(feature = "testing-timing")]
 					{
 						use $crate::testing::specs::csp::Event;
-						use $crate::testing::timing::TimingConstraints;
+						use $crate::testing::timing::{DeadlineBuilder, TimingConstraints};
+						use $crate::testing::macros::DeadlineParams;
 						let mut timing_constraints = TimingConstraints::new();
-						$(
-							timing_constraints.add(
-								Event($timing_event),
-								$timing_constraint
-							);
-						)*
+
+						$crate::tb_process_spec! {
+							@parse_timing
+							timing_constraints,
+							$($timing_content)*
+						}
+
 						builder = builder.timing_constraints(timing_constraints);
 					}
 				)?
@@ -150,4 +152,99 @@ macro_rules! tb_process_spec {
 			}
 		}
 	};
+
+	// Parse grouped timing syntax
+	(@parse_timing
+		$constraints:ident,
+		wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? }
+		$(, jitter: { $($jitter_event:expr => $jitter_constraint:expr),* $(,)? })?
+		$(, deadline: { $($deadline_start:expr => $deadline_end:expr, $deadline_params:expr),* $(,)? })?
+		$(,)?
+	) => {
+		// Parse WCET constraints
+		$(
+			$constraints.add(
+				Event($wcet_event),
+				$wcet_constraint
+			);
+		)*
+
+		// Parse Jitter constraints
+		$($(
+			$constraints.add(
+				Event($jitter_event),
+				$jitter_constraint
+			);
+		)*)?
+
+		// Parse Deadline constraints
+		$($(
+			{
+				let params: DeadlineParams = $deadline_params;
+				let mut builder = DeadlineBuilder::default()
+					.with_duration(params.duration)
+					.with_start_event(Event($deadline_start))
+					.with_end_event(Event($deadline_end));
+				if let Some(slack) = params.min_slack {
+					builder = builder.with_min_slack(slack);
+				}
+				let deadline = builder
+					.build()
+					.expect("Failed to build deadline");
+				$constraints.add_deadline(deadline);
+			}
+		)*)?
+	};
+
+	// Parse timing with only wcet
+	(@parse_timing
+		$constraints:ident,
+		wcet: { $($wcet_event:expr => $wcet_constraint:expr),* $(,)? }
+	) => {
+		$(
+			$constraints.add(
+				Event($wcet_event),
+				$wcet_constraint
+			);
+		)*
+	};
+
+	// Parse timing with only jitter
+	(@parse_timing
+		$constraints:ident,
+		jitter: { $($jitter_event:expr => $jitter_constraint:expr),* $(,)? }
+	) => {
+		$(
+			$constraints.add(
+				Event($jitter_event),
+				$jitter_constraint
+			);
+		)*
+	};
+
+	// Parse timing with only deadline
+	(@parse_timing
+		$constraints:ident,
+		deadline: { $($deadline_start:expr => $deadline_end:expr, $deadline_params:expr),* $(,)? }
+	) => {
+		$(
+			{
+				let params: DeadlineParams = $deadline_params;
+				let mut builder = DeadlineBuilder::default()
+					.with_duration(params.duration)
+					.with_start_event(Event($deadline_start))
+					.with_end_event(Event($deadline_end));
+				if let Some(slack) = params.min_slack {
+					builder = builder.with_min_slack(slack);
+				}
+				let deadline = builder
+					.build()
+					.expect("Failed to build deadline");
+				$constraints.add_deadline(deadline);
+			}
+		)*
+	};
+
+	// Fallback: empty timing block
+	(@parse_timing $constraints:ident,) => {};
 }

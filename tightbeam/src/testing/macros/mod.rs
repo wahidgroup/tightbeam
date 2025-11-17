@@ -56,43 +56,121 @@ macro_rules! ratio {
 }
 
 /// Helper macro for WCET (Worst-Case Execution Time) timing constraint
-/// Usage: wcet!(10ms) or wcet!(Duration::from_millis(10))
+/// Usage:
+///   wcet!(10ms)  (simple case, backward compatible)
+///   wcet!(10ms, percentile: P99)  (with percentile)
+///   wcet!(10ms, analyzer: my_analyzer)  (with analyzer)
+///   wcet!(10ms, percentile: P99, analyzer: my_analyzer)  (with both, order-independent)
+///   wcet!(10ms, analyzer: my_analyzer, percentile: P99)  (same as above)
+/// Event comes from the key in grouped syntax.
 #[cfg(feature = "testing-timing")]
 #[macro_export]
 macro_rules! wcet {
+	// Simple case: wcet!(10ms) - backward compatible
 	($dur:expr) => {
-		$crate::testing::timing::TimingConstraint::Wcet($dur)
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.build()
+			.expect("Failed to build WcetConfig")
 	};
+	// With percentile: wcet!(10ms, percentile: P99)
+	($dur:expr, percentile: $p:expr) => {
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.with_percentile($p)
+			.build()
+			.expect("Failed to build WcetConfig")
+	};
+	// With analyzer: wcet!(10ms, analyzer: my_analyzer)
+	($dur:expr, analyzer: $a:expr) => {{
+		use std::sync::Arc;
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.with_analyzer(Arc::new($a))
+			.build()
+			.expect("Failed to build WcetConfig")
+	}};
+	// With both (order-independent): wcet!(10ms, percentile: P99, analyzer: my_analyzer)
+	($dur:expr, percentile: $p:expr, analyzer: $a:expr) => {{
+		use std::sync::Arc;
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.with_percentile($p)
+			.with_analyzer(Arc::new($a))
+			.build()
+			.expect("Failed to build WcetConfig")
+	}};
+	($dur:expr, analyzer: $a:expr, percentile: $p:expr) => {{
+		use std::sync::Arc;
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.with_analyzer(Arc::new($a))
+			.with_percentile($p)
+			.build()
+			.expect("Failed to build WcetConfig")
+	}};
+}
+
+/// Helper struct for deadline parameters (used internally by deadline! macro)
+#[cfg(feature = "testing-timing")]
+#[doc(hidden)]
+pub struct DeadlineParams {
+	pub duration: std::time::Duration,
+	pub min_slack: Option<std::time::Duration>,
 }
 
 /// Helper macro for deadline timing constraint
-/// Usage: deadline!(100ms) or deadline!(Duration::from_millis(100))
+/// Usage:
+///   deadline!(duration: 100ms, slack: 5ms)  (parentheses)
+///   deadline! { duration: 100ms, slack: 5ms }  (curly braces)
+///   deadline!(duration: 100ms)  (without slack)
+/// Events come from the key in grouped syntax.
 #[cfg(feature = "testing-timing")]
 #[macro_export]
 macro_rules! deadline {
-	($dur:expr) => {
-		$crate::testing::timing::TimingConstraint::Deadline($dur)
+	// Parentheses syntax: deadline!(duration: ..., slack: ...)
+	(duration: $dur:expr, slack: $slack:expr) => {
+		$crate::testing::macros::DeadlineParams {
+			duration: $dur,
+			min_slack: Some($slack),
+		}
+	};
+	(duration: $dur:expr) => {
+		$crate::testing::macros::DeadlineParams {
+			duration: $dur,
+			min_slack: None,
+		}
+	};
+	// Curly braces syntax: deadline! { duration: ..., slack: ... }
+	{ duration: $dur:expr, slack: $slack:expr } => {
+		$crate::testing::macros::DeadlineParams {
+			duration: $dur,
+			min_slack: Some($slack),
+		}
+	};
+	{ duration: $dur:expr } => {
+		$crate::testing::macros::DeadlineParams {
+			duration: $dur,
+			min_slack: None,
+		}
 	};
 }
 
 /// Helper macro for jitter timing constraint
-/// Usage: jitter!(5ms) or jitter!(Duration::from_millis(5))
+/// Usage:
+///   jitter!(5ms)  (default MinMaxJitter calculator)
+///   jitter!(5ms, calculator)  (custom calculator)
+/// Event comes from the key in grouped syntax.
 #[cfg(feature = "testing-timing")]
 #[macro_export]
 macro_rules! jitter {
 	($dur:expr) => {
-		$crate::testing::timing::TimingConstraint::Jitter($dur)
+		$crate::testing::timing::TimingConstraint::Jitter($dur, None)
 	};
-}
-
-/// Helper macro for slack timing constraint
-/// Usage: slack!(2ms) or slack!(Duration::from_millis(2))
-#[cfg(feature = "testing-timing")]
-#[macro_export]
-macro_rules! slack {
-	($dur:expr) => {
-		$crate::testing::timing::TimingConstraint::Slack($dur)
-	};
+	($dur:expr, $calc:expr) => {{
+		use std::sync::Arc;
+		$crate::testing::timing::TimingConstraint::Jitter($dur, Some(Arc::new($calc)))
+	}};
 }
 
 // ---------------------------------------------------------------------------

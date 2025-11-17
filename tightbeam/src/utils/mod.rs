@@ -10,6 +10,8 @@ use crate::{
 };
 
 // Submodules
+pub mod jitter;
+pub mod statistics;
 pub mod urn;
 
 // Re-exports

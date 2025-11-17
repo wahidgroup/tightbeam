@@ -13,6 +13,10 @@ pub enum TestingError {
 	FuzzInputUnavailable,
 	#[cfg_attr(feature = "derive", error("Fuzz input lock poisoned"))]
 	FuzzInputLockPoisoned,
+	#[cfg_attr(feature = "derive", error("Invalid timing constraint configuration"))]
+	InvalidTimingConstraint,
+	#[cfg_attr(feature = "derive", error("Slack exceeds deadline duration"))]
+	InvalidSlack,
 }
 
 #[cfg(not(feature = "derive"))]
