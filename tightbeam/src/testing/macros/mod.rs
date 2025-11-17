@@ -300,7 +300,6 @@ impl InstrumentationMode {
 /// - spec: AssertSpecType (uses latest version) OR specs: [expr, ...] (specific spec instances)
 /// - instrumentation: TbInstrumentationConfig (OPTIONAL, when feature = "instrument")
 /// - hooks { on_pass: |trace| {}, on_fail: |trace, violations| {} } (OPTIONAL)
-/// - assert_policies { ... } (TODO: future)
 #[macro_export]
 macro_rules! tb_scenario {
 	// ===== Standalone test with name for ServiceClient =====

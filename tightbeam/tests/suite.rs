@@ -24,6 +24,10 @@ mod x509;
 #[cfg(feature = "testing-fdr")]
 mod fdr;
 
+// Timing verification integration tests
+#[cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
+mod timing;
+
 // DLT Network test
 // #[cfg(feature = "full")]
 // mod proof;

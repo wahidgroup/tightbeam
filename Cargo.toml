@@ -82,6 +82,7 @@ zeekstd = { version = "0.6.1", default-features = false }
 paste = { version = "1.0.15" }
 gumdrop = { version = "0.8.1" }
 rand = { version = "0.9" }
+trybuild = { version = "1.0", features = ["diff"] }
 fake = { version = "=4.3.0", features = [
 	"derive",
 	"uuid",

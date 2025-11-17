@@ -221,14 +221,115 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		quote! { ::tightbeam::Version::V0 }
 	};
 
+	let _has_profile = profile_type.is_some();
 	let profile_type_impl = if let Some(profile_ty) = &profile_type {
 		quote! {
 			const HAS_PROFILE: bool = true;
 			type Profile = #profile_ty;
 		}
 	} else {
+		// Always define HAS_PROFILE, even when false (needed for checker trait impls)
 		quote! {
+			const HAS_PROFILE: bool = false;
 			type Profile = ::tightbeam::crypto::profiles::TightbeamProfile;
+		}
+	};
+
+	// Generate checker trait implementations for compile-time OID validation
+	// When HAS_PROFILE = true: generates impls ONLY for the matching OID type from the profile (compile-time enforcement)
+	// When HAS_PROFILE = false: generates generic impls for all OID types (no enforcement, allows any)
+	// All types using #[derive(Beamable)] get these impls - types not using derive must implement manually
+	let oid_validation_helpers = if let Some(profile_ty) = &profile_type {
+		// We know the profile type, so we can reference its associated types directly
+		// ONLY implement for the exact OID types from the profile - wrong OIDs will fail to compile
+		quote! {
+			#[cfg(feature = "digest")]
+			impl ::tightbeam::builder::private::SealedDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
+			where
+				#name: ::tightbeam::Message,
+			{}
+
+			#[cfg(feature = "digest")]
+			impl ::tightbeam::builder::CheckDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
+			where
+				#name: ::tightbeam::Message,
+			{
+				const RESULT: () = ();
+			}
+
+			#[cfg(feature = "aead")]
+			impl ::tightbeam::builder::private::SealedAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
+			where
+				#name: ::tightbeam::Message,
+			{}
+
+			#[cfg(feature = "aead")]
+			impl ::tightbeam::builder::CheckAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
+			where
+				#name: ::tightbeam::Message,
+			{
+				const RESULT: () = ();
+			}
+
+			#[cfg(feature = "signature")]
+			impl ::tightbeam::builder::private::SealedSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
+			where
+				#name: ::tightbeam::Message,
+			{}
+
+			#[cfg(feature = "signature")]
+			impl ::tightbeam::builder::CheckSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
+			where
+				#name: ::tightbeam::Message,
+			{
+				const RESULT: () = ();
+			}
+		}
+	} else {
+		// When HAS_PROFILE = false, generate generic impls for all OID types (no enforcement)
+		// These allow FrameBuilder methods to work for types without profiles
+		quote! {
+			#[cfg(feature = "digest")]
+			impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedDigestOid<D> for #name
+			where
+				#name: ::tightbeam::Message,
+			{}
+
+			#[cfg(feature = "digest")]
+			impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckDigestOid<D> for #name
+			where
+				#name: ::tightbeam::Message,
+			{
+				const RESULT: () = ();
+			}
+
+			#[cfg(feature = "aead")]
+			impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedAeadOid<C> for #name
+			where
+				#name: ::tightbeam::Message,
+			{}
+
+			#[cfg(feature = "aead")]
+			impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckAeadOid<C> for #name
+			where
+				#name: ::tightbeam::Message,
+			{
+				const RESULT: () = ();
+			}
+
+			#[cfg(feature = "signature")]
+			impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::private::SealedSignatureOid<S> for #name
+			where
+				#name: ::tightbeam::Message,
+			{}
+
+			#[cfg(feature = "signature")]
+			impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::CheckSignatureOid<S> for #name
+			where
+				#name: ::tightbeam::Message,
+			{
+				const RESULT: () = ();
+			}
 		}
 	};
 
@@ -247,6 +348,8 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 			const MIN_VERSION: ::tightbeam::Version = #min_version_value;
 			#profile_type_impl
 		}
+
+		#oid_validation_helpers
 	};
 
 	TokenStream::from(expanded)

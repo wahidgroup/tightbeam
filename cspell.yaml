@@ -50,6 +50,7 @@ words:
   - Holz
   - I_DONT_CARE
   - ijon
+  - impls
   - Keccak
   - keypair
   - KTRI
@@ -58,6 +59,7 @@ words:
   - makedirs
   - matrixd
   - Merkle
+  - metas
   - millis
   - Monodomy
   - Morpher
@@ -101,6 +103,7 @@ words:
   - supraorganisms
   - Tanveer
   - tightbeam
+  - trybuild
   - typenum
   - unwrapper
   - usize

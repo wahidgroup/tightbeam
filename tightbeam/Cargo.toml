@@ -58,6 +58,7 @@ afl = { workspace = true, optional = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 fake = { workspace = true }
+trybuild = { workspace = true }
 
 [features]
 default = ["full"]

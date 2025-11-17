@@ -28,6 +28,46 @@ use crate::helpers::Digestor;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
+/// Sealed trait pattern for compile-time OID validation
+/// Prevents external impls while allowing conditional enforcement
+#[doc(hidden)]
+pub mod private {
+	use super::*;
+
+	#[cfg(feature = "digest")]
+	pub trait SealedDigestOid<D: AssociatedOid> {}
+
+	#[cfg(feature = "aead")]
+	pub trait SealedAeadOid<C: AssociatedOid> {}
+
+	#[cfg(feature = "signature")]
+	pub trait SealedSignatureOid<S: SignatureAlgorithmIdentifier> {}
+}
+
+/// Checker traits for compile-time OID validation
+/// Uses sealed trait pattern to prevent external impls and enable conditional enforcement
+#[cfg(feature = "digest")]
+pub trait CheckDigestOid<D: AssociatedOid>: private::SealedDigestOid<D> {
+	const RESULT: ();
+}
+
+#[cfg(feature = "aead")]
+pub trait CheckAeadOid<C: AssociatedOid>: private::SealedAeadOid<C> {
+	const RESULT: ();
+}
+
+#[cfg(feature = "signature")]
+pub trait CheckSignatureOid<S: SignatureAlgorithmIdentifier>: private::SealedSignatureOid<S> {
+	const RESULT: ();
+}
+
+// No blanket impls - enables compile-time enforcement via proc macro generated impls.
+// The proc macro generates impls for ALL types using #[derive(Beamable)]:
+// - When HAS_PROFILE = true: impls ONLY for matching OID types (compile-time enforcement)
+// - When HAS_PROFILE = false: impls for all OID types (no enforcement, allows any)
+// Types not using #[derive(Beamable)] must manually implement these traits to use FrameBuilder.
+// Trade-off: Generic T: Message code requires all T to use #[derive(Beamable)] or manual impls.
+
 /// Scaffold: envelope-only structure (version + metadata) for computing Frame Integrity.
 /// Excludes the message field per spec: FI MUST be computed over envelope only.
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
@@ -107,69 +147,6 @@ impl<T: Message> FrameBuilder<T> {
 		self.compressor = Some(Box::new(compressor));
 		self
 	}
-
-	/// Automatically hash the message body using the specified digest algorithm
-	#[cfg(feature = "digest")]
-	pub fn with_message_hasher<D>(mut self) -> Self
-	where
-		D: Digest + AssociatedOid,
-	{
-		// Validate that the digest algorithm matches the message's profile (only if HAS_PROFILE is true)
-		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
-			self.errors
-				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
-					D::OID,
-					<T::Profile as SecurityProfile>::DigestOid::OID,
-				))));
-			return self;
-		}
-
-		let message = match self.message.as_ref() {
-			Some(m) => m,
-			None => {
-				self.errors.push(TightBeamError::InvalidBody);
-				return self;
-			}
-		};
-
-		let encoded = match crate::encode(message) {
-			Ok(e) => e,
-			Err(e) => {
-				self.errors.push(e);
-				return self;
-			}
-		};
-
-		match crate::utils::digest::<D>(&encoded) {
-			Ok(hash_info) => {
-				self.metadata_builder = self.metadata_builder.with_integrity_info(hash_info);
-			}
-			Err(e) => {
-				self.errors.push(e);
-			}
-		}
-		self
-	}
-
-	#[cfg(feature = "digest")]
-	pub fn with_witness_hasher<D>(mut self) -> Self
-	where
-		D: Digest + AssociatedOid + 'static,
-	{
-		// Validate that the digest algorithm matches the message's profile (only if HAS_PROFILE is true)
-		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
-			self.errors
-				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
-					D::OID,
-					<T::Profile as SecurityProfile>::DigestOid::OID,
-				))));
-			return self;
-		}
-
-		self.witness = Some(Box::new(|tbs_der: &[u8]| crate::utils::digest::<D>(tbs_der)));
-		self
-	}
-
 	/// Set the message priority (V2+ only)
 	pub fn with_priority(mut self, priority: crate::MessagePriority) -> Self {
 		self.metadata_builder = self.metadata_builder.with_priority(priority);
@@ -219,13 +196,87 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
+	/// Automatically hash the message body using the specified digest algorithm
+	#[cfg(feature = "digest")]
+	pub fn with_message_hasher<D>(mut self) -> Self
+	where
+		D: Digest + AssociatedOid,
+		T: CheckDigestOid<D>,
+	{
+		// Compile-time check
+		let _ = <T as crate::builder::CheckDigestOid<D>>::RESULT;
+
+		// Runtime fallback validation
+		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
+			self.errors
+				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+					D::OID,
+					<T::Profile as SecurityProfile>::DigestOid::OID,
+				))));
+			return self;
+		}
+
+		let message = match self.message.as_ref() {
+			Some(m) => m,
+			None => {
+				self.errors.push(TightBeamError::InvalidBody);
+				return self;
+			}
+		};
+
+		let encoded = match crate::encode(message) {
+			Ok(e) => e,
+			Err(e) => {
+				self.errors.push(e);
+				return self;
+			}
+		};
+
+		match crate::utils::digest::<D>(&encoded) {
+			Ok(hash_info) => {
+				self.metadata_builder = self.metadata_builder.with_integrity_info(hash_info);
+			}
+			Err(e) => {
+				self.errors.push(e);
+			}
+		}
+		self
+	}
+
+	#[cfg(feature = "digest")]
+	pub fn with_witness_hasher<D>(mut self) -> Self
+	where
+		D: Digest + AssociatedOid + 'static,
+		T: CheckDigestOid<D>,
+	{
+		// Compile-time check
+		let _ = <T as crate::builder::CheckDigestOid<D>>::RESULT;
+
+		// Runtime fallback validation
+		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
+			self.errors
+				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+					D::OID,
+					<T::Profile as SecurityProfile>::DigestOid::OID,
+				))));
+			return self;
+		}
+
+		self.witness = Some(Box::new(|tbs_der: &[u8]| crate::utils::digest::<D>(tbs_der)));
+		self
+	}
+
 	#[cfg(feature = "aead")]
 	pub fn with_cipher<C, Cipher>(mut self, cipher: &Cipher) -> Self
 	where
 		C: AssociatedOid,
 		Cipher: Aead + Clone + 'static,
+		T: CheckAeadOid<C>,
 	{
-		// Validate that the cipher OID matches the message's profile (only if HAS_PROFILE is true)
+		// Compile-time check
+		let _ = <T as crate::builder::CheckAeadOid<C>>::RESULT;
+
+		// Runtime fallback validation
 		if T::HAS_PROFILE && C::OID != <T::Profile as SecurityProfile>::AeadOid::OID {
 			self.errors
 				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
@@ -268,8 +319,12 @@ impl<T: Message> FrameBuilder<T> {
 	where
 		S: SignatureEncoding + SignatureAlgorithmIdentifier,
 		X: Signatory<S> + Clone + 'static,
+		T: CheckSignatureOid<S>,
 	{
-		// Validate that the signature algorithm matches the message's profile (only if HAS_PROFILE is true)
+		// Compile-time check
+		let _ = <T as crate::builder::CheckSignatureOid<S>>::RESULT;
+
+		// Runtime fallback validation
 		if T::HAS_PROFILE && S::ALGORITHM_OID != <T::Profile as SecurityProfile>::SignatureAlg::ALGORITHM_OID {
 			self.errors
 				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
@@ -454,8 +509,6 @@ mod tests {
 	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
 	use crate::{compose, test_builder, test_case};
 
-	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
-	use crate::crypto::aead::Aes256Gcm;
 	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
 	use crate::crypto::hash::Sha3_256;
 
@@ -714,66 +767,354 @@ mod tests {
 		}
 	}
 
-	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
-	test_case! {
-		name: test_unexpected_algorithm_validation,
-		setup: || {
-			// Create a message with a profile that expects AES-128-GCM
-			#[derive(Clone, Debug, PartialEq, Sequence)]
-			struct Aes128Message {
-				content: String,
+	mod validation {
+		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+		use crate::testing::{create_test_cipher_key, create_test_signing_key};
+		use crate::Version;
+
+		// Helper macro to run shared test logic after struct definition
+		macro_rules! run_tests {
+			($name:expr, $confidential:expr, $nonrepudiable:expr, $message_integrity:expr, $frame_integrity:expr, $min_version:expr, $cipher:expr, $signing_key:expr) => {
+				let message = TestMsg { content: format!("test {}", $name) };
+
+				// Test 1: Verify constants match derive macro attributes
+				assert_eq!(TestMsg::MUST_BE_CONFIDENTIAL, $confidential);
+				assert_eq!(TestMsg::MUST_BE_NON_REPUDIABLE, $nonrepudiable);
+				assert_eq!(TestMsg::MUST_HAVE_MESSAGE_INTEGRITY, $message_integrity);
+				assert_eq!(TestMsg::MUST_HAVE_FRAME_INTEGRITY, $frame_integrity);
+				assert_eq!(TestMsg::MIN_VERSION, $min_version);
+
+				// Test 2: Verify frame composition
+				let result = compose_frame(
+					$name,
+					message.clone(),
+					$cipher,
+					$signing_key,
+					$confidential,
+					$nonrepudiable,
+					$message_integrity,
+					$frame_integrity,
+				);
+				assert!(result.is_ok());
+
+				let frame = result.unwrap();
+
+				// Test 3: Verify README semantics - MUST fields → Frame fields MUST be present
+				// README line 363: MUST_BE_NON_REPUDIABLE=true → Frame MUST include nonrepudiation field
+				assert_eq!(frame.nonrepudiation.is_some(), $nonrepudiable);
+				// README line 364: MUST_BE_CONFIDENTIAL=true → Frame MUST include confidentiality field
+				assert_eq!(frame.metadata.confidentiality.is_some(), $confidential);
+				// MUST_HAVE_MESSAGE_INTEGRITY=true → Frame metadata MUST include integrity field
+				assert_eq!(frame.metadata.integrity.is_some(), $message_integrity);
+				// MUST_HAVE_FRAME_INTEGRITY=true → Frame MUST include integrity field
+				assert_eq!(frame.integrity.is_some(), $frame_integrity);
+
+				// Test 4: Verify version enforcement
+				if $min_version > Version::V0 {
+					let result_v0 = crate::compose! {
+						V0: id: $name, order: 1u64, message: message.clone()
+					};
+					assert!(result_v0.is_err());
+				}
+			};
+		}
+
+		// Helper macro to generate test message struct with correct attributes
+		// Only matches the 4 test cases actually used in the test
+		macro_rules! test_msg_struct {
+			// BasicMessage: (false, false, false, false, V0)
+			(false, false, false, false, V0) => {
+				#[cfg(feature = "derive")]
+				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
+				#[beam(min_version = "V0")]
+				struct TestMsg {
+					content: String,
+				}
+				#[cfg(not(feature = "derive"))]
+				#[derive(Clone, Debug, PartialEq, der::Sequence)]
+				struct TestMsg {
+					content: String,
+				}
+				#[cfg(not(feature = "derive"))]
+				impl $crate::Message for TestMsg {
+					const MUST_BE_CONFIDENTIAL: bool = false;
+					const MUST_BE_NON_REPUDIABLE: bool = false;
+					const MUST_BE_COMPRESSED: bool = false;
+					const MUST_BE_PRIORITIZED: bool = false;
+					const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+					const MUST_HAVE_FRAME_INTEGRITY: bool = false;
+					const MIN_VERSION: Version = Version::V0;
+					type Profile = $crate::crypto::profiles::TightbeamProfile;
+				}
+			};
+			// ConfidentialMessage: (true, false, false, false, V1)
+			(true, false, false, false, V1) => {
+				#[cfg(feature = "derive")]
+				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
+				#[beam(confidential, min_version = "V1")]
+				struct TestMsg {
+					content: String,
+				}
+				#[cfg(not(feature = "derive"))]
+				#[derive(Clone, Debug, PartialEq, der::Sequence)]
+				struct TestMsg {
+					content: String,
+				}
+				#[cfg(not(feature = "derive"))]
+				impl $crate::Message for TestMsg {
+					const MUST_BE_CONFIDENTIAL: bool = true;
+					const MUST_BE_NON_REPUDIABLE: bool = false;
+					const MUST_BE_COMPRESSED: bool = false;
+					const MUST_BE_PRIORITIZED: bool = false;
+					const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+					const MUST_HAVE_FRAME_INTEGRITY: bool = false;
+					const MIN_VERSION: Version = Version::V1;
+					type Profile = $crate::crypto::profiles::TightbeamProfile;
+				}
+			};
+			// NonrepudiableMessage: (false, true, false, false, V1)
+			(false, true, false, false, V1) => {
+				#[cfg(feature = "derive")]
+				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
+				#[beam(nonrepudiable, min_version = "V1")]
+				struct TestMsg {
+					content: String,
+				}
+				#[cfg(not(feature = "derive"))]
+				#[derive(Clone, Debug, PartialEq, der::Sequence)]
+				struct TestMsg {
+					content: String,
+				}
+				#[cfg(not(feature = "derive"))]
+				impl $crate::Message for TestMsg {
+					const MUST_BE_CONFIDENTIAL: bool = false;
+					const MUST_BE_NON_REPUDIABLE: bool = true;
+					const MUST_BE_COMPRESSED: bool = false;
+					const MUST_BE_PRIORITIZED: bool = false;
+					const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+					const MUST_HAVE_FRAME_INTEGRITY: bool = false;
+					const MIN_VERSION: Version = Version::V1;
+					type Profile = $crate::crypto::profiles::TightbeamProfile;
+				}
+			};
+			// FullSecurityMessage: (true, true, true, true, V2)
+			(true, true, true, true, V2) => {
+				#[cfg(feature = "derive")]
+				#[derive($crate::Beamable, Clone, Debug, PartialEq, der::Sequence)]
+				#[beam(
+					confidential,
+					nonrepudiable,
+					message_integrity,
+					frame_integrity,
+					min_version = "V2"
+				)]
+				struct TestMsg {
+					content: String,
+				}
+				#[cfg(not(feature = "derive"))]
+				#[derive(Clone, Debug, PartialEq, der::Sequence)]
+				struct TestMsg {
+					content: String,
+				}
+				#[cfg(not(feature = "derive"))]
+				impl $crate::Message for TestMsg {
+					const MUST_BE_CONFIDENTIAL: bool = true;
+					const MUST_BE_NON_REPUDIABLE: bool = true;
+					const MUST_BE_COMPRESSED: bool = false;
+					const MUST_BE_PRIORITIZED: bool = false;
+					const MUST_HAVE_MESSAGE_INTEGRITY: bool = true;
+					const MUST_HAVE_FRAME_INTEGRITY: bool = true;
+					const MIN_VERSION: Version = Version::V2;
+					type Profile = $crate::crypto::profiles::TightbeamProfile;
+				}
+			};
+		}
+
+		#[test]
+		fn test_message_traits() {
+			let (_, cipher) = create_test_cipher_key();
+			let signing_key = create_test_signing_key();
+
+			// Helper to compose frames based on requirements
+			#[allow(clippy::too_many_arguments)]
+			fn compose_frame<T>(
+				test_name: &str,
+				message: T,
+				cipher: &Aes256Gcm,
+				signing_key: &Secp256k1SigningKey,
+				confidential: bool,
+				nonrepudiable: bool,
+				message_integrity: bool,
+				frame_integrity: bool,
+			) -> crate::error::Result<crate::Frame>
+			where
+				T: crate::Message
+					+ crate::builder::CheckAeadOid<Aes256GcmOid>
+					+ crate::builder::CheckSignatureOid<Secp256k1Signature>
+					+ crate::builder::CheckDigestOid<Sha3_256>
+					+ Clone,
+			{
+				match (confidential, nonrepudiable, message_integrity, frame_integrity) {
+					(true, true, true, true) => crate::compose! {
+						V2: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						nonrepudiation<Secp256k1Signature, _>: signing_key,
+						message_integrity: type Sha3_256,
+						frame_integrity: type Sha3_256
+					},
+					(true, false, true, _) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						message_integrity: type Sha3_256
+					},
+					(true, false, false, _) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher
+					},
+					(false, true, true, _) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						nonrepudiation<Secp256k1Signature, _>: signing_key,
+						message_integrity: type Sha3_256
+					},
+					(false, true, false, _) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						nonrepudiation<Secp256k1Signature, _>: signing_key
+					},
+					(false, false, true, true) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						message_integrity: type Sha3_256,
+						frame_integrity: type Sha3_256
+					},
+					(false, false, true, false) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						message_integrity: type Sha3_256
+					},
+					(false, false, false, true) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						frame_integrity: type Sha3_256
+					},
+					(false, false, false, false) => crate::compose! {
+						V0: id: test_name, order: 1u64, message: message.clone()
+					},
+					(true, true, true, false) => crate::compose! {
+						V2: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						nonrepudiation<Secp256k1Signature, _>: signing_key,
+						message_integrity: type Sha3_256
+					},
+					(true, true, false, true) => crate::compose! {
+						V2: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						nonrepudiation<Secp256k1Signature, _>: signing_key,
+						frame_integrity: type Sha3_256
+					},
+					(true, true, false, false) => crate::compose! {
+						V1: id: test_name, order: 1u64, message: message.clone(),
+						confidentiality<Aes256GcmOid, _>: cipher,
+						nonrepudiation<Secp256k1Signature, _>: signing_key
+					},
+				}
 			}
 
-			impl crate::Message for Aes128Message {
-				const MUST_BE_NON_REPUDIABLE: bool = false;
-				const MUST_BE_CONFIDENTIAL: bool = false;
-				const MUST_BE_COMPRESSED: bool = false;
-				const MUST_BE_PRIORITIZED: bool = false;
-				const HAS_PROFILE: bool = true;
-				const MIN_VERSION: crate::Version = crate::Version::V0;
+			// Test cases: (name, attrs, confidential, nonrepudiable, message_integrity, frame_integrity, min_version)
+			let test_cases = [
+				("BasicMessage", "", false, false, false, false, Version::V0),
+				(
+					"ConfidentialMessage",
+					"confidential, min_version = \"V1\"",
+					true,
+					false,
+					false,
+					false,
+					Version::V1,
+				),
+				(
+					"NonrepudiableMessage",
+					"nonrepudiable, min_version = \"V1\"",
+					false,
+					true,
+					false,
+					false,
+					Version::V1,
+				),
+				(
+					"FullSecurityMessage",
+					"confidential, nonrepudiable, message_integrity, frame_integrity, min_version = \"V2\"",
+					true,
+					true,
+					true,
+					true,
+					Version::V2,
+				),
+			];
 
-				type Profile = Aes128Profile;
+			for (name, _attrs, confidential, nonrepudiable, message_integrity, frame_integrity, min_version) in
+				test_cases
+			{
+				use crate::core::Message;
+
+				// Generate the appropriate test message struct based on the test case
+				match (confidential, nonrepudiable, message_integrity, frame_integrity, min_version) {
+					(false, false, false, false, Version::V0) => {
+						test_msg_struct!(false, false, false, false, V0);
+						run_tests!(
+							name,
+							confidential,
+							nonrepudiable,
+							message_integrity,
+							frame_integrity,
+							min_version,
+							&cipher,
+							&signing_key
+						);
+					}
+					(true, false, false, false, Version::V1) => {
+						test_msg_struct!(true, false, false, false, V1);
+						run_tests!(
+							name,
+							confidential,
+							nonrepudiable,
+							message_integrity,
+							frame_integrity,
+							min_version,
+							&cipher,
+							&signing_key
+						);
+					}
+					(false, true, false, false, Version::V1) => {
+						test_msg_struct!(false, true, false, false, V1);
+						run_tests!(
+							name,
+							confidential,
+							nonrepudiable,
+							message_integrity,
+							frame_integrity,
+							min_version,
+							&cipher,
+							&signing_key
+						);
+					}
+					(true, true, true, true, Version::V2) => {
+						test_msg_struct!(true, true, true, true, V2);
+						run_tests!(
+							name,
+							confidential,
+							nonrepudiable,
+							message_integrity,
+							frame_integrity,
+							min_version,
+							&cipher,
+							&signing_key
+						);
+					}
+					_ => panic!(
+						"Unhandled test case combination: ({}, {}, {}, {}, {:?})",
+						confidential, nonrepudiable, message_integrity, frame_integrity, min_version
+					),
+				}
 			}
-
-			// Define a profile that uses AES-128-GCM
-			#[derive(Debug, Default, Clone, Copy)]
-			struct Aes128Profile;
-
-			impl SecurityProfile for Aes128Profile {
-				type DigestOid = Sha3_256;
-				type AeadOid = crate::crypto::aead::Aes128GcmOid;
-				type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
-				#[cfg(feature = "kdf")]
-				type KdfOid = crate::crypto::kdf::HkdfSha3_256Oid;
-				#[cfg(feature = "ecdh")]
-				type CurveOid = crate::crypto::curves::Secp256k1Oid;
-			}
-
-			let message = Aes128Message { content: "test".to_string() };
-			let (_, cipher) = create_test_cipher_key(); // This creates an AES-256 key
-
-			// Try to use AES-256-GCM cipher with a message that expects AES-128-GCM
-			let builder: FrameBuilder<Aes128Message> = Version::V1.into();
-			builder
-				.with_message(message)
-				.with_id("test_unexpected_algorithm")
-				.with_order(1696521600)
-				.with_cipher::<crate::crypto::aead::Aes256GcmOid, Aes256Gcm>(&cipher)
-				.build()
-		},
-		assertions: |result: Result<Frame>| {
-			// Should fail with UnexpectedAlgorithm error
-			assert!(result.is_err());
-			if let Err(TightBeamError::Sequence(errors)) = result {
-				assert!(!errors.is_empty());
-				// Check that one of the errors is UnexpectedAlgorithm
-				let has_unexpected_algorithm = errors.iter().any(|e| matches!(e, TightBeamError::UnexpectedAlgorithm(_)));
-				assert!(has_unexpected_algorithm, "Expected UnexpectedAlgorithm error, but got: {errors:?}");
-			} else {
-				panic!("Expected Sequence error, but got: {result:?}");
-			}
-
-			Ok(())
 		}
 	}
 }
