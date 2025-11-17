@@ -63,3 +63,16 @@ pub struct TimingSlackViolation {
 	pub start_seq: u32,
 	pub end_seq: u32,
 }
+
+/// Path WCET violation: total path duration exceeded path WCET
+#[derive(Debug, Clone, PartialEq, Eq, crate::der::Sequence)]
+pub struct PathWcetViolation {
+	/// Path events that violated WCET
+	pub path: Vec<Event>,
+	/// Maximum allowed path duration (nanoseconds)
+	pub max_path_duration_ns: u64,
+	/// Observed path duration (nanoseconds)
+	pub observed_path_duration_ns: u64,
+	/// Sequence numbers of events in path
+	pub seqs: Vec<u32>,
+}

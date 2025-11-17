@@ -7,6 +7,7 @@
 mod constraints;
 mod deadline;
 mod export;
+mod path;
 mod verification;
 mod violations;
 mod wcet;
@@ -14,6 +15,7 @@ mod wcet;
 pub use constraints::{TimingConstraint, TimingConstraints};
 pub use deadline::{Deadline, DeadlineBuilder};
 pub use export::TimingVerificationArtifact;
+pub use path::{ExecutionPath, PathWcet};
 pub use verification::TimingVerificationResult;
-pub use violations::{DeadlineMiss, JitterViolation, TimingSlackViolation, TimingViolation};
+pub use violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 pub use wcet::{WcetConfig, WcetConfigBuilder};

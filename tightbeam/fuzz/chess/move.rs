@@ -24,7 +24,7 @@ impl From<(u8, u8, u8, u8)> for ChessMove {
 
 impl ChessMove {
 	/// Convert to ChessMoveRequest for sending over the wire
-	pub(crate) fn to_request(&self) -> ChessMoveRequest {
+	pub(crate) fn to_request(self) -> ChessMoveRequest {
 		ChessMoveRequest {
 			from_row: self.from_row,
 			from_col: self.from_col,

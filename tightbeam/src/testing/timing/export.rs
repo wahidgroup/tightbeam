@@ -66,9 +66,9 @@ mod tests {
 		// Create test evidence artifact
 		let spec_hash = [0u8; 32];
 		let evidence = EvidenceArtifact {
-			spec_hash: OctetString::new(&spec_hash)?,
-			trace_hash: OctetString::new(&spec_hash)?,
-			evidence_hash: OctetString::new(&spec_hash)?,
+			spec_hash: OctetString::new(spec_hash)?,
+			trace_hash: OctetString::new(spec_hash)?,
+			evidence_hash: OctetString::new(spec_hash)?,
 			events: vec![],
 			overflow: false,
 		};
@@ -106,6 +106,7 @@ mod tests {
 				start_seq: 1,
 				end_seq: 2,
 			}],
+			path_wcet_violations: vec![],
 		};
 
 		// Create test statistical measures

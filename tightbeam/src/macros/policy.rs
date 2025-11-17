@@ -93,6 +93,8 @@ macro_rules! policy {
 
 #[cfg(test)]
 mod tests {
+	#![allow(unused_variables)]
+
 	use crate::der::Sequence;
 	use crate::policy::{GatePolicy, ReceptorPolicy, TransitStatus};
 	use crate::Beamable;
@@ -120,6 +122,12 @@ mod tests {
 			crate::transport::policy::RetryAction::RetryWithSame
 		}
 	}
+
+	#[allow(dead_code)]
+	impl TestGateAccept {}
+
+	#[allow(dead_code)]
+	impl TestRestart {}
 
 	#[test]
 	fn test_gate_policy() -> Result<(), crate::TightBeamError> {

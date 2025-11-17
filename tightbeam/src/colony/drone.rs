@@ -607,7 +607,7 @@ macro_rules! drone {
 				}
 
 				fn addr(&self) -> Self::Address {
-					self.addr.clone()
+					self.addr
 				}
 
 				fn stop(mut self) {
@@ -901,7 +901,7 @@ macro_rules! drone {
 				}
 
 				fn addr(&self) -> Self::Address {
-					self.addr.clone()
+					self.addr
 				}
 
 				fn stop(mut self) {
@@ -1526,7 +1526,7 @@ mod tests {
 		}
 
 		fn addr(&self) -> Self::Address {
-			self.addr.clone()
+			self.addr
 		}
 
 		fn stop(self) {
@@ -1720,7 +1720,7 @@ mod tests {
 		}
 
 		fn addr(&self) -> Self::Address {
-			self.addr.clone()
+			self.addr
 		}
 
 		fn stop(self) {

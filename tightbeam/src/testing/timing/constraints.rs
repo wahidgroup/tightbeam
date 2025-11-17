@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::deadline::Deadline;
+use super::path::PathWcet;
 use super::wcet::WcetConfig;
 use crate::testing::specs::csp::Event;
 use crate::utils::jitter::JitterCalculator;
@@ -27,14 +28,11 @@ pub struct TimingConstraints {
 	pub(crate) constraints: HashMap<Event, TimingConstraint>,
 	/// Separate storage for deadlines (event pairs)
 	deadlines: Vec<Deadline>,
+	/// Separate storage for path-based WCET constraints
+	path_wcets: Vec<PathWcet>,
 }
 
 impl TimingConstraints {
-	/// Create new empty timing constraints
-	pub fn new() -> Self {
-		Self { constraints: HashMap::new(), deadlines: Vec::new() }
-	}
-
 	/// Add a timing constraint for an event (WCET or Jitter)
 	pub fn add(&mut self, event: Event, constraint: TimingConstraint) {
 		// Skip Deadline constraints - they should be added via add_deadline()
@@ -66,5 +64,15 @@ impl TimingConstraints {
 	/// Get all deadlines
 	pub fn deadlines(&self) -> &[Deadline] {
 		&self.deadlines
+	}
+
+	/// Add a path-based WCET constraint
+	pub fn add_path_wcet(&mut self, path_wcet: PathWcet) {
+		self.path_wcets.push(path_wcet);
+	}
+
+	/// Get all path-based WCET constraints
+	pub fn path_wcets(&self) -> &[PathWcet] {
+		&self.path_wcets
 	}
 }

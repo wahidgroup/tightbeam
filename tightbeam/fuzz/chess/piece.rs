@@ -4,7 +4,6 @@
 /// - 0 = empty square
 /// - 1-6 = white pieces (pawn=1, rook=2, knight=3, bishop=4, queen=5, king=6)
 /// - 7-12 = black pieces (pawn=7, rook=8, knight=9, bishop=10, queen=11, king=12)
-
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceKind {
@@ -131,7 +130,7 @@ impl PieceKind {
 
 impl Color {
 	/// Get the starting row for a pawn of this color
-	pub fn to_pawn_start_row(&self) -> u8 {
+	pub fn to_pawn_start_row(self) -> u8 {
 		match self {
 			Color::White => 1,
 			Color::Black => 6,
@@ -140,7 +139,7 @@ impl Color {
 
 	/// Get the forward direction for a pawn of this color (row offset per move)
 	/// White pawns move up (negative), black pawns move down (positive)
-	pub fn to_pawn_forward_direction(&self) -> i8 {
+	pub fn to_pawn_forward_direction(self) -> i8 {
 		match self {
 			Color::White => -1,
 			Color::Black => 1,
@@ -155,7 +154,7 @@ impl Piece {
 	}
 
 	/// Get the starting row for a pawn (only valid for pawns)
-	pub fn to_pawn_start_row(&self) -> Option<u8> {
+	pub fn to_pawn_start_row(self) -> Option<u8> {
 		match self.kind {
 			PieceKind::Pawn => Some(self.color.to_pawn_start_row()),
 			_ => None,
@@ -163,7 +162,7 @@ impl Piece {
 	}
 
 	/// Get the forward direction for a pawn (only valid for pawns)
-	pub fn to_pawn_forward_direction(&self) -> Option<i8> {
+	pub fn to_pawn_forward_direction(self) -> Option<i8> {
 		match self.kind {
 			PieceKind::Pawn => Some(self.color.to_pawn_forward_direction()),
 			_ => None,

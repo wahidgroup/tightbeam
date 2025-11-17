@@ -635,7 +635,6 @@ macro_rules! tb_assert_spec {
 				{
 					static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
 					CELL.get_or_init(|| {
-						let desc_opt = desc_opt;
 						let mut v = Vec::new();
 						$(
 							$crate::__tb_assert_spec_build!(

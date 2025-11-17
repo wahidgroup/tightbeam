@@ -18,6 +18,7 @@ use std::fmt;
 
 use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
 use crate::der::{Header, Length, Reader, Writer};
+use crate::trace::ConsumedTrace;
 
 /// Process state in the LTS
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -262,7 +263,7 @@ impl Process {
 /// Trait for CSP process specifications that can be validated against traces
 pub trait ProcessSpec {
 	/// Validate a trace against this process specification
-	fn validate_trace(&self, trace: &crate::trace::ConsumedTrace) -> CspValidationResult;
+	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult;
 }
 
 /// Result of CSP process validation
@@ -314,7 +315,7 @@ impl std::fmt::Display for CspViolation {
 
 impl Process {
 	/// Validate a consumed trace against this CSP process
-	pub fn validate_trace(&self, trace: &crate::trace::ConsumedTrace) -> CspValidationResult {
+	pub fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		let mut violations = Vec::new();
 		let mut current_state = self.initial;
 
@@ -370,7 +371,7 @@ impl Process {
 }
 
 impl ProcessSpec for Process {
-	fn validate_trace(&self, trace: &crate::trace::ConsumedTrace) -> CspValidationResult {
+	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		self.validate_trace(trace)
 	}
 }

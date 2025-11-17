@@ -76,6 +76,7 @@ mod tests {
 		// At most 2^64 - 1
 		assert!(max_sqrt <= 18446744073709551615);
 		// Verify no overflow: max_sqrt^2 should be ≤ u128::MAX
-		assert!(max_sqrt.saturating_mul(max_sqrt) <= u128::MAX);
+		let squared = max_sqrt.checked_mul(max_sqrt);
+		assert!(squared.is_some(), "max_sqrt^2 should not overflow");
 	}
 }

@@ -62,7 +62,6 @@ mod tests {
 
 	/// Test case for WcetConfigBuilder
 	struct WcetConfigTestCase {
-		name: &'static str,
 		duration_ms: u64,
 		percentile: Option<Percentile>,
 		has_analyzer: bool,
@@ -73,7 +72,6 @@ mod tests {
 
 	const WCET_CONFIG_TEST_CASES: &[WcetConfigTestCase] = &[
 		WcetConfigTestCase {
-			name: "simple",
 			duration_ms: 100,
 			percentile: None,
 			has_analyzer: false,
@@ -82,7 +80,6 @@ mod tests {
 			expected_has_analyzer: false,
 		},
 		WcetConfigTestCase {
-			name: "with_percentile",
 			duration_ms: 100,
 			percentile: Some(Percentile::P99),
 			has_analyzer: false,
@@ -91,7 +88,6 @@ mod tests {
 			expected_has_analyzer: false,
 		},
 		WcetConfigTestCase {
-			name: "with_analyzer",
 			duration_ms: 100,
 			percentile: None,
 			has_analyzer: true,
@@ -100,7 +96,6 @@ mod tests {
 			expected_has_analyzer: true,
 		},
 		WcetConfigTestCase {
-			name: "with_all",
 			duration_ms: 100,
 			percentile: Some(Percentile::P99),
 			has_analyzer: true,
@@ -111,8 +106,9 @@ mod tests {
 	];
 
 	/// Run WcetConfig test case
-	fn run_wcet_config_test_case(case: &WcetConfigTestCase) {
-		let mut builder = WcetConfigBuilder::default().with_duration(Duration::from_millis(case.duration_ms));
+	fn run_wcet_config_test_case(case: &WcetConfigTestCase) -> Result<(), TestingError> {
+		let duration = Duration::from_millis(case.duration_ms);
+		let mut builder = WcetConfigBuilder::default().with_duration(duration);
 
 		if let Some(percentile) = case.percentile {
 			builder = builder.with_percentile(percentile);
@@ -123,32 +119,19 @@ mod tests {
 			builder = builder.with_analyzer(analyzer);
 		}
 
-		let config = builder.build().unwrap();
-
-		assert_eq!(
-			config.duration,
-			Duration::from_millis(case.expected_duration_ms),
-			"Test case: {} - duration mismatch",
-			case.name
-		);
-		assert_eq!(
-			config.percentile, case.expected_percentile,
-			"Test case: {} - percentile mismatch",
-			case.name
-		);
-		assert_eq!(
-			config.analyzer.is_some(),
-			case.expected_has_analyzer,
-			"Test case: {} - analyzer presence mismatch",
-			case.name
-		);
+		let config = builder.build()?;
+		assert_eq!(config.duration, Duration::from_millis(case.expected_duration_ms));
+		assert_eq!(config.percentile, case.expected_percentile);
+		assert_eq!(config.analyzer.is_some(), case.expected_has_analyzer);
+		Ok(())
 	}
 
 	#[test]
-	fn test_wcet_config_builder() {
+	fn test_wcet_config_builder() -> Result<(), TestingError> {
 		for case in WCET_CONFIG_TEST_CASES {
-			run_wcet_config_test_case(case);
+			run_wcet_config_test_case(case)?;
 		}
+		Ok(())
 	}
 
 	#[test]

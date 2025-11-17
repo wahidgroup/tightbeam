@@ -12,7 +12,7 @@ macro_rules! __tightbeam_servlet_common_methods {
 	($protocol:path) => {
 		#[allow(dead_code)]
 		pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
-			self.addr.clone()
+			self.addr
 		}
 
 		#[allow(dead_code)]
@@ -46,7 +46,7 @@ macro_rules! __tightbeam_servlet_common_methods {
 	($protocol:path) => {
 		#[allow(dead_code)]
 		pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
-			self.addr.clone()
+			self.addr
 		}
 
 		pub fn set_trace(&self, trace: $crate::trace::TraceCollector) {
@@ -978,7 +978,7 @@ macro_rules! servlet {
 			}
 
 			fn addr(&self) -> Self::Address {
-				self.addr.clone()
+				self.addr
 			}
 
 			fn stop(self) {
@@ -1003,7 +1003,7 @@ macro_rules! servlet {
 			}
 
 			fn addr(&self) -> Self::Address {
-				self.addr.clone()
+				self.addr
 			}
 
 			fn stop(self) {
@@ -1030,7 +1030,7 @@ macro_rules! servlet {
 				}
 
 				fn addr(&self) -> Self::Address {
-					self.addr.clone()
+					self.addr
 				}
 
 				fn stop(self) {
@@ -1058,7 +1058,7 @@ macro_rules! servlet {
 				}
 
 				fn addr(&self) -> Self::Address {
-					self.addr.clone()
+					self.addr
 				}
 
 				fn stop(self) {

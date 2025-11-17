@@ -532,6 +532,7 @@ impl ChessGameState {
 	}
 
 	/// Check if a square can be attacked, accounting for a temporary move
+	#[allow(clippy::too_many_arguments)]
 	fn can_attack_square_with_move(
 		&self,
 		target_row: u8,
@@ -585,6 +586,7 @@ impl ChessGameState {
 	}
 
 	/// Check if a piece can attack a square, accounting for a temporary move
+	#[allow(clippy::too_many_arguments)]
 	fn can_piece_attack_with_move(
 		&self,
 		from_row: u8,
@@ -618,6 +620,7 @@ impl ChessGameState {
 	}
 
 	/// Check if path is clear, accounting for a temporary move
+	#[allow(clippy::too_many_arguments)]
 	fn is_path_clear_with_move(
 		&self,
 		from_row: u8,
