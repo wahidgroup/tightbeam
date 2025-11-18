@@ -74,7 +74,9 @@ impl Protocol for std::net::TcpListener {
 	type Address = TightBeamSocketAddr;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
-		Ok("127.0.0.1:0".parse().expect("Valid default TCP address"))
+		"127.0.0.1:0"
+			.parse()
+			.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid default address"))
 	}
 
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
@@ -91,7 +93,7 @@ impl Protocol for std::net::TcpListener {
 		TcpTransport::from(stream)
 	}
 
-	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
+	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
 		Ok(TightBeamSocketAddr(self.local_addr()?))
 	}
 }
@@ -100,7 +102,7 @@ impl Protocol for std::net::TcpListener {
 
 #[cfg(feature = "std")]
 impl Mycelial for std::net::TcpListener {
-	async fn get_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
+	async fn try_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let addr = "0.0.0.0:0"
 			.parse::<TightBeamSocketAddr>()
 			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -651,10 +653,13 @@ macro_rules! impl_tcp_common {
 							self.client_validators.as_ref().map(Arc::clone)
 						)?
 					}
-					});
-				}
+				});
+			}
 
-				let orchestrator = self.server_handshake.as_mut().unwrap();
+			let orchestrator = self
+				.server_handshake
+				.as_mut()
+				.ok_or(TransportError::InvalidState)?;
 
 				// Process client handshake message - may return response to send
 				let response_bytes = orchestrator.handle_request(&raw_message).await?;
@@ -764,11 +769,11 @@ macro_rules! impl_tcp_common {
 			type EmitterGate = dyn GatePolicy;
 			type RestartPolicy = dyn RestartPolicy;
 
-			fn get_restart_policy(&self) -> &Self::RestartPolicy {
+			fn as_restart_policy(&self) -> &Self::RestartPolicy {
 				self.restart_policy.as_ref()
 			}
 
-			fn get_emitter_gate_policy(&self) -> &Self::EmitterGate {
+			fn as_emitter_gate_policy(&self) -> &Self::EmitterGate {
 				self.emitter_gate.as_ref()
 			}
 		}

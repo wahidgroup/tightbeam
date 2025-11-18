@@ -56,6 +56,11 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Handshake signature verification failed"))]
 	SignatureVerificationFailed,
 
+	/// Signature error (parsing or verification)
+	#[cfg_attr(feature = "derive", error("Signature error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	SignatureError(crate::crypto::sign::Error),
+
 	/// Key derivation failed
 	#[cfg_attr(feature = "derive", error("Handshake key derivation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -65,11 +70,6 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("DER error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	DerError(crate::der::Error),
-
-	/// ECDSA error
-	#[cfg_attr(feature = "derive", error("ECDSA error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	EcdsaError(crate::crypto::sign::ecdsa::Error),
 
 	/// SPKI (SubjectPublicKeyInfo) error
 	#[cfg_attr(feature = "derive", error("SPKI error: {0}"))]
@@ -153,7 +153,7 @@ pub enum HandshakeError {
 	/// Negotiation error
 	#[cfg_attr(feature = "derive", error("Profile negotiation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	NegotiationError(crate::crypto::negotiation::NegotiationError),
+	NegotiationError(crate::transport::handshake::negotiation::NegotiationError),
 
 	/// No mutually supported profiles found during negotiation
 	#[cfg_attr(feature = "derive", error("No mutually supported cryptographic profiles found"))]
@@ -275,7 +275,6 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::InvalidServerKeyExchange => write!(f, "Invalid server key exchange message"),
 			HandshakeError::InvalidPublicKey(e) => write!(f, "Invalid public key in handshake: {}", e),
 			HandshakeError::CertificateValidationError(e) => write!(f, "Invalid certificate: {}", e),
-			HandshakeError::EcdsaError(e) => write!(f, "ECDSA error: {}", e),
 			HandshakeError::SpkiError(e) => write!(f, "SPKI error: {}", e),
 			HandshakeError::CmsBuilderError(e) => write!(f, "CMS builder error: {}", e),
 			HandshakeError::SignatureVerificationFailed => write!(f, "Handshake signature verification failed"),

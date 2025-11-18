@@ -189,7 +189,7 @@ impl Protocol for TokioListener {
 		TcpTransport::from(stream)
 	}
 
-	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
+	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
 		Ok(crate::transport::tcp::TightBeamSocketAddr(self.local_addr()?))
 	}
 }
@@ -293,7 +293,7 @@ impl AsyncListenerTrait for TokioListener {
 }
 
 impl crate::transport::Mycelial for TokioListener {
-	async fn get_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
+	async fn try_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		// Bind to an available port (0.0.0.0:0 lets the OS choose)
 		let addr = "0.0.0.0:0"
 			.parse::<crate::transport::tcp::TightBeamSocketAddr>()
@@ -750,11 +750,11 @@ where
 	type EmitterGate = dyn crate::policy::GatePolicy;
 	type RestartPolicy = dyn crate::transport::policy::RestartPolicy;
 
-	fn get_restart_policy(&self) -> &Self::RestartPolicy {
+	fn as_restart_policy(&self) -> &Self::RestartPolicy {
 		self.restart_policy.as_ref()
 	}
 
-	fn get_emitter_gate_policy(&self) -> &Self::EmitterGate {
+	fn as_emitter_gate_policy(&self) -> &Self::EmitterGate {
 		self.emitter_gate.as_ref()
 	}
 
@@ -785,7 +785,7 @@ where
 		loop {
 			self.ensure_handshake_complete().await?;
 
-			let status: TransitStatus = self.get_emitter_gate_policy().evaluate(letter.try_peek()?);
+			let status: TransitStatus = self.as_emitter_gate_policy().evaluate(letter.try_peek()?);
 			if status != TransitStatus::Accepted {
 				return Err(TransportError::Unauthorized);
 			}
@@ -819,7 +819,7 @@ where
 						letter.try_return_to_sender(frame)?;
 
 						let result: TransportResult<&Frame> = Err(TransportError::SendFailed);
-						let action = self.get_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
+						let action = self.as_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
 						match action {
 							RetryAction::RetryWithSame => {
 								if current_attempt == usize::MAX {
@@ -863,7 +863,7 @@ where
 			};
 
 			if result.is_err() {
-				let action = self.get_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
+				let action = self.as_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
 				match action {
 					RetryAction::RetryWithSame => {
 						if current_attempt == usize::MAX {

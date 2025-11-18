@@ -144,6 +144,7 @@ mod utils;
 mod tests;
 
 pub mod client;
+pub mod negotiation;
 pub mod server;
 pub mod state;
 
@@ -176,13 +177,13 @@ use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientI
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
 use crate::crypto::aead::RuntimeAead;
-use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Decode, Encode, Enumerated, Sequence};
 use crate::transport::error::TransportError;
 use crate::transport::handshake::error::Result;
+use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 use crate::Beamable;
 
 #[cfg(feature = "std")]

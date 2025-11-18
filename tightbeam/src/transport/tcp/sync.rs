@@ -369,11 +369,11 @@ where
 	type EmitterGate = dyn crate::policy::GatePolicy;
 	type RestartPolicy = dyn crate::transport::policy::RestartPolicy;
 
-	fn get_restart_policy(&self) -> &Self::RestartPolicy {
+	fn as_restart_policy(&self) -> &Self::RestartPolicy {
 		self.restart_policy.as_ref()
 	}
 
-	fn get_emitter_gate_policy(&self) -> &Self::EmitterGate {
+	fn as_emitter_gate_policy(&self) -> &Self::EmitterGate {
 		self.emitter_gate.as_ref()
 	}
 
@@ -390,7 +390,7 @@ where
 			self.ensure_handshake_complete().await?;
 
 			// Evaluate gate policy before moving message
-			let gate_status = self.get_emitter_gate_policy().evaluate(letter.try_peek()?);
+			let gate_status = self.as_emitter_gate_policy().evaluate(letter.try_peek()?);
 			if gate_status != TransitStatus::Accepted {
 				return Err(TransportError::Unauthorized);
 			}
@@ -442,7 +442,7 @@ where
 						// Create error result for retry policy evaluation (without frame since we took it)
 						// Policy evaluation doesn't need the frame, just the error type
 						let result: TransportResult<&Frame> = Err(TransportError::SendFailed);
-						let action = self.get_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
+						let action = self.as_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
 						match action {
 							RetryAction::RetryWithSame => {
 								if current_attempt == usize::MAX {
@@ -493,7 +493,7 @@ where
 
 			// Evaluate retry policy only on error
 			if result.is_err() {
-				let action = self.get_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
+				let action = self.as_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
 				match action {
 					RetryAction::RetryWithSame => {
 						if current_attempt == usize::MAX {
@@ -618,7 +618,7 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 		TcpTransport::from(stream)
 	}
 
-	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
+	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
 		Ok(crate::transport::tcp::TightBeamSocketAddr(self.listener.local_addr()?))
 	}
 }

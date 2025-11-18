@@ -11,7 +11,6 @@ use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfo};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
-use crate::crypto::negotiation::SecurityOffer;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -27,22 +26,25 @@ use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::negotiation::SecurityOffer;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
 
+#[cfg(feature = "secp256k1")]
+use crate::crypto::profiles::DefaultCryptoProvider;
+
 /// Client-side CMS handshake orchestrator.
 ///
-/// Generic over `P: CryptoProvider` which defines the complete cryptographic suite
-/// (curve, signature algorithm, digest, AEAD, KDF).
+/// Generic over `P: CryptoProvider` which defines the complete cryptographic
+/// suite (curve, signature algorithm, digest, AEAD, KDF). Supports
+/// cryptographic profile negotiation via optional `security_offer` field.
 ///
 /// Manages the complete client handshake flow:
 /// 1. Sends KeyExchange (EnvelopedData with KARI)
 /// 2. Receives and verifies server Finished (SignedData)
 /// 3. Sends client Finished (SignedData)
-///
-/// Supports cryptographic profile negotiation via optional `security_offer` field.
 pub struct CmsHandshakeClient<P>
 where
 	P: CryptoProvider,
@@ -197,13 +199,8 @@ where
 
 	/// Extract the server's verifying key from a certificate or similar.
 	fn extract_server_verifying_key(&self, server_cert: &Certificate) -> Result<P::VerifyingKey, HandshakeError> {
-		let server_public_key = PublicKey::<P::Curve>::from_sec1_bytes(
-			server_cert
-				.tbs_certificate
-				.subject_public_key_info
-				.subject_public_key
-				.raw_bytes(),
-		)?;
+		let pubkey_bytes = crate::crypto::x509::utils::extract_verifying_key_bytes(server_cert);
+		let server_public_key = PublicKey::<P::Curve>::from_sec1_bytes(pubkey_bytes)?;
 		Ok(P::VerifyingKey::from(server_public_key))
 	}
 
@@ -482,9 +479,10 @@ where
 	async fn build_finished_crypto_components(
 		&self,
 	) -> Result<(SignerIdentifier, AlgorithmIdentifierOwned, AlgorithmIdentifierOwned), HandshakeError> {
-		let public_key = self.client_key_provider.to_public_key().await?;
-		let signer_id = crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(&public_key)?;
+		use crate::crypto::x509::utils::compute_signer_identifier;
 
+		let public_key = self.client_key_provider.to_public_key().await?;
+		let signer_id = compute_signer_identifier::<P::Digest, _>(&public_key)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 
@@ -622,7 +620,7 @@ where
 		self.is_complete()
 	}
 
-	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
@@ -632,7 +630,7 @@ where
 /// This is the default curve used in TightBeam and is provided as a
 /// convenient alias for the generic `CmsHandshakeClient`.
 #[cfg(feature = "secp256k1")]
-pub type CmsHandshakeClientSecp256k1 = CmsHandshakeClient<crate::crypto::profiles::DefaultCryptoProvider>;
+pub type CmsHandshakeClientSecp256k1 = CmsHandshakeClient<DefaultCryptoProvider>;
 
 #[cfg(test)]
 mod tests {

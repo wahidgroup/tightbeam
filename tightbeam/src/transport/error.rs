@@ -48,6 +48,10 @@ pub enum TransportError {
 	MissingRequest,
 	#[cfg_attr(feature = "derive", error("Max retries exceeded"))]
 	MaxRetriesExceeded,
+	#[cfg_attr(feature = "derive", error("Invalid address"))]
+	InvalidAddress,
+	#[cfg_attr(feature = "derive", error("Invalid state"))]
+	InvalidState,
 	#[cfg_attr(feature = "derive", error("Message not sent: {1:?} - {0:?}"))]
 	MessageNotSent(Box<crate::asn1::Frame>, TransportFailure),
 	#[cfg(feature = "x509")]
@@ -174,9 +178,9 @@ impl TransportFailure {
 		TransportError::from_failure(frame, self)
 	}
 
-	pub fn with_optional_frame(self, frame: Option<&Frame>) -> TransportError {
+	pub fn with_optional_frame(self, frame: Option<Frame>) -> TransportError {
 		if let Some(frame) = frame {
-			self.clone().with_frame(frame.clone())
+			self.with_frame(frame)
 		} else {
 			self.into()
 		}

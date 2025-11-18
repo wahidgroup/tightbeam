@@ -8,12 +8,12 @@
 use crate::constants::{MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_SESSION_KDF_INFO};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::kdf::KdfFunction;
-use crate::crypto::negotiation::{select_profile, SecurityOffer};
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::oids::HANDSHAKE_ABORT_ALERT;
 use crate::transport::handshake::attributes::{extract_alert_x509, find_x509};
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::negotiation::{select_profile, SecurityOffer};
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;

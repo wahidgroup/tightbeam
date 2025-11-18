@@ -12,7 +12,6 @@ use crate::crypto::ecies::EciesEphemeral;
 use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::KeyProvider;
-use crate::crypto::negotiation::SecurityOffer;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -23,6 +22,7 @@ use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::negotiation::SecurityOffer;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake};
@@ -639,8 +639,7 @@ impl EciesHandshakeClient<crate::crypto::profiles::DefaultCryptoProvider, crate:
 #[cfg(feature = "secp256k1")]
 impl ExtractVerifyingKey for crate::crypto::sign::ecdsa::Secp256k1VerifyingKey {
 	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError> {
-		let spki = &cert.tbs_certificate.subject_public_key_info;
-		let public_key_bytes = spki.subject_public_key.raw_bytes();
+		let public_key_bytes = crate::crypto::x509::utils::extract_verifying_key_bytes(cert);
 		let public_key = k256::PublicKey::from_sec1_bytes(public_key_bytes)?;
 		Ok(Self::from(public_key))
 	}
@@ -649,11 +648,11 @@ impl ExtractVerifyingKey for crate::crypto::sign::ecdsa::Secp256k1VerifyingKey {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
 	use crate::crypto::profiles::SecurityProfileDesc;
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::Signer;
 	use crate::der::Encode;
+	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 	use crate::transport::handshake::tests::*;
 	use crate::transport::handshake::ServerHandshake;
 

@@ -117,6 +117,14 @@ where
 	Ok(SignerIdentifier::SubjectKeyIdentifier(skid))
 }
 
+/// Extract a verifying key from a certificate using a security profile.
+///
+/// This function extracts the raw public key bytes from the certificate and
+/// attempts to construct the profile's verifying key type from them.
+pub fn extract_verifying_key_bytes(cert: &Certificate) -> &[u8] {
+	cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes()
+}
+
 #[cfg(test)]
 mod tests {
 	use crate::crypto::x509::error::CertificateValidationError;

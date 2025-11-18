@@ -25,7 +25,6 @@ use crate::crypto::ecies::{EciesMessageOps, Secp256k1EciesMessage};
 use crate::crypto::hash::Digest;
 use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256};
 use crate::crypto::key::KeyProvider;
-use crate::crypto::negotiation::SecurityAccept;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
@@ -35,6 +34,7 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::negotiation::SecurityAccept;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeProtocol};
@@ -184,10 +184,10 @@ where
 		self.validate_expected_state(ServerHandshakeState::ServerHelloSent)?;
 
 		// 2. Decode ClientKeyExchange message
-		let client_kex = self.decode_client_key_exchange(client_kex_der)?;
+		let mut client_kex = self.decode_client_key_exchange(client_kex_der)?;
 
 		// 3. Validate client certificate if mutual auth is configured
-		self.validate_client_certificate(&client_kex)?;
+		self.validate_client_certificate(&mut client_kex)?;
 
 		// 4. Get encrypted bytes from the message
 		let encrypted_bytes = client_kex.encrypted_data.as_bytes();
@@ -262,6 +262,7 @@ where
 		if bytes.len() != 32 {
 			return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
 		}
+
 		let mut out = [0u8; 32];
 		out.copy_from_slice(bytes);
 		Ok(out)
@@ -331,11 +332,8 @@ where
 	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError> {
 		// Parse the ECIES message from bytes
 		let encrypted_message = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
-
 		// Get ephemeral public key from message
-		let ephemeral_pubkey = PublicKey::from_sec1_bytes(encrypted_message.ephemeral_pubkey())
-			.map_err(|_| HandshakeError::InvalidPublicKey(crate::crypto::sign::elliptic_curve::Error))?;
-
+		let ephemeral_pubkey = PublicKey::from_sec1_bytes(encrypted_message.ephemeral_pubkey())?;
 		// Use KeyProvider to perform ECDH
 		let shared_secret_bytes = self.server_key_provider.ecdh(&ephemeral_pubkey).await?;
 
@@ -366,10 +364,7 @@ where
 			None => Payload { msg: ciphertext_with_tag, aad: b"" },
 		};
 
-		let plaintext = cipher
-			.decrypt(nonce, payload)
-			.map_err(|_| HandshakeError::EciesError(EciesError::DecryptionFailed(aead::Error)))?;
-
+		let plaintext = cipher.decrypt(nonce, payload)?;
 		Ok(plaintext)
 	}
 
@@ -403,7 +398,7 @@ where
 	}
 
 	#[cfg(feature = "x509")]
-	fn validate_client_certificate(&mut self, client_kex: &ClientKeyExchange) -> Result<(), HandshakeError>
+	fn validate_client_certificate(&mut self, client_kex: &mut ClientKeyExchange) -> Result<(), HandshakeError>
 	where
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -415,12 +410,12 @@ where
 			// Client cert is required when validators are present
 			let client_cert = client_kex
 				.client_certificate
-				.as_ref()
+				.take()
 				.ok_or(HandshakeError::MissingClientCertificate)?;
 
 			// Run validator chain (includes expiry, pinning, policy, etc.)
 			for validator in validators.iter() {
-				validator.evaluate(client_cert)?;
+				validator.evaluate(&client_cert)?;
 			}
 
 			// Verify client signature over transcript hash
@@ -432,15 +427,9 @@ where
 			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 			// Extract public key from client certificate
-			let pubkey_bytes = client_cert
-				.tbs_certificate
-				.subject_public_key_info
-				.subject_public_key
-				.raw_bytes();
-
+			let pubkey_bytes = crate::crypto::x509::utils::extract_verifying_key_bytes(&client_cert);
 			// Parse public key
 			let public_key = PublicKey::<P::Curve>::from_sec1_bytes(pubkey_bytes)?;
-
 			// Parse signature
 			let signature = P::Signature::try_from(client_signature.as_bytes())
 				.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
@@ -449,12 +438,10 @@ where
 			let verifying_key = P::VerifyingKey::from(&public_key);
 
 			// Verify signature over transcript hash
-			verifying_key
-				.verify(&transcript_hash, &signature)
-				.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+			verifying_key.verify(&transcript_hash, &signature)?;
 
 			// Store validated cert (identity is now locked)
-			self.validated_client_cert = Some(Arc::new(client_cert.clone()));
+			self.validated_client_cert = Some(Arc::new(client_cert));
 		}
 
 		Ok(())
@@ -592,9 +579,9 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::negotiation::{select_profile, SecurityOffer};
 	use crate::crypto::profiles::SecurityProfileDesc;
 	use crate::random::OsRng;
+	use crate::transport::handshake::negotiation::{select_profile, SecurityOffer};
 	use crate::transport::handshake::tests::*;
 
 	fn create_test_client_hello_with_offer(

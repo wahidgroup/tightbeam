@@ -15,7 +15,6 @@ use std::sync::Arc;
 use crate::asn1::OctetString;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::crypto::key::{InMemoryKeyProvider, KeyProvider};
-use crate::crypto::negotiation::SecurityAccept;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
@@ -29,6 +28,7 @@ use crate::oids::{
 };
 use crate::random::OsRng;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
+use crate::transport::handshake::negotiation::SecurityAccept;
 use crate::transport::handshake::server::EciesHandshakeServer;
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake};
 use crate::x509::serial_number::SerialNumber;

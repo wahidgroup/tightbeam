@@ -4,10 +4,10 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
 use crate::crypto::x509::attr::Attribute;
 use crate::der::asn1::{ObjectIdentifier, OctetString, UintRef};
 use crate::der::{asn1::Any, Sequence};
+use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 
 use super::{HandshakeAlert, HandshakeError};
 use crate::oids::{

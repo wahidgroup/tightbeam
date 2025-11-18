@@ -213,7 +213,7 @@ pub trait Protocol {
 	fn create_transport(stream: Self::Stream) -> Self::Transport;
 
 	// Get the tightbeam address for this protocol
-	fn get_tightbeam_addr(&self) -> Result<Self::Address, Self::Error>;
+	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error>;
 }
 
 #[cfg(feature = "x509")]
@@ -230,7 +230,7 @@ pub trait EncryptedProtocol: Protocol {
 
 /// This protocol can operate as a mycelial network (ie. TCP SocketAddress)
 pub trait Mycelial: Protocol {
-	fn get_available_connect(
+	fn try_available_connect(
 		&self,
 	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
 }
@@ -412,8 +412,8 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Encrypt and write an envelope (legacy method, use send_envelope instead)
 	#[allow(async_fn_in_trait)]
-	async fn write_encrypted_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()> {
-		self.send_envelope(envelope.clone(), true).await
+	async fn write_encrypted_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
+		self.send_envelope(envelope, true).await
 	}
 
 	/// Wrap a message in a TransportEnvelope
@@ -518,10 +518,10 @@ pub trait MessageEmitter: MessageIO {
 	type RestartPolicy: RestartPolicy + ?Sized;
 
 	/// Get the restart policy instance
-	fn get_restart_policy(&self) -> &Self::RestartPolicy;
+	fn as_restart_policy(&self) -> &Self::RestartPolicy;
 
 	/// Get the emitter gate policy instance
-	fn get_emitter_gate_policy(&self) -> &Self::EmitterGate;
+	fn as_emitter_gate_policy(&self) -> &Self::EmitterGate;
 
 	/// Send a TightBeam message
 	#[allow(async_fn_in_trait)]
@@ -543,19 +543,19 @@ pub trait MessageEmitter: MessageIO {
 		let mut current_attempt = attempt.unwrap_or(0);
 		loop {
 			// Evaluate gate policy before sending
-			let status = self.get_emitter_gate_policy().evaluate(&current_message);
+			let status = self.as_emitter_gate_policy().evaluate(&current_message);
 			if status != TransitStatus::Accepted {
 				// The gate did not accept the message
 				return Err(TransportError::from(status));
 			}
 
 			// Wrap in envelope and send
-			let envelope = TransportEnvelope::new_request(current_message.clone());
+			let envelope = TransportEnvelope::new_request(current_message);
 
 			// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
 			#[cfg(feature = "x509")]
 			{
-				let wire_envelope = WireEnvelope::Cleartext(envelope);
+				let wire_envelope = WireEnvelope::Cleartext(envelope.clone());
 				self.write_envelope(&wire_envelope.to_der()?).await?;
 			}
 
@@ -608,12 +608,23 @@ pub trait MessageEmitter: MessageIO {
 
 			// Evaluate retry policy only on error
 			if result.is_err() {
-				let action = self.get_restart_policy().evaluate(&current_message, &result, current_attempt);
+				// Extract message from envelope for retry evaluation
+				let message_ref = match &envelope {
+					TransportEnvelope::Request(pkg) => &pkg.message,
+					_ => return Err(TransportError::InvalidState),
+				};
+
+				let action = self.as_restart_policy().evaluate(message_ref, &result, current_attempt);
 				match action {
 					crate::transport::policy::RetryAction::RetryWithSame => {
 						if current_attempt == usize::MAX {
 							return Err(TransportError::MaxRetriesExceeded);
 						} else {
+							// Extract message from envelope for retry
+							current_message = match envelope {
+								TransportEnvelope::Request(pkg) => pkg.message,
+								_ => return Err(TransportError::InvalidState),
+							};
 							current_attempt += 1;
 							continue;
 						}
@@ -910,7 +921,7 @@ mod tests {
 		}
 	}
 
-	fn get_test_cases() -> Vec<PackageTestCase> {
+	fn as_test_cases() -> Vec<PackageTestCase> {
 		vec![
 			PackageTestCase {
 				message_value: "Hi",
@@ -943,7 +954,7 @@ mod tests {
 
 	#[test]
 	fn test_request_package_encode_decode() -> Result<(), Box<dyn std::error::Error>> {
-		for test_case in get_test_cases() {
+		for test_case in as_test_cases() {
 			let original = test_case.create_request();
 			let encoded = original.to_der()?;
 			let decoded = RequestPackage::from_der(&encoded)?;
@@ -955,7 +966,7 @@ mod tests {
 
 	#[test]
 	fn test_response_package_encode_decode() -> Result<(), Box<dyn std::error::Error>> {
-		for test_case in get_test_cases() {
+		for test_case in as_test_cases() {
 			let original = test_case.create_response();
 			let encoded = original.to_der()?;
 			let decoded = ResponsePackage::from_der(&encoded)?;

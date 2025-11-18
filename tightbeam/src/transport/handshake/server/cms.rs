@@ -240,7 +240,7 @@ where
 	}
 
 	/// Get the client certificate, returning an error if not set.
-	fn get_client_certificate(&self) -> Result<&Certificate, HandshakeError> {
+	fn as_client_certificate(&self) -> Result<&Certificate, HandshakeError> {
 		self.client_cert
 			.as_ref()
 			.map(|arc| arc.as_ref())
@@ -249,7 +249,7 @@ where
 
 	/// Extract the client's verifying key from certificate.
 	fn extract_client_verifying_key(&self) -> Result<P::VerifyingKey, HandshakeError> {
-		let client_cert = self.get_client_certificate()?;
+		let client_cert = self.as_client_certificate()?;
 		let client_public_key = PublicKey::<P::Curve>::from_sec1_bytes(
 			client_cert
 				.tbs_certificate
