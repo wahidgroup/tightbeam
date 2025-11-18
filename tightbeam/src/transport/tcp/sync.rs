@@ -90,65 +90,95 @@ where
 	TransportError: From<S::Error>,
 {
 	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
-		// Read tag byte
-		let mut tag_byte = [0u8; 1];
-		self.stream.read_exact(&mut tag_byte)?;
-
-		// Read length encoding
-		let mut length_first = [0u8; 1];
-		self.stream.read_exact(&mut length_first)?;
-
-		let (length_octets, content_length) = if length_first[0] & 0x80 == 0 {
-			// Short form
-			(vec![], length_first[0] as usize)
-		} else {
-			// Long form
-			let num_length_octets = (length_first[0] & 0x7F) as usize;
-			let mut length_octets = vec![0u8; num_length_octets];
-			self.stream.read_exact(&mut length_octets)?;
-
-			let length = Self::parse_der_length(length_first[0], &length_octets);
-			(length_octets, length)
-		};
-
-		// Enforce size ceilings if configured
-
-		{
-			let max_allowed = self
-				.max_encrypted_envelope
-				.or(self.max_cleartext_envelope)
-				.unwrap_or(512 * 1024);
-			if content_length > max_allowed {
-				return Err(TransportError::InvalidMessage);
-			}
+		// Apply operation timeout if configured
+		#[cfg(feature = "std")]
+		if let Some(timeout) = self.operation_timeout {
+			self.stream.set_timeout(Some(timeout))?;
 		}
 
-		// If in handshake waiting state, optionally enforce timeout by short read deadline using std only
+		// Perform all reads - timeout will apply to all operations
+		let result = (|| -> TransportResult<Vec<u8>> {
+			// Read tag byte
+			let mut tag_byte = [0u8; 1];
+			self.stream.read_exact(&mut tag_byte)?;
 
-		{
-			match self.handshake_state() {
-				TcpHandshakeState::AwaitingServerResponse { initiated_at }
-				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
-					let now = std::time::Instant::now();
-					if now >= initiated_at + self.handshake_timeout {
-						return Err(TransportError::Timeout);
-					}
+			// Read length encoding
+			let mut length_first = [0u8; 1];
+			self.stream.read_exact(&mut length_first)?;
+
+			let (length_octets, content_length) = if length_first[0] & 0x80 == 0 {
+				// Short form
+				(vec![], length_first[0] as usize)
+			} else {
+				// Long form
+				let num_length_octets = (length_first[0] & 0x7F) as usize;
+				let mut length_octets = vec![0u8; num_length_octets];
+				self.stream.read_exact(&mut length_octets)?;
+
+				let length = Self::parse_der_length(length_first[0], &length_octets);
+				(length_octets, length)
+			};
+
+			// Enforce size ceilings if configured
+			{
+				let max_allowed = self
+					.max_encrypted_envelope
+					.or(self.max_cleartext_envelope)
+					.unwrap_or(512 * 1024);
+				if content_length > max_allowed {
+					return Err(TransportError::InvalidMessage);
 				}
-				_ => {}
 			}
+
+			// If in handshake waiting state, optionally enforce timeout by
+			// short read deadline using std only
+			{
+				match self.handshake_state() {
+					TcpHandshakeState::AwaitingServerResponse { initiated_at }
+					| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
+						let now = std::time::Instant::now();
+						if now >= initiated_at + self.handshake_timeout {
+							return Err(TransportError::Timeout);
+						}
+					}
+					_ => {}
+				}
+			}
+
+			// Read content
+			let mut content = vec![0u8; content_length];
+			self.stream.read_exact(&mut content)?;
+
+			// Reconstruct full DER encoding using the helper
+			let buffer = Self::reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
+			Ok(buffer)
+		})();
+
+		// Clear timeout before handling result
+		#[cfg(feature = "std")]
+		if self.operation_timeout.is_some() {
+			let _ = self.stream.set_timeout(None);
 		}
 
-		// Read content
-		let mut content = vec![0u8; content_length];
-		self.stream.read_exact(&mut content)?;
-
-		// Reconstruct full DER encoding using the helper
-		let buffer = Self::reconstruct_der_encoding(tag_byte[0], length_first[0], &length_octets, &content);
-		Ok(buffer)
+		result
 	}
 
 	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()> {
-		self.stream.write_all(buffer)?;
+		// Apply operation timeout if configured
+		#[cfg(feature = "std")]
+		if let Some(timeout) = self.operation_timeout {
+			self.stream.set_timeout(Some(timeout))?;
+		}
+
+		let result = self.stream.write_all(buffer);
+
+		// Clear timeout before handling result
+		#[cfg(feature = "std")]
+		if self.operation_timeout.is_some() {
+			let _ = self.stream.set_timeout(None);
+		}
+
+		result?;
 		Ok(())
 	}
 }
@@ -268,7 +298,7 @@ where
 		status: crate::policy::TransitStatus,
 		message: Option<Frame>,
 	) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message: message.map(|f| Arc::new(f)) };
+		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
 		let mut builder = limits.apply(EnvelopeBuilder::response(response_pkg));
 

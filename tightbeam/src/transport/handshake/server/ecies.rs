@@ -22,7 +22,6 @@ use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_ECIES_KDF_INFO};
 use crate::crypto::aead::{Aead, Aes256Gcm, Key, KeyInit, Nonce, Payload};
 use crate::crypto::ecies::EciesError;
 use crate::crypto::ecies::{EciesMessageOps, Secp256k1EciesMessage};
-use crate::crypto::hash::Digest;
 use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256};
 use crate::crypto::key::KeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
@@ -37,6 +36,10 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::SecurityAccept;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
+use crate::transport::handshake::utils::{
+	clear_session_randoms, compute_transcript_digest, extract_verifying_key_from_cert, octet_string_to_32_byte_array,
+	validate_state,
+};
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeProtocol};
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::x509::Certificate;
@@ -133,7 +136,7 @@ where
 		let security_accept = SecurityAccept::new(selected);
 
 		// 4. Extract and store client random
-		let client_random = self.octet_string_to_array(&client_hello.client_random)?;
+		let client_random = octet_string_to_32_byte_array(&client_hello.client_random)?;
 		self.client_random = Some(client_random);
 
 		// 5. Generate and store server random
@@ -257,17 +260,6 @@ where
 
 	// Helper methods
 
-	fn octet_string_to_array(&self, octet_string: &OctetString) -> Result<[u8; 32], HandshakeError> {
-		let bytes = octet_string.as_bytes();
-		if bytes.len() != 32 {
-			return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
-		}
-
-		let mut out = [0u8; 32];
-		out.copy_from_slice(bytes);
-		Ok(out)
-	}
-
 	fn compute_transcript_hash(
 		&self,
 		client_random: &[u8; 32],
@@ -278,18 +270,11 @@ where
 		data.extend_from_slice(client_random);
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
-		let digest_arr = P::Digest::digest(&data);
-		let mut digest = [0u8; 32];
-		digest.copy_from_slice(&digest_arr);
-		digest
+		compute_transcript_digest::<P::Digest>(&data)
 	}
 
 	fn validate_expected_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
-		if self.state.state() != expected {
-			Err(HandshakeError::InvalidState)
-		} else {
-			Ok(())
-		}
+		validate_state(self.state.state(), expected)
 	}
 
 	fn decode_client_hello(&self, client_hello_der: &[u8]) -> Result<ClientHello, HandshakeError> {
@@ -427,9 +412,8 @@ where
 			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
 			// Extract public key from client certificate
-			let pubkey_bytes = crate::crypto::x509::utils::extract_verifying_key_bytes(&client_cert);
 			// Parse public key
-			let public_key = PublicKey::<P::Curve>::from_sec1_bytes(pubkey_bytes)?;
+			let public_key = extract_verifying_key_from_cert::<P::Curve>(&client_cert)?;
 			// Parse signature
 			let signature = P::Signature::try_from(client_signature.as_bytes())
 				.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
@@ -448,15 +432,7 @@ where
 	}
 
 	fn clear_sensitive_data(&mut self) {
-		if let Some(mut bk) = self.base_session_key.take() {
-			bk.fill(0);
-		}
-		if let Some(mut cr) = self.client_random.take() {
-			cr.fill(0);
-		}
-		if let Some(mut sr) = self.server_random.take() {
-			sr.fill(0);
-		}
+		clear_session_randoms(&mut self.base_session_key, &mut self.client_random, &mut self.server_random);
 	}
 }
 

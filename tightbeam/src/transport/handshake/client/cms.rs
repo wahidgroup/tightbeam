@@ -30,6 +30,7 @@ use crate::transport::handshake::negotiation::SecurityOffer;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
+use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
 
 #[cfg(feature = "secp256k1")]
@@ -147,11 +148,7 @@ where
 
 	/// Validate that the current state matches the expected state.
 	fn validate_expected_state(&self, expected: ClientHandshakeState) -> Result<(), HandshakeError> {
-		if self.state.state() != expected {
-			Err(HandshakeError::InvalidState)
-		} else {
-			Ok(())
-		}
+		validate_state(self.state.state(), expected)
 	}
 
 	/// Validate state and server certificate for key exchange.
@@ -199,8 +196,7 @@ where
 
 	/// Extract the server's verifying key from a certificate or similar.
 	fn extract_server_verifying_key(&self, server_cert: &Certificate) -> Result<P::VerifyingKey, HandshakeError> {
-		let pubkey_bytes = crate::crypto::x509::utils::extract_verifying_key_bytes(server_cert);
-		let server_public_key = PublicKey::<P::Curve>::from_sec1_bytes(pubkey_bytes)?;
+		let server_public_key = extract_verifying_key_from_cert::<P::Curve>(server_cert)?;
 		Ok(P::VerifyingKey::from(server_public_key))
 	}
 
@@ -215,14 +211,7 @@ where
 	///
 	/// Uses the provider's digest algorithm for consistency with signatures.
 	fn compute_transcript_hash(&self) -> [u8; 32] {
-		let mut hasher = P::Digest::default();
-		hasher.update(&self.transcript_buffer);
-
-		let hash_result = hasher.finalize();
-
-		let mut hash_array = [0u8; 32];
-		hash_array.copy_from_slice(&hash_result);
-		hash_array
+		compute_transcript_digest::<P::Digest>(&self.transcript_buffer)
 	}
 
 	/// Verify the signature and content of the SignedData.

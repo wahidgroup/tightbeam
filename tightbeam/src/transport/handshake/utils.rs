@@ -1,9 +1,14 @@
 //! Utility functions for handshake operations.
 //!
-//! Provides common cryptographic utilities used across handshake builders and processors.
+//! Provides common cryptographic and state management utilities used across
+//! handshake builders, processors, and orchestrators.
 
+use crate::asn1::OctetString;
 use crate::crypto::secret::Secret;
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::transport::handshake::error::HandshakeError;
+use crate::x509::Certificate;
 use spki::AlgorithmIdentifierOwned;
 
 /// Generate a random 32-byte CEK for AES-256-GCM.
@@ -94,6 +99,137 @@ pub fn aes_gcm_decrypt(key: &[u8], ciphertext: &[u8], aad: Option<&[u8]>) -> Res
 pub fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
 	use crate::oids::AES_256_GCM;
 	AlgorithmIdentifierOwned { oid: AES_256_GCM, parameters: None }
+}
+
+// ============================================================================
+// Orchestrator Utilities (State, Certificates, Data Conversion)
+// ============================================================================
+
+/// Validate that the current state matches the expected state.
+///
+/// This is a generic state validation utility used across all handshake
+/// orchestrators to enforce state machine transitions.
+///
+/// # Parameters
+/// - `current`: The current state value
+/// - `expected`: The expected state value
+///
+/// # Returns
+/// - `Ok(())` if states match
+/// - `Err(HandshakeError::InvalidState)` if states don't match
+#[inline]
+pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), HandshakeError> {
+	if current != expected {
+		Err(HandshakeError::InvalidState)
+	} else {
+		Ok(())
+	}
+}
+
+/// Extract a verifying public key from an X.509 certificate.
+///
+/// Extracts the subject public key from the certificate's SPKI and parses it
+/// into a curve-specific `PublicKey`. Used for signature verification in both
+/// ECIES and CMS handshakes.
+///
+/// # Type Parameters
+/// - `C`: The elliptic curve type (e.g., `k256::Secp256k1`)
+///
+/// # Parameters
+/// - `cert`: The X.509 certificate containing the public key
+///
+/// # Returns
+/// Parsed public key ready for cryptographic operations
+///
+/// # Errors
+/// - `HandshakeError`: If key extraction or parsing fails
+pub fn extract_verifying_key_from_cert<C>(cert: &Certificate) -> Result<PublicKey<C>, HandshakeError>
+where
+	C: Curve + CurveArithmetic,
+	<C as Curve>::FieldBytesSize: ModulusSize,
+	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
+{
+	let pubkey_bytes = crate::crypto::x509::utils::extract_verifying_key_bytes(cert);
+	Ok(PublicKey::<C>::from_sec1_bytes(pubkey_bytes)?)
+}
+
+/// Convert an ASN.1 OctetString to a fixed 32-byte array.
+///
+/// Used in ECIES handshakes to convert random nonces from wire format
+/// (OctetString) to internal format ([u8; 32]).
+///
+/// # Parameters
+/// - `octet_string`: The ASN.1 OctetString to convert
+///
+/// # Returns
+/// Fixed-size 32-byte array
+///
+/// # Errors
+/// - `HandshakeError::OctetStringLengthError` if length is not exactly 32 bytes
+pub fn octet_string_to_32_byte_array(octet_string: &OctetString) -> Result<[u8; 32], HandshakeError> {
+	let bytes = octet_string.as_bytes();
+	if bytes.len() != 32 {
+		return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
+	}
+	let mut out = [0u8; 32];
+	out.copy_from_slice(bytes);
+	Ok(out)
+}
+
+/// Compute a 32-byte transcript digest from arbitrary data.
+///
+/// Generic digest computation utility used by both ECIES and CMS handshakes.
+/// The digest algorithm is parameterized via the type parameter `D`.
+///
+/// # Type Parameters
+/// - `D`: The digest algorithm (e.g., `Sha3_256`)
+///
+/// # Parameters
+/// - `data`: The data to hash
+///
+/// # Returns
+/// 32-byte digest array
+///
+/// # Note
+/// This function assumes the digest algorithm produces at least 32 bytes.
+/// It will truncate to 32 bytes if the digest is longer.
+pub fn compute_transcript_digest<D>(data: &[u8]) -> [u8; 32]
+where
+	D: crate::crypto::hash::Digest,
+{
+	let digest_arr = D::digest(data);
+	let mut digest = [0u8; 32];
+	digest.copy_from_slice(&digest_arr[..32]);
+	digest
+}
+
+/// Clear sensitive session data by zeroizing and dropping.
+///
+/// Used in ECIES handshakes to securely erase ephemeral key material
+/// after session establishment. Zeroizes all provided optional values.
+///
+/// # Parameters
+/// - `base_session_key`: Optional base session key to clear
+/// - `client_random`: Optional client random to clear
+/// - `server_random`: Optional server random to clear
+///
+/// # Security
+/// This function ensures sensitive data is overwritten before deallocation,
+/// preventing potential memory scraping attacks.
+pub fn clear_session_randoms(
+	base_session_key: &mut Option<[u8; 32]>,
+	client_random: &mut Option<[u8; 32]>,
+	server_random: &mut Option<[u8; 32]>,
+) {
+	if let Some(mut bk) = base_session_key.take() {
+		bk.fill(0);
+	}
+	if let Some(mut cr) = client_random.take() {
+		cr.fill(0);
+	}
+	if let Some(mut sr) = server_random.take() {
+		sr.fill(0);
+	}
 }
 
 #[cfg(test)]

@@ -43,6 +43,7 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
+use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
 use crate::transport::handshake::ServerHandshakeProtocol;
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::x509::attr::Attributes;
@@ -177,21 +178,12 @@ where
 	///
 	/// Uses SHA3-256 for consistency with the protocol.
 	fn compute_transcript_hash(&self) -> [u8; 32] {
-		let mut hasher = P::Digest::default();
-		hasher.update(&self.transcript_buffer);
-		let hash_result = hasher.finalize();
-		let mut hash_array = [0u8; 32];
-		hash_array.copy_from_slice(&hash_result);
-		hash_array
+		compute_transcript_digest::<P::Digest>(&self.transcript_buffer)
 	}
 
 	/// Validate that the current state matches the expected state.
 	fn validate_expected_state(&self, expected: ServerHandshakeState) -> Result<(), HandshakeError> {
-		if self.state.state() != expected {
-			Err(HandshakeError::InvalidState)
-		} else {
-			Ok(())
-		}
+		validate_state(self.state.state(), expected)
 	}
 
 	/// Process SecurityOffer from unprotected attributes and perform profile negotiation.
@@ -250,14 +242,7 @@ where
 	/// Extract the client's verifying key from certificate.
 	fn extract_client_verifying_key(&self) -> Result<P::VerifyingKey, HandshakeError> {
 		let client_cert = self.as_client_certificate()?;
-		let client_public_key = PublicKey::<P::Curve>::from_sec1_bytes(
-			client_cert
-				.tbs_certificate
-				.subject_public_key_info
-				.subject_public_key
-				.raw_bytes(),
-		)?;
-
+		let client_public_key = extract_verifying_key_from_cert::<P::Curve>(client_cert)?;
 		Ok(P::VerifyingKey::from(client_public_key))
 	}
 

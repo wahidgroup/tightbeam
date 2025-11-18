@@ -386,85 +386,73 @@ where
 {
 	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
 		use tokio::time::timeout;
-		// Compute handshake deadline before mutably borrowing the stream
+
+		// Determine timeout duration: prefer handshake_timeout during
+		// handshake, operation_timeout otherwise
 		#[cfg(feature = "x509")]
-		let handshake_deadline: Option<std::time::Instant> = {
+		let timeout_duration: Option<std::time::Duration> = {
 			use crate::transport::handshake::TcpHandshakeState;
 			match self.handshake_state() {
 				TcpHandshakeState::AwaitingServerResponse { initiated_at }
-				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.handshake_timeout),
-				_ => None,
+				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
+					let now = std::time::Instant::now();
+					let deadline = initiated_at + self.handshake_timeout;
+					if now >= deadline {
+						return Err(TransportError::Timeout);
+					}
+					Some(deadline.saturating_duration_since(now))
+				}
+				_ => {
+					// Not in handshake - use operation_timeout if configured
+					#[cfg(feature = "transport-policy")]
+					{
+						self.operation_timeout
+					}
+					#[cfg(not(feature = "transport-policy"))]
+					{
+						None
+					}
+				}
+			}
+		};
+
+		#[cfg(not(feature = "x509"))]
+		let timeout_duration: Option<std::time::Duration> = {
+			#[cfg(feature = "transport-policy")]
+			{
+				self.operation_timeout
+			}
+			#[cfg(not(feature = "transport-policy"))]
+			{
+				None
 			}
 		};
 
 		let stream = self.stream.inner_mut();
 
-		let mut tag = [0u8; 1];
-		#[cfg(feature = "x509")]
-		{
-			if let Some(deadline) = handshake_deadline {
-				let now = std::time::Instant::now();
-				if now >= deadline {
-					return Err(TransportError::Timeout);
+		// Helper macro to apply timeout if configured
+		macro_rules! with_timeout {
+			($op:expr) => {
+				if let Some(dur) = timeout_duration {
+					timeout(dur, $op).await??
+				} else {
+					$op.await?
 				}
-				let dur = deadline.saturating_duration_since(now);
-				timeout(dur, stream.read_exact(&mut tag))
-					.await
-					.map_err(|_| TransportError::Timeout)??;
-			} else {
-				stream.read_exact(&mut tag).await?;
-			}
-		}
-		#[cfg(not(feature = "x509"))]
-		{
-			stream.read_exact(&mut tag).await?;
+			};
 		}
 
+		let mut tag = [0u8; 1];
+		with_timeout!(stream.read_exact(&mut tag));
+
 		let mut length_first = [0u8; 1];
-		#[cfg(feature = "x509")]
-		{
-			if let Some(deadline) = handshake_deadline {
-				let now = std::time::Instant::now();
-				if now >= deadline {
-					return Err(TransportError::Timeout);
-				}
-				let dur = deadline.saturating_duration_since(now);
-				timeout(dur, stream.read_exact(&mut length_first))
-					.await
-					.map_err(|_| TransportError::Timeout)??;
-			} else {
-				stream.read_exact(&mut length_first).await?;
-			}
-		}
-		#[cfg(not(feature = "x509"))]
-		{
-			stream.read_exact(&mut length_first).await?;
-		}
+		with_timeout!(stream.read_exact(&mut length_first));
 
 		let (length_octets, content_length) = if length_first[0] & 0x80 == 0 {
 			(vec![], length_first[0] as usize)
 		} else {
 			let octet_count = (length_first[0] & 0x7F) as usize;
 			let mut length_octets = vec![0u8; octet_count];
-			#[cfg(feature = "x509")]
-			{
-				if let Some(deadline) = handshake_deadline {
-					let now = std::time::Instant::now();
-					if now >= deadline {
-						return Err(TransportError::Timeout);
-					}
-					let dur = deadline.saturating_duration_since(now);
-					timeout(dur, stream.read_exact(&mut length_octets))
-						.await
-						.map_err(|_| TransportError::Timeout)??;
-				} else {
-					stream.read_exact(&mut length_octets).await?;
-				}
-			}
-			#[cfg(not(feature = "x509"))]
-			{
-				stream.read_exact(&mut length_octets).await?;
-			}
+			with_timeout!(stream.read_exact(&mut length_octets));
 			let length = Self::parse_der_length(length_first[0], &length_octets);
 			(length_octets, length)
 		};
@@ -472,7 +460,7 @@ where
 		// Enforce size ceilings if configured
 		#[cfg(feature = "x509")]
 		{
-			// We can’t tell encrypted vs cleartext at this point,
+			// We can't tell encrypted vs cleartext at this point,
 			// so choose the larger cap conservatively
 			let max_allowed = self
 				.max_encrypted_envelope
@@ -484,25 +472,7 @@ where
 		}
 
 		let mut content = vec![0u8; content_length];
-		#[cfg(feature = "x509")]
-		{
-			if let Some(deadline) = handshake_deadline {
-				let now = std::time::Instant::now();
-				if now >= deadline {
-					return Err(TransportError::Timeout);
-				}
-				let dur = deadline.saturating_duration_since(now);
-				timeout(dur, stream.read_exact(&mut content))
-					.await
-					.map_err(|_| TransportError::Timeout)??;
-			} else {
-				stream.read_exact(&mut content).await?;
-			}
-		}
-		#[cfg(not(feature = "x509"))]
-		{
-			stream.read_exact(&mut content).await?;
-		}
+		with_timeout!(stream.read_exact(&mut content));
 
 		let buffer = Self::reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content);
 		Ok(buffer)
@@ -510,7 +480,18 @@ where
 
 	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()> {
 		let stream = self.stream.inner_mut();
+
+		// Apply operation timeout if configured
+		#[cfg(feature = "transport-policy")]
+		if let Some(dur) = self.operation_timeout {
+			tokio::time::timeout(dur, stream.write_all(buffer)).await??;
+		} else {
+			stream.write_all(buffer).await?;
+		}
+
+		#[cfg(not(feature = "transport-policy"))]
 		stream.write_all(buffer).await?;
+
 		Ok(())
 	}
 }

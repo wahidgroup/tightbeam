@@ -23,6 +23,7 @@ fn unwrap_arc_frame(arc: Arc<Frame>) -> Frame {
 #[cfg(feature = "x509")]
 use crate::crypto::aead::RuntimeAead;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum EnvelopePayload {
 	Request { message: Frame },

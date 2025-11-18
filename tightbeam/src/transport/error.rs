@@ -123,6 +123,14 @@ impl From<tokio::task::JoinError> for TransportError {
 	}
 }
 
+// Convert timeout errors
+#[cfg(feature = "tokio")]
+impl From<tokio::time::error::Elapsed> for TransportError {
+	fn from(_: tokio::time::error::Elapsed) -> Self {
+		TransportError::Timeout
+	}
+}
+
 // Convert ecdsa::Error through HandshakeError
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
 impl From<k256::ecdsa::Error> for TransportError {

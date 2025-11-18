@@ -7,7 +7,6 @@ use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{KeyInit, RuntimeAead};
 use crate::crypto::ecies::EciesEphemeral;
 use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
-use crate::crypto::hash::Digest;
 use crate::crypto::key::KeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -22,6 +21,7 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::SecurityOffer;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
+use crate::transport::handshake::utils::{compute_transcript_digest, octet_string_to_32_byte_array, validate_state};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake};
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization}; // for derive_session_aead
 use crate::x509::Certificate;
@@ -52,8 +52,6 @@ where
 }
 
 /// Helper trait for extracting verifying keys from certificates.
-/// This trait exists to work around orphan rules when implementing
-/// `TryFrom<&Certificate>` for external types.
 pub trait ExtractVerifyingKey: Sized {
 	fn extract_from_certificate(cert: &Certificate) -> Result<Self, HandshakeError>;
 }
@@ -151,11 +149,7 @@ where
 
 	/// Validate that the current state matches the expected state.
 	fn validate_expected_state(&self, expected: ClientHandshakeState) -> Result<(), HandshakeError> {
-		if self.state.state() != expected {
-			Err(HandshakeError::InvalidState)
-		} else {
-			Ok(())
-		}
+		validate_state(self.state.state(), expected)
 	}
 
 	/// Validate server handshake and extract components.
@@ -177,7 +171,7 @@ where
 
 	/// Extract and store server random from handshake.
 	fn extract_server_random(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
-		let server_random = self.octet_string_to_array(&server_handshake.server_random)?;
+		let server_random = octet_string_to_32_byte_array(&server_handshake.server_random)?;
 		self.server_random = Some(server_random);
 
 		Ok(())
@@ -409,17 +403,6 @@ where
 
 	// Helper methods
 
-	fn octet_string_to_array(&self, octet_string: &OctetString) -> Result<[u8; 32], HandshakeError> {
-		let bytes = octet_string.as_bytes();
-		if bytes.len() != 32 {
-			return Err(HandshakeError::OctetStringLengthError((bytes.len(), 32).into()));
-		}
-
-		let mut out = [0u8; 32];
-		out.copy_from_slice(bytes);
-		Ok(out)
-	}
-
 	fn extract_verifying_key(&self, cert: &Certificate) -> Result<P::VerifyingKey, HandshakeError> {
 		P::VerifyingKey::extract_from_certificate(cert)
 	}
@@ -435,11 +418,7 @@ where
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
 
-		let digest_arr = P::Digest::digest(&data);
-		let mut digest = [0u8; 32];
-
-		digest.copy_from_slice(&digest_arr);
-		digest
+		compute_transcript_digest::<P::Digest>(&data)
 	}
 
 	fn verify_server_signature(

@@ -118,7 +118,7 @@ impl<'a> Decode<'a> for RequestPackage {
 }
 
 /// Response package containing status and optional message
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResponsePackage {
 	status: TransitStatus,
 	message: Option<Arc<Frame>>,
@@ -135,12 +135,6 @@ impl ResponsePackage {
 
 	pub fn message(&self) -> Option<&Arc<Frame>> {
 		self.message.as_ref()
-	}
-}
-
-impl Default for ResponsePackage {
-	fn default() -> Self {
-		Self { status: TransitStatus::default(), message: None }
 	}
 }
 
