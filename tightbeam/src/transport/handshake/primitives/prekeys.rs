@@ -144,7 +144,7 @@ mod tests {
 		let bundle = PrekeyBundle {
 			identity_key: create_test_spki(),
 			signed_prekey: create_test_spki(),
-			signed_prekey_signature: OctetString::new(&[0x01, 0x02, 0x03])?,
+			signed_prekey_signature: OctetString::new([0x01, 0x02, 0x03])?,
 			onetime_prekey: None,
 			#[cfg(feature = "kem")]
 			pq_prekey: None,

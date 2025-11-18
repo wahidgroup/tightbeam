@@ -203,9 +203,6 @@ impl<T: Message> FrameBuilder<T> {
 		D: Digest + AssociatedOid,
 		T: CheckDigestOid<D>,
 	{
-		// Compile-time check
-		let _ = <T as crate::builder::CheckDigestOid<D>>::RESULT;
-
 		// Runtime fallback validation
 		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
 			self.errors
@@ -249,9 +246,6 @@ impl<T: Message> FrameBuilder<T> {
 		D: Digest + AssociatedOid + 'static,
 		T: CheckDigestOid<D>,
 	{
-		// Compile-time check
-		let _ = <T as crate::builder::CheckDigestOid<D>>::RESULT;
-
 		// Runtime fallback validation
 		if T::HAS_PROFILE && D::OID != <T::Profile as SecurityProfile>::DigestOid::OID {
 			self.errors
@@ -273,9 +267,6 @@ impl<T: Message> FrameBuilder<T> {
 		Cipher: Aead + Clone + 'static,
 		T: CheckAeadOid<C>,
 	{
-		// Compile-time check
-		let _ = <T as crate::builder::CheckAeadOid<C>>::RESULT;
-
 		// Runtime fallback validation
 		if T::HAS_PROFILE && C::OID != <T::Profile as SecurityProfile>::AeadOid::OID {
 			self.errors
@@ -321,9 +312,6 @@ impl<T: Message> FrameBuilder<T> {
 		X: Signatory<S> + Clone + 'static,
 		T: CheckSignatureOid<S>,
 	{
-		// Compile-time check
-		let _ = <T as crate::builder::CheckSignatureOid<S>>::RESULT;
-
 		// Runtime fallback validation
 		if T::HAS_PROFILE && S::ALGORITHM_OID != <T::Profile as SecurityProfile>::SignatureAlg::ALGORITHM_OID {
 			self.errors

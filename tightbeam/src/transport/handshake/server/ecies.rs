@@ -420,7 +420,7 @@ where
 
 			// Run validator chain (includes expiry, pinning, policy, etc.)
 			for validator in validators.iter() {
-				validator.evaluate(&client_cert)?;
+				validator.evaluate(client_cert)?;
 			}
 
 			// Verify client signature over transcript hash

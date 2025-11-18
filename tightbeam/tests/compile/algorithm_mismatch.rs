@@ -18,6 +18,8 @@ impl SecurityProfile for Aes128Profile {
 	type KdfOid = tightbeam::crypto::kdf::HkdfSha3_256Oid;
 	#[cfg(feature = "ecdh")]
 	type CurveOid = tightbeam::crypto::curves::Secp256k1Oid;
+	#[cfg(feature = "kem")]
+	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
 }
 
 // Create a message with a profile that expects AES-128-GCM

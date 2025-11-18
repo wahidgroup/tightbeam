@@ -48,9 +48,8 @@ pub enum TransportError {
 	MissingRequest,
 	#[cfg_attr(feature = "derive", error("Max retries exceeded"))]
 	MaxRetriesExceeded,
-	/// Message not sent - returned for retry with failure reason
 	#[cfg_attr(feature = "derive", error("Message not sent: {1:?} - {0:?}"))]
-	MessageNotSent(crate::asn1::Frame, TransportFailure),
+	MessageNotSent(Box<crate::asn1::Frame>, TransportFailure),
 	#[cfg(feature = "x509")]
 	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -130,13 +129,13 @@ impl From<k256::ecdsa::Error> for TransportError {
 
 impl TransportError {
 	pub fn from_failure(frame: Frame, failure: TransportFailure) -> Self {
-		TransportError::MessageNotSent(frame, failure)
+		TransportError::MessageNotSent(Box::new(frame), failure)
 	}
 
 	/// Extract Frame from error if present, otherwise returns None
 	pub fn take_frame(self) -> Option<crate::asn1::Frame> {
 		match self {
-			TransportError::MessageNotSent(frame, _) => Some(frame),
+			TransportError::MessageNotSent(frame, _) => Some(*frame),
 			_ => None,
 		}
 	}

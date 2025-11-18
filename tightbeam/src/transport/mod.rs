@@ -1027,7 +1027,7 @@ mod tests {
 
 		match err {
 			TransportError::MessageNotSent(returned, TransportFailure::SizeExceeded) => {
-				assert_eq!(returned, frame);
+				assert_eq!(*returned, frame);
 			}
 			other => panic!("unexpected error variant: {other:?}"),
 		}
@@ -1051,7 +1051,7 @@ mod tests {
 
 		match err {
 			TransportError::MessageNotSent(returned, TransportFailure::SizeExceeded) => {
-				assert_eq!(returned, frame);
+				assert_eq!(*returned, frame);
 			}
 			other => panic!("unexpected error variant: {other:?}"),
 		}
