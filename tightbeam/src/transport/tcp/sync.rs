@@ -324,20 +324,14 @@ where
 		use crate::policy::TransitStatus;
 		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
 
-		// Extract original message before wrapping for retry evaluation when status != Accepted
-		// For encrypted messages, we can't extract after encryption, so preserve it now
-		let original_message = message;
-
 		// Wrap and encrypt message (returns message on error)
-		let wire_envelope = self.wrap_and_encrypt_message(original_message).await?;
-
+		let wire_envelope = self.wrap_and_encrypt_message(message).await?;
 		// Write envelope bytes (uses reference, doesn't consume)
 		let wire_bytes = wire_envelope.to_der()?;
 		self.write_envelope(&wire_bytes).await?;
 
 		// Read response bytes
 		let response_bytes = self.read_envelope().await?;
-
 		// Decrypt response using trait method
 		let response_envelope = <Self as EncryptedMessageIO>::decrypt_response(self, response_bytes).await?;
 

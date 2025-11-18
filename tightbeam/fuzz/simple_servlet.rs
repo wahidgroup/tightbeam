@@ -94,6 +94,14 @@ tb_scenario! {
 	fuzz: afl,
 	environment Servlet {
 		servlet: EchoServlet,
+		start: |trace| async move {
+			let servlet = EchoServlet::start(trace.clone(), None).await?;
+			let server_addr = servlet.addr();
+			let client = tightbeam::client! {
+				connect tightbeam::transport::tcp::r#async::TokioListener: server_addr
+			};
+			Ok((servlet, client))
+		},
 		client: |trace, mut client| async move {
 			// Read a byte from fuzz input
 			let value = match trace.oracle().fuzz_u8() {

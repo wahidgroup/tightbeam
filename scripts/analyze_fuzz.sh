@@ -304,13 +304,22 @@ if command -v make &> /dev/null && make -n fuzz-build &> /dev/null 2>&1; then
 	fi
 fi
 if [ "$BUILD_OK" = false ]; then
-	for CANDIDATE_BIN in "fuzz_${TEST_NAME}" "${TEST_NAME}"; do
-		if RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "$CANDIDATE_BIN" > /dev/null 2>&1; then
+	# Try building with different feature combinations
+	# Chess fuzz target requires additional features
+	if [ "$TEST_NAME" = "chess" ]; then
+		if RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "fuzz_${TEST_NAME}" --features "std,testing-fuzz,testing-fdr,testing-csp" > /dev/null 2>&1; then
 			BUILD_OK=true
-			TARGET_HINT="$CANDIDATE_BIN"
-			break
+			TARGET_HINT="fuzz_${TEST_NAME}"
 		fi
-	done
+	else
+		for CANDIDATE_BIN in "fuzz_${TEST_NAME}" "${TEST_NAME}"; do
+			if RUSTFLAGS="--cfg fuzzing" cargo afl build --bin "$CANDIDATE_BIN" --features "std,testing-fuzz" > /dev/null 2>&1; then
+				BUILD_OK=true
+				TARGET_HINT="$CANDIDATE_BIN"
+				break
+			fi
+		done
+	fi
 fi
 if [ "$BUILD_OK" = false ]; then
 	if RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing > /dev/null 2>&1; then

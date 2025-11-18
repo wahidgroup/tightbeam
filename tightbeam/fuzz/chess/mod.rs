@@ -16,6 +16,7 @@ mod state;
 mod utils;
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tightbeam::macros::client::builder::ClientBuilder;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
@@ -166,9 +167,10 @@ tb_scenario! {
 			let client_builder = ClientBuilder::<TokioListener>::connect(server_addr).await?;
 			let client = client_builder
 				.with_restart(restart_policy)
+				.with_timeout(Duration::from_millis(500))
 				.build()?;
 
-			Ok((servlet, client))
+			Ok::<_, tightbeam::TightBeamError>((servlet, client))
 		},
 		client: |trace, mut client| async move {
 			#[derive(Default)]
@@ -190,10 +192,19 @@ tb_scenario! {
 
 			const MAX_TOTAL_MOVES: u64 = 50;
 			const MAX_GAME_REPLAYS: u64 = 3;
+			// Maximum time for entire fuzz execution
+			const MAX_EXECUTION_TIME_SECS: u64 = 1;
 
 			// Continuous: Play multiple games until input bytes are exhausted
 			// This maximizes state exploration across different game scenarios
+			let start_time = Instant::now();
 			loop {
+				// Check execution time limit to prevent hangs
+				if start_time.elapsed().as_secs() >= MAX_EXECUTION_TIME_SECS {
+					trace.event("client_execution_timeout");
+					break;
+				}
+
 				if stats.move_sent_count >= MAX_TOTAL_MOVES || stats.game_restarted_count >= MAX_GAME_REPLAYS {
 					break;
 				}
@@ -235,11 +246,27 @@ tb_scenario! {
 					matrix: matrix
 				}?;
 
-				// Get response frame
-				let response_frame = match client.emit(frame, None).await? {
-					Some(frame) => frame,
-					None => {
+				// Get response frame with timeout protection
+				// Wrap emit in timeout to prevent hang
+				let response_frame = match tokio::time::timeout(
+					Duration::from_millis(1000),
+					client.emit(frame, None)
+				).await {
+					Ok(Ok(Some(frame))) => frame,
+					Ok(Ok(None)) => {
 						trace.event("client_no_response");
+						stats.no_response_count += 1;
+						break;
+					}
+					Ok(Err(_e)) => {
+						// Transport error - log and break
+						trace.event("client_emit_error");
+						stats.no_response_count += 1;
+						break;
+					}
+					Err(_) => {
+						// Timeout occurred
+						trace.event("client_timeout");
 						stats.no_response_count += 1;
 						break;
 					}

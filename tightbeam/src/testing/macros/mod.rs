@@ -2155,28 +2155,15 @@ macro_rules! tb_scenario {
 				let trace_client = trace_collector.clone();
 				let trace_server = trace_collector.clone();
 
+				// Start closure must return (servlet, client) tuple
 				let start_result = $crate::__tb_scenario_servlet_start!(
 					$servlet_name,
 					trace_server.clone(),
 					$($start_expr)?
 				);
+				// Unwrap the tuple - start closure always returns (servlet, client)
+				let (mut servlet_instance, client) = start_result;
 
-				// Handle both Servlet and (Servlet, Client) tuple returns
-				// Pattern match to extract servlet and client
-				let (mut servlet_instance, client) = match start_result {
-					// Tuple case: (servlet, client) - use provided client
-					(servlet, client) => (servlet, client),
-					// Single servlet case - create client from servlet address
-					servlet => {
-						let server_addr = servlet.addr();
-						let created_client = async {
-							Ok::<_, $crate::TightBeamError>($crate::client! {
-								connect $crate::transport::tcp::r#async::TokioListener: server_addr
-							})
-						}.await.expect("Failed to connect client");
-						(servlet, created_client)
-					}
-				};
 				servlet_instance.set_trace(trace_server.clone());
 
 				// Execute client closure
@@ -2267,28 +2254,14 @@ macro_rules! tb_scenario {
 			let trace_server = trace_collector.clone();
 
 			// Start servlet - use custom start expression or default start(trace_server)
+			// Start closure must return (servlet, client) tuple
 			let start_result = $crate::__tb_scenario_servlet_start!(
 				$servlet_name,
 				trace_server,
 				$($start_expr)?
 			);
-
-			// Handle both Servlet and (Servlet, Client) tuple returns
-			// Pattern match to extract servlet and client
-			let (servlet_instance, client) = match start_result {
-				// Tuple case: (servlet, client) - use provided client
-				(servlet, client) => (servlet, client),
-				// Single servlet case - create client from servlet address
-				servlet => {
-					let server_addr = servlet.addr();
-					let created_client = async {
-						Ok::<_, $crate::TightBeamError>($crate::client! {
-							connect $crate::transport::tcp::r#async::TokioListener: server_addr
-						})
-					}.await.expect("Failed to connect client");
-					(servlet, created_client)
-				}
-			};
+			// Unwrap the tuple - start closure always returns (servlet, client)
+			let (servlet_instance, client) = start_result;
 
 			// Execute client closure
 			async fn __call_client_closure<F, Fut, T>(
@@ -2415,16 +2388,26 @@ macro_rules! tb_scenario {
 }
 
 /// Helper macro for starting servlets in tb_scenario!
+/// Always returns (servlet, client) tuple
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_scenario_servlet_start {
-	// Custom start expression provided
+	// Custom start expression provided - must return (servlet, client) tuple
 	($servlet:ident, $trace:expr, $start:expr) => {{
 		($start)($trace).await.expect("Failed to start servlet")
 	}};
-	// Default: call start with trace collector
+	// Default: call start with trace collector, then create client
 	($servlet:ident, $trace:expr,) => {{
-		$servlet::start($trace).await.expect("Failed to start servlet")
+		let servlet = $servlet::start($trace.clone()).await.expect("Failed to start servlet");
+		let server_addr = servlet.addr();
+		let client = async {
+			Ok::<_, $crate::TightBeamError>($crate::client! {
+				connect $crate::transport::tcp::r#async::TokioListener: server_addr
+			})
+		}
+		.await
+		.expect("Failed to connect client");
+		(servlet, client)
 	}};
 }
 
