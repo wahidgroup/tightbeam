@@ -11,7 +11,9 @@ use crate::crypto::aead::{KeyInit, RuntimeAead};
 use crate::crypto::ecies::EciesEphemeral;
 use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
 use crate::crypto::hash::Digest;
-use crate::crypto::profiles::CryptoProvider;
+use crate::crypto::key::KeyProvider;
+use crate::crypto::negotiation::SecurityOffer;
+use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::SignatureEncoding;
@@ -42,8 +44,8 @@ where
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: Option<&'static [u8]>,
-	security_offer: Option<crate::crypto::negotiation::SecurityOffer>,
-	selected_profile: Option<crate::crypto::profiles::SecurityProfileDesc>,
+	security_offer: Option<SecurityOffer>,
+	selected_profile: Option<SecurityProfileDesc>,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
 	client_certificate: Option<Arc<Certificate>>,
 	client_key_provider: Option<Arc<dyn crate::crypto::key::KeyProvider>>,
@@ -91,18 +93,16 @@ where
 			certificate_validator: None,
 			client_certificate: None,
 			client_key_provider: None,
+			invariants: HandshakeInvariant::default(),
 			_phantom_provider: ::core::marker::PhantomData,
 			_phantom_message: ::core::marker::PhantomData,
-			invariants: HandshakeInvariant::default(),
 		}
 	}
 
 	/// Create a new ECIES handshake client with optional client identity.
 	///
-	/// This constructor doesn't require default, allowing construction with concrete key provider.
-	///
 	/// # Parameters
-	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
+	/// - `aad_domain_tag`: Optional domain tag for ECIES encryption
 	/// - `client_certificate`: Optional client certificate for mutual auth
 	/// - `client_key_provider`: Optional client key provider for mutual auth
 	pub fn new_with_identity(
@@ -122,9 +122,9 @@ where
 			certificate_validator: None,
 			client_certificate,
 			client_key_provider,
+			invariants: HandshakeInvariant::default(),
 			_phantom_provider: ::core::marker::PhantomData,
 			_phantom_message: ::core::marker::PhantomData,
-			invariants: HandshakeInvariant::default(),
 		}
 	}
 
@@ -139,11 +139,7 @@ where
 	/// # Parameters
 	/// - `certificate`: The client's X.509 certificate
 	/// - `key_provider`: The client's key provider
-	pub fn with_client_identity(
-		mut self,
-		certificate: Arc<Certificate>,
-		key_provider: Arc<dyn crate::crypto::key::KeyProvider>,
-	) -> Self {
+	pub fn with_client_identity(mut self, certificate: Arc<Certificate>, key_provider: Arc<dyn KeyProvider>) -> Self {
 		self.client_certificate = Some(certificate);
 		self.client_key_provider = Some(key_provider);
 		self
@@ -151,7 +147,7 @@ where
 
 	/// Set the security profile offer for negotiation.
 	/// If not set, server will pick default profile (dealer's choice mode).
-	pub fn with_security_offer(mut self, offer: crate::crypto::negotiation::SecurityOffer) -> Self {
+	pub fn with_security_offer(mut self, offer: SecurityOffer) -> Self {
 		self.security_offer = Some(offer);
 		self
 	}
@@ -171,9 +167,8 @@ where
 		server_handshake_der: &[u8],
 	) -> Result<ServerHandshake, HandshakeError> {
 		// Decode ServerHandshake
-		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
-
 		// Use provided validator if available, otherwise default to expiry check
+		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
 		if let Some(validator) = &self.certificate_validator {
 			validator.evaluate(&server_handshake.certificate)?;
 		} else {
@@ -344,13 +339,12 @@ where
 			// Server requires mutual auth - ensure we have client identity
 			let cert = self.client_certificate.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-
 			let sig = key_provider.sign(&transcript_digest).await?;
 			let signature_bytes = sig.to_bytes();
 			let sig_bytes_slice: &[u8] = signature_bytes.as_ref();
 			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(sig_bytes_slice)?)))
 		} else if let Some(cert) = &self.client_certificate {
-			// Client wants mutual auth but server doesn't require it - include anyway
+			// Client wants mutual auth but server doesn't require it
 			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::InvalidState)?;
 			let sig = key_provider.sign(&transcript_digest).await?;
 			let signature_bytes = sig.to_bytes();
@@ -497,7 +491,7 @@ impl<P, M> HandshakeFinalization<P> for EciesHandshakeClient<P, M>
 where
 	P: CryptoProvider,
 {
-	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
@@ -583,7 +577,7 @@ where
 		self.state.state().is_completed()
 	}
 
-	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
@@ -657,6 +651,7 @@ mod tests {
 	use super::*;
 	use crate::crypto::negotiation::{SecurityAccept, SecurityOffer};
 	use crate::crypto::profiles::SecurityProfileDesc;
+	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::Signer;
 	use crate::der::Encode;
 	use crate::transport::handshake::tests::*;
@@ -668,7 +663,7 @@ mod tests {
 	};
 
 	#[test]
-	fn test_client_state_flow() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_client_state_flow() -> Result<(), Box<dyn core::error::Error>> {
 		// Given: A client in init state
 		let mut client = TestEciesClientBuilder::new().build();
 		assert_eq!(client.state(), ClientHandshakeState::Init);
@@ -693,8 +688,7 @@ mod tests {
 				.raw_bytes(),
 		);
 
-		let signature_bytes: crate::crypto::sign::ecdsa::Secp256k1Signature =
-			test_cert.signing_key.try_sign(&transcript_hash)?;
+		let signature_bytes: Secp256k1Signature = test_cert.signing_key.try_sign(&transcript_hash)?;
 		let server_handshake_der =
 			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
 
@@ -717,7 +711,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_invalid_state_transitions() -> Result<(), Box<dyn core::error::Error>> {
 		// Given: A fresh client in init state
 		let mut client = TestEciesClientBuilder::new().build();
 
@@ -738,31 +732,20 @@ mod tests {
 
 	/// Test client-side profile validation
 	#[test]
-	fn test_client_profile_validation() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_client_profile_validation() -> Result<(), Box<dyn core::error::Error>> {
 		let mk_profile = |id: u8| SecurityProfileDesc {
-			#[cfg(feature = "digest")]
 			digest: match id {
 				1 => HASH_SHA3_256,
 				2 => HASH_SHA3_384,
 				_ => HASH_SHA3_512,
 			},
-			#[cfg(feature = "aead")]
 			aead: Some(AES_256_GCM),
-			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
-			#[cfg(feature = "signature")]
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-			#[cfg(feature = "kdf")]
 			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
-			#[cfg(feature = "ecdh")]
 			curve: Some(CURVE_SECP256K1),
-			#[cfg(feature = "kem")]
+			key_wrap: Some(AES_256_WRAP),
 			kem: None,
-			key_wrap: if id % 2 == 0 {
-				Some(AES_256_WRAP)
-			} else {
-				None
-			},
 		};
 
 		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));
@@ -783,7 +766,7 @@ mod tests {
 		let create_server_response = |client_random: &[u8; 32],
 		                              server_random: [u8; 32],
 		                              accepted_profile: &SecurityProfileDesc|
-		 -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+		 -> Result<Vec<u8>, Box<dyn core::error::Error>> {
 			let transcript_hash = compute_test_transcript_hash(
 				client_random,
 				&server_random,
@@ -794,8 +777,7 @@ mod tests {
 					.subject_public_key
 					.raw_bytes(),
 			);
-			let signature: crate::crypto::sign::ecdsa::Secp256k1Signature =
-				test_cert.signing_key.try_sign(&transcript_hash)?;
+			let signature: Secp256k1Signature = test_cert.signing_key.try_sign(&transcript_hash)?;
 			let signature_bytes = signature.to_bytes().to_vec();
 
 			let response = ServerHandshake {

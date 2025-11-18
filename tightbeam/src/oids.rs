@@ -115,6 +115,12 @@ pub const CURVE_NIST_P521: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.
 /// See `<https://oid-base.com/get/1.3.101.110>`
 pub const CURVE_X25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.110");
 
+/// ML-KEM-1024 (formerly Kyber-1024) - NIST-standardized post-quantum KEM
+/// FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard
+/// Used in Signal's PQXDH protocol for hybrid classical+PQ key agreement
+/// See `<https://csrc.nist.gov/pubs/fips/203/final>`
+pub const KEM_ML_KEM_1024: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.4.4");
+
 // ============================================================================
 // Transport Handshake Attribute OIDs (FULL_CMS profile)
 // ============================================================================

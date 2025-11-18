@@ -687,29 +687,19 @@ mod tests {
 		};
 
 		let mk_profile = |id: u8| SecurityProfileDesc {
-			#[cfg(feature = "digest")]
 			digest: match id {
 				1 => HASH_SHA3_256,
 				2 => HASH_SHA3_384,
 				_ => HASH_SHA3_512,
 			},
-			#[cfg(feature = "aead")]
 			aead: Some(AES_256_GCM),
-			#[cfg(feature = "aead")]
 			aead_key_size: Some(32),
-			#[cfg(feature = "signature")]
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-			#[cfg(feature = "kdf")]
 			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
-			#[cfg(feature = "ecdh")]
 			curve: Some(CURVE_SECP256K1),
-			#[cfg(feature = "kem")]
+			// Make key_wrap consistent so profiles only differ by digest
+			key_wrap: Some(AES_256_WRAP),
 			kem: None,
-			key_wrap: if id % 2 == 0 {
-				Some(AES_256_WRAP)
-			} else {
-				None
-			},
 		};
 
 		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));

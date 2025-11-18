@@ -52,21 +52,14 @@ use crate::x509::time::Time;
 /// Create a default test security profile for handshake tests.
 pub fn create_default_test_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		#[cfg(feature = "digest")]
 		digest: HASH_SHA3_256,
-		#[cfg(feature = "aead")]
 		aead: Some(AES_256_GCM),
-		#[cfg(feature = "aead")]
 		aead_key_size: Some(32), // AES-256 uses 32-byte keys
-		#[cfg(feature = "signature")]
 		signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
-		#[cfg(feature = "kdf")]
 		kdf: Some(HASH_SHA3_256), // Use SHA3-256 OID for HKDF-SHA3-256
-		#[cfg(feature = "ecdh")]
 		curve: Some(CURVE_SECP256K1),
-		#[cfg(feature = "kem")]
-		kem: None,
 		key_wrap: None,
+		kem: None,
 	}
 }
 

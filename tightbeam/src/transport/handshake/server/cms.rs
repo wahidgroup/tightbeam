@@ -896,21 +896,14 @@ mod tests {
 			};
 
 			crate::crypto::profiles::SecurityProfileDesc {
-				#[cfg(feature = "digest")]
 				digest: HASH_SHA256,
-				#[cfg(feature = "aead")]
 				aead: Some(aead_oid),
-				#[cfg(feature = "aead")]
 				aead_key_size: Some(key_size),
-				#[cfg(feature = "signature")]
 				signature: Some(SIGNER_ECDSA_WITH_SHA256),
-				#[cfg(feature = "kdf")]
 				kdf: Some(HASH_SHA256), // HKDF-SHA256
-				#[cfg(feature = "ecdh")]
 				curve: Some(CURVE_SECP256K1),
-				#[cfg(feature = "kem")]
-				kem: None,
 				key_wrap: Some(key_wrap_oid),
+				kem: None,
 			}
 		}
 	}

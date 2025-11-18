@@ -4,8 +4,10 @@ use crate::constants::TIGHTBEAM_UKM_PREFIX;
 use crate::crypto::hash::Digest;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::oid::AssociatedOid;
+use crate::der::Sequence;
 use crate::oids::AES_256_WRAP;
 use crate::spki::AlgorithmIdentifierOwned;
+use crate::Beamable;
 
 #[cfg(feature = "derive")]
 use crate::Errorizable;
@@ -21,7 +23,7 @@ use crate::crypto::hash::Sha3_256;
 #[cfg(feature = "kdf")]
 use crate::crypto::kdf::{HkdfSha3_256, HkdfSha3_256Oid, KdfFunction};
 #[cfg(feature = "kem")]
-use crate::crypto::kem::{Decapsulator, EncappedKey, Encapsulator};
+use crate::crypto::kem::{Decapsulator, EncappedKey, Encapsulator, Kyber1024Oid};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 #[cfg(feature = "signature")]
@@ -93,24 +95,17 @@ impl AeadKeySize for crate::crypto::aead::Aes256GcmOid {
 }
 
 /// Negotiation descriptor: pure OID set for a security profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[cfg_attr(feature = "derive", derive(crate::Beamable, crate::der::Sequence))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence)]
+#[cfg_attr(feature = "derive", derive(Beamable))]
 pub struct SecurityProfileDesc {
-	#[cfg(feature = "digest")]
 	pub digest: ObjectIdentifier,
-	#[cfg(feature = "aead")]
 	pub aead: Option<ObjectIdentifier>,
-	#[cfg(feature = "aead")]
 	pub aead_key_size: Option<u16>,
-	#[cfg(feature = "signature")]
 	pub signature: Option<ObjectIdentifier>,
-	#[cfg(feature = "kdf")]
 	pub kdf: Option<ObjectIdentifier>,
-	#[cfg(feature = "ecdh")]
 	pub curve: Option<ObjectIdentifier>,
-	#[cfg(feature = "kem")]
-	pub kem: Option<ObjectIdentifier>,
 	pub key_wrap: Option<ObjectIdentifier>,
+	pub kem: Option<ObjectIdentifier>,
 }
 
 impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
@@ -118,19 +113,33 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 		SecurityProfileDesc {
 			#[cfg(feature = "digest")]
 			digest: <P::DigestOid as AssociatedOid>::OID,
+			#[cfg(not(feature = "digest"))]
+			digest: ObjectIdentifier::new_unwrap("0.0.0.0"),
 			#[cfg(feature = "aead")]
 			aead: Some(<P::AeadOid as AssociatedOid>::OID),
+			#[cfg(not(feature = "aead"))]
+			aead: None,
 			#[cfg(feature = "aead")]
 			aead_key_size: Some(<P::AeadOid as AeadKeySize>::KEY_SIZE as u16),
+			#[cfg(not(feature = "aead"))]
+			aead_key_size: None,
 			#[cfg(feature = "signature")]
 			signature: Some(<P::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID),
+			#[cfg(not(feature = "signature"))]
+			signature: None,
 			#[cfg(feature = "kdf")]
 			kdf: Some(<P::KdfOid as AssociatedOid>::OID),
+			#[cfg(not(feature = "kdf"))]
+			kdf: None,
 			#[cfg(feature = "ecdh")]
 			curve: Some(<P::CurveOid as AssociatedOid>::OID),
-			#[cfg(feature = "kem")]
-			kem: P::KEM_OID,
+			#[cfg(not(feature = "ecdh"))]
+			curve: None,
 			key_wrap: P::KEY_WRAP_OID,
+			#[cfg(feature = "kem")]
+			kem: Some(<P::KemOid as AssociatedOid>::OID),
+			#[cfg(not(feature = "kem"))]
+			kem: None,
 		}
 	}
 }
@@ -153,17 +162,15 @@ pub trait SecurityProfile {
 	#[cfg(feature = "aead")]
 	type AeadOid: AssociatedOid + AeadKeySize;
 	#[cfg(feature = "signature")]
-	type SignatureAlg: SignatureAlgorithmIdentifier; // Provides ALGORITHM_OID
+	type SignatureAlg: SignatureAlgorithmIdentifier;
 	#[cfg(feature = "kdf")]
 	type KdfOid: AssociatedOid;
 	#[cfg(feature = "ecdh")]
 	type CurveOid: AssociatedOid;
+	#[cfg(feature = "kem")]
+	type KemOid: AssociatedOid;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
-
-	/// KEM OID for post-quantum key encapsulation.
-	/// Override this constant when implementing a profile with KEM support.
-	const KEM_OID: Option<ObjectIdentifier> = None;
 }
 
 /// Provides digest/hash functionality.
@@ -293,14 +300,6 @@ pub trait KdfProvider {
 	/// Convert this provider into a KeyDeriver function for a specific output length.
 	///
 	/// The output length is specified as a const generic parameter `N`.
-	/// Common sizes: 16 (AES-128), 24 (AES-192), 32 (AES-256), 48, 64
-	///
-	/// # Example
-	/// ```ignore
-	/// let provider = DefaultCryptoProvider::default();
-	/// let deriver = provider.as_key_deriver::<HandshakeError, 32>(); // 32-byte keys
-	/// let key = deriver(ikm, salt, info)?;
-	/// ```
 	#[allow(clippy::type_complexity)]
 	fn as_key_deriver<E, const N: usize>(&self) -> Box<dyn Fn(&[u8], &[u8], &[u8]) -> Result<[u8; N], E>>
 	where
@@ -367,6 +366,8 @@ impl SecurityProfile for TightbeamProfile {
 	type KdfOid = HkdfSha3_256Oid;
 	#[cfg(feature = "ecdh")]
 	type CurveOid = Secp256k1Oid;
+	#[cfg(feature = "kem")]
+	type KemOid = Kyber1024Oid;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
@@ -632,7 +633,13 @@ mod tests {
 		assert_eq!(<Aes256GcmOid as AeadKeySize>::KEY_SIZE, 32);
 	}
 
-	#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+	#[cfg(all(
+		feature = "aes-gcm",
+		feature = "secp256k1",
+		feature = "sha3",
+		feature = "kdf",
+		feature = "kem"
+	))]
 	#[test]
 	fn test_profile_descriptor_aes128() {
 		// Define a test profile using AES-128-GCM
@@ -645,6 +652,7 @@ mod tests {
 			type SignatureAlg = crate::crypto::sign::ecdsa::Secp256k1Signature;
 			type KdfOid = crate::crypto::kdf::HkdfSha3_256Oid;
 			type CurveOid = crate::crypto::curves::Secp256k1Oid;
+			type KemOid = crate::crypto::kem::Kyber1024Oid;
 
 			const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 		}
