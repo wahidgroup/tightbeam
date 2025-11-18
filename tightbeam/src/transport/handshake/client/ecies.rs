@@ -1,9 +1,6 @@
 //! ECIES-based client handshake orchestrator.
 //!
 //! Implements the client side of the TightBeam ECIES handshake protocol.
-//!
-//! Generic over `P: CryptoProvider` which defines the complete cryptographic suite,
-//! and ECIES message type `M` which is curve-specific.
 
 use crate::asn1::OctetString;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
@@ -248,25 +245,28 @@ where
 		self.validate_expected_state(ClientHandshakeState::HelloSent)?;
 		let _client_random_check = self.client_random.ok_or(HandshakeError::InvalidState)?;
 
-		// 2. Decode and validate server handshake
+		// 2. Transition to ServerHelloReceived
+		self.state.transition(ClientHandshakeState::ServerHelloReceived)?;
+
+		// 3. Decode and validate server handshake
 		let server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
 
-		// 3. Validate profile negotiation
+		// 4. Validate profile negotiation
 		self.validate_profile_selection(&server_handshake)?;
 
-		// 4. Extract server random
+		// 5. Extract server random
 		self.extract_server_random(&server_handshake)?;
 
-		// 5. Verify server signature
+		// 6. Verify server signature
 		self.verify_server_handshake_signature(&server_handshake)?;
 
-		// 6. Generate and encrypt session key
+		// 7. Generate and encrypt session key
 		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake)?;
 
-		// 7. Handle mutual authentication
+		// 8. Handle mutual authentication
 		let (client_certificate, client_signature) = self.prepare_client_auth(&server_handshake).await?;
 
-		// 8. Build and encode ClientKeyExchange
+		// 10. Build and encode ClientKeyExchange
 		let client_kex = ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
 			#[cfg(feature = "x509")]
@@ -275,8 +275,7 @@ where
 			client_signature,
 		};
 
-		// 9. Transition through intermediate ServerHelloReceived then KeyExchangeSent
-		self.state.transition(ClientHandshakeState::ServerHelloReceived)?;
+		// 11. Transition through intermediate ServerHelloReceived then KeyExchangeSent
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex.to_der()?)
@@ -601,24 +600,27 @@ impl EciesHandshakeClient<crate::crypto::profiles::DefaultCryptoProvider, crate:
 	pub fn process_server_handshake_no_auth(&mut self, server_handshake_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::HelloSent)?;
-		let _client_random_check = self.client_random.ok_or(HandshakeError::InvalidState)?;
+		self.client_random.ok_or(HandshakeError::InvalidState)?;
 
-		// 2. Decode and validate
+		// 2. Transition state
+		self.state.transition(ClientHandshakeState::ServerHelloReceived)?;
+
+		// 3. Decode and validate
 		let server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
 
-		// 3. Profile negotiation
+		// 4. Profile negotiation
 		self.validate_profile_selection(&server_handshake)?;
 
-		// 4. Extract server random
+		// 5. Extract server random
 		self.extract_server_random(&server_handshake)?;
 
-		// 5. Verify signature
+		// 6. Verify signature
 		self.verify_server_handshake_signature(&server_handshake)?;
 
-		// 6. Generate and encrypt session key
+		// 7. Generate and encrypt session key
 		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake)?;
 
-		// 7. Build ClientKeyExchange (no mutual auth)
+		// 8. Build ClientKeyExchange (no mutual auth)
 		let client_kex = ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
 			#[cfg(feature = "x509")]
@@ -627,8 +629,7 @@ impl EciesHandshakeClient<crate::crypto::profiles::DefaultCryptoProvider, crate:
 			client_signature: None,
 		};
 
-		// 8. Transition state
-		self.state.transition(ClientHandshakeState::ServerHelloReceived)?;
+		// 9. Transition state
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex.to_der()?)

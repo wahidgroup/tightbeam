@@ -526,7 +526,7 @@ where
 		self.collector_gate.as_ref()
 	}
 
-	async fn collect_message(&mut self) -> TransportResult<(Frame, crate::policy::TransitStatus)> {
+	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, crate::policy::TransitStatus)> {
 		use crate::crypto::aead::Decryptor;
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
@@ -648,7 +648,7 @@ where
 		use crate::der::Encode;
 		use crate::transport::ResponsePackage;
 
-		let response_pkg = ResponsePackage { status, message };
+		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
 		let mut builder = limits.apply(EnvelopeBuilder::response(response_pkg));
 
@@ -729,7 +729,7 @@ where
 		// For cleartext, we can extract it from the WireEnvelope
 		// For encrypted, message is consumed during encryption, so we can't return it
 		let returned_message = if status != TransitStatus::Accepted {
-			// Extract message from cleartext WireEnvelope (move, not clone)
+			// Extract Arc<Frame> from cleartext WireEnvelope
 			match wire_envelope {
 				WireEnvelope::Cleartext(TransportEnvelope::Request(pkg)) => Some(pkg.message),
 				_ => None, // Encrypted - can't extract original message
@@ -738,7 +738,11 @@ where
 			None
 		};
 
-		Ok((status, response, returned_message))
+		// Convert Arc<Frame> to Frame for return
+		let response_frame = response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
+		let returned_frame = returned_message.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
+
+		Ok((status, response_frame, returned_frame))
 	}
 }
 

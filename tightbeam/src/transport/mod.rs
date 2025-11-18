@@ -23,7 +23,7 @@ use crate::builder::TypeBuilder;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData};
 use crate::cms::signed_data::SignedData;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
-use crate::der::{Choice, Decode, Encode, Sequence};
+use crate::der::{Choice, Decode, Encode, EncodeValue, Tag, Tagged};
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
 use crate::transport::error::TransportError;
@@ -80,24 +80,105 @@ impl TransportEncryptionConfig {
 	}
 }
 
-/// Request package containing a TightBeam message
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+/// Request package containing the message frame
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestPackage {
-	message: Frame,
+	message: Arc<Frame>,
 }
 
 impl RequestPackage {
 	pub fn new(message: Frame) -> Self {
-		Self { message }
+		Self { message: Arc::new(message) }
+	}
+}
+
+impl EncodeValue for RequestPackage {
+	fn value_len(&self) -> crate::der::Result<crate::der::Length> {
+		self.message.as_ref().encoded_len()
+	}
+
+	fn encode_value(&self, writer: &mut impl crate::der::Writer) -> crate::der::Result<()> {
+		self.message.as_ref().encode(writer)
+	}
+}
+
+impl Tagged for RequestPackage {
+	fn tag(&self) -> Tag {
+		Tag::Sequence
+	}
+}
+
+impl<'a> Decode<'a> for RequestPackage {
+	fn decode<R: crate::der::Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+		reader.sequence(|reader| {
+			let frame = Frame::decode(reader)?;
+			Ok(Self { message: Arc::new(frame) })
+		})
 	}
 }
 
 /// Response package containing status and optional message
-#[derive(Sequence, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponsePackage {
 	status: TransitStatus,
-	#[asn1(optional = "true")]
-	message: Option<Frame>,
+	message: Option<Arc<Frame>>,
+}
+
+impl ResponsePackage {
+	pub fn new(status: TransitStatus, message: Option<Frame>) -> Self {
+		Self { status, message: message.map(Arc::new) }
+	}
+
+	pub fn status(&self) -> TransitStatus {
+		self.status
+	}
+
+	pub fn message(&self) -> Option<&Arc<Frame>> {
+		self.message.as_ref()
+	}
+}
+
+impl Default for ResponsePackage {
+	fn default() -> Self {
+		Self { status: TransitStatus::default(), message: None }
+	}
+}
+
+impl EncodeValue for ResponsePackage {
+	fn value_len(&self) -> crate::der::Result<crate::der::Length> {
+		let message_len = match &self.message {
+			Some(arc) => arc.as_ref().encoded_len()?,
+			None => crate::der::Length::ZERO,
+		};
+		[self.status.encoded_len()?, message_len]
+			.into_iter()
+			.try_fold(crate::der::Length::ZERO, |acc, len| acc + len)
+	}
+
+	fn encode_value(&self, writer: &mut impl crate::der::Writer) -> crate::der::Result<()> {
+		self.status.encode(writer)?;
+		if let Some(arc) = &self.message {
+			arc.as_ref().encode(writer)?;
+		}
+
+		Ok(())
+	}
+}
+
+impl Tagged for ResponsePackage {
+	fn tag(&self) -> Tag {
+		Tag::Sequence
+	}
+}
+
+impl<'a> Decode<'a> for ResponsePackage {
+	fn decode<R: crate::der::Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+		reader.sequence(|reader| {
+			let status = TransitStatus::decode(reader)?;
+			let message: Option<Frame> = Option::<Frame>::decode(reader)?;
+			Ok(Self { status, message: message.map(Arc::new) })
+		})
+	}
 }
 
 /// Transport envelope wrapping all messages at the transport layer.
@@ -153,14 +234,14 @@ impl From<ResponsePackage> for TransportEnvelope {
 
 impl From<Frame> for TransportEnvelope {
 	fn from(msg: Frame) -> Self {
-		Self::Request(RequestPackage { message: msg })
+		Self::Request(RequestPackage { message: Arc::new(msg) })
 	}
 }
 
 impl TransportEnvelope {
 	/// Create a new request envelope from a message
 	pub fn new_request(msg: Frame) -> Self {
-		Self::Request(RequestPackage { message: msg })
+		Self::Request(RequestPackage { message: Arc::new(msg) })
 	}
 }
 
@@ -258,7 +339,7 @@ pub trait MessageIO: ResponseHandler {
 
 	/// Encode envelope to DER bytes
 	fn encode_envelope(envelope: &TransportEnvelope) -> TransportResult<Vec<u8>> {
-		encode(envelope).map_err(TransportError::from)
+		Ok(encode(envelope)?)
 	}
 
 	/// Read and decode a transport envelope
@@ -270,18 +351,17 @@ pub trait MessageIO: ResponseHandler {
 	}
 
 	/// Send a response back to the sender
-	fn handle_message(&self, message: Frame) -> Option<Frame> {
-		// If a handler is set, use it to generate the response
-		self.handler().and_then(|handler| handler(message))
+	///
+	fn handle_message(&self, message: Arc<Frame>) -> Option<Frame> {
+		let frame = Arc::try_unwrap(message).unwrap_or_else(|arc| (*arc).clone());
+		self.handler().and_then(|handler| handler(frame))
 	}
 
 	/// Helper for parsing DER length encoding
 	fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> usize {
 		if first_byte & 0x80 == 0 {
-			// Short form
 			first_byte as usize
 		} else {
-			// Long form
 			let mut length = 0usize;
 			for &byte in length_octets {
 				length = (length << 8) | (byte as usize);
@@ -371,22 +451,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 	}
 
-	/// Read and decrypt an envelope (legacy method, use relay_message instead)
-	#[allow(async_fn_in_trait)]
-	async fn read_encrypted_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		let encrypted_bytes = self.read_envelope().await?;
-		let encrypted_info = EncryptedContentInfo::from_der(&encrypted_bytes)
-			.map_err(TightBeamError::from)
-			.map_err(TransportError::from)?;
-
-		let decrypted_bytes = self
-			.decryptor()?
-			.decrypt_content(&encrypted_info)
-			.map_err(TransportError::from)?;
-
-		Self::decode_envelope(&decrypted_bytes)
-	}
-
 	/// Send a cleartext or encrypted envelope based on encryption flag
 	#[allow(async_fn_in_trait)]
 	async fn send_envelope(&mut self, envelope: TransportEnvelope, encrypt: bool) -> TransportResult<()> {
@@ -410,12 +474,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope(&wire_bytes).await
 	}
 
-	/// Encrypt and write an envelope (legacy method, use send_envelope instead)
-	#[allow(async_fn_in_trait)]
-	async fn write_encrypted_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
-		self.send_envelope(envelope, true).await
-	}
-
 	/// Wrap a message in a TransportEnvelope
 	/// Protocol-agnostic default implementation
 	fn wrap_message(message: Frame) -> TransportEnvelope {
@@ -424,7 +482,6 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Wrap and encrypt a message, returning WireEnvelope
 	/// Protocol-agnostic default implementation
-	/// Takes ownership of message and returns it in error variants if encryption/wrapping fails
 	#[allow(async_fn_in_trait)]
 	async fn wrap_and_encrypt_message(&mut self, message: Frame) -> TransportResult<WireEnvelope> {
 		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope(), self.max_encrypted_envelope());
@@ -555,8 +612,10 @@ pub trait MessageEmitter: MessageIO {
 			// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
 			#[cfg(feature = "x509")]
 			{
+				// Clone is cheap here - Arc<Frame> inside envelope makes this efficient
 				let wire_envelope = WireEnvelope::Cleartext(envelope.clone());
-				self.write_envelope(&wire_envelope.to_der()?).await?;
+				let der_bytes = wire_envelope.to_der()?;
+				self.write_envelope(&der_bytes).await?;
 			}
 
 			#[cfg(not(feature = "x509"))]
@@ -601,7 +660,7 @@ pub trait MessageEmitter: MessageIO {
 				Err(TransportError::from(status))
 			} else {
 				match &response {
-					Some(msg) => Ok(msg),
+					Some(msg) => Ok(msg.as_ref()), // Deref Arc<Frame> to &Frame for policy
 					None => return Ok(None),
 				}
 			};
@@ -610,7 +669,7 @@ pub trait MessageEmitter: MessageIO {
 			if result.is_err() {
 				// Extract message from envelope for retry evaluation
 				let message_ref = match &envelope {
-					TransportEnvelope::Request(pkg) => &pkg.message,
+					TransportEnvelope::Request(pkg) => pkg.message.as_ref(),
 					_ => return Err(TransportError::InvalidState),
 				};
 
@@ -620,11 +679,13 @@ pub trait MessageEmitter: MessageIO {
 						if current_attempt == usize::MAX {
 							return Err(TransportError::MaxRetriesExceeded);
 						} else {
-							// Extract message from envelope for retry
-							current_message = match envelope {
+							// Extract Arc from envelope for retry
+							// Try to unwrap Arc or clone the Frame if Arc has multiple owners
+							let message_arc = match envelope {
 								TransportEnvelope::Request(pkg) => pkg.message,
 								_ => return Err(TransportError::InvalidState),
 							};
+							current_message = Arc::try_unwrap(message_arc).unwrap_or_else(|arc| (*arc).clone());
 							current_attempt += 1;
 							continue;
 						}
@@ -644,8 +705,8 @@ pub trait MessageEmitter: MessageIO {
 					}
 				}
 			} else {
-				// Success case - return response
-				return Ok(response);
+				// Success case - unwrap Arc from response and return
+				return Ok(response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())));
 			}
 		}
 	}
@@ -662,7 +723,7 @@ pub trait MessageCollector: MessageIO {
 	/// Read and validate a message without sending a response
 	/// Returns the message and the gate evaluation status
 	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)> {
+	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
 		// Read and decode the envelope (can be overridden for encryption)
 		let decoded_envelope = self.read_decoded_envelope().await?;
 		let request = match decoded_envelope {
@@ -704,7 +765,7 @@ pub trait MessageCollector: MessageIO {
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message };
+		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
@@ -755,7 +816,7 @@ pub trait MessageCollector: MessageIO {
 	/// Read and validate a message without sending a response
 	/// Returns the message (status is always Accepted without policies)
 	#[allow(async_fn_in_trait)]
-	async fn collect_message(&mut self) -> TransportResult<(Frame, TransitStatus)> {
+	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
 		// Read the envelope
 		let request_envelope = self.read_envelope().await?;
 		// Extract message from request
@@ -772,7 +833,7 @@ pub trait MessageCollector: MessageIO {
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
-		let response_pkg = ResponsePackage { status, message };
+		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 		let response_envelope = TransportEnvelope::from(response_pkg);
 
 		// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
@@ -913,7 +974,7 @@ mod tests {
 			ResponsePackage {
 				status: self.expected_status,
 				message: if self.should_have_message {
-					Some(create_v0_tightbeam(Some(self.message_value), None))
+					Some(Arc::new(create_v0_tightbeam(Some(self.message_value), None)))
 				} else {
 					None
 				},
@@ -1000,8 +1061,10 @@ mod tests {
 
 	#[test]
 	fn test_length_validation_response() -> Result<(), Box<dyn std::error::Error>> {
-		let original =
-			ResponsePackage { status: TransitStatus::Accepted, message: Some(create_v0_tightbeam(None, None)) };
+		let original = ResponsePackage {
+			status: TransitStatus::Accepted,
+			message: Some(Arc::new(create_v0_tightbeam(None, None))),
+		};
 		let mut encoded = original.to_der()?;
 
 		// Corrupt the length field

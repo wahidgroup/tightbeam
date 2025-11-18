@@ -462,8 +462,11 @@ macro_rules! server {
 							};
 
 						// Process message asynchronously
+						// Unwrap Arc<Frame> to Frame for handler (clone only if Arc has multiple owners)
+						let frame_owned = std::sync::Arc::try_unwrap(frame)
+							.unwrap_or_else(|arc| (*arc).clone());
 						let response = if status == $crate::policy::TransitStatus::Accepted {
-							match (__handler_clone)(frame).await {
+							match (__handler_clone)(frame_owned).await {
 								Ok(opt) => opt,
 								Err(_err) => {
 									None

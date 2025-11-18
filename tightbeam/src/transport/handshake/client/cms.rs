@@ -123,8 +123,8 @@ where
 	}
 
 	/// Set client certificate for mutual authentication.
-	pub fn with_client_certificate(mut self, certificate: Certificate) -> Self {
-		self.client_certificate = Some(Arc::new(certificate));
+	pub fn with_client_certificate(mut self, certificate: impl Into<Certificate>) -> Self {
+		self.client_certificate = Some(Arc::new(certificate.into()));
 		self
 	}
 

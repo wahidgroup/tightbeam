@@ -2,15 +2,23 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use crate::asn1::Frame;
 use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::{ResponsePackage, TransportEnvelope, TransportResult, WireEnvelope, WireMode};
+
+/// Helper to unwrap an Arc<Frame> to an owned Frame.
+#[inline]
+fn unwrap_arc_frame(arc: Arc<Frame>) -> Frame {
+	Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+}
 
 #[cfg(feature = "x509")]
 use crate::crypto::aead::RuntimeAead;
@@ -146,12 +154,14 @@ impl<'a> EnvelopeBuilder<'a> {
 			_ => None,
 		};
 
+		let request_frame_owned = request_frame.map(unwrap_arc_frame);
 		let encoded = envelope
 			.to_der()
-			.map_err(|err| Self::map_der_error(request_frame.as_ref(), err))?;
+			.map_err(|err| Self::map_der_error(request_frame_owned.as_ref(), err))?;
+
 		if let Some(max) = max_cleartext {
 			if encoded.len() > max {
-				return Err(TransportFailure::SizeExceeded.with_optional_frame(request_frame));
+				return Err(TransportFailure::SizeExceeded.with_optional_frame(request_frame_owned));
 			}
 		}
 
@@ -168,34 +178,30 @@ impl<'a> EnvelopeBuilder<'a> {
 			_ => None,
 		};
 
+		let request_frame_owned = request_frame.map(unwrap_arc_frame);
 		let encoded = envelope
 			.to_der()
-			.map_err(|err| Self::map_der_error(request_frame.as_ref(), err))?;
+			.map_err(|err| Self::map_der_error(request_frame_owned.as_ref(), err))?;
+
 		if let Some(max) = max_encrypted {
 			if encoded.len() > max {
-				return Err(TransportFailure::SizeExceeded.with_optional_frame(request_frame));
+				return Err(TransportFailure::SizeExceeded.with_optional_frame(request_frame_owned));
 			}
 		}
 
 		let nonce = match crate::random::generate_nonce::<12>(None) {
 			Ok(n) => n,
-			Err(_) => {
-				return Err(TransportFailure::NonceGenerationFailed.with_optional_frame(request_frame));
-			}
+			Err(_) => return Err(TransportFailure::NonceGenerationFailed.with_optional_frame(request_frame_owned)),
 		};
 
 		let encryptor = match encryptor {
 			Some(e) => e,
-			None => {
-				return Err(TransportFailure::EncryptorUnavailable.with_optional_frame(request_frame));
-			}
+			None => return Err(TransportFailure::EncryptorUnavailable.with_optional_frame(request_frame_owned)),
 		};
 
 		let encrypted = match encryptor.encrypt_content(&encoded, nonce, None) {
 			Ok(e) => e,
-			Err(_) => {
-				return Err(TransportFailure::EncryptionFailed.with_optional_frame(request_frame));
-			}
+			Err(_) => return Err(TransportFailure::EncryptionFailed.with_optional_frame(request_frame_owned)),
 		};
 
 		Ok(WireEnvelope::Encrypted(encrypted))

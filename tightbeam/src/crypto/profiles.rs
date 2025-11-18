@@ -373,7 +373,7 @@ impl SecurityProfile for TightbeamProfile {
 }
 
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultCryptoProvider {
 	profile: TightbeamProfile,
 }

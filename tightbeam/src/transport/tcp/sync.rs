@@ -14,12 +14,13 @@ use core::time::Duration;
 use crate::builder::TypeBuilder;
 use crate::crypto::aead::RuntimeAead;
 use crate::crypto::x509::policy::CertificateValidation;
+use crate::der::Encode;
 use crate::prelude::TightBeamSocketAddr;
 use crate::transport::handshake::{
 	HandshakeError, HandshakeProtocolKind, ServerHandshakeProtocol, ServerKeyManager, TcpHandshakeState,
 };
 use crate::transport::tcp::TcpListenerTrait;
-use crate::transport::{EncryptedMessageIO, EncryptedProtocol, Protocol, TransportEncryptionConfig};
+use crate::transport::{EncryptedMessageIO, EncryptedProtocol, Protocol, ResponsePackage, TransportEncryptionConfig};
 use crate::transport::{MessageIO, Pingable, TransportResult};
 use crate::x509::Certificate;
 use crate::Frame;
@@ -163,7 +164,7 @@ where
 		self.collector_gate.as_ref()
 	}
 
-	async fn collect_message(&mut self) -> TransportResult<(crate::Frame, crate::policy::TransitStatus)> {
+	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, crate::policy::TransitStatus)> {
 		use crate::crypto::aead::Decryptor;
 		use crate::der::{Decode, Encode};
 		use crate::policy::TransitStatus;
@@ -267,11 +268,7 @@ where
 		status: crate::policy::TransitStatus,
 		message: Option<Frame>,
 	) -> TransportResult<()> {
-		// Removed unused imports
-		use crate::der::Encode;
-		use crate::transport::ResponsePackage;
-
-		let response_pkg = ResponsePackage { status, message };
+		let response_pkg = ResponsePackage { status, message: message.map(|f| Arc::new(f)) };
 		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
 		let mut builder = limits.apply(EnvelopeBuilder::response(response_pkg));
 
@@ -283,7 +280,6 @@ where
 		}
 
 		let wire_envelope = builder.build()?;
-
 		let wire_bytes = wire_envelope.to_der()?;
 		self.write_envelope(&wire_bytes).await
 	}
@@ -348,7 +344,7 @@ where
 		// For cleartext, we can extract it from the WireEnvelope
 		// For encrypted, message is consumed during encryption, so we can't return it
 		let returned_message = if status != TransitStatus::Accepted {
-			// Extract message from cleartext WireEnvelope (move, not clone)
+			// Extract Arc<Frame> from cleartext WireEnvelope
 			match wire_envelope {
 				WireEnvelope::Cleartext(TransportEnvelope::Request(pkg)) => Some(pkg.message),
 				_ => None, // Encrypted - can't extract original message
@@ -357,7 +353,11 @@ where
 			None
 		};
 
-		Ok((status, response, returned_message))
+		// Convert Arc<Frame> to Frame for return
+		let response_frame = response.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
+		let returned_frame = returned_message.map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()));
+
+		Ok((status, response_frame, returned_frame))
 	}
 }
 
@@ -474,15 +474,16 @@ where
 			};
 
 			// Check transport status and handle response
-			// If status is not Accepted, use original message from perform_emit_cycle for retry evaluation
+			// If status is not Accepted, use original message from
+			// perform_emit_cycle for retry evaluation
 			let result: TransportResult<&Frame> = if status != TransitStatus::Accepted {
 				// Use original message returned from perform_emit_cycle
 				if let Some(msg) = original_message {
 					letter.try_return_to_sender(msg)?;
 				} else {
-					// Encrypted message - can't extract original, can't retry
 					return Err(<TransportError as From<TransitStatus>>::from(status));
 				}
+
 				Err(<TransportError as From<TransitStatus>>::from(status))
 			} else {
 				match &response {
@@ -491,7 +492,6 @@ where
 				}
 			};
 
-			// Evaluate retry policy only on error
 			if result.is_err() {
 				let action = self.as_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
 				match action {
@@ -513,12 +513,10 @@ where
 						}
 					}
 					RetryAction::NoRetry => {
-						// Return the error
 						result?;
 					}
 				}
 			} else {
-				// Success case - return response
 				return Ok(response);
 			}
 		}
