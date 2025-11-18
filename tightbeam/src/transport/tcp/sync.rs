@@ -11,25 +11,25 @@ use std::sync::Arc;
 use core::str::FromStr;
 use core::time::Duration;
 
+use crate::builder::TypeBuilder;
 use crate::crypto::aead::RuntimeAead;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::der::{Decode, Encode};
 use crate::prelude::TightBeamSocketAddr;
 use crate::transport::handshake::{
 	HandshakeError, HandshakeProtocolKind, ServerHandshakeProtocol, ServerKeyManager, TcpHandshakeState,
 };
-use crate::transport::policy::RetryAction;
 use crate::transport::tcp::TcpListenerTrait;
 use crate::transport::{EncryptedMessageIO, EncryptedProtocol, Protocol, TransportEncryptionConfig};
 use crate::transport::{MessageIO, Pingable, TransportResult};
-use crate::transport::{TransitStatus, TransportEnvelope, WireEnvelope};
 use crate::x509::Certificate;
 use crate::Frame;
 
 #[cfg(feature = "transport-policy")]
 use crate::{
 	policy::GatePolicy,
-	transport::{error::TransportError, policy::RestartPolicy, tcp::ProtocolStream},
+	transport::{
+		error::TransportError, policy::RestartPolicy, tcp::ProtocolStream, EnvelopeBuilder, EnvelopeLimits, WireMode,
+	},
 };
 
 pub struct TcpTransport<S: ProtocolStream> {
@@ -41,6 +41,8 @@ pub struct TcpTransport<S: ProtocolStream> {
 	emitter_gate: Box<dyn GatePolicy>,
 	#[cfg(feature = "transport-policy")]
 	collector_gate: Box<dyn GatePolicy>,
+	#[cfg(feature = "std")]
+	operation_timeout: Option<std::time::Duration>,
 
 	server_certificate: Option<Arc<Certificate>>,
 
@@ -267,33 +269,101 @@ where
 	) -> TransportResult<()> {
 		// Removed unused imports
 		use crate::der::Encode;
-		use crate::transport::{ResponsePackage, TransportEnvelope, WireEnvelope};
+		use crate::transport::ResponsePackage;
 
 		let response_pkg = ResponsePackage { status, message };
-		let response_envelope = TransportEnvelope::from(response_pkg);
+		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
+		let mut builder = limits.apply(EnvelopeBuilder::response(response_pkg));
 
-		let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
-			let envelope_bytes = response_envelope.to_der()?;
-			if let Some(max) = self.max_encrypted_envelope {
-				if envelope_bytes.len() > max {
-					return Err(TransportError::InvalidMessage);
-				}
-			}
-			let nonce = crate::random::generate_nonce::<12>(None)?;
-			let encrypted = self.encryptor()?.encrypt_content(&envelope_bytes, nonce, None)?;
-			WireEnvelope::Encrypted(encrypted)
+		if self.handshake_state() == TcpHandshakeState::Complete {
+			let encryptor = self.encryptor()?;
+			builder = builder.with_wire_mode(WireMode::Encrypted).with_encryptor(encryptor);
 		} else {
-			let bytes = response_envelope.to_der()?;
-			if let Some(max) = self.max_cleartext_envelope {
-				if bytes.len() > max {
-					return Err(TransportError::InvalidMessage);
-				}
-			}
-			WireEnvelope::Cleartext(response_envelope)
-		};
+			builder = builder.with_wire_mode(WireMode::Cleartext);
+		}
+
+		let wire_envelope = builder.build()?;
 
 		let wire_bytes = wire_envelope.to_der()?;
 		self.write_envelope(&wire_bytes).await
+	}
+}
+
+#[cfg(feature = "transport-policy")]
+impl<S: ProtocolStream> TcpTransport<S>
+where
+	TransportError: From<S::Error>,
+{
+	/// Ensure handshake is complete, performing it if needed
+	/// Returns error if handshake fails (caller handles message return)
+	async fn ensure_handshake_complete(&mut self) -> TransportResult<()> {
+		use crate::transport::handshake::TcpHandshakeState;
+
+		// Check if handshake is needed
+		#[cfg(feature = "x509")]
+		let should_handshake = (self.server_certificate().is_some() || self.client_validators.is_some())
+			&& self.handshake_state() == TcpHandshakeState::None;
+		#[cfg(not(feature = "x509"))]
+		let should_handshake = false;
+
+		if should_handshake {
+			self.perform_client_handshake().await?;
+		}
+
+		Ok(())
+	}
+
+	// Helper method to perform a single request-response cycle
+	// Takes ownership of message and returns it on error via TransportError variants
+	// Returns (status, response, original_message) where original_message is Some when status != Accepted
+	async fn perform_emit_cycle(
+		&mut self,
+		message: Frame,
+	) -> TransportResult<(crate::policy::TransitStatus, Option<Frame>, Option<Frame>)> {
+		use crate::der::Encode;
+		use crate::policy::TransitStatus;
+		use crate::transport::{EncryptedMessageIO, MessageIO, TransportEnvelope, WireEnvelope};
+
+		// Extract original message before wrapping for retry evaluation when status != Accepted
+		// For encrypted messages, we can't extract after encryption, so preserve it now
+		let original_message = message;
+
+		// Wrap and encrypt message (returns message on error)
+		let wire_envelope = self.wrap_and_encrypt_message(original_message).await?;
+
+		// Write envelope bytes (uses reference, doesn't consume)
+		let wire_bytes = wire_envelope.to_der()?;
+		self.write_envelope(&wire_bytes).await?;
+
+		// Read response bytes
+		let response_bytes = self.read_envelope().await?;
+
+		// Decrypt response using trait method
+		let response_envelope = <Self as EncryptedMessageIO>::decrypt_response(self, response_bytes).await?;
+
+		// Parse response
+		let (status, response) = match response_envelope {
+			TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
+			TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
+			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+				return Err(TransportError::InvalidMessage)
+			}
+		};
+
+		// Return original message when status != Accepted (for retry evaluation)
+		// For cleartext, we can extract it from the WireEnvelope
+		// For encrypted, message is consumed during encryption, so we can't return it
+		let returned_message = if status != TransitStatus::Accepted {
+			// Extract message from cleartext WireEnvelope (move, not clone)
+			match wire_envelope {
+				WireEnvelope::Cleartext(TransportEnvelope::Request(pkg)) => Some(pkg.message),
+				_ => None, // Encrypted - can't extract original message
+			}
+		} else {
+			None
+		};
+
+		Ok((status, response, returned_message))
 	}
 }
 
@@ -314,75 +384,111 @@ where
 	}
 
 	async fn emit(&mut self, message: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-		let mut current_message = message;
+		use crate::policy::TransitStatus;
+		use crate::transport::policy::RetryAction;
+		use crate::transport::Letter;
+
+		let mut letter = Letter::from(message);
 		let mut current_attempt = attempt.unwrap_or(0);
 
 		loop {
-			let status: TransitStatus = self.get_emitter_gate_policy().evaluate(&current_message);
-			if status != TransitStatus::Accepted {
+			// Check handshake FIRST - if fails, message stays in current_message, return HandshakeError
+			self.ensure_handshake_complete().await?;
+
+			// Evaluate gate policy before moving message
+			let gate_status = self.get_emitter_gate_policy().evaluate(letter.try_peek()?);
+			if gate_status != TransitStatus::Accepted {
 				return Err(TransportError::Unauthorized);
 			}
 
-			// Initiate handshake when:
-			// - State is None (no handshake attempted yet) AND
-			// - We have server_certificate (expecting encrypted connection) OR
-			// - We have x509_gate validators (expecting to validate server cert)
-			#[cfg(feature = "x509")]
-			let should_handshake = (self.server_certificate().is_some() || self.client_validators.is_some())
-				&& self.handshake_state() == TcpHandshakeState::None;
-			#[cfg(not(feature = "x509"))]
-			let should_handshake = false;
+			let message_to_send = letter.try_take()?;
 
-			if should_handshake {
-				self.perform_client_handshake().await?;
-			}
+			#[cfg(feature = "std")]
+			let operation_result = {
+				// Set socket timeout before operation (if configured)
+				let timeout_duration = self.operation_timeout;
+				if let Some(duration) = timeout_duration {
+					// Set timeout on socket - this applies to all blocking I/O operations
+					// Timeout will cause I/O operations to return WouldBlock or TimedOut errors
+					self.stream.set_timeout(Some(duration))?;
+				}
 
-			let envelope = TransportEnvelope::new_request(current_message.clone());
-			let wire_envelope = if self.handshake_state() == TcpHandshakeState::Complete {
-				// Removed unused imports
-				let envelope_bytes = envelope.to_der()?;
-				if let Some(max) = self.max_encrypted_envelope {
-					if envelope_bytes.len() > max {
-						return Err(TransportError::InvalidMessage);
-					}
+				let result = self.perform_emit_cycle(message_to_send).await;
+
+				// Restore/clear timeout after operation
+				// Note: We could save/restore original timeout, but clearing is simpler
+				if timeout_duration.is_some() {
+					let _ = self.stream.set_timeout(None);
 				}
-				let nonce = crate::random::generate_nonce::<12>(None)?;
-				let encrypted = self.encryptor()?.encrypt_content(&envelope_bytes, nonce, None)?;
-				WireEnvelope::Encrypted(encrypted)
-			} else {
-				let bytes = envelope.to_der()?;
-				if let Some(max) = self.max_cleartext_envelope {
-					if bytes.len() > max {
-						return Err(TransportError::InvalidMessage);
+
+				// Convert I/O timeout errors to TransportError::Timeout
+				result.map_err(|e| {
+					if let TransportError::IoError(io_err) = &e {
+						if io_err.kind() == std::io::ErrorKind::TimedOut {
+							return TransportError::Timeout;
+						}
 					}
-				}
-				WireEnvelope::Cleartext(envelope)
+					e
+				})
 			};
 
-			self.write_envelope(&wire_envelope.to_der()?).await?;
+			#[cfg(not(feature = "std"))]
+			let operation_result = self.perform_emit_cycle(message_to_send).await;
 
-			let response_bytes = self.read_envelope().await?;
-			let response_envelope = {
-				let wire_envelope = WireEnvelope::from_der(&response_bytes)?;
-				match wire_envelope {
-					WireEnvelope::Cleartext(env) => env,
-					WireEnvelope::Encrypted(encrypted_info) => {
-						use crate::crypto::aead::Decryptor;
-						let decrypted_bytes = self.decryptor()?.decrypt_content(&encrypted_info)?;
-						<Self as MessageIO>::decode_envelope(&decrypted_bytes)?
+			let (status, response, original_message) = match operation_result {
+				Ok((stat, resp, orig_msg)) => (stat, resp, orig_msg),
+				Err(e) => {
+					// Extract Frame from error variant if present (for retry evaluation)
+					// Use take_frame() which consumes the error but gives us the frame
+					let returned_frame = e.take_frame();
+					if let Some(frame) = returned_frame {
+						// Error carries Frame - restore it for retry evaluation
+						letter.try_return_to_sender(frame)?;
+
+						// Create error result for retry policy evaluation (without frame since we took it)
+						// Policy evaluation doesn't need the frame, just the error type
+						let result: TransportResult<&Frame> = Err(TransportError::SendFailed);
+						let action = self.get_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
+						match action {
+							RetryAction::RetryWithSame => {
+								if current_attempt == usize::MAX {
+									return Err(TransportError::MaxRetriesExceeded);
+								} else {
+									current_attempt += 1;
+									continue;
+								}
+							}
+							RetryAction::RetryWithModified(retry_message) => {
+								if current_attempt == usize::MAX {
+									return Err(TransportError::MaxRetriesExceeded);
+								} else {
+									letter.overwrite(*retry_message);
+									current_attempt += 1;
+									continue;
+								}
+							}
+							RetryAction::NoRetry => {
+								return result.map(|_| None);
+							}
+						}
+					} else {
+						// Error doesn't carry Frame - message was already sent or consumed
+						// Can't retry in this case - return original error
+						return Err(TransportError::SendFailed);
 					}
 				}
 			};
 
-			let (status, response) = match response_envelope {
-				TransportEnvelope::Response(pkg) => (pkg.status, pkg.message),
-				TransportEnvelope::Request(_) => return Err(TransportError::InvalidMessage),
-				TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-					return Err(TransportError::InvalidMessage)
-				}
-			};
-
+			// Check transport status and handle response
+			// If status is not Accepted, use original message from perform_emit_cycle for retry evaluation
 			let result: TransportResult<&Frame> = if status != TransitStatus::Accepted {
+				// Use original message returned from perform_emit_cycle
+				if let Some(msg) = original_message {
+					letter.try_return_to_sender(msg)?;
+				} else {
+					// Encrypted message - can't extract original, can't retry
+					return Err(<TransportError as From<TransitStatus>>::from(status));
+				}
 				Err(<TransportError as From<TransitStatus>>::from(status))
 			} else {
 				match &response {
@@ -393,7 +499,7 @@ where
 
 			// Evaluate retry policy only on error
 			if result.is_err() {
-				let action = self.get_restart_policy().evaluate(&current_message, &result, current_attempt);
+				let action = self.get_restart_policy().evaluate(letter.try_peek()?, &result, current_attempt);
 				match action {
 					RetryAction::RetryWithSame => {
 						if current_attempt == usize::MAX {
@@ -407,7 +513,7 @@ where
 						if current_attempt == usize::MAX {
 							return Err(TransportError::MaxRetriesExceeded);
 						} else {
-							current_message = *retry_message;
+							letter.overwrite(*retry_message);
 							current_attempt += 1;
 							continue;
 						}
@@ -453,6 +559,14 @@ where
 		// Replace existing key, ensuring the old key material is dropped immediately
 		let _ = self.symmetric_key.take();
 		self.symmetric_key = Some(key);
+	}
+
+	fn max_cleartext_envelope(&self) -> Option<usize> {
+		self.max_cleartext_envelope
+	}
+
+	fn max_encrypted_envelope(&self) -> Option<usize> {
+		self.max_encrypted_envelope
 	}
 }
 

@@ -2,10 +2,10 @@ pub mod error;
 pub mod frame;
 pub mod metadata;
 
-#[cfg(feature = "digest")]
-pub use frame::CheckDigestOid;
 #[cfg(feature = "aead")]
 pub use frame::CheckAeadOid;
+#[cfg(feature = "digest")]
+pub use frame::CheckDigestOid;
 #[cfg(feature = "signature")]
 pub use frame::CheckSignatureOid;
 pub use frame::FrameBuilder;

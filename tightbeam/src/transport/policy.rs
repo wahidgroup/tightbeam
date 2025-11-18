@@ -36,6 +36,11 @@ where
 	{
 		unimplemented!("X.509 certificate validation is not supported on this transport");
 	}
+
+	#[cfg(feature = "std")]
+	fn with_timeout(self, _: std::time::Duration) -> Self {
+		unimplemented!("Timeout is not supported on this transport");
+	}
 }
 
 /// Restart policy trait - decides whether to retry.

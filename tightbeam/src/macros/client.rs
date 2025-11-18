@@ -201,6 +201,16 @@ macro_rules! client {
 	(@process_policy $transport:expr, collector_gate: $value:expr $(,)?) => {
 		$transport = $transport.with_collector_gate($value);
 	};
+	// timeout accepts Duration
+	(@process_policy $transport:expr, timeout: $value:expr, $($rest:tt)*) => {
+		#[cfg(feature = "std")]
+		{ $transport = $transport.with_timeout($value); }
+		$crate::client!(@process_policy $transport, $($rest)*);
+	};
+	(@process_policy $transport:expr, timeout: $value:expr $(,)?) => {
+		#[cfg(feature = "std")]
+		{ $transport = $transport.with_timeout($value); }
+	};
 	// x509_gate accepts array of validators
 	(@process_policy $transport:expr, x509_gate: [ $( $validator:expr ),* $(,)? ], $($rest:tt)*) => {
 		$(
@@ -259,6 +269,8 @@ pub mod builder {
 		collector_gates: Vec<DynGate>,
 		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
 		validators: Vec<DynCertValidator>,
+		#[cfg(feature = "std")]
+		timeout: Option<std::time::Duration>,
 	}
 
 	pub struct DynRestart(pub Box<dyn crate::transport::policy::RestartPolicy + Send + Sync>);
@@ -327,6 +339,11 @@ pub mod builder {
 			self.validators.push(DynCertValidator(std::sync::Arc::new(v)));
 			self
 		}
+		#[cfg(feature = "std")]
+		pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+			self.timeout = Some(timeout);
+			self
+		}
 		pub fn apply<P>(self, mut transport: P::Transport) -> P::Transport
 		where
 			P: Protocol,
@@ -344,6 +361,10 @@ pub mod builder {
 			}
 			for g in self.collector_gates.into_iter() {
 				transport = transport.with_collector_gate(g);
+			}
+			#[cfg(feature = "std")]
+			if let Some(timeout) = self.timeout {
+				transport = transport.with_timeout(timeout);
 			}
 			transport
 		}
@@ -405,6 +426,11 @@ pub mod builder {
 			V: crate::crypto::x509::policy::CertificateValidation + Send + Sync + 'static,
 		{
 			self.policies = self.policies.with_x509_gate(v);
+			self
+		}
+		#[cfg(feature = "std")]
+		pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+			self.policies = self.policies.with_timeout(timeout);
 			self
 		}
 		pub fn build(self) -> Result<GenericClient<P>, TransportError>

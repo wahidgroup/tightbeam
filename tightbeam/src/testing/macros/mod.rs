@@ -1578,19 +1578,28 @@ macro_rules! tb_scenario {
 			let trace_server = $trace_collector.clone();
 			let trace_client = $trace_collector.clone();
 
-			let servlet_instance = $crate::__tb_scenario_servlet_start!(
+			let start_result = $crate::__tb_scenario_servlet_start!(
 				$servlet_name,
 				trace_server,
 				$($start_expr)?
 			);
 
-			let server_addr = servlet_instance.addr();
-
-			let client = async {
-				Ok::<_, $crate::TightBeamError>($crate::client! {
-					connect $crate::transport::tcp::r#async::TokioListener: server_addr
-				})
-			}.await.expect("Failed to connect client");
+			// Handle both Servlet and (Servlet, Client) tuple returns
+			// Pattern match to extract servlet and client
+			let (servlet_instance, client) = match start_result {
+				// Tuple case: (servlet, client) - use provided client
+				(servlet, client) => (servlet, client),
+				// Single servlet case - create client from servlet address
+				servlet => {
+					let server_addr = servlet.addr();
+					let created_client = async {
+						Ok::<_, $crate::TightBeamError>($crate::client! {
+							connect $crate::transport::tcp::r#async::TokioListener: server_addr
+						})
+					}.await.expect("Failed to connect client");
+					(servlet, created_client)
+				}
+			};
 
 			async fn __call_client_closure<F, Fut, T>(
 				closure: F,
@@ -2146,21 +2155,29 @@ macro_rules! tb_scenario {
 				let trace_client = trace_collector.clone();
 				let trace_server = trace_collector.clone();
 
-				let mut servlet_instance = $crate::__tb_scenario_servlet_start!(
+				let start_result = $crate::__tb_scenario_servlet_start!(
 					$servlet_name,
 					trace_server.clone(),
 					$($start_expr)?
 				);
+
+				// Handle both Servlet and (Servlet, Client) tuple returns
+				// Pattern match to extract servlet and client
+				let (mut servlet_instance, client) = match start_result {
+					// Tuple case: (servlet, client) - use provided client
+					(servlet, client) => (servlet, client),
+					// Single servlet case - create client from servlet address
+					servlet => {
+						let server_addr = servlet.addr();
+						let created_client = async {
+							Ok::<_, $crate::TightBeamError>($crate::client! {
+								connect $crate::transport::tcp::r#async::TokioListener: server_addr
+							})
+						}.await.expect("Failed to connect client");
+						(servlet, created_client)
+					}
+				};
 				servlet_instance.set_trace(trace_server.clone());
-
-				let server_addr = servlet_instance.addr();
-
-				// Wrap client creation in an async block that returns Result
-				let client = async {
-					Ok::<_, $crate::TightBeamError>($crate::client! {
-						connect $crate::transport::tcp::r#async::TokioListener: server_addr
-					})
-				}.await.expect("Failed to connect client");
 
 				// Execute client closure
 				async fn __call_client_closure<F, Fut, T>(
@@ -2250,21 +2267,28 @@ macro_rules! tb_scenario {
 			let trace_server = trace_collector.clone();
 
 			// Start servlet - use custom start expression or default start(trace_server)
-			let servlet_instance = $crate::__tb_scenario_servlet_start!(
+			let start_result = $crate::__tb_scenario_servlet_start!(
 				$servlet_name,
 				trace_server,
 				$($start_expr)?
 			);
 
-			// Get servlet address and create client
-			let server_addr = servlet_instance.addr();
-
-			// Wrap client creation in an async block that returns Result
-			let client = async {
-				Ok::<_, $crate::TightBeamError>($crate::client! {
-					connect $crate::transport::tcp::r#async::TokioListener: server_addr
-				})
-			}.await.expect("Failed to connect client");
+			// Handle both Servlet and (Servlet, Client) tuple returns
+			// Pattern match to extract servlet and client
+			let (servlet_instance, client) = match start_result {
+				// Tuple case: (servlet, client) - use provided client
+				(servlet, client) => (servlet, client),
+				// Single servlet case - create client from servlet address
+				servlet => {
+					let server_addr = servlet.addr();
+					let created_client = async {
+						Ok::<_, $crate::TightBeamError>($crate::client! {
+							connect $crate::transport::tcp::r#async::TokioListener: server_addr
+						})
+					}.await.expect("Failed to connect client");
+					(servlet, created_client)
+				}
+			};
 
 			// Execute client closure
 			async fn __call_client_closure<F, Fut, T>(

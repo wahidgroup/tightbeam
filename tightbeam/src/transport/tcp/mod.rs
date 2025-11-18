@@ -127,6 +127,12 @@ impl ProtocolStream for std::net::TcpStream {
 	fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
 		std::io::Read::read_exact(self, buf)
 	}
+
+	fn set_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<(), Self::Error> {
+		self.set_read_timeout(timeout)?;
+		self.set_write_timeout(timeout)?;
+		Ok(())
+	}
 }
 
 // New type wrapper for SocketAddr that implements Into<Vec<u8>>
@@ -239,6 +245,8 @@ macro_rules! impl_tcp_common {
 					restart_policy: Box::new(NoRestart),
 					emitter_gate: Box::new(AcceptAllGate),
 					collector_gate: Box::new(AcceptAllGate),
+					#[cfg(feature = "std")]
+					operation_timeout: None,
 					handler: None,
 					#[cfg(feature = "x509")]
 					server_certificate: None,
@@ -738,6 +746,12 @@ macro_rules! impl_tcp_common {
 						self.client_validators = Some(Arc::new(vec![new_validator]));
 					}
 				}
+				self
+			}
+
+			#[cfg(feature = "std")]
+			fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+				self.operation_timeout = Some(timeout);
 				self
 			}
 		}

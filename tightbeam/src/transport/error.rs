@@ -1,8 +1,24 @@
+use crate::asn1::Frame;
 use crate::policy::TransitStatus;
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
 pub type Result<T> = core::result::Result<T, TransportError>;
+
+/// Reasons why a message failed to be sent before network I/O
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportFailure {
+	/// DER encoding failed
+	EncodingFailed,
+	/// AEAD encryption failed
+	EncryptionFailed,
+	/// Message size exceeds configured limits
+	SizeExceeded,
+	/// Encryptor not available
+	EncryptorUnavailable,
+	/// Random nonce generation failed
+	NonceGenerationFailed,
+}
 
 /// Transport error types
 #[cfg_attr(feature = "derive", derive(Errorizable))]
@@ -32,6 +48,9 @@ pub enum TransportError {
 	MissingRequest,
 	#[cfg_attr(feature = "derive", error("Max retries exceeded"))]
 	MaxRetriesExceeded,
+	/// Message not sent - returned for retry with failure reason
+	#[cfg_attr(feature = "derive", error("Message not sent: {1:?} - {0:?}"))]
+	MessageNotSent(crate::asn1::Frame, TransportFailure),
 	#[cfg(feature = "x509")]
 	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -106,5 +125,61 @@ impl From<tokio::task::JoinError> for TransportError {
 impl From<k256::ecdsa::Error> for TransportError {
 	fn from(err: k256::ecdsa::Error) -> Self {
 		TransportError::HandshakeError(crate::transport::handshake::HandshakeError::from(err))
+	}
+}
+
+impl TransportError {
+	pub fn from_failure(frame: Frame, failure: TransportFailure) -> Self {
+		TransportError::MessageNotSent(frame, failure)
+	}
+
+	/// Extract Frame from error if present, otherwise returns None
+	pub fn take_frame(self) -> Option<crate::asn1::Frame> {
+		match self {
+			TransportError::MessageNotSent(frame, _) => Some(frame),
+			_ => None,
+		}
+	}
+
+	/// Extract Frame from error if present without consuming the error
+	pub fn frame(&self) -> Option<&crate::asn1::Frame> {
+		match self {
+			TransportError::MessageNotSent(frame, _) => Some(frame),
+			_ => None,
+		}
+	}
+
+	/// Extract TransportFailure from error if present, otherwise returns None
+	pub fn failure_reason(&self) -> Option<&TransportFailure> {
+		match self {
+			TransportError::MessageNotSent(_, reason) => Some(reason),
+			_ => None,
+		}
+	}
+}
+
+impl From<TransportFailure> for TransportError {
+	fn from(failure: TransportFailure) -> Self {
+		match failure {
+			TransportFailure::EncodingFailed => TransportError::InvalidMessage,
+			TransportFailure::EncryptionFailed => TransportError::Forbidden,
+			TransportFailure::SizeExceeded => TransportError::InvalidMessage,
+			TransportFailure::EncryptorUnavailable => TransportError::Forbidden,
+			TransportFailure::NonceGenerationFailed => TransportError::SendFailed,
+		}
+	}
+}
+
+impl TransportFailure {
+	pub fn with_frame(self, frame: Frame) -> TransportError {
+		TransportError::from_failure(frame, self)
+	}
+
+	pub fn with_optional_frame(self, frame: Option<&Frame>) -> TransportError {
+		if let Some(frame) = frame {
+			self.clone().with_frame(frame.clone())
+		} else {
+			self.into()
+		}
 	}
 }

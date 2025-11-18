@@ -17,7 +17,10 @@ mod utils;
 
 use std::sync::{Arc, Mutex};
 
+use tightbeam::macros::client::builder::ClientBuilder;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
+use tightbeam::transport::policy::RestartExponentialBackoff;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 use board::{
@@ -153,7 +156,19 @@ tb_scenario! {
 				manager: ChessMatchManager::default(),
 			});
 
-			ChessEngineServlet::start(trace, config).await
+			// Start the servlet
+			let servlet = ChessEngineServlet::start(trace, config).await?;
+			let server_addr = servlet.addr();
+
+			// Create a custom client with exponential backoff retry policy
+			// Exponential backoff: 100ms, 200ms, 400ms, 800ms delays (max 3 attempts)
+			let restart_policy = RestartExponentialBackoff::new(3, 100, None);
+			let client_builder = ClientBuilder::<TokioListener>::connect(server_addr).await?;
+			let client = client_builder
+				.with_restart(restart_policy)
+				.build()?;
+
+			Ok((servlet, client))
 		},
 		client: |trace, mut client| async move {
 			#[derive(Default)]
