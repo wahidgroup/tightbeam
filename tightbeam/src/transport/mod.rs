@@ -9,6 +9,7 @@ use std::sync::Arc;
 #[cfg(all(feature = "x509", feature = "std"))]
 use std::time::Duration;
 
+pub mod builders;
 pub mod error;
 pub mod handshake;
 
@@ -24,7 +25,8 @@ use crate::cms::signed_data::SignedData;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::der::{Choice, Decode, Encode, Sequence};
 use crate::policy::{GatePolicy, TransitStatus};
-use crate::transport::error::{TransportError, TransportFailure};
+use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
+use crate::transport::error::TransportError;
 use crate::{encode, TightBeamError};
 
 #[cfg(feature = "x509")]
@@ -132,198 +134,6 @@ pub enum WireMode {
 	Cleartext,
 	/// Encrypt the encoded envelope prior to emission.
 	Encrypted,
-}
-
-#[derive(Debug)]
-enum EnvelopePayload {
-	Request { message: Frame },
-	Response { package: ResponsePackage },
-	Transport { envelope: TransportEnvelope },
-}
-
-impl EnvelopePayload {
-	fn materialize(self) -> TransportEnvelope {
-		match self {
-			Self::Request { message } => TransportEnvelope::new_request(message),
-			Self::Response { package } => TransportEnvelope::from(package),
-			Self::Transport { envelope } => envelope,
-		}
-	}
-}
-
-/// Builder responsible for constructing `WireEnvelope` instances with shared
-/// size validation and encryption logic.
-pub struct EnvelopeBuilder<'a> {
-	payload: EnvelopePayload,
-	encryptor: Option<&'a RuntimeAead>,
-	max_cleartext_envelope: Option<usize>,
-	max_encrypted_envelope: Option<usize>,
-	wire_mode: WireMode,
-}
-
-#[derive(Clone, Copy, Default)]
-pub struct EnvelopeLimits {
-	cleartext: Option<usize>,
-	encrypted: Option<usize>,
-}
-
-impl EnvelopeLimits {
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	pub fn from_pair(cleartext: Option<usize>, encrypted: Option<usize>) -> Self {
-		Self { cleartext, encrypted }
-	}
-
-	pub fn with_cleartext(mut self, limit: Option<usize>) -> Self {
-		self.cleartext = limit;
-		self
-	}
-
-	pub fn with_encrypted(mut self, limit: Option<usize>) -> Self {
-		self.encrypted = limit;
-		self
-	}
-
-	pub fn apply<'a>(self, builder: EnvelopeBuilder<'a>) -> EnvelopeBuilder<'a> {
-		let builder = if let Some(max) = self.cleartext {
-			builder.with_max_cleartext_envelope(max)
-		} else {
-			builder
-		};
-
-		if let Some(max) = self.encrypted {
-			builder.with_max_encrypted_envelope(max)
-		} else {
-			builder
-		}
-	}
-}
-
-impl<'a> EnvelopeBuilder<'a> {
-	fn new(payload: EnvelopePayload) -> Self {
-		Self {
-			payload,
-			encryptor: None,
-			max_cleartext_envelope: None,
-			max_encrypted_envelope: None,
-			wire_mode: WireMode::Cleartext,
-		}
-	}
-
-	/// Create a builder configured for a request frame.
-	pub fn request(message: Frame) -> Self {
-		Self::new(EnvelopePayload::Request { message })
-	}
-
-	/// Create a builder configured for a response package.
-	pub fn response(package: ResponsePackage) -> Self {
-		Self::new(EnvelopePayload::Response { package })
-	}
-
-	/// Create a builder around an existing transport envelope.
-	pub fn transport(envelope: TransportEnvelope) -> Self {
-		Self::new(EnvelopePayload::Transport { envelope })
-	}
-
-	pub fn with_encryptor(mut self, encryptor: &'a RuntimeAead) -> Self {
-		self.encryptor = Some(encryptor);
-		self
-	}
-
-	pub fn with_max_cleartext_envelope(mut self, max: usize) -> Self {
-		self.max_cleartext_envelope = Some(max);
-		self
-	}
-
-	pub fn with_max_encrypted_envelope(mut self, max: usize) -> Self {
-		self.max_encrypted_envelope = Some(max);
-		self
-	}
-
-	pub fn with_wire_mode(mut self, mode: WireMode) -> Self {
-		self.wire_mode = mode;
-		self
-	}
-
-	/// Finalize the builder, returning a `WireEnvelope`.
-	pub fn finish(self) -> TransportResult<WireEnvelope> {
-		let EnvelopeBuilder { payload, encryptor, max_cleartext_envelope, max_encrypted_envelope, wire_mode } = self;
-
-		let envelope = payload.materialize();
-
-		match wire_mode {
-			WireMode::Cleartext => Self::build_cleartext(envelope, max_cleartext_envelope),
-			WireMode::Encrypted => Self::build_encrypted(envelope, max_encrypted_envelope, encryptor),
-		}
-	}
-
-	fn build_cleartext(envelope: TransportEnvelope, max_cleartext: Option<usize>) -> TransportResult<WireEnvelope> {
-		use crate::der::Encode;
-
-		let request_frame = match &envelope {
-			TransportEnvelope::Request(pkg) => Some(&pkg.message),
-			_ => None,
-		};
-
-		let encoded = envelope.to_der().map_err(|err| Self::map_der_error(request_frame, err))?;
-
-		if let Some(max) = max_cleartext {
-			if encoded.len() > max {
-				return Err(TransportFailure::SizeExceeded.with_optional_frame(request_frame));
-			}
-		}
-
-		Ok(WireEnvelope::Cleartext(envelope))
-	}
-
-	fn build_encrypted(
-		envelope: TransportEnvelope,
-		max_encrypted: Option<usize>,
-		encryptor: Option<&'a RuntimeAead>,
-	) -> TransportResult<WireEnvelope> {
-		use crate::der::Encode;
-
-		let request_frame = match &envelope {
-			TransportEnvelope::Request(pkg) => Some(&pkg.message),
-			_ => None,
-		};
-
-		let encoded = envelope.to_der().map_err(|err| Self::map_der_error(request_frame, err))?;
-
-		if let Some(max) = max_encrypted {
-			if encoded.len() > max {
-				return Err(TransportFailure::SizeExceeded.with_optional_frame(request_frame));
-			}
-		}
-
-		let nonce = crate::random::generate_nonce::<12>(None)
-			.map_err(|_| TransportFailure::NonceGenerationFailed.with_optional_frame(request_frame))?;
-
-		let encryptor =
-			encryptor.ok_or_else(|| TransportFailure::EncryptorUnavailable.with_optional_frame(request_frame))?;
-
-		let encrypted = encryptor
-			.encrypt_content(&encoded, nonce, None)
-			.map_err(|_| TransportFailure::EncryptionFailed.with_optional_frame(request_frame))?;
-
-		Ok(WireEnvelope::Encrypted(encrypted))
-	}
-
-	fn map_der_error(frame: Option<&Frame>, err: der::Error) -> TransportError {
-		frame
-			.map(|message| TransportFailure::EncodingFailed.with_frame(message.clone()))
-			.unwrap_or_else(|| TransportError::from(err))
-	}
-}
-
-impl<'a> TypeBuilder<WireEnvelope> for EnvelopeBuilder<'a> {
-	type Error = TransportError;
-
-	fn build(self) -> TransportResult<WireEnvelope> {
-		self.finish()
-	}
 }
 
 #[cfg(not(feature = "derive"))]
@@ -579,9 +389,9 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Send a cleartext or encrypted envelope based on encryption flag
 	#[allow(async_fn_in_trait)]
-	async fn send_envelope(&mut self, envelope: &TransportEnvelope, encrypt: bool) -> TransportResult<()> {
+	async fn send_envelope(&mut self, envelope: TransportEnvelope, encrypt: bool) -> TransportResult<()> {
 		let wire_envelope = if encrypt {
-			let envelope_bytes = Self::encode_envelope(envelope)?;
+			let envelope_bytes = Self::encode_envelope(&envelope)?;
 			let encrypted_info = self
 				.encryptor()?
 				.encrypt_content(&envelope_bytes, [], None)
@@ -589,7 +399,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 			WireEnvelope::Encrypted(encrypted_info)
 		} else {
-			WireEnvelope::Cleartext(envelope.clone())
+			WireEnvelope::Cleartext(envelope)
 		};
 
 		let wire_bytes = wire_envelope
@@ -603,7 +413,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Encrypt and write an envelope (legacy method, use send_envelope instead)
 	#[allow(async_fn_in_trait)]
 	async fn write_encrypted_envelope(&mut self, envelope: &TransportEnvelope) -> TransportResult<()> {
-		self.send_envelope(envelope, true).await
+		self.send_envelope(envelope.clone(), true).await
 	}
 
 	/// Wrap a message in a TransportEnvelope
@@ -745,7 +555,7 @@ pub trait MessageEmitter: MessageIO {
 			// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
 			#[cfg(feature = "x509")]
 			{
-				let wire_envelope = WireEnvelope::Cleartext(envelope.clone());
+				let wire_envelope = WireEnvelope::Cleartext(envelope);
 				self.write_envelope(&wire_envelope.to_der()?).await?;
 			}
 
@@ -1025,7 +835,9 @@ mod tests {
 	use super::*;
 	use crate::der::{oid::AssociatedOid, Decode, Encode};
 	use crate::testing::create_v0_tightbeam;
+	use crate::transport::error::TransportFailure;
 	use crate::transport::policy::PolicyConf;
+
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn test_server_and_client_macros() -> TransportResult<()> {
@@ -1071,6 +883,7 @@ mod tests {
 		assert_eq!(message, received);
 
 		server_handle.abort();
+
 		Ok(())
 	}
 
@@ -1132,11 +945,11 @@ mod tests {
 	fn test_request_package_encode_decode() -> Result<(), Box<dyn std::error::Error>> {
 		for test_case in get_test_cases() {
 			let original = test_case.create_request();
-
 			let encoded = original.to_der()?;
 			let decoded = RequestPackage::from_der(&encoded)?;
 			assert_eq!(original, decoded);
 		}
+
 		Ok(())
 	}
 
@@ -1144,12 +957,12 @@ mod tests {
 	fn test_response_package_encode_decode() -> Result<(), Box<dyn std::error::Error>> {
 		for test_case in get_test_cases() {
 			let original = test_case.create_response();
-
 			let encoded = original.to_der()?;
 			let decoded = ResponsePackage::from_der(&encoded)?;
 			assert_eq!(original.status, decoded.status);
 			assert_eq!(original.message, decoded.message);
 		}
+
 		Ok(())
 	}
 
@@ -1170,6 +983,7 @@ mod tests {
 			let result = RequestPackage::from_der(&encoded);
 			assert!(result.is_err(), "Should fail with corrupted length");
 		}
+
 		Ok(())
 	}
 
@@ -1188,6 +1002,7 @@ mod tests {
 			let result = ResponsePackage::from_der(&encoded);
 			assert!(result.is_err(), "Should fail with corrupted length");
 		}
+
 		Ok(())
 	}
 
@@ -1197,7 +1012,6 @@ mod tests {
 
 		let encoded = original.to_der()?;
 		let decoded = ResponsePackage::from_der(&encoded)?;
-
 		assert_eq!(original.status, decoded.status);
 		assert_eq!(original.message, decoded.message);
 		Ok(())

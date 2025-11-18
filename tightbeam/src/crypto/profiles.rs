@@ -20,10 +20,16 @@ use crate::crypto::curves::Secp256k1Oid;
 use crate::crypto::hash::Sha3_256;
 #[cfg(feature = "kdf")]
 use crate::crypto::kdf::{HkdfSha3_256, HkdfSha3_256Oid, KdfFunction};
+#[cfg(feature = "kem")]
+use crate::crypto::kem::{Decapsulator, EncappedKey, Encapsulator};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 #[cfg(feature = "signature")]
+use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic};
+#[cfg(feature = "signature")]
 use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
+#[cfg(feature = "transport")]
+use crate::transport::handshake::HandshakeError;
 
 /// Macro to generate key wrapper implementations.
 /// Reduces duplication across AES-128/192/256 variants.
@@ -31,8 +37,6 @@ use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier, SignatureEnco
 macro_rules! impl_key_wrapper {
 	($err:ty, $cipher:ty, $n:expr) => {
 		Box::new(|cek: &[u8], kek: &[u8; $n]| {
-			use crate::transport::handshake::HandshakeError;
-
 			if cek.len() < 16 || cek.len() % 8 != 0 {
 				return Err(<$err>::from(HandshakeError::InvalidKeySize {
 					expected: 16,
@@ -53,8 +57,6 @@ macro_rules! impl_key_wrapper {
 macro_rules! impl_key_unwrapper {
 	($err:ty, $cipher:ty, $n:expr) => {
 		Box::new(|wrapped_cek: &[u8], kek: &[u8; $n]| {
-			use crate::transport::handshake::HandshakeError;
-
 			if wrapped_cek.len() < 24 || wrapped_cek.len() % 8 != 0 {
 				return Err(<$err>::from(HandshakeError::InvalidKeySize {
 					expected: 24,
@@ -106,6 +108,8 @@ pub struct SecurityProfileDesc {
 	pub kdf: Option<ObjectIdentifier>,
 	#[cfg(feature = "ecdh")]
 	pub curve: Option<ObjectIdentifier>,
+	#[cfg(feature = "kem")]
+	pub kem: Option<ObjectIdentifier>,
 	pub key_wrap: Option<ObjectIdentifier>,
 }
 
@@ -124,6 +128,8 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 			kdf: Some(<P::KdfOid as AssociatedOid>::OID),
 			#[cfg(feature = "ecdh")]
 			curve: Some(<P::CurveOid as AssociatedOid>::OID),
+			#[cfg(feature = "kem")]
+			kem: P::KEM_OID,
 			key_wrap: P::KEY_WRAP_OID,
 		}
 	}
@@ -133,13 +139,14 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 /// negotiated security profile. No concrete key types or implementations.
 ///
 /// Rationale:
-/// - Allows negotiation over a compact descriptor (hash + aead + sig + wrap + kdf + curve).
+/// - Allows negotiation over a compact descriptor (hash + aead + sig + wrap + kdf + curve + kem).
 /// - Decouples compile-time algorithm implementation (CryptoProvider) from
 ///   protocol-visible identifiers (SecurityProfile).
 /// - Enables future dynamic dispatch / plugin loading without changing wire format.
-/// - KDF and curve must be negotiated to ensure interoperability:
+/// - KDF, curve, and KEM must be negotiated to ensure interoperability:
 ///   * Different KDFs produce different keys from the same inputs
 ///   * Curve choice affects ECDH operations (e.g., Ed25519 signatures typically use X25519 for ECDH)
+///   * KEM choice enables hybrid classical+PQ key agreement (e.g., ECDH + Kyber-1024)
 pub trait SecurityProfile {
 	#[cfg(feature = "digest")]
 	type DigestOid: AssociatedOid;
@@ -153,6 +160,10 @@ pub trait SecurityProfile {
 	type CurveOid: AssociatedOid;
 
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
+
+	/// KEM OID for post-quantum key encapsulation.
+	/// Override this constant when implementing a profile with KEM support.
+	const KEM_OID: Option<ObjectIdentifier> = None;
 }
 
 /// Provides digest/hash functionality.
@@ -193,7 +204,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
 	where
-		E: From<crate::transport::handshake::HandshakeError>,
+		E: From<HandshakeError>,
 	{
 		impl_key_wrapper!(E, aes::Aes128, 16)
 	}
@@ -203,7 +214,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
 	where
-		E: From<crate::transport::handshake::HandshakeError>,
+		E: From<HandshakeError>,
 	{
 		impl_key_wrapper!(E, aes::Aes192, 24)
 	}
@@ -213,7 +224,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_wrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
 	where
-		E: From<crate::transport::handshake::HandshakeError>,
+		E: From<HandshakeError>,
 	{
 		impl_key_wrapper!(E, aes::Aes256, 32)
 	}
@@ -225,7 +236,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_16<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 16]) -> Result<Vec<u8>, E>>
 	where
-		E: From<crate::transport::handshake::HandshakeError>,
+		E: From<HandshakeError>,
 	{
 		impl_key_unwrapper!(E, aes::Aes128, 16)
 	}
@@ -237,7 +248,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_24<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 24]) -> Result<Vec<u8>, E>>
 	where
-		E: From<crate::transport::handshake::HandshakeError>,
+		E: From<HandshakeError>,
 	{
 		impl_key_unwrapper!(E, aes::Aes192, 24)
 	}
@@ -249,7 +260,7 @@ pub trait AeadProvider {
 	#[allow(clippy::type_complexity)]
 	fn as_key_unwrapper_32<E>(&self) -> Box<dyn Fn(&[u8], &[u8; 32]) -> Result<Vec<u8>, E>>
 	where
-		E: From<crate::transport::handshake::HandshakeError>,
+		E: From<HandshakeError>,
 	{
 		impl_key_unwrapper!(E, aes::Aes256, 32)
 	}
@@ -307,7 +318,18 @@ pub trait KdfProvider {
 /// Isolates curve-specific functionality (ECDH, key generation).
 #[cfg(feature = "ecdh")]
 pub trait CurveProvider {
-	type Curve: elliptic_curve::Curve + elliptic_curve::CurveArithmetic;
+	type Curve: Curve + CurveArithmetic;
+}
+
+/// Provides Key Encapsulation Mechanism (KEM) operations.
+///
+/// Enables post-quantum and hybrid key agreement using RustCrypto's `kem` traits.
+/// Applications can provide KEM implementations (e.g., Kyber via `pqcrypto-compat`)
+/// to enable hybrid classical+PQ protocols like PQXDH.
+#[cfg(feature = "kem")]
+pub trait KemProvider {
+	type EncappedKey: EncappedKey;
+	type Kem: Encapsulator<Self::EncappedKey> + Decapsulator<Self::EncappedKey> + Send + Sync;
 }
 
 /// Binds concrete implementations to the metadata in a `SecurityProfile`.
@@ -451,12 +473,14 @@ impl UkmBuilder {
 		out.extend_from_slice(TIGHTBEAM_UKM_PREFIX);
 		out.extend_from_slice(&self.client);
 		out.extend_from_slice(&self.server);
+
 		for (tag, data) in self.extensions.into_iter() {
 			out.push(tag);
 			let len = data.len() as u16;
 			out.extend_from_slice(&len.to_be_bytes());
 			out.extend_from_slice(&data);
 		}
+
 		out
 	}
 }
@@ -542,6 +566,7 @@ mod tests {
 			.with_extension(0x01, b"hello")?
 			.with_extension(0x02, b"world")?
 			.finalize();
+
 		// prefix + nonces + (tag+len+data)*2 = prefix + 64 + (1+2+5)*2 = prefix + 64 + 16
 		assert_eq!(ukm.len(), TIGHTBEAM_UKM_PREFIX.len() + 64 + 16);
 		let tail = &ukm[TIGHTBEAM_UKM_PREFIX.len() + 64..];
@@ -560,11 +585,13 @@ mod tests {
 		let s = nonce(4);
 		let mut b = UkmBuilder::new(c, s);
 		assert!(b.add_extension(0x01, b"a").is_ok());
+
 		let err = b.add_extension(0x01, b"b").unwrap_err();
 		match err {
 			UkmBuilderError::DuplicateTag { tag } => assert_eq!(tag, 0x01),
 			_ => panic!("wrong error"),
 		}
+
 		Ok(())
 	}
 
@@ -575,6 +602,7 @@ mod tests {
 		let mut b = UkmBuilder::new(c, s);
 		let big = vec![0u8; (u16::MAX as usize) + 1];
 		let err = b.add_extension(0x02, &big).unwrap_err();
+
 		match err {
 			UkmBuilderError::ExtensionTooLarge { tag, len } => {
 				assert_eq!(tag, 0x02);
@@ -582,6 +610,7 @@ mod tests {
 			}
 			_ => panic!("wrong error"),
 		}
+
 		Ok(())
 	}
 
@@ -620,10 +649,9 @@ mod tests {
 			const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 		}
 
+		// Verify the descriptor captures the 16-byte key size
 		let profile = Aes128Profile;
 		let desc = SecurityProfileDesc::from(&profile);
-
-		// Verify the descriptor captures the 16-byte key size
 		assert_eq!(desc.aead_key_size, Some(16));
 		assert_eq!(desc.aead, Some(crate::crypto::aead::Aes128GcmOid::OID));
 	}

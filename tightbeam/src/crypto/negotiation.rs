@@ -7,6 +7,8 @@
 extern crate alloc;
 
 use crate::crypto::profiles::SecurityProfileDesc;
+use crate::der::Sequence;
+use crate::Beamable;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -21,7 +23,7 @@ use crate::Errorizable;
 /// Client sends this to advertise which algorithm combinations it supports.
 /// Serializable to DER for wire transmission.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(crate::Beamable, crate::der::Sequence))]
+#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct SecurityOffer {
 	/// Ordered list of security profile descriptors (preference: first is most preferred).
 	pub profiles: Vec<SecurityProfileDesc>,
@@ -43,7 +45,7 @@ impl SecurityOffer {
 ///
 /// Server sends this after selecting a mutually supported profile from the client's offer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "derive", derive(crate::Beamable, crate::der::Sequence))]
+#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct SecurityAccept {
 	/// The selected security profile descriptor.
 	pub profile: SecurityProfileDesc,
@@ -145,6 +147,8 @@ mod tests {
 			kdf: Some(HASH_SHA3_256),
 			#[cfg(feature = "ecdh")]
 			curve: Some(crate::oids::CURVE_SECP256K1),
+			#[cfg(feature = "kem")]
+			kem: None,
 			// Use different key wrap algorithms to differentiate profiles
 			key_wrap: match id {
 				1 => Some(AES_128_WRAP),
@@ -220,6 +224,8 @@ mod tests {
 			kdf: Some(HASH_SHA256),
 			#[cfg(feature = "ecdh")]
 			curve: Some(CURVE_SECP256K1),
+			#[cfg(feature = "kem")]
+			kem: None,
 			key_wrap: Some(AES_128_WRAP),
 		};
 
@@ -237,12 +243,13 @@ mod tests {
 			kdf: Some(HASH_SHA256),
 			#[cfg(feature = "ecdh")]
 			curve: Some(CURVE_SECP256K1),
+			#[cfg(feature = "kem")]
+			kem: None,
 			key_wrap: Some(AES_256_WRAP),
 		};
 
 		// Client offers AES-128 first (client preference)
 		let client_offer = SecurityOffer::new(Vec::from([aes128_gcm, aes256_gcm]));
-
 		// Server supports both
 		let server_supported = [aes256_gcm, aes128_gcm];
 

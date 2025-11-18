@@ -311,10 +311,10 @@ where
 		&self,
 		server_random: [u8; 32],
 		signature_bytes: Vec<u8>,
-		security_accept: Option<crate::crypto::negotiation::SecurityAccept>,
+		security_accept: Option<SecurityAccept>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		let server_handshake = ServerHandshake {
-			certificate: (*self.server_cert).clone(),
+			certificate: Certificate::clone(&self.server_cert),
 			server_random: OctetString::new(server_random)?,
 			signature: OctetString::new(signature_bytes)?,
 			security_accept,
@@ -418,16 +418,9 @@ where
 				.as_ref()
 				.ok_or(HandshakeError::MissingClientCertificate)?;
 
-			// Check for identity immutability
-			if let Some(existing_cert) = &self.validated_client_cert {
-				if existing_cert.as_ref() != client_cert {
-					return Err(HandshakeError::PeerIdentityMismatch);
-				}
-			}
-
 			// Run validator chain (includes expiry, pinning, policy, etc.)
 			for validator in validators.iter() {
-				validator.evaluate(client_cert)?;
+				validator.evaluate(&client_cert)?;
 			}
 
 			// Verify client signature over transcript hash
@@ -517,7 +510,7 @@ where
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
-	P::Signature: crate::crypto::sign::SignatureEncoding,
+	P::Signature: SignatureEncoding,
 {
 	type Error = HandshakeError;
 
@@ -657,10 +650,8 @@ mod tests {
 	#[tokio::test]
 	async fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
 		let mut server = TestEciesServerBuilder::new().build()?;
-
 		// Cannot process client key exchange before client hello
 		assert!(server.process_client_key_exchange(&[]).await.is_err());
-
 		// Cannot complete before any handshake steps
 		assert!(server.complete().is_err());
 
@@ -668,20 +659,16 @@ mod tests {
 		let client_random = crate::random::generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
 		server.process_client_hello(&client_hello_der).await?;
-
 		// Cannot process client hello again
 		assert!(server.process_client_hello(&client_hello_der).await.is_err());
-
 		// Cannot complete before client key exchange
 		assert!(server.complete().is_err());
 
 		// Process client key exchange to advance state
 		let client_kex_der = build_test_client_key_exchange(&server)?;
 		server.process_client_key_exchange(&client_kex_der).await?;
-
 		// Cannot process client key exchange again
 		assert!(server.process_client_key_exchange(&client_kex_der).await.is_err());
-
 		// Cannot process client hello after key exchange
 		assert!(server.process_client_hello(&client_hello_der).await.is_err());
 
@@ -716,6 +703,8 @@ mod tests {
 			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
 			#[cfg(feature = "ecdh")]
 			curve: Some(CURVE_SECP256K1),
+			#[cfg(feature = "kem")]
+			kem: None,
 			key_wrap: if id % 2 == 0 {
 				Some(AES_256_WRAP)
 			} else {
@@ -794,7 +783,6 @@ mod tests {
 
 		// Use server's AAD domain tag (or default if None)
 		let aad = server.aad_domain_tag.or(Some(crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG));
-
 		// Encrypt with ECIES
 		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
 			&server_pubkey,

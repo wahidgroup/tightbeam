@@ -15,7 +15,7 @@
 //! ┌────────────────────────────────────────────────────────────────────────┐
 //! │                        TIGHTBEAM HANDSHAKE CAPABILITIES                │
 //! ├────────────────────────────────────────────────────────────────────────┤
-//! │  🔐 AUTHENTICATION      🔒 ENCRYPTION        ⚖️  NEGOTIATION           │
+//! │  AUTHENTICATION           ENCRYPTION          NEGOTIATION              │
 //! │  • Server authentication  • Session keys      • Algorithm selection    │
 //! │  • Mutual authentication  • Forward secrecy   • Profile negotiation    │
 //! │  • Certificate validation • AEAD ciphers      • Dealer's choice mode   │
@@ -147,6 +147,8 @@ pub mod client;
 pub mod server;
 pub mod state;
 
+pub mod primitives;
+
 #[cfg(feature = "transport-cms")]
 pub mod builders;
 #[cfg(feature = "transport-cms")]
@@ -163,6 +165,8 @@ pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generat
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
 #[cfg(feature = "transport-cms")]
 pub use kari::{kari_unwrap, kari_wrap};
+#[cfg(all(feature = "transport-cms", feature = "kem"))]
+pub use kari::{kari_unwrap_hybrid, kari_wrap_hybrid};
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 

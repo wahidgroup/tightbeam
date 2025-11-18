@@ -16,6 +16,8 @@ pub mod ecies;
 pub mod hash;
 #[cfg(feature = "kdf")]
 pub mod kdf;
+#[cfg(feature = "kem")]
+pub mod kem;
 #[cfg(feature = "signature")]
 pub mod sign;
 #[cfg(feature = "x509")]

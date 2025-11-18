@@ -33,6 +33,7 @@ aead = { workspace = true, optional = true }
 signature = { workspace = true, optional = true }
 digest = { workspace = true, optional = true }
 hkdf = { workspace = true, optional = true }
+kem = { workspace = true, optional = true }
 aes = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 aes-kw = { workspace = true, optional = true }
@@ -156,6 +157,7 @@ x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
 ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
 ecdh = []
+kem = ["crypto", "dep:kem"]
 
 ## Security features
 random = ["dep:rand_core"]
@@ -168,16 +170,18 @@ secp256k1 = ["crypto", "dep:k256"]
 
 ## Handshake protocol features
 transport-cms = [
+	"transport",
 	"builder",
 	"aead",
 	"signature",
 	"digest",
 	"kdf",
+	"kem",
 	"sha3",
 	"secp256k1",
 	"x509",
 ]
-handshake_ecies = ["ecies", "x509"]
+transport-ecies = ["transport", "ecies", "x509"]
 
 # Derive macro support
 derive = ["dep:tightbeam-derive"]
@@ -188,6 +192,7 @@ std = [
 	"spki/std",
 	"cms/std",
 	"x509-cert/std",
+	"kem?/std",
 	"crypto-common?/std",
 	"zeroize?/std",
 	"digest?/std",

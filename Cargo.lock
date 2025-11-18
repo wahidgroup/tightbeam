@@ -759,6 +759,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kem"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1de74da99b010cc3a51a4f8a2e368b98f98f21f500091a06d2e8c1657b879ad2"
+dependencies = [
+ "generic-array",
+ "rand_core 0.6.4",
+ "zeroize",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1424,6 +1435,7 @@ dependencies = [
  "hex-literal",
  "hkdf",
  "k256",
+ "kem",
  "paste",
  "pkcs12",
  "rand 0.9.2",

@@ -23,6 +23,7 @@ use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentif
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::aead::{Decryptor, KeyInit};
 use crate::crypto::hash::Digest;
+use crate::crypto::key::KeyProvider;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
@@ -34,9 +35,10 @@ use crate::crypto::x509::utils::compute_signer_identifier;
 use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode};
+use crate::oids;
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::spki::EncodePublicKey;
-use crate::transport::handshake::attributes::HandshakeAttribute;
+use crate::transport::handshake::attributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
@@ -63,7 +65,7 @@ where
 	P: CryptoProvider,
 {
 	state: ServerStateMachine,
-	server_key_provider: Arc<dyn crate::crypto::key::KeyProvider>,
+	server_key_provider: Arc<dyn KeyProvider>,
 	client_cert: Option<Arc<Certificate>>,
 	validated_client_cert: Option<Arc<Certificate>>,
 	transcript_hash: Option<[u8; 32]>,
@@ -72,8 +74,8 @@ where
 	supported_profiles: Vec<SecurityProfileDesc>,
 	selected_profile: Option<SecurityProfileDesc>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	_phantom: PhantomData<P>,
 	invariants: HandshakeInvariant,
+	_phantom: PhantomData<P>,
 }
 
 impl<P> CmsHandshakeServer<P>
@@ -93,7 +95,7 @@ where
 	/// - `server_key_provider`: The key provider for cryptographic operations
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
-		server_key_provider: Arc<dyn crate::crypto::key::KeyProvider>,
+		server_key_provider: Arc<dyn KeyProvider>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {
@@ -107,8 +109,8 @@ where
 			supported_profiles: Vec::new(),
 			selected_profile: None,
 			client_validators,
-			_phantom: PhantomData,
 			invariants: { HandshakeInvariant::default() },
+			_phantom: PhantomData,
 		}
 	}
 
@@ -130,7 +132,7 @@ where
 	/// supported profile from client's offer. If no profiles are configured or
 	/// client sends no offer, the server uses dealer's choice mode (default profile).
 	#[must_use]
-	pub fn with_supported_profiles(mut self, profiles: Vec<crate::crypto::profiles::SecurityProfileDesc>) -> Self {
+	pub fn with_supported_profiles(mut self, profiles: Vec<SecurityProfileDesc>) -> Self {
 		self.supported_profiles = profiles;
 		self
 	}
@@ -213,11 +215,9 @@ where
 		// Extract SecurityOffer from attributes if present
 		let offer = unprotected_attrs.and_then(|attrs| {
 			let handshake_attrs = self.convert_to_handshake_attributes(attrs).ok()?;
-			let offer_attr =
-				crate::transport::handshake::attributes::find(&handshake_attrs, &crate::oids::HANDSHAKE_SECURITY_OFFER)
-					.ok()?;
+			let offer_attr = attributes::find(&handshake_attrs, &oids::HANDSHAKE_SECURITY_OFFER).ok()?;
 
-			crate::transport::handshake::attributes::extract_security_offer(offer_attr).ok()
+			attributes::extract_security_offer(offer_attr).ok()
 		});
 
 		// Use trait method for negotiation
@@ -227,10 +227,15 @@ where
 	}
 
 	/// Convert Attributes to HandshakeAttribute format.
-	fn convert_to_handshake_attributes(&self, attrs: &Attributes) -> Result<Vec<HandshakeAttribute>, HandshakeError> {
+	fn convert_to_handshake_attributes(
+		&self,
+		attrs: &Attributes,
+	) -> Result<Vec<attributes::HandshakeAttribute>, HandshakeError> {
 		attrs
 			.iter()
-			.map(|attr| Ok(HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() }))
+			.map(|attr| {
+				Ok(attributes::HandshakeAttribute { attr_type: attr.oid, attr_values: attr.values.clone().into() })
+			})
 			.collect()
 	}
 
@@ -395,6 +400,7 @@ where
 
 		// 7. Decrypt and store session key
 		self.decrypt_session_key(enveloped_data_der).await?;
+
 		// Transcript implicitly locked for CMS (provided externally). Mark AEAD derivation here
 		// as session key material now available.
 		self.invariants.derive_aead_once()?;
@@ -436,7 +442,6 @@ where
 	) -> Result<(SignerIdentifier, AlgorithmIdentifierOwned, AlgorithmIdentifierOwned), HandshakeError> {
 		let public_key = self.server_key_provider.to_public_key().await?;
 		let signer_id = compute_signer_identifier::<P::Digest, _>(&public_key)?;
-
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 
@@ -709,7 +714,7 @@ mod tests {
 		use crate::crypto::sign::elliptic_curve::SecretKey;
 		use crate::crypto::x509::name::Name;
 		use crate::crypto::x509::serial_number::SerialNumber;
-		use crate::der::Decode;
+		use crate::der::{Decode, Encode};
 		use crate::oids::{
 			AES_128_GCM, AES_128_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA256, HASH_SHA3_256,
 			SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256,
@@ -769,10 +774,8 @@ mod tests {
 		#[tokio::test]
 		async fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
 			let (mut server, _) = TestCmsServerBuilder::new().build();
-
 			// Cannot build server finished before processing key exchange
 			assert!(server.build_server_finished().await.is_err());
-
 			// Cannot process client finished before sending server finished
 			assert!(server.process_client_finished(&[]).is_err());
 
@@ -794,6 +797,8 @@ mod tests {
 				create_aes_gcm_profile(16), // AES-128-GCM
 				create_aes_gcm_profile(32), // AES-256-GCM
 			];
+
+			// Configure server with supported profiles
 			server = server.with_supported_profiles(profiles);
 
 			// Setup client certificate for mutual auth
@@ -850,7 +855,6 @@ mod tests {
 			});
 
 			let key_enc_alg = AlgorithmIdentifierOwned { oid: AES_128_WRAP, parameters: None };
-
 			let kari_builder = TightBeamKariBuilder::default()
 				.with_sender_priv(sender_ephemeral)
 				.with_sender_pub_spki(sender_pub_spki)
@@ -859,7 +863,6 @@ mod tests {
 				.with_ukm(ukm)
 				.with_key_enc_alg(key_enc_alg);
 
-			use der::Encode;
 			let enveloped_builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 			let enveloped_data = enveloped_builder.build(session_key, None)?;
 			Ok(enveloped_data.to_der()?)
@@ -872,8 +875,6 @@ mod tests {
 		) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 			let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
 			let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
-
-			use der::Encode;
 			let builder =
 				TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(signing_key, digest_alg, signature_alg)?;
 
@@ -907,6 +908,8 @@ mod tests {
 				kdf: Some(HASH_SHA256), // HKDF-SHA256
 				#[cfg(feature = "ecdh")]
 				curve: Some(CURVE_SECP256K1),
+				#[cfg(feature = "kem")]
+				kem: None,
 				key_wrap: Some(key_wrap_oid),
 			}
 		}

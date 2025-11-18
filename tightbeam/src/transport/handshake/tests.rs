@@ -64,6 +64,8 @@ pub fn create_default_test_profile() -> SecurityProfileDesc {
 		kdf: Some(HASH_SHA3_256), // Use SHA3-256 OID for HKDF-SHA3-256
 		#[cfg(feature = "ecdh")]
 		curve: Some(CURVE_SECP256K1),
+		#[cfg(feature = "kem")]
+		kem: None,
 		key_wrap: None,
 	}
 }

@@ -251,6 +251,13 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", from)]
 	AesKeyWrap(crate::crypto::aead::aes_kw::Error),
 
+	#[cfg(feature = "kem")]
+	#[cfg_attr(
+		feature = "derive",
+		error("Hybrid key agreement integrity check failed: combined ECDH+KEM key validation error")
+	)]
+	HybridKariIntegrityCheckFailed,
+
 	// ---------------- Random generation ----------------
 	#[cfg_attr(feature = "derive", error("Random generation failed"))]
 	RandomGenerationFailed,

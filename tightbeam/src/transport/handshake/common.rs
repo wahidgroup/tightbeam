@@ -195,6 +195,8 @@ mod tests {
 			kdf: Some(HASH_SHA256),
 			#[cfg(feature = "ecdh")]
 			curve: Some(CURVE_SECP256K1),
+			#[cfg(feature = "kem")]
+			kem: None,
 			key_wrap: None,
 		}
 	}

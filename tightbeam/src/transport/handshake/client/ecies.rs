@@ -348,14 +348,14 @@ where
 			let sig = key_provider.sign(&transcript_digest).await?;
 			let signature_bytes = sig.to_bytes();
 			let sig_bytes_slice: &[u8] = signature_bytes.as_ref();
-			Ok((Some((**cert).clone()), Some(OctetString::new(sig_bytes_slice)?)))
+			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(sig_bytes_slice)?)))
 		} else if let Some(cert) = &self.client_certificate {
 			// Client wants mutual auth but server doesn't require it - include anyway
 			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::InvalidState)?;
 			let sig = key_provider.sign(&transcript_digest).await?;
 			let signature_bytes = sig.to_bytes();
 			let sig_bytes_slice: &[u8] = signature_bytes.as_ref();
-			Ok((Some((**cert).clone()), Some(OctetString::new(sig_bytes_slice)?)))
+			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(sig_bytes_slice)?)))
 		} else {
 			// No mutual auth
 			Ok((None, None))
@@ -756,6 +756,8 @@ mod tests {
 			kdf: Some(HASH_SHA3_256), // HKDF-SHA3-256
 			#[cfg(feature = "ecdh")]
 			curve: Some(CURVE_SECP256K1),
+			#[cfg(feature = "kem")]
+			kem: None,
 			key_wrap: if id % 2 == 0 {
 				Some(AES_256_WRAP)
 			} else {
