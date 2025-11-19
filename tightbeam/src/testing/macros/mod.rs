@@ -217,76 +217,7 @@ macro_rules! jitter {
 
 // Removed: AssertionCollector type alias - use TraceCollector directly
 
-// ---------------------------------------------------------------------------
-// Instrumentation Mode
-// ---------------------------------------------------------------------------
-
-/// Instrumentation mode for tb_scenario!
-#[cfg(feature = "instrument")]
-#[derive(Clone, Debug, Default)]
-pub enum InstrumentationMode {
-	/// Automatic: framework initializes and captures events (default)
-	#[default]
-	Auto,
-
-	/// Manual: user controls init/start/end
-	Manual,
-
-	/// Custom: automatic with custom configuration
-	Custom {
-		enable_payloads: bool,
-		enable_internal_detail: bool,
-		sample_enabled_sets: bool,
-		sample_refusals: bool,
-		divergence_heuristics: bool,
-		record_durations: bool,
-		max_events: u32,
-	},
-}
-
-#[cfg(feature = "instrument")]
-impl InstrumentationMode {
-	/// Get the TbInstrumentationConfig for this mode
-	pub fn config(&self) -> crate::instrumentation::TbInstrumentationConfig {
-		match self {
-			Self::Auto => crate::instrumentation::TbInstrumentationConfig {
-				enable_payloads: false,
-				enable_internal_detail: true, // Need hidden events for CSP
-				sample_enabled_sets: false,
-				sample_refusals: false,
-				divergence_heuristics: false,
-				record_durations: false,
-				max_events: 4096,
-			},
-			Self::Manual => {
-				// Manual mode shouldn't call this, but provide safe default
-				crate::instrumentation::TbInstrumentationConfig::default()
-			}
-			Self::Custom {
-				enable_payloads,
-				enable_internal_detail,
-				sample_enabled_sets,
-				sample_refusals,
-				divergence_heuristics,
-				record_durations,
-				max_events,
-			} => crate::instrumentation::TbInstrumentationConfig {
-				enable_payloads: *enable_payloads,
-				enable_internal_detail: *enable_internal_detail,
-				sample_enabled_sets: *sample_enabled_sets,
-				sample_refusals: *sample_refusals,
-				divergence_heuristics: *divergence_heuristics,
-				record_durations: *record_durations,
-				max_events: *max_events,
-			},
-		}
-	}
-
-	/// Should framework auto-initialize?
-	pub fn is_auto(&self) -> bool {
-		matches!(self, Self::Auto | Self::Custom { .. })
-	}
-}
+// InstrumentationMode removed - use trace: TraceConfig instead
 
 /// tb_scenario! macro - MVP implementation
 ///
@@ -298,7 +229,7 @@ impl InstrumentationMode {
 /// Common top-level keys:
 /// - name: test_function_name (creates standalone #[test] function)
 /// - spec: AssertSpecType (uses latest version) OR specs: [expr, ...] (specific spec instances)
-/// - instrumentation: TbInstrumentationConfig (OPTIONAL, when feature = "instrument")
+/// - trace: TraceConfig (OPTIONAL, when feature = "instrument")
 /// - hooks { on_pass: |trace| {}, on_fail: |trace, violations| {} } (OPTIONAL)
 #[macro_export]
 macro_rules! tb_scenario {
@@ -310,7 +241,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
 			worker_threads: $threads:literal,
@@ -402,7 +333,7 @@ macro_rules! tb_scenario {
 			tb_scenario!(@execute ServiceClient, single_spec, $spec,
 				$(csp: $csp,)?
 				$(fdr: $fdr_config,)?
-				$(instrumentation: $instr_cfg,)?
+				$(trace: $trace_cfg,)?
 				$(hooks: $hooks,)?
 				protocol: { $($protocol)? },
 				worker_threads: { $threads },
@@ -418,7 +349,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
@@ -430,12 +361,12 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Common setup
+			// Create trace collector from config if provided, otherwise use default
 			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
-
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
 
 			// Environment-specific execution
@@ -454,8 +385,6 @@ macro_rules! tb_scenario {
 			// Common finalization
 			let mut trace = $crate::tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 			$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -476,7 +405,7 @@ macro_rules! tb_scenario {
 		fuzz: afl,
 		spec: $spec:ty,
 		csp: $csp:ty,
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
@@ -490,11 +419,13 @@ macro_rules! tb_scenario {
 		#[cfg(fuzzing)]
 		fn main() {
 			::afl::fuzz!(|data: &[u8]| {
-				// Common setup
+				// Create trace collector from config if provided
 				#[cfg(feature = "instrument")]
-				let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-				#[cfg(feature = "instrument")]
-				$crate::tb_scenario!(@init_instrumentation instr_mode);
+				let trace_collector: $crate::trace::TraceCollector = {
+					$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+				};
+				#[cfg(not(feature = "instrument"))]
+				let trace_collector = $crate::trace::TraceCollector::new();
 
 				// AFL provides the data - use it directly with FuzzContext
 				let trace_collector = $crate::trace::TraceCollector::with_fuzz_oracle(
@@ -533,8 +464,6 @@ macro_rules! tb_scenario {
 				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
-				#[cfg(feature = "instrument")]
-				$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 				$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 				let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -565,7 +494,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		csp: $csp:ty,
 		fuzz: $fuzz:ty,
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
@@ -577,12 +506,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Common setup
-			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
-
 			// Fuzz wrapper handles iteration
 			let result = $crate::tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
 				let trace_collector = $crate::trace::TraceCollector::with_fuzz_oracle(
@@ -606,8 +529,6 @@ macro_rules! tb_scenario {
 				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
-				#[cfg(feature = "instrument")]
-				$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 				$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 				let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -629,7 +550,7 @@ macro_rules! tb_scenario {
 		name: $test_name:ident,
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
@@ -641,18 +562,19 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Common setup
+			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
 
 			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 			];
 
 			// Environment-specific execution
-			let trace_collector = $crate::trace::TraceCollector::new();
 			let trace_exec = trace_collector.clone();
 			fn __call_exec_closure<F>(
 				closure: F,
@@ -668,8 +590,6 @@ macro_rules! tb_scenario {
 			// Common finalization
 			let mut trace = $crate::tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 			$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -689,7 +609,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		fuzz: $fuzz:ty,
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
 			stimulus: $stimulus_closure:expr
@@ -702,12 +622,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Common setup
-			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
-
 			// Fuzz wrapper handles iteration
 			let result = $crate::tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
 				// Environment-specific execution
@@ -747,8 +661,6 @@ macro_rules! tb_scenario {
 				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
-				#[cfg(feature = "instrument")]
-				$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 				$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 				let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -771,7 +683,7 @@ macro_rules! tb_scenario {
 		name: $test_name:ident,
 		spec: $spec:ty,
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
 			stimulus: $stimulus_closure:expr
@@ -784,13 +696,12 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Common setup
+			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
-
-			// Environment-specific execution
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
 			let trace_setup = trace_collector.clone();
 			let trace_stimulus = trace_collector.clone();
@@ -823,8 +734,6 @@ macro_rules! tb_scenario {
 			// Common finalization
 			let mut trace = $crate::tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 			$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -843,7 +752,7 @@ macro_rules! tb_scenario {
 		name: $test_name:ident,
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
 			stimulus: $stimulus_closure:expr
@@ -856,18 +765,19 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Common setup
+			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
 
 			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 			];
 
 			// Environment-specific execution
-			let trace_collector = $crate::trace::TraceCollector::new();
 			let trace_setup = trace_collector.clone();
 			let trace_stimulus = trace_collector.clone();
 
@@ -899,8 +809,6 @@ macro_rules! tb_scenario {
 			// Common finalization
 			let mut trace = $crate::tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 			$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -920,7 +828,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
 			$(worker_threads: $threads:literal,)?
@@ -935,11 +843,13 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Common setup
+			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
+			let trace_collector_base: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector_base = $crate::trace::TraceCollector::new();
 
 			const WORKER_THREADS: usize = $crate::tb_scenario!(@default_worker_threads $($threads)?);
 
@@ -950,7 +860,7 @@ macro_rules! tb_scenario {
 				.expect("Failed to build tokio runtime");
 
 			let exec_result = runtime.block_on(async {
-				let trace_collector = $crate::trace::TraceCollector::new();
+				let trace_collector = trace_collector_base.clone();
 				let trace_server = trace_collector.clone();
 				let trace_client = trace_collector.clone();
 
@@ -979,8 +889,6 @@ macro_rules! tb_scenario {
 				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
-				#[cfg(feature = "instrument")]
-				$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 				$crate::tb_scenario!(@finalize_trace trace, client_result);
 
 				server_handle.abort();
@@ -1005,7 +913,7 @@ macro_rules! tb_scenario {
 		name: $test_name:ident,
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
 			$(worker_threads: $threads:literal,)?
@@ -1020,11 +928,13 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Common setup
+			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
-			let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-			#[cfg(feature = "instrument")]
-			$crate::tb_scenario!(@init_instrumentation instr_mode);
+			let trace_collector_base: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector_base = $crate::trace::TraceCollector::new();
 
 			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
@@ -1039,7 +949,7 @@ macro_rules! tb_scenario {
 				.expect("Failed to build tokio runtime");
 
 			let exec_result = runtime.block_on(async {
-				let trace_collector = $crate::trace::TraceCollector::new();
+				let trace_collector = trace_collector_base.clone();
 				let trace_server = trace_collector.clone();
 				let trace_client = trace_collector.clone();
 
@@ -1068,8 +978,6 @@ macro_rules! tb_scenario {
 				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
-				#[cfg(feature = "instrument")]
-				$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 				$crate::tb_scenario!(@finalize_trace trace, client_result);
 
 				server_handle.abort();
@@ -1094,7 +1002,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
@@ -1110,7 +1018,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
@@ -1126,7 +1034,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
@@ -1136,27 +1044,27 @@ macro_rules! tb_scenario {
 		}
 		$(,)?
 	) => {
-		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? $(hooks: { on_pass: $on_pass, on_fail: $on_fail },)? exec: $exec_closure)
+		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(trace: $trace_cfg,)? $(hooks: { on_pass: $on_pass, on_fail: $on_fail },)? exec: $exec_closure)
 	};
 	// Pattern without hooks
 	(
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
 		$(,)?
 	) => {
-		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? exec: $exec_closure)
+		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(trace: $trace_cfg,)? exec: $exec_closure)
 	};
 
 	// ===== Bare environment variant (multiple specs: [...] form) =====
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Bare {
 			exec: $exec_closure:expr
 		}
@@ -1166,11 +1074,14 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {{
-		// Common setup
+		// Create trace collector from config if provided
+		#[allow(unused_variables)]
 		#[cfg(feature = "instrument")]
-		let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-		#[cfg(feature = "instrument")]
-		$crate::tb_scenario!(@init_instrumentation instr_mode);
+		let trace_collector: $crate::trace::TraceCollector = {
+			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+		};
+		#[cfg(not(feature = "instrument"))]
+		let trace_collector = $crate::trace::TraceCollector::new();
 
 		let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
@@ -1193,8 +1104,6 @@ macro_rules! tb_scenario {
 		// Common finalization
 		let mut trace = $crate::tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
-		#[cfg(feature = "instrument")]
-		$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 		$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1211,7 +1120,7 @@ macro_rules! tb_scenario {
 	(
 		spec: $spec:ty,
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
 			stimulus: $stimulus_closure:expr
@@ -1222,13 +1131,12 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {{
-		// Common setup
+		// Create trace collector from config if provided
 		#[cfg(feature = "instrument")]
-		let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-		#[cfg(feature = "instrument")]
-		$crate::tb_scenario!(@init_instrumentation instr_mode);
-
-		// Environment-specific execution
+		let trace_collector: $crate::trace::TraceCollector = {
+			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+		};
+		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
 		let trace_setup = trace_collector.clone();
 		let trace_stimulus = trace_collector.clone();
@@ -1261,8 +1169,6 @@ macro_rules! tb_scenario {
 		// Common finalization
 		let mut trace = $crate::tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
-		#[cfg(feature = "instrument")]
-		$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 		$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1279,7 +1185,7 @@ macro_rules! tb_scenario {
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Worker {
 			setup: $setup_closure:expr,
 			stimulus: $stimulus_closure:expr
@@ -1290,11 +1196,13 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {{
-		// Common setup
+		// Create trace collector from config if provided
 		#[cfg(feature = "instrument")]
-		let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-		#[cfg(feature = "instrument")]
-		$crate::tb_scenario!(@init_instrumentation instr_mode);
+		let trace_collector: $crate::trace::TraceCollector = {
+			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+		};
+		#[cfg(not(feature = "instrument"))]
+		let trace_collector = $crate::trace::TraceCollector::new();
 
 		let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
@@ -1333,8 +1241,6 @@ macro_rules! tb_scenario {
 		// Common finalization
 		let mut trace = $crate::tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
-		#[cfg(feature = "instrument")]
-		$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 		$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1353,7 +1259,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
 			$(worker_threads: $threads:literal,)?
@@ -1369,7 +1275,7 @@ macro_rules! tb_scenario {
 		tb_scenario!(@execute ServiceClient, single_spec, $spec,
 			$(csp: $csp,)?
 			$(fdr: $fdr_config,)?
-			$(instrumentation: $instr_cfg,)?
+			$(trace: $trace_cfg,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			protocol: { $($protocol)? },
 			worker_threads: { $($threads)? },
@@ -1382,7 +1288,7 @@ macro_rules! tb_scenario {
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
 			$(worker_threads: $threads:literal,)?
@@ -1406,53 +1312,14 @@ macro_rules! tb_scenario {
 		)
 	};
 
-	// ===== Internal: Instrumentation helpers =====
-	(@get_instr_mode) => {
-		$crate::testing::macros::InstrumentationMode::Auto
-	};
-	(@get_instr_mode $mode:expr) => {
-		$mode
-	};
+	// Instrumentation helpers removed - instrumentation now handled by TraceCollector
 
-	(@init_instrumentation $mode:expr) => {
-		#[cfg(feature = "instrument")]
-		{
-			let mode = &$mode;
-			if mode.is_auto() {
-				let cfg = mode.config();
-				let _ = $crate::instrumentation::active::init(cfg);
-				$crate::instrumentation::active::start_trace();
-			} else {
-				// For Custom mode, also initialize to enable tb_instrument! calls
-				// Use the config from the Custom mode
-				let cfg = mode.config();
-				let _ = $crate::instrumentation::active::init(cfg);
-				$crate::instrumentation::active::start_trace();
-			}
-		}
+	// ===== Internal: Trace collector creation =====
+	(@create_trace_collector) => {
+		$crate::trace::TraceCollector::new()
 	};
-
-	(@finalize_instrumentation $trace:expr, $mode:expr) => {
-		#[cfg(feature = "instrument")]
-		{
-			let mode = &$mode;
-			if mode.is_auto() {
-				let artifact = $crate::instrumentation::active::end_trace().expect("Failed to finalize trace");
-				$trace.instrument_events = artifact.events;
-			} else {
-				// For Custom mode, copy events from global state to trace
-				// Events from tb_instrument! are in global state
-				// Note: TraceCollector events are already in trace.instrument_events from populate_from_collector
-				// So we merge global state events (from tb_instrument!) with TraceCollector events
-				let artifact = $crate::instrumentation::active::end_trace().expect("Failed to finalize trace");
-				// Filter out Start/End events and merge
-				let global_events: Vec<_> = artifact.events
-					.into_iter()
-					.filter(|e| e.kind != $crate::instrumentation::TbEventKind::Start && e.kind != $crate::instrumentation::TbEventKind::End)
-					.collect();
-				$trace.instrument_events.extend(global_events);
-			}
-		}
+	(@create_trace_collector $trace_cfg:expr) => {
+		$crate::trace::TraceCollector::from($trace_cfg)
 	};
 
 	// ===== Internal: Common trace setup/teardown =====
@@ -1467,32 +1334,21 @@ macro_rules! tb_scenario {
 		}
 	}};
 
-	(@with_instrumentation $instr_mode:expr, $body:block) => {{
-		#[cfg(feature = "instrument")]
-		let instr_mode = $instr_mode;
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@init_instrumentation instr_mode);
-
-		let result = $body;
-
-		result
-	}};
+	// @with_instrumentation removed - instrumentation now handled by TraceCollector
 
 	// ===== Common execution logic helper =====
-	(@common_exec_logic $exec_result:expr, $spec:tt, $spec_type:tt, $($instr_cfg:expr)?, $($csp:ty)?, $($hooks:block)?) => {{
+	(@common_exec_logic $exec_result:expr, $spec:tt, $spec_type:tt, $($trace_cfg:expr)?, $($csp:ty)?, $($hooks:block)?) => {{
+		// Create trace collector from config if provided
 		#[cfg(feature = "instrument")]
-		let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-		#[cfg(feature = "instrument")]
-		$crate::tb_scenario!(@init_instrumentation instr_mode);
-
+		let trace_collector: $crate::trace::TraceCollector = {
+			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+		};
+		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
 		let exec_result = $exec_result;
 
 		let mut trace = $crate::tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
-
-		#[cfg(feature = "instrument")]
-		$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 
 		$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
@@ -1526,21 +1382,12 @@ macro_rules! tb_scenario {
 
 	// ===== Unified execution wrapper =====
 	(@common_execution
-		$(instrumentation: $instr_mode:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		$(csp: $csp:ty,)?
 		$spec_type:tt: $spec:tt,
 		$trace:expr,
 		$exec_result:expr
 	) => {{
-		#[cfg(feature = "instrument")]
-		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@init_instrumentation instr_mode);
-
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@finalize_instrumentation $trace, instr_mode);
-
 		tb_scenario!(@finalize_trace $trace, $exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1686,12 +1533,17 @@ macro_rules! tb_scenario {
 
 	// ===== Unified execution generation dispatcher =====
 	(@generate_execution $env:tt,
-		$(instrumentation: $instr_mode:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		$(csp: $csp:ty,)?
 		$spec_type:tt: $spec:tt,
 		$($env_args:tt)*
 	) => {{
+		#[cfg(feature = "instrument")]
+		let trace_collector: $crate::trace::TraceCollector = {
+			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+		};
+		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
 
 		let exec_result = tb_scenario!(@environment_exec $env, trace_collector, $($env_args)*);
@@ -1700,7 +1552,6 @@ macro_rules! tb_scenario {
 		trace.populate_from_collector(&trace_collector);
 
 		tb_scenario!(@common_execution
-			$(instrumentation: $instr_mode,)?
 			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 			$(csp: $csp,)?
 			$spec_type: $spec,
@@ -1710,13 +1561,13 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== Execution dispatcher for Bare environment =====
-	(@execute Bare, single_spec, $spec:ty, $(csp: $csp:ty,)? $(fdr: $fdr_config:expr,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
+	(@execute Bare, single_spec, $spec:ty, $(csp: $csp:ty,)? $(fdr: $fdr_config:expr,)? $(trace: $trace_cfg:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? exec: $exec_closure:expr) => {{
+		// Create TraceCollector from config if provided
 		#[cfg(feature = "instrument")]
-		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@init_instrumentation instr_mode);
-
-		// Create TraceCollector for explicit passing
+		let trace_collector: $crate::trace::TraceCollector = {
+			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+		};
+		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
 		let trace_exec = trace_collector.clone();
 
@@ -1736,10 +1587,6 @@ macro_rules! tb_scenario {
 		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
-
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
 		tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1806,13 +1653,13 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== Execution dispatcher for Worker environment =====
-	(@execute Worker, single_spec, $spec:ty, $(fdr: $fdr_config:expr,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
+	(@execute Worker, single_spec, $spec:ty, $(fdr: $fdr_config:expr,)? $(trace: $trace_cfg:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
+		// Create TraceCollector from config if provided
 		#[cfg(feature = "instrument")]
-		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@init_instrumentation instr_mode);
-
-		// Create TraceCollector for explicit passing
+		let trace_collector: $crate::trace::TraceCollector = {
+			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+		};
+		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
 		let trace_setup = trace_collector.clone();
 		let trace_stimulus = trace_collector.clone();
@@ -1845,10 +1692,6 @@ macro_rules! tb_scenario {
 		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
-
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
 		tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1861,17 +1704,17 @@ macro_rules! tb_scenario {
 		tb_scenario!(@propagate_result exec_result, verification_result)
 	}};
 
-	(@execute Worker, multi_specs, [ $( $spec_expr:expr ),+ ], $(fdr: $fdr_config:expr,)? $(instrumentation: $instr_mode:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
+	(@execute Worker, multi_specs, [ $( $spec_expr:expr ),+ ], $(fdr: $fdr_config:expr,)? $(trace: $trace_cfg:expr,)? $(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)? setup: $setup_closure:expr, stimulus: $stimulus_closure:expr) => {{
 		let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 		];
 
+		// Create TraceCollector from config if provided
 		#[cfg(feature = "instrument")]
-		let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@init_instrumentation instr_mode);
-
-		// Create TraceCollector for explicit passing
+		let trace_collector: $crate::trace::TraceCollector = {
+			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+		};
+		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
 		let trace_setup = trace_collector.clone();
 		let trace_stimulus = trace_collector.clone();
@@ -1904,10 +1747,6 @@ macro_rules! tb_scenario {
 		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
-
-		#[cfg(feature = "instrument")]
-		tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
 		tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1924,7 +1763,7 @@ macro_rules! tb_scenario {
 	// User provides complete server setup, returns Result for composition
 	(
 		spec: $spec:ty,
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
 			$(worker_threads: $threads:literal,)?
@@ -1952,7 +1791,7 @@ macro_rules! tb_scenario {
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment ServiceClient {
 			$(protocol: $protocol:path,)?
 			$(worker_threads: $threads:literal,)?
@@ -1979,7 +1818,7 @@ macro_rules! tb_scenario {
 	(@execute ServiceClient, single_spec, $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_mode:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
 		worker_threads: { $($threads:literal)? },
@@ -1994,11 +1833,12 @@ macro_rules! tb_scenario {
 		let runtime = $crate::testing::macros::__tb_build_multi_thread_runtime(WORKER_THREADS)?;
 
 		let exec_result = runtime.block_on(async {
+			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
-			let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-			#[cfg(feature = "instrument")]
-			tb_scenario!(@init_instrumentation instr_mode);
-
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
 
 			let client_result = $crate::testing::macros::__tb_run_service_client_session::<
@@ -2012,10 +1852,6 @@ macro_rules! tb_scenario {
 
 			let mut trace = tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
-
-			#[cfg(feature = "instrument")]
-			tb_scenario!(@finalize_instrumentation trace, instr_mode);
-
 			tb_scenario!(@finalize_trace trace, client_result);
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -2034,7 +1870,7 @@ macro_rules! tb_scenario {
 
 	(@execute ServiceClient, multi_specs, [ $( $spec_expr:expr ),+ ],
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_mode:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		$(hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? },)?
 		protocol: { $($protocol:path)? },
 		worker_threads: { $($threads:literal)? },
@@ -2053,11 +1889,6 @@ macro_rules! tb_scenario {
 		let runtime = $crate::testing::macros::__tb_build_multi_thread_runtime(WORKER_THREADS)?;
 
 		let exec_result = runtime.block_on(async {
-			#[cfg(feature = "instrument")]
-			let instr_mode = tb_scenario!(@get_instr_mode $($instr_mode)?);
-			#[cfg(feature = "instrument")]
-			tb_scenario!(@init_instrumentation instr_mode);
-
 			let result = tb_scenario!(@execute_service_client_async multi_specs, specs,
 				$(fdr: $fdr_config,)?
 				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
@@ -2148,7 +1979,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		csp: $csp:ty,
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
 			$(start: $start_expr:expr,)?
@@ -2165,7 +1996,7 @@ macro_rules! tb_scenario {
 			csp: $csp,
 			fuzz: afl,
 			$(fdr: $fdr_config,)?
-			$(instrumentation: $instr_cfg,)?
+			$(trace: $trace_cfg,)?
 			environment Servlet {
 				servlet: $servlet_name,
 				$(start: $start_expr,)?
@@ -2182,7 +2013,7 @@ macro_rules! tb_scenario {
 		csp: $csp:ty,
 		fuzz: afl,
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
 			$(start: $start_expr:expr,)?
@@ -2198,11 +2029,13 @@ macro_rules! tb_scenario {
 		#[cfg(fuzzing)]
 		fn main() {
 			::afl::fuzz!(|data: &[u8]| {
-				// Common setup
+				// Create trace collector from config if provided
 				#[cfg(feature = "instrument")]
-				let instr_mode = $crate::tb_scenario!(@get_instr_mode $($instr_cfg)?);
-				#[cfg(feature = "instrument")]
-				$crate::tb_scenario!(@init_instrumentation instr_mode);
+				let trace_collector: $crate::trace::TraceCollector = {
+					$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+				};
+				#[cfg(not(feature = "instrument"))]
+				let trace_collector = $crate::trace::TraceCollector::new();
 
 				// AFL provides the data - use it directly with FuzzContext
 				let trace_collector = $crate::trace::TraceCollector::with_fuzz_oracle(
@@ -2267,8 +2100,6 @@ macro_rules! tb_scenario {
 				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
-				#[cfg(feature = "instrument")]
-				$crate::tb_scenario!(@finalize_instrumentation trace, instr_mode);
 				$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 				let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -2300,7 +2131,7 @@ macro_rules! tb_scenario {
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
-		$(instrumentation: $instr_cfg:expr,)?
+		$(trace: $trace_cfg:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
 			$(start: $start_expr:expr,)?
@@ -2608,9 +2439,9 @@ mod tests {
 		spec: DemoSpec,
 		environment Bare {
 			exec: |trace| {
-				trace.event("Received");
-				trace.event("Responded");
-				trace.event("Responded");
+				trace.event("Received").emit();
+				trace.event("Responded").emit();
+				trace.event("Responded").emit();
 				Ok(())
 			}
 		}
@@ -2621,8 +2452,8 @@ mod tests {
 		specs: [DemoSpec::get(1, 0, 0)],
 		environment Bare {
 			exec: |trace| {
-				trace.event("Received");
-				trace.event("Responded");
+				trace.event("Received").emit();
+				trace.event("Responded").emit();
 				Ok(())
 			}
 		}
@@ -2640,8 +2471,8 @@ mod tests {
 			specs: [DemoSpec::get(1, 0, 0), DemoSpec::get(1, 1, 0)],
 			environment Bare {
 				exec: |trace| {
-					trace.event("Received");
-					trace.event("Responded");
+					trace.event("Received").emit();
+					trace.event("Responded").emit();
 					Ok(())
 				}
 			}
@@ -2660,10 +2491,10 @@ mod tests {
 		}
 
 		fn process(&mut self) -> Result<(), crate::TightBeamError> {
-			self.trace.event("Received");
+			self.trace.event("Received").emit();
 			self.received_count += 1;
-			self.trace.event("Responded");
-			self.trace.event("Responded");
+			self.trace.event("Responded").emit();
+			self.trace.event("Responded").emit();
 			Ok(())
 		}
 	}
@@ -2683,9 +2514,9 @@ mod tests {
 		environment Worker {
 			setup: TestWorker::new,
 			stimulus: |trace, worker: &mut TestWorker| {
-				trace.event("Received");
+				trace.event("Received").emit();
 				worker.received_count += 1;
-				trace.event("Responded");
+				trace.event("Responded").emit();
 				Ok(())
 			}
 		}
@@ -2705,9 +2536,9 @@ mod tests {
 					protocol TokioListener: listener,
 					assertions: trace,
 					handle: |frame, trace| async move {
-						trace.event("Received");
-						trace.event("Responded");
-						trace.event("Responded");
+						trace.event("Received").emit();
+						trace.event("Responded").emit();
+						trace.event("Responded").emit();
 						Ok(Some(frame))
 					}
 				};
@@ -2744,13 +2575,13 @@ mod tests {
 					assertions: trace,
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.event("Received");
-						trace.event("Responded");
+						trace.event("Received").emit();
+						trace.event("Responded").emit();
 
 						// Decode message to extract value for assertion
 						let decoded: Result<TestMessage, _> = crate::decode(&frame.message);
 						if let Ok(msg) = decoded {
-							trace.event_with("message_content", &[], msg.content);
+							trace.event_with("message_content", &[], msg.content).emit();
 						}
 
 						Ok(Some(frame))
@@ -2761,7 +2592,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.event("Responded");
+				trace.event("Responded").emit();
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -2771,7 +2602,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event("Received");
+				trace.event("Received").emit();
 
 				Ok(())
 			}

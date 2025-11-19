@@ -38,7 +38,7 @@ tb_scenario! {
 	name: test_auto_instrumentation_capture,
 	spec: AutoInstrSpec,
 	csp: MessageFlowProc,
-	instrumentation: InstrumentationMode::Auto,
+	trace: TraceConfig::default(),
 	environment ServiceClient {
 		worker_threads: 1,
 		server: |trace| async move {
@@ -68,13 +68,13 @@ tb_scenario! {
 		on_pass: |trace| {
 			println!("Test passed! Captured {} instrument events:", trace.instrument_events.len());
 			for event in &trace.instrument_events {
-				println!("  Event: {:?} - {:?}", event.kind, event.label);
+				println!("  Event: {} - {:?}", event.urn, event.label);
 			}
 		},
 		on_fail: |trace, violations| {
 			println!("Test failed! Captured {} instrument events:", trace.instrument_events.len());
 			for event in &trace.instrument_events {
-				println!("  Event: {:?} - {:?}", event.kind, event.label);
+				println!("  Event: {} - {:?}", event.urn, event.label);
 			}
 			panic!("Test failed with violations: {violations:?}");
 		}

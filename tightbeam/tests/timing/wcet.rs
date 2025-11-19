@@ -1,18 +1,14 @@
 //! WCET constraint integration tests
-//!
-//! NOTE: These tests use instrumentation which relies on global state.
-//! When running tests in parallel, a test guard serializes instrumentation operations
-//! to prevent interference. However, for maximum reliability, these tests should
-//! be run with `--test-threads=1` or `RUST_TEST_THREADS=1` to ensure complete isolation.
 
 #![cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
 
 use std::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
+use tightbeam::instrumentation::TbInstrumentationConfig;
 use tightbeam::testing::fdr::FdrConfig;
-use tightbeam::testing::macros::InstrumentationMode;
 use tightbeam::testing::specs::csp::Process;
+use tightbeam::trace::TraceConfig;
 
 tightbeam::tb_process_spec! {
 	pub SimpleWcetProcess,
@@ -69,7 +65,7 @@ tightbeam::tb_scenario! {
 	name: test_wcet_constraint_passing,
 	spec: SimpleWcetSpec,
 	fdr: build_timing_fdr_config(vec![SimpleWcetProcess::process()]),
-	instrumentation: InstrumentationMode::Custom {
+	trace: TraceConfig::with_instrumentation(TbInstrumentationConfig {
 		enable_payloads: false,
 		enable_internal_detail: false,
 		sample_enabled_sets: false,
@@ -77,16 +73,13 @@ tightbeam::tb_scenario! {
 		divergence_heuristics: false,
 		record_durations: true,
 		max_events: 1024,
-	},
+	}),
 	environment Bare {
 		exec: |trace| {
 			// Emit timing event with duration within WCET constraint (5ms < 10ms)
-			tightbeam::tb_instrument!(
-				TimingWcet,
-				label = "process",
-				duration_ns = 5_000_000 // 5ms in nanoseconds
-			);
-			trace.event("process");
+			trace.event("process")
+				.with_timing(Duration::from_nanos(5_000_000))
+				.emit();
 			Ok(())
 		}
 	},
@@ -113,7 +106,7 @@ tightbeam::tb_scenario! {
 	name: test_wcet_constraint_at_limit,
 	spec: SimpleWcetSpec,
 	fdr: build_timing_fdr_config(vec![SimpleWcetProcess::process()]),
-	instrumentation: InstrumentationMode::Custom {
+	trace: TraceConfig::with_instrumentation(TbInstrumentationConfig {
 		enable_payloads: false,
 		enable_internal_detail: false,
 		sample_enabled_sets: false,
@@ -121,16 +114,13 @@ tightbeam::tb_scenario! {
 		divergence_heuristics: false,
 		record_durations: true,
 		max_events: 1024,
-	},
+	}),
 	environment Bare {
 		exec: |trace| {
 			// Emit timing event with duration exactly at WCET constraint (10ms == 10ms)
-			tightbeam::tb_instrument!(
-				TimingWcet,
-				label = "process",
-				duration_ns = 10_000_000 // 10ms in nanoseconds - at the limit
-			);
-			trace.event("process");
+			trace.event("process")
+				.with_timing(Duration::from_nanos(10_000_000))
+				.emit();
 			Ok(())
 		}
 	},
@@ -158,7 +148,7 @@ tightbeam::tb_scenario! {
 	name: test_wcet_constraint_violation,
 	spec: SimpleWcetSpec,
 	fdr: build_timing_fdr_config(vec![SimpleWcetProcess::process()]),
-	instrumentation: InstrumentationMode::Custom {
+	trace: TraceConfig::with_instrumentation(TbInstrumentationConfig {
 		enable_payloads: false,
 		enable_internal_detail: false,
 		sample_enabled_sets: false,
@@ -166,16 +156,13 @@ tightbeam::tb_scenario! {
 		divergence_heuristics: false,
 		record_durations: true,
 		max_events: 1024,
-	},
+	}),
 	environment Bare {
 		exec: |trace| {
 			// Emit timing event with duration exceeding WCET constraint (15ms > 10ms)
-			tightbeam::tb_instrument!(
-				TimingWcet,
-				label = "process",
-				duration_ns = 15_000_000 // 15ms in nanoseconds - violates 10ms constraint
-			);
-			trace.event("process");
+			trace.event("process")
+				.with_timing(Duration::from_nanos(15_000_000))
+				.emit();
 			Ok(())
 		}
 	},

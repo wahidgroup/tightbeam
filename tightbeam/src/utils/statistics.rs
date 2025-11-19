@@ -3,7 +3,7 @@
 //! Provides traits and implementations for statistical analysis of timing data.
 //! Used for percentile-based WCET analysis and other statistical measures.
 
-use crate::der::Enumerated;
+use crate::der::{Enumerated, Sequence};
 use crate::error::TightBeamError;
 use crate::utils::math::integer_sqrt;
 
@@ -76,7 +76,7 @@ impl Percentile {
 }
 
 /// Confidence intervals for statistical measures.
-#[derive(Debug, Clone, crate::der::Sequence)]
+#[derive(Debug, Clone, Sequence, PartialEq)]
 pub struct ConfidenceIntervals {
 	/// Confidence level (e.g., 9500 for 95% - stored as integer * 10000)
 	pub level: u32,
@@ -87,14 +87,14 @@ pub struct ConfidenceIntervals {
 }
 
 /// Key-value pair for percentile data (ASN.1-compatible)
-#[derive(Debug, Clone, crate::der::Sequence)]
+#[derive(Debug, Clone, Sequence, PartialEq)]
 pub struct PercentileValue {
 	pub percentile: Percentile,
 	pub value: u64,
 }
 
 /// Key-value pair for custom metrics (ASN.1-compatible)
-#[derive(Debug, Clone, crate::der::Sequence)]
+#[derive(Debug, Clone, Sequence, PartialEq)]
 pub struct CustomMetric {
 	pub key: String,
 	/// Value stored as integer * 10000 (fixed-point representation)
@@ -102,7 +102,7 @@ pub struct CustomMetric {
 }
 
 /// Statistical measures from analysis.
-#[derive(Debug, Clone, crate::der::Sequence)]
+#[derive(Debug, Clone, Sequence, PartialEq)]
 pub struct StatisticalMeasures {
 	/// Sample count
 	pub count: u64,

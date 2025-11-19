@@ -1,15 +1,17 @@
 //! ASN.1 export for timing verification results
 
+use crate::der::Sequence;
 use crate::instrumentation::EvidenceArtifact;
 use crate::testing::timing::verification::TimingVerificationResult;
 use crate::utils::statistics::StatisticalMeasures;
+use crate::Beamable;
 
 /// Timing verification artifact in ASN.1 format
 ///
 /// Combines evidence artifact (trace, spec hash, etc.) with timing
 /// verification results and optional statistical analysis for standards
 /// compliance and tool integration.
-#[derive(Debug, Clone, crate::der::Sequence)]
+#[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct TimingVerificationArtifact {
 	/// Base evidence artifact (trace, spec hash, etc.)
 	pub evidence: EvidenceArtifact,

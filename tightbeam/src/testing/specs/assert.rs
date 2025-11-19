@@ -9,8 +9,7 @@ use crate::testing::assertions::{AssertionContract, AssertionLabel};
 use crate::trace::{ConsumedTrace, ExecutionMode};
 use crate::Frame;
 
-#[cfg(feature = "instrument")]
-use crate::instrumentation::TbEventKind;
+// TbEventKind removed - use event_kinds module constants instead
 
 use std::fmt;
 
@@ -31,9 +30,9 @@ pub trait TBSpec {
 	/// Expected execution mode
 	fn mode(&self) -> ExecutionMode;
 
-	/// Required instrumentation event kinds (if instrumentation feature enabled)
+	/// Required instrumentation event URNs (if instrumentation feature enabled)
 	#[cfg(feature = "instrument")]
-	fn required_event_kinds(&self) -> &[TbEventKind] {
+	fn required_event_kinds(&self) -> &[crate::utils::urn::Urn<'static>] {
 		&[]
 	}
 
@@ -82,13 +81,13 @@ pub enum SpecViolation {
 	/// Event ordering violation (instrumentation)
 	#[cfg(feature = "instrument")]
 	EventOrderViolation {
-		expected_kind: TbEventKind,
+		expected_kind: crate::utils::urn::Urn<'static>,
 		position: usize,
 	},
 	/// Event count mismatch
 	#[cfg(feature = "instrument")]
 	EventCountMismatch {
-		kind: TbEventKind,
+		kind: crate::utils::urn::Urn<'static>,
 		expected: usize,
 		actual: usize,
 	},
@@ -228,12 +227,12 @@ pub fn verify_trace<S: TBSpec>(spec: &S, trace: &ConsumedTrace) -> Result<(), Sp
 		if !required_kinds.is_empty() {
 			let mut idx = 0;
 			for ev in trace.instrument_events.iter() {
-				if idx < required_kinds.len() && ev.kind == required_kinds[idx] {
+				if idx < required_kinds.len() && ev.urn == required_kinds[idx] {
 					idx += 1;
 				}
 			}
 			if idx != required_kinds.len() {
-				return Err(SpecViolation::EventOrderViolation { expected_kind: required_kinds[idx], position: idx });
+				return Err(SpecViolation::EventOrderViolation { expected_kind: required_kinds[idx].clone(), position: idx });
 			}
 		}
 	}

@@ -90,6 +90,7 @@ words:
   - rwlock
   - SBMF
   - Schedulability
+  - schedulable
   - schnorr
   - Schumilo
   - SECG
@@ -102,10 +103,12 @@ words:
   - subsys
   - supraorganisms
   - Tanveer
+  - TCTL
   - tightbeam
   - trybuild
   - typenum
   - unwrapper
+  - UPPAAL
   - usize
   - Verlag
   - Wahid

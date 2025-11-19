@@ -751,18 +751,7 @@ where
 		use crate::transport::policy::RetryAction;
 		use crate::transport::Letter;
 
-		// Instrument message emit event
-		#[cfg(feature = "instrument")]
-		{
-			let _ = crate::instrumentation::emit(
-				crate::instrumentation::TbEventKind::RequestRecv,
-				Some("message_emit"),
-				None,
-				None,
-				0,
-				None,
-			);
-		}
+		// Instrumentation removed - transport layer no longer has access to TraceCollector
 
 		let mut letter = Letter::from(message);
 		let mut current_attempt = attempt.unwrap_or(0);

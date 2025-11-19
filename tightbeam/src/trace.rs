@@ -14,7 +14,135 @@ use crate::Frame;
 use sha3::{Digest, Sha3_256};
 
 #[cfg(feature = "instrument")]
-use crate::instrumentation::{TbEvent, TbEventKind};
+use crate::instrumentation::{TbEvent, TbInstrumentationConfig};
+
+/// Configuration for trace collection
+#[derive(Clone, Debug, Default)]
+pub struct TraceConfig {
+	#[cfg(feature = "instrument")]
+	pub instrumentation: Option<TbInstrumentationConfig>,
+}
+
+impl TraceConfig {
+	#[cfg(feature = "instrument")]
+	pub fn with_instrumentation(config: TbInstrumentationConfig) -> Self {
+		Self { instrumentation: Some(config) }
+	}
+
+	#[cfg(feature = "instrument")]
+	pub fn instrumentation(&self) -> TbInstrumentationConfig {
+		self.instrumentation.unwrap_or_default()
+	}
+}
+
+#[cfg(feature = "instrument")]
+impl From<TbInstrumentationConfig> for TraceConfig {
+	fn from(config: TbInstrumentationConfig) -> Self {
+		Self { instrumentation: Some(config) }
+	}
+}
+
+/// Builder for constructing and emitting trace events
+///
+/// Allows optional chaining of timing and payload information.
+/// Example:
+/// ```rust
+/// trace.event("process")
+///     .with_timing(Duration::from_millis(5))
+///     .with_payload(data)
+///     .emit();
+/// ```
+pub struct EventBuilder<'a> {
+	collector: &'a TraceCollector,
+	label: String,
+	tags: Vec<&'static str>,
+	value: Option<EventValue>,
+	#[cfg(feature = "instrument")]
+	duration_ns: Option<u64>,
+	#[cfg(feature = "instrument")]
+	payload: Option<&'a [u8]>,
+}
+
+impl<'a> EventBuilder<'a> {
+	fn new(collector: &'a TraceCollector, label: String, tags: Vec<&'static str>, value: Option<EventValue>) -> Self {
+		Self {
+			collector,
+			label,
+			tags,
+			value,
+			#[cfg(feature = "instrument")]
+			duration_ns: None,
+			#[cfg(feature = "instrument")]
+			payload: None,
+		}
+	}
+
+	/// Add timing information to the event
+	#[cfg(feature = "instrument")]
+	pub fn with_timing(mut self, duration: std::time::Duration) -> Self {
+		self.duration_ns = Some(duration.as_nanos() as u64);
+		self
+	}
+
+	#[cfg(not(feature = "instrument"))]
+	pub fn with_timing(self, _duration: std::time::Duration) -> Self {
+		self
+	}
+
+	/// Add payload data to the event
+	#[cfg(feature = "instrument")]
+	pub fn with_payload(mut self, payload: &'a [u8]) -> Self {
+		self.payload = Some(payload);
+		self
+	}
+
+	#[cfg(not(feature = "instrument"))]
+	pub fn with_payload(self, _payload: &'a [u8]) -> Self {
+		self
+	}
+
+	/// Emit the event (both assertion and instrumentation if enabled)
+	pub fn emit(self) {
+		let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
+		let static_label: &'static str = leak_label(&self.label);
+		let assertion = match self.value {
+			Some(EventValue::None) | None => {
+				#[cfg(feature = "instrument")]
+				{
+					use crate::instrumentation::event_kinds;
+					self.collector.emit_internal(
+						&event_kinds::ASSERT_LABEL,
+						Some(&self.label),
+						self.payload,
+						self.duration_ns,
+					);
+				}
+				Assertion::new(seq, AssertionLabel::Custom(static_label), self.tags, None)
+			}
+			Some(EventValue::Value(assertion_value)) => {
+				#[cfg(feature = "instrument")]
+				{
+					use crate::instrumentation::event_kinds;
+					let value_str = format_assertion_value(&assertion_value);
+					self.collector.emit_internal(
+						&event_kinds::ASSERT_PAYLOAD,
+						Some(&self.label),
+						Some(value_str.as_bytes()),
+						self.duration_ns,
+					);
+				}
+				Assertion::with_value(seq, AssertionLabel::Custom(static_label), self.tags, None, assertion_value)
+			}
+		};
+
+		if let Ok(mut assertions) = self.collector.state.assertions.lock() {
+			assertions.push(assertion);
+		}
+
+		#[cfg(feature = "testing-fuzz")]
+		self.collector.dispatch_csp_event(&self.label);
+	}
+}
 
 #[derive(Clone)]
 pub struct TraceCollector {
@@ -25,6 +153,10 @@ struct TraceState {
 	assertions: Mutex<Vec<Assertion>>,
 	#[cfg(feature = "instrument")]
 	events: Mutex<Vec<TbEvent>>,
+	#[cfg(feature = "instrument")]
+	config: TbInstrumentationConfig,
+	#[cfg(feature = "instrument")]
+	seq: Mutex<u32>,
 	#[cfg(feature = "testing-fuzz")]
 	oracle: Option<crate::testing::fuzz::FuzzContext>,
 }
@@ -35,6 +167,22 @@ impl TraceState {
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
 			events: Mutex::new(Vec::new()),
+			#[cfg(feature = "instrument")]
+			config: TbInstrumentationConfig::default(),
+			#[cfg(feature = "instrument")]
+			seq: Mutex::new(0),
+			#[cfg(feature = "testing-fuzz")]
+			oracle: None,
+		}
+	}
+
+	#[cfg(feature = "instrument")]
+	fn with_config(config: TbInstrumentationConfig) -> Self {
+		Self {
+			assertions: Mutex::new(Vec::new()),
+			events: Mutex::new(Vec::new()),
+			config,
+			seq: Mutex::new(0),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
 		}
@@ -47,15 +195,24 @@ impl TraceState {
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
 			events: Mutex::new(Vec::new()),
+			#[cfg(feature = "instrument")]
+			config: TbInstrumentationConfig::default(),
+			#[cfg(feature = "instrument")]
+			seq: Mutex::new(0),
 			oracle: Some(crate::testing::fuzz::FuzzContext::new(input, process)),
 		}
 	}
 }
 
 impl TraceCollector {
-	/// Create a new empty trace collector
+	/// Create a new empty trace collector with default config
 	pub fn new() -> Self {
 		Self { state: Arc::new(TraceState::new()) }
+	}
+
+	#[cfg(feature = "instrument")]
+	fn with_config(config: TbInstrumentationConfig) -> Self {
+		Self { state: Arc::new(TraceState::with_config(config)) }
 	}
 
 	/// Create a trace collector with fuzz oracle (CSP-guided fuzzing)
@@ -76,42 +233,18 @@ impl TraceCollector {
 	}
 
 	/// Record an event with no tags or value.
-	pub fn event(&self, label: impl AsRef<str>) {
-		self.event_with(label.as_ref(), &[], ());
+	/// Returns an EventBuilder for optional chaining.
+	pub fn event(&self, label: impl AsRef<str>) -> EventBuilder {
+		EventBuilder::new(self, label.as_ref().to_string(), Vec::new(), None)
 	}
 
 	/// Record an event with explicit tags and optional value.
-	pub fn event_with<V>(&self, label: &str, tags: &[&'static str], value: V)
+	/// Returns an EventBuilder for optional chaining.
+	pub fn event_with<V>(&self, label: &str, tags: &[&'static str], value: V) -> EventBuilder
 	where
 		V: Into<EventValue>,
 	{
-		let seq = self.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
-		let static_label: &'static str = leak_label(label);
-		let event_value = value.into();
-		let assertion = match event_value {
-			EventValue::None => {
-				#[cfg(feature = "instrument")]
-				self.emit_with_payload(TbEventKind::AssertLabel, label, None);
-
-				Assertion::new(seq, AssertionLabel::Custom(static_label), tags.to_vec(), None)
-			}
-			EventValue::Value(assertion_value) => {
-				#[cfg(feature = "instrument")]
-				{
-					let value_str = format_assertion_value(&assertion_value);
-					self.emit_with_payload(TbEventKind::AssertPayload, label, Some(value_str.as_bytes()));
-				}
-
-				Assertion::with_value(seq, AssertionLabel::Custom(static_label), tags.to_vec(), None, assertion_value)
-			}
-		};
-
-		if let Ok(mut assertions) = self.state.assertions.lock() {
-			assertions.push(assertion);
-		}
-
-		#[cfg(feature = "testing-fuzz")]
-		self.dispatch_csp_event(label);
+		EventBuilder::new(self, label.to_string(), tags.to_vec(), Some(value.into()))
 	}
 
 	#[cfg(feature = "testing-fuzz")]
@@ -137,29 +270,82 @@ impl TraceCollector {
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn emit(&self, kind: TbEventKind, label: impl AsRef<str>) {
-		self.emit_with_payload(kind, label.as_ref(), None);
+	fn next_seq(&self) -> u32 {
+		if let Ok(mut seq) = self.state.seq.lock() {
+			let current = *seq;
+			*seq += 1;
+			current
+		} else {
+			0
+		}
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn emit_with_payload(&self, kind: TbEventKind, label: impl AsRef<str>, payload: Option<&[u8]>) {
-		let label = label.as_ref();
-		let seq = crate::instrumentation::active::next_seq();
+	fn emit_internal(
+		&self,
+		event_urn: &crate::utils::urn::Urn<'static>,
+		label: Option<&str>,
+		payload: Option<&[u8]>,
+		duration_ns: Option<u64>,
+	) {
+		let cfg = self.state.config;
+		let seq = self.next_seq();
+
+		// Check overflow
+		if let Ok(events) = self.state.events.lock() {
+			if (events.len() as u32) >= cfg.max_events {
+				return;
+			}
+		}
+
+		let payload_hash = if cfg.enable_payloads {
+			payload.map(hash_payload)
+		} else {
+			None
+		};
+
 		let event = TbEvent {
 			seq,
-			kind,
-			label: Some(label.to_string()),
-			payload_hash: payload.map(hash_payload),
-			duration_ns: None,
+			urn: event_urn.clone().into_owned(), // Convert to 'static for storage
+			label: label.map(|l| l.to_string()),
+			payload_hash,
+			duration_ns: if cfg.record_durations {
+				duration_ns
+			} else {
+				None
+			},
 			flags: 0,
 			extras: None,
 		};
 
 		if let Ok(mut events) = self.state.events.lock() {
-			events.push(event.clone());
+			events.push(event);
 		}
+	}
 
-		let _ = crate::instrumentation::active::emit(kind, Some(label), payload, None, 0, None);
+	#[cfg(feature = "instrument")]
+	pub fn emit(&self, event_urn: &crate::utils::urn::Urn<'static>, label: impl AsRef<str>) {
+		self.emit_with_payload(event_urn, label.as_ref(), None);
+	}
+
+	#[cfg(feature = "instrument")]
+	pub fn emit_with_payload(
+		&self,
+		event_urn: &crate::utils::urn::Urn<'static>,
+		label: impl AsRef<str>,
+		payload: Option<&[u8]>,
+	) {
+		self.emit_internal(event_urn, Some(label.as_ref()), payload, None);
+	}
+
+	#[cfg(feature = "instrument")]
+	pub fn emit_with_timing(
+		&self,
+		event_urn: &crate::utils::urn::Urn<'static>,
+		label: impl AsRef<str>,
+		duration: std::time::Duration,
+	) {
+		self.emit_internal(event_urn, Some(label.as_ref()), None, Some(duration.as_nanos() as u64));
 	}
 
 	/// Drain assertions into a vector
@@ -178,6 +364,19 @@ impl TraceCollector {
 			events.drain(..).collect()
 		} else {
 			Vec::new()
+		}
+	}
+}
+
+impl From<TraceConfig> for TraceCollector {
+	fn from(config: TraceConfig) -> Self {
+		#[cfg(feature = "instrument")]
+		{
+			Self::with_config(config.instrumentation())
+		}
+		#[cfg(not(feature = "instrument"))]
+		{
+			Self::new()
 		}
 	}
 }
@@ -295,8 +494,8 @@ impl ConsumedTrace {
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn count_event_kind(&self, kind: TbEventKind) -> usize {
-		self.instrument_events.iter().filter(|e| e.kind == kind).count()
+	pub fn count_event_urn(&self, event_urn: &crate::utils::urn::Urn<'static>) -> usize {
+		self.instrument_events.iter().filter(|e| &e.urn == event_urn).count()
 	}
 }
 

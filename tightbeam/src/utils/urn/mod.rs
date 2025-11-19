@@ -81,9 +81,13 @@ pub use builders::{UrnBuilder, UrnSpecBuilder};
 pub use error::UrnValidationError;
 pub use spec::{UrnComponents, UrnSpec};
 
+use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
+
 /// RFC 8141 compliant URN structure
 ///
 /// Uses `Cow<'a, str>` for zero-copy string handling.
+///
+/// DER serialization: Encoded as a UTF8String containing the full URN representation "urn:nid:nss".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Urn<'a> {
 	/// Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with letter)
@@ -175,6 +179,57 @@ impl<'a> Urn<'a> {
 impl<'a> fmt::Display for Urn<'a> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "urn:{}:{}", self.nid, self.nss)
+	}
+}
+
+// DER serialization: Urn is encoded as a UTF8String containing "urn:nid:nss"
+impl<'a> Tagged for Urn<'a> {
+	fn tag(&self) -> Tag {
+		Tag::Utf8String
+	}
+}
+
+impl<'a> EncodeValue for Urn<'a> {
+	fn value_len(&self) -> crate::der::Result<crate::der::Length> {
+		let urn_str = format!("urn:{}:{}", self.nid, self.nss);
+		urn_str.value_len()
+	}
+
+	fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
+		let urn_str = format!("urn:{}:{}", self.nid, self.nss);
+		urn_str.encode_value(encoder)
+	}
+}
+
+impl<'a> DecodeValue<'a> for Urn<'a> {
+	fn decode_value<R: crate::der::Reader<'a>>(
+		reader: &mut R,
+		_header: crate::der::Header,
+	) -> crate::der::Result<Self> {
+		let utf8_str = String::decode_value(reader, _header)?;
+		let urn_str = utf8_str.as_str();
+
+		// Parse "urn:nid:nss" format
+		if !urn_str.starts_with("urn:") {
+			return Err(crate::der::ErrorKind::Value { tag: Tag::Utf8String }.into());
+		}
+
+		let rest = &urn_str[4..]; // Skip "urn:"
+		let colon_pos = rest
+			.find(':')
+			.ok_or_else(|| crate::der::ErrorKind::Value { tag: Tag::Utf8String })?;
+
+		let nid = &rest[..colon_pos];
+		let nss = &rest[colon_pos + 1..];
+
+		Ok(Urn { nid: Cow::Owned(nid.to_string()), nss: Cow::Owned(nss.to_string()) })
+	}
+}
+
+impl<'a> Decode<'a> for Urn<'a> {
+	fn decode<R: crate::der::Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+		let header = reader.peek_header()?;
+		Self::decode_value(reader, header)
 	}
 }
 

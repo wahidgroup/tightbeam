@@ -97,15 +97,13 @@ pub fn extract_paths(trace: &ConsumedTrace, process: &Process) -> Vec<ExecutionP
 	let timing_events: Vec<&TbEvent> = {
 		#[cfg(feature = "instrument")]
 		{
+			use crate::instrumentation::event_kinds;
 			trace
 				.instrument_events
 				.iter()
 				.filter(|ev| {
-					matches!(
-						ev.kind,
-						crate::instrumentation::TbEventKind::TimingWcet
-							| crate::instrumentation::TbEventKind::TimingDeadline
-					)
+					ev.urn == event_kinds::TIMING_WCET
+						|| ev.urn == event_kinds::TIMING_DEADLINE
 				})
 				.collect()
 		}
@@ -239,12 +237,13 @@ mod tests {
 		let mut trace = ConsumedTrace::new();
 		#[cfg(feature = "instrument")]
 		{
+			use crate::instrumentation::event_kinds;
 			trace.instrument_events = events
 				.iter()
 				.enumerate()
 				.map(|(idx, (label, duration_ns))| TbEvent {
 					seq: idx as u32 + 1,
-					kind: crate::instrumentation::TbEventKind::TimingWcet,
+					urn: event_kinds::TIMING_WCET,
 					label: Some(label.to_string()),
 					payload_hash: None,
 					duration_ns: Some(*duration_ns),

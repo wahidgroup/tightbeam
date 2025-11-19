@@ -12,8 +12,7 @@ use crate::Errorizable;
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulerType, TaskSet};
 
-#[cfg(feature = "instrument")]
-use crate::instrumentation::TbEventKind;
+// TbEventKind removed - use event_kinds module constants instead
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(not(feature = "std"))]
@@ -137,7 +136,7 @@ pub struct AssertSpecBuilder {
 	tag_filter: Option<Vec<&'static str>>,
 	ordering: Vec<&'static str>,
 	#[cfg(feature = "instrument")]
-	required_events: Vec<TbEventKind>,
+	required_events: Vec<crate::utils::urn::Urn<'static>>,
 	description: Option<&'static str>,
 	#[cfg(feature = "testing-timing")]
 	schedulability: Option<SchedulabilityAssertion>,
@@ -228,12 +227,12 @@ impl AssertSpecBuilder {
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn required_events(mut self, kinds: &[TbEventKind]) -> Self {
+	pub fn required_events(mut self, kinds: &[crate::utils::urn::Urn<'static>]) -> Self {
 		use std::collections::HashSet;
 		let mut seen = HashSet::new();
-		for &k in kinds {
-			if seen.insert(k) {
-				self.required_events.push(k);
+		for k in kinds {
+			if seen.insert(k.clone()) {
+				self.required_events.push(k.clone());
 			}
 		}
 		self
@@ -316,7 +315,7 @@ impl BuiltAssertSpec {
 		version_patch: u16,
 		contracts: &[AssertionContract],
 		tag_filter: Option<&[&'static str]>,
-		#[cfg(feature = "instrument")] events: &[TbEventKind],
+		#[cfg(feature = "instrument")] events: &[crate::utils::urn::Urn<'static>],
 		#[cfg(feature = "testing-timing")] schedulability: Option<&SchedulabilityAssertion>,
 	) -> [u8; 32] {
 		let mut h = Sha3_256::new();
@@ -370,19 +369,22 @@ impl BuiltAssertSpec {
 		}
 		#[cfg(feature = "instrument")]
 		{
-			for ev in events {
-				h.update([*ev as u8]);
+			// Sort events for deterministic hashing (by string representation)
+			let mut sorted_events: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+			sorted_events.sort();
+			for urn_str in sorted_events {
+				h.update(urn_str.as_bytes());
 			}
 		}
 		#[cfg(feature = "testing-timing")]
 		{
-			if let Some(sched) = schedulability {
+			if let Some(schedule) = schedulability {
 				h.update([1u8]); // Has schedulability
-				h.update([sched.task_set.scheduler as u8]);
-				h.update([sched.must_be_schedulable as u8]);
-				h.update((sched.task_set.tasks.len() as u32).to_be_bytes());
+				h.update([schedule.task_set.scheduler as u8]);
+				h.update([schedule.must_be_schedulable as u8]);
+				h.update((schedule.task_set.tasks.len() as u32).to_be_bytes());
 				// Hash task set: sort tasks by ID for deterministic hashing
-				let mut tasks: Vec<_> = sched.task_set.tasks.iter().collect();
+				let mut tasks: Vec<_> = schedule.task_set.tasks.iter().collect();
 				tasks.sort_by(|a, b| a.id.cmp(&b.id));
 				for task in tasks {
 					h.update(task.id.as_bytes());
@@ -422,14 +424,14 @@ impl TBSpec for BuiltAssertSpec {
 		self.inner.gate_decision
 	}
 	#[cfg(feature = "instrument")]
-	fn required_event_kinds(&self) -> &[TbEventKind] {
+	fn required_event_kinds(&self) -> &[crate::utils::urn::Urn<'static>] {
 		&self.inner.required_events
 	}
 	fn validate_trace(&self, _trace: &ConsumedTrace) -> Result<(), SpecViolation> {
 		#[cfg(feature = "testing-timing")]
 		{
-			if let Some(ref sched) = self.inner.schedulability {
-				return Self::check_schedulability(sched);
+			if let Some(ref schedule) = self.inner.schedulability {
+				return Self::check_schedulability(schedule);
 			}
 		}
 		Ok(())
@@ -448,11 +450,11 @@ impl BuiltAssertSpec {
 		};
 
 		match result {
-			Ok(sched_result) => {
-				let is_schedulable = sched_result.is_schedulable;
+			Ok(schedule_result) => {
+				let is_schedulable = schedule_result.is_schedulable;
 				if assertion.must_be_schedulable && !is_schedulable {
 					// Task set must be schedulable but isn't
-					let violations_msg = sched_result
+					let violations_msg = schedule_result
 						.violations
 						.iter()
 						.map(|v| format!("{}: {}", v.task_id, v.message))
@@ -461,8 +463,8 @@ impl BuiltAssertSpec {
 					Err(SpecViolation::SchedulabilityViolation {
 						expected: "schedulable".to_string(),
 						actual: "not schedulable".to_string(),
-						utilization: sched_result.utilization,
-						utilization_bound: sched_result.utilization_bound,
+						utilization: schedule_result.utilization,
+						utilization_bound: schedule_result.utilization_bound,
 						violations: violations_msg,
 					})
 				} else if !assertion.must_be_schedulable && is_schedulable {
@@ -470,8 +472,8 @@ impl BuiltAssertSpec {
 					Err(SpecViolation::SchedulabilityViolation {
 						expected: "not schedulable".to_string(),
 						actual: "schedulable".to_string(),
-						utilization: sched_result.utilization,
-						utilization_bound: sched_result.utilization_bound,
+						utilization: schedule_result.utilization,
+						utilization_bound: schedule_result.utilization_bound,
 						violations: String::new(),
 					})
 				} else {
@@ -653,7 +655,7 @@ macro_rules! __tb_assert_spec_build_all {
 				events: [ $($events_tt:tt)* ],
 			)?
 			$(, tag_filter: [ $( $tag:expr ),* $(,)? ])?
-			$(, schedulability: { $($sched_content:tt)* })?
+			$(, schedulability: { $($schedule_content:tt)* })?
 		)+
 	) => {{
 		#[cfg(feature = "std")]
@@ -670,7 +672,7 @@ macro_rules! __tb_assert_spec_build_all {
 							events: [ $($events_tt)* ],
 						)?
 						$(, tag_filter: [ $( $tag ),* ])?
-						$(, schedulability: { $($sched_content)* })?
+						$(, schedulability: { $($schedule_content)* })?
 					)+
 				);
 				v
@@ -693,7 +695,7 @@ macro_rules! __tb_assert_spec_build_all {
 							events: [ $($events_tt)* ],
 						)?
 						$(, tag_filter: [ $( $tag ),* ])?
-						$(, schedulability: { $($sched_content)* })?
+						$(, schedulability: { $($schedule_content)* })?
 					)+
 				);
 				unsafe { VEC = Some(v); }
@@ -717,7 +719,7 @@ macro_rules! __tb_assert_spec_build_all_impl {
 				events: [ $($events_tt:tt)* ],
 			)?
 			$(, tag_filter: [ $( $tag:expr ),* $(,)? ])?
-			$(, schedulability: { $($sched_content:tt)* })?
+			$(, schedulability: { $($schedule_content:tt)* })?
 		)+
 	) => {
 		$(
@@ -728,7 +730,7 @@ macro_rules! __tb_assert_spec_build_all_impl {
 					events: [ $($events_tt:tt)* ],
 				)?
 				$(, tag_filter: [ $( $tag ),* ])?
-				$(, schedulability: { $($sched_content)* })?
+				$(, schedulability: { $($schedule_content)* })?
 			);
 		)+
 	};
@@ -745,7 +747,7 @@ macro_rules! __tb_assert_spec_build_all_impl_with_events {
 			events: [ $($events_tt:tt)* ],
 		)?
 		$(, tag_filter: [ $( $tag:expr ),* ])?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		// Use @expand_events which handles nested repetition correctly
 		// Description is handled separately in @build_with_events via $desc_opt parameter
@@ -757,7 +759,7 @@ macro_rules! __tb_assert_spec_build_all_impl_with_events {
 				events_tt: [ $($events_tt:tt)* ],
 			)?
 			$( tag_filter: [ $( $tag ),* ])?
-			$(, schedulability: { $($sched_content)* })?
+			$(, schedulability: { $($schedule_content)* })?
 		}
 	}};
 }
@@ -777,7 +779,7 @@ macro_rules! __tb_assert_spec_build {
 		)?
 		$(tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		// Expand events token tree to avoid nested repetition issues
 		$crate::__tb_assert_spec_build! {
@@ -789,7 +791,7 @@ macro_rules! __tb_assert_spec_build {
 			)?
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, description: $desc)?
-			$(, schedulability: { $($sched_content)* })?
+			$(, schedulability: { $($schedule_content)* })?
 		}
 	}};
 	// Expand events and build - separate arms for events vs no events
@@ -800,7 +802,7 @@ macro_rules! __tb_assert_spec_build {
 		assertions: [ $( $assertion:tt ),* ],
 		events_tt: [ $($events_tt:tt)* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {
 		$crate::__tb_assert_spec_build! {
 			@build_with_events_expanded
@@ -808,7 +810,7 @@ macro_rules! __tb_assert_spec_build {
 			assertions: [ $( $assertion ),* ],
 			events_tt: [ $($events_tt:tt)* ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
-			$(, schedulability: { $($sched_content)* })?
+			$(, schedulability: { $($schedule_content)* })?
 		}
 	};
 	// No events case
@@ -816,7 +818,7 @@ macro_rules! __tb_assert_spec_build {
 		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
 		assertions: [ $( $assertion:tt ),* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {
 		$crate::__tb_assert_spec_build! {
 			@build_with_events
@@ -824,7 +826,7 @@ macro_rules! __tb_assert_spec_build {
 			assertions: [ $( $assertion ),* ],
 			events: [ ],
 			$( tag_filter: [ $( $tag ),* ])?
-			$(, schedulability: { $($sched_content)* })?
+			$(, schedulability: { $($schedule_content)* })?
 		}
 	};
 	// Legacy pattern without desc_opt (for backward compatibility)
@@ -836,7 +838,7 @@ macro_rules! __tb_assert_spec_build {
 		)?
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {
 		$(
 			// Has events - expand events_tt here
@@ -847,7 +849,7 @@ macro_rules! __tb_assert_spec_build {
 				events_tt: [ $($events_tt:tt)* ],
 				$( tag_filter: [ $( $tag ),* $(,)? ])?
 				$(, description: $desc)?
-				$(, schedulability: { $($sched_content)* })?
+				$(, schedulability: { $($schedule_content)* })?
 			}
 		)?
 		$(
@@ -859,7 +861,7 @@ macro_rules! __tb_assert_spec_build {
 				events: [ ],
 				$( tag_filter: [ $( $tag ),* $(,)? ])?
 				$(, description: $desc)?
-				$(, schedulability: { $($sched_content)* })?
+				$(, schedulability: { $($schedule_content)* })?
 			}
 		)?
 	};
@@ -869,7 +871,7 @@ macro_rules! __tb_assert_spec_build {
 		events_tt: [ $( $ev:ident ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		$crate::__tb_assert_spec_build! {
 			@build_with_events
@@ -878,7 +880,7 @@ macro_rules! __tb_assert_spec_build {
 			events: [ $( $ev ),* $(,)? ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, description: $desc)?
-			$(, schedulability: { $($sched_content)* })?
+			$(, schedulability: { $($schedule_content)* })?
 		}
 	}};
 	// Handle token tree events (from __tb_assert_spec_build_all_impl_with_events)
@@ -888,7 +890,7 @@ macro_rules! __tb_assert_spec_build {
 		events_tt: [ $($events_tt:tt)* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		// Recursively expand token tree to identifiers
 		$crate::__tb_assert_spec_build! {
@@ -898,7 +900,7 @@ macro_rules! __tb_assert_spec_build {
 			events_tt: [ $($events_tt)* ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, description: $desc)?
-			$(, schedulability: { $($sched_content)* })?
+			$(, schedulability: { $($schedule_content)* })?
 		}
 	}};
 	// Legacy pattern without desc_opt (for backward compatibility)
@@ -908,7 +910,7 @@ macro_rules! __tb_assert_spec_build {
 		events_tt: [ $($events_tt:tt)* ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		// Recursively expand token tree to identifiers
 		$crate::__tb_assert_spec_build! {
@@ -918,16 +920,16 @@ macro_rules! __tb_assert_spec_build {
 			events_tt: [ $($events_tt)* ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, description: $desc)?
-			$(, schedulability: { $($sched_content)* })?
+			$(, schedulability: { $($schedule_content)* })?
 		}
 	}};
 	(@build_with_events
 		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
 		assertions: [ $( $assertion:tt ),* ],
-		events: [ $( $ev:ident ),* $(,)? ],
+		events: [ $( $ev:expr ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
@@ -953,13 +955,13 @@ macro_rules! __tb_assert_spec_build {
 		#[cfg(feature = "instrument")]
 		{
 			$(
-				builder = builder.required_events(&[$crate::instrumentation::TbEventKind::$ev]);
+				builder = builder.required_events(&[$ev.clone()]);
 			)*
 		}
 		$(
 			#[cfg(feature = "testing-timing")]
 			{
-				$crate::__tb_assert_spec_parse_schedulability!(builder, $($sched_content)*);
+				$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
 			}
 		)?
 		$vec.push(builder.build());
@@ -971,7 +973,7 @@ macro_rules! __tb_assert_spec_build {
 		events_tt: [ ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
-		$(, schedulability: { $($sched_content:tt)* })?
+		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
 		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
 		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
@@ -997,7 +999,7 @@ macro_rules! __tb_assert_spec_build {
 		$(
 			#[cfg(feature = "testing-timing")]
 			{
-				$crate::__tb_assert_spec_parse_schedulability!(builder, $($sched_content)*);
+				$crate::__tb_assert_spec_parse_schedulability!(builder, $($schedule_content)*);
 			}
 		)?
 		$vec.push(builder.build());
@@ -1071,7 +1073,7 @@ macro_rules! tb_assert_spec {
 			$( tag_filter: [ $( $tag:expr ),* $(,)? ], )?
 			assertions: [ $( $assertion:tt ),* $(,)? ]
 			$(, events: [ $($events_tt:tt)* ])?
-			$(, schedulability: { $($sched_content:tt)* })?
+			$(, schedulability: { $($schedule_content:tt)* })?
 		} ),+ $(,)?
 		$(, annotations { description: $desc:expr })?
 	) => {
@@ -1090,7 +1092,7 @@ macro_rules! tb_assert_spec {
 							events: [ $($events_tt:tt)* ],
 						)?
 						$(, tag_filter: [ $( $tag ),* ])?
-						$(, schedulability: { $($sched_content)* })?
+						$(, schedulability: { $($schedule_content)* })?
 					)+
 				)
 			}

@@ -8,7 +8,7 @@ use super::deadline::Deadline;
 use super::path::extract_paths;
 use super::violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 use crate::der::Sequence;
-use crate::instrumentation::{TbEvent, TbEventKind};
+use crate::instrumentation::{TbEvent, event_kinds};
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process};
 use crate::trace::ConsumedTrace;
@@ -67,6 +67,7 @@ impl TimingConstraints {
 	}
 
 	/// Extract timing events from trace
+	/// Looks for events with duration_ns set (timing information)
 	fn extract_timing_events(trace: &ConsumedTrace) -> Vec<&TbEvent> {
 		#[cfg(feature = "instrument")]
 		{
@@ -74,10 +75,11 @@ impl TimingConstraints {
 				.instrument_events
 				.iter()
 				.filter(|ev| {
-					matches!(
-						ev.kind,
-						TbEventKind::TimingWcet | TbEventKind::TimingDeadline | TbEventKind::TimingJitter
-					)
+					// Include events with timing URNs or any event with duration_ns set
+					ev.urn == event_kinds::TIMING_WCET
+						|| ev.urn == event_kinds::TIMING_DEADLINE
+						|| ev.urn == event_kinds::TIMING_JITTER
+						|| ev.duration_ns.is_some()
 				})
 				.collect()
 		}
@@ -110,8 +112,12 @@ impl TimingConstraints {
 				let wcet_ns = wcet_config.duration.as_nanos() as u64;
 				let event_label = event.0;
 				if let Some(events) = events_by_label.get(event_label) {
-					let wcet_events: Vec<&TbEvent> =
-						events.iter().filter(|e| e.kind == TbEventKind::TimingWcet).copied().collect();
+					// Filter for timing-wcet URN or any event with duration_ns (from builder pattern)
+					let wcet_events: Vec<&TbEvent> = events
+						.iter()
+						.filter(|e| e.urn == event_kinds::TIMING_WCET || e.duration_ns.is_some())
+						.copied()
+						.collect();
 
 					// If percentile is specified, use statistical analysis
 					if let Some(percentile) = wcet_config.percentile {
@@ -194,13 +200,24 @@ impl TimingConstraints {
 			let start_label = deadline.start_event.0;
 			let end_label = deadline.end_event.0;
 
+			// Filter for timing-deadline URN or any event with duration_ns
 			let start_events: Vec<&TbEvent> = events_by_label
 				.get(start_label)
-				.map(|v| v.iter().filter(|e| e.kind == TbEventKind::TimingDeadline).copied().collect())
+				.map(|v| {
+					v.iter()
+						.filter(|e| e.urn == event_kinds::TIMING_DEADLINE || e.duration_ns.is_some())
+						.copied()
+						.collect()
+				})
 				.unwrap_or_default();
 			let end_events: Vec<&TbEvent> = events_by_label
 				.get(end_label)
-				.map(|v| v.iter().filter(|e| e.kind == TbEventKind::TimingDeadline).copied().collect())
+				.map(|v| {
+					v.iter()
+						.filter(|e| e.urn == event_kinds::TIMING_DEADLINE || e.duration_ns.is_some())
+						.copied()
+						.collect()
+				})
 				.unwrap_or_default();
 
 			Self::check_deadline_pairs(deadline, deadline_ns, &start_events, &end_events, result);
@@ -395,9 +412,11 @@ mod tests {
 
 	use super::*;
 	use crate::builder::TypeBuilder;
+	use crate::instrumentation::event_kinds;
 	use crate::testing::specs::csp::{Process, State};
 	use crate::testing::timing::{DeadlineBuilder, PathWcet, WcetConfig, WcetConfigBuilder};
 	use crate::utils::jitter::VarianceJitter;
+	use crate::utils::urn::Urn;
 
 	// ========================================================================
 	// Test Case Data Structures
@@ -406,7 +425,7 @@ mod tests {
 	/// Test case for WCET constraint verification
 	struct WcetTestCase {
 		constraint_ms: u64,
-		events: &'static [(TbEventKind, &'static str, u64)], // (kind, label, duration_ns)
+		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, duration_ns)
 		expected_passed: bool,
 		expected_violations: usize,
 	}
@@ -417,7 +436,7 @@ mod tests {
 		start_event: &'static str,
 		end_event: &'static str,
 		min_slack_ms: Option<u64>,
-		events: &'static [(TbEventKind, &'static str, u64)], // (kind, label, duration_ns)
+		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, duration_ns)
 		expected_passed: bool,
 		expected_deadline_misses: usize,
 		expected_slack_violations: usize,
@@ -427,7 +446,7 @@ mod tests {
 	struct JitterTestCase {
 		max_jitter_ms: u64,
 		event_label: &'static str,
-		events: &'static [(TbEventKind, &'static str, u64)], // (kind, label, duration_ns)
+		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, duration_ns)
 		expected_passed: bool,
 		expected_violations: usize,
 	}
@@ -439,22 +458,22 @@ mod tests {
 	const WCET_TEST_CASES: &[WcetTestCase] = &[
 		WcetTestCase {
 			constraint_ms: 100,
-			events: &[(TbEventKind::TimingWcet, "process", 50_000_000)],
+			events: &[(event_kinds::TIMING_WCET, "process", 50_000_000)],
 			expected_passed: true,
 			expected_violations: 0,
 		},
 		WcetTestCase {
 			constraint_ms: 100,
-			events: &[(TbEventKind::TimingWcet, "process", 150_000_000)],
+			events: &[(event_kinds::TIMING_WCET, "process", 150_000_000)],
 			expected_passed: false,
 			expected_violations: 1,
 		},
 		WcetTestCase {
 			constraint_ms: 100,
 			events: &[
-				(TbEventKind::TimingWcet, "process", 50_000_000),
-				(TbEventKind::TimingWcet, "process", 150_000_000),
-				(TbEventKind::TimingWcet, "process", 80_000_000),
+				(event_kinds::TIMING_WCET, "process", 50_000_000),
+				(event_kinds::TIMING_WCET, "process", 150_000_000),
+				(event_kinds::TIMING_WCET, "process", 80_000_000),
 			],
 			expected_passed: false,
 			expected_violations: 1,
@@ -462,13 +481,13 @@ mod tests {
 		WcetTestCase { constraint_ms: 100, events: &[], expected_passed: true, expected_violations: 0 },
 		WcetTestCase {
 			constraint_ms: 100,
-			events: &[(TbEventKind::TimingWcet, "process", 100_000_000)],
+			events: &[(event_kinds::TIMING_WCET, "process", 100_000_000)],
 			expected_passed: true,
 			expected_violations: 0,
 		},
 		WcetTestCase {
 			constraint_ms: 100,
-			events: &[(TbEventKind::TimingDeadline, "process", 150_000_000)],
+			events: &[(event_kinds::TIMING_DEADLINE, "process", 150_000_000)],
 			expected_passed: true,
 			expected_violations: 0,
 		},
@@ -481,8 +500,8 @@ mod tests {
 			end_event: "end",
 			min_slack_ms: None,
 			events: &[
-				(TbEventKind::TimingDeadline, "start", 0),
-				(TbEventKind::TimingDeadline, "end", 50_000_000),
+				(event_kinds::TIMING_DEADLINE, "start", 0),
+				(event_kinds::TIMING_DEADLINE, "end", 50_000_000),
 			],
 			expected_passed: true,
 			expected_deadline_misses: 0,
@@ -494,23 +513,8 @@ mod tests {
 			end_event: "end",
 			min_slack_ms: None,
 			events: &[
-				(TbEventKind::TimingDeadline, "start", 0),
-				(TbEventKind::TimingDeadline, "end", 150_000_000),
-			],
-			expected_passed: false,
-			expected_deadline_misses: 1,
-			expected_slack_violations: 0,
-		},
-		DeadlineTestCase {
-			deadline_ms: 100,
-			start_event: "start",
-			end_event: "end",
-			min_slack_ms: None,
-			events: &[
-				(TbEventKind::TimingDeadline, "start", 0),
-				(TbEventKind::TimingDeadline, "end", 50_000_000),
-				(TbEventKind::TimingDeadline, "start", 200_000_000),
-				(TbEventKind::TimingDeadline, "end", 350_000_000),
+				(event_kinds::TIMING_DEADLINE, "start", 0),
+				(event_kinds::TIMING_DEADLINE, "end", 150_000_000),
 			],
 			expected_passed: false,
 			expected_deadline_misses: 1,
@@ -521,7 +525,22 @@ mod tests {
 			start_event: "start",
 			end_event: "end",
 			min_slack_ms: None,
-			events: &[(TbEventKind::TimingDeadline, "end", 50_000_000)],
+			events: &[
+				(event_kinds::TIMING_DEADLINE, "start", 0),
+				(event_kinds::TIMING_DEADLINE, "end", 50_000_000),
+				(event_kinds::TIMING_DEADLINE, "start", 200_000_000),
+				(event_kinds::TIMING_DEADLINE, "end", 350_000_000),
+			],
+			expected_passed: false,
+			expected_deadline_misses: 1,
+			expected_slack_violations: 0,
+		},
+		DeadlineTestCase {
+			deadline_ms: 100,
+			start_event: "start",
+			end_event: "end",
+			min_slack_ms: None,
+			events: &[(event_kinds::TIMING_DEADLINE, "end", 50_000_000)],
 			expected_passed: true,
 			expected_deadline_misses: 0,
 			expected_slack_violations: 0,
@@ -531,7 +550,7 @@ mod tests {
 			start_event: "start",
 			end_event: "end",
 			min_slack_ms: None,
-			events: &[(TbEventKind::TimingDeadline, "start", 0)],
+			events: &[(event_kinds::TIMING_DEADLINE, "start", 0)],
 			expected_passed: true,
 			expected_deadline_misses: 0,
 			expected_slack_violations: 0,
@@ -542,8 +561,8 @@ mod tests {
 			end_event: "end",
 			min_slack_ms: None,
 			events: &[
-				(TbEventKind::TimingDeadline, "start", 0),
-				(TbEventKind::TimingDeadline, "end", 100_000_000),
+				(event_kinds::TIMING_DEADLINE, "start", 0),
+				(event_kinds::TIMING_DEADLINE, "end", 100_000_000),
 			],
 			expected_passed: true,
 			expected_deadline_misses: 0,
@@ -555,8 +574,8 @@ mod tests {
 			end_event: "end",
 			min_slack_ms: Some(20),
 			events: &[
-				(TbEventKind::TimingDeadline, "start", 0),
-				(TbEventKind::TimingDeadline, "end", 50_000_000),
+				(event_kinds::TIMING_DEADLINE, "start", 0),
+				(event_kinds::TIMING_DEADLINE, "end", 50_000_000),
 			],
 			expected_passed: true,
 			expected_deadline_misses: 0,
@@ -568,8 +587,8 @@ mod tests {
 			end_event: "end",
 			min_slack_ms: Some(20),
 			events: &[
-				(TbEventKind::TimingDeadline, "start", 0),
-				(TbEventKind::TimingDeadline, "end", 85_000_000),
+				(event_kinds::TIMING_DEADLINE, "start", 0),
+				(event_kinds::TIMING_DEADLINE, "end", 85_000_000),
 			],
 			expected_passed: false,
 			expected_deadline_misses: 0,
@@ -581,8 +600,8 @@ mod tests {
 			end_event: "end",
 			min_slack_ms: Some(20),
 			events: &[
-				(TbEventKind::TimingDeadline, "start", 0),
-				(TbEventKind::TimingDeadline, "end", 150_000_000),
+				(event_kinds::TIMING_DEADLINE, "start", 0),
+				(event_kinds::TIMING_DEADLINE, "end", 150_000_000),
 			],
 			expected_passed: false,
 			expected_deadline_misses: 1,
@@ -595,9 +614,9 @@ mod tests {
 			max_jitter_ms: 50,
 			event_label: "process",
 			events: &[
-				(TbEventKind::TimingJitter, "process", 10_000_000),
-				(TbEventKind::TimingJitter, "process", 12_000_000),
-				(TbEventKind::TimingJitter, "process", 11_000_000),
+				(event_kinds::TIMING_JITTER, "process", 10_000_000),
+				(event_kinds::TIMING_JITTER, "process", 12_000_000),
+				(event_kinds::TIMING_JITTER, "process", 11_000_000),
 			],
 			expected_passed: true,
 			expected_violations: 0,
@@ -606,9 +625,9 @@ mod tests {
 			max_jitter_ms: 50,
 			event_label: "process",
 			events: &[
-				(TbEventKind::TimingJitter, "process", 10_000_000),
-				(TbEventKind::TimingJitter, "process", 70_000_000),
-				(TbEventKind::TimingJitter, "process", 15_000_000),
+				(event_kinds::TIMING_JITTER, "process", 10_000_000),
+				(event_kinds::TIMING_JITTER, "process", 70_000_000),
+				(event_kinds::TIMING_JITTER, "process", 15_000_000),
 			],
 			expected_passed: false,
 			expected_violations: 1,
@@ -616,7 +635,7 @@ mod tests {
 		JitterTestCase {
 			max_jitter_ms: 50,
 			event_label: "process",
-			events: &[(TbEventKind::TimingJitter, "process", 10_000_000)],
+			events: &[(event_kinds::TIMING_JITTER, "process", 10_000_000)],
 			expected_passed: true,
 			expected_violations: 0,
 		},
@@ -627,10 +646,10 @@ mod tests {
 	// ========================================================================
 
 	/// Create a timing event with duration
-	fn timing_event(kind: TbEventKind, label: &str, duration_ns: u64, seq: u32) -> TbEvent {
+	fn timing_event(event_urn: Urn<'static>, label: &str, duration_ns: u64, seq: u32) -> TbEvent {
 		TbEvent {
 			seq,
-			kind,
+			urn: event_urn,
 			label: Some(label.to_string()),
 			payload_hash: None,
 			duration_ns: Some(duration_ns),
@@ -655,18 +674,28 @@ mod tests {
 	}
 
 	/// Build events from test case data
-	fn build_events(events: &'static [(TbEventKind, &'static str, u64)]) -> Vec<TbEvent> {
+	fn build_events(events: &'static [(Urn<'static>, &'static str, u64)]) -> Vec<TbEvent> {
 		events
 			.iter()
 			.enumerate()
-			.map(|(seq, (kind, label, duration_ns))| timing_event(*kind, label, *duration_ns, seq as u32))
+			.map(|(seq, (event_urn, label, duration_ns))| {
+				TbEvent {
+					seq: seq as u32,
+					urn: event_urn.clone(),
+					label: Some(label.to_string()),
+					payload_hash: None,
+					duration_ns: Some(*duration_ns),
+					flags: 0,
+					extras: None,
+				}
+			})
 			.collect()
 	}
 
 	/// Common verification pattern: setup constraints, create trace, verify, assert
 	fn verify_constraints<F>(
 		setup: F,
-		events: &'static [(TbEventKind, &'static str, u64)],
+		events: &'static [(Urn<'static>, &'static str, u64)],
 	) -> Result<TimingVerificationResult, TestingError>
 	where
 		F: FnOnce(&mut TimingConstraints) -> Result<(), TestingError>,
@@ -780,7 +809,7 @@ mod tests {
 		{
 			trace.instrument_events.push(TbEvent {
 				seq: 0,
-				kind: TbEventKind::TimingWcet,
+				urn: event_kinds::TIMING_WCET,
 				label: Some("process".to_string()),
 				payload_hash: None,
 				duration_ns: None, // No duration
@@ -827,11 +856,11 @@ mod tests {
 		setup_combined_constraints(&mut constraints)?;
 
 		let trace = trace_with_events(vec![
-			timing_event(TbEventKind::TimingWcet, "process", 50_000_000, 0),
-			timing_event(TbEventKind::TimingJitter, "request", 10_000_000, 1),
-			timing_event(TbEventKind::TimingJitter, "request", 12_000_000, 2),
-			timing_event(TbEventKind::TimingDeadline, "start", 0, 3),
-			timing_event(TbEventKind::TimingDeadline, "end", 100_000_000, 4),
+			timing_event(event_kinds::TIMING_WCET, "process", 50_000_000, 0),
+			timing_event(event_kinds::TIMING_JITTER, "request", 10_000_000, 1),
+			timing_event(event_kinds::TIMING_JITTER, "request", 12_000_000, 2),
+			timing_event(event_kinds::TIMING_DEADLINE, "start", 0, 3),
+			timing_event(event_kinds::TIMING_DEADLINE, "end", 100_000_000, 4),
 		]);
 
 		let result = constraints.verify(&trace)?;
@@ -848,11 +877,11 @@ mod tests {
 		setup_combined_constraints(&mut constraints)?;
 
 		let trace = trace_with_events(vec![
-			timing_event(TbEventKind::TimingWcet, "process", 150_000_000, 0), // WCET violation
-			timing_event(TbEventKind::TimingJitter, "request", 10_000_000, 1),
-			timing_event(TbEventKind::TimingJitter, "request", 70_000_000, 2), // Jitter violation
-			timing_event(TbEventKind::TimingDeadline, "start", 0, 3),
-			timing_event(TbEventKind::TimingDeadline, "end", 250_000_000, 4), // Deadline violation
+			timing_event(event_kinds::TIMING_WCET, "process", 150_000_000, 0), // WCET violation
+			timing_event(event_kinds::TIMING_JITTER, "request", 10_000_000, 1),
+			timing_event(event_kinds::TIMING_JITTER, "request", 70_000_000, 2), // Jitter violation
+			timing_event(event_kinds::TIMING_DEADLINE, "start", 0, 3),
+			timing_event(event_kinds::TIMING_DEADLINE, "end", 250_000_000, 4), // Deadline violation
 		]);
 
 		let result = constraints.verify(&trace)?;
@@ -870,7 +899,7 @@ mod tests {
 	#[test]
 	fn test_empty_constraints() -> Result<(), TestingError> {
 		let constraints = TimingConstraints::default();
-		let event = timing_event(TbEventKind::TimingWcet, "process", 50_000_000, 0);
+		let event = timing_event(event_kinds::TIMING_WCET, "process", 50_000_000, 0);
 		let trace = trace_with_events(vec![event]);
 
 		let result = constraints.verify(&trace)?;
@@ -898,9 +927,9 @@ mod tests {
 
 		// Durations: [10ms, 20ms, 15ms] - variance-based jitter
 		let trace = trace_with_events(vec![
-			timing_event(TbEventKind::TimingJitter, "process", 10_000_000, 0),
-			timing_event(TbEventKind::TimingJitter, "process", 20_000_000, 1),
-			timing_event(TbEventKind::TimingJitter, "process", 15_000_000, 2),
+			timing_event(event_kinds::TIMING_JITTER, "process", 10_000_000, 0),
+			timing_event(event_kinds::TIMING_JITTER, "process", 20_000_000, 1),
+			timing_event(event_kinds::TIMING_JITTER, "process", 15_000_000, 2),
 		]);
 
 		// Result depends on variance calculation - just verify it doesn't panic
@@ -976,9 +1005,9 @@ mod tests {
 		constraints.add_path_wcet(create_test_path_wcet(case.max_duration_ms));
 
 		let trace = trace_with_events(vec![
-			timing_event(TbEventKind::TimingWcet, "start", case.start_duration_ns, 0),
-			timing_event(TbEventKind::TimingWcet, "process", case.process_duration_ns, 1),
-			timing_event(TbEventKind::TimingWcet, "end", case.end_duration_ns, 2),
+			timing_event(event_kinds::TIMING_WCET, "start", case.start_duration_ns, 0),
+			timing_event(event_kinds::TIMING_WCET, "process", case.process_duration_ns, 1),
+			timing_event(event_kinds::TIMING_WCET, "end", case.end_duration_ns, 2),
 		]);
 
 		let result = constraints.verify_with_process(&trace, Some(&process))?;
@@ -1010,9 +1039,9 @@ mod tests {
 		constraints.add_path_wcet(create_test_path_wcet(50));
 
 		let trace = trace_with_events(vec![
-			timing_event(TbEventKind::TimingWcet, "start", 10_000_000, 0),
-			timing_event(TbEventKind::TimingWcet, "process", 30_000_000, 1),
-			timing_event(TbEventKind::TimingWcet, "end", 15_000_000, 2),
+			timing_event(event_kinds::TIMING_WCET, "start", 10_000_000, 0),
+			timing_event(event_kinds::TIMING_WCET, "process", 30_000_000, 1),
+			timing_event(event_kinds::TIMING_WCET, "end", 15_000_000, 2),
 		]);
 
 		// Without process, path WCET is not checked

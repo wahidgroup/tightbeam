@@ -16,52 +16,80 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crate::der::Enumerated)]
-#[repr(u8)]
-pub enum TbEventKind {
-	Start = 0,
-	End = 1,
-	GateAccept = 2,
-	GateReject = 3,
-	RequestRecv = 4,
-	ResponseSend = 5,
-	AssertLabel = 6,
-	AssertPayload = 7,
-	HandlerEnter = 8,
-	HandlerExit = 9,
-	CryptoStep = 10,
-	CompressStep = 11,
-	RouteStep = 12,
-	PolicyEval = 13,
-	ProcessTransition = 14,
-	ProcessHidden = 15,
-	SeedStart = 16,
-	SeedEnd = 17,
-	StateExpand = 18,
-	StatePrune = 19,
-	DivergenceDetect = 20,
-	RefusalSnapshot = 21,
-	EnabledSetSample = 22,
-	Warn = 23,
-	Error = 24,
+use crate::utils::urn::Urn;
+
+/// Event kind URN constants for tightbeam instrumentation events
+///
+/// These constants provide convenient access to URNs for all event types.
+/// Format: `urn:tightbeam:instrumentation:event/<event-name>`
+pub mod event_kinds {
+	use super::*;
+
+	// Core lifecycle events
+	pub const START: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/start");
+	pub const END: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/end");
+
+	// Gate events
+	pub const GATE_ACCEPT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/gate-accept");
+	pub const GATE_REJECT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/gate-reject");
+
+	// Transport events
+	pub const REQUEST_RECV: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/request-recv");
+	pub const RESPONSE_SEND: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/response-send");
+
+	// Assertion events
+	pub const ASSERT_LABEL: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/assert-label");
+	pub const ASSERT_PAYLOAD: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/assert-payload");
+
+	// Handler events
+	pub const HANDLER_ENTER: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/handler-enter");
+	pub const HANDLER_EXIT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/handler-exit");
+
+	// Processing events
+	pub const CRYPTO_STEP: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/crypto-step");
+	pub const COMPRESS_STEP: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/compress-step");
+	pub const ROUTE_STEP: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/route-step");
+	pub const POLICY_EVAL: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/policy-eval");
+
+	// Process events
+	pub const PROCESS_TRANSITION: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/process-transition");
+	pub const PROCESS_HIDDEN: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/process-hidden");
+
+	// FDR/exploration events
+	pub const SEED_START: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/seed-start");
+	pub const SEED_END: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/seed-end");
+	pub const STATE_EXPAND: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/state-expand");
+	pub const STATE_PRUNE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/state-prune");
+	pub const DIVERGENCE_DETECT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/divergence-detect");
+	pub const REFUSAL_SNAPSHOT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/refusal-snapshot");
+	pub const ENABLED_SET_SAMPLE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/enabled-set-sample");
+
+	// Error events
+	pub const WARN: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/warn");
+	pub const ERROR: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/error");
+
 	// Timing events
-	TimingWcet = 25,
-	TimingDeadline = 26,
-	TimingJitter = 27,
-	TimingSlack = 28,
+	pub const TIMING_WCET: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/timing-wcet");
+	pub const TIMING_DEADLINE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/timing-deadline");
+	pub const TIMING_JITTER: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/timing-jitter");
+	pub const TIMING_SLACK: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/timing-slack");
+
 	// Fault events
-	FaultInjected = 29,
-	FaultRecovered = 30,
-	FaultDetected = 31,
+	pub const FAULT_INJECTED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/fault-injected");
+	pub const FAULT_RECOVERED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/fault-recovered");
+	pub const FAULT_DETECTED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/fault-detected");
+
 	// Schedulability events
-	TaskRelease = 32,
-	TaskComplete = 33,
-	TaskMissedDeadline = 34,
+	pub const TASK_RELEASE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/task-release");
+	pub const TASK_COMPLETE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/task-complete");
+	pub const TASK_MISSED_DEADLINE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/task-missed-deadline");
+
 	// Scheduler events
-	SchedulerAllocate = 35,
-	SchedulerRelease = 36,
-	SchedulerBlocked = 37,
+	pub const SCHEDULER_ALLOCATE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/scheduler-allocate");
+	pub const SCHEDULER_RELEASE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/scheduler-release");
+	pub const SCHEDULER_BLOCKED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/scheduler-blocked");
 }
+
 #[cfg(not(feature = "instrument"))]
 pub mod stub {
 	use super::*;
@@ -73,7 +101,7 @@ pub mod stub {
 	#[derive(Clone, Debug)]
 	pub struct TbEvent {
 		pub seq: u32,
-		pub kind: TbEventKind,
+		pub urn: Urn<'static>,
 		pub label: Option<String>,
 		pub payload_hash: Option<[u8; 32]>,
 		pub duration_ns: Option<u64>,
@@ -122,28 +150,145 @@ pub mod stub {
 
 #[cfg(feature = "instrument")]
 pub mod active {
-	use super::*;
-
-	use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-	use std::sync::{Arc, Mutex, OnceLock};
-
 	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::der::asn1::OctetString;
+	use crate::der::{Decode, Encode, FixedTag, Sequence, Tag};
+	use crate::utils::urn::Urn;
+	use crate::Beamable;
 	use crate::TightBeamError;
 
-	#[derive(Clone, Debug, crate::der::Sequence)]
+	#[derive(Clone, Debug, PartialEq)]
 	pub struct TbEvent {
 		pub seq: u32,
-		pub kind: TbEventKind,
-		#[asn1(optional = "true")]
+		pub urn: Urn<'static>,
 		pub label: Option<String>,
-		#[asn1(optional = "true")]
 		pub payload_hash: Option<[u8; 32]>,
-		#[asn1(optional = "true")]
 		pub duration_ns: Option<u64>,
 		pub flags: u32,
-		#[asn1(optional = "true")]
 		pub extras: Option<Vec<u8>>,
+	}
+
+	// Manual DER implementation: Sequence derive can't handle Urn<'static>
+	// lifetime
+	impl FixedTag for TbEvent {
+		const TAG: Tag = Tag::Sequence;
+	}
+
+	impl crate::der::EncodeValue for TbEvent {
+		fn value_len(&self) -> crate::der::Result<crate::der::Length> {
+			let mut len = match self.seq.encoded_len() {
+				Ok(l) => l,
+				Err(e) => return Err(e),
+			};
+
+			// Encode Urn as UTF8String (format as "urn:nid:nss")
+			let urn_str = format!("urn:{}:{}", self.urn.nid, self.urn.nss);
+			len = match urn_str.encoded_len() {
+				Ok(l) => (len + l)?,
+				Err(e) => return Err(e),
+			};
+
+			if let Some(ref label) = self.label {
+				len = match label.encoded_len() {
+					Ok(l) => (len + l)?,
+					Err(e) => return Err(e),
+				};
+			}
+			if let Some(ref payload_hash) = self.payload_hash {
+				let os = match crate::der::asn1::OctetString::new(payload_hash.as_slice()) {
+					Ok(o) => o,
+					Err(e) => return Err(e),
+				};
+				len = match os.encoded_len() {
+					Ok(l) => (len + l)?,
+					Err(e) => return Err(e),
+				};
+			}
+			if let Some(duration_ns) = self.duration_ns {
+				len = match duration_ns.encoded_len() {
+					Ok(l) => (len + l)?,
+					Err(e) => return Err(e),
+				};
+			}
+
+			len = match self.flags.encoded_len() {
+				Ok(l) => (len + l)?,
+				Err(e) => return Err(e),
+			};
+
+			if let Some(ref extras) = self.extras {
+				let os = match crate::der::asn1::OctetString::new(extras.as_slice()) {
+					Ok(o) => o,
+					Err(e) => return Err(e),
+				};
+				len = match os.encoded_len() {
+					Ok(l) => (len + l)?,
+					Err(e) => return Err(e),
+				};
+			}
+
+			Ok(len)
+		}
+
+		fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
+			self.seq.encode(encoder)?;
+
+			// Encode Urn as UTF8String (format as "urn:nid:nss")
+			let urn_str = format!("urn:{}:{}", self.urn.nid, self.urn.nss);
+			urn_str.encode(encoder)?;
+
+			if let Some(ref label) = self.label {
+				label.encode(encoder)?;
+			}
+			if let Some(ref payload_hash) = self.payload_hash {
+				let os = crate::der::asn1::OctetString::new(payload_hash.as_slice())?;
+				os.encode(encoder)?;
+			}
+			if let Some(duration_ns) = self.duration_ns {
+				duration_ns.encode(encoder)?;
+			}
+
+			self.flags.encode(encoder)?;
+
+			if let Some(ref extras) = self.extras {
+				let os = crate::der::asn1::OctetString::new(extras.as_slice())?;
+				os.encode(encoder)?;
+			}
+
+			Ok(())
+		}
+	}
+
+	impl<'a> crate::der::DecodeValue<'a> for TbEvent {
+		fn decode_value<R: crate::der::Reader<'a>>(
+			reader: &mut R,
+			_header: crate::der::Header,
+		) -> crate::der::Result<Self> {
+			reader.sequence(|seq: &mut crate::der::NestedReader<'_, R>| {
+				let seq_val = u32::decode(seq)?;
+				// Decode Urn and convert to 'static
+				let urn_decoded: Urn<'_> = Urn::decode(seq)?;
+				let urn = urn_decoded.into_owned();
+				let label = Option::<String>::decode(seq)?;
+				// Decode payload_hash as OctetString and convert to [u8; 32]
+				let payload_hash: Option<[u8; 32]> =
+					Option::<crate::der::asn1::OctetString>::decode(seq)?.and_then(|os| {
+						let bytes = os.as_bytes();
+						if bytes.len() == 32 {
+							let mut hash = [0u8; 32];
+							hash.copy_from_slice(bytes);
+							Some(hash)
+						} else {
+							None
+						}
+					});
+				let duration_ns = Option::<u64>::decode(seq)?;
+				let flags = u32::decode(seq)?;
+				// Decode extras as OctetString and convert to Vec<u8>
+				let extras = Option::<crate::der::asn1::OctetString>::decode(seq)?.map(|os| os.as_bytes().to_vec());
+				Ok(TbEvent { seq: seq_val, urn, label, payload_hash, duration_ns, flags, extras })
+			})
+		}
 	}
 
 	#[derive(Clone, Copy, Debug)]
@@ -171,96 +316,9 @@ pub mod active {
 		}
 	}
 
-	static ACTIVE: AtomicBool = AtomicBool::new(false);
-	static OVERFLOW: AtomicBool = AtomicBool::new(false);
-	static SEQ: AtomicU32 = AtomicU32::new(0);
-	static CONFIG: OnceLock<TbInstrumentationConfig> = OnceLock::new();
-	static EVENTS: OnceLock<Arc<Mutex<Vec<TbEvent>>>> = OnceLock::new();
+	// Global state removed - all instrumentation now handled by TraceCollector
 
-	/// Get next sequence number for event (thread-safe)
-	pub fn next_seq() -> u32 {
-		SEQ.fetch_add(1, Ordering::Relaxed)
-	}
-
-	pub fn init(cfg: TbInstrumentationConfig) -> Result<(), TightBeamError> {
-		let _ = CONFIG.set(cfg);
-		let _ = EVENTS.set(Arc::new(Mutex::new(Vec::new())));
-
-		ACTIVE.store(true, Ordering::Relaxed);
-		SEQ.store(0, Ordering::Relaxed);
-		OVERFLOW.store(false, Ordering::Relaxed);
-
-		Ok(())
-	}
-
-	#[inline]
-	pub fn is_active() -> bool {
-		ACTIVE.load(Ordering::Relaxed)
-	}
-
-	pub fn start_trace() {
-		SEQ.store(0, Ordering::Relaxed);
-		OVERFLOW.store(false, Ordering::Relaxed);
-		if let Some(events) = EVENTS.get() {
-			let mut events = events.lock().unwrap();
-			events.clear();
-		}
-
-		let _ = emit(TbEventKind::Start, None, None, None, 0, None);
-	}
-
-	pub fn emit(
-		kind: TbEventKind,
-		label: Option<&str>,
-		payload: Option<&[u8]>,
-		duration_ns: Option<u64>,
-		flags: u32,
-		extras: Option<&[u8]>,
-	) -> Result<(), TightBeamError> {
-		if !is_active() {
-			return Ok(());
-		}
-
-		let cfg = CONFIG.get().copied().unwrap_or_default();
-		let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-		if let Some(events) = EVENTS.get() {
-			let mut buf = events.lock().unwrap();
-			if (buf.len() as u32) >= cfg.max_events {
-				OVERFLOW.store(true, Ordering::Relaxed);
-				return Ok(());
-			}
-
-			let payload_hash = if cfg.enable_payloads {
-				payload.map(|p| {
-					let mut hasher = Sha3_256::new();
-					hasher.update(p);
-					let out = hasher.finalize();
-					let mut arr = [0u8; 32];
-					arr.copy_from_slice(&out);
-					arr
-				})
-			} else {
-				None
-			};
-
-			buf.push(TbEvent {
-				seq,
-				kind,
-				label: label.map(|l| l.to_string()),
-				payload_hash,
-				duration_ns: if cfg.record_durations {
-					duration_ns
-				} else {
-					None
-				},
-				flags,
-				extras: extras.map(|e| e.to_vec()),
-			});
-		}
-		Ok(())
-	}
-
-	#[derive(Debug, Clone, crate::der::Sequence)]
+	#[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 	pub struct EvidenceArtifact {
 		pub spec_hash: OctetString,
 		pub trace_hash: OctetString,
@@ -270,18 +328,19 @@ pub mod active {
 	}
 
 	impl EvidenceArtifact {
-		pub fn finalize(spec_hash: [u8; 32]) -> Result<Self, TightBeamError> {
-			let events = if let Some(events) = EVENTS.get() {
-				events.lock().unwrap().clone()
-			} else {
-				Vec::new()
-			};
-
+		/// Finalize evidence artifact from events
+		///
+		/// Takes events as parameter instead of reading from global state.
+		pub fn finalize(spec_hash: [u8; 32], events: Vec<TbEvent>) -> Result<Self, TightBeamError> {
 			// Canonical byte representation (stable ordering) for trace hash
 			let mut bytes = Vec::with_capacity(events.len() * 64);
 			for ev in &events {
 				bytes.extend_from_slice(&ev.seq.to_be_bytes());
-				bytes.push(ev.kind as u8);
+				// URN serialized as string representation
+				let urn_str = ev.urn.to_string();
+				let urn_bytes = urn_str.as_bytes();
+				bytes.extend_from_slice(&(urn_bytes.len() as u32).to_be_bytes());
+				bytes.extend_from_slice(urn_bytes);
 				match &ev.label {
 					Some(l) => {
 						let lb = l.as_bytes();
@@ -324,57 +383,9 @@ pub mod active {
 				trace_hash,
 				evidence_hash,
 				events,
-				overflow: OVERFLOW.load(Ordering::Relaxed),
+				overflow: false, // Overflow tracking moved to TraceCollector
 			})
 		}
-	}
-
-	pub fn end_trace() -> Result<EvidenceArtifact, TightBeamError> {
-		let zero_spec = [0u8; 32];
-		let _ = emit(TbEventKind::End, None, None, None, 0, None);
-		EvidenceArtifact::finalize(zero_spec)
-	}
-
-	/// End trace using a real spec hash (preferred API once spec built).
-	pub fn end_trace_with_spec(spec_hash: [u8; 32]) -> Result<EvidenceArtifact, TightBeamError> {
-		let _ = emit(TbEventKind::End, None, None, None, 0, None);
-		EvidenceArtifact::finalize(spec_hash)
-	}
-
-	#[macro_export]
-	macro_rules! tb_instrument {
-		($kind:ident $(, label = $label:expr )? $(, payload = $payload:expr )? $(, duration_ns = $dur:expr )? $(, flags = $flags:expr )? $(, extras = $extras:expr )? $(,)?) => {{
-			if $crate::instrumentation::is_active() {
-				let _ = $crate::instrumentation::emit(
-					$crate::instrumentation::TbEventKind::$kind,
-					{
-						let mut __opt = None;
-						$( __opt = Some($label); )?
-						__opt
-					},
-					{
-						let mut __opt = None;
-						$( __opt = Some($payload); )?
-						__opt
-					},
-					{
-						let mut __opt = None;
-						$( __opt = Some($dur); )?
-						__opt
-					},
-					{
-						let mut __f: u32 = 0;
-						$( __f = $flags; )?
-						__f
-					},
-					{
-						let mut __opt = None;
-						$( __opt = Some($extras); )?
-						__opt
-					},
-				);
-			}
-		}};
 	}
 }
 
