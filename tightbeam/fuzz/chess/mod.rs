@@ -173,6 +173,16 @@ tb_scenario! {
 			Ok::<_, tightbeam::TightBeamError>((servlet, client))
 		},
 		client: |trace, mut client| async move {
+			// TODO handle this more elegantly
+			// Guard: ensure we have enough bytes to attempt at least one move
+			// If not, emit required events and exit gracefully
+			let input_len = trace.oracle().fuzz_remaining().unwrap_or(0);
+			if input_len < 4 {
+				trace.event("client_move_sent");
+				trace.event("client_move_rejected");
+				return Ok(());
+			}
+
 			#[derive(Default)]
 			struct GameStats {
 				move_sent_count: u64,

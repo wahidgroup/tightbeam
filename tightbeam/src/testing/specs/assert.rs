@@ -232,7 +232,10 @@ pub fn verify_trace<S: TBSpec>(spec: &S, trace: &ConsumedTrace) -> Result<(), Sp
 				}
 			}
 			if idx != required_kinds.len() {
-				return Err(SpecViolation::EventOrderViolation { expected_kind: required_kinds[idx].clone(), position: idx });
+				return Err(SpecViolation::EventOrderViolation {
+					expected_kind: required_kinds[idx].clone(),
+					position: idx,
+				});
 			}
 		}
 	}

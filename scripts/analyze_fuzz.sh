@@ -198,11 +198,18 @@ if [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
     shift
 fi
 
-# Handle AFL_ARGS (everything after --)
+# Handle AFL_ARGS (everything remaining after TEST_NAME/DURATION, optional leading --)
+AFL_ARGS_ARRAY=()
 AFL_ARGS=""
-if [ $# -gt 0 ] && [ "$1" = "--" ]; then
-    shift
-    AFL_ARGS="$*"
+if [ $# -gt 0 ]; then
+    if [ "$1" = "--" ]; then
+        shift
+    fi
+    if [ $# -gt 0 ]; then
+        AFL_ARGS_ARRAY=("$@")
+        AFL_ARGS="${AFL_ARGS_ARRAY[*]}"
+    fi
+    set --
 fi
 
 # Validate duration
@@ -469,15 +476,15 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 # Set up AFL environment
-AFL_ENV=""
+AFL_ENV_VARS=()
 if [ "$SKIP_CRASH_CHECK" = true ]; then
-    AFL_ENV="${AFL_ENV}AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 "
+    AFL_ENV_VARS+=("AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1")
 fi
 if [ "$SKIP_CPU_FREQ" = true ]; then
-    AFL_ENV="${AFL_ENV}AFL_SKIP_CPUFREQ=1 "
+    AFL_ENV_VARS+=("AFL_SKIP_CPUFREQ=1")
 fi
 
-if [ -n "$AFL_ENV" ]; then
+if [ ${#AFL_ENV_VARS[@]} -gt 0 ]; then
     echo "[*] Note: Skipping AFL system configuration checks"
     if [ "$SKIP_CRASH_CHECK" = true ]; then
         echo "    - Crash reporting check disabled"
@@ -496,6 +503,31 @@ if [ -n "$AFL_ARGS" ]; then
 fi
 echo ""
 
+run_afl_command() {
+    local hide_output="$1"
+    local cmd=(timeout "$DURATION")
+    if [ "$USE_CARGO_AFL" = false ]; then
+        cmd+=("$AFL_FUZZ_BIN")
+    else
+        cmd+=("cargo" "afl" "fuzz")
+    fi
+    cmd+=("-i" "built/fuzz/in" "-o" "built/fuzz/out")
+    if [ ${#AFL_ARGS_ARRAY[@]} -gt 0 ]; then
+        cmd+=("${AFL_ARGS_ARRAY[@]}")
+    fi
+    cmd+=(-- "$FUZZ_TARGET")
+
+    if [ ${#AFL_ENV_VARS[@]} -gt 0 ]; then
+        cmd=(env "${AFL_ENV_VARS[@]}" "${cmd[@]}")
+    fi
+
+    if [ "$hide_output" = "true" ]; then
+        "${cmd[@]}" > /dev/null 2>&1
+    else
+        "${cmd[@]}"
+    fi
+}
+
 # Run fuzzer
 if [ "$SHOW_UI" = true ]; then
     echo "[*] AFL UI will be displayed below..."
@@ -504,16 +536,7 @@ if [ "$SHOW_UI" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
-    # Run with UI visible (AFL's TUI will be displayed)
-    # The UI shows real-time stats: cycles, corpus count, coverage, exec speed, etc.
-    # Use timeout with SIGTERM (default) - AFL will handle it gracefully
-    # Exit code 124 means timeout occurred (expected), other codes are errors
-	if [ "$USE_CARGO_AFL" = false ]; then
-		RUN_CMD="$AFL_ENV timeout $DURATION \"$AFL_FUZZ_BIN\" -i built/fuzz/in -o built/fuzz/out $AFL_ARGS -- \"$FUZZ_TARGET\""
-	else
-		RUN_CMD="$AFL_ENV timeout $DURATION cargo afl fuzz -i built/fuzz/in -o built/fuzz/out $AFL_ARGS -- \"$FUZZ_TARGET\""
-	fi
-	if eval "$RUN_CMD"; then
+    if run_afl_command "false"; then
         TIMEOUT_OCCURRED=false
     else
         EXIT_CODE=$?
@@ -527,12 +550,7 @@ if [ "$SHOW_UI" = true ]; then
 else
     echo "[*] Running in background (UI hidden)..."
     echo "    Note: Use --no-ui=false to see AFL's real-time TUI display"
-	if [ "$USE_CARGO_AFL" = false ]; then
-		RUN_CMD="$AFL_ENV timeout $DURATION \"$AFL_FUZZ_BIN\" -i built/fuzz/in -o built/fuzz/out $AFL_ARGS -- \"$FUZZ_TARGET\" > /dev/null 2>&1"
-	else
-		RUN_CMD="$AFL_ENV timeout $DURATION cargo afl fuzz -i built/fuzz/in -o built/fuzz/out $AFL_ARGS -- \"$FUZZ_TARGET\" > /dev/null 2>&1"
-	fi
-	if eval "$RUN_CMD"; then
+    if run_afl_command "true"; then
         TIMEOUT_OCCURRED=false
     else
         EXIT_CODE=$?

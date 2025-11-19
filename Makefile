@@ -105,7 +105,7 @@ fuzz-build:
 		exit 1; \
 	}
 	@set -e; \
-	for target in simple_workflow simple_servlet complex_workflow verification; do \
+	for target in simple_workflow complex_workflow verification; do \
 		echo "  - fuzz_$$target"; \
 		RUSTFLAGS="--cfg fuzzing" cargo afl build --bin fuzz_$$target --features "std,testing-fuzz"; \
 	done

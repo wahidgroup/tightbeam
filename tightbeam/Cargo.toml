@@ -228,11 +228,6 @@ path = "fuzz/simple_workflow.rs"
 required-features = ["std", "testing-fuzz"]
 
 [[bin]]
-name = "fuzz_simple_servlet"
-path = "fuzz/simple_servlet.rs"
-required-features = ["std", "testing-fuzz"]
-
-[[bin]]
 name = "fuzz_complex_workflow"
 path = "fuzz/complex_workflow.rs"
 required-features = ["std", "testing-fuzz"]

@@ -101,10 +101,7 @@ pub fn extract_paths(trace: &ConsumedTrace, process: &Process) -> Vec<ExecutionP
 			trace
 				.instrument_events
 				.iter()
-				.filter(|ev| {
-					ev.urn == event_kinds::TIMING_WCET
-						|| ev.urn == event_kinds::TIMING_DEADLINE
-				})
+				.filter(|ev| ev.urn == event_kinds::TIMING_WCET || ev.urn == event_kinds::TIMING_DEADLINE)
 				.collect()
 		}
 		#[cfg(not(feature = "instrument"))]

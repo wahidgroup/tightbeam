@@ -8,7 +8,7 @@ use super::deadline::Deadline;
 use super::path::extract_paths;
 use super::violations::{DeadlineMiss, JitterViolation, PathWcetViolation, TimingSlackViolation, TimingViolation};
 use crate::der::Sequence;
-use crate::instrumentation::{TbEvent, event_kinds};
+use crate::instrumentation::{event_kinds, TbEvent};
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process};
 use crate::trace::ConsumedTrace;
@@ -678,16 +678,14 @@ mod tests {
 		events
 			.iter()
 			.enumerate()
-			.map(|(seq, (event_urn, label, duration_ns))| {
-				TbEvent {
-					seq: seq as u32,
-					urn: event_urn.clone(),
-					label: Some(label.to_string()),
-					payload_hash: None,
-					duration_ns: Some(*duration_ns),
-					flags: 0,
-					extras: None,
-				}
+			.map(|(seq, (event_urn, label, duration_ns))| TbEvent {
+				seq: seq as u32,
+				urn: event_urn.clone(),
+				label: Some(label.to_string()),
+				payload_hash: None,
+				duration_ns: Some(*duration_ns),
+				flags: 0,
+				extras: None,
 			})
 			.collect()
 	}
