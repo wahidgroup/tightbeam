@@ -2,4 +2,4 @@
 
 pub mod tightbeam;
 
-pub use tightbeam::TightbeamInstrumentation;
+pub use tightbeam::TightbeamUrnSpec;

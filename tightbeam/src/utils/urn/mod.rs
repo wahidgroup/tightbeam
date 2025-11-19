@@ -11,6 +11,10 @@
 //! urn:<NID>:<NSS>
 //! ```
 //!
+//! Note:
+//! The optional r-component, q-component, and f-component extensions from RFC
+//! 8141 are not included in this basic implementation.
+//!
 //! Where:
 //! - **NID**: Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with letter)
 //! - **NSS**: Namespace-Specific String (structure defined by namespace spec)
@@ -42,8 +46,8 @@
 //!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:123:trace");
 //!
 //!     // Build a URN with a spec (recommended pattern)
-//!     use tightbeam::utils::urn::specs::tightbeam::TightbeamInstrumentation;
-//!     let urn = UrnBuilder::from(TightbeamInstrumentation)
+//!     use tightbeam::utils::urn::specs::tightbeam::TightbeamUrnSpec;
+//!     let urn = UrnBuilder::from(TightbeamUrnSpec)
 //!         .set("category", "instrumentation")
 //!         .set("resource_type", "trace")
 //!         .set("resource_id", "abc-123")
@@ -75,7 +79,7 @@ pub mod specs;
 
 pub use builders::{UrnBuilder, UrnSpecBuilder};
 pub use error::UrnValidationError;
-pub use spec::UrnSpec;
+pub use spec::{UrnComponents, UrnSpec};
 
 /// RFC 8141 compliant URN structure
 ///
@@ -115,34 +119,20 @@ impl<'a> Urn<'a> {
 	/// - The NID matches the spec's NID
 	/// - The NID format is valid (RFC 8141 compliant)
 	/// - The NSS structure conforms to the spec's requirements
-	///
-	/// # Example
-	///
-	/// ```rust
-	/// # use tightbeam::utils::urn::{Urn, UrnSpec};
-	/// # struct MySpec;
-	/// # impl UrnSpec for MySpec {
-	/// #     const NID: &'static str = "example";
-	/// #     fn validate(_: &UrnBuilder) -> Result<(), _> { Ok(()) }
-	/// #     fn build_nss(_: &UrnBuilder) -> Result<_, _> { Ok("test".into()) }
-	/// # }
-	/// const URN: Urn<'static> = Urn::new("example", "test:resource");
-	/// URN.verify::<MySpec>()?;
-	/// ```
 	pub fn verify<S: UrnSpec>(&self) -> Result<(), UrnValidationError> {
 		// Check NID matches spec
 		if self.nid.as_ref() != S::NID {
-			return Err(UrnValidationError::InvalidNid("NID does not match spec"));
+			return Err(UrnValidationError::NidMismatch);
 		}
 
 		// Validate NID format
 		Self::validate_nid(self.nid.as_ref())?;
 
 		// Create a builder with this URN's data for spec validation
-		let builder = UrnBuilder::new().with_nid(self.nid.as_ref()).with_nss(self.nss.as_ref());
+		let builder = UrnBuilder::default().with_nid(self.nid.as_ref()).with_nss(self.nss.as_ref());
 
-		// Validate using the spec
-		S::validate(&builder)
+		// Validate using the spec with UrnComponents trait
+		S::validate(&builder as &dyn UrnComponents)
 	}
 
 	/// Validate that the NID conforms to RFC 8141 Section 2.3.1
@@ -153,21 +143,19 @@ impl<'a> Urn<'a> {
 	pub fn validate_nid(nid: &str) -> Result<(), UrnValidationError> {
 		let len = nid.len();
 		if !(2..=32).contains(&len) {
-			return Err(UrnValidationError::InvalidNid("NID must be 2-32 characters"));
+			return Err(UrnValidationError::InvalidNidLength);
 		}
 
 		let mut chars = nid.chars();
 		if let Some(first) = chars.next() {
 			if !first.is_ascii_alphabetic() {
-				return Err(UrnValidationError::InvalidNid("NID must start with a letter"));
+				return Err(UrnValidationError::InvalidNidStart);
 			}
 		}
 
 		for ch in chars {
 			if !ch.is_ascii_alphanumeric() && ch != '-' {
-				return Err(UrnValidationError::InvalidNid(
-					"NID must contain only alphanumeric characters and hyphens",
-				));
+				return Err(UrnValidationError::InvalidNidCharacters);
 			}
 		}
 

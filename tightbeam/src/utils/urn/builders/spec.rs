@@ -9,7 +9,7 @@ use alloc::{string::String, vec::Vec};
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
-use crate::utils::urn::{UrnBuilder, UrnValidationError};
+use crate::utils::urn::{UrnComponents, UrnValidationError};
 
 /// Validation pattern for field values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,35 +174,29 @@ impl UrnSpecBuilder {
 		self
 	}
 
-	/// Validate a builder using this spec's configuration
-	pub fn validate(&self, builder: &UrnBuilder) -> Result<(), UrnValidationError> {
+	/// Validate components using this spec's configuration
+	pub fn validate<'a>(&self, components: &dyn UrnComponents<'a>) -> Result<(), UrnValidationError> {
 		for field in &self.fields {
 			// Check required
-			if field.required && builder.get(field.name).is_none() {
+			if field.required && components.get_component(field.name).is_none() {
 				return Err(UrnValidationError::RequiredFieldMissing(field.name));
 			}
 
 			// Check constraints and pattern if value exists
-			if let Some(value) = builder.get(field.name) {
+			if let Some(value) = components.get_component(field.name) {
 				let value_str = value.as_ref();
 
 				// Check constraints
 				for constraint in &field.constraints {
 					if !constraint.matches(value_str) {
-						return Err(UrnValidationError::InvalidFormat {
-							field: field.name,
-							pattern: constraint.pattern_str(),
-						});
+						return Err(UrnValidationError::InvalidFormat { field: field.name, pattern: None });
 					}
 				}
 
 				// Check pattern
 				if let Some(pattern) = field.pattern {
 					if !pattern.matches(value_str) {
-						return Err(UrnValidationError::InvalidFormat {
-							field: field.name,
-							pattern: pattern.pattern_str(),
-						});
+						return Err(UrnValidationError::InvalidFormat { field: field.name, pattern: Some(pattern) });
 					}
 				}
 			}
@@ -211,13 +205,13 @@ impl UrnSpecBuilder {
 		Ok(())
 	}
 
-	/// Build NSS from builder using this spec's configuration
-	pub fn build_nss(&self, builder: &UrnBuilder) -> Result<String, UrnValidationError> {
+	/// Build NSS from components using this spec's configuration
+	pub fn build_nss<'a>(&self, components: &dyn UrnComponents<'a>) -> Result<String, UrnValidationError> {
 		match &self.nss_format {
 			NssFormat::Join(default_separator) => {
 				let mut nss_parts = Vec::new();
 				for field in &self.fields {
-					if let Some(value) = builder.get(field.name) {
+					if let Some(value) = components.get_component(field.name) {
 						// Add separator before value (except for first field)
 						if !nss_parts.is_empty() {
 							// Use field-specific separator if set, otherwise default
@@ -240,11 +234,11 @@ impl UrnSpecBuilder {
 				let mut field_values = Vec::new();
 				for field in &self.fields {
 					if field.required {
-						let value = builder
-							.get(field.name)
+						let value = components
+							.get_component(field.name)
 							.ok_or(UrnValidationError::RequiredFieldMissing(field.name))?;
 						field_values.push(value.as_ref());
-					} else if let Some(value) = builder.get(field.name) {
+					} else if let Some(value) = components.get_component(field.name) {
 						field_values.push(value.as_ref());
 					}
 				}
@@ -289,6 +283,8 @@ impl From<&'static str> for UrnSpecBuilder {
 
 #[cfg(test)]
 mod tests {
+	use crate::utils::urn::UrnBuilder;
+
 	use super::*;
 
 	#[test]
@@ -391,96 +387,150 @@ mod tests {
 
 	#[test]
 	fn test_urn_spec_builder_validation() {
-		// Test required field missing
-		let spec = UrnSpecBuilder::from("test")
-			.field_required("field1")
-			.field_pattern("field1", Pattern::Alpha);
-		let builder = UrnBuilder::new();
-		assert!(matches!(
-			spec.validate(&builder),
-			Err(UrnValidationError::RequiredFieldMissing("field1"))
-		));
+		// Macro to reduce repetition in validation tests
+		macro_rules! validate_pass {
+			(spec: [$($spec_op:ident($($arg:expr),*)),+], values: [$($k:literal = $v:literal),*]) => {{
+				let spec = UrnSpecBuilder::from("test")$(.$spec_op($($arg),*))+;
+				let builder = UrnBuilder::default()$(.set($k, $v))*;
+				assert!(spec.validate(&builder).is_ok());
+			}};
+		}
 
-		// Test optional field passes when missing
-		let spec = UrnSpecBuilder::from("test").field_optional("field1");
-		let builder = UrnBuilder::new();
-		assert!(spec.validate(&builder).is_ok());
+		macro_rules! validate_fail_missing {
+			(spec: [$($spec_op:ident($($arg:expr),*)),+], values: [$($k:literal = $v:literal),*], field: $expected:literal) => {{
+				let spec = UrnSpecBuilder::from("test")$(.$spec_op($($arg),*))+;
+				let builder = UrnBuilder::default()$(.set($k, $v))*;
+				assert!(matches!(
+					spec.validate(&builder),
+					Err(UrnValidationError::RequiredFieldMissing(field)) if field == $expected
+				));
+			}};
+		}
 
-		// Test pattern validation
-		let spec = UrnSpecBuilder::from("test")
-			.field_required("field1")
-			.field_pattern("field1", Pattern::Alpha);
-		let builder = UrnBuilder::new().set("field1", "abc");
-		assert!(spec.validate(&builder).is_ok());
-		let builder = UrnBuilder::new().set("field1", "abc123");
-		assert!(
-			matches!(spec.validate(&builder), Err(UrnValidationError::InvalidFormat { field, .. }) if field == "field1")
+		macro_rules! validate_fail_format {
+			(spec: [$($spec_op:ident($($arg:expr),*)),+], values: [$($k:literal = $v:literal),*], field: $expected:literal) => {{
+				let spec = UrnSpecBuilder::from("test")$(.$spec_op($($arg),*))+;
+				let builder = UrnBuilder::default()$(.set($k, $v))*;
+				assert!(matches!(
+					spec.validate(&builder),
+					Err(UrnValidationError::InvalidFormat { field, .. }) if field == $expected
+				));
+			}};
+		}
+
+		// Required field missing
+		validate_fail_missing!(
+			spec: [field_required("field1"), field_pattern("field1", Pattern::Alpha)],
+			values: [],
+			field: "field1"
 		);
 
-		// Test const constraint
-		let spec = UrnSpecBuilder::from("test")
-			.field_required("field1")
-			.field_const("field1", "expected");
-		let builder = UrnBuilder::new().set("field1", "expected");
-		assert!(spec.validate(&builder).is_ok());
-		let builder = UrnBuilder::new().set("field1", "unexpected");
-		assert!(
-			matches!(spec.validate(&builder), Err(UrnValidationError::InvalidFormat { field, .. }) if field == "field1")
+		// Optional field passes when missing
+		validate_pass!(spec: [field_optional("field1")], values: []);
+
+		// Pattern validation - valid
+		validate_pass!(
+			spec: [field_required("field1"), field_pattern("field1", Pattern::Alpha)],
+			values: ["field1" = "abc"]
 		);
 
-		// Test oneof constraint
-		let spec = UrnSpecBuilder::from("test")
-			.field_required("field1")
-			.field_oneof("field1", &["a", "b", "c"]);
-		let builder = UrnBuilder::new().set("field1", "b");
-		assert!(spec.validate(&builder).is_ok());
-		let builder = UrnBuilder::new().set("field1", "d");
-		assert!(
-			matches!(spec.validate(&builder), Err(UrnValidationError::InvalidFormat { field, .. }) if field == "field1")
+		// Pattern validation - invalid
+		validate_fail_format!(
+			spec: [field_required("field1"), field_pattern("field1", Pattern::Alpha)],
+			values: ["field1" = "abc123"],
+			field: "field1"
+		);
+
+		// Const constraint - valid
+		validate_pass!(
+			spec: [field_required("field1"), field_const("field1", "expected")],
+			values: ["field1" = "expected"]
+		);
+
+		// Const constraint - invalid
+		validate_fail_format!(
+			spec: [field_required("field1"), field_const("field1", "expected")],
+			values: ["field1" = "unexpected"],
+			field: "field1"
+		);
+
+		// OneOf constraint - valid
+		validate_pass!(
+			spec: [field_required("field1"), field_oneof("field1", &["a", "b", "c"])],
+			values: ["field1" = "b"]
+		);
+
+		// OneOf constraint - invalid
+		validate_fail_format!(
+			spec: [field_required("field1"), field_oneof("field1", &["a", "b", "c"])],
+			values: ["field1" = "d"],
+			field: "field1"
 		);
 	}
 
 	#[test]
 	fn test_urn_spec_builder_build_nss() -> Result<(), UrnValidationError> {
-		// Test Join format (default)
-		let spec = UrnSpecBuilder::from("test")
-			.field_required("field1")
-			.field_required("field2")
-			.field_nss_separator("field2", "/")
-			.field_optional("field3");
-		let builder = UrnBuilder::new().set("field1", "value1").set("field2", "value2");
-		assert_eq!(spec.build_nss(&builder)?, "value1/value2");
+		// Macro to reduce repetition in NSS building tests
+		macro_rules! build_nss_pass {
+			(spec: [$($spec_op:ident($($arg:expr),*)),+], values: [$($k:literal = $v:literal),+], expected: $exp:literal) => {{
+				let spec = UrnSpecBuilder::from("test")$(.$spec_op($($arg),*))+;
+				let builder = UrnBuilder::default()$(.set($k, $v))+;
+				assert_eq!(spec.build_nss(&builder)?, $exp);
+			}};
+		}
 
-		// Test Custom format
-		let spec = UrnSpecBuilder::from("test")
-			.field_required("field1")
-			.field_required("field2")
-			.field_optional("field3")
-			.nss_format("{}:{}/{}");
-		let builder = UrnBuilder::new()
-			.set("field1", "value1")
-			.set("field2", "value2")
-			.set("field3", "value3");
-		assert_eq!(spec.build_nss(&builder)?, "value1:value2/value3");
+		macro_rules! build_nss_fail {
+			(spec: [$($spec_op:ident($($arg:expr),*)),*], values: [$($k:literal = $v:literal),*], error: $err_msg:literal) => {{
+				#![allow(unused_mut)]
+				let mut spec = UrnSpecBuilder::from("test");
+				$(spec = spec.$spec_op($($arg),*);)*
+				let mut builder = UrnBuilder::default();
+				$(builder = builder.set($k, $v);)*
+				assert!(matches!(
+					spec.build_nss(&builder),
+					Err(UrnValidationError::RequiredFieldMissing(msg)) if msg == $err_msg
+				));
+			}};
+		}
 
-		// Test empty NSS
-		let spec = UrnSpecBuilder::from("test");
-		let builder = UrnBuilder::new();
-		assert!(matches!(
-			spec.build_nss(&builder),
-			Err(UrnValidationError::RequiredFieldMissing("nss components"))
-		));
+		// Join format (default)
+		build_nss_pass!(
+			spec: [
+				field_required("field1"),
+				field_required("field2"),
+				field_nss_separator("field2", "/"),
+				field_optional("field3")
+			],
+			values: ["field1" = "value1", "field2" = "value2"],
+			expected: "value1/value2"
+		);
 
-		// Test Custom format error when placeholder count doesn't match
-		let spec = UrnSpecBuilder::from("test")
-			.field_required("field1")
-			.field_required("field2")
-			.nss_format("{}");
-		let builder = UrnBuilder::new().set("field1", "value1").set("field2", "value2");
-		assert!(matches!(
-			spec.build_nss(&builder),
-			Err(UrnValidationError::RequiredFieldMissing("nss components"))
-		));
+		// Custom format
+		build_nss_pass!(
+			spec: [
+				field_required("field1"),
+				field_required("field2"),
+				field_optional("field3"),
+				nss_format("{}:{}/{}")
+			],
+			values: ["field1" = "value1", "field2" = "value2", "field3" = "value3"],
+			expected: "value1:value2/value3"
+		);
+
+		// Empty NSS
+		build_nss_fail!(
+			spec: [],
+			values: [],
+			error: "nss components"
+		);
+
+		// Format mismatch
+		build_nss_fail!(
+			spec: [field_required("field1"), field_required("field2"), nss_format("{}")],
+			values: ["field1" = "value1", "field2" = "value2"],
+			error: "nss components"
+		);
+
 		Ok(())
 	}
 

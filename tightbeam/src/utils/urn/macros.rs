@@ -12,6 +12,9 @@
 /// - `pattern: Pattern::*`
 /// - `required: true/false` - whether field is required (defaults to `true`)
 /// - `sep: "separator"` - NSS separator for this field (optional)
+///
+/// Optional transform closure:
+/// - `transform: |components| { ... }` - closure for component transformations
 #[macro_export]
 macro_rules! urn_spec {
 	// Main entry point
@@ -23,6 +26,7 @@ macro_rules! urn_spec {
 			$($field:ident: { $($config:tt)* }),* $(,)?
 		}
 		$(, nss_format: $nss_format:literal)?
+		$(, transform: $transform_expr:expr)?
 	) => {
 		$(#[$meta])*
 		$vis struct $name;
@@ -47,12 +51,14 @@ macro_rules! urn_spec {
 		impl $crate::utils::urn::UrnSpec for $name {
 			const NID: &'static str = $nid;
 
-			fn validate(builder: &$crate::utils::urn::UrnBuilder) -> Result<(), $crate::utils::urn::UrnValidationError> {
-				Self::spec_builder().validate(builder)
+			$crate::urn_spec!(@generate_transform $($transform_expr)?);
+
+			fn validate<'a>(components: &dyn $crate::utils::urn::UrnComponents<'a>) -> Result<(), $crate::utils::urn::UrnValidationError> {
+				Self::spec_builder().validate(components)
 			}
 
-			fn build_nss(builder: &$crate::utils::urn::UrnBuilder) -> Result<::std::borrow::Cow<'static, str>, $crate::utils::urn::UrnValidationError> {
-				let nss = Self::spec_builder().build_nss(builder)?;
+			fn build_nss<'a>(components: &dyn $crate::utils::urn::UrnComponents<'a>) -> Result<::std::borrow::Cow<'static, str>, $crate::utils::urn::UrnValidationError> {
+				let nss = Self::spec_builder().build_nss(components)?;
 				Ok(nss.into())
 			}
 		}
@@ -140,5 +146,18 @@ macro_rules! urn_spec {
 
 	(@parse_field_config $builder:expr, $field:ident, $req:expr, { }) => {
 		$crate::urn_spec!(@apply_required $builder, $field, $req)
+	};
+
+	// Generate transform method - with closure provided
+	(@generate_transform $transform_expr:expr) => {
+		fn transform<'a>(components: &mut dyn $crate::utils::urn::UrnComponents<'a>) {
+			let closure: fn(&mut dyn $crate::utils::urn::UrnComponents<'a>) = $transform_expr;
+			closure(components);
+		}
+	};
+
+	// Generate transform method - no closure (use default trait impl)
+	(@generate_transform) => {
+		// No override - use default trait implementation
 	};
 }
