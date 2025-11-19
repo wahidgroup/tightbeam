@@ -1404,7 +1404,7 @@ mod tests {
 
 	job! {
 		name: ActivateServletJob,
-		fn run(id: &[u8], servlet_id: &[u8], config: Option<Vec<u8>>, signing_key: &Secp256k1SigningKey) -> crate::error::Result<Frame> {
+		fn run(id: &[u8], servlet_id: &[u8], config: Option<Vec<u8>>, signing_key: Secp256k1SigningKey) -> crate::error::Result<Frame> {
 			crate::compose! {
 				V0: id: id,
 					message: ActivateServletRequest {
@@ -1661,7 +1661,7 @@ mod tests {
 				b"cluster-activation-001",
 				b"simple_servlet",
 				None,
-				&signing_key
+				signing_key.clone()
 			)?;
 
 			// Send activation request to drone's control server
@@ -1677,7 +1677,7 @@ mod tests {
 				b"cluster-activation-002",
 				b"simple_servlet",
 				None,
-				&signing_key
+				signing_key.clone()
 			)?;
 
 			let simple_again_response = client.emit(signed_simple_again_frame, None).await?
@@ -1691,7 +1691,7 @@ mod tests {
 				b"cluster-activation-003",
 				b"nonexistent_servlet",
 				None,
-				&signing_key
+				signing_key
 			)?;
 
 			let invalid_response = client.emit(signed_invalid_frame, None).await?

@@ -278,9 +278,9 @@ impl BuiltAssertSpec {
 			.iter()
 			.map(|(label, _tags, card, value)| {
 				let mut contract = if let Some(ref val) = value {
-					AssertionContract::new(AssertionLabel::Custom(label), *card).with_value(val.clone())
+					AssertionContract::new(AssertionLabel::Custom(Cow::Borrowed(label)), *card).with_value(val.clone())
 				} else {
-					AssertionContract::new(AssertionLabel::Custom(label), *card)
+					AssertionContract::new(AssertionLabel::Custom(Cow::Borrowed(label)), *card)
 				};
 				if let Some(ref filter) = tag_filter {
 					contract = contract.with_tag_filter(filter.clone());
@@ -349,10 +349,15 @@ impl BuiltAssertSpec {
 			h.update([0u8]);
 		}
 		// Normalize assertion order independent of insertion sequence
-		let mut norm: Vec<(&'static str, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
+		let mut norm: Vec<(&str, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
 		for c in contracts {
-			let AssertionLabel::Custom(lbl) = c.label;
-			norm.push((lbl, c.cardinality.min, c.cardinality.max, c.cardinality.must_be_present));
+			let AssertionLabel::Custom(lbl) = &c.label;
+			norm.push((
+				lbl.as_ref(),
+				c.cardinality.min,
+				c.cardinality.max,
+				c.cardinality.must_be_present,
+			));
 		}
 		norm.sort_by(|a, b| a.0.cmp(b.0)); // label only
 		for (lbl, min, max, must) in norm {
@@ -634,7 +639,7 @@ macro_rules! tb_labels {
 		}
 
 	impl From<$name> for $crate::testing::assertions::AssertionLabel {
-		fn from(lbl: $name) -> Self { $crate::testing::assertions::AssertionLabel::Custom(<$name as $crate::testing::macros::TbAssertLabelTrait>::name(&lbl)) }
+		fn from(lbl: $name) -> Self { $crate::testing::assertions::AssertionLabel::Custom(::std::borrow::Cow::Borrowed(<$name as $crate::testing::macros::TbAssertLabelTrait>::name(&lbl))) }
 	}		pub const ALL_LABELS: &[$name] = &[ $( $name::$label ),* ];
 	};
 	(@flag payload) => { true };

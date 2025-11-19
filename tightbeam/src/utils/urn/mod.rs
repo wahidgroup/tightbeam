@@ -27,7 +27,7 @@
 //!
 //! fn main() -> Result<(), UrnValidationError> {
 //!     // Build a URN with direct NSS
-//!     let urn = UrnBuilder::new()
+//!     let urn = UrnBuilder::default()
 //!         .with_nid("tightbeam")
 //!         .with_nss("instrumentation:trace:123")
 //!         .build()?;
@@ -35,7 +35,7 @@
 //!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:trace:123");
 //!
 //!     // Build a URN from components (sorted by key)
-//!     let urn = UrnBuilder::new()
+//!     let urn = UrnBuilder::default()
 //!         .with_nid("tightbeam")
 //!         .set("category", "instrumentation")
 //!         .set("resource.type", "trace")
@@ -45,15 +45,6 @@
 //!     // Components sorted: "category", "resource.id", "resource.type"
 //!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:123:trace");
 //!
-//!     // Build a URN with a spec (recommended pattern)
-//!     use tightbeam::utils::urn::specs::tightbeam::TightbeamUrnSpec;
-//!     let urn = UrnBuilder::from(TightbeamUrnSpec)
-//!         .set("category", "instrumentation")
-//!         .set("resource_type", "trace")
-//!         .set("resource_id", "abc-123")
-//!         .build()?;
-//!
-//!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:trace/abc-123");
 //!     Ok(())
 //! }
 //! ```

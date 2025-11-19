@@ -13,11 +13,13 @@
 //!
 //! Feature gated: requires `testing-csp`
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
 use crate::der::{Header, Length, Reader, Writer};
+use crate::testing::assertions::AssertionLabel;
 use crate::trace::ConsumedTrace;
 
 #[cfg(feature = "testing-timing")]
@@ -329,8 +331,11 @@ impl Process {
 		// Map assertion labels to events
 		for assertion in &trace.assertions {
 			// Extract event from assertion label
-			let event_name = match &assertion.label {
-				crate::testing::assertions::AssertionLabel::Custom(s) => *s,
+			let event_name: &'static str = match &assertion.label {
+				AssertionLabel::Custom(s) => match s {
+					Cow::Borrowed(static_str) => static_str,
+					Cow::Owned(owned) => Box::leak(owned.clone().into_boxed_str()),
+				},
 			};
 
 			let event = Event(event_name);

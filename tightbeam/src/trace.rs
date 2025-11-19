@@ -4,10 +4,16 @@ use core::cell::Cell;
 use core::time::Duration;
 
 #[cfg(feature = "std")]
-use std::sync::{Arc, Mutex};
+use std::{
+	borrow::Cow,
+	sync::{Arc, Mutex},
+};
 
 #[cfg(not(feature = "std"))]
-use alloc::sync::{Arc, Mutex};
+use alloc::{
+	borrow::Cow,
+	sync::{Arc, Mutex},
+};
 
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::TransitStatus;
@@ -18,6 +24,29 @@ use crate::Frame;
 
 #[cfg(feature = "instrument")]
 use crate::instrumentation::{events, TbEvent, TbInstrumentationConfig};
+
+/// Trait for converting types into event labels
+pub trait IntoEventLabel {
+	fn into_label(self) -> Cow<'static, str>;
+}
+
+impl IntoEventLabel for &'static str {
+	fn into_label(self) -> Cow<'static, str> {
+		Cow::Borrowed(self)
+	}
+}
+
+impl IntoEventLabel for String {
+	fn into_label(self) -> Cow<'static, str> {
+		Cow::Owned(self)
+	}
+}
+
+impl IntoEventLabel for &String {
+	fn into_label(self) -> Cow<'static, str> {
+		Cow::Owned(self.clone())
+	}
+}
 
 /// Configuration for trace collection
 #[derive(Clone, Debug, Default)]
@@ -50,14 +79,17 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 /// Allows optional chaining of timing and payload information.
 /// Example:
 /// ```rust
+/// # use core::time::Duration;
+/// # use tightbeam::trace::{TraceCollector, EventValue};
+/// # let trace = TraceCollector::default();
 /// trace.event("process")
 ///     .with_timing(Duration::from_millis(5))
-///     .with_payload(data)
+///     .with_payload(b"payload")
 ///     .emit();
 /// ```
 pub struct EventBuilder<'a> {
 	collector: &'a TraceCollector,
-	label: String,
+	label: Cow<'static, str>,
 	tags: Option<Vec<&'static str>>,
 	value: Option<EventValue>,
 	#[cfg(feature = "instrument")]
@@ -70,7 +102,7 @@ pub struct EventBuilder<'a> {
 impl<'a> EventBuilder<'a> {
 	fn new(
 		collector: &'a TraceCollector,
-		label: String,
+		label: Cow<'static, str>,
 		tags: Option<Vec<&'static str>>,
 		value: Option<EventValue>,
 	) -> Self {
@@ -118,10 +150,6 @@ impl<'a> EventBuilder<'a> {
 	}
 
 	fn emit_internal(&mut self) {
-		fn leak_label(label: &str) -> &'static str {
-			Box::leak(label.to_string().into_boxed_str())
-		}
-
 		// Check if already emitted
 		if self.emitted.get() {
 			return;
@@ -130,8 +158,7 @@ impl<'a> EventBuilder<'a> {
 		self.emitted.set(true);
 
 		let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
-		let static_label: &'static str = leak_label(&self.label);
-
+		let label = core::mem::take(&mut self.label);
 		let tags = self.tags.take().unwrap_or_default();
 		let assertion = match self.value.take() {
 			Some(EventValue::None) | None => {
@@ -144,10 +171,13 @@ impl<'a> EventBuilder<'a> {
 						events::ASSERT_LABEL
 					};
 
-					self.collector
-						.emit_internal(urn, Some(&self.label), self.payload, self.duration_ns);
+					self.collector.emit_internal(urn, Some(&label), self.payload, self.duration_ns);
 				}
-				Assertion::new(seq, AssertionLabel::Custom(static_label), tags, None)
+
+				#[cfg(feature = "testing-fuzz")]
+				self.collector.dispatch_csp_event(&label);
+
+				Assertion::new(seq, AssertionLabel::Custom(label), tags, None)
 			}
 			Some(EventValue::Value(assertion_value)) => {
 				#[cfg(feature = "instrument")]
@@ -155,21 +185,22 @@ impl<'a> EventBuilder<'a> {
 					let value_str = format_assertion_value(&assertion_value);
 					self.collector.emit_internal(
 						events::ASSERT_PAYLOAD,
-						Some(&self.label),
+						Some(&label),
 						Some(value_str.as_bytes()),
 						self.duration_ns,
 					);
 				}
-				Assertion::with_value(seq, AssertionLabel::Custom(static_label), tags, None, assertion_value)
+
+				#[cfg(feature = "testing-fuzz")]
+				self.collector.dispatch_csp_event(&label);
+
+				Assertion::with_value(seq, AssertionLabel::Custom(label), tags, None, assertion_value)
 			}
 		};
 
 		if let Ok(mut assertions) = self.collector.state.assertions.lock() {
 			assertions.push(assertion);
 		}
-
-		#[cfg(feature = "testing-fuzz")]
-		self.collector.dispatch_csp_event(&self.label);
 	}
 }
 
@@ -269,17 +300,17 @@ impl TraceCollector {
 
 	/// Record an event with no tags or value.
 	/// Returns an EventBuilder for optional chaining.
-	pub fn event(&self, label: impl AsRef<str>) -> EventBuilder<'_> {
-		EventBuilder::new(self, label.as_ref().to_string(), Some(Vec::new()), None)
+	pub fn event(&self, label: impl IntoEventLabel) -> EventBuilder<'_> {
+		EventBuilder::new(self, label.into_label(), None, None)
 	}
 
 	/// Record an event with explicit tags and optional value.
 	/// Returns an EventBuilder for optional chaining.
-	pub fn event_with<V>(&self, label: &str, tags: &[&'static str], value: V) -> EventBuilder<'_>
+	pub fn event_with<V>(&self, label: impl IntoEventLabel, tags: &[&'static str], value: V) -> EventBuilder<'_>
 	where
 		V: Into<EventValue>,
 	{
-		EventBuilder::new(self, label.to_string(), Some(tags.to_vec()), Some(value.into()))
+		EventBuilder::new(self, label.into_label(), Some(tags.to_vec()), Some(value.into()))
 	}
 
 	#[cfg(feature = "testing-fuzz")]
@@ -419,7 +450,7 @@ fn hash_payload(payload: &[u8]) -> [u8; 32] {
 #[cfg(feature = "instrument")]
 fn format_assertion_value(value: &AssertionValue) -> String {
 	match value {
-		AssertionValue::String(s) => s.clone(),
+		AssertionValue::String(s) => s.to_string(),
 		AssertionValue::Bool(b) => b.to_string(),
 		AssertionValue::U8(n) => n.to_string(),
 		AssertionValue::U32(n) => n.to_string(),

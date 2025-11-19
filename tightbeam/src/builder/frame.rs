@@ -261,10 +261,10 @@ impl<T: Message> FrameBuilder<T> {
 	}
 
 	#[cfg(feature = "aead")]
-	pub fn with_cipher<C, Cipher>(mut self, cipher: &Cipher) -> Self
+	pub fn with_cipher<C, Cipher>(mut self, cipher: Cipher) -> Self
 	where
 		C: AssociatedOid,
-		Cipher: Aead + Clone + 'static,
+		Cipher: Aead + 'static,
 		T: CheckAeadOid<C>,
 	{
 		// Runtime fallback validation
@@ -285,11 +285,10 @@ impl<T: Message> FrameBuilder<T> {
 
 		// Generate nonce
 		let nonce = Cipher::generate_nonce(rng);
-		let cipher_cloned = cipher.clone();
 		let message_oid = self.message_oid;
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
 			let encrypted_content = <Cipher as crate::crypto::aead::Encryptor<C>>::encrypt_content(
-				&cipher_cloned,
+				&cipher,
 				plaintext,
 				&nonce,
 				message_oid,
@@ -306,10 +305,10 @@ impl<T: Message> FrameBuilder<T> {
 	/// message structure. This method captures the signer and signing
 	/// algorithm to be used later.
 	#[cfg(feature = "signature")]
-	pub fn with_signer<S, X>(mut self, signer: &X) -> Self
+	pub fn with_signer<S, X>(mut self, signer: X) -> Self
 	where
 		S: SignatureEncoding + SignatureAlgorithmIdentifier,
-		X: Signatory<S> + Clone + 'static,
+		X: Signatory<S> + 'static,
 		T: CheckSignatureOid<S>,
 	{
 		// Runtime fallback validation
@@ -322,7 +321,6 @@ impl<T: Message> FrameBuilder<T> {
 			return self;
 		}
 
-		let signer = signer.clone();
 		self.signer = Some(Box::new(move |data: &[u8]| signer.to_signer_info(data)));
 		self
 	}
@@ -534,13 +532,13 @@ mod tests {
 			let (_, cipher) = create_test_cipher_key();
 			let signing_key = create_test_signing_key();
 
-			builder
-				.with_message(msg)
-				.with_id("test_v1_with_encryption")
-				.with_order(1696521600)
-				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
-				.with_signer::<Secp256k1Signature, _>(&signing_key)
-				.build()
+		builder
+			.with_message(msg)
+			.with_id("test_v1_with_encryption")
+			.with_order(1696521600)
+			.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+			.with_signer::<Secp256k1Signature, _>(signing_key)
+			.build()
 		},
 		assertions: |message, result| {
 			let tightbeam  = result?;
@@ -580,14 +578,14 @@ mod tests {
 			let (_, cipher) = create_test_cipher_key();
 			let signing_key = create_test_signing_key();
 
-			builder
-				.with_message(msg)
-				.with_id("test_v1_with_compression")
-				.with_order(1696521600)
-				.with_compression(ZstdCompression)
-				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
-				.with_signer::<Secp256k1Signature, _>(&signing_key)
-				.build()
+		builder
+			.with_message(msg)
+			.with_id("test_v1_with_compression")
+			.with_order(1696521600)
+			.with_compression(ZstdCompression)
+			.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+			.with_signer::<Secp256k1Signature, _>(signing_key)
+			.build()
 		},
 		assertions: |message, result| {
 			let tightbeam = result?;
@@ -641,8 +639,8 @@ mod tests {
 				.with_witness_hasher::<Sha3_256>()
 				.with_compression(ZstdCompression)
 				.with_rng(Box::new(rng))
-				.with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher)
-				.with_signer::<Secp256k1Signature, _>(&signing_key)
+				.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+				.with_signer::<Secp256k1Signature, _>(signing_key)
 				.with_priority(crate::MessagePriority::High)
 				.with_lifetime(3600)
 				.with_previous_hash(previous_hash)
@@ -778,8 +776,8 @@ mod tests {
 				let result = compose_frame(
 					$name,
 					message.clone(),
-					$cipher,
-					$signing_key,
+					$cipher.clone(),
+					$signing_key.clone(),
 					$confidential,
 					$nonrepudiable,
 					$message_integrity,
@@ -930,8 +928,8 @@ mod tests {
 			fn compose_frame<T>(
 				test_name: &str,
 				message: T,
-				cipher: &Aes256Gcm,
-				signing_key: &Secp256k1SigningKey,
+				cipher: Aes256Gcm,
+				signing_key: Secp256k1SigningKey,
 				confidential: bool,
 				nonrepudiable: bool,
 				message_integrity: bool,

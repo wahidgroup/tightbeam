@@ -399,8 +399,8 @@ mod tests {
 				V1: id: "test-003",
 					order: 1696521800,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1Signature, _>: &signing_key
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key
 			}.unwrap()
 		},
 		tightbeam_v2_full: {
@@ -416,8 +416,8 @@ mod tests {
 				V2: id: "test-004",
 					order: 1696521900,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1Signature, _>: &signing_key,
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity: type Sha3_256,
 					priority: MessagePriority::Bulk,
 					lifetime: 3600
@@ -470,8 +470,8 @@ mod tests {
 					id: "ver-001",
 					order: 2000,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1Signature, _>: &signing_key,
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity: type Sha3_256,
 					priority: MessagePriority::Top,
 					lifetime: 60
@@ -517,8 +517,8 @@ mod tests {
 				V1: id: "sig-001",
 					order: 3000,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1Signature, _>: &signing_key
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key
 			}.unwrap()
 		} => SignerInfo,
 		tightbeam_v2_to_encryption_info: {
@@ -535,8 +535,8 @@ mod tests {
 					id: "enc-001",
 					order: 4000,
 					message: message,
-					confidentiality<Aes256GcmOid, _>: &cipher,
-					nonrepudiation<Secp256k1Signature, _>: &signing_key,
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity: type Sha3_256,
 					priority: MessagePriority::High,
 					lifetime: 120

@@ -188,6 +188,7 @@ where
 
 	/// Build the recipient identifier from server certificate.
 	fn build_recipient_identifier(&self) -> KeyAgreeRecipientIdentifier {
+		// Cloning here is cheaper than Arc
 		KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
 			issuer: self.server_cert.tbs_certificate.issuer.clone(),
 			serial_number: self.server_cert.tbs_certificate.serial_number.clone(),

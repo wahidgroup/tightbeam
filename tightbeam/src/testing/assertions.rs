@@ -7,14 +7,17 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use crate::asn1::{MessagePriority, Version};
 use crate::testing::macros::Cardinality;
 
+#[cfg(feature = "std")]
+use std::borrow::Cow;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AssertionLabel {
-	Custom(&'static str),
+	Custom(Cow<'static, str>),
 }
 
 /// Type-safe wrapper for assertion values supporting PartialEq comparison
@@ -27,7 +30,7 @@ pub enum AssertionValue {
 	U64(u64),
 	I32(i32),
 	I64(i64),
-	F64(f64),
+	F64(f64), // f64 implements PartialOrd and PartialEq — not Ord or Eq
 	MessagePriority(MessagePriority),
 	Version(Version),
 	Some(Box<AssertionValue>),

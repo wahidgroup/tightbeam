@@ -17,12 +17,14 @@ formats MAY change WITHOUT notice. It is NOT yet production-ready.
 
 ## Copyright Notice
 
-   Copyright (C) Tanveer Wahid, WahidGroup, LLC (2025).  All Rights Reserved.
+Copyright (C) Tanveer Wahid, WahidGroup, LLC (2025).  All Rights Reserved.
 
 ## Abstract
 
 tightbeam is a Layer-5 messaging framework using ASN.1 DER encoding with
 versioned metadata structures for high-fidelity information transmission.
+
+> Zero-Copy, Zero-Panic, no_std-Ready
 
 ## Table of Contents
 

@@ -6,7 +6,7 @@ use crate::Errorizable;
 pub type Result<T> = core::result::Result<T, TransportError>;
 
 /// Reasons why a message failed to be sent before network I/O
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TransportFailure {
 	/// DER encoding failed
 	EncodingFailed,

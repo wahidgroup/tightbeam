@@ -4,6 +4,7 @@
 //! This module is FDR-specific: trace-to-process conversion is used for refinement checking
 //! (comparing trace_process ⊑ spec_process), not for general CSP validation.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Write;
 
@@ -193,7 +194,7 @@ impl FdrTraceExt for ConsumedTrace {
 	fn assertion_count(&self, label: &str) -> usize {
 		self.assertions
 			.iter()
-			.filter(|a| matches!(&a.label, AssertionLabel::Custom(l) if *l == label))
+			.filter(|a| matches!(&a.label, AssertionLabel::Custom(l) if l.as_ref() == label))
 			.count()
 	}
 
@@ -295,14 +296,16 @@ impl FdrTraceExt for ConsumedTrace {
 		// Always include assertions
 		for assertion in &self.assertions {
 			let AssertionLabel::Custom(label) = &assertion.label;
-			events.push(TraceEvent::Assertion { seq: assertion.seq, label });
+			let static_label: &'static str = match label {
+				Cow::Borrowed(s) => s,
+				Cow::Owned(s) => Box::leak(s.clone().into_boxed_str()),
+			};
+			events.push(TraceEvent::Assertion { seq: assertion.seq, label: static_label });
 		}
 
 		// Include instrumentation events based on mode
 		#[cfg(feature = "instrument")]
 		{
-			// TbEventKind removed - use events module constants instead
-
 			match mode {
 				TraceProcessMode::AssertionsOnly => {
 					// No instrumentation events

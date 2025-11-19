@@ -1,7 +1,7 @@
 error[E0277]: the trait bound `Aes128Message: CheckAeadOid<Aes256GcmOid>` is not satisfied
   --> tests/compile/algorithm_mismatch.rs:44:4
    |
-44 |         .with_cipher::<Aes256GcmOid, Aes256Gcm>(&cipher);
+44 |         .with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher);
    |          ^^^^^^^^^^^ unsatisfied trait bound
    |
 help: the trait `CheckAeadOid<Aes256GcmOid>` is not implemented for `Aes128Message`
@@ -14,7 +14,7 @@ help: the trait `CheckAeadOid<Aes256GcmOid>` is not implemented for `Aes128Messa
 note: required by a bound in `FrameBuilder::<T>::with_cipher`
   --> src/builder/frame.rs
    |
-   |     pub fn with_cipher<C, Cipher>(mut self, cipher: &Cipher) -> Self
+   |     pub fn with_cipher<C, Cipher>(mut self, cipher: Cipher) -> Self
    |            ----------- required by a bound in this associated function
 ...
    |         T: CheckAeadOid<C>,

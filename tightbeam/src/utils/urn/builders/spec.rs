@@ -4,10 +4,10 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
 #[cfg(feature = "std")]
-use std::vec::Vec;
+use std::{borrow::Cow, vec::Vec};
 
 use crate::utils::urn::{UrnComponents, UrnValidationError};
 
@@ -52,7 +52,7 @@ pub enum Constraint {
 	/// Field must equal a constant value
 	Const(&'static str),
 	/// Field must be one of the given values
-	OneOf(Vec<&'static str>),
+	OneOf(Cow<'static, [&'static str]>),
 }
 
 impl Constraint {
@@ -146,9 +146,9 @@ impl UrnSpecBuilder {
 	}
 
 	/// Add a oneof constraint to the specified field
-	pub fn field_oneof(mut self, name: &'static str, options: &[&'static str]) -> Self {
+	pub fn field_oneof(mut self, name: &'static str, options: &'static [&'static str]) -> Self {
 		let index = self.get_or_create_field_index(name, true);
-		self.fields[index].constraints.push(Constraint::OneOf(options.to_vec()));
+		self.fields[index].constraints.push(Constraint::OneOf(Cow::Borrowed(options)));
 		self
 	}
 
@@ -363,7 +363,7 @@ mod tests {
 		];
 
 		for (options, valid_values, invalid_values) in oneof_test_cases {
-			let constraint = Constraint::OneOf(options.to_vec());
+			let constraint = Constraint::OneOf(Cow::Borrowed(*options));
 			for value in *valid_values {
 				assert!(constraint.matches(value), "OneOf({options:?}) should match '{value}'");
 			}
@@ -382,7 +382,7 @@ mod tests {
 	#[test]
 	fn test_constraint_pattern_str() {
 		assert_eq!(Constraint::Const("value").pattern_str(), "const(\"value\")");
-		assert_eq!(Constraint::OneOf(vec!["a", "b"]).pattern_str(), "oneof(...)");
+		assert_eq!(Constraint::OneOf(Cow::Borrowed(&["a", "b"])).pattern_str(), "oneof(...)");
 	}
 
 	#[test]

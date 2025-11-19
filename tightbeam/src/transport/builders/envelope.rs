@@ -14,12 +14,6 @@ use crate::der::Encode;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::{ResponsePackage, TransportEnvelope, TransportResult, WireEnvelope, WireMode};
 
-/// Helper to unwrap an Arc<Frame> to an owned Frame.
-#[inline]
-fn unwrap_arc_frame(arc: Arc<Frame>) -> Frame {
-	Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
-}
-
 #[cfg(feature = "x509")]
 use crate::crypto::aead::RuntimeAead;
 
@@ -149,23 +143,38 @@ impl<'a> EnvelopeBuilder<'a> {
 		}
 	}
 
-	fn build_cleartext(envelope: TransportEnvelope, max_cleartext: Option<usize>) -> TransportResult<WireEnvelope> {
-		let request_frame = match &envelope {
-			TransportEnvelope::Request(pkg) => Some(pkg.message.clone()),
+	fn encode_and_validate(
+		envelope: &TransportEnvelope,
+		max_size: Option<usize>,
+	) -> TransportResult<(Vec<u8>, impl Fn(TransportFailure) -> TransportError + '_)> {
+		let request_frame = match envelope {
+			TransportEnvelope::Request(pkg) => Some(Arc::clone(&pkg.message)),
 			_ => None,
 		};
 
-		let request_frame_owned = request_frame.map(unwrap_arc_frame);
-		let encoded = envelope
-			.to_der()
-			.map_err(|err| Self::map_der_error(request_frame_owned.as_ref(), err))?;
+		let with_frame = move |failure: TransportFailure| -> TransportError {
+			request_frame
+				.clone() // Arc clone
+				.map(|arc| {
+					// Non-hot path clone
+					let frame = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());
+					failure.with_frame(frame)
+				})
+				.unwrap_or_else(|| failure.into())
+		};
 
-		if let Some(max) = max_cleartext {
+		let encoded = envelope.to_der().map_err(|_| with_frame(TransportFailure::EncodingFailed))?;
+		if let Some(max) = max_size {
 			if encoded.len() > max {
-				return Err(TransportFailure::SizeExceeded.with_optional_frame(request_frame_owned));
+				return Err(with_frame(TransportFailure::SizeExceeded));
 			}
 		}
 
+		Ok((encoded, with_frame))
+	}
+
+	fn build_cleartext(envelope: TransportEnvelope, max_cleartext: Option<usize>) -> TransportResult<WireEnvelope> {
+		let _ = Self::encode_and_validate(&envelope, max_cleartext)?;
 		Ok(WireEnvelope::Cleartext(envelope))
 	}
 
@@ -174,44 +183,16 @@ impl<'a> EnvelopeBuilder<'a> {
 		max_encrypted: Option<usize>,
 		encryptor: Option<&'a RuntimeAead>,
 	) -> TransportResult<WireEnvelope> {
-		let request_frame = match &envelope {
-			TransportEnvelope::Request(pkg) => Some(pkg.message.clone()),
-			_ => None,
-		};
+		let (encoded, with_frame) = Self::encode_and_validate(&envelope, max_encrypted)?;
+		let nonce = crate::random::generate_nonce::<12>(None)
+			.map_err(|_| with_frame(TransportFailure::NonceGenerationFailed))?;
 
-		let request_frame_owned = request_frame.map(unwrap_arc_frame);
-		let encoded = envelope
-			.to_der()
-			.map_err(|err| Self::map_der_error(request_frame_owned.as_ref(), err))?;
-
-		if let Some(max) = max_encrypted {
-			if encoded.len() > max {
-				return Err(TransportFailure::SizeExceeded.with_optional_frame(request_frame_owned));
-			}
-		}
-
-		let nonce = match crate::random::generate_nonce::<12>(None) {
-			Ok(n) => n,
-			Err(_) => return Err(TransportFailure::NonceGenerationFailed.with_optional_frame(request_frame_owned)),
-		};
-
-		let encryptor = match encryptor {
-			Some(e) => e,
-			None => return Err(TransportFailure::EncryptorUnavailable.with_optional_frame(request_frame_owned)),
-		};
-
-		let encrypted = match encryptor.encrypt_content(&encoded, nonce, None) {
-			Ok(e) => e,
-			Err(_) => return Err(TransportFailure::EncryptionFailed.with_optional_frame(request_frame_owned)),
-		};
+		let encryptor = encryptor.ok_or_else(|| with_frame(TransportFailure::EncryptorUnavailable))?;
+		let encrypted = encryptor
+			.encrypt_content(&encoded, nonce, None)
+			.map_err(|_| with_frame(TransportFailure::EncryptionFailed))?;
 
 		Ok(WireEnvelope::Encrypted(encrypted))
-	}
-
-	fn map_der_error(frame: Option<&Frame>, err: der::Error) -> TransportError {
-		frame
-			.map(|message| TransportFailure::EncodingFailed.with_frame(message.clone()))
-			.unwrap_or_else(|| TransportError::from(err))
 	}
 }
 

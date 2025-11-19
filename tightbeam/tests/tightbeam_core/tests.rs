@@ -117,8 +117,8 @@ fn build_version_frame(
 	if version >= tb::Version::V1 {
 		builder = builder
 			.with_message_hasher::<Sha3_256>()
-			.with_cipher::<Aes256GcmOid, _>(&crypto.cipher)
-			.with_signer::<Secp256k1Signature, _>(&crypto.signing_key);
+			.with_cipher::<Aes256GcmOid, _>(crypto.cipher.clone())
+			.with_signer::<Secp256k1Signature, _>(crypto.signing_key.clone());
 	}
 
 	if version >= tb::Version::V2 {
