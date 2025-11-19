@@ -97,6 +97,11 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	IoError(std::io::Error),
 
+	#[cfg(feature = "std")]
+	/// Lock poisoned
+	#[cfg_attr(feature = "derive", error("Lock poisoned"))]
+	LockPoisoned,
+
 	/// Invalid or unsupported algorithm identifier
 	#[cfg_attr(feature = "derive", error("Invalid or unsupported object identifier: {0}"))]
 	InvalidOID(crate::der::oid::Error),
@@ -293,6 +298,8 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),
 			#[cfg(feature = "colony")]
 			TightBeamError::DroneError(err) => write!(f, "Drone error: {err}"),
+			#[cfg(feature = "std")]
+			TightBeamError::LockPoisoned => write!(f, "Lock poisoned"),
 			#[cfg(feature = "standards")]
 			TightBeamError::StandardError(err) => write!(f, "Standard error: {err}"),
 			#[cfg(feature = "random")]
@@ -406,6 +413,13 @@ crate::impl_from!(crate::utils::urn::UrnValidationError => TightBeamError::UrnVa
 
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for TightBeamError {}
+
+#[cfg(feature = "std")]
+impl<T> From<std::sync::PoisonError<T>> for TightBeamError {
+	fn from(_: std::sync::PoisonError<T>) -> Self {
+		TightBeamError::LockPoisoned
+	}
+}
 
 #[cfg(all(feature = "compress", not(feature = "derive")))]
 impl core::error::Error for CompressionError {}

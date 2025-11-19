@@ -176,10 +176,7 @@ pub mod active {
 
 	impl crate::der::EncodeValue for TbEvent {
 		fn value_len(&self) -> crate::der::Result<crate::der::Length> {
-			let mut len = match self.seq.encoded_len() {
-				Ok(l) => l,
-				Err(e) => return Err(e),
-			};
+			let mut len = self.seq.encoded_len()?;
 
 			// Encode Urn directly (it implements EncodeValue)
 			len = match self.urn.encoded_len() {
@@ -194,10 +191,7 @@ pub mod active {
 				};
 			}
 			if let Some(ref payload_hash) = self.payload_hash {
-				let os = match OctetString::new(payload_hash.as_slice()) {
-					Ok(o) => o,
-					Err(e) => return Err(e),
-				};
+				let os = OctetString::new(payload_hash.as_slice())?;
 				len = match os.encoded_len() {
 					Ok(l) => (len + l)?,
 					Err(e) => return Err(e),
@@ -216,10 +210,7 @@ pub mod active {
 			};
 
 			if let Some(ref extras) = self.extras {
-				let os = match OctetString::new(extras.as_slice()) {
-					Ok(o) => o,
-					Err(e) => return Err(e),
-				};
+				let os = OctetString::new(extras.as_slice())?;
 				len = match os.encoded_len() {
 					Ok(l) => (len + l)?,
 					Err(e) => return Err(e),

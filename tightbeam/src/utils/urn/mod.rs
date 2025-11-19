@@ -224,7 +224,7 @@ impl<'a> DecodeValue<'a> for Urn<'a> {
 		let rest = &urn_str[4..]; // Skip "urn:"
 		let colon_pos = rest
 			.find(':')
-			.ok_or_else(|| crate::der::ErrorKind::Value { tag: Tag::Utf8String })?;
+			.ok_or(crate::der::ErrorKind::Value { tag: Tag::Utf8String })?;
 
 		let nid = &rest[..colon_pos];
 		let nss = &rest[colon_pos + 1..];

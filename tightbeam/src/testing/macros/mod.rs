@@ -2439,9 +2439,9 @@ mod tests {
 		spec: DemoSpec,
 		environment Bare {
 			exec: |trace| {
-				trace.event("Received").emit();
-				trace.event("Responded").emit();
-				trace.event("Responded").emit();
+				trace.event("Received");
+				trace.event("Responded");
+				trace.event("Responded");
 				Ok(())
 			}
 		}
@@ -2452,8 +2452,8 @@ mod tests {
 		specs: [DemoSpec::get(1, 0, 0)],
 		environment Bare {
 			exec: |trace| {
-				trace.event("Received").emit();
-				trace.event("Responded").emit();
+				trace.event("Received");
+				trace.event("Responded");
 				Ok(())
 			}
 		}
@@ -2471,8 +2471,8 @@ mod tests {
 			specs: [DemoSpec::get(1, 0, 0), DemoSpec::get(1, 1, 0)],
 			environment Bare {
 				exec: |trace| {
-					trace.event("Received").emit();
-					trace.event("Responded").emit();
+					trace.event("Received");
+					trace.event("Responded");
 					Ok(())
 				}
 			}
@@ -2491,10 +2491,10 @@ mod tests {
 		}
 
 		fn process(&mut self) -> Result<(), crate::TightBeamError> {
-			self.trace.event("Received").emit();
+			self.trace.event("Received");
 			self.received_count += 1;
-			self.trace.event("Responded").emit();
-			self.trace.event("Responded").emit();
+			self.trace.event("Responded");
+			self.trace.event("Responded");
 			Ok(())
 		}
 	}
@@ -2514,9 +2514,9 @@ mod tests {
 		environment Worker {
 			setup: TestWorker::new,
 			stimulus: |trace, worker: &mut TestWorker| {
-				trace.event("Received").emit();
+				trace.event("Received");
 				worker.received_count += 1;
-				trace.event("Responded").emit();
+				trace.event("Responded");
 				Ok(())
 			}
 		}
@@ -2536,9 +2536,9 @@ mod tests {
 					protocol TokioListener: listener,
 					assertions: trace,
 					handle: |frame, trace| async move {
-						trace.event("Received").emit();
-						trace.event("Responded").emit();
-						trace.event("Responded").emit();
+						trace.event("Received");
+						trace.event("Responded");
+						trace.event("Responded");
 						Ok(Some(frame))
 					}
 				};
@@ -2575,13 +2575,13 @@ mod tests {
 					assertions: trace,
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.event("Received").emit();
-						trace.event("Responded").emit();
+						trace.event("Received");
+						trace.event("Responded");
 
 						// Decode message to extract value for assertion
 						let decoded: Result<TestMessage, _> = crate::decode(&frame.message);
 						if let Ok(msg) = decoded {
-							trace.event_with("message_content", &[], msg.content).emit();
+							trace.event_with("message_content", &[], msg.content);
 						}
 
 						Ok(Some(frame))
@@ -2592,7 +2592,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.event("Responded").emit();
+				trace.event("Responded");
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -2602,7 +2602,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event("Received").emit();
+				trace.event("Received");
 
 				Ok(())
 			}

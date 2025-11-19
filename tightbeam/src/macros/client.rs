@@ -437,7 +437,7 @@ pub mod builder {
 		where
 			P::Transport: MessageEmitter + MessageCollector + PolicyConf,
 		{
-			let stream = self.stream.expect("stream must be present");
+			let stream = self.stream.ok_or(TransportError::ConnectionFailed)?;
 			let transport = <P as Protocol>::create_transport(stream);
 			let configured = self.policies.apply::<P>(transport);
 			Ok(GenericClient::from_transport(configured))
@@ -468,12 +468,14 @@ pub mod builder {
 	}
 
 	// Conversions
-	impl<P: Protocol> From<ClientBuilder<P>> for GenericClient<P>
+	impl<P: Protocol> TryFrom<ClientBuilder<P>> for GenericClient<P>
 	where
 		P::Transport: MessageEmitter + MessageCollector + PolicyConf,
 	{
-		fn from(builder: ClientBuilder<P>) -> Self {
-			builder.build().expect("client builder failed")
+		type Error = TransportError;
+
+		fn try_from(builder: ClientBuilder<P>) -> Result<Self, Self::Error> {
+			builder.build()
 		}
 	}
 	impl crate::policy::GatePolicy for Arc<dyn crate::policy::GatePolicy + Send + Sync> {

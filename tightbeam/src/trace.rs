@@ -1,27 +1,23 @@
 #![allow(unexpected_cfgs)]
 
+use core::cell::Cell;
 use core::time::Duration;
 
-#[cfg(feature = "std")]
-use std::borrow::Cow;
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex};
 
 #[cfg(not(feature = "std"))]
-use alloc::borrow::Cow;
-#[cfg(not(feature = "std"))]
 use alloc::sync::{Arc, Mutex};
 
+use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{Assertion, AssertionLabel, AssertionValue};
 use crate::transport::error::TransportError;
 use crate::utils::urn::Urn;
 use crate::Frame;
 
-use sha3::{Digest, Sha3_256};
-
 #[cfg(feature = "instrument")]
-use crate::instrumentation::{TbEvent, TbInstrumentationConfig};
+use crate::instrumentation::{events, TbEvent, TbInstrumentationConfig};
 
 /// Configuration for trace collection
 #[derive(Clone, Debug, Default)]
@@ -68,6 +64,7 @@ pub struct EventBuilder<'a> {
 	duration_ns: Option<u64>,
 	#[cfg(feature = "instrument")]
 	payload: Option<&'a [u8]>,
+	emitted: Cell<bool>,
 }
 
 impl<'a> EventBuilder<'a> {
@@ -81,6 +78,7 @@ impl<'a> EventBuilder<'a> {
 			duration_ns: None,
 			#[cfg(feature = "instrument")]
 			payload: None,
+			emitted: Cell::new(false),
 		}
 	}
 
@@ -109,28 +107,45 @@ impl<'a> EventBuilder<'a> {
 	}
 
 	/// Emit the event (both assertion and instrumentation if enabled)
+	/// This is automatically called when the builder is dropped.
 	pub fn emit(self) {
+		self.emit_internal();
+	}
+
+	fn emit_internal(&self) {
+		fn leak_label(label: &str) -> &'static str {
+			Box::leak(label.to_string().into_boxed_str())
+		}
+
+		// Check if already emitted
+		if self.emitted.get() {
+			return;
+		}
+
+		self.emitted.set(true);
+
 		let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
 		let static_label: &'static str = leak_label(&self.label);
-		let assertion = match self.value {
+		let assertion = match &self.value {
 			Some(EventValue::None) | None => {
 				#[cfg(feature = "instrument")]
 				{
-					use crate::instrumentation::events;
-					self.collector.emit_internal(
-						events::ASSERT_LABEL,
-						Some(&self.label),
-						self.payload,
-						self.duration_ns,
-					);
+					// Use TIMING_WCET URN if duration is specified, otherwise ASSERT_LABEL
+					let urn = if self.duration_ns.is_some() {
+						events::TIMING_WCET
+					} else {
+						events::ASSERT_LABEL
+					};
+
+					self.collector
+						.emit_internal(urn, Some(&self.label), self.payload, self.duration_ns);
 				}
-				Assertion::new(seq, AssertionLabel::Custom(static_label), self.tags, None)
+				Assertion::new(seq, AssertionLabel::Custom(static_label), self.tags.clone(), None)
 			}
 			Some(EventValue::Value(assertion_value)) => {
 				#[cfg(feature = "instrument")]
 				{
-					use crate::instrumentation::events;
-					let value_str = format_assertion_value(&assertion_value);
+					let value_str = format_assertion_value(assertion_value);
 					self.collector.emit_internal(
 						events::ASSERT_PAYLOAD,
 						Some(&self.label),
@@ -138,7 +153,13 @@ impl<'a> EventBuilder<'a> {
 						self.duration_ns,
 					);
 				}
-				Assertion::with_value(seq, AssertionLabel::Custom(static_label), self.tags, None, assertion_value)
+				Assertion::with_value(
+					seq,
+					AssertionLabel::Custom(static_label),
+					self.tags.clone(),
+					None,
+					assertion_value.clone(),
+				)
 			}
 		};
 
@@ -148,6 +169,12 @@ impl<'a> EventBuilder<'a> {
 
 		#[cfg(feature = "testing-fuzz")]
 		self.collector.dispatch_csp_event(&self.label);
+	}
+}
+
+impl<'a> Drop for EventBuilder<'a> {
+	fn drop(&mut self) {
+		self.emit_internal();
 	}
 }
 
@@ -241,13 +268,13 @@ impl TraceCollector {
 
 	/// Record an event with no tags or value.
 	/// Returns an EventBuilder for optional chaining.
-	pub fn event(&self, label: impl AsRef<str>) -> EventBuilder {
+	pub fn event(&self, label: impl AsRef<str>) -> EventBuilder<'_> {
 		EventBuilder::new(self, label.as_ref().to_string(), Vec::new(), None)
 	}
 
 	/// Record an event with explicit tags and optional value.
 	/// Returns an EventBuilder for optional chaining.
-	pub fn event_with<V>(&self, label: &str, tags: &[&'static str], value: V) -> EventBuilder
+	pub fn event_with<V>(&self, label: &str, tags: &[&'static str], value: V) -> EventBuilder<'_>
 	where
 		V: Into<EventValue>,
 	{
@@ -288,13 +315,7 @@ impl TraceCollector {
 	}
 
 	#[cfg(feature = "instrument")]
-	fn emit_internal(
-		&self,
-		event_urn: Urn<'static>,
-		label: Option<&str>,
-		payload: Option<&[u8]>,
-		duration_ns: Option<u64>,
-	) {
+	fn emit_internal(&self, urn: Urn<'static>, label: Option<&str>, payload: Option<&[u8]>, duration_ns: Option<u64>) {
 		let cfg = self.state.config;
 		let seq = self.next_seq();
 
@@ -313,7 +334,7 @@ impl TraceCollector {
 
 		let event = TbEvent {
 			seq,
-			urn: event_urn, // URN is cloned, not moved - cheap for borrowed Cow
+			urn,
 			label: label.map(|l| l.to_string()),
 			payload_hash,
 			duration_ns: if cfg.record_durations {
@@ -382,10 +403,6 @@ impl Default for TraceCollector {
 	fn default() -> Self {
 		Self::new()
 	}
-}
-
-fn leak_label(label: &str) -> &'static str {
-	Box::leak(label.to_string().into_boxed_str())
 }
 
 fn hash_payload(payload: &[u8]) -> [u8; 32] {
@@ -472,11 +489,7 @@ impl ConsumedTrace {
 		self.response.is_some()
 	}
 
-	pub fn count_assertions(
-		&self,
-		label: &crate::testing::assertions::AssertionLabel,
-		tags: Option<&[&'static str]>,
-	) -> usize {
+	pub fn count_assertions(&self, label: &AssertionLabel, tags: Option<&[&'static str]>) -> usize {
 		self.assertions
 			.iter()
 			.filter(|a| {
@@ -557,8 +570,8 @@ mod tests {
 		environment Bare {
 			exec: |trace| {
 				let other = trace.clone();
-				trace.event("alpha").emit();
-				other.event("beta").emit();
+				trace.event("alpha");
+				other.event("beta");
 				Ok(())
 			}
 		}

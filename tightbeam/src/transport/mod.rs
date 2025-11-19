@@ -1081,11 +1081,11 @@ mod tests {
 
 	#[cfg(feature = "aes-gcm")]
 	#[test]
-	fn test_envelope_builder_encrypted_limit_returns_message() {
+	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
 
 		let frame = create_v0_tightbeam(None, None);
-		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32]).expect("cipher");
+		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32]).map_err(|_| "Invalid key")?;
 		let encryptor = RuntimeAead::new(cipher, Aes256GcmOid::OID);
 
 		let err = EnvelopeBuilder::request(frame.clone())
@@ -1101,5 +1101,6 @@ mod tests {
 			}
 			other => panic!("unexpected error variant: {other:?}"),
 		}
+		Ok(())
 	}
 }

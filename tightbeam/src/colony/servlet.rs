@@ -98,8 +98,8 @@ macro_rules! __tightbeam_servlet_parallelize_methods {
 				async move {
 					$crate::paste::paste! {
 						$(
-							let msg_arc = ::std::sync::Arc::clone(&message);
-							let [<r $worker_field>] = self.$worker_field.relay(trace.clone(), msg_arc);
+							let msg_arc = Arc::clone(&message);
+							let [<r $worker_field>] = self.$worker_field.relay(trace.clone(), Arc::clone(&msg_arc));
 						)*
 						tokio::join!($([<r $worker_field>],)*)
 					}
@@ -126,7 +126,7 @@ macro_rules! __tightbeam_servlet_parallelize_methods {
 			{
 				$crate::paste::paste! {
 					$(
-						let [<r $worker_field>] = self.$worker_field.relay(trace.clone(), ::std::sync::Arc::clone(&message)).await;
+						let [<r $worker_field>] = self.$worker_field.relay(trace.clone(), Arc::clone(&message)).await;
 					)*
 					($([<r $worker_field>],)*)
 				}
@@ -1245,12 +1245,12 @@ macro_rules! servlet {
 					let config_arc = config_arc.clone();
 					let workers_arc = workers_arc.clone();
 					let trace_handle = trace_handle.clone();
-				async move {
-					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
-					let $config_param = &config_arc;
-					let $workers_param = &workers_arc;
-					$body
-				}
+					async move {
+						let $trace_param = trace_handle.lock()?.clone();
+						let $config_param = &config_arc;
+						let $workers_param = &workers_arc;
+						$body
+					}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1270,7 +1270,7 @@ macro_rules! servlet {
 					let workers_arc = workers_arc.clone();
 					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+					let $trace_param = trace_handle.lock()?.clone();
 					let $config_param = &config_arc;
 					let $workers_param = &workers_arc;
 					$body
@@ -1351,7 +1351,7 @@ macro_rules! servlet {
 					let config_arc = config_arc.clone();
 					let trace_handle = trace_handle.clone();
 					async move {
-						let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+						let $trace_param = trace_handle.lock()?.clone();
 						let $router_param = &router_arc;
 						let $config_param = &config_arc;
 						$body
@@ -1375,7 +1375,7 @@ macro_rules! servlet {
 					let config_arc = config_arc.clone();
 					let trace_handle = trace_handle.clone();
 					async move {
-						let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+						let $trace_param = trace_handle.lock()?.clone();
 						let $router_param = &router_arc;
 						let $config_param = &config_arc;
 						$body
@@ -1398,7 +1398,7 @@ macro_rules! servlet {
 					let config_arc = config_arc.clone();
 					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+					let $trace_param = trace_handle.lock()?.clone();
 					let $config_param = &config_arc;
 					$body
 				}
@@ -1419,7 +1419,7 @@ macro_rules! servlet {
 					let config_arc = config_arc.clone();
 					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+					let $trace_param = trace_handle.lock()?.clone();
 					let $config_param = &config_arc;
 					$body
 				}
@@ -1441,7 +1441,7 @@ macro_rules! servlet {
 					let router_arc = router_arc.clone();
 					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+					let $trace_param = trace_handle.lock()?.clone();
 					let $router_param = &router_arc;
 					$body
 				}
@@ -1462,7 +1462,7 @@ macro_rules! servlet {
 					let router_arc = router_arc.clone();
 					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+					let $trace_param = trace_handle.lock()?.clone();
 					let $router_param = &router_arc;
 					$body
 				}
@@ -1482,7 +1482,7 @@ macro_rules! servlet {
 				handle: move |$msg: $crate::Frame| {
 					let trace_handle = trace_handle.clone();
 					async move {
-						let $trace = trace_handle.lock().expect("trace poisoned").clone();
+						let $trace = trace_handle.lock()?.clone();
 						$body
 					}
 				}
@@ -1501,7 +1501,7 @@ macro_rules! servlet {
 				handle: move |$msg: $crate::Frame| {
 					let trace_handle = trace_handle.clone();
 					async move {
-						let $trace = trace_handle.lock().expect("trace poisoned").clone();
+						let $trace = trace_handle.lock()?.clone();
 						$body
 					}
 				}
@@ -1522,10 +1522,10 @@ macro_rules! servlet {
 				policies: { $($policy_key: $policy_val),* },
 				handle: move |$msg: $crate::Frame| {
 					let trace_handle = trace_handle.clone();
-				async move {
-					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
-					$body
-				}
+					async move {
+						let $trace_param = trace_handle.lock()?.clone();
+						$body
+					}
 				}
 			};
 
@@ -1544,7 +1544,7 @@ macro_rules! servlet {
 				handle: move |$msg: $crate::Frame| {
 					let trace_handle = trace_handle.clone();
 				async move {
-					let $trace_param = trace_handle.lock().expect("trace poisoned").clone();
+					let $trace_param = trace_handle.lock()?.clone();
 					$body
 				}
 				}
@@ -1638,13 +1638,13 @@ mod tests {
 			// Test winning case
 			let ping_message = generate_message(42, None)?;
 			let response = client.emit(ping_message, None).await?;
-			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
+			let response_message: ResponseMessage = crate::decode(&response.ok_or("No response")?.message)?;
 			assert_eq!(response_message.result, "PONG");
 			assert!(response_message.is_winner);
 
 			let ping_message_loser = generate_message(99, None)?;
 			let response = client.emit(ping_message_loser, None).await?;
-			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
+			let response_message: ResponseMessage = crate::decode(&response.ok_or("No response")?.message)?;
 			assert_eq!(response_message.result, "PONG");
 			assert!(!response_message.is_winner);
 
@@ -1770,7 +1770,7 @@ mod tests {
 				// Test winning case
 				let ping_message = generate_message(42, None)?;
 				let response = client.emit(ping_message, None).await?;
-				let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
+				let response_message: ResponseMessage = crate::decode(&response.ok_or("No response")?.message)?;
 				assert_eq!(response_message.result, "PONG");
 				assert!(response_message.is_winner);
 

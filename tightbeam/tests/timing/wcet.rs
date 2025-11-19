@@ -77,9 +77,7 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Emit timing event with duration within WCET constraint (5ms < 10ms)
-			trace.event("process")
-				.with_timing(Duration::from_nanos(5_000_000))
-				.emit();
+			trace.event("process").with_timing(Duration::from_nanos(5_000_000));
 			Ok(())
 		}
 	},
@@ -118,9 +116,7 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Emit timing event with duration exactly at WCET constraint (10ms == 10ms)
-			trace.event("process")
-				.with_timing(Duration::from_nanos(10_000_000))
-				.emit();
+			trace.event("process").with_timing(Duration::from_nanos(10_000_000));
 			Ok(())
 		}
 	},
@@ -160,9 +156,7 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Emit timing event with duration exceeding WCET constraint (15ms > 10ms)
-			trace.event("process")
-				.with_timing(Duration::from_nanos(15_000_000))
-				.emit();
+			trace.event("process").with_timing(Duration::from_nanos(15_000_000));
 			Ok(())
 		}
 	},

@@ -49,7 +49,7 @@ macro_rules! test_job {
 		assertions: |$frame:ident| $assertions:block
 	) => {
 		#[test]
-		fn $test_name() {
+		fn $test_name() -> ::core::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
 			let $frame = $job;
 			$assertions
 		}
@@ -62,7 +62,7 @@ macro_rules! test_job {
 	) => {
 		#[cfg(feature = "tokio")]
 		#[tokio::test]
-		async fn $test_name() {
+		async fn $test_name() -> ::core::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
 			let $frame = $job;
 			$assertions
 		}
@@ -168,12 +168,13 @@ mod tests {
 		name: test_spawn_servlet_job,
 		job: SpawnServletJob::run("worker_servlet", None),
 		assertions: |frame| {
-			let frame = frame.unwrap();
+			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata.id, b"spawn-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message).unwrap();
+			let request: HiveManagementRequest = crate::decode(&frame.message)?;
 			assert!(request.spawn.is_some());
-			assert_eq!(request.spawn.unwrap().servlet_type, b"worker_servlet");
+			assert_eq!(request.spawn.expect("spawn should be Some").servlet_type, b"worker_servlet");
+			Ok(())
 		}
 	}
 
@@ -181,11 +182,12 @@ mod tests {
 		name: test_list_servlets_job,
 		job: ListServletsJob::run(),
 		assertions: |frame| {
-			let frame = frame.unwrap();
+			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata.id, b"list-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message).unwrap();
+			let request: HiveManagementRequest = crate::decode(&frame.message)?;
 			assert!(request.list.is_some());
+			Ok(())
 		}
 	}
 
@@ -193,12 +195,13 @@ mod tests {
 		name: test_stop_servlet_job,
 		job: StopServletJob::run("worker_servlet_127.0.0.1:8080"),
 		assertions: |frame| {
-			let frame = frame.unwrap();
+			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata.id, b"stop-req");
 
-			let request: HiveManagementRequest = crate::decode(&frame.message).unwrap();
+			let request: HiveManagementRequest = crate::decode(&frame.message)?;
 			assert!(request.stop.is_some());
-			assert_eq!(request.stop.unwrap().servlet_id, b"worker_servlet_127.0.0.1:8080");
+			assert_eq!(request.stop.expect("stop should be Some").servlet_id, b"worker_servlet_127.0.0.1:8080");
+			Ok(())
 		}
 	}
 
@@ -206,11 +209,12 @@ mod tests {
 		name: test_async_job,
 		job: AsyncCalculationJob::run(10, 32),
 		assertions: |frame| async move {
-			let frame = frame.await.unwrap();
+			let frame = frame.await?;
 			assert_eq!(frame.metadata.id, b"calc-result");
 
-			let result: crate::testing::TestMessage = crate::decode(&frame.message).unwrap();
+			let result: crate::testing::TestMessage = crate::decode(&frame.message)?;
 			assert_eq!(result.content, "42");
+			Ok(())
 		}
 	}
 }

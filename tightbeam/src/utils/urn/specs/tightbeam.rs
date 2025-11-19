@@ -267,7 +267,7 @@ mod tests {
 					.set("resource_id", "abc-123")
 					.build()?;
 
-				trace.event_with("urn_string", &[], urn.to_string()).emit();
+				trace.event_with("urn_string", &[], urn.to_string());
 
 				Ok(())
 			}

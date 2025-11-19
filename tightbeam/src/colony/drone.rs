@@ -35,6 +35,7 @@
 //!
 //! ```ignore
 //! use tightbeam::drone;
+//! use tightbeam::trace::TraceCollector;
 //!
 //! // Regular drone (non-mycelial)
 //! drone! {
@@ -47,7 +48,7 @@
 //! }
 //!
 //! // Start the drone
-//! let drone = RegularDrone::start(tightbeam::trace::TraceCollector::new(), None).await?;
+//! let drone = RegularDrone::start(TraceCollector::new(), None).await?;
 //!
 //! // Register with cluster
 //! let cluster_addr = "127.0.0.1:8888".parse()?;
@@ -69,10 +70,10 @@
 //! }
 //!
 //! // Only mycelial drones can call establish_hive()
-//! let mut mycelial_drone = MycelialDrone::start(tightbeam::trace::TraceCollector::new(), None).await?;
+//! let mut mycelial_drone = MycelialDrone::start(TraceCollector::new(), None).await?;
 //! mycelial_drone.establish_hive();  // ✓ Compiles
 //!
-//! let mut regular_drone = RegularDrone::start(tightbeam::trace::TraceCollector::new(), None).await?;
+//! let mut regular_drone = RegularDrone::start(TraceCollector::new(), None).await?;
 //! // regular_drone.establish_hive();  // ✗ Compile error: Hive trait not implemented
 //! ```
 
@@ -114,6 +115,9 @@ pub enum DroneError {
 	/// Message decoding failed
 	#[cfg_attr(feature = "derive", error("Message decoding failed"))]
 	DecodeFailed,
+	/// Lock poisoned
+	#[cfg_attr(feature = "derive", error("Lock poisoned"))]
+	LockPoisoned,
 }
 
 #[cfg(not(feature = "derive"))]
@@ -126,12 +130,20 @@ impl core::fmt::Display for DroneError {
 			DroneError::EmitFailed => write!(f, "Message emission failed"),
 			DroneError::NoResponse => write!(f, "No response received"),
 			DroneError::DecodeFailed => write!(f, "Message decoding failed"),
+			DroneError::LockPoisoned => write!(f, "Lock poisoned"),
 		}
 	}
 }
 
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for DroneError {}
+
+#[cfg(feature = "std")]
+impl<T> From<::std::sync::PoisonError<T>> for DroneError {
+	fn from(_: ::std::sync::PoisonError<T>) -> Self {
+		DroneError::LockPoisoned
+	}
+}
 
 /// Message type for registering a drone with a cluster
 ///
@@ -484,7 +496,7 @@ macro_rules! drone {
 				None,
 			).await
 				.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId($error_id))?;
-			let mut active = $instance.active_servlet.lock().unwrap();
+			let mut active = $instance.active_servlet.lock()?;
 			*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
 			return Ok($crate::policy::TransitStatus::Accepted);
 		}
@@ -495,7 +507,7 @@ macro_rules! drone {
 		paste::paste! {
 			// Stop old servlet if any
 			let old_servlet = {
-				let mut active = $active_servlet.lock().unwrap();
+				let mut active = $active_servlet.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
 				core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None)
 			};
 			$stop_old(old_servlet);
@@ -508,7 +520,7 @@ macro_rules! drone {
 				Ok(servlet) => {
 					let servlet_addr = servlet.addr();
 					let addr_str: Vec<u8> = servlet_addr.clone().into();
-					let mut active = $active_servlet.lock().unwrap();
+					let mut active = $active_servlet.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
 					*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
 					drop(active);
 					return Ok(Some($crate::compose! {
@@ -517,7 +529,7 @@ macro_rules! drone {
 								status: $crate::policy::TransitStatus::Accepted,
 								servlet_address: Some(addr_str)
 							}
-					}?));
+					}.map_err(|e| $crate::TightBeamError::from(e))?));
 				}
 				Err(_) => {
 					return Ok(Some($crate::compose! {
@@ -526,7 +538,7 @@ macro_rules! drone {
 								status: $crate::policy::TransitStatus::Forbidden,
 								servlet_address: None
 							}
-					}?));
+					}.map_err(|e| $crate::TightBeamError::from(e))?));
 				}
 			}
 		}
@@ -594,7 +606,7 @@ macro_rules! drone {
 
 					// Create shared state for the active servlet
 					let active_servlet = ::std::sync::Arc::new(::std::sync::Mutex::new([<$drone_name ActiveServlet>]::None));
-					let active_servlet_clone = active_servlet.clone();
+					let active_servlet_clone = ::std::sync::Arc::clone(&active_servlet);
 
 					// Start the control server that listens for ActivateServletRequest messages
 					let control_server_handle = drone!(@build_control_server $protocol, listener, [$($policy_key: $policy_val),*], active_servlet_clone, $drone_name, $($servlet_id: $servlet_name<$input>),*);
@@ -615,16 +627,17 @@ macro_rules! drone {
 						$crate::colony::servlet_runtime::rt::abort(handle);
 					}
 					// Stop any active servlet
-					let mut active = self.active_servlet.lock().unwrap();
-					let servlet = core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None);
-					drop(active);
-					match servlet {
-						[<$drone_name ActiveServlet>]::None => {},
-						$(
-							[<$drone_name ActiveServlet>]::[<$servlet_id:camel>](s) => {
-								s.stop();
-							}
-						)*
+					if let Ok(mut active) = self.active_servlet.lock() {
+						let servlet = core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None);
+						drop(active);
+						match servlet {
+							[<$drone_name ActiveServlet>]::None => {},
+							$(
+								[<$drone_name ActiveServlet>]::[<$servlet_id:camel>](s) => {
+									s.stop();
+								}
+							)*
+						}
 					}
 				}
 
@@ -662,9 +675,10 @@ macro_rules! drone {
 				servlet_id.extend_from_slice(stringify!($servlet_id).as_bytes());
 				servlet_id.push(b'_');
 				servlet_id.extend_from_slice(&addr_str);
-				let mut servlets = $instance.servlets.lock().unwrap();
-				servlets.insert(servlet_id, [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
-				drop(servlets);
+				if let Ok(mut servlets) = $instance.servlets.lock() {
+					servlets.insert(servlet_id, [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
+					drop(servlets);
+				}
 			}
 		}
 	};
@@ -683,7 +697,7 @@ macro_rules! drone {
 					servlet_id.extend_from_slice(stringify!($servlet_id).as_bytes());
 					servlet_id.push(b'_');
 					servlet_id.extend_from_slice(&addr_str);
-					let mut servlets = $servlets.lock().unwrap();
+					let mut servlets = $servlets.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
 					servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
 					drop(servlets);
 					return Ok(Some($crate::compose! {
@@ -697,7 +711,7 @@ macro_rules! drone {
 								list: None,
 								stop: None,
 							}
-					}?));
+					}.map_err(|e| $crate::TightBeamError::from(e))?));
 				}
 				Err(_) => {
 					return Ok(Some($crate::compose! {
@@ -711,7 +725,7 @@ macro_rules! drone {
 								list: None,
 								stop: None,
 							}
-					}?));
+					}.map_err(|e| $crate::TightBeamError::from(e))?));
 				}
 			}
 		}
@@ -744,13 +758,14 @@ macro_rules! drone {
 				}
 
 				fn is_active(&self) -> bool {
-					let active = self.active_servlet.lock().unwrap();
-					!matches!(*active, [<$drone_name ActiveServlet>]::None)
+					self.active_servlet.lock()
+						.map(|active| !matches!(*active, [<$drone_name ActiveServlet>]::None))
+						.unwrap_or(false)
 				}
 
 				async fn deactivate(&mut self) -> Result<(), $crate::colony::drone::DroneError> {
 					// Take the active servlet and stop it
-					let mut active = self.active_servlet.lock().unwrap();
+					let mut active = self.active_servlet.lock()?;
 					let servlet = core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None);
 					drop(active);
 					match servlet {
@@ -887,7 +902,7 @@ macro_rules! drone {
 
 					// Create shared state for servlets
 					let servlets = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::collections::HashMap::new()));
-					let servlets_clone = servlets.clone();
+					let servlets_clone = ::std::sync::Arc::clone(&servlets);
 
 					// Start the control server that listens for management commands
 					let control_server_handle = drone!(@build_hive_control_server $protocol, listener, [$($policy_key: $policy_val),*], servlets_clone, $drone_name, $($servlet_id: $servlet_name<$input>),*);
@@ -909,14 +924,15 @@ macro_rules! drone {
 						$crate::colony::servlet_runtime::rt::abort(handle);
 					}
 					// Stop all servlets
-					let mut servlets = self.servlets.lock().unwrap();
-					for (_name, servlet) in servlets.drain() {
-						match servlet {
-							$(
-								[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => {
-									s.stop();
-								}
-							)*
+					if let Ok(mut servlets) = self.servlets.lock() {
+						for (_name, servlet) in servlets.drain() {
+							match servlet {
+								$(
+									[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => {
+										s.stop();
+									}
+								)*
+							}
 						}
 					}
 				}
@@ -957,13 +973,14 @@ macro_rules! drone {
 				}
 
 				fn is_active(&self) -> bool {
-					let servlets = self.servlets.lock().unwrap();
-					!servlets.is_empty()
+					self.servlets.lock()
+						.map(|servlets| !servlets.is_empty())
+						.unwrap_or(false)
 				}
 
 				async fn deactivate(&mut self) -> Result<(), $crate::colony::drone::DroneError> {
 					// Stop all servlets
-					let mut servlets = self.servlets.lock().unwrap();
+					let mut servlets = self.servlets.lock()?;
 					for (_name, servlet) in servlets.drain() {
 						match servlet {
 							$(
@@ -1049,20 +1066,23 @@ macro_rules! drone {
 				}
 
 				async fn servlet_addresses(&self) -> Vec<(Vec<u8>, <$protocol as $crate::transport::Protocol>::Address)> {
-					let servlets = self.servlets.lock().unwrap();
-					let mut addresses = Vec::new();
+					self.servlets.lock()
+						.map(|servlets| {
+							let mut addresses = Vec::new();
 
-					// Collect addresses of all active servlets
-					for (name, servlet) in servlets.iter() {
-						let addr = match servlet {
-							$(
-								[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.addr(),
-							)*
-						};
-						addresses.push((name.clone(), addr));
-					}
+							// Collect addresses of all active servlets
+							for (name, servlet) in servlets.iter() {
+								let addr = match servlet {
+									$(
+										[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.addr(),
+									)*
+								};
+								addresses.push((name.clone(), addr));
+							}
 
-					addresses
+							addresses
+						})
+						.unwrap_or_else(|_| Vec::new())
 				}
 			}
 		}
@@ -1097,10 +1117,10 @@ macro_rules! drone {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),+ },
 				handle: move |frame: $crate::Frame| {
-					let active_servlet = $active_servlet.clone();
-				async move {
-					drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_name<$input>),*)
-				}
+					let active_servlet = std::sync::Arc::clone(&$active_servlet);
+					async move {
+						drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_name<$input>),*)
+					}
 				}
 			}
 		}
@@ -1112,9 +1132,9 @@ macro_rules! drone {
 			$crate::server! {
 				protocol $protocol: $listener,
 				handle: move |frame: $crate::Frame| {
-					let active_servlet = $active_servlet.clone();
+					let active_servlet = ::std::sync::Arc::clone(&$active_servlet);
 				async move {
-					drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_name<$input>),*)
+					drone!(@handle_activation_request frame, $active_servlet, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 				}
 				}
 			}
@@ -1128,9 +1148,9 @@ macro_rules! drone {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),+ },
 				handle: move |frame: $crate::Frame| {
-					let servlets = $servlets.clone();
+					let servlets = ::std::sync::Arc::clone(&$servlets);
 				async move {
-					drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_name<$input>),*)
+					drone!(@handle_hive_management frame, $servlets, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 				}
 				}
 			}
@@ -1143,10 +1163,10 @@ macro_rules! drone {
 			$crate::server! {
 				protocol $protocol: $listener,
 				handle: move |frame: $crate::Frame| {
-					let servlets = $servlets.clone();
-				async move {
-					drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_name<$input>),*)
-				}
+					let servlets = ::std::sync::Arc::clone(&$servlets);
+					async move {
+						drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_name<$input>),*)
+					}
 				}
 			}
 		}
@@ -1188,7 +1208,7 @@ macro_rules! drone {
 								status: $crate::policy::TransitStatus::Forbidden,
 								servlet_address: None
 							}
-					}?));
+					}.map_err(|e| $crate::TightBeamError::from(e))?));
 				}
 
 				// Not an activation request - check if there's an active servlet to handle it
@@ -1233,12 +1253,12 @@ macro_rules! drone {
 									list: None,
 									stop: None,
 								}
-						}?));
+						}.map_err(|e| $crate::TightBeamError::from(e))?));
 					}
 
 					// Handle list request
 					if let Some(_list_params) = request.list {
-						let servlets = $servlets.lock().unwrap();
+						let servlets = $servlets.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
 						let mut servlet_list = Vec::new();
 
 						for (servlet_id, servlet) in servlets.iter() {
@@ -1265,12 +1285,12 @@ macro_rules! drone {
 									}),
 									stop: None,
 								}
-						}?));
+						}.map_err(|e| $crate::TightBeamError::from(e))?));
 					}
 
 					// Handle stop request
 					if let Some(stop_params) = request.stop {
-						let mut servlets = $servlets.lock().unwrap();
+						let mut servlets = $servlets.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
 
 						if let Some(servlet) = servlets.remove(&stop_params.servlet_id) {
 							// Stop the servlet
@@ -1290,7 +1310,7 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Accepted
 										}),
 									}
-							}?));
+							}.map_err(|e| $crate::TightBeamError::from(e))?));
 						} else {
 							drop(servlets);
 
@@ -1303,7 +1323,7 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Forbidden
 										}),
 									}
-							}?));
+							}.map_err(|e| $crate::TightBeamError::from(e))?));
 						}
 					}
 				}
@@ -1422,6 +1442,14 @@ mod tests {
 
 	mutex! { SIGNING_KEY: Secp256k1SigningKey = crate::testing::create_test_signing_key() }
 
+	// Helper to safely get signing key for gate policy initialization
+	fn get_signing_key_for_gate() -> Secp256k1VerifyingKey {
+		SIGNING_KEY()
+			.lock()
+			.map(|guard| *guard.verifying_key())
+			.unwrap_or_else(|_| *crate::testing::create_test_signing_key().verifying_key())
+	}
+
 	// Test message types
 	#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 	pub struct DroneTestMessage {
@@ -1512,15 +1540,13 @@ mod tests {
 	}
 
 	use crate::colony::servlet::Servlet;
+	use crate::trace::TraceCollector;
 
 	impl Servlet<DroneTestMessage> for SimpleServlet {
 		type Conf = ();
 		type Address = <Listener as crate::transport::Protocol>::Address;
 
-		async fn start(
-			trace: crate::trace::TraceCollector,
-			config: Option<Self::Conf>,
-		) -> Result<Self, crate::TightBeamError> {
+		async fn start(trace: TraceCollector, config: Option<Self::Conf>) -> Result<Self, crate::TightBeamError> {
 			let _ = config;
 			SimpleServlet::start(trace).await
 		}
@@ -1607,7 +1633,7 @@ mod tests {
 		RegularDrone,
 		protocol: Listener,
 		policies: {
-			with_collector_gate: [SignatureGate::new(*SIGNING_KEY().lock().unwrap().verifying_key())]
+			with_collector_gate: [SignatureGate::new(get_signing_key_for_gate())]
 		},
 		servlets: {
 			simple_servlet: SimpleServlet<DroneTestMessage>,
@@ -1630,7 +1656,7 @@ mod tests {
 			// let (ok_rx, reject_rx) = channels;
 
 			// Step 1: Send a signed activation request to morph the drone into simple_servlet
-			let signing_key = SIGNING_KEY().lock().unwrap().clone();
+			let signing_key = SIGNING_KEY().lock().map_err(|_| "Lock error")?.clone();
 			let signed_frame = ActivateServletJob::run(
 				b"cluster-activation-001",
 				b"simple_servlet",
@@ -1711,10 +1737,7 @@ mod tests {
 		type Conf = ();
 		type Address = <Listener as crate::transport::Protocol>::Address;
 
-		async fn start(
-			trace: crate::trace::TraceCollector,
-			config: Option<Self::Conf>,
-		) -> Result<Self, crate::TightBeamError> {
+		async fn start(trace: TraceCollector, config: Option<Self::Conf>) -> Result<Self, crate::TightBeamError> {
 			let _ = config;
 			EchoServlet::start(trace).await
 		}
@@ -1787,11 +1810,12 @@ mod tests {
 	#[tokio::test]
 	async fn test_hive_management_commands() -> Result<(), Box<dyn std::error::Error>> {
 		use crate::colony::drone::Hive;
+		use crate::trace::TraceCollector;
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::{MessageEmitter, Protocol};
 
 		// Start the hive
-		let mut hive = TestHive::start(crate::trace::TraceCollector::new(), None).await?;
+		let mut hive = TestHive::start(TraceCollector::new(), None).await?;
 		let control_addr = hive.addr();
 		println!("Hive control server at: {control_addr:?}");
 
@@ -1806,9 +1830,9 @@ mod tests {
 		println!("\n=== Test 1: List initial servlets ===");
 		let list_frame = ListServletsJob::run(b"list-1")?;
 
-		let response = transport.emit(list_frame, None).await?.unwrap();
+		let response = transport.emit(list_frame, None).await?.ok_or("No response")?;
 		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let list_response = management_response.list.expect("Should have list response");
+		let list_response = management_response.list.ok_or("No list response")?;
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
 		assert_eq!(list_response.servlets.len(), 2, "Should have 2 default servlets");
@@ -1825,16 +1849,16 @@ mod tests {
 		println!("\n=== Test 2: Spawn new servlet ===");
 		let spawn_frame = SpawnServletJob::run(b"spawn-1", b"simple_servlet", None)?;
 
-		let response = transport.emit(spawn_frame, None).await?.unwrap();
+		let response = transport.emit(spawn_frame, None).await?.ok_or("No response")?;
 		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let spawn_response = management_response.spawn.expect("Should have spawn response");
+		let spawn_response = management_response.spawn.ok_or("No spawn response")?;
 
 		assert_eq!(spawn_response.status, crate::policy::TransitStatus::Accepted);
 		assert!(spawn_response.servlet_address.is_some());
 		assert!(spawn_response.servlet_id.is_some());
 
-		let new_servlet_id = spawn_response.servlet_id.unwrap();
-		let new_servlet_addr = spawn_response.servlet_address.unwrap();
+		let new_servlet_id = spawn_response.servlet_id.ok_or("No servlet_id")?;
+		let new_servlet_addr = spawn_response.servlet_address.ok_or("No servlet_address")?;
 
 		println!(
 			"  Spawned: {} at {}",
@@ -1846,9 +1870,9 @@ mod tests {
 		println!("\n=== Test 3: List servlets after spawn ===");
 		let list_frame = ListServletsJob::run(b"list-2")?;
 
-		let response = transport.emit(list_frame, None).await?.unwrap();
+		let response = transport.emit(list_frame, None).await?.ok_or("No response")?;
 		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let list_response = management_response.list.expect("Should have list response");
+		let list_response = management_response.list.ok_or("No list response")?;
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
 		assert_eq!(list_response.servlets.len(), 3, "Should have 3 servlets after spawn");
@@ -1866,18 +1890,18 @@ mod tests {
 		println!("  Attempting to stop: {}", String::from_utf8_lossy(&new_servlet_id));
 		let stop_frame = StopServletJob::run(b"stop-1", new_servlet_id.clone())?;
 
-		let response = transport.emit(stop_frame, None).await?.unwrap();
+		let response = transport.emit(stop_frame, None).await?.ok_or("No response")?;
 		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let stop_response = management_response.stop.expect("Should have stop response");
+		let stop_response = management_response.stop.ok_or("No stop response")?;
 
 		if stop_response.status != crate::policy::TransitStatus::Accepted {
 			println!("  ERROR: Stop failed with status: {:?}", stop_response.status);
 			println!("  Servlet ID sent: {new_servlet_id:?}");
 			println!("  Current servlets:");
 			let list_frame = ListServletsJob::run(b"list-debug")?;
-			let response = transport.emit(list_frame, None).await?.unwrap();
+			let response = transport.emit(list_frame, None).await?.ok_or("No response")?;
 			let management_response: HiveManagementResponse = crate::decode(&response.message)?;
-			let list_response = management_response.list.expect("Should have list response");
+			let list_response = management_response.list.ok_or("No list response")?;
 			for servlet in &list_response.servlets {
 				println!("    - ID: {:?}", servlet.servlet_id);
 			}
@@ -1890,9 +1914,9 @@ mod tests {
 		println!("\n=== Test 5: List servlets after stop ===");
 		let list_frame = ListServletsJob::run(b"list-3")?;
 
-		let response = transport.emit(list_frame, None).await?.unwrap();
+		let response = transport.emit(list_frame, None).await?.ok_or("No response")?;
 		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let list_response = management_response.list.expect("Should have list response");
+		let list_response = management_response.list.ok_or("No list response")?;
 
 		assert_eq!(list_response.status, crate::policy::TransitStatus::Accepted);
 		assert_eq!(list_response.servlets.len(), 2, "Should be back to 2 servlets after stop");
@@ -1909,9 +1933,9 @@ mod tests {
 		println!("\n=== Test 6: Spawn unknown servlet type ===");
 		let spawn_frame = SpawnServletJob::run(b"spawn-2", b"unknown_servlet", None)?;
 
-		let response = transport.emit(spawn_frame, None).await?.unwrap();
+		let response = transport.emit(spawn_frame, None).await?.ok_or("No response")?;
 		let management_response: HiveManagementResponse = crate::decode(&response.message)?;
-		let spawn_response = management_response.spawn.expect("Should have spawn response");
+		let spawn_response = management_response.spawn.ok_or("No spawn response")?;
 
 		assert_eq!(spawn_response.status, crate::policy::TransitStatus::Forbidden);
 		assert!(spawn_response.servlet_address.is_none());
