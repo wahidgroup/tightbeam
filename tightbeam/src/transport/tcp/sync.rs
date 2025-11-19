@@ -59,7 +59,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 
 	max_encrypted_envelope: Option<usize>,
 
-	signatory: Option<ServerKeyManager>,
+	signatory: Option<Arc<ServerKeyManager>>,
 
 	handshake_state: TcpHandshakeState,
 
@@ -601,7 +601,7 @@ pub struct TcpListener<L: TcpListenerTrait> {
 	aad_domain_tag: Option<&'static [u8]>,
 	max_cleartext_envelope: Option<usize>,
 	max_encrypted_envelope: Option<usize>,
-	signatory: Option<ServerKeyManager>,
+	signatory: Option<Arc<ServerKeyManager>>,
 	handshake_timeout: Option<Duration>,
 }
 
@@ -697,7 +697,7 @@ where
 		}
 
 		if let Some(ref signatory) = self.signatory {
-			transport.signatory = Some(signatory.clone());
+			transport.signatory = Some(Arc::clone(signatory));
 		}
 		Ok(transport)
 	}
@@ -723,7 +723,7 @@ impl EncryptedProtocol for TcpListener<std::net::TcpListener> {
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 
-				signatory: Some(config.signatory.clone()),
+				signatory: Some(Arc::clone(&config.signatory)),
 				handshake_timeout: Some(config.handshake_timeout),
 			},
 			TightBeamSocketAddr(bound_addr),

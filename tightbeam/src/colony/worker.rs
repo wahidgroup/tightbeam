@@ -501,7 +501,7 @@ macro_rules! worker {
 					);
 
 					let run_loop = {
-						let config_arc = config_arc.clone();
+						let config_arc = ::std::sync::Arc::clone(&config_arc);
 						let policies = policies.clone();
 						$crate::worker!(@run_loop rx, (config Some(config_arc)), policies, $handler)
 					};
@@ -564,7 +564,7 @@ macro_rules! worker {
 					);
 
 					let run_loop = {
-						let config_arc = config_arc.clone();
+						let config_arc = ::std::sync::Arc::clone(&config_arc);
 						let policies = policies.clone();
 						$crate::worker!(@run_loop rx, (config Some(config_arc)), policies, $handler)
 					};

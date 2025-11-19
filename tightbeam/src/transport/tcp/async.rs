@@ -68,7 +68,7 @@ pub struct TokioListener {
 	#[cfg(feature = "x509")]
 	handshake_timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
-	signatory: Option<ServerKeyManager>,
+	signatory: Option<Arc<ServerKeyManager>>,
 }
 
 impl TokioListener {
@@ -135,7 +135,7 @@ impl TokioListener {
 
 		#[cfg(feature = "x509")]
 		if let Some(signatory) = &self.signatory {
-			transport.signatory = Some(signatory.clone());
+			transport.signatory = Some(Arc::clone(signatory));
 		}
 
 		Ok((transport, addr))
@@ -214,7 +214,7 @@ impl EncryptedProtocol for TokioListener {
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 				handshake_timeout: Some(config.handshake_timeout),
-				signatory: Some(config.signatory),
+				signatory: Some(Arc::clone(&config.signatory)),
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
@@ -280,7 +280,7 @@ impl AsyncListenerTrait for TokioListener {
 
 		#[cfg(feature = "x509")]
 		if let Some(ref signatory) = self.signatory {
-			transport.signatory = Some(signatory.clone());
+			transport.signatory = Some(Arc::clone(signatory));
 		}
 
 		#[cfg(feature = "x509")]
@@ -321,7 +321,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	signatory: Option<ServerKeyManager>,
+	signatory: Option<Arc<ServerKeyManager>>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
@@ -355,7 +355,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	signatory: Option<ServerKeyManager>,
+	signatory: Option<Arc<ServerKeyManager>>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]

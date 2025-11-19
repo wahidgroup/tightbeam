@@ -387,6 +387,7 @@ pub mod builder {
 			}
 		}
 		pub async fn connect(addr: P::Address) -> Result<Self, TransportError> {
+			// Cannt avoid clone here because of the async trait bound
 			let stream = <P as Protocol>::connect(addr.clone()).await.map_err(|e| e.into())?;
 			Ok(Self {
 				addr: Some(addr),

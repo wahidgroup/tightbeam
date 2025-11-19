@@ -22,7 +22,7 @@ where
 {
 	let handler = Arc::new(handler);
 	Arc::new(move |frame: Frame| -> HandlerFuture {
-		let handler = handler.clone();
+		let handler = ::std::sync::Arc::clone(&handler);
 		Box::pin(async move { handler(frame).await })
 	})
 }
@@ -396,7 +396,7 @@ macro_rules! server {
 							__transport = $crate::server!(@apply_one_policy __transport, $policy_name, $policy_expr);
 						)*
 					)*
-					let __handler_clone = $handler.clone();
+					let __handler_clone = ::std::sync::Arc::clone(&$handler);
 					#[allow(unused_imports)]
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(move || {
@@ -443,9 +443,9 @@ macro_rules! server {
 							__transport = $crate::server!(@apply_one_policy __transport, $policy_name, $policy_expr);
 						)*
 					)*
-					let __handler_clone = $handler.clone();
-					let mut __error_channel = $error_tx.clone();
-					let mut __ok_channel = $ok_tx.clone();
+					let __handler_clone = ::std::sync::Arc::clone(&$handler);
+				let mut __error_channel = $error_tx.clone();
+				let mut __ok_channel = $ok_tx.clone();
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(async move {
 						let mut __transport = __transport;

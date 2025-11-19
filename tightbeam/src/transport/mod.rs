@@ -52,7 +52,7 @@ pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
 #[derive(Clone)]
 pub struct TransportEncryptionConfig {
 	pub certificate: Certificate,
-	pub signatory: ServerKeyManager,
+	pub signatory: Arc<ServerKeyManager>,
 	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	pub aad_domain_tag: &'static [u8],
 	pub max_cleartext_envelope: usize,
@@ -65,7 +65,7 @@ impl TransportEncryptionConfig {
 	pub fn new(certificate: Certificate, signatory: ServerKeyManager) -> Self {
 		Self {
 			certificate,
-			signatory,
+			signatory: Arc::new(signatory),
 			client_validators: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			max_cleartext_envelope: 128 * 1024,

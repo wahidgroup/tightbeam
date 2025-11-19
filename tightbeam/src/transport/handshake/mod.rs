@@ -299,7 +299,6 @@ pub trait ServerHandshakeKey: Send + Sync {
 /// The key material is never exposed through the public API - orchestrators
 /// get shared ownership via Arc cloning.
 #[cfg(feature = "x509")]
-#[derive(Clone)]
 pub struct ServerKeyManager {
 	provider: Arc<dyn crate::crypto::key::KeyProvider>,
 }

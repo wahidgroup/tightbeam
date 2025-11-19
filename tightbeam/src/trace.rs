@@ -58,7 +58,7 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 pub struct EventBuilder<'a> {
 	collector: &'a TraceCollector,
 	label: String,
-	tags: Vec<&'static str>,
+	tags: Option<Vec<&'static str>>,
 	value: Option<EventValue>,
 	#[cfg(feature = "instrument")]
 	duration_ns: Option<u64>,
@@ -68,7 +68,12 @@ pub struct EventBuilder<'a> {
 }
 
 impl<'a> EventBuilder<'a> {
-	fn new(collector: &'a TraceCollector, label: String, tags: Vec<&'static str>, value: Option<EventValue>) -> Self {
+	fn new(
+		collector: &'a TraceCollector,
+		label: String,
+		tags: Option<Vec<&'static str>>,
+		value: Option<EventValue>,
+	) -> Self {
 		Self {
 			collector,
 			label,
@@ -108,11 +113,11 @@ impl<'a> EventBuilder<'a> {
 
 	/// Emit the event (both assertion and instrumentation if enabled)
 	/// This is automatically called when the builder is dropped.
-	pub fn emit(self) {
+	pub fn emit(mut self) {
 		self.emit_internal();
 	}
 
-	fn emit_internal(&self) {
+	fn emit_internal(&mut self) {
 		fn leak_label(label: &str) -> &'static str {
 			Box::leak(label.to_string().into_boxed_str())
 		}
@@ -126,7 +131,9 @@ impl<'a> EventBuilder<'a> {
 
 		let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
 		let static_label: &'static str = leak_label(&self.label);
-		let assertion = match &self.value {
+
+		let tags = self.tags.take().unwrap_or_default();
+		let assertion = match self.value.take() {
 			Some(EventValue::None) | None => {
 				#[cfg(feature = "instrument")]
 				{
@@ -140,12 +147,12 @@ impl<'a> EventBuilder<'a> {
 					self.collector
 						.emit_internal(urn, Some(&self.label), self.payload, self.duration_ns);
 				}
-				Assertion::new(seq, AssertionLabel::Custom(static_label), self.tags.clone(), None)
+				Assertion::new(seq, AssertionLabel::Custom(static_label), tags, None)
 			}
 			Some(EventValue::Value(assertion_value)) => {
 				#[cfg(feature = "instrument")]
 				{
-					let value_str = format_assertion_value(assertion_value);
+					let value_str = format_assertion_value(&assertion_value);
 					self.collector.emit_internal(
 						events::ASSERT_PAYLOAD,
 						Some(&self.label),
@@ -153,13 +160,7 @@ impl<'a> EventBuilder<'a> {
 						self.duration_ns,
 					);
 				}
-				Assertion::with_value(
-					seq,
-					AssertionLabel::Custom(static_label),
-					self.tags.clone(),
-					None,
-					assertion_value.clone(),
-				)
+				Assertion::with_value(seq, AssertionLabel::Custom(static_label), tags, None, assertion_value)
 			}
 		};
 
@@ -269,7 +270,7 @@ impl TraceCollector {
 	/// Record an event with no tags or value.
 	/// Returns an EventBuilder for optional chaining.
 	pub fn event(&self, label: impl AsRef<str>) -> EventBuilder<'_> {
-		EventBuilder::new(self, label.as_ref().to_string(), Vec::new(), None)
+		EventBuilder::new(self, label.as_ref().to_string(), Some(Vec::new()), None)
 	}
 
 	/// Record an event with explicit tags and optional value.
@@ -278,7 +279,7 @@ impl TraceCollector {
 	where
 		V: Into<EventValue>,
 	{
-		EventBuilder::new(self, label.to_string(), tags.to_vec(), Some(value.into()))
+		EventBuilder::new(self, label.to_string(), Some(tags.to_vec()), Some(value.into()))
 	}
 
 	#[cfg(feature = "testing-fuzz")]

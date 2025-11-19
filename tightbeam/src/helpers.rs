@@ -178,7 +178,7 @@ macro_rules! rwlock {
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
 				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
-					.clone()
+					|> std::sync::Arc::clone
 			}
 		}
 	};

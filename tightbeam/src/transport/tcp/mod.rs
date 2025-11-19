@@ -316,7 +316,7 @@ macro_rules! impl_tcp_common {
 				key: $crate::transport::handshake::ServerKeyManager,
 			) -> Self {
 				self.client_certificate = Some(Arc::new(cert));
-				self.signatory = Some(key);
+				self.signatory = Some(Arc::new(key));
 				self
 			}
 
