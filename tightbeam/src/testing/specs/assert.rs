@@ -167,13 +167,13 @@ impl fmt::Display for SpecViolation {
 					if violations.is_empty() {
 						String::new()
 					} else {
-						format!("; violations: {}", violations)
+						format!("; violations: {violations}")
 					}
 				)
 			}
 			#[cfg(feature = "testing-timing")]
 			Self::SchedulabilityError { error } => {
-				write!(f, "Schedulability analysis error: {}", error)
+				write!(f, "Schedulability analysis error: {error}")
 			}
 		}
 	}

@@ -142,6 +142,11 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	TestingError(crate::testing::error::TestingError),
 
+	/// Error during URN validation
+	#[cfg_attr(feature = "derive", error("URN validation error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	UrnValidationError(crate::utils::urn::UrnValidationError),
+
 	/// Error during encryption or decryption
 	#[cfg(feature = "aead")]
 	#[cfg_attr(feature = "derive", error("Encryption or decryption error: {0}"))]
@@ -357,6 +362,7 @@ impl core::fmt::Display for TightBeamError {
 			}
 			#[cfg(feature = "testing")]
 			TightBeamError::TestingError(err) => write!(f, "Testing error: {err}"),
+			TightBeamError::UrnValidationError(err) => write!(f, "URN validation error: {err}"),
 		}
 	}
 }
@@ -395,6 +401,8 @@ crate::impl_from!(zeekstd::Error => TightBeamError::CompressionError via Compres
 crate::impl_from!(zeekstd::Error => CompressionError::ZSTD);
 #[cfg(all(feature = "testing", not(feature = "derive")))]
 crate::impl_from!(crate::testing::error::TestingError => TightBeamError::TestingError);
+#[cfg(not(feature = "derive"))]
+crate::impl_from!(crate::utils::urn::UrnValidationError => TightBeamError::UrnValidationError);
 
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for TightBeamError {}

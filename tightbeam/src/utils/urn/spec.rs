@@ -11,7 +11,7 @@ use alloc::borrow::Cow;
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 
-use super::error::ValidationError;
+use super::error::UrnValidationError;
 use super::UrnBuilder;
 
 /// Trait defining a URN namespace specification
@@ -28,7 +28,7 @@ pub trait UrnSpec {
 	/// Validate a partially constructed URN builder
 	///
 	/// Checks that all required fields are present and satisfy constraints.
-	fn validate(builder: &UrnBuilder) -> Result<(), ValidationError>;
+	fn validate(builder: &UrnBuilder) -> Result<(), UrnValidationError>;
 
 	/// Transform builder (apply defaults, normalizations)
 	///
@@ -42,5 +42,5 @@ pub trait UrnSpec {
 	///
 	/// Constructs the Namespace-Specific String from the builder's components
 	/// according to the spec's defined structure.
-	fn build_nss(builder: &UrnBuilder) -> Result<Cow<'static, str>, ValidationError>;
+	fn build_nss(builder: &UrnBuilder) -> Result<Cow<'static, str>, UrnValidationError>;
 }

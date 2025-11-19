@@ -1,165 +1,144 @@
 //! Declarative macro for defining URN specifications
 //!
 //! The `urn_spec!` macro generates a `UrnSpec` implementation with validation,
-//! transformation, and NSS construction logic based on a declarative specification.
+//! transformation, and NSS construction logic based on a declarative
+//! specification.
 
 /// Define a URN specification with validation and NSS structure
 ///
-/// # Syntax
-///
-/// ```ignore
-/// urn_spec! {
-///     pub SpecName,
-///     nid: "namespace-id",
-///     nss_structure {
-///         field1: required, const("value"),
-///         field2: required, oneof("opt1", "opt2"),
-///         field3: optional, pattern(r"^[a-z0-9-]+$"),
-///         nested: required {
-///             subfield1: required, pattern(r"^\d+$"),
-///             subfield2: optional
-///         }
-///     },
-///     validate {
-///         // Custom validation logic
-///         if field1 == "value" && field2 == "opt1" {
-///             error("invalid combination")
-///         }
-///     }
-/// }
-/// ```
-///
-/// # Generated API
-///
-/// The macro generates:
-/// - `UrnSpec` trait implementation
-/// - Validation logic
-/// - NSS construction
-/// - Builder methods for each field
+/// Field configuration supports:
+/// - `value: "literal"` - fixed constant value
+/// - `values: ["opt1", "opt2", ...]` - one-of validation
+/// - `pattern: Pattern::*`
+/// - `required: true/false` - whether field is required (defaults to `true`)
+/// - `sep: "separator"` - NSS separator for this field (optional)
 #[macro_export]
 macro_rules! urn_spec {
 	// Main entry point
 	(
+		$(#[$meta:meta])*
 		$vis:vis $name:ident,
 		nid: $nid:literal,
 		nss_structure {
-			$($field:ident: $req:ident $(, $constraint:ident($($args:tt)*))?  $({ $($nested:tt)* })?),* $(,)?
+			$($field:ident: { $($config:tt)* }),* $(,)?
 		}
-		$(, validate { $($validate:tt)* })?
+		$(, nss_format: $nss_format:literal)?
 	) => {
+		$(#[$meta])*
 		$vis struct $name;
+
+		impl $name {
+			/// Get the UrnSpecBuilder configuration for this spec
+			fn spec_builder() -> $crate::utils::urn::UrnSpecBuilder {
+				let mut builder = $crate::utils::urn::UrnSpecBuilder::from($nid);
+
+				$(
+					builder = $crate::urn_spec!(@apply_field builder, $field, $($config)*);
+				)*
+
+				$(
+					builder = builder.nss_format($nss_format);
+				)?
+
+				builder
+			}
+		}
 
 		impl $crate::utils::urn::UrnSpec for $name {
 			const NID: &'static str = $nid;
 
-			fn validate(builder: &$crate::utils::urn::UrnBuilder) -> Result<(), $crate::utils::urn::ValidationError> {
-				use $crate::utils::urn::ValidationError;
-
-				// Generate field validation
-				$(
-					$crate::urn_spec!(@validate_field builder, stringify!($field), $req $(, $constraint($($args)*))?);
-				)*
-
-				// TODO: Custom validation block (would require full parsing of validate block)
-				// For now, specs can override validate() method manually
-
-				Ok(())
+			fn validate(builder: &$crate::utils::urn::UrnBuilder) -> Result<(), $crate::utils::urn::UrnValidationError> {
+				Self::spec_builder().validate(builder)
 			}
 
-			fn build_nss(builder: &$crate::utils::urn::UrnBuilder) -> Result<::std::borrow::Cow<'static, str>, $crate::utils::urn::ValidationError> {
-				use $crate::utils::urn::ValidationError;
-
-				// Build NSS from components
-				let mut parts = ::std::vec::Vec::new();
-
-				$(
-					$crate::urn_spec!(@build_nss_part builder, parts, stringify!($field) $(, $constraint($($args)*))?);
-				)*
-
-				Ok(parts.join(":").into())
-			}
-		}
-
-		// Generate builder methods
-		impl<'a> $crate::utils::urn::UrnBuilder<'a> {
-			$(
-				$crate::urn_spec!(@builder_method $field);
-			)*
-		}
-	};
-
-	// Validate field: required
-	(@validate_field $builder:expr, $field:expr, required) => {
-		if $builder.get($field).is_none() {
-			return Err($crate::utils::urn::ValidationError::RequiredFieldMissing($field));
-		}
-	};
-
-	// Validate field: optional
-	(@validate_field $builder:expr, $field:expr, optional) => {
-		// Optional fields don't need validation
-	};
-
-	// Validate field: required with const constraint
-	(@validate_field $builder:expr, $field:expr, required, const($val:literal)) => {
-		match $builder.get($field) {
-			None => return Err($crate::utils::urn::ValidationError::RequiredFieldMissing($field)),
-			Some(v) if v.as_ref() != $val => {
-				return Err($crate::utils::urn::ValidationError::InvalidFormat {
-					field: $field,
-					pattern: concat!("const(\"", $val, "\")"),
-				});
-			}
-			_ => {}
-		}
-	};
-
-	// Validate field: required with oneof constraint
-	(@validate_field $builder:expr, $field:expr, required, oneof($($opts:literal),+)) => {
-		match $builder.get($field) {
-			None => return Err($crate::utils::urn::ValidationError::RequiredFieldMissing($field)),
-			Some(v) => {
-				let valid = false $(|| v.as_ref() == $opts)+;
-				if !valid {
-					return Err($crate::utils::urn::ValidationError::InvalidFormat {
-						field: $field,
-						pattern: concat!("oneof(", $($opts, ", "),+, ")"),
-					});
-				}
+			fn build_nss(builder: &$crate::utils::urn::UrnBuilder) -> Result<::std::borrow::Cow<'static, str>, $crate::utils::urn::UrnValidationError> {
+				let nss = Self::spec_builder().build_nss(builder)?;
+				Ok(nss.into())
 			}
 		}
 	};
 
-	// Validate field: required with pattern constraint
-	(@validate_field $builder:expr, $field:expr, required, pattern($pat:literal)) => {
-		match $builder.get($field) {
-			None => return Err($crate::utils::urn::ValidationError::RequiredFieldMissing($field)),
-			Some(v) => {
-				// Pattern validation would require regex - simplified for now
-				// Real implementation would use regex crate
-			}
+	// Apply field configuration
+	(@apply_field $builder:expr, $field:ident, $($config:tt)*) => {
+		$crate::urn_spec!(@parse_field_config $builder, $field, true, { $($config)* })
+	};
+
+	// Helper: apply required/optional based on flag
+	(@apply_required $builder:expr, $field:ident, $req:expr) => {
+		if $req {
+			$builder.field_required(stringify!($field))
+		} else {
+			$builder.field_optional(stringify!($field))
 		}
 	};
 
-	// Build NSS part: simple field
-	(@build_nss_part $builder:expr, $parts:expr, $field:expr) => {
-		if let Some(val) = $builder.get($field) {
-			$parts.push(val.as_ref());
-		}
+	// Parse field config block recursively - handle required first
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { required: true, $($rest:tt)* }) => {
+		$crate::urn_spec!(@parse_field_config $builder, $field, true, { $($rest)* })
 	};
 
-	// Build NSS part: with const constraint
-	(@build_nss_part $builder:expr, $parts:expr, $field:expr, const($val:literal)) => {
-		$parts.push($val);
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { required: false, $($rest:tt)* }) => {
+		$crate::urn_spec!(@parse_field_config $builder, $field, false, { $($rest)* })
 	};
 
-	// Builder method: generate setter
-	(@builder_method $field:ident) => {
-		#[doc = concat!("Set the `", stringify!($field), "` field")]
-		#[inline]
-		pub fn $field(self, value: impl Into<::std::borrow::Cow<'a, str>>) -> Self {
-			self.set(stringify!($field), value)
-		}
+	// Parse config options recursively
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { value: $val:literal, $($rest:tt)* }) => {{
+		let mut b = $crate::urn_spec!(@apply_required $builder, $field, $req);
+		b = b.field_const(stringify!($field), $val);
+		$crate::urn_spec!(@parse_field_config b, $field, $req, { $($rest)* })
+	}};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { value: $val:literal }) => {{
+		let mut b = $crate::urn_spec!(@apply_required $builder, $field, $req);
+		b = b.field_const(stringify!($field), $val);
+		b
+	}};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { values: [$($opts:literal),+ $(,)?], $($rest:tt)* }) => {{
+		let mut b = $crate::urn_spec!(@apply_required $builder, $field, $req);
+		b = b.field_oneof(stringify!($field), &[$($opts),+]);
+		$crate::urn_spec!(@parse_field_config b, $field, $req, { $($rest)* })
+	}};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { values: [$($opts:literal),+ $(,)?] }) => {{
+		let mut b = $crate::urn_spec!(@apply_required $builder, $field, $req);
+		b = b.field_oneof(stringify!($field), &[$($opts),+]);
+		b
+	}};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { pattern: $pattern_expr:expr, $($rest:tt)* }) => {{
+		let mut b = $crate::urn_spec!(@apply_required $builder, $field, $req);
+		b = b.field_pattern(stringify!($field), $pattern_expr);
+		$crate::urn_spec!(@parse_field_config b, $field, $req, { $($rest)* })
+	}};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { pattern: $pattern_expr:expr }) => {{
+		let mut b = $crate::urn_spec!(@apply_required $builder, $field, $req);
+		b = b.field_pattern(stringify!($field), $pattern_expr);
+		b
+	}};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { sep: $sep:literal, $($rest:tt)* }) => {{
+		let mut b = $crate::urn_spec!(@apply_required $builder, $field, $req);
+		b = b.field_nss_separator(stringify!($field), $sep);
+		$crate::urn_spec!(@parse_field_config b, $field, $req, { $($rest)* })
+	}};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { sep: $sep:literal }) => {{
+		let mut b = $crate::urn_spec!(@apply_required $builder, $field, $req);
+		b = b.field_nss_separator(stringify!($field), $sep);
+		b
+	}};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { required: true }) => {
+		$crate::urn_spec!(@apply_required $builder, $field, true)
+	};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { required: false }) => {
+		$crate::urn_spec!(@apply_required $builder, $field, false)
+	};
+
+	(@parse_field_config $builder:expr, $field:ident, $req:expr, { }) => {
+		$crate::urn_spec!(@apply_required $builder, $field, $req)
 	};
 }
-

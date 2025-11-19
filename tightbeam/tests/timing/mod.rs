@@ -17,5 +17,4 @@
 
 #![cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
 
-// Integration tests will be added here
-// See plan in MISSION_CRITICAL_TESTING_REVIEW.md
+mod wcet;

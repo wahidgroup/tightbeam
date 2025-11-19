@@ -1,5 +1,7 @@
 //! RFC 8141 compliant URN (Uniform Resource Name) implementation
 //!
+//! See: `<https://datatracker.ietf.org/doc/html/rfc8141>`
+//!
 //! Provides zero-copy URN construction with declarative specification support
 //! for validation and hierarchical NSS (Namespace-Specific String) structure.
 //!
@@ -16,56 +18,63 @@
 //! # Examples
 //!
 //! ```rust
-//! use tightbeam::utils::urn::{Urn, UrnBuilder, ValidationError};
+//! use tightbeam::utils::urn::{Urn, UrnBuilder, UrnValidationError};
+//! use tightbeam::builder::TypeBuilder;
 //!
-//! fn main() -> Result<(), ValidationError> {
-//!     // Build a URN manually
+//! fn main() -> Result<(), UrnValidationError> {
+//!     // Build a URN with direct NSS
 //!     let urn = UrnBuilder::new()
-//!         .nid("tightbeam")
+//!         .with_nid("tightbeam")
+//!         .with_nss("instrumentation:trace:123")
+//!         .build()?;
+//!
+//!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:trace:123");
+//!
+//!     // Build a URN from components (sorted by key)
+//!     let urn = UrnBuilder::new()
+//!         .with_nid("tightbeam")
 //!         .set("category", "instrumentation")
 //!         .set("resource.type", "trace")
 //!         .set("resource.id", "123")
-//!         .build_with(|builder| {
-//!             let category = builder
-//!                 .get("category")
-//!                 .ok_or(ValidationError::RequiredFieldMissing("category"))?;
-//!             let res_type = builder
-//!                 .get("resource.type")
-//!                 .ok_or(ValidationError::RequiredFieldMissing("resource.type"))?;
-//!             let res_id = builder
-//!                 .get("resource.id")
-//!                 .ok_or(ValidationError::RequiredFieldMissing("resource.id"))?;
-//!             Ok(format!("{}:{}:{}", category, res_type, res_id).into())
-//!         })?;
+//!         .build()?;
 //!
-//!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:trace:123");
+//!     // Components sorted: "category", "resource.id", "resource.type"
+//!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:123:trace");
+//!
+//!     // Build a URN with a spec (recommended pattern)
+//!     use tightbeam::utils::urn::specs::tightbeam::TightbeamInstrumentation;
+//!     let urn = UrnBuilder::from(TightbeamInstrumentation)
+//!         .set("category", "instrumentation")
+//!         .set("resource_type", "trace")
+//!         .set("resource_id", "abc-123")
+//!         .build()?;
+//!
+//!     assert_eq!(urn.to_string(), "urn:tightbeam:instrumentation:trace/abc-123");
 //!     Ok(())
 //! }
 //! ```
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-
 #[cfg(not(feature = "std"))]
-use alloc::borrow::Cow;
-#[cfg(not(feature = "std"))]
-use alloc::collections::BTreeMap as Map;
-#[cfg(not(feature = "std"))]
-use alloc::string::String;
+use alloc::{borrow::Cow, string::String};
 
 #[cfg(feature = "std")]
 use std::borrow::Cow;
-#[cfg(feature = "std")]
-use std::collections::HashMap as Map;
 
 use core::fmt;
 
+#[macro_use]
+mod macros;
+
+pub mod builders;
 pub mod error;
 pub mod spec;
+#[cfg(test)]
+pub mod specs;
 
-pub use error::ValidationError;
+pub use builders::{UrnBuilder, UrnSpecBuilder};
+pub use error::UrnValidationError;
 pub use spec::UrnSpec;
 
 /// RFC 8141 compliant URN structure
@@ -74,54 +83,89 @@ pub use spec::UrnSpec;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Urn<'a> {
 	/// Namespace Identifier (2-32 chars, alphanumeric+hyphen, starts with letter)
+	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	pub nid: Cow<'a, str>,
 
 	/// Namespace-Specific String (structure defined by namespace)
+	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.2>`
 	pub nss: Cow<'a, str>,
 }
 
 impl<'a> Urn<'a> {
-	/// Create a new URN builder
-	#[inline]
-	pub fn builder() -> UrnBuilder<'a> {
-		UrnBuilder::new()
-	}
-
-	/// Create a URN from a spec type
+	/// Create an unchecked URN from static strings
 	///
-	/// Returns a pre-configured builder for the given spec.
+	/// This can be used in const contexts to define constant URNs.
+	/// No validation is performed - use `verify::<Spec>()` at runtime
+	/// to validate against a spec.
+	///
+	/// # Example
+	///
+	/// ```rust
+	/// # use tightbeam::utils::urn::Urn;
+	/// const EXAMPLE_URN: Urn<'static> = Urn::new("example", "test:resource");
+	/// ```
 	#[inline]
-	pub fn from<S: UrnSpec>(_spec: S) -> UrnBuilder<'a> {
-		let mut builder = UrnBuilder::new();
-		builder.nid = Some(Cow::Borrowed(S::NID));
-		builder
+	pub const fn new(nid: &'static str, nss: &'static str) -> Urn<'static> {
+		Urn { nid: Cow::Borrowed(nid), nss: Cow::Borrowed(nss) }
 	}
 
-	/// Convert the URN to an owned version with 'static lifetime
-	#[inline]
-	pub fn into_owned(self) -> Urn<'static> {
-		Urn { nid: Cow::Owned(self.nid.into_owned()), nss: Cow::Owned(self.nss.into_owned()) }
+	/// Verify this URN against a spec
+	///
+	/// Validates that:
+	/// - The NID matches the spec's NID
+	/// - The NID format is valid (RFC 8141 compliant)
+	/// - The NSS structure conforms to the spec's requirements
+	///
+	/// # Example
+	///
+	/// ```rust
+	/// # use tightbeam::utils::urn::{Urn, UrnSpec};
+	/// # struct MySpec;
+	/// # impl UrnSpec for MySpec {
+	/// #     const NID: &'static str = "example";
+	/// #     fn validate(_: &UrnBuilder) -> Result<(), _> { Ok(()) }
+	/// #     fn build_nss(_: &UrnBuilder) -> Result<_, _> { Ok("test".into()) }
+	/// # }
+	/// const URN: Urn<'static> = Urn::new("example", "test:resource");
+	/// URN.verify::<MySpec>()?;
+	/// ```
+	pub fn verify<S: UrnSpec>(&self) -> Result<(), UrnValidationError> {
+		// Check NID matches spec
+		if self.nid.as_ref() != S::NID {
+			return Err(UrnValidationError::InvalidNid("NID does not match spec"));
+		}
+
+		// Validate NID format
+		Self::validate_nid(self.nid.as_ref())?;
+
+		// Create a builder with this URN's data for spec validation
+		let builder = UrnBuilder::new().with_nid(self.nid.as_ref()).with_nss(self.nss.as_ref());
+
+		// Validate using the spec
+		S::validate(&builder)
 	}
 
-	/// Validate that the NID conforms to RFC 8141
+	/// Validate that the NID conforms to RFC 8141 Section 2.3.1
+	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	///
 	/// NID must be 2-32 characters, alphanumeric plus hyphens, starting with a letter.
-	pub fn validate_nid(nid: &str) -> Result<(), ValidationError> {
+	/// This implements the formal-namespace-identifier production from RFC 8141.
+	pub fn validate_nid(nid: &str) -> Result<(), UrnValidationError> {
 		let len = nid.len();
 		if !(2..=32).contains(&len) {
-			return Err(ValidationError::InvalidNid("NID must be 2-32 characters"));
+			return Err(UrnValidationError::InvalidNid("NID must be 2-32 characters"));
 		}
 
 		let mut chars = nid.chars();
 		if let Some(first) = chars.next() {
 			if !first.is_ascii_alphabetic() {
-				return Err(ValidationError::InvalidNid("NID must start with a letter"));
+				return Err(UrnValidationError::InvalidNid("NID must start with a letter"));
 			}
 		}
 
 		for ch in chars {
 			if !ch.is_ascii_alphanumeric() && ch != '-' {
-				return Err(ValidationError::InvalidNid(
+				return Err(UrnValidationError::InvalidNid(
 					"NID must contain only alphanumeric characters and hyphens",
 				));
 			}
@@ -129,92 +173,20 @@ impl<'a> Urn<'a> {
 
 		Ok(())
 	}
+
+	/// Convert the URN to an owned version with 'static lifetime
+	///
+	/// This converts borrowed strings to owned strings, allowing the URN
+	/// to outlive its original data sources. This is similar to `Cow::into_owned()`.
+	#[inline]
+	pub fn into_owned(self) -> Urn<'static> {
+		Urn { nid: Cow::Owned(self.nid.into_owned()), nss: Cow::Owned(self.nss.into_owned()) }
+	}
 }
 
 impl<'a> fmt::Display for Urn<'a> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "urn:{}:{}", self.nid, self.nss)
-	}
-}
-
-/// Builder for constructing URNs with validation
-#[derive(Debug, Default)]
-pub struct UrnBuilder<'a> {
-	/// Namespace Identifier
-	pub(crate) nid: Option<Cow<'a, str>>,
-
-	/// Hierarchical components for NSS construction
-	pub(crate) components: Map<&'static str, Cow<'a, str>>,
-}
-
-impl<'a> UrnBuilder<'a> {
-	/// Create a new URN builder
-	#[inline]
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	/// Set the Namespace Identifier (NID)
-	#[inline]
-	pub fn nid(mut self, nid: impl Into<Cow<'a, str>>) -> Self {
-		self.nid = Some(nid.into());
-		self
-	}
-
-	/// Set a component value by key
-	///
-	/// Keys can be hierarchical using dot notation (e.g., "resource.type", "resource.id")
-	#[inline]
-	pub fn set(mut self, key: &'static str, value: impl Into<Cow<'a, str>>) -> Self {
-		self.components.insert(key, value.into());
-		self
-	}
-
-	/// Get a component value by key
-	#[inline]
-	pub fn get(&self, key: &'static str) -> Option<&Cow<'a, str>> {
-		self.components.get(key)
-	}
-
-	/// Build the URN with a custom NSS builder function
-	///
-	/// This is a lower-level method for when you're not using a spec.
-	pub fn build_with<F>(self, nss_builder: F) -> Result<Urn<'a>, ValidationError>
-	where
-		F: FnOnce(&Self) -> Result<Cow<'a, str>, ValidationError>,
-	{
-		// Validate NID format first (before consuming self)
-		let nid_ref = self.nid.as_ref().ok_or(ValidationError::RequiredFieldMissing("nid"))?;
-		Urn::validate_nid(nid_ref)?;
-
-		// Build NSS (while self is still intact)
-		let nss = nss_builder(&self)?;
-
-		// Now consume self to extract nid
-		let nid = self.nid.unwrap(); // Safe: we validated it exists above
-
-		Ok(Urn { nid, nss })
-	}
-
-	/// Build the URN using a spec's validation and NSS construction
-	pub fn build_with_spec<S: UrnSpec>(self) -> Result<Urn<'a>, ValidationError> {
-		// Apply spec transformations
-		let builder = S::transform(self);
-
-		// Validate
-		S::validate(&builder)?;
-
-		// Validate NID format before building NSS
-		let nid_ref = builder.nid.as_ref().ok_or(ValidationError::RequiredFieldMissing("nid"))?;
-		Urn::validate_nid(nid_ref)?;
-
-		// Build NSS (while builder is still intact)
-		let nss = S::build_nss(&builder)?;
-
-		// Now consume builder to extract nid
-		let nid = builder.nid.unwrap(); // Safe: we validated it exists above
-
-		Ok(Urn { nid, nss })
 	}
 }
 
@@ -225,74 +197,47 @@ mod tests {
 	#[test]
 	fn test_urn_nid_validation() {
 		// Valid NIDs
-		assert!(Urn::validate_nid("ab").is_ok());
-		assert!(Urn::validate_nid("tightbeam").is_ok());
-		assert!(Urn::validate_nid("isbn").is_ok());
-		assert!(Urn::validate_nid("a123").is_ok());
-		assert!(Urn::validate_nid("my-namespace").is_ok());
+		let valid_cases: &[&str] = &["ab", "tightbeam", "isbn", "a123", "my-namespace"];
+		for nid in valid_cases {
+			assert!(Urn::validate_nid(nid).is_ok());
+		}
 
 		// Invalid NIDs - too short
 		assert!(Urn::validate_nid("a").is_err());
 
 		// Invalid NIDs - too long
-		assert!(Urn::validate_nid("a".repeat(33).as_str()).is_err());
+		let too_long = "a".repeat(33);
+		assert!(Urn::validate_nid(&too_long).is_err());
 
 		// Invalid NIDs - doesn't start with letter
-		assert!(Urn::validate_nid("1abc").is_err());
-		assert!(Urn::validate_nid("-abc").is_err());
+		let invalid_start: &[&str] = &["1abc", "-abc"];
+		for nid in invalid_start {
+			assert!(Urn::validate_nid(nid).is_err());
+		}
 
 		// Invalid NIDs - invalid characters
-		assert!(Urn::validate_nid("ab_cd").is_err());
-		assert!(Urn::validate_nid("ab.cd").is_err());
+		let invalid_chars: &[&str] = &["ab_cd", "ab.cd"];
+		for nid in invalid_chars {
+			assert!(Urn::validate_nid(nid).is_err());
+		}
 	}
 
 	#[test]
-	fn test_urn_builder_basic() {
-		let urn = UrnBuilder::new()
-			.nid("tightbeam")
-			.build_with(|_| Ok("test:resource".into()))
-			.unwrap();
+	fn test_urn_to_owned() {
+		// (nid, nss)
+		let test_cases: &[(&str, &str)] = &[
+			("tightbeam", "test:resource"),
+			("example", "path/to/resource"),
+			("test", "simple"),
+		];
 
-		assert_eq!(urn.nid, "tightbeam");
-		assert_eq!(urn.nss, "test:resource");
-		assert_eq!(urn.to_string(), "urn:tightbeam:test:resource");
-	}
-
-	#[test]
-	fn test_urn_builder_with_components() {
-		let urn = UrnBuilder::new()
-			.nid("example")
-			.set("type", "book")
-			.set("id", "123")
-			.build_with(|builder| {
-				let type_val = builder.get("type").ok_or(ValidationError::RequiredFieldMissing("type"))?;
-				let id_val = builder.get("id").ok_or(ValidationError::RequiredFieldMissing("id"))?;
-				Ok(format!("{type_val}:{id_val}").into())
-			})
-			.unwrap();
-
-		assert_eq!(urn.to_string(), "urn:example:book:123");
-	}
-
-	#[test]
-	fn test_urn_builder_missing_nid() {
-		let result = UrnBuilder::new().build_with(|_| Ok("test".into()));
-
-		assert!(matches!(result, Err(ValidationError::RequiredFieldMissing("nid"))));
-	}
-
-	#[test]
-	fn test_urn_into_owned() {
-		let borrowed_nid = "tightbeam";
-		let borrowed_nss = "test:resource";
-
-		let urn = Urn { nid: Cow::Borrowed(borrowed_nid), nss: Cow::Borrowed(borrowed_nss) };
-
-		let owned_urn = urn.into_owned();
-
-		assert!(matches!(owned_urn.nid, Cow::Owned(_)));
-		assert!(matches!(owned_urn.nss, Cow::Owned(_)));
-		assert_eq!(owned_urn.nid, "tightbeam");
-		assert_eq!(owned_urn.nss, "test:resource");
+		for (nid, nss) in test_cases {
+			let urn = Urn { nid: Cow::Borrowed(*nid), nss: Cow::Borrowed(*nss) };
+			let owned_urn = urn.into_owned();
+			assert!(matches!(owned_urn.nid, Cow::Owned(_)));
+			assert!(matches!(owned_urn.nss, Cow::Owned(_)));
+			assert_eq!(owned_urn.nid, *nid);
+			assert_eq!(owned_urn.nss, *nss);
+		}
 	}
 }

@@ -478,7 +478,7 @@ impl BuiltAssertSpec {
 					Ok(())
 				}
 			}
-			Err(e) => Err(SpecViolation::SchedulabilityError { error: format!("{}", e) }),
+			Err(e) => Err(SpecViolation::SchedulabilityError { error: format!("{e}") }),
 		}
 	}
 }
@@ -1225,15 +1225,20 @@ macro_rules! __tb_scenario_verify_impl {
 					}
 				}
 
-				$( $( {
-					fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace)
-					where
-						F: FnOnce(&$crate::trace::ConsumedTrace),
-					{
-						f(trace)
-					}
-					__call_on_pass($on_pass, &$trace);
-				} )? )?
+				// Call on_pass hook if provided
+				$(
+					$(
+						{
+							fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace)
+							where
+								F: FnOnce(&$crate::trace::ConsumedTrace),
+							{
+								f(trace)
+							}
+							__call_on_pass($on_pass, &$trace);
+						}
+					)?
+				)?
 			}
 			Err(_violations) => {
 				// L1 failed - also report L2 and L3 if they failed
@@ -1247,15 +1252,20 @@ macro_rules! __tb_scenario_verify_impl {
 					// Note: on_fail hook signature expects SpecViolation, not FdrVerdict
 				}
 
-				$( $( {
-					fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, violations: &$crate::testing::specs::SpecViolation)
-					where
-						F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::specs::SpecViolation),
-					{
-						f(trace, violations)
-					}
-					__call_on_fail($on_fail, &$trace, _violations);
-				} )? )?
+				// Call on_fail hook if provided
+				$(
+					$(
+						{
+							fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, violations: &$crate::testing::specs::SpecViolation)
+							where
+								F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::specs::SpecViolation),
+							{
+								f(trace, violations)
+							}
+							__call_on_fail($on_fail, &$trace, _violations);
+						}
+					)?
+				)?
 			}
 		}
 		verification_result
@@ -1285,26 +1295,36 @@ macro_rules! __tb_scenario_verify_impl {
 			let verification_result = $crate::testing::specs::verify_trace(*spec, &$trace);
 			match &verification_result {
 				Ok(()) => {
-					$( $( {
-						fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace)
-						where
-							F: FnOnce(&$crate::trace::ConsumedTrace),
-						{
-							f(trace)
-						}
-						__call_on_pass($on_pass, &$trace);
-					} )? )?
+					// Call on_pass hook if provided
+					$(
+						$(
+							{
+								fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace)
+								where
+									F: FnOnce(&$crate::trace::ConsumedTrace),
+								{
+									f(trace)
+								}
+								__call_on_pass($on_pass, &$trace);
+							}
+						)?
+					)?
 				}
 				Err(_violations) => {
-					$( $( {
-						fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, violations: &$crate::testing::spec::SpecViolation)
-						where
-							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::spec::SpecViolation),
-						{
-							f(trace, violations)
-						}
-						__call_on_fail($on_fail, &$trace, _violations);
-					} )? )?
+					// Call on_fail hook if provided
+					$(
+						$(
+							{
+								fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, violations: &$crate::testing::specs::SpecViolation)
+								where
+									F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::specs::SpecViolation),
+								{
+									f(trace, violations)
+								}
+								__call_on_fail($on_fail, &$trace, _violations);
+							}
+						)?
+					)?
 					all_passed = false;
 					if first_violation.is_none() {
 						first_violation = Some(_violations.clone());

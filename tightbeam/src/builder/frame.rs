@@ -1098,8 +1098,7 @@ mod tests {
 						);
 					}
 					_ => panic!(
-						"Unhandled test case combination: ({}, {}, {}, {}, {:?})",
-						confidential, nonrepudiable, message_integrity, frame_integrity, min_version
+						"Unhandled test case combination: ({confidential}, {nonrepudiable}, {message_integrity}, {frame_integrity}, {min_version:?})"
 					),
 				}
 			}

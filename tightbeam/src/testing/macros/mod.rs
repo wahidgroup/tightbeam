@@ -1089,6 +1089,7 @@ macro_rules! tb_scenario {
 	};
 
 	// ===== Bare environment variant (single spec: Type form) =====
+	// Pattern with only on_pass
 	(
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
@@ -1097,13 +1098,58 @@ macro_rules! tb_scenario {
 		environment Bare {
 			exec: $exec_closure:expr
 		}
-		$(, hooks {
-			$(on_pass: $on_pass:expr,)?
-			$(on_fail: $on_fail:expr)?
-		})?
+		, hooks {
+			on_pass: $on_pass:expr
+		}
 		$(,)?
 	) => {
-		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? $(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)? exec: $exec_closure)
+		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? $(hooks: { on_pass: $on_pass, },)? exec: $exec_closure)
+	};
+	// Pattern with only on_fail
+	(
+		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Bare {
+			exec: $exec_closure:expr
+		}
+		, hooks {
+			on_fail: $on_fail:expr
+		}
+		$(,)?
+	) => {
+		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? $(hooks: { on_fail: $on_fail },)? exec: $exec_closure)
+	};
+	// Pattern with both hooks
+	(
+		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Bare {
+			exec: $exec_closure:expr
+		}
+		, hooks {
+			on_pass: $on_pass:expr,
+			on_fail: $on_fail:expr
+		}
+		$(,)?
+	) => {
+		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? $(hooks: { on_pass: $on_pass, on_fail: $on_fail },)? exec: $exec_closure)
+	};
+	// Pattern without hooks
+	(
+		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(instrumentation: $instr_cfg:expr,)?
+		environment Bare {
+			exec: $exec_closure:expr
+		}
+		$(,)?
+	) => {
+		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? exec: $exec_closure)
 	};
 
 	// ===== Bare environment variant (multiple specs: [...] form) =====
@@ -1376,6 +1422,12 @@ macro_rules! tb_scenario {
 				let cfg = mode.config();
 				let _ = $crate::instrumentation::active::init(cfg);
 				$crate::instrumentation::active::start_trace();
+			} else {
+				// For Custom mode, also initialize to enable tb_instrument! calls
+				// Use the config from the Custom mode
+				let cfg = mode.config();
+				let _ = $crate::instrumentation::active::init(cfg);
+				$crate::instrumentation::active::start_trace();
 			}
 		}
 	};
@@ -1387,6 +1439,18 @@ macro_rules! tb_scenario {
 			if mode.is_auto() {
 				let artifact = $crate::instrumentation::active::end_trace().expect("Failed to finalize trace");
 				$trace.instrument_events = artifact.events;
+			} else {
+				// For Custom mode, copy events from global state to trace
+				// Events from tb_instrument! are in global state
+				// Note: TraceCollector events are already in trace.instrument_events from populate_from_collector
+				// So we merge global state events (from tb_instrument!) with TraceCollector events
+				let artifact = $crate::instrumentation::active::end_trace().expect("Failed to finalize trace");
+				// Filter out Start/End events and merge
+				let global_events: Vec<_> = artifact.events
+					.into_iter()
+					.filter(|e| e.kind != $crate::instrumentation::TbEventKind::Start && e.kind != $crate::instrumentation::TbEventKind::End)
+					.collect();
+				$trace.instrument_events.extend(global_events);
 			}
 		}
 	};
@@ -2107,10 +2171,10 @@ macro_rules! tb_scenario {
 				$(start: $start_expr,)?
 				client: $client_closure
 			}
-			$(, hooks {
-				$(on_pass: $on_pass,)?
-				$(on_fail: $on_fail)?
-			})?
+		$(, hooks {
+			$(on_pass: $on_pass $(,)?)?
+			$(on_fail: $on_fail $(,)?)?
+		})?
 		}
 	};
 	(

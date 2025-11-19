@@ -133,7 +133,7 @@ macro_rules! tb_process_spec {
 						use $crate::testing::specs::csp::Event;
 						use $crate::testing::timing::{DeadlineBuilder, TimingConstraints};
 						use $crate::testing::macros::DeadlineParams;
-						let mut timing_constraints = TimingConstraints::new();
+						let mut timing_constraints = TimingConstraints::default();
 
 						$crate::tb_process_spec! {
 							@parse_timing
@@ -169,7 +169,7 @@ macro_rules! tb_process_spec {
 		$($(
 			$constraints.add(
 				Event($wcet_event),
-				$wcet_constraint
+				$crate::testing::timing::TimingConstraint::Wcet($wcet_constraint)
 			);
 		)*)?
 

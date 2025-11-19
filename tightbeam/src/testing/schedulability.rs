@@ -75,10 +75,10 @@ impl core::fmt::Display for SchedulabilityError {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
 			SchedulabilityError::MissingPeriod(event) => {
-				write!(f, "Missing period for event: {}", event)
+				write!(f, "Missing period for event: {event}")
 			}
 			SchedulabilityError::InvalidTaskSet(msg) => {
-				write!(f, "Invalid task set: {}", msg)
+				write!(f, "Invalid task set: {msg}")
 			}
 		}
 	}
@@ -112,7 +112,7 @@ fn calculate_utilization(task_set: &TaskSet) -> Result<f64, SchedulabilityError>
 fn create_utilization_violation(utilization: f64, bound: f64) -> SchedulabilityViolation {
 	SchedulabilityViolation {
 		task_id: "system".to_string(),
-		message: format!("Utilization {} exceeds bound {}", utilization, bound),
+		message: format!("Utilization {utilization} exceeds bound {bound}"),
 	}
 }
 

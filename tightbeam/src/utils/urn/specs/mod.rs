@@ -3,4 +3,3 @@
 pub mod tightbeam;
 
 pub use tightbeam::TightbeamInstrumentation;
-

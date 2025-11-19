@@ -231,22 +231,19 @@ impl FdrConfig {
 			(Some(scheduler_count), Some(process_count)) => {
 				if scheduler_count > process_count {
 					return Err(TestingError::InvalidFdrConfig(format!(
-						"scheduler_count ({}) cannot exceed process_count ({}). \
+						"scheduler_count ({scheduler_count}) cannot exceed process_count ({process_count}). \
 						When m > n, all processes can run simultaneously, making \
-						resource constraint modeling meaningless.",
-						scheduler_count, process_count
+						resource constraint modeling meaningless."
 					)));
 				}
 				if scheduler_count == 0 {
 					return Err(TestingError::InvalidFdrConfig(format!(
-						"scheduler_count must be > 0. Got {}.",
-						scheduler_count
+						"scheduler_count must be > 0. Got {scheduler_count}."
 					)));
 				}
 				if process_count == 0 {
 					return Err(TestingError::InvalidFdrConfig(format!(
-						"process_count must be > 0. Got {}.",
-						process_count
+						"process_count must be > 0. Got {process_count}."
 					)));
 				}
 				Ok(())
