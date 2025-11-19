@@ -191,13 +191,18 @@ impl<'a> Tagged for Urn<'a> {
 
 impl<'a> EncodeValue for Urn<'a> {
 	fn value_len(&self) -> crate::der::Result<crate::der::Length> {
-		let urn_str = format!("urn:{}:{}", self.nid, self.nss);
-		urn_str.value_len()
+		// "urn:" (4) + nid + ":" (1) + nss
+		let total_len = 4 + self.nid.len() + 1 + self.nss.len();
+		crate::der::Length::try_from(total_len)
 	}
 
 	fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
-		let urn_str = format!("urn:{}:{}", self.nid, self.nss);
-		urn_str.encode_value(encoder)
+		// Manually write "urn:nid:nss" without format!() for no_std compatibility
+		encoder.write(b"urn:")?;
+		encoder.write(self.nid.as_bytes())?;
+		encoder.write(b":")?;
+		encoder.write(self.nss.as_bytes())?;
+		Ok(())
 	}
 }
 
@@ -206,10 +211,12 @@ impl<'a> DecodeValue<'a> for Urn<'a> {
 		reader: &mut R,
 		_header: crate::der::Header,
 	) -> crate::der::Result<Self> {
+		// Decode as String (requires allocation) then parse
+		// DER decoding inherently needs allocation for owned data
 		let utf8_str = String::decode_value(reader, _header)?;
 		let urn_str = utf8_str.as_str();
 
-		// Parse "urn:nid:nss" format
+		// Parse "urn:nid:nss" format without additional allocations
 		if !urn_str.starts_with("urn:") {
 			return Err(crate::der::ErrorKind::Value { tag: Tag::Utf8String }.into());
 		}
@@ -222,6 +229,7 @@ impl<'a> DecodeValue<'a> for Urn<'a> {
 		let nid = &rest[..colon_pos];
 		let nss = &rest[colon_pos + 1..];
 
+		// Create owned Cow for static lifetime
 		Ok(Urn { nid: Cow::Owned(nid.to_string()), nss: Cow::Owned(nss.to_string()) })
 	}
 }

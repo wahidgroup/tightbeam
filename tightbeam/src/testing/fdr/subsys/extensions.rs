@@ -199,16 +199,16 @@ impl FdrTraceExt for ConsumedTrace {
 
 	#[cfg(feature = "instrument")]
 	fn project_to_observable(&self) -> Vec<String> {
-		use crate::instrumentation::event_kinds;
+		use crate::instrumentation::events;
 
 		self.instrument_events
 			.iter()
 			.filter(|e| {
-				e.urn == event_kinds::GATE_ACCEPT
-					|| e.urn == event_kinds::GATE_REJECT
-					|| e.urn == event_kinds::REQUEST_RECV
-					|| e.urn == event_kinds::RESPONSE_SEND
-					|| e.urn == event_kinds::ASSERT_LABEL
+				e.urn == events::GATE_ACCEPT
+					|| e.urn == events::GATE_REJECT
+					|| e.urn == events::REQUEST_RECV
+					|| e.urn == events::RESPONSE_SEND
+					|| e.urn == events::ASSERT_LABEL
 			})
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
 			.collect()
@@ -216,18 +216,18 @@ impl FdrTraceExt for ConsumedTrace {
 
 	#[cfg(feature = "instrument")]
 	fn project_to_hidden(&self) -> Vec<String> {
-		use crate::instrumentation::event_kinds;
+		use crate::instrumentation::events;
 
 		self.instrument_events
 			.iter()
 			.filter(|e| {
-				e.urn == event_kinds::HANDLER_ENTER
-					|| e.urn == event_kinds::HANDLER_EXIT
-					|| e.urn == event_kinds::CRYPTO_STEP
-					|| e.urn == event_kinds::COMPRESS_STEP
-					|| e.urn == event_kinds::ROUTE_STEP
-					|| e.urn == event_kinds::POLICY_EVAL
-					|| e.urn == event_kinds::PROCESS_HIDDEN
+				e.urn == events::HANDLER_ENTER
+					|| e.urn == events::HANDLER_EXIT
+					|| e.urn == events::CRYPTO_STEP
+					|| e.urn == events::COMPRESS_STEP
+					|| e.urn == events::ROUTE_STEP
+					|| e.urn == events::POLICY_EVAL
+					|| e.urn == events::PROCESS_HIDDEN
 			})
 			.filter_map(|e| e.label.as_ref().map(|s| s.to_string()))
 			.collect()
@@ -301,7 +301,7 @@ impl FdrTraceExt for ConsumedTrace {
 		// Include instrumentation events based on mode
 		#[cfg(feature = "instrument")]
 		{
-			// TbEventKind removed - use event_kinds module constants instead
+			// TbEventKind removed - use events module constants instead
 
 			match mode {
 				TraceProcessMode::AssertionsOnly => {
@@ -309,13 +309,13 @@ impl FdrTraceExt for ConsumedTrace {
 				}
 				TraceProcessMode::WithObservableInstrumentation | TraceProcessMode::FullInstrumentation => {
 					// Include observable instrumentation events
-					use crate::instrumentation::event_kinds;
+					use crate::instrumentation::events;
 					for event in &self.instrument_events {
-						if event.urn == event_kinds::GATE_ACCEPT
-							|| event.urn == event_kinds::GATE_REJECT
-							|| event.urn == event_kinds::REQUEST_RECV
-							|| event.urn == event_kinds::RESPONSE_SEND
-							|| event.urn == event_kinds::ASSERT_LABEL
+						if event.urn == events::GATE_ACCEPT
+							|| event.urn == events::GATE_REJECT
+							|| event.urn == events::REQUEST_RECV
+							|| event.urn == events::RESPONSE_SEND
+							|| event.urn == events::ASSERT_LABEL
 						{
 							if let Some(label) = &event.label {
 								events.push(TraceEvent::ObservableInstrumentation {
@@ -330,15 +330,15 @@ impl FdrTraceExt for ConsumedTrace {
 
 			if matches!(mode, TraceProcessMode::FullInstrumentation) {
 				// Include hidden instrumentation events
-				use crate::instrumentation::event_kinds;
+				use crate::instrumentation::events;
 				for event in &self.instrument_events {
-					if event.urn == event_kinds::HANDLER_ENTER
-						|| event.urn == event_kinds::HANDLER_EXIT
-						|| event.urn == event_kinds::CRYPTO_STEP
-						|| event.urn == event_kinds::COMPRESS_STEP
-						|| event.urn == event_kinds::ROUTE_STEP
-						|| event.urn == event_kinds::POLICY_EVAL
-						|| event.urn == event_kinds::PROCESS_HIDDEN
+					if event.urn == events::HANDLER_ENTER
+						|| event.urn == events::HANDLER_EXIT
+						|| event.urn == events::CRYPTO_STEP
+						|| event.urn == events::COMPRESS_STEP
+						|| event.urn == events::ROUTE_STEP
+						|| event.urn == events::POLICY_EVAL
+						|| event.urn == events::PROCESS_HIDDEN
 					{
 						if let Some(label) = &event.label {
 							events.push(TraceEvent::HiddenInstrumentation { seq: event.seq, label: label.clone() });

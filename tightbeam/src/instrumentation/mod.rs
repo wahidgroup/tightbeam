@@ -22,7 +22,7 @@ use crate::utils::urn::Urn;
 ///
 /// These constants provide convenient access to URNs for all event types.
 /// Format: `urn:tightbeam:instrumentation:event/<event-name>`
-pub mod event_kinds {
+pub mod events {
 	use super::*;
 
 	// Core lifecycle events
@@ -181,9 +181,8 @@ pub mod active {
 				Err(e) => return Err(e),
 			};
 
-			// Encode Urn as UTF8String (format as "urn:nid:nss")
-			let urn_str = format!("urn:{}:{}", self.urn.nid, self.urn.nss);
-			len = match urn_str.encoded_len() {
+			// Encode Urn directly (it implements EncodeValue)
+			len = match self.urn.encoded_len() {
 				Ok(l) => (len + l)?,
 				Err(e) => return Err(e),
 			};
@@ -195,7 +194,7 @@ pub mod active {
 				};
 			}
 			if let Some(ref payload_hash) = self.payload_hash {
-				let os = match crate::der::asn1::OctetString::new(payload_hash.as_slice()) {
+				let os = match OctetString::new(payload_hash.as_slice()) {
 					Ok(o) => o,
 					Err(e) => return Err(e),
 				};
@@ -217,7 +216,7 @@ pub mod active {
 			};
 
 			if let Some(ref extras) = self.extras {
-				let os = match crate::der::asn1::OctetString::new(extras.as_slice()) {
+				let os = match OctetString::new(extras.as_slice()) {
 					Ok(o) => o,
 					Err(e) => return Err(e),
 				};
@@ -233,15 +232,14 @@ pub mod active {
 		fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
 			self.seq.encode(encoder)?;
 
-			// Encode Urn as UTF8String (format as "urn:nid:nss")
-			let urn_str = format!("urn:{}:{}", self.urn.nid, self.urn.nss);
-			urn_str.encode(encoder)?;
+			// Encode Urn directly (it implements Encode)
+			self.urn.encode(encoder)?;
 
 			if let Some(ref label) = self.label {
 				label.encode(encoder)?;
 			}
 			if let Some(ref payload_hash) = self.payload_hash {
-				let os = crate::der::asn1::OctetString::new(payload_hash.as_slice())?;
+				let os = OctetString::new(payload_hash.as_slice())?;
 				os.encode(encoder)?;
 			}
 			if let Some(duration_ns) = self.duration_ns {
@@ -251,7 +249,7 @@ pub mod active {
 			self.flags.encode(encoder)?;
 
 			if let Some(ref extras) = self.extras {
-				let os = crate::der::asn1::OctetString::new(extras.as_slice())?;
+				let os = OctetString::new(extras.as_slice())?;
 				os.encode(encoder)?;
 			}
 
@@ -266,26 +264,23 @@ pub mod active {
 		) -> crate::der::Result<Self> {
 			reader.sequence(|seq: &mut crate::der::NestedReader<'_, R>| {
 				let seq_val = u32::decode(seq)?;
-				// Decode Urn and convert to 'static
-				let urn_decoded: Urn<'_> = Urn::decode(seq)?;
-				let urn = urn_decoded.into_owned();
+				let urn_decoded = Urn::decode(seq)?;
+				let urn: Urn<'static> = urn_decoded.into_owned();
 				let label = Option::<String>::decode(seq)?;
-				// Decode payload_hash as OctetString and convert to [u8; 32]
-				let payload_hash: Option<[u8; 32]> =
-					Option::<crate::der::asn1::OctetString>::decode(seq)?.and_then(|os| {
-						let bytes = os.as_bytes();
-						if bytes.len() == 32 {
-							let mut hash = [0u8; 32];
-							hash.copy_from_slice(bytes);
-							Some(hash)
-						} else {
-							None
-						}
-					});
+				let payload_hash: Option<[u8; 32]> = Option::<OctetString>::decode(seq)?.and_then(|os| {
+					let bytes = os.as_bytes();
+					if bytes.len() == 32 {
+						let mut hash = [0u8; 32];
+						hash.copy_from_slice(bytes);
+						Some(hash)
+					} else {
+						None
+					}
+				});
+
 				let duration_ns = Option::<u64>::decode(seq)?;
 				let flags = u32::decode(seq)?;
-				// Decode extras as OctetString and convert to Vec<u8>
-				let extras = Option::<crate::der::asn1::OctetString>::decode(seq)?.map(|os| os.as_bytes().to_vec());
+				let extras = Option::<OctetString>::decode(seq)?.map(|os| os.as_bytes().to_vec());
 				Ok(TbEvent { seq: seq_val, urn, label, payload_hash, duration_ns, flags, extras })
 			})
 		}

@@ -12,7 +12,7 @@ use crate::Errorizable;
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulerType, TaskSet};
 
-// TbEventKind removed - use event_kinds module constants instead
+// TbEventKind removed - use events module constants instead
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(not(feature = "std"))]
@@ -424,7 +424,7 @@ impl TBSpec for BuiltAssertSpec {
 		self.inner.gate_decision
 	}
 	#[cfg(feature = "instrument")]
-	fn required_event_kinds(&self) -> &[crate::utils::urn::Urn<'static>] {
+	fn required_events(&self) -> &[crate::utils::urn::Urn<'static>] {
 		&self.inner.required_events
 	}
 	fn validate_trace(&self, _trace: &ConsumedTrace) -> Result<(), SpecViolation> {

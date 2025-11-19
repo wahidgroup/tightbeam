@@ -9,7 +9,7 @@ use crate::testing::assertions::{AssertionContract, AssertionLabel};
 use crate::trace::{ConsumedTrace, ExecutionMode};
 use crate::Frame;
 
-// TbEventKind removed - use event_kinds module constants instead
+// TbEventKind removed - use events module constants instead
 
 use std::fmt;
 
@@ -32,7 +32,7 @@ pub trait TBSpec {
 
 	/// Required instrumentation event URNs (if instrumentation feature enabled)
 	#[cfg(feature = "instrument")]
-	fn required_event_kinds(&self) -> &[crate::utils::urn::Urn<'static>] {
+	fn required_events(&self) -> &[crate::utils::urn::Urn<'static>] {
 		&[]
 	}
 
@@ -223,7 +223,7 @@ pub fn verify_trace<S: TBSpec>(spec: &S, trace: &ConsumedTrace) -> Result<(), Sp
 	// 4. Verify instrumentation event ordering (if instrumentation feature enabled)
 	#[cfg(feature = "instrument")]
 	{
-		let required_kinds = spec.required_event_kinds();
+		let required_kinds = spec.required_events();
 		if !required_kinds.is_empty() {
 			let mut idx = 0;
 			for ev in trace.instrument_events.iter() {

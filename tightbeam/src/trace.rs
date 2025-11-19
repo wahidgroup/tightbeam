@@ -1,14 +1,21 @@
 #![allow(unexpected_cfgs)]
 
+use core::time::Duration;
+
+#[cfg(feature = "std")]
+use std::borrow::Cow;
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(feature = "std"))]
+use alloc::borrow::Cow;
 #[cfg(not(feature = "std"))]
 use alloc::sync::{Arc, Mutex};
 
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{Assertion, AssertionLabel, AssertionValue};
 use crate::transport::error::TransportError;
+use crate::utils::urn::Urn;
 use crate::Frame;
 
 use sha3::{Digest, Sha3_256};
@@ -79,13 +86,13 @@ impl<'a> EventBuilder<'a> {
 
 	/// Add timing information to the event
 	#[cfg(feature = "instrument")]
-	pub fn with_timing(mut self, duration: std::time::Duration) -> Self {
+	pub fn with_timing(mut self, duration: Duration) -> Self {
 		self.duration_ns = Some(duration.as_nanos() as u64);
 		self
 	}
 
 	#[cfg(not(feature = "instrument"))]
-	pub fn with_timing(self, _duration: std::time::Duration) -> Self {
+	pub fn with_timing(self, _duration: Duration) -> Self {
 		self
 	}
 
@@ -109,9 +116,9 @@ impl<'a> EventBuilder<'a> {
 			Some(EventValue::None) | None => {
 				#[cfg(feature = "instrument")]
 				{
-					use crate::instrumentation::event_kinds;
+					use crate::instrumentation::events;
 					self.collector.emit_internal(
-						&event_kinds::ASSERT_LABEL,
+						events::ASSERT_LABEL,
 						Some(&self.label),
 						self.payload,
 						self.duration_ns,
@@ -122,10 +129,10 @@ impl<'a> EventBuilder<'a> {
 			Some(EventValue::Value(assertion_value)) => {
 				#[cfg(feature = "instrument")]
 				{
-					use crate::instrumentation::event_kinds;
+					use crate::instrumentation::events;
 					let value_str = format_assertion_value(&assertion_value);
 					self.collector.emit_internal(
-						&event_kinds::ASSERT_PAYLOAD,
+						events::ASSERT_PAYLOAD,
 						Some(&self.label),
 						Some(value_str.as_bytes()),
 						self.duration_ns,
@@ -283,7 +290,7 @@ impl TraceCollector {
 	#[cfg(feature = "instrument")]
 	fn emit_internal(
 		&self,
-		event_urn: &crate::utils::urn::Urn<'static>,
+		event_urn: Urn<'static>,
 		label: Option<&str>,
 		payload: Option<&[u8]>,
 		duration_ns: Option<u64>,
@@ -306,7 +313,7 @@ impl TraceCollector {
 
 		let event = TbEvent {
 			seq,
-			urn: event_urn.clone().into_owned(), // Convert to 'static for storage
+			urn: event_urn, // URN is cloned, not moved - cheap for borrowed Cow
 			label: label.map(|l| l.to_string()),
 			payload_hash,
 			duration_ns: if cfg.record_durations {
@@ -324,27 +331,17 @@ impl TraceCollector {
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn emit(&self, event_urn: &crate::utils::urn::Urn<'static>, label: impl AsRef<str>) {
+	pub fn emit(&self, event_urn: Urn<'static>, label: impl AsRef<str>) {
 		self.emit_with_payload(event_urn, label.as_ref(), None);
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn emit_with_payload(
-		&self,
-		event_urn: &crate::utils::urn::Urn<'static>,
-		label: impl AsRef<str>,
-		payload: Option<&[u8]>,
-	) {
+	pub fn emit_with_payload(&self, event_urn: Urn<'static>, label: impl AsRef<str>, payload: Option<&[u8]>) {
 		self.emit_internal(event_urn, Some(label.as_ref()), payload, None);
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn emit_with_timing(
-		&self,
-		event_urn: &crate::utils::urn::Urn<'static>,
-		label: impl AsRef<str>,
-		duration: std::time::Duration,
-	) {
+	pub fn emit_with_timing(&self, event_urn: Urn<'static>, label: impl AsRef<str>, duration: Duration) {
 		self.emit_internal(event_urn, Some(label.as_ref()), None, Some(duration.as_nanos() as u64));
 	}
 
@@ -494,8 +491,8 @@ impl ConsumedTrace {
 	}
 
 	#[cfg(feature = "instrument")]
-	pub fn count_event_urn(&self, event_urn: &crate::utils::urn::Urn<'static>) -> usize {
-		self.instrument_events.iter().filter(|e| &e.urn == event_urn).count()
+	pub fn count_event_urn(&self, event_urn: Urn<'static>) -> usize {
+		self.instrument_events.iter().filter(|e| e.urn == event_urn).count()
 	}
 }
 
@@ -560,8 +557,8 @@ mod tests {
 		environment Bare {
 			exec: |trace| {
 				let other = trace.clone();
-				trace.event("alpha");
-				other.event("beta");
+				trace.event("alpha").emit();
+				other.event("beta").emit();
 				Ok(())
 			}
 		}

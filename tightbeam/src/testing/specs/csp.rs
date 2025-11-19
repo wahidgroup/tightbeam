@@ -943,8 +943,8 @@ mod tests {
 		csp: SimpleBareFlowProc,
 		environment Bare {
 			exec: |trace| {
-				trace.event("step1");
-				trace.event("step2");
+				trace.event("step1").emit();
+				trace.event("step2").emit();
 				Ok(())
 			}
 		}
@@ -1000,8 +1000,8 @@ mod tests {
 					assertions: trace,
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.event("Received");
-						trace.event("Responded");
+						trace.event("Received").emit();
+						trace.event("Responded").emit();
 						Ok(Some(frame))
 					}
 				};
@@ -1010,7 +1010,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.event("Responded");
+				trace.event("Responded").emit();
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -1020,13 +1020,13 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event("Received");
+				trace.event("Received").emit();
 
 				Ok(())
 			}
 		},
 		hooks {
-			on_pass: |_trace| {
+		on_pass: |_trace| {
 				// Hook called - assertions already validated by spec
 				HOOK_CALLED.store(true, Ordering::SeqCst);
 			},
@@ -1043,8 +1043,8 @@ mod tests {
 		protocol: TokioListener,
 		handle: |frame, trace| async move {
 			// Server-side assertions
-			trace.event("Received");
-			trace.event("Responded");
+			trace.event("Received").emit();
+			trace.event("Responded").emit();
 			Ok(Some(frame))
 		}
 	}
@@ -1067,7 +1067,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.event("Responded");
+				trace.event("Responded").emit();
 
 				let test_message = create_test_message(None);
 				let test_frame = crate::compose! {
@@ -1077,7 +1077,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event("Received");
+				trace.event("Received").emit();
 
 				Ok(())
 			}
