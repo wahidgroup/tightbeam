@@ -1066,12 +1066,12 @@ mod tests {
 			}
 		},
 		hooks {
-			on_pass: |_trace, _result| -> Result<(), Box<dyn std::error::Error>> {
+			on_pass: |_trace, _result| {
 				// Hook called - assertions already validated by spec
 				HOOK_CALLED.store(true, Ordering::SeqCst);
 				Ok(())
 			},
-			on_fail: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
+			on_fail: |_trace, result| {
 				Err(format!("Test should not fail! Result: {result:?}").into())
 			}
 		}

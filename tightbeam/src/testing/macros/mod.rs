@@ -3094,11 +3094,11 @@ mod tests {
 			}
 		},
 		hooks {
-			on_pass: |_trace, _result| -> Result<(), Box<dyn std::error::Error>> {
+			on_pass: |_trace, _result| {
 				HOOK_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
 				Ok(())
 			},
-			on_fail: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
+			on_fail: |_trace, result| {
 				Err(format!("Test should not fail! Result: {result:?}").into())
 			}
 		}

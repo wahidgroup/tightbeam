@@ -73,7 +73,7 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
+		on_pass: |_trace, result| {
 			// Verify that ScenarioResult contains the specification data (owned for export)
 			assert!(result.assert_spec.is_some(), "Assert spec should be present");
 			assert!(result.process.is_some(), "Process should be present");

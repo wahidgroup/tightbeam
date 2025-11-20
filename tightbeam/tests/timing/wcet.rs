@@ -82,7 +82,7 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |trace, _result| -> Result<(), Box<dyn std::error::Error>> {
+		on_pass: |trace, _result| {
 			// Verify timing constraints exist on process
 			let process = SimpleWcetProcess::process();
 			let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");
@@ -121,7 +121,7 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |trace, _result| -> Result<(), Box<dyn std::error::Error>> {
+		on_pass: |trace, _result| {
 			// Verify timing constraints exist on process
 			let process = SimpleWcetProcess::process();
 			let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");
@@ -161,7 +161,7 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |trace, _result| -> Result<(), Box<dyn std::error::Error>> {
+		on_pass: |trace, _result| {
 			// Verify timing constraints exist on process
 			let process = SimpleWcetProcess::process();
 			let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");

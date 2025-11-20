@@ -71,7 +71,7 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_fail: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
+		on_fail: |_trace, result| {
 			// Verify that we got a schedulability violation with structured data
 			let violation = result.spec_violation.as_ref().unwrap_or_else(|| panic!("Expected spec violation"));
 			match violation {
@@ -150,7 +150,7 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_fail: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
+		on_fail: |_trace, result| {
 			// Verify that we got a schedulability violation with structured data
 			let violation = result.spec_violation.as_ref().unwrap_or_else(|| panic!("Expected spec violation"));
 			match violation {
@@ -222,7 +222,7 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_fail: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
+		on_fail: |_trace, result| {
 			// Should fail with schedulability error for missing WCET
 			let violation = result.spec_violation.as_ref().unwrap_or_else(|| panic!("Expected spec violation"));
 			match violation {
