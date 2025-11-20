@@ -507,7 +507,7 @@ macro_rules! drone {
 		paste::paste! {
 			// Stop old servlet if any
 			let old_servlet = {
-				let mut active = $active_servlet.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
+				let mut active = $active_servlet.lock()?;
 				core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None)
 			};
 			$stop_old(old_servlet);
@@ -520,7 +520,7 @@ macro_rules! drone {
 				Ok(servlet) => {
 					let servlet_addr = servlet.addr();
 					let addr_str: Vec<u8> = servlet_addr.clone().into();
-					let mut active = $active_servlet.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
+					let mut active = $active_servlet.lock()?;
 					*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
 					drop(active);
 					return Ok(Some($crate::compose! {
@@ -529,7 +529,7 @@ macro_rules! drone {
 								status: $crate::policy::TransitStatus::Accepted,
 								servlet_address: Some(addr_str)
 							}
-					}.map_err(|e| $crate::TightBeamError::from(e))?));
+					}?));
 				}
 				Err(_) => {
 					return Ok(Some($crate::compose! {
@@ -538,7 +538,7 @@ macro_rules! drone {
 								status: $crate::policy::TransitStatus::Forbidden,
 								servlet_address: None
 							}
-					}.map_err(|e| $crate::TightBeamError::from(e))?));
+					}?));
 				}
 			}
 		}
@@ -599,10 +599,8 @@ macro_rules! drone {
 
 				async fn start(_trace: $crate::trace::TraceCollector, _config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
 					// Bind to a port for the control server
-					let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
-						.map_err(|e| $crate::TightBeamError::from(e))?;
-					let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
-						.map_err(|e| $crate::TightBeamError::from(e))?;
+					let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()?;
+					let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
 
 					// Create shared state for the active servlet
 					let active_servlet = ::std::sync::Arc::new(::std::sync::Mutex::new([<$drone_name ActiveServlet>]::None));
@@ -697,7 +695,7 @@ macro_rules! drone {
 					servlet_id.extend_from_slice(stringify!($servlet_id).as_bytes());
 					servlet_id.push(b'_');
 					servlet_id.extend_from_slice(&addr_str);
-					let mut servlets = $servlets.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
+					let mut servlets = $servlets.lock()?;
 					servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
 					drop(servlets);
 					return Ok(Some($crate::compose! {
@@ -711,7 +709,7 @@ macro_rules! drone {
 								list: None,
 								stop: None,
 							}
-					}.map_err(|e| $crate::TightBeamError::from(e))?));
+					}?));
 				}
 				Err(_) => {
 					return Ok(Some($crate::compose! {
@@ -725,7 +723,7 @@ macro_rules! drone {
 								list: None,
 								stop: None,
 							}
-					}.map_err(|e| $crate::TightBeamError::from(e))?));
+					}?));
 				}
 			}
 		}
@@ -892,10 +890,8 @@ macro_rules! drone {
 
 				async fn start(_trace: $crate::trace::TraceCollector, config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
 					// Bind to a port for the control server
-					let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
-						.map_err(|e| $crate::TightBeamError::from(e))?;
-					let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
-						.map_err(|e| $crate::TightBeamError::from(e))?;
+					let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()?;
+					let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
 
 					// Use provided config or default
 					let config = config.unwrap_or_default();
@@ -1208,7 +1204,7 @@ macro_rules! drone {
 								status: $crate::policy::TransitStatus::Forbidden,
 								servlet_address: None
 							}
-					}.map_err(|e| $crate::TightBeamError::from(e))?));
+					}?));
 				}
 
 				// Not an activation request - check if there's an active servlet to handle it
@@ -1253,12 +1249,12 @@ macro_rules! drone {
 									list: None,
 									stop: None,
 								}
-						}.map_err(|e| $crate::TightBeamError::from(e))?));
+					}?));
 					}
 
 					// Handle list request
 					if let Some(_list_params) = request.list {
-						let servlets = $servlets.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
+						let servlets = $servlets.lock()?;
 						let mut servlet_list = Vec::new();
 
 						for (servlet_id, servlet) in servlets.iter() {
@@ -1285,12 +1281,12 @@ macro_rules! drone {
 									}),
 									stop: None,
 								}
-						}.map_err(|e| $crate::TightBeamError::from(e))?));
+					}?));
 					}
 
 					// Handle stop request
 					if let Some(stop_params) = request.stop {
-						let mut servlets = $servlets.lock().map_err(|_| $crate::colony::drone::DroneError::LockPoisoned)?;
+						let mut servlets = $servlets.lock()?;
 
 						if let Some(servlet) = servlets.remove(&stop_params.servlet_id) {
 							// Stop the servlet
@@ -1310,7 +1306,7 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Accepted
 										}),
 									}
-							}.map_err(|e| $crate::TightBeamError::from(e))?));
+						}?));
 						} else {
 							drop(servlets);
 
@@ -1323,7 +1319,7 @@ macro_rules! drone {
 											status: $crate::policy::TransitStatus::Forbidden
 										}),
 									}
-							}.map_err(|e| $crate::TightBeamError::from(e))?));
+						}?));
 						}
 					}
 				}
@@ -1599,11 +1595,16 @@ mod tests {
 			})
 		},
 		handle: |message, trace, _config, workers| async move {
+			let trace = ::std::sync::Arc::new(trace);
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			let decoded_arc = ::std::sync::Arc::new(decoded);
 			let (echo_result, check_result) = tokio::join!(
-				workers.echo.relay(trace.clone(), ::std::sync::Arc::clone(&decoded_arc)),
-				workers.checker.relay(trace.clone(), ::std::sync::Arc::clone(&decoded_arc))
+				workers
+					.echo
+					.relay(::std::sync::Arc::clone(&trace), ::std::sync::Arc::clone(&decoded_arc)),
+				workers
+					.checker
+					.relay(::std::sync::Arc::clone(&trace), ::std::sync::Arc::clone(&decoded_arc))
 			);
 
 			let echo_msg = match echo_result {

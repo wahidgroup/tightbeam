@@ -190,7 +190,7 @@ servlet! {
 	},
 	handle: |message, trace, config| async move {
 		let message_id = message.metadata.id.clone();
-		let invalid_move = |trace: TraceCollector, id: Vec<u8>, order: u64|
+		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {
 			trace.event("server_response_emitted");
 			Ok(Some(create_invalid_move_response(id, order)?))
@@ -204,7 +204,7 @@ servlet! {
 			Err(_) => {
 				// Invalid message format - return invalid move response
 				trace.event("server_decode_failure");
-				return invalid_move(trace, message_id, message.metadata.order);
+				return invalid_move(Arc::clone(&trace), message_id, message.metadata.order);
 			}
 		};
 
@@ -214,7 +214,7 @@ servlet! {
 		let game_status = match config.manager.process_move(&move_req, move_count, &trace) {
 			Ok(status) => status,
 			Err(_) => {
-				return invalid_move(trace, message_id, move_count);
+				return invalid_move(Arc::clone(&trace), message_id, move_count);
 			}
 		};
 
@@ -222,7 +222,7 @@ servlet! {
 		let matrix = match config.manager.game_state_matrix() {
 			Ok(m) => m,
 			Err(_) => {
-				return invalid_move(trace, message_id, move_count);
+				return invalid_move(Arc::clone(&trace), message_id, move_count);
 			}
 		};
 

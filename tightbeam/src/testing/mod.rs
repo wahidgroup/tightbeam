@@ -5,7 +5,9 @@
 
 pub mod assertions;
 pub mod error;
+pub mod export;
 pub mod macros;
+pub mod result;
 pub mod specs;
 pub mod trace;
 pub mod utils;
@@ -26,6 +28,12 @@ pub use utils::*;
 
 // Re-export commonly used items from specs module for convenience
 pub use specs::{verify_trace, SpecViolation, TBSpec};
+
+// Re-export ScenarioResult for test hooks
+pub use result::ScenarioResult;
+
+// Re-export export trait
+pub use export::ScenarioResultExport;
 
 #[cfg(feature = "testing-fdr")]
 pub use fdr::*;

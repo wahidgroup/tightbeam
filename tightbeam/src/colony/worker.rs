@@ -1,10 +1,15 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 
 #[cfg(feature = "std")]
 use std::sync::Arc;
+
+use core::future::Future;
+use core::pin::Pin;
 
 #[cfg(feature = "derive")]
 use crate::Errorizable;
@@ -25,7 +30,7 @@ macro_rules! __tightbeam_worker_common_methods {
 		/// Relay a message to the worker
 		pub async fn relay(
 			&self,
-			trace: $crate::trace::TraceCollector,
+			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			message: ::std::sync::Arc<$input>,
 		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
 			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
@@ -72,7 +77,7 @@ macro_rules! __tightbeam_worker_common_methods {
 		/// Relay a message to the worker
 		pub async fn relay(
 			&self,
-			trace: crate::trace::TraceCollector,
+			trace: ::std::sync::Arc<crate::trace::TraceCollector>,
 			message: ::std::sync::Arc<$input>,
 		) -> ::core::result::Result<$output, $crate::colony::WorkerRelayError> {
 			let sender = self.sender.as_ref().ok_or($crate::colony::WorkerRelayError::QueueClosed)?;
@@ -214,7 +219,7 @@ pub mod worker_runtime {
 			handle.thread().unpark();
 		}
 
-		fn block_on<F: Future>(mut fut: F) -> F::Output {
+		pub fn block_on<F: Future>(mut fut: F) -> F::Output {
 			fn raw_waker() -> RawWaker {
 				fn clone(_: *const ()) -> RawWaker {
 					raw_waker()
@@ -240,7 +245,7 @@ pub mod worker_runtime {
 pub struct WorkerRequest<I: Send, O> {
 	pub message: Arc<I>,
 	pub respond_to: worker_runtime::rt::ResponseSender<Result<O, TransitStatus>>,
-	pub trace: TraceCollector,
+	pub trace: Arc<TraceCollector>,
 }
 
 #[cfg_attr(feature = "derive", derive(Errorizable))]
@@ -268,6 +273,56 @@ impl core::fmt::Display for WorkerRelayError {
 
 #[cfg(not(feature = "derive"))]
 impl std::error::Error for WorkerRelayError {}
+
+pub type WorkerRelayFuture<'a, O> = Pin<Box<dyn Future<Output = Result<O, WorkerRelayError>> + Send + 'a>>;
+pub type WorkerStartFuture<W> = Pin<Box<dyn Future<Output = Result<W, crate::error::TightBeamError>> + Send>>;
+
+#[cfg(feature = "tokio")]
+#[allow(dead_code)]
+pub fn block_on_worker_future<F, T>(future: F) -> Result<T, std::io::Error>
+where
+	F: Future<Output = T> + Send + 'static,
+	T: Send + 'static,
+{
+	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+	Ok(runtime.block_on(future))
+}
+
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[allow(dead_code)]
+pub fn block_on_worker_future<F, T>(future: F) -> T
+where
+	F: Future<Output = T> + Send + 'static,
+	T: Send + 'static,
+{
+	worker_runtime::rt::block_on(future)
+}
+
+pub trait Worker: Send + Sync + Sized {
+	type Input: Send + Sync + 'static;
+	type Output: Send + 'static;
+	type Config: Send + 'static;
+
+	fn start(self) -> WorkerStartFuture<Self>;
+
+	fn kill(self) -> ::core::result::Result<(), std::io::Error>;
+
+	fn relay<'a>(
+		&'a self,
+		trace: Arc<TraceCollector>,
+		message: Arc<Self::Input>,
+	) -> WorkerRelayFuture<'a, Self::Output>;
+
+	fn handle<'a>(
+		&'a self,
+		trace: Arc<TraceCollector>,
+		message: Arc<Self::Input>,
+	) -> WorkerRelayFuture<'a, Self::Output> {
+		self.relay(trace, message)
+	}
+
+	fn queue_capacity(&self) -> usize;
+}
 
 pub struct WorkerPolicies<I: Send> {
 	#[allow(dead_code)]
@@ -408,6 +463,9 @@ macro_rules! worker {
 			{ $( $policy_method : $policy_value ),* },
 			$handler
 		);
+		$crate::worker!(@impl_from $worker_name, $config_kind, { $($cfg_field: $cfg_ty,)* });
+		$crate::worker!(@impl_default_if_needed $worker_name, $config_kind);
+		$crate::worker!(@impl_worker_trait $worker_name, $input, $output, $config_kind, { $($cfg_field: $cfg_ty,)* });
 		$crate::worker!(@drop_impl $worker_name);
 	};
 
@@ -424,6 +482,9 @@ macro_rules! worker {
 			{ $( $policy_method : $policy_value ),* },
 			$handler
 		);
+		$crate::worker!(@impl_from $worker_name, no_config, {});
+		$crate::worker!(@impl_default_if_needed $worker_name, no_config);
+		$crate::worker!(@impl_worker_trait $worker_name, $input, $output, no_config, {});
 		$crate::worker!(@drop_impl $worker_name);
 	};
 
@@ -440,6 +501,9 @@ macro_rules! worker {
 			{},
 			$handler
 		);
+		$crate::worker!(@impl_from $worker_name, config, { $($cfg_field: $cfg_ty,)* });
+		$crate::worker!(@impl_default_if_needed $worker_name, config);
+		$crate::worker!(@impl_worker_trait $worker_name, $input, $output, config, { $($cfg_field: $cfg_ty,)* });
 		$crate::worker!(@drop_impl $worker_name);
 	};
 
@@ -456,6 +520,9 @@ macro_rules! worker {
 			{},
 			$handler
 		);
+		$crate::worker!(@impl_from $worker_name, no_config, {});
+		$crate::worker!(@impl_default_if_needed $worker_name, no_config);
+		$crate::worker!(@impl_worker_trait $worker_name, $input, $output, no_config, {});
 		$crate::worker!(@drop_impl $worker_name);
 	};
 
@@ -470,9 +537,10 @@ macro_rules! worker {
 	(@impl_struct $worker_name:ident, $input:ty, $output:ty, { $($cfg_field:ident: $cfg_ty:ty,)* }) => {
 		$crate::paste::paste! {
 			pub struct $worker_name {
-				sender: Option<$crate::colony::worker_runtime::rt::QueueSender<$crate::colony::worker::WorkerRequest<$input, $output>>>,
+				sender: Option<$crate::colony::worker_runtime::rt::QueueSender<$crate::colony::WorkerRequest<$input, $output>>>,
 				join: Option<$crate::colony::worker_runtime::rt::JoinHandle>,
 				queue: usize,
+				pending_config: Option<[<$worker_name Conf>]>,
 			}
 
 			#[derive(Clone)]
@@ -491,9 +559,9 @@ macro_rules! worker {
 	) => {
 		$crate::paste::paste! {
 			impl $worker_name {
-				pub fn start(config: [<$worker_name Conf>]) -> $crate::error::Result<Self> {
+				pub fn start(config: [<$worker_name Conf>]) -> Self {
 					let queue_capacity = $crate::worker!(@queue $($queue)?);
-					let (tx, rx) = $crate::colony::worker_runtime::rt::channel::<$crate::colony::worker::WorkerRequest<$input, $output>>(queue_capacity);
+					let (tx, rx) = $crate::colony::worker_runtime::rt::channel::<$crate::colony::WorkerRequest<$input, $output>>(queue_capacity);
 
 					let config_arc = std::sync::Arc::new(config);
 					let policies = std::sync::Arc::new(
@@ -502,12 +570,12 @@ macro_rules! worker {
 
 					let run_loop = {
 						let config_arc = ::std::sync::Arc::clone(&config_arc);
-						let policies = policies.clone();
+						let policies = ::std::sync::Arc::clone(&policies);
 						$crate::worker!(@run_loop rx, (config Some(config_arc)), policies, $handler)
 					};
 
 					let join = $crate::colony::worker_runtime::rt::spawn(run_loop);
-					Ok(Self { sender: Some(tx), join: Some(join), queue: queue_capacity })
+					Self { sender: Some(tx), join: Some(join), queue: queue_capacity, pending_config: None }
 				}
 
 				$crate::worker!(@common_methods $input, $output);
@@ -523,7 +591,7 @@ macro_rules! worker {
 		$handler:tt
 	) => {
 		impl $worker_name {
-			pub fn start() -> $crate::error::Result<Self> {
+			pub fn start() -> Self {
 				let queue_capacity = $crate::worker!(@queue $($queue)?);
 				let (tx, rx) = $crate::colony::worker_runtime::rt::channel::<$crate::colony::WorkerRequest<$input, $output>>(queue_capacity);
 
@@ -532,12 +600,12 @@ macro_rules! worker {
 				);
 
 				let run_loop = {
-					let policies = policies.clone();
+					let policies = ::std::sync::Arc::clone(&policies);
 					$crate::worker!(@run_loop rx, (config None), policies, $handler)
 				};
 
 				let join = $crate::colony::worker_runtime::rt::spawn(run_loop);
-				Ok(Self { sender: Some(tx), join: Some(join), queue: queue_capacity })
+				Self { sender: Some(tx), join: Some(join), queue: queue_capacity }
 			}
 
 			$crate::worker!(@common_methods $input, $output);
@@ -553,24 +621,24 @@ macro_rules! worker {
 	) => {
 		$crate::paste::paste! {
 			impl $worker_name {
-				pub fn start(config: [<$worker_name Conf>]) -> $crate::Result<Self> {
+				pub fn start(config: [<$worker_name Conf>]) -> Self {
 					let queue_capacity = $crate::worker!(@queue $($queue)?);
-					let (tx, rx) = rt::channel::<$crate::colony::worker::WorkerRequest<$input, $output>>(queue_capacity);
+					let (tx, rx) = rt::channel::<$crate::colony::WorkerRequest<$input, $output>>(queue_capacity);
 
 					let config_arc = Arc::new(config);
 					let policies = Arc::new(
-						$crate::colony::worker::WorkerPolicyBuilder::<$input>::default()
+						$crate::colony::WorkerPolicyBuilder::<$input>::default()
 							.build(),
 					);
 
 					let run_loop = {
 						let config_arc = ::std::sync::Arc::clone(&config_arc);
-						let policies = policies.clone();
+						let policies = ::std::sync::Arc::clone(&policies);
 						$crate::worker!(@run_loop rx, (config Some(config_arc)), policies, $handler)
 					};
 
 					let join = rt::spawn(run_loop);
-					Ok(Self { sender: Some(tx), join: Some(join), queue: queue_capacity })
+					Self { sender: Some(tx), join: Some(join), queue: queue_capacity, pending_config: None }
 				}
 
 				$crate::worker!(@common_methods $input, $output);
@@ -586,24 +654,167 @@ macro_rules! worker {
 		$handler:tt
 	) => {
 		impl $worker_name {
-			pub fn start() -> $crate::Result<Self> {
+			pub fn start() -> Self {
 				let queue_capacity = $crate::worker!(@queue $($queue)?);
-				let (tx, rx) = rt::channel::<$crate::colony::worker::WorkerRequest<$input, $output>>(queue_capacity);
+				let (tx, rx) = rt::channel::<$crate::colony::WorkerRequest<$input, $output>>(queue_capacity);
 
 				let policies = Arc::new(
-					$crate::colony::worker::WorkerPolicyBuilder::<$input>::default()
+					$crate::colony::WorkerPolicyBuilder::<$input>::default()
 						.build(),
 				);
 
 				let join = rt::spawn(async move {
-					let policies = policies.clone();
+					let policies = ::std::sync::Arc::clone(&policies);
 					$crate::worker!(@run_loop rx, (config None), policies, $handler).await;
 				});
 
-				Ok(Self { sender: Some(tx), join: Some(join), queue: queue_capacity })
+				Self { sender: Some(tx), join: Some(join), queue: queue_capacity }
 			}
 
 			$crate::worker!(@common_methods $input, $output);
+		}
+	};
+
+	(@impl_from $worker_name:ident, config, { $($cfg_field:ident: $cfg_ty:ty,)* }) => {
+		$crate::paste::paste! {
+			impl From<[<$worker_name Conf>]> for $worker_name {
+				fn from(config: [<$worker_name Conf>]) -> Self {
+					Self {
+						sender: None,
+						join: None,
+						queue: 0,
+						pending_config: Some(config),
+					}
+				}
+			}
+		}
+	};
+
+	(@impl_from $worker_name:ident, no_config, {}) => {};
+
+	(@impl_default_if_needed $worker_name:ident, config) => {};
+
+	(@impl_default_if_needed $worker_name:ident, no_config) => {
+		impl Default for $worker_name {
+			fn default() -> Self {
+				Self {
+					sender: None,
+					join: None,
+					queue: 0,
+				}
+			}
+		}
+	};
+
+	(@impl_worker_trait $worker_name:ident, $input:ty, $output:ty, config, { $($cfg_field:ident: $cfg_ty:ty,)* }) => {
+		$crate::paste::paste! {
+			impl $crate::colony::Worker for $worker_name {
+				type Input = $input;
+				type Output = $output;
+				type Config = [<$worker_name Conf>];
+
+				fn start(mut self) -> $crate::colony::WorkerStartFuture<Self> {
+					Box::pin(async move {
+						if let Some(config) = self.pending_config.take() {
+							Ok(Self::start(config))
+						} else if self.sender.is_some() {
+							Ok(self)
+						} else {
+							Err($crate::error::TightBeamError::MissingFeature("worker config"))
+						}
+					})
+				}
+
+				fn relay<'a>(
+					&'a self,
+					trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+					message: ::std::sync::Arc<Self::Input>,
+				) -> $crate::colony::WorkerRelayFuture<'a, Self::Output> {
+					Box::pin($worker_name::relay(self, trace, message))
+				}
+
+				fn kill(self) -> ::core::result::Result<(), std::io::Error> {
+					#[cfg(feature = "tokio")]
+					{
+						use std::io::{Error, ErrorKind};
+						$crate::colony::block_on_worker_future(async move {
+							$worker_name::kill(self)
+								.await
+								.map_err(|err| Error::new(ErrorKind::Other, err))
+						})?
+					}
+					#[cfg(all(not(feature = "tokio"), feature = "std"))]
+					{
+						$worker_name::kill(self)
+					}
+					#[cfg(not(any(feature = "tokio", feature = "std")))]
+					{
+						let _ = self;
+						Err(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							"worker kill requires either `tokio` or `std` feature",
+						))
+					}
+				}
+
+				fn queue_capacity(&self) -> usize {
+					self.queue
+				}
+			}
+		}
+	};
+
+	(@impl_worker_trait $worker_name:ident, $input:ty, $output:ty, no_config, {}) => {
+		impl $crate::colony::Worker for $worker_name {
+			type Input = $input;
+			type Output = $output;
+			type Config = ();
+
+			fn start(self) -> $crate::colony::WorkerStartFuture<Self> {
+				Box::pin(async move {
+					if self.sender.is_some() {
+						Ok(self)
+					} else {
+						Ok(Self::start())
+					}
+				})
+			}
+
+			fn relay<'a>(
+				&'a self,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+				message: ::std::sync::Arc<Self::Input>,
+			) -> $crate::colony::WorkerRelayFuture<'a, Self::Output> {
+				Box::pin($worker_name::relay(self, trace, message))
+			}
+
+			fn kill(self) -> ::core::result::Result<(), std::io::Error> {
+				#[cfg(feature = "tokio")]
+				{
+					use std::io::{Error, ErrorKind};
+					$crate::colony::block_on_worker_future(async move {
+						$worker_name::kill(self)
+							.await
+							.map_err(|err| Error::new(ErrorKind::Other, err))
+					})?
+				}
+				#[cfg(all(not(feature = "tokio"), feature = "std"))]
+				{
+					$worker_name::kill(self)
+				}
+				#[cfg(not(any(feature = "tokio", feature = "std")))]
+				{
+					let _ = self;
+					Err(std::io::Error::new(
+						std::io::ErrorKind::Other,
+						"worker kill requires either `tokio` or `std` feature",
+					))
+				}
+			}
+
+			fn queue_capacity(&self) -> usize {
+				self.queue
+			}
 		}
 	};
 
@@ -613,13 +824,13 @@ macro_rules! worker {
 		let policies = $policies;
 		async move {
 			while let Some(request) = $crate::colony::worker_runtime::rt::recv(&mut receiver).await {
-				let $crate::colony::worker::WorkerRequest { message, respond_to, trace } = request;
+				let $crate::colony::WorkerRequest { message, respond_to, trace } = request;
 				if let Err(status) = $crate::worker!(@evaluate_policies policies, &message) {
 					let _ = respond_to.send(Err(status));
 					continue;
 				}
 				let $message_ident = (*message).clone();
-				let $trace_ident = trace;
+				let $trace_ident = ::std::sync::Arc::clone(&trace);
 				let $config_ident = config_arc.as_ref();
 				let output = (async move $handler_block).await;
 				let _ = respond_to.send(Ok(output));
@@ -638,7 +849,7 @@ macro_rules! worker {
 					continue;
 				}
 				let $message_ident = (*message).clone();
-				let $trace_ident = trace;
+				let $trace_ident = ::std::sync::Arc::clone(&trace);
 				let $config_ident = ();
 				let output = (async move $handler_block).await;
 				let _ = respond_to.send(Ok(output));
@@ -664,7 +875,7 @@ macro_rules! worker {
 	}};
 
 	(@build_policies $input:ty, { $( with_receptor_gate : [ $( $gate:expr ),* $(,)? ] ),* $(,)? }) => {{
-		$crate::colony::worker::WorkerPolicyBuilder::<$input>::default()
+		$crate::colony::WorkerPolicyBuilder::<$input>::default()
 			$(.with_receptor_gate([ $( $gate ),* ]))*
 			.build()
 	}};
@@ -690,9 +901,12 @@ macro_rules! worker {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Arc;
+
 	use crate::colony::worker::WorkerRelayError;
 	use crate::der::Sequence;
 	use crate::policy::{ReceptorPolicy, TransitStatus};
+	use crate::trace::TraceCollector;
 	use crate::Beamable;
 
 	#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
@@ -725,7 +939,6 @@ mod tests {
 			lotto_number: u32,
 		},
 		handle: |message, _trace, config| async move {
-
 			message.lucky_number == config.lotto_number
 		}
 	}
@@ -746,20 +959,19 @@ mod tests {
 	crate::test_worker! {
 		name: lucky_number_worker_checks_winner,
 		setup: || {
-			LuckyNumberDeterminer::start(LuckyNumberDeterminerConf { lotto_number: 42 })
+			LuckyNumberDeterminer::from(LuckyNumberDeterminerConf { lotto_number: 42 })
 		},
 		assertions: |worker| async move {
 			assert_eq!(worker.queue_capacity(), 64);
 
-			let trace = crate::trace::TraceCollector::new();
-
-			let winner = worker.relay(trace.clone(), ::std::sync::Arc::new(RequestMessage {
+			let trace = Arc::new(TraceCollector::new());
+			let winner = worker.relay(Arc::clone(&trace), Arc::new(RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
 			})).await?;
 			assert!(winner);
 
-			let loser = worker.relay(trace.clone(), ::std::sync::Arc::new(RequestMessage {
+			let loser = worker.relay(Arc::clone(&trace), Arc::new(RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 7,
 			})).await?;
@@ -773,16 +985,16 @@ mod tests {
 	crate::test_worker! {
 		name: test_ping_pong_worker,
 		setup: || {
-			PingPongWorker::start()
+			PingPongWorker::default()
 		},
 		assertions: |worker| async move {
 			// Test accepted message
-			let trace = crate::trace::TraceCollector::new();
+			let trace = Arc::new(TraceCollector::new());
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
 			};
-			let response = worker.relay(trace.clone(), ::std::sync::Arc::new(ping_msg)).await?;
+			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg)).await?;
 			assert_eq!(response, PongMessage { result: "PONG".to_string() });
 
 			// Test rejected message
@@ -791,7 +1003,7 @@ mod tests {
 				lucky_number: 42,
 			};
 
-			let result = worker.relay(trace, ::std::sync::Arc::new(pong_msg)).await;
+			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg)).await;
 			assert!(matches!(result, Err(WorkerRelayError::Rejected(_))));
 
 			Ok(())

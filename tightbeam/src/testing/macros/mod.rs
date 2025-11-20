@@ -627,7 +627,7 @@ macro_rules! tb_scenario {
 				// Environment-specific execution
 				let trace_collector = $crate::trace::TraceCollector::new();
 				let trace_setup = trace_collector.clone();
-				let trace_stimulus = trace_collector.clone();
+				let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
 				let fuzz_for_setup = fuzz_input.clone();
 				let fuzz_for_stimulus = fuzz_input.clone();
 
@@ -645,12 +645,12 @@ macro_rules! tb_scenario {
 
 				fn __call_stimulus_closure<F, W>(
 					closure: F,
-					trace: $crate::trace::TraceCollector,
+					trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 					worker: &mut W,
 					fuzz_input: Vec<u8>,
 				) -> Result<(), $crate::TightBeamError>
 				where
-					F: FnOnce($crate::trace::TraceCollector, &mut W, Vec<u8>) -> Result<(), $crate::TightBeamError>,
+					F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W, Vec<u8>) -> Result<(), $crate::TightBeamError>,
 				{
 					closure(trace, worker, fuzz_input)
 				}
@@ -675,6 +675,476 @@ macro_rules! tb_scenario {
 			});
 
 			result.expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for Worker environment (worker closure syntax) =====
+	(
+		name: $test_name:ident,
+		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(trace: $trace_cfg:expr,)?
+		environment Worker {
+			worker: || $worker_body:expr,
+			stimulus: $stimulus_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[cfg(feature = "tokio")]
+		#[tokio::test]
+		async fn $test_name() {
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+
+			let builder = (|| $worker_body)();
+			let mut worker = <_ as $crate::colony::Worker>::start(builder)
+				.await
+				.expect("failed to start worker");
+
+			fn __tb_call_worker_stimulus<W, F, Fut>(
+				closure: F,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+				worker: W,
+			) -> Fut
+			where
+				W: $crate::colony::Worker,
+				F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
+				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+			{
+				closure(trace, worker)
+			}
+
+			let exec_result = __tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await;
+
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				single_spec: $spec,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+			};
+
+			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+
+		#[cfg(not(feature = "tokio"))]
+		#[test]
+		fn $test_name() {
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+
+			let builder = (|| $worker_body)();
+			let future = async move {
+				let worker = <_ as $crate::colony::Worker>::start(builder)
+					.await
+					.expect("failed to start worker");
+				fn __tb_call_worker_stimulus<W, F, Fut>(
+					closure: F,
+					trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+					worker: W,
+				) -> Fut
+				where
+					W: $crate::colony::Worker,
+					F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
+					Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+				{
+					closure(trace, worker)
+				}
+
+				__tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await
+			};
+
+			let exec_result = $crate::tb_scenario!(@run_worker_future(future));
+
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				single_spec: $spec,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+			};
+
+			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for Worker environment (worker closure syntax, multiple specs) =====
+	(
+		name: $test_name:ident,
+		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(trace: $trace_cfg:expr,)?
+		environment Worker {
+			worker: || $worker_body:expr,
+			stimulus: $stimulus_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[cfg(feature = "tokio")]
+		#[tokio::test]
+		async fn $test_name() {
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+
+			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
+				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
+			];
+
+			let builder = (|| $worker_body)();
+			let worker = <_ as $crate::colony::Worker>::start(builder)
+				.await
+				.expect("failed to start worker");
+
+			fn __tb_call_worker_stimulus<W, F, Fut>(
+				closure: F,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+				worker: W,
+			) -> Fut
+			where
+				W: $crate::colony::Worker,
+				F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
+				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+			{
+				closure(trace, worker)
+			}
+
+			let exec_result = __tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await;
+
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				multi_specs: specs,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+			};
+
+			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+
+		#[cfg(not(feature = "tokio"))]
+		#[test]
+		fn $test_name() {
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+
+			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
+				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
+			];
+
+			let builder = (|| $worker_body)();
+			let future = async move {
+				let worker = <_ as $crate::colony::Worker>::start(builder)
+					.await
+					.expect("failed to start worker");
+				fn __tb_call_worker_stimulus<W, F, Fut>(
+					closure: F,
+					trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+					worker: W,
+				) -> Fut
+				where
+					W: $crate::colony::Worker,
+					F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
+					Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+				{
+					closure(trace, worker)
+				}
+
+				__tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await
+			};
+
+			let exec_result = $crate::tb_scenario!(@run_worker_future(future));
+
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				multi_specs: specs,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+			};
+
+			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for Worker environment (worker type syntax) =====
+	(
+		name: $test_name:ident,
+		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(trace: $trace_cfg:expr,)?
+		environment Worker {
+			worker: $worker_type:path,
+			stimulus: $stimulus_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[cfg(feature = "tokio")]
+		#[tokio::test]
+		async fn $test_name() {
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+
+			let builder: $worker_type = <$worker_type as Default>::default();
+			let mut worker = <_ as $crate::colony::Worker>::start(builder)
+				.await
+				.expect("failed to start worker");
+
+			fn __tb_call_worker_stimulus<W, F, Fut>(
+				closure: F,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+				worker: W,
+			) -> Fut
+			where
+				W: $crate::colony::Worker,
+				F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
+				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+			{
+				closure(trace, worker)
+			}
+
+			let exec_result = __tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await;
+
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				single_spec: $spec,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+			};
+
+			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+
+		#[cfg(not(feature = "tokio"))]
+		#[test]
+		fn $test_name() {
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+
+			let builder: $worker_type = <$worker_type as Default>::default();
+			let future = async move {
+				let mut worker = <_ as $crate::colony::Worker>::start(builder)
+					.await
+					.expect("failed to start worker");
+
+				fn __tb_call_worker_stimulus<W, F, Fut>(
+					closure: F,
+					trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+					worker: W,
+				) -> Fut
+				where
+					W: $crate::colony::Worker,
+					F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
+					Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+				{
+					closure(trace, worker)
+				}
+
+				__tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await
+			};
+
+			let exec_result = $crate::tb_scenario!(@run_worker_future(future));
+
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				single_spec: $spec,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+			};
+
+			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
+	// ===== Standalone test with name for Worker environment (worker type syntax, multiple specs) =====
+	(
+		name: $test_name:ident,
+		specs: [ $( $spec_expr:expr ),+ $(,)? ],
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(trace: $trace_cfg:expr,)?
+		environment Worker {
+			worker: $worker_type:path,
+			stimulus: $stimulus_closure:expr
+		}
+		$(, hooks {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		})?
+		$(,)?
+	) => {
+		#[cfg(feature = "tokio")]
+		#[tokio::test]
+		async fn $test_name() {
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+
+			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
+				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
+			];
+
+			let builder: $worker_type = <$worker_type as Default>::default();
+			let worker = <_ as $crate::colony::Worker>::start(builder)
+				.await
+				.expect("failed to start worker");
+
+			fn __tb_call_worker_stimulus<W, F, Fut>(
+				closure: F,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+				worker: W,
+			) -> Fut
+			where
+				W: $crate::colony::Worker,
+				F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
+				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+			{
+				closure(trace, worker)
+			}
+
+			let exec_result = __tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await;
+
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				multi_specs: specs,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+			};
+
+			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+
+		#[cfg(not(feature = "tokio"))]
+		#[test]
+		fn $test_name() {
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+
+			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
+				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
+			];
+
+			let builder: $worker_type = <$worker_type as Default>::default();
+			let future = async move {
+				let worker = <_ as $crate::colony::Worker>::start(builder)
+					.await
+					.expect("failed to start worker");
+
+				fn __tb_call_worker_stimulus<W, F, Fut>(
+					closure: F,
+					trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
+					worker: W,
+				) -> Fut
+				where
+					W: $crate::colony::Worker,
+					F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
+					Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+				{
+					closure(trace, worker)
+				}
+
+				__tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await
+			};
+
+			let exec_result = $crate::tb_scenario!(@run_worker_future(future));
+
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				multi_specs: specs,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+			};
+
+			$crate::tb_scenario!(@propagate_result exec_result, verification_result).expect(concat!("Test failed: ", stringify!($test_name)));
 		}
 	};
 
@@ -704,7 +1174,7 @@ macro_rules! tb_scenario {
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
 			let trace_setup = trace_collector.clone();
-			let trace_stimulus = trace_collector.clone();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
 
 			// Helper functions to enable type inference (synchronous)
 			fn __call_setup_closure<F, W>(
@@ -719,11 +1189,11 @@ macro_rules! tb_scenario {
 
 			fn __call_stimulus_closure<F, W>(
 				closure: F,
-				trace: $crate::trace::TraceCollector,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 				worker: &mut W,
 			) -> Result<(), $crate::TightBeamError>
 			where
-				F: FnOnce($crate::trace::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
+				F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W) -> Result<(), $crate::TightBeamError>,
 			{
 				closure(trace, worker)
 			}
@@ -779,7 +1249,7 @@ macro_rules! tb_scenario {
 
 			// Environment-specific execution
 			let trace_setup = trace_collector.clone();
-			let trace_stimulus = trace_collector.clone();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
 
 			// Helper functions to enable type inference (synchronous)
 			fn __call_setup_closure<F, W>(
@@ -794,11 +1264,11 @@ macro_rules! tb_scenario {
 
 			fn __call_stimulus_closure<F, W>(
 				closure: F,
-				trace: $crate::trace::TraceCollector,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 				worker: &mut W,
 			) -> Result<(), $crate::TightBeamError>
 			where
-				F: FnOnce($crate::trace::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
+				F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W) -> Result<(), $crate::TightBeamError>,
 			{
 				closure(trace, worker)
 			}
@@ -1139,7 +1609,7 @@ macro_rules! tb_scenario {
 		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
 		let trace_setup = trace_collector.clone();
-		let trace_stimulus = trace_collector.clone();
+		let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
 
 		// Helper functions to enable type inference (synchronous)
 		fn __call_setup_closure<F, W>(
@@ -1154,11 +1624,11 @@ macro_rules! tb_scenario {
 
 		fn __call_stimulus_closure<F, W>(
 			closure: F,
-			trace: $crate::trace::TraceCollector,
+			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			worker: &mut W,
 		) -> Result<(), $crate::TightBeamError>
 		where
-			F: FnOnce($crate::trace::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
+			F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W) -> Result<(), $crate::TightBeamError>,
 		{
 			closure(trace, worker)
 		}
@@ -1211,7 +1681,7 @@ macro_rules! tb_scenario {
 		// Environment-specific execution
 		let trace_collector = $crate::trace::TraceCollector::new();
 		let trace_setup = trace_collector.clone();
-		let trace_stimulus = trace_collector.clone();
+		let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
 
 		// Helper functions to enable type inference (synchronous)
 		fn __call_setup_closure<F, W>(
@@ -1226,11 +1696,11 @@ macro_rules! tb_scenario {
 
 		fn __call_stimulus_closure<F, W>(
 			closure: F,
-			trace: $crate::trace::TraceCollector,
+			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			worker: &mut W,
 		) -> Result<(), $crate::TightBeamError>
 		where
-			F: FnOnce($crate::trace::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
+			F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W) -> Result<(), $crate::TightBeamError>,
 		{
 			closure(trace, worker)
 		}
@@ -1332,6 +1802,10 @@ macro_rules! tb_scenario {
 		if $exec_result.is_err() {
 			$trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
 		}
+	}};
+
+	(@run_worker_future $future:expr) => {{
+		$crate::colony::worker::block_on_worker_future($future)
 	}};
 
 	// @with_instrumentation removed - instrumentation now handled by TraceCollector
@@ -2620,11 +3094,12 @@ mod tests {
 			}
 		},
 		hooks {
-			on_pass: |_trace| {
+			on_pass: |_trace, _result| -> Result<(), Box<dyn std::error::Error>> {
 				HOOK_CALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+				Ok(())
 			},
-			on_fail: |_trace, violations| {
-				panic!("Test should not fail! Violations: {violations:?}");
+			on_fail: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
+				Err(format!("Test should not fail! Result: {result:?}").into())
 			}
 		}
 	}

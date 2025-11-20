@@ -435,6 +435,8 @@ impl FdrTraceExt for ConsumedTrace {
 			timing_constraints: None,
 			#[cfg(feature = "testing-timing")]
 			timed_transitions: None,
+			#[cfg(feature = "testing-schedulability")]
+			schedulability_periods: None,
 		}
 	}
 }

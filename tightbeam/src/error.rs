@@ -91,6 +91,11 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	DroneError(crate::colony::DroneError),
 
+	#[cfg(feature = "colony")]
+	#[cfg_attr(feature = "derive", error("Worker relay error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	WorkerRelay(crate::colony::WorkerRelayError),
+
 	#[cfg(feature = "std")]
 	/// I/O error
 	#[cfg_attr(feature = "derive", error("I/O error: {0}"))]
@@ -275,6 +280,13 @@ pub enum TightBeamError {
 	/// Multiple errors collected together
 	#[cfg_attr(feature = "derive", error("Multiple errors occurred: {0:?}"))]
 	Sequence(Vec<TightBeamError>),
+}
+
+#[cfg(all(feature = "colony", not(feature = "derive")))]
+impl From<crate::colony::WorkerRelayError> for TightBeamError {
+	fn from(err: crate::colony::WorkerRelayError) -> Self {
+		TightBeamError::WorkerRelay(err)
+	}
 }
 
 #[cfg(not(feature = "derive"))]

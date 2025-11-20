@@ -151,6 +151,31 @@ pub fn check_timed_transition_guard(transition: &TimedTransition, clock_values: 
 	}
 }
 
+/// Check if schedulability constraints are violated
+///
+/// Runs schedulability analysis (RMA or EDF) on the process's task set.
+/// Returns `true` if the task set is NOT schedulable (violation detected).
+#[cfg(feature = "testing-schedulability")]
+pub fn check_schedulability_violations(
+	process: &crate::testing::specs::csp::Process,
+) -> Result<bool, crate::testing::schedulability::SchedulabilityError> {
+	use crate::testing::schedulability::{is_edf_schedulable, is_rm_schedulable, SchedulerType};
+
+	// Generate TaskSet from timing + periods
+	if let Some(task_set) = process.generate_task_set()? {
+		// Run schedulability analysis
+		let result = match task_set.scheduler {
+			SchedulerType::RateMonotonic => is_rm_schedulable(&task_set)?,
+			SchedulerType::EarliestDeadlineFirst => is_edf_schedulable(&task_set)?,
+		};
+
+		// Return true if NOT schedulable (violation detected)
+		Ok(!result.is_schedulable)
+	} else {
+		Ok(false) // No schedulability config, no violation
+	}
+}
+
 #[cfg(test)]
 #[cfg(feature = "testing-timing")]
 mod tests {

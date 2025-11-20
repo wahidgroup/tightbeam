@@ -31,24 +31,6 @@ impl TimingVerificationArtifact {
 	) -> Self {
 		Self { evidence, timing_results, statistical_analysis }
 	}
-
-	/// Export to Markdown (human-readable report) - stub for future implementation
-	pub fn to_markdown(&self) -> String {
-		// TODO: Generate Markdown report for documentation
-		todo!("Markdown export not yet implemented")
-	}
-
-	/// Export to UPPAAL format (stub for future implementation)
-	pub fn to_uppaal(&self) -> String {
-		// TODO: Generate UPPAAL XML format
-		todo!("UPPAAL export not yet implemented")
-	}
-
-	/// Export to TCTL (Timed Computation Tree Logic) format (stub for future implementation)
-	pub fn to_tctl(&self) -> String {
-		// TODO: Generate TCTL specification
-		todo!("TCTL export not yet implemented")
-	}
 }
 
 #[cfg(test)]

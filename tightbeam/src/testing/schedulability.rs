@@ -8,7 +8,7 @@
 use core::time::Duration;
 
 /// Real-time task model
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Task {
 	/// Task identifier
 	pub id: String,
@@ -23,7 +23,7 @@ pub struct Task {
 }
 
 /// Task set for schedulability analysis
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskSet {
 	/// Tasks in the set
 	pub tasks: Vec<Task>,
@@ -41,8 +41,10 @@ pub enum SchedulerType {
 }
 
 /// Schedulability result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SchedulabilityResult {
+	/// Scheduler type used for analysis
+	pub scheduler: SchedulerType,
 	/// Whether the task set is schedulable
 	pub is_schedulable: bool,
 	/// Total utilization (Σ(Ci/Ti))
@@ -50,12 +52,12 @@ pub struct SchedulabilityResult {
 	/// Utilization bound for the scheduler
 	pub utilization_bound: f64,
 	/// Violations (if any)
-	pub violations: Vec<SchedulabilityViolation>,
+	pub violations: Vec<TaskViolationDetail>,
 }
 
-/// Schedulability violation
-#[derive(Debug, Clone)]
-pub struct SchedulabilityViolation {
+/// Per-task violation detail
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskViolationDetail {
 	/// Task ID (or "system" for system-level violations)
 	pub task_id: String,
 	/// Violation message
@@ -63,7 +65,7 @@ pub struct SchedulabilityViolation {
 }
 
 /// Schedulability error
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SchedulabilityError {
 	/// Missing period for an event
 	MissingPeriod(String),
@@ -109,8 +111,8 @@ fn calculate_utilization(task_set: &TaskSet) -> Result<f64, SchedulabilityError>
 }
 
 /// Create violation message for utilization exceeding bound
-fn create_utilization_violation(utilization: f64, bound: f64) -> SchedulabilityViolation {
-	SchedulabilityViolation {
+fn create_utilization_violation(utilization: f64, bound: f64) -> TaskViolationDetail {
+	TaskViolationDetail {
 		task_id: "system".to_string(),
 		message: format!("Utilization {utilization} exceeds bound {bound}"),
 	}
@@ -121,38 +123,40 @@ fn create_utilization_violation(utilization: f64, bound: f64) -> SchedulabilityV
 /// Utilization bound: Σ(Ci/Ti) ≤ n(2^(1/n) - 1)
 /// where n = number of tasks, Ci = WCET, Ti = period
 pub fn is_rm_schedulable(task_set: &TaskSet) -> Result<SchedulabilityResult, SchedulabilityError> {
+	let scheduler = SchedulerType::RateMonotonic;
 	let utilization = calculate_utilization(task_set)?;
 	// Calculate utilization bound
 	let n = task_set.tasks.len() as f64;
-	let bound = if n == 1.0 {
+	let utilization_bound = if n == 1.0 {
 		1.0
 	} else {
 		n * (2f64.powf(1.0 / n) - 1.0)
 	};
-	let is_schedulable = utilization <= bound;
+	let is_schedulable = utilization <= utilization_bound;
 
 	let mut violations = Vec::new();
 	if !is_schedulable {
-		violations.push(create_utilization_violation(utilization, bound));
+		violations.push(create_utilization_violation(utilization, utilization_bound));
 	}
 
-	Ok(SchedulabilityResult { is_schedulable, utilization, utilization_bound: bound, violations })
+	Ok(SchedulabilityResult { scheduler, is_schedulable, utilization, utilization_bound, violations })
 }
 
 /// Earliest Deadline First (EDF) schedulability test
 ///
 /// Utilization bound: Σ(Ci/Ti) ≤ 1
 pub fn is_edf_schedulable(task_set: &TaskSet) -> Result<SchedulabilityResult, SchedulabilityError> {
+	let scheduler = SchedulerType::EarliestDeadlineFirst;
 	let utilization = calculate_utilization(task_set)?;
-	let bound = 1.0;
-	let is_schedulable = utilization <= bound;
+	let utilization_bound = 1.0;
+	let is_schedulable = utilization <= utilization_bound;
 
 	let mut violations = Vec::new();
 	if !is_schedulable {
-		violations.push(create_utilization_violation(utilization, bound));
+		violations.push(create_utilization_violation(utilization, utilization_bound));
 	}
 
-	Ok(SchedulabilityResult { is_schedulable, utilization, utilization_bound: bound, violations })
+	Ok(SchedulabilityResult { scheduler, is_schedulable, utilization, utilization_bound, violations })
 }
 
 /// Response Time Analysis (exact schedulability test)

@@ -231,6 +231,7 @@ following bounds:
   - Inherits: All V0 features
   - OPTIONAL: Message integrity (digest)
   - OPTIONAL: Confidentiality (cipher)
+  - OPTIONAL: Non-repudiation(signature)
 
 - VERSION 2
   - Inherits: All V1 features
@@ -258,6 +259,7 @@ pub trait SecurityProfile {
 	type AeadOid: AssociatedOid + AeadKeySize;
 	type SignatureAlg: SignatureAlgorithmIdentifier;
 	type CurveOid: AssociatedOid;
+	type KemOid: AssociatedOid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier>;
 }
 ```
@@ -292,6 +294,7 @@ impl SecurityProfile for MyAppProfile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type CurveOid = Secp256k1Oid;
+	type KemOid = Kyber1024Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
 }
 ```
@@ -308,6 +311,7 @@ impl SecurityProfile for TightbeamProfile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type CurveOid = Secp256k1Oid;
+	type KemOid = Kyber1024Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
 }
 ```
@@ -786,19 +790,19 @@ data retention choices.
 - Message Integrity (MI): MI MUST be computed over the message payload bytes.
 When present at the metadata level (i.e., `Metadata.integrity`), MI MUST bind
 the message body.
-- Frame Integrity (FI): FI MUST be computed over the envelope only (version +
+- Frame Integrity (FI): FI MUST be computed over the frame only (version +
 metadata; it MUST exclude the message) using DER-canonical encoding. FI MUST
-bind the envelope around the message and the metadata itself.
+bind the frame around the message and the metadata itself.
 
 Important properties:
 - FI alone MUST NOT be used to prove message content correctness; it ONLY proves
-the integrity of the envelope (version + metadata).
+the integrity of the frame (version + metadata).
 - MI MUST be used to prove message content correctness. Because MI lives in
-metadata and FI commits to the envelope that contains that metadata, FI
+metadata and FI commits to the frame that contains that metadata, FI
 therefore witnesses MI. When FI is authenticated (e.g., covered by a signature
 via nonrepudiation or finalized via consensus), any tampering with MI MUST cause
 the authenticated FI validation to fail. Receivers SHOULD treat the pair
-(valid MI, authenticated FI) as sufficient evidence that both envelope and
+(valid MI, authenticated FI) as sufficient evidence that both frame and
 message are intact. Note: an in-band, unsigned FI MUST NOT be relied upon to
 prevent an active attacker from changing both MI and FI.
 
@@ -1083,12 +1087,12 @@ END
 
 Implementations MUST provide:
 - Memory safety AND ownership guarantees (Rust)
-- ASN.1 DER encoding/decoding
-- Frame and Metadata as specified as ASN.1
+- Abstract Syntax Notation One (ASN.1) DER encoding/decoding
+- Frame and Metadata exactly as specified in ASN.1
 - Message-level security requirement enforcement
+- ASN.1 DER encoding/decoding
 
 Implementations MUST OPTIONALLY provide:
-- Abstract Layer-4 transport with async/sync
 - Cryptographic abstraction for confidentiality, integrity and non-repudiation
 
 ### 6.1.1 Message Security Enforcement
@@ -1102,14 +1106,12 @@ Implementations MUST enforce message-level security requirements through:
 
 #### Runtime Validation
 - Frame validation against message type requirements during encoding/decoding
-- Security profile compliance verification
 - Graceful error handling for requirement violations
 
 ### 6.2 Transport Layer
 
 tightbeam MUST operate over ANY transport protocol:
 - TCP (built-in async/sync support)
-- Custom transports via trait implementation
 
 ### 6.3 Cryptographic Key Management
 
@@ -1258,6 +1260,7 @@ pub enum RetryAction {
 	NoRetry,
 	RetryWithSame,
 	RetryAfter(Duration),
+	RetryWithModified(Box<Frame>),
 }
 ```
 
@@ -1725,7 +1728,7 @@ let security_accept = SecurityAccept {
 | **Confidentiality** | ECDH + HKDF derived AEAD key | Session key never transmitted; derived from ECDH shared secret |
 | **Forward Secrecy** | Ephemeral client keys | New ephemeral key per handshake; compromise doesn't affect past sessions |
 | **DoS** | 16 KiB handshake size cap | Reject oversized handshake messages before processing |
-| **Certificate Forgery** | X.509 chain validation | Verify certificate chain against trust anchors |
+| **Certificate Forgery** | X.509 chain validation | Verify root of trust Note: Application responsibility |
 | **Nonce Reuse** | Monotonic counter + XOR | Per-message nonce derived from seed XOR counter |
 
 ### 8.6 Audit
@@ -1845,30 +1848,31 @@ tb_scenario! {
 	spec: PingPongWorkerSpec,
 	csp: PingPongWorkerProcess,
 	environment Worker {
-		setup: PingPongWorker::new,
-		stimulus: |trace, worker: &mut PingPongWorker| {
+		worker: PingPongWorker,
+		stimulus: |trace, worker| {
 			// Test accepted message
 			trace.event("relay_start");
+
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
 				lucky_number: 42,
 			};
 
-			let response = worker.relay(trace.clone(), std::sync::Arc::new(ping_msg))?;
+			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg))?;
 			if let Some(pong) = response {
+				trace.event("relay_success");
 				trace.event_with("response_result", &[], pong.result);
 			}
 
-			trace.event("relay_success");
-
 			// Test rejected message
 			trace.event("relay_start");
+
 			let pong_msg = RequestMessage {
 				content: "PONG".to_string(),
 				lucky_number: 42,
 			};
 
-			let result = worker.relay(trace.clone(), std::sync::Arc::new(pong_msg));
+			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg));
 			if result.is_err() {
 				trace.event("relay_rejected");
 			}
@@ -1880,8 +1884,8 @@ tb_scenario! {
 ```
 
 The Worker environment:
-- Calls `setup` constructor with TraceCollector to create worker instance
-- Executes `stimulus` closure with trace and mutable worker reference
+- Calls `worker` constructor to create worker instance
+- Executes `stimulus` closure with trace and worker reference
 - Collects assertions from worker operations
 - Verifies against spec and process after execution
 - Does not involve transport layer (workers operate on local data)
@@ -1909,12 +1913,12 @@ tightbeam::servlet! {
 			lotto_number: config.lotto_number,
 		})
 	},
-	handle: |message, _trace, _config, workers| async move {
-		let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
+	handle: |message, trace, _config, workers| async move {
+		let decoded = decode::<RequestMessage, _>(&message.message)?;
 		let decoded_arc = Arc::new(decoded);
-			let (ping_result, lucky_result) = tokio::join!(
-			workers.ping_pong.relay(trace.clone(), Arc::clone(&decoded_arc)),
-			workers.lucky_number.relay(trace.clone(), Arc::clone(&decoded_arc))
+		let (ping_result, lucky_result) = tokio::join!( // Parallel processing
+			workers.ping_pong.relay(Arc::clone(&trace), Arc::clone(&decoded_arc)),
+			workers.lucky_number.relay(Arc::clone(&trace), Arc::clone(&decoded_arc))
 		);
 
 		let reply = match ping_result {
@@ -1927,13 +1931,13 @@ tightbeam::servlet! {
 			Err(_) => return None,
 		};
 
-		crate::compose! {
-			V0: id: std::sync::Arc::new(message.metadata.id.clone()),
+		Ok(compose! {
+			V0: id: b"ping-pong-servlet-response-id",
 				message: ResponseMessage {
 					result: reply.result,
 					is_winner,
 				}
-		}.ok()
+		}?)
 	}
 }
 ```
@@ -1952,9 +1956,10 @@ in parallel:
 **Example using `tokio::join!`:**
 ```rust
 let decoded_arc = Arc::new(decoded);
+let trace = Arc::new(trace);
 let (result1, result2) = tokio::join!(
-    workers.worker1.relay(Arc::clone(trace), Arc::clone(&decoded_arc)),
-    workers.worker2.relay(Arc::clone(trace), Arc::clone(&decoded_arc))
+    workers.worker1.relay(Arc::clone(&trace), Arc::clone(&decoded_arc)),
+    workers.worker2.relay(Arc::clone(&trace), Arc::clone(&decoded_arc))
 );
 ```
 
@@ -2441,9 +2446,9 @@ tb_scenario! {
 
 #### 10.2.9 Timing Verification and Schedulability
 
-The `testing-timing` feature enables timing verification for real-time systems, 
-including timing constraints, timed CSP semantics, and schedulability analysis. 
-All timing features integrate seamlessly with the existing CSP and FDR 
+The `testing-timing` feature enables timing verification for real-time systems,
+including timing constraints, timed CSP semantics, and schedulability analysis.
+All timing features integrate seamlessly with the existing CSP and FDR
 verification layers.
 
 **Timing Constraints in Process Specs:**
@@ -2893,12 +2898,15 @@ The `FdrTraceExt` trait extends `ConsumedTrace` with CSP-specific analysis:
 use tightbeam::testing::fdr::FdrTraceExt;
 
 hooks {
-    on_pass: |trace| {
+    on_pass: |trace, result| -> Result<(), Box<dyn std::error::Error>> {
         // Refinement properties
-        assert!(trace.fdr_verdict.trace_refines);
-        assert!(trace.fdr_verdict.failures_refines);
-        assert!(trace.fdr_verdict.divergence_free);
-        assert!(trace.fdr_verdict.is_deterministic);
+        if let Some(ref fdr_verdict) = result.fdr_verdict {
+            assert!(fdr_verdict.trace_refines);
+            assert!(fdr_verdict.failures_refines);
+            assert!(fdr_verdict.divergence_free);
+            assert!(fdr_verdict.is_deterministic);
+        }
+        Ok(())
     }
 }
 ```
@@ -3094,11 +3102,13 @@ tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |trace| {
+		on_pass: |_trace, _result| -> Result<(), Box<dyn std::error::Error>> {
 			// Optional: custom logic on test pass
+			Ok(())
 		},
-		on_fail: |_trace, violations| {
+		on_fail: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
 			// Optional: custom logic on test fail
+			Err(format!("Test failed with result: {result:?}").into())
 		}
 	}
 }

@@ -21,6 +21,9 @@ macro_rules! tb_process_spec {
 		$(timing {
 			$($timing_content:tt)*
 		})?
+		$(schedulability {
+			$($schedulability_content:tt)*
+		})?
 	) => {
 		$crate::tb_process_spec! {
 			@impl
@@ -40,6 +43,9 @@ macro_rules! tb_process_spec {
 			$($timing_content)*
 		})?
 		$(clocks: { $($clock_name:expr),* $(,)? })?
+		$(schedulability {
+			$($schedulability_content)*
+		})?
 		}
 	};
 	// Implementation pattern
@@ -59,6 +65,9 @@ macro_rules! tb_process_spec {
 		$(clocks: { $($clock_name:expr),* $(,)? })?
 		$(timing {
 			$($timing_content:tt)*
+		})?
+		$(schedulability {
+			$($schedulability_content:tt)*
 		})?
 	) => {
 		$(#[$meta])*
@@ -145,6 +154,21 @@ macro_rules! tb_process_spec {
 					}
 				)?
 
+				$(
+					#[cfg(feature = "testing-schedulability")]
+					{
+						use $crate::testing::specs::csp::Event;
+						use std::collections::HashMap;
+						use core::time::Duration;
+
+						$crate::tb_process_spec! {
+							@parse_schedulability
+							builder,
+							$($schedulability_content)*
+						}
+					}
+				)?
+
 				builder.build().expect("Failed to build Process")
 			}
 		}
@@ -218,6 +242,27 @@ macro_rules! tb_process_spec {
 
 	// Fallback: empty timing block
 	(@parse_timing $constraints:ident,) => {};
+
+	// Parse schedulability block
+	(@parse_schedulability
+		$builder:ident,
+		scheduler: $scheduler:ident,
+		periods: {
+			$($event_period:expr => $period:expr),* $(,)?
+		}
+	) => {
+		{
+			let scheduler = $crate::testing::schedulability::SchedulerType::$scheduler;
+			let mut periods = HashMap::new();
+			$(
+				periods.insert(Event($event_period), $period);
+			)*
+			$builder = $builder.with_schedulability_periods(scheduler, periods);
+		}
+	};
+
+	// Fallback: empty schedulability block
+	(@parse_schedulability $builder:ident,) => {};
 
 	// Parse transitions from a state - handle multiple transitions
 	// Recursively parse each transition

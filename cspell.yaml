@@ -21,6 +21,7 @@ words:
   - crls
   - CSPM
   - CSPRNG
+  - Decapsulator
   - Decorrelated
   - Decryptor
   - Deque
@@ -33,6 +34,8 @@ words:
   - EECI
   - EMERG
   - encap
+  - Encapped
+  - Encapsulator
   - Encryptor
   - eprintln
   - Errorizable
@@ -74,12 +77,14 @@ words:
   - OCSP
   - oids
   - oipk
+  - oneshot
   - Orchestr
   - Pedersen
   - Pingable
   - pkcs
   - pkix
   - Polydomy
+  - PQXDH
   - PRNG
   - recip
   - repr
@@ -107,6 +112,7 @@ words:
   - tightbeam
   - trybuild
   - typenum
+  - unpark
   - unwrapper
   - UPPAAL
   - usize

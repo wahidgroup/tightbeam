@@ -1191,12 +1191,13 @@ macro_rules! test_worker {
 	) => {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
-			// Call the setup closure and get the worker
-			let worker = $setup_body?;
+			// Build and start the worker
+			let builder = $setup_body;
+			let mut worker = <_ as $crate::colony::Worker>::start(builder).await?;
 
 			// Run assertions with reference to worker
 			let result = {
-				let $worker = &worker;
+				let $worker = &mut worker;
 				$assertions_body.await
 			};
 

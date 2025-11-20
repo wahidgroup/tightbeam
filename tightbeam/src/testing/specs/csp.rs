@@ -17,11 +17,15 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use core::time::Duration;
+
 use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
 use crate::der::{Header, Length, Reader, Writer};
 use crate::testing::assertions::AssertionLabel;
 use crate::trace::ConsumedTrace;
 
+#[cfg(feature = "testing-schedulability")]
+use crate::testing::schedulability::{SchedulabilityError, SchedulerType, TaskSet};
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::{TimedTransition, TimingConstraints, TimingGuard};
 
@@ -214,6 +218,11 @@ pub struct Process {
 	/// Optional timed transitions with timing guards
 	#[cfg(feature = "testing-timing")]
 	pub timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
+
+	/// Period mapping for schedulability analysis
+	/// Combined with timing_constraints to form TaskSet
+	#[cfg(feature = "testing-schedulability")]
+	pub schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
 }
 
 impl Process {
@@ -266,6 +275,16 @@ impl Process {
 	/// Check if state is nondeterministic choice point
 	pub fn is_choice(&self, state: State) -> bool {
 		self.choice.contains(&state)
+	}
+
+	/// Generate TaskSet from timing constraints and schedulability periods
+	#[cfg(feature = "testing-schedulability")]
+	pub fn generate_task_set(&self) -> Result<Option<TaskSet>, SchedulabilityError> {
+		if let (Some(timing), Some((scheduler, periods))) = (&self.timing_constraints, &self.schedulability_periods) {
+			Ok(Some(timing.to_task_set(periods, *scheduler)?))
+		} else {
+			Ok(None)
+		}
 	}
 }
 
@@ -404,6 +423,8 @@ pub struct ProcessBuilder {
 	timing_constraints: Option<TimingConstraints>,
 	#[cfg(feature = "testing-timing")]
 	timed_transitions: Option<HashMap<(State, Event), Vec<TimedTransition>>>,
+	#[cfg(feature = "testing-schedulability")]
+	schedulability_periods: Option<(SchedulerType, HashMap<Event, Duration>)>,
 }
 
 impl ProcessBuilder {
@@ -422,6 +443,8 @@ impl ProcessBuilder {
 			timing_constraints: None,
 			#[cfg(feature = "testing-timing")]
 			timed_transitions: None,
+			#[cfg(feature = "testing-schedulability")]
+			schedulability_periods: None,
 		}
 	}
 
@@ -511,6 +534,16 @@ impl ProcessBuilder {
 		self
 	}
 
+	#[cfg(feature = "testing-schedulability")]
+	pub fn with_schedulability_periods(
+		mut self,
+		scheduler: crate::testing::schedulability::SchedulerType,
+		periods: HashMap<Event, core::time::Duration>,
+	) -> Self {
+		self.schedulability_periods = Some((scheduler, periods));
+		self
+	}
+
 	pub fn build(self) -> Result<Process, &'static str> {
 		let initial = self.initial.ok_or("Initial state not set")?;
 
@@ -528,6 +561,8 @@ impl ProcessBuilder {
 			timing_constraints: self.timing_constraints,
 			#[cfg(feature = "testing-timing")]
 			timed_transitions: self.timed_transitions,
+			#[cfg(feature = "testing-schedulability")]
+			schedulability_periods: self.schedulability_periods,
 		})
 	}
 }
@@ -1031,12 +1066,13 @@ mod tests {
 			}
 		},
 		hooks {
-		on_pass: |_trace| {
+			on_pass: |_trace, _result| -> Result<(), Box<dyn std::error::Error>> {
 				// Hook called - assertions already validated by spec
 				HOOK_CALLED.store(true, Ordering::SeqCst);
+				Ok(())
 			},
-			on_fail: |_trace, violations| {
-				panic!("Test should not fail! Violations: {violations:?}");
+			on_fail: |_trace, result| -> Result<(), Box<dyn std::error::Error>> {
+				Err(format!("Test should not fail! Result: {result:?}").into())
 			}
 		}
 	}

@@ -125,6 +125,7 @@ pub enum SpecBuildError {
 }
 
 /// Builder for programmatic spec construction
+#[derive(Debug, Clone)]
 pub struct AssertSpecBuilder {
 	id: &'static str,
 	execution_mode: ExecutionMode,
@@ -264,6 +265,7 @@ pub struct SchedulabilityAssertion {
 	pub must_be_schedulable: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct BuiltAssertSpec {
 	inner: AssertSpecBuilder,
 	contracts: Box<[AssertionContract]>,
@@ -459,33 +461,25 @@ impl BuiltAssertSpec {
 				let is_schedulable = schedule_result.is_schedulable;
 				if assertion.must_be_schedulable && !is_schedulable {
 					// Task set must be schedulable but isn't
-					let violations_msg = schedule_result
-						.violations
-						.iter()
-						.map(|v| format!("{}: {}", v.task_id, v.message))
-						.collect::<Vec<_>>()
-						.join("; ");
-					Err(SpecViolation::SchedulabilityViolation {
-						expected: "schedulable".to_string(),
-						actual: "not schedulable".to_string(),
-						utilization: schedule_result.utilization,
-						utilization_bound: schedule_result.utilization_bound,
-						violations: violations_msg,
-					})
+					Err(SpecViolation::SchedulabilityViolation(schedule_result))
 				} else if !assertion.must_be_schedulable && is_schedulable {
 					// Task set must NOT be schedulable but is
-					Err(SpecViolation::SchedulabilityViolation {
-						expected: "not schedulable".to_string(),
-						actual: "schedulable".to_string(),
-						utilization: schedule_result.utilization,
-						utilization_bound: schedule_result.utilization_bound,
-						violations: String::new(),
-					})
+					// Create a synthetic violation for this case
+					let violation = crate::testing::schedulability::TaskViolationDetail {
+						task_id: "system".to_string(),
+						message: format!(
+							"Task set is schedulable (utilization: {:.3}, bound: {:.3}) but should not be",
+							schedule_result.utilization, schedule_result.utilization_bound
+						),
+					};
+					let mut modified_result = schedule_result;
+					modified_result.violations = vec![violation];
+					Err(SpecViolation::SchedulabilityViolation(modified_result))
 				} else {
 					Ok(())
 				}
 			}
-			Err(e) => Err(SpecViolation::SchedulabilityError { error: format!("{e}") }),
+			Err(e) => Err(SpecViolation::SchedulabilityError(e)),
 		}
 	}
 }
@@ -1199,83 +1193,31 @@ macro_rules! __tb_scenario_verify_impl {
 		},)?
 	) => {{
 		let spec = <$spec>::latest();
-		let verification_result = $crate::testing::specs::verify_trace(spec, &$trace);
+		let l1_result = $crate::testing::specs::verify_trace(spec, &$trace);
 
-		let (csp_result, csp_failed, fdr_result, _fdr_config, fdr_failed, expect_failure) = $crate::__tb_scenario_validate_csp_fdr!(
-			$trace,
+		// Build ScenarioResult with all layer results
+		let mut scenario_result = $crate::testing::ScenarioResult::default();
+		// Move trace into result (transfer ownership)
+		scenario_result.trace = $trace;
+		// Clone and store the spec
+		scenario_result.assert_spec = Some(spec.clone());
+		// Layer 1: Spec verification
+		scenario_result.spec_violation = l1_result.as_ref().err().cloned();
+
+		let l1_passed = l1_result.is_ok();
+
+		// Delegate to common implementation
+		$crate::__tb_scenario_verify_impl! {
+			@common
+			l1_passed: l1_passed,
+			scenario_result: scenario_result,
 			$(csp: $csp,)?
 			$(fdr: $fdr_config,)?
-		);
-
-		match &verification_result {
-			Ok(()) => {
-				// L1 passed, check L2 (CSP) and L3 (FDR)
-				if csp_failed {
-					panic!("Layer 1 (assertions) passed but Layer 2 (CSP) failed: {:?}", csp_result);
-				}
-
-				if fdr_failed {
-					// Check if failure is expected (for negative tests)
-					if expect_failure {
-						// Failure is expected - test passes
-						// Verify that we have a witness to prove the failure
-						let verdict = fdr_result.as_ref().unwrap();
-						if !verdict.trace_refines && verdict.trace_refinement_witness.is_some() {
-							// Expected failure confirmed - test passes
-						} else {
-							panic!("Expected FDR failure but verdict doesn't show refinement failure: {:?}", verdict);
-						}
-					} else {
-						// Failure is unexpected - test fails
-						let verdict = fdr_result.as_ref().unwrap();
-						panic!("Layer 1 (assertions) passed but Layer 3 (FDR) failed: {:?}", verdict);
-					}
-				}
-
-				// Call on_pass hook if provided
-				$(
-					$(
-						{
-							fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace)
-							where
-								F: FnOnce(&$crate::trace::ConsumedTrace),
-							{
-								f(trace)
-							}
-							__call_on_pass($on_pass, &$trace);
-						}
-					)?
-				)?
-			}
-			Err(_violations) => {
-				// L1 failed - also report L2 and L3 if they failed
-				if csp_failed {
-					eprintln!("Layer 1 (assertions) failed AND Layer 2 (CSP) failed: {:?}", csp_result);
-				}
-
-				if fdr_failed {
-					let verdict = fdr_result.as_ref().unwrap();
-					eprintln!("Layer 1 (assertions) failed AND Layer 3 (FDR) failed: {:?}", verdict);
-					// Note: on_fail hook signature expects SpecViolation, not FdrVerdict
-				}
-
-				// Call on_fail hook if provided
-				$(
-					$(
-						{
-							fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, violations: &$crate::testing::specs::SpecViolation)
-							where
-								F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::specs::SpecViolation),
-							{
-								f(trace, violations)
-							}
-							__call_on_fail($on_fail, &$trace, _violations);
-						}
-					)?
-				)?
-			}
+			$(hooks: {
+				$(on_pass: $on_pass,)?
+				$(on_fail: $on_fail)?
+			},)?
 		}
-		verification_result
 	}};
 
 	// Multiple specs variant with optional CSP and FDR
@@ -1292,74 +1234,151 @@ macro_rules! __tb_scenario_verify_impl {
 		let mut all_passed = true;
 		let mut first_violation = None;
 
-		let (csp_result, csp_failed, fdr_result, _fdr_config, fdr_failed, _expect_failure) = $crate::__tb_scenario_validate_csp_fdr!(
-			$trace,
-			$(csp: $csp,)?
-			$(fdr: $fdr_config,)?
-		);
-
+		// Validate all specs
 		for spec in &$specs {
 			let verification_result = $crate::testing::specs::verify_trace(*spec, &$trace);
-			match &verification_result {
-				Ok(()) => {
-					// Call on_pass hook if provided
-					$(
-						$(
-							{
-								fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace)
-								where
-									F: FnOnce(&$crate::trace::ConsumedTrace),
-								{
-									f(trace)
-								}
-								__call_on_pass($on_pass, &$trace);
-							}
-						)?
-					)?
-				}
-				Err(_violations) => {
-					// Call on_fail hook if provided
-					$(
-						$(
-							{
-								fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, violations: &$crate::testing::specs::SpecViolation)
-								where
-									F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::specs::SpecViolation),
-								{
-									f(trace, violations)
-								}
-								__call_on_fail($on_fail, &$trace, _violations);
-							}
-						)?
-					)?
-					all_passed = false;
-					if first_violation.is_none() {
-						first_violation = Some(_violations.clone());
-					}
+			if let Err(v) = verification_result {
+				all_passed = false;
+				if first_violation.is_none() {
+					first_violation = Some(v);
 				}
 			}
 		}
 
-		// Check CSP and FDR after all specs are checked
-		if all_passed {
-			if csp_failed {
-				panic!("All specs passed but Layer 2 (CSP) failed: {:?}", csp_result);
+		// Build ScenarioResult
+		let mut scenario_result = $crate::testing::ScenarioResult::default();
+
+		// Move trace into result
+		scenario_result.trace = $trace;
+		// Clone and store all specs
+		scenario_result.assert_specs = $specs.iter().map(|s| (*s).clone()).collect();
+		scenario_result.spec_violation = first_violation;
+
+		// Delegate to common implementation
+		$crate::__tb_scenario_verify_impl! {
+			@common
+			l1_passed: all_passed,
+			scenario_result: scenario_result,
+			$(csp: $csp,)?
+			$(fdr: $fdr_config,)?
+			$(hooks: {
+				$(on_pass: $on_pass,)?
+				$(on_fail: $on_fail)?
+			},)?
 			}
-			if fdr_failed {
-				let verdict = fdr_result.as_ref().unwrap();
-				panic!("All specs passed but Layer 3 (FDR) failed: {:?}", verdict);
-			}
-			Ok(())
+	}};
+
+	// Common implementation for both single and multiple specs
+	(
+		@common
+		l1_passed: $l1_passed:expr,
+		scenario_result: $scenario_result:expr,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(hooks: {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		},)?
+	) => {{
+		let mut scenario_result = $scenario_result;
+		let l1_passed = $l1_passed;
+
+		// Layer 2: CSP validation (if provided)
+		#[allow(unused_mut, unused_assignments)]
+		let mut csp_failed = false;
+
+		#[cfg(feature = "testing-csp")]
+		{
+			$(
+				let csp_spec = <$csp>::default();
+				let csp_result = <$csp as $crate::testing::specs::csp::ProcessSpec>::validate_trace(&csp_spec, &scenario_result.trace);
+				csp_failed = !csp_result.valid;
+				scenario_result.csp_result = Some(csp_result);
+				// Move process into result
+				scenario_result.process = Some(<$csp>::process());
+
+				// Move timing constraints into result (if available)
+				#[cfg(feature = "testing-timing")]
+				{
+					let process = scenario_result.process.as_ref().unwrap();
+					scenario_result.timing_constraints = process.timing_constraints.clone();
+				}
+			)?
+		}
+
+		// Layer 3: FDR validation (if provided)
+		#[allow(unused_mut, unused_assignments)]
+		let mut fdr_failed = false;
+		#[allow(unused_mut, unused_assignments)]
+		let mut expect_failure = false;
+
+		#[cfg(feature = "testing-fdr")]
+		{
+			$(
+				use $crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
+				let config: FdrConfig = $fdr_config.into();
+				expect_failure = config.expect_failure;
+				let trace_process = scenario_result.trace.to_process();
+				let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, config.clone());
+				let verdict = explorer.explore();
+				fdr_failed = !verdict.passed;
+				scenario_result.fdr_verdict = Some(verdict);
+			)?
+		}
+
+		// Determine overall pass/fail
+		scenario_result.passed = l1_passed && !csp_failed && (!fdr_failed || expect_failure);
+
+		// Call hooks and get their decision
+		#[allow(unreachable_code)]
+		#[allow(unused_labels)]
+		let hook_result: Result<(), Box<dyn std::error::Error>> = 'hook_call: {
+			if scenario_result.passed {
+				// Test passed - call on_pass hook if provided
+					$(
+						$(
+						fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace, result: &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>
+								where
+							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>,
+								{
+							f(trace, result)
+								}
+						break 'hook_call __call_on_pass($on_pass, &scenario_result.trace, &scenario_result);
+						)?
+					)?
+				Ok(())
+			} else {
+				// Test failed - call on_fail hook if provided
+					$(
+						$(
+						fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, result: &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>
+								where
+							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>,
+								{
+							f(trace, result)
+								}
+						break 'hook_call __call_on_fail($on_fail, &scenario_result.trace, &scenario_result);
+						)?
+					)?
+				// No hook provided - return default error
+				if let Some(ref violation) = scenario_result.spec_violation {
+					Err(format!("Spec verification failed: {}", violation).into())
+				} else if csp_failed {
+					Err("CSP validation failed".into())
+				} else if fdr_failed && !expect_failure {
+					Err("FDR refinement check failed".into())
 		} else {
-			// L1 failed - also report L2 and L3 if they failed
-			if csp_failed {
-				eprintln!("Layer 1 (assertions) failed AND Layer 2 (CSP) failed: {:?}", csp_result);
+					Err("Test failed".into())
+				}
 			}
-			if fdr_failed {
-				let verdict = fdr_result.as_ref().unwrap();
-				eprintln!("Layer 1 (assertions) failed AND Layer 3 (FDR) failed: {:?}", verdict);
+		};
+
+		// Convert hook result to verification result format
+		match hook_result {
+			Ok(()) => Ok(()),
+			Err(e) => {
+				Err(e)
 			}
-			Err(first_violation.unwrap())
 		}
 	}};
 }

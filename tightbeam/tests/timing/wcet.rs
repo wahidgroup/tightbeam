@@ -82,18 +82,18 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |trace| {
+		on_pass: |trace, _result| -> Result<(), Box<dyn std::error::Error>> {
 			// Verify timing constraints exist on process
 			let process = SimpleWcetProcess::process();
 			let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");
 
 			// Verify timing constraints against trace
-			let timing_result = constraints.verify_with_process(trace, Some(&process))
-				.expect("Timing verification should succeed");
+			let timing_result = constraints.verify_with_process(trace, Some(&process))?;
 
 			// Verify no violations (within constraint: 5ms < 10ms)
 			assert!(timing_result.passed, "Timing verification should pass for duration within constraint. Violations: {:?}", timing_result.wcet_violations);
 			assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected");
+			Ok(())
 		},
 	}
 }
@@ -121,18 +121,18 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |trace| {
+		on_pass: |trace, _result| -> Result<(), Box<dyn std::error::Error>> {
 			// Verify timing constraints exist on process
 			let process = SimpleWcetProcess::process();
 			let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");
 
 			// Verify timing constraints against trace
-			let timing_result = constraints.verify_with_process(trace, Some(&process))
-				.expect("Timing verification should succeed");
+			let timing_result = constraints.verify_with_process(trace, Some(&process))?;
 
 			// Verify no violations (at limit: 10ms == 10ms, should pass)
 			assert!(timing_result.passed, "Timing verification should pass for duration at constraint limit");
 			assert!(timing_result.wcet_violations.is_empty(), "No WCET violations expected at limit");
+			Ok(())
 		},
 	}
 }
@@ -161,14 +161,13 @@ tightbeam::tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |trace| {
+		on_pass: |trace, _result| -> Result<(), Box<dyn std::error::Error>> {
 			// Verify timing constraints exist on process
 			let process = SimpleWcetProcess::process();
 			let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");
 
 			// Verify timing constraints against trace
-			let timing_result = constraints.verify_with_process(trace, Some(&process))
-				.expect("Timing verification should succeed");
+			let timing_result = constraints.verify_with_process(trace, Some(&process))?;
 
 			// Verify violations detected (exceeds constraint: 15ms > 10ms)
 			assert!(!timing_result.passed, "Timing verification should fail for duration exceeding constraint. Result: {timing_result:?}");
@@ -180,6 +179,7 @@ tightbeam::tb_scenario! {
 			assert_eq!(violation.event.0, "process");
 			assert_eq!(violation.wcet_ns, 10_000_000); // 10ms constraint
 			assert_eq!(violation.observed_ns, 15_000_000); // 15ms observed
+			Ok(())
 		},
 	}
 }

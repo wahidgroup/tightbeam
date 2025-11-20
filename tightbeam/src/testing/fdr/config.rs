@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 
 use crate::builder::TypeBuilder;
+use crate::testing::error::FdrConfigError;
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
 
@@ -223,28 +224,28 @@ impl FdrConfig {
 	pub fn validate_scheduler_model(&self) -> Result<(), TestingError> {
 		match (self.scheduler_count, self.process_count) {
 			(None, None) => Ok(()), // Scheduler modeling disabled - valid
-			(Some(_), None) | (None, Some(_)) => Err(TestingError::InvalidFdrConfig(
-				"scheduler_count and process_count must both be set or both be None. \
-					Resource constraint modeling requires both values."
-					.to_string(),
-			)),
+			(Some(_), None) | (None, Some(_)) => Err(TestingError::InvalidFdrConfig(FdrConfigError {
+				field: "scheduler_count/process_count",
+				reason: "both must be set or both be None for resource constraint modeling",
+			})),
 			(Some(scheduler_count), Some(process_count)) => {
 				if scheduler_count > process_count {
-					return Err(TestingError::InvalidFdrConfig(format!(
-						"scheduler_count ({scheduler_count}) cannot exceed process_count ({process_count}). \
-						When m > n, all processes can run simultaneously, making \
-						resource constraint modeling meaningless."
-					)));
+					return Err(TestingError::InvalidFdrConfig(FdrConfigError {
+						field: "scheduler_count",
+						reason: "cannot exceed process_count (would make resource modeling meaningless)",
+					}));
 				}
 				if scheduler_count == 0 {
-					return Err(TestingError::InvalidFdrConfig(format!(
-						"scheduler_count must be > 0. Got {scheduler_count}."
-					)));
+					return Err(TestingError::InvalidFdrConfig(FdrConfigError {
+						field: "scheduler_count",
+						reason: "must be > 0",
+					}));
 				}
 				if process_count == 0 {
-					return Err(TestingError::InvalidFdrConfig(format!(
-						"process_count must be > 0. Got {process_count}."
-					)));
+					return Err(TestingError::InvalidFdrConfig(FdrConfigError {
+						field: "process_count",
+						reason: "must be > 0",
+					}));
 				}
 				Ok(())
 			}
@@ -284,7 +285,7 @@ macro_rules! __validate_probability {
 /// Captures verification results from multi-seed exploration and refinement checking:
 /// - Single-process properties: determinism, deadlock, divergence
 /// - Refinement checking: Spec ⊑ Impl (traces, failures, divergences)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FdrVerdict {
 	/// Overall pass/fail status
 	pub passed: bool,
@@ -402,6 +403,8 @@ mod tests {
 			timing_constraints: None,
 			#[cfg(feature = "testing-timing")]
 			timed_transitions: None,
+			#[cfg(feature = "testing-schedulability")]
+			schedulability_periods: None,
 		};
 
 		let config_refinement = FdrConfig { specs: vec![spec], ..FdrConfig::default() };
@@ -542,7 +545,10 @@ mod tests {
 		/// Helper to assert validation error is InvalidFdrConfig variant
 		fn assert_validation_error(result: Result<(), TestingError>) -> Result<(), TestingError> {
 			match result {
-				Ok(()) => Err(TestingError::InvalidFdrConfig(String::new())),
+				Ok(()) => Err(TestingError::InvalidFdrConfig(crate::testing::error::FdrConfigError {
+					field: "test",
+					reason: "expected validation error but got Ok",
+				})),
 				Err(TestingError::InvalidFdrConfig(_)) => Ok(()),
 				Err(e) => Err(e),
 			}

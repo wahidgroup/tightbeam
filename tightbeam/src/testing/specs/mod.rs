@@ -10,13 +10,18 @@
 //! - `testing-csp` - L2 (requires `testing`)
 //! - `testing-fdr` - L3 (requires `testing-csp`)
 
-mod assert;
+pub mod assert;
+pub mod error;
 
 #[cfg(feature = "testing-csp")]
 pub mod csp;
 
 // Re-exports
-pub use assert::{verify_trace, SpecViolation, TBSpec};
+pub use assert::{verify_trace, TBSpec};
+pub use error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation};
+
+#[cfg(feature = "instrument")]
+pub use error::{EventCountMismatchDetail, EventOrderViolationDetail};
 
 #[cfg(feature = "testing-csp")]
 pub use csp::*;

@@ -323,7 +323,7 @@ pub trait CurveProvider {
 /// Provides Key Encapsulation Mechanism (KEM) operations.
 ///
 /// Enables post-quantum and hybrid key agreement using RustCrypto's `kem` traits.
-/// Applications can provide KEM implementations (e.g., Kyber via `pqcrypto-compat`)
+/// Applications can provide KEM implementations
 /// to enable hybrid classical+PQ protocols like PQXDH.
 #[cfg(feature = "kem")]
 pub trait KemProvider {
@@ -336,6 +336,7 @@ pub trait KemProvider {
 /// This is a convenience trait that composes all role-based provider traits.
 /// Components can use specific role traits (e.g., `SigningProvider + DigestProvider`)
 /// instead of requiring the full `CryptoProvider` to reduce trait bound complexity.
+// TODO RustCrypto currently does not support KEMs.
 #[cfg(all(
 	feature = "digest",
 	feature = "aead",
@@ -344,7 +345,7 @@ pub trait KemProvider {
 	feature = "ecdh"
 ))]
 pub trait CryptoProvider:
-	Default + Clone + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider
+	Default + Clone + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider // + KemProvider
 {
 	type Profile: SecurityProfile + Default;
 	fn profile(&self) -> &Self::Profile;
@@ -406,6 +407,13 @@ impl KdfProvider for DefaultCryptoProvider {
 impl CurveProvider for DefaultCryptoProvider {
 	type Curve = k256::Secp256k1;
 }
+
+// TODO RustCrypto currently does not support KEMs.
+// #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+// impl KemProvider for DefaultCryptoProvider {
+// 	type EncappedKey = Kyber1024EncappedKey;
+// 	type Kem = Kyber1024;
+// }
 
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 impl CryptoProvider for DefaultCryptoProvider {

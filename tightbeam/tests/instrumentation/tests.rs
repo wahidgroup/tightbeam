@@ -60,23 +60,7 @@ tb_scenario! {
 			}?;
 
 			let _response = client.emit(test_frame, None).await?;
-			println!("Client: Emit completed");
 			Ok(())
-		}
-	},
-	hooks {
-		on_pass: |trace| {
-			println!("Test passed! Captured {} instrument events:", trace.instrument_events.len());
-			for event in &trace.instrument_events {
-				println!("  Event: {} - {:?}", event.urn, event.label);
-			}
-		},
-		on_fail: |trace, violations| {
-			println!("Test failed! Captured {} instrument events:", trace.instrument_events.len());
-			for event in &trace.instrument_events {
-				println!("  Event: {} - {:?}", event.urn, event.label);
-			}
-			panic!("Test failed with violations: {violations:?}");
 		}
 	}
 }

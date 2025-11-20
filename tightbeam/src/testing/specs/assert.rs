@@ -4,14 +4,17 @@
 //! for pure spec-driven CBVOC testing. Specs declaratively describe
 //! expected behavior; the framework automatically verifies traces.
 
+use crate::error::ReceivedExpectedError;
 use crate::policy::TransitStatus;
-use crate::testing::assertions::{AssertionContract, AssertionLabel};
+use crate::testing::assertions::AssertionContract;
 use crate::trace::{ConsumedTrace, ExecutionMode};
+use crate::utils::urn::Urn;
 use crate::Frame;
 
-// TbEventKind removed - use events module constants instead
+use super::error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation};
 
-use std::fmt;
+#[cfg(feature = "instrument")]
+use super::error::EventOrderViolationDetail;
 
 /// Spec trait defining expected test behavior.
 ///
@@ -32,7 +35,7 @@ pub trait TBSpec {
 
 	/// Required instrumentation event URNs (if instrumentation feature enabled)
 	#[cfg(feature = "instrument")]
-	fn required_events(&self) -> &[crate::utils::urn::Urn<'static>] {
+	fn required_events(&self) -> &[Urn<'static>] {
 		&[]
 	}
 
@@ -55,131 +58,6 @@ pub trait TBSpec {
 	}
 }
 
-/// Spec violation error type
-#[derive(Clone, Debug, PartialEq)]
-pub enum SpecViolation {
-	/// Execution mode mismatch
-	ModeMismatch {
-		expected: ExecutionMode,
-		actual: ExecutionMode,
-	},
-	/// Response assertion mismatch (presence handled via AssertionViolation on Response phase)
-	ResponseUnexpectedPresence,
-	ResponseUnexpectedAbsence,
-	/// Gate decision mismatch
-	GateDecisionMismatch {
-		expected: TransitStatus,
-		actual: Option<TransitStatus>,
-	},
-	/// Assertion contract violated
-	AssertionViolation {
-		label: AssertionLabel,
-		tags: Option<Vec<&'static str>>,
-		expected: String,
-		actual: usize,
-	},
-	/// Event ordering violation (instrumentation)
-	#[cfg(feature = "instrument")]
-	EventOrderViolation {
-		expected_kind: crate::utils::urn::Urn<'static>,
-		position: usize,
-	},
-	/// Event count mismatch
-	#[cfg(feature = "instrument")]
-	EventCountMismatch {
-		kind: crate::utils::urn::Urn<'static>,
-		expected: usize,
-		actual: usize,
-	},
-	/// Custom validation failed
-	CustomValidationFailed {
-		reason: String,
-	},
-	/// Response validation failed
-	ResponseValidationFailed,
-	/// Schedulability violation
-	#[cfg(feature = "testing-timing")]
-	SchedulabilityViolation {
-		expected: String,
-		actual: String,
-		utilization: f64,
-		utilization_bound: f64,
-		violations: String,
-	},
-	/// Schedulability analysis error
-	#[cfg(feature = "testing-timing")]
-	SchedulabilityError {
-		error: String,
-	},
-}
-
-impl fmt::Display for SpecViolation {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::ModeMismatch { expected, actual } => {
-				write!(
-					f,
-					"Execution mode mismatch: expected {}, got {}",
-					expected.as_str(),
-					actual.as_str()
-				)
-			}
-			Self::ResponseUnexpectedPresence => write!(f, "Response present but spec forbids it"),
-			Self::ResponseUnexpectedAbsence => write!(f, "Response absent but spec requires it"),
-			Self::GateDecisionMismatch { expected, actual } => {
-				write!(f, "Gate decision mismatch: expected {expected:?}, got {actual:?}")
-			}
-			Self::AssertionViolation { label, tags, expected, actual } => {
-				let tag_desc = if let Some(ref t) = tags {
-					format!(" with tags {t:?}")
-				} else {
-					String::new()
-				};
-				write!(
-					f,
-					"Assertion contract violated: {label:?}{tag_desc} expected {expected}, found {actual}"
-				)
-			}
-			#[cfg(feature = "instrument")]
-			Self::EventOrderViolation { expected_kind, position } => {
-				write!(f, "Event order violation: expected {expected_kind:?} at position {position}")
-			}
-			#[cfg(feature = "instrument")]
-			Self::EventCountMismatch { kind, expected, actual } => {
-				write!(f, "Event count mismatch: {kind:?} expected {expected}, found {actual}")
-			}
-			Self::CustomValidationFailed { reason } => {
-				write!(f, "Custom validation failed: {reason}")
-			}
-			Self::ResponseValidationFailed => {
-				write!(f, "Response validation failed")
-			}
-			#[cfg(feature = "testing-timing")]
-			Self::SchedulabilityViolation { expected, actual, utilization, utilization_bound, violations } => {
-				write!(
-					f,
-					"Schedulability violation: expected {}, got {} (utilization: {:.3}, bound: {:.3}){}",
-					expected,
-					actual,
-					utilization,
-					utilization_bound,
-					if violations.is_empty() {
-						String::new()
-					} else {
-						format!("; violations: {violations}")
-					}
-				)
-			}
-			#[cfg(feature = "testing-timing")]
-			Self::SchedulabilityError { error } => {
-				write!(f, "Schedulability analysis error: {error}")
-			}
-		}
-	}
-}
-
-impl std::error::Error for SpecViolation {}
-
 /// Verify captured trace against spec contract.
 ///
 /// This is the core verification algorithm:
@@ -194,16 +72,19 @@ pub fn verify_trace<S: TBSpec>(spec: &S, trace: &ConsumedTrace) -> Result<(), Sp
 	// 1. Verify execution mode
 	let actual_mode = trace.execution_mode();
 	if actual_mode != spec.mode() {
-		return Err(SpecViolation::ModeMismatch { expected: spec.mode(), actual: actual_mode });
+		return Err(SpecViolation::ModeMismatch(ReceivedExpectedError {
+			received: actual_mode,
+			expected: spec.mode(),
+		}));
 	}
 
 	// 2. Verify gate decision (if spec constrains it)
 	if let Some(expected_decision) = spec.expected_gate_decision() {
 		if trace.gate_decision != Some(expected_decision) {
-			return Err(SpecViolation::GateDecisionMismatch {
+			return Err(SpecViolation::GateDecisionMismatch(GateDecisionMismatch {
 				expected: expected_decision,
 				actual: trace.gate_decision,
-			});
+			}));
 		}
 	}
 
@@ -211,12 +92,12 @@ pub fn verify_trace<S: TBSpec>(spec: &S, trace: &ConsumedTrace) -> Result<(), Sp
 	for contract in spec.required_assertions() {
 		if !contract.is_satisfied_by(&trace.assertions) {
 			let actual_count = trace.count_assertions(&contract.label, contract.tag_filter.as_deref());
-			return Err(SpecViolation::AssertionViolation {
+			return Err(SpecViolation::AssertionViolation(AssertionViolationDetail {
 				label: contract.label.clone(),
 				tags: contract.tag_filter.clone(),
 				expected: contract.cardinality.describe(),
 				actual: actual_count,
-			});
+			}));
 		}
 	}
 
@@ -232,10 +113,10 @@ pub fn verify_trace<S: TBSpec>(spec: &S, trace: &ConsumedTrace) -> Result<(), Sp
 				}
 			}
 			if idx != required_kinds.len() {
-				return Err(SpecViolation::EventOrderViolation {
+				return Err(SpecViolation::EventOrderViolation(EventOrderViolationDetail {
 					expected_kind: required_kinds[idx].clone(),
 					position: idx,
-				});
+				}));
 			}
 		}
 	}

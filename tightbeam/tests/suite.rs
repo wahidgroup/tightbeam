@@ -28,6 +28,18 @@ mod fdr;
 #[cfg(all(feature = "testing-timing", feature = "testing-fdr", feature = "instrument"))]
 mod timing;
 
+// Schedulability analysis integration tests
+#[cfg(all(
+	feature = "testing-timing",
+	feature = "testing-schedulability",
+	feature = "testing-fdr"
+))]
+mod schedulability;
+
+// Colony tests
+#[cfg(feature = "colony")]
+mod colony;
+
 // DLT Network test
 // #[cfg(feature = "full")]
 // mod proof;
