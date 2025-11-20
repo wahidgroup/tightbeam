@@ -3,7 +3,7 @@
 /// Define a CSP Process with declarative syntax.
 #[macro_export]
 macro_rules! tb_process_spec {
-	// Pattern with timing block
+	// Pattern with timing block and optional terminal
 	(
 		$(#[$meta:meta])*
 		$vis:vis $name:ident,
@@ -14,7 +14,7 @@ macro_rules! tb_process_spec {
 		states {
 			$($from_state:ident => { $($event:expr => $to_state:ident),* $(,)? }),* $(,)?
 		}
-		terminal { $($term_state:ident),* $(,)? }
+		$(terminal { $($term_state:ident),* $(,)? })?
 		$(choice { $($choice_state:ident),* $(,)? })?
 		$(annotations { description: $desc:expr })?
 		$(clocks: { $($clock_name:expr),* $(,)? })?
@@ -36,7 +36,7 @@ macro_rules! tb_process_spec {
 		states {
 			$($from_state => { $($event => $to_state),* }),*
 		}
-		terminal { $($term_state),* }
+		$(terminal { $($term_state),* })?
 		$(choice { $($choice_state),* })?
 		$(annotations { description: $desc })?
 		$(timing {
@@ -48,7 +48,7 @@ macro_rules! tb_process_spec {
 		})?
 		}
 	};
-	// Implementation pattern
+	// Implementation pattern with optional terminal
 	(@impl
 		$(#[$meta:meta])*
 		$vis:vis $name:ident,
@@ -59,7 +59,7 @@ macro_rules! tb_process_spec {
 		states {
 			$($from_state:ident => { $($event:expr => $to_state:ident),* $(,)? }),* $(,)?
 		}
-		terminal { $($term_state:ident),* }
+		$(terminal { $($term_state:ident),* })?
 		$(choice { $($choice_state:ident),* })?
 		$(annotations { description: $desc:expr })?
 		$(clocks: { $($clock_name:expr),* $(,)? })?
@@ -117,14 +117,14 @@ macro_rules! tb_process_spec {
 							State(stringify!($to_state))
 						);
 					)*
-				)*
+			)*
 
-				// Add terminal states
-				$(
-					builder = builder.add_terminal(State(stringify!($term_state)));
-				)*
+			// Add terminal states if present
+			$($(
+				builder = builder.add_terminal(State(stringify!($term_state)));
+			)*)?
 
-				// Add choice states if present
+			// Add choice states if present
 				$($(
 					builder = builder.add_choice(State(stringify!($choice_state)));
 				)*)?

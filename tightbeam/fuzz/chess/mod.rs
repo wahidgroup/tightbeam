@@ -82,7 +82,7 @@ tb_process_spec! {
 			"errors_within_limit", "rejection_ratio",
 			"server_move_received", "server_move_validated", "server_move_generated",
 			"server_move_invalid", "server_response_emitted", "server_decode_failure",
-			"server_state_lock_poisoned", "server_game_ended",
+			"server_state_lock_poisoned", "server_game_ended", "server_game_restarted",
 			"pawn_move", "rook_move", "knight_move", "bishop_move", "queen_move", "king_move"
 		}
 		hidden { }
@@ -110,6 +110,7 @@ tb_process_spec! {
 			"server_decode_failure"       => ValidatingMove,
 			"server_state_lock_poisoned"  => ValidatingMove,
 			"server_game_ended"           => ValidatingMove,
+			"server_game_restarted"       => ValidatingMove,
 			"pawn_move"                   => ValidatingMove,
 			"rook_move"                   => ValidatingMove,
 			"knight_move"                 => ValidatingMove,
@@ -125,6 +126,7 @@ tb_process_spec! {
 			"server_move_generated"    => ProcessingMove,
 			"server_response_emitted"  => ProcessingMove,
 			"server_game_ended"        => ProcessingMove,
+			"server_game_restarted"    => ProcessingMove,
 			"pawn_move"                => ProcessingMove,
 			"rook_move"                => ProcessingMove,
 			"knight_move"              => ProcessingMove,
@@ -133,12 +135,12 @@ tb_process_spec! {
 			"king_move"                => ProcessingMove,
 		},
 		GameOver => {
-			"client_game_restarted"  => WaitingForMove,
-			"client_server_move"     => GameOver,
-			"client_move_validated"  => GameOver,
+			"client_game_ended"        => GameOver,
+			"server_game_ended"        => GameOver,
+			"server_game_restarted"    => GameOver,
+			"client_game_restarted"    => WaitingForMove,
 		}
 	}
-	terminal { GameOver }
 	annotations { description: "High-level chess game protocol flow" }
 }
 

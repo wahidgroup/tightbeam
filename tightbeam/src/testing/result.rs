@@ -3,6 +3,8 @@
 //! This module provides `ScenarioResult`, a unified result structure that
 //! aggregates all verification layers for comprehensive test reporting.
 
+use core::fmt::{Display, Formatter};
+
 use crate::testing::export::ScenarioResultExport;
 use crate::testing::macros::BuiltAssertSpec;
 use crate::testing::specs::SpecViolation;
@@ -137,6 +139,63 @@ impl Default for ScenarioResult {
 			#[cfg(feature = "testing-schedulability")]
 			schedulability_result: None,
 			passed: true,
+		}
+	}
+}
+
+impl Display for ScenarioResult {
+	fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+		if self.passed {
+			write!(f, "Verification passed")
+		} else {
+			writeln!(f, "Verification failed:")?;
+
+			// Layer 1: Assertion spec violations
+			if let Some(ref violation) = self.spec_violation {
+				writeln!(f, "  [Assertion] {}", violation)?;
+			}
+
+			// Layer 2: CSP validation failures
+			#[cfg(feature = "testing-csp")]
+			if let Some(ref csp_res) = self.csp_result {
+				if !csp_res.valid {
+					writeln!(f, "  [CSP] Validation failed:")?;
+					for violation in &csp_res.violations {
+						writeln!(f, "    - {}", violation)?;
+					}
+				}
+			}
+
+			// Layer 3: FDR refinement failures
+			#[cfg(feature = "testing-fdr")]
+			if let Some(ref fdr_verdict) = self.fdr_verdict {
+				if !fdr_verdict.passed {
+					writeln!(f, "  [FDR] Refinement check failed")?;
+				}
+			}
+
+			// Timing verification failures
+			#[cfg(feature = "testing-timing")]
+			if let Some(ref timing_res) = self.timing_result {
+				if !timing_res.passed {
+					writeln!(f, "  [Timing] Verification failed")?;
+				}
+			}
+
+			// Schedulability analysis failures
+			#[cfg(feature = "testing-schedulability")]
+			if let Some(ref schedule_res) = self.schedulability_result {
+				if !schedule_res.is_schedulable {
+					writeln!(
+						f,
+						"  [Schedulability] Analysis failed: utilization {:.2}% (bound {:.2}%)",
+						schedule_res.utilization * 100.0,
+						schedule_res.utilization_bound * 100.0
+					)?;
+				}
+			}
+
+			Ok(())
 		}
 	}
 }

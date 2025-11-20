@@ -2550,12 +2550,6 @@ fdr: FdrConfig {
 	// ...
 }
 ```
-
-Higher seed counts increase confidence but also test execution time. Typical values:
-- **Development**: 16-32 seeds for quick feedback
-- **CI Pipeline**: 64-128 seeds for thorough verification
-- **Release**: 256+ seeds for critical protocols
-
 Each seed explores different interleaving at nondeterministic choice points,
 verifying trace refinement, failures refinement, and divergence freedom across
 all executions.
@@ -3515,13 +3509,13 @@ tb_scenario! {
 			fn generate_message(
 				lucky_number: u32,
 				content: Option<String>
-			) -> Result<crate::Frame, crate::TightBeamError> {
+			) -> Result<Frame, TightBeamError> {
 				let message = RequestMessage {
 					content: content.unwrap_or_else(|| "PING".to_string()),
 					lucky_number,
 				};
 
-				crate::compose! { V0: id: b"test-ping", message: message }
+				compose! { V0: id: b"test-ping", message: message }
 			}
 
 			// Client-side assertion before sending
@@ -3530,7 +3524,7 @@ tb_scenario! {
 			// Test winning case
 			let ping_message = generate_message(42, None)?;
 			let response = client.emit(ping_message, None).await?;
-			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
+			let response_message: ResponseMessage = decode(&response.unwrap().message)?;
 
 			// Emit value assertions for spec verification
 			trace.event_with("response_result", &[], response_message.result);

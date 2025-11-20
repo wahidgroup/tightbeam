@@ -86,6 +86,7 @@ words:
   - Polydomy
   - PQXDH
   - PRNG
+  - pytest
   - recip
   - repr
   - REPUDIABLE

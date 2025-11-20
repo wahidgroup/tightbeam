@@ -1195,16 +1195,8 @@ macro_rules! __tb_scenario_call_hooks {
 						break 'hook_call __call_hook($on_fail, &$scenario_result.trace, &$scenario_result);
 					)?
 				)?
-				// No hook provided - return default error
-				if let Some(ref violation) = $scenario_result.spec_violation {
-					Err(format!("Spec verification failed: {}", violation).into())
-				} else if $csp_failed {
-					Err("CSP validation failed".into())
-				} else if $fdr_failed && !$expect_failure {
-					Err("FDR refinement check failed".into())
-				} else {
-					Err("Test failed".into())
-				}
+				// No hook provided
+				Err(format!("{}", $scenario_result).into())
 			}
 		};
 		hook_result
