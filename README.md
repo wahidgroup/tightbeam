@@ -17,12 +17,14 @@ formats MAY change WITHOUT notice. It is NOT yet production-ready.
 
 ## Copyright Notice
 
-   Copyright (C) Tanveer Wahid, WahidGroup, LLC (2025).  All Rights Reserved.
+Copyright (C) Tanveer Wahid, WahidGroup, LLC (2025).  All Rights Reserved.
 
 ## Abstract
 
 tightbeam is a Layer-5 messaging framework using ASN.1 DER encoding with
 versioned metadata structures for high-fidelity information transmission.
+
+> Zero-Copy, Zero-Panic, no_std-Ready
 
 ## Table of Contents
 
@@ -121,7 +123,7 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.3.2. [Specification: tb_process_spec! Syntax](#1032-specification-tb_process_spec-syntax)
 		- 10.3.3. [Validation Rules](#1033-validation-rules)
 		- 10.3.4. [Example: CSP Process Specification](#1034-example-csp-process-specification)
-		- 10.3.5. [Generated API](#1035-generated-api)
+		- 10.3.5. [Timing and Schedulability Verification](#1035-timing-and-schedulability-verification)
 	- 10.4. [Layer 3: Refinement Checking (FDR)](#104-layer-3-refinement-checking-fdr)
 		- 10.4.1. [Concept](#1041-concept)
 		- 10.4.2. [Specification: FdrConfig Syntax](#1042-specification-fdrconfig-syntax)
@@ -138,6 +140,7 @@ versioned metadata structures for high-fidelity information transmission.
 	- 10.6. [Unified Testing: tb_scenario! Macro](#106-unified-testing-tb_scenario-macro)
 		- 10.6.1. [Syntax](#1061-syntax)
 		- 10.6.2. [Examples](#1062-examples)
+		- 10.6.3. [Hook Semantics](#1063-hook-semantics)
 	- 10.7. [Coverage-Guided Fuzzing with AFL](#107-coverage-guided-fuzzing-with-afl)
 		- 10.7.1. [Concept](#1071-concept)
 		- 10.7.2. [Creating Fuzz Targets](#1072-creating-fuzz-targets)
@@ -229,6 +232,7 @@ following bounds:
   - Inherits: All V0 features
   - OPTIONAL: Message integrity (digest)
   - OPTIONAL: Confidentiality (cipher)
+  - OPTIONAL: Non-repudiation(signature)
 
 - VERSION 2
   - Inherits: All V1 features
@@ -256,6 +260,7 @@ pub trait SecurityProfile {
 	type AeadOid: AssociatedOid + AeadKeySize;
 	type SignatureAlg: SignatureAlgorithmIdentifier;
 	type CurveOid: AssociatedOid;
+	type KemOid: AssociatedOid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier>;
 }
 ```
@@ -290,6 +295,7 @@ impl SecurityProfile for MyAppProfile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type CurveOid = Secp256k1Oid;
+	type KemOid = Kyber1024Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
 }
 ```
@@ -306,6 +312,7 @@ impl SecurityProfile for TightbeamProfile {
 	type AeadOid = Aes256GcmOid;
 	type SignatureAlg = Secp256k1Signature;
 	type CurveOid = Secp256k1Oid;
+	type KemOid = Kyber1024Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
 }
 ```
@@ -784,19 +791,19 @@ data retention choices.
 - Message Integrity (MI): MI MUST be computed over the message payload bytes.
 When present at the metadata level (i.e., `Metadata.integrity`), MI MUST bind
 the message body.
-- Frame Integrity (FI): FI MUST be computed over the envelope only (version +
+- Frame Integrity (FI): FI MUST be computed over the frame only (version +
 metadata; it MUST exclude the message) using DER-canonical encoding. FI MUST
-bind the envelope around the message and the metadata itself.
+bind the frame around the message and the metadata itself.
 
 Important properties:
 - FI alone MUST NOT be used to prove message content correctness; it ONLY proves
-the integrity of the envelope (version + metadata).
+the integrity of the frame (version + metadata).
 - MI MUST be used to prove message content correctness. Because MI lives in
-metadata and FI commits to the envelope that contains that metadata, FI
+metadata and FI commits to the frame that contains that metadata, FI
 therefore witnesses MI. When FI is authenticated (e.g., covered by a signature
 via nonrepudiation or finalized via consensus), any tampering with MI MUST cause
 the authenticated FI validation to fail. Receivers SHOULD treat the pair
-(valid MI, authenticated FI) as sufficient evidence that both envelope and
+(valid MI, authenticated FI) as sufficient evidence that both frame and
 message are intact. Note: an in-band, unsigned FI MUST NOT be relied upon to
 prevent an active attacker from changing both MI and FI.
 
@@ -1081,12 +1088,12 @@ END
 
 Implementations MUST provide:
 - Memory safety AND ownership guarantees (Rust)
-- ASN.1 DER encoding/decoding
-- Frame and Metadata as specified as ASN.1
+- Abstract Syntax Notation One (ASN.1) DER encoding/decoding
+- Frame and Metadata exactly as specified in ASN.1
 - Message-level security requirement enforcement
+- ASN.1 DER encoding/decoding
 
 Implementations MUST OPTIONALLY provide:
-- Abstract Layer-4 transport with async/sync
 - Cryptographic abstraction for confidentiality, integrity and non-repudiation
 
 ### 6.1.1 Message Security Enforcement
@@ -1100,14 +1107,12 @@ Implementations MUST enforce message-level security requirements through:
 
 #### Runtime Validation
 - Frame validation against message type requirements during encoding/decoding
-- Security profile compliance verification
 - Graceful error handling for requirement violations
 
 ### 6.2 Transport Layer
 
 tightbeam MUST operate over ANY transport protocol:
 - TCP (built-in async/sync support)
-- Custom transports via trait implementation
 
 ### 6.3 Cryptographic Key Management
 
@@ -1256,6 +1261,7 @@ pub enum RetryAction {
 	NoRetry,
 	RetryWithSame,
 	RetryAfter(Duration),
+	RetryWithModified(Box<Frame>),
 }
 ```
 
@@ -1723,7 +1729,7 @@ let security_accept = SecurityAccept {
 | **Confidentiality** | ECDH + HKDF derived AEAD key | Session key never transmitted; derived from ECDH shared secret |
 | **Forward Secrecy** | Ephemeral client keys | New ephemeral key per handshake; compromise doesn't affect past sessions |
 | **DoS** | 16 KiB handshake size cap | Reject oversized handshake messages before processing |
-| **Certificate Forgery** | X.509 chain validation | Verify certificate chain against trust anchors |
+| **Certificate Forgery** | X.509 chain validation | Verify root of trust Note: Application responsibility |
 | **Nonce Reuse** | Monotonic counter + XOR | Per-message nonce derived from seed XOR counter |
 
 ### 8.6 Audit
@@ -1801,88 +1807,9 @@ and allows for a high degree of parallelism and fault tolerance. As a result,
 they do not have access to the full Frame nor should they need it.
 
 ##### Testing
-Testing workers uses the `tb_scenario!` macro with the Worker environment:
 
-```rust
-use tightbeam::testing::*;
-
-// Define assertion spec for worker behavior
-tb_assert_spec! {
-	pub PingPongWorkerSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Accepted,
-		assertions: [
-			("relay_start", exactly!(2)),
-			("relay_success", exactly!(1)),
-			("response_result", exactly!(1), equals!("PONG")),
-			("relay_rejected", exactly!(1))
-		]
-	},
-}
-
-// Define CSP process spec for worker state machine
-tb_process_spec! {
-	pub PingPongWorkerProcess,
-	events {
-		observable { "relay_start", "relay_success", "relay_rejected" }
-		hidden { "validate_message", "process_message" }
-	}
-	states {
-		Idle       => { "relay_start" => Processing }
-		Processing => { "validate_message" => Validating }
-		Validating => { "process_message" => Responding, "relay_rejected" => Idle }
-		Responding => { "relay_success" => Idle }
-	}
-	terminal { Idle }
-	choice { Validating }
-}
-
-tb_scenario! {
-	name: test_ping_pong_worker,
-	spec: PingPongWorkerSpec,
-	csp: PingPongWorkerProcess,
-	environment Worker {
-		setup: PingPongWorker::new,
-		stimulus: |trace, worker: &mut PingPongWorker| {
-			// Test accepted message
-			trace.event("relay_start");
-			let ping_msg = RequestMessage {
-				content: "PING".to_string(),
-				lucky_number: 42,
-			};
-
-			let response = worker.relay(trace.clone(), std::sync::Arc::new(ping_msg))?;
-			if let Some(pong) = response {
-				trace.event_with("response_result", &[], pong.result);
-			}
-
-			trace.event("relay_success");
-
-			// Test rejected message
-			trace.event("relay_start");
-			let pong_msg = RequestMessage {
-				content: "PONG".to_string(),
-				lucky_number: 42,
-			};
-
-			let result = worker.relay(trace.clone(), std::sync::Arc::new(pong_msg));
-			if result.is_err() {
-				trace.event("relay_rejected");
-			}
-
-			Ok(())
-		}
-	}
-}
-```
-
-The Worker environment:
-- Calls `setup` constructor with TraceCollector to create worker instance
-- Executes `stimulus` closure with trace and mutable worker reference
-- Collects assertions from worker operations
-- Verifies against spec and process after execution
-- Does not involve transport layer (workers operate on local data)
+Testing patterns for workers are shown in §12.1, which provides a complete
+`tb_scenario!`-based integration example for `PingPongWorker`.
 
 #### 9.3.2 E: Servlets
 
@@ -1907,12 +1834,12 @@ tightbeam::servlet! {
 			lotto_number: config.lotto_number,
 		})
 	},
-	handle: |message, _trace, _config, workers| async move {
-		let decoded = crate::decode::<RequestMessage, _>(&message.message).ok()?;
+	handle: |message, trace, _config, workers| async move {
+		let decoded = decode::<RequestMessage, _>(&message.message)?;
 		let decoded_arc = Arc::new(decoded);
-			let (ping_result, lucky_result) = tokio::join!(
-			workers.ping_pong.relay(trace.clone(), Arc::clone(&decoded_arc)),
-			workers.lucky_number.relay(trace.clone(), Arc::clone(&decoded_arc))
+		let (ping_result, lucky_result) = tokio::join!( // Parallel processing
+			workers.ping_pong.relay(Arc::clone(&trace), Arc::clone(&decoded_arc)),
+			workers.lucky_number.relay(Arc::clone(&trace), Arc::clone(&decoded_arc))
 		);
 
 		let reply = match ping_result {
@@ -1925,13 +1852,13 @@ tightbeam::servlet! {
 			Err(_) => return None,
 		};
 
-		crate::compose! {
-			V0: id: std::sync::Arc::new(message.metadata.id.clone()),
+		Ok(compose! {
+			V0: id: b"ping-pong-servlet-response-id",
 				message: ResponseMessage {
 					result: reply.result,
 					is_winner,
 				}
-		}.ok()
+		}?)
 	}
 }
 ```
@@ -1950,96 +1877,17 @@ in parallel:
 **Example using `tokio::join!`:**
 ```rust
 let decoded_arc = Arc::new(decoded);
+let trace = Arc::new(trace);
 let (result1, result2) = tokio::join!(
-    workers.worker1.relay(Arc::clone(trace), Arc::clone(&decoded_arc)),
-    workers.worker2.relay(Arc::clone(trace), Arc::clone(&decoded_arc))
+    workers.worker1.relay(Arc::clone(&trace), Arc::clone(&decoded_arc)),
+    workers.worker2.relay(Arc::clone(&trace), Arc::clone(&decoded_arc))
 );
 ```
 
 ##### Testing
-Testing servlets uses the `tb_scenario!` macro with the Servlet environment:
 
-```rust
-use tightbeam::testing::*;
-
-// Define assertion spec for servlet behavior
-tb_assert_spec! {
-	pub PingPongSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Accepted,
-		assertions: [
-			("request_received", exactly!(1)),
-			("pong_sent", exactly!(1)),
-			("response_result", exactly!(1), equals!("PONG")),
-			("is_winner", exactly!(1), equals!(true))
-		]
-	},
-}
-
-// Define process spec for servlet state machine
-tb_process_spec! {
-	pub PingPongProcess,
-	events {
-		observable { "request_received", "pong_sent" }
-		hidden { "validate_lucky_number", "format_response" }
-	}
-	states {
-		Idle       => { "request_received" => Processing }
-		Processing => { "validate_lucky_number" => Validating }
-		Validating => { "format_response" => Responding }
-		Responding => { "pong_sent" => Idle }
-	}
-	terminal { Idle }
-	choice { Processing }
-}
-
-tb_scenario! {
-	name: test_servlet_with_workers,
-	spec: PingPongSpec,
-	csp: PingPongProcess,
-	environment Servlet {
-		servlet: PingPongServletWithWorker,
-		client: |trace, mut client| async move {
-			fn generate_message(
-				lucky_number: u32,
-				content: Option<String>
-			) -> Result<crate::Frame, crate::TightBeamError> {
-				let message = RequestMessage {
-					content: content.unwrap_or_else(|| "PING".to_string()),
-					lucky_number,
-				};
-
-				crate::compose! { V0: id: b"test-ping", message: message }
-			}
-
-			// Client-side assertion before sending
-			trace.event("request_received");
-
-			// Test winning case
-			let ping_message = generate_message(42, None)?;
-			let response = client.emit(ping_message, None).await?;
-			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
-
-			// Emit value assertions for spec verification
-			trace.event_with("response_result", &[], response_message.result);
-			trace.event_with("is_winner", &[], response_message.is_winner);
-
-			// Client-side assertion after receiving
-			trace.event("pong_sent");
-
-			Ok(())
-		}
-	}
-}
-```
-
-The Servlet environment automatically:
-- Starts the servlet with its configuration
-- Manages the servlet lifecycle
-- Provides a client connected to the servlet
-- Collects assertions from both servlet handlers and client code
-- Verifies against the spec and process model after execution
+A complete `tb_scenario!` example for servlets (including workers and client
+code) is given in §12.1.
 
 #### 9.3.3 C: Clusters - WIP
 
@@ -2225,7 +2073,8 @@ The testing framework uses progressive feature flags:
 - `testing`: Enables L1 assertion verification (foundation)
 - `testing-csp`: Enables L1+L2 CSP process modeling
 - `testing-fdr`: Enables L1+L2+L3 refinement checking (requires `testing-csp`)
-- `testing-timing`: Enables timing verification and schedulability analysis (requires `testing`)
+- `testing-timing`: Enables timing verification (WCET, deadline, jitter, slack) - requires `testing`
+- `testing-schedulability`: Enables schedulability analysis (RMA/EDF) - requires `testing-timing`
 
 Each layer builds on the previous, ensuring consistent semantics across
 verification levels.
@@ -2283,7 +2132,7 @@ V(major, minor, patch): {
 		...
 	],
 	events: [Kind, ...]                 // Optional: when instrumentation enabled
-	schedulability: {                   // Optional: when testing-timing enabled
+	schedulability: {                   // Optional: when testing-schedulability enabled
 		task_set: <TaskSet>,
 		scheduler: RateMonotonic | EarliestDeadlineFirst,
 		must_be_schedulable: <bool>
@@ -2300,7 +2149,7 @@ V(major, minor, patch): {
 - Tag filter (if present)
 - Normalized assertions (sorted by label)
 - Optional event kinds
-- Optional schedulability parameters (when `testing-timing` enabled)
+- Optional schedulability parameters (when `testing-schedulability` enabled)
 
 #### 10.2.3 Implementation Examples
 
@@ -2437,11 +2286,15 @@ tb_scenario! {
 }
 ```
 
+All such events are emitted via the instrumentation subsystem described in §11.
+Layer 1–3 verification operates over this event stream as the authoritative
+trace for a single execution.
+
 #### 10.2.9 Timing Verification and Schedulability
 
-The `testing-timing` feature enables timing verification for real-time systems, 
-including timing constraints, timed CSP semantics, and schedulability analysis. 
-All timing features integrate seamlessly with the existing CSP and FDR 
+The `testing-timing` feature enables timing verification for real-time systems,
+including timing constraints, timed CSP semantics, and schedulability analysis.
+All timing features integrate seamlessly with the existing CSP and FDR
 verification layers.
 
 **Timing Constraints in Process Specs:**
@@ -2527,13 +2380,21 @@ tb_process_spec! {
 	}
 	terminal { S4 }                               // Valid end states
 	choice { S1 }                                 // Nondeterministic states
+	clocks: { "clock1", "clock2" }                // Optional: when testing-timing enabled
 	timing {                                      // Optional: when testing-timing enabled
-		wcet: { "event1" => wcet!(10ms) },
-		jitter: { "event2" => jitter!(5ms) },
-		deadline: { "start" => "end", deadline!(duration: 100ms) }
+		wcet:     { "event1" => wcet!(10ms) },
+		jitter:   { "event2" => jitter!(5ms) },
+		deadline: { "start" => "end", deadline!(duration: 100ms) },
+		slack:    { "start" => "end", slack!(min: 5ms) }
 	}
-	clocks: { "clock1", "clock2" }               // Optional: when testing-timing enabled
-	annotations { description: "..." }           // Optional metadata
+	schedulability {                              // Optional: when testing-schedulability enabled
+		scheduler: RateMonotonic,                 // or EarliestDeadlineFirst
+		periods: {
+			"event1" => 50ms,
+			"event2" => 100ms
+		}
+	}
+	annotations { description: "..." }            // Optional metadata
 }
 ```
 
@@ -2566,21 +2427,24 @@ tb_process_spec! {
 }
 ```
 
-#### 10.3.5 Generated API
+#### 10.3.5 Timing and Schedulability Verification
 
-Each `tb_process_spec!` generates:
-```rust
-impl ProcessName {
-	pub fn process() -> Process;  // Returns LTS structure
-}
-```
+When `testing-timing` and `testing-schedulability` features are enabled, process
+specifications participate in timing and schedulability verification via the
+`clocks`, `timing` and `schedulability` blocks shown in §10.3.2. Timing
+constraints (WCET, deadlines, jitter, slack) and task periods are combined into
+task sets that are checked using Rate Monotonic or Earliest Deadline First
+analysis. See §10.2.9 for a complete overview of timing and schedulability
+semantics.
 
 ### 10.4 Layer 3: Refinement Checking (FDR)
 
 #### 10.4.1 Concept
 
 Refinement checking provides multi-seed exploration for trace and failures
-refinement verification. Based on the Failures-Divergences Refinement (FDR)
+refinement verification. Formal definitions of traces, failures, and divergences
+are given in §10.1.1 and §10.5; this section focuses on configuration and
+verdict structure. Based on the Failures-Divergences Refinement (FDR)
 methodology from CSP theory. Enabled with `testing-fdr` feature flag.
 
 **Verification Properties**:
@@ -2891,12 +2755,15 @@ The `FdrTraceExt` trait extends `ConsumedTrace` with CSP-specific analysis:
 use tightbeam::testing::fdr::FdrTraceExt;
 
 hooks {
-    on_pass: |trace| {
+    on_pass: |trace, result| {
         // Refinement properties
-        assert!(trace.fdr_verdict.trace_refines);
-        assert!(trace.fdr_verdict.failures_refines);
-        assert!(trace.fdr_verdict.divergence_free);
-        assert!(trace.fdr_verdict.is_deterministic);
+        if let Some(ref fdr_verdict) = result.fdr_verdict {
+            assert!(fdr_verdict.trace_refines);
+            assert!(fdr_verdict.failures_refines);
+            assert!(fdr_verdict.divergence_free);
+            assert!(fdr_verdict.is_deterministic);
+        }
+        Ok(())
     }
 }
 ```
@@ -3092,11 +2959,13 @@ tb_scenario! {
 		}
 	},
 	hooks {
-		on_pass: |trace| {
+		on_pass: |_trace, _result| {
 			// Optional: custom logic on test pass
+			Ok(())
 		},
-		on_fail: |_trace, violations| {
+		on_fail: |_trace, result| {
 			// Optional: custom logic on test fail
+			Err(format!("Test failed with result: {result:?}").into())
 		}
 	}
 }
@@ -3106,6 +2975,23 @@ This test verifies:
 - **L1**: Correct assertion labels and cardinalities
 - **L2**: Valid state transitions with internal events
 - **L3**: Trace refinement across multiple exploration seeds
+
+#### 10.6.3 Hook Semantics
+
+Hooks provide optional callbacks that can observe and override test outcomes:
+
+- Declared under `hooks { ... }` with signatures like
+  `on_pass: |trace, result| { ... }` and `on_fail: |trace, result| { ... }`.
+- Each hook is a closure of type
+  `FnOnce(&ConsumedTrace, &ScenarioResult) -> Result<(), Box<dyn std::error::Error>>`,
+  though the return type is usually inferred by the compiler.
+- `Ok(())` means the hook accepts the outcome and the test passes.
+- `Err(e)` means the hook rejects the outcome and the test fails, with
+  `e.to_string()` reported as the failure message.
+- Hooks receive the full `ScenarioResult`, allowing inspection of assertion
+  violations, CSP validation results, FDR verdicts, and timing/schedulability
+  analysis, and can freely use `?` to propagate any error type implementing
+  `std::error::Error`.
 
 ### 10.7 Coverage-Guided Fuzzing with AFL
 
@@ -3362,10 +3248,10 @@ The following table summarizes capabilities available across the testing layers:
 | Edge coverage tracking | – | – | – | ✓ |
 | Input corpus evolution | – | – | – | ✓ |
 | **Timing Verification** | | | | |
-| Timing constraints (WCET/Deadline/Jitter) | – | `timing` | `timing` | – |
-| Timed CSP (clocks, guards) | – | `timing` | `timing` | – |
-| Schedulability analysis (RMA/EDF) | – | – | `timing` | – |
-| Early pruning (timing violations) | – | – | `timing` | – |
+| Timing constraints (WCET/Deadline/Jitter/Slack) | `testing-timing` | `testing-timing` | `testing-timing` | – |
+| Timed CSP (clocks, guards) | – | `testing-timing` | `testing-timing` | – |
+| Schedulability analysis (RMA/EDF) | – | `testing-schedulability` | `testing-schedulability` | – |
+| Early pruning (timing violations) | – | – | `testing-fdr` + `testing-timing` | – |
 | **Combined Capabilities** | | | | |
 | CSP oracle for fuzzing | – | – | – | `csp` + `fuzz` |
 | IJON state annotations | – | – | – | `csp` + `fuzz-ijon` |
@@ -3501,8 +3387,162 @@ This section contains complete, runnable examples demonstrating real-world usage
 
 ### 12.1 Complete Client-Server Application
 
+This example demonstrates an end-to-end worker and servlet setup tested with
+`tb_scenario!`, covering assertion specs, CSP process specs, and environment
+integration.
+
+#### Worker Integration Example
+
 ```rust
-// TODO
+use tightbeam::testing::*;
+
+// Define assertion spec for worker behavior
+tb_assert_spec! {
+	pub PingPongWorkerSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("relay_start", exactly!(2)),
+			("relay_success", exactly!(1)),
+			("response_result", exactly!(1), equals!("PONG")),
+			("relay_rejected", exactly!(1))
+		]
+	},
+}
+
+// Define CSP process spec for worker state machine
+tb_process_spec! {
+	pub PingPongWorkerProcess,
+	events {
+		observable { "relay_start", "relay_success", "relay_rejected" }
+		hidden { "validate_message", "process_message" }
+	}
+	states {
+		Idle       => { "relay_start" => Processing }
+		Processing => { "validate_message" => Validating }
+		Validating => { "process_message" => Responding, "relay_rejected" => Idle }
+		Responding => { "relay_success" => Idle }
+	}
+	terminal { Idle }
+	choice { Validating }
+}
+
+tb_scenario! {
+	name: test_ping_pong_worker,
+	spec: PingPongWorkerSpec,
+	csp: PingPongWorkerProcess,
+	environment Worker {
+		worker: PingPongWorker,
+		stimulus: |trace, worker| {
+			// Test accepted message
+			trace.event("relay_start");
+
+			let ping_msg = RequestMessage {
+				content: "PING".to_string(),
+				lucky_number: 42,
+			};
+
+			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg))?;
+			if let Some(pong) = response {
+				trace.event("relay_success");
+				trace.event_with("response_result", &[], pong.result);
+			}
+
+			// Test rejected message
+			trace.event("relay_start");
+
+			let pong_msg = RequestMessage {
+				content: "PONG".to_string(),
+				lucky_number: 42,
+			};
+
+			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg));
+			if result.is_err() {
+				trace.event("relay_rejected");
+			}
+
+			Ok(())
+		}
+	}
+}
+```
+
+#### Servlet Integration Example
+
+```rust
+use tightbeam::testing::*;
+
+// Define assertion spec for servlet behavior
+tb_assert_spec! {
+	pub PingPongSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("request_received", exactly!(1)),
+			("pong_sent", exactly!(1)),
+			("response_result", exactly!(1), equals!("PONG")),
+			("is_winner", exactly!(1), equals!(true))
+		]
+	},
+}
+
+// Define process spec for servlet state machine
+tb_process_spec! {
+	pub PingPongProcess,
+	events {
+		observable { "request_received", "pong_sent" }
+		hidden { "validate_lucky_number", "format_response" }
+	}
+	states {
+		Idle       => { "request_received" => Processing }
+		Processing => { "validate_lucky_number" => Validating }
+		Validating => { "format_response" => Responding }
+		Responding => { "pong_sent" => Idle }
+	}
+	terminal { Idle }
+	choice { Processing }
+}
+
+tb_scenario! {
+	name: test_servlet_with_workers,
+	spec: PingPongSpec,
+	csp: PingPongProcess,
+	environment Servlet {
+		servlet: PingPongServletWithWorker,
+		client: |trace, mut client| async move {
+			fn generate_message(
+				lucky_number: u32,
+				content: Option<String>
+			) -> Result<crate::Frame, crate::TightBeamError> {
+				let message = RequestMessage {
+					content: content.unwrap_or_else(|| "PING".to_string()),
+					lucky_number,
+				};
+
+				crate::compose! { V0: id: b"test-ping", message: message }
+			}
+
+			// Client-side assertion before sending
+			trace.event("request_received");
+
+			// Test winning case
+			let ping_message = generate_message(42, None)?;
+			let response = client.emit(ping_message, None).await?;
+			let response_message: ResponseMessage = crate::decode(&response.unwrap().message)?;
+
+			// Emit value assertions for spec verification
+			trace.event_with("response_result", &[], response_message.result);
+			trace.event_with("is_winner", &[], response_message.is_winner);
+
+			// Client-side assertion after receiving
+			trace.event("pong_sent");
+
+			Ok(())
+		}
+	}
+}
 ```
 
 ## 13. References
