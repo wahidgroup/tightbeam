@@ -90,7 +90,7 @@ tightbeam::tb_scenario! {
 					Ok(())
 				},
 				_ => {
-					Err(format!("Expected SchedulabilityViolation, got: {:?}", violation).into())
+					Err(format!("Expected SchedulabilityViolation, got: {violation:?}").into())
 				}
 			}
 		}
@@ -171,7 +171,7 @@ tightbeam::tb_scenario! {
 					Ok(())
 				},
 				_ => {
-					Err(format!("Expected SchedulabilityViolation, got: {:?}", violation).into())
+					Err(format!("Expected SchedulabilityViolation, got: {violation:?}").into())
 				}
 			}
 		}
@@ -228,12 +228,12 @@ tightbeam::tb_scenario! {
 			match violation {
 				SpecViolation::SchedulabilityError(error) => {
 					// Verify it's a valid error with details
-					let error_display = format!("{}", error);
-					assert!(!error_display.is_empty(), "Should have error details: {:?}", error);
+					let error_display = format!("{error}");
+					assert!(!error_display.is_empty(), "Should have error details: {error:?}");
 					Ok(())
 				},
 				_ => {
-					Err(format!("Expected SchedulabilityError, got: {:?}", violation).into())
+					Err(format!("Expected SchedulabilityError, got: {violation:?}").into())
 				}
 			}
 		}

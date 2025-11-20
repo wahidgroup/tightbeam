@@ -78,19 +78,19 @@ tightbeam::tb_scenario! {
 			assert!(result.assert_spec.is_some(), "Assert spec should be present");
 			assert!(result.process.is_some(), "Process should be present");
 			assert!(result.timing_constraints.is_some(), "Timing constraints should be present");
-			
+
 			// Verify we can access the process data
 			let process = result.process.as_ref().unwrap();
 			assert_eq!(process.name, "RmaSchedulableProcess", "Process name should match");
-			
+
 			// Verify timing constraints are accessible
 			let constraints = result.timing_constraints.as_ref().unwrap();
 			assert!(constraints.has_constraint(&tightbeam::testing::specs::csp::Event("task1")));
 			assert!(constraints.has_constraint(&tightbeam::testing::specs::csp::Event("task2")));
-			
+
 			// Task set and schedulability result would be populated if schedulability analysis was performed
 			// (These are set by FDR timing subsystem during exploration)
-			
+
 			Ok(())
 		},
 	}

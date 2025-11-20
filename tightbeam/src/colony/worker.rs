@@ -829,8 +829,8 @@ macro_rules! worker {
 					let _ = respond_to.send(Err(status));
 					continue;
 				}
-				let $message_ident = (*message).clone();
-				let $trace_ident = ::std::sync::Arc::clone(&trace);
+				let $message_ident = message;
+				let $trace_ident = trace;
 				let $config_ident = config_arc.as_ref();
 				let output = (async move $handler_block).await;
 				let _ = respond_to.send(Ok(output));
@@ -848,8 +848,8 @@ macro_rules! worker {
 					let _ = respond_to.send(Err(status));
 					continue;
 				}
-				let $message_ident = (*message).clone();
-				let $trace_ident = ::std::sync::Arc::clone(&trace);
+				let $message_ident = message;
+				let $trace_ident = trace;
 				let $config_ident = ();
 				let output = (async move $handler_block).await;
 				let _ = respond_to.send(Ok(output));

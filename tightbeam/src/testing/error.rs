@@ -29,10 +29,10 @@ impl core::fmt::Display for SchedulabilityViolationDetail {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		write!(f, "Task '{}': {}", self.task_id, self.message)?;
 		if let Some(u) = self.utilization {
-			write!(f, " (utilization: {:.3})", u)?;
+			write!(f, " (utilization: {u:.3})")?;
 		}
 		if let Some(d) = self.deadline_miss {
-			write!(f, " (deadline miss: {:?})", d)?;
+			write!(f, " (deadline miss: {d:?})")?;
 		}
 		Ok(())
 	}

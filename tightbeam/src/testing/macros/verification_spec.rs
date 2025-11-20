@@ -930,24 +930,11 @@ macro_rules! __tb_assert_spec_build {
 		$(, description: $desc:expr)?
 		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
-		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
-		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
-			stringify!($base),
-			$crate::trace::ExecutionMode::$mode,
+		let mut builder = $crate::__tb_assert_spec_init_builder!(
+			$base, $desc_opt, $maj, $min, $patch, $mode, $gate,
+			$(tag_filter: [ $( $tag ),* ])?
+			$(, description: $desc)?
 		);
-		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
-		$(
-			builder = builder.tag_filter(vec![ $( $tag ),* ]);
-		)?
-		$(
-			if let Some(desc) = $desc {
-				builder = builder.description(desc);
-			}
-		)?
-		// Handle description from desc_opt parameter (not part of repetition)
-		if let Some(desc) = $desc_opt {
-			builder = builder.description(desc);
-		}
 		$(
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
@@ -974,24 +961,11 @@ macro_rules! __tb_assert_spec_build {
 		$(, description: $desc:expr)?
 		$(, schedulability: { $($schedule_content:tt)* })?
 	) => {{
-		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
-		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
-			stringify!($base),
-			$crate::trace::ExecutionMode::$mode,
+		let mut builder = $crate::__tb_assert_spec_init_builder!(
+			$base, $desc_opt, $maj, $min, $patch, $mode, $gate,
+			$(tag_filter: [ $( $tag ),* ])?
+			$(, description: $desc)?
 		);
-		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
-		$(
-			builder = builder.tag_filter(vec![ $( $tag ),* ]);
-		)?
-		$(
-			if let Some(desc) = $desc {
-				builder = builder.description(desc);
-			}
-		)?
-		// Handle description from desc_opt parameter (not part of repetition)
-		if let Some(desc) = $desc_opt {
-			builder = builder.description(desc);
-		}
 		$(
 			builder = $crate::__tb_assert_spec_add_assertion!(builder, $assertion);
 		)*
@@ -1177,6 +1151,103 @@ macro_rules! __tb_scenario_validate_csp_fdr {
 	}};
 }
 
+// Helper macro to call hooks and handle results (reduces duplication)
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_scenario_call_hooks {
+	(
+		scenario_result: $scenario_result:expr,
+		csp_failed: $csp_failed:expr,
+		fdr_failed: $fdr_failed:expr,
+		expect_failure: $expect_failure:expr,
+		$(hooks: {
+			$(on_pass: $on_pass:expr,)?
+			$(on_fail: $on_fail:expr)?
+		},)?
+	) => {{
+		#[allow(unreachable_code)]
+		#[allow(unused_labels)]
+		let hook_result: Result<(), Box<dyn std::error::Error>> = 'hook_call: {
+			if $scenario_result.passed {
+				// Test passed - call on_pass hook if provided
+				$(
+					$(
+						fn __call_hook<F>(f: F, trace: &$crate::trace::ConsumedTrace, result: &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>
+						where
+							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>,
+						{
+							f(trace, result)
+						}
+						break 'hook_call __call_hook($on_pass, &$scenario_result.trace, &$scenario_result);
+					)?
+				)?
+				Ok(())
+			} else {
+				// Test failed - call on_fail hook if provided
+				$(
+					$(
+						fn __call_hook<F>(f: F, trace: &$crate::trace::ConsumedTrace, result: &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>
+						where
+							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>,
+						{
+							f(trace, result)
+						}
+						break 'hook_call __call_hook($on_fail, &$scenario_result.trace, &$scenario_result);
+					)?
+				)?
+				// No hook provided - return default error
+				if let Some(ref violation) = $scenario_result.spec_violation {
+					Err(format!("Spec verification failed: {}", violation).into())
+				} else if $csp_failed {
+					Err("CSP validation failed".into())
+				} else if $fdr_failed && !$expect_failure {
+					Err("FDR refinement check failed".into())
+				} else {
+					Err("Test failed".into())
+				}
+			}
+		};
+		hook_result
+	}};
+}
+
+// Helper macro for common spec builder initialization (reduces duplication)
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_init_builder {
+	(
+		$base:ident,
+		$desc_opt:expr,
+		$maj:literal,
+		$min:literal,
+		$patch:literal,
+		$mode:ident,
+		$gate:ident,
+		$(tag_filter: [ $($tag:expr),* $(,)? ])?
+		$(, description: $desc:expr)?
+	) => {{
+		let (maj, min, patch) = ($maj as u16, $min as u16, $patch as u16);
+		let mut builder = $crate::testing::macros::AssertSpecBuilder::new(
+			stringify!($base),
+			$crate::trace::ExecutionMode::$mode,
+		);
+		builder = builder.version(maj, min, patch).gate_decision($crate::policy::TransitStatus::$gate);
+		$(
+			builder = builder.tag_filter(vec![ $( $tag ),* ]);
+		)?
+		$(
+			if let Some(desc) = $desc {
+				builder = builder.description(desc);
+			}
+		)?
+		// Handle description from desc_opt parameter
+		if let Some(desc) = $desc_opt {
+			builder = builder.description(desc);
+		}
+		builder
+	}};
+}
+
 /// Helper macro for common trace verification logic (reduces duplication)
 #[doc(hidden)]
 #[macro_export]
@@ -1330,55 +1401,15 @@ macro_rules! __tb_scenario_verify_impl {
 		scenario_result.passed = l1_passed && !csp_failed && (!fdr_failed || expect_failure);
 
 		// Call hooks and get their decision
-		#[allow(unreachable_code)]
-		#[allow(unused_labels)]
-		let hook_result: Result<(), Box<dyn std::error::Error>> = 'hook_call: {
-			if scenario_result.passed {
-				// Test passed - call on_pass hook if provided
-					$(
-						$(
-						fn __call_on_pass<F>(f: F, trace: &$crate::trace::ConsumedTrace, result: &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>
-								where
-							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>,
-								{
-							f(trace, result)
-								}
-						break 'hook_call __call_on_pass($on_pass, &scenario_result.trace, &scenario_result);
-						)?
-					)?
-				Ok(())
-			} else {
-				// Test failed - call on_fail hook if provided
-					$(
-						$(
-						fn __call_on_fail<F>(f: F, trace: &$crate::trace::ConsumedTrace, result: &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>
-								where
-							F: FnOnce(&$crate::trace::ConsumedTrace, &$crate::testing::ScenarioResult) -> Result<(), Box<dyn std::error::Error>>,
-								{
-							f(trace, result)
-								}
-						break 'hook_call __call_on_fail($on_fail, &scenario_result.trace, &scenario_result);
-						)?
-					)?
-				// No hook provided - return default error
-				if let Some(ref violation) = scenario_result.spec_violation {
-					Err(format!("Spec verification failed: {}", violation).into())
-				} else if csp_failed {
-					Err("CSP validation failed".into())
-				} else if fdr_failed && !expect_failure {
-					Err("FDR refinement check failed".into())
-		} else {
-					Err("Test failed".into())
-				}
-			}
-		};
-
-		// Convert hook result to verification result format
-		match hook_result {
-			Ok(()) => Ok(()),
-			Err(e) => {
-				Err(e)
-			}
-		}
+		$crate::__tb_scenario_call_hooks!(
+			scenario_result: scenario_result,
+			csp_failed: csp_failed,
+			fdr_failed: fdr_failed,
+			expect_failure: expect_failure,
+			$(hooks: {
+				$(on_pass: $on_pass,)?
+				$(on_fail: $on_fail)?
+			},)?
+		)
 	}};
 }
