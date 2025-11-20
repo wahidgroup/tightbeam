@@ -170,19 +170,9 @@ tb_scenario! {
 				.with_timeout(Duration::from_millis(500))
 				.build()?;
 
-			Ok::<_, tightbeam::TightBeamError>((servlet, client))
+			Ok((servlet, client))
 		},
 		client: |trace, mut client| async move {
-			// TODO handle this more elegantly
-			// Guard: ensure we have enough bytes to attempt at least one move
-			// If not, emit required events and exit gracefully
-			let input_len = trace.oracle().fuzz_remaining().unwrap_or(0);
-			if input_len < 4 {
-				trace.event("client_move_sent");
-				trace.event("client_move_rejected");
-				return Ok(());
-			}
-
 			#[derive(Default)]
 			struct GameStats {
 				move_sent_count: u64,
@@ -220,12 +210,20 @@ tb_scenario! {
 				}
 
 				// Check if we have enough bytes before attempting to read
+				// For short inputs, break immediately - the loop will have run at least once
+				// if we had any bytes, satisfying the "at least 1 move" requirement
 				if !trace.oracle().fuzz_has_bytes(4).unwrap_or(false) {
-					// No bytes available, break immediately
-					break;
+					// If we haven't sent any moves yet and have no bytes, we need to send
+					// at least one move to satisfy server assertions. Use zeros.
+					if stats.move_sent_count == 0 {
+						// Continue to send a synthetic move with zeros
+					} else {
+						// We've sent at least one move, safe to break
+						break;
+					}
 				}
 
-				// We have bytes, try to read them
+				// We have bytes (or need to send synthetic move), try to read them
 				let move_req = match (
 					trace.oracle().fuzz_u8(),
 					trace.oracle().fuzz_u8(),
@@ -233,10 +231,11 @@ tb_scenario! {
 					trace.oracle().fuzz_u8(),
 				) {
 					(Ok(fr), Ok(fc), Ok(tr), Ok(tc)) => {
-						// Generate move from fuzz bytes (no validation - we want to test invalid moves too)
+						// Generate move from fuzz bytes
 						ChessMove::from((fr, fc, tr, tc)).to_request()
 					},
-					_ => break, // Should not happen if fuzz_has_bytes was true
+					// Partial read or no bytes - use zeros for synthetic move
+					_ => ChessMove::from((0u8, 0u8, 0u8, 0u8)).to_request(),
 				};
 
 				trace.event("client_move_sent");

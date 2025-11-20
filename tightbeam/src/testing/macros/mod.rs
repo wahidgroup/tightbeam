@@ -2112,6 +2112,8 @@ macro_rules! tb_scenario {
 
 				// AFL fuzz targets should not panic on failure - just return
 				let _ = $crate::tb_scenario!(@propagate_result exec_result, verification_result);
+
+				drop(runtime);
 			});
 		}
 
@@ -2289,7 +2291,17 @@ macro_rules! tb_scenario {
 macro_rules! __tb_scenario_servlet_start {
 	// Custom start expression provided - must return (servlet, client) tuple
 	($servlet:ident, $trace:expr, $start:expr) => {{
-		($start)($trace).await.expect("Failed to start servlet")
+		async fn __call_start_closure<F, Fut, T, C>(
+			closure: F,
+			trace: $crate::trace::TraceCollector,
+		) -> Result<(T, C), $crate::TightBeamError>
+		where
+			F: FnOnce($crate::trace::TraceCollector) -> Fut,
+			Fut: core::future::Future<Output = Result<(T, C), $crate::TightBeamError>>,
+		{
+			closure(trace).await
+		}
+		__call_start_closure($start, $trace).await.expect("Failed to start servlet")
 	}};
 	// Default: call start with trace collector, then create client
 	($servlet:ident, $trace:expr,) => {{
