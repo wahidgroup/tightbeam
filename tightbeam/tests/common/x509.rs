@@ -18,7 +18,7 @@ use tightbeam::{
 	server,
 	spki::SubjectPublicKeyInfoOwned,
 	testing::create_test_signing_key,
-	transport::{EncryptedProtocol, TransportEncryptionConfig},
+	transport::{handshake::HandshakeKeyManager, EncryptedProtocol, TransportEncryptionConfig},
 	x509::Certificate,
 	Frame, TightBeamError,
 };
@@ -48,10 +48,10 @@ pub fn create_test_cert_with_key(subject: &str, validity_days: u64) -> Result<(C
 /// Create server encryption config with certificate, key, and validators
 pub fn create_server_config(
 	cert: Certificate,
-	key: Secp256k1SigningKey,
+	key_provider: impl Into<HandshakeKeyManager>,
 	validators: Vec<Arc<dyn CertificateValidation>>,
 ) -> TransportEncryptionConfig {
-	let key_manager = key.into();
+	let key_manager = key_provider.into();
 	TransportEncryptionConfig::new(cert, key_manager).with_client_validators(validators)
 }
 

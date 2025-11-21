@@ -3,9 +3,6 @@
 //! This module provides various certificate validation policies that can be
 //! used to validate X.509 certificates according to different trust models.
 
-#[cfg(feature = "std")]
-use std::collections::HashSet;
-
 use core::marker::PhantomData;
 use core::time::Duration;
 
@@ -16,6 +13,7 @@ use crate::crypto::sign::Verifier;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
+use crate::der::Encode;
 
 /// Trait for certificate validation strategies.
 ///
@@ -78,19 +76,6 @@ pub trait SignatureVerification: CertificateValidation {
 // Built-in Validators
 // ============================================================================
 
-/// Accept all certificates without validation.
-///
-/// **Warning:** This validator provides no security and should only be used
-/// in testing or development environments.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AcceptAll;
-
-impl CertificateValidation for AcceptAll {
-	fn evaluate(&self, _cert: &Certificate) -> Result<(), CertificateValidationError> {
-		Ok(())
-	}
-}
-
 /// Validate only certificate expiry.
 ///
 /// This validator checks if the certificate is within its validity period
@@ -104,145 +89,114 @@ impl CertificateValidation for ExpiryValidator {
 	}
 }
 
-/// Public key pinning validator.
+/// Public key pinning validator with const-generic array
 ///
-/// Only accepts certificates whose public key matches one of the pinned keys.
-/// This is useful for establishing trust without requiring full PKI validation.
-#[cfg(feature = "std")]
-#[derive(Debug, Clone)]
-pub struct PublicKeyPinning {
-	allowed_keys: HashSet<Vec<u8>>,
+/// This validator is zero-copy and const-constructible, making it suitable
+/// for use in static configurations.
+///
+/// The const generic parameter `N` specifies the number of pinned keys.
+#[derive(Debug, Clone, Copy)]
+pub struct PublicKeyPinning<const N: usize> {
+	allowed_keys: [&'static [u8]; N],
 }
 
-#[cfg(feature = "std")]
-impl PublicKeyPinning {
-	/// Create a new public key pinning validator.
+impl<const N: usize> PublicKeyPinning<N> {
+	/// Create a new public key pinning validator with the given allowed keys.
 	///
-	/// # Arguments
-	/// * `keys` - List of allowed public key bytes (raw SPKI format)
-	pub fn new(keys: Vec<Vec<u8>>) -> Self {
-		Self { allowed_keys: keys.into_iter().collect() }
-	}
-
-	/// Add a public key to the allowlist.
-	pub fn add_key(&mut self, key: Vec<u8>) {
-		self.allowed_keys.insert(key);
+	/// This is a const function, allowing creation in const contexts.
+	pub const fn new(keys: [&'static [u8]; N]) -> Self {
+		Self { allowed_keys: keys }
 	}
 }
 
-#[cfg(feature = "std")]
-impl CertificateValidation for PublicKeyPinning {
+impl<const N: usize> CertificateValidation for PublicKeyPinning<N> {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		let public_key_bytes = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
-		if self.allowed_keys.contains(public_key_bytes) {
-			Ok(())
-		} else {
-			Err(CertificateValidationError::PublicKeyNotPinned)
+		let pub_key_bytes = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
+		for allowed_key in &self.allowed_keys {
+			if *allowed_key == pub_key_bytes {
+				return Ok(());
+			}
 		}
+
+		Err(CertificateValidationError::PublicKeyNotPinned)
 	}
 }
 
-/// Certificate fingerprint pinning validator.
+/// Certificate fingerprint pinning validator with const-generic array.
 ///
-/// Only accepts certificates whose fingerprint matches one of the pinned fingerprints.
-/// This provides the strongest binding but requires updating pins on certificate rotation.
+/// This validator is const-constructible, making it suitable for use in static
+/// configurations.
 ///
-/// Generic over the digest algorithm used for fingerprinting.
-#[cfg(feature = "std")]
-#[derive(Debug, Clone)]
-pub struct FingerprintPinning<D> {
-	allowed_fingerprints: HashSet<Vec<u8>>,
+/// Generic over the digest algorithm and the number of pinned fingerprints.
+#[derive(Debug, Clone, Copy)]
+pub struct FingerprintPinning<D, const N: usize> {
+	allowed_fingerprints: [&'static [u8]; N],
 	_digest: PhantomData<D>,
 }
 
-#[cfg(feature = "std")]
-impl<D> FingerprintPinning<D>
+impl<D, const N: usize> FingerprintPinning<D, N>
 where
 	D: Digest,
 {
-	/// Create a new fingerprint pinning validator.
+	/// Create a new fingerprint pinning validator with the given allowed fingerprints.
 	///
-	/// # Arguments
-	/// * `fingerprints` - List of allowed certificate fingerprints
-	pub fn new(fingerprints: Vec<Vec<u8>>) -> Self {
-		Self { allowed_fingerprints: fingerprints.into_iter().collect(), _digest: PhantomData }
-	}
-
-	/// Add a fingerprint to the allowlist.
-	pub fn add_fingerprint(&mut self, fingerprint: Vec<u8>) {
-		self.allowed_fingerprints.insert(fingerprint);
+	/// This is a const function, allowing creation in const contexts.
+	pub const fn new(fingerprints: [&'static [u8]; N]) -> Self {
+		Self { allowed_fingerprints: fingerprints, _digest: PhantomData }
 	}
 }
 
-#[cfg(feature = "std")]
-impl<D> CertificateValidation for FingerprintPinning<D>
+impl<D, const N: usize> CertificateValidation for FingerprintPinning<D, N>
 where
 	D: Digest + Send + Sync,
 {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		use crate::der::Encode;
-
 		let cert_der = cert.to_der()?;
 		let fingerprint = D::digest(&cert_der);
-
-		if self.allowed_fingerprints.contains(fingerprint.as_slice()) {
-			Ok(())
-		} else {
-			Err(CertificateValidationError::CertificateNotPinned)
+		for allowed_fp in &self.allowed_fingerprints {
+			if *allowed_fp == fingerprint.as_ref() {
+				return Ok(());
+			}
 		}
+
+		Err(CertificateValidationError::CertificateNotPinned)
 	}
 }
 
-/// Certificate fingerprint denylist validator.
+/// Certificate fingerprint denylist validator with const-generic array.
 ///
-/// Rejects certificates whose fingerprint matches a denied fingerprint.
-/// Useful for blocking compromised certificates.
-///
-/// Generic over the digest algorithm used for fingerprinting.
-#[cfg(feature = "std")]
-#[derive(Debug, Clone)]
-pub struct FingerprintDenylist<D> {
-	denied_fingerprints: HashSet<Vec<u8>>,
+/// This validator is const-constructible, making it suitable for use in
+/// static configurations.
+#[derive(Debug, Clone, Copy)]
+pub struct FingerprintDenylist<D, const N: usize> {
+	denied_fingerprints: [&'static [u8]; N],
 	_digest: PhantomData<D>,
 }
 
-#[cfg(feature = "std")]
-impl<D> FingerprintDenylist<D>
+impl<D, const N: usize> FingerprintDenylist<D, N>
 where
 	D: Digest,
 {
-	/// Create a new fingerprint denylist validator.
-	///
-	/// # Arguments
-	/// * `fingerprints` - List of denied certificate fingerprints
-	pub fn new(fingerprints: Vec<Vec<u8>>) -> Self {
-		Self { denied_fingerprints: fingerprints.into_iter().collect(), _digest: PhantomData }
-	}
-
-	/// Add a fingerprint to the denylist.
-	pub fn add_fingerprint(&mut self, fingerprint: Vec<u8>) {
-		self.denied_fingerprints.insert(fingerprint);
+	/// Create a new fingerprint denylist validator with the given fingerprints.
+	pub const fn new(fingerprints: [&'static [u8]; N]) -> Self {
+		Self { denied_fingerprints: fingerprints, _digest: PhantomData }
 	}
 }
 
-#[cfg(feature = "std")]
-impl<D> CertificateValidation for FingerprintDenylist<D>
+impl<D, const N: usize> CertificateValidation for FingerprintDenylist<D, N>
 where
 	D: Digest + Send + Sync,
 {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		use crate::der::Encode;
-
-		let cert_der = cert
-			.to_der()
-			.map_err(|_| CertificateValidationError::InvalidCertificateEncoding)?;
+		let cert_der = cert.to_der()?;
 		let fingerprint = D::digest(&cert_der);
-
-		if self.denied_fingerprints.contains(fingerprint.as_slice()) {
-			Err(CertificateValidationError::CertificateDenied)
-		} else {
-			Ok(())
+		for denied_fp in &self.denied_fingerprints {
+			if *denied_fp == fingerprint.as_ref() {
+				return Err(CertificateValidationError::CertificateDenied);
+			}
 		}
+
+		Ok(())
 	}
 }
 
@@ -258,11 +212,6 @@ pub struct FullValidator {
 }
 
 impl FullValidator {
-	/// Create a new full PKI validator.
-	pub fn new() -> Self {
-		Self::default()
-	}
-
 	/// Add a trust chain to the validator.
 	///
 	/// # Arguments
@@ -351,11 +300,6 @@ pub struct ChainValidator {
 
 #[cfg(feature = "std")]
 impl ChainValidator {
-	/// Create a new chain validator.
-	pub fn new() -> Self {
-		Self { validators: Vec::new() }
-	}
-
 	/// Add a validator to the chain.
 	#[allow(clippy::should_implement_trait)]
 	pub fn add(mut self, validator: Box<dyn CertificateValidation>) -> Self {
@@ -367,7 +311,7 @@ impl ChainValidator {
 #[cfg(feature = "std")]
 impl Default for ChainValidator {
 	fn default() -> Self {
-		Self::new()
+		Self { validators: vec![] }
 	}
 }
 

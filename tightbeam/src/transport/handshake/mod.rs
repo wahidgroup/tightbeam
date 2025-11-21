@@ -177,6 +177,7 @@ use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientI
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
 use crate::crypto::aead::RuntimeAead;
+use crate::crypto::key::{InMemoryKeyProvider, KeyProvider};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::SetOfVec;
@@ -299,34 +300,34 @@ pub trait ServerHandshakeKey: Send + Sync {
 /// The key material is never exposed through the public API - orchestrators
 /// get shared ownership via Arc cloning.
 #[cfg(feature = "x509")]
-pub struct ServerKeyManager {
-	provider: Arc<dyn crate::crypto::key::KeyProvider>,
+pub struct HandshakeKeyManager {
+	provider: Arc<dyn KeyProvider>,
 }
 
 #[cfg(feature = "x509")]
-impl From<Secp256k1SigningKey> for ServerKeyManager {
+impl From<Secp256k1SigningKey> for HandshakeKeyManager {
 	fn from(signing_key: Secp256k1SigningKey) -> Self {
-		let provider = crate::crypto::key::InMemoryKeyProvider::from(signing_key);
+		let provider = InMemoryKeyProvider::from(signing_key);
 		Self { provider: Arc::new(provider) }
 	}
 }
 
 #[cfg(feature = "x509")]
-impl From<crate::crypto::key::InMemoryKeyProvider> for ServerKeyManager {
-	fn from(provider: crate::crypto::key::InMemoryKeyProvider) -> Self {
+impl From<InMemoryKeyProvider> for HandshakeKeyManager {
+	fn from(provider: InMemoryKeyProvider) -> Self {
 		Self { provider: Arc::new(provider) }
 	}
 }
 
 #[cfg(feature = "x509")]
-impl From<Arc<dyn crate::crypto::key::KeyProvider>> for ServerKeyManager {
-	fn from(provider: Arc<dyn crate::crypto::key::KeyProvider>) -> Self {
+impl From<Arc<dyn KeyProvider>> for HandshakeKeyManager {
+	fn from(provider: Arc<dyn KeyProvider>) -> Self {
 		Self { provider }
 	}
 }
 
 #[cfg(feature = "x509")]
-impl ServerKeyManager {
+impl HandshakeKeyManager {
 	/// Create an ECIES server handshake orchestrator using the encapsulated key provider.
 	///
 	/// The orchestrator uses the key provider for cryptographic operations,

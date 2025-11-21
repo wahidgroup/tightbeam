@@ -16,7 +16,7 @@ use crate::crypto::aead::RuntimeAead;
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
 use crate::transport::handshake::{
-	HandshakeError, HandshakeProtocolKind, ServerHandshakeProtocol, ServerKeyManager, TcpHandshakeState,
+	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 };
 #[cfg(feature = "x509")]
 use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
@@ -68,7 +68,7 @@ pub struct TokioListener {
 	#[cfg(feature = "x509")]
 	handshake_timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
-	signatory: Option<Arc<ServerKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager>>,
 }
 
 impl TokioListener {
@@ -93,7 +93,7 @@ impl TokioListener {
 			#[cfg(feature = "x509")]
 			handshake_timeout: None,
 			#[cfg(feature = "x509")]
-			signatory: None,
+			key_manager: None,
 		})
 	}
 
@@ -109,7 +109,7 @@ impl TokioListener {
 		let mut transport = TcpTransport::from(TokioStream::from(stream));
 
 		if let Some(cert) = &self.certificate {
-			transport.server_certificate = Some(Arc::clone(cert));
+			transport.server_certificates.push(Arc::clone(cert));
 		}
 
 		if let Some(ref validators) = self.client_validators {
@@ -134,8 +134,8 @@ impl TokioListener {
 		}
 
 		#[cfg(feature = "x509")]
-		if let Some(signatory) = &self.signatory {
-			transport.signatory = Some(Arc::clone(signatory));
+		if let Some(signatory) = &self.key_manager {
+			transport.key_manager = Some(Arc::clone(signatory));
 		}
 
 		Ok((transport, addr))
@@ -174,7 +174,7 @@ impl Protocol for TokioListener {
 				#[cfg(feature = "x509")]
 				handshake_timeout: None,
 				#[cfg(feature = "x509")]
-				signatory: None,
+				key_manager: None,
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
@@ -214,7 +214,7 @@ impl EncryptedProtocol for TokioListener {
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 				handshake_timeout: Some(config.handshake_timeout),
-				signatory: Some(Arc::clone(&config.signatory)),
+				key_manager: Some(Arc::clone(&config.key_manager)),
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
@@ -243,7 +243,7 @@ where
 	}
 
 	fn server_certificate(&self) -> Option<&Certificate> {
-		self.server_certificate.as_ref().map(|arc| arc.as_ref())
+		self.server_certificates.first().map(|arc| arc.as_ref())
 	}
 
 	fn set_symmetric_key(&mut self, key: RuntimeAead) {
@@ -275,12 +275,12 @@ impl AsyncListenerTrait for TokioListener {
 
 		#[cfg(feature = "x509")]
 		if let Some(ref cert) = self.certificate {
-			transport.server_certificate = Some(Arc::clone(cert));
+			transport.server_certificates.push(Arc::clone(cert));
 		}
 
 		#[cfg(feature = "x509")]
-		if let Some(ref signatory) = self.signatory {
-			transport.signatory = Some(Arc::clone(signatory));
+		if let Some(ref signatory) = self.key_manager {
+			transport.key_manager = Some(Arc::clone(signatory));
 		}
 
 		#[cfg(feature = "x509")]
@@ -307,7 +307,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
 	#[cfg(feature = "x509")]
-	server_certificate: Option<Arc<Certificate>>,
+	server_certificates: Vec<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
@@ -321,7 +321,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	signatory: Option<Arc<ServerKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager>>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
@@ -341,7 +341,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "std")]
 	operation_timeout: Option<std::time::Duration>,
 	#[cfg(feature = "x509")]
-	server_certificate: Option<Arc<Certificate>>,
+	server_certificates: Vec<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
@@ -355,7 +355,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	signatory: Option<Arc<ServerKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager>>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
@@ -874,6 +874,8 @@ mod tests {
 	use crate::crypto::sign::Sha3Signer;
 	use crate::testing::*;
 	use crate::transport::policy::PolicyConf;
+	#[cfg(feature = "x509")]
+	use crate::transport::X509ClientConfig;
 	use crate::transport::{MessageCollector, MessageEmitter, ResponseHandler, TransitStatus};
 	use crate::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
 

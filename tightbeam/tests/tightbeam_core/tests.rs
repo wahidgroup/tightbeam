@@ -17,9 +17,6 @@ use tightbeam::testing::macros::{IsNone, IsSome};
 use tightbeam::utils;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
-#[cfg(all(feature = "tokio", feature = "transport-policy"))]
-mod queue_free;
-
 /// Simple test message
 #[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
 #[derive(Clone, Debug, PartialEq, Sequence)]

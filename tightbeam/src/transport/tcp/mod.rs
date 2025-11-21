@@ -205,7 +205,7 @@ macro_rules! impl_tcp_common {
 					stream,
 					handler: None,
 					#[cfg(feature = "x509")]
-					server_certificate: None,
+					server_certificates: Vec::new(),
 					#[cfg(feature = "x509")]
 					client_certificate: None,
 					#[cfg(feature = "x509")]
@@ -251,7 +251,7 @@ macro_rules! impl_tcp_common {
 					operation_timeout: None,
 					handler: None,
 					#[cfg(feature = "x509")]
-					server_certificate: None,
+					server_certificates: Vec::new(),
 					#[cfg(feature = "x509")]
 					client_certificate: None,
 					#[cfg(feature = "x509")]
@@ -265,7 +265,7 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					max_encrypted_envelope: None,
 					#[cfg(feature = "x509")]
-					signatory: None,
+					key_manager: None,
 					#[cfg(feature = "x509")]
 					handshake_state: $crate::transport::handshake::TcpHandshakeState::None,
 					#[cfg(feature = "x509")]
@@ -298,28 +298,36 @@ macro_rules! impl_tcp_common {
 		}
 
 		#[cfg(feature = "x509")]
+		impl<S: $stream_trait> $crate::transport::X509ClientConfig for $transport<S>
+		where
+			TransportError: From<S::Error>,
+		{
+			fn with_server_certificate(mut self, cert: $crate::x509::Certificate) -> Self {
+				self.server_certificates.push(Arc::new(cert));
+				self
+			}
+
+			fn with_server_certificates(mut self, certs: impl IntoIterator<Item = $crate::x509::Certificate>) -> Self {
+				self.server_certificates.extend(certs.into_iter().map(Arc::new));
+				self
+			}
+
+			fn with_client_identity(
+				mut self,
+				cert: $crate::x509::Certificate,
+				key: $crate::transport::handshake::HandshakeKeyManager,
+			) -> Self {
+				self.client_certificate = Some(Arc::new(cert));
+				self.key_manager = Some(Arc::new(key));
+				self
+			}
+		}
+
+		#[cfg(feature = "x509")]
 		impl<S: $stream_trait> $transport<S>
 		where
 			TransportError: From<S::Error>,
 		{
-			/// Set the server's certificate on the client transport
-			/// This indicates that the server requires encryption
-			pub fn with_server_certificate(mut self, cert: $crate::x509::Certificate) -> Self {
-				self.server_certificate = Some(Arc::new(cert));
-				self
-			}
-
-			/// Set the client's identity (certificate and signing key) for mutual authentication
-			pub fn with_client_identity(
-				mut self,
-				cert: $crate::x509::Certificate,
-				key: $crate::transport::handshake::ServerKeyManager,
-			) -> Self {
-				self.client_certificate = Some(Arc::new(cert));
-				self.signatory = Some(Arc::new(key));
-				self
-			}
-
 			/// Get the peer certificate from a completed mutual authentication handshake.
 			/// Returns None if mutual auth was not performed or handshake not complete.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
@@ -464,15 +472,15 @@ macro_rules! impl_tcp_common {
 				let validator = None;
 
 				// Branch: Handle ECIES without mutual auth separately (K=() cannot be trait object)
-				if matches!(self.handshake_protocol_kind, HandshakeProtocolKind::Ecies) && self.signatory.is_none() {
+				if matches!(self.handshake_protocol_kind, HandshakeProtocolKind::Ecies) && self.key_manager.is_none() {
 					return self.perform_client_handshake_no_mutual_auth(validator).await;
 				}
 
 				// Path: Mutual auth clients - use trait object via factory
-				let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = $crate::transport::handshake::HandshakeError>> = match (self.handshake_protocol_kind, &self.signatory) {
+				let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = $crate::transport::handshake::HandshakeError>> = match (self.handshake_protocol_kind, &self.key_manager) {
 					(HandshakeProtocolKind::Ecies, Some(key)) => {
 						key.create_ecies_client(
-							self.server_certificate.as_ref().map(Arc::clone),
+							self.server_certificates.first().map(Arc::clone),
 							self.client_certificate.as_ref().map(Arc::clone),
 							None, // Use default AAD domain tag
 							validator,
@@ -481,7 +489,7 @@ macro_rules! impl_tcp_common {
 
 					#[cfg(feature = "transport-cms")]
 					(HandshakeProtocolKind::Cms, Some(signatory)) => {
-						let server_cert = self.server_certificate.as_ref()
+						let server_cert = self.server_certificates.first()
 							.ok_or(TransportError::Forbidden)?;
 						signatory.create_cms_client(Arc::clone(server_cert), validator)?
 					}
@@ -623,8 +631,8 @@ macro_rules! impl_tcp_common {
 				};
 
 				// Get server certificate and signatory (required for handshake)
-				let cert_arc = self.server_certificate.as_ref().ok_or(TransportError::Forbidden)?;
-				let signatory = self.signatory.as_ref().ok_or(TransportError::Forbidden)?;
+				let cert_arc = self.server_certificates.first().ok_or(TransportError::Forbidden)?;
+				let signatory = self.key_manager.as_ref().ok_or(TransportError::Forbidden)?;
 
 				// Get or create handshake orchestrator (persists state across multiple messages)
 				if self.server_handshake.is_none() {

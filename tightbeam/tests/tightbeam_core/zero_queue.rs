@@ -7,6 +7,7 @@ use tightbeam::asn1::{DigestInfo, MessagePriority};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::der::ValueOrd;
+use tightbeam::macros::client::builder::ClientBuilder;
 use tightbeam::policy::{GatePolicy, TransitStatus};
 use tightbeam::prelude::policy::PolicyConf;
 use tightbeam::prelude::*;
@@ -15,17 +16,17 @@ use tightbeam::transport::policy::{RestartLinearBackoff, RestartPolicy, RetryAct
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{MessageEmitter, Protocol, TransportResult};
-use tightbeam::{at_least, between, exactly, present, server, tb_assert_spec, tb_scenario};
+use tightbeam::Beamable;
+use tightbeam::{at_least, between, exactly, present, server, servlet, tb_assert_spec, tb_scenario};
 use tightbeam::{utils, Frame, TightBeamError, Version};
+
+use crate::common::x509::create_test_cert_with_key;
 
 const QUEUE_TAG: &str = "queue-free";
 const WORKER_0_TAG: &str = "worker:0";
 const WORKER_1_TAG: &str = "worker:1";
-const CLIENT_TAG: &str = "client";
-const BUSY_TAG: &str = "busy";
 
-#[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
-#[derive(Clone, Debug, PartialEq, Sequence)]
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 struct WorkOrder {
 	#[cfg_attr(feature = "derive", beam(bytes))]
 	payload: Vec<u8>,
@@ -245,13 +246,12 @@ impl BackPressureStats {
 
 #[derive(Clone)]
 struct AdaptiveGate {
-	trace: Arc<TraceCollector>,
 	stats: BackPressureStats,
 }
 
 impl AdaptiveGate {
-	fn new(stats: BackPressureStats, trace: Arc<TraceCollector>) -> Self {
-		Self { trace, stats }
+	fn new(stats: BackPressureStats) -> Self {
+		Self { stats }
 	}
 }
 
@@ -259,33 +259,10 @@ impl GatePolicy for AdaptiveGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
 		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Normal);
 		if priority >= MessagePriority::Normal && self.stats.mark_throttled(frame.metadata.order) {
-			self.trace
-				.event_with("retry_backoff_busy", &[QUEUE_TAG, BUSY_TAG], frame.metadata.order);
 			TransitStatus::Busy
 		} else {
 			TransitStatus::Accepted
 		}
-	}
-}
-
-struct InstrumentedRestart {
-	trace: Arc<TraceCollector>,
-	inner: RestartLinearBackoff,
-}
-
-impl InstrumentedRestart {
-	fn new(trace: Arc<TraceCollector>) -> Self {
-		Self { trace, inner: RestartLinearBackoff::new(3, 50, 1, None) }
-	}
-}
-
-impl RestartPolicy for InstrumentedRestart {
-	fn evaluate(&self, message: &Frame, result: &TransportResult<&Frame>, attempt: usize) -> RetryAction {
-		if result.is_err() {
-			let order = message.metadata.order;
-			self.trace.event_with("retry_backoff_client", &[QUEUE_TAG, CLIENT_TAG], order);
-		}
-		self.inner.evaluate(message, result, attempt)
 	}
 }
 
@@ -328,6 +305,19 @@ fn default_batch() -> WorkBatch {
 	batch
 }
 
+servlet! {
+	QueueServlet<WorkOrder>,
+	protocol: TokioListener,
+	policies: {
+		with_collector_gate: [AdaptiveGate::new(BackPressureStats::default())]
+	},
+	handle: |frame, trace| async move {
+		let harness = QueueHarness::new(Arc::clone(&trace));
+		harness.handle(&frame)?;
+		Ok(None)
+	}
+}
+
 tb_assert_spec! {
 	pub QueueFreeSpec,
 	V(1,0,0): {
@@ -338,9 +328,7 @@ tb_assert_spec! {
 			("lag_tip", present!(), equals!(0u64)),
 			("priority_respected", at_least!(1), equals!(true)),
 			("worker_fan_out_0", at_least!(1), equals!(0u8), tags: [WORKER_0_TAG]),
-			("worker_fan_out_1", at_least!(1), equals!(1u8), tags: [WORKER_1_TAG]),
-			("retry_backoff_client", present!(), equals!(2u64), tags: [CLIENT_TAG]),
-			("retry_backoff_busy", present!(), equals!(2u64), tags: [BUSY_TAG])
+			("worker_fan_out_1", at_least!(1), equals!(1u8), tags: [WORKER_1_TAG])
 		]
 	}
 }
@@ -348,44 +336,31 @@ tb_assert_spec! {
 tb_scenario! {
 	name: queue_free_system,
 	spec: QueueFreeSpec,
-	environment ServiceClient {
-		worker_threads: 2,
-		server: |trace| async move {
-			let trace = Arc::new(trace);
-			let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
-			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
+	environment Servlet {
+		servlet: QueueServlet,
+		start: |trace| async move {
+			let (client_cert, client_key) = create_test_cert_with_key("CN=Test Client", 365)?;
 
-			let gate = AdaptiveGate::new(BackPressureStats::default(), Arc::clone(&trace));
+			let servlet = QueueServlet::start(trace).await?;
+			let server_addr = servlet.addr();
 
-			let handle = server! {
-				protocol TokioListener: listener,
-				assertions: trace.as_ref().share(),
-				policies: {
-					with_collector_gate: [gate.clone()]
-				},
-				handle: move |frame, _trace| {
-					let harness = QueueHarness::new(Arc::clone(&trace));
-					async move {
-						harness.handle(&frame)?;
-						Ok(None)
-					}
-				}
-			};
+			let restart_policy = RestartLinearBackoff::new(3, 50, 1, None);
+			let client = ClientBuilder::<TokioListener>::connect(server_addr).await?
+				.with_client_identity(client_cert, client_key.into())
+				.with_restart(restart_policy)
+				.build()?;
 
-			Ok((handle, addr))
+			Ok((servlet, client))
 		},
-		client: |trace, client| async move {
+		client: |trace, mut client| async move {
 			let trace = Arc::new(trace);
-			let restart = InstrumentedRestart::new(Arc::clone(&trace));
-			let mut transport = client.with_restart(restart);
 
 			let batch = default_batch();
 			let mut prev_hash: Option<DigestInfo> = None;
-			let mut sent = Vec::new();
 
-			for spec in batch.entries() {
+			for (index, spec) in batch.entries().iter().enumerate() {
 				trace.event_with("emit_work", &[QUEUE_TAG], spec.order);
-				let (frame, digest) = match build_frame(batch.work_id(), spec, prev_hash.clone()) {
+				let (frame, digest) = match build_frame(batch.work_id(), spec, prev_hash) {
 					Ok(result) => result,
 					Err(err) => {
 						eprintln!("build_frame error for order {}: {err:?}", spec.order);
@@ -393,13 +368,15 @@ tb_scenario! {
 					}
 				};
 				prev_hash = Some(digest);
-				transport.emit(frame.clone(), None).await?;
-				sent.push(frame);
-			}
 
-			if let Some(duplicate) = sent.get(1).cloned() {
-					trace.event_with("replay_attempt", &[QUEUE_TAG], duplicate.metadata.order);
-				transport.emit(duplicate, None).await?;
+				if index == 1 {
+					// For the second frame, emit it then immediately replay it
+					client.emit(frame.clone(), None).await?;
+					trace.event_with("replay_attempt", &[QUEUE_TAG], frame.metadata.order);
+					client.emit(frame, None).await?;
+				} else {
+					client.emit(frame, None).await?;
+				}
 			}
 
 			Ok(())

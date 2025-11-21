@@ -21,8 +21,38 @@ use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 use crate::crypto::sign::Signer as SignerTrait;
 use crate::error::TightBeamError;
 
+#[cfg(feature = "x509")]
+use crate::transport::handshake::HandshakeKeyManager;
 #[cfg(feature = "zeroize")]
 use crate::zeroize::ZeroizeOnDrop;
+
+/// Specification for providing a cryptographic key in various formats.
+///
+/// This enum allows keys to be specified in multiple ways for flexible
+/// configuration in const contexts (e.g., servlet! macro).
+#[derive(Debug)]
+pub enum KeySpec {
+	/// Raw key bytes (e.g., secp256k1 scalar - 32 bytes)
+	Bytes(&'static [u8]),
+
+	/// Key provider instance (for HSM/KMS)
+	Provider(Arc<dyn KeyProvider>),
+}
+
+#[cfg(feature = "x509")]
+impl TryFrom<KeySpec> for HandshakeKeyManager {
+	type Error = TightBeamError;
+
+	fn try_from(spec: KeySpec) -> Result<Self, Self::Error> {
+		match spec {
+			KeySpec::Bytes(bytes) => {
+				let signing_key = Secp256k1SigningKey::from_bytes(bytes.into())?;
+				Ok(HandshakeKeyManager::from(signing_key))
+			}
+			KeySpec::Provider(provider) => Ok(HandshakeKeyManager::from(provider)),
+		}
+	}
+}
 
 /// Trait for pluggable cryptographic key backends.
 ///

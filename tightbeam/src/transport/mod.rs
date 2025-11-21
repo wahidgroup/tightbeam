@@ -34,7 +34,7 @@ use crate::crypto::aead::{Decryptor, RuntimeAead};
 #[cfg(feature = "x509")]
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
-use crate::transport::handshake::{ServerKeyManager, TcpHandshakeState};
+use crate::transport::handshake::{HandshakeKeyManager, TcpHandshakeState};
 #[cfg(feature = "transport-policy")]
 use crate::transport::policy::RestartPolicy;
 #[cfg(feature = "x509")]
@@ -52,7 +52,7 @@ pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}
 #[derive(Clone)]
 pub struct TransportEncryptionConfig {
 	pub certificate: Certificate,
-	pub signatory: Arc<ServerKeyManager>,
+	pub key_manager: Arc<HandshakeKeyManager>,
 	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	pub aad_domain_tag: &'static [u8],
 	pub max_cleartext_envelope: usize,
@@ -62,10 +62,10 @@ pub struct TransportEncryptionConfig {
 
 #[cfg(all(feature = "x509", feature = "std"))]
 impl TransportEncryptionConfig {
-	pub fn new(certificate: Certificate, signatory: ServerKeyManager) -> Self {
+	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager) -> Self {
 		Self {
 			certificate,
-			signatory: Arc::new(signatory),
+			key_manager: Arc::new(key_manager),
 			client_validators: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			max_cleartext_envelope: 128 * 1024,
@@ -301,6 +301,21 @@ pub trait EncryptedProtocol: Protocol {
 		addr: Self::Address,
 		config: TransportEncryptionConfig,
 	) -> impl core::future::Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
+}
+
+/// Trait for configuring client-side X.509 mutual authentication.
+/// Supports multiple server certificates for rotation and multi-CA scenarios.
+#[cfg(feature = "x509")]
+pub trait X509ClientConfig: Sized {
+	/// Add a server certificate for verification.
+	fn with_server_certificate(self, cert: Certificate) -> Self;
+
+	/// Add multiple server certificates at once.
+	fn with_server_certificates(self, certs: impl IntoIterator<Item = Certificate>) -> Self;
+
+	/// Set the client's identity (certificate and private key) for mutual authentication.
+	/// The client presents this certificate to the server when requested.
+	fn with_client_identity(self, cert: Certificate, key: HandshakeKeyManager) -> Self;
 }
 
 /// This protocol can operate as a mycelial network (ie. TCP SocketAddress)

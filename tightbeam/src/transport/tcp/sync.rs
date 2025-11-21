@@ -17,7 +17,7 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::Encode;
 use crate::prelude::TightBeamSocketAddr;
 use crate::transport::handshake::{
-	HandshakeError, HandshakeProtocolKind, ServerHandshakeProtocol, ServerKeyManager, TcpHandshakeState,
+	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 };
 use crate::transport::tcp::TcpListenerTrait;
 use crate::transport::{EncryptedMessageIO, EncryptedProtocol, Protocol, ResponsePackage, TransportEncryptionConfig};
@@ -45,7 +45,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 	#[cfg(feature = "std")]
 	operation_timeout: Option<std::time::Duration>,
 
-	server_certificate: Option<Arc<Certificate>>,
+	server_certificates: Vec<Arc<Certificate>>,
 
 	client_certificate: Option<Arc<Certificate>>,
 
@@ -59,7 +59,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 
 	max_encrypted_envelope: Option<usize>,
 
-	signatory: Option<Arc<ServerKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager>>,
 
 	handshake_state: TcpHandshakeState,
 
@@ -574,7 +574,7 @@ where
 	}
 
 	fn server_certificate(&self) -> Option<&Certificate> {
-		self.server_certificate.as_ref().map(|arc| arc.as_ref())
+		self.server_certificates.first().map(|arc| arc.as_ref())
 	}
 
 	fn set_symmetric_key(&mut self, key: RuntimeAead) {
@@ -601,7 +601,7 @@ pub struct TcpListener<L: TcpListenerTrait> {
 	aad_domain_tag: Option<&'static [u8]>,
 	max_cleartext_envelope: Option<usize>,
 	max_encrypted_envelope: Option<usize>,
-	signatory: Option<Arc<ServerKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager>>,
 	handshake_timeout: Option<Duration>,
 }
 
@@ -631,7 +631,7 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 				aad_domain_tag: None,
 				max_cleartext_envelope: None,
 				max_encrypted_envelope: None,
-				signatory: None,
+				key_manager: None,
 				handshake_timeout: None,
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
@@ -666,7 +666,7 @@ where
 			aad_domain_tag: None,
 			max_cleartext_envelope: None,
 			max_encrypted_envelope: None,
-			signatory: None,
+			key_manager: None,
 			handshake_timeout: None,
 		}
 	}
@@ -677,7 +677,7 @@ where
 
 		{
 			if let Some(ref cert) = self.certificate {
-				transport.server_certificate = Some(Arc::clone(cert));
+				transport.server_certificates.push(Arc::clone(cert));
 			}
 			if let Some(ref validators) = self.client_validators {
 				transport.client_validators = Some(Arc::clone(validators));
@@ -696,8 +696,8 @@ where
 			}
 		}
 
-		if let Some(ref signatory) = self.signatory {
-			transport.signatory = Some(Arc::clone(signatory));
+		if let Some(ref signatory) = self.key_manager {
+			transport.key_manager = Some(Arc::clone(signatory));
 		}
 		Ok(transport)
 	}
@@ -723,7 +723,7 @@ impl EncryptedProtocol for TcpListener<std::net::TcpListener> {
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 
-				signatory: Some(Arc::clone(&config.signatory)),
+				key_manager: Some(Arc::clone(&config.key_manager)),
 				handshake_timeout: Some(config.handshake_timeout),
 			},
 			TightBeamSocketAddr(bound_addr),

@@ -5,13 +5,19 @@ macro_rules! client {
 	(connect $protocol:path: $addr:expr, identity: ($cert:expr, $key:expr)) => {{
 		#[cfg(feature = "std")]
 		{
-			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
-			let __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream)
-				.with_client_identity($cert, $key);
 			#[cfg(feature = "builder")]
-			{ $crate::macros::client::builder::GenericClient::<$protocol>::from_transport(__transport) }
+			{
+				$crate::macros::client::builder::ClientBuilder::<$protocol>::connect($addr)
+					.await?
+					.with_client_identity($cert, $key)
+					.build()?
+			}
 			#[cfg(not(feature = "builder"))]
-			{ __transport }
+			{
+				let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
+				<$protocol as $crate::transport::Protocol>::create_transport(stream)
+					.with_client_identity($cert, $key)
+			}
 		}
 	}};
 
@@ -19,14 +25,20 @@ macro_rules! client {
 	(connect $protocol:path: $addr:expr, identity: ($cert:expr, $key:expr), policies: { $($tt:tt)* }) => {{
 		#[cfg(feature = "std")]
 		{
-			let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
-			let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream)
-				.with_client_identity($cert, $key);
-			__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
 			#[cfg(feature = "builder")]
-			{ $crate::macros::client::builder::GenericClient::<$protocol>::from_transport(__transport) }
+			{
+				let __builder = $crate::macros::client::builder::ClientBuilder::<$protocol>::connect($addr).await?;
+				let __builder = $crate::client!(@apply_policies_to_builder __builder, { $($tt)* });
+				__builder.with_client_identity($cert, $key).build()?
+			}
 			#[cfg(not(feature = "builder"))]
-			{ __transport }
+			{
+				let stream = <$protocol as $crate::transport::Protocol>::connect($addr).await?;
+				let mut __transport = <$protocol as $crate::transport::Protocol>::create_transport(stream)
+					.with_client_identity($cert, $key);
+				__transport = $crate::client!(@apply_policies __transport, { $($tt)* });
+				__transport
+			}
 		}
 	}};
 
@@ -135,6 +147,16 @@ macro_rules! client {
 		__t
 	}};
 
+	// Policy application helper for ClientBuilder - processes policies for builder pattern
+	(@apply_policies_to_builder $builder:expr, { $($tt:tt)* }) => {{
+		#[cfg(feature = "builder")]
+		{
+			let mut __b = $builder;
+			$crate::client!(@process_policy_builder __b, $($tt)*);
+			__b
+		}
+	}};
+
 	// Process individual policies recursively
 	(@process_policy $transport:expr, restart_policy: $value:expr, $($rest:tt)*) => {
 		$transport = $transport.with_restart($value);
@@ -241,6 +263,72 @@ macro_rules! client {
 	// Base case: no more policies
 	(@process_policy $transport:expr,) => {};
 	(@process_policy $transport:expr) => {};
+
+	// Process policies for ClientBuilder - similar to process_policy but works with builder methods
+	(@process_policy_builder $builder:expr, restart_policy: $value:expr, $($rest:tt)*) => {
+		$builder = $builder.with_restart($value);
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, restart: $value:expr, $($rest:tt)*) => {
+		$builder = $builder.with_restart($value);
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, emitter_gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+		$(
+			$builder = $builder.with_emitter_gate($value);
+		)*
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, emitter_gate: $value:expr, $($rest:tt)*) => {
+		$builder = $builder.with_emitter_gate($value);
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+		$(
+			$builder = $builder.with_emitter_gate($value);
+		)*
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, gate: $value:expr, $($rest:tt)*) => {
+		$builder = $builder.with_emitter_gate($value);
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, collector_gate: [ $( $value:expr ),* $(,)? ], $($rest:tt)*) => {
+		$(
+			$builder = $builder.with_collector_gate($value);
+		)*
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, collector_gate: $value:expr, $($rest:tt)*) => {
+		$builder = $builder.with_collector_gate($value);
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, timeout: $value:expr, $($rest:tt)*) => {
+		#[cfg(feature = "std")]
+		{
+			$builder = $builder.with_timeout($value);
+		}
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, x509_gate: [ $( $validator:expr ),* $(,)? ], $($rest:tt)*) => {
+		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+		{
+			$(
+				$builder = $builder.with_x509_gate($validator);
+			)*
+		}
+		$crate::client!(@process_policy_builder $builder, $($rest)*);
+	};
+	(@process_policy_builder $builder:expr, x509_gate: [ $( $validator:expr ),* $(,)? ] $(,)?) => {
+		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+		{
+			$(
+				$builder = $builder.with_x509_gate($validator);
+			)*
+		}
+	};
+	(@process_policy_builder $builder:expr,) => {};
+	(@process_policy_builder $builder:expr) => {};
 }
 
 // Programmatic client policy system (non-macro) enabling external implementors to apply
@@ -260,6 +348,8 @@ pub mod builder {
 	use crate::transport::error::TransportError;
 	#[cfg(feature = "transport-policy")]
 	use crate::transport::policy::PolicyConf;
+	#[cfg(feature = "x509")]
+	use crate::transport::X509ClientConfig;
 	use crate::transport::{MessageCollector, MessageEmitter, Protocol, TransportResult};
 
 	#[derive(Default)]
@@ -374,6 +464,12 @@ pub mod builder {
 		addr: Option<P::Address>,
 		stream: Option<P::Stream>,
 		policies: ClientPolicies,
+		#[cfg(feature = "x509")]
+		server_certificates: Vec<crate::x509::Certificate>,
+		#[cfg(feature = "x509")]
+		client_certificate: Option<crate::x509::Certificate>,
+		#[cfg(feature = "x509")]
+		client_key: Option<crate::transport::handshake::HandshakeKeyManager>,
 		_ph: core::marker::PhantomData<P>,
 	}
 
@@ -383,6 +479,12 @@ pub mod builder {
 				addr: None,
 				stream: Some(stream),
 				policies: ClientPolicies::new(),
+				#[cfg(feature = "x509")]
+				server_certificates: Vec::new(),
+				#[cfg(feature = "x509")]
+				client_certificate: None,
+				#[cfg(feature = "x509")]
+				client_key: None,
 				_ph: core::marker::PhantomData,
 			}
 		}
@@ -393,6 +495,12 @@ pub mod builder {
 				addr: Some(addr),
 				stream: Some(stream),
 				policies: ClientPolicies::new(),
+				#[cfg(feature = "x509")]
+				server_certificates: Vec::new(),
+				#[cfg(feature = "x509")]
+				client_certificate: None,
+				#[cfg(feature = "x509")]
+				client_key: None,
 				_ph: core::marker::PhantomData,
 			})
 		}
@@ -434,12 +542,54 @@ pub mod builder {
 			self.policies = self.policies.with_timeout(timeout);
 			self
 		}
+		#[cfg(feature = "x509")]
+		pub fn with_server_certificate(mut self, cert: crate::x509::Certificate) -> Self {
+			self.server_certificates.push(cert);
+			self
+		}
+		#[cfg(feature = "x509")]
+		pub fn with_server_certificates(mut self, certs: impl IntoIterator<Item = crate::x509::Certificate>) -> Self {
+			self.server_certificates.extend(certs);
+			self
+		}
+		#[cfg(feature = "x509")]
+		pub fn with_client_identity(
+			mut self,
+			cert: crate::x509::Certificate,
+			key: crate::transport::handshake::HandshakeKeyManager,
+		) -> Self {
+			self.client_certificate = Some(cert);
+			self.client_key = Some(key);
+			self
+		}
+		/// Build the client. For x509 configuration, call with_server_certificate()
+		/// and with_client_identity() before calling build().
+		#[cfg(not(feature = "x509"))]
 		pub fn build(self) -> Result<GenericClient<P>, TransportError>
 		where
 			P::Transport: MessageEmitter + MessageCollector + PolicyConf,
 		{
 			let stream = self.stream.ok_or(TransportError::ConnectionFailed)?;
 			let transport = <P as Protocol>::create_transport(stream);
+			let configured = self.policies.apply::<P>(transport);
+			Ok(GenericClient::from_transport(configured))
+		}
+
+		#[cfg(feature = "x509")]
+		pub fn build(self) -> Result<GenericClient<P>, TransportError>
+		where
+			P::Transport: MessageEmitter + MessageCollector + PolicyConf + crate::transport::X509ClientConfig,
+		{
+			let stream = self.stream.ok_or(TransportError::ConnectionFailed)?;
+			let mut transport = <P as Protocol>::create_transport(stream);
+
+			if !self.server_certificates.is_empty() {
+				transport = transport.with_server_certificates(self.server_certificates);
+			}
+			if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
+				transport = transport.with_client_identity(cert, key);
+			}
+
 			let configured = self.policies.apply::<P>(transport);
 			Ok(GenericClient::from_transport(configured))
 		}
@@ -469,9 +619,22 @@ pub mod builder {
 	}
 
 	// Conversions
+	#[cfg(not(feature = "x509"))]
 	impl<P: Protocol> TryFrom<ClientBuilder<P>> for GenericClient<P>
 	where
 		P::Transport: MessageEmitter + MessageCollector + PolicyConf,
+	{
+		type Error = TransportError;
+
+		fn try_from(builder: ClientBuilder<P>) -> Result<Self, Self::Error> {
+			builder.build()
+		}
+	}
+
+	#[cfg(feature = "x509")]
+	impl<P: Protocol> TryFrom<ClientBuilder<P>> for GenericClient<P>
+	where
+		P::Transport: MessageEmitter + MessageCollector + PolicyConf + crate::transport::X509ClientConfig,
 	{
 		type Error = TransportError;
 
