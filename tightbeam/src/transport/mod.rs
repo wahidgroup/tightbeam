@@ -610,7 +610,6 @@ pub trait MessageEmitter: MessageIO {
 			// When x509 is enabled, wrap in WireEnvelope for protocol compatibility
 			#[cfg(feature = "x509")]
 			{
-				// Clone is cheap here - Arc<Frame> inside envelope makes this efficient
 				let wire_envelope = WireEnvelope::Cleartext(envelope.clone());
 				let der_bytes = wire_envelope.to_der()?;
 				self.write_envelope(&der_bytes).await?;

@@ -933,7 +933,7 @@ macro_rules! servlet {
 				   |$message:ident, $trace:ident| $handler_body:expr) => {
 		impl $worker_name {
 			pub async fn start(assertions: $crate::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
-				servlet!(@setup_protocol $protocol, listener, addr);
+				servlet!(@setup_protocol_maybe_x509 $protocol, listener, addr, [$($x509_key: $x509_val),*]);
 				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::sync::Arc::new(assertions)));
 				let (server_handle, server_pool_handles) = servlet!(@build_server_with_assertions
 					$protocol, listener, [$($policy_key: $policy_val),*], ::std::sync::Arc::clone(&trace_handle),
@@ -952,7 +952,7 @@ macro_rules! servlet {
 				   |$message:ident, $trace:ident| $handler_body:expr, $assertions:expr) => {
 		impl $worker_name {
 			pub async fn start(assertions: $crate::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
-				servlet!(@setup_protocol $protocol, listener, addr);
+				servlet!(@setup_protocol_maybe_x509 $protocol, listener, addr, [$($x509_key: $x509_val),*]);
 				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::sync::Arc::new(assertions)));
 				let (server_handle, server_pool_handles) = servlet!(@build_server_with_assertions
 					$protocol, listener, [$($policy_key: $policy_val),*], ::std::sync::Arc::clone(&trace_handle),
@@ -971,7 +971,7 @@ macro_rules! servlet {
 				   |$message:ident, $trace_param:ident| $handler_body:expr) => {
 		impl $worker_name {
 			pub async fn start(trace: $crate::trace::TraceCollector) -> Result<Self, $crate::TightBeamError> {
-				servlet!(@setup_protocol $protocol, listener, addr);
+				servlet!(@setup_protocol_maybe_x509 $protocol, listener, addr, [$($x509_key: $x509_val),*]);
 				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::sync::Arc::new(trace)));
 				let (server_handle, server_pool_handles) = servlet!(@build_server
 					$protocol, listener, [$($policy_key: $policy_val),*], ::std::sync::Arc::clone(&trace_handle),
@@ -1351,6 +1351,15 @@ macro_rules! servlet {
 	};
 
 	// Protocol setup - updated to handle protocol paths
+	// Helper to conditionally setup protocol with or without x509
+	(@setup_protocol_maybe_x509 $protocol:path, $listener:ident, $addr:ident, []) => {
+		servlet!(@setup_protocol $protocol, $listener, $addr);
+	};
+
+	(@setup_protocol_maybe_x509 $protocol:path, $listener:ident, $addr:ident, [$($x509_key:ident: $x509_val:tt),+]) => {
+		servlet!(@setup_protocol $protocol, $listener, $addr, with_x509: { $($x509_key: $x509_val),+ });
+	};
+
 	(@setup_protocol $protocol:path, $listener:ident, $addr:ident) => {
 		let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()
 			.map_err(|e| $crate::TightBeamError::from(e))?;

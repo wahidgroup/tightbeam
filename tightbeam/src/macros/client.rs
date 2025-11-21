@@ -9,7 +9,7 @@ macro_rules! client {
 			{
 				$crate::macros::client::builder::ClientBuilder::<$protocol>::connect($addr)
 					.await?
-					.with_client_identity($cert, $key)
+					.with_client_identity($cert, $key)?
 					.build()?
 			}
 			#[cfg(not(feature = "builder"))]
@@ -29,7 +29,7 @@ macro_rules! client {
 			{
 				let __builder = $crate::macros::client::builder::ClientBuilder::<$protocol>::connect($addr).await?;
 				let __builder = $crate::client!(@apply_policies_to_builder __builder, { $($tt)* });
-				__builder.with_client_identity($cert, $key).build()?
+				__builder.with_client_identity($cert, $key)?.build()?
 			}
 			#[cfg(not(feature = "builder"))]
 			{
@@ -397,9 +397,6 @@ pub mod builder {
 	}
 
 	impl ClientPolicies {
-		pub fn new() -> Self {
-			Self::default()
-		}
 		pub fn with_restart<P>(mut self, policy: P) -> Self
 		where
 			P: crate::transport::policy::RestartPolicy + Send + Sync + 'static,
@@ -407,6 +404,7 @@ pub mod builder {
 			self.restart = Some(DynRestart(Box::new(policy)));
 			self
 		}
+
 		pub fn with_emitter_gate<G>(mut self, gate: G) -> Self
 		where
 			G: crate::policy::GatePolicy + Send + Sync + 'static,
@@ -414,6 +412,7 @@ pub mod builder {
 			self.emitter_gates.push(DynGate(std::sync::Arc::new(gate)));
 			self
 		}
+
 		pub fn with_collector_gate<G>(mut self, gate: G) -> Self
 		where
 			G: crate::policy::GatePolicy + Send + Sync + 'static,
@@ -421,6 +420,7 @@ pub mod builder {
 			self.collector_gates.push(DynGate(std::sync::Arc::new(gate)));
 			self
 		}
+
 		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
 		pub fn with_x509_gate<V>(mut self, v: V) -> Self
 		where
@@ -429,11 +429,13 @@ pub mod builder {
 			self.validators.push(DynCertValidator(std::sync::Arc::new(v)));
 			self
 		}
+
 		#[cfg(feature = "std")]
 		pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
 			self.timeout = Some(timeout);
 			self
 		}
+
 		pub fn apply<P>(self, mut transport: P::Transport) -> P::Transport
 		where
 			P: Protocol,
@@ -478,7 +480,7 @@ pub mod builder {
 			Self {
 				addr: None,
 				stream: Some(stream),
-				policies: ClientPolicies::new(),
+				policies: ClientPolicies::default(),
 				#[cfg(feature = "x509")]
 				server_certificates: Vec::new(),
 				#[cfg(feature = "x509")]
@@ -488,13 +490,14 @@ pub mod builder {
 				_ph: core::marker::PhantomData,
 			}
 		}
+
 		pub async fn connect(addr: P::Address) -> Result<Self, TransportError> {
 			// Cannt avoid clone here because of the async trait bound
 			let stream = <P as Protocol>::connect(addr.clone()).await.map_err(|e| e.into())?;
 			Ok(Self {
 				addr: Some(addr),
 				stream: Some(stream),
-				policies: ClientPolicies::new(),
+				policies: ClientPolicies::default(),
 				#[cfg(feature = "x509")]
 				server_certificates: Vec::new(),
 				#[cfg(feature = "x509")]
@@ -504,10 +507,12 @@ pub mod builder {
 				_ph: core::marker::PhantomData,
 			})
 		}
+
 		pub fn policies(mut self, policies: ClientPolicies) -> Self {
 			self.policies = policies;
 			self
 		}
+
 		pub fn with_restart<R>(mut self, p: R) -> Self
 		where
 			R: crate::transport::policy::RestartPolicy + Send + Sync + 'static,
@@ -515,6 +520,7 @@ pub mod builder {
 			self.policies = self.policies.with_restart(p);
 			self
 		}
+
 		pub fn with_emitter_gate<G>(mut self, g: G) -> Self
 		where
 			G: crate::policy::GatePolicy + Send + Sync + 'static,
@@ -522,6 +528,7 @@ pub mod builder {
 			self.policies = self.policies.with_emitter_gate(g);
 			self
 		}
+
 		pub fn with_collector_gate<G>(mut self, g: G) -> Self
 		where
 			G: crate::policy::GatePolicy + Send + Sync + 'static,
@@ -529,6 +536,7 @@ pub mod builder {
 			self.policies = self.policies.with_collector_gate(g);
 			self
 		}
+
 		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
 		pub fn with_x509_gate<V>(mut self, v: V) -> Self
 		where
@@ -542,26 +550,37 @@ pub mod builder {
 			self.policies = self.policies.with_timeout(timeout);
 			self
 		}
+
 		#[cfg(feature = "x509")]
-		pub fn with_server_certificate(mut self, cert: crate::x509::Certificate) -> Self {
+		pub fn with_server_certificate(
+			mut self,
+			cert: crate::crypto::x509::CertificateSpec,
+		) -> Result<Self, TransportError> {
+			let cert = crate::x509::Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
 			self.server_certificates.push(cert);
-			self
+			Ok(self)
 		}
+
 		#[cfg(feature = "x509")]
 		pub fn with_server_certificates(mut self, certs: impl IntoIterator<Item = crate::x509::Certificate>) -> Self {
 			self.server_certificates.extend(certs);
 			self
 		}
+
 		#[cfg(feature = "x509")]
 		pub fn with_client_identity(
 			mut self,
-			cert: crate::x509::Certificate,
-			key: crate::transport::handshake::HandshakeKeyManager,
-		) -> Self {
+			cert: crate::crypto::x509::CertificateSpec,
+			key: crate::crypto::key::KeySpec,
+		) -> Result<Self, TransportError> {
+			let cert = crate::x509::Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
+			let key_manager = crate::transport::handshake::HandshakeKeyManager::try_from(key)
+				.map_err(|_| TransportError::ConnectionFailed)?;
 			self.client_certificate = Some(cert);
-			self.client_key = Some(key);
-			self
+			self.client_key = Some(key_manager);
+			Ok(self)
 		}
+
 		/// Build the client. For x509 configuration, call with_server_certificate()
 		/// and with_client_identity() before calling build().
 		#[cfg(not(feature = "x509"))]
@@ -603,12 +622,15 @@ pub mod builder {
 		pub fn from_transport(transport: P::Transport) -> Self {
 			Self { transport, _ph: core::marker::PhantomData }
 		}
+
 		pub fn transport(&self) -> &P::Transport {
 			&self.transport
 		}
+
 		pub fn into_transport(self) -> P::Transport {
 			self.transport
 		}
+
 		#[allow(async_fn_in_trait)]
 		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>>
 		where

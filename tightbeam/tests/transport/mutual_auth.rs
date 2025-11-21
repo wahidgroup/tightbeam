@@ -35,13 +35,13 @@ const SERVER_CERT: CertificateSpec = CertificateSpec::Pem(
 	r#"
     -----BEGIN CERTIFICATE-----
     MIIBajCCAQ+gAwIBAgIBATALBglghkgBZQMEAwowHTEbMBkGA1UEAwwSU3RhdGlj
-    IFRlc3QgU2VydmVyMB4XDTI1MTEyMTIwMDk0MloXDTM1MTExOTIwMDk0MlowHTEb
+    IFRlc3QgU2VydmVyMB4XDTI1MTEyMTIyMDkxMVoXDTM1MTExOTIyMDkxMVowHTEb
     MBkGA1UEAwwSU3RhdGljIFRlc3QgU2VydmVyMFYwEAYHKoZIzj0CAQYFK4EEAAoD
     QgAEG4TFVnsSZECZXT7VqroFZdceGDRgSBn/nBf16dXdB49wvq+PWItUFQf+1qZC
     xatC39+BIKf2Od5RItR6aajo0aNCMEAwHQYDVR0OBBYEFEOubLl6za81S4KG3bKb
     SSyV6VhwMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAsGCWCGSAFl
-    AwQDCgNIADBFAiEAmYxdAPoWH4W7SRiJA8ZT/Nr05BS8FX7+MLqpN4vL5v4CIChY
-    qCueHq1ts/ay2nKHXZp/lNFxqO0katvNQxyY8IRT
+    AwQDCgNIADBFAiEA2aChCQdJ1LI46IWMds2yNoOG8Pq4nYqbEgETdIR+vnQCID7U
+    88OyM9q8+mrRAHYOyG7zYxKaxeWQTpwQVoVgCjs+
     -----END CERTIFICATE-----
 "#,
 );
@@ -49,23 +49,23 @@ const SERVER_CERT: CertificateSpec = CertificateSpec::Pem(
 const CLIENT_CERT: CertificateSpec = CertificateSpec::Pem(
 	r#"
     -----BEGIN CERTIFICATE-----
-    MIIBaTCCAQ+gAwIBAgIBATALBglghkgBZQMEAwowHTEbMBkGA1UEAwwSU3RhdGlj
-    IFRlc3QgQ2xpZW50MB4XDTI1MTEyMTIwMDk0MloXDTM1MTExOTIwMDk0MlowHTEb
+    MIIBajCCAQ+gAwIBAgIBATALBglghkgBZQMEAwowHTEbMBkGA1UEAwwSU3RhdGlj
+    IFRlc3QgQ2xpZW50MB4XDTI1MTEyMTIyMDkxMVoXDTM1MTExOTIyMDkxMVowHTEb
     MBkGA1UEAwwSU3RhdGljIFRlc3QgQ2xpZW50MFYwEAYHKoZIzj0CAQYFK4EEAAoD
-    QgAEG4TFVnsSZECZXT7VqroFZdceGDRgSBn/nBf16dXdB49wvq+PWItUFQf+1qZC
-    xatC39+BIKf2Od5RItR6aajo0aNCMEAwHQYDVR0OBBYEFEOubLl6za81S4KG3bKb
-    SSyV6VhwMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAsGCWCGSAFl
-    AwQDCgNHADBEAiAPIoi/ZYamjnSS/+YkeIG53hEzWpL+UBf04jyWnpCG5wIgQrGE
-    pC7NuhifPZO2kSFiLIAIrpc+UnsvwGrI7gMNjW8=
+    QgAETUts0TYQMsqb0q652QCqTUXZ6tgKyUIzdMRRpyVNB2YqPq2i0P4gi20lfOsP
+    BkKEZi6Ff1e2a1TBmL0xDe020KNCMEAwHQYDVR0OBBYEFKPczeMV5zGTz6VPSCJD
+    QZFgb0XEMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAsGCWCGSAFl
+    AwQDCgNIADBFAiEA0HI5WVq8ch27rQx7SO+hGwsQGLGHHvc34pfa7MQ3R4kCICJP
+    7O7AR01io0/m4Hez90niWi1m+zeJS00hvuznD/Hp
     -----END CERTIFICATE-----
 "#,
 );
 
 const SERVER_KEY: KeySpec = KeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
-const CLIENT_KEY: KeySpec = KeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
+const CLIENT_KEY: KeySpec = KeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
 
 // Client public key for pinning validation (zero-copy, const-constructible)
-const CLIENT_PUB_KEY: &[u8] = &hex!("041b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1");
+const CLIENT_PUB_KEY: &[u8] = &hex!("044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0");
 const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KEY]);
 
 // ============================================================================
@@ -132,22 +132,15 @@ tb_scenario! {
 	environment Servlet {
 		servlet: MutualAuthServlet,
 		start: |trace| async move {
-			use core::convert::TryFrom;
-
 			// Create servlet with x509 mutual auth
 			let servlet = MutualAuthServlet::start(trace).await?;
 			let server_addr = servlet.addr();
 
-			// Convert specs to concrete types for client
-			let server_cert = tightbeam::crypto::x509::Certificate::try_from(SERVER_CERT)?;
-			let client_cert = tightbeam::crypto::x509::Certificate::try_from(CLIENT_CERT)?;
-			let client_key = tightbeam::transport::handshake::HandshakeKeyManager::try_from(CLIENT_KEY)?;
-
-			// Create client with mutual authentication
+			// Create client with mutual authentication using specs
 			let client = ClientBuilder::<tightbeam::transport::tcp::r#async::TokioListener>::connect(server_addr)
 				.await?
-				.with_server_certificate(server_cert)
-				.with_client_identity(client_cert, client_key)
+				.with_server_certificate(SERVER_CERT)?
+				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 				.build()?;
 
 			Ok((servlet, client))
@@ -163,7 +156,7 @@ tb_scenario! {
 				message: request
 			}?;
 
-			let response_frame = client.emit(request_frame, None).await?;
+			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
 
 			// Validate response
 			assert!(response_frame.is_some(), "Expected response from server");

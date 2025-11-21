@@ -17,9 +17,13 @@ use std::sync::Arc;
 
 use tightbeam::{
 	client, compose,
-	crypto::x509::{
-		error::CertificateValidationError,
-		policy::{CertificateValidation, ExpiryValidator},
+	crypto::{
+		key::{InMemoryKeyProvider, KeySpec},
+		x509::{
+			error::CertificateValidationError,
+			policy::{CertificateValidation, ExpiryValidator},
+			CertificateSpec,
+		},
 	},
 	decode,
 	error::Result,
@@ -55,18 +59,13 @@ struct PongMessage {
 struct ClientValidator;
 impl CertificateValidation for ClientValidator {
 	fn evaluate(&self, cert: &Certificate) -> core::result::Result<(), CertificateValidationError> {
-		println!("ClientValidator: Starting evaluation");
 		if let Some(cn) = extract_cn(cert) {
-			println!("ClientValidator: Extracted CN: '{cn}'");
 			if cn == "Test Client" {
-				println!("ClientValidator: ACCEPTED");
 				Ok(())
 			} else {
-				println!("ClientValidator: REJECTED - CN mismatch");
 				Err(CertificateValidationError::InvalidCertificateEncoding)
 			}
 		} else {
-			println!("ClientValidator: REJECTED - No CN found");
 			Err(CertificateValidationError::InvalidCertificateEncoding)
 		}
 	}
@@ -107,9 +106,14 @@ async fn test_mutual_auth_with_servlet() -> Result<()> {
 	)
 	.await?;
 
+	// Convert cert and key to specs
+	let client_cert_spec = CertificateSpec::Built(client_cert);
+	let provider = InMemoryKeyProvider::from(client_key);
+	let client_key_spec = KeySpec::Provider(Arc::new(provider));
+
 	let mut client = client! {
 		connect TokioListener: server.addr,
-		identity: (client_cert, client_key.into()),
+		identity: (client_cert_spec, client_key_spec),
 		policies: {
 			x509_gate: [ExpiryValidator, ServerValidator]
 		}
@@ -153,39 +157,33 @@ async fn test_unexpected_client_cert_rejected() -> Result<()> {
 
 	// Try to create client and connect - this should fail during handshake
 	let client_result: Result<()> = async {
-		println!("Attempting to create client with unexpected certificate...");
+		// Convert cert and key to specs
+		let client_cert_spec = CertificateSpec::Built(client_cert);
+		let provider = InMemoryKeyProvider::from(client_key);
+		let client_key_spec = KeySpec::Provider(Arc::new(provider));
+
 		let client = client! {
 			connect TokioListener: server.addr,
-			identity: (client_cert, client_key.into()),
+			identity: (client_cert_spec, client_key_spec),
 			policies: {
 				x509_gate: [ExpiryValidator]
 			}
 		};
 		let transport = client.into_transport().with_server_certificate(server_cert);
 		let mut client = GenericClient::<TokioListener>::from_transport(transport);
-		println!("Client created successfully (unexpected!)");
 
 		let ping = PingMessage { data: "test".to_string() };
 		let request = compose! { V0: id: b"test-1", message: ping }?;
 
-		println!("Attempting to emit message...");
-		let response = client.emit(request, None).await?;
-		println!("Message emitted successfully: {:?}", response.is_some());
+		client.emit(request, None).await?;
 
 		Ok(())
 	}
 	.await;
-	println!("Final result: {client_result:?}");
-	if let Err(e) = &client_result {
-		println!("Error details: {e:?}");
-	}
 
-	assert!(
-		client_result.is_err(),
-		"Should reject client certificate that doesn't contain 'Test Client', but got: {client_result:?}"
-	);
-
+	assert!(client_result.is_err(), "Should reject client certificate");
 	server.abort();
+
 	Ok(())
 }
 
@@ -196,9 +194,15 @@ async fn test_client_rejects_expired_server() -> Result<()> {
 	let (client_cert, client_key) = create_test_cert_with_key("CN=Test Client", 365)?;
 
 	let server = MutualAuthServer::new(server_cert, server_key, vec![]).await?;
+
+	// Convert cert and key to specs
+	let client_cert_spec = CertificateSpec::Built(client_cert);
+	let provider = InMemoryKeyProvider::from(client_key);
+	let client_key_spec = KeySpec::Provider(Arc::new(provider));
+
 	let mut client = client! {
 		connect TokioListener: server.addr,
-		identity: (client_cert, client_key.into()),
+		identity: (client_cert_spec, client_key_spec),
 		policies: {
 			x509_gate: [ExpiryValidator]
 		}

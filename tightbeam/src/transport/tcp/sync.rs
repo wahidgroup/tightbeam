@@ -763,7 +763,7 @@ mod tests {
 
 		let stream = TcpStream::connect(addr)?;
 		let mut client_transport = TcpTransport::from(stream);
-		let response = client_transport.emit(message.clone(), None).await?;
+		let response = client_transport.emit(message, None).await?;
 
 		server_handle.join().unwrap();
 

@@ -5,7 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use tightbeam::asn1::{DigestInfo, MessagePriority};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
-use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::{
+	hash::Sha3_256,
+	key::{InMemoryKeyProvider, KeySpec},
+	x509::CertificateSpec,
+};
 use tightbeam::der::ValueOrd;
 use tightbeam::macros::client::builder::ClientBuilder;
 use tightbeam::policy::{GatePolicy, TransitStatus};
@@ -344,9 +348,13 @@ tb_scenario! {
 			let servlet = QueueServlet::start(trace).await?;
 			let server_addr = servlet.addr();
 
+			// Convert signing key to KeySpec via InMemoryKeyProvider
+			let provider = InMemoryKeyProvider::from(client_key);
+			let key_spec = KeySpec::Provider(Arc::new(provider));
+
 			let restart_policy = RestartLinearBackoff::new(3, 50, 1, None);
 			let client = ClientBuilder::<TokioListener>::connect(server_addr).await?
-				.with_client_identity(client_cert, client_key.into())
+				.with_client_identity(CertificateSpec::Built(client_cert), key_spec)?
 				.with_restart(restart_policy)
 				.build()?;
 

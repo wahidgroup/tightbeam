@@ -84,12 +84,13 @@ macro_rules! routes {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::mpsc;
+	use std::sync::{mpsc, Arc};
 	use std::time::Duration;
 
 	use crate::der::Sequence;
 	use crate::router::RouterPolicy;
 	use crate::Beamable;
+	use crate::Frame;
 
 	#[cfg(not(feature = "derive"))]
 	use crate::router::RouterPolicy;
@@ -130,33 +131,33 @@ mod tests {
 		#[cfg(feature = "derive")]
 		routes! {
 			ChannelRouter {
-				payment_tx: mpsc::Sender<crate::Frame>,
-				health_tx: mpsc::Sender<crate::Frame>,
+				payment_tx: mpsc::Sender<Arc<Frame>>,
+				health_tx: mpsc::Sender<Arc<Frame>>,
 			}:
 				Payment |router, msg| {
-					let _ = router.payment_tx.send(msg.clone());
+					let _ = router.payment_tx.send(Arc::new(msg));
 				}
 				HealthCheck |router, msg| {
-					let _ = router.health_tx.send(msg.clone());
+					let _ = router.health_tx.send(Arc::new(msg));
 				}
 		}
 
 		#[cfg(not(feature = "derive"))]
 		struct ChannelRouter {
-			payment_tx: mpsc::Sender<crate::Frame>,
-			health_tx: mpsc::Sender<crate::Frame>,
+			payment_tx: mpsc::Sender<Arc<Frame>>,
+			health_tx: mpsc::Sender<Arc<Frame>>,
 		}
 
 		#[cfg(not(feature = "derive"))]
 		impl super::RouterPolicy for ChannelRouter {
-			fn dispatch<M: Message>(&self, message: crate::Frame) -> crate::router::Result<()> {
+			fn dispatch<M: Message>(&self, message: Arc<Frame>) -> crate::router::Result<()> {
 				if std::any::TypeId::of::<M>() == std::any::TypeId::of::<Payment>() {
-					let _ = self.payment_tx.send(message);
+					let _ = self.payment_tx.send(Arc::new(message));
 					return Ok(());
 				}
 
 				if std::any::TypeId::of::<M>() == std::any::TypeId::of::<HealthCheck>() {
-					let _ = self.health_tx.send(message);
+					let _ = self.health_tx.send(Arc::new(message));
 					return Ok(());
 				}
 
@@ -164,8 +165,8 @@ mod tests {
 			}
 		}
 
-		let (payment_tx, payment_rx) = mpsc::channel::<crate::Frame>();
-		let (health_tx, health_rx) = mpsc::channel::<crate::Frame>();
+		let (payment_tx, payment_rx) = mpsc::channel::<Arc<Frame>>();
+		let (health_tx, health_rx) = mpsc::channel::<Arc<Frame>>();
 		let router = ChannelRouter { payment_tx, health_tx };
 
 		let n = 5usize;
