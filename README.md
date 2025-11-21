@@ -2923,7 +2923,7 @@ tb_scenario! {
 			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 			let handle = server! {
 				protocol TokioListener: listener,
-				assertions: trace,
+				assertions: trace.share(),
 				handle: |frame, trace| async move {
 					trace.event("connect");
 					trace.event("request");

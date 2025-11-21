@@ -128,7 +128,7 @@ pub struct Asn1Matrix {
 ///     matrix           [5] Matrix OPTIONAL
 /// }
 /// ```
-#[derive(der::Sequence, Debug, Clone, PartialEq, Eq)]
+#[derive(der::Sequence, Default, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "zeroize", derive(zeroize::ZeroizeOnDrop))]
 pub struct Metadata {
 	// Core fields (V0+)

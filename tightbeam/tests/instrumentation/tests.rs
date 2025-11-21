@@ -46,7 +46,7 @@ tb_scenario! {
 			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 			let handle = server! {
 				protocol TokioListener: listener,
-				assertions: trace,
+				assertions: trace.share(),
 				handle: |frame, _trace| async move {
 					Ok(Some(frame))
 				}

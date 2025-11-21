@@ -46,7 +46,7 @@ rand_core = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
-# Macro helper
+# Macro helpers
 paste = { workspace = true }
 
 ## Compression dependencies

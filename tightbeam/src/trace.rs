@@ -210,11 +210,12 @@ impl<'a> Drop for EventBuilder<'a> {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct TraceCollector {
 	state: Arc<TraceState>,
 }
 
+#[derive(Debug)]
 struct TraceState {
 	assertions: Mutex<Vec<Assertion>>,
 	#[cfg(feature = "instrument")]
@@ -274,6 +275,11 @@ impl TraceCollector {
 	/// Create a new empty trace collector with default config
 	pub fn new() -> Self {
 		Self { state: Arc::new(TraceState::new()) }
+	}
+
+	/// Create an additional handle that observes and records the same state.
+	pub fn share(&self) -> Self {
+		Self { state: Arc::clone(&self.state) }
 	}
 
 	#[cfg(feature = "instrument")]
@@ -601,9 +607,8 @@ mod tests {
 		spec: TraceCollectorSpec,
 		environment Bare {
 			exec: |trace| {
-				let other = trace.clone();
 				trace.event("alpha");
-				other.event("beta");
+				trace.event("beta");
 				Ok(())
 			}
 		}

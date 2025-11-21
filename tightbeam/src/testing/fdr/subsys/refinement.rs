@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::testing::fdr::config::{Failure, FdrConfig, Trace};
 use crate::testing::fdr::explorer::{MemoizationCache, RefinementChecker};
-use crate::testing::specs::csp::{Event, Process, State};
+use crate::testing::specs::csp::{Action, Event, Process, State};
 
 /// Timeout checker helper
 struct TimeoutChecker {
@@ -243,6 +243,91 @@ where
 		tau_states_seen.contains(&next_key)
 	}
 
+	/// Process observable events matching the next event in target trace.
+	/// Returns false if timeout or resource limits exceeded.
+	#[allow(clippy::too_many_arguments)]
+	fn process_observable_events(
+		spec: &Process,
+		state: State,
+		next_event: &Event,
+		enabled_actions: &[Action],
+		queue: &mut VecDeque<(State, usize)>,
+		visited: &mut HashSet<(State, usize)>,
+		trace_idx: usize,
+		max_queue_size: usize,
+		max_visited: usize,
+		timeout_checker: &TimeoutChecker,
+	) -> bool {
+		for action in enabled_actions {
+			if timeout_checker.is_expired() {
+				return false;
+			}
+			if &action.event == next_event {
+				for next_state in spec.step(state, &action.event) {
+					if timeout_checker.is_expired() {
+						return false;
+					}
+					if queue.len() >= max_queue_size || visited.len() >= max_visited {
+						break;
+					}
+					queue.push_back((next_state, trace_idx + 1));
+				}
+			}
+		}
+		true
+	}
+
+	/// Process τ-transitions (hidden events) with exploration limits.
+	/// Returns false if timeout or resource limits exceeded.
+	#[allow(clippy::too_many_arguments)]
+	fn process_tau_transitions(
+		spec: &Process,
+		state: State,
+		enabled_actions: &[Action],
+		queue: &mut VecDeque<(State, usize)>,
+		visited: &mut HashSet<(State, usize)>,
+		trace_idx: usize,
+		max_queue_size: usize,
+		max_visited: usize,
+		timeout_checker: &TimeoutChecker,
+	) -> bool {
+		let mut tau_count = 0;
+		const MAX_TAU_PER_STATE: usize = 10; // Limit τ-transition exploration
+
+		for action in enabled_actions {
+			if timeout_checker.is_expired() {
+				return false;
+			}
+			if spec.hidden.contains(&action.event) {
+				if tau_count >= MAX_TAU_PER_STATE {
+					break; // Limit τ-transition exploration
+				}
+				tau_count += 1;
+				for next_state in spec.step(state, &action.event) {
+					if timeout_checker.is_expired() {
+						return false;
+					}
+					if queue.len() >= max_queue_size || visited.len() >= max_visited {
+						break;
+					}
+					queue.push_back((next_state, trace_idx));
+				}
+			}
+		}
+		true
+	}
+
+	/// Check if an implementation failure exists in the specification failures.
+	/// Returns true if a matching spec failure is found where impl_refusal ⊆ spec_refusal.
+	fn failure_exists_in_spec(spec_failures: &[Failure], impl_trace: &Trace, impl_refusal: &HashSet<Event>) -> bool {
+		for (spec_trace, spec_refusal) in spec_failures {
+			if spec_trace == impl_trace && impl_refusal.is_subset(spec_refusal) {
+				return true;
+			}
+		}
+		false
+	}
+
 	/// Check if a specific trace exists in a spec without computing all traces
 	fn trace_exists_in_spec(
 		spec: &Process,
@@ -283,45 +368,34 @@ where
 			// Process observable events first (matching the next event in target trace)
 			let next_event = &target_trace[trace_idx];
 			let enabled_actions = spec.enabled(state);
-			for action in &enabled_actions {
-				if timeout_checker.is_expired() {
-					return false;
-				}
-				if &action.event == next_event {
-					for next_state in spec.step(state, &action.event) {
-						if timeout_checker.is_expired() {
-							return false;
-						}
-						if queue.len() >= max_queue_size || visited.len() >= max_visited {
-							break;
-						}
-						queue.push_back((next_state, trace_idx + 1));
-					}
-				}
+			if !Self::process_observable_events(
+				spec,
+				state,
+				next_event,
+				&enabled_actions,
+				&mut queue,
+				&mut visited,
+				trace_idx,
+				max_queue_size,
+				max_visited,
+				&timeout_checker,
+			) {
+				return false;
 			}
 
 			// Explore τ-transitions (limit exploration to avoid state explosion)
-			let mut tau_count = 0;
-			const MAX_TAU_PER_STATE: usize = 10; // Limit τ-transition exploration
-			for action in &enabled_actions {
-				if timeout_checker.is_expired() {
-					return false;
-				}
-				if spec.hidden.contains(&action.event) {
-					if tau_count >= MAX_TAU_PER_STATE {
-						break; // Limit τ-transition exploration
-					}
-					tau_count += 1;
-					for next_state in spec.step(state, &action.event) {
-						if timeout_checker.is_expired() {
-							return false;
-						}
-						if queue.len() >= max_queue_size || visited.len() >= max_visited {
-							break;
-						}
-						queue.push_back((next_state, trace_idx));
-					}
-				}
+			if !Self::process_tau_transitions(
+				spec,
+				state,
+				&enabled_actions,
+				&mut queue,
+				&mut visited,
+				trace_idx,
+				max_queue_size,
+				max_visited,
+				&timeout_checker,
+			) {
+				return false;
 			}
 		}
 
@@ -367,15 +441,9 @@ where
 		// Reference: Roscoe (1998, 2010)
 		let spec_failures = self.compute_failures(spec, self.config.max_depth);
 		let impl_failures = self.compute_failures(impl_process, self.config.max_depth);
+
 		for (impl_trace, impl_refusal) in &impl_failures {
-			let mut found = false;
-			for (spec_trace, spec_refusal) in &spec_failures {
-				if spec_trace == impl_trace && impl_refusal.is_subset(spec_refusal) {
-					found = true;
-					break;
-				}
-			}
-			if !found {
+			if !<DefaultRefinementChecker<'a, M>>::failure_exists_in_spec(&spec_failures, impl_trace, impl_refusal) {
 				return (false, Some((impl_trace.clone(), impl_refusal.clone())));
 			}
 		}

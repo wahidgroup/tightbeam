@@ -107,85 +107,52 @@ macro_rules! impl_from {
 /// Macro to implement TryFrom trait for extracting optional fields
 ///
 /// This generates:
-/// - `impl TryFrom<&TightBeam> for TargetType` that extracts optional fields
-/// - `impl TryFrom<TightBeam> for TargetType` that delegates to the reference
-///   impl
+/// - `impl TryFrom<TightBeam> for TargetType` that consumes the source
+/// - Uses `take()` for zero-copy extraction when consuming the source
 #[macro_export]
 macro_rules! impl_try_from {
 	// For fields directly on TightBeam
 	($source:ty, $param:ident => $target:ty: $field:ident) => {
-		impl TryFrom<&$source> for $target {
-			type Error = $crate::error::TightBeamError;
-
-			fn try_from($param: &$source) -> Result<Self, Self::Error> {
-				$param.$field.clone().ok_or($crate::error::TightBeamError::InvalidMetadata)
-			}
-		}
-
 		impl TryFrom<$source> for $target {
 			type Error = $crate::error::TightBeamError;
 
-			fn try_from($param: $source) -> Result<Self, Self::Error> {
-				(&$param).try_into()
+			fn try_from(mut $param: $source) -> Result<Self, Self::Error> {
+				$param.$field.take().ok_or($crate::error::TightBeamError::InvalidMetadata)
 			}
 		}
 	};
 
 	($source:ty, $param:ident => $target:ty: $field:ident, $error:expr) => {
-		impl TryFrom<&$source> for $target {
-			type Error = $crate::error::TightBeamError;
-
-			fn try_from($param: &$source) -> core::result::Result<Self, Self::Error> {
-				$param.$field.clone().ok_or($error)
-			}
-		}
-
 		impl TryFrom<$source> for $target {
 			type Error = $crate::error::TightBeamError;
 
-			fn try_from($param: $source) -> core::result::Result<Self, Self::Error> {
-				(&$param).try_into()
+			fn try_from(mut $param: $source) -> core::result::Result<Self, Self::Error> {
+				$param.$field.take().ok_or($error)
 			}
 		}
 	};
 
 	// For fields in metadata
 	($source:ty, $param:ident => $target:ty: metadata.$field:ident) => {
-		impl TryFrom<&$source> for $target {
-			type Error = $crate::error::TightBeamError;
-
-			fn try_from($param: &$source) -> Result<Self, Self::Error> {
-				$param
-					.metadata
-					.$field
-					.clone()
-					.ok_or($crate::error::TightBeamError::InvalidMetadata)
-			}
-		}
-
 		impl TryFrom<$source> for $target {
 			type Error = $crate::error::TightBeamError;
 
-			fn try_from($param: $source) -> Result<Self, Self::Error> {
-				(&$param).try_into()
+			fn try_from(mut $param: $source) -> Result<Self, Self::Error> {
+				$param
+					.metadata
+					.$field
+					.take()
+					.ok_or($crate::error::TightBeamError::InvalidMetadata)
 			}
 		}
 	};
 
 	($source:ty, $param:ident => $target:ty: metadata.$field:ident, $error:expr) => {
-		impl TryFrom<&$source> for $target {
-			type Error = $crate::error::TightBeamError;
-
-			fn try_from($param: &$source) -> core::result::Result<Self, Self::Error> {
-				$param.metadata.$field.clone().ok_or($error)
-			}
-		}
-
 		impl TryFrom<$source> for $target {
 			type Error = $crate::error::TightBeamError;
 
-			fn try_from($param: $source) -> core::result::Result<Self, Self::Error> {
-				(&$param).try_into()
+			fn try_from(mut $param: $source) -> core::result::Result<Self, Self::Error> {
+				$param.metadata.$field.take().ok_or($error)
 			}
 		}
 	};

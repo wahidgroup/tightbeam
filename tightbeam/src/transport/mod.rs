@@ -901,7 +901,7 @@ mod tests {
 		let server_handle = crate::server! {
 			protocol TokioListener: listener,
 			handle: move |message: Frame| {
-				let tx = tx.clone();
+				let tx = Arc::clone(&tx);
 				async move {
 					// Quantum tunnel testing channel -- TUNNEL
 					let _ = tx.send(message);

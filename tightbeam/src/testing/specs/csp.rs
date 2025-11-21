@@ -1037,7 +1037,7 @@ mod tests {
 
 				let handle = crate::server! {
 					protocol TokioListener: listener,
-					assertions: trace,
+					assertions: trace.share(),
 					handle: |frame, trace| async move {
 						// Server-side assertions
 						trace.event("Received");

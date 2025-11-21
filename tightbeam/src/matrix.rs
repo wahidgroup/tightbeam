@@ -249,16 +249,17 @@ impl TryFrom<u8> for MatrixDyn {
 impl TryFrom<MatrixDyn> for Asn1Matrix {
 	type Error = crate::matrix::MatrixError;
 
-	fn try_from(matrix: MatrixDyn) -> Result<Self, Self::Error> {
+	fn try_from(mut matrix: MatrixDyn) -> Result<Self, Self::Error> {
 		let n = matrix.n();
 		validate_n!(n);
 
-		let mut data = Vec::with_capacity((n as usize) * (n as usize));
-		for r in 0..n {
-			for c in 0..n {
-				data.push(matrix.get(r, c));
-			}
+		// MatrixDyn stores row-major n*n bytes, same as Asn1Matrix
+		let expected_len = (n as usize) * (n as usize);
+		if matrix.data.len() != expected_len {
+			return Err(crate::matrix::MatrixError::LengthMismatch { n, len: matrix.data.len() });
 		}
+
+		let data = std::mem::take(&mut matrix.data);
 		Ok(Self { n, data })
 	}
 }

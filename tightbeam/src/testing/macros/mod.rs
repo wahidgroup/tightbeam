@@ -66,49 +66,54 @@ macro_rules! ratio {
 #[cfg(feature = "testing-timing")]
 #[macro_export]
 macro_rules! wcet {
-	// Simple case: wcet!(10ms) - backward compatible
+	// Unified builder helper - handles all combinations
+	(@builder $dur:expr) => {{
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.build()
+			.expect("Failed to build WcetConfig")
+	}};
+	(@builder $dur:expr, percentile: $p:expr) => {{
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.with_percentile($p)
+			.build()
+			.expect("Failed to build WcetConfig")
+	}};
+	(@builder $dur:expr, analyzer: $a:expr) => {{
+		use std::sync::Arc;
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.with_analyzer(Arc::new($a))
+			.build()
+			.expect("Failed to build WcetConfig")
+	}};
+	(@builder $dur:expr, percentile: $p:expr, analyzer: $a:expr) => {{
+		use std::sync::Arc;
+		$crate::testing::timing::WcetConfigBuilder::default()
+			.with_duration($dur)
+			.with_percentile($p)
+			.with_analyzer(Arc::new($a))
+			.build()
+			.expect("Failed to build WcetConfig")
+	}};
+
+	// Public API - normalize parameter order and delegate to builder
 	($dur:expr) => {
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.build()
-			.expect("Failed to build WcetConfig")
+		$crate::wcet!(@builder $dur)
 	};
-	// With percentile: wcet!(10ms, percentile: P99)
 	($dur:expr, percentile: $p:expr) => {
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.with_percentile($p)
-			.build()
-			.expect("Failed to build WcetConfig")
+		$crate::wcet!(@builder $dur, percentile: $p)
 	};
-	// With analyzer: wcet!(10ms, analyzer: my_analyzer)
-	($dur:expr, analyzer: $a:expr) => {{
-		use std::sync::Arc;
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.with_analyzer(Arc::new($a))
-			.build()
-			.expect("Failed to build WcetConfig")
-	}};
-	// With both (order-independent): wcet!(10ms, percentile: P99, analyzer: my_analyzer)
-	($dur:expr, percentile: $p:expr, analyzer: $a:expr) => {{
-		use std::sync::Arc;
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.with_percentile($p)
-			.with_analyzer(Arc::new($a))
-			.build()
-			.expect("Failed to build WcetConfig")
-	}};
-	($dur:expr, analyzer: $a:expr, percentile: $p:expr) => {{
-		use std::sync::Arc;
-		$crate::testing::timing::WcetConfigBuilder::default()
-			.with_duration($dur)
-			.with_analyzer(Arc::new($a))
-			.with_percentile($p)
-			.build()
-			.expect("Failed to build WcetConfig")
-	}};
+	($dur:expr, analyzer: $a:expr) => {
+		$crate::wcet!(@builder $dur, analyzer: $a)
+	};
+	($dur:expr, percentile: $p:expr, analyzer: $a:expr) => {
+		$crate::wcet!(@builder $dur, percentile: $p, analyzer: $a)
+	};
+	($dur:expr, analyzer: $a:expr, percentile: $p:expr) => {
+		$crate::wcet!(@builder $dur, percentile: $p, analyzer: $a)
+	};
 }
 
 /// Helper struct for deadline parameters (used internally by deadline! macro)
@@ -258,8 +263,8 @@ macro_rules! tb_scenario {
 
 			// Create shared trace collector and clone upfront
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_server = trace_collector.clone();
-			let trace_client = trace_collector.clone();
+			let trace_server = trace_collector.share();
+			let trace_client = trace_collector.share();
 
 			// Helper function for server closure to enable type inference
 			async fn __call_server_closure<F, Fut>(
@@ -370,7 +375,7 @@ macro_rules! tb_scenario {
 			let trace_collector = $crate::trace::TraceCollector::new();
 
 			// Environment-specific execution
-			let trace_exec = trace_collector.clone();
+			let trace_exec = trace_collector.share();
 			fn __call_exec_closure<F>(
 				closure: F,
 				trace: $crate::trace::TraceCollector,
@@ -434,7 +439,7 @@ macro_rules! tb_scenario {
 				);
 
 				// Environment-specific execution
-				let trace_exec = trace_collector.clone();
+				let trace_exec = trace_collector.share();
 				fn __call_exec_closure<F>(
 					closure: F,
 					trace: $crate::trace::TraceCollector,
@@ -514,7 +519,7 @@ macro_rules! tb_scenario {
 				);
 
 				// Environment-specific execution
-				let trace_exec = trace_collector.clone();
+				let trace_exec = trace_collector.share();
 				fn __call_exec_closure<F>(
 					closure: F,
 					trace: $crate::trace::TraceCollector,
@@ -575,7 +580,7 @@ macro_rules! tb_scenario {
 			];
 
 			// Environment-specific execution
-			let trace_exec = trace_collector.clone();
+			let trace_exec = trace_collector.share();
 			fn __call_exec_closure<F>(
 				closure: F,
 				trace: $crate::trace::TraceCollector,
@@ -626,8 +631,8 @@ macro_rules! tb_scenario {
 			let result = $crate::tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
 				// Environment-specific execution
 				let trace_collector = $crate::trace::TraceCollector::new();
-				let trace_setup = trace_collector.clone();
-				let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+				let trace_setup = trace_collector.share();
+				let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 				let fuzz_for_setup = fuzz_input.clone();
 				let fuzz_for_stimulus = fuzz_input.clone();
 
@@ -704,7 +709,7 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			let builder = (|| $worker_body)();
 			let mut worker = <_ as $crate::colony::Worker>::start(builder)
@@ -750,7 +755,7 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			let builder = (|| $worker_body)();
 			let future = async move {
@@ -817,7 +822,7 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
@@ -867,7 +872,7 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
@@ -938,7 +943,7 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			let builder: $worker_type = <$worker_type as Default>::default();
 			let mut worker = <_ as $crate::colony::Worker>::start(builder)
@@ -984,7 +989,7 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			let builder: $worker_type = <$worker_type as Default>::default();
 			let future = async move {
@@ -1052,7 +1057,7 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
@@ -1102,7 +1107,7 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
@@ -1173,8 +1178,8 @@ macro_rules! tb_scenario {
 			};
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_setup = trace_collector.clone();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_setup = trace_collector.share();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			// Helper functions to enable type inference (synchronous)
 			fn __call_setup_closure<F, W>(
@@ -1248,8 +1253,8 @@ macro_rules! tb_scenario {
 			];
 
 			// Environment-specific execution
-			let trace_setup = trace_collector.clone();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+			let trace_setup = trace_collector.share();
+			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 			// Helper functions to enable type inference (synchronous)
 			fn __call_setup_closure<F, W>(
@@ -1331,8 +1336,8 @@ macro_rules! tb_scenario {
 
 			let exec_result = runtime.block_on(async {
 				let trace_collector = trace_collector_base.clone();
-				let trace_server = trace_collector.clone();
-				let trace_client = trace_collector.clone();
+				let trace_server = trace_collector.share();
+				let trace_client = trace_collector.share();
 
 				let server_setup_result: Result<(tokio::task::JoinHandle<()>, _), $crate::TightBeamError> =
 					($server_closure)(trace_server).await;
@@ -1420,8 +1425,8 @@ macro_rules! tb_scenario {
 
 			let exec_result = runtime.block_on(async {
 				let trace_collector = trace_collector_base.clone();
-				let trace_server = trace_collector.clone();
-				let trace_client = trace_collector.clone();
+				let trace_server = trace_collector.share();
+				let trace_client = trace_collector.share();
 
 				let server_setup_result: Result<(tokio::task::JoinHandle<()>, _), $crate::TightBeamError> =
 					($server_closure)(trace_server).await;
@@ -1547,25 +1552,25 @@ macro_rules! tb_scenario {
 		// Create trace collector from config if provided
 		#[allow(unused_variables)]
 		#[cfg(feature = "instrument")]
-		let trace_collector: $crate::trace::TraceCollector = {
+		let trace_collector_base: $crate::trace::TraceCollector = {
 			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
 		};
 		#[cfg(not(feature = "instrument"))]
-		let trace_collector = $crate::trace::TraceCollector::new();
+		let trace_collector_base = $crate::trace::TraceCollector::new();
 
 		let specs: Vec<&$crate::testing::macros::BuiltAssertSpec> = vec![
 			$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 		];
 
 		// Environment-specific execution
-		let trace_collector = $crate::trace::TraceCollector::new();
-		let trace_exec = trace_collector.clone();
+		let trace_collector = ::std::sync::Arc::new(trace_collector_base.share());
+		let trace_exec = ::std::sync::Arc::clone(&trace_collector);
 		fn __call_exec_closure<F>(
 			closure: F,
-			trace: $crate::trace::TraceCollector,
+			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 		) -> Result<(), $crate::TightBeamError>
 		where
-			F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
+			F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>) -> Result<(), $crate::TightBeamError>,
 		{
 			closure(trace)
 		}
@@ -1573,7 +1578,7 @@ macro_rules! tb_scenario {
 
 		// Common finalization
 		let mut trace = $crate::tb_scenario!(@setup_trace);
-		trace.populate_from_collector(&trace_collector);
+		trace.populate_from_collector(trace_collector.as_ref());
 		$crate::tb_scenario!(@finalize_trace trace, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
@@ -1608,8 +1613,8 @@ macro_rules! tb_scenario {
 		};
 		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
-		let trace_setup = trace_collector.clone();
-		let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+		let trace_setup = trace_collector.share();
+		let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 		// Helper functions to enable type inference (synchronous)
 		fn __call_setup_closure<F, W>(
@@ -1680,8 +1685,8 @@ macro_rules! tb_scenario {
 
 		// Environment-specific execution
 		let trace_collector = $crate::trace::TraceCollector::new();
-		let trace_setup = trace_collector.clone();
-		let trace_stimulus = ::std::sync::Arc::new(trace_collector.clone());
+		let trace_setup = trace_collector.share();
+		let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 		// Helper functions to enable type inference (synchronous)
 		fn __call_setup_closure<F, W>(
@@ -1876,7 +1881,7 @@ macro_rules! tb_scenario {
 
 	// ===== Environment-specific execution dispatchers =====
 	(@environment_exec Bare, $trace_collector:expr, $exec_closure:expr) => {{
-		let trace_exec = $trace_collector.clone();
+		let trace_exec = $trace_collector.share();
 
 		fn __call_exec_closure<F>(
 			closure: F,
@@ -1892,8 +1897,8 @@ macro_rules! tb_scenario {
 	}};
 
 	(@environment_exec Worker, $trace_collector:expr, $setup_closure:expr, $stimulus_closure:expr) => {{
-		let trace_setup = $trace_collector.clone();
-		let trace_stimulus = $trace_collector.clone();
+		let trace_setup = $trace_collector.share();
+		let trace_stimulus = $trace_collector.share();
 
 		fn __call_setup_closure<F, W>(
 			closure: F,
@@ -1933,7 +1938,7 @@ macro_rules! tb_scenario {
 			runtime.block_on($crate::testing::macros::__tb_run_service_client_session::<
 				tb_scenario!(@default_protocol $($protocol)?)
 			>(
-				$trace_collector.clone(),
+				$trace_collector.share(),
 				$server_closure,
 				$client_closure,
 			))
@@ -1960,8 +1965,8 @@ macro_rules! tb_scenario {
 	) => {{
 		#[cfg(feature = "tokio")]
 		{
-			let trace_server = $trace_collector.clone();
-			let trace_client = $trace_collector.clone();
+			let trace_server = $trace_collector.share();
+			let trace_client = $trace_collector.share();
 
 			let start_result = $crate::__tb_scenario_servlet_start!(
 				$servlet_name,
@@ -2043,7 +2048,7 @@ macro_rules! tb_scenario {
 		};
 		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
-		let trace_exec = trace_collector.clone();
+		let trace_exec = trace_collector.share();
 
 		// Helper function to enable type inference for exec closure (synchronous)
 		fn __call_exec_closure<F>(
@@ -2135,8 +2140,8 @@ macro_rules! tb_scenario {
 		};
 		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
-		let trace_setup = trace_collector.clone();
-		let trace_stimulus = trace_collector.clone();
+		let trace_setup = trace_collector.share();
+		let trace_stimulus = trace_collector.share();
 
 		// Helper functions to enable type inference (synchronous)
 		fn __call_setup_closure<F, W>(
@@ -2190,8 +2195,8 @@ macro_rules! tb_scenario {
 		};
 		#[cfg(not(feature = "instrument"))]
 		let trace_collector = $crate::trace::TraceCollector::new();
-		let trace_setup = trace_collector.clone();
-		let trace_stimulus = trace_collector.clone();
+		let trace_setup = trace_collector.share();
+		let trace_stimulus = trace_collector.share();
 
 		// Helper functions to enable type inference
 		fn __call_setup_closure<F, W>(
@@ -2318,7 +2323,7 @@ macro_rules! tb_scenario {
 			let client_result = $crate::testing::macros::__tb_run_service_client_session::<
 				tb_scenario!(@default_protocol $($protocol)?)
 			>(
-				trace_collector.clone(),
+				trace_collector.share(),
 				$server_closure,
 				$client_closure,
 			)
@@ -2523,19 +2528,19 @@ macro_rules! tb_scenario {
 					.expect("Failed to create tokio runtime");
 
 				let exec_result = runtime.block_on(async {
-				let trace_client = trace_collector.clone();
-				let trace_server = trace_collector.clone();
+				let trace_client = trace_collector.share();
+				let trace_server = trace_collector.share();
 
 				// Start closure must return (servlet, client) tuple
 				let start_result = $crate::__tb_scenario_servlet_start!(
 					$servlet_name,
-					trace_server.clone(),
+					trace_server.share(),
 					$($start_expr)?
 				);
 				// Unwrap the tuple - start closure always returns (servlet, client)
 				let (mut servlet_instance, client) = start_result;
 
-				servlet_instance.set_trace(trace_server.clone());
+				servlet_instance.set_trace(trace_server.share());
 
 				// Execute client closure
 				async fn __call_client_closure<F, Fut, T>(
@@ -2621,8 +2626,8 @@ macro_rules! tb_scenario {
 		async fn $test_name() {
 			// Create trace collector
 			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_client = trace_collector.clone();
-			let trace_server = trace_collector.clone();
+			let trace_client = trace_collector.share();
+			let trace_server = trace_collector.share();
 
 			// Start servlet - use custom start expression or default start(trace_server)
 			// Start closure must return (servlet, client) tuple
@@ -2824,8 +2829,8 @@ where
 	ClientFn: FnOnce(crate::trace::TraceCollector, <Protocol as crate::transport::Protocol>::Transport) -> ClientFut,
 	ClientFut: core::future::Future<Output = Result<(), crate::TightBeamError>>,
 {
-	let trace_server = trace_collector.clone();
-	let trace_client = trace_collector;
+	let trace_server = trace_collector.share();
+	let trace_client = trace_collector.share();
 
 	let (server_handle, server_addr) = server_closure(trace_server).await?;
 
@@ -3020,7 +3025,7 @@ mod tests {
 				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 				let handle = crate::server! {
 					protocol TokioListener: listener,
-					assertions: trace,
+					assertions: trace.share(),
 					handle: |frame, trace| async move {
 						trace.event("Received");
 						trace.event("Responded");
@@ -3058,7 +3063,7 @@ mod tests {
 				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 				let handle = crate::server! {
 					protocol TokioListener: listener,
-					assertions: trace,
+					assertions: trace.share(),
 					handle: |frame, trace| async move {
 						// Server-side assertions
 						trace.event("Received");

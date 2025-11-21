@@ -152,7 +152,7 @@ impl Display for ScenarioResult {
 
 			// Layer 1: Assertion spec violations
 			if let Some(ref violation) = self.spec_violation {
-				writeln!(f, "  [Assertion] {}", violation)?;
+				writeln!(f, "  [Assertion] {violation}")?;
 			}
 
 			// Layer 2: CSP validation failures
@@ -161,7 +161,7 @@ impl Display for ScenarioResult {
 				if !csp_res.valid {
 					writeln!(f, "  [CSP] Validation failed:")?;
 					for violation in &csp_res.violations {
-						writeln!(f, "    - {}", violation)?;
+						writeln!(f, "    - {violation}")?;
 					}
 				}
 			}

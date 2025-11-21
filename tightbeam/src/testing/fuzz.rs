@@ -472,11 +472,12 @@ impl CspOracle {
 /// The `fuzz_u8()`, `fuzz_u16()`, etc. methods are provided for custom
 /// fuzzing logic that needs structured data beyond oracle-guided execution.
 /// Most fuzz targets should use `fuzz_from_bytes()` instead.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct FuzzContext {
 	inner: Arc<Mutex<FuzzContextInner>>,
 }
 
+#[derive(Debug)]
 struct FuzzContextInner {
 	input: Vec<u8>,
 	cursor: usize,

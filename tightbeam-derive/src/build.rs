@@ -99,23 +99,46 @@ pub fn generate_builder_macro(config: &MacroConf) -> proc_macro2::TokenStream {
 		}
 	};
 
+	// Generate common macro patterns (shared between variant and non-variant forms)
+	let common_call_patterns = quote! {
+		// Internal dispatcher - shared patterns
+		(@call $builder:ident; $key:ident : type $ty:ty) => {
+			$crate::#helper_name!($builder; $key : type $ty);
+		};
+
+		(@call $builder:ident; $key:ident < $($g:ty),+ > : $value:expr) => {
+			$crate::#helper_name!($builder; $key<$($g),+> : $value);
+		};
+
+		(@call $builder:ident; $key:ident : $value:expr) => {
+			$crate::#helper_name!($builder; $key : $value);
+		};
+
+		// Process entries - shared patterns
+		(@entries $builder:ident; $key:ident : type $ty:ty $(, $($rest:tt)*)?) => {
+			$crate::#macro_name!(@call $builder; $key : type $ty);
+			$($crate::#macro_name!(@entries $builder; $($rest)*);)?
+		};
+
+		(@entries $builder:ident; $key:ident < $($g:ty),+ > : $value:expr $(, $($rest:tt)*)?) => {
+			$crate::#macro_name!(@call $builder; $key<$($g),+> : $value);
+			$($crate::#macro_name!(@entries $builder; $($rest)*);)?
+		};
+
+		(@entries $builder:ident; $key:ident : $value:expr $(, $($rest:tt)*)?) => {
+			$crate::#macro_name!(@call $builder; $key : $value);
+			$($crate::#macro_name!(@entries $builder; $($rest)*);)?
+		};
+
+		(@entries $builder:ident;) => {};
+	};
+
 	// Generate main macro - explicitly parse each entry pattern
 	let main_macro = if let Some(variant) = &variant_path_tokens {
 		quote! {
 			#[macro_export]
 			macro_rules! #macro_name {
-				// Internal dispatcher
-				(@call $builder:ident; $key:ident : type $ty:ty) => {
-					$crate::#helper_name!($builder; $key : type $ty);
-				};
-
-				(@call $builder:ident; $key:ident < $($g:ty),+ > : $value:expr) => {
-					$crate::#helper_name!($builder; $key<$($g),+> : $value);
-				};
-
-				(@call $builder:ident; $key:ident : $value:expr) => {
-					$crate::#helper_name!($builder; $key : $value);
-				};
+				#common_call_patterns
 
 				// Main entry - variant form
 				($variant_id:ident : $($rest:tt)*) => {{
@@ -124,65 +147,21 @@ pub fn generate_builder_macro(config: &MacroConf) -> proc_macro2::TokenStream {
 					$crate::#macro_name!(@entries __b; $($rest)*);
 					__b.build()
 				}};
-
-				// Process entries - match explicit patterns
-				(@entries $builder:ident; $key:ident : type $ty:ty $(, $($rest:tt)*)?) => {
-					$crate::#macro_name!(@call $builder; $key : type $ty);
-					$($crate::#macro_name!(@entries $builder; $($rest)*);)?
-				};
-
-				(@entries $builder:ident; $key:ident < $($g:ty),+ > : $value:expr $(, $($rest:tt)*)?) => {
-					$crate::#macro_name!(@call $builder; $key<$($g),+> : $value);
-					$($crate::#macro_name!(@entries $builder; $($rest)*);)?
-				};
-
-				(@entries $builder:ident; $key:ident : $value:expr $(, $($rest:tt)*)?) => {
-					$crate::#macro_name!(@call $builder; $key : $value);
-					$($crate::#macro_name!(@entries $builder; $($rest)*);)?
-				};
-
-				(@entries $builder:ident;) => {};
 			}
 		}
 	} else {
 		quote! {
 			#[macro_export]
 			macro_rules! #macro_name {
-				(@call $builder:ident; $key:ident : type $ty:ty) => {
-					$crate::#helper_name!($builder; $key : type $ty);
-				};
+				#common_call_patterns
 
-				(@call $builder:ident; $key:ident < $($g:ty),+ > : $value:expr) => {
-					$crate::#helper_name!($builder; $key<$($g),+> : $value);
-				};
-
-				(@call $builder:ident; $key:ident : $value:expr) => {
-					$crate::#helper_name!($builder; $key : $value);
-				};
-
+				// Main entry - non-variant form
 				($($rest:tt)*) => {{
 					use $crate::builder::TypeBuilder as _;
 					let mut __b: #builder_type = ::core::default::Default::default();
 					$crate::#macro_name!(@entries __b; $($rest)*);
 					__b.build()
 				}};
-
-				(@entries $builder:ident; $key:ident : type $ty:ty $(, $($rest:tt)*)?) => {
-					$crate::#macro_name!(@call $builder; $key : type $ty);
-					$($crate::#macro_name!(@entries $builder; $($rest)*);)?
-				};
-
-				(@entries $builder:ident; $key:ident < $($g:ty),+ > : $value:expr $(, $($rest:tt)*)?) => {
-					$crate::#macro_name!(@call $builder; $key<$($g),+> : $value);
-					$($crate::#macro_name!(@entries $builder; $($rest)*);)?
-				};
-
-				(@entries $builder:ident; $key:ident : $value:expr $(, $($rest:tt)*)?) => {
-					$crate::#macro_name!(@call $builder; $key : $value);
-					$($crate::#macro_name!(@entries $builder; $($rest)*);)?
-				};
-
-				(@entries $builder:ident;) => {};
 			}
 		}
 	};

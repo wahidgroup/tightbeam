@@ -522,11 +522,11 @@ macro_rules! test_container {
 			let ok_tx_arc = Arc::new(ok_tx_inner);
 			let reject_tx_arc = Arc::new(reject_tx_inner);
 
-			// Build server with NO runtime policies (with_x509 is setup-only)
-			let server_handle = {
-				let tx_clone = tx.clone();
-				let ok_tx_clone = ok_tx_arc.clone();
-				let reject_tx_clone = reject_tx_arc.clone();
+		// Build server with NO runtime policies (with_x509 is setup-only)
+		let server_handle = {
+			let tx_clone = Arc::clone(&tx);
+			let ok_tx_clone = Arc::clone(&ok_tx_arc);
+			let reject_tx_clone = Arc::clone(&reject_tx_arc);
 				test_container!(@build_server
 					$protocol,
 					listener,
@@ -568,11 +568,11 @@ macro_rules! test_container {
 			let ok_tx_arc = Arc::new(ok_tx_inner);
 			let reject_tx_arc = Arc::new(reject_tx_inner);
 
-			// Build server
-			let server_handle = {
-				let tx_clone = tx.clone();
-				let ok_tx_clone = ok_tx_arc.clone();
-				let reject_tx_clone = reject_tx_arc.clone();
+		// Build server
+		let server_handle = {
+			let tx_clone = Arc::clone(&tx);
+			let ok_tx_clone = Arc::clone(&ok_tx_arc);
+			let reject_tx_clone = Arc::clone(&reject_tx_arc);
 				test_container!(@build_server
 					$protocol,
 					listener,
@@ -923,8 +923,8 @@ macro_rules! test_container {
 				policies: {
 					with_collector_gate: [$(
 						{
-							let ok_tx_for_gate = $ok_tx.clone();
-							let reject_tx_for_gate = $reject_tx.clone();
+							let ok_tx_for_gate = ::std::sync::Arc::clone(&$ok_tx);
+							let reject_tx_for_gate = ::std::sync::Arc::clone(&$reject_tx);
 							$crate::policy::GateMiddleware::new(
 								$gate,
 								move |message: &$crate::Frame, status: &$crate::policy::TransitStatus| {
@@ -940,7 +940,7 @@ macro_rules! test_container {
 					$(, $($rest_key: $rest_val),*)?
 				},
 				handle: move |$msg: $msg_ty| {
-					let $svc_tx = $tx.clone();
+					let $svc_tx = ::std::sync::Arc::clone(&$tx);
 					$body
 				}
 			}
@@ -954,7 +954,7 @@ macro_rules! test_container {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),+ },
 				handle: move |$msg: $msg_ty| {
-					let $svc_tx = $tx.clone();
+					let $svc_tx = ::std::sync::Arc::clone(&$tx);
 					$body
 				}
 			}
@@ -967,7 +967,7 @@ macro_rules! test_container {
 			$crate::server! {
 				protocol $protocol: $listener,
 				handle: move |$msg: $msg_ty| {
-					let $svc_tx = $tx.clone();
+					let $svc_tx = ::std::sync::Arc::clone(&$tx);
 					$body
 				}
 			}

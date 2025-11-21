@@ -57,6 +57,21 @@ pub trait TightBeamLike:
 }
 
 impl Frame {
+	/// Get a reference to the metadata.
+	///
+	/// For owned, use `From<Frame> for Metadata` which consumes the frame.
+	pub fn as_metadata(&self) -> &Metadata {
+		&self.metadata
+	}
+}
+
+#[cfg(feature = "signature")]
+impl Frame {
+	/// Get a reference to the signature info if present.
+	pub fn as_signature_info(&self) -> Option<&SignerInfo> {
+		self.nonrepudiation.as_ref()
+	}
+
 	/// Verify the signature of the TightBeam message
 	///
 	/// This verifies the signature against the entire TightBeam structure.
@@ -71,7 +86,6 @@ impl Frame {
 	/// Returns an error if:
 	/// - The TightBeam doesn't contain a signature
 	/// - Signature verification fails
-	#[cfg(feature = "signature")]
 	pub fn verify<S>(&self, verifier: &impl Verifier<S>) -> Result<()>
 	where
 		S: SignatureEncoding,
@@ -94,7 +108,6 @@ impl Frame {
 
 	/// Encode the Frame for signature verification (TBS - to-be-signed)
 	/// This excludes the signature field to avoid cloning the entire structure
-	#[cfg(feature = "signature")]
 	fn encode_tbs(&self) -> Result<Vec<u8>> {
 		use crate::der::Encode;
 
@@ -116,7 +129,6 @@ impl Frame {
 	}
 
 	/// Encode integrity field with context-specific tagging
-	#[cfg(feature = "signature")]
 	fn encode_tagged_integrity(&self, buffer: &mut Vec<u8>, integrity: &crate::DigestInfo) -> Result<()> {
 		use crate::der::Encode;
 
@@ -134,7 +146,6 @@ impl Frame {
 	}
 
 	/// Wrap data in a DER sequence
-	#[cfg(feature = "signature")]
 	fn wrap_in_sequence(&self, data: Vec<u8>) -> Result<Vec<u8>> {
 		use crate::der::Encode;
 
@@ -146,80 +157,154 @@ impl Frame {
 		buffer.extend(data);
 		Ok(buffer)
 	}
+}
 
-	/// Decrypt and decode the message body into a typed message T
+#[cfg(feature = "aead")]
+impl Frame {
+	/// Get a reference to the encrypted content info if present.
+	pub fn as_encrypted_content_info(&self) -> Option<&EncryptedContentInfo> {
+		self.metadata.confidentiality.as_ref()
+	}
+
+	/// Decrypt the message body and return the plaintext bytes.
+	/// This will consume the frame.
 	///
 	/// # Arguments
-	/// * `cipher` - The AEAD cipher to use for decryption
-	/// * `inflator` - Optional inflator for decompressing the data
+	/// * `decryptor` - The AEAD decryptor to use for decryption
 	///
 	/// # Returns
-	/// The decrypted and decoded message of type T
+	/// The decrypted plaintext bytes. If the frame was compressed, these bytes
+	/// are still compressed and need to be decompressed separately.
 	///
 	/// # Errors
 	/// Returns an error if:
 	/// - The metadata doesn't contain encryption info (V0 metadata)
 	/// - Decryption fails
+	pub fn decrypt_bytes(mut self, decryptor: &impl crate::crypto::aead::Decryptor) -> Result<Vec<u8>> {
+		let mut encrypted_content_info = self
+			.metadata
+			.confidentiality
+			.take()
+			.ok_or(TightBeamError::MissingEncryptionInfo)?;
+
+		// The encrypted content is stored in the message field - move it into the info
+		let message = OctetString::new(std::mem::take(&mut self.message))?;
+		encrypted_content_info.encrypted_content = Some(message);
+
+		// Decrypt using the Decryptor trait
+		decryptor.decrypt_content(&encrypted_content_info)
+	}
+
+	/// Decrypt, decompress (if needed), and decode the message body into a typed message T.
+	/// This is a convenience method that combines `decrypt_bytes`, `decompress`, and `decode`.
+	///
+	/// # Arguments
+	/// * `decryptor` - The AEAD decryptor to use for decryption
+	/// * `inflator` - Optional inflator for decompressing the data (required if compressed)
+	///
+	/// # Returns
+	/// The decrypted, decompressed, and decoded message of type T
+	///
+	/// # Errors
+	/// Returns an error if:
+	/// - The metadata doesn't contain encryption info (V0 metadata)
+	/// - Decryption fails
+	/// - Decompression fails (if compressed)
 	/// - Deserialization of the decrypted data fails
-	#[cfg(feature = "aead")]
 	pub fn decrypt<T>(
-		&self,
+		self,
 		decryptor: &impl crate::crypto::aead::Decryptor,
 		inflator: Option<&dyn Inflator>,
 	) -> Result<T>
 	where
 		T: Message,
 	{
-		// Extract encrypted content info from metadata and reconstruct with message bytes
-		let message = OctetString::new(self.message.clone())?;
-		let mut encrypted_content_info = self
-			.metadata
-			.confidentiality
-			.clone()
-			.ok_or(TightBeamError::MissingEncryptionInfo)?;
-
-		// The encrypted content is stored in the message field
-		encrypted_content_info.encrypted_content = Some(message);
-
-		// Decrypt using the Decryptor trait
-		let plaintext = decryptor.decrypt_content(&encrypted_content_info)?;
-		// When compressed, decompress before decoding
-		let decompressed = if self.metadata.compactness.is_some() {
-			#[cfg(not(feature = "compress"))]
-			return Err(TightBeamError::MissingFeature("compress"));
-
-			#[cfg(feature = "compress")]
-			{
-				let inflator = inflator.ok_or(TightBeamError::MissingInflator)?;
-				inflator.decompress(&plaintext)?
-			}
-		} else {
-			plaintext
-		};
-
-		// Decode the plaintext into type T
-		let message_content = decompressed;
-		crate::decode::<T>(&message_content)
+		let was_compressed = self.metadata.compactness.is_some();
+		let plaintext = self.decrypt_bytes(decryptor)?;
+		let decompressed = Self::decompress(plaintext, was_compressed, inflator)?;
+		crate::decode::<T>(&decompressed)
 	}
 }
 
 impl TightBeamLike for Frame {}
 
-crate::impl_from!(Frame, tb => Metadata: tb.metadata.clone());
+impl From<Frame> for Metadata {
+	fn from(mut frame: Frame) -> Self {
+		std::mem::take(&mut frame.metadata)
+	}
+}
+
 crate::impl_from!(Frame, tb => Version: tb.version);
 
 #[cfg(feature = "signature")]
 crate::impl_try_from!(Frame, tb => SignerInfo: nonrepudiation, TightBeamError::MissingSignature);
 
+#[cfg(feature = "digest")]
+impl Frame {
+	/// Get a reference to the frame integrity info if present.
+	pub fn as_integrity_info(&self) -> Option<&crate::DigestInfo> {
+		self.integrity.as_ref()
+	}
+
+	/// Get a reference to the message integrity info if present.
+	pub fn as_message_integrity(&self) -> Option<&crate::DigestInfo> {
+		self.metadata.integrity.as_ref()
+	}
+}
+
+#[cfg(feature = "compress")]
+impl Frame {
+	/// Get a reference to the compressed data info if present.
+	pub fn as_compressed_data(&self) -> Option<&crate::CompressedData> {
+		self.metadata.compactness.as_ref()
+	}
+
+	/// Decompress the plaintext bytes if compression was used.
+	///
+	/// # Arguments
+	/// * `plaintext` - The plaintext bytes (may be compressed)
+	/// * `was_compressed` - Whether the data was compressed
+	/// * `inflator` - The inflator to use for decompression (required if compressed)
+	///
+	/// # Returns
+	/// The decompressed bytes, or the original bytes if not compressed.
+	///
+	/// # Errors
+	/// Returns an error if:
+	/// - Compression was used but no inflator was provided
+	/// - Decompression fails
+	#[cfg(feature = "compress")]
+	pub fn decompress(plaintext: Vec<u8>, was_compressed: bool, inflator: Option<&dyn Inflator>) -> Result<Vec<u8>> {
+		if was_compressed {
+			let inflator = inflator.ok_or(TightBeamError::MissingInflator)?;
+			Ok(inflator.decompress(&plaintext)?)
+		} else {
+			Ok(plaintext)
+		}
+	}
+
+	/// Decompress the plaintext bytes if compression was used.
+	///
+	/// This is a no-op when the `compress` feature is disabled.
+	#[cfg(not(feature = "compress"))]
+	pub fn decompress(plaintext: Vec<u8>, was_compressed: bool, _inflator: Option<&dyn Inflator>) -> Result<Vec<u8>> {
+		if was_compressed {
+			Err(TightBeamError::MissingFeature("compress"))
+		} else {
+			Ok(plaintext)
+		}
+	}
+}
+
 #[cfg(feature = "aead")]
-impl TryFrom<&Frame> for EncryptedContentInfo {
+impl TryFrom<Frame> for EncryptedContentInfo {
 	type Error = TightBeamError;
 
-	fn try_from(frame: &Frame) -> core::result::Result<Self, Self::Error> {
+	fn try_from(mut frame: Frame) -> core::result::Result<Self, Self::Error> {
 		frame
 			.metadata
 			.confidentiality
-			.clone()
+			.take()
 			.ok_or(TightBeamError::MissingEncryptionInfo)
 	}
 }
@@ -432,15 +517,7 @@ mod tests {
 				#[test]
 				fn $name() {
 					let tightbeam = $tightbeam;
-
-					// Test reference conversion
-					let converted_ref: $target = (&tightbeam).into();
-
-					// Test owned conversion
-					let converted_owned: $target = tightbeam.clone().into();
-
-					// Both should be equal
-					assert_eq!(converted_ref, converted_owned);
+					let _converted: $target = tightbeam.clone().into();
 				}
 			)*
 		};
@@ -479,14 +556,14 @@ mod tests {
 		} => Version,
 	}
 
-	/// Macro to test TightBeam TryFrom conversions
+	/// Macro to test TightBeam TryFrom conversions (owned only)
 	macro_rules! test_tightbeam_try_conversions {
 		(success: $($name:ident: $tightbeam:expr => $target:ty,)*) => {
 			$(
 				#[test]
 				fn $name() {
 					let tightbeam = $tightbeam;
-					let result: Result<$target> = (&tightbeam).try_into();
+					let result: Result<$target> = tightbeam.try_into();
 					assert!(result.is_ok());
 				}
 			)*
@@ -496,7 +573,7 @@ mod tests {
 				#[test]
 				fn $name() {
 					let tightbeam = $tightbeam;
-					let result: Result<$target> = (&tightbeam).try_into();
+					let result: Result<$target> = tightbeam.try_into();
 					assert!(result.is_err());
 				}
 			)*

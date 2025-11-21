@@ -355,22 +355,6 @@ macro_rules! tb_process_spec {
 		$event:tt,
 		$guard_expr:tt,
 		$to_state:ident,
-	) => {
-		$crate::tb_process_spec! {
-			@parse_timed_transition_impl
-			$builder,
-			$from_state,
-			$event,
-			$guard_expr,
-			$to_state,
-		}
-	};
-	(@parse_timed_transition
-		$builder:ident,
-		$from_state:expr,
-		$event:tt,
-		$guard_expr:tt,
-		$to_state:ident,
 		$($reset_clock:expr),* $(,)?
 	) => {
 		$crate::tb_process_spec! {

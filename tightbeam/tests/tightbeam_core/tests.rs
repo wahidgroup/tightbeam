@@ -17,6 +17,9 @@ use tightbeam::testing::macros::{IsNone, IsSome};
 use tightbeam::utils;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
+#[cfg(all(feature = "tokio", feature = "transport-policy"))]
+mod queue_free;
+
 /// Simple test message
 #[cfg_attr(feature = "derive", derive(tightbeam::Beamable))]
 #[derive(Clone, Debug, PartialEq, Sequence)]
@@ -230,19 +233,13 @@ tb_scenario! {
 			// Roundtrip checks
 			let v0_roundtrip: TestMessage = tightbeam::decode(&v0_frame.message)?;
 			trace.event_with("roundtrip_ok", &["v0"], v0_roundtrip == message);
-			let v1_roundtrip = v1_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
-			let v2_roundtrip = v2_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
-			let v3_roundtrip = v3_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
-			trace.event_with("roundtrip_ok", &["v1"], v1_roundtrip == message);
-			trace.event_with("roundtrip_ok", &["v2"], v2_roundtrip == message);
-			trace.event_with("roundtrip_ok", &["v3"], v3_roundtrip == message);
 
-			// V1+ signature checks
+			// V1+ signature checks (before decrypt, which consumes the frame)
 			trace.event_with("sig_valid", &["v1"], v1_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
 			trace.event_with("sig_valid", &["v2"], v2_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
 			trace.event_with("sig_valid", &["v3"], v3_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok());
 
-			// V1+ integrity checks
+			// V1+ integrity checks (before decrypt)
 			let v1_integrity = v1_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
 			let v2_integrity = v2_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
 			let v3_integrity = v3_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
@@ -250,13 +247,13 @@ tb_scenario! {
 			trace.event_with("integrity_ok", &["v2"], v2_integrity.value_cmp(&message_hash).is_ok());
 			trace.event_with("integrity_ok", &["v3"], v3_integrity.value_cmp(&message_hash).is_ok());
 
-			// Frame-level fields
+			// Frame-level fields (before decrypt)
 			trace.event_with("nonrepudiation", &["v0"], Presence::of_option(&v0_frame.nonrepudiation));
 			trace.event_with("nonrepudiation", &["v1", "v2", "v3"], Presence::of_option(&v1_frame.nonrepudiation));
 			trace.event_with("integrity", &["v0"], Presence::of_option(&v0_frame.integrity));
 			trace.event_with("integrity", &["v1", "v2", "v3"], Presence::of_option(&v1_frame.integrity));
 
-			// Metadata fields
+			// Metadata fields (before decrypt)
 			trace.event_with("confidentiality", &["v0"], Presence::of_option(&v0_frame.metadata.confidentiality));
 			trace.event_with("confidentiality", &["v1", "v2", "v3"], Presence::of_option(&v1_frame.metadata.confidentiality));
 			trace.event_with("priority", &["v0", "v1"], v0_frame.metadata.priority);
@@ -270,11 +267,19 @@ tb_scenario! {
 			trace.event_with("matrix", &["v0", "v1", "v2"], Presence::of_option(&v0_frame.metadata.matrix));
 			trace.event_with("matrix", &["v3"], Presence::of_option(&v3_frame.metadata.matrix));
 
-			// Version checks - each version is unique
+			// Version checks - each version is unique (before decrypt)
 			trace.event_with("version", &["v0"], v0_frame.version);
 			trace.event_with("version", &["v1"], v1_frame.version);
 			trace.event_with("version", &["v2"], v2_frame.version);
 			trace.event_with("version", &["v3"], v3_frame.version);
+
+			// Decrypt (consumes frames, so must be last)
+			let v1_roundtrip = v1_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
+			let v2_roundtrip = v2_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
+			let v3_roundtrip = v3_frame.decrypt::<TestMessage>(&crypto.cipher, None)?;
+			trace.event_with("roundtrip_ok", &["v1"], v1_roundtrip == message);
+			trace.event_with("roundtrip_ok", &["v2"], v2_roundtrip == message);
+			trace.event_with("roundtrip_ok", &["v3"], v3_roundtrip == message);
 
 			Ok(())
 		}

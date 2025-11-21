@@ -515,9 +515,13 @@ macro_rules! server {
 		#[allow(unused_imports)]
 		use $crate::trace::TraceCollector;
 
-		let __handler_with_trace = move |$param1: $crate::Frame| {
-			let $param2: TraceCollector = $assertions.clone();
-			$handler_body
+		let __assertions = ::std::sync::Arc::new($assertions);
+		let __handler_with_trace = {
+			let __assertions = ::std::sync::Arc::clone(&__assertions);
+			move |$param1: $crate::Frame| {
+				let $param2: TraceCollector = __assertions.as_ref().share();
+				$handler_body
+			}
 		};
 
 		$crate::server!(@async_loop $protocol, $listener, __handler_with_trace, $error_tx, $ok_tx, $($policy_name: [ $( $policy_expr ),* ]),*);
