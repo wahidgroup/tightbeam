@@ -14,6 +14,7 @@ use crate::{Asn1Matrix, Frame};
 #[cfg(feature = "signature")]
 use crate::{SignerInfo, TightBeamError};
 
+#[cfg(feature = "signature")]
 pub type SignatureVerifier<E = TightBeamError> = Box<dyn FnOnce(&[u8], &SignerInfo) -> core::result::Result<(), E>>;
 #[cfg(feature = "digest")]
 pub type Digestor<E = TightBeamError> = Box<dyn FnOnce(&[u8]) -> core::result::Result<crate::DigestInfo, E>>;

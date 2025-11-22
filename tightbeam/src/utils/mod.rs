@@ -1,7 +1,10 @@
 //! Utility modules and functions
 
 use crate::error::TightBeamError;
+use crate::{Message, Version};
 
+#[cfg(feature = "builder")]
+use crate::builder::FrameBuilder;
 #[cfg(feature = "compress")]
 use crate::{
 	compress::{Compressor, Inflator},
@@ -169,6 +172,15 @@ pub fn encode<T: der::Encode>(value: &T) -> Result<Vec<u8>, TightBeamError> {
 #[inline]
 pub fn decode<'a, T: der::Decode<'a>>(content: &'a impl AsRef<[u8]>) -> Result<T, TightBeamError> {
 	Ok(der::Decode::from_der(content.as_ref())?)
+}
+
+/// Create a new FrameBuilder for the given message type and version
+///
+/// This is a convenience function for creating frames without using the
+/// `compose!` macro. Useful in contexts where macros cannot be used
+/// (e.g., within other macro definitions).
+pub fn compose<T: Message>(version: Version) -> FrameBuilder<T> {
+	FrameBuilder::from(version)
 }
 
 /// Compress data using the specified algorithm.

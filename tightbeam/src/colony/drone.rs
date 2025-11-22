@@ -523,22 +523,28 @@ macro_rules! drone {
 					let mut active = $active_servlet.lock()?;
 					*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
 					drop(active);
-					return Ok(Some($crate::compose! {
-						V0: id: $frame.metadata.id.clone(),
-							message: $crate::colony::drone::ActivateServletResponse {
+					return Ok(Some({
+						use $crate::builder::TypeBuilder;
+						$crate::utils::compose($crate::Version::V0)
+							.with_id($frame.metadata.id.clone())
+							.with_message($crate::colony::drone::ActivateServletResponse {
 								status: $crate::policy::TransitStatus::Accepted,
 								servlet_address: Some(addr_str)
-							}
-					}?));
+							})
+							.build()?
+					}));
 				}
 				Err(_) => {
-					return Ok(Some($crate::compose! {
-						V0: id: $frame.metadata.id.clone(),
-							message: $crate::colony::drone::ActivateServletResponse {
+					return Ok(Some({
+						use $crate::builder::TypeBuilder;
+						$crate::utils::compose($crate::Version::V0)
+							.with_id($frame.metadata.id.clone())
+							.with_message($crate::colony::drone::ActivateServletResponse {
 								status: $crate::policy::TransitStatus::Forbidden,
 								servlet_address: None
-							}
-					}?));
+							})
+							.build()?
+					}));
 				}
 			}
 		}
@@ -698,9 +704,12 @@ macro_rules! drone {
 					let mut servlets = $servlets.lock()?;
 					servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
 					drop(servlets);
-					return Ok(Some($crate::compose! {
-						V0: id: $frame.metadata.id.clone(),
-							message: $crate::colony::drone::HiveManagementResponse {
+					return Ok(Some({
+						use $crate::builder::TypeBuilder;
+						$crate::utils::compose($crate::Version::V0)
+							.with_id($frame.metadata.id.clone())
+							.with_order(0)
+							.with_message($crate::colony::drone::HiveManagementResponse {
 								spawn: Some($crate::colony::drone::SpawnServletResult {
 									status: $crate::policy::TransitStatus::Accepted,
 									servlet_address: Some(addr_str),
@@ -708,13 +717,17 @@ macro_rules! drone {
 								}),
 								list: None,
 								stop: None,
-							}
-					}?));
+							})
+							.build()?
+					}));
 				}
 				Err(_) => {
-					return Ok(Some($crate::compose! {
-						V0: id: $frame.metadata.id.clone(),
-							message: $crate::colony::drone::HiveManagementResponse {
+					return Ok(Some({
+						use $crate::builder::TypeBuilder;
+						$crate::utils::compose($crate::Version::V0)
+							.with_id($frame.metadata.id.clone())
+							.with_order(0)
+							.with_message($crate::colony::drone::HiveManagementResponse {
 								spawn: Some($crate::colony::drone::SpawnServletResult {
 									status: $crate::policy::TransitStatus::Forbidden,
 									servlet_address: None,
@@ -722,12 +735,13 @@ macro_rules! drone {
 								}),
 								list: None,
 								stop: None,
-							}
-					}?));
+							})
+							.build()?
+					}));
+					}
 				}
 			}
-		}
-	};
+		};
 
 	// Implement Drone trait
 	(@impl_drone_trait $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
@@ -807,13 +821,16 @@ macro_rules! drone {
 					let stream = <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await
 						.map_err(|_| $crate::colony::drone::DroneError::ConnectionFailed(drone_addr_bytes))?;
 
-					let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
-
-					// Compose and send the registration message
-					let frame = $crate::compose! {
-						V0: id: b"drone-registration",
-							message: request
-					}.map_err(|_| $crate::colony::drone::DroneError::ComposeFailed)?;
+				let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
+				let frame = {
+					use $crate::builder::TypeBuilder;
+					$crate::utils::compose($crate::Version::V0)
+						.with_id(b"drone-registration")
+						.with_order(0)
+						.with_message(request)
+						.build()
+						.map_err(|_| $crate::colony::drone::DroneError::ComposeFailed)?
+				};
 
 					// Send and wait for response
 					let response_frame = transport.emit(frame, None).await
@@ -1018,12 +1035,15 @@ macro_rules! drone {
 						.map_err(|_| $crate::colony::drone::DroneError::ConnectionFailed(drone_addr_bytes))?;
 
 					let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
-
-					// Compose and send the registration message
-					let frame = $crate::compose! {
-						V0: id: b"hive-registration",
-							message: request
-					}.map_err(|_| $crate::colony::drone::DroneError::ComposeFailed)?;
+					let frame = {
+						use $crate::builder::TypeBuilder;
+						$crate::utils::compose($crate::Version::V0)
+							.with_id(b"hive-registration")
+							.with_order(0)
+							.with_message(request)
+							.build()
+							.map_err(|_| $crate::colony::drone::DroneError::ComposeFailed)?
+					};
 
 					// Send and wait for response
 					let response_frame = transport.emit(frame, None).await
@@ -1195,16 +1215,20 @@ macro_rules! drone {
 							drone!(@start_servlet_with_response $servlet_name<$input>, $drone_name, $servlet_id, stringify!($servlet_id), request.servlet_id.clone(), $active_servlet, stop_old_servlet, $frame);
 							}
 						}
-					)*
+				)*
 
-					// Unknown servlet ID - return error
-					return Ok(Some($crate::compose! {
-						V0: id: $frame.metadata.id.clone(),
-							message: $crate::colony::drone::ActivateServletResponse {
-								status: $crate::policy::TransitStatus::Forbidden,
-								servlet_address: None
-							}
-					}?));
+				// Unknown servlet ID - return error
+				return Ok(Some({
+					use $crate::builder::TypeBuilder;
+					$crate::utils::compose($crate::Version::V0)
+						.with_id($frame.metadata.id.clone())
+						.with_order(0)
+						.with_message($crate::colony::drone::ActivateServletResponse {
+							status: $crate::policy::TransitStatus::Forbidden,
+							servlet_address: None
+						})
+						.build()?
+				}));
 				}
 
 				// Not an activation request - check if there's an active servlet to handle it
@@ -1235,21 +1259,25 @@ macro_rules! drone {
 							drone!(@start_servlet_for_hive $servlet_name<$input>, $drone_name, $servlet_id, stringify!($servlet_id), servlet_type_name.to_vec(), $servlets, $frame);
 								}
 							}
-						)*
+					)*
 
-						// Unknown servlet type
-						return Ok(Some($crate::compose! {
-							V0: id: $frame.metadata.id.clone(),
-								message: $crate::colony::drone::HiveManagementResponse {
-									spawn: Some($crate::colony::drone::SpawnServletResult {
-										status: $crate::policy::TransitStatus::Forbidden,
-										servlet_address: None,
-										servlet_id: None
-									}),
-									list: None,
-									stop: None,
-								}
-					}?));
+					// Unknown servlet type
+					return Ok(Some({
+						use $crate::builder::TypeBuilder;
+						$crate::utils::compose($crate::Version::V0)
+							.with_id($frame.metadata.id.clone())
+							.with_order(0)
+							.with_message($crate::colony::drone::HiveManagementResponse {
+								spawn: Some($crate::colony::drone::SpawnServletResult {
+									status: $crate::policy::TransitStatus::Forbidden,
+									servlet_address: None,
+									servlet_id: None
+								}),
+								list: None,
+								stop: None,
+							})
+							.build()?
+					}));
 					}
 
 					// Handle list request
@@ -1271,17 +1299,21 @@ macro_rules! drone {
 						}
 						drop(servlets);
 
-						return Ok(Some($crate::compose! {
-							V0: id: $frame.metadata.id.clone(),
-								message: $crate::colony::drone::HiveManagementResponse {
+						return Ok(Some({
+							use $crate::builder::TypeBuilder;
+							$crate::utils::compose($crate::Version::V0)
+								.with_id($frame.metadata.id.clone())
+								.with_order(0)
+								.with_message($crate::colony::drone::HiveManagementResponse {
 									spawn: None,
 									list: Some($crate::colony::drone::ListServletsResult {
 										status: $crate::policy::TransitStatus::Accepted,
 										servlets: servlet_list
 									}),
 									stop: None,
-								}
-					}?));
+								})
+								.build()?
+						}));
 					}
 
 					// Handle stop request
@@ -1294,32 +1326,40 @@ macro_rules! drone {
 								$(
 									[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
 								)*
-							}
-							drop(servlets);
+						}
+						drop(servlets);
 
-							return Ok(Some($crate::compose! {
-								V0: id: $frame.metadata.id.clone(),
-									message: $crate::colony::drone::HiveManagementResponse {
-										spawn: None,
-										list: None,
-										stop: Some($crate::colony::drone::StopServletResult {
-											status: $crate::policy::TransitStatus::Accepted
-										}),
-									}
-						}?));
+						return Ok(Some({
+							use $crate::builder::TypeBuilder;
+							$crate::utils::compose($crate::Version::V0)
+								.with_id($frame.metadata.id.clone())
+								.with_order(0)
+								.with_message($crate::colony::drone::HiveManagementResponse {
+									spawn: None,
+									list: None,
+									stop: Some($crate::colony::drone::StopServletResult {
+										status: $crate::policy::TransitStatus::Accepted
+									}),
+								})
+								.build()?
+							}));
 						} else {
 							drop(servlets);
 
-							return Ok(Some($crate::compose! {
-								V0: id: $frame.metadata.id.clone(),
-									message: $crate::colony::drone::HiveManagementResponse {
+							return Ok(Some({
+								use $crate::builder::TypeBuilder;
+								$crate::utils::compose($crate::Version::V0)
+									.with_id($frame.metadata.id.clone())
+									.with_order(0)
+									.with_message($crate::colony::drone::HiveManagementResponse {
 										spawn: None,
 										list: None,
 										stop: Some($crate::colony::drone::StopServletResult {
 											status: $crate::policy::TransitStatus::Forbidden
 										}),
-									}
-						}?));
+									})
+									.build()?
+							}));
 						}
 					}
 				}

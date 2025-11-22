@@ -3,11 +3,12 @@
 macro_rules! relay {
 	($beamable:expr, $tx:expr) => {{
 		// Build a simple V0 wrapper with id=0, order=0
-		let __frame = match $crate::compose! {
-			V0: id: b"\0",
-				order: 0u64,
-				message: $beamable
-		} {
+		let __frame = match $crate::utils::compose($crate::Version::V0)
+			.with_id(b"\0")
+			.with_order(0u64)
+			.with_message($beamable)
+			.build()
+		{
 			Ok(f) => f,
 			Err(_) => return None,
 		};
