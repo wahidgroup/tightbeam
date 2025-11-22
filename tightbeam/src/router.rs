@@ -103,6 +103,7 @@ mod tests {
 	use std::sync::{mpsc, Arc};
 	use std::time::Duration;
 
+	use crate::compose;
 	use crate::der::Sequence;
 	use crate::router::RouterPolicy;
 	use crate::Beamable;
@@ -188,7 +189,7 @@ mod tests {
 		let n = 5usize;
 		for i in 0..n {
 			// Compose Payment
-			let payment = crate::compose! {
+			let payment = compose! {
 				V0: id: format!("p-{i}"),
 					order: 1u64,
 					message: Payment {
@@ -200,7 +201,7 @@ mod tests {
 			router.dispatch::<Payment>(Arc::new(payment))?;
 
 			// Compose HealthCheck
-			let health = crate::compose! {
+			let health = compose! {
 				V0: id: format!("h-{i}"),
 					order: 1u64,
 					message: HealthCheck {

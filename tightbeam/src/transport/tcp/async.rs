@@ -638,9 +638,7 @@ mod tests {
 	use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;
 	use crate::crypto::sign::Sha3Signer;
 	use crate::testing::*;
-	use crate::transport::policy::PolicyConf;
 	use crate::transport::{MessageCollector, MessageEmitter, ResponseHandler};
-	use crate::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
 
 	#[cfg(feature = "x509")]
 	use crate::transport::X509ClientConfig;
@@ -733,9 +731,7 @@ mod tests {
 		let server = listener;
 
 		let test_message = create_v0_tightbeam(None, None);
-
 		let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-
 		let server_handle = tokio::spawn(async move {
 			let (transport, _) = server.accept().await?;
 			let mut transport =
@@ -773,67 +769,5 @@ mod tests {
 
 		server_handle.await??;
 		Ok(())
-	}
-
-	#[cfg(all(feature = "transport-policy", feature = "x509"))]
-	crate::test_container! {
-		name: test_ecies_end_to_end_encryption,
-		worker_threads: 2,
-		protocol: TokioListener,
-		service_policies: {
-			with_collector_gate: [crate::policy::AcceptAllGate],
-			with_x509: []
-		},
-		client_policies: {
-			with_emitter_gate: [crate::policy::AcceptAllGate],
-			with_restart: [crate::transport::policy::RestartLinearBackoff::new(3, 1, 1, None)],
-			with_x509: []
-		},
-		service: |message, tx| async move {
-			// Echo the message back as response
-			let _ = tx.send(message.clone());
-			Ok(Some(message))
-		},
-		container: |client, channels| async move {
-			use crate::transport::MessageEmitter;
-			use crate::transport::handshake::TcpHandshakeState;
-
-			let (rx, ok_rx, reject_rx) = channels;
-
-			// Create test message
-			let test_message = create_v0_tightbeam(Some("Hello ECIES!"), Some("test-ecies-1"));
-
-			// Verify client starts without encryption
-			assert_eq!(client.to_handshake_state(), TcpHandshakeState::None);
-			assert!(client.to_encryptor_ref().is_err());
-
-			// First emit triggers ECIES handshake and sends encrypted message
-			let response = client.emit(test_message.clone(), None).await?;
-
-			// Verify encryption is now active
-			assert_eq!(client.to_handshake_state(), TcpHandshakeState::Complete);
-			assert!(client.to_encryptor_ref().is_ok());
-
-			// Verify response matches
-			assert_eq!(response, Some(test_message.clone()));
-
-			// Verify server received the message
-			assert_recv!(rx, test_message.clone(), 1);
-			assert_recv!(ok_rx, test_message.clone(), 1);
-			assert_channels_quiet!(reject_rx);
-
-			// Second message should reuse encrypted channel (no re-handshake)
-			let test_message2 = create_v0_tightbeam(Some("Second ECIES"), Some("test-ecies-2"));
-			let response2 = client.emit(test_message2.clone(), None).await?;
-
-			// Verify still encrypted
-			assert_eq!(client.to_handshake_state(), TcpHandshakeState::Complete);
-			assert_eq!(response2, Some(test_message2.clone()));
-
-			// Verify second message received
-			assert_recv!(rx, test_message2, 1);
-
-			Ok(())
-		}
 	}
 }

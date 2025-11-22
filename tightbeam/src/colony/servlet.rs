@@ -1621,6 +1621,7 @@ macro_rules! servlet {
 mod tests {
 	use std::sync::Arc;
 
+	use crate::compose;
 	use crate::der::Sequence;
 	use crate::transport::policy::PolicyConf;
 
@@ -1657,7 +1658,7 @@ mod tests {
 			let decoded: RequestMessage = crate::decode(&message.message)?;
 			let is_winner = decoded.lucky_number == config.lotto_number;
 			if decoded.content == "PING" {
-				 Ok(Some(crate::compose! {
+				 Ok(Some(compose! {
 					V0: id: message.metadata.id.clone(),
 						order: 1_700_000_000u64,
 						message: ResponseMessage {
@@ -1692,7 +1693,7 @@ mod tests {
 					lucky_number,
 				};
 
-				crate::compose! {
+				compose! {
 					V0: id: b"test-ping",
 						order: 1_700_000_000u64,
 						message: message
@@ -1796,7 +1797,7 @@ mod tests {
 					Err(_) => return Ok(None),
 				};
 
-				Ok(crate::compose! {
+				Ok(compose! {
 					V0: id: message.metadata.id.clone(),
 						message: ResponseMessage {
 							result: reply.result,
@@ -1828,7 +1829,7 @@ mod tests {
 						lucky_number,
 					};
 
-					crate::compose! { V0: id: b"test-ping", message: message }
+					compose! { V0: id: b"test-ping", message: message }
 				}
 
 				// Test winning case

@@ -528,188 +528,173 @@ mod tests {
 	const SALT: &[u8] = b"random_salt_value";
 
 	// Consolidated test for ECIES KDF basic functionality
-	crate::test_case! {
-		name: test_ecies_kdf_basic_functionality,
-		setup: || {
-			// Test cases for basic functionality and determinism
-			let basic_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-			let same_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-			// Test cases for input variation (different inputs should produce different outputs)
-			let different_pubkey = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33_ALT, shared_secret_32(), INFO_V1, None).unwrap();
-			let different_info = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None).unwrap();
-			let with_salt = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT)).unwrap();
+	#[test]
+	fn test_ecies_kdf_basic_functionality() -> crate::error::Result<()> {
+		// Test cases for basic functionality and determinism
+		let basic_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let same_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		// Test cases for input variation (different inputs should produce different outputs)
+		let different_pubkey =
+			ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33_ALT, shared_secret_32(), INFO_V1, None).unwrap();
+		let different_info = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None).unwrap();
+		let with_salt =
+			ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT)).unwrap();
 
-			// Test case for uncompressed pubkey (65 bytes)
-			let mut uncompressed_pubkey = [0u8; 65];
-			uncompressed_pubkey[0] = 0x04; // Uncompressed marker
-			for (i, byte) in uncompressed_pubkey.iter_mut().enumerate().skip(1) {
-				*byte = (i % 256) as u8;
-			}
-
-			let uncompressed_result = ecies_kdf::<HkdfSha3_256>(uncompressed_pubkey, shared_secret_32(), INFO_V1, None);
-			(basic_key, same_key, different_pubkey, different_info, with_salt, uncompressed_result)
-		},
-		assertions: |(basic_key, same_key, different_pubkey, different_info, with_salt, uncompressed_result)| {
-			// Basic functionality: key should be 32 bytes
-			assert_key_length(&basic_key, 32);
-			// Determinism: same inputs produce same outputs
-			assert_keys_equal(&basic_key, &same_key);
-			// Input variation: different inputs produce different outputs
-			assert_keys_different(&basic_key, &different_pubkey); // Different pubkey
-			assert_keys_different(&basic_key, &different_info); // Different info
-			assert_keys_different(&basic_key, &with_salt); // With vs without salt
-			// Uncompressed pubkey: should work and produce 32-byte key
-			assert!(uncompressed_result.is_ok());
-			assert_key_length(&uncompressed_result.unwrap(), 32);
-
-			Ok(())
+		// Test case for uncompressed pubkey (65 bytes)
+		let mut uncompressed_pubkey = [0u8; 65];
+		uncompressed_pubkey[0] = 0x04; // Uncompressed marker
+		for (i, byte) in uncompressed_pubkey.iter_mut().enumerate().skip(1) {
+			*byte = (i % 256) as u8;
 		}
+
+		let uncompressed_result = ecies_kdf::<HkdfSha3_256>(uncompressed_pubkey, shared_secret_32(), INFO_V1, None);
+
+		// Basic functionality: key should be 32 bytes
+		assert_key_length(&basic_key, 32);
+		// Determinism: same inputs produce same outputs
+		assert_keys_equal(&basic_key, &same_key);
+		// Input variation: different inputs produce different outputs
+		assert_keys_different(&basic_key, &different_pubkey); // Different pubkey
+		assert_keys_different(&basic_key, &different_info); // Different info
+		assert_keys_different(&basic_key, &with_salt); // With vs without salt
+												 // Uncompressed pubkey: should work and produce 32-byte key
+		assert!(uncompressed_result.is_ok());
+		assert_key_length(&uncompressed_result.unwrap(), 32);
+
+		Ok(())
 	}
 
 	// Consolidated test for ECIES KDF size variations
-	crate::test_case! {
-		name: test_ecies_kdf_size_variations,
-		setup: || {
-			// Test different key sizes
-			let keys_16 = ecies_kdf_with_size::<HkdfSha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-			let keys_32 = ecies_kdf_with_size::<HkdfSha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-			let keys_64 = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+	#[test]
+	fn test_ecies_kdf_size_variations() -> crate::error::Result<()> {
+		// Test different key sizes
+		let keys_16 =
+			ecies_kdf_with_size::<HkdfSha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let keys_32 =
+			ecies_kdf_with_size::<HkdfSha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let keys_64 =
+			ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
 
-			(keys_16, keys_32, keys_64)
-		},
-		assertions: |(keys_16, keys_32, keys_64)| {
-			let (k_enc_16, k_mac_16) = keys_16;
-			let (k_enc_32, k_mac_32) = keys_32;
-			let (k_enc_64, k_mac_64) = keys_64;
+		let (k_enc_16, k_mac_16) = keys_16;
+		let (k_enc_32, k_mac_32) = keys_32;
+		let (k_enc_64, k_mac_64) = keys_64;
 
-			// Check key lengths
-			assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
-			assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
-			assert_key_pair_lengths!(k_enc_64, k_mac_64, 64);
-			// Encryption and MAC keys should be different
-			assert_keys_different!(k_enc_32, k_mac_32);
+		// Check key lengths
+		assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
+		assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
+		assert_key_pair_lengths!(k_enc_64, k_mac_64, 64);
+		// Encryption and MAC keys should be different
+		assert_keys_different!(k_enc_32, k_mac_32);
 
-			Ok(())
-		}
+		Ok(())
 	}
 
 	// Consolidated test for input validation
-	crate::test_case! {
-		name: test_ecies_kdf_input_validation,
-		setup: || {
-			// Invalid input test cases
-			let short_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"short", shared_secret_32(), INFO_V1, None);
-			let wrong_size_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"wrong_size_ephemeral_key_34_bytes_", shared_secret_32(), INFO_V1, None);
-			let short_secret_result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, Secret::from(b"short".to_vec()), INFO_V1, None);
-			let long_secret_result = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, Secret::from(b"shared_secret_that_is_too_long____".to_vec()), INFO_V1, None);
+	#[test]
+	fn test_ecies_kdf_input_validation() -> crate::error::Result<()> {
+		// Invalid input test cases
+		let short_pubkey_result = ecies_kdf::<HkdfSha3_256>(b"short", shared_secret_32(), INFO_V1, None);
+		let wrong_size_pubkey_result =
+			ecies_kdf::<HkdfSha3_256>(b"wrong_size_ephemeral_key_34_bytes_", shared_secret_32(), INFO_V1, None);
+		let short_secret_result =
+			ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, Secret::from(b"short".to_vec()), INFO_V1, None);
+		let long_secret_result = ecies_kdf::<HkdfSha3_256>(
+			EPHEMERAL_PUBKEY_33,
+			Secret::from(b"shared_secret_that_is_too_long____".to_vec()),
+			INFO_V1,
+			None,
+		);
 
-			(short_pubkey_result, wrong_size_pubkey_result, short_secret_result, long_secret_result)
-		},
-		assertions: |(short_pubkey_result, wrong_size_pubkey_result, short_secret_result, long_secret_result)| {
-			// Invalid public key lengths
-			assert_kdf_error!(short_pubkey_result, InvalidPublicKeyLength(5));
-			assert_kdf_error!(wrong_size_pubkey_result, InvalidPublicKeyLength(34));
-			// Invalid shared secret lengths
-			assert_kdf_error!(short_secret_result, InvalidSharedSecretLength(5));
-			assert_kdf_error!(long_secret_result, InvalidSharedSecretLength(34));
+		// Invalid public key lengths
+		assert_kdf_error!(short_pubkey_result, InvalidPublicKeyLength(5));
+		assert_kdf_error!(wrong_size_pubkey_result, InvalidPublicKeyLength(34));
+		// Invalid shared secret lengths
+		assert_kdf_error!(short_secret_result, InvalidSharedSecretLength(5));
+		assert_kdf_error!(long_secret_result, InvalidSharedSecretLength(34));
 
-			Ok(())
-		}
+		Ok(())
 	}
 
 	// Consolidated test for general-purpose HKDF
-	crate::test_case! {
-		name: test_hkdf_sha3_256_basic,
-		setup: || {
-			let ikm = b"input_key_material";
-			let info = b"test_info";
+	#[test]
+	fn test_hkdf_sha3_256_basic() -> crate::error::Result<()> {
+		let ikm = b"input_key_material";
+		let info = b"test_info";
 
-			// Test different key sizes
-			let key_16 = hkdf::<HkdfSha3_256, 16>(ikm, info, None).unwrap();
-			let key_32 = hkdf::<HkdfSha3_256, 32>(ikm, info, None).unwrap();
-			let key_64 = hkdf::<HkdfSha3_256, 64>(ikm, info, None).unwrap();
+		// Test different key sizes
+		let key_16 = hkdf::<HkdfSha3_256, 16>(ikm, info, None).unwrap();
+		let key_32 = hkdf::<HkdfSha3_256, 32>(ikm, info, None).unwrap();
+		let key_64 = hkdf::<HkdfSha3_256, 64>(ikm, info, None).unwrap();
 
-			// Determinism test
-			let key_32_again = hkdf::<HkdfSha3_256, 32>(ikm, info, None).unwrap();
-			// Different inputs test
-			let key_different = hkdf::<HkdfSha3_256, 32>(b"different_ikm", info, None).unwrap();
+		// Determinism test
+		let key_32_again = hkdf::<HkdfSha3_256, 32>(ikm, info, None).unwrap();
+		// Different inputs test
+		let key_different = hkdf::<HkdfSha3_256, 32>(b"different_ikm", info, None).unwrap();
 
-			(key_16, key_32, key_64, key_32_again, key_different)
-		},
-		assertions: |(key_16, key_32, key_64, key_32_again, key_different)| {
-			// Check key lengths
-			assert_key_length!(key_16, 16);
-			assert_key_length!(key_32, 32);
-			assert_key_length!(key_64, 64);
-			// Same inputs should produce same outputs (determinism)
-			assert_eq!(key_32[..], key_32_again[..]);
-			// Different inputs should produce different outputs
-			assert_keys_different!(key_32, key_different);
+		// Check key lengths
+		assert_key_length!(key_16, 16);
+		assert_key_length!(key_32, 32);
+		assert_key_length!(key_64, 64);
+		// Same inputs should produce same outputs (determinism)
+		assert_eq!(key_32[..], key_32_again[..]);
+		// Different inputs should produce different outputs
+		assert_keys_different!(key_32, key_different);
 
-			Ok(())
-		}
+		Ok(())
 	}
 
 	// Test bounds checking for dual key derivation
-	crate::test_case! {
-		name: test_ecies_kdf_bounds_checking,
-		setup: || {
-			// Test maximum allowed key size (64 bytes * 2 = 128 bytes = MAX_HKDF_OUTPUT_SIZE)
-			let max_size_result = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None);
-			// Test oversized key size that should fail (65 bytes * 2 = 130 bytes > MAX_HKDF_OUTPUT_SIZE)
-			let oversized_result = ecies_kdf_with_size::<HkdfSha3_256, 65>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None);
+	#[test]
+	fn test_ecies_kdf_bounds_checking() -> crate::error::Result<()> {
+		// Test maximum allowed key size (64 bytes * 2 = 128 bytes = MAX_HKDF_OUTPUT_SIZE)
+		let max_size_result =
+			ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None);
+		// Test oversized key size that should fail (65 bytes * 2 = 130 bytes > MAX_HKDF_OUTPUT_SIZE)
+		let oversized_result =
+			ecies_kdf_with_size::<HkdfSha3_256, 65>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None);
 
-			(max_size_result, oversized_result)
-		},
-		assertions: |(max_size_result, oversized_result)| {
-			// Maximum allowed size should work
-			assert!(max_size_result.is_ok());
-			let (k_enc, k_mac) = max_size_result.unwrap();
-			assert_key_pair_lengths!(k_enc, k_mac, 64);
+		// Maximum allowed size should work
+		assert!(max_size_result.is_ok());
+		let (k_enc, k_mac) = max_size_result.unwrap();
+		assert_key_pair_lengths!(k_enc, k_mac, 64);
 
-			// Oversized key should fail with DerivationFailed
-			assert!(oversized_result.is_err());
-			assert!(matches!(oversized_result, Err(KdfError::DerivationFailed(_))));
+		// Oversized key should fail with DerivationFailed
+		assert!(oversized_result.is_err());
+		assert!(matches!(oversized_result, Err(KdfError::DerivationFailed(_))));
 
-			Ok(())
-		}
+		Ok(())
 	}
 
 	// Smoke tests for ANSI X9.63 provider over SHA3-256
-	crate::test_case! {
-		name: test_x963_ecies_kdf_basic,
-		setup: || {
-			let key1 = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-			let key1_again = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-			let key_diff_info = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None).unwrap();
-			// Salt is ignored by X9.63; with vs without salt should be equal
-			let key_with_salt = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT)).unwrap();
-			(key1, key1_again, key_diff_info, key_with_salt)
-		},
-		assertions: |(key1, key1_again, key_diff_info, key_with_salt)| {
-			assert_key_length(&key1, 32);
-			assert_keys_equal(&key1, &key1_again);
-			assert_keys_different(&key1, &key_diff_info);
-			// Salt should have no effect in X9.63
-			assert_keys_equal(&key1, &key_with_salt);
-			Ok(())
-		}
+	#[test]
+	fn test_x963_ecies_kdf_basic() -> crate::error::Result<()> {
+		let key1 = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let key1_again = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let key_diff_info = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None).unwrap();
+		// Salt is ignored by X9.63; with vs without salt should be equal
+		let key_with_salt =
+			ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT)).unwrap();
+
+		assert_key_length(&key1, 32);
+		assert_keys_equal(&key1, &key1_again);
+		assert_keys_different(&key1, &key_diff_info);
+		// Salt should have no effect in X9.63
+		assert_keys_equal(&key1, &key_with_salt);
+		Ok(())
 	}
 
-	crate::test_case! {
-		name: test_x963_ecies_kdf_size_variations,
-		setup: || {
-			let keys_16 = ecies_kdf_with_size::<X963Sha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-			let keys_32 = ecies_kdf_with_size::<X963Sha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-			(keys_16, keys_32)
-		},
-		assertions: |(keys_16, keys_32)| {
-			let (k_enc_16, k_mac_16) = keys_16;
-			let (k_enc_32, k_mac_32) = keys_32;
-			assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
-			assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
-			assert_keys_different!(k_enc_32, k_mac_32);
-			Ok(())
-		}
+	#[test]
+	fn test_x963_ecies_kdf_size_variations() -> crate::error::Result<()> {
+		let keys_16 =
+			ecies_kdf_with_size::<X963Sha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let keys_32 =
+			ecies_kdf_with_size::<X963Sha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+
+		let (k_enc_16, k_mac_16) = keys_16;
+		let (k_enc_32, k_mac_32) = keys_32;
+		assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
+		assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
+		assert_keys_different!(k_enc_32, k_mac_32);
+		Ok(())
 	}
 }

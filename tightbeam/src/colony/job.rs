@@ -102,13 +102,14 @@ macro_rules! job {
 #[cfg(test)]
 mod tests {
 	use crate::colony::drone::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
+	use crate::compose;
 	use crate::error::Result;
 	use crate::Frame;
 
 	job! {
 		name: SpawnServletJob,
 		fn run(servlet_type: &str, config: Option<Vec<u8>>) -> Result<Frame> {
-			crate::compose! {
+			compose! {
 				V0: id: "spawn-req",
 					message: HiveManagementRequest {
 						spawn: Some(SpawnServletParams {
@@ -125,7 +126,7 @@ mod tests {
 	job! {
 		name: ListServletsJob,
 		fn run() -> Result<Frame> {
-			crate::compose! {
+			compose! {
 				V0: id: "list-req",
 					message: HiveManagementRequest {
 						spawn: None,
@@ -139,7 +140,7 @@ mod tests {
 	job! {
 		name: StopServletJob,
 		fn run(servlet_id: &str) -> Result<Frame> {
-			crate::compose! {
+			compose! {
 				V0: id: "stop-req",
 					message: HiveManagementRequest {
 						spawn: None,
@@ -157,7 +158,7 @@ mod tests {
 		async fn run(x: u64, y: u64) -> Result<Frame> {
 			// Simulate async work
 			let result = x + y;
-			crate::compose! {
+			compose! {
 				V0: id: "calc-result",
 					message: crate::testing::TestMessage { content: result.to_string() }
 			}

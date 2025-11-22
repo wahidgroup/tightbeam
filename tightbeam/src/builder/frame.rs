@@ -668,7 +668,7 @@ mod tests {
 	use super::*;
 	use crate::compress::ZstdCompression;
 	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
-	use crate::{compose, test_builder, test_case};
+	use crate::{compose, test_builder};
 
 	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
 	use crate::crypto::hash::Sha3_256;
@@ -871,64 +871,51 @@ mod tests {
 		}
 	}
 
+	#[test]
 	#[cfg(feature = "sha3")]
-	test_case! {
-		name: test_missing_message,
-		setup: || {
-			FrameBuilder::<TestMessage>::from(Version::V0)
-				.with_id("no-message")
-				.with_order(1696521600)
-				.with_message_hasher::<Sha3_256>()
-				.build()
-		},
-		assertions: |result: Result<Frame>| {
-			assert!(result.is_err());
-			Ok(())
-		}
+	fn test_missing_message() {
+		let result = FrameBuilder::<TestMessage>::from(Version::V0)
+			.with_id("no-message")
+			.with_order(1696521600)
+			.with_message_hasher::<Sha3_256>()
+			.build();
+		assert!(result.is_err());
 	}
 
+	#[test]
 	#[cfg(feature = "sha3")]
-	test_case! {
-		name: test_error_accumulation,
-		setup: || {
-			let message = create_test_message(None);
-			FrameBuilder::from(Version::V0)
-				.with_id("error-test")
-				.with_order(1696521600)
-				.with_message_hasher::<Sha3_256>()
-				.with_message(message)
-				.build()
-		},
-		assertions: |result: Result<Frame>| {
-			assert!(result.is_err());
-			assert!(matches!(result, Err(TightBeamError::Sequence(_))));
-			Ok(())
-		}
+	fn test_error_accumulation() {
+		let message = create_test_message(None);
+		let result = FrameBuilder::from(Version::V0)
+			.with_id("error-test")
+			.with_order(1696521600)
+			.with_message_hasher::<Sha3_256>()
+			.with_message(message)
+			.build();
+		assert!(result.is_err());
+		assert!(matches!(result, Err(TightBeamError::Sequence(_))));
 	}
 
+	#[test]
 	#[cfg(feature = "derive")]
-	test_case! {
-		name: test_compose_macro,
-		setup: || {
-			let message = create_test_message(None);
-			compose! {
-				V0:
-					id: "test-id",
-					order: 1696521600,
-					message: message,
-					message_integrity: type Sha3_256
-			}
-		},
-		assertions: |result: Result<Frame>| {
-			let tightbeam = result?;
-			assert_eq!(tightbeam.version, Version::V0);
-			assert_eq!(tightbeam.metadata.id, b"test-id");
-			assert_eq!(tightbeam.metadata.order, 1696521600);
-			Ok(())
-		}
+	fn test_compose_macro() -> Result<()> {
+		let message = create_test_message(None);
+		let result = compose! {
+			V0:
+				id: "test-id",
+				order: 1696521600,
+				message: message,
+				message_integrity: type Sha3_256
+		};
+		let tightbeam = result?;
+		assert_eq!(tightbeam.version, Version::V0);
+		assert_eq!(tightbeam.metadata.id, b"test-id");
+		assert_eq!(tightbeam.metadata.order, 1696521600);
+		Ok(())
 	}
 
 	mod validation {
+		use super::*;
 		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
@@ -974,7 +961,7 @@ mod tests {
 
 				// Test 4: Verify version enforcement
 				if $min_version > Version::V0 {
-					let result_v0 = crate::compose! {
+					let result_v0 = compose! {
 						V0: id: $name, order: 1u64, message: message.clone()
 					};
 					assert!(result_v0.is_err());
@@ -1118,60 +1105,60 @@ mod tests {
 					+ Clone,
 			{
 				match (confidential, nonrepudiable, message_integrity, frame_integrity) {
-					(true, true, true, true) => crate::compose! {
+					(true, true, true, true) => compose! {
 						V2: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
 						nonrepudiation<Secp256k1Signature, _>: signing_key,
 						message_integrity: type Sha3_256,
 						frame_integrity: type Sha3_256
 					},
-					(true, false, true, _) => crate::compose! {
+					(true, false, true, _) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
 						message_integrity: type Sha3_256
 					},
-					(true, false, false, _) => crate::compose! {
+					(true, false, false, _) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher
 					},
-					(false, true, true, _) => crate::compose! {
+					(false, true, true, _) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						nonrepudiation<Secp256k1Signature, _>: signing_key,
 						message_integrity: type Sha3_256
 					},
-					(false, true, false, _) => crate::compose! {
+					(false, true, false, _) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						nonrepudiation<Secp256k1Signature, _>: signing_key
 					},
-					(false, false, true, true) => crate::compose! {
+					(false, false, true, true) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						message_integrity: type Sha3_256,
 						frame_integrity: type Sha3_256
 					},
-					(false, false, true, false) => crate::compose! {
+					(false, false, true, false) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						message_integrity: type Sha3_256
 					},
-					(false, false, false, true) => crate::compose! {
+					(false, false, false, true) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						frame_integrity: type Sha3_256
 					},
-					(false, false, false, false) => crate::compose! {
+					(false, false, false, false) => compose! {
 						V0: id: test_name, order: 1u64, message: message.clone()
 					},
-					(true, true, true, false) => crate::compose! {
+					(true, true, true, false) => compose! {
 						V2: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
 						nonrepudiation<Secp256k1Signature, _>: signing_key,
 						message_integrity: type Sha3_256
 					},
-					(true, true, false, true) => crate::compose! {
+					(true, true, false, true) => compose! {
 						V2: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
 						nonrepudiation<Secp256k1Signature, _>: signing_key,
 						frame_integrity: type Sha3_256
 					},
-					(true, true, false, false) => crate::compose! {
+					(true, true, false, false) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
 						nonrepudiation<Secp256k1Signature, _>: signing_key

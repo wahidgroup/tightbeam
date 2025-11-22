@@ -94,6 +94,7 @@ macro_rules! policy {
 mod tests {
 	#![allow(unused_variables)]
 
+	use crate::compose;
 	use crate::der::Sequence;
 	use crate::policy::{GatePolicy, ReceptorPolicy, TransitStatus};
 	use crate::transport::policy::RetryAction;
@@ -132,7 +133,7 @@ mod tests {
 	#[test]
 	fn test_gate_policy() -> Result<(), crate::TightBeamError> {
 		let gate = TestGateBusy;
-		let frame = crate::compose! {
+		let frame = compose! {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
 		assert_eq!(gate.evaluate(&frame), TransitStatus::Busy);

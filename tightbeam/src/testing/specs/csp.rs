@@ -579,7 +579,7 @@ mod tests {
 	use crate::transport::Protocol;
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	use crate::servlet;
+	use crate::{compose, exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
 
 	#[test]
 	fn builder_creates_valid_process() {
@@ -726,7 +726,7 @@ mod tests {
 	fn test_csp_process_spec_structure() {
 		// Define CSP process using tb_process_spec! macro
 		// This models the theoretical state machine behavior
-		crate::tb_process_spec! {
+		tb_process_spec! {
 			pub ComprehensiveHandshake,
 			events {
 				observable { "start", "send", "ack", "fail" }
@@ -952,19 +952,19 @@ mod tests {
 	}
 
 	// Integration test with tb_scenario! for Bare environment
-	crate::tb_assert_spec! {
+	tb_assert_spec! {
 		pub SimpleBareFlowSpec,
 		V(1,0,0): {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				("step1", crate::exactly!(1)),
-				("step2", crate::exactly!(1))
+				("step1", exactly!(1)),
+				("step2", exactly!(1))
 			]
 		},
 	}
 
-	crate::tb_process_spec! {
+	tb_process_spec! {
 		pub SimpleBareFlowProc,
 		events {
 			observable { "step1", "step2" }
@@ -977,7 +977,7 @@ mod tests {
 		terminal { S2 }
 	}
 
-	crate::tb_scenario! {
+	tb_scenario! {
 		name: test_csp_with_bare_environment,
 		spec: SimpleBareFlowSpec,
 		csp: SimpleBareFlowProc,
@@ -991,21 +991,21 @@ mod tests {
 	}
 
 	// Define the assertion spec (what to validate at runtime)
-	crate::tb_assert_spec! {
+	tb_assert_spec! {
 		pub ClientServerFlowSpec,
 		V(1,0,0): {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				("Received", crate::exactly!(2)),
-				("Responded", crate::exactly!(2))
+				("Received", exactly!(2)),
+				("Responded", exactly!(2))
 			]
 		},
 	}
 
 	// Define the CSP process spec (theoretical state machine model)
 	// Models the client-server request-response flow with assertions
-	crate::tb_process_spec! {
+	tb_process_spec! {
 		pub ClientServerFlowProc,
 		events {
 			observable { "Received", "Responded" }
@@ -1053,7 +1053,7 @@ mod tests {
 				trace.event("Responded");
 
 				let test_message = create_test_message(None);
-				let test_frame = crate::compose! {
+				let test_frame = compose! {
 					V0: id: "test", order: 1u64, message: test_message
 				}?;
 
@@ -1092,7 +1092,7 @@ mod tests {
 
 	// Test using the new Servlet environment
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
-	crate::tb_scenario! {
+	tb_scenario! {
 		name: test_servlet_environment_integration,
 		spec: ClientServerFlowSpec,
 		csp: ClientServerFlowProc,
@@ -1111,7 +1111,7 @@ mod tests {
 				trace.event("Responded");
 
 				let test_message = create_test_message(None);
-				let test_frame = crate::compose! {
+				let test_frame = compose! {
 					V0: id: "test", order: 1u64, message: test_message
 				}?;
 

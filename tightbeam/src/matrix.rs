@@ -323,172 +323,169 @@ impl TryFrom<Option<Asn1Matrix>> for MatrixDyn {
 mod tests {
 	use super::*;
 
+	#[test]
 	#[cfg(feature = "std")]
-	crate::test_case! {
-		name: test_matrix_like_reality_end_to_end,
-		setup: || {
-			// Build a 3×3 from row-major bytes 0..9
-			let bytes: Vec<u8> = (0u8..9u8).collect();
-			let dyn_ok = MatrixDyn::from_row_major(3, bytes.clone()).expect("n*n bytes");
-			let stat_ok: Matrix<3> = Matrix::<3>::from_row_major(&bytes);
-			(dyn_ok, stat_ok, bytes)
-		},
-		assertions: |triple| {
-			let (mut dyn_m, mut stat_m, bytes) = triple;
+	fn test_matrix_like_reality_end_to_end() -> crate::error::Result<()> {
+		// Build a 3×3 from row-major bytes 0..9
+		let bytes: Vec<u8> = (0u8..9u8).collect();
+		let mut dyn_m = MatrixDyn::from_row_major(3, bytes.clone()).expect("n*n bytes");
+		let mut stat_m: Matrix<3> = Matrix::<3>::from_row_major(&bytes);
 
-			// Paint identity for any MatrixLike without recursion.
-			fn paint_diag<M: MatrixLike>(m: &mut M) {
-				let n = m.n();
-				// Ensure non-diagonal cells are zeroed
-				m.clear();
-				for i in 0..n {
-					m.set(i, i, 1);
-				}
+		// Paint identity for any MatrixLike without recursion.
+		fn paint_diag<M: MatrixLike>(m: &mut M) {
+			let n = m.n();
+			// Ensure non-diagonal cells are zeroed
+			m.clear();
+			for i in 0..n {
+				m.set(i, i, 1);
 			}
-
-			// Dimensions
-			assert_eq!(dyn_m.n(), 3);
-			assert_eq!(stat_m.n(), 3);
-
-			// Row views match source bytes
-			assert_eq!(dyn_m.row(1).unwrap(), &[3, 4, 5]);
-			assert_eq!(stat_m.row(1).unwrap().as_slice(), &[3, 4, 5]);
-
-			// Indexing
-			assert_eq!(dyn_m.get(2, 2), 8);
-			assert_eq!(stat_m.get(0, 2), 2);
-
-			// Paint identity on both
-			paint_diag(&mut dyn_m);
-			paint_diag(&mut stat_m);
-
-			// Validate diagonal = 1, others = 0
-			for r in 0..3 {
-				for c in 0..3 {
-					let dv = dyn_m.get(r, c);
-					let sv = stat_m.get(r, c);
-					if r == c {
-						assert_eq!(dv, 1);
-						assert_eq!(sv, 1);
-					} else {
-						assert_eq!(dv, 0);
-						assert_eq!(sv, 0);
-					}
-				}
-			}
-
-			// Fill and clear
-			dyn_m.fill(7);
-			for r in 0..3 { for c in 0..3 { assert_eq!(dyn_m.get(r, c), 7); } }
-			dyn_m.clear();
-			for r in 0..3 { for c in 0..3 { assert_eq!(dyn_m.get(r, c), 0); } }
-
-			// Byte view length and static reconstruction
-			assert_eq!(dyn_m.as_bytes().len(), 9);
-			let stat_bytes = Matrix::<3>::from_row_major(&bytes);
-			assert_eq!(stat_bytes.row(0).unwrap(), &[0, 1, 2]);
-
-			// Invalid constructor length rejected
-			assert!(MatrixDyn::from_row_major(3, vec![0u8; 8]).is_none());
-
-			Ok(())
 		}
+
+		// Dimensions
+		assert_eq!(dyn_m.n(), 3);
+		assert_eq!(stat_m.n(), 3);
+
+		// Row views match source bytes
+		assert_eq!(dyn_m.row(1).unwrap(), &[3, 4, 5]);
+		assert_eq!(stat_m.row(1).unwrap().as_slice(), &[3, 4, 5]);
+
+		// Indexing
+		assert_eq!(dyn_m.get(2, 2), 8);
+		assert_eq!(stat_m.get(0, 2), 2);
+
+		// Paint identity on both
+		paint_diag(&mut dyn_m);
+		paint_diag(&mut stat_m);
+
+		// Validate diagonal = 1, others = 0
+		for r in 0..3 {
+			for c in 0..3 {
+				let dv = dyn_m.get(r, c);
+				let sv = stat_m.get(r, c);
+				if r == c {
+					assert_eq!(dv, 1);
+					assert_eq!(sv, 1);
+				} else {
+					assert_eq!(dv, 0);
+					assert_eq!(sv, 0);
+				}
+			}
+		}
+
+		// Fill and clear
+		dyn_m.fill(7);
+		for r in 0..3 {
+			for c in 0..3 {
+				assert_eq!(dyn_m.get(r, c), 7);
+			}
+		}
+		dyn_m.clear();
+		for r in 0..3 {
+			for c in 0..3 {
+				assert_eq!(dyn_m.get(r, c), 0);
+			}
+		}
+
+		// Byte view length and static reconstruction
+		assert_eq!(dyn_m.as_bytes().len(), 9);
+		let stat_bytes = Matrix::<3>::from_row_major(&bytes);
+		assert_eq!(stat_bytes.row(0).unwrap(), &[0, 1, 2]);
+
+		// Invalid constructor length rejected
+		assert!(MatrixDyn::from_row_major(3, vec![0u8; 8]).is_none());
+
+		Ok(())
 	}
 
+	#[test]
 	#[cfg(feature = "std")]
-	crate::test_case! {
-		name: test_matrix_specification_compliance,
-		setup: || {
-			// Test data for various matrix sizes
-			let test_matrices = vec![
-				(1u8, vec![42u8]),
-				(2u8, vec![1, 2, 3, 4]),
-				(3u8, (0u8..9u8).collect()),
-				(255u8, vec![0u8; 255 * 255]),
-			];
+	fn test_matrix_specification_compliance() -> crate::error::Result<()> {
+		// Test data for various matrix sizes
+		let test_matrices = vec![
+			(1u8, vec![42u8]),
+			(2u8, vec![1, 2, 3, 4]),
+			(3u8, (0u8..9u8).collect()),
+			(255u8, vec![0u8; 255 * 255]),
+		];
 
-			test_matrices
-		},
-		assertions: |test_matrices| {
-			// Test 1: Wire format compliance (n ∈ [1, 255], data.len == n*n)
-			for (n, data) in &test_matrices {
-				// Valid construction
-				let asn1_matrix = Asn1Matrix { n: *n, data: data.clone() };
+		// Test 1: Wire format compliance (n ∈ [1, 255], data.len == n*n)
+		for (n, data) in &test_matrices {
+			// Valid construction
+			let asn1_matrix = Asn1Matrix { n: *n, data: data.clone() };
 
-				// Validate n bounds
-				assert!(*n >= 1);
+			// Validate n bounds
+			assert!(*n >= 1);
 
-				// Validate data length equals n*n
-				let expected_len = (*n as usize) * (*n as usize);
-				assert_eq!(data.len(), expected_len);
+			// Validate data length equals n*n
+			let expected_len = (*n as usize) * (*n as usize);
+			assert_eq!(data.len(), expected_len);
 
-				// Test conversion to MatrixDyn preserves row-major ordering
-				let matrix_dyn = MatrixDyn::try_from(&asn1_matrix)?;
-				assert_eq!(matrix_dyn.n(), *n);
-				assert_eq!(matrix_dyn.as_bytes(), data.as_slice());
-			}
-
-			// Test 2: Error handling - invalid n (n == 0)
-			let invalid_n = MatrixDyn::try_from(0u8);
-			assert!(invalid_n.is_err());
-
-			// Test 3: Error handling - length mismatch
-			let invalid_asn1 = Asn1Matrix { n: 2, data: vec![1, 2, 3] }; // 3 != 2*2
-			let invalid_conversion = MatrixDyn::try_from(invalid_asn1);
-			assert!(invalid_conversion.is_err());
-
-			// Test 4: Row-major ordering preservation
-			// Fill with values: row 0 = [10, 11, 12], row 1 = [20, 21, 22], row 2 = [30, 31, 32]
-			let matrix_3x3 = MatrixDyn::try_from(3u8)?;
-			let mut test_matrix = matrix_3x3;
-			for r in 0..3 {
-				for c in 0..3 {
-					let value = (r + 1) * 10 + c;
-					test_matrix.set(r, c, value);
-				}
-			}
-
-			// Verify row-major layout
-			let expected_bytes = vec![10, 11, 12, 20, 21, 22, 30, 31, 32];
-			assert_eq!(test_matrix.as_bytes(), expected_bytes.as_slice());
-
-			// Test 5: MatrixLike trait compliance
-			let mut matrix = MatrixDyn::try_from(2u8)?;
-
-			// Test get/set operations
-			matrix.set(0, 1, 99);
-			assert_eq!(matrix.get(0, 1), 99);
-
-			// Test out-of-bounds behavior (returns 0, no-op for set)
-			assert_eq!(matrix.get(5, 5), 0);
-			matrix.set(5, 5, 123); // Should be no-op
-
-			// Test fill operation
-			matrix.fill(77);
-			for r in 0..2 {
-				for c in 0..2 {
-					assert_eq!(matrix.get(r, c), 77);
-				}
-			}
-
-			// Test clear operation
-			matrix.clear();
-			for r in 0..2 {
-				for c in 0..2 {
-					assert_eq!(matrix.get(r, c), 0);
-				}
-			}
-
-			// Test 6: Conversion consistency between Matrix<N> and MatrixDyn
-			let static_matrix: Matrix<3> = Matrix::from_row_major(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
-			let dynamic_matrix = MatrixDyn::from_row_major(3, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
-			for r in 0..3 {
-				for c in 0..3 {
-					assert_eq!(static_matrix.get(r, c), dynamic_matrix.get(r, c));
-				}
-			}
-
-			Ok(())
+			// Test conversion to MatrixDyn preserves row-major ordering
+			let matrix_dyn = MatrixDyn::try_from(&asn1_matrix)?;
+			assert_eq!(matrix_dyn.n(), *n);
+			assert_eq!(matrix_dyn.as_bytes(), data.as_slice());
 		}
+
+		// Test 2: Error handling - invalid n (n == 0)
+		let invalid_n = MatrixDyn::try_from(0u8);
+		assert!(invalid_n.is_err());
+
+		// Test 3: Error handling - length mismatch
+		let invalid_asn1 = Asn1Matrix { n: 2, data: vec![1, 2, 3] }; // 3 != 2*2
+		let invalid_conversion = MatrixDyn::try_from(invalid_asn1);
+		assert!(invalid_conversion.is_err());
+
+		// Test 4: Row-major ordering preservation
+		// Fill with values: row 0 = [10, 11, 12], row 1 = [20, 21, 22], row 2 = [30, 31, 32]
+		let matrix_3x3 = MatrixDyn::try_from(3u8)?;
+		let mut test_matrix = matrix_3x3;
+		for r in 0..3 {
+			for c in 0..3 {
+				let value = (r + 1) * 10 + c;
+				test_matrix.set(r, c, value);
+			}
+		}
+
+		// Verify row-major layout
+		let expected_bytes = vec![10, 11, 12, 20, 21, 22, 30, 31, 32];
+		assert_eq!(test_matrix.as_bytes(), expected_bytes.as_slice());
+
+		// Test 5: MatrixLike trait compliance
+		let mut matrix = MatrixDyn::try_from(2u8)?;
+
+		// Test get/set operations
+		matrix.set(0, 1, 99);
+		assert_eq!(matrix.get(0, 1), 99);
+
+		// Test out-of-bounds behavior (returns 0, no-op for set)
+		assert_eq!(matrix.get(5, 5), 0);
+		matrix.set(5, 5, 123); // Should be no-op
+
+		// Test fill operation
+		matrix.fill(77);
+		for r in 0..2 {
+			for c in 0..2 {
+				assert_eq!(matrix.get(r, c), 77);
+			}
+		}
+
+		// Test clear operation
+		matrix.clear();
+		for r in 0..2 {
+			for c in 0..2 {
+				assert_eq!(matrix.get(r, c), 0);
+			}
+		}
+
+		// Test 6: Conversion consistency between Matrix<N> and MatrixDyn
+		let static_matrix: Matrix<3> = Matrix::from_row_major(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+		let dynamic_matrix = MatrixDyn::from_row_major(3, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+		for r in 0..3 {
+			for c in 0..3 {
+				assert_eq!(static_matrix.get(r, c), dynamic_matrix.get(r, c));
+			}
+		}
+
+		Ok(())
 	}
 }

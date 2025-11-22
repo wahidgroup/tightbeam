@@ -317,11 +317,11 @@ mod tests {
 		vec,
 		vec::Vec,
 	};
-	use tightbeam_derive::Beamable;
 
 	use crate::compose;
 	use crate::testing::create_test_cipher_key;
 	use crate::testing::{create_test_message, create_test_signing_key};
+	use crate::Beamable;
 	use crate::MessagePriority;
 
 	use super::*;

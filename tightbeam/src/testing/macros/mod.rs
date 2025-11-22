@@ -2873,7 +2873,6 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::tb_assert_spec;
 	use crate::testing::create_test_message;
 	use crate::testing::utils::TestMessage;
 	use crate::trace::ExecutionMode;
@@ -2882,6 +2881,7 @@ mod tests {
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;
 	use crate::transport::Protocol;
+	use crate::{compose, tb_assert_spec};
 
 	#[test]
 	fn cardinality_basic() {
@@ -3058,7 +3058,7 @@ mod tests {
 			},
 			client: |_trace: TraceCollector, mut client| async move {
 				let test_message = create_test_message(None);
-				let test_frame = crate::compose! {
+				let test_frame = compose! {
 					V0: id: "test", order: 1u64, message: test_message
 				}?;
 
@@ -3106,7 +3106,7 @@ mod tests {
 				trace.event("Responded");
 
 				let test_message = create_test_message(None);
-				let test_frame = crate::compose! {
+				let test_frame = compose! {
 					V0: id: "test", order: 1u64, message: test_message
 					}?;
 
