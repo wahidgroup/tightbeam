@@ -1,7 +1,6 @@
-#![cfg(feature = "x509")]
-
 #[cfg(not(feature = "std"))]
 extern crate alloc;
+
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 
@@ -15,25 +14,30 @@ use crate::builder::TypeBuilder;
 use crate::crypto::aead::RuntimeAead;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::Encode;
-use crate::prelude::TightBeamSocketAddr;
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::{
 	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 };
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::tcp::TcpListenerTrait;
-use crate::transport::{EncryptedMessageIO, EncryptedProtocol, Protocol, ResponsePackage, TransportEncryptionConfig};
-use crate::transport::{MessageIO, Pingable, TransportResult};
+use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
+use crate::transport::{
+	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageEmitter, MessageIO, Pingable, Protocol,
+	ResponsePackage, TransportEncryptionConfig, TransportResult,
+};
 use crate::x509::Certificate;
 use crate::Frame;
 
 #[cfg(feature = "transport-policy")]
-use crate::{
-	policy::GatePolicy,
-	transport::{
-		error::TransportError, policy::RestartPolicy, tcp::ProtocolStream, EnvelopeBuilder, EnvelopeLimits, WireMode,
-	},
-};
+mod policy {
+	pub use crate::policy::GatePolicy;
+	pub use crate::policy::TransitStatus;
+	pub use crate::transport::error::TransportError;
+	pub use crate::transport::policy::RestartPolicy;
+	pub use crate::transport::{EnvelopeBuilder, EnvelopeLimits, ProtocolStream, WireMode};
+}
+
+#[cfg(feature = "transport-policy")]
+use policy::*;
 
 pub struct TcpTransport<S: ProtocolStream> {
 	stream: S,
@@ -186,26 +190,22 @@ where
 }
 
 #[cfg(feature = "transport-policy")]
-impl<S: ProtocolStream> crate::transport::MessageCollector for TcpTransport<S>
+impl<S: ProtocolStream> MessageCollector for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
-	type CollectorGate = dyn crate::policy::GatePolicy;
+	type CollectorGate = dyn GatePolicy;
 
 	fn collector_gate(&self) -> &Self::CollectorGate {
 		self.collector_gate.as_ref()
 	}
 
-	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, crate::policy::TransitStatus)> {
+	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
 		// Use the default trait implementation
 		self.collect_message_with_encryption().await
 	}
 
-	async fn send_response(
-		&mut self,
-		status: crate::policy::TransitStatus,
-		message: Option<Frame>,
-	) -> TransportResult<()> {
+	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
 		let response_pkg = ResponsePackage { status, message: message.map(Arc::new) };
 		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, self.max_encrypted_envelope);
 		let mut builder = limits.apply(EnvelopeBuilder::response(response_pkg));
@@ -224,12 +224,12 @@ where
 }
 
 #[cfg(feature = "transport-policy")]
-impl<S: ProtocolStream> crate::transport::MessageEmitter for TcpTransport<S>
+impl<S: ProtocolStream> MessageEmitter for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
-	type EmitterGate = dyn crate::policy::GatePolicy;
-	type RestartPolicy = dyn crate::transport::policy::RestartPolicy;
+	type EmitterGate = dyn GatePolicy;
+	type RestartPolicy = dyn RestartPolicy;
 
 	fn to_restart_policy_ref(&self) -> &Self::RestartPolicy {
 		self.restart_policy.as_ref()
@@ -243,7 +243,7 @@ where
 	async fn perform_send_receive(
 		&mut self,
 		message: Frame,
-	) -> TransportResult<(crate::policy::TransitStatus, Option<Frame>, Option<Frame>)> {
+	) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)> {
 		// Ensure handshake is complete
 		self.ensure_handshake_complete().await?;
 
@@ -374,7 +374,7 @@ impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportEr
 /// TCP server using abstract listener trait
 pub struct TcpListener<L: TcpListenerTrait> {
 	listener: L,
-	certificate: Option<Arc<crate::x509::Certificate>>,
+	certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	aad_domain_tag: Option<&'static [u8]>,
@@ -385,16 +385,16 @@ pub struct TcpListener<L: TcpListenerTrait> {
 }
 
 #[cfg(feature = "std")]
-impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
+impl Protocol for TcpListener<std::net::TcpListener> {
 	type Listener = TcpListener<std::net::TcpListener>;
 	type Stream = std::net::TcpStream;
 	type Error = std::io::Error;
 	type Transport = TcpTransport<std::net::TcpStream>;
-	type Address = crate::transport::tcp::TightBeamSocketAddr;
+	type Address = TightBeamSocketAddr;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
 		std::net::SocketAddr::from_str("127.0.0.1:0")
-			.map(crate::transport::tcp::TightBeamSocketAddr)
+			.map(TightBeamSocketAddr)
 			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 	}
 
@@ -413,7 +413,7 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 				key_manager: None,
 				handshake_timeout: None,
 			},
-			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
+			TightBeamSocketAddr(bound_addr),
 		))
 	}
 
@@ -426,7 +426,7 @@ impl crate::transport::Protocol for TcpListener<std::net::TcpListener> {
 	}
 
 	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
-		Ok(crate::transport::tcp::TightBeamSocketAddr(self.listener.local_addr()?))
+		Ok(TightBeamSocketAddr(self.listener.local_addr()?))
 	}
 }
 
@@ -518,7 +518,6 @@ mod tests {
 
 	use super::*;
 	use crate::testing::*;
-	use crate::transport::{MessageCollector, MessageEmitter};
 
 	#[cfg(not(feature = "x509"))]
 	#[tokio::test]
@@ -556,6 +555,7 @@ mod tests {
 	async fn test_tcp_transport_with_gate_policy() -> TransportResult<()> {
 		use std::sync::atomic::{AtomicBool, Ordering};
 
+		use crate::policy::TransitStatus;
 		use crate::transport::policy::PolicyConf;
 
 		/// Policy: first Busy, then Accepted
@@ -570,11 +570,11 @@ mod tests {
 		}
 
 		impl GatePolicy for BusyFirstGate {
-			fn evaluate(&self, _msg: &crate::asn1::Frame) -> crate::transport::TransitStatus {
+			fn evaluate(&self, _msg: &Frame) -> TransitStatus {
 				if self.first.swap(false, Ordering::SeqCst) {
-					crate::transport::TransitStatus::Busy
+					TransitStatus::Busy
 				} else {
-					crate::transport::TransitStatus::Accepted
+					TransitStatus::Accepted
 				}
 			}
 		}

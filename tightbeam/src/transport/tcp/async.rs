@@ -7,7 +7,6 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
-use crate::transport::state::EncryptedProtocolState;
 use crate::transport::ResponsePackage;
 use crate::transport::{
 	AsyncListenerTrait, EnvelopeBuilder, EnvelopeLimits, MessageIO, Pingable, Protocol, TransportError,
@@ -16,22 +15,28 @@ use crate::transport::{
 use crate::Frame;
 
 #[cfg(feature = "x509")]
-use crate::crypto::aead::RuntimeAead;
+mod x509 {
+	pub use crate::crypto::aead::RuntimeAead;
+	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::transport::handshake::{
+		HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
+	};
+	pub use crate::transport::state::EncryptedProtocolState;
+	pub use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
+	pub use crate::x509::Certificate;
+}
+
 #[cfg(feature = "x509")]
-use crate::crypto::x509::policy::CertificateValidation;
-#[cfg(feature = "x509")]
-use crate::transport::handshake::{
-	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
-};
-#[cfg(feature = "x509")]
-use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
-#[cfg(feature = "x509")]
-use crate::x509::Certificate;
+use x509::*;
 
 #[cfg(feature = "transport-policy")]
-use crate::policy::GatePolicy;
+mod policy {
+	pub use crate::policy::GatePolicy;
+	pub use crate::transport::policy::RestartPolicy;
+}
+
 #[cfg(feature = "transport-policy")]
-use crate::transport::policy::RestartPolicy;
+use policy::*;
 
 pub trait AsyncProtocolStream: Send + Unpin {
 	type Error: Into<TransportError>;
@@ -634,7 +639,7 @@ mod tests {
 	use crate::crypto::sign::Sha3Signer;
 	use crate::testing::*;
 	use crate::transport::policy::PolicyConf;
-	use crate::transport::{MessageCollector, MessageEmitter, ResponseHandler, TransitStatus};
+	use crate::transport::{MessageCollector, MessageEmitter, ResponseHandler};
 	use crate::{assert_channel_empty, assert_channels_quiet, assert_recv, test_container};
 
 	#[cfg(feature = "x509")]
@@ -679,6 +684,7 @@ mod tests {
 		use core::str::FromStr;
 		use core::sync::atomic::{AtomicBool, Ordering};
 
+		use crate::policy::TransitStatus;
 		use crate::spki::SubjectPublicKeyInfoOwned;
 		use crate::transport::TransportEncryptionConfig;
 		use crate::{prelude::TightBeamSocketAddr, transport::policy::PolicyConf};

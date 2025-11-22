@@ -339,39 +339,39 @@ pub mod builder {
 	extern crate alloc;
 
 	#[cfg(not(feature = "std"))]
-	use alloc::sync::Arc;
+	use alloc::{boxed::Box, sync::Arc, vec::Vec};
+
 	#[cfg(feature = "std")]
 	use std::sync::Arc;
-
-	#[cfg(not(feature = "std"))]
-	use alloc::boxed::Box;
-	#[cfg(not(feature = "std"))]
-	use alloc::sync::Arc;
-	#[cfg(not(feature = "std"))]
-	use alloc::vec::Vec;
 
 	use core::time::Duration;
 
 	use crate::asn1::Frame;
 	use crate::policy::{GatePolicy, TransitStatus};
 	use crate::transport::error::{TransportError, TransportFailure};
-	use crate::transport::policy::{RestartPolicy, RetryAction};
 	use crate::transport::{MessageCollector, MessageEmitter, Protocol, TransportResult};
 
 	#[cfg(feature = "x509")]
-	use crate::crypto::x509::error::CertificateValidationError;
+	mod x509 {
+		pub use crate::crypto::key::KeySpec;
+		pub use crate::crypto::x509::error::CertificateValidationError;
+		pub use crate::crypto::x509::policy::CertificateValidation;
+		pub use crate::crypto::x509::CertificateSpec;
+		pub use crate::transport::handshake::HandshakeKeyManager;
+		pub use crate::transport::X509ClientConfig;
+		pub use crate::x509::Certificate;
+	}
+
 	#[cfg(feature = "x509")]
-	use crate::crypto::x509::policy::CertificateValidation;
-	#[cfg(feature = "x509")]
-	use crate::crypto::x509::CertificateSpec;
-	#[cfg(feature = "x509")]
-	use crate::transport::handshake::HandshakeKeyManager;
+	use x509::*;
+
 	#[cfg(feature = "transport-policy")]
-	use crate::transport::policy::PolicyConf;
-	#[cfg(feature = "x509")]
-	use crate::transport::X509ClientConfig;
-	#[cfg(feature = "x509")]
-	use crate::x509::Certificate;
+	mod policy {
+		pub use crate::transport::policy::{PolicyConf, RestartPolicy, RetryAction};
+	}
+
+	#[cfg(feature = "transport-policy")]
+	use policy::*;
 
 	#[derive(Default)]
 	pub struct ClientPolicies {
@@ -471,7 +471,6 @@ pub mod builder {
 	}
 
 	pub struct ClientBuilder<P: Protocol> {
-		addr: Option<P::Address>,
 		stream: Option<P::Stream>,
 		policies: ClientPolicies,
 		#[cfg(feature = "x509")]
@@ -486,7 +485,6 @@ pub mod builder {
 	impl<P: Protocol> ClientBuilder<P> {
 		pub fn from_stream(stream: P::Stream) -> Self {
 			Self {
-				addr: None,
 				stream: Some(stream),
 				policies: ClientPolicies::default(),
 				#[cfg(feature = "x509")]
@@ -503,7 +501,6 @@ pub mod builder {
 			// Cannt avoid clone here because of the async trait bound
 			let stream = <P as Protocol>::connect(addr.clone()).await.map_err(|e| e.into())?;
 			Ok(Self {
-				addr: Some(addr),
 				stream: Some(stream),
 				policies: ClientPolicies::default(),
 				#[cfg(feature = "x509")]
@@ -573,11 +570,7 @@ pub mod builder {
 		}
 
 		#[cfg(feature = "x509")]
-		pub fn with_client_identity(
-			mut self,
-			cert: CertificateSpec,
-			key: crate::crypto::key::KeySpec,
-		) -> Result<Self, TransportError> {
+		pub fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> Result<Self, TransportError> {
 			let cert = Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
 			let key_manager = HandshakeKeyManager::try_from(key).map_err(|_| TransportError::ConnectionFailed)?;
 			self.client_certificate = Some(cert);
