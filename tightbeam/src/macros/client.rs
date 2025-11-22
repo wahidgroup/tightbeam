@@ -334,7 +334,6 @@ macro_rules! client {
 // Programmatic client policy system (non-macro) enabling external implementors to apply
 // policies without invoking the `client!` macro.
 #[cfg(feature = "builder")]
-#[allow(dead_code)]
 pub mod builder {
 	#[cfg(not(feature = "std"))]
 	extern crate alloc;
@@ -344,13 +343,35 @@ pub mod builder {
 	#[cfg(feature = "std")]
 	use std::sync::Arc;
 
+	#[cfg(not(feature = "std"))]
+	use alloc::boxed::Box;
+	#[cfg(not(feature = "std"))]
+	use alloc::sync::Arc;
+	#[cfg(not(feature = "std"))]
+	use alloc::vec::Vec;
+
+	use core::time::Duration;
+
 	use crate::asn1::Frame;
-	use crate::transport::error::TransportError;
+	use crate::policy::{GatePolicy, TransitStatus};
+	use crate::transport::error::{TransportError, TransportFailure};
+	use crate::transport::policy::{RestartPolicy, RetryAction};
+	use crate::transport::{MessageCollector, MessageEmitter, Protocol, TransportResult};
+
+	#[cfg(feature = "x509")]
+	use crate::crypto::x509::error::CertificateValidationError;
+	#[cfg(feature = "x509")]
+	use crate::crypto::x509::policy::CertificateValidation;
+	#[cfg(feature = "x509")]
+	use crate::crypto::x509::CertificateSpec;
+	#[cfg(feature = "x509")]
+	use crate::transport::handshake::HandshakeKeyManager;
 	#[cfg(feature = "transport-policy")]
 	use crate::transport::policy::PolicyConf;
 	#[cfg(feature = "x509")]
 	use crate::transport::X509ClientConfig;
-	use crate::transport::{MessageCollector, MessageEmitter, Protocol, TransportResult};
+	#[cfg(feature = "x509")]
+	use crate::x509::Certificate;
 
 	#[derive(Default)]
 	pub struct ClientPolicies {
@@ -359,39 +380,28 @@ pub mod builder {
 		collector_gates: Vec<DynGate>,
 		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
 		validators: Vec<DynCertValidator>,
-		#[cfg(feature = "std")]
-		timeout: Option<std::time::Duration>,
+		timeout: Option<Duration>,
 	}
 
-	pub struct DynRestart(pub Box<dyn crate::transport::policy::RestartPolicy + Send + Sync>);
-	impl crate::transport::policy::RestartPolicy for DynRestart {
-		fn evaluate(
-			&self,
-			message: &crate::Frame,
-			result: &crate::transport::TransportResult<&crate::Frame>,
-			attempt: usize,
-		) -> crate::transport::policy::RetryAction {
-			self.0.evaluate(message, result, attempt)
+	pub struct DynRestart(pub Box<dyn RestartPolicy + Send + Sync>);
+	impl RestartPolicy for DynRestart {
+		fn evaluate(&self, frame: Box<Frame>, failure: &TransportFailure, attempt: usize) -> RetryAction {
+			self.0.evaluate(frame, failure, attempt)
 		}
 	}
 
-	pub struct DynGate(pub std::sync::Arc<dyn crate::policy::GatePolicy + Send + Sync>);
-	impl crate::policy::GatePolicy for DynGate {
-		fn evaluate(&self, message: &crate::Frame) -> crate::policy::TransitStatus {
+	pub struct DynGate(pub Arc<dyn GatePolicy + Send + Sync>);
+	impl GatePolicy for DynGate {
+		fn evaluate(&self, message: &Frame) -> TransitStatus {
 			self.0.evaluate(message)
 		}
 	}
 
 	#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-	pub struct DynCertValidator(
-		pub std::sync::Arc<dyn crate::crypto::x509::policy::CertificateValidation + Send + Sync>,
-	);
+	pub struct DynCertValidator(pub Arc<dyn CertificateValidation + Send + Sync>);
 	#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-	impl crate::crypto::x509::policy::CertificateValidation for DynCertValidator {
-		fn evaluate(
-			&self,
-			cert: &crate::x509::Certificate,
-		) -> core::result::Result<(), crate::crypto::x509::error::CertificateValidationError> {
+	impl CertificateValidation for DynCertValidator {
+		fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 			self.0.evaluate(cert)
 		}
 	}
@@ -399,7 +409,7 @@ pub mod builder {
 	impl ClientPolicies {
 		pub fn with_restart<P>(mut self, policy: P) -> Self
 		where
-			P: crate::transport::policy::RestartPolicy + Send + Sync + 'static,
+			P: RestartPolicy + Send + Sync + 'static,
 		{
 			self.restart = Some(DynRestart(Box::new(policy)));
 			self
@@ -407,31 +417,30 @@ pub mod builder {
 
 		pub fn with_emitter_gate<G>(mut self, gate: G) -> Self
 		where
-			G: crate::policy::GatePolicy + Send + Sync + 'static,
+			G: GatePolicy + Send + Sync + 'static,
 		{
-			self.emitter_gates.push(DynGate(std::sync::Arc::new(gate)));
+			self.emitter_gates.push(DynGate(Arc::new(gate)));
 			self
 		}
 
 		pub fn with_collector_gate<G>(mut self, gate: G) -> Self
 		where
-			G: crate::policy::GatePolicy + Send + Sync + 'static,
+			G: GatePolicy + Send + Sync + 'static,
 		{
-			self.collector_gates.push(DynGate(std::sync::Arc::new(gate)));
+			self.collector_gates.push(DynGate(Arc::new(gate)));
 			self
 		}
 
 		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
 		pub fn with_x509_gate<V>(mut self, v: V) -> Self
 		where
-			V: crate::crypto::x509::policy::CertificateValidation + Send + Sync + 'static,
+			V: CertificateValidation + Send + Sync + 'static,
 		{
-			self.validators.push(DynCertValidator(std::sync::Arc::new(v)));
+			self.validators.push(DynCertValidator(Arc::new(v)));
 			self
 		}
 
-		#[cfg(feature = "std")]
-		pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+		pub fn with_timeout(mut self, timeout: Duration) -> Self {
 			self.timeout = Some(timeout);
 			self
 		}
@@ -454,7 +463,6 @@ pub mod builder {
 			for g in self.collector_gates.into_iter() {
 				transport = transport.with_collector_gate(g);
 			}
-			#[cfg(feature = "std")]
 			if let Some(timeout) = self.timeout {
 				transport = transport.with_timeout(timeout);
 			}
@@ -467,11 +475,11 @@ pub mod builder {
 		stream: Option<P::Stream>,
 		policies: ClientPolicies,
 		#[cfg(feature = "x509")]
-		server_certificates: Vec<crate::x509::Certificate>,
+		server_certificates: Vec<Certificate>,
 		#[cfg(feature = "x509")]
-		client_certificate: Option<crate::x509::Certificate>,
+		client_certificate: Option<Certificate>,
 		#[cfg(feature = "x509")]
-		client_key: Option<crate::transport::handshake::HandshakeKeyManager>,
+		client_key: Option<HandshakeKeyManager>,
 		_ph: core::marker::PhantomData<P>,
 	}
 
@@ -515,7 +523,7 @@ pub mod builder {
 
 		pub fn with_restart<R>(mut self, p: R) -> Self
 		where
-			R: crate::transport::policy::RestartPolicy + Send + Sync + 'static,
+			R: RestartPolicy + Send + Sync + 'static,
 		{
 			self.policies = self.policies.with_restart(p);
 			self
@@ -523,7 +531,7 @@ pub mod builder {
 
 		pub fn with_emitter_gate<G>(mut self, g: G) -> Self
 		where
-			G: crate::policy::GatePolicy + Send + Sync + 'static,
+			G: GatePolicy + Send + Sync + 'static,
 		{
 			self.policies = self.policies.with_emitter_gate(g);
 			self
@@ -531,7 +539,7 @@ pub mod builder {
 
 		pub fn with_collector_gate<G>(mut self, g: G) -> Self
 		where
-			G: crate::policy::GatePolicy + Send + Sync + 'static,
+			G: GatePolicy + Send + Sync + 'static,
 		{
 			self.policies = self.policies.with_collector_gate(g);
 			self
@@ -540,29 +548,26 @@ pub mod builder {
 		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
 		pub fn with_x509_gate<V>(mut self, v: V) -> Self
 		where
-			V: crate::crypto::x509::policy::CertificateValidation + Send + Sync + 'static,
+			V: CertificateValidation + Send + Sync + 'static,
 		{
 			self.policies = self.policies.with_x509_gate(v);
 			self
 		}
-		#[cfg(feature = "std")]
-		pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+
+		pub fn with_timeout(mut self, timeout: Duration) -> Self {
 			self.policies = self.policies.with_timeout(timeout);
 			self
 		}
 
 		#[cfg(feature = "x509")]
-		pub fn with_server_certificate(
-			mut self,
-			cert: crate::crypto::x509::CertificateSpec,
-		) -> Result<Self, TransportError> {
-			let cert = crate::x509::Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
+		pub fn with_server_certificate(mut self, cert: CertificateSpec) -> Result<Self, TransportError> {
+			let cert = Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
 			self.server_certificates.push(cert);
 			Ok(self)
 		}
 
 		#[cfg(feature = "x509")]
-		pub fn with_server_certificates(mut self, certs: impl IntoIterator<Item = crate::x509::Certificate>) -> Self {
+		pub fn with_server_certificates(mut self, certs: impl IntoIterator<Item = Certificate>) -> Self {
 			self.server_certificates.extend(certs);
 			self
 		}
@@ -570,12 +575,11 @@ pub mod builder {
 		#[cfg(feature = "x509")]
 		pub fn with_client_identity(
 			mut self,
-			cert: crate::crypto::x509::CertificateSpec,
+			cert: CertificateSpec,
 			key: crate::crypto::key::KeySpec,
 		) -> Result<Self, TransportError> {
-			let cert = crate::x509::Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
-			let key_manager = crate::transport::handshake::HandshakeKeyManager::try_from(key)
-				.map_err(|_| TransportError::ConnectionFailed)?;
+			let cert = Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
+			let key_manager = HandshakeKeyManager::try_from(key).map_err(|_| TransportError::ConnectionFailed)?;
 			self.client_certificate = Some(cert);
 			self.client_key = Some(key_manager);
 			Ok(self)
@@ -597,7 +601,7 @@ pub mod builder {
 		#[cfg(feature = "x509")]
 		pub fn build(self) -> Result<GenericClient<P>, TransportError>
 		where
-			P::Transport: MessageEmitter + MessageCollector + PolicyConf + crate::transport::X509ClientConfig,
+			P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
 		{
 			let stream = self.stream.ok_or(TransportError::ConnectionFailed)?;
 			let mut transport = <P as Protocol>::create_transport(stream);
@@ -634,7 +638,7 @@ pub mod builder {
 		#[allow(async_fn_in_trait)]
 		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>>
 		where
-			P::Transport: crate::transport::MessageEmitter,
+			P::Transport: MessageEmitter,
 		{
 			self.transport.emit(frame, attempt).await
 		}
@@ -656,7 +660,7 @@ pub mod builder {
 	#[cfg(feature = "x509")]
 	impl<P: Protocol> TryFrom<ClientBuilder<P>> for GenericClient<P>
 	where
-		P::Transport: MessageEmitter + MessageCollector + PolicyConf + crate::transport::X509ClientConfig,
+		P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
 	{
 		type Error = TransportError;
 
@@ -664,8 +668,9 @@ pub mod builder {
 			builder.build()
 		}
 	}
-	impl crate::policy::GatePolicy for Arc<dyn crate::policy::GatePolicy + Send + Sync> {
-		fn evaluate(&self, message: &crate::Frame) -> crate::policy::TransitStatus {
+
+	impl GatePolicy for Arc<dyn GatePolicy + Send + Sync> {
+		fn evaluate(&self, message: &Frame) -> TransitStatus {
 			(**self).evaluate(message)
 		}
 	}

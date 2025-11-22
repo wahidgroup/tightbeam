@@ -342,23 +342,21 @@ tb_scenario! {
 	spec: QueueFreeSpec,
 	environment Servlet {
 		servlet: QueueServlet,
-		start: |trace| async move {
+		setup: |addr| async move {
 			let (client_cert, client_key) = create_test_cert_with_key("CN=Test Client", 365)?;
-
-			let servlet = QueueServlet::start(trace).await?;
-			let server_addr = servlet.addr();
 
 			// Convert signing key to KeySpec via InMemoryKeyProvider
 			let provider = InMemoryKeyProvider::from(client_key);
 			let key_spec = KeySpec::Provider(Arc::new(provider));
 
+			let certificate = CertificateSpec::Built(Box::new(client_cert));
 			let restart_policy = RestartLinearBackoff::new(3, 50, 1, None);
-			let client = ClientBuilder::<TokioListener>::connect(server_addr).await?
-				.with_client_identity(CertificateSpec::Built(client_cert), key_spec)?
+			let client = ClientBuilder::<TokioListener>::connect(addr).await?
+				.with_client_identity(certificate, key_spec)?
 				.with_restart(restart_policy)
 				.build()?;
 
-			Ok((servlet, client))
+			Ok(client)
 		},
 		client: |trace, mut client| async move {
 			let trace = Arc::new(trace);

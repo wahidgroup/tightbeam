@@ -107,7 +107,7 @@ async fn test_mutual_auth_with_servlet() -> Result<()> {
 	.await?;
 
 	// Convert cert and key to specs
-	let client_cert_spec = CertificateSpec::Built(client_cert);
+	let client_cert_spec = CertificateSpec::Built(Box::new(client_cert));
 	let provider = InMemoryKeyProvider::from(client_key);
 	let client_key_spec = KeySpec::Provider(Arc::new(provider));
 
@@ -158,7 +158,7 @@ async fn test_unexpected_client_cert_rejected() -> Result<()> {
 	// Try to create client and connect - this should fail during handshake
 	let client_result: Result<()> = async {
 		// Convert cert and key to specs
-		let client_cert_spec = CertificateSpec::Built(client_cert);
+		let client_cert_spec = CertificateSpec::Built(Box::new(client_cert));
 		let provider = InMemoryKeyProvider::from(client_key);
 		let client_key_spec = KeySpec::Provider(Arc::new(provider));
 
@@ -196,7 +196,7 @@ async fn test_client_rejects_expired_server() -> Result<()> {
 	let server = MutualAuthServer::new(server_cert, server_key, vec![]).await?;
 
 	// Convert cert and key to specs
-	let client_cert_spec = CertificateSpec::Built(client_cert);
+	let client_cert_spec = CertificateSpec::Built(Box::new(client_cert));
 	let provider = InMemoryKeyProvider::from(client_key);
 	let client_key_spec = KeySpec::Provider(Arc::new(provider));
 

@@ -61,6 +61,14 @@ impl core::fmt::Display for CompressionError {
 	}
 }
 
+/// Trait for injected faults in testing
+#[cfg(feature = "testing-fault")]
+pub trait InjectedError: core::fmt::Debug + core::fmt::Display + Send + Sync {}
+
+// Blanket implementation for any type meeting the requirements
+#[cfg(feature = "testing-fault")]
+impl<T> InjectedError for T where T: core::fmt::Debug + core::fmt::Display + Send + Sync {}
+
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]
 pub enum TightBeamError {
@@ -280,6 +288,11 @@ pub enum TightBeamError {
 	/// Multiple errors collected together
 	#[cfg_attr(feature = "derive", error("Multiple errors occurred: {0:?}"))]
 	Sequence(Vec<TightBeamError>),
+
+	/// Injected fault for testing (any error type)
+	#[cfg(feature = "testing-fault")]
+	#[cfg_attr(feature = "derive", error("Injected fault: {0}"))]
+	InjectedFault(Box<dyn InjectedError>),
 }
 
 #[cfg(all(feature = "colony", not(feature = "derive")))]
@@ -382,6 +395,8 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "testing")]
 			TightBeamError::TestingError(err) => write!(f, "Testing error: {err}"),
 			TightBeamError::UrnValidationError(err) => write!(f, "URN validation error: {err}"),
+			#[cfg(feature = "testing-fault")]
+			TightBeamError::InjectedFault(err) => write!(f, "Injected fault: {err}"),
 		}
 	}
 }

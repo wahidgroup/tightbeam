@@ -18,6 +18,16 @@ pub enum TransportFailure {
 	EncryptorUnavailable,
 	/// Random nonce generation failed
 	NonceGenerationFailed,
+	/// Gate policy rejected (busy)
+	Busy,
+	/// Gate policy rejected (forbidden)
+	Forbidden,
+	/// Gate policy rejected (unauthorized)
+	Unauthorized,
+	/// Gate policy rejected (timeout)
+	Timeout,
+	/// Gate policy rejected (general)
+	PolicyRejection,
 }
 
 /// Transport error types
@@ -28,16 +38,6 @@ pub enum TransportError {
 	ConnectionFailed,
 	#[cfg_attr(feature = "derive", error("Send failed"))]
 	SendFailed,
-	#[cfg_attr(feature = "derive", error("Receive failed"))]
-	ReceiveFailed,
-	#[cfg_attr(feature = "derive", error("Timeout"))]
-	Timeout,
-	#[cfg_attr(feature = "derive", error("Busy"))]
-	Busy,
-	#[cfg_attr(feature = "derive", error("Unauthorized"))]
-	Unauthorized,
-	#[cfg_attr(feature = "derive", error("Forbidden"))]
-	Forbidden,
 	#[cfg_attr(feature = "derive", error("Encryption required but not provided"))]
 	MissingEncryption,
 	#[cfg_attr(feature = "derive", error("Invalid message"))]
@@ -53,7 +53,9 @@ pub enum TransportError {
 	#[cfg_attr(feature = "derive", error("Invalid state"))]
 	InvalidState,
 	#[cfg_attr(feature = "derive", error("Message not sent: {1:?} - {0:?}"))]
-	MessageNotSent(Box<crate::asn1::Frame>, TransportFailure),
+	MessageNotSent(Box<Frame>, TransportFailure),
+	#[cfg_attr(feature = "derive", error("Operation failed: {0:?}"))]
+	OperationFailed(TransportFailure),
 	#[cfg(feature = "x509")]
 	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -79,10 +81,10 @@ impl From<TransitStatus> for TransportError {
 		match status {
 			TransitStatus::Request => TransportError::InvalidMessage,
 			TransitStatus::Accepted => TransportError::InvalidMessage,
-			TransitStatus::Busy => TransportError::Busy,
-			TransitStatus::Unauthorized => TransportError::Unauthorized,
-			TransitStatus::Forbidden => TransportError::Forbidden,
-			TransitStatus::Timeout => TransportError::Timeout,
+			TransitStatus::Busy => TransportError::OperationFailed(TransportFailure::Busy),
+			TransitStatus::Unauthorized => TransportError::OperationFailed(TransportFailure::Unauthorized),
+			TransitStatus::Forbidden => TransportError::OperationFailed(TransportFailure::Forbidden),
+			TransitStatus::Timeout => TransportError::OperationFailed(TransportFailure::Timeout),
 		}
 	}
 }
@@ -127,7 +129,7 @@ impl From<tokio::task::JoinError> for TransportError {
 #[cfg(feature = "tokio")]
 impl From<tokio::time::error::Elapsed> for TransportError {
 	fn from(_: tokio::time::error::Elapsed) -> Self {
-		TransportError::Timeout
+		TransportError::OperationFailed(TransportFailure::Timeout)
 	}
 }
 
@@ -173,10 +175,11 @@ impl From<TransportFailure> for TransportError {
 	fn from(failure: TransportFailure) -> Self {
 		match failure {
 			TransportFailure::EncodingFailed => TransportError::InvalidMessage,
-			TransportFailure::EncryptionFailed => TransportError::Forbidden,
 			TransportFailure::SizeExceeded => TransportError::InvalidMessage,
-			TransportFailure::EncryptorUnavailable => TransportError::Forbidden,
+			TransportFailure::PolicyRejection => TransportError::InvalidReply,
 			TransportFailure::NonceGenerationFailed => TransportError::SendFailed,
+			// All other failures map to OperationFailed
+			other => TransportError::OperationFailed(other),
 		}
 	}
 }

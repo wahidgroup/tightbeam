@@ -154,25 +154,20 @@ tb_scenario! {
 	csp: ChessGameFlow,
 	environment Servlet {
 		servlet: ChessEngineServlet,
-		start: |trace| async move {
-			let config = Arc::new(ChessEngineServletConf {
-				manager: ChessMatchManager::default(),
-			});
-
-			// Start the servlet
-			let servlet = ChessEngineServlet::start(trace, config).await?;
-			let server_addr = servlet.addr();
-
+		config: ChessEngineServletConf {
+			manager: ChessMatchManager::default(),
+		},
+		setup: |addr| async move {
 			// Create a custom client with exponential backoff retry policy
 			// Exponential backoff: 100ms, 200ms, 400ms, 800ms delays (max 3 attempts)
 			let restart_policy = RestartExponentialBackoff::new(3, 100, None);
-			let client_builder = ClientBuilder::<TokioListener>::connect(server_addr).await?;
+			let client_builder = ClientBuilder::<TokioListener>::connect(addr).await?;
 			let client = client_builder
 				.with_restart(restart_policy)
 				.with_timeout(Duration::from_millis(500))
 				.build()?;
 
-			Ok((servlet, client))
+			Ok(client)
 		},
 		client: |trace, mut client| async move {
 			#[derive(Default)]

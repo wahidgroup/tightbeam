@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::policy::{GatePolicy, ReceptorPolicy};
-use crate::transport::TransportResult;
+use crate::transport::error::TransportFailure;
 use crate::{Frame, Message};
 
 /// Trait for transports that support policy configuration
@@ -51,22 +51,20 @@ pub trait RestartPolicy: Send + Sync {
 	/// Evaluate whether to restart after a transport operation.
 	///
 	/// # Arguments
-	/// * `message` - The original message that was sent
-	/// * `result` - The result of the emit operation (response or error)
+	/// * `frame` - Boxed frame from the failed operation
+	/// * `failure` - The failure reason
 	/// * `attempt` - The current attempt number (0-indexed)
 	///
 	/// # Returns
-	/// * `RetryAction` - What action to take for retry
-	fn evaluate(&self, message: &Frame, result: &TransportResult<&Frame>, attempt: usize) -> RetryAction;
+	/// * `RetryAction` - What action to take (retry with frame, or no retry)
+	fn evaluate(&self, frame: Box<Frame>, failure: &TransportFailure, attempt: usize) -> RetryAction;
 }
 
 /// Action to take when evaluating retry policy
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetryAction {
-	/// Retry with the same message
-	RetryWithSame,
-	/// Retry with a modified message
-	RetryWithModified(Box<Frame>),
+	/// Retry with the provided frame (same or modified from input)
+	Retry(Box<Frame>),
 	/// Do not retry, propagate the error
 	NoRetry,
 }
@@ -106,7 +104,7 @@ impl JitterStrategy for DecorrelatedJitter {
 pub struct NoRestart;
 
 impl RestartPolicy for NoRestart {
-	fn evaluate(&self, _message: &Frame, _: &TransportResult<&Frame>, _: usize) -> RetryAction {
+	fn evaluate(&self, _frame: Box<Frame>, _failure: &TransportFailure, _attempt: usize) -> RetryAction {
 		RetryAction::NoRetry
 	}
 }
@@ -190,25 +188,27 @@ impl Default for RestartLinearBackoff {
 macro_rules! impl_timed_backoff_policy {
 	($policy:ident, $delay_calc:expr) => {
 		impl RestartPolicy for $policy {
-			fn evaluate(&self, _message: &Frame, _result: &TransportResult<&Frame>, attempt: usize) -> RetryAction {
+			fn evaluate(&self, frame: Box<Frame>, _failure: &TransportFailure, attempt: usize) -> RetryAction {
+				use core::time::Duration;
+
 				if attempt >= self.max_attempts {
 					return RetryAction::NoRetry;
 				}
 
-				// Since this is only called on error, always retry
+				// Calculate delay and sleep
 				match &self.jitter {
 					Some(jitter_strategy) => {
 						let delay_ms = $delay_calc(self, attempt);
 						let delay_ms = jitter_strategy.apply(delay_ms);
-
-						std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-						RetryAction::RetryWithSame
+						std::thread::sleep(Duration::from_millis(delay_ms));
 					}
 					None => {
-						std::thread::sleep(std::time::Duration::from_millis($delay_calc(self, attempt)));
-						RetryAction::RetryWithSame
+						std::thread::sleep(Duration::from_millis($delay_calc(self, attempt)));
 					}
 				}
+
+				// Return the same box for retry
+				RetryAction::Retry(frame)
 			}
 		}
 	};

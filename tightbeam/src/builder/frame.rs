@@ -72,9 +72,11 @@ pub trait CheckSignatureOid<S: SignatureAlgorithmIdentifier>: private::SealedSig
 /// falling back to Vec only if exceeded.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
+#[derive(Default)]
 enum ErrorAccumulator {
 	/// No errors (zero allocation)
-	None,
+	#[default]
+ None,
 	/// 1 error stored inline (zero allocation)
 	One(TightBeamError),
 	/// 2-5 errors stored inline (zero allocation)
@@ -83,11 +85,6 @@ enum ErrorAccumulator {
 	Heap(Vec<TightBeamError>),
 }
 
-impl Default for ErrorAccumulator {
-	fn default() -> Self {
-		Self::None
-	}
-}
 
 impl ErrorAccumulator {
 	fn push(&mut self, error: TightBeamError) {

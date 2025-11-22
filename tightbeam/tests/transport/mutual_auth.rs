@@ -24,7 +24,9 @@ use tightbeam::{
 	decode, hex,
 	macros::client::builder::ClientBuilder,
 	prelude::*,
-	servlet, tb_assert_spec, tb_scenario, Beamable,
+	servlet, tb_assert_spec, tb_scenario,
+	transport::tcp::r#async::TokioListener,
+	Beamable,
 };
 
 // ============================================================================
@@ -89,7 +91,7 @@ struct AuthResponse {
 
 servlet! {
 	pub MutualAuthServlet<AuthRequest>,
-	protocol: tightbeam::transport::tcp::r#async::TokioListener,
+	protocol: TokioListener,
 	x509: {
 		certificate: SERVER_CERT,
 		key_provider: SERVER_KEY,
@@ -131,19 +133,14 @@ tb_scenario! {
 	spec: MutualAuthSpec,
 	environment Servlet {
 		servlet: MutualAuthServlet,
-		start: |trace| async move {
-			// Create servlet with x509 mutual auth
-			let servlet = MutualAuthServlet::start(trace).await?;
-			let server_addr = servlet.addr();
-
-			// Create client with mutual authentication using specs
-			let client = ClientBuilder::<tightbeam::transport::tcp::r#async::TokioListener>::connect(server_addr)
+		setup: |addr| async move {
+			let client = ClientBuilder::<TokioListener>::connect(addr)
 				.await?
 				.with_server_certificate(SERVER_CERT)?
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 				.build()?;
 
-			Ok((servlet, client))
+			Ok(client)
 		},
 		client: |_trace, mut client| async move {
 			// Send authenticated request

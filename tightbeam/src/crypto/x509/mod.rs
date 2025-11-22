@@ -21,7 +21,7 @@ pub enum CertificateSpec {
 	Der(&'static [u8]),
 
 	/// Pre-constructed Certificate instance
-	Built(Certificate),
+	Built(Box<Certificate>),
 }
 
 impl TryFrom<CertificateSpec> for Certificate {
@@ -34,7 +34,7 @@ impl TryFrom<CertificateSpec> for Certificate {
 				Ok(Certificate::from_pem(cleaned.as_bytes())?)
 			}
 			CertificateSpec::Der(der_bytes) => Ok(Certificate::from_der(der_bytes)?),
-			CertificateSpec::Built(cert) => Ok(cert),
+			CertificateSpec::Built(cert) => Ok(*cert),
 		}
 	}
 }

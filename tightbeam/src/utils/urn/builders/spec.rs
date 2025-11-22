@@ -7,7 +7,7 @@ extern crate alloc;
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
 #[cfg(feature = "std")]
-use std::{borrow::Cow, vec::Vec};
+use std::borrow::Cow;
 
 use crate::utils::urn::{UrnComponents, UrnValidationError};
 

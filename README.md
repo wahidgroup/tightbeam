@@ -3505,6 +3505,9 @@ tb_scenario! {
 	csp: PingPongProcess,
 	environment Servlet {
 		servlet: PingPongServletWithWorker,
+		setup: |addr| async move {
+			Ok(client! { connect TokioListener: addr })
+		},
 		client: |trace, mut client| async move {
 			fn generate_message(
 				lucky_number: u32,

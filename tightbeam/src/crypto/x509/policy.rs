@@ -294,6 +294,7 @@ impl SignatureVerification for FullValidator {
 /// Validators are evaluated in order. This validator only chains
 /// simple `evaluate()` calls and does not support signature verification.
 #[cfg(feature = "std")]
+#[derive(Default)]
 pub struct ChainValidator {
 	validators: Vec<Box<dyn CertificateValidation>>,
 }
@@ -305,13 +306,6 @@ impl ChainValidator {
 	pub fn add(mut self, validator: Box<dyn CertificateValidation>) -> Self {
 		self.validators.push(validator);
 		self
-	}
-}
-
-#[cfg(feature = "std")]
-impl Default for ChainValidator {
-	fn default() -> Self {
-		Self { validators: vec![] }
 	}
 }
 

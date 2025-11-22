@@ -53,7 +53,7 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
-	(RestartPolicy: $name:ident | $msg_arg:ident, $res_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
+	(RestartPolicy: $name:ident | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
 		pub struct $name;
 
@@ -61,8 +61,8 @@ macro_rules! policy {
 			#[allow(unused_variables)]
 			fn evaluate(
 				&self,
-				$msg_arg: &$crate::Frame,
-				$res_arg: &$crate::transport::TransportResult<&$crate::Frame>,
+				$frame_arg: Box<$crate::Frame>,
+				$failure_arg: &$crate::transport::error::TransportFailure,
 				$attempt_arg: usize,
 			) -> $crate::transport::policy::RetryAction {
 				$($body)*
@@ -71,24 +71,23 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
-	(RestartPolicy: $name:ident { $($body:tt)* } $($rest:tt)*) => {
-		#[derive(Default)]
-		pub struct $name;
+(RestartPolicy: $name:ident { $($body:tt)* } $($rest:tt)*) => {
+	#[derive(Default)]
+	pub struct $name;
 
-		impl $crate::transport::policy::RestartPolicy for $name {
-			#[allow(unused_variables)]
-			fn evaluate(
-				&self,
-				message: &$crate::Frame,
-				result: &$crate::transport::TransportResult<&$crate::Frame>,
-				attempt: usize,
-			) -> $crate::transport::policy::RetryAction {
-				$($body)*
-			}
+	impl $crate::transport::policy::RestartPolicy for $name {
+		#[allow(unused_variables)]
+		fn evaluate(
+			&self,
+			result: &$crate::transport::TransportResult<&$crate::Frame>,
+			attempt: usize,
+		) -> $crate::transport::policy::RetryAction {
+			$($body)*
 		}
+	}
 
-		$crate::policy! { $($rest)* }
-	};
+	$crate::policy! { $($rest)* }
+};
 }
 
 #[cfg(test)]
@@ -97,6 +96,7 @@ mod tests {
 
 	use crate::der::Sequence;
 	use crate::policy::{GatePolicy, ReceptorPolicy, TransitStatus};
+	use crate::transport::policy::RetryAction;
 	use crate::Beamable;
 
 	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -118,8 +118,8 @@ mod tests {
 				TransitStatus::Accepted
 			}
 		}
-		RestartPolicy: TestRestart |message, result, attempt| {
-			crate::transport::policy::RetryAction::RetryWithSame
+		RestartPolicy: TestRestart |frame, _failure, _attempt| {
+			RetryAction::Retry(frame)
 		}
 	}
 

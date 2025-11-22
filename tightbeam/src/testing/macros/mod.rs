@@ -2461,7 +2461,8 @@ macro_rules! tb_scenario {
 		$(trace: $trace_cfg:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
-			$(start: $start_expr:expr,)?
+			$(config: $servlet_config:expr,)?
+			$(setup: $setup_expr:expr,)?
 			client: $client_closure:expr
 		}
 		$(, hooks {
@@ -2478,7 +2479,8 @@ macro_rules! tb_scenario {
 			$(trace: $trace_cfg,)?
 			environment Servlet {
 				servlet: $servlet_name,
-				$(start: $start_expr,)?
+				$(config: $servlet_config,)?
+				$(setup: $setup_expr,)?
 				client: $client_closure
 			}
 		$(, hooks {
@@ -2495,7 +2497,8 @@ macro_rules! tb_scenario {
 		$(trace: $trace_cfg:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
-			$(start: $start_expr:expr,)?
+			$(config: $servlet_config:expr,)?
+			$(setup: $setup_expr:expr,)?
 			client: $client_closure:expr
 		}
 		$(, hooks {
@@ -2531,16 +2534,23 @@ macro_rules! tb_scenario {
 				let trace_client = trace_collector.share();
 				let trace_server = trace_collector.share();
 
-				// Start closure must return (servlet, client) tuple
-				let start_result = $crate::__tb_scenario_servlet_start!(
+				// Start servlet automatically (with optional config)
+				let mut servlet_instance = $crate::__tb_scenario_servlet_start_with_config!(
 					$servlet_name,
 					trace_server.share(),
-					$($start_expr)?
+					$($servlet_config)?
 				);
-				// Unwrap the tuple - start closure always returns (servlet, client)
-				let (mut servlet_instance, client) = start_result;
+				let server_addr = servlet_instance.addr();
 
 				servlet_instance.set_trace(trace_server.share());
+
+				// Setup client using custom expression or default
+				let client = $crate::__tb_scenario_servlet_setup!(
+					$servlet_name,
+					trace_client,
+					server_addr,
+					$($setup_expr)?
+				);
 
 				// Execute client closure
 				async fn __call_client_closure<F, Fut, T>(
@@ -2615,7 +2625,8 @@ macro_rules! tb_scenario {
 		$(trace: $trace_cfg:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
-			$(start: $start_expr:expr,)?
+			$(config: $servlet_config:expr,)?
+			$(setup: $setup_expr:expr,)?
 			client: $client_closure:expr
 		}
 		$(, hooks $hooks:tt)?
@@ -2629,15 +2640,21 @@ macro_rules! tb_scenario {
 			let trace_client = trace_collector.share();
 			let trace_server = trace_collector.share();
 
-			// Start servlet - use custom start expression or default start(trace_server)
-			// Start closure must return (servlet, client) tuple
-			let start_result = $crate::__tb_scenario_servlet_start!(
+			// Start servlet automatically (with optional config)
+			let servlet_instance = $crate::__tb_scenario_servlet_start_with_config!(
 				$servlet_name,
 				trace_server,
-				$($start_expr)?
+				$($servlet_config)?
 			);
-			// Unwrap the tuple - start closure always returns (servlet, client)
-			let (servlet_instance, client) = start_result;
+			let server_addr = servlet_instance.addr();
+
+			// Setup client using custom expression or default
+			let client = $crate::__tb_scenario_servlet_setup!(
+				$servlet_name,
+				trace_client,
+				server_addr,
+				$($setup_expr)?
+			);
 
 			// Execute client closure
 			async fn __call_client_closure<F, Fut, T>(
@@ -2763,37 +2780,40 @@ macro_rules! tb_scenario {
 	};
 }
 
-/// Helper macro for starting servlets in tb_scenario!
-/// Always returns (servlet, client) tuple
+/// Helper macro for starting servlets with optional config
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __tb_scenario_servlet_start {
-	// Custom start expression provided - must return (servlet, client) tuple
-	($servlet:ident, $trace:expr, $start:expr) => {{
-		async fn __call_start_closure<F, Fut, T, C>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> Result<(T, C), $crate::TightBeamError>
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> Fut,
-			Fut: core::future::Future<Output = Result<(T, C), $crate::TightBeamError>>,
-		{
-			closure(trace).await
-		}
-		__call_start_closure($start, $trace).await.expect("Failed to start servlet")
+macro_rules! __tb_scenario_servlet_start_with_config {
+	// With config - automatically wrap in Arc
+	($servlet:ident, $trace:expr, $config:expr) => {{
+		$servlet::start($trace, ::std::sync::Arc::new($config))
+			.await
+			.expect("Failed to start servlet")
 	}};
-	// Default: call start with trace collector, then create client
+	// Without config
 	($servlet:ident, $trace:expr,) => {{
-		let servlet = $servlet::start($trace.clone()).await.expect("Failed to start servlet");
-		let server_addr = servlet.addr();
-		let client = async {
-			Ok::<_, $crate::TightBeamError>($crate::client! {
-				connect $crate::transport::tcp::r#async::TokioListener: server_addr
-			})
+		$servlet::start($trace).await.expect("Failed to start servlet")
+	}};
+}
+
+/// Helper macro for setting up clients in tb_scenario!
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_scenario_servlet_setup {
+	// Custom setup expression - receives address, returns client
+	($servlet:ident, $trace:expr, $addr:expr, $setup:expr) => {{
+		async fn __call_setup_closure<F, Fut, A, C>(closure: F, addr: A) -> Result<C, $crate::TightBeamError>
+		where
+			F: FnOnce(A) -> Fut,
+			Fut: core::future::Future<Output = Result<C, $crate::TightBeamError>>,
+		{
+			closure(addr).await
 		}
-		.await
-		.expect("Failed to connect client");
-		(servlet, client)
+		__call_setup_closure($setup, $addr).await.expect("Failed to setup client")
+	}};
+	// Default: create basic client connection
+	($servlet:ident, $trace:expr, $addr:expr,) => {{
+		compile_error!("setup: closure is required for Servlet environment")
 	}};
 }
 

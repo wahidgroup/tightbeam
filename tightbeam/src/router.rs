@@ -1,7 +1,10 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use crate::{Frame, Message};
 
@@ -30,7 +33,7 @@ impl core::fmt::Display for RouterError {
 impl core::error::Error for RouterError {}
 
 pub trait RouterPolicy: Send + Sync {
-	fn dispatch<T: Message + Send + 'static>(&self, message: Frame) -> Result<()>;
+	fn dispatch<T: Message + Send + 'static>(&self, message: Arc<Frame>) -> Result<()>;
 }
 
 #[macro_export]
@@ -68,7 +71,20 @@ macro_rules! routes {
 	) => {
 		struct $RouterName { $( $field : $fty ),* }
 		impl $crate::router::RouterPolicy for $RouterName {
-			fn dispatch<T: $crate::Message + Send + 'static>(&self, message: $crate::Frame) -> $crate::router::Result<()> {
+			#[cfg(not(feature = "std"))]
+			fn dispatch<T: $crate::Message + Send + 'static>(&self, message: alloc::sync::Arc<$crate::Frame>) -> $crate::router::Result<()> {
+				$(
+					if std::any::TypeId::of::<T>() == std::any::TypeId::of::<$MsgTy>() {
+						let ($($arg),*) = (self, message);
+						$handler;
+						return Ok(());
+					}
+				)*
+				Err($crate::router::RouterError::UnknownRoute)
+			}
+
+			#[cfg(feature = "std")]
+			fn dispatch<T: $crate::Message + Send + 'static>(&self, message: std::sync::Arc<$crate::Frame>) -> $crate::router::Result<()> {
 				$(
 					if std::any::TypeId::of::<T>() == std::any::TypeId::of::<$MsgTy>() {
 						let ($($arg),*) = (self, message);
@@ -135,10 +151,10 @@ mod tests {
 				health_tx: mpsc::Sender<Arc<Frame>>,
 			}:
 				Payment |router, msg| {
-					let _ = router.payment_tx.send(Arc::new(msg));
+					let _ = router.payment_tx.send(msg);
 				}
 				HealthCheck |router, msg| {
-					let _ = router.health_tx.send(Arc::new(msg));
+					let _ = router.health_tx.send(msg);
 				}
 		}
 
@@ -152,12 +168,12 @@ mod tests {
 		impl super::RouterPolicy for ChannelRouter {
 			fn dispatch<M: Message>(&self, message: Arc<Frame>) -> crate::router::Result<()> {
 				if std::any::TypeId::of::<M>() == std::any::TypeId::of::<Payment>() {
-					let _ = self.payment_tx.send(Arc::new(message));
+					let _ = self.payment_tx.send(message);
 					return Ok(());
 				}
 
 				if std::any::TypeId::of::<M>() == std::any::TypeId::of::<HealthCheck>() {
-					let _ = self.health_tx.send(Arc::new(message));
+					let _ = self.health_tx.send(message);
 					return Ok(());
 				}
 
@@ -181,7 +197,7 @@ mod tests {
 					}
 			}?;
 			// Route
-			router.dispatch::<Payment>(payment)?;
+			router.dispatch::<Payment>(Arc::new(payment))?;
 
 			// Compose HealthCheck
 			let health = crate::compose! {
@@ -192,7 +208,7 @@ mod tests {
 					}
 			}?;
 			// Route
-			router.dispatch::<HealthCheck>(health)?;
+			router.dispatch::<HealthCheck>(Arc::new(health))?;
 		}
 
 		// Verify n messages per channel

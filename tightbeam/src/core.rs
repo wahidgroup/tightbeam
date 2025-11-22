@@ -68,7 +68,7 @@ impl Frame {
 #[cfg(feature = "signature")]
 impl Frame {
 	/// Get a reference to the signature info if present.
-	pub fn as_signature_info(&self) -> Option<&SignerInfo> {
+	pub fn to_signature_info_ref(&self) -> Option<&SignerInfo> {
 		self.nonrepudiation.as_ref()
 	}
 
@@ -162,7 +162,7 @@ impl Frame {
 #[cfg(feature = "aead")]
 impl Frame {
 	/// Get a reference to the encrypted content info if present.
-	pub fn as_encrypted_content_info(&self) -> Option<&EncryptedContentInfo> {
+	pub fn to_encrypted_content_info_ref(&self) -> Option<&EncryptedContentInfo> {
 		self.metadata.confidentiality.as_ref()
 	}
 
@@ -242,12 +242,12 @@ crate::impl_try_from!(Frame, tb => SignerInfo: nonrepudiation, TightBeamError::M
 #[cfg(feature = "digest")]
 impl Frame {
 	/// Get a reference to the frame integrity info if present.
-	pub fn as_integrity_info(&self) -> Option<&crate::DigestInfo> {
+	pub fn to_integrity_info_ref(&self) -> Option<&crate::DigestInfo> {
 		self.integrity.as_ref()
 	}
 
 	/// Get a reference to the message integrity info if present.
-	pub fn as_message_integrity(&self) -> Option<&crate::DigestInfo> {
+	pub fn to_message_integrity_ref(&self) -> Option<&crate::DigestInfo> {
 		self.metadata.integrity.as_ref()
 	}
 }
@@ -255,7 +255,7 @@ impl Frame {
 #[cfg(feature = "compress")]
 impl Frame {
 	/// Get a reference to the compressed data info if present.
-	pub fn as_compressed_data(&self) -> Option<&crate::CompressedData> {
+	pub fn to_compressed_data_ref(&self) -> Option<&crate::CompressedData> {
 		self.metadata.compactness.as_ref()
 	}
 
