@@ -318,6 +318,52 @@ where
 	closure(trace, client).await
 }
 
+/// Helper function for start closures (receives trace, &config, returns servlet)
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub async fn __call_start_closure<F, Fut, C, S>(
+	closure: F,
+	trace: std::sync::Arc<crate::trace::TraceCollector>,
+	config: &C,
+) -> Result<S, crate::TightBeamError>
+where
+	F: FnOnce(std::sync::Arc<crate::trace::TraceCollector>, &C) -> Fut,
+	Fut: core::future::Future<Output = Result<S, crate::TightBeamError>>,
+{
+	closure(trace, config).await
+}
+
+/// Helper function for setup closures with Arc<RwLock<Config>>
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub async fn __call_setup_with_rwlock<F, Fut, A, C, T>(
+	closure: F,
+	addr: A,
+	config: std::sync::Arc<std::sync::RwLock<C>>,
+) -> Result<T, crate::TightBeamError>
+where
+	F: FnOnce(A, std::sync::Arc<std::sync::RwLock<C>>) -> Fut,
+	Fut: core::future::Future<Output = Result<T, crate::TightBeamError>>,
+{
+	closure(addr, config).await
+}
+
+/// Helper function for client closures with Arc<Config>
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub async fn __call_client_with_config<F, Fut, T, C>(
+	closure: F,
+	trace: crate::trace::TraceCollector,
+	client: T,
+	config: std::sync::Arc<std::sync::RwLock<C>>,
+) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(crate::trace::TraceCollector, T, std::sync::Arc<std::sync::RwLock<C>>) -> Fut,
+	Fut: core::future::Future<Output = Result<(), crate::TightBeamError>>,
+{
+	closure(trace, client, config).await
+}
+
 /// tb_scenario! macro - MVP implementation
 ///
 /// Supports three execution environments:
@@ -2309,9 +2355,10 @@ macro_rules! tb_scenario {
 		csp: $csp:ty,
 		$(fdr: $fdr_config:expr,)?
 		$(trace: $trace_cfg:expr,)?
+		$(config: $scenario_config:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
-			$(config: $servlet_config:expr,)?
+			start: $start_closure:expr,
 			$(setup: $setup_expr:expr,)?
 			client: $client_closure:expr
 		}
@@ -2327,9 +2374,10 @@ macro_rules! tb_scenario {
 			fuzz: afl,
 			$(fdr: $fdr_config,)?
 			$(trace: $trace_cfg,)?
+			$(config: $scenario_config,)?
 			environment Servlet {
 				servlet: $servlet_name,
-				$(config: $servlet_config,)?
+				start: $start_closure,
 				$(setup: $setup_expr,)?
 				client: $client_closure
 			}
@@ -2345,9 +2393,10 @@ macro_rules! tb_scenario {
 		fuzz: afl,
 		$(fdr: $fdr_config:expr,)?
 		$(trace: $trace_cfg:expr,)?
+		$(config: $scenario_config:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
-			$(config: $servlet_config:expr,)?
+			start: $start_closure:expr,
 			$(setup: $setup_expr:expr,)?
 			client: $client_closure:expr
 		}
@@ -2380,45 +2429,43 @@ macro_rules! tb_scenario {
 					.expect("Failed to create tokio runtime");
 
 				let exec_result = runtime.block_on(async {
-				let trace_client = trace_collector.share();
-				let trace_server = trace_collector.share();
+					let trace_client = trace_collector.share();
+					let trace_server = trace_collector.share();
 
-				// Start servlet automatically (with optional config)
-				let mut servlet_instance = $crate::__tb_scenario_servlet_start_with_config!(
-					$servlet_name,
-					trace_server.share(),
-					$($servlet_config)?
-				);
-				let server_addr = servlet_instance.addr();
+					// Create scenario config
+				let config = $crate::__tb_scenario_default_config!($($scenario_config)?);
 
-				servlet_instance.set_trace(trace_server.share());
+				// Start servlet using start block
+				let mut servlet_instance = $crate::testing::macros::__call_start_closure($start_closure, std::sync::Arc::new(trace_server.share()), &config)
+					.await
+					.expect("Failed to start servlet");
+					let server_addr = servlet_instance.addr();
 
-				// Setup client using custom expression or default
-				let client = $crate::__tb_scenario_servlet_setup!(
-					$servlet_name,
-					trace_client,
-					server_addr,
-					$($setup_expr)?
-				);
+					servlet_instance.set_trace(std::sync::Arc::new(trace_server.share()));
 
-				// Execute client closure
-				async fn __call_client_closure<F, Fut, T>(
-					closure: F,
-					trace: $crate::trace::TraceCollector,
-					client: T,
-				) -> Result<(), $crate::TightBeamError>
-				where
-					F: FnOnce($crate::trace::TraceCollector, T) -> Fut,
-					Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
-				{
-					closure(trace, client).await
-				}
-				let client_result = $crate::testing::macros::__tb_call_client_closure_async($client_closure, trace_client, client).await;
+					// Wrap config in Arc<RwLock> for mutable setup
+					let config_lock = std::sync::Arc::new(std::sync::RwLock::new(config));
 
-				servlet_instance.stop();
+					// Setup client
+					let client = $crate::__tb_scenario_servlet_setup_with_config!(
+						server_addr,
+						config_lock.clone(),
+						$($setup_expr)?
+					);
 
-				client_result
-			});
+					// Extract config for read-only client access
+					let final_config = {
+						let guard = config_lock.read().expect("Failed to read config lock");
+						std::sync::Arc::new(guard.clone())
+					};
+
+					// Execute client closure
+					let client_result = $crate::testing::macros::__call_client_with_config($client_closure, trace_client, client, final_config).await;
+
+					servlet_instance.stop();
+
+					client_result
+				});
 
 				// Report CSP exploration to IJON (if feature enabled)
 				#[cfg(feature = "testing-fuzz-ijon")]
@@ -2469,9 +2516,10 @@ macro_rules! tb_scenario {
 		$(csp: $csp:ty,)?
 		$(fdr: $fdr_config:expr,)?
 		$(trace: $trace_cfg:expr,)?
+		$(config: $scenario_config:expr,)?
 		environment Servlet {
 			servlet: $servlet_name:ident,
-			$(config: $servlet_config:expr,)?
+			start: $start_closure:expr,
 			$(setup: $setup_expr:expr,)?
 			client: $client_closure:expr
 		}
@@ -2481,29 +2529,47 @@ macro_rules! tb_scenario {
 		#[cfg(feature = "tokio")]
 		#[tokio::test]
 		async fn $test_name() {
-			// Create trace collector
-			let trace_collector = $crate::trace::TraceCollector::new();
-			let trace_client = trace_collector.share();
-			let trace_server = trace_collector.share();
+		// Create trace collector
+		let trace_collector = $crate::trace::TraceCollector::new();
+		let trace_client = trace_collector.share();
+		let trace_server = std::sync::Arc::new(trace_collector.share());
 
-			// Start servlet automatically (with optional config)
-			let servlet_instance = $crate::__tb_scenario_servlet_start_with_config!(
-				$servlet_name,
-				trace_server,
-				$($servlet_config)?
-			);
+		// Create scenario config (or use () if not provided)
+		let config = $crate::__tb_scenario_default_config!($($scenario_config)?);
+
+		// Start servlet using start block (receives Arc<trace>, &config)
+		let servlet_instance = $crate::testing::macros::__call_start_closure($start_closure, trace_server, &config)
+			.await
+			.expect("Failed to start servlet");
 			let server_addr = servlet_instance.addr();
 
-			// Setup client using custom expression or default
-			let client = $crate::__tb_scenario_servlet_setup!(
-				$servlet_name,
-				trace_client,
+			// Wrap config in Arc<RwLock> for mutable setup
+			let config_lock = std::sync::Arc::new(std::sync::RwLock::new(config));
+
+			// Setup client (receives addr + Arc<RwLock<config>> for mutation)
+			let client: _ = $crate::__tb_scenario_servlet_setup_with_config!(
 				server_addr,
+				config_lock.clone(),
 				$($setup_expr)?
 			);
 
-			// Execute client closure
-			let client_result = $crate::testing::macros::__tb_call_client_closure_async($client_closure, trace_client, client).await;
+			// Use the same config lock for client (it will acquire read lock when needed)
+			let final_config = config_lock.clone();
+
+		// Execute client closure - use a type-erased wrapper
+		async fn __call_client_inner<F, Fut, T, C>(
+			closure: F,
+			trace: $crate::trace::TraceCollector,
+			client: T,
+			config: std::sync::Arc<std::sync::RwLock<C>>,
+		) -> Result<(), $crate::TightBeamError>
+		where
+			F: FnOnce($crate::trace::TraceCollector, T, std::sync::Arc<std::sync::RwLock<C>>) -> Fut,
+			Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+		{
+			closure(trace, client, config).await
+		}
+		let client_result = __call_client_inner($client_closure, trace_client, client, final_config).await;
 
 			// Stop servlet
 			servlet_instance.stop();
@@ -2530,7 +2596,9 @@ macro_rules! tb_scenario {
 				panic!("Spec verification failed: {:?}", v);
 			}
 		}
-	};	// ===== Helper dispatchers for defaults =====
+	};
+
+	// ===== Helper dispatchers for defaults =====
 	(@default_worker_threads) => { 2 };
 	(@default_worker_threads $threads:literal) => { $threads };
 
@@ -2648,6 +2716,44 @@ macro_rules! tb_scenario {
 	($($tt:tt)*) => {
 		compile_error!("Unrecognized tb_scenario! syntax; expected: name: test_name, spec: Type, environment <Variant> { ... }");
 	};
+}
+
+/// Helper macro for default config (returns () if not provided)
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_scenario_default_config {
+	() => {
+		()
+	};
+	($config:expr) => {
+		$config
+	};
+}
+
+/// Helper macro for setup with config
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_scenario_servlet_setup_with_config {
+	// With setup expression
+	($addr:expr, $config:expr, $setup:expr) => {{
+		$crate::testing::macros::__call_setup_with_rwlock($setup, $addr, $config)
+			.await
+			.expect("Failed to setup client")
+	}};
+	// Without setup expression - return default client builder
+	($addr:expr, $config:expr,) => {{
+		use $crate::macros::client::builder::ClientBuilder;
+		async {
+			let client = ClientBuilder::connect($addr)
+				.await
+				.map_err(|e| $crate::TightBeamError::from(e))?
+				.build()
+				.map_err(|e| $crate::TightBeamError::from(e))?;
+			Ok::<_, $crate::TightBeamError>(client)
+		}
+		.await
+		.expect("Failed to setup default client")
+	}};
 }
 
 /// Helper macro for starting servlets with optional config

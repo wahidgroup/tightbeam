@@ -83,13 +83,18 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
 use core::future::Future;
 
 use crate::colony::Servlet;
 use crate::der::Sequence;
 use crate::policy::TransitStatus;
+use crate::trace::TraceCollector;
 use crate::transport::{AsyncListenerTrait, Mycelial, Protocol};
 use crate::Beamable;
+
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
@@ -296,6 +301,9 @@ pub trait Drone<I>: Servlet<I> {
 	/// The protocol type this drone uses
 	type Protocol: Protocol;
 
+	/// Get the trace collector for this drone
+	fn trace(&self) -> Arc<TraceCollector>;
+
 	/// Activate a servlet on this drone
 	///
 	/// # Arguments
@@ -492,7 +500,7 @@ macro_rules! drone {
 	(@start_servlet $servlet_name:ident<$input:ty>, $instance:ident, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr) => {
 		paste::paste! {
 			let servlet = <$servlet_name as $crate::colony::Servlet<$input>>::start(
-				$crate::trace::TraceCollector::new(),
+				::std::sync::Arc::clone(&$instance.trace),
 				None,
 			).await
 				.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId($error_id))?;
@@ -503,7 +511,7 @@ macro_rules! drone {
 	};
 
 	// Start servlet with response (for control server)
-	(@start_servlet_with_response $servlet_name:ident<$input:ty>, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr, $active_servlet:ident, $stop_old:ident, $frame:ident) => {
+	(@start_servlet_with_response $servlet_name:ident<$input:ty>, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr, $active_servlet:ident, $trace:ident, $stop_old:ident, $frame:ident) => {
 		paste::paste! {
 			// Stop old servlet if any
 			let old_servlet = {
@@ -514,7 +522,7 @@ macro_rules! drone {
 
 			// Start new servlet
 			match <$servlet_name as $crate::colony::Servlet<$input>>::start(
-				$crate::trace::TraceCollector::new(),
+				::std::sync::Arc::clone(&$trace),
 				None,
 			).await {
 				Ok(servlet) => {
@@ -582,6 +590,7 @@ macro_rules! drone {
 				active_servlet: ::std::sync::Arc<::std::sync::Mutex<[<$drone_name ActiveServlet>]>>,
 				control_server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			}
 		}
 	};
@@ -592,6 +601,7 @@ macro_rules! drone {
 				active_servlet: ::std::sync::Arc<::std::sync::Mutex<[<$drone_name ActiveServlet>]>>,
 				control_server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			}
 		}
 	};
@@ -603,7 +613,7 @@ macro_rules! drone {
 				type Conf = ();
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
-				async fn start(_trace: $crate::trace::TraceCollector, _config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
+				async fn start(trace: ::std::sync::Arc<$crate::trace::TraceCollector>, _config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
 					// Bind to a port for the control server
 					let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()?;
 					let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
@@ -612,13 +622,17 @@ macro_rules! drone {
 					let active_servlet = ::std::sync::Arc::new(::std::sync::Mutex::new([<$drone_name ActiveServlet>]::None));
 					let active_servlet_clone = ::std::sync::Arc::clone(&active_servlet);
 
+					// Clone trace for control server
+					let trace_clone = ::std::sync::Arc::clone(&trace);
+
 					// Start the control server that listens for ActivateServletRequest messages
-					let control_server_handle = drone!(@build_control_server $protocol, listener, [$($policy_key: $policy_val),*], active_servlet_clone, $drone_name, $($servlet_id: $servlet_name<$input>),*);
+					let control_server_handle = drone!(@build_control_server $protocol, listener, [$($policy_key: $policy_val),*], active_servlet_clone, trace_clone, $drone_name, $($servlet_id: $servlet_name<$input>),*);
 
 					Ok(Self {
 						active_servlet,
 						control_server_handle: Some(control_server_handle),
 						addr,
+						trace,
 					})
 				}
 
@@ -670,7 +684,7 @@ macro_rules! drone {
 	(@start_servlet_for_hive_establish_impl $servlet_name:ident<$input:ty>, $instance:ident, $drone_name:ident, $servlet_id:ident) => {
 		paste::paste! {
 			if let Ok(servlet) = <$servlet_name as $crate::colony::Servlet<$input>>::start(
-				$crate::trace::TraceCollector::new(),
+				::std::sync::Arc::clone(&$instance.trace),
 				None,
 			).await {
 				let servlet_addr = servlet.addr();
@@ -688,10 +702,10 @@ macro_rules! drone {
 	};
 
 	// Start servlet for hive (with response)
-	(@start_servlet_for_hive $servlet_name:ident<$input:ty>, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr, $servlets:ident, $frame:ident) => {
+	(@start_servlet_for_hive $servlet_name:ident<$input:ty>, $drone_name:ident, $servlet_id:ident, $servlet_id_str:expr, $error_id:expr, $servlets:ident, $trace:ident, $frame:ident) => {
 		paste::paste! {
 			match <$servlet_name as $crate::colony::Servlet<$input>>::start(
-				$crate::trace::TraceCollector::new(),
+				::std::sync::Arc::clone(&$trace),
 				None,
 			).await {
 				Ok(servlet) => {
@@ -748,6 +762,10 @@ macro_rules! drone {
 		paste::paste! {
 			impl $crate::colony::drone::Drone<()> for $drone_name {
 				type Protocol = $protocol;
+
+				fn trace(&self) -> ::std::sync::Arc<$crate::trace::TraceCollector> {
+					::std::sync::Arc::clone(&self.trace)
+				}
 
 				async fn morph(
 					&mut self,
@@ -865,6 +883,7 @@ macro_rules! drone {
 				config: $crate::colony::drone::HiveConf,
 				control_server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			}
 
 			// Enum to hold any servlet type
@@ -887,6 +906,7 @@ macro_rules! drone {
 				config: $crate::colony::drone::HiveConf,
 				control_server_handle: Option<$crate::colony::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
+				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			}
 
 			// Enum to hold any servlet type
@@ -905,7 +925,7 @@ macro_rules! drone {
 				type Conf = $crate::colony::drone::HiveConf;
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
-				async fn start(_trace: $crate::trace::TraceCollector, config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
+				async fn start(trace: ::std::sync::Arc<$crate::trace::TraceCollector>, config: Option<Self::Conf>) -> Result<Self, $crate::TightBeamError> {
 					// Bind to a port for the control server
 					let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()?;
 					let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
@@ -916,15 +936,17 @@ macro_rules! drone {
 					// Create shared state for servlets
 					let servlets = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::collections::HashMap::new()));
 					let servlets_clone = ::std::sync::Arc::clone(&servlets);
+					let trace_clone = ::std::sync::Arc::clone(&trace);
 
 					// Start the control server that listens for management commands
-					let control_server_handle = drone!(@build_hive_control_server $protocol, listener, [$($policy_key: $policy_val),*], servlets_clone, $drone_name, $($servlet_id: $servlet_name<$input>),*);
+					let control_server_handle = drone!(@build_hive_control_server $protocol, listener, [$($policy_key: $policy_val),*], servlets_clone, trace_clone, $drone_name, $($servlet_id: $servlet_name<$input>),*);
 
 					Ok(Self {
 						servlets,
 						config,
 						control_server_handle: Some(control_server_handle),
 						addr,
+						trace,
 					})
 				}
 
@@ -976,6 +998,10 @@ macro_rules! drone {
 		paste::paste! {
 			impl $crate::colony::drone::Drone<()> for $drone_name {
 				type Protocol = $protocol;
+
+				fn trace(&self) -> ::std::sync::Arc<$crate::trace::TraceCollector> {
+					::std::sync::Arc::clone(&self.trace)
+				}
 
 				async fn morph(
 					&mut self,
@@ -1127,15 +1153,16 @@ macro_rules! drone {
 	};
 
 	// Helper to build control server with policies
-	(@build_control_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+	(@build_control_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $active_servlet:ident, $trace:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			$crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),+ },
 				handle: move |frame: $crate::Frame| {
 					let active_servlet = std::sync::Arc::clone(&$active_servlet);
+					let trace = ::std::sync::Arc::clone(&$trace);
 					async move {
-						drone!(@handle_activation_request frame, active_servlet, $drone_name, $($servlet_id: $servlet_name<$input>),*)
+						drone!(@handle_activation_request frame, active_servlet, trace, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 					}
 				}
 			}
@@ -1143,14 +1170,15 @@ macro_rules! drone {
 	};
 
 	// Helper to build control server without policies
-	(@build_control_server $protocol:path, $listener:ident, [], $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+	(@build_control_server $protocol:path, $listener:ident, [], $active_servlet:ident, $trace:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			$crate::server! {
 				protocol $protocol: $listener,
 				handle: move |frame: $crate::Frame| {
 					let active_servlet = ::std::sync::Arc::clone(&$active_servlet);
+					let trace = ::std::sync::Arc::clone(&$trace);
 				async move {
-					drone!(@handle_activation_request frame, $active_servlet, $drone_name, $($servlet_id: $servlet_name<$input>),*)
+					drone!(@handle_activation_request frame, $active_servlet, trace, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 				}
 				}
 			}
@@ -1158,15 +1186,16 @@ macro_rules! drone {
 	};
 
 	// Helper to build hive control server with policies
-	(@build_hive_control_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+	(@build_hive_control_server $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $servlets:ident, $trace:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			$crate::server! {
 				protocol $protocol: $listener,
 				policies: { $($policy_key: $policy_val),+ },
 				handle: move |frame: $crate::Frame| {
 					let servlets = ::std::sync::Arc::clone(&$servlets);
+					let trace = ::std::sync::Arc::clone(&$trace);
 				async move {
-					drone!(@handle_hive_management frame, $servlets, $drone_name, $($servlet_id: $servlet_name<$input>),*)
+					drone!(@handle_hive_management frame, servlets, trace, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 				}
 				}
 			}
@@ -1174,14 +1203,15 @@ macro_rules! drone {
 	};
 
 	// Helper to build hive control server without policies
-	(@build_hive_control_server $protocol:path, $listener:ident, [], $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+	(@build_hive_control_server $protocol:path, $listener:ident, [], $servlets:ident, $trace:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			$crate::server! {
 				protocol $protocol: $listener,
 				handle: move |frame: $crate::Frame| {
 					let servlets = ::std::sync::Arc::clone(&$servlets);
+					let trace = ::std::sync::Arc::clone(&$trace);
 					async move {
-						drone!(@handle_hive_management frame, servlets, $drone_name, $($servlet_id: $servlet_name<$input>),*)
+						drone!(@handle_hive_management frame, servlets, trace, $drone_name, $($servlet_id: $servlet_name<$input>),*)
 					}
 				}
 			}
@@ -1189,7 +1219,7 @@ macro_rules! drone {
 	};
 
 	// Helper to handle activation requests and route messages to active servlet
-	(@handle_activation_request $frame:ident, $active_servlet:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+	(@handle_activation_request $frame:ident, $active_servlet:ident, $trace:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			{
 				// Define a helper function to stop old servlets
@@ -1212,7 +1242,7 @@ macro_rules! drone {
 						if request.servlet_id == stringify!($servlet_id).as_bytes() {
 							// Start the servlet with correct generic parameter (handles both generic and non-generic)
 							paste::paste! {
-							drone!(@start_servlet_with_response $servlet_name<$input>, $drone_name, $servlet_id, stringify!($servlet_id), request.servlet_id.clone(), $active_servlet, stop_old_servlet, $frame);
+							drone!(@start_servlet_with_response $servlet_name<$input>, $drone_name, $servlet_id, stringify!($servlet_id), request.servlet_id.clone(), $active_servlet, $trace, stop_old_servlet, $frame);
 							}
 						}
 				)*
@@ -1241,7 +1271,7 @@ macro_rules! drone {
 	};
 
 	// Helper to handle management commands for hives
-	(@handle_hive_management $frame:ident, $servlets:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+	(@handle_hive_management $frame:ident, $servlets:ident, $trace:ident, $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			{
 				// Decode the management request
@@ -1256,7 +1286,7 @@ macro_rules! drone {
 							if servlet_type_name == stringify!($servlet_id).as_bytes() {
 								// Start the servlet with correct generic parameter (handles both generic and non-generic)
 								paste::paste! {
-							drone!(@start_servlet_for_hive $servlet_name<$input>, $drone_name, $servlet_id, stringify!($servlet_id), servlet_type_name.to_vec(), $servlets, $frame);
+							drone!(@start_servlet_for_hive $servlet_name<$input>, $drone_name, $servlet_id, stringify!($servlet_id), servlet_type_name.to_vec(), $servlets, $trace, $frame);
 								}
 							}
 					)*
@@ -1375,10 +1405,14 @@ macro_rules! drone {
 mod tests {
 	use super::*;
 
+	use std::sync::Arc;
+
+	use crate::colony::servlet::Servlet;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::der::Sequence;
 	use crate::policy::GatePolicy;
 	use crate::policy::TransitStatus;
+	use crate::trace::TraceCollector;
 	use crate::transport::policy::PolicyConf;
 	use crate::{compose, job, mutex, policy, servlet, worker};
 	use crate::{Beamable, Frame};
@@ -1575,14 +1609,11 @@ mod tests {
 		}
 	}
 
-	use crate::colony::servlet::Servlet;
-	use crate::trace::TraceCollector;
-
 	impl Servlet<DroneTestMessage> for SimpleServlet {
 		type Conf = ();
 		type Address = <Listener as crate::transport::Protocol>::Address;
 
-		async fn start(trace: TraceCollector, config: Option<Self::Conf>) -> Result<Self, crate::TightBeamError> {
+		async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, crate::TightBeamError> {
 			let _ = config;
 			SimpleServlet::start(trace).await
 		}
@@ -1778,7 +1809,7 @@ mod tests {
 		type Conf = ();
 		type Address = <Listener as crate::transport::Protocol>::Address;
 
-		async fn start(trace: TraceCollector, config: Option<Self::Conf>) -> Result<Self, crate::TightBeamError> {
+		async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, crate::TightBeamError> {
 			let _ = config;
 			EchoServlet::start(trace).await
 		}
@@ -1802,7 +1833,7 @@ mod tests {
 		use crate::colony::drone::Hive;
 
 		// Start the hive
-		let mut hive = TestHive::start(crate::trace::TraceCollector::new(), None).await?;
+		let mut hive = TestHive::start(Arc::new(TraceCollector::new()), None).await?;
 
 		// Get the hive's control server address
 		let control_addr = hive.addr();
@@ -1850,13 +1881,11 @@ mod tests {
 	#[cfg(feature = "tokio")]
 	#[tokio::test]
 	async fn test_hive_management_commands() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::colony::drone::Hive;
-		use crate::trace::TraceCollector;
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::{MessageEmitter, Protocol};
 
 		// Start the hive
-		let mut hive = TestHive::start(TraceCollector::new(), None).await?;
+		let mut hive = TestHive::start(Arc::new(TraceCollector::new()), None).await?;
 		let control_addr = hive.addr();
 		println!("Hive control server at: {control_addr:?}");
 

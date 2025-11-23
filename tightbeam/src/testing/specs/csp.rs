@@ -567,6 +567,7 @@ impl ProcessBuilder {
 #[cfg(test)]
 mod tests {
 	use core::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::Arc;
 
 	use super::*;
 	use crate::testing::create_test_message;
@@ -1096,7 +1097,7 @@ mod tests {
 		environment ServiceClient {
 			worker_threads: 1,
 			server: |trace| async move {
-				let servlet = TestServletForScenario::start(trace).await?;
+				let servlet = TestServletForScenario::start(Arc::new(trace)).await?;
 				let addr = servlet.addr();
 				let server_handle = tokio::spawn(async move {
 					let _ = servlet.join().await;

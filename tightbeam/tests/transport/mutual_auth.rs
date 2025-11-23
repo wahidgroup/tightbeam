@@ -15,6 +15,7 @@
 	feature = "builder"
 ))]
 
+use std::sync::Arc;
 use tightbeam::{
 	compose,
 	crypto::{
@@ -133,7 +134,10 @@ tb_scenario! {
 	spec: MutualAuthSpec,
 	environment Servlet {
 		servlet: MutualAuthServlet,
-		setup: |addr| async move {
+		start: |trace, _config| async move {
+			MutualAuthServlet::start(Arc::clone(&trace)).await
+		},
+		setup: |addr, _config| async move {
 			let client = ClientBuilder::<TokioListener>::connect(addr)
 				.await?
 				.with_server_certificate(SERVER_CERT)?
@@ -142,7 +146,7 @@ tb_scenario! {
 
 			Ok(client)
 		},
-		client: |_trace, mut client| async move {
+		client: |_trace, mut client, _config| async move {
 			// Send authenticated request
 			let request = AuthRequest {
 				client_id: "test-client-mutual-001".to_string(),

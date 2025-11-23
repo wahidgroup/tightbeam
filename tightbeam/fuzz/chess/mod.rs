@@ -152,12 +152,15 @@ tb_scenario! {
 	fuzz: afl,
 	spec: ChessAssertSpec,
 	csp: ChessGameFlow,
+	config: ChessEngineServletConf {
+		manager: ChessMatchManager::default(),
+	},
 	environment Servlet {
 		servlet: ChessEngineServlet,
-		config: ChessEngineServletConf {
-			manager: ChessMatchManager::default(),
+		start: |trace, config| async move {
+			ChessEngineServlet::start(Arc::clone(&trace), Arc::new(config.clone())).await
 		},
-		setup: |addr| async move {
+		setup: |addr, _config| async move {
 			// Create a custom client with exponential backoff retry policy
 			// Exponential backoff: 100ms, 200ms, 400ms, 800ms delays (max 3 attempts)
 			let restart_policy = RestartExponentialBackoff::new(3, 100, None);

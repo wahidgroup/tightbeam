@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::sync::Arc;
 use tightbeam::asn1::{Metadata, Version};
 use tightbeam::error::Result;
 use tightbeam::{encode, job, policy, worker, Frame, TightBeamError};
@@ -693,8 +694,8 @@ mod tests {
 	#[tokio::test]
 	async fn test_basic() -> Result<()> {
 		BFTLedgerServlet::start(
-			TraceCollector::new(),
-			BFTLedgerServletConf { ledger_state: Default::default(), epoch_size: 1000 },
+			Arc::new(TraceCollector::new()),
+			Arc::new(BFTLedgerServletConf { ledger_state: Default::default(), epoch_size: 1000 }),
 		).await?;
 
 		Ok(())

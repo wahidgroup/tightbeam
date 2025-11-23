@@ -345,7 +345,10 @@ tb_scenario! {
 	spec: QueueFreeSpec,
 	environment Servlet {
 		servlet: QueueServlet,
-		setup: |addr| async move {
+		start: |trace, _config| async move {
+			QueueServlet::start(Arc::clone(&trace)).await
+		},
+		setup: |addr, _config| async move {
 			let (client_cert, client_key) = create_test_cert_with_key("CN=Test Client", 365)?;
 
 			// Convert signing key to KeySpec via InMemoryKeyProvider
@@ -361,7 +364,7 @@ tb_scenario! {
 
 			Ok(client)
 		},
-		client: |trace, mut client| async move {
+		client: |trace, mut client, _config| async move {
 			let trace = Arc::new(trace);
 
 			let batch = default_batch();
