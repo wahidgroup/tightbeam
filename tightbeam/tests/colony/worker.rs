@@ -74,7 +74,7 @@ tb_scenario! {
 			})
 		},
 		stimulus: |trace, worker| async move {
-			trace.event_with("relay_start", &[], ());
+			trace.event_with("relay_start", &[], ())?;
 
 			let ping_msg = PingMessage {
 				content: "PING".to_string(),
@@ -83,7 +83,7 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
-				trace.event_with("relay_success", &[], resp.result);
+				trace.event_with("relay_success", &[], resp.result)?;
 			}
 
 			Ok(())
@@ -95,18 +95,18 @@ tb_scenario! {
 	name: test_worker_with_type,
 	specs: [WorkerSpec::get(1, 0, 0)],
 	environment Worker {
-		worker: DefaultWorker,
-		stimulus: |trace, worker| async move {
-			trace.event_with("relay_start", &[], ());
+	worker: DefaultWorker,
+	stimulus: |trace, worker| async move {
+		trace.event_with("relay_start", &[], ())?;
 
-			let ping_msg = PingMessage {
-				content: "PING".to_string(),
+		let ping_msg = PingMessage {
+			content: "PING".to_string(),
 				lucky_number: 99,
 			};
 
 			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
-				trace.event_with("relay_success", &[], resp.result);
+				trace.event_with("relay_success", &[], resp.result)?;
 			}
 
 			Ok(())

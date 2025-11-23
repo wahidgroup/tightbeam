@@ -3,12 +3,19 @@
 //! This module contains the core configuration structures and result types
 //! used by the FDR exploration engine.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::builder::TypeBuilder;
+use crate::constants::DEFAULT_FAULT_SEED;
+use crate::error::TightBeamError;
 use crate::testing::error::FdrConfigError;
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
+use crate::utils::BasisPoints;
+
+#[cfg(feature = "testing-fault")]
+use crate::testing::fault::{ProcessEvent, ProcessState};
 
 /// CSP trace: sequence of observable events
 pub type Trace = Vec<Event>;
@@ -32,100 +39,118 @@ pub enum SchedulerModel {
 	Preemptive,
 }
 
-/// Fault injection strategy
-/// Panics if used when `testing-fault` feature is not enabled
+/// Fault injection strategy for runtime and FDR-based fault injection
+///
+/// - **Deterministic**: Counter-based injection for reproducibility (DO-178C/IEC 61508)
+/// - **Random**: Seeded RNG for statistical coverage (same seed = same faults)
+#[cfg(feature = "testing-fault")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectionStrategy {
-	/// Deterministic fault injection (seed-based)
+	/// Deterministic fault injection (counter-based)
+	/// Injects faults based on call counters: predictable, reproducible
 	Deterministic,
-	/// Random fault injection
+	/// Random fault injection (seeded RNG)
+	/// Injects faults probabilistically but deterministically via seed
 	Random,
 }
 
-/// Fault type for injection
-/// Panics if used when `testing-fault` feature is not enabled
-#[derive(Debug, Clone, PartialEq)]
-pub enum Fault {
-	/// Network packet drop
-	NetworkDrop { probability: f64 },
-	/// Message corruption
-	MessageCorruption { probability: f64 },
-	/// Node crash
-	NodeCrash { probability: f64 },
+/// Individual fault injection configuration
+#[cfg(feature = "testing-fault")]
+#[derive(Clone)]
+pub struct FaultInjection {
+	pub error_factory: Arc<dyn Fn() -> TightBeamError + Send + Sync>,
+	/// Probability in basis points (0-10000, where 10000 = 100%)
+	/// Compile-time validated via BasisPoints type
+	pub probability_bps: BasisPoints,
 }
 
-/// Fault model configuration
+#[cfg(feature = "testing-fault")]
+impl FaultInjection {
+	/// Check if fault should fire based on RNG value (0-9999)
+	pub fn should_inject(&self, rng_value: u32) -> bool {
+		(rng_value % 10000) < (self.probability_bps.get() as u32)
+	}
+}
+
+#[cfg(feature = "testing-fault")]
+impl core::fmt::Debug for FaultInjection {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("FaultInjection")
+			.field("probability_bps", &self.probability_bps)
+			.finish_non_exhaustive()
+	}
+}
+
+/// Fault model configuration with HashMap for O(1) lookups
+/// Key: (csp_state, event_label)
 /// Panics if used when `testing-fault` feature is not enabled
-#[derive(Debug, Clone)]
+#[cfg(feature = "testing-fault")]
+#[derive(Clone)]
 pub struct FaultModel {
-	/// List of faults to inject
-	pub faults: Vec<Fault>,
-	/// Injection strategy
+	pub injection_points: HashMap<(Cow<'static, str>, Cow<'static, str>), FaultInjection>,
 	pub injection_strategy: InjectionStrategy,
-}
-
-/// Builder for creating `FaultModel` instances with auto-prefixed fault syntax.
-///
-/// Allows users to write `NetworkDrop { probability: 0.1 }` instead of
-/// `Fault::NetworkDrop { probability: 0.1 }` for better ergonomics.
-#[cfg(feature = "testing-fault")]
-#[derive(Debug, Default, Clone)]
-pub struct FaultModelBuilder {
-	faults: Vec<Fault>,
-	injection_strategy: Option<InjectionStrategy>,
+	/// Seed for deterministic fault injection
+	/// - reproducibility for DO-178C/IEC 61508
+	pub seed: u64,
 }
 
 #[cfg(feature = "testing-fault")]
-impl FaultModelBuilder {
-	/// Add a [multiple] network drop fault (auto-prefixes `Fault::`).
-	pub fn with_network_drop(mut self, probability: f64) -> Self {
-		self.faults.push(Fault::NetworkDrop { probability });
-		self
+impl core::fmt::Debug for FaultModel {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("FaultModel")
+			.field("injection_points", &format!("{} points", self.injection_points.len()))
+			.field("injection_strategy", &self.injection_strategy)
+			.finish()
 	}
+}
 
-	/// Add a [multiple] message corruption fault (auto-prefixes `Fault::`).
-	pub fn with_message_corruption(mut self, probability: f64) -> Self {
-		self.faults.push(Fault::MessageCorruption { probability });
-		self
+#[cfg(feature = "testing-fault")]
+impl Default for FaultModel {
+	fn default() -> Self {
+		Self {
+			injection_points: HashMap::new(),
+			injection_strategy: InjectionStrategy::Deterministic,
+			seed: DEFAULT_FAULT_SEED,
+		}
 	}
+}
 
-	/// Add a [multiple] node crash fault (auto-prefixes `Fault::`).
-	pub fn with_node_crash(mut self, probability: f64) -> Self {
-		self.faults.push(Fault::NodeCrash { probability });
-		self
+#[cfg(feature = "testing-fault")]
+impl From<InjectionStrategy> for FaultModel {
+	fn from(injection_strategy: InjectionStrategy) -> Self {
+		Self { injection_points: HashMap::new(), injection_strategy, seed: DEFAULT_FAULT_SEED }
 	}
+}
 
-	/// Add a [multiple] fault directly (for advanced use cases).
+#[cfg(feature = "testing-fault")]
+impl FaultModel {
+	/// Type-safe fault injection using ProcessState and ProcessEvent traits
 	///
-	/// This method allows adding a `Fault` enum variant directly if needed.
-	pub fn with_fault(mut self, fault: Fault) -> Self {
-		self.faults.push(fault);
+	/// Injects a fault at the specified (process state, event) combination with
+	/// the given probability in basis points (0-10000, where 10000 = 100%).
+	///
+	/// Uses ProcessState and ProcessEvent traits for compile-time validation when
+	/// used with enums generated by tb_process_spec! macro.
+	pub fn with_fault<S, E, F, Err>(mut self, state: S, event: E, error_fn: F, probability_bps: BasisPoints) -> Self
+	where
+		S: ProcessState,
+		E: ProcessEvent,
+		F: Fn() -> Err + Send + Sync + 'static,
+		Err: Into<TightBeamError>,
+	{
+		let key = (state.full_key(), Cow::Borrowed(event.event_label()));
+		self.injection_points.insert(
+			key,
+			FaultInjection { error_factory: Arc::new(move || error_fn().into()), probability_bps },
+		);
 		self
 	}
 
-	/// Set the injection strategy.
-	pub fn with_strategy(mut self, strategy: InjectionStrategy) -> Self {
-		self.injection_strategy = Some(strategy);
+	/// Set seed for deterministic fault injection
+	pub fn with_seed(mut self, seed: u64) -> Self {
+		self.seed = seed;
 		self
 	}
-}
-
-#[cfg(feature = "testing-fault")]
-impl TypeBuilder<FaultModel> for FaultModelBuilder {
-	type Error = TestingError;
-
-	fn build(self) -> Result<FaultModel, Self::Error> {
-		let injection_strategy = self.injection_strategy.unwrap_or(InjectionStrategy::Deterministic);
-		Ok(FaultModel { faults: self.faults, injection_strategy })
-	}
-}
-
-/// FMEA configuration (automatic analysis only)
-/// Panics if used when `testing-fmea` feature is not enabled
-#[derive(Debug, Clone)]
-pub struct FmeaConfig {
-	/// Enable automatic FMEA analysis
-	pub enabled: bool,
 }
 
 /// FDR configuration for refinement checking and multi-seed exploration
@@ -179,12 +204,9 @@ pub struct FdrConfig {
 	pub scheduler_model: Option<SchedulerModel>,
 
 	/// Fault injection model
-	/// Panics if set to Some(_) when `testing-fault` feature is not enabled
+	/// When provided, enables CSP state-driven fault injection during FDR exploration
+	#[cfg(feature = "testing-fault")]
 	pub fault_model: Option<FaultModel>,
-
-	/// FMEA analysis configuration
-	/// Panics if set to Some(_) when `testing-fmea` feature is not enabled
-	pub fmea: Option<FmeaConfig>,
 }
 
 impl Default for FdrConfig {
@@ -205,8 +227,6 @@ impl Default for FdrConfig {
 			scheduler_model: None,
 			#[cfg(feature = "testing-fault")]
 			fault_model: None,
-			#[cfg(feature = "testing-fmea")]
-			fmea: None,
 		}
 	}
 }
@@ -267,17 +287,14 @@ impl FdrConfig {
 	}
 }
 
-/// Validate probability is in range [0.0, 1.0] at compile time
-/// Helper macro for validating probabilities (must be used in const context)
+/// Record of an injected fault during FDR exploration
 #[cfg(feature = "testing-fault")]
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __validate_probability {
-	($p:expr) => {{
-		// Compile-time assertion: probability must be in [0.0, 1.0]
-		const _: () = assert!($p >= 0.0 && $p <= 1.0, "Probability must be in range [0.0, 1.0]");
-		$p
-	}};
+#[derive(Debug, Clone, PartialEq)]
+pub struct InjectedFaultRecord {
+	pub csp_state: String,
+	pub event_label: String,
+	pub error_message: String,
+	pub probability_bps: u16,
 }
 
 /// FDR verification verdict
@@ -340,6 +357,18 @@ pub struct FdrVerdict {
 
 	/// Seed that caused failure, if any
 	pub failing_seed: Option<u64>,
+
+	/// Faults that were injected during exploration
+	#[cfg(feature = "testing-fault")]
+	pub faults_injected: Vec<InjectedFaultRecord>,
+
+	/// Number of successfully recovered errors
+	#[cfg(feature = "testing-fault")]
+	pub error_recovery_successful: usize,
+
+	/// Number of failed error recoveries
+	#[cfg(feature = "testing-fault")]
+	pub error_recovery_failed: usize,
 }
 
 impl Default for FdrVerdict {
@@ -362,6 +391,12 @@ impl Default for FdrVerdict {
 			states_visited: 0,
 			seeds_completed: 0,
 			failing_seed: None,
+			#[cfg(feature = "testing-fault")]
+			faults_injected: Vec::new(),
+			#[cfg(feature = "testing-fault")]
+			error_recovery_successful: 0,
+			#[cfg(feature = "testing-fault")]
+			error_recovery_failed: 0,
 		}
 	}
 }
@@ -370,6 +405,178 @@ impl Default for FdrVerdict {
 mod tests {
 	use super::*;
 	use crate::testing::specs::csp::TransitionRelation;
+
+	// ========== FaultModel Unit Tests ==========
+
+	#[cfg(feature = "testing-fault")]
+	mod fault_model {
+		use super::*;
+
+		#[derive(Debug, Clone, Copy)]
+		struct TestError;
+
+		impl core::fmt::Display for TestError {
+			fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+				write!(f, "test error")
+			}
+		}
+
+		impl From<TestError> for TightBeamError {
+			fn from(e: TestError) -> Self {
+				TightBeamError::InjectedFault(Box::new(e))
+			}
+		}
+
+		#[derive(Debug, Clone, Copy)]
+		struct TestState;
+
+		impl ProcessState for TestState {
+			fn process_name(&self) -> &'static str {
+				"TestProcess"
+			}
+			fn state_name(&self) -> &'static str {
+				"TestState"
+			}
+		}
+
+		#[derive(Debug, Clone, Copy)]
+		struct TestEvent;
+
+		impl ProcessEvent for TestEvent {
+			fn event_label(&self) -> &'static str {
+				"test_event"
+			}
+		}
+
+		#[derive(Debug, Clone, Copy)]
+		struct AnotherState;
+
+		impl ProcessState for AnotherState {
+			fn process_name(&self) -> &'static str {
+				"TestProcess"
+			}
+			fn state_name(&self) -> &'static str {
+				"AnotherState"
+			}
+		}
+
+		#[derive(Debug, Clone, Copy)]
+		struct AnotherEvent;
+
+		impl ProcessEvent for AnotherEvent {
+			fn event_label(&self) -> &'static str {
+				"another_event"
+			}
+		}
+
+		#[test]
+		fn default_initializes_empty() {
+			let model = FaultModel::default();
+			assert_eq!(model.injection_points.len(), 0);
+			assert_eq!(model.injection_strategy, InjectionStrategy::Deterministic);
+		}
+
+		#[test]
+		fn from_strategy_sets_strategy() {
+			let model = FaultModel::from(InjectionStrategy::Random);
+			assert_eq!(model.injection_strategy, InjectionStrategy::Random);
+		}
+
+		#[test]
+		fn with_fault_adds_typed_injection() {
+			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(5000));
+			assert_eq!(model.injection_points.len(), 1);
+
+			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
+			let injection = model.injection_points.get(&key).unwrap();
+			assert_eq!(injection.probability_bps, BasisPoints::new(5000));
+		}
+
+		#[test]
+		fn with_fault_io_error() {
+			let model = FaultModel::default().with_fault(
+				TestState,
+				TestEvent,
+				|| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test"),
+				BasisPoints::new(100),
+			);
+
+			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
+			let error = (model.injection_points.get(&key).unwrap().error_factory)();
+			assert!(matches!(error, TightBeamError::IoError(_)));
+		}
+
+		#[test]
+		fn hashmap_provides_o1_lookup() {
+			let model = FaultModel::default()
+				.with_fault(TestState, TestEvent, || TestError, BasisPoints::new(1000))
+				.with_fault(TestState, AnotherEvent, || TestError, BasisPoints::new(2000))
+				.with_fault(AnotherState, TestEvent, || TestError, BasisPoints::new(3000));
+
+			assert_eq!(model.injection_points.len(), 3);
+
+			let key1 = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
+			let key2 = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("another_event"));
+			let key3 = (Cow::Borrowed("TestProcess.AnotherState"), Cow::Borrowed("test_event"));
+			assert_eq!(
+				model.injection_points.get(&key1).unwrap().probability_bps,
+				BasisPoints::new(1000)
+			);
+			assert_eq!(
+				model.injection_points.get(&key2).unwrap().probability_bps,
+				BasisPoints::new(2000)
+			);
+			assert_eq!(
+				model.injection_points.get(&key3).unwrap().probability_bps,
+				BasisPoints::new(3000)
+			);
+		}
+
+		#[test]
+		fn should_inject_probability_0_percent() {
+			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(0));
+			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
+			let injection = model.injection_points.get(&key).unwrap();
+			assert!(!injection.should_inject(0));
+			assert!(!injection.should_inject(9999));
+		}
+
+		#[test]
+		fn should_inject_probability_100_percent() {
+			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(10000));
+			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
+			let injection = model.injection_points.get(&key).unwrap();
+			assert!(injection.should_inject(0));
+			assert!(injection.should_inject(9999));
+		}
+
+		#[test]
+		fn should_inject_probability_50_percent() {
+			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(5000));
+			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
+			let injection = model.injection_points.get(&key).unwrap();
+			assert!(injection.should_inject(0));
+			assert!(injection.should_inject(4999));
+			assert!(!injection.should_inject(5000));
+			assert!(!injection.should_inject(9999));
+		}
+
+		#[test]
+		#[should_panic(expected = "BasisPoints must be 0-10000")]
+		fn probability_above_10000_panics() {
+			let _model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(10001));
+		}
+
+		#[test]
+		fn clone_preserves_injection_points() {
+			let model1 = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(5000));
+			let model2 = model1.clone();
+			assert_eq!(model2.injection_points.len(), 1);
+			assert_eq!(model2.injection_strategy, InjectionStrategy::Deterministic);
+		}
+	}
+
+	// ========== FdrConfig Tests ==========
 
 	#[test]
 	fn default_configuration() {
@@ -411,204 +618,25 @@ mod tests {
 		assert!(!config_refinement.specs.is_empty());
 	}
 
-	// Tests for FdrVerdict
-	mod verdict {
-		use super::*;
+	// ========== FdrVerdict Tests ==========
 
-		#[test]
-		fn default_values() {
-			let verdict = FdrVerdict::default();
-
-			assert!(verdict.passed);
-			assert!(verdict.divergence_free);
-			assert!(verdict.deadlock_free);
-			assert!(verdict.is_deterministic);
-			assert!(verdict.trace_refines);
-			assert!(verdict.failures_refines);
-
-			assert!(verdict.determinism_witness.is_none());
-			assert!(verdict.divergence_witness.is_none());
-			assert!(verdict.deadlock_witness.is_none());
-			assert!(verdict.trace_refinement_witness.is_none());
-			assert!(verdict.failures_refinement_witness.is_none());
-
-			assert_eq!(verdict.traces_explored, 0);
-			assert_eq!(verdict.states_visited, 0);
-			assert_eq!(verdict.seeds_completed, 0);
-			assert!(verdict.failing_seed.is_none());
-		}
-
-		#[test]
-		fn refinement_witness_tracking() {
-			let mut verdict = FdrVerdict::default();
-
-			// Trace refinement violation
-			let bad_trace = vec![Event("unexpected")];
-			verdict.trace_refines = false;
-			verdict.trace_refinement_witness = Some(bad_trace.clone());
-			verdict.passed = false;
-			assert!(!verdict.trace_refines);
-			assert_eq!(verdict.trace_refinement_witness, Some(bad_trace));
-
-			// Failures refinement violation
-			let bad_failure_trace = vec![Event("a"), Event("b")];
-			let bad_refusal: HashSet<Event> = vec![Event("c")].into_iter().collect();
-			verdict.failures_refines = false;
-			verdict.failures_refinement_witness = Some((bad_failure_trace.clone(), bad_refusal.clone()));
-			assert!(!verdict.failures_refines);
-			assert_eq!(verdict.failures_refinement_witness, Some((bad_failure_trace, bad_refusal)));
-		}
-
-		#[test]
-		fn trace_refinement_structure() {
-			// Spec ⊑_T Impl: traces(Impl) ⊆ traces(Spec)
-			let verdict = FdrVerdict::default();
-			assert!(verdict.trace_refines);
-			assert!(verdict.trace_refinement_witness.is_none());
-		}
-
-		#[test]
-		fn failures_refinement_structure() {
-			// Spec ⊑_F Impl: failures(Impl) ⊆ failures(Spec)
-			let verdict = FdrVerdict::default();
-			assert!(verdict.failures_refines);
-			assert!(verdict.failures_refinement_witness.is_none());
-		}
+	#[test]
+	fn verdict_default_all_pass() {
+		let verdict = FdrVerdict::default();
+		assert!(verdict.passed);
+		assert!(verdict.divergence_free);
+		assert!(verdict.deadlock_free);
+		assert!(verdict.is_deterministic);
+		assert_eq!(verdict.traces_explored, 0);
+		assert_eq!(verdict.states_visited, 0);
 	}
 
-	// Tests for FaultModelBuilder
-	#[cfg(feature = "testing-fault")]
-	mod builder {
-		use super::*;
+	#[test]
+	fn verdict_tracks_witnesses() {
+		let mut verdict = FdrVerdict::default();
 
-		#[test]
-		fn fault_model_builder_single_fault() -> Result<(), TestingError> {
-			let model = FaultModelBuilder::default().with_network_drop(0.1).build()?;
-			assert_eq!(model.faults.len(), 1);
-
-			match &model.faults[0] {
-				Fault::NetworkDrop { probability } => assert_eq!(probability, &0.1),
-				_ => return Err(TestingError::InvalidFaultModel),
-			}
-			assert_eq!(model.injection_strategy, InjectionStrategy::Deterministic);
-			Ok(())
-		}
-
-		#[test]
-		fn fault_model_builder_multiple_faults() -> Result<(), TestingError> {
-			let model = FaultModelBuilder::default()
-				.with_network_drop(0.1)
-				.with_message_corruption(0.05)
-				.with_node_crash(0.01)
-				.build()?;
-
-			assert_eq!(model.faults.len(), 3);
-			match &model.faults[0] {
-				Fault::NetworkDrop { probability } => assert_eq!(probability, &0.1),
-				_ => return Err(TestingError::InvalidFaultModel),
-			}
-			match &model.faults[1] {
-				Fault::MessageCorruption { probability } => assert_eq!(probability, &0.05),
-				_ => return Err(TestingError::InvalidFaultModel),
-			}
-			match &model.faults[2] {
-				Fault::NodeCrash { probability } => assert_eq!(probability, &0.01),
-				_ => return Err(TestingError::InvalidFaultModel),
-			}
-			Ok(())
-		}
-
-		#[test]
-		fn fault_model_builder_with_strategy() -> Result<(), TestingError> {
-			let model = FaultModelBuilder::default()
-				.with_network_drop(0.1)
-				.with_strategy(InjectionStrategy::Random)
-				.build()?;
-			assert_eq!(model.injection_strategy, InjectionStrategy::Random);
-			Ok(())
-		}
-
-		#[test]
-		fn fault_model_builder_add_fault_directly() -> Result<(), TestingError> {
-			let fault = Fault::NetworkDrop { probability: 0.2 };
-			let model = FaultModelBuilder::default().with_fault(fault).build()?;
-			assert_eq!(model.faults.len(), 1);
-			Ok(())
-		}
-	}
-
-	// Tests for scheduler model validation
-	#[cfg(feature = "testing-fault")]
-	mod validation {
-		use super::*;
-
-		/// Helper to assert validation error is InvalidFdrConfig variant
-		fn assert_validation_error(result: Result<(), TestingError>) -> Result<(), TestingError> {
-			match result {
-				Ok(()) => Err(TestingError::InvalidFdrConfig(crate::testing::error::FdrConfigError {
-					field: "test",
-					reason: "expected validation error but got Ok",
-				})),
-				Err(TestingError::InvalidFdrConfig(_)) => Ok(()),
-				Err(e) => Err(e),
-			}
-		}
-
-		#[test]
-		fn scheduler_validation_valid_config() -> Result<(), TestingError> {
-			let config = FdrConfig {
-				scheduler_count: Some(2),
-				process_count: Some(5),
-				scheduler_model: Some(SchedulerModel::Cooperative),
-				..FdrConfig::default()
-			};
-
-			config.validate_scheduler_model()?;
-			Ok(())
-		}
-
-		#[test]
-		fn scheduler_validation_scheduler_exceeds_process_count() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: Some(5), process_count: Some(2), ..FdrConfig::default() };
-			assert_validation_error(config.validate_scheduler_model())
-		}
-
-		#[test]
-		fn scheduler_validation_zero_scheduler_count() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: Some(0), process_count: Some(5), ..FdrConfig::default() };
-			assert_validation_error(config.validate_scheduler_model())
-		}
-
-		#[test]
-		fn scheduler_validation_zero_process_count() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: Some(2), process_count: Some(0), ..FdrConfig::default() };
-			assert_validation_error(config.validate_scheduler_model())
-		}
-
-		#[test]
-		fn scheduler_validation_equal_counts() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: Some(3), process_count: Some(3), ..FdrConfig::default() };
-			config.validate_scheduler_model()?;
-			Ok(())
-		}
-
-		#[test]
-		fn scheduler_validation_default_values() -> Result<(), TestingError> {
-			let config = FdrConfig::default();
-			config.validate_scheduler_model()?;
-			Ok(())
-		}
-
-		#[test]
-		fn scheduler_validation_only_scheduler_count_set() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: Some(2), process_count: None, ..FdrConfig::default() };
-			assert_validation_error(config.validate_scheduler_model())
-		}
-
-		#[test]
-		fn scheduler_validation_only_process_count_set() -> Result<(), TestingError> {
-			let config = FdrConfig { scheduler_count: None, process_count: Some(5), ..FdrConfig::default() };
-			assert_validation_error(config.validate_scheduler_model())
-		}
+		let trace = vec![Event("unexpected")];
+		verdict.trace_refinement_witness = Some(trace.clone());
+		assert_eq!(verdict.trace_refinement_witness, Some(trace));
 	}
 }

@@ -11,6 +11,9 @@ use std::collections::{HashMap, HashSet};
 use super::config::{Failure, FdrConfig, Trace};
 use crate::testing::specs::csp::{Event, Process, State};
 
+#[cfg(feature = "testing-fault")]
+use crate::testing::fdr::config::InjectedFaultRecord;
+
 /// Core exploration functionality
 ///
 /// Handles the fundamental exploration mechanics: state space traversal,
@@ -145,6 +148,9 @@ pub trait MemoizationCache {
 #[derive(Debug, Clone)]
 pub enum SeedResult {
 	/// Exploration completed successfully
+	#[cfg(feature = "testing-fault")]
+	Success(Trace, Vec<Failure>, Vec<InjectedFaultRecord>),
+	#[cfg(not(feature = "testing-fault"))]
 	Success(Trace, Vec<Failure>),
 	/// Divergence detected (τ-loop)
 	Divergence(Trace, Vec<Event>),
@@ -270,9 +276,10 @@ impl SeededRng {
 	/// Generate next pseudo-random number (LCG algorithm)
 	pub fn get_next(&mut self) -> u64 {
 		// Linear Congruential Generator constants from Numerical Recipes
-		const A: u64 = 6364136223846793005;
-		const C: u64 = 1442695040888963407;
-		self.state = self.state.wrapping_mul(A).wrapping_add(C);
+		self.state = self
+			.state
+			.wrapping_mul(crate::constants::LCG_MULTIPLIER)
+			.wrapping_add(crate::constants::LCG_INCREMENT);
 		self.state
 	}
 

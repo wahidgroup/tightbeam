@@ -25,26 +25,26 @@ pub(crate) struct ChessMatchManager {
 
 impl ChessMatchManager {
 	/// Process a move request, returning the game status
-	/// Returns Ok(status) if successful, Err(()) if lock poisoned or invalid move
+	/// Returns Ok(status) if successful, Err(TightBeamError) if error occurs
 	pub(crate) fn process_move(
 		&self,
 		move_req: &ChessMoveRequest,
 		move_count: u64,
 		trace: &TraceCollector,
-	) -> Result<GameStatusCode, ()> {
+	) -> Result<GameStatusCode, TightBeamError> {
 		let mut game_state = match self.game_state.lock() {
 			Ok(gs) => gs,
 			Err(_) => {
-				trace.event("server_state_lock_poisoned");
-				return Err(());
+				trace.event("server_state_lock_poisoned")?;
+				return Err(TightBeamError::LockPoisoned);
 			}
 		};
 
 		let mut last_order = match self.last_order.lock() {
 			Ok(lo) => lo,
 			Err(_) => {
-				trace.event("server_state_lock_poisoned");
-				return Err(());
+				trace.event("server_state_lock_poisoned")?;
+				return Err(TightBeamError::LockPoisoned);
 			}
 		};
 
@@ -52,8 +52,8 @@ impl ChessMatchManager {
 		if move_count == 1 && *last_order > 1 {
 			// New game started - reset server's authoritative board state
 			*game_state = ChessGameState::new();
-			trace.event("server_game_ended");
-			trace.event("server_game_restarted");
+			trace.event("server_game_ended")?;
+			trace.event("server_game_restarted")?;
 		}
 		*last_order = move_count;
 
@@ -70,15 +70,15 @@ impl ChessMatchManager {
 		};
 
 		if !game_state.is_move_valid(&client_move, is_white_turn) {
-			trace.event("server_move_invalid");
-			return Err(());
+			trace.event("server_move_invalid")?;
+			return Err(TightBeamError::LockPoisoned);
 		}
 
-		trace.event("server_move_validated");
+		trace.event("server_move_validated")?;
 
 		// Emit piece kind event for client move
 		if let Some(kind) = game_state.piece_kind_at(move_req.from_row, move_req.from_col) {
-			trace.event(kind);
+			trace.event(kind)?;
 		}
 
 		// Make the client's move
@@ -103,11 +103,11 @@ impl ChessMatchManager {
 			// Make the server move (track captures)
 			game_state.apply_move(&server_move);
 
-			trace.event("server_move_generated");
+			trace.event("server_move_generated")?;
 
 			// Emit piece kind event for server move
 			if let Some(kind) = game_state.piece_kind_at(server_move.from_row, server_move.from_col) {
-				trace.event(kind);
+				trace.event(kind)?;
 			}
 
 			// Check game status after server move (check if client is in checkmate/stalemate)
@@ -115,7 +115,7 @@ impl ChessMatchManager {
 		};
 
 		if matches!(game_status, GameStatusCode::Checkmate | GameStatusCode::Stalemate) {
-			trace.event("server_game_ended");
+			trace.event("server_game_ended")?;
 		}
 
 		Ok(game_status)
@@ -192,18 +192,18 @@ servlet! {
 		let message_id = message.metadata.id.clone();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {
-			trace.event("server_response_emitted");
+			trace.event("server_response_emitted")?;
 			Ok(Some(create_invalid_move_response(id, order)?))
 		};
 
-		trace.event("server_move_received");
+		trace.event("server_move_received")?;
 
 		// Decode ChessMoveRequest from message
 		let move_req: ChessMoveRequest = match decode(&message.message) {
 			Ok(req) => req,
 			Err(_) => {
 				// Invalid message format - return invalid move response
-				trace.event("server_decode_failure");
+				trace.event("server_decode_failure")?;
 				return invalid_move(Arc::clone(&trace), message_id, message.metadata.order);
 			}
 		};
@@ -213,7 +213,7 @@ servlet! {
 		let move_count = message.metadata.order;
 		let game_status = match config.manager.process_move(&move_req, move_count, &trace) {
 			Ok(status) => status,
-			Err(_) => {
+			Err(_e) => {
 				return invalid_move(Arc::clone(&trace), message_id, move_count);
 			}
 		};
@@ -228,7 +228,7 @@ servlet! {
 
 		// Return response with game status and updated board state
 		let response = ChessMoveResponse { game_status };
-		trace.event("server_response_emitted");
+		trace.event("server_response_emitted")?;
 
 		Ok(Some(compose! {
 			V0: id: message_id,

@@ -198,7 +198,7 @@ tb_scenario! {
 			loop {
 				// Check execution time limit to prevent hangs
 				if start_time.elapsed().as_secs() >= MAX_EXECUTION_TIME_SECS {
-					trace.event("client_execution_timeout");
+					trace.event("client_execution_timeout")?;
 					break;
 				}
 
@@ -235,7 +235,7 @@ tb_scenario! {
 					_ => ChessMove::from((0u8, 0u8, 0u8, 0u8)).to_request(),
 				};
 
-				trace.event("client_move_sent");
+				trace.event("client_move_sent")?;
 				stats.move_sent_count += 1;
 
 				// Emit piece kind event only after move is sent (not before validation)
@@ -260,19 +260,19 @@ tb_scenario! {
 				).await {
 					Ok(Ok(Some(frame))) => frame,
 					Ok(Ok(None)) => {
-						trace.event("client_no_response");
+						trace.event("client_no_response")?;
 						stats.no_response_count += 1;
 						break;
 					}
 					Ok(Err(_e)) => {
 						// Transport error - log and break
-						trace.event("client_emit_error");
+						trace.event("client_emit_error")?;
 						stats.no_response_count += 1;
 						break;
 					}
 					Err(_) => {
 						// Timeout occurred
-						trace.event("client_timeout");
+						trace.event("client_timeout")?;
 						stats.no_response_count += 1;
 						break;
 					}
@@ -282,7 +282,7 @@ tb_scenario! {
 				let response: ChessMoveResponse = match decode(&response_frame.message) {
 					Ok(r) => r,
 					Err(_) => {
-						trace.event("client_decode_error");
+						trace.event("client_decode_error")?;
 						stats.decode_error_count += 1;
 						break;
 					}
@@ -299,28 +299,28 @@ tb_scenario! {
 				// Track response type for coverage feedback
 				match response.game_status {
 					GameStatusCode::InvalidMove => {
-						trace.event("client_move_rejected");
+						trace.event("client_move_rejected")?;
 						stats.move_rejected_count += 1;
 						// Continue to next move even if invalid
 					}
 					GameStatusCode::InProgress => {
-						trace.event("client_move_validated");
-						trace.event("client_server_move");
+						trace.event("client_move_validated")?;
+						trace.event("client_server_move")?;
 						stats.move_validated_count += 1;
 						stats.server_move_count += 1;
 						order += 2; // Client move + server move
 					}
 					GameStatusCode::Checkmate | GameStatusCode::Stalemate => {
 						// Move was validated (we got a response), emit events
-						trace.event("client_move_validated");
-						trace.event("client_server_move");
+						trace.event("client_move_validated")?;
+						trace.event("client_server_move")?;
 						stats.move_validated_count += 1;
 						stats.server_move_count += 1;
 						stats.game_ended_count += 1;
-						stats.game_restarted_count += 1;
+					stats.game_restarted_count += 1;
 
-						restart_game(&mut client_game_state, &mut order, &trace);
-						if stats.game_restarted_count >= MAX_GAME_REPLAYS {
+					restart_game(&mut client_game_state, &mut order, &trace)?;
+					if stats.game_restarted_count >= MAX_GAME_REPLAYS {
 							break;
 						}
 						// Continue loop to play another game

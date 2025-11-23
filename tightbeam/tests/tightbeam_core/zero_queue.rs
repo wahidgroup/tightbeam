@@ -153,13 +153,13 @@ impl ChainState {
 
 		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata.order > prev);
 		let valid = prev_ok && order_ok;
-		self.trace.event_with("chain_valid", &[QUEUE_TAG], valid);
+		self.trace.event_with("chain_valid", &[QUEUE_TAG], valid)?;
 
 		if valid {
 			guard.last_order = Some(frame.metadata.order);
 			let digest = utils::digest::<Sha3_256>(&frame.message)?;
 			guard.last_digest = Some(digest);
-			self.trace.event_with("lag_tip", &[QUEUE_TAG], 0u64);
+			self.trace.event_with("lag_tip", &[QUEUE_TAG], 0u64)?;
 		}
 
 		Ok(())
@@ -179,16 +179,17 @@ impl DedupBook {
 		Self { trace, seen: Arc::new(Mutex::new(BTreeSet::new())) }
 	}
 
-	fn record(&self, frame: &Frame) -> bool {
+	fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		let key = (frame.metadata.id.clone(), frame.metadata.order);
 		let mut guard = self.seen.lock().unwrap();
 		let inserted = guard.insert(key);
 		if inserted {
-			self.trace.event_with("dedup_kept", &[QUEUE_TAG], true);
+			self.trace.event_with("dedup_kept", &[QUEUE_TAG], true)?;
 		} else {
-			self.trace.event_with("dedup_skipped", &[QUEUE_TAG], true);
+			self.trace.event_with("dedup_skipped", &[QUEUE_TAG], true)?;
 		}
-		inserted
+
+		Ok(inserted)
 	}
 }
 
@@ -202,7 +203,7 @@ impl PriorityLedger {
 		Self { trace }
 	}
 
-	fn assign(&self, frame: &Frame) -> u8 {
+	fn assign(&self, frame: &Frame) -> Result<u8, TightBeamError> {
 		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Normal);
 		let worker = if priority <= MessagePriority::High {
 			0
@@ -219,15 +220,17 @@ impl PriorityLedger {
 		} else {
 			"worker_fan_out_1"
 		};
-		self.trace.event_with(label, &[QUEUE_TAG, tag], worker);
+
+		self.trace.event_with(label, vec![QUEUE_TAG, tag], worker)?;
 
 		let respected = if priority <= MessagePriority::High {
 			worker == 0
 		} else {
 			worker == 1
 		};
-		self.trace.event_with("priority_respected", &[QUEUE_TAG], respected);
-		worker
+
+		self.trace.event_with("priority_respected", &[QUEUE_TAG], respected)?;
+		Ok(worker)
 	}
 }
 
@@ -289,14 +292,14 @@ impl QueueHarness {
 	}
 
 	fn handle(&self, frame: &Frame) -> Result<(), TightBeamError> {
-		if !self.dedup.record(frame) {
+		if !self.dedup.record(frame)? {
 			return Ok(());
 		}
 
 		self.chain.record(frame)?;
-		let worker = self.priority.assign(frame);
-		self.trace.event_with("worker_commit", &[QUEUE_TAG], worker as u64);
-		self.trace.event_with("response_ready", &[QUEUE_TAG], frame.metadata.order);
+		let worker = self.priority.assign(frame)?;
+		self.trace.event_with("worker_commit", &[QUEUE_TAG], worker as u64)?;
+		self.trace.event_with("response_ready", &[QUEUE_TAG], frame.metadata.order)?;
 		Ok(())
 	}
 }
@@ -365,7 +368,7 @@ tb_scenario! {
 			let mut prev_hash: Option<DigestInfo> = None;
 
 			for (index, spec) in batch.entries().iter().enumerate() {
-				trace.event_with("emit_work", &[QUEUE_TAG], spec.order);
+				trace.event_with("emit_work", &[QUEUE_TAG], spec.order)?;
 				let (frame, digest) = match build_frame(batch.work_id(), spec, prev_hash) {
 					Ok(result) => result,
 					Err(err) => {
@@ -378,7 +381,7 @@ tb_scenario! {
 				if index == 1 {
 					// For the second frame, emit it then immediately replay it
 					client.emit(frame.clone(), None).await?;
-					trace.event_with("replay_attempt", &[QUEUE_TAG], frame.metadata.order);
+					trace.event_with("replay_attempt", &[QUEUE_TAG], frame.metadata.order)?;
 					client.emit(frame, None).await?;
 				} else {
 					client.emit(frame, None).await?;

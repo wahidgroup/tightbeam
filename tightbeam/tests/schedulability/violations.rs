@@ -61,12 +61,11 @@ tightbeam::tb_scenario! {
 		process_count: None,
 		scheduler_model: None,
 		fault_model: None,
-		fmea: None,
 	},
 	environment Bare {
 		exec: |trace| {
-			trace.event("task1");
-			trace.event("task2");
+			trace.event("task1")?;
+			trace.event("task2")?;
 			Ok(())
 		}
 	},
@@ -140,12 +139,11 @@ tightbeam::tb_scenario! {
 		process_count: None,
 		scheduler_model: None,
 		fault_model: None,
-		fmea: None,
 	},
 	environment Bare {
 		exec: |trace| {
-			trace.event("task1");
-			trace.event("task2");
+			trace.event("task1")?;
+			trace.event("task2")?;
 			Ok(())
 		}
 	},
@@ -213,11 +211,10 @@ tightbeam::tb_scenario! {
 		process_count: None,
 		scheduler_model: None,
 		fault_model: None,
-		fmea: None,
 	},
 	environment Bare {
 		exec: |trace| {
-			trace.event("task1");
+			trace.event("task1")?;
 			Ok(())
 		}
 	},

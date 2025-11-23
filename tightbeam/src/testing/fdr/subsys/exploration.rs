@@ -4,6 +4,7 @@
 //! functions for the FDR exploration loop. These handle state space traversal,
 //! seed management, and basic property verification.
 
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 
 #[cfg(feature = "testing-timing")]
@@ -13,6 +14,9 @@ use crate::testing::fdr::config::{Failure, FdrConfig, RefusalSet, Trace};
 use crate::testing::fdr::explorer::{ExplorationCore, ExplorationState, SeedResult, SeededRng};
 use crate::testing::fdr::subsys::timing::check_timing_violations;
 use crate::testing::specs::csp::{Action, Event, Process, State};
+
+#[cfg(feature = "testing-fault")]
+use crate::testing::fdr::config::{FaultInjection, FaultModel, InjectedFaultRecord};
 
 #[cfg(feature = "testing-timing")]
 use crate::testing::fdr::subsys::timing::check_event_wcet_violation;
@@ -90,6 +94,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 		// Track best result for this seed
 		let mut longest_trace = Vec::new();
 		let mut failures = Vec::new();
+		#[cfg(feature = "testing-fault")]
+		let mut injected_faults = Vec::new();
 
 		while let Some(state) = queue.pop_front() {
 			// Track visited states
@@ -141,12 +147,33 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 			// Select action using seeded RNG at choice points
 			let action = Self::select_action_helper(&mut rng, process, state.process_state, &actions);
+
+			// Check for fault injection (if feature enabled)
+			#[cfg(feature = "testing-fault")]
+			if let Some(ref fault_model) = config.fault_model {
+				if let Some(fault_record) =
+					Self::check_fault_injection(fault_model, process, state.process_state, &action.event, &mut rng)
+				{
+					// Fault injected - record for verdict tracking
+					injected_faults.push(fault_record);
+					// For now, we continue exploration (fault is noted but doesn't stop execution)
+					// Future enhancement: add error recovery transitions
+				}
+			}
+
 			// Execute transition
 			Self::execute_transition_helper(process, &state, action, &mut queue);
 		}
 
 		// Return success with longest trace found and collected failures
-		SeedResult::Success(longest_trace, failures)
+		#[cfg(feature = "testing-fault")]
+		{
+			SeedResult::Success(longest_trace, failures, injected_faults)
+		}
+		#[cfg(not(feature = "testing-fault"))]
+		{
+			SeedResult::Success(longest_trace, failures)
+		}
 	}
 }
 
@@ -174,6 +201,9 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 		self.seed_results
 			.iter()
 			.filter_map(|(_, result)| match result {
+				#[cfg(feature = "testing-fault")]
+				SeedResult::Success(trace, _failures, _faults) => Some(trace.clone()),
+				#[cfg(not(feature = "testing-fault"))]
 				SeedResult::Success(trace, _failures) => Some(trace.clone()),
 				_ => None,
 			})
@@ -183,6 +213,11 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 	fn failures(&self) -> Vec<Failure> {
 		let mut failures = Vec::new();
 		for (_, result) in &self.seed_results {
+			#[cfg(feature = "testing-fault")]
+			if let SeedResult::Success(_trace, seed_failures, _faults) = result {
+				failures.extend(seed_failures.clone());
+			}
+			#[cfg(not(feature = "testing-fault"))]
 			if let SeedResult::Success(_trace, seed_failures) = result {
 				failures.extend(seed_failures.clone());
 			}
@@ -218,7 +253,6 @@ impl<'a> DefaultExplorationEngine<'a> {
 	/// Hidden events (τ-transitions) are filtered out as they cannot be refused.
 	/// Reference: Roscoe (1998, 2010)
 	fn compute_refusals_helper(process: &Process, state: State) -> RefusalSet {
-		use std::collections::HashSet;
 		// Only consider observable events (filter out hidden τ-transitions)
 		let enabled_events: HashSet<_> = process
 			.enabled(state)
@@ -258,6 +292,41 @@ impl<'a> DefaultExplorationEngine<'a> {
 			// Multiple actions but not marked as choice state: use RNG anyway
 			rng.choose(actions).unwrap_or(&actions[0])
 		}
+	}
+
+	/// Check for fault injection at current (state, event) combination
+	#[cfg(feature = "testing-fault")]
+	fn check_fault_injection(
+		fault_model: &FaultModel,
+		process: &Process,
+		state: State,
+		event: &Event,
+		rng: &mut SeededRng,
+	) -> Option<InjectedFaultRecord> {
+		// Construct lookup key with zero-allocation Cow::Borrowed for lookup
+		let state_key_str = format!("{}.{}", process.name, state.0);
+		let lookup_key = (Cow::Borrowed(state_key_str.as_str()), Cow::Borrowed(event.0));
+
+		// Check if fault should be injected at this point
+		fault_model
+			.injection_points
+			.get(&lookup_key)
+			.and_then(|injection: &FaultInjection| {
+				// Use SeededRng's get_next() and convert to basis points range (0-10000)
+				let rng_value = (rng.get_next() % 10001) as u16;
+				if rng_value < injection.probability_bps.get() {
+					let error = (injection.error_factory)();
+					// Clone only when actually injecting fault (rare path)
+					Some(InjectedFaultRecord {
+						csp_state: state_key_str.clone(),
+						event_label: event.0.to_string(),
+						error_message: error.to_string(),
+						probability_bps: injection.probability_bps.get(),
+					})
+				} else {
+					None
+				}
+			})
 	}
 
 	/// Execute transition and enqueue next states

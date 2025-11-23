@@ -1,7 +1,7 @@
 //! FDR exploration engine subsystem
 //!
-//! This module contains the core FdrExplorer struct that orchestrates exploration
-//! and refinement checking by delegating to pluggable subsystems.
+//! This module contains the core FdrExplorer struct that orchestrates
+//! exploration and refinement checking by delegating to pluggable subsystems.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -9,16 +9,15 @@ use std::rc::Rc;
 #[cfg(feature = "rayon")]
 use std::collections::HashSet;
 
+use super::cache::DefaultCache;
+use super::exploration::DefaultExplorationEngine;
+use super::refinement::DefaultRefinementChecker;
 use crate::testing::fdr::config::{Failure, FdrConfig, FdrVerdict, Trace};
 use crate::testing::fdr::explorer::{ExplorationCore, RefinementChecker, SeedResult};
 use crate::testing::specs::csp::Process;
 
 #[cfg(feature = "rayon")]
 use crate::testing::specs::csp::State;
-
-use super::cache::DefaultCache;
-use super::exploration::DefaultExplorationEngine;
-use super::refinement::DefaultRefinementChecker;
 
 /// FDR exploration engine (pluggable design)
 ///
@@ -66,13 +65,23 @@ where
 
 	/// Run multi-seed exploration
 	pub fn explore(&mut self) -> FdrVerdict {
-		// Mode 1: Refinement checking (when specs provided)
+		// Mode 1: Specification robustness testing (fault model + specs)
+		// When fault_model is provided with specs, explore the spec WITH faults
+		#[cfg(feature = "testing-fault")]
+		if self.config.fault_model.is_some() && !self.config.specs.is_empty() {
+			// Explore the specification process with faults injected
+			// This tests if the SPEC correctly models error conditions
+			self.explore_specification_with_faults();
+			return self.verdict.clone();
+		}
+
+		// Mode 2: Refinement checking (specs without fault model)
 		if !self.config.specs.is_empty() {
 			self.check_refinement();
 			return self.verdict.clone();
 		}
 
-		// Mode 2: Single-process multi-seed exploration
+		// Mode 3: Single-process multi-seed exploration
 		#[cfg(feature = "rayon")]
 		{
 			use rayon::prelude::*;
@@ -130,10 +139,69 @@ where
 				self.verdict.deadlock_witness = Some((seed, trace.clone(), *state));
 				self.verdict.failing_seed = Some(seed);
 			}
-			SeedResult::Success(_, _) => {
+			#[cfg(feature = "testing-fault")]
+			SeedResult::Success(_trace, _failures, faults) => {
+				self.verdict.seeds_completed += 1;
+				self.verdict.faults_injected.extend(faults.clone());
+			}
+			#[cfg(not(feature = "testing-fault"))]
+			SeedResult::Success(..) => {
 				self.verdict.seeds_completed += 1;
 			}
 		}
+	}
+
+	/// Explore specification process with fault injection
+	/// This tests whether the specification correctly models error conditions
+	#[cfg(feature = "testing-fault")]
+	fn explore_specification_with_faults(&mut self) {
+		if self.config.specs.is_empty() {
+			return;
+		}
+
+		// Get the spec process (first one if multiple)
+		let spec_process = &self.config.specs[0];
+		let config = &self.config;
+
+		#[cfg(feature = "rayon")]
+		{
+			use rayon::prelude::*;
+			let seeds: Vec<u64> = (0..config.seeds).map(|s| s as u64).collect();
+
+			let results: Vec<(u64, SeedResult, HashSet<State>)> = seeds
+				.par_iter()
+				.map(|&seed| {
+					let (result, visited) = DefaultExplorationEngine::explore_seed_static(spec_process, config, seed);
+					(seed, result, visited)
+				})
+				.collect();
+
+			for (seed, result, visited) in results {
+				self.explorer.add_seed_result(seed, result.clone());
+				self.explorer.update_visited_states(&visited);
+				self.update_verdict_from_result(seed, &result);
+			}
+		}
+
+		#[cfg(not(feature = "rayon"))]
+		{
+			for seed in 0..config.seeds {
+				let (result, visited) =
+					DefaultExplorationEngine::explore_seed_static(spec_process, config, seed as u64);
+				self.explorer.add_seed_result(seed as u64, result.clone());
+				self.explorer.update_visited_states(&visited);
+				self.update_verdict_from_result(seed as u64, &result);
+			}
+		}
+
+		self.verdict.traces_explored = self.explorer.traces().len();
+		self.verdict.states_visited = self.explorer.states_visited();
+
+		self.check_determinism();
+
+		self.verdict.passed = self.verdict.divergence_free
+			&& self.verdict.deadlock_free
+			&& (self.verdict.is_deterministic || self.verdict.determinism_witness.is_none());
 	}
 
 	/// Check for witnesses to nondeterminism

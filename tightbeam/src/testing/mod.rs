@@ -12,34 +12,30 @@ pub mod specs;
 pub mod trace;
 pub mod utils;
 
+#[cfg(feature = "testing-fault")]
+pub mod fault;
+#[cfg(feature = "testing-fdr")]
+pub mod fdr;
+#[cfg(feature = "testing-fuzz")]
+pub mod fuzz;
+#[cfg(feature = "testing-timing")]
+pub mod schedulability;
 #[cfg(feature = "testing-timing")]
 pub mod timing;
 
-#[cfg(feature = "testing-timing")]
-pub mod schedulability;
-
-#[cfg(feature = "testing-fuzz")]
-pub mod fuzz;
-
-#[cfg(feature = "testing-fdr")]
-pub mod fdr;
-
+// Re-exports
+pub use export::ScenarioResultExport;
+pub use result::ScenarioResult;
+pub use specs::{verify_trace, SpecViolation, TBSpec};
 pub use utils::*;
 
-// Re-export commonly used items from specs module for convenience
-pub use specs::{verify_trace, SpecViolation, TBSpec};
-
-// Re-export ScenarioResult for test hooks
-pub use result::ScenarioResult;
-
-// Re-export export trait
-pub use export::ScenarioResultExport;
+#[cfg(feature = "testing-fault")]
+pub use fault::{ProcessEvent, ProcessState};
+#[cfg(feature = "testing-fault")]
+pub use fdr::FaultModel;
 
 #[cfg(feature = "testing-fdr")]
 pub use fdr::*;
-
-// Demo labels using tb_labels! macro (payload + non-payload)
-crate::tb_labels! { pub enum TbDemoLabels { MessageReceived => payload, TestEvent } }
 
 #[cfg(test)]
 mod tests {

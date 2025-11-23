@@ -6,6 +6,7 @@ use core::time::Duration;
 #[cfg(feature = "std")]
 use std::{
 	borrow::Cow,
+	collections::HashMap,
 	sync::{Arc, Mutex},
 };
 
@@ -22,8 +23,14 @@ use crate::transport::error::TransportError;
 use crate::utils::urn::Urn;
 use crate::Frame;
 
+#[cfg(feature = "testing-fault")]
+use crate::constants::DEFAULT_FAULT_SEED;
 #[cfg(feature = "instrument")]
 use crate::instrumentation::{events, TbEvent, TbInstrumentationConfig};
+#[cfg(feature = "testing-fault")]
+use crate::testing::fdr::FaultModel;
+#[cfg(feature = "testing-fault")]
+use crate::testing::fdr::InjectionStrategy;
 
 /// Trait for converting types into event labels
 pub trait IntoEventLabel {
@@ -80,17 +87,21 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 /// Example:
 /// ```rust
 /// # use core::time::Duration;
+/// # use tightbeam::error::TightBeamError;
 /// # use tightbeam::trace::{TraceCollector, EventValue};
+/// # fn example() -> Result<(), TightBeamError> {
 /// # let trace = TraceCollector::default();
-/// trace.event("process")
+/// trace.event("process")?
 ///     .with_timing(Duration::from_millis(5))
 ///     .with_payload(b"payload")
 ///     .emit();
+/// # Ok(())
+/// # }
 /// ```
 pub struct EventBuilder<'a> {
 	collector: &'a TraceCollector,
 	label: Cow<'static, str>,
-	tags: Option<Vec<&'static str>>,
+	tags: Option<Cow<'static, [&'static str]>>,
 	value: Option<EventValue>,
 	#[cfg(feature = "instrument")]
 	duration_ns: Option<u64>,
@@ -103,7 +114,7 @@ impl<'a> EventBuilder<'a> {
 	fn new(
 		collector: &'a TraceCollector,
 		label: Cow<'static, str>,
-		tags: Option<Vec<&'static str>>,
+		tags: Option<Cow<'static, [&'static str]>>,
 		value: Option<EventValue>,
 	) -> Self {
 		Self {
@@ -159,7 +170,7 @@ impl<'a> EventBuilder<'a> {
 
 		let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
 		let label = core::mem::take(&mut self.label);
-		let tags = self.tags.take().unwrap_or_default();
+		let tags = self.tags.take().map(|t| t.into_owned()).unwrap_or_default();
 		let assertion = match self.value.take() {
 			Some(EventValue::None) | None => {
 				#[cfg(feature = "instrument")]
@@ -226,6 +237,12 @@ struct TraceState {
 	seq: Mutex<u32>,
 	#[cfg(feature = "testing-fuzz")]
 	oracle: Option<crate::testing::fuzz::FuzzContext>,
+	#[cfg(feature = "testing-fault")]
+	runtime_fault_model: Option<FaultModel>,
+	#[cfg(feature = "testing-fault")]
+	fault_rng_state: Mutex<u64>, // For Random strategy (seeded RNG)
+	#[cfg(feature = "testing-fault")]
+	fault_call_counters: Mutex<HashMap<Cow<'static, str>, u32>>, // For Deterministic strategy
 }
 
 impl TraceState {
@@ -240,6 +257,12 @@ impl TraceState {
 			seq: Mutex::new(0),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
+			#[cfg(feature = "testing-fault")]
+			runtime_fault_model: None,
+			#[cfg(feature = "testing-fault")]
+			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
+			#[cfg(feature = "testing-fault")]
+			fault_call_counters: Mutex::new(HashMap::new()),
 		}
 	}
 
@@ -252,6 +275,12 @@ impl TraceState {
 			seq: Mutex::new(0),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
+			#[cfg(feature = "testing-fault")]
+			runtime_fault_model: None,
+			#[cfg(feature = "testing-fault")]
+			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
+			#[cfg(feature = "testing-fault")]
+			fault_call_counters: Mutex::new(HashMap::new()),
 		}
 	}
 
@@ -267,6 +296,12 @@ impl TraceState {
 			#[cfg(feature = "instrument")]
 			seq: Mutex::new(0),
 			oracle: Some(crate::testing::fuzz::FuzzContext::new(input, process)),
+			#[cfg(feature = "testing-fault")]
+			runtime_fault_model: None,
+			#[cfg(feature = "testing-fault")]
+			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
+			#[cfg(feature = "testing-fault")]
+			fault_call_counters: Mutex::new(HashMap::new()),
 		}
 	}
 }
@@ -304,19 +339,101 @@ impl TraceCollector {
 			.expect("Oracle not configured - did you provide csp: parameter in tb_scenario!?")
 	}
 
+	/// Check for runtime fault injection (certification-grade)
+	///
+	/// # Returns
+	/// - Ok(()) if no fault should be injected
+	/// - Err if a fault is injected.
+	///
+	/// # Why `&Cow<'static, str>` instead of `&str`
+	///
+	/// This violates clippy's ptr_arg lint but is necessary for zero-copy:
+	/// - We must store the label in a HashMap<Cow<'static, str>, u32> for fault injection counters
+	/// - `Cow::clone()` on `Cow::Borrowed` is zero-cost (just copies the pointer)
+	/// - Taking `&str` would force `Cow::Borrowed(label)` construction
+	/// - This maintains zero-allocation for static labels while supporting dynamic ones
+	#[allow(clippy::ptr_arg)]
+	#[cfg(feature = "testing-fault")]
+	fn check_runtime_fault_injection(&self, label_cow: &Cow<'static, str>) -> Result<(), crate::TightBeamError> {
+		if let Some(ref fault_config) = self.state.runtime_fault_model {
+			let key = (Cow::Borrowed("*"), Cow::Borrowed(label_cow.as_ref()));
+			if let Some(fault_injection) = fault_config.injection_points.get(&key) {
+				let should_inject = match fault_config.injection_strategy {
+					InjectionStrategy::Deterministic => {
+						// Counter-based injection for DO-178C/IEC 61508 reproducibility
+						// Clone Cow: zero-cost for static strings, one alloc for dynamic
+						let mut counters = self.state.fault_call_counters.lock()?;
+						let count = counters.entry(Cow::clone(label_cow)).or_insert(0);
+						*count += 1;
+
+						// Inject based on probability: e.g., 3000 bps (30%) = inject on calls 3,6,9 out of 10
+						(*count * fault_injection.probability_bps.get() as u32) % 10000
+							< fault_injection.probability_bps.get() as u32
+					}
+					InjectionStrategy::Random => {
+						// Seeded RNG for statistical coverage (like FDR)
+						let mut rng_state = self.state.fault_rng_state.lock()?;
+						if *rng_state == 0 {
+							*rng_state = fault_config.seed.wrapping_add(1);
+						}
+						// LCG algorithm (same as FDR's SeededRng)
+						*rng_state = rng_state
+							.wrapping_mul(crate::constants::LCG_MULTIPLIER)
+							.wrapping_add(crate::constants::LCG_INCREMENT);
+						let rng_value = (*rng_state % 10000) as u16;
+						rng_value < fault_injection.probability_bps.get()
+					}
+				};
+
+				if should_inject {
+					return Err((fault_injection.error_factory)());
+				}
+			}
+		}
+		Ok(())
+	}
+
 	/// Record an event with no tags or value.
-	/// Returns an EventBuilder for optional chaining.
-	pub fn event(&self, label: impl IntoEventLabel) -> EventBuilder<'_> {
-		EventBuilder::new(self, label.into_label(), None, None)
+	///
+	/// # Returns
+	/// - Ok(EventBuilder) for optional chaining
+	/// - Err if a fault is injected.
+	pub fn event(&self, label: impl IntoEventLabel) -> Result<EventBuilder<'_>, crate::TightBeamError> {
+		let label_cow = label.into_label();
+
+		#[cfg(feature = "testing-fault")]
+		self.check_runtime_fault_injection(&label_cow)?;
+
+		Ok(EventBuilder::new(self, label_cow, None, None))
 	}
 
 	/// Record an event with explicit tags and optional value.
-	/// Returns an EventBuilder for optional chaining.
-	pub fn event_with<V>(&self, label: impl IntoEventLabel, tags: &[&'static str], value: V) -> EventBuilder<'_>
+	///
+	/// # Returns
+	/// - Ok(EventBuilder) for optional chaining
+	/// - Err if a fault is injected.
+	///
+	/// # Zero-allocation option
+	/// Pass a static slice to avoid allocation:
+	/// ```ignore
+	/// const TAGS: &[&str] = &["critical", "network"];
+	/// trace.event_with("event", TAGS, value)?
+	/// ```
+	pub fn event_with<V>(
+		&self,
+		label: impl IntoEventLabel,
+		tags: impl Into<Cow<'static, [&'static str]>>,
+		value: V,
+	) -> Result<EventBuilder<'_>, crate::TightBeamError>
 	where
 		V: Into<EventValue>,
 	{
-		EventBuilder::new(self, label.into_label(), Some(tags.to_vec()), Some(value.into()))
+		let label_cow = label.into_label();
+
+		#[cfg(feature = "testing-fault")]
+		self.check_runtime_fault_injection(&label_cow)?;
+
+		Ok(EventBuilder::new(self, label_cow, Some(tags.into()), Some(value.into())))
 	}
 
 	#[cfg(feature = "testing-fuzz")]
@@ -607,8 +724,8 @@ mod tests {
 		spec: TraceCollectorSpec,
 		environment Bare {
 			exec: |trace| {
-				trace.event("alpha");
-				trace.event("beta");
+				trace.event("alpha")?;
+				trace.event("beta")?;
 				Ok(())
 			}
 		}

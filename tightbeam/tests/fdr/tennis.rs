@@ -30,7 +30,6 @@ fn build_fdr_config(
 		process_count: None,
 		scheduler_model: None,
 		fault_model: None,
-		fmea: None,
 	}
 }
 
@@ -126,11 +125,11 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
-			trace.event("pointA");
-			trace.event("pointA");
-			trace.event("pointB");
-			trace.event("pointA");
-			trace.event("pointA");
+			trace.event("pointA")?;
+			trace.event("pointA")?;
+			trace.event("pointB")?;
+			trace.event("pointA")?;
+			trace.event("pointA")?;
 			Ok(())
 		}
 	}
@@ -166,11 +165,11 @@ tightbeam::tb_scenario! {
 		exec: |trace| {
 			// Invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
 			// This violates the tennis scoring rules - after (0,40), B should win
-			trace.event("pointA");
-			trace.event("pointB");
-			trace.event("pointB");
-			trace.event("pointB");
-			trace.event("pointB");
+			trace.event("pointA")?;
+			trace.event("pointB")?;
+			trace.event("pointB")?;
+			trace.event("pointB")?;
+			trace.event("pointB")?;
 			Ok(())
 		}
 	}
@@ -206,14 +205,14 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Valid trace going through deuce: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
-			trace.event("pointA");
-			trace.event("pointB");
-			trace.event("pointA");
-			trace.event("pointB");
-			trace.event("pointA");
-			trace.event("pointB");
-			trace.event("pointA");
-			trace.event("pointA");
+			trace.event("pointA")?;
+			trace.event("pointB")?;
+			trace.event("pointA")?;
+			trace.event("pointB")?;
+			trace.event("pointA")?;
+			trace.event("pointB")?;
+			trace.event("pointA")?;
+			trace.event("pointA")?;
 			Ok(())
 		}
 	}
@@ -247,9 +246,9 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Create a trace that should pass failures refinement
-			trace.event("pointA");
-			trace.event("pointB");
-			trace.event("pointA");
+			trace.event("pointA")?;
+			trace.event("pointB")?;
+			trace.event("pointA")?;
 			Ok(())
 		}
 	}

@@ -8,9 +8,13 @@
 #[cfg(feature = "testing-csp")]
 pub mod process_spec;
 
+// Gen States macro for fault injection (opt-in)
+#[cfg(feature = "testing-fault")]
+pub mod gen_states;
+
 pub mod verification_spec;
 pub use verification_spec::{
-	absent, between, present, AssertSpecBuilder, BuiltAssertSpec, Cardinality, SpecBuildError, TbAssertLabelTrait,
+	absent, between, present, AssertSpecBuilder, BuiltAssertSpec, Cardinality, SpecBuildError,
 };
 
 #[cfg(not(feature = "std"))]
@@ -348,6 +352,54 @@ macro_rules! tb_scenario {
 		}
 	};
 
+	// ===== Standalone test with name for Bare environment (hooks without trailing comma) =====
+	(
+		name: $test_name:ident,
+		spec: $spec:ty,
+		$(csp: $csp:ty,)?
+		$(fdr: $fdr_config:expr,)?
+		$(trace: $trace_cfg:expr,)?
+		environment Bare {
+			exec: $exec_closure:expr
+		},
+		hooks {
+			on_pass: $on_pass:expr
+		}
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			// Create trace collector from config if provided, otherwise use default
+			#[cfg(feature = "instrument")]
+			let trace_collector: $crate::trace::TraceCollector = {
+				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
+			};
+			#[cfg(not(feature = "instrument"))]
+			let trace_collector = $crate::trace::TraceCollector::new();
+
+			// Environment-specific execution
+			let trace_exec = trace_collector.share();
+			$crate::tb_scenario!(@def_exec_closure_helper);
+			let exec_result = __call_exec_closure($exec_closure, trace_exec);
+
+			// Common finalization
+			let mut trace = $crate::tb_scenario!(@setup_trace);
+			trace.populate_from_collector(&trace_collector);
+			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+
+			let verification_result = $crate::__tb_scenario_verify_impl! {
+				single_spec: $spec,
+				trace: trace,
+				$(csp: $csp,)?
+				$(fdr: $fdr_config,)?
+				hooks: { on_pass: $on_pass, },
+			};
+
+			let result = $crate::tb_scenario!(@propagate_result exec_result, verification_result);
+			result.expect(concat!("Test failed: ", stringify!($test_name)));
+		}
+	};
+
 	// ===== Standalone test with name for Bare environment =====
 	(
 		name: $test_name:ident,
@@ -376,15 +428,7 @@ macro_rules! tb_scenario {
 
 			// Environment-specific execution
 			let trace_exec = trace_collector.share();
-			fn __call_exec_closure<F>(
-				closure: F,
-				trace: $crate::trace::TraceCollector,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
-			{
-				closure(trace)
-			}
+			$crate::tb_scenario!(@def_exec_closure_helper);
 			let exec_result = __call_exec_closure($exec_closure, trace_exec);
 
 			// Common finalization
@@ -581,15 +625,7 @@ macro_rules! tb_scenario {
 
 			// Environment-specific execution
 			let trace_exec = trace_collector.share();
-			fn __call_exec_closure<F>(
-				closure: F,
-				trace: $crate::trace::TraceCollector,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
-			{
-				closure(trace)
-			}
+			$crate::tb_scenario!(@def_exec_closure_helper);
 			let exec_result = __call_exec_closure($exec_closure, trace_exec);
 
 			// Common finalization
@@ -1617,26 +1653,9 @@ macro_rules! tb_scenario {
 		let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 		// Helper functions to enable type inference (synchronous)
-		fn __call_setup_closure<F, W>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> W
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> W,
-		{
-			closure(trace)
-		}
+		$crate::tb_scenario!(@def_worker_setup_helper);
 
-		fn __call_stimulus_closure<F, W>(
-			closure: F,
-			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-			worker: &mut W,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace, worker)
-		}
+		$crate::tb_scenario!(@def_worker_stimulus_helper);
 
 		let mut worker = __call_setup_closure($setup_closure, trace_setup);
 		let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
@@ -1689,26 +1708,9 @@ macro_rules! tb_scenario {
 		let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
 		// Helper functions to enable type inference (synchronous)
-		fn __call_setup_closure<F, W>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> W
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> W,
-		{
-			closure(trace)
-		}
+		$crate::tb_scenario!(@def_worker_setup_helper);
 
-		fn __call_stimulus_closure<F, W>(
-			closure: F,
-			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-			worker: &mut W,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace, worker)
-		}
+		$crate::tb_scenario!(@def_worker_stimulus_helper);
 
 		let mut worker = __call_setup_closure($setup_closure, trace_setup);
 		let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
@@ -1795,6 +1797,30 @@ macro_rules! tb_scenario {
 	};
 	(@create_trace_collector $trace_cfg:expr) => {
 		$crate::trace::TraceCollector::from($trace_cfg)
+	};
+
+	// ===== Internal: Critical closure helper functions (SINGLE SOURCE OF TRUTH) =====
+	// These function definitions are the critical logic that must exist only once.
+	// Any changes to closure calling semantics should be made here.
+
+	(@def_exec_closure_helper) => {
+		fn __call_exec_closure<F>(
+			closure: F,
+			trace: $crate::trace::TraceCollector,
+		) -> Result<(), $crate::TightBeamError>
+		where
+			F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
+		{
+			closure(trace)
+		}
+	};
+
+	(@def_worker_setup_helper) => {
+		$crate::tb_scenario!(@def_worker_setup_helper);
+	};
+
+	(@def_worker_stimulus_helper) => {
+		$crate::tb_scenario!(@def_worker_stimulus_helper);
 	};
 
 	// ===== Internal: Common trace setup/teardown =====
@@ -1900,15 +1926,7 @@ macro_rules! tb_scenario {
 		let trace_setup = $trace_collector.share();
 		let trace_stimulus = $trace_collector.share();
 
-		fn __call_setup_closure<F, W>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> W
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> W,
-		{
-			closure(trace)
-		}
+		$crate::tb_scenario!(@def_worker_setup_helper);
 
 		fn __call_stimulus_closure<F, W>(
 			closure: F,
@@ -2144,15 +2162,7 @@ macro_rules! tb_scenario {
 		let trace_stimulus = trace_collector.share();
 
 		// Helper functions to enable type inference (synchronous)
-		fn __call_setup_closure<F, W>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> W
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> W,
-		{
-			closure(trace)
-		}
+		$crate::tb_scenario!(@def_worker_setup_helper);
 
 		fn __call_stimulus_closure<F, W>(
 			closure: F,
@@ -2199,15 +2209,7 @@ macro_rules! tb_scenario {
 		let trace_stimulus = trace_collector.share();
 
 		// Helper functions to enable type inference
-		fn __call_setup_closure<F, W>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> W
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> W,
-		{
-			closure(trace)
-		}
+		$crate::tb_scenario!(@def_worker_setup_helper);
 
 		fn __call_stimulus_closure<F, W>(
 			closure: F,
@@ -2950,9 +2952,9 @@ mod tests {
 		spec: DemoSpec,
 		environment Bare {
 			exec: |trace| {
-				trace.event("Received");
-				trace.event("Responded");
-				trace.event("Responded");
+				trace.event("Received")?;
+				trace.event("Responded")?;
+				trace.event("Responded")?;
 				Ok(())
 			}
 		}
@@ -2963,8 +2965,8 @@ mod tests {
 		specs: [DemoSpec::get(1, 0, 0)],
 		environment Bare {
 			exec: |trace| {
-				trace.event("Received");
-				trace.event("Responded");
+				trace.event("Received")?;
+				trace.event("Responded")?;
 				Ok(())
 			}
 		}
@@ -2982,8 +2984,8 @@ mod tests {
 			specs: [DemoSpec::get(1, 0, 0), DemoSpec::get(1, 1, 0)],
 			environment Bare {
 				exec: |trace| {
-					trace.event("Received");
-					trace.event("Responded");
+					trace.event("Received")?;
+					trace.event("Responded")?;
 					Ok(())
 				}
 			}
@@ -3002,10 +3004,10 @@ mod tests {
 		}
 
 		fn process(&mut self) -> Result<(), crate::TightBeamError> {
-			self.trace.event("Received");
+			self.trace.event("Received")?;
 			self.received_count += 1;
-			self.trace.event("Responded");
-			self.trace.event("Responded");
+			self.trace.event("Responded")?;
+			self.trace.event("Responded")?;
 			Ok(())
 		}
 	}
@@ -3025,9 +3027,9 @@ mod tests {
 		environment Worker {
 			setup: TestWorker::new,
 			stimulus: |trace, worker: &mut TestWorker| {
-				trace.event("Received");
+				trace.event("Received")?;
 				worker.received_count += 1;
-				trace.event("Responded");
+				trace.event("Responded")?;
 				Ok(())
 			}
 		}
@@ -3047,9 +3049,9 @@ mod tests {
 					protocol TokioListener: listener,
 					assertions: trace.share(),
 					handle: |frame, trace| async move {
-						trace.event("Received");
-						trace.event("Responded");
-						trace.event("Responded");
+						trace.event("Received")?;
+						trace.event("Responded")?;
+						trace.event("Responded")?;
 						Ok(Some(frame))
 					}
 				};
@@ -3086,13 +3088,13 @@ mod tests {
 					assertions: trace.share(),
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.event("Received");
-						trace.event("Responded");
+						trace.event("Received")?;
+						trace.event("Responded")?;
 
 						// Decode message to extract value for assertion
 						let decoded: Result<TestMessage, _> = crate::decode(&frame.message);
 						if let Ok(msg) = decoded {
-							trace.event_with("message_content", &[], msg.content);
+							trace.event_with("message_content", &[], msg.content)?;
 						}
 
 						Ok(Some(frame))
@@ -3103,7 +3105,7 @@ mod tests {
 			},
 			client: |trace, mut client| async move {
 				// Client-side assertion before sending
-				trace.event("Responded");
+				trace.event("Responded")?;
 
 				let test_message = create_test_message(None);
 				let test_frame = compose! {
@@ -3113,7 +3115,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event("Received");
+				trace.event("Received")?;
 
 				Ok(())
 			}

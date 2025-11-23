@@ -40,6 +40,14 @@ mod schedulability;
 #[cfg(feature = "colony")]
 mod colony;
 
+// Fault injection tests
+#[cfg(feature = "testing-fault")]
+mod fault;
+
+// Delay-Tolerant Networking tests
+// #[cfg(all(feature = "testing-fault", feature = "testing-fdr"))]
+// mod dtn;
+
 // DLT Network test
 // #[cfg(feature = "full")]
 // mod proof;

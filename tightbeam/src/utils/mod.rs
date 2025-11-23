@@ -13,10 +13,13 @@ use crate::{
 };
 
 // Submodules
+pub mod basis_points;
 pub mod jitter;
 pub mod math;
 pub mod statistics;
 pub mod urn;
+
+pub use basis_points::BasisPoints;
 
 // Re-exports
 pub use ::hex_literal::hex;

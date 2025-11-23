@@ -70,6 +70,7 @@ macro_rules! tb_process_spec {
 			$($schedulability_content:tt)*
 		})?
 	) => {
+		// Process struct at top level
 		$(#[$meta])*
 		$vis struct $name;
 
@@ -81,6 +82,7 @@ macro_rules! tb_process_spec {
 
 		impl $name {
 			#[allow(clippy::vec_init_then_push)]
+			#[allow(dead_code)]
 			pub fn process() -> $crate::testing::specs::csp::Process {
 				use $crate::testing::specs::csp::State;
 
@@ -177,6 +179,59 @@ macro_rules! tb_process_spec {
 		impl $crate::testing::specs::csp::ProcessSpec for $name {
 			fn validate_trace(&self, trace: &$crate::trace::ConsumedTrace) -> $crate::testing::specs::csp::CspValidationResult {
 				Self::process().validate_trace(trace)
+			}
+		}
+	};
+
+	// Generate module with States enum and Event helper
+	(@gen_module
+		$name:ident,
+		observable_events: [ $($obs_event:expr),* ],
+		hidden_events: [ $($hid_event:expr),* ],
+		all_states: [ $($state:ident),* ],
+		terminal_states: [ $($term_state:ident),* ]
+	) => {
+		$crate::paste::paste! {
+			#[allow(non_snake_case)]
+			mod [<$name:snake>] {
+				/// All states in this process (from states + terminal states)
+				/// Note: Some states may appear in both sets, resulting in duplicate enum variants.
+				/// This is intentional - terminal states with outgoing transitions are valid.
+				#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+				#[allow(dead_code)]
+				pub enum States {
+					$( $state, )*
+					$( $term_state, )*
+				}
+
+				impl $crate::testing::fault::ProcessState for States {
+					fn process_name(&self) -> &'static str {
+						stringify!($name)
+					}
+
+					fn state_name(&self) -> &'static str {
+						match self {
+							$( Self::$state => stringify!($state), )*
+							$( Self::$term_state => stringify!($term_state), )*
+						}
+					}
+				}
+
+				/// Event wrapper for type-safe fault injection
+				///
+				/// Create events using string literals:
+				/// ```ignore
+				/// use my_process::Event;
+				/// fault_model.with_fault(States::Idle, Event("connect"), ...);
+				/// ```
+				#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+				pub struct Event(pub &'static str);
+
+				impl $crate::testing::fault::ProcessEvent for Event {
+					fn event_label(&self) -> &'static str {
+						self.0
+					}
+				}
 			}
 		}
 	};

@@ -96,19 +96,6 @@ pub const fn absent() -> Cardinality {
 }
 
 // ---------------------------------------------------------------------------
-// Label trait + dynamic representation
-// ---------------------------------------------------------------------------
-
-pub trait TbAssertLabelTrait {
-	fn name(&self) -> &'static str;
-	fn payload_capable(&self) -> bool {
-		false
-	}
-}
-
-// (Dynamic label builder retained for potential future use)
-
-// ---------------------------------------------------------------------------
 // Spec builder and concrete implementation
 // ---------------------------------------------------------------------------
 
@@ -620,25 +607,6 @@ macro_rules! absent {
 
 // Label declaration macro
 // Usage:
-// tb_labels! { pub enum MyLabels { A, B(payload), C } }
-#[macro_export]
-macro_rules! tb_labels {
-	(pub enum $name:ident { $( $label:ident $(=> $payload_marker:ident)? ),* $(,)? }) => {
-		#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-		pub enum $name { $( $label ),* }
-
-		impl $crate::testing::macros::TbAssertLabelTrait for $name {
-			fn name(&self) -> &'static str { match self { $( $name::$label => stringify!($label) ),* } }
-			fn payload_capable(&self) -> bool { match self { $( $name::$label => $crate::tb_labels!(@flag $( $payload_marker )? ) ),* } }
-		}
-
-	impl From<$name> for $crate::testing::assertions::AssertionLabel {
-		fn from(lbl: $name) -> Self { $crate::testing::assertions::AssertionLabel::Custom(::std::borrow::Cow::Borrowed(<$name as $crate::testing::macros::TbAssertLabelTrait>::name(&lbl))) }
-	}		pub const ALL_LABELS: &[$name] = &[ $( $name::$label ),* ];
-	};
-	(@flag payload) => { true };
-	(@flag) => { false };
-}
 
 // Helper to build all specs (handles std vs non-std)
 #[doc(hidden)]
@@ -1381,8 +1349,21 @@ macro_rules! __tb_scenario_verify_impl {
 				use $crate::testing::fdr::{DefaultFdrExplorer, FdrConfig};
 				let config: FdrConfig = $fdr_config.into();
 				expect_failure = config.expect_failure;
-				let trace_process = scenario_result.trace.to_process();
-				let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, config.clone());
+
+				// AUTOMATIC MODE SELECTION:
+				// If fault_model + specs provided → explore spec WITH faults (specification robustness)
+				// Otherwise → explore execution trace (normal behavior / implementation resilience)
+				#[cfg(feature = "testing-fault")]
+				let process_to_explore = if config.fault_model.is_some() && !config.specs.is_empty() {
+					&config.specs[0]
+				} else {
+					&scenario_result.trace.to_process()
+				};
+
+				#[cfg(not(feature = "testing-fault"))]
+				let process_to_explore = &scenario_result.trace.to_process();
+
+				let mut explorer = DefaultFdrExplorer::with_defaults(process_to_explore, config.clone());
 				let verdict = explorer.explore();
 				fdr_failed = !verdict.passed;
 				scenario_result.fdr_verdict = Some(verdict);
