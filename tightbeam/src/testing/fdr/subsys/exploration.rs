@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 #[cfg(feature = "testing-timing")]
 use core::time::Duration;
@@ -28,7 +29,7 @@ pub struct DefaultExplorationEngine<'a> {
 	/// Process being explored
 	process: &'a Process,
 	/// Configuration
-	config: FdrConfig,
+	config: Arc<FdrConfig>,
 	/// Results per seed
 	seed_results: Vec<(u64, SeedResult)>,
 	/// States visited (for statistics)
@@ -37,7 +38,7 @@ pub struct DefaultExplorationEngine<'a> {
 
 impl<'a> DefaultExplorationEngine<'a> {
 	/// Create new exploration engine
-	pub fn new(process: &'a Process, config: FdrConfig) -> Self {
+	pub fn new(process: &'a Process, config: Arc<FdrConfig>) -> Self {
 		Self { process, config, seed_results: Vec::new(), visited_states: HashSet::new() }
 	}
 
@@ -187,14 +188,7 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 	}
 
 	fn explore_seed(&mut self, seed: u64) -> SeedResult {
-		let result = self.explore_seed_internal(seed);
-		self.seed_results.push((seed, result.clone()));
-		result
-	}
-
-	fn check_determinism(&mut self) {
-		// Determinism checking is handled by FdrExplorer using seed_results
-		// This is a no-op at the exploration level
+		self.explore_seed_internal(seed)
 	}
 
 	fn traces(&self) -> Vec<Trace> {
@@ -259,7 +253,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 			.iter()
 			.filter_map(|action| {
 				if !process.hidden.contains(&action.event) {
-					Some(action.event.clone())
+					Some(action.event)
 				} else {
 					None
 				}
@@ -342,7 +336,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 			// Check timing guards if timed transitions exist
 			if let Some(ref timed_transitions) = process.timed_transitions {
-				if let Some(transitions) = timed_transitions.get(&(state.process_state, action.event.clone())) {
+				if let Some(transitions) = timed_transitions.get(&(state.process_state, action.event)) {
 					// Filter transitions by guard satisfaction
 					let valid_transitions: Vec<_> = transitions
 						.iter()
@@ -364,10 +358,10 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 						if process.hidden.contains(&action.event) {
 							// Hidden (τ) transition
-							next_exploration.record_hidden(action.event.clone(), next_state);
+							next_exploration.record_hidden(action.event, next_state);
 						} else {
 							// Observable transition
-							next_exploration.record_observable(action.event.clone(), next_state);
+							next_exploration.record_observable(action.event, next_state);
 
 							// Update timing if timing constraints exist
 							if let Some(ref constraints) = process.timing_constraints {
@@ -408,10 +402,10 @@ impl<'a> DefaultExplorationEngine<'a> {
 			let mut next_exploration = state.branch();
 			if process.hidden.contains(&action.event) {
 				// Hidden (τ) transition
-				next_exploration.record_hidden(action.event.clone(), next_state);
+				next_exploration.record_hidden(action.event, next_state);
 			} else {
 				// Observable transition
-				next_exploration.record_observable(action.event.clone(), next_state);
+				next_exploration.record_observable(action.event, next_state);
 
 				// Update timing if timing constraints exist
 				#[cfg(feature = "testing-timing")]

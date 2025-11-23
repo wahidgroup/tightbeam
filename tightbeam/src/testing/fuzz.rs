@@ -213,7 +213,7 @@ impl CspOracle {
 			.enabled(self.current_state)
 			.iter()
 			.filter(|a| a.is_observable())
-			.map(|a| a.event.clone())
+			.map(|a| a.event)
 			.collect()
 	}
 
@@ -229,8 +229,8 @@ impl CspOracle {
 		}
 
 		// Record transition
-		self.visited_transitions.insert((self.current_state, event.clone()));
-		self.trace.push(event.clone());
+		self.visited_transitions.insert((self.current_state, *event));
+		self.trace.push(*event);
 
 		// Take first state (deterministic or first choice)
 		self.current_state = next_states[0];

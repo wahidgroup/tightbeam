@@ -44,7 +44,7 @@ impl fmt::Display for State {
 /// Represents a named event in a CSP process specification. Also used by
 /// timing verification to identify events with timing constraints (WCET,
 /// deadlines, jitter) and in violation reports.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Event(pub &'static str);
 
 impl fmt::Display for Event {
@@ -156,15 +156,12 @@ impl TransitionRelation {
 
 	/// Get all target states: from --[event]--> ?
 	pub fn targets(&self, from: State, event: &Event) -> Option<&[State]> {
-		self.transitions.get(&(from, event.clone())).map(|v| v.as_slice())
+		self.transitions.get(&(from, *event)).map(|v| v.as_slice())
 	}
 
 	/// Check if nondeterministic: from --[event]--> {s1, s2, ...}
 	pub fn is_nondeterministic(&self, from: State, event: &Event) -> bool {
-		self.transitions
-			.get(&(from, event.clone()))
-			.map(|v| v.len() > 1)
-			.unwrap_or(false)
+		self.transitions.get(&(from, *event)).map(|v| v.len() > 1).unwrap_or(false)
 	}
 }
 
@@ -253,14 +250,14 @@ impl Process {
 		// Observable actions
 		for event in &self.observable {
 			if self.transitions.targets(state, event).is_some() {
-				actions.push(Action { event: event.clone(), alphabet: Alphabet::Observable });
+				actions.push(Action { event: *event, alphabet: Alphabet::Observable });
 			}
 		}
 
 		// Hidden actions
 		for event in &self.hidden {
 			if self.transitions.targets(state, event).is_some() {
-				actions.push(Action { event: event.clone(), alphabet: Alphabet::Hidden });
+				actions.push(Action { event: *event, alphabet: Alphabet::Hidden });
 			}
 		}
 
@@ -362,7 +359,7 @@ impl Process {
 
 			// Check if in terminal state
 			if self.is_terminal(current_state) {
-				violations.push(CspViolation::AfterTermination { event: event.clone(), terminal_state: current_state });
+				violations.push(CspViolation::AfterTermination { event, terminal_state: current_state });
 				continue;
 			}
 
@@ -370,7 +367,7 @@ impl Process {
 			let enabled = self.enabled(current_state);
 			if !enabled.contains(&action) {
 				violations.push(CspViolation::EventNotEnabled {
-					event: event.clone(),
+					event,
 					state: current_state,
 					enabled: enabled.clone(),
 				});
@@ -381,13 +378,13 @@ impl Process {
 			let next_states = self.step(current_state, &event);
 
 			if next_states.is_empty() {
-				violations.push(CspViolation::Deadlock { event: event.clone(), state: current_state });
+				violations.push(CspViolation::Deadlock { event, state: current_state });
 				continue;
 			}
 
 			if next_states.len() > 1 {
 				violations.push(CspViolation::NondeterministicChoice {
-					event: event.clone(),
+					event,
 					state: current_state,
 					next_states: next_states.clone(),
 				});
@@ -512,9 +509,9 @@ impl ProcessBuilder {
 		}
 
 		if let Some(ref mut transitions) = self.timed_transitions {
-			let key = (from, event.clone());
+			let key = (from, event);
 			let action = Action {
-				event: event.clone(),
+				event,
 				alphabet: if self.observable.contains(&event) {
 					Alphabet::Observable
 				} else {

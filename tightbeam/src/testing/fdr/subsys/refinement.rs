@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::testing::fdr::config::{Failure, FdrConfig, Trace};
@@ -33,7 +34,7 @@ where
 	M: MemoizationCache,
 {
 	/// Configuration
-	config: FdrConfig,
+	config: Arc<FdrConfig>,
 	/// Process being verified
 	process: &'a Process,
 	/// Shared memoization cache
@@ -45,7 +46,7 @@ where
 	M: MemoizationCache,
 {
 	/// Create new refinement checker with shared cache
-	pub fn new(process: &'a Process, config: FdrConfig, cache: Rc<RefCell<M>>) -> Self {
+	pub fn new(process: &'a Process, config: Arc<FdrConfig>, cache: Rc<RefCell<M>>) -> Self {
 		Self { config, process, cache }
 	}
 
@@ -92,7 +93,7 @@ where
 		} else {
 			// Observable event: extend trace
 			let mut new_trace = trace;
-			new_trace.push(event.clone());
+			new_trace.push(*event);
 			(new_trace, depth + 1)
 		}
 	}
@@ -173,7 +174,7 @@ where
 				}
 
 				// Add event to trace
-				trace.push(action.event.clone());
+				trace.push(action.event);
 				current_state = next_states[0];
 
 				// Check for cycles
@@ -606,7 +607,7 @@ where
 						queue.push_back((next_state, trace.clone(), new_tau_seen));
 					} else {
 						let mut new_trace = trace.clone();
-						new_trace.push(action.event.clone());
+						new_trace.push(action.event);
 						let mut new_tau_seen = HashSet::new();
 						new_tau_seen.insert((next_state, new_trace.clone()));
 						queue.push_back((next_state, new_trace, new_tau_seen));
@@ -634,7 +635,7 @@ where
 			.iter()
 			.filter_map(|action| {
 				if !process.hidden.contains(&action.event) {
-					Some(action.event.clone())
+					Some(action.event)
 				} else {
 					None
 				}

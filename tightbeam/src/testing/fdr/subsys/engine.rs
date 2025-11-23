@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[cfg(feature = "rayon")]
 use std::collections::HashSet;
@@ -35,7 +36,7 @@ where
 	process: &'a Process,
 
 	/// Configuration
-	config: FdrConfig,
+	config: Arc<FdrConfig>,
 
 	/// Exploration engine
 	explorer: E,
@@ -60,6 +61,19 @@ where
 	///
 	/// The cache is managed by the refinement checker, which receives it during construction.
 	pub fn new(process: &'a Process, config: FdrConfig, explorer: E, refinement: R) -> Self {
+		Self {
+			process,
+			config: Arc::new(config),
+			explorer,
+			refinement,
+			verdict: FdrVerdict::default(),
+		}
+	}
+
+	/// Create new FDR explorer with custom subsystems using Arc<FdrConfig>
+	///
+	/// Use this when you've already created an Arc<FdrConfig> to share across subsystems.
+	pub fn new_with_arc(process: &'a Process, config: Arc<FdrConfig>, explorer: E, refinement: R) -> Self {
 		Self { process, config, explorer, refinement, verdict: FdrVerdict::default() }
 	}
 
@@ -98,9 +112,9 @@ where
 				.collect();
 
 			for (seed, result, visited) in results {
-				self.explorer.add_seed_result(seed, result.clone());
-				self.explorer.update_visited_states(&visited);
 				self.update_verdict_from_result(seed, &result);
+				self.explorer.add_seed_result(seed, result);
+				self.explorer.update_visited_states(&visited);
 			}
 		}
 
@@ -109,6 +123,7 @@ where
 			for seed in 0..self.config.seeds {
 				let result = self.explorer.explore_seed(seed as u64);
 				self.update_verdict_from_result(seed as u64, &result);
+				self.explorer.add_seed_result(seed as u64, result);
 			}
 		}
 
@@ -177,9 +192,9 @@ where
 				.collect();
 
 			for (seed, result, visited) in results {
-				self.explorer.add_seed_result(seed, result.clone());
-				self.explorer.update_visited_states(&visited);
 				self.update_verdict_from_result(seed, &result);
+				self.explorer.add_seed_result(seed, result);
+				self.explorer.update_visited_states(&visited);
 			}
 		}
 
@@ -188,9 +203,9 @@ where
 			for seed in 0..config.seeds {
 				let (result, visited) =
 					DefaultExplorationEngine::explore_seed_static(spec_process, config, seed as u64);
-				self.explorer.add_seed_result(seed as u64, result.clone());
-				self.explorer.update_visited_states(&visited);
 				self.update_verdict_from_result(seed as u64, &result);
+				self.explorer.add_seed_result(seed as u64, result);
+				self.explorer.update_visited_states(&visited);
 			}
 		}
 
@@ -294,9 +309,10 @@ impl<'a> DefaultFdrExplorer<'a> {
 	/// This is a convenience constructor that uses the default implementations
 	/// of all subsystems. For custom subsystems, use `FdrExplorer::new` directly.
 	pub fn with_defaults(process: &'a Process, config: FdrConfig) -> Self {
-		let explorer = DefaultExplorationEngine::new(process, config.clone());
+		let config = Arc::new(config);
+		let explorer = DefaultExplorationEngine::new(process, Arc::clone(&config));
 		let cache = Rc::new(RefCell::new(DefaultCache::new()));
-		let refinement = DefaultRefinementChecker::new(process, config.clone(), cache);
-		FdrExplorer::new(process, config, explorer, refinement)
+		let refinement = DefaultRefinementChecker::new(process, Arc::clone(&config), cache);
+		FdrExplorer::new_with_arc(process, config, explorer, refinement)
 	}
 }

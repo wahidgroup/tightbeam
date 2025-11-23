@@ -28,9 +28,6 @@ pub trait ExplorationCore {
 	/// Explore a single seed and return the result
 	fn explore_seed(&mut self, seed: u64) -> SeedResult;
 
-	/// Check determinism across all completed seeds
-	fn check_determinism(&mut self);
-
 	/// Get traces explored so far
 	fn traces(&self) -> Vec<Trace>;
 
@@ -62,7 +59,7 @@ pub trait ExplorationCore {
 			.iter()
 			.filter_map(|action| {
 				if !process.hidden.contains(&action.event) {
-					Some(action.event.clone())
+					Some(action.event)
 				} else {
 					None
 				}
@@ -214,7 +211,7 @@ impl ExplorationState {
 
 	/// Record observable event
 	pub fn record_observable(&mut self, event: Event, next_state: State) {
-		self.trace.push(event.clone());
+		self.trace.push(event);
 		self.process_state = next_state;
 		self.state_path.push(next_state);
 		self.internal_run = 0; // Reset τ counter
@@ -226,7 +223,7 @@ impl ExplorationState {
 
 	/// Record hidden (τ) event
 	pub fn record_hidden(&mut self, event: Event, next_state: State) {
-		self.hidden_events.push(event.clone());
+		self.hidden_events.push(event);
 		self.process_state = next_state;
 		self.state_path.push(next_state);
 		self.internal_run += 1;
@@ -241,7 +238,7 @@ impl ExplorationState {
 	#[cfg(feature = "testing-timing")]
 	pub fn update_timing(&mut self, event: &Event, wcet: Duration) {
 		self.elapsed_time += wcet;
-		self.event_times.push((event.clone(), self.elapsed_time));
+		self.event_times.push((*event, self.elapsed_time));
 	}
 
 	/// Advance all clocks by elapsed time
@@ -352,7 +349,7 @@ mod tests {
 			let event = Event("evt");
 
 			let mut exp_state = ExplorationState::initial(state1);
-			exp_state.record_observable(event.clone(), state2);
+			exp_state.record_observable(event, state2);
 			assert_eq!(exp_state.process_state, state2);
 			assert_eq!(exp_state.trace, vec![event]);
 			assert_eq!(exp_state.internal_run, 0); // Reset after observable
@@ -365,7 +362,7 @@ mod tests {
 			let event = Event("tau");
 
 			let mut exp_state = ExplorationState::initial(state1);
-			exp_state.record_hidden(event.clone(), state2);
+			exp_state.record_hidden(event, state2);
 			assert_eq!(exp_state.process_state, state2);
 			assert!(exp_state.trace.is_empty()); // Hidden events don't go in trace
 			assert_eq!(exp_state.internal_run, 1); // Incremented
@@ -381,7 +378,7 @@ mod tests {
 
 			// Simulate τ-loop: many hidden transitions
 			for _ in 0..35 {
-				exp_state.record_hidden(tau.clone(), state);
+				exp_state.record_hidden(tau, state);
 			}
 
 			assert!(exp_state.internal_run > 32);
@@ -396,7 +393,7 @@ mod tests {
 			let event = Event("evt");
 			let mut exp_state = ExplorationState::initial(state);
 
-			exp_state.record_observable(event.clone(), state);
+			exp_state.record_observable(event, state);
 			exp_state.update_timing(&event, Duration::from_millis(10));
 			assert_eq!(exp_state.elapsed_time, Duration::from_millis(10));
 			assert_eq!(exp_state.event_times.len(), 1);
@@ -405,7 +402,7 @@ mod tests {
 
 			// Add another event
 			let event2 = Event("evt2");
-			exp_state.record_observable(event2.clone(), state);
+			exp_state.record_observable(event2, state);
 			exp_state.update_timing(&event2, Duration::from_millis(5));
 			assert_eq!(exp_state.elapsed_time, Duration::from_millis(15));
 			assert_eq!(exp_state.event_times.len(), 2);

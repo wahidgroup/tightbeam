@@ -386,9 +386,9 @@ impl FdrTraceExt for ConsumedTrace {
 
 				// Add to appropriate alphabet
 				if is_hidden {
-					hidden.insert(event.clone());
+					hidden.insert(event);
 				} else {
-					observable.insert(event.clone());
+					observable.insert(event);
 				}
 
 				// Add transition: last event goes to terminal, others use intermediate states
