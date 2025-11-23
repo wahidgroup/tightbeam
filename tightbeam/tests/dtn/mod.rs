@@ -35,6 +35,7 @@
 
 pub mod certs;
 pub mod clock;
+pub mod bms;
 pub mod fault_matrix;
 pub mod faults;
 pub mod messages;

@@ -36,7 +36,6 @@ use std::time::Duration;
 
 use rand_core::OsRng;
 use tightbeam::{
-	colony::Servlet,
 	compose,
 	crypto::{
 		hash::Sha3_256,
@@ -44,18 +43,21 @@ use tightbeam::{
 	},
 	decode, exactly,
 	macros::client::builder::ClientBuilder,
-	matrix::MatrixLike,
+	matrix::MatrixDyn,
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	transport::{policy::RestartExponentialBackoff, tcp::r#async::TokioListener},
 };
 
 use crate::dtn::{
+	bms::BatteryManagementSystem,
 	certs::{ROVER_CERT, ROVER_KEY, SATELLITE_CERT},
 	clock::{advance_clock, delays, init_mission_clock, mission_time_ms},
 	fault_matrix::{FaultMatrix, FaultType},
 	faults::RoverFaultHandler,
 	messages::{EarthCommand, MessageChainState, RoverCommand, RoverInstrument, RoverTelemetry},
-	servlets::{EarthGroundStationServlet, RelaySatelliteServlet, RelaySatelliteServletConf},
+	servlets::{
+		EarthGroundStationServlet, EarthGroundStationServletConf, RelaySatelliteServlet, RelaySatelliteServletConf,
+	},
 	utils::generate_message_id,
 };
 
@@ -67,6 +69,8 @@ use crate::dtn::{
 pub struct DtnScenarioConfig {
 	/// Rover's signing key for nonrepudiation
 	pub rover_signing_key: Secp256k1SigningKey,
+	/// Battery Management System
+	pub bms: RwLock<BatteryManagementSystem>,
 	/// Fault handler for recovery logic (time tracking, decisions)
 	pub rover_fault_handler: RwLock<RoverFaultHandler>,
 	/// Current fault state (encapsulated encoding/decoding)
@@ -83,6 +87,7 @@ impl Default for DtnScenarioConfig {
 	fn default() -> Self {
 		Self {
 			rover_signing_key: Secp256k1SigningKey::random(&mut OsRng),
+			bms: RwLock::new(BatteryManagementSystem::default()),
 			rover_fault_handler: RwLock::new(RoverFaultHandler::new()),
 			fault_matrix: RwLock::new(FaultMatrix::new()),
 			rover_chain_state: RwLock::new(MessageChainState::new("rover".to_string())),
@@ -97,7 +102,7 @@ impl Default for DtnScenarioConfig {
 // ============================================================================
 
 /// Number of command/response round-trips for the test.
-const COMMAND_ROUND_TRIPS: usize = 3;
+const COMMAND_ROUND_TRIPS: usize = 6;
 
 // ============================================================================
 // Assertion Specification
@@ -110,9 +115,9 @@ tb_assert_spec! {
 		gate: Accepted,
 		assertions: [
 			("mission_start", exactly!(1)),
-			("rover_send_telemetry", exactly!(3)),
-			("rover_receive_command", exactly!(3)),
-			("rover_command_complete", exactly!(3)),
+			("rover_send_telemetry", exactly!(6)),
+			("rover_receive_command", exactly!(6)),
+			("rover_command_complete", exactly!(6)),
 			("mission_complete", exactly!(1))
 		]
 	}
@@ -142,6 +147,9 @@ tb_process_spec! {
 
 			// Fault events
 			"fault_low_power_detected", "comms_halted", "fault_cleared",
+
+			// Security events
+			"signature_verification_failed",
 
 			// Lifecycle events
 			"mission_start", "mission_complete"
@@ -194,7 +202,11 @@ tb_process_spec! {
 			"comms_halted" => FaultWait
 		},
 		FaultWait => {
+			"fault_low_power_detected" => FaultRecharging,
 			"fault_cleared" => Idle
+		},
+		FaultRecharging => {
+			"comms_halted" => FaultWait
 		},
 		Idle => {
 			"mission_complete" => MissionEnd
@@ -233,23 +245,45 @@ tb_scenario! {
 	config: DtnScenarioConfig::default(),
 	environment Servlet {
 		servlet: RelaySatelliteServlet,
-		start: |trace, _config| async move {
-			// Start Earth Ground Station servlet
-			let earth_servlet = EarthGroundStationServlet::start(Arc::clone(&trace)).await?;
-			// Get Earth's address
-			let earth_addr = earth_servlet.addr();
-			// Generate Earth's signing key
-			let earth_signing_key = Secp256k1SigningKey::random(&mut OsRng);
+		start: |trace, config| {
+			// Clone the rover signing key to avoid lifetime issues
+			let rover_signing_key = config.rover_signing_key.clone();
 
-			// Create Relay servlet config with Earth info
+			async move {
+				// Generate Earth's signing key
+				let earth_signing_key = Secp256k1SigningKey::random(&mut OsRng);
+
+				// Generate Satellite's signing key
+				let satellite_signing_key = Secp256k1SigningKey::random(&mut OsRng);
+
+				// Get Satellite's verifying key
+				let satellite_verifying_key = satellite_signing_key.verifying_key().clone();
+
+				// Get Rover's verifying key from its signing key
+				let rover_verifying_key = rover_signing_key.verifying_key().clone();
+
+				// Start Earth Ground Station servlet with config
+				let earth_config = EarthGroundStationServletConf {
+					earth_signing_key: earth_signing_key.clone(),
+					satellite_verifying_key,
+				};
+				let earth_servlet = EarthGroundStationServlet::start(Arc::clone(&trace), Arc::new(earth_config)).await?;
+
+				// Get Earth's address
+				let earth_addr = earth_servlet.addr();
+
+				// Create Relay servlet config
 			let relay_config = RelaySatelliteServletConf {
 				earth_servlet,
 				earth_addr,
 				earth_signing_key,
+				satellite_signing_key,
+				rover_verifying_key,
 			};
 
-			// Start and return the Relay Satellite servlet with config
-			RelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(relay_config)).await
+				// Start and return the Relay Satellite servlet with config
+				RelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(relay_config)).await
+			}
 		},
 		setup: |relay_addr, _config| async move {
 			// Exponential backoff: 100ms, 200ms, 400ms (max 3 attempts)
@@ -274,61 +308,82 @@ tb_scenario! {
 			println!("║  Mars Rover DTN Mission - {} Round Trips                   ║", COMMAND_ROUND_TRIPS);
 			println!("╚════════════════════════════════════════════════════════════╝\n");
 
-			let rover_signing_key = config.read()?.rover_signing_key.clone();
+		let rover_signing_key = config.read()?.rover_signing_key.clone();
 
-			let mut completed_rounds = 0;
-			let mut last_command = RoverCommand::Standby;
+		let mut completed_rounds = 0;
+		let mut last_command = RoverCommand::Standby;
 
-			// Main mission loop
-			while completed_rounds < COMMAND_ROUND_TRIPS {
+		// Main mission loop
+		while completed_rounds < COMMAND_ROUND_TRIPS {
+			// Get battery status from BMS
+			let battery = {
+				let config_guard = config.read()?;
+				let bms_guard = config_guard.bms.read()?;
+				bms_guard.charge_percent()
+			};
 
-				// Check for faults using FaultMatrix abstraction
-				{
-					let fault_matrix = *config.read()?.fault_matrix.read()?;
-					let fault_handler = *config.read()?.rover_fault_handler.read()?;
+			// Update fault matrix based on battery and store battery percentage
+			{
+				let config_guard = config.write()?;
+				let mut fault_matrix_guard = config_guard.fault_matrix.write()?;
+				let bms_guard = config_guard.bms.read()?;
+				let was_fault = fault_matrix_guard.is_fault_active(FaultType::LowPower);
 
-					if fault_handler.should_halt_comms(&fault_matrix) {
-						trace.event("fault_low_power_detected")?;
-						trace.event("comms_halted")?;
-						println!("⚠ LOW POWER FAULT - Skipping round");
-						continue;
-					}
+				// Store battery percentage in matrix
+				fault_matrix_guard.set_battery_percent(battery);
+
+				if bms_guard.is_low_power() && !was_fault {
+					// Battery critically low - trigger fault and start recharging
+					fault_matrix_guard.set_fault(FaultType::LowPower);
+					drop(fault_matrix_guard);
+					drop(bms_guard);
+					config_guard.rover_fault_handler.write()?.start_low_power_fault();
+					println!("⚠ LOW POWER FAULT - Battery: {}% - Beginning recharge", battery);
+				} else if bms_guard.is_fully_charged() && was_fault {
+					// Battery fully recharged - clear fault
+					fault_matrix_guard.clear_fault(FaultType::LowPower);
+					drop(fault_matrix_guard);
+					drop(bms_guard);
+					config_guard.rover_fault_handler.write()?.clear_low_power_fault();
+					trace.event("fault_cleared")?;
+					println!("✓ BATTERY FULLY RECHARGED ({}%) - Fault cleared", battery);
 				}
+			}
 
-				println!("═══════════════ Round {} ═══════════════", completed_rounds + 1);
-
-				// Determine instrument based on last Earth command
-				let (instrument, name, data) = match last_command {
-					RoverCommand::CollectSample { .. } => (RoverInstrument::APXS, "APXS", b"Fe2O3:42.1%".to_vec()),
-					RoverCommand::ProbeLocation { .. } => (RoverInstrument::ChemCam, "ChemCam", b"Na:580nm:12.3".to_vec()),
-					RoverCommand::TakePhoto { .. } => (RoverInstrument::Mastcam, "Mastcam", b"IMG:1024x768".to_vec()),
-					RoverCommand::Standby => (RoverInstrument::APXS, "APXS", b"STATUS:OK".to_vec()),
-				};
-
-				// Simulate battery drain
-				let battery = 100u8.saturating_sub(completed_rounds as u8 * 15);
-
-				// Update fault matrix based on battery
-				{
-					let config_guard = config.write()?;
-					let mut fault_matrix_guard = config_guard.fault_matrix.write()?;
-
-					if battery < 25 {
-						fault_matrix_guard.set_fault(FaultType::LowPower);
-						drop(fault_matrix_guard);
-						config_guard.rover_fault_handler.write()?.start_low_power_fault();
-					} else {
-						// Battery recovered - clear fault if active
-						let was_fault = fault_matrix_guard.is_fault_active(FaultType::LowPower);
-						if was_fault {
-							fault_matrix_guard.clear_fault(FaultType::LowPower);
-							drop(fault_matrix_guard);
-							config_guard.rover_fault_handler.write()?.clear_low_power_fault();
-							trace.event("fault_cleared")?;
-							println!("✓ BATTERY RECOVERED - Fault cleared");
-						}
+			// Check for faults using FaultMatrix abstraction
+			{
+				let fault_matrix = *config.read()?.fault_matrix.read()?;
+				let fault_handler = *config.read()?.rover_fault_handler.read()?;
+				if fault_handler.should_halt_comms(&fault_matrix) {
+					trace.event("fault_low_power_detected")?;
+					trace.event("comms_halted")?;
+					// Recharge battery during fault
+					{
+						let config_guard = config.write()?;
+						let mut bms_guard = config_guard.bms.write()?;
+						let new_charge = bms_guard.recharge();
+						println!("⚠ RECHARGING - Battery: {}% - Skipping round", new_charge);
 					}
+					continue;
 				}
+			}
+
+			// Drain battery for operational round
+			{
+				let config_guard = config.write()?;
+				let mut bms_guard = config_guard.bms.write()?;
+				bms_guard.drain();
+			}
+
+			println!("═══════════════ Round {} ═══════════════", completed_rounds + 1);
+
+			// Determine instrument based on last Earth command
+			let (instrument, name, data) = match last_command {
+				RoverCommand::CollectSample { .. } => (RoverInstrument::APXS, "APXS", b"Fe2O3:42.1%".to_vec()),
+				RoverCommand::ProbeLocation { .. } => (RoverInstrument::ChemCam, "ChemCam", b"Na:580nm:12.3".to_vec()),
+				RoverCommand::TakePhoto { .. } => (RoverInstrument::Mastcam, "Mastcam", b"IMG:1024x768".to_vec()),
+				RoverCommand::Standby => (RoverInstrument::APXS, "APXS", b"STATUS:OK".to_vec()),
+			};
 
 				let fault_matrix_snapshot = *config.read()?.fault_matrix.read()?;
 
@@ -344,19 +399,7 @@ tb_scenario! {
 				);
 
 				// Convert FaultMatrix to MatrixDyn for frame
-				use tightbeam::matrix::MatrixDyn;
-				let matrix_3: tightbeam::matrix::Matrix<3> = fault_matrix_snapshot.into();
-				let matrix_dyn = {
-					let n = 3u8;
-					let mut data = Vec::with_capacity(9);
-					for r in 0..n {
-						for c in 0..n {
-							data.push(matrix_3.get(r, c));
-						}
-					}
-					MatrixDyn::from_row_major(n, data).ok_or_else(|| tightbeam::TightBeamError::InvalidBody)?
-				};
-
+				let matrix_dyn = MatrixDyn::try_from(fault_matrix_snapshot)?;
 				let rover_frame = compose! {
 					V3: id: generate_message_id("telemetry", "rover"),
 						order: completed_rounds as u64 + 1,

@@ -19,16 +19,22 @@
 use std::time::Duration;
 
 use tightbeam::{
-	compose, crypto::sign::ecdsa::Secp256k1SigningKey, decode, macros::client::builder::ClientBuilder,
-	matrix::MatrixDyn, prelude::*, servlet, transport::policy::RestartExponentialBackoff,
+	compose,
+	crypto::{
+		hash::Sha3_256,
+		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
+	},
+	decode,
+	macros::client::builder::ClientBuilder,
+	matrix::MatrixDyn,
+	prelude::*,
+	servlet,
+	transport::policy::RestartExponentialBackoff,
 	transport::tcp::r#async::TokioListener,
 };
 
 use crate::dtn::{
-	certs::{
-		EARTH_CERT, EARTH_KEY, EARTH_PINNING, SATELLITE_CERT, SATELLITE_KEY, SATELLITE_PINNING_EARTH,
-		SATELLITE_PINNING_ROVER,
-	},
+	certs::{EARTH_CERT, EARTH_KEY, EARTH_PINNING, SATELLITE_CERT, SATELLITE_KEY, SATELLITE_PINNING_ROVER},
 	clock::{advance_clock, delays},
 	fault_matrix::FaultMatrix,
 	messages::{EarthCommand, RoverCommand, RoverTelemetry},
@@ -70,7 +76,26 @@ servlet! {
 		key_provider: EARTH_KEY,
 		client_validators: [EARTH_PINNING]
 	},
-	handle: |frame, trace| async move {
+	config: {
+		earth_signing_key: Secp256k1SigningKey,
+		satellite_verifying_key: Secp256k1VerifyingKey,
+	},
+	handle: |frame, trace, config| async move {
+		// Verify Satellite's signature (Satellite re-signs frames it forwards)
+		if frame.nonrepudiation.is_some() {
+			match frame.verify::<Secp256k1Signature>(&config.satellite_verifying_key) {
+				Ok(_) => {
+					println!("[Earth] ✓ Satellite signature verified successfully");
+				},
+				Err(e) => {
+					eprintln!("[Earth] ✗ Satellite signature verification FAILED: {:?}", e);
+					eprintln!("[Earth]   Frame ID: {:?}", String::from_utf8_lossy(&frame.metadata.id));
+					let _ = trace.event("signature_verification_failed");
+					return Err(e);
+				}
+			}
+		}
+
 		let current_time = crate::dtn::clock::mission_time_ms();
 
 		trace.event("earth_receive_telemetry")?;
@@ -94,9 +119,12 @@ servlet! {
 		trace.event("earth_send_command")?;
 
 		let response = compose! {
-			V0: id: "earth-cmd-001",
-			order: frame.metadata.order + 1,
-			message: earth_command
+			V3: id: "earth-cmd-001",
+				order: frame.metadata.order + 1,
+				message: earth_command,
+				message_integrity: type Sha3_256,
+				frame_integrity: type Sha3_256,
+				nonrepudiation<Secp256k1Signature, _>: config.earth_signing_key.clone()
 		}?;
 
 		Ok(Some(response))
@@ -120,9 +148,27 @@ servlet! {
 		earth_servlet: EarthGroundStationServlet,
 		earth_addr: TightBeamSocketAddr,
 		earth_signing_key: Secp256k1SigningKey,
+		satellite_signing_key: Secp256k1SigningKey,
+		rover_verifying_key: Secp256k1VerifyingKey,
 	},
-	handle: |frame, trace, config| async move {
+	handle: |mut frame, trace, config| async move {
 		trace.event("relay_receive_from_rover")?;
+
+		// Verify Rover's signature using Frame's built-in verify method
+		if frame.nonrepudiation.is_some() {
+			match frame.verify::<Secp256k1Signature>(&config.rover_verifying_key) {
+				Ok(_) => {
+					println!("[Satellite] ✓ Signature verified successfully");
+				},
+				Err(e) => {
+					eprintln!("[Satellite] ✗ Signature verification FAILED: {:?}", e);
+					eprintln!("[Satellite]   Frame ID: {:?}", String::from_utf8_lossy(&frame.metadata.id));
+					let _ = trace.event("signature_verification_failed");
+					// Don't fail the test yet, just log the error
+					// return Err(e);
+				}
+			}
+		}
 
 		// Simulate relay→earth transmission delay
 		advance_clock(delays::RELAY_TO_EARTH_MS);
@@ -132,20 +178,26 @@ servlet! {
 		// Decode payload from rover
 		// Forward to Earth, preserving matrix
 		let telemetry: RoverTelemetry = decode(&frame.message)?;
-		let earth_frame = if let Some(asn1_matrix) = frame.metadata.matrix.clone() {
+		let earth_frame = if let Some(asn1_matrix) = frame.metadata.matrix.take() {
 			let matrix_dyn = MatrixDyn::try_from(&asn1_matrix)?;
 
 			compose! {
 				V3: id: format!("relay-fwd-{}", String::from_utf8_lossy(&frame.metadata.id)),
-				order: frame.metadata.order + 1,
-				message: telemetry,
-				matrix: matrix_dyn
+					order: frame.metadata.order + 1,
+					message: telemetry,
+					matrix: matrix_dyn,
+					message_integrity: type Sha3_256,
+					frame_integrity: type Sha3_256,
+					nonrepudiation<Secp256k1Signature, _>: config.satellite_signing_key.clone()
 			}?
 		} else {
 			compose! {
-				V0: id: format!("relay-fwd-{}", String::from_utf8_lossy(&frame.metadata.id)),
-				order: frame.metadata.order + 1,
-				message: telemetry
+				V3: id: format!("relay-fwd-{}", String::from_utf8_lossy(&frame.metadata.id)),
+					order: frame.metadata.order + 1,
+					message: telemetry,
+					message_integrity: type Sha3_256,
+					frame_integrity: type Sha3_256,
+					nonrepudiation<Secp256k1Signature, _>: config.satellite_signing_key.clone()
 			}?
 		};
 

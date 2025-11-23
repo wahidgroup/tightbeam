@@ -26,6 +26,7 @@
 use tightbeam::{
 	crypto::{
 		key::KeySpec,
+		sign::ecdsa::Secp256k1VerifyingKey,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
 	hex,
@@ -115,3 +116,25 @@ pub const SATELLITE_PINNING_ROVER: PublicKeyPinning<1> = PublicKeyPinning::new([
 
 /// Rover's pinning policy: accepts only Satellite's public key
 pub const ROVER_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([SATELLITE_PUB_KEY]);
+
+// ============================================================================
+// Verifying Keys for Signature Verification
+// ============================================================================
+
+/// Helper function to create Earth's verifying key from its public key
+pub fn earth_verifying_key() -> Secp256k1VerifyingKey {
+	Secp256k1VerifyingKey::from_sec1_bytes(EARTH_PUB_KEY)
+		.expect("EARTH_PUB_KEY is a valid secp256k1 public key")
+}
+
+/// Helper function to create Satellite's verifying key from its public key
+pub fn satellite_verifying_key() -> Secp256k1VerifyingKey {
+	Secp256k1VerifyingKey::from_sec1_bytes(SATELLITE_PUB_KEY)
+		.expect("SATELLITE_PUB_KEY is a valid secp256k1 public key")
+}
+
+/// Helper function to create Rover's verifying key from its public key
+pub fn rover_verifying_key() -> Secp256k1VerifyingKey {
+	Secp256k1VerifyingKey::from_sec1_bytes(ROVER_PUB_KEY)
+		.expect("ROVER_PUB_KEY is a valid secp256k1 public key")
+}

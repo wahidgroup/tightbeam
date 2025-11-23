@@ -30,15 +30,16 @@ impl FaultType {
 	}
 }
 
-/// Encapsulates rover fault state in a 3x3 matrix representation.
+/// Encapsulates rover fault state and telemetry in a 3x3 matrix representation.
 ///
-/// Each fault type is independently represented in its own cell:
+/// Matrix layout:
 /// - Cell [0,0]: Low Power fault (0=inactive, 1=active)
-/// - Cell [0,1]: Communications fault (0=inactive, 1=active)
+/// - Cell [0,1]: Communications fault (0=inactive, 1=active)  
 /// - Cell [0,2]: Thermal fault (0=inactive, 1=active)
-/// - Remaining cells: Reserved for future fault types
+/// - Cell [1,0]: Battery percentage (0-100)
+/// - Remaining cells: Reserved for future use
 ///
-/// This provides a clean abstraction for encoding fault flags into
+/// This provides a clean abstraction for encoding fault flags and telemetry into
 /// the Frame.matrix field while maintaining separation of concerns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FaultMatrix {
@@ -88,6 +89,18 @@ impl FaultMatrix {
 	pub fn as_matrix(&self) -> &Matrix<3> {
 		&self.matrix
 	}
+
+	/// Set battery percentage (0-100).
+	/// Stored in cell [1,0] of the matrix.
+	pub fn set_battery_percent(&mut self, percent: u8) {
+		self.matrix.set(1, 0, percent.min(100));
+	}
+
+	/// Get battery percentage (0-100).
+	/// Retrieved from cell [1,0] of the matrix.
+	pub fn battery_percent(&self) -> u8 {
+		self.matrix.get(1, 0)
+	}
 }
 
 impl Default for FaultMatrix {
@@ -114,6 +127,23 @@ impl From<Matrix<3>> for FaultMatrix {
 impl From<&Matrix<3>> for FaultMatrix {
 	fn from(matrix: &Matrix<3>) -> Self {
 		Self { matrix: *matrix }
+	}
+}
+
+/// Convert FaultMatrix to MatrixDyn for frame composition.
+impl TryFrom<FaultMatrix> for tightbeam::matrix::MatrixDyn {
+	type Error = tightbeam::TightBeamError;
+
+	fn try_from(fault: FaultMatrix) -> Result<Self, Self::Error> {
+		let matrix_3: Matrix<3> = fault.into();
+		let n = 3u8;
+		let mut data = Vec::with_capacity(9);
+		for r in 0..n {
+			for c in 0..n {
+				data.push(matrix_3.get(r, c));
+			}
+		}
+		tightbeam::matrix::MatrixDyn::from_row_major(n, data).ok_or_else(|| tightbeam::TightBeamError::InvalidBody)
 	}
 }
 

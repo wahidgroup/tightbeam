@@ -312,11 +312,39 @@ macro_rules! servlet {
 		$(x509: { $($x509_key:ident: $x509_val:tt),* $(,)? },)?
 		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
 		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		handle: |mut $message:ident, $trace_param:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val),*)?], [$($($x509_key: $x509_val),*)?],
+				config_only, {}, { $($config_field: $config_type,)* },
+				|mut $message, $trace_param, $config_param| $handler_body, [$input], pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(x509: { $($x509_key:ident: $x509_val:tt),* $(,)? },)?
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
 		handle: |$message:ident, $trace_param:ident, $config_param:ident| async move $handler_body:block
 	) => {
 		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val),*)?], [$($($x509_key: $x509_val),*)?],
 				config_only, {}, { $($config_field: $config_type,)* },
 				|$message, $trace_param, $config_param| $handler_body, [$input], pub, [$(#[$meta])*]);
+	};
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty>,
+		$(worker_threads: $threads:literal,)?
+		protocol: $protocol:path,
+		$(x509: { $($x509_key:ident: $x509_val:tt),* $(,)? },)?
+		$(policies: { $($policy_key:ident: $policy_val:tt),* $(,)? },)?
+		config: { $($config_field:ident: $config_type:ty),* $(,)? },
+		handle: |mut $message:ident, $trace_param:ident, $config_param:ident| async move $handler_body:block
+	) => {
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val),*)?], [$($($x509_key: $x509_val),*)?],
+				config_only, {}, { $($config_field: $config_type,)* },
+				|mut $message, $trace_param, $config_param| $handler_body, [$input], , [$(#[$meta])*]);
 	};
 	(
 		$(#[$meta:meta])*
@@ -555,7 +583,26 @@ macro_rules! servlet {
 				|$message, $trace_param, $config_param, $workers_param| $handler_body, $worker_config, $init_config, $init_body, [$input], , [$(#[$meta])*]);
 	};
 
-	// Generate with attributes and visibility (new syntax)
+	// Generate with attributes and visibility (new syntax) - with mut
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], [$($x509_key:ident: $x509_val:tt),*],
+			  config_only, {}, { $($config_field:ident: $config_type:ty,)* },
+			  |mut $message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, pub, [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*], [$($x509_key: $x509_val),*],
+				config_only, {}, { $($config_field: $config_type,)* },
+				|mut $message, $trace_param, $config_param| $handler_body);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
+	};
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], [$($x509_key:ident: $x509_val:tt),*],
+			  config_only, {}, { $($config_field:ident: $config_type:ty,)* },
+			  |mut $message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
+		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, , [$(#[$meta])*]);
+		servlet!(@impl_methods $worker_name, $protocol, [$($policy_key: $policy_val),*], [$($x509_key: $x509_val),*],
+				config_only, {}, { $($config_field: $config_type,)* },
+				|mut $message, $trace_param, $config_param| $handler_body);
+		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
+	};
+	// Generate with attributes and visibility (new syntax) - without mut
 	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], [$($x509_key:ident: $x509_val:tt),*],
 			  config_only, {}, { $($config_field:ident: $config_type:ty,)* },
 			  |$message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
@@ -872,6 +919,28 @@ macro_rules! servlet {
 		servlet!(@drop_impl $worker_name);
 	};
 
+	// config_only with mut
+	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], [$($x509_key:ident: $x509_val:tt),*],
+				   config_only, {}, { $($config_field:ident: $config_type:ty,)* },
+				   |mut $message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr) => {
+		$crate::paste::paste! {
+			impl $worker_name {
+				pub async fn start(trace: ::std::sync::Arc<$crate::trace::TraceCollector>, config: ::std::sync::Arc<[<$worker_name Conf>]>) -> Result<Self, $crate::TightBeamError> {
+					servlet!(@setup_protocol $protocol, listener, addr, [$($x509_key: $x509_val),*]);
+					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
+					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
+						$protocol, listener, [$($policy_key: $policy_val),*], ::std::sync::Arc::clone(&trace_handle), config,
+						(|mut $message: $crate::Frame, $trace_param, $config_param| async move { $handler_body }));
+					Ok(Self { server_handle: Some(server_handle), server_pool_handles, addr, trace_handle })
+				}
+
+				servlet!(@common_methods $protocol);
+			}
+
+			servlet!(@drop_impl $worker_name);
+		}
+	};
+	// config_only without mut
 	(@impl_methods $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], [$($x509_key:ident: $x509_val:tt),*],
 				   config_only, {}, { $($config_field:ident: $config_type:ty,)* },
 				   |$message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr) => {
@@ -1451,6 +1520,28 @@ macro_rules! servlet {
 	};
 
 	// Build server with config only (non-empty policies)
+	// Build server with config only (with policies) - with mut
+	(@build_server_config_only $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $trace:expr, $config:ident, (|mut $msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident| async move $body:block)) => {
+		{
+			let config_arc = $config;
+			let trace_handle = ::std::sync::Arc::clone(&$trace);
+			let server_handle = $crate::server! {
+				protocol $protocol: $listener,
+				policies: { $($policy_key: $policy_val),* },
+				handle: move |mut $msg| {
+					let config_arc = ::std::sync::Arc::clone(&config_arc);
+					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
+				async move {
+					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+					let $config_param = &config_arc;
+					$body
+				}
+				}
+			};
+			(server_handle, Vec::new())
+		}
+	};
+	// Build server with config only (with policies) - without mut
 	(@build_server_config_only $protocol:path, $listener:ident, [$($policy_key:ident: $policy_val:tt),+], $trace:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident| async move $body:block)) => {
 		{
 			let config_arc = $config;
@@ -1472,7 +1563,27 @@ macro_rules! servlet {
 		}
 	};
 
-	// Build server with config only (empty policies)
+	// Build server with config only (empty policies) - with mut
+	(@build_server_config_only $protocol:path, $listener:ident, [], $trace:expr, $config:ident, (|mut $msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident| async move $body:block)) => {
+		{
+			let config_arc = $config;
+			let trace_handle = ::std::sync::Arc::clone(&$trace);
+			let server_handle = $crate::server! {
+				protocol $protocol: $listener,
+				handle: move |mut $msg| {
+					let config_arc = ::std::sync::Arc::clone(&config_arc);
+					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
+				async move {
+					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+					let $config_param = &config_arc;
+					$body
+				}
+				}
+			};
+			(server_handle, Vec::new())
+		}
+	};
+	// Build server with config only (empty policies) - without mut
 	(@build_server_config_only $protocol:path, $listener:ident, [], $trace:expr, $config:ident, (|$msg:ident: $msg_ty:ty, $trace_param:ident, $config_param:ident| async move $body:block)) => {
 		{
 			let config_arc = $config;
