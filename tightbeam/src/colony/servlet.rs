@@ -314,7 +314,7 @@ macro_rules! servlet {
 		config: { $($config_field:ident: $config_type:ty),* $(,)? },
 		handle: |$message:ident, $trace_param:ident, $config_param:ident| async move $handler_body:block
 	) => {
-		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?], [$($($x509_key: $x509_val,)*)?],
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val),*)?], [$($($x509_key: $x509_val),*)?],
 				config_only, {}, { $($config_field: $config_type,)* },
 				|$message, $trace_param, $config_param| $handler_body, [$input], pub, [$(#[$meta])*]);
 	};
@@ -328,7 +328,7 @@ macro_rules! servlet {
 		config: { $($config_field:ident: $config_type:ty),* $(,)? },
 		handle: |$message:ident, $trace_param:ident, $config_param:ident| async move $handler_body:block
 	) => {
-		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val,)*)?], [$($($x509_key: $x509_val,)*)?],
+		servlet!(@generate_with_attrs $servlet_name, $protocol, [$($($policy_key: $policy_val),*)?], [$($($x509_key: $x509_val),*)?],
 				config_only, {}, { $($config_field: $config_type,)* },
 				|$message, $trace_param, $config_param| $handler_body, [$input], , [$(#[$meta])*]);
 	};
@@ -556,7 +556,7 @@ macro_rules! servlet {
 	};
 
 	// Generate with attributes and visibility (new syntax)
-	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*], [$($x509_key:ident: $x509_val:tt,)*],
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], [$($x509_key:ident: $x509_val:tt),*],
 			  config_only, {}, { $($config_field:ident: $config_type:ty,)* },
 			  |$message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr, [$input:ty], pub, [$(#[$meta:meta])*]) => {
 		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, pub, [$(#[$meta])*]);
@@ -565,7 +565,7 @@ macro_rules! servlet {
 				|$message, $trace_param, $config_param| $handler_body);
 		servlet!(@impl_trait_with_input $worker_name, $protocol, $input, { $($config_field: $config_type,)* });
 	};
-	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt,)*], [$($x509_key:ident: $x509_val:tt,)*],
+	(@generate_with_attrs $worker_name:ident, $protocol:path, [$($policy_key:ident: $policy_val:tt),*], [$($x509_key:ident: $x509_val:tt),*],
 			  config_only, {}, { $($config_field:ident: $config_type:ty,)* },
 			  |$message:ident, $trace_param:ident, $config_param:ident| $handler_body:expr, [$input:ty], , [$(#[$meta:meta])*]) => {
 		servlet!(@impl_struct_with_attrs $worker_name, $protocol, { $($config_field: $config_type,)* }, , [$(#[$meta])*]);
@@ -878,7 +878,7 @@ macro_rules! servlet {
 		$crate::paste::paste! {
 			impl $worker_name {
 				pub async fn start(trace: ::std::sync::Arc<$crate::trace::TraceCollector>, config: ::std::sync::Arc<[<$worker_name Conf>]>) -> Result<Self, $crate::TightBeamError> {
-					servlet!(@setup_protocol $protocol, listener, addr $(, with_x509: { $($x509_key: $x509_val),* })?);
+					servlet!(@setup_protocol $protocol, listener, addr, [$($x509_key: $x509_val),*]);
 					let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(trace));
 					let (server_handle, server_pool_handles) = servlet!(@build_server_with_config
 						$protocol, listener, [$($policy_key: $policy_val),*], ::std::sync::Arc::clone(&trace_handle), config,
@@ -1357,6 +1357,16 @@ macro_rules! servlet {
 			.map_err(|e| $crate::TightBeamError::from(e))?;
 		let ($listener, $addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await
 			.map_err(|e| $crate::TightBeamError::from(e))?;
+	};
+
+	// Protocol setup with x509 from array (empty means no x509)
+	(@setup_protocol $protocol:path, $listener:ident, $addr:ident, []) => {
+		servlet!(@setup_protocol $protocol, $listener, $addr);
+	};
+
+	// Protocol setup with x509 from array (non-empty)
+	(@setup_protocol $protocol:path, $listener:ident, $addr:ident, [$($x509_key:ident: $x509_val:tt),+]) => {
+		servlet!(@setup_protocol $protocol, $listener, $addr, with_x509: { $($x509_key: $x509_val),+ });
 	};
 
 	// Protocol setup with x509 encryption

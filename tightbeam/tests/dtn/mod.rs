@@ -25,14 +25,20 @@
 //!
 //! ## Test Structure
 //!
-//! - `types.rs`: Message types and custom error types
-//! - `storage.rs`: Frame persistence and chain verification utilities
-//! - `delay.rs`: Delay simulation for multi-hop scenarios
-//! - `delay_tolerant.rs`: Comprehensive multi-hop DTN test with fault injection
+//! - `clock.rs`: Simulated mission clock with realistic Mars-Earth delays
+//! - `messages.rs`: Rover telemetry, Earth commands, and consensus types
+//! - `faults.rs`: Fault flags and fault handling logic
+//! - `utils.rs`: UUID generator and helper functions
+//! - `servlets.rs`: Earth and Relay servlet definitions
+//! - `types.rs`: Base DTN types and custom error types
+//! - `ultimate.rs`: Ultimate DTN test demonstrating all framework capabilities
 
-// TODO: Fix these - they use Vec<u8> instead of Beamable types
-// pub mod delay;
-// pub mod delay_tolerant;
-// pub mod storage;
+pub mod certs;
+pub mod clock;
+pub mod fault_matrix;
+pub mod faults;
+pub mod messages;
+pub mod servlets;
 pub mod types;
 pub mod ultimate;
+pub mod utils;

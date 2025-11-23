@@ -2,6 +2,7 @@
 
 use tightbeam::Beamable;
 use tightbeam::der::Sequence;
+use tightbeam::TightBeamError;
 
 /// DTN payload for multi-hop communication
 ///
@@ -59,6 +60,44 @@ pub struct LinkDelay {
 impl core::fmt::Display for LinkDelay {
 	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
 		write!(f, "Link delay ({}ms)", self.delay_ms)
+	}
+}
+
+/// Communications fault - transient, resolves after 1-3 retries
+#[derive(Debug, Clone)]
+pub struct CommsFault {
+	pub duration_ms: u64,
+	pub retry_count: u8,
+}
+
+impl core::fmt::Display for CommsFault {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+		write!(f, "Communications fault: {}ms (retry {})", self.duration_ms, self.retry_count)
+	}
+}
+
+impl From<CommsFault> for TightBeamError {
+	fn from(e: CommsFault) -> Self {
+		TightBeamError::InjectedFault(Box::new(e))
+	}
+}
+
+/// Thermal fault - transient, resolves after cooldown cycles
+#[derive(Debug, Clone)]
+pub struct ThermalFault {
+	pub temp_c: i8,
+	pub cycle_count: u8,
+}
+
+impl core::fmt::Display for ThermalFault {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+		write!(f, "Thermal fault: {}°C (cycle {})", self.temp_c, self.cycle_count)
+	}
+}
+
+impl From<ThermalFault> for TightBeamError {
+	fn from(e: ThermalFault) -> Self {
+		TightBeamError::InjectedFault(Box::new(e))
 	}
 }
 
