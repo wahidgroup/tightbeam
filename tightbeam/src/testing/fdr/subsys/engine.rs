@@ -17,6 +17,9 @@ use crate::testing::fdr::config::{Failure, FdrConfig, FdrVerdict, Trace};
 use crate::testing::fdr::explorer::{ExplorationCore, RefinementChecker, SeedResult};
 use crate::testing::specs::csp::Process;
 
+#[cfg(feature = "testing-fmea")]
+use crate::testing::fmea::generate_fmea_report;
+
 #[cfg(feature = "rayon")]
 use crate::testing::specs::csp::State;
 
@@ -70,9 +73,9 @@ where
 		}
 	}
 
-	/// Create new FDR explorer with custom subsystems using Arc<FdrConfig>
+	/// Create new FDR explorer with custom subsystems using `Arc<FdrConfig>`
 	///
-	/// Use this when you've already created an Arc<FdrConfig> to share across subsystems.
+	/// Use this when you've already created an `Arc<FdrConfig>` to share across subsystems.
 	pub fn new_with_arc(process: &'a Process, config: Arc<FdrConfig>, explorer: E, refinement: R) -> Self {
 		Self { process, config, explorer, refinement, verdict: FdrVerdict::default() }
 	}
@@ -86,12 +89,16 @@ where
 			// Explore the specification process with faults injected
 			// This tests if the SPEC correctly models error conditions
 			self.explore_specification_with_faults();
+			#[cfg(feature = "testing-fmea")]
+			self.generate_fmea_if_configured();
 			return self.verdict.clone();
 		}
 
 		// Mode 2: Refinement checking (specs without fault model)
 		if !self.config.specs.is_empty() {
 			self.check_refinement();
+			#[cfg(feature = "testing-fmea")]
+			self.generate_fmea_if_configured();
 			return self.verdict.clone();
 		}
 
@@ -135,6 +142,9 @@ where
 		self.verdict.passed = self.verdict.divergence_free
 			&& self.verdict.deadlock_free
 			&& (self.verdict.is_deterministic || self.verdict.determinism_witness.is_none());
+
+		#[cfg(feature = "testing-fmea")]
+		self.generate_fmea_if_configured();
 
 		self.verdict.clone()
 	}
@@ -217,6 +227,19 @@ where
 		self.verdict.passed = self.verdict.divergence_free
 			&& self.verdict.deadlock_free
 			&& (self.verdict.is_deterministic || self.verdict.determinism_witness.is_none());
+	}
+
+	/// Generate FMEA report if configured
+	#[cfg(feature = "testing-fmea")]
+	fn generate_fmea_if_configured(&mut self) {
+		if let Some(ref fmea_config) = self.config.fmea_config {
+			if fmea_config.auto_generate && !self.verdict.faults_injected.is_empty() {
+				match generate_fmea_report(&self.verdict, self.process, Some(fmea_config.clone())) {
+					Ok(report) => self.verdict.fmea_report = Some(report),
+					Err(e) => eprintln!("Warning: FMEA generation failed: {}", e),
+				}
+			}
+		}
 	}
 
 	/// Check for witnesses to nondeterminism

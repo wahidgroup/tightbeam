@@ -156,6 +156,8 @@ fn build_deterministic_config() -> FdrConfig {
 		process_count: None,
 		scheduler_model: None,
 		fault_model: Some(fault_model),
+		#[cfg(feature = "testing-fmea")]
+		fmea_config: None,
 	}
 }
 
@@ -238,6 +240,8 @@ fn build_probabilistic_config() -> FdrConfig {
 		process_count: None,
 		scheduler_model: None,
 		fault_model: Some(fault_model),
+		#[cfg(feature = "testing-fmea")]
+		fmea_config: None,
 	}
 }
 
@@ -331,6 +335,8 @@ fn build_multi_fault_config() -> FdrConfig {
 		process_count: None,
 		scheduler_model: None,
 		fault_model: Some(fault_model),
+		#[cfg(feature = "testing-fmea")]
+		fmea_config: None,
 	}
 }
 
@@ -434,6 +440,8 @@ fn build_coverage_config() -> FdrConfig {
 		process_count: None,
 		scheduler_model: None,
 		fault_model: Some(fault_model),
+		#[cfg(feature = "testing-fmea")]
+		fmea_config: None,
 	}
 }
 

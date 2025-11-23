@@ -1,7 +1,7 @@
 //! AFL-powered fuzzing support
 //!
 //! CSP-guided fuzzing using `CspOracle` for intelligent state exploration.
-//! All fuzzing is powered by AFL.rs (https://github.com/rust-fuzz/afl.rs).
+//! All fuzzing is powered by AFL.rs (<https://github.com/rust-fuzz/afl.rs>).
 //!
 //! # AFL Integration Architecture
 //!

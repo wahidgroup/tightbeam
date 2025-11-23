@@ -9,7 +9,7 @@
 //! - Labeled Transition Systems (LTS) represent process behavior
 //!
 //! Reference: C.A.R. Hoare, "Communicating Sequential Processes" (1978)
-//! https://www.cs.cmu.edu/~crary/819-f09/Hoare78.pdf
+//! <https://www.cs.cmu.edu/~crary/819-f09/Hoare78.pdf>
 //!
 //! Feature gated: requires `testing-csp`
 
@@ -128,7 +128,7 @@ impl Action {
 	}
 }
 
-/// CSP transition: state --[event]--> state
+/// CSP transition: state --\[event\]--> state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition {
 	pub from: State,
@@ -149,17 +149,17 @@ impl TransitionRelation {
 		Self { transitions: HashMap::new() }
 	}
 
-	/// Add transition: from --[event]--> to
+	/// Add transition: from --\[event\]--> to
 	pub fn add(&mut self, from: State, event: Event, to: State) {
 		self.transitions.entry((from, event)).or_default().push(to);
 	}
 
-	/// Get all target states: from --[event]--> ?
+	/// Get all target states: from --\[event\]--> ?
 	pub fn targets(&self, from: State, event: &Event) -> Option<&[State]> {
 		self.transitions.get(&(from, *event)).map(|v| v.as_slice())
 	}
 
-	/// Check if nondeterministic: from --[event]--> {s1, s2, ...}
+	/// Check if nondeterministic: from --\[event\]--> {s1, s2, ...}
 	pub fn is_nondeterministic(&self, from: State, event: &Event) -> bool {
 		self.transitions.get(&(from, *event)).map(|v| v.len() > 1).unwrap_or(false)
 	}
@@ -238,7 +238,7 @@ impl Process {
 		&self.hidden
 	}
 
-	/// Execute transition: s --[e]--> ?
+	/// Execute transition: s --\[e\]--> ?
 	pub fn step(&self, state: State, event: &Event) -> Vec<State> {
 		self.transitions.targets(state, event).map(|v| v.to_vec()).unwrap_or_default()
 	}

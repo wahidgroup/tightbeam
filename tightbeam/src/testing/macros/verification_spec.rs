@@ -475,7 +475,7 @@ impl BuiltAssertSpec {
 // Payload encoding trait (AssertEncode) for tb_assert! ergonomic payloads
 // ---------------------------------------------------------------------------
 /// Trait converting payload values into a canonical byte representation.
-/// Numeric primitives are big-endian; &str/&[u8]/Vec<u8> zero-copy.
+/// Numeric primitives are big-endian; &str/&\[u8\]/`Vec<u8>` zero-copy.
 pub trait AssertEncode {
 	fn tb_payload_bytes(&self) -> Cow<'_, [u8]>;
 }

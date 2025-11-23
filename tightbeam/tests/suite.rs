@@ -44,6 +44,10 @@ mod colony;
 #[cfg(feature = "testing-fault")]
 mod fault;
 
+// FMEA tests
+#[cfg(feature = "testing-fmea")]
+mod fmea;
+
 // Delay-Tolerant Networking tests
 // #[cfg(all(feature = "testing-fault", feature = "testing-fdr"))]
 // mod dtn;

@@ -39,7 +39,7 @@ impl Piece {
 		Self { kind, color: Color::Black }
 	}
 
-	/// Convert u8 to Option<Piece> (0 = empty, 1-12 = pieces)
+	/// Convert u8 to `Option<Piece>` (0 = empty, 1-12 = pieces)
 	pub const fn from_u8(value: u8) -> Option<Self> {
 		match value {
 			0 => None,

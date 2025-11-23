@@ -26,10 +26,7 @@ fn build_fdr_config(
 		specs,
 		fail_fast: true,
 		expect_failure: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
-		fault_model: None,
+		..Default::default()
 	}
 }
 

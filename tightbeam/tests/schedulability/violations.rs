@@ -57,10 +57,7 @@ tightbeam::tb_scenario! {
 		specs: vec![RmaNotSchedulableProcess::process()],
 		fail_fast: false,
 		expect_failure: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
-		fault_model: None,
+		..Default::default()
 	},
 	environment Bare {
 		exec: |trace| {
@@ -135,10 +132,7 @@ tightbeam::tb_scenario! {
 		specs: vec![EdfNotSchedulableProcess::process()],
 		fail_fast: false,
 		expect_failure: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
-		fault_model: None,
+		..Default::default()
 	},
 	environment Bare {
 		exec: |trace| {
@@ -207,10 +201,7 @@ tightbeam::tb_scenario! {
 		specs: vec![ProcessWithoutTiming::process()],
 		fail_fast: false,
 		expect_failure: false,
-		scheduler_count: None,
-		process_count: None,
-		scheduler_model: None,
-		fault_model: None,
+		..Default::default()
 	},
 	environment Bare {
 		exec: |trace| {

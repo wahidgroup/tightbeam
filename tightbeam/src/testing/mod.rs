@@ -16,6 +16,8 @@ pub mod utils;
 pub mod fault;
 #[cfg(feature = "testing-fdr")]
 pub mod fdr;
+#[cfg(feature = "testing-fmea")]
+pub mod fmea;
 #[cfg(feature = "testing-fuzz")]
 pub mod fuzz;
 #[cfg(feature = "testing-timing")]
@@ -33,9 +35,10 @@ pub use utils::*;
 pub use fault::{ProcessEvent, ProcessState};
 #[cfg(feature = "testing-fault")]
 pub use fdr::FaultModel;
-
 #[cfg(feature = "testing-fdr")]
 pub use fdr::*;
+#[cfg(feature = "testing-fmea")]
+pub use fmea::{FailureMode, FmeaConfig, FmeaReport, SeverityScale};
 
 #[cfg(test)]
 mod tests {

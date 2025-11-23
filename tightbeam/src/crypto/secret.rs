@@ -5,7 +5,7 @@
 //! - Strict ownership (no Clone/Copy)
 //! - Explicit access via ExposeSecret/ExposeSecretMut
 //! - Zeroize on drop for the inner value
-//! - Blanket From<T> for ergonomic construction
+//! - Blanket `From<T>` for ergonomic construction
 
 use core::str::FromStr;
 use core::{any, fmt};
@@ -60,7 +60,7 @@ impl<S: Zeroize + ?Sized> fmt::Debug for Secret<S> {
 	}
 }
 
-/// Blanket conversion from owning values into Secret<T>.
+/// Blanket conversion from owning values into `Secret<T>`.
 impl<S> From<S> for Secret<S>
 where
 	S: Zeroize + Encode + for<'a> Decode<'a>,
@@ -70,7 +70,7 @@ where
 	}
 }
 
-/// Conversion from boxed values into Secret<T>.
+/// Conversion from boxed values into `Secret<T>`.
 impl<S: Zeroize + ?Sized> From<Box<S>> for Secret<S> {
 	fn from(b: Box<S>) -> Self {
 		Secret::new(b)
@@ -84,7 +84,7 @@ where
 	const TAG: der::Tag = S::TAG;
 }
 
-/// Secret slice alias (owns Box<[T]>)
+/// Secret slice alias (owns `Box<[T]>`)
 pub type SecretSlice<T> = Secret<[T]>;
 
 impl<T> From<Vec<T>> for SecretSlice<T>
@@ -97,7 +97,7 @@ where
 	}
 }
 
-/// Secret string alias (owns Box<str>)
+/// Secret string alias (owns `Box<str>`)
 pub type SecretString = Secret<str>;
 
 impl From<String> for SecretString {

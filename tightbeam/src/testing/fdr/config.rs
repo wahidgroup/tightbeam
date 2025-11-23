@@ -16,6 +16,8 @@ use crate::utils::BasisPoints;
 
 #[cfg(feature = "testing-fault")]
 use crate::testing::fault::{ProcessEvent, ProcessState};
+#[cfg(feature = "testing-fmea")]
+use crate::testing::fmea::{FmeaConfig, FmeaReport};
 
 /// CSP trace: sequence of observable events
 pub type Trace = Vec<Event>;
@@ -173,7 +175,7 @@ pub struct FdrConfig {
 	pub timeout_ms: u64,
 
 	/// Additional processes for refinement checking
-	/// If provided, check: specs[0] ⊑ main_process
+	/// If provided, check: specs\[0\] ⊑ main_process
 	pub specs: Vec<Process>,
 
 	/// Stop refinement checking on first violation (fast-fail mode)
@@ -207,6 +209,10 @@ pub struct FdrConfig {
 	/// When provided, enables CSP state-driven fault injection during FDR exploration
 	#[cfg(feature = "testing-fault")]
 	pub fault_model: Option<FaultModel>,
+
+	/// FMEA configuration
+	#[cfg(feature = "testing-fmea")]
+	pub fmea_config: Option<FmeaConfig>,
 }
 
 impl Default for FdrConfig {
@@ -227,6 +233,8 @@ impl Default for FdrConfig {
 			scheduler_model: None,
 			#[cfg(feature = "testing-fault")]
 			fault_model: None,
+			#[cfg(feature = "testing-fmea")]
+			fmea_config: None,
 		}
 	}
 }
@@ -369,6 +377,10 @@ pub struct FdrVerdict {
 	/// Number of failed error recoveries
 	#[cfg(feature = "testing-fault")]
 	pub error_recovery_failed: usize,
+
+	/// FMEA report
+	#[cfg(feature = "testing-fmea")]
+	pub fmea_report: Option<FmeaReport>,
 }
 
 impl Default for FdrVerdict {
@@ -397,6 +409,8 @@ impl Default for FdrVerdict {
 			error_recovery_successful: 0,
 			#[cfg(feature = "testing-fault")]
 			error_recovery_failed: 0,
+			#[cfg(feature = "testing-fmea")]
+			fmea_report: None,
 		}
 	}
 }

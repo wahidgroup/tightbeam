@@ -70,27 +70,27 @@ pub const SIGNER_ECDSA_WITH_SHA3_256: ObjectIdentifier = ObjectIdentifier::new_u
 pub const SIGNER_ECDSA_WITH_SHA3_512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.12");
 
 /// id-aes128-gcm - AES-GCM with 128-bit key
-/// See RFC 5084 - https://datatracker.ietf.org/doc/html/rfc5084
+/// See RFC 5084 - <https://datatracker.ietf.org/doc/html/rfc5084>
 /// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.6>`
 pub const AES_128_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.6");
 
 /// id-aes256-gcm - AES-GCM with 256-bit key
-/// See RFC 5084 - https://datatracker.ietf.org/doc/html/rfc5084
+/// See RFC 5084 - <https://datatracker.ietf.org/doc/html/rfc5084>
 /// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.46>`
 pub const AES_256_GCM: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46");
 
 /// id-aes128-wrap - AES Key Wrap with 128-bit key
-/// See RFC 3394 - https://datatracker.ietf.org/doc/html/rfc3394
+/// See RFC 3394 - <https://datatracker.ietf.org/doc/html/rfc3394>
 /// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.5>`
 pub const AES_128_WRAP: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.5");
 
 /// id-aes192-wrap - AES Key Wrap with 192-bit key
-/// See RFC 3394 - https://datatracker.ietf.org/doc/html/rfc3394
+/// See RFC 3394 - <https://datatracker.ietf.org/doc/html/rfc3394>
 /// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.25>`
 pub const AES_192_WRAP: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.25");
 
 /// id-aes256-wrap - AES Key Wrap with 256-bit key
-/// See RFC 3394 - https://datatracker.ietf.org/doc/html/rfc3394
+/// See RFC 3394 - <https://datatracker.ietf.org/doc/html/rfc3394>
 /// See `<https://oid-base.com/get/2.16.840.1.101.3.4.1.45>`
 pub const AES_256_WRAP: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.45");
 
