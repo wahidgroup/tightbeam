@@ -1,6 +1,8 @@
-//! Clean declarative testing macro & builder layer (legacy forms removed).
-//! Layer 1 verification specs live in `verification_spec`, Layer 2 CSP specs
-//! in `process_spec`, and this file retains the shared helpers plus `tb_scenario!`.
+//! Testing macro layer providing unified `tb_scenario!` macro and helpers.
+//!
+//! - Layer 1 (Assertions): `verification_spec`
+//! - Layer 2 (CSP): `process_spec`
+//! - Layer 3 (FDR): integrated via `tb_scenario!`
 
 #![allow(unexpected_cfgs)]
 
@@ -220,13 +222,101 @@ macro_rules! jitter {
 	}};
 }
 
-// ---------------------------------------------------------------------------
-// Type aliases
-// ---------------------------------------------------------------------------
+// Helper Functions for tb_scenario!
 
-// Removed: AssertionCollector type alias - use TraceCollector directly
+/// Helper function for exec closures (synchronous, bare/worker environments)
+#[doc(hidden)]
+pub fn __tb_call_exec_closure<F>(closure: F, trace: crate::trace::TraceCollector) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(crate::trace::TraceCollector) -> Result<(), crate::TightBeamError>,
+{
+	closure(trace)
+}
 
-// InstrumentationMode removed - use trace: TraceConfig instead
+/// Helper function for exec closures with Arc (multi-specs bare environment)
+#[doc(hidden)]
+pub fn __tb_call_exec_closure_arc<F>(
+	closure: F,
+	trace: std::sync::Arc<crate::trace::TraceCollector>,
+) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(std::sync::Arc<crate::trace::TraceCollector>) -> Result<(), crate::TightBeamError>,
+{
+	closure(trace)
+}
+
+/// Helper function for setup closures (worker environment)
+#[doc(hidden)]
+pub fn __tb_call_setup_closure<F, W>(closure: F, trace: crate::trace::TraceCollector) -> W
+where
+	F: FnOnce(crate::trace::TraceCollector) -> W,
+{
+	closure(trace)
+}
+
+/// Helper function for setup closures with fuzz input
+#[doc(hidden)]
+pub fn __tb_call_setup_closure_fuzz<F, W>(closure: F, trace: crate::trace::TraceCollector, fuzz_input: Vec<u8>) -> W
+where
+	F: FnOnce(crate::trace::TraceCollector, Vec<u8>) -> W,
+{
+	closure(trace, fuzz_input)
+}
+
+/// Helper function for stimulus closures (worker environment, synchronous)
+#[doc(hidden)]
+pub fn __tb_call_stimulus_closure<F, W>(
+	closure: F,
+	trace: crate::trace::TraceCollector,
+	worker: &mut W,
+) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(crate::trace::TraceCollector, &mut W) -> Result<(), crate::TightBeamError>,
+{
+	closure(trace, worker)
+}
+
+/// Helper function for stimulus closures with fuzz input
+#[doc(hidden)]
+pub fn __tb_call_stimulus_closure_fuzz<F, W>(
+	closure: F,
+	trace: std::sync::Arc<crate::trace::TraceCollector>,
+	worker: &mut W,
+	fuzz_input: Vec<u8>,
+) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(std::sync::Arc<crate::trace::TraceCollector>, &mut W, Vec<u8>) -> Result<(), crate::TightBeamError>,
+{
+	closure(trace, worker, fuzz_input)
+}
+
+/// Helper function for stimulus closures (worker environment, Arc)
+#[doc(hidden)]
+pub fn __tb_call_stimulus_closure_arc<F, W>(
+	closure: F,
+	trace: std::sync::Arc<crate::trace::TraceCollector>,
+	worker: &mut W,
+) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(std::sync::Arc<crate::trace::TraceCollector>, &mut W) -> Result<(), crate::TightBeamError>,
+{
+	closure(trace, worker)
+}
+
+/// Helper function for client closures (async, ServiceClient environment)
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub async fn __tb_call_client_closure_async<F, Fut, T>(
+	closure: F,
+	trace: crate::trace::TraceCollector,
+	client: T,
+) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(crate::trace::TraceCollector, T) -> Fut,
+	Fut: core::future::Future<Output = Result<(), crate::TightBeamError>>,
+{
+	closure(trace, client).await
+}
 
 /// tb_scenario! macro - MVP implementation
 ///
@@ -286,7 +376,6 @@ macro_rules! tb_scenario {
 			let server_setup_result = __call_server_closure($server_closure, trace_server).await;
 			let (server_handle, server_addr) = server_setup_result.expect("Server setup failed");
 
-			// Default protocol to TokioListener if not specified
 			#[allow(unused_imports)]
 			use $crate::tb_scenario;
 			type ProtocolType = tb_scenario!(@default_protocol $($protocol)?);
@@ -297,18 +386,7 @@ macro_rules! tb_scenario {
 			let client = <ProtocolType as $crate::transport::Protocol>::create_transport(stream);
 
 			// Execute client closure - use helper to enable inference
-			async fn __call_client_closure<F, Fut, T>(
-				closure: F,
-				trace: $crate::trace::TraceCollector,
-				client: T,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce($crate::trace::TraceCollector, T) -> Fut,
-				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
-			{
-				closure(trace, client).await
-			}
-			let client_result = __call_client_closure($client_closure, trace_client, client).await;
+			let client_result = $crate::testing::macros::__tb_call_client_closure_async($client_closure, trace_client, client).await;
 
 			// Collect trace from shared collector
 			let mut trace = $crate::trace::ConsumedTrace::new();
@@ -369,7 +447,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Create trace collector from config if provided, otherwise use default
 			#[cfg(feature = "instrument")]
 			let trace_collector: $crate::trace::TraceCollector = {
 				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -377,15 +454,10 @@ macro_rules! tb_scenario {
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
 
-			// Environment-specific execution
 			let trace_exec = trace_collector.share();
-			$crate::tb_scenario!(@def_exec_closure_helper);
-			let exec_result = __call_exec_closure($exec_closure, trace_exec);
+			let exec_result = $crate::testing::macros::__tb_call_exec_closure($exec_closure, trace_exec);
 
-			// Common finalization
-			let mut trace = $crate::tb_scenario!(@setup_trace);
-			trace.populate_from_collector(&trace_collector);
-			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+			let trace = $crate::tb_scenario!(@trace_lifecycle trace_collector, exec_result);
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
 				single_spec: $spec,
@@ -418,7 +490,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Create trace collector from config if provided, otherwise use default
 			#[cfg(feature = "instrument")]
 			let trace_collector: $crate::trace::TraceCollector = {
 				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -426,15 +497,10 @@ macro_rules! tb_scenario {
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
 
-			// Environment-specific execution
 			let trace_exec = trace_collector.share();
-			$crate::tb_scenario!(@def_exec_closure_helper);
-			let exec_result = __call_exec_closure($exec_closure, trace_exec);
+			let exec_result = $crate::testing::macros::__tb_call_exec_closure($exec_closure, trace_exec);
 
-			// Common finalization
-			let mut trace = $crate::tb_scenario!(@setup_trace);
-			trace.populate_from_collector(&trace_collector);
-			$crate::tb_scenario!(@finalize_trace trace, exec_result);
+			let trace = $crate::tb_scenario!(@trace_lifecycle trace_collector, exec_result);
 
 			let verification_result = $crate::__tb_scenario_verify_impl! {
 				single_spec: $spec,
@@ -468,7 +534,6 @@ macro_rules! tb_scenario {
 		#[cfg(fuzzing)]
 		fn main() {
 			::afl::fuzz!(|data: &[u8]| {
-				// Create trace collector from config if provided
 				#[cfg(feature = "instrument")]
 				let trace_collector: $crate::trace::TraceCollector = {
 					$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -482,7 +547,6 @@ macro_rules! tb_scenario {
 					<$csp>::process()
 				);
 
-				// Environment-specific execution
 				let trace_exec = trace_collector.share();
 				fn __call_exec_closure<F>(
 					closure: F,
@@ -493,7 +557,7 @@ macro_rules! tb_scenario {
 				{
 					closure(trace)
 				}
-				let exec_result = __call_exec_closure($exec_closure, trace_exec);
+				let exec_result = $crate::testing::macros::__tb_call_exec_closure($exec_closure, trace_exec);
 
 				// Report CSP exploration to IJON (if feature enabled)
 				#[cfg(feature = "testing-fuzz-ijon")]
@@ -510,10 +574,7 @@ macro_rules! tb_scenario {
 						unsafe { ::afl::ijon_hashint(trace_depth, state_hash); }
 					}
 				}
-				// Common finalization
-				let mut trace = $crate::tb_scenario!(@setup_trace);
-				trace.populate_from_collector(&trace_collector);
-				$crate::tb_scenario!(@finalize_trace trace, exec_result);
+				let trace = $crate::tb_scenario!(@trace_lifecycle trace_collector, exec_result);
 
 				let verification_result = $crate::__tb_scenario_verify_impl! {
 					single_spec: $spec,
@@ -522,13 +583,11 @@ macro_rules! tb_scenario {
 					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 				};
 
-				// AFL fuzz targets should not panic on failure - just return
 				let _ = $crate::tb_scenario!(@propagate_result exec_result, verification_result);
 			});
 		}
 
-		// Stub main() for IDE - rust-analyzer needs this to see a main() function
-		// This is only compiled when NOT fuzzing, so it won't conflict with the generated main() above
+		// Stub for IDE support (not compiled when fuzzing)
 		#[allow(unexpected_cfgs)]
 		#[cfg(not(fuzzing))]
 		#[allow(dead_code)]
@@ -562,32 +621,11 @@ macro_rules! tb_scenario {
 					<$csp>::process()
 				);
 
-				// Environment-specific execution
 				let trace_exec = trace_collector.share();
-				fn __call_exec_closure<F>(
-					closure: F,
-					trace: $crate::trace::TraceCollector,
-				) -> Result<(), $crate::TightBeamError>
-				where
-					F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
-				{
-					closure(trace)
-				}
-				let exec_result = __call_exec_closure($exec_closure, trace_exec);
+				let exec_result = $crate::testing::macros::__tb_call_exec_closure($exec_closure, trace_exec);
 
-				// Common finalization
-				let mut trace = $crate::tb_scenario!(@setup_trace);
-				trace.populate_from_collector(&trace_collector);
-				$crate::tb_scenario!(@finalize_trace trace, exec_result);
-
-				let verification_result = $crate::__tb_scenario_verify_impl! {
-					single_spec: $spec,
-					trace: trace,
-					csp: $csp,
-					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
-				};
-
-				$crate::tb_scenario!(@propagate_result exec_result, verification_result)
+				let trace = $crate::tb_scenario!(@trace_lifecycle trace_collector, exec_result);
+				$crate::tb_scenario!(@verify_and_propagate exec_result, trace, single_spec: $spec, csp: $csp $(, hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? })?)
 			});
 
 			result.expect(concat!("Test failed: ", stringify!($test_name)));
@@ -611,7 +649,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
 			let trace_collector: $crate::trace::TraceCollector = {
 				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -623,12 +660,9 @@ macro_rules! tb_scenario {
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 			];
 
-			// Environment-specific execution
 			let trace_exec = trace_collector.share();
-			$crate::tb_scenario!(@def_exec_closure_helper);
-			let exec_result = __call_exec_closure($exec_closure, trace_exec);
+			let exec_result = $crate::testing::macros::__tb_call_exec_closure($exec_closure, trace_exec);
 
-			// Common finalization
 			let mut trace = $crate::tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
 			$crate::tb_scenario!(@finalize_trace trace, exec_result);
@@ -665,41 +699,17 @@ macro_rules! tb_scenario {
 		fn $test_name() {
 			// Fuzz wrapper handles iteration
 			let result = $crate::tb_scenario!(@fuzz_wrapper $fuzz, |fuzz_input| {
-				// Environment-specific execution
 				let trace_collector = $crate::trace::TraceCollector::new();
 				let trace_setup = trace_collector.share();
 				let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 				let fuzz_for_setup = fuzz_input.clone();
 				let fuzz_for_stimulus = fuzz_input.clone();
 
-				// Helper functions to enable type inference
-				fn __call_setup_closure<F, W>(
-					closure: F,
-					trace: $crate::trace::TraceCollector,
-					fuzz_input: Vec<u8>,
-				) -> W
-				where
-					F: FnOnce($crate::trace::TraceCollector, Vec<u8>) -> W,
-				{
-					closure(trace, fuzz_input)
-				}
 
-				fn __call_stimulus_closure<F, W>(
-					closure: F,
-					trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-					worker: &mut W,
-					fuzz_input: Vec<u8>,
-				) -> Result<(), $crate::TightBeamError>
-				where
-					F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W, Vec<u8>) -> Result<(), $crate::TightBeamError>,
-				{
-					closure(trace, worker, fuzz_input)
-				}
 
-				let mut worker = __call_setup_closure($setup_closure, trace_setup, fuzz_for_setup);
-				let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker, fuzz_for_stimulus);
+				let mut worker = $crate::testing::macros::__tb_call_setup_closure_fuzz($setup_closure, trace_setup, fuzz_for_setup);
+				let exec_result = $crate::testing::macros::__tb_call_stimulus_closure_fuzz($stimulus_closure, trace_stimulus, &mut worker, fuzz_for_stimulus);
 
-				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
 				$crate::tb_scenario!(@finalize_trace trace, exec_result);
@@ -1207,7 +1217,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
 			let trace_collector: $crate::trace::TraceCollector = {
 				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -1215,34 +1224,11 @@ macro_rules! tb_scenario {
 			#[cfg(not(feature = "instrument"))]
 			let trace_collector = $crate::trace::TraceCollector::new();
 			let trace_setup = trace_collector.share();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
+		let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
-			// Helper functions to enable type inference (synchronous)
-			fn __call_setup_closure<F, W>(
-				closure: F,
-				trace: $crate::trace::TraceCollector,
-			) -> W
-			where
-				F: FnOnce($crate::trace::TraceCollector) -> W,
-			{
-				closure(trace)
-			}
+		let mut worker = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
+		let exec_result = $crate::testing::macros::__tb_call_stimulus_closure_arc($stimulus_closure, trace_stimulus, &mut worker);
 
-			fn __call_stimulus_closure<F, W>(
-				closure: F,
-				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-				worker: &mut W,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W) -> Result<(), $crate::TightBeamError>,
-			{
-				closure(trace, worker)
-			}
-
-			let mut worker = __call_setup_closure($setup_closure, trace_setup);
-			let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
-
-			// Common finalization
 			let mut trace = $crate::tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
 			$crate::tb_scenario!(@finalize_trace trace, exec_result);
@@ -1276,7 +1262,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
 			let trace_collector: $crate::trace::TraceCollector = {
 				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -1288,36 +1273,12 @@ macro_rules! tb_scenario {
 				$( $spec_expr.expect(concat!("Spec version not found: ", stringify!($spec_expr))) ),+
 			];
 
-			// Environment-specific execution
 			let trace_setup = trace_collector.share();
-			let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
+		let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
-			// Helper functions to enable type inference (synchronous)
-			fn __call_setup_closure<F, W>(
-				closure: F,
-				trace: $crate::trace::TraceCollector,
-			) -> W
-			where
-				F: FnOnce($crate::trace::TraceCollector) -> W,
-			{
-				closure(trace)
-			}
+		let mut worker = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
+		let exec_result = $crate::testing::macros::__tb_call_stimulus_closure_arc($stimulus_closure, trace_stimulus, &mut worker);
 
-			fn __call_stimulus_closure<F, W>(
-				closure: F,
-				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-				worker: &mut W,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>, &mut W) -> Result<(), $crate::TightBeamError>,
-			{
-				closure(trace, worker)
-			}
-
-			let mut worker = __call_setup_closure($setup_closure, trace_setup);
-			let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
-
-			// Common finalization
 			let mut trace = $crate::tb_scenario!(@setup_trace);
 			trace.populate_from_collector(&trace_collector);
 			$crate::tb_scenario!(@finalize_trace trace, exec_result);
@@ -1354,7 +1315,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
 			let trace_collector_base: $crate::trace::TraceCollector = {
 				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -1395,9 +1355,8 @@ macro_rules! tb_scenario {
 				{
 					closure(trace, client).await
 				}
-				let client_result = __call_client_closure($client_closure, trace_client, client).await;
+				let client_result = $crate::testing::macros::__tb_call_client_closure_async($client_closure, trace_client, client).await;
 
-				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
 				$crate::tb_scenario!(@finalize_trace trace, client_result);
@@ -1439,7 +1398,6 @@ macro_rules! tb_scenario {
 	) => {
 		#[test]
 		fn $test_name() {
-			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
 			let trace_collector_base: $crate::trace::TraceCollector = {
 				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -1484,9 +1442,8 @@ macro_rules! tb_scenario {
 				{
 					closure(trace, client).await
 				}
-				let client_result = __call_client_closure($client_closure, trace_client, client).await;
+				let client_result = $crate::testing::macros::__tb_call_client_closure_async($client_closure, trace_client, client).await;
 
-				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
 				$crate::tb_scenario!(@finalize_trace trace, client_result);
@@ -1507,8 +1464,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Bare environment variant (single spec: Type form) =====
-	// Pattern with only on_pass
+	// Bare environment variant (single spec: Type form)
 	(
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
@@ -1524,7 +1480,6 @@ macro_rules! tb_scenario {
 	) => {
 		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? $(hooks: { on_pass: $on_pass, },)? exec: $exec_closure)
 	};
-	// Pattern with only on_fail
 	(
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
@@ -1540,7 +1495,6 @@ macro_rules! tb_scenario {
 	) => {
 		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(instrumentation: $instr_cfg,)? $(hooks: { on_fail: $on_fail },)? exec: $exec_closure)
 	};
-	// Pattern with both hooks
 	(
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
@@ -1557,7 +1511,6 @@ macro_rules! tb_scenario {
 	) => {
 		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(trace: $trace_cfg,)? $(hooks: { on_pass: $on_pass, on_fail: $on_fail },)? exec: $exec_closure)
 	};
-	// Pattern without hooks
 	(
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
@@ -1571,7 +1524,7 @@ macro_rules! tb_scenario {
 		tb_scenario!(@execute Bare, single_spec, $spec, $(csp: $csp,)? $(fdr: $fdr_config,)? $(trace: $trace_cfg,)? exec: $exec_closure)
 	};
 
-	// ===== Bare environment variant (multiple specs: [...] form) =====
+	// Bare environment variant (multiple specs: [...] form)
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
@@ -1585,7 +1538,6 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {{
-		// Create trace collector from config if provided
 		#[allow(unused_variables)]
 		#[cfg(feature = "instrument")]
 		let trace_collector_base: $crate::trace::TraceCollector = {
@@ -1601,21 +1553,9 @@ macro_rules! tb_scenario {
 		// Environment-specific execution
 		let trace_collector = ::std::sync::Arc::new(trace_collector_base.share());
 		let trace_exec = ::std::sync::Arc::clone(&trace_collector);
-		fn __call_exec_closure<F>(
-			closure: F,
-			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce(::std::sync::Arc<$crate::trace::TraceCollector>) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace)
-		}
-		let exec_result = __call_exec_closure($exec_closure, trace_exec);
+		let exec_result = $crate::testing::macros::__tb_call_exec_closure_arc($exec_closure, trace_exec);
 
-		// Common finalization
-		let mut trace = $crate::tb_scenario!(@setup_trace);
-		trace.populate_from_collector(trace_collector.as_ref());
-		$crate::tb_scenario!(@finalize_trace trace, exec_result);
+		let trace = $crate::tb_scenario!(@trace_lifecycle_arc trace_collector, exec_result);
 
 		let verification_result = $crate::__tb_scenario_verify_impl! {
 			multi_specs: specs,
@@ -1627,7 +1567,7 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario!(@propagate_result exec_result, verification_result)
 	}};
 
-	// ===== Worker environment variant (single spec: Type form) =====
+	// Worker environment variant (single spec: Type form)
 	(
 		spec: $spec:ty,
 		$(fdr: $fdr_config:expr,)?
@@ -1642,7 +1582,6 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {{
-		// Create trace collector from config if provided
 		#[cfg(feature = "instrument")]
 		let trace_collector: $crate::trace::TraceCollector = {
 			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -1652,15 +1591,9 @@ macro_rules! tb_scenario {
 		let trace_setup = trace_collector.share();
 		let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
-		// Helper functions to enable type inference (synchronous)
-		$crate::tb_scenario!(@def_worker_setup_helper);
+		let mut worker = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
+		let exec_result = $crate::testing::macros::__tb_call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
 
-		$crate::tb_scenario!(@def_worker_stimulus_helper);
-
-		let mut worker = __call_setup_closure($setup_closure, trace_setup);
-		let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
-
-		// Common finalization
 		let mut trace = $crate::tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
 		$crate::tb_scenario!(@finalize_trace trace, exec_result);
@@ -1675,7 +1608,7 @@ macro_rules! tb_scenario {
 		$crate::tb_scenario!(@propagate_result exec_result, verification_result)
 	}};
 
-	// ===== Worker environment variant (multiple specs: [...] form) =====
+	// Worker environment variant (multiple specs: [...] form)
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
@@ -1690,7 +1623,6 @@ macro_rules! tb_scenario {
 		})?
 		$(,)?
 	) => {{
-		// Create trace collector from config if provided
 		#[cfg(feature = "instrument")]
 		let trace_collector: $crate::trace::TraceCollector = {
 			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -1707,15 +1639,9 @@ macro_rules! tb_scenario {
 		let trace_setup = trace_collector.share();
 		let trace_stimulus = ::std::sync::Arc::new(trace_collector.share());
 
-		// Helper functions to enable type inference (synchronous)
-		$crate::tb_scenario!(@def_worker_setup_helper);
+		let mut worker = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
+		let exec_result = $crate::testing::macros::__tb_call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
 
-		$crate::tb_scenario!(@def_worker_stimulus_helper);
-
-		let mut worker = __call_setup_closure($setup_closure, trace_setup);
-		let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
-
-		// Common finalization
 		let mut trace = $crate::tb_scenario!(@setup_trace);
 		trace.populate_from_collector(&trace_collector);
 		$crate::tb_scenario!(@finalize_trace trace, exec_result);
@@ -1731,7 +1657,6 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== ServiceClient environment - user provides complete server setup =====
-	// User receives assertions collector for both server and client
 	(
 		spec: $spec:ty,
 		$(csp: $csp:ty,)?
@@ -1761,7 +1686,7 @@ macro_rules! tb_scenario {
 		)
 	};
 
-	// ===== ServiceClient environment variant (multiple specs: [...] form) =====
+	// ServiceClient environment variant (multiple specs: [...] form)
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
@@ -1789,9 +1714,7 @@ macro_rules! tb_scenario {
 		)
 	};
 
-	// Instrumentation helpers removed - instrumentation now handled by TraceCollector
-
-	// ===== Internal: Trace collector creation =====
+	// Internal: Trace collector creation
 	(@create_trace_collector) => {
 		$crate::trace::TraceCollector::new()
 	};
@@ -1799,31 +1722,7 @@ macro_rules! tb_scenario {
 		$crate::trace::TraceCollector::from($trace_cfg)
 	};
 
-	// ===== Internal: Critical closure helper functions (SINGLE SOURCE OF TRUTH) =====
-	// These function definitions are the critical logic that must exist only once.
-	// Any changes to closure calling semantics should be made here.
-
-	(@def_exec_closure_helper) => {
-		fn __call_exec_closure<F>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace)
-		}
-	};
-
-	(@def_worker_setup_helper) => {
-		$crate::tb_scenario!(@def_worker_setup_helper);
-	};
-
-	(@def_worker_stimulus_helper) => {
-		$crate::tb_scenario!(@def_worker_stimulus_helper);
-	};
-
-	// ===== Internal: Common trace setup/teardown =====
+	// Internal: Common trace setup/teardown
 	(@setup_trace) => {{
 		$crate::trace::ConsumedTrace::new()
 	}};
@@ -1835,6 +1734,28 @@ macro_rules! tb_scenario {
 		}
 	}};
 
+	// ===== Unified trace lifecycle (setup + populate + finalize) =====
+	(@trace_lifecycle $trace_collector:expr, $exec_result:expr) => {{
+		let mut trace = $crate::trace::ConsumedTrace::new();
+		trace.populate_from_collector(&$trace_collector);
+		trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
+		if $exec_result.is_err() {
+			trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
+		}
+		trace
+	}};
+
+	// Arc version for multi-specs bare environment
+	(@trace_lifecycle_arc $trace_collector:expr, $exec_result:expr) => {{
+		let mut trace = $crate::trace::ConsumedTrace::new();
+		trace.populate_from_collector($trace_collector.as_ref());
+		trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
+		if $exec_result.is_err() {
+			trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
+		}
+		trace
+	}};
+
 	(@run_worker_future $future:expr) => {{
 		$crate::colony::worker::block_on_worker_future($future)
 	}};
@@ -1843,7 +1764,6 @@ macro_rules! tb_scenario {
 
 	// ===== Common execution logic helper =====
 	(@common_exec_logic $exec_result:expr, $spec:tt, $spec_type:tt, $($trace_cfg:expr)?, $($csp:ty)?, $($hooks:block)?) => {{
-		// Create trace collector from config if provided
 		#[cfg(feature = "instrument")]
 		let trace_collector: $crate::trace::TraceCollector = {
 			$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -1909,15 +1829,6 @@ macro_rules! tb_scenario {
 	(@environment_exec Bare, $trace_collector:expr, $exec_closure:expr) => {{
 		let trace_exec = $trace_collector.share();
 
-		fn __call_exec_closure<F>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace)
-		}
 
 		__call_exec_closure($exec_closure, trace_exec)
 	}};
@@ -1925,22 +1836,8 @@ macro_rules! tb_scenario {
 	(@environment_exec Worker, $trace_collector:expr, $setup_closure:expr, $stimulus_closure:expr) => {{
 		let trace_setup = $trace_collector.share();
 		let trace_stimulus = $trace_collector.share();
-
-		$crate::tb_scenario!(@def_worker_setup_helper);
-
-		fn __call_stimulus_closure<F, W>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-			worker: &mut W,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce($crate::trace::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace, worker)
-		}
-
-		let mut worker = __call_setup_closure($setup_closure, trace_setup);
-		__call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker)
+		let mut worker = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
+		$crate::testing::macros::__tb_call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker)
 	}};
 
 	(@environment_exec ServiceClient, $trace_collector:expr,
@@ -2009,18 +1906,7 @@ macro_rules! tb_scenario {
 				}
 			};
 
-			async fn __call_client_closure<F, Fut, T>(
-				closure: F,
-				trace: $crate::trace::TraceCollector,
-				client: T,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce($crate::trace::TraceCollector, T) -> Fut,
-				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
-			{
-				closure(trace, client).await
-			}
-			let client_result = __call_client_closure($client_closure, trace_client, client).await;
+			let client_result = $crate::testing::macros::__tb_call_client_closure_async($client_closure, trace_client, client).await;
 
 			servlet_instance.stop();
 
@@ -2069,17 +1955,8 @@ macro_rules! tb_scenario {
 		let trace_exec = trace_collector.share();
 
 		// Helper function to enable type inference for exec closure (synchronous)
-		fn __call_exec_closure<F>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace)
-		}
 
-		let exec_result = __call_exec_closure($exec_closure, trace_exec);
+		let exec_result = $crate::testing::macros::__tb_call_exec_closure($exec_closure, trace_exec);
 
 		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
@@ -2161,22 +2038,8 @@ macro_rules! tb_scenario {
 		let trace_setup = trace_collector.share();
 		let trace_stimulus = trace_collector.share();
 
-		// Helper functions to enable type inference (synchronous)
-		$crate::tb_scenario!(@def_worker_setup_helper);
-
-		fn __call_stimulus_closure<F, W>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-			worker: &mut W,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce($crate::trace::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace, worker)
-		}
-
-		let mut worker = __call_setup_closure($setup_closure, trace_setup);
-		let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
+		let mut worker = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
+		let exec_result = $crate::testing::macros::__tb_call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
 
 		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
@@ -2209,21 +2072,8 @@ macro_rules! tb_scenario {
 		let trace_stimulus = trace_collector.share();
 
 		// Helper functions to enable type inference
-		$crate::tb_scenario!(@def_worker_setup_helper);
-
-		fn __call_stimulus_closure<F, W>(
-			closure: F,
-			trace: $crate::trace::TraceCollector,
-			worker: &mut W,
-		) -> Result<(), $crate::TightBeamError>
-		where
-			F: FnOnce($crate::trace::TraceCollector, &mut W) -> Result<(), $crate::TightBeamError>,
-		{
-			closure(trace, worker)
-		}
-
-		let mut worker = __call_setup_closure($setup_closure, trace_setup);
-		let exec_result = __call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
+		let mut worker = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
+		let exec_result = $crate::testing::macros::__tb_call_stimulus_closure($stimulus_closure, trace_stimulus, &mut worker);
 
 		// Populate trace from collector
 		let mut trace = tb_scenario!(@setup_trace);
@@ -2241,7 +2091,6 @@ macro_rules! tb_scenario {
 	}};
 
 	// ===== ServiceClient environment (returns Result) =====
-	// User provides complete server setup, returns Result for composition
 	(
 		spec: $spec:ty,
 		$(trace: $trace_cfg:expr,)?
@@ -2268,7 +2117,7 @@ macro_rules! tb_scenario {
 		)
 	};
 
-	// ===== ServiceClient environment variant (multiple specs: [...] form) =====
+	// ServiceClient environment variant (multiple specs: [...] form)
 	(
 		specs: [ $( $spec_expr:expr ),+ $(,)? ],
 		$(fdr: $fdr_config:expr,)?
@@ -2314,7 +2163,6 @@ macro_rules! tb_scenario {
 		let runtime = $crate::testing::macros::__tb_build_multi_thread_runtime(WORKER_THREADS)?;
 
 		let exec_result = runtime.block_on(async {
-			// Create trace collector from config if provided
 			#[cfg(feature = "instrument")]
 			let trace_collector: $crate::trace::TraceCollector = {
 				$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -2513,7 +2361,6 @@ macro_rules! tb_scenario {
 		#[cfg(fuzzing)]
 		fn main() {
 			::afl::fuzz!(|data: &[u8]| {
-				// Create trace collector from config if provided
 				#[cfg(feature = "instrument")]
 				let trace_collector: $crate::trace::TraceCollector = {
 					$crate::tb_scenario!(@create_trace_collector $($trace_cfg)?)
@@ -2566,7 +2413,7 @@ macro_rules! tb_scenario {
 				{
 					closure(trace, client).await
 				}
-				let client_result = __call_client_closure($client_closure, trace_client, client).await;
+				let client_result = $crate::testing::macros::__tb_call_client_closure_async($client_closure, trace_client, client).await;
 
 				servlet_instance.stop();
 
@@ -2588,7 +2435,6 @@ macro_rules! tb_scenario {
 					}
 				}
 
-				// Common finalization
 				let mut trace = $crate::tb_scenario!(@setup_trace);
 				trace.populate_from_collector(&trace_collector);
 				$crate::tb_scenario!(@finalize_trace trace, exec_result);
@@ -2601,15 +2447,13 @@ macro_rules! tb_scenario {
 					$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
 				};
 
-				// AFL fuzz targets should not panic on failure - just return
 				let _ = $crate::tb_scenario!(@propagate_result exec_result, verification_result);
 
 				drop(runtime);
 			});
 		}
 
-		// Stub main() for IDE - rust-analyzer needs this to see a main() function
-		// This is only compiled when NOT fuzzing, so it won't conflict with the generated main() above
+		// Stub for IDE support (not compiled when fuzzing)
 		#[cfg(not(fuzzing))]
 		#[allow(dead_code)]
 		fn main() {
@@ -2617,7 +2461,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== Servlet environment variant =====
+	// Servlet environment variant
 	// Servlet is defined at module scope, test environment starts it
 	(
 		name: $test_name:ident,
@@ -2659,18 +2503,7 @@ macro_rules! tb_scenario {
 			);
 
 			// Execute client closure
-			async fn __call_client_closure<F, Fut, T>(
-				closure: F,
-				trace: $crate::trace::TraceCollector,
-				client: T,
-			) -> Result<(), $crate::TightBeamError>
-			where
-				F: FnOnce($crate::trace::TraceCollector, T) -> Fut,
-				Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
-			{
-				closure(trace, client).await
-			}
-			let client_result = __call_client_closure($client_closure, trace_client, client).await;
+			let client_result = $crate::testing::macros::__tb_call_client_closure_async($client_closure, trace_client, client).await;
 
 			// Stop servlet
 			servlet_instance.stop();
@@ -2775,6 +2608,41 @@ macro_rules! tb_scenario {
 			Ok(())
 		}
 	};
+
+	// ===== Unified verification + propagation =====
+	(@verify_and_propagate
+		$exec_result:expr,
+		$trace:expr,
+		single_spec: $spec:ty
+		$(, csp: $csp:ty)?
+		$(, fdr: $fdr_config:expr)?
+		$(, hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? })?
+	) => {{
+		let verification_result = $crate::__tb_scenario_verify_impl! {
+			single_spec: $spec,
+			trace: $trace,
+			$(csp: $csp,)?
+			$(fdr: $fdr_config,)?
+			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+		};
+		$crate::tb_scenario!(@propagate_result $exec_result, verification_result)
+	}};
+
+	(@verify_and_propagate
+		$exec_result:expr,
+		$trace:expr,
+		multi_specs: $specs:expr
+		$(, fdr: $fdr_config:expr)?
+		$(, hooks: { $(on_pass: $on_pass:expr,)? $(on_fail: $on_fail:expr)? })?
+	) => {{
+		let verification_result = $crate::__tb_scenario_verify_impl! {
+			multi_specs: $specs,
+			trace: $trace,
+			$(fdr: $fdr_config,)?
+			$(hooks: { $(on_pass: $on_pass,)? $(on_fail: $on_fail)? },)?
+		};
+		$crate::tb_scenario!(@propagate_result $exec_result, verification_result)
+	}};
 
 	// Catch-all for unrecognized syntax
 	($($tt:tt)*) => {
