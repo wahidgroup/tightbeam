@@ -7,14 +7,17 @@
 //! - Chain state updates
 //! - Missing message detection
 
-use crate::dtn::messages::MessageChainState;
-use crate::dtn::ordering::OutOfOrderBuffer;
-use crate::dtn::storage::FrameStore;
 use std::sync::{Arc, RwLock};
+
 use tightbeam::asn1::{AlgorithmIdentifier, Frame, OctetString};
+use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::der::oid::AssociatedOid;
 use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::TightBeamError;
+
+use crate::dtn::messages::MessageChainState;
+use crate::dtn::ordering::OutOfOrderBuffer;
+use crate::dtn::storage::FrameStore;
 
 /// Result of processing a frame
 #[derive(Debug)]
@@ -53,15 +56,11 @@ impl ChainProcessor {
 
 		// 2. Insert into ordering buffer
 		let frames_to_process = self.order_buffer.write()?.insert(frame)?;
-
 		if let Some(frames) = frames_to_process {
 			// 3. Validate and update chain for ordered frames
 			let mut validated_frames = Vec::new();
-
 			for ordered_frame in frames {
-				// Validate chain
 				let chain_valid = self.chain_state.read()?.validate_frame(&ordered_frame)?;
-
 				if !chain_valid {
 					// Chain gap detected
 					let current_head = self.chain_state.read()?.last_hash.to_vec();
@@ -93,8 +92,6 @@ impl ChainProcessor {
 
 	/// Prepare outgoing frame: get next order and previous hash
 	pub fn prepare_outgoing(&self) -> Result<(u64, Option<DigestInfo>), TightBeamError> {
-		use tightbeam::crypto::hash::Sha3_256;
-
 		let chain_state = self.chain_state.read()?;
 		let next_order = chain_state.sequence + 1;
 		let previous_digest = if chain_state.sequence > 0 {

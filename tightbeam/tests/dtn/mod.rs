@@ -33,12 +33,28 @@
 //! - `types.rs`: Base DTN types and custom error types
 //! - `ultimate.rs`: Ultimate DTN test demonstrating all framework capabilities
 
+#![cfg(all(
+	feature = "testing-csp",
+	feature = "testing-fdr",
+	feature = "std",
+	feature = "tcp",
+	feature = "tokio",
+	feature = "signature",
+	feature = "secp256k1",
+	feature = "sha3",
+	feature = "x509",
+	feature = "compress"
+))]
+
 pub mod bms;
 pub mod certs;
 pub mod chain_processor;
 pub mod clock;
+pub mod command_executor;
+pub mod fault_manager;
 pub mod fault_matrix;
 pub mod faults;
+pub mod frame_builder;
 pub mod messages;
 pub mod ordering;
 pub mod servlets;

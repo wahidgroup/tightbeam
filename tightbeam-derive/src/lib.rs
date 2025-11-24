@@ -151,13 +151,6 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		.into();
 	}
 
-	// Future: validate that type-based profiles implement SecurityProfile trait
-	// For now, we just parse and ignore the type to prepare for future extensibility
-	if let Some(_profile_ty) = &profile_type {
-		// TODO: Add compile-time validation that the type implements SecurityProfile
-		// For now, we accept any type but don't use it
-	}
-
 	// Profile-based security requirements
 	let (profile_confidential, profile_nonrep, profile_min_version) = match profile_value {
 		Some(1) => (true, true, Some(syn::Ident::new("V1", name.span()))), // FIPS

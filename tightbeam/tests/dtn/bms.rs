@@ -1,96 +1,94 @@
 //! Battery Management System (BMS)
-//!
-//! Handles battery state, charge/discharge logic, and fault detection for the DTN rover.
 
 /// Battery Management System for Mars Rover
 ///
 /// Manages battery state including:
 /// - Current charge level (0-100%)
 /// - Drain rate during operations
-/// - Recharge rate during faults
+/// - Re-energize rate during faults
 /// - Fault detection for low power
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatteryManagementSystem {
-	/// Current battery charge percentage (0-100)
-	charge_percent: u8,
+	/// Current battery energy percentage (0-100)
+	energy_percent: u8,
 	/// Drain rate per operational round (percentage points)
 	drain_rate: u8,
-	/// Recharge rate per skipped round (percentage points)
-	recharge_rate: u8,
+	/// Re-energize rate per skipped round (percentage points)
+	reenergize_rate: u8,
 	/// Low power fault threshold (percentage)
 	fault_threshold: u8,
-	/// Full charge threshold for clearing faults (percentage)
-	full_charge_threshold: u8,
+	/// Full threshold for clearing faults (percentage)
+	full_threshold: u8,
 }
 
 impl BatteryManagementSystem {
 	/// Create a BMS with custom parameters
 	pub fn with_config(
-		initial_charge: u8,
+		energy_percent: u8,
 		drain_rate: u8,
-		recharge_rate: u8,
+		reenergize_rate: u8,
 		fault_threshold: u8,
-		full_charge_threshold: u8,
+		full_threshold: u8,
 	) -> Self {
 		Self {
-			charge_percent: initial_charge.min(100),
+			energy_percent: energy_percent.min(100),
 			drain_rate,
-			recharge_rate,
+			reenergize_rate,
 			fault_threshold,
-			full_charge_threshold,
+			full_threshold,
 		}
 	}
 
-	/// Get current battery charge percentage
-	pub fn charge_percent(&self) -> u8 {
-		self.charge_percent
+	/// Get current battery percentage
+	pub fn to_energy_percent(&self) -> u8 {
+		self.energy_percent
 	}
 
 	/// Drain battery by one operational round
 	///
 	/// Returns the new charge level after draining
 	pub fn drain(&mut self) -> u8 {
-		self.charge_percent = self.charge_percent.saturating_sub(self.drain_rate);
-		self.charge_percent
+		self.energy_percent = self.energy_percent.saturating_sub(self.drain_rate);
+		self.energy_percent
 	}
 
-	/// Recharge battery by one cycle
+	/// Re-energize battery by one cycle
 	///
-	/// Returns the new charge level after recharging
-	pub fn recharge(&mut self) -> u8 {
-		self.charge_percent = self.charge_percent.saturating_add(self.recharge_rate).min(100);
-		self.charge_percent
+	/// Returns the new charge level after re-energizing
+	pub fn reenergize(&mut self) -> u8 {
+		self.energy_percent = self.energy_percent.saturating_add(self.reenergize_rate).min(100);
+		self.energy_percent
 	}
 
 	/// Check if battery is in low power fault state
 	pub fn is_low_power(&self) -> bool {
-		self.charge_percent < self.fault_threshold
+		self.energy_percent < self.fault_threshold
 	}
 
-	/// Check if battery is fully recharged (fault clear condition)
-	pub fn is_fully_charged(&self) -> bool {
-		self.charge_percent >= self.full_charge_threshold
+	/// Check if battery is fully energized
+	pub fn is_full(&self) -> bool {
+		self.energy_percent >= self.full_threshold
 	}
 
 	/// Reset battery to full charge
 	pub fn reset(&mut self) {
-		self.charge_percent = 100;
+		self.energy_percent = 100;
 	}
 
-	/// Set charge to a specific percentage (for testing/initialization)
-	pub fn set_charge(&mut self, charge: u8) {
-		self.charge_percent = charge.min(100);
+	/// Set energy level to a specific percentage
+	pub fn set_energy_level(&mut self, energy_level: u8) {
+		self.energy_percent = energy_level.min(100);
 	}
 }
 
 impl Default for BatteryManagementSystem {
 	fn default() -> Self {
 		Self {
-			charge_percent: 100,
+			energy_percent: 100,
 			drain_rate: 25,
-			recharge_rate: 25,
+			reenergize_rate: 25,
 			fault_threshold: 25,
-			full_charge_threshold: 100,
+			full_threshold: 100,
 		}
 	}
 }
@@ -102,9 +100,9 @@ mod tests {
 	#[test]
 	fn test_bms_default() {
 		let bms = BatteryManagementSystem::default();
-		assert_eq!(bms.charge_percent(), 100);
+		assert_eq!(bms.to_energy_percent(), 100);
 		assert!(!bms.is_low_power());
-		assert!(bms.is_fully_charged());
+		assert!(bms.is_full());
 	}
 
 	#[test]
@@ -118,49 +116,49 @@ mod tests {
 		assert_eq!(bms.drain(), 0); // Can't go below 0
 
 		assert!(bms.is_low_power());
-		assert!(!bms.is_fully_charged());
+		assert!(!bms.is_full());
 	}
 
 	#[test]
 	fn test_bms_recharge() {
 		let mut bms = BatteryManagementSystem::default();
-		bms.set_charge(0);
+		bms.set_energy_level(0);
 
-		assert_eq!(bms.recharge(), 25); // 0 + 25
-		assert_eq!(bms.recharge(), 50); // 25 + 25
-		assert_eq!(bms.recharge(), 75); // 50 + 25
-		assert_eq!(bms.recharge(), 100); // 75 + 25
-		assert_eq!(bms.recharge(), 100); // Can't go above 100
+		assert_eq!(bms.reenergize(), 25); // 0 + 25
+		assert_eq!(bms.reenergize(), 50); // 25 + 25
+		assert_eq!(bms.reenergize(), 75); // 50 + 25
+		assert_eq!(bms.reenergize(), 100); // 75 + 25
+		assert_eq!(bms.reenergize(), 100); // Can't go above 100
 
 		assert!(!bms.is_low_power());
-		assert!(bms.is_fully_charged());
+		assert!(bms.is_full());
 	}
 
 	#[test]
 	fn test_bms_fault_threshold() {
 		let mut bms = BatteryManagementSystem::default();
-		bms.set_charge(25);
+		bms.set_energy_level(25);
 		assert!(!bms.is_low_power()); // Exactly at threshold is OK
 
-		bms.set_charge(24);
+		bms.set_energy_level(24);
 		assert!(bms.is_low_power()); // Below threshold triggers fault
 	}
 
 	#[test]
 	fn test_bms_custom_config() {
 		let bms = BatteryManagementSystem::with_config(50, 10, 15, 20, 90);
-		assert_eq!(bms.charge_percent(), 50);
+		assert_eq!(bms.to_energy_percent(), 50);
 		assert!(!bms.is_low_power()); // 50 >= 20
-		assert!(!bms.is_fully_charged()); // 50 < 90
+		assert!(!bms.is_full()); // 50 < 90
 	}
 
 	#[test]
 	fn test_bms_reset() {
 		let mut bms = BatteryManagementSystem::default();
-		bms.set_charge(25);
-		assert_eq!(bms.charge_percent(), 25);
+		bms.set_energy_level(25);
+		assert_eq!(bms.to_energy_percent(), 25);
 
 		bms.reset();
-		assert_eq!(bms.charge_percent(), 100);
+		assert_eq!(bms.to_energy_percent(), 100);
 	}
 }

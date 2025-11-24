@@ -4,26 +4,18 @@
 //! - Earth Ground Station: Receives telemetry and sends commands
 //! - Relay Satellite: Forwards messages between Mars and Earth
 
-#![cfg(all(
-	feature = "testing-csp",
-	feature = "testing-fdr",
-	feature = "std",
-	feature = "tcp",
-	feature = "tokio",
-	feature = "signature",
-	feature = "secp256k1",
-	feature = "sha3",
-	feature = "x509"
-))]
-
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
+#[cfg(feature = "compress")]
+use tightbeam::compress::ZstdCompression;
+
 use tightbeam::{
-	builder::{frame::FrameBuilder, TypeBuilder},
+	asn1::MessagePriority,
+	compress::Inflator,
 	crypto::{
-		aead::{Aes256Gcm, Aes256GcmOid},
-		hash::Sha3_256,
+		aead::Aes256Gcm,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
 	},
 	decode,
@@ -35,10 +27,16 @@ use tightbeam::{
 };
 
 use crate::dtn::{
-	certs::{EARTH_CERT, EARTH_KEY, EARTH_PINNING, SATELLITE_CERT, SATELLITE_KEY, SATELLITE_PINNING_ROVER},
+	certs::{
+		EARTH_CERT, EARTH_KEY, EARTH_PINNING, ROVER_CERT, ROVER_KEY, ROVER_PINNING, SATELLITE_CERT, SATELLITE_KEY,
+		SATELLITE_PINNING_ROVER,
+	},
 	chain_processor::{ChainProcessor, ProcessResult},
 	clock::{advance_clock, delays, mission_time_ms},
+	command_executor::CommandExecutor,
+	fault_manager::FaultManager,
 	fault_matrix::FaultMatrix,
+	frame_builder::FrameBuilderHelper,
 	messages::{EarthCommand, RoverCommand, RoverTelemetry},
 };
 
@@ -47,14 +45,9 @@ use crate::dtn::{
 // ============================================================================
 
 /// Select command based on telemetry and fault state using simple LCG RNG
-fn select_random_command(
-	telemetry: &RoverTelemetry,
-	fault_matrix: &crate::dtn::fault_matrix::FaultMatrix,
-	seed: u64,
-) -> RoverCommand {
+fn select_random_command(telemetry: &RoverTelemetry, fault_matrix: &FaultMatrix, seed: u64) -> RoverCommand {
 	// Simple linear congruential generator for deterministic randomness
 	let rng_state = seed.wrapping_mul(1103515245).wrapping_add(12345);
-
 	// Constraints: low battery or any fault -> standby
 	if telemetry.battery_percent < 20 || fault_matrix.has_fault() {
 		return RoverCommand::Standby;
@@ -83,6 +76,7 @@ servlet! {
 		rover_verifying_key: Secp256k1VerifyingKey,
 		shared_cipher: Aes256Gcm,
 		chain_processor: Arc<ChainProcessor>,
+		frame_builder: Arc<FrameBuilderHelper>,
 	},
 	handle: |frame, trace, config| async move {
 		trace.event("earth_receive_telemetry")?;
@@ -102,15 +96,11 @@ servlet! {
 		match config.chain_processor.process_incoming(frame)? {
 			ProcessResult::Processed(ordered_frames) => {
 				let mut last_response = None;
-
 				for ordered_frame in ordered_frames {
-					// Extract metadata before consuming frame
 					let fault_matrix = FaultMatrix::try_from(&ordered_frame.metadata.matrix)?;
-
-					// Decrypt telemetry
 					let telemetry: RoverTelemetry = if ordered_frame.metadata.confidentiality.is_some() {
 						println!("[Earth] Decrypting telemetry with shared cipher");
-						ordered_frame.decrypt::<RoverTelemetry>(&config.shared_cipher, None)?
+						ordered_frame.decrypt::<RoverTelemetry>(&config.shared_cipher, Some(&ZstdCompression))?
 					} else {
 						decode(&ordered_frame.message)?
 					};
@@ -120,32 +110,20 @@ servlet! {
 
 					// Generate command
 					let command = select_random_command(&telemetry, &fault_matrix, mission_time_ms());
-					let earth_command = EarthCommand::new(command, Some(128), mission_time_ms());
+					let earth_command = EarthCommand::new(command, MessagePriority::Normal, mission_time_ms());
 
 					// Prepare outgoing frame with previous_frame hash
 					let (next_order, previous_digest) = config.chain_processor.prepare_outgoing()?;
-
-					// Build frame with previous_frame support
-					let mut builder = FrameBuilder::from(Version::V3)
-						.with_id(format!("earth-cmd-{:03}", next_order))
-						.with_order(next_order)
-						.with_message(earth_command)
-						.with_message_hasher::<Sha3_256>()
-						.with_witness_hasher::<Sha3_256>()
-						.with_cipher::<Aes256GcmOid, _>(config.shared_cipher.clone())
-						.with_signer::<Secp256k1Signature, _>(config.earth_signing_key.clone());
-
-					// Set previous_frame if not the first frame
-					if let Some(digest) = previous_digest {
-						builder = builder.with_previous_hash(digest);
-					}
-
-					let response = builder.build()?;
-
-					// Finalize outgoing frame
-					config.chain_processor.finalize_outgoing(&response)?;
+					let response = config.frame_builder.build_command_frame(
+						earth_command,
+						next_order,
+						previous_digest,
+						&config.earth_signing_key,
+						&config.shared_cipher,
+					)?;
 
 					trace.event("earth_send_command")?;
+
 					last_response = Some(response);
 				}
 
@@ -175,7 +153,6 @@ servlet! {
 		client_validators: [SATELLITE_PINNING_ROVER]
 	},
 	config: {
-		earth_servlet: EarthGroundStationServlet,
 		earth_addr: TightBeamSocketAddr,
 		rover_verifying_key: Secp256k1VerifyingKey,
 		earth_verifying_key: Secp256k1VerifyingKey,
@@ -196,7 +173,6 @@ servlet! {
 		match config.chain_processor.process_incoming(frame)? {
 			ProcessResult::Processed(ordered_frames) => {
 				let mut last_response = None;
-
 				for ordered_frame in ordered_frames {
 					advance_clock(delays::RELAY_TO_EARTH_MS);
 					trace.event("relay_forward_uplink")?;
@@ -211,8 +187,6 @@ servlet! {
 						.build()?;
 
 					let earth_response = earth_client.emit(ordered_frame, None).await?;
-
-					// Process downlink response
 					if let Some(response_frame) = earth_response {
 						trace.event("relay_receive_from_earth")?;
 
@@ -242,6 +216,99 @@ servlet! {
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { .. } => {
 				eprintln!("[Satellite] Chain gap in uplink");
+				Ok(None)
+			}
+		}
+	}
+}
+
+// ============================================================================
+// Rover Servlet
+// ============================================================================
+
+/// Mission state for tracking rover mission progress
+#[derive(Debug, Clone)]
+pub struct MissionState {
+	pub completed_rounds: usize,
+	pub mission_started: bool,
+	pub mission_complete: bool,
+}
+
+impl Default for MissionState {
+	fn default() -> Self {
+		Self { completed_rounds: 0, mission_started: false, mission_complete: false }
+	}
+}
+
+servlet! {
+	/// Mars rover servlet that sends telemetry and receives commands
+	pub RoverServlet<EarthCommand>,
+	protocol: TokioListener,
+	x509: {
+		certificate: ROVER_CERT,
+		key_provider: ROVER_KEY,
+		client_validators: [ROVER_PINNING]
+	},
+	config: {
+		relay_addr: TightBeamSocketAddr,
+		rover_signing_key: Secp256k1SigningKey,
+		earth_verifying_key: Secp256k1VerifyingKey,
+		shared_cipher: Aes256Gcm,
+		chain_processor: Arc<ChainProcessor>,
+		fault_manager: Arc<FaultManager>,
+		command_executor: Arc<RwLock<CommandExecutor>>,
+		frame_builder: Arc<FrameBuilderHelper>,
+		mission_state: Arc<RwLock<MissionState>>,
+		max_rounds: usize,
+	},
+	handle: |frame, trace, config| async move {
+		trace.event("rover_receive_command")?;
+
+		// Verify Earth's signature
+		match frame.verify::<Secp256k1Signature>(&config.earth_verifying_key) {
+			Ok(_) => println!("  [Rover] ✓ Earth signature verified"),
+			Err(e) => return Err(e),
+		}
+
+		// Process response
+		match config.chain_processor.process_incoming(frame)? {
+			ProcessResult::Processed(ordered_frames) => {
+				for ordered_frame in ordered_frames {
+					// Decrypt command (and decompress if compressed)
+					let command: EarthCommand = if ordered_frame.metadata.confidentiality.is_some() {
+						println!("  [Rover] Decrypting command with shared cipher");
+						ordered_frame.decrypt::<EarthCommand>(&config.shared_cipher, Some(&ZstdCompression))?
+					} else {
+						decode(&ordered_frame.message)?
+					};
+
+					let cmd_type = RoverCommand::try_from(command.command_type)?;
+
+					println!("  [Rover] Command: {}", cmd_type.to_string());
+
+					// Execute command
+					config.command_executor.write()?.execute_command(cmd_type, &trace)?;
+
+					advance_clock(delays::ROVER_TO_RELAY_MS * 2);
+					trace.event("rover_command_complete")?;
+
+					// Update mission state
+					{
+						let mut state = config.mission_state.write()?;
+						state.completed_rounds += 1;
+						if state.completed_rounds >= config.max_rounds {
+							state.mission_complete = true;
+						}
+					}
+
+					println!("  [Rover] Complete - MET: T+{:05}s\n", mission_time_ms() / 1000);
+				}
+
+				Ok(None)
+			},
+			ProcessResult::Buffered => Ok(None),
+			ProcessResult::ChainGap { .. } => {
+				eprintln!("  [Rover] Chain gap detected");
 				Ok(None)
 			}
 		}

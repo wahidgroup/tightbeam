@@ -5,7 +5,10 @@
 //! - Earth command & control
 //! - Message chain consensus validation
 
-use tightbeam::asn1::Frame;
+use std::convert::TryFrom;
+use std::fmt;
+
+use tightbeam::asn1::{Frame, MessagePriority};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::der::{Encode, Enumerated, Sequence};
 use tightbeam::{Beamable, TightBeamError};
@@ -27,7 +30,6 @@ pub struct RoverTelemetry {
 	pub battery_percent: u8,
 	/// Ambient temperature in Celsius
 	pub temperature_c: i8,
-	// Note: Fault flags are now encoded in Frame.matrix via FaultMatrix
 }
 
 impl RoverTelemetry {
@@ -40,17 +42,12 @@ impl RoverTelemetry {
 		temperature_c: i8,
 	) -> Self {
 		Self {
-			instrument: instrument.to_u8(),
+			instrument: instrument as u8,
 			data,
 			mission_time_ms,
 			battery_percent,
 			temperature_c,
 		}
-	}
-
-	/// Get the instrument type
-	pub fn get_instrument(&self) -> Option<RoverInstrument> {
-		RoverInstrument::from_u8(self.instrument)
 	}
 }
 
@@ -66,25 +63,6 @@ pub enum RoverInstrument {
 	Mastcam = 2,
 }
 
-impl RoverInstrument {
-	pub fn to_u8(&self) -> u8 {
-		match self {
-			RoverInstrument::APXS => 0,
-			RoverInstrument::ChemCam => 1,
-			RoverInstrument::Mastcam => 2,
-		}
-	}
-
-	pub fn from_u8(value: u8) -> Option<Self> {
-		match value {
-			0 => Some(RoverInstrument::APXS),
-			1 => Some(RoverInstrument::ChemCam),
-			2 => Some(RoverInstrument::Mastcam),
-			_ => None,
-		}
-	}
-}
-
 // ============================================================================
 // Earth Command & Control Messages
 // ============================================================================
@@ -96,26 +74,26 @@ pub struct EarthCommand {
 	pub command_type: u8,
 	/// Command-specific parameters
 	pub parameters: Vec<u8>,
-	/// Command priority (0=lowest, 255=highest)
-	pub priority: u8,
+	/// Command priority
+	pub priority: MessagePriority,
 	/// Mission time when command was issued
 	pub mission_time_ms: u64,
 }
 
 impl EarthCommand {
 	/// Create command from typed RoverCommand
-	pub fn new(command: RoverCommand, priority: Option<u8>, mission_time_ms: u64) -> Self {
+	pub fn new(command: RoverCommand, priority: MessagePriority, mission_time_ms: u64) -> Self {
 		Self {
 			command_type: command.command_type(),
 			parameters: command.encode_parameters(),
-			priority: priority.unwrap_or(128), // Default priority: medium
+			priority,
 			mission_time_ms,
 		}
 	}
 }
 
 /// Rover command types (encoded as u8 + parameters)
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub enum RoverCommand {
 	/// Collect soil/rock sample at location
 	CollectSample { location: String },
@@ -124,6 +102,7 @@ pub enum RoverCommand {
 	/// Take photo in direction with resolution
 	TakePhoto { direction: String, resolution: u16 },
 	/// Enter standby mode (for low power situations)
+	#[default]
 	Standby,
 }
 
@@ -156,26 +135,31 @@ impl RoverCommand {
 			RoverCommand::Standby => vec![],
 		}
 	}
+}
 
-	/// Create command from type byte
-	pub fn from_u8(value: u8) -> Option<Self> {
+impl TryFrom<u8> for RoverCommand {
+	type Error = TightBeamError;
+
+	fn try_from(value: u8) -> Result<Self, Self::Error> {
 		match value {
-			0 => Some(RoverCommand::CollectSample { location: "default".to_string() }),
-			1 => Some(RoverCommand::ProbeLocation { x: 0, y: 0 }),
-			2 => Some(RoverCommand::TakePhoto { direction: "forward".to_string(), resolution: 1024 }),
-			3 => Some(RoverCommand::Standby),
-			_ => None,
+			0 => Ok(RoverCommand::CollectSample { location: "default".to_string() }),
+			1 => Ok(RoverCommand::ProbeLocation { x: 0, y: 0 }),
+			2 => Ok(RoverCommand::TakePhoto { direction: "forward".to_string(), resolution: 1024 }),
+			3 => Ok(RoverCommand::Standby),
+			_ => Err(TightBeamError::InvalidBody),
 		}
 	}
+}
 
-	/// Get human-readable command name
-	pub fn to_string(&self) -> &str {
-		match self {
+impl fmt::Display for RoverCommand {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let name = match self {
 			RoverCommand::CollectSample { .. } => "CollectSample",
 			RoverCommand::ProbeLocation { .. } => "ProbeLocation",
 			RoverCommand::TakePhoto { .. } => "TakePhoto",
 			RoverCommand::Standby => "Standby",
-		}
+		};
+		write!(f, "{}", name)
 	}
 }
 
