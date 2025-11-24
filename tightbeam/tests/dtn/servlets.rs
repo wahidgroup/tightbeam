@@ -16,17 +16,18 @@
 	feature = "x509"
 ))]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tightbeam::{
-	compose,
+	builder::{frame::FrameBuilder, TypeBuilder},
 	crypto::{
+		aead::{Aes256Gcm, Aes256GcmOid},
 		hash::Sha3_256,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
 	},
 	decode,
 	macros::client::builder::ClientBuilder,
-	matrix::MatrixDyn,
 	prelude::*,
 	servlet,
 	transport::policy::RestartExponentialBackoff,
@@ -35,7 +36,8 @@ use tightbeam::{
 
 use crate::dtn::{
 	certs::{EARTH_CERT, EARTH_KEY, EARTH_PINNING, SATELLITE_CERT, SATELLITE_KEY, SATELLITE_PINNING_ROVER},
-	clock::{advance_clock, delays},
+	chain_processor::{ChainProcessor, ProcessResult},
+	clock::{advance_clock, delays, mission_time_ms},
 	fault_matrix::FaultMatrix,
 	messages::{EarthCommand, RoverCommand, RoverTelemetry},
 };
@@ -78,56 +80,84 @@ servlet! {
 	},
 	config: {
 		earth_signing_key: Secp256k1SigningKey,
-		satellite_verifying_key: Secp256k1VerifyingKey,
+		rover_verifying_key: Secp256k1VerifyingKey,
+		shared_cipher: Aes256Gcm,
+		chain_processor: Arc<ChainProcessor>,
 	},
 	handle: |frame, trace, config| async move {
-		// Verify Satellite's signature (Satellite re-signs frames it forwards)
+		trace.event("earth_receive_telemetry")?;
+
+		// 1. Verify Rover's signature
 		if frame.nonrepudiation.is_some() {
-			match frame.verify::<Secp256k1Signature>(&config.satellite_verifying_key) {
-				Ok(_) => {
-					println!("[Earth] ✓ Satellite signature verified successfully");
-				},
+			match frame.verify::<Secp256k1Signature>(&config.rover_verifying_key) {
+				Ok(_) => println!("[Earth] ✓ Rover signature verified"),
 				Err(e) => {
-					eprintln!("[Earth] ✗ Satellite signature verification FAILED: {:?}", e);
-					eprintln!("[Earth]   Frame ID: {:?}", String::from_utf8_lossy(&frame.metadata.id));
-					let _ = trace.event("signature_verification_failed");
+					eprintln!("[Earth] ✗ Rover signature verification FAILED");
 					return Err(e);
 				}
 			}
 		}
 
-		let current_time = crate::dtn::clock::mission_time_ms();
+		// 2. Process frame (persist, order, validate chain)
+		match config.chain_processor.process_incoming(frame)? {
+			ProcessResult::Processed(ordered_frames) => {
+				let mut last_response = None;
 
-		trace.event("earth_receive_telemetry")?;
+				for ordered_frame in ordered_frames {
+					// Extract metadata before consuming frame
+					let fault_matrix = FaultMatrix::try_from(&ordered_frame.metadata.matrix)?;
 
-		let telemetry: RoverTelemetry = decode(&frame.message)?;
+					// Decrypt telemetry
+					let telemetry: RoverTelemetry = if ordered_frame.metadata.confidentiality.is_some() {
+						println!("[Earth] Decrypting telemetry with shared cipher");
+						ordered_frame.decrypt::<RoverTelemetry>(&config.shared_cipher, None)?
+					} else {
+						decode(&ordered_frame.message)?
+					};
 
-		trace.event("earth_analyze_telemetry")?;
+					trace.event("earth_analyze_telemetry")?;
+					trace.event("earth_select_command")?;
 
-		// Extract fault state from frame matrix
-		let fault_matrix = FaultMatrix::try_from(&frame.metadata.matrix)?;
+					// Generate command
+					let command = select_random_command(&telemetry, &fault_matrix, mission_time_ms());
+					let earth_command = EarthCommand::new(command, Some(128), mission_time_ms());
 
-		trace.event("earth_select_command")?;
-		let command = select_random_command(&telemetry, &fault_matrix, current_time);
+					// Prepare outgoing frame with previous_frame hash
+					let (next_order, previous_digest) = config.chain_processor.prepare_outgoing()?;
 
-		let earth_command = EarthCommand::new(
-			command,
-			Some(128),
-			current_time,
-		);
+					// Build frame with previous_frame support
+					let mut builder = FrameBuilder::from(Version::V3)
+						.with_id(format!("earth-cmd-{:03}", next_order))
+						.with_order(next_order)
+						.with_message(earth_command)
+						.with_message_hasher::<Sha3_256>()
+						.with_witness_hasher::<Sha3_256>()
+						.with_cipher::<Aes256GcmOid, _>(config.shared_cipher.clone())
+						.with_signer::<Secp256k1Signature, _>(config.earth_signing_key.clone());
 
-		trace.event("earth_send_command")?;
+					// Set previous_frame if not the first frame
+					if let Some(digest) = previous_digest {
+						builder = builder.with_previous_hash(digest);
+					}
 
-		let response = compose! {
-			V3: id: "earth-cmd-001",
-				order: frame.metadata.order + 1,
-				message: earth_command,
-				message_integrity: type Sha3_256,
-				frame_integrity: type Sha3_256,
-				nonrepudiation<Secp256k1Signature, _>: config.earth_signing_key.clone()
-		}?;
+					let response = builder.build()?;
 
-		Ok(Some(response))
+					// Finalize outgoing frame
+					config.chain_processor.finalize_outgoing(&response)?;
+
+					trace.event("earth_send_command")?;
+					last_response = Some(response);
+				}
+
+				Ok(last_response)
+			},
+			ProcessResult::Buffered => Ok(None),
+			ProcessResult::ChainGap { current_head, missing_hash } => {
+				// TODO: Request missing frames
+				eprintln!("[Earth] Chain gap - would request frames (head: {:?}, missing: {:?})", current_head, missing_hash);
+				Ok(None)
+			}
+		}
 	}
 }
 
@@ -147,81 +177,73 @@ servlet! {
 	config: {
 		earth_servlet: EarthGroundStationServlet,
 		earth_addr: TightBeamSocketAddr,
-		earth_signing_key: Secp256k1SigningKey,
-		satellite_signing_key: Secp256k1SigningKey,
 		rover_verifying_key: Secp256k1VerifyingKey,
+		earth_verifying_key: Secp256k1VerifyingKey,
+		chain_processor: Arc<ChainProcessor>,
 	},
-	handle: |mut frame, trace, config| async move {
+	handle: |frame, trace, config| async move {
 		trace.event("relay_receive_from_rover")?;
 
-		// Verify Rover's signature using Frame's built-in verify method
+		// Verify Rover's signature
 		if frame.nonrepudiation.is_some() {
 			match frame.verify::<Secp256k1Signature>(&config.rover_verifying_key) {
-				Ok(_) => {
-					println!("[Satellite] ✓ Signature verified successfully");
-				},
-				Err(e) => {
-					eprintln!("[Satellite] ✗ Signature verification FAILED: {:?}", e);
-					eprintln!("[Satellite]   Frame ID: {:?}", String::from_utf8_lossy(&frame.metadata.id));
-					let _ = trace.event("signature_verification_failed");
-					// Don't fail the test yet, just log the error
-					// return Err(e);
-				}
+				Ok(_) => println!("[Satellite] ✓ Rover signature verified - forwarding encrypted frame"),
+				Err(e) => return Err(e),
 			}
 		}
 
-		// Simulate relay→earth transmission delay
-		advance_clock(delays::RELAY_TO_EARTH_MS);
+		// Process uplink frame
+		match config.chain_processor.process_incoming(frame)? {
+			ProcessResult::Processed(ordered_frames) => {
+				let mut last_response = None;
 
-		trace.event("relay_forward_uplink")?;
+				for ordered_frame in ordered_frames {
+					advance_clock(delays::RELAY_TO_EARTH_MS);
+					trace.event("relay_forward_uplink")?;
 
-		// Decode payload from rover
-		// Forward to Earth, preserving matrix
-		let telemetry: RoverTelemetry = decode(&frame.message)?;
-		let earth_frame = if let Some(asn1_matrix) = frame.metadata.matrix.take() {
-			let matrix_dyn = MatrixDyn::try_from(&asn1_matrix)?;
+					// Forward to Earth
+					let mut earth_client = ClientBuilder::<TokioListener>::connect(config.earth_addr)
+						.await?
+						.with_server_certificate(EARTH_CERT)?
+						.with_client_identity(SATELLITE_CERT, SATELLITE_KEY)?
+						.with_restart(RestartExponentialBackoff::new(3, 100, None))
+						.with_timeout(Duration::from_millis(2000))
+						.build()?;
 
-			compose! {
-				V3: id: format!("relay-fwd-{}", String::from_utf8_lossy(&frame.metadata.id)),
-					order: frame.metadata.order + 1,
-					message: telemetry,
-					matrix: matrix_dyn,
-					message_integrity: type Sha3_256,
-					frame_integrity: type Sha3_256,
-					nonrepudiation<Secp256k1Signature, _>: config.satellite_signing_key.clone()
-			}?
-		} else {
-			compose! {
-				V3: id: format!("relay-fwd-{}", String::from_utf8_lossy(&frame.metadata.id)),
-					order: frame.metadata.order + 1,
-					message: telemetry,
-					message_integrity: type Sha3_256,
-					frame_integrity: type Sha3_256,
-					nonrepudiation<Secp256k1Signature, _>: config.satellite_signing_key.clone()
-			}?
-		};
+					let earth_response = earth_client.emit(ordered_frame, None).await?;
 
-		// Create client to Earth with retry policy and mutual TLS
-		let restart_policy = RestartExponentialBackoff::new(3, 100, None);
-		let mut earth_client = ClientBuilder::<TokioListener>::connect(config.earth_addr)
-			.await?
-			.with_server_certificate(EARTH_CERT)?
-			.with_client_identity(SATELLITE_CERT, SATELLITE_KEY)?
-			.with_restart(restart_policy)
-			.with_timeout(Duration::from_millis(2000))
-			.build()?;
+					// Process downlink response
+					if let Some(response_frame) = earth_response {
+						trace.event("relay_receive_from_earth")?;
 
-		// Get Earth's response
-		let earth_response = earth_client.emit(earth_frame, None).await?;
+						// Verify Earth's signature
+						match response_frame.verify::<Secp256k1Signature>(&config.earth_verifying_key) {
+							Ok(_) => println!("[Satellite] ✓ Earth signature verified - forwarding encrypted command"),
+							Err(e) => return Err(e),
+						}
 
-		trace.event("relay_receive_from_earth")?;
+						// Process downlink (also validates chain)
+						match config.chain_processor.process_incoming(response_frame.clone())? {
+							ProcessResult::Processed(_) | ProcessResult::Buffered => {
+								last_response = Some(response_frame);
+							},
+							ProcessResult::ChainGap { .. } => {
+								eprintln!("[Satellite] Chain gap in downlink");
+							}
+						}
+					}
 
-		// Simulate earth→relay transmission delay
-		advance_clock(delays::EARTH_TO_RELAY_MS);
+					advance_clock(delays::EARTH_TO_RELAY_MS);
+					trace.event("relay_forward_downlink")?;
+				}
 
-		trace.event("relay_forward_downlink")?;
-
-		// Return Earth's response to Rover
-		Ok(earth_response)
+				Ok(last_response)
+			},
+			ProcessResult::Buffered => Ok(None),
+			ProcessResult::ChainGap { .. } => {
+				eprintln!("[Satellite] Chain gap in uplink");
+				Ok(None)
+			}
+		}
 	}
 }

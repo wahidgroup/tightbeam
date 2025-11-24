@@ -1,7 +1,7 @@
 //! DTN message types and custom errors for delay-tolerant network testing
 
-use tightbeam::Beamable;
 use tightbeam::der::Sequence;
+use tightbeam::Beamable;
 use tightbeam::TightBeamError;
 
 /// DTN payload for multi-hop communication
@@ -35,7 +35,11 @@ pub struct NetworkPartition {
 
 impl core::fmt::Display for NetworkPartition {
 	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-		write!(f, "Network partition {} → {} ({}ms)", self.from_node, self.to_node, self.duration_ms)
+		write!(
+			f,
+			"Network partition {} → {} ({}ms)",
+			self.from_node, self.to_node, self.duration_ms
+		)
 	}
 }
 
@@ -101,3 +105,56 @@ impl From<ThermalFault> for TightBeamError {
 	}
 }
 
+/// Invalid chain error - hash chain validation failed
+#[derive(Debug, Clone)]
+pub struct InvalidChainError {
+	pub message: String,
+}
+
+impl core::fmt::Display for InvalidChainError {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+		write!(f, "Invalid chain: {}", self.message)
+	}
+}
+
+impl From<InvalidChainError> for TightBeamError {
+	fn from(e: InvalidChainError) -> Self {
+		TightBeamError::InjectedFault(Box::new(e))
+	}
+}
+
+/// Invalid sequence error - out-of-sequence frame
+#[derive(Debug, Clone)]
+pub struct InvalidSequenceError {
+	pub message: String,
+}
+
+impl core::fmt::Display for InvalidSequenceError {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+		write!(f, "Invalid sequence: {}", self.message)
+	}
+}
+
+impl From<InvalidSequenceError> for TightBeamError {
+	fn from(e: InvalidSequenceError) -> Self {
+		TightBeamError::InjectedFault(Box::new(e))
+	}
+}
+
+/// Buffer full error - ordering buffer exceeded capacity
+#[derive(Debug, Clone)]
+pub struct BufferFullError {
+	pub message: String,
+}
+
+impl core::fmt::Display for BufferFullError {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+		write!(f, "Buffer full: {}", self.message)
+	}
+}
+
+impl From<BufferFullError> for TightBeamError {
+	fn from(e: BufferFullError) -> Self {
+		TightBeamError::InjectedFault(Box::new(e))
+	}
+}

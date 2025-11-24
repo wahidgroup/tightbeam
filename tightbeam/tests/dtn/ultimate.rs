@@ -31,33 +31,39 @@
 	feature = "x509"
 ))]
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rand_core::OsRng;
 use tightbeam::{
-	compose,
+	builder::{frame::FrameBuilder, TypeBuilder},
 	crypto::{
+		aead::{Aes256Gcm, Aes256GcmOid},
 		hash::Sha3_256,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
 	},
 	decode, exactly,
 	macros::client::builder::ClientBuilder,
 	matrix::MatrixDyn,
+	prelude::Version,
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	transport::{policy::RestartExponentialBackoff, tcp::r#async::TokioListener},
 };
 
 use crate::dtn::{
 	bms::BatteryManagementSystem,
-	certs::{ROVER_CERT, ROVER_KEY, SATELLITE_CERT},
+	certs::{generate_shared_cipher, ROVER_CERT, ROVER_KEY, SATELLITE_CERT},
+	chain_processor::{ChainProcessor, ProcessResult},
 	clock::{advance_clock, delays, init_mission_clock, mission_time_ms},
 	fault_matrix::{FaultMatrix, FaultType},
 	faults::RoverFaultHandler,
 	messages::{EarthCommand, MessageChainState, RoverCommand, RoverInstrument, RoverTelemetry},
+	ordering::OutOfOrderBuffer,
 	servlets::{
 		EarthGroundStationServlet, EarthGroundStationServletConf, RelaySatelliteServlet, RelaySatelliteServletConf,
 	},
+	storage::FrameStore,
 	utils::generate_message_id,
 };
 
@@ -69,6 +75,10 @@ use crate::dtn::{
 pub struct DtnScenarioConfig {
 	/// Rover's signing key for nonrepudiation
 	pub rover_signing_key: Secp256k1SigningKey,
+	/// Shared AES-256-GCM cipher (Earth ↔ Rover only)
+	pub shared_cipher: Aes256Gcm,
+	/// Earth's verifying key for signature verification (set by servlet start)
+	pub earth_verifying_key: RwLock<Option<tightbeam::crypto::sign::ecdsa::Secp256k1VerifyingKey>>,
 	/// Battery Management System
 	pub bms: RwLock<BatteryManagementSystem>,
 	/// Fault handler for recovery logic (time tracking, decisions)
@@ -81,19 +91,56 @@ pub struct DtnScenarioConfig {
 	pub earth_chain_state: RwLock<MessageChainState>,
 	/// Relay chain state for consensus
 	pub relay_chain_state: RwLock<MessageChainState>,
+	/// Frame storage for Rover
+	pub rover_store: RwLock<FrameStore>,
+	/// Frame storage for Earth
+	pub earth_store: RwLock<FrameStore>,
+	/// Frame storage for Relay
+	pub relay_store: RwLock<FrameStore>,
 }
 
 impl Default for DtnScenarioConfig {
 	fn default() -> Self {
+		// Create storage directories
+		let rover_store = FrameStore::new(PathBuf::from("temp/dtn/rover")).expect("Failed to create rover storage");
+		let earth_store = FrameStore::new(PathBuf::from("temp/dtn/earth")).expect("Failed to create earth storage");
+		let relay_store = FrameStore::new(PathBuf::from("temp/dtn/relay")).expect("Failed to create relay storage");
+
 		Self {
 			rover_signing_key: Secp256k1SigningKey::random(&mut OsRng),
+			shared_cipher: generate_shared_cipher(),
+			earth_verifying_key: RwLock::new(None),
 			bms: RwLock::new(BatteryManagementSystem::default()),
 			rover_fault_handler: RwLock::new(RoverFaultHandler::new()),
 			fault_matrix: RwLock::new(FaultMatrix::new()),
 			rover_chain_state: RwLock::new(MessageChainState::new("rover".to_string())),
 			earth_chain_state: RwLock::new(MessageChainState::new("earth".to_string())),
 			relay_chain_state: RwLock::new(MessageChainState::new("relay".to_string())),
+			rover_store: RwLock::new(rover_store),
+			earth_store: RwLock::new(earth_store),
+			relay_store: RwLock::new(relay_store),
 		}
+	}
+}
+
+impl Drop for DtnScenarioConfig {
+	fn drop(&mut self) {
+		// Clean up storage directories
+		if let Ok(mut store) = self.rover_store.write() {
+			let _ = store.clear();
+		}
+		if let Ok(mut store) = self.earth_store.write() {
+			let _ = store.clear();
+		}
+		if let Ok(mut store) = self.relay_store.write() {
+			let _ = store.clear();
+		}
+
+		// Remove storage directories
+		let _ = std::fs::remove_dir_all("temp/dtn/rover");
+		let _ = std::fs::remove_dir_all("temp/dtn/earth");
+		let _ = std::fs::remove_dir_all("temp/dtn/relay");
+		let _ = std::fs::remove_dir_all("temp/dtn");
 	}
 }
 
@@ -245,50 +292,72 @@ tb_scenario! {
 	config: DtnScenarioConfig::default(),
 	environment Servlet {
 		servlet: RelaySatelliteServlet,
-		start: |trace, config| {
-			// Clone the rover signing key to avoid lifetime issues
-			let rover_signing_key = config.rover_signing_key.clone();
+		start: |trace, config| async move {
+			// Generate Earth's signing key
+			let earth_signing_key = Secp256k1SigningKey::random(&mut OsRng);
 
-			async move {
-				// Generate Earth's signing key
-				let earth_signing_key = Secp256k1SigningKey::random(&mut OsRng);
+			// Get verifying keys
+			let rover_verifying_key = config.read()?.rover_signing_key.verifying_key().to_owned();
+			let earth_verifying_key = earth_signing_key.verifying_key().to_owned();
 
-				// Generate Satellite's signing key
-				let satellite_signing_key = Secp256k1SigningKey::random(&mut OsRng);
+			// Store Earth's verifying key in config for Rover client to use
+			*config.write()?.earth_verifying_key.write()? = Some(earth_verifying_key);
 
-				// Get Satellite's verifying key
-				let satellite_verifying_key = satellite_signing_key.verifying_key().clone();
+			// Get shared cipher from config
+			let shared_cipher = config.read()?.shared_cipher.to_owned();
 
-				// Get Rover's verifying key from its signing key
-				let rover_verifying_key = rover_signing_key.verifying_key().clone();
+			// Create ChainProcessors for servlets
+			let config_read = config.read()?;
+			drop(config_read);
 
-				// Start Earth Ground Station servlet with config
-				let earth_config = EarthGroundStationServletConf {
-					earth_signing_key: earth_signing_key.clone(),
-					satellite_verifying_key,
-				};
-				let earth_servlet = EarthGroundStationServlet::start(Arc::clone(&trace), Arc::new(earth_config)).await?;
+			let earth_store = Arc::new(RwLock::new(FrameStore::new(PathBuf::from("temp/dtn/earth"))?));
+			let earth_chain_state = Arc::new(RwLock::new(MessageChainState::new("earth".to_string())));
+			let earth_order_buffer = Arc::new(RwLock::new(OutOfOrderBuffer::new(10)));
 
-				// Get Earth's address
-				let earth_addr = earth_servlet.addr();
+			let earth_processor = Arc::new(ChainProcessor::new(
+				earth_store,
+				earth_chain_state,
+				earth_order_buffer,
+				"Earth".to_string(),
+			));
 
-				// Create Relay servlet config
+			let relay_store = Arc::new(RwLock::new(FrameStore::new(PathBuf::from("temp/dtn/relay"))?));
+			let relay_chain_state = Arc::new(RwLock::new(MessageChainState::new("relay".to_string())));
+			let relay_order_buffer = Arc::new(RwLock::new(OutOfOrderBuffer::new(10)));
+
+			let relay_processor = Arc::new(ChainProcessor::new(
+				relay_store,
+				relay_chain_state,
+				relay_order_buffer,
+				"Satellite".to_string(),
+			));
+
+			// Start Earth Ground Station servlet with config
+			let earth_config = EarthGroundStationServletConf {
+				earth_signing_key,
+				rover_verifying_key,
+				shared_cipher: shared_cipher.clone(),
+				chain_processor: earth_processor,
+			};
+			let earth_servlet = EarthGroundStationServlet::start(Arc::clone(&trace), Arc::new(earth_config)).await?;
+			// Get Earth's address
+			let earth_addr = earth_servlet.addr();
+
+			// Create Relay servlet config
 			let relay_config = RelaySatelliteServletConf {
 				earth_servlet,
 				earth_addr,
-				earth_signing_key,
-				satellite_signing_key,
 				rover_verifying_key,
+				earth_verifying_key,
+				chain_processor: relay_processor,
 			};
 
-				// Start and return the Relay Satellite servlet with config
-				RelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(relay_config)).await
-			}
+			// Start and return the Relay Satellite servlet with config
+			RelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(relay_config)).await
 		},
 		setup: |relay_addr, _config| async move {
 			// Exponential backoff: 100ms, 200ms, 400ms (max 3 attempts)
 			let restart_policy = RestartExponentialBackoff::new(3, 100, None);
-
 			let client = ClientBuilder::<TokioListener>::connect(relay_addr)
 				.await?
 				.with_server_certificate(SATELLITE_CERT)?
@@ -309,6 +378,28 @@ tb_scenario! {
 			println!("╚════════════════════════════════════════════════════════════╝\n");
 
 		let rover_signing_key = config.read()?.rover_signing_key.clone();
+		let shared_cipher = config.read()?.shared_cipher.clone();
+
+		// Wait for Earth verifying key to be set by the servlet start
+		let earth_verifying_key = loop {
+			if let Some(key) = config.read()?.earth_verifying_key.read()?.clone() {
+				break key;
+			}
+			// Give the servlet a moment to initialize
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		};
+
+		// Create ChainProcessor for Rover
+		let rover_store = Arc::new(RwLock::new(FrameStore::new(PathBuf::from("temp/dtn/rover"))?));
+		let rover_chain_state = Arc::new(RwLock::new(MessageChainState::new("rover".to_string())));
+		let rover_order_buffer = Arc::new(RwLock::new(OutOfOrderBuffer::new(10)));
+
+		let chain_processor = Arc::new(ChainProcessor::new(
+			rover_store,
+			rover_chain_state,
+			rover_order_buffer,
+			"Rover".to_string(),
+		));
 
 		let mut completed_rounds = 0;
 		let mut last_command = RoverCommand::Standby;
@@ -398,68 +489,110 @@ tb_scenario! {
 					-20,
 				);
 
-				// Convert FaultMatrix to MatrixDyn for frame
-				let matrix_dyn = MatrixDyn::try_from(fault_matrix_snapshot)?;
-				let rover_frame = compose! {
-					V3: id: generate_message_id("telemetry", "rover"),
-						order: completed_rounds as u64 + 1,
-						message: telemetry,
-						matrix: matrix_dyn,
-						message_integrity: type Sha3_256,
-						frame_integrity: type Sha3_256,
-						nonrepudiation<Secp256k1Signature, _>: rover_signing_key.clone()
-				}?;
+			// Prepare outgoing telemetry with previous_frame hash
+			let (next_order, previous_digest) = chain_processor.prepare_outgoing()?;
 
-				println!("  [Rover] {} telemetry (Battery: {}%)", name, battery);
+			// Convert FaultMatrix to MatrixDyn for frame
+			let matrix_dyn = MatrixDyn::try_from(fault_matrix_snapshot)?;
+
+			// Build frame with previous_frame support
+			let mut builder = FrameBuilder::from(Version::V3)
+				.with_id(generate_message_id("telemetry", "rover"))
+				.with_order(next_order)
+				.with_message(telemetry)
+				.with_matrix(matrix_dyn)
+				.with_message_hasher::<Sha3_256>()
+				.with_witness_hasher::<Sha3_256>()
+				.with_cipher::<Aes256GcmOid, _>(shared_cipher.clone())
+				.with_signer::<Secp256k1Signature, _>(rover_signing_key.clone());
+
+			// Set previous_frame if not the first frame
+			if let Some(digest) = previous_digest {
+				builder = builder.with_previous_hash(digest);
+			}
+
+			let rover_frame = builder.build()?;
+
+			println!("  [Rover] {} telemetry (Battery: {}%) [ENCRYPTED]", name, battery);
 				if fault_matrix_snapshot.has_fault() {
 					let active: Vec<_> = fault_matrix_snapshot.active_faults().collect();
 					println!("  [Rover] ⚠ Active faults: {:?}", active);
 				}
 
-				let response = rover_client.emit(rover_frame, None).await?;
+			// Finalize outgoing frame
+			chain_processor.finalize_outgoing(&rover_frame)?;
 
-				if let Some(response_frame) = response {
-					trace.event("rover_receive_command")?;
+			let response = rover_client.emit(rover_frame, None).await?;
+			if let Some(response_frame) = response {
+				// Verify Earth's signature
+				match response_frame.verify::<Secp256k1Signature>(&earth_verifying_key) {
+					Ok(_) => println!("  [Rover] ✓ Earth signature verified"),
+					Err(e) => return Err(e),
+				}
 
-					let command: EarthCommand = decode(&response_frame.message)?;
-					let cmd_type = RoverCommand::from_u8(command.command_type)
-						.ok_or_else(|| tightbeam::TightBeamError::InvalidBody)?;
+				// Process response
+				match chain_processor.process_incoming(response_frame)? {
+					ProcessResult::Processed(ordered_frames) => {
+						for ordered_frame in ordered_frames {
+							trace.event("rover_receive_command")?;
 
-					println!("  [Rover] Command: {}", cmd_type.to_string());
+							// Decrypt command
+							let command: EarthCommand = if ordered_frame.metadata.confidentiality.is_some() {
+								println!("  [Rover] Decrypting command with shared cipher");
+								ordered_frame.decrypt::<EarthCommand>(&shared_cipher, None)?
+							} else {
+								decode(&ordered_frame.message)?
+							};
 
-					// Execute command and update state
-					match cmd_type {
-						RoverCommand::CollectSample { .. } => {
-							trace.event("rover_execute_collect_sample")?;
-							println!("  [Rover] Collecting sample...");
-							last_command = cmd_type;
-						},
-						RoverCommand::ProbeLocation { .. } => {
-							trace.event("rover_execute_probe_location")?;
-							println!("  [Rover] Probing location...");
-							last_command = cmd_type;
-						},
-						RoverCommand::TakePhoto { .. } => {
-							trace.event("rover_execute_take_photo")?;
-							println!("  [Rover] Capturing image...");
-							last_command = cmd_type;
-						},
-						RoverCommand::Standby => {
-							trace.event("rover_execute_standby")?;
-							println!("  [Rover] Entering standby...");
-							last_command = cmd_type;
-						},
+							let cmd_type = RoverCommand::from_u8(command.command_type)
+								.ok_or_else(|| tightbeam::TightBeamError::InvalidBody)?;
+
+							println!("  [Rover] Command: {}", cmd_type.to_string());
+
+							// Execute command and update state
+							match cmd_type {
+								RoverCommand::CollectSample { .. } => {
+									trace.event("rover_execute_collect_sample")?;
+									println!("  [Rover] Collecting sample...");
+									last_command = cmd_type;
+								},
+								RoverCommand::ProbeLocation { .. } => {
+									trace.event("rover_execute_probe_location")?;
+									println!("  [Rover] Probing location...");
+									last_command = cmd_type;
+								},
+								RoverCommand::TakePhoto { .. } => {
+									trace.event("rover_execute_take_photo")?;
+									println!("  [Rover] Capturing image...");
+									last_command = cmd_type;
+								},
+								RoverCommand::Standby => {
+									trace.event("rover_execute_standby")?;
+									println!("  [Rover] Entering standby...");
+									last_command = cmd_type;
+								},
+							}
+
+							advance_clock(delays::ROVER_TO_RELAY_MS * 2);
+							trace.event("rover_command_complete")?;
+
+							println!("  [Rover] Complete - MET: T+{:05}s\n", mission_time_ms() / 1000);
+
+							completed_rounds += 1;
+						}
+					},
+					ProcessResult::Buffered => {
+						// Wait for more frames
+						continue;
+					},
+					ProcessResult::ChainGap { .. } => {
+						eprintln!("  [Rover] Chain gap detected");
+						// TODO: Request missing frames
+						continue;
 					}
-
-					advance_clock(delays::ROVER_TO_RELAY_MS * 2);
-					trace.event("rover_command_complete")?;
-
-					println!("  [Rover] Complete - MET: T+{:05}s\n",
-						mission_time_ms() / 1000);
-
-					completed_rounds += 1;
 				}
 			}
+		}
 
 			trace.event("mission_complete")?;
 			println!("╔════════════════════════════════════════════════════════════╗");

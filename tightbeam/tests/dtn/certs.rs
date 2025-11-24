@@ -138,3 +138,17 @@ pub fn rover_verifying_key() -> Secp256k1VerifyingKey {
 	Secp256k1VerifyingKey::from_sec1_bytes(ROVER_PUB_KEY)
 		.expect("ROVER_PUB_KEY is a valid secp256k1 public key")
 }
+
+// ============================================================================
+// Shared Encryption Key (Earth ↔ Rover)
+// ============================================================================
+
+/// Generate a shared AES-256-GCM cipher for end-to-end encryption between Earth and Rover
+/// The Satellite cannot decrypt messages as it does not possess this key
+pub fn generate_shared_cipher() -> tightbeam::crypto::aead::Aes256Gcm {
+	use tightbeam::crypto::aead::{Aes256Gcm, Key, KeyInit};
+	// For testing: use a deterministic key
+	// In production, this would be securely exchanged or derived
+	let key_bytes = hex!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+	Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes))
+}

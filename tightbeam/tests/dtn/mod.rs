@@ -33,13 +33,16 @@
 //! - `types.rs`: Base DTN types and custom error types
 //! - `ultimate.rs`: Ultimate DTN test demonstrating all framework capabilities
 
-pub mod certs;
-pub mod clock;
 pub mod bms;
+pub mod certs;
+pub mod chain_processor;
+pub mod clock;
 pub mod fault_matrix;
 pub mod faults;
 pub mod messages;
+pub mod ordering;
 pub mod servlets;
+pub mod storage;
 pub mod types;
 pub mod ultimate;
 pub mod utils;

@@ -5,8 +5,10 @@
 //! - Earth command & control
 //! - Message chain consensus validation
 
-use tightbeam::der::{Enumerated, Sequence};
-use tightbeam::Beamable;
+use tightbeam::asn1::Frame;
+use tightbeam::crypto::hash::{Digest, Sha3_256};
+use tightbeam::der::{Encode, Enumerated, Sequence};
+use tightbeam::{Beamable, TightBeamError};
 
 // ============================================================================
 // Rover Telemetry Messages
@@ -201,9 +203,50 @@ impl MessageChainState {
 		self.last_hash = new_hash;
 		self.sequence += 1;
 	}
+
+	/// Validate frame against chain state
+	///
+	/// Checks:
+	/// 1. Frame order matches expected sequence
+	/// 2. Frame's previous_frame hash matches our last_hash (if sequence > 0)
+	pub fn validate_frame(&self, frame: &Frame) -> Result<bool, TightBeamError> {
+		// Check sequence order
+		if frame.metadata.order != self.sequence + 1 {
+			return Ok(false);
+		}
+
+		// For first frame (sequence 0), no previous hash to check
+		if self.sequence == 0 {
+			return Ok(true);
+		}
+
+		// Verify previous_frame hash matches
+		if let Some(ref digest_info) = frame.metadata.previous_frame {
+			let expected_hash = digest_info.digest.as_bytes();
+			Ok(expected_hash == self.last_hash.as_slice())
+		} else {
+			// Missing previous_frame when we expect one
+			Ok(false)
+		}
+	}
+
+	/// Update chain state with new frame
+	///
+	/// Computes the frame's hash and updates the chain state
+	pub fn update_with_frame(&mut self, frame: &Frame) -> Result<(), TightBeamError> {
+		let frame_bytes = frame.to_der()?;
+		let frame_hash = Sha3_256::digest(&frame_bytes);
+
+		// Copy hash into our buffer
+		self.last_hash.copy_from_slice(&frame_hash);
+		self.sequence = frame.metadata.order;
+
+		Ok(())
+	}
 }
 
 /// Consensus validator for 2/3 agreement on message chains
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConsensusValidator {
 	pub rover_state: MessageChainState,
 	pub earth_state: MessageChainState,
@@ -211,14 +254,6 @@ pub struct ConsensusValidator {
 }
 
 impl ConsensusValidator {
-	pub fn new() -> Self {
-		Self {
-			rover_state: MessageChainState::new("rover".to_string()),
-			earth_state: MessageChainState::new("earth".to_string()),
-			relay_state: MessageChainState::new("relay".to_string()),
-		}
-	}
-
 	/// Validate that at least 2/3 nodes agree on chain state
 	pub fn validate(&self, new_hash: &[u8; 32]) -> bool {
 		let mut agreements = 0;
@@ -252,6 +287,10 @@ impl ConsensusValidator {
 
 impl Default for ConsensusValidator {
 	fn default() -> Self {
-		Self::new()
+		Self {
+			rover_state: MessageChainState::new("rover".to_string()),
+			earth_state: MessageChainState::new("earth".to_string()),
+			relay_state: MessageChainState::new("relay".to_string()),
+		}
 	}
 }

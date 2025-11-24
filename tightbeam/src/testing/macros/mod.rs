@@ -333,6 +333,21 @@ where
 	closure(trace, config).await
 }
 
+/// Helper function for start closures with Arc<RwLock<Config>>
+#[cfg(feature = "tokio")]
+#[doc(hidden)]
+pub async fn __call_start_closure_with_rwlock<F, Fut, C, S>(
+	closure: F,
+	trace: std::sync::Arc<crate::trace::TraceCollector>,
+	config: std::sync::Arc<std::sync::RwLock<C>>,
+) -> Result<S, crate::TightBeamError>
+where
+	F: FnOnce(std::sync::Arc<crate::trace::TraceCollector>, std::sync::Arc<std::sync::RwLock<C>>) -> Fut,
+	Fut: core::future::Future<Output = Result<S, crate::TightBeamError>>,
+{
+	closure(trace, config).await
+}
+
 /// Helper function for setup closures with Arc<RwLock<Config>>
 #[cfg(feature = "tokio")]
 #[doc(hidden)]
@@ -2536,15 +2551,14 @@ macro_rules! tb_scenario {
 
 		// Create scenario config (or use () if not provided)
 		let config = $crate::__tb_scenario_default_config!($($scenario_config)?);
+		// Wrap config in Arc<RwLock> before start
+		let config_lock = std::sync::Arc::new(std::sync::RwLock::new(config));
 
-		// Start servlet using start block (receives Arc<trace>, &config)
-		let servlet_instance = $crate::testing::macros::__call_start_closure($start_closure, trace_server, &config)
+		// Start servlet using start block (receives Arc<trace>, Arc<RwLock<config>>)
+		let servlet_instance = $crate::testing::macros::__call_start_closure_with_rwlock($start_closure, trace_server, config_lock.clone())
 			.await
 			.expect("Failed to start servlet");
 			let server_addr = servlet_instance.addr();
-
-			// Wrap config in Arc<RwLock> for mutable setup
-			let config_lock = std::sync::Arc::new(std::sync::RwLock::new(config));
 
 			// Setup client (receives addr + Arc<RwLock<config>> for mutation)
 			let client: _ = $crate::__tb_scenario_servlet_setup_with_config!(
