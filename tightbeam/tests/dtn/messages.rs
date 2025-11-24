@@ -8,7 +8,7 @@
 use std::convert::TryFrom;
 use std::fmt;
 
-use tightbeam::asn1::{Frame, MessagePriority};
+use tightbeam::asn1::{Choice, Frame, MessagePriority};
 use tightbeam::crypto::hash::{Digest, Sha3_256};
 use tightbeam::der::{Encode, Enumerated, Sequence};
 use tightbeam::{Beamable, TightBeamError};
@@ -78,6 +78,17 @@ pub struct EarthCommand {
 	pub priority: MessagePriority,
 	/// Mission time when command was issued
 	pub mission_time_ms: u64,
+}
+
+/// Acknowledgment of command receipt
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+pub struct CommandAck {
+	/// Command ID being acknowledged
+	pub command_id: String,
+	/// Whether command was accepted
+	pub accepted: bool,
+	/// Optional message
+	pub message: Option<String>,
 }
 
 impl EarthCommand {
@@ -161,6 +172,38 @@ impl fmt::Display for RoverCommand {
 		};
 		write!(f, "{}", name)
 	}
+}
+
+// ============================================================================
+// Relay & Network Messages
+// ============================================================================
+
+/// Request for missing frames (Chain Gap recovery)
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+pub struct FrameRequest {
+	/// Hash of the last successfully received frame (chain head)
+	pub requester_head: [u8; 32],
+	/// Hash of the frame we received that indicated a gap
+	pub last_received_hash: [u8; 32],
+}
+
+/// Response containing missing frames
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+pub struct FrameResponse {
+	pub frames: Vec<Frame>,
+}
+
+/// Message types that Relay servlet can handle (from Earth or Rover)
+#[derive(Beamable, Choice, Clone, Debug, PartialEq)]
+pub enum RelayMessage {
+	/// Command from Earth to be forwarded to Rover
+	Command(EarthCommand),
+	/// Telemetry from Rover to be forwarded to Earth
+	Telemetry(RoverTelemetry),
+	/// Acknowledgment from Rover to Earth
+	CommandAck(CommandAck),
+	/// Frame request from Earth
+	FrameRequest(FrameRequest),
 }
 
 // ============================================================================

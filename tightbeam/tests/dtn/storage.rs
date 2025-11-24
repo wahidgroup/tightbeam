@@ -78,6 +78,31 @@ impl FrameStore {
 		Ok(frame)
 	}
 
+	/// Retrieve a frame by its hash (searches all stored frames)
+	pub fn retrieve_by_hash(&mut self, hash: &[u8]) -> Result<Option<Frame>, TightBeamError> {
+		// Check memory cache first
+		for frame in self.frames.values() {
+			let frame_bytes = frame.to_der()?;
+			let frame_hash = Sha3_256::digest(&frame_bytes);
+			if frame_hash.as_slice() == hash {
+				return Ok(Some(frame.clone()));
+			}
+		}
+
+		// Search disk storage
+		let frame_ids = self.list_frames()?;
+		for id in frame_ids {
+			let frame = self.retrieve(&id)?;
+			let frame_bytes = frame.to_der()?;
+			let frame_hash = Sha3_256::digest(&frame_bytes);
+			if frame_hash.as_slice() == hash {
+				return Ok(Some(frame));
+			}
+		}
+
+		Ok(None)
+	}
+
 	/// Verify cryptographic chain of frames
 	///
 	/// Validates that each frame's `previous_frame` hash matches the
@@ -121,7 +146,6 @@ impl FrameStore {
 	pub fn list_frames(&self) -> Result<Vec<String>, TightBeamError> {
 		let mut frame_ids = Vec::new();
 		let entries = std::fs::read_dir(&self.storage_dir)?;
-
 		for entry in entries {
 			let entry = entry?;
 			let path = entry.path();

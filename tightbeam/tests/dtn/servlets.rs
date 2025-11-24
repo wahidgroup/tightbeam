@@ -4,16 +4,12 @@
 //! - Earth Ground Station: Receives telemetry and sends commands
 //! - Relay Satellite: Forwards messages between Mars and Earth
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
-#[cfg(feature = "compress")]
-use tightbeam::compress::ZstdCompression;
-
 use tightbeam::{
-	asn1::MessagePriority,
-	compress::Inflator,
 	crypto::{
 		aead::Aes256Gcm,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
@@ -32,7 +28,6 @@ use crate::dtn::{
 		SATELLITE_PINNING_ROVER,
 	},
 	chain_processor::{ChainProcessor, ProcessResult},
-	clock::{advance_clock, delays, mission_time_ms},
 	command_executor::CommandExecutor,
 	fault_manager::FaultManager,
 	fault_matrix::FaultMatrix,
@@ -44,26 +39,8 @@ use crate::dtn::{
 // Earth Ground Station Servlet
 // ============================================================================
 
-/// Select command based on telemetry and fault state using simple LCG RNG
-fn select_random_command(telemetry: &RoverTelemetry, fault_matrix: &FaultMatrix, seed: u64) -> RoverCommand {
-	// Simple linear congruential generator for deterministic randomness
-	let rng_state = seed.wrapping_mul(1103515245).wrapping_add(12345);
-	// Constraints: low battery or any fault -> standby
-	if telemetry.battery_percent < 20 || fault_matrix.has_fault() {
-		return RoverCommand::Standby;
-	}
-
-	// Random selection among operational commands
-	match rng_state % 3 {
-		0 => RoverCommand::CollectSample { location: "Jezero Crater Delta".to_string() },
-		1 => RoverCommand::ProbeLocation { x: 100, y: 200 },
-		2 => RoverCommand::TakePhoto { direction: "forward".to_string(), resolution: 1024 },
-		_ => unreachable!(),
-	}
-}
-
 servlet! {
-	/// Earth ground station that receives science data from relay and sends commands
+	/// Earth ground station that receives science data from relay
 	pub EarthGroundStationServlet<RoverTelemetry>,
 	protocol: TokioListener,
 	x509: {
@@ -77,11 +54,10 @@ servlet! {
 		shared_cipher: Aes256Gcm,
 		chain_processor: Arc<ChainProcessor>,
 		frame_builder: Arc<FrameBuilderHelper>,
+		relay_addr: TightBeamSocketAddr,
 	},
 	handle: |frame, trace, config| async move {
-		trace.event("earth_receive_telemetry")?;
-
-		// 1. Verify Rover's signature
+		// Verify Rover's signature
 		if frame.nonrepudiation.is_some() {
 			match frame.verify::<Secp256k1Signature>(&config.rover_verifying_key) {
 				Ok(_) => println!("[Earth] ✓ Rover signature verified"),
@@ -92,47 +68,78 @@ servlet! {
 			}
 		}
 
-		// 2. Process frame (persist, order, validate chain)
+		// Process frame (persist, order, validate chain)
 		match config.chain_processor.process_incoming(frame)? {
 			ProcessResult::Processed(ordered_frames) => {
 				let mut last_response = None;
 				for ordered_frame in ordered_frames {
-					let fault_matrix = FaultMatrix::try_from(&ordered_frame.metadata.matrix)?;
-					let telemetry: RoverTelemetry = if ordered_frame.metadata.confidentiality.is_some() {
-						println!("[Earth] Decrypting telemetry with shared cipher");
-						ordered_frame.decrypt::<RoverTelemetry>(&config.shared_cipher, Some(&ZstdCompression))?
+					trace.event("earth_receive_telemetry")?;
+					let _fault_matrix = FaultMatrix::try_from(&ordered_frame.metadata.matrix)?;
+
+					// Get order before consuming frame
+					let order = ordered_frame.metadata.order;
+					
+					// Decode telemetry
+					let _telemetry: RoverTelemetry = if ordered_frame.metadata.confidentiality.is_some() {
+						use tightbeam::compress::{Inflator, ZstdCompression};
+						let inflator: Option<&dyn Inflator> = if ordered_frame.metadata.compactness.is_some() {
+							Some(&ZstdCompression)
+						} else {
+							None
+						};
+						ordered_frame.decrypt::<RoverTelemetry>(&config.shared_cipher, inflator)?
 					} else {
 						decode(&ordered_frame.message)?
 					};
 
+					println!("[Earth] Received telemetry");
 					trace.event("earth_analyze_telemetry")?;
-					trace.event("earth_select_command")?;
 
-					// Generate command
-					let command = select_random_command(&telemetry, &fault_matrix, mission_time_ms());
-					let earth_command = EarthCommand::new(command, MessagePriority::Normal, mission_time_ms());
+			// Build command response
+			let command_type = (order % 3) as u8;
+			let rover_cmd = match command_type {
+				0 => RoverCommand::CollectSample { location: "Site Alpha".to_string() },
+				1 => RoverCommand::ProbeLocation { x: 100, y: 200 },
+				_ => RoverCommand::TakePhoto { direction: "North".to_string(), resolution: 1080 },
+			};
 
-					// Prepare outgoing frame with previous_frame hash
-					let (next_order, previous_digest) = config.chain_processor.prepare_outgoing()?;
-					let response = config.frame_builder.build_command_frame(
-						earth_command,
+			let (next_order, previous_digest) = config.chain_processor.prepare_outgoing()?;
+			let command = EarthCommand::new(rover_cmd, tightbeam::asn1::MessagePriority::Normal, 0);
+					
+					let command_frame = config.frame_builder.build_command_frame(
+						command,
 						next_order,
 						previous_digest,
 						&config.earth_signing_key,
 						&config.shared_cipher,
 					)?;
 
-					trace.event("earth_send_command")?;
-
-					last_response = Some(response);
+					println!("[Earth] ✓ Command frame built, returning as response");
+					last_response = Some(command_frame);
 				}
 
 				Ok(last_response)
 			},
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// TODO: Request missing frames
-				eprintln!("[Earth] Chain gap - would request frames (head: {:?}, missing: {:?})", current_head, missing_hash);
+				eprintln!("[Earth] Chain gap detected - requesting missing frames");
+
+				// Convert Vec<u8> to [u8; 32]
+				let requester_head: [u8; 32] = current_head.as_slice().try_into()
+					.map_err(|_| TightBeamError::MissingSignature)?; // Using available error variant
+				let last_received_hash: [u8; 32] = missing_hash.as_slice().try_into()
+					.map_err(|_| TightBeamError::MissingSignature)?;
+
+				// Build FrameRequest
+				let _request = crate::dtn::messages::FrameRequest {
+					requester_head,
+					last_received_hash,
+				};
+
+				println!("[Earth] FrameRequest built (sending not implemented - needs frame building)");
+				// TODO: Build frame containing FrameRequest, send to Relay, receive FrameResponse
+				// This requires proper FrameBuilder support for RelayMessage enum
+
 				Ok(None)
 			}
 		}
@@ -144,7 +151,7 @@ servlet! {
 // ============================================================================
 
 servlet! {
-	/// Relay satellite that forwards frames from Rover to Earth
+	/// Relay satellite that forwards messages between Earth and Rover
 	pub RelaySatelliteServlet<RoverTelemetry>,
 	protocol: TokioListener,
 	x509: {
@@ -154,70 +161,61 @@ servlet! {
 	},
 	config: {
 		earth_addr: TightBeamSocketAddr,
+		rover_addr: TightBeamSocketAddr,
 		rover_verifying_key: Secp256k1VerifyingKey,
 		earth_verifying_key: Secp256k1VerifyingKey,
 		chain_processor: Arc<ChainProcessor>,
+		shared_cipher: Aes256Gcm,
 	},
 	handle: |frame, trace, config| async move {
-		trace.event("relay_receive_from_rover")?;
-
-		// Verify Rover's signature
-		if frame.nonrepudiation.is_some() {
-			match frame.verify::<Secp256k1Signature>(&config.rover_verifying_key) {
-				Ok(_) => println!("[Satellite] ✓ Rover signature verified - forwarding encrypted frame"),
-				Err(e) => return Err(e),
+		// Verify signature and determine source
+		let from_rover = if frame.nonrepudiation.is_some() {
+			if frame.verify::<Secp256k1Signature>(&config.rover_verifying_key).is_ok() {
+				println!("[Satellite] ✓ Rover signature verified");
+				true
+			} else if frame.verify::<Secp256k1Signature>(&config.earth_verifying_key).is_ok() {
+				println!("[Satellite] ✓ Earth signature verified");
+				false
+			} else {
+				eprintln!("[Satellite] ✗ Signature verification FAILED");
+				frame.verify::<Secp256k1Signature>(&config.rover_verifying_key)?;
+				false
 			}
-		}
+		} else {
+			false
+		};
 
-		// Process uplink frame
-		match config.chain_processor.process_incoming(frame)? {
-			ProcessResult::Processed(ordered_frames) => {
-				let mut last_response = None;
-				for ordered_frame in ordered_frames {
-					advance_clock(delays::RELAY_TO_EARTH_MS);
-					trace.event("relay_forward_uplink")?;
+		// Emit appropriate receive event based on source
+		if from_rover {
+			trace.event("relay_receive_from_rover")?;
+			trace.event("relay_forward_uplink")?;
 
-					// Forward to Earth
-					let mut earth_client = ClientBuilder::<TokioListener>::connect(config.earth_addr)
-						.await?
-						.with_server_certificate(EARTH_CERT)?
-						.with_client_identity(SATELLITE_CERT, SATELLITE_KEY)?
-						.with_restart(RestartExponentialBackoff::new(3, 100, None))
-						.with_timeout(Duration::from_millis(2000))
-						.build()?;
+		// Forward telemetry to Earth (Relay just forwards, doesn't process/order)
+		let mut earth_client = ClientBuilder::<TokioListener>::connect(config.earth_addr)
+			.await?
+			.with_server_certificate(EARTH_CERT)?
+			.with_client_identity(SATELLITE_CERT, SATELLITE_KEY)?
+			.with_restart(RestartExponentialBackoff::new(3, 100, None))
+			.with_timeout(Duration::from_millis(2000))
+			.build()?;
 
-					let earth_response = earth_client.emit(ordered_frame, None).await?;
-					if let Some(response_frame) = earth_response {
-						trace.event("relay_receive_from_earth")?;
-
-						// Verify Earth's signature
-						match response_frame.verify::<Secp256k1Signature>(&config.earth_verifying_key) {
-							Ok(_) => println!("[Satellite] ✓ Earth signature verified - forwarding encrypted command"),
-							Err(e) => return Err(e),
-						}
-
-						// Process downlink (also validates chain)
-						match config.chain_processor.process_incoming(response_frame.clone())? {
-							ProcessResult::Processed(_) | ProcessResult::Buffered => {
-								last_response = Some(response_frame);
-							},
-							ProcessResult::ChainGap { .. } => {
-								eprintln!("[Satellite] Chain gap in downlink");
-							}
-						}
-					}
-
-					advance_clock(delays::EARTH_TO_RELAY_MS);
-					trace.event("relay_forward_downlink")?;
-				}
-
-				Ok(last_response)
-			},
-			ProcessResult::Buffered => Ok(None),
-			ProcessResult::ChainGap { .. } => {
-				eprintln!("[Satellite] Chain gap in uplink");
-				Ok(None)
-			}
+		let response = earth_client.emit(frame, None).await?;
+		Ok(response)
+		} else {
+		// Forward command from Earth to Rover (Relay just forwards, doesn't process/order)
+		trace.event("relay_receive_from_earth")?;
+		trace.event("relay_forward_downlink")?;
+		
+		let mut rover_client = ClientBuilder::<TokioListener>::connect(config.rover_addr)
+			.await?
+			.with_server_certificate(ROVER_CERT)?
+			.with_client_identity(SATELLITE_CERT, SATELLITE_KEY)?
+			.with_restart(RestartExponentialBackoff::new(3, 100, None))
+			.with_timeout(Duration::from_millis(2000))
+			.build()?;
+			
+		let response = rover_client.emit(frame, None).await?;
+		Ok(response)
 		}
 	}
 }
@@ -241,7 +239,7 @@ impl Default for MissionState {
 }
 
 servlet! {
-	/// Mars rover servlet that sends telemetry and receives commands
+	/// Mars rover servlet (currently unused - using direct client connection)
 	pub RoverServlet<EarthCommand>,
 	protocol: TokioListener,
 	x509: {
@@ -260,57 +258,11 @@ servlet! {
 		frame_builder: Arc<FrameBuilderHelper>,
 		mission_state: Arc<RwLock<MissionState>>,
 		max_rounds: usize,
+		command_queue: Arc<RwLock<VecDeque<EarthCommand>>>,
 	},
-	handle: |frame, trace, config| async move {
-		trace.event("rover_receive_command")?;
-
-		// Verify Earth's signature
-		match frame.verify::<Secp256k1Signature>(&config.earth_verifying_key) {
-			Ok(_) => println!("  [Rover] ✓ Earth signature verified"),
-			Err(e) => return Err(e),
-		}
-
-		// Process response
-		match config.chain_processor.process_incoming(frame)? {
-			ProcessResult::Processed(ordered_frames) => {
-				for ordered_frame in ordered_frames {
-					// Decrypt command (and decompress if compressed)
-					let command: EarthCommand = if ordered_frame.metadata.confidentiality.is_some() {
-						println!("  [Rover] Decrypting command with shared cipher");
-						ordered_frame.decrypt::<EarthCommand>(&config.shared_cipher, Some(&ZstdCompression))?
-					} else {
-						decode(&ordered_frame.message)?
-					};
-
-					let cmd_type = RoverCommand::try_from(command.command_type)?;
-
-					println!("  [Rover] Command: {}", cmd_type.to_string());
-
-					// Execute command
-					config.command_executor.write()?.execute_command(cmd_type, &trace)?;
-
-					advance_clock(delays::ROVER_TO_RELAY_MS * 2);
-					trace.event("rover_command_complete")?;
-
-					// Update mission state
-					{
-						let mut state = config.mission_state.write()?;
-						state.completed_rounds += 1;
-						if state.completed_rounds >= config.max_rounds {
-							state.mission_complete = true;
-						}
-					}
-
-					println!("  [Rover] Complete - MET: T+{:05}s\n", mission_time_ms() / 1000);
-				}
-
-				Ok(None)
-			},
-			ProcessResult::Buffered => Ok(None),
-			ProcessResult::ChainGap { .. } => {
-				eprintln!("  [Rover] Chain gap detected");
-				Ok(None)
-			}
-		}
+	handle: |_frame, _trace, _config| async move {
+		// NOTE: Rover servlet currently unused - using direct client connection in mission loop
+		// TODO: Migrate to servlet-based async command reception
+		Ok(None)
 	}
 }

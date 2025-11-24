@@ -10,8 +10,8 @@
 use std::sync::{Arc, RwLock};
 
 use tightbeam::asn1::{AlgorithmIdentifier, Frame, OctetString};
-use tightbeam::crypto::hash::Sha3_256;
-use tightbeam::der::oid::AssociatedOid;
+use tightbeam::crypto::hash::{Digest, Sha3_256};
+use tightbeam::der::{oid::AssociatedOid, Encode};
 use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::TightBeamError;
 
@@ -57,13 +57,38 @@ impl ChainProcessor {
 		// 2. Insert into ordering buffer
 		let frames_to_process = self.order_buffer.write()?.insert(frame)?;
 		if let Some(frames) = frames_to_process {
-			// 3. Validate and update chain for ordered frames
+			// 3. Verify batch integrity before committing to chain state
+			let verdict = self.store.read()?.verify_chain(&frames)?;
+			if !verdict.valid {
+				// Batch verification failed - return chain gap
+				let current_head = self.chain_state.read()?.last_hash.to_vec();
+				let missing_hash = frames
+					.first()
+					.and_then(|f| f.metadata.previous_frame.as_ref())
+					.map(|d| d.digest.as_bytes().to_vec())
+					.unwrap_or_default();
+
+				eprintln!(
+					"[{}] ⚠ Batch chain verification failed ({} broken links)",
+					self.node_name,
+					verdict.broken_links.len()
+				);
+				for (idx, msg) in &verdict.broken_links {
+					eprintln!("  Frame {}: {}", idx, msg);
+				}
+
+				return Ok(ProcessResult::ChainGap { current_head, missing_hash });
+			}
+
+			// 4. Validate and update chain for ordered frames
+			let chain_state_guard = self.chain_state.read()?;
 			let mut validated_frames = Vec::new();
+			let mut frames_to_update = Vec::new();
 			for ordered_frame in frames {
-				let chain_valid = self.chain_state.read()?.validate_frame(&ordered_frame)?;
+				let chain_valid = chain_state_guard.validate_frame(&ordered_frame)?;
 				if !chain_valid {
 					// Chain gap detected
-					let current_head = self.chain_state.read()?.last_hash.to_vec();
+					let current_head = chain_state_guard.last_hash.to_vec();
 					let missing_hash = ordered_frame
 						.metadata
 						.previous_frame
@@ -78,8 +103,17 @@ impl ChainProcessor {
 					return Ok(ProcessResult::ChainGap { current_head, missing_hash });
 				}
 
-				// Update chain state
-				self.chain_state.write()?.update_with_frame(&ordered_frame)?;
+				// Collect frames to update (will update after releasing read lock)
+				frames_to_update.push(ordered_frame);
+			}
+
+			// Release read lock before acquiring write lock
+			drop(chain_state_guard);
+
+			// Update chain state for all validated frames (single write lock acquisition)
+			let mut chain_state_guard = self.chain_state.write()?;
+			for ordered_frame in frames_to_update {
+				chain_state_guard.update_with_frame(&ordered_frame)?;
 				validated_frames.push(ordered_frame);
 			}
 
@@ -119,5 +153,65 @@ impl ChainProcessor {
 		}
 
 		Ok(())
+	}
+
+	/// Request missing frames between requester_head and last_received_hash
+	///
+	/// Traverses the chain backwards from last_received_hash to requester_head,
+	/// collecting all frames in between.
+	pub fn request_missing_frames(
+		&self,
+		requester_head: &[u8],
+		last_received_hash: &[u8],
+	) -> Result<Vec<Frame>, TightBeamError> {
+		let mut store = self.store.write()?;
+
+		// Find frame with hash matching last_received_hash (frame just before gap)
+		let mut current_frame = match store.retrieve_by_hash(last_received_hash)? {
+			Some(frame) => frame,
+			None => {
+				// Frame not found, return empty
+				return Ok(Vec::new());
+			}
+		};
+
+		// Traverse backwards collecting frames until we reach requester_head
+		let mut collected_frames = Vec::new();
+		loop {
+			// Check if we've reached the requester's head
+			let current_bytes = current_frame.to_der()?;
+			let current_hash = Sha3_256::digest(&current_bytes);
+			if current_hash.as_slice() == requester_head {
+				// Found the requester's head, we're done
+				break;
+			}
+
+			// Add current frame to collection
+			collected_frames.push(current_frame.clone());
+
+			// Move to previous frame using previous_frame hash
+			match current_frame.metadata.previous_frame.as_ref() {
+				Some(digest_info) => {
+					let prev_hash = digest_info.digest.as_bytes();
+					match store.retrieve_by_hash(prev_hash)? {
+						Some(prev_frame) => {
+							current_frame = prev_frame;
+						}
+						None => {
+							// Previous frame not found, stop traversal
+							break;
+						}
+					}
+				}
+				None => {
+					// No previous frame, stop traversal
+					break;
+				}
+			}
+		}
+
+		// Reverse to get forward chronological order
+		collected_frames.reverse();
+		Ok(collected_frames)
 	}
 }
