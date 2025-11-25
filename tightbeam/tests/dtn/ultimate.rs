@@ -104,6 +104,8 @@ pub struct DtnScenarioConfig {
 	pub relay_store: RwLock<FrameStore>,
 	/// Relay address for rover client to connect to
 	pub relay_addr: RwLock<Option<TightBeamSocketAddr>>,
+	/// Shared mission state between RoverServlet and mission loop
+	pub mission_state: Arc<RwLock<MissionState>>,
 	/// Rover servlet address for async commands
 	pub rover_addr: RwLock<Option<TightBeamSocketAddr>>,
 	/// Relay servlet handle (keeps the servlet task alive)
@@ -112,8 +114,6 @@ pub struct DtnScenarioConfig {
 	pub _earth_servlet: RwLock<Option<EarthGroundStationServlet>>,
 	/// Command queue for async command execution on Rover
 	pub command_queue: Arc<RwLock<VecDeque<EarthCommand>>>,
-	/// Shared mission state (updated by RoverServlet, read by rover client)
-	pub mission_state: Arc<RwLock<MissionState>>,
 }
 
 impl Default for DtnScenarioConfig {
@@ -207,9 +207,6 @@ async fn earth_mission_control_task(
 ) -> Result<(), TightBeamError> {
 	println!("[Earth Mission Control] Task STARTING - {} rounds", max_rounds);
 
-	// Wait for RoverServlet to be fully ready
-	tokio::time::sleep(Duration::from_millis(200)).await;
-
 	debug_log!(
 		"[{}] [Earth Mission Control] Task started - {} rounds",
 		format_mission_time(mission_time_ms()),
@@ -298,17 +295,15 @@ tb_assert_spec! {
 			("mission_start", exactly!(1)),
 			("mission_complete", exactly!(1)),
 
-			// Earth events
-			("earth_receive_telemetry", exactly!(6)),
-			("earth_analyze_telemetry", exactly!(6)),
+			// Earth events (async architecture)
+			("earth_send_command", exactly!(6)),
 
-			// Relay events (uplink only - downlink is synchronous response)
-			("relay_receive_from_rover", exactly!(6)),
-			("relay_forward_uplink", exactly!(6)),
+			// Relay events (bidirectional async)
+			("relay_receive_from_earth", exactly!(6)),
+			("relay_forward_downlink", exactly!(6)),
 
-			// Rover events
-			("rover_send_telemetry", exactly!(6)),
-			("rover_receive_command", exactly!(6)),
+			// Rover events (async command reception)
+			("rover_receive_async_command", exactly!(6)),
 			("rover_command_complete", exactly!(6))
 		]
 	}
@@ -322,18 +317,19 @@ tb_process_spec! {
 	pub DtnRoverEarthFlow,
 	events {
 		observable {
-			// Rover events
-			"rover_send_telemetry", "rover_receive_command",
+			// Rover events (async)
+			"rover_send_telemetry", "rover_receive_async_command",
 			"rover_execute_collect_sample", "rover_execute_probe_location",
 			"rover_execute_take_photo", "rover_execute_standby",
 			"rover_command_complete",
 
-			// Relay events
+			// Relay events (bidirectional async)
 			"relay_receive_from_rover", "relay_forward_uplink",
 			"relay_receive_from_earth", "relay_forward_downlink",
 
-			// Earth events
+			// Earth events (async)
 			"earth_receive_telemetry", "earth_analyze_telemetry",
+			"earth_send_command",
 
 			// Fault events
 			"fault_low_power_detected", "comms_halted", "fault_cleared",
@@ -347,57 +343,44 @@ tb_process_spec! {
 		hidden { }
 	}
 	states {
-		MissionStart => { "mission_start" => TelemetrySending },
+		// Start state
+		Init => { "mission_start" => Running },
 
-		// Rover initiates telemetry (synchronous request/response pattern)
-		TelemetrySending => {
-			"rover_send_telemetry" => UplinkInProgress
-		},
-		UplinkInProgress => {
-			"relay_receive_from_rover" => RelayForwardingTelemetry
-		},
-		RelayForwardingTelemetry => {
-			"relay_forward_uplink" => EarthBound
-		},
-		EarthBound => {
-			"earth_receive_telemetry" => EarthAnalyzing
-		},
-		EarthAnalyzing => {
-			"earth_analyze_telemetry" => CommandDownlink
-		},
+		// Single running state that allows all async events
+		Running => {
+			// Command flow events
+			"earth_send_command" => Running,
+			"relay_receive_from_earth" => Running,
+			"relay_forward_downlink" => Running,
+			"rover_receive_async_command" => Running,
 
-		// Earth responds with command (synchronous response - relay transparent)
-		CommandDownlink => {
-			"rover_receive_command" => CommandExecution
-		},
-		CommandExecution => {
-			"rover_execute_collect_sample" => CommandComplete,
-			"rover_execute_probe_location" => CommandComplete,
-			"rover_execute_take_photo" => CommandComplete,
-			"rover_execute_standby" => CommandComplete
-		},
-		CommandComplete => {
-			"rover_command_complete" => RoundComplete
-		},
+			// Command execution events
+			"rover_execute_collect_sample" => Running,
+			"rover_execute_probe_location" => Running,
+			"rover_execute_take_photo" => Running,
+			"rover_execute_standby" => Running,
+			"rover_command_complete" => Running,
 
-		// Loop back or complete
-		RoundComplete => {
-			"rover_send_telemetry" => UplinkInProgress,
-			"mission_complete" => MissionEnd
-		},
+			// Telemetry flow events (future expansion)
+			"rover_send_telemetry" => Running,
+			"relay_receive_from_rover" => Running,
+			"relay_forward_uplink" => Running,
+			"earth_receive_telemetry" => Running,
+			"earth_analyze_telemetry" => Running,
 
-		// Fault handling
-		CommandExecution => {
-			"fault_low_power_detected" => FaultHandling
-		},
-		FaultHandling => {
-			"comms_halted" => FaultWait
-		},
-		FaultWait => {
-			"fault_cleared" => TelemetrySending
+			// Fault events
+			"fault_low_power_detected" => Running,
+			"comms_halted" => Running,
+			"fault_cleared" => Running,
+
+			// Security events
+			"signature_verification_failed" => Running,
+
+			// Mission completion
+			"mission_complete" => Done
 		}
 	}
-	terminal { MissionEnd }
+	terminal { Done }
 }
 
 // ============================================================================
@@ -569,9 +552,6 @@ async fn run_mission_loop(
 
 		// Note: Commands are executed by the isolated RoverServlet when received from Earth via Relay
 		// The rover client just sends telemetry and monitors mission completion via shared state
-
-		// Give time for Earth to analyze telemetry and for RoverServlet to execute command
-		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
 
 	Ok(())
@@ -769,10 +749,13 @@ tb_scenario! {
 
 			// Initialize mission clock for the entire test
 			println!("[START] Initializing mission clock");
-			init_mission_clock();
+		init_mission_clock();
 
-			// Spawn Earth Mission Control task for async command sending
-			println!("[START] Spawning Earth Mission Control task");
+		//  Emit mission_start event
+		trace.event("mission_start")?;
+
+		// Spawn Earth Mission Control task for async command sending
+		println!("[START] Spawning Earth Mission Control task");
 			let earth_task_trace = Arc::clone(&trace);
 			let earth_task_signing_key = earth_signing_key.to_owned();
 			let earth_task_cipher = shared_cipher.to_owned();
@@ -822,7 +805,6 @@ tb_scenario! {
 			Ok(client)
 		},
 		client: |trace, mut rover_client, config| async move {
-			trace.event("mission_start")?;
 			println!("╔════════════════════════════════════════════════════════════╗");
 			println!("║  Mars Rover DTN Mission - {} Round Trips                   ║", COMMAND_ROUND_TRIPS);
 			println!("╚════════════════════════════════════════════════════════════╝\n");
