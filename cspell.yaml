@@ -47,6 +47,7 @@ words:
   - getopt
   - getrandom
   - hashint
+  - hashset
   - hashstack
   - HKDF
   - HMAC
@@ -97,6 +98,7 @@ words:
   - rustup
   - rwlock
   - SBMF
+  - sccs
   - Schedulability
   - schedulable
   - schnorr
@@ -111,6 +113,7 @@ words:
   - subsys
   - supraorganisms
   - Tanveer
+  - Tarjan
   - TCTL
   - tightbeam
   - trybuild

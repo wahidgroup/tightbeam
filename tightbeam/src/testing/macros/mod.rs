@@ -9,6 +9,9 @@
 // ProcessSpec macro (Layer 2 - CSP)
 #[cfg(feature = "testing-csp")]
 pub mod process_spec;
+// CompositionSpec macro (Layer 2 - CSP Composition)
+#[cfg(feature = "testing-csp")]
+pub mod compose_spec;
 
 // Gen States macro for fault injection (opt-in)
 #[cfg(feature = "testing-fault")]

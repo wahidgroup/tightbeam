@@ -14,14 +14,17 @@ pub mod assert;
 pub mod error;
 
 #[cfg(feature = "testing-csp")]
+pub mod composition;
+#[cfg(feature = "testing-csp")]
 pub mod csp;
 
 // Re-exports
 pub use assert::{verify_trace, TBSpec};
 pub use error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation};
 
-#[cfg(feature = "instrument")]
-pub use error::{EventCountMismatchDetail, EventOrderViolationDetail};
-
+#[cfg(feature = "testing-csp")]
+pub use composition::*;
 #[cfg(feature = "testing-csp")]
 pub use csp::*;
+#[cfg(feature = "instrument")]
+pub use error::{EventCountMismatchDetail, EventOrderViolationDetail};
