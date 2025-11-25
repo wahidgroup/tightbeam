@@ -21,7 +21,7 @@ use tightbeam::{
 use crate::dtn::{
 	chain_processor::ChainProcessor,
 	fault_matrix::FaultMatrix,
-	messages::{EarthCommand, RoverTelemetry},
+	messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverTelemetry},
 	utils::generate_message_id,
 };
 
@@ -99,6 +99,82 @@ impl FrameBuilderHelper {
 			.with_order(next_order)
 			.with_priority(command.priority)
 			.with_message(command);
+
+		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
+		let frame = builder.build()?;
+		self.finalize_frame(frame)
+	}
+
+	/// Build a frame request for missing frames (chain gap recovery)
+	pub fn build_frame_request_frame(
+		&self,
+		request: FrameRequest,
+		next_order: u64,
+		previous_digest: Option<DigestInfo>,
+		signing_key: &Secp256k1SigningKey,
+	) -> Result<Frame, TightBeamError> {
+		let builder = FrameBuilder::from(Version::V3)
+			.with_id(format!("frame-req-{:03}", next_order))
+			.with_order(next_order)
+			.with_message(request)
+			.with_message_hasher::<Sha3_256>()
+			.with_witness_hasher::<Sha3_256>()
+			.with_signer::<Secp256k1Signature, _>(signing_key.to_owned());
+
+		let builder = if let Some(digest) = previous_digest {
+			builder.with_previous_hash(digest)
+		} else {
+			builder
+		};
+
+		let frame = builder.build()?;
+		self.finalize_frame(frame)
+	}
+
+	/// Build a frame response with missing frames (chain gap recovery)
+	pub fn build_frame_response_frame(
+		&self,
+		response: FrameResponse,
+		next_order: u64,
+		previous_digest: Option<DigestInfo>,
+		signing_key: &Secp256k1SigningKey,
+	) -> Result<Frame, TightBeamError> {
+		let builder = FrameBuilder::from(Version::V3)
+			.with_id(format!("frame-resp-{:03}", next_order))
+			.with_order(next_order)
+			.with_message(response)
+			.with_message_hasher::<Sha3_256>()
+			.with_witness_hasher::<Sha3_256>()
+			.with_compression(ZstdCompression)
+			.with_signer::<Secp256k1Signature, _>(signing_key.to_owned());
+
+		let builder = if let Some(digest) = previous_digest {
+			builder.with_previous_hash(digest)
+		} else {
+			builder
+		};
+
+		let frame = builder.build()?;
+		self.finalize_frame(frame)
+	}
+
+	/// Build a relay message frame (for async Earth-initiated commands)
+	pub fn build_relay_command_frame(
+		&self,
+		command: EarthCommand,
+		next_order: u64,
+		previous_digest: Option<DigestInfo>,
+		signing_key: &Secp256k1SigningKey,
+		cipher: &Aes256Gcm,
+	) -> Result<Frame, TightBeamError> {
+		// Wrap command in RelayMessage
+		let relay_message = RelayMessage::Command(command.clone());
+
+		let builder = FrameBuilder::from(Version::V3)
+			.with_id(format!("relay-cmd-{:03}", next_order))
+			.with_order(next_order)
+			.with_priority(command.priority)
+			.with_message(relay_message);
 
 		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
 		let frame = builder.build()?;

@@ -24,6 +24,8 @@ pub enum BatteryUpdate {
 }
 
 /// Action to take based on fault state
+/// NOTE: Available for explicit fault action handling in complex scenarios
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FaultAction {
 	/// Continue normal operations
@@ -90,6 +92,8 @@ impl FaultManager {
 	}
 
 	/// Check for faults and return action to take
+	/// NOTE: Available for scenarios requiring explicit fault action decisions
+	#[allow(dead_code)]
 	pub fn check_and_handle_faults(&self) -> Result<FaultAction, TightBeamError> {
 		let fault_matrix = *self.fault_matrix.read()?;
 		let fault_handler = *self.fault_handler.read()?;

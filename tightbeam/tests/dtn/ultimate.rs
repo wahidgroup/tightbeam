@@ -18,6 +18,16 @@
 //! - T+25min: Rover receives Earth's command
 //! - T+25min: Low power fault detected
 //! - T+55min: Recharge complete, resume operations
+//!
+//! ## Debug Logging
+//!
+//! Set the `TIGHTBEAM_DEBUG` environment variable to see detailed execution logs:
+//!
+//! ```bash
+//! TIGHTBEAM_DEBUG=1 cargo test --features=... dtn_ultimate_realistic -- --nocapture
+//! ```
+//!
+//! Without this variable, only critical events are logged.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -25,10 +35,13 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rand_core::OsRng;
+
 use tightbeam::{
+	asn1::MessagePriority,
 	crypto::{
 		aead::Aes256Gcm,
-		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey},
+		key::KeySpec,
+		sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey},
 	},
 	error::TightBeamError,
 	exactly,
@@ -40,23 +53,29 @@ use tightbeam::{
 	transport::{policy::RestartExponentialBackoff, tcp::r#async::TokioListener},
 };
 
-use crate::dtn::{
-	bms::BatteryManagementSystem,
-	certs::{generate_shared_cipher, ROVER_CERT, ROVER_KEY, SATELLITE_CERT},
-	chain_processor::ChainProcessor,
-	clock::init_mission_clock,
-	command_executor::CommandExecutor,
-	fault_manager::FaultManager,
-	fault_matrix::FaultMatrix,
-	faults::RoverFaultHandler,
-	frame_builder::FrameBuilderHelper,
-	messages::{EarthCommand, MessageChainState, RoverCommand, RoverTelemetry},
-	ordering::OutOfOrderBuffer,
-	servlets::{
-		EarthGroundStationServlet, EarthGroundStationServletConf, MissionState, RelaySatelliteServlet,
-		RelaySatelliteServletConf, RoverServlet, RoverServletConf,
+use crate::{
+	debug_log,
+	dtn::{
+		bms::BatteryManagementSystem,
+		certs::{
+			generate_shared_cipher, rover_verifying_key, EARTH_CERT, EARTH_KEY, ROVER_CERT, ROVER_KEY, SATELLITE_CERT,
+		},
+		chain_processor::ChainProcessor,
+		clock::{advance_clock, delays, init_mission_clock, mission_time_ms},
+		command_executor::CommandExecutor,
+		fault_manager::{BatteryUpdate, FaultManager},
+		fault_matrix::FaultMatrix,
+		faults::RoverFaultHandler,
+		frame_builder::FrameBuilderHelper,
+		messages::{EarthCommand, MessageChainState, RoverCommand, RoverTelemetry},
+		ordering::OutOfOrderBuffer,
+		servlets::{
+			EarthGroundStationServlet, EarthGroundStationServletConf, MissionState, RelaySatelliteServlet,
+			RelaySatelliteServletConf, RoverServlet, RoverServletConf,
+		},
+		storage::FrameStore,
+		utils::format_mission_time,
 	},
-	storage::FrameStore,
 };
 
 // ============================================================================
@@ -70,7 +89,7 @@ pub struct DtnScenarioConfig {
 	/// Shared AES-256-GCM cipher (Earth ↔ Rover only)
 	pub shared_cipher: Aes256Gcm,
 	/// Earth's verifying key for signature verification (set by servlet start)
-	pub earth_verifying_key: RwLock<Option<tightbeam::crypto::sign::ecdsa::Secp256k1VerifyingKey>>,
+	pub earth_verifying_key: RwLock<Option<Secp256k1VerifyingKey>>,
 	/// Battery Management System
 	pub bms: RwLock<BatteryManagementSystem>,
 	/// Fault handler for recovery logic (time tracking, decisions)
@@ -85,12 +104,16 @@ pub struct DtnScenarioConfig {
 	pub relay_store: RwLock<FrameStore>,
 	/// Relay address for rover client to connect to
 	pub relay_addr: RwLock<Option<TightBeamSocketAddr>>,
+	/// Rover servlet address for async commands
+	pub rover_addr: RwLock<Option<TightBeamSocketAddr>>,
 	/// Relay servlet handle (keeps the servlet task alive)
-	pub relay_servlet: RwLock<Option<crate::dtn::servlets::RelaySatelliteServlet>>,
+	pub _relay_servlet: RwLock<Option<RelaySatelliteServlet>>,
 	/// Earth servlet handle (keeps the servlet task alive)
-	pub earth_servlet: RwLock<Option<crate::dtn::servlets::EarthGroundStationServlet>>,
+	pub _earth_servlet: RwLock<Option<EarthGroundStationServlet>>,
 	/// Command queue for async command execution on Rover
 	pub command_queue: Arc<RwLock<VecDeque<EarthCommand>>>,
+	/// Shared mission state (updated by RoverServlet, read by rover client)
+	pub mission_state: Arc<RwLock<MissionState>>,
 }
 
 impl Default for DtnScenarioConfig {
@@ -100,8 +123,13 @@ impl Default for DtnScenarioConfig {
 		let earth_store = FrameStore::new(PathBuf::from("temp/dtn/earth")).expect("Failed to create earth storage");
 		let relay_store = FrameStore::new(PathBuf::from("temp/dtn/relay")).expect("Failed to create relay storage");
 
+		let rover_key_bytes = match ROVER_KEY {
+			KeySpec::Bytes(bytes) => bytes,
+			_ => panic!("ROVER_KEY must be KeySpec::Bytes"),
+		};
+
 		Self {
-			rover_signing_key: Secp256k1SigningKey::random(&mut OsRng),
+			rover_signing_key: Secp256k1SigningKey::from_slice(rover_key_bytes).expect("ROVER_KEY is valid"),
 			shared_cipher: generate_shared_cipher(),
 			earth_verifying_key: RwLock::new(None),
 			bms: RwLock::new(BatteryManagementSystem::default()),
@@ -111,15 +139,34 @@ impl Default for DtnScenarioConfig {
 			earth_store: RwLock::new(earth_store),
 			relay_store: RwLock::new(relay_store),
 			relay_addr: RwLock::new(None),
-			relay_servlet: RwLock::new(None),
-			earth_servlet: RwLock::new(None),
+			rover_addr: RwLock::new(None),
+			_relay_servlet: RwLock::new(None),
+			_earth_servlet: RwLock::new(None),
 			command_queue: Arc::new(RwLock::new(VecDeque::new())),
+			mission_state: Arc::new(RwLock::new(MissionState::default())),
 		}
 	}
 }
 
 impl Drop for DtnScenarioConfig {
 	fn drop(&mut self) {
+		// Shutdown servlets gracefully
+		debug_log!("[Cleanup] Shutting down servlets...");
+
+		// Access and drop Earth servlet
+		if let Ok(mut servlet_guard) = self._earth_servlet.write() {
+			if let Some(_servlet) = servlet_guard.take() {
+				debug_log!("[Cleanup] Earth servlet stopped");
+			}
+		}
+
+		// Access and drop Relay servlet
+		if let Ok(mut servlet_guard) = self._relay_servlet.write() {
+			if let Some(_servlet) = servlet_guard.take() {
+				debug_log!("[Cleanup] Relay servlet stopped");
+			}
+		}
+
 		// Clean up storage directories
 		if let Ok(mut store) = self.rover_store.write() {
 			let _ = store.clear();
@@ -136,6 +183,8 @@ impl Drop for DtnScenarioConfig {
 		let _ = std::fs::remove_dir_all("temp/dtn/earth");
 		let _ = std::fs::remove_dir_all("temp/dtn/relay");
 		let _ = std::fs::remove_dir_all("temp/dtn");
+
+		debug_log!("[Cleanup] DTN test cleanup complete");
 	}
 }
 
@@ -146,50 +195,92 @@ impl Drop for DtnScenarioConfig {
 /// Number of command/response round-trips for the test.
 const COMMAND_ROUND_TRIPS: usize = 6;
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
 /// Earth Mission Control task: sends commands to Relay (which forwards to Rover)
-// NOTE: Currently unused - for future Earth-initiated async flow
-#[allow(dead_code)]
 async fn earth_mission_control_task(
 	trace: Arc<TraceCollector>,
-	_relay_addr: TightBeamSocketAddr,
-	_earth_signing_key: Secp256k1SigningKey,
-	_shared_cipher: Aes256Gcm,
-	_earth_processor: Arc<ChainProcessor>,
+	relay_addr: TightBeamSocketAddr,
+	earth_signing_key: Secp256k1SigningKey,
+	shared_cipher: Aes256Gcm,
+	earth_processor: Arc<ChainProcessor>,
+	frame_builder: Arc<FrameBuilderHelper>,
 	max_rounds: usize,
 ) -> Result<(), TightBeamError> {
-	println!(
-		"[Earth Mission Control] Task started (stubbed for future use) - {} rounds",
+	println!("[Earth Mission Control] Task STARTING - {} rounds", max_rounds);
+
+	// Wait for RoverServlet to be fully ready
+	tokio::time::sleep(Duration::from_millis(200)).await;
+
+	debug_log!(
+		"[{}] [Earth Mission Control] Task started - {} rounds",
+		format_mission_time(mission_time_ms()),
 		max_rounds
 	);
-	trace.event("earth_send_command")?;
-
-	// Wait a bit for rover servlet to be ready
-	tokio::time::sleep(Duration::from_millis(500)).await;
 
 	for round in 0..max_rounds {
-		println!("[Earth Mission Control] Sending command {}/{}", round + 1, max_rounds);
+		println!("[Earth Mission Control] Round {}/{}", round + 1, max_rounds);
+		debug_log!(
+			"[{}] [Earth Mission Control] Preparing command {}/{}",
+			format_mission_time(mission_time_ms()),
+			round + 1,
+			max_rounds
+		);
 
-		// Create command
 		let rover_cmd = match round % 3 {
 			0 => RoverCommand::ProbeLocation { x: 100, y: 200 },
 			1 => RoverCommand::TakePhoto { direction: "North".to_string(), resolution: 1080 },
 			_ => RoverCommand::CollectSample { location: "Site Alpha".to_string() },
 		};
 
-		// For now, stub out command sending (TODO: implement proper frame building for RelayMessage)
-		println!(
-			"[Earth Mission Control] Command {} would be sent here (implementation pending)",
-			round + 1
-		);
 		trace.event("earth_send_command")?;
-		tokio::time::sleep(Duration::from_millis(500)).await;
+
+		println!("[Earth Mission Control] Building command");
+		let earth_command = EarthCommand::new(rover_cmd, MessagePriority::Normal, mission_time_ms());
+		println!("[Earth Mission Control] Preparing outgoing frame");
+		let (next_order, previous_digest) = earth_processor.prepare_outgoing()?;
+		println!("[Earth Mission Control] Building relay command frame");
+		let command_frame = frame_builder.build_relay_command_frame(
+			earth_command,
+			next_order,
+			previous_digest,
+			&earth_signing_key,
+			&shared_cipher,
+		)?;
+		println!("[Earth Mission Control] Command frame built");
+
+		debug_log!(
+			"[{}] [Earth Mission Control] Sending command {}/{} to Relay",
+			format_mission_time(mission_time_ms()),
+			round + 1,
+			max_rounds
+		);
+
+		// Connect to Relay and send command
+		println!("[Earth Mission Control] Connecting to Relay at {:?}", relay_addr);
+		let mut relay_client = ClientBuilder::<TokioListener>::connect(relay_addr)
+			.await?
+			.with_server_certificate(SATELLITE_CERT)?
+			.with_client_identity(EARTH_CERT, EARTH_KEY)?
+			.with_timeout(Duration::from_millis(5000))
+			.build()?;
+
+		println!("[Earth Mission Control] Sending command frame to Relay");
+		let _response = relay_client.emit(command_frame, None).await?;
+		println!("[Earth Mission Control] Command sent successfully");
+		debug_log!(
+			"[{}] [Earth Mission Control] Command {}/{} sent",
+			format_mission_time(mission_time_ms()),
+			round + 1,
+			max_rounds
+		);
+
+		// Wait between commands (simulate realistic operations tempo)
+		tokio::time::sleep(Duration::from_millis(2000)).await;
 	}
 
-	println!("[Earth Mission Control] All commands sent");
+	debug_log!(
+		"[{}] [Earth Mission Control] All commands sent",
+		format_mission_time(mission_time_ms())
+	);
 	Ok(())
 }
 
@@ -313,7 +404,8 @@ tb_process_spec! {
 // Mission Loop Helpers
 // ============================================================================
 
-/// Build and send telemetry to Relay after command execution
+/// Build and send telemetry to Relay (one-way, no response expected)
+/// Relay will forward to Earth Ground Station
 async fn send_telemetry_to_relay(
 	trace: &TraceCollector,
 	frame_builder: &FrameBuilderHelper,
@@ -323,11 +415,6 @@ async fn send_telemetry_to_relay(
 	shared_cipher: &Aes256Gcm,
 	relay_addr: TightBeamSocketAddr,
 ) -> Result<(), TightBeamError> {
-	use crate::dtn::{
-		certs::{ROVER_CERT, ROVER_KEY, SATELLITE_CERT},
-		clock::mission_time_ms,
-	};
-
 	// Gather telemetry data
 	let (instrument, name, data) = command_executor.read()?.determine_next_instrument();
 	let battery = fault_manager.battery_percent()?;
@@ -336,14 +423,17 @@ async fn send_telemetry_to_relay(
 	trace.event("rover_send_telemetry")?;
 
 	let telemetry = RoverTelemetry::new(instrument, data, mission_time_ms(), battery, -20);
-
-	// Build telemetry frame
 	let rover_frame =
 		frame_builder.build_telemetry_frame(telemetry, fault_matrix_snapshot, rover_signing_key, shared_cipher)?;
 
-	println!("  [Rover] Sending {} telemetry (Battery: {}%) [ENCRYPTED]", name, battery);
+	debug_log!(
+		"  [{}] [Rover] Sending {} telemetry (Battery: {}%) [ENCRYPTED]",
+		format_mission_time(mission_time_ms()),
+		name,
+		battery
+	);
 
-	// Initiate connection to Relay to send telemetry
+	// Initiate connection to Relay to send telemetry (one-way)
 	let mut telemetry_client = ClientBuilder::<TokioListener>::connect(relay_addr)
 		.await?
 		.with_server_certificate(SATELLITE_CERT)?
@@ -351,8 +441,8 @@ async fn send_telemetry_to_relay(
 		.with_timeout(Duration::from_millis(5000))
 		.build()?;
 
-	telemetry_client.emit(rover_frame, None).await?;
-	println!("  [Rover] Telemetry sent to Relay");
+	// Send telemetry to Relay (which forwards to Earth), ignore any response
+	let _ = telemetry_client.emit(rover_frame, None).await?;
 
 	Ok(())
 }
@@ -363,95 +453,125 @@ async fn send_telemetry_to_relay(
 /// TODO: Migrate to Earth-initiated async pattern once FrameBuilder supports RelayMessage enum.
 async fn run_mission_loop(
 	trace: &TraceCollector,
-	rover_client: &mut GenericClient<TokioListener>,
+	_rover_client: &mut GenericClient<TokioListener>,
 	rover_config: Arc<RoverServletConf>,
+	shared_mission_state: Arc<RwLock<MissionState>>,
 ) -> Result<(), TightBeamError> {
-	use crate::dtn::clock::mission_time_ms;
-
 	let rover_signing_key = &rover_config.rover_signing_key;
 	let shared_cipher = &rover_config.shared_cipher;
-	let earth_verifying_key = rover_config.earth_verifying_key;
 	let fault_manager = Arc::clone(&rover_config.fault_manager);
 	let command_executor = Arc::clone(&rover_config.command_executor);
 	let frame_builder = Arc::clone(&rover_config.frame_builder);
-	let mission_state = Arc::clone(&rover_config.mission_state);
+	let mission_state = shared_mission_state;
 
 	// Main mission loop: send telemetry, receive command, execute (old synchronous pattern)
-	let mut completed_rounds = 0usize;
-	println!("[Rover Mission Loop] Started - using synchronous telemetry/command pattern");
+	debug_log!("[Rover Mission Loop] Started - telemetry only, commands executed by RoverServlet");
 
-	while completed_rounds < COMMAND_ROUND_TRIPS {
-		println!("═══════════════ Round {} ═══════════════", completed_rounds + 1);
+	// Loop until mission is complete (updated by isolated RoverServlet)
+	loop {
+		// Check if mission is complete
+		if mission_state.read()?.mission_complete {
+			debug_log!(
+				"  [{}] [Rover Client] Mission complete detected!",
+				format_mission_time(mission_time_ms())
+			);
+			break;
+		}
 
-		// Update battery state
-		fault_manager.update_battery_state()?;
-		fault_manager.drain_battery()?;
+		let mut completed_rounds = mission_state.read()?.completed_rounds;
+		debug_log!(
+			"\n═══════════════ Round {} {} ═══════════════",
+			completed_rounds + 1,
+			format_mission_time(mission_time_ms())
+		);
 
-		// Build and send telemetry
-		let (instrument, name, data) = command_executor.read()?.determine_next_instrument();
-		let battery = fault_manager.battery_percent()?;
-		let fault_matrix_snapshot = fault_manager.fault_matrix()?;
+		// Update battery state and check for faults
+		let battery_update = fault_manager.update_battery_state()?;
+		match battery_update {
+			BatteryUpdate::LowPowerDetected(battery) => {
+				trace.event("fault_low_power_detected")?;
+				println!(
+					"  [{}] [Rover] ⚠ LOW POWER DETECTED ({}%) - Halting communications",
+					format_mission_time(mission_time_ms()),
+					battery
+				);
+				trace.event("comms_halted")?;
 
-		trace.event("rover_send_telemetry")?;
+				// Simulate recharge period
+				println!(
+					"  [{}] [Rover] Entering recharge mode (30 minutes)...",
+					format_mission_time(mission_time_ms())
+				);
+				advance_clock(delays::ROVER_RECHARGE_MS);
 
-		let telemetry = RoverTelemetry::new(instrument, data, mission_time_ms(), battery, -20);
-		let rover_frame =
-			frame_builder.build_telemetry_frame(telemetry, fault_matrix_snapshot, rover_signing_key, shared_cipher)?;
-
-		println!("  [Rover] Sending {} telemetry (Battery: {}%) [ENCRYPTED]", name, battery);
-
-		// Send telemetry and receive command response (synchronous)
-		let response = rover_client.emit(rover_frame, None).await?;
-
-		if let Some(response_frame) = response {
-			// Verify Earth's signature
-			response_frame.verify::<Secp256k1Signature>(&earth_verifying_key)?;
-			println!("  [Rover] ✓ Earth signature verified");
-
-			// Process command response
-			match rover_config.chain_processor.process_incoming(response_frame)? {
-				crate::dtn::chain_processor::ProcessResult::Processed(ordered_frames) => {
-					for ordered_frame in ordered_frames {
-						trace.event("rover_receive_command")?;
-
-						// Decode command
-						let command: EarthCommand = if ordered_frame.metadata.confidentiality.is_some() {
-							use tightbeam::compress::{Inflator, ZstdCompression};
-							let inflator: Option<&dyn Inflator> = if ordered_frame.metadata.compactness.is_some() {
-								Some(&ZstdCompression)
-							} else {
-								None
-							};
-							ordered_frame.decrypt::<EarthCommand>(shared_cipher, inflator)?
-						} else {
-							tightbeam::decode(&ordered_frame.message)?
-						};
-
-						let cmd_type = RoverCommand::try_from(command.command_type)?;
-						println!("  [Rover] Command: {}", cmd_type);
-
-						// Execute command
-						command_executor.write()?.execute_command(cmd_type, trace)?;
-						trace.event("rover_command_complete")?;
-
-						// Update mission state
-						completed_rounds += 1;
-						{
-							let mut state = mission_state.write()?;
-							state.completed_rounds = completed_rounds;
-							if completed_rounds >= COMMAND_ROUND_TRIPS {
-								state.mission_complete = true;
-							}
-						}
-					}
+				// Re-energize battery to full
+				while fault_manager.battery_percent()? < 100 {
+					fault_manager.reenergize_battery()?;
 				}
-				_ => {
-					println!("  [Rover] No command received or buffered");
-				}
+
+				println!(
+					"  [{}] [Rover] ✓ Recharge complete (Battery: 100%) - Resuming operations",
+					format_mission_time(mission_time_ms())
+				);
+				trace.event("fault_cleared")?;
+			}
+			BatteryUpdate::FaultCleared(battery) => {
+				println!(
+					"  [{}] [Rover] ✓ Battery recharged to {}%",
+					format_mission_time(mission_time_ms()),
+					battery
+				);
+			}
+			BatteryUpdate::Updated => {
+				// Normal battery drain
+				fault_manager.drain_battery()?;
 			}
 		}
 
-		println!("  [Rover] Round {} complete\n", completed_rounds);
+		// ONE-WAY: Send telemetry to Relay (which forwards to Earth)
+		let relay_addr = rover_config.relay_addr;
+		send_telemetry_to_relay(
+			trace,
+			&frame_builder,
+			&command_executor,
+			&fault_manager,
+			rover_signing_key,
+			shared_cipher,
+			relay_addr,
+		)
+		.await?;
+
+		// Simulate propagation delays
+		advance_clock(delays::ROVER_TO_RELAY_MS);
+		debug_log!(
+			"  [{}] [Relay] Received telemetry from Rover, forwarding to Earth...",
+			format_mission_time(mission_time_ms())
+		);
+
+		advance_clock(delays::RELAY_TO_EARTH_MS);
+		debug_log!(
+			"  [{}] [Earth] Received telemetry from Relay",
+			format_mission_time(mission_time_ms())
+		);
+
+		// Check mission state (updated by RoverServlet when it executes commands)
+		// Servlets are isolated - we can only share state via DtnScenarioConfig
+		let state = mission_state.read()?;
+		if state.completed_rounds > completed_rounds {
+			completed_rounds = state.completed_rounds;
+			debug_log!(
+				"  [{}] [Rover Client] Mission progress: {}/{} commands executed by RoverServlet",
+				format_mission_time(mission_time_ms()),
+				completed_rounds,
+				COMMAND_ROUND_TRIPS
+			);
+		}
+
+		// Note: Commands are executed by the isolated RoverServlet when received from Earth via Relay
+		// The rover client just sends telemetry and monitors mission completion via shared state
+
+		// Give time for Earth to analyze telemetry and for RoverServlet to execute command
+		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
 
 	Ok(())
@@ -461,7 +581,10 @@ async fn run_mission_loop(
 // Tests
 // ============================================================================
 
+/// Build FDR configuration for DTN testing
+/// NOTE: Reserved for future FDR (Failures, Divergence, Refinement) testing
 #[cfg(feature = "testing-fault")]
+#[allow(dead_code)]
 fn build_dtn_fdr_config() -> FdrConfig {
 	FdrConfig {
 		seeds: 10,
@@ -491,17 +614,16 @@ tb_scenario! {
 			// Generate Earth's signing key
 			let earth_signing_key = Secp256k1SigningKey::random(&mut OsRng);
 
-			// Get verifying keys
-			let rover_verifying_key = config.read()?.rover_signing_key.verifying_key().to_owned();
-			let earth_verifying_key = earth_signing_key.verifying_key().to_owned();
+			// Get verifying keys using helper functions
+			let rover_verifying_key_value = rover_verifying_key();
+			let earth_verifying_key_value = earth_signing_key.verifying_key().to_owned();
 
 			// Store Earth's verifying key in config for Rover client to use
-			*config.write()?.earth_verifying_key.write()? = Some(earth_verifying_key);
+			*config.write()?.earth_verifying_key.write()? = Some(earth_verifying_key_value);
 
 			// Get shared cipher from config
 			let shared_cipher = config.read()?.shared_cipher.to_owned();
 
-			// Create ChainProcessors for servlets
 			let earth_store = Arc::new(RwLock::new(FrameStore::new(PathBuf::from("temp/dtn/earth"))?));
 			let earth_chain_state = Arc::new(RwLock::new(MessageChainState::new("earth".to_string())));
 			let earth_order_buffer = Arc::new(RwLock::new(OutOfOrderBuffer::new(10)));
@@ -524,52 +646,49 @@ tb_scenario! {
 				"Satellite".to_string(),
 			));
 
+			let relay_signing_key = Secp256k1SigningKey::random(&mut OsRng);
+			let relay_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&relay_processor)));
+
 			// Start Earth Ground Station servlet with config (relay_addr added later in separate task)
 			let earth_config = EarthGroundStationServletConf {
 				earth_signing_key: earth_signing_key.to_owned(),
-				rover_verifying_key,
+				rover_verifying_key: rover_verifying_key_value,
 				shared_cipher: shared_cipher.to_owned(),
 				chain_processor: Arc::clone(&earth_processor),
-				frame_builder: earth_frame_builder,
+				frame_builder: Arc::clone(&earth_frame_builder),
 				relay_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder
 			};
+			println!("[START] Starting Earth Ground Station");
 			let earth_servlet = EarthGroundStationServlet::start(Arc::clone(&trace), Arc::new(earth_config)).await?;
 			let earth_addr = earth_servlet.addr();
+			println!("[START] Earth servlet started at {:?}", earth_addr);
 
 			// Store Earth servlet handle in config to keep it alive
 			{
 				let config_guard = config.write()?;
-				config_guard.earth_servlet.write()?.replace(earth_servlet);
+				config_guard._earth_servlet.write()?.replace(earth_servlet);
 			}
 
-			// Create Relay servlet config (relay only needs earth_addr, not the servlet handle)
-			let relay_config = RelaySatelliteServletConf {
-				earth_addr,
-				rover_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder
-				rover_verifying_key,
-				earth_verifying_key,
-				chain_processor: relay_processor,
-				shared_cipher: shared_cipher.clone(),
+			// CREATE ROVER SERVLET FIRST (so we have its real address for the Relay)
+			println!("[START] Creating Rover servlet configuration");
+
+			// Get needed values from config, then drop the lock immediately
+			let (rover_signing_key_owned, command_queue_arc) = {
+				let config_guard = config.read()?;
+				let rover_fault_manager = Arc::new(FaultManager::from_refs(
+					&config_guard.bms,
+					&config_guard.fault_matrix,
+					&config_guard.rover_fault_handler,
+				));
+				drop(config_guard); // Explicitly drop read lock
+
+				let config_guard2 = config.read()?;
+				(
+					config_guard2.rover_signing_key.to_owned(),
+					Arc::clone(&config_guard2.command_queue),
+				)
 			};
 
-			// Start Relay Satellite servlet (servlet spawns background task, handle keeps it alive)
-			let relay_servlet_handle = RelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(relay_config)).await?;
-			let relay_addr = relay_servlet_handle.addr();
-			// Store relay address and servlet handle in config
-			{
-				let config_guard = config.write()?;
-				config_guard.relay_addr.write()?.replace(relay_addr);
-				config_guard.relay_servlet.write()?.replace(relay_servlet_handle);
-			}
-
-			// Give servlets time to be ready
-			tokio::time::sleep(Duration::from_millis(100)).await;
-
-			// NOTE: Earth Mission Control task disabled - using synchronous request/response pattern
-			// TODO: Enable when RelayMessage frame building is implemented
-
-			// Create Rover components
-			let config_guard = config.read()?;
 			let rover_store = Arc::new(RwLock::new(FrameStore::new(PathBuf::from("temp/dtn/rover"))?));
 			let rover_chain_state = Arc::new(RwLock::new(MessageChainState::new("rover".to_string())));
 			let rover_order_buffer = Arc::new(RwLock::new(OutOfOrderBuffer::new(10)));
@@ -580,53 +699,115 @@ tb_scenario! {
 				"Rover".to_string(),
 			));
 
-			// Create FaultManager by wrapping the RwLocks from config in Arc
 			let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
-			let rover_fault_manager = Arc::new(FaultManager::from_refs(
-				&config_guard.bms,
-				&config_guard.fault_matrix,
-				&config_guard.rover_fault_handler,
-			));
+			let rover_fault_manager = {
+				let config_guard = config.read()?;
+				Arc::new(FaultManager::from_refs(
+					&config_guard.bms,
+					&config_guard.fault_matrix,
+					&config_guard.rover_fault_handler,
+				))
+			};
 
 			let rover_command_executor = Arc::new(RwLock::new(CommandExecutor::default()));
-			let rover_mission_state = Arc::new(RwLock::new(MissionState::default()));
+			// Use shared mission state from DtnScenarioConfig
+			let shared_mission_state = Arc::clone(&config.read()?.mission_state);
 			let rover_config = RoverServletConf {
-				relay_addr,
-				rover_signing_key: config_guard.rover_signing_key.to_owned(),
-				earth_verifying_key,
-				shared_cipher,
+				relay_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder (RoverServlet doesn't connect to Relay)
+				rover_signing_key: rover_signing_key_owned,
+				earth_verifying_key: earth_verifying_key_value,
+				shared_cipher: shared_cipher.clone(),
 				chain_processor: rover_processor,
 				fault_manager: rover_fault_manager,
 				command_executor: rover_command_executor,
 				frame_builder: rover_frame_builder,
-				mission_state: rover_mission_state,
+				mission_state: shared_mission_state,
 				max_rounds: COMMAND_ROUND_TRIPS,
-				command_queue: Arc::clone(&config.read()?.command_queue),
+				command_queue: command_queue_arc,
 			};
 
-			// Start and return the Rover servlet
-			RoverServlet::start(Arc::clone(&trace), Arc::new(rover_config)).await
+			// Start the Rover servlet to receive async commands
+			println!("[START] Starting Rover servlet");
+			let rover_config_arc = Arc::new(rover_config);
+			let rover_servlet = RoverServlet::start(Arc::clone(&trace), rover_config_arc).await?;
+			let rover_addr = rover_servlet.addr();
+
+			println!("[START] Rover servlet started at {:?}", rover_addr);
+
+			// Store rover address in config for mission loop
+			*config.read()?.rover_addr.write()? = Some(rover_addr);
+
+			// NOW create Relay servlet with the REAL rover_addr
+			println!("[START] Creating Relay servlet configuration with rover_addr: {:?}", rover_addr);
+			let relay_config = RelaySatelliteServletConf {
+				earth_addr,
+				rover_addr, // Real address, not placeholder!
+				rover_verifying_key: rover_verifying_key_value,
+				earth_verifying_key: earth_verifying_key_value,
+				chain_processor: relay_processor,
+				shared_cipher: shared_cipher.clone(),
+				relay_signing_key,
+				frame_builder: relay_frame_builder,
+			};
+
+			println!("[START] Starting Relay satellite");
+			let relay_servlet_handle = RelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(relay_config)).await?;
+			let relay_addr = relay_servlet_handle.addr();
+			println!("[START] Relay servlet started at {:?}", relay_addr);
+
+			// Store relay address and servlet handle in config
+			println!("[START] Storing relay address in config");
+			{
+				let config_guard = config.write()?;
+				println!("[START] Got config write lock");
+				config_guard.relay_addr.write()?.replace(relay_addr);
+				println!("[START] Stored relay_addr");
+				config_guard._relay_servlet.write()?.replace(relay_servlet_handle);
+				println!("[START] Stored relay_servlet handle");
+			}
+			println!("[START] Released config lock");
+
+			// Initialize mission clock for the entire test
+			println!("[START] Initializing mission clock");
+			init_mission_clock();
+
+			// Spawn Earth Mission Control task for async command sending
+			println!("[START] Spawning Earth Mission Control task");
+			let earth_task_trace = Arc::clone(&trace);
+			let earth_task_signing_key = earth_signing_key.to_owned();
+			let earth_task_cipher = shared_cipher.to_owned();
+			let earth_task_processor = Arc::clone(&earth_processor);
+			let earth_task_builder = Arc::clone(&earth_frame_builder);
+			tokio::spawn(async move {
+				if let Err(e) = earth_mission_control_task(
+					earth_task_trace,
+					relay_addr,
+					earth_task_signing_key,
+					earth_task_cipher,
+					earth_task_processor,
+					earth_task_builder,
+					COMMAND_ROUND_TRIPS,
+				).await {
+					eprintln!("[Earth Mission Control] Task error: {:?}", e);
+				}
+			});
+			println!("[START] Earth Mission Control task spawned");
+
+			println!("[START] Returning Rover servlet to scenario");
+			Ok(rover_servlet)
 		},
-		setup: |_rover_addr, config| async move {
-			// Wait for Earth verifying key and relay address to be set by the servlet start
-			let _earth_verifying_key = loop {
-				if let Some(key) = config.read()?.earth_verifying_key.read()?.clone() {
-					break key;
-				}
+		setup: |rover_addr, config| async move {
+			debug_log!("[Setup] Rover servlet address: {:?}", rover_addr);
 
-				// Give the servlet a moment to initialize
-				tokio::time::sleep(Duration::from_millis(10)).await;
-			};
+			let _earth_verifying_key = config.read()?.earth_verifying_key.read()?
+				.clone()
+				.expect("Earth verifying key must be set before setup");
+			debug_log!("[Setup] Earth verifying key found");
 
-			// Get relay address from config
-			let relay_addr = loop {
-				if let Some(addr) = config.read()?.relay_addr.read()?.clone() {
-					break addr;
-				}
-
-				// Give the servlet a moment to initialize
-				tokio::time::sleep(Duration::from_millis(50)).await;
-			};
+			let relay_addr = config.read()?.relay_addr.read()?
+				.clone()
+				.expect("Relay address must be set before setup");
+			debug_log!("[Setup] Relay address found: {:?}", relay_addr);
 
 			// Exponential backoff: 100ms, 200ms, 400ms (max 3 attempts)
 			let restart_policy = RestartExponentialBackoff::new(3, 100, None);
@@ -641,22 +822,14 @@ tb_scenario! {
 			Ok(client)
 		},
 		client: |trace, mut rover_client, config| async move {
-			// Initialize mission clock at T+0
-			init_mission_clock();
-
 			trace.event("mission_start")?;
 			println!("╔════════════════════════════════════════════════════════════╗");
 			println!("║  Mars Rover DTN Mission - {} Round Trips                   ║", COMMAND_ROUND_TRIPS);
 			println!("╚════════════════════════════════════════════════════════════╝\n");
 
-			// Wait for Earth verifying key to be set
-			let earth_verifying_key = loop {
-				if let Some(key) = config.read()?.earth_verifying_key.read()?.to_owned() {
-					break key;
-				}
-
-				tokio::time::sleep(Duration::from_millis(10)).await;
-			};
+			let earth_verifying_key = config.read()?.earth_verifying_key.read()?
+				.to_owned()
+				.expect("Earth verifying key must be set before client");
 
 			// Recreate rover components for mission loop
 			let config_guard = config.read()?;
@@ -680,17 +853,10 @@ tb_scenario! {
 			let rover_command_executor = Arc::new(RwLock::new(CommandExecutor::default()));
 			let rover_mission_state = Arc::new(RwLock::new(MissionState::default()));
 
-			// Get relay address from config
-			let relay_addr = loop {
-				if let Some(addr) = config.read()?.relay_addr.read()?.clone() {
-					break addr;
-				}
+			let relay_addr = config.read()?.relay_addr.read()?
+				.clone()
+				.expect("Relay address must be set before client");
 
-				// Give the servlet a moment to initialize
-				tokio::time::sleep(Duration::from_millis(10)).await;
-			};
-
-			// Create rover servlet config for mission loop
 			let rover_servlet_config = RoverServletConf {
 				relay_addr,
 				earth_verifying_key,
@@ -705,8 +871,11 @@ tb_scenario! {
 				command_queue: Arc::clone(&config.read()?.command_queue),
 			};
 
+			// Get shared mission state from config (same Arc as RoverServlet uses)
+			let shared_mission_state = Arc::clone(&config.read()?.mission_state);
+
 			drop(config_guard);
-			run_mission_loop(&trace, &mut rover_client, Arc::new(rover_servlet_config)).await?;
+			run_mission_loop(&trace, &mut rover_client, Arc::new(rover_servlet_config), shared_mission_state).await?;
 
 			trace.event("mission_complete")?;
 			println!("╔════════════════════════════════════════════════════════════╗");

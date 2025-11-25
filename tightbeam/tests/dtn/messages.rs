@@ -226,6 +226,9 @@ impl MessageChainState {
 		Self { last_hash: [0u8; 32], sequence: 0, node_id }
 	}
 
+	/// Update chain state with a new hash manually
+	/// NOTE: Available for manual chain state manipulation in test scenarios
+	#[allow(dead_code)]
 	pub fn update(&mut self, new_hash: [u8; 32]) {
 		self.last_hash = new_hash;
 		self.sequence += 1;
@@ -282,6 +285,8 @@ pub struct ConsensusValidator {
 
 impl ConsensusValidator {
 	/// Validate that at least 2/3 nodes agree on chain state
+	/// NOTE: Available for Byzantine fault tolerance validation in distributed scenarios
+	#[allow(dead_code)]
 	pub fn validate(&self, new_hash: &[u8; 32]) -> bool {
 		let mut agreements = 0;
 		if self.rover_state.last_hash == *new_hash {
@@ -297,6 +302,8 @@ impl ConsensusValidator {
 	}
 
 	/// Get the number of nodes that agree on a hash
+	/// NOTE: Available for consensus quorum analysis
+	#[allow(dead_code)]
 	pub fn agreement_count(&self, hash: &[u8; 32]) -> usize {
 		let mut count = 0;
 		if self.rover_state.last_hash == *hash {

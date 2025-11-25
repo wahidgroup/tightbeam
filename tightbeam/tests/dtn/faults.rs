@@ -25,6 +25,8 @@ impl RoverFaultHandler {
 	}
 
 	/// Check if the rover should halt communications due to faults.
+	/// NOTE: Available for explicit fault checking in complex scenarios
+	#[allow(dead_code)]
 	pub fn should_halt_comms(&self, fault_matrix: &FaultMatrix) -> bool {
 		fault_matrix.is_fault_active(FaultType::LowPower)
 	}
@@ -37,6 +39,8 @@ impl RoverFaultHandler {
 	}
 
 	/// Calculate time remaining until recharge complete.
+	/// NOTE: Available for displaying recharge progress in UI
+	#[allow(dead_code)]
 	pub fn time_until_recharged_ms(&self) -> Option<u64> {
 		self.low_power_start_time_ms.map(|start_time| {
 			let elapsed = mission_time_ms().saturating_sub(start_time);
@@ -45,6 +49,8 @@ impl RoverFaultHandler {
 	}
 
 	/// Check if recharge is complete.
+	/// NOTE: Available for conditional logic based on recharge completion
+	#[allow(dead_code)]
 	pub fn is_recharged(&self) -> bool {
 		self.time_until_recharged_ms().map_or(true, |t| t == 0)
 	}

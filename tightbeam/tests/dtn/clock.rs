@@ -52,12 +52,16 @@ pub mod delays {
 	// Light speed = 299,792 km/s
 
 	/// Minimum light-time delay (closest approach): ~3 minutes
+	/// NOTE: Available for scenarios testing minimum Mars-Earth distance
+	#[allow(dead_code)]
 	pub const MIN_LIGHT_TIME_MS: u64 = 3 * 60 * 1000;
 
 	/// Average light-time delay (mean distance): ~12.5 minutes
 	pub const AVG_LIGHT_TIME_MS: u64 = 12 * 60 * 1000 + 30 * 1000;
 
 	/// Maximum light-time delay (farthest): ~22 minutes
+	/// NOTE: Available for scenarios testing maximum Mars-Earth distance
+	#[allow(dead_code)]
 	pub const MAX_LIGHT_TIME_MS: u64 = 22 * 60 * 1000;
 
 	/// Rover → Relay delay (Mars orbit): ~1-2 seconds
@@ -73,6 +77,8 @@ pub mod delays {
 	pub const RELAY_TO_ROVER_MS: u64 = 1500;
 
 	/// Total round-trip time (Rover → Earth → Rover)
+	/// NOTE: Useful for calculating expected completion times in tests
+	#[allow(dead_code)]
 	pub const ROUND_TRIP_MS: u64 =
 		ROVER_TO_RELAY_MS + RELAY_TO_EARTH_MS + EARTH_TO_RELAY_MS + RELAY_TO_ROVER_MS;
 
@@ -81,6 +87,11 @@ pub mod delays {
 }
 
 /// Track message transmission with delay
+///
+/// NOTE: This struct provides a wrapper for messages with simulated propagation delays.
+/// Currently unused as the test uses direct `advance_clock()` calls for timing simulation.
+/// Reserved for future use in more complex DTN scenarios with message queuing.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct DelayedMessage<T> {
 	pub payload: T,
@@ -88,6 +99,7 @@ pub struct DelayedMessage<T> {
 	pub arrival_at_ms: u64,
 }
 
+#[allow(dead_code)]
 impl<T> DelayedMessage<T> {
 	pub fn new(payload: T, delay_ms: u64) -> Self {
 		let sent_at = mission_time_ms();

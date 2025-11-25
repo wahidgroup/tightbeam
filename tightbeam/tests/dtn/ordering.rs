@@ -104,6 +104,9 @@ impl OutOfOrderBuffer {
 	}
 
 	/// Clear all buffered frames (for testing/reset)
+	/// Clear all buffered frames
+	/// NOTE: Available for scenarios requiring buffer reset between test phases
+	#[allow(dead_code)]
 	pub fn clear(&mut self) {
 		self.buffer.clear();
 	}

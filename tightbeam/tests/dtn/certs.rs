@@ -2,7 +2,7 @@
 //!
 //! This module contains static X.509 certificates and keys for the DTN architecture:
 //! - Earth Ground Station
-//! - Relay Satellite  
+//! - Relay Satellite
 //! - Mars Rover
 //!
 //! Mutual authentication flows:
@@ -10,18 +10,6 @@
 //! - Satellite ↔ Rover (mutual TLS)
 //!
 //! All certificates are configured for 10-year validity and use secp256k1 keys.
-
-#![cfg(all(
-	feature = "testing-csp",
-	feature = "testing-fdr",
-	feature = "std",
-	feature = "tcp",
-	feature = "tokio",
-	feature = "x509",
-	feature = "secp256k1",
-	feature = "signature",
-	feature = "sha3"
-))]
 
 use tightbeam::{
 	crypto::{
@@ -108,11 +96,8 @@ pub const ROVER_PUB_KEY: &[u8] = &hex!("048a6488041ccb629f2c2f3a8b1f06eaf155db47
 /// Earth's pinning policy: accepts only Satellite's public key
 pub const EARTH_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([SATELLITE_PUB_KEY]);
 
-/// Satellite's pinning policy for Earth connection
-pub const SATELLITE_PINNING_EARTH: PublicKeyPinning<1> = PublicKeyPinning::new([EARTH_PUB_KEY]);
-
-/// Satellite's pinning policy for Rover connection
-pub const SATELLITE_PINNING_ROVER: PublicKeyPinning<1> = PublicKeyPinning::new([ROVER_PUB_KEY]);
+/// Satellite's pinning policy: accepts both Earth and Rover connections
+pub const SATELLITE_PINNING: PublicKeyPinning<2> = PublicKeyPinning::new([EARTH_PUB_KEY, ROVER_PUB_KEY]);
 
 /// Rover's pinning policy: accepts only Satellite's public key
 pub const ROVER_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([SATELLITE_PUB_KEY]);
@@ -122,12 +107,19 @@ pub const ROVER_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([SATELLITE_
 // ============================================================================
 
 /// Helper function to create Earth's verifying key from its public key
+///
+/// NOTE: Reserved for future use if Earth verifying key needs to be constructed from public key bytes.
+/// Currently Earth's verifying key is derived from the signing key directly.
+#[allow(dead_code)]
 pub fn earth_verifying_key() -> Secp256k1VerifyingKey {
-	Secp256k1VerifyingKey::from_sec1_bytes(EARTH_PUB_KEY)
-		.expect("EARTH_PUB_KEY is a valid secp256k1 public key")
+	Secp256k1VerifyingKey::from_sec1_bytes(EARTH_PUB_KEY).expect("EARTH_PUB_KEY is a valid secp256k1 public key")
 }
 
 /// Helper function to create Satellite's verifying key from its public key
+///
+/// NOTE: Reserved for future use if Satellite needs to sign its own messages.
+/// Currently Relay forwards messages without signing them.
+#[allow(dead_code)]
 pub fn satellite_verifying_key() -> Secp256k1VerifyingKey {
 	Secp256k1VerifyingKey::from_sec1_bytes(SATELLITE_PUB_KEY)
 		.expect("SATELLITE_PUB_KEY is a valid secp256k1 public key")
@@ -135,8 +127,7 @@ pub fn satellite_verifying_key() -> Secp256k1VerifyingKey {
 
 /// Helper function to create Rover's verifying key from its public key
 pub fn rover_verifying_key() -> Secp256k1VerifyingKey {
-	Secp256k1VerifyingKey::from_sec1_bytes(ROVER_PUB_KEY)
-		.expect("ROVER_PUB_KEY is a valid secp256k1 public key")
+	Secp256k1VerifyingKey::from_sec1_bytes(ROVER_PUB_KEY).expect("ROVER_PUB_KEY is a valid secp256k1 public key")
 }
 
 // ============================================================================
