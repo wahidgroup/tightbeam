@@ -4,6 +4,7 @@
 //! - Rover telemetry (APXS, ChemCam, Mastcam instruments)
 //! - Earth command & control
 //! - Message chain consensus validation
+//! - Stateless/Stateful ACKs
 
 use std::convert::TryFrom;
 use std::fmt;
@@ -14,11 +15,22 @@ use tightbeam::der::{Encode, Enumerated, Sequence};
 use tightbeam::{Beamable, TightBeamError};
 
 // ============================================================================
+// Stateless ACK (metadata-only)
+// ============================================================================
+
+/// Stateless acknowledgment (minimal message body, not added to chain)
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+pub struct StatelessAck {
+	/// Acknowledgment received (always true)
+	pub ack: bool,
+}
+
+// ============================================================================
 // Rover Telemetry Messages
 // ============================================================================
 
 /// Rover telemetry message with instrument data
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct RoverTelemetry {
 	/// Instrument that generated this data (0=APXS, 1=ChemCam, 2=Mastcam)
 	pub instrument: u8,
@@ -68,7 +80,7 @@ pub enum RoverInstrument {
 // ============================================================================
 
 /// Command from Earth to rover
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct EarthCommand {
 	/// Command type (0=CollectSample, 1=ProbeLocation, 2=TakePhoto, 3=Standby)
 	pub command_type: u8,
@@ -81,14 +93,10 @@ pub struct EarthCommand {
 }
 
 /// Acknowledgment of command receipt
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct CommandAck {
-	/// Command ID being acknowledged
-	pub command_id: String,
-	/// Whether command was accepted
-	pub accepted: bool,
-	/// Optional message
-	pub message: Option<String>,
+	/// Frame order of command being acknowledged
+	pub command_order: u64,
 }
 
 impl EarthCommand {
@@ -179,7 +187,7 @@ impl fmt::Display for RoverCommand {
 // ============================================================================
 
 /// Request for missing frames (Chain Gap recovery)
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct FrameRequest {
 	/// Hash of the last successfully received frame (chain head)
 	pub requester_head: [u8; 32],
@@ -188,7 +196,7 @@ pub struct FrameRequest {
 }
 
 /// Response containing missing frames
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[derive(Sequence, Clone, Debug, PartialEq)]
 pub struct FrameResponse {
 	pub frames: Vec<Frame>,
 }
@@ -197,13 +205,20 @@ pub struct FrameResponse {
 #[derive(Beamable, Choice, Clone, Debug, PartialEq)]
 pub enum RelayMessage {
 	/// Command from Earth to be forwarded to Rover
+	#[asn1(context_specific = "0", constructed = "true")]
 	Command(EarthCommand),
 	/// Telemetry from Rover to be forwarded to Earth
+	#[asn1(context_specific = "1", constructed = "true")]
 	Telemetry(RoverTelemetry),
 	/// Acknowledgment from Rover to Earth
+	#[asn1(context_specific = "2", constructed = "true")]
 	CommandAck(CommandAck),
 	/// Frame request from Earth
+	#[asn1(context_specific = "3", constructed = "true")]
 	FrameRequest(FrameRequest),
+	/// Frame response with missing frames
+	#[asn1(context_specific = "4", constructed = "true")]
+	FrameResponse(FrameResponse),
 }
 
 // ============================================================================

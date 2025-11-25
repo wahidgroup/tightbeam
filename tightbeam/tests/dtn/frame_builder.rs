@@ -21,13 +21,12 @@ use tightbeam::{
 use crate::dtn::{
 	chain_processor::ChainProcessor,
 	fault_matrix::FaultMatrix,
-	messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverTelemetry},
-	utils::generate_message_id,
+	messages::{CommandAck, EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverTelemetry, StatelessAck},
 };
 
 /// Helper for building frames with chain support and compression
 pub struct FrameBuilderHelper {
-	chain_processor: Arc<ChainProcessor>,
+	pub chain_processor: Arc<ChainProcessor>,
 }
 
 /// Macro to apply common builder patterns (hashers, cipher, signer, compression, previous_hash)
@@ -63,48 +62,6 @@ impl FrameBuilderHelper {
 		Ok(frame)
 	}
 
-	/// Build a telemetry frame from rover
-	pub fn build_telemetry_frame(
-		&self,
-		telemetry: RoverTelemetry,
-		fault_matrix: FaultMatrix,
-		signing_key: &Secp256k1SigningKey,
-		cipher: &Aes256Gcm,
-	) -> Result<Frame, TightBeamError> {
-		let (next_order, previous_digest) = self.chain_processor.prepare_outgoing()?;
-		let matrix_dyn = MatrixDyn::try_from(fault_matrix)?;
-
-		let builder = FrameBuilder::from(Version::V3)
-			.with_id(generate_message_id("telemetry", "rover"))
-			.with_order(next_order)
-			.with_message(telemetry)
-			.with_matrix(matrix_dyn);
-
-		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
-		let frame = builder.build()?;
-		self.finalize_frame(frame)
-	}
-
-	/// Build a command frame from earth
-	pub fn build_command_frame(
-		&self,
-		command: EarthCommand,
-		next_order: u64,
-		previous_digest: Option<DigestInfo>,
-		signing_key: &Secp256k1SigningKey,
-		cipher: &Aes256Gcm,
-	) -> Result<Frame, TightBeamError> {
-		let builder = FrameBuilder::from(Version::V3)
-			.with_id(format!("earth-cmd-{:03}", next_order))
-			.with_order(next_order)
-			.with_priority(command.priority)
-			.with_message(command);
-
-		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
-		let frame = builder.build()?;
-		self.finalize_frame(frame)
-	}
-
 	/// Build a frame request for missing frames (chain gap recovery)
 	pub fn build_frame_request_frame(
 		&self,
@@ -112,21 +69,15 @@ impl FrameBuilderHelper {
 		next_order: u64,
 		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
+		cipher: &Aes256Gcm,
 	) -> Result<Frame, TightBeamError> {
+		let relay_message = RelayMessage::FrameRequest(request);
 		let builder = FrameBuilder::from(Version::V3)
 			.with_id(format!("frame-req-{:03}", next_order))
 			.with_order(next_order)
-			.with_message(request)
-			.with_message_hasher::<Sha3_256>()
-			.with_witness_hasher::<Sha3_256>()
-			.with_signer::<Secp256k1Signature, _>(signing_key.to_owned());
+			.with_message(relay_message);
 
-		let builder = if let Some(digest) = previous_digest {
-			builder.with_previous_hash(digest)
-		} else {
-			builder
-		};
-
+		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
 		let frame = builder.build()?;
 		self.finalize_frame(frame)
 	}
@@ -138,22 +89,15 @@ impl FrameBuilderHelper {
 		next_order: u64,
 		previous_digest: Option<DigestInfo>,
 		signing_key: &Secp256k1SigningKey,
+		cipher: &Aes256Gcm,
 	) -> Result<Frame, TightBeamError> {
+		let relay_message = RelayMessage::FrameResponse(response);
 		let builder = FrameBuilder::from(Version::V3)
 			.with_id(format!("frame-resp-{:03}", next_order))
 			.with_order(next_order)
-			.with_message(response)
-			.with_message_hasher::<Sha3_256>()
-			.with_witness_hasher::<Sha3_256>()
-			.with_compression(ZstdCompression)
-			.with_signer::<Secp256k1Signature, _>(signing_key.to_owned());
+			.with_message(relay_message);
 
-		let builder = if let Some(digest) = previous_digest {
-			builder.with_previous_hash(digest)
-		} else {
-			builder
-		};
-
+		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
 		let frame = builder.build()?;
 		self.finalize_frame(frame)
 	}
@@ -167,9 +111,7 @@ impl FrameBuilderHelper {
 		signing_key: &Secp256k1SigningKey,
 		cipher: &Aes256Gcm,
 	) -> Result<Frame, TightBeamError> {
-		// Wrap command in RelayMessage
 		let relay_message = RelayMessage::Command(command.clone());
-
 		let builder = FrameBuilder::from(Version::V3)
 			.with_id(format!("relay-cmd-{:03}", next_order))
 			.with_order(next_order)
@@ -179,5 +121,63 @@ impl FrameBuilderHelper {
 		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
 		let frame = builder.build()?;
 		self.finalize_frame(frame)
+	}
+
+	/// Build a relay ACK frame (Rover acknowledges command)
+	pub fn build_relay_ack_frame(
+		&self,
+		command_order: u64,
+		next_order: u64,
+		previous_digest: Option<DigestInfo>,
+		signing_key: &Secp256k1SigningKey,
+		cipher: &Aes256Gcm,
+	) -> Result<Frame, TightBeamError> {
+		let ack = CommandAck { command_order };
+		let relay_message = RelayMessage::CommandAck(ack);
+		let builder = FrameBuilder::from(Version::V3)
+			.with_id(format!("relay-ack-{:03}", next_order))
+			.with_order(next_order)
+			.with_message(relay_message);
+
+		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
+		let frame = builder.build()?;
+		self.finalize_frame(frame)
+	}
+
+	/// Build a relay telemetry frame (Rover sends telemetry)
+	pub fn build_relay_telemetry_frame(
+		&self,
+		telemetry: RoverTelemetry,
+		fault_matrix: FaultMatrix,
+		next_order: u64,
+		previous_digest: Option<DigestInfo>,
+		signing_key: &Secp256k1SigningKey,
+		cipher: &Aes256Gcm,
+	) -> Result<Frame, TightBeamError> {
+		let matrix_dyn = MatrixDyn::try_from(fault_matrix)?;
+		let relay_message = RelayMessage::Telemetry(telemetry);
+		let builder = FrameBuilder::from(Version::V3)
+			.with_id(format!("relay-telem-{:03}", next_order))
+			.with_order(next_order)
+			.with_message(relay_message)
+			.with_matrix(matrix_dyn);
+
+		let builder = apply_common_builder_patterns!(builder, previous_digest, signing_key, cipher);
+		let frame = builder.build()?;
+		self.finalize_frame(frame)
+	}
+
+	/// Build a stateless ACK frame (metadata-only, not added to chain)
+	/// Used for immediate acknowledgment responses at relay nodes
+	pub fn build_stateless_ack_frame(&self, ack_for_order: u64) -> Result<Frame, TightBeamError> {
+		// Metadata-only frame with minimal message body
+		// Not added to chain (no order, no previous_hash)
+		let ack = StatelessAck { ack: true };
+		let frame = FrameBuilder::from(Version::V3)
+			.with_id(format!("stateless-ack-{}", ack_for_order))
+			.with_message(ack)
+			.build()?;
+
+		Ok(frame)
 	}
 }
