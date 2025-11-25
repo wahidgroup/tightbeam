@@ -47,8 +47,8 @@ use tightbeam::{
 	exactly,
 	macros::client::builder::{ClientBuilder, GenericClient},
 	prelude::*,
-	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::fdr::FdrConfig,
+	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
+	testing::{fdr::FdrConfig, specs::composition::CompositionSpec},
 	trace::TraceCollector,
 	transport::{policy::RestartExponentialBackoff, tcp::r#async::TokioListener},
 };
@@ -310,77 +310,120 @@ tb_assert_spec! {
 }
 
 // ============================================================================
-// DTN Process Specification
+// DTN Process Specifications - Parallel Composition
 // ============================================================================
 
+// Telemetry Flow: Rover → Relay → Earth (one-way pipeline)
 tb_process_spec! {
-	pub DtnRoverEarthFlow,
+	pub DtnTelemetryFlow,
 	events {
 		observable {
-			// Rover events (async)
-			"rover_send_telemetry", "rover_receive_async_command",
-			"rover_execute_collect_sample", "rover_execute_probe_location",
-			"rover_execute_take_photo", "rover_execute_standby",
-			"rover_command_complete",
-
-			// Relay events (bidirectional async)
-			"relay_receive_from_rover", "relay_forward_uplink",
-			"relay_receive_from_earth", "relay_forward_downlink",
-
-			// Earth events (async)
-			"earth_receive_telemetry", "earth_analyze_telemetry",
-			"earth_send_command",
-
-			// Fault events
-			"fault_low_power_detected", "comms_halted", "fault_cleared",
-
-			// Security events
-			"signature_verification_failed",
-
-			// Lifecycle events
-			"mission_start", "mission_complete"
+			"rover_send_telemetry",
+			"relay_receive_from_rover",
+			"relay_forward_uplink",
+			"earth_receive_telemetry",
+			"earth_analyze_telemetry"
 		}
 		hidden { }
 	}
 	states {
-		// Start state
-		Init => { "mission_start" => Running },
-
-		// Single running state that allows all async events
-		Running => {
-			// Command flow events
-			"earth_send_command" => Running,
-			"relay_receive_from_earth" => Running,
-			"relay_forward_downlink" => Running,
-			"rover_receive_async_command" => Running,
-
-			// Command execution events
-			"rover_execute_collect_sample" => Running,
-			"rover_execute_probe_location" => Running,
-			"rover_execute_take_photo" => Running,
-			"rover_execute_standby" => Running,
-			"rover_command_complete" => Running,
-
-			// Telemetry flow events (future expansion)
-			"rover_send_telemetry" => Running,
-			"relay_receive_from_rover" => Running,
-			"relay_forward_uplink" => Running,
-			"earth_receive_telemetry" => Running,
-			"earth_analyze_telemetry" => Running,
-
-			// Fault events
-			"fault_low_power_detected" => Running,
-			"comms_halted" => Running,
-			"fault_cleared" => Running,
-
-			// Security events
-			"signature_verification_failed" => Running,
-
-			// Mission completion
-			"mission_complete" => Done
+		TelemetryIdle => {
+			"rover_send_telemetry" => TelemetryRelayReceive
+		},
+		TelemetryRelayReceive => {
+			"relay_receive_from_rover" => TelemetryRelayForward
+		},
+		TelemetryRelayForward => {
+			"relay_forward_uplink" => TelemetryEarthReceive
+		},
+		TelemetryEarthReceive => {
+			"earth_receive_telemetry" => TelemetryEarthAnalyze
+		},
+		TelemetryEarthAnalyze => {
+			"earth_analyze_telemetry" => TelemetryIdle
 		}
 	}
-	terminal { Done }
+}
+
+// Command Flow: Earth → Relay → Rover (one-way async pipeline)
+tb_process_spec! {
+	pub DtnCommandFlow,
+	events {
+		observable {
+			"earth_send_command",
+			"relay_receive_from_earth",
+			"relay_forward_downlink",
+			"rover_receive_async_command",
+			"rover_execute_collect_sample",
+			"rover_execute_probe_location",
+			"rover_execute_take_photo",
+			"rover_execute_standby",
+			"rover_command_complete"
+		}
+		hidden { }
+	}
+	states {
+		CommandIdle => {
+			"earth_send_command" => CommandRelayReceive
+		},
+		CommandRelayReceive => {
+			"relay_receive_from_earth" => CommandRelayForward
+		},
+		CommandRelayForward => {
+			"relay_forward_downlink" => CommandRoverReceive
+		},
+		CommandRoverReceive => {
+			"rover_receive_async_command" => CommandExecuting
+		},
+		CommandExecuting => {
+			"rover_execute_collect_sample" => CommandComplete,
+			"rover_execute_probe_location" => CommandComplete,
+			"rover_execute_take_photo" => CommandComplete,
+			"rover_execute_standby" => CommandComplete
+		},
+		CommandComplete => {
+			"rover_command_complete" => CommandIdle
+		}
+	}
+}
+
+// Composed System: Interface Parallel with Relay Synchronization
+// Both flows synchronize on relay events (shared satellite infrastructure)
+tb_compose_spec! {
+	pub DtnComposedSystem,
+	processes: {
+		DtnTelemetryFlow,
+		DtnCommandFlow
+	},
+	composition: interface_parallel(
+		"relay_receive_from_rover",
+		"relay_forward_uplink",
+		"relay_receive_from_earth",
+		"relay_forward_downlink"
+	),
+	properties: {
+		deadlock_free: true,
+		livelock_free: true,
+		deterministic: false
+	},
+	annotations {
+		description: "DTN system with relay-synchronized telemetry and command flows"
+	}
+}
+
+// Event Count Assertion Spec
+tb_assert_spec! {
+	pub DtnEventCountSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("rover_send_telemetry", exactly!(6)),
+			("earth_send_command", exactly!(6)),
+			("rover_command_complete", exactly!(6)),
+			("earth_analyze_telemetry", exactly!(6))
+		]
+	}
 }
 
 // ============================================================================
@@ -585,8 +628,8 @@ fn build_dtn_fdr_config() -> FdrConfig {
 
 tb_scenario! {
 	name: dtn_ultimate_realistic,
-	spec: DtnRealisticSpec,
-	csp: DtnRoverEarthFlow,
+	spec: DtnEventCountSpec,
+	csp: DtnComposedSystem,
 	config: DtnScenarioConfig::default(),
 	environment Servlet {
 		servlet: RoverServlet,

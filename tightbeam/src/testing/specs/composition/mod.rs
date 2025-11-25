@@ -8,7 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::testing::specs::csp::{Event, Process, State};
+use crate::testing::specs::csp::{CspValidationResult, Event, Process, ProcessSpec, State};
+use crate::trace::ConsumedTrace;
 
 // Submodules
 pub mod algebra;
@@ -35,6 +36,17 @@ pub trait CompositionSpec {
 	/// Verify composition properties (deadlock-free, livelock-free, etc.)
 	fn verify_properties() -> Result<(), CompositionError> {
 		Ok(())
+	}
+}
+
+/// Blanket implementation of ProcessSpec for CompositionSpec types
+///
+/// This allows composed processes to be used directly in tb_scenario! and
+/// other testing macros that expect a ProcessSpec.
+impl<T: CompositionSpec> ProcessSpec for T {
+	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
+		let process = T::process();
+		process.validate_trace(trace)
 	}
 }
 

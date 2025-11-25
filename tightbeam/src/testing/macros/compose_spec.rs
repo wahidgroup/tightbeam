@@ -50,6 +50,12 @@ macro_rules! tb_compose_spec {
 		$(#[$meta])*
 		$vis struct $name;
 
+		impl Default for $name {
+			fn default() -> Self {
+				Self
+			}
+		}
+
 		impl $crate::testing::specs::composition::CompositionSpec for $name {
 			fn process() -> $crate::testing::specs::csp::Process {
 				use $crate::testing::specs::csp::{Event, Process};
