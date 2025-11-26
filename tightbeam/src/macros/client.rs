@@ -472,6 +472,7 @@ pub mod builder {
 
 	pub struct ClientBuilder<P: Protocol> {
 		stream: Option<P::Stream>,
+		addr: Option<P::Address>,
 		policies: ClientPolicies,
 		#[cfg(feature = "x509")]
 		server_certificates: Vec<Certificate>,
@@ -486,6 +487,7 @@ pub mod builder {
 		pub fn from_stream(stream: P::Stream) -> Self {
 			Self {
 				stream: Some(stream),
+				addr: None,
 				policies: ClientPolicies::default(),
 				#[cfg(feature = "x509")]
 				server_certificates: Vec::new(),
@@ -502,6 +504,7 @@ pub mod builder {
 			let stream = <P as Protocol>::connect(addr.clone()).await.map_err(|e| e.into())?;
 			Ok(Self {
 				stream: Some(stream),
+				addr: Some(addr),
 				policies: ClientPolicies::default(),
 				#[cfg(feature = "x509")]
 				server_certificates: Vec::new(),
@@ -581,24 +584,27 @@ pub mod builder {
 		/// Build the client. For x509 configuration, call with_server_certificate()
 		/// and with_client_identity() before calling build().
 		#[cfg(not(feature = "x509"))]
-		pub fn build(self) -> Result<GenericClient<P>, TransportError>
+		pub fn build(mut self) -> Result<GenericClient<P>, TransportError>
 		where
 			P::Transport: MessageEmitter + MessageCollector + PolicyConf,
 		{
-			let stream = self.stream.ok_or(TransportError::ConnectionFailed)?;
+			let stream = self.stream.take().ok_or(TransportError::ConnectionFailed)?;
 			let transport = <P as Protocol>::create_transport(stream);
 			let configured = self.policies.apply::<P>(transport);
-			Ok(GenericClient::from_transport(configured))
+			Ok(GenericClient {
+				transport: Some(configured),
+				connection_params: ClientConnectionParams { addr: self.addr },
+				_ph: core::marker::PhantomData,
+			})
 		}
 
 		#[cfg(feature = "x509")]
-		pub fn build(self) -> Result<GenericClient<P>, TransportError>
+		pub fn build(mut self) -> Result<GenericClient<P>, TransportError>
 		where
 			P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
 		{
-			let stream = self.stream.ok_or(TransportError::ConnectionFailed)?;
+			let stream = self.stream.take().ok_or(TransportError::ConnectionFailed)?;
 			let mut transport = <P as Protocol>::create_transport(stream);
-
 			if !self.server_certificates.is_empty() {
 				transport = transport.with_server_certificates(self.server_certificates);
 			}
@@ -607,24 +613,42 @@ pub mod builder {
 			}
 
 			let configured = self.policies.apply::<P>(transport);
-			Ok(GenericClient::from_transport(configured))
+			Ok(GenericClient {
+				transport: Some(configured),
+				connection_params: ClientConnectionParams { addr: self.addr },
+				_ph: core::marker::PhantomData,
+			})
 		}
+	}
+
+	/// Connection parameters for reconnection
+	///
+	/// Note: Currently only stores address for basic reconnection.
+	/// Policies and x509 configuration are not restored on reconnect.
+	struct ClientConnectionParams<P: Protocol> {
+		addr: Option<P::Address>,
 	}
 
 	pub struct GenericClient<P: Protocol> {
-		transport: P::Transport,
+		transport: Option<P::Transport>,
+		connection_params: ClientConnectionParams<P>,
 		_ph: core::marker::PhantomData<P>,
 	}
+
 	impl<P: Protocol> GenericClient<P> {
 		pub fn from_transport(transport: P::Transport) -> Self {
-			Self { transport, _ph: core::marker::PhantomData }
+			Self {
+				transport: Some(transport),
+				connection_params: ClientConnectionParams { addr: None },
+				_ph: core::marker::PhantomData,
+			}
 		}
 
-		pub fn transport(&self) -> &P::Transport {
-			&self.transport
+		pub fn transport(&self) -> Option<&P::Transport> {
+			self.transport.as_ref()
 		}
 
-		pub fn into_transport(self) -> P::Transport {
+		pub fn into_transport(self) -> Option<P::Transport> {
 			self.transport
 		}
 
@@ -633,7 +657,44 @@ pub mod builder {
 		where
 			P::Transport: MessageEmitter,
 		{
-			self.transport.emit(frame, attempt).await
+			// Delegate to transport if available
+			if let Some(transport) = &mut self.transport {
+				transport.emit(frame, attempt).await
+			} else {
+				// No transport available
+				Err(TransportError::ConnectionFailed)
+			}
+		}
+
+		/// Check if transport is available
+		pub fn is_connected(&self) -> bool {
+			self.transport.is_some()
+		}
+
+		/// Reconnect using stored parameters
+		///
+		/// Note: Currently does not restore policies or x509 configuration.
+		/// Reconnection creates a basic transport.
+		///
+		/// Zero-copy consideration: Address is small (IP + port) and required by
+		/// Protocol::connect which takes ownership. The alternative (store address
+		/// by value, consume on reconnect) would prevent multiple reconnects.
+		pub async fn reconnect(&mut self) -> TransportResult<()>
+		where
+			P::Address: Clone, // Required by Protocol::connect signature
+		{
+			let addr = self
+				.connection_params
+				.addr
+				.as_ref()
+				.ok_or(TransportError::ConnectionFailed)?
+				.clone();
+
+			let stream = P::connect(addr).await.map_err(|e| e.into())?;
+			let transport = P::create_transport(stream);
+
+			self.transport = Some(transport);
+			Ok(())
 		}
 	}
 

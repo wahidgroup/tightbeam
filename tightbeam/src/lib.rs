@@ -45,9 +45,10 @@
 //!
 //!         ┌──────────────────────────────────────────────────────┐
 //!         │  📦 Protocol Versions                                │
-//!         │  ├─ V0: Basic metadata (id, order, hash)             │
-//!         │  ├─ V1: Secure messaging (encryption + signature)    │
-//!         │  └─ V2: Extended (priority, TTL, headers, chaining)  │
+//!         │  ├─ V0: Core metadata (id, order, message)           │
+//!         │  ├─ V1: + integrity, confidentiality, signature      │
+//!         │  ├─ V2: + priority, TTL, previous_frame chaining     │
+//!         │  └─ V3: + matrix control                             │
 //!         └──────────────────────────────────────────────────────┘
 //!
 //!         ┌──────────────────────────────────────────────────────┐
@@ -116,7 +117,7 @@ pub mod prelude;
 pub mod trace;
 pub mod utils;
 
-#[cfg(all(feature = "testing", feature = "std"))]
+#[cfg(feature = "instrument")]
 pub mod instrumentation;
 
 #[cfg(feature = "builder")]

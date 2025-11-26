@@ -19,6 +19,29 @@ pub mod verification;
 // Re-export key types
 pub use verification::{DeadlockChecker, DeterminismChecker, LivelockChecker};
 
+/// CSP Parallel Composition Operators
+///
+/// Defines the different ways processes can be composed in parallel,
+/// following standard CSP theory notation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompositionOperator {
+	/// Synchronized parallel (||) - synchronize on ALL shared events
+	/// Events in both alphabets must occur together; unique events interleave
+	Synchronized,
+
+	/// Interleaved parallel (|||) - no synchronization, pure interleaving
+	/// All events from both processes interleave independently
+	Interleaved,
+
+	/// Interface parallel ([| A |]) - synchronize only on specified events
+	/// Events in alphabet A must synchronize; all others interleave
+	Interface { events: Vec<&'static str> },
+
+	/// Alphabetized parallel ([| αP | αQ |]) - custom alphabets per process
+	/// Each process restricted to its alphabet, synchronize on intersection
+	Alphabetized { left: Vec<&'static str>, right: Vec<&'static str> },
+}
+
 /// Trait for process composition specifications
 ///
 /// Similar to `ProcessSpec`, this trait allows both declarative macro usage

@@ -50,7 +50,6 @@ pub trait TightBeamLike:
 	+ Clone
 	+ core::fmt::Debug
 	+ PartialEq
-	+ core::fmt::Debug
 	+ Into<Metadata>
 	+ Into<Version>
 {

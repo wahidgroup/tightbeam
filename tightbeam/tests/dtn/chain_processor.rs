@@ -50,31 +50,17 @@ impl ChainProcessor {
 
 	/// Process incoming frame: persist, order, validate chain
 	pub fn process_incoming(&self, frame: Frame) -> Result<ProcessResult, TightBeamError> {
-		println!(
-			"[{}] >>> process_incoming called (order: {}, id: {:?})",
-			self.node_name,
-			frame.metadata.order,
-			String::from_utf8_lossy(&frame.metadata.id)
-		);
-
 		// 1. Persist frame
-		println!("[{}] Acquiring write lock on store...", self.node_name);
 		let mut store_guard = self.store.write()?;
-		println!("[{}] Write lock acquired, persisting frame...", self.node_name);
 		store_guard.persist(&frame)?;
+
 		drop(store_guard);
-		println!("[{}] ✓ Frame persisted (order: {})", self.node_name, frame.metadata.order);
 
 		// 2. Insert into ordering buffer
-		println!("[{}] Inserting into order buffer...", self.node_name);
 		let frames_to_process = self.order_buffer.write()?.insert(frame)?;
-		println!("[{}] Order buffer insert complete", self.node_name);
 		if let Some(frames) = frames_to_process {
-			println!("[{}] Frames to process: {} frames", self.node_name, frames.len());
 			// 3. Verify batch integrity before committing to chain state
-			println!("[{}] Verifying chain batch...", self.node_name);
 			let verdict = self.store.read()?.verify_chain(&frames)?;
-			println!("[{}] Chain verification complete, valid: {}", self.node_name, verdict.valid);
 			if !verdict.valid {
 				// Batch verification failed - return chain gap
 				let current_head = self.chain_state.read()?.last_hash.to_vec();
@@ -97,18 +83,11 @@ impl ChainProcessor {
 			}
 
 			// 4. Validate and update chain for ordered frames
-			println!("[{}] Validating frames against chain state...", self.node_name);
 			let chain_state_guard = self.chain_state.read()?;
-			println!(
-				"[{}] Chain state read lock acquired (current sequence: {})",
-				self.node_name, chain_state_guard.sequence
-			);
 			let mut validated_frames = Vec::new();
 			let mut frames_to_update = Vec::new();
 			for ordered_frame in frames {
-				println!("[{}] Validating frame order: {}", self.node_name, ordered_frame.metadata.order);
 				let chain_valid = chain_state_guard.validate_frame(&ordered_frame)?;
-				println!("[{}] Validation result: {}", self.node_name, chain_valid);
 				if !chain_valid {
 					// Chain gap detected
 					let current_head = chain_state_guard.last_hash.to_vec();
@@ -123,6 +102,7 @@ impl ChainProcessor {
 						"[{}] ⚠ Chain gap detected (order: {})",
 						self.node_name, ordered_frame.metadata.order
 					);
+
 					return Ok(ProcessResult::ChainGap { current_head, missing_hash });
 				}
 
@@ -131,27 +111,17 @@ impl ChainProcessor {
 			}
 
 			// Release read lock before acquiring write lock
-			println!("[{}] Dropping chain state read lock...", self.node_name);
 			drop(chain_state_guard);
-			println!("[{}] Read lock dropped", self.node_name);
 
 			// Update chain state for all validated frames (single write lock acquisition)
-			println!("[{}] Acquiring chain state write lock...", self.node_name);
 			let mut chain_state_guard = self.chain_state.write()?;
-			println!(
-				"[{}] Chain state write lock acquired, updating {} frames...",
-				self.node_name,
-				frames_to_update.len()
-			);
 			for ordered_frame in frames_to_update {
 				chain_state_guard.update_with_frame(&ordered_frame)?;
 				validated_frames.push(ordered_frame);
 			}
-			println!("[{}] Chain state updated successfully", self.node_name);
 
 			Ok(ProcessResult::Processed(validated_frames))
 		} else {
-			println!("[{}] Frame buffered (waiting for missing frames)", self.node_name);
 			Ok(ProcessResult::Buffered)
 		}
 	}
@@ -177,8 +147,9 @@ impl ChainProcessor {
 		self.store.write()?.persist(frame)?;
 		self.chain_state.write()?.update_with_frame(frame)?;
 
-		// Update ordering buffer's next_expected to account for the frame we just sent
-		// This ensures the ordering buffer is synchronized with the global chain
+		// Update ordering buffer's next_expected to account for the frame we
+		// just sent. This ensures the ordering buffer is synchronized with
+		// the global chain
 		let mut order_buffer = self.order_buffer.write()?;
 		if frame.metadata.order >= order_buffer.next_expected() {
 			order_buffer.set_next_expected(frame.metadata.order + 1);
@@ -196,9 +167,8 @@ impl ChainProcessor {
 		requester_head: &[u8],
 		last_received_hash: &[u8],
 	) -> Result<Vec<Frame>, TightBeamError> {
-		let mut store = self.store.write()?;
-
 		// Find frame with hash matching last_received_hash (frame just before gap)
+		let mut store = self.store.write()?;
 		let mut current_frame = match store.retrieve_by_hash(last_received_hash)? {
 			Some(frame) => frame,
 			None => {

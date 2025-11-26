@@ -34,6 +34,8 @@ pub enum TransportFailure {
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug)]
 pub enum TransportError {
+	#[cfg_attr(feature = "derive", error("Connection closed gracefully"))]
+	ConnectionClosed,
 	#[cfg_attr(feature = "derive", error("Connection failed"))]
 	ConnectionFailed,
 	#[cfg_attr(feature = "derive", error("Send failed"))]
@@ -167,6 +169,28 @@ impl TransportError {
 		match self {
 			TransportError::MessageNotSent(_, reason) => Some(reason),
 			_ => None,
+		}
+	}
+
+	/// Check if error indicates connection is dead (for auto-reconnect)
+	///
+	/// Returns true for errors that suggest the underlying connection
+	/// should be discarded and a new connection established.
+	pub fn is_connection_error(&self) -> bool {
+		matches!(
+			self,
+			TransportError::ConnectionClosed
+				| TransportError::ConnectionFailed
+				| TransportError::OperationFailed(TransportFailure::Timeout)
+		) || {
+			#[cfg(feature = "std")]
+			{
+				matches!(self, TransportError::IoError(_))
+			}
+			#[cfg(not(feature = "std"))]
+			{
+				false
+			}
 		}
 	}
 }

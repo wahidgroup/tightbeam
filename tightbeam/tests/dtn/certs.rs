@@ -1,6 +1,6 @@
 //! X.509 Certificates for DTN Mutual Authentication
 //!
-//! This module contains static X.509 certificates and keys for the 4-tier DTN architecture:
+//! This module contains static X.509 certificates and keys:
 //! - Mission Control (Earth-based command center)
 //! - Earth Relay Satellite
 //! - Mars Relay Satellite
@@ -122,7 +122,8 @@ pub const ROVER_PUB_KEY: &[u8] = &hex!("048a6488041ccb629f2c2f3a8b1f06eaf155db47
 pub const MISSION_CONTROL_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([EARTH_RELAY_PUB_KEY]);
 
 /// Earth Relay's pinning policy: accepts Mission Control and Mars Relay connections
-pub const EARTH_RELAY_PINNING: PublicKeyPinning<2> = PublicKeyPinning::new([MISSION_CONTROL_PUB_KEY, MARS_RELAY_PUB_KEY]);
+pub const EARTH_RELAY_PINNING: PublicKeyPinning<2> =
+	PublicKeyPinning::new([MISSION_CONTROL_PUB_KEY, MARS_RELAY_PUB_KEY]);
 
 /// Mars Relay's pinning policy: accepts Earth Relay and Rover connections
 pub const MARS_RELAY_PINNING: PublicKeyPinning<2> = PublicKeyPinning::new([EARTH_RELAY_PUB_KEY, ROVER_PUB_KEY]);

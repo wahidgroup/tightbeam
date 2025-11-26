@@ -115,3 +115,24 @@ pub trait AsyncListenerTrait: Protocol + Send {
 	#[allow(async_fn_in_trait)]
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error>;
 }
+
+/// Protocol supports persistent connections (keep-alive)
+///
+/// This trait allows protocols to opt-in to connection reuse,
+/// enabling TLS handshakes to occur once per connection lifecycle
+/// rather than per message.
+pub trait PersistentConnection: Protocol {
+	/// Check if underlying transport is still connected
+	///
+	/// Returns false on EOF, socket error, or explicit close.
+	/// Protocols should use lightweight checks (e.g., peek) without
+	/// blocking or allocating.
+	fn is_connected(transport: &Self::Transport) -> bool;
+
+	/// Attempt graceful close (best effort, no panic)
+	///
+	/// This is a best-effort operation that should not panic.
+	/// Implementations may be no-ops if graceful close is not
+	/// supported by the underlying protocol.
+	fn try_close(transport: &mut Self::Transport);
+}
