@@ -11,6 +11,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use tightbeam::{
+	asn1::MessagePriority,
 	compress::{Inflator, ZstdCompression},
 	crypto::{
 		aead::Aes256Gcm,
@@ -19,7 +20,6 @@ use tightbeam::{
 		x509::CertificateSpec,
 	},
 	decode,
-	macros::client::builder::ClientBuilder,
 	prelude::*,
 	servlet,
 	testing::trace::TraceCollector,
@@ -74,7 +74,6 @@ trait DtnNode {
 
 	fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
 		if frame.metadata.confidentiality.is_some() {
-			use tightbeam::compress::{Inflator, ZstdCompression};
 			let inflator: Option<&dyn Inflator> = if frame.metadata.compactness.is_some() {
 				Some(&ZstdCompression)
 			} else {
@@ -119,14 +118,14 @@ trait DtnNode {
 			CertificateSpec,
 		)>,
 	) -> Result<Option<Frame>, TightBeamError> {
-		trace.event(&format!("{}_receive_frame_request", self.node_name()))?;
+		trace.event(format!("{}_receive_frame_request", self.node_name()))?;
 
 		let missing_frames = self
 			.chain_processor()
 			.request_missing_frames(&request.requester_head, &request.last_received_hash)?;
 
 		if !missing_frames.is_empty() {
-			trace.event(&format!("{}_send_frame_response", self.node_name()))?;
+			trace.event(format!("{}_send_frame_response", self.node_name()))?;
 
 			let response = FrameResponse { frames: missing_frames };
 			let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
@@ -141,7 +140,7 @@ trait DtnNode {
 			self.chain_processor().finalize_outgoing(&response_frame)?;
 			Ok(Some(response_frame))
 		} else if let Some((pool, addr, cert)) = cascade_target {
-			trace.event(&format!("{}_cascade_frame_request", self.node_name()))?;
+			trace.event(format!("{}_cascade_frame_request", self.node_name()))?;
 
 			let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
 			let cascade_frame = self.frame_builder().build_frame_request_frame(
@@ -161,13 +160,47 @@ trait DtnNode {
 	}
 
 	fn handle_frame_response(&self, response: FrameResponse, trace: &TraceCollector) -> Result<(), TightBeamError> {
-		trace.event(&format!("{}_receive_frame_response", self.node_name()))?;
+		trace.event(format!("{}_receive_frame_response", self.node_name()))?;
 
 		for frame in response.frames {
 			self.chain_processor().process_incoming(frame)?;
 		}
 
 		Ok(())
+	}
+
+	// Helper: Process FrameResponse and return stateless ACK
+	fn process_frame_response(
+		&self,
+		response: FrameResponse,
+		frame_order: u64,
+		trace: &TraceCollector,
+	) -> Result<Option<Frame>, TightBeamError> {
+		self.handle_frame_response(response, trace)?;
+		let stateless_ack = self.frame_builder().build_stateless_ack_frame(frame_order)?;
+		Ok(Some(stateless_ack))
+	}
+
+	// Helper: Build and send FrameResponse for gap recovery
+	fn build_and_send_frame_response(
+		&self,
+		missing_frames: Vec<Frame>,
+		trace: &TraceCollector,
+	) -> Result<Frame, TightBeamError> {
+		trace.event(format!("{}_send_frame_response", self.node_name()))?;
+
+		let response = FrameResponse { frames: missing_frames };
+		let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
+		let response_frame = self.frame_builder().build_frame_response_frame(
+			response,
+			order,
+			prev_digest,
+			self.signing_key(),
+			self.cipher(),
+		)?;
+
+		self.chain_processor().finalize_outgoing(&response_frame)?;
+		Ok(response_frame)
 	}
 
 	async fn handle_chain_gap(
@@ -179,7 +212,7 @@ trait DtnNode {
 		server_cert: CertificateSpec,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
-		trace.event(&format!("{}_gap_detected", self.node_name()))?;
+		trace.event(format!("{}_gap_detected", self.node_name()))?;
 
 		let request = FrameRequest {
 			requester_head: current_head.try_into().unwrap_or([0u8; 32]),
@@ -196,10 +229,26 @@ trait DtnNode {
 		)?;
 
 		self.chain_processor().finalize_outgoing(&request_frame)?;
-		trace.event(&format!("{}_send_frame_request", self.node_name()))?;
+		trace.event(format!("{}_send_frame_request", self.node_name()))?;
 
 		self.send_frame(pool, upstream_addr, server_cert, request_frame).await?;
 		Ok(())
+	}
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Helper: Wait for an address to be set (with timeout)
+async fn wait_for_address(
+	addr_lock: &Arc<RwLock<Option<TightBeamSocketAddr>>>,
+) -> Result<TightBeamSocketAddr, TightBeamError> {
+	loop {
+		if let Some(addr) = *addr_lock.read()? {
+			break Ok(addr);
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
 }
 
@@ -272,7 +321,7 @@ servlet! {
 								};
 
 								let (next_order, previous_digest) = config.chain_processor.prepare_outgoing()?;
-								let command = EarthCommand::new(rover_cmd, tightbeam::asn1::MessagePriority::Normal, mission_time_ms());
+								let command = EarthCommand::new(rover_cmd, MessagePriority::Normal, mission_time_ms());
 
 								trace.event("mission_control_send_command")?;
 
@@ -448,18 +497,9 @@ servlet! {
 				println!("[Earth Relay] ProcessResult::Processed branch");
 
 				// Check if any processed frames are gap recovery messages
-				for ordered_frame in ordered_frames {
+				if let Some(ordered_frame) = ordered_frames.into_iter().next() {
 					// Decrypt and decode to check message type
-					let relay_message: RelayMessage = if ordered_frame.metadata.confidentiality.is_some() {
-						let inflator: Option<&dyn Inflator> = if ordered_frame.metadata.compactness.is_some() {
-							Some(&ZstdCompression)
-						} else {
-							None
-						};
-						ordered_frame.decrypt::<RelayMessage>(&config.shared_cipher, inflator)?
-					} else {
-						decode(&ordered_frame.message)?
-					};
+					let relay_message = config.decrypt_relay_message(ordered_frame.clone())?;
 
 					match relay_message {
 						RelayMessage::FrameRequest(request) => {
@@ -471,20 +511,7 @@ servlet! {
 							)?;
 
 							if !missing_frames.is_empty() {
-								// We have the frames - respond
-								trace.event("earth_relay_send_frame_response")?;
-
-								let response = FrameResponse { frames: missing_frames };
-								let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
-								let response_frame = config.frame_builder.build_frame_response_frame(
-									response,
-									order,
-									prev_digest,
-									&config.earth_relay_signing_key,
-									&config.shared_cipher,
-								)?;
-
-								config.chain_processor.finalize_outgoing(&response_frame)?;
+								let response_frame = config.build_and_send_frame_response(missing_frames, &trace)?;
 								return Ok(Some(response_frame));
 							} else {
 								// We don't have frames - cascade to upstream
@@ -511,29 +538,13 @@ servlet! {
 								)?;
 
 								config.chain_processor.finalize_outgoing(&cascade_frame)?;
+								config.send_frame(&config.connection_pool, cascade_addr, cascade_cert, cascade_frame).await?;
 
-							let mut client = ClientBuilder::<TokioListener>::connect(cascade_addr)
-								.await?
-								.with_server_certificate(cascade_cert)?
-								.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY)?
-								.build()
-								.await?;
-
-							client.emit(cascade_frame, None).await?;
 								return Ok(None); // Cascade is async, no immediate response
 							}
 						},
 						RelayMessage::FrameResponse(response) => {
-							trace.event("earth_relay_receive_frame_response")?;
-
-							// Process all frames into chain
-							for frame in response.frames {
-								config.chain_processor.process_incoming(frame)?;
-							}
-
-							// Return stateless ACK
-							let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
-							return Ok(Some(stateless_ack));
+							return config.process_frame_response(response, frame_order, &trace);
 						},
 						_ => {
 							// Regular message - route based on source
@@ -570,12 +581,7 @@ servlet! {
 								debug_log!("[{}] [Earth Relay] Forwarding from Mars Relay to Mission Control", format_mission_time(mission_time_ms()));
 
 								// Get Mission Control address (wait if not set yet)
-								let mc_addr = loop {
-									if let Some(addr) = *config.mission_control_addr.read()? {
-										break addr;
-									}
-									tokio::time::sleep(Duration::from_millis(10)).await;
-								};
+								let mc_addr = wait_for_address(&config.mission_control_addr).await?;
 
 								// Use pooled client
 								config.send_frame(
@@ -693,212 +699,160 @@ servlet! {
 			return Err(TightBeamError::MissingSignature);
 		};
 
-	// Get frame order before processing
-	let frame_order = frame.metadata.order;
+		// Get frame order before processing
+		let frame_order = frame.metadata.order;
+		// Process frame through Mars Relay's chain
+		match config.chain_processor.process_incoming(frame.clone())? {
+			ProcessResult::Processed(ordered_frames) => {
+				// Check if any processed frames are gap recovery messages
+				for ordered_frame in ordered_frames {
+					// Decrypt and decode to check message type
+					let relay_message = config.decrypt_relay_message(ordered_frame.clone())?;
+					match relay_message {
+						RelayMessage::FrameRequest(request) => {
+							trace.event("mars_relay_receive_frame_request")?;
 
-	// Process frame through Mars Relay's chain
-	match config.chain_processor.process_incoming(frame.clone())? {
-		ProcessResult::Processed(ordered_frames) => {
-			// Check if any processed frames are gap recovery messages
-			for ordered_frame in ordered_frames {
-				// Decrypt and decode to check message type
-				let relay_message: RelayMessage = if ordered_frame.metadata.confidentiality.is_some() {
-					use tightbeam::compress::{Inflator, ZstdCompression};
-					let inflator: Option<&dyn Inflator> = if ordered_frame.metadata.compactness.is_some() {
-						Some(&ZstdCompression)
-					} else {
-						None
-					};
-					ordered_frame.decrypt::<RelayMessage>(&config.shared_cipher, inflator)?
-				} else {
-					decode(&ordered_frame.message)?
-				};
+							let missing_frames = config.chain_processor.request_missing_frames(
+								&request.requester_head,
+								&request.last_received_hash,
+							)?;
 
-				match relay_message {
-				RelayMessage::FrameRequest(request) => {
-					trace.event("mars_relay_receive_frame_request")?;
+							if !missing_frames.is_empty() {
+								let response_frame = config.build_and_send_frame_response(missing_frames, &trace)?;
+								return Ok(Some(response_frame));
+							} else {
+								// We don't have frames - cascade to upstream
+								trace.event("mars_relay_cascade_frame_request")?;
 
-					let missing_frames = config.chain_processor.request_missing_frames(
-						&request.requester_head,
-						&request.last_received_hash,
-					)?;
+								let (cascade_addr, cascade_cert) = if from_rover {
+									// Request from Rover, cascade to Earth Relay
+									match *config.earth_relay_addr.read()? {
+										Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT),
+										None => return Ok(None), // Earth address not available yet
+									}
+								} else {
+									// Request from Earth, cascade to Rover
+									(config.rover_addr, ROVER_CERT)
+								};
 
-					if !missing_frames.is_empty() {
-						// We have the frames - respond
-						trace.event("mars_relay_send_frame_response")?;
+								let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+								let cascade_frame = config.frame_builder.build_frame_request_frame(
+									request,
+									order,
+									prev_digest,
+									&config.mars_relay_signing_key,
+									&config.shared_cipher,
+								)?;
 
-						let response = FrameResponse { frames: missing_frames };
-						let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
-						let response_frame = config.frame_builder.build_frame_response_frame(
-							response,
-							order,
-							prev_digest,
-							&config.mars_relay_signing_key,
-							&config.shared_cipher,
-						)?;
-
-						config.chain_processor.finalize_outgoing(&response_frame)?;
-						return Ok(Some(response_frame));
-					} else {
-						// We don't have frames - cascade to upstream
-						trace.event("mars_relay_cascade_frame_request")?;
-
-						let (cascade_addr, cascade_cert) = if from_rover {
-							// Request from Rover, cascade to Earth Relay
-							match *config.earth_relay_addr.read()? {
-								Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT),
-								None => return Ok(None), // Earth address not available yet
+								config.chain_processor.finalize_outgoing(&cascade_frame)?;
+								config.send_frame(&config.connection_pool, cascade_addr, cascade_cert, cascade_frame).await?;
+								return Ok(None); // Cascade is async, no immediate response
 							}
-						} else {
-							// Request from Earth, cascade to Rover
-							(config.rover_addr, ROVER_CERT)
-						};
-
-						let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
-						let cascade_frame = config.frame_builder.build_frame_request_frame(
-							request,
-							order,
-							prev_digest,
-							&config.mars_relay_signing_key,
-							&config.shared_cipher,
-						)?;
-
-						config.chain_processor.finalize_outgoing(&cascade_frame)?;
-
-					let mut client = ClientBuilder::<TokioListener>::connect(cascade_addr)
-						.await?
-						.with_server_certificate(cascade_cert)?
-						.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
-						.build()
-						.await?;
-
-					client.emit(cascade_frame, None).await?;
-						return Ok(None); // Cascade is async, no immediate response
-					}
-				},
-				RelayMessage::FrameResponse(response) => {
-					trace.event("mars_relay_receive_frame_response")?;
-
-					// Process all frames into chain
-					for frame in response.frames {
-						config.chain_processor.process_incoming(frame)?;
-					}
-
-					// Return stateless ACK
-					let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
-					return Ok(Some(stateless_ack));
-				},
-					_ => {
-						// Regular message - route based on source
-						// Fall through to routing logic below
-					}
-				}
-			}
-
-			if from_rover {
-				// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
-				let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
-
-				// Forward to Earth Relay
-				if is_telemetry {
-					trace.event("mars_relay_receive_telemetry_from_rover")?;
-					trace.event("mars_relay_forward_telemetry_to_earth")?;
-				} else {
-					trace.event("mars_relay_receive_ack_from_rover")?;
-					trace.event("mars_relay_forward_ack_to_earth")?;
-				}
-
-				debug_log!("[{}] [Mars Relay] Forwarding from Rover to Earth Relay", format_mission_time(mission_time_ms()));
-
-				// Get Earth Relay address (wait if not set yet)
-				let earth_addr = loop {
-					if let Some(addr) = *config.earth_relay_addr.read()? {
-						break addr;
-					}
-					tokio::time::sleep(Duration::from_millis(10)).await;
-				};
-
-				// Use pooled client
-				config.send_frame(
-					&config.connection_pool,
-					earth_addr,
-					EARTH_RELAY_CERT,
-					frame,
-				).await?;
-
-				// Return stateless ACK to Rover
-				let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
-				Ok(Some(stateless_ack))
-			} else {
-				// Forward to Rover using cached client
-				trace.event("mars_relay_receive_from_earth")?;
-				trace.event("mars_relay_forward_to_rover")?;
-				debug_log!("[{}] [Mars Relay] Forwarding from Earth Relay to Rover", format_mission_time(mission_time_ms()));
-
-				debug_log!("[Mars Relay] Emitting frame to Rover...");
-				let response = config.send_frame(
-					&config.connection_pool,
-					config.rover_addr,
-					ROVER_CERT,
-					frame,
-				).await?;
-				debug_log!("[Mars Relay] Response from Rover: {:?}", response.is_some());
-
-				if let Some(ack_frame) = response {
-					debug_log!("[Mars Relay] Rover sent ACK, processing...");
-					// Process Rover's ACK into chain and forward to Earth Relay
-					config.chain_processor.process_incoming(ack_frame.clone())?;
-
-					// Emit trace event for receiving ACK from Rover (stateful ACK for command)
-					trace.event("mars_relay_receive_ack_from_rover")?;
-					trace.event("mars_relay_forward_ack_to_earth")?;
-
-					// Forward ACK to Earth Relay using cached client
-					let earth_addr = loop {
-						if let Some(addr) = *config.earth_relay_addr.read()? {
-							break addr;
+						},
+						RelayMessage::FrameResponse(response) => {
+							return config.process_frame_response(response, frame_order, &trace);
+						},
+						_ => {
+							// Regular message - route based on source
+							// Fall through to routing logic below
 						}
-						tokio::time::sleep(Duration::from_millis(10)).await;
-					};
+					}
+				}
 
+				if from_rover {
+					// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
+					let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
+
+					// Forward to Earth Relay
+					if is_telemetry {
+						trace.event("mars_relay_receive_telemetry_from_rover")?;
+						trace.event("mars_relay_forward_telemetry_to_earth")?;
+					} else {
+						trace.event("mars_relay_receive_ack_from_rover")?;
+						trace.event("mars_relay_forward_ack_to_earth")?;
+					}
+
+					debug_log!("[{}] [Mars Relay] Forwarding from Rover to Earth Relay", format_mission_time(mission_time_ms()));
+
+					// Get Earth Relay address (wait if not set yet)
+					let earth_addr = wait_for_address(&config.earth_relay_addr).await?;
+
+					// Use pooled client
 					config.send_frame(
 						&config.connection_pool,
 						earth_addr,
 						EARTH_RELAY_CERT,
-						ack_frame,
+						frame,
 					).await?;
-					debug_log!("[Mars Relay] ACK forwarded to Earth Relay");
-				}
 
-				// Fire-and-forget (no response to Earth Relay)
+					// Return stateless ACK to Rover
+					let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
+					Ok(Some(stateless_ack))
+				} else {
+					// Forward to Rover using cached client
+					trace.event("mars_relay_receive_from_earth")?;
+					trace.event("mars_relay_forward_to_rover")?;
+					debug_log!("[{}] [Mars Relay] Forwarding from Earth Relay to Rover", format_mission_time(mission_time_ms()));
+
+					debug_log!("[Mars Relay] Emitting frame to Rover...");
+					let response = config.send_frame(
+						&config.connection_pool,
+						config.rover_addr,
+						ROVER_CERT,
+						frame,
+					).await?;
+					debug_log!("[Mars Relay] Response from Rover: {:?}", response.is_some());
+
+					if let Some(ack_frame) = response {
+						debug_log!("[Mars Relay] Rover sent ACK, processing...");
+						// Process Rover's ACK into chain and forward to Earth Relay
+						config.chain_processor.process_incoming(ack_frame.clone())?;
+
+						// Emit trace event for receiving ACK from Rover (stateful ACK for command)
+						trace.event("mars_relay_receive_ack_from_rover")?;
+						trace.event("mars_relay_forward_ack_to_earth")?;
+
+						// Forward ACK to Earth Relay using cached client
+						let earth_addr = wait_for_address(&config.earth_relay_addr).await?;
+
+						config.send_frame(
+							&config.connection_pool,
+							earth_addr,
+							EARTH_RELAY_CERT,
+							ack_frame,
+						).await?;
+						debug_log!("[Mars Relay] ACK forwarded to Earth Relay");
+					}
+
+					// Fire-and-forget (no response to Earth Relay)
+					Ok(None)
+				}
+			},
+			ProcessResult::Buffered => Ok(None),
+			ProcessResult::ChainGap { current_head, missing_hash } => {
+				// Determine upstream based on gap source
+				let (upstream_addr, upstream_cert) = if from_rover {
+					// Gap from Rover direction, cascade to Earth Relay
+					match *config.earth_relay_addr.read()? {
+						Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT),
+						None => return Ok(None), // Earth address not available yet
+					}
+				} else {
+					// Gap from Earth direction, cascade to Rover
+					(config.rover_addr, ROVER_CERT)
+				};
+
+				// Use trait method with pooled client
+				config.handle_chain_gap(
+					current_head,
+					missing_hash,
+					&config.connection_pool,
+					upstream_addr,
+					upstream_cert,
+					&trace,
+				).await?;
 				Ok(None)
-			}
-		},
-		ProcessResult::Buffered => Ok(None),
-		ProcessResult::ChainGap { current_head, missing_hash } => {
-			// Determine upstream based on gap source
-			let (upstream_addr, upstream_cert) = if from_rover {
-				// Gap from Rover direction, cascade to Earth Relay
-				match *config.earth_relay_addr.read()? {
-					Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT),
-					None => return Ok(None), // Earth address not available yet
-				}
-			} else {
-				// Gap from Earth direction, cascade to Rover
-				(config.rover_addr, ROVER_CERT)
-			};
-
-			// Use trait method with pooled client
-			config.handle_chain_gap(
-				current_head,
-				missing_hash,
-				&config.connection_pool,
-				upstream_addr,
-				upstream_cert,
-				&trace,
-			).await?;
-			Ok(None)
-		},
+			},
 		}
 	}
 }
@@ -1010,17 +964,7 @@ servlet! {
 		}
 
 		// Decrypt and decode RelayMessage
-		let relay_message: RelayMessage = if frame.metadata.confidentiality.is_some() {
-			use tightbeam::compress::{Inflator, ZstdCompression};
-			let inflator: Option<&dyn Inflator> = if frame.metadata.compactness.is_some() {
-				Some(&ZstdCompression)
-			} else {
-				None
-			};
-			frame.decrypt::<RelayMessage>(&config.shared_cipher, inflator)?
-		} else {
-			decode(&frame.message)?
-		};
+		let relay_message = config.decrypt_relay_message(frame)?;
 
 		// Process the RelayMessage
 		match relay_message {
@@ -1102,16 +1046,7 @@ servlet! {
 				}
 			},
 			RelayMessage::FrameResponse(response) => {
-				trace.event("rover_receive_frame_response")?;
-
-				// Process all frames into chain
-				for frame in response.frames {
-					config.chain_processor.process_incoming(frame)?;
-				}
-
-				// Return stateless ACK
-				let stateless_ack = config.frame_builder.build_stateless_ack_frame(command_order)?;
-				Ok(Some(stateless_ack))
+				config.process_frame_response(response, command_order, &trace)
 			},
 			RelayMessage::Telemetry(_) | RelayMessage::CommandAck(_) => {
 				debug_log!("[{}] [Rover] Received unexpected RelayMessage type (Telemetry/ACK)", format_mission_time(mission_time_ms()));
@@ -1159,21 +1094,11 @@ impl DtnNode for RoverServletConf {
 // Mission State (shared across nodes for coordination)
 // ============================================================================
 
+#[derive(Default)]
 pub struct MissionState {
 	pub completed_rounds: usize,
 	pub telemetry_received_count: usize,
 	/// Track if mission has started (available for pre-mission validation)
 	pub _mission_started: bool,
 	pub mission_complete: bool,
-}
-
-impl Default for MissionState {
-	fn default() -> Self {
-		Self {
-			completed_rounds: 0,
-			telemetry_received_count: 0,
-			_mission_started: false,
-			mission_complete: false,
-		}
-	}
 }

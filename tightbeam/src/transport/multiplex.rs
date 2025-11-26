@@ -2,11 +2,8 @@
 //!
 //! This module provides stub interfaces for HTTP/2-style multiplexing.
 
-#![cfg(feature = "transport-multiplex")]
-
 use core::future::Future;
 
-use crate::transport::error::TransportError;
 use crate::transport::protocols::Protocol;
 use crate::transport::TransportResult;
 use crate::Frame;
@@ -102,4 +99,4 @@ pub enum StreamState {
 	Closed,
 }
 
-/// TODO Implement multiplexed transport
+// TODO Implement multiplexed transport

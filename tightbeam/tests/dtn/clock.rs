@@ -16,31 +16,18 @@ pub fn init_mission_clock() {
 
 /// Get current mission elapsed time (milliseconds)
 pub fn mission_time_ms() -> u64 {
-	MISSION_CLOCK
-		.get()
-		.expect("Mission clock not initialized")
-		.read()
-		.unwrap()
-		.clone()
+	*MISSION_CLOCK.get().expect("Mission clock not initialized").read().unwrap()
 }
 
 /// Advance mission clock by specified duration
 pub fn advance_clock(duration_ms: u64) {
-	let mut time = MISSION_CLOCK
-		.get()
-		.expect("Mission clock not initialized")
-		.write()
-		.unwrap();
+	let mut time = MISSION_CLOCK.get().expect("Mission clock not initialized").write().unwrap();
 	*time += duration_ms;
 }
 
 /// Advance clock to specific absolute time
 pub fn advance_to(target_ms: u64) {
-	let mut time = MISSION_CLOCK
-		.get()
-		.expect("Mission clock not initialized")
-		.write()
-		.unwrap();
+	let mut time = MISSION_CLOCK.get().expect("Mission clock not initialized").write().unwrap();
 	if target_ms > *time {
 		*time = target_ms;
 	}
@@ -79,8 +66,7 @@ pub mod delays {
 	/// Total round-trip time (Rover → Earth → Rover)
 	/// NOTE: Useful for calculating expected completion times in tests
 	#[allow(dead_code)]
-	pub const ROUND_TRIP_MS: u64 =
-		ROVER_TO_RELAY_MS + RELAY_TO_EARTH_MS + EARTH_TO_RELAY_MS + RELAY_TO_ROVER_MS;
+	pub const ROUND_TRIP_MS: u64 = ROVER_TO_RELAY_MS + RELAY_TO_EARTH_MS + EARTH_TO_RELAY_MS + RELAY_TO_ROVER_MS;
 
 	/// Rover recharge time (simulated battery recharge): 30 minutes
 	pub const ROVER_RECHARGE_MS: u64 = 30 * 60 * 1000;
@@ -114,4 +100,3 @@ impl<T> DelayedMessage<T> {
 		advance_to(self.arrival_at_ms);
 	}
 }
-

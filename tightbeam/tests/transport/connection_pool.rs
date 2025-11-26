@@ -31,7 +31,7 @@ use tightbeam::{
 	testing::trace::TraceCollector,
 	trace::TraceConfig,
 	transport::{tcp::r#async::TokioListener, Client, ConnectionPool, PoolConfig},
-	Beamable, TightBeamError,
+	Beamable,
 };
 
 #[cfg(feature = "x509")]

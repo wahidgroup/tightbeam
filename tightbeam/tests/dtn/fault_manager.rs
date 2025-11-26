@@ -49,9 +49,9 @@ impl FaultManager {
 		fault_handler: &RwLock<RoverFaultHandler>,
 	) -> Self {
 		Self {
-			bms: Arc::new(RwLock::new(bms.read().ok().map(|g| g.clone()).unwrap_or_default())),
-			fault_matrix: Arc::new(RwLock::new(fault_matrix.read().ok().map(|g| g.clone()).unwrap_or_default())),
-			fault_handler: Arc::new(RwLock::new(fault_handler.read().ok().map(|g| g.clone()).unwrap_or_default())),
+			bms: Arc::new(RwLock::new(bms.read().ok().map(|g| *g).unwrap_or_default())),
+			fault_matrix: Arc::new(RwLock::new(fault_matrix.read().ok().map(|g| *g).unwrap_or_default())),
+			fault_handler: Arc::new(RwLock::new(fault_handler.read().ok().map(|g| *g).unwrap_or_default())),
 		}
 	}
 

@@ -68,7 +68,7 @@ impl RoverTelemetry {
 #[repr(u8)]
 pub enum RoverInstrument {
 	/// Alpha Particle X-ray Spectrometer (soil composition)
-	APXS = 0,
+	Apxs = 0,
 	/// Chemistry Camera (laser spectrometer)
 	ChemCam = 1,
 	/// Mast Camera (imaging)

@@ -57,10 +57,10 @@ impl CommandExecutor {
 	/// Determine next instrument and data based on last command
 	pub fn determine_next_instrument(&self) -> (RoverInstrument, &'static str, Vec<u8>) {
 		match self.last_command() {
-			RoverCommand::CollectSample { .. } => (RoverInstrument::APXS, "APXS", b"Fe2O3:42.1%".to_vec()),
+			RoverCommand::CollectSample { .. } => (RoverInstrument::Apxs, "APXS", b"Fe2O3:42.1%".to_vec()),
 			RoverCommand::ProbeLocation { .. } => (RoverInstrument::ChemCam, "ChemCam", b"Na:580nm:12.3".to_vec()),
 			RoverCommand::TakePhoto { .. } => (RoverInstrument::Mastcam, "Mastcam", b"IMG:1024x768".to_vec()),
-			RoverCommand::Standby => (RoverInstrument::APXS, "APXS", b"STATUS:OK".to_vec()),
+			RoverCommand::Standby => (RoverInstrument::Apxs, "APXS", b"STATUS:OK".to_vec()),
 		}
 	}
 

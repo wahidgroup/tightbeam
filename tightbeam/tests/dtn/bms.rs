@@ -40,7 +40,7 @@ impl BatteryManagementSystem {
 	}
 
 	/// Get current battery percentage
-	pub fn to_energy_percent(&self) -> u8 {
+	pub fn to_energy_percent(self) -> u8 {
 		self.energy_percent
 	}
 

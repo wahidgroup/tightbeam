@@ -638,7 +638,7 @@ impl PersistentConnection for TokioListener {
 		transport.stream.stream.peer_addr().is_ok()
 	}
 
-	fn try_close(transport: &mut Self::Transport) {
+	fn try_close(_transport: &mut Self::Transport) {
 		// Best-effort graceful shutdown
 		// TCP connections will be fully closed when transport drops
 		// tokio TcpStream doesn't provide a shutdown method, relies on Drop

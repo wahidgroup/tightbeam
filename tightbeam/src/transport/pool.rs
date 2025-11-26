@@ -45,21 +45,15 @@ pub trait Client<P: Protocol>: Sized {
 	fn with_client_identity(self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self>;
 
 	/// Build the client connection (sync for ClientBuilder, async for pooling)
-	fn build(self) -> impl core::future::Future<Output = TransportResult<Self::Output>> + Send;
+	async fn build(self) -> TransportResult<Self::Output>;
 }
 
 /// Configuration for connection pool
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PoolConfig {
 	/// Optional idle timeout for connections
 	/// None means connections never expire
 	pub idle_timeout: Option<Duration>,
-}
-
-impl Default for PoolConfig {
-	fn default() -> Self {
-		Self { idle_timeout: None }
-	}
 }
 
 /// Per-destination connection pool
@@ -269,8 +263,8 @@ where
 		self
 	}
 
-	fn build(self) -> impl core::future::Future<Output = TransportResult<Self::Output>> + Send {
-		self.build_impl()
+	async fn build(self) -> TransportResult<Self::Output> {
+		self.build_impl().await
 	}
 }
 
@@ -304,8 +298,8 @@ where
 		Ok(self)
 	}
 
-	fn build(self) -> impl core::future::Future<Output = TransportResult<Self::Output>> + Send {
-		self.build_impl()
+	async fn build(self) -> TransportResult<Self::Output> {
+		self.build_impl().await
 	}
 }
 

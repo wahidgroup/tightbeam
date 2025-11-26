@@ -109,6 +109,7 @@ impl LivelockChecker {
 		let mut on_stack: HashSet<State> = HashSet::new();
 		let mut sccs = Vec::new();
 
+		#[allow(clippy::too_many_arguments)]
 		fn strong_connect(
 			v: State,
 			graph: &HashMap<State, HashSet<State>>,

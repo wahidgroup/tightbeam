@@ -52,7 +52,7 @@ impl RoverFaultHandler {
 	/// NOTE: Available for conditional logic based on recharge completion
 	#[allow(dead_code)]
 	pub fn is_recharged(&self) -> bool {
-		self.time_until_recharged_ms().map_or(true, |t| t == 0)
+		self.time_until_recharged_ms().is_none_or(|t| t == 0)
 	}
 
 	/// Clear low power fault tracking.
@@ -66,4 +66,3 @@ impl Default for RoverFaultHandler {
 		Self::new()
 	}
 }
-

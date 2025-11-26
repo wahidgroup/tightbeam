@@ -523,6 +523,7 @@ async fn send_telemetry_to_mars_relay(
 /// - Earth responds with command → Satellite → Rover
 /// - Rover sends ACK → Satellite → Earth
 /// - Rover executes command and sends next telemetry
+#[allow(clippy::too_many_arguments)]
 async fn run_mission_loop(
 	trace: &TraceCollector,
 	rover_client: &mut GenericClient<TokioListener>,
@@ -977,8 +978,7 @@ tb_scenario! {
 		setup: |rover_addr, config| async move {
 			debug_log!("[Setup] Rover servlet address: {:?}", rover_addr);
 
-			let mars_relay_addr = config.read()?.mars_relay_addr.read()?
-				.clone()
+			let mars_relay_addr = (*config.read()?.mars_relay_addr.read()?)
 				.expect("Mars Relay address must be set before setup");
 
 			debug_log!("[Setup] Mars Relay address found: {:?}", mars_relay_addr);
@@ -1000,10 +1000,10 @@ tb_scenario! {
 			debug_log!("╚════════════════════════════════════════════════════════════╝\n");
 			debug_log!("[Rover Mission Loop] Started - sends telemetry, RoverServlet handles commands asynchronously\n");
 
-			// Get components from config
+		// Get components from config
+		let (rover_processor, rover_fault_manager, rover_signing_key, shared_cipher, shared_mission_state) = {
 			let config_guard = config.read()?;
 			let rover_processor = Arc::clone(&config_guard.rover_chain_processor);
-			let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
 			let rover_fault_manager = Arc::new(FaultManager::from_refs(
 				&config_guard.bms,
 				&config_guard.fault_matrix,
@@ -1012,10 +1012,11 @@ tb_scenario! {
 			let rover_signing_key = config_guard.rover_signing_key.to_owned();
 			let shared_cipher = config_guard.shared_cipher.to_owned();
 			let shared_mission_state = Arc::clone(&config_guard.mission_state);
+			(rover_processor, rover_fault_manager, rover_signing_key, shared_cipher, shared_mission_state)
+		};
+		let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
 
-			drop(config_guard);
-
-			// Run mission loop (sends telemetry to Mars Relay)
+		// Run mission loop (sends telemetry to Mars Relay)
 			run_mission_loop(
 				&trace,
 				&mut rover_client,

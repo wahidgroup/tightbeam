@@ -746,25 +746,22 @@ pub mod builder {
 			Ok(self)
 		}
 
-		fn build(self) -> impl core::future::Future<Output = TransportResult<Self::Output>> + Send {
-			async move {
-				let mut builder = self;
-				let stream = builder.stream.take().ok_or(TransportError::ConnectionFailed)?;
-				let mut transport = <P as Protocol>::create_transport(stream);
-				if !builder.server_certificates.is_empty() {
-					transport = transport.with_server_certificates(builder.server_certificates);
-				}
-				if let (Some(cert), Some(key)) = (builder.client_certificate, builder.client_key) {
-					transport = transport.with_client_identity(cert, key);
-				}
-
-				let configured = builder.policies.apply::<P>(transport);
-				Ok(GenericClient {
-					transport: configured,
-					connection_params: ClientConnectionParams { addr: builder.addr },
-					_ph: core::marker::PhantomData,
-				})
+		async fn build(mut self) -> TransportResult<Self::Output> {
+			let stream = self.stream.take().ok_or(TransportError::ConnectionFailed)?;
+			let mut transport = <P as Protocol>::create_transport(stream);
+			if !self.server_certificates.is_empty() {
+				transport = transport.with_server_certificates(self.server_certificates);
 			}
+			if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
+				transport = transport.with_client_identity(cert, key);
+			}
+
+			let configured = self.policies.apply::<P>(transport);
+			Ok(GenericClient {
+				transport: configured,
+				connection_params: ClientConnectionParams { addr: self.addr },
+				_ph: core::marker::PhantomData,
+			})
 		}
 	}
 

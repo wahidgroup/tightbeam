@@ -94,7 +94,8 @@ versioned metadata structures for high-fidelity information transmission.
 		- 8.5.5. [Security Profile Negotiation](#855-security-profile-negotiation)
 		- 8.5.6. [Negotiation & Failure Modes](#856-negotiation--failure-modes)
 		- 8.5.7. [Threat → Control Mapping](#857-threat--control-mapping)
-	- 8.6. [Audit](#86-audit)
+	- 8.6. [Connection Pooling](#86-connection-pooling)
+	- 8.7. [Audit](#87-audit)
 9. [Network Theory](#9-network-theory)
 	- 9.1. [Network Architecture](#91-network-architecture)
 	- 9.2. [Efficient Exchange-Compute Interconnect](#92-efficient-exchange-compute-interconnect)
@@ -1737,7 +1738,37 @@ let security_accept = SecurityAccept {
 | **Certificate Forgery** | X.509 chain validation | Verify root of trust Note: Application responsibility |
 | **Nonce Reuse** | Monotonic counter + XOR | Per-message nonce derived from seed XOR counter |
 
-### 8.6 Audit
+### 8.6 Connection Pooling
+
+Connection pooling enables efficient connection reuse across multiple requests, 
+eliminating redundant TLS handshakes. Both `ClientBuilder` and `ConnectionPool` 
+implement the `Client` trait, providing identical builder APIs.
+
+**Example**:
+
+```rust
+// Create shared pool (once per application)
+let pool = Arc::new(ConnectionPool::<TokioListener, 3>::new(PoolConfig::default()));
+
+// Use pooled client (identical API to ClientBuilder)
+let mut client = pool
+	.connect(server_addr)
+	.with_server_certificate(SERVER_CERT)?
+	.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+	.with_timeout(Duration::from_millis(5000))
+	.build()
+	.await?;
+
+client.emit(frame, None).await?;
+// Connection automatically returned to pool on drop
+```
+
+**Configuration**:
+- `N`: Max connections per destination (const generic)
+- `PoolConfig::idle_timeout`: Optional connection expiration (default: None/infinite)
+- Health checks occur on acquire (lazy, zero overhead when idle)
+
+### 8.7 Audit
 
 The tightbeam transport layer and handshake protocols have not yet been
 independently audited. We welcome help in this area.
@@ -2283,7 +2314,7 @@ tb_scenario! {
 	environment Bare {
 		exec: |trace| {
 			// Single assertion satisfies both version specs via tags
-			trace.event_with("feature", &["v0", "v1"], tightbeam::testing::macros::Presence::of_option(&some_option));
+			trace.event_with("feature", &["v0", "v1"], Presence::of_option(&some_option));
 			trace.event_with("v2_specific", &["v1"], ());
 			Ok(())
 		}
@@ -3354,19 +3385,180 @@ The following table summarizes capabilities available across the testing layers:
 
 ### 10.9 Standards Compliance Mapping
 
-The table below maps common high-assurance standards to the **testing, FDR, and
-fault-injection capabilities** in tightbeam. It describes what the standards
-expect at a high level and what the framework provides natively to help you
-build a compliant verification story. Final certification and process evidence
-remain the responsibility of the integrator.
+This section maps tightbeam's verification capabilities to common high-assurance
+standards and regulations. The framework provides native support for many
+certification requirements, though final certification evidence and process
+compliance remain the responsibility of the integrator.
 
-| Standard / Regulation | What they require | What tightbeam provides natively |
-|-----------------------|-------------------|----------------------------------|
-| DO‑178C DAL A / ISO 26262 ASIL‑D | 100 % MC/DC + fault injection coverage + traceability to requirements | Done. Deterministic fault injection tied directly to CSP states/events via `FaultModel` and CSP process specs, plus traceable evidence artifacts (§10, §11). |
-| IEC 61508 SIL 4 | Systematic fault injection + proof that all error paths are tested | Done. `FaultModel::from(Deterministic)` combined with FDR refinement and CSP coverage ensures every modeled error path is explored under controlled fault campaigns. |
-| NASA/ESA ECSS‑E‑HB‑40A | Fault tree analysis + coverage of all single-event upsets (SEUs) | Done. Single-event upsets can be injected per CSP transition, with CSP oracles and FDR exploration providing structured fault-tree style coverage over the state space. |
-| Common Criteria EAL7 | Full attack/failure tree coverage with formal evidence | Done. Every injected fault is recorded in instrumentation evidence artifacts, and FDR-style refinement plus CSPM export give you formal, machine-checkable traces. |
-| FMEA/FMECA requirements | Every failure mode must be injected and observed | Done. `fmea_config` and FDR verdict extensions (e.g. `faults_injected`) allow you to enumerate injected failure modes and their observed effects as a ready-made FMEA/FMECA table. |
+#### 10.9.1 DO-178C DAL A / ISO 26262 ASIL-D
+
+**Requirements**: 100% MC/DC coverage, systematic fault injection, and complete
+traceability from requirements to test evidence.
+
+**tightbeam Support**:
+- Deterministic fault injection tied to CSP states/events via `FaultModel`
+  (§10.4.2), configured with `with_fault()` for specific state-event pairs
+- Probabilistic fault coverage with `BasisPoints` (0-10000) for precise
+  injection rates
+- `InjectedFaultRecord` tracking in `FdrVerdict::faults_injected` provides
+  complete fault campaign traceability
+- URN-based evidence artifacts (§11, §12.1.1) link instrumentation events to
+  test assertions
+- CSP process specifications (§10.3) model state machines for formal trace
+  verification
+
+#### 10.9.2 IEC 61508 SIL 4
+
+**Requirements**: Systematic fault injection with proof that all error paths 
+are exercised and tested.
+
+**tightbeam Support**:
+- `FaultModel` with `InjectionStrategy::Deterministic` ensures reproducible
+  fault campaigns (§10.4.2)
+- FDR refinement checking (§10.4) explores all modeled error paths across
+  multiple seeds
+- `FdrVerdict` tracks error recovery success/failure counts via
+  `error_recovery_successful` and `error_recovery_failed` fields
+- Multi-seed exploration (default 64 seeds) verifies behavior under different
+  scheduling interleavings
+
+#### 10.9.3 NASA/ESA ECSS-E-HB-40A
+
+**Requirements**: Fault tree analysis with coverage of all single-event upsets
+(SEUs) and failure propagation paths.
+
+**tightbeam Support**:
+- Per-transition fault injection models SEUs at the CSP state machine level
+- FDR exploration traces fault propagation through the state space
+- `CompositionSpec` (§10.3.6) enables hierarchical fault tree modeling via CSP
+  parallel composition
+- Instrumentation events (§11) capture fault propagation sequences for post-hoc
+  analysis
+
+#### 10.9.4 Common Criteria EAL7
+
+**Requirements**: Formal verification methods with machine-checkable evidence
+and complete attack/failure tree coverage.
+
+**tightbeam Support**:
+- CSP formal semantics with trace/failures/divergence refinement checking
+  (§10.4)
+- Instrumentation evidence artifacts tagged with RFC 8141-compliant URNs
+  (§12.1.1)
+- `FdrVerdict` provides machine-readable witnesses to violations 
+  (trace/failure/divergence witnesses)
+- Process specifications export to standard CSP notations for external tool
+  verification
+
+#### 10.9.5 FMEA/FMECA (MIL-STD-1629, ISO 26262)
+
+**Requirements**: Enumerate all failure modes, inject each mode, observe effects,
+and calculate Risk Priority Numbers (RPN) based on Severity × Occurrence ×
+Detection ratings.
+
+**tightbeam Support**:
+- `FmeaConfig` with configurable severity scales (`MilStd1629`, `Iso26262`)
+  and RPN thresholds (default: 100)
+- Auto-generated `FmeaReport` from FDR verdicts via `fmea_config` field,
+  containing:
+  - `failure_modes`: enumerated failure modes with severity/occurrence/detection
+  - `total_rpn`: aggregate risk priority
+  - `critical_failures`: indices of failures exceeding RPN threshold
+- `FaultModel::with_fault()` allows precise failure mode specification with
+  error factories and injection probabilities
+- `FdrVerdict::faults_injected` records all injected faults with CSP context
+  for traceability
+
+**Automatic FMEA Calculation**:
+
+tightbeam automatically calculates Severity, Occurrence, and Detection ratings
+from FDR exploration results using CSP-based criticality analysis:
+
+1. **Severity** (calculated via CSP reachability analysis):
+   - **MIL-STD-1629 scale (1-10)**:
+     - 10: Deadlock (system completely stops)
+     - 9: Cannot reach terminal states (cannot complete normal operation)
+     - 7: Severe restriction (<50% of states reachable)
+     - 5: Moderate restriction (50-80% states reachable)
+     - 3: Minor impact (>80% states reachable)
+   - **ISO 26262 scale (1-4)**:
+     - 4: Catastrophic (deadlock or cannot reach terminal)
+     - 3: Hazardous (<50% states reachable)
+     - 2: Major (50-80% states reachable)
+     - 1: Minor (>80% states reachable)
+
+2. **Occurrence** (converted from `BasisPoints` injection probability):
+   - MIL-STD-1629: `probability_bps / 1000` (0-10000 → 1-10)
+   - ISO 26262: `probability_bps / 2500` (0-10000 → 1-4)
+
+3. **Detection** (calculated from error recovery statistics):
+   - Based on `FdrVerdict::error_recovery_successful` vs
+     `error_recovery_failed` counts
+   - Inverted success rate: high recovery = low detection number (easily
+     detected)
+   - 100% recovery success → Detection = 1 (easily detected/recoverable)
+   - 0% recovery success → Detection = max scale (undetectable/unrecoverable)
+
+**FMEA Report Structure**:
+```rust
+pub struct FmeaReport {
+	pub failure_modes: Vec<FailureMode>,
+	pub severity_scale: SeverityScale,
+	pub total_rpn: u32,
+	pub critical_failures: Vec<usize>,
+}
+
+pub struct FailureMode {
+	pub component: String,
+	pub failure: String,
+	pub effects: Vec<String>,
+	pub severity: u8,        // Auto-calculated from CSP reachability
+	pub occurrence: u16,     // Auto-converted from BasisPoints
+	pub detection: u8,       // Auto-calculated from recovery stats
+	pub rpn: u32,            // severity × occurrence × detection
+}
+```
+
+**Example Configuration**:
+```rust
+fdr: FdrConfig {
+	fault_model: Some(FaultModel::default()
+		.with_fault(
+			State::Active, 
+			Event::Send,
+			|| TightBeamError::Unavailable,
+			BasisPoints::new(2500)  // 25% occurrence
+		)
+	),
+	fmea_config: Some(FmeaConfig {
+		severity_scale: SeverityScale::MilStd1629,
+		rpn_critical_threshold: 100,
+		auto_generate: true,
+	}),
+	// ... other FDR config
+}
+```
+
+#### 10.9.6 Standards Compliance Summary
+
+The following table summarizes tightbeam's native support for high-assurance
+standards requirements:
+
+| Standard | Level | Key Requirements | tightbeam Features | Feature Flags |
+|----------|-------|------------------|-------------------|---------------|
+| DO-178C | DAL A | 100% MC/DC, fault injection, traceability | `FaultModel`, CSP specs, URN evidence | `testing-fdr`, `testing-fault` |
+| ISO 26262 | ASIL-D | Systematic fault injection, FMEA/FMECA | Auto-FMEA (ISO scale), fault campaigns | `testing-fdr`, `testing-fmea` |
+| IEC 61508 | SIL 4 | Error path coverage, reproducibility | Deterministic injection, multi-seed FDR | `testing-fdr`, `testing-fault` |
+| ECSS-E-HB-40A | – | SEU coverage, fault tree analysis | Per-transition injection, CSP composition | `testing-fdr`, `testing-fault` |
+| Common Criteria | EAL7 | Formal methods, machine-checkable evidence | CSP refinement, URN artifacts, CSPM export | `testing-fdr` |
+| MIL-STD-1629 | – | FMEA with RPN calculation | Auto-severity (1-10), auto-RPN | `testing-fmea` |
+
+**Legend**:
+- All features require base `testing` feature
+- `testing-fdr` enables FDR refinement checking and multi-seed exploration
+- `testing-fault` enables `FaultModel` and deterministic fault injection
+- `testing-fmea` enables automatic FMEA report generation
+- `instrument` enables URN-based evidence artifacts (independent of testing)
 
 ## 11. Instrumentation
 
