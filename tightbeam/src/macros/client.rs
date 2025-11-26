@@ -592,7 +592,7 @@ pub mod builder {
 			let transport = <P as Protocol>::create_transport(stream);
 			let configured = self.policies.apply::<P>(transport);
 			Ok(GenericClient {
-				transport: Some(configured),
+				transport: configured,
 				connection_params: ClientConnectionParams { addr: self.addr },
 				_ph: core::marker::PhantomData,
 			})
@@ -614,7 +614,7 @@ pub mod builder {
 
 			let configured = self.policies.apply::<P>(transport);
 			Ok(GenericClient {
-				transport: Some(configured),
+				transport: configured,
 				connection_params: ClientConnectionParams { addr: self.addr },
 				_ph: core::marker::PhantomData,
 			})
@@ -630,7 +630,7 @@ pub mod builder {
 	}
 
 	pub struct GenericClient<P: Protocol> {
-		transport: Option<P::Transport>,
+		transport: P::Transport,
 		connection_params: ClientConnectionParams<P>,
 		_ph: core::marker::PhantomData<P>,
 	}
@@ -638,17 +638,17 @@ pub mod builder {
 	impl<P: Protocol> GenericClient<P> {
 		pub fn from_transport(transport: P::Transport) -> Self {
 			Self {
-				transport: Some(transport),
+				transport,
 				connection_params: ClientConnectionParams { addr: None },
 				_ph: core::marker::PhantomData,
 			}
 		}
 
-		pub fn transport(&self) -> Option<&P::Transport> {
-			self.transport.as_ref()
+		pub fn transport(&self) -> &P::Transport {
+			&self.transport
 		}
 
-		pub fn into_transport(self) -> Option<P::Transport> {
+		pub fn into_transport(self) -> P::Transport {
 			self.transport
 		}
 
@@ -657,18 +657,7 @@ pub mod builder {
 		where
 			P::Transport: MessageEmitter,
 		{
-			// Delegate to transport if available
-			if let Some(transport) = &mut self.transport {
-				transport.emit(frame, attempt).await
-			} else {
-				// No transport available
-				Err(TransportError::ConnectionFailed)
-			}
-		}
-
-		/// Check if transport is available
-		pub fn is_connected(&self) -> bool {
-			self.transport.is_some()
+			self.transport.emit(frame, attempt).await
 		}
 
 		/// Reconnect using stored parameters
@@ -691,9 +680,7 @@ pub mod builder {
 				.clone();
 
 			let stream = P::connect(addr).await.map_err(|e| e.into())?;
-			let transport = P::create_transport(stream);
-
-			self.transport = Some(transport);
+			self.transport = P::create_transport(stream);
 			Ok(())
 		}
 	}

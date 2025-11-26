@@ -124,6 +124,7 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.3.3. [Validation Rules](#1033-validation-rules)
 		- 10.3.4. [Example: CSP Process Specification](#1034-example-csp-process-specification)
 		- 10.3.5. [Timing and Schedulability Verification](#1035-timing-and-schedulability-verification)
+		- 10.3.6. [Process Composition: tb_compose_spec!](#1036-process-composition-tb_compose_spec)
 	- 10.4. [Layer 3: Refinement Checking (FDR)](#104-layer-3-refinement-checking-fdr)
 		- 10.4.1. [Concept](#1041-concept)
 		- 10.4.2. [Specification: FdrConfig Syntax](#1042-specification-fdrconfig-syntax)
@@ -148,6 +149,7 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.7.4. [Advanced: CSP Oracle Integration](#1074-advanced-csp-oracle-integration)
 		- 10.7.5. [IJON Integration: Input-to-State Correspondence](#1075-ijon-integration-input-to-state-correspondence)
 	- 10.8. [Feature Matrix](#108-feature-matrix)
+	- 10.9. [Standards Compliance Mapping](#109-standards-compliance-mapping)
 11. [Instrumentation](#11-instrumentation)
 	- 11.1. [Objectives](#111-objectives)
 	- 11.2. [Event Kind Taxonomy](#112-event-kind-taxonomy)
@@ -156,14 +158,17 @@ versioned metadata structures for high-fidelity information transmission.
 	- 11.5. [Configuration](#115-configuration)
 	- 11.6. [Evidence Artifact Format](#116-evidence-artifact-format)
 	- 11.7. [Failure Handling](#117-failure-handling)
-12. [End-to-End Examples](#12-end-to-end-examples)
-	- 12.1. [Complete Client-Server Application](#121-complete-client-server-application)
-13. [References](#13-references)
-	- 13.1. [Normative References](#131-normative-references)
-	- 13.2. [Standards References](#132-standards-references)
-	- 13.3. [ASN.1 References](#133-asn1-references)
-14. [License](#14-license)
-15. [Implementation Notes](#15-implementation-notes)
+12. [Misc](#12-misc)
+	- 12.1. [Utilities](#121-utilities)
+		- 12.1.1. [URNs](#1211-urns)
+13. [End-to-End Examples](#13-end-to-end-examples)
+	- 13.1. [Complete Client-Server Application](#131-complete-client-server-application)
+14. [References](#14-references)
+	- 14.1. [Normative References](#141-normative-references)
+	- 14.2. [Standards References](#142-standards-references)
+	- 14.3. [ASN.1 References](#143-asn1-references)
+15. [License](#15-license)
+16. [Implementation Notes](#16-implementation-notes)
 
 ## 1. Introduction
 
@@ -1808,7 +1813,7 @@ they do not have access to the full Frame nor should they need it.
 
 ##### Testing
 
-Testing patterns for workers are shown in §12.1, which provides a complete
+Testing patterns for workers are shown in §13.1, which provides a complete
 `tb_scenario!`-based integration example for `PingPongWorker`.
 
 #### 9.3.2 E: Servlets
@@ -1887,7 +1892,7 @@ let (result1, result2) = tokio::join!(
 ##### Testing
 
 A complete `tb_scenario!` example for servlets (including workers and client
-code) is given in §12.1.
+code) is given in §13.1.
 
 #### 9.3.3 C: Clusters - WIP
 
@@ -2437,6 +2442,83 @@ task sets that are checked using Rate Monotonic or Earliest Deadline First
 analysis. See §10.2.9 for a complete overview of timing and schedulability
 semantics.
 
+#### 10.3.6 Process Composition: tb_compose_spec!
+
+In addition to individual `ProcessSpec` models, tightbeam supports **composed
+processes** via the `CompositionSpec` trait and the `tb_compose_spec!` macro.
+Compositions allow you to build larger CSP models from smaller ones using
+standard parallel composition operators:
+
+- **Synchronized**: All shared events synchronize (`P || Q`)
+- **Interleaved**: No synchronization, pure interleaving (`P ||| Q`)
+- **Interface**: Synchronize on an explicit event set (`P [| A |] Q`)
+- **Alphabetized**: Per-process alphabets with synchronization on intersection
+  (`P [| αP | αQ |] Q`)
+
+The `tb_compose_spec!` macro generates a type that implements `CompositionSpec`
+and, via a blanket impl, `ProcessSpec`, so it can be used anywhere a process
+spec is expected (including `tb_scenario!`’s `csp:` field).
+
+**Example: Interleaved request/response and retry flows**
+
+```rust
+use tightbeam::testing::*;
+
+// Two simple processes
+tb_process_spec! {
+	pub RequestFlow,
+	events { observable { "request", "response" } }
+	states {
+		Idle => { "request" => Waiting },
+		Waiting => { "response" => Idle }
+	}
+	terminal { Idle }
+}
+
+tb_process_spec! {
+	pub RetryFlow,
+	events { observable { "retry" } }
+	states {
+		RetryIdle => { "retry" => RetryIdle }
+	}
+	terminal { RetryIdle }
+}
+
+// Compose them with interleaved parallelism
+tb_compose_spec! {
+	pub RequestWithRetry,
+	processes: {
+		RequestFlow,
+		RetryFlow
+	},
+	composition: Interleaved,
+	properties: {
+		deadlock_free: true,
+		livelock_free: true,
+		deterministic: false
+	}
+}
+
+// Use the composed process in a scenario
+tb_scenario! {
+	name: test_request_with_retry,
+	spec: ClientServerSpec,
+	csp: RequestWithRetry,
+	environment Bare {
+		exec: |trace| {
+			trace.event("request");
+			trace.event("retry");
+			trace.event("response");
+			Ok(())
+		}
+	}
+}
+```
+
+Composition properties (`deadlock_free`, `livelock_free`, `deterministic`) are
+checked by the composition verification layer (§10.4, §10.5) and provide an
+early sanity check before enabling full FDR refinement.
+
 ### 10.4 Layer 3: Refinement Checking (FDR)
 
 #### 10.4.1 Concept
@@ -2468,6 +2550,15 @@ fdr: FdrConfig {
 	specs: vec![],           // Processes for refinement checking (empty = exploration mode)
 	fail_fast: true,         // Stop on first violation (default: true)
 	expect_failure: false,   // Expect refinement to fail (default: false)
+
+	// Optional scheduler/resource modeling (feature `testing-fault`)
+	scheduler_count: None,   // Number of schedulers (m)
+	process_count: None,     // Number of concurrent processes (n)
+	scheduler_model: None,   // Cooperative / Preemptive model, when enabled
+
+	// Optional fault/FMEA configuration (features `testing-fault`, `testing-fmea`)
+	fault_model: None,
+	fmea_config: None,
 }
 ```
 
@@ -2479,6 +2570,16 @@ fdr: FdrConfig {
 - `specs`: Specification processes for refinement checking (empty vector = exploration mode)
 - `fail_fast`: Stop on first refinement violation (default: true)
 - `expect_failure`: Expect refinement to fail for negative tests (default: false)
+- `scheduler_count` / `process_count` (feature `testing-fault`): Optional
+  resource-modeling parameters where `scheduler_count ≤ process_count`; when
+  set, refinement explores traces under constrained scheduler availability
+  (§10.5.4).
+- `scheduler_model` (feature `testing-fault`): Chooses between cooperative and
+  preemptive scheduler models for refinement.
+- `fault_model` (feature `testing-fault`): Enables CSP state-driven fault
+  injection during FDR exploration (e.g., link drops, node failures).
+- `fmea_config` (feature `testing-fmea`): Configures Failure Modes and Effects
+  Analysis integrated with refinement runs.
 
 **Operational Modes**:
 - **Mode 1** (specs empty): Single-process exploration - verifies determinism, deadlock freedom, divergence freedom
@@ -2802,8 +2903,9 @@ tb_scenario! {
 	csp: ProcessSpecType,            // OPTIONAL: Layer 2 CSP model (requires testing-csp)
 	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
 	fdr: FdrConfig { ... },          // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-	instrumentation: Config { ... }, // OPTIONAL: instrumentation config
-	environment <Variant> { ... },   // REQUIRED: execution environment
+	trace: TbInstrumentationConfig,  // OPTIONAL: instrumentation/trace config (§11)
+	config: ScenarioConfig,          // OPTIONAL: shared scenario state for environments
+	environment <Variant> { ... },   // REQUIRED: execution environment (Bare, Worker, ServiceClient, Servlet)
 	hooks { ... }                    // OPTIONAL: on_pass/on_fail callbacks
 }
 ```
@@ -3250,6 +3352,22 @@ The following table summarizes capabilities available across the testing layers:
 | CSP oracle for fuzzing | – | – | – | `csp` + `fuzz` |
 | IJON state annotations | – | – | – | `csp` + `fuzz-ijon` |
 
+### 10.9 Standards Compliance Mapping
+
+The table below maps common high-assurance standards to the **testing, FDR, and
+fault-injection capabilities** in tightbeam. It describes what the standards
+expect at a high level and what the framework provides natively to help you
+build a compliant verification story. Final certification and process evidence
+remain the responsibility of the integrator.
+
+| Standard / Regulation | What they require | What tightbeam provides natively |
+|-----------------------|-------------------|----------------------------------|
+| DO‑178C DAL A / ISO 26262 ASIL‑D | 100 % MC/DC + fault injection coverage + traceability to requirements | Done. Deterministic fault injection tied directly to CSP states/events via `FaultModel` and CSP process specs, plus traceable evidence artifacts (§10, §11). |
+| IEC 61508 SIL 4 | Systematic fault injection + proof that all error paths are tested | Done. `FaultModel::from(Deterministic)` combined with FDR refinement and CSP coverage ensures every modeled error path is explored under controlled fault campaigns. |
+| NASA/ESA ECSS‑E‑HB‑40A | Fault tree analysis + coverage of all single-event upsets (SEUs) | Done. Single-event upsets can be injected per CSP transition, with CSP oracles and FDR exploration providing structured fault-tree style coverage over the state space. |
+| Common Criteria EAL7 | Full attack/failure tree coverage with formal evidence | Done. Every injected fault is recorded in instrumentation evidence artifacts, and FDR-style refinement plus CSPM export give you formal, machine-checkable traces. |
+| FMEA/FMECA requirements | Every failure mode must be injected and observed | Done. `fmea_config` and FDR verdict extensions (e.g. `faults_injected`) allow you to enumerate injected failure modes and their observed effects as a ready-made FMEA/FMECA table. |
+
 ## 11. Instrumentation
 
 This section normatively specifies the TightBeam instrumentation subsystem.
@@ -3278,6 +3396,12 @@ Each event MUST have one kind from a closed, feature‑gated set:
 - Meta: `start`, `end`, `warn`, `error`
 
 Hidden/internal events MUST use the internal category.
+
+Instrumentation events are also identified by **URNs** defined in
+`tightbeam::utils::urn::specs::TightbeamUrnSpec`. The `TightbeamUrnSpec` format
+`urn:tightbeam:instrumentation:<resource_type>/<resource_id>` provides stable
+names for traces, events, seeds, and verdicts, and is used by the
+instrumentation subsystem to label evidence artifacts.
 
 ### 11.3 Event Structure
 Conceptual fixed layout (names illustrative):
@@ -3375,11 +3499,60 @@ Privacy:
 - Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
 - Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
 
-## 12. End-to-End Examples
+## 12. Misc
+
+### 12.1 Utilities
+
+tightbeam provides a small `utils` module family for cross-cutting concerns.
+
+#### 12.1.1 URNs
+
+The URN subsystem provides:
+
+- `Urn<'a>`: RFC 8141-compliant `urn:<nid>:<nss>` representation using
+  `Cow<'a, str>` for zero-copy handling and DER encoding support.
+- `UrnBuilder`: a fluent builder for constructing and validating URNs from
+  either a raw NID/NSS or structured components.
+- `UrnSpec` / `UrnValidationError`: traits and error types for namespace‑specific
+  validation logic.
+- `tightbeam::utils::urn::specs::TightbeamUrnSpec`: a built‑in spec for
+  instrumentation URNs of the form
+  `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
+
+`TightbeamUrnSpec` constrains:
+
+- **`resource_type`**: one of `trace`, `event`, `seed`, `verdict`
+  (case‑insensitive, normalized to lowercase), and
+- **`resource_id`**: an application‑defined identifier that must match an
+  alphanumeric‑with‑hyphen pattern.
+
+These URNs can be used by applications to name any kind of resource in a
+stable, parseable way. Internally, they are also used by the instrumentation
+subsystem (§11) to tag traces, events, seeds, and verdicts with globally
+unique identifiers for evidence artifacts and external analysis.
+
+**Example: Building a custom application URN**
+
+```rust
+use tightbeam::utils::urn::{UrnBuilder, UrnValidationError};
+
+fn build_customer_urn() -> Result<(), UrnValidationError> {
+	let urn = UrnBuilder::default()
+		.with_nid("example")
+		.with_nss("customer:1234")
+		.build()?;
+
+	assert_eq!(urn.to_string(), "urn:example:customer:1234");
+
+	Ok(())
+}
+```
+
+## 13. End-to-End Examples
 
 This section contains complete, runnable examples demonstrating real-world usage patterns.
 
-### 12.1 Complete Client-Server Application
+### 13.1 Complete Client-Server Application
 
 This example demonstrates an end-to-end worker and servlet setup tested with
 `tb_scenario!`, covering assertion specs, CSP process specs, and environment
@@ -3542,7 +3715,7 @@ tb_scenario! {
 }
 ```
 
-## 13. References
+## 14. References
 
 [^hoare1978]: C.A.R. Hoare, "Communicating sequential processes," *Communications of the ACM*, vol. 21, no. 8, pp. 666-677, August 1978. DOI: [10.1145/359576.359585](https://doi.org/10.1145/359576.359585)
 
@@ -3554,7 +3727,7 @@ tb_scenario! {
 
 [^ijon2020]: C. Aschermann, S. Schumilo, A. Abbasi, and T. Holz, "IJON: Exploring Deep State Spaces via Fuzzing," in *2020 IEEE Symposium on Security and Privacy (SP)*, San Francisco, CA, USA, 2020, pp. 1597-1612. DOI: [10.1109/SP40000.2020.00117](https://doi.org/10.1109/SP40000.2020.00117)
 
-### 13.1 Normative References
+### 14.1 Normative References
 
 - [RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119): Key words for use in RFCs to Indicate Requirement Levels
 - [ITU-T X.690](https://www.itu.int/rec/T-REC-X.690): ASN.1 Distinguished Encoding Rules (DER)
@@ -3572,7 +3745,7 @@ tb_scenario! {
 - [RFC 8439](https://datatracker.ietf.org/doc/html/rfc8439): ChaCha20 and Poly1305 for IETF Protocols
 - [RFC 8446](https://datatracker.ietf.org/doc/html/rfc8446): The Transport Layer Security (TLS) Protocol Version 1.3
 
-### 13.2 Standards References
+### 14.2 Standards References
 
 - [FIPS 140-2](https://csrc.nist.gov/publications/detail/fips/140/2/final): Security Requirements for Cryptographic Modules
 - [FIPS 140-3](https://csrc.nist.gov/publications/detail/fips/140/3/final): Security Requirements for Cryptographic Modules
@@ -3584,7 +3757,7 @@ tb_scenario! {
 - [NIST SP 800-57](https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final): Recommendation for Key Management: Part 1 - General
 - [NIST SP 800-131A](https://csrc.nist.gov/publications/detail/sp/800-131a/rev-2/final): Transitioning the Use of Cryptographic Algorithms and Key Lengths
 
-### 13.3 ASN.1 References
+### 14.3 ASN.1 References
 
 - [ITU-T X.680](https://www.itu.int/rec/T-REC-X.680): ASN.1 Specification of basic notation
 - [ITU-T X.681](https://www.itu.int/rec/T-REC-X.681): ASN.1 Information object specification
@@ -3595,7 +3768,7 @@ tb_scenario! {
 - [ITU-T X.400](https://www.itu.int/rec/T-REC-X.400): Message Handling Systems (MHS): System and service overview
 - [ITU-T X.420](https://www.itu.int/rec/T-REC-X.420): Message Handling Systems (MHS): Interpersonal messaging system
 
-## 14. License
+## 15. License
 
 ### For Users (Outbound Licensing)
 
@@ -3619,7 +3792,7 @@ dual licensed as above, without any additional terms or conditions.
 - MIT's simplicity for users who prefer it
 - Apache-2.0's patent grants for enhanced protection
 
-## 15. Implementation Notes
+## 16. Implementation Notes
 
 #### Project Structure
 

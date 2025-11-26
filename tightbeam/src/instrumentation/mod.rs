@@ -37,6 +37,13 @@ pub mod events {
 	pub const REQUEST_RECV: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/request-recv");
 	pub const RESPONSE_SEND: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/response-send");
 
+	// Connection lifecycle events
+	pub const CONNECTION_ACCEPTED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/connection-accepted");
+	pub const CONNECTION_CLOSED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/connection-closed");
+	pub const CONNECTION_STALE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/connection-stale");
+	#[rustfmt::skip]
+	pub const CONNECTION_RECONNECTED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/connection-reconnected");
+
 	// Assertion events
 	pub const ASSERT_LABEL: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/assert-label");
 	pub const ASSERT_PAYLOAD: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/assert-payload");

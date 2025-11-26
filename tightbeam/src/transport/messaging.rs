@@ -292,6 +292,41 @@ pub trait MessageCollector: MessageIO {
 		Ok((request, status))
 	}
 
+	/// Try to collect next message without blocking on closed connections
+	///
+	/// Returns Ok(None) if connection closed gracefully (EOF).
+	/// Returns Err if connection failed unexpectedly.
+	#[allow(async_fn_in_trait)]
+	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
+		// Try to read envelope (returns None on graceful close)
+		let decoded_envelope = match self.try_read_decoded_envelope().await? {
+			Some(envelope) => envelope,
+			None => return Ok(None), // Connection closed gracefully
+		};
+
+		let request = match decoded_envelope {
+			TransportEnvelope::Request(msg) => msg.message,
+			TransportEnvelope::Response(_) => {
+				// Only requests are valid here
+				return Err(TransportError::InvalidMessage);
+			}
+			#[cfg(feature = "x509")]
+			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+				// Handshake messages not expected here
+				return Err(TransportError::InvalidMessage);
+			}
+		};
+
+		// Evaluate gate policy
+		let status = self.collector_gate().evaluate(&request);
+		if status == TransitStatus::Request {
+			// Invalid status from gate
+			return Err(TransportError::InvalidReply);
+		}
+
+		Ok(Some((request, status)))
+	}
+
 	/// Send a response for a previously collected message
 	#[allow(async_fn_in_trait)]
 	async fn send_response(&mut self, status: TransitStatus, message: Option<Frame>) -> TransportResult<()> {
@@ -448,6 +483,33 @@ pub trait MessageCollector: MessageIO {
 		};
 
 		Ok((request, TransitStatus::Accepted))
+	}
+
+	/// Try to collect next message without blocking on closed connections
+	///
+	/// Returns Ok(None) if connection closed gracefully (EOF).
+	/// Returns Err if connection failed unexpectedly.
+	#[allow(async_fn_in_trait)]
+	async fn try_collect_message(&mut self) -> TransportResult<Option<(Arc<Frame>, TransitStatus)>> {
+		// Try to read envelope (returns None on graceful close)
+		let request_envelope = match self.try_read_decoded_envelope().await? {
+			Some(envelope) => envelope,
+			None => return Ok(None), // Connection closed gracefully
+		};
+
+		// Extract message from request
+		let request = match request_envelope {
+			TransportEnvelope::Request(msg) => msg.message,
+			TransportEnvelope::Response(_) => {
+				return Err(TransportError::InvalidMessage);
+			}
+			#[cfg(feature = "x509")]
+			_ => {
+				return Err(TransportError::InvalidMessage);
+			}
+		};
+
+		Ok(Some((request, TransitStatus::Accepted)))
 	}
 
 	/// Send a response for a previously collected message

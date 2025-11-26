@@ -22,6 +22,8 @@ pub mod messaging;
 pub mod protocols;
 pub mod state;
 
+#[cfg(feature = "transport-multiplex")]
+pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
 #[cfg(feature = "tcp")]

@@ -161,7 +161,6 @@ async fn test_unexpected_client_cert_rejected() -> Result<()> {
 		let client_cert_spec = CertificateSpec::Built(Box::new(client_cert));
 		let provider = InMemoryKeyProvider::from(client_key);
 		let client_key_spec = KeySpec::Provider(Arc::new(provider));
-
 		let client = client! {
 			connect TokioListener: server.addr,
 			identity: (client_cert_spec, client_key_spec),
@@ -169,6 +168,7 @@ async fn test_unexpected_client_cert_rejected() -> Result<()> {
 				x509_gate: [ExpiryValidator]
 			}
 		};
+
 		let transport = client.into_transport().with_server_certificate(server_cert);
 		let mut client = GenericClient::<TokioListener>::from_transport(transport);
 
