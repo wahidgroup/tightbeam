@@ -82,12 +82,14 @@ use crate::{
 // ============================================================================
 
 /// Configuration for 4-tier DTN scenario
-/// Only contains state that is SHARED between multiple components or accessed by test client
+/// Only contains state that is SHARED between multiple components or accessed
+/// by test client
 pub struct DtnScenarioConfig {
 	// === SHARED CRYPTOGRAPHIC MATERIAL ===
 	/// Rover's signing key (shared: RoverServlet + mission loop client)
 	pub rover_signing_key: Secp256k1SigningKey,
-	/// Shared AES-256-GCM cipher (Mission Control ↔ Rover end-to-end encryption)
+	/// Shared AES-256-GCM cipher (Mission Control ↔ Rover end-to-end
+	/// encryption)
 	pub shared_cipher: Aes256Gcm,
 
 	// === ROVER STATE (SHARED WITH CLIENT) ===
@@ -130,7 +132,8 @@ impl Default for DtnScenarioConfig {
 			_ => panic!("ROVER_KEY must be KeySpec::Bytes"),
 		};
 
-		// Create Rover's chain processor (shared between RoverServlet and mission loop client)
+		// Create Rover's chain processor (shared between RoverServlet and mission loop
+		// client)
 		let rover_chain_proc = Arc::new(ChainProcessor::new(
 			Arc::clone(&rover_store),
 			Arc::new(RwLock::new(MessageChainState::new("Rover".to_string()))),
@@ -534,7 +537,8 @@ async fn run_mission_loop(
 	shared_cipher: &Aes256Gcm,
 	shared_mission_state: &Arc<RwLock<MissionState>>,
 ) -> Result<(), TightBeamError> {
-	// Wait for first command to be executed by RoverServlet before starting telemetry loop
+	// Wait for first command to be executed by RoverServlet before starting
+	// telemetry loop
 	debug_log!("[Rover Mission Loop] Waiting for first command to arrive...");
 
 	let mut wait_iterations = 0;
@@ -549,7 +553,8 @@ async fn run_mission_loop(
 	debug_log!("[Rover Mission Loop] First command received and executed. Starting telemetry loop.\n");
 
 	// Loop exactly COMMAND_ROUND_TRIPS times (6 rounds)
-	// We start from round 0 since we've completed command 0 and need to send its telemetry
+	// We start from round 0 since we've completed command 0 and need to send its
+	// telemetry
 	for round in 0..COMMAND_ROUND_TRIPS {
 		debug_log!(
 			"\n═══════════════ Round {} (Telemetry for Command {}) {} ═══════════════",
@@ -605,7 +610,8 @@ async fn run_mission_loop(
 			}
 		}
 
-		// Send telemetry to Mars Relay (which forwards to Earth Relay → Mission Control)
+		// Send telemetry to Mars Relay (which forwards to Earth Relay → Mission
+		// Control)
 		send_telemetry_to_mars_relay(
 			trace,
 			rover_client,
