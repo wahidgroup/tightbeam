@@ -10,7 +10,8 @@ macro_rules! client {
 				$crate::macros::client::builder::ClientBuilder::<$protocol>::connect($addr)
 					.await?
 					.with_client_identity($cert, $key)?
-					.build()?
+					.build()
+					.await?
 			}
 			#[cfg(not(feature = "builder"))]
 			{
@@ -29,7 +30,7 @@ macro_rules! client {
 			{
 				let __builder = $crate::macros::client::builder::ClientBuilder::<$protocol>::connect($addr).await?;
 				let __builder = $crate::client!(@apply_policies_to_builder __builder, { $($tt)* });
-				__builder.with_client_identity($cert, $key)?.build()?
+				__builder.with_client_identity($cert, $key)?.build().await?
 			}
 			#[cfg(not(feature = "builder"))]
 			{
@@ -499,23 +500,6 @@ pub mod builder {
 			}
 		}
 
-		pub async fn connect(addr: P::Address) -> Result<Self, TransportError> {
-			// Cannt avoid clone here because of the async trait bound
-			let stream = <P as Protocol>::connect(addr.clone()).await.map_err(|e| e.into())?;
-			Ok(Self {
-				stream: Some(stream),
-				addr: Some(addr),
-				policies: ClientPolicies::default(),
-				#[cfg(feature = "x509")]
-				server_certificates: Vec::new(),
-				#[cfg(feature = "x509")]
-				client_certificate: None,
-				#[cfg(feature = "x509")]
-				client_key: None,
-				_ph: core::marker::PhantomData,
-			})
-		}
-
 		pub fn policies(mut self, policies: ClientPolicies) -> Self {
 			self.policies = policies;
 			self
@@ -554,70 +538,65 @@ pub mod builder {
 			self
 		}
 
-		pub fn with_timeout(mut self, timeout: Duration) -> Self {
-			self.policies = self.policies.with_timeout(timeout);
-			self
-		}
-
-		#[cfg(feature = "x509")]
-		pub fn with_server_certificate(mut self, cert: CertificateSpec) -> Result<Self, TransportError> {
-			let cert = Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
-			self.server_certificates.push(cert);
-			Ok(self)
-		}
-
 		#[cfg(feature = "x509")]
 		pub fn with_server_certificates(mut self, certs: impl IntoIterator<Item = Certificate>) -> Self {
 			self.server_certificates.extend(certs);
 			self
 		}
+	}
 
-		#[cfg(feature = "x509")]
-		pub fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> Result<Self, TransportError> {
-			let cert = Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
-			let key_manager = HandshakeKeyManager::try_from(key).map_err(|_| TransportError::ConnectionFailed)?;
-			self.client_certificate = Some(cert);
-			self.client_key = Some(key_manager);
-			Ok(self)
+	// Additional methods that delegate to trait for ergonomic API
+	#[cfg(not(feature = "x509"))]
+	impl<P: Protocol + Send> ClientBuilder<P>
+	where
+		P::Transport: MessageEmitter + MessageCollector + PolicyConf,
+		P::Address: Send,
+	{
+		/// Connect to an address. Delegates to the Client trait implementation.
+		pub async fn connect(addr: P::Address) -> Result<Self, TransportError> {
+			<Self as crate::transport::pool::Client<P>>::connect(addr).await
 		}
 
-		/// Build the client. For x509 configuration, call with_server_certificate()
-		/// and with_client_identity() before calling build().
-		#[cfg(not(feature = "x509"))]
-		pub fn build(mut self) -> Result<GenericClient<P>, TransportError>
-		where
-			P::Transport: MessageEmitter + MessageCollector + PolicyConf,
-		{
-			let stream = self.stream.take().ok_or(TransportError::ConnectionFailed)?;
-			let transport = <P as Protocol>::create_transport(stream);
-			let configured = self.policies.apply::<P>(transport);
-			Ok(GenericClient {
-				transport: configured,
-				connection_params: ClientConnectionParams { addr: self.addr },
-				_ph: core::marker::PhantomData,
-			})
+		/// Set timeout. Delegates to the Client trait implementation.
+		pub fn with_timeout(self, timeout: Duration) -> Self {
+			<Self as crate::transport::pool::Client<P>>::with_timeout(self, timeout)
 		}
 
-		#[cfg(feature = "x509")]
-		pub fn build(mut self) -> Result<GenericClient<P>, TransportError>
-		where
-			P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
-		{
-			let stream = self.stream.take().ok_or(TransportError::ConnectionFailed)?;
-			let mut transport = <P as Protocol>::create_transport(stream);
-			if !self.server_certificates.is_empty() {
-				transport = transport.with_server_certificates(self.server_certificates);
-			}
-			if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
-				transport = transport.with_client_identity(cert, key);
-			}
+		/// Build the client. Delegates to the Client trait implementation.
+		pub async fn build(self) -> Result<GenericClient<P>, TransportError> {
+			<Self as crate::transport::pool::Client<P>>::build(self).await
+		}
+	}
 
-			let configured = self.policies.apply::<P>(transport);
-			Ok(GenericClient {
-				transport: configured,
-				connection_params: ClientConnectionParams { addr: self.addr },
-				_ph: core::marker::PhantomData,
-			})
+	#[cfg(feature = "x509")]
+	impl<P: Protocol + Send> ClientBuilder<P>
+	where
+		P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
+		P::Address: Send,
+	{
+		/// Connect to an address. Delegates to the Client trait implementation.
+		pub async fn connect(addr: P::Address) -> Result<Self, TransportError> {
+			<Self as crate::transport::pool::Client<P>>::connect(addr).await
+		}
+
+		/// Set server certificate. Delegates to the Client trait implementation.
+		pub fn with_server_certificate(self, cert: CertificateSpec) -> Result<Self, TransportError> {
+			<Self as crate::transport::pool::Client<P>>::with_server_certificate(self, cert)
+		}
+
+		/// Set client identity. Delegates to the Client trait implementation.
+		pub fn with_client_identity(self, cert: CertificateSpec, key: KeySpec) -> Result<Self, TransportError> {
+			<Self as crate::transport::pool::Client<P>>::with_client_identity(self, cert, key)
+		}
+
+		/// Set timeout. Delegates to the Client trait implementation.
+		pub fn with_timeout(self, timeout: Duration) -> Self {
+			<Self as crate::transport::pool::Client<P>>::with_timeout(self, timeout)
+		}
+
+		/// Build the client. Delegates to the Client trait implementation.
+		pub async fn build(self) -> Result<GenericClient<P>, TransportError> {
+			<Self as crate::transport::pool::Client<P>>::build(self).await
 		}
 	}
 
@@ -685,28 +664,134 @@ pub mod builder {
 		}
 	}
 
-	// Conversions
+	// Client trait implementation for ClientBuilder
 	#[cfg(not(feature = "x509"))]
-	impl<P: Protocol> TryFrom<ClientBuilder<P>> for GenericClient<P>
+	impl<P: Protocol + Send> crate::transport::pool::Client<P> for ClientBuilder<P>
 	where
 		P::Transport: MessageEmitter + MessageCollector + PolicyConf,
+		P::Address: Send,
 	{
-		type Error = TransportError;
+		type Output = GenericClient<P>;
 
-		fn try_from(builder: ClientBuilder<P>) -> Result<Self, Self::Error> {
-			builder.build()
+		async fn connect(addr: P::Address) -> TransportResult<Self> {
+			let stream = <P as Protocol>::connect(addr.clone()).await.map_err(|e| e.into())?;
+			Ok(Self {
+				stream: Some(stream),
+				addr: Some(addr),
+				policies: ClientPolicies::default(),
+				_ph: core::marker::PhantomData,
+			})
+		}
+
+		fn with_timeout(mut self, timeout: Duration) -> Self {
+			self.policies = self.policies.with_timeout(timeout);
+			self
+		}
+
+		fn build(self) -> impl core::future::Future<Output = TransportResult<Self::Output>> + Send {
+			async move {
+				let mut builder = self;
+				let stream = builder.stream.take().ok_or(TransportError::ConnectionFailed)?;
+				let transport = <P as Protocol>::create_transport(stream);
+				let configured = builder.policies.apply::<P>(transport);
+				Ok(GenericClient {
+					transport: configured,
+					connection_params: ClientConnectionParams { addr: builder.addr },
+					_ph: core::marker::PhantomData,
+				})
+			}
 		}
 	}
 
 	#[cfg(feature = "x509")]
-	impl<P: Protocol> TryFrom<ClientBuilder<P>> for GenericClient<P>
+	impl<P: Protocol + Send> crate::transport::pool::Client<P> for ClientBuilder<P>
 	where
 		P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
+		P::Address: Send,
+	{
+		type Output = GenericClient<P>;
+
+		async fn connect(addr: P::Address) -> TransportResult<Self> {
+			let stream = <P as Protocol>::connect(addr.clone()).await.map_err(|e| e.into())?;
+			Ok(Self {
+				stream: Some(stream),
+				addr: Some(addr),
+				policies: ClientPolicies::default(),
+				#[cfg(feature = "x509")]
+				server_certificates: Vec::new(),
+				#[cfg(feature = "x509")]
+				client_certificate: None,
+				#[cfg(feature = "x509")]
+				client_key: None,
+				_ph: core::marker::PhantomData,
+			})
+		}
+
+		fn with_timeout(mut self, timeout: Duration) -> Self {
+			self.policies = self.policies.with_timeout(timeout);
+			self
+		}
+
+		fn with_server_certificate(mut self, cert: CertificateSpec) -> TransportResult<Self> {
+			let cert = Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
+			self.server_certificates.push(cert);
+			Ok(self)
+		}
+
+		fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self> {
+			let cert = Certificate::try_from(cert).map_err(|_| TransportError::ConnectionFailed)?;
+			let key_manager = HandshakeKeyManager::try_from(key).map_err(|_| TransportError::ConnectionFailed)?;
+			self.client_certificate = Some(cert);
+			self.client_key = Some(key_manager);
+			Ok(self)
+		}
+
+		fn build(self) -> impl core::future::Future<Output = TransportResult<Self::Output>> + Send {
+			async move {
+				let mut builder = self;
+				let stream = builder.stream.take().ok_or(TransportError::ConnectionFailed)?;
+				let mut transport = <P as Protocol>::create_transport(stream);
+				if !builder.server_certificates.is_empty() {
+					transport = transport.with_server_certificates(builder.server_certificates);
+				}
+				if let (Some(cert), Some(key)) = (builder.client_certificate, builder.client_key) {
+					transport = transport.with_client_identity(cert, key);
+				}
+
+				let configured = builder.policies.apply::<P>(transport);
+				Ok(GenericClient {
+					transport: configured,
+					connection_params: ClientConnectionParams { addr: builder.addr },
+					_ph: core::marker::PhantomData,
+				})
+			}
+		}
+	}
+
+	// Conversions
+	#[cfg(not(feature = "x509"))]
+	impl<P: Protocol + Send> TryFrom<ClientBuilder<P>> for GenericClient<P>
+	where
+		P::Transport: MessageEmitter + MessageCollector + PolicyConf,
+		P::Address: Send,
 	{
 		type Error = TransportError;
 
 		fn try_from(builder: ClientBuilder<P>) -> Result<Self, Self::Error> {
-			builder.build()
+			tokio::runtime::Handle::current().block_on(async { builder.build().await })
+		}
+	}
+
+	#[cfg(feature = "x509")]
+	impl<P: Protocol + Send> TryFrom<ClientBuilder<P>> for GenericClient<P>
+	where
+		P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
+		P::Address: Send,
+	{
+		type Error = TransportError;
+
+		fn try_from(builder: ClientBuilder<P>) -> Result<Self, Self::Error> {
+			tokio::runtime::Handle::current().block_on(async { builder.build().await })
 		}
 	}
 

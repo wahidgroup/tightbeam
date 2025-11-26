@@ -22,10 +22,11 @@ use tightbeam::{
 		key::KeySpec,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
-	decode, hex,
+	decode, exactly, hex,
 	macros::client::builder::ClientBuilder,
 	prelude::*,
 	servlet, tb_assert_spec, tb_scenario,
+	testing::{assertions::Presence, macros::IsSome},
 	transport::tcp::r#async::TokioListener,
 	Beamable,
 };
@@ -125,7 +126,11 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
-		assertions: []
+		assertions: [
+			("response_received", exactly!(1), equals!(IsSome)),
+			("server_id", exactly!(1), equals!("mutual-auth-server")),
+			("authenticated", exactly!(1), equals!(true))
+		]
 	}
 }
 
@@ -142,11 +147,12 @@ tb_scenario! {
 				.await?
 				.with_server_certificate(SERVER_CERT)?
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
-				.build()?;
+				.build()
+				.await?;
 
 			Ok(client)
 		},
-		client: |_trace, mut client, _config| async move {
+		client: |trace, mut client, _config| async move {
 			// Send authenticated request
 			let request = AuthRequest {
 				client_id: "test-client-mutual-001".to_string(),
@@ -159,11 +165,13 @@ tb_scenario! {
 
 			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
 
-			// Validate response
-			assert!(response_frame.is_some(), "Expected response from server");
+			// Emit trace events unconditionally - assertion spec validates them
+			trace.event_with("response_received", &[], Presence::of_option(&response_frame))?;
+
 			let response: AuthResponse = decode(&response_frame.unwrap().message)?;
-			assert_eq!(response.server_id, "mutual-auth-server", "Server ID mismatch");
-			assert!(response.authenticated, "Client should be authenticated");
+
+			trace.event_with("server_id", &[], response.server_id)?;
+			trace.event_with("authenticated", &[], response.authenticated)?;
 
 			Ok(())
 		}

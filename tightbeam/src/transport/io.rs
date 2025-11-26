@@ -73,6 +73,29 @@ pub trait MessageIO: ResponseHandler {
 		Self::decode_envelope(&bytes)
 	}
 
+	/// Try to read next envelope, distinguishing graceful close from errors
+	///
+	/// Returns:
+	/// - `Ok(Some(envelope))` - Successfully read a message
+	/// - `Ok(None)` - Connection closed gracefully (EOF)
+	/// - `Err(...)` - Connection failed unexpectedly
+	///
+	/// This method enables keep-alive: servlets loop on connections, handling
+	/// multiple requests until the client closes the connection.
+	///
+	/// **Default implementation**: Handles the `ConnectionClosed` error variant but
+	/// relies on protocol-specific implementations to detect EOF conditions (e.g.,
+	/// `UnexpectedEof` for TCP). Protocols should override to map their EOF errors
+	/// to `Ok(None)`.
+	#[allow(async_fn_in_trait)]
+	async fn try_read_decoded_envelope(&mut self) -> TransportResult<Option<TransportEnvelope>> {
+		match self.read_decoded_envelope().await {
+			Ok(envelope) => Ok(Some(envelope)),
+			Err(TransportError::ConnectionClosed) => Ok(None),
+			Err(e) => Err(e),
+		}
+	}
+
 	/// Send a response back to the sender
 	///
 	fn handle_message(&self, message: Arc<Frame>) -> Option<Frame> {

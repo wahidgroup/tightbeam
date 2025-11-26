@@ -11,6 +11,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use tightbeam::{
+	compress::{Inflator, ZstdCompression},
 	crypto::{
 		aead::Aes256Gcm,
 		key::KeySpec,
@@ -18,13 +19,12 @@ use tightbeam::{
 		x509::CertificateSpec,
 	},
 	decode,
-	macros::client::builder::{ClientBuilder, GenericClient},
+	macros::client::builder::ClientBuilder,
 	prelude::*,
 	servlet,
 	testing::trace::TraceCollector,
 	transport::tcp::r#async::TokioListener,
 };
-use tokio::sync::{Mutex, OnceCell};
 
 use crate::{
 	debug_log,
@@ -86,33 +86,35 @@ trait DtnNode {
 		}
 	}
 
-	// Send frame by creating fresh client each time
-	// TODO: Re-enable caching once servlet keep-alive is verified working
+	// Send frame using connection pool
 	async fn send_frame(
 		&self,
-		_client_cache: &Arc<tokio::sync::OnceCell<tokio::sync::Mutex<GenericClient<TokioListener>>>>,
+		pool: &Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 		addr: TightBeamSocketAddr,
 		server_cert: CertificateSpec,
 		frame: Frame,
 	) -> Result<Option<Frame>, TightBeamError> {
-		// Create fresh client for each request (temporary)
-		let mut client = ClientBuilder::<TokioListener>::connect(addr)
-			.await?
+		use tightbeam::transport::Client;
+
+		// Acquire pooled client with full x509 configuration
+		let mut client = pool
+			.connect(addr)
 			.with_server_certificate(server_cert)?
 			.with_client_identity(self.node_cert(), self.node_key())?
 			.with_timeout(Duration::from_millis(5000))
-			.build()?;
+			.build()
+			.await?;
 
 		Ok(client.emit(frame, None).await?)
 	}
 
-	// Gap recovery with client caching
+	// Gap recovery with pooling
 	async fn handle_frame_request(
 		&self,
 		request: FrameRequest,
 		trace: &TraceCollector,
 		cascade_target: Option<(
-			&Arc<OnceCell<Mutex<GenericClient<TokioListener>>>>,
+			&Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 			TightBeamSocketAddr,
 			CertificateSpec,
 		)>,
@@ -138,7 +140,7 @@ trait DtnNode {
 
 			self.chain_processor().finalize_outgoing(&response_frame)?;
 			Ok(Some(response_frame))
-		} else if let Some((client_cache, addr, cert)) = cascade_target {
+		} else if let Some((pool, addr, cert)) = cascade_target {
 			trace.event(&format!("{}_cascade_frame_request", self.node_name()))?;
 
 			let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
@@ -151,7 +153,7 @@ trait DtnNode {
 			)?;
 
 			self.chain_processor().finalize_outgoing(&cascade_frame)?;
-			self.send_frame(client_cache, addr, cert, cascade_frame).await?;
+			self.send_frame(pool, addr, cert, cascade_frame).await?;
 			Ok(None)
 		} else {
 			Ok(None)
@@ -172,7 +174,7 @@ trait DtnNode {
 		&self,
 		current_head: Vec<u8>,
 		missing_hash: Vec<u8>,
-		client_cache: &Arc<OnceCell<Mutex<GenericClient<TokioListener>>>>,
+		pool: &Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 		upstream_addr: TightBeamSocketAddr,
 		server_cert: CertificateSpec,
 		trace: &TraceCollector,
@@ -196,7 +198,7 @@ trait DtnNode {
 		self.chain_processor().finalize_outgoing(&request_frame)?;
 		trace.event(&format!("{}_send_frame_request", self.node_name()))?;
 
-		self.send_frame(client_cache, upstream_addr, server_cert, request_frame).await?;
+		self.send_frame(pool, upstream_addr, server_cert, request_frame).await?;
 		Ok(())
 	}
 }
@@ -222,7 +224,7 @@ servlet! {
 		chain_processor: Arc<ChainProcessor>,
 		frame_builder: Arc<FrameBuilderHelper>,
 		earth_relay_addr: TightBeamSocketAddr,
-		earth_relay_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>>,
+		connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 		shared_mission_state: Arc<RwLock<MissionState>>,
 	},
 	handle: |frame, trace, config| async move {
@@ -288,9 +290,9 @@ servlet! {
 									telemetry_count + 1
 								);
 
-								// Send command via cached client
+								// Send command via pooled client
 								config.send_frame(
-									&config.earth_relay_client,
+									&config.connection_pool,
 									config.earth_relay_addr,
 									EARTH_RELAY_CERT,
 									command_frame,
@@ -330,18 +332,18 @@ servlet! {
 				Ok(Some(stateless_ack))
 			},
 			ProcessResult::Buffered => Ok(None),
-		ProcessResult::ChainGap { current_head, missing_hash } => {
-			// Use trait method with cached client
-			config.handle_chain_gap(
-				current_head,
-				missing_hash,
-				&config.earth_relay_client,
-				config.earth_relay_addr,
-				EARTH_RELAY_CERT,
-				&trace,
-			).await?;
-			Ok(None)
-		},
+			ProcessResult::ChainGap { current_head, missing_hash } => {
+				// Use trait method with pooled client
+				config.handle_chain_gap(
+					current_head,
+					missing_hash,
+					&config.connection_pool,
+					config.earth_relay_addr,
+					EARTH_RELAY_CERT,
+					&trace,
+				).await?;
+				Ok(None)
+			},
 		}
 	}
 }
@@ -400,9 +402,8 @@ servlet! {
 		rover_verifying_key: Secp256k1VerifyingKey,
 		shared_cipher: Aes256Gcm,
 		mars_relay_addr: TightBeamSocketAddr,
-		mars_relay_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>>,
 		mission_control_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
-		mission_control_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>>,
+		connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 		chain_processor: Arc<ChainProcessor>,
 		frame_builder: Arc<FrameBuilderHelper>,
 	},
@@ -450,7 +451,6 @@ servlet! {
 				for ordered_frame in ordered_frames {
 					// Decrypt and decode to check message type
 					let relay_message: RelayMessage = if ordered_frame.metadata.confidentiality.is_some() {
-						use tightbeam::compress::{Inflator, ZstdCompression};
 						let inflator: Option<&dyn Inflator> = if ordered_frame.metadata.compactness.is_some() {
 							Some(&ZstdCompression)
 						} else {
@@ -462,144 +462,145 @@ servlet! {
 					};
 
 					match relay_message {
-				RelayMessage::FrameRequest(request) => {
-					trace.event("earth_relay_receive_frame_request")?;
+						RelayMessage::FrameRequest(request) => {
+							trace.event("earth_relay_receive_frame_request")?;
 
-					let missing_frames = config.chain_processor.request_missing_frames(
-						&request.requester_head,
-						&request.last_received_hash,
-					)?;
+							let missing_frames = config.chain_processor.request_missing_frames(
+								&request.requester_head,
+								&request.last_received_hash,
+							)?;
 
-					if !missing_frames.is_empty() {
-						// We have the frames - respond
-						trace.event("earth_relay_send_frame_response")?;
+							if !missing_frames.is_empty() {
+								// We have the frames - respond
+								trace.event("earth_relay_send_frame_response")?;
 
-						let response = FrameResponse { frames: missing_frames };
-						let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
-						let response_frame = config.frame_builder.build_frame_response_frame(
-							response,
-							order,
-							prev_digest,
-							&config.earth_relay_signing_key,
-							&config.shared_cipher,
-						)?;
+								let response = FrameResponse { frames: missing_frames };
+								let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+								let response_frame = config.frame_builder.build_frame_response_frame(
+									response,
+									order,
+									prev_digest,
+									&config.earth_relay_signing_key,
+									&config.shared_cipher,
+								)?;
 
-						config.chain_processor.finalize_outgoing(&response_frame)?;
-						return Ok(Some(response_frame));
-					} else {
-						// We don't have frames - cascade to upstream
-						trace.event("earth_relay_cascade_frame_request")?;
+								config.chain_processor.finalize_outgoing(&response_frame)?;
+								return Ok(Some(response_frame));
+							} else {
+								// We don't have frames - cascade to upstream
+								trace.event("earth_relay_cascade_frame_request")?;
 
-						let (cascade_addr, cascade_cert) = if from_mission_control {
-							// Request from MC, cascade to Mars Relay
-							(config.mars_relay_addr, MARS_RELAY_CERT)
-						} else {
-							// Request from Mars, cascade to MC (rare but possible)
-							match *config.mission_control_addr.read()? {
-								Some(mc_addr) => (mc_addr, MISSION_CONTROL_CERT),
-								None => return Ok(None), // MC address not available yet
+								let (cascade_addr, cascade_cert) = if from_mission_control {
+									// Request from MC, cascade to Mars Relay
+									(config.mars_relay_addr, MARS_RELAY_CERT)
+								} else {
+									// Request from Mars, cascade to MC (rare but possible)
+									match *config.mission_control_addr.read()? {
+										Some(mc_addr) => (mc_addr, MISSION_CONTROL_CERT),
+										None => return Ok(None), // MC address not available yet
+									}
+								};
+
+								let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+								let cascade_frame = config.frame_builder.build_frame_request_frame(
+									request,
+									order,
+									prev_digest,
+									&config.earth_relay_signing_key,
+									&config.shared_cipher,
+								)?;
+
+								config.chain_processor.finalize_outgoing(&cascade_frame)?;
+
+							let mut client = ClientBuilder::<TokioListener>::connect(cascade_addr)
+								.await?
+								.with_server_certificate(cascade_cert)?
+								.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY)?
+								.build()
+								.await?;
+
+							client.emit(cascade_frame, None).await?;
+								return Ok(None); // Cascade is async, no immediate response
 							}
-						};
+						},
+						RelayMessage::FrameResponse(response) => {
+							trace.event("earth_relay_receive_frame_response")?;
 
-						let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
-						let cascade_frame = config.frame_builder.build_frame_request_frame(
-							request,
-							order,
-							prev_digest,
-							&config.earth_relay_signing_key,
-							&config.shared_cipher,
-						)?;
+							// Process all frames into chain
+							for frame in response.frames {
+								config.chain_processor.process_incoming(frame)?;
+							}
 
-						config.chain_processor.finalize_outgoing(&cascade_frame)?;
-
-						let mut client = ClientBuilder::<TokioListener>::connect(cascade_addr)
-							.await?
-							.with_server_certificate(cascade_cert)?
-							.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY)?
-							.build()?;
-
-						client.emit(cascade_frame, None).await?;
-						return Ok(None); // Cascade is async, no immediate response
-					}
-				},
-					RelayMessage::FrameResponse(response) => {
-						trace.event("earth_relay_receive_frame_response")?;
-
-						// Process all frames into chain
-						for frame in response.frames {
-							config.chain_processor.process_incoming(frame)?;
-						}
-
-						// Return stateless ACK
-						let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
-						return Ok(Some(stateless_ack));
-					},
-					_ => {
-						// Regular message - route based on source
-						if from_mission_control {
-							// Forward to Mars Relay using cached client
-							debug_log!("[Earth Relay] Recording trace events...");
-							trace.event("earth_relay_receive_from_mc")?;
-							trace.event("earth_relay_forward_to_mars")?;
-							debug_log!("[Earth Relay] Forwarding to Mars Relay...");
-
-							config.send_frame(
-								&config.mars_relay_client,
-								config.mars_relay_addr,
-								MARS_RELAY_CERT,
-								frame,
-							).await?;
-
-							// Return stateless ACK to Mission Control
+							// Return stateless ACK
 							let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
 							return Ok(Some(stateless_ack));
-						} else {
-							// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
-							let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
+						},
+						_ => {
+							// Regular message - route based on source
+							if from_mission_control {
+								// Forward to Mars Relay using cached client
+								debug_log!("[Earth Relay] Recording trace events...");
+								trace.event("earth_relay_receive_from_mc")?;
+								trace.event("earth_relay_forward_to_mars")?;
+								debug_log!("[Earth Relay] Forwarding to Mars Relay...");
 
-							// Forward to Mission Control
-							if is_telemetry {
-								trace.event("earth_relay_receive_telemetry_from_mars")?;
-								trace.event("earth_relay_forward_telemetry_to_mc")?;
+								config.send_frame(
+									&config.connection_pool,
+									config.mars_relay_addr,
+									MARS_RELAY_CERT,
+									frame,
+								).await?;
+
+								// Return stateless ACK to Mission Control
+								let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
+								return Ok(Some(stateless_ack));
 							} else {
-								trace.event("earth_relay_receive_ack_from_mars")?;
-								trace.event("earth_relay_forward_ack_to_mc")?;
-							}
+								// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
+								let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
 
-							debug_log!("[{}] [Earth Relay] Forwarding from Mars Relay to Mission Control", format_mission_time(mission_time_ms()));
-
-							// Get Mission Control address (wait if not set yet)
-							let mc_addr = loop {
-								if let Some(addr) = *config.mission_control_addr.read()? {
-									break addr;
+								// Forward to Mission Control
+								if is_telemetry {
+									trace.event("earth_relay_receive_telemetry_from_mars")?;
+									trace.event("earth_relay_forward_telemetry_to_mc")?;
+								} else {
+									trace.event("earth_relay_receive_ack_from_mars")?;
+									trace.event("earth_relay_forward_ack_to_mc")?;
 								}
-								tokio::time::sleep(Duration::from_millis(10)).await;
-							};
 
-							// Use cached client
-							config.send_frame(
-								&config.mission_control_client,
-								mc_addr,
-								MISSION_CONTROL_CERT,
-								frame,
-							).await?;
+								debug_log!("[{}] [Earth Relay] Forwarding from Mars Relay to Mission Control", format_mission_time(mission_time_ms()));
 
-							// Fire-and-forget (no response to Mars Relay)
-							return Ok(None);
+								// Get Mission Control address (wait if not set yet)
+								let mc_addr = loop {
+									if let Some(addr) = *config.mission_control_addr.read()? {
+										break addr;
+									}
+									tokio::time::sleep(Duration::from_millis(10)).await;
+								};
+
+								// Use pooled client
+								config.send_frame(
+									&config.connection_pool,
+									mc_addr,
+									MISSION_CONTROL_CERT,
+									frame,
+								).await?;
+
+								// Fire-and-forget (no response to Mars Relay)
+								return Ok(None);
+							}
 						}
 					}
 				}
-			}
 
-			Ok(None)
-		},
+				Ok(None)
+			},
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// Use trait method with cached client
+				// Use trait method with pooled client
 				config.handle_chain_gap(
 					current_head,
 					missing_hash,
-					&config.mars_relay_client,
+					&config.connection_pool,
 					config.mars_relay_addr,
 					MARS_RELAY_CERT,
 					&trace,
@@ -668,9 +669,8 @@ servlet! {
 		rover_verifying_key: Secp256k1VerifyingKey,
 		shared_cipher: Aes256Gcm,
 		rover_addr: TightBeamSocketAddr,
-		rover_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>>,
 		earth_relay_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
-		earth_relay_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>>,
+		connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 		chain_processor: Arc<ChainProcessor>,
 		frame_builder: Arc<FrameBuilderHelper>,
 	},
@@ -765,13 +765,14 @@ servlet! {
 
 						config.chain_processor.finalize_outgoing(&cascade_frame)?;
 
-						let mut client = ClientBuilder::<TokioListener>::connect(cascade_addr)
-							.await?
-							.with_server_certificate(cascade_cert)?
-							.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
-							.build()?;
+					let mut client = ClientBuilder::<TokioListener>::connect(cascade_addr)
+						.await?
+						.with_server_certificate(cascade_cert)?
+						.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
+						.build()
+						.await?;
 
-						client.emit(cascade_frame, None).await?;
+					client.emit(cascade_frame, None).await?;
 						return Ok(None); // Cascade is async, no immediate response
 					}
 				},
@@ -817,9 +818,9 @@ servlet! {
 					tokio::time::sleep(Duration::from_millis(10)).await;
 				};
 
-				// Use cached client
+				// Use pooled client
 				config.send_frame(
-					&config.earth_relay_client,
+					&config.connection_pool,
 					earth_addr,
 					EARTH_RELAY_CERT,
 					frame,
@@ -836,7 +837,7 @@ servlet! {
 
 				debug_log!("[Mars Relay] Emitting frame to Rover...");
 				let response = config.send_frame(
-					&config.rover_client,
+					&config.connection_pool,
 					config.rover_addr,
 					ROVER_CERT,
 					frame,
@@ -861,7 +862,7 @@ servlet! {
 					};
 
 					config.send_frame(
-						&config.earth_relay_client,
+						&config.connection_pool,
 						earth_addr,
 						EARTH_RELAY_CERT,
 						ack_frame,
@@ -876,22 +877,22 @@ servlet! {
 		ProcessResult::Buffered => Ok(None),
 		ProcessResult::ChainGap { current_head, missing_hash } => {
 			// Determine upstream based on gap source
-			let (client_cache, upstream_addr, upstream_cert) = if from_rover {
+			let (upstream_addr, upstream_cert) = if from_rover {
 				// Gap from Rover direction, cascade to Earth Relay
 				match *config.earth_relay_addr.read()? {
-					Some(earth_addr) => (&config.earth_relay_client, earth_addr, EARTH_RELAY_CERT),
+					Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT),
 					None => return Ok(None), // Earth address not available yet
 				}
 			} else {
 				// Gap from Earth direction, cascade to Rover
-				(&config.rover_client, config.rover_addr, ROVER_CERT)
+				(config.rover_addr, ROVER_CERT)
 			};
 
-			// Use trait method with cached client
+			// Use trait method with pooled client
 			config.handle_chain_gap(
 				current_head,
 				missing_hash,
-				client_cache,
+				&config.connection_pool,
 				upstream_addr,
 				upstream_cert,
 				&trace,
@@ -955,7 +956,7 @@ servlet! {
 	},
 	config: {
 		mars_relay_addr: TightBeamSocketAddr,
-		mars_relay_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>>,
+		connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 		rover_signing_key: Secp256k1SigningKey,
 		mission_control_verifying_key: Secp256k1VerifyingKey,
 		mars_relay_verifying_key: Secp256k1VerifyingKey,
@@ -994,18 +995,18 @@ servlet! {
 				debug_log!("[{}] [Rover] Frame buffered", format_mission_time(mission_time_ms()));
 				return Ok(None);
 			},
-		ProcessResult::ChainGap { current_head, missing_hash } => {
-			// Use trait method with cached client
-			config.handle_chain_gap(
-				current_head,
-				missing_hash,
-				&config.mars_relay_client,
-				config.mars_relay_addr,
-				MARS_RELAY_CERT,
-				&trace,
-			).await?;
-			return Ok(None);
-		}
+			ProcessResult::ChainGap { current_head, missing_hash } => {
+				// Use trait method with pooled client
+				config.handle_chain_gap(
+					current_head,
+					missing_hash,
+					&config.connection_pool,
+					config.mars_relay_addr,
+					MARS_RELAY_CERT,
+					&trace,
+				).await?;
+				return Ok(None);
+			}
 		}
 
 		// Decrypt and decode RelayMessage
@@ -1071,47 +1072,47 @@ servlet! {
 				// Return stateful ACK as response
 				Ok(Some(ack_frame))
 			},
-		RelayMessage::FrameRequest(request) => {
-			trace.event("rover_receive_frame_request")?;
+			RelayMessage::FrameRequest(request) => {
+				trace.event("rover_receive_frame_request")?;
 
-			let missing_frames = config.chain_processor.request_missing_frames(
-				&request.requester_head,
-				&request.last_received_hash,
-			)?;
-
-			if !missing_frames.is_empty() {
-				// We have the frames - respond
-				trace.event("rover_send_frame_response")?;
-
-				let response = FrameResponse { frames: missing_frames };
-				let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
-				let response_frame = config.frame_builder.build_frame_response_frame(
-					response,
-					order,
-					prev_digest,
-					&config.rover_signing_key,
-					&config.shared_cipher,
+				let missing_frames = config.chain_processor.request_missing_frames(
+					&request.requester_head,
+					&request.last_received_hash,
 				)?;
 
-				config.chain_processor.finalize_outgoing(&response_frame)?;
-				Ok(Some(response_frame))
-			} else {
-				// Rover is origin - cannot cascade, return None
-				Ok(None)
-			}
-		},
-		RelayMessage::FrameResponse(response) => {
-			trace.event("rover_receive_frame_response")?;
+				if !missing_frames.is_empty() {
+					// We have the frames - respond
+					trace.event("rover_send_frame_response")?;
 
-			// Process all frames into chain
-			for frame in response.frames {
-				config.chain_processor.process_incoming(frame)?;
-			}
+					let response = FrameResponse { frames: missing_frames };
+					let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+					let response_frame = config.frame_builder.build_frame_response_frame(
+						response,
+						order,
+						prev_digest,
+						&config.rover_signing_key,
+						&config.shared_cipher,
+					)?;
 
-			// Return stateless ACK
-			let stateless_ack = config.frame_builder.build_stateless_ack_frame(command_order)?;
-			Ok(Some(stateless_ack))
-		},
+					config.chain_processor.finalize_outgoing(&response_frame)?;
+					Ok(Some(response_frame))
+				} else {
+					// Rover is origin - cannot cascade, return None
+					Ok(None)
+				}
+			},
+			RelayMessage::FrameResponse(response) => {
+				trace.event("rover_receive_frame_response")?;
+
+				// Process all frames into chain
+				for frame in response.frames {
+					config.chain_processor.process_incoming(frame)?;
+				}
+
+				// Return stateless ACK
+				let stateless_ack = config.frame_builder.build_stateless_ack_frame(command_order)?;
+				Ok(Some(stateless_ack))
+			},
 			RelayMessage::Telemetry(_) | RelayMessage::CommandAck(_) => {
 				debug_log!("[{}] [Rover] Received unexpected RelayMessage type (Telemetry/ACK)", format_mission_time(mission_time_ms()));
 				Ok(None)

@@ -41,7 +41,7 @@ use policy::*;
 
 pub struct TcpTransport<S: ProtocolStream> {
 	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
+	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
 	#[cfg(feature = "transport-policy")]
 	restart_policy: Box<dyn RestartPolicy>,
 	#[cfg(feature = "transport-policy")]
@@ -73,7 +73,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 
 	symmetric_key: Option<RuntimeAead>,
 
-	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>>,
+	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>>,
 
 	handshake_protocol_kind: HandshakeProtocolKind,
 }
@@ -347,7 +347,7 @@ where
 
 	fn to_server_handshake_mut(
 		&mut self,
-	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>> {
+	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>> {
 		&mut self.server_handshake
 	}
 

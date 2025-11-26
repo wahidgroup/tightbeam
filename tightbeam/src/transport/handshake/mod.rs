@@ -233,7 +233,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		aad_domain_tag: Option<&'static [u8]>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
+	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>;
 
 	/// Create an ECIES client handshake orchestrator.
 	///
@@ -288,7 +288,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	fn create_cms_server(
 		&self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
+	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>;
 }
 
 /// Encapsulated server key manager for handshake protocols.
@@ -347,7 +347,7 @@ impl HandshakeKeyManager {
 		aad_domain_tag: Option<&'static [u8]>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + 'static>> {
+	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>> {
 		#[cfg(feature = "secp256k1")]
 		{
 			let server = crate::transport::handshake::server::EciesHandshakeServer::<
@@ -464,7 +464,7 @@ impl HandshakeKeyManager {
 	pub fn create_cms_server<'a>(
 		&'a self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + 'static>> {
+	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>> {
 		#[cfg(feature = "secp256k1")]
 		{
 			let server = crate::transport::handshake::server::CmsHandshakeServerSecp256k1::new(

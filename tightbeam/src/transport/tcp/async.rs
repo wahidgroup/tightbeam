@@ -7,6 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
+use crate::transport::protocols::PersistentConnection;
 use crate::transport::ResponsePackage;
 use crate::transport::{
 	AsyncListenerTrait, EnvelopeBuilder, EnvelopeLimits, MessageIO, Pingable, Protocol, TransportError,
@@ -294,7 +295,7 @@ where
 
 	fn to_server_handshake_mut(
 		&mut self,
-	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>> {
+	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>> {
 		&mut self.server_handshake
 	}
 
@@ -363,7 +364,7 @@ impl crate::transport::Mycelial for TokioListener {
 #[cfg(not(feature = "transport-policy"))]
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
+	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
 	#[cfg(feature = "x509")]
 	server_certificates: Vec<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
@@ -392,7 +393,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 #[cfg(feature = "transport-policy")]
 pub struct TcpTransport<S: AsyncProtocolStream> {
 	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send>>,
+	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
 	restart_policy: Box<dyn RestartPolicy>,
 	emitter_gate: Box<dyn GatePolicy>,
 	collector_gate: Box<dyn GatePolicy>,
@@ -420,7 +421,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	symmetric_key: Option<RuntimeAead>,
 	#[cfg(feature = "x509")]
-	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send>>,
+	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>>,
 	#[cfg(feature = "x509")]
 	handshake_protocol_kind: HandshakeProtocolKind,
 }
@@ -630,7 +631,19 @@ where
 	}
 }
 
-// Old emit() implementation removed - now uses default trait implementation
+impl PersistentConnection for TokioListener {
+	fn is_connected(transport: &Self::Transport) -> bool {
+		// Check TCP connection via peer_addr - if it fails, connection is dead
+		// This is lightweight and doesn't perform I/O
+		transport.stream.stream.peer_addr().is_ok()
+	}
+
+	fn try_close(transport: &mut Self::Transport) {
+		// Best-effort graceful shutdown
+		// TCP connections will be fully closed when transport drops
+		// tokio TcpStream doesn't provide a shutdown method, relies on Drop
+	}
+}
 
 #[cfg(test)]
 mod tests {

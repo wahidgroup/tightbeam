@@ -48,7 +48,6 @@ use tightbeam::{
 	trace::TraceCollector,
 	transport::tcp::r#async::TokioListener,
 };
-use tokio::sync::{Mutex, OnceCell};
 
 use crate::{
 	debug_log,
@@ -760,14 +759,11 @@ tb_scenario! {
 			let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
 
 			// ================================================================
-			// CACHED CLIENT CONNECTIONS (lazy initialization via OnceCell + Mutex for mutability)
+			// CONNECTION POOL (shared across all servlets for connection reuse)
 			// ================================================================
-			let mission_control_earth_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>> = Arc::new(OnceCell::new());
-			let earth_mars_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>> = Arc::new(OnceCell::new());
-			let earth_mc_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>> = Arc::new(OnceCell::new());
-			let mars_earth_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>> = Arc::new(OnceCell::new());
-			let mars_rover_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>> = Arc::new(OnceCell::new());
-			let rover_mars_client: Arc<OnceCell<Mutex<GenericClient<TokioListener>>>> = Arc::new(OnceCell::new());
+			let connection_pool = Arc::new(tightbeam::transport::ConnectionPool::<TokioListener, 3>::new(
+				tightbeam::transport::PoolConfig::default()
+			));
 
 			// ================================================================
 			// 1. START ROVER SERVLET
@@ -787,16 +783,16 @@ tb_scenario! {
 			let rover_command_executor = Arc::new(RwLock::new(CommandExecutor::default()));
 			let rover_config = RoverServletConf {
 				mars_relay_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder
-				mars_relay_client: Arc::clone(&rover_mars_client),
+				connection_pool: Arc::clone(&connection_pool),
 				rover_signing_key: rover_signing_key.to_owned(),
 				mission_control_verifying_key: mc_verifying_key,
 				mars_relay_verifying_key: mars_relay_verifying_key_val,
 				shared_cipher: shared_cipher.to_owned(),
-			chain_processor: Arc::clone(&rover_processor),
-			fault_manager: Arc::clone(&rover_fault_manager),
-			command_executor: Arc::clone(&rover_command_executor),
-			frame_builder: Arc::clone(&rover_frame_builder),
-			mission_state: Arc::clone(&shared_mission_state),
+				chain_processor: Arc::clone(&rover_processor),
+				fault_manager: Arc::clone(&rover_fault_manager),
+				command_executor: Arc::clone(&rover_command_executor),
+				frame_builder: Arc::clone(&rover_frame_builder),
+				mission_state: Arc::clone(&shared_mission_state),
 				max_rounds: COMMAND_ROUND_TRIPS,
 			};
 
@@ -830,13 +826,12 @@ tb_scenario! {
 				earth_relay_verifying_key: earth_relay_verifying_key_val,
 				rover_verifying_key: rover_verifying_key_val,
 				shared_cipher: shared_cipher.to_owned(),
-			rover_addr,
-			rover_client: Arc::clone(&mars_rover_client),
-			earth_relay_addr: Arc::clone(&mars_earth_relay_addr),
-			earth_relay_client: Arc::clone(&mars_earth_client),
-			chain_processor: Arc::clone(&mars_relay_processor),
-			frame_builder: Arc::clone(&mars_relay_frame_builder),
-		};
+				rover_addr,
+				earth_relay_addr: Arc::clone(&mars_earth_relay_addr),
+				connection_pool: Arc::clone(&connection_pool),
+				chain_processor: Arc::clone(&mars_relay_processor),
+				frame_builder: Arc::clone(&mars_relay_frame_builder),
+			};
 
 			let mars_relay_servlet = MarsRelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(mars_relay_config)).await?;
 			let mars_relay_addr = mars_relay_servlet.addr();
@@ -871,13 +866,12 @@ tb_scenario! {
 				mars_relay_verifying_key: mars_relay_verifying_key_val,
 				rover_verifying_key: rover_verifying_key_val,
 				shared_cipher: shared_cipher.to_owned(),
-			mars_relay_addr, // Now we have the real address!
-			mars_relay_client: Arc::clone(&earth_mars_client),
-			mission_control_addr: Arc::clone(&earth_mission_control_addr),
-			mission_control_client: Arc::clone(&earth_mc_client),
-			chain_processor: Arc::clone(&earth_relay_processor),
-			frame_builder: Arc::clone(&earth_relay_frame_builder),
-		};
+				mars_relay_addr, // Now we have the real address!
+				mission_control_addr: Arc::clone(&earth_mission_control_addr),
+				connection_pool: Arc::clone(&connection_pool),
+				chain_processor: Arc::clone(&earth_relay_processor),
+				frame_builder: Arc::clone(&earth_relay_frame_builder),
+			};
 
 			let earth_relay_servlet = EarthRelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(earth_relay_config)).await?;
 			let earth_relay_addr = earth_relay_servlet.addr();
@@ -906,11 +900,11 @@ tb_scenario! {
 				mission_control_signing_key: mission_control_signing_key.to_owned(),
 				rover_verifying_key: rover_verifying_key_val,
 				earth_relay_verifying_key: earth_relay_verifying_key_val,
-			shared_cipher: shared_cipher.to_owned(),
-			chain_processor: Arc::clone(&mc_processor),
-			frame_builder: Arc::clone(&mc_frame_builder),
-			earth_relay_addr, // Real address!
-			earth_relay_client: Arc::clone(&mission_control_earth_client),
+				shared_cipher: shared_cipher.to_owned(),
+				chain_processor: Arc::clone(&mc_processor),
+				frame_builder: Arc::clone(&mc_frame_builder),
+				earth_relay_addr, // Real address!
+				connection_pool: Arc::clone(&connection_pool),
 				shared_mission_state: Arc::clone(&shared_mission_state),
 			};
 
@@ -968,7 +962,8 @@ tb_scenario! {
 					.with_server_certificate(EARTH_RELAY_CERT)?
 					.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY)?
 					.with_timeout(Duration::from_millis(5000))
-					.build()?;
+					.build()
+					.await?;
 
 				let _stateless_ack = earth_relay_client.emit(command_frame, None).await?;
 
@@ -994,7 +989,8 @@ tb_scenario! {
 				.with_server_certificate(MARS_RELAY_CERT)?
 				.with_client_identity(ROVER_CERT, ROVER_KEY)?
 				.with_timeout(Duration::from_millis(5000))
-				.build()?;
+				.build()
+				.await?;
 
 			Ok(client)
 		},

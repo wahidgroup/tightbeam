@@ -26,6 +26,8 @@ pub mod state;
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
+#[cfg(feature = "std")]
+pub mod pool;
 #[cfg(feature = "tcp")]
 pub mod tcp;
 
@@ -36,8 +38,12 @@ pub use error::{TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, MessageIO, Pingable};
 pub use messaging::{MessageCollector, MessageEmitter, ResponseHandler, Transport};
 pub use protocols::{
-	AsyncListenerTrait, EncryptedProtocol, Mycelial, Protocol, ProtocolStream, TightBeamAddress, X509ClientConfig,
+	AsyncListenerTrait, EncryptedProtocol, Mycelial, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
+	X509ClientConfig,
 };
+
+#[cfg(feature = "std")]
+pub use pool::{Client, ConnectionPool, PoolConfig, PooledClient};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -164,12 +170,12 @@ mod tests {
 	#[cfg(feature = "aes-gcm")]
 	#[test]
 	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
+		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit, RuntimeAead};
 		use crate::der::oid::AssociatedOid;
 
 		let frame = create_v0_tightbeam(None, None);
 		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32]).map_err(|_| "Invalid key")?;
-		let encryptor = crate::crypto::aead::RuntimeAead::new(cipher, Aes256GcmOid::OID);
+		let encryptor = RuntimeAead::new(cipher, Aes256GcmOid::OID);
 
 		let err = builders::EnvelopeBuilder::request(frame.clone())
 			.with_wire_mode(WireMode::Encrypted)
@@ -184,6 +190,7 @@ mod tests {
 			}
 			other => panic!("unexpected error variant: {other:?}"),
 		}
+
 		Ok(())
 	}
 

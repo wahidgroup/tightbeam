@@ -360,7 +360,8 @@ tb_scenario! {
 			let client = ClientBuilder::<TokioListener>::connect(addr).await?
 				.with_client_identity(certificate, key_spec)?
 				.with_restart(restart_policy)
-				.build()?;
+				.build()
+				.await?;
 
 			Ok(client)
 		},

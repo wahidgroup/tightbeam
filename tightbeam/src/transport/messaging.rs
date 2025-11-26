@@ -36,10 +36,10 @@ pub trait ResponseHandler {
 	/// Set a handler that processes incoming messages and generates responses
 	fn with_handler<F>(self, handler: F) -> Self
 	where
-		F: Fn(Frame) -> Option<Frame> + Send + 'static;
+		F: Fn(Frame) -> Option<Frame> + Send + Sync + 'static;
 
 	/// Get the current handler if one is set
-	fn handler(&self) -> Option<&(dyn Fn(Frame) -> Option<Frame> + Send)>;
+	fn handler(&self) -> Option<&(dyn Fn(Frame) -> Option<Frame> + Send + Sync)>;
 }
 
 #[cfg(feature = "transport-policy")]

@@ -444,8 +444,8 @@ macro_rules! server {
 						)*
 					)*
 					let __handler_clone = ::std::sync::Arc::clone(&$handler);
-				let mut __error_channel = $error_tx.clone();
-				let mut __ok_channel = $ok_tx.clone();
+					let mut __error_channel = $error_tx.clone();
+					let mut __ok_channel = $ok_tx.clone();
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(async move {
 						let mut __transport = __transport;
@@ -461,20 +461,20 @@ macro_rules! server {
 								}
 							};
 
-						// Process message asynchronously
-						// Unwrap Arc<Frame> to Frame for handler (clone only if Arc has multiple owners)
-						let frame_owned = std::sync::Arc::try_unwrap(frame)
-							.unwrap_or_else(|arc| (*arc).clone());
-						let response = if status == $crate::policy::TransitStatus::Accepted {
-							match (__handler_clone)(frame_owned).await {
-								Ok(opt) => opt,
-								Err(_err) => {
-									None
+							// Process message asynchronously
+							// Unwrap Arc<Frame> to Frame for handler (clone only if Arc has multiple owners)
+							let frame_owned = std::sync::Arc::try_unwrap(frame)
+								.unwrap_or_else(|arc| (*arc).clone());
+							let response = if status == $crate::policy::TransitStatus::Accepted {
+								match (__handler_clone)(frame_owned).await {
+									Ok(opt) => opt,
+									Err(_err) => {
+										None
+									}
 								}
-							}
-						} else {
-							None
-						};
+							} else {
+								None
+							};
 
 							// Send response
 							match __transport.send_response(status, response).await {
