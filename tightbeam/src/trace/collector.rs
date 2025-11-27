@@ -31,6 +31,8 @@ use crate::instrumentation::{events, TbEvent, TbInstrumentationConfig};
 use crate::testing::fdr::FaultModel;
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::InjectionStrategy;
+#[cfg(feature = "logging")]
+use crate::trace::logging::LogRecord;
 
 /// Trait for converting types into event labels
 pub trait IntoEventLabel {
@@ -107,6 +109,8 @@ pub struct EventBuilder<'a> {
 	duration_ns: Option<u64>,
 	#[cfg(feature = "instrument")]
 	payload: Option<&'a [u8]>,
+	#[cfg(feature = "logging")]
+	log_level: Option<super::logging::LogLevel>,
 	emitted: Cell<bool>,
 }
 
@@ -126,6 +130,8 @@ impl<'a> EventBuilder<'a> {
 			duration_ns: None,
 			#[cfg(feature = "instrument")]
 			payload: None,
+			#[cfg(feature = "logging")]
+			log_level: None,
 			emitted: Cell::new(false),
 		}
 	}
@@ -154,6 +160,21 @@ impl<'a> EventBuilder<'a> {
 		self
 	}
 
+	/// Set log level for this event
+	///
+	/// When a log level is set, the event will be emitted to the configured
+	/// log backend (if any) in addition to trace events.
+	#[cfg(feature = "logging")]
+	pub fn with_log_level(mut self, level: super::logging::LogLevel) -> Self {
+		self.log_level = Some(level);
+		self
+	}
+
+	#[cfg(not(feature = "logging"))]
+	pub fn with_log_level(self, _level: ()) -> Self {
+		self
+	}
+
 	/// Emit the event (both assertion and instrumentation if enabled)
 	/// This is automatically called when the builder is dropped.
 	pub fn emit(mut self) {
@@ -167,6 +188,32 @@ impl<'a> EventBuilder<'a> {
 		}
 
 		self.emitted.set(true);
+
+		// Emit to log backend if configured and log level is set (before moving label)
+		#[cfg(feature = "logging")]
+		if let Some(logger_config) = &self.collector.state.logger_config {
+			// Use explicit log level, or fall back to default from config
+			let effective_level = self.log_level.or(logger_config.default_level);
+			if let Some(level) = effective_level {
+				if logger_config.filter.should_log(level, None) {
+					let label_str = match &self.label {
+						Cow::Borrowed(s) => *s,
+						Cow::Owned(s) => s.as_str(),
+					};
+
+					let record = LogRecord {
+						level,
+						timestamp: self.duration_ns,
+						component: None, // TODO: Extract from tags
+						message: label_str,
+						metadata: None, // TODO: Extract from value
+					};
+
+					// Ignore logging errors (don't fail trace collection)
+					let _ = logger_config.backend.emit(&record);
+				}
+			}
+		}
 
 		let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
 		let label = core::mem::take(&mut self.label);
@@ -243,10 +290,12 @@ struct TraceState {
 	fault_rng_state: Mutex<u64>, // For Random strategy (seeded RNG)
 	#[cfg(feature = "testing-fault")]
 	fault_call_counters: Mutex<HashMap<Cow<'static, str>, u32>>, // For Deterministic strategy
+	#[cfg(feature = "logging")]
+	logger_config: Option<super::logging::LoggerConfig>,
 }
 
-impl TraceState {
-	fn new() -> Self {
+impl Default for TraceState {
+	fn default() -> Self {
 		Self {
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
@@ -263,9 +312,13 @@ impl TraceState {
 			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
 			#[cfg(feature = "testing-fault")]
 			fault_call_counters: Mutex::new(HashMap::new()),
+			#[cfg(feature = "logging")]
+			logger_config: None,
 		}
 	}
+}
 
+impl TraceState {
 	#[cfg(feature = "instrument")]
 	fn with_config(config: TbInstrumentationConfig) -> Self {
 		Self {
@@ -281,6 +334,8 @@ impl TraceState {
 			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
 			#[cfg(feature = "testing-fault")]
 			fault_call_counters: Mutex::new(HashMap::new()),
+			#[cfg(feature = "logging")]
+			logger_config: None,
 		}
 	}
 
@@ -302,14 +357,22 @@ impl TraceState {
 			fault_rng_state: Mutex::new(DEFAULT_FAULT_SEED),
 			#[cfg(feature = "testing-fault")]
 			fault_call_counters: Mutex::new(HashMap::new()),
+			#[cfg(feature = "logging")]
+			logger_config: None,
 		}
+	}
+}
+
+impl Default for TraceCollector {
+	fn default() -> Self {
+		Self { state: Arc::new(TraceState::default()) }
 	}
 }
 
 impl TraceCollector {
 	/// Create a new empty trace collector with default config
 	pub fn new() -> Self {
-		Self { state: Arc::new(TraceState::new()) }
+		Self::default()
 	}
 
 	/// Create an additional handle that observes and records the same state.
@@ -320,6 +383,19 @@ impl TraceCollector {
 	#[cfg(feature = "instrument")]
 	fn with_config(config: TbInstrumentationConfig) -> Self {
 		Self { state: Arc::new(TraceState::with_config(config)) }
+	}
+
+	/// Configure logging backend for this trace collector
+	///
+	/// Events can emit to the log backend by calling `.with_log_level()`.
+	/// If the logger config has a default level, it applies to all events
+	/// without an explicit log level.
+	#[cfg(feature = "logging")]
+	pub fn with_logger(mut self, config: super::logging::LoggerConfig) -> Self {
+		if let Some(state) = Arc::get_mut(&mut self.state) {
+			state.logger_config = Some(config);
+		}
+		self
 	}
 
 	/// Create a trace collector with fuzz oracle (CSP-guided fuzzing)
@@ -551,12 +627,6 @@ impl From<TraceConfig> for TraceCollector {
 		{
 			Self::new()
 		}
-	}
-}
-
-impl Default for TraceCollector {
-	fn default() -> Self {
-		Self::new()
 	}
 }
 

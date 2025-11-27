@@ -23,25 +23,22 @@ use tightbeam::{
 	prelude::*,
 	servlet,
 	testing::trace::TraceCollector,
+	trace::LogLevel,
 	transport::tcp::r#async::TokioListener,
 };
 
-use crate::{
-	debug_log,
-	dtn::{
-		certs::{
-			EARTH_RELAY_CERT, EARTH_RELAY_KEY, EARTH_RELAY_PINNING, MARS_RELAY_CERT, MARS_RELAY_KEY,
-			MARS_RELAY_PINNING, MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, MISSION_CONTROL_PINNING, ROVER_CERT,
-			ROVER_KEY, ROVER_PINNING,
-		},
-		chain_processor::{ChainProcessor, ProcessResult},
-		clock::mission_time_ms,
-		command_executor::CommandExecutor,
-		fault_manager::FaultManager,
-		frame_builder::FrameBuilderHelper,
-		messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverCommand},
-		utils::format_mission_time,
+use crate::dtn::{
+	certs::{
+		EARTH_RELAY_CERT, EARTH_RELAY_KEY, EARTH_RELAY_PINNING, MARS_RELAY_CERT, MARS_RELAY_KEY, MARS_RELAY_PINNING,
+		MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, MISSION_CONTROL_PINNING, ROVER_CERT, ROVER_KEY, ROVER_PINNING,
 	},
+	chain_processor::{ChainProcessor, ProcessResult},
+	clock::mission_time_ms,
+	command_executor::CommandExecutor,
+	fault_manager::FaultManager,
+	frame_builder::FrameBuilderHelper,
+	messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverCommand},
+	utils::format_mission_time,
 };
 
 // ============================================================================
@@ -279,10 +276,13 @@ servlet! {
 	handle: |frame, trace, config| async move {
 		// Verify signature using trait method
 		if !config.verify_signature(&frame)? {
-			debug_log!("[Mission Control] ✗ Signature verification FAILED");
+			trace
+				.event("[Mission Control] ✗ Signature verification FAILED")?
+				.with_log_level(LogLevel::Error)
+				.emit();
 			return Err(TightBeamError::MissingSignature);
 		}
-		debug_log!("[Mission Control] ✓ Signature verified");
+		trace.event("[Mission Control] ✓ Signature verified")?.with_log_level(LogLevel::Debug).emit();
 
 		// Process frame (persist, order, validate chain)
 		match config.chain_processor.process_incoming(frame.clone())? {
@@ -296,11 +296,14 @@ servlet! {
 						RelayMessage::Telemetry(telemetry) => {
 							trace.event("mission_control_receive_telemetry")?;
 
-							debug_log!(
-								"[{}] [Mission Control] Received telemetry (Battery: {}%)",
-								format_mission_time(mission_time_ms()),
-								telemetry.battery_percent
-							);
+							trace
+								.event(format!(
+									"[{}] [Mission Control] Received telemetry (Battery: {}%)",
+									format_mission_time(mission_time_ms()),
+									telemetry.battery_percent
+								))?
+								.with_log_level(LogLevel::Info)
+								.emit();
 
 							trace.event("mission_control_analyze_telemetry")?;
 
@@ -333,11 +336,14 @@ servlet! {
 									&config.shared_cipher,
 								)?;
 
-								debug_log!(
-									"[{}] [Mission Control] Sending command {} to Earth Relay",
-									format_mission_time(mission_time_ms()),
-									telemetry_count + 1
-								);
+								trace
+									.event(format!(
+										"[{}] [Mission Control] Sending command {} to Earth Relay",
+										format_mission_time(mission_time_ms()),
+										telemetry_count + 1
+									))?
+									.with_log_level(LogLevel::Info)
+									.emit();
 
 								// Send command via pooled client
 								config.send_frame(
@@ -347,18 +353,30 @@ servlet! {
 									command_frame,
 								).await?;
 
-								debug_log!("[Mission Control] ✓ Command {} sent", telemetry_count + 1);
+								trace
+									.event(format!("[Mission Control] ✓ Command {} sent", telemetry_count + 1))?
+									.with_log_level(LogLevel::Debug)
+									.emit();
 							} else {
-								debug_log!("[{}] [Mission Control] Mission complete, not sending more commands", format_mission_time(mission_time_ms()));
+								trace
+									.event(format!(
+										"[{}] [Mission Control] Mission complete, not sending more commands",
+										format_mission_time(mission_time_ms())
+									))?
+									.with_log_level(LogLevel::Info)
+									.emit();
 							}
 						},
 					RelayMessage::CommandAck(ack) => {
 						trace.event("mission_control_receive_ack")?;
-						debug_log!(
-							"[{}] [Mission Control] Received ACK for command order {}",
-							format_mission_time(mission_time_ms()),
-							ack.command_order
-						);
+						trace
+							.event(format!(
+								"[{}] [Mission Control] Received ACK for command order {}",
+								format_mission_time(mission_time_ms()),
+								ack.command_order
+							))?
+							.with_log_level(LogLevel::Info)
+							.emit();
 					},
 				RelayMessage::FrameRequest(request) => {
 					// Use trait method - Mission Control is origin so no cascade target
@@ -371,7 +389,7 @@ servlet! {
 					config.handle_frame_response(response, &trace)?;
 				},
 					RelayMessage::Command(_) => {
-						debug_log!("[Mission Control] Received unexpected Command message");
+						trace.event("[Mission Control] Received unexpected Command message")?.with_log_level(LogLevel::Warning).emit();
 					}
 				}
 				}
@@ -457,22 +475,37 @@ servlet! {
 		frame_builder: Arc<FrameBuilderHelper>,
 	},
 	handle: |frame, trace, config| async move {
-		debug_log!("[Earth Relay] Received frame with order: {}", frame.metadata.order);
+		trace
+			.event(format!("[Earth Relay] Received frame with order: {}", frame.metadata.order))?
+			.with_log_level(LogLevel::Debug)
+			.emit();
 
 		// Verify signature and determine source
 		let from_mission_control = if frame.nonrepudiation.is_some() {
 			if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
-				debug_log!("[Earth Relay] ✓ Mission Control signature verified (order: {})", frame.metadata.order);
+				trace
+					.event(format!("[Earth Relay] ✓ Mission Control signature verified (order: {})", frame.metadata.order))?
+					.with_log_level(LogLevel::Debug)
+					.emit();
 				true
 			} else if frame.verify::<Secp256k1Signature>(&config.rover_verifying_key).is_ok() {
-				debug_log!("[Earth Relay] ✓ Rover signature verified (order: {}) via Mars Relay", frame.metadata.order);
+				trace
+					.event(format!("[Earth Relay] ✓ Rover signature verified (order: {}) via Mars Relay", frame.metadata.order))?
+					.with_log_level(LogLevel::Debug)
+					.emit();
 				false
 		} else {
-			eprintln!("[Earth Relay] ✗ Signature verification FAILED (order: {})", frame.metadata.order);
+			trace
+				.event(format!("[Earth Relay] ✗ Signature verification FAILED (order: {})", frame.metadata.order))?
+				.with_log_level(LogLevel::Error)
+				.emit();
 			return Err(TightBeamError::MissingSignature);
 		}
 	} else {
-			eprintln!("[Earth Relay] ✗ No signature found (order: {})", frame.metadata.order);
+			trace
+				.event(format!("[Earth Relay] ✗ No signature found (order: {})", frame.metadata.order))?
+				.with_log_level(LogLevel::Error)
+				.emit();
 			return Err(TightBeamError::MissingSignature);
 		};
 
@@ -550,10 +583,12 @@ servlet! {
 							// Regular message - route based on source
 							if from_mission_control {
 								// Forward to Mars Relay using cached client
-								debug_log!("[Earth Relay] Recording trace events...");
 								trace.event("earth_relay_receive_from_mc")?;
 								trace.event("earth_relay_forward_to_mars")?;
-								debug_log!("[Earth Relay] Forwarding to Mars Relay...");
+								trace
+									.event("[Earth Relay] Forwarding to Mars Relay")?
+									.with_log_level(LogLevel::Debug)
+									.emit();
 
 								config.send_frame(
 									&config.connection_pool,
@@ -578,7 +613,13 @@ servlet! {
 									trace.event("earth_relay_forward_ack_to_mc")?;
 								}
 
-								debug_log!("[{}] [Earth Relay] Forwarding from Mars Relay to Mission Control", format_mission_time(mission_time_ms()));
+								trace
+									.event(format!(
+										"[{}] [Earth Relay] Forwarding from Mars Relay to Mission Control",
+										format_mission_time(mission_time_ms())
+									))?
+									.with_log_level(LogLevel::Debug)
+									.emit();
 
 								// Get Mission Control address (wait if not set yet)
 								let mc_addr = wait_for_address(&config.mission_control_addr).await?;
@@ -685,17 +726,17 @@ servlet! {
 		// Earth Relay forwards messages, so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation.is_some() {
 			if frame.verify::<Secp256k1Signature>(&config.rover_verifying_key).is_ok() {
-				debug_log!("[Mars Relay] ✓ Rover signature verified");
+				trace.event("[Mars Relay] ✓ Rover signature verified")?.with_log_level(LogLevel::Debug).emit();
 				true
 			} else if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
-				debug_log!("[Mars Relay] ✓ Mission Control signature verified (via Earth Relay)");
+				trace.event("[Mars Relay] ✓ Mission Control signature verified (via Earth Relay)")?.with_log_level(LogLevel::Debug).emit();
 				false
 			} else {
-				eprintln!("[Mars Relay] ✗ Signature verification FAILED");
+				trace.event("[Mars Relay] ✗ Signature verification FAILED")?.with_log_level(LogLevel::Error).emit();
 				return Err(TightBeamError::MissingSignature);
 			}
 		} else {
-			eprintln!("[Mars Relay] ✗ No signature found");
+			trace.event("[Mars Relay] ✗ No signature found")?.with_log_level(LogLevel::Error).emit();
 			return Err(TightBeamError::MissingSignature);
 		};
 
@@ -772,7 +813,10 @@ servlet! {
 						trace.event("mars_relay_forward_ack_to_earth")?;
 					}
 
-					debug_log!("[{}] [Mars Relay] Forwarding from Rover to Earth Relay", format_mission_time(mission_time_ms()));
+					trace
+						.event(format!("[{}] [Mars Relay] Forwarding from Rover to Earth Relay", format_mission_time(mission_time_ms())))?
+						.with_log_level(LogLevel::Debug)
+						.emit();
 
 					// Get Earth Relay address (wait if not set yet)
 					let earth_addr = wait_for_address(&config.earth_relay_addr).await?;
@@ -792,19 +836,24 @@ servlet! {
 					// Forward to Rover using cached client
 					trace.event("mars_relay_receive_from_earth")?;
 					trace.event("mars_relay_forward_to_rover")?;
-					debug_log!("[{}] [Mars Relay] Forwarding from Earth Relay to Rover", format_mission_time(mission_time_ms()));
+					trace
+						.event(format!("[{}] [Mars Relay] Forwarding from Earth Relay to Rover", format_mission_time(mission_time_ms())))?
+						.with_log_level(LogLevel::Debug)
+						.emit();
 
-					debug_log!("[Mars Relay] Emitting frame to Rover...");
 					let response = config.send_frame(
 						&config.connection_pool,
 						config.rover_addr,
 						ROVER_CERT,
 						frame,
 					).await?;
-					debug_log!("[Mars Relay] Response from Rover: {:?}", response.is_some());
+					trace
+						.event(format!("[Mars Relay] Response from Rover: {:?}", response.is_some()))?
+						.with_log_level(LogLevel::Debug)
+						.emit();
 
 					if let Some(ack_frame) = response {
-						debug_log!("[Mars Relay] Rover sent ACK, processing...");
+						trace.event("[Mars Relay] Rover sent ACK, processing")?.with_log_level(LogLevel::Debug).emit();
 						// Process Rover's ACK into chain and forward to Earth Relay
 						config.chain_processor.process_incoming(ack_frame.clone())?;
 
@@ -821,7 +870,7 @@ servlet! {
 							EARTH_RELAY_CERT,
 							ack_frame,
 						).await?;
-						debug_log!("[Mars Relay] ACK forwarded to Earth Relay");
+						trace.event("[Mars Relay] ACK forwarded to Earth Relay")?.with_log_level(LogLevel::Debug).emit();
 					}
 
 					// Fire-and-forget (no response to Earth Relay)
@@ -923,16 +972,19 @@ servlet! {
 		max_rounds: usize,
 	},
 	handle: |frame, trace, config| async move {
-		debug_log!("[{}] [Rover] Received frame", format_mission_time(mission_time_ms()));
+		trace
+			.event(format!("[{}] [Rover] Received frame", format_mission_time(mission_time_ms())))?
+			.with_log_level(LogLevel::Debug)
+			.emit();
 
 		// Verify signature (Mars Relay forwards messages, so could be from Mission Control)
 		if frame.nonrepudiation.is_some() {
 			if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
-				debug_log!("[Rover] ✓ Mission Control signature verified (via relays)");
+				trace.event("[Rover] ✓ Mission Control signature verified (via relays)")?.with_log_level(LogLevel::Debug).emit();
 			} else if frame.verify::<Secp256k1Signature>(&config.mars_relay_verifying_key).is_ok() {
-				debug_log!("[Rover] ✓ Mars Relay signature verified");
+				trace.event("[Rover] ✓ Mars Relay signature verified")?.with_log_level(LogLevel::Debug).emit();
 			} else {
-				eprintln!("[Rover] ✗ Signature verification FAILED");
+				trace.event("[Rover] ✗ Signature verification FAILED")?.with_log_level(LogLevel::Error).emit();
 				return Err(TightBeamError::MissingSignature);
 			}
 		}
@@ -943,10 +995,16 @@ servlet! {
 		// Process frame through Rover's chain
 		match config.chain_processor.process_incoming(frame.clone())? {
 			ProcessResult::Processed(_) => {
-				debug_log!("[{}] [Rover] Frame added to global chain", format_mission_time(mission_time_ms()));
+				trace
+					.event(format!("[{}] [Rover] Frame added to global chain", format_mission_time(mission_time_ms())))?
+					.with_log_level(LogLevel::Debug)
+					.emit();
 			},
 			ProcessResult::Buffered => {
-				debug_log!("[{}] [Rover] Frame buffered", format_mission_time(mission_time_ms()));
+				trace
+					.event(format!("[{}] [Rover] Frame buffered", format_mission_time(mission_time_ms())))?
+					.with_log_level(LogLevel::Debug)
+					.emit();
 				return Ok(None);
 			},
 			ProcessResult::ChainGap { current_head, missing_hash } => {
@@ -969,12 +1027,18 @@ servlet! {
 		// Process the RelayMessage
 		match relay_message {
 			RelayMessage::Command(command) => {
-				debug_log!("[{}] [Rover] Received command", format_mission_time(mission_time_ms()));
+				trace
+					.event(format!("[{}] [Rover] Received command", format_mission_time(mission_time_ms())))?
+					.with_log_level(LogLevel::Info)
+					.emit();
 				trace.event("rover_receive_command")?;
 
 				// Execute command
 				let cmd_type = RoverCommand::try_from(command.command_type)?;
-				debug_log!("[{}] [Rover] Executing command: {}", format_mission_time(mission_time_ms()), cmd_type);
+				trace
+					.event(format!("[{}] [Rover] Executing command: {}", format_mission_time(mission_time_ms()), cmd_type))?
+					.with_log_level(LogLevel::Info)
+					.emit();
 
 				trace.event("rover_execute_command")?;
 				config.command_executor.write()?.execute_command(cmd_type, &trace)?;
@@ -985,14 +1049,22 @@ servlet! {
 					let mut state = config.mission_state.write()?;
 					state.completed_rounds += 1;
 
-					debug_log!("[{}] [Rover] Command {}/{} executed",
-						format_mission_time(mission_time_ms()),
-						state.completed_rounds,
-						config.max_rounds);
+					trace
+						.event(format!(
+							"[{}] [Rover] Command {}/{} executed",
+							format_mission_time(mission_time_ms()),
+							state.completed_rounds,
+							config.max_rounds
+						))?
+						.with_log_level(LogLevel::Info)
+						.emit();
 
 					if state.completed_rounds >= config.max_rounds {
 						state.mission_complete = true;
-						debug_log!("[{}] [Rover] ✓ Mission complete!", format_mission_time(mission_time_ms()));
+						trace
+							.event(format!("[{}] [Rover] ✓ Mission complete!", format_mission_time(mission_time_ms())))?
+							.with_log_level(LogLevel::Info)
+							.emit();
 					}
 				}
 
@@ -1007,11 +1079,14 @@ servlet! {
 				)?;
 
 				trace.event("rover_send_ack")?;
-				debug_log!(
-					"[{}] [Rover] Returning stateful ACK for command order {}",
-					format_mission_time(mission_time_ms()),
-					command_order
-				);
+				trace
+					.event(format!(
+						"[{}] [Rover] Returning stateful ACK for command order {}",
+						format_mission_time(mission_time_ms()),
+						command_order
+					))?
+					.with_log_level(LogLevel::Debug)
+					.emit();
 
 				// Return stateful ACK as response
 				Ok(Some(ack_frame))
@@ -1049,7 +1124,10 @@ servlet! {
 				config.process_frame_response(response, command_order, &trace)
 			},
 			RelayMessage::Telemetry(_) | RelayMessage::CommandAck(_) => {
-				debug_log!("[{}] [Rover] Received unexpected RelayMessage type (Telemetry/ACK)", format_mission_time(mission_time_ms()));
+				trace
+					.event(format!("[{}] [Rover] Received unexpected RelayMessage type (Telemetry/ACK)", format_mission_time(mission_time_ms())))?
+					.with_log_level(LogLevel::Warning)
+					.emit();
 				Ok(None)
 			}
 		}

@@ -514,7 +514,7 @@ async fn send_telemetry_to_mars_relay(
 	);
 
 	// Send telemetry to Mars Relay (gets stateless ACK back)
-	let _stateless_ack = rover_client.emit(rover_frame, None).await?;
+	rover_client.emit(rover_frame, None).await?;
 
 	Ok(())
 }
@@ -550,6 +550,7 @@ async fn run_mission_loop(
 			panic!("Timeout waiting for first command to arrive");
 		}
 	}
+
 	debug_log!("[Rover Mission Loop] First command received and executed. Starting telemetry loop.\n");
 
 	// Loop exactly COMMAND_ROUND_TRIPS times (6 rounds)

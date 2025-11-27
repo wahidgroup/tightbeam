@@ -27,6 +27,7 @@ pub struct DtnPayload {
 /// This demonstrates tightbeam's ability to inject arbitrary error types
 /// during testing via the InjectedError trait.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NetworkPartition {
 	pub from_node: String,
 	pub to_node: String,
@@ -45,6 +46,7 @@ impl core::fmt::Display for NetworkPartition {
 
 /// Data corruption error (custom fault type)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DataCorruption {
 	pub bytes_affected: usize,
 }
@@ -57,6 +59,7 @@ impl core::fmt::Display for DataCorruption {
 
 /// Link delay error (custom fault type)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LinkDelay {
 	pub delay_ms: u64,
 }

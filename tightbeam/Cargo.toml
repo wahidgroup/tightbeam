@@ -102,6 +102,7 @@ full = [
 	"testing-fmea",
 	"testing-timing",
 	"instrument",
+	"logging",
 	"rayon",
 	"colony",
 ]
@@ -129,6 +130,8 @@ testing-fmea = ["testing", "testing-fault"]
 testing-fuzz = ["testing", "dep:afl"]
 testing-fuzz-ijon = ["testing-fuzz"]
 instrument = ["std", "sha3"]
+logging = []
+logging-stdout = ["logging", "std"]
 
 # TODO
 bitcoin = ["dep:k256"]
