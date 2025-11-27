@@ -28,8 +28,7 @@ use tightbeam::{
 	der::Sequence,
 	macros::client::builder::ClientBuilder,
 	servlet,
-	testing::trace::TraceCollector,
-	trace::TraceConfig,
+	testing::{trace::TraceCollector, ScenarioConf},
 	transport::{tcp::r#async::TokioListener, Client, ConnectionPool, PoolConfig},
 	Beamable,
 };
@@ -185,8 +184,9 @@ fn create_pool<const N: usize>() -> Arc<ConnectionPool<TokioListener, N>> {
 
 tightbeam::tb_scenario! {
 	name: tcp_connection_reuse,
-	spec: ConnectionReuseSpec,
-	trace: TraceConfig::default(),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ConnectionReuseSpec::latest())
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			tokio::runtime::Runtime::new()?.block_on(async {
@@ -237,8 +237,9 @@ tightbeam::tb_scenario! {
 ))]
 tightbeam::tb_scenario! {
 	name: tls_connection_reuse,
-	spec: ConnectionReuseSpec,
-	trace: TraceConfig::default(),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ConnectionReuseSpec::latest())
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			tokio::runtime::Runtime::new()?.block_on(async {
@@ -303,22 +304,20 @@ tightbeam::tb_scenario! {
 ))]
 tightbeam::tb_scenario! {
 	name: connection_pool_reuse,
-	spec: PoolReuseSpec,
-	trace: TraceConfig::default(),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(PoolReuseSpec::latest())
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			tokio::runtime::Runtime::new()?.block_on(async {
-				// Import DTN certs for realistic testing
-				use crate::dtn::certs::{EARTH_RELAY_CERT, EARTH_RELAY_KEY, EARTH_RELAY_PINNING, MARS_RELAY_CERT, MARS_RELAY_KEY};
-
 				// Start echo servlet with TLS
 				servlet! {
 					PoolEchoServlet<TestMessage>,
 					protocol: TokioListener,
 					x509: {
-						certificate: EARTH_RELAY_CERT,
-						key_provider: EARTH_RELAY_KEY,
-						client_validators: [EARTH_RELAY_PINNING]
+						certificate: SERVER_CERT,
+						key_provider: SERVER_KEY,
+						client_validators: [CLIENT_PINNING]
 					},
 					config: {
 						message_count: Arc<AtomicUsize>,
@@ -345,8 +344,8 @@ tightbeam::tb_scenario! {
 					trace.event("acquire_client")?;
 					let mut client = pool
 						.connect(server_addr)
-						.with_server_certificate(EARTH_RELAY_CERT)?
-						.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
+						.with_server_certificate(SERVER_CERT)?
+						.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 						.with_timeout(Duration::from_millis(1000))
 						.build()
 						.await?;
@@ -383,20 +382,19 @@ tightbeam::tb_scenario! {
 ))]
 tightbeam::tb_scenario! {
 	name: pool_per_destination_isolation,
-	spec: PoolReuseSpec,
-	trace: TraceConfig::default(),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(PoolReuseSpec::latest())
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			tokio::runtime::Runtime::new()?.block_on(async {
-				use crate::dtn::certs::{EARTH_RELAY_CERT, EARTH_RELAY_KEY, EARTH_RELAY_PINNING, MARS_RELAY_CERT, MARS_RELAY_KEY};
-
 				servlet! {
 					IsolationServlet<TestMessage>,
 					protocol: TokioListener,
 					x509: {
-						certificate: EARTH_RELAY_CERT,
-						key_provider: EARTH_RELAY_KEY,
-						client_validators: [EARTH_RELAY_PINNING]
+						certificate: SERVER_CERT,
+						key_provider: SERVER_KEY,
+						client_validators: [CLIENT_PINNING]
 					},
 					config: {
 						message_count: Arc<AtomicUsize>,
@@ -426,8 +424,8 @@ tightbeam::tb_scenario! {
 					trace.event("acquire_client")?;
 					let mut client = pool
 						.connect(addr)
-						.with_server_certificate(EARTH_RELAY_CERT)?
-						.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
+						.with_server_certificate(SERVER_CERT)?
+						.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 						.build()
 						.await?;
 
@@ -462,20 +460,19 @@ tightbeam::tb_scenario! {
 ))]
 tightbeam::tb_scenario! {
 	name: pool_concurrent_access,
-	spec: PoolReuseSpec,
-	trace: TraceConfig::default(),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(PoolReuseSpec::latest())
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			tokio::runtime::Runtime::new()?.block_on(async {
-				use crate::dtn::certs::{EARTH_RELAY_CERT, EARTH_RELAY_KEY, EARTH_RELAY_PINNING, MARS_RELAY_CERT, MARS_RELAY_KEY};
-
 				servlet! {
 					ConcurrentServlet<TestMessage>,
 					protocol: TokioListener,
 					x509: {
-						certificate: EARTH_RELAY_CERT,
-						key_provider: EARTH_RELAY_KEY,
-						client_validators: [EARTH_RELAY_PINNING]
+						certificate: SERVER_CERT,
+						key_provider: SERVER_KEY,
+						client_validators: [CLIENT_PINNING]
 					},
 					config: {
 						message_count: Arc<AtomicUsize>,
@@ -502,8 +499,8 @@ tightbeam::tb_scenario! {
 					trace.event("acquire_client")?;
 					let mut client = pool
 						.connect(server_addr)
-						.with_server_certificate(EARTH_RELAY_CERT)?
-						.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
+						.with_server_certificate(SERVER_CERT)?
+						.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 						.build()
 						.await?;
 

@@ -44,38 +44,42 @@ use tightbeam::{
 	macros::client::builder::{ClientBuilder, GenericClient},
 	prelude::*,
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
-	testing::{fdr::FdrConfig, specs::composition::CompositionSpec},
-	trace::TraceCollector,
+	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, ScenarioConf},
+	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector},
 	transport::tcp::r#async::TokioListener,
 };
 
-use crate::{
-	debug_log,
-	dtn::{
-		bms::BatteryManagementSystem,
-		certs::{
-			earth_relay_verifying_key, generate_shared_cipher, mars_relay_verifying_key, mission_control_verifying_key,
-			rover_verifying_key, EARTH_RELAY_CERT, EARTH_RELAY_KEY, MARS_RELAY_CERT, MARS_RELAY_KEY,
-			MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, ROVER_CERT, ROVER_KEY,
-		},
-		chain_processor::ChainProcessor,
-		clock::{advance_clock, delays, init_mission_clock, mission_time_ms},
-		command_executor::CommandExecutor,
-		fault_manager::{BatteryUpdate, FaultManager},
-		fault_matrix::FaultMatrix,
-		faults::RoverFaultHandler,
-		frame_builder::FrameBuilderHelper,
-		messages::{EarthCommand, MessageChainState, RoverCommand, RoverTelemetry},
-		ordering::OutOfOrderBuffer,
-		servlets::{
-			EarthRelaySatelliteServlet, EarthRelaySatelliteServletConf, MarsRelaySatelliteServlet,
-			MarsRelaySatelliteServletConf, MissionControlServlet, MissionControlServletConf, MissionState,
-			RoverServlet, RoverServletConf,
-		},
-		storage::FrameStore,
-		utils::format_mission_time,
+use crate::dtn::{
+	bms::BatteryManagementSystem,
+	certs::{
+		earth_relay_verifying_key, generate_shared_cipher, mars_relay_verifying_key, mission_control_verifying_key,
+		rover_verifying_key, EARTH_RELAY_CERT, EARTH_RELAY_KEY, MARS_RELAY_CERT, MARS_RELAY_KEY, MISSION_CONTROL_CERT,
+		MISSION_CONTROL_KEY, ROVER_CERT, ROVER_KEY,
 	},
+	chain_processor::ChainProcessor,
+	clock::{advance_clock, delays, init_mission_clock, mission_time_ms},
+	command_executor::CommandExecutor,
+	fault_manager::{BatteryUpdate, FaultManager},
+	fault_matrix::FaultMatrix,
+	faults::RoverFaultHandler,
+	frame_builder::FrameBuilderHelper,
+	messages::{EarthCommand, MessageChainState, RoverCommand, RoverTelemetry},
+	ordering::OutOfOrderBuffer,
+	servlets::{
+		EarthRelaySatelliteServlet, EarthRelaySatelliteServletConf, MarsRelaySatelliteServlet,
+		MarsRelaySatelliteServletConf, MissionControlServlet, MissionControlServletConf, MissionState, RoverServlet,
+		RoverServletConf,
+	},
+	storage::FrameStore,
 };
+
+// ============================================================================
+// Debug Logging (No-op for now - servlets use real logging)
+// ============================================================================
+
+macro_rules! debug_log {
+	($($arg:tt)*) => {};
+}
 
 // ============================================================================
 // DTN Scenario Configuration
@@ -506,13 +510,6 @@ async fn send_telemetry_to_mars_relay(
 		shared_cipher,
 	)?;
 
-	debug_log!(
-		"  [{}] [Rover] Sending {} telemetry (Battery: {}%) [ENCRYPTED]",
-		format_mission_time(mission_time_ms()),
-		name,
-		battery
-	);
-
 	// Send telemetry to Mars Relay (gets stateless ACK back)
 	rover_client.emit(rover_frame, None).await?;
 
@@ -692,9 +689,17 @@ fn build_dtn_fdr_config() -> FdrConfig {
 
 tb_scenario! {
 	name: dtn_ultimate_realistic,
-	spec: DtnEventCountSpec,
-	csp: DtnComposedSystem,
-	config: DtnScenarioConfig::default(),
+	config: ScenarioConf::<DtnScenarioConfig>::builder()
+		.with_spec(DtnEventCountSpec::latest())
+		.with_csp(DtnComposedSystem::default())
+		.with_trace(TraceCollector::default().with_logger(
+			LoggerConfig::new(
+				Box::new(StdoutBackend::default()),
+				LogFilter::new(LogLevel::Debug)
+			).with_default_level(LogLevel::Debug)
+		))
+		.with_env_config(DtnScenarioConfig::default())
+		.build(),
 	environment Servlet {
 		servlet: RoverServlet,
 		start: |trace, config| async move {
@@ -707,10 +712,10 @@ tb_scenario! {
 			// ================================================================
 			// SHARED COMPONENTS (from scenario config)
 			// ================================================================
-			let shared_cipher = config.read()?.shared_cipher.to_owned();
-			let rover_signing_key = config.read()?.rover_signing_key.to_owned();
-			let shared_mission_state = Arc::clone(&config.read()?.mission_state);
-			let rover_processor = Arc::clone(&config.read()?.rover_chain_processor);
+			let shared_cipher = config.shared_cipher.to_owned();
+			let rover_signing_key = config.rover_signing_key.to_owned();
+			let shared_mission_state = Arc::clone(&config.mission_state);
+			let rover_processor = Arc::clone(&config.rover_chain_processor);
 
 			// Verifying keys (shared across servlets)
 			let mc_verifying_key = mission_control_verifying_key();
@@ -779,14 +784,11 @@ tb_scenario! {
 
 			debug_log!("[START] Starting Rover servlet");
 
-			let rover_fault_manager = {
-				let config_guard = config.read()?;
-				Arc::new(FaultManager::from_refs(
-					&config_guard.bms,
-					&config_guard.fault_matrix,
-					&config_guard.rover_fault_handler,
-				))
-			};
+			let rover_fault_manager = Arc::new(FaultManager::from_refs(
+				&config.bms,
+				&config.fault_matrix,
+				&config.rover_fault_handler,
+			));
 
 			let rover_command_executor = Arc::new(RwLock::new(CommandExecutor::default()));
 			let rover_config = RoverServletConf {
@@ -810,7 +812,7 @@ tb_scenario! {
 			debug_log!("[START] Rover servlet started at {:?}", rover_addr);
 
 			// Store rover address
-			config.write()?.rover_addr.write()?.replace(rover_addr);
+			config.rover_addr.write()?.replace(rover_addr);
 
 			// ================================================================
 			// 2. START MARS RELAY SERVLET
@@ -847,11 +849,8 @@ tb_scenario! {
 			debug_log!("[START] Mars Relay started at {:?}", mars_relay_addr);
 
 			// Store Mars Relay servlet and address
-			{
-				let config_guard = config.write()?;
-				config_guard._mars_relay_servlet.write()?.replace(mars_relay_servlet);
-				config_guard.mars_relay_addr.write()?.replace(mars_relay_addr);
-			}
+			config._mars_relay_servlet.write()?.replace(mars_relay_servlet);
+			config.mars_relay_addr.write()?.replace(mars_relay_addr);
 
 			// ================================================================
 			// 3. START EARTH RELAY SERVLET
@@ -892,11 +891,8 @@ tb_scenario! {
 			debug_log!("[START] Mars Relay's earth_relay_addr updated");
 
 			// Store Earth Relay servlet and address
-			{
-				let config_guard = config.write()?;
-				config_guard._earth_relay_servlet.write()?.replace(earth_relay_servlet);
-				config_guard.earth_relay_addr.write()?.replace(earth_relay_addr);
-			}
+			config._earth_relay_servlet.write()?.replace(earth_relay_servlet);
+			config.earth_relay_addr.write()?.replace(earth_relay_addr);
 
 			// ================================================================
 			// 4. START MISSION CONTROL SERVLET
@@ -927,11 +923,8 @@ tb_scenario! {
 			debug_log!("[START] Earth Relay's mission_control_addr updated");
 
 			// Store Mission Control servlet and address
-			{
-				let config_guard = config.write()?;
-				config_guard._mission_control_servlet.write()?.replace(mc_servlet);
-				config_guard.mission_control_addr.write()?.replace(mc_addr);
-			}
+			config._mission_control_servlet.write()?.replace(mc_servlet);
+			config.mission_control_addr.write()?.replace(mc_addr);
 
 			debug_log!("[START] All servlets started successfully");
 
@@ -982,10 +975,10 @@ tb_scenario! {
 
 			Ok(rover_servlet)
 		},
-		setup: |rover_addr, config| async move {
+		setup: |rover_addr, config: Arc<DtnScenarioConfig>| async move {
 			debug_log!("[Setup] Rover servlet address: {:?}", rover_addr);
 
-			let mars_relay_addr = (*config.read()?.mars_relay_addr.read()?)
+			let mars_relay_addr = (*config.mars_relay_addr.read()?)
 				.expect("Mars Relay address must be set before setup");
 
 			debug_log!("[Setup] Mars Relay address found: {:?}", mars_relay_addr);
@@ -1008,19 +1001,15 @@ tb_scenario! {
 			debug_log!("[Rover Mission Loop] Started - sends telemetry, RoverServlet handles commands asynchronously\n");
 
 		// Get components from config
-		let (rover_processor, rover_fault_manager, rover_signing_key, shared_cipher, shared_mission_state) = {
-			let config_guard = config.read()?;
-			let rover_processor = Arc::clone(&config_guard.rover_chain_processor);
-			let rover_fault_manager = Arc::new(FaultManager::from_refs(
-				&config_guard.bms,
-				&config_guard.fault_matrix,
-				&config_guard.rover_fault_handler,
-			));
-			let rover_signing_key = config_guard.rover_signing_key.to_owned();
-			let shared_cipher = config_guard.shared_cipher.to_owned();
-			let shared_mission_state = Arc::clone(&config_guard.mission_state);
-			(rover_processor, rover_fault_manager, rover_signing_key, shared_cipher, shared_mission_state)
-		};
+		let rover_processor = Arc::clone(&config.rover_chain_processor);
+		let rover_fault_manager = Arc::new(FaultManager::from_refs(
+			&config.bms,
+			&config.fault_matrix,
+			&config.rover_fault_handler,
+		));
+		let rover_signing_key = config.rover_signing_key.to_owned();
+		let shared_cipher = config.shared_cipher.to_owned();
+		let shared_mission_state = Arc::clone(&config.mission_state);
 		let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
 
 		// Run mission loop (sends telemetry to Mars Relay)

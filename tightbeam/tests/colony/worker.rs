@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use tightbeam::der::Sequence;
+use tightbeam::testing::ScenarioConf;
 use tightbeam::Beamable;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, worker};
 
@@ -66,9 +67,11 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_worker_with_config,
-	specs: [WorkerSpec::get(2, 0, 0)],
+	config: ScenarioConf::<()>::builder()
+		.with_specs(vec![WorkerSpec::get(2, 0, 0).expect("WorkerSpec 2.0.0")])
+		.build(),
 	environment Worker {
-		worker: || {
+		setup: |_trace| {
 			ConfigurableWorker::from(ConfigurableWorkerConf {
 				response: "CUSTOM_RESPONSE".to_string(),
 			})
@@ -93,9 +96,11 @@ tb_scenario! {
 
 tb_scenario! {
 	name: test_worker_with_type,
-	specs: [WorkerSpec::get(1, 0, 0)],
+	config: ScenarioConf::<()>::builder()
+		.with_specs(vec![WorkerSpec::get(1, 0, 0).expect("WorkerSpec 1.0.0")])
+		.build(),
 	environment Worker {
-	worker: DefaultWorker,
+	setup: |_trace| DefaultWorker::default(),
 	stimulus: |trace, worker| async move {
 		trace.event_with("relay_start", &[], ())?;
 

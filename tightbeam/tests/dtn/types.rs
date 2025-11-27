@@ -4,12 +4,7 @@ use tightbeam::der::Sequence;
 use tightbeam::Beamable;
 use tightbeam::TightBeamError;
 
-/// DTN payload for multi-hop communication
-///
-/// This message type demonstrates tightbeam's self-contained nature:
-/// - No custody transfer protocol needed
-/// - No trusted intermediaries required
-/// - Cryptographic chain in metadata provides verification
+/// DTN payload for multi-hop communication (used in tests)
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 pub struct DtnPayload {
 	/// Payload content

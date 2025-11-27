@@ -26,7 +26,7 @@ use tightbeam::{
 	macros::client::builder::ClientBuilder,
 	prelude::*,
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{assertions::Presence, macros::IsSome},
+	testing::{assertions::Presence, macros::IsSome, ScenarioConf},
 	transport::tcp::r#async::TokioListener,
 	Beamable,
 };
@@ -136,7 +136,9 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_mutual_auth_with_servlet,
-	spec: MutualAuthSpec,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(MutualAuthSpec::latest())
+		.build(),
 	environment Servlet {
 		servlet: MutualAuthServlet,
 		start: |trace, _config| async move {

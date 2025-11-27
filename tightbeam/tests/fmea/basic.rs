@@ -1,10 +1,11 @@
 #![cfg(feature = "testing-fmea")]
 
-use tightbeam::testing::fdr::FdrConfig;
+use tightbeam::error::TightBeamError;
+use tightbeam::testing::fdr::{FdrConfig, FdrVerdict};
 use tightbeam::testing::fmea::{FmeaConfig, SeverityScale};
-use tightbeam::testing::FaultModel;
+use tightbeam::testing::{FaultModel, ScenarioConf, TestHooks};
 use tightbeam::utils::BasisPoints;
-use tightbeam::{tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario, TightBeamError};
+use tightbeam::{tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
 
 use safety_process::{Event, States};
 
@@ -67,9 +68,7 @@ fn create_test_config(scale: SeverityScale) -> FdrConfig {
 	}
 }
 
-fn verify_fmea_report(
-	verdict_opt: &Option<tightbeam::testing::fdr::FdrVerdict>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_fmea_report(verdict_opt: &Option<FdrVerdict>) -> Result<(), Box<dyn std::error::Error>> {
 	let verdict = verdict_opt.as_ref().ok_or("No FDR verdict")?;
 	let fmea = verdict.fmea_report.as_ref().ok_or("FMEA report not generated")?;
 
@@ -81,8 +80,17 @@ fn verify_fmea_report(
 
 tb_scenario! {
 	name: test_fmea_mil_std,
-	spec: FmeaTestSpec,
-	fdr: create_test_config(SeverityScale::MilStd1629),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(FmeaTestSpec::latest())
+		.with_fdr(create_test_config(SeverityScale::MilStd1629))
+		.with_hooks(TestHooks {
+			on_pass: Some(std::sync::Arc::new(|result| {
+				verify_fmea_report(&result.fdr_verdict).expect("FMEA verification failed");
+				Ok(())
+			})),
+			on_fail: None,
+		})
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			trace.event("sensor_read")?;
@@ -90,16 +98,22 @@ tb_scenario! {
 			trace.event("actuate")?;
 			Ok(())
 		}
-	},
-	hooks {
-		on_pass: |_trace, result| verify_fmea_report(&result.fdr_verdict)
 	}
 }
 
 tb_scenario! {
 	name: test_fmea_iso26262,
-	spec: FmeaTestSpec,
-	fdr: create_test_config(SeverityScale::Iso26262),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(FmeaTestSpec::latest())
+		.with_fdr(create_test_config(SeverityScale::Iso26262))
+		.with_hooks(TestHooks {
+			on_pass: Some(std::sync::Arc::new(|result| {
+				verify_fmea_report(&result.fdr_verdict).expect("FMEA verification failed");
+				Ok(())
+			})),
+			on_fail: None,
+		})
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			trace.event("sensor_read")?;
@@ -107,8 +121,5 @@ tb_scenario! {
 			trace.event("actuate")?;
 			Ok(())
 		}
-	},
-	hooks {
-		on_pass: |_trace, result| verify_fmea_report(&result.fdr_verdict)
 	}
 }

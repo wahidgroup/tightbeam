@@ -571,6 +571,7 @@ mod tests {
 
 	use super::*;
 	use crate::testing::create_test_message;
+	use crate::testing::{ScenarioConf, TestHooks};
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;
@@ -977,8 +978,10 @@ mod tests {
 
 	tb_scenario! {
 		name: test_csp_with_bare_environment,
-		spec: SimpleBareFlowSpec,
-		csp: SimpleBareFlowProc,
+		config: ScenarioConf::<()>::builder()
+			.with_spec(SimpleBareFlowSpec::latest())
+			.with_csp(SimpleBareFlowProc)
+			.build(),
 		environment Bare {
 		exec: |trace| {
 			trace.event("step1")?;
@@ -1025,8 +1028,20 @@ mod tests {
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	crate::tb_scenario! {
 		name: test_csp_process_with_assert_spec_integration,
-		spec: ClientServerFlowSpec,
-		csp: ClientServerFlowProc,
+		config: ScenarioConf::<()>::builder()
+			.with_spec(ClientServerFlowSpec::latest())
+			.with_csp(ClientServerFlowProc)
+			.with_hooks(TestHooks {
+				on_pass: Some(std::sync::Arc::new(|_result| {
+					// Hook called - assertions already validated by spec
+					HOOK_CALLED.store(true, Ordering::SeqCst);
+					Ok(())
+				})),
+				on_fail: Some(std::sync::Arc::new(|_result, violation| {
+					panic!("Test should not fail! Violation: {violation:?}")
+				})),
+			})
+			.build(),
 		environment ServiceClient {
 			worker_threads: 2,
 			server: |trace| async move {
@@ -1062,16 +1077,6 @@ mod tests {
 
 				Ok(())
 			}
-		},
-		hooks {
-			on_pass: |_trace, _result| {
-				// Hook called - assertions already validated by spec
-				HOOK_CALLED.store(true, Ordering::SeqCst);
-				Ok(())
-			},
-			on_fail: |_trace, result| {
-				Err(format!("Test should not fail! Result: {result:?}").into())
-			}
 		}
 	}
 
@@ -1092,8 +1097,10 @@ mod tests {
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	tb_scenario! {
 		name: test_servlet_environment_integration,
-		spec: ClientServerFlowSpec,
-		csp: ClientServerFlowProc,
+		config: ScenarioConf::<()>::builder()
+			.with_spec(ClientServerFlowSpec::latest())
+			.with_csp(ClientServerFlowProc)
+			.build(),
 		environment ServiceClient {
 			worker_threads: 1,
 			server: |trace| async move {

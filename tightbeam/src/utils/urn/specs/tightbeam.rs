@@ -123,6 +123,7 @@ impl UrnSpec for TightbeamUrnSpec {
 mod tests {
 	use super::*;
 	use crate::builder::TypeBuilder;
+	use crate::testing::ScenarioConf;
 	use crate::utils::urn::UrnBuilder;
 
 	#[cfg(feature = "testing")]
@@ -258,7 +259,9 @@ mod tests {
 	#[cfg(feature = "testing")]
 	tb_scenario! {
 		name: test_tightbeam_urn_with_spec,
-		spec: TightbeamUrnSpecSpec,
+		config: ScenarioConf::<()>::builder()
+			.with_spec(TightbeamUrnSpecSpec::latest())
+			.build(),
 		environment Bare {
 			exec: |trace| {
 				let urn = UrnBuilder::from(TightbeamUrnSpec)

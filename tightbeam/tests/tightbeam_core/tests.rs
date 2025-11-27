@@ -14,6 +14,7 @@ use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
 use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
+use tightbeam::testing::ScenarioConf;
 use tightbeam::utils;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
@@ -209,12 +210,14 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: version_check_all,
-	specs: [
-		VersionSpec::get(0, 0, 0),
-		VersionSpec::get(1, 0, 0),
-		VersionSpec::get(2, 0, 0),
-		VersionSpec::get(3, 0, 0)
-	],
+	config: ScenarioConf::<()>::builder()
+		.with_specs(vec![
+			VersionSpec::get(0, 0, 0).expect("VersionSpec 0.0.0"),
+			VersionSpec::get(1, 0, 0).expect("VersionSpec 1.0.0"),
+			VersionSpec::get(2, 0, 0).expect("VersionSpec 2.0.0"),
+			VersionSpec::get(3, 0, 0).expect("VersionSpec 3.0.0")
+		])
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			let message = TestMessage { content: "Hello from workflow".to_string() };

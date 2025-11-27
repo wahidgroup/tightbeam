@@ -116,8 +116,10 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
-	spec: VerificationSpec,
-	csp: VerificationProcess,
+	config: tightbeam::testing::ScenarioConf::<()>::builder()
+		.with_spec(VerificationSpec::latest())
+		.with_csp(VerificationProcess)
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			use std::fs;
@@ -167,7 +169,7 @@ tb_scenario! {
 			trace.event_with("binary_has_afl_runtime", &[], has_afl_runtime);
 
 			// Proof 5: Oracle Methods - Test actual oracle functionality
-			let oracle = trace.oracle();
+			let oracle = trace.as_ref().oracle();
 			let coverage = oracle.coverage_score();
 			trace.event_with("coverage_score", &[], coverage > 0);
 

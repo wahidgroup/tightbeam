@@ -4,6 +4,7 @@
 //! compilation errors early when introducing new declarative APIs.
 
 pub mod assertions;
+pub mod config;
 pub mod error;
 pub mod export;
 pub mod macros;
@@ -26,6 +27,7 @@ pub mod schedulability;
 pub mod timing;
 
 // Re-exports
+pub use config::{HookContext, ScenarioConf, ScenarioConfBuilder, TestHooks};
 pub use export::ScenarioResultExport;
 pub use result::ScenarioResult;
 pub use specs::{verify_trace, SpecViolation, TBSpec};

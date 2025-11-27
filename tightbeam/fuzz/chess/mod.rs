@@ -150,15 +150,17 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
-	spec: ChessAssertSpec,
-	csp: ChessGameFlow,
-	config: ChessEngineServletConf {
-		manager: ChessMatchManager::default(),
-	},
+	config: tightbeam::testing::ScenarioConf::<ChessEngineServletConf>::builder()
+		.with_spec(ChessAssertSpec::latest())
+		.with_csp(ChessGameFlow)
+		.with_env_config(ChessEngineServletConf {
+			manager: ChessMatchManager::default(),
+		})
+		.build(),
 	environment Servlet {
 		servlet: ChessEngineServlet,
 		start: |trace, config| async move {
-			ChessEngineServlet::start(Arc::clone(&trace), Arc::new(config.clone())).await
+			ChessEngineServlet::start(Arc::clone(&trace), Arc::new(config.env_config().as_ref().clone())).await
 		},
 		setup: |addr, _config| async move {
 			// Create a custom client with exponential backoff retry policy

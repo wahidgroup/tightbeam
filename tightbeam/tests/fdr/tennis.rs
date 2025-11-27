@@ -8,8 +8,8 @@
 
 #![cfg(feature = "testing-fdr")]
 
-use tightbeam::testing::fdr::FdrConfig;
-use tightbeam::testing::specs::csp::Process;
+use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConf};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 fn build_fdr_config(
 	specs: Vec<Process>,
@@ -32,7 +32,7 @@ fn build_fdr_config(
 
 // ===== Tennis Game Scoring System =====
 
-tightbeam::tb_process_spec! {
+tb_process_spec! {
 	/// Tennis Game Scoring System CSP Process
 	///
 	/// Models tennis scoring with states:
@@ -97,28 +97,30 @@ tightbeam::tb_process_spec! {
 
 // Define assertion spec for valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
 // Score progression: (0,0) -> (15,0) -> (30,0) -> (30,15) -> (40,15) -> GameA
-tightbeam::tb_assert_spec! {
+tb_assert_spec! {
 	pub ValidTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pointA", tightbeam::exactly!(4)),
-			("pointB", tightbeam::exactly!(1))
+			("pointA", exactly!(4)),
+			("pointB", exactly!(1))
 		]
 	},
 }
 
-tightbeam::tb_scenario! {
+tb_scenario! {
 	name: test_tennis_valid_trace_refinement,
-	spec: ValidTennisSpec,
-	fdr: build_fdr_config(
-		vec![TennisScorer::process()],
-		4,
-		16,
-		8,
-		500,
-	),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ValidTennisSpec::latest())
+		.with_fdr(build_fdr_config(
+			vec![TennisScorer::process()],
+			4,
+			16,
+			8,
+			500,
+		))
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
@@ -136,28 +138,30 @@ tightbeam::tb_scenario! {
 
 // Define assertion spec for invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
 // This is impossible because after (0,40), B should win, not continue scoring
-tightbeam::tb_assert_spec! {
+tb_assert_spec! {
 	pub InvalidTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pointA", tightbeam::exactly!(1)),
-			("pointB", tightbeam::exactly!(4))
+			("pointA", exactly!(1)),
+			("pointB", exactly!(4))
 		]
 	},
 }
 
-tightbeam::tb_scenario! {
+tb_scenario! {
 	name: test_tennis_invalid_trace_refinement,
-	spec: InvalidTennisSpec,
-	fdr: build_fdr_config(
-		vec![TennisScorer::process()],
-		4,
-		16,
-		8,
-		500,
-	),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(InvalidTennisSpec::latest())
+		.with_fdr(build_fdr_config(
+			vec![TennisScorer::process()],
+			4,
+			16,
+			8,
+			500,
+		))
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			// Invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
@@ -177,28 +181,30 @@ tightbeam::tb_scenario! {
 // Define assertion spec for complex valid trace going through deuce
 // Valid trace: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
 // Score progression: (0,0) -> (15,0) -> (15,15) -> (30,15) -> (30,30) -> (40,30) -> Deuce -> AdvantageA -> GameA
-tightbeam::tb_assert_spec! {
+tb_assert_spec! {
 	pub DeuceTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pointA", tightbeam::exactly!(5)),
-			("pointB", tightbeam::exactly!(3))
+			("pointA", exactly!(5)),
+			("pointB", exactly!(3))
 		]
 	},
 }
 
-tightbeam::tb_scenario! {
+tb_scenario! {
 	name: test_tennis_deuce_to_advantage,
-	spec: DeuceTennisSpec,
-	fdr: build_fdr_config(
-		vec![TennisScorer::process()],
-		4,
-		16,
-		8,
-		500,
-	),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(DeuceTennisSpec::latest())
+		.with_fdr(build_fdr_config(
+			vec![TennisScorer::process()],
+			4,
+			16,
+			8,
+			500,
+		))
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			// Valid trace going through deuce: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
@@ -218,28 +224,30 @@ tightbeam::tb_scenario! {
 // ===== Test 4: Failures Refinement =====
 
 // Create a trace that should pass failures refinement
-tightbeam::tb_assert_spec! {
+tb_assert_spec! {
 	pub FailuresTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pointA", tightbeam::exactly!(2)),
-			("pointB", tightbeam::exactly!(1))
+			("pointA", exactly!(2)),
+			("pointB", exactly!(1))
 		]
 	},
 }
 
-tightbeam::tb_scenario! {
+tb_scenario! {
 	name: test_failures_refinement,
-	spec: FailuresTennisSpec,
-	fdr: build_fdr_config(
-		vec![TennisScorer::process()],
-		4,
-		16,
-		8,
-		500,
-	),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(FailuresTennisSpec::latest())
+		.with_fdr(build_fdr_config(
+			vec![TennisScorer::process()],
+			4,
+			16,
+			8,
+			500,
+		))
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			// Create a trace that should pass failures refinement

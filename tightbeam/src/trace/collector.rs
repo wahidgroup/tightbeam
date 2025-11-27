@@ -775,6 +775,7 @@ impl ExecutionMode {
 
 #[cfg(test)]
 mod tests {
+	use crate::testing::ScenarioConf;
 	use crate::{exactly, tb_assert_spec, tb_scenario};
 
 	tb_assert_spec! {
@@ -791,7 +792,9 @@ mod tests {
 
 	tb_scenario! {
 		name: trace_collector_records_shared_state,
-		spec: TraceCollectorSpec,
+		config: ScenarioConf::<()>::builder()
+			.with_spec(TraceCollectorSpec::latest())
+			.build(),
 		environment Bare {
 			exec: |trace| {
 				trace.event("alpha")?;

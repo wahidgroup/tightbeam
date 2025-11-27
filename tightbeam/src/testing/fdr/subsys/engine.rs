@@ -331,8 +331,10 @@ impl<'a> DefaultFdrExplorer<'a> {
 	///
 	/// This is a convenience constructor that uses the default implementations
 	/// of all subsystems. For custom subsystems, use `FdrExplorer::new` directly.
-	pub fn with_defaults(process: &'a Process, config: FdrConfig) -> Self {
-		let config = Arc::new(config);
+	///
+	/// Accepts either owned `FdrConfig` or `Arc<FdrConfig>`.
+	pub fn with_defaults(process: &'a Process, config: impl Into<Arc<FdrConfig>>) -> Self {
+		let config = config.into();
 		let explorer = DefaultExplorationEngine::new(process, Arc::clone(&config));
 		let cache = Rc::new(RefCell::new(DefaultCache::new()));
 		let refinement = DefaultRefinementChecker::new(process, Arc::clone(&config), cache);

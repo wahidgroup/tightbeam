@@ -4,7 +4,7 @@
 
 #![cfg(feature = "instrument")]
 
-use tightbeam::testing::create_test_message;
+use tightbeam::testing::{create_test_message, ScenarioConf};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{MessageEmitter, Protocol};
@@ -36,9 +36,10 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_auto_instrumentation_capture,
-	spec: AutoInstrSpec,
-	csp: MessageFlowProc,
-	trace: TraceConfig::default(),
+	config: ScenarioConf::<()>::builder()
+		.with_spec(AutoInstrSpec::latest())
+		.with_csp(MessageFlowProc::default())
+		.build(),
 	environment ServiceClient {
 		worker_threads: 1,
 		server: |trace| async move {

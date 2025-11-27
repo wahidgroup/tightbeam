@@ -15,6 +15,7 @@ use tightbeam::macros::client::builder::ClientBuilder;
 use tightbeam::policy::{GatePolicy, TransitStatus};
 use tightbeam::prelude::policy::PolicyConf;
 use tightbeam::prelude::*;
+use tightbeam::testing::ScenarioConf;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::policy::{RestartLinearBackoff, RestartPolicy, RetryAction};
 use tightbeam::transport::tcp::r#async::TokioListener;
@@ -342,7 +343,9 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: queue_free_system,
-	spec: QueueFreeSpec,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(QueueFreeSpec::latest())
+		.build(),
 	environment Servlet {
 		servlet: QueueServlet,
 		start: |trace, _config| async move {

@@ -20,19 +20,3 @@ pub fn format_mission_time(ms: u64) -> String {
 		format!("T+{}s", seconds)
 	}
 }
-
-/// Debug log macro that only prints if TIGHTBEAM_DEBUG env var is set
-///
-/// Usage:
-/// ```rust
-/// debug_log!("Processing frame {}", frame_id);
-/// debug_log!("Status: {:?}", status);
-/// ```
-#[macro_export]
-macro_rules! debug_log {
-	($($arg:tt)*) => {
-		if std::env::var("TIGHTBEAM_DEBUG").is_ok() {
-			println!($($arg)*);
-		}
-	};
-}
