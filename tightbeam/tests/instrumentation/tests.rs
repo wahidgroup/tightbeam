@@ -38,7 +38,7 @@ tb_scenario! {
 	name: test_auto_instrumentation_capture,
 	config: ScenarioConf::<()>::builder()
 		.with_spec(AutoInstrSpec::latest())
-		.with_csp(MessageFlowProc::default())
+		.with_csp(MessageFlowProc)
 		.build(),
 	environment ServiceClient {
 		worker_threads: 1,

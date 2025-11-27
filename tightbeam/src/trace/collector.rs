@@ -339,7 +339,6 @@ impl TraceState {
 		}
 	}
 
-	#[cfg(fuzzing)]
 	#[cfg(feature = "testing-fuzz")]
 	fn with_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
 		Self {
@@ -399,14 +398,12 @@ impl TraceCollector {
 	}
 
 	/// Create a trace collector with fuzz oracle (CSP-guided fuzzing)
-	#[cfg(fuzzing)]
 	#[cfg(feature = "testing-fuzz")]
 	pub fn with_fuzz_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
 		Self { state: Arc::new(TraceState::with_oracle(input, process)) }
 	}
 
 	/// Get the fuzz oracle, panicking if not configured
-	#[cfg(fuzzing)]
 	#[cfg(feature = "testing-fuzz")]
 	pub fn oracle(&self) -> &crate::testing::fuzz::FuzzContext {
 		self.state

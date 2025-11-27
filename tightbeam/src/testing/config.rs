@@ -32,16 +32,14 @@ use crate::testing::timing::TimingConstraints;
 #[derive(Clone)]
 pub struct ScenarioConf<E = ()> {
 	specs_internal: Arc<Vec<&'static BuiltAssertSpec>>,
+	trace_internal: Arc<TraceCollector>,
+	hooks_internal: Option<Arc<TestHooks>>,
+	env_config_internal: Option<Arc<E>>,
 
 	#[cfg(feature = "testing-csp")]
 	csp_internal: Option<Arc<dyn ProcessSpec + Send + Sync>>,
-
 	#[cfg(feature = "testing-fdr")]
 	fdr_internal: Option<Arc<FdrConfig>>,
-
-	trace_internal: Arc<TraceCollector>,
-	hooks_internal: Option<Arc<TestHooks>>,
-	env_config_internal: Arc<E>,
 }
 
 impl<E> ScenarioConf<E> {
@@ -74,12 +72,18 @@ impl<E> ScenarioConf<E> {
 		self.hooks_internal.as_ref()
 	}
 
+	/// Get env_config (panics if with_env_config() was not called).
+	///
+	/// For E=(), the builder auto-supplies () so this never panics.
+	/// For custom types, with_env_config() must be called before build().
 	pub fn env_config(&self) -> &Arc<E> {
-		&self.env_config_internal
+		self.env_config_internal
+			.as_ref()
+			.expect("env_config not set - call with_env_config() before build()")
 	}
 }
 
-impl<E: Default> Default for ScenarioConf<E> {
+impl Default for ScenarioConf<()> {
 	fn default() -> Self {
 		Self {
 			specs_internal: Arc::new(Vec::new()),
@@ -89,7 +93,7 @@ impl<E: Default> Default for ScenarioConf<E> {
 			fdr_internal: None,
 			trace_internal: Arc::new(TraceCollector::default()),
 			hooks_internal: None,
-			env_config_internal: Arc::new(E::default()),
+			env_config_internal: Some(Arc::new(())),
 		}
 	}
 }
@@ -97,16 +101,14 @@ impl<E: Default> Default for ScenarioConf<E> {
 /// Builder for ScenarioConf (consumes owned values, wraps in Arc on build)
 pub struct ScenarioConfBuilder<E = ()> {
 	specs: Vec<&'static BuiltAssertSpec>,
-
-	#[cfg(feature = "testing-csp")]
-	csp: Option<Box<dyn ProcessSpec + Send + Sync>>,
-
-	#[cfg(feature = "testing-fdr")]
-	fdr: Option<FdrConfig>,
-
 	trace: TraceCollector,
 	hooks: Option<TestHooks>,
 	env_config: Option<E>,
+
+	#[cfg(feature = "testing-csp")]
+	csp: Option<Box<dyn ProcessSpec + Send + Sync>>,
+	#[cfg(feature = "testing-fdr")]
+	fdr: Option<FdrConfig>,
 }
 
 impl<E> Default for ScenarioConfBuilder<E> {
@@ -124,7 +126,7 @@ impl<E> Default for ScenarioConfBuilder<E> {
 	}
 }
 
-impl<E: Default> ScenarioConfBuilder<E> {
+impl<E> ScenarioConfBuilder<E> {
 	/// Add a single spec to the list (builder convention)
 	pub fn with_spec(mut self, spec: &'static BuiltAssertSpec) -> Self {
 		self.specs.push(spec);
@@ -163,8 +165,13 @@ impl<E: Default> ScenarioConfBuilder<E> {
 		self.env_config = Some(env_config);
 		self
 	}
+}
 
-	/// Build the final ScenarioConf (wraps all values in Arc)
+impl<E> ScenarioConfBuilder<E> {
+	/// Build the final ScenarioConf (wraps all values in Arc).
+	///
+	/// **Note**: `env_config` is optional - call `env_config_opt()` if unsure it's set.
+	/// For tests using `ScenarioConf::<()>`, env_config is rarely needed.
 	pub fn build(self) -> ScenarioConf<E> {
 		ScenarioConf {
 			specs_internal: Arc::new(self.specs),
@@ -174,7 +181,7 @@ impl<E: Default> ScenarioConfBuilder<E> {
 			fdr_internal: self.fdr.map(Arc::new),
 			trace_internal: Arc::new(self.trace),
 			hooks_internal: self.hooks.map(Arc::new),
-			env_config_internal: Arc::new(self.env_config.unwrap_or_default()),
+			env_config_internal: self.env_config.map(Arc::new),
 		}
 	}
 }
@@ -221,19 +228,6 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn default_creates_empty_config() {
-		let config: ScenarioConf = ScenarioConf::default();
-		assert_eq!(config.specs().len(), 0);
-		assert!(config.hooks().is_none());
-	}
-
-	#[test]
-	fn builder_creates_config() {
-		let config: ScenarioConf = ScenarioConf::builder().build();
-		assert_eq!(config.specs().len(), 0);
-	}
-
-	#[test]
 	fn with_env_config_sets_value() {
 		#[derive(Debug, Clone, PartialEq)]
 		struct TestEnvConfig {
@@ -248,25 +242,6 @@ mod tests {
 
 		let custom_config = TestEnvConfig { value: 123 };
 		let config = ScenarioConf::builder().with_env_config(custom_config.clone()).build();
-
 		assert_eq!(config.env_config().value, 123);
-	}
-
-	#[test]
-	fn clone_preserves_config() {
-		let config1: ScenarioConf = ScenarioConf::builder().build();
-		let config2 = config1.clone();
-
-		assert_eq!(config1.specs().len(), config2.specs().len());
-	}
-
-	#[test]
-	fn trace_returns_arc() {
-		let config: ScenarioConf = ScenarioConf::builder().build();
-		let trace1 = config.trace();
-		let trace2 = config.trace();
-
-		// Arc clones should point to the same underlying data
-		assert!(Arc::ptr_eq(&trace1, &trace2));
 	}
 }

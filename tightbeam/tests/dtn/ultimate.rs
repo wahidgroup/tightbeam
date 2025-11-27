@@ -44,7 +44,7 @@ use tightbeam::{
 	macros::client::builder::{ClientBuilder, GenericClient},
 	prelude::*,
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
-	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, ScenarioConf},
+	testing::{fdr::FdrConfig, ScenarioConf},
 	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector},
 	transport::tcp::r#async::TokioListener,
 };
@@ -493,7 +493,7 @@ async fn send_telemetry_to_mars_relay(
 	let command_executor = CommandExecutor::default();
 
 	// Gather telemetry data
-	let (instrument, name, data) = command_executor.determine_next_instrument();
+	let (instrument, _name, data) = command_executor.determine_next_instrument();
 	let battery = fault_manager.battery_percent()?;
 	let fault_matrix_snapshot = fault_manager.fault_matrix()?;
 
@@ -564,7 +564,7 @@ async fn run_mission_loop(
 		// Update battery state and check for faults
 		let battery_update = fault_manager.update_battery_state()?;
 		match battery_update {
-			BatteryUpdate::LowPowerDetected(battery) => {
+			BatteryUpdate::LowPowerDetected(_battery) => {
 				trace.event("fault_low_power_detected")?;
 
 				debug_log!(
@@ -595,7 +595,7 @@ async fn run_mission_loop(
 
 				trace.event("fault_cleared")?;
 			}
-			BatteryUpdate::FaultCleared(battery) => {
+			BatteryUpdate::FaultCleared(_battery) => {
 				debug_log!(
 					"  [{}] [Rover] ✓ Battery recharged to {}%",
 					format_mission_time(mission_time_ms()),
@@ -691,10 +691,10 @@ tb_scenario! {
 	name: dtn_ultimate_realistic,
 	config: ScenarioConf::<DtnScenarioConfig>::builder()
 		.with_spec(DtnEventCountSpec::latest())
-		.with_csp(DtnComposedSystem::default())
+		.with_csp(DtnComposedSystem)
 		.with_trace(TraceCollector::default().with_logger(
 			LoggerConfig::new(
-				Box::new(StdoutBackend::default()),
+				Box::new(StdoutBackend),
 				LogFilter::new(LogLevel::Debug)
 			).with_default_level(LogLevel::Debug)
 		))
@@ -975,7 +975,7 @@ tb_scenario! {
 
 			Ok(rover_servlet)
 		},
-		setup: |rover_addr, config: Arc<DtnScenarioConfig>| async move {
+		setup: |_rover_addr, config: Arc<DtnScenarioConfig>| async move {
 			debug_log!("[Setup] Rover servlet address: {:?}", rover_addr);
 
 			let mars_relay_addr = (*config.mars_relay_addr.read()?)

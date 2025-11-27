@@ -40,17 +40,18 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
-	config: tightbeam::testing::ScenarioConf::<()>::builder()
+	csp: SimpleFuzzProc,
+	config: ScenarioConf::<()>::builder()
 		.with_spec(SimpleFuzzSpec::latest())
 		.with_csp(SimpleFuzzProc)
 		.build(),
 	environment Bare {
 		exec: |trace| {
 			// Oracle-guided fuzzing: interprets AFL input as event choices
-			trace.as_ref().oracle().fuzz_from_bytes()?;
+			trace.oracle().fuzz_from_bytes()?;
 
 			// Make assertions based on execution trace
-			for event in trace.as_ref().oracle().trace() {
+			for event in trace.oracle().trace() {
 				trace.event(event.0)?;
 			}
 			Ok(())

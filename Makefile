@@ -134,11 +134,10 @@ fuzz-test: fuzz-build
 	@echo "seed" > built/fuzz/in/seed.txt
 	@echo ""
 	@echo "Locating fuzz target binary..."
-	@FUZZ_TARGET=$$(ls target/debug/deps/fuzzing-* 2>/dev/null | grep -v '\.d$$' | head -1); \
+	@FUZZ_TARGET=$$(ls target/debug/fuzz_* 2>/dev/null | grep -v '\.d$$' | head -1); \
 	if [ -z "$$FUZZ_TARGET" ]; then \
-		echo "Error: Could not find fuzzing binary in target/debug/deps/"; \
-		echo "Available binaries:"; \
-		ls -1 target/debug/deps/ | grep -E "^[^\.]+$$" | head -10; \
+		echo "Error: Could not find any fuzz binary in target/debug/"; \
+		echo "Run 'make fuzz-build' first"; \
 		exit 1; \
 	fi; \
 	echo "Found: $$FUZZ_TARGET"; \

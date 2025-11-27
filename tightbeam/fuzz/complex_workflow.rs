@@ -56,7 +56,8 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
-	config: tightbeam::testing::ScenarioConf::<()>::builder()
+	csp: WorkflowFuzzProc,
+	config: ScenarioConf::<()>::builder()
 		.with_spec(WorkflowFuzzSpec::latest())
 		.with_csp(WorkflowFuzzProc)
 		.build(),
@@ -64,10 +65,10 @@ tb_scenario! {
 		exec: |trace| {
 			// Oracle-guided fuzzing through complex 6-state workflow
 			// IJON state tracking is automatic
-			trace.as_ref().oracle().fuzz_from_bytes()?;
+			trace.oracle().fuzz_from_bytes()?;
 
 			// Make assertions based on execution trace
-			for event in trace.as_ref().oracle().trace() {
+			for event in trace.oracle().trace() {
 				trace.event(event.0)?;
 			}
 			Ok(())

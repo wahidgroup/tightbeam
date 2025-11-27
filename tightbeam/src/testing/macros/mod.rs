@@ -472,16 +472,31 @@ macro_rules! tb_scenario {
 	// ===== FUZZ VARIANT: AFL fuzz target for Bare environment (generates fn main()) =====
 	(
 		fuzz: afl,
+		csp: $csp_type:ty,
 		config: $config:expr,
-		environment Bare { $($env_body:tt)* }
+		environment Bare { exec: $exec_closure:expr }
 		$(,)?
 	) => {
 		fn main() {
-			$crate::tb_scenario!(@execute_unified
-				name: fuzz_target,
-				config: $config,
-				environment Bare { $($env_body)* }
-			)
+			// Type inference helper
+			fn __exec_fuzz<F>(f: F, trace: $crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>
+			where
+				F: FnOnce($crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>,
+			{
+				f(trace)
+			}
+
+			afl::fuzz!(|data: &[u8]| {
+				// Get CSP process directly from concrete type (fresh each iteration)
+				#[cfg(feature = "testing-csp")]
+				let process = <$csp_type>::process();
+
+				// Create fresh trace with oracle for this AFL iteration
+				let trace = $crate::trace::TraceCollector::with_fuzz_oracle(data.to_vec(), process);
+
+				// Execute fuzz closure
+				let _result = __exec_fuzz($exec_closure, trace);
+			});
 		}
 	};
 

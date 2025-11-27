@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use tightbeam::macros::client::builder::ClientBuilder;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
+use tightbeam::testing::ScenarioConf;
 use tightbeam::transport::policy::RestartExponentialBackoff;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
@@ -150,7 +151,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
-	config: tightbeam::testing::ScenarioConf::<ChessEngineServletConf>::builder()
+	config: ScenarioConf::<ChessEngineServletConf>::builder()
 		.with_spec(ChessAssertSpec::latest())
 		.with_csp(ChessGameFlow)
 		.with_env_config(ChessEngineServletConf {
@@ -160,7 +161,7 @@ tb_scenario! {
 	environment Servlet {
 		servlet: ChessEngineServlet,
 		start: |trace, config| async move {
-			ChessEngineServlet::start(Arc::clone(&trace), Arc::new(config.env_config().as_ref().clone())).await
+			ChessEngineServlet::start(Arc::clone(&trace), config).await
 		},
 		setup: |addr, _config| async move {
 			// Create a custom client with exponential backoff retry policy
@@ -170,11 +171,12 @@ tb_scenario! {
 			let client = client_builder
 				.with_restart(restart_policy)
 				.with_timeout(Duration::from_millis(500))
-				.build()?;
+				.build()
+				.await?;
 
 			Ok(client)
 		},
-		client: |trace, mut client| async move {
+		client: |trace, mut client, _config| async move {
 			#[derive(Default)]
 			struct GameStats {
 				move_sent_count: u64,
@@ -245,7 +247,7 @@ tb_scenario! {
 
 				// Emit piece kind event only after move is sent (not before validation)
 				if let Some(piece) = Piece::from_u8(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
-					trace.event(piece.as_kind_label());
+					trace.event(piece.as_kind_label())?;
 				}
 
 				// Send move request to server with current board state in matrix
@@ -340,9 +342,9 @@ tb_scenario! {
 			let moves_processed_balance = (stats.move_sent_count as i64) - (processed_moves as i64);
 			let server_move_balance = (stats.move_validated_count as i64) - (stats.server_move_count as i64);
 			let game_restart_balance = (stats.game_restarted_count as i64) - (stats.game_ended_count as i64);
-			trace.event_with("client_moves_processed_balance", &["balance"], moves_processed_balance);
-			trace.event_with("client_server_move_balance", &["balance"], server_move_balance);
-			trace.event_with("client_game_restart_balance", &["lifecycle"], game_restart_balance);
+			trace.event_with("client_moves_processed_balance", &["balance"], moves_processed_balance)?;
+			trace.event_with("client_server_move_balance", &["balance"], server_move_balance)?;
+			trace.event_with("client_game_restart_balance", &["lifecycle"], game_restart_balance)?;
 
 			Ok(())
 		}

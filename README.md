@@ -3163,7 +3163,6 @@ tb_scenario! {
 **Feature Requirements**:
 - `testing-csp` feature flag (required for CSP oracle)
 - `cargo-afl` installed: `cargo install cargo-afl`
-- Fuzz targets gated by `#[cfg(fuzzing)]` to avoid compilation during normal tests
 - `std` feature flag (required for most fuzz targets)
 
 #### 10.7.2 Creating Fuzz Targets
@@ -3209,7 +3208,6 @@ tb_process_spec! {
 
 // AFL fuzz target - compiled with `cargo afl build`
 // Note: AFL fuzz targets generate `fn main()` - do NOT include `name:` parameter
-#[cfg(fuzzing)]
 tb_scenario! {
 	fuzz: afl,
 	spec: SimpleFuzzSpec,

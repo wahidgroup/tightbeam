@@ -17,7 +17,7 @@ use super::state::ChessGameState;
 
 /// Manages chess match state and game lifecycle
 /// Server maintains authoritative board state - client's board state is ignored
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ChessMatchManager {
 	game_state: Arc<Mutex<ChessGameState>>,
 	last_order: Arc<Mutex<u64>>,

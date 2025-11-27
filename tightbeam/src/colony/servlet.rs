@@ -805,6 +805,7 @@ macro_rules! servlet {
 				trace_handle: ::std::sync::Arc<::std::sync::Mutex<::std::sync::Arc<$crate::trace::TraceCollector>>>,
 			}
 
+			#[derive(Clone)]
 			pub struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -820,6 +821,7 @@ macro_rules! servlet {
 				trace_handle: ::std::sync::Arc<::std::sync::Mutex<::std::sync::Arc<$crate::trace::TraceCollector>>>,
 			}
 
+			#[derive(Clone)]
 			struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -839,11 +841,12 @@ macro_rules! servlet {
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
 
-			pub struct [<$worker_name Conf>] {
-				$(pub $config_field: $config_type,)*
-			}
+	#[derive(Clone)]
+	pub struct [<$worker_name Conf>] {
+		$(pub $config_field: $config_type,)*
+	}
 
-			pub struct [<$worker_name Servlets>]<I> {
+		pub struct [<$worker_name Servlets>]<I> {
 				$(pub $worker_field: $worker_type,)*
 				#[allow(dead_code)]
 				_phantom: ::std::marker::PhantomData<I>,
@@ -864,6 +867,7 @@ macro_rules! servlet {
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
 
+			#[derive(Default, Clone)]
 			struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -1204,6 +1208,7 @@ macro_rules! servlet {
 				workers: ::std::sync::Arc<[<$worker_name Servlets>]<$input>>,
 			}
 
+			#[derive(Clone)]
 			pub struct [<$worker_name Conf>] {
 				$(pub $config_field: $config_type,)*
 			}
@@ -1531,11 +1536,11 @@ macro_rules! servlet {
 				handle: move |mut $msg| {
 					let config_arc = ::std::sync::Arc::clone(&config_arc);
 					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
-				async move {
-					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
-					let $config_param = &config_arc;
-					$body
-				}
+					async move {
+						let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+						let $config_param = &config_arc;
+						$body
+					}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1552,11 +1557,11 @@ macro_rules! servlet {
 				handle: move |$msg| {
 					let config_arc = ::std::sync::Arc::clone(&config_arc);
 					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
-				async move {
-					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
-					let $config_param = &config_arc;
-					$body
-				}
+					async move {
+						let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+						let $config_param = &config_arc;
+						$body
+					}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1573,11 +1578,11 @@ macro_rules! servlet {
 				handle: move |mut $msg| {
 					let config_arc = ::std::sync::Arc::clone(&config_arc);
 					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
-				async move {
-					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
-					let $config_param = &config_arc;
-					$body
-				}
+					async move {
+						let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+						let $config_param = &config_arc;
+						$body
+					}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1593,11 +1598,11 @@ macro_rules! servlet {
 				handle: move |$msg| {
 					let config_arc = ::std::sync::Arc::clone(&config_arc);
 					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
-				async move {
-					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
-					let $config_param = &config_arc;
-					$body
-				}
+					async move {
+						let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+						let $config_param = &config_arc;
+						$body
+					}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1615,11 +1620,11 @@ macro_rules! servlet {
 				handle: move |$msg| {
 					let router_arc = ::std::sync::Arc::clone(&router_arc);
 					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
-				async move {
-					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
-					let $router_param = &router_arc;
-					$body
-				}
+					async move {
+						let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+						let $router_param = &router_arc;
+						$body
+					}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1636,11 +1641,11 @@ macro_rules! servlet {
 				handle: move |$msg| {
 					let router_arc = ::std::sync::Arc::clone(&router_arc);
 					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
-				async move {
-					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
-					let $router_param = &router_arc;
-					$body
-				}
+					async move {
+						let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+						let $router_param = &router_arc;
+						$body
+					}
 				}
 			};
 			(server_handle, Vec::new())
@@ -1718,10 +1723,10 @@ macro_rules! servlet {
 				protocol $protocol: $listener,
 				handle: move |$msg: $crate::Frame| {
 					let trace_handle = ::std::sync::Arc::clone(&trace_handle);
-				async move {
-					let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
-					$body
-				}
+					async move {
+						let $trace_param = ::std::sync::Arc::clone(&*trace_handle.lock()?);
+						$body
+					}
 				}
 			};
 
@@ -1734,11 +1739,11 @@ macro_rules! servlet {
 mod tests {
 	use std::sync::Arc;
 
-	use crate::compose;
 	use crate::der::Sequence;
 	use crate::trace::TraceCollector;
 	use crate::transport::policy::PolicyConf;
 	use crate::Frame;
+	use crate::{compose, test_servlet, worker};
 
 	#[cfg(feature = "tokio")]
 	use crate::transport::tcp::r#async::TokioListener as Listener;
@@ -1788,7 +1793,7 @@ mod tests {
 	}
 
 	#[cfg(all(feature = "tokio", feature = "tcp", feature = "std"))]
-	crate::test_servlet! {
+	test_servlet! {
 		name: test_worker_with_test_async_case,
 		worker_threads: 2,
 		protocol: Listener,
@@ -1834,7 +1839,7 @@ mod tests {
 
 	mod workers {
 		use super::*;
-		use crate::policy::{ReceptorPolicy, TransitStatus};
+		use crate::policy::{AcceptAllGate, ReceptorPolicy, TransitStatus};
 		use crate::Beamable;
 
 		#[derive(Sequence, Beamable, Clone, Debug, PartialEq)]
@@ -1855,7 +1860,7 @@ mod tests {
 			}
 		}
 
-		crate::worker! {
+		worker! {
 			name: LuckyNumberWorker<RequestMessage, bool>,
 			config: {
 				lotto_number: u32,
@@ -1865,7 +1870,7 @@ mod tests {
 			}
 		}
 
-		crate::worker! {
+		worker! {
 			name: PingPongWorker<RequestMessage, PongMessage>,
 			policies: {
 				with_receptor_gate: [PingGate]
@@ -1877,11 +1882,11 @@ mod tests {
 			}
 		}
 
-		crate::servlet! {
+		servlet! {
 			PingPongServletWithWorker<RequestMessage>,
 			protocol: Listener,
 			policies: {
-				with_collector_gate: [crate::policy::AcceptAllGate],
+				with_collector_gate: [AcceptAllGate],
 				// with_x509: [some_cert]
 				// with_x509_gate: [crate::somewhere::CertificateValidationLike]
 			},
@@ -1923,7 +1928,7 @@ mod tests {
 		}
 
 		#[cfg(all(feature = "tokio", feature = "tcp", feature = "std"))]
-		crate::test_servlet! {
+		test_servlet! {
 			name: test_servlet_with_workers,
 			worker_threads: 2,
 			protocol: Listener,
