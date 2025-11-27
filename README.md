@@ -766,12 +766,12 @@ and SHOULD NOT use MD5 or SHA-1 for new deployments.
 
 #### Version 0 (V0)
 - REQUIRED: `id`, `order`, `message`
-- OPTIONAL: `compactness`, `integrity`, `nonrepudiation`
+- OPTIONAL: `compactness`
 - FORBIDDEN: All V1+ and V2+ specific fields
 
 #### Version 1 (V1)
 - INHERITS: All V0 requirements
-- OPTIONAL: `integrity` (metadata level), `confidentiality`
+- OPTIONAL: `integrity`, `confidentiality`, `nonrepudiation`
 - FORBIDDEN: All V2+ specific fields
 
 #### Version 2 (V2)
