@@ -4,8 +4,6 @@
 //! - Layered CSP specs (high-level flow + detailed chess rules)
 //! - AFL fuzzing with invalid move testing
 
-#![allow(unused_imports)]
-#![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "full"))]
 
 mod board;
@@ -15,7 +13,7 @@ mod piece;
 mod state;
 mod utils;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tightbeam::macros::client::builder::ClientBuilder;
@@ -25,9 +23,7 @@ use tightbeam::transport::policy::RestartExponentialBackoff;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-use board::{
-	ChessEngineServlet, ChessEngineServletConf, ChessMatchManager, ChessMoveRequest, ChessMoveResponse, GameStatusCode,
-};
+use board::{ChessEngineServlet, ChessEngineServletConf, ChessMatchManager, ChessMoveResponse, GameStatusCode};
 use piece::Piece;
 use r#move::ChessMove;
 use state::ChessGameState;

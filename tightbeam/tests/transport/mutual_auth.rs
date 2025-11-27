@@ -138,6 +138,7 @@ tb_scenario! {
 	name: test_mutual_auth_with_servlet,
 	config: ScenarioConf::<()>::builder()
 		.with_spec(MutualAuthSpec::latest())
+		.with_env_config(())  // TODO revisit
 		.build(),
 	environment Servlet {
 		servlet: MutualAuthServlet,

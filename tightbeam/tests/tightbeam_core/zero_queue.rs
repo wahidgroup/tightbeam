@@ -345,6 +345,7 @@ tb_scenario! {
 	name: queue_free_system,
 	config: ScenarioConf::<()>::builder()
 		.with_spec(QueueFreeSpec::latest())
+		.with_env_config(())  // TODO revisit
 		.build(),
 	environment Servlet {
 		servlet: QueueServlet,

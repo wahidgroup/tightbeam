@@ -477,6 +477,7 @@ macro_rules! tb_scenario {
 		environment Bare { exec: $exec_closure:expr }
 		$(,)?
 	) => {
+		#[cfg(fuzzing)]
 		fn main() {
 			// Type inference helper
 			fn __exec_fuzz<F>(f: F, trace: $crate::trace::TraceCollector) -> Result<(), $crate::TightBeamError>
@@ -497,6 +498,11 @@ macro_rules! tb_scenario {
 				// Execute fuzz closure
 				let _result = __exec_fuzz($exec_closure, trace);
 			});
+		}
+
+		#[cfg(not(fuzzing))]
+		fn main() {
+			panic!("This is an AFL fuzz target. Build with: RUSTFLAGS='--cfg fuzzing' cargo afl build --bin <name>");
 		}
 	};
 

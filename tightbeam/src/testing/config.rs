@@ -31,15 +31,15 @@ use crate::testing::timing::TimingConstraints;
 /// Unified configuration for tb_scenario! tests (zero-copy with Arc wrapping)
 #[derive(Clone)]
 pub struct ScenarioConf<E = ()> {
-	specs_internal: Arc<Vec<&'static BuiltAssertSpec>>,
-	trace_internal: Arc<TraceCollector>,
-	hooks_internal: Option<Arc<TestHooks>>,
-	env_config_internal: Option<Arc<E>>,
+	specs: Arc<Vec<&'static BuiltAssertSpec>>,
+	trace: Arc<TraceCollector>,
+	hooks: Option<Arc<TestHooks>>,
+	env_config: Option<Arc<E>>,
 
 	#[cfg(feature = "testing-csp")]
-	csp_internal: Option<Arc<dyn ProcessSpec + Send + Sync>>,
+	csp: Option<Arc<dyn ProcessSpec + Send + Sync>>,
 	#[cfg(feature = "testing-fdr")]
-	fdr_internal: Option<Arc<FdrConfig>>,
+	fdr: Option<Arc<FdrConfig>>,
 }
 
 impl<E> ScenarioConf<E> {
@@ -51,33 +51,30 @@ impl<E> ScenarioConf<E> {
 	// ===== Accessors (zero-copy) =====
 
 	pub fn specs(&self) -> &[&'static BuiltAssertSpec] {
-		&self.specs_internal
+		&self.specs
 	}
 
 	#[cfg(feature = "testing-csp")]
 	pub fn csp(&self) -> Option<&Arc<dyn ProcessSpec + Send + Sync>> {
-		self.csp_internal.as_ref()
+		self.csp.as_ref()
 	}
 
 	#[cfg(feature = "testing-fdr")]
 	pub fn fdr(&self) -> Option<&Arc<FdrConfig>> {
-		self.fdr_internal.as_ref()
+		self.fdr.as_ref()
 	}
 
 	pub fn trace(&self) -> Arc<TraceCollector> {
-		Arc::clone(&self.trace_internal)
+		Arc::clone(&self.trace)
 	}
 
 	pub fn hooks(&self) -> Option<&Arc<TestHooks>> {
-		self.hooks_internal.as_ref()
+		self.hooks.as_ref()
 	}
 
-	/// Get env_config (panics if with_env_config() was not called).
-	///
-	/// For E=(), the builder auto-supplies () so this never panics.
-	/// For custom types, with_env_config() must be called before build().
+	/// Get env_config (panics if not set for custom types).
 	pub fn env_config(&self) -> &Arc<E> {
-		self.env_config_internal
+		self.env_config
 			.as_ref()
 			.expect("env_config not set - call with_env_config() before build()")
 	}
@@ -86,14 +83,14 @@ impl<E> ScenarioConf<E> {
 impl Default for ScenarioConf<()> {
 	fn default() -> Self {
 		Self {
-			specs_internal: Arc::new(Vec::new()),
+			specs: Arc::new(Vec::new()),
+			trace: Arc::new(TraceCollector::default()),
+			hooks: None,
+			env_config: Some(Arc::new(())),
 			#[cfg(feature = "testing-csp")]
-			csp_internal: None,
+			csp: None,
 			#[cfg(feature = "testing-fdr")]
-			fdr_internal: None,
-			trace_internal: Arc::new(TraceCollector::default()),
-			hooks_internal: None,
-			env_config_internal: Some(Arc::new(())),
+			fdr: None,
 		}
 	}
 }
@@ -115,13 +112,13 @@ impl<E> Default for ScenarioConfBuilder<E> {
 	fn default() -> Self {
 		Self {
 			specs: Vec::new(),
+			trace: TraceCollector::default(),
+			hooks: None,
+			env_config: None,
 			#[cfg(feature = "testing-csp")]
 			csp: None,
 			#[cfg(feature = "testing-fdr")]
 			fdr: None,
-			trace: TraceCollector::default(),
-			hooks: None,
-			env_config: None,
 		}
 	}
 }
@@ -168,27 +165,26 @@ impl<E> ScenarioConfBuilder<E> {
 }
 
 impl<E> ScenarioConfBuilder<E> {
-	/// Build the final ScenarioConf (wraps all values in Arc).
-	///
-	/// **Note**: `env_config` is optional - call `env_config_opt()` if unsure it's set.
-	/// For tests using `ScenarioConf::<()>`, env_config is rarely needed.
+	/// Build ScenarioConf (requires with_env_config() for custom types).
 	pub fn build(self) -> ScenarioConf<E> {
 		ScenarioConf {
-			specs_internal: Arc::new(self.specs),
+			specs: Arc::new(self.specs),
+			trace: Arc::new(self.trace),
+			hooks: self.hooks.map(Arc::new),
+			env_config: self.env_config.map(Arc::new),
 			#[cfg(feature = "testing-csp")]
-			csp_internal: self.csp.map(|csp| Arc::from(csp) as Arc<dyn ProcessSpec + Send + Sync>),
+			csp: self.csp.map(|csp| Arc::from(csp) as Arc<dyn ProcessSpec + Send + Sync>),
 			#[cfg(feature = "testing-fdr")]
-			fdr_internal: self.fdr.map(Arc::new),
-			trace_internal: Arc::new(self.trace),
-			hooks_internal: self.hooks.map(Arc::new),
-			env_config_internal: self.env_config.map(Arc::new),
+			fdr: self.fdr.map(Arc::new),
 		}
 	}
 }
 
 /// Complete scenario execution context for hooks
 pub struct HookContext {
+	pub assert_spec: Option<&'static BuiltAssertSpec>,
 	pub trace: ConsumedTrace,
+
 	#[cfg(feature = "testing-fdr")]
 	pub fdr_verdict: Option<FdrVerdict>,
 	#[cfg(feature = "testing-fdr")]
@@ -197,12 +193,12 @@ pub struct HookContext {
 	pub process: Option<Arc<dyn ProcessSpec + Send + Sync>>,
 	#[cfg(feature = "testing-timing")]
 	pub timing_constraints: Option<Arc<TimingConstraints>>,
-	pub assert_spec: Option<&'static BuiltAssertSpec>,
 }
 
 impl HookContext {
 	pub fn new(trace: ConsumedTrace) -> Self {
 		Self {
+			assert_spec: None,
 			trace,
 			#[cfg(feature = "testing-fdr")]
 			fdr_verdict: None,
@@ -212,7 +208,6 @@ impl HookContext {
 			process: None,
 			#[cfg(feature = "testing-timing")]
 			timing_constraints: None,
-			assert_spec: None,
 		}
 	}
 }

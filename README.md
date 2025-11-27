@@ -2310,7 +2310,9 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_all_versions,
-	specs: [VersionSpec::get(0, 0, 0), VersionSpec::get(1, 0, 0)],
+	config: ScenarioConf::builder()
+		.with_specs(vec![VersionSpec::get(0, 0, 0), VersionSpec::get(1, 0, 0)])
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			// Single assertion satisfies both version specs via tags
@@ -2533,8 +2535,10 @@ tb_compose_spec! {
 // Use the composed process in a scenario
 tb_scenario! {
 	name: test_request_with_retry,
-	spec: ClientServerSpec,
-	csp: RequestWithRetry,
+	config: ScenarioConf::builder()
+		.with_spec(ClientServerSpec::latest())
+		.with_csp(RequestWithRetry)
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			trace.event("request");
@@ -2650,16 +2654,18 @@ tb_assert_spec! {
 // Test with refinement checking
 tb_scenario! {
 	name: test_simple_refinement,
-	spec: SimpleSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 10,
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![SimpleProcess::process()],
-		fail_fast: true,
-		expect_failure: false,
-	},
+	config: ScenarioConf::builder()
+		.with_spec(SimpleSpec::latest())
+		.with_fdr(FdrConfig {
+			seeds: 4,
+			max_depth: 10,
+			max_internal_run: 8,
+			timeout_ms: 500,
+			specs: vec![SimpleProcess::process()],
+			fail_fast: true,
+			expect_failure: false,
+		})
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			trace.event("start");
@@ -2930,14 +2936,15 @@ CSP and FDR verification.
 ```rust
 tb_scenario! {
 	name: test_function_name,        // OPTIONAL: creates standalone #[test] function NOTE: Do NOT use with `fuzz: afl`
-	spec: AssertSpecType,            // REQUIRED: Layer 1 assertion spec
-	csp: ProcessSpecType,            // OPTIONAL: Layer 2 CSP model (requires testing-csp)
+	config: ScenarioConf::builder()  // REQUIRED: Unified configuration
+		.with_spec(AssertSpecType::latest())          // Layer 1 assertion spec
+		.with_csp(ProcessSpecType)                    // OPTIONAL: Layer 2 CSP model (requires testing-csp)
+		.with_fdr(FdrConfig { ... })                  // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
+		.with_trace(TbInstrumentationConfig { ... })  // OPTIONAL: instrumentation/trace config (§11)
+		.with_hooks(TestHooks { ... })                // OPTIONAL: on_pass/on_fail callbacks
+		.build(),
 	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
-	fdr: FdrConfig { ... },          // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-	trace: TbInstrumentationConfig,  // OPTIONAL: instrumentation/trace config (§11)
-	config: ScenarioConfig,          // OPTIONAL: shared scenario state for environments
 	environment <Variant> { ... },   // REQUIRED: execution environment (Bare, Worker, ServiceClient, Servlet)
-	hooks { ... }                    // OPTIONAL: on_pass/on_fail callbacks
 }
 ```
 
@@ -2976,8 +2983,10 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_bare_environment,
-	spec: BareSpec,
-	csp: BareProcess,
+	config: ScenarioConf::builder()
+		.with_spec(BareSpec::latest())
+		.with_csp(BareProcess)
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			trace.event("Received");
