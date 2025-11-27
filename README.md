@@ -139,18 +139,29 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.5.4. [Multi-Seed Exploration and Scheduler Interleaving](#1054-multi-seed-exploration-and-scheduler-interleaving)
 		- 10.5.5. [CSPM Export for FDR4 Integration](#1055-cspm-export-for-fdr4-integration)
 		- 10.5.6. [Trace Analysis Extensions](#1056-trace-analysis-extensions)
-	- 10.6. [Unified Testing: tb_scenario! Macro](#106-unified-testing-tb_scenario-macro)
-		- 10.6.1. [Syntax](#1061-syntax)
-		- 10.6.2. [Examples](#1062-examples)
-		- 10.6.3. [Hook Semantics](#1063-hook-semantics)
-	- 10.7. [Coverage-Guided Fuzzing with AFL](#107-coverage-guided-fuzzing-with-afl)
-		- 10.7.1. [Concept](#1071-concept)
-		- 10.7.2. [Creating Fuzz Targets](#1072-creating-fuzz-targets)
-		- 10.7.3. [Building and Running Fuzz Targets](#1073-building-and-running-fuzz-targets)
-		- 10.7.4. [Advanced: CSP Oracle Integration](#1074-advanced-csp-oracle-integration)
-		- 10.7.5. [IJON Integration: Input-to-State Correspondence](#1075-ijon-integration-input-to-state-correspondence)
-	- 10.8. [Feature Matrix](#108-feature-matrix)
-	- 10.9. [Standards Compliance Mapping](#109-standards-compliance-mapping)
+	- 10.6. [Fault Injection](#106-fault-injection)
+		- 10.6.1. [FaultModel Configuration](#1061-faultmodel-configuration)
+		- 10.6.2. [Injection Strategies](#1062-injection-strategies)
+		- 10.6.3. [Type-Safe State and Event Identifiers](#1063-type-safe-state-and-event-identifiers)
+		- 10.6.4. [Integration with FDR](#1064-integration-with-fdr)
+	- 10.7. [Unified Testing: tb_scenario! Macro](#107-unified-testing-tb_scenario-macro)
+		- 10.7.1. [Syntax](#1071-syntax)
+		- 10.7.2. [Examples](#1072-examples)
+		- 10.7.3. [Hook Semantics](#1073-hook-semantics)
+	- 10.8. [Coverage-Guided Fuzzing with AFL](#108-coverage-guided-fuzzing-with-afl)
+		- 10.8.1. [Concept](#1081-concept)
+		- 10.8.2. [Creating Fuzz Targets](#1082-creating-fuzz-targets)
+		- 10.8.3. [Building and Running Fuzz Targets](#1083-building-and-running-fuzz-targets)
+		- 10.8.4. [Advanced: CSP Oracle Integration](#1084-advanced-csp-oracle-integration)
+		- 10.8.5. [IJON Integration: Input-to-State Correspondence](#1085-ijon-integration-input-to-state-correspondence)
+	- 10.9. [Feature Matrix](#109-feature-matrix)
+	- 10.10. [Standards Compliance Mapping](#1010-standards-compliance-mapping)
+		- 10.10.1. [DO-178C DAL A / ISO 26262 ASIL-D](#10101-do-178c-dal-a--iso-26262-asil-d)
+		- 10.10.2. [IEC 61508 SIL 4](#10102-iec-61508-sil-4)
+		- 10.10.3. [NASA/ESA ECSS-E-HB-40A](#10103-nasaesa-ecss-e-hb-40a)
+		- 10.10.4. [Common Criteria EAL7](#10104-common-criteria-eal7)
+		- 10.10.5. [FMEA/FMECA (MIL-STD-1629, ISO 26262)](#10105-fmeafmeca-mil-std-1629-iso-26262)
+		- 10.10.6. [Standards Compliance Summary](#10106-standards-compliance-summary)
 11. [Instrumentation](#11-instrumentation)
 	- 11.1. [Objectives](#111-objectives)
 	- 11.2. [Event Kind Taxonomy](#112-event-kind-taxonomy)
@@ -159,6 +170,7 @@ versioned metadata structures for high-fidelity information transmission.
 	- 11.5. [Configuration](#115-configuration)
 	- 11.6. [Evidence Artifact Format](#116-evidence-artifact-format)
 	- 11.7. [Failure Handling](#117-failure-handling)
+	- 11.8. [Logging Subsystem](#118-logging-subsystem)
 12. [Misc](#12-misc)
 	- 12.1. [Utilities](#121-utilities)
 		- 12.1.1. [URNs](#1211-urns)
@@ -174,7 +186,8 @@ versioned metadata structures for high-fidelity information transmission.
 ## 1. Introduction
 
 tightbeam defines a structured, versioned messaging protocol with an
-information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Sections follow
+information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Its philosophy is
+predicated upon a return to first order principles. Sections follow
 a [concept → specification → implementation → testing] pattern.
 
 ### 1.1 Information Fidelity Constraint
@@ -2077,9 +2090,9 @@ each building upon the previous:
 
 | Layer | Feature Flag | Purpose | Specification | Usage |
 |-------|--------------|---------|---------------|-------|
-| L1 AssertSpec | `testing` | Runtime assertion verification | `tb_assert_spec!` | Required: `spec:` field |
-| L2 ProcessSpec | `testing-csp` | CSP state machine modeling | `tb_process_spec!` | Optional: `csp:` field |
-| L3 Refinement | `testing-fdr` | Trace/failures refinement | Inline config | Optional: `fdr:` field |
+| L1 AssertSpec | `testing` | Runtime assertion verification | `tb_assert_spec!` | Required: `.with_spec()` or `.with_specs()` |
+| L2 ProcessSpec | `testing-csp` | CSP state machine modeling | `tb_process_spec!` | Optional: `.with_csp()` |
+| L3 Refinement | `testing-fdr` | Trace/failures refinement | Inline config | Optional: `.with_fdr()` |
 
 **Layer 1 (Assertions)**: Verifies that expected events occur with correct
 cardinality. This provides basic behavioral correctness through declarative
@@ -2276,8 +2289,8 @@ Assertions can be tagged with arbitrary string labels for flexible categorizatio
 - `trace.event_with("label", &["tag"], value)` records the label with tags plus an optional value (anything implementing `Into<AssertionValue>`, e.g. `bool`, `u64`, `Version`, etc.).:
 
 ```rust
-trace.event("relay_start");
-trace.event_with("response_ok", &["tag_a"], true);
+trace.event("relay_start")?;
+trace.event_with("response_ok", &["tag_a"], true)?;
 ```
 
 **How Tags Work**:
@@ -2310,12 +2323,14 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_all_versions,
-	specs: [VersionSpec::get(0, 0, 0), VersionSpec::get(1, 0, 0)],
+	config: ScenarioConf::builder()
+		.with_specs(vec![VersionSpec::get(0, 0, 0), VersionSpec::get(1, 0, 0)])
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			// Single assertion satisfies both version specs via tags
-			trace.event_with("feature", &["v0", "v1"], Presence::of_option(&some_option));
-			trace.event_with("v2_specific", &["v1"], ());
+			trace.event_with("feature", &["v0", "v1"], Presence::of_option(&some_option))?;
+			trace.event_with("v2_specific", &["v1"], ())?;
 			Ok(())
 		}
 	}
@@ -2436,7 +2451,7 @@ tb_process_spec! {
 
 #### 10.3.3 Validation Rules
 
-When `csp:` is specified in `tb_scenario!`:
+When CSP is configured via `.with_csp()` in `tb_scenario!`:
 
 1. **Compile-Time**: Assert labels MUST be in CSP observable alphabet
 2. **Runtime**: Observed events MUST form valid CSP trace (framework tracks state)
@@ -2488,7 +2503,7 @@ standard parallel composition operators:
 
 The `tb_compose_spec!` macro generates a type that implements `CompositionSpec`
 and, via a blanket impl, `ProcessSpec`, so it can be used anywhere a process
-spec is expected (including `tb_scenario!`’s `csp:` field).
+spec is expected (including with `.with_csp()` in `tb_scenario!`).
 
 **Example: Interleaved request/response and retry flows**
 
@@ -2533,13 +2548,15 @@ tb_compose_spec! {
 // Use the composed process in a scenario
 tb_scenario! {
 	name: test_request_with_retry,
-	spec: ClientServerSpec,
-	csp: RequestWithRetry,
+	config: ScenarioConf::builder()
+		.with_spec(ClientServerSpec::latest())
+		.with_csp(RequestWithRetry)
+		.build(),
 	environment Bare {
 		exec: |trace| {
-			trace.event("request");
-			trace.event("retry");
-			trace.event("response");
+			trace.event("request")?;
+			trace.event("retry")?;
+			trace.event("response")?;
 			Ok(())
 		}
 	}
@@ -2650,20 +2667,22 @@ tb_assert_spec! {
 // Test with refinement checking
 tb_scenario! {
 	name: test_simple_refinement,
-	spec: SimpleSpec,
-	fdr: FdrConfig {
-		seeds: 4,
-		max_depth: 10,
-		max_internal_run: 8,
-		timeout_ms: 500,
-		specs: vec![SimpleProcess::process()],
-		fail_fast: true,
-		expect_failure: false,
-	},
+	config: ScenarioConf::builder()
+		.with_spec(SimpleSpec::latest())
+		.with_fdr(FdrConfig {
+			seeds: 4,
+			max_depth: 10,
+			max_internal_run: 8,
+			timeout_ms: 500,
+			specs: vec![SimpleProcess::process()],
+			fail_fast: true,
+			expect_failure: false,
+		})
+		.build(),
 	environment Bare {
 		exec: |trace| {
-			trace.event("start");
-			trace.event("finish");
+			trace.event("start")?;
+			trace.event("finish")?;
 			Ok(())
 		}
 	}
@@ -2873,7 +2892,7 @@ This enables:
 2. **Algebraic proofs** using CSP laws and theorems
 3. **Integration** with existing CSP toolchains and specifications
 
-#### 10.5.7 Trace Analysis Extensions
+#### 10.5.6 Trace Analysis Extensions
 
 The `FdrTraceExt` trait extends `ConsumedTrace` with CSP-specific analysis:
 
@@ -2912,7 +2931,90 @@ if let Some(acceptance) = trace.acceptance_at("Connected") {
 assert!(!trace.can_refuse_after("Connected", "request"));
 ```
 
-### 10.6 Unified Testing: tb_scenario! Macro
+### 10.6 Fault Injection
+
+Fault injection enables systematic error testing through CSP state-driven fault 
+injection during refinement checking. Requires `testing-fault` feature flag.
+
+#### 10.6.1 FaultModel Configuration
+
+```rust
+use tightbeam::testing::{FaultModel, InjectionStrategy};
+use tightbeam::utils::BasisPoints;
+
+let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
+	.with_fault(
+		States::Sending,            // Type-safe state enum
+		Event("response"),          // Event label
+		|| NetworkTimeoutError {...}, // Error factory
+		BasisPoints::new(3000),       // 30% probability
+	)
+	.with_seed(0xDEADBEEF);           // Reproducibility
+```
+
+#### 10.6.2 Injection Strategies
+
+**Deterministic (Counter-Based):**
+```rust
+InjectionStrategy::Deterministic
+```
+- Call counters per event label
+- Predictable fault sequences
+- Ideal for DO-178C DAL A, IEC 61508 SIL 4
+
+**Random (Seeded RNG):**
+```rust
+InjectionStrategy::Random
+```
+- Linear Congruential Generator with seed
+- Statistical coverage analysis
+- Same seed produces same fault sequence
+
+#### 10.6.3 Type-Safe State and Event Identifiers
+
+Generate type-safe enums via `tb_gen_process_types!`:
+
+```rust
+tb_gen_process_types!(FaultTolerantProcess, Idle, Sending, Retrying, Success, Fallback);
+
+// Generates:
+// - fault_tolerant_process::States enum (implements ProcessState)
+// - fault_tolerant_process::Event struct (implements ProcessEvent)
+```
+
+Manual implementation:
+
+```rust
+pub trait ProcessState: Copy + Debug {
+	fn process_name(&self) -> &'static str;
+	fn state_name(&self) -> &'static str;
+	fn full_key(&self) -> Cow<'static, str>;
+}
+
+pub trait ProcessEvent: Copy + Debug {
+	fn event_label(&self) -> &'static str;
+}
+```
+
+#### 10.6.4 Integration with FDR
+
+```rust
+fdr: FdrConfig {
+	seeds: 64,
+	fault_model: Some(fault_model),
+	specs: vec![MyProcess::process()],
+	..Default::default()
+}
+```
+
+Faults are injected during CSP exploration before state transitions. Injected 
+faults are recorded in `FdrVerdict::faults_injected` with full traceability 
+(state, event, error message, probability).
+
+**Example:** See `tightbeam/tests/fault/basic.rs` for a full fault injection 
+demonstration.
+
+### 10.7 Unified Testing: tb_scenario! Macro
 
 The `tb_scenario!` macro is the unified entry point for all testing layers,
 executing AssertSpec verifications under selectable environments with optional
@@ -2925,25 +3027,26 @@ CSP and FDR verification.
 - Instrumentation integration
 - Policy enforcement
 
-#### 10.6.1 Syntax
+#### 10.7.1 Syntax
 
 ```rust
 tb_scenario! {
 	name: test_function_name,        // OPTIONAL: creates standalone #[test] function NOTE: Do NOT use with `fuzz: afl`
-	spec: AssertSpecType,            // REQUIRED: Layer 1 assertion spec
-	csp: ProcessSpecType,            // OPTIONAL: Layer 2 CSP model (requires testing-csp)
+	config: ScenarioConf::builder()  // REQUIRED: Unified configuration
+		.with_spec(AssertSpecType::latest())          // Layer 1 assertion spec
+		.with_csp(ProcessSpecType)                    // OPTIONAL: Layer 2 CSP model (requires testing-csp)
+		.with_fdr(FdrConfig { ... })                  // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
+		.with_trace(TbInstrumentationConfig { ... })  // OPTIONAL: instrumentation/trace config (§11)
+		.with_hooks(TestHooks { ... })                // OPTIONAL: on_pass/on_fail callbacks
+		.build(),
 	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
-	fdr: FdrConfig { ... },          // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-	trace: TbInstrumentationConfig,  // OPTIONAL: instrumentation/trace config (§11)
-	config: ScenarioConfig,          // OPTIONAL: shared scenario state for environments
 	environment <Variant> { ... },   // REQUIRED: execution environment (Bare, Worker, ServiceClient, Servlet)
-	hooks { ... }                    // OPTIONAL: on_pass/on_fail callbacks
 }
 ```
 
 See sections 10.3.4 and 10.4 for detailed environment examples.
 
-#### 10.6.2 Examples
+#### 10.7.2 Examples
 
 **Bare Environment Example**: Pure logic/function invocation
 
@@ -2976,12 +3079,14 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_bare_environment,
-	spec: BareSpec,
-	csp: BareProcess,
+	config: ScenarioConf::builder()
+		.with_spec(BareSpec::latest())
+		.with_csp(BareProcess)
+		.build(),
 	environment Bare {
 		exec: |trace| {
-			trace.event("Received");
-			trace.event("Responded");
+			trace.event("Received")?;
+			trace.event("Responded")?;
 			Ok(())
 		}
 	}
@@ -3038,17 +3143,29 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_client_server_all_layers,
-	spec: ClientServerSpec,
-	csp: ClientServerProcess,
-	fdr: FdrConfig {
-		seeds: 64,
-		max_depth: 128,
-		max_internal_run: 32,
-		timeout_ms: 5000,
-		specs: vec![ClientServerProcess::process()],
-		fail_fast: true,
-		expect_failure: false,
-	},
+	config: ScenarioConf::builder()
+		.with_spec(ClientServerSpec::latest())
+		.with_csp(ClientServerProcess)
+		.with_fdr(FdrConfig {
+			seeds: 64,
+			max_depth: 128,
+			max_internal_run: 32,
+			timeout_ms: 5000,
+			specs: vec![ClientServerProcess::process()],
+			fail_fast: true,
+			expect_failure: false,
+		})
+		.with_hooks(TestHooks {
+			on_pass: Some(Arc::new(|_trace, _result| {
+				// Optional: custom logic on test pass
+				Ok(())
+			})),
+			on_fail: Some(Arc::new(|_trace, _result, _violation| {
+				// Optional: custom logic on test fail
+				Err("Test failed".into())
+			})),
+		})
+		.build(),
 	environment ServiceClient {
 		worker_threads: 2,
 		server: |trace| async move {
@@ -3058,16 +3175,16 @@ tb_scenario! {
 				protocol TokioListener: listener,
 				assertions: trace.share(),
 				handle: |frame, trace| async move {
-					trace.event("connect");
-					trace.event("request");
-					trace.event("response");
+					trace.event("connect")?;
+					trace.event("request")?;
+					trace.event("response")?;
 					Some(frame)
 				}
 			};
 			Ok((handle, addr))
 		},
 		client: |trace, mut client| async move {
-			trace.event("response");
+			trace.event("response")?;
 			let frame = compose! {
 				V0: id: "test",
 				order: 1u64,
@@ -3078,21 +3195,11 @@ tb_scenario! {
 			// Decode response and emit value assertion
 			if let Some(resp_frame) = response {
 				let decoded: TestMessage = crate::decode(&resp_frame.message)?;
-				trace.event_with("message_content", &[], decoded.content);
+				trace.event_with("message_content", &[], decoded.content)?;
 			}
 
-			trace.event("disconnect");
+			trace.event("disconnect")?;
 			Ok(())
-		}
-	},
-	hooks {
-		on_pass: |_trace, _result| {
-			// Optional: custom logic on test pass
-			Ok(())
-		},
-		on_fail: |_trace, result| {
-			// Optional: custom logic on test fail
-			Err(format!("Test failed with result: {result:?}").into())
 		}
 	}
 }
@@ -3103,26 +3210,25 @@ This test verifies:
 - **L2**: Valid state transitions with internal events
 - **L3**: Trace refinement across multiple exploration seeds
 
-#### 10.6.3 Hook Semantics
+#### 10.7.3 Hook Semantics
 
 Hooks provide optional callbacks that can observe and override test outcomes:
 
-- Declared under `hooks { ... }` with signatures like
-  `on_pass: |trace, result| { ... }` and `on_fail: |trace, result| { ... }`.
-- Each hook is a closure of type
-  `FnOnce(&ConsumedTrace, &ScenarioResult) -> Result<(), Box<dyn std::error::Error>>`,
-  though the return type is usually inferred by the compiler.
+- Configured via `.with_hooks(TestHooks { on_pass: Some(...), on_fail: Some(...) })`
+  in the `ScenarioConf` builder.
+- Each hook is a closure wrapped in `Arc`, of type
+  `Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>` for `on_pass`
+  and `Arc<dyn Fn(&HookContext, &SpecViolation) -> Result<(), TightBeamError> + Send + Sync>` for `on_fail`.
 - `Ok(())` means the hook accepts the outcome and the test passes.
 - `Err(e)` means the hook rejects the outcome and the test fails, with
   `e.to_string()` reported as the failure message.
-- Hooks receive the full `ScenarioResult`, allowing inspection of assertion
-  violations, CSP validation results, FDR verdicts, and timing/schedulability
-  analysis, and can freely use `?` to propagate any error type implementing
-  `std::error::Error`.
+- Hooks receive `HookContext` containing the consumed trace, FDR verdict (if enabled),
+  FDR config, process spec, timing constraints, and assertion spec, allowing inspection
+  of all verification results.
 
-### 10.7 Coverage-Guided Fuzzing with AFL
+### 10.8 Coverage-Guided Fuzzing with AFL
 
-#### 10.7.1 Concept
+#### 10.8.1 Concept
 
 TightBeam integrates [AFL.rs](https://github.com/rust-fuzz/afl.rs), a Rust port
 of American Fuzzy Lop, for coverage-guided fuzzing of protocol implementations.
@@ -3141,15 +3247,17 @@ AFL-compatible fuzz targets that leverage the oracle for guided exploration:
 ```rust
 tb_scenario! {
 	fuzz: afl,              // ← AFL fuzzing mode
-	spec: MySpec,
-	csp: MyProcess,         // ← oracle for valid state navigation
+	config: ScenarioConf::builder()
+		.with_spec(MySpec::latest())
+		.with_csp(MyProcess)   // ← oracle for valid state navigation
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			// AFL provides random bytes, oracle navigates state machine
 			match trace.oracle().fuzz_from_bytes() {
 				Ok(()) => {
 					for event in trace.oracle().trace() {
-						trace.event(event.0);
+						trace.event(event.0)?;
 					}
 					Ok(())
 				}
@@ -3163,10 +3271,9 @@ tb_scenario! {
 **Feature Requirements**:
 - `testing-csp` feature flag (required for CSP oracle)
 - `cargo-afl` installed: `cargo install cargo-afl`
-- Fuzz targets gated by `#[cfg(fuzzing)]` to avoid compilation during normal tests
 - `std` feature flag (required for most fuzz targets)
 
-#### 10.7.2 Creating Fuzz Targets
+#### 10.8.2 Creating Fuzz Targets
 
 **Example Fuzz Target**:
 
@@ -3209,18 +3316,19 @@ tb_process_spec! {
 
 // AFL fuzz target - compiled with `cargo afl build`
 // Note: AFL fuzz targets generate `fn main()` - do NOT include `name:` parameter
-#[cfg(fuzzing)]
 tb_scenario! {
 	fuzz: afl,
-	spec: SimpleFuzzSpec,
-	csp: SimpleFuzzProc,
+	config: ScenarioConf::builder()
+		.with_spec(SimpleFuzzSpec::latest())
+		.with_csp(SimpleFuzzProc)
+		.build(),
 	environment Bare {
 		exec: |trace| {
 			// AFL provides bytes, oracle interprets as state machine choices
 			match trace.oracle().fuzz_from_bytes() {
 				Ok(()) => {
 					for event in trace.oracle().trace() {
-						trace.event(event.0);
+						trace.event(event.0)?;
 					}
 					Ok(())
 				}
@@ -3231,7 +3339,7 @@ tb_scenario! {
 }
 ```
 
-#### 10.7.3 Building and Running Fuzz Targets
+#### 10.8.3 Building and Running Fuzz Targets
 
 **Prerequisites**:
 ```bash
@@ -3253,7 +3361,7 @@ FUZZ_TARGET=$(ls target/debug/deps/fuzzing-* 2>/dev/null | grep -v '\.d$' | head
 cargo afl fuzz -i fuzz_in -o fuzz_out "$FUZZ_TARGET"
 ```
 
-#### 10.7.4 Advanced: CSP Oracle Integration
+#### 10.8.4 Advanced: CSP Oracle Integration
 
 The `CspOracle` interprets AFL's random bytes as state machine navigation choices,
 ensuring fuzz inputs trigger valid protocol behavior:
@@ -3280,7 +3388,7 @@ State: S0 → S1 → S1 → S2
 Result: Crash at state S1 after "action_b"
 ```
 
-#### 10.7.5 IJON Integration: Input-to-State Correspondence
+#### 10.8.5 IJON Integration: Input-to-State Correspondence
 
 TightBeam optionally integrates with AFL's IJON extension[^ijon2020] for
 state-aware fuzzing. IJON enables "input-to-state correspondence" - bridging
@@ -3346,7 +3454,7 @@ tb_process_spec! {
 }
 ```
 
-### 10.8 Feature Matrix
+### 10.9 Feature Matrix
 
 The following table summarizes capabilities available across the testing layers:
 
@@ -3383,14 +3491,14 @@ The following table summarizes capabilities available across the testing layers:
 | CSP oracle for fuzzing | – | – | – | `csp` + `fuzz` |
 | IJON state annotations | – | – | – | `csp` + `fuzz-ijon` |
 
-### 10.9 Standards Compliance Mapping
+### 10.10 Standards Compliance Mapping
 
 This section maps tightbeam's verification capabilities to common high-assurance
 standards and regulations. The framework provides native support for many
 certification requirements, though final certification evidence and process
 compliance remain the responsibility of the integrator.
 
-#### 10.9.1 DO-178C DAL A / ISO 26262 ASIL-D
+#### 10.10.1 DO-178C DAL A / ISO 26262 ASIL-D
 
 **Requirements**: 100% MC/DC coverage, systematic fault injection, and complete
 traceability from requirements to test evidence.
@@ -3407,7 +3515,7 @@ traceability from requirements to test evidence.
 - CSP process specifications (§10.3) model state machines for formal trace
   verification
 
-#### 10.9.2 IEC 61508 SIL 4
+#### 10.10.2 IEC 61508 SIL 4
 
 **Requirements**: Systematic fault injection with proof that all error paths 
 are exercised and tested.
@@ -3422,7 +3530,7 @@ are exercised and tested.
 - Multi-seed exploration (default 64 seeds) verifies behavior under different
   scheduling interleavings
 
-#### 10.9.3 NASA/ESA ECSS-E-HB-40A
+#### 10.10.3 NASA/ESA ECSS-E-HB-40A
 
 **Requirements**: Fault tree analysis with coverage of all single-event upsets
 (SEUs) and failure propagation paths.
@@ -3435,7 +3543,7 @@ are exercised and tested.
 - Instrumentation events (§11) capture fault propagation sequences for post-hoc
   analysis
 
-#### 10.9.4 Common Criteria EAL7
+#### 10.10.4 Common Criteria EAL7
 
 **Requirements**: Formal verification methods with machine-checkable evidence
 and complete attack/failure tree coverage.
@@ -3450,7 +3558,7 @@ and complete attack/failure tree coverage.
 - Process specifications export to standard CSP notations for external tool
   verification
 
-#### 10.9.5 FMEA/FMECA (MIL-STD-1629, ISO 26262)
+#### 10.10.5 FMEA/FMECA (MIL-STD-1629, ISO 26262)
 
 **Requirements**: Enumerate all failure modes, inject each mode, observe effects,
 and calculate Risk Priority Numbers (RPN) based on Severity × Occurrence ×
@@ -3539,7 +3647,7 @@ fdr: FdrConfig {
 }
 ```
 
-#### 10.9.6 Standards Compliance Summary
+#### 10.10.6 Standards Compliance Summary
 
 The following table summarizes tightbeam's native support for high-assurance
 standards requirements:
@@ -3691,6 +3799,58 @@ Privacy:
 - Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
 - Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
 
+### 11.8 Logging Subsystem
+
+Implements RFC 5424-compliant logging with trait-based backends.
+
+#### RFC 5424 Severity Levels
+
+```rust
+pub enum LogLevel {
+	Emergency = 0, 
+	Alert = 1, 
+	Critical = 2, 
+	Error = 3,
+	Warning = 4, 
+	Notice = 5, 
+	Info = 6, 
+	Debug = 7,
+}
+```
+
+#### LogBackend Trait
+
+```rust
+pub trait LogBackend: Send + Sync {
+	fn emit(&self, record: &LogRecord) -> Result<(), LogError>;
+	fn accepts(&self, level: LogLevel) -> bool;
+	fn flush(&self) -> Result<(), LogError> { Ok(()) }
+}
+```
+
+Built-in backends: `StdoutBackend` (std only), `MultiplexBackend` (fan-out).
+
+#### Log Filtering
+
+```rust
+let filter = LogFilter::new(LogLevel::Warning)
+	.with_component("security", LogLevel::Debug);
+```
+
+#### Integration
+
+```rust
+use tightbeam::trace::{TraceCollector, logging::*};
+
+let config = LoggerConfig::new(
+	Box::new(StdoutBackend),
+	LogFilter::new(LogLevel::Info)
+).with_default_level(LogLevel::Info);
+
+let trace = TraceCollector::default().with_logger(config);
+trace.event("msg")?.with_log_level(LogLevel::Error).emit();
+```
+
 ## 12. Misc
 
 ### 12.1 Utilities
@@ -3789,13 +3949,15 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_ping_pong_worker,
-	spec: PingPongWorkerSpec,
-	csp: PingPongWorkerProcess,
+	config: ScenarioConf::builder()
+		.with_spec(PingPongWorkerSpec::latest())
+		.with_csp(PingPongWorkerProcess)
+		.build(),
 	environment Worker {
 		worker: PingPongWorker,
 		stimulus: |trace, worker| {
 			// Test accepted message
-			trace.event("relay_start");
+			trace.event("relay_start")?;
 
 			let ping_msg = RequestMessage {
 				content: "PING".to_string(),
@@ -3804,12 +3966,12 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg))?;
 			if let Some(pong) = response {
-				trace.event("relay_success");
-				trace.event_with("response_result", &[], pong.result);
+				trace.event("relay_success")?;
+				trace.event_with("response_result", &[], pong.result)?;
 			}
 
 			// Test rejected message
-			trace.event("relay_start");
+			trace.event("relay_start")?;
 
 			let pong_msg = RequestMessage {
 				content: "PONG".to_string(),
@@ -3818,7 +3980,7 @@ tb_scenario! {
 
 			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg));
 			if result.is_err() {
-				trace.event("relay_rejected");
+				trace.event("relay_rejected")?;
 			}
 
 			Ok(())
@@ -3866,8 +4028,10 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_servlet_with_workers,
-	spec: PingPongSpec,
-	csp: PingPongProcess,
+	config: ScenarioConf::builder()
+		.with_spec(PingPongSpec::latest())
+		.with_csp(PingPongProcess)
+		.build(),
 	environment Servlet {
 		servlet: PingPongServletWithWorker,
 		setup: |addr| async move {
@@ -3887,7 +4051,7 @@ tb_scenario! {
 			}
 
 			// Client-side assertion before sending
-			trace.event("request_received");
+			trace.event("request_received")?;
 
 			// Test winning case
 			let ping_message = generate_message(42, None)?;
@@ -3895,11 +4059,11 @@ tb_scenario! {
 			let response_message: ResponseMessage = decode(&response.unwrap().message)?;
 
 			// Emit value assertions for spec verification
-			trace.event_with("response_result", &[], response_message.result);
-			trace.event_with("is_winner", &[], response_message.is_winner);
+			trace.event_with("response_result", &[], response_message.result)?;
+			trace.event_with("is_winner", &[], response_message.is_winner)?;
 
 			// Client-side assertion after receiving
-			trace.event("pong_sent");
+			trace.event("pong_sent")?;
 
 			Ok(())
 		}
@@ -3927,6 +4091,7 @@ tb_scenario! {
 - [RFC 3447](https://datatracker.ietf.org/doc/html/rfc3447): Public-Key Cryptography Standards (PKCS) #1: RSA Cryptography Specifications Version 2.1
 - [RFC 5246](https://datatracker.ietf.org/doc/html/rfc5246): The Transport Layer Security (TLS) Protocol Version 1.2
 - [RFC 5280](https://datatracker.ietf.org/doc/html/rfc5280): Internet X.509 Public Key Infrastructure Certificate and CRL Profile
+- [RFC 5424](https://datatracker.ietf.org/doc/html/rfc5424): The Syslog Protocol
 - [RFC 5480](https://datatracker.ietf.org/doc/html/rfc5480): Elliptic Curve Cryptography Subject Public Key Information
 - [RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652): Cryptographic Message Syntax (CMS)
 - [RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869): HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
