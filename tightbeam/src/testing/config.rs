@@ -214,7 +214,9 @@ impl HookContext {
 
 /// Test lifecycle hooks (receive full scenario context)
 pub struct TestHooks {
+	#[allow(clippy::type_complexity)]
 	pub on_pass: Option<Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>>,
+	#[allow(clippy::type_complexity)]
 	pub on_fail: Option<Arc<dyn Fn(&HookContext, &SpecViolation) -> Result<(), TightBeamError> + Send + Sync>>,
 }
 

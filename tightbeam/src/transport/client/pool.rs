@@ -21,7 +21,6 @@ use crate::transport::protocols::{PersistentConnection, Protocol};
 use crate::transport::{MessageCollector, MessageEmitter, TransportResult, X509ClientConfig};
 
 #[cfg(feature = "x509")]
-#[cfg(feature = "x509")]
 use crate::crypto::x509::Certificate;
 #[cfg(not(feature = "x509"))]
 use crate::transport::client::ClientBuilder;

@@ -573,6 +573,7 @@ impl ExtractVerifyingKey for crate::crypto::sign::ecdsa::Secp256k1VerifyingKey {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::ecies::Secp256k1EciesMessage;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::Signer;
@@ -676,11 +677,9 @@ mod tests {
 		let test_cert = create_test_certificate();
 
 		// Helper to create client with security offer and build hello
+		#[allow(clippy::type_complexity)]
 		let setup_client = |offer: Option<SecurityOffer>| -> Result<
-			(
-				EciesHandshakeClient<DefaultCryptoProvider, crate::crypto::ecies::Secp256k1EciesMessage>,
-				[u8; 32],
-			),
+			(EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>, [u8; 32]),
 			Box<dyn std::error::Error>,
 		> {
 			let mut client = TestEciesClientBuilder::new().build();

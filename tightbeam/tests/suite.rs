@@ -45,7 +45,7 @@ mod fault;
 mod fmea;
 
 // Delay-Tolerant Networking tests
-#[cfg(all(feature = "full"))]
+#[cfg(feature = "full")]
 mod dtn;
 
 // DLT Network test

@@ -10,16 +10,9 @@ use std::sync::Arc;
 
 use core::time::Duration;
 
-use crate::crypto::aead::{KeyInit, RuntimeAead};
-use crate::crypto::ecies::{EciesEphemeral, EciesPublicKeyOps};
+use crate::crypto::aead::RuntimeAead;
 use crate::crypto::profiles::CryptoProvider;
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-use crate::crypto::sign::{SignatureEncoding, Verifier};
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::der::oid::AssociatedOid;
-use crate::spki::EncodePublicKey;
-use crate::transport::handshake::client::ExtractVerifyingKey;
 use crate::transport::handshake::{
 	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 };

@@ -1,5 +1,7 @@
 //! X.509 certificate test helpers
 
+#![allow(dead_code)]
+
 use core::time::Duration;
 use std::{sync::Arc, time::Instant};
 

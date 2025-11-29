@@ -271,7 +271,9 @@ where
 
 	/// Get the x509 configuration
 	#[cfg(feature = "x509")]
-	pub fn to_encryption_config_ref(&self) -> Option<&TransportEncryptionConfig<crate::crypto::profiles::DefaultCryptoProvider>> {
+	pub fn to_encryption_config_ref(
+		&self,
+	) -> Option<&TransportEncryptionConfig<crate::crypto::profiles::DefaultCryptoProvider>> {
 		self.x509_config.as_ref()
 	}
 

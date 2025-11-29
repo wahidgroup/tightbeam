@@ -34,8 +34,6 @@ use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachin
 use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
 
-#[cfg(feature = "secp256k1")]
-
 /// Client-side CMS handshake orchestrator.
 ///
 /// Generic over `P: CryptoProvider` which defines the complete cryptographic

@@ -1,5 +1,3 @@
-#![cfg(feature = "builder")]
-
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
@@ -11,7 +9,7 @@ use std::sync::Arc;
 
 use core::time::Duration;
 
-use super::client::GenericClient;
+use super::GenericClient;
 use crate::asn1::Frame;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::error::TransportFailure;

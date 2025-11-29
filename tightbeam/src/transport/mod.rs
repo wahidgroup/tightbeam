@@ -52,9 +52,9 @@ pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 pub type TransportResult<T> = Result<T, TransportError>;
 
 #[cfg(feature = "x509")]
-use crate::crypto::x509::policy::CertificateValidation;
-#[cfg(feature = "x509")]
 use crate::crypto::profiles::CryptoProvider;
+#[cfg(feature = "x509")]
+use crate::crypto::x509::policy::CertificateValidation;
 use crate::transport::handshake::HandshakeKeyManager;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
