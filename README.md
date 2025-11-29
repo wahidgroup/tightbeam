@@ -280,7 +280,8 @@ pub trait SecurityProfile {
 	type SignatureAlg: SignatureAlgorithmIdentifier;
 	type CurveOid: AssociatedOid;
 	type KemOid: AssociatedOid;
-	const KEY_WRAP_OID: Option<ObjectIdentifier>;
+	
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
 }
 ```
 
@@ -315,7 +316,8 @@ impl SecurityProfile for MyAppProfile {
 	type SignatureAlg = Secp256k1Signature;
 	type CurveOid = Secp256k1Oid;
 	type KemOid = Kyber1024Oid;
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
+	
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
 ```
 
@@ -332,7 +334,8 @@ impl SecurityProfile for TightbeamProfile {
 	type SignatureAlg = Secp256k1Signature;
 	type CurveOid = Secp256k1Oid;
 	type KemOid = Kyber1024Oid;
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
+	
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
 ```
 
@@ -480,7 +483,8 @@ cryptographic implementations to `SecurityProfile` metadata:
 
 ```rust
 pub trait CryptoProvider:
-	Default + Clone +
+	Default +
+	Copy + // zero-sized type (ZST),
 	DigestProvider +
 	AeadProvider +
 	SigningProvider +
@@ -833,9 +837,11 @@ Encryption with Associated Data (AEAD) ciphers. This requirement is enforced at
 the type system level through trait bounds:
 
 ```rust
-pub fn with_cipher<C, Cipher>(mut self, cipher: &Cipher) -> Self
+pub fn with_cipher<C, Cipher>(mut self, cipher: Cipher) -> Self
 where
-    Cipher: Aead + Clone + 'static,  // AEAD trait bound required
+	C: AssociatedOid,
+	Cipher: Aead + 'static, // AEAD trait bound required
+	T: CheckAeadOid<C>;
 ```
 
 This design ensures MI over plaintext is cryptographically sound:
@@ -987,9 +993,9 @@ use tightbeam::Matrix;
 
 // Full 3x3 matrix
 let mut matrix = Matrix::<3>::default();
-matrix.set(0, 0, 1)?; // Feature A: enabled
-matrix.set(1, 1, 1)?; // Feature B: enabled
-matrix.set(2, 2, 0)?; // Feature C: disabled
+matrix.set(0, 0, 1); // Feature A: enabled
+matrix.set(1, 1, 1); // Feature B: enabled
+matrix.set(2, 2, 0); // Feature C: disabled
 
 // Embed in a frame
 let frame = compose! {
@@ -1213,13 +1219,14 @@ length-prefixed envelopes. Supports both `std::net` (sync) and `tokio` (async).
 **Example:**
 ```rust
 use std::net::TcpListener;
-use tightbeam::{server, compose};
+use tightbeam::{server, compose, Frame};
 
 let listener = TcpListener::bind("127.0.0.1:8080")?;
 server! {
 	protocol std::net::TcpListener: listener,
-	|message: RequestMessage, tx| async move {
-		tx.send(ResponseMessage { data: "response".to_string() }).await.ok();
+	handle: |message: Frame| async move {
+		// Echo the frame back
+		Ok(Some(message))
 	}
 }
 ```
@@ -1253,10 +1260,18 @@ pub trait ReceptorPolicy<T: Message>: Send + Sync {
 **RestartPolicy Trait:**
 ```rust
 pub trait RestartPolicy: Send + Sync {
+	/// Evaluate whether to restart after a transport operation.
+	///
+	/// # Arguments
+	/// * `frame` - Boxed frame from the failed operation
+	/// * `failure` - The failure reason
+	/// * `attempt` - The current attempt number (0-indexed)
+	///
+	/// # Returns
+	/// * `RetryAction` - What action to take (retry with frame, or no retry)
 	fn evaluate(
-		&self,
-		message: &Frame,
-		result: &TransportResult<&Frame>,
+		&self, frame: Box<Frame>, 
+		failure: &TransportFailure, 
 		attempt: usize
 	) -> RetryAction;
 }
@@ -1265,6 +1280,7 @@ pub trait RestartPolicy: Send + Sync {
 **TransitStatus:**
 ```rust
 pub enum TransitStatus {
+	#[default]
 	Request = 0,
 	Accepted = 1,
 	Busy = 2,
@@ -1276,11 +1292,12 @@ pub enum TransitStatus {
 
 **RetryAction:**
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub enum RetryAction {
+	/// Retry with the provided frame (same or modified from input)
+	Retry(Box<Frame>),
+	/// Do not retry, propagate the error
 	NoRetry,
-	RetryWithSame,
-	RetryAfter(Duration),
-	RetryWithModified(Box<Frame>),
 }
 ```
 
@@ -1364,9 +1381,9 @@ tightbeam::policy! {
 		}
 	}
 
-	RestartPolicy: RetryThreeTimes |_message, result, attempt| {
-		if attempt < 3 && result.is_err() {
-			RetryAction::RetryAfter(Duration::from_secs(1))
+	RestartPolicy: RetryThreeTimes |frame, _failure, attempt| {
+		if attempt < 3 {
+			RetryAction::Retry(frame)
 		} else {
 			RetryAction::NoRetry
 		}
@@ -1377,20 +1394,14 @@ tightbeam::policy! {
 **Composing Policies:**
 
 ```rust
-// Server-side
-let listener = TokioListener::bind_with_policies(
-	addr,
-	ServerPolicies::default()
-		.with_collector_gate(vec![Box::new(IdPatternGate)])
-)?;
+// Client-side with policies
+let builder = ClientBuilder::<TokioListener>::builder()
+	.with_emitter_gate(IdPatternGate)
+	.with_collector_gate(PriorityGate)
+	.with_restart(RestartLinearBackoff::new(3, 1000, 1, None))
+	.build();
 
-// Client-side
-let client = TcpTransport::connect_with_policies(
-	addr,
-	ClientPolicies::default()
-		.with_emitter_gate(vec![Box::new(PriorityGate)])
-		.with_restart(RestartLinearBackoff::new(3, 1000, 1, None))
-)?;
+let mut client = builder.connect(addr).await?;
 ```
 
 ### 8.5 Handshake Protocols
@@ -1715,15 +1726,15 @@ Client                              Server
 ```rust
 // Client offers supported profiles
 let security_offer = SecurityOffer {
-	supported_profiles: vec![
-		ProfileDescriptor { /* SHA3-256 + AES-256-GCM + secp256k1 */ },
-		ProfileDescriptor { /* SHA-256 + AES-128-GCM + P-256 */ },
+	profiles: vec![
+		SecurityProfileDesc { /* SHA3-256 + AES-256-GCM + secp256k1 */ },
+		SecurityProfileDesc { /* SHA-256 + AES-128-GCM + P-256 */ },
 	],
 };
 
 // Server selects first mutually supported profile
 let security_accept = SecurityAccept {
-	selected_profile: ProfileDescriptor { /* chosen profile */ },
+	profile: SecurityProfileDesc { /* chosen profile */ },
 };
 ```
 
@@ -1754,23 +1765,23 @@ let security_accept = SecurityAccept {
 ### 8.6 Connection Pooling
 
 Connection pooling enables efficient connection reuse across multiple requests, 
-eliminating redundant TLS handshakes. Both `ClientBuilder` and `ConnectionPool` 
-implement the `Client` trait, providing identical builder APIs.
+eliminating redundant TLS handshakes. `ConnectionPool` uses a builder pattern 
+where the pool is configured once via `.builder()`, then `.connect()` retrieves 
+connections from the configured pool.
 
 **Example**:
 
 ```rust
-// Create shared pool (once per application)
-let pool = Arc::new(ConnectionPool::<TokioListener, 3>::new(PoolConfig::default()));
-
-// Use pooled client (identical API to ClientBuilder)
-let mut client = pool
-	.connect(server_addr)
+// Create shared pool with configuration (once per application)
+let pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+	.with_config(PoolConfig::default())
 	.with_server_certificate(SERVER_CERT)?
 	.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 	.with_timeout(Duration::from_millis(5000))
-	.build()
-	.await?;
+	.build());
+
+// Get connection from pool
+let mut client = pool.connect(server_addr).await?;
 
 client.emit(frame, None).await?;
 // Connection automatically returned to pool on drop
@@ -1870,46 +1881,71 @@ as a set of configurations. Servlets must be provided a relay which is used to
 relay `Message` types to the worker without the entire Frame. A servlet must
 only be responsible for a single message type.
 
+**Step 1**: Define configuration struct outside the macro:
+
+```rust
+#[derive(Clone)]
+pub struct PingPongServletConf {
+	pub lotto_number: u32,
+}
+```
+
+**Step 2**: Define the servlet using `EnvConfig`:
+
 ```rust
 tightbeam::servlet! {
-	pub PingPongServletWithWorker<RequestMessage>,
-	protocol: Listener,
-	config: {
-		lotto_number: u32
-	},
-	workers: |config| {
-		ping_pong: PingPongWorker = PingPongWorker::start(),
-		lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConf {
-			lotto_number: config.lotto_number,
-		})
-	},
-	handle: |message, trace, _config, workers| async move {
-		let decoded = decode::<RequestMessage, _>(&message.message)?;
+	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConf>,
+	protocol: TokioListener,
+	handle: |frame, trace, config, workers| async move {
+		// Handler receives Frame, not decoded message
+		let decoded = decode::<RequestMessage, _>(&frame.message)?;
 		let decoded_arc = Arc::new(decoded);
-		let (ping_result, lucky_result) = tokio::join!( // Parallel processing
-			workers.ping_pong.relay(Arc::clone(&trace), Arc::clone(&decoded_arc)),
-			workers.lucky_number.relay(Arc::clone(&trace), Arc::clone(&decoded_arc))
+		
+		// Workers are accessed via the workers parameter
+		let (ping_result, lucky_result) = tokio::join!(
+			workers.relay::<PingPongWorker>(Arc::clone(&decoded_arc)),
+			workers.relay::<LuckyNumberDeterminer>(Arc::clone(&decoded_arc))
 		);
 
 		let reply = match ping_result {
-			Ok(reply) => reply,
-			Err(_) => return None,
+			Ok(Some(reply)) => reply,
+			_ => return Ok(None),
 		};
 
 		let is_winner = match lucky_result {
-			Ok(is_winner) => is_winner,
-			Err(_) => return None,
+			Ok(Some(is_winner)) => is_winner,
+			_ => return Ok(None),
 		};
 
-		Ok(compose! {
-			V0: id: b"ping-pong-servlet-response-id",
+		Ok(Some(compose! {
+			V0: id: frame.metadata.id.clone(),
 				message: ResponseMessage {
 					result: reply.result,
 					is_winner,
 				}
-		}?)
+		}?))
 	}
 }
+```
+
+**Step 3**: Configure workers via `ServletConf` when starting the servlet:
+
+```rust
+// Create workers
+let ping_pong_worker = PingPongWorker::start();
+let lucky_number_worker = LuckyNumberDeterminer::start(LuckyNumberDeterminerConf {
+	lotto_number: 42,
+});
+
+// Build servlet configuration
+let servlet_conf = ServletConf::<TokioListener, RequestMessage>::builder()
+	.with_config(Arc::new(PingPongServletConf { lotto_number: 42 }))
+	.with_worker(ping_pong_worker)
+	.with_worker(lucky_number_worker)
+	.build();
+
+// Start the servlet
+PingPongServletWithWorker::start(trace, Some(servlet_conf)).await?
 ```
 
 **Efficient Parallel Worker Processing**
@@ -1976,7 +2012,7 @@ cluster so it can register it under its hive.
 **Regular Drone Example** (morphs between servlets one at a time):
 
 ```rust
-tightbeam::drone! {
+drone! {
 	pub RegularDrone,
 	protocol: Listener,
 	servlets: {
@@ -1996,7 +2032,7 @@ let response = drone.register_with_cluster(cluster_addr).await?;
 **Hive Example** (manages multiple servlets simultaneously on different ports):
 
 ```rust
-tightbeam::drone! {
+drone! {
 	pub MyHive,
 	protocol: TokioListener,
 	hive: true,
@@ -2013,7 +2049,7 @@ let hive = MyHive::start(TraceCollector::new(), None).await?;
 **Drone with Policies**:
 
 ```rust
-tightbeam::drone! {
+drone! {
 	pub SecureDrone,
 	protocol: Listener,
 	policies: {
@@ -2944,8 +2980,8 @@ use tightbeam::utils::BasisPoints;
 
 let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
 	.with_fault(
-		States::Sending,            // Type-safe state enum
-		Event("response"),          // Event label
+		States::Sending,              // Type-safe state enum
+		Event("response"),            // Event label
 		|| NetworkTimeoutError {...}, // Error factory
 		BasisPoints::new(3000),       // 30% probability
 	)
@@ -3949,13 +3985,15 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_ping_pong_worker,
-	config: ScenarioConf::builder()
+	config: ScenarioConf::<()>::builder()
 		.with_spec(PingPongWorkerSpec::latest())
 		.with_csp(PingPongWorkerProcess)
 		.build(),
 	environment Worker {
-		worker: PingPongWorker,
-		stimulus: |trace, worker| {
+		setup: |_trace| {
+			PingPongWorker::default()
+		},
+		stimulus: |trace, worker| async move {
 			// Test accepted message
 			trace.event("relay_start")?;
 
@@ -3964,7 +4002,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg))?;
+			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg)).await?;
 			if let Some(pong) = response {
 				trace.event("relay_success")?;
 				trace.event_with("response_result", &[], pong.result)?;
@@ -3978,7 +4016,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg));
+			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg)).await;
 			if result.is_err() {
 				trace.event("relay_rejected")?;
 			}
