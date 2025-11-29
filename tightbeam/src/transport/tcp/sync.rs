@@ -52,6 +52,8 @@ pub struct TcpTransport<S: ProtocolStream> {
 	operation_timeout: Option<std::time::Duration>,
 
 	server_certificates: Vec<Arc<Certificate>>,
+	
+	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 
 	client_certificate: Option<Arc<Certificate>>,
 

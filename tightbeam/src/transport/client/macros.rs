@@ -237,33 +237,6 @@ macro_rules! client {
 		#[cfg(feature = "std")]
 		{ $transport = $transport.with_timeout($value); }
 	};
-	// x509_gate accepts array of validators
-	(@process_policy $transport:expr, x509_gate: [ $( $validator:expr ),* $(,)? ], $($rest:tt)*) => {
-		$(
-			#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-			{ $transport = $transport.with_x509_gate($validator); }
-		)*
-		$crate::client!(@process_policy $transport, $($rest)*);
-	};
-	(@process_policy $transport:expr, x509_gate: [ $( $validator:expr ),* $(,)? ] $(,)?) => {
-		$(
-			#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-			{ $transport = $transport.with_x509_gate($validator); }
-		)*
-	};
-	(@process_policy $transport:expr, with_x509_gate: [ $( $validator:expr ),* $(,)? ], $($rest:tt)*) => {
-		$(
-			#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-			{ $transport = $transport.with_x509_gate($validator); }
-		)*
-		$crate::client!(@process_policy $transport, $($rest)*);
-	};
-	(@process_policy $transport:expr, with_x509_gate: [ $( $validator:expr ),* $(,)? ] $(,)?) => {
-		$(
-			#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-			{ $transport = $transport.with_x509_gate($validator); }
-		)*
-	};
 	// Base case: no more policies
 	(@process_policy $transport:expr,) => {};
 	(@process_policy $transport:expr) => {};
@@ -313,23 +286,6 @@ macro_rules! client {
 			$builder = $builder.with_timeout($value);
 		}
 		$crate::client!(@process_policy_builder $builder, $($rest)*);
-	};
-	(@process_policy_builder $builder:expr, x509_gate: [ $( $validator:expr ),* $(,)? ], $($rest:tt)*) => {
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		{
-			$(
-				$builder = $builder.with_x509_gate($validator);
-			)*
-		}
-		$crate::client!(@process_policy_builder $builder, $($rest)*);
-	};
-	(@process_policy_builder $builder:expr, x509_gate: [ $( $validator:expr ),* $(,)? ] $(,)?) => {
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		{
-			$(
-				$builder = $builder.with_x509_gate($validator);
-			)*
-		}
 	};
 	(@process_policy_builder $builder:expr,) => {};
 	(@process_policy_builder $builder:expr) => {};

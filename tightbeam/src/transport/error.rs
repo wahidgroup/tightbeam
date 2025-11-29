@@ -54,6 +54,10 @@ pub enum TransportError {
 	InvalidAddress,
 	#[cfg_attr(feature = "derive", error("Invalid state"))]
 	InvalidState,
+	#[cfg(feature = "x509")]
+	#[cfg_attr(feature = "derive", error("Invalid certificate: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	InvalidCertificate(crate::crypto::x509::error::CertificateValidationError),
 	#[cfg_attr(feature = "derive", error("Message not sent: {1:?} - {0:?}"))]
 	MessageNotSent(Box<Frame>, TransportFailure),
 	#[cfg_attr(feature = "derive", error("Operation failed: {0:?}"))]

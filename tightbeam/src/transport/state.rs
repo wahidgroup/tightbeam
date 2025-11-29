@@ -99,4 +99,9 @@ pub trait EncryptedProtocolState {
 	fn to_client_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
 		None
 	}
+
+	/// Get server validators (for client-side server certificate validation)
+	fn to_server_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
+		None
+	}
 }

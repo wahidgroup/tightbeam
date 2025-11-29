@@ -264,41 +264,41 @@ where
 		ServletConfBuilder::default()
 	}
 
-	/// Get the x509 configuration
-	#[cfg(feature = "x509")]
-	pub fn x509(&self) -> Option<&TransportEncryptionConfig> {
-		self.x509_config.as_ref()
-	}
-
-	/// Get the servlet application config (downcasted to the specific type)
-	pub fn config<C: 'static>(&self) -> Option<&Arc<C>> {
-		self.servlet_config.as_ref()?.downcast_ref()
-	}
-
 	/// Get a worker by name (downcasted to the specific type)
 	pub fn worker<W: 'static>(&self, name: &str) -> Option<&W> {
 		self.workers.get(name)?.downcast_ref()
 	}
 
-	/// Get servlet config for internal use (crate-visible)
+	/// Get the x509 configuration
+	#[cfg(feature = "x509")]
+	pub fn to_encryption_config_ref(&self) -> Option<&TransportEncryptionConfig> {
+		self.x509_config.as_ref()
+	}
+
+	/// Get the servlet application config (downcasted to the specific type)
+	pub fn to_env_config_ref<C: 'static>(&self) -> Option<&Arc<C>> {
+		self.servlet_config.as_ref()?.downcast_ref()
+	}
+
+	/// Get servlet config for internal use
 	#[doc(hidden)]
 	pub fn to_servlet_conf_ref(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
 		self.servlet_config.as_ref()
 	}
 
-	/// Get workers map for internal use (crate-visible)
+	/// Get workers map for internal use
 	#[doc(hidden)]
 	pub fn to_workers(self) -> HashMap<String, Box<dyn Any + Send + Sync>> {
 		self.workers
 	}
 
-	/// Get collector gates for internal use (crate-visible)
+	/// Get collector gates for internal use
 	#[doc(hidden)]
 	pub fn to_collector_gates(self) -> Vec<Arc<dyn crate::policy::GatePolicy + Send + Sync>> {
 		self.collector_gates
 	}
 
-	/// Get collector gates by reference for internal use (crate-visible)
+	/// Get collector gates by reference for internal use
 	#[doc(hidden)]
 	pub fn collector_gates_ref(&self) -> &[Arc<dyn crate::policy::GatePolicy + Send + Sync>] {
 		&self.collector_gates
@@ -347,7 +347,7 @@ where
 {
 	/// Add x509 configuration for encrypted transport
 	#[cfg(feature = "x509")]
-	pub fn with_x509(
+	pub fn with_certificate(
 		mut self,
 		cert: CertificateSpec,
 		key: KeySpec,
@@ -613,7 +613,7 @@ macro_rules! __servlet_start_impl {
 				let bind_addr = <$protocol as $crate::transport::Protocol>::default_bind_address()?;
 
 				#[cfg(feature = "x509")]
-				let (listener, addr) = if let Some(x509_cfg) = servlet_conf.x509() {
+				let (listener, addr) = if let Some(x509_cfg) = servlet_conf.to_encryption_config_ref() {
 					<$protocol as $crate::transport::EncryptedProtocol>::bind_with(
 						bind_addr,
 						x509_cfg.clone()

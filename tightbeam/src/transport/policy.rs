@@ -6,7 +6,6 @@ use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
-use crate::crypto::x509::policy::CertificateValidation;
 use crate::policy::{GatePolicy, ReceptorPolicy};
 use crate::transport::error::TransportFailure;
 use crate::{Frame, Message};
@@ -19,22 +18,17 @@ where
 	fn with_restart<P: RestartPolicy + 'static>(self, _: P) -> Self {
 		unimplemented!("Restart policy is not supported on this transport");
 	}
+
 	fn with_emitter_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
 		unimplemented!("Emitter gate is not supported on this transport");
 	}
+
 	fn with_collector_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
 		unimplemented!("Collector gate is not supported on this transport");
 	}
+
 	fn with_receptor_gate<T: Message, R: ReceptorPolicy<T> + 'static>(self, _: R) -> Self {
 		unimplemented!("Receptor policy is not supported on this transport");
-	}
-
-	#[cfg(all(feature = "x509", feature = "std"))]
-	fn with_x509_gate<V>(self, _: V) -> Self
-	where
-		V: CertificateValidation + 'static,
-	{
-		unimplemented!("X.509 certificate validation is not supported on this transport");
 	}
 
 	#[cfg(feature = "std")]

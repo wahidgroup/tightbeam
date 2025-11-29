@@ -61,4 +61,3 @@ pub mod servlets;
 pub mod storage;
 pub mod types;
 pub mod ultimate;
-pub mod utils;

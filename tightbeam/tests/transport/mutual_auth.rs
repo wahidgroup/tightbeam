@@ -26,8 +26,8 @@ use tightbeam::{
 	decode, exactly, hex,
 	prelude::*,
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{assertions::Presence, macros::IsSome, ScenarioConf},
-	transport::{tcp::r#async::TokioListener, ClientBuilder},
+	testing::{assertions::Presence, macros::IsSome, ScenarioConf, TestHooks},
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	Beamable,
 };
 
@@ -68,8 +68,9 @@ const CLIENT_CERT: CertificateSpec = CertificateSpec::Pem(
 const SERVER_KEY: KeySpec = KeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
 const CLIENT_KEY: KeySpec = KeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
 
-// Client public key for pinning validation (zero-copy, const-constructible)
+// Client public key for server-side validation
 const CLIENT_PUB_KEY: &[u8] = &hex!("044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0");
+// Server-side pinning: validate incoming client certificates
 const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KEY]);
 
 // ============================================================================
@@ -96,7 +97,6 @@ servlet! {
 	protocol: TokioListener,
 	handle: |frame, _trace, _config, _workers| async move {
 		let request: AuthRequest = decode(&frame.message)?;
-
 		let response = AuthResponse {
 			server_id: "mutual-auth-server".to_string(),
 			authenticated: request.client_id == "test-client-mutual-001",
@@ -139,14 +139,13 @@ tb_scenario! {
 		servlet: MutualAuthServlet,
 		start: |trace, _config| async move {
 			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
-				.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
 
 			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
 		setup: |addr, _config| async move {
-			use tightbeam::transport::ConnectionBuilder;
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_server_certificate(SERVER_CERT)?
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
@@ -176,6 +175,120 @@ tb_scenario! {
 			trace.event_with("server_id", &[], response.server_id)?;
 			trace.event_with("authenticated", &[], response.authenticated)?;
 
+			Ok(())
+		}
+	}
+}
+
+// Negative test A: Invalid client certificate
+tb_assert_spec! {
+	pub InvalidClientSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: []
+	}
+}
+
+tb_scenario! {
+	name: test_invalid_client_cert,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(InvalidClientSpec::latest())
+		.with_env_config(())
+		.with_hooks(TestHooks {
+			on_fail: Some(Arc::new(|_context, _violation| {
+				// Expected to fail - authentication should reject invalid client cert
+				Ok(())
+			})),
+			on_pass: None,
+		})
+		.build(),
+	environment Servlet {
+		servlet: MutualAuthServlet,
+		start: |trace, _config| async move {
+			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
+				.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_config(Arc::new(()))
+				.build();
+
+			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
+		},
+		setup: |addr, _config| async move {
+			use tightbeam::testing::utils::{create_test_signing_key, create_test_certificate};
+			const INVALID_KEY: KeySpec = KeySpec::Bytes(&hex!("9999999999999999999999999999999999999999999999999999999999999999"));
+
+			// Create invalid client cert
+			let invalid_key = create_test_signing_key();
+			let invalid_cert = create_test_certificate(&invalid_key);
+
+			// Client with invalid cert - should fail during handshake
+			let certificate = CertificateSpec::Built(Box::new(invalid_cert));
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_server_certificate(SERVER_CERT)?
+				.with_client_identity(certificate, INVALID_KEY)?
+				.build();
+
+			let client = builder.connect(addr).await?;
+			Ok(client)
+		},
+		client: |_trace, mut _client, _config| async move {
+			Ok(())
+		}
+	}
+}
+
+// Negative test B: Invalid server certificate
+tb_assert_spec! {
+	pub InvalidServerSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: []
+	}
+}
+
+tb_scenario! {
+	name: test_invalid_server_cert,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(InvalidServerSpec::latest())
+		.with_env_config(())
+		.with_hooks(TestHooks {
+			on_fail: Some(Arc::new(|_context, _violation| {
+				// Expected to fail - client should reject invalid server cert
+				Ok(())
+			})),
+			on_pass: None,
+		})
+		.build(),
+	environment Servlet {
+		servlet: MutualAuthServlet,
+		start: |trace, _config| async move {
+			use tightbeam::testing::utils::{create_test_signing_key, create_test_certificate};
+			const INVALID_SERVER_KEY: KeySpec = KeySpec::Bytes(&hex!("8888888888888888888888888888888888888888888888888888888888888888"));
+
+			// Server uses different cert than client expects
+			let invalid_server_key = create_test_signing_key();
+			let invalid_server_cert = create_test_certificate(&invalid_server_key);
+
+			let certificate = CertificateSpec::Built(Box::new(invalid_server_cert));
+			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
+				.with_certificate(certificate, INVALID_SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_config(Arc::new(()))
+				.build();
+
+			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
+		},
+		setup: |addr, _config| async move {
+			// Client expects SERVER_CERT, but server presents different cert - should fail during handshake
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_server_certificate(SERVER_CERT)?
+				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+				.build();
+
+			let client = builder.connect(addr).await?;
+			Ok(client)
+		},
+		client: |_trace, mut _client, _config| async move {
 			Ok(())
 		}
 	}

@@ -364,7 +364,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		// Build composite validator if validators are configured
 		#[cfg(all(feature = "x509", feature = "std"))]
-		let validator = self.to_client_validators_ref().map(|validators| {
+		let validator = self.to_server_validators_ref().map(|validators| {
 			let composite = CompositeValidator { validators: Arc::clone(validators) };
 			Arc::new(composite) as Arc<dyn CertificateValidation>
 		});
@@ -398,7 +398,7 @@ pub trait EncryptedMessageIO: MessageIO {
 						.to_server_certificates_ref()
 						.first()
 						.ok_or(TransportError::MissingEncryption)?;
-					key.create_cms_client(Arc::clone(server_cert), validator)?
+					key.create_cms_client(Arc::clone(server_cert), validator.map(|v| Arc::new(vec![v])))?
 				}
 
 				#[cfg(not(feature = "transport-cms"))]

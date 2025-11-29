@@ -15,14 +15,17 @@ use super::client::GenericClient;
 use crate::asn1::Frame;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::error::TransportFailure;
-use crate::transport::{MessageCollector, MessageEmitter, Protocol, TransportResult};
+use crate::transport::{ConnectionBuilder, MessageCollector, MessageEmitter, Protocol, TransportResult};
 
 #[cfg(feature = "x509")]
 mod x509 {
+	pub use crate::crypto::hash::Digest;
+	pub use crate::crypto::hash::Sha3_256;
 	pub use crate::crypto::key::KeySpec;
 	pub use crate::crypto::x509::error::CertificateValidationError;
-	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::crypto::x509::policy::{CertificateValidation, RuntimeCertificatePinning};
 	pub use crate::crypto::x509::CertificateSpec;
+	pub use crate::der::Encode;
 	pub use crate::transport::handshake::HandshakeKeyManager;
 	pub use crate::transport::X509ClientConfig;
 	pub use crate::x509::Certificate;
@@ -44,8 +47,6 @@ pub struct ClientPolicies {
 	restart: Option<DynRestart>,
 	emitter_gates: Vec<DynGate>,
 	collector_gates: Vec<DynGate>,
-	#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-	validators: Vec<DynCertValidator>,
 	timeout: Option<Duration>,
 }
 
@@ -63,9 +64,10 @@ impl GatePolicy for DynGate {
 	}
 }
 
-#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+#[cfg(feature = "x509")]
 pub struct DynCertValidator(pub Arc<dyn CertificateValidation + Send + Sync>);
-#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
+
+#[cfg(feature = "x509")]
 impl CertificateValidation for DynCertValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		self.0.evaluate(cert)
@@ -97,15 +99,6 @@ impl ClientPolicies {
 		self
 	}
 
-	#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-	pub fn with_x509_gate<V>(mut self, v: V) -> Self
-	where
-		V: CertificateValidation + Send + Sync + 'static,
-	{
-		self.validators.push(DynCertValidator(Arc::new(v)));
-		self
-	}
-
 	pub fn with_timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = Some(timeout);
 		self
@@ -118,10 +111,6 @@ impl ClientPolicies {
 	{
 		if let Some(r) = self.restart {
 			transport = transport.with_restart(r);
-		}
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		for v in self.validators.into_iter() {
-			transport = transport.with_x509_gate(v);
 		}
 		for g in self.emitter_gates.into_iter() {
 			transport = transport.with_emitter_gate(g);
@@ -141,6 +130,8 @@ pub struct ClientBuilder<P: Protocol> {
 	#[cfg(feature = "x509")]
 	server_certificates: Vec<Certificate>,
 	#[cfg(feature = "x509")]
+	server_validators: Vec<Arc<dyn CertificateValidation>>,
+	#[cfg(feature = "x509")]
 	client_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
 	client_key: Option<HandshakeKeyManager>,
@@ -153,6 +144,8 @@ impl<P: Protocol> ClientBuilder<P> {
 			policies: ClientPolicies::default(),
 			#[cfg(feature = "x509")]
 			server_certificates: Vec::new(),
+			#[cfg(feature = "x509")]
+			server_validators: Vec::new(),
 			#[cfg(feature = "x509")]
 			client_certificate: None,
 			#[cfg(feature = "x509")]
@@ -190,19 +183,33 @@ impl<P: Protocol> ClientBuilder<P> {
 		self
 	}
 
-	#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-	pub fn with_x509_gate<V>(mut self, v: V) -> Self
-	where
-		V: CertificateValidation + Send + Sync + 'static,
-	{
-		self.policies = self.policies.with_x509_gate(v);
-		self
-	}
-
 	#[cfg(feature = "x509")]
-	pub fn with_server_certificates(mut self, certs: impl IntoIterator<Item = Certificate>) -> Self {
-		self.server_certificates.extend(certs);
-		self
+	pub fn with_server_certificates(
+		mut self,
+		certs: impl IntoIterator<Item = CertificateSpec>,
+	) -> TransportResult<Self> {
+		let mut cert_objs = Vec::new();
+		for cert_spec in certs {
+			let cert = Certificate::try_from(cert_spec)?;
+			cert_objs.push(cert);
+		}
+
+		// Compute fingerprints before moving certs
+		let mut fingerprints = Vec::new();
+		for cert in &cert_objs {
+			let cert_der = cert.to_der()?;
+			let fingerprint = Sha3_256::digest(&cert_der).to_vec();
+			fingerprints.push(fingerprint);
+		}
+
+		// Create validator from fingerprints
+		if !fingerprints.is_empty() {
+			let validator = RuntimeCertificatePinning::<Sha3_256>::from_fingerprints(fingerprints);
+			self.server_validators.push(Arc::new(validator));
+		}
+
+		self.server_certificates.extend(cert_objs);
+		Ok(self)
 	}
 }
 
@@ -229,9 +236,11 @@ where
 	pub async fn connect(self, addr: P::Address) -> TransportResult<GenericClient<P>> {
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let mut transport = P::create_transport(stream);
-
 		if !self.server_certificates.is_empty() {
 			transport = transport.with_server_certificates(self.server_certificates);
+		}
+		if !self.server_validators.is_empty() {
+			transport = transport.with_server_validators(Arc::new(self.server_validators));
 		}
 		if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
 			transport = transport.with_client_identity(cert, key);
@@ -243,7 +252,7 @@ where
 }
 
 #[cfg(all(feature = "std", not(feature = "x509")))]
-impl<P: Protocol + Send> crate::transport::ConnectionBuilder<P> for ClientBuilder<P>
+impl<P: Protocol + Send> ConnectionBuilder<P> for ClientBuilder<P>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConf,
 	P::Address: Send,
@@ -261,7 +270,7 @@ where
 }
 
 #[cfg(all(feature = "std", feature = "x509"))]
-impl<P: Protocol + Send> crate::transport::ConnectionBuilder<P> for ClientBuilder<P>
+impl<P: Protocol + Send> ConnectionBuilder<P> for ClientBuilder<P>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
 	P::Address: Send,
@@ -274,14 +283,50 @@ where
 	}
 
 	fn with_server_certificate(mut self, cert: CertificateSpec) -> TransportResult<Self> {
-		let cert = Certificate::try_from(cert)?;
-		self.server_certificates.push(cert);
+		let cert_obj = Certificate::try_from(cert)?;
+
+		// Compute fingerprint directly (zero-copy - no clone!)
+		let cert_der = cert_obj.to_der()?;
+		let fingerprint = Sha3_256::digest(&cert_der).to_vec();
+
+		// Create validator from fingerprint
+		let validator = RuntimeCertificatePinning::<Sha3_256>::from_fingerprints([fingerprint]);
+		self.server_validators.push(Arc::new(validator));
+
+		// Store cert (moved, not cloned)
+		self.server_certificates.push(cert_obj);
+		Ok(self)
+	}
+
+	fn with_server_certificates(mut self, certs: impl IntoIterator<Item = CertificateSpec>) -> TransportResult<Self> {
+		let mut cert_objs = Vec::new();
+		for cert_spec in certs {
+			let cert = Certificate::try_from(cert_spec)?;
+			cert_objs.push(cert);
+		}
+
+		// Compute fingerprints before moving certs (zero-copy)
+		let mut fingerprints = Vec::new();
+		for cert in &cert_objs {
+			let cert_der = cert.to_der()?;
+			let fingerprint = Sha3_256::digest(&cert_der).to_vec();
+			fingerprints.push(fingerprint);
+		}
+
+		// Create validator from fingerprints (no clones!)
+		if !fingerprints.is_empty() {
+			let validator = RuntimeCertificatePinning::<Sha3_256>::from_fingerprints(fingerprints);
+			self.server_validators.push(Arc::new(validator));
+		}
+
+		self.server_certificates.extend(cert_objs);
 		Ok(self)
 	}
 
 	fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self> {
 		let cert = Certificate::try_from(cert)?;
 		let key_manager = HandshakeKeyManager::try_from(key)?;
+
 		self.client_certificate = Some(cert);
 		self.client_key = Some(key_manager);
 		Ok(self)

@@ -232,6 +232,8 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					server_certificates: Vec::new(),
 					#[cfg(feature = "x509")]
+					server_validators: None,
+					#[cfg(feature = "x509")]
 					client_certificate: None,
 					#[cfg(feature = "x509")]
 					client_validators: None,
@@ -291,6 +293,11 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
+			fn with_server_validators(mut self, validators: Arc<Vec<Arc<dyn $crate::crypto::x509::policy::CertificateValidation>>>) -> Self {
+				self.server_validators = Some(validators);
+				self
+			}
+
 			fn with_client_identity(
 				mut self,
 				cert: $crate::x509::Certificate,
@@ -331,26 +338,6 @@ macro_rules! impl_tcp_common {
 
 			fn with_collector_gate<G: GatePolicy + 'static>(mut self, gate: G) -> Self {
 				self.collector_gate = Box::new(gate);
-				self
-			}
-
-			#[cfg(all(feature = "x509", feature = "std"))]
-			fn with_x509_gate<V>(mut self, validator: V) -> Self
-			where
-				V: $crate::crypto::x509::policy::CertificateValidation + 'static,
-			{
-				let new_validator = Arc::new(validator);
-				match self.client_validators.as_mut() {
-					Some(validators) => {
-						let mut validators_vec = Arc::try_unwrap(std::mem::replace(validators, Arc::new(vec![])))
-							.unwrap_or_else(|arc| (*arc).clone());
-						validators_vec.push(new_validator);
-						self.client_validators = Some(Arc::new(validators_vec));
-					}
-					None => {
-						self.client_validators = Some(Arc::new(vec![new_validator]));
-					}
-				}
 				self
 			}
 

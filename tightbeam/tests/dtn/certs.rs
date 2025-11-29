@@ -133,23 +133,6 @@ pub const MARS_RELAY_PINNING: PublicKeyPinning<2> = PublicKeyPinning::new([EARTH
 pub const ROVER_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([MARS_RELAY_PUB_KEY]);
 
 // ============================================================================
-// Client-Side Validators (for validating server certificates)
-// ============================================================================
-// These validators are used by clients to validate the server they're connecting to
-
-/// Validator for connecting TO Mission Control (validates Mission Control's public key)
-pub const VALIDATE_MISSION_CONTROL: PublicKeyPinning<1> = PublicKeyPinning::new([MISSION_CONTROL_PUB_KEY]);
-
-/// Validator for connecting TO Earth Relay (validates Earth Relay's public key)
-pub const VALIDATE_EARTH_RELAY: PublicKeyPinning<1> = PublicKeyPinning::new([EARTH_RELAY_PUB_KEY]);
-
-/// Validator for connecting TO Mars Relay (validates Mars Relay's public key)
-pub const VALIDATE_MARS_RELAY: PublicKeyPinning<1> = PublicKeyPinning::new([MARS_RELAY_PUB_KEY]);
-
-/// Validator for connecting TO Rover (validates Rover's public key)
-pub const VALIDATE_ROVER: PublicKeyPinning<1> = PublicKeyPinning::new([ROVER_PUB_KEY]);
-
-// ============================================================================
 // Verifying Keys for Signature Verification
 // ============================================================================
 

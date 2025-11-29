@@ -16,10 +16,6 @@ mod tightbeam_core;
 #[cfg(feature = "transport")]
 mod transport;
 
-// X.509 tests
-#[cfg(feature = "x509")]
-mod x509;
-
 // FDR refinement checking tests
 #[cfg(feature = "testing-fdr")]
 mod fdr;

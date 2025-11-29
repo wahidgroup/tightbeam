@@ -369,19 +369,6 @@ macro_rules! server {
 		)*
 	}};
 
-	// Feature-gated x509 policy application (single expression)
-	(@apply_one_policy $transport:ident, with_x509_gate, $policy_expr:expr) => {{
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		{ $transport.with_x509_gate($policy_expr) }
-		#[cfg(not(all(feature = "x509", feature = "signature", feature = "secp256k1")))]
-		{ $transport }
-	}};
-	(@apply_one_policy $transport:ident, x509_gate, $policy_expr:expr) => {{
-		#[cfg(all(feature = "x509", feature = "signature", feature = "secp256k1"))]
-		{ $transport.with_x509_gate($policy_expr) }
-		#[cfg(not(all(feature = "x509", feature = "signature", feature = "secp256k1")))]
-		{ $transport }
-	}};
 	// Generic fallback
 	(@apply_one_policy $transport:ident, $other:ident, $policy_expr:expr) => {{
 		$transport.$other($policy_expr)

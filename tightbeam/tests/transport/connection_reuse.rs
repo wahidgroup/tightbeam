@@ -197,7 +197,7 @@ tb_scenario! {
 			}
 
 			let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
-				.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
 			let servlet_task = TlsEchoServlet::start(Arc::clone(&trace), Some(servlet_conf)).await?;

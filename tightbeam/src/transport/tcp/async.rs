@@ -310,6 +310,10 @@ where
 	fn to_client_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
 		self.client_validators.as_ref()
 	}
+	
+	fn to_server_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
+		self.server_validators.as_ref()
+	}
 
 	fn unset_symmetric_key(&mut self) {
 		self.symmetric_key = None;
@@ -368,6 +372,8 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	server_certificates: Vec<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
+	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	#[cfg(feature = "x509")]
 	client_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
@@ -400,6 +406,8 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	operation_timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
 	server_certificates: Vec<Arc<Certificate>>,
+	#[cfg(feature = "x509")]
+	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	#[cfg(feature = "x509")]
 	client_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]

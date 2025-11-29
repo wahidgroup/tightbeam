@@ -10,6 +10,13 @@ use alloc::vec::Vec;
 
 use crate::transport::error::TransportError;
 
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
+use std::sync::Arc;
+
+#[cfg(feature = "x509")]
+use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
 use crate::transport::handshake::HandshakeKeyManager;
 #[cfg(feature = "x509")]
@@ -97,6 +104,9 @@ pub trait X509ClientConfig: Sized {
 
 	/// Add multiple server certificates at once.
 	fn with_server_certificates(self, certs: impl IntoIterator<Item = Certificate>) -> Self;
+
+	/// Set server certificate validators for strict validation.
+	fn with_server_validators(self, validators: Arc<Vec<Arc<dyn CertificateValidation>>>) -> Self;
 
 	/// Set the client's identity for mutual authentication.
 	/// The client presents this certificate to the server when requested.

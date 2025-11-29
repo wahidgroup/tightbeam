@@ -40,6 +40,10 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 	#[cfg(feature = "x509")]
 	fn with_server_certificate(self, cert: CertificateSpec) -> TransportResult<Self>;
 
+	/// Configure multiple server certificates for TLS validation
+	#[cfg(feature = "x509")]
+	fn with_server_certificates(self, certs: impl IntoIterator<Item = CertificateSpec>) -> TransportResult<Self>;
+
 	/// Configure client identity for mutual TLS
 	#[cfg(feature = "x509")]
 	fn with_client_identity(self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self>;
@@ -65,11 +69,18 @@ struct ClientIdentity {
 }
 
 #[cfg(feature = "x509")]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 /// Shared TLS assets reused across pooled connections without reallocations.
 struct PoolTlsConfig {
 	server_certificates: Vec<Arc<Certificate>>,
 	client_identity: Option<ClientIdentity>,
+}
+
+#[cfg(feature = "x509")]
+impl Default for PoolTlsConfig {
+	fn default() -> Self {
+		Self { server_certificates: Vec::new(), client_identity: None }
+	}
 }
 
 #[cfg(feature = "x509")]
@@ -134,7 +145,7 @@ impl<P: Protocol, const N: usize> ConnectionPoolBuilder<P, N> {
 
 #[cfg(feature = "std")]
 impl<P: Protocol, const N: usize> ConnectionBuilder<P> for ConnectionPoolBuilder<P, N> {
-	type Output = Arc<ConnectionPool<P, N>>;
+	type Output = ConnectionPool<P, N>;
 
 	fn with_timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = Some(timeout);
@@ -149,6 +160,16 @@ impl<P: Protocol, const N: usize> ConnectionBuilder<P> for ConnectionPoolBuilder
 	}
 
 	#[cfg(feature = "x509")]
+	fn with_server_certificates(mut self, certs: impl IntoIterator<Item = CertificateSpec>) -> TransportResult<Self> {
+		for cert_spec in certs {
+			let cert = Certificate::try_from(cert_spec)?;
+			self.tls.push_server_certificate(cert);
+		}
+
+		Ok(self)
+	}
+
+	#[cfg(feature = "x509")]
 	fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self> {
 		let cert_converted = Certificate::try_from(cert)?;
 		let key_converted = HandshakeKeyManager::try_from(key)?;
@@ -158,13 +179,13 @@ impl<P: Protocol, const N: usize> ConnectionBuilder<P> for ConnectionPoolBuilder
 	}
 
 	fn build(self) -> Self::Output {
-		Arc::new(ConnectionPool {
+		ConnectionPool {
 			pools: Arc::new(RwLock::new(HashMap::new())),
 			config: self.config,
 			timeout: self.timeout,
 			#[cfg(feature = "x509")]
 			tls: self.tls,
-		})
+		}
 	}
 }
 

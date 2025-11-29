@@ -11,6 +11,7 @@ use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfo};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
+use crate::crypto::key::KeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -51,7 +52,7 @@ where
 	P: CryptoProvider,
 {
 	state: ClientStateMachine,
-	client_key_provider: Arc<dyn crate::crypto::key::KeyProvider>,
+	client_key_provider: Arc<dyn KeyProvider>,
 	client_certificate: Option<Arc<Certificate>>,
 	server_cert: Arc<Certificate>,
 	transcript_hash: Option<[u8; 32]>,
@@ -60,7 +61,7 @@ where
 	security_offer: Option<SecurityOffer>,
 	selected_profile: Option<SecurityProfileDesc>,
 	provider: P,
-	certificate_validator: Option<Arc<dyn CertificateValidation>>,
+	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	invariants: HandshakeInvariant,
 }
 
@@ -87,11 +88,7 @@ where
 	/// The transcript hash is computed internally from handshake messages.
 	/// If you need to provide an external transcript hash (for testing),
 	/// use `with_transcript_hash()` after construction.
-	pub fn new(
-		provider: P,
-		client_key_provider: Arc<dyn crate::crypto::key::KeyProvider>,
-		server_cert: Arc<Certificate>,
-	) -> Self {
+	pub fn new(provider: P, client_key_provider: Arc<dyn KeyProvider>, server_cert: Arc<Certificate>) -> Self {
 		Self {
 			state: ClientStateMachine::default(),
 			client_key_provider,
@@ -103,7 +100,7 @@ where
 			security_offer: None,
 			selected_profile: None,
 			provider,
-			certificate_validator: None,
+			server_validators: None,
 			invariants: HandshakeInvariant::default(),
 		}
 	}
@@ -117,9 +114,13 @@ where
 		self
 	}
 
-	/// Set a certificate validator for the handshake.
-	pub fn with_certificate_validator(mut self, validator: Arc<dyn CertificateValidation>) -> Self {
-		self.certificate_validator = Some(validator);
+	/// Set certificate validators for server certificate validation.
+	///
+	/// Validators will be applied during the handshake when the server
+	/// certificate is validated.
+	#[must_use]
+	pub fn with_server_validators(mut self, validators: Arc<Vec<Arc<dyn CertificateValidation>>>) -> Self {
+		self.server_validators = Some(validators);
 		self
 	}
 
@@ -155,9 +156,11 @@ where
 	fn validate_state_and_certificate(&self) -> Result<(), HandshakeError> {
 		self.validate_expected_state(ClientHandshakeState::Init)?;
 
-		// Use provided validator if available, otherwise default to expiry check
-		if let Some(validator) = &self.certificate_validator {
-			validator.evaluate(&self.server_cert)?;
+		// Validate server certificate using configured validators
+		if let Some(validators) = &self.server_validators {
+			for validator in validators.iter() {
+				validator.evaluate(&self.server_cert)?;
+			}
 		} else {
 			validate_certificate_expiry(&self.server_cert)?;
 		}

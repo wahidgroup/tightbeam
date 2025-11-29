@@ -200,6 +200,64 @@ where
 	}
 }
 
+/// Runtime certificate pinning validator.
+///
+/// Pins to a specific set of certificates using fingerprint comparison.
+/// Unlike `FingerprintPinning<D, N>`, this validator can be created at runtime
+/// with dynamic certificate lists, making it suitable for use in builders.
+#[cfg(feature = "std")]
+#[derive(Clone)]
+pub struct RuntimeCertificatePinning<D> {
+	fingerprints: Vec<Vec<u8>>,
+	_digest: PhantomData<D>,
+}
+
+#[cfg(feature = "std")]
+impl<D> RuntimeCertificatePinning<D>
+where
+	D: Digest,
+{
+	/// Create a new runtime certificate pinning validator from certificates.
+	///
+	/// Computes fingerprints for each certificate and stores them for validation.
+	pub fn from_certificates(certs: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError> {
+		let mut fingerprints = Vec::new();
+		for cert in certs {
+			let cert_der = cert.to_der()?;
+			let fingerprint = D::digest(&cert_der);
+			fingerprints.push(fingerprint.to_vec());
+		}
+
+		Ok(Self { fingerprints, _digest: PhantomData })
+	}
+
+	/// Create validator directly from pre-computed fingerprints.
+	///
+	/// This method allows creating a validator without cloning certificates,
+	/// as fingerprints can be computed once and passed directly.
+	pub fn from_fingerprints(fingerprints: impl IntoIterator<Item = Vec<u8>>) -> Self {
+		Self { fingerprints: fingerprints.into_iter().collect(), _digest: PhantomData }
+	}
+}
+
+#[cfg(feature = "std")]
+impl<D> CertificateValidation for RuntimeCertificatePinning<D>
+where
+	D: Digest + Send + Sync,
+{
+	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		let cert_der = cert.to_der()?;
+		let fingerprint = D::digest(&cert_der);
+		for allowed_fp in &self.fingerprints {
+			if allowed_fp.as_slice() == fingerprint.as_ref() {
+				return Ok(());
+			}
+		}
+
+		Err(CertificateValidationError::CertificateNotPinned)
+	}
+}
+
 /// Full PKI certificate validator.
 ///
 /// Validates:

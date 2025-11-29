@@ -191,7 +191,7 @@ tb_scenario! {
 				let message_count = Arc::new(AtomicUsize::new(0));
 				let env_config = Arc::new(PoolEchoServletConf { message_count: Arc::clone(&message_count) });
 				let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
-					.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
 					.with_config(env_config)
 					.build();
 				let servlet = PoolEchoServlet::start(
@@ -202,12 +202,12 @@ tb_scenario! {
 
 				trace.event("pool_create")?;
 
-				let pool = ConnectionPool::<TokioListener, 3>::builder()
+				let pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
 					.with_config(PoolConfig::default())
 					.with_server_certificate(SERVER_CERT)?
 					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 					.with_timeout(Duration::from_millis(1000))
-					.build();
+					.build());
 
 				for i in 1..=3 {
 					trace.event("acquire_client")?;
@@ -270,11 +270,11 @@ tb_scenario! {
 				let config2 = Arc::new(IsolationServletConf { message_count: Arc::clone(&count2) });
 
 				let servlet_conf1 = ServletConf::<TokioListener, TestMessage>::builder()
-					.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
 					.with_config(config1)
 					.build();
 				let servlet_conf2 = ServletConf::<TokioListener, TestMessage>::builder()
-					.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
 					.with_config(config2)
 					.build();
 
@@ -285,10 +285,10 @@ tb_scenario! {
 
 				trace.event("pool_create")?;
 
-				let pool = ConnectionPool::<TokioListener, 2>::builder()
+				let pool = Arc::new(ConnectionPool::<TokioListener, 2>::builder()
 					.with_server_certificate(SERVER_CERT)?
 					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
-					.build();
+					.build());
 
 				for (addr, name) in [(addr1, "addr1-test"), (addr2, "addr2-test"), (addr1, "addr1-test2")] {
 					trace.event("acquire_client")?;
@@ -348,7 +348,7 @@ tb_scenario! {
 			let message_count = Arc::new(AtomicUsize::new(0));
 			let env_config = Arc::new(ConcurrentServletConf { message_count: Arc::clone(&message_count) });
 			let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
-				.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(env_config)
 				.build();
 			let servlet = ConcurrentServlet::start(
@@ -359,10 +359,10 @@ tb_scenario! {
 
 			trace.event("pool_create")?;
 
-			let pool = ConnectionPool::<TokioListener, 3>::builder()
+			let pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
 				.with_server_certificate(SERVER_CERT)?
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
-				.build();
+				.build());
 
 			for _ in 0..3 {
 				trace.event("acquire_client")?;

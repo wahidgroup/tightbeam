@@ -26,10 +26,6 @@
 //! - T+1.5s: Mars Relay forwards
 //! - T+12.5min: Earth Relay forwards
 //! - T+13min: Mission Control receives, sends next command
-//!
-//! ## Debug Logging
-//!
-//! Set the `TIGHTBEAM_DEBUG` environment variable to see execution logs.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -45,7 +41,7 @@ use tightbeam::{
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
 	testing::{fdr::FdrConfig, ScenarioConf},
 	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector},
-	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, GenericClient},
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient},
 };
 
 use crate::dtn::{
@@ -76,14 +72,6 @@ use crate::dtn::{
 	},
 	storage::FrameStore,
 };
-
-// ============================================================================
-// Debug Logging (No-op for now - servlets use real logging)
-// ============================================================================
-
-macro_rules! debug_log {
-	($($arg:tt)*) => {};
-}
 
 // ============================================================================
 // DTN Scenario Configuration
@@ -177,25 +165,10 @@ impl Default for DtnScenarioConfig {
 
 impl Drop for DtnScenarioConfig {
 	fn drop(&mut self) {
-		// Shutdown servlets gracefully
-		debug_log!("[Cleanup] Shutting down servlets...");
-
-		// Drop all servlets
-		if let Ok(mut guard) = self._mission_control_servlet.write() {
-			if let Some(_servlet) = guard.take() {
-				debug_log!("[Cleanup] Mission Control servlet stopped");
-			}
-		}
-		if let Ok(mut guard) = self._earth_relay_servlet.write() {
-			if let Some(_servlet) = guard.take() {
-				debug_log!("[Cleanup] Earth Relay servlet stopped");
-			}
-		}
-		if let Ok(mut guard) = self._mars_relay_servlet.write() {
-			if let Some(_servlet) = guard.take() {
-				debug_log!("[Cleanup] Mars Relay servlet stopped");
-			}
-		}
+		// Shutdown servlets gracefully (Drop trait handles cleanup)
+		self._mission_control_servlet.write().ok().and_then(|mut g| g.take());
+		self._earth_relay_servlet.write().ok().and_then(|mut g| g.take());
+		self._mars_relay_servlet.write().ok().and_then(|mut g| g.take());
 
 		// Remove storage directories
 		let _ = std::fs::remove_dir_all("temp/dtn/rover");
@@ -203,8 +176,6 @@ impl Drop for DtnScenarioConfig {
 		let _ = std::fs::remove_dir_all("temp/dtn/earth_relay");
 		let _ = std::fs::remove_dir_all("temp/dtn/mars_relay");
 		let _ = std::fs::remove_dir_all("temp/dtn");
-
-		debug_log!("[Cleanup] DTN test cleanup complete");
 	}
 }
 
@@ -538,10 +509,6 @@ async fn run_mission_loop(
 	shared_cipher: &Aes256Gcm,
 	shared_mission_state: &Arc<RwLock<MissionState>>,
 ) -> Result<(), TightBeamError> {
-	// Wait for first command to be executed by RoverServlet before starting
-	// telemetry loop
-	debug_log!("[Rover Mission Loop] Waiting for first command to arrive...");
-
 	let mut wait_iterations = 0;
 	const MAX_WAIT_ITERATIONS: usize = 100;
 	while shared_mission_state.read()?.completed_rounds < 1 {
@@ -552,38 +519,16 @@ async fn run_mission_loop(
 		}
 	}
 
-	debug_log!("[Rover Mission Loop] First command received and executed. Starting telemetry loop.\n");
-
 	// Loop exactly COMMAND_ROUND_TRIPS times (6 rounds)
 	// We start from round 0 since we've completed command 0 and need to send its
 	// telemetry
 	for round in 0..COMMAND_ROUND_TRIPS {
-		debug_log!(
-			"\n═══════════════ Round {} (Telemetry for Command {}) {} ═══════════════",
-			round,
-			round,
-			format_mission_time(mission_time_ms())
-		);
-
 		// Update battery state and check for faults
 		let battery_update = fault_manager.update_battery_state()?;
 		match battery_update {
 			BatteryUpdate::LowPowerDetected(_battery) => {
 				trace.event("fault_low_power_detected")?;
-
-				debug_log!(
-					"  [{}] [Rover] ⚠ LOW POWER DETECTED ({}%) - Halting communications",
-					format_mission_time(mission_time_ms()),
-					battery
-				);
-
 				trace.event("comms_halted")?;
-
-				// Simulate recharge period
-				debug_log!(
-					"  [{}] [Rover] Entering recharge mode (30 minutes)...",
-					format_mission_time(mission_time_ms())
-				);
 
 				advance_clock(delays::ROVER_RECHARGE_MS);
 
@@ -592,19 +537,10 @@ async fn run_mission_loop(
 					fault_manager.reenergize_battery()?;
 				}
 
-				debug_log!(
-					"  [{}] [Rover] ✓ Recharge complete (Battery: 100%) - Resuming operations",
-					format_mission_time(mission_time_ms())
-				);
-
 				trace.event("fault_cleared")?;
 			}
 			BatteryUpdate::FaultCleared(_battery) => {
-				debug_log!(
-					"  [{}] [Rover] ✓ Battery recharged to {}%",
-					format_mission_time(mission_time_ms()),
-					battery
-				);
+				// Fault cleared
 			}
 			BatteryUpdate::Updated => {
 				// Normal battery drain
@@ -639,28 +575,11 @@ async fn run_mission_loop(
 				tokio::time::sleep(Duration::from_millis(100)).await;
 				wait_iterations += 1;
 				if wait_iterations >= MAX_WAIT_ITERATIONS {
-					debug_log!(
-						"  [{}] [Rover Client] Timeout waiting for command {} to complete",
-						format_mission_time(mission_time_ms()),
-						target_completed
-					);
 					break;
 				}
 			}
-
-			debug_log!(
-				"  [{}] [Rover Client] Command {} completed",
-				format_mission_time(mission_time_ms()),
-				target_completed
-			);
 		}
 	}
-
-	debug_log!(
-		"  [{}] [Rover Client] All {} telemetry rounds complete",
-		format_mission_time(mission_time_ms()),
-		COMMAND_ROUND_TRIPS
-	);
 
 	Ok(())
 }
@@ -776,17 +695,48 @@ tb_scenario! {
 			let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
 
 			// ================================================================
-			// CONNECTION POOL (shared across all servlets for connection reuse)
+			// CONNECTION POOLS (per-destination with TLS and mutual auth)
 			// ================================================================
-			let connection_pool = tightbeam::transport::ConnectionPool::<TokioListener, 3>::builder()
-				.with_config(tightbeam::transport::PoolConfig::default())
-				.build();
+
+			// Mission Control → Earth Relay pool
+			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+				.with_server_certificate(EARTH_RELAY_CERT)?
+				.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY)?
+				.build());
+
+			// Earth Relay → Mission Control pool
+			let earth_mc_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+				.with_server_certificate(MISSION_CONTROL_CERT)?
+				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY)?
+				.build());
+
+			// Earth Relay → Mars Relay pool
+			let earth_mars_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+				.with_server_certificate(MARS_RELAY_CERT)?
+				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY)?
+				.build());
+
+			// Mars Relay → Earth Relay pool
+			let mars_earth_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+				.with_server_certificate(EARTH_RELAY_CERT)?
+				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
+				.build());
+
+			// Mars Relay → Rover pool
+			let mars_rover_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+				.with_server_certificate(ROVER_CERT)?
+				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
+				.build());
+
+			// Rover → Mars Relay pool
+			let rover_mars_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+				.with_server_certificate(MARS_RELAY_CERT)?
+				.with_client_identity(ROVER_CERT, ROVER_KEY)?
+				.build());
 
 			// ================================================================
 			// 1. START ROVER SERVLET
 			// ================================================================
-
-			debug_log!("[START] Starting Rover servlet");
 
 			let rover_fault_manager = Arc::new(FaultManager::from_refs(
 				&config.bms,
@@ -797,13 +747,13 @@ tb_scenario! {
 			let rover_command_executor = Arc::new(RwLock::new(CommandExecutor::default()));
 			let rover_config = RoverServletConf {
 				mars_relay_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder
-				connection_pool: Arc::clone(&connection_pool),
+				mars_relay_pool: rover_mars_pool,
 				rover_signing_key: rover_signing_key.to_owned(),
 				mission_control_verifying_key: mc_verifying_key,
 				mars_relay_verifying_key: mars_relay_verifying_key_val,
 				shared_cipher: shared_cipher.to_owned(),
 				chain_processor: Arc::clone(&rover_processor),
-				fault_manager: Arc::clone(&rover_fault_manager),
+				_fault_manager: Arc::clone(&rover_fault_manager),
 				command_executor: Arc::clone(&rover_command_executor),
 				frame_builder: Arc::clone(&rover_frame_builder),
 				mission_state: Arc::clone(&shared_mission_state),
@@ -811,13 +761,11 @@ tb_scenario! {
 			};
 
 			let rover_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
-				.with_x509(ROVER_CERT, ROVER_KEY, vec![Arc::new(ROVER_PINNING)])?
+				.with_certificate(ROVER_CERT, ROVER_KEY, vec![Arc::new(ROVER_PINNING)])?
 				.with_config(Arc::new(rover_config))
 				.build();
 			let rover_servlet = RoverServlet::start(Arc::clone(&trace), Some(rover_servlet_conf)).await?;
 			let rover_addr = rover_servlet.addr();
-
-			debug_log!("[START] Rover servlet started at {:?}", rover_addr);
 
 			// Store rover address
 			config.rover_addr.write()?.replace(rover_addr);
@@ -825,8 +773,6 @@ tb_scenario! {
 			// ================================================================
 			// 2. START MARS RELAY SERVLET
 			// ================================================================
-
-			debug_log!("[START] Starting Mars Relay servlet with rover_addr: {:?}", rover_addr);
 
 			// Extract Mars Relay signing key
 			let mars_relay_key_bytes = match MARS_RELAY_KEY {
@@ -846,20 +792,19 @@ tb_scenario! {
 				shared_cipher: shared_cipher.to_owned(),
 				rover_addr,
 				earth_relay_addr: Arc::clone(&mars_earth_relay_addr),
-				connection_pool: Arc::clone(&connection_pool),
+				earth_relay_pool: mars_earth_pool,
+				rover_pool: mars_rover_pool,
 				chain_processor: Arc::clone(&mars_relay_processor),
 				frame_builder: Arc::clone(&mars_relay_frame_builder),
 			};
 
 			let mars_relay_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
-				.with_x509(MARS_RELAY_CERT, MARS_RELAY_KEY, vec![Arc::new(MARS_RELAY_PINNING)])?
+				.with_certificate(MARS_RELAY_CERT, MARS_RELAY_KEY, vec![Arc::new(MARS_RELAY_PINNING)])?
 				.with_config(Arc::new(mars_relay_config))
 				.build();
 			let mars_relay_servlet_conf = Some(mars_relay_servlet_conf);
 			let mars_relay_servlet = MarsRelaySatelliteServlet::start(Arc::clone(&trace), mars_relay_servlet_conf).await?;
 			let mars_relay_addr = mars_relay_servlet.addr();
-
-			debug_log!("[START] Mars Relay started at {:?}", mars_relay_addr);
 
 			// Store Mars Relay servlet and address
 			config._mars_relay_servlet.write()?.replace(mars_relay_servlet);
@@ -868,8 +813,6 @@ tb_scenario! {
 			// ================================================================
 			// 3. START EARTH RELAY SERVLET
 			// ================================================================
-
-			debug_log!("[START] Starting Earth Relay servlet");
 
 			// Extract Earth Relay signing key
 			let earth_relay_key_bytes = match EARTH_RELAY_KEY {
@@ -888,25 +831,22 @@ tb_scenario! {
 				shared_cipher: shared_cipher.to_owned(),
 				mars_relay_addr, // Now we have the real address!
 				mission_control_addr: Arc::clone(&earth_mission_control_addr),
-				connection_pool: Arc::clone(&connection_pool),
+				mission_control_pool: earth_mc_pool,
+				mars_relay_pool: earth_mars_pool,
 				chain_processor: Arc::clone(&earth_relay_processor),
 				frame_builder: Arc::clone(&earth_relay_frame_builder),
 			};
 
 			let earth_relay_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
-				.with_x509(EARTH_RELAY_CERT, EARTH_RELAY_KEY, vec![Arc::new(EARTH_RELAY_PINNING)])?
+				.with_certificate(EARTH_RELAY_CERT, EARTH_RELAY_KEY, vec![Arc::new(EARTH_RELAY_PINNING)])?
 				.with_config(Arc::new(earth_relay_config))
 				.build();
 			let earth_relay_servlet_conf = Some(earth_relay_servlet_conf);
 			let earth_relay_servlet = EarthRelaySatelliteServlet::start(Arc::clone(&trace), earth_relay_servlet_conf).await?;
 			let earth_relay_addr = earth_relay_servlet.addr();
 
-			debug_log!("[START] Earth Relay started at {:?}", earth_relay_addr);
-
 			// Update Mars Relay's earth_relay_addr
 			*mars_earth_relay_addr.write()? = Some(earth_relay_addr);
-
-			debug_log!("[START] Mars Relay's earth_relay_addr updated");
 
 			// Store Earth Relay servlet and address
 			config._earth_relay_servlet.write()?.replace(earth_relay_servlet);
@@ -916,8 +856,6 @@ tb_scenario! {
 			// 4. START MISSION CONTROL SERVLET
 			// ================================================================
 
-			debug_log!("[START] Starting Mission Control servlet");
-
 			let mc_config = MissionControlServletConf {
 				mission_control_signing_key: mission_control_signing_key.to_owned(),
 				rover_verifying_key: rover_verifying_key_val,
@@ -926,35 +864,27 @@ tb_scenario! {
 				chain_processor: Arc::clone(&mc_processor),
 				frame_builder: Arc::clone(&mc_frame_builder),
 				earth_relay_addr, // Real address!
-				connection_pool: Arc::clone(&connection_pool),
+				earth_relay_pool: mc_earth_pool,
 				shared_mission_state: Arc::clone(&shared_mission_state),
 			};
 
 			let mc_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
-				.with_x509(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, vec![Arc::new(MISSION_CONTROL_PINNING)])?
+				.with_certificate(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, vec![Arc::new(MISSION_CONTROL_PINNING)])?
 				.with_config(Arc::new(mc_config))
 				.build();
 			let mc_servlet = MissionControlServlet::start(Arc::clone(&trace), Some(mc_servlet_conf)).await?;
 			let mc_addr = mc_servlet.addr();
 
-			debug_log!("[START] Mission Control started at {:?}", mc_addr);
-
 			// Update Earth Relay's mission_control_addr
 			*earth_mission_control_addr.write()? = Some(mc_addr);
-
-			debug_log!("[START] Earth Relay's mission_control_addr updated");
 
 			// Store Mission Control servlet and address
 			config._mission_control_servlet.write()?.replace(mc_servlet);
 			config.mission_control_addr.write()?.replace(mc_addr);
 
-			debug_log!("[START] All servlets started successfully");
-
 			// ================================================================
 			// 5. INITIALIZE MISSION CLOCK
 			// ================================================================
-
-			debug_log!("[START] Initializing mission clock");
 
 			init_mission_clock();
 			trace.event("mission_start")?;
@@ -963,7 +893,6 @@ tb_scenario! {
 			// 6. SEND INITIAL COMMAND FROM MISSION CONTROL
 			// ================================================================
 
-			debug_log!("[START] Sending initial command from Mission Control to Rover");
 			{
 				let initial_cmd = RoverCommand::ProbeLocation { x: 100, y: 200 };
 				let (next_order, previous_digest) = mc_processor.prepare_outgoing()?;
@@ -988,22 +917,13 @@ tb_scenario! {
 					.connect(earth_relay_addr)
 					.await?;
 
-				let _stateless_ack = earth_relay_client.emit(command_frame, None).await?;
-
-				debug_log!("[START] Initial command sent from Mission Control");
+				earth_relay_client.emit(command_frame, None).await?;
 			}
-
-			debug_log!("[START] Returning Rover servlet to scenario");
 
 			Ok(rover_servlet)
 		},
 		setup: |_rover_addr, config: Arc<DtnScenarioConfig>| async move {
-			debug_log!("[Setup] Rover servlet address: {:?}", rover_addr);
-
 			let mars_relay_addr = (*config.mars_relay_addr.read()?).expect("Mars Relay address must be set");
-
-			debug_log!("[Setup] Mars Relay address found: {:?}", mars_relay_addr);
-
 			// Connect Rover client to Mars Relay
 			let client = ClientBuilder::<TokioListener>::builder()
 				.with_server_certificate(MARS_RELAY_CERT)?
@@ -1016,11 +936,6 @@ tb_scenario! {
 			Ok(client)
 		},
 		client: |trace, mut rover_client, config| async move {
-			debug_log!("╔════════════════════════════════════════════════════════════╗");
-			debug_log!("║  Mars Rover DTN Mission - {} Round Trips                   ║", COMMAND_ROUND_TRIPS);
-			debug_log!("╚════════════════════════════════════════════════════════════╝\n");
-			debug_log!("[Rover Mission Loop] Started - sends telemetry, RoverServlet handles commands asynchronously\n");
-
 			// Get components from config
 			let rover_processor = Arc::clone(&config.rover_chain_processor);
 			let rover_fault_manager = Arc::new(FaultManager::from_refs(
@@ -1046,10 +961,6 @@ tb_scenario! {
 			).await?;
 
 			trace.event("mission_complete")?;
-
-			debug_log!("╔════════════════════════════════════════════════════════════╗");
-			debug_log!("║  Mission Complete - {} commands                            ║", COMMAND_ROUND_TRIPS);
-			debug_log!("╚════════════════════════════════════════════════════════════╝");
 
 			Ok(())
 		}
