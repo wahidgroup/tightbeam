@@ -993,9 +993,9 @@ use tightbeam::Matrix;
 
 // Full 3x3 matrix
 let mut matrix = Matrix::<3>::default();
-matrix.set(0, 0, 1)?; // Feature A: enabled
-matrix.set(1, 1, 1)?; // Feature B: enabled
-matrix.set(2, 2, 0)?; // Feature C: disabled
+matrix.set(0, 0, 1); // Feature A: enabled
+matrix.set(1, 1, 1); // Feature B: enabled
+matrix.set(2, 2, 0); // Feature C: disabled
 
 // Embed in a frame
 let frame = compose! {
@@ -1219,13 +1219,14 @@ length-prefixed envelopes. Supports both `std::net` (sync) and `tokio` (async).
 **Example:**
 ```rust
 use std::net::TcpListener;
-use tightbeam::{server, compose};
+use tightbeam::{server, compose, Frame};
 
 let listener = TcpListener::bind("127.0.0.1:8080")?;
 server! {
 	protocol std::net::TcpListener: listener,
-	|message: RequestMessage, tx| async move {
-		tx.send(ResponseMessage { data: "response".to_string() }).await.ok();
+	handle: |message: Frame| async move {
+		// Echo the frame back
+		Ok(Some(message))
 	}
 }
 ```
@@ -1880,46 +1881,71 @@ as a set of configurations. Servlets must be provided a relay which is used to
 relay `Message` types to the worker without the entire Frame. A servlet must
 only be responsible for a single message type.
 
+**Step 1**: Define configuration struct outside the macro:
+
+```rust
+#[derive(Clone)]
+pub struct PingPongServletConf {
+	pub lotto_number: u32,
+}
+```
+
+**Step 2**: Define the servlet using `EnvConfig`:
+
 ```rust
 tightbeam::servlet! {
-	pub PingPongServletWithWorker<RequestMessage>,
-	protocol: Listener,
-	config: {
-		lotto_number: u32
-	},
-	workers: |config| {
-		ping_pong: PingPongWorker = PingPongWorker::start(),
-		lucky_number: LuckyNumberDeterminer = LuckyNumberDeterminer::start(LuckyNumberDeterminerConf {
-			lotto_number: config.lotto_number,
-		})
-	},
-	handle: |message, trace, _config, workers| async move {
-		let decoded = decode::<RequestMessage, _>(&message.message)?;
+	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConf>,
+	protocol: TokioListener,
+	handle: |frame, trace, config, workers| async move {
+		// Handler receives Frame, not decoded message
+		let decoded = decode::<RequestMessage, _>(&frame.message)?;
 		let decoded_arc = Arc::new(decoded);
-		let (ping_result, lucky_result) = tokio::join!( // Parallel processing
-			workers.ping_pong.relay(Arc::clone(&trace), Arc::clone(&decoded_arc)),
-			workers.lucky_number.relay(Arc::clone(&trace), Arc::clone(&decoded_arc))
+		
+		// Workers are accessed via the workers parameter
+		let (ping_result, lucky_result) = tokio::join!(
+			workers.relay::<PingPongWorker>(Arc::clone(&decoded_arc)),
+			workers.relay::<LuckyNumberDeterminer>(Arc::clone(&decoded_arc))
 		);
 
 		let reply = match ping_result {
-			Ok(reply) => reply,
-			Err(_) => return None,
+			Ok(Some(reply)) => reply,
+			_ => return Ok(None),
 		};
 
 		let is_winner = match lucky_result {
-			Ok(is_winner) => is_winner,
-			Err(_) => return None,
+			Ok(Some(is_winner)) => is_winner,
+			_ => return Ok(None),
 		};
 
-		Ok(compose! {
-			V0: id: b"ping-pong-servlet-response-id",
+		Ok(Some(compose! {
+			V0: id: frame.metadata.id.clone(),
 				message: ResponseMessage {
 					result: reply.result,
 					is_winner,
 				}
-		}?)
+		}?))
 	}
 }
+```
+
+**Step 3**: Configure workers via `ServletConf` when starting the servlet:
+
+```rust
+// Create workers
+let ping_pong_worker = PingPongWorker::start();
+let lucky_number_worker = LuckyNumberDeterminer::start(LuckyNumberDeterminerConf {
+	lotto_number: 42,
+});
+
+// Build servlet configuration
+let servlet_conf = ServletConf::<TokioListener, RequestMessage>::builder()
+	.with_config(Arc::new(PingPongServletConf { lotto_number: 42 }))
+	.with_worker(ping_pong_worker)
+	.with_worker(lucky_number_worker)
+	.build();
+
+// Start the servlet
+PingPongServletWithWorker::start(trace, Some(servlet_conf)).await?
 ```
 
 **Efficient Parallel Worker Processing**
@@ -1986,7 +2012,7 @@ cluster so it can register it under its hive.
 **Regular Drone Example** (morphs between servlets one at a time):
 
 ```rust
-tightbeam::drone! {
+drone! {
 	pub RegularDrone,
 	protocol: Listener,
 	servlets: {
@@ -2006,7 +2032,7 @@ let response = drone.register_with_cluster(cluster_addr).await?;
 **Hive Example** (manages multiple servlets simultaneously on different ports):
 
 ```rust
-tightbeam::drone! {
+drone! {
 	pub MyHive,
 	protocol: TokioListener,
 	hive: true,
@@ -2023,7 +2049,7 @@ let hive = MyHive::start(TraceCollector::new(), None).await?;
 **Drone with Policies**:
 
 ```rust
-tightbeam::drone! {
+drone! {
 	pub SecureDrone,
 	protocol: Listener,
 	policies: {
@@ -2954,8 +2980,8 @@ use tightbeam::utils::BasisPoints;
 
 let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
 	.with_fault(
-		States::Sending,            // Type-safe state enum
-		Event("response"),          // Event label
+		States::Sending,              // Type-safe state enum
+		Event("response"),            // Event label
 		|| NetworkTimeoutError {...}, // Error factory
 		BasisPoints::new(3000),       // 30% probability
 	)
@@ -3959,13 +3985,15 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_ping_pong_worker,
-	config: ScenarioConf::builder()
+	config: ScenarioConf::<()>::builder()
 		.with_spec(PingPongWorkerSpec::latest())
 		.with_csp(PingPongWorkerProcess)
 		.build(),
 	environment Worker {
-		worker: PingPongWorker,
-		stimulus: |trace, worker| {
+		setup: |_trace| {
+			PingPongWorker::default()
+		},
+		stimulus: |trace, worker| async move {
 			// Test accepted message
 			trace.event("relay_start")?;
 
@@ -3974,7 +4002,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg))?;
+			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg)).await?;
 			if let Some(pong) = response {
 				trace.event("relay_success")?;
 				trace.event_with("response_result", &[], pong.result)?;
@@ -3988,7 +4016,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg));
+			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg)).await;
 			if result.is_err() {
 				trace.event("relay_rejected")?;
 			}
