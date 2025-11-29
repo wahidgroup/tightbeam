@@ -1,11 +1,11 @@
-//! Connection Pool and Keep-Alive Integration Tests
+//! Connection Pool Integration Tests
 //!
-//! Tests connection pooling, reuse, and keep-alive functionality:
-//! - Basic TCP connection reuse (no TLS)
-//! - TLS connection reuse with session persistence
+//! Tests connection pooling functionality:
 //! - Connection pool reuse across multiple acquire/release cycles
 //! - Per-destination pool isolation
 //! - Concurrent pool access
+//!
+//! For basic connection keep-alive tests, see connection_reuse.rs
 
 #![cfg(all(
 	feature = "std",
@@ -24,12 +24,11 @@ use std::{
 };
 
 use tightbeam::{
-	compose,
+	colony::ServletConf,
 	der::Sequence,
-	macros::client::builder::ClientBuilder,
-	servlet,
-	testing::{trace::TraceCollector, ScenarioConf},
-	transport::{tcp::r#async::TokioListener, Client, ConnectionPool, PoolConfig},
+	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{create_v0_tightbeam, trace::TraceCollector, ScenarioConf},
+	transport::{tcp::r#async::TokioListener, ConnectionBuilder, ConnectionPool, PoolConfig},
 	Beamable,
 };
 
@@ -99,38 +98,7 @@ const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KE
 // Spec Definitions
 // ============================================================================
 
-tightbeam::tb_process_spec! {
-	pub ConnectionReuseProcess,
-	events {
-		observable { "client_connect", "send_message", "receive_response" }
-		hidden { }
-	}
-	states {
-		Init => { "client_connect" => Connected },
-		Connected => { "send_message" => Sent1 },
-		Sent1 => { "receive_response" => Received1 },
-		Received1 => { "send_message" => Sent2 },
-		Sent2 => { "receive_response" => Received2 },
-		Received2 => { "send_message" => Sent3 },
-		Sent3 => { "receive_response" => Complete }
-	}
-	terminal { Complete }
-}
-
-tightbeam::tb_assert_spec! {
-	pub ConnectionReuseSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Accepted,
-		assertions: [
-			("client_connect", tightbeam::exactly!(1)),
-			("send_message", tightbeam::exactly!(3)),
-			("receive_response", tightbeam::exactly!(3))
-		]
-	}
-}
-
-tightbeam::tb_process_spec! {
+tb_process_spec! {
 	pub PoolReuseProcess,
 	events {
 		observable { "pool_create", "acquire_client", "send_message", "receive_response", "release_client" }
@@ -154,139 +122,36 @@ tightbeam::tb_process_spec! {
 	terminal { Complete }
 }
 
-tightbeam::tb_assert_spec! {
+tb_assert_spec! {
 	pub PoolReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pool_create", tightbeam::exactly!(1)),
-			("acquire_client", tightbeam::exactly!(3)),
-			("send_message", tightbeam::exactly!(3)),
-			("receive_response", tightbeam::exactly!(3)),
-			("release_client", tightbeam::exactly!(3))
+			("pool_create", exactly!(1)),
+			("acquire_client", exactly!(3)),
+			("send_message", exactly!(3)),
+			("receive_response", exactly!(3)),
+			("release_client", exactly!(3)),
+			("message_count", exactly!(1), equals!(3u64))
 		]
 	}
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Create a new connection pool with the given max connections per destination
-fn create_pool<const N: usize>() -> Arc<ConnectionPool<TokioListener, N>> {
-	Arc::new(ConnectionPool::<TokioListener, N>::new(PoolConfig::default()))
-}
-
-// ============================================================================
-// Scenario: Basic TCP Connection Reuse (No TLS)
-// ============================================================================
-
-tightbeam::tb_scenario! {
-	name: tcp_connection_reuse,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ConnectionReuseSpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| {
-			tokio::runtime::Runtime::new()?.block_on(async {
-				// Start echo servlet
-				servlet! {
-					EchoServlet<TestMessage>,
-					protocol: TokioListener,
-					handle: |frame, _trace| async move {
-						Ok(Some(frame))
-					}
-				}
-
-				let servlet_task = EchoServlet::start(Arc::new(TraceCollector::new())).await?;
-				let addr = servlet_task.addr;
-
-				trace.event("client_connect")?;
-				let mut client = ClientBuilder::<TokioListener>::connect(addr).await?.build().await?;
-
-				// Send 3 messages using the same client
-				for i in 1..=3 {
-					trace.event("send_message")?;
-					let msg = compose! {
-						V0: id: format!("msg{}", i).as_bytes(),
-						message: TestMessage { content: format!("test{}", i) }
-					}?;
-					if client.emit(msg, None).await?.is_some() {
-						trace.event("receive_response")?;
-					}
-				}
-
-				Ok(())
-			})
-		}
-	}
-}
-
-// ============================================================================
-// Scenario: TLS Connection Reuse with Session Persistence
-// ============================================================================
-
-#[cfg(all(
-	feature = "x509",
-	feature = "transport-policy",
-	feature = "secp256k1",
-	feature = "signature",
-	feature = "sha3",
-	feature = "aead"
-))]
-tightbeam::tb_scenario! {
-	name: tls_connection_reuse,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ConnectionReuseSpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| {
-			tokio::runtime::Runtime::new()?.block_on(async {
-				// Start TLS echo servlet
-				servlet! {
-					TlsEchoServlet<TestMessage>,
-					protocol: TokioListener,
-					x509: {
-						certificate: SERVER_CERT,
-						key_provider: SERVER_KEY,
-						client_validators: [CLIENT_PINNING]
-					},
-					handle: |frame, _trace| async move {
-						Ok(Some(frame))
-					}
-				}
-
-				let servlet_task = TlsEchoServlet::start(Arc::new(TraceCollector::new())).await?;
-				let addr = servlet_task.addr;
-
-				trace.event("client_connect")?;
-				let mut client = ClientBuilder::<TokioListener>::connect(addr)
-					.await?
-					.with_server_certificate(SERVER_CERT)?
-					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
-					.build()
-					.await?;
-
-				// Send 3 messages using the same TLS client (no re-handshake)
-				for i in 1..=3 {
-					trace.event("send_message")?;
-					let msg = compose! {
-						V0: id: format!("tls-msg{}", i).as_bytes(),
-						message: TestMessage { content: format!("test{}", i) }
-					}?;
-					if client.emit(msg, None).await?.is_some() {
-						trace.event("receive_response")?;
-					}
-
-					if i < 3 {
-						tokio::time::sleep(Duration::from_millis(50)).await;
-					}
-				}
-
-				Ok(())
-			})
-		}
+tb_assert_spec! {
+	pub PoolIsolationSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("pool_create", exactly!(1)),
+			("acquire_client", exactly!(3)),
+			("send_message", exactly!(3)),
+			("receive_response", exactly!(3)),
+			("release_client", exactly!(3)),
+			("servlet1_count", exactly!(1), equals!(2u64)),
+			("servlet2_count", exactly!(1), equals!(1u64))
+		]
 	}
 }
 
@@ -302,56 +167,56 @@ tightbeam::tb_scenario! {
 	feature = "sha3",
 	feature = "aead"
 ))]
-tightbeam::tb_scenario! {
+tb_scenario! {
 	name: connection_pool_reuse,
 	config: ScenarioConf::<()>::builder()
 		.with_spec(PoolReuseSpec::latest())
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			tokio::runtime::Runtime::new()?.block_on(async {
-				// Start echo servlet with TLS
-				servlet! {
-					PoolEchoServlet<TestMessage>,
+		exec: |trace| async move {
+			// Start echo servlet with TLS
+			pub struct PoolEchoServletConf {
+				message_count: Arc<AtomicUsize>,
+			}
+
+			servlet! {
+				PoolEchoServlet<TestMessage, EnvConfig = PoolEchoServletConf>,
 					protocol: TokioListener,
-					x509: {
-						certificate: SERVER_CERT,
-						key_provider: SERVER_KEY,
-						client_validators: [CLIENT_PINNING]
-					},
-					config: {
-						message_count: Arc<AtomicUsize>,
-					},
-					handle: |frame, _trace, config| async move {
+					handle: |frame, _trace, config, _workers| async move {
 						config.message_count.fetch_add(1, Ordering::SeqCst);
 						Ok(Some(frame))
 					}
 				}
 
 				let message_count = Arc::new(AtomicUsize::new(0));
-				let config = PoolEchoServletConf { message_count: Arc::clone(&message_count) };
+				let env_config = Arc::new(PoolEchoServletConf { message_count: Arc::clone(&message_count) });
+				let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
+					.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_config(env_config)
+					.build();
 				let servlet = PoolEchoServlet::start(
 					Arc::new(TraceCollector::default()),
-					Arc::new(config),
+					Some(servlet_conf),
 				).await?;
 				let server_addr = servlet.addr();
 
 				trace.event("pool_create")?;
-				let pool = create_pool::<3>();
 
-				// Send 3 messages using the pool (acquire, send, release cycle)
+				let pool = ConnectionPool::<TokioListener, 3>::builder()
+					.with_config(PoolConfig::default())
+					.with_server_certificate(SERVER_CERT)?
+					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+					.with_timeout(Duration::from_millis(1000))
+					.build();
+
 				for i in 1..=3 {
 					trace.event("acquire_client")?;
-					let mut client = pool
-						.connect(server_addr)
-						.with_server_certificate(SERVER_CERT)?
-						.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
-						.with_timeout(Duration::from_millis(1000))
-						.build()
-						.await?;
+
+					let mut client = pool.connect(server_addr).await?;
 
 					trace.event("send_message")?;
-					let msg = tightbeam::testing::create_v0_tightbeam(Some(&format!("test{}", i)), None);
+
+					let msg = create_v0_tightbeam(Some(&format!("test{}", i)), None);
 					if client.emit(msg, None).await?.is_some() {
 						trace.event("receive_response")?;
 					}
@@ -360,10 +225,9 @@ tightbeam::tb_scenario! {
 				}
 
 				// Verify all 3 messages were processed
-				assert_eq!(message_count.load(Ordering::SeqCst), 3, "Expected 3 messages to be processed");
+				trace.event_with("message_count", &[], message_count.load(Ordering::SeqCst) as u64)?;
 
-				Ok(())
-			})
+			Ok(())
 		}
 	}
 }
@@ -380,26 +244,21 @@ tightbeam::tb_scenario! {
 	feature = "sha3",
 	feature = "aead"
 ))]
-tightbeam::tb_scenario! {
+tb_scenario! {
 	name: pool_per_destination_isolation,
 	config: ScenarioConf::<()>::builder()
-		.with_spec(PoolReuseSpec::latest())
+		.with_spec(PoolIsolationSpec::latest())
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			tokio::runtime::Runtime::new()?.block_on(async {
-				servlet! {
-					IsolationServlet<TestMessage>,
+		exec: |trace| async move {
+			pub struct IsolationServletConf {
+				message_count: Arc<AtomicUsize>,
+			}
+
+			servlet! {
+				IsolationServlet<TestMessage, EnvConfig = IsolationServletConf>,
 					protocol: TokioListener,
-					x509: {
-						certificate: SERVER_CERT,
-						key_provider: SERVER_KEY,
-						client_validators: [CLIENT_PINNING]
-					},
-					config: {
-						message_count: Arc<AtomicUsize>,
-					},
-					handle: |frame, _trace, config| async move {
+					handle: |frame, _trace, config, _workers| async move {
 						config.message_count.fetch_add(1, Ordering::SeqCst);
 						Ok(Some(frame))
 					}
@@ -407,41 +266,49 @@ tightbeam::tb_scenario! {
 
 				let count1 = Arc::new(AtomicUsize::new(0));
 				let count2 = Arc::new(AtomicUsize::new(0));
-
 				let config1 = Arc::new(IsolationServletConf { message_count: Arc::clone(&count1) });
 				let config2 = Arc::new(IsolationServletConf { message_count: Arc::clone(&count2) });
 
-				let servlet1 = IsolationServlet::start(Arc::new(TraceCollector::default()), config1).await?;
-				let servlet2 = IsolationServlet::start(Arc::new(TraceCollector::default()), config2).await?;
+				let servlet_conf1 = ServletConf::<TokioListener, TestMessage>::builder()
+					.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_config(config1)
+					.build();
+				let servlet_conf2 = ServletConf::<TokioListener, TestMessage>::builder()
+					.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_config(config2)
+					.build();
+
+				let servlet1 = IsolationServlet::start(Arc::new(TraceCollector::default()), Some(servlet_conf1)).await?;
+				let servlet2 = IsolationServlet::start(Arc::new(TraceCollector::default()), Some(servlet_conf2)).await?;
 				let addr1 = servlet1.addr();
 				let addr2 = servlet2.addr();
 
 				trace.event("pool_create")?;
-				let pool = create_pool::<2>();
 
-				// Send to addr1, addr2, addr1 again (testing pool isolation)
+				let pool = ConnectionPool::<TokioListener, 2>::builder()
+					.with_server_certificate(SERVER_CERT)?
+					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+					.build();
+
 				for (addr, name) in [(addr1, "addr1-test"), (addr2, "addr2-test"), (addr1, "addr1-test2")] {
 					trace.event("acquire_client")?;
-					let mut client = pool
-						.connect(addr)
-						.with_server_certificate(SERVER_CERT)?
-						.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
-						.build()
-						.await?;
+
+					let mut client = pool.connect(addr).await?;
 
 					trace.event("send_message")?;
-					if client.emit(tightbeam::testing::create_v0_tightbeam(Some(name), None), None).await?.is_some() {
+
+					if client.emit(create_v0_tightbeam(Some(name), None), None).await?.is_some() {
 						trace.event("receive_response")?;
 					}
-					trace.event("release_client")?;
-				}
 
-				// Verify counts
-				assert_eq!(count1.load(Ordering::SeqCst), 2);
-				assert_eq!(count2.load(Ordering::SeqCst), 1);
+				trace.event("release_client")?;
+			}
 
-				Ok(())
-			})
+			// Verify counts
+			trace.event_with("servlet1_count", &[], count1.load(Ordering::SeqCst) as u64)?;
+			trace.event_with("servlet2_count", &[], count2.load(Ordering::SeqCst) as u64)?;
+
+			Ok(())
 		}
 	}
 }
@@ -458,64 +325,63 @@ tightbeam::tb_scenario! {
 	feature = "sha3",
 	feature = "aead"
 ))]
-tightbeam::tb_scenario! {
+tb_scenario! {
 	name: pool_concurrent_access,
 	config: ScenarioConf::<()>::builder()
 		.with_spec(PoolReuseSpec::latest())
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			tokio::runtime::Runtime::new()?.block_on(async {
-				servlet! {
-					ConcurrentServlet<TestMessage>,
-					protocol: TokioListener,
-					x509: {
-						certificate: SERVER_CERT,
-						key_provider: SERVER_KEY,
-						client_validators: [CLIENT_PINNING]
-					},
-					config: {
-						message_count: Arc<AtomicUsize>,
-					},
-					handle: |frame, _trace, config| async move {
-						config.message_count.fetch_add(1, Ordering::SeqCst);
-						Ok(Some(frame))
-					}
+		exec: |trace| async move {
+			pub struct ConcurrentServletConf {
+				message_count: Arc<AtomicUsize>,
+			}
+
+			servlet! {
+				ConcurrentServlet<TestMessage, EnvConfig = ConcurrentServletConf>,
+				protocol: TokioListener,
+				handle: |frame, _trace, config, _workers| async move {
+					config.message_count.fetch_add(1, Ordering::SeqCst);
+					Ok(Some(frame))
+				}
+			}
+
+			let message_count = Arc::new(AtomicUsize::new(0));
+			let env_config = Arc::new(ConcurrentServletConf { message_count: Arc::clone(&message_count) });
+			let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
+				.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_config(env_config)
+				.build();
+			let servlet = ConcurrentServlet::start(
+				Arc::new(TraceCollector::default()),
+				Some(servlet_conf),
+			).await?;
+			let server_addr = servlet.addr();
+
+			trace.event("pool_create")?;
+
+			let pool = ConnectionPool::<TokioListener, 3>::builder()
+				.with_server_certificate(SERVER_CERT)?
+				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+				.build();
+
+			for _ in 0..3 {
+				trace.event("acquire_client")?;
+
+				let mut client = pool.connect(server_addr).await?;
+
+				trace.event("send_message")?;
+
+				if client.emit(create_v0_tightbeam(Some("concurrent-test"), None), None).await?.is_some() {
+					trace.event("receive_response")?;
 				}
 
-				let message_count = Arc::new(AtomicUsize::new(0));
-				let config = ConcurrentServletConf { message_count: Arc::clone(&message_count) };
-				let servlet = ConcurrentServlet::start(
-					Arc::new(TraceCollector::default()),
-					Arc::new(config),
-				).await?;
-				let server_addr = servlet.addr();
+				trace.event("release_client")?;
+			}
 
-				trace.event("pool_create")?;
-				let pool = create_pool::<3>();
+			// Verify 3 messages processed
+			trace.event_with("message_count", &[], message_count.load(Ordering::SeqCst) as u64)?;
 
-				// Simulate 3 concurrent tasks, but run sequentially for deterministic tracing
-				for _ in 0..3 {
-					trace.event("acquire_client")?;
-					let mut client = pool
-						.connect(server_addr)
-						.with_server_certificate(SERVER_CERT)?
-						.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
-						.build()
-						.await?;
-
-					trace.event("send_message")?;
-					if client.emit(tightbeam::testing::create_v0_tightbeam(Some("concurrent-test"), None), None).await?.is_some() {
-						trace.event("receive_response")?;
-					}
-					trace.event("release_client")?;
-				}
-
-				// Verify 3 messages processed
-				assert_eq!(message_count.load(Ordering::SeqCst), 3);
-
-				Ok(())
-			})
+			Ok(())
 		}
 	}
 }

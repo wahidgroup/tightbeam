@@ -49,7 +49,7 @@ mod fault;
 mod fmea;
 
 // Delay-Tolerant Networking tests
-// #[cfg(all(feature = "testing-fault", feature = "testing-fdr"))]
+#[cfg(all(feature = "full"))]
 mod dtn;
 
 // DLT Network test

@@ -14,6 +14,7 @@ use core::time::Duration;
 
 // Module declarations
 pub mod builders;
+pub mod client;
 pub mod envelopes;
 pub mod error;
 pub mod handshake;
@@ -26,8 +27,6 @@ pub mod state;
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
-#[cfg(feature = "std")]
-pub mod pool;
 #[cfg(feature = "tcp")]
 pub mod tcp;
 
@@ -42,8 +41,12 @@ pub use protocols::{
 	X509ClientConfig,
 };
 
+pub use client::GenericClient;
+
+#[cfg(feature = "builder")]
+pub use client::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
-pub use pool::{Client, ConnectionPool, PoolConfig, PooledClient};
+pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;

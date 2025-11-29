@@ -1083,9 +1083,9 @@ mod tests {
 	// Define servlet at module scope for testing
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	servlet! {
-		pub TestServletForScenario<()>,
+		pub TestServletForScenario<crate::testing::utils::TestMessage, EnvConfig = ()>,
 		protocol: TokioListener,
-		handle: |frame, trace| async move {
+		handle: |frame, trace, _config, _workers| async move {
 			// Server-side assertions
 			trace.event("Received")?;
 			trace.event("Responded")?;
@@ -1104,7 +1104,7 @@ mod tests {
 		environment ServiceClient {
 			worker_threads: 1,
 			server: |trace| async move {
-				let servlet = TestServletForScenario::start(Arc::new(trace)).await?;
+				let servlet = TestServletForScenario::start(Arc::new(trace), None).await?;
 				let addr = servlet.addr();
 				let server_handle = tokio::spawn(async move {
 					let _ = servlet.join().await;

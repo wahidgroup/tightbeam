@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use tightbeam::asn1::{Metadata, Version};
 use tightbeam::error::Result;
-use tightbeam::{encode, job, policy, worker, Frame, TightBeamError};
 use tightbeam::trace::TraceCollector;
+use tightbeam::{encode, job, policy, worker, Frame, TightBeamError};
 use tightbeam::{prelude::*, Null};
 
 /// Compressed public key (33 bytes)
@@ -660,7 +660,7 @@ mod tests {
 
 			Ok(())
 		},
-		handle: |message, _trace, config| async move {
+		handle: |message, _trace, config, _workers| async move {
 			// Add frame to current epoch
 			let epochs = EPOCHS();
 			let Ok(mut epochs) = epochs.write() else {
@@ -696,7 +696,8 @@ mod tests {
 		BFTLedgerServlet::start(
 			Arc::new(TraceCollector::new()),
 			Arc::new(BFTLedgerServletConf { ledger_state: Default::default(), epoch_size: 1000 }),
-		).await?;
+		)
+		.await?;
 
 		Ok(())
 	}

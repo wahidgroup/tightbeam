@@ -29,8 +29,8 @@ use tightbeam::{
 
 use crate::dtn::{
 	certs::{
-		EARTH_RELAY_CERT, EARTH_RELAY_KEY, EARTH_RELAY_PINNING, MARS_RELAY_CERT, MARS_RELAY_KEY, MARS_RELAY_PINNING,
-		MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, MISSION_CONTROL_PINNING, ROVER_CERT, ROVER_KEY, ROVER_PINNING,
+		EARTH_RELAY_CERT, EARTH_RELAY_KEY, MARS_RELAY_CERT, MARS_RELAY_KEY, MISSION_CONTROL_CERT, MISSION_CONTROL_KEY,
+		ROVER_CERT, ROVER_KEY, VALIDATE_EARTH_RELAY, VALIDATE_MARS_RELAY, VALIDATE_MISSION_CONTROL, VALIDATE_ROVER,
 	},
 	chain_processor::{ChainProcessor, ProcessResult},
 	clock::mission_time_ms,
@@ -82,30 +82,35 @@ trait DtnNode {
 		}
 	}
 
-	// Send frame using connection pool
-	async fn send_frame(
+	// Send frame using client builder with x509 configuration and mutual authentication
+	async fn send_frame<V>(
 		&self,
-		pool: &Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
+		_pool: &Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 		addr: TightBeamSocketAddr,
 		server_cert: CertificateSpec,
+		validator: V,
 		frame: Frame,
-	) -> Result<Option<Frame>, TightBeamError> {
-		use tightbeam::transport::Client;
+	) -> Result<Option<Frame>, TightBeamError>
+	where
+		V: tightbeam::crypto::x509::policy::CertificateValidation + Send + Sync + 'static,
+	{
+		use tightbeam::transport::{ClientBuilder, ConnectionBuilder};
 
-		// Acquire pooled client with full x509 configuration
-		let mut client = pool
-			.connect(addr)
+		// Create client with full x509 configuration including server validation
+		let mut client = ClientBuilder::<TokioListener>::builder()
 			.with_server_certificate(server_cert)?
 			.with_client_identity(self.node_cert(), self.node_key())?
+			.with_x509_gate(validator)
 			.with_timeout(Duration::from_millis(5000))
 			.build()
+			.connect(addr)
 			.await?;
 
 		Ok(client.emit(frame, None).await?)
 	}
 
 	// Gap recovery with pooling
-	async fn handle_frame_request(
+	async fn handle_frame_request<V>(
 		&self,
 		request: FrameRequest,
 		trace: &TraceCollector,
@@ -113,8 +118,12 @@ trait DtnNode {
 			&Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 			TightBeamSocketAddr,
 			CertificateSpec,
+			V,
 		)>,
-	) -> Result<Option<Frame>, TightBeamError> {
+	) -> Result<Option<Frame>, TightBeamError>
+	where
+		V: tightbeam::crypto::x509::policy::CertificateValidation + Send + Sync + 'static,
+	{
 		trace.event(format!("{}_receive_frame_request", self.node_name()))?;
 
 		let missing_frames = self
@@ -136,7 +145,7 @@ trait DtnNode {
 
 			self.chain_processor().finalize_outgoing(&response_frame)?;
 			Ok(Some(response_frame))
-		} else if let Some((pool, addr, cert)) = cascade_target {
+		} else if let Some((pool, addr, cert, validator)) = cascade_target {
 			trace.event(format!("{}_cascade_frame_request", self.node_name()))?;
 
 			let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
@@ -149,7 +158,7 @@ trait DtnNode {
 			)?;
 
 			self.chain_processor().finalize_outgoing(&cascade_frame)?;
-			self.send_frame(pool, addr, cert, cascade_frame).await?;
+			self.send_frame(pool, addr, cert, validator, cascade_frame).await?;
 			Ok(None)
 		} else {
 			Ok(None)
@@ -200,15 +209,19 @@ trait DtnNode {
 		Ok(response_frame)
 	}
 
-	async fn handle_chain_gap(
+	async fn handle_chain_gap<V>(
 		&self,
 		current_head: Vec<u8>,
 		missing_hash: Vec<u8>,
 		pool: &Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
 		upstream_addr: TightBeamSocketAddr,
 		server_cert: CertificateSpec,
+		validator: V,
 		trace: &TraceCollector,
-	) -> Result<(), TightBeamError> {
+	) -> Result<(), TightBeamError>
+	where
+		V: tightbeam::crypto::x509::policy::CertificateValidation + Send + Sync + 'static,
+	{
 		trace.event(format!("{}_gap_detected", self.node_name()))?;
 
 		let request = FrameRequest {
@@ -228,7 +241,8 @@ trait DtnNode {
 		self.chain_processor().finalize_outgoing(&request_frame)?;
 		trace.event(format!("{}_send_frame_request", self.node_name()))?;
 
-		self.send_frame(pool, upstream_addr, server_cert, request_frame).await?;
+		self.send_frame(pool, upstream_addr, server_cert, validator, request_frame)
+			.await?;
 		Ok(())
 	}
 }
@@ -253,27 +267,24 @@ async fn wait_for_address(
 // Mission Control Servlet
 // ============================================================================
 
+#[derive(Clone)]
+pub struct MissionControlServletConf {
+	pub mission_control_signing_key: Secp256k1SigningKey,
+	pub rover_verifying_key: Secp256k1VerifyingKey,
+	pub earth_relay_verifying_key: Secp256k1VerifyingKey,
+	pub shared_cipher: Aes256Gcm,
+	pub chain_processor: Arc<ChainProcessor>,
+	pub frame_builder: Arc<FrameBuilderHelper>,
+	pub earth_relay_addr: TightBeamSocketAddr,
+	pub connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
+	pub shared_mission_state: Arc<RwLock<MissionState>>,
+}
+
 servlet! {
 	/// Mission Control receives telemetry and sends commands to Rover via relays
-	pub MissionControlServlet<RelayMessage>,
+	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConf>,
 	protocol: TokioListener,
-	x509: {
-		certificate: MISSION_CONTROL_CERT,
-		key_provider: MISSION_CONTROL_KEY,
-		client_validators: [MISSION_CONTROL_PINNING]
-	},
-	config: {
-		mission_control_signing_key: Secp256k1SigningKey,
-		rover_verifying_key: Secp256k1VerifyingKey,
-		earth_relay_verifying_key: Secp256k1VerifyingKey,
-		shared_cipher: Aes256Gcm,
-		chain_processor: Arc<ChainProcessor>,
-		frame_builder: Arc<FrameBuilderHelper>,
-		earth_relay_addr: TightBeamSocketAddr,
-		connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
-		shared_mission_state: Arc<RwLock<MissionState>>,
-	},
-	handle: |frame, trace, config| async move {
+	handle: |frame, trace, config, _workers| async move {
 		// Verify signature using trait method
 		if !config.verify_signature(&frame)? {
 			trace
@@ -290,8 +301,6 @@ servlet! {
 				for ordered_frame in ordered_frames {
 					// Decrypt and decode using trait method
 					let relay_message = config.decrypt_relay_message(ordered_frame.clone())?;
-
-					// Handle based on message type
 					match relay_message {
 						RelayMessage::Telemetry(telemetry) => {
 							trace.event("mission_control_receive_telemetry")?;
@@ -345,11 +354,12 @@ servlet! {
 									.with_log_level(LogLevel::Info)
 									.emit();
 
-								// Send command via pooled client
+								// Send command via pooled client (validate Earth Relay's certificate)
 								config.send_frame(
 									&config.connection_pool,
 									config.earth_relay_addr,
 									EARTH_RELAY_CERT,
+									VALIDATE_EARTH_RELAY,
 									command_frame,
 								).await?;
 
@@ -380,7 +390,7 @@ servlet! {
 					},
 				RelayMessage::FrameRequest(request) => {
 					// Use trait method - Mission Control is origin so no cascade target
-					if let Some(response_frame) = config.handle_frame_request(request, &trace, None).await? {
+					if let Some(response_frame) = config.handle_frame_request::<tightbeam::crypto::x509::policy::PublicKeyPinning<1>>(request, &trace, None).await? {
 						return Ok(Some(response_frame));
 					}
 				},
@@ -400,13 +410,14 @@ servlet! {
 			},
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// Use trait method with pooled client
+				// Use trait method with pooled client (validate Earth Relay's certificate)
 				config.handle_chain_gap(
 					current_head,
 					missing_hash,
 					&config.connection_pool,
 					config.earth_relay_addr,
 					EARTH_RELAY_CERT,
+					VALIDATE_EARTH_RELAY,
 					&trace,
 				).await?;
 				Ok(None)
@@ -453,28 +464,25 @@ impl DtnNode for MissionControlServletConf {
 // Earth Relay Satellite Servlet
 // ============================================================================
 
+#[derive(Clone)]
+pub struct EarthRelaySatelliteServletConf {
+	pub earth_relay_signing_key: Secp256k1SigningKey,
+	pub mission_control_verifying_key: Secp256k1VerifyingKey,
+	pub mars_relay_verifying_key: Secp256k1VerifyingKey,
+	pub rover_verifying_key: Secp256k1VerifyingKey,
+	pub shared_cipher: Aes256Gcm,
+	pub mars_relay_addr: TightBeamSocketAddr,
+	pub mission_control_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
+	pub connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
+	pub chain_processor: Arc<ChainProcessor>,
+	pub frame_builder: Arc<FrameBuilderHelper>,
+}
+
 servlet! {
 	/// Earth Relay forwards messages between Mission Control and Mars Relay
-	pub EarthRelaySatelliteServlet<RelayMessage>,
+	pub EarthRelaySatelliteServlet<RelayMessage, EnvConfig = EarthRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	x509: {
-		certificate: EARTH_RELAY_CERT,
-		key_provider: EARTH_RELAY_KEY,
-		client_validators: [EARTH_RELAY_PINNING]
-	},
-	config: {
-		earth_relay_signing_key: Secp256k1SigningKey,
-		mission_control_verifying_key: Secp256k1VerifyingKey,
-		mars_relay_verifying_key: Secp256k1VerifyingKey,
-		rover_verifying_key: Secp256k1VerifyingKey,
-		shared_cipher: Aes256Gcm,
-		mars_relay_addr: TightBeamSocketAddr,
-		mission_control_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
-		connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
-		chain_processor: Arc<ChainProcessor>,
-		frame_builder: Arc<FrameBuilderHelper>,
-	},
-	handle: |frame, trace, config| async move {
+	handle: |frame, trace, config, _workers| async move {
 		trace
 			.event(format!("[Earth Relay] Received frame with order: {}", frame.metadata.order))?
 			.with_log_level(LogLevel::Debug)
@@ -494,14 +502,14 @@ servlet! {
 					.with_log_level(LogLevel::Debug)
 					.emit();
 				false
+			} else {
+				trace
+					.event(format!("[Earth Relay] ✗ Signature verification FAILED (order: {})", frame.metadata.order))?
+					.with_log_level(LogLevel::Error)
+					.emit();
+				return Err(TightBeamError::MissingSignature);
+			}
 		} else {
-			trace
-				.event(format!("[Earth Relay] ✗ Signature verification FAILED (order: {})", frame.metadata.order))?
-				.with_log_level(LogLevel::Error)
-				.emit();
-			return Err(TightBeamError::MissingSignature);
-		}
-	} else {
 			trace
 				.event(format!("[Earth Relay] ✗ No signature found (order: {})", frame.metadata.order))?
 				.with_log_level(LogLevel::Error)
@@ -533,7 +541,6 @@ servlet! {
 				if let Some(ordered_frame) = ordered_frames.into_iter().next() {
 					// Decrypt and decode to check message type
 					let relay_message = config.decrypt_relay_message(ordered_frame.clone())?;
-
 					match relay_message {
 						RelayMessage::FrameRequest(request) => {
 							trace.event("earth_relay_receive_frame_request")?;
@@ -550,13 +557,13 @@ servlet! {
 								// We don't have frames - cascade to upstream
 								trace.event("earth_relay_cascade_frame_request")?;
 
-								let (cascade_addr, cascade_cert) = if from_mission_control {
+								let (cascade_addr, cascade_cert, cascade_validator) = if from_mission_control {
 									// Request from MC, cascade to Mars Relay
-									(config.mars_relay_addr, MARS_RELAY_CERT)
+									(config.mars_relay_addr, MARS_RELAY_CERT, VALIDATE_MARS_RELAY)
 								} else {
 									// Request from Mars, cascade to MC (rare but possible)
 									match *config.mission_control_addr.read()? {
-										Some(mc_addr) => (mc_addr, MISSION_CONTROL_CERT),
+										Some(mc_addr) => (mc_addr, MISSION_CONTROL_CERT, VALIDATE_MISSION_CONTROL),
 										None => return Ok(None), // MC address not available yet
 									}
 								};
@@ -571,7 +578,7 @@ servlet! {
 								)?;
 
 								config.chain_processor.finalize_outgoing(&cascade_frame)?;
-								config.send_frame(&config.connection_pool, cascade_addr, cascade_cert, cascade_frame).await?;
+								config.send_frame(&config.connection_pool, cascade_addr, cascade_cert, cascade_validator, cascade_frame).await?;
 
 								return Ok(None); // Cascade is async, no immediate response
 							}
@@ -594,6 +601,7 @@ servlet! {
 									&config.connection_pool,
 									config.mars_relay_addr,
 									MARS_RELAY_CERT,
+									VALIDATE_MARS_RELAY,
 									frame,
 								).await?;
 
@@ -624,11 +632,12 @@ servlet! {
 								// Get Mission Control address (wait if not set yet)
 								let mc_addr = wait_for_address(&config.mission_control_addr).await?;
 
-								// Use pooled client
+								// Use pooled client (validate Mission Control's certificate)
 								config.send_frame(
 									&config.connection_pool,
 									mc_addr,
 									MISSION_CONTROL_CERT,
+									VALIDATE_MISSION_CONTROL,
 									frame,
 								).await?;
 
@@ -643,13 +652,14 @@ servlet! {
 			},
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// Use trait method with pooled client
+				// Use trait method with pooled client (validate Mars Relay's certificate)
 				config.handle_chain_gap(
 					current_head,
 					missing_hash,
 					&config.connection_pool,
 					config.mars_relay_addr,
 					MARS_RELAY_CERT,
+					VALIDATE_MARS_RELAY,
 					&trace,
 				).await?;
 				Ok(None)
@@ -700,28 +710,25 @@ impl DtnNode for EarthRelaySatelliteServletConf {
 // Mars Relay Satellite Servlet
 // ============================================================================
 
+#[derive(Clone)]
+pub struct MarsRelaySatelliteServletConf {
+	pub mars_relay_signing_key: Secp256k1SigningKey,
+	pub mission_control_verifying_key: Secp256k1VerifyingKey,
+	pub earth_relay_verifying_key: Secp256k1VerifyingKey,
+	pub rover_verifying_key: Secp256k1VerifyingKey,
+	pub shared_cipher: Aes256Gcm,
+	pub rover_addr: TightBeamSocketAddr,
+	pub earth_relay_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
+	pub connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
+	pub chain_processor: Arc<ChainProcessor>,
+	pub frame_builder: Arc<FrameBuilderHelper>,
+}
+
 servlet! {
 	/// Mars Relay forwards messages between Earth Relay and Rover
-	pub MarsRelaySatelliteServlet<RelayMessage>,
+	pub MarsRelaySatelliteServlet<RelayMessage, EnvConfig = MarsRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	x509: {
-		certificate: MARS_RELAY_CERT,
-		key_provider: MARS_RELAY_KEY,
-		client_validators: [MARS_RELAY_PINNING]
-	},
-	config: {
-		mars_relay_signing_key: Secp256k1SigningKey,
-		mission_control_verifying_key: Secp256k1VerifyingKey,
-		earth_relay_verifying_key: Secp256k1VerifyingKey,
-		rover_verifying_key: Secp256k1VerifyingKey,
-		shared_cipher: Aes256Gcm,
-		rover_addr: TightBeamSocketAddr,
-		earth_relay_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
-		connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
-		chain_processor: Arc<ChainProcessor>,
-		frame_builder: Arc<FrameBuilderHelper>,
-	},
-	handle: |frame, trace, config| async move {
+	handle: |frame, trace, config, _workers| async move {
 		// Verify signature and determine source
 		// Earth Relay forwards messages, so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation.is_some() {
@@ -765,15 +772,15 @@ servlet! {
 								// We don't have frames - cascade to upstream
 								trace.event("mars_relay_cascade_frame_request")?;
 
-								let (cascade_addr, cascade_cert) = if from_rover {
+								let (cascade_addr, cascade_cert, cascade_validator) = if from_rover {
 									// Request from Rover, cascade to Earth Relay
 									match *config.earth_relay_addr.read()? {
-										Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT),
+										Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT, VALIDATE_EARTH_RELAY),
 										None => return Ok(None), // Earth address not available yet
 									}
 								} else {
 									// Request from Earth, cascade to Rover
-									(config.rover_addr, ROVER_CERT)
+									(config.rover_addr, ROVER_CERT, VALIDATE_ROVER)
 								};
 
 								let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
@@ -786,7 +793,7 @@ servlet! {
 								)?;
 
 								config.chain_processor.finalize_outgoing(&cascade_frame)?;
-								config.send_frame(&config.connection_pool, cascade_addr, cascade_cert, cascade_frame).await?;
+								config.send_frame(&config.connection_pool, cascade_addr, cascade_cert, cascade_validator, cascade_frame).await?;
 								return Ok(None); // Cascade is async, no immediate response
 							}
 						},
@@ -821,11 +828,12 @@ servlet! {
 					// Get Earth Relay address (wait if not set yet)
 					let earth_addr = wait_for_address(&config.earth_relay_addr).await?;
 
-					// Use pooled client
+					// Use pooled client (validate Earth Relay's certificate)
 					config.send_frame(
 						&config.connection_pool,
 						earth_addr,
 						EARTH_RELAY_CERT,
+						VALIDATE_EARTH_RELAY,
 						frame,
 					).await?;
 
@@ -845,8 +853,10 @@ servlet! {
 						&config.connection_pool,
 						config.rover_addr,
 						ROVER_CERT,
+						VALIDATE_ROVER,
 						frame,
 					).await?;
+
 					trace
 						.event(format!("[Mars Relay] Response from Rover: {:?}", response.is_some()))?
 						.with_log_level(LogLevel::Debug)
@@ -868,6 +878,7 @@ servlet! {
 							&config.connection_pool,
 							earth_addr,
 							EARTH_RELAY_CERT,
+							VALIDATE_EARTH_RELAY,
 							ack_frame,
 						).await?;
 						trace.event("[Mars Relay] ACK forwarded to Earth Relay")?.with_log_level(LogLevel::Debug).emit();
@@ -880,15 +891,15 @@ servlet! {
 			ProcessResult::Buffered => Ok(None),
 			ProcessResult::ChainGap { current_head, missing_hash } => {
 				// Determine upstream based on gap source
-				let (upstream_addr, upstream_cert) = if from_rover {
+				let (upstream_addr, upstream_cert, upstream_validator) = if from_rover {
 					// Gap from Rover direction, cascade to Earth Relay
 					match *config.earth_relay_addr.read()? {
-						Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT),
+						Some(earth_addr) => (earth_addr, EARTH_RELAY_CERT, VALIDATE_EARTH_RELAY),
 						None => return Ok(None), // Earth address not available yet
 					}
 				} else {
 					// Gap from Earth direction, cascade to Rover
-					(config.rover_addr, ROVER_CERT)
+					(config.rover_addr, ROVER_CERT, VALIDATE_ROVER)
 				};
 
 				// Use trait method with pooled client
@@ -898,6 +909,7 @@ servlet! {
 					&config.connection_pool,
 					upstream_addr,
 					upstream_cert,
+					upstream_validator,
 					&trace,
 				).await?;
 				Ok(None)
@@ -948,30 +960,27 @@ impl DtnNode for MarsRelaySatelliteServletConf {
 // Rover Servlet
 // ============================================================================
 
+#[derive(Clone)]
+pub struct RoverServletConf {
+	pub mars_relay_addr: TightBeamSocketAddr,
+	pub connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
+	pub rover_signing_key: Secp256k1SigningKey,
+	pub mission_control_verifying_key: Secp256k1VerifyingKey,
+	pub mars_relay_verifying_key: Secp256k1VerifyingKey,
+	pub shared_cipher: Aes256Gcm,
+	pub chain_processor: Arc<ChainProcessor>,
+	pub fault_manager: Arc<FaultManager>,
+	pub command_executor: Arc<RwLock<CommandExecutor>>,
+	pub frame_builder: Arc<FrameBuilderHelper>,
+	pub mission_state: Arc<RwLock<MissionState>>,
+	pub max_rounds: usize,
+}
+
 servlet! {
 	/// Mars Rover executes commands and sends telemetry
-	pub RoverServlet<RelayMessage>,
+	pub RoverServlet<RelayMessage, EnvConfig = RoverServletConf>,
 	protocol: TokioListener,
-	x509: {
-		certificate: ROVER_CERT,
-		key_provider: ROVER_KEY,
-		client_validators: [ROVER_PINNING]
-	},
-	config: {
-		mars_relay_addr: TightBeamSocketAddr,
-		connection_pool: Arc<tightbeam::transport::ConnectionPool<TokioListener, 3>>,
-		rover_signing_key: Secp256k1SigningKey,
-		mission_control_verifying_key: Secp256k1VerifyingKey,
-		mars_relay_verifying_key: Secp256k1VerifyingKey,
-		shared_cipher: Aes256Gcm,
-		chain_processor: Arc<ChainProcessor>,
-		fault_manager: Arc<FaultManager>,
-		command_executor: Arc<RwLock<CommandExecutor>>,
-		frame_builder: Arc<FrameBuilderHelper>,
-		mission_state: Arc<RwLock<MissionState>>,
-		max_rounds: usize,
-	},
-	handle: |frame, trace, config| async move {
+	handle: |frame, trace, config, _workers| async move {
 		trace
 			.event(format!("[{}] [Rover] Received frame", format_mission_time(mission_time_ms())))?
 			.with_log_level(LogLevel::Debug)
@@ -1008,13 +1017,14 @@ servlet! {
 				return Ok(None);
 			},
 			ProcessResult::ChainGap { current_head, missing_hash } => {
-				// Use trait method with pooled client
+				// Use trait method with pooled client (validate Mars Relay's certificate)
 				config.handle_chain_gap(
 					current_head,
 					missing_hash,
 					&config.connection_pool,
 					config.mars_relay_addr,
 					MARS_RELAY_CERT,
+					VALIDATE_MARS_RELAY,
 					&trace,
 				).await?;
 				return Ok(None);

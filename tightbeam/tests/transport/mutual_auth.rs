@@ -17,17 +17,17 @@
 
 use std::sync::Arc;
 use tightbeam::{
+	colony::ServletConf,
 	compose,
 	crypto::{
 		key::KeySpec,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
 	decode, exactly, hex,
-	macros::client::builder::ClientBuilder,
 	prelude::*,
 	servlet, tb_assert_spec, tb_scenario,
 	testing::{assertions::Presence, macros::IsSome, ScenarioConf},
-	transport::tcp::r#async::TokioListener,
+	transport::{tcp::r#async::TokioListener, ClientBuilder},
 	Beamable,
 };
 
@@ -92,14 +92,9 @@ struct AuthResponse {
 // ============================================================================
 
 servlet! {
-	pub MutualAuthServlet<AuthRequest>,
+	pub MutualAuthServlet<AuthRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	x509: {
-		certificate: SERVER_CERT,
-		key_provider: SERVER_KEY,
-		client_validators: [CLIENT_PINNING]
-	},
-	handle: |frame, _trace| async move {
+	handle: |frame, _trace, _config, _workers| async move {
 		let request: AuthRequest = decode(&frame.message)?;
 
 		let response = AuthResponse {
@@ -143,16 +138,21 @@ tb_scenario! {
 	environment Servlet {
 		servlet: MutualAuthServlet,
 		start: |trace, _config| async move {
-			MutualAuthServlet::start(Arc::clone(&trace)).await
+			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
+				.with_x509(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_config(Arc::new(()))
+				.build();
+
+			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
 		setup: |addr, _config| async move {
-			let client = ClientBuilder::<TokioListener>::connect(addr)
-				.await?
+			use tightbeam::transport::ConnectionBuilder;
+			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_server_certificate(SERVER_CERT)?
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
-				.build()
-				.await?;
+				.build();
 
+			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
 		client: |trace, mut client, _config| async move {

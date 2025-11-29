@@ -305,6 +305,13 @@ pub struct HandshakeKeyManager {
 }
 
 #[cfg(feature = "x509")]
+impl Clone for HandshakeKeyManager {
+	fn clone(&self) -> Self {
+		Self { provider: Arc::clone(&self.provider) }
+	}
+}
+
+#[cfg(feature = "x509")]
 impl From<Secp256k1SigningKey> for HandshakeKeyManager {
 	fn from(signing_key: Secp256k1SigningKey) -> Self {
 		let provider = InMemoryKeyProvider::from(signing_key);

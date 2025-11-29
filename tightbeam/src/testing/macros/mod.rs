@@ -248,6 +248,20 @@ where
 	closure(trace)
 }
 
+/// Helper function for async exec closures with Arc (multi-specs bare environment)
+#[doc(hidden)]
+#[cfg(feature = "tokio")]
+pub async fn __tb_call_exec_closure_arc_async<F, Fut>(
+	closure: F,
+	trace: std::sync::Arc<crate::trace::TraceCollector>,
+) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(std::sync::Arc<crate::trace::TraceCollector>) -> Fut,
+	Fut: std::future::Future<Output = Result<(), crate::TightBeamError>>,
+{
+	closure(trace).await
+}
+
 /// Helper function for setup closures (worker environment)
 #[doc(hidden)]
 pub fn __tb_call_setup_closure<F, W>(closure: F, trace: crate::trace::TraceCollector) -> W
@@ -403,8 +417,8 @@ where
 macro_rules! tb_servlet_setup_inner {
 	($client:ident, $server_addr:expr, $env_config:expr) => {
 		let $client = {
-			use $crate::macros::client::builder::ClientBuilder;
 			use $crate::transport::tcp::r#async::TokioListener;
+			use $crate::transport::ClientBuilder;
 			async { ClientBuilder::<TokioListener>::connect($server_addr).await?.build() }
 				.await
 				.expect("Failed to setup servlet client (default)")
@@ -525,10 +539,29 @@ macro_rules! tb_scenario {
 	};
 
 	// ===== NEW UNIFIED SYNTAX: Bare environment (sync) =====
+	// ===== NEW UNIFIED SYNTAX: Bare environment with async closure =====
 	(
 		name: $test_name:ident,
 		config: $config:expr,
-		environment Bare { $($env_body:tt)* }
+		environment Bare { exec: |$trace_param:ident| async move $exec_body:block }
+		$(,)?
+	) => {
+		#[cfg(feature = "tokio")]
+		#[tokio::test]
+		async fn $test_name() {
+			$crate::tb_scenario!(@execute_unified_async
+				name: $test_name,
+				config: $config,
+				exec: |$trace_param| async move $exec_body
+			).await.expect(concat!("Test ", stringify!($test_name), " failed"));
+		}
+	};
+
+	// ===== NEW UNIFIED SYNTAX: Bare environment with sync closure =====
+	(
+		name: $test_name:ident,
+		config: $config:expr,
+		environment Bare { exec: $exec_closure:expr }
 		$(,)?
 	) => {
 		#[test]
@@ -536,7 +569,7 @@ macro_rules! tb_scenario {
 			$crate::tb_scenario!(@execute_unified
 				name: $test_name,
 				config: $config,
-				environment Bare { $($env_body)* }
+				environment Bare { exec: $exec_closure }
 			)
 		}
 	};
@@ -630,7 +663,61 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== INTERNAL: Execute unified scenario for Bare environment =====
+	// ===== INTERNAL: Execute unified scenario for Bare environment (ASYNC) =====
+	(@execute_unified_async
+		name: $test_name:ident,
+		config: $config:expr,
+		exec: |$trace_param:ident| async move $exec_body:block
+	) => {{
+		async move {
+			use $crate::testing::TBSpec;
+
+			let config = $config;
+			let trace = config.trace();
+
+			// Execute the async bare closure with explicit Result type
+			let closure = |$trace_param: ::std::sync::Arc<$crate::trace::TraceCollector>| -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Result<(), $crate::TightBeamError>> + Send>> {
+				Box::pin(async move $exec_body)
+			};
+			let exec_result = closure(::std::sync::Arc::clone(&trace)).await;
+
+			// Consume trace
+			let mut consumed_trace = $crate::trace::ConsumedTrace::new();
+			consumed_trace.populate_from_collector(&trace);
+			consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
+			if exec_result.is_err() {
+				consumed_trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
+			}
+
+			// Build hook context
+			let mut hook_ctx = $crate::testing::HookContext::new(consumed_trace);
+			#[cfg(feature = "testing-csp")]
+			{
+				hook_ctx.process = config.csp().map(|p| std::sync::Arc::clone(p));
+			}
+			#[cfg(feature = "testing-fdr")]
+			{
+				if let Some(fdr_cfg) = config.fdr() {
+					hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
+					// Run FDR verification
+					use $crate::testing::fdr::DefaultFdrExplorer;
+					let trace_process = hook_ctx.trace.to_process();
+					let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, std::sync::Arc::clone(fdr_cfg));
+					hook_ctx.fdr_verdict = Some(explorer.explore());
+				}
+			}
+			if !config.specs().is_empty() {
+				hook_ctx.assert_spec = config.specs().first().copied();
+			}
+
+			// Call hooks for specs (panics on failure)
+			$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, exec_result);
+
+			Ok::<(), $crate::TightBeamError>(())
+		}
+	}};
+
+	// ===== INTERNAL: Execute unified scenario for Bare environment (SYNC) =====
 	(@execute_unified
 		name: $test_name:ident,
 		config: $config:expr,
@@ -781,20 +868,21 @@ macro_rules! tb_scenario {
 		// Setup client (with optional setup expression - defaults to simple connect)
 		$crate::tb_servlet_setup_inner!(client, server_addr, std::sync::Arc::clone(&env_config) $(, $setup_expr)?);
 
-		// Execute client closure
-		async fn __call_client_inner<F, Fut, T, C>(
+		// Execute client closure with proper type inference
+		fn __tb_call_servlet_client<T, F, Fut, C>(
 			closure: F,
 			trace: $crate::trace::TraceCollector,
 			client: T,
 			config: std::sync::Arc<C>,
-		) -> Result<(), $crate::TightBeamError>
+		) -> Fut
 		where
 			F: FnOnce($crate::trace::TraceCollector, T, std::sync::Arc<C>) -> Fut,
 			Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
 		{
-			closure(trace, client, config).await
+			closure(trace, client, config)
 		}
-		let client_result = __call_client_inner($client_closure, trace_client, client, env_config).await;
+
+		let client_result = __tb_call_servlet_client($client_closure, trace_client, client, env_config).await;
 
 		// Stop servlet
 		servlet_instance.stop();

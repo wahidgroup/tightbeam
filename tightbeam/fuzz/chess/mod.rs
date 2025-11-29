@@ -16,14 +16,18 @@ mod utils;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tightbeam::macros::client::builder::ClientBuilder;
+use tightbeam::colony::ServletConf;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
 use tightbeam::testing::ScenarioConf;
 use tightbeam::transport::policy::RestartExponentialBackoff;
 use tightbeam::transport::tcp::r#async::TokioListener;
+use tightbeam::transport::ClientBuilder;
+use tightbeam::transport::ConnectionBuilder;
 use tightbeam::{at_least, at_most, compose, decode, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
-use board::{ChessEngineServlet, ChessEngineServletConf, ChessMatchManager, ChessMoveResponse, GameStatusCode};
+use board::{
+	ChessEngineServlet, ChessEngineServletConf, ChessMatchManager, ChessMoveRequest, ChessMoveResponse, GameStatusCode,
+};
 use piece::Piece;
 use r#move::ChessMove;
 use state::ChessGameState;
@@ -157,18 +161,21 @@ tb_scenario! {
 	environment Servlet {
 		servlet: ChessEngineServlet,
 		start: |trace, config| async move {
-			ChessEngineServlet::start(Arc::clone(&trace), config).await
+			let servlet_conf = ServletConf::<TokioListener, ChessMoveRequest>::builder()
+				.with_config(config)
+				.build();
+
+			ChessEngineServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
 		setup: |addr, _config| async move {
 			// Create a custom client with exponential backoff retry policy
 			// Exponential backoff: 100ms, 200ms, 400ms, 800ms delays (max 3 attempts)
 			let restart_policy = RestartExponentialBackoff::new(3, 100, None);
-			let client_builder = ClientBuilder::<TokioListener>::connect(addr).await?;
-			let client = client_builder
+			let client_builder = ClientBuilder::<TokioListener>::builder()
 				.with_restart(restart_policy)
 				.with_timeout(Duration::from_millis(500))
-				.build()
-				.await?;
+				.build();
+			let client = client_builder.connect(addr).await?;
 
 			Ok(client)
 		},

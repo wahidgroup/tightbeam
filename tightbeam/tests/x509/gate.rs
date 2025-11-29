@@ -27,10 +27,9 @@ use tightbeam::{
 	},
 	decode,
 	error::Result,
-	macros::client::builder::GenericClient,
 	prelude::*,
 	testing::create_expiring_test_certificate,
-	transport::{tcp::r#async::TokioListener, X509ClientConfig},
+	transport::{GenericClient, tcp::r#async::TokioListener, X509ClientConfig},
 	x509::Certificate,
 	TightBeamError,
 };

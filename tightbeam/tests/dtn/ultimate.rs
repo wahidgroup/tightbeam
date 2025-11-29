@@ -41,12 +41,16 @@ use tightbeam::{
 	crypto::{aead::Aes256Gcm, key::KeySpec, sign::ecdsa::Secp256k1SigningKey},
 	error::TightBeamError,
 	exactly,
-	macros::client::builder::{ClientBuilder, GenericClient},
 	prelude::*,
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
 	testing::{fdr::FdrConfig, ScenarioConf},
 	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector},
-	transport::tcp::r#async::TokioListener,
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, GenericClient},
+};
+
+use crate::dtn::{
+	certs::{EARTH_RELAY_PINNING, MARS_RELAY_PINNING, MISSION_CONTROL_PINNING, ROVER_PINNING},
+	messages::RelayMessage,
 };
 
 use crate::dtn::{
@@ -774,9 +778,9 @@ tb_scenario! {
 			// ================================================================
 			// CONNECTION POOL (shared across all servlets for connection reuse)
 			// ================================================================
-			let connection_pool = Arc::new(tightbeam::transport::ConnectionPool::<TokioListener, 3>::new(
-				tightbeam::transport::PoolConfig::default()
-			));
+			let connection_pool = tightbeam::transport::ConnectionPool::<TokioListener, 3>::builder()
+				.with_config(tightbeam::transport::PoolConfig::default())
+				.build();
 
 			// ================================================================
 			// 1. START ROVER SERVLET
@@ -806,7 +810,11 @@ tb_scenario! {
 				max_rounds: COMMAND_ROUND_TRIPS,
 			};
 
-			let rover_servlet = RoverServlet::start(Arc::clone(&trace), Arc::new(rover_config)).await?;
+			let rover_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
+				.with_x509(ROVER_CERT, ROVER_KEY, vec![Arc::new(ROVER_PINNING)])?
+				.with_config(Arc::new(rover_config))
+				.build();
+			let rover_servlet = RoverServlet::start(Arc::clone(&trace), Some(rover_servlet_conf)).await?;
 			let rover_addr = rover_servlet.addr();
 
 			debug_log!("[START] Rover servlet started at {:?}", rover_addr);
@@ -843,7 +851,12 @@ tb_scenario! {
 				frame_builder: Arc::clone(&mars_relay_frame_builder),
 			};
 
-			let mars_relay_servlet = MarsRelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(mars_relay_config)).await?;
+			let mars_relay_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
+				.with_x509(MARS_RELAY_CERT, MARS_RELAY_KEY, vec![Arc::new(MARS_RELAY_PINNING)])?
+				.with_config(Arc::new(mars_relay_config))
+				.build();
+			let mars_relay_servlet_conf = Some(mars_relay_servlet_conf);
+			let mars_relay_servlet = MarsRelaySatelliteServlet::start(Arc::clone(&trace), mars_relay_servlet_conf).await?;
 			let mars_relay_addr = mars_relay_servlet.addr();
 
 			debug_log!("[START] Mars Relay started at {:?}", mars_relay_addr);
@@ -880,7 +893,12 @@ tb_scenario! {
 				frame_builder: Arc::clone(&earth_relay_frame_builder),
 			};
 
-			let earth_relay_servlet = EarthRelaySatelliteServlet::start(Arc::clone(&trace), Arc::new(earth_relay_config)).await?;
+			let earth_relay_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
+				.with_x509(EARTH_RELAY_CERT, EARTH_RELAY_KEY, vec![Arc::new(EARTH_RELAY_PINNING)])?
+				.with_config(Arc::new(earth_relay_config))
+				.build();
+			let earth_relay_servlet_conf = Some(earth_relay_servlet_conf);
+			let earth_relay_servlet = EarthRelaySatelliteServlet::start(Arc::clone(&trace), earth_relay_servlet_conf).await?;
 			let earth_relay_addr = earth_relay_servlet.addr();
 
 			debug_log!("[START] Earth Relay started at {:?}", earth_relay_addr);
@@ -912,7 +930,11 @@ tb_scenario! {
 				shared_mission_state: Arc::clone(&shared_mission_state),
 			};
 
-			let mc_servlet = MissionControlServlet::start(Arc::clone(&trace), Arc::new(mc_config)).await?;
+			let mc_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
+				.with_x509(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, vec![Arc::new(MISSION_CONTROL_PINNING)])?
+				.with_config(Arc::new(mc_config))
+				.build();
+			let mc_servlet = MissionControlServlet::start(Arc::clone(&trace), Some(mc_servlet_conf)).await?;
 			let mc_addr = mc_servlet.addr();
 
 			debug_log!("[START] Mission Control started at {:?}", mc_addr);
@@ -958,12 +980,12 @@ tb_scenario! {
 				)?;
 
 				// Connect to Earth Relay and send initial command
-				let mut earth_relay_client = ClientBuilder::<TokioListener>::connect(earth_relay_addr)
-					.await?
+				let mut earth_relay_client = ClientBuilder::<TokioListener>::builder()
 					.with_server_certificate(EARTH_RELAY_CERT)?
 					.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY)?
 					.with_timeout(Duration::from_millis(5000))
 					.build()
+					.connect(earth_relay_addr)
 					.await?;
 
 				let _stateless_ack = earth_relay_client.emit(command_frame, None).await?;
@@ -978,18 +1000,17 @@ tb_scenario! {
 		setup: |_rover_addr, config: Arc<DtnScenarioConfig>| async move {
 			debug_log!("[Setup] Rover servlet address: {:?}", rover_addr);
 
-			let mars_relay_addr = (*config.mars_relay_addr.read()?)
-				.expect("Mars Relay address must be set before setup");
+			let mars_relay_addr = (*config.mars_relay_addr.read()?).expect("Mars Relay address must be set");
 
 			debug_log!("[Setup] Mars Relay address found: {:?}", mars_relay_addr);
 
 			// Connect Rover client to Mars Relay
-			let client = ClientBuilder::<TokioListener>::connect(mars_relay_addr)
-				.await?
+			let client = ClientBuilder::<TokioListener>::builder()
 				.with_server_certificate(MARS_RELAY_CERT)?
 				.with_client_identity(ROVER_CERT, ROVER_KEY)?
 				.with_timeout(Duration::from_millis(5000))
 				.build()
+				.connect(mars_relay_addr)
 				.await?;
 
 			Ok(client)
@@ -1000,19 +1021,19 @@ tb_scenario! {
 			debug_log!("╚════════════════════════════════════════════════════════════╝\n");
 			debug_log!("[Rover Mission Loop] Started - sends telemetry, RoverServlet handles commands asynchronously\n");
 
-		// Get components from config
-		let rover_processor = Arc::clone(&config.rover_chain_processor);
-		let rover_fault_manager = Arc::new(FaultManager::from_refs(
-			&config.bms,
-			&config.fault_matrix,
-			&config.rover_fault_handler,
-		));
-		let rover_signing_key = config.rover_signing_key.to_owned();
-		let shared_cipher = config.shared_cipher.to_owned();
-		let shared_mission_state = Arc::clone(&config.mission_state);
-		let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
+			// Get components from config
+			let rover_processor = Arc::clone(&config.rover_chain_processor);
+			let rover_fault_manager = Arc::new(FaultManager::from_refs(
+				&config.bms,
+				&config.fault_matrix,
+				&config.rover_fault_handler,
+			));
+			let rover_signing_key = config.rover_signing_key.to_owned();
+			let shared_cipher = config.shared_cipher.to_owned();
+			let shared_mission_state = Arc::clone(&config.mission_state);
+			let rover_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&rover_processor)));
 
-		// Run mission loop (sends telemetry to Mars Relay)
+			// Run mission loop (sends telemetry to Mars Relay)
 			run_mission_loop(
 				&trace,
 				&mut rover_client,

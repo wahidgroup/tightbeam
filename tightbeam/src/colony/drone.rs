@@ -1592,14 +1592,17 @@ mod tests {
 		}
 	}
 
+	// Config structs for servlets
+	#[derive(Clone)]
+	pub struct ConfigurableServletConf {
+		pub threshold: u32,
+	}
+
 	// Create test servlets
 	servlet! {
-		pub SimpleServlet<DroneTestMessage>,
+		pub SimpleServlet<DroneTestMessage, EnvConfig = ()>,
 		protocol: Listener,
-		policies: {
-			with_collector_gate: [crate::policy::AcceptAllGate]
-		},
-		handle: |message, _trace| async move {
+		handle: |message, _trace, _config, _workers| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			if decoded.content == "PING" {
 				Ok(Some(DroneResponseJob::run(message.metadata.id.clone(), "PONG".to_string())?))
@@ -1609,38 +1612,10 @@ mod tests {
 		}
 	}
 
-	impl Servlet<DroneTestMessage> for SimpleServlet {
-		type Conf = ();
-		type Address = <Listener as crate::transport::Protocol>::Address;
-
-		async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, crate::TightBeamError> {
-			let _ = config;
-			SimpleServlet::start(trace).await
-		}
-
-		fn addr(&self) -> Self::Address {
-			self.addr
-		}
-
-		fn stop(self) {
-			self.stop()
-		}
-
-		async fn join(self) -> Result<(), crate::colony::servlet_runtime::rt::JoinError> {
-			self.join().await
-		}
-	}
-
 	servlet! {
-		pub ConfigurableServlet<DroneTestMessage>,
+		pub ConfigurableServlet<DroneTestMessage, EnvConfig = ConfigurableServletConf>,
 		protocol: Listener,
-		policies: {
-			with_collector_gate: [crate::policy::AcceptAllGate]
-		},
-		config: {
-			threshold: u32,
-		},
-		handle: |message, _trace, config| async move {
+		handle: |message, _trace, config, _workers| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			if decoded.value >= config.threshold {
 				Ok(Some(DroneResponseJob::run(message.metadata.id.clone(), "ACCEPTED".to_string())?))
@@ -1651,31 +1626,14 @@ mod tests {
 	}
 
 	servlet! {
-		pub WorkerServlet<DroneTestMessage>,
+		pub WorkerServlet<DroneTestMessage, EnvConfig = ()>,
 		protocol: Listener,
-		policies: {
-			with_collector_gate: [crate::policy::AcceptAllGate]
-		},
-		config: {
-			threshold: u32,
-		},
-		workers: |config| {
-			echo: EchoWorker = EchoWorker::start(),
-			checker: ValueCheckerWorker = ValueCheckerWorker::start(ValueCheckerWorkerConf {
-				threshold: config.threshold,
-			})
-		},
-		handle: |message, trace, _config, workers| async move {
-			let trace = ::std::sync::Arc::new(trace);
+		handle: |message, _trace, _config, workers| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			let decoded_arc = ::std::sync::Arc::new(decoded);
 			let (echo_result, check_result) = tokio::join!(
-				workers
-					.echo
-					.relay(::std::sync::Arc::clone(&trace), ::std::sync::Arc::clone(&decoded_arc)),
-				workers
-					.checker
-					.relay(::std::sync::Arc::clone(&trace), ::std::sync::Arc::clone(&decoded_arc))
+				workers.relay::<EchoWorker>(::std::sync::Arc::clone(&decoded_arc)),
+				workers.relay::<ValueCheckerWorker>(::std::sync::Arc::clone(&decoded_arc))
 			);
 
 			let echo_msg = match echo_result {
@@ -1790,40 +1748,14 @@ mod tests {
 
 	#[cfg(feature = "tokio")]
 	servlet! {
-		EchoServlet<DroneTestMessage>,
+		EchoServlet<DroneTestMessage, EnvConfig = ()>,
 		protocol: crate::transport::tcp::r#async::TokioListener,
-		policies: {
-			with_collector_gate: [crate::policy::AcceptAllGate]
-		},
-		handle: |message, _trace| async move {
+		handle: |message, _trace, _config, _workers| async move {
 			let decoded: DroneTestMessage = crate::decode(&message.message)?;
 			Ok(Some(DroneResponseJob::run(
 				message.metadata.id.clone(),
 				format!("ECHO: {}", decoded.content)
 			)?))
-		}
-	}
-
-	#[cfg(feature = "tokio")]
-	impl Servlet<DroneTestMessage> for EchoServlet {
-		type Conf = ();
-		type Address = <Listener as crate::transport::Protocol>::Address;
-
-		async fn start(trace: Arc<TraceCollector>, config: Option<Self::Conf>) -> Result<Self, crate::TightBeamError> {
-			let _ = config;
-			EchoServlet::start(trace).await
-		}
-
-		fn addr(&self) -> Self::Address {
-			self.addr
-		}
-
-		fn stop(self) {
-			self.stop()
-		}
-
-		async fn join(self) -> Result<(), crate::colony::servlet_runtime::rt::JoinError> {
-			self.join().await
 		}
 	}
 

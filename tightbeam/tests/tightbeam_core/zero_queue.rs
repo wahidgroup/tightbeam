@@ -5,13 +5,13 @@ use std::sync::{Arc, Mutex};
 
 use tightbeam::asn1::{DigestInfo, MessagePriority};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
+use tightbeam::colony::{Servlet, ServletConf};
 use tightbeam::crypto::{
 	hash::Sha3_256,
 	key::{InMemoryKeyProvider, KeySpec},
 	x509::CertificateSpec,
 };
 use tightbeam::der::ValueOrd;
-use tightbeam::macros::client::builder::ClientBuilder;
 use tightbeam::policy::{GatePolicy, TransitStatus};
 use tightbeam::prelude::policy::PolicyConf;
 use tightbeam::prelude::*;
@@ -20,6 +20,8 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::policy::{RestartLinearBackoff, RestartPolicy, RetryAction};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
+use tightbeam::transport::ClientBuilder;
+use tightbeam::transport::ConnectionBuilder;
 use tightbeam::transport::{MessageEmitter, Protocol, TransportResult};
 use tightbeam::Beamable;
 use tightbeam::{at_least, between, exactly, present, server, servlet, tb_assert_spec, tb_scenario};
@@ -254,19 +256,24 @@ impl BackPressureStats {
 
 #[derive(Clone)]
 struct AdaptiveGate {
-	stats: BackPressureStats,
+	stats: Arc<BackPressureStats>,
+	trace: Arc<TraceCollector>,
 }
 
 impl AdaptiveGate {
-	fn new(stats: BackPressureStats) -> Self {
-		Self { stats }
+	fn new(stats: Arc<BackPressureStats>, trace: Arc<TraceCollector>) -> Self {
+		Self { stats, trace }
 	}
 }
 
 impl GatePolicy for AdaptiveGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
+		// Throttle Normal+ priority frames on first encounter
+		// Subsequent attempts (same order) will be accepted
 		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Normal);
 		if priority >= MessagePriority::Normal && self.stats.mark_throttled(frame.metadata.order) {
+			// Emit trace event for test verification
+			let _ = self.trace.event_with("throttle_engaged", &[QUEUE_TAG], true);
 			TransitStatus::Busy
 		} else {
 			TransitStatus::Accepted
@@ -314,12 +321,10 @@ fn default_batch() -> WorkBatch {
 }
 
 servlet! {
-	QueueServlet<WorkOrder>,
+	QueueServlet<WorkOrder, EnvConfig = BackPressureStats>,
 	protocol: TokioListener,
-	policies: {
-		with_collector_gate: [AdaptiveGate::new(BackPressureStats::default())]
-	},
-	handle: |frame, trace| async move {
+	handle: |frame, trace, _config, _workers| async move {
+		// Process the frame - collector gate handles back-pressure automatically
 		let harness = QueueHarness::new(Arc::clone(&trace));
 		harness.handle(&frame)?;
 		Ok(None)
@@ -336,7 +341,9 @@ tb_assert_spec! {
 			("lag_tip", present!(), equals!(0u64)),
 			("priority_respected", at_least!(1), equals!(true)),
 			("worker_fan_out_0", at_least!(1), equals!(0u8), tags: [WORKER_0_TAG]),
-			("worker_fan_out_1", at_least!(1), equals!(1u8), tags: [WORKER_1_TAG])
+			("worker_fan_out_1", at_least!(1), equals!(1u8), tags: [WORKER_1_TAG]),
+			("throttle_engaged", present!(), equals!(true)),
+			("adaptive_behavior", at_least!(1))
 		]
 	}
 }
@@ -350,7 +357,15 @@ tb_scenario! {
 	environment Servlet {
 		servlet: QueueServlet,
 		start: |trace, _config| async move {
-			QueueServlet::start(Arc::clone(&trace)).await
+			let stats = Arc::new(BackPressureStats::default());
+			let adaptive_gate = AdaptiveGate::new(Arc::clone(&stats), Arc::clone(&trace));
+
+			let servlet_conf = ServletConf::<TokioListener, WorkOrder>::builder()
+				.with_config(Arc::clone(&stats))
+				.with_collector_gate(adaptive_gate)
+				.build();
+
+			QueueServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
 		setup: |addr, _config| async move {
 			let (client_cert, client_key) = create_test_cert_with_key("CN=Test Client", 365)?;
@@ -360,13 +375,15 @@ tb_scenario! {
 			let key_spec = KeySpec::Provider(Arc::new(provider));
 
 			let certificate = CertificateSpec::Built(Box::new(client_cert));
+			// Restart policy will handle server-side Busy responses
 			let restart_policy = RestartLinearBackoff::new(3, 50, 1, None);
-			let client = ClientBuilder::<TokioListener>::connect(addr).await?
+
+			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_client_identity(certificate, key_spec)?
 				.with_restart(restart_policy)
-				.build()
-				.await?;
+				.build();
 
+			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
 		client: |trace, mut client, _config| async move {
@@ -374,7 +391,6 @@ tb_scenario! {
 
 			let batch = default_batch();
 			let mut prev_hash: Option<DigestInfo> = None;
-
 			for (index, spec) in batch.entries().iter().enumerate() {
 				trace.event_with("emit_work", &[QUEUE_TAG], spec.order)?;
 				let (frame, digest) = match build_frame(batch.work_id(), spec, prev_hash) {
@@ -386,12 +402,17 @@ tb_scenario! {
 				};
 				prev_hash = Some(digest);
 
+				trace.event_with("adaptive_behavior", &[QUEUE_TAG], spec.order)?;
+
 				if index == 1 {
 					// For the second frame, emit it then immediately replay it
+					// Server will throttle on first attempt, restart policy will retry
 					client.emit(frame.clone(), None).await?;
 					trace.event_with("replay_attempt", &[QUEUE_TAG], frame.metadata.order)?;
 					client.emit(frame, None).await?;
 				} else {
+					// Server-side adaptive gate will throttle Normal+ priority frames
+					// Restart policy will automatically retry throttled frames
 					client.emit(frame, None).await?;
 				}
 			}

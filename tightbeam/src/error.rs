@@ -245,6 +245,10 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Missing priority"))]
 	MissingPriority,
 
+	/// Missing response
+	#[cfg_attr(feature = "derive", error("Missing response"))]
+	MissingResponse,
+
 	/// Signature is missing
 	#[cfg(feature = "signature")]
 	#[cfg_attr(feature = "derive", error("Missing signature"))]
@@ -319,6 +323,7 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingInflator => write!(f, "Missing inflator"),
 			TightBeamError::MissingOrder => write!(f, "Missing order"),
 			TightBeamError::MissingPriority => write!(f, "Missing priority"),
+			TightBeamError::MissingResponse => write!(f, "Missing response"),
 			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
 			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),
 			#[cfg(feature = "colony")]

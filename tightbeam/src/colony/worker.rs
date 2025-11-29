@@ -324,6 +324,12 @@ pub trait Worker: Send + Sync + Sized {
 	fn queue_capacity(&self) -> usize;
 }
 
+/// Provides static metadata about a worker type
+pub trait WorkerMetadata {
+	/// Returns the registration name for this worker
+	fn name() -> &'static str;
+}
+
 pub struct WorkerPolicies<I: Send> {
 	#[allow(dead_code)]
 	pub(crate) receptor_gates: Vec<Arc<dyn ReceptorPolicy<I> + Send + Sync>>,
@@ -761,6 +767,12 @@ macro_rules! worker {
 					self.queue
 				}
 			}
+
+			impl $crate::colony::WorkerMetadata for $worker_name {
+				fn name() -> &'static str {
+					stringify!($worker_name)
+				}
+			}
 		}
 	};
 
@@ -814,6 +826,12 @@ macro_rules! worker {
 
 			fn queue_capacity(&self) -> usize {
 				self.queue
+			}
+		}
+
+		impl $crate::colony::WorkerMetadata for $worker_name {
+			fn name() -> &'static str {
+				stringify!($worker_name)
 			}
 		}
 	};

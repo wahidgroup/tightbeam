@@ -480,7 +480,7 @@ cryptographic implementations to `SecurityProfile` metadata:
 
 ```rust
 pub trait CryptoProvider:
-	Default + Clone +
+	Default +
 	DigestProvider +
 	AeadProvider +
 	SigningProvider +
@@ -833,9 +833,11 @@ Encryption with Associated Data (AEAD) ciphers. This requirement is enforced at
 the type system level through trait bounds:
 
 ```rust
-pub fn with_cipher<C, Cipher>(mut self, cipher: &Cipher) -> Self
+pub fn with_cipher<C, Cipher>(mut self, cipher: Cipher) -> Self
 where
-    Cipher: Aead + Clone + 'static,  // AEAD trait bound required
+	C: AssociatedOid,
+	Cipher: Aead + 'static, // AEAD trait bound required
+	T: CheckAeadOid<C>;
 ```
 
 This design ensures MI over plaintext is cryptographically sound:
@@ -1253,10 +1255,18 @@ pub trait ReceptorPolicy<T: Message>: Send + Sync {
 **RestartPolicy Trait:**
 ```rust
 pub trait RestartPolicy: Send + Sync {
+	/// Evaluate whether to restart after a transport operation.
+	///
+	/// # Arguments
+	/// * `frame` - Boxed frame from the failed operation
+	/// * `failure` - The failure reason
+	/// * `attempt` - The current attempt number (0-indexed)
+	///
+	/// # Returns
+	/// * `RetryAction` - What action to take (retry with frame, or no retry)
 	fn evaluate(
-		&self,
-		message: &Frame,
-		result: &TransportResult<&Frame>,
+		&self, frame: Box<Frame>, 
+		failure: &TransportFailure, 
 		attempt: usize
 	) -> RetryAction;
 }
@@ -1265,6 +1275,7 @@ pub trait RestartPolicy: Send + Sync {
 **TransitStatus:**
 ```rust
 pub enum TransitStatus {
+	#[default]
 	Request = 0,
 	Accepted = 1,
 	Busy = 2,
@@ -1276,11 +1287,12 @@ pub enum TransitStatus {
 
 **RetryAction:**
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub enum RetryAction {
+	/// Retry with the provided frame (same or modified from input)
+	Retry(Box<Frame>),
+	/// Do not retry, propagate the error
 	NoRetry,
-	RetryWithSame,
-	RetryAfter(Duration),
-	RetryWithModified(Box<Frame>),
 }
 ```
 
@@ -1364,9 +1376,9 @@ tightbeam::policy! {
 		}
 	}
 
-	RestartPolicy: RetryThreeTimes |_message, result, attempt| {
-		if attempt < 3 && result.is_err() {
-			RetryAction::RetryAfter(Duration::from_secs(1))
+	RestartPolicy: RetryThreeTimes |frame, _failure, attempt| {
+		if attempt < 3 {
+			RetryAction::Retry(frame)
 		} else {
 			RetryAction::NoRetry
 		}

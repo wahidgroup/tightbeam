@@ -131,8 +131,8 @@ impl<E> ScenarioConfBuilder<E> {
 	}
 
 	/// Replace entire spec list (builder convention)
-	pub fn with_specs(mut self, specs: Vec<&'static BuiltAssertSpec>) -> Self {
-		self.specs = specs;
+	pub fn with_specs(mut self, specs: impl IntoIterator<Item = &'static BuiltAssertSpec>) -> Self {
+		self.specs = specs.into_iter().collect();
 		self
 	}
 

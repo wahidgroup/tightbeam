@@ -68,7 +68,7 @@ tb_assert_spec! {
 tb_scenario! {
 	name: test_worker_with_config,
 	config: ScenarioConf::<()>::builder()
-		.with_specs(vec![WorkerSpec::get(2, 0, 0).expect("WorkerSpec 2.0.0")])
+		.with_specs(vec![WorkerSpec::latest()])
 		.build(),
 	environment Worker {
 		setup: |_trace| {

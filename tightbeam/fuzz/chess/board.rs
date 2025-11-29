@@ -177,18 +177,15 @@ pub(crate) fn create_invalid_move_response(id: Vec<u8>, order: u64) -> Result<Fr
 	}
 }
 
+pub struct ChessEngineServletConf {
+	pub manager: ChessMatchManager,
+}
+
 servlet! {
 	/// Chess engine servlet for processing chess moves
-	pub ChessEngineServlet<ChessMoveRequest>,
+	pub ChessEngineServlet<ChessMoveRequest, EnvConfig = ChessEngineServletConf>,
 	protocol: TokioListener,
-	policies: {
-		// TODO: Add mutual authentication policies
-		// with_collector_gate: [ExpiryValidator, ChessClientValidator]
-	},
-	config: {
-		manager: ChessMatchManager,
-	},
-	handle: |message, trace, config| async move {
+	handle: |message, trace, config, _workers| async move {
 		let message_id = message.metadata.id.clone();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {

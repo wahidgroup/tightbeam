@@ -115,8 +115,9 @@ pub const ROVER_KEY: KeySpec =
 pub const ROVER_PUB_KEY: &[u8] = &hex!("048a6488041ccb629f2c2f3a8b1f06eaf155db4747993b17441b1d7b2b09b1c4da1fbb733a081f3d1cab7c40e03fdd56811348e21349f4885cc1b4a26ed7e5b3e1");
 
 // ============================================================================
-// Public Key Pinning Configurations
+// Public Key Pinning Configurations (Server-Side)
 // ============================================================================
+// These validators are used by servers to validate incoming client certificates
 
 /// Mission Control's pinning policy: accepts only Earth Relay's public key
 pub const MISSION_CONTROL_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([EARTH_RELAY_PUB_KEY]);
@@ -130,6 +131,23 @@ pub const MARS_RELAY_PINNING: PublicKeyPinning<2> = PublicKeyPinning::new([EARTH
 
 /// Rover's pinning policy: accepts only Mars Relay's public key
 pub const ROVER_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([MARS_RELAY_PUB_KEY]);
+
+// ============================================================================
+// Client-Side Validators (for validating server certificates)
+// ============================================================================
+// These validators are used by clients to validate the server they're connecting to
+
+/// Validator for connecting TO Mission Control (validates Mission Control's public key)
+pub const VALIDATE_MISSION_CONTROL: PublicKeyPinning<1> = PublicKeyPinning::new([MISSION_CONTROL_PUB_KEY]);
+
+/// Validator for connecting TO Earth Relay (validates Earth Relay's public key)
+pub const VALIDATE_EARTH_RELAY: PublicKeyPinning<1> = PublicKeyPinning::new([EARTH_RELAY_PUB_KEY]);
+
+/// Validator for connecting TO Mars Relay (validates Mars Relay's public key)
+pub const VALIDATE_MARS_RELAY: PublicKeyPinning<1> = PublicKeyPinning::new([MARS_RELAY_PUB_KEY]);
+
+/// Validator for connecting TO Rover (validates Rover's public key)
+pub const VALIDATE_ROVER: PublicKeyPinning<1> = PublicKeyPinning::new([ROVER_PUB_KEY]);
 
 // ============================================================================
 // Verifying Keys for Signature Verification

@@ -1,11 +1,11 @@
 //! Secret handling utilities for Tightbeam
-#![forbid(unsafe_code)]
 //!
 //! A minimal secret wrapper providing:
 //! - Strict ownership (no Clone/Copy)
 //! - Explicit access via ExposeSecret/ExposeSecretMut
 //! - Zeroize on drop for the inner value
 //! - Blanket `From<T>` for ergonomic construction
+#![forbid(unsafe_code)]
 
 use core::str::FromStr;
 use core::{any, fmt};
