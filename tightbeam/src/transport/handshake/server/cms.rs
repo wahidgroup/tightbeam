@@ -24,7 +24,6 @@ use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::aead::{Decryptor, KeyInit};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::KeyProvider;
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -677,16 +676,10 @@ where
 		self.validated_client_cert.as_ref().map(|arc| arc.as_ref())
 	}
 
-	fn selected_profile(&self) -> Option<crate::crypto::profiles::SecurityProfileDesc> {
+	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
 }
-
-/// Type alias for CMS server using secp256k1 curve.
-///
-/// This is the default curve used in TightBeam and is provided as a
-/// convenient alias for the generic `CmsHandshakeServer`.
-pub type CmsHandshakeServerSecp256k1 = CmsHandshakeServer<DefaultCryptoProvider>;
 
 #[cfg(test)]
 mod tests {
@@ -868,7 +861,7 @@ mod tests {
 		}
 
 		/// Create a test security profile with the given AEAD key size.
-		fn create_aes_gcm_profile(key_size: u16) -> crate::crypto::profiles::SecurityProfileDesc {
+		fn create_aes_gcm_profile(key_size: u16) -> SecurityProfileDesc {
 			let aead_oid = if key_size == 16 {
 				AES_128_GCM
 			} else {
@@ -880,7 +873,7 @@ mod tests {
 				AES_256_WRAP
 			};
 
-			crate::crypto::profiles::SecurityProfileDesc {
+			SecurityProfileDesc {
 				digest: HASH_SHA256,
 				aead: Some(aead_oid),
 				aead_key_size: Some(key_size),

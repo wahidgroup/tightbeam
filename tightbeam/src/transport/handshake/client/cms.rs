@@ -35,7 +35,6 @@ use crate::transport::handshake::utils::{compute_transcript_digest, extract_veri
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
 
 #[cfg(feature = "secp256k1")]
-use crate::crypto::profiles::DefaultCryptoProvider;
 
 /// Client-side CMS handshake orchestrator.
 ///
@@ -617,13 +616,6 @@ where
 		self.selected_profile
 	}
 }
-
-/// Type alias for CMS client using secp256k1 curve.
-///
-/// This is the default curve used in TightBeam and is provided as a
-/// convenient alias for the generic `CmsHandshakeClient`.
-#[cfg(feature = "secp256k1")]
-pub type CmsHandshakeClientSecp256k1 = CmsHandshakeClient<DefaultCryptoProvider>;
 
 #[cfg(test)]
 mod tests {

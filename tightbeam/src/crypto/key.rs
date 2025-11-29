@@ -15,6 +15,7 @@ use core::fmt::Debug;
 use core::future::Future;
 use core::pin::Pin;
 
+use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::sign::ecdsa::k256::PublicKey;
 use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
@@ -40,16 +41,17 @@ pub enum KeySpec {
 }
 
 #[cfg(feature = "x509")]
-impl TryFrom<KeySpec> for HandshakeKeyManager {
+impl<P: CryptoProvider + Send + Sync + 'static> TryFrom<KeySpec> for HandshakeKeyManager<P> {
 	type Error = TightBeamError;
 
 	fn try_from(spec: KeySpec) -> Result<Self, Self::Error> {
 		match spec {
 			KeySpec::Bytes(bytes) => {
 				let signing_key = Secp256k1SigningKey::from_bytes(bytes.into())?;
-				Ok(HandshakeKeyManager::from(signing_key))
+				let provider = InMemoryKeyProvider::from(signing_key);
+				Ok(HandshakeKeyManager::new(Arc::new(provider)))
 			}
-			KeySpec::Provider(provider) => Ok(HandshakeKeyManager::from(provider)),
+			KeySpec::Provider(provider) => Ok(HandshakeKeyManager::new(provider)),
 		}
 	}
 }

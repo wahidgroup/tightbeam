@@ -179,7 +179,7 @@ pub trait SecurityProfile {
 /// making trait bounds clearer and enabling focused testing.
 #[cfg(feature = "digest")]
 pub trait DigestProvider {
-	type Digest: Digest + AssociatedOid + Default;
+	type Digest: Digest + AssociatedOid + Default + Send + Sync;
 
 	fn to_digest_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned { oid: <Self::Digest as AssociatedOid>::OID, parameters: None }
@@ -199,7 +199,7 @@ pub trait DigestProvider {
 /// Separates AEAD operations (encryption/decryption) from other crypto primitives.
 #[cfg(feature = "aead")]
 pub trait AeadProvider {
-	type AeadCipher: Aead;
+	type AeadCipher: Aead + Send + Sync;
 	type AeadOid: AssociatedOid;
 
 	fn to_aead_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
@@ -278,9 +278,9 @@ pub trait AeadProvider {
 /// Isolates signing operations to reduce generic bounds on types that only sign.
 #[cfg(feature = "signature")]
 pub trait SigningProvider {
-	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier;
+	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync;
 	type SigningKey: Signatory<Self::Signature>;
-	type VerifyingKey;
+	type VerifyingKey: Send + Sync;
 
 	fn to_signature_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned {
@@ -318,6 +318,8 @@ pub trait KdfProvider {
 #[cfg(feature = "ecdh")]
 pub trait CurveProvider {
 	type Curve: Curve + CurveArithmetic;
+	#[cfg(feature = "x509")]
+	type EciesMessage: crate::crypto::ecies::EciesMessageOps;
 }
 
 /// Provides Key Encapsulation Mechanism (KEM) operations.
@@ -406,6 +408,8 @@ impl KdfProvider for DefaultCryptoProvider {
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 impl CurveProvider for DefaultCryptoProvider {
 	type Curve = k256::Secp256k1;
+	#[cfg(feature = "x509")]
+	type EciesMessage = crate::crypto::ecies::Secp256k1EciesMessage;
 }
 
 // TODO RustCrypto currently does not support KEMs.

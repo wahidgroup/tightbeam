@@ -22,6 +22,7 @@ mod x509 {
 	pub use crate::crypto::hash::Digest;
 	pub use crate::crypto::hash::Sha3_256;
 	pub use crate::crypto::key::KeySpec;
+	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 	pub use crate::crypto::x509::error::CertificateValidationError;
 	pub use crate::crypto::x509::policy::{CertificateValidation, RuntimeCertificatePinning};
 	pub use crate::crypto::x509::CertificateSpec;
@@ -125,7 +126,7 @@ impl ClientPolicies {
 	}
 }
 
-pub struct ClientBuilder<P: Protocol> {
+pub struct ClientBuilder<P: Protocol, C: CryptoProvider + 'static = DefaultCryptoProvider> {
 	policies: ClientPolicies,
 	#[cfg(feature = "x509")]
 	server_certificates: Vec<Certificate>,
@@ -134,11 +135,11 @@ pub struct ClientBuilder<P: Protocol> {
 	#[cfg(feature = "x509")]
 	client_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
-	client_key: Option<HandshakeKeyManager>,
-	_ph: core::marker::PhantomData<P>,
+	client_key: Option<HandshakeKeyManager<C>>,
+	_ph: core::marker::PhantomData<(P, C)>,
 }
 
-impl<P: Protocol> ClientBuilder<P> {
+impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 	pub fn builder() -> Self {
 		Self {
 			policies: ClientPolicies::default(),
@@ -214,7 +215,7 @@ impl<P: Protocol> ClientBuilder<P> {
 }
 
 #[cfg(not(feature = "x509"))]
-impl<P: Protocol + Send> ClientBuilder<P>
+impl<P: Protocol + Send, C: CryptoProvider + 'static> ClientBuilder<P, C>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConf,
 	P::Address: Send,
@@ -228,9 +229,9 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl<P: Protocol + Send> ClientBuilder<P>
+impl<P: Protocol + Send, C: CryptoProvider + Send + Sync + 'static> ClientBuilder<P, C>
 where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C>,
 	P::Address: Send,
 {
 	pub async fn connect(self, addr: P::Address) -> TransportResult<GenericClient<P>> {
@@ -252,7 +253,7 @@ where
 }
 
 #[cfg(all(feature = "std", not(feature = "x509")))]
-impl<P: Protocol + Send> ConnectionBuilder<P> for ClientBuilder<P>
+impl<P: Protocol + Send, C: CryptoProvider + 'static> ConnectionBuilder<P> for ClientBuilder<P, C>
 where
 	P::Transport: MessageEmitter + MessageCollector + PolicyConf,
 	P::Address: Send,
@@ -270,9 +271,9 @@ where
 }
 
 #[cfg(all(feature = "std", feature = "x509"))]
-impl<P: Protocol + Send> ConnectionBuilder<P> for ClientBuilder<P>
+impl<P: Protocol + Send, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P> for ClientBuilder<P, C>
 where
-	P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
+	P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C>,
 	P::Address: Send,
 {
 	type Output = Self;
@@ -325,7 +326,7 @@ where
 
 	fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self> {
 		let cert = Certificate::try_from(cert)?;
-		let key_manager = HandshakeKeyManager::try_from(key)?;
+		let key_manager = HandshakeKeyManager::<C>::try_from(key)?;
 
 		self.client_certificate = Some(cert);
 		self.client_key = Some(key_manager);

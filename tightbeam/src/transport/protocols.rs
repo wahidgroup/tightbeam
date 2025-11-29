@@ -16,6 +16,8 @@ use alloc::sync::Arc;
 use std::sync::Arc;
 
 #[cfg(feature = "x509")]
+use crate::crypto::profiles::CryptoProvider;
+#[cfg(feature = "x509")]
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
 use crate::transport::handshake::HandshakeKeyManager;
@@ -87,11 +89,12 @@ pub trait Protocol {
 pub trait EncryptedProtocol: Protocol {
 	type Encryptor: Send;
 	type Decryptor: Send;
+	type CryptoProvider: CryptoProvider;
 
 	/// Bind to an address with transport encryption configuration
 	fn bind_with(
 		addr: Self::Address,
-		config: TransportEncryptionConfig,
+		config: TransportEncryptionConfig<Self::CryptoProvider>,
 	) -> impl Future<Output = Result<(Self::Listener, Self::Address), Self::Error>> + Send;
 }
 
@@ -99,6 +102,8 @@ pub trait EncryptedProtocol: Protocol {
 /// Supports multiple server certificates for rotation and multi-CA scenarios.
 #[cfg(feature = "x509")]
 pub trait X509ClientConfig: Sized {
+	type CryptoProvider: CryptoProvider;
+
 	/// Add a server certificate for verification.
 	fn with_server_certificate(self, cert: Certificate) -> Self;
 
@@ -110,7 +115,7 @@ pub trait X509ClientConfig: Sized {
 
 	/// Set the client's identity for mutual authentication.
 	/// The client presents this certificate to the server when requested.
-	fn with_client_identity(self, cert: Certificate, key: HandshakeKeyManager) -> Self;
+	fn with_client_identity(self, cert: Certificate, key: HandshakeKeyManager<Self::CryptoProvider>) -> Self;
 }
 
 /// This protocol can operate as a mycelial network (ie. TCP SocketAddress)

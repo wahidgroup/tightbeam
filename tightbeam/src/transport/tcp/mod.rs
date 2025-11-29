@@ -175,7 +175,7 @@ impl crate::transport::TightBeamAddress for TightBeamSocketAddr {}
 macro_rules! impl_tcp_common {
 	($transport:ident, $stream_trait:path) => {
 		#[cfg(not(feature = "transport-policy"))]
-		impl<S: $stream_trait> From<S> for $transport<S>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> From<S> for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -209,12 +209,13 @@ macro_rules! impl_tcp_common {
 					server_handshake: None,
 					#[cfg(feature = "x509")]
 					handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind::default(),
+					_phantom: core::marker::PhantomData,
 				}
 			}
 		}
 
 		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait> From<S> for $transport<S>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> From<S> for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -257,11 +258,12 @@ macro_rules! impl_tcp_common {
 					server_handshake: None,
 					#[cfg(feature = "x509")]
 					handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind::default(),
+					_phantom: core::marker::PhantomData,
 				}
 			}
 		}
 
-		impl<S: $stream_trait> $crate::transport::ResponseHandler for $transport<S>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::ResponseHandler for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -279,10 +281,12 @@ macro_rules! impl_tcp_common {
 		}
 
 		#[cfg(feature = "x509")]
-		impl<S: $stream_trait> $crate::transport::X509ClientConfig for $transport<S>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::X509ClientConfig for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
+			type CryptoProvider = P;
+
 			fn with_server_certificate(mut self, cert: $crate::x509::Certificate) -> Self {
 				self.server_certificates.push(Arc::new(cert));
 				self
@@ -298,19 +302,19 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-			fn with_client_identity(
-				mut self,
-				cert: $crate::x509::Certificate,
-				key: $crate::transport::handshake::HandshakeKeyManager,
-			) -> Self {
-				self.client_certificate = Some(Arc::new(cert));
-				self.key_manager = Some(Arc::new(key));
-				self
-			}
+		fn with_client_identity(
+			mut self,
+			cert: $crate::x509::Certificate,
+			key: $crate::transport::handshake::HandshakeKeyManager<P>,
+		) -> Self {
+			self.client_certificate = Some(Arc::new(cert));
+			self.key_manager = Some(Arc::new(key));
+			self
+		}
 		}
 
 		#[cfg(feature = "x509")]
-		impl<S: $stream_trait> $transport<S>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
@@ -322,11 +326,11 @@ macro_rules! impl_tcp_common {
 		}
 
 		#[cfg(feature = "transport-policy")]
-		impl<S: $stream_trait> $crate::transport::policy::PolicyConf for $transport<S>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::policy::PolicyConf for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{
-			fn with_restart<P: RestartPolicy + 'static>(mut self, policy: P) -> Self {
+			fn with_restart<Pol: RestartPolicy + 'static>(mut self, policy: Pol) -> Self {
 				self.restart_policy = Box::new(policy);
 				self
 			}
@@ -349,7 +353,7 @@ macro_rules! impl_tcp_common {
 		}
 
 		#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
-		impl<S: $stream_trait> $crate::transport::MessageEmitter for $transport<S>
+		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> $crate::transport::MessageEmitter for $transport<S, P>
 		where
 			TransportError: From<S::Error>,
 		{

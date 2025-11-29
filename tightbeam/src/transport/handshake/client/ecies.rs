@@ -560,61 +560,6 @@ where
 	}
 }
 
-// ============================================================================
-// Type Alias for secp256k1
-// ============================================================================
-
-/// Type alias for ECIES client using secp256k1 curve without mutual auth.
-///
-/// This is the default curve used in TightBeam and is provided as a
-/// convenient alias for the generic `EciesHandshakeClient`.
-#[cfg(feature = "secp256k1")]
-pub type EciesHandshakeClientSecp256k1 =
-	EciesHandshakeClient<crate::crypto::profiles::DefaultCryptoProvider, crate::crypto::ecies::Secp256k1EciesMessage>;
-
-// Special impl for clients without mutual auth
-#[cfg(feature = "secp256k1")]
-impl EciesHandshakeClient<crate::crypto::profiles::DefaultCryptoProvider, crate::crypto::ecies::Secp256k1EciesMessage> {
-	/// Process ServerHandshake without mutual auth support (K=()).
-	pub fn process_server_handshake_no_auth(&mut self, server_handshake_der: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		// 1. Validation
-		self.validate_expected_state(ClientHandshakeState::HelloSent)?;
-		self.client_random.ok_or(HandshakeError::InvalidState)?;
-
-		// 2. Transition state
-		self.state.transition(ClientHandshakeState::ServerHelloReceived)?;
-
-		// 3. Decode and validate
-		let server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
-
-		// 4. Profile negotiation
-		self.validate_profile_selection(&server_handshake)?;
-
-		// 5. Extract server random
-		self.extract_server_random(&server_handshake)?;
-
-		// 6. Verify signature
-		self.verify_server_handshake_signature(&server_handshake)?;
-
-		// 7. Generate and encrypt session key
-		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake)?;
-
-		// 8. Build ClientKeyExchange (no mutual auth)
-		let client_kex = ClientKeyExchange {
-			encrypted_data: OctetString::new(encrypted_bytes)?,
-			#[cfg(feature = "x509")]
-			client_certificate: None,
-			#[cfg(feature = "x509")]
-			client_signature: None,
-		};
-
-		// 9. Transition state
-		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
-
-		Ok(client_kex.to_der()?)
-	}
-}
-
 // Implement helper trait for secp256k1 verifying key
 #[cfg(feature = "secp256k1")]
 impl ExtractVerifyingKey for crate::crypto::sign::ecdsa::Secp256k1VerifyingKey {
@@ -628,7 +573,7 @@ impl ExtractVerifyingKey for crate::crypto::sign::ecdsa::Secp256k1VerifyingKey {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::profiles::SecurityProfileDesc;
+	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
 	use crate::crypto::sign::Signer;
 	use crate::der::Encode;
@@ -641,8 +586,8 @@ mod tests {
 		SIGNER_ECDSA_WITH_SHA3_512,
 	};
 
-	#[test]
-	fn test_client_state_flow() -> Result<(), Box<dyn core::error::Error>> {
+	#[tokio::test]
+	async fn test_client_state_flow() -> Result<(), Box<dyn core::error::Error>> {
 		// Given: A client in init state
 		let mut client = TestEciesClientBuilder::new().build();
 		assert_eq!(client.state(), ClientHandshakeState::Init);
@@ -672,7 +617,7 @@ mod tests {
 			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
 
 		// When: Client processes the server handshake
-		let client_kex_der = client.process_server_handshake_no_auth(&server_handshake_der)?;
+		let client_kex_der = client.process_server_handshake(&server_handshake_der).await?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		assert!(client.base_session_key.is_some());
 		assert!(client.transcript_hash.is_some());
@@ -689,13 +634,13 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn test_invalid_state_transitions() -> Result<(), Box<dyn core::error::Error>> {
+	#[tokio::test]
+	async fn test_invalid_state_transitions() -> Result<(), Box<dyn core::error::Error>> {
 		// Given: A fresh client in init state
 		let mut client = TestEciesClientBuilder::new().build();
 
 		// When: Trying to process server handshake before building client hello
-		let result = client.process_server_handshake_no_auth(&[]);
+		let result = client.process_server_handshake(&[]).await;
 		assert!(result.is_err());
 
 		// When: Client builds client hello
@@ -710,8 +655,8 @@ mod tests {
 	}
 
 	/// Test client-side profile validation
-	#[test]
-	fn test_client_profile_validation() -> Result<(), Box<dyn core::error::Error>> {
+	#[tokio::test]
+	async fn test_client_profile_validation() -> Result<(), Box<dyn core::error::Error>> {
 		let mk_profile = |id: u8| SecurityProfileDesc {
 			digest: match id {
 				1 => HASH_SHA3_256,
@@ -731,7 +676,13 @@ mod tests {
 		let test_cert = create_test_certificate();
 
 		// Helper to create client with security offer and build hello
-		let setup_client = |offer: Option<SecurityOffer>| -> Result<(EciesHandshakeClientSecp256k1, [u8; 32]), Box<dyn std::error::Error>> {
+		let setup_client = |offer: Option<SecurityOffer>| -> Result<
+			(
+				EciesHandshakeClient<DefaultCryptoProvider, crate::crypto::ecies::Secp256k1EciesMessage>,
+				[u8; 32],
+			),
+			Box<dyn std::error::Error>,
+		> {
 			let mut client = TestEciesClientBuilder::new().build();
 			if let Some(offer) = offer {
 				client = client.with_security_offer(offer);
@@ -773,7 +724,7 @@ mod tests {
 		{
 			let (mut client, client_random) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
 			let server_response = create_server_response(&client_random, [2u8; 32], &p_b)?;
-			let _kex = client.process_server_handshake_no_auth(&server_response)?;
+			let _kex = client.process_server_handshake(&server_response).await?;
 			assert_eq!(client.selected_profile, Some(p_b));
 		}
 
@@ -781,7 +732,7 @@ mod tests {
 		{
 			let (mut client, client_random) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
 			let server_response = create_server_response(&client_random, [3u8; 32], &p_c)?;
-			let result = client.process_server_handshake_no_auth(&server_response);
+			let result = client.process_server_handshake(&server_response).await;
 			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 		}
 
@@ -789,7 +740,7 @@ mod tests {
 		{
 			let (mut client, client_random) = setup_client(None)?;
 			let server_response = create_server_response(&client_random, [4u8; 32], &p_a)?;
-			let _kex = client.process_server_handshake_no_auth(&server_response)?;
+			let _kex = client.process_server_handshake(&server_response).await?;
 			assert_eq!(client.selected_profile, Some(p_a));
 		}
 

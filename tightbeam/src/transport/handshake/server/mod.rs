@@ -8,9 +8,6 @@ mod cms;
 #[cfg(feature = "transport-cms")]
 pub use cms::CmsHandshakeServer;
 
-#[cfg(all(feature = "transport-cms", feature = "secp256k1"))]
-pub use cms::CmsHandshakeServerSecp256k1;
-
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
 mod ecies;
 

@@ -18,12 +18,13 @@ use crate::Frame;
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::aead::RuntimeAead;
+	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 	pub use crate::crypto::x509::policy::CertificateValidation;
 	pub use crate::transport::handshake::{
 		HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 	};
 	pub use crate::transport::state::EncryptedProtocolState;
-	pub use crate::transport::{EncryptedMessageIO, EncryptedProtocol};
+	pub use crate::transport::{EncryptedMessageIO, EncryptedProtocol, TransportEncryptionConfig};
 	pub use crate::x509::Certificate;
 }
 
@@ -62,7 +63,7 @@ impl From<TcpStream> for TokioStream {
 	}
 }
 
-pub struct TokioListener {
+pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	listener: TcpListener,
 	#[cfg(feature = "x509")]
 	certificate: Option<Arc<Certificate>>,
@@ -77,10 +78,10 @@ pub struct TokioListener {
 	#[cfg(feature = "x509")]
 	handshake_timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
-	key_manager: Option<Arc<HandshakeKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
 }
 
-impl TokioListener {
+impl<P: CryptoProvider> TokioListener<P> {
 	pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
 		self.listener.local_addr()
 	}
@@ -113,7 +114,7 @@ impl TokioListener {
 	}
 
 	#[cfg(feature = "x509")]
-	pub async fn accept(&self) -> std::io::Result<(TcpTransport<TokioStream>, std::net::SocketAddr)> {
+	pub async fn accept(&self) -> std::io::Result<(TcpTransport<TokioStream, P>, std::net::SocketAddr)> {
 		let (stream, addr) = self.listener.accept().await?;
 		let mut transport = TcpTransport::from(TokioStream::from(stream));
 
@@ -151,11 +152,11 @@ impl TokioListener {
 	}
 }
 
-impl Protocol for TokioListener {
-	type Listener = TokioListener;
+impl<P: CryptoProvider + Send + Sync> Protocol for TokioListener<P> {
+	type Listener = TokioListener<P>;
 	type Stream = TokioStream;
 	type Error = std::io::Error;
-	type Transport = TcpTransport<TokioStream>;
+	type Transport = TcpTransport<TokioStream, P>;
 	type Address = crate::transport::tcp::TightBeamSocketAddr;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
@@ -204,13 +205,14 @@ impl Protocol for TokioListener {
 }
 
 #[cfg(feature = "x509")]
-impl EncryptedProtocol for TokioListener {
+impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TokioListener<P> {
 	type Encryptor = RuntimeAead;
 	type Decryptor = RuntimeAead;
+	type CryptoProvider = P;
 
 	async fn bind_with(
 		addr: Self::Address,
-		config: crate::transport::TransportEncryptionConfig,
+		config: TransportEncryptionConfig<P>,
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
@@ -231,10 +233,12 @@ impl EncryptedProtocol for TokioListener {
 }
 
 #[cfg(feature = "x509")]
-impl<S: AsyncProtocolStream> EncryptedProtocolState for TcpTransport<S>
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync + 'static> EncryptedProtocolState for TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
+	type CryptoProvider = P;
+
 	fn to_encryptor_ref(&self) -> TransportResult<&RuntimeAead> {
 		self.symmetric_key
 			.as_ref()
@@ -281,7 +285,7 @@ where
 		self.handshake_protocol_kind
 	}
 
-	fn to_key_manager_ref(&self) -> Option<&Arc<HandshakeKeyManager>> {
+	fn to_key_manager_ref(&self) -> Option<&Arc<HandshakeKeyManager<P>>> {
 		self.key_manager.as_ref()
 	}
 
@@ -310,7 +314,7 @@ where
 	fn to_client_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
 		self.client_validators.as_ref()
 	}
-	
+
 	fn to_server_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
 		self.server_validators.as_ref()
 	}
@@ -325,13 +329,13 @@ where
 impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
 // Ensure symmetric key material is dropped when the transport is dropped
-impl<S: AsyncProtocolStream> Drop for TcpTransport<S> {
+impl<S: AsyncProtocolStream, P: crate::crypto::profiles::CryptoProvider> Drop for TcpTransport<S, P> {
 	fn drop(&mut self) {
 		let _ = self.symmetric_key.take();
 	}
 }
 
-impl AsyncListenerTrait for TokioListener {
+impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		let (stream, addr) = self.listener.accept().await?;
 		let mut transport = Self::create_transport(TokioStream::from(stream));
@@ -355,18 +359,18 @@ impl AsyncListenerTrait for TokioListener {
 	}
 }
 
-impl crate::transport::Mycelial for TokioListener {
+impl<P: CryptoProvider + Send + Sync> crate::transport::Mycelial for TokioListener<P> {
 	async fn try_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		// Bind to an available port (0.0.0.0:0 lets the OS choose)
 		let addr = "0.0.0.0:0"
 			.parse::<crate::transport::tcp::TightBeamSocketAddr>()
 			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-		<TokioListener as Protocol>::bind(addr).await
+		<TokioListener<P> as Protocol>::bind(addr).await
 	}
 }
 
 #[cfg(not(feature = "transport-policy"))]
-pub struct TcpTransport<S: AsyncProtocolStream> {
+pub struct TcpTransport<S: AsyncProtocolStream, P: CryptoProvider = DefaultCryptoProvider> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
 	#[cfg(feature = "x509")]
@@ -386,18 +390,19 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	key_manager: Option<Arc<HandshakeKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
 	handshake_timeout: Duration,
 	#[cfg(feature = "x509")]
 	symmetric_key: Option<RuntimeAead>,
+	_phantom: core::marker::PhantomData<P>,
 }
 
 // (single Drop impl above covers both feature variants)
 #[cfg(feature = "transport-policy")]
-pub struct TcpTransport<S: AsyncProtocolStream> {
+pub struct TcpTransport<S: AsyncProtocolStream, P: CryptoProvider = DefaultCryptoProvider> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
 	restart_policy: Box<dyn RestartPolicy>,
@@ -421,7 +426,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	#[cfg(feature = "x509")]
 	max_encrypted_envelope: Option<usize>,
 	#[cfg(feature = "x509")]
-	key_manager: Option<Arc<HandshakeKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
 	#[cfg(feature = "x509")]
 	handshake_state: TcpHandshakeState,
 	#[cfg(feature = "x509")]
@@ -432,6 +437,7 @@ pub struct TcpTransport<S: AsyncProtocolStream> {
 	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>>,
 	#[cfg(feature = "x509")]
 	handshake_protocol_kind: HandshakeProtocolKind,
+	_phantom: core::marker::PhantomData<P>,
 }
 
 impl<S: AsyncProtocolStream> Pingable for TcpTransport<S>
@@ -639,7 +645,7 @@ where
 	}
 }
 
-impl PersistentConnection for TokioListener {
+impl<P: CryptoProvider + Send + Sync> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
 		// Check TCP connection via peer_addr - if it fails, connection is dead
 		// This is lightweight and doesn't perform I/O

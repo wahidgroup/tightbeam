@@ -29,6 +29,7 @@ use crate::Frame;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
+	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 	pub use crate::policy::GatePolicy;
 	pub use crate::policy::TransitStatus;
 	pub use crate::transport::error::TransportError;
@@ -39,7 +40,7 @@ mod policy {
 #[cfg(feature = "transport-policy")]
 use policy::*;
 
-pub struct TcpTransport<S: ProtocolStream> {
+pub struct TcpTransport<S: ProtocolStream, P: CryptoProvider = DefaultCryptoProvider> {
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
 	#[cfg(feature = "transport-policy")]
@@ -52,7 +53,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 	operation_timeout: Option<std::time::Duration>,
 
 	server_certificates: Vec<Arc<Certificate>>,
-	
+
 	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 
 	client_certificate: Option<Arc<Certificate>>,
@@ -67,7 +68,7 @@ pub struct TcpTransport<S: ProtocolStream> {
 
 	max_encrypted_envelope: Option<usize>,
 
-	key_manager: Option<Arc<HandshakeKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
 
 	handshake_state: TcpHandshakeState,
 
@@ -78,6 +79,8 @@ pub struct TcpTransport<S: ProtocolStream> {
 	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>>,
 
 	handshake_protocol_kind: HandshakeProtocolKind,
+
+	_phantom: core::marker::PhantomData<P>,
 }
 
 impl<S: ProtocolStream> Pingable for TcpTransport<S>
@@ -285,10 +288,12 @@ where
 
 // Old emit() implementation removed - now uses default trait implementation
 
-impl<S: ProtocolStream> EncryptedProtocolState for TcpTransport<S>
+impl<S: ProtocolStream, P: CryptoProvider + Send + Sync + 'static> EncryptedProtocolState for TcpTransport<S, P>
 where
 	TransportError: From<S::Error>,
 {
+	type CryptoProvider = P;
+
 	fn to_encryptor_ref(&self) -> TransportResult<&RuntimeAead> {
 		self.symmetric_key
 			.as_ref()
@@ -335,7 +340,7 @@ where
 		self.handshake_protocol_kind
 	}
 
-	fn to_key_manager_ref(&self) -> Option<&Arc<HandshakeKeyManager>> {
+	fn to_key_manager_ref(&self) -> Option<&Arc<HandshakeKeyManager<P>>> {
 		self.key_manager.as_ref()
 	}
 
@@ -374,7 +379,7 @@ where
 impl<S: ProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
 /// TCP server using abstract listener trait
-pub struct TcpListener<L: TcpListenerTrait> {
+pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoProvider> {
 	listener: L,
 	certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
@@ -382,16 +387,16 @@ pub struct TcpListener<L: TcpListenerTrait> {
 	aad_domain_tag: Option<&'static [u8]>,
 	max_cleartext_envelope: Option<usize>,
 	max_encrypted_envelope: Option<usize>,
-	key_manager: Option<Arc<HandshakeKeyManager>>,
+	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
 	handshake_timeout: Option<Duration>,
 }
 
 #[cfg(feature = "std")]
-impl Protocol for TcpListener<std::net::TcpListener> {
-	type Listener = TcpListener<std::net::TcpListener>;
+impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<std::net::TcpListener, P> {
+	type Listener = TcpListener<std::net::TcpListener, P>;
 	type Stream = std::net::TcpStream;
 	type Error = std::io::Error;
-	type Transport = TcpTransport<std::net::TcpStream>;
+	type Transport = TcpTransport<std::net::TcpStream, P>;
 	type Address = TightBeamSocketAddr;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
@@ -432,7 +437,7 @@ impl Protocol for TcpListener<std::net::TcpListener> {
 	}
 }
 
-impl<L: TcpListenerTrait> TcpListener<L>
+impl<L: TcpListenerTrait, P: CryptoProvider> TcpListener<L, P>
 where
 	TransportError: From<L::Error>,
 	TransportError: From<<L::Stream as ProtocolStream>::Error>,
@@ -452,7 +457,7 @@ where
 		}
 	}
 
-	pub fn accept(&self) -> TransportResult<TcpTransport<L::Stream>> {
+	pub fn accept(&self) -> TransportResult<TcpTransport<L::Stream, P>> {
 		let (stream, _) = self.listener.accept()?;
 		let mut transport = TcpTransport::from(stream);
 
@@ -484,13 +489,14 @@ where
 	}
 }
 
-impl EncryptedProtocol for TcpListener<std::net::TcpListener> {
+impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<std::net::TcpListener, P> {
 	type Encryptor = RuntimeAead;
 	type Decryptor = RuntimeAead;
+	type CryptoProvider = P;
 
 	async fn bind_with(
 		addr: <Self as Protocol>::Address,
-		config: TransportEncryptionConfig,
+		config: TransportEncryptionConfig<P>,
 	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
 		let listener = std::net::TcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;

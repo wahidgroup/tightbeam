@@ -234,7 +234,7 @@ where
 	pub(crate) _protocol: PhantomData<P>,
 	pub(crate) _message: PhantomData<M>,
 	#[cfg(feature = "x509")]
-	pub(crate) x509_config: Option<TransportEncryptionConfig>,
+	pub(crate) x509_config: Option<TransportEncryptionConfig<crate::crypto::profiles::DefaultCryptoProvider>>,
 	pub(crate) servlet_config: Option<Arc<dyn Any + Send + Sync>>,
 	pub(crate) workers: HashMap<String, Box<dyn Any + Send + Sync>>,
 	pub(crate) collector_gates: Vec<Arc<dyn crate::policy::GatePolicy + Send + Sync>>,
@@ -247,7 +247,7 @@ where
 	M: Message,
 {
 	#[cfg(feature = "x509")]
-	x509_config: Option<TransportEncryptionConfig>,
+	x509_config: Option<TransportEncryptionConfig<crate::crypto::profiles::DefaultCryptoProvider>>,
 	servlet_config: Option<Arc<dyn Any + Send + Sync>>,
 	workers: HashMap<String, Box<dyn Any + Send + Sync>>,
 	collector_gates: Vec<Arc<dyn crate::policy::GatePolicy + Send + Sync>>,
@@ -271,7 +271,7 @@ where
 
 	/// Get the x509 configuration
 	#[cfg(feature = "x509")]
-	pub fn to_encryption_config_ref(&self) -> Option<&TransportEncryptionConfig> {
+	pub fn to_encryption_config_ref(&self) -> Option<&TransportEncryptionConfig<crate::crypto::profiles::DefaultCryptoProvider>> {
 		self.x509_config.as_ref()
 	}
 

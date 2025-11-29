@@ -54,6 +54,7 @@ pub type TransportResult<T> = Result<T, TransportError>;
 #[cfg(feature = "x509")]
 use crate::crypto::x509::policy::CertificateValidation;
 #[cfg(feature = "x509")]
+use crate::crypto::profiles::CryptoProvider;
 use crate::transport::handshake::HandshakeKeyManager;
 #[cfg(feature = "x509")]
 use crate::x509::Certificate;
@@ -81,9 +82,9 @@ impl CertificateValidation for CompositeValidator {
 
 #[cfg(all(feature = "x509", feature = "std"))]
 #[derive(Clone)]
-pub struct TransportEncryptionConfig {
+pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub certificate: Certificate,
-	pub key_manager: Arc<HandshakeKeyManager>,
+	pub key_manager: Arc<HandshakeKeyManager<P>>,
 	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	pub aad_domain_tag: &'static [u8],
 	pub max_cleartext_envelope: usize,
@@ -92,8 +93,8 @@ pub struct TransportEncryptionConfig {
 }
 
 #[cfg(all(feature = "x509", feature = "std"))]
-impl TransportEncryptionConfig {
-	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager) -> Self {
+impl<P: CryptoProvider> TransportEncryptionConfig<P> {
+	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager<P>) -> Self {
 		Self {
 			certificate,
 			key_manager: Arc::new(key_manager),

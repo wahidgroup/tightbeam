@@ -19,7 +19,13 @@ use crate::transport::TransportResult;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::aead::Decryptor;
+	pub use crate::crypto::aead::{Decryptor, KeyInit};
+	pub use crate::crypto::ecies::EciesPublicKeyOps;
+	pub use crate::crypto::profiles::CryptoProvider;
+	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+	pub use crate::crypto::sign::Verifier;
+	pub use crate::spki::EncodePublicKey;
 	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::io::EncryptedMessageIO;
 	pub use crate::transport::state::EncryptedProtocolState;
@@ -378,9 +384,17 @@ pub trait MessageCollector: MessageIO {
 	/// X509-enabled collect_message with encryption and handshake support
 	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
-	async fn collect_message_with_encryption(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
+	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where
-		Self: EncryptedMessageIO + Sized + EncryptedProtocolState,
+		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P>,
+		P: CryptoProvider + Send + Sync + 'static,
+		P::Curve: Curve + CurveArithmetic,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		PublicKey<P::Curve>: EciesPublicKeyOps,
+		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature>,
+		for<'b> P::VerifyingKey: From<&'b PublicKey<P::Curve>>,
+		P::AeadCipher: KeyInit,
 	{
 		loop {
 			// Read wire envelope

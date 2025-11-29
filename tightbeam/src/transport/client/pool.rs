@@ -11,19 +11,20 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 #[cfg(feature = "std")]
 use std::time::Instant;
 
+use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::crypto::{key::KeySpec, x509::CertificateSpec};
 use crate::transport::client::GenericClient;
 use crate::transport::error::{TransportError, TransportFailure};
+use crate::transport::handshake::HandshakeKeyManager;
 use crate::transport::policy::PolicyConf;
 use crate::transport::protocols::{PersistentConnection, Protocol};
 use crate::transport::{MessageCollector, MessageEmitter, TransportResult, X509ClientConfig};
 
 #[cfg(feature = "x509")]
+#[cfg(feature = "x509")]
 use crate::crypto::x509::Certificate;
 #[cfg(not(feature = "x509"))]
 use crate::transport::client::ClientBuilder;
-#[cfg(feature = "x509")]
-use crate::transport::handshake::HandshakeKeyManager;
 
 /// Builder trait for connection configuration
 ///
@@ -63,40 +64,33 @@ pub struct PoolConfig {
 #[cfg(feature = "x509")]
 #[derive(Clone)]
 /// Client authentication bundle kept behind Arc for zero-copy reuse.
-struct ClientIdentity {
+struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
 	certificate: Arc<Certificate>,
-	key: Arc<HandshakeKeyManager>,
+	key: Arc<HandshakeKeyManager<C>>,
 }
 
 #[cfg(feature = "x509")]
-#[derive(Clone)]
+#[derive(Clone, Default)]
 /// Shared TLS assets reused across pooled connections without reallocations.
-struct PoolTlsConfig {
+struct PoolTlsConfig<C: CryptoProvider = DefaultCryptoProvider> {
 	server_certificates: Vec<Arc<Certificate>>,
-	client_identity: Option<ClientIdentity>,
+	client_identity: Option<ClientIdentity<C>>,
 }
 
 #[cfg(feature = "x509")]
-impl Default for PoolTlsConfig {
-	fn default() -> Self {
-		Self { server_certificates: Vec::new(), client_identity: None }
-	}
-}
-
-#[cfg(feature = "x509")]
-impl PoolTlsConfig {
+impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 	fn push_server_certificate(&mut self, cert: Certificate) {
 		self.server_certificates.push(Arc::new(cert));
 	}
 
-	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager) {
+	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager<C>) {
 		self.client_identity = Some(ClientIdentity { certificate: Arc::new(cert), key: Arc::new(key) });
 	}
 
-	fn apply<P>(&self, transport: P::Transport) -> P::Transport
+	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
 	where
-		P: Protocol,
-		P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig,
+		Pro: Protocol,
+		Pro::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C>,
 	{
 		let mut configured = transport;
 
@@ -116,15 +110,15 @@ impl PoolTlsConfig {
 }
 
 /// Builder for creating a configured ConnectionPool
-pub struct ConnectionPoolBuilder<P: Protocol, const N: usize> {
+pub struct ConnectionPoolBuilder<P: Protocol, const N: usize, C: CryptoProvider = DefaultCryptoProvider> {
 	config: PoolConfig,
 	timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
-	tls: PoolTlsConfig,
-	_phantom: core::marker::PhantomData<P>,
+	tls: PoolTlsConfig<C>,
+	_phantom: core::marker::PhantomData<(P, C)>,
 }
 
-impl<P: Protocol, const N: usize> Default for ConnectionPoolBuilder<P, N> {
+impl<P: Protocol, const N: usize, C: CryptoProvider> Default for ConnectionPoolBuilder<P, N, C> {
 	fn default() -> Self {
 		Self {
 			config: PoolConfig::default(),
@@ -136,7 +130,7 @@ impl<P: Protocol, const N: usize> Default for ConnectionPoolBuilder<P, N> {
 	}
 }
 
-impl<P: Protocol, const N: usize> ConnectionPoolBuilder<P, N> {
+impl<P: Protocol, const N: usize, C: CryptoProvider> ConnectionPoolBuilder<P, N, C> {
 	pub fn with_config(mut self, config: PoolConfig) -> Self {
 		self.config = config;
 		self
@@ -144,8 +138,10 @@ impl<P: Protocol, const N: usize> ConnectionPoolBuilder<P, N> {
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, const N: usize> ConnectionBuilder<P> for ConnectionPoolBuilder<P, N> {
-	type Output = ConnectionPool<P, N>;
+impl<P: Protocol, const N: usize, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P>
+	for ConnectionPoolBuilder<P, N, C>
+{
+	type Output = ConnectionPool<P, N, C>;
 
 	fn with_timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = Some(timeout);
@@ -172,7 +168,8 @@ impl<P: Protocol, const N: usize> ConnectionBuilder<P> for ConnectionPoolBuilder
 	#[cfg(feature = "x509")]
 	fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self> {
 		let cert_converted = Certificate::try_from(cert)?;
-		let key_converted = HandshakeKeyManager::try_from(key)?;
+		let key_converted =
+			HandshakeKeyManager::<C>::try_from(key).map_err(|e| TransportError::HandshakeError(e.into()))?;
 
 		self.tls.set_client_identity(cert_converted, key_converted);
 		Ok(self)
@@ -211,7 +208,7 @@ struct DestinationPool<P: Protocol> {
 /// - Idle connections exceeding `PoolConfig::idle_timeout` are pruned lazily
 /// - Lock poisoning never panics; callers receive `TransportFailure::Busy` instead
 #[cfg(feature = "std")]
-pub struct ConnectionPool<P: Protocol, const N: usize> {
+pub struct ConnectionPool<P: Protocol, const N: usize, C: CryptoProvider = DefaultCryptoProvider> {
 	/// Per-destination sub-pools
 	pools: Arc<RwLock<HashMap<P::Address, DestinationPool<P>>>>,
 	/// Pool configuration
@@ -220,21 +217,21 @@ pub struct ConnectionPool<P: Protocol, const N: usize> {
 	timeout: Option<Duration>,
 	/// Shared TLS assets reused across pooled connections
 	#[cfg(feature = "x509")]
-	tls: PoolTlsConfig,
+	tls: PoolTlsConfig<C>,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + Send + Sync, const N: usize> ConnectionPool<P, N>
+impl<P: Protocol + Send + Sync, const N: usize, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, N, C>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 	P::Transport: Send + Sync,
 {
 	/// Create a new connection pool builder
-	pub fn builder() -> ConnectionPoolBuilder<P, N> {
+	pub fn builder() -> ConnectionPoolBuilder<P, N, C> {
 		ConnectionPoolBuilder::default()
 	}
 
-	fn wrap_client(self: &Arc<Self>, client: GenericClient<P>, addr: P::Address) -> PooledClient<P, N>
+	fn wrap_client(self: &Arc<Self>, client: GenericClient<P>, addr: P::Address) -> PooledClient<P, N, C>
 	where
 		P: PersistentConnection,
 	{
@@ -276,7 +273,7 @@ where
 		Ok(None)
 	}
 
-	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, N>> {
+	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, N, C>> {
 		let mut pools = self.write_pools()?;
 		let dest_pool = pools
 			.entry(addr.clone())
@@ -306,7 +303,7 @@ where
 	}
 
 	#[cfg(not(feature = "x509"))]
-	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, N>>
+	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, N, C>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport: MessageEmitter + MessageCollector + PolicyConf + Send + Sync,
@@ -317,7 +314,7 @@ where
 
 		let mut reservation = self.reserve_slot(&addr)?;
 
-		let builder = self.apply_timeout_to_builder(ClientBuilder::<P>::builder());
+		let builder = self.apply_timeout_to_builder(ClientBuilder::<P, C>::builder());
 		let builder = ConnectionBuilder::build(builder);
 		let client = builder.connect(addr.clone()).await?;
 
@@ -327,10 +324,11 @@ where
 	}
 
 	#[cfg(feature = "x509")]
-	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, N>>
+	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, N, C>>
 	where
 		P: PersistentConnection + Send + Sync,
-		P::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig + Send + Sync,
+		P::Transport:
+			MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C> + Send + Sync,
 	{
 		if let Some(client) = self.try_take_ready_client(&addr)? {
 			return Ok(self.wrap_client(client, addr));
@@ -351,7 +349,7 @@ where
 		Ok(self.wrap_client(client, addr))
 	}
 
-	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, N>>>
+	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, N, C>>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport: MessageEmitter + MessageCollector + PolicyConf + Send + Sync,
@@ -361,19 +359,29 @@ where
 	}
 }
 
+// Separate impl with tighter bounds for non-x509 features
+#[cfg(feature = "std")]
+#[cfg(not(feature = "x509"))]
+impl<P: Protocol + Send + Sync, const N: usize, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, N, C>
+where
+	P::Address: Hash + Eq + Clone + Send + Sync,
+	P::Transport: Send + Sync,
+{
+}
+
 /// A pooled client connection that returns to the pool on drop
 #[cfg(feature = "std")]
-pub struct PooledClient<P: Protocol + PersistentConnection, const N: usize>
+pub struct PooledClient<P: Protocol + PersistentConnection, const N: usize, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
 	client: Option<GenericClient<P>>,
-	pool: Arc<ConnectionPool<P, N>>,
+	pool: Arc<ConnectionPool<P, N, C>>,
 	addr: P::Address,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + PersistentConnection, const N: usize> Deref for PooledClient<P, N>
+impl<P: Protocol + PersistentConnection, const N: usize, C: CryptoProvider> Deref for PooledClient<P, N, C>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
@@ -381,23 +389,25 @@ where
 
 	fn deref(&self) -> &Self::Target {
 		debug_assert!(self.client.is_some(), "pooled client should never be None before drop");
+		// TODO WE CANNOT USE EXPECT
 		self.client.as_ref().expect("pooled client still active")
 	}
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + PersistentConnection, const N: usize> DerefMut for PooledClient<P, N>
+impl<P: Protocol + PersistentConnection, const N: usize, C: CryptoProvider> DerefMut for PooledClient<P, N, C>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
 	fn deref_mut(&mut self) -> &mut Self::Target {
 		debug_assert!(self.client.is_some(), "pooled client should never be None before drop");
+		// TODO WE CANNOT USE EXPECT
 		self.client.as_mut().expect("pooled client still active")
 	}
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + PersistentConnection, const N: usize> Drop for PooledClient<P, N>
+impl<P: Protocol + PersistentConnection, const N: usize, C: CryptoProvider> Drop for PooledClient<P, N, C>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
@@ -426,21 +436,21 @@ where
 }
 
 #[cfg(feature = "std")]
-struct SlotGuard<P: Protocol, const N: usize>
+struct SlotGuard<P: Protocol, const N: usize, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {
-	pool: Arc<ConnectionPool<P, N>>,
+	pool: Arc<ConnectionPool<P, N, C>>,
 	addr: P::Address,
 	active: bool,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, const N: usize> SlotGuard<P, N>
+impl<P: Protocol, const N: usize, C: CryptoProvider> SlotGuard<P, N, C>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {
-	fn new(pool: Arc<ConnectionPool<P, N>>, addr: P::Address) -> Self {
+	fn new(pool: Arc<ConnectionPool<P, N, C>>, addr: P::Address) -> Self {
 		Self { pool, addr, active: true }
 	}
 
@@ -450,7 +460,7 @@ where
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, const N: usize> Drop for SlotGuard<P, N>
+impl<P: Protocol, const N: usize, C: CryptoProvider> Drop for SlotGuard<P, N, C>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {

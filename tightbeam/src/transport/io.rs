@@ -25,12 +25,17 @@ use crate::{encode, TightBeamError};
 mod x509 {
 	pub use crate::cms::enveloped_data::EnvelopedData;
 	pub use crate::cms::signed_data::SignedData;
-	pub use crate::crypto::aead::{Decryptor, RuntimeAead};
-	pub use crate::crypto::ecies::Secp256k1EciesMessage;
-	pub use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc, TightbeamProfile};
+	pub use crate::crypto::aead::{Decryptor, KeyInit, RuntimeAead};
+	pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+	pub use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc, TightbeamProfile};
+	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+	pub use crate::crypto::sign::{SignatureEncoding, Verifier};
 	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::der::oid::AssociatedOid;
+	pub use crate::spki::EncodePublicKey;
 	pub use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
-	pub use crate::transport::handshake::client::EciesHandshakeClient;
+	pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
 	pub use crate::transport::handshake::{
 		ClientHandshakeProtocol, ClientHello, ClientKeyExchange, HandshakeError, HandshakeFinalization,
 		HandshakeProtocolKind, ServerHandshake, TcpHandshakeState,
@@ -251,9 +256,23 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Ensure handshake is complete, performing it if needed
 	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
-	async fn ensure_handshake_complete(&mut self) -> TransportResult<()>
+	async fn ensure_handshake_complete<P>(&mut self) -> TransportResult<()>
 	where
-		Self: Sized + EncryptedProtocolState,
+		Self: Sized + EncryptedProtocolState<CryptoProvider = P>,
+		// Curve and elliptic curve bounds
+		P: CryptoProvider + Default + Send + Sync + 'static,
+		P::Curve: Curve + CurveArithmetic + AssociatedOid,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		PublicKey<P::Curve>: EciesPublicKeyOps + EncodePublicKey,
+		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
+		// Signature bounds
+		P::Signature: SignatureEncoding,
+		for<'b> P::Signature: TryFrom<&'b [u8]>,
+		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
+		P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + From<PublicKey<P::Curve>> + EncodePublicKey,
+		// AEAD bound
+		P::AeadCipher: KeyInit,
 	{
 		let should_handshake = (self.to_server_certificate_ref().is_some() || self.is_client_validators_present())
 			&& self.to_handshake_state() == TcpHandshakeState::None;
@@ -269,16 +288,37 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// This is a helper method because K=() cannot be cast to trait object due to missing Signer bound
 	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
-	async fn perform_client_handshake_no_mutual_auth(
-		&mut self,
-		#[cfg(all(feature = "x509", feature = "std"))] validator: Option<Arc<dyn CertificateValidation>>,
-		#[cfg(not(all(feature = "x509", feature = "std")))] validator: Option<()>,
-	) -> TransportResult<()>
+	async fn perform_client_handshake_no_mutual_auth<P>(&mut self) -> TransportResult<()>
 	where
-		Self: Sized + MessageIO + EncryptedProtocolState,
+		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P>,
+		// Curve and elliptic curve bounds
+		P: CryptoProvider + Default + Send + Sync + 'static,
+		P::Curve: Curve + CurveArithmetic + AssociatedOid,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		PublicKey<P::Curve>: EciesPublicKeyOps + EncodePublicKey,
+		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
+		// Signature bounds
+		P::Signature: SignatureEncoding,
+		for<'b> P::Signature: TryFrom<&'b [u8]>,
+		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
+		P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + From<PublicKey<P::Curve>> + EncodePublicKey,
+		// AEAD and ECIES message bounds
+		P::AeadCipher: KeyInit,
+		P::EciesMessage: EciesMessageOps,
 	{
+		// Build composite validator if validators are configured
+		#[cfg(all(feature = "x509", feature = "std"))]
+		let validator = self.to_server_validators_ref().map(|validators| {
+			let composite = CompositeValidator { validators: Arc::clone(validators) };
+			Arc::new(composite) as Arc<dyn CertificateValidation>
+		});
+
+		#[cfg(not(all(feature = "x509", feature = "std")))]
+		let validator = None;
+
 		// Create client without mutual auth
-		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None);
+		let mut client = EciesHandshakeClient::<P, P::EciesMessage>::new(None);
 		#[cfg(all(feature = "x509", feature = "std"))]
 		if let Some(val) = validator {
 			client = client.with_certificate_validator(val);
@@ -331,8 +371,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		// Step 3: Process server handshake (no mutual auth)
-		let next_message_bytes = client.process_server_handshake_no_auth(&response_bytes)?;
+		// Step 3: Process server handshake
+		let next_message_bytes = client.process_server_handshake(&response_bytes).await?;
 		if next_message_bytes.len() > HANDSHAKE_MAX_WIRE {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -358,9 +398,23 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Perform client-side handshake (extracted from macro)
 	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
-	async fn perform_client_handshake(&mut self) -> TransportResult<()>
+	async fn perform_client_handshake<P>(&mut self) -> TransportResult<()>
 	where
-		Self: Sized + MessageIO + EncryptedProtocolState,
+		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P>,
+		// Curve and elliptic curve bounds
+		P: CryptoProvider + Default + Send + Sync + 'static,
+		P::Curve: Curve + CurveArithmetic + AssociatedOid,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		PublicKey<P::Curve>: EciesPublicKeyOps + EncodePublicKey,
+		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
+		// Signature bounds
+		P::Signature: SignatureEncoding,
+		for<'b> P::Signature: TryFrom<&'b [u8]>,
+		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
+		P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + From<PublicKey<P::Curve>> + EncodePublicKey,
+		// AEAD bound
+		P::AeadCipher: KeyInit,
 	{
 		// Build composite validator if validators are configured
 		#[cfg(all(feature = "x509", feature = "std"))]
@@ -376,7 +430,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		if matches!(self.to_handshake_protocol_kind(), HandshakeProtocolKind::Ecies)
 			&& self.to_key_manager_ref().is_none()
 		{
-			return self.perform_client_handshake_no_mutual_auth(validator).await;
+			return self.perform_client_handshake_no_mutual_auth().await;
 		}
 
 		// Path: Mutual auth clients - use trait object via factory
@@ -384,7 +438,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = HandshakeError>> =
 			match (self.to_handshake_protocol_kind(), key_manager) {
 				(HandshakeProtocolKind::Ecies, key) => {
-					key.create_ecies_client(
+					key.create_ecies_client::<crate::crypto::ecies::Secp256k1EciesMessage>(
 						self.to_server_certificates_ref().first().map(Arc::clone),
 						self.to_client_certificate_ref().map(Arc::clone),
 						None, // Use default AAD domain tag
@@ -493,9 +547,17 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// Perform server-side handshake (extracted from macro)
 	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
-	async fn perform_server_handshake(&mut self, handshake_bytes: &[u8]) -> TransportResult<()>
+	async fn perform_server_handshake<P>(&mut self, handshake_bytes: &[u8]) -> TransportResult<()>
 	where
-		Self: Sized + MessageIO + EncryptedProtocolState,
+		Self: Sized + MessageIO + EncryptedProtocolState<CryptoProvider = P>,
+		P: CryptoProvider + Send + Sync + 'static,
+		P::Curve: Curve + CurveArithmetic,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		PublicKey<P::Curve>: EciesPublicKeyOps,
+		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature>,
+		for<'b> P::VerifyingKey: From<&'b PublicKey<P::Curve>>,
+		P::AeadCipher: KeyInit,
 	{
 		if handshake_bytes.len() > HANDSHAKE_MAX_WIRE {
 			return Err(TransportError::InvalidMessage);
@@ -551,7 +613,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				#[cfg(all(feature = "aead", feature = "signature"))]
 				HandshakeProtocolKind::Cms => {
 					// Use factory method to create CMS server with concrete key type
-					key_manager.create_cms_server(client_validators.clone())?
+					key_manager.create_cms_server(client_validators.clone(), vec![])?
 				}
 
 				#[cfg(not(all(feature = "aead", feature = "signature")))]

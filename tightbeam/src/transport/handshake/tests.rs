@@ -15,7 +15,6 @@ use std::sync::Arc;
 use crate::asn1::OctetString;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::crypto::key::{InMemoryKeyProvider, KeyProvider};
-use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -36,16 +35,20 @@ use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate};
 
+#[cfg(feature = "x509")]
+use crate::crypto::ecies::Secp256k1EciesMessage;
+#[cfg(feature = "x509")]
+use crate::crypto::profiles::DefaultCryptoProvider;
 #[cfg(feature = "transport-cms")]
 use crate::crypto::sign::elliptic_curve::PublicKey;
 #[cfg(feature = "time")]
 use crate::der::asn1::GeneralizedTime;
 #[cfg(feature = "transport-cms")]
-use crate::transport::handshake::client::CmsHandshakeClientSecp256k1;
+use crate::transport::handshake::client::CmsHandshakeClient;
 #[cfg(feature = "x509")]
-use crate::transport::handshake::client::EciesHandshakeClientSecp256k1;
+use crate::transport::handshake::client::EciesHandshakeClient;
 #[cfg(feature = "transport-cms")]
-use crate::transport::handshake::server::CmsHandshakeServerSecp256k1;
+use crate::transport::handshake::server::CmsHandshakeServer;
 #[cfg(feature = "time")]
 use crate::x509::time::Time;
 
@@ -354,8 +357,8 @@ impl TestEciesClientBuilder {
 	}
 
 	/// Build the ECIES handshake client.
-	pub fn build(self) -> EciesHandshakeClientSecp256k1 {
-		EciesHandshakeClientSecp256k1::new(self.aad_domain)
+	pub fn build(self) -> EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage> {
+		EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(self.aad_domain)
 	}
 }
 
@@ -396,15 +399,15 @@ impl TestCmsServerBuilder {
 	}
 
 	/// Build the CMS handshake server.
-	pub fn build(self) -> (CmsHandshakeServerSecp256k1, PublicKey<k256::Secp256k1>) {
-		use CmsHandshakeServerSecp256k1;
+	pub fn build(self) -> (CmsHandshakeServer<DefaultCryptoProvider>, PublicKey<k256::Secp256k1>) {
+		use CmsHandshakeServer;
 
 		let test_key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let verifying_key = *test_key.verifying_key();
 
 		// Apply transcript hash if explicitly set
 		let public_key = PublicKey::<k256::Secp256k1>::from(verifying_key);
-		let mut server = CmsHandshakeServerSecp256k1::new(into_provider(test_key), None);
+		let mut server = CmsHandshakeServer::<DefaultCryptoProvider>::new(into_provider(test_key), None);
 		if let Some(hash) = self.transcript_hash {
 			server = server.with_transcript_hash(hash);
 		}
@@ -458,14 +461,14 @@ impl TestCmsClientBuilder {
 	}
 
 	/// Build the CMS handshake client.
-	pub fn build(self) -> Result<CmsHandshakeClientSecp256k1, Box<dyn std::error::Error>> {
+	pub fn build(self) -> Result<CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn std::error::Error>> {
 		let client_key = self.client_key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let server_cert = match self.server_cert {
 			Some(cert) => cert,
 			None => create_test_certificate_from_key(&create_test_certificate().signing_key)?,
 		};
 
-		let mut client = CmsHandshakeClientSecp256k1::new(
+		let mut client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
 			DefaultCryptoProvider::default(),
 			into_provider(client_key),
 			Arc::new(server_cert),

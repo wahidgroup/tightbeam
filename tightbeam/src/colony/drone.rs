@@ -1408,6 +1408,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use crate::colony::servlet::Servlet;
+	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
 	use crate::der::Sequence;
 	use crate::policy::GatePolicy;
@@ -1825,8 +1826,8 @@ mod tests {
 		hive.establish_hive().await?;
 
 		// Connect to the hive control server
-		let stream = TokioListener::connect(control_addr).await?;
-		let mut transport = TokioListener::create_transport(stream);
+		let stream = TokioListener::<DefaultCryptoProvider>::connect(control_addr).await?;
+		let mut transport = TokioListener::<DefaultCryptoProvider>::create_transport(stream);
 
 		// Test 1: List servlets (should have 2 default servlets)
 		println!("\n=== Test 1: List initial servlets ===");

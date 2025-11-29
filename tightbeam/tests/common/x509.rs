@@ -6,6 +6,7 @@ use std::{sync::Arc, time::Instant};
 use tightbeam::{
 	cert,
 	crypto::{
+		profiles::DefaultCryptoProvider,
 		sign::{
 			ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey},
 			Sha3Signer,
@@ -13,8 +14,7 @@ use tightbeam::{
 		x509::policy::CertificateValidation,
 	},
 	error::Result,
-	prelude::collect::TokioListener,
-	prelude::*,
+	prelude::{collect::TokioListener, *},
 	server,
 	spki::SubjectPublicKeyInfoOwned,
 	testing::create_test_signing_key,
@@ -48,9 +48,9 @@ pub fn create_test_cert_with_key(subject: &str, validity_days: u64) -> Result<(C
 /// Create server encryption config with certificate, key, and validators
 pub fn create_server_config(
 	cert: Certificate,
-	key_provider: impl Into<HandshakeKeyManager>,
+	key_provider: impl Into<HandshakeKeyManager<DefaultCryptoProvider>>,
 	validators: Vec<Arc<dyn CertificateValidation>>,
-) -> TransportEncryptionConfig {
+) -> TransportEncryptionConfig<DefaultCryptoProvider> {
 	let key_manager = key_provider.into();
 	TransportEncryptionConfig::new(cert, key_manager).with_client_validators(validators)
 }
