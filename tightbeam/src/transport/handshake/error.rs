@@ -349,17 +349,6 @@ impl core::fmt::Display for HandshakeError {
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for HandshakeError {}
 
-// From implementations for common underlying errors
-impl From<crate::TightBeamError> for HandshakeError {
-	fn from(e: crate::TightBeamError) -> Self {
-		match e {
-			crate::TightBeamError::InvalidMetadata => HandshakeError::InvalidState,
-			crate::TightBeamError::InvalidOverflowValue => HandshakeError::RandomGenerationFailed,
-			_ => HandshakeError::InvalidState, // Default fallback
-		}
-	}
-}
-
 impl From<crate::crypto::kdf::KdfError> for HandshakeError {
 	fn from(_: crate::crypto::kdf::KdfError) -> Self {
 		HandshakeError::KeyDerivationFailed(crate::crypto::aead::Error)

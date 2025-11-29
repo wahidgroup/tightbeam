@@ -142,6 +142,12 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	CompressionError(CompressionError),
 
+	/// Error during handshake operations
+	#[cfg(feature = "transport")]
+	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	HandshakeError(crate::transport::handshake::HandshakeError),
+
 	#[cfg(feature = "transport")]
 	#[cfg_attr(feature = "derive", error("Transport error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -326,6 +332,8 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingResponse => write!(f, "Missing response"),
 			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
 			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),
+			#[cfg(feature = "transport")]
+			TightBeamError::HandshakeError(err) => write!(f, "Handshake error: {err}"),
 			#[cfg(feature = "colony")]
 			TightBeamError::DroneError(err) => write!(f, "Drone error: {err}"),
 			#[cfg(feature = "std")]

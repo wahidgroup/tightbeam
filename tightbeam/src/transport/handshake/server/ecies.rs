@@ -360,6 +360,7 @@ where
 		if decrypted_payload.len() != 64 {
 			return Err(HandshakeError::InvalidDecryptedPayloadSize);
 		}
+
 		let mut base_session_key = [0u8; 32];
 		let mut client_random_from_payload = [0u8; 32];
 

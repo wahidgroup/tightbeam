@@ -398,7 +398,7 @@ where
 			<P::Profile as SecurityProfile>::KEY_WRAP_OID.ok_or(HandshakeError::MissingKeyWrapAlgorithm)?;
 		let key_enc_alg = AlgorithmIdentifierOwned { oid: key_wrap_oid, parameters: None };
 
-		let kari_builder = TightBeamKariBuilder::new(self.provider.clone())
+		let kari_builder = TightBeamKariBuilder::new(self.provider)
 			.with_sender_priv(sender_ephemeral)
 			.with_sender_pub_spki(sender_pub_spki)
 			.with_recipient_pub(server_public_key)

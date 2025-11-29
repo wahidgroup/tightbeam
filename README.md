@@ -280,7 +280,8 @@ pub trait SecurityProfile {
 	type SignatureAlg: SignatureAlgorithmIdentifier;
 	type CurveOid: AssociatedOid;
 	type KemOid: AssociatedOid;
-	const KEY_WRAP_OID: Option<ObjectIdentifier>;
+	
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
 }
 ```
 
@@ -315,7 +316,8 @@ impl SecurityProfile for MyAppProfile {
 	type SignatureAlg = Secp256k1Signature;
 	type CurveOid = Secp256k1Oid;
 	type KemOid = Kyber1024Oid;
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
+	
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
 ```
 
@@ -332,7 +334,8 @@ impl SecurityProfile for TightbeamProfile {
 	type SignatureAlg = Secp256k1Signature;
 	type CurveOid = Secp256k1Oid;
 	type KemOid = Kyber1024Oid;
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP_OID);
+	
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
 ```
 
@@ -481,6 +484,7 @@ cryptographic implementations to `SecurityProfile` metadata:
 ```rust
 pub trait CryptoProvider:
 	Default +
+	Copy + // zero-sized type (ZST),
 	DigestProvider +
 	AeadProvider +
 	SigningProvider +
@@ -1389,20 +1393,14 @@ tightbeam::policy! {
 **Composing Policies:**
 
 ```rust
-// Server-side
-let listener = TokioListener::bind_with_policies(
-	addr,
-	ServerPolicies::default()
-		.with_collector_gate(vec![Box::new(IdPatternGate)])
-)?;
+// Client-side with policies
+let builder = ClientBuilder::<TokioListener>::builder()
+	.with_emitter_gate(IdPatternGate)
+	.with_collector_gate(PriorityGate)
+	.with_restart(RestartLinearBackoff::new(3, 1000, 1, None))
+	.build();
 
-// Client-side
-let client = TcpTransport::connect_with_policies(
-	addr,
-	ClientPolicies::default()
-		.with_emitter_gate(vec![Box::new(PriorityGate)])
-		.with_restart(RestartLinearBackoff::new(3, 1000, 1, None))
-)?;
+let mut client = builder.connect(addr).await?;
 ```
 
 ### 8.5 Handshake Protocols
@@ -1727,15 +1725,15 @@ Client                              Server
 ```rust
 // Client offers supported profiles
 let security_offer = SecurityOffer {
-	supported_profiles: vec![
-		ProfileDescriptor { /* SHA3-256 + AES-256-GCM + secp256k1 */ },
-		ProfileDescriptor { /* SHA-256 + AES-128-GCM + P-256 */ },
+	profiles: vec![
+		SecurityProfileDesc { /* SHA3-256 + AES-256-GCM + secp256k1 */ },
+		SecurityProfileDesc { /* SHA-256 + AES-128-GCM + P-256 */ },
 	],
 };
 
 // Server selects first mutually supported profile
 let security_accept = SecurityAccept {
-	selected_profile: ProfileDescriptor { /* chosen profile */ },
+	profile: SecurityProfileDesc { /* chosen profile */ },
 };
 ```
 
@@ -1766,23 +1764,23 @@ let security_accept = SecurityAccept {
 ### 8.6 Connection Pooling
 
 Connection pooling enables efficient connection reuse across multiple requests, 
-eliminating redundant TLS handshakes. Both `ClientBuilder` and `ConnectionPool` 
-implement the `Client` trait, providing identical builder APIs.
+eliminating redundant TLS handshakes. `ConnectionPool` uses a builder pattern 
+where the pool is configured once via `.builder()`, then `.connect()` retrieves 
+connections from the configured pool.
 
 **Example**:
 
 ```rust
-// Create shared pool (once per application)
-let pool = Arc::new(ConnectionPool::<TokioListener, 3>::new(PoolConfig::default()));
-
-// Use pooled client (identical API to ClientBuilder)
-let mut client = pool
-	.connect(server_addr)
+// Create shared pool with configuration (once per application)
+let pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+	.with_config(PoolConfig::default())
 	.with_server_certificate(SERVER_CERT)?
 	.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 	.with_timeout(Duration::from_millis(5000))
-	.build()
-	.await?;
+	.build());
+
+// Get connection from pool
+let mut client = pool.connect(server_addr).await?;
 
 client.emit(frame, None).await?;
 // Connection automatically returned to pool on drop

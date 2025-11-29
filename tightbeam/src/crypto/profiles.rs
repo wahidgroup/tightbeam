@@ -347,7 +347,7 @@ pub trait KemProvider {
 	feature = "ecdh"
 ))]
 pub trait CryptoProvider:
-	Default + Clone + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider // + KemProvider
+	Default + Copy + DigestProvider + AeadProvider + SigningProvider + KdfProvider + CurveProvider // + KemProvider
 {
 	type Profile: SecurityProfile + Default;
 	fn profile(&self) -> &Self::Profile;
