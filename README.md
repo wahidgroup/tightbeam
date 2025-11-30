@@ -433,6 +433,9 @@ let frame = compose::<SecureMessage>(Version::V1)
 	.build()?;
 ```
 
+> Note: All tightbeam macros are entirely optional and contain underlying
+	functionality and traits for direct/manual implementation.
+
 **Validation Rules**:
 - `with_message_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
 - `with_witness_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
@@ -1764,10 +1767,9 @@ let security_accept = SecurityAccept {
 
 ### 8.6 Connection Pooling
 
-Connection pooling enables efficient connection reuse across multiple requests, 
-eliminating redundant TLS handshakes. `ConnectionPool` uses a builder pattern 
-where the pool is configured once via `.builder()`, then `.connect()` retrieves 
-connections from the configured pool.
+Connection pooling enables efficient connection reuse across multiple requests. 
+`ConnectionPool` uses a builder pattern where the pool is configured once 
+via `.builder()`, then `.connect()` retrieves connections from the pool.
 
 **Example**:
 
@@ -1789,8 +1791,7 @@ client.emit(frame, None).await?;
 
 **Configuration**:
 - `N`: Max connections per destination (const generic)
-- `PoolConfig::idle_timeout`: Optional connection expiration (default: None/infinite)
-- Health checks occur on acquire (lazy, zero overhead when idle)
+- `PoolConfig::idle_timeout`: Optional connection expiration (default: None)
 
 ### 8.7 Audit
 
@@ -1868,8 +1869,50 @@ they do not have access to the full Frame nor should they need it.
 
 ##### Testing
 
-Testing patterns for workers are shown in §13.1, which provides a complete
-`tb_scenario!`-based integration example for `PingPongWorker`.
+Workers can be tested using the `tb_scenario!` macro with `environment Worker`:
+
+```rust
+use tightbeam::{tb_scenario, tb_assert_spec, exactly, worker};
+
+tb_assert_spec! {
+	pub PingPongSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("worker_called", exactly!(1)),
+			("response_received", exactly!(1), equals!("pong"))
+		]
+	}
+}
+
+tb_scenario! {
+	name: test_ping_pong_worker,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(PingPongSpec::latest())
+		.build(),
+	environment Worker {
+		setup: |_trace| {
+			PingPongWorker::new(PingPongWorkerConf {
+				response: "pong",
+			})
+		},
+		stimulus: |trace, worker| async move {
+			trace.event_with("worker_called", &[], ())?;
+			
+			let request = RequestMessage { content: "ping".to_string() };
+			let response = worker.relay(Arc::new(request)).await?;
+			
+			trace.event_with("response_received", &[], response.result)?;
+			Ok(())
+		}
+	}
+}
+```
+
+The `environment Worker` syntax provides:
+- `setup`: Creates the worker instance with its configuration
+- `stimulus`: Sends a message to the worker via `relay()` and validates the response
 
 #### 9.3.2 E: Servlets
 
@@ -1959,7 +2002,8 @@ When workers are added to a servlet via `ServletConf::builder().with_worker(work
 - Workers inherit the servlet's trace collector for instrumentation
 - All worker events are captured in the servlet's trace
 
-For standalone worker testing (outside servlets), use the `Worker` trait's `start()` method explicitly:
+For standalone worker testing (outside servlets), use the `Worker` trait's 
+`start()` method explicitly:
 ```rust
 let worker = MyWorker::new(config);
 let trace = Arc::new(TraceCollector::new());
@@ -1969,13 +2013,7 @@ let started_worker = worker.start(trace).await?;
 **Efficient Parallel Worker Processing**
 
 Workers accept `Arc<Input>` instead of owned `Input` to enable efficient
-parallel processing without cloning message data. When calling multiple workers
-in parallel:
-
-- `Arc::new(decoded)` creates a single shared reference-counted pointer to the message
-- `Arc::clone(&decoded_arc)` increments the reference count (cheap operation, no data copying)
-- Multiple workers can process the same message data concurrently
-- `tokio::join!` executes all worker relays in parallel
+parallel processing. When calling multiple workers in parallel:
 
 **Example using `tokio::join!`:**
 ```rust
@@ -1988,8 +2026,69 @@ let (result1, result2) = tokio::join!(
 
 ##### Testing
 
-A complete `tb_scenario!` example for servlets (including workers and client
-code) is given in §13.1.
+Servlets with workers can be tested using `environment Servlet`:
+
+```rust
+use tightbeam::{tb_scenario, tb_assert_spec, exactly, servlet, worker};
+
+tb_assert_spec! {
+	pub CalcServletSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("servlet_receive", exactly!(1)),
+			("worker_process", exactly!(1)),
+			("servlet_respond", exactly!(1)),
+			("result_verified", exactly!(1), equals!(10u32))
+		]
+	}
+}
+
+tb_scenario! {
+	name: test_calc_servlet,
+	config: ScenarioConf::<CalcServletConf>::builder()
+		.with_spec(CalcServletSpec::latest())
+		.with_env_config(CalcServletConf { multiplier: 2 })
+		.build(),
+	environment Servlet {
+		servlet: CalcServlet,
+		start: |trace, config| async move {
+			let worker = DoublerWorker::new(());
+			
+			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
+				.with_config(config)
+				.with_worker(worker)
+				.build();
+			
+			CalcServlet::start(trace, Some(servlet_conf)).await
+		},
+		setup: |servlet_addr, _config| async move {
+			let builder = ClientBuilder::<TokioListener>::builder().build();
+			let client = builder.connect(servlet_addr).await?;
+			Ok(client)
+		},
+		client: |trace, mut client, _config| async move {
+			let request = compose! {
+				V0: id: b"calc-req",
+					message: CalcRequest { value: 5 }
+			}?;
+			
+			let response_frame = client.emit(request, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+			let response: CalcResponse = decode(&response_frame.message)?;
+			
+			trace.event_with("result_verified", &[], response.result)?;
+			Ok(())
+		}
+	}
+}
+```
+
+The `environment Servlet` syntax provides:
+- `start`: Configures and starts the servlet with workers
+- `setup`: Creates the client connection to the servlet
+- `client`: Sends requests and validates responses via trace events
 
 #### 9.3.3 C: Clusters - WIP
 
@@ -2538,8 +2637,7 @@ specifications participate in timing and schedulability verification via the
 `clocks`, `timing` and `schedulability` blocks shown in §10.3.2. Timing
 constraints (WCET, deadlines, jitter, slack) and task periods are combined into
 task sets that are checked using Rate Monotonic or Earliest Deadline First
-analysis. See §10.2.9 for a complete overview of timing and schedulability
-semantics.
+analysis.
 
 #### 10.3.6 Process Composition: tb_compose_spec!
 
@@ -2551,8 +2649,7 @@ standard parallel composition operators:
 - **Synchronized**: All shared events synchronize (`P || Q`)
 - **Interleaved**: No synchronization, pure interleaving (`P ||| Q`)
 - **Interface**: Synchronize on an explicit event set (`P [| A |] Q`)
-- **Alphabetized**: Per-process alphabets with synchronization on intersection
-  (`P [| αP | αQ |] Q`)
+- **Alphabetized**: Per-process alphabets with synchronization on intersection (`P [| αP | αQ |] Q`)
 
 The `tb_compose_spec!` macro generates a type that implements `CompositionSpec`
 and, via a blanket impl, `ProcessSpec`, so it can be used anywhere a process
@@ -2688,7 +2785,7 @@ fdr: FdrConfig {
 
 #### 10.4.3 Implementation Examples
 
-**Simple Working Example**:
+**Simple Example**:
 ```rust
 // Define a simple two-state process
 tb_process_spec! {
@@ -2966,23 +3063,30 @@ hooks {
 }
 ```
 
-**Projection**: Extract observable or hidden event subsequences for analysis:
+**Trace Analysis in Hooks**: Query process behavior and event sequences:
 ```rust
-let observable = trace.project_to_observable();
-// ["connect", "request", "response", "disconnect"]
+use tightbeam::testing::fdr::FdrTraceExt;
 
-let hidden = trace.project_to_hidden();
-// ["serialize", "encrypt", "decrypt", "deserialize"]
-```
+hooks {
+	on_pass: |context| {
+		// Acceptance queries: Check what events are accepted at specific states
+		if let Some(acceptance) = context.trace.acceptance_at("Connected") {
+			// At Connected state, process accepts "serialize"
+			assert!(acceptance.iter().any(|e| e.0 == "serialize"));
+		}
 
-**Acceptance/Refusal queries**: Inspect process behavior at specific states:
-```rust
-if let Some(acceptance) = trace.acceptance_at("Connected") {
-    assert!(acceptance.contains(&Event("request")));
+		// Refusal queries: Verify process can refuse events not in acceptance set
+		// At Connected, process must do "serialize" before "request"
+		assert!(context.trace.can_refuse_after("Connected", "request"));
+		assert!(context.trace.can_refuse_after("Connected", "disconnect"));
+
+		Ok(())
+	}
 }
-
-assert!(!trace.can_refuse_after("Connected", "request"));
 ```
+
+These queries enable CSP-style reasoning about process behavior at specific 
+states, validating that the implementation matches the formal specification.
 
 ### 10.6 Fault Injection
 
@@ -3019,7 +3123,7 @@ InjectionStrategy::Deterministic
 ```rust
 InjectionStrategy::Random
 ```
-- Linear Congruential Generator with seed
+- Linear Congruential Generator (LCG) with seed
 - Statistical coverage analysis
 - Same seed produces same fault sequence
 
@@ -3268,16 +3372,15 @@ This test verifies:
 Hooks provide optional callbacks that can observe and override test outcomes:
 
 - Configured via `.with_hooks(TestHooks { on_pass: Some(...), on_fail: Some(...) })`
-  in the `ScenarioConf` builder.
+	in the `ScenarioConf` builder.
 - Each hook is a closure wrapped in `Arc`, of type
-  `Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>` for `on_pass`
-  and `Arc<dyn Fn(&HookContext, &SpecViolation) -> Result<(), TightBeamError> + Send + Sync>` for `on_fail`.
+	`Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>` for `on_pass`
+	and `Arc<dyn Fn(&HookContext, &SpecViolation) -> Result<(), TightBeamError> + Send + Sync>` for `on_fail`.
 - `Ok(())` means the hook accepts the outcome and the test passes.
-- `Err(e)` means the hook rejects the outcome and the test fails, with
-  `e.to_string()` reported as the failure message.
-- Hooks receive `HookContext` containing the consumed trace, FDR verdict (if enabled),
-  FDR config, process spec, timing constraints, and assertion spec, allowing inspection
-  of all verification results.
+- `Err(e)` means the hook rejects the outcome and the test fails
+- Hooks receive `HookContext` containing the consumed trace, FDR verdict 
+	(if enabled), process spec, timing constraints, and assertion spec, allowing 
+	inspection of all verification results.
 
 ### 10.8 Coverage-Guided Fuzzing with AFL
 
@@ -3299,10 +3402,10 @@ AFL-compatible fuzz targets that leverage the oracle for guided exploration:
 
 ```rust
 tb_scenario! {
-	fuzz: afl,              // ← AFL fuzzing mode
+	fuzz: afl,                        // ← AFL fuzzing mode
 	config: ScenarioConf::builder()
 		.with_spec(MySpec::latest())
-		.with_csp(MyProcess)   // ← oracle for valid state navigation
+		.with_csp(MyProcess)          // ← oracle for valid state navigation
 		.build(),
 	environment Bare {
 		exec: |trace| {
@@ -3403,7 +3506,7 @@ cargo install cargo-afl
 ```bash
 # Build fuzz targets first
 # Note: Some fuzz targets may require additional features
-RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing --features "std,testing-csp"
+RUSTFLAGS="--cfg fuzzing" cargo afl build --test fuzzing --features "std,testing-csp,testing-fuzz"
 
 # Create seed input directory
 mkdir -p fuzz_in
@@ -3591,10 +3694,8 @@ are exercised and tested.
 **tightbeam Support**:
 - Per-transition fault injection models SEUs at the CSP state machine level
 - FDR exploration traces fault propagation through the state space
-- `CompositionSpec` (§10.3.6) enables hierarchical fault tree modeling via CSP
-  parallel composition
-- Instrumentation events (§11) capture fault propagation sequences for post-hoc
-  analysis
+- `CompositionSpec` (§10.3.6) enables hierarchical fault tree modeling via CSP parallel composition
+- Instrumentation events (§11) capture fault propagation sequences for post-hoc analysis
 
 #### 10.10.4 Common Criteria EAL7
 
@@ -3602,14 +3703,10 @@ are exercised and tested.
 and complete attack/failure tree coverage.
 
 **tightbeam Support**:
-- CSP formal semantics with trace/failures/divergence refinement checking
-  (§10.4)
-- Instrumentation evidence artifacts tagged with RFC 8141-compliant URNs
-  (§12.1.1)
-- `FdrVerdict` provides machine-readable witnesses to violations 
-  (trace/failure/divergence witnesses)
-- Process specifications export to standard CSP notations for external tool
-  verification
+- CSP formal semantics with trace/failures/divergence refinement checking (§10.4)
+- Instrumentation evidence artifacts tagged with RFC 8141-compliant URNs (§12.1.1)
+- `FdrVerdict` provides machine-readable witnesses to violations (trace/failure/divergence witnesses)
+- Process specifications export to standard CSP notations for external tool verification
 
 #### 10.10.5 FMEA/FMECA (MIL-STD-1629, ISO 26262)
 
@@ -3618,17 +3715,16 @@ and calculate Risk Priority Numbers (RPN) based on Severity × Occurrence ×
 Detection ratings.
 
 **tightbeam Support**:
-- `FmeaConfig` with configurable severity scales (`MilStd1629`, `Iso26262`)
-  and RPN thresholds (default: 100)
-- Auto-generated `FmeaReport` from FDR verdicts via `fmea_config` field,
-  containing:
+- `FmeaConfig` with configurable severity scales (`MilStd1629`, `Iso26262`) 
+	and RPN thresholds (default: 100)
+- Auto-generated `FmeaReport` from FDR verdicts via `fmea_config` field, containing:
   - `failure_modes`: enumerated failure modes with severity/occurrence/detection
   - `total_rpn`: aggregate risk priority
   - `critical_failures`: indices of failures exceeding RPN threshold
 - `FaultModel::with_fault()` allows precise failure mode specification with
-  error factories and injection probabilities
+	error factories and injection probabilities
 - `FdrVerdict::faults_injected` records all injected faults with CSP context
-  for traceability
+	for traceability
 
 **Automatic FMEA Calculation**:
 
@@ -3653,10 +3749,8 @@ from FDR exploration results using CSP-based criticality analysis:
    - ISO 26262: `probability_bps / 2500` (0-10000 → 1-4)
 
 3. **Detection** (calculated from error recovery statistics):
-   - Based on `FdrVerdict::error_recovery_successful` vs
-     `error_recovery_failed` counts
-   - Inverted success rate: high recovery = low detection number (easily
-     detected)
+   - Based on `FdrVerdict::error_recovery_successful` vs `error_recovery_failed` counts
+   - Inverted success rate: high recovery = low detection number (easily detected)
    - 100% recovery success → Detection = 1 (easily detected/recoverable)
    - 0% recovery success → Detection = max scale (undetectable/unrecoverable)
 
@@ -3778,10 +3872,12 @@ Runtime values captured under `assert_payload` MUST be transformed before emissi
 - Representation: First 32 bytes (full SHA3‑256 output) MUST be stored; NO truncation below 32 bytes.
 - Literal integers MAY be emitted directly as 64‑bit unsigned values IF NOT sensitive.
 - Structured values SHOULD emit a static schema tag plus digest.
-Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
+
+> Warning: Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
 
 ### 11.5 Configuration
-Instrumentation behavior MUST be controlled by a configuration object (conceptual fields). Configuration existence itself is gated by `instrument`:
+Instrumentation behavior MUST be controlled by a configuration object 
+(conceptual fields). Configuration existence itself is gated by `instrument`:
 ```rust
 TbInstrumentationConfig {
 	enable_payloads: bool,
@@ -3802,14 +3898,17 @@ Defaults (instrument only):
 - `record_durations = false`
 - `max_events = 1024`
 
-Layer Interaction (informative): Enabling testing layers does NOT alter these defaults; tests MAY explicitly override fields per scenario.
+Layer Interaction (informative): Enabling testing layers does NOT alter these 
+defaults; tests MAY explicitly override fields per scenario.
 
-If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, emit a single `warn` event, and drop subsequent events.
+If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, 
+emit a single `warn` event, and drop subsequent events.
 
 ### 11.6 Evidence Artifact Format
-For every finalized trace an artifact MUST be producible in a canonical binary form (DER).
+For every finalized trace an artifact MUST be producible in a canonical binary 
+form (ASN.1 DER).
 
-Canonical DER Schema (conceptual):
+Canonical ASN.1 DER Schema (conceptual):
 ```
 EvidenceArtifact ::= SEQUENCE {
 	specHash   OCTET STRING,               -- SHA3-256(spec definition)
@@ -3895,14 +3994,16 @@ let filter = LogFilter::new(LogLevel::Warning)
 ```rust
 use tightbeam::trace::{TraceCollector, logging::*};
 
-let config = LoggerConfig::new(
-	Box::new(StdoutBackend),
-	LogFilter::new(LogLevel::Info)
-).with_default_level(LogLevel::Info);
+let backend = Box::new(StdoutBackend);
+let filter = LogFilter::new(LogLevel::Warning);
+let config = LoggerConfig::new(backend, filter)
+	.with_default_level(LogLevel::Info);
 
 let trace = TraceCollector::default().with_logger(config);
 trace.event("msg")?.with_log_level(LogLevel::Error).emit();
 ```
+
+> Note: The event emit may be ellided as events are emitted on drop.
 
 ## 12. Misc
 
@@ -3914,15 +4015,14 @@ tightbeam provides a small `utils` module family for cross-cutting concerns.
 
 The URN subsystem provides:
 
-- `Urn<'a>`: RFC 8141-compliant `urn:<nid>:<nss>` representation using
-  `Cow<'a, str>` for zero-copy handling and DER encoding support.
-- `UrnBuilder`: a fluent builder for constructing and validating URNs from
-  either a raw NID/NSS or structured components.
-- `UrnSpec` / `UrnValidationError`: traits and error types for namespace‑specific
-  validation logic.
-- `tightbeam::utils::urn::specs::TightbeamUrnSpec`: a built‑in spec for
-  instrumentation URNs of the form
-  `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
+- `Urn<'a>`: RFC 8141-compliant `urn:<nid>:<nss>` representation.
+- `UrnBuilder`: a fluent builder for constructing and validating URNs from 
+	either a raw NID/NSS or structured components.
+- `UrnSpec` / `UrnValidationError`: traits and error types for 
+	namespace‑specific validation logic.
+- `tightbeam::utils::urn::specs::TightbeamUrnSpec`: a built‑in spec for 
+	instrumentation URNs of the form
+	`urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
 
 `TightbeamUrnSpec` constrains:
 
@@ -3955,7 +4055,7 @@ fn build_customer_urn() -> Result<(), UrnValidationError> {
 
 ## 13. End-to-End Examples
 
-This section contains complete, runnable examples demonstrating real-world usage patterns.
+This section contains complete, runnable examples demonstrating usage patterns.
 
 ### 13.1 Complete Client-Server Application
 
@@ -4102,7 +4202,10 @@ tb_scenario! {
 					lucky_number,
 				};
 
-				compose! { V0: id: b"test-ping", message: message }
+				compose! { 
+					V0: id: b"test-ping", 
+						message: message 
+				}
 			}
 
 			// Client-side assertion before sending
