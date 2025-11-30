@@ -49,7 +49,7 @@ impl ChainProcessor {
 	}
 
 	/// Process incoming frame: persist, order, validate chain
-	pub fn process_incoming(&self, frame: Frame) -> Result<ProcessResult, TightBeamError> {
+	pub fn process_incoming(&self, frame: &Frame) -> Result<ProcessResult, TightBeamError> {
 		// 1. Persist frame
 		let mut store_guard = self.store.write()?;
 		store_guard.persist(&frame)?;
@@ -57,7 +57,7 @@ impl ChainProcessor {
 		drop(store_guard);
 
 		// 2. Insert into ordering buffer
-		let frames_to_process = self.order_buffer.write()?.insert(frame)?;
+		let frames_to_process = self.order_buffer.write()?.insert(frame.clone())?;
 		if let Some(frames) = frames_to_process {
 			// 3. Verify batch integrity before committing to chain state
 			let verdict = self.store.read()?.verify_chain(&frames)?;

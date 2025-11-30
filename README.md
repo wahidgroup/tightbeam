@@ -1814,11 +1814,11 @@ the basics of processing and communication, we can start at these base levels
 and develop from here. The goal of EECI is to operate on these base layers
 across any transmission protocol:
 - thread-thread.
-- thread-port-thread.
+- thread-protocol-thread.
 
 ### 9.3 Components
 
-There are four main components to the EECI:
+There are four main components to EECI:
 - [Workers](#931-e-workers) - Efficient processing units
 - [Servlets](#932-e-servlets) - Exchange endpoints
 - [Clusters](#933-c-clusters) - Compute orchestration
@@ -1858,7 +1858,7 @@ tightbeam::worker! {
 Not unlike supraorganisms, we can name them, and their "head" may possess
 a specific configuration (config). They may or may not have receptors which
 can be used to optionally gate messages. The "thorax" is itself the container
-for which isolates the entity within its own scoped thread--locality. Finally,
+which isolates the entity within its own scoped thread--locality. Finally,
 its "abdomen" is the handle which digests the message and produces a response.
 
 The important thing to note is that workers operate on local information
@@ -1866,6 +1866,9 @@ within their bounded scope. They are not aware of the larger system and only
 operate on the message they are given. This is a critical aspect of the EECI
 and allows for a high degree of parallelism and fault tolerance. As a result,
 they do not have access to the full Frame nor should they need it.
+
+> Note: It is highly discouraged to workaround the Frame limitation by passing
+	the Frame in a message parameter.
 
 ##### Testing
 
@@ -1923,6 +1926,10 @@ define as many different workers as it needs to accomplish its task as well
 as a set of configurations. Servlets must be provided a relay which is used to
 relay `Message` types to the worker without the entire Frame. A servlet must
 only be responsible for a single message type.
+
+> Note: Servlets must only be responsible for a single message type however,
+	using an ASN.1 Choice type allows for related concerns to be handled
+	within the same servlet.
 
 **Step 1**: Define configuration struct outside the macro:
 

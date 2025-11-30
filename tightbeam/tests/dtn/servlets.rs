@@ -11,7 +11,6 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use tightbeam::{
-	asn1::MessagePriority,
 	compress::{Inflator, ZstdCompression},
 	crypto::{
 		aead::Aes256Gcm,
@@ -29,8 +28,14 @@ use crate::dtn::{
 	clock::mission_time_ms,
 	fault_manager::FaultManager,
 	frame_builder::FrameBuilderHelper,
-	messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverCommand},
-	workers::{command_execution::CommandExecutionWorker, messages::CommandExecutionRequest},
+	messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage},
+	workers::{
+		command_ack_handler::{CommandAckHandlerRequest, CommandAckHandlerWorker},
+		frame_request_handler::{FrameRequestAction, FrameRequestHandlerRequest, FrameRequestHandlerWorker},
+		frame_response_handler::{FrameResponseHandlerRequest, FrameResponseHandlerWorker},
+		mission_control_telemetry_handler::{MissionControlTelemetryHandlerWorker, TelemetryHandlerRequest},
+		rover_command_handler::{RoverCommandHandlerRequest, RoverCommandHandlerWorker},
+	},
 };
 
 // ============================================================================
@@ -46,7 +51,7 @@ trait DtnNode {
 	fn chain_processor(&self) -> &Arc<ChainProcessor>;
 	fn frame_builder(&self) -> &Arc<FrameBuilderHelper>;
 
-	// Default trait methods (reusable across all nodes)
+	/// Default trait methods (reusable across all nodes)
 	fn verify_signature(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		if frame.nonrepudiation.is_none() {
 			return Ok(false);
@@ -59,6 +64,7 @@ trait DtnNode {
 		Ok(false)
 	}
 
+	/// Helper: Decrypt relay message
 	fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
 		if frame.metadata.confidentiality.is_some() {
 			let inflator: Option<&dyn Inflator> = if frame.metadata.compactness.is_some() {
@@ -72,7 +78,7 @@ trait DtnNode {
 		}
 	}
 
-	// Send frame using pre-configured connection pool
+	/// Send frame using pre-configured connection pool
 	async fn send_frame(
 		&self,
 		pool: &Arc<ConnectionPool<TokioListener, 3>>,
@@ -81,98 +87,6 @@ trait DtnNode {
 	) -> Result<Option<Frame>, TightBeamError> {
 		let mut client = pool.connect(addr).await?;
 		Ok(client.emit(frame, None).await?)
-	}
-
-	// Gap recovery with pooling
-	async fn handle_frame_request(
-		&self,
-		request: FrameRequest,
-		trace: &TraceCollector,
-		cascade_target: Option<(&Arc<ConnectionPool<TokioListener, 3>>, TightBeamSocketAddr)>,
-	) -> Result<Option<Frame>, TightBeamError> {
-		trace.event(format!("{}_receive_frame_request", self.node_name()))?;
-
-		let missing_frames = self
-			.chain_processor()
-			.request_missing_frames(&request.requester_head, &request.last_received_hash)?;
-
-		if !missing_frames.is_empty() {
-			trace.event(format!("{}_send_frame_response", self.node_name()))?;
-
-			let response = FrameResponse { frames: missing_frames };
-			let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
-			let response_frame = self.frame_builder().build_frame_response_frame(
-				response,
-				order,
-				prev_digest,
-				self.signing_key(),
-				self.cipher(),
-			)?;
-
-			self.chain_processor().finalize_outgoing(&response_frame)?;
-			Ok(Some(response_frame))
-		} else if let Some((pool, addr)) = cascade_target {
-			trace.event(format!("{}_cascade_frame_request", self.node_name()))?;
-
-			let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
-			let cascade_frame = self.frame_builder().build_frame_request_frame(
-				request,
-				order,
-				prev_digest,
-				self.signing_key(),
-				self.cipher(),
-			)?;
-
-			self.chain_processor().finalize_outgoing(&cascade_frame)?;
-			self.send_frame(pool, addr, cascade_frame).await?;
-			Ok(None)
-		} else {
-			Ok(None)
-		}
-	}
-
-	fn handle_frame_response(&self, response: FrameResponse, trace: &TraceCollector) -> Result<(), TightBeamError> {
-		trace.event(format!("{}_receive_frame_response", self.node_name()))?;
-
-		for frame in response.frames {
-			self.chain_processor().process_incoming(frame)?;
-		}
-
-		Ok(())
-	}
-
-	// Helper: Process FrameResponse and return stateless ACK
-	fn process_frame_response(
-		&self,
-		response: FrameResponse,
-		frame_order: u64,
-		trace: &TraceCollector,
-	) -> Result<Option<Frame>, TightBeamError> {
-		self.handle_frame_response(response, trace)?;
-		let stateless_ack = self.frame_builder().build_stateless_ack_frame(frame_order)?;
-		Ok(Some(stateless_ack))
-	}
-
-	// Helper: Build and send FrameResponse for gap recovery
-	fn build_and_send_frame_response(
-		&self,
-		missing_frames: Vec<Frame>,
-		trace: &TraceCollector,
-	) -> Result<Frame, TightBeamError> {
-		trace.event(format!("{}_send_frame_response", self.node_name()))?;
-
-		let response = FrameResponse { frames: missing_frames };
-		let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
-		let response_frame = self.frame_builder().build_frame_response_frame(
-			response,
-			order,
-			prev_digest,
-			self.signing_key(),
-			self.cipher(),
-		)?;
-
-		self.chain_processor().finalize_outgoing(&response_frame)?;
-		Ok(response_frame)
 	}
 
 	async fn handle_chain_gap(
@@ -238,79 +152,94 @@ pub struct MissionControlServletConf {
 	pub frame_builder: Arc<FrameBuilderHelper>,
 	pub earth_relay_addr: TightBeamSocketAddr,
 	pub earth_relay_pool: Arc<ConnectionPool<TokioListener, 3>>,
-	pub shared_mission_state: Arc<RwLock<MissionState>>,
 }
 
 servlet! {
 	/// Mission Control receives telemetry and sends commands to Rover via relays
 	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, _workers| async move {
+	handle: |frame, trace, config, workers| async move {
+		let frame_order = frame.metadata.order;
+
 		// Verify signature using trait method
 		if !config.verify_signature(&frame)? {
 			return Err(TightBeamError::MissingSignature);
 		}
 
 		// Process frame (persist, order, validate chain)
-		match config.chain_processor.process_incoming(frame.clone())? {
+		match config.chain_processor.process_incoming(&frame)? {
 			ProcessResult::Processed(ordered_frames) => {
 				for ordered_frame in ordered_frames {
 					// Decrypt and decode using trait method
-					let relay_message = config.decrypt_relay_message(ordered_frame.clone())?;
+					let relay_message = config.decrypt_relay_message(ordered_frame)?;
 					match relay_message {
-						RelayMessage::Telemetry(_) => {
-							trace.event("mission_control_receive_telemetry")?;
-							trace.event("mission_control_analyze_telemetry")?;
+						RelayMessage::Telemetry(telemetry) => {
+							// WORKER: Handle telemetry analysis and command decision
+							let request = TelemetryHandlerRequest { telemetry };
+							let result = workers.relay::<MissionControlTelemetryHandlerWorker>(Arc::new(request)).await??;
+							if result.should_send_command {
+								if let Some(next_cmd) = result.next_command {
+									let (next_order, previous_digest) = config.chain_processor.prepare_outgoing()?;
+									let command = EarthCommand {
+										command_type: next_cmd.command,
+										parameters: next_cmd.parameters,
+										priority: next_cmd.priority,
+										mission_time_ms: mission_time_ms(),
+									};
 
-							// Increment telemetry counter
-							config.shared_mission_state.write()?.telemetry_received_count += 1;
-							let telemetry_count = config.shared_mission_state.read()?.telemetry_received_count;
+									let command_frame = config.frame_builder.build_relay_command_frame(
+										command,
+										next_order,
+										previous_digest,
+										&config.mission_control_signing_key,
+										&config.shared_cipher,
+									)?;
 
-							// Only send next command if we haven't reached the limit
-							// We send 1 initial command + 5 subsequent = 6 total (COMMAND_ROUND_TRIPS)
-							const MAX_COMMANDS: usize = 6;  // COMMAND_ROUND_TRIPS
-							if telemetry_count < MAX_COMMANDS {
-								// Spawn task to send next command
-								let command_type = (telemetry_count % 3) as u8;
-								let rover_cmd = match command_type {
-									0 => RoverCommand::CollectSample { location: "Site Alpha".to_string() },
-									1 => RoverCommand::ProbeLocation { x: 100, y: 200 },
-									_ => RoverCommand::TakePhoto { direction: "North".to_string(), resolution: 1080 },
-								};
-
-								let (next_order, previous_digest) = config.chain_processor.prepare_outgoing()?;
-								let command = EarthCommand::new(rover_cmd, MessagePriority::Normal, mission_time_ms());
-
-								trace.event("mission_control_send_command")?;
-
-								let command_frame = config.frame_builder.build_relay_command_frame(
-									command,
-									next_order,
-									previous_digest,
-									&config.mission_control_signing_key,
-									&config.shared_cipher,
-								)?;
-
-								// Send command via pooled client
-								config.send_frame(
-									&config.earth_relay_pool,
-									config.earth_relay_addr,
-									command_frame,
-								).await?;
+									config.send_frame(
+										&config.earth_relay_pool,
+										config.earth_relay_addr,
+										command_frame,
+									).await?;
+								}
 							}
 						},
-						RelayMessage::CommandAck(_) => {
-							trace.event("mission_control_receive_ack")?;
+						RelayMessage::CommandAck(ack) => {
+							// WORKER: Handle ACK processing
+							let request = CommandAckHandlerRequest { ack };
+							workers.relay::<CommandAckHandlerWorker>(Arc::new(request)).await??;
 						},
 						RelayMessage::FrameRequest(request) => {
-							// Use trait method - Mission Control is origin so no cascade target
-							if let Some(response_frame) = config.handle_frame_request(request, &trace, None).await? {
-								return Ok(Some(response_frame));
+							// WORKER: Decide what to do with frame request
+							let node_name = config.node_name().to_string();
+							let worker_request = FrameRequestHandlerRequest { request, node_name };
+							let result = workers.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
+							match result.action {
+								FrameRequestAction::Respond(_) => {
+									let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+									let response = FrameResponse { frames: result.missing_frames };
+									let response_frame = config.frame_builder.build_frame_response_frame(
+										response,
+										order,
+										prev_digest,
+										&config.mission_control_signing_key,
+										&config.shared_cipher,
+									)?;
+
+									config.chain_processor.finalize_outgoing(&response_frame)?;
+									return Ok(Some(response_frame));
+								},
+								_ => {
+									// NoAction or Cascade (but MC can't cascade)
+								}
 							}
 						},
 						RelayMessage::FrameResponse(response) => {
-							// Use trait method
-							config.handle_frame_response(response, &trace)?;
+							// WORKER: Process frame response and validate chain
+							let request = FrameResponseHandlerRequest {
+								response,
+								node_name: config.node_name().to_string(),
+							};
+							workers.relay::<FrameResponseHandlerWorker>(Arc::new(request)).await??;
 						},
 						RelayMessage::Command(_) => {
 							// Invalid message type
@@ -320,7 +249,7 @@ servlet! {
 				}
 
 				// Return stateless ACK
-				let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame.metadata.order)?;
+				let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
 				Ok(Some(stateless_ack))
 			},
 			ProcessResult::Buffered => Ok(None),
@@ -388,7 +317,7 @@ servlet! {
 	/// Earth Relay forwards messages between Mission Control and Mars Relay
 	pub EarthRelaySatelliteServlet<RelayMessage, EnvConfig = EarthRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, _workers| async move {
+	handle: |frame, trace, config, workers| async move {
 		// Verify signature and determine source
 		let from_mission_control = if frame.nonrepudiation.is_some() {
 			if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
@@ -405,7 +334,7 @@ servlet! {
 		// Get frame order before processing
 		let frame_order = frame.metadata.order;
 		// Process frame through Earth Relay's chain
-		let process_result = match config.chain_processor.process_incoming(frame.clone()) {
+		let process_result = match config.chain_processor.process_incoming(&frame) {
 			Ok(result) => {
 				result
 			},
@@ -419,51 +348,66 @@ servlet! {
 				// Check if any processed frames are gap recovery messages
 				if let Some(ordered_frame) = ordered_frames.into_iter().next() {
 					// Decrypt and decode to check message type
-					let relay_message = config.decrypt_relay_message(ordered_frame.clone())?;
+					let relay_message = config.decrypt_relay_message(ordered_frame)?;
 					match relay_message {
 						RelayMessage::FrameRequest(request) => {
-							trace.event("earth_relay_receive_frame_request")?;
+							// WORKER: Decide what to do with frame request
+							let node_name = config.node_name().to_string();
+							let worker_request = FrameRequestHandlerRequest { request: request.clone(), node_name };
+							let result = workers.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
+							match result.action {
+								FrameRequestAction::Respond(_) => {
+									let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+									let response = FrameResponse { frames: result.missing_frames };
+									let response_frame = config.frame_builder.build_frame_response_frame(
+										response,
+										order,
+										prev_digest,
+										&config.earth_relay_signing_key,
+										&config.shared_cipher,
+									)?;
+									config.chain_processor.finalize_outgoing(&response_frame)?;
+									return Ok(Some(response_frame));
+								},
+								FrameRequestAction::Cascade(_) => {
+									// Servlet builds and sends cascade frame
+									let (cascade_pool, cascade_addr) = if from_mission_control {
+										// Request from MC, cascade to Mars Relay
+										(&config.mars_relay_pool, config.mars_relay_addr)
+									} else {
+										// Request from Mars, cascade to MC (rare but possible)
+										match *config.mission_control_addr.read()? {
+											Some(mc_addr) => (&config.mission_control_pool, mc_addr),
+											None => return Ok(None),
+										}
+									};
 
-							let missing_frames = config.chain_processor.request_missing_frames(
-								&request.requester_head,
-								&request.last_received_hash,
-							)?;
-
-							if !missing_frames.is_empty() {
-								let response_frame = config.build_and_send_frame_response(missing_frames, &trace)?;
-								return Ok(Some(response_frame));
-							} else {
-								// We don't have frames - cascade to upstream
-								trace.event("earth_relay_cascade_frame_request")?;
-
-								let (cascade_pool, cascade_addr) = if from_mission_control {
-									// Request from MC, cascade to Mars Relay
-									(&config.mars_relay_pool, config.mars_relay_addr)
-								} else {
-									// Request from Mars, cascade to MC (rare but possible)
-									match *config.mission_control_addr.read()? {
-										Some(mc_addr) => (&config.mission_control_pool, mc_addr),
-										None => return Ok(None), // MC address not available yet
-									}
-								};
-
-								let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
-								let cascade_frame = config.frame_builder.build_frame_request_frame(
-									request,
-									order,
-									prev_digest,
-									&config.earth_relay_signing_key,
-									&config.shared_cipher,
-								)?;
-
-								config.chain_processor.finalize_outgoing(&cascade_frame)?;
-								config.send_frame(cascade_pool, cascade_addr, cascade_frame).await?;
-
-								return Ok(None); // Cascade is async, no immediate response
+									let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+									let cascade_frame = config.frame_builder.build_frame_request_frame(
+										request,
+										order,
+										prev_digest,
+										&config.earth_relay_signing_key,
+										&config.shared_cipher,
+									)?;
+									config.chain_processor.finalize_outgoing(&cascade_frame)?;
+									config.send_frame(cascade_pool, cascade_addr, cascade_frame).await?;
+									return Ok(None);
+								},
+								_ => {}
 							}
 						},
 						RelayMessage::FrameResponse(response) => {
-							return config.process_frame_response(response, frame_order, &trace);
+							// WORKER: Process frame response and validate chain
+							let worker_request = FrameResponseHandlerRequest {
+								response,
+								node_name: config.node_name().to_string(),
+							};
+							workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
+
+							// Servlet builds ACK
+							let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
+							return Ok(Some(stateless_ack));
 						},
 						_ => {
 							// Regular message - route based on source
@@ -582,7 +526,7 @@ servlet! {
 	/// Mars Relay forwards messages between Earth Relay and Rover
 	pub MarsRelaySatelliteServlet<RelayMessage, EnvConfig = MarsRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, _workers| async move {
+	handle: |frame, trace, config, workers| async move {
 		// Verify signature and determine source
 		// Earth Relay forwards messages, so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation.is_some() {
@@ -600,55 +544,71 @@ servlet! {
 		// Get frame order before processing
 		let frame_order = frame.metadata.order;
 		// Process frame through Mars Relay's chain
-		match config.chain_processor.process_incoming(frame.clone())? {
+		match config.chain_processor.process_incoming(&frame)? {
 			ProcessResult::Processed(ordered_frames) => {
 				// Check if any processed frames are gap recovery messages
 				for ordered_frame in ordered_frames {
 					// Decrypt and decode to check message type
-					let relay_message = config.decrypt_relay_message(ordered_frame.clone())?;
+					let relay_message = config.decrypt_relay_message(ordered_frame)?;
 					match relay_message {
 						RelayMessage::FrameRequest(request) => {
-							trace.event("mars_relay_receive_frame_request")?;
+							// WORKER: Decide what to do with frame request
+							let node_name = config.node_name().to_string();
+							let worker_request = FrameRequestHandlerRequest { request: request.clone(), node_name };
+							let result = workers.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
+							match result.action {
+								FrameRequestAction::Respond(_) => {
+									let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+									let response = FrameResponse { frames: result.missing_frames };
+									let response_frame = config.frame_builder.build_frame_response_frame(
+										response,
+										order,
+										prev_digest,
+										&config.mars_relay_signing_key,
+										&config.shared_cipher,
+									)?;
+									config.chain_processor.finalize_outgoing(&response_frame)?;
+									return Ok(Some(response_frame));
+								},
+								FrameRequestAction::Cascade(_) => {
+									// Servlet builds and sends cascade frame
+									let (cascade_pool, cascade_addr) = if from_rover {
+										// Request from Rover, cascade to Earth Relay
+										match *config.earth_relay_addr.read()? {
+											Some(earth_addr) => (&config.earth_relay_pool, earth_addr),
+											None => return Ok(None),
+										}
+									} else {
+										// Request from Earth, cascade to Rover
+										(&config.rover_pool, config.rover_addr)
+									};
 
-							let missing_frames = config.chain_processor.request_missing_frames(
-								&request.requester_head,
-								&request.last_received_hash,
-							)?;
-
-							if !missing_frames.is_empty() {
-								let response_frame = config.build_and_send_frame_response(missing_frames, &trace)?;
-								return Ok(Some(response_frame));
-							} else {
-								// We don't have frames - cascade to upstream
-								trace.event("mars_relay_cascade_frame_request")?;
-
-								let (cascade_pool, cascade_addr) = if from_rover {
-									// Request from Rover, cascade to Earth Relay
-									match *config.earth_relay_addr.read()? {
-										Some(earth_addr) => (&config.earth_relay_pool, earth_addr),
-										None => return Ok(None), // Earth address not available yet
-									}
-								} else {
-									// Request from Earth, cascade to Rover
-									(&config.rover_pool, config.rover_addr)
-								};
-
-								let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
-								let cascade_frame = config.frame_builder.build_frame_request_frame(
-									request,
-									order,
-									prev_digest,
-									&config.mars_relay_signing_key,
-									&config.shared_cipher,
-								)?;
-
-								config.chain_processor.finalize_outgoing(&cascade_frame)?;
-								config.send_frame(cascade_pool, cascade_addr, cascade_frame).await?;
-								return Ok(None); // Cascade is async, no immediate response
+									let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+									let cascade_frame = config.frame_builder.build_frame_request_frame(
+										request,
+										order,
+										prev_digest,
+										&config.mars_relay_signing_key,
+										&config.shared_cipher,
+									)?;
+									config.chain_processor.finalize_outgoing(&cascade_frame)?;
+									config.send_frame(cascade_pool, cascade_addr, cascade_frame).await?;
+									return Ok(None);
+								},
+								_ => {}
 							}
 						},
 						RelayMessage::FrameResponse(response) => {
-							return config.process_frame_response(response, frame_order, &trace);
+							// WORKER: Process frame response and validate chain
+							let worker_request = FrameResponseHandlerRequest {
+								response,
+								node_name: config.node_name().to_string(),
+							};
+							workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
+
+							// Servlet builds ACK
+							let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
+							return Ok(Some(stateless_ack));
 						},
 						_ => {
 							// Regular message - route based on source
@@ -688,15 +648,10 @@ servlet! {
 					trace.event("mars_relay_receive_from_earth")?;
 					trace.event("mars_relay_forward_to_rover")?;
 
-					let response = config.send_frame(
-						&config.rover_pool,
-						config.rover_addr,
-						frame,
-					).await?;
-
+					let response = config.send_frame(&config.rover_pool, config.rover_addr, frame).await?;
 					if let Some(ack_frame) = response {
 						// Process Rover's ACK into chain and forward to Earth Relay
-						config.chain_processor.process_incoming(ack_frame.clone())?;
+						config.chain_processor.process_incoming(&ack_frame)?;
 
 						// Emit trace event for receiving ACK from Rover (stateful ACK for command)
 						trace.event("mars_relay_receive_ack_from_rover")?;
@@ -704,12 +659,7 @@ servlet! {
 
 						// Forward ACK to Earth Relay using cached client
 						let earth_addr = wait_for_address(&config.earth_relay_addr).await?;
-
-						config.send_frame(
-							&config.earth_relay_pool,
-							earth_addr,
-							ack_frame,
-						).await?;
+						config.send_frame(&config.earth_relay_pool, earth_addr, ack_frame).await?;
 					}
 
 					// Fire-and-forget (no response to Earth Relay)
@@ -790,7 +740,6 @@ pub struct RoverServletConf {
 	// TODO
 	pub _fault_manager: Arc<FaultManager>,
 	pub frame_builder: Arc<FrameBuilderHelper>,
-	pub mission_state: Arc<RwLock<MissionState>>,
 	pub max_rounds: usize,
 }
 
@@ -809,9 +758,8 @@ servlet! {
 
 		// Get command order before consuming frame
 		let command_order = frame.metadata.order;
-
 		// Process frame through Rover's chain
-		match config.chain_processor.process_incoming(frame.clone())? {
+		match config.chain_processor.process_incoming(&frame)? {
 			ProcessResult::Processed(_) => {
 				// Processing accepted
 			},
@@ -836,26 +784,12 @@ servlet! {
 		let relay_message = config.decrypt_relay_message(frame)?;
 		match relay_message {
 			RelayMessage::Command(command) => {
-				trace.event("rover_receive_command")?;
-				trace.event("rover_execute_command")?;
+				let request = RoverCommandHandlerRequest {
+					command,
+					max_rounds: config.max_rounds as u64,
+				};
+				let _result = workers.relay::<RoverCommandHandlerWorker>(Arc::new(request)).await??;
 
-				// Execute command via worker
-				let exec_request = CommandExecutionRequest { command_type: command.command_type };
-				let _exec_result = workers.relay::<CommandExecutionWorker>(Arc::new(exec_request)).await??;
-
-				trace.event("rover_command_complete")?;
-
-				// Update mission state
-				{
-					let mut state = config.mission_state.write()?;
-					state.completed_rounds += 1;
-
-					if state.completed_rounds >= config.max_rounds {
-						state.mission_complete = true;
-					}
-				}
-
-				// Build stateful ACK as response
 				let (ack_order, ack_prev_digest) = config.chain_processor.prepare_outgoing()?;
 				let ack_frame = config.frame_builder.build_relay_ack_frame(
 					command_order,
@@ -866,24 +800,17 @@ servlet! {
 				)?;
 
 				trace.event("rover_send_ack")?;
-
-				// Return stateful ACK as response
 				Ok(Some(ack_frame))
 			},
-			RelayMessage::FrameRequest(request) => {
-				trace.event("rover_receive_frame_request")?;
-
-				let missing_frames = config.chain_processor.request_missing_frames(
-					&request.requester_head,
-					&request.last_received_hash,
-				)?;
-
-				if !missing_frames.is_empty() {
-					// We have the frames - respond
-					trace.event("rover_send_frame_response")?;
-
-					let response = FrameResponse { frames: missing_frames };
+		RelayMessage::FrameRequest(request) => {
+			// WORKER: Decide what to do with frame request
+			let node_name = config.node_name().to_string();
+			let worker_request = FrameRequestHandlerRequest { request, node_name };
+			let result = workers.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
+			match result.action {
+				FrameRequestAction::Respond(_) => {
 					let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
+					let response = FrameResponse { frames: result.missing_frames };
 					let response_frame = config.frame_builder.build_frame_response_frame(
 						response,
 						order,
@@ -891,17 +818,27 @@ servlet! {
 						&config.rover_signing_key,
 						&config.shared_cipher,
 					)?;
-
 					config.chain_processor.finalize_outgoing(&response_frame)?;
 					Ok(Some(response_frame))
-				} else {
-					// Rover is origin - cannot cascade, return None
+				},
+				_ => {
+					// Rover is origin - cannot cascade
 					Ok(None)
 				}
-			},
-			RelayMessage::FrameResponse(response) => {
-				config.process_frame_response(response, command_order, &trace)
-			},
+			}
+		},
+		RelayMessage::FrameResponse(response) => {
+			// WORKER: Process frame response and validate chain
+			let worker_request = FrameResponseHandlerRequest {
+				response,
+				node_name: config.node_name().to_string(),
+			};
+			workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
+
+			// Servlet builds ACK
+			let stateless_ack = config.frame_builder.build_stateless_ack_frame(command_order)?;
+			Ok(Some(stateless_ack))
+		},
 			RelayMessage::Telemetry(_) | RelayMessage::CommandAck(_) => {
 				Ok(None)
 			}
