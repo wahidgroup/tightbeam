@@ -1931,9 +1931,9 @@ tightbeam::servlet! {
 **Step 3**: Configure workers via `ServletConf` when starting the servlet:
 
 ```rust
-// Create workers
-let ping_pong_worker = PingPongWorker::start();
-let lucky_number_worker = LuckyNumberDeterminer::start(LuckyNumberDeterminerConf {
+// Create workers (use ::new, not .start - servlet auto-starts them)
+let ping_pong_worker = PingPongWorker::new(());
+let lucky_number_worker = LuckyNumberDeterminer::new(LuckyNumberDeterminerConf {
 	lotto_number: 42,
 });
 
@@ -1944,8 +1944,26 @@ let servlet_conf = ServletConf::<TokioListener, RequestMessage>::builder()
 	.with_worker(lucky_number_worker)
 	.build();
 
-// Start the servlet
+// Start the servlet (workers are auto-started with servlet's trace)
 PingPongServletWithWorker::start(trace, Some(servlet_conf)).await?
+```
+
+**Worker Lifecycle**
+
+Workers follow a two-phase lifecycle:
+1. **Creation** (`::new(config)` or `::default()`) - Creates the worker in an unstarted state
+2. **Starting** (`.start(trace)`) - Spawns the worker's async task loop with a trace collector
+
+When workers are added to a servlet via `ServletConf::builder().with_worker(worker)`:
+- The servlet automatically calls `.start(trace)` on each worker during servlet startup
+- Workers inherit the servlet's trace collector for instrumentation
+- All worker events are captured in the servlet's trace
+
+For standalone worker testing (outside servlets), use the `Worker` trait's `start()` method explicitly:
+```rust
+let worker = MyWorker::new(config);
+let trace = Arc::new(TraceCollector::new());
+let started_worker = worker.start(trace).await?;
 ```
 
 **Efficient Parallel Worker Processing**
@@ -1962,10 +1980,9 @@ in parallel:
 **Example using `tokio::join!`:**
 ```rust
 let decoded_arc = Arc::new(decoded);
-let trace = Arc::new(trace);
 let (result1, result2) = tokio::join!(
-    workers.worker1.relay(Arc::clone(&trace), Arc::clone(&decoded_arc)),
-    workers.worker2.relay(Arc::clone(&trace), Arc::clone(&decoded_arc))
+    workers.worker1.relay(Arc::clone(&decoded_arc)),
+    workers.worker2.relay(Arc::clone(&decoded_arc))
 );
 ```
 
@@ -4002,7 +4019,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg)).await?;
+			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(pong) = response {
 				trace.event("relay_success")?;
 				trace.event_with("response_result", &[], pong.result)?;
@@ -4016,7 +4033,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let result = worker.relay(Arc::clone(&trace), Arc::new(pong_msg)).await;
+			let result = worker.relay(Arc::new(pong_msg)).await;
 			if result.is_err() {
 				trace.event("relay_rejected")?;
 			}
