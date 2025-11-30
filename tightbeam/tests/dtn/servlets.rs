@@ -27,10 +27,10 @@ use tightbeam::{
 use crate::dtn::{
 	chain_processor::{ChainProcessor, ProcessResult},
 	clock::mission_time_ms,
-	command_executor::CommandExecutor,
 	fault_manager::FaultManager,
 	frame_builder::FrameBuilderHelper,
 	messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage, RoverCommand},
+	workers::{command_execution::CommandExecutionWorker, messages::CommandExecutionRequest},
 };
 
 // ============================================================================
@@ -789,7 +789,6 @@ pub struct RoverServletConf {
 	pub chain_processor: Arc<ChainProcessor>,
 	// TODO
 	pub _fault_manager: Arc<FaultManager>,
-	pub command_executor: Arc<RwLock<CommandExecutor>>,
 	pub frame_builder: Arc<FrameBuilderHelper>,
 	pub mission_state: Arc<RwLock<MissionState>>,
 	pub max_rounds: usize,
@@ -799,7 +798,7 @@ servlet! {
 	/// Mars Rover executes commands and sends telemetry
 	pub RoverServlet<RelayMessage, EnvConfig = RoverServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, _workers| async move {
+	handle: |frame, trace, config, workers| async move {
 		// Verify signature
 		if frame.nonrepudiation.is_some()
 			&& frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_err()
@@ -838,13 +837,11 @@ servlet! {
 		match relay_message {
 			RelayMessage::Command(command) => {
 				trace.event("rover_receive_command")?;
-
-				// Execute command
-				let cmd_type = RoverCommand::try_from(command.command_type)?;
-
 				trace.event("rover_execute_command")?;
 
-				config.command_executor.write()?.execute_command(cmd_type, &trace)?;
+				// Execute command via worker
+				let exec_request = CommandExecutionRequest { command_type: command.command_type };
+				let _exec_result = workers.relay::<CommandExecutionWorker>(Arc::new(exec_request)).await??;
 
 				trace.event("rover_command_complete")?;
 

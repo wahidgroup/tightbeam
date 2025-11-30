@@ -4,12 +4,16 @@
 //! processing applications that can be easily deployed and tested.
 
 use core::convert::TryFrom;
+use core::future::Future;
 use core::marker::PhantomData;
+use core::pin::Pin;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::colony::Worker;
 use crate::core::Message;
+use crate::trace::TraceCollector;
 use crate::transport::Protocol;
 use crate::transport::TightBeamAddress;
 use crate::TightBeamError;
@@ -27,7 +31,6 @@ use crate::transport::handshake::HandshakeKeyManager;
 #[cfg(feature = "x509")]
 use crate::transport::TransportEncryptionConfig;
 
-#[cfg(feature = "tokio")]
 #[macro_export]
 macro_rules! __tightbeam_servlet_common_methods {
 	($protocol:path) => {
@@ -51,6 +54,7 @@ macro_rules! __tightbeam_servlet_common_methods {
 		}
 
 		#[allow(dead_code)]
+		#[cfg(feature = "tokio")]
 		pub async fn join(mut self) -> ::core::result::Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
 			if let Some(handle) = self.server_handle.take() {
 				$crate::colony::servlet_runtime::rt::join(handle).await
@@ -58,45 +62,16 @@ macro_rules! __tightbeam_servlet_common_methods {
 				Ok(())
 			}
 		}
-	};
-}
 
-#[cfg(all(not(feature = "tokio"), feature = "std"))]
-#[macro_export]
-macro_rules! __tightbeam_servlet_common_methods {
-	($protocol:path) => {
 		#[allow(dead_code)]
-		pub fn addr(&self) -> <$protocol as $crate::transport::Protocol>::Address {
-			self.addr
-		}
-
-		pub fn set_trace(&self, trace: ::std::sync::Arc<$crate::trace::TraceCollector>) {
-			if let Ok(mut guard) = self.trace_handle.lock() {
-				*guard = trace;
-			}
-		}
-
-		pub fn stop(mut self) {
-			if let Some(handle) = self.server_handle.take() {
-				$crate::colony::servlet_runtime::rt::abort(handle);
-			}
-		}
-
-		pub async fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
+		#[cfg(all(not(feature = "tokio"), feature = "std"))]
+		pub fn join(mut self) -> Result<(), $crate::colony::servlet_runtime::rt::JoinError> {
 			if let Some(handle) = self.server_handle.take() {
 				$crate::colony::servlet_runtime::rt::join(handle)
 			} else {
 				Ok(())
 			}
 		}
-	};
-}
-
-#[cfg(not(any(feature = "tokio", feature = "std")))]
-#[macro_export]
-macro_rules! __tightbeam_servlet_common_methods {
-	($protocol:path) => {
-		compile_error!("tightbeam::servlet! requires tightbeam to be built with either the `tokio` or `std` feature");
 	};
 }
 
@@ -225,6 +200,30 @@ pub mod servlet_runtime {
 	}
 }
 
+/// Type alias for boxed worker start future
+pub type WorkerBoxStartFuture = Pin<Box<dyn Future<Output = Result<Box<dyn WorkerBox>, TightBeamError>> + Send>>;
+
+/// Trait for type-erased worker lifecycle management
+pub trait WorkerBox: Send + Sync + core::any::Any {
+	fn start_boxed(self: Box<Self>, trace: Arc<TraceCollector>) -> WorkerBoxStartFuture;
+}
+
+impl<W: Worker + 'static> WorkerBox for W {
+	fn start_boxed(self: Box<Self>, trace: Arc<TraceCollector>) -> WorkerBoxStartFuture {
+		Box::pin(async move {
+			let started = (*self).start(trace).await?;
+			Ok(Box::new(started) as Box<dyn WorkerBox>)
+		})
+	}
+}
+
+// Downcast helper
+impl dyn WorkerBox {
+	pub fn downcast_ref<W: 'static>(&self) -> Option<&W> {
+		(self as &dyn core::any::Any).downcast_ref()
+	}
+}
+
 /// Configuration for a servlet, containing x509, application config, and workers
 pub struct ServletConf<P, M>
 where
@@ -236,7 +235,7 @@ where
 	#[cfg(feature = "x509")]
 	pub(crate) x509_config: Option<TransportEncryptionConfig<crate::crypto::profiles::DefaultCryptoProvider>>,
 	pub(crate) servlet_config: Option<Arc<dyn Any + Send + Sync>>,
-	pub(crate) workers: HashMap<String, Box<dyn Any + Send + Sync>>,
+	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
 	pub(crate) collector_gates: Vec<Arc<dyn crate::policy::GatePolicy + Send + Sync>>,
 }
 
@@ -249,7 +248,7 @@ where
 	#[cfg(feature = "x509")]
 	x509_config: Option<TransportEncryptionConfig<crate::crypto::profiles::DefaultCryptoProvider>>,
 	servlet_config: Option<Arc<dyn Any + Send + Sync>>,
-	workers: HashMap<String, Box<dyn Any + Send + Sync>>,
+	workers: HashMap<String, Box<dyn WorkerBox>>,
 	collector_gates: Vec<Arc<dyn crate::policy::GatePolicy + Send + Sync>>,
 	_phantom: PhantomData<(P, M)>,
 }
@@ -282,26 +281,22 @@ where
 		self.servlet_config.as_ref()?.downcast_ref()
 	}
 
-	/// Get servlet config for internal use
-	#[doc(hidden)]
+	/// Get servlet config
 	pub fn to_servlet_conf_ref(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
 		self.servlet_config.as_ref()
 	}
 
-	/// Get workers map for internal use
-	#[doc(hidden)]
-	pub fn to_workers(self) -> HashMap<String, Box<dyn Any + Send + Sync>> {
+	/// Get workers map
+	pub fn to_workers(self) -> HashMap<String, Box<dyn WorkerBox>> {
 		self.workers
 	}
 
-	/// Get collector gates for internal use
-	#[doc(hidden)]
+	/// Get collector gates
 	pub fn to_collector_gates(self) -> Vec<Arc<dyn crate::policy::GatePolicy + Send + Sync>> {
 		self.collector_gates
 	}
 
-	/// Get collector gates by reference for internal use
-	#[doc(hidden)]
+	/// Get collector gates by reference
 	pub fn collector_gates_ref(&self) -> &[Arc<dyn crate::policy::GatePolicy + Send + Sync>] {
 		&self.collector_gates
 	}
@@ -372,9 +367,10 @@ where
 	/// Add a worker using its WorkerMetadata name
 	pub fn with_worker<W>(mut self, worker: W) -> Self
 	where
-		W: Send + Sync + crate::colony::WorkerMetadata + 'static,
+		W: Worker + crate::colony::WorkerMetadata + 'static,
 	{
-		self.workers.insert(W::name().to_string(), Box::new(worker));
+		self.workers
+			.insert(W::name().to_string(), Box::new(worker) as Box<dyn WorkerBox>);
 		self
 	}
 
@@ -418,9 +414,9 @@ pub trait Servlet<I> {
 
 	/// Start the servlet with configuration
 	fn start(
-		trace: ::std::sync::Arc<crate::trace::TraceCollector>,
+		trace: Arc<crate::trace::TraceCollector>,
 		config: Option<Self::Conf>,
-	) -> impl std::future::Future<Output = Result<Self, crate::TightBeamError>> + Send
+	) -> impl Future<Output = Result<Self, crate::TightBeamError>> + Send
 	where
 		Self: Sized;
 
@@ -431,9 +427,7 @@ pub trait Servlet<I> {
 	fn stop(self);
 
 	/// Wait for the servlet to finish
-	fn join(
-		self,
-	) -> impl std::future::Future<Output = Result<(), crate::colony::servlet_runtime::rt::JoinError>> + Send;
+	fn join(self) -> impl Future<Output = Result<(), crate::colony::servlet_runtime::rt::JoinError>> + Send;
 }
 
 // Helper macro: Generate servlet struct and workers struct definitions
@@ -454,7 +448,7 @@ macro_rules! __servlet_structs {
 
 			$vis struct [<$servlet_name Workers>] {
 				#[allow(dead_code)]
-				inner: ::std::collections::HashMap<String, Box<dyn ::std::any::Any + Send + Sync>>,
+				inner: ::std::collections::HashMap<String, Box<dyn $crate::colony::WorkerBox>>,
 				#[allow(dead_code)]
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			}
@@ -482,7 +476,7 @@ macro_rules! __servlet_workers_impl {
 				{
 					let name = W::name();
 					let worker = self.get::<W>(name).ok_or($crate::TightBeamError::MissingConfiguration)?;
-					worker.relay(::std::sync::Arc::clone(&self.trace), input).await.map_err(|e| e.into())
+					worker.relay(input).await.map_err(|e| e.into())
 				}
 			}
 		}
@@ -633,12 +627,18 @@ macro_rules! __servlet_start_impl {
 				);
 
 				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::sync::Arc::clone(&trace)));
-
 				let collector_gates = servlet_conf.collector_gates_ref().to_vec();
 				let workers_map = servlet_conf.to_workers();
 
+				// Auto-start all workers with servlet trace
+				let mut started_workers = ::std::collections::HashMap::new();
+				for (name, worker_box) in workers_map {
+					let started = worker_box.start_boxed(::std::sync::Arc::clone(&trace)).await?;
+					started_workers.insert(name, started);
+				}
+
 				let workers = ::std::sync::Arc::new([<$servlet_name Workers>] {
-					inner: workers_map,
+					inner: started_workers,
 					trace: ::std::sync::Arc::clone(&trace),
 				});
 				let config_for_handler = ::std::sync::Arc::clone(&config_any);

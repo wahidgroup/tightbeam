@@ -5,7 +5,7 @@
 
 use crate::cms::signed_data::SignedData;
 use crate::crypto::sign::SignatureVerifier;
-use crate::der::asn1::ObjectIdentifier;
+use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::{Decode, Encode};
 use crate::transport::handshake::error::HandshakeError;
 
@@ -63,12 +63,13 @@ impl TightBeamSignedDataProcessor {
 
 		// Decode the OCTET STRING from the Any wrapper
 		let content_der = content.to_der()?;
-		let content_bytes = der::asn1::OctetString::from_der(&content_der)?;
+		let content_bytes = OctetString::from_der(&content_der)?;
 
 		// 4. Verify the signature
 		let signature_bytes = signer_info.signature.as_bytes();
 		self.verifier
-			.verify_signature(content_bytes.as_bytes(), signature_bytes, &signer_info.sid)?;
+			.verify_signature(content_bytes.as_bytes(), signature_bytes, &signer_info.sid)
+			.map_err(|_| HandshakeError::SignatureVerificationFailed)?;
 
 		// 5. Return verified content
 		Ok(content_bytes.as_bytes().to_vec())

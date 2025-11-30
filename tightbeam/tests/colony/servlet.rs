@@ -130,8 +130,8 @@ tb_scenario! {
 	environment Servlet {
 		servlet: CalcServlet,
 		start: |trace, config| async move {
-			let doubler = DoublerWorker::start();
-			let squarer = SquarerWorker::start(SquarerWorkerConf {
+			let doubler = DoublerWorker::new(());
+			let squarer = SquarerWorker::new(SquarerWorkerConf {
 				add_offset: config.squarer_offset
 			});
 

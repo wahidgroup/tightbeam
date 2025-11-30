@@ -398,9 +398,12 @@ macro_rules! test_worker {
 	) => {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
+			use $crate::colony::Worker;
+
 			// Build and start the worker
 			let builder = $setup_body;
-			let mut worker = <_ as $crate::colony::Worker>::start(builder).await?;
+			let trace = std::sync::Arc::new($crate::trace::TraceCollector::new());
+			let mut worker = <_ as $crate::colony::Worker>::start(builder, trace).await?;
 
 			// Run assertions with reference to worker
 			let result = {
@@ -408,11 +411,9 @@ macro_rules! test_worker {
 				$assertions_body.await
 			};
 
-			// Clean shutdown
-			#[cfg(feature = "tokio")]
-			worker.kill().await?;
-			#[cfg(all(not(feature = "tokio"), feature = "std"))]
-			worker.kill()?;
+			// Worker will be dropped automatically at end of test
+			// Explicitly killing causes nested runtime issues when called from async tests
+			drop(worker);
 
 			result
 		}

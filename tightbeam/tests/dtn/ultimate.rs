@@ -44,6 +44,7 @@ use tightbeam::{
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient},
 };
 
+use crate::dtn::messages::RoverInstrument;
 use crate::dtn::{
 	certs::{EARTH_RELAY_PINNING, MARS_RELAY_PINNING, MISSION_CONTROL_PINNING, ROVER_PINNING},
 	messages::RelayMessage,
@@ -58,7 +59,6 @@ use crate::dtn::{
 	},
 	chain_processor::ChainProcessor,
 	clock::{advance_clock, delays, init_mission_clock, mission_time_ms},
-	command_executor::CommandExecutor,
 	fault_manager::{BatteryUpdate, FaultManager},
 	fault_matrix::FaultMatrix,
 	faults::RoverFaultHandler,
@@ -71,6 +71,7 @@ use crate::dtn::{
 		RoverServletConf,
 	},
 	storage::FrameStore,
+	workers::{CommandExecutionWorker, TelemetryBuilderWorker, TelemetryBuilderWorkerConf},
 };
 
 // ============================================================================
@@ -464,11 +465,9 @@ async fn send_telemetry_to_mars_relay(
 	rover_signing_key: &Secp256k1SigningKey,
 	shared_cipher: &Aes256Gcm,
 ) -> Result<(), TightBeamError> {
-	// Create temporary command executor to get telemetry data
-	let command_executor = CommandExecutor::default();
-
-	// Gather telemetry data
-	let (instrument, _name, data) = command_executor.determine_next_instrument();
+	// Gather telemetry data (default instrument for periodic telemetry)
+	let instrument = RoverInstrument::Apxs;
+	let data = b"STATUS:OK".to_vec();
 	let battery = fault_manager.battery_percent()?;
 	let fault_matrix_snapshot = fault_manager.fault_matrix()?;
 
@@ -744,25 +743,32 @@ tb_scenario! {
 				&config.rover_fault_handler,
 			));
 
-			let rover_command_executor = Arc::new(RwLock::new(CommandExecutor::default()));
-			let rover_config = RoverServletConf {
-				mars_relay_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder
-				mars_relay_pool: rover_mars_pool,
-				rover_signing_key: rover_signing_key.to_owned(),
-				mission_control_verifying_key: mc_verifying_key,
-				mars_relay_verifying_key: mars_relay_verifying_key_val,
-				shared_cipher: shared_cipher.to_owned(),
-				chain_processor: Arc::clone(&rover_processor),
-				_fault_manager: Arc::clone(&rover_fault_manager),
-				command_executor: Arc::clone(&rover_command_executor),
-				frame_builder: Arc::clone(&rover_frame_builder),
-				mission_state: Arc::clone(&shared_mission_state),
-				max_rounds: COMMAND_ROUND_TRIPS,
-			};
+		let rover_config = RoverServletConf {
+			mars_relay_addr: TightBeamSocketAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0))), // Placeholder
+			mars_relay_pool: rover_mars_pool,
+			rover_signing_key: rover_signing_key.to_owned(),
+			mission_control_verifying_key: mc_verifying_key,
+			mars_relay_verifying_key: mars_relay_verifying_key_val,
+			shared_cipher: shared_cipher.to_owned(),
+			chain_processor: Arc::clone(&rover_processor),
+			_fault_manager: Arc::clone(&rover_fault_manager),
+			frame_builder: Arc::clone(&rover_frame_builder),
+			mission_state: Arc::clone(&shared_mission_state),
+			max_rounds: COMMAND_ROUND_TRIPS,
+		};
+
+			// Initialize workers
+			let command_worker = CommandExecutionWorker::new(());
+			let telemetry_worker = TelemetryBuilderWorker::new(TelemetryBuilderWorkerConf {
+				default_battery: 85,
+				default_temp: -63,
+			});
 
 			let rover_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
 				.with_certificate(ROVER_CERT, ROVER_KEY, vec![Arc::new(ROVER_PINNING)])?
 				.with_config(Arc::new(rover_config))
+				.with_worker(command_worker)
+				.with_worker(telemetry_worker)
 				.build();
 			let rover_servlet = RoverServlet::start(Arc::clone(&trace), Some(rover_servlet_conf)).await?;
 			let rover_addr = rover_servlet.addr();

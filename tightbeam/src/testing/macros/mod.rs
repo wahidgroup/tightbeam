@@ -483,6 +483,36 @@ macro_rules! tb_scenario {
 		}
 	};
 
+	// ===== HELPER: Build hook context =====
+	(@build_hook_context $config:expr, $trace:expr, $exec_result:expr) => {{
+		let mut consumed_trace = $crate::trace::ConsumedTrace::new();
+		consumed_trace.populate_from_collector(&$trace);
+		consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
+		if $exec_result.is_err() {
+			consumed_trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
+		}
+
+		let mut hook_ctx = $crate::testing::HookContext::new(consumed_trace);
+		#[cfg(feature = "testing-csp")]
+		{
+			hook_ctx.process = $config.csp().map(|p| std::sync::Arc::clone(p));
+		}
+		#[cfg(feature = "testing-fdr")]
+		{
+			if let Some(fdr_cfg) = $config.fdr() {
+				hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
+				use $crate::testing::fdr::DefaultFdrExplorer;
+				let trace_process = hook_ctx.trace.to_process();
+				let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, std::sync::Arc::clone(fdr_cfg));
+				hook_ctx.fdr_verdict = Some(explorer.explore());
+			}
+		}
+		if !$config.specs().is_empty() {
+			hook_ctx.assert_spec = $config.specs().first().copied();
+		}
+		hook_ctx
+	}};
+
 	// ===== FUZZ VARIANT: AFL fuzz target for Bare environment (generates fn main()) =====
 	(
 		fuzz: afl,
@@ -538,8 +568,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== NEW UNIFIED SYNTAX: Bare environment (sync) =====
-	// ===== NEW UNIFIED SYNTAX: Bare environment with async closure =====
+	// ===== Bare environment with async closure =====
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -557,7 +586,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== NEW UNIFIED SYNTAX: Bare environment with sync closure =====
+	// ===== Bare environment with sync closure =====
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -574,7 +603,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== NEW UNIFIED SYNTAX: Worker environment (async) =====
+	// ===== Worker environment (async) =====
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -592,7 +621,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== NEW UNIFIED SYNTAX: Servlet environment (async) =====
+	// ===== Servlet environment (async) =====
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -610,7 +639,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== NEW UNIFIED SYNTAX: ServiceClient environment with worker_threads =====
+	// ===== ServiceClient environment with worker_threads =====
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -637,7 +666,7 @@ macro_rules! tb_scenario {
 		}
 	};
 
-	// ===== NEW UNIFIED SYNTAX: ServiceClient environment without worker_threads =====
+	// ===== ServiceClient environment without worker_threads =====
 	(
 		name: $test_name:ident,
 		config: $config:expr,
@@ -681,34 +710,8 @@ macro_rules! tb_scenario {
 			};
 			let exec_result = closure(::std::sync::Arc::clone(&trace)).await;
 
-			// Consume trace
-			let mut consumed_trace = $crate::trace::ConsumedTrace::new();
-			consumed_trace.populate_from_collector(&trace);
-			consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-			if exec_result.is_err() {
-				consumed_trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-			}
-
-			// Build hook context
-			let mut hook_ctx = $crate::testing::HookContext::new(consumed_trace);
-			#[cfg(feature = "testing-csp")]
-			{
-				hook_ctx.process = config.csp().map(|p| std::sync::Arc::clone(p));
-			}
-			#[cfg(feature = "testing-fdr")]
-			{
-				if let Some(fdr_cfg) = config.fdr() {
-					hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
-					// Run FDR verification
-					use $crate::testing::fdr::DefaultFdrExplorer;
-					let trace_process = hook_ctx.trace.to_process();
-					let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, std::sync::Arc::clone(fdr_cfg));
-					hook_ctx.fdr_verdict = Some(explorer.explore());
-				}
-			}
-			if !config.specs().is_empty() {
-				hook_ctx.assert_spec = config.specs().first().copied();
-			}
+			// Build hook context and verify
+			let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
 
 			// Call hooks for specs (panics on failure)
 			$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, exec_result);
@@ -731,41 +734,17 @@ macro_rules! tb_scenario {
 		// Execute the bare closure (using helper for type inference)
 		let exec_result = $crate::testing::macros::__tb_call_exec_closure_arc($exec_closure, std::sync::Arc::clone(&trace));
 
-		// Consume trace
-		let mut consumed_trace = $crate::trace::ConsumedTrace::new();
-		consumed_trace.populate_from_collector(&trace);
-		consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if exec_result.is_err() {
-			consumed_trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
+		// Build hook context and verify
+		let mut hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
 
-		// Build hook context
-		let mut hook_ctx = $crate::testing::HookContext::new(consumed_trace);
-		#[cfg(feature = "testing-csp")]
-		{
-			hook_ctx.process = config.csp().map(|p| std::sync::Arc::clone(p));
-		}
-		#[cfg(feature = "testing-fdr")]
+		// Extract timing constraints from FDR specs if available (Bare-specific)
+		#[cfg(all(feature = "testing-fdr", feature = "testing-timing"))]
 		{
 			if let Some(fdr_cfg) = config.fdr() {
-				hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
-				// Run FDR verification
-				use $crate::testing::fdr::DefaultFdrExplorer;
-				let trace_process = hook_ctx.trace.to_process();
-				let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, std::sync::Arc::clone(fdr_cfg));
-				hook_ctx.fdr_verdict = Some(explorer.explore());
-
-				// Extract timing constraints from FDR specs if available
-				#[cfg(feature = "testing-timing")]
-				{
-					if let Some(first_spec) = fdr_cfg.specs.first() {
-						hook_ctx.timing_constraints = first_spec.timing_constraints.clone().map(std::sync::Arc::new);
-					}
+				if let Some(first_spec) = fdr_cfg.specs.first() {
+					hook_ctx.timing_constraints = first_spec.timing_constraints.clone().map(std::sync::Arc::new);
 				}
 			}
-		}
-		if !config.specs().is_empty() {
-			hook_ctx.assert_spec = config.specs().first().copied();
 		}
 
 		// Verify specs and call hooks (DRY helper)
@@ -783,11 +762,12 @@ macro_rules! tb_scenario {
 		let config = $config;
 		let trace = config.trace();
 		let trace_setup = trace.share();
+		let trace_start = std::sync::Arc::new(trace.share());
 		let trace_stimulus = std::sync::Arc::new(trace.share());
 
 		// Execute setup and stimulus
 		let builder = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
-		let mut worker = <_ as $crate::colony::Worker>::start(builder)
+		let mut worker = <_ as $crate::colony::Worker>::start(builder, trace_start)
 			.await
 			.expect("Failed to start worker");
 
@@ -806,33 +786,8 @@ macro_rules! tb_scenario {
 
 		let exec_result = __tb_call_worker_stimulus($stimulus_closure, trace_stimulus, worker).await;
 
-		// Consume trace
-		let mut consumed_trace = $crate::trace::ConsumedTrace::new();
-		consumed_trace.populate_from_collector(&trace);
-		consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if exec_result.is_err() {
-			consumed_trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
-
-		// Build hook context
-		let mut hook_ctx = $crate::testing::HookContext::new(consumed_trace);
-		#[cfg(feature = "testing-csp")]
-		{
-			hook_ctx.process = config.csp().map(|p| std::sync::Arc::clone(p));
-		}
-		#[cfg(feature = "testing-fdr")]
-		{
-			if let Some(fdr_cfg) = config.fdr() {
-				hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
-				use $crate::testing::fdr::DefaultFdrExplorer;
-				let trace_process = hook_ctx.trace.to_process();
-				let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, std::sync::Arc::clone(fdr_cfg));
-				hook_ctx.fdr_verdict = Some(explorer.explore());
-			}
-		}
-		if !config.specs().is_empty() {
-			hook_ctx.assert_spec = config.specs().first().copied();
-		}
+		// Build hook context and verify
+		let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
 
 		// Verify specs and call hooks (DRY helper)
 		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, exec_result);
@@ -887,58 +842,11 @@ macro_rules! tb_scenario {
 		// Stop servlet
 		servlet_instance.stop();
 
-		// Consume trace
-		let mut consumed_trace = $crate::trace::ConsumedTrace::new();
-		consumed_trace.populate_from_collector(&trace);
-		consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if client_result.is_err() {
-			consumed_trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
+		// Build hook context and verify
+		let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, client_result);
 
-		// Build hook context
-		let mut hook_ctx = $crate::testing::HookContext::new(consumed_trace);
-		#[cfg(feature = "testing-csp")]
-		{
-			hook_ctx.process = config.csp().map(|p| std::sync::Arc::clone(p));
-		}
-		#[cfg(feature = "testing-fdr")]
-		{
-			if let Some(fdr_cfg) = config.fdr() {
-				hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
-				use $crate::testing::fdr::DefaultFdrExplorer;
-				let trace_process = hook_ctx.trace.to_process();
-				let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, std::sync::Arc::clone(fdr_cfg));
-				hook_ctx.fdr_verdict = Some(explorer.explore());
-			}
-		}
-		if !config.specs().is_empty() {
-			hook_ctx.assert_spec = config.specs().first().copied();
-		}
-
-		// Verify specs
-		for spec in config.specs() {
-			match $crate::testing::specs::verify_trace(*spec, &hook_ctx.trace) {
-				Err(violation) => {
-					if let Some(hooks) = config.hooks() {
-						if let Some(ref on_fail) = hooks.on_fail {
-							let _ = on_fail(&hook_ctx, &violation);
-						}
-					}
-					panic!("Spec verification failed for {}: {:?}", spec.id(), violation);
-				}
-				Ok(()) => {}
-			}
-		}
-
-		if let Some(hooks) = config.hooks() {
-			if let Some(ref on_pass) = hooks.on_pass {
-				let _ = on_pass(&hook_ctx);
-			}
-		}
-
-		if let Err(e) = client_result {
-			panic!("Client execution failed: {:?}", e);
-		}
+		// Verify specs and call hooks
+		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, client_result);
 	}};
 
 	// ===== INTERNAL: Execute unified scenario for ServiceClient environment =====
@@ -990,58 +898,11 @@ macro_rules! tb_scenario {
 		// Cleanup server
 		server_handle.abort();
 
-		// Consume trace
-		let mut consumed_trace = $crate::trace::ConsumedTrace::new();
-		consumed_trace.populate_from_collector(&trace);
-		consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
-		if client_result.is_err() {
-			consumed_trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
-		}
+		// Build hook context and verify
+		let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, client_result);
 
-		// Build hook context
-		let mut hook_ctx = $crate::testing::HookContext::new(consumed_trace);
-		#[cfg(feature = "testing-csp")]
-		{
-			hook_ctx.process = config.csp().map(|p| std::sync::Arc::clone(p));
-		}
-		#[cfg(feature = "testing-fdr")]
-		{
-			if let Some(fdr_cfg) = config.fdr() {
-				hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
-				use $crate::testing::fdr::DefaultFdrExplorer;
-				let trace_process = hook_ctx.trace.to_process();
-				let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, std::sync::Arc::clone(fdr_cfg));
-				hook_ctx.fdr_verdict = Some(explorer.explore());
-			}
-		}
-		if !config.specs().is_empty() {
-			hook_ctx.assert_spec = config.specs().first().copied();
-		}
-
-		// Verify specs
-		for spec in config.specs() {
-			match $crate::testing::specs::verify_trace(*spec, &hook_ctx.trace) {
-				Err(violation) => {
-					if let Some(hooks) = config.hooks() {
-						if let Some(ref on_fail) = hooks.on_fail {
-							let _ = on_fail(&hook_ctx, &violation);
-						}
-					}
-					panic!("Spec verification failed for {}: {:?}", spec.id(), violation);
-				}
-				Ok(()) => {}
-			}
-		}
-
-		if let Some(hooks) = config.hooks() {
-			if let Some(ref on_pass) = hooks.on_pass {
-				let _ = on_pass(&hook_ctx);
-			}
-		}
-
-		if let Err(e) = client_result {
-			panic!("Client execution failed: {:?}", e);
-		}
+		// Verify specs and call hooks
+		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, client_result);
 	}};
 
 }

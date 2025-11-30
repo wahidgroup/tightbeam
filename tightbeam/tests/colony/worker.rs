@@ -1,6 +1,7 @@
 //! Integration test for Worker environment syntax in tb_scenario!
 
 use std::sync::Arc;
+use tightbeam::colony::Worker;
 use tightbeam::der::Sequence;
 use tightbeam::testing::ScenarioConf;
 use tightbeam::Beamable;
@@ -72,7 +73,7 @@ tb_scenario! {
 		.build(),
 	environment Worker {
 		setup: |_trace| {
-			ConfigurableWorker::from(ConfigurableWorkerConf {
+			ConfigurableWorker::new(ConfigurableWorkerConf {
 				response: "CUSTOM_RESPONSE".to_string(),
 			})
 		},
@@ -84,7 +85,7 @@ tb_scenario! {
 				lucky_number: 42,
 			};
 
-			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg)).await?;
+			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
 				trace.event_with("relay_success", &[], resp.result)?;
 			}
@@ -100,7 +101,7 @@ tb_scenario! {
 		.with_specs(vec![WorkerSpec::get(1, 0, 0).expect("WorkerSpec 1.0.0")])
 		.build(),
 	environment Worker {
-	setup: |_trace| DefaultWorker::default(),
+	setup: |_trace| DefaultWorker::new(()),
 	stimulus: |trace, worker| async move {
 		trace.event_with("relay_start", &[], ())?;
 
@@ -109,7 +110,7 @@ tb_scenario! {
 				lucky_number: 99,
 			};
 
-			let response = worker.relay(Arc::clone(&trace), Arc::new(ping_msg)).await?;
+			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
 				trace.event_with("relay_success", &[], resp.result)?;
 			}
