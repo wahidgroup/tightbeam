@@ -4,6 +4,8 @@
 //! well-known CSP examples from the FDR Manual:
 //! - Tennis Game Scoring System (state transitions, trace refinement)
 //! - Dining Philosophers (deadlock detection)
+//! - Trace Analysis (FdrTraceExt methods demonstration)
 
 mod diners;
 mod tennis;
+mod trace_analysis;
