@@ -180,6 +180,10 @@ macro_rules! tb_process_spec {
 			fn validate_trace(&self, trace: &$crate::trace::ConsumedTrace) -> $crate::testing::specs::csp::CspValidationResult {
 				Self::process().validate_trace(trace)
 			}
+
+			fn to_process_cow(&self) -> std::borrow::Cow<'_, $crate::testing::specs::csp::Process> {
+				std::borrow::Cow::Owned(Self::process())
+			}
 		}
 	};
 

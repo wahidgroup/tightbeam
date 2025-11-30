@@ -3200,7 +3200,10 @@ tb_scenario! {
 		.with_spec(AssertSpecType::latest())          // Layer 1 assertion spec
 		.with_csp(ProcessSpecType)                    // OPTIONAL: Layer 2 CSP model (requires testing-csp)
 		.with_fdr(FdrConfig { ... })                  // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-		.with_trace(TbInstrumentationConfig { ... })  // OPTIONAL: instrumentation/trace config (§11)
+		.with_trace(TraceConfig::builder()            // OPTIONAL: unified trace config (§11)
+			.with_instrumentation(TbInstrumentationConfig { ... })
+			.with_logger(LoggerConfig::new(...))
+			.build())
 		.with_hooks(TestHooks { ... })                // OPTIONAL: on_pass/on_fail callbacks
 		.build(),
 	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
@@ -3999,14 +4002,17 @@ let filter = LogFilter::new(LogLevel::Warning)
 #### Integration
 
 ```rust
-use tightbeam::trace::{TraceCollector, logging::*};
+use tightbeam::trace::{TraceConfig, logging::*};
 
 let backend = Box::new(StdoutBackend);
 let filter = LogFilter::new(LogLevel::Warning);
 let config = LoggerConfig::new(backend, filter)
 	.with_default_level(LogLevel::Info);
 
-let trace = TraceCollector::default().with_logger(config);
+let trace: TraceCollector = TraceConfig::builder()
+	.with_logger(config)
+	.build();
+
 trace.event("msg")?.with_log_level(LogLevel::Error).emit();
 ```
 

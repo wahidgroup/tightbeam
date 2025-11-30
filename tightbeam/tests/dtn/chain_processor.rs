@@ -52,7 +52,7 @@ impl ChainProcessor {
 	pub fn process_incoming(&self, frame: &Frame) -> Result<ProcessResult, TightBeamError> {
 		// 1. Persist frame
 		let mut store_guard = self.store.write()?;
-		store_guard.persist(&frame)?;
+		store_guard.persist(frame)?;
 
 		drop(store_guard);
 

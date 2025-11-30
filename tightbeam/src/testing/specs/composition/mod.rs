@@ -5,6 +5,7 @@
 //!
 //! Based on Hoare's CSP theory and Roscoe's refinement checking.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -66,10 +67,18 @@ pub trait CompositionSpec {
 ///
 /// This allows composed processes to be used directly in tb_scenario! and
 /// other testing macros that expect a ProcessSpec.
+///
+/// Note: CompositionSpecs are typically zero-sized structs (ZSTs) generated
+/// by `tb_compose_spec!`. The `process()` method constructs the Process, so we
+/// return Cow::Owned. This is only called once per test.
 impl<T: CompositionSpec> ProcessSpec for T {
 	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		let process = T::process();
 		process.validate_trace(trace)
+	}
+
+	fn to_process_cow(&self) -> Cow<'_, Process> {
+		Cow::Owned(T::process())
 	}
 }
 

@@ -19,6 +19,7 @@ use alloc::{
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::TransitStatus;
 use crate::testing::assertions::{Assertion, AssertionLabel, AssertionValue};
+use crate::trace::TraceConfigBuilder;
 use crate::transport::error::TransportError;
 use crate::utils::urn::Urn;
 use crate::Frame;
@@ -58,16 +59,26 @@ impl IntoEventLabel for &String {
 }
 
 /// Configuration for trace collection
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct TraceConfig {
 	#[cfg(feature = "instrument")]
 	pub instrumentation: Option<TbInstrumentationConfig>,
+	#[cfg(feature = "logging")]
+	pub logger: Option<super::logging::LoggerConfig>,
 }
 
 impl TraceConfig {
+	pub fn builder() -> TraceConfigBuilder {
+		TraceConfigBuilder::default()
+	}
+
 	#[cfg(feature = "instrument")]
 	pub fn with_instrumentation(config: TbInstrumentationConfig) -> Self {
-		Self { instrumentation: Some(config) }
+		Self {
+			instrumentation: Some(config),
+			#[cfg(feature = "logging")]
+			logger: None,
+		}
 	}
 
 	#[cfg(feature = "instrument")]
@@ -79,7 +90,11 @@ impl TraceConfig {
 #[cfg(feature = "instrument")]
 impl From<TbInstrumentationConfig> for TraceConfig {
 	fn from(config: TbInstrumentationConfig) -> Self {
-		Self { instrumentation: Some(config) }
+		Self {
+			instrumentation: Some(config),
+			#[cfg(feature = "logging")]
+			logger: None,
+		}
 	}
 }
 
@@ -616,14 +631,19 @@ impl TraceCollector {
 
 impl From<TraceConfig> for TraceCollector {
 	fn from(config: TraceConfig) -> Self {
+		let mut collector = Self::default();
+
 		#[cfg(feature = "instrument")]
-		{
-			Self::with_config(config.instrumentation())
+		if let Some(instrumentation) = config.instrumentation {
+			collector = Self::with_config(instrumentation);
 		}
-		#[cfg(not(feature = "instrument"))]
-		{
-			Self::new()
+
+		#[cfg(feature = "logging")]
+		if let Some(logger) = config.logger {
+			collector = collector.with_logger(logger);
 		}
+
+		collector
 	}
 }
 

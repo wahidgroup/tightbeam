@@ -34,14 +34,17 @@ use std::time::Duration;
 use tightbeam::{
 	asn1::MessagePriority,
 	at_most,
+	builder::TypeBuilder,
 	crypto::{aead::Aes256Gcm, key::KeySpec, sign::ecdsa::Secp256k1SigningKey},
 	error::TightBeamError,
 	exactly,
+	instrumentation::TbInstrumentationConfig,
 	prelude::*,
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
-	testing::{fdr::FdrConfig, ScenarioConf},
-	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector},
+	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, ScenarioConf},
+	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient},
+	wcet,
 };
 
 use crate::dtn::messages::RoverInstrument;
@@ -234,6 +237,18 @@ tb_process_spec! {
 			"mission_control_analyze_telemetry" => TelemetryIdle
 		}
 	}
+	terminal { TelemetryIdle }
+	timing {
+		wcet: {
+			"rover_send_telemetry" => wcet!(Duration::from_millis(100)),
+			"mars_relay_receive_telemetry_from_rover" => wcet!(Duration::from_millis(50)),
+			"mars_relay_forward_telemetry_to_earth" => wcet!(Duration::from_millis(50)),
+			"earth_relay_receive_telemetry_from_mars" => wcet!(Duration::from_millis(50)),
+			"earth_relay_forward_telemetry_to_mc" => wcet!(Duration::from_millis(50)),
+			"mission_control_receive_telemetry" => wcet!(Duration::from_millis(50)),
+			"mission_control_analyze_telemetry" => wcet!(Duration::from_millis(200))
+		}
+	}
 }
 
 // Command Flow: Mission Control → Earth Relay → Mars Relay → Rover → ACK back
@@ -313,6 +328,20 @@ tb_process_spec! {
 			"mission_control_receive_ack" => CommandIdle
 		}
 	}
+	terminal { CommandIdle }
+	timing {
+		wcet: {
+			"mission_control_send_command" => wcet!(Duration::from_millis(50)),
+			"earth_relay_receive_from_mc" => wcet!(Duration::from_millis(50)),
+			"earth_relay_forward_to_mars" => wcet!(Duration::from_millis(50)),
+			"mars_relay_receive_from_earth" => wcet!(Duration::from_millis(50)),
+			"mars_relay_forward_to_rover" => wcet!(Duration::from_millis(50)),
+			"rover_receive_command" => wcet!(Duration::from_millis(50)),
+			"rover_execute_command" => wcet!(Duration::from_millis(500)),
+			"rover_command_complete" => wcet!(Duration::from_millis(100)),
+			"rover_send_ack" => wcet!(Duration::from_millis(50))
+		}
+	}
 }
 
 // Mission Lifecycle and Fault Events
@@ -344,6 +373,7 @@ tb_process_spec! {
 		},
 		LifecycleEnd => { }
 	}
+	terminal { LifecycleEnd }
 }
 
 // First compose telemetry and command flows
@@ -593,17 +623,18 @@ async fn run_mission_loop(
 // ============================================================================
 
 /// Build FDR configuration for DTN testing
-/// NOTE: Reserved for future FDR (Failures, Divergence, Refinement) testing
-#[cfg(feature = "testing-fault")]
-#[allow(dead_code)]
-fn build_dtn_fdr_config() -> FdrConfig {
+///
+/// With the framework's dual-mode FDR:
+/// 1. CSP spec exploration: Framework automatically explores DtnComposedSystem state space
+/// 2. Trace refinement: Validates runtime trace against spec (via specs field)
+fn build_dtn_fdr_config_refinement() -> FdrConfig {
 	FdrConfig {
-		seeds: 10,
-		max_depth: 50,
-		max_internal_run: 10,
-		timeout_ms: 30000,
-		specs: vec![],
-		fail_fast: false,
+		seeds: 2, // Multiple seeds for exploring different interleavings of the CSP model
+		max_depth: 10,
+		max_internal_run: 5,
+		timeout_ms: 15000,
+		specs: vec![DtnComposedSystem::process()], // Triggers trace refinement checking
+		fail_fast: true,
 		expect_failure: false,
 		scheduler_count: None,
 		process_count: None,
@@ -619,12 +650,24 @@ tb_scenario! {
 	config: ScenarioConf::<DtnScenarioConfig>::builder()
 		.with_spec(DtnEventCountSpec::latest())
 		.with_csp(DtnComposedSystem)
-		.with_trace(TraceCollector::default().with_logger(
-			LoggerConfig::new(
+		.with_fdr(build_dtn_fdr_config_refinement())
+		.with_trace(TraceConfig::builder()
+			.with_instrumentation(TbInstrumentationConfig {
+				enable_payloads: false,
+				enable_internal_detail: true,
+				sample_enabled_sets: true,
+				sample_refusals: true,
+				divergence_heuristics: true,
+				record_durations: true,
+				max_events: 4096,
+			})
+			.with_logger(LoggerConfig::new(
 				Box::new(StdoutBackend),
-				LogFilter::new(LogLevel::Debug)
-			).with_default_level(LogLevel::Debug)
-		))
+				LogFilter::new(LogLevel::Error)
+			).with_default_level(LogLevel::Debug))
+			.build()
+			.into()
+		)
 		.with_env_config(DtnScenarioConfig::default())
 		.build(),
 	environment Servlet {

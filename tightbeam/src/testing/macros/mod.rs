@@ -502,14 +502,62 @@ macro_rules! tb_scenario {
 			if let Some(fdr_cfg) = $config.fdr() {
 				hook_ctx.fdr_config = Some(std::sync::Arc::clone(fdr_cfg));
 				use $crate::testing::fdr::DefaultFdrExplorer;
-				let trace_process = hook_ctx.trace.to_process();
-				let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, std::sync::Arc::clone(fdr_cfg));
-				hook_ctx.fdr_verdict = Some(explorer.explore());
+
+				// Determine what to explore based on configuration
+				let fdr_verdict = if let Some(csp_spec) = $config.csp() {
+					// Mode A: CSP spec provided - explore the spec model itself
+					let spec_process_cow = csp_spec.to_process_cow();
+					// Create exploration config (empty specs = state-space exploration)
+					let exploration_cfg = std::sync::Arc::new($crate::testing::fdr::FdrConfig {
+						seeds: fdr_cfg.seeds,
+						max_depth: fdr_cfg.max_depth,
+						max_internal_run: fdr_cfg.max_internal_run,
+						timeout_ms: fdr_cfg.timeout_ms,
+						specs: Vec::new(), // Empty: triggers exploration mode
+						fail_fast: fdr_cfg.fail_fast,
+						expect_failure: fdr_cfg.expect_failure,
+						scheduler_count: fdr_cfg.scheduler_count,
+						process_count: fdr_cfg.process_count,
+						scheduler_model: fdr_cfg.scheduler_model.clone(),
+						fault_model: fdr_cfg.fault_model.clone(),
+						#[cfg(feature = "testing-fmea")]
+						fmea_config: fdr_cfg.fmea_config.clone(),
+					});
+
+					let mut explorer = DefaultFdrExplorer::with_defaults(&spec_process_cow, exploration_cfg);
+					let mut verdict = explorer.explore();
+					// Also validate runtime trace against spec if specs are
+					// provided in FdrConfig
+					if !fdr_cfg.specs.is_empty() {
+						let trace_process = hook_ctx.trace.to_process();
+						let fdr_cfg_arc = std::sync::Arc::clone(fdr_cfg);
+						let mut trace_explorer = DefaultFdrExplorer::with_defaults(&trace_process, fdr_cfg_arc);
+						let trace_verdict = trace_explorer.explore();
+
+						// Merge verdicts: spec exploration + trace validation
+						verdict.trace_refines = trace_verdict.trace_refines;
+						verdict.divergence_refines = trace_verdict.divergence_refines;
+						verdict.trace_refinement_witness = trace_verdict.trace_refinement_witness;
+						verdict.divergence_refinement_witness = trace_verdict.divergence_refinement_witness;
+						verdict.passed = verdict.passed && trace_verdict.trace_refines && trace_verdict.divergence_refines;
+					}
+					verdict
+				} else {
+					// Mode B: No CSP spec - explore runtime trace
+					let trace_process = hook_ctx.trace.to_process();
+					let fdr_cfg_arc = std::sync::Arc::clone(fdr_cfg);
+					let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, fdr_cfg_arc);
+					explorer.explore()
+				};
+
+				hook_ctx.fdr_verdict = Some(fdr_verdict);
 			}
 		}
+
 		if !$config.specs().is_empty() {
 			hook_ctx.assert_spec = $config.specs().first().copied();
 		}
+
 		hook_ctx
 	}};
 

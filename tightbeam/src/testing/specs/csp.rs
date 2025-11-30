@@ -289,6 +289,13 @@ impl Process {
 pub trait ProcessSpec {
 	/// Validate a trace against this process specification
 	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult;
+
+	/// Get the underlying Process for FDR exploration
+	///
+	/// Returns `Cow<Process>` to support both:
+	/// - Borrowed: For `Process` itself
+	/// - Owned: For CompositionSpec ZSTs that construct the process
+	fn to_process_cow(&self) -> Cow<'_, Process>;
 }
 
 /// Result of CSP process validation
@@ -401,6 +408,10 @@ impl Process {
 impl ProcessSpec for Process {
 	fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		self.validate_trace(trace)
+	}
+
+	fn to_process_cow(&self) -> Cow<'_, Process> {
+		Cow::Borrowed(self)
 	}
 }
 
