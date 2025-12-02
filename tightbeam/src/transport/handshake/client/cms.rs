@@ -281,9 +281,8 @@ where
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
-		// 2. Add server finished to transcript and compute hash if needed
+		// 2. Compute transcript hash BEFORE adding server_finished (to match server's hash)
 		if self.transcript_hash.is_none() {
-			self.transcript_buffer.extend_from_slice(signed_data_der);
 			self.transcript_hash = Some(self.compute_transcript_hash());
 		}
 
@@ -295,7 +294,10 @@ where
 		let verified_content =
 			self.verify_signature(signed_data_der, server_verifying_key, expected_signer_identifier)?;
 
-		// 5. Transition state & lock transcript (transcript hash verified)
+		// 5. Add server finished to transcript AFTER verification
+		self.transcript_buffer.extend_from_slice(signed_data_der);
+
+		// 6. Transition state & lock transcript (transcript hash verified)
 		self.state.transition(ClientHandshakeState::ServerFinishedReceived)?;
 		self.invariants.lock_transcript()?;
 
@@ -500,10 +502,9 @@ where
 
 		let octet_string = OctetString::new(transcript_hash)?;
 		let econtent_der = octet_string.to_der()?;
-		let encap_content_info = EncapsulatedContentInfo {
-			econtent_type: crate::oids::DATA,
-			econtent: Some(crate::der::Any::new(crate::der::Tag::OctetString, econtent_der.as_slice())?),
-		};
+		let econtent_any = crate::der::Any::from_der(&econtent_der)?;
+		let encap_content_info =
+			EncapsulatedContentInfo { econtent_type: crate::oids::DATA, econtent: Some(econtent_any) };
 
 		let signed_data = SignedData {
 			version: crate::cms::content_info::CmsVersion::V1,

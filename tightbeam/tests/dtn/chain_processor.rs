@@ -15,6 +15,7 @@ use tightbeam::der::{oid::AssociatedOid, Encode};
 use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::TightBeamError;
 
+use crate::dtn::jobs::{PersistAndBufferFrame, ValidateChain};
 use crate::dtn::messages::MessageChainState;
 use crate::dtn::ordering::OutOfOrderBuffer;
 use crate::dtn::storage::FrameStore;
@@ -35,7 +36,6 @@ pub struct ChainProcessor {
 	store: Arc<RwLock<FrameStore>>,
 	chain_state: Arc<RwLock<MessageChainState>>,
 	order_buffer: Arc<RwLock<OutOfOrderBuffer>>,
-	node_name: String,
 }
 
 impl ChainProcessor {
@@ -43,86 +43,23 @@ impl ChainProcessor {
 		store: Arc<RwLock<FrameStore>>,
 		chain_state: Arc<RwLock<MessageChainState>>,
 		order_buffer: Arc<RwLock<OutOfOrderBuffer>>,
-		node_name: String,
 	) -> Self {
-		Self { store, chain_state, order_buffer, node_name }
+		Self { store, chain_state, order_buffer }
 	}
 
 	/// Process incoming frame: persist, order, validate chain
 	pub fn process_incoming(&self, frame: &Frame) -> Result<ProcessResult, TightBeamError> {
-		// 1. Persist frame
-		let mut store_guard = self.store.write()?;
-		store_guard.persist(frame)?;
-
-		drop(store_guard);
-
-		// 2. Insert into ordering buffer
-		let frames_to_process = self.order_buffer.write()?.insert(frame.clone())?;
-		if let Some(frames) = frames_to_process {
-			// 3. Verify batch integrity before committing to chain state
-			let verdict = self.store.read()?.verify_chain(&frames)?;
-			if !verdict.valid {
-				// Batch verification failed - return chain gap
-				let current_head = self.chain_state.read()?.last_hash.to_vec();
-				let missing_hash = frames
-					.first()
-					.and_then(|f| f.metadata.previous_frame.as_ref())
-					.map(|d| d.digest.as_bytes().to_vec())
-					.unwrap_or_default();
-
-				eprintln!(
-					"[{}] ⚠ Batch chain verification failed ({} broken links)",
-					self.node_name,
-					verdict.broken_links.len()
-				);
-				for (idx, msg) in &verdict.broken_links {
-					eprintln!("  Frame {}: {}", idx, msg);
-				}
-
-				return Ok(ProcessResult::ChainGap { current_head, missing_hash });
+		let store = Arc::clone(&self.store);
+		let buffer = Arc::clone(&self.order_buffer);
+		let state = Arc::clone(&self.chain_state);
+		match PersistAndBufferFrame::run((frame.to_owned(), store, buffer))? {
+			None => Ok(ProcessResult::Buffered),
+			Some(frames) => {
+				let store = Arc::clone(&self.store);
+				let chain_state = Arc::clone(&self.chain_state);
+				let result = ValidateChain::run((frames, store, chain_state))?;
+				result.finalize(state)
 			}
-
-			// 4. Validate and update chain for ordered frames
-			let chain_state_guard = self.chain_state.read()?;
-			let mut validated_frames = Vec::new();
-			let mut frames_to_update = Vec::new();
-			for ordered_frame in frames {
-				let chain_valid = chain_state_guard.validate_frame(&ordered_frame)?;
-				if !chain_valid {
-					// Chain gap detected
-					let current_head = chain_state_guard.last_hash.to_vec();
-					let missing_hash = ordered_frame
-						.metadata
-						.previous_frame
-						.as_ref()
-						.map(|d| d.digest.as_bytes().to_vec())
-						.unwrap_or_default();
-
-					eprintln!(
-						"[{}] ⚠ Chain gap detected (order: {})",
-						self.node_name, ordered_frame.metadata.order
-					);
-
-					return Ok(ProcessResult::ChainGap { current_head, missing_hash });
-				}
-
-				// Collect frames to update (will update after releasing read lock)
-				frames_to_update.push(ordered_frame);
-			}
-
-			// Release read lock before acquiring write lock
-			drop(chain_state_guard);
-
-			// Update chain state for all validated frames (single write lock acquisition)
-			let mut chain_state_guard = self.chain_state.write()?;
-			for ordered_frame in frames_to_update {
-				chain_state_guard.update_with_frame(&ordered_frame)?;
-				validated_frames.push(ordered_frame);
-			}
-
-			Ok(ProcessResult::Processed(validated_frames))
-		} else {
-			Ok(ProcessResult::Buffered)
 		}
 	}
 

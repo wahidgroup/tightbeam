@@ -54,7 +54,19 @@ impl IntoEventLabel for String {
 
 impl IntoEventLabel for &String {
 	fn into_label(self) -> Cow<'static, str> {
-		Cow::Owned(self.clone())
+		Cow::Owned(self.to_owned())
+	}
+}
+
+impl IntoEventLabel for Urn<'_> {
+	fn into_label(self) -> Cow<'static, str> {
+		Cow::Owned(self.to_string())
+	}
+}
+
+impl IntoEventLabel for &Urn<'_> {
+	fn into_label(self) -> Cow<'static, str> {
+		Cow::Owned(self.to_string())
 	}
 }
 

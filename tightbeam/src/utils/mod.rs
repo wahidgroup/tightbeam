@@ -17,6 +17,7 @@ pub mod basis_points;
 pub mod jitter;
 pub mod math;
 pub mod statistics;
+pub mod task;
 pub mod urn;
 
 pub use basis_points::BasisPoints;

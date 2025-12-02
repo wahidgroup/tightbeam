@@ -7,7 +7,41 @@ use std::collections::HashMap;
 
 use tightbeam::{asn1::Frame, TightBeamError};
 
-use crate::dtn::types::{BufferFullError, InvalidSequenceError};
+/// Invalid sequence error - out-of-sequence frame
+#[derive(Debug, Clone)]
+pub struct InvalidSequenceError {
+	pub message: String,
+}
+
+impl core::fmt::Display for InvalidSequenceError {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+		write!(f, "Invalid sequence: {}", self.message)
+	}
+}
+
+impl From<InvalidSequenceError> for TightBeamError {
+	fn from(e: InvalidSequenceError) -> Self {
+		TightBeamError::InjectedFault(Box::new(e))
+	}
+}
+
+/// Buffer full error - ordering buffer exceeded capacity
+#[derive(Debug, Clone)]
+pub struct BufferFullError {
+	pub message: String,
+}
+
+impl core::fmt::Display for BufferFullError {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+		write!(f, "Buffer full: {}", self.message)
+	}
+}
+
+impl From<BufferFullError> for TightBeamError {
+	fn from(e: BufferFullError) -> Self {
+		TightBeamError::InjectedFault(Box::new(e))
+	}
+}
 
 /// Buffer for handling out-of-order frame delivery
 ///
@@ -78,7 +112,6 @@ impl OutOfOrderBuffer {
 	/// Drain all sequential frames starting from next_expected
 	fn drain_sequential(&mut self) -> Vec<Frame> {
 		let mut result = Vec::new();
-
 		while let Some(frame) = self.buffer.remove(&self.next_expected) {
 			result.push(frame);
 			self.next_expected += 1;
@@ -115,7 +148,7 @@ impl OutOfOrderBuffer {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::dtn::types::DtnPayload;
+	use crate::dtn::storage::DtnPayload;
 	use tightbeam::compose;
 
 	#[test]

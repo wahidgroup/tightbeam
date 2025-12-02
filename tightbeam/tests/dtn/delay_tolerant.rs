@@ -28,8 +28,7 @@ use tightbeam::pkcs12::digest_info::DigestInfo;
 use tightbeam::TightBeamError;
 
 use crate::dtn::delay::DelaySimulator;
-use crate::dtn::storage::FrameStore;
-use crate::dtn::types::DtnPayload;
+use crate::dtn::storage::{DtnPayload, FrameStore};
 
 /// Multi-hop DTN test simulating Earth -> Relay -> Mars
 ///

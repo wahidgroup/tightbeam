@@ -21,6 +21,7 @@ use tightbeam::{
 	servlet,
 	testing::trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ConnectionPool},
+	utils::task::Pipeline,
 };
 
 use crate::dtn::{
@@ -28,7 +29,11 @@ use crate::dtn::{
 	clock::mission_time_ms,
 	fault_manager::FaultManager,
 	frame_builder::FrameBuilderHelper,
-	messages::{EarthCommand, FrameRequest, FrameResponse, RelayMessage},
+	jobs::{
+		BuildGapRecoveryFrame, CreateFrameRequest, EmitFrameToNetwork, FinalizeChainOutgoing, GapRecoveryContext,
+		PrepareGapRecoveryBuild,
+	},
+	messages::{EarthCommand, FrameResponse, RelayMessage},
 	workers::{
 		command_ack_handler::{CommandAckHandlerRequest, CommandAckHandlerWorker},
 		frame_request_handler::{FrameRequestAction, FrameRequestHandlerRequest, FrameRequestHandlerWorker},
@@ -99,24 +104,25 @@ trait DtnNode {
 	) -> Result<(), TightBeamError> {
 		trace.event(format!("{}_gap_detected", self.node_name()))?;
 
-		let request = FrameRequest {
-			requester_head: current_head.try_into().unwrap_or([0u8; 32]),
-			last_received_hash: missing_hash.try_into().unwrap_or([0u8; 32]),
-		};
+		let ctx = Arc::new(GapRecoveryContext {
+			chain_processor: Arc::clone(self.chain_processor()),
+			frame_builder: Arc::clone(self.frame_builder()),
+			signing_key: Arc::new(self.signing_key().clone()),
+			cipher: Arc::new(self.cipher().clone()),
+			pool: Arc::clone(pool),
+		});
 
-		let (order, prev_digest) = self.chain_processor().prepare_outgoing()?;
-		let request_frame = self.frame_builder().build_frame_request_frame(
-			request,
-			order,
-			prev_digest,
-			self.signing_key(),
-			self.cipher(),
-		)?;
+		let frame = CreateFrameRequest::run(current_head, missing_hash)
+			.map(|req| (req, Arc::clone(&ctx)))
+			.and_then(PrepareGapRecoveryBuild::run)
+			.and_then(BuildGapRecoveryFrame::run)
+			.map(|frame| (frame, Arc::clone(&ctx)))
+			.and_then(FinalizeChainOutgoing::run)
+			.run()?;
 
-		self.chain_processor().finalize_outgoing(&request_frame)?;
 		trace.event(format!("{}_send_frame_request", self.node_name()))?;
 
-		self.send_frame(pool, upstream_addr, request_frame).await?;
+		EmitFrameToNetwork::run((frame, upstream_addr, ctx)).await?;
 		Ok(())
 	}
 }
@@ -239,6 +245,7 @@ servlet! {
 								response,
 								node_name: config.node_name().to_string(),
 							};
+
 							workers.relay::<FrameResponseHandlerWorker>(Arc::new(request)).await??;
 						},
 						RelayMessage::Command(_) => {
@@ -366,6 +373,7 @@ servlet! {
 										&config.earth_relay_signing_key,
 										&config.shared_cipher,
 									)?;
+
 									config.chain_processor.finalize_outgoing(&response_frame)?;
 									return Ok(Some(response_frame));
 								},
@@ -390,6 +398,7 @@ servlet! {
 										&config.earth_relay_signing_key,
 										&config.shared_cipher,
 									)?;
+
 									config.chain_processor.finalize_outgoing(&cascade_frame)?;
 									config.send_frame(cascade_pool, cascade_addr, cascade_frame).await?;
 									return Ok(None);
@@ -403,6 +412,7 @@ servlet! {
 								response,
 								node_name: config.node_name().to_string(),
 							};
+
 							workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
 							// Servlet builds ACK
@@ -428,8 +438,6 @@ servlet! {
 							} else {
 								// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
 								let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
-
-								// Forward to Mission Control
 								if is_telemetry {
 									trace.event("earth_relay_receive_telemetry_from_mars")?;
 									trace.event("earth_relay_forward_telemetry_to_mc")?;
@@ -567,6 +575,7 @@ servlet! {
 										&config.mars_relay_signing_key,
 										&config.shared_cipher,
 									)?;
+
 									config.chain_processor.finalize_outgoing(&response_frame)?;
 									return Ok(Some(response_frame));
 								},
@@ -591,8 +600,10 @@ servlet! {
 										&config.mars_relay_signing_key,
 										&config.shared_cipher,
 									)?;
+
 									config.chain_processor.finalize_outgoing(&cascade_frame)?;
 									config.send_frame(cascade_pool, cascade_addr, cascade_frame).await?;
+
 									return Ok(None);
 								},
 								_ => {}
@@ -604,6 +615,7 @@ servlet! {
 								response,
 								node_name: config.node_name().to_string(),
 							};
+
 							workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
 							// Servlet builds ACK
@@ -620,8 +632,6 @@ servlet! {
 				if from_rover {
 					// Determine message type from frame ID (relay-telem-NNN vs relay-ack-NNN)
 					let is_telemetry = frame.metadata.id.starts_with(b"relay-telem");
-
-					// Forward to Earth Relay
 					if is_telemetry {
 						trace.event("mars_relay_receive_telemetry_from_rover")?;
 						trace.event("mars_relay_forward_telemetry_to_earth")?;
@@ -688,6 +698,7 @@ servlet! {
 					upstream_addr,
 					&trace,
 				).await?;
+
 				Ok(None)
 			},
 		}
@@ -777,7 +788,7 @@ servlet! {
 				).await?;
 
 				return Ok(None);
-			}
+			},
 		}
 
 		// Decrypt and decode RelayMessage
@@ -800,6 +811,7 @@ servlet! {
 				)?;
 
 				trace.event("rover_send_ack")?;
+
 				Ok(Some(ack_frame))
 			},
 		RelayMessage::FrameRequest(request) => {
@@ -818,6 +830,7 @@ servlet! {
 						&config.rover_signing_key,
 						&config.shared_cipher,
 					)?;
+
 					config.chain_processor.finalize_outgoing(&response_frame)?;
 					Ok(Some(response_frame))
 				},
@@ -833,6 +846,7 @@ servlet! {
 				response,
 				node_name: config.node_name().to_string(),
 			};
+
 			workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
 			// Servlet builds ACK

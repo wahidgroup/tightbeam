@@ -385,8 +385,12 @@ where
 		// 7. Decrypt and store session key
 		self.decrypt_session_key(enveloped_data_der).await?;
 
-		// Transcript implicitly locked for CMS (provided externally). Mark AEAD derivation here
-		// as session key material now available.
+		// 8. Lock transcript and mark AEAD derivation now that session key material is available.
+		// For CMS, transcript is locked here (after key exchange processed) rather than during
+		// server finished preparation, since session key derivation happens at this point.
+		if !self.invariants.transcript_locked {
+			self.invariants.lock_transcript()?;
+		}
 		self.invariants.derive_aead_once()?;
 
 		Ok(())
@@ -402,8 +406,6 @@ where
 		// Compute transcript hash if not already set
 		if self.transcript_hash.is_none() {
 			self.transcript_hash = Some(self.compute_transcript_hash());
-			// Lock transcript now that it's computed
-			self.invariants.lock_transcript()?;
 		}
 
 		// Hash the transcript hash
@@ -453,10 +455,9 @@ where
 
 		let octet_string = OctetString::new(transcript_hash)?;
 		let econtent_der = octet_string.to_der()?;
-		let encap_content_info = EncapsulatedContentInfo {
-			econtent_type: crate::oids::DATA,
-			econtent: Some(crate::der::Any::new(crate::der::Tag::OctetString, econtent_der.as_slice())?),
-		};
+		let econtent_any = crate::der::Any::from_der(&econtent_der)?;
+		let encap_content_info =
+			EncapsulatedContentInfo { econtent_type: crate::oids::DATA, econtent: Some(econtent_any) };
 
 		let signed_data = SignedData {
 			version: CmsVersion::V1,

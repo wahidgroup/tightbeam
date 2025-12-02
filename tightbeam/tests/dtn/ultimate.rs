@@ -143,7 +143,6 @@ impl Default for DtnScenarioConfig {
 			Arc::clone(&rover_store),
 			Arc::new(RwLock::new(MessageChainState::new("Rover".to_string()))),
 			Arc::new(RwLock::new(OutOfOrderBuffer::new(10))),
-			"Rover".to_string(),
 		));
 
 		Self {
@@ -710,7 +709,6 @@ tb_scenario! {
 				Arc::clone(&mc_store),
 				Arc::new(RwLock::new(MessageChainState::new("MissionControl".to_string()))),
 				Arc::new(RwLock::new(OutOfOrderBuffer::new(10))),
-				"MissionControl".to_string(),
 			));
 			let mc_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&mc_processor)));
 
@@ -722,7 +720,6 @@ tb_scenario! {
 				Arc::clone(&earth_relay_store),
 				Arc::new(RwLock::new(MessageChainState::new("EarthRelay".to_string()))),
 				Arc::new(RwLock::new(OutOfOrderBuffer::new(10))),
-				"EarthRelay".to_string(),
 			));
 			let earth_relay_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&earth_relay_processor)));
 
@@ -734,7 +731,6 @@ tb_scenario! {
 				Arc::clone(&mars_relay_store),
 				Arc::new(RwLock::new(MessageChainState::new("MarsRelay".to_string()))),
 				Arc::new(RwLock::new(OutOfOrderBuffer::new(10))),
-				"MarsRelay".to_string(),
 			));
 			let mars_relay_frame_builder = Arc::new(FrameBuilderHelper::new(Arc::clone(&mars_relay_processor)));
 

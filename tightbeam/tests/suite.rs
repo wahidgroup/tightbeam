@@ -5,6 +5,9 @@
 // Common test helpers
 mod common;
 
+// Job/Pipeline tests
+mod jobs;
+
 // Instrumentation tests
 #[cfg(feature = "instrument")]
 mod instrumentation;
@@ -47,6 +50,10 @@ mod fmea;
 // Delay-Tolerant Networking tests
 #[cfg(feature = "full")]
 mod dtn;
+
+// Security tests
+#[cfg(feature = "transport")]
+mod security;
 
 // DLT Network test
 // #[cfg(feature = "full")]

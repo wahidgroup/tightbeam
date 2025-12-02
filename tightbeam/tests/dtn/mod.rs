@@ -28,9 +28,9 @@
 //! - `clock.rs`: Simulated mission clock with realistic Mars-Earth delays
 //! - `messages.rs`: Rover telemetry, Earth commands, and consensus types
 //! - `faults.rs`: Fault flags and fault handling logic
-//! - `utils.rs`: UUID generator and helper functions
 //! - `servlets.rs`: Earth and Relay servlet definitions
-//! - `types.rs`: Base DTN types and custom error types
+//! - `storage.rs`: Frame storage and DtnPayload type
+//! - `ordering.rs`: Out-of-order buffer and ordering error types
 //! - `ultimate.rs`: Ultimate DTN test demonstrating all framework capabilities
 
 #![cfg(all(
@@ -54,10 +54,10 @@ pub mod fault_manager;
 pub mod fault_matrix;
 pub mod faults;
 pub mod frame_builder;
+pub mod jobs;
 pub mod messages;
 pub mod ordering;
 pub mod servlets;
 pub mod storage;
-pub mod types;
 pub mod ultimate;
 pub mod workers;

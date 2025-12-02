@@ -10,7 +10,6 @@ worker! {
 	handle: |request, trace| async move {
 		// Convert command type back to RoverCommand for execution
 		let command = RoverCommand::try_from(request.command_type)?;
-
 		match command {
 			RoverCommand::CollectSample { .. } => {
 				trace.event("rover_execute_collect_sample")?;

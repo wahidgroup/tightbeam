@@ -4,9 +4,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tightbeam::asn1::Frame;
 use tightbeam::crypto::hash::{Digest, Sha3_256};
-use tightbeam::der::{Decode, Encode};
+use tightbeam::der::{Decode, Encode, Sequence};
 use tightbeam::pkcs12::digest_info::DigestInfo;
-use tightbeam::TightBeamError;
+use tightbeam::{Beamable, TightBeamError};
+
+/// DTN payload for multi-hop communication (used in tests)
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+pub struct DtnPayload {
+	/// Payload content
+	pub content: Vec<u8>,
+	/// Source node identifier
+	pub source_node: String,
+	/// Destination node identifier
+	pub dest_node: String,
+	/// Hop count for tracking message path
+	pub hop_count: u32,
+}
 
 /// Verdict from cryptographic chain verification
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +65,7 @@ impl FrameStore {
 		// Write to disk
 		let file_path = self.storage_dir.join(format!("{}.frame", frame_id));
 		let frame_bytes = frame.to_der()?;
+
 		std::fs::write(&file_path, &frame_bytes).map_err(|e| {
 			TightBeamError::IoError(std::io::Error::new(e.kind(), format!("Failed to write frame: {}", e)))
 		})?;
@@ -81,26 +95,31 @@ impl FrameStore {
 	/// Retrieve a frame by its hash (searches all stored frames)
 	pub fn retrieve_by_hash(&mut self, hash: &[u8]) -> Result<Option<Frame>, TightBeamError> {
 		// Check memory cache first
-		for frame in self.frames.values() {
-			let frame_bytes = frame.to_der()?;
-			let frame_hash = Sha3_256::digest(&frame_bytes);
-			if frame_hash.as_slice() == hash {
-				return Ok(Some(frame.clone()));
-			}
+		let cached = self.frames.values().find_map(|frame| {
+			frame
+				.to_der()
+				.ok()
+				.filter(|bytes| Sha3_256::digest(bytes).as_slice() == hash)
+				.map(|_| frame.clone())
+		});
+
+		if cached.is_some() {
+			return Ok(cached);
 		}
 
 		// Search disk storage
-		let frame_ids = self.list_frames()?;
-		for id in frame_ids {
-			let frame = self.retrieve(&id)?;
-			let frame_bytes = frame.to_der()?;
-			let frame_hash = Sha3_256::digest(&frame_bytes);
-			if frame_hash.as_slice() == hash {
-				return Ok(Some(frame));
-			}
-		}
-
-		Ok(None)
+		self.list_frames()?
+			.into_iter()
+			.find_map(|id| {
+				self.retrieve(&id).ok().filter(|frame| {
+					frame
+						.to_der()
+						.ok()
+						.map(|bytes| Sha3_256::digest(&bytes).as_slice() == hash)
+						.unwrap_or(false)
+				})
+			})
+			.map_or(Ok(None), |frame| Ok(Some(frame)))
 	}
 
 	/// Verify cryptographic chain of frames
@@ -109,69 +128,46 @@ impl FrameStore {
 	/// actual hash of the previous frame, proving integrity without
 	/// requiring trusted intermediaries.
 	pub fn verify_chain(&self, frames: &[Frame]) -> Result<ChainVerdict, TightBeamError> {
-		let mut verdict = ChainVerdict { valid: true, broken_links: Vec::new(), verified_count: 0 };
-		for (i, frame) in frames.iter().enumerate() {
-			if i == 0 {
-				// First frame has no previous
-				verdict.verified_count += 1;
-				continue;
-			}
+		let broken_links: Vec<(usize, String)> = frames
+			.iter()
+			.enumerate()
+			.skip(1) // First frame has no previous
+			.filter_map(|(i, frame)| {
+				let prev_frame = &frames[i - 1];
+				let prev_hash = prev_frame.to_der().ok().map(|bytes| Sha3_256::digest(&bytes))?;
 
-			let prev_frame = &frames[i - 1];
-			let prev_bytes = prev_frame.to_der()?;
-			let prev_hash = Sha3_256::digest(&prev_bytes);
-
-			// Check if current frame references previous frame
-			let expected_digest = frame.metadata.previous_frame.as_ref();
-			match expected_digest {
-				Some(digest_info) => {
-					if verify_digest(&prev_hash, digest_info) {
-						verdict.verified_count += 1;
-					} else {
-						verdict.valid = false;
-						verdict.broken_links.push((i, "Hash mismatch".to_string()));
-					}
+				match frame.metadata.previous_frame.as_ref() {
+					Some(digest_info) if verify_digest(&prev_hash, digest_info) => None,
+					Some(_) => Some((i, "Hash mismatch".to_string())),
+					None => Some((i, "Missing previous_frame".to_string())),
 				}
-				None => {
-					verdict.valid = false;
-					verdict.broken_links.push((i, "Missing previous_frame".to_string()));
-				}
-			}
-		}
+			})
+			.collect();
 
-		Ok(verdict)
+		let verified_count = frames.len() - broken_links.len();
+		Ok(ChainVerdict { valid: broken_links.is_empty(), broken_links, verified_count })
 	}
 
 	/// List all stored frame IDs
 	pub fn list_frames(&self) -> Result<Vec<String>, TightBeamError> {
-		let mut frame_ids = Vec::new();
-		let entries = std::fs::read_dir(&self.storage_dir)?;
-		for entry in entries {
-			let entry = entry?;
-			let path = entry.path();
-
-			if path.extension().and_then(|s| s.to_str()) == Some("frame") {
-				if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-					frame_ids.push(stem.to_string());
-				}
-			}
-		}
-
-		Ok(frame_ids)
+		Ok(std::fs::read_dir(&self.storage_dir)?
+			.filter_map(Result::ok)
+			.filter_map(|entry| {
+				let path = entry.path();
+				(path.extension()?.to_str()? == "frame").then(|| path.file_stem()?.to_str().map(String::from))?
+			})
+			.collect())
 	}
 
 	/// Clear all stored frames
 	pub fn clear(&mut self) -> Result<(), TightBeamError> {
 		self.frames.clear();
 
-		let entries = std::fs::read_dir(&self.storage_dir)?;
-		for entry in entries {
-			let entry = entry?;
-			let path = entry.path();
-			if path.extension().and_then(|s| s.to_str()) == Some("frame") {
-				std::fs::remove_file(&path)?;
-			}
-		}
+		std::fs::read_dir(&self.storage_dir)?
+			.filter_map(Result::ok)
+			.map(|entry| entry.path())
+			.filter(|path| path.extension().and_then(|s| s.to_str()) == Some("frame"))
+			.try_for_each(std::fs::remove_file)?;
 
 		Ok(())
 	}
@@ -186,7 +182,6 @@ fn verify_digest(computed: &[u8], expected: &DigestInfo) -> bool {
 mod tests {
 	use super::super::ordering::OutOfOrderBuffer;
 	use super::*;
-	use crate::dtn::types::DtnPayload;
 	use tightbeam::compose;
 
 	#[test]
