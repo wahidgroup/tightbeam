@@ -174,6 +174,8 @@ versioned metadata structures for high-fidelity information transmission.
 12. [Misc](#12-misc)
 	- 12.1. [Utilities](#121-utilities)
 		- 12.1.1. [URNs](#1211-urns)
+		- 12.1.2. [Jobs](#1212-jobs)
+		- 12.1.3. [Job Pipelines](#1213-job-pipelines)
 13. [End-to-End Examples](#13-end-to-end-examples)
 	- 13.1. [Complete Client-Server Application](#131-complete-client-server-application)
 14. [References](#14-references)
@@ -1814,11 +1816,11 @@ the basics of processing and communication, we can start at these base levels
 and develop from here. The goal of EECI is to operate on these base layers
 across any transmission protocol:
 - thread-thread.
-- thread-port-thread.
+- thread-protocol-thread.
 
 ### 9.3 Components
 
-There are four main components to the EECI:
+There are four main components to EECI:
 - [Workers](#931-e-workers) - Efficient processing units
 - [Servlets](#932-e-servlets) - Exchange endpoints
 - [Clusters](#933-c-clusters) - Compute orchestration
@@ -1858,7 +1860,7 @@ tightbeam::worker! {
 Not unlike supraorganisms, we can name them, and their "head" may possess
 a specific configuration (config). They may or may not have receptors which
 can be used to optionally gate messages. The "thorax" is itself the container
-for which isolates the entity within its own scoped thread--locality. Finally,
+which isolates the entity within its own scoped thread--locality. Finally,
 its "abdomen" is the handle which digests the message and produces a response.
 
 The important thing to note is that workers operate on local information
@@ -1866,6 +1868,9 @@ within their bounded scope. They are not aware of the larger system and only
 operate on the message they are given. This is a critical aspect of the EECI
 and allows for a high degree of parallelism and fault tolerance. As a result,
 they do not have access to the full Frame nor should they need it.
+
+> Note: It is highly discouraged to workaround the Frame limitation by passing
+	the Frame in a message parameter.
 
 ##### Testing
 
@@ -1924,6 +1929,10 @@ as a set of configurations. Servlets must be provided a relay which is used to
 relay `Message` types to the worker without the entire Frame. A servlet must
 only be responsible for a single message type.
 
+> Note: Servlets must only be responsible for a single message type however,
+	using an ASN.1 Choice type allows for related concerns to be handled
+	within the same servlet.
+
 **Step 1**: Define configuration struct outside the macro:
 
 ```rust
@@ -1961,7 +1970,7 @@ tightbeam::servlet! {
 		};
 
 		Ok(Some(compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: b"response-id",
 				message: ResponseMessage {
 					result: reply.result,
 					is_winner,
@@ -3193,7 +3202,10 @@ tb_scenario! {
 		.with_spec(AssertSpecType::latest())          // Layer 1 assertion spec
 		.with_csp(ProcessSpecType)                    // OPTIONAL: Layer 2 CSP model (requires testing-csp)
 		.with_fdr(FdrConfig { ... })                  // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-		.with_trace(TbInstrumentationConfig { ... })  // OPTIONAL: instrumentation/trace config (§11)
+		.with_trace(TraceConfig::builder()            // OPTIONAL: unified trace config (§11)
+			.with_instrumentation(TbInstrumentationConfig { ... })
+			.with_logger(LoggerConfig::new(...))
+			.build())
 		.with_hooks(TestHooks { ... })                // OPTIONAL: on_pass/on_fail callbacks
 		.build(),
 	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
@@ -3992,14 +4004,17 @@ let filter = LogFilter::new(LogLevel::Warning)
 #### Integration
 
 ```rust
-use tightbeam::trace::{TraceCollector, logging::*};
+use tightbeam::trace::{TraceConfig, logging::*};
 
 let backend = Box::new(StdoutBackend);
 let filter = LogFilter::new(LogLevel::Warning);
 let config = LoggerConfig::new(backend, filter)
 	.with_default_level(LogLevel::Info);
 
-let trace = TraceCollector::default().with_logger(config);
+let trace: TraceCollector = TraceConfig::builder()
+	.with_logger(config)
+	.build();
+
 trace.event("msg")?.with_log_level(LogLevel::Error).emit();
 ```
 
@@ -4013,9 +4028,11 @@ tightbeam provides a small `utils` module family for cross-cutting concerns.
 
 #### 12.1.1 URNs
 
+**Module**: `tightbeam::utils::urn`
+
 The URN subsystem provides:
 
-- `Urn<'a>`: RFC 8141-compliant `urn:<nid>:<nss>` representation.
+- `Urn<'a>`: RFC 8141-compliant `urn:<nid>:<nss>` representation.
 - `UrnBuilder`: a fluent builder for constructing and validating URNs from 
 	either a raw NID/NSS or structured components.
 - `UrnSpec` / `UrnValidationError`: traits and error types for 
@@ -4051,6 +4068,259 @@ fn build_customer_urn() -> Result<(), UrnValidationError> {
 
 	Ok(())
 }
+```
+
+#### 12.1.2 Jobs
+
+**Module**: `tightbeam::utils::task`
+
+The `job!` macro implements the **Command Pattern** for encapsulating executable
+units of work as zero-sized types (ZST). Jobs provide a lightweight abstraction
+for reusable, composable, and testable logic without runtime overhead.
+
+**Imports**:
+
+```rust
+// Macros are exported at crate root
+use tightbeam::job;
+
+// Traits and types are in utils::task
+use tightbeam::utils::task::{Job, AsyncJob, Pipeline, join};
+```
+
+**Key Properties**:
+- **Zero-Cost**: Generates a ZST struct with a single static method
+- **Namespace Organization**: Groups related functionality under a type name
+- **Composable**: Jobs can be passed as types and invoked uniformly
+- **Testable**: Stateless functions are easy to test in isolation
+- **Protocol Independence**: Works with both sync and async execution contexts
+
+**Design Rationale**: Jobs serve as a fundamental behavioral unit in tightbeam,
+analogous to functions-as-objects in object-oriented design. They provide a
+consistent interface for executable commands across different contexts.
+
+**Syntax**:
+
+```rust
+// Async job
+job! {
+	name: JobName,
+	async fn run(param1: Type1, param2: Type2) -> ReturnType {
+		// Implementation
+	}
+}
+
+// Sync job
+job! {
+	name: JobName,
+	fn run(param1: Type1, param2: Type2) -> ReturnType {
+		// Implementation
+	}
+}
+```
+
+**Traits**:
+
+The `job!` macro automatically implements marker traits for job handling:
+
+```rust
+/// Synchronous job trait
+pub trait Job {
+	type Input;
+	type Output;
+	fn run(input: Self::Input) -> Self::Output;
+}
+
+/// Asynchronous job trait
+pub trait AsyncJob {
+	type Input;
+	type Output;
+	fn run(input: Self::Input) -> impl Future<Output = Self::Output> + Send;
+}
+```
+
+#### 12.1.3 Job Pipelines
+
+**Module**: `tightbeam::utils::task`
+
+The `Pipeline` trait extends Rust's `Result<T, E>` with job composition 
+capabilities, making Result itself a pipeline. This design enables seamless 
+integration between jobs and standard Rust code with zero learning curve.
+
+**Imports**:
+
+```rust
+use tightbeam::job;  // Macro for creating jobs
+use tightbeam::utils::task::{Pipeline, join};
+```
+
+**Core Concept**: If you know how to use `Result`, you already know how to use pipelines.
+
+**Design Principles**:
+
+1. **Result is a Pipeline** - `Result<T, E>` implements `Pipeline` directly
+2. **Organic Integration** - Mix jobs with standard Result methods seamlessly
+3. **Zero Learning Curve** - Uses familiar Result methods (`and_then`, `map`, `or_else`)
+4. **Optional Trace** - Use `PipelineBuilder` for automatic trace event emission
+5. **Idiomatic Rust** - Follows Result/Future conventions exactly
+
+**Basic Usage - Jobs as Pipelines**:
+
+```rust
+use tightbeam::utils::task::Pipeline;
+
+// Jobs return Results, which are pipelines
+let frame = CreateHandshakeRequest::run(client_id, nonce)
+	.map(|req| req.with_timestamp(now()))             // Core Result::map
+	.and_then(|req| ValidateRequest::run(req))        // Job
+	.map_err(|e| TightBeamError::ValidationFailed(e)) // Core Result::map_err
+	.and_then(|req| SendRequest::run(req))            // Another job
+	.run()?;                                          // Execute the pipeline
+```
+
+**Mixed Composition**:
+
+```rust
+// Start from existing Result
+let config: Result<Config, Error> = parse_config_file(path);
+
+// Chain jobs onto it organically
+config
+	.and_then(|cfg| ValidateConfig::run(cfg))
+	.and_then(|cfg| SaveConfig::run(cfg))
+	.map(|_| "Configuration saved successfully")
+	.and_then(|msg| NotifyUser::run(msg))
+	.run()?;
+```
+
+**Parallel Execution with `join()`**:
+
+```rust
+use tightbeam::utils::task::join;
+
+// Both return Results, both implement Pipeline
+let (encrypted, signed) = join(
+	EncryptPayload::run(payload),
+	SignPayload::run(payload)
+).run()?;
+
+// Use results
+SendRequest::run(encrypted, signed)?;
+```
+
+**Fallback Handling**:
+
+```rust
+// Fallback to alternative on error
+let frame = SendRequest::run(request)
+	.or(|| UseCachedResponse::run())  // Try fallback on error
+	.or_else(|e| HandleError::run(e)) // Error recovery
+	.run()?;
+```
+
+**Automatic Trace with `PipelineBuilder`**:
+
+When you need trace event emission, use `PipelineBuilder` to create a traced 
+pipeline. Job names are automatically converted to snake_case URN events:
+
+```rust
+use tightbeam::utils::task::PipelineBuilder;
+
+// Create pipeline with trace context
+PipelineBuilder::new(trace)
+	.start((client_id, nonce))
+	// Auto-emits: urn:tightbeam:instrumentation:event/create_handshake_request_start
+	//             urn:tightbeam:instrumentation:event/create_handshake_request_success
+	.and_then(|(id, n)| CreateHandshakeRequest::run(id, n))
+	.map(|req| req.validate())  // No trace event (standard map)
+	// Auto-emits: urn:tightbeam:instrumentation:event/validate_request_*
+	.and_then(|req| ValidateRequest::run(req))
+	// Auto-emits: urn:tightbeam:instrumentation:event/send_request_*
+	.and_then(|req| SendRequest::run(req))
+	.run()?;
+```
+
+**Retry with Policy**:
+
+```rust
+use tightbeam::transport::policy::RestartLinearBackoff;
+
+// Add retry logic to any pipeline
+let result = SendRequest::run(request)
+	.with_retry(RestartLinearBackoff::new(3, 1000, 1, None))
+	.run()?;
+```
+
+**Testing Integration**:
+
+Pipelines work seamlessly with `tb_scenario!`:
+
+```rust
+tb_assert_spec! {
+	pub HandshakeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("pipeline_start", exactly!(1)),
+			("pipeline_complete", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: test_pipeline_workflow,
+	config: ScenarioConf::builder()
+		.with_spec(HandshakeSpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| {
+			trace.event("pipeline_start")?;
+			
+			// Mix standard Result code with jobs
+			let _result = PipelineBuilder::new(Arc::clone(&trace))
+				.start(input)
+				.and_then(|x| CreateHandshakeRequest::run(x, nonce))
+				.map(|req| req.with_metadata())
+				.and_then(|req| ValidateRequest::run(req))
+				.run()?;
+			
+			trace.event("pipeline_complete")?;
+			Ok(())
+		}
+	}
+}
+```
+
+**Complete Example**:
+
+```rust
+use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
+
+// Mix everything: jobs, Results, parallel execution, fallbacks, trace
+let session_id = PipelineBuilder::new(trace)
+	.start(client_id)
+	// Job with auto-trace
+	.and_then(|id| CreateHandshakeRequest::run(id, nonce))
+	// Standard Result operation
+	.map(|req| req.add_timestamp(now()))
+	// Parallel execution
+	.and_then(|req| {
+		let encrypted = EncryptPayload::run(payload);
+		let signed = SignPayload::run(payload);
+		
+		join(encrypted, signed).map(|(e, s)| (req, e, s))
+	})
+	// Job with retry
+	.and_then(|(req, enc, sig)| SendRequest::run(req, enc, sig))
+	.with_retry(RestartLinearBackoff::new(3, 1000, 1, None))
+	// Fallback on error
+	.or(|| UseCachedResponse::run())
+	// Error recovery
+	.or_else(|e| HandleError::run(e))
+	// Extract result
+	.and_then(|resp| ExtractSessionId::run(resp))
+	.run()?;
 ```
 
 ## 13. End-to-End Examples
