@@ -248,6 +248,19 @@ where
 	closure(trace)
 }
 
+/// Helper function for pipeline exec closures (Pipeline environment)
+/// Accepts closures that return Result<T, TightBeamError> and maps to Result<(), TightBeamError>
+#[doc(hidden)]
+pub fn __tb_call_pipeline_exec<F, T>(
+	closure: F,
+	pipeline: crate::utils::task::PipelineBuilder,
+) -> Result<(), crate::TightBeamError>
+where
+	F: FnOnce(crate::utils::task::PipelineBuilder) -> Result<T, crate::TightBeamError>,
+{
+	closure(pipeline).map(|_| ())
+}
+
 /// Helper function for async exec closures with Arc (multi-specs bare environment)
 #[doc(hidden)]
 #[cfg(feature = "tokio")]
@@ -651,6 +664,25 @@ macro_rules! tb_scenario {
 		}
 	};
 
+	// ===== Pipeline environment (sync) =====
+	// Provides PipelineBuilder with trace context pre-configured
+	// Closure returns Result<T, TightBeamError> directly from .run()
+	(
+		name: $test_name:ident,
+		config: $config:expr,
+		environment Pipeline { exec: $exec_closure:expr }
+		$(,)?
+	) => {
+		#[test]
+		fn $test_name() {
+			$crate::tb_scenario!(@execute_unified
+				name: $test_name,
+				config: $config,
+				environment Pipeline { exec: $exec_closure }
+			)
+		}
+	};
+
 	// ===== Worker environment (async) =====
 	(
 		name: $test_name:ident,
@@ -794,6 +826,31 @@ macro_rules! tb_scenario {
 				}
 			}
 		}
+
+		// Verify specs and call hooks (DRY helper)
+		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, exec_result);
+	}};
+
+	// ===== INTERNAL: Execute unified scenario for Pipeline environment =====
+	(@execute_unified
+		name: $test_name:ident,
+		config: $config:expr,
+		environment Pipeline { exec: $exec_closure:expr }
+	) => {{
+		use $crate::testing::TBSpec;
+		use $crate::utils::task::PipelineBuilder;
+
+		let config = $config;
+		let trace = config.trace();
+
+		// Create PipelineBuilder with trace context
+		let pipeline = PipelineBuilder::new(std::sync::Arc::clone(&trace));
+
+		// Execute the pipeline closure (returns Result<T, E>, mapped to Result<(), E>)
+		let exec_result = $crate::testing::macros::__tb_call_pipeline_exec($exec_closure, pipeline);
+
+		// Build hook context and verify
+		let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
 
 		// Verify specs and call hooks (DRY helper)
 		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, exec_result);

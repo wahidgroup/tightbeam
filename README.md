@@ -3862,6 +3862,11 @@ Instrumentation events are also identified by **URNs** defined in
 names for traces, events, seeds, and verdicts, and is used by the
 instrumentation subsystem to label evidence artifacts.
 
+**Shorthand Event Matching**: In `tb_assert_spec!` and `tb_process_spec!`, you 
+can use shorthand labels instead of full URNs. The shorthand `"foo"` matches 
+any event containing `instrumentation:event/foo`, such as 
+`urn:tightbeam:instrumentation:event/foo` or `urn:custom:instrumentation:event/foo`.
+
 ### 11.3 Event Structure
 Conceptual fixed layout (names illustrative):
 ```
@@ -4160,9 +4165,9 @@ use tightbeam::utils::task::{Pipeline, join};
 
 1. **Result is a Pipeline** - `Result<T, E>` implements `Pipeline` directly
 2. **Organic Integration** - Mix jobs with standard Result methods seamlessly
-3. **Zero Learning Curve** - Uses familiar Result methods (`and_then`, `map`, `or_else`)
+3. **Minimal Learning Curve** - Uses familiar Result methods (`and_then`, `map`, `or_else`)
 4. **Optional Trace** - Use `PipelineBuilder` for automatic trace event emission
-5. **Idiomatic Rust** - Follows Result/Future conventions exactly
+5. **Idiomatic Rust** - Follows Result/Future conventions
 
 **Basic Usage - Jobs as Pipelines**:
 
@@ -4256,37 +4261,59 @@ let result = SendRequest::run(request)
 Pipelines work seamlessly with `tb_scenario!`:
 
 ```rust
+// L1: Assertion specification
 tb_assert_spec! {
-	pub HandshakeSpec,
+	pub PipelineSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pipeline_start", exactly!(1)),
-			("pipeline_complete", exactly!(1))
+			// Shorthand labels match full URNs
+			("create_handshake_request_start", exactly!(1)),
+			("create_handshake_request_success", exactly!(1)),
+			("validate_request_start", exactly!(1)),
+			("validate_request_success", exactly!(1))
 		]
 	}
+}
+
+// L2: CSP process specification
+tb_process_spec! {
+	pub PipelineProcess,
+	events {
+		observable {
+			"create_handshake_request_start",
+			"create_handshake_request_success",
+			"validate_request_start",
+			"validate_request_success"
+		}
+		hidden {}
+	}
+	states {
+		Idle     => { "create_handshake_request_start" => Creating },
+		Creating => { "create_handshake_request_success" => Validating },
+		Validating => { "validate_request_start" => ValidatingRun },
+		ValidatingRun => { "validate_request_success" => Done },
+		Done => {}
+	}
+	terminal { Done }
 }
 
 tb_scenario! {
 	name: test_pipeline_workflow,
 	config: ScenarioConf::builder()
-		.with_spec(HandshakeSpec::latest())
+		.with_spec(PipelineSpec::latest())
+		.with_csp(PipelineProcess)
 		.build(),
-	environment Bare {
-		exec: |trace| {
-			trace.event("pipeline_start")?;
-			
-			// Mix standard Result code with jobs
-			let _result = PipelineBuilder::new(Arc::clone(&trace))
+	environment Pipeline {
+		exec: |pipeline| {
+			let input = ("test-001".to_string(), "nonce".to_string());
+			pipeline
 				.start(input)
 				.and_then(|x| CreateHandshakeRequest::run(x, nonce))
 				.map(|req| req.with_metadata())
 				.and_then(|req| ValidateRequest::run(req))
-				.run()?;
-			
-			trace.event("pipeline_complete")?;
-			Ok(())
+				.run()
 		}
 	}
 }

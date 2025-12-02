@@ -25,76 +25,81 @@ use crate::utils::urn::Urn;
 pub mod events {
 	use super::*;
 
+	pub const TIGHTBEAM_NID: &str = "tightbeam";
+	pub const TIGHTBEAM_INSTRUMENTATION_NSS: &str = "instrumentation:event/";
+	pub const TIGHTBEAM_EVENT_URN_PREFIX: &str = "urn:tightbeam:instrumentation:event/";
+
 	// Core lifecycle events
-	pub const START: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/start");
-	pub const END: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/end");
+	pub const START: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/start");
+	pub const END: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/end");
 
 	// Gate events
-	pub const GATE_ACCEPT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/gate-accept");
-	pub const GATE_REJECT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/gate-reject");
+	pub const GATE_ACCEPT: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/gate-accept");
+	pub const GATE_REJECT: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/gate-reject");
 
 	// Transport events
-	pub const REQUEST_RECV: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/request-recv");
-	pub const RESPONSE_SEND: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/response-send");
+	pub const REQUEST_RECV: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/request-recv");
+	pub const RESPONSE_SEND: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/response-send");
 
 	// Connection lifecycle events
-	pub const CONNECTION_ACCEPTED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/connection-accepted");
-	pub const CONNECTION_CLOSED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/connection-closed");
-	pub const CONNECTION_STALE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/connection-stale");
+	pub const CONNECTION_ACCEPTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/connection-accepted");
+	pub const CONNECTION_CLOSED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/connection-closed");
+	pub const CONNECTION_STALE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/connection-stale");
 	#[rustfmt::skip]
-	pub const CONNECTION_RECONNECTED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/connection-reconnected");
+	pub const CONNECTION_RECONNECTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/connection-reconnected");
 
 	// Assertion events
-	pub const ASSERT_LABEL: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/assert-label");
-	pub const ASSERT_PAYLOAD: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/assert-payload");
+	pub const ASSERT_LABEL: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/assert-label");
+	pub const ASSERT_PAYLOAD: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/assert-payload");
 
 	// Handler events
-	pub const HANDLER_ENTER: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/handler-enter");
-	pub const HANDLER_EXIT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/handler-exit");
+	pub const HANDLER_ENTER: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/handler-enter");
+	pub const HANDLER_EXIT: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/handler-exit");
 
 	// Processing events
-	pub const CRYPTO_STEP: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/crypto-step");
-	pub const COMPRESS_STEP: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/compress-step");
-	pub const ROUTE_STEP: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/route-step");
-	pub const POLICY_EVAL: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/policy-eval");
+	pub const CRYPTO_STEP: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/crypto-step");
+	pub const COMPRESS_STEP: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/compress-step");
+	pub const ROUTE_STEP: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/route-step");
+	pub const POLICY_EVAL: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/policy-eval");
 
 	// Process events
-	pub const PROCESS_TRANSITION: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/process-transition");
-	pub const PROCESS_HIDDEN: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/process-hidden");
+	pub const PROCESS_TRANSITION: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/process-transition");
+	pub const PROCESS_HIDDEN: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/process-hidden");
 
 	// FDR/exploration events
-	pub const SEED_START: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/seed-start");
-	pub const SEED_END: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/seed-end");
-	pub const STATE_EXPAND: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/state-expand");
-	pub const STATE_PRUNE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/state-prune");
-	pub const DIVERGENCE_DETECT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/divergence-detect");
-	pub const REFUSAL_SNAPSHOT: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/refusal-snapshot");
-	pub const ENABLED_SET_SAMPLE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/enabled-set-sample");
+	pub const SEED_START: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/seed-start");
+	pub const SEED_END: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/seed-end");
+	pub const STATE_EXPAND: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/state-expand");
+	pub const STATE_PRUNE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/state-prune");
+	pub const DIVERGENCE_DETECT: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/divergence-detect");
+	pub const REFUSAL_SNAPSHOT: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/refusal-snapshot");
+	pub const ENABLED_SET_SAMPLE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/enabled-set-sample");
 
 	// Error events
-	pub const WARN: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/warn");
-	pub const ERROR: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/error");
+	pub const WARN: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/warn");
+	pub const ERROR: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/error");
 
 	// Timing events
-	pub const TIMING_WCET: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/timing-wcet");
-	pub const TIMING_DEADLINE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/timing-deadline");
-	pub const TIMING_JITTER: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/timing-jitter");
-	pub const TIMING_SLACK: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/timing-slack");
+	pub const TIMING_WCET: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/timing-wcet");
+	pub const TIMING_DEADLINE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/timing-deadline");
+	pub const TIMING_JITTER: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/timing-jitter");
+	pub const TIMING_SLACK: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/timing-slack");
 
 	// Fault events
-	pub const FAULT_INJECTED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/fault-injected");
-	pub const FAULT_RECOVERED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/fault-recovered");
-	pub const FAULT_DETECTED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/fault-detected");
+	pub const FAULT_INJECTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/fault-injected");
+	pub const FAULT_RECOVERED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/fault-recovered");
+	pub const FAULT_DETECTED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/fault-detected");
 
 	// Schedulability events
-	pub const TASK_RELEASE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/task-release");
-	pub const TASK_COMPLETE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/task-complete");
-	pub const TASK_MISSED_DEADLINE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/task-missed-deadline");
+	pub const TASK_RELEASE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/task-release");
+	pub const TASK_COMPLETE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/task-complete");
+	pub const TASK_MISSED_DEADLINE: Urn<'static> =
+		Urn::new(TIGHTBEAM_NID, "instrumentation:event/task-missed-deadline");
 
 	// Scheduler events
-	pub const SCHEDULER_ALLOCATE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/scheduler-allocate");
-	pub const SCHEDULER_RELEASE: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/scheduler-release");
-	pub const SCHEDULER_BLOCKED: Urn<'static> = Urn::new("tightbeam", "instrumentation:event/scheduler-blocked");
+	pub const SCHEDULER_ALLOCATE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/scheduler-allocate");
+	pub const SCHEDULER_RELEASE: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/scheduler-release");
+	pub const SCHEDULER_BLOCKED: Urn<'static> = Urn::new(TIGHTBEAM_NID, "instrumentation:event/scheduler-blocked");
 }
 
 #[cfg(not(feature = "instrument"))]

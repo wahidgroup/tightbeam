@@ -45,7 +45,7 @@ pub trait Pipeline: Sized {
 	fn run(self) -> Result<Self::Output, Self::Error>;
 }
 
-// Result<T, E> IS a Pipeline!
+// Result<T, E> is a Pipeline
 impl<T, E> Pipeline for Result<T, E> {
 	type Output = T;
 	type Error = E;
@@ -54,7 +54,6 @@ impl<T, E> Pipeline for Result<T, E> {
 	where
 		F: FnOnce(T) -> Result<U, E>,
 	{
-		// Use built-in Result::and_then
 		self.and_then(f)
 	}
 
@@ -163,23 +162,32 @@ where
 	}
 }
 
-/// Convert CamelCase type name to snake_case for trace events
+/// Extract Job struct name from type_name and convert to snake_case for trace events
+///
+/// Handles Job::run function paths like `crate::module::CreateTestFrame::run`
+/// by extracting the struct name (second-to-last segment) and converting to snake_case.
 ///
 /// Examples:
-/// - `CreateHandshakeRequest` -> `create_handshake_request`
-/// - `ValidateConfig` -> `validate_config`
+/// - `suite::jobs::CreateTestFrame::run` -> `create_test_frame`
+/// - `my_crate::ValidateConfig::run` -> `validate_config`
+/// - `CreateHandshakeRequest` -> `create_handshake_request` (fallback)
 fn to_snake_case(type_name: &str) -> String {
-	// Extract just the type name, removing module paths
-	// rsplit always yields at least one element, so unwrap_or is defensive only
-	let name = type_name.rsplit("::").next().unwrap_or(type_name);
-	// Worst case: every char is uppercase → "ABC" becomes "a_b_c" (2n - 1 chars)
-	// Use saturating arithmetic to prevent overflow on pathological input
-	let capacity = name.len().saturating_mul(2);
+	// Split by "::" and collect segments
+	let segments: Vec<&str> = type_name.split("::").collect();
+	// For Job::run paths, the struct name is second-to-last (before "run")
+	// e.g., ["suite", "jobs", "CreateTestFrame", "run"] -> "CreateTestFrame"
+	let name = if segments.len() >= 2 && segments.last() == Some(&"run") {
+		segments[segments.len() - 2]
+	} else {
+		// Fallback: use last segment
+		segments.last().copied().unwrap_or(type_name)
+	};
 
+	// Worst case: every char is uppercase → "ABC" becomes "a_b_c" (2n - 1 chars)
+	let capacity = name.len().saturating_mul(2);
 	let mut result = String::with_capacity(capacity);
 	for (i, ch) in name.chars().enumerate() {
 		if ch.is_uppercase() {
-			// Add underscore before uppercase if not at start
 			if i > 0 {
 				result.push('_');
 			}
@@ -234,7 +242,7 @@ where
 	where
 		F: FnOnce(T) -> Result<U, E>,
 	{
-		// Extract job name from closure type
+		// Extract job name from closure type (e.g., "crate::CreateTestFrame::run" -> "create_test_frame")
 		let job_name = to_snake_case(core::any::type_name::<F>());
 		TracedResult {
 			result: self.result.and_then(|val| {
@@ -384,10 +392,16 @@ mod tests {
 
 	#[test]
 	fn test_to_snake_case() {
+		// Simple type names (fallback behavior)
 		assert_eq!(to_snake_case("CreateHandshakeRequest"), "create_handshake_request");
 		assert_eq!(to_snake_case("ValidateConfig"), "validate_config");
 		assert_eq!(to_snake_case("HTTPRequest"), "h_t_t_p_request");
 		assert_eq!(to_snake_case("simple"), "simple");
+
+		// Job::run paths - extracts struct name (second-to-last segment)
+		assert_eq!(to_snake_case("suite::jobs::CreateTestFrame::run"), "create_test_frame");
+		assert_eq!(to_snake_case("my_crate::ValidateFrame::run"), "validate_frame");
+		assert_eq!(to_snake_case("TransformContent::run"), "transform_content");
 	}
 
 	#[test]

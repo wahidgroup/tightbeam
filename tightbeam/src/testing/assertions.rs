@@ -10,6 +10,7 @@ extern crate alloc;
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use crate::asn1::{MessagePriority, Version};
+use crate::instrumentation::events::TIGHTBEAM_INSTRUMENTATION_NSS;
 use crate::testing::macros::Cardinality;
 
 #[cfg(feature = "std")]
@@ -18,6 +19,27 @@ use std::borrow::Cow;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AssertionLabel {
 	Custom(Cow<'static, str>),
+}
+
+impl AssertionLabel {
+	/// Check if this label matches another, supporting tightbeam URN shorthand.
+	///
+	/// Returns true if:
+	/// - Labels are exactly equal, OR
+	/// - `self` (recorded) contains `instrumentation:event/{other}` (shorthand)
+	///
+	/// This allows specs to use shorthand like `"create_frame_start"` to match
+	/// recorded URNs like `"urn:tightbeam:instrumentation:event/create_frame_start"`.
+	pub fn matches(&self, other: &AssertionLabel) -> bool {
+		if self == other {
+			return true;
+		}
+
+		// Try shorthand matching: recorded contains "instrumentation:event/{expected}"
+		let (Self::Custom(recorded), Self::Custom(expected)) = (self, other);
+		let suffix = [TIGHTBEAM_INSTRUMENTATION_NSS, expected.as_ref()].concat();
+		recorded.contains(&suffix)
+	}
 }
 
 /// Type-safe wrapper for assertion values supporting PartialEq comparison
@@ -275,10 +297,11 @@ impl AssertionContract {
 		let matching: Vec<_> = assertions
 			.iter()
 			.filter(|a| {
-				// Match label first
-				if a.label != self.label {
+				// Match label (supports tightbeam URN shorthand)
+				if !a.label.matches(&self.label) {
 					return false;
 				}
+
 				// Tag matching: if spec has tag_filter, assertion must have all those tags
 				if let Some(ref filter_tags) = self.tag_filter {
 					for filter_tag in filter_tags {
@@ -287,6 +310,7 @@ impl AssertionContract {
 						}
 					}
 				}
+
 				true
 			})
 			.collect();

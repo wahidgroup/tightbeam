@@ -747,7 +747,8 @@ impl ConsumedTrace {
 		self.assertions
 			.iter()
 			.filter(|a| {
-				&a.label == label
+				// Use matches() for tightbeam URN shorthand support
+				a.label.matches(label)
 					&& if let Some(filter_tags) = tags {
 						filter_tags.iter().all(|tag| a.tags.contains(tag))
 					} else {
