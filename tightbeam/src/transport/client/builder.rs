@@ -35,7 +35,7 @@ use x509::*;
 
 #[cfg(feature = "transport-policy")]
 mod policy {
-	pub use crate::transport::policy::{PolicyConf, RestartPolicy, RetryAction};
+	pub use crate::transport::policy::{CoreRetryPolicy, PolicyConf, RestartPolicy, RetryAction};
 }
 
 #[cfg(feature = "transport-policy")]
@@ -50,6 +50,17 @@ pub struct ClientPolicies {
 }
 
 pub struct DynRestart(pub Box<dyn RestartPolicy + Send + Sync>);
+
+impl CoreRetryPolicy for DynRestart {
+	fn max_attempts(&self) -> usize {
+		self.0.max_attempts()
+	}
+
+	fn delay_ms(&self, attempt: usize) -> u64 {
+		self.0.delay_ms(attempt)
+	}
+}
+
 impl RestartPolicy for DynRestart {
 	fn evaluate(&self, frame: Box<Frame>, failure: &TransportFailure, attempt: usize) -> RetryAction {
 		self.0.evaluate(frame, failure, attempt)

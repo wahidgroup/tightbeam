@@ -53,9 +53,43 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
+	// RestartPolicy with config: (max_attempts, delay_ms)
+	(RestartPolicy: $name:ident ($max:expr, $delay:expr) | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
+		#[derive(Default)]
+		pub struct $name;
+
+		impl $crate::transport::policy::CoreRetryPolicy for $name {
+			fn max_attempts(&self) -> usize { $max }
+			fn delay_ms(&self, attempt: usize) -> u64 { ($delay as u64).saturating_mul(attempt as u64 + 1) }
+		}
+
+		impl $crate::transport::policy::RestartPolicy for $name {
+			#[allow(unused_variables)]
+			fn evaluate(
+				&self,
+				$frame_arg: Box<$crate::Frame>,
+				$failure_arg: &$crate::transport::error::TransportFailure,
+				$attempt_arg: usize,
+			) -> $crate::transport::policy::RetryAction {
+				$($body)*
+			}
+		}
+
+		$crate::policy! { $($rest)* }
+	};
+	// RestartPolicy with max_attempts only: (max_attempts)
+	(RestartPolicy: $name:ident ($max:expr) | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
+		$crate::policy! { RestartPolicy: $name ($max, 0) | $frame_arg, $failure_arg, $attempt_arg | { $($body)* } $($rest)* }
+	};
+	// RestartPolicy default: max_attempts = 1, delay = 0
 	(RestartPolicy: $name:ident | $frame_arg:ident, $failure_arg:ident, $attempt_arg:ident | { $($body:tt)* } $($rest:tt)*) => {
 		#[derive(Default)]
 		pub struct $name;
+
+		impl $crate::transport::policy::CoreRetryPolicy for $name {
+			fn max_attempts(&self) -> usize { 1 }
+			fn delay_ms(&self, _attempt: usize) -> u64 { 0 }
+		}
 
 		impl $crate::transport::policy::RestartPolicy for $name {
 			#[allow(unused_variables)]
@@ -74,6 +108,11 @@ macro_rules! policy {
 (RestartPolicy: $name:ident { $($body:tt)* } $($rest:tt)*) => {
 	#[derive(Default)]
 	pub struct $name;
+
+	impl $crate::transport::policy::CoreRetryPolicy for $name {
+		fn max_attempts(&self) -> usize { 1 }
+		fn delay_ms(&self, _attempt: usize) -> u64 { 0 }
+	}
 
 	impl $crate::transport::policy::RestartPolicy for $name {
 		#[allow(unused_variables)]

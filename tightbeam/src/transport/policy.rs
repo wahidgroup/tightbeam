@@ -37,11 +37,23 @@ where
 	}
 }
 
-/// Restart policy trait - decides whether to retry.
+/// Core retry policy - provides basic retry configuration.
+///
+/// This is the foundation trait for all retry behavior, providing
+/// max attempts and delay calculation without transport-specific details.
+pub trait CoreRetryPolicy: Send + Sync {
+	/// Maximum number of retry attempts (0 means no retries, just initial attempt).
+	fn max_attempts(&self) -> usize;
+
+	/// Delay in milliseconds before the given attempt (0-indexed).
+	fn delay_ms(&self, attempt: usize) -> u64;
+}
+
+/// Restart policy trait - decides whether to retry transport operations.
 ///
 /// Restart policies are stateless procedures that determine retry behavior
-/// after a transport operation.
-pub trait RestartPolicy: Send + Sync {
+/// after a transport operation. Requires `CoreRetryPolicy` for basic config.
+pub trait RestartPolicy: CoreRetryPolicy {
 	/// Evaluate whether to restart after a transport operation.
 	///
 	/// # Arguments
@@ -226,3 +238,51 @@ impl_timed_backoff_policy!(RestartLinearBackoff, |policy: &RestartLinearBackoff,
 		.saturating_mul(policy.interval_ms)
 		.saturating_mul(attempt as u64 + 1)
 });
+
+// CoreRetryPolicy implementations (required by RestartPolicy supertrait)
+
+#[cfg(feature = "std")]
+impl CoreRetryPolicy for RestartExponentialBackoff {
+	fn max_attempts(&self) -> usize {
+		self.max_attempts
+	}
+
+	fn delay_ms(&self, attempt: usize) -> u64 {
+		let exp = (attempt as u32).min(63);
+		let base_delay = self.scale_factor.saturating_mul(2_u64.saturating_pow(exp));
+
+		match &self.jitter {
+			Some(jitter_strategy) => jitter_strategy.apply(base_delay),
+			None => base_delay,
+		}
+	}
+}
+
+#[cfg(feature = "std")]
+impl CoreRetryPolicy for RestartLinearBackoff {
+	fn max_attempts(&self) -> usize {
+		self.max_attempts
+	}
+
+	fn delay_ms(&self, attempt: usize) -> u64 {
+		let base_delay = self
+			.scale_factor
+			.saturating_mul(self.interval_ms)
+			.saturating_mul(attempt as u64 + 1);
+
+		match &self.jitter {
+			Some(jitter_strategy) => jitter_strategy.apply(base_delay),
+			None => base_delay,
+		}
+	}
+}
+
+impl CoreRetryPolicy for NoRestart {
+	fn max_attempts(&self) -> usize {
+		0
+	}
+
+	fn delay_ms(&self, _attempt: usize) -> u64 {
+		0
+	}
+}

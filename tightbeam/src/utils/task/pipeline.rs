@@ -1,14 +1,14 @@
 //! Job orchestration pipeline engine
 //!
-//! Implements a Pipeline trait for Result<T, E> and closures, making Result itself a pipeline.
-//! Jobs compose seamlessly with standard Rust code using familiar Result methods.
+//! Implements a Pipeline trait for Result<T, E> and closures, making Result
+//! itself a pipeline. Jobs compose seamlessly with standard Rust code using
+//! familiar Result methods.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::error::TightBeamError;
 use crate::trace::TraceCollector;
-use crate::transport::policy::RestartPolicy;
 use crate::utils::urn::Urn;
 
 /// Pipeline trait - extends Result with trace and retry capabilities
@@ -34,12 +34,6 @@ pub trait Pipeline: Sized {
 	fn or_else<F>(self, f: F) -> impl Pipeline<Output = Self::Output, Error = Self::Error>
 	where
 		F: FnOnce(Self::Error) -> Result<Self::Output, Self::Error>;
-
-	/// Retry on failure with policy
-	fn with_retry(
-		self,
-		policy: impl RestartPolicy + 'static,
-	) -> impl Pipeline<Output = Self::Output, Error = Self::Error>;
 
 	/// Execute the pipeline
 	fn run(self) -> Result<Self::Output, Self::Error>;
@@ -73,54 +67,8 @@ impl<T, E> Pipeline for Result<T, E> {
 		self.or_else(f)
 	}
 
-	fn with_retry(self, policy: impl RestartPolicy + 'static) -> impl Pipeline<Output = T, Error = E> {
-		WithRetry { result: self, policy: Box::new(policy) }
-	}
-
 	fn run(self) -> Result<T, E> {
 		self // Already a Result
-	}
-}
-
-/// Wrapper for retry logic
-pub struct WithRetry<T, E> {
-	result: Result<T, E>,
-	policy: Box<dyn RestartPolicy>,
-}
-
-impl<T, E> Pipeline for WithRetry<T, E> {
-	type Output = T;
-	type Error = E;
-
-	fn and_then<F, U>(self, f: F) -> impl Pipeline<Output = U, Error = E>
-	where
-		F: FnOnce(T) -> Result<U, E>,
-	{
-		WithRetry { result: self.result.and_then(f), policy: self.policy }
-	}
-
-	fn map<F, U>(self, f: F) -> impl Pipeline<Output = U, Error = E>
-	where
-		F: FnOnce(T) -> U,
-	{
-		WithRetry { result: self.result.map(f), policy: self.policy }
-	}
-
-	fn or_else<F>(self, f: F) -> impl Pipeline<Output = T, Error = E>
-	where
-		F: FnOnce(E) -> Result<T, E>,
-	{
-		WithRetry { result: self.result.or_else(f), policy: self.policy }
-	}
-
-	fn with_retry(self, policy: impl RestartPolicy + 'static) -> impl Pipeline<Output = T, Error = E> {
-		WithRetry { result: self.result, policy: Box::new(policy) }
-	}
-
-	fn run(self) -> Result<T, E> {
-		// TODO: Implement actual retry logic with policy
-		// For now, just return the result
-		self.result
 	}
 }
 
@@ -151,10 +99,6 @@ where
 		G: FnOnce(E) -> Result<T, E>,
 	{
 		self().or_else(g)
-	}
-
-	fn with_retry(self, policy: impl RestartPolicy + 'static) -> impl Pipeline<Output = T, Error = E> {
-		self().with_retry(policy)
 	}
 
 	fn run(self) -> Result<T, E> {
@@ -284,10 +228,6 @@ where
 		TracedResult { result: self.result.or_else(f), trace: self.trace }
 	}
 
-	fn with_retry(self, policy: impl RestartPolicy + 'static) -> impl Pipeline<Output = T, Error = E> {
-		WithRetry { result: self.result, policy: Box::new(policy) }
-	}
-
 	fn run(self) -> Result<T, E> {
 		self.result
 	}
@@ -346,13 +286,6 @@ where
 		F: FnOnce(Self::Error) -> Result<(P1::Output, P2::Output), Self::Error>,
 	{
 		self.run().or_else(f)
-	}
-
-	fn with_retry(
-		self,
-		policy: impl RestartPolicy + 'static,
-	) -> impl Pipeline<Output = (P1::Output, P2::Output), Error = Self::Error> {
-		self.run().with_retry(policy)
 	}
 
 	fn run(self) -> Result<(P1::Output, P2::Output), Self::Error> {

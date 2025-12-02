@@ -4245,17 +4245,6 @@ PipelineBuilder::new(trace)
 	.run()?;
 ```
 
-**Retry with Policy**:
-
-```rust
-use tightbeam::transport::policy::RestartLinearBackoff;
-
-// Add retry logic to any pipeline
-let result = SendRequest::run(request)
-	.with_retry(RestartLinearBackoff::new(3, 1000, 1, None))
-	.run()?;
-```
-
 **Testing Integration**:
 
 Pipelines work seamlessly with `tb_scenario!`:
