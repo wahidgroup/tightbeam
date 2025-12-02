@@ -1970,7 +1970,7 @@ tightbeam::servlet! {
 		};
 
 		Ok(Some(compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: b"response-id",
 				message: ResponseMessage {
 					result: reply.result,
 					is_winner,
@@ -4278,7 +4278,7 @@ tb_scenario! {
 			trace.event("pipeline_start")?;
 			
 			// Mix standard Result code with jobs
-			let _result = PipelineBuilder::new(trace.clone())
+			let _result = PipelineBuilder::new(Arc::clone(&trace))
 				.start(input)
 				.and_then(|x| CreateHandshakeRequest::run(x, nonce))
 				.map(|req| req.with_metadata())
