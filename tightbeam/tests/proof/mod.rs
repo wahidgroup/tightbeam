@@ -231,7 +231,7 @@ pub fn extract_pubkey_from_matrix<M: MatrixLike>(
 }
 job! {
 	name: MerkleComputeRootJob,
-	fn run(sequence: MerkleComputeRootRequest) -> MerkleResponse {
+	fn run((sequence,): (MerkleComputeRootRequest,)) -> MerkleResponse {
 		use tightbeam::crypto::hash::{Digest, Sha3_256};
 
 		if sequence.items.is_empty() {
@@ -273,7 +273,7 @@ job! {
 
 job! {
 	name: MerkleVerifyPathJob,
-	fn run(params: MerkleVerifyPathRequest) -> MerkleResponse {
+	fn run((params,): (MerkleVerifyPathRequest,)) -> MerkleResponse {
 		use tightbeam::crypto::hash::{Digest, Sha3_256};
 
 		let mut current = match octet_to_hash(&params.leaf) {
@@ -304,7 +304,7 @@ job! {
 
 job! {
 	name: LedgerStateJob,
-	fn run(ledger: Ledger) -> LedgerResult<()> {
+	fn run((ledger,): (Ledger,)) -> LedgerResult<()> {
 		if ledger.entries.len() != ledger.balances.len() {
 			return Err(LedgerError::CountMismatch);
 		}
@@ -335,7 +335,7 @@ job! {
 // Compute Merkle root for an epoch of frames
 job! {
 	name: ComputeEpochRootJob,
-	fn run(epoch_frames: Vec<Frame>) -> Result<MerkleHash> {
+	fn run((epoch_frames,): (Vec<Frame>,)) -> Result<MerkleHash> {
 		use tightbeam::crypto::hash::{Digest, Sha3_256};
 		use tightbeam::der::Encode;
 
@@ -364,7 +364,7 @@ job! {
 
 		// Compute Merkle root
 		let sequence = HashSequence { items };
-		let response = MerkleComputeRootJob::run(sequence);
+		let response = MerkleComputeRootJob::run((sequence,));
 
 		match response {
 			MerkleResponse::Root(root) => octet_to_hash(&root),
@@ -376,7 +376,7 @@ job! {
 // Verify a frame is part of an epoch using Merkle proof
 job! {
 	name: VerifyEpochMembershipJob,
-	fn run(frame: Frame, merkle_path: Vec<MerkleHash>, expected_root: MerkleHash) -> Result<bool> {
+	fn run((frame, merkle_path, expected_root): (Frame, Vec<MerkleHash>, MerkleHash)) -> Result<bool> {
 		use tightbeam::crypto::hash::{Digest, Sha3_256};
 		use tightbeam::der::Encode;
 
@@ -404,7 +404,7 @@ job! {
 			path: HashSequence { items: path_items },
 		};
 
-		let response = MerkleVerifyPathJob::run(verify_request);
+		let response = MerkleVerifyPathJob::run((verify_request,));
 
 		match response {
 			MerkleResponse::Verified(computed_root) => {
@@ -420,8 +420,8 @@ worker! {
 	name: MerkleWorker<MerkleRequest, MerkleResponse>,
 	handle: |message, _trace| async move {
 		match message {
-			MerkleRequest::ComputeRoot(sequence) => MerkleComputeRootJob::run(sequence),
-			MerkleRequest::VerifyPath(params) => MerkleVerifyPathJob::run(params),
+			MerkleRequest::ComputeRoot(sequence) => MerkleComputeRootJob::run((sequence,)),
+			MerkleRequest::VerifyPath(params) => MerkleVerifyPathJob::run((params,)),
 		}
 	}
 }
@@ -676,7 +676,7 @@ mod tests {
 				let epoch_frames = epochs[epoch_start..].to_vec();
 
 				// Compute Merkle root for the epoch
-				match ComputeEpochRootJob::run(epoch_frames) {
+				match ComputeEpochRootJob::run((epoch_frames,)) {
 					Ok(root) => {
 						println!("Epoch {} complete. Merkle root: {}", epoch_number, to_hex(&root));
 						// TODO: Anchor to Bitcoin

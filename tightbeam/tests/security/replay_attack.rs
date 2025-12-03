@@ -64,14 +64,14 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |trace| async move {
-			ReplayAttackScenario::run(trace).await
+			ReplayAttackScenario::run((trace,)).await
 		}
 	}
 }
 
 job! {
 	name: ReplayAttackScenario,
-	async fn run(trace: Arc<TraceCollector>) -> Result<(), TightBeamError> {
+	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::default();
 
 		for kind in HandshakeBackendKind::all() {

@@ -118,7 +118,7 @@ versioned metadata structures for high-fidelity information transmission.
 		- 10.2.6. [Value Assertion Helpers](#1026-value-assertion-helpers)
 		- 10.2.7. [Tag-Based Assertion Filtering](#1027-tag-based-assertion-filtering)
 		- 10.2.8. [Recording Trace Events](#1028-recording-trace-events)
-		- 10.2.9. [Timing Verification and Schedulability](#1029-timing-verification-and-schedulability)
+		- 10.2.9. [Schedulability Analysis](#1029-schedulability-analysis)
 	- 10.3. [Layer 2: Process Specifications (CSP)](#103-layer-2-process-specifications-csp)
 		- 10.3.1. [Concept](#1031-concept)
 		- 10.3.2. [Specification: tb_process_spec! Syntax](#1032-specification-tb_process_spec-syntax)
@@ -253,7 +253,7 @@ following bounds:
   - Inherits: All V0 features
   - OPTIONAL: Message integrity (digest)
   - OPTIONAL: Confidentiality (cipher)
-  - OPTIONAL: Non-repudiation(signature)
+  - OPTIONAL: Non-repudiation (signature)
 
 - VERSION 2
   - Inherits: All V1 features
@@ -2502,35 +2502,10 @@ All such events are emitted via the instrumentation subsystem described in §11.
 Layer 1–3 verification operates over this event stream as the authoritative
 trace for a single execution.
 
-#### 10.2.9 Timing Verification and Schedulability
+#### 10.2.9 Schedulability Analysis
 
-The `testing-timing` feature enables timing verification for real-time systems,
-including timing constraints, timed CSP semantics, and schedulability analysis.
-All timing features integrate seamlessly with the existing CSP and FDR
-verification layers.
-
-**Timing Constraints in Process Specs:**
-
-Process specs support four types of timing constraints via the `timing: { }` block:
-
-- **WCET (Worst-Case Execution Time)**: `wcet: { "event" => wcet!(10ms) }` - Maximum allowed execution time per event
-- **Deadline**: `deadline: { "start" => "end", deadline!(duration: 100ms) }` - Maximum latency between start and end events
-- **Jitter**: `jitter: { "event" => jitter!(5ms) }` - Maximum timing variation for an event
-- **Slack**: Specified via `deadline!(duration: 100ms, slack: 5ms)` - Minimum safety margin
-
-**Timed CSP Semantics:**
-
-Process specs support timed automata semantics with clock variables and timing guards:
-
-- **Clock Variables**: `clocks: { "clock1", "clock2" }` - Named clocks that advance during execution
-- **Timing Guards**: `"event" [ guard!(clock1 < 10ms) ] => State` - Transitions enabled only when guard conditions are satisfied
-- **Clock Resets**: `"event" [ guard!(clock2 >= 5ms), reset: ["clock1"] ] => State` - Reset clocks when transition is taken
-
-Guard expressions support: `<`, `<=`, `>`, `>=`, `==`, and ranges (`5ms <= x <= 10ms`).
-
-**Schedulability Analysis in Assertion Specs:**
-
-Assertion specs support schedulability verification via the `schedulability: { }` block:
+Assertion specs support schedulability verification via the `schedulability: { }` 
+block when `testing-schedulability` is enabled:
 
 ```rust
 schedulability: {
@@ -2545,19 +2520,9 @@ Supported schedulers:
 - **Earliest Deadline First (EDF)**: Dynamic priority scheduling with utilization bound ≤ 1.0
 - **Response Time Analysis (RTA)**: Exact schedulability test for both RMA and EDF
 
-**Early Pruning and FDR Integration:**
-
-Timing violations automatically prune traces during FDR exploration, improving verification efficiency:
-- Per-event WCET violations prune immediately
-- Deadline violations prune when detected
-- Path-based WCET violations prune compositional violations
-- Timed transitions filter based on guard satisfaction
-
-**Additional Features:**
-
-- **Statistical Analysis**: Percentile-based WCET (P50-P99.99) and confidence intervals
-- **Path-Based WCET**: Compositional WCET analysis along execution paths
-- **Integer-Only Math**: Fixed-point arithmetic for deterministic schedulability calculations
+Additional features include percentile-based WCET analysis (P50-P99.99), 
+confidence intervals, and fixed-point arithmetic for deterministic calculations.
+See §10.3.5 for timing constraints in process specifications
 
 ### 10.3 Layer 2: Process Specifications (CSP)
 
@@ -2641,12 +2606,39 @@ tb_process_spec! {
 
 #### 10.3.5 Timing and Schedulability Verification
 
-When `testing-timing` and `testing-schedulability` features are enabled, process
-specifications participate in timing and schedulability verification via the
-`clocks`, `timing` and `schedulability` blocks shown in §10.3.2. Timing
-constraints (WCET, deadlines, jitter, slack) and task periods are combined into
-task sets that are checked using Rate Monotonic or Earliest Deadline First
-analysis.
+When `testing-timing` is enabled, process specifications support timing 
+constraints and timed automata semantics.
+
+**Timing Constraints:**
+
+Process specs support four types of timing constraints via the `timing: { }` block:
+
+- **WCET (Worst-Case Execution Time)**: `wcet: { "event" => wcet!(10ms) }` - Maximum allowed execution time per event
+- **Deadline**: `deadline: { "start" => "end", deadline!(duration: 100ms) }` - Maximum latency between start and end events
+- **Jitter**: `jitter: { "event" => jitter!(5ms) }` - Maximum timing variation for an event
+- **Slack**: Specified via `deadline!(duration: 100ms, slack: 5ms)` - Minimum safety margin
+
+**Timed CSP Semantics:**
+
+Process specs support timed automata semantics with clock variables and timing guards:
+
+- **Clock Variables**: `clocks: { "clock1", "clock2" }` - Named clocks that advance during execution
+- **Timing Guards**: `"event" [ guard!(clock1 < 10ms) ] => State` - Transitions enabled only when guard conditions are satisfied
+- **Clock Resets**: `"event" [ guard!(clock2 >= 5ms), reset: ["clock1"] ] => State` - Reset clocks when transition is taken
+
+Guard expressions support: `<`, `<=`, `>`, `>=`, `==`, and ranges (`5ms <= x <= 10ms`).
+
+**Early Pruning and FDR Integration:**
+
+Timing violations automatically prune traces during FDR exploration:
+- Per-event WCET violations prune immediately
+- Deadline violations prune when detected
+- Path-based WCET violations prune compositional violations
+- Timed transitions filter based on guard satisfaction
+
+When `testing-schedulability` is also enabled, timing constraints and task 
+periods are combined into task sets for Rate Monotonic or EDF analysis. 
+See §10.2.9 for schedulability configuration in assertion specs.
 
 #### 10.3.6 Process Composition: tb_compose_spec!
 
@@ -4107,18 +4099,26 @@ consistent interface for executable commands across different contexts.
 **Syntax**:
 
 ```rust
-// Async job
+// Async job with tuple input (implements AsyncJob trait)
 job! {
 	name: JobName,
-	async fn run(param1: Type1, param2: Type2) -> ReturnType {
+	async fn run((param1, param2): (Type1, Type2)) -> ReturnType {
 		// Implementation
 	}
 }
 
-// Sync job
+// Sync job with tuple input (implements Job trait)
 job! {
 	name: JobName,
-	fn run(param1: Type1, param2: Type2) -> ReturnType {
+	fn run((param1, param2): (Type1, Type2)) -> ReturnType {
+		// Implementation
+	}
+}
+
+// No-parameter job (implements Job/AsyncJob with Input = ())
+job! {
+	name: NoParamJob,
+	fn run() -> ReturnType {
 		// Implementation
 	}
 }
@@ -4327,9 +4327,8 @@ let session_id = PipelineBuilder::new(trace)
 		
 		join(encrypted, signed).map(|(e, s)| (req, e, s))
 	})
-	// Job with retry
-	.and_then(|(req, enc, sig)| SendRequest::run(req, enc, sig))
-	.with_retry(RestartLinearBackoff::new(3, 1000, 1, None))
+	// Send request
+	.and_then(|(req, enc, sig)| SendRequest::run((req, enc, sig)))
 	// Fallback on error
 	.or(|| UseCachedResponse::run())
 	// Error recovery

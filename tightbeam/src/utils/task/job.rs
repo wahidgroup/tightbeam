@@ -132,20 +132,6 @@ macro_rules! job {
 		}
 	};
 
-	// Sync job with named parameters (no trait impl - may have references)
-	(
-		$(#[$meta:meta])*
-		name: $job_name:ident,
-		fn run($($param:ident : $param_ty:ty),+ $(,)?) -> $return_ty:ty $body:block
-	) => {
-		$(#[$meta])*
-		pub struct $job_name;
-
-		impl $job_name {
-			pub fn run($($param: $param_ty),+) -> $return_ty $body
-		}
-	};
-
 	// Async job with tuple-destructured parameter (implements AsyncJob trait)
 	(
 		$(#[$meta:meta])*
@@ -194,19 +180,6 @@ macro_rules! job {
 		}
 	};
 
-	// Async job with named parameters (no trait impl - may have references)
-	(
-		$(#[$meta:meta])*
-		name: $job_name:ident,
-		async fn run($($param:ident : $param_ty:ty),+ $(,)?) -> $return_ty:ty $body:block
-	) => {
-		$(#[$meta])*
-		pub struct $job_name;
-
-		impl $job_name {
-			pub async fn run($($param: $param_ty),+) -> $return_ty $body
-		}
-	};
 }
 
 #[cfg(test)]
@@ -216,14 +189,15 @@ mod tests {
 	use crate::error::Result;
 	use crate::Frame;
 
+	// Sync job with tuple input - implements Job trait
 	job! {
 		name: SpawnServletJob,
-		fn run(servlet_type: &str, config: Option<Vec<u8>>) -> Result<Frame> {
+		fn run((servlet_type, config): (Vec<u8>, Option<Vec<u8>>)) -> Result<Frame> {
 			compose! {
 				V0: id: "spawn-req",
 					message: HiveManagementRequest {
 						spawn: Some(SpawnServletParams {
-							servlet_type: servlet_type.as_bytes().to_vec(),
+							servlet_type,
 							config,
 						}),
 						list: None,
@@ -233,6 +207,7 @@ mod tests {
 		}
 	}
 
+	// Sync job with no params - implements Job trait with Input = ()
 	job! {
 		name: ListServletsJob,
 		fn run() -> Result<Frame> {
@@ -247,26 +222,25 @@ mod tests {
 		}
 	}
 
+	// Sync job with single tuple input
 	job! {
 		name: StopServletJob,
-		fn run(servlet_id: &str) -> Result<Frame> {
+		fn run((servlet_id,): (Vec<u8>,)) -> Result<Frame> {
 			compose! {
 				V0: id: "stop-req",
 					message: HiveManagementRequest {
 						spawn: None,
 						list: None,
-						stop: Some(StopServletParams {
-							servlet_id: servlet_id.as_bytes().to_vec(),
-						}),
+						stop: Some(StopServletParams { servlet_id }),
 					}
 			}
 		}
 	}
 
+	// Async job with tuple input - implements AsyncJob trait
 	job! {
 		name: AsyncCalculationJob,
-		async fn run(x: u64, y: u64) -> Result<Frame> {
-			// Simulate async work
+		async fn run((x, y): (u64, u64)) -> Result<Frame> {
 			let result = x + y;
 			compose! {
 				V0: id: "calc-result",
@@ -277,7 +251,7 @@ mod tests {
 
 	test_job! {
 		name: test_spawn_servlet_job,
-		job: SpawnServletJob::run("worker_servlet", None),
+		job: SpawnServletJob::run((b"worker_servlet".to_vec(), None)),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata.id, b"spawn-req");
@@ -304,7 +278,7 @@ mod tests {
 
 	test_job! {
 		name: test_stop_servlet_job,
-		job: StopServletJob::run("worker_servlet_127.0.0.1:8080"),
+		job: StopServletJob::run((b"worker_servlet_127.0.0.1:8080".to_vec(),)),
 		assertions: |frame| {
 			let frame = frame.unwrap_or_else(|e| panic!("Error: {e:?}"));
 			assert_eq!(frame.metadata.id, b"stop-req");
@@ -318,7 +292,7 @@ mod tests {
 
 	test_job! {
 		name: test_async_job,
-		job: AsyncCalculationJob::run(10, 32),
+		job: AsyncCalculationJob::run((10, 32)),
 		assertions: |frame| async move {
 			let frame = frame.await?;
 			assert_eq!(frame.metadata.id, b"calc-result");

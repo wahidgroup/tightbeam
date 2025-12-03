@@ -112,7 +112,7 @@ trait DtnNode {
 			pool: Arc::clone(pool),
 		});
 
-		let frame = CreateFrameRequest::run(current_head, missing_hash)
+		let frame = CreateFrameRequest::run((current_head, missing_hash))
 			.map(|req| (req, Arc::clone(&ctx)))
 			.and_then(PrepareGapRecoveryBuild::run)
 			.and_then(BuildGapRecoveryFrame::run)
