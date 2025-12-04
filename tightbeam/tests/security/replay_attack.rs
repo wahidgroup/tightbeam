@@ -44,11 +44,25 @@ tb_process_spec! {
 			"replay_detected",
 			"replay_rejected"
 		}
-		hidden { }
+		hidden {
+			"harness_spawn_session",
+			"harness_spawn_ecies",
+			"harness_spawn_cms"
+		}
 	}
 	states {
-		Idle => { "replay_initial_handshake" => Established },
-		Established => { "replay_attempt" => AttackObserved },
+		Idle => { "harness_spawn_session" => Spawning },
+		Spawning => {
+			"harness_spawn_ecies" => SessionReady,
+			"harness_spawn_cms" => SessionReady
+		},
+		SessionReady => { "replay_initial_handshake" => Established },
+		Established => { "harness_spawn_session" => SpawningAttack },
+		SpawningAttack => {
+			"harness_spawn_ecies" => AttackSessionReady,
+			"harness_spawn_cms" => AttackSessionReady
+		},
+		AttackSessionReady => { "replay_attempt" => AttackObserved },
 		AttackObserved => { "replay_detected" => ReplaySuppressed },
 		ReplaySuppressed => { "replay_rejected" => Idle }
 	}
@@ -72,8 +86,7 @@ tb_scenario! {
 job! {
 	name: ReplayAttackScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
-		let harness = SecurityThreatHarness::default();
-
+		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
 		for kind in HandshakeBackendKind::all() {
 			// Capture a complete handshake
 			let mut session = harness.spawn(kind);

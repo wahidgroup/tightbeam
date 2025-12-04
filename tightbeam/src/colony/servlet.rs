@@ -7,6 +7,7 @@ use core::convert::TryFrom;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +31,40 @@ use crate::crypto::x509::CertificateSpec;
 use crate::transport::handshake::HandshakeKeyManager;
 #[cfg(feature = "x509")]
 use crate::transport::TransportEncryptionConfig;
+
+/// Lightweight metrics exposed by each servlet instance for auto-scaling
+///
+/// Used by hives to calculate utilization and make scaling decisions.
+/// Metrics are updated atomically for thread-safe concurrent access.
+#[derive(Debug, Default)]
+pub struct ServletMetrics {
+	/// Current pending messages in queue
+	queue_depth: AtomicU32,
+}
+
+impl ServletMetrics {
+	/// Create new metrics with zero queue depth
+	pub fn new() -> Self {
+		Self {
+			queue_depth: AtomicU32::new(0),
+		}
+	}
+
+	/// Increment queue depth when a message is enqueued
+	pub fn enqueue(&self) {
+		self.queue_depth.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Decrement queue depth when a message is dequeued/processed
+	pub fn dequeue(&self) {
+		self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+	}
+
+	/// Get the current queue depth
+	pub fn queue_depth(&self) -> u32 {
+		self.queue_depth.load(Ordering::Relaxed)
+	}
+}
 
 #[macro_export]
 macro_rules! __tightbeam_servlet_common_methods {

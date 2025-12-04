@@ -18,4 +18,5 @@
 //! transport security table.
 
 pub mod common;
+pub mod downgrade_attack;
 pub mod replay_attack;

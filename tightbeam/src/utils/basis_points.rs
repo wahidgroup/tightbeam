@@ -19,6 +19,8 @@
 //! assert_eq!(prob.as_percentage(), 75.0);
 //! ```
 
+use crate::der::{Decode, Encode, Reader, Writer};
+
 /// Probability in basis points (0-10000, where 10000 = 100%)
 ///
 /// Enforces valid range at compile time via const constructor.
@@ -137,12 +139,51 @@ impl BasisPoints {
 		assert!((0.0..=1.0).contains(&fraction), "Fraction must be 0.0-1.0");
 		Self((fraction * 10000.0).round() as u16)
 	}
+
+	/// Create a new BasisPoints value, saturating at MAX (10000)
+	///
+	/// Unlike `new()`, this does not panic for out-of-range values.
+	/// Values > 10000 are clamped to 10000.
+	///
+	/// # Example
+	///
+	/// ```
+	/// use tightbeam::utils::BasisPoints;
+	///
+	/// let clamped = BasisPoints::new_saturating(15000);
+	/// assert_eq!(clamped.get(), 10000);
+	/// ```
+	pub const fn new_saturating(value: u16) -> Self {
+		if value > 10000 {
+			Self(10000)
+		} else {
+			Self(value)
+		}
+	}
 }
 
 impl Default for BasisPoints {
 	/// Default is 0 basis points (0%)
 	fn default() -> Self {
 		Self::MIN
+	}
+}
+
+// DER encoding: BasisPoints encodes as an INTEGER (u16)
+impl Encode for BasisPoints {
+	fn encoded_len(&self) -> crate::der::Result<der::Length> {
+		self.0.encoded_len()
+	}
+
+	fn encode(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
+		self.0.encode(encoder)
+	}
+}
+
+impl<'a> Decode<'a> for BasisPoints {
+	fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
+		let value = u16::decode(reader)?;
+		Ok(Self::new_saturating(value))
 	}
 }
 
@@ -231,5 +272,44 @@ mod tests {
 		assert!(BasisPoints::new(1000) < BasisPoints::new(5000));
 		assert!(BasisPoints::new(10000) > BasisPoints::new(0));
 		assert_eq!(BasisPoints::new(5000), BasisPoints::new(5000));
+	}
+
+	#[test]
+	fn new_saturating_clamps() {
+		assert_eq!(BasisPoints::new_saturating(0).get(), 0);
+		assert_eq!(BasisPoints::new_saturating(5000).get(), 5000);
+		assert_eq!(BasisPoints::new_saturating(10000).get(), 10000);
+		assert_eq!(BasisPoints::new_saturating(10001).get(), 10000);
+		assert_eq!(BasisPoints::new_saturating(u16::MAX).get(), 10000);
+	}
+
+	#[test]
+	fn der_roundtrip() {
+		use crate::der::{Decode, Encode};
+
+		let original = BasisPoints::new(7500);
+		let mut buf = [0u8; 16];
+		let encoded = original.encode_to_slice(&mut buf);
+		assert!(encoded.is_ok());
+
+		let decoded = BasisPoints::from_der(encoded.as_ref().map(|s| *s).unwrap_or(&[]));
+		assert!(decoded.is_ok());
+		assert_eq!(decoded.ok(), Some(original));
+	}
+
+	#[test]
+	fn der_decode_saturates() {
+		use crate::der::Encode;
+
+		// Encode a u16 value > 10000 directly
+		let over_max: u16 = 15000;
+		let mut buf = [0u8; 16];
+		let encoded = over_max.encode_to_slice(&mut buf);
+		assert!(encoded.is_ok());
+
+		// Decode as BasisPoints - should saturate to 10000
+		let decoded = BasisPoints::from_der(encoded.as_ref().map(|s| *s).unwrap_or(&[]));
+		assert!(decoded.is_ok());
+		assert_eq!(decoded.ok(), Some(BasisPoints::MAX));
 	}
 }
