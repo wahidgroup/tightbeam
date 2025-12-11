@@ -1,7 +1,7 @@
 //! Connection pooling for transport layer
 
 use core::hash::Hash;
-use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 
 #[cfg(feature = "std")]
@@ -53,11 +53,19 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 }
 
 /// Configuration for connection pool
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PoolConfig {
 	/// Optional idle timeout for connections
 	/// None means connections never expire
 	pub idle_timeout: Option<Duration>,
+	/// Maximum total connections in the pool (default: 64)
+	pub max_connections: usize,
+}
+
+impl Default for PoolConfig {
+	fn default() -> Self {
+		Self { idle_timeout: None, max_connections: 64 }
+	}
 }
 
 #[cfg(feature = "x509")]
@@ -109,7 +117,7 @@ impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 }
 
 /// Builder for creating a configured ConnectionPool
-pub struct ConnectionPoolBuilder<P: Protocol, const N: usize, C: CryptoProvider = DefaultCryptoProvider> {
+pub struct ConnectionPoolBuilder<P: Protocol, C: CryptoProvider = DefaultCryptoProvider> {
 	config: PoolConfig,
 	timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
@@ -117,7 +125,7 @@ pub struct ConnectionPoolBuilder<P: Protocol, const N: usize, C: CryptoProvider 
 	_phantom: core::marker::PhantomData<(P, C)>,
 }
 
-impl<P: Protocol, const N: usize, C: CryptoProvider> Default for ConnectionPoolBuilder<P, N, C> {
+impl<P: Protocol, C: CryptoProvider> Default for ConnectionPoolBuilder<P, C> {
 	fn default() -> Self {
 		Self {
 			config: PoolConfig::default(),
@@ -129,7 +137,7 @@ impl<P: Protocol, const N: usize, C: CryptoProvider> Default for ConnectionPoolB
 	}
 }
 
-impl<P: Protocol, const N: usize, C: CryptoProvider> ConnectionPoolBuilder<P, N, C> {
+impl<P: Protocol, C: CryptoProvider> ConnectionPoolBuilder<P, C> {
 	pub fn with_config(mut self, config: PoolConfig) -> Self {
 		self.config = config;
 		self
@@ -137,10 +145,8 @@ impl<P: Protocol, const N: usize, C: CryptoProvider> ConnectionPoolBuilder<P, N,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, const N: usize, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P>
-	for ConnectionPoolBuilder<P, N, C>
-{
-	type Output = ConnectionPool<P, N, C>;
+impl<P: Protocol, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P> for ConnectionPoolBuilder<P, C> {
+	type Output = ConnectionPool<P, C>;
 
 	fn with_timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = Some(timeout);
@@ -179,6 +185,7 @@ impl<P: Protocol, const N: usize, C: CryptoProvider + Send + Sync + 'static> Con
 			pools: Arc::new(RwLock::new(HashMap::new())),
 			config: self.config,
 			timeout: self.timeout,
+			total_connections: Arc::new(AtomicUsize::new(0)),
 			#[cfg(feature = "x509")]
 			tls: self.tls,
 		}
@@ -200,37 +207,39 @@ struct DestinationPool<P: Protocol> {
 	in_use: usize,
 }
 
-/// Connection pool for protocol P with max N connections per destination
+/// Connection pool for protocol P with global connection limit
 ///
 /// # Invariants
-/// - `available.len() + in_use <= N` at all times (enforced by `SlotGuard`)
+/// - Total connections across all destinations <= `config.max_connections`
 /// - Idle connections exceeding `PoolConfig::idle_timeout` are pruned lazily
 /// - Lock poisoning never panics; callers receive `TransportFailure::Busy` instead
 #[cfg(feature = "std")]
-pub struct ConnectionPool<P: Protocol, const N: usize, C: CryptoProvider = DefaultCryptoProvider> {
+pub struct ConnectionPool<P: Protocol, C: CryptoProvider = DefaultCryptoProvider> {
 	/// Per-destination sub-pools
 	pools: Arc<RwLock<HashMap<P::Address, DestinationPool<P>>>>,
 	/// Pool configuration
 	config: PoolConfig,
 	/// Shared timeout for all connections
 	timeout: Option<Duration>,
+	/// Total connections across all destinations
+	total_connections: Arc<AtomicUsize>,
 	/// Shared TLS assets reused across pooled connections
 	#[cfg(feature = "x509")]
 	tls: PoolTlsConfig<C>,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + Send + Sync, const N: usize, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, N, C>
+impl<P: Protocol + Send + Sync, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, C>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 	P::Transport: Send + Sync,
 {
 	/// Create a new connection pool builder
-	pub fn builder() -> ConnectionPoolBuilder<P, N, C> {
+	pub fn builder() -> ConnectionPoolBuilder<P, C> {
 		ConnectionPoolBuilder::default()
 	}
 
-	fn wrap_client(self: &Arc<Self>, client: GenericClient<P>, addr: P::Address) -> PooledClient<P, N, C>
+	fn wrap_client(self: &Arc<Self>, client: GenericClient<P>, addr: P::Address) -> PooledClient<P, C>
 	where
 		P: PersistentConnection,
 	{
@@ -272,7 +281,16 @@ where
 		Ok(None)
 	}
 
-	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, N, C>> {
+	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, C>> {
+		// Check global limit
+		let current = self.total_connections.load(Ordering::Acquire);
+		if current >= self.config.max_connections {
+			return Err(TransportError::OperationFailed(TransportFailure::Busy));
+		}
+
+		// Atomically increment global counter
+		self.total_connections.fetch_add(1, Ordering::AcqRel);
+
 		let mut pools = self.write_pools()?;
 		let dest_pool = pools
 			.entry(addr.clone())
@@ -280,12 +298,8 @@ where
 
 		self.prune_idle_locked(dest_pool, Instant::now());
 
-		let total_connections = dest_pool.available.len() + dest_pool.in_use;
-		if total_connections >= N {
-			return Err(TransportError::OperationFailed(TransportFailure::Busy));
-		}
-
 		dest_pool.in_use += 1;
+
 		Ok(SlotGuard::new(Arc::clone(self), addr.clone()))
 	}
 
@@ -302,7 +316,7 @@ where
 	}
 
 	#[cfg(not(feature = "x509"))]
-	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, N, C>>
+	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport: MessageEmitter + MessageCollector + PolicyConf + Send + Sync,
@@ -323,7 +337,7 @@ where
 	}
 
 	#[cfg(feature = "x509")]
-	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, N, C>>
+	pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport:
@@ -348,7 +362,7 @@ where
 		Ok(self.wrap_client(client, addr))
 	}
 
-	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, N, C>>>
+	pub fn try_acquire(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<PooledClient<P, C>>>
 	where
 		P: PersistentConnection + Send + Sync,
 		P::Transport: MessageEmitter + MessageCollector + PolicyConf + Send + Sync,
@@ -361,7 +375,7 @@ where
 // Separate impl with tighter bounds for non-x509 features
 #[cfg(feature = "std")]
 #[cfg(not(feature = "x509"))]
-impl<P: Protocol + Send + Sync, const N: usize, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, N, C>
+impl<P: Protocol + Send + Sync, C: CryptoProvider + Send + Sync + 'static> ConnectionPool<P, C>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 	P::Transport: Send + Sync,
@@ -370,43 +384,30 @@ where
 
 /// A pooled client connection that returns to the pool on drop
 #[cfg(feature = "std")]
-pub struct PooledClient<P: Protocol + PersistentConnection, const N: usize, C: CryptoProvider = DefaultCryptoProvider>
+pub struct PooledClient<P: Protocol + PersistentConnection, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
 	client: Option<GenericClient<P>>,
-	pool: Arc<ConnectionPool<P, N, C>>,
+	pool: Arc<ConnectionPool<P, C>>,
 	addr: P::Address,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + PersistentConnection, const N: usize, C: CryptoProvider> Deref for PooledClient<P, N, C>
+impl<P: Protocol + PersistentConnection, C: CryptoProvider> PooledClient<P, C>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
-	type Target = GenericClient<P>;
-
-	fn deref(&self) -> &Self::Target {
-		debug_assert!(self.client.is_some(), "pooled client should never be None before drop");
-		// TODO WE CANNOT USE EXPECT
-		self.client.as_ref().expect("pooled client still active")
+	/// Returns a mutable reference to the underlying connection
+	pub fn conn(&mut self) -> TransportResult<&mut GenericClient<P>> {
+		self.client
+			.as_mut()
+			.ok_or(TransportError::OperationFailed(TransportFailure::Busy))
 	}
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol + PersistentConnection, const N: usize, C: CryptoProvider> DerefMut for PooledClient<P, N, C>
-where
-	P::Address: Hash + Eq + Send + Sync,
-{
-	fn deref_mut(&mut self) -> &mut Self::Target {
-		debug_assert!(self.client.is_some(), "pooled client should never be None before drop");
-		// TODO WE CANNOT USE EXPECT
-		self.client.as_mut().expect("pooled client still active")
-	}
-}
-
-#[cfg(feature = "std")]
-impl<P: Protocol + PersistentConnection, const N: usize, C: CryptoProvider> Drop for PooledClient<P, N, C>
+impl<P: Protocol + PersistentConnection, C: CryptoProvider> Drop for PooledClient<P, C>
 where
 	P::Address: Hash + Eq + Send + Sync,
 {
@@ -416,8 +417,10 @@ where
 			None => return,
 		};
 
-		let is_healthy = <P as PersistentConnection>::is_connected(client.transport());
+		// Decrement global counter
+		self.pool.total_connections.fetch_sub(1, Ordering::AcqRel);
 
+		let is_healthy = <P as PersistentConnection>::is_connected(client.transport());
 		let mut pools = match self.pool.pools.write() {
 			Ok(p) => p,
 			Err(_) => return,
@@ -435,21 +438,21 @@ where
 }
 
 #[cfg(feature = "std")]
-struct SlotGuard<P: Protocol, const N: usize, C: CryptoProvider = DefaultCryptoProvider>
+struct SlotGuard<P: Protocol, C: CryptoProvider = DefaultCryptoProvider>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {
-	pool: Arc<ConnectionPool<P, N, C>>,
+	pool: Arc<ConnectionPool<P, C>>,
 	addr: P::Address,
 	active: bool,
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, const N: usize, C: CryptoProvider> SlotGuard<P, N, C>
+impl<P: Protocol, C: CryptoProvider> SlotGuard<P, C>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {
-	fn new(pool: Arc<ConnectionPool<P, N, C>>, addr: P::Address) -> Self {
+	fn new(pool: Arc<ConnectionPool<P, C>>, addr: P::Address) -> Self {
 		Self { pool, addr, active: true }
 	}
 
@@ -459,7 +462,7 @@ where
 }
 
 #[cfg(feature = "std")]
-impl<P: Protocol, const N: usize, C: CryptoProvider> Drop for SlotGuard<P, N, C>
+impl<P: Protocol, C: CryptoProvider> Drop for SlotGuard<P, C>
 where
 	P::Address: Hash + Eq + Clone + Send + Sync,
 {
@@ -467,6 +470,9 @@ where
 		if !self.active {
 			return;
 		}
+
+		// Decrement global counter
+		self.pool.total_connections.fetch_sub(1, Ordering::AcqRel);
 
 		let pools = self.pool.pools.write();
 		if let Ok(mut pools) = pools {
@@ -485,11 +491,18 @@ mod tests {
 	fn test_pool_config_default() {
 		let config = PoolConfig::default();
 		assert!(config.idle_timeout.is_none());
+		assert_eq!(config.max_connections, 64);
 	}
 
 	#[test]
 	fn test_pool_config_with_timeout() {
-		let config = PoolConfig { idle_timeout: Some(Duration::from_secs(30)) };
+		let config = PoolConfig { idle_timeout: Some(Duration::from_secs(30)), max_connections: 64 };
 		assert_eq!(config.idle_timeout, Some(Duration::from_secs(30)));
+	}
+
+	#[test]
+	fn test_pool_config_with_max_connections() {
+		let config = PoolConfig { idle_timeout: None, max_connections: 16 };
+		assert_eq!(config.max_connections, 16);
 	}
 }

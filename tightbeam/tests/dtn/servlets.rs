@@ -86,19 +86,19 @@ trait DtnNode {
 	/// Send frame using pre-configured connection pool
 	async fn send_frame(
 		&self,
-		pool: &Arc<ConnectionPool<TokioListener, 3>>,
+		pool: &Arc<ConnectionPool<TokioListener>>,
 		addr: TightBeamSocketAddr,
 		frame: Frame,
 	) -> Result<Option<Frame>, TightBeamError> {
 		let mut client = pool.connect(addr).await?;
-		Ok(client.emit(frame, None).await?)
+		Ok(client.conn()?.emit(frame, None).await?)
 	}
 
 	async fn handle_chain_gap(
 		&self,
 		current_head: Vec<u8>,
 		missing_hash: Vec<u8>,
-		pool: &Arc<ConnectionPool<TokioListener, 3>>,
+		pool: &Arc<ConnectionPool<TokioListener>>,
 		upstream_addr: TightBeamSocketAddr,
 		trace: &TraceCollector,
 	) -> Result<(), TightBeamError> {
@@ -157,7 +157,7 @@ pub struct MissionControlServletConf {
 	pub chain_processor: Arc<ChainProcessor>,
 	pub frame_builder: Arc<FrameBuilderHelper>,
 	pub earth_relay_addr: TightBeamSocketAddr,
-	pub earth_relay_pool: Arc<ConnectionPool<TokioListener, 3>>,
+	pub earth_relay_pool: Arc<ConnectionPool<TokioListener>>,
 }
 
 servlet! {
@@ -314,8 +314,8 @@ pub struct EarthRelaySatelliteServletConf {
 	pub shared_cipher: Aes256Gcm,
 	pub mars_relay_addr: TightBeamSocketAddr,
 	pub mission_control_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
-	pub mission_control_pool: Arc<ConnectionPool<TokioListener, 3>>,
-	pub mars_relay_pool: Arc<ConnectionPool<TokioListener, 3>>,
+	pub mission_control_pool: Arc<ConnectionPool<TokioListener>>,
+	pub mars_relay_pool: Arc<ConnectionPool<TokioListener>>,
 	pub chain_processor: Arc<ChainProcessor>,
 	pub frame_builder: Arc<FrameBuilderHelper>,
 }
@@ -524,8 +524,8 @@ pub struct MarsRelaySatelliteServletConf {
 	pub shared_cipher: Aes256Gcm,
 	pub rover_addr: TightBeamSocketAddr,
 	pub earth_relay_addr: Arc<RwLock<Option<TightBeamSocketAddr>>>,
-	pub earth_relay_pool: Arc<ConnectionPool<TokioListener, 3>>,
-	pub rover_pool: Arc<ConnectionPool<TokioListener, 3>>,
+	pub earth_relay_pool: Arc<ConnectionPool<TokioListener>>,
+	pub rover_pool: Arc<ConnectionPool<TokioListener>>,
 	pub chain_processor: Arc<ChainProcessor>,
 	pub frame_builder: Arc<FrameBuilderHelper>,
 }
@@ -742,7 +742,7 @@ impl DtnNode for MarsRelaySatelliteServletConf {
 #[derive(Clone)]
 pub struct RoverServletConf {
 	pub mars_relay_addr: TightBeamSocketAddr,
-	pub mars_relay_pool: Arc<ConnectionPool<TokioListener, 3>>,
+	pub mars_relay_pool: Arc<ConnectionPool<TokioListener>>,
 	pub rover_signing_key: Secp256k1SigningKey,
 	pub mission_control_verifying_key: Secp256k1VerifyingKey,
 	pub mars_relay_verifying_key: Secp256k1VerifyingKey,

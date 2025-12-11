@@ -31,7 +31,7 @@ use crate::zeroize::ZeroizeOnDrop;
 ///
 /// This enum allows keys to be specified in multiple ways for flexible
 /// configuration in const contexts (e.g., servlet! macro).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum KeySpec {
 	/// Raw key bytes (e.g., secp256k1 scalar - 32 bytes)
 	Bytes(&'static [u8]),

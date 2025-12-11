@@ -43,7 +43,7 @@ use tightbeam::{
 	tb_assert_spec, tb_compose_spec, tb_process_spec, tb_scenario,
 	testing::{fdr::FdrConfig, specs::composition::CompositionSpec, ScenarioConf},
 	trace::{LogFilter, LogLevel, LoggerConfig, StdoutBackend, TraceCollector, TraceConfig},
-	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient},
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, ConnectionPool, GenericClient, PoolConfig},
 	wcet,
 };
 
@@ -741,38 +741,47 @@ tb_scenario! {
 			// CONNECTION POOLS (per-destination with TLS and mutual auth)
 			// ================================================================
 
+			// Pool configuration for relay connections (max 3 per destination)
+			let pool_config = PoolConfig { idle_timeout: None, max_connections: 3 };
+
 			// Mission Control → Earth Relay pool
-			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+				.with_config(pool_config.clone())
 				.with_server_certificate(EARTH_RELAY_CERT)?
 				.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY)?
 				.build());
 
 			// Earth Relay → Mission Control pool
-			let earth_mc_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+			let earth_mc_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+				.with_config(pool_config.clone())
 				.with_server_certificate(MISSION_CONTROL_CERT)?
 				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY)?
 				.build());
 
 			// Earth Relay → Mars Relay pool
-			let earth_mars_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+			let earth_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+				.with_config(pool_config.clone())
 				.with_server_certificate(MARS_RELAY_CERT)?
 				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY)?
 				.build());
 
 			// Mars Relay → Earth Relay pool
-			let mars_earth_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+			let mars_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+				.with_config(pool_config.clone())
 				.with_server_certificate(EARTH_RELAY_CERT)?
 				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
 				.build());
 
 			// Mars Relay → Rover pool
-			let mars_rover_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+			let mars_rover_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+				.with_config(pool_config.clone())
 				.with_server_certificate(ROVER_CERT)?
 				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY)?
 				.build());
 
 			// Rover → Mars Relay pool
-			let rover_mars_pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+			let rover_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+				.with_config(pool_config)
 				.with_server_certificate(MARS_RELAY_CERT)?
 				.with_client_identity(ROVER_CERT, ROVER_KEY)?
 				.build());

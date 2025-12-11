@@ -88,6 +88,16 @@ pub const LCG_INCREMENT: u64 = 1442695040888963407;
 pub const DEFAULT_FAULT_SEED: u64 = 0xDEADBEEF;
 
 // ============================================================================
+// Configuration Constants
+// ============================================================================
+
+/// Default backpressure threshold in basis points (90% = 9000 bps)
+///
+/// When aggregate utilization exceeds this threshold, the hive signals
+/// `TransitStatus::Busy` to the cluster, indicating it should route work elsewhere.
+pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
+
+// ============================================================================
 // Bitcoin Constants
 // ============================================================================
 

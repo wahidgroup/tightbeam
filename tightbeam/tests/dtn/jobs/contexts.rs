@@ -16,5 +16,5 @@ pub struct GapRecoveryContext {
 	pub frame_builder: Arc<FrameBuilderHelper>,
 	pub signing_key: Arc<Secp256k1SigningKey>,
 	pub cipher: Arc<Aes256Gcm>,
-	pub pool: Arc<ConnectionPool<TokioListener, 3>>,
+	pub pool: Arc<ConnectionPool<TokioListener>>,
 }

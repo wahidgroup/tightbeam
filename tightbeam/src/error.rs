@@ -461,5 +461,19 @@ impl<T> From<std::sync::PoisonError<T>> for TightBeamError {
 	}
 }
 
+#[cfg(feature = "std")]
+impl From<std::string::FromUtf8Error> for TightBeamError {
+	fn from(err: std::string::FromUtf8Error) -> Self {
+		TightBeamError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+	}
+}
+
+#[cfg(feature = "std")]
+impl From<std::net::AddrParseError> for TightBeamError {
+	fn from(err: std::net::AddrParseError) -> Self {
+		TightBeamError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
+	}
+}
+
 #[cfg(all(feature = "compress", not(feature = "derive")))]
 impl core::error::Error for CompressionError {}

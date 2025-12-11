@@ -10,6 +10,6 @@ job! {
 		(frame, addr, ctx): (Frame, TightBeamSocketAddr, Arc<GapRecoveryContext>),
 	) -> Result<Option<Frame>, TightBeamError> {
 		let mut client = ctx.pool.connect(addr).await?;
-		Ok(client.emit(frame, None).await?)
+		Ok(client.conn()?.emit(frame, None).await?)
 	}
 }

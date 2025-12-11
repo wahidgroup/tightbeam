@@ -202,7 +202,7 @@ tb_scenario! {
 
 				trace.event("pool_create")?;
 
-				let pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+				let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 					.with_config(PoolConfig::default())
 					.with_server_certificate(SERVER_CERT)?
 					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
@@ -217,7 +217,7 @@ tb_scenario! {
 					trace.event("send_message")?;
 
 					let msg = create_v0_tightbeam(Some(&format!("test{}", i)), None);
-					if client.emit(msg, None).await?.is_some() {
+					if client.conn()?.emit(msg, None).await?.is_some() {
 						trace.event("receive_response")?;
 					}
 
@@ -285,7 +285,7 @@ tb_scenario! {
 
 				trace.event("pool_create")?;
 
-				let pool = Arc::new(ConnectionPool::<TokioListener, 2>::builder()
+				let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 					.with_server_certificate(SERVER_CERT)?
 					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 					.build());
@@ -297,7 +297,7 @@ tb_scenario! {
 
 					trace.event("send_message")?;
 
-					if client.emit(create_v0_tightbeam(Some(name), None), None).await?.is_some() {
+					if client.conn()?.emit(create_v0_tightbeam(Some(name), None), None).await?.is_some() {
 						trace.event("receive_response")?;
 					}
 
@@ -359,7 +359,7 @@ tb_scenario! {
 
 			trace.event("pool_create")?;
 
-			let pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
+			let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_server_certificate(SERVER_CERT)?
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
 				.build());
@@ -371,7 +371,7 @@ tb_scenario! {
 
 				trace.event("send_message")?;
 
-				if client.emit(create_v0_tightbeam(Some("concurrent-test"), None), None).await?.is_some() {
+				if client.conn()?.emit(create_v0_tightbeam(Some("concurrent-test"), None), None).await?.is_some() {
 					trace.event("receive_response")?;
 				}
 
