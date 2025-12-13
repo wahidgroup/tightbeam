@@ -19,7 +19,7 @@ use crate::transport::{ConnectionBuilder, MessageCollector, MessageEmitter, Prot
 mod x509 {
 	pub use crate::crypto::hash::Digest;
 	pub use crate::crypto::hash::Sha3_256;
-	pub use crate::crypto::key::KeySpec;
+	pub use crate::crypto::key::KeyProvider;
 	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 	pub use crate::crypto::x509::error::CertificateValidationError;
 	pub use crate::crypto::x509::policy::{CertificateValidation, RuntimeCertificatePinning};
@@ -333,9 +333,9 @@ where
 		Ok(self)
 	}
 
-	fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self> {
+	fn with_client_identity(mut self, cert: CertificateSpec, key: Arc<dyn KeyProvider>) -> TransportResult<Self> {
 		let cert = Certificate::try_from(cert)?;
-		let key_manager = HandshakeKeyManager::<C>::try_from(key)?;
+		let key_manager: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
 
 		self.client_certificate = Some(cert);
 		self.client_key = Some(key_manager);

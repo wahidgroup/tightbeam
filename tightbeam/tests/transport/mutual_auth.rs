@@ -21,6 +21,7 @@ use tightbeam::{
 	compose,
 	crypto::{
 		key::KeySpec,
+		sign::ecdsa::Secp256k1,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
 	decode, exactly, hex,
@@ -139,7 +140,7 @@ tb_scenario! {
 		servlet: MutualAuthServlet,
 		start: |trace, _config| async move {
 			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
-				.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
 
@@ -148,7 +149,7 @@ tb_scenario! {
 		setup: |addr, _config| async move {
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_server_certificate(SERVER_CERT)?
-				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 
 			let client = builder.connect(addr).await?;
@@ -207,7 +208,7 @@ tb_scenario! {
 		servlet: MutualAuthServlet,
 		start: |trace, _config| async move {
 			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
-				.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
 
@@ -225,7 +226,7 @@ tb_scenario! {
 			let certificate = CertificateSpec::Built(Box::new(invalid_cert));
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_server_certificate(SERVER_CERT)?
-				.with_client_identity(certificate, INVALID_KEY)?
+				.with_client_identity(certificate, INVALID_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 
 			let client = builder.connect(addr).await?;
@@ -272,7 +273,7 @@ tb_scenario! {
 
 			let certificate = CertificateSpec::Built(Box::new(invalid_server_cert));
 			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
-				.with_certificate(certificate, INVALID_SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(certificate, INVALID_SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
 
@@ -282,7 +283,7 @@ tb_scenario! {
 			// Client expects SERVER_CERT, but server presents different cert - should fail during handshake
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_server_certificate(SERVER_CERT)?
-				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 
 			let client = builder.connect(addr).await?;

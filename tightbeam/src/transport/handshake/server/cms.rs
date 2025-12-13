@@ -30,7 +30,6 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier, Verifier};
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::utils::compute_signer_identifier;
 use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode};
@@ -307,10 +306,8 @@ where
 			_ => return Err(HandshakeError::InvalidClientKeyExchange),
 		};
 
-		let originator_pub = k256::PublicKey::from_sec1_bytes(originator_pub_bytes)?;
-
-		// Perform ECDH using KeyProvider
-		let shared_secret_bytes = self.server_key_provider.ecdh(&originator_pub).await?;
+		// Perform ECDH using KeyProvider (takes SEC1 bytes directly)
+		let shared_secret_bytes = self.server_key_provider.key_agreement(originator_pub_bytes).await?;
 
 		// Derive KEK using HKDF via provider
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
@@ -418,16 +415,18 @@ where
 
 	/// Sign the finished digest using the server key provider.
 	async fn sign_server_finished_digest(&self, digest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		let signature = self.server_key_provider.sign(digest).await?;
-		Ok(signature.to_bytes().to_vec())
+		let signature_bytes = self.server_key_provider.sign(digest).await?;
+		Ok(signature_bytes)
 	}
 
 	/// Build cryptographic components needed for SignedData.
 	async fn build_server_finished_crypto_components(
 		&self,
 	) -> Result<(SignerIdentifier, AlgorithmIdentifierOwned, AlgorithmIdentifierOwned), HandshakeError> {
-		let public_key = self.server_key_provider.to_public_key().await?;
-		let signer_id = compute_signer_identifier::<P::Digest, _>(&public_key)?;
+		use crate::crypto::x509::utils::compute_signer_identifier_from_der;
+
+		let public_key_bytes = self.server_key_provider.to_public_key_bytes().await?;
+		let signer_id = compute_signer_identifier_from_der::<P::Digest>(&public_key_bytes)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 

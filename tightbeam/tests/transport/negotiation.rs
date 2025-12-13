@@ -11,7 +11,7 @@ use tightbeam::crypto::curves::Secp256k1Oid;
 use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 use tightbeam::crypto::hash::{Sha3_256, Sha3_512};
 use tightbeam::crypto::kdf::{HkdfSha3_256, HkdfSha3_256Oid};
-use tightbeam::crypto::key::{InMemoryKeyProvider, KeyProvider};
+use tightbeam::crypto::key::{KeyProvider, Secp256k1KeyProvider};
 use tightbeam::crypto::profiles::{
 	AeadProvider, CryptoProvider, CurveProvider, DigestProvider, KdfProvider, SecurityProfile, SecurityProfileDesc,
 	SigningProvider,
@@ -179,7 +179,7 @@ tb_scenario! {
 			let server_signing_key = create_test_signing_key();
 			let server_cert = create_test_certificate(&server_signing_key);
 			let signing_key = Secp256k1SigningKey::from(server_signing_key);
-			let server_key_provider: Arc<dyn KeyProvider> = Arc::new(InMemoryKeyProvider::from(signing_key));
+			let server_key_provider: Arc<dyn KeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
 
 			// Create client with offer: [AES-256, AES-128] (AES-256 preferred)
 			let client_offer = SecurityOffer::new(vec![profile_aes256_sha512, profile_aes128_sha256]);

@@ -332,17 +332,13 @@ where
 			// Server requires mutual auth - ensure we have client identity
 			let cert = self.client_certificate.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-			let sig = key_provider.sign(&transcript_digest).await?;
-			let signature_bytes = sig.to_bytes();
-			let sig_bytes_slice: &[u8] = signature_bytes.as_ref();
-			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(sig_bytes_slice)?)))
+			let signature_bytes = key_provider.sign(&transcript_digest).await?;
+			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(signature_bytes)?)))
 		} else if let Some(cert) = &self.client_certificate {
 			// Client wants mutual auth but server doesn't require it
 			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let sig = key_provider.sign(&transcript_digest).await?;
-			let signature_bytes = sig.to_bytes();
-			let sig_bytes_slice: &[u8] = signature_bytes.as_ref();
-			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(sig_bytes_slice)?)))
+			let signature_bytes = key_provider.sign(&transcript_digest).await?;
+			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(signature_bytes)?)))
 		} else {
 			// No mutual auth
 			Ok((None, None))

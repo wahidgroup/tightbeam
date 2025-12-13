@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::asn1::OctetString;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
-use crate::crypto::key::{InMemoryKeyProvider, KeyProvider};
+use crate::crypto::key::{KeyProvider, Secp256k1KeyProvider};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -276,7 +276,7 @@ pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
 /// This is a convenience function for tests and simple use cases where
 /// you want to quickly wrap a signing key in a KeyProvider trait object.
 pub fn into_provider(signing_key: Secp256k1SigningKey) -> std::sync::Arc<dyn KeyProvider> {
-	std::sync::Arc::new(InMemoryKeyProvider::from(signing_key))
+	std::sync::Arc::new(Secp256k1KeyProvider::from(signing_key))
 }
 
 // ============================================================================

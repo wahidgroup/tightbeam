@@ -76,6 +76,11 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", from)]
 	SpkiError(crate::spki::Error),
 
+	/// Key provider error
+	#[cfg_attr(feature = "derive", error("Key provider error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	KeyError(crate::crypto::key::KeyError),
+
 	/// CMS builder error
 	#[cfg_attr(feature = "derive", error("CMS builder error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -276,6 +281,7 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::InvalidPublicKey(e) => write!(f, "Invalid public key in handshake: {}", e),
 			HandshakeError::CertificateValidationError(e) => write!(f, "Invalid certificate: {}", e),
 			HandshakeError::SpkiError(e) => write!(f, "SPKI error: {}", e),
+			HandshakeError::KeyError(e) => write!(f, "Key provider error: {}", e),
 			HandshakeError::CmsBuilderError(e) => write!(f, "CMS builder error: {}", e),
 			HandshakeError::SignatureVerificationFailed => write!(f, "Handshake signature verification failed"),
 			HandshakeError::KeyDerivationFailed(e) => write!(f, "Handshake key derivation failed: {}", e),
@@ -358,5 +364,12 @@ impl From<crate::crypto::kdf::KdfError> for HandshakeError {
 impl From<crypto_common::InvalidLength> for HandshakeError {
 	fn from(_: crypto_common::InvalidLength) -> Self {
 		HandshakeError::KeyDerivationFailed(crate::crypto::aead::Error)
+	}
+}
+
+#[cfg(not(feature = "derive"))]
+impl From<crate::crypto::key::KeyError> for HandshakeError {
+	fn from(e: crate::crypto::key::KeyError) -> Self {
+		HandshakeError::KeyError(e)
 	}
 }

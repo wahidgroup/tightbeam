@@ -48,4 +48,3 @@ impl<T> From<std::sync::PoisonError<T>> for ClusterError {
 		ClusterError::LockPoisoned
 	}
 }
-

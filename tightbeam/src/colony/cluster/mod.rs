@@ -326,33 +326,33 @@ pub fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
 		};
 
 		// Spawn heartbeat threads with concurrency limiting via chunking
-		hives
-			.chunks(config.heartbeat.max_concurrent)
-			.for_each(|chunk| {
-				let handles: Vec<_> = chunk
-					.iter()
-					.map(|hive| {
-						let registry = Arc::clone(&registry);
-						let config = Arc::clone(&config);
-						let trace = Arc::clone(&trace);
-						let hive_addr = Arc::clone(&hive.address);
+		hives.chunks(config.heartbeat.max_concurrent).for_each(|chunk| {
+			let handles: Vec<_> = chunk
+				.iter()
+				.map(|hive| {
+					let registry = Arc::clone(&registry);
+					let config = Arc::clone(&config);
+					let trace = Arc::clone(&trace);
+					let hive_addr = Arc::clone(&hive.address);
 
-						std_rt::spawn(move || {
-							let _cmd = ClusterCommand {
-								heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
-								manage: None,
-							};
+					std_rt::spawn(move || {
+						let _cmd = ClusterCommand {
+							heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
+							manage: None,
+						};
 
-							// TODO: Send via connection pool
-							let result = simulate_heartbeat();
-							process_heartbeat_result(result, &hive_addr, &registry, &config, &trace);
-						})
+						// TODO: Send via connection pool
+						let result = simulate_heartbeat();
+						process_heartbeat_result(result, &hive_addr, &registry, &config, &trace);
 					})
-					.collect();
+				})
+				.collect();
 
-				// Wait for this chunk to complete before spawning next
-				handles.into_iter().for_each(|h| { let _ = std_rt::join(h); });
+			// Wait for this chunk to complete before spawning next
+			handles.into_iter().for_each(|h| {
+				let _ = std_rt::join(h);
 			});
+		});
 
 		std_rt::sleep(config.heartbeat.interval);
 	}
@@ -546,4 +546,3 @@ mod tests {
 		Ok(())
 	}
 }
-

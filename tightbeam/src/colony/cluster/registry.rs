@@ -58,11 +58,7 @@ impl HiveRegistry {
 	/// Takes ownership for zero-copy conversion to `Arc<[u8]>`.
 	pub fn register(&self, request: RegisterDroneRequest) -> Result<(), ClusterError> {
 		let hive_id: SharedId = request.drone_addr.into();
-		let servlet_types: Arc<[SharedId]> = request
-			.available_servlets
-			.into_iter()
-			.map(Into::into)
-			.collect();
+		let servlet_types: Arc<[SharedId]> = request.available_servlets.into_iter().map(Into::into).collect();
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
 
 		let entry = HiveEntry {
@@ -86,10 +82,7 @@ impl HiveRegistry {
 		{
 			let mut index = self.servlet_index.write()?;
 			for servlet_type in servlet_types.iter() {
-				index
-					.entry(Arc::clone(servlet_type))
-					.or_default()
-					.push(Arc::clone(&hive_id));
+				index.entry(Arc::clone(servlet_type)).or_default().push(Arc::clone(&hive_id));
 			}
 		}
 
@@ -131,10 +124,7 @@ impl HiveRegistry {
 		drop(index);
 
 		let hives = self.hives.read()?;
-		let entries: Vec<HiveEntry> = hive_ids
-			.iter()
-			.filter_map(|id| hives.get(id.as_ref()).cloned())
-			.collect();
+		let entries: Vec<HiveEntry> = hive_ids.iter().filter_map(|id| hives.get(id.as_ref()).cloned()).collect();
 
 		Ok(entries)
 	}
@@ -234,4 +224,3 @@ impl Default for HiveRegistry {
 		Self::new(Duration::from_secs(15))
 	}
 }
-

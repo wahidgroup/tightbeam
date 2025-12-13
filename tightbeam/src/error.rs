@@ -191,6 +191,11 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	KeyDerivationError(crate::crypto::kdf::KdfError),
 
+	/// Error from key provider operations
+	#[cfg_attr(feature = "derive", error("Key provider error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	KeyError(crate::crypto::key::KeyError),
+
 	/// Error obtaining random bytes from the OS
 	#[cfg(feature = "random")]
 	#[cfg_attr(feature = "derive", error("OS random number generator error: {0}"))]
@@ -295,6 +300,10 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Missing configuration"))]
 	MissingConfiguration,
 
+	/// Operation not supported by this implementation
+	#[cfg_attr(feature = "derive", error("Unsupported operation"))]
+	UnsupportedOperation,
+
 	/// Multiple errors collected together
 	#[cfg_attr(feature = "derive", error("Multiple errors occurred: {0:?}"))]
 	Sequence(Vec<TightBeamError>),
@@ -332,6 +341,7 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingResponse => write!(f, "Missing response"),
 			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
 			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),
+			TightBeamError::UnsupportedOperation => write!(f, "Unsupported operation"),
 			#[cfg(feature = "transport")]
 			TightBeamError::HandshakeError(err) => write!(f, "Handshake error: {err}"),
 			#[cfg(feature = "colony")]
@@ -362,6 +372,7 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::EllipticCurveError(_) => write!(f, "Elliptic curve error"),
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
+			TightBeamError::KeyError(err) => write!(f, "Key provider error: {err}"),
 			#[cfg(feature = "digest")]
 			TightBeamError::MissingDigestInfo => write!(f, "Missing integrity info"),
 			#[cfg(feature = "aead")]

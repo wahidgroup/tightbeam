@@ -84,4 +84,3 @@ impl From<crate::TightBeamError> for DroneError {
 		DroneError::ComposeFailed(e.to_string().into_bytes())
 	}
 }
-

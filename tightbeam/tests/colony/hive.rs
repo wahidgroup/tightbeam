@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tightbeam::{
 	colony::drone::{Hive, HiveConf, HiveTlsConfig},
 	colony::servlet::Servlet,
-	compose, decode,
+	compose,
+	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
+	decode,
 	der::Sequence,
 	drone, exactly, servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
@@ -16,7 +18,7 @@ use tightbeam::{
 	Beamable,
 };
 
-use crate::dtn::certs::{MARS_RELAY_CERT, MARS_RELAY_KEY, MARS_RELAY_PINNING};
+use crate::common::x509::create_test_cert_with_key;
 
 // ============================================================================
 // Test Messages
@@ -93,11 +95,14 @@ tb_scenario! {
 		exec: |trace| async move {
 			trace.event("hive_started")?;
 
-			// Configure TLS for servlets
+			// Generate test certificate and key
+			let (cert, signing_key) = create_test_cert_with_key("CN=Hive Test Server", 365)?;
+
+			// Configure TLS for servlets (no client validation for this test)
 			let tls_config = Arc::new(HiveTlsConfig {
-				certificate: MARS_RELAY_CERT,
-				key: MARS_RELAY_KEY,
-				validators: vec![Arc::new(MARS_RELAY_PINNING)],
+				certificate: CertificateSpec::Built(Box::new(cert)),
+				key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
+				validators: vec![],
 			});
 
 			// Configure hive with TLS
@@ -164,4 +169,3 @@ tb_scenario! {
 		}
 	}
 }
-

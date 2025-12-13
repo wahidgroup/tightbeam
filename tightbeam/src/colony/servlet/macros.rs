@@ -25,7 +25,9 @@ macro_rules! __tightbeam_servlet_common_methods {
 
 		#[allow(dead_code)]
 		#[cfg(feature = "tokio")]
-		pub async fn join(mut self) -> ::core::result::Result<(), $crate::colony::servlet::servlet_runtime::rt::JoinError> {
+		pub async fn join(
+			mut self,
+		) -> ::core::result::Result<(), $crate::colony::servlet::servlet_runtime::rt::JoinError> {
 			if let Some(handle) = self.server_handle.take() {
 				$crate::colony::servlet::servlet_runtime::rt::join(handle).await
 			} else {
@@ -412,5 +414,3 @@ macro_rules! servlet {
 		}
 	};
 }
-
-

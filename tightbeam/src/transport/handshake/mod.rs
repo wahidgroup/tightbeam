@@ -180,7 +180,7 @@ use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
 use crate::crypto::aead::{KeyInit, RuntimeAead};
 use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
-use crate::crypto::key::{InMemoryKeyProvider, KeyProvider};
+use crate::crypto::key::{KeyProvider, Secp256k1KeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -323,14 +323,14 @@ impl<P: CryptoProvider> Clone for HandshakeKeyManager<P> {
 #[cfg(feature = "x509")]
 impl From<Secp256k1SigningKey> for HandshakeKeyManager<DefaultCryptoProvider> {
 	fn from(signing_key: Secp256k1SigningKey) -> Self {
-		let provider = InMemoryKeyProvider::from(signing_key);
+		let provider = Secp256k1KeyProvider::from(signing_key);
 		Self { provider: Arc::new(provider), _phantom: PhantomData }
 	}
 }
 
 #[cfg(feature = "x509")]
-impl From<InMemoryKeyProvider> for HandshakeKeyManager<DefaultCryptoProvider> {
-	fn from(provider: InMemoryKeyProvider) -> Self {
+impl From<Secp256k1KeyProvider> for HandshakeKeyManager<DefaultCryptoProvider> {
+	fn from(provider: Secp256k1KeyProvider) -> Self {
 		Self { provider: Arc::new(provider), _phantom: PhantomData }
 	}
 }

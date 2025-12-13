@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::Instant;
 
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
-use crate::crypto::{key::KeySpec, x509::CertificateSpec};
+use crate::crypto::{key::KeyProvider, x509::CertificateSpec};
 use crate::transport::client::GenericClient;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::HandshakeKeyManager;
@@ -46,7 +46,7 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 
 	/// Configure client identity for mutual TLS
 	#[cfg(feature = "x509")]
-	fn with_client_identity(self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self>;
+	fn with_client_identity(self, cert: CertificateSpec, key: Arc<dyn KeyProvider>) -> TransportResult<Self>;
 
 	/// Build the configured builder/pool (sync)
 	fn build(self) -> Self::Output;
@@ -171,10 +171,9 @@ impl<P: Protocol, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P
 	}
 
 	#[cfg(feature = "x509")]
-	fn with_client_identity(mut self, cert: CertificateSpec, key: KeySpec) -> TransportResult<Self> {
+	fn with_client_identity(mut self, cert: CertificateSpec, key: Arc<dyn KeyProvider>) -> TransportResult<Self> {
 		let cert_converted = Certificate::try_from(cert)?;
-		let key_converted =
-			HandshakeKeyManager::<C>::try_from(key).map_err(|e| TransportError::HandshakeError(e.into()))?;
+		let key_converted: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
 
 		self.tls.set_client_identity(cert_converted, key_converted);
 		Ok(self)

@@ -118,4 +118,3 @@ impl Default for LatencyTracker {
 		Self::new(2000, 100_000)
 	}
 }
-

@@ -162,8 +162,8 @@ where
 pub struct HiveTlsConfig {
 	/// Server certificate specification
 	pub certificate: crate::crypto::x509::CertificateSpec,
-	/// Private key specification
-	pub key: crate::crypto::key::KeySpec,
+	/// Private key provider for signing operations
+	pub key: Arc<dyn crate::crypto::key::KeyProvider>,
 	/// Client certificate validators (e.g., public key pinning)
 	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 }
@@ -173,7 +173,7 @@ impl core::fmt::Debug for HiveTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("HiveTlsConfig")
 			.field("certificate", &self.certificate)
-			.field("key", &self.key)
+			.field("key", &"<KeyProvider>")
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.finish()
 	}
@@ -251,4 +251,3 @@ impl Default for HiveConf {
 // The drone! macro is defined in macros.rs and exported via #[macro_export]
 #[path = "macros.rs"]
 mod macros_impl;
-

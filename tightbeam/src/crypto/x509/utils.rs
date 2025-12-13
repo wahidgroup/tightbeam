@@ -106,9 +106,20 @@ where
 	V: EncodePublicKey,
 {
 	let public_key_der = verifying_key.to_public_key_der()?;
+	compute_signer_identifier_from_der::<D>(public_key_der.as_bytes())
+}
 
+/// Compute a SubjectKeyIdentifier-based SignerIdentifier from DER-encoded public key bytes.
+///
+/// This is the byte-based variant for use with `KeyProvider::to_public_key_bytes()`.
+pub fn compute_signer_identifier_from_der<D>(
+	public_key_der: &[u8],
+) -> Result<SignerIdentifier, CertificateValidationError>
+where
+	D: Digest,
+{
 	let mut hasher = D::new();
-	Digest::update(&mut hasher, public_key_der.as_bytes());
+	Digest::update(&mut hasher, public_key_der);
 	let digest_bytes = Digest::finalize(hasher);
 
 	let skid_octets = OctetString::new(&digest_bytes.as_slice()[..20])?;

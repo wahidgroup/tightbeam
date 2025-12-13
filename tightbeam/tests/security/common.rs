@@ -15,7 +15,7 @@ use tightbeam::{
 		hash::Sha3_256,
 		kdf::{HkdfSha3_256, HkdfSha3_256Oid},
 		kem::Kyber1024Oid,
-		key::{InMemoryKeyProvider, KeyProvider},
+		key::{KeyProvider, Secp256k1KeyProvider},
 		profiles::{
 			AeadProvider, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
 			SecurityProfile, SecurityProfileDesc, SigningProvider, TightbeamProfile,
@@ -181,7 +181,7 @@ impl ServerMaterials {
 		let signing_key = create_test_signing_key();
 		let certificate = Arc::new(create_test_certificate(&signing_key));
 		let server_key = Secp256k1SigningKey::from(signing_key);
-		let provider: Arc<dyn KeyProvider> = Arc::new(InMemoryKeyProvider::from(server_key));
+		let provider: Arc<dyn KeyProvider> = Arc::new(Secp256k1KeyProvider::from(server_key));
 		Self { certificate, key_provider: provider }
 	}
 }
@@ -323,11 +323,6 @@ impl SecurityThreatHarness {
 				Box::new(CmsSession::with_profiles(&self.materials, client_profiles, server_profiles))
 			}
 		}
-	}
-
-	/// Get the server materials for advanced cross-session scenarios.
-	pub fn materials(&self) -> &ServerMaterials {
-		&self.materials
 	}
 
 	/// Spawn a session using the WEAK cipher (AES-128-GCM) for downgrade testing.
@@ -498,7 +493,7 @@ impl Aes128EciesSession {
 		let weak_profile = weak_security_profile();
 
 		let client = EciesHandshakeClient::<Aes128CryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(vec![weak_profile.clone()]));
+			.with_security_offer(SecurityOffer::new(vec![weak_profile]));
 
 		let server = EciesHandshakeServer::<Aes128CryptoProvider>::new(
 			Arc::clone(&materials.key_provider),
@@ -614,7 +609,7 @@ impl CmsSession {
 		let client_key = create_test_signing_key();
 		let client_cert = Arc::new(create_test_certificate(&client_key));
 		let client_key = Secp256k1SigningKey::from(client_key);
-		let client_provider: Arc<dyn KeyProvider> = Arc::new(InMemoryKeyProvider::from(client_key));
+		let client_provider: Arc<dyn KeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
 
 		// Use internal transcript computation for proper replay detection
 		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(

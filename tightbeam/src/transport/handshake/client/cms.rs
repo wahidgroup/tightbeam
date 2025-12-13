@@ -6,6 +6,7 @@
 use core::future::Future;
 use core::pin::Pin;
 
+use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfo};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
@@ -463,18 +464,18 @@ where
 
 	/// Sign the finished digest using the client key provider.
 	async fn sign_finished_digest(&self, digest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		let signature = self.client_key_provider.sign(digest).await?;
-		Ok(signature.to_bytes().to_vec())
+		let signature_bytes = self.client_key_provider.sign(digest).await?;
+		Ok(signature_bytes)
 	}
 
 	/// Build cryptographic components needed for SignedData.
 	async fn build_finished_crypto_components(
 		&self,
 	) -> Result<(SignerIdentifier, AlgorithmIdentifierOwned, AlgorithmIdentifierOwned), HandshakeError> {
-		use crate::crypto::x509::utils::compute_signer_identifier;
+		use crate::crypto::x509::utils::compute_signer_identifier_from_der;
 
-		let public_key = self.client_key_provider.to_public_key().await?;
-		let signer_id = compute_signer_identifier::<P::Digest, _>(&public_key)?;
+		let public_key_bytes = self.client_key_provider.to_public_key_bytes().await?;
+		let signer_id = compute_signer_identifier_from_der::<P::Digest>(&public_key_bytes)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
 		let signature_alg = AlgorithmIdentifierOwned { oid: P::Signature::ALGORITHM_OID, parameters: None };
 
@@ -491,7 +492,7 @@ where
 		signature_alg: AlgorithmIdentifierOwned,
 	) -> Result<Vec<u8>, HandshakeError> {
 		let signer_info = SignerInfo {
-			version: crate::cms::content_info::CmsVersion::V1,
+			version: CmsVersion::V1,
 			sid: signer_id,
 			digest_alg: digest_alg.clone(),
 			signed_attrs: None,
@@ -507,7 +508,7 @@ where
 			EncapsulatedContentInfo { econtent_type: crate::oids::DATA, econtent: Some(econtent_any) };
 
 		let signed_data = SignedData {
-			version: crate::cms::content_info::CmsVersion::V1,
+			version: CmsVersion::V1,
 			digest_algorithms: vec![digest_alg].try_into()?,
 			encap_content_info,
 			certificates: None,

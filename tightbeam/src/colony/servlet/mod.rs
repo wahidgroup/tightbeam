@@ -17,21 +17,21 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::colony::servlet::servlet_runtime::rt;
 use crate::colony::worker::Worker;
+use crate::colony::worker::WorkerMetadata;
 use crate::core::Message;
+use crate::crypto::profiles::DefaultCryptoProvider;
+use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
 use crate::transport::Protocol;
 use crate::transport::TightBeamAddress;
 use crate::utils::BasisPoints;
 use crate::TightBeamError;
-use crate::policy::GatePolicy;
-use crate::crypto::profiles::DefaultCryptoProvider;
-use crate::colony::servlet::servlet_runtime::rt;
-use crate::colony::worker::WorkerMetadata;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::key::KeySpec;
+	pub use crate::crypto::key::KeyProvider;
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::policy::CertificateValidation;
 	pub use crate::crypto::x509::{Certificate, CertificateSpec};
@@ -300,11 +300,11 @@ where
 	pub fn with_certificate(
 		mut self,
 		cert: CertificateSpec,
-		key: KeySpec,
+		key: Arc<dyn KeyProvider>,
 		validators: Vec<Arc<dyn CertificateValidation>>,
 	) -> Result<Self, TightBeamError> {
 		let cert_obj = Certificate::try_from(cert)?;
-		let key_mgr = HandshakeKeyManager::try_from(key)?;
+		let key_mgr: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
 		self.x509_config = Some(TransportEncryptionConfig::new(cert_obj, key_mgr).with_client_validators(validators));
 		Ok(self)
 	}

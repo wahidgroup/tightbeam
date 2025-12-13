@@ -36,6 +36,7 @@ use tightbeam::{
 use tightbeam::{
 	crypto::{
 		key::KeySpec,
+		sign::ecdsa::Secp256k1,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
 	hex,
@@ -191,7 +192,7 @@ tb_scenario! {
 				let message_count = Arc::new(AtomicUsize::new(0));
 				let env_config = Arc::new(PoolEchoServletConf { message_count: Arc::clone(&message_count) });
 				let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
-					.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 					.with_config(env_config)
 					.build();
 				let servlet = PoolEchoServlet::start(
@@ -205,7 +206,7 @@ tb_scenario! {
 				let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 					.with_config(PoolConfig::default())
 					.with_server_certificate(SERVER_CERT)?
-					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+					.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 					.with_timeout(Duration::from_millis(1000))
 					.build());
 
@@ -270,11 +271,11 @@ tb_scenario! {
 				let config2 = Arc::new(IsolationServletConf { message_count: Arc::clone(&count2) });
 
 				let servlet_conf1 = ServletConf::<TokioListener, TestMessage>::builder()
-					.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 					.with_config(config1)
 					.build();
 				let servlet_conf2 = ServletConf::<TokioListener, TestMessage>::builder()
-					.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+					.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 					.with_config(config2)
 					.build();
 
@@ -287,7 +288,7 @@ tb_scenario! {
 
 				let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 					.with_server_certificate(SERVER_CERT)?
-					.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+					.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 					.build());
 
 				for (addr, name) in [(addr1, "addr1-test"), (addr2, "addr2-test"), (addr1, "addr1-test2")] {
@@ -348,7 +349,7 @@ tb_scenario! {
 			let message_count = Arc::new(AtomicUsize::new(0));
 			let env_config = Arc::new(ConcurrentServletConf { message_count: Arc::clone(&message_count) });
 			let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
-				.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(env_config)
 				.build();
 			let servlet = ConcurrentServlet::start(
@@ -361,7 +362,7 @@ tb_scenario! {
 
 			let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_server_certificate(SERVER_CERT)?
-				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			for _ in 0..3 {

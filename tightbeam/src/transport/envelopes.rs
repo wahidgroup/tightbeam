@@ -20,12 +20,12 @@ mod x509 {
 	pub use crate::cms::signed_data::SignedData;
 }
 
-#[cfg(feature = "x509")]
-use x509::*;
 #[cfg(feature = "derive")]
 use crate::Beamable;
 #[cfg(not(feature = "derive"))]
 use crate::{Message, Version};
+#[cfg(feature = "x509")]
+use x509::*;
 
 /// Request package containing the message frame
 #[derive(Debug, Clone, PartialEq, Eq)]

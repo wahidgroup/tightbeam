@@ -187,8 +187,8 @@ mod tests {
 	use super::WorkerRelayError;
 	use crate::der::Sequence;
 	use crate::policy::{ReceptorPolicy, TransitStatus};
-	use crate::Beamable;
 	use crate::worker;
+	use crate::Beamable;
 
 	#[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
 	pub struct RequestMessage {

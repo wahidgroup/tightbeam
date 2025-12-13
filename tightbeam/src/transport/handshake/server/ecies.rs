@@ -317,14 +317,14 @@ where
 	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError> {
 		// Parse the ECIES message from bytes
 		let encrypted_message = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
-		// Get ephemeral public key from message
-		let ephemeral_pubkey = PublicKey::from_sec1_bytes(encrypted_message.ephemeral_pubkey())?;
+		// Get ephemeral public key bytes from message
+		let ephemeral_pubkey_bytes = encrypted_message.ephemeral_pubkey();
 		// Use KeyProvider to perform ECDH
-		let shared_secret_bytes = self.server_key_provider.ecdh(&ephemeral_pubkey).await?;
+		let shared_secret_bytes = self.server_key_provider.key_agreement(ephemeral_pubkey_bytes).await?;
 
 		// Derive encryption key using KDF
 		let k_enc = ecies_kdf::<HkdfSha3_256>(
-			encrypted_message.ephemeral_pubkey(),
+			ephemeral_pubkey_bytes,
 			shared_secret_bytes.into(),
 			TIGHTBEAM_ECIES_KDF_INFO,
 			None,

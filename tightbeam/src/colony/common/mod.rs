@@ -197,4 +197,3 @@ pub fn current_timestamp_ms() -> u64 {
 pub fn current_timestamp_ms() -> u64 {
 	0 // Embedded systems need external time source
 }
-

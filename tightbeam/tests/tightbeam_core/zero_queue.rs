@@ -8,7 +8,7 @@ use tightbeam::builder::{FrameBuilder, TypeBuilder};
 use tightbeam::colony::servlet::{Servlet, ServletConf};
 use tightbeam::crypto::{
 	hash::Sha3_256,
-	key::{InMemoryKeyProvider, KeySpec},
+	key::{KeyProvider, KeySpec, Secp256k1KeyProvider},
 	x509::CertificateSpec,
 };
 use tightbeam::der::ValueOrd;
@@ -370,16 +370,12 @@ tb_scenario! {
 		setup: |addr, _config| async move {
 			let (client_cert, client_key) = create_test_cert_with_key("CN=Test Client", 365)?;
 
-			// Convert signing key to KeySpec via InMemoryKeyProvider
-			let provider = InMemoryKeyProvider::from(client_key);
-			let key_spec = KeySpec::Provider(Arc::new(provider));
-
+			let key_provider: Arc<dyn KeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
 			let certificate = CertificateSpec::Built(Box::new(client_cert));
-			// Restart policy will handle server-side Busy responses
 			let restart_policy = RestartLinearBackoff::new(3, 50, 1, None);
 
 			let builder = ClientBuilder::<TokioListener>::builder()
-				.with_client_identity(certificate, key_spec)?
+				.with_client_identity(certificate, key_provider)?
 				.with_restart(restart_policy)
 				.build();
 

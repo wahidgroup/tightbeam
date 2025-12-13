@@ -29,6 +29,7 @@ use tightbeam::{
 use tightbeam::{
 	crypto::{
 		key::KeySpec,
+		sign::ecdsa::Secp256k1,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
 	hex,
@@ -197,7 +198,7 @@ tb_scenario! {
 			}
 
 			let servlet_conf = ServletConf::<TokioListener, TestMessage>::builder()
-				.with_certificate(SERVER_CERT, SERVER_KEY, vec![Arc::new(CLIENT_PINNING)])?
+				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
 			let servlet_task = TlsEchoServlet::start(Arc::clone(&trace), Some(servlet_conf)).await?;
@@ -208,7 +209,7 @@ tb_scenario! {
 			// Configure client with TLS credentials
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_server_certificate(SERVER_CERT)?
-				.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 			let mut client = builder.connect(addr).await?;
 
