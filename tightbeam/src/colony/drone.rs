@@ -131,6 +131,9 @@ pub enum DroneError {
 	/// Lock poisoned
 	#[cfg_attr(feature = "derive", error("Lock poisoned"))]
 	LockPoisoned,
+	/// No trusted keys configured for ClusterSecurityGate
+	#[cfg_attr(feature = "derive", error("No trusted keys configured"))]
+	NoTrustedKeys,
 }
 
 #[cfg(not(feature = "derive"))]
@@ -144,6 +147,7 @@ impl core::fmt::Display for DroneError {
 			DroneError::NoResponse => write!(f, "No response received"),
 			DroneError::DecodeFailed => write!(f, "Message decoding failed"),
 			DroneError::LockPoisoned => write!(f, "Lock poisoned"),
+			DroneError::NoTrustedKeys => write!(f, "No trusted keys configured"),
 		}
 	}
 }
@@ -565,7 +569,7 @@ fn current_timestamp_ms() -> u64 {
 /// 1. Check circuit breaker - reject if open
 /// 2. Verify nonrepudiation signature present
 /// 3. Verify frame integrity present
-/// 4. If trusted keys configured: verify signature against at least one key
+/// 4. Verify signature against at least one trusted key
 /// 5. On failure: record auth failure (may trip breaker)
 /// 6. On success: record success (resets breaker)
 pub struct ClusterSecurityGate<S, V>
@@ -576,7 +580,6 @@ where
 	/// Circuit breaker for tracking auth failures
 	circuit_breaker: Arc<ClusterCircuitBreaker>,
 	/// Trusted cluster verifying keys for signature validation
-	/// If empty, only presence checks are performed (no verification)
 	trusted_keys: Vec<V>,
 	/// Phantom data for signature type
 	_signature: core::marker::PhantomData<S>,
@@ -591,15 +594,15 @@ where
 	///
 	/// # Arguments
 	/// * `circuit_breaker` - Shared circuit breaker for tracking auth failures
-	/// * `trusted_keys` - Trusted verifying keys; if empty, signature presence
-	///   is checked but not verified
-	pub fn new(circuit_breaker: Arc<ClusterCircuitBreaker>, trusted_keys: Vec<V>) -> Self {
-		Self { circuit_breaker, trusted_keys, _signature: core::marker::PhantomData }
-	}
-
-	/// Create a gate that only checks presence (no signature verification)
-	pub fn presence_only(circuit_breaker: Arc<ClusterCircuitBreaker>) -> Self {
-		Self::new(circuit_breaker, Vec::new())
+	/// * `trusted_keys` - Trusted verifying keys for signature verification
+	///
+	/// # Errors
+	/// Returns `DroneError::NoTrustedKeys` if `trusted_keys` is empty.
+	pub fn new(circuit_breaker: Arc<ClusterCircuitBreaker>, trusted_keys: Vec<V>) -> Result<Self, DroneError> {
+		if trusted_keys.is_empty() {
+			return Err(DroneError::NoTrustedKeys);
+		}
+		Ok(Self { circuit_breaker, trusted_keys, _signature: core::marker::PhantomData })
 	}
 }
 
@@ -626,13 +629,11 @@ where
 			return TransitStatus::Unauthorized;
 		}
 
-		// Verify signature against trusted keys (if any configured)
-		if !self.trusted_keys.is_empty() {
-			let verified = self.trusted_keys.iter().any(|key| frame.verify::<S>(key).is_ok());
-			if !verified {
-				self.circuit_breaker.record_auth_failure();
-				return TransitStatus::Forbidden;
-			}
+		// Verify signature against trusted keys
+		let verified = self.trusted_keys.iter().any(|key| frame.verify::<S>(key).is_ok());
+		if !verified {
+			self.circuit_breaker.record_auth_failure();
+			return TransitStatus::Forbidden;
 		}
 
 		// All checks passed
@@ -1037,8 +1038,9 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 	pub circuit_breaker_threshold: u8,
 	/// Circuit breaker cooldown in milliseconds (default: 30_000)
 	pub circuit_breaker_cooldown_ms: u64,
-	/// Trusted cluster verifying keys (DER-encoded)
-	/// If empty, signature presence is checked but not verified
+	/// Trusted cluster verifying keys (SEC1-encoded public keys)
+	/// Required for receiving authenticated ClusterCommand messages.
+	/// If empty, all cluster commands will be rejected.
 	pub trusted_cluster_keys: Vec<Vec<u8>>,
 	/// Max connections per servlet for forwarding (default: 8)
 	pub servlet_pool_size: usize,
@@ -2726,13 +2728,21 @@ macro_rules! drone {
 						$crate::crypto::sign::ecdsa::Secp256k1VerifyingKey::from_sec1_bytes(der_bytes).ok()
 					})
 					.collect();
-				let security_gate = $crate::colony::ClusterSecurityGate::<
+				let security_gate = match $crate::colony::ClusterSecurityGate::<
 					$crate::crypto::sign::ecdsa::Secp256k1Signature,
 					$crate::crypto::sign::ecdsa::Secp256k1VerifyingKey,
 				>::new(
 					::std::sync::Arc::clone(&$circuit_breaker),
 					parsed_keys,
-				);
+				) {
+					Ok(gate) => gate,
+					Err(_) => {
+						// No trusted keys configured - reject all cluster commands
+						return drone!(@reply $frame, $crate::colony::ClusterCommandResponse::manage(
+							$crate::colony::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Forbidden)
+						));
+					}
+				};
 				let security_status = $crate::policy::GatePolicy::evaluate(&security_gate, &$frame);
 				if security_status != $crate::policy::TransitStatus::Accepted {
 					return drone!(@reply $frame, $crate::colony::ClusterCommandResponse::manage(
@@ -3432,8 +3442,15 @@ mod tests {
 	#[tokio::test]
 	async fn test_hive_management_commands() -> Result<(), Box<dyn std::error::Error>> {
 		let signing_key = SIGNING_KEY().lock().map_err(|_| "Lock error")?.clone();
+		let verifying_key_bytes = signing_key.verifying_key().to_sec1_bytes().to_vec();
 
-		let mut hive = TestHive::start(Arc::new(TraceCollector::new()), None).await?;
+		// Configure hive with trusted cluster key
+		let config = HiveConf {
+			trusted_cluster_keys: vec![verifying_key_bytes],
+			..Default::default()
+		};
+
+		let mut hive = TestHive::start(Arc::new(TraceCollector::new()), Some(config)).await?;
 		let control_addr = hive.addr();
 
 		hive.establish_hive().await?;
@@ -3725,16 +3742,23 @@ mod tests {
 	// ClusterSecurityGate Unit Tests
 	// ==========================================================================
 
-	/// Helper to create a presence-only security gate (no signature verification)
-	fn make_presence_gate(breaker: Arc<ClusterCircuitBreaker>) -> ClusterSecurityGate<TestSignature, TestVerifyingKey> {
-		ClusterSecurityGate::presence_only(breaker)
+	/// Helper to get the test verifying key
+	fn test_verifying_key() -> TestVerifyingKey {
+		get_signing_key_for_gate()
 	}
 
-	/// Helper to create a gate with trusted keys for signature verification
+	/// Helper to create a security gate with the test signing key
+	fn make_test_gate(
+		breaker: Arc<ClusterCircuitBreaker>,
+	) -> Result<ClusterSecurityGate<TestSignature, TestVerifyingKey>, DroneError> {
+		ClusterSecurityGate::new(breaker, vec![test_verifying_key()])
+	}
+
+	/// Helper to create a gate with specific trusted keys for signature verification
 	fn make_verifying_gate(
 		breaker: Arc<ClusterCircuitBreaker>,
 		keys: Vec<TestVerifyingKey>,
-	) -> ClusterSecurityGate<TestSignature, TestVerifyingKey> {
+	) -> Result<ClusterSecurityGate<TestSignature, TestVerifyingKey>, DroneError> {
 		ClusterSecurityGate::new(breaker, keys)
 	}
 
@@ -3744,7 +3768,7 @@ mod tests {
 		breaker.record_auth_failure(); // Trip immediately
 		assert!(breaker.is_open());
 
-		let gate = make_presence_gate(Arc::clone(&breaker));
+		let gate = make_test_gate(Arc::clone(&breaker))?;
 		let frame = build_test_frame(FrameOpts::default())?;
 		assert_eq!(gate.evaluate(&frame), TransitStatus::Forbidden);
 		Ok(())
@@ -3756,7 +3780,7 @@ mod tests {
 		assert!(frame.nonrepudiation.is_none());
 
 		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 1000));
-		let gate = make_presence_gate(Arc::clone(&breaker));
+		let gate = make_test_gate(Arc::clone(&breaker))?;
 		assert_eq!(gate.evaluate(&frame), TransitStatus::Unauthorized);
 		Ok(())
 	}
@@ -3768,7 +3792,7 @@ mod tests {
 		assert!(frame.integrity.is_none());
 
 		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 1000));
-		let gate = make_presence_gate(Arc::clone(&breaker));
+		let gate = make_test_gate(Arc::clone(&breaker))?;
 		assert_eq!(gate.evaluate(&frame), TransitStatus::Unauthorized);
 		Ok(())
 	}
@@ -3780,7 +3804,7 @@ mod tests {
 		assert!(frame.integrity.is_some());
 
 		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 1000));
-		let gate = make_presence_gate(Arc::clone(&breaker));
+		let gate = make_test_gate(Arc::clone(&breaker))?;
 		assert_eq!(gate.evaluate(&frame), TransitStatus::Accepted);
 		Ok(())
 	}
@@ -3788,7 +3812,7 @@ mod tests {
 	#[test]
 	fn security_gate_records_failures_on_breaker() -> crate::error::Result<()> {
 		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 1000));
-		let gate = make_presence_gate(Arc::clone(&breaker));
+		let gate = make_test_gate(Arc::clone(&breaker))?;
 
 		// Send 3 unsigned frames - should trip breaker
 		for _ in 0..3 {
@@ -3807,7 +3831,8 @@ mod tests {
 
 		let frame = build_test_frame(FrameOpts::default())?;
 		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 1000));
-		let gate = make_verifying_gate(Arc::clone(&breaker), vec![verifying_key]);
+		let gate = make_verifying_gate(Arc::clone(&breaker), vec![verifying_key])
+			.map_err(|_| DroneError::LockPoisoned)?;
 		assert_eq!(gate.evaluate(&frame), TransitStatus::Accepted);
 		Ok(())
 	}
@@ -3824,9 +3849,17 @@ mod tests {
 		let wrong_verifying_key = *different_key.verifying_key();
 
 		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 1000));
-		let gate = make_verifying_gate(Arc::clone(&breaker), vec![wrong_verifying_key]);
+		let gate = make_verifying_gate(Arc::clone(&breaker), vec![wrong_verifying_key])
+			.map_err(|_| DroneError::LockPoisoned)?;
 		assert_eq!(gate.evaluate(&frame), TransitStatus::Forbidden);
 		Ok(())
+	}
+
+	#[test]
+	fn security_gate_rejects_empty_trusted_keys() {
+		let breaker = Arc::new(ClusterCircuitBreaker::new(3, 1000));
+		let result = ClusterSecurityGate::<TestSignature, TestVerifyingKey>::new(breaker, vec![]);
+		assert!(matches!(result, Err(DroneError::NoTrustedKeys)));
 	}
 
 	// ==========================================================================

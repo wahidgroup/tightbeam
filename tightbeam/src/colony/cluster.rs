@@ -16,15 +16,20 @@
 //! ```ignore
 //! use tightbeam::cluster;
 //! use tightbeam::colony::ClusterConfig;
+//! use tightbeam::crypto::key::KeySpec;
+//!
+//! // Signing key for cluster → hive communication
+//! const CLUSTER_KEY: &[u8] = &[/* 32-byte secp256k1 secret key */];
 //!
 //! cluster! {
 //!     pub MyCluster,
 //!     protocol: TokioListener,
-//!     config: ClusterConfig::default()
+//!     config: ClusterConfig::new(KeySpec::Bytes(CLUSTER_KEY))
 //! }
 //!
 //! // Start the cluster
-//! let cluster = MyCluster::start(trace, ClusterConfig::default()).await?;
+//! let config = ClusterConfig::new(KeySpec::Bytes(CLUSTER_KEY));
+//! let cluster = MyCluster::start(trace, config).await?;
 //! println!("Cluster listening on {:?}", cluster.addr());
 //!
 //! // Hives will register themselves, cluster learns available servlets dynamically
@@ -36,6 +41,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::crypto::key::KeySpec;
 use crate::der::Sequence;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::trace::TraceCollector;
@@ -86,7 +92,8 @@ impl core::fmt::Debug for HeartbeatConf {
 
 /// Configuration for clusters
 ///
-/// Contains settings for load balancing, health checks, and gateway policies.
+/// Contains settings for load balancing, health checks, gateway policies,
+/// and cryptographic signing for cluster → hive communication.
 pub struct ClusterConfig<L: LoadBalancer = LeastLoaded> {
 	/// Load balancing strategy for distributing work across hives
 	pub load_balancer: L,
@@ -98,16 +105,21 @@ pub struct ClusterConfig<L: LoadBalancer = LeastLoaded> {
 	pub pool_config: PoolConfig,
 	/// Default retry policy for all cluster → hive communication
 	pub retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
+	/// Signing key for cluster → hive messages (nonrepudiation)
+	/// Supports HSM/KMS via KeySpec::Provider
+	pub signing_key: KeySpec,
 }
 
-impl Default for ClusterConfig {
-	fn default() -> Self {
+impl ClusterConfig {
+	/// Create a new cluster configuration with the given signing key
+	pub fn new(signing_key: KeySpec) -> Self {
 		Self {
 			load_balancer: LeastLoaded,
 			heartbeat: HeartbeatConf::default(),
 			policies: Vec::new(),
 			pool_config: PoolConfig::default(),
 			retry_policy: Arc::new(RestartExponentialBackoff::default()),
+			signing_key,
 		}
 	}
 }
@@ -118,6 +130,7 @@ impl<L: LoadBalancer> core::fmt::Debug for ClusterConfig<L> {
 			.field("heartbeat", &self.heartbeat)
 			.field("policies", &format!("[{} policies]", self.policies.len()))
 			.field("pool_config", &self.pool_config)
+			.field("signing_key", &self.signing_key)
 			.finish()
 	}
 }
@@ -457,10 +470,14 @@ pub trait Cluster: Sized {
 /// # Syntax
 ///
 /// ```ignore
+/// use tightbeam::crypto::key::KeySpec;
+///
+/// const CLUSTER_KEY: &[u8] = &[/* 32-byte secret key */];
+///
 /// cluster! {
 ///     pub MyCluster,
 ///     protocol: TokioListener,
-///     config: ClusterConfig::default()
+///     config: ClusterConfig::new(KeySpec::Bytes(CLUSTER_KEY))
 /// }
 /// ```
 #[macro_export]
@@ -691,12 +708,16 @@ macro_rules! cluster {
 mod tests {
 	use super::*;
 
+	// Test key bytes for unit tests
+	const TEST_KEY_BYTES: &[u8] = &[1u8; 32];
+
 	#[test]
-	fn cluster_config_default() {
-		let config = ClusterConfig::default();
+	fn cluster_config_new() {
+		let config = ClusterConfig::new(KeySpec::Bytes(TEST_KEY_BYTES));
 		assert_eq!(config.heartbeat.interval, Duration::from_secs(5));
 		assert_eq!(config.heartbeat.timeout, Duration::from_secs(15));
 		assert!(config.policies.is_empty());
+		assert!(matches!(config.signing_key, KeySpec::Bytes(_)));
 	}
 
 	#[test]
