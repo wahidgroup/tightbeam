@@ -24,7 +24,7 @@ use std::{
 };
 
 use tightbeam::{
-	colony::ServletConf,
+	colony::servlet::ServletConf,
 	der::Sequence,
 	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{create_v0_tightbeam, trace::TraceCollector, ScenarioConf},

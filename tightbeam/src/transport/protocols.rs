@@ -16,15 +16,16 @@ use alloc::sync::Arc;
 use std::sync::Arc;
 
 #[cfg(feature = "x509")]
-use crate::crypto::profiles::CryptoProvider;
+mod x509 {
+	pub use crate::crypto::profiles::CryptoProvider;
+	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::transport::handshake::HandshakeKeyManager;
+	pub use crate::transport::TransportEncryptionConfig;
+	pub use crate::x509::Certificate;
+}
+
 #[cfg(feature = "x509")]
-use crate::crypto::x509::policy::CertificateValidation;
-#[cfg(feature = "x509")]
-use crate::transport::handshake::HandshakeKeyManager;
-#[cfg(feature = "x509")]
-use crate::transport::TransportEncryptionConfig;
-#[cfg(feature = "x509")]
-use crate::x509::Certificate;
+use x509::*;
 
 /// Marker trait for applications to handle the address the way they wish
 pub trait TightBeamAddress: Into<Vec<u8>> + Clone + Send {}

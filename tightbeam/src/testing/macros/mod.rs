@@ -872,7 +872,7 @@ macro_rules! tb_scenario {
 
 		// Execute setup and stimulus
 		let builder = $crate::testing::macros::__tb_call_setup_closure($setup_closure, trace_setup);
-		let mut worker = <_ as $crate::colony::Worker>::start(builder, trace_start)
+		let mut worker = <_ as $crate::colony::worker::Worker>::start(builder, trace_start)
 			.await
 			.expect("Failed to start worker");
 
@@ -882,7 +882,7 @@ macro_rules! tb_scenario {
 			worker: W,
 		) -> Fut
 		where
-			W: $crate::colony::Worker,
+			W: $crate::colony::worker::Worker,
 			F: FnOnce(std::sync::Arc<$crate::trace::TraceCollector>, W) -> Fut,
 			Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
 		{

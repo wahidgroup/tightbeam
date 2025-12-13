@@ -113,6 +113,8 @@ pub mod helpers;
 pub mod matrix;
 pub mod oids;
 pub mod prelude;
+#[cfg(feature = "std")]
+pub mod runtime;
 #[cfg(any(test, feature = "testing"))]
 pub mod trace;
 pub mod utils;

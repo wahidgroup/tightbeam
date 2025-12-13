@@ -201,7 +201,6 @@ use crate::Beamable;
 use std::time::Instant;
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
-#[cfg(all(feature = "x509", feature = "secp256k1"))]
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 #[cfg(feature = "x509")]
 use crate::crypto::x509::attr::{Attribute, AttributeValue, Attributes};

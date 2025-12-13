@@ -97,12 +97,12 @@ pub enum TightBeamError {
 	#[cfg(feature = "colony")]
 	#[cfg_attr(feature = "derive", error("Drone error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	DroneError(crate::colony::DroneError),
+	DroneError(crate::colony::drone::DroneError),
 
 	#[cfg(feature = "colony")]
 	#[cfg_attr(feature = "derive", error("Worker relay error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	WorkerRelay(crate::colony::WorkerRelayError),
+	WorkerRelay(crate::colony::worker::WorkerRelayError),
 
 	#[cfg(feature = "std")]
 	/// I/O error

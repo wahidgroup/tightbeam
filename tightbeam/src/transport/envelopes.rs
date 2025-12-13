@@ -15,9 +15,13 @@ use crate::der::{Choice, Decode, Encode, EncodeValue, Tag, Tagged};
 use crate::policy::TransitStatus;
 
 #[cfg(feature = "x509")]
-use crate::cms::enveloped_data::EnvelopedData;
+mod x509 {
+	pub use crate::cms::enveloped_data::EnvelopedData;
+	pub use crate::cms::signed_data::SignedData;
+}
+
 #[cfg(feature = "x509")]
-use crate::cms::signed_data::SignedData;
+use x509::*;
 #[cfg(feature = "derive")]
 use crate::Beamable;
 #[cfg(not(feature = "derive"))]

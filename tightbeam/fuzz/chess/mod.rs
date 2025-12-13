@@ -16,7 +16,7 @@ mod utils;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tightbeam::colony::ServletConf;
+use tightbeam::colony::servlet::ServletConf;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
 use tightbeam::testing::ScenarioConf;
 use tightbeam::transport::policy::RestartExponentialBackoff;

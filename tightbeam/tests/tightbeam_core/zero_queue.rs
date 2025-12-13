@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use tightbeam::asn1::{DigestInfo, MessagePriority};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
-use tightbeam::colony::{Servlet, ServletConf};
+use tightbeam::colony::servlet::{Servlet, ServletConf};
 use tightbeam::crypto::{
 	hash::Sha3_256,
 	key::{InMemoryKeyProvider, KeySpec},

@@ -283,80 +283,33 @@ macro_rules! __tightbeam_server_protocol_bind_policies_handle {
 	};
 }
 
+/// Server-specific runtime extensions
+///
+/// Re-exports unified runtime and adds server-specific channel helpers.
 #[cfg(any(feature = "tokio", feature = "std"))]
 pub mod server_runtime {
-	#[cfg(feature = "tokio")]
+	/// Runtime primitives (re-exported from unified runtime)
 	pub mod rt {
-		#![allow(dead_code)]
+		pub use crate::runtime::rt::*;
+
 		use crate::transport::error::TransportError;
-		use core::future::Future;
 
-		pub type JoinHandle = tokio::task::JoinHandle<()>;
-		pub type ErrorSender = tokio::sync::mpsc::Sender<TransportError>;
-		pub type OkSender = tokio::sync::mpsc::Sender<()>;
+		/// Error notification channel sender type
+		pub type ErrorSender = crate::runtime::rt::Sender<TransportError>;
 
-		pub fn spawn<F>(task: F) -> JoinHandle
-		where
-			F: Future<Output = ()> + Send + 'static,
-		{
-			tokio::spawn(task)
-		}
+		/// Success notification channel sender type
+		pub type OkSender = crate::runtime::rt::Sender<()>;
 
+		/// Returns None for optional error channel
+		#[allow(dead_code)]
 		pub fn empty_error_channel() -> Option<ErrorSender> {
 			None
 		}
 
+		/// Returns None for optional success channel
+		#[allow(dead_code)]
 		pub fn empty_ok_channel() -> Option<OkSender> {
 			None
-		}
-
-		pub fn block_on<F>(future: F) -> F::Output
-		where
-			F: Future,
-		{
-			tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
-		}
-	}
-
-	#[cfg(all(not(feature = "tokio"), feature = "std"))]
-	pub(crate) mod rt {
-		#![allow(dead_code)]
-		use core::{
-			future::Future,
-			pin::Pin,
-			task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-		};
-		use std::thread;
-
-		pub type JoinHandle = thread::JoinHandle<()>;
-
-		pub fn spawn<F>(task: F) -> JoinHandle
-		where
-			F: FnOnce() + Send + 'static,
-		{
-			thread::spawn(task)
-		}
-
-		pub fn block_on<F: Future>(mut future: F) -> F::Output {
-			fn raw_waker() -> RawWaker {
-				fn clone(_: *const ()) -> RawWaker {
-					raw_waker()
-				}
-				fn wake(_: *const ()) {}
-				fn wake_by_ref(_: *const ()) {}
-				fn drop(_: *const ()) {}
-				RawWaker::new(core::ptr::null(), &RawWakerVTable::new(clone, wake, wake_by_ref, drop))
-			}
-
-			let waker = unsafe { Waker::from_raw(raw_waker()) };
-			let mut cx = Context::from_waker(&waker);
-			let mut pinned = unsafe { Pin::new_unchecked(&mut future) };
-			loop {
-				match pinned.as_mut().poll(&mut cx) {
-					Poll::Ready(output) => break output,
-					Poll::Pending => thread::yield_now(),
-				}
-			}
 		}
 	}
 }

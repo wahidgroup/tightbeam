@@ -826,7 +826,7 @@ tb_scenario! {
 				chain_processor: Arc::clone(&rover_processor),
 			});
 
-			let rover_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
+			let rover_servlet_conf = tightbeam::colony::servlet::ServletConf::<TokioListener, RelayMessage>::builder()
 				.with_certificate(ROVER_CERT, ROVER_KEY, vec![Arc::new(ROVER_PINNING)])?
 				.with_config(Arc::new(rover_config))
 				.with_worker(command_handler_worker)
@@ -878,7 +878,7 @@ tb_scenario! {
 				chain_processor: Arc::clone(&mars_relay_processor),
 			});
 
-			let mars_relay_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
+			let mars_relay_servlet_conf = tightbeam::colony::servlet::ServletConf::<TokioListener, RelayMessage>::builder()
 				.with_certificate(MARS_RELAY_CERT, MARS_RELAY_KEY, vec![Arc::new(MARS_RELAY_PINNING)])?
 				.with_config(Arc::new(mars_relay_config))
 				.with_worker(mars_frame_request_handler_worker)
@@ -928,7 +928,7 @@ tb_scenario! {
 				chain_processor: Arc::clone(&earth_relay_processor),
 			});
 
-			let earth_relay_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
+			let earth_relay_servlet_conf = tightbeam::colony::servlet::ServletConf::<TokioListener, RelayMessage>::builder()
 				.with_certificate(EARTH_RELAY_CERT, EARTH_RELAY_KEY, vec![Arc::new(EARTH_RELAY_PINNING)])?
 				.with_config(Arc::new(earth_relay_config))
 				.with_worker(earth_frame_request_handler_worker)
@@ -974,7 +974,7 @@ tb_scenario! {
 			});
 			let command_ack_handler_worker = CommandAckHandlerWorker::new(());
 
-			let mc_servlet_conf = tightbeam::colony::ServletConf::<TokioListener, RelayMessage>::builder()
+			let mc_servlet_conf = tightbeam::colony::servlet::ServletConf::<TokioListener, RelayMessage>::builder()
 				.with_certificate(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY, vec![Arc::new(MISSION_CONTROL_PINNING)])?
 				.with_config(Arc::new(mc_config))
 				.with_worker(telemetry_handler_worker)

@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	colony::{Hive, HiveConf, HiveTlsConfig, Servlet},
+	colony::drone::{Hive, HiveConf, HiveTlsConfig},
+	colony::servlet::Servlet,
 	compose, decode,
 	der::Sequence,
 	drone, exactly, servlet, tb_assert_spec, tb_scenario,

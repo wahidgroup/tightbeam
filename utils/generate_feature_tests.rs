@@ -42,8 +42,9 @@ fn main() {
 		if in_features_section && !trimmed.is_empty() && !trimmed.starts_with('#') {
 			if let Some(feature_name) = trimmed.split('=').next() {
 				let feature = feature_name.trim();
-				// Skip default, quoted strings, and dependency specifications
+				// Skip default, full, quoted strings, and dependency specifications
 				if feature != "default" 
+					&& feature != "full"
 					&& !feature.starts_with('"')
 					&& !feature.contains(']')
 					&& !feature.contains('/')

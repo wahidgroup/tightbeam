@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	colony::ServletConf,
+	colony::servlet::ServletConf,
 	compose,
 	der::Sequence,
 	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,

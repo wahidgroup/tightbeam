@@ -52,12 +52,16 @@ pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 pub type TransportResult<T> = Result<T, TransportError>;
 
 #[cfg(feature = "x509")]
-use crate::crypto::profiles::CryptoProvider;
+mod x509 {
+	pub use crate::crypto::profiles::CryptoProvider;
+	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::x509::Certificate;
+}
+
 #[cfg(feature = "x509")]
-use crate::crypto::x509::policy::CertificateValidation;
+use x509::*;
+
 use crate::transport::handshake::HandshakeKeyManager;
-#[cfg(feature = "x509")]
-use crate::x509::Certificate;
 
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 

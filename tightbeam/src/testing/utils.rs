@@ -398,12 +398,12 @@ macro_rules! test_worker {
 	) => {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
-			use $crate::colony::Worker;
+			use $crate::colony::worker::Worker;
 
 			// Build and start the worker
 			let builder = $setup_body;
 			let trace = std::sync::Arc::new($crate::trace::TraceCollector::new());
-			let mut worker = <_ as $crate::colony::Worker>::start(builder, trace).await?;
+			let mut worker = <_ as $crate::colony::worker::Worker>::start(builder, trace).await?;
 
 			// Run assertions with reference to worker
 			let result = {
@@ -512,7 +512,7 @@ macro_rules! test_drone {
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Start the drone
 			let drone =
-				<$drone_type as $crate::colony::Servlet<()>>::start($crate::trace::TraceCollector::new(), $config)
+				<$drone_type as $crate::colony::servlet::Servlet<()>>::start($crate::trace::TraceCollector::new(), $config)
 					.await?;
 
 			// Call the setup closure and await the resulting future
@@ -552,7 +552,7 @@ macro_rules! test_drone {
 		#[tokio::test]
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Start the drone
-			let drone = <$drone_type as $crate::colony::Servlet<()>>::start(
+			let drone = <$drone_type as $crate::colony::servlet::Servlet<()>>::start(
 				::std::sync::Arc::new($crate::trace::TraceCollector::new()),
 				$config,
 			)
@@ -596,7 +596,7 @@ macro_rules! test_drone {
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Start the drone
 			let drone =
-				<$drone_type as $crate::colony::Servlet<()>>::start($crate::trace::TraceCollector::new(), $config)
+				<$drone_type as $crate::colony::servlet::Servlet<()>>::start($crate::trace::TraceCollector::new(), $config)
 					.await?;
 
 			// Get the drone address
@@ -632,7 +632,7 @@ macro_rules! test_drone {
 		async fn $test_name() -> Result<(), Box<dyn std::error::Error>> {
 			// Start the drone
 			let drone =
-				<$drone_type as $crate::colony::Servlet<()>>::start($crate::trace::TraceCollector::new(), $config)
+				<$drone_type as $crate::colony::servlet::Servlet<()>>::start($crate::trace::TraceCollector::new(), $config)
 					.await?;
 
 			// Get the drone address

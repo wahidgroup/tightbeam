@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 use tightbeam::{
-	colony::ServletConf,
+	colony::servlet::ServletConf,
 	compose,
 	crypto::{
 		key::KeySpec,

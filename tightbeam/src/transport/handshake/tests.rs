@@ -36,21 +36,33 @@ use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate};
 
 #[cfg(feature = "x509")]
-use crate::crypto::ecies::Secp256k1EciesMessage;
+mod x509 {
+	pub use crate::crypto::ecies::Secp256k1EciesMessage;
+	pub use crate::crypto::profiles::DefaultCryptoProvider;
+	pub use crate::transport::handshake::client::EciesHandshakeClient;
+}
+
 #[cfg(feature = "x509")]
-use crate::crypto::profiles::DefaultCryptoProvider;
+use x509::*;
+
 #[cfg(feature = "transport-cms")]
-use crate::crypto::sign::elliptic_curve::PublicKey;
+mod cms {
+	pub use crate::crypto::sign::elliptic_curve::PublicKey;
+	pub use crate::transport::handshake::client::CmsHandshakeClient;
+	pub use crate::transport::handshake::server::CmsHandshakeServer;
+}
+
+#[cfg(feature = "transport-cms")]
+use cms::*;
+
 #[cfg(feature = "time")]
-use crate::der::asn1::GeneralizedTime;
-#[cfg(feature = "transport-cms")]
-use crate::transport::handshake::client::CmsHandshakeClient;
-#[cfg(feature = "x509")]
-use crate::transport::handshake::client::EciesHandshakeClient;
-#[cfg(feature = "transport-cms")]
-use crate::transport::handshake::server::CmsHandshakeServer;
+mod time_imports {
+	pub use crate::der::asn1::GeneralizedTime;
+	pub use crate::x509::time::Time;
+}
+
 #[cfg(feature = "time")]
-use crate::x509::time::Time;
+use time_imports::*;
 
 /// Create a default test security profile for handshake tests.
 pub fn create_default_test_profile() -> SecurityProfileDesc {

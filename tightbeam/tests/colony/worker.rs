@@ -1,7 +1,7 @@
 //! Integration test for Worker environment syntax in tb_scenario!
 
 use std::sync::Arc;
-use tightbeam::colony::Worker;
+use tightbeam::colony::worker::Worker;
 use tightbeam::der::Sequence;
 use tightbeam::testing::ScenarioConf;
 use tightbeam::Beamable;

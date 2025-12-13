@@ -1,0 +1,385 @@
+//! Cluster framework for servlet orchestration
+//!
+//! Clusters are gateways that receive work requests from external clients
+//! and route them to registered hives/drones based on servlet type.
+//!
+//! # Architecture
+//!
+//! 1. **Hives/Drones register** with the cluster, announcing available servlet types
+//! 2. **Cluster maintains registry** of hives and their capabilities
+//! 3. **Clients send** `ClusterWorkRequest` with `servlet_type` and `payload`
+//! 4. **Cluster routes** to a hive that supports the requested servlet type
+//! 5. **Cluster forwards** payload and returns response to client
+
+pub mod error;
+pub mod macros;
+pub mod registry;
+
+// Re-export submodule types
+pub use error::ClusterError;
+pub use registry::{HiveEntry, HiveRegistry, SharedId};
+
+use core::future::Future;
+use core::time::Duration;
+use std::sync::Arc;
+
+use crate::crypto::key::KeySpec;
+use crate::der::Sequence;
+use crate::policy::{GatePolicy, TransitStatus};
+use crate::trace::TraceCollector;
+use crate::transport::client::pool::PoolConfig;
+use crate::transport::policy::{RestartExponentialBackoff, RestartPolicy};
+use crate::transport::{Protocol, TightBeamAddress};
+use crate::Beamable;
+
+use super::common::LeastLoaded;
+use super::drone::LoadBalancer;
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// Configuration for cluster heartbeat behavior
+pub struct HeartbeatConf {
+	/// Interval between heartbeat checks
+	pub interval: Duration,
+	/// Timeout before evicting unresponsive hives
+	pub timeout: Duration,
+	/// Optional retry policy override (uses ClusterConfig.retry_policy if None)
+	pub retry_policy: Option<Arc<dyn RestartPolicy + Send + Sync>>,
+}
+
+impl Default for HeartbeatConf {
+	fn default() -> Self {
+		Self {
+			interval: Duration::from_secs(5),
+			timeout: Duration::from_secs(15),
+			retry_policy: None,
+		}
+	}
+}
+
+impl core::fmt::Debug for HeartbeatConf {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("HeartbeatConf")
+			.field("interval", &self.interval)
+			.field("timeout", &self.timeout)
+			.field("retry_policy", &self.retry_policy.as_ref().map(|_| "Some(...)"))
+			.finish()
+	}
+}
+
+/// Configuration for clusters
+///
+/// Contains settings for load balancing, health checks, gateway policies,
+/// and cryptographic signing for cluster → hive communication.
+pub struct ClusterConf<L: LoadBalancer = LeastLoaded> {
+	/// Load balancing strategy for distributing work across hives
+	pub load_balancer: L,
+	/// Heartbeat configuration
+	pub heartbeat: HeartbeatConf,
+	/// Gate policies for the gateway (rate limiting, auth, etc.)
+	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	/// Connection pool configuration for hive connections
+	pub pool_config: PoolConfig,
+	/// Default retry policy for all cluster → hive communication
+	pub retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
+	/// Signing key for cluster → hive messages (nonrepudiation)
+	/// Supports HSM/KMS via KeySpec::Provider
+	pub signing_key: KeySpec,
+}
+
+impl ClusterConf {
+	/// Create a new cluster configuration with the given signing key
+	pub fn new(signing_key: KeySpec) -> Self {
+		Self {
+			load_balancer: LeastLoaded,
+			heartbeat: HeartbeatConf::default(),
+			policies: Vec::new(),
+			pool_config: PoolConfig::default(),
+			retry_policy: Arc::new(RestartExponentialBackoff::default()),
+			signing_key,
+		}
+	}
+}
+
+impl<L: LoadBalancer> core::fmt::Debug for ClusterConf<L> {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("ClusterConfig")
+			.field("heartbeat", &self.heartbeat)
+			.field("policies", &format!("[{} policies]", self.policies.len()))
+			.field("pool_config", &self.pool_config)
+			.field("signing_key", &self.signing_key)
+			.finish()
+	}
+}
+
+// =============================================================================
+// Work Request/Response Messages
+// =============================================================================
+
+/// Work request envelope for cluster routing
+///
+/// Clients send this to the cluster gateway. The cluster routes based on
+/// `servlet_type` and forwards `payload` to the selected hive.
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct ClusterWorkRequest {
+	/// Target servlet type (e.g., b"ping_servlet")
+	pub servlet_type: Vec<u8>,
+	/// Raw message payload (encoded inner message)
+	pub payload: Vec<u8>,
+}
+
+/// Work response from cluster
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct ClusterWorkResponse {
+	/// Status of the routing/execution
+	pub status: TransitStatus,
+	/// Response payload from servlet (if successful)
+	pub payload: Option<Vec<u8>>,
+}
+
+impl ClusterWorkResponse {
+	/// Create a successful response with payload
+	#[inline]
+	pub fn ok(payload: Vec<u8>) -> Self {
+		Self { status: TransitStatus::Accepted, payload: Some(payload) }
+	}
+
+	/// Create an error response with status
+	#[inline]
+	pub fn err(status: TransitStatus) -> Self {
+		Self { status, payload: None }
+	}
+}
+
+// =============================================================================
+// Cluster Trait
+// =============================================================================
+
+/// Trait for cluster implementations
+///
+/// Clusters are gateways that route work requests to registered hives
+/// based on servlet type. Hives register dynamically, and the cluster
+/// learns available servlet types from their registrations.
+pub trait Cluster: Sized {
+	/// The protocol type this cluster uses
+	type Protocol: Protocol;
+
+	/// Address type for this cluster
+	type Address: TightBeamAddress;
+
+	/// Start the cluster gateway
+	fn start(
+		trace: Arc<TraceCollector>,
+		config: ClusterConf,
+	) -> impl Future<Output = Result<Self, crate::TightBeamError>> + Send;
+
+	/// Get the gateway address
+	fn addr(&self) -> Self::Address;
+
+	/// Get available servlet types (from registered hives)
+	fn available_servlets(&self) -> Vec<Vec<u8>>;
+
+	/// Get the number of registered hives
+	fn hive_count(&self) -> usize;
+
+	/// Get the trace collector
+	fn trace(&self) -> Arc<TraceCollector>;
+
+	/// Stop the cluster
+	fn stop(self);
+
+	/// Wait for the cluster to finish
+	fn join(self) -> impl Future<Output = Result<(), crate::colony::servlet::servlet_runtime::rt::JoinError>> + Send;
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::colony::common::RegisterDroneRequest;
+	use crate::utils::BasisPoints;
+
+	// Test key bytes for unit tests
+	const TEST_KEY_BYTES: &[u8] = &[1u8; 32];
+
+	#[test]
+	fn cluster_config_new() {
+		let config = ClusterConf::new(KeySpec::Bytes(TEST_KEY_BYTES));
+		assert_eq!(config.heartbeat.interval, Duration::from_secs(5));
+		assert_eq!(config.heartbeat.timeout, Duration::from_secs(15));
+		assert!(config.policies.is_empty());
+		assert!(matches!(config.signing_key, KeySpec::Bytes(_)));
+	}
+
+	#[test]
+	fn cluster_work_response_ok() {
+		let response = ClusterWorkResponse::ok(b"test".to_vec());
+		assert_eq!(response.status, TransitStatus::Accepted);
+		assert_eq!(response.payload, Some(b"test".to_vec()));
+	}
+
+	#[test]
+	fn cluster_work_response_err() {
+		let response = ClusterWorkResponse::err(TransitStatus::Forbidden);
+		assert_eq!(response.status, TransitStatus::Forbidden);
+		assert!(response.payload.is_none());
+	}
+
+	#[test]
+	fn hive_registry_register_and_lookup() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::new(Duration::from_secs(15));
+
+		let request = RegisterDroneRequest {
+			drone_addr: b"127.0.0.1:8080".to_vec(),
+			available_servlets: vec![b"ping_servlet".to_vec(), b"calc_servlet".to_vec()],
+			metadata: None,
+		};
+
+		registry.register(request)?;
+
+		// Should find hives for registered types
+		let hives = registry.hives_for_type(b"ping_servlet")?;
+		assert_eq!(hives.len(), 1);
+		assert_eq!(hives[0].address.as_ref(), b"127.0.0.1:8080");
+
+		let hives = registry.hives_for_type(b"calc_servlet")?;
+		assert_eq!(hives.len(), 1);
+
+		// Should not find hives for unregistered types
+		let hives = registry.hives_for_type(b"unknown_servlet")?;
+		assert!(hives.is_empty());
+
+		Ok(())
+	}
+
+	#[test]
+	fn hive_registry_unregister() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::new(Duration::from_secs(15));
+
+		let request = RegisterDroneRequest {
+			drone_addr: b"127.0.0.1:8080".to_vec(),
+			available_servlets: vec![b"ping_servlet".to_vec()],
+			metadata: None,
+		};
+
+		registry.register(request)?;
+		assert_eq!(registry.len()?, 1);
+
+		let entry = registry.unregister(b"127.0.0.1:8080")?;
+		assert!(entry.is_some());
+		assert_eq!(registry.len()?, 0);
+
+		// Servlet index should be cleaned up
+		let hives = registry.hives_for_type(b"ping_servlet")?;
+		assert!(hives.is_empty());
+
+		Ok(())
+	}
+
+	#[test]
+	fn hive_registry_update_utilization() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::new(Duration::from_secs(15));
+
+		let request = RegisterDroneRequest {
+			drone_addr: b"127.0.0.1:8080".to_vec(),
+			available_servlets: vec![b"ping_servlet".to_vec()],
+			metadata: None,
+		};
+
+		registry.register(request)?;
+
+		let updated = registry.update_utilization(b"127.0.0.1:8080", BasisPoints::new(5000))?;
+		assert!(updated);
+
+		let hives = registry.hives_for_type(b"ping_servlet")?;
+		assert_eq!(hives[0].utilization.get(), 5000);
+
+		Ok(())
+	}
+
+	#[test]
+	fn hive_registry_available_servlets() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::new(Duration::from_secs(15));
+
+		let request1 = RegisterDroneRequest {
+			drone_addr: b"hive1".to_vec(),
+			available_servlets: vec![b"ping".to_vec(), b"calc".to_vec()],
+			metadata: None,
+		};
+
+		let request2 = RegisterDroneRequest {
+			drone_addr: b"hive2".to_vec(),
+			available_servlets: vec![b"ping".to_vec(), b"worker".to_vec()],
+			metadata: None,
+		};
+
+		registry.register(request1)?;
+		registry.register(request2)?;
+
+		let servlets = registry.to_available_servlets()?;
+		assert_eq!(servlets.len(), 3); // ping, calc, worker (ping deduplicated)
+
+		Ok(())
+	}
+
+	#[test]
+	fn hive_registry_multiple_hives_same_type() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::new(Duration::from_secs(15));
+
+		let request1 = RegisterDroneRequest {
+			drone_addr: b"hive1".to_vec(),
+			available_servlets: vec![b"ping".to_vec()],
+			metadata: None,
+		};
+
+		let request2 = RegisterDroneRequest {
+			drone_addr: b"hive2".to_vec(),
+			available_servlets: vec![b"ping".to_vec()],
+			metadata: None,
+		};
+
+		registry.register(request1)?;
+		registry.register(request2)?;
+
+		let hives = registry.hives_for_type(b"ping")?;
+		assert_eq!(hives.len(), 2);
+
+		Ok(())
+	}
+
+	#[test]
+	fn hive_registry_all_hives() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::new(Duration::from_secs(15));
+
+		let request1 = RegisterDroneRequest {
+			drone_addr: b"hive1".to_vec(),
+			available_servlets: vec![b"ping".to_vec()],
+			metadata: None,
+		};
+
+		let request2 = RegisterDroneRequest {
+			drone_addr: b"hive2".to_vec(),
+			available_servlets: vec![b"calc".to_vec()],
+			metadata: Some(b"metadata".to_vec()),
+		};
+
+		registry.register(request1)?;
+		registry.register(request2)?;
+
+		let all = registry.all_hives()?;
+		assert_eq!(all.len(), 2);
+
+		// Verify entries contain expected data
+		let addrs: Vec<&[u8]> = all.iter().map(|e| e.address.as_ref()).collect();
+		assert!(addrs.contains(&b"hive1".as_slice()));
+		assert!(addrs.contains(&b"hive2".as_slice()));
+
+		Ok(())
+	}
+}
+
