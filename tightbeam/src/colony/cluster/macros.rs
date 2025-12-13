@@ -40,7 +40,7 @@ macro_rules! cluster {
 		$(#[$meta])*
 		pub struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
-			config: $crate::colony::cluster::ClusterConfig,
+			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
@@ -56,7 +56,7 @@ macro_rules! cluster {
 		$(#[$meta])*
 		struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
-			config: $crate::colony::cluster::ClusterConfig,
+			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
@@ -75,9 +75,12 @@ macro_rules! cluster {
 
 			async fn start(
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-				config: $crate::colony::cluster::ClusterConfig,
+				config: $crate::colony::cluster::ClusterConf,
 			) -> Result<Self, $crate::TightBeamError> {
 				use $crate::transport::Protocol;
+
+				// Wrap config in Arc for zero-copy sharing
+				let config = ::std::sync::Arc::new(config);
 
 				// Bind to a port for the gateway server
 				let bind_addr = <$protocol>::default_bind_address()?;
@@ -98,11 +101,21 @@ macro_rules! cluster {
 					trace_for_server
 				);
 
+				// Start the heartbeat loop
+				let heartbeat_handle = {
+					let registry = ::std::sync::Arc::clone(&registry);
+					let config = ::std::sync::Arc::clone(&config);
+					let trace = ::std::sync::Arc::clone(&trace);
+					$crate::colony::servlet::servlet_runtime::rt::spawn(
+						$crate::colony::cluster::run_heartbeat_loop(registry, config, trace)
+					)
+				};
+
 				Ok(Self {
 					registry,
 					config,
 					server_handle: Some(server_handle),
-					heartbeat_handle: None, // TODO: Start heartbeat loop
+					heartbeat_handle: Some(heartbeat_handle),
 					addr,
 					trace,
 				})

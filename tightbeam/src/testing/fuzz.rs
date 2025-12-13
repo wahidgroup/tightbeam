@@ -501,7 +501,7 @@ impl FuzzContext {
 	/// Interprets input bytes as choices for which events to take at each state.
 	/// Returns `Ok(())` if execution reaches terminal state.
 	pub fn fuzz_from_bytes(&self) -> Result<(), TestingError> {
-		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let mut guard = self.inner.lock()?;
 		let input = guard.input.clone();
 		guard
 			.oracle
@@ -570,13 +570,13 @@ impl FuzzContext {
 	/// ## Errors
 	/// Returns `Err(TestingError::FuzzInputLockPoisoned)` if mutex is poisoned.
 	pub fn step_event(&self, event: &Event) -> Result<bool, TestingError> {
-		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let mut guard = self.inner.lock()?;
 		Ok(guard.oracle.step(event))
 	}
 
 	/// Consume and return a u8 from fuzz input
 	pub fn fuzz_u8(&self) -> Result<u8, TestingError> {
-		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let mut guard = self.inner.lock()?;
 		if guard.cursor + 1 > guard.input.len() {
 			return Err(TestingError::FuzzInputExhausted);
 		}
@@ -590,7 +590,7 @@ impl FuzzContext {
 
 	/// Consume and return a u16 from fuzz input (big-endian)
 	pub fn fuzz_u16(&self) -> Result<u16, TestingError> {
-		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let mut guard = self.inner.lock()?;
 		if guard.cursor + 2 > guard.input.len() {
 			return Err(TestingError::FuzzInputExhausted);
 		}
@@ -603,7 +603,7 @@ impl FuzzContext {
 
 	/// Consume and return a u32 from fuzz input (big-endian)
 	pub fn fuzz_u32(&self) -> Result<u32, TestingError> {
-		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let mut guard = self.inner.lock()?;
 		if guard.cursor + 4 > guard.input.len() {
 			return Err(TestingError::FuzzInputExhausted);
 		}
@@ -621,7 +621,7 @@ impl FuzzContext {
 
 	/// Consume and return a u64 from fuzz input (big-endian)
 	pub fn fuzz_u64(&self) -> Result<u64, TestingError> {
-		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let mut guard = self.inner.lock()?;
 		if guard.cursor + 8 > guard.input.len() {
 			return Err(TestingError::FuzzInputExhausted);
 		}
@@ -643,7 +643,7 @@ impl FuzzContext {
 
 	/// Consume and return N bytes from fuzz input
 	pub fn fuzz_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
-		let mut guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let mut guard = self.inner.lock()?;
 		if guard.cursor + n > guard.input.len() {
 			return Err(TestingError::FuzzInputExhausted);
 		}
@@ -657,25 +657,25 @@ impl FuzzContext {
 
 	/// Get raw fuzz input bytes
 	pub fn fuzz_input(&self) -> Result<Vec<u8>, TestingError> {
-		let guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let guard = self.inner.lock()?;
 		Ok(guard.input.clone())
 	}
 
 	/// Check if N bytes are available in fuzz input
 	pub fn fuzz_has_bytes(&self, n: usize) -> Result<bool, TestingError> {
-		let guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let guard = self.inner.lock()?;
 		Ok(guard.cursor + n <= guard.input.len())
 	}
 
 	/// Get remaining byte count in fuzz input
 	pub fn fuzz_remaining(&self) -> Result<usize, TestingError> {
-		let guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let guard = self.inner.lock()?;
 		Ok(guard.input.len() - guard.cursor)
 	}
 
 	/// Peek at next u8 from fuzz input without consuming
 	pub fn fuzz_peek_u8(&self) -> Result<u8, TestingError> {
-		let guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let guard = self.inner.lock()?;
 		if guard.cursor + 1 > guard.input.len() {
 			return Err(TestingError::FuzzInputExhausted);
 		}
@@ -685,7 +685,7 @@ impl FuzzContext {
 
 	/// Peek at next N bytes from fuzz input without consuming
 	pub fn fuzz_peek_bytes(&self, n: usize) -> Result<Vec<u8>, TestingError> {
-		let guard = self.inner.lock().map_err(|_| TestingError::FuzzInputLockPoisoned)?;
+		let guard = self.inner.lock()?;
 		if guard.cursor + n > guard.input.len() {
 			return Err(TestingError::FuzzInputExhausted);
 		}

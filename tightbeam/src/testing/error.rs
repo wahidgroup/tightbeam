@@ -78,3 +78,10 @@ impl core::fmt::Display for TestingError {
 
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for TestingError {}
+
+#[cfg(feature = "std")]
+impl<T> From<std::sync::PoisonError<T>> for TestingError {
+	fn from(_: std::sync::PoisonError<T>) -> Self {
+		TestingError::FuzzInputLockPoisoned
+	}
+}

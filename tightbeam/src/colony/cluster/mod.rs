@@ -32,8 +32,13 @@ use crate::transport::policy::{RestartExponentialBackoff, RestartPolicy};
 use crate::transport::{Protocol, TightBeamAddress};
 use crate::Beamable;
 
-use super::common::LeastLoaded;
+use super::common::{ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, LeastLoaded};
 use super::drone::LoadBalancer;
+
+#[cfg(feature = "tokio")]
+use crate::colony::servlet::servlet_runtime::rt;
+#[cfg(feature = "tokio")]
+use tokio::sync::Semaphore;
 
 // =============================================================================
 // Configuration
@@ -45,8 +50,12 @@ pub struct HeartbeatConf {
 	pub interval: Duration,
 	/// Timeout before evicting unresponsive hives
 	pub timeout: Duration,
-	/// Optional retry policy override (uses ClusterConfig.retry_policy if None)
+	/// Optional retry policy override (uses ClusterConf.retry_policy if None)
 	pub retry_policy: Option<Arc<dyn RestartPolicy + Send + Sync>>,
+	/// Maximum concurrent heartbeat requests
+	pub max_concurrent: usize,
+	/// Failed heartbeats before eviction
+	pub max_failures: u32,
 }
 
 impl Default for HeartbeatConf {
@@ -55,6 +64,8 @@ impl Default for HeartbeatConf {
 			interval: Duration::from_secs(5),
 			timeout: Duration::from_secs(15),
 			retry_policy: None,
+			max_concurrent: 10,
+			max_failures: 3,
 		}
 	}
 }
@@ -65,6 +76,8 @@ impl core::fmt::Debug for HeartbeatConf {
 			.field("interval", &self.interval)
 			.field("timeout", &self.timeout)
 			.field("retry_policy", &self.retry_policy.as_ref().map(|_| "Some(...)"))
+			.field("max_concurrent", &self.max_concurrent)
+			.field("max_failures", &self.max_failures)
 			.finish()
 	}
 }
@@ -192,6 +205,157 @@ pub trait Cluster: Sized {
 
 	/// Wait for the cluster to finish
 	fn join(self) -> impl Future<Output = Result<(), crate::colony::servlet::servlet_runtime::rt::JoinError>> + Send;
+}
+
+// =============================================================================
+// Heartbeat Loop
+// =============================================================================
+
+/// Process a single heartbeat result, updating registry accordingly
+fn process_heartbeat_result<L: LoadBalancer>(
+	result: Result<ClusterCommandResponse, ClusterError>,
+	hive_addr: &[u8],
+	registry: &HiveRegistry,
+	config: &ClusterConf<L>,
+	trace: &TraceCollector,
+) {
+	match result {
+		Ok(response) if response.heartbeat.is_some() => {
+			let hb = response.heartbeat.as_ref();
+			let _ = registry.touch(hive_addr, hb.map(|h| h.utilization).unwrap_or_default());
+			let _ = trace.event("heartbeat_success");
+		}
+		_ => {
+			if let Ok(failures) = registry.increment_failure(hive_addr) {
+				if failures >= config.heartbeat.max_failures {
+					let _ = registry.unregister(hive_addr);
+					let _ = trace.event("hive_evicted");
+				}
+			}
+		}
+	}
+}
+
+/// Simulate a heartbeat (placeholder until connection pool is wired)
+fn simulate_heartbeat() -> Result<ClusterCommandResponse, ClusterError> {
+	Ok(ClusterCommandResponse {
+		heartbeat: Some(super::common::HeartbeatResult {
+			status: TransitStatus::Accepted,
+			utilization: crate::utils::BasisPoints::default(),
+			active_servlets: 0,
+		}),
+		manage: None,
+	})
+}
+
+/// Run the cluster heartbeat loop (tokio async version)
+///
+/// Periodically sends heartbeat requests to all registered hives, updates
+/// utilization metrics, and evicts unresponsive hives.
+#[cfg(feature = "tokio")]
+pub async fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
+	registry: Arc<HiveRegistry>,
+	config: Arc<ClusterConf<L>>,
+	trace: Arc<TraceCollector>,
+) {
+	loop {
+		let hives = match registry.all_hives() {
+			Ok(h) => h,
+			Err(_) => {
+				rt::sleep(config.heartbeat.interval).await;
+				continue;
+			}
+		};
+
+		let semaphore = Arc::new(Semaphore::new(config.heartbeat.max_concurrent));
+		let tasks: Vec<_> = hives
+			.into_iter()
+			.map(|hive| {
+				let registry = Arc::clone(&registry);
+				let config = Arc::clone(&config);
+				let semaphore = Arc::clone(&semaphore);
+				let trace = Arc::clone(&trace);
+				let hive_addr = Arc::clone(&hive.address);
+
+				rt::spawn(async move {
+					let _permit = match semaphore.acquire().await {
+						Ok(p) => p,
+						Err(_) => return,
+					};
+
+					let _cmd = ClusterCommand {
+						heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
+						manage: None,
+					};
+
+					// TODO: Send via connection pool
+					let result = simulate_heartbeat();
+					process_heartbeat_result(result, &hive_addr, &registry, &config, &trace);
+				})
+			})
+			.collect();
+
+		// Await all tasks
+		for task in tasks {
+			let _ = rt::join(task).await;
+		}
+
+		rt::sleep(config.heartbeat.interval).await;
+	}
+}
+
+/// Run the cluster heartbeat loop
+///
+/// Periodically sends heartbeat requests to all registered hives, updates
+/// utilization metrics, and evicts unresponsive hives.
+#[cfg(all(not(feature = "tokio"), feature = "std"))]
+pub fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
+	registry: Arc<HiveRegistry>,
+	config: Arc<ClusterConf<L>>,
+	trace: Arc<TraceCollector>,
+) {
+	use crate::colony::servlet::servlet_runtime::rt as std_rt;
+
+	loop {
+		let hives = match registry.all_hives() {
+			Ok(h) => h,
+			Err(_) => {
+				std_rt::sleep(config.heartbeat.interval);
+				continue;
+			}
+		};
+
+		// Spawn heartbeat threads with concurrency limiting via chunking
+		hives
+			.chunks(config.heartbeat.max_concurrent)
+			.for_each(|chunk| {
+				let handles: Vec<_> = chunk
+					.iter()
+					.map(|hive| {
+						let registry = Arc::clone(&registry);
+						let config = Arc::clone(&config);
+						let trace = Arc::clone(&trace);
+						let hive_addr = Arc::clone(&hive.address);
+
+						std_rt::spawn(move || {
+							let _cmd = ClusterCommand {
+								heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
+								manage: None,
+							};
+
+							// TODO: Send via connection pool
+							let result = simulate_heartbeat();
+							process_heartbeat_result(result, &hive_addr, &registry, &config, &trace);
+						})
+					})
+					.collect();
+
+				// Wait for this chunk to complete before spawning next
+				handles.into_iter().for_each(|h| { let _ = std_rt::join(h); });
+			});
+
+		std_rt::sleep(config.heartbeat.interval);
+	}
 }
 
 // =============================================================================

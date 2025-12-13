@@ -1182,8 +1182,7 @@ macro_rules! drone {
 				async fn drain(&self) -> Result<(), $crate::colony::drone::DroneError> {
 					// Set draining state
 					{
-						let mut guard = self.draining_since.write()
-							.map_err(|_| $crate::TightBeamError::LockPoisoned)?;
+						let mut guard = self.draining_since.write()?;
 						*guard = Some(::std::time::Instant::now());
 					}
 
