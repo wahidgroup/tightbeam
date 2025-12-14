@@ -37,8 +37,15 @@ use tightbeam::{
 	builder::TypeBuilder,
 	crypto::{
 		aead::Aes256Gcm,
+		hash::Sha3_256,
 		key::SigningKeySpec,
+		policy::Secp256k1Policy,
 		sign::ecdsa::{Secp256k1, Secp256k1SigningKey},
+		x509::{
+			error::CertificateValidationError,
+			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+			Certificate, CertificateSpec,
+		},
 	},
 	error::TightBeamError,
 	exactly,
@@ -87,6 +94,19 @@ use crate::dtn::{
 		TelemetryBuilderWorker, TelemetryBuilderWorkerConf,
 	},
 };
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+fn make_trust_store(cert_spec: CertificateSpec) -> Result<Arc<dyn CertificateTrust>, CertificateValidationError> {
+	let cert = Certificate::try_from(cert_spec)?;
+	Ok(Arc::new(
+		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			.with_certificate(cert)?
+			.build(),
+	))
+}
 
 // ============================================================================
 // DTN Scenario Configuration
@@ -753,42 +773,42 @@ tb_scenario! {
 			// Mission Control → Earth Relay pool
 			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
-				.with_server_certificate(EARTH_RELAY_CERT)?
+				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
 				.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Earth Relay → Mission Control pool
 			let earth_mc_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
-				.with_server_certificate(MISSION_CONTROL_CERT)?
+				.with_trust_store(make_trust_store(MISSION_CONTROL_CERT)?)
 				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Earth Relay → Mars Relay pool
 			let earth_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
-				.with_server_certificate(MARS_RELAY_CERT)?
+				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
 				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Mars Relay → Earth Relay pool
 			let mars_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
-				.with_server_certificate(EARTH_RELAY_CERT)?
+				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
 				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Mars Relay → Rover pool
 			let mars_rover_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
-				.with_server_certificate(ROVER_CERT)?
+				.with_trust_store(make_trust_store(ROVER_CERT)?)
 				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Rover → Mars Relay pool
 			let rover_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config)
-				.with_server_certificate(MARS_RELAY_CERT)?
+				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
 				.with_client_identity(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
@@ -1026,7 +1046,7 @@ tb_scenario! {
 
 				// Connect to Earth Relay and send initial command
 				let mut earth_relay_client = ClientBuilder::<TokioListener>::builder()
-					.with_server_certificate(EARTH_RELAY_CERT)?
+					.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
 					.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?
 					.with_timeout(Duration::from_millis(5000))
 					.build()
@@ -1040,9 +1060,10 @@ tb_scenario! {
 		},
 		setup: |_rover_addr, config: Arc<DtnScenarioConfig>| async move {
 			let mars_relay_addr = (*config.mars_relay_addr.read()?).expect("Mars Relay address must be set");
+
 			// Connect Rover client to Mars Relay
 			let client = ClientBuilder::<TokioListener>::builder()
-				.with_server_certificate(MARS_RELAY_CERT)?
+				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
 				.with_client_identity(ROVER_CERT, ROVER_KEY.to_provider::<Secp256k1>()?)?
 				.with_timeout(Duration::from_millis(5000))
 				.build()

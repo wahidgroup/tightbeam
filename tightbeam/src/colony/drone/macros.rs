@@ -752,7 +752,8 @@ macro_rules! drone {
 					// Circuit breaker and security settings from config
 					let cb_threshold = config.circuit_breaker_threshold;
 					let cb_cooldown_ms = config.circuit_breaker_cooldown_ms;
-					let trusted_keys = config.trusted_cluster_keys.clone();
+					#[cfg(feature = "x509")]
+					let trust_store = config.trust_store.clone();
 
 					// Create connection pool for servlet forwarding
 					let pool_config = $crate::transport::client::pool::PoolConfig {
@@ -774,6 +775,7 @@ macro_rules! drone {
 					let draining_since_for_server = ::std::sync::Arc::clone(&draining_since);
 
 					// Start the control server that listens for management commands
+					#[cfg(feature = "x509")]
 					let control_server_handle = drone!(
 						@build_hive_control_server $protocol,
 						listener,
@@ -784,12 +786,14 @@ macro_rules! drone {
 						utilization_map_for_server,
 						cb_threshold,
 						cb_cooldown_ms,
-						trusted_keys,
+						trust_store,
 						servlet_pool_for_server,
 						draining_since_for_server,
 						$drone_name,
 						$($servlet_id: $servlet_name<$input>),*
 					);
+					#[cfg(not(feature = "x509"))]
+					let control_server_handle = compile_error!("Hive requires x509 feature for certificate-based authentication");
 
 					Ok(Self {
 						servlets,
@@ -1332,7 +1336,7 @@ macro_rules! drone {
 		$utilization_map:ident,
 		$cb_threshold:ident,
 		$cb_cooldown_ms:ident,
-		$trusted_keys:ident,
+		$trust_store:ident,
 		$servlet_pool:ident,
 		$draining_since:ident,
 		$drone_name:ident,
@@ -1341,7 +1345,6 @@ macro_rules! drone {
 		let circuit_breaker = ::std::sync::Arc::new(
 			$crate::colony::drone::ClusterCircuitBreaker::new($cb_threshold, $cb_cooldown_ms)
 		);
-		let trusted_keys = ::std::sync::Arc::new($trusted_keys);
 
 		paste::paste! {
 			$crate::server! {
@@ -1353,7 +1356,7 @@ macro_rules! drone {
 					let utilization = ::std::sync::Arc::clone(&$utilization);
 					let utilization_map = ::std::sync::Arc::clone(&$utilization_map);
 					let circuit_breaker = ::std::sync::Arc::clone(&circuit_breaker);
-					let trusted_keys = ::std::sync::Arc::clone(&trusted_keys);
+					let trust_store = $trust_store.clone();
 					let servlet_pool = ::std::sync::Arc::clone(&$servlet_pool);
 					let draining_since = ::std::sync::Arc::clone(&$draining_since);
 					async move {
@@ -1365,7 +1368,7 @@ macro_rules! drone {
 							utilization,
 							utilization_map,
 							circuit_breaker,
-							trusted_keys,
+							trust_store,
 							servlet_pool,
 							draining_since,
 							$drone_name,
@@ -1388,7 +1391,7 @@ macro_rules! drone {
 		$utilization_map:ident,
 		$cb_threshold:ident,
 		$cb_cooldown_ms:ident,
-		$trusted_keys:ident,
+		$trust_store:ident,
 		$servlet_pool:ident,
 		$draining_since:ident,
 		$drone_name:ident,
@@ -1397,7 +1400,6 @@ macro_rules! drone {
 		let circuit_breaker = ::std::sync::Arc::new(
 			$crate::colony::drone::ClusterCircuitBreaker::new($cb_threshold, $cb_cooldown_ms)
 		);
-		let trusted_keys = ::std::sync::Arc::new($trusted_keys);
 
 		paste::paste! {
 			$crate::server! {
@@ -1408,7 +1410,7 @@ macro_rules! drone {
 					let utilization = ::std::sync::Arc::clone(&$utilization);
 					let utilization_map = ::std::sync::Arc::clone(&$utilization_map);
 					let circuit_breaker = ::std::sync::Arc::clone(&circuit_breaker);
-					let trusted_keys = ::std::sync::Arc::clone(&trusted_keys);
+					let trust_store = $trust_store.clone();
 					let servlet_pool = ::std::sync::Arc::clone(&$servlet_pool);
 					let draining_since = ::std::sync::Arc::clone(&$draining_since);
 					async move {
@@ -1420,7 +1422,7 @@ macro_rules! drone {
 							utilization,
 							utilization_map,
 							circuit_breaker,
-							trusted_keys,
+							trust_store,
 							servlet_pool,
 							draining_since,
 							$drone_name,
@@ -1527,7 +1529,7 @@ macro_rules! drone {
 		$utilization:ident,
 		$utilization_map:ident,
 		$circuit_breaker:ident,
-		$trusted_keys:ident,
+		$trust_store:ident,
 		$servlet_pool:ident,
 		$draining_since:ident,
 		$drone_name:ident,
@@ -1558,29 +1560,20 @@ macro_rules! drone {
 					));
 				}
 
-				// 1. Apply ClusterSecurityGate with trusted keys from HiveConf
-				let parsed_keys: Vec<$crate::crypto::sign::ecdsa::Secp256k1VerifyingKey> = (*$trusted_keys)
-					.iter()
-					.filter_map(|der_bytes| {
-						$crate::crypto::sign::ecdsa::Secp256k1VerifyingKey::from_sec1_bytes(der_bytes).ok()
-					})
-					.collect();
-				let security_gate = match $crate::colony::drone::ClusterSecurityGate::<
-					$crate::crypto::sign::ecdsa::Secp256k1Signature,
-					$crate::crypto::sign::ecdsa::Secp256k1VerifyingKey,
-				>::new(
-					::std::sync::Arc::clone(&$circuit_breaker),
-					parsed_keys,
-				) {
-					Ok(gate) => gate,
-					Err(_) => {
-						// No trusted keys configured - reject all cluster commands
-						return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-							$crate::colony::drone::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Forbidden)
-						));
+				// 1. Apply ClusterSecurityGate with certificate trust store
+				let security_status = match &$trust_store {
+					Some(store) => {
+						let security_gate = $crate::colony::drone::ClusterSecurityGate::new(
+							::std::sync::Arc::clone(&$circuit_breaker),
+							::std::sync::Arc::clone(store),
+						);
+						$crate::policy::GatePolicy::evaluate(&security_gate, &$frame)
+					}
+					None => {
+						// No trust store configured - reject all cluster commands
+						$crate::policy::TransitStatus::Forbidden
 					}
 				};
-				let security_status = $crate::policy::GatePolicy::evaluate(&security_gate, &$frame);
 				if security_status != $crate::policy::TransitStatus::Accepted {
 					return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
 						$crate::colony::drone::HiveManagementResponse::stop_err(security_status)

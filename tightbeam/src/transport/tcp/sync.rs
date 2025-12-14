@@ -13,6 +13,7 @@ use core::time::Duration;
 use crate::builder::TypeBuilder;
 use crate::crypto::aead::RuntimeAead;
 use crate::crypto::x509::policy::CertificateValidation;
+use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::{
@@ -52,9 +53,9 @@ pub struct TcpTransport<S: ProtocolStream, P: CryptoProvider = DefaultCryptoProv
 	#[cfg(feature = "std")]
 	operation_timeout: Option<std::time::Duration>,
 
-	server_certificates: Vec<Arc<Certificate>>,
+	trust_store: Option<Arc<dyn CertificateTrust>>,
 
-	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	server_identity: Option<Arc<Certificate>>,
 
 	client_certificate: Option<Arc<Certificate>>,
 
@@ -315,7 +316,11 @@ where
 	}
 
 	fn to_server_certificate_ref(&self) -> Option<&Certificate> {
-		self.server_certificates.first().map(|arc| arc.as_ref())
+		self.server_identity.as_ref().map(|arc| arc.as_ref())
+	}
+
+	fn to_server_certificate_arc(&self) -> Option<Arc<Certificate>> {
+		self.server_identity.clone()
 	}
 
 	fn set_symmetric_key(&mut self, key: RuntimeAead) {
@@ -348,8 +353,8 @@ where
 		self.client_certificate.as_ref()
 	}
 
-	fn to_server_certificates_ref(&self) -> &[Arc<Certificate>] {
-		&self.server_certificates
+	fn to_trust_store_ref(&self) -> Option<&Arc<dyn CertificateTrust>> {
+		self.trust_store.as_ref()
 	}
 
 	fn to_server_handshake_mut(
@@ -463,7 +468,7 @@ where
 
 		{
 			if let Some(ref cert) = self.certificate {
-				transport.server_certificates.push(Arc::clone(cert));
+				transport.server_identity = Some(Arc::clone(cert));
 			}
 			if let Some(ref validators) = self.client_validators {
 				transport.client_validators = Some(Arc::clone(validators));

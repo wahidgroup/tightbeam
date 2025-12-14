@@ -303,7 +303,7 @@ impl crate::Frame {
 	pub async fn sign_with_provider<D, P>(mut self, provider: &P) -> Result<Self>
 	where
 		D: Digest + AssociatedOid,
-		P: SigningKeyProvider,
+		P: SigningKeyProvider + ?Sized,
 	{
 		// 1. Encode the frame (without signature field)
 		let unsigned_bytes = crate::encode(&self)?;

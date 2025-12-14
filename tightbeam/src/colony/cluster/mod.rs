@@ -23,6 +23,7 @@ use core::future::Future;
 use core::time::Duration;
 use std::sync::Arc;
 
+use crate::builder::TypeBuilder;
 use crate::crypto::key::SigningKeyProvider;
 use crate::der::Sequence;
 use crate::policy::{GatePolicy, TransitStatus};
@@ -317,12 +318,50 @@ pub async fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
 						Err(_) => return,
 					};
 
-					let _cmd = ClusterCommand {
+					let cmd = ClusterCommand {
 						heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
 						manage: None,
 					};
 
-					// TODO: Send via connection pool
+					// Build and sign the heartbeat frame
+					let frame: crate::Frame = match crate::builder::frame::FrameBuilder::from(crate::Version::V1)
+						.with_message(cmd)
+						.with_priority(crate::MessagePriority::Heartbeat)
+						.build()
+					{
+						Ok(f) => f,
+						Err(_) => {
+							process_heartbeat_result(
+								Err(ClusterError::EncodingError),
+								&hive_addr,
+								&registry,
+								&config,
+								&trace,
+							);
+							return;
+						}
+					};
+
+					// Sign the frame with the cluster's key provider
+					let signed_frame = match frame
+						.sign_with_provider::<crate::crypto::hash::Sha3_256, _>(config.tls.key.as_ref())
+						.await
+					{
+						Ok(f) => f,
+						Err(_) => {
+							process_heartbeat_result(
+								Err(ClusterError::SigningError),
+								&hive_addr,
+								&registry,
+								&config,
+								&trace,
+							);
+							return;
+						}
+					};
+
+					// TODO: Send signed_frame via connection pool to hive_addr
+					let _ = signed_frame;
 					let result = simulate_heartbeat();
 					process_heartbeat_result(result, &hive_addr, &registry, &config, &trace);
 				})
@@ -338,11 +377,14 @@ pub async fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
 	}
 }
 
-/// Run the cluster heartbeat loop
+/// Run the cluster heartbeat loop (std sync version)
 ///
 /// Periodically sends heartbeat requests to all registered hives, updates
 /// utilization metrics, and evicts unresponsive hives.
-#[cfg(all(not(feature = "tokio"), feature = "std"))]
+///
+/// Note: This sync version cannot use async signing (HSM/KMS support).
+/// Use the tokio async version for production with HSM/KMS key providers.
+#[cfg(all(not(feature = "tokio"), feature = "std", feature = "x509"))]
 pub fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
 	registry: Arc<HiveRegistry>,
 	config: Arc<ClusterConf<L>>,
@@ -370,13 +412,16 @@ pub fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
 					let hive_addr = Arc::clone(&hive.address);
 
 					std_rt::spawn(move || {
-						let _cmd = ClusterCommand {
-							heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
+						// Note: Sync version cannot use async signing
+						// This is a placeholder - production should use tokio version
+						let result: Result<ClusterCommandResponse, ClusterError> = Ok(ClusterCommandResponse {
+							heartbeat: Some(super::common::HeartbeatResult {
+								status: TransitStatus::Accepted,
+								utilization: crate::utils::BasisPoints::default(),
+								active_servlets: 0,
+							}),
 							manage: None,
-						};
-
-						// TODO: Send via connection pool
-						let result = simulate_heartbeat();
+						});
 						process_heartbeat_result(result, &hive_addr, &registry, &config, &trace);
 					})
 				})

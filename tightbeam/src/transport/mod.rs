@@ -65,25 +65,6 @@ use crate::transport::handshake::HandshakeKeyManager;
 
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 
-/// Composite validator that runs multiple validators in sequence
-#[cfg(feature = "x509")]
-pub(crate) struct CompositeValidator {
-	pub(crate) validators: Arc<Vec<Arc<dyn CertificateValidation>>>,
-}
-
-#[cfg(feature = "x509")]
-impl CertificateValidation for CompositeValidator {
-	fn evaluate(
-		&self,
-		cert: &Certificate,
-	) -> core::result::Result<(), crate::crypto::x509::error::CertificateValidationError> {
-		for validator in self.validators.iter() {
-			validator.evaluate(cert)?;
-		}
-		Ok(())
-	}
-}
-
 #[cfg(all(feature = "x509", feature = "std"))]
 #[derive(Clone)]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {

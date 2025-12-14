@@ -17,14 +17,10 @@ use crate::transport::{ConnectionBuilder, MessageCollector, MessageEmitter, Prot
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::hash::Digest;
-	pub use crate::crypto::hash::Sha3_256;
 	pub use crate::crypto::key::SigningKeyProvider;
 	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
-	pub use crate::crypto::x509::error::CertificateValidationError;
-	pub use crate::crypto::x509::policy::{CertificateValidation, RuntimeCertificatePinning};
+	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::crypto::x509::CertificateSpec;
-	pub use crate::der::Encode;
 	pub use crate::transport::handshake::HandshakeKeyManager;
 	pub use crate::transport::X509ClientConfig;
 	pub use crate::x509::Certificate;
@@ -71,16 +67,6 @@ pub struct DynGate(pub Arc<dyn GatePolicy + Send + Sync>);
 impl GatePolicy for DynGate {
 	fn evaluate(&self, message: &Frame) -> TransitStatus {
 		self.0.evaluate(message)
-	}
-}
-
-#[cfg(feature = "x509")]
-pub struct DynCertValidator(pub Arc<dyn CertificateValidation + Send + Sync>);
-
-#[cfg(feature = "x509")]
-impl CertificateValidation for DynCertValidator {
-	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		self.0.evaluate(cert)
 	}
 }
 
@@ -138,9 +124,7 @@ impl ClientPolicies {
 pub struct ClientBuilder<P: Protocol, C: CryptoProvider + 'static = DefaultCryptoProvider> {
 	policies: ClientPolicies,
 	#[cfg(feature = "x509")]
-	server_certificates: Vec<Certificate>,
-	#[cfg(feature = "x509")]
-	server_validators: Vec<Arc<dyn CertificateValidation>>,
+	trust_store: Option<Arc<dyn CertificateTrust>>,
 	#[cfg(feature = "x509")]
 	client_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
@@ -153,9 +137,7 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 		Self {
 			policies: ClientPolicies::default(),
 			#[cfg(feature = "x509")]
-			server_certificates: Vec::new(),
-			#[cfg(feature = "x509")]
-			server_validators: Vec::new(),
+			trust_store: None,
 			#[cfg(feature = "x509")]
 			client_certificate: None,
 			#[cfg(feature = "x509")]
@@ -194,32 +176,9 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 	}
 
 	#[cfg(feature = "x509")]
-	pub fn with_server_certificates(
-		mut self,
-		certs: impl IntoIterator<Item = CertificateSpec>,
-	) -> TransportResult<Self> {
-		let mut cert_objs = Vec::new();
-		for cert_spec in certs {
-			let cert = Certificate::try_from(cert_spec)?;
-			cert_objs.push(cert);
-		}
-
-		// Compute fingerprints before moving certs
-		let mut fingerprints = Vec::new();
-		for cert in &cert_objs {
-			let cert_der = cert.to_der()?;
-			let fingerprint = Sha3_256::digest(&cert_der).to_vec();
-			fingerprints.push(fingerprint);
-		}
-
-		// Create validator from fingerprints
-		if !fingerprints.is_empty() {
-			let validator = RuntimeCertificatePinning::<Sha3_256>::from_fingerprints(fingerprints);
-			self.server_validators.push(Arc::new(validator));
-		}
-
-		self.server_certificates.extend(cert_objs);
-		Ok(self)
+	pub fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
+		self.trust_store = Some(store);
+		self
 	}
 }
 
@@ -246,11 +205,8 @@ where
 	pub async fn connect(self, addr: P::Address) -> TransportResult<GenericClient<P>> {
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let mut transport = P::create_transport(stream);
-		if !self.server_certificates.is_empty() {
-			transport = transport.with_server_certificates(self.server_certificates);
-		}
-		if !self.server_validators.is_empty() {
-			transport = transport.with_server_validators(Arc::new(self.server_validators));
+		if let Some(store) = self.trust_store {
+			transport = transport.with_trust_store(store);
 		}
 		if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
 			transport = transport.with_client_identity(cert, key);
@@ -292,45 +248,9 @@ where
 		self
 	}
 
-	fn with_server_certificate(mut self, cert: CertificateSpec) -> TransportResult<Self> {
-		let cert_obj = Certificate::try_from(cert)?;
-
-		// Compute fingerprint directly (zero-copy - no clone!)
-		let cert_der = cert_obj.to_der()?;
-		let fingerprint = Sha3_256::digest(&cert_der).to_vec();
-
-		// Create validator from fingerprint
-		let validator = RuntimeCertificatePinning::<Sha3_256>::from_fingerprints([fingerprint]);
-		self.server_validators.push(Arc::new(validator));
-
-		// Store cert (moved, not cloned)
-		self.server_certificates.push(cert_obj);
-		Ok(self)
-	}
-
-	fn with_server_certificates(mut self, certs: impl IntoIterator<Item = CertificateSpec>) -> TransportResult<Self> {
-		let mut cert_objs = Vec::new();
-		for cert_spec in certs {
-			let cert = Certificate::try_from(cert_spec)?;
-			cert_objs.push(cert);
-		}
-
-		// Compute fingerprints before moving certs (zero-copy)
-		let mut fingerprints = Vec::new();
-		for cert in &cert_objs {
-			let cert_der = cert.to_der()?;
-			let fingerprint = Sha3_256::digest(&cert_der).to_vec();
-			fingerprints.push(fingerprint);
-		}
-
-		// Create validator from fingerprints (no clones!)
-		if !fingerprints.is_empty() {
-			let validator = RuntimeCertificatePinning::<Sha3_256>::from_fingerprints(fingerprints);
-			self.server_validators.push(Arc::new(validator));
-		}
-
-		self.server_certificates.extend(cert_objs);
-		Ok(self)
+	fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
+		self.trust_store = Some(store);
+		self
 	}
 
 	fn with_client_identity(

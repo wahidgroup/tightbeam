@@ -16,6 +16,7 @@ mod std_imports {
 	pub use std::collections::{HashMap, HashSet};
 	pub use std::sync::Arc;
 
+	pub use crate::cms::signed_data::SignerIdentifier;
 	pub use crate::crypto::hash::Digest;
 	pub use crate::crypto::hash::Sha3_256;
 	pub use crate::crypto::policy::VerificationPolicy;
@@ -31,6 +32,7 @@ pub type Fingerprint = [u8; 32];
 ///
 /// Extends `CertificateValidation` with trust-based operations.
 /// Implementations can use fingerprints, PKI chains, or custom logic.
+#[cfg(feature = "std")]
 pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// Check if a certificate is trusted.
 	fn is_trusted(&self, cert: &Certificate) -> bool;
@@ -49,6 +51,32 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// # Returns
 	/// - `Ok(())` if the chain is valid and terminates at a trusted root
 	/// - `Err(_)` if validation fails
+	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
+
+	/// Find a certificate by SignerInfo.
+	///
+	/// Used for frame signature verification - looks up the signer's certificate
+	/// using the SignerInfo's identifier and digest algorithm.
+	///
+	/// # Arguments
+	/// * `signer_info` - SignerInfo from the frame's nonrepudiation field
+	///
+	/// # Returns
+	/// - `Some(&Certificate)` if a matching certificate is found
+	/// - `None` if no certificate matches
+	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate>;
+
+	/// Get the verification policy for signature operations.
+	fn to_policy_ref(&self) -> &dyn VerificationPolicy;
+}
+
+/// Trait for certificate trust verification (no_std version without SignerIdentifier).
+#[cfg(not(feature = "std"))]
+pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
+	/// Check if a certificate is trusted.
+	fn is_trusted(&self, cert: &Certificate) -> bool;
+
+	/// Verify a certificate chain with full cryptographic validation.
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
 }
 
@@ -77,6 +105,9 @@ pub trait TrustBuilder: Sized {
 // CertificateTrustStore Implementation
 // ============================================================================
 
+/// SKID type: first 20 bytes of hash (RFC 5280)
+pub type Skid = [u8; 20];
+
 /// Built-in trust store with cryptographic signature verification.
 ///
 /// Uses a `VerificationPolicy` for runtime signature verification of
@@ -84,10 +115,12 @@ pub trait TrustBuilder: Sized {
 /// `HashSet` for O(1) lookup.
 #[cfg(feature = "std")]
 pub struct CertificateTrustStore {
-	/// Trusted certificate fingerprints (SHA-256 of DER)
+	/// Trusted certificate fingerprints
 	fingerprints: HashSet<Fingerprint>,
 	/// Full certificates indexed by fingerprint
 	certificates: HashMap<Fingerprint, Certificate>,
+	/// Pre-computed SKID
+	skid_index: HashMap<Skid, Fingerprint>,
 	/// Verification policy for signature verification
 	policy: Arc<dyn VerificationPolicy>,
 }
@@ -199,6 +232,33 @@ impl CertificateTrust for CertificateTrustStore {
 				.verify_signature(&algorithm_oid, &public_key_der, &message, signature_bytes)
 		})
 	}
+
+	fn find_by_signer_info(&self, signer_info: &crate::SignerInfo) -> Option<&Certificate> {
+		match &signer_info.sid {
+			SignerIdentifier::IssuerAndSerialNumber(ias) => {
+				// Find by issuer DN + serial number
+				self.certificates.values().find(|cert| {
+					cert.tbs_certificate.issuer == ias.issuer && cert.tbs_certificate.serial_number == ias.serial_number
+				})
+			}
+			SignerIdentifier::SubjectKeyIdentifier(skid) => {
+				// O(1) lookup via pre-indexed SKID
+				let skid_bytes = skid.0.as_bytes();
+				(skid_bytes.len() == 20)
+					.then(|| {
+						let mut key = [0u8; 20];
+						key.copy_from_slice(skid_bytes);
+						key
+					})
+					.and_then(|key| self.skid_index.get(&key))
+					.and_then(|fp| self.certificates.get(fp))
+			}
+		}
+	}
+
+	fn to_policy_ref(&self) -> &dyn VerificationPolicy {
+		&*self.policy
+	}
 }
 
 // ============================================================================
@@ -207,27 +267,53 @@ impl CertificateTrust for CertificateTrustStore {
 
 /// Builder for constructing `CertificateTrustStore`.
 ///
-/// Validates structural correctness (expiry, issuer/subject chaining) at add time.
+/// Generic over digest algorithm `D` which is used for SKID computation.
+/// Validates structural correctness (expiry, issuer/subject chaining) on add.
 /// The resulting store handles cryptographic verification at runtime.
 #[cfg(feature = "std")]
-pub struct CertificateTrustBuilder {
+pub struct CertificateTrustBuilder<D: Digest> {
 	fingerprints: HashSet<Fingerprint>,
 	certificates: HashMap<Fingerprint, Certificate>,
+	skid_index: HashMap<Skid, Fingerprint>,
 	policy: Arc<dyn VerificationPolicy>,
+	_digest: core::marker::PhantomData<D>,
 }
 
 #[cfg(feature = "std")]
-impl CertificateTrustBuilder {
-	/// Create a new builder with the given verification policy.
-	pub fn new(policy: Arc<dyn VerificationPolicy>) -> Self {
-		Self { fingerprints: HashSet::new(), certificates: HashMap::new(), policy }
+impl<D: Digest, P: VerificationPolicy + 'static> From<P> for CertificateTrustBuilder<D> {
+	fn from(policy: P) -> Self {
+		Self {
+			fingerprints: HashSet::new(),
+			certificates: HashMap::new(),
+			skid_index: HashMap::new(),
+			policy: Arc::new(policy),
+			_digest: core::marker::PhantomData,
+		}
 	}
+}
 
+#[cfg(feature = "std")]
+impl<D: Digest> CertificateTrustBuilder<D> {
 	/// Add a single certificate (internal helper).
-	fn add_certificate_internal(&mut self, cert: Certificate) -> Result<(), CertificateValidationError> {
+	fn add_certificate(&mut self, cert: Certificate) -> Result<(), CertificateValidationError> {
 		let fp = CertificateTrustStore::to_fingerprint(&cert)?;
 
+		// Compute SKID from public key
+		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
+		let hash = D::digest(&spki_der);
+
+		let mut skid = [0u8; 20];
+		skid.copy_from_slice(&hash.as_ref()[..20]);
+
+		// Collision detection: same SKID but different fingerprint
+		if let Some(existing_fp) = self.skid_index.get(&skid) {
+			if *existing_fp != fp {
+				return Err(CertificateValidationError::SkidCollision);
+			}
+		}
+
 		self.fingerprints.insert(fp);
+		self.skid_index.insert(skid, fp);
 		self.certificates.insert(fp, cert);
 
 		Ok(())
@@ -235,7 +321,7 @@ impl CertificateTrustBuilder {
 }
 
 #[cfg(feature = "std")]
-impl TrustBuilder for CertificateTrustBuilder {
+impl<D: Digest> TrustBuilder for CertificateTrustBuilder<D> {
 	type Store = CertificateTrustStore;
 
 	fn with_chain(mut self, chain: Vec<Certificate>) -> Result<Self, CertificateValidationError> {
@@ -255,14 +341,14 @@ impl TrustBuilder for CertificateTrustBuilder {
 		})?;
 
 		// Transfer ownership and add all certificates
-		chain.into_iter().try_for_each(|cert| self.add_certificate_internal(cert))?;
+		chain.into_iter().try_for_each(|cert| self.add_certificate(cert))?;
 
 		Ok(self)
 	}
 
 	fn with_certificate(mut self, cert: Certificate) -> Result<Self, CertificateValidationError> {
 		validate_certificate_expiry(&cert)?;
-		self.add_certificate_internal(cert)?;
+		self.add_certificate(cert)?;
 		Ok(self)
 	}
 
@@ -270,17 +356,19 @@ impl TrustBuilder for CertificateTrustBuilder {
 		CertificateTrustStore {
 			fingerprints: self.fingerprints,
 			certificates: self.certificates,
+			skid_index: self.skid_index,
 			policy: self.policy,
 		}
 	}
 }
 
 #[cfg(feature = "std")]
-impl Debug for CertificateTrustBuilder {
+impl<D: Digest> Debug for CertificateTrustBuilder<D> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("CertificateTrustBuilder")
 			.field("fingerprints", &self.fingerprints.len())
 			.field("certificates", &self.certificates.len())
+			.field("skid_index", &self.skid_index.len())
 			.finish_non_exhaustive()
 	}
 }
@@ -290,18 +378,18 @@ mod tests {
 	use super::*;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::SigningKey;
+	use crate::crypto::sign::Signatory;
 	use crate::testing::create_test_signing_key;
 	use crate::testing::utils::{create_test_certificate, create_test_certificate_chain, TestCertificateChain};
 
 	type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+	/// Type alias for the builder with SHA3-256 digest (matches secp256k1 signer)
+	type TestBuilder = CertificateTrustBuilder<Sha3_256>;
+
 	// ========================================================================
 	// Test Helpers
 	// ========================================================================
-
-	fn policy() -> Arc<dyn VerificationPolicy> {
-		Arc::new(Secp256k1Policy)
-	}
 
 	/// Which certificates to add to the trust store
 	#[derive(Debug, Clone, Copy)]
@@ -324,14 +412,15 @@ mod tests {
 		chain: &TestCertificateChain,
 		certs: StoreCerts,
 	) -> Result<CertificateTrustStore, CertificateValidationError> {
-		let mut builder = CertificateTrustBuilder::new(policy());
-		builder = match certs {
+		let builder: TestBuilder = Secp256k1Policy.into();
+		let builder = match certs {
 			StoreCerts::None => builder,
 			StoreCerts::Root => builder.with_certificate(chain.root.clone())?,
 			StoreCerts::RootAndIntermediate => builder
 				.with_certificate(chain.root.clone())?
 				.with_certificate(chain.intermediate.clone())?,
 		};
+
 		Ok(builder.build())
 	}
 
@@ -358,7 +447,7 @@ mod tests {
 	#[test]
 	fn is_trusted_matches_fingerprint() -> TestResult {
 		let cert = create_test_certificate(&create_test_signing_key());
-		let store = CertificateTrustBuilder::new(policy()).with_certificate(cert.clone())?.build();
+		let store = TestBuilder::from(Secp256k1Policy).with_certificate(cert.clone())?.build();
 		assert!(store.is_trusted(&cert));
 		assert!(!store.is_trusted(&create_test_certificate(&SigningKey::from_bytes(&[2u8; 32].into())?)));
 		Ok(())
@@ -367,7 +456,7 @@ mod tests {
 	#[test]
 	fn builder_validates_chain_structure() -> TestResult {
 		let chain = create_test_certificate_chain();
-		assert!(CertificateTrustBuilder::new(policy())
+		assert!(TestBuilder::from(Secp256k1Policy)
 			.with_chain(vec![chain.root, chain.intermediate, chain.leaf])
 			.is_ok());
 
@@ -409,7 +498,7 @@ mod tests {
 	#[test]
 	fn evaluate_rejects_cross_chain_cert() -> TestResult {
 		// Store has one chain's root, evaluate leaf from different chain
-		let store = CertificateTrustBuilder::new(policy())
+		let store = TestBuilder::from(Secp256k1Policy)
 			.with_certificate(create_test_certificate(&create_test_signing_key()))?
 			.build();
 
@@ -448,6 +537,43 @@ mod tests {
 				chain_slice.len()
 			);
 		}
+
+		Ok(())
+	}
+
+	// ========================================================================
+	// Signer Lookup
+	// ========================================================================
+
+	#[test]
+	fn find_by_signer_info_skid() -> TestResult {
+		let key = create_test_signing_key();
+		let cert = create_test_certificate(&key);
+		let store = TestBuilder::from(Secp256k1Policy).with_certificate(cert.clone())?.build();
+
+		// Create signer info via Signatory trait (uses SHA3-256 for SKID)
+		let signer_info = key.to_signer_info(b"test")?;
+		// Should find the certificate
+		let found = store.find_by_signer_info(&signer_info);
+		assert!(found.is_some());
+		assert_eq!(
+			CertificateTrustStore::to_fingerprint(found.unwrap())?,
+			CertificateTrustStore::to_fingerprint(&cert)?
+		);
+
+		Ok(())
+	}
+
+	#[test]
+	fn find_by_signer_info_not_found() -> TestResult {
+		let store = TestBuilder::from(Secp256k1Policy)
+			.with_certificate(create_test_certificate(&create_test_signing_key()))?
+			.build();
+
+		// Different key
+		let other_key = SigningKey::from_bytes(&[99u8; 32].into())?;
+		let signer_info = other_key.to_signer_info(b"test")?;
+		assert!(store.find_by_signer_info(&signer_info).is_none());
 
 		Ok(())
 	}

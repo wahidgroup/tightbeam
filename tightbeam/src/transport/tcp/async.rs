@@ -20,6 +20,7 @@ mod x509 {
 	pub use crate::crypto::aead::RuntimeAead;
 	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::transport::handshake::{
 		HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 	};
@@ -119,7 +120,7 @@ impl<P: CryptoProvider> TokioListener<P> {
 		let mut transport = TcpTransport::from(TokioStream::from(stream));
 
 		if let Some(cert) = &self.certificate {
-			transport.server_certificates.push(Arc::clone(cert));
+			transport.server_identity = Some(Arc::clone(cert));
 		}
 
 		if let Some(ref validators) = self.client_validators {
@@ -260,7 +261,11 @@ where
 	}
 
 	fn to_server_certificate_ref(&self) -> Option<&Certificate> {
-		self.server_certificates.first().map(|arc| arc.as_ref())
+		self.server_identity.as_ref().map(|arc| arc.as_ref())
+	}
+
+	fn to_server_certificate_arc(&self) -> Option<Arc<Certificate>> {
+		self.server_identity.clone()
 	}
 
 	fn set_symmetric_key(&mut self, key: RuntimeAead) {
@@ -293,8 +298,8 @@ where
 		self.client_certificate.as_ref()
 	}
 
-	fn to_server_certificates_ref(&self) -> &[Arc<Certificate>] {
-		&self.server_certificates
+	fn to_trust_store_ref(&self) -> Option<&Arc<dyn CertificateTrust>> {
+		self.trust_store.as_ref()
 	}
 
 	fn to_server_handshake_mut(
@@ -313,10 +318,6 @@ where
 
 	fn to_client_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
 		self.client_validators.as_ref()
-	}
-
-	fn to_server_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
-		self.server_validators.as_ref()
 	}
 
 	fn unset_symmetric_key(&mut self) {
@@ -342,7 +343,7 @@ impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
 
 		#[cfg(feature = "x509")]
 		if let Some(ref cert) = self.certificate {
-			transport.server_certificates.push(Arc::clone(cert));
+			transport.server_identity = Some(Arc::clone(cert));
 		}
 
 		#[cfg(feature = "x509")]
@@ -374,9 +375,9 @@ pub struct TcpTransport<S: AsyncProtocolStream, P: CryptoProvider = DefaultCrypt
 	stream: S,
 	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
 	#[cfg(feature = "x509")]
-	server_certificates: Vec<Arc<Certificate>>,
+	trust_store: Option<Arc<dyn CertificateTrust>>,
 	#[cfg(feature = "x509")]
-	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	server_identity: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
@@ -410,9 +411,9 @@ pub struct TcpTransport<S: AsyncProtocolStream, P: CryptoProvider = DefaultCrypt
 	collector_gate: Box<dyn GatePolicy>,
 	operation_timeout: Option<Duration>,
 	#[cfg(feature = "x509")]
-	server_certificates: Vec<Arc<Certificate>>,
+	trust_store: Option<Arc<dyn CertificateTrust>>,
 	#[cfg(feature = "x509")]
-	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	server_identity: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
 	client_certificate: Option<Arc<Certificate>>,
 	#[cfg(feature = "x509")]
@@ -668,8 +669,6 @@ mod tests {
 	use crate::transport::{MessageCollector, MessageEmitter, ResponseHandler};
 
 	#[cfg(feature = "x509")]
-	use crate::transport::X509ClientConfig;
-
 	#[tokio::test]
 	async fn async_round_trip() -> TransportResult<()> {
 		let listener = TokioListener::bind("127.0.0.1:0").await?;
@@ -708,10 +707,15 @@ mod tests {
 	async fn async_with_encrypted_and_gate_policy() -> TransportResult<()> {
 		use core::str::FromStr;
 		use core::sync::atomic::{AtomicBool, Ordering};
+		use std::sync::Arc;
 
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 		use crate::policy::TransitStatus;
 		use crate::spki::SubjectPublicKeyInfoOwned;
 		use crate::transport::TransportEncryptionConfig;
+		use crate::transport::X509ClientConfig;
 		use crate::{prelude::TightBeamSocketAddr, transport::policy::PolicyConf};
 
 		struct BusyFirstGate {
@@ -780,7 +784,13 @@ mod tests {
 		});
 
 		let stream = TcpStream::connect(*socket_addr).await?;
-		let mut transport = TcpTransport::from(TokioStream::from(stream)).with_server_certificate(cert);
+		// Create trust store from certificate
+		let trust_store: Arc<dyn CertificateTrust> = Arc::new(
+			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_certificate(cert)?
+				.build(),
+		);
+		let mut transport = TcpTransport::from(TokioStream::from(stream)).with_trust_store(trust_store);
 
 		// First emit triggers handshake, then sends encrypted message
 		// Gate policy returns Busy for first application message

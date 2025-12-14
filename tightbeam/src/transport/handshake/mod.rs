@@ -186,6 +186,7 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::{SignatureEncoding, Verifier};
 use crate::crypto::x509::policy::CertificateValidation;
+use crate::crypto::x509::store::CertificateTrust;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Decode, Encode, Enumerated, Sequence};
 use crate::spki::EncodePublicKey;
@@ -443,7 +444,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	pub fn create_cms_client<'a>(
 		&'a self,
 		server_cert: Arc<Certificate>,
-		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		trust_store: Option<Arc<dyn CertificateTrust>>,
 	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>
 	where
 		P: Default + 'static,
@@ -463,8 +464,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 			server_cert,
 		);
 
-		if let Some(vals) = validators {
-			client = client.with_server_validators(vals);
+		if let Some(store) = trust_store {
+			client = client.with_trust_store(store);
 		}
 
 		Ok(Box::new(client))

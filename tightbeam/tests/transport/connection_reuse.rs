@@ -28,10 +28,17 @@ use tightbeam::{
 #[cfg(feature = "x509")]
 use tightbeam::{
 	crypto::{
+		hash::Sha3_256,
 		key::SigningKeySpec,
+		policy::Secp256k1Policy,
 		sign::ecdsa::Secp256k1,
-		x509::{policy::PublicKeyPinning, CertificateSpec},
+		x509::{
+			policy::PublicKeyPinning,
+			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+			Certificate, CertificateSpec,
+		},
 	},
+	error::TightBeamError,
 	hex,
 };
 
@@ -89,6 +96,20 @@ const CLIENT_PUB_KEY: &[u8] = &hex!("044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80
 
 #[cfg(feature = "x509")]
 const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KEY]);
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+#[cfg(feature = "x509")]
+fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
+	let server_cert = Certificate::try_from(SERVER_CERT)?;
+	Ok(Arc::new(
+		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			.with_certificate(server_cert)?
+			.build(),
+	))
+}
 
 // ============================================================================
 // Spec Definitions
@@ -210,7 +231,7 @@ tb_scenario! {
 
 			// Configure client with TLS credentials
 			let builder = ClientBuilder::<TokioListener>::builder()
-				.with_server_certificate(SERVER_CERT)?
+				.with_trust_store(make_server_trust_store()?)
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 			let mut client = builder.connect(addr).await?;

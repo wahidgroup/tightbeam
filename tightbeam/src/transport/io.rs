@@ -41,7 +41,6 @@ mod x509 {
 		HandshakeProtocolKind, ServerHandshake, TcpHandshakeState,
 	};
 	pub use crate::transport::state::EncryptedProtocolState;
-	pub(crate) use crate::transport::CompositeValidator;
 }
 
 #[cfg(feature = "x509")]
@@ -274,7 +273,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		// AEAD bound
 		P::AeadCipher: KeyInit,
 	{
-		let should_handshake = (self.to_server_certificate_ref().is_some() || self.is_client_validators_present())
+		let should_handshake = (self.to_server_certificate_ref().is_some()
+			|| self.to_trust_store_ref().is_some()
+			|| self.is_client_validators_present())
 			&& self.to_handshake_state() == TcpHandshakeState::None;
 
 		if should_handshake {
@@ -307,21 +308,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::AeadCipher: KeyInit,
 		P::EciesMessage: EciesMessageOps,
 	{
-		// Build composite validator if validators are configured
-		#[cfg(all(feature = "x509", feature = "std"))]
-		let validator = self.to_server_validators_ref().map(|validators| {
-			let composite = CompositeValidator { validators: Arc::clone(validators) };
-			Arc::new(composite) as Arc<dyn CertificateValidation>
-		});
-
-		#[cfg(not(all(feature = "x509", feature = "std")))]
-		let validator = None;
-
 		// Create client without mutual auth
 		let mut client = EciesHandshakeClient::<P, P::EciesMessage>::new(None);
+
+		// Use trust store for server certificate validation
 		#[cfg(all(feature = "x509", feature = "std"))]
-		if let Some(val) = validator {
-			client = client.with_certificate_validator(val);
+		if let Some(store) = self.to_trust_store_ref() {
+			client = client.with_certificate_validator(Arc::clone(store) as Arc<dyn CertificateValidation>);
 		}
 
 		// Step 1: Build and send client hello
@@ -416,12 +409,11 @@ pub trait EncryptedMessageIO: MessageIO {
 		// AEAD bound
 		P::AeadCipher: KeyInit,
 	{
-		// Build composite validator if validators are configured
+		// Use trust store for server certificate validation
 		#[cfg(all(feature = "x509", feature = "std"))]
-		let validator = self.to_server_validators_ref().map(|validators| {
-			let composite = CompositeValidator { validators: Arc::clone(validators) };
-			Arc::new(composite) as Arc<dyn CertificateValidation>
-		});
+		let validator = self
+			.to_trust_store_ref()
+			.map(|store| Arc::clone(store) as Arc<dyn CertificateValidation>);
 
 		#[cfg(not(all(feature = "x509", feature = "std")))]
 		let validator = None;
@@ -438,8 +430,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = HandshakeError>> =
 			match (self.to_handshake_protocol_kind(), key_manager) {
 				(HandshakeProtocolKind::Ecies, key) => {
+					// With trust store, validation happens via the validator callback
 					key.create_ecies_client::<crate::crypto::ecies::Secp256k1EciesMessage>(
-						self.to_server_certificates_ref().first().map(Arc::clone),
+						None, // Trust store validates instead of explicit cert matching
 						self.to_client_certificate_ref().map(Arc::clone),
 						None, // Use default AAD domain tag
 						validator,
@@ -447,12 +440,9 @@ pub trait EncryptedMessageIO: MessageIO {
 				}
 
 				#[cfg(feature = "transport-cms")]
-				(HandshakeProtocolKind::Cms, key) => {
-					let server_cert = self
-						.to_server_certificates_ref()
-						.first()
-						.ok_or(TransportError::MissingEncryption)?;
-					key.create_cms_client(Arc::clone(server_cert), validator.map(|v| Arc::new(vec![v])))?
+				(HandshakeProtocolKind::Cms, _) => {
+					// CMS requires explicit server certificate
+					return Err(TransportError::MissingEncryption);
 				}
 
 				#[cfg(not(feature = "transport-cms"))]
@@ -582,11 +572,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		};
 
 		// Get all immutable data first before mutable borrow
-		let cert_arc = self
-			.to_server_certificates_ref()
-			.first()
-			.ok_or(TransportError::MissingEncryption)?;
-		let cert_arc = Arc::clone(cert_arc);
+		let cert_arc = self.to_server_certificate_arc().ok_or(TransportError::MissingEncryption)?;
 		let key_manager = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
 		let key_manager = Arc::clone(key_manager);
 		let protocol_kind = self.to_handshake_protocol_kind();

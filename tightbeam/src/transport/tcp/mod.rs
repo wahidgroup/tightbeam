@@ -184,7 +184,9 @@ macro_rules! impl_tcp_common {
 					stream,
 					handler: None,
 					#[cfg(feature = "x509")]
-					server_certificates: Vec::new(),
+					trust_store: None,
+					#[cfg(feature = "x509")]
+					server_identity: None,
 					#[cfg(feature = "x509")]
 					client_certificate: None,
 					#[cfg(feature = "x509")]
@@ -231,9 +233,9 @@ macro_rules! impl_tcp_common {
 					operation_timeout: None,
 					handler: None,
 					#[cfg(feature = "x509")]
-					server_certificates: Vec::new(),
+					trust_store: None,
 					#[cfg(feature = "x509")]
-					server_validators: None,
+					server_identity: None,
 					#[cfg(feature = "x509")]
 					client_certificate: None,
 					#[cfg(feature = "x509")]
@@ -287,18 +289,8 @@ macro_rules! impl_tcp_common {
 		{
 			type CryptoProvider = P;
 
-			fn with_server_certificate(mut self, cert: $crate::x509::Certificate) -> Self {
-				self.server_certificates.push(Arc::new(cert));
-				self
-			}
-
-			fn with_server_certificates(mut self, certs: impl IntoIterator<Item = $crate::x509::Certificate>) -> Self {
-				self.server_certificates.extend(certs.into_iter().map(Arc::new));
-				self
-			}
-
-			fn with_server_validators(mut self, validators: Arc<Vec<Arc<dyn $crate::crypto::x509::policy::CertificateValidation>>>) -> Self {
-				self.server_validators = Some(validators);
+			fn with_trust_store(mut self, store: Arc<dyn $crate::crypto::x509::store::CertificateTrust>) -> Self {
+				self.trust_store = Some(store);
 				self
 			}
 

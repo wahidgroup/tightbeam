@@ -13,6 +13,7 @@ use core::time::Duration;
 use crate::crypto::aead::RuntimeAead;
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::x509::policy::CertificateValidation;
+use crate::crypto::x509::store::CertificateTrust;
 use crate::transport::handshake::{
 	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 };
@@ -42,6 +43,11 @@ pub trait EncryptedProtocolState {
 
 	/// Get server certificate if present (pure accessor)
 	fn to_server_certificate_ref(&self) -> Option<&Certificate>;
+
+	/// Get server certificate Arc if present (zero-copy accessor)
+	fn to_server_certificate_arc(&self) -> Option<Arc<Certificate>> {
+		None
+	}
 
 	/// Set symmetric encryption key (pure mutator)
 	fn set_symmetric_key(&mut self, key: RuntimeAead);
@@ -82,9 +88,9 @@ pub trait EncryptedProtocolState {
 		None
 	}
 
-	/// Get server certificates reference
-	fn to_server_certificates_ref(&self) -> &[Arc<Certificate>] {
-		&[]
+	/// Get trust store reference (for server certificate validation)
+	fn to_trust_store_ref(&self) -> Option<&Arc<dyn CertificateTrust>> {
+		None
 	}
 
 	/// Get mutable reference to server handshake orchestrator
@@ -101,11 +107,6 @@ pub trait EncryptedProtocolState {
 
 	/// Get client validators
 	fn to_client_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
-		None
-	}
-
-	/// Get server validators (for client-side server certificate validation)
-	fn to_server_validators_ref(&self) -> Option<&Arc<Vec<Arc<dyn CertificateValidation>>>> {
 		None
 	}
 }

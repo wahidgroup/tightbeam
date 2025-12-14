@@ -19,6 +19,12 @@ pub enum ClusterError {
 	/// Registration failed
 	#[cfg_attr(feature = "derive", error("Registration failed"))]
 	RegistrationFailed,
+	/// Frame encoding error
+	#[cfg_attr(feature = "derive", error("Frame encoding error"))]
+	EncodingError,
+	/// Frame signing error
+	#[cfg_attr(feature = "derive", error("Frame signing error"))]
+	SigningError,
 }
 
 #[cfg(not(feature = "derive"))]
@@ -36,6 +42,8 @@ impl core::fmt::Display for ClusterError {
 				write!(f, "Hive communication failed: {}", String::from_utf8_lossy(msg))
 			}
 			ClusterError::RegistrationFailed => write!(f, "Registration failed"),
+			ClusterError::EncodingError => write!(f, "Frame encoding error"),
+			ClusterError::SigningError => write!(f, "Frame signing error"),
 		}
 	}
 }

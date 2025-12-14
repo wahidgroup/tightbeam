@@ -193,6 +193,12 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	CryptoPolicyError(crate::crypto::policy::CryptoPolicyError),
 
+	/// Error during certificate validation
+	#[cfg(feature = "x509")]
+	#[cfg_attr(feature = "derive", error("Certificate validation error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	CertificateValidationError(crate::crypto::x509::error::CertificateValidationError),
+
 	#[cfg_attr(feature = "derive", error("Key derivation error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	KeyDerivationError(crate::crypto::kdf::KdfError),

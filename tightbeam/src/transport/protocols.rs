@@ -18,7 +18,7 @@ use std::sync::Arc;
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
-	pub use crate::crypto::x509::policy::CertificateValidation;
+	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::transport::handshake::HandshakeKeyManager;
 	pub use crate::transport::TransportEncryptionConfig;
 	pub use crate::x509::Certificate;
@@ -100,22 +100,14 @@ pub trait EncryptedProtocol: Protocol {
 }
 
 /// Trait for configuring client-side X.509 mutual authentication.
-/// Supports multiple server certificates for rotation and multi-CA scenarios.
 #[cfg(feature = "x509")]
 pub trait X509ClientConfig: Sized {
 	type CryptoProvider: CryptoProvider;
 
-	/// Add a server certificate for verification.
-	fn with_server_certificate(self, cert: Certificate) -> Self;
-
-	/// Add multiple server certificates at once.
-	fn with_server_certificates(self, certs: impl IntoIterator<Item = Certificate>) -> Self;
-
-	/// Set server certificate validators for strict validation.
-	fn with_server_validators(self, validators: Arc<Vec<Arc<dyn CertificateValidation>>>) -> Self;
+	/// Set the trust store for server certificate validation.
+	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
 	/// Set the client's identity for mutual authentication.
-	/// The client presents this certificate to the server when requested.
 	fn with_client_identity(self, cert: Certificate, key: HandshakeKeyManager<Self::CryptoProvider>) -> Self;
 }
 

@@ -18,7 +18,7 @@ use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
 use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier};
-use crate::crypto::x509::policy::CertificateValidation;
+use crate::crypto::x509::store::CertificateTrust;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
 use crate::der::asn1::OctetString;
@@ -59,7 +59,7 @@ where
 	security_offer: Option<SecurityOffer>,
 	selected_profile: Option<SecurityProfileDesc>,
 	provider: P,
-	server_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	trust_store: Option<Arc<dyn CertificateTrust>>,
 	invariants: HandshakeInvariant,
 }
 
@@ -98,7 +98,7 @@ where
 			security_offer: None,
 			selected_profile: None,
 			provider,
-			server_validators: None,
+			trust_store: None,
 			invariants: HandshakeInvariant::default(),
 		}
 	}
@@ -112,13 +112,10 @@ where
 		self
 	}
 
-	/// Set certificate validators for server certificate validation.
-	///
-	/// Validators will be applied during the handshake when the server
-	/// certificate is validated.
+	/// Set trust store for server certificate validation.
 	#[must_use]
-	pub fn with_server_validators(mut self, validators: Arc<Vec<Arc<dyn CertificateValidation>>>) -> Self {
-		self.server_validators = Some(validators);
+	pub fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
+		self.trust_store = Some(store);
 		self
 	}
 
@@ -154,11 +151,9 @@ where
 	fn validate_state_and_certificate(&self) -> Result<(), HandshakeError> {
 		self.validate_expected_state(ClientHandshakeState::Init)?;
 
-		// Validate server certificate using configured validators
-		if let Some(validators) = &self.server_validators {
-			for validator in validators.iter() {
-				validator.evaluate(&self.server_cert)?;
-			}
+		// Validate server certificate using trust store or default expiry check
+		if let Some(store) = &self.trust_store {
+			store.evaluate(&self.server_cert)?;
 		} else {
 			validate_certificate_expiry(&self.server_cert)?;
 		}

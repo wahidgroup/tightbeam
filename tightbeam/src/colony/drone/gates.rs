@@ -14,16 +14,19 @@ use std::sync::Arc;
 
 use core::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering};
 
+use crate::colony::common::current_timestamp_ms;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::utils::BasisPoints;
 use crate::Frame;
 
-use super::error::DroneError;
-use crate::colony::common::current_timestamp_ms;
+#[cfg(feature = "x509")]
+use crate::crypto::x509::store::CertificateTrust;
+#[cfg(feature = "x509")]
+use crate::der::Encode;
 
-// =============================================================================
+// ============================================================================
 // Circuit Breaker
-// =============================================================================
+// ============================================================================
 
 /// Circuit breaker states
 ///
@@ -144,64 +147,42 @@ impl ClusterCircuitBreaker {
 // Gate Policies
 // =============================================================================
 
-/// Gate policy for cluster command security
+/// Gate policy for certificate-based cluster command security
 ///
-/// Enforces nonrepudiation and integrity requirements on cluster commands.
-/// Integrates with the circuit breaker to halt communication after repeated
-/// authentication failures.
-///
-/// # Type Parameters
-///
-/// * `S` - Signature encoding type (e.g., `Secp256k1Signature`)
-/// * `V` - Verifying key type that implements `signature::Verifier<S>`
+/// Enforces nonrepudiation and integrity requirements on cluster commands
+/// using certificate-based trust verification.
 ///
 /// # Security Flow
 ///
 /// 1. Check circuit breaker - reject if open
 /// 2. Verify nonrepudiation signature present
 /// 3. Verify frame integrity present
-/// 4. Verify signature against at least one trusted key
-/// 5. On failure: record auth failure (may trip breaker)
-/// 6. On success: record success (resets breaker)
-pub struct ClusterSecurityGate<S, V>
-where
-	S: signature::SignatureEncoding,
-	V: signature::Verifier<S> + Clone,
-{
+/// 4. Look up signer certificate in trust store
+/// 5. Verify signature using certificate's public key
+/// 6. On failure: record auth failure (may trip breaker)
+/// 7. On success: record success (resets breaker)
+#[cfg(feature = "x509")]
+pub struct ClusterSecurityGate {
 	/// Circuit breaker for tracking auth failures
 	circuit_breaker: Arc<ClusterCircuitBreaker>,
-	/// Trusted cluster verifying keys for signature validation
-	trusted_keys: Vec<V>,
-	/// Phantom data for signature type
-	_signature: core::marker::PhantomData<S>,
+	/// Trust store for certificate lookup and signature verification
+	trust_store: Arc<dyn CertificateTrust>,
 }
 
-impl<S, V> ClusterSecurityGate<S, V>
-where
-	S: signature::SignatureEncoding,
-	V: signature::Verifier<S> + Clone,
-{
-	/// Create a new security gate with the given circuit breaker and trusted keys
+#[cfg(feature = "x509")]
+impl ClusterSecurityGate {
+	/// Create a new security gate with certificate-based trust
 	///
 	/// # Arguments
 	/// * `circuit_breaker` - Shared circuit breaker for tracking auth failures
-	/// * `trusted_keys` - Trusted verifying keys for signature verification
-	///
-	/// # Errors
-	/// Returns `DroneError::NoTrustedKeys` if `trusted_keys` is empty.
-	pub fn new(circuit_breaker: Arc<ClusterCircuitBreaker>, trusted_keys: Vec<V>) -> Result<Self, DroneError> {
-		if trusted_keys.is_empty() {
-			return Err(DroneError::NoTrustedKeys);
-		}
-		Ok(Self { circuit_breaker, trusted_keys, _signature: core::marker::PhantomData })
+	/// * `trust_store` - Trust store containing trusted certificates
+	pub fn new(circuit_breaker: Arc<ClusterCircuitBreaker>, trust_store: Arc<dyn CertificateTrust>) -> Self {
+		Self { circuit_breaker, trust_store }
 	}
 }
 
-impl<S, V> GatePolicy for ClusterSecurityGate<S, V>
-where
-	S: signature::SignatureEncoding + Send + Sync,
-	V: signature::Verifier<S> + Clone + Send + Sync,
-{
+#[cfg(feature = "x509")]
+impl GatePolicy for ClusterSecurityGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
 		// Check circuit breaker first
 		if !self.circuit_breaker.allow_request() {
@@ -209,28 +190,62 @@ where
 		}
 
 		// Check nonrepudiation (required by #[beam(nonrepudiable)])
-		if frame.nonrepudiation.is_none() {
-			self.circuit_breaker.record_auth_failure();
-			return TransitStatus::Unauthorized;
-		}
+		let signer_info = match frame.nonrepudiation.as_ref() {
+			Some(info) => info,
+			None => {
+				self.circuit_breaker.record_auth_failure();
+				return TransitStatus::Unauthorized;
+			}
+		};
 
-		// Check integrity (required by #[beam(frame_integrity)])
+		// Check integrity
 		if frame.integrity.is_none() {
 			self.circuit_breaker.record_auth_failure();
 			return TransitStatus::Unauthorized;
 		}
 
-		// Verify signature against trusted keys
-		let verified = self.trusted_keys.iter().any(|key| frame.verify::<S>(key).is_ok());
-		if !verified {
-			self.circuit_breaker.record_auth_failure();
-			return TransitStatus::Forbidden;
+		// Look up signer certificate - if found, signer is trusted
+		let cert = match self.trust_store.find_by_signer_info(signer_info) {
+			Some(c) => c,
+			None => {
+				self.circuit_breaker.record_auth_failure();
+				return TransitStatus::Forbidden;
+			}
+		};
+
+		// Verify signature using certificate's public key
+		let algorithm_oid = signer_info.signature_algorithm.oid;
+		let signature = signer_info.signature.as_bytes();
+		let public_key_der = match cert.tbs_certificate.subject_public_key_info.to_der() {
+			Ok(der) => der,
+			Err(_) => {
+				self.circuit_breaker.record_auth_failure();
+				return TransitStatus::Forbidden;
+			}
+		};
+
+		let message = match frame.to_tbs() {
+			Ok(tbs) => tbs,
+			Err(_) => {
+				self.circuit_breaker.record_auth_failure();
+				return TransitStatus::Forbidden;
+			}
+		};
+
+		match self
+			.trust_store
+			.to_policy_ref()
+			.verify_signature(&algorithm_oid, &public_key_der, &message, signature)
+		{
+			Ok(()) => {
+				self.circuit_breaker.record_success();
+				TransitStatus::Accepted
+			}
+			Err(_) => {
+				self.circuit_breaker.record_auth_failure();
+				TransitStatus::Forbidden
+			}
 		}
-
-		// All checks passed
-		self.circuit_breaker.record_success();
-
-		TransitStatus::Accepted
 	}
 }
 
@@ -252,7 +267,7 @@ impl BackpressureGate {
 	/// Create a new backpressure gate
 	///
 	/// # Arguments
-	/// * `utilization` - Shared atomic for current utilization (updated by scaling loop)
+	/// * `utilization` - Shared atomic for current utilization
 	/// * `threshold` - Utilization threshold above which to reject requests
 	pub fn new(utilization: Arc<AtomicU16>, threshold: BasisPoints) -> Self {
 		Self { utilization, threshold }

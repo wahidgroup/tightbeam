@@ -210,16 +210,17 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 	pub circuit_breaker_threshold: u8,
 	/// Circuit breaker cooldown in milliseconds (default: 30_000)
 	pub circuit_breaker_cooldown_ms: u64,
-	/// Trusted cluster verifying keys (SEC1-encoded public keys)
-	/// Required for receiving authenticated ClusterCommand messages.
-	/// If empty, all cluster commands will be rejected.
-	pub trusted_cluster_keys: Vec<Vec<u8>>,
 	/// Max connections per servlet for forwarding (default: 8)
 	pub servlet_pool_size: usize,
 	/// Idle timeout for pooled connections (default: 30s)
 	pub servlet_pool_idle_timeout: Option<Duration>,
 	/// Drain timeout before force-stop (default: 30s)
 	pub drain_timeout: Duration,
+	/// Trust store for certificate-based cluster command authentication.
+	/// Required for receiving authenticated ClusterCommand messages.
+	/// If None, all cluster commands will be rejected.
+	#[cfg(feature = "x509")]
+	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 	/// TLS configuration for spawned servlets (default: None = plain transport)
 	#[cfg(feature = "x509")]
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
@@ -237,10 +238,11 @@ impl Default for HiveConf {
 			backpressure_threshold: BasisPoints::new(DEFAULT_BACKPRESSURE_THRESHOLD_BPS),
 			circuit_breaker_threshold: 3,
 			circuit_breaker_cooldown_ms: 30_000,
-			trusted_cluster_keys: Vec::new(),
 			servlet_pool_size: 8,
 			servlet_pool_idle_timeout: Some(Duration::from_secs(30)),
 			drain_timeout: Duration::from_secs(30),
+			#[cfg(feature = "x509")]
+			trust_store: None,
 			#[cfg(feature = "x509")]
 			hive_tls: None,
 		}

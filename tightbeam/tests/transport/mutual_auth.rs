@@ -20,9 +20,15 @@ use tightbeam::{
 	colony::servlet::ServletConf,
 	compose,
 	crypto::{
+		hash::Sha3_256,
 		key::SigningKeySpec,
+		policy::Secp256k1Policy,
 		sign::ecdsa::Secp256k1,
-		x509::{policy::PublicKeyPinning, CertificateSpec},
+		x509::{
+			policy::PublicKeyPinning,
+			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+			Certificate, CertificateSpec,
+		},
 	},
 	decode, exactly, hex,
 	prelude::*,
@@ -75,6 +81,19 @@ const CLIENT_KEY: SigningKeySpec =
 const CLIENT_PUB_KEY: &[u8] = &hex!("044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0");
 // Server-side pinning: validate incoming client certificates
 const CLIENT_PINNING: PublicKeyPinning<1> = PublicKeyPinning::new([CLIENT_PUB_KEY]);
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+fn make_server_trust_store() -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
+	let server_cert = Certificate::try_from(SERVER_CERT)?;
+	Ok(Arc::new(
+		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			.with_certificate(server_cert)?
+			.build(),
+	))
+}
 
 // ============================================================================
 // Message Types
@@ -150,7 +169,7 @@ tb_scenario! {
 		},
 		setup: |addr, _config| async move {
 			let builder = ClientBuilder::<TokioListener>::builder()
-				.with_server_certificate(SERVER_CERT)?
+				.with_trust_store(make_server_trust_store()?)
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 
@@ -227,7 +246,7 @@ tb_scenario! {
 			// Client with invalid cert - should fail during handshake
 			let certificate = CertificateSpec::Built(Box::new(invalid_cert));
 			let builder = ClientBuilder::<TokioListener>::builder()
-				.with_server_certificate(SERVER_CERT)?
+				.with_trust_store(make_server_trust_store()?)
 				.with_client_identity(certificate, INVALID_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 
@@ -284,7 +303,7 @@ tb_scenario! {
 		setup: |addr, _config| async move {
 			// Client expects SERVER_CERT, but server presents different cert - should fail during handshake
 			let builder = ClientBuilder::<TokioListener>::builder()
-				.with_server_certificate(SERVER_CERT)?
+				.with_trust_store(make_server_trust_store()?)
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 

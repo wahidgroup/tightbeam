@@ -21,6 +21,8 @@ use crate::transport::protocols::{PersistentConnection, Protocol};
 use crate::transport::{MessageCollector, MessageEmitter, TransportResult, X509ClientConfig};
 
 #[cfg(feature = "x509")]
+use crate::crypto::x509::store::CertificateTrust;
+#[cfg(feature = "x509")]
 use crate::crypto::x509::Certificate;
 #[cfg(not(feature = "x509"))]
 use crate::transport::client::ClientBuilder;
@@ -36,13 +38,9 @@ pub trait ConnectionBuilder<P: Protocol>: Sized {
 	/// Configure timeout for operations
 	fn with_timeout(self, timeout: Duration) -> Self;
 
-	/// Configure server certificate for TLS validation
+	/// Configure trust store for server certificate validation
 	#[cfg(feature = "x509")]
-	fn with_server_certificate(self, cert: CertificateSpec) -> TransportResult<Self>;
-
-	/// Configure multiple server certificates for TLS validation
-	#[cfg(feature = "x509")]
-	fn with_server_certificates(self, certs: impl IntoIterator<Item = CertificateSpec>) -> TransportResult<Self>;
+	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
 	/// Configure client identity for mutual TLS
 	#[cfg(feature = "x509")]
@@ -80,14 +78,14 @@ struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
 #[derive(Clone, Default)]
 /// Shared TLS assets reused across pooled connections without reallocations.
 struct PoolTlsConfig<C: CryptoProvider = DefaultCryptoProvider> {
-	server_certificates: Vec<Arc<Certificate>>,
+	trust_store: Option<Arc<dyn CertificateTrust>>,
 	client_identity: Option<ClientIdentity<C>>,
 }
 
 #[cfg(feature = "x509")]
 impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
-	fn push_server_certificate(&mut self, cert: Certificate) {
-		self.server_certificates.push(Arc::new(cert));
+	fn set_trust_store(&mut self, store: Arc<dyn CertificateTrust>) {
+		self.trust_store = Some(store);
 	}
 
 	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager<C>) {
@@ -100,10 +98,8 @@ impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 		Pro::Transport: MessageEmitter + MessageCollector + PolicyConf + X509ClientConfig<CryptoProvider = C>,
 	{
 		let mut configured = transport;
-
-		if !self.server_certificates.is_empty() {
-			let certs: Vec<_> = self.server_certificates.iter().map(|cert| (**cert).clone()).collect();
-			configured = configured.with_server_certificates(certs);
+		if let Some(store) = &self.trust_store {
+			configured = configured.with_trust_store(Arc::clone(store));
 		}
 
 		if let Some(identity) = &self.client_identity {
@@ -154,20 +150,9 @@ impl<P: Protocol, C: CryptoProvider + Send + Sync + 'static> ConnectionBuilder<P
 	}
 
 	#[cfg(feature = "x509")]
-	fn with_server_certificate(mut self, cert: CertificateSpec) -> TransportResult<Self> {
-		let converted = Certificate::try_from(cert)?;
-		self.tls.push_server_certificate(converted);
-		Ok(self)
-	}
-
-	#[cfg(feature = "x509")]
-	fn with_server_certificates(mut self, certs: impl IntoIterator<Item = CertificateSpec>) -> TransportResult<Self> {
-		for cert_spec in certs {
-			let cert = Certificate::try_from(cert_spec)?;
-			self.tls.push_server_certificate(cert);
-		}
-
-		Ok(self)
+	fn with_trust_store(mut self, store: Arc<dyn CertificateTrust>) -> Self {
+		self.tls.set_trust_store(store);
+		self
 	}
 
 	#[cfg(feature = "x509")]

@@ -1,7 +1,6 @@
 use crate::asn1::OctetString;
 use crate::crypto::profiles::SecurityProfile;
-use crate::der::EncodeValue;
-use crate::der::Tagged;
+use crate::der::{Encode, EncodeValue, Tagged};
 use crate::error::Result;
 use crate::{Frame, Metadata, TightBeamError, Version};
 
@@ -71,6 +70,26 @@ impl Frame {
 		self.nonrepudiation.as_ref()
 	}
 
+	/// Encode the Frame for signature verification (TBS - to-be-signed)
+	/// This excludes the signature field to avoid cloning the entire structure
+	pub fn to_tbs(&self) -> Result<Vec<u8>> {
+		// Manually encode the sequence without the signature field
+		let mut tbs_data = Vec::new();
+
+		// Encode version, metadata, and message
+		self.version.encode(&mut tbs_data)?;
+		self.metadata.encode(&mut tbs_data)?;
+		self.message.encode(&mut tbs_data)?;
+
+		// Encode integrity if present (context-specific tag 0)
+		if let Some(ref integrity) = self.integrity {
+			self.encode_tagged_integrity(&mut tbs_data, integrity)?;
+		}
+
+		// Wrap in sequence
+		self.wrap_in_sequence(tbs_data)
+	}
+
 	/// Verify the signature of the TightBeam message
 	///
 	/// This verifies the signature against the entire TightBeam structure.
@@ -97,7 +116,7 @@ impl Frame {
 		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;
 
 		// Encode TBS (to-be-signed) structure without cloning - skip the signature field
-		let tbs_der = self.encode_tbs()?;
+		let tbs_der = self.to_tbs()?;
 
 		// Verify signature
 		verifier.verify(&tbs_der, &signature)?;
@@ -105,32 +124,8 @@ impl Frame {
 		Ok(())
 	}
 
-	/// Encode the Frame for signature verification (TBS - to-be-signed)
-	/// This excludes the signature field to avoid cloning the entire structure
-	fn encode_tbs(&self) -> Result<Vec<u8>> {
-		use crate::der::Encode;
-
-		// Manually encode the sequence without the signature field
-		let mut tbs_data = Vec::new();
-
-		// Encode version, metadata, and message
-		self.version.encode(&mut tbs_data)?;
-		self.metadata.encode(&mut tbs_data)?;
-		self.message.encode(&mut tbs_data)?;
-
-		// Encode integrity if present (context-specific tag 0)
-		if let Some(ref integrity) = self.integrity {
-			self.encode_tagged_integrity(&mut tbs_data, integrity)?;
-		}
-
-		// Wrap in sequence
-		self.wrap_in_sequence(tbs_data)
-	}
-
 	/// Encode integrity field with context-specific tagging
 	fn encode_tagged_integrity(&self, buffer: &mut Vec<u8>, integrity: &crate::DigestInfo) -> Result<()> {
-		use crate::der::Encode;
-
 		let integrity_bytes = integrity.to_der()?;
 
 		let mut tagged_integrity = Vec::new();
@@ -146,8 +141,6 @@ impl Frame {
 
 	/// Wrap data in a DER sequence
 	fn wrap_in_sequence(&self, data: Vec<u8>) -> Result<Vec<u8>> {
-		use crate::der::Encode;
-
 		let mut buffer = Vec::new();
 		let sequence_len = crate::der::Length::try_from(data.len())?;
 
