@@ -20,7 +20,7 @@ use tightbeam::{
 	colony::servlet::ServletConf,
 	compose,
 	crypto::{
-		key::KeySpec,
+		key::SigningKeySpec,
 		sign::ecdsa::Secp256k1,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
@@ -66,8 +66,10 @@ const CLIENT_CERT: CertificateSpec = CertificateSpec::Pem(
 "#,
 );
 
-const SERVER_KEY: KeySpec = KeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
-const CLIENT_KEY: KeySpec = KeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
+const SERVER_KEY: SigningKeySpec =
+	SigningKeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
+const CLIENT_KEY: SigningKeySpec =
+	SigningKeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
 
 // Client public key for server-side validation
 const CLIENT_PUB_KEY: &[u8] = &hex!("044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0");
@@ -216,7 +218,7 @@ tb_scenario! {
 		},
 		setup: |addr, _config| async move {
 			use tightbeam::testing::utils::{create_test_signing_key, create_test_certificate};
-			const INVALID_KEY: KeySpec = KeySpec::Bytes(&hex!("9999999999999999999999999999999999999999999999999999999999999999"));
+			const INVALID_KEY: SigningKeySpec = SigningKeySpec::Bytes(&hex!("9999999999999999999999999999999999999999999999999999999999999999"));
 
 			// Create invalid client cert
 			let invalid_key = create_test_signing_key();
@@ -265,7 +267,7 @@ tb_scenario! {
 		servlet: MutualAuthServlet,
 		start: |trace, _config| async move {
 			use tightbeam::testing::utils::{create_test_signing_key, create_test_certificate};
-			const INVALID_SERVER_KEY: KeySpec = KeySpec::Bytes(&hex!("8888888888888888888888888888888888888888888888888888888888888888"));
+			const INVALID_SERVER_KEY: SigningKeySpec = SigningKeySpec::Bytes(&hex!("8888888888888888888888888888888888888888888888888888888888888888"));
 
 			// Server uses different cert than client expects
 			let invalid_server_key = create_test_signing_key();

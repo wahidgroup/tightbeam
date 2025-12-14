@@ -35,7 +35,7 @@ use tightbeam::{
 #[cfg(feature = "x509")]
 use tightbeam::{
 	crypto::{
-		key::KeySpec,
+		key::SigningKeySpec,
 		sign::ecdsa::Secp256k1,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
@@ -84,10 +84,12 @@ AwQDCgNIADBFAiEA0HI5WVq8ch27rQx7SO+hGwsQGLGHHvc34pfa7MQ3R4kCICJP
 );
 
 #[cfg(feature = "x509")]
-const SERVER_KEY: KeySpec = KeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
+const SERVER_KEY: SigningKeySpec =
+	SigningKeySpec::Bytes(&hex!("0101010101010101010101010101010101010101010101010101010101010101"));
 
 #[cfg(feature = "x509")]
-const CLIENT_KEY: KeySpec = KeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
+const CLIENT_KEY: SigningKeySpec =
+	SigningKeySpec::Bytes(&hex!("0202020202020202020202020202020202020202020202020202020202020202"));
 
 #[cfg(feature = "x509")]
 const CLIENT_PUB_KEY: &[u8] = &hex!("044d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d07662a3eada2d0fe208b6d257ceb0f064284662e857f57b66b54c198bd310ded36d0");

@@ -23,7 +23,7 @@ use crate::crypto::aead::{Aead, Aes256Gcm, Key, KeyInit, Nonce, Payload};
 use crate::crypto::ecies::EciesError;
 use crate::crypto::ecies::{EciesMessageOps, Secp256k1EciesMessage};
 use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256};
-use crate::crypto::key::KeyProvider;
+use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
@@ -58,7 +58,7 @@ where
 	P: CryptoProvider,
 {
 	state: ServerStateMachine,
-	server_key_provider: Arc<dyn KeyProvider>,
+	server_key_provider: Arc<dyn SigningKeyProvider>,
 	server_cert: Arc<Certificate>,
 	client_random: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
@@ -87,7 +87,7 @@ where
 	/// - `aad_domain_tag`: Optional domain tag for ECIES decryption (defaults to `TIGHTBEAM_AAD_DOMAIN_TAG`)
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
-		server_key_provider: Arc<dyn KeyProvider>,
+		server_key_provider: Arc<dyn SigningKeyProvider>,
 		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<&'static [u8]>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,

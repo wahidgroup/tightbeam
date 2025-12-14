@@ -192,7 +192,7 @@ impl CertificateTrust for CertificateTrustStore {
 			let signature_bytes = cert.signature.raw_bytes();
 
 			self.policy
-				.verify_signature(&algorithm_oid, &public_key_der, &message, &signature_bytes)
+				.verify_signature(&algorithm_oid, &public_key_der, &message, signature_bytes)
 		})
 	}
 }

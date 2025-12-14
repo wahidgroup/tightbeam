@@ -109,6 +109,63 @@ macro_rules! impl_from {
 			}
 		}
 	};
+
+	// Pattern for unit variants (discard the error value)
+	($from_type:ty => $target:ident::$variant:ident discard) => {
+		impl From<$from_type> for $target {
+			fn from(_: $from_type) -> Self {
+				$target::$variant
+			}
+		}
+	};
+
+	// Pattern for unit variants with cfg (discard the error value)
+	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident discard) => {
+		#[cfg($feature)]
+		impl From<$from_type> for $target {
+			fn from(_: $from_type) -> Self {
+				$target::$variant
+			}
+		}
+	};
+
+	// Pattern for generic types to unit variants (e.g., PoisonError<T>)
+	(<$($gen:ident),+> $from_type:ty => $target:ident::$variant:ident discard) => {
+		impl<$($gen),+> From<$from_type> for $target {
+			fn from(_: $from_type) -> Self {
+				$target::$variant
+			}
+		}
+	};
+
+	// Pattern for generic types to unit variants with cfg
+	(#[cfg($feature:meta)] <$($gen:ident),+> $from_type:ty => $target:ident::$variant:ident discard) => {
+		#[cfg($feature)]
+		impl<$($gen),+> From<$from_type> for $target {
+			fn from(_: $from_type) -> Self {
+				$target::$variant
+			}
+		}
+	};
+
+	// Pattern for transformative conversions (wrap error via expression)
+	($from_type:ty => $target:ident::$variant:ident via |$err:ident| $transform:expr) => {
+		impl From<$from_type> for $target {
+			fn from($err: $from_type) -> Self {
+				$target::$variant($transform)
+			}
+		}
+	};
+
+	// Pattern for transformative conversions with cfg
+	(#[cfg($feature:meta)] $from_type:ty => $target:ident::$variant:ident via |$err:ident| $transform:expr) => {
+		#[cfg($feature)]
+		impl From<$from_type> for $target {
+			fn from($err: $from_type) -> Self {
+				$target::$variant($transform)
+			}
+		}
+	};
 }
 
 /// Macro to implement TryFrom trait for extracting optional fields

@@ -12,7 +12,7 @@ use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfo};
 use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
-use crate::crypto::key::KeyProvider;
+use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -50,7 +50,7 @@ where
 	P: CryptoProvider,
 {
 	state: ClientStateMachine,
-	client_key_provider: Arc<dyn KeyProvider>,
+	client_key_provider: Arc<dyn SigningKeyProvider>,
 	client_certificate: Option<Arc<Certificate>>,
 	server_cert: Arc<Certificate>,
 	transcript_hash: Option<[u8; 32]>,
@@ -86,7 +86,7 @@ where
 	/// The transcript hash is computed internally from handshake messages.
 	/// If you need to provide an external transcript hash (for testing),
 	/// use `with_transcript_hash()` after construction.
-	pub fn new(provider: P, client_key_provider: Arc<dyn KeyProvider>, server_cert: Arc<Certificate>) -> Self {
+	pub fn new(provider: P, client_key_provider: Arc<dyn SigningKeyProvider>, server_cert: Arc<Certificate>) -> Self {
 		Self {
 			state: ClientStateMachine::default(),
 			client_key_provider,

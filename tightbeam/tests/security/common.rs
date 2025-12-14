@@ -15,7 +15,7 @@ use tightbeam::{
 		hash::Sha3_256,
 		kdf::{HkdfSha3_256, HkdfSha3_256Oid},
 		kem::Kyber1024Oid,
-		key::{KeyProvider, Secp256k1KeyProvider},
+		key::{Secp256k1KeyProvider, SigningKeyProvider},
 		profiles::{
 			AeadProvider, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
 			SecurityProfile, SecurityProfileDesc, SigningProvider, TightbeamProfile,
@@ -173,7 +173,7 @@ pub trait HandshakeProtocol: Send {
 #[derive(Clone)]
 pub struct ServerMaterials {
 	pub certificate: Arc<Certificate>,
-	pub key_provider: Arc<dyn KeyProvider>,
+	pub key_provider: Arc<dyn SigningKeyProvider>,
 }
 
 impl ServerMaterials {
@@ -181,7 +181,7 @@ impl ServerMaterials {
 		let signing_key = create_test_signing_key();
 		let certificate = Arc::new(create_test_certificate(&signing_key));
 		let server_key = Secp256k1SigningKey::from(signing_key);
-		let provider: Arc<dyn KeyProvider> = Arc::new(Secp256k1KeyProvider::from(server_key));
+		let provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(server_key));
 		Self { certificate, key_provider: provider }
 	}
 }
@@ -609,7 +609,7 @@ impl CmsSession {
 		let client_key = create_test_signing_key();
 		let client_cert = Arc::new(create_test_certificate(&client_key));
 		let client_key = Secp256k1SigningKey::from(client_key);
-		let client_provider: Arc<dyn KeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
+		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
 
 		// Use internal transcript computation for proper replay detection
 		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(

@@ -20,22 +20,48 @@ use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
 
-use crate::crypto::sign::ecdsa::{
-	DigestPrimitive, Secp256k1Signature, Secp256k1SigningKey, SignPrimitive, Signature, SignatureSize, SigningKey,
-	VerifyPrimitive,
-};
-use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
-use crate::crypto::sign::elliptic_curve::generic_array::{ArrayLength, GenericArray};
-use crate::crypto::sign::elliptic_curve::ops::{Invert, Reduce};
-use crate::crypto::sign::elliptic_curve::point::PointCompression;
-use crate::crypto::sign::elliptic_curve::scalar::Scalar;
-use crate::crypto::sign::elliptic_curve::sec1::ModulusSize;
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::subtle::CtOption;
-use crate::crypto::sign::elliptic_curve::{AffinePoint, CurveArithmetic, FieldBytesSize, PrimeCurve, PublicKey};
-use crate::crypto::sign::{Keypair, SignatureAlgorithmIdentifier, SignatureEncoding, Signer};
-use crate::der::oid::AssociatedOid;
-use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
+#[cfg(feature = "signature")]
+mod signing {
+	pub use crate::crypto::sign::ecdsa::{
+		DigestPrimitive, Secp256k1, Secp256k1Signature, Secp256k1SigningKey, SignPrimitive, Signature, SignatureSize,
+		SigningKey, VerifyPrimitive,
+	};
+	pub use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
+	pub use crate::crypto::sign::elliptic_curve::generic_array::{ArrayLength, GenericArray};
+	pub use crate::crypto::sign::elliptic_curve::ops::{Invert, Reduce};
+	pub use crate::crypto::sign::elliptic_curve::point::PointCompression;
+	pub use crate::crypto::sign::elliptic_curve::scalar::Scalar;
+	pub use crate::crypto::sign::elliptic_curve::sec1::ModulusSize;
+	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+	pub use crate::crypto::sign::elliptic_curve::subtle::CtOption;
+	pub use crate::crypto::sign::elliptic_curve::{
+		AffinePoint, CurveArithmetic, Error as EllipticCurveError, FieldBytesSize, PrimeCurve, PublicKey,
+	};
+	pub use crate::crypto::sign::{
+		Error as SignatureError, Keypair, SignatureAlgorithmIdentifier, SignatureEncoding, Signer,
+	};
+}
+
+#[cfg(feature = "signature")]
+use signing::*;
+
+#[cfg(feature = "aead")]
+mod encryption {
+	pub use crate::crypto::aead::{
+		Aead, AeadCore, Aes128Gcm, Aes128cmOid, Aes256Gcm, Aes256GcmOid, Error as AeadError, Nonce,
+	};
+	pub use crate::crypto::common::typenum::Unsigned;
+}
+
+#[cfg(feature = "aead")]
+use encryption::*;
+
+mod common {
+	pub use crate::der::oid::AssociatedOid;
+	pub use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
+}
+
+use common::*;
 
 #[cfg(feature = "derive")]
 use crate::Errorizable;
@@ -54,14 +80,30 @@ pub enum KeyError {
 	SpkiError(crate::spki::Error),
 
 	/// Elliptic curve operation error
+	#[cfg(feature = "signature")]
 	#[cfg_attr(feature = "derive", error("Elliptic curve error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	EllipticCurveError(crate::crypto::sign::elliptic_curve::Error),
+	EllipticCurveError(EllipticCurveError),
 
 	/// Signature/ECDSA error (e.g., invalid key bytes)
+	#[cfg(feature = "signature")]
 	#[cfg_attr(feature = "derive", error("Signature error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	SignatureError(crate::crypto::sign::Error),
+	SignatureError(SignatureError),
+
+	/// AEAD encryption/decryption error
+	#[cfg(feature = "aead")]
+	#[cfg_attr(feature = "derive", error("AEAD error: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	AeadError(AeadError),
+
+	/// Nonce length mismatch
+	#[cfg(feature = "aead")]
+	#[cfg_attr(
+		feature = "derive",
+		error("Nonce length mismatch: expected {expected}, got {received}")
+	)]
+	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 
 	/// Operation not supported by this key provider
 	#[cfg_attr(feature = "derive", error("Operation not supported by this key provider"))]
@@ -73,8 +115,14 @@ impl core::fmt::Display for KeyError {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
 			KeyError::SpkiError(e) => write!(f, "SPKI error: {}", e),
+			#[cfg(feature = "signature")]
 			KeyError::EllipticCurveError(e) => write!(f, "Elliptic curve error: {}", e),
+			#[cfg(feature = "signature")]
 			KeyError::SignatureError(e) => write!(f, "Signature error: {}", e),
+			#[cfg(feature = "aead")]
+			KeyError::AeadError(e) => write!(f, "AEAD error: {}", e),
+			#[cfg(feature = "aead")]
+			KeyError::NonceLengthError(e) => write!(f, "Nonce length mismatch: {}", e),
 			KeyError::UnsupportedOperation => write!(f, "Operation not supported by this key provider"),
 		}
 	}
@@ -83,20 +131,22 @@ impl core::fmt::Display for KeyError {
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for KeyError {}
 
-/// Specification for providing a cryptographic key in various formats.
+/// Specification for providing a cryptographic signing key in various formats.
 ///
 /// This enum allows keys to be specified in multiple ways for flexible
 /// configuration in const contexts (e.g., servlet! macro).
+#[cfg(feature = "signature")]
 #[derive(Debug, Clone)]
-pub enum KeySpec {
+pub enum SigningKeySpec {
 	/// Raw key bytes (e.g., secp256k1 scalar - 32 bytes)
 	Bytes(&'static [u8]),
 
 	/// Key provider instance (for HSM/KMS)
-	Provider(Arc<dyn KeyProvider>),
+	Provider(Arc<dyn SigningKeyProvider>),
 }
 
-impl KeySpec {
+#[cfg(feature = "signature")]
+impl SigningKeySpec {
 	/// Convert this key specification to a key provider for the given ECDSA curve.
 	///
 	/// For `KeySpec::Bytes`, constructs an ECDSA signing key from the raw bytes
@@ -106,14 +156,7 @@ impl KeySpec {
 	/// # Type Parameters
 	///
 	/// * `C` - The elliptic curve type (e.g., `k256::Secp256k1`)
-	///
-	/// # Example
-	///
-	/// ```ignore
-	/// use k256::Secp256k1;
-	/// let provider = KEY_SPEC.to_provider::<Secp256k1>()?;
-	/// ```
-	pub fn to_provider<C>(&self) -> Result<Arc<dyn KeyProvider>, KeyError>
+	pub fn to_provider<C>(&self) -> Result<Arc<dyn SigningKeyProvider>, KeyError>
 	where
 		C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
 		Scalar<C>: Invert<Output = CtOption<Scalar<C>>> + SignPrimitive<C> + Reduce<C::Uint>,
@@ -125,12 +168,12 @@ impl KeySpec {
 		Signature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync + 'static,
 	{
 		match self {
-			KeySpec::Bytes(bytes) => {
+			SigningKeySpec::Bytes(bytes) => {
 				let field_bytes = GenericArray::from_slice(bytes);
 				let signing_key = SigningKey::<C>::from_bytes(field_bytes)?;
 				Ok(Arc::new(EcdsaKeyProvider::from(signing_key)))
 			}
-			KeySpec::Provider(provider) => Ok(Arc::clone(provider)),
+			SigningKeySpec::Provider(provider) => Ok(Arc::clone(provider)),
 		}
 	}
 }
@@ -138,12 +181,10 @@ impl KeySpec {
 /// Trait for pluggable cryptographic key backends.
 ///
 /// Implementations of this trait provide access to private key operations
-/// (key agreement, signing) without exposing the raw key material. This enables
-/// integration with Hardware Security Modules (HSMs), Key Management Services
-/// (KMS), and secure enclaves where private keys cannot leave the secure boundary.
-///
-/// All operations return boxed futures to maintain object safety.
-/// All values use byte representations for algorithm agnosticism.
+/// (key agreement, signing) without exposing the raw key material. This
+/// enables integration with Hardware Security Modules (HSMs), Key Management
+/// Services (KMS), and secure enclaves where private keys cannot leave the
+/// secure boundary.
 ///
 /// # Security Properties
 ///
@@ -151,7 +192,8 @@ impl KeySpec {
 /// - **Uniform Interface**: In-memory and remote backends use identical APIs
 /// - **Async by Default**: All operations async for maximum flexibility
 /// - **Algorithm Agnostic**: Byte encoding allows any signature/key algorithm
-pub trait KeyProvider: Send + Sync + Debug {
+#[cfg(feature = "signature")]
+pub trait SigningKeyProvider: Send + Sync + Debug {
 	/// Returns the algorithm identifier for this key.
 	fn algorithm(&self) -> AlgorithmIdentifierOwned;
 
@@ -210,8 +252,10 @@ pub trait KeyProvider: Send + Sync + Debug {
 ///
 /// # Security
 ///
-/// For zeroization on drop, use keys that implement `ZeroizeOnDrop` (e.g., k256's `SigningKey`).
-pub struct InMemoryKeyProvider<K, S>
+/// For zeroization on drop, use keys that implement `ZeroizeOnDrop`
+/// (e.g., k256's `SigningKey`).
+#[cfg(feature = "signature")]
+pub struct InMemorySigningKeyProvider<K, S>
 where
 	K: Signer<S> + Keypair,
 	S: SignatureEncoding,
@@ -220,17 +264,19 @@ where
 	_sig: PhantomData<S>,
 }
 
-impl<K, S> From<K> for InMemoryKeyProvider<K, S>
+#[cfg(feature = "signature")]
+impl<K, S> From<K> for InMemorySigningKeyProvider<K, S>
 where
 	K: Signer<S> + Keypair,
 	S: SignatureEncoding,
 {
 	fn from(signing_key: K) -> Self {
-		InMemoryKeyProvider { signing_key, _sig: PhantomData }
+		InMemorySigningKeyProvider { signing_key, _sig: PhantomData }
 	}
 }
 
-impl<K, S> Debug for InMemoryKeyProvider<K, S>
+#[cfg(feature = "signature")]
+impl<K, S> Debug for InMemorySigningKeyProvider<K, S>
 where
 	K: Signer<S> + Keypair + Debug,
 	S: SignatureEncoding,
@@ -242,7 +288,8 @@ where
 	}
 }
 
-impl<K, S> KeyProvider for InMemoryKeyProvider<K, S>
+#[cfg(feature = "signature")]
+impl<K, S> SigningKeyProvider for InMemorySigningKeyProvider<K, S>
 where
 	K: Signer<S> + Keypair + Send + Sync + Debug + 'static,
 	K::VerifyingKey: EncodePublicKey,
@@ -270,7 +317,8 @@ where
 }
 
 // Implement KeyProvider for Arc<InMemoryKeyProvider<K, S>> for convenience
-impl<K, S> KeyProvider for Arc<InMemoryKeyProvider<K, S>>
+#[cfg(feature = "signature")]
+impl<K, S> SigningKeyProvider for Arc<InMemorySigningKeyProvider<K, S>>
 where
 	K: Signer<S> + Keypair + Send + Sync + Debug + 'static,
 	K::VerifyingKey: EncodePublicKey,
@@ -290,11 +338,12 @@ where
 }
 
 /// Type alias for secp256k1 key provider (signing only, no ECDH)
-pub type Secp256k1Provider = InMemoryKeyProvider<Secp256k1SigningKey, Secp256k1Signature>;
+#[cfg(all(feature = "signature", feature = "secp256k1"))]
+pub type Secp256k1Provider = InMemorySigningKeyProvider<Secp256k1SigningKey, Secp256k1Signature>;
 
-// =============================================================================
+// ============================================================================
 // ECDSA Key Provider with ECDH Support (Generic)
-// =============================================================================
+// ============================================================================
 
 /// Generic ECDSA key provider with signing and key agreement (ECDH) support.
 ///
@@ -304,6 +353,7 @@ pub type Secp256k1Provider = InMemoryKeyProvider<Secp256k1SigningKey, Secp256k1S
 /// # Type Parameters
 ///
 /// * `C` - The elliptic curve type (e.g., `k256::Secp256k1`, `p256::NistP256`)
+#[cfg(all(feature = "signature", feature = "secp256k1"))]
 pub struct EcdsaKeyProvider<C>
 where
 	C: PrimeCurve + CurveArithmetic,
@@ -313,6 +363,7 @@ where
 	signing_key: SigningKey<C>,
 }
 
+#[cfg(all(feature = "signature", feature = "secp256k1"))]
 impl<C> From<SigningKey<C>> for EcdsaKeyProvider<C>
 where
 	C: PrimeCurve + CurveArithmetic,
@@ -324,6 +375,7 @@ where
 	}
 }
 
+#[cfg(all(feature = "signature", feature = "secp256k1"))]
 impl<C> Debug for EcdsaKeyProvider<C>
 where
 	C: PrimeCurve + CurveArithmetic,
@@ -337,7 +389,8 @@ where
 	}
 }
 
-impl<C> KeyProvider for EcdsaKeyProvider<C>
+#[cfg(all(feature = "signature", feature = "secp256k1"))]
+impl<C> SigningKeyProvider for EcdsaKeyProvider<C>
 where
 	C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
 	Scalar<C>: Invert<Output = CtOption<Scalar<C>>> + SignPrimitive<C> + Reduce<C::Uint>,
@@ -372,7 +425,7 @@ where
 		&self,
 		peer_public_key: &[u8],
 	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
-		let pk_result = PublicKey::<C>::from_sec1_bytes(peer_public_key).map_err(KeyError::from);
+		let pk_result = PublicKey::<C>::from_sec1_bytes(peer_public_key);
 		let secret_key = *self.signing_key.as_nonzero_scalar();
 
 		Box::pin(async move {
@@ -383,7 +436,8 @@ where
 	}
 }
 
-impl<C> KeyProvider for Arc<EcdsaKeyProvider<C>>
+#[cfg(all(feature = "signature", feature = "secp256k1"))]
+impl<C> SigningKeyProvider for Arc<EcdsaKeyProvider<C>>
 where
 	C: PrimeCurve + CurveArithmetic + DigestPrimitive + PointCompression + AssociatedOid + Send + Sync + 'static,
 	Scalar<C>: Invert<Output = CtOption<Scalar<C>>> + SignPrimitive<C> + Reduce<C::Uint>,
@@ -415,7 +469,208 @@ where
 }
 
 /// Type alias for secp256k1-specific ECDSA key provider with ECDH
-pub type Secp256k1KeyProvider = EcdsaKeyProvider<crate::crypto::sign::ecdsa::k256::Secp256k1>;
+#[cfg(feature = "signature")]
+pub type Secp256k1KeyProvider = EcdsaKeyProvider<Secp256k1>;
+
+// ============================================================================
+// EncryptingKeyProvider Trait
+// ============================================================================
+
+/// Trait for pluggable symmetric encryption key backends.
+///
+/// Implementations of this trait provide access to symmetric encryption
+/// and decryption operations without exposing the raw key material. This
+/// enables integration with Hardware Security Modules (HSMs), Key Management
+/// Services (KMS), and secure enclaves where encryption keys cannot leave the
+/// secure boundary.
+///
+/// # Security Properties
+///
+/// - **Key Encapsulation**: Encryption keys never leave the provider boundary
+/// - **Uniform Interface**: In-memory and remote backends use identical APIs
+/// - **Async by Default**: All operations async for maximum flexibility
+/// - **Algorithm Agnostic**: Byte encoding allows any AEAD cipher
+#[cfg(feature = "aead")]
+pub trait EncryptingKeyProvider: Send + Sync + Debug {
+	/// Returns the algorithm identifier for this encryption key.
+	fn algorithm(&self) -> AlgorithmIdentifierOwned;
+
+	/// Encrypts plaintext using the provided nonce.
+	///
+	/// # Arguments
+	///
+	/// * `nonce` - The nonce/IV for this encryption operation
+	/// * `plaintext` - The data to encrypt
+	///
+	/// # Returns
+	///
+	/// Encrypted ciphertext bytes (includes authentication tag for AEAD ciphers).
+	fn encrypt(
+		&self,
+		nonce: &[u8],
+		plaintext: &[u8],
+	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
+
+	/// Decrypts ciphertext using the provided nonce.
+	///
+	/// # Arguments
+	///
+	/// * `nonce` - The nonce/IV used for encryption
+	/// * `ciphertext` - The encrypted data to decrypt
+	///
+	/// # Returns
+	///
+	/// Decrypted plaintext bytes.
+	fn decrypt(
+		&self,
+		nonce: &[u8],
+		ciphertext: &[u8],
+	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
+}
+
+// =============================================================================
+// InMemoryEncryptingKeyProvider
+// =============================================================================
+
+/// In-memory encryption key provider generic over any RustCrypto AEAD cipher.
+///
+/// This is the reference implementation for [`EncryptingKeyProvider`], storing the
+/// encryption key directly in memory. Suitable for development, testing, and applications
+/// where HSM/KMS integration is not required.
+///
+/// # Type Parameters
+///
+/// * `A` - The AEAD cipher type (e.g., `Aes256Gcm`, `Aes128Gcm`)
+/// * `O` - The OID type associated with this cipher (e.g., `Aes256GcmOid`)
+///
+/// # Security
+///
+/// For zeroization on drop, use keys that implement `ZeroizeOnDrop`.
+#[cfg(feature = "aead")]
+pub struct InMemoryEncryptingKeyProvider<A, O>
+where
+	A: Aead + Send + Sync + 'static,
+	O: AssociatedOid + Send + Sync,
+{
+	cipher: A,
+	_oid: PhantomData<O>,
+}
+
+#[cfg(feature = "aead")]
+impl<A, O> From<A> for InMemoryEncryptingKeyProvider<A, O>
+where
+	A: Aead + Send + Sync + 'static,
+	O: AssociatedOid + Send + Sync,
+{
+	fn from(cipher: A) -> Self {
+		InMemoryEncryptingKeyProvider { cipher, _oid: PhantomData }
+	}
+}
+
+#[cfg(feature = "aead")]
+impl<A, O> Debug for InMemoryEncryptingKeyProvider<A, O>
+where
+	A: Aead + Send + Sync + 'static,
+	O: AssociatedOid + Send + Sync,
+{
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("InMemoryEncryptingKeyProvider")
+			.field("algorithm", &O::OID)
+			.finish_non_exhaustive()
+	}
+}
+
+#[cfg(feature = "aead")]
+impl<A, O> EncryptingKeyProvider for InMemoryEncryptingKeyProvider<A, O>
+where
+	A: Aead + Send + Sync + 'static,
+	O: AssociatedOid + Send + Sync,
+{
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		AlgorithmIdentifierOwned { oid: O::OID, parameters: None }
+	}
+
+	fn encrypt(
+		&self,
+		nonce: &[u8],
+		plaintext: &[u8],
+	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		let nonce_size = <<A as AeadCore>::NonceSize as Unsigned>::USIZE;
+		let received_len = nonce.len();
+		if received_len != nonce_size {
+			return Box::pin(async move {
+				Err(KeyError::NonceLengthError(crate::error::ReceivedExpectedError::from((
+					received_len,
+					nonce_size,
+				))))
+			});
+		}
+
+		let nonce_ref = Nonce::<A>::from_slice(nonce);
+		let result = self.cipher.encrypt(nonce_ref, plaintext).map_err(KeyError::from);
+		Box::pin(async move { result })
+	}
+
+	fn decrypt(
+		&self,
+		nonce: &[u8],
+		ciphertext: &[u8],
+	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		let nonce_size = <<A as AeadCore>::NonceSize as Unsigned>::USIZE;
+		let received_len = nonce.len();
+		if received_len != nonce_size {
+			return Box::pin(async move {
+				Err(KeyError::NonceLengthError(crate::error::ReceivedExpectedError::from((
+					received_len,
+					nonce_size,
+				))))
+			});
+		}
+
+		let nonce_ref = Nonce::<A>::from_slice(nonce);
+		let result = self.cipher.decrypt(nonce_ref, ciphertext).map_err(KeyError::from);
+		Box::pin(async move { result })
+	}
+}
+
+#[cfg(feature = "aead")]
+impl<A, O> EncryptingKeyProvider for Arc<InMemoryEncryptingKeyProvider<A, O>>
+where
+	A: Aead + Send + Sync + 'static,
+	O: AssociatedOid + Send + Sync,
+{
+	fn algorithm(&self) -> AlgorithmIdentifierOwned {
+		self.as_ref().algorithm()
+	}
+
+	fn encrypt(
+		&self,
+		nonce: &[u8],
+		plaintext: &[u8],
+	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		self.as_ref().encrypt(nonce, plaintext)
+	}
+
+	fn decrypt(
+		&self,
+		nonce: &[u8],
+		ciphertext: &[u8],
+	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		self.as_ref().decrypt(nonce, ciphertext)
+	}
+}
+
+// =============================================================================
+// AES Type Aliases
+// =============================================================================
+
+#[cfg(all(feature = "aead", feature = "aes-gcm"))]
+/// Type alias for AES-256-GCM encryption key provider
+pub type Aes256GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes256Gcm, Aes256GcmOid>;
+
+#[cfg(all(feature = "aead", feature = "aes-gcm"))]
+/// Type alias for AES-128-GCM encryption key provider
+pub type Aes128GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes128Gcm, Aes128cmOid>;
 
 #[cfg(test)]
 mod tests {
@@ -433,7 +688,6 @@ mod tests {
 		let public_key_bytes = provider.to_public_key_bytes().await?;
 		// DER-encoded SPKI for secp256k1 is 88 bytes
 		assert_eq!(public_key_bytes.len(), 88);
-
 		Ok(())
 	}
 
@@ -470,14 +724,13 @@ mod tests {
 
 		assert_eq!(shared1, shared2);
 		assert_eq!(shared1.len(), 32); // secp256k1 shared secret is 32 bytes
-
 		Ok(())
 	}
 
 	#[tokio::test]
 	async fn test_generic_provider_sign() -> Result<(), Box<dyn std::error::Error>> {
 		let signing_key = SigningKey::random(&mut OsRng);
-		let provider: Secp256k1Provider = InMemoryKeyProvider::from(signing_key.clone());
+		let provider: Secp256k1Provider = InMemorySigningKeyProvider::from(signing_key.clone());
 
 		let data = b"test data to sign";
 		let signature_bytes = provider.sign(data).await?;
@@ -515,7 +768,6 @@ mod tests {
 
 		let alg = provider.algorithm();
 		assert_eq!(alg.oid, Secp256k1Signature::ALGORITHM_OID);
-
 		Ok(())
 	}
 }

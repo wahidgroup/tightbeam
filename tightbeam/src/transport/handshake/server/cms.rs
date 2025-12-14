@@ -23,7 +23,7 @@ use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentif
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::aead::{Decryptor, KeyInit};
 use crate::crypto::hash::Digest;
-use crate::crypto::key::KeyProvider;
+use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -64,7 +64,7 @@ where
 	P: CryptoProvider,
 {
 	state: ServerStateMachine,
-	server_key_provider: Arc<dyn KeyProvider>,
+	server_key_provider: Arc<dyn SigningKeyProvider>,
 	client_cert: Option<Arc<Certificate>>,
 	validated_client_cert: Option<Arc<Certificate>>,
 	transcript_hash: Option<[u8; 32]>,
@@ -94,7 +94,7 @@ where
 	/// - `server_key_provider`: The key provider for cryptographic operations
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
 	pub fn new(
-		server_key_provider: Arc<dyn KeyProvider>,
+		server_key_provider: Arc<dyn SigningKeyProvider>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	) -> Self {
 		Self {

@@ -163,7 +163,7 @@ pub struct HiveTlsConfig {
 	/// Server certificate specification
 	pub certificate: crate::crypto::x509::CertificateSpec,
 	/// Private key provider for signing operations
-	pub key: Arc<dyn crate::crypto::key::KeyProvider>,
+	pub key: Arc<dyn crate::crypto::key::SigningKeyProvider>,
 	/// Client certificate validators (e.g., public key pinning)
 	pub validators: Vec<Arc<dyn crate::crypto::x509::policy::CertificateValidation>>,
 }

@@ -180,7 +180,7 @@ use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
 use crate::crypto::aead::{KeyInit, RuntimeAead};
 use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
-use crate::crypto::key::{KeyProvider, Secp256k1KeyProvider};
+use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -309,7 +309,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 /// get shared ownership via Arc cloning.
 #[cfg(feature = "x509")]
 pub struct HandshakeKeyManager<P: CryptoProvider> {
-	provider: Arc<dyn KeyProvider>,
+	provider: Arc<dyn SigningKeyProvider>,
 	_phantom: PhantomData<P>,
 }
 
@@ -336,15 +336,15 @@ impl From<Secp256k1KeyProvider> for HandshakeKeyManager<DefaultCryptoProvider> {
 }
 
 #[cfg(feature = "x509")]
-impl From<Arc<dyn KeyProvider>> for HandshakeKeyManager<DefaultCryptoProvider> {
-	fn from(provider: Arc<dyn KeyProvider>) -> Self {
+impl From<Arc<dyn SigningKeyProvider>> for HandshakeKeyManager<DefaultCryptoProvider> {
+	fn from(provider: Arc<dyn SigningKeyProvider>) -> Self {
 		Self { provider, _phantom: PhantomData }
 	}
 }
 
 #[cfg(feature = "x509")]
 impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
-	pub fn new(provider: Arc<dyn KeyProvider>) -> Self {
+	pub fn new(provider: Arc<dyn SigningKeyProvider>) -> Self {
 		Self { provider, _phantom: PhantomData }
 	}
 

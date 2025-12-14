@@ -104,8 +104,7 @@ impl<const N: usize> CertificateValidation for PublicKeyPinning<N> {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let pub_key_bytes = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
 		self.allowed_keys
-			.iter()
-			.any(|k| *k == pub_key_bytes)
+			.contains(&pub_key_bytes)
 			.then_some(())
 			.ok_or(CertificateValidationError::PublicKeyNotPinned)
 	}
@@ -177,11 +176,13 @@ where
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let cert_der = cert.to_der()?;
 		let fingerprint = D::digest(&cert_der);
-		self.denied_fingerprints
-			.iter()
-			.any(|fp| *fp == fingerprint.as_ref())
-			.then(|| Err(CertificateValidationError::CertificateDenied))
-			.unwrap_or(Ok(()))
+
+		let is_denied = self.denied_fingerprints.iter().any(|fp| *fp == fingerprint.as_ref());
+		if is_denied {
+			Err(CertificateValidationError::CertificateDenied)
+		} else {
+			Ok(())
+		}
 	}
 }
 

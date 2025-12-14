@@ -15,7 +15,7 @@
 
 use tightbeam::{
 	crypto::{
-		key::KeySpec,
+		key::SigningKeySpec,
 		sign::ecdsa::Secp256k1VerifyingKey,
 		x509::{policy::PublicKeyPinning, CertificateSpec},
 	},
@@ -40,8 +40,8 @@ O8ZqbdXnVBULkrLWVzUsXg==
 -----END CERTIFICATE-----"#,
 );
 
-pub const MISSION_CONTROL_KEY: KeySpec =
-	KeySpec::Bytes(&hex!("ce3c6e1d00d4b950963770268e96062a357f8b444e075ec8d35369d325213195"));
+pub const MISSION_CONTROL_KEY: SigningKeySpec =
+	SigningKeySpec::Bytes(&hex!("ce3c6e1d00d4b950963770268e96062a357f8b444e075ec8d35369d325213195"));
 
 pub const MISSION_CONTROL_PUB_KEY: &[u8] = &hex!("04f7b1990ed2940d725ee641ac684551b6499ea54ee55b5c4c7105f05087bf77599d58c9cb90447e71c5e0488999ffe34bac3b08ff228531e086466b6cddf15df0");
 
@@ -63,8 +63,8 @@ ihlyt+G86bVx
 -----END CERTIFICATE-----"#,
 );
 
-pub const EARTH_RELAY_KEY: KeySpec =
-	KeySpec::Bytes(&hex!("5c676e5bbb9d78c6f2e78d67e83052e38bea1858fd67e6e0c12b5e229eaef0ee"));
+pub const EARTH_RELAY_KEY: SigningKeySpec =
+	SigningKeySpec::Bytes(&hex!("5c676e5bbb9d78c6f2e78d67e83052e38bea1858fd67e6e0c12b5e229eaef0ee"));
 
 pub const EARTH_RELAY_PUB_KEY: &[u8] = &hex!("04be88b2dfd778906006db78ac192c522468218d8139340787079034d59a29430629a3570b6a5cd0f788c96d8614573510dd44fbf9c6a50fd7f662c03268825dff");
 
@@ -86,8 +86,8 @@ gIK96Eg=
 -----END CERTIFICATE-----"#,
 );
 
-pub const MARS_RELAY_KEY: KeySpec =
-	KeySpec::Bytes(&hex!("52c304e563d6bf2f792ddd8b6bcdd8d1a203075ca6ef66119efa7eafa9a5fb6d"));
+pub const MARS_RELAY_KEY: SigningKeySpec =
+	SigningKeySpec::Bytes(&hex!("52c304e563d6bf2f792ddd8b6bcdd8d1a203075ca6ef66119efa7eafa9a5fb6d"));
 
 pub const MARS_RELAY_PUB_KEY: &[u8] = &hex!("04314a7c1f17a970ed5ece1e6cda7950f046c5e43920bce47a7166e0b6806337a47bee2db07cc534b23e8fa0bdac7dea6770163511b7403899fea664772a904800");
 
@@ -109,8 +109,8 @@ eXamI/HCiM6bzg==
 -----END CERTIFICATE-----"#,
 );
 
-pub const ROVER_KEY: KeySpec =
-	KeySpec::Bytes(&hex!("c5d575279e5fc6c691a084db64139f237a18a7044dbd4b5bc7d00e0a21f9eb5b"));
+pub const ROVER_KEY: SigningKeySpec =
+	SigningKeySpec::Bytes(&hex!("c5d575279e5fc6c691a084db64139f237a18a7044dbd4b5bc7d00e0a21f9eb5b"));
 
 pub const ROVER_PUB_KEY: &[u8] = &hex!("048a6488041ccb629f2c2f3a8b1f06eaf155db4747993b17441b1d7b2b09b1c4da1fbb733a081f3d1cab7c40e03fdd56811348e21349f4885cc1b4a26ed7e5b3e1");
 
@@ -182,13 +182,13 @@ pub fn generate_shared_cipher() -> tightbeam::crypto::aead::Aes256Gcm {
 #[allow(dead_code)]
 pub const EARTH_CERT: CertificateSpec = EARTH_RELAY_CERT;
 #[allow(dead_code)]
-pub const EARTH_KEY: KeySpec = EARTH_RELAY_KEY;
+pub const EARTH_KEY: SigningKeySpec = EARTH_RELAY_KEY;
 #[allow(dead_code)]
 pub const EARTH_PUB_KEY: &[u8] = EARTH_RELAY_PUB_KEY;
 
 #[allow(dead_code)]
 pub const SATELLITE_CERT: CertificateSpec = MARS_RELAY_CERT;
 #[allow(dead_code)]
-pub const SATELLITE_KEY: KeySpec = MARS_RELAY_KEY;
+pub const SATELLITE_KEY: SigningKeySpec = MARS_RELAY_KEY;
 #[allow(dead_code)]
 pub const SATELLITE_PUB_KEY: &[u8] = MARS_RELAY_PUB_KEY;

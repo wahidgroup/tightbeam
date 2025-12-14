@@ -31,7 +31,7 @@ use crate::TightBeamError;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::key::KeyProvider;
+	pub use crate::crypto::key::SigningKeyProvider;
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::policy::CertificateValidation;
 	pub use crate::crypto::x509::{Certificate, CertificateSpec};
@@ -300,7 +300,7 @@ where
 	pub fn with_certificate(
 		mut self,
 		cert: CertificateSpec,
-		key: Arc<dyn KeyProvider>,
+		key: Arc<dyn SigningKeyProvider>,
 		validators: Vec<Arc<dyn CertificateValidation>>,
 	) -> Result<Self, TightBeamError> {
 		let cert_obj = Certificate::try_from(cert)?;

@@ -7,7 +7,7 @@ use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{KeyInit, RuntimeAead};
 use crate::crypto::ecies::EciesEphemeral;
 use crate::crypto::ecies::{encrypt, EciesMessageOps, EciesPublicKeyOps};
-use crate::crypto::key::KeyProvider;
+use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -45,7 +45,7 @@ where
 	selected_profile: Option<SecurityProfileDesc>,
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
 	client_certificate: Option<Arc<Certificate>>,
-	client_key_provider: Option<Arc<dyn crate::crypto::key::KeyProvider>>,
+	client_key_provider: Option<Arc<dyn crate::crypto::key::SigningKeyProvider>>,
 	_phantom_provider: ::core::marker::PhantomData<P>,
 	_phantom_message: ::core::marker::PhantomData<M>,
 	invariants: HandshakeInvariant,
@@ -103,7 +103,7 @@ where
 	pub fn new_with_identity(
 		aad_domain_tag: Option<&'static [u8]>,
 		client_certificate: Option<Arc<Certificate>>,
-		client_key_provider: Option<Arc<dyn crate::crypto::key::KeyProvider>>,
+		client_key_provider: Option<Arc<dyn crate::crypto::key::SigningKeyProvider>>,
 	) -> Self {
 		Self {
 			state: ClientStateMachine::default(),
@@ -134,7 +134,11 @@ where
 	/// # Parameters
 	/// - `certificate`: The client's X.509 certificate
 	/// - `key_provider`: The client's key provider
-	pub fn with_client_identity(mut self, certificate: Arc<Certificate>, key_provider: Arc<dyn KeyProvider>) -> Self {
+	pub fn with_client_identity(
+		mut self,
+		certificate: Arc<Certificate>,
+		key_provider: Arc<dyn SigningKeyProvider>,
+	) -> Self {
 		self.client_certificate = Some(certificate);
 		self.client_key_provider = Some(key_provider);
 		self

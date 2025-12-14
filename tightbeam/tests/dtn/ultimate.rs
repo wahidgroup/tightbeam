@@ -37,7 +37,7 @@ use tightbeam::{
 	builder::TypeBuilder,
 	crypto::{
 		aead::Aes256Gcm,
-		key::KeySpec,
+		key::SigningKeySpec,
 		sign::ecdsa::{Secp256k1, Secp256k1SigningKey},
 	},
 	error::TightBeamError,
@@ -139,7 +139,7 @@ impl Default for DtnScenarioConfig {
 
 		// Extract Rover key bytes
 		let rover_key_bytes = match ROVER_KEY {
-			KeySpec::Bytes(bytes) => bytes,
+			SigningKeySpec::Bytes(bytes) => bytes,
 			_ => panic!("ROVER_KEY must be KeySpec::Bytes"),
 		};
 
@@ -704,7 +704,7 @@ tb_scenario! {
 
 			// Mission Control: store, signing key, chain processor, frame builder
 			let mc_key_bytes = match MISSION_CONTROL_KEY {
-				KeySpec::Bytes(bytes) => bytes,
+				SigningKeySpec::Bytes(bytes) => bytes,
 				_ => panic!("MISSION_CONTROL_KEY must be KeySpec::Bytes"),
 			};
 			let mission_control_signing_key = Secp256k1SigningKey::from_slice(mc_key_bytes)?;
@@ -853,7 +853,7 @@ tb_scenario! {
 
 			// Extract Mars Relay signing key
 			let mars_relay_key_bytes = match MARS_RELAY_KEY {
-				KeySpec::Bytes(bytes) => bytes,
+				SigningKeySpec::Bytes(bytes) => bytes,
 				_ => panic!("MARS_RELAY_KEY must be KeySpec::Bytes"),
 			};
 			let mars_relay_signing_key = Secp256k1SigningKey::from_slice(mars_relay_key_bytes)?;
@@ -904,7 +904,7 @@ tb_scenario! {
 
 			// Extract Earth Relay signing key
 			let earth_relay_key_bytes = match EARTH_RELAY_KEY {
-				KeySpec::Bytes(bytes) => bytes,
+				SigningKeySpec::Bytes(bytes) => bytes,
 				_ => panic!("EARTH_RELAY_KEY must be KeySpec::Bytes"),
 			};
 			let earth_relay_signing_key = Secp256k1SigningKey::from_slice(earth_relay_key_bytes)?;

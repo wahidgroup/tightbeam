@@ -23,7 +23,7 @@ use core::future::Future;
 use core::time::Duration;
 use std::sync::Arc;
 
-use crate::crypto::key::KeyProvider;
+use crate::crypto::key::SigningKeyProvider;
 use crate::der::Sequence;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::trace::TraceCollector;
@@ -98,7 +98,7 @@ pub struct ClusterTlsConfig {
 	/// Client certificate specification for mutual TLS
 	pub certificate: CertificateSpec,
 	/// Private key provider for signing operations (supports HSM/KMS)
-	pub key: Arc<dyn KeyProvider>,
+	pub key: Arc<dyn SigningKeyProvider>,
 	/// Server certificate validators for hive connections
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
 }
@@ -408,7 +408,7 @@ mod tests {
 	/// Create a test TLS config for unit tests
 	fn create_test_tls_config() -> ClusterTlsConfig {
 		let signing_key = create_test_signing_key();
-		let key: Secp256k1SigningKey = signing_key.into();
+		let key: Secp256k1SigningKey = signing_key;
 		ClusterTlsConfig {
 			certificate: CertificateSpec::Der(&[]),
 			key: Arc::new(Secp256k1KeyProvider::from(key)),

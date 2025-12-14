@@ -29,6 +29,15 @@ impl AssociatedOid for Aes256GcmOid {
 	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46");
 }
 
+/// Wrapper type for AES-128-GCM with the OID
+#[cfg(feature = "aes-gcm")]
+pub struct Aes128cmOid;
+
+#[cfg(feature = "aes-gcm")]
+impl AssociatedOid for Aes128cmOid {
+	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.6");
+}
+
 /// Object-safe AEAD trait for runtime polymorphism.
 ///
 /// This trait provides a minimal object-safe interface for AEAD operations,
