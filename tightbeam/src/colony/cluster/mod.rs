@@ -23,7 +23,7 @@ use core::future::Future;
 use core::time::Duration;
 use std::sync::Arc;
 
-use crate::crypto::key::KeySpec;
+use crate::crypto::key::KeyProvider;
 use crate::der::Sequence;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::trace::TraceCollector;
@@ -31,6 +31,9 @@ use crate::transport::client::pool::PoolConfig;
 use crate::transport::policy::{RestartExponentialBackoff, RestartPolicy};
 use crate::transport::{Protocol, TightBeamAddress};
 use crate::Beamable;
+
+#[cfg(feature = "x509")]
+use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
 
 use super::common::{ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, LeastLoaded};
 use super::drone::LoadBalancer;
@@ -82,6 +85,35 @@ impl core::fmt::Debug for HeartbeatConf {
 	}
 }
 
+// ============================================================================
+// TLS Configuration
+// ============================================================================
+
+/// TLS configuration for cluster → hive connections
+///
+/// Contains certificate, key, and validators for encrypted transport.
+/// Used by the connection pool for mutual TLS with hives.
+#[cfg(feature = "x509")]
+pub struct ClusterTlsConfig {
+	/// Client certificate specification for mutual TLS
+	pub certificate: CertificateSpec,
+	/// Private key provider for signing operations (supports HSM/KMS)
+	pub key: Arc<dyn KeyProvider>,
+	/// Server certificate validators for hive connections
+	pub validators: Vec<Arc<dyn CertificateValidation>>,
+}
+
+#[cfg(feature = "x509")]
+impl core::fmt::Debug for ClusterTlsConfig {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		f.debug_struct("ClusterTlsConfig")
+			.field("certificate", &self.certificate)
+			.field("key", &"<KeyProvider>")
+			.field("validators", &format!("[{} validators]", self.validators.len()))
+			.finish()
+	}
+}
+
 /// Configuration for clusters
 ///
 /// Contains settings for load balancing, health checks, gateway policies,
@@ -97,32 +129,34 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded> {
 	pub pool_config: PoolConfig,
 	/// Default retry policy for all cluster → hive communication
 	pub retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
-	/// Signing key for cluster → hive messages (nonrepudiation)
-	/// Supports HSM/KMS via KeySpec::Provider
-	pub signing_key: KeySpec,
+	/// TLS configuration for cluster → hive connections
+	#[cfg(feature = "x509")]
+	pub tls: ClusterTlsConfig,
 }
 
+#[cfg(feature = "x509")]
 impl ClusterConf {
-	/// Create a new cluster configuration with the given signing key
-	pub fn new(signing_key: KeySpec) -> Self {
+	/// Create a new cluster configuration with TLS config
+	pub fn new(tls: ClusterTlsConfig) -> Self {
 		Self {
 			load_balancer: LeastLoaded,
 			heartbeat: HeartbeatConf::default(),
 			policies: Vec::new(),
 			pool_config: PoolConfig::default(),
 			retry_policy: Arc::new(RestartExponentialBackoff::default()),
-			signing_key,
+			tls,
 		}
 	}
 }
 
+#[cfg(feature = "x509")]
 impl<L: LoadBalancer> core::fmt::Debug for ClusterConf<L> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterConfig")
 			.field("heartbeat", &self.heartbeat)
 			.field("policies", &format!("[{} policies]", self.policies.len()))
 			.field("pool_config", &self.pool_config)
-			.field("signing_key", &self.signing_key)
+			.field("tls", &self.tls)
 			.finish()
 	}
 }
@@ -366,18 +400,29 @@ pub fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
 mod tests {
 	use super::*;
 	use crate::colony::common::RegisterDroneRequest;
+	use crate::crypto::key::Secp256k1KeyProvider;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::testing::create_test_signing_key;
 	use crate::utils::BasisPoints;
 
-	// Test key bytes for unit tests
-	const TEST_KEY_BYTES: &[u8] = &[1u8; 32];
+	/// Create a test TLS config for unit tests
+	fn create_test_tls_config() -> ClusterTlsConfig {
+		let signing_key = create_test_signing_key();
+		let key: Secp256k1SigningKey = signing_key.into();
+		ClusterTlsConfig {
+			certificate: CertificateSpec::Der(&[]),
+			key: Arc::new(Secp256k1KeyProvider::from(key)),
+			validators: Vec::new(),
+		}
+	}
 
 	#[test]
 	fn cluster_config_new() {
-		let config = ClusterConf::new(KeySpec::Bytes(TEST_KEY_BYTES));
+		let tls = create_test_tls_config();
+		let config = ClusterConf::new(tls);
 		assert_eq!(config.heartbeat.interval, Duration::from_secs(5));
 		assert_eq!(config.heartbeat.timeout, Duration::from_secs(15));
 		assert!(config.policies.is_empty());
-		assert!(matches!(config.signing_key, KeySpec::Bytes(_)));
 	}
 
 	#[test]

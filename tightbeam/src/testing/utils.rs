@@ -187,6 +187,117 @@ pub fn create_test_certificate(signing_key: &k256::ecdsa::SigningKey) -> crate::
 	}
 }
 
+/// A certificate chain with root -> intermediate -> leaf certificates.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub struct TestCertificateChain {
+	pub root: crate::x509::Certificate,
+	pub intermediate: crate::x509::Certificate,
+	pub leaf: crate::x509::Certificate,
+	pub root_key: k256::ecdsa::SigningKey,
+	pub intermediate_key: k256::ecdsa::SigningKey,
+	pub leaf_key: k256::ecdsa::SigningKey,
+}
+
+/// Create a valid certificate chain: root -> intermediate -> leaf.
+///
+/// All certificates have proper issuer/subject chaining and valid signatures.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub fn create_test_certificate_chain() -> TestCertificateChain {
+	use crate::crypto::sign::ecdsa::{Secp256k1, Signature, SigningKey};
+	use crate::crypto::sign::Signer;
+	use crate::der::asn1::{BitString, UtcTime};
+	use crate::der::{Decode, Encode};
+	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
+	use crate::x509::name::RdnSequence;
+	use crate::x509::serial_number::SerialNumber;
+	use crate::x509::time::{Time, Validity};
+	use crate::x509::{Certificate, TbsCertificate, Version};
+
+	// Generate keys for each level
+	let root_key = SigningKey::from_bytes(&[1u8; 32].into()).unwrap();
+	let intermediate_key = SigningKey::from_bytes(&[2u8; 32].into()).unwrap();
+	let leaf_key = SigningKey::from_bytes(&[3u8; 32].into()).unwrap();
+
+	// Use default RDN (empty) for all - they'll match for chaining
+	let name = RdnSequence::default();
+
+	// Common validity period
+	let validity = Validity {
+		not_before: Time::UtcTime(UtcTime::from_unix_duration(core::time::Duration::from_secs(0)).unwrap()),
+		not_after: Time::UtcTime(UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000)).unwrap()),
+	};
+
+	let algorithm = AlgorithmIdentifierOwned { oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
+
+	// Root certificate (self-signed)
+	let root_pub_der = root_key.verifying_key().to_public_key_der().unwrap();
+	let root_tbs = TbsCertificate {
+		version: Version::V3,
+		serial_number: SerialNumber::new(&[1]).unwrap(),
+		signature: algorithm.clone(),
+		issuer: name.clone(),
+		validity: validity.clone(),
+		subject: name.clone(),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes()).unwrap(),
+		issuer_unique_id: None,
+		subject_unique_id: None,
+		extensions: None,
+	};
+	let root_tbs_der = root_tbs.to_der().unwrap();
+	let root_sig: Signature<Secp256k1> = root_key.sign(&root_tbs_der);
+	let root = Certificate {
+		tbs_certificate: root_tbs,
+		signature_algorithm: algorithm.clone(),
+		signature: BitString::new(0, root_sig.to_vec()).unwrap(),
+	};
+
+	// Intermediate certificate (signed by root)
+	let inter_pub_der = intermediate_key.verifying_key().to_public_key_der().unwrap();
+	let inter_tbs = TbsCertificate {
+		version: Version::V3,
+		serial_number: SerialNumber::new(&[2]).unwrap(),
+		signature: algorithm.clone(),
+		issuer: name.clone(),
+		validity: validity.clone(),
+		subject: name.clone(),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes()).unwrap(),
+		issuer_unique_id: None,
+		subject_unique_id: None,
+		extensions: None,
+	};
+	let inter_tbs_der = inter_tbs.to_der().unwrap();
+	let inter_sig: Signature<Secp256k1> = root_key.sign(&inter_tbs_der);
+	let intermediate = Certificate {
+		tbs_certificate: inter_tbs,
+		signature_algorithm: algorithm.clone(),
+		signature: BitString::new(0, inter_sig.to_vec()).unwrap(),
+	};
+
+	// Leaf certificate (signed by intermediate)
+	let leaf_pub_der = leaf_key.verifying_key().to_public_key_der().unwrap();
+	let leaf_tbs = TbsCertificate {
+		version: Version::V3,
+		serial_number: SerialNumber::new(&[3]).unwrap(),
+		signature: algorithm.clone(),
+		issuer: name.clone(),
+		validity: validity.clone(),
+		subject: name.clone(),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes()).unwrap(),
+		issuer_unique_id: None,
+		subject_unique_id: None,
+		extensions: None,
+	};
+	let leaf_tbs_der = leaf_tbs.to_der().unwrap();
+	let leaf_sig: Signature<Secp256k1> = intermediate_key.sign(&leaf_tbs_der);
+	let leaf = Certificate {
+		tbs_certificate: leaf_tbs,
+		signature_algorithm: algorithm,
+		signature: BitString::new(0, leaf_sig.to_vec()).unwrap(),
+	};
+
+	TestCertificateChain { root, intermediate, leaf, root_key, intermediate_key, leaf_key }
+}
+
 #[cfg(feature = "aead")]
 pub fn create_test_cipher_key() -> (
 	crate::crypto::common::Key<crate::crypto::aead::Aes256Gcm>,

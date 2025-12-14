@@ -9,7 +9,6 @@ use core::time::Duration;
 use crate::asn1::GeneralizedTime;
 use crate::crypto::hash::Digest;
 use crate::crypto::policy::VerificationPolicy;
-use crate::crypto::sign::Verifier;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
@@ -42,34 +41,29 @@ pub trait CertificateValidation: Send + Sync {
 /// Trait for certificate validation with cryptographic signature verification.
 ///
 /// This trait extends `CertificateValidation` with the ability to verify
-/// signatures. It should only be implemented by validators that perform
-/// full PKI validation.
+/// certificate signatures using a pluggable verification policy.
 pub trait SignatureVerification: CertificateValidation {
 	/// Perform full certificate validation with cryptographic verification.
 	///
 	/// This method verifies the certificate signature using the provided
-	/// verification policy and expected public key.
+	/// verification policy and issuer's public key.
 	///
 	/// # Arguments
 	/// * `cert` - The certificate to validate
 	/// * `curr_time` - Current UNIX timestamp (seconds since epoch)
+	/// * `issuer_pub_key` - DER-encoded public key of the issuer
 	/// * `policy` - Verification policy to use for signature validation
-	/// * `expected_pub_key` - Public key expected to have signed this certificate
 	///
 	/// # Returns
 	/// * `Ok(())` if validation succeeds
 	/// * `Err(CertificateValidationError)` with specific error details
-	fn evaluate_with_crypto<P: VerificationPolicy>(
+	fn verify_with_policy(
 		&self,
 		cert: &Certificate,
 		curr_time: u64,
-		policy: &P,
-		expected_pub_key: &[u8],
-	) -> Result<(), CertificateValidationError>
-	where
-		P::VerifyingKey: Verifier<P::Signature>,
-		for<'a> P::Signature: TryFrom<&'a [u8]>,
-		for<'a> CertificateValidationError: From<<P::Signature as TryFrom<&'a [u8]>>::Error>;
+		issuer_pub_key: &[u8],
+		policy: &dyn VerificationPolicy,
+	) -> Result<(), CertificateValidationError>;
 }
 
 // ============================================================================
@@ -91,9 +85,6 @@ impl CertificateValidation for ExpiryValidator {
 
 /// Public key pinning validator with const-generic array
 ///
-/// This validator is zero-copy and const-constructible, making it suitable
-/// for use in static configurations.
-///
 /// The const generic parameter `N` specifies the number of pinned keys.
 #[derive(Debug, Clone, Copy)]
 pub struct PublicKeyPinning<const N: usize> {
@@ -112,13 +103,11 @@ impl<const N: usize> PublicKeyPinning<N> {
 impl<const N: usize> CertificateValidation for PublicKeyPinning<N> {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let pub_key_bytes = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
-		for allowed_key in &self.allowed_keys {
-			if *allowed_key == pub_key_bytes {
-				return Ok(());
-			}
-		}
-
-		Err(CertificateValidationError::PublicKeyNotPinned)
+		self.allowed_keys
+			.iter()
+			.any(|k| *k == pub_key_bytes)
+			.then_some(())
+			.ok_or(CertificateValidationError::PublicKeyNotPinned)
 	}
 }
 
@@ -153,13 +142,11 @@ where
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let cert_der = cert.to_der()?;
 		let fingerprint = D::digest(&cert_der);
-		for allowed_fp in &self.allowed_fingerprints {
-			if *allowed_fp == fingerprint.as_ref() {
-				return Ok(());
-			}
-		}
-
-		Err(CertificateValidationError::CertificateNotPinned)
+		self.allowed_fingerprints
+			.iter()
+			.any(|fp| *fp == fingerprint.as_ref())
+			.then_some(())
+			.ok_or(CertificateValidationError::CertificateNotPinned)
 	}
 }
 
@@ -190,13 +177,11 @@ where
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let cert_der = cert.to_der()?;
 		let fingerprint = D::digest(&cert_der);
-		for denied_fp in &self.denied_fingerprints {
-			if *denied_fp == fingerprint.as_ref() {
-				return Err(CertificateValidationError::CertificateDenied);
-			}
-		}
-
-		Ok(())
+		self.denied_fingerprints
+			.iter()
+			.any(|fp| *fp == fingerprint.as_ref())
+			.then(|| Err(CertificateValidationError::CertificateDenied))
+			.unwrap_or(Ok(()))
 	}
 }
 
@@ -221,12 +206,10 @@ where
 	///
 	/// Computes fingerprints for each certificate and stores them for validation.
 	pub fn from_certificates(certs: impl IntoIterator<Item = Certificate>) -> Result<Self, CertificateValidationError> {
-		let mut fingerprints = Vec::new();
-		for cert in certs {
-			let cert_der = cert.to_der()?;
-			let fingerprint = D::digest(&cert_der);
-			fingerprints.push(fingerprint.to_vec());
-		}
+		let fingerprints = certs
+			.into_iter()
+			.map(|cert| cert.to_der().map(|der| D::digest(&der).to_vec()))
+			.collect::<Result<Vec<_>, _>>()?;
 
 		Ok(Self { fingerprints, _digest: PhantomData })
 	}
@@ -248,13 +231,11 @@ where
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let cert_der = cert.to_der()?;
 		let fingerprint = D::digest(&cert_der);
-		for allowed_fp in &self.fingerprints {
-			if allowed_fp.as_slice() == fingerprint.as_ref() {
-				return Ok(());
-			}
-		}
-
-		Err(CertificateValidationError::CertificateNotPinned)
+		self.fingerprints
+			.iter()
+			.any(|fp| fp.as_slice() == fingerprint.as_ref())
+			.then_some(())
+			.ok_or(CertificateValidationError::CertificateNotPinned)
 	}
 }
 
@@ -288,20 +269,13 @@ impl CertificateValidation for FullValidator {
 }
 
 impl SignatureVerification for FullValidator {
-	fn evaluate_with_crypto<P: VerificationPolicy>(
+	fn verify_with_policy(
 		&self,
 		cert: &Certificate,
 		curr_time: u64,
-		policy: &P,
-		expected_pub_key: &[u8],
-	) -> Result<(), CertificateValidationError>
-	where
-		P::VerifyingKey: Verifier<P::Signature>,
-		for<'a> P::Signature: TryFrom<&'a [u8]>,
-		for<'a> CertificateValidationError: From<<P::Signature as TryFrom<&'a [u8]>>::Error>,
-	{
-		use crate::der::Encode;
-
+		public_key_der: &[u8],
+		policy: &dyn VerificationPolicy,
+	) -> Result<(), CertificateValidationError> {
 		// Validate expiration with provided time
 		let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
 		let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
@@ -330,19 +304,13 @@ impl SignatureVerification for FullValidator {
 		}
 
 		// Verify algorithm consistency
-		let algorithm_oid = &cert.signature_algorithm.oid;
 		if cert.signature_algorithm.oid != cert.tbs_certificate.signature.oid {
 			return Err(CertificateValidationError::AlgorithmMismatch);
 		}
 
-		let tbs_der = cert.tbs_certificate.to_der()?;
-		let signature = P::Signature::try_from(signature_bytes)?;
-		let verifying_key = policy
-			.to_verifying_key(algorithm_oid, expected_pub_key)
-			.map_err(|_| CertificateValidationError::UnsupportedAlgorithm(*algorithm_oid))?;
-
-		verifying_key.verify(&tbs_der, &signature)?;
-		Ok(())
+		// Delegate cryptographic verification to the policy
+		let message = cert.tbs_certificate.to_der()?;
+		policy.verify_signature(&cert.signature_algorithm.oid, public_key_der, &message, signature_bytes)
 	}
 }
 
@@ -370,10 +338,7 @@ impl ChainValidator {
 #[cfg(feature = "std")]
 impl CertificateValidation for ChainValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		for validator in &self.validators {
-			validator.evaluate(cert)?;
-		}
-		Ok(())
+		self.validators.iter().try_for_each(|v| v.evaluate(cert))
 	}
 }
 

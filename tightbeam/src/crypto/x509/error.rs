@@ -72,6 +72,26 @@ pub enum CertificateValidationError {
 	/// Invalid certificate encoding
 	#[cfg_attr(feature = "derive", error("Invalid certificate encoding"))]
 	InvalidCertificateEncoding,
+
+	/// Trust store is sealed and cannot be modified
+	#[cfg_attr(feature = "derive", error("Trust store is sealed"))]
+	StoreSealed,
+
+	/// Certificate not found in trust store
+	#[cfg_attr(feature = "derive", error("Certificate not trusted"))]
+	CertificateNotTrusted,
+
+	/// Invalid certificate chain (broken chain or untrusted root)
+	#[cfg_attr(feature = "derive", error("Invalid certificate chain"))]
+	InvalidChain,
+
+	/// Empty certificate chain provided
+	#[cfg_attr(feature = "derive", error("Empty certificate chain"))]
+	EmptyChain,
+
+	/// Operation not supported by this validator
+	#[cfg_attr(feature = "derive", error("Operation not supported"))]
+	UnsupportedOperation,
 }
 
 #[cfg(not(feature = "derive"))]
@@ -101,6 +121,11 @@ impl core::fmt::Display for CertificateValidationError {
 			}
 			CertificateValidationError::CertificateDenied => write!(f, "Certificate is denied"),
 			CertificateValidationError::InvalidCertificateEncoding => write!(f, "Invalid certificate encoding"),
+			CertificateValidationError::StoreSealed => write!(f, "Trust store is sealed"),
+			CertificateValidationError::CertificateNotTrusted => write!(f, "Certificate not trusted"),
+			CertificateValidationError::InvalidChain => write!(f, "Invalid certificate chain"),
+			CertificateValidationError::EmptyChain => write!(f, "Empty certificate chain"),
+			CertificateValidationError::UnsupportedOperation => write!(f, "Operation not supported"),
 		}
 	}
 }

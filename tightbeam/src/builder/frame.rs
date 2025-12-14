@@ -18,6 +18,8 @@ use crate::{Frame, Message, Metadata, Version};
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
+#[cfg(feature = "aead")]
+use crate::crypto::aead::Encryptor;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::SignatureEncoding;
 
@@ -347,12 +349,7 @@ impl<T: Message> FrameBuilder<T> {
 		let nonce = Cipher::generate_nonce(rng);
 		let message_oid = self.message_oid;
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
-			let encrypted_content = <Cipher as crate::crypto::aead::Encryptor<C>>::encrypt_content(
-				&cipher,
-				plaintext,
-				&nonce,
-				message_oid,
-			)?;
+			let encrypted_content = <Cipher as Encryptor<C>>::encrypt_content(&cipher, plaintext, &nonce, message_oid)?;
 			Ok(encrypted_content)
 		}));
 

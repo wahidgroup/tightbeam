@@ -41,6 +41,7 @@ macro_rules! cluster {
 		pub struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
 			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
+			pool: ::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>,
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
@@ -57,6 +58,7 @@ macro_rules! cluster {
 		struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
 			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
+			pool: ::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>,
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
@@ -93,6 +95,15 @@ macro_rules! cluster {
 				let registry_for_server = ::std::sync::Arc::clone(&registry);
 				let trace_for_server = ::std::sync::Arc::clone(&trace);
 
+				// Build connection pool with TLS configuration
+				let pool = {
+					use $crate::transport::client::pool::ConnectionBuilder;
+					let builder = $crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
+						.with_config(config.pool_config.clone())
+						.with_client_identity(config.tls.certificate.clone(), ::std::sync::Arc::clone(&config.tls.key))?;
+					::std::sync::Arc::new(builder.build())
+				};
+
 				// Start the gateway server
 				let server_handle = $crate::cluster!(
 					@build_gateway_server $protocol,
@@ -106,14 +117,26 @@ macro_rules! cluster {
 					let registry = ::std::sync::Arc::clone(&registry);
 					let config = ::std::sync::Arc::clone(&config);
 					let trace = ::std::sync::Arc::clone(&trace);
-					$crate::colony::servlet::servlet_runtime::rt::spawn(
-						$crate::colony::cluster::run_heartbeat_loop(registry, config, trace)
-					)
+					// For tokio: spawn takes a Future (async fn returns Future when called)
+					// For std: spawn takes FnOnce (must wrap in closure to defer execution)
+					#[cfg(feature = "tokio")]
+					{
+						$crate::colony::servlet::servlet_runtime::rt::spawn(
+							$crate::colony::cluster::run_heartbeat_loop(registry, config, trace)
+						)
+					}
+					#[cfg(all(not(feature = "tokio"), feature = "std"))]
+					{
+						$crate::colony::servlet::servlet_runtime::rt::spawn(
+							move || $crate::colony::cluster::run_heartbeat_loop(registry, config, trace)
+						)
+					}
 				};
 
 				Ok(Self {
 					registry,
 					config,
+					pool,
 					server_handle: Some(server_handle),
 					heartbeat_handle: Some(heartbeat_handle),
 					addr,

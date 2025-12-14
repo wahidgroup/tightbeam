@@ -16,13 +16,14 @@ pub mod ecdsa {
 
 // Re-exports
 pub use elliptic_curve;
-pub use signature::*;
+pub use signature::{Error, Keypair, SignatureEncoding, Signer, Verifier};
 
 use crate::cms::content_info::CmsVersion;
 use crate::cms::signed_data::{SignatureValue, SignerIdentifier, SignerInfo};
 use crate::crypto::hash::Digest;
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
+use crate::error::{Result, TightBeamError};
 use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 use crate::x509::ext::pkix::SubjectKeyIdentifier;
@@ -46,7 +47,7 @@ where
 	type DigestAlgorithm: Digest + AssociatedOid;
 
 	/// Sign data and return the signature information
-	fn to_signer_info(&self, data: impl AsRef<[u8]>) -> crate::error::Result<SignerInfo> {
+	fn to_signer_info(&self, data: impl AsRef<[u8]>) -> Result<SignerInfo> {
 		// Compute digest first
 		let mut hasher = Self::DigestAlgorithm::new();
 		hasher.update(&data);
@@ -81,7 +82,7 @@ where
 	fn signature_algorithm(&self) -> AlgorithmIdentifierOwned;
 
 	/// Get the signer's identifier
-	fn signer_identifier(&self) -> crate::error::Result<SignerIdentifier>;
+	fn signer_identifier(&self) -> Result<SignerIdentifier>;
 }
 
 #[cfg(feature = "secp256k1")]
@@ -92,13 +93,15 @@ impl Signatory<ecdsa::Signature<ecdsa::Secp256k1>> for ecdsa::SigningKey<ecdsa::
 		AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
 	}
 
-	fn signer_identifier(&self) -> crate::error::Result<SignerIdentifier> {
+	fn signer_identifier(&self) -> Result<SignerIdentifier> {
 		let verifying_key = self.verifying_key();
 		let public_key_der = verifying_key
 			.to_public_key_der()
-			.map_err(|_| crate::error::TightBeamError::SignatureEncodingError)?;
+			.map_err(|_| TightBeamError::SignatureEncodingError)?;
+
 		let mut hasher = Self::DigestAlgorithm::new();
 		hasher.update(public_key_der.as_bytes());
+
 		let skid_bytes = hasher.finalize();
 		let octet_string = OctetString::new(&skid_bytes[..20])?;
 		Ok(SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier::from(octet_string)))
@@ -110,10 +113,7 @@ pub struct Sha3Signer<'a, S>(&'a S);
 
 impl<'a, S> crate::spki::DynSignatureAlgorithmIdentifier for Sha3Signer<'a, S> {
 	fn signature_algorithm_identifier(&self) -> crate::spki::Result<crate::spki::AlgorithmIdentifierOwned> {
-		Ok(crate::spki::AlgorithmIdentifierOwned {
-			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10"), // ecdsa-with-SHA3-256
-			parameters: None,
-		})
+		Ok(crate::spki::AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None })
 	}
 }
 
@@ -145,16 +145,16 @@ impl<'a, S> From<&'a S> for Sha3Signer<'a, S> {
 
 /// Compute the SubjectKeyIdentifier-based SignerIdentifier for a Secp256k1 verifying key.
 #[cfg(feature = "secp256k1")]
-pub fn secp256k1_signer_identifier(
-	verifying_key: &ecdsa::VerifyingKey<ecdsa::Secp256k1>,
-) -> crate::error::Result<SignerIdentifier> {
+pub fn secp256k1_signer_identifier(verifying_key: &ecdsa::VerifyingKey<ecdsa::Secp256k1>) -> Result<SignerIdentifier> {
 	let public_key_der = verifying_key
 		.to_public_key_der()
-		.map_err(|_| crate::error::TightBeamError::SignatureEncodingError)?;
+		.map_err(|_| TightBeamError::SignatureEncodingError)?;
+
 	let mut hasher = sha3::Sha3_256::new();
 	hasher.update(public_key_der.as_bytes());
+
 	let skid_bytes = hasher.finalize();
-	let octet_string = OctetString::new(&skid_bytes[..20]).map_err(crate::error::TightBeamError::SerializationError)?;
+	let octet_string = OctetString::new(&skid_bytes[..20]).map_err(TightBeamError::SerializationError)?;
 	Ok(SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier::from(octet_string)))
 }
 
@@ -171,12 +171,7 @@ pub trait SignatureVerifier {
 	///
 	/// # Returns
 	/// `Ok(())` if signature is valid, `Err` otherwise
-	fn verify_signature(
-		&self,
-		content: &[u8],
-		signature: &[u8],
-		signer_id: &SignerIdentifier,
-	) -> crate::error::Result<()>;
+	fn verify_signature(&self, content: &[u8], signature: &[u8], signer_id: &SignerIdentifier) -> Result<()>;
 }
 
 /// Concrete implementation of `SignatureVerifier` for ECDSA signatures.
@@ -207,7 +202,7 @@ where
 	///
 	/// # Parameters
 	/// - `signing_key`: The signing key to derive the expected identifier from
-	pub fn from_signing_key<K>(signing_key: &K) -> crate::error::Result<Self>
+	pub fn from_signing_key<K>(signing_key: &K) -> Result<Self>
 	where
 		K: Signatory<S>,
 		K::VerifyingKey: Into<V>,
@@ -242,16 +237,11 @@ where
 	S: SignatureEncoding,
 	D: Digest,
 {
-	fn verify_signature(
-		&self,
-		content: &[u8],
-		signature_bytes: &[u8],
-		signer_id: &SignerIdentifier,
-	) -> crate::error::Result<()> {
+	fn verify_signature(&self, content: &[u8], signature_bytes: &[u8], signer_id: &SignerIdentifier) -> Result<()> {
 		// 1. Validate SID if expected
 		if let Some(ref expected_sid) = self.expected_sid {
 			if signer_id != expected_sid {
-				return Err(crate::error::TightBeamError::SignatureEncodingError);
+				return Err(TightBeamError::SignatureEncodingError);
 			}
 		}
 
@@ -261,11 +251,10 @@ where
 		let digest = hasher.finalize();
 
 		// 3. Parse and verify signature
-		let signature =
-			S::try_from(signature_bytes).map_err(|_| crate::error::TightBeamError::SignatureEncodingError)?;
+		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;
 		self.verifying_key
 			.verify(digest.as_slice(), &signature)
-			.map_err(|_| crate::error::TightBeamError::SignatureEncodingError)?;
+			.map_err(|_| TightBeamError::SignatureEncodingError)?;
 
 		Ok(())
 	}

@@ -1,4 +1,10 @@
-use crate::crypto::sign::SignatureEncoding;
+//! Cryptographic verification policies.
+//!
+//! This module provides traits for algorithm-agnostic signature verification.
+
+use core::fmt::Debug;
+
+use crate::crypto::x509::error::CertificateValidationError;
 use crate::der::oid::ObjectIdentifier;
 
 #[cfg(feature = "derive")]
@@ -24,31 +30,70 @@ impl core::fmt::Display for CryptoPolicyError {
 #[cfg(not(feature = "derive"))]
 impl core::error::Error for CryptoPolicyError {}
 
-/// Trait for cryptographic verification policies
+/// Trait for cryptographic verification policies.
 ///
-/// This trait defines how to map algorithm OIDs to concrete verification
-/// operations. Implementations specify which algorithms are accepted and
-/// how to verify signatures using those algorithms.
-pub trait VerificationPolicy {
-	/// The type of verifying key this policy produces
-	type VerifyingKey;
-	type Signature: SignatureEncoding;
-
-	/// Error type for policy operations
-	type Error;
-
-	/// Map an algorithm OID and public key bytes to a verifying key
+/// This trait defines how to verify signatures in an object-safe manner.
+/// Implementations handle algorithm-specific parsing and verification internally,
+/// allowing callers to remain algorithm-agnostic.
+///
+/// # Object Safety
+///
+/// This trait is object-safe and can be used with `Arc<dyn VerificationPolicy>`.
+pub trait VerificationPolicy: Send + Sync + Debug {
+	/// Verify a signature given algorithm OID, public key, message, and signature bytes.
+	///
+	/// The implementation handles all algorithm-specific logic internally:
+	/// - Parsing public key bytes into the appropriate key type
+	/// - Parsing signature bytes into the appropriate signature type
+	/// - Performing the cryptographic verification
 	///
 	/// # Arguments
 	/// * `algorithm_oid` - The signature algorithm OID from the certificate
-	/// * `public_key_bytes` - The raw public key bytes
+	/// * `public_key_der` - DER-encoded public key of the signer
+	/// * `message` - The message that was signed (e.g., TBS certificate DER)
+	/// * `signature` - Raw signature bytes
 	///
 	/// # Returns
-	/// * `Ok(VerifyingKey)` if the algorithm is supported and key is valid
-	/// * `Err(Error)` if the algorithm is unsupported or key is invalid
-	fn to_verifying_key(
+	/// * `Ok(())` if the signature is valid
+	/// * `Err(CertificateValidationError)` if verification fails
+	fn verify_signature(
 		&self,
 		algorithm_oid: &ObjectIdentifier,
-		public_key_bytes: &[u8],
-	) -> Result<Self::VerifyingKey, Self::Error>;
+		public_key_der: &[u8],
+		message: &[u8],
+		signature: &[u8],
+	) -> Result<(), CertificateValidationError>;
+}
+
+// ============================================================================
+// Secp256k1 Policy Implementation
+// ============================================================================
+
+/// Verification policy for secp256k1 ECDSA signatures.
+///
+/// Handles parsing and verification of secp256k1 signatures internally.
+/// Supports ECDSA signatures on the secp256k1 curve.
+#[cfg(all(feature = "secp256k1", feature = "signature"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Secp256k1Policy;
+
+#[cfg(all(feature = "secp256k1", feature = "signature"))]
+impl VerificationPolicy for Secp256k1Policy {
+	fn verify_signature(
+		&self,
+		_algorithm_oid: &ObjectIdentifier,
+		public_key_der: &[u8],
+		message: &[u8],
+		signature: &[u8],
+	) -> Result<(), CertificateValidationError> {
+		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
+		use crate::crypto::sign::Verifier;
+		use crate::spki::DecodePublicKey;
+
+		let verifying_key = Secp256k1VerifyingKey::from_public_key_der(public_key_der)?;
+		let sig = Secp256k1Signature::try_from(signature)?;
+
+		verifying_key.verify(message, &sig)?;
+		Ok(())
+	}
 }

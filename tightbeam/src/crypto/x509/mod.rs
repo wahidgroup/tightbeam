@@ -1,5 +1,6 @@
 pub mod error;
 pub mod policy;
+pub mod store;
 pub mod utils;
 
 // Re-exports
