@@ -687,6 +687,8 @@ fn format_assertion_value(value: &AssertionValue) -> String {
 		AssertionValue::IsSome => "some".to_string(),
 		AssertionValue::RatioActual(n, d) => format!("{n}/{d}"),
 		AssertionValue::RatioLimit(n, d) => format!("≤{n}/{d}"),
+		#[cfg(feature = "policy")]
+		AssertionValue::TransitStatus(status) => format!("{status:?}"),
 	}
 }
 

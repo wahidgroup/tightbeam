@@ -719,6 +719,24 @@ macro_rules! tb_scenario {
 		}
 	};
 
+	// ===== Cluster environment (async) =====
+	(
+		name: $test_name:ident,
+		config: $config:expr,
+		environment Cluster { $($env_body:tt)* }
+		$(,)?
+	) => {
+		#[cfg(feature = "tokio")]
+		#[tokio::test]
+		async fn $test_name() {
+			$crate::tb_scenario!(@execute_unified
+				name: $test_name,
+				config: $config,
+				environment Cluster { $($env_body)* }
+			)
+		}
+	};
+
 	// ===== ServiceClient environment with worker_threads =====
 	(
 		name: $test_name:ident,
@@ -946,6 +964,80 @@ macro_rules! tb_scenario {
 
 		// Stop servlet
 		servlet_instance.stop();
+
+		// Build hook context and verify
+		let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, client_result);
+
+		// Verify specs and call hooks
+		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, client_result);
+	}};
+
+	// ===== INTERNAL: Execute unified scenario for Cluster environment =====
+	(@execute_unified
+		name: $test_name:ident,
+		config: $config:expr,
+		environment Cluster {
+			cluster: $cluster_name:ident,
+			start: $start_closure:expr,
+			drones: [$($drone:ident),* $(,)?],
+			client: $client_closure:expr
+		}
+	) => {{
+		use $crate::testing::TBSpec;
+		use $crate::colony::cluster::Cluster;
+		use $crate::colony::drone::Drone;
+
+		let config = $config;
+		let trace = config.trace();
+		let trace_client = trace.share();
+		let trace_cluster = std::sync::Arc::new(trace.share());
+
+		// Get env_config as Arc for passing to closures
+		let env_config = std::sync::Arc::clone(config.env_config());
+
+		// Start cluster using start closure
+		let cluster_instance = $crate::testing::macros::__call_start_closure($start_closure, trace_cluster, std::sync::Arc::clone(&env_config))
+			.await
+			.expect("Failed to start cluster");
+		let cluster_addr = cluster_instance.addr();
+
+		// Start and register each drone with the cluster
+		let mut drone_handles: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+		$(
+			let drone_trace = std::sync::Arc::new(trace.share());
+			let drone = <$drone as $crate::colony::servlet::Servlet<_>>::start(drone_trace, None)
+				.await
+				.expect(concat!("Failed to start drone: ", stringify!($drone)));
+			drone.register_with_cluster(cluster_addr).await.expect(concat!("Failed to register drone: ", stringify!($drone)));
+			drone_handles.push(Box::new(drone));
+		)*
+
+		// Connect client to cluster gateway
+		use $crate::transport::{ClientBuilder, ConnectionBuilder};
+		let builder = ClientBuilder::<$crate::transport::tcp::r#async::TokioListener>::builder().build();
+		let client = builder.connect(cluster_addr).await.expect("Failed to connect to cluster");
+
+		// Execute client closure with proper type inference
+		fn __tb_call_cluster_client<T, F, Fut, C>(
+			closure: F,
+			trace: $crate::trace::TraceCollector,
+			client: T,
+			config: std::sync::Arc<C>,
+		) -> Fut
+		where
+			F: FnOnce($crate::trace::TraceCollector, T, std::sync::Arc<C>) -> Fut,
+			Fut: core::future::Future<Output = Result<(), $crate::TightBeamError>>,
+		{
+			closure(trace, client, config)
+		}
+
+		let client_result = __tb_call_cluster_client($client_closure, trace_client, client, env_config).await;
+
+		// Stop drones (drop handles)
+		drop(drone_handles);
+
+		// Stop cluster
+		cluster_instance.stop();
 
 		// Build hook context and verify
 		let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, client_result);

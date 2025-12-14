@@ -86,7 +86,7 @@ macro_rules! cluster {
 
 				// Bind to a port for the gateway server
 				let bind_addr = <$protocol>::default_bind_address()?;
-				let (listener, addr) = <$protocol>::bind(bind_addr).await?;
+				let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
 
 				// Create registry with timeout from config
 				let registry = ::std::sync::Arc::new(

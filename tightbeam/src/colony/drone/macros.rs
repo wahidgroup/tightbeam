@@ -1314,7 +1314,7 @@ macro_rules! drone {
 					async move {
 						drone!(
 							@handle_activation_request frame,
-							$active_servlet,
+							active_servlet,
 							trace,
 							$drone_name,
 							$($servlet_id: $servlet_name<$input>),*

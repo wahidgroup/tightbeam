@@ -9,12 +9,15 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
+#[cfg(feature = "std")]
+use std::borrow::Cow;
+
 use crate::asn1::{MessagePriority, Version};
 use crate::instrumentation::events::TIGHTBEAM_INSTRUMENTATION_NSS;
 use crate::testing::macros::Cardinality;
 
-#[cfg(feature = "std")]
-use std::borrow::Cow;
+#[cfg(feature = "policy")]
+use crate::policy::TransitStatus;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AssertionLabel {
@@ -60,6 +63,8 @@ pub enum AssertionValue {
 	IsSome,
 	RatioActual(u64, u64),
 	RatioLimit(u64, u64),
+	#[cfg(feature = "policy")]
+	TransitStatus(TransitStatus),
 }
 
 impl PartialEq for AssertionValue {
@@ -90,6 +95,8 @@ impl PartialEq for AssertionValue {
 			(Self::RatioLimit(an, ad), Self::RatioLimit(bn, bd)) => ratio_equal(*an, *ad, *bn, *bd),
 			(Self::RatioActual(an, ad), Self::RatioLimit(bn, bd)) => ratio_less_equal(*an, *ad, *bn, *bd),
 			(Self::RatioLimit(an, ad), Self::RatioActual(bn, bd)) => ratio_less_equal(*bn, *bd, *an, *ad),
+			#[cfg(feature = "policy")]
+			(Self::TransitStatus(a), Self::TransitStatus(b)) => a == b,
 			_ => false,
 		}
 	}
@@ -167,6 +174,13 @@ impl From<MessagePriority> for AssertionValue {
 impl From<Version> for AssertionValue {
 	fn from(v: Version) -> Self {
 		Self::Version(v)
+	}
+}
+
+#[cfg(feature = "policy")]
+impl From<TransitStatus> for AssertionValue {
+	fn from(status: TransitStatus) -> Self {
+		Self::TransitStatus(status)
 	}
 }
 

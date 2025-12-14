@@ -105,6 +105,17 @@ pub struct ClusterTlsConfig {
 }
 
 #[cfg(feature = "x509")]
+impl Clone for ClusterTlsConfig {
+	fn clone(&self) -> Self {
+		Self {
+			certificate: self.certificate.clone(),
+			key: Arc::clone(&self.key),
+			validators: self.validators.clone(),
+		}
+	}
+}
+
+#[cfg(feature = "x509")]
 impl core::fmt::Debug for ClusterTlsConfig {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterTlsConfig")
