@@ -1153,6 +1153,31 @@ and delegates key lifecycle management to applications:
 - **Handshake Protocols**: CMS-based and ECIES-based handshakes for session establishment
 - **Application Responsibilities**: Key generation, storage, rotation, certificate validation, revocation checking
 
+#### Trust Stores
+
+The `CertificateTrust` trait provides certificate chain verification and trust 
+anchor management. Trust stores are used for:
+- Verifying peer certificates during connection establishment
+- Validating certificate chains (root -> intermediate -> leaf)
+- Looking up signer certificates for frame signature verification
+
+**Building a Trust Store:**
+
+```rust
+let cert = Certificate::try_from(CERT_PEM)?;
+let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+    .with_certificate(cert)?
+    .build();
+```
+
+**Adding Certificate Chains:**
+
+```rust
+let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+    .with_chain(vec![root_cert, intermediate_cert, leaf_cert])?
+    .build();
+```
+
 ## 7. Security Considerations
 
 ### 7.1 Cryptographic Requirements
@@ -1777,10 +1802,10 @@ via `.builder()`, then `.connect()` retrieves connections from the pool.
 
 ```rust
 // Create shared pool with configuration (once per application)
-let pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
-	.with_config(PoolConfig::default())
-	.with_server_certificate(SERVER_CERT)?
-	.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+	.with_config(PoolConfig { max_connections: 3, ..Default::default() })
+	.with_trust_store(trust_store)
+	.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 	.with_timeout(Duration::from_millis(5000))
 	.build());
 
@@ -1792,7 +1817,7 @@ client.emit(frame, None).await?;
 ```
 
 **Configuration**:
-- `N`: Max connections per destination (const generic)
+- `PoolConfig::max_connections`: Max connections per destination (default: 64)
 - `PoolConfig::idle_timeout`: Optional connection expiration (default: None)
 
 ### 8.7 Audit
