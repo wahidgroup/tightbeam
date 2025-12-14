@@ -53,6 +53,9 @@ use crate::trace::TraceCollector;
 use crate::transport::{AsyncListenerTrait, Mycelial, Protocol};
 use crate::utils::BasisPoints;
 
+#[cfg(feature = "x509")]
+pub use crate::crypto::x509::store::CertificateTrust;
+
 // =============================================================================
 // Drone Trait
 // =============================================================================

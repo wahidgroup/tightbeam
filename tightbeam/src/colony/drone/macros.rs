@@ -1559,7 +1559,7 @@ macro_rules! drone {
 				}
 
 				// 1. Apply ClusterSecurityGate with trusted keys from HiveConf
-				let parsed_keys: Vec<$crate::crypto::sign::ecdsa::Secp256k1VerifyingKey> = $trusted_keys
+				let parsed_keys: Vec<$crate::crypto::sign::ecdsa::Secp256k1VerifyingKey> = (*$trusted_keys)
 					.iter()
 					.filter_map(|der_bytes| {
 						$crate::crypto::sign::ecdsa::Secp256k1VerifyingKey::from_sec1_bytes(der_bytes).ok()

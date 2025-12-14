@@ -92,6 +92,10 @@ pub enum CertificateValidationError {
 	/// Operation not supported by this validator
 	#[cfg_attr(feature = "derive", error("Operation not supported"))]
 	UnsupportedOperation,
+
+	/// Certificates with different fingerprints have the same SKID
+	#[cfg_attr(feature = "derive", error("SKID collision detected"))]
+	SkidCollision,
 }
 
 #[cfg(not(feature = "derive"))]
@@ -126,6 +130,7 @@ impl core::fmt::Display for CertificateValidationError {
 			CertificateValidationError::InvalidChain => write!(f, "Invalid certificate chain"),
 			CertificateValidationError::EmptyChain => write!(f, "Empty certificate chain"),
 			CertificateValidationError::UnsupportedOperation => write!(f, "Operation not supported"),
+			CertificateValidationError::SkidCollision => write!(f, "SKID collision detected"),
 		}
 	}
 }

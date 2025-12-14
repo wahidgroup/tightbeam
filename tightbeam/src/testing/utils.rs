@@ -213,13 +213,35 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 	use crate::x509::time::{Time, Validity};
 	use crate::x509::{Certificate, TbsCertificate, Version};
 
+	use crate::der::asn1::{PrintableString, SetOfVec};
+	use crate::x509::attr::AttributeTypeAndValue;
+	use crate::x509::name::RelativeDistinguishedName;
+
 	// Generate keys for each level
 	let root_key = SigningKey::from_bytes(&[1u8; 32].into()).unwrap();
 	let intermediate_key = SigningKey::from_bytes(&[2u8; 32].into()).unwrap();
 	let leaf_key = SigningKey::from_bytes(&[3u8; 32].into()).unwrap();
 
-	// Use default RDN (empty) for all - they'll match for chaining
-	let name = RdnSequence::default();
+	// Create unique Subject DNs for each certificate (CN=Root, CN=Intermediate, CN=Leaf)
+	let cn_oid = crate::der::oid::ObjectIdentifier::new_unwrap("2.5.4.3"); // commonName
+
+	let root_cn_str = PrintableString::new("Root").unwrap();
+	let root_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&root_cn_str) };
+	let root_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
+		SetOfVec::try_from(vec![root_cn]).unwrap(),
+	)]);
+
+	let inter_cn_str = PrintableString::new("Intermediate").unwrap();
+	let inter_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&inter_cn_str) };
+	let inter_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
+		SetOfVec::try_from(vec![inter_cn]).unwrap(),
+	)]);
+
+	let leaf_cn_str = PrintableString::new("Leaf").unwrap();
+	let leaf_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&leaf_cn_str) };
+	let leaf_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
+		SetOfVec::try_from(vec![leaf_cn]).unwrap(),
+	)]);
 
 	// Common validity period
 	let validity = Validity {
@@ -235,9 +257,9 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 		version: Version::V3,
 		serial_number: SerialNumber::new(&[1]).unwrap(),
 		signature: algorithm.clone(),
-		issuer: name.clone(),
+		issuer: root_name.clone(),
 		validity,
-		subject: name.clone(),
+		subject: root_name.clone(),
 		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes()).unwrap(),
 		issuer_unique_id: None,
 		subject_unique_id: None,
@@ -257,9 +279,9 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 		version: Version::V3,
 		serial_number: SerialNumber::new(&[2]).unwrap(),
 		signature: algorithm.clone(),
-		issuer: name.clone(),
+		issuer: root_name,
 		validity,
-		subject: name.clone(),
+		subject: inter_name.clone(),
 		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes()).unwrap(),
 		issuer_unique_id: None,
 		subject_unique_id: None,
@@ -279,9 +301,9 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 		version: Version::V3,
 		serial_number: SerialNumber::new(&[3]).unwrap(),
 		signature: algorithm.clone(),
-		issuer: name.clone(),
+		issuer: inter_name,
 		validity,
-		subject: name.clone(),
+		subject: leaf_name,
 		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes()).unwrap(),
 		issuer_unique_id: None,
 		subject_unique_id: None,

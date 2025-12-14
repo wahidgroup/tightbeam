@@ -50,7 +50,7 @@ impl core::fmt::Display for DroneError {
 			DroneError::NoResponse => write!(f, "No response received"),
 			DroneError::DecodeFailed => write!(f, "Message decoding failed"),
 			DroneError::LockPoisoned => write!(f, "Lock poisoned"),
-			DroneError::NoTrustedKeys => write!(f, "No trusted keys configured"),
+			DroneError::NoTrustedKeys => write!(f, "No trust store configured"),
 		}
 	}
 }

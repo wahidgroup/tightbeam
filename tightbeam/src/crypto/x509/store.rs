@@ -27,10 +27,6 @@ use std_imports::*;
 /// Fingerprint type: SHA-256 hash (32 bytes)
 pub type Fingerprint = [u8; 32];
 
-// ============================================================================
-// CertificateTrust Trait
-// ============================================================================
-
 /// Trait for certificate trust verification.
 ///
 /// Extends `CertificateValidation` with trust-based operations.
@@ -56,10 +52,6 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	fn verify_chain(&self, chain: &[Certificate]) -> Result<(), CertificateValidationError>;
 }
 
-// ============================================================================
-// TrustBuilder Trait
-// ============================================================================
-
 /// Builder trait for constructing trust stores.
 ///
 /// Validates structural correctness (expiry, issuer/subject chaining) on add.
@@ -74,7 +66,7 @@ pub trait TrustBuilder: Sized {
 	/// in the chain are added to the trust store.
 	fn with_chain(self, chain: Vec<Certificate>) -> Result<Self, CertificateValidationError>;
 
-	/// Add a single trusted certificate (root anchor).
+	/// Add a single trusted certificate (leaf certificate).
 	fn with_certificate(self, cert: Certificate) -> Result<Self, CertificateValidationError>;
 
 	/// Build the sealed trust store.
@@ -103,7 +95,7 @@ pub struct CertificateTrustStore {
 #[cfg(feature = "std")]
 impl CertificateTrustStore {
 	/// Compute SHA-256 fingerprint of a certificate's DER encoding.
-	pub fn fingerprint(cert: &Certificate) -> Result<Fingerprint, CertificateValidationError> {
+	pub fn to_fingerprint(cert: &Certificate) -> Result<Fingerprint, CertificateValidationError> {
 		let der_bytes = cert.to_der()?;
 		let hash = Sha3_256::digest(&der_bytes);
 		let mut fp = [0u8; 32];
@@ -138,29 +130,41 @@ impl Debug for CertificateTrustStore {
 	}
 }
 
-// ============================================================================
-// CertificateValidation Implementation
-// ============================================================================
-
 #[cfg(feature = "std")]
 impl CertificateValidation for CertificateTrustStore {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		validate_certificate_expiry(cert)?;
+
+		// Fast path: direct fingerprint trust
 		if self.is_trusted(cert) {
-			Ok(())
-		} else {
-			Err(CertificateValidationError::CertificateNotTrusted)
+			return Ok(());
 		}
+
+		// Chain walk: find issuer by Subject DN match
+		let issuer = self
+			.certificates
+			.values()
+			.find(|c| c.tbs_certificate.subject == cert.tbs_certificate.issuer)
+			.ok_or(CertificateValidationError::CertificateNotTrusted)?;
+
+		// Verify signature against issuer
+		let algorithm_oid = cert.signature_algorithm.oid;
+		let public_key_der = issuer.tbs_certificate.subject_public_key_info.to_der()?;
+		let message = cert.tbs_certificate.to_der()?;
+		let signature = cert.signature.raw_bytes();
+
+		self.policy
+			.verify_signature(&algorithm_oid, &public_key_der, &message, signature)?;
+
+		// Recursively validate issuer (terminates when issuer is directly trusted)
+		self.evaluate(issuer)
 	}
 }
-
-// ============================================================================
-// CertificateTrust Implementation
-// ============================================================================
 
 #[cfg(feature = "std")]
 impl CertificateTrust for CertificateTrustStore {
 	fn is_trusted(&self, cert: &Certificate) -> bool {
-		match Self::fingerprint(cert) {
+		match Self::to_fingerprint(cert) {
 			Ok(fp) => self.fingerprints.contains(&fp),
 			Err(_) => false,
 		}
@@ -221,9 +225,11 @@ impl CertificateTrustBuilder {
 
 	/// Add a single certificate (internal helper).
 	fn add_certificate_internal(&mut self, cert: Certificate) -> Result<(), CertificateValidationError> {
-		let fp = CertificateTrustStore::fingerprint(&cert)?;
+		let fp = CertificateTrustStore::to_fingerprint(&cert)?;
+
 		self.fingerprints.insert(fp);
 		self.certificates.insert(fp, cert);
+
 		Ok(())
 	}
 }
@@ -279,133 +285,170 @@ impl Debug for CertificateTrustBuilder {
 	}
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::sign::ecdsa::SigningKey;
 	use crate::testing::create_test_signing_key;
-	use crate::testing::utils::{create_test_certificate, create_test_certificate_chain};
+	use crate::testing::utils::{create_test_certificate, create_test_certificate_chain, TestCertificateChain};
 
 	type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-	fn create_test_store() -> Result<CertificateTrustStore, CertificateValidationError> {
-		let signing_key = create_test_signing_key();
-		let cert = create_test_certificate(&signing_key);
+	// ========================================================================
+	// Test Helpers
+	// ========================================================================
 
-		Ok(CertificateTrustBuilder::new(Arc::new(Secp256k1Policy))
-			.with_certificate(cert)?
-			.build())
+	fn policy() -> Arc<dyn VerificationPolicy> {
+		Arc::new(Secp256k1Policy)
 	}
 
-	#[test]
-	fn trust_store_fingerprint() -> TestResult {
-		let signing_key = create_test_signing_key();
-		let cert = create_test_certificate(&signing_key);
+	/// Which certificates to add to the trust store
+	#[derive(Debug, Clone, Copy)]
+	enum StoreCerts {
+		None,
+		Root,
+		RootAndIntermediate,
+	}
 
-		let fp = CertificateTrustStore::fingerprint(&cert)?;
-		assert_eq!(fp.len(), 32);
+	/// Which certificate to evaluate
+	#[derive(Debug, Clone, Copy)]
+	enum EvalTarget {
+		Root,
+		Intermediate,
+		Leaf,
+	}
+
+	/// Build a trust store with the specified certificates from a chain
+	fn build_store(
+		chain: &TestCertificateChain,
+		certs: StoreCerts,
+	) -> Result<CertificateTrustStore, CertificateValidationError> {
+		let mut builder = CertificateTrustBuilder::new(policy());
+		builder = match certs {
+			StoreCerts::None => builder,
+			StoreCerts::Root => builder.with_certificate(chain.root.clone())?,
+			StoreCerts::RootAndIntermediate => builder
+				.with_certificate(chain.root.clone())?
+				.with_certificate(chain.intermediate.clone())?,
+		};
+		Ok(builder.build())
+	}
+
+	/// Get the target certificate from a chain
+	fn target_cert(chain: &TestCertificateChain, target: EvalTarget) -> &Certificate {
+		match target {
+			EvalTarget::Root => &chain.root,
+			EvalTarget::Intermediate => &chain.intermediate,
+			EvalTarget::Leaf => &chain.leaf,
+		}
+	}
+
+	// ========================================================================
+	// Basic Operations
+	// ========================================================================
+
+	#[test]
+	fn fingerprint_is_32_bytes() -> TestResult {
+		let cert = create_test_certificate(&create_test_signing_key());
+		assert_eq!(CertificateTrustStore::to_fingerprint(&cert)?.len(), 32);
 		Ok(())
 	}
 
 	#[test]
-	fn trust_store_is_trusted() -> TestResult {
-		let signing_key = create_test_signing_key();
-		let cert = create_test_certificate(&signing_key);
-
-		let store = CertificateTrustBuilder::new(Arc::new(Secp256k1Policy))
-			.with_certificate(cert.clone())?
-			.build();
+	fn is_trusted_matches_fingerprint() -> TestResult {
+		let cert = create_test_certificate(&create_test_signing_key());
+		let store = CertificateTrustBuilder::new(policy()).with_certificate(cert.clone())?.build();
 		assert!(store.is_trusted(&cert));
-
-		// Different key produces different cert - should not be trusted
-		let other_key = SigningKey::from_bytes(&[2u8; 32].into())?;
-		let untrusted_cert = create_test_certificate(&other_key);
-		assert!(!store.is_trusted(&untrusted_cert));
-		Ok(())
-	}
-
-	#[test]
-	fn trust_store_evaluate() -> TestResult {
-		let signing_key = create_test_signing_key();
-		let cert = create_test_certificate(&signing_key);
-
-		let store = CertificateTrustBuilder::new(Arc::new(Secp256k1Policy))
-			.with_certificate(cert.clone())?
-			.build();
-		assert!(store.evaluate(&cert).is_ok());
-
-		// Different key produces different cert - should fail evaluate
-		let other_key = SigningKey::from_bytes(&[2u8; 32].into())?;
-		let untrusted_cert = create_test_certificate(&other_key);
-		assert!(matches!(
-			store.evaluate(&untrusted_cert),
-			Err(CertificateValidationError::CertificateNotTrusted)
-		));
-		Ok(())
-	}
-
-	#[test]
-	fn trust_store_verify_chain_empty() -> TestResult {
-		let store = create_test_store()?;
-		assert!(matches!(store.verify_chain(&[]), Err(CertificateValidationError::EmptyChain)));
-		Ok(())
-	}
-
-	#[test]
-	fn trust_store_verify_chain_untrusted_root() -> TestResult {
-		let signing_key = create_test_signing_key();
-		let root = create_test_certificate(&signing_key);
-
-		// Empty store - root not trusted
-		let store = CertificateTrustBuilder::new(Arc::new(Secp256k1Policy)).build();
-		assert!(matches!(
-			store.verify_chain(&[root]),
-			Err(CertificateValidationError::CertificateNotTrusted)
-		));
-		Ok(())
-	}
-
-	#[test]
-	fn trust_store_verify_chain_trusted_root() -> TestResult {
-		let signing_key = create_test_signing_key();
-		let root = create_test_certificate(&signing_key);
-
-		let store = CertificateTrustBuilder::new(Arc::new(Secp256k1Policy))
-			.with_certificate(root.clone())?
-			.build();
-		assert!(store.verify_chain(&[root]).is_ok());
+		assert!(!store.is_trusted(&create_test_certificate(&SigningKey::from_bytes(&[2u8; 32].into())?)));
 		Ok(())
 	}
 
 	#[test]
 	fn builder_validates_chain_structure() -> TestResult {
 		let chain = create_test_certificate_chain();
-		let result = CertificateTrustBuilder::new(Arc::new(Secp256k1Policy)).with_chain(vec![
-			chain.root,
-			chain.intermediate,
-			chain.leaf,
-		]);
+		assert!(CertificateTrustBuilder::new(policy())
+			.with_chain(vec![chain.root, chain.intermediate, chain.leaf])
+			.is_ok());
 
-		// Chain has proper issuer/subject chaining, should pass structural validation
-		assert!(result.is_ok());
+		Ok(())
+	}
+
+	/// Test cases for evaluate() with chain walking
+	const EVALUATE_CASES: &[(StoreCerts, EvalTarget, bool)] = &[
+		// Direct trust
+		(StoreCerts::Root, EvalTarget::Root, true),
+		// Chain walking: root trusts intermediate
+		(StoreCerts::Root, EvalTarget::Intermediate, true),
+		// Chain walking: root+intermediate trusts leaf
+		(StoreCerts::RootAndIntermediate, EvalTarget::Leaf, true),
+		// Fails: root alone cannot verify leaf (missing intermediate)
+		(StoreCerts::Root, EvalTarget::Leaf, false),
+		// Fails: empty store trusts nothing
+		(StoreCerts::None, EvalTarget::Leaf, false),
+	];
+
+	#[test]
+	fn evaluate_chain_walking() -> TestResult {
+		let chain = create_test_certificate_chain();
+		for (store_certs, eval_target, should_succeed) in EVALUATE_CASES {
+			let store = build_store(&chain, *store_certs)?;
+			let cert = target_cert(&chain, *eval_target);
+
+			let result = store.evaluate(cert);
+			assert_eq!(
+				result.is_ok(),
+				*should_succeed,
+				"store={store_certs:?} target={eval_target:?}: expected {should_succeed}, got {result:?}"
+			);
+		}
+
 		Ok(())
 	}
 
 	#[test]
-	fn verify_chain_with_valid_signatures() -> TestResult {
-		let chain = create_test_certificate_chain();
-		let store = CertificateTrustBuilder::new(Arc::new(Secp256k1Policy))
-			.with_certificate(chain.root.clone())?
+	fn evaluate_rejects_cross_chain_cert() -> TestResult {
+		// Store has one chain's root, evaluate leaf from different chain
+		let store = CertificateTrustBuilder::new(policy())
+			.with_certificate(create_test_certificate(&create_test_signing_key()))?
 			.build();
 
-		// Full chain verification (includes signature verification)
-		let result = store.verify_chain(&[chain.root, chain.intermediate, chain.leaf]);
-		assert!(result.is_ok());
+		let other_chain = create_test_certificate_chain();
+		assert!(store.evaluate(&other_chain.leaf).is_err());
+		Ok(())
+	}
+
+	// ========================================================================
+	// Chain Verification
+	// ========================================================================
+
+	#[test]
+	fn verify_chain_cases() -> TestResult {
+		let chain = create_test_certificate_chain();
+		let cases: &[(StoreCerts, &[&Certificate], bool)] = &[
+			// Empty chain fails
+			(StoreCerts::Root, &[], false),
+			// Untrusted root fails
+			(StoreCerts::None, &[&chain.root], false),
+			// Trusted root alone succeeds
+			(StoreCerts::Root, &[&chain.root], true),
+			// Full chain with trusted root succeeds
+			(StoreCerts::Root, &[&chain.root, &chain.intermediate, &chain.leaf], true),
+		];
+
+		for (store_certs, chain_slice, should_succeed) in cases {
+			let store = build_store(&chain, *store_certs)?;
+			let chain_vec: Vec<_> = chain_slice.iter().map(|c| (*c).clone()).collect();
+
+			let result: Result<(), CertificateValidationError> = store.verify_chain(&chain_vec);
+			assert_eq!(
+				result.is_ok(),
+				*should_succeed,
+				"verify_chain: store={store_certs:?} chain_len={}: expected {should_succeed}, got {result:?}",
+				chain_slice.len()
+			);
+		}
+
 		Ok(())
 	}
 }
