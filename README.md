@@ -103,7 +103,7 @@ versioned metadata structures for high-fidelity information transmission.
 		- 9.3.1. [E: Workers](#931-e-workers)
 		- 9.3.2. [E: Servlets](#932-e-servlets)
 		- 9.3.3. [C: Clusters - WIP](#933-c-clusters-wip)
-		- 9.3.4. [I: Drones & Hives - WIP](#934-i-drones-hives-wip)
+		- 9.3.4. [I: Hives](#934-i-hives)
 10. [Testing Framework](#10-testing-framework)
 	- 10.1. [Architecture and Concepts](#101-architecture-and-concepts)
 		- 10.1.1. [Three-Layer Progressive Verification](#1011-three-layer-progressive-verification)
@@ -1153,6 +1153,31 @@ and delegates key lifecycle management to applications:
 - **Handshake Protocols**: CMS-based and ECIES-based handshakes for session establishment
 - **Application Responsibilities**: Key generation, storage, rotation, certificate validation, revocation checking
 
+#### Trust Stores
+
+The `CertificateTrust` trait provides certificate chain verification and trust 
+anchor management. Trust stores are used for:
+- Verifying peer certificates during connection establishment
+- Validating certificate chains (root -> intermediate -> leaf)
+- Looking up signer certificates for frame signature verification
+
+**Building a Trust Store:**
+
+```rust
+let cert = Certificate::try_from(CERT_PEM)?;
+let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+    .with_certificate(cert)?
+    .build();
+```
+
+**Adding Certificate Chains:**
+
+```rust
+let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+    .with_chain(vec![root_cert, intermediate_cert, leaf_cert])?
+    .build();
+```
+
 ## 7. Security Considerations
 
 ### 7.1 Cryptographic Requirements
@@ -1777,10 +1802,10 @@ via `.builder()`, then `.connect()` retrieves connections from the pool.
 
 ```rust
 // Create shared pool with configuration (once per application)
-let pool = Arc::new(ConnectionPool::<TokioListener, 3>::builder()
-	.with_config(PoolConfig::default())
-	.with_server_certificate(SERVER_CERT)?
-	.with_client_identity(CLIENT_CERT, CLIENT_KEY)?
+let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+	.with_config(PoolConfig { max_connections: 3, ..Default::default() })
+	.with_trust_store(trust_store)
+	.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 	.with_timeout(Duration::from_millis(5000))
 	.build());
 
@@ -1792,7 +1817,7 @@ client.emit(frame, None).await?;
 ```
 
 **Configuration**:
-- `N`: Max connections per destination (const generic)
+- `PoolConfig::max_connections`: Max connections per destination (default: 64)
 - `PoolConfig::idle_timeout`: Optional connection expiration (default: None)
 
 ### 8.7 Audit
@@ -1824,7 +1849,7 @@ There are four main components to EECI:
 - [Workers](#931-e-workers) - Efficient processing units
 - [Servlets](#932-e-servlets) - Exchange endpoints
 - [Clusters](#933-c-clusters) - Compute orchestration
-- [Drone/Hive](#934-i-drones--hives) - Interconnected infrastructure
+- [Hives](#934-i-hives) - Interconnected infrastructure
 
 Think of workers as ants, servlets as ant hills, and clusters as ant colonies.
 Insects have specific functions for which they process organic matter
@@ -2099,92 +2124,389 @@ The `environment Servlet` syntax provides:
 - `setup`: Creates the client connection to the servlet
 - `client`: Sends requests and validates responses via trace events
 
-#### 9.3.3 C: Clusters - WIP
+#### 9.3.3 C: Clusters
 
-Clusters orchestrate multiple servlets and workers. They are the "ant colonies"
-of the EECI. Colonies are made up of multiple servlets which command different
-workers. Clusters are multi-threaded and must handle messages asynchronously.
-Clusters may also define a configuration and as many different servlets as it
-needs to handle its purpose. While servlets are given a relay, clusters must be
-provided a router. Routers can emit messages to the servlets registered within
-the cluster.
+Clusters are the "ant colonies" of the EECI--centralized gateways that coordinate
+distributed hives. While hives manage individual servlets, clusters provide the
+higher-level orchestration: routing work requests to the right hive, monitoring
+hive health, and balancing load across the swarm.
+
+##### Architecture
+
+A cluster operates as a gateway server with three primary responsibilities:
+
+1. **Hive Registry**: Maintains a dynamic registry of connected hives and their
+   available servlet types. Hives register themselves on startup, announcing
+   which servlet types they can handle.
+
+2. **Work Routing**: Receives `ClusterWorkRequest` messages from external clients,
+   looks up which hives support the requested servlet type, selects one via load
+   balancing, and forwards the request.
+
+3. **Health Monitoring**: Periodically sends heartbeats to all registered hives.
+   Unresponsive hives are evicted after consecutive failures, ensuring clients
+   are never routed to dead endpoints.
+
+##### The `cluster!` Macro
+
+Define a cluster type using the `cluster!` macro:
 
 ```rust
-// TODO
+cluster! {
+	pub MyCluster,
+	protocol: TokioListener,
+	config: ClusterConf::default()
+}
 ```
 
-#### 9.3.4 I: Drones & Hives - WIP
+The macro accepts an optional `digest` parameter for custom hash algorithms used
+in frame integrity verification:
 
-Drones are containerized servlet runners that can dynamically morph between
-different servlet types based on command messages from a cluster. This
-allows you to seed your application over a specific protocol and then morph
-into any known servlet type at runtime.
+```rust
+cluster! {
+	pub MyCluster,
+	protocol: TokioListener,
+	digest: Blake3,
+	config: ClusterConf::default()
+}
+```
 
-Hives are an extension of drones that can manage multiple servlets
-simultaneously. They are useful for managing a pool of servlets that can be
-activated on demand. Hives must only be available on
-[Mycelial](src/transport/mod.rs) protocols which support multiple ports
-per address. Hives should automatically maintain exactly the number of servlets
-required to efficiently process messages from the cluster.
+##### Mutual TLS
+
+Clusters require TLS configuration for secure communication with hives. The cluster
+acts as a TLS client when connecting to hives, presenting its certificate for
+mutual authentication. This ensures both parties can verify identity before
+exchanging work.
+
+```rust
+let tls = ClusterTlsConfig {
+	certificate: CertificateSpec::Built(Box::new(cert)),
+	key: Arc::new(Secp256k1KeyProvider::from(key)),
+	validators: vec![],  // Optional: validators for hive certificates
+};
+```
+
+For hives to trust cluster commands (like heartbeats), they must have the cluster's
+certificate in their trust store. See [Trust Stores](#trust-stores) for details.
+
+##### Heartbeat Mechanism
+
+Clusters continuously monitor hive health through heartbeats. Each heartbeat is a
+signed frame sent to the hive, which responds with its current utilization. This
+serves two purposes:
+
+- **Liveness Detection**: Hives that fail to respond are marked unhealthy and
+  eventually evicted from the registry.
+- **Load Metrics**: Utilization data informs the load balancer, enabling smarter
+  routing decisions.
+
+Configure heartbeat behavior via `HeartbeatConf`:
+
+```rust
+let heartbeat_conf = HeartbeatConf::builder()
+	.with_interval(Duration::from_secs(5))   // Check every 5 seconds
+	.with_timeout(Duration::from_secs(15))   // Response deadline
+	.with_max_failures(3)                    // Evict after 3 failures
+	.with_max_concurrent(10)                 // Parallel heartbeat limit
+	.build();
+```
+
+The `on_heartbeat` callback enables monitoring and metrics collection:
+
+```rust
+.with_callback(Arc::new(|event| {
+	metrics::counter!("heartbeat", "success" => event.success.to_string()).increment(1);
+}))
+```
+
+##### Load Balancing
+
+When multiple hives support the same servlet type, the cluster uses a `LoadBalancer`
+to select one. The default is `LeastLoaded`, which routes to the hive with the
+lowest reported utilization. Other strategies include `RoundRobin` and
+`PowerOfTwoChoices`. Custom strategies can be created by implementin the 
+`LoadBalancer` trait.
+
+##### Work Request Flow
+
+Clients interact with clusters through work request messages:
+
+1. Client sends `ClusterWorkRequest` with `servlet_type` and encoded `payload`
+2. Cluster looks up hives supporting that servlet type
+3. Load balancer selects a hive
+4. Cluster forwards the payload to the selected hive
+5. Hive processes and returns response
+6. Cluster wraps response in `ClusterWorkResponse` and returns to client
+
+```rust
+// Client sends:
+let request = ClusterWorkRequest {
+	servlet_type: b"calculator".to_vec(),
+	payload: encode(&CalcRequest { value: 42 })?,
+};
+
+// Client receives:
+let response: ClusterWorkResponse = decode(&frame.message)?;
+match response.status {
+	TransitStatus::Accepted => { /* process response.payload */ }
+	TransitStatus::Forbidden => { /* no hive available */ }
+	_ => { /* handle other statuses */ }
+}
+```
+
+##### ClusterConf Reference
+
+```rust
+pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
+	/// Load balancing strategy for distributing work across hives
+	pub load_balancer: L,
+	/// Heartbeat configuration
+	pub heartbeat: HeartbeatConf,
+	/// Gate policies for the gateway (rate limiting, auth, etc.)
+	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	/// Connection pool configuration for hive connections
+	pub pool_config: PoolConfig,
+	/// Default retry policy for all cluster → hive communication
+	pub retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
+	/// TLS configuration for cluster → hive connections
+	pub tls: ClusterTlsConfig,
+}
+```
+
+##### Testing
+
+Clusters can be tested using `environment Cluster`:
+
+```rust
+use tightbeam::{tb_scenario, tb_assert_spec, exactly, cluster, hive};
+
+tb_assert_spec! {
+	pub ClusterRoutingSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("work_sent", exactly!(1)),
+			("routing_status", exactly!(1), equals!(TransitStatus::Accepted))
+		]
+	}
+}
+
+tb_scenario! {
+	name: cluster_work_routing,
+	config: ScenarioConf::<ClusterTestConf>::builder()
+		.with_spec(ClusterRoutingSpec::latest())
+		.with_env_config(ClusterTestConf {
+			heartbeat_stats: Arc::new(HeartbeatStats::default()),
+			heartbeat_interval: Duration::from_millis(50),
+		})
+		.build(),
+	environment Cluster {
+		cluster: ClusterGateway,
+		start: |trace, config| async move {
+			let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365)?;
+
+			// Build hive trust from cluster cert
+			let hive_trust = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_chain(vec![cert.clone()])?
+				.build();
+
+			let tls = ClusterTlsConfig {
+				certificate: CertificateSpec::Built(Box::new(cert)),
+				key: Arc::new(Secp256k1KeyProvider::from(key)),
+				validators: vec![],
+			};
+
+			let heartbeat_conf = HeartbeatConf::builder()
+				.with_interval(config.heartbeat_interval)
+				.with_callback(Arc::new({
+					let stats = Arc::clone(&config.heartbeat_stats);
+					move |event| {
+						stats.attempts.fetch_add(1, Ordering::SeqCst);
+						if event.success {
+							stats.successes.fetch_add(1, Ordering::SeqCst);
+						}
+					}
+				}))
+				.build();
+
+			let cluster_conf = ClusterConf::builder(tls)
+				.with_heartbeat_config(heartbeat_conf)
+				.build();
+
+			let cluster = ClusterGateway::start(trace, cluster_conf).await?;
+			Ok((cluster, hive_trust))
+		},
+		hives: |trace, hive_trust| {
+			vec![
+				TestHive::start(Arc::clone(&trace), Some(HiveConf {
+					trust_store: Some(Arc::new(hive_trust)),
+					..Default::default()
+				}))
+			]
+		},
+		client: |trace, mut client, config| async move {
+			let request = ClusterWorkRequest {
+				servlet_type: b"ping".to_vec(),
+				payload: encode(&PingRequest { value: 21 })?,
+			};
+
+			trace.event("work_sent")?;
+			let response_frame = client.emit(compose! {
+				V0: id: b"work-001", message: request
+			}?, None).await?;
+
+			if let Some(frame) = response_frame {
+				let work_response: ClusterWorkResponse = decode(&frame.message)?;
+				trace.event_with("routing_status", &[], work_response.status)?;
+			}
+
+			Ok(())
+		}
+	}
+}
+```
+
+The `environment Cluster` syntax provides:
+- `cluster`: The cluster type to test
+- `start`: Configures and starts the cluster, returns `(Cluster, HiveTrust)` tuple
+- `hives`: Creates hive instances that register with the cluster (receives trust from `start`)
+- `client`: Sends work requests and validates routing via trace events
+
+#### 9.3.4 I: Hives
+
+Hives are orchestrators that manage servlet instances. They support two modes:
+
+- **Single-Servlet Mode**: Morph between different servlet types one at a time
+- **Multi-Servlet Mode**: On mycelial protocols, manage multiple servlets simultaneously
+
+The mode is determined automatically based on the protocol's capabilities. Call
+`establish_hive()` to enable multi-servlet mode on mycelial protocols.
 
 ##### "Mycelial" Protocols
 
 Protocols such as TCP are considered "mycelial" as they operate over a single
 address but can have multiple ports (SocketAddress). This allows the hive to
-establish a servlet on different ports and provide the protocol address to the
-cluster so it can register it under its hive.
+spawn servlets on different ports and provide their addresses to the cluster.
 
-**Regular Drone Example** (morphs between servlets one at a time):
-
-```rust
-drone! {
-	pub RegularDrone,
-	protocol: Listener,
-	servlets: {
-		ping_pong: PingPongServletWithWorker<RequestMessage>,
-		other_servlet: OtherServlet<RequestMessage>
-	}
-}
-
-// Start the drone
-let drone = RegularDrone::start(TraceCollector::new(), None).await?;
-
-// Register with cluster
-let cluster_addr = "127.0.0.1:8888".parse()?;
-let response = drone.register_with_cluster(cluster_addr).await?;
-```
-
-**Hive Example** (manages multiple servlets simultaneously on different ports):
+**Basic Hive Example**:
 
 ```rust
-drone! {
+hive! {
 	pub MyHive,
 	protocol: TokioListener,
-	hive: true,
 	servlets: {
-		ping_pong: PingPongServletWithWorker<RequestMessage>,
+		ping_pong: PingPongServlet<RequestMessage>,
 		other_servlet: OtherServlet<RequestMessage>
 	}
 }
 
 // Start the hive
-let hive = MyHive::start(TraceCollector::new(), None).await?;
+let mut hive = MyHive::start(
+	Arc::new(TraceCollector::new()),
+	Some(HiveConf::default()),
+).await?;
+
+// On mycelial protocols, establish multi-servlet mode
+hive.establish_hive().await?;
+
+// Get servlet addresses
+let addrs = hive.servlet_addresses().await;
+
+// Register with cluster
+let cluster_addr = "127.0.0.1:8888".parse()?;
+let response = hive.register_with_cluster(cluster_addr).await?;
+
+// Clean up
+hive.stop();
 ```
 
-**Drone with Policies**:
+**Hive with Policies**:
 
 ```rust
-drone! {
-	pub SecureDrone,
-	protocol: Listener,
+hive! {
+	pub SecureHive,
+	protocol: TokioListener,
 	policies: {
 		with_collector_gate: [SignatureGate::new(verifying_key)]
 	},
 	servlets: {
-		ping_pong: PingPongServletWithWorker<RequestMessage>
+		ping_pong: PingPongServlet<RequestMessage>
 	}
 }
 ```
+
+##### HiveConf Configuration
+
+```rust
+pub struct HiveConf {
+	/// Load balancing strategy (default: LeastLoaded)
+	pub load_balancer: L,
+	/// Message routing strategy (default: TypeBasedRouter)
+	pub router: R,
+	/// Default scaling config for all servlet types
+	pub default_scale: ServletScaleConf,
+	/// Per-type overrides keyed by servlet type name
+	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
+	/// Cooldown between scaling decisions (default: 5s)
+	pub cooldown: Duration,
+	/// Queue capacity per servlet for utilization calculation (default: 100)
+	pub queue_capacity: u32,
+	/// Backpressure threshold in basis points (default: 9000 = 90%)
+	pub backpressure_threshold: BasisPoints,
+	/// Circuit breaker failure threshold (default: 3)
+	pub circuit_breaker_threshold: u8,
+	/// Circuit breaker cooldown in milliseconds (default: 30_000)
+	pub circuit_breaker_cooldown_ms: u64,
+	/// Max connections per servlet for forwarding (default: 8)
+	pub servlet_pool_size: usize,
+	/// Idle timeout for pooled connections (default: 30s)
+	pub servlet_pool_idle_timeout: Option<Duration>,
+	/// Drain timeout before force-stop (default: 30s)
+	pub drain_timeout: Duration,
+	/// Trust store for cluster command authentication
+	pub trust_store: Option<Arc<dyn CertificateTrust>>,
+	/// TLS configuration for spawned servlets
+	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+}
+```
+
+##### HiveTlsConfig
+
+```rust
+pub struct HiveTlsConfig {
+	/// Server certificate specification
+	pub certificate: CertificateSpec,
+	/// Private key provider for signing
+	pub key: Arc<dyn SigningKeyProvider>,
+	/// Client certificate validators
+	pub validators: Vec<Arc<dyn CertificateValidation>>,
+}
+```
+
+**TLS Configuration Example**:
+
+```rust
+let (cert, signing_key) = create_test_cert_with_key("CN=Hive Server", 365)?;
+
+let tls_config = Arc::new(HiveTlsConfig {
+	certificate: CertificateSpec::Built(Box::new(cert)),
+	key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
+	validators: vec![],
+});
+
+let hive_conf = HiveConf {
+	hive_tls: Some(tls_config),
+	..Default::default()
+};
+```
+
+##### Testing
+
+Hives are typically tested in the context of a cluster environment. See the
+[Cluster Testing](#testing) section above for examples using `environment Cluster`,
+which demonstrates how to configure hives with trust stores and verify cluster-hive
+communication.
 
 ##### Conclusion
 
