@@ -1,6 +1,6 @@
 //! Protocol messages for cluster-hive communication
 //!
-//! All message types used in the cluster ↔ hive/drone protocol.
+//! All message types used in the cluster ↔ hive protocol.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -14,42 +14,40 @@ use crate::utils::BasisPoints;
 use crate::Beamable;
 
 // =============================================================================
-// Drone Registration Messages
+// Hive Registration Messages
 // =============================================================================
 
-/// Message type for registering a drone with a cluster
+/// Message type for registering a hive with a cluster
 ///
-/// This message is sent from a drone to a cluster controller to announce
+/// This message is sent from a hive to a cluster controller to announce
 /// its availability and capabilities.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
-pub struct RegisterDroneRequest {
-	/// The address where this drone can be reached
-	pub drone_addr: Vec<u8>,
-	/// List of servlet IDs this drone can run
+pub struct RegisterHiveRequest {
+	/// The address where this hive can be reached
+	pub hive_addr: Vec<u8>,
+	/// List of servlet IDs this hive can run
 	pub available_servlets: Vec<Vec<u8>>,
-	/// Optional metadata about the drone
+	/// Optional metadata about the hive
 	pub metadata: Option<Vec<u8>>,
 }
 
-/// Response message for drone registration
+/// Response message for hive registration
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
-pub struct RegisterDroneResponse {
+pub struct RegisterHiveResponse {
 	/// The status of the registration request
 	pub status: TransitStatus,
-	/// Optional cluster-assigned drone ID
-	pub drone_id: Option<Vec<u8>>,
+	/// Optional cluster-assigned hive ID
+	pub hive_id: Option<Vec<u8>>,
 }
 
 // =============================================================================
-// Drone Activation Messages
+// Servlet Activation Messages
 // =============================================================================
 
-/// Message type for activating a servlet on a drone
+/// Message type for activating a servlet on a hive
 ///
-/// This message is sent from a cluster controller to a drone to instruct
+/// This message is sent from a cluster controller to a hive to instruct
 /// it to morph into a specific servlet configuration.
-///
-/// **Drones** morph into a single servlet at a time.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ActivateServletRequest {
 	/// The identifier of the servlet to activate

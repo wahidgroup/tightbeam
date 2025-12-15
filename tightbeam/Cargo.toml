@@ -46,6 +46,7 @@ rand_core = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 # Macro helpers
 paste = { workspace = true }
 
@@ -88,6 +89,8 @@ full = [
 	"ecdh",
 	"derive",
 	"tokio",
+	"futures",
+	"rayon",
 	"constants",
 	"zstd",
 	"time",
@@ -103,7 +106,6 @@ full = [
 	"testing-timing",
 	"instrument",
 	"logging",
-	"rayon",
 	"colony",
 ]
 
@@ -213,6 +215,7 @@ std = [
 # NON-RustCrypto features
 time = ["dep:time", "der/time"]
 tokio = ["dep:tokio", "std"]
+futures = ["dep:futures"]
 rayon = ["dep:rayon"]
 zstd = ["dep:zeekstd", "compress", "std"]
 # TODO

@@ -1,4 +1,4 @@
-//! Gate policies for drone/hive security and backpressure
+//! Gate policies for hive security and backpressure
 //!
 //! Contains circuit breaker and security gate implementations for
 //! cluster command authentication and capacity management.

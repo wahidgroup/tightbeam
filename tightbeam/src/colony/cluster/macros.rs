@@ -112,24 +112,101 @@ macro_rules! cluster {
 					trace_for_server
 				);
 
-				// Start the heartbeat loop
+				// Start the heartbeat loop - 3-tier implementation
 				let heartbeat_handle = {
 					let registry = ::std::sync::Arc::clone(&registry);
 					let config = ::std::sync::Arc::clone(&config);
-					let trace = ::std::sync::Arc::clone(&trace);
-					// For tokio: spawn takes a Future (async fn returns Future when called)
-					// For std: spawn takes FnOnce (must wrap in closure to defer execution)
+					let pool = ::std::sync::Arc::clone(&pool);
+
+					// Tier 1: Tokio - use JoinSet for bounded concurrency
 					#[cfg(feature = "tokio")]
 					{
-						$crate::colony::servlet::servlet_runtime::rt::spawn(
-							$crate::colony::cluster::run_heartbeat_loop(registry, config, trace)
-						)
+						$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
+							loop {
+								let hives = registry.all_hives().unwrap_or_default();
+								let max_concurrent = config.heartbeat.max_concurrent;
+								let mut set = ::tokio::task::JoinSet::new();
+
+								let tasks: Vec<_> = hives
+									.into_iter()
+									.filter_map(|hive| $crate::cluster!(@parse_hive_addr hive))
+									.collect();
+
+								for (hive_addr, addr) in tasks {
+									// Bounded: wait if at capacity
+									while set.len() >= max_concurrent {
+										let _ = set.join_next().await;
+									}
+
+									let registry = ::std::sync::Arc::clone(&registry);
+									let config = ::std::sync::Arc::clone(&config);
+									let pool = ::std::sync::Arc::clone(&pool);
+									let max_failures = config.heartbeat.max_failures;
+
+									set.spawn(async move {
+										let result = $crate::cluster!(@send_heartbeat_async pool, config, addr);
+										$crate::cluster!(@process_heartbeat_result registry, hive_addr, result, max_failures);
+									});
+								}
+
+								// Drain remaining tasks
+								while set.join_next().await.is_some() {}
+
+								$crate::colony::servlet::servlet_runtime::rt::sleep(config.heartbeat.interval).await;
+							}
+						})
 					}
-					#[cfg(all(not(feature = "tokio"), feature = "std"))]
+
+					// Tier 2: std + futures - use block_on with for_each_concurrent
+					#[cfg(all(not(feature = "tokio"), feature = "std", feature = "futures"))]
 					{
-						$crate::colony::servlet::servlet_runtime::rt::spawn(
-							move || $crate::colony::cluster::run_heartbeat_loop(registry, config, trace)
-						)
+						use futures::{executor::block_on, stream::{self, StreamExt}};
+
+						$crate::colony::servlet::servlet_runtime::rt::spawn(move || {
+							loop {
+								let hives = registry.all_hives().unwrap_or_default();
+								let max_concurrent = config.heartbeat.max_concurrent;
+
+								block_on(async {
+									stream::iter(hives.into_iter().filter_map(|hive| {
+										$crate::cluster!(@parse_hive_addr hive)
+									}))
+									.for_each_concurrent(max_concurrent, |(hive_addr, addr)| {
+										let registry = ::std::sync::Arc::clone(&registry);
+										let config = ::std::sync::Arc::clone(&config);
+										let pool = ::std::sync::Arc::clone(&pool);
+										let max_failures = config.heartbeat.max_failures;
+										async move {
+											let result = $crate::cluster!(@send_heartbeat_async pool, config, addr);
+											$crate::cluster!(@process_heartbeat_result registry, hive_addr, result, max_failures);
+										}
+									})
+									.await;
+								});
+
+								$crate::colony::servlet::servlet_runtime::rt::sleep(config.heartbeat.interval);
+							}
+						})
+					}
+
+					// Tier 3: std only - sequential fallback
+					#[cfg(all(not(feature = "tokio"), feature = "std", not(feature = "futures")))]
+					{
+						$crate::colony::servlet::servlet_runtime::rt::spawn(move || {
+							loop {
+								registry
+									.all_hives()
+									.unwrap_or_default()
+									.into_iter()
+									.filter_map(|hive| $crate::cluster!(@parse_hive_addr hive))
+									.for_each(|(hive_addr, _addr)| {
+										// Note: Sequential sync version - no async pool available
+										// This tier is a placeholder for sync transport implementations
+										let _ = registry.increment_failure(&hive_addr);
+									});
+								$crate::colony::servlet::servlet_runtime::rt::sleep(config.heartbeat.interval);
+							}
+						})
 					}
 				};
 
@@ -186,6 +263,50 @@ macro_rules! cluster {
 					Ok(())
 				}
 			}
+
+			// =====================================================================
+			// Heartbeat Methods
+			// =====================================================================
+
+			fn registry(&self) -> &::std::sync::Arc<$crate::colony::cluster::HiveRegistry> {
+				&self.registry
+			}
+
+			fn heartbeat_config(&self) -> &$crate::colony::cluster::HeartbeatConf {
+				&self.config.heartbeat
+			}
+
+			async fn send_heartbeat(
+				&self,
+				addr: Self::Address,
+			) -> Result<$crate::colony::common::HeartbeatResult, $crate::colony::cluster::ClusterError> {
+				use $crate::builder::TypeBuilder;
+
+				// Build heartbeat command
+				let cmd = $crate::colony::common::ClusterCommand {
+					heartbeat: Some($crate::colony::common::HeartbeatParams {
+						cluster_status: $crate::colony::common::ClusterStatus::Healthy,
+					}),
+					manage: None,
+				};
+
+				let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V1)
+					.with_message(cmd)
+					.with_priority($crate::MessagePriority::Heartbeat)
+					.build()?;
+
+				let signed_frame = frame
+					.sign_with_provider::<$crate::crypto::hash::Sha3_256, _>(self.config.tls.key.as_ref())
+					.await?;
+
+				// Send via pool
+				let mut client = self.pool.connect(addr).await?;
+				let response = client.conn()?.emit(signed_frame, None).await?
+					.ok_or($crate::colony::cluster::ClusterError::HiveCommunicationFailed($crate::colony::cluster::error::NO_RESPONSE_MSG.to_vec()))?;
+
+				let cmd_response: $crate::colony::common::ClusterCommandResponse = $crate::decode(&response.message)?;
+				cmd_response.heartbeat.ok_or($crate::colony::cluster::ClusterError::EncodingError)
+			}
 		}
 	};
 
@@ -217,16 +338,16 @@ macro_rules! cluster {
 
 	// Handle gateway requests (registration + work)
 	(@handle_gateway_request $frame:ident, $registry:ident) => {{
-		// Try to decode as RegisterDroneRequest (hive registration)
-		if let Ok(request) = $crate::decode::<$crate::colony::drone::RegisterDroneRequest>(&$frame.message) {
+		// Try to decode as RegisterHiveRequest (hive registration)
+		if let Ok(request) = $crate::decode::<$crate::colony::hive::RegisterHiveRequest>(&$frame.message) {
 			let status = match $registry.register(request.clone()) {
 				Ok(()) => $crate::policy::TransitStatus::Accepted,
 				Err(_) => $crate::policy::TransitStatus::Forbidden,
 			};
 
-			let response = $crate::colony::drone::RegisterDroneResponse {
+			let response = $crate::colony::hive::RegisterHiveResponse {
 				status,
-				drone_id: Some(request.drone_addr.clone()),
+				hive_id: Some(request.hive_addr.clone()),
 			};
 
 			return $crate::cluster!(@reply $frame, response);
@@ -267,6 +388,70 @@ macro_rules! cluster {
 					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
 				}
 			}
+		}
+	};
+
+	// =========================================================================
+	// Helpers
+	// =========================================================================
+
+	// Helper: Send heartbeat async - builds, signs, and sends heartbeat frame
+	(@send_heartbeat_async $pool:expr, $config:expr, $addr:expr) => {
+		async {
+			use $crate::builder::TypeBuilder;
+
+			let cmd = $crate::colony::common::ClusterCommand {
+				heartbeat: Some($crate::colony::common::HeartbeatParams {
+					cluster_status: $crate::colony::common::ClusterStatus::Healthy,
+				}),
+				manage: None,
+			};
+
+			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V1)
+				.with_message(cmd)
+				.with_priority($crate::MessagePriority::Heartbeat)
+				.build()?;
+
+			let signed_frame = frame
+				.sign_with_provider::<$crate::crypto::hash::Sha3_256, _>($config.tls.key.as_ref())
+				.await?;
+
+			let mut client = $pool.connect($addr).await?;
+			let response = client.conn()?.emit(signed_frame, None).await?
+				.ok_or($crate::colony::cluster::ClusterError::HiveCommunicationFailed(
+					$crate::colony::cluster::error::NO_RESPONSE_MSG.to_vec()
+				))?;
+
+			let cmd_response: $crate::colony::common::ClusterCommandResponse =
+				$crate::decode(&response.message)?;
+			cmd_response.heartbeat.ok_or($crate::colony::cluster::ClusterError::EncodingError)
+		}.await
+	};
+
+	// Helper: Process heartbeat result - updates registry based on success/failure
+	(@process_heartbeat_result $registry:expr, $hive_addr:expr, $result:expr, $max_failures:expr) => {
+		match $result {
+			Ok(hb) => {
+				let _ = $registry.touch(&$hive_addr, hb.utilization);
+			}
+			Err(_) => {
+				if let Ok(failures) = $registry.increment_failure(&$hive_addr) {
+					if failures >= $max_failures {
+						let _ = $registry.unregister(&$hive_addr);
+					}
+				}
+			}
+		}
+	};
+
+	// Helper: Parse hive address from bytes to protocol address
+	(@parse_hive_addr $hive:expr) => {
+		{
+			let hive_addr = ::std::sync::Arc::clone(&$hive.address);
+			core::str::from_utf8(&hive_addr)
+				.ok()
+				.and_then(|s| s.parse().ok())
+				.map(|addr| (hive_addr, addr))
 		}
 	};
 }

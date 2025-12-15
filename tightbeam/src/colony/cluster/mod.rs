@@ -23,7 +23,6 @@ use core::future::Future;
 use core::time::Duration;
 use std::sync::Arc;
 
-use crate::builder::TypeBuilder;
 use crate::crypto::key::SigningKeyProvider;
 use crate::der::Sequence;
 use crate::policy::{GatePolicy, TransitStatus};
@@ -36,13 +35,11 @@ use crate::Beamable;
 #[cfg(feature = "x509")]
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
 
-use super::common::{ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams, LeastLoaded};
-use super::drone::LoadBalancer;
+use super::common::LeastLoaded;
+use super::hive::LoadBalancer;
 
 #[cfg(feature = "tokio")]
 use crate::colony::servlet::servlet_runtime::rt;
-#[cfg(feature = "tokio")]
-use tokio::sync::Semaphore;
 
 // =============================================================================
 // Configuration
@@ -221,7 +218,7 @@ impl ClusterWorkResponse {
 /// Clusters are gateways that route work requests to registered hives
 /// based on servlet type. Hives register dynamically, and the cluster
 /// learns available servlet types from their registrations.
-pub trait Cluster: Sized {
+pub trait Cluster: Sized + Send + Sync {
 	/// The protocol type this cluster uses
 	type Protocol: Protocol;
 
@@ -251,200 +248,164 @@ pub trait Cluster: Sized {
 
 	/// Wait for the cluster to finish
 	fn join(self) -> impl Future<Output = Result<(), crate::colony::servlet::servlet_runtime::rt::JoinError>> + Send;
-}
 
-// =============================================================================
-// Heartbeat Loop
-// =============================================================================
+	// =========================================================================
+	// Heartbeat Methods
+	// =========================================================================
 
-/// Process a single heartbeat result, updating registry accordingly
-fn process_heartbeat_result<L: LoadBalancer>(
-	result: Result<ClusterCommandResponse, ClusterError>,
-	hive_addr: &[u8],
-	registry: &HiveRegistry,
-	config: &ClusterConf<L>,
-	trace: &TraceCollector,
-) {
-	match result {
-		Ok(response) if response.heartbeat.is_some() => {
-			let hb = response.heartbeat.as_ref();
-			let _ = registry.touch(hive_addr, hb.map(|h| h.utilization).unwrap_or_default());
-			let _ = trace.event("heartbeat_success");
-		}
-		_ => {
-			if let Ok(failures) = registry.increment_failure(hive_addr) {
-				if failures >= config.heartbeat.max_failures {
-					let _ = registry.unregister(hive_addr);
-					let _ = trace.event("hive_evicted");
+	/// Access the hive registry
+	fn registry(&self) -> &Arc<HiveRegistry>;
+
+	/// Access heartbeat configuration
+	fn heartbeat_config(&self) -> &HeartbeatConf;
+
+	/// Send a single heartbeat to a hive
+	///
+	/// Builds a signed heartbeat frame and sends it via the connection pool.
+	/// Returns the heartbeat result from the hive.
+	fn send_heartbeat(
+		&self,
+		addr: Self::Address,
+	) -> impl Future<Output = Result<super::common::HeartbeatResult, ClusterError>> + Send;
+
+	/// Process a heartbeat result, updating registry accordingly
+	///
+	/// On success, updates the hive's utilization metric.
+	/// On failure, increments the failure counter and evicts if threshold exceeded.
+	fn process_heartbeat_result(&self, hive_addr: &[u8], result: Result<super::common::HeartbeatResult, ClusterError>) {
+		match result {
+			Ok(hb) => {
+				let _ = self.registry().touch(hive_addr, hb.utilization);
+			}
+			Err(_) => {
+				if let Ok(failures) = self.registry().increment_failure(hive_addr) {
+					if failures >= self.heartbeat_config().max_failures {
+						let _ = self.registry().unregister(hive_addr);
+					}
 				}
 			}
 		}
 	}
-}
 
-/// Simulate a heartbeat (placeholder until connection pool is wired)
-fn simulate_heartbeat() -> Result<ClusterCommandResponse, ClusterError> {
-	Ok(ClusterCommandResponse {
-		heartbeat: Some(super::common::HeartbeatResult {
-			status: TransitStatus::Accepted,
-			utilization: crate::utils::BasisPoints::default(),
-			active_servlets: 0,
-		}),
-		manage: None,
-	})
-}
+	// =========================================================================
+	// Heartbeat Loop - Default Trait Implementation
+	// =========================================================================
+	//
+	// Note: The cluster! macro provides optimized implementations with proper
+	// concurrency. These trait defaults are simpler fallbacks.
 
-/// Run the cluster heartbeat loop (tokio async version)
-///
-/// Periodically sends heartbeat requests to all registered hives, updates
-/// utilization metrics, and evicts unresponsive hives.
-#[cfg(feature = "tokio")]
-pub async fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
-	registry: Arc<HiveRegistry>,
-	config: Arc<ClusterConf<L>>,
-	trace: Arc<TraceCollector>,
-) {
-	loop {
-		let hives = match registry.all_hives() {
-			Ok(h) => h,
-			Err(_) => {
-				rt::sleep(config.heartbeat.interval).await;
-				continue;
-			}
-		};
-
-		let semaphore = Arc::new(Semaphore::new(config.heartbeat.max_concurrent));
-		let tasks: Vec<_> = hives
-			.into_iter()
-			.map(|hive| {
-				let registry = Arc::clone(&registry);
-				let config = Arc::clone(&config);
-				let semaphore = Arc::clone(&semaphore);
-				let trace = Arc::clone(&trace);
-				let hive_addr = Arc::clone(&hive.address);
-
-				rt::spawn(async move {
-					let _permit = match semaphore.acquire().await {
-						Ok(p) => p,
-						Err(_) => return,
-					};
-
-					let cmd = ClusterCommand {
-						heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
-						manage: None,
-					};
-
-					// Build and sign the heartbeat frame
-					let frame: crate::Frame = match crate::builder::frame::FrameBuilder::from(crate::Version::V1)
-						.with_message(cmd)
-						.with_priority(crate::MessagePriority::Heartbeat)
-						.build()
-					{
-						Ok(f) => f,
-						Err(_) => {
-							process_heartbeat_result(
-								Err(ClusterError::EncodingError),
-								&hive_addr,
-								&registry,
-								&config,
-								&trace,
-							);
-							return;
-						}
-					};
-
-					// Sign the frame with the cluster's key provider
-					let signed_frame = match frame
-						.sign_with_provider::<crate::crypto::hash::Sha3_256, _>(config.tls.key.as_ref())
-						.await
-					{
-						Ok(f) => f,
-						Err(_) => {
-							process_heartbeat_result(
-								Err(ClusterError::SigningError),
-								&hive_addr,
-								&registry,
-								&config,
-								&trace,
-							);
-							return;
-						}
-					};
-
-					// TODO: Send signed_frame via connection pool to hive_addr
-					let _ = signed_frame;
-					let result = simulate_heartbeat();
-					process_heartbeat_result(result, &hive_addr, &registry, &config, &trace);
-				})
-			})
-			.collect();
-
-		// Await all tasks
-		for task in tasks {
-			let _ = rt::join(task).await;
-		}
-
-		rt::sleep(config.heartbeat.interval).await;
-	}
-}
-
-/// Run the cluster heartbeat loop (std sync version)
-///
-/// Periodically sends heartbeat requests to all registered hives, updates
-/// utilization metrics, and evicts unresponsive hives.
-///
-/// Note: This sync version cannot use async signing (HSM/KMS support).
-/// Use the tokio async version for production with HSM/KMS key providers.
-#[cfg(all(not(feature = "tokio"), feature = "std", feature = "x509"))]
-pub fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
-	registry: Arc<HiveRegistry>,
-	config: Arc<ClusterConf<L>>,
-	trace: Arc<TraceCollector>,
-) {
-	use crate::colony::servlet::servlet_runtime::rt as std_rt;
-
-	loop {
-		let hives = match registry.all_hives() {
-			Ok(h) => h,
-			Err(_) => {
-				std_rt::sleep(config.heartbeat.interval);
-				continue;
-			}
-		};
-
-		// Spawn heartbeat threads with concurrency limiting via chunking
-		hives.chunks(config.heartbeat.max_concurrent).for_each(|chunk| {
-			let handles: Vec<_> = chunk
-				.iter()
-				.map(|hive| {
-					let registry = Arc::clone(&registry);
-					let config = Arc::clone(&config);
-					let trace = Arc::clone(&trace);
-					let hive_addr = Arc::clone(&hive.address);
-
-					std_rt::spawn(move || {
-						// Note: Sync version cannot use async signing
-						// This is a placeholder - production should use tokio version
-						let result: Result<ClusterCommandResponse, ClusterError> = Ok(ClusterCommandResponse {
-							heartbeat: Some(super::common::HeartbeatResult {
-								status: TransitStatus::Accepted,
-								utilization: crate::utils::BasisPoints::default(),
-								active_servlets: 0,
-							}),
-							manage: None,
-						});
-						process_heartbeat_result(result, &hive_addr, &registry, &config, &trace);
+	/// Tier 1: Tokio - sequential async processing
+	///
+	/// Default implementation processes heartbeats sequentially.
+	/// The macro-generated implementation uses JoinSet for concurrency.
+	#[cfg(feature = "tokio")]
+	fn run_heartbeat_loop(&self) -> impl Future<Output = ()> + Send
+	where
+		Self::Address: core::str::FromStr,
+	{
+		async move {
+			loop {
+				// Collect parsed addresses first
+				let tasks: Vec<_> = self
+					.registry()
+					.all_hives()
+					.unwrap_or_default()
+					.into_iter()
+					.filter_map(|hive| {
+						let hive_addr = Arc::clone(&hive.address);
+						core::str::from_utf8(&hive_addr)
+							.ok()
+							.and_then(|s| s.parse().ok())
+							.map(|addr| (hive_addr, addr))
 					})
+					.collect();
+
+				// Concurrent processing with futures
+				#[cfg(feature = "futures")]
+				{
+					use futures::stream::{self, StreamExt};
+
+					let max_concurrent = self.heartbeat_config().max_concurrent;
+					stream::iter(tasks)
+						.for_each_concurrent(max_concurrent, |(hive_addr, addr)| async move {
+							let result = self.send_heartbeat(addr).await;
+							self.process_heartbeat_result(&hive_addr, result);
+						})
+						.await;
+				}
+
+				// Sequential fallback without futures
+				#[cfg(not(feature = "futures"))]
+				for (hive_addr, addr) in tasks {
+					let result = self.send_heartbeat(addr).await;
+					self.process_heartbeat_result(&hive_addr, result);
+				}
+
+				rt::sleep(self.heartbeat_config().interval).await;
+			}
+		}
+	}
+
+	/// Tier 2: std + futures - sequential with block_on
+	///
+	/// For non-tokio builds with futures crate.
+	#[cfg(all(not(feature = "tokio"), feature = "std", feature = "futures"))]
+	fn run_heartbeat_loop(&self)
+	where
+		Self::Address: core::str::FromStr,
+	{
+		use futures::executor::block_on;
+
+		loop {
+			self.registry()
+				.all_hives()
+				.unwrap_or_default()
+				.into_iter()
+				.filter_map(|hive| {
+					let hive_addr = Arc::clone(&hive.address);
+					core::str::from_utf8(&hive_addr)
+						.ok()
+						.and_then(|s| s.parse().ok())
+						.map(|addr| (hive_addr, addr))
 				})
-				.collect();
+				.for_each(|(hive_addr, addr)| {
+					let result = block_on(self.send_heartbeat(addr));
+					self.process_heartbeat_result(&hive_addr, result);
+				});
 
-			// Wait for this chunk to complete before spawning next
-			handles.into_iter().for_each(|h| {
-				let _ = std_rt::join(h);
-			});
-		});
+			std::thread::sleep(self.heartbeat_config().interval);
+		}
+	}
 
-		std_rt::sleep(config.heartbeat.interval);
+	/// Tier 3: std only - placeholder
+	///
+	/// For std builds without tokio or futures.
+	/// Cannot call async send_heartbeat - placeholder only.
+	#[cfg(all(not(feature = "tokio"), feature = "std", not(feature = "futures")))]
+	fn run_heartbeat_loop(&self)
+	where
+		Self::Address: core::str::FromStr,
+	{
+		loop {
+			self.registry()
+				.all_hives()
+				.unwrap_or_default()
+				.into_iter()
+				.filter_map(|hive| {
+					let hive_addr = Arc::clone(&hive.address);
+					core::str::from_utf8(&hive_addr)
+						.ok()
+						.and_then(|s| s.parse::<Self::Address>().ok())
+						.map(|addr| (hive_addr, addr))
+				})
+				.for_each(|(hive_addr, _addr)| {
+					// Note: Cannot call async send_heartbeat without executor
+					// Increment failure as placeholder behavior
+					let _ = self.registry().increment_failure(&hive_addr);
+				});
+
+			std::thread::sleep(self.heartbeat_config().interval);
+		}
 	}
 }
 
@@ -455,16 +416,18 @@ pub fn run_heartbeat_loop<L: LoadBalancer + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::colony::common::RegisterDroneRequest;
+	use crate::colony::common::RegisterHiveRequest;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::testing::create_test_signing_key;
 	use crate::utils::BasisPoints;
 
-	/// Create a test TLS config for unit tests
-	fn create_test_tls_config() -> ClusterTlsConfig {
-		let signing_key = create_test_signing_key();
-		let key: Secp256k1SigningKey = signing_key;
+	// =========================================================================
+	// Test Helpers
+	// =========================================================================
+
+	fn test_tls_config() -> ClusterTlsConfig {
+		let key: Secp256k1SigningKey = create_test_signing_key();
 		ClusterTlsConfig {
 			certificate: CertificateSpec::Der(&[]),
 			key: Arc::new(Secp256k1KeyProvider::from(key)),
@@ -472,175 +435,133 @@ mod tests {
 		}
 	}
 
+	fn test_registry() -> HiveRegistry {
+		HiveRegistry::new(Duration::from_secs(15))
+	}
+
+	fn request(addr: &[u8], servlets: &[&[u8]]) -> RegisterHiveRequest {
+		RegisterHiveRequest {
+			hive_addr: addr.to_vec(),
+			available_servlets: servlets.iter().map(|s| s.to_vec()).collect(),
+			metadata: None,
+		}
+	}
+
+	fn request_with_meta(addr: &[u8], servlets: &[&[u8]], meta: &[u8]) -> RegisterHiveRequest {
+		RegisterHiveRequest {
+			hive_addr: addr.to_vec(),
+			available_servlets: servlets.iter().map(|s| s.to_vec()).collect(),
+			metadata: Some(meta.to_vec()),
+		}
+	}
+
+	// =========================================================================
+	// ClusterConf Tests
+	// =========================================================================
+
 	#[test]
-	fn cluster_config_new() {
-		let tls = create_test_tls_config();
-		let config = ClusterConf::new(tls);
+	fn cluster_conf_defaults() {
+		let config = ClusterConf::new(test_tls_config());
 		assert_eq!(config.heartbeat.interval, Duration::from_secs(5));
 		assert_eq!(config.heartbeat.timeout, Duration::from_secs(15));
 		assert!(config.policies.is_empty());
 	}
 
+	// =========================================================================
+	// ClusterWorkResponse Tests
+	// =========================================================================
+
 	#[test]
-	fn cluster_work_response_ok() {
+	fn work_response_ok() {
 		let response = ClusterWorkResponse::ok(b"test".to_vec());
 		assert_eq!(response.status, TransitStatus::Accepted);
 		assert_eq!(response.payload, Some(b"test".to_vec()));
 	}
 
 	#[test]
-	fn cluster_work_response_err() {
+	fn work_response_err() {
 		let response = ClusterWorkResponse::err(TransitStatus::Forbidden);
 		assert_eq!(response.status, TransitStatus::Forbidden);
 		assert!(response.payload.is_none());
 	}
 
+	// =========================================================================
+	// HiveRegistry Tests
+	// =========================================================================
+
 	#[test]
-	fn hive_registry_register_and_lookup() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::new(Duration::from_secs(15));
+	fn registry_register_and_lookup() -> Result<(), ClusterError> {
+		let registry = test_registry();
+		registry.register(request(b"127.0.0.1:8080", &[b"ping", b"calc"]))?;
 
-		let request = RegisterDroneRequest {
-			drone_addr: b"127.0.0.1:8080".to_vec(),
-			available_servlets: vec![b"ping_servlet".to_vec(), b"calc_servlet".to_vec()],
-			metadata: None,
-		};
+		// Registered types found
+		assert_eq!(registry.hives_for_type(b"ping")?.len(), 1);
+		assert_eq!(registry.hives_for_type(b"calc")?.len(), 1);
+		assert_eq!(registry.hives_for_type(b"ping")?[0].address.as_ref(), b"127.0.0.1:8080");
 
-		registry.register(request)?;
-
-		// Should find hives for registered types
-		let hives = registry.hives_for_type(b"ping_servlet")?;
-		assert_eq!(hives.len(), 1);
-		assert_eq!(hives[0].address.as_ref(), b"127.0.0.1:8080");
-
-		let hives = registry.hives_for_type(b"calc_servlet")?;
-		assert_eq!(hives.len(), 1);
-
-		// Should not find hives for unregistered types
-		let hives = registry.hives_for_type(b"unknown_servlet")?;
-		assert!(hives.is_empty());
+		// Unknown type not found
+		assert!(registry.hives_for_type(b"unknown")?.is_empty());
 
 		Ok(())
 	}
 
 	#[test]
-	fn hive_registry_unregister() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::new(Duration::from_secs(15));
+	fn registry_unregister() -> Result<(), ClusterError> {
+		let registry = test_registry();
+		registry.register(request(b"127.0.0.1:8080", &[b"ping"]))?;
 
-		let request = RegisterDroneRequest {
-			drone_addr: b"127.0.0.1:8080".to_vec(),
-			available_servlets: vec![b"ping_servlet".to_vec()],
-			metadata: None,
-		};
-
-		registry.register(request)?;
 		assert_eq!(registry.len()?, 1);
-
-		let entry = registry.unregister(b"127.0.0.1:8080")?;
-		assert!(entry.is_some());
+		assert!(registry.unregister(b"127.0.0.1:8080")?.is_some());
 		assert_eq!(registry.len()?, 0);
-
-		// Servlet index should be cleaned up
-		let hives = registry.hives_for_type(b"ping_servlet")?;
-		assert!(hives.is_empty());
+		assert!(registry.hives_for_type(b"ping")?.is_empty());
 
 		Ok(())
 	}
 
 	#[test]
-	fn hive_registry_update_utilization() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::new(Duration::from_secs(15));
+	fn registry_update_utilization() -> Result<(), ClusterError> {
+		let registry = test_registry();
+		registry.register(request(b"127.0.0.1:8080", &[b"ping"]))?;
 
-		let request = RegisterDroneRequest {
-			drone_addr: b"127.0.0.1:8080".to_vec(),
-			available_servlets: vec![b"ping_servlet".to_vec()],
-			metadata: None,
-		};
-
-		registry.register(request)?;
-
-		let updated = registry.update_utilization(b"127.0.0.1:8080", BasisPoints::new(5000))?;
-		assert!(updated);
-
-		let hives = registry.hives_for_type(b"ping_servlet")?;
-		assert_eq!(hives[0].utilization.get(), 5000);
+		assert!(registry.update_utilization(b"127.0.0.1:8080", BasisPoints::new(5000))?);
+		assert_eq!(registry.hives_for_type(b"ping")?[0].utilization.get(), 5000);
 
 		Ok(())
 	}
 
 	#[test]
-	fn hive_registry_available_servlets() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::new(Duration::from_secs(15));
+	fn registry_available_servlets_deduplicated() -> Result<(), ClusterError> {
+		let registry = test_registry();
+		registry.register(request(b"hive1", &[b"ping", b"calc"]))?;
+		registry.register(request(b"hive2", &[b"ping", b"worker"]))?;
 
-		let request1 = RegisterDroneRequest {
-			drone_addr: b"hive1".to_vec(),
-			available_servlets: vec![b"ping".to_vec(), b"calc".to_vec()],
-			metadata: None,
-		};
-
-		let request2 = RegisterDroneRequest {
-			drone_addr: b"hive2".to_vec(),
-			available_servlets: vec![b"ping".to_vec(), b"worker".to_vec()],
-			metadata: None,
-		};
-
-		registry.register(request1)?;
-		registry.register(request2)?;
-
-		let servlets = registry.to_available_servlets()?;
-		assert_eq!(servlets.len(), 3); // ping, calc, worker (ping deduplicated)
+		// ping, calc, worker - ping deduplicated
+		assert_eq!(registry.to_available_servlets()?.len(), 3);
 
 		Ok(())
 	}
 
 	#[test]
-	fn hive_registry_multiple_hives_same_type() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::new(Duration::from_secs(15));
+	fn registry_multiple_hives_same_type() -> Result<(), ClusterError> {
+		let registry = test_registry();
+		registry.register(request(b"hive1", &[b"ping"]))?;
+		registry.register(request(b"hive2", &[b"ping"]))?;
 
-		let request1 = RegisterDroneRequest {
-			drone_addr: b"hive1".to_vec(),
-			available_servlets: vec![b"ping".to_vec()],
-			metadata: None,
-		};
-
-		let request2 = RegisterDroneRequest {
-			drone_addr: b"hive2".to_vec(),
-			available_servlets: vec![b"ping".to_vec()],
-			metadata: None,
-		};
-
-		registry.register(request1)?;
-		registry.register(request2)?;
-
-		let hives = registry.hives_for_type(b"ping")?;
-		assert_eq!(hives.len(), 2);
+		assert_eq!(registry.hives_for_type(b"ping")?.len(), 2);
 
 		Ok(())
 	}
 
 	#[test]
-	fn hive_registry_all_hives() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::new(Duration::from_secs(15));
-
-		let request1 = RegisterDroneRequest {
-			drone_addr: b"hive1".to_vec(),
-			available_servlets: vec![b"ping".to_vec()],
-			metadata: None,
-		};
-
-		let request2 = RegisterDroneRequest {
-			drone_addr: b"hive2".to_vec(),
-			available_servlets: vec![b"calc".to_vec()],
-			metadata: Some(b"metadata".to_vec()),
-		};
-
-		registry.register(request1)?;
-		registry.register(request2)?;
+	fn registry_all_hives() -> Result<(), ClusterError> {
+		let registry = test_registry();
+		registry.register(request(b"hive1", &[b"ping"]))?;
+		registry.register(request_with_meta(b"hive2", &[b"calc"], b"metadata"))?;
 
 		let all = registry.all_hives()?;
 		assert_eq!(all.len(), 2);
 
-		// Verify entries contain expected data
-		let addrs: Vec<&[u8]> = all.iter().map(|e| e.address.as_ref()).collect();
+		let addrs: Vec<_> = all.iter().map(|e| e.address.as_ref()).collect();
 		assert!(addrs.contains(&b"hive1".as_slice()));
 		assert!(addrs.contains(&b"hive2".as_slice()));
 

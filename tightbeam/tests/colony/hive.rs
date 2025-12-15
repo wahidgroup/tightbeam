@@ -5,13 +5,13 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	colony::drone::{Hive, HiveConf, HiveTlsConfig},
+	colony::hive::{Hive, HiveConf, HiveTlsConfig},
 	colony::servlet::Servlet,
 	compose,
 	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
 	decode,
 	der::Sequence,
-	drone, exactly, servlet, tb_assert_spec, tb_scenario,
+	exactly, hive, servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
 	trace::TraceCollector,
 	transport::tcp::r#async::TokioListener,
@@ -57,10 +57,9 @@ servlet! {
 // Test Hive
 // ============================================================================
 
-drone! {
+hive! {
 	HiveX509Test,
 	protocol: TokioListener,
-	hive: true,
 	servlets: {
 		test_servlet: HiveTestServlet<HiveTestRequest>
 	}

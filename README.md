@@ -2138,77 +2138,122 @@ the cluster.
 // TODO
 ```
 
-#### 9.3.4 I: Drones & Hives - WIP
+#### 9.3.4 I: Hives
 
-Drones are containerized servlet runners that can dynamically morph between
-different servlet types based on command messages from a cluster. This
-allows you to seed your application over a specific protocol and then morph
-into any known servlet type at runtime.
+Hives are orchestrators that manage servlet instances. They support two modes:
 
-Hives are an extension of drones that can manage multiple servlets
-simultaneously. They are useful for managing a pool of servlets that can be
-activated on demand. Hives must only be available on
-[Mycelial](src/transport/mod.rs) protocols which support multiple ports
-per address. Hives should automatically maintain exactly the number of servlets
-required to efficiently process messages from the cluster.
+- **Single-Servlet Mode**: Morph between different servlet types one at a time
+- **Multi-Servlet Mode**: On mycelial protocols, manage multiple servlets simultaneously
+
+The mode is determined automatically based on the protocol's capabilities. Call
+`establish_hive()` to enable multi-servlet mode on mycelial protocols.
 
 ##### "Mycelial" Protocols
 
 Protocols such as TCP are considered "mycelial" as they operate over a single
 address but can have multiple ports (SocketAddress). This allows the hive to
-establish a servlet on different ports and provide the protocol address to the
-cluster so it can register it under its hive.
+spawn servlets on different ports and provide their addresses to the cluster.
 
-**Regular Drone Example** (morphs between servlets one at a time):
-
-```rust
-drone! {
-	pub RegularDrone,
-	protocol: Listener,
-	servlets: {
-		ping_pong: PingPongServletWithWorker<RequestMessage>,
-		other_servlet: OtherServlet<RequestMessage>
-	}
-}
-
-// Start the drone
-let drone = RegularDrone::start(TraceCollector::new(), None).await?;
-
-// Register with cluster
-let cluster_addr = "127.0.0.1:8888".parse()?;
-let response = drone.register_with_cluster(cluster_addr).await?;
-```
-
-**Hive Example** (manages multiple servlets simultaneously on different ports):
+**Basic Hive Example**:
 
 ```rust
-drone! {
+hive! {
 	pub MyHive,
 	protocol: TokioListener,
-	hive: true,
 	servlets: {
-		ping_pong: PingPongServletWithWorker<RequestMessage>,
+		ping_pong: PingPongServlet<RequestMessage>,
 		other_servlet: OtherServlet<RequestMessage>
 	}
 }
 
 // Start the hive
-let hive = MyHive::start(TraceCollector::new(), None).await?;
+let mut hive = MyHive::start(
+	Arc::new(TraceCollector::new()),
+	Some(HiveConf::default()),
+).await?;
+
+// On mycelial protocols, establish multi-servlet mode
+hive.establish_hive().await?;
+
+// Get servlet addresses
+let addrs = hive.servlet_addresses().await;
+
+// Register with cluster
+let cluster_addr = "127.0.0.1:8888".parse()?;
+let response = hive.register_with_cluster(cluster_addr).await?;
+
+// Clean up
+hive.stop();
 ```
 
-**Drone with Policies**:
+**Hive with Policies**:
 
 ```rust
-drone! {
-	pub SecureDrone,
-	protocol: Listener,
+hive! {
+	pub SecureHive,
+	protocol: TokioListener,
 	policies: {
 		with_collector_gate: [SignatureGate::new(verifying_key)]
 	},
 	servlets: {
-		ping_pong: PingPongServletWithWorker<RequestMessage>
+		ping_pong: PingPongServlet<RequestMessage>
 	}
 }
+```
+
+##### HiveConf Configuration
+
+```rust
+pub struct HiveConf {
+	/// Load balancing strategy (default: LeastLoaded)
+	pub load_balancer: L,
+	/// Message routing strategy (default: TypeBasedRouter)
+	pub router: R,
+	/// Default scaling config for all servlet types
+	pub default_scale: ServletScaleConf,
+	/// Per-type overrides keyed by servlet type name
+	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
+	/// Cooldown between scaling decisions (default: 5s)
+	pub cooldown: Duration,
+	/// Circuit breaker failure threshold (default: 3)
+	pub circuit_breaker_threshold: u8,
+	/// Drain timeout before force-stop (default: 30s)
+	pub drain_timeout: Duration,
+	/// Trust store for cluster command authentication
+	pub trust_store: Option<Arc<dyn CertificateTrust>>,
+	/// TLS configuration for spawned servlets
+	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+}
+```
+
+##### HiveTlsConfig
+
+```rust
+pub struct HiveTlsConfig {
+	/// Server certificate specification
+	pub certificate: CertificateSpec,
+	/// Private key provider for signing
+	pub key: Arc<dyn SigningKeyProvider>,
+	/// Client certificate validators
+	pub validators: Vec<Arc<dyn CertificateValidation>>,
+}
+```
+
+**TLS Configuration Example**:
+
+```rust
+let (cert, signing_key) = create_test_cert_with_key("CN=Hive Server", 365)?;
+
+let tls_config = Arc::new(HiveTlsConfig {
+	certificate: CertificateSpec::Built(Box::new(cert)),
+	key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
+	validators: vec![],
+});
+
+let hive_conf = HiveConf {
+	hive_tls: Some(tls_config),
+	..Default::default()
+};
 ```
 
 ##### Conclusion

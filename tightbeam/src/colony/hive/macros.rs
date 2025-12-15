@@ -1,32 +1,55 @@
-/// Macro for creating drones with pre-registered servlets
+/// Macro for creating hives with pre-registered servlets
+///
+/// Hives are orchestrators that manage servlet instances. On mycelial protocols
+/// (like TCP), they can manage multiple servlets simultaneously via `establish_hive()`.
+///
+/// # Example
+///
+/// ```ignore
+/// hive! {
+///     pub MyHive,
+///     protocol: TokioListener,
+///     servlets: {
+///         ping: PingServlet<PingRequest>,
+///         calc: CalcServlet<CalcRequest>
+///     }
+/// }
+///
+/// // Start the hive
+/// let mut hive = MyHive::start(trace, Some(config)).await?;
+///
+/// // On mycelial protocols, establish multi-servlet mode
+/// hive.establish_hive().await?;
+/// ```
 #[macro_export]
-macro_rules! drone {
+macro_rules! hive {
+	// Public hive with policies
 	(
 		$(#[$meta:meta])*
-		pub $drone_name:ident,
+		pub $hive_name:ident,
 		protocol: $protocol:path,
-		hive: true,
 		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
 		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
 	) => {
-		drone!(
-			@generate_with_attrs $drone_name,
-			$protocol, [hive],
+		hive!(
+			@generate_with_attrs $hive_name,
+			$protocol,
+			[hive],
 			[$($policy_key: $policy_val),+],
 			$($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]
 		);
 	};
 
+	// Private hive with policies
 	(
 		$(#[$meta:meta])*
-		$drone_name:ident,
+		$hive_name:ident,
 		protocol: $protocol:path,
-		hive: true,
 		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
 		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
 	) => {
-		drone!(
-			@generate_with_attrs $drone_name,
+		hive!(
+			@generate_with_attrs $hive_name,
 			$protocol,
 			[hive],
 			[$($policy_key: $policy_val),+],
@@ -34,95 +57,33 @@ macro_rules! drone {
 		);
 	};
 
+	// Public hive without policies
 	(
 		$(#[$meta:meta])*
-		pub $drone_name:ident,
+		pub $hive_name:ident,
 		protocol: $protocol:path,
-		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
 		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
 	) => {
-		drone!(
-			@generate_with_attrs $drone_name,
-			$protocol,
-			[],
-			[$($policy_key: $policy_val),+],
-			$($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]
-		);
-	};
-
-	(
-		$(#[$meta:meta])*
-		$drone_name:ident,
-		protocol: $protocol:path,
-		policies: { $($policy_key:ident: $policy_val:tt),+ $(,)? },
-		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
-	) => {
-		drone!(
-			@generate_with_attrs $drone_name,
-			$protocol,
-			[],
-			[$($policy_key: $policy_val),+],
-			$($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]
-		);
-	};
-
-	(
-		$(#[$meta:meta])*
-		pub $drone_name:ident,
-		protocol: $protocol:path,
-		hive: true,
-		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
-	) => {
-		drone!(
-			@generate_with_attrs $drone_name,
+		hive!(
+			@generate_with_attrs $hive_name,
 			$protocol,
 			[hive],
 			[],
 			$($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]
 		);
 	};
+
+	// Private hive without policies
 	(
 		$(#[$meta:meta])*
-		$drone_name:ident,
+		$hive_name:ident,
 		protocol: $protocol:path,
-		hive: true,
 		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
 	) => {
-		drone!(
-			@generate_with_attrs $drone_name,
+		hive!(
+			@generate_with_attrs $hive_name,
 			$protocol,
 			[hive],
-			[],
-			$($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]
-		);
-	};
-
-	(
-		$(#[$meta:meta])*
-		pub $drone_name:ident,
-		protocol: $protocol:path,
-		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
-	) => {
-		drone!(
-			@generate_with_attrs $drone_name,
-			$protocol,
-			[],
-			[],
-			$($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]
-		);
-	};
-
-	// Implement hive struct without attributes and visibility
-	(
-		$(#[$meta:meta])*
-		$drone_name:ident,
-		protocol: $protocol:path,
-		servlets: { $($servlet_id:ident: $servlet_name:ident<$input:ty>),* $(,)? }
-	) => {
-		drone!(
-			@generate_with_attrs $drone_name,
-			$protocol,
-			[],
 			[],
 			$($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]
 		);
@@ -130,66 +91,37 @@ macro_rules! drone {
 
 	// Generate with attributes and visibility
 	(
-		@generate_with_attrs $drone_name:ident,
+		@generate_with_attrs $hive_name:ident,
 		$protocol:path,
 		[hive],
 		[$($policy_key:ident: $policy_val:tt),*],
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, pub, [$(#[$meta:meta])*]
 	) => {
-		drone!(@impl_hive_struct_with_attrs $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
-		drone!(@impl_servlet_trait_for_hive $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_drone_trait_for_hive $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_hive_trait $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_drop_for_hive $drone_name);
+		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
+		hive!(@impl_servlet_trait_for_hive $hive_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
+		hive!(@impl_hive_trait $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
+		hive!(@impl_drop_for_hive $hive_name);
 	};
 
 	(
-		@generate_with_attrs $drone_name:ident,
+		@generate_with_attrs $hive_name:ident,
 		$protocol:path,
 		[hive],
 		[$($policy_key:ident: $policy_val:tt),*],
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, , [$(#[$meta:meta])*]
 	) => {
-		drone!(@impl_hive_struct_with_attrs $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
-		drone!(@impl_servlet_trait_for_hive $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_drone_trait_for_hive $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_hive_trait $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_drop_for_hive $drone_name);
+		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
+		hive!(@impl_servlet_trait_for_hive $hive_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
+		hive!(@impl_hive_trait $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
+		hive!(@impl_drop_for_hive $hive_name);
 	};
 
-	(
-		@generate_with_attrs $drone_name:ident,
-		$protocol:path,
-		[],
-		[$($policy_key:ident: $policy_val:tt),*],
-		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, pub, [$(#[$meta:meta])*]
-	) => {
-		drone!(@impl_enum $drone_name, $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_struct_with_attrs $drone_name, $protocol, pub, [$(#[$meta])*]);
-		drone!(@impl_servlet_trait $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_drone_trait $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_drop $drone_name);
-	};
-
-	(
-		@generate_with_attrs $drone_name:ident,
-		$protocol:path,
-		[],
-		[$($policy_key:ident: $policy_val:tt),*],
-		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, , [$(#[$meta:meta])*]
-	) => {
-		drone!(@impl_enum $drone_name, $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_struct_with_attrs $drone_name, $protocol, , [$(#[$meta])*]);
-		drone!(@impl_servlet_trait $drone_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_drone_trait $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
-		drone!(@impl_drop $drone_name);
-	};
 
 	// Start servlet
 	(
 		@start_servlet $servlet_name:ident<$input:ty>,
 		$instance:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$servlet_id:ident,
 		$servlet_id_str:expr,
 		$error_id:expr
@@ -197,10 +129,10 @@ macro_rules! drone {
 		paste::paste! {
 			let servlet = <$servlet_name as $crate::colony::servlet::Servlet<$input>>::start(
 				::std::sync::Arc::clone(&$instance.trace), None,
-			).await.map_err(|_| $crate::colony::drone::DroneError::InvalidServletId($error_id))?;
+			).await.map_err(|_| $crate::colony::hive::HiveError::InvalidServletId($error_id))?;
 
 			let mut active = $instance.active_servlet.lock()?;
-			*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
+			*active = [<$hive_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
 			return Ok($crate::policy::TransitStatus::Accepted);
 		}
 	};
@@ -208,7 +140,7 @@ macro_rules! drone {
 	// Start servlet with response (for control server)
 	(
 		@start_servlet_with_response $servlet_name:ident<$input:ty>,
-		$drone_name:ident,
+		$hive_name:ident,
 		$servlet_id:ident,
 		$servlet_id_str:expr,
 		$error_id:expr,
@@ -221,7 +153,7 @@ macro_rules! drone {
 			// Stop old servlet if any
 			let old_servlet = {
 				let mut active = $active_servlet.lock()?;
-				core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None)
+				core::mem::replace(&mut *active, [<$hive_name ActiveServlet>]::None)
 			};
 
 			$stop_old(old_servlet);
@@ -234,13 +166,13 @@ macro_rules! drone {
 					let servlet_addr = servlet.addr();
 					let addr_bytes: Vec<u8> = servlet_addr.into();
 					let mut active = $active_servlet.lock()?;
-					*active = [<$drone_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
+					*active = [<$hive_name ActiveServlet>]::[<$servlet_id:camel>](servlet);
 					drop(active);
-					return drone!(@reply $frame, $crate::colony::drone::ActivateServletResponse::ok(addr_bytes));
+					return hive!(@reply $frame, $crate::colony::hive::ActivateServletResponse::ok(addr_bytes));
 				}
 				Err(_) => {
-					return drone!(@reply $frame,
-						$crate::colony::drone::ActivateServletResponse::err($crate::policy::TransitStatus::Forbidden)
+					return hive!(@reply $frame,
+						$crate::colony::hive::ActivateServletResponse::err($crate::policy::TransitStatus::Forbidden)
 					);
 				}
 			}
@@ -248,17 +180,17 @@ macro_rules! drone {
 	};
 
 	// Generate the enum for holding different servlet types
-	(@impl_enum $drone_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+	(@impl_enum $hive_name:ident, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
 			// Generate an enum to hold any of the possible servlet types
-			enum [<$drone_name ActiveServlet>] {
+			enum [<$hive_name ActiveServlet>] {
 				None,
 				$(
 					[<$servlet_id:camel>]($servlet_name),
 				)*
 			}
 
-			impl Default for [<$drone_name ActiveServlet>] {
+			impl Default for [<$hive_name ActiveServlet>] {
 				fn default() -> Self {
 					Self::None
 				}
@@ -267,27 +199,27 @@ macro_rules! drone {
 	};
 
 	// Generate the drone struct
-	(@impl_struct $drone_name:ident, $protocol:path) => {
-		drone!(@impl_struct_with_attrs $drone_name, $protocol, pub, []);
+	(@impl_struct $hive_name:ident, $protocol:path) => {
+		hive!(@impl_struct_with_attrs $hive_name, $protocol, pub, []);
 	};
 
 	// Generate the drone struct with attributes and visibility
-	(@impl_struct_with_attrs $drone_name:ident, $protocol:path, pub, [$(#[$meta:meta])*]) => {
+	(@impl_struct_with_attrs $hive_name:ident, $protocol:path, pub, [$(#[$meta:meta])*]) => {
 		paste::paste! {
 			$(#[$meta])*
-			pub struct $drone_name {
-				active_servlet: ::std::sync::Arc<::std::sync::Mutex<[<$drone_name ActiveServlet>]>>,
+			pub struct $hive_name {
+				active_servlet: ::std::sync::Arc<::std::sync::Mutex<[<$hive_name ActiveServlet>]>>,
 				control_server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 			}
 		}
 	};
-	(@impl_struct_with_attrs $drone_name:ident, $protocol:path, , [$(#[$meta:meta])*]) => {
+	(@impl_struct_with_attrs $hive_name:ident, $protocol:path, , [$(#[$meta:meta])*]) => {
 		paste::paste! {
 			$(#[$meta])*
-			struct $drone_name {
-				active_servlet: ::std::sync::Arc<::std::sync::Mutex<[<$drone_name ActiveServlet>]>>,
+			struct $hive_name {
+				active_servlet: ::std::sync::Arc<::std::sync::Mutex<[<$hive_name ActiveServlet>]>>,
 				control_server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
 				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
@@ -297,13 +229,13 @@ macro_rules! drone {
 
 	// Implement Servlet trait
 	(
-		@impl_servlet_trait $drone_name:ident,
+		@impl_servlet_trait $hive_name:ident,
 		$protocol:path,
 		[$($policy_key:ident: $policy_val:tt),*],
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {
 		paste::paste! {
-			impl $crate::colony::servlet::Servlet<()> for $drone_name {
+			impl $crate::colony::servlet::Servlet<()> for $hive_name {
 				type Conf = ();
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
@@ -316,20 +248,20 @@ macro_rules! drone {
 					let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
 
 					// Create shared state for the active servlet
-					let active_servlet = ::std::sync::Arc::new(::std::sync::Mutex::new([<$drone_name ActiveServlet>]::None));
+					let active_servlet = ::std::sync::Arc::new(::std::sync::Mutex::new([<$hive_name ActiveServlet>]::None));
 					let active_servlet_clone = ::std::sync::Arc::clone(&active_servlet);
 
 					// Clone trace for control server
 					let trace_clone = ::std::sync::Arc::clone(&trace);
 
 					// Start the control server that listens for ActivateServletRequest messages
-					let control_server_handle = drone!(
+					let control_server_handle = hive!(
 						@build_control_server $protocol,
 						listener,
 						[$($policy_key: $policy_val),*],
 						active_servlet_clone,
 						trace_clone,
-						$drone_name,
+						$hive_name,
 						$($servlet_id: $servlet_name<$input>),*
 					);
 
@@ -351,12 +283,12 @@ macro_rules! drone {
 					}
 					// Stop any active servlet
 					if let Ok(mut active) = self.active_servlet.lock() {
-						let servlet = ::core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None);
+						let servlet = ::core::mem::replace(&mut *active, [<$hive_name ActiveServlet>]::None);
 						drop(active);
 						match servlet {
-							[<$drone_name ActiveServlet>]::None => {},
+							[<$hive_name ActiveServlet>]::None => {},
 							$(
-								[<$drone_name ActiveServlet>]::[<$servlet_id:camel>](s) => {
+								[<$hive_name ActiveServlet>]::[<$servlet_id:camel>](s) => {
 									s.stop();
 								}
 							)*
@@ -390,7 +322,7 @@ macro_rules! drone {
 		@start_servlet_for_hive_establish_impl $protocol:path,
 		$servlet_name:ident<$input:ty>,
 		$instance:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$servlet_id:ident
 	) => {
 		paste::paste! {
@@ -430,7 +362,7 @@ macro_rules! drone {
 					}
 
 					if let Ok(mut servlets) = $instance.servlets.lock() {
-						servlets.insert(servlet_id, [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
+						servlets.insert(servlet_id, [<$hive_name Servlet>]::[<$servlet_id:camel>](servlet));
 					}
 				}
 				Err(_e) => {
@@ -445,7 +377,7 @@ macro_rules! drone {
 	// Start servlet for hive (with response) - legacy version
 	(
 		@start_servlet_for_hive $servlet_name:ident<$input:ty>,
-		$drone_name:ident,
+		$hive_name:ident,
 		$servlet_id:ident,
 		$servlet_id_str:expr,
 		$error_id:expr,
@@ -471,17 +403,17 @@ macro_rules! drone {
 					servlet_id.extend_from_slice(&addr_bytes);
 
 					let mut servlets = $servlets.lock()?;
-					servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
+					servlets.insert(servlet_id.clone(), [<$hive_name Servlet>]::[<$servlet_id:camel>](servlet));
 
 					drop(servlets);
 
-					return drone!(@reply $frame,
-						$crate::colony::drone::HiveManagementResponse::spawn_ok(addr_bytes, servlet_id)
+					return hive!(@reply $frame,
+						$crate::colony::hive::HiveManagementResponse::spawn_ok(addr_bytes, servlet_id)
 					);
 				}
 				Err(_) => {
-					return drone!(@reply $frame,
-						$crate::colony::drone::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
+					return hive!(@reply $frame,
+						$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
 					);
 				}
 			}
@@ -491,7 +423,7 @@ macro_rules! drone {
 	// Start servlet for hive (with ClusterCommandResponse wrapper)
 	(
 		@start_servlet_for_hive_cmd $servlet_name:ident<$input:ty>,
-		$drone_name:ident,
+		$hive_name:ident,
 		$servlet_id:ident,
 		$servlet_id_str:expr,
 		$error_id:expr,
@@ -515,153 +447,40 @@ macro_rules! drone {
 					servlet_id.extend_from_slice(&addr_bytes);
 
 					let mut servlets = $servlets.lock()?;
-					servlets.insert(servlet_id.clone(), [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
+					servlets.insert(servlet_id.clone(), [<$hive_name Servlet>]::[<$servlet_id:camel>](servlet));
 
 					drop(servlets);
 
-					return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-						$crate::colony::drone::HiveManagementResponse::spawn_ok(addr_bytes, servlet_id)
+					return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+						$crate::colony::hive::HiveManagementResponse::spawn_ok(addr_bytes, servlet_id)
 					));
 				}
 				Err(_) => {
-					return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-						$crate::colony::drone::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
+					return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+						$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
 					));
 				}
 			}
 		}
 	};
 
-	// Implement Drone trait
-	(@impl_drone_trait $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
-		paste::paste! {
-			impl $crate::colony::drone::Drone<()> for $drone_name {
-				type Protocol = $protocol;
-
-				fn trace(&self) -> ::std::sync::Arc<$crate::trace::TraceCollector> {
-					::std::sync::Arc::clone(&self.trace)
-				}
-
-				async fn morph(
-					&mut self,
-					msg: $crate::colony::drone::ActivateServletRequest,
-				) -> Result<$crate::policy::TransitStatus, $crate::colony::drone::DroneError> {
-					// Deactivate current servlet if any
-					if self.is_active() {
-						self.deactivate().await?;
-					}
-
-					// Match servlet_id and activate the corresponding servlet
-					$(
-						if msg.servlet_id == stringify!($servlet_id).as_bytes() {
-							drone!(
-								@start_servlet $servlet_name<$input>,
-								self,
-								$drone_name,
-								$servlet_id,
-								stringify!($servlet_id),
-								msg.servlet_id.clone()
-							);
-						}
-					)*
-
-					// Unknown servlet ID
-					Err($crate::colony::drone::DroneError::InvalidServletId(msg.servlet_id))
-				}
-
-				fn is_active(&self) -> bool {
-					self.active_servlet.lock()
-						.map(|active| !matches!(*active, [<$drone_name ActiveServlet>]::None))
-						.unwrap_or(false)
-				}
-
-				async fn deactivate(&mut self) -> Result<(), $crate::colony::drone::DroneError> {
-					// Take the active servlet and stop it
-					let mut active = self.active_servlet.lock()?;
-					let servlet = core::mem::replace(&mut *active, [<$drone_name ActiveServlet>]::None);
-
-					drop(active);
-
-					match servlet {
-						[<$drone_name ActiveServlet>]::None => {},
-						$(
-							[<$drone_name ActiveServlet>]::[<$servlet_id:camel>](s) => {
-								s.stop();
-							}
-						)*
-					}
-
-					Ok(())
-				}
-
-				async fn register_with_cluster(
-					&self,
-					cluster_addr: <$protocol as $crate::transport::Protocol>::Address,
-				) -> Result<$crate::colony::drone::RegisterDroneResponse, $crate::colony::drone::DroneError> {
-					use $crate::transport::MessageEmitter;
-
-					// Get this drone's address
-					let drone_addr = self.addr();
-					// Convert address to bytes
-					let drone_addr_bytes: Vec<u8> = drone_addr.into();
-
-					// Build list of available servlet IDs
-					let available_servlets = vec![
-						$(
-							stringify!($servlet_id).as_bytes().to_vec(),
-						)*
-					];
-
-					// Create registration request
-					let request = $crate::colony::drone::RegisterDroneRequest {
-						drone_addr: drone_addr_bytes,
-						available_servlets,
-						metadata: None,
-					};
-
-					// Connect to cluster and send registration
-					let stream = <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await?;
-					let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
-					let frame = {
-						use $crate::builder::TypeBuilder;
-						$crate::utils::compose($crate::Version::V0)
-							.with_id(b"drone-registration")
-							.with_order(0)
-							.with_message(request)
-							.build()?
-					};
-
-					// Send and wait for response
-					let response_frame = transport.emit(frame, None).await
-						.map_err(|_| $crate::colony::drone::DroneError::EmitFailed)?
-						.ok_or_else(|| $crate::colony::drone::DroneError::NoResponse)?;
-
-					// Decode response
-					let response = $crate::decode::<$crate::colony::drone::RegisterDroneResponse>(&response_frame.message)
-						.map_err(|_| $crate::colony::drone::DroneError::DecodeFailed)?;
-
-					Ok(response)
-				}
-			}
-		}
-	};
 
 	// Generate hive struct (stores multiple servlet instances)
-	(@impl_hive_struct $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
-		drone!(@impl_hive_struct_with_attrs $drone_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, []);
+	(@impl_hive_struct $hive_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
+		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, []);
 	};
 
 	// Generate hive struct with attributes and visibility
 	(
-		@impl_hive_struct_with_attrs $drone_name:ident,
+		@impl_hive_struct_with_attrs $hive_name:ident,
 		$protocol:path,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, pub, [$(#[$meta:meta])*]
 	) => {
 		paste::paste! {
 			$(#[$meta])*
-			pub struct $drone_name {
-				servlets: ::std::sync::Arc<::std::sync::Mutex<::std::collections::HashMap<Vec<u8>, [<$drone_name Servlet>]>>>,
-				config: $crate::colony::drone::HiveConf,
+			pub struct $hive_name {
+				servlets: ::std::sync::Arc<::std::sync::Mutex<::std::collections::HashMap<Vec<u8>, [<$hive_name Servlet>]>>>,
+				config: $crate::colony::hive::HiveConf,
 				control_server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 				scaling_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
@@ -674,7 +493,7 @@ macro_rules! drone {
 				draining_since: ::std::sync::Arc<::std::sync::RwLock<Option<::std::time::Instant>>>,
 			}
 
-			enum [<$drone_name Servlet>] {
+			enum [<$hive_name Servlet>] {
 				$(
 					[<$servlet_id:camel>]($servlet_name),
 				)*
@@ -684,15 +503,15 @@ macro_rules! drone {
 
 	// Implement hive struct with attributes and visibility
 	(
-		@impl_hive_struct_with_attrs $drone_name:ident,
+		@impl_hive_struct_with_attrs $hive_name:ident,
 		$protocol:path,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, , [$(#[$meta:meta])*]
 	) => {
 		paste::paste! {
 			$(#[$meta])*
-			struct $drone_name {
-				servlets: ::std::sync::Arc<::std::sync::Mutex<::std::collections::HashMap<Vec<u8>, [<$drone_name Servlet>]>>>,
-				config: $crate::colony::drone::HiveConf,
+			struct $hive_name {
+				servlets: ::std::sync::Arc<::std::sync::Mutex<::std::collections::HashMap<Vec<u8>, [<$hive_name Servlet>]>>>,
+				config: $crate::colony::hive::HiveConf,
 				control_server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 				scaling_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
@@ -705,7 +524,7 @@ macro_rules! drone {
 				draining_since: ::std::sync::Arc<::std::sync::RwLock<Option<::std::time::Instant>>>,
 			}
 
-			enum [<$drone_name Servlet>] {
+			enum [<$hive_name Servlet>] {
 				$(
 					[<$servlet_id:camel>]($servlet_name),
 				)*
@@ -715,14 +534,14 @@ macro_rules! drone {
 
 	// Implement Servlet trait for hive
 	(
-		@impl_servlet_trait_for_hive $drone_name:ident,
+		@impl_servlet_trait_for_hive $hive_name:ident,
 		$protocol:path,
 		[$($policy_key:ident: $policy_val:tt),*],
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {
 		paste::paste! {
-			impl $crate::colony::servlet::Servlet<()> for $drone_name {
-				type Conf = $crate::colony::drone::HiveConf;
+			impl $crate::colony::servlet::Servlet<()> for $hive_name {
+				type Conf = $crate::colony::hive::HiveConf;
 				type Address = <$protocol as $crate::transport::Protocol>::Address;
 
 				async fn start(
@@ -776,7 +595,7 @@ macro_rules! drone {
 
 					// Start the control server that listens for management commands
 					#[cfg(feature = "x509")]
-					let control_server_handle = drone!(
+					let control_server_handle = hive!(
 						@build_hive_control_server $protocol,
 						listener,
 						[$($policy_key: $policy_val),*],
@@ -789,7 +608,7 @@ macro_rules! drone {
 						trust_store,
 						servlet_pool_for_server,
 						draining_since_for_server,
-						$drone_name,
+						$hive_name,
 						$($servlet_id: $servlet_name<$input>),*
 					);
 					#[cfg(not(feature = "x509"))]
@@ -827,7 +646,7 @@ macro_rules! drone {
 						for (_name, servlet) in servlets.drain() {
 							match servlet {
 								$(
-									[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => {
+									[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => {
 										s.stop();
 									}
 								)*
@@ -857,14 +676,11 @@ macro_rules! drone {
 		}
 	};
 
-	// Implement Drone trait for hive (minimal implementation)
-	(
-		@impl_drone_trait_for_hive $drone_name:ident,
-		$protocol:path,
-		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
-	) => {
+
+	// Implement Hive trait (all methods)
+	(@impl_hive_trait $hive_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
 		paste::paste! {
-			impl $crate::colony::drone::Drone<()> for $drone_name {
+			impl $crate::colony::hive::Hive<()> for $hive_name {
 				type Protocol = $protocol;
 
 				fn trace(&self) -> ::std::sync::Arc<$crate::trace::TraceCollector> {
@@ -873,10 +689,10 @@ macro_rules! drone {
 
 				async fn morph(
 					&mut self,
-					_msg: $crate::colony::drone::ActivateServletRequest,
-				) -> Result<$crate::policy::TransitStatus, $crate::colony::drone::DroneError> {
-					// Hives don't morph - they manage multiple servlets
-					Err($crate::colony::drone::DroneError::InvalidServletId(b"hive_does_not_morph".to_vec()))
+					_msg: $crate::colony::hive::ActivateServletRequest,
+				) -> Result<$crate::policy::TransitStatus, $crate::colony::hive::HiveError> {
+					// Hives don't morph - they manage multiple servlets via establish_hive()
+					Err($crate::colony::hive::HiveError::InvalidServletId(b"use_establish_hive".to_vec()))
 				}
 
 				fn is_active(&self) -> bool {
@@ -885,47 +701,40 @@ macro_rules! drone {
 						.unwrap_or(false)
 				}
 
-				async fn deactivate(&mut self) -> Result<(), $crate::colony::drone::DroneError> {
+				async fn deactivate(&mut self) -> Result<(), $crate::colony::hive::HiveError> {
 					// Stop all servlets
 					let mut servlets = self.servlets.lock()?;
 					for (_name, servlet) in servlets.drain() {
 						match servlet {
 							$(
-								[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => {
+								[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => {
 									s.stop();
 								}
 							)*
 						}
 					}
-
 					Ok(())
 				}
 
 				async fn register_with_cluster(
 					&self,
 					cluster_addr: <$protocol as $crate::transport::Protocol>::Address,
-				) -> Result<$crate::colony::drone::RegisterDroneResponse, $crate::colony::drone::DroneError> {
+				) -> Result<$crate::colony::hive::RegisterHiveResponse, $crate::colony::hive::HiveError> {
 					use $crate::transport::MessageEmitter;
 
-					// Get this hive's address
-					let drone_addr = self.addr();
-					let drone_addr_bytes: Vec<u8> = drone_addr.into();
+					let hive_addr = self.addr();
+					let hive_addr_bytes: Vec<u8> = hive_addr.into();
 
-					// Build list of available servlet IDs
 					let available_servlets = vec![
-						$(
-							stringify!($servlet_id).as_bytes().to_vec(),
-						)*
+						$(stringify!($servlet_id).as_bytes().to_vec(),)*
 					];
 
-					// Create registration request
-					let request = $crate::colony::drone::RegisterDroneRequest {
-						drone_addr: drone_addr_bytes,
+					let request = $crate::colony::hive::RegisterHiveRequest {
+						hive_addr: hive_addr_bytes,
 						available_servlets,
 						metadata: Some(b"hive".to_vec()),
 					};
 
-					// Connect to cluster and send registration
 					let stream = <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await?;
 					let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
 					let frame = {
@@ -937,25 +746,16 @@ macro_rules! drone {
 							.build()?
 					};
 
-					// Send and wait for response
 					let response_frame = transport.emit(frame, None).await?
-						.ok_or($crate::colony::drone::DroneError::NoResponse)?;
+						.ok_or($crate::colony::hive::HiveError::NoResponse)?;
 
-					// Decode response
-					Ok($crate::decode::<$crate::colony::drone::RegisterDroneResponse>(&response_frame.message)?)
+					Ok($crate::decode::<$crate::colony::hive::RegisterHiveResponse>(&response_frame.message)?)
 				}
-			}
-		}
-	};
 
-	// Implement Hive trait for mycelial async protocols
-	(@impl_hive_trait $drone_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
-		paste::paste! {
-			impl $crate::colony::drone::Hive<()> for $drone_name
-			where
-				$protocol: $crate::transport::Mycelial + $crate::transport::AsyncListenerTrait,
-			{
-				async fn establish_hive(&mut self) -> Result<(), $crate::colony::drone::DroneError> {
+				async fn establish_hive(&mut self) -> Result<(), $crate::colony::hive::HiveError>
+				where
+					$protocol: $crate::transport::Mycelial + $crate::transport::AsyncListenerTrait,
+				{
 					// Start min_instances of each servlet type
 					// Each servlet will call Protocol::bind() with default_bind_address()
 					// which returns "0.0.0.0:0" (or equivalent), causing the OS to allocate
@@ -968,11 +768,11 @@ macro_rules! drone {
 								.unwrap_or(self.config.default_scale.min_instances);
 
 							for _ in 0..min_instances {
-								drone!(
+								hive!(
 									@start_servlet_for_hive_establish_impl $protocol,
 									$servlet_name<$input>,
 									self,
-									$drone_name,
+									$hive_name,
 									$servlet_id
 								);
 							}
@@ -987,10 +787,10 @@ macro_rules! drone {
 					let utilization_map_for_scaling = ::std::sync::Arc::clone(&self.utilization_map);
 
 					// Define helper closure to stop any servlet variant (avoids nested macro repetition)
-					let stop_servlet = |servlet: [<$drone_name Servlet>]| {
+					let stop_servlet = |servlet: [<$hive_name Servlet>]| {
 						match servlet {
 							$(
-								[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
+								[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
 							)*
 						}
 					};
@@ -1041,7 +841,7 @@ macro_rules! drone {
 												}
 
 												if let Ok(mut guard) = servlets_inner.lock() {
-													guard.insert(key, [<$drone_name Servlet>]::[<$servlet_id:camel>](servlet));
+													guard.insert(key, [<$hive_name Servlet>]::[<$servlet_id:camel>](servlet));
 												}
 											}
 										})
@@ -1086,7 +886,7 @@ macro_rules! drone {
 										// Get utilization from servlet (if it reports one)
 										let util_bps: u16 = match servlet {
 											$(
-												[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => {
+												[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => {
 													s.utilization()
 														.map(|bp| bp.get())
 														.unwrap_or(5000) // Default 50% if not reported
@@ -1163,7 +963,10 @@ macro_rules! drone {
 					Ok(())
 				}
 
-				async fn servlet_addresses(&self) -> Vec<(Vec<u8>, <$protocol as $crate::transport::Protocol>::Address)> {
+				async fn servlet_addresses(&self) -> Vec<(Vec<u8>, <$protocol as $crate::transport::Protocol>::Address)>
+				where
+					$protocol: $crate::transport::Mycelial + $crate::transport::AsyncListenerTrait,
+				{
 					self.servlets.lock()
 						.map(|servlets| {
 							// Collect addresses of all active servlets
@@ -1171,7 +974,7 @@ macro_rules! drone {
 							for (name, servlet) in servlets.iter() {
 								let addr = match servlet {
 									$(
-										[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.addr(),
+										[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => s.addr(),
 									)*
 								};
 
@@ -1183,7 +986,10 @@ macro_rules! drone {
 						.unwrap_or_else(|_| Vec::new())
 				}
 
-				async fn drain(&self) -> Result<(), $crate::colony::drone::DroneError> {
+				async fn drain(&self) -> Result<(), $crate::colony::hive::HiveError>
+				where
+					$protocol: $crate::transport::Mycelial + $crate::transport::AsyncListenerTrait,
+				{
 					// Set draining state
 					{
 						let mut guard = self.draining_since.write()?;
@@ -1211,7 +1017,7 @@ macro_rules! drone {
 									if let Some(servlet) = guard.remove(&key) {
 										match servlet {
 											$(
-												[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
+												[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
 											)*
 										}
 									}
@@ -1229,7 +1035,10 @@ macro_rules! drone {
 					Ok(())
 				}
 
-				fn is_draining(&self) -> bool {
+				fn is_draining(&self) -> bool
+				where
+					$protocol: $crate::transport::Mycelial + $crate::transport::AsyncListenerTrait,
+				{
 					self.draining_since.read()
 						.map(|g| g.is_some())
 						.unwrap_or(false)
@@ -1239,8 +1048,8 @@ macro_rules! drone {
 	};
 
 	// Implement Drop for hive
-	(@impl_drop_for_hive $drone_name:ident) => {
-		impl Drop for $drone_name {
+	(@impl_drop_for_hive $hive_name:ident) => {
+		impl Drop for $hive_name {
 			fn drop(&mut self) {
 				// Stop the scaling task
 				if let Some(handle) = self.scaling_handle.take() {
@@ -1255,8 +1064,8 @@ macro_rules! drone {
 	};
 
 	// Implement Drop trait
-	(@impl_drop $drone_name:ident) => {
-		impl Drop for $drone_name {
+	(@impl_drop $hive_name:ident) => {
+		impl Drop for $hive_name {
 			fn drop(&mut self) {
 				if let Some(handle) = self.control_server_handle.take() {
 					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
@@ -1272,7 +1081,7 @@ macro_rules! drone {
 		[$($policy_key:ident: $policy_val:tt),+],
 		$active_servlet:ident,
 		$trace:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {
 		paste::paste! {
@@ -1283,11 +1092,11 @@ macro_rules! drone {
 					let active_servlet = std::sync::Arc::clone(&$active_servlet);
 					let trace = ::std::sync::Arc::clone(&$trace);
 					async move {
-						drone!(
+						hive!(
 							@handle_activation_request frame,
 							active_servlet,
 							trace,
-							$drone_name, $($servlet_id: $servlet_name<$input>),*
+							$hive_name, $($servlet_id: $servlet_name<$input>),*
 						)
 					}
 				}
@@ -1302,7 +1111,7 @@ macro_rules! drone {
 		[],
 		$active_servlet:ident,
 		$trace:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {
 		paste::paste! {
@@ -1312,11 +1121,11 @@ macro_rules! drone {
 					let active_servlet = ::std::sync::Arc::clone(&$active_servlet);
 					let trace = ::std::sync::Arc::clone(&$trace);
 					async move {
-						drone!(
+						hive!(
 							@handle_activation_request frame,
 							active_servlet,
 							trace,
-							$drone_name,
+							$hive_name,
 							$($servlet_id: $servlet_name<$input>),*
 						)
 					}
@@ -1339,11 +1148,11 @@ macro_rules! drone {
 		$trust_store:ident,
 		$servlet_pool:ident,
 		$draining_since:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {{
 		let circuit_breaker = ::std::sync::Arc::new(
-			$crate::colony::drone::ClusterCircuitBreaker::new($cb_threshold, $cb_cooldown_ms)
+			$crate::colony::hive::ClusterCircuitBreaker::new($cb_threshold, $cb_cooldown_ms)
 		);
 
 		paste::paste! {
@@ -1360,7 +1169,7 @@ macro_rules! drone {
 					let servlet_pool = ::std::sync::Arc::clone(&$servlet_pool);
 					let draining_since = ::std::sync::Arc::clone(&$draining_since);
 					async move {
-						drone!(
+						hive!(
 							@handle_cluster_command $protocol,
 							frame,
 							servlets,
@@ -1371,7 +1180,7 @@ macro_rules! drone {
 							trust_store,
 							servlet_pool,
 							draining_since,
-							$drone_name,
+							$hive_name,
 							$($servlet_id: $servlet_name<$input>),*
 						)
 					}
@@ -1394,11 +1203,11 @@ macro_rules! drone {
 		$trust_store:ident,
 		$servlet_pool:ident,
 		$draining_since:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {{
 		let circuit_breaker = ::std::sync::Arc::new(
-			$crate::colony::drone::ClusterCircuitBreaker::new($cb_threshold, $cb_cooldown_ms)
+			$crate::colony::hive::ClusterCircuitBreaker::new($cb_threshold, $cb_cooldown_ms)
 		);
 
 		paste::paste! {
@@ -1414,7 +1223,7 @@ macro_rules! drone {
 					let servlet_pool = ::std::sync::Arc::clone(&$servlet_pool);
 					let draining_since = ::std::sync::Arc::clone(&$draining_since);
 					async move {
-						drone!(
+						hive!(
 							@handle_cluster_command $protocol,
 							frame,
 							servlets,
@@ -1425,7 +1234,7 @@ macro_rules! drone {
 							trust_store,
 							servlet_pool,
 							draining_since,
-							$drone_name,
+							$hive_name,
 							$($servlet_id: $servlet_name<$input>),*
 						)
 					}
@@ -1468,7 +1277,7 @@ macro_rules! drone {
 		@handle_activation_request $frame:ident,
 		$active_servlet:ident,
 		$trace:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {
 		paste::paste! {
@@ -1476,11 +1285,11 @@ macro_rules! drone {
 				// Define a helper function to stop old servlets
 				// This must be defined outside the repetition so we can
 				// generate all match arms
-				let stop_old_servlet = |old: [<$drone_name ActiveServlet>]| {
+				let stop_old_servlet = |old: [<$hive_name ActiveServlet>]| {
 					match old {
-						[<$drone_name ActiveServlet>]::None => {},
+						[<$hive_name ActiveServlet>]::None => {},
 						$(
-							[<$drone_name ActiveServlet>]::[<$servlet_id:camel>](s) => {
+							[<$hive_name ActiveServlet>]::[<$servlet_id:camel>](s) => {
 								s.stop();
 							}
 						)*
@@ -1488,15 +1297,15 @@ macro_rules! drone {
 				};
 
 				// First, try to decode as an activation request
-				if let Ok(request) = $crate::decode::<$crate::colony::drone::ActivateServletRequest>(&$frame.message) {
+				if let Ok(request) = $crate::decode::<$crate::colony::hive::ActivateServletRequest>(&$frame.message) {
 					// Match servlet_id and activate the corresponding servlet
 					$(
 						if request.servlet_id == stringify!($servlet_id).as_bytes() {
 							// Start the servlet with correct generic parameter
 							paste::paste! {
-								drone!(
+								hive!(
 									@start_servlet_with_response $servlet_name<$input>,
-									$drone_name,
+									$hive_name,
 									$servlet_id,
 									stringify!($servlet_id),
 									request.servlet_id.clone(),
@@ -1510,8 +1319,8 @@ macro_rules! drone {
 					)*
 
 					// Unknown servlet ID - return error
-					return drone!(@reply $frame,
-						$crate::colony::drone::ActivateServletResponse::err($crate::policy::TransitStatus::Forbidden)
+					return hive!(@reply $frame,
+						$crate::colony::hive::ActivateServletResponse::err($crate::policy::TransitStatus::Forbidden)
 					);
 				}
 
@@ -1532,7 +1341,7 @@ macro_rules! drone {
 		$trust_store:ident,
 		$servlet_pool:ident,
 		$draining_since:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {
 		paste::paste! {
@@ -1555,7 +1364,7 @@ macro_rules! drone {
 					.unwrap_or(false);
 
 				if is_draining && !is_heartbeat {
-					return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
+					return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
 						$crate::policy::TransitStatus::Busy, current_util(), active_count()
 					));
 				}
@@ -1563,7 +1372,7 @@ macro_rules! drone {
 				// 1. Apply ClusterSecurityGate with certificate trust store
 				let security_status = match &$trust_store {
 					Some(store) => {
-						let security_gate = $crate::colony::drone::ClusterSecurityGate::new(
+						let security_gate = $crate::colony::hive::ClusterSecurityGate::new(
 							::std::sync::Arc::clone(&$circuit_breaker),
 							::std::sync::Arc::clone(store),
 						);
@@ -1575,19 +1384,19 @@ macro_rules! drone {
 					}
 				};
 				if security_status != $crate::policy::TransitStatus::Accepted {
-					return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-						$crate::colony::drone::HiveManagementResponse::stop_err(security_status)
+					return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+						$crate::colony::hive::HiveManagementResponse::stop_err(security_status)
 					));
 				}
 
 				// 2. Apply BackpressureGate (heartbeat priority frames exempt)
-				let backpressure_gate = $crate::colony::drone::BackpressureGate::new(
+				let backpressure_gate = $crate::colony::hive::BackpressureGate::new(
 					::std::sync::Arc::clone(&$utilization),
 					$crate::utils::BasisPoints::new(9000)
 				);
 				let bp_status = $crate::policy::GatePolicy::evaluate(&backpressure_gate, &$frame);
 				if bp_status == $crate::policy::TransitStatus::Busy {
-					return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
+					return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
 						$crate::policy::TransitStatus::Busy,
 						current_util(),
 						active_count(),
@@ -1604,18 +1413,18 @@ macro_rules! drone {
 							$crate::policy::TransitStatus::Accepted
 						};
 
-						return drone!(@reply_priority $frame, $crate::MessagePriority::Heartbeat,
+						return hive!(@reply_priority $frame, $crate::MessagePriority::Heartbeat,
 							$crate::colony::common::ClusterCommandResponse::heartbeat(status, util_bps, active_count())
 						);
 					}
 
 					if let Some(manage_request) = cmd.manage {
-						return drone!(
+						return hive!(
 							@handle_management_request $frame,
 							manage_request,
 							$servlets,
 							$trace,
-							$drone_name,
+							$hive_name,
 							$($servlet_id: $servlet_name<$input>),*
 						);
 					}
@@ -1672,7 +1481,7 @@ macro_rules! drone {
 		$request:ident,
 		$servlets:ident,
 		$trace:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {
 		paste::paste! {
@@ -1684,9 +1493,9 @@ macro_rules! drone {
 					// Try to spawn the requested servlet type
 					$(
 						if servlet_type_name == stringify!($servlet_id).as_bytes() {
-							drone!(
+							hive!(
 								@start_servlet_for_hive_cmd $servlet_name<$input>,
-								$drone_name,
+								$hive_name,
 								$servlet_id,
 								stringify!($servlet_id),
 								servlet_type_name,
@@ -1698,8 +1507,8 @@ macro_rules! drone {
 					)*
 
 					// Unknown servlet type
-					return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-						$crate::colony::drone::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
+					return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+						$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
 					));
 				}
 
@@ -1709,7 +1518,7 @@ macro_rules! drone {
 					let servlet_list: Vec<_> = servlets.iter().map(|(id, servlet)| {
 						let addr = match servlet {
 							$(
-								[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.addr(),
+								[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => s.addr(),
 							)*
 						};
 						$crate::colony::common::ServletInfo {
@@ -1719,8 +1528,8 @@ macro_rules! drone {
 					}).collect();
 					drop(servlets);
 
-					return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-						$crate::colony::drone::HiveManagementResponse::list_ok(servlet_list)
+					return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+						$crate::colony::hive::HiveManagementResponse::list_ok(servlet_list)
 					));
 				}
 
@@ -1732,16 +1541,16 @@ macro_rules! drone {
 						// Stop the servlet
 						match servlet {
 							$(
-								[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
+								[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
 							)*
 						}
-						return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-							$crate::colony::drone::HiveManagementResponse::stop_ok()
+						return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+							$crate::colony::hive::HiveManagementResponse::stop_ok()
 						));
 					} else {
 						drop(servlets);
-						return drone!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-							$crate::colony::drone::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Forbidden)
+						return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+							$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Forbidden)
 						));
 					}
 				}
@@ -1757,13 +1566,13 @@ macro_rules! drone {
 		@handle_hive_management $frame:ident,
 		$servlets:ident,
 		$trace:ident,
-		$drone_name:ident,
+		$hive_name:ident,
 		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*
 	) => {
 		paste::paste! {
 			{
 				// Decode the management request
-				if let Ok(request) = $crate::decode::<$crate::colony::drone::HiveManagementRequest>(&$frame.message) {
+				if let Ok(request) = $crate::decode::<$crate::colony::hive::HiveManagementRequest>(&$frame.message) {
 					// Handle spawn request
 					if let Some(spawn_params) = request.spawn {
 						let servlet_type_name = spawn_params.servlet_type;
@@ -1771,9 +1580,9 @@ macro_rules! drone {
 						// Try to spawn the requested servlet type
 						$(
 							if servlet_type_name == stringify!($servlet_id).as_bytes() {
-								drone!(
+								hive!(
 									@start_servlet_for_hive $servlet_name<$input>,
-									$drone_name,
+									$hive_name,
 									$servlet_id,
 									stringify!($servlet_id),
 									servlet_type_name,
@@ -1785,8 +1594,8 @@ macro_rules! drone {
 						)*
 
 						// Unknown servlet type
-						return drone!(@reply $frame,
-							$crate::colony::drone::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
+						return hive!(@reply $frame,
+							$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
 						);
 					}
 
@@ -1796,7 +1605,7 @@ macro_rules! drone {
 						let servlet_list: Vec<_> = servlets.iter().map(|(id, servlet)| {
 							let addr = match servlet {
 								$(
-									[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.addr(),
+									[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => s.addr(),
 								)*
 							};
 							$crate::colony::common::ServletInfo {
@@ -1806,7 +1615,7 @@ macro_rules! drone {
 						}).collect();
 						drop(servlets);
 
-						return drone!(@reply $frame, $crate::colony::drone::HiveManagementResponse::list_ok(servlet_list));
+						return hive!(@reply $frame, $crate::colony::hive::HiveManagementResponse::list_ok(servlet_list));
 					}
 
 					// Handle stop request
@@ -1817,14 +1626,14 @@ macro_rules! drone {
 							// Stop the servlet
 							match servlet {
 								$(
-									[<$drone_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
+									[<$hive_name Servlet>]::[<$servlet_id:camel>](s) => s.stop(),
 								)*
 							}
-							return drone!(@reply $frame, $crate::colony::drone::HiveManagementResponse::stop_ok());
+							return hive!(@reply $frame, $crate::colony::hive::HiveManagementResponse::stop_ok());
 						} else {
 							drop(servlets);
-							return drone!(@reply $frame,
-								$crate::colony::drone::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Forbidden)
+							return hive!(@reply $frame,
+								$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Forbidden)
 							);
 						}
 					}

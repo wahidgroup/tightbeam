@@ -1,33 +1,34 @@
-//! Drone framework for dynamic servlet deployment
+//! Hive framework for dynamic servlet deployment
 //!
-//! This module provides two types of servlet orchestration:
+//! Hives are orchestrators that manage servlet instances. They support two modes:
 //!
-//! ## Drone
-//! A **Drone** is a containerized servlet runner that can morph into **one servlet at a time**.
+//! ## Single-Servlet Mode
+//! A hive can morph into **one servlet at a time**.
 //! - Receives `ActivateServletRequest` from cluster
 //! - Stops current servlet and starts the requested one
 //! - Useful for dynamic workload allocation
 //!
-//! ## Hive
-//! A **Hive** is an orchestrator that manages **multiple servlets simultaneously**.
-//! - Requires a mycelial protocol (different port per servlet)
-//! - Receives `OverlordMessage` from cluster containing `servlet_name` and `frame`
-//! - Routes messages to the appropriate servlet
-//! - All servlets run concurrently on different ports
+//! ## Multi-Servlet Mode (Mycelial)
+//! On mycelial protocols (like TCP), a hive can manage **multiple servlets simultaneously**.
+//! - Requires a protocol that implements `Mycelial` (different port per servlet)
+//! - Call `establish_hive()` to spawn all registered servlets on different ports
+//! - All servlets run concurrently
+//!
+//! The mode is determined automatically based on the protocol's capabilities.
 
 pub mod error;
 pub mod gates;
 
 // Re-export submodule types
-pub use error::DroneError;
+pub use error::HiveError;
 pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker, ClusterSecurityGate};
 
-// Re-export common types used by drones
+// Re-export common types used by hives
 pub use crate::colony::common::{
 	ActivateServletRequest, ActivateServletResponse, ClusterCommand, ClusterCommandResponse, ClusterStatus,
 	HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse, InstanceMetrics, LeastLoaded,
 	ListServletsParams, ListServletsResult, LoadBalancer, MessageRouter, MessageValidator, PowerOfTwoChoices,
-	RegisterDroneRequest, RegisterDroneResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletInfo,
+	RegisterHiveRequest, RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletInfo,
 	ServletScaleConf, SpawnServletParams, SpawnServletResult, StopServletParams, StopServletResult, TypeBasedRouter,
 };
 
@@ -57,100 +58,102 @@ use crate::utils::BasisPoints;
 pub use crate::crypto::x509::store::CertificateTrust;
 
 // =============================================================================
-// Drone Trait
+// Hive Trait
 // =============================================================================
 
-/// Trait for drone implementations
+/// Trait for hive implementations
 ///
-/// Drones are containerized servlet runners that can dynamically morph
-/// between different servlet types based on activation messages.
+/// Hives are orchestrators that manage servlet instances. They extend the `Servlet`
+/// trait, inheriting standard lifecycle methods (start, addr, stop, join) and adding
+/// hive-specific capabilities.
 ///
-/// Drones extend the `Servlet` trait, inheriting the standard lifecycle methods
-/// (start, addr, stop, join) and adding drone-specific capabilities for morphing
-/// between different servlet types.
-pub trait Drone<I>: Servlet<I> {
-	/// The protocol type this drone uses
+/// ## Capabilities
+///
+/// - **Morphing**: Switch between different servlet types dynamically
+/// - **Cluster Registration**: Register with a cluster to receive work
+/// - **Multi-Servlet Mode**: On mycelial protocols, manage multiple servlets simultaneously
+///
+/// ## Multi-Servlet Mode
+///
+/// When the protocol implements `Mycelial + AsyncListenerTrait`, additional methods
+/// become available:
+/// - `establish_hive()` - Spawn all registered servlets on different ports
+/// - `servlet_addresses()` - Get addresses of all active servlets
+/// - `drain()` - Graceful shutdown
+pub trait Hive<I>: Servlet<I> {
+	/// The protocol type this hive uses
 	type Protocol: Protocol;
 
-	/// Get the trace collector for this drone
+	/// Get the trace collector for this hive
 	fn trace(&self) -> Arc<TraceCollector>;
 
-	/// Activate a servlet on this drone
+	/// Activate a servlet on this hive
 	///
 	/// # Arguments
 	/// * `msg` - The activation message containing servlet ID and configuration
 	///
 	/// # Returns
 	/// * `Ok(TransitStatus)` indicating whether the servlet was activated
-	/// * `Err(DroneError)` if activation failed
-	fn morph(&mut self, msg: ActivateServletRequest) -> impl Future<Output = Result<TransitStatus, DroneError>> + Send;
+	/// * `Err(HiveError)` if activation failed
+	fn morph(&mut self, msg: ActivateServletRequest) -> impl Future<Output = Result<TransitStatus, HiveError>> + Send;
 
 	/// Check if a servlet is currently active
 	fn is_active(&self) -> bool;
 
 	/// Stop the currently active servlet
-	fn deactivate(&mut self) -> impl Future<Output = Result<(), DroneError>> + Send;
+	fn deactivate(&mut self) -> impl Future<Output = Result<(), HiveError>> + Send;
 
-	/// Register this drone with a cluster
+	/// Register this hive with a cluster
 	///
-	/// Sends a `RegisterDroneRequest` to the cluster controller with this drone's
+	/// Sends a `RegisterHiveRequest` to the cluster controller with this hive's
 	/// address and available servlet types.
 	///
 	/// # Arguments
 	/// * `cluster_addr` - The address of the cluster controller
 	///
 	/// # Returns
-	/// * `Ok(RegisterDroneResponse)` if registration succeeded
-	/// * `Err(DroneError)` if registration failed
+	/// * `Ok(RegisterHiveResponse)` if registration succeeded
+	/// * `Err(HiveError)` if registration failed
 	fn register_with_cluster(
 		&self,
 		cluster_addr: <Self::Protocol as Protocol>::Address,
-	) -> impl Future<Output = Result<RegisterDroneResponse, DroneError>> + Send;
-}
+	) -> impl Future<Output = Result<RegisterHiveResponse, HiveError>> + Send;
 
-// =============================================================================
-// Hive Trait
-// =============================================================================
-
-/// Trait for hives that manage multiple servlets simultaneously
-///
-/// **Design Philosophy:**
-/// - **Drone**: Morphs into a single servlet at a time (one active servlet)
-/// - **Hive**: Orchestrates multiple servlet instances simultaneously (many active servlets)
-///
-/// Hives act as orchestrators that manage servlet lifecycle based on cluster demand:
-/// - Spawn new servlet instances on demand
-/// - Stop/restart servlets
-/// - Provide service discovery (servlet addresses)
-/// - Health monitoring
-///
-/// Clusters connect directly to individual servlets for actual work messages.
-/// The hive's control server is only used for management commands.
-///
-/// This trait can only be implemented by drones whose protocol implements both `Mycelial`
-/// and `AsyncListenerTrait` (hives require async protocols for concurrent servlet management).
-pub trait Hive<I>: Drone<I>
-where
-	Self::Protocol: Mycelial + AsyncListenerTrait,
-{
-	/// Establish a hive for this mycelial drone
+	/// Establish multi-servlet mode (mycelial protocols only)
 	///
 	/// This starts all registered servlets on different ports (using mycelial networking)
-	/// and begins listening for `OverlordMessage` commands from the cluster.
-	fn establish_hive(&mut self) -> impl Future<Output = Result<(), DroneError>> + Send;
+	/// and begins listening for management commands from the cluster.
+	///
+	/// # Requirements
+	/// This method is only available when `Self::Protocol: Mycelial + AsyncListenerTrait`.
+	fn establish_hive(&mut self) -> impl Future<Output = Result<(), HiveError>> + Send
+	where
+		Self::Protocol: Mycelial + AsyncListenerTrait;
 
 	/// Get the addresses of all active servlets in the hive
 	///
-	/// Returns a map of servlet names to their addresses.
-	fn servlet_addresses(&self) -> impl Future<Output = Vec<(Vec<u8>, <Self::Protocol as Protocol>::Address)>> + Send;
+	/// Returns a list of (servlet_name, address) pairs.
+	///
+	/// # Requirements
+	/// This method is only available when `Self::Protocol: Mycelial + AsyncListenerTrait`.
+	fn servlet_addresses(&self) -> impl Future<Output = Vec<(Vec<u8>, <Self::Protocol as Protocol>::Address)>> + Send
+	where
+		Self::Protocol: Mycelial + AsyncListenerTrait;
 
 	/// Begin graceful shutdown - stop accepting new requests and wait for in-flight to complete
 	///
 	/// Returns once all servlets have stopped or the drain timeout has elapsed.
-	fn drain(&self) -> impl Future<Output = Result<(), DroneError>> + Send;
+	///
+	/// # Requirements
+	/// This method is only available when `Self::Protocol: Mycelial + AsyncListenerTrait`.
+	fn drain(&self) -> impl Future<Output = Result<(), HiveError>> + Send
+	where
+		Self::Protocol: Mycelial + AsyncListenerTrait;
 
 	/// Check if the hive is currently draining
-	fn is_draining(&self) -> bool;
+	fn is_draining(&self) -> bool
+	where
+		Self::Protocol: Mycelial + AsyncListenerTrait;
 }
 
 // =============================================================================
@@ -253,6 +256,6 @@ impl Default for HiveConf {
 // Macro (included from macros.rs)
 // =============================================================================
 
-// The drone! macro is defined in macros.rs and exported via #[macro_export]
+// The hive! macro is defined in macros.rs and exported via #[macro_export]
 #[path = "macros.rs"]
 mod macros_impl;

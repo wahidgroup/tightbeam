@@ -1,5 +1,11 @@
 //! Cluster-specific error types
 
+/// Static error message for no heartbeat response
+pub const NO_RESPONSE_MSG: &[u8] = b"no response";
+
+/// Static error message for transport errors
+pub const TRANSPORT_ERROR_MSG: &[u8] = b"transport error";
+
 /// Errors specific to clusters
 #[cfg_attr(feature = "derive", derive(crate::Errorizable))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,5 +60,17 @@ impl core::error::Error for ClusterError {}
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {
 	fn from(_: std::sync::PoisonError<T>) -> Self {
 		ClusterError::LockPoisoned
+	}
+}
+
+impl From<crate::transport::error::TransportError> for ClusterError {
+	fn from(_: crate::transport::error::TransportError) -> Self {
+		ClusterError::HiveCommunicationFailed(TRANSPORT_ERROR_MSG.to_vec())
+	}
+}
+
+impl From<crate::TightBeamError> for ClusterError {
+	fn from(_: crate::TightBeamError) -> Self {
+		ClusterError::EncodingError
 	}
 }

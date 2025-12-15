@@ -1,6 +1,6 @@
 //! Integration tests for Cluster environment
 //!
-//! Tests the Cluster lifecycle with drone registration and work routing.
+//! Tests the Cluster lifecycle with hive registration and work routing.
 
 #![cfg(all(
 	feature = "std",
@@ -23,7 +23,7 @@ use tightbeam::{
 	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
 	decode,
 	der::Sequence,
-	drone, encode, exactly,
+	encode, exactly, hive,
 	policy::TransitStatus,
 	servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
@@ -58,7 +58,7 @@ pub struct PingResponse {
 }
 
 // ============================================================================
-// Test Servlet for Drone
+// Test Servlet for Hive
 // ============================================================================
 
 servlet! {
@@ -74,11 +74,11 @@ servlet! {
 }
 
 // ============================================================================
-// Test Drone
+// Test Hive
 // ============================================================================
 
-drone! {
-	ClusterTestDrone,
+hive! {
+	ClusterTestHive,
 	protocol: TokioListener,
 	servlets: {
 		ping: ClusterTestServlet<PingRequest>
@@ -137,7 +137,7 @@ tb_scenario! {
 			ClusterGateway::start(trace, cluster_conf).await
 		},
 		drones: [
-			ClusterTestDrone,
+			ClusterTestHive,
 		],
 		client: |trace, mut client, _config| async move {
 			// Send work request to cluster

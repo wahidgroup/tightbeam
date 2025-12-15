@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::utils::BasisPoints;
 
 use super::error::ClusterError;
-use crate::colony::common::RegisterDroneRequest;
+use crate::colony::common::RegisterHiveRequest;
 
 /// Shared byte slice for hive and servlet identifiers
 pub type SharedId = Arc<[u8]>;
@@ -56,8 +56,8 @@ impl HiveRegistry {
 	///
 	/// If the hive was already registered, updates its entry and re-indexes.
 	/// Takes ownership for zero-copy conversion to `Arc<[u8]>`.
-	pub fn register(&self, request: RegisterDroneRequest) -> Result<(), ClusterError> {
-		let hive_id: SharedId = request.drone_addr.into();
+	pub fn register(&self, request: RegisterHiveRequest) -> Result<(), ClusterError> {
+		let hive_id: SharedId = request.hive_addr.into();
 		let servlet_types: Arc<[SharedId]> = request.available_servlets.into_iter().map(Into::into).collect();
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
 

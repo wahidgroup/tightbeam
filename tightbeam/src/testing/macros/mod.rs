@@ -985,7 +985,7 @@ macro_rules! tb_scenario {
 	) => {{
 		use $crate::testing::TBSpec;
 		use $crate::colony::cluster::Cluster;
-		use $crate::colony::drone::Drone;
+		use $crate::colony::hive::Hive;
 
 		let config = $config;
 		let trace = config.trace();

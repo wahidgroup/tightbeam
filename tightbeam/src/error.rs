@@ -97,7 +97,7 @@ pub enum TightBeamError {
 	#[cfg(feature = "colony")]
 	#[cfg_attr(feature = "derive", error("Drone error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	DroneError(crate::colony::drone::DroneError),
+	HiveError(crate::colony::hive::HiveError),
 
 	#[cfg(feature = "colony")]
 	#[cfg_attr(feature = "derive", error("Worker relay error: {0}"))]
@@ -357,7 +357,7 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "transport")]
 			TightBeamError::HandshakeError(err) => write!(f, "Handshake error: {err}"),
 			#[cfg(feature = "colony")]
-			TightBeamError::DroneError(err) => write!(f, "Drone error: {err}"),
+			TightBeamError::HiveError(err) => write!(f, "Drone error: {err}"),
 			#[cfg(feature = "std")]
 			TightBeamError::LockPoisoned => write!(f, "Lock poisoned"),
 			#[cfg(feature = "standards")]
@@ -478,7 +478,7 @@ crate::impl_from!(crate::builder::error::BuildError => TightBeamError::BuildErro
 crate::impl_from!(crate::standards::error::StandardError => TightBeamError::StandardError);
 
 #[cfg(all(feature = "colony", not(feature = "derive")))]
-crate::impl_from!(crate::colony::drone::DroneError => TightBeamError::DroneError);
+crate::impl_from!(crate::colony::hive::HiveError => TightBeamError::HiveError);
 #[cfg(all(feature = "colony", not(feature = "derive")))]
 crate::impl_from!(crate::colony::worker::WorkerRelayError => TightBeamError::WorkerRelay);
 

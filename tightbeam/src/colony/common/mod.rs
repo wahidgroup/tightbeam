@@ -1,7 +1,7 @@
 //! Common types shared across colony modules
 //!
 //! Contains load balancing strategies, message routing, and scaling configuration
-//! used by both cluster and drone/hive components.
+//! used by both cluster and hive components.
 
 pub mod messages;
 pub mod scaling;
