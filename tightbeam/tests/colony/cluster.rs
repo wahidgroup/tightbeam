@@ -11,16 +11,27 @@
 	feature = "signature"
 ))]
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use sha3::Sha3_256;
 use tightbeam::{
 	cluster,
 	colony::{
-		cluster::{ClusterConf, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		cluster::{ClusterConf, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse, HeartbeatConf},
+		hive::HiveConf,
 		servlet::Servlet,
 	},
 	compose,
-	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
+	crypto::{
+		key::Secp256k1KeyProvider,
+		policy::Secp256k1Policy,
+		x509::{
+			store::{CertificateTrustBuilder, TrustBuilder},
+			CertificateSpec,
+		},
+	},
 	decode,
 	der::Sequence,
 	encode, exactly, hive,
@@ -37,10 +48,18 @@ use crate::common::x509::create_test_cert_with_key;
 // Cluster Configuration
 // ============================================================================
 
-/// Configuration for cluster tests
+/// Heartbeat statistics collected via callback
+#[derive(Default)]
+pub struct HeartbeatStats {
+	pub attempts: AtomicU32,
+	pub successes: AtomicU32,
+}
+
+/// Configuration for cluster tests (test instrumentation only)
 #[derive(Clone)]
 pub struct ClusterTestConf {
-	pub tls_config: Arc<ClusterTlsConfig>,
+	pub heartbeat_stats: Arc<HeartbeatStats>,
+	pub heartbeat_interval: Duration,
 }
 
 // ============================================================================
@@ -120,26 +139,54 @@ tb_scenario! {
 	config: ScenarioConf::<ClusterTestConf>::builder()
 		.with_spec(ClusterRoutingSpec::latest())
 		.with_env_config(ClusterTestConf {
-			tls_config: {
-				let (cert, signing_key) = create_test_cert_with_key("CN=Cluster Gateway", 365).unwrap();
-				Arc::new(ClusterTlsConfig {
-					certificate: CertificateSpec::Built(Box::new(cert)),
-					key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
-					validators: vec![],
-				})
-			},
+			heartbeat_stats: Arc::new(HeartbeatStats::default()),
+			heartbeat_interval: Duration::from_millis(50),
 		})
 		.build(),
 	environment Cluster {
 		cluster: ClusterGateway,
 		start: |trace, config| async move {
-			let cluster_conf = ClusterConf::new((*config.tls_config).clone());
-			ClusterGateway::start(trace, cluster_conf).await
+			let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365)?;
+
+			// Build hive trust from same cert (before moving cert into ClusterTlsConfig)
+			let hive_trust = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_chain(vec![cert.clone()])?
+				.build();
+
+			let tls = ClusterTlsConfig {
+				certificate: CertificateSpec::Built(Box::new(cert)),
+				key: Arc::new(Secp256k1KeyProvider::from(key)),
+				validators: vec![],
+			};
+
+			let heartbeat_conf = HeartbeatConf::builder()
+				.with_interval(config.heartbeat_interval)
+				.with_callback(Arc::new({
+					let stats = Arc::clone(&config.heartbeat_stats);
+					move |event| {
+						stats.attempts.fetch_add(1, Ordering::SeqCst);
+						if event.success {
+							stats.successes.fetch_add(1, Ordering::SeqCst);
+						}
+					}
+				}))
+				.build();
+			let cluster_conf = ClusterConf::builder(tls)
+				.with_heartbeat_config(heartbeat_conf)
+				.build();
+
+			let cluster = ClusterGateway::start(trace, cluster_conf).await?;
+			Ok((cluster, hive_trust))
 		},
-		drones: [
-			ClusterTestHive,
-		],
-		client: |trace, mut client, _config| async move {
+		hives: |trace, hive_trust| {
+			vec![
+				ClusterTestHive::start(Arc::clone(&trace), Some(HiveConf {
+					trust_store: Some(Arc::new(hive_trust)),
+					..Default::default()
+				}))
+			]
+		},
+		client: |trace, mut client, config| async move {
 			// Send work request to cluster
 			let request = ClusterWorkRequest {
 				servlet_type: b"ping".to_vec(),
@@ -158,6 +205,13 @@ tb_scenario! {
 				let work_response: ClusterWorkResponse = decode(&frame.message)?;
 				trace.event_with("routing_status", &[], work_response.status)?;
 			}
+
+			// Wait for heartbeat and verify stats
+			tokio::time::sleep(config.heartbeat_interval * 2).await;
+			let attempts = config.heartbeat_stats.attempts.load(Ordering::SeqCst);
+			let successes = config.heartbeat_stats.successes.load(Ordering::SeqCst);
+			assert!(attempts >= 1, "Expected at least 1 heartbeat attempt, got {attempts}");
+			assert!(successes >= 1, "Expected at least 1 heartbeat success, got {successes}");
 
 			Ok(())
 		}

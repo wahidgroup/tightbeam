@@ -979,7 +979,7 @@ macro_rules! tb_scenario {
 		environment Cluster {
 			cluster: $cluster_name:ident,
 			start: $start_closure:expr,
-			drones: [$($drone:ident),* $(,)?],
+			hives: $hives_closure:expr,
 			client: $client_closure:expr
 		}
 	) => {{
@@ -995,22 +995,21 @@ macro_rules! tb_scenario {
 		// Get env_config as Arc for passing to closures
 		let env_config = std::sync::Arc::clone(config.env_config());
 
-		// Start cluster using start closure
-		let cluster_instance = $crate::testing::macros::__call_start_closure($start_closure, trace_cluster, std::sync::Arc::clone(&env_config))
+		// Start cluster using start closure - returns (cluster, hive_data) tuple
+		let (cluster_instance, hive_data) = $crate::testing::macros::__call_start_closure($start_closure, trace_cluster, std::sync::Arc::clone(&env_config))
 			.await
 			.expect("Failed to start cluster");
 		let cluster_addr = cluster_instance.addr();
 
-		// Start and register each drone with the cluster
-		let mut drone_handles: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
-		$(
-			let drone_trace = std::sync::Arc::new(trace.share());
-			let drone = <$drone as $crate::colony::servlet::Servlet<_>>::start(drone_trace, None)
-				.await
-				.expect(concat!("Failed to start drone: ", stringify!($drone)));
-			drone.register_with_cluster(cluster_addr).await.expect(concat!("Failed to register drone: ", stringify!($drone)));
-			drone_handles.push(Box::new(drone));
-		)*
+		// Call hives closure to get futures, then await each and register with cluster
+		let hive_trace = std::sync::Arc::new(trace.share());
+		let hive_futures = ($hives_closure)(std::sync::Arc::clone(&hive_trace), hive_data);
+		let mut hive_handles: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+		for hive_future in hive_futures {
+			let hive = hive_future.await.expect("Failed to start hive");
+			hive.register_with_cluster(cluster_addr).await.expect("Failed to register hive");
+			hive_handles.push(Box::new(hive));
+		}
 
 		// Connect client to cluster gateway
 		use $crate::transport::{ClientBuilder, ConnectionBuilder};
@@ -1033,8 +1032,8 @@ macro_rules! tb_scenario {
 
 		let client_result = __tb_call_cluster_client($client_closure, trace_client, client, env_config).await;
 
-		// Stop drones (drop handles)
-		drop(drone_handles);
+		// Stop hives (drop handles)
+		drop(hive_handles);
 
 		// Stop cluster
 		cluster_instance.stop();

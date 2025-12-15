@@ -622,12 +622,12 @@ macro_rules! test_servlet {
 	};
 }
 
-/// Async test macro for drones
+/// Async test macro for hives
 ///
 /// Automatically starts a drone, creates a client, and passes the ready
 /// client to the assertions block for testing. Properly manages drone lifecycle.
 ///
-/// Note: Gate observation channels are not yet implemented for drones.
+/// Note: Gate observation channels are not yet implemented for hives.
 /// The `channels` parameter is reserved for future use.
 #[macro_export]
 macro_rules! test_drone {
@@ -662,7 +662,7 @@ macro_rules! test_drone {
 				connect $protocol: addr
 			};
 
-			// Placeholder channels tuple (not yet implemented for drones)
+			// Placeholder channels tuple (not yet implemented for hives)
 			let $channels = ((), ());
 
 			// Run assertions
@@ -705,7 +705,7 @@ macro_rules! test_drone {
 				connect $protocol: addr
 			};
 
-			// Placeholder channels tuple (not yet implemented for drones)
+			// Placeholder channels tuple (not yet implemented for hives)
 			let $channels = ((), ());
 
 			// Run assertions
@@ -744,7 +744,7 @@ macro_rules! test_drone {
 				connect $protocol: addr
 			};
 
-			// Placeholder channels tuple (not yet implemented for drones)
+			// Placeholder channels tuple (not yet implemented for hives)
 			let $channels = ((), ());
 
 			// Run assertions
@@ -782,7 +782,7 @@ macro_rules! test_drone {
 				connect $protocol: addr
 			};
 
-			// Placeholder channels tuple (not yet implemented for drones)
+			// Placeholder channels tuple (not yet implemented for hives)
 			let $channels = ((), ());
 
 			// Run assertions

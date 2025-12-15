@@ -100,6 +100,7 @@ macro_rules! hive {
 		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
 		hive!(@impl_servlet_trait_for_hive $hive_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
 		hive!(@impl_hive_trait $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
+		hive!(@impl_maybe_establish $hive_name, $protocol);
 		hive!(@impl_drop_for_hive $hive_name);
 	};
 
@@ -113,6 +114,7 @@ macro_rules! hive {
 		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
 		hive!(@impl_servlet_trait_for_hive $hive_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
 		hive!(@impl_hive_trait $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
+		hive!(@impl_maybe_establish $hive_name, $protocol);
 		hive!(@impl_drop_for_hive $hive_name);
 	};
 
@@ -614,7 +616,7 @@ macro_rules! hive {
 					#[cfg(not(feature = "x509"))]
 					let control_server_handle = compile_error!("Hive requires x509 feature for certificate-based authentication");
 
-					Ok(Self {
+					let mut hive = Self {
 						servlets,
 						config,
 						control_server_handle: Some(control_server_handle),
@@ -625,7 +627,15 @@ macro_rules! hive {
 						utilization_map,
 						servlet_pool,
 						draining_since,
-					})
+					};
+
+					// Auto-establish for Mycelial protocols
+					{
+						use $crate::colony::hive::MaybeEstablish;
+						hive.maybe_establish().await?;
+					}
+
+					Ok(hive)
 				}
 
 				fn addr(&self) -> Self::Address {
@@ -1043,6 +1053,20 @@ macro_rules! hive {
 						.map(|g| g.is_some())
 						.unwrap_or(false)
 				}
+			}
+		}
+	};
+
+	// Implement MaybeEstablish for Mycelial protocols
+	// This enables automatic establish_hive() call in start()
+	(@impl_maybe_establish $hive_name:ident, $protocol:path) => {
+		impl $crate::colony::hive::MaybeEstablish for $hive_name
+		where
+			$protocol: $crate::transport::Mycelial + $crate::transport::AsyncListenerTrait,
+		{
+			async fn maybe_establish(&mut self) -> Result<(), $crate::colony::hive::HiveError> {
+				use $crate::colony::hive::Hive;
+				self.establish_hive().await
 			}
 		}
 	};

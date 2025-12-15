@@ -5,38 +5,66 @@
 /// # Syntax
 ///
 /// ```ignore
-/// use tightbeam::crypto::key::KeySpec;
-///
-/// const CLUSTER_KEY: &[u8] = &[/* 32-byte secret key */];
-///
 /// cluster! {
 ///     pub MyCluster,
 ///     protocol: TokioListener,
-///     config: ClusterConfig::new(KeySpec::Bytes(CLUSTER_KEY))
+///     config: ClusterConf::default()
+/// }
+///
+/// // With custom digest:
+/// cluster! {
+///     pub MyCluster,
+///     protocol: TokioListener,
+///     digest: Blake3,
+///     config: ClusterConf::default()
 /// }
 /// ```
 #[macro_export]
 macro_rules! cluster {
+	// Public with custom digest
+	(
+		$(#[$meta:meta])*
+		pub $cluster_name:ident,
+		protocol: $protocol:path,
+		digest: $digest:path,
+		config: $config:expr
+	) => {
+		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $digest, pub, [$(#[$meta])*]);
+	};
+
+	// Public with default digest (Sha3_256)
 	(
 		$(#[$meta:meta])*
 		pub $cluster_name:ident,
 		protocol: $protocol:path,
 		config: $config:expr
 	) => {
-		$crate::cluster!(@impl_cluster $cluster_name, $protocol, pub, [$(#[$meta])*]);
+		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $crate::crypto::hash::Sha3_256, pub, [$(#[$meta])*]);
 	};
 
+	// Private with custom digest
+	(
+		$(#[$meta:meta])*
+		$cluster_name:ident,
+		protocol: $protocol:path,
+		digest: $digest:path,
+		config: $config:expr
+	) => {
+		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $digest, , [$(#[$meta])*]);
+	};
+
+	// Private with default digest (Sha3_256)
 	(
 		$(#[$meta:meta])*
 		$cluster_name:ident,
 		protocol: $protocol:path,
 		config: $config:expr
 	) => {
-		$crate::cluster!(@impl_cluster $cluster_name, $protocol, , [$(#[$meta])*]);
+		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $crate::crypto::hash::Sha3_256, , [$(#[$meta])*]);
 	};
 
 	// Generate cluster struct (public)
-	(@impl_cluster $cluster_name:ident, $protocol:path, pub, [$(#[$meta:meta])*]) => {
+	(@impl_cluster $cluster_name:ident, $protocol:path, $digest:path, pub, [$(#[$meta:meta])*]) => {
 		$(#[$meta])*
 		pub struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
@@ -48,12 +76,12 @@ macro_rules! cluster {
 			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 		}
 
-		$crate::cluster!(@impl_cluster_trait $cluster_name, $protocol);
+		$crate::cluster!(@impl_cluster_trait $cluster_name, $protocol, $digest);
 		$crate::cluster!(@impl_drop $cluster_name);
 	};
 
 	// Generate cluster struct (private)
-	(@impl_cluster $cluster_name:ident, $protocol:path, , [$(#[$meta:meta])*]) => {
+	(@impl_cluster $cluster_name:ident, $protocol:path, $digest:path, , [$(#[$meta:meta])*]) => {
 		$(#[$meta])*
 		struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
@@ -65,12 +93,12 @@ macro_rules! cluster {
 			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 		}
 
-		$crate::cluster!(@impl_cluster_trait $cluster_name, $protocol);
+		$crate::cluster!(@impl_cluster_trait $cluster_name, $protocol, $digest);
 		$crate::cluster!(@impl_drop $cluster_name);
 	};
 
 	// Implement Cluster trait
-	(@impl_cluster_trait $cluster_name:ident, $protocol:path) => {
+	(@impl_cluster_trait $cluster_name:ident, $protocol:path, $digest:path) => {
 		impl $crate::colony::cluster::Cluster for $cluster_name {
 			type Protocol = $protocol;
 			type Address = <$protocol as $crate::transport::Protocol>::Address;
@@ -143,10 +171,10 @@ macro_rules! cluster {
 									let pool = ::std::sync::Arc::clone(&pool);
 									let max_failures = config.heartbeat.max_failures;
 
-									set.spawn(async move {
-										let result = $crate::cluster!(@send_heartbeat_async pool, config, addr);
-										$crate::cluster!(@process_heartbeat_result registry, hive_addr, result, max_failures);
-									});
+								set.spawn(async move {
+									let result = $crate::cluster!(@send_heartbeat_async pool, config, addr, $digest);
+									$crate::cluster!(@process_heartbeat_result registry, hive_addr, result, max_failures, config);
+								});
 								}
 
 								// Drain remaining tasks
@@ -176,10 +204,10 @@ macro_rules! cluster {
 										let config = ::std::sync::Arc::clone(&config);
 										let pool = ::std::sync::Arc::clone(&pool);
 										let max_failures = config.heartbeat.max_failures;
-										async move {
-											let result = $crate::cluster!(@send_heartbeat_async pool, config, addr);
-											$crate::cluster!(@process_heartbeat_result registry, hive_addr, result, max_failures);
-										}
+									async move {
+										let result = $crate::cluster!(@send_heartbeat_async pool, config, addr, $digest);
+										$crate::cluster!(@process_heartbeat_result registry, hive_addr, result, max_failures, config);
+									}
 									})
 									.await;
 								});
@@ -202,6 +230,15 @@ macro_rules! cluster {
 									.for_each(|(hive_addr, _addr)| {
 										// Note: Sequential sync version - no async pool available
 										// This tier is a placeholder for sync transport implementations
+										// Fire callback with failure (no async executor available)
+										if let Some(ref callback) = config.heartbeat.on_heartbeat {
+											let event = $crate::colony::cluster::HeartbeatEvent {
+												hive_addr: ::std::sync::Arc::clone(&hive_addr),
+												success: false,
+												utilization: None,
+											};
+											callback(event);
+										}
 										let _ = registry.increment_failure(&hive_addr);
 									});
 								$crate::colony::servlet::servlet_runtime::rt::sleep(config.heartbeat.interval);
@@ -280,32 +317,7 @@ macro_rules! cluster {
 				&self,
 				addr: Self::Address,
 			) -> Result<$crate::colony::common::HeartbeatResult, $crate::colony::cluster::ClusterError> {
-				use $crate::builder::TypeBuilder;
-
-				// Build heartbeat command
-				let cmd = $crate::colony::common::ClusterCommand {
-					heartbeat: Some($crate::colony::common::HeartbeatParams {
-						cluster_status: $crate::colony::common::ClusterStatus::Healthy,
-					}),
-					manage: None,
-				};
-
-				let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V1)
-					.with_message(cmd)
-					.with_priority($crate::MessagePriority::Heartbeat)
-					.build()?;
-
-				let signed_frame = frame
-					.sign_with_provider::<$crate::crypto::hash::Sha3_256, _>(self.config.tls.key.as_ref())
-					.await?;
-
-				// Send via pool
-				let mut client = self.pool.connect(addr).await?;
-				let response = client.conn()?.emit(signed_frame, None).await?
-					.ok_or($crate::colony::cluster::ClusterError::HiveCommunicationFailed($crate::colony::cluster::error::NO_RESPONSE_MSG.to_vec()))?;
-
-				let cmd_response: $crate::colony::common::ClusterCommandResponse = $crate::decode(&response.message)?;
-				cmd_response.heartbeat.ok_or($crate::colony::cluster::ClusterError::EncodingError)
+				$crate::cluster!(@send_heartbeat_async self.pool, self.config, addr, $digest)
 			}
 		}
 	};
@@ -340,14 +352,16 @@ macro_rules! cluster {
 	(@handle_gateway_request $frame:ident, $registry:ident) => {{
 		// Try to decode as RegisterHiveRequest (hive registration)
 		if let Ok(request) = $crate::decode::<$crate::colony::hive::RegisterHiveRequest>(&$frame.message) {
-			let status = match $registry.register(request.clone()) {
+			// Extract hive_addr before consuming request (zero-copy: only one clone)
+			let hive_addr = request.hive_addr.clone();
+			let status = match $registry.register(request) {
 				Ok(()) => $crate::policy::TransitStatus::Accepted,
 				Err(_) => $crate::policy::TransitStatus::Forbidden,
 			};
 
 			let response = $crate::colony::hive::RegisterHiveResponse {
 				status,
-				hive_id: Some(request.hive_addr.clone()),
+				hive_id: Some(hive_addr),
 			};
 
 			return $crate::cluster!(@reply $frame, response);
@@ -396,7 +410,7 @@ macro_rules! cluster {
 	// =========================================================================
 
 	// Helper: Send heartbeat async - builds, signs, and sends heartbeat frame
-	(@send_heartbeat_async $pool:expr, $config:expr, $addr:expr) => {
+	(@send_heartbeat_async $pool:expr, $config:expr, $addr:expr, $digest:path) => {
 		async {
 			use $crate::builder::TypeBuilder;
 
@@ -408,15 +422,18 @@ macro_rules! cluster {
 			};
 
 			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V1)
+				.with_id(b"heartbeat")
 				.with_message(cmd)
 				.with_priority($crate::MessagePriority::Heartbeat)
+				.with_witness_hasher::<$digest>()
 				.build()?;
 
 			let signed_frame = frame
-				.sign_with_provider::<$crate::crypto::hash::Sha3_256, _>($config.tls.key.as_ref())
+				.sign_with_provider::<$digest, _>($config.tls.key.as_ref())
 				.await?;
 
 			let mut client = $pool.connect($addr).await?;
+
 			let response = client.conn()?.emit(signed_frame, None).await?
 				.ok_or($crate::colony::cluster::ClusterError::HiveCommunicationFailed(
 					$crate::colony::cluster::error::NO_RESPONSE_MSG.to_vec()
@@ -429,7 +446,10 @@ macro_rules! cluster {
 	};
 
 	// Helper: Process heartbeat result - updates registry based on success/failure
-	(@process_heartbeat_result $registry:expr, $hive_addr:expr, $result:expr, $max_failures:expr) => {
+	(@process_heartbeat_result $registry:expr, $hive_addr:expr, $result:expr, $max_failures:expr, $config:expr) => {
+		// Fire callback if configured
+		$crate::cluster!(@fire_heartbeat_callback $config, $hive_addr, $result);
+
 		match $result {
 			Ok(hb) => {
 				let _ = $registry.touch(&$hive_addr, hb.utilization);
@@ -441,6 +461,18 @@ macro_rules! cluster {
 					}
 				}
 			}
+		}
+	};
+
+	// Helper: Fire heartbeat callback if configured
+	(@fire_heartbeat_callback $config:expr, $hive_addr:expr, $result:expr) => {
+		if let Some(ref callback) = $config.heartbeat.on_heartbeat {
+			let event = $crate::colony::cluster::HeartbeatEvent {
+				hive_addr: ::std::sync::Arc::clone(&$hive_addr),
+				success: $result.is_ok(),
+				utilization: $result.as_ref().ok().map(|r| r.utilization),
+			};
+			callback(event);
 		}
 	};
 

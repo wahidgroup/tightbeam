@@ -306,23 +306,16 @@ impl crate::Frame {
 		P: SigningKeyProvider + ?Sized,
 	{
 		// 1. Encode the frame (without signature field)
-		let unsigned_bytes = crate::encode(&self)?;
+		let unsigned_bytes = self.to_tbs()?;
 
-		// 2. Compute digest
-		let mut hasher = D::new();
-		hasher.update(&unsigned_bytes);
-
-		let digest = hasher.finalize();
-		let digest_bytes = digest.as_slice();
-
-		// 3. Sign the digest using the key provider
-		let signature_bytes = provider.sign(digest_bytes).await?;
+		// 2. Sign the frame
+		let signature_bytes = provider.sign(&unsigned_bytes).await?;
 		let signature_value = SignatureValue::new(signature_bytes.as_slice())?;
 
-		// 4. Get signature algorithm from provider
+		// 3. Get signature algorithm from provider
 		let signature_algorithm = provider.algorithm();
 
-		// 5. Compute signer identifier from public key
+		// 4. Compute signer identifier from public key
 		let public_key_der = provider.to_public_key_bytes().await?;
 		let mut hasher = D::new();
 		hasher.update(&public_key_der);
@@ -332,10 +325,10 @@ impl crate::Frame {
 		let skid = SubjectKeyIdentifier::from(skid_octets);
 		let sid = SignerIdentifier::SubjectKeyIdentifier(skid);
 
-		// 6. Build digest algorithm identifier
+		// 5. Build digest algorithm identifier
 		let digest_alg = AlgorithmIdentifierOwned { oid: D::OID, parameters: None };
 
-		// 7. Create SignerInfo
+		// 6. Create SignerInfo
 		let signer_info = SignerInfo {
 			version: CmsVersion::V1,
 			sid,

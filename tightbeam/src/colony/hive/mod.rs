@@ -58,6 +58,23 @@ use crate::utils::BasisPoints;
 pub use crate::crypto::x509::store::CertificateTrust;
 
 // =============================================================================
+// Auto-Establish Helper
+// =============================================================================
+
+/// Helper trait for automatic hive establishment
+///
+/// This trait enables transparent auto-establishment for Mycelial protocols.
+/// The `hive!` macro generates implementations:
+/// - For Mycelial protocols: calls `establish_hive()`
+/// - For other protocols: no-op (returns Ok)
+///
+/// This is called automatically at the end of `start()`.
+pub trait MaybeEstablish {
+	/// Establish the hive if the protocol supports it
+	fn maybe_establish(&mut self) -> impl Future<Output = Result<(), HiveError>> + Send;
+}
+
+// =============================================================================
 // Hive Trait
 // =============================================================================
 

@@ -263,7 +263,7 @@ pub enum ClusterStatus {
 /// Frames without proper authentication will be rejected and may trigger
 /// the circuit breaker.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
-#[beam(nonrepudiable, frame_integrity)]
+#[beam(frame_integrity)]
 pub struct ClusterCommand {
 	/// Heartbeat request [context 0]
 	#[asn1(context_specific = "0", optional = "true")]

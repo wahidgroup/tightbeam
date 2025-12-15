@@ -1,7 +1,7 @@
 //! Cluster framework for servlet orchestration
 //!
 //! Clusters are gateways that receive work requests from external clients
-//! and route them to registered hives/drones based on servlet type.
+//! and route them to registered hives/hives based on servlet type.
 //!
 //! # Architecture
 //!
@@ -11,24 +11,28 @@
 //! 4. **Cluster routes** to a hive that supports the requested servlet type
 //! 5. **Cluster forwards** payload and returns response to client
 
+pub mod builder;
 pub mod error;
 pub mod macros;
 pub mod registry;
 
 // Re-export submodule types
+pub use builder::{ClusterConfBuilder, HeartbeatConfBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
 
 use core::future::Future;
+use core::marker::PhantomData;
 use core::time::Duration;
 use std::sync::Arc;
 
+use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::key::SigningKeyProvider;
 use crate::der::Sequence;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
-use crate::transport::policy::{RestartExponentialBackoff, RestartPolicy};
+use crate::transport::policy::RestartPolicy;
 use crate::transport::{Protocol, TightBeamAddress};
 use crate::Beamable;
 
@@ -45,6 +49,12 @@ use crate::colony::servlet::servlet_runtime::rt;
 // Configuration
 // =============================================================================
 
+// Heartbeat default constants (single source of truth)
+pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
+pub(crate) const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
+pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 10;
+pub(crate) const DEFAULT_MAX_FAILURES: u32 = 3;
+
 /// Configuration for cluster heartbeat behavior
 pub struct HeartbeatConf {
 	/// Interval between heartbeat checks
@@ -57,16 +67,19 @@ pub struct HeartbeatConf {
 	pub max_concurrent: usize,
 	/// Failed heartbeats before eviction
 	pub max_failures: u32,
+	/// Optional callback for heartbeat events (monitoring, testing)
+	pub on_heartbeat: Option<HeartbeatCallback>,
 }
 
 impl Default for HeartbeatConf {
 	fn default() -> Self {
 		Self {
-			interval: Duration::from_secs(5),
-			timeout: Duration::from_secs(15),
+			interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
+			timeout: Duration::from_secs(DEFAULT_HEARTBEAT_TIMEOUT_SECS),
 			retry_policy: None,
-			max_concurrent: 10,
-			max_failures: 3,
+			max_concurrent: DEFAULT_MAX_CONCURRENT,
+			max_failures: DEFAULT_MAX_FAILURES,
+			on_heartbeat: None,
 		}
 	}
 }
@@ -79,9 +92,43 @@ impl core::fmt::Debug for HeartbeatConf {
 			.field("retry_policy", &self.retry_policy.as_ref().map(|_| "Some(...)"))
 			.field("max_concurrent", &self.max_concurrent)
 			.field("max_failures", &self.max_failures)
+			.field("on_heartbeat", &self.on_heartbeat.as_ref().map(|_| "Some(...)"))
 			.finish()
 	}
 }
+
+impl HeartbeatConf {
+	/// Add a callback to be invoked on each heartbeat result
+	pub fn with_callback(mut self, callback: HeartbeatCallback) -> Self {
+		self.on_heartbeat = Some(callback);
+		self
+	}
+}
+
+// =============================================================================
+// Heartbeat Callback
+// =============================================================================
+
+/// Event emitted for each heartbeat result
+///
+/// Provides information about the heartbeat outcome for monitoring,
+/// metrics collection, or testing purposes.
+#[derive(Debug, Clone)]
+pub struct HeartbeatEvent {
+	/// Address of the hive that was checked
+	pub hive_addr: Arc<[u8]>,
+	/// Whether the heartbeat succeeded
+	pub success: bool,
+	/// Utilization reported by the hive (if successful)
+	pub utilization: Option<crate::utils::BasisPoints>,
+}
+
+/// Callback type for heartbeat events
+///
+/// Called after each heartbeat result is processed. The callback must be
+/// thread-safe (`Send + Sync`) as it may be invoked from multiple concurrent
+/// heartbeat tasks.
+pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 
 // ============================================================================
 // TLS Configuration
@@ -127,7 +174,11 @@ impl core::fmt::Debug for ClusterTlsConfig {
 ///
 /// Contains settings for load balancing, health checks, gateway policies,
 /// and cryptographic signing for cluster → hive communication.
-pub struct ClusterConf<L: LoadBalancer = LeastLoaded> {
+///
+/// # Type Parameters
+/// - `L`: Load balancing strategy (default: `LeastLoaded`)
+/// - `D`: Digest algorithm for frame integrity and signing (default: `Sha3_256`)
+pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	/// Load balancing strategy for distributing work across hives
 	pub load_balancer: L,
 	/// Heartbeat configuration
@@ -141,25 +192,20 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded> {
 	/// TLS configuration for cluster → hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
+	/// Phantom data for digest type
+	pub(crate) _digest: PhantomData<D>,
 }
 
 #[cfg(feature = "x509")]
 impl ClusterConf {
 	/// Create a new cluster configuration with TLS config
 	pub fn new(tls: ClusterTlsConfig) -> Self {
-		Self {
-			load_balancer: LeastLoaded,
-			heartbeat: HeartbeatConf::default(),
-			policies: Vec::new(),
-			pool_config: PoolConfig::default(),
-			retry_policy: Arc::new(RestartExponentialBackoff::default()),
-			tls,
-		}
+		Self::builder(tls).build()
 	}
 }
 
 #[cfg(feature = "x509")]
-impl<L: LoadBalancer> core::fmt::Debug for ClusterConf<L> {
+impl<L: LoadBalancer, D: Digest> core::fmt::Debug for ClusterConf<L, D> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterConfig")
 			.field("heartbeat", &self.heartbeat)
