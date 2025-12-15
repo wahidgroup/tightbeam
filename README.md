@@ -1860,10 +1860,36 @@ singular task.
 
 #### 9.3.1 E: Workers
 
-Workers are the smallest unit of computation. They must be single-threaded and
-handle a single message at a time. Workers are the "ants" of the EECI. Insects
-have a head, thorax, and abdomen. Workers have the following similarly
-inspired structure:
+Workers are the smallest unit of computation in the EECI--the "ants" that do the
+actual work. They exist because of a fundamental insight: most business logic
+doesn't need network context. A function that doubles a number doesn't care
+whether the input came from TCP, UDP, or an in-memory channel. By isolating
+this logic into workers, we gain:
+
+- **Parallelism**: Multiple workers can process messages concurrently
+- **Fault Isolation**: A failing worker doesn't crash the servlet
+- **Testability**: Workers can be tested without network setup
+- **Reusability**: The same worker can serve multiple servlets
+
+##### Design Constraints
+
+Workers are intentionally constrained:
+
+1. **Single-threaded**: Each worker processes one message at a time
+2. **Message-only**: Workers receive decoded messages, not raw Frames
+3. **Stateless between messages**: Configuration is fixed at creation time
+
+These constraints enable the parallelism and fault isolation that make EECI
+effective. Workers don't coordinate with each other--they just transform
+input to output.
+
+> Note: It is highly discouraged to workaround the Frame limitation by passing
+	the Frame in a message parameter.
+
+##### The `worker!` Macro
+
+Workers follow an insect-inspired structure: a "head" (configuration), optional
+"receptors" (gates), a "thorax" (isolation container), and an "abdomen" (handler).
 
 ```rust
 tightbeam::worker! {
@@ -1882,20 +1908,8 @@ tightbeam::worker! {
 }
 ```
 
-Not unlike supraorganisms, we can name them, and their "head" may possess
-a specific configuration (config). They may or may not have receptors which
-can be used to optionally gate messages. The "thorax" is itself the container
-which isolates the entity within its own scoped thread--locality. Finally,
-its "abdomen" is the handle which digests the message and produces a response.
-
-The important thing to note is that workers operate on local information
-within their bounded scope. They are not aware of the larger system and only
-operate on the message they are given. This is a critical aspect of the EECI
-and allows for a high degree of parallelism and fault tolerance. As a result,
-they do not have access to the full Frame nor should they need it.
-
-> Note: It is highly discouraged to workaround the Frame limitation by passing
-	the Frame in a message parameter.
+The handler receives the message, a trace collector for instrumentation, and the
+worker's configuration. It returns the output message type.
 
 ##### Testing
 
@@ -1946,17 +1960,61 @@ The `environment Worker` syntax provides:
 
 #### 9.3.2 E: Servlets
 
-Servlets are "anthills" in the sense they operate on a specific protocol. From
-a protocol perspective, an anthill is a port in many ways. Servlets are
-multi-threaded and must handle messages asynchronously. A servlet may also
-define as many different workers as it needs to accomplish its task as well
-as a set of configurations. Servlets must be provided a relay which is used to
-relay `Message` types to the worker without the entire Frame. A servlet must
-only be responsible for a single message type.
+Servlets are the network endpoints of the EECI--the "anthills" where messages
+arrive and are processed. While workers handle pure business logic, servlets
+handle the protocol layer: accepting connections, decoding frames, dispatching
+to workers, and sending responses.
 
-> Note: Servlets must only be responsible for a single message type however,
-	using an ASN.1 Choice type allows for related concerns to be handled
-	within the same servlet.
+##### Architecture
+
+Servlets sit between the network and workers:
+
+1. **Listen** on a protocol-specific endpoint (e.g., TCP port)
+2. **Receive** raw Frames from clients
+3. **Decode** and validate incoming messages
+4. **Dispatch** to one or more workers for processing
+5. **Compose** the response Frame and send it back
+
+This separation means servlets handle concerns like connection management,
+frame validation, and response composition--things workers shouldn't know about.
+
+##### Single Message Type Rule
+
+Each servlet is responsible for exactly one message type. This keeps servlets
+focused and predictable. When you need to handle multiple related message types,
+use an ASN.1 Choice type to group them:
+
+```rust
+// A Choice type groups related messages
+#[derive(Beamable, Choice)]
+pub enum CalcRequest {
+	Add(AddParams),
+	Multiply(MultiplyParams),
+	Divide(DivideParams),
+}
+```
+
+##### Gate Policies
+
+Servlets can apply gate policies to filter or validate incoming messages before
+processing. Common use cases include rate limiting, authentication, and input
+validation:
+
+```rust
+servlet! {
+	pub SecureServlet<Request, EnvConfig = ()>,
+	protocol: TokioListener,
+	policies: {
+		with_collector_gate: [RateLimitGate::new(100), AuthGate::new(key)]
+	},
+	handle: |frame, trace, config, workers| async move {
+		// Only reached if all gates pass
+		// ...
+	}
+}
+```
+
+##### Defining a Servlet
 
 **Step 1**: Define configuration struct outside the macro:
 
@@ -2375,53 +2433,55 @@ The `environment Cluster` syntax provides:
 
 #### 9.3.4 I: Hives
 
-Hives are orchestrators that manage servlet instances. They support two modes:
+Hives are the intermediary layer between clusters and servlets. While a servlet
+handles a single message type on a single port, a hive can manage multiple servlets
+and coordinate with a cluster for work distribution. Think of hives as "ant nests"
+that house multiple specialized workers (servlets).
 
-- **Single-Servlet Mode**: Morph between different servlet types one at a time
-- **Multi-Servlet Mode**: On mycelial protocols, manage multiple servlets simultaneously
+##### Operating Modes
 
-The mode is determined automatically based on the protocol's capabilities. Call
-`establish_hive()` to enable multi-servlet mode on mycelial protocols.
+Hives support two distinct operating modes:
 
-##### "Mycelial" Protocols
+**Single-Servlet Mode** allows a hive to "morph" between different servlet types
+dynamically. The cluster sends an `ActivateServletRequest`, and the hive stops its
+current servlet and starts the requested one. This is useful for dynamic workload
+reallocation--a hive can switch from handling "ping" requests to "calculator"
+requests based on cluster demand.
 
-Protocols such as TCP are considered "mycelial" as they operate over a single
-address but can have multiple ports (SocketAddress). This allows the hive to
-spawn servlets on different ports and provide their addresses to the cluster.
+**Multi-Servlet Mode** enables a hive to run all its registered servlets
+simultaneously, each on a different port. This requires a "mycelial" protocol
+(like TCP) that supports multiple endpoints. Call `establish_hive()` to spawn all
+servlets, then register with a cluster to advertise all available capabilities.
 
-**Basic Hive Example**:
+The mode is determined by the protocol's capabilities. On mycelial protocols, you
+typically want multi-servlet mode for maximum throughput.
+
+##### Mycelial Protocols
+
+The term "mycelial" refers to protocols that can spawn multiple endpoints from a
+single base address--like how fungal mycelium branches from a central point. TCP
+is mycelial because a single host address (e.g., `192.168.1.10`) can bind multiple
+ports. This allows a hive to spawn servlets on ports 8001, 8002, 8003, etc., each
+handling different message types.
+
+Non-mycelial protocols (like in-memory channels) are limited to single-servlet mode.
+
+##### The `hive!` Macro
+
+Define a hive type with its available servlets:
 
 ```rust
 hive! {
 	pub MyHive,
 	protocol: TokioListener,
 	servlets: {
-		ping_pong: PingPongServlet<RequestMessage>,
-		other_servlet: OtherServlet<RequestMessage>
+		ping: PingServlet<PingRequest>,
+		calc: CalculatorServlet<CalcRequest>
 	}
 }
-
-// Start the hive
-let mut hive = MyHive::start(
-	Arc::new(TraceCollector::new()),
-	Some(HiveConf::default()),
-).await?;
-
-// On mycelial protocols, establish multi-servlet mode
-hive.establish_hive().await?;
-
-// Get servlet addresses
-let addrs = hive.servlet_addresses().await;
-
-// Register with cluster
-let cluster_addr = "127.0.0.1:8888".parse()?;
-let response = hive.register_with_cluster(cluster_addr).await?;
-
-// Clean up
-hive.stop();
 ```
 
-**Hive with Policies**:
+Add security policies to gate incoming messages:
 
 ```rust
 hive! {
@@ -2431,74 +2491,114 @@ hive! {
 		with_collector_gate: [SignatureGate::new(verifying_key)]
 	},
 	servlets: {
-		ping_pong: PingPongServlet<RequestMessage>
+		ping: PingServlet<PingRequest>
 	}
 }
 ```
 
-##### HiveConf Configuration
+##### Hive Lifecycle
+
+A typical hive lifecycle with cluster integration:
 
 ```rust
-pub struct HiveConf {
-	/// Load balancing strategy (default: LeastLoaded)
-	pub load_balancer: L,
-	/// Message routing strategy (default: TypeBasedRouter)
-	pub router: R,
-	/// Default scaling config for all servlet types
-	pub default_scale: ServletScaleConf,
-	/// Per-type overrides keyed by servlet type name
-	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
-	/// Cooldown between scaling decisions (default: 5s)
-	pub cooldown: Duration,
-	/// Queue capacity per servlet for utilization calculation (default: 100)
-	pub queue_capacity: u32,
-	/// Backpressure threshold in basis points (default: 9000 = 90%)
-	pub backpressure_threshold: BasisPoints,
-	/// Circuit breaker failure threshold (default: 3)
-	pub circuit_breaker_threshold: u8,
-	/// Circuit breaker cooldown in milliseconds (default: 30_000)
-	pub circuit_breaker_cooldown_ms: u64,
-	/// Max connections per servlet for forwarding (default: 8)
-	pub servlet_pool_size: usize,
-	/// Idle timeout for pooled connections (default: 30s)
-	pub servlet_pool_idle_timeout: Option<Duration>,
-	/// Drain timeout before force-stop (default: 30s)
-	pub drain_timeout: Duration,
-	/// Trust store for cluster command authentication
-	pub trust_store: Option<Arc<dyn CertificateTrust>>,
-	/// TLS configuration for spawned servlets
-	pub hive_tls: Option<Arc<HiveTlsConfig>>,
-}
+// 1. Start the hive
+let mut hive = MyHive::start(trace, Some(HiveConf::default())).await?;
+
+// 2. Establish multi-servlet mode (spawns all servlets on separate ports)
+hive.establish_hive().await?;
+
+// 3. Register with cluster (announces available servlet types)
+let response = hive.register_with_cluster(cluster_addr).await?;
+
+// 4. Hive now receives work routed by the cluster
+
+// 5. Clean shutdown
+hive.stop();
 ```
 
-##### HiveTlsConfig
+##### Cluster Trust
+
+For hives to accept commands from a cluster (heartbeats, management requests),
+they must trust the cluster's certificate. Configure this via `HiveConf.trust_store`:
 
 ```rust
-pub struct HiveTlsConfig {
-	/// Server certificate specification
-	pub certificate: CertificateSpec,
-	/// Private key provider for signing
-	pub key: Arc<dyn SigningKeyProvider>,
-	/// Client certificate validators
-	pub validators: Vec<Arc<dyn CertificateValidation>>,
-}
+let hive_conf = HiveConf {
+	trust_store: Some(Arc::new(cluster_trust_store)),
+	..Default::default()
+};
 ```
 
-**TLS Configuration Example**:
+Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores)
+for building trust stores from cluster certificates.
+
+##### Resilience Features
+
+Hives include built-in resilience mechanisms:
+
+**Backpressure**: When utilization exceeds the threshold (default: 90%), the hive
+signals to the cluster that it's overloaded. The cluster can then route new work
+to less-loaded hives.
+
+**Circuit Breaker**: After consecutive failures (default: 3), the circuit opens
+and the hive temporarily stops accepting work, allowing time for recovery before
+resuming.
+
+These are configured via `HiveConf`:
 
 ```rust
-let (cert, signing_key) = create_test_cert_with_key("CN=Hive Server", 365)?;
+let hive_conf = HiveConf {
+	backpressure_threshold: BasisPoints::new(8000),  // 80%
+	circuit_breaker_threshold: 5,                    // Open after 5 failures
+	circuit_breaker_cooldown_ms: 60_000,             // 1 minute cooldown
+	..Default::default()
+};
+```
 
+##### Load Balancing and Routing
+
+When a hive manages multiple servlet instances of the same type (for scaling), it
+uses a `LoadBalancer` to select which instance handles each request. The default
+`LeastLoaded` strategy routes to the instance with lowest utilization.
+
+The `MessageRouter` determines which servlet type handles a given message. The
+default `TypeBasedRouter` uses the message's type information for routing.
+
+##### TLS Configuration
+
+For secure communication, configure TLS on the hive:
+
+```rust
 let tls_config = Arc::new(HiveTlsConfig {
 	certificate: CertificateSpec::Built(Box::new(cert)),
 	key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
-	validators: vec![],
+	validators: vec![],  // Optional: validate client certificates
 });
 
 let hive_conf = HiveConf {
 	hive_tls: Some(tls_config),
 	..Default::default()
 };
+```
+
+##### HiveConf Reference
+
+```rust
+pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedRouter> {
+	pub load_balancer: L,
+	pub router: R,
+	pub default_scale: ServletScaleConf,
+	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
+	pub cooldown: Duration,                         // Default: 5s
+	pub queue_capacity: u32,                        // Default: 100
+	pub backpressure_threshold: BasisPoints,        // Default: 9000 (90%)
+	pub circuit_breaker_threshold: u8,              // Default: 3
+	pub circuit_breaker_cooldown_ms: u64,           // Default: 30_000
+	pub servlet_pool_size: usize,                   // Default: 8
+	pub servlet_pool_idle_timeout: Option<Duration>,// Default: 30s
+	pub drain_timeout: Duration,                    // Default: 30s
+	pub trust_store: Option<Arc<dyn CertificateTrust>>,
+	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+}
 ```
 
 ##### Testing
