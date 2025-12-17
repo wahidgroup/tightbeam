@@ -55,6 +55,10 @@ mod dtn;
 #[cfg(feature = "transport")]
 mod security;
 
+// Payment Processing Gateway tests
+#[cfg(feature = "colony")]
+mod payments;
+
 // DLT Network test
 // #[cfg(feature = "full")]
 // mod proof;

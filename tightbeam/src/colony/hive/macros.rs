@@ -747,6 +747,28 @@ macro_rules! hive {
 
 					let stream = <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await?;
 					let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
+
+					// Apply TLS configuration for cluster connection
+					#[cfg(feature = "x509")]
+					{
+						use $crate::transport::X509ClientConfig;
+
+						// Apply trust_store if configured (validates cluster certificate)
+						if let Some(ref store) = self.config.trust_store {
+							transport = transport.with_trust_store(::std::sync::Arc::clone(store));
+						}
+
+						// Apply client identity if hive_tls is configured (for mutual auth with cluster)
+						if let Some(ref hive_tls) = self.config.hive_tls {
+							// Clone certificate spec (required - try_from consumes, hive_tls is in Arc)
+							let cert = $crate::crypto::x509::Certificate::try_from(hive_tls.certificate.clone())?;
+							let key_mgr = $crate::transport::handshake::HandshakeKeyManager::new(
+								::std::sync::Arc::clone(&hive_tls.key)
+							);
+							transport = transport.with_client_identity(cert, key_mgr);
+						}
+					}
+
 					let frame = {
 						use $crate::builder::TypeBuilder;
 						$crate::utils::compose($crate::Version::V0)

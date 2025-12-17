@@ -142,12 +142,14 @@ pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 /// Used by the connection pool for mutual TLS with hives.
 #[cfg(feature = "x509")]
 pub struct ClusterTlsConfig {
-	/// Client certificate specification for mutual TLS
+	/// Cluster's certificate (used for both client and hive connections)
 	pub certificate: CertificateSpec,
 	/// Private key provider for signing operations (supports HSM/KMS)
 	pub key: Arc<dyn SigningKeyProvider>,
-	/// Server certificate validators for hive connections
+	/// Server certificate validators for hive connections (cluster→hive)
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
+	/// Client certificate validators for mutual auth (client→cluster)
+	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
 }
 
 #[cfg(feature = "x509")]
@@ -157,6 +159,7 @@ impl Clone for ClusterTlsConfig {
 			certificate: self.certificate.clone(),
 			key: Arc::clone(&self.key),
 			validators: self.validators.clone(),
+			client_validators: self.client_validators.clone(),
 		}
 	}
 }
@@ -168,6 +171,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 			.field("certificate", &self.certificate)
 			.field("key", &"<KeyProvider>")
 			.field("validators", &format!("[{} validators]", self.validators.len()))
+			.field("client_validators", &format!("[{} validators]", self.client_validators.len()))
 			.finish()
 	}
 }
@@ -483,6 +487,7 @@ mod tests {
 			certificate: CertificateSpec::Der(&[]),
 			key: Arc::new(Secp256k1KeyProvider::from(key)),
 			validators: Vec::new(),
+			client_validators: Vec::new(),
 		}
 	}
 

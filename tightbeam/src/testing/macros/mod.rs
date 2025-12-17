@@ -431,10 +431,13 @@ macro_rules! tb_servlet_setup_inner {
 	($client:ident, $server_addr:expr, $env_config:expr) => {
 		let $client = {
 			use $crate::transport::tcp::r#async::TokioListener;
-			use $crate::transport::ClientBuilder;
-			async { ClientBuilder::<TokioListener>::connect($server_addr).await?.build() }
-				.await
-				.expect("Failed to setup servlet client (default)")
+			use $crate::transport::{ClientBuilder, ConnectionBuilder};
+			async {
+				let builder = ClientBuilder::<TokioListener>::builder().build();
+				builder.connect($server_addr).await
+			}
+			.await
+			.expect("Failed to setup servlet client (default)")
 		};
 	};
 	($client:ident, $server_addr:expr, $env_config:expr, $setup_expr:expr) => {
@@ -980,6 +983,7 @@ macro_rules! tb_scenario {
 			cluster: $cluster_name:ident,
 			start: $start_closure:expr,
 			hives: $hives_closure:expr,
+			$(setup: $setup_expr:expr,)?
 			client: $client_closure:expr
 		}
 	) => {{
@@ -1011,10 +1015,8 @@ macro_rules! tb_scenario {
 			hive_handles.push(Box::new(hive));
 		}
 
-		// Connect client to cluster gateway
-		use $crate::transport::{ClientBuilder, ConnectionBuilder};
-		let builder = ClientBuilder::<$crate::transport::tcp::r#async::TokioListener>::builder().build();
-		let client = builder.connect(cluster_addr).await.expect("Failed to connect to cluster");
+		// Setup client (with optional setup expression - defaults to simple connect)
+		$crate::tb_servlet_setup_inner!(client, cluster_addr, std::sync::Arc::clone(&env_config) $(, $setup_expr)?);
 
 		// Execute client closure with proper type inference
 		fn __tb_call_cluster_client<T, F, Fut, C>(

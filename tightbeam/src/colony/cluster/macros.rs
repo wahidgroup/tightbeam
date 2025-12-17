@@ -116,8 +116,28 @@ macro_rules! cluster {
 				// Wrap config in Arc for zero-copy sharing
 				let config = ::std::sync::Arc::new(config);
 
-				// Bind to a port for the gateway server
+				// Bind to a port for the gateway server with TLS
+				// Always uses TLS when x509 is enabled (cluster has cert)
+				// client_validators controls whether client certs are required
 				let bind_addr = <$protocol>::default_bind_address()?;
+
+				#[cfg(feature = "x509")]
+				let (listener, addr) = {
+					// Clone certificate spec (required - try_from consumes, config is in Arc)
+					let cert_obj = $crate::crypto::x509::Certificate::try_from(config.tls.certificate.clone())?;
+					let key_mgr = $crate::transport::handshake::HandshakeKeyManager::new(
+						::std::sync::Arc::clone(&config.tls.key)
+					);
+					let mut encryption_config = $crate::transport::TransportEncryptionConfig::new(cert_obj, key_mgr);
+					// Only require client certs if client_validators is non-empty
+					if !config.tls.client_validators.is_empty() {
+						let validators: Vec<_> = config.tls.client_validators.iter().map(::std::sync::Arc::clone).collect();
+						encryption_config = encryption_config.with_client_validators(validators);
+					}
+					<$protocol as $crate::transport::EncryptedProtocol>::bind_with(bind_addr, encryption_config).await?
+				};
+
+				#[cfg(not(feature = "x509"))]
 				let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
 
 				// Create hive registry with timeout from config
