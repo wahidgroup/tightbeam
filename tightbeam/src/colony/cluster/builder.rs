@@ -10,15 +10,16 @@ use crate::transport::client::pool::PoolConfig;
 use crate::transport::policy::{RestartExponentialBackoff, RestartPolicy};
 
 use super::{
-	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, DEFAULT_HEARTBEAT_INTERVAL_SECS,
-	DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
+	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf,
+	DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT,
+	DEFAULT_MAX_FAILURES,
 };
 use crate::colony::common::LeastLoaded;
 use crate::colony::hive::LoadBalancer;
 
-// =============================================================================
+// ============================================================================
 // HeartbeatConfBuilder
-// =============================================================================
+// ============================================================================
 
 /// Builder for HeartbeatConf
 pub struct HeartbeatConfBuilder {
@@ -100,15 +101,16 @@ impl HeartbeatConfBuilder {
 	}
 }
 
-// =============================================================================
+// ============================================================================
 // ClusterConfBuilder
-// =============================================================================
+// ============================================================================
 
 /// Builder for ClusterConf
 #[cfg(feature = "x509")]
 pub struct ClusterConfBuilder<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	load_balancer: L,
 	heartbeat: HeartbeatConf,
+	pheromone: PheromoneConf,
 	policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pool_config: PoolConfig,
 	retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
@@ -123,6 +125,7 @@ impl ClusterConf {
 		ClusterConfBuilder {
 			load_balancer: LeastLoaded,
 			heartbeat: HeartbeatConf::default(),
+			pheromone: PheromoneConf::default(),
 			policies: Vec::new(),
 			pool_config: PoolConfig::default(),
 			retry_policy: Arc::new(RestartExponentialBackoff::default()),
@@ -140,11 +143,18 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 		self
 	}
 
+	/// Set the pheromone configuration for bio-inspired routing
+	pub fn with_pheromone_config(mut self, config: PheromoneConf) -> Self {
+		self.pheromone = config;
+		self
+	}
+
 	/// Set the load balancer strategy
 	pub fn with_load_balancer<L2: LoadBalancer>(self, load_balancer: L2) -> ClusterConfBuilder<L2, D> {
 		ClusterConfBuilder {
 			load_balancer,
 			heartbeat: self.heartbeat,
+			pheromone: self.pheromone,
 			policies: self.policies,
 			pool_config: self.pool_config,
 			retry_policy: self.retry_policy,
@@ -176,6 +186,7 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 		ClusterConf {
 			load_balancer: self.load_balancer,
 			heartbeat: self.heartbeat,
+			pheromone: self.pheromone,
 			policies: self.policies,
 			pool_config: self.pool_config,
 			retry_policy: self.retry_policy,

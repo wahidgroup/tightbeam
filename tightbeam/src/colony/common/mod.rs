@@ -140,9 +140,90 @@ impl LoadBalancer for RoundRobin {
 	}
 }
 
-// =============================================================================
+// ============================================================================
+// Scoring Policy
+// ============================================================================
+
+/// Converts raw entry data into a selection score for load balancing
+///
+/// ScoringPolicy transforms pheromone and utilization data into a unified
+/// score that any LoadBalancer can use. The score semantics match utilization:
+/// lower values are preferred by LeastLoaded.
+///
+/// This separation allows bio-inspired algorithms (ACO/ABC) to work with
+/// any load balancing strategy.
+pub trait ScoringPolicy: Send + Sync {
+	/// Compute a selection score from pheromone and utilization
+	///
+	/// # Arguments
+	/// * `pheromone` - Pheromone level (0-10000, higher = more successful)
+	/// * `utilization` - Current load in basis points (0-10000, higher = busier)
+	///
+	/// # Returns
+	/// Score in basis points (lower = preferred by LeastLoaded-style balancers)
+	fn score(&self, pheromone: u64, utilization: BasisPoints) -> BasisPoints;
+}
+
+/// Pheromone-first scoring: high pheromone = low score = preferred
+///
+/// Ignores utilization and focuses purely on historical success.
+/// Good for environments where past performance predicts future success.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PheromoneScoring;
+
+impl ScoringPolicy for PheromoneScoring {
+	fn score(&self, pheromone: u64, _utilization: BasisPoints) -> BasisPoints {
+		// Invert: MAX - pheromone so LeastLoaded picks highest pheromone
+		let inverted = 10000u64.saturating_sub(pheromone);
+		BasisPoints::new(inverted as u16)
+	}
+}
+
+/// Utilization-first scoring (existing behavior)
+///
+/// Ignores pheromone and uses only current load.
+/// Good for predictable, homogeneous workloads.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UtilizationScoring;
+
+impl ScoringPolicy for UtilizationScoring {
+	fn score(&self, _pheromone: u64, utilization: BasisPoints) -> BasisPoints {
+		utilization
+	}
+}
+
+/// Combined scoring: weighted blend of pheromone and utilization
+///
+/// Balances historical success with current load for adaptive routing.
+#[derive(Debug, Clone, Copy)]
+pub struct CombinedScoring {
+	/// Weight for pheromone component (0-10000 basis points)
+	pub pheromone_weight: u16,
+}
+
+impl Default for CombinedScoring {
+	fn default() -> Self {
+		Self { pheromone_weight: 5000 } // 50/50 blend
+	}
+}
+
+impl ScoringPolicy for CombinedScoring {
+	fn score(&self, pheromone: u64, utilization: BasisPoints) -> BasisPoints {
+		let pheromone_score = 10000u64.saturating_sub(pheromone);
+		let util_score = utilization.get() as u64;
+
+		let pw = self.pheromone_weight as u64;
+		let uw = 10000u64.saturating_sub(pw);
+
+		// Weighted average
+		let combined = (pheromone_score * pw + util_score * uw) / 10000;
+		BasisPoints::new(combined as u16)
+	}
+}
+
+// ============================================================================
 // Message Routing
-// =============================================================================
+// ============================================================================
 
 /// Type validator function signature for message routing
 pub type MessageValidator = fn(&[u8]) -> bool;
@@ -177,9 +258,9 @@ impl MessageRouter for TypeBasedRouter {
 	}
 }
 
-// =============================================================================
+// ============================================================================
 // Timestamp Helper
-// =============================================================================
+// ============================================================================
 
 /// Get current timestamp in milliseconds since UNIX epoch
 #[cfg(feature = "std")]

@@ -68,10 +68,12 @@ macro_rules! cluster {
 		$(#[$meta])*
 		pub struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
+			servlet_registry: ::std::sync::Arc<$crate::colony::cluster::ServletRegistry>,
 			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
 			pool: ::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>,
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
+			evaporation_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
 			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 		}
@@ -85,10 +87,12 @@ macro_rules! cluster {
 		$(#[$meta])*
 		struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
+			servlet_registry: ::std::sync::Arc<$crate::colony::cluster::ServletRegistry>,
 			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
 			pool: ::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>,
 			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
+			evaporation_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 			addr: <$protocol as $crate::transport::Protocol>::Address,
 			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
 		}
@@ -116,12 +120,15 @@ macro_rules! cluster {
 				let bind_addr = <$protocol>::default_bind_address()?;
 				let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
 
-				// Create registry with timeout from config
+				// Create hive registry with timeout from config
 				let registry = ::std::sync::Arc::new(
 					$crate::colony::cluster::HiveRegistry::new(config.heartbeat.timeout)
 				);
-				let registry_for_server = ::std::sync::Arc::clone(&registry);
-				let trace_for_server = ::std::sync::Arc::clone(&trace);
+
+				// Create servlet registry with pheromone config
+				let servlet_registry = ::std::sync::Arc::new(
+					$crate::colony::cluster::ServletRegistry::new(config.pheromone.clone())
+				);
 
 				// Build connection pool with TLS configuration
 				let pool = {
@@ -132,11 +139,20 @@ macro_rules! cluster {
 					::std::sync::Arc::new(builder.build())
 				};
 
+				let registry_for_server = ::std::sync::Arc::clone(&registry);
+				let servlet_registry_for_server = ::std::sync::Arc::clone(&servlet_registry);
+				let config_for_server = ::std::sync::Arc::clone(&config);
+				let pool_for_server = ::std::sync::Arc::clone(&pool);
+				let trace_for_server = ::std::sync::Arc::clone(&trace);
+
 				// Start the gateway server
 				let server_handle = $crate::cluster!(
 					@build_gateway_server $protocol,
 					listener,
 					registry_for_server,
+					servlet_registry_for_server,
+					config_for_server,
+					pool_for_server,
 					trace_for_server
 				);
 
@@ -247,12 +263,42 @@ macro_rules! cluster {
 					}
 				};
 
+				// Start the evaporation loop for bio-inspired routing
+				let evaporation_handle = {
+					let servlet_registry = ::std::sync::Arc::clone(&servlet_registry);
+					let evaporation_interval = config.pheromone.evaporation_interval;
+
+					#[cfg(feature = "tokio")]
+					{
+						$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
+							loop {
+								$crate::colony::servlet::servlet_runtime::rt::sleep(evaporation_interval).await;
+								let _ = servlet_registry.evaporate();
+								let _ = servlet_registry.remove_abandoned();
+							}
+						})
+					}
+
+					#[cfg(all(not(feature = "tokio"), feature = "std"))]
+					{
+						$crate::colony::servlet::servlet_runtime::rt::spawn(move || {
+							loop {
+								$crate::colony::servlet::servlet_runtime::rt::sleep(evaporation_interval);
+								let _ = servlet_registry.evaporate();
+								let _ = servlet_registry.remove_abandoned();
+							}
+						})
+					}
+				};
+
 				Ok(Self {
 					registry,
+					servlet_registry,
 					config,
 					pool,
 					server_handle: Some(server_handle),
 					heartbeat_handle: Some(heartbeat_handle),
+					evaporation_handle: Some(evaporation_handle),
 					addr,
 					trace,
 				})
@@ -275,6 +321,9 @@ macro_rules! cluster {
 			}
 
 			fn stop(mut self) {
+				if let Some(handle) = self.evaporation_handle.take() {
+					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
+				}
 				if let Some(handle) = self.heartbeat_handle.take() {
 					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
 				}
@@ -323,14 +372,17 @@ macro_rules! cluster {
 	};
 
 	// Build gateway server
-	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $trace:ident) => {
+	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident) => {
 		$crate::server! {
 			protocol $protocol: $listener,
 			handle: move |frame: $crate::Frame| {
 				let registry = ::std::sync::Arc::clone(&$registry);
+				let servlet_registry = ::std::sync::Arc::clone(&$servlet_registry);
+				let config = ::std::sync::Arc::clone(&$config);
+				let pool = ::std::sync::Arc::clone(&$pool);
 				let _trace = ::std::sync::Arc::clone(&$trace);
 				async move {
-					$crate::cluster!(@handle_gateway_request frame, registry)
+					$crate::cluster!(@handle_gateway_request frame, registry, servlet_registry, config, pool)
 				}
 			}
 		}
@@ -349,19 +401,30 @@ macro_rules! cluster {
 	}};
 
 	// Handle gateway requests (registration + work)
-	(@handle_gateway_request $frame:ident, $registry:ident) => {{
+	(@handle_gateway_request $frame:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident) => {{
 		// Try to decode as RegisterHiveRequest (hive registration)
 		if let Ok(request) = $crate::decode::<$crate::colony::hive::RegisterHiveRequest>(&$frame.message) {
-			// Extract hive_addr before consuming request (zero-copy: only one clone)
-			let hive_addr = request.hive_addr.clone();
+			// Extract data before consuming request (zero-copy: single Arc allocation)
+			let hive_addr: ::std::sync::Arc<[u8]> = request.hive_addr.clone().into();
+			let servlet_types: Vec<::std::sync::Arc<[u8]>> = request
+				.available_servlets
+				.iter()
+				.map(|s| ::std::sync::Arc::from(s.as_slice()))
+				.collect();
+
 			let status = match $registry.register(request) {
-				Ok(()) => $crate::policy::TransitStatus::Accepted,
+				Ok(()) => {
+					// Populate servlet registry with entries from this hive
+					// hive_id and hive_addr are the same - reuse Arc
+					let _ = $servlet_registry.add_entries_from_hive(&hive_addr, &hive_addr, &servlet_types);
+					$crate::policy::TransitStatus::Accepted
+				}
 				Err(_) => $crate::policy::TransitStatus::Forbidden,
 			};
 
 			let response = $crate::colony::hive::RegisterHiveResponse {
 				status,
-				hive_id: Some(hive_addr),
+				hive_id: Some(hive_addr.to_vec()),
 			};
 
 			return $crate::cluster!(@reply $frame, response);
@@ -369,32 +432,88 @@ macro_rules! cluster {
 
 		// Try to decode as ClusterWorkRequest (work routing)
 		if let Ok(request) = $crate::decode::<$crate::colony::cluster::ClusterWorkRequest>(&$frame.message) {
-			// Check if any hives support this servlet type
-			let hives = match $registry.hives_for_type(&request.servlet_type) {
-				Ok(h) if !h.is_empty() => h,
+			// Look up servlet entries by type (bio-inspired routing)
+			let entries = match $servlet_registry.entries_for_type(&request.servlet_type) {
+				Ok(e) if !e.is_empty() => e,
 				_ => {
 					return $crate::cluster!(@reply $frame,
-						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Forbidden)
+						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Busy)
 					);
 				}
 			};
 
-			// TODO: Load balance and forward to selected hive
-			// For now, return accepted with the payload echoed back
-			let _ = hives; // Suppress unused warning until forwarding is implemented
-			return $crate::cluster!(@reply $frame,
-				$crate::colony::cluster::ClusterWorkResponse::ok(request.payload)
-			);
+			// Apply scoring policy to convert entries to InstanceMetrics
+			let scoring_policy = $crate::colony::common::PheromoneScoring;
+			let metrics: Vec<$crate::colony::common::InstanceMetrics> = entries
+				.iter()
+				.map(|e| {
+					use core::sync::atomic::Ordering;
+					use $crate::colony::common::ScoringPolicy;
+					$crate::colony::common::InstanceMetrics {
+						servlet_id: e.address.to_vec(),
+						utilization: scoring_policy.score(e.pheromone.load(Ordering::Relaxed), $crate::utils::BasisPoints::default()),
+						active_requests: 0,
+					}
+				})
+				.collect();
+
+			// Use load balancer to select a servlet
+			use $crate::colony::hive::LoadBalancer;
+			let selected_idx = match $config.load_balancer.select(&metrics) {
+				Some(idx) => idx,
+				None => {
+					return $crate::cluster!(@reply $frame,
+						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Busy)
+					);
+				}
+			};
+
+			let selected_entry = &entries[selected_idx];
+			let selected_addr = ::std::sync::Arc::clone(&selected_entry.address);
+
+			// Parse the servlet address and forward the request
+			let forward_result = $crate::cluster!(@forward_work $pool, selected_addr, request.payload);
+
+			// Reinforce or weaken based on outcome
+			match forward_result {
+				Ok(response_payload) => {
+					// Reinforce pheromone on success (quality = 500 = 5% boost)
+					let _ = $servlet_registry.reinforce(&selected_entry.address, 500);
+					return $crate::cluster!(@reply $frame,
+						$crate::colony::cluster::ClusterWorkResponse::ok(response_payload)
+					);
+				}
+				Err(_) => {
+					// Weaken on failure
+					let _ = $servlet_registry.weaken(&selected_entry.address);
+					return $crate::cluster!(@reply $frame,
+						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Busy)
+					);
+				}
+			}
 		}
 
 		// Unknown message type
 		Ok(None)
 	}};
 
+	// Helper: Forward work to a servlet
+	// TODO: Actually connect to the servlet and forward the payload
+	// For now, this is a stub that echoes back the payload
+	(@forward_work $pool:expr, $addr:expr, $payload:expr) => {{
+		// Suppress unused warnings until forwarding is implemented
+		let _ = &$pool;
+		let _ = &$addr;
+		Ok::<_, $crate::colony::cluster::ClusterError>($payload)
+	}};
+
 	// Implement Drop
 	(@impl_drop $cluster_name:ident) => {
 		impl Drop for $cluster_name {
 			fn drop(&mut self) {
+				if let Some(handle) = self.evaporation_handle.take() {
+					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
+				}
 				if let Some(handle) = self.heartbeat_handle.take() {
 					$crate::colony::servlet::servlet_runtime::rt::abort(&handle);
 				}

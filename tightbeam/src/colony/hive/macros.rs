@@ -36,7 +36,7 @@ macro_rules! hive {
 			$protocol,
 			[hive],
 			[$($policy_key: $policy_val),+],
-			$($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]
+			$($servlet_id: $servlet_name<$input>),*; [pub]; [$(#[$meta])*]
 		);
 	};
 
@@ -53,7 +53,7 @@ macro_rules! hive {
 			$protocol,
 			[hive],
 			[$($policy_key: $policy_val),+],
-			$($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]
+			$($servlet_id: $servlet_name<$input>),*; []; [$(#[$meta])*]
 		);
 	};
 
@@ -69,7 +69,7 @@ macro_rules! hive {
 			$protocol,
 			[hive],
 			[],
-			$($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]
+			$($servlet_id: $servlet_name<$input>),*; [pub]; [$(#[$meta])*]
 		);
 	};
 
@@ -85,7 +85,7 @@ macro_rules! hive {
 			$protocol,
 			[hive],
 			[],
-			$($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]
+			$($servlet_id: $servlet_name<$input>),*; []; [$(#[$meta])*]
 		);
 	};
 
@@ -95,9 +95,9 @@ macro_rules! hive {
 		$protocol:path,
 		[hive],
 		[$($policy_key:ident: $policy_val:tt),*],
-		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, pub, [$(#[$meta:meta])*]
+		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*; [pub]; [$(#[$meta:meta])*]
 	) => {
-		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, [$(#[$meta])*]);
+		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*; [pub]; [$(#[$meta])*]);
 		hive!(@impl_servlet_trait_for_hive $hive_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
 		hive!(@impl_hive_trait $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
 		hive!(@impl_maybe_establish $hive_name, $protocol);
@@ -109,9 +109,9 @@ macro_rules! hive {
 		$protocol:path,
 		[hive],
 		[$($policy_key:ident: $policy_val:tt),*],
-		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, , [$(#[$meta:meta])*]
+		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*; []; [$(#[$meta:meta])*]
 	) => {
-		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*, , [$(#[$meta])*]);
+		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*; []; [$(#[$meta])*]);
 		hive!(@impl_servlet_trait_for_hive $hive_name, $protocol, [$($policy_key: $policy_val),*], $($servlet_id: $servlet_name<$input>),*);
 		hive!(@impl_hive_trait $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*);
 		hive!(@impl_maybe_establish $hive_name, $protocol);
@@ -469,14 +469,14 @@ macro_rules! hive {
 
 	// Generate hive struct (stores multiple servlet instances)
 	(@impl_hive_struct $hive_name:ident, $protocol:path, $($servlet_id:ident: $servlet_name:ident<$input:ty>),*) => {
-		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*, pub, []);
+		hive!(@impl_hive_struct_with_attrs $hive_name, $protocol, $($servlet_id: $servlet_name<$input>),*; [pub]; []);
 	};
 
-	// Generate hive struct with attributes and visibility
+	// Generate hive struct with attributes and visibility (public)
 	(
 		@impl_hive_struct_with_attrs $hive_name:ident,
 		$protocol:path,
-		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, pub, [$(#[$meta:meta])*]
+		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*; [pub]; [$(#[$meta:meta])*]
 	) => {
 		paste::paste! {
 			$(#[$meta])*
@@ -503,11 +503,11 @@ macro_rules! hive {
 		}
 	};
 
-	// Implement hive struct with attributes and visibility
+	// Generate hive struct with attributes and visibility (private)
 	(
 		@impl_hive_struct_with_attrs $hive_name:ident,
 		$protocol:path,
-		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*, , [$(#[$meta:meta])*]
+		$($servlet_id:ident: $servlet_name:ident<$input:ty>),*; []; [$(#[$meta:meta])*]
 	) => {
 		paste::paste! {
 			$(#[$meta])*

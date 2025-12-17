@@ -15,11 +15,13 @@ pub mod builder;
 pub mod error;
 pub mod macros;
 pub mod registry;
+pub mod servlet_registry;
 
 // Re-export submodule types
 pub use builder::{ClusterConfBuilder, HeartbeatConfBuilder};
 pub use error::ClusterError;
 pub use registry::{HiveEntry, HiveRegistry, SharedId};
+pub use servlet_registry::{PheromoneConf, ServletEntry, ServletRegistry};
 
 use core::future::Future;
 use core::marker::PhantomData;
@@ -183,6 +185,8 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	pub load_balancer: L,
 	/// Heartbeat configuration
 	pub heartbeat: HeartbeatConf,
+	/// Pheromone configuration for bio-inspired routing
+	pub pheromone: PheromoneConf,
 	/// Gate policies for the gateway (rate limiting, auth, etc.)
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	/// Connection pool configuration for hive connections
@@ -209,6 +213,7 @@ impl<L: LoadBalancer, D: Digest> core::fmt::Debug for ClusterConf<L, D> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("ClusterConfig")
 			.field("heartbeat", &self.heartbeat)
+			.field("pheromone", &self.pheromone)
 			.field("policies", &format!("[{} policies]", self.policies.len()))
 			.field("pool_config", &self.pool_config)
 			.field("tls", &self.tls)
