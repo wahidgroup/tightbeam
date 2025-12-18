@@ -28,8 +28,9 @@ pub use crate::colony::common::{
 	ActivateServletRequest, ActivateServletResponse, ClusterCommand, ClusterCommandResponse, ClusterStatus,
 	HeartbeatParams, HeartbeatResult, HiveManagementRequest, HiveManagementResponse, InstanceMetrics, LeastLoaded,
 	ListServletsParams, ListServletsResult, LoadBalancer, MessageRouter, MessageValidator, PowerOfTwoChoices,
-	RegisterHiveRequest, RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletInfo,
-	ServletScaleConf, SpawnServletParams, SpawnServletResult, StopServletParams, StopServletResult, TypeBasedRouter,
+	RegisterHiveRequest, RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletAddressUpdate,
+	ServletAddressUpdateResponse, ServletInfo, ServletScaleConf, SpawnServletParams, SpawnServletResult,
+	StopServletParams, StopServletResult, TypeBasedRouter,
 };
 
 #[cfg(not(feature = "std"))]
@@ -200,6 +201,44 @@ impl core::fmt::Debug for HiveTlsConfig {
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.finish()
 	}
+}
+
+// =============================================================================
+// Intra-Hive Communication
+// =============================================================================
+
+use crate::TightBeamError;
+use core::pin::Pin;
+
+/// Type alias for async call result
+pub type CallFuture<'a> = Pin<Box<dyn core::future::Future<Output = Result<Vec<u8>, TightBeamError>> + Send + 'a>>;
+
+/// Context for intra-hive servlet communication.
+///
+/// This trait enables servlets within the same hive to call each other
+/// without going through the cluster. This is useful for patterns like
+/// a KeyManager servlet that provides encryption/decryption services
+/// to other servlets in the hive.
+///
+/// # Example
+///
+/// ```ignore
+/// // In a servlet handler:
+/// if let Some(ctx) = config.hive_context() {
+///     let decrypted = ctx.call(b"keymanager", encrypt_request).await?;
+/// }
+/// ```
+pub trait HiveContext: Send + Sync {
+	/// Call a sibling servlet by type ID and get a response.
+	///
+	/// # Arguments
+	/// * `servlet_type` - The type identifier of the target servlet (e.g., b"keymanager")
+	/// * `request` - The serialized request message
+	///
+	/// # Returns
+	/// * `Ok(Vec<u8>)` - The serialized response from the target servlet
+	/// * `Err(TightBeamError)` - If the servlet is not found or the call fails
+	fn call<'a>(&'a self, servlet_type: &'a [u8], request: Vec<u8>) -> CallFuture<'a>;
 }
 
 // =============================================================================

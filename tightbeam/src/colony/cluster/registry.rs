@@ -58,7 +58,13 @@ impl HiveRegistry {
 	/// Takes ownership for zero-copy conversion to `Arc<[u8]>`.
 	pub fn register(&self, request: RegisterHiveRequest) -> Result<(), ClusterError> {
 		let hive_id: SharedId = request.hive_addr.into();
-		let servlet_types: Arc<[SharedId]> = request.available_servlets.into_iter().map(Into::into).collect();
+		// Extract servlet types from servlet_addresses
+		let servlet_types: Arc<[SharedId]> = request
+			.servlet_addresses
+			.iter()
+			.map(|info| Arc::from(info.servlet_id.as_slice()))
+			.collect();
+
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
 
 		let entry = HiveEntry {

@@ -12,7 +12,7 @@
 ))]
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use sha3::Sha3_256;
@@ -27,9 +27,10 @@ use tightbeam::{
 	crypto::{
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
+		sign::ecdsa::Secp256k1SigningKey,
 		x509::{
 			store::{CertificateTrustBuilder, TrustBuilder},
-			CertificateSpec,
+			Certificate, CertificateSpec,
 		},
 	},
 	decode,
@@ -38,11 +39,35 @@ use tightbeam::{
 	policy::TransitStatus,
 	servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
-	transport::tcp::r#async::TokioListener,
+	transport::{tcp::r#async::TokioListener, ClientBuilder},
 	Beamable,
 };
 
 use crate::common::x509::create_test_cert_with_key;
+
+// ============================================================================
+// Shared Test Certificates
+// ============================================================================
+
+struct ClusterTestCerts {
+	cert: Certificate,
+	key: Secp256k1SigningKey,
+	trust: Arc<dyn tightbeam::crypto::x509::store::CertificateTrust>,
+}
+
+fn get_cluster_test_certs() -> &'static ClusterTestCerts {
+	static CERTS: OnceLock<ClusterTestCerts> = OnceLock::new();
+	CERTS.get_or_init(|| {
+		let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365)
+			.expect("Failed to create cluster cert");
+		let trust: Arc<dyn tightbeam::crypto::x509::store::CertificateTrust> =
+			Arc::new(CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_chain(vec![cert.clone()])
+				.expect("Failed to build trust")
+				.build());
+		ClusterTestCerts { cert, key, trust }
+	})
+}
 
 // ============================================================================
 // Cluster Configuration
@@ -146,17 +171,14 @@ tb_scenario! {
 	environment Cluster {
 		cluster: ClusterGateway,
 		start: |trace, config| async move {
-			let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365)?;
-
-			// Build hive trust from same cert (before moving cert into ClusterTlsConfig)
-			let hive_trust = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_chain(vec![cert.clone()])?
-				.build();
+			let certs = get_cluster_test_certs();
 
 			let tls = ClusterTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(cert)),
-				key: Arc::new(Secp256k1KeyProvider::from(key)),
+				certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
+				key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
 				validators: vec![],
+				client_validators: vec![],  // No mutual auth - TLS only
+				hive_trust: None,  // Servlets use plain TCP in this test
 			};
 
 			let heartbeat_conf = HeartbeatConf::builder()
@@ -176,15 +198,24 @@ tb_scenario! {
 				.build();
 
 			let cluster = ClusterGateway::start(trace, cluster_conf).await?;
-			Ok((cluster, hive_trust))
+			Ok((cluster, ()))
 		},
-		hives: |trace, hive_trust| {
+		hives: |trace, _| {
+			let certs = get_cluster_test_certs();
 			vec![
 				ClusterTestHive::start(Arc::clone(&trace), Some(HiveConf {
-					trust_store: Some(Arc::new(hive_trust)),
+					trust_store: Some(Arc::clone(&certs.trust)),
 					..Default::default()
 				}))
 			]
+		},
+		setup: |cluster_addr, _env_config| async move {
+			let certs = get_cluster_test_certs();
+			// Client uses TLS (validates cluster cert, no client cert needed)
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_trust_store(Arc::clone(&certs.trust));
+			let client = builder.connect(cluster_addr).await?;
+			Ok(client)
 		},
 		client: |trace, mut client, config| async move {
 			// Send work request to cluster

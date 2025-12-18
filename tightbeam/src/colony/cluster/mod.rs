@@ -150,6 +150,8 @@ pub struct ClusterTlsConfig {
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
 	/// Client certificate validators for mutual auth (client→cluster)
 	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
+	/// Trust store for validating hive/servlet server certificates (outbound connections)
+	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
 }
 
 #[cfg(feature = "x509")]
@@ -160,6 +162,7 @@ impl Clone for ClusterTlsConfig {
 			key: Arc::clone(&self.key),
 			validators: self.validators.clone(),
 			client_validators: self.client_validators.clone(),
+			hive_trust: self.hive_trust.as_ref().map(Arc::clone),
 		}
 	}
 }
@@ -172,6 +175,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 			.field("key", &"<KeyProvider>")
 			.field("validators", &format!("[{} validators]", self.validators.len()))
 			.field("client_validators", &format!("[{} validators]", self.client_validators.len()))
+			.field("hive_trust", &self.hive_trust.as_ref().map(|_| "Some(<TrustStore>)"))
 			.finish()
 	}
 }
@@ -472,6 +476,7 @@ pub trait Cluster: Sized + Send + Sync {
 mod tests {
 	use super::*;
 	use crate::colony::common::RegisterHiveRequest;
+	use crate::colony::hive::ServletInfo;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::testing::create_test_signing_key;
@@ -488,6 +493,7 @@ mod tests {
 			key: Arc::new(Secp256k1KeyProvider::from(key)),
 			validators: Vec::new(),
 			client_validators: Vec::new(),
+			hive_trust: None,
 		}
 	}
 
@@ -498,16 +504,22 @@ mod tests {
 	fn request(addr: &[u8], servlets: &[&[u8]]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
 			hive_addr: addr.to_vec(),
-			available_servlets: servlets.iter().map(|s| s.to_vec()).collect(),
 			metadata: None,
+			servlet_addresses: servlets
+				.iter()
+				.map(|s| ServletInfo { servlet_id: s.to_vec(), address: addr.to_vec() })
+				.collect(),
 		}
 	}
 
 	fn request_with_meta(addr: &[u8], servlets: &[&[u8]], meta: &[u8]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
 			hive_addr: addr.to_vec(),
-			available_servlets: servlets.iter().map(|s| s.to_vec()).collect(),
 			metadata: Some(meta.to_vec()),
+			servlet_addresses: servlets
+				.iter()
+				.map(|s| ServletInfo { servlet_id: s.to_vec(), address: addr.to_vec() })
+				.collect(),
 		}
 	}
 

@@ -7,7 +7,7 @@ use tightbeam::hive;
 use tightbeam::transport::tcp::r#async::TokioListener;
 
 use super::messages::{CaptureTransaction, CreditTransferTransaction};
-use super::servlets::{AuthorizationServlet, CaptureServlet};
+use super::servlets::{AuthorizationServlet, CaptureServlet, KeyManagerRequest, KeyManagerServlet};
 
 // ============================================================================
 // Payment Processor Hive
@@ -17,6 +17,7 @@ hive! {
 	pub PaymentProcessorHive,
 	protocol: TokioListener,
 	servlets: {
+		keymanager: KeyManagerServlet<KeyManagerRequest>,
 		authorize: AuthorizationServlet<CreditTransferTransaction>,
 		capture: CaptureServlet<CaptureTransaction>
 	}

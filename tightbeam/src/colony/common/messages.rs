@@ -20,13 +20,13 @@ use crate::Beamable;
 /// Message type for registering a hive with a cluster
 ///
 /// This message is sent from a hive to a cluster controller to announce
-/// its availability and capabilities.
+/// its availability and capabilities, including actual servlet addresses.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct RegisterHiveRequest {
-	/// The address where this hive can be reached
+	/// The address where this hive can be reached (for heartbeats)
 	pub hive_addr: Vec<u8>,
-	/// List of servlet IDs this hive can run
-	pub available_servlets: Vec<Vec<u8>>,
+	/// Servlet type-to-address mappings for direct routing
+	pub servlet_addresses: Vec<ServletInfo>,
 	/// Optional metadata about the hive
 	pub metadata: Option<Vec<u8>>,
 }
@@ -38,6 +38,27 @@ pub struct RegisterHiveResponse {
 	pub status: TransitStatus,
 	/// Optional cluster-assigned hive ID
 	pub hive_id: Option<Vec<u8>>,
+}
+
+/// Notification from hive to cluster about servlet address changes
+///
+/// Sent by hives when auto-scaling spawns or stops servlet instances.
+/// Enables push-based cluster registry updates.
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct ServletAddressUpdate {
+	/// Hive identifier (matches hive_addr from registration)
+	pub hive_id: Vec<u8>,
+	/// Newly spawned servlet addresses
+	pub added: Vec<ServletInfo>,
+	/// Removed servlet IDs (servlet_id field from ServletInfo)
+	pub removed: Vec<Vec<u8>>,
+}
+
+/// Response to servlet address update notification
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct ServletAddressUpdateResponse {
+	/// Status of the update (Accepted = success)
+	pub status: TransitStatus,
 }
 
 // =============================================================================

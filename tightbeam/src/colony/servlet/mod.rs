@@ -17,6 +17,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::colony::hive::HiveContext;
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::colony::worker::Worker;
 use crate::colony::worker::WorkerMetadata;
@@ -83,6 +84,7 @@ where
 	pub(crate) _crypto: PhantomData<C>,
 	pub(crate) x509_config: Option<TransportEncryptionConfig<C>>,
 	pub(crate) servlet_config: Option<Arc<dyn Any + Send + Sync>>,
+	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 }
@@ -97,6 +99,7 @@ where
 	pub(crate) _protocol: PhantomData<P>,
 	pub(crate) _message: PhantomData<M>,
 	pub(crate) servlet_config: Option<Arc<dyn Any + Send + Sync>>,
+	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 }
@@ -110,6 +113,7 @@ where
 {
 	x509_config: Option<TransportEncryptionConfig<C>>,
 	servlet_config: Option<Arc<dyn Any + Send + Sync>>,
+	hive_context: Option<Arc<dyn HiveContext>>,
 	workers: HashMap<String, Box<dyn WorkerBox>>,
 	collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	_phantom: PhantomData<(P, M, C)>,
@@ -123,6 +127,7 @@ where
 	M: Message,
 {
 	servlet_config: Option<Arc<dyn Any + Send + Sync>>,
+	hive_context: Option<Arc<dyn HiveContext>>,
 	workers: HashMap<String, Box<dyn WorkerBox>>,
 	collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	_phantom: PhantomData<(P, M)>,
@@ -174,6 +179,11 @@ where
 	pub fn collector_gates_ref(&self) -> &[Arc<dyn GatePolicy + Send + Sync>] {
 		&self.collector_gates
 	}
+
+	/// Get the hive context for intra-hive servlet communication
+	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
+		self.hive_context.as_ref()
+	}
 }
 
 #[cfg(not(feature = "x509"))]
@@ -216,6 +226,11 @@ where
 	pub fn collector_gates_ref(&self) -> &[Arc<dyn GatePolicy + Send + Sync>] {
 		&self.collector_gates
 	}
+
+	/// Get the hive context for intra-hive servlet communication
+	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
+		self.hive_context.as_ref()
+	}
 }
 
 #[cfg(feature = "x509")]
@@ -232,6 +247,7 @@ where
 			_crypto: PhantomData,
 			x509_config: None,
 			servlet_config: Some(Arc::new(())),
+			hive_context: None,
 			workers: HashMap::new(),
 			collector_gates: Vec::new(),
 		}
@@ -249,6 +265,7 @@ where
 			_protocol: PhantomData,
 			_message: PhantomData,
 			servlet_config: Some(Arc::new(())),
+			hive_context: None,
 			workers: HashMap::new(),
 			collector_gates: Vec::new(),
 		}
@@ -266,6 +283,7 @@ where
 		Self {
 			x509_config: None,
 			servlet_config: None,
+			hive_context: None,
 			workers: HashMap::new(),
 			collector_gates: Vec::new(),
 			_phantom: PhantomData,
@@ -282,6 +300,7 @@ where
 	fn default() -> Self {
 		Self {
 			servlet_config: None,
+			hive_context: None,
 			workers: HashMap::new(),
 			collector_gates: Vec::new(),
 			_phantom: PhantomData,
@@ -335,6 +354,13 @@ where
 		self
 	}
 
+	/// Add hive context for intra-hive servlet communication
+	#[must_use]
+	pub fn with_hive_context(mut self, ctx: Arc<dyn HiveContext>) -> Self {
+		self.hive_context = Some(ctx);
+		self
+	}
+
 	/// Build the final ServletConf
 	pub fn build(self) -> ServletConf<P, M, C> {
 		ServletConf {
@@ -343,6 +369,7 @@ where
 			_crypto: PhantomData,
 			x509_config: self.x509_config,
 			servlet_config: self.servlet_config,
+			hive_context: self.hive_context,
 			workers: self.workers,
 			collector_gates: self.collector_gates,
 		}
@@ -381,12 +408,20 @@ where
 		self
 	}
 
+	/// Add hive context for intra-hive servlet communication
+	#[must_use]
+	pub fn with_hive_context(mut self, ctx: Arc<dyn HiveContext>) -> Self {
+		self.hive_context = Some(ctx);
+		self
+	}
+
 	/// Build the final ServletConf
 	pub fn build(self) -> ServletConf<P, M> {
 		ServletConf {
 			_protocol: PhantomData,
 			_message: PhantomData,
 			servlet_config: self.servlet_config,
+			hive_context: self.hive_context,
 			workers: self.workers,
 			collector_gates: self.collector_gates,
 		}

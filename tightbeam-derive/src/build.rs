@@ -27,6 +27,7 @@ pub const BUILDER_CONFIGS: &[MacroConf] = &[MacroConf {
 		("message_integrity", "with_message_hasher", true, false),
 		("frame_integrity", "with_witness_hasher", true, false),
 		("confidentiality", "with_cipher", false, false),
+		("encryptor", "with_encryptor", false, false),
 		("nonrepudiation", "with_signer", false, false),
 		("compactness", "with_compression", false, false),
 		("priority", "with_priority", false, false),

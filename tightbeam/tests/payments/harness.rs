@@ -3,14 +3,12 @@
 //! Re-implements patterns from zero_queue.rs locally for test isolation:
 //! - DedupBook: Idempotence tracking using (frame.metadata.id, frame.metadata.order)
 //! - ChainState: DAG validation for previous_frame linkage
-//! - ProcessorGate: AdaptiveGate for backpressure simulation
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use sha3::Sha3_256;
 use tightbeam::asn1::DigestInfo;
-use tightbeam::policy::{GatePolicy, TransitStatus};
 use tightbeam::trace::TraceCollector;
 use tightbeam::{utils, Frame, TightBeamError};
 
@@ -21,18 +19,26 @@ use super::messages::TransactionStatus;
 // ============================================================================
 
 pub const PAYMENT_TAG: &str = "payment";
-pub const AUTH_TAG: &str = "auth";
-pub const CAPTURE_TAG: &str = "capture";
-pub const PROCESSOR_1_TAG: &str = "processor:1";
-pub const PROCESSOR_2_TAG: &str = "processor:2";
-pub const PROCESSOR_3_TAG: &str = "processor:3";
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Idempotency key type: (frame ID, frame order)
+type IdempotencyKey = (Vec<u8>, u64);
+
+/// Extract idempotency key from frame (DRY helper)
+#[inline]
+fn frame_key(frame: &Frame) -> IdempotencyKey {
+	(frame.metadata.id.clone(), frame.metadata.order)
+}
 
 // ============================================================================
 // DedupBook - Idempotence Tracking
 // ============================================================================
 
-type SeenSet = Arc<Mutex<BTreeSet<(Vec<u8>, u64)>>>;
-type CacheMap = Arc<Mutex<std::collections::HashMap<(Vec<u8>, u64), TransactionStatus>>>;
+type SeenSet = Arc<Mutex<BTreeSet<IdempotencyKey>>>;
+type CacheMap = Arc<Mutex<std::collections::HashMap<IdempotencyKey, TransactionStatus>>>;
 
 /// Deduplication book for idempotent payment processing
 ///
@@ -60,7 +66,7 @@ impl DedupBook {
 	/// Returns Ok(true) if this is a new frame (should process)
 	/// Returns Ok(false) if this is a duplicate (skip processing)
 	pub fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		let key = (frame.metadata.id.clone(), frame.metadata.order);
+		let key = frame_key(frame);
 		let mut guard = self.seen.lock().map_err(|_| TightBeamError::LockPoisoned)?;
 		let inserted = guard.insert(key);
 
@@ -75,7 +81,7 @@ impl DedupBook {
 
 	/// Cache a response for a frame
 	pub fn cache_response(&self, frame: &Frame, response: TransactionStatus) -> Result<(), TightBeamError> {
-		let key = (frame.metadata.id.clone(), frame.metadata.order);
+		let key = frame_key(frame);
 		let mut guard = self.cache.lock().map_err(|_| TightBeamError::LockPoisoned)?;
 		guard.insert(key, response);
 		Ok(())
@@ -83,7 +89,7 @@ impl DedupBook {
 
 	/// Get cached response for a frame
 	pub fn get_cached(&self, frame: &Frame) -> Option<TransactionStatus> {
-		let key = (frame.metadata.id.clone(), frame.metadata.order);
+		let key = frame_key(frame);
 		let guard = self.cache.lock().ok()?;
 		guard.get(&key).cloned()
 	}
@@ -168,83 +174,6 @@ impl ChainState {
 }
 
 // ============================================================================
-// ProcessorGate - Adaptive Backpressure
-// ============================================================================
-
-/// Backpressure statistics for throttling simulation
-#[derive(Clone, Default)]
-pub struct BackpressureStats {
-	/// Set of frame orders that have been throttled
-	throttled: Arc<Mutex<BTreeSet<u64>>>,
-	/// Whether the processor is in failure mode
-	failure_mode: Arc<Mutex<bool>>,
-}
-
-impl BackpressureStats {
-	/// Mark a frame as throttled (returns true if first time)
-	pub fn mark_throttled(&self, order: u64) -> bool {
-		let mut guard = match self.throttled.lock() {
-			Ok(g) => g,
-			Err(_) => return false,
-		};
-		if guard.contains(&order) {
-			false
-		} else {
-			guard.insert(order);
-			true
-		}
-	}
-
-	/// Set failure mode (simulate processor failure)
-	pub fn set_failure_mode(&self, enabled: bool) {
-		if let Ok(mut guard) = self.failure_mode.lock() {
-			*guard = enabled;
-		}
-	}
-
-	/// Check if in failure mode
-	pub fn is_failure_mode(&self) -> bool {
-		self.failure_mode.lock().map(|g| *g).unwrap_or(false)
-	}
-}
-
-/// Adaptive gate for processor backpressure
-///
-/// Simulates processor overload by rejecting frames with Busy status.
-/// First encounter of a frame is throttled; subsequent attempts are accepted.
-#[derive(Clone)]
-pub struct ProcessorGate {
-	stats: Arc<BackpressureStats>,
-	trace: Arc<TraceCollector>,
-}
-
-impl ProcessorGate {
-	/// Create a new processor gate
-	pub fn new(stats: Arc<BackpressureStats>, trace: Arc<TraceCollector>) -> Self {
-		Self { stats, trace }
-	}
-}
-
-impl GatePolicy for ProcessorGate {
-	fn evaluate(&self, frame: &Frame) -> TransitStatus {
-		// If in failure mode, always reject
-		if self.stats.is_failure_mode() {
-			let _ = self.trace.event_with("throttle_engaged", &[PAYMENT_TAG], true);
-			return TransitStatus::Busy;
-		}
-
-		// Throttle on first encounter, accept on retry
-		if self.stats.mark_throttled(frame.metadata.order) {
-			let _ = self.trace.event_with("throttle_engaged", &[PAYMENT_TAG], true);
-			TransitStatus::Busy
-		} else {
-			let _ = self.trace.event_with("retry_with_jitter", &[PAYMENT_TAG], true);
-			TransitStatus::Accepted
-		}
-	}
-}
-
-// ============================================================================
 // PaymentHarness - Combined Validation
 // ============================================================================
 
@@ -280,6 +209,21 @@ impl PaymentHarness {
 		self.chain.record(frame)?;
 
 		Ok(true)
+	}
+
+	/// Check if frame is duplicate and return cached response if available
+	///
+	/// Returns Ok(Some(cached)) if duplicate with cached response
+	/// Returns Ok(None) if not duplicate or no cached response
+	/// Emits dedup_cache_hit trace event on cache hit
+	pub fn check_dedup_cache(&self, frame: &Frame) -> Result<Option<TransactionStatus>, TightBeamError> {
+		if !self.handle(frame)? {
+			if let Some(cached) = self.dedup.get_cached(frame) {
+				self.trace.event_with("dedup_cache_hit", &[PAYMENT_TAG], true)?;
+				return Ok(Some(cached));
+			}
+		}
+		Ok(None)
 	}
 }
 
@@ -339,38 +283,5 @@ mod tests {
 		let result = dedup.record(&frame2);
 		assert!(result.is_ok());
 		assert!(result.unwrap());
-	}
-
-	#[test]
-	fn backpressure_first_throttled() {
-		let stats = Arc::new(BackpressureStats::default());
-		let trace = Arc::new(TraceCollector::default());
-		let gate = ProcessorGate::new(stats, trace);
-		let frame = test_frame(b"txn1", 1);
-
-		assert_eq!(gate.evaluate(&frame), TransitStatus::Busy);
-	}
-
-	#[test]
-	fn backpressure_retry_accepted() {
-		let stats = Arc::new(BackpressureStats::default());
-		let trace = Arc::new(TraceCollector::default());
-		let gate = ProcessorGate::new(stats, trace);
-		let frame = test_frame(b"txn1", 1);
-
-		gate.evaluate(&frame); // First: throttled
-		assert_eq!(gate.evaluate(&frame), TransitStatus::Accepted); // Retry: accepted
-	}
-
-	#[test]
-	fn failure_mode_always_busy() {
-		let stats = Arc::new(BackpressureStats::default());
-		stats.set_failure_mode(true);
-		let trace = Arc::new(TraceCollector::default());
-		let gate = ProcessorGate::new(stats, trace);
-		let frame = test_frame(b"txn1", 1);
-
-		assert_eq!(gate.evaluate(&frame), TransitStatus::Busy);
-		assert_eq!(gate.evaluate(&frame), TransitStatus::Busy); // Still busy
 	}
 }

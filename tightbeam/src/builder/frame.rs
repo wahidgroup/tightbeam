@@ -355,6 +355,46 @@ impl<T: Message> FrameBuilder<T> {
 
 		self
 	}
+
+	/// Use a custom encryptor for asymmetric encryption (e.g., ECIES).
+	///
+	/// Unlike `with_cipher` which requires an AEAD cipher, this method accepts
+	/// any type implementing `Encryptor`. This enables asymmetric encryption
+	/// schemes like ECIES where the client encrypts to a recipient's public key.
+	///
+	/// # Example
+	/// ```ignore
+	/// use tightbeam::crypto::ecies::{EciesEncryptor, EciesSecp256k1Oid};
+	///
+	/// let encryptor = EciesEncryptor::new(recipient_pubkey);
+	/// let frame = builder
+	///     .with_encryptor::<EciesSecp256k1Oid, _>(encryptor)
+	///     .build()?;
+	/// ```
+	pub fn with_encryptor<C, E>(mut self, encryptor: E) -> Self
+	where
+		C: AssociatedOid,
+		E: Encryptor<C> + 'static,
+		T: CheckAeadOid<C>,
+	{
+		// Runtime fallback validation
+		if T::HAS_PROFILE && C::OID != <T::Profile as SecurityProfile>::AeadOid::OID {
+			self.errors
+				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+					C::OID,
+					<T::Profile as SecurityProfile>::AeadOid::OID,
+				))));
+			return self;
+		}
+
+		let message_oid = self.message_oid;
+		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
+			// Encryptor handles nonce generation internally (e.g., ECIES)
+			encryptor.encrypt_content(plaintext, [], message_oid)
+		}));
+
+		self
+	}
 }
 
 #[cfg(feature = "digest")]
