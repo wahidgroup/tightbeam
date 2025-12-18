@@ -48,6 +48,9 @@ pub mod private {
 	#[cfg(feature = "aead")]
 	pub trait SealedAeadOid<C: AssociatedOid> {}
 
+	#[cfg(feature = "ecdh")]
+	pub trait SealedCurveOid<C: AssociatedOid> {}
+
 	#[cfg(feature = "signature")]
 	pub trait SealedSignatureOid<S: SignatureAlgorithmIdentifier> {}
 }
@@ -61,6 +64,11 @@ pub trait CheckDigestOid<D: AssociatedOid>: private::SealedDigestOid<D> {
 
 #[cfg(feature = "aead")]
 pub trait CheckAeadOid<C: AssociatedOid>: private::SealedAeadOid<C> {
+	const RESULT: ();
+}
+
+#[cfg(feature = "ecdh")]
+pub trait CheckCurveOid<C: AssociatedOid>: private::SealedCurveOid<C> {
 	const RESULT: ();
 }
 
@@ -323,6 +331,7 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
+	/// Set the cipher for symmetric encryption
 	pub fn with_cipher<C, Cipher>(mut self, cipher: Cipher) -> Self
 	where
 		C: AssociatedOid,
@@ -357,34 +366,27 @@ impl<T: Message> FrameBuilder<T> {
 	}
 
 	/// Use a custom encryptor for asymmetric encryption (e.g., ECIES).
-	///
-	/// Unlike `with_cipher` which requires an AEAD cipher, this method accepts
-	/// any type implementing `Encryptor`. This enables asymmetric encryption
-	/// schemes like ECIES where the client encrypts to a recipient's public key.
-	///
-	/// # Example
-	/// ```ignore
-	/// use tightbeam::crypto::ecies::{EciesEncryptor, EciesSecp256k1Oid};
-	///
-	/// let encryptor = EciesEncryptor::new(recipient_pubkey);
-	/// let frame = builder
-	///     .with_encryptor::<EciesSecp256k1Oid, _>(encryptor)
-	///     .build()?;
-	/// ```
 	pub fn with_encryptor<C, E>(mut self, encryptor: E) -> Self
 	where
 		C: AssociatedOid,
 		E: Encryptor<C> + 'static,
-		T: CheckAeadOid<C>,
 	{
-		// Runtime fallback validation
-		if T::HAS_PROFILE && C::OID != <T::Profile as SecurityProfile>::AeadOid::OID {
-			self.errors
-				.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
-					C::OID,
-					<T::Profile as SecurityProfile>::AeadOid::OID,
-				))));
-			return self;
+		// Runtime validation: check either AEAD OID or Curve OID
+		if T::HAS_PROFILE {
+			let aead_match = C::OID == <T::Profile as SecurityProfile>::AeadOid::OID;
+			#[cfg(feature = "ecdh")]
+			let curve_match = C::OID == <T::Profile as SecurityProfile>::CurveOid::OID;
+			#[cfg(not(feature = "ecdh"))]
+			let curve_match = false;
+
+			if !aead_match && !curve_match {
+				self.errors
+					.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+						C::OID,
+						<T::Profile as SecurityProfile>::AeadOid::OID,
+					))));
+				return self;
+			}
 		}
 
 		let message_oid = self.message_oid;

@@ -58,13 +58,13 @@ struct ClusterTestCerts {
 fn get_cluster_test_certs() -> &'static ClusterTestCerts {
 	static CERTS: OnceLock<ClusterTestCerts> = OnceLock::new();
 	CERTS.get_or_init(|| {
-		let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365)
-			.expect("Failed to create cluster cert");
-		let trust: Arc<dyn tightbeam::crypto::x509::store::CertificateTrust> =
-			Arc::new(CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365).expect("Failed to create cluster cert");
+		let trust: Arc<dyn tightbeam::crypto::x509::store::CertificateTrust> = Arc::new(
+			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
 				.with_chain(vec![cert.clone()])
 				.expect("Failed to build trust")
-				.build());
+				.build(),
+		);
 		ClusterTestCerts { cert, key, trust }
 	})
 }
@@ -108,7 +108,7 @@ pub struct PingResponse {
 servlet! {
 	ClusterTestServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, _trace, _config, _workers| async move {
+	handle: |frame, _ctx| async move {
 		let req: PingRequest = decode(&frame.message)?;
 		Ok(Some(compose! {
 			V0: id: frame.metadata.id.clone(),

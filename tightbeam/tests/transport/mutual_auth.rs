@@ -117,7 +117,7 @@ struct AuthResponse {
 servlet! {
 	pub MutualAuthServlet<AuthRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, _trace, _config, _workers| async move {
+	handle: |frame, _ctx| async move {
 		let request: AuthRequest = decode(&frame.message)?;
 		let response = AuthResponse {
 			server_id: "mutual-auth-server".to_string(),

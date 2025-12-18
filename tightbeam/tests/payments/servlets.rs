@@ -51,9 +51,11 @@ pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 servlet! {
 	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, trace, _config, _workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+
 		// Create harness for validation
-		let harness = PaymentHarness::new(Arc::clone(&trace));
+		let harness = PaymentHarness::new(Arc::clone(trace));
 
 		// Check for duplicates and return cached response if available
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
@@ -64,9 +66,8 @@ servlet! {
 		}
 
 		// Decode the authorization request
-		// Note: HiveContext-based decryption via KeyManager is available but requires
-		// servlet macro changes to expose full ServletConf to handlers.
-		// For now, messages are expected to be unencrypted at this layer.
+		// Note: ECIES decryption via KeyManager is available when ctx.hive_context() is Some
+		// but requires encrypted messages. For now, messages are unencrypted.
 		let req: CreditTransferTransaction = decode(&frame.message)?;
 
 		// Verify integrity
@@ -90,8 +91,6 @@ servlet! {
 
 		// Generate authorization code
 		let auth_code = format!("AUTH{:08X}", req.creation_datetime as u32).into_bytes();
-
-		// Create approved response
 		let response = TransactionStatus::approved(req.payment_id.clone(), auth_code);
 
 		// Cache the response
@@ -114,9 +113,11 @@ servlet! {
 servlet! {
 	pub CaptureServlet<CaptureTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, trace, _config, _workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+
 		// Create harness for validation
-		let harness = PaymentHarness::new(Arc::clone(&trace));
+		let harness = PaymentHarness::new(Arc::clone(trace));
 
 		// Check for duplicates and return cached response if available
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
@@ -178,8 +179,9 @@ pub enum KeyManagerRequest {
 servlet! {
 	pub KeyManagerServlet<KeyManagerRequest, EnvConfig = Arc<SecretKey>>,
 	protocol: TokioListener,
-	handle: |frame, trace, secret_key, _workers| async move {
-		// `secret_key` is `&Arc<SecretKey>` (downcast by macro)
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+		let secret_key: &Arc<SecretKey> = ctx.env_config()?;
 
 		// Decode the request
 		let req: KeyManagerRequest = decode(&frame.message)?;

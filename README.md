@@ -2007,8 +2007,10 @@ servlet! {
 	policies: {
 		with_collector_gate: [RateLimitGate::new(100), AuthGate::new(key)]
 	},
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
 		// Only reached if all gates pass
+		// Access trace, config, workers via ctx
+		let _trace = ctx.trace();
 		// ...
 	}
 }
@@ -2031,15 +2033,19 @@ pub struct PingPongServletConf {
 tightbeam::servlet! {
 	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
+		// Access context members
+		let trace = ctx.trace();
+		let config: &PingPongServletConf = ctx.env_config()?;
+
 		// Handler receives Frame, not decoded message
 		let decoded = decode::<RequestMessage, _>(&frame.message)?;
 		let decoded_arc = Arc::new(decoded);
 		
-		// Workers are accessed via the workers parameter
+		// Workers are accessed via ctx.relay
 		let (ping_result, lucky_result) = tokio::join!(
-			workers.relay::<PingPongWorker>(Arc::clone(&decoded_arc)),
-			workers.relay::<LuckyNumberDeterminer>(Arc::clone(&decoded_arc))
+			ctx.relay::<PingPongWorker>(Arc::clone(&decoded_arc)),
+			ctx.relay::<LuckyNumberDeterminer>(Arc::clone(&decoded_arc))
 		);
 
 		let reply = match ping_result {

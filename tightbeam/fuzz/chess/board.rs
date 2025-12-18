@@ -185,7 +185,9 @@ servlet! {
 	/// Chess engine servlet for processing chess moves
 	pub ChessEngineServlet<ChessMoveRequest, EnvConfig = ChessEngineServletConf>,
 	protocol: TokioListener,
-	handle: |message, trace, config, _workers| async move {
+	handle: |message, ctx| async move {
+		let trace = ctx.trace();
+		let config: &ChessEngineServletConf = ctx.env_config()?;
 		let message_id = message.metadata.id.clone();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {

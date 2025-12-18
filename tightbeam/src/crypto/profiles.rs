@@ -94,12 +94,6 @@ impl AeadKeySize for crate::crypto::aead::Aes256GcmOid {
 	const KEY_SIZE: usize = 32;
 }
 
-/// ECIES derives its own 32-byte key internally via KDF
-#[cfg(feature = "x509")]
-impl AeadKeySize for crate::crypto::ecies::EciesSecp256k1Oid {
-	const KEY_SIZE: usize = 32;
-}
-
 /// Negotiation descriptor: pure OID set for a security profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence)]
 #[cfg_attr(feature = "derive", derive(Beamable))]
@@ -363,39 +357,6 @@ pub trait CryptoProvider:
 /// Maps to numeric profile = 1.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TightbeamProfile;
-
-/// ECIES-based profile using secp256k1 for asymmetric message encryption.
-///
-/// This profile uses ECIES (Elliptic Curve Integrated Encryption Scheme) for
-/// message-level encryption, allowing clients to encrypt to a recipient's
-/// public key without sharing symmetric keys.
-#[cfg(feature = "x509")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EciesSecp256k1Profile;
-
-#[cfg(all(
-	feature = "x509",
-	feature = "sha3",
-	feature = "secp256k1",
-	feature = "kdf",
-	feature = "kem"
-))]
-impl SecurityProfile for EciesSecp256k1Profile {
-	#[cfg(feature = "digest")]
-	type DigestOid = Sha3_256;
-	#[cfg(feature = "aead")]
-	type AeadOid = crate::crypto::ecies::EciesSecp256k1Oid;
-	#[cfg(feature = "signature")]
-	type SignatureAlg = Secp256k1Signature;
-	#[cfg(feature = "kdf")]
-	type KdfOid = HkdfSha3_256Oid;
-	#[cfg(feature = "ecdh")]
-	type CurveOid = Secp256k1Oid;
-	#[cfg(feature = "kem")]
-	type KemOid = Kyber1024Oid;
-
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
-}
 
 impl SecurityProfile for TightbeamProfile {
 	#[cfg(feature = "digest")]

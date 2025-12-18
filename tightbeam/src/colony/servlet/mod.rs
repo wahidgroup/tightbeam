@@ -72,6 +72,69 @@ impl dyn WorkerBox {
 	}
 }
 
+// =============================================================================
+// Servlet Context
+// =============================================================================
+
+/// Unified context for servlet handlers.
+///
+/// Provides access to trace collection, environment configuration, workers,
+/// and hive context for intra-hive communication.
+pub struct ServletContext {
+	trace: Arc<TraceCollector>,
+	env_config: Arc<dyn Any + Send + Sync>,
+	workers: HashMap<String, Box<dyn WorkerBox>>,
+	hive_context: Option<Arc<dyn HiveContext>>,
+}
+
+impl ServletContext {
+	/// Create a new servlet context
+	pub fn new(
+		trace: Arc<TraceCollector>,
+		env_config: Arc<dyn Any + Send + Sync>,
+		workers: HashMap<String, Box<dyn WorkerBox>>,
+		hive_context: Option<Arc<dyn HiveContext>>,
+	) -> Self {
+		Self { trace, env_config, workers, hive_context }
+	}
+
+	/// Get the trace collector
+	pub fn trace(&self) -> &Arc<TraceCollector> {
+		&self.trace
+	}
+
+	/// Get the environment configuration (downcasted to the specific type)
+	pub fn env_config<T: 'static>(&self) -> Result<&T, TightBeamError> {
+		self.env_config.downcast_ref().ok_or(TightBeamError::MissingConfiguration)
+	}
+
+	/// Get the hive context for intra-hive servlet communication
+	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
+		self.hive_context.as_ref()
+	}
+
+	/// Get a worker by name (downcasted to the specific type)
+	pub fn worker<W: 'static>(&self, name: &str) -> Option<&W> {
+		self.workers.get(name)?.downcast_ref()
+	}
+
+	/// Relay a message to a worker by type name
+	///
+	/// This finds the worker by its registered name and calls its relay method.
+	pub async fn relay<W>(&self, input: Arc<W::Input>) -> Result<W::Output, TightBeamError>
+	where
+		W: Worker + WorkerMetadata + 'static,
+	{
+		let name = W::name();
+		let worker = self.worker::<W>(name).ok_or(TightBeamError::MissingConfiguration)?;
+		worker.relay(input).await.map_err(|e| e.into())
+	}
+}
+
+// =============================================================================
+// Servlet Configuration
+// =============================================================================
+
 /// Configuration for a servlet, containing x509, application config, and workers
 #[cfg(feature = "x509")]
 pub struct ServletConf<P, M, C: CryptoProvider = DefaultCryptoProvider>

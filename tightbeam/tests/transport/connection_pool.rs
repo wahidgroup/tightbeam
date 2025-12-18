@@ -206,7 +206,8 @@ tb_scenario! {
 			servlet! {
 				PoolEchoServlet<TestMessage, EnvConfig = PoolEchoServletConf>,
 					protocol: TokioListener,
-					handle: |frame, _trace, config, _workers| async move {
+					handle: |frame, ctx| async move {
+						let config: &PoolEchoServletConf = ctx.env_config()?;
 						config.message_count.fetch_add(1, Ordering::SeqCst);
 						Ok(Some(frame))
 					}
@@ -282,7 +283,8 @@ tb_scenario! {
 			servlet! {
 				IsolationServlet<TestMessage, EnvConfig = IsolationServletConf>,
 					protocol: TokioListener,
-					handle: |frame, _trace, config, _workers| async move {
+					handle: |frame, ctx| async move {
+						let config: &IsolationServletConf = ctx.env_config()?;
 						config.message_count.fetch_add(1, Ordering::SeqCst);
 						Ok(Some(frame))
 					}
@@ -363,7 +365,8 @@ tb_scenario! {
 			servlet! {
 				ConcurrentServlet<TestMessage, EnvConfig = ConcurrentServletConf>,
 				protocol: TokioListener,
-				handle: |frame, _trace, config, _workers| async move {
+				handle: |frame, ctx| async move {
+					let config: &ConcurrentServletConf = ctx.env_config()?;
 					config.message_count.fetch_add(1, Ordering::SeqCst);
 					Ok(Some(frame))
 				}

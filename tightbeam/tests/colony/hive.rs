@@ -41,7 +41,8 @@ pub struct HiveTestResponse {
 servlet! {
 	HiveTestServlet<HiveTestRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, trace, _config, _workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
 		trace.event("servlet_receive")?;
 		let req: HiveTestRequest = decode(&frame.message)?;
 
