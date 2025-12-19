@@ -146,8 +146,6 @@ servlet! {
 
 		// Generate settlement code
 		let settlement_code = format!("SETTLE{:08X}", req.capture_datetime as u32).into_bytes();
-
-		// Create captured response
 		let response = TransactionStatus::captured(payment_id, settlement_code);
 
 		// Cache the response

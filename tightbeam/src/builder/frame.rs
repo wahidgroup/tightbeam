@@ -331,8 +331,8 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Set the cipher for symmetric encryption
-	pub fn with_cipher<C, Cipher>(mut self, cipher: Cipher) -> Self
+	/// Set the AEAD cipher for symmetric encryption
+	pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
 	where
 		C: AssociatedOid,
 		Cipher: Aead + 'static,
@@ -750,7 +750,7 @@ mod tests {
 			.with_message(msg)
 			.with_id("test_v1_with_encryption")
 			.with_order(1696521600)
-			.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+			.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 			.with_signer::<Secp256k1Signature, _>(signing_key)
 			.build()
 		},
@@ -797,7 +797,7 @@ mod tests {
 			.with_id("test_v1_with_compression")
 			.with_order(1696521600)
 			.with_compression(ZstdCompression)
-			.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+			.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 			.with_signer::<Secp256k1Signature, _>(signing_key)
 			.build()
 		},
@@ -853,7 +853,7 @@ mod tests {
 				.with_witness_hasher::<Sha3_256>()
 				.with_compression(ZstdCompression)
 				.with_rng(Box::new(rng))
-				.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+				.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 				.with_signer::<Secp256k1Signature, _>(signing_key)
 				.with_priority(crate::MessagePriority::High)
 				.with_lifetime(3600)
@@ -939,17 +939,16 @@ mod tests {
 	#[cfg(feature = "derive")]
 	fn test_compose_macro() -> Result<()> {
 		let message = create_test_message(None);
-		let result = compose! {
+		let frame = compose! {
 			V0:
 				id: "test-id",
 				order: 1696521600,
 				message: message,
 				message_integrity: type Sha3_256
-		};
-		let tightbeam = result?;
-		assert_eq!(tightbeam.version, Version::V0);
-		assert_eq!(tightbeam.metadata.id, b"test-id");
-		assert_eq!(tightbeam.metadata.order, 1696521600);
+		}?;
+		assert_eq!(frame.version, Version::V0);
+		assert_eq!(frame.metadata.id, b"test-id");
+		assert_eq!(frame.metadata.order, 1696521600);
 		Ok(())
 	}
 
@@ -1240,8 +1239,6 @@ mod tests {
 			for (name, _attrs, confidential, nonrepudiable, message_integrity, frame_integrity, min_version) in
 				test_cases
 			{
-				use crate::core::Message;
-
 				// Generate the appropriate test message struct based on the test case
 				match (confidential, nonrepudiable, message_integrity, frame_integrity, min_version) {
 					(false, false, false, false, Version::V0) => {
