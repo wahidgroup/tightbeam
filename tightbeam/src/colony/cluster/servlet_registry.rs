@@ -8,25 +8,6 @@
 //! - **Pheromone**: Success metric that grows with successful requests and decays over time
 //! - **Trial Count**: Failure metric from ABC - entries are abandoned after too many failures
 //! - **Evaporation**: Natural decay of pheromone to forget stale routes
-//!
-//! # Usage
-//!
-//! ```ignore
-//! let registry = ServletRegistry::new(PheromoneConf::default());
-//!
-//! // On hive registration, entries are created with initial pheromone
-//! registry.add_entries_from_hive(&hive_id, &servlet_types)?;
-//!
-//! // On successful work:
-//! registry.reinforce(&servlet_addr, quality);
-//!
-//! // On failed work:
-//! registry.weaken(&servlet_addr);
-//!
-//! // Periodic maintenance:
-//! registry.evaporate();
-//! registry.remove_abandoned();
-//! ```
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
@@ -61,7 +42,16 @@ pub struct PheromoneConf {
 	pub initial_pheromone: u64,
 	/// Max consecutive failures before abandonment
 	pub abandonment_limit: u32,
+	/// Pheromone boost on successful request (default: 500 = 5% boost)
+	pub reinforcement_boost: u64,
+	/// Pheromone penalty on failed request (default: 0, only trial_count incremented)
+	pub weakening_penalty: u64,
 }
+
+/// Default reinforcement boost (500 = 5% pheromone increase on success)
+pub const DEFAULT_REINFORCEMENT_BOOST: u64 = 500;
+/// Default weakening penalty (0 = only increment trial count on failure)
+pub const DEFAULT_WEAKENING_PENALTY: u64 = 0;
 
 impl Default for PheromoneConf {
 	fn default() -> Self {
@@ -70,6 +60,8 @@ impl Default for PheromoneConf {
 			evaporation_interval: Duration::from_secs(DEFAULT_EVAPORATION_INTERVAL_SECS),
 			initial_pheromone: DEFAULT_INITIAL_PHEROMONE,
 			abandonment_limit: DEFAULT_ABANDONMENT_LIMIT,
+			reinforcement_boost: DEFAULT_REINFORCEMENT_BOOST,
+			weakening_penalty: DEFAULT_WEAKENING_PENALTY,
 		}
 	}
 }
@@ -148,6 +140,17 @@ impl ServletEntry {
 	/// Weaken entry on failure (increment trial count)
 	pub fn weaken(&self) {
 		self.trial_count.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Weaken entry with pheromone penalty on failure
+	///
+	/// Increments trial count and applies optional pheromone penalty.
+	pub fn weaken_with_penalty(&self, penalty: u64) {
+		self.trial_count.fetch_add(1, Ordering::Relaxed);
+		if penalty > 0 {
+			let current = self.pheromone.load(Ordering::Relaxed);
+			self.pheromone.store(current.saturating_sub(penalty), Ordering::Relaxed);
+		}
 	}
 
 	/// Apply evaporation decay
@@ -339,6 +342,17 @@ impl ServletRegistry {
 		let entries = self.entries.read()?;
 		if let Some(entry) = entries.get(address) {
 			entry.weaken();
+			Ok(true)
+		} else {
+			Ok(false)
+		}
+	}
+
+	/// Weaken a servlet with pheromone penalty on failure
+	pub fn weaken_with_penalty(&self, address: &[u8], penalty: u64) -> Result<bool, ClusterError> {
+		let entries = self.entries.read()?;
+		if let Some(entry) = entries.get(address) {
+			entry.weaken_with_penalty(penalty);
 			Ok(true)
 		} else {
 			Ok(false)

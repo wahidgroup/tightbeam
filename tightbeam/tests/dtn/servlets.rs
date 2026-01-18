@@ -269,7 +269,7 @@ servlet! {
 					missing_hash,
 					&config.earth_relay_pool,
 					config.earth_relay_addr,
-					&trace,
+					trace,
 				).await?;
 				Ok(None)
 			},
@@ -477,7 +477,7 @@ servlet! {
 					missing_hash,
 					&config.mars_relay_pool,
 					config.mars_relay_addr,
-					&trace,
+					trace,
 				).await?;
 				Ok(None)
 			},
@@ -702,7 +702,7 @@ servlet! {
 					missing_hash,
 					upstream_pool,
 					upstream_addr,
-					&trace,
+					trace,
 				).await?;
 
 				Ok(None)
@@ -792,7 +792,7 @@ servlet! {
 					missing_hash,
 					&config.mars_relay_pool,
 					config.mars_relay_addr,
-					&trace,
+					trace,
 				).await?;
 
 				return Ok(None);

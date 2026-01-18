@@ -7,7 +7,7 @@ pub mod macros;
 pub mod tracking;
 
 // Re-export tracking types
-pub use tracking::{LatencyTracker, ServletMetrics};
+pub use tracking::{LatencyTracker, ServletMetrics, UtilizationReporter};
 
 use core::convert::TryFrom;
 use core::future::Future;

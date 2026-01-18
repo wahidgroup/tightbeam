@@ -299,6 +299,31 @@ macro_rules! __servlet_drop_impl {
 	};
 }
 
+// Helper macro: Generate ServletBox trait implementation for hive registration
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __servlet_box_impl {
+	($servlet_name:ident, $protocol:path) => {
+		impl $crate::colony::hive::ServletBox for $servlet_name {
+			fn addr_bytes(&self) -> Vec<u8> {
+				let addr = self.addr();
+				let addr_string: String = addr.to_string();
+				addr_string.into_bytes()
+			}
+
+			fn stop_boxed(self: Box<Self>) {
+				(*self).stop()
+			}
+
+			fn utilization(&self) -> Option<$crate::utils::BasisPoints> {
+				// Servlets can override this via the Servlet trait's utilization method
+				use $crate::colony::servlet::Servlet;
+				<Self as Servlet<_>>::utilization(self)
+			}
+		}
+	};
+}
+
 /// Servlet macro for creating containerized tightbeam applications
 #[macro_export]
 macro_rules! servlet {
@@ -324,6 +349,7 @@ macro_rules! servlet {
 			$crate::__servlet_impl_methods!(pub, $servlet_name, $protocol, $input);
 			$crate::__servlet_trait_impl!($servlet_name, $protocol, $input);
 			$crate::__servlet_drop_impl!($servlet_name);
+			$crate::__servlet_box_impl!($servlet_name, $protocol);
 		}
 	};
 
@@ -349,6 +375,7 @@ macro_rules! servlet {
 			$crate::__servlet_impl_methods!(pub, $servlet_name, $protocol, $input);
 			$crate::__servlet_trait_impl!($servlet_name, $protocol, $input);
 			$crate::__servlet_drop_impl!($servlet_name);
+			$crate::__servlet_box_impl!($servlet_name, $protocol);
 		}
 	};
 }

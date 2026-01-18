@@ -31,12 +31,19 @@ pub const fn currency_exponent(code: &[u8; 3]) -> u8 {
 }
 
 /// Check if a currency code is valid (known)
+#[allow(dead_code)]
 pub const fn is_known_currency(code: &[u8; 3]) -> bool {
 	matches!(
 		code,
-		b"USD" | b"EUR" | b"GBP" | b"JPY" | b"KRW" | b"VND" | b"XAF" | b"XOF" | b"BHD" | b"KWD"
-			| b"OMR" | b"TND" | b"CLF" | b"CHF"
-			| b"CAD" | b"AUD" | b"CNY"
+		b"USD"
+			| b"EUR" | b"GBP"
+			| b"JPY" | b"KRW"
+			| b"VND" | b"XAF"
+			| b"XOF" | b"BHD"
+			| b"KWD" | b"OMR"
+			| b"TND" | b"CLF"
+			| b"CHF" | b"CAD"
+			| b"AUD" | b"CNY"
 	)
 }
 
@@ -168,6 +175,3 @@ mod tests {
 		assert_eq!(amount.minor_units(), 0);
 	}
 }
-
-
-

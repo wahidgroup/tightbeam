@@ -124,6 +124,7 @@ pub struct CaptureTransaction {
 
 impl CaptureTransaction {
 	/// Create a new capture transaction
+	#[allow(dead_code)]
 	pub fn new(
 		original_end_to_end_id: impl Into<Vec<u8>>,
 		capture_amount: MonetaryAmount,
@@ -234,6 +235,7 @@ impl TransactionStatus {
 	}
 
 	/// Create a pending status
+	#[allow(dead_code)]
 	pub fn pending(original_payment_id: PaymentIdentification) -> Self {
 		Self {
 			original_payment_id,
@@ -331,9 +333,7 @@ mod tests {
 	#[test]
 	fn decrypt_request_roundtrip() {
 		use tightbeam::{decode, encode};
-		let req = super::DecryptRequest {
-			ciphertext: b"encrypted_data".to_vec(),
-		};
+		let req = super::DecryptRequest { ciphertext: b"encrypted_data".to_vec() };
 		let encoded = encode(&req).unwrap();
 		let decoded: super::DecryptRequest = decode(&encoded).unwrap();
 		assert_eq!(decoded.ciphertext, req.ciphertext);

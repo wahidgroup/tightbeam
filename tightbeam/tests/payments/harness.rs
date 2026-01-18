@@ -159,12 +159,14 @@ impl ChainState {
 	}
 
 	/// Get the last digest for linking the next frame
+	#[allow(dead_code)]
 	pub fn last_digest(&self) -> Option<DigestInfo> {
 		let guard = self.state.lock().ok()?;
 		guard.last_digest.clone()
 	}
 
 	/// Reset the chain state (for testing different chains)
+	#[allow(dead_code)]
 	pub fn reset(&self) -> Result<(), TightBeamError> {
 		let mut guard = self.state.lock().map_err(|_| TightBeamError::LockPoisoned)?;
 		guard.last_order = None;

@@ -118,3 +118,87 @@ impl Default for LatencyTracker {
 		Self::new(2000, 100_000)
 	}
 }
+
+// ============================================================================
+// Utilization Reporter
+// ============================================================================
+
+/// Helper for servlets to track and report utilization.
+///
+/// Wraps a `LatencyTracker` with a convenient interface for recording
+/// request latencies and reporting utilization to the hive.
+///
+/// Servlets can embed this and return `Some(reporter.utilization())` from
+/// `ServletBox::utilization()`.
+///
+/// # Example
+///
+/// ```ignore
+/// struct MyServlet {
+///     reporter: UtilizationReporter,
+///     // ... other fields
+/// }
+///
+/// impl MyServlet {
+///     fn handle_request(&self, request: Request) -> Response {
+///         let start = std::time::Instant::now();
+///         let response = self.process(request);
+///         self.reporter.record_latency(start.elapsed());
+///         response
+///     }
+/// }
+///
+/// impl ServletBox for MyServlet {
+///     fn utilization(&self) -> Option<BasisPoints> {
+///         Some(self.reporter.utilization())
+///     }
+///     // ... other methods
+/// }
+/// ```
+#[derive(Debug)]
+pub struct UtilizationReporter {
+	tracker: LatencyTracker,
+}
+
+impl UtilizationReporter {
+	/// Create a new utilization reporter with custom parameters.
+	///
+	/// # Arguments
+	/// * `alpha_bps` - Smoothing factor (0-10000). Higher = more weight on new samples.
+	/// * `target_us` - Target latency in microseconds (100% utilization point).
+	pub const fn new(alpha_bps: u16, target_us: u64) -> Self {
+		Self { tracker: LatencyTracker::new(alpha_bps, target_us) }
+	}
+
+	/// Record a latency sample from a request duration.
+	pub fn record_latency(&self, duration: core::time::Duration) {
+		self.tracker.record(duration.as_micros() as u64);
+	}
+
+	/// Record a latency sample in microseconds.
+	pub fn record_microseconds(&self, latency_us: u64) {
+		self.tracker.record(latency_us);
+	}
+
+	/// Get current utilization as basis points (0-10000).
+	pub fn utilization(&self) -> BasisPoints {
+		self.tracker.utilization()
+	}
+
+	/// Get the raw EMA latency in microseconds.
+	pub fn ema_microseconds(&self) -> u64 {
+		self.tracker.ema_microseconds()
+	}
+
+	/// Reset the tracker to zero.
+	pub fn reset(&self) {
+		self.tracker.reset();
+	}
+}
+
+impl Default for UtilizationReporter {
+	/// Default: 20% alpha, 100ms target latency
+	fn default() -> Self {
+		Self::new(2000, 100_000)
+	}
+}

@@ -24,11 +24,10 @@
 	feature = "transport-policy"
 ))]
 
-pub mod currency;
-pub mod messages;
-pub mod harness;
-pub mod servlets;
-pub mod hives;
 pub mod cluster;
+pub mod currency;
+pub mod harness;
+pub mod hives;
+pub mod messages;
 mod scenarios;
-
+pub mod servlets;

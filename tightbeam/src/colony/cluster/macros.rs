@@ -545,15 +545,15 @@ macro_rules! cluster {
 			// Reinforce or weaken based on outcome
 			match forward_result {
 				Ok(response_payload) => {
-					// Reinforce pheromone on success (quality = 500 = 5% boost)
-					let _ = $servlet_registry.reinforce(&selected_entry.address, 500);
+					// Reinforce pheromone on success using configured boost
+					let _ = $servlet_registry.reinforce(&selected_entry.address, $config.pheromone.reinforcement_boost);
 					return $crate::cluster!(@reply $frame,
 						$crate::colony::cluster::ClusterWorkResponse::ok(response_payload)
 					);
 				}
 				Err(_) => {
-					// Weaken on failure
-					let _ = $servlet_registry.weaken(&selected_entry.address);
+					// Weaken on failure using configured penalty
+					let _ = $servlet_registry.weaken_with_penalty(&selected_entry.address, $config.pheromone.weakening_penalty);
 					return $crate::cluster!(@reply $frame,
 						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Busy)
 					);
