@@ -153,9 +153,15 @@ macro_rules! cluster {
 				// Build connection pool with TLS configuration
 				let pool = {
 					use $crate::transport::client::pool::ConnectionBuilder;
-					let builder = $crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
+					let mut builder = $crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
 						.with_config(config.pool_config.clone())
 						.with_client_identity(config.tls.certificate.clone(), ::std::sync::Arc::clone(&config.tls.key))?;
+
+					// Add trust store for validating hive/servlet certs if configured
+					if let Some(ref trust) = config.tls.hive_trust {
+						builder = builder.with_trust_store(::std::sync::Arc::clone(trust));
+					}
+
 					::std::sync::Arc::new(builder.build())
 				};
 
@@ -179,6 +185,7 @@ macro_rules! cluster {
 				// Start the heartbeat loop - 3-tier implementation
 				let heartbeat_handle = {
 					let registry = ::std::sync::Arc::clone(&registry);
+					let servlet_registry_for_hb = ::std::sync::Arc::clone(&servlet_registry);
 					let config = ::std::sync::Arc::clone(&config);
 					let pool = ::std::sync::Arc::clone(&pool);
 
@@ -203,14 +210,15 @@ macro_rules! cluster {
 									}
 
 									let registry = ::std::sync::Arc::clone(&registry);
+									let servlet_registry = ::std::sync::Arc::clone(&servlet_registry_for_hb);
 									let config = ::std::sync::Arc::clone(&config);
 									let pool = ::std::sync::Arc::clone(&pool);
 									let max_failures = config.heartbeat.max_failures;
 
-								set.spawn(async move {
-									let result = $crate::cluster!(@send_heartbeat_async pool, config, addr, $digest);
-									$crate::cluster!(@process_heartbeat_result registry, hive_addr, result, max_failures, config);
-								});
+									set.spawn(async move {
+										let result = $crate::cluster!(@send_heartbeat_async pool, config, addr, $digest);
+										$crate::cluster!(@process_heartbeat_result registry, servlet_registry, hive_addr, result, max_failures, config);
+									});
 								}
 
 								// Drain remaining tasks
@@ -237,12 +245,13 @@ macro_rules! cluster {
 									}))
 									.for_each_concurrent(max_concurrent, |(hive_addr, addr)| {
 										let registry = ::std::sync::Arc::clone(&registry);
+										let servlet_registry = ::std::sync::Arc::clone(&servlet_registry_for_hb);
 										let config = ::std::sync::Arc::clone(&config);
 										let pool = ::std::sync::Arc::clone(&pool);
 										let max_failures = config.heartbeat.max_failures;
 									async move {
 										let result = $crate::cluster!(@send_heartbeat_async pool, config, addr, $digest);
-										$crate::cluster!(@process_heartbeat_result registry, hive_addr, result, max_failures, config);
+										$crate::cluster!(@process_heartbeat_result registry, servlet_registry, hive_addr, result, max_failures, config);
 									}
 									})
 									.await;
@@ -426,17 +435,30 @@ macro_rules! cluster {
 		if let Ok(request) = $crate::decode::<$crate::colony::hive::RegisterHiveRequest>(&$frame.message) {
 			// Extract data before consuming request (zero-copy: single Arc allocation)
 			let hive_addr: ::std::sync::Arc<[u8]> = request.hive_addr.clone().into();
-			let servlet_types: Vec<::std::sync::Arc<[u8]>> = request
-				.available_servlets
+
+			// Extract servlet info for ServletRegistry (actual addresses)
+			let servlet_info: Vec<(::std::sync::Arc<[u8]>, ::std::sync::Arc<[u8]>)> = request
+				.servlet_addresses
 				.iter()
-				.map(|s| ::std::sync::Arc::from(s.as_slice()))
+				.map(|info| (
+					::std::sync::Arc::from(info.servlet_id.as_slice()),
+					::std::sync::Arc::from(info.address.as_slice()),
+				))
 				.collect();
 
-			let status = match $registry.register(request) {
+				let status = match $registry.register(request) {
 				Ok(()) => {
-					// Populate servlet registry with entries from this hive
-					// hive_id and hive_addr are the same - reuse Arc
-					let _ = $servlet_registry.add_entries_from_hive(&hive_addr, &hive_addr, &servlet_types);
+					// Store actual servlet addresses in ServletRegistry
+					for (servlet_type, servlet_addr) in &servlet_info {
+						let entry = $crate::colony::cluster::ServletEntry::new(
+							::std::sync::Arc::clone(servlet_addr),  // Actual servlet address!
+							::std::sync::Arc::clone(servlet_type),
+							::std::sync::Arc::clone(&hive_addr),
+							$config.pheromone.initial_pheromone,
+							$config.pheromone.abandonment_limit,
+						);
+						let _ = $servlet_registry.add(entry);
+					}
 					$crate::policy::TransitStatus::Accepted
 				}
 				Err(_) => $crate::policy::TransitStatus::Forbidden,
@@ -448,6 +470,32 @@ macro_rules! cluster {
 			};
 
 			return $crate::cluster!(@reply $frame, response);
+		}
+
+		// Try to decode as ServletAddressUpdate (scaling notification from hive)
+		if let Ok(update) = $crate::decode::<$crate::colony::hive::ServletAddressUpdate>(&$frame.message) {
+			let hive_id: ::std::sync::Arc<[u8]> = update.hive_id.into();
+
+			// Add new servlet entries
+			for info in &update.added {
+				let entry = $crate::colony::cluster::ServletEntry::new(
+					::std::sync::Arc::from(info.address.as_slice()),
+					::std::sync::Arc::from(info.servlet_id.as_slice()),
+					::std::sync::Arc::clone(&hive_id),
+					$config.pheromone.initial_pheromone,
+					$config.pheromone.abandonment_limit,
+				);
+				let _ = $servlet_registry.add(entry);
+			}
+
+			// Remove stopped servlet entries
+			for servlet_id in &update.removed {
+				let _ = $servlet_registry.remove(servlet_id);
+			}
+
+			return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
+				status: $crate::policy::TransitStatus::Accepted,
+			});
 		}
 
 		// Try to decode as ClusterWorkRequest (work routing)
@@ -497,15 +545,15 @@ macro_rules! cluster {
 			// Reinforce or weaken based on outcome
 			match forward_result {
 				Ok(response_payload) => {
-					// Reinforce pheromone on success (quality = 500 = 5% boost)
-					let _ = $servlet_registry.reinforce(&selected_entry.address, 500);
+					// Reinforce pheromone on success using configured boost
+					let _ = $servlet_registry.reinforce(&selected_entry.address, $config.pheromone.reinforcement_boost);
 					return $crate::cluster!(@reply $frame,
 						$crate::colony::cluster::ClusterWorkResponse::ok(response_payload)
 					);
 				}
 				Err(_) => {
-					// Weaken on failure
-					let _ = $servlet_registry.weaken(&selected_entry.address);
+					// Weaken on failure using configured penalty
+					let _ = $servlet_registry.weaken_with_penalty(&selected_entry.address, $config.pheromone.weakening_penalty);
 					return $crate::cluster!(@reply $frame,
 						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Busy)
 					);
@@ -518,13 +566,43 @@ macro_rules! cluster {
 	}};
 
 	// Helper: Forward work to a servlet
-	// TODO: Actually connect to the servlet and forward the payload
-	// For now, this is a stub that echoes back the payload
 	(@forward_work $pool:expr, $addr:expr, $payload:expr) => {{
-		// Suppress unused warnings until forwarding is implemented
-		let _ = &$pool;
-		let _ = &$addr;
-		Ok::<_, $crate::colony::cluster::ClusterError>($payload)
+		async {
+			// Parse servlet address from bytes
+			let addr_str = core::str::from_utf8(&$addr)
+				.map_err(|_| $crate::colony::cluster::ClusterError::InvalidAddress($addr.to_vec()))?;
+			let parsed_addr = addr_str.parse()
+				.map_err(|_| $crate::colony::cluster::ClusterError::InvalidAddress($addr.to_vec()))?;
+
+			// Build minimal frame with payload as message
+			let mut metadata = $crate::Metadata::default();
+			metadata.id = b"work-forward".to_vec();
+
+			let frame = $crate::Frame {
+				version: $crate::Version::V0,
+				metadata,
+				message: $payload,
+				integrity: None,
+				nonrepudiation: None,
+			};
+
+			// Connect to servlet and send
+			let mut client = $pool.connect(parsed_addr).await
+				.map_err(|_| $crate::colony::cluster::ClusterError::HiveCommunicationFailed(b"connect failed".to_vec()))?;
+
+			let response = match client.conn()?.emit(frame, None).await {
+				Ok(Some(r)) => r,
+				Ok(None) => {
+					return Err($crate::colony::cluster::ClusterError::HiveCommunicationFailed(b"no response".to_vec()));
+				}
+				Err(_) => {
+					return Err($crate::colony::cluster::ClusterError::HiveCommunicationFailed(b"transport error".to_vec()));
+				}
+			};
+
+			// Clone the message to avoid moving out of Frame (which has Drop)
+			Ok::<_, $crate::colony::cluster::ClusterError>(response.message.clone())
+		}.await
 	}};
 
 	// Implement Drop
@@ -585,7 +663,7 @@ macro_rules! cluster {
 	};
 
 	// Helper: Process heartbeat result - updates registry based on success/failure
-	(@process_heartbeat_result $registry:expr, $hive_addr:expr, $result:expr, $max_failures:expr, $config:expr) => {
+	(@process_heartbeat_result $registry:expr, $servlet_registry:expr, $hive_addr:expr, $result:expr, $max_failures:expr, $config:expr) => {
 		// Fire callback if configured
 		$crate::cluster!(@fire_heartbeat_callback $config, $hive_addr, $result);
 
@@ -596,7 +674,10 @@ macro_rules! cluster {
 			Err(_) => {
 				if let Ok(failures) = $registry.increment_failure(&$hive_addr) {
 					if failures >= $max_failures {
+						// Remove from HiveRegistry
 						let _ = $registry.unregister(&$hive_addr);
+						// Also remove all servlet entries for this hive
+						let _ = $servlet_registry.remove_by_hive(&$hive_addr);
 					}
 				}
 			}

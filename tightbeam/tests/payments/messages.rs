@@ -4,6 +4,7 @@
 //! These types are for business-level correlation/audit, NOT idempotency.
 //! Idempotency uses Frame's (metadata.id, metadata.order).
 
+use tightbeam::crypto::profiles::TightbeamProfile;
 use tightbeam::der::{Enumerated, Sequence};
 use tightbeam::Beamable;
 
@@ -51,6 +52,13 @@ impl PaymentIdentification {
 ///
 /// Based on ISO 20022 CreditTransferTransaction.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
+#[beam(
+	profile(TightbeamProfile),
+	confidential,
+	nonrepudiable,
+	message_integrity,
+	min_version = "V1"
+)]
 pub struct CreditTransferTransaction {
 	/// Payment identification
 	pub payment_id: PaymentIdentification,
@@ -98,6 +106,13 @@ impl CreditTransferTransaction {
 /// Based on ISO 20022 payment chain concept.
 /// Links to original auth via original_end_to_end_id.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
+#[beam(
+	profile(TightbeamProfile),
+	confidential,
+	nonrepudiable,
+	message_integrity,
+	min_version = "V1"
+)]
 pub struct CaptureTransaction {
 	/// Original authorization's end-to-end ID
 	pub original_end_to_end_id: Vec<u8>,
@@ -109,6 +124,7 @@ pub struct CaptureTransaction {
 
 impl CaptureTransaction {
 	/// Create a new capture transaction
+	#[allow(dead_code)]
 	pub fn new(
 		original_end_to_end_id: impl Into<Vec<u8>>,
 		capture_amount: MonetaryAmount,
@@ -155,10 +171,7 @@ impl PaymentStatusCode {
 
 	/// Check if the status indicates a final state
 	pub const fn is_final(&self) -> bool {
-		matches!(
-			self,
-			Self::AcceptedSettlementCompleted | Self::Rejected
-		)
+		matches!(self, Self::AcceptedSettlementCompleted | Self::Rejected)
 	}
 }
 
@@ -170,6 +183,13 @@ impl PaymentStatusCode {
 ///
 /// Based on ISO 20022 pacs.002 TransactionStatus.
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
+#[beam(
+	profile(TightbeamProfile),
+	confidential,
+	nonrepudiable,
+	message_integrity,
+	min_version = "V1"
+)]
 pub struct TransactionStatus {
 	/// Original payment identification
 	pub original_payment_id: PaymentIdentification,
@@ -215,6 +235,7 @@ impl TransactionStatus {
 	}
 
 	/// Create a pending status
+	#[allow(dead_code)]
 	pub fn pending(original_payment_id: PaymentIdentification) -> Self {
 		Self {
 			original_payment_id,
@@ -223,6 +244,39 @@ impl TransactionStatus {
 			reason_code: None,
 		}
 	}
+}
+
+// ============================================================================
+// KeyManager Messages (for intra-hive ECIES key management)
+// ============================================================================
+
+/// Request to get the KeyManager's public key for encryption
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
+pub struct GetPublicKeyRequest {
+	/// Placeholder (empty struct causes derive issues)
+	#[asn1(optional = "true")]
+	pub _placeholder: Option<u8>,
+}
+
+/// Response containing the KeyManager's public key
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
+pub struct GetPublicKeyResponse {
+	/// The ECIES public key in SEC1 compressed format (33 bytes for secp256k1)
+	pub public_key: Vec<u8>,
+}
+
+/// Request to decrypt ciphertext using the KeyManager's private key
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
+pub struct DecryptRequest {
+	/// ECIES ciphertext to decrypt
+	pub ciphertext: Vec<u8>,
+}
+
+/// Response containing the decrypted plaintext
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq, Eq)]
+pub struct DecryptResponse {
+	/// Decrypted plaintext bytes
+	pub plaintext: Vec<u8>,
 }
 
 // ============================================================================
@@ -268,6 +322,24 @@ mod tests {
 	}
 
 	#[test]
+	fn get_public_key_request_roundtrip() {
+		use tightbeam::{decode, encode};
+		let req = super::GetPublicKeyRequest { _placeholder: None };
+		let encoded = encode(&req).unwrap();
+		let decoded: super::GetPublicKeyRequest = decode(&encoded).unwrap();
+		assert_eq!(decoded, req);
+	}
+
+	#[test]
+	fn decrypt_request_roundtrip() {
+		use tightbeam::{decode, encode};
+		let req = super::DecryptRequest { ciphertext: b"encrypted_data".to_vec() };
+		let encoded = encode(&req).unwrap();
+		let decoded: super::DecryptRequest = decode(&encoded).unwrap();
+		assert_eq!(decoded.ciphertext, req.ciphertext);
+	}
+
+	#[test]
 	fn transaction_status_rejected() {
 		let pid = PaymentIdentification::new(b"I", b"E", b"T");
 		let status = TransactionStatus::rejected(pid.clone(), b"INSUFFICIENT_FUNDS".to_vec());
@@ -276,5 +348,3 @@ mod tests {
 		assert_eq!(status.reason_code, Some(b"INSUFFICIENT_FUNDS".to_vec()));
 	}
 }
-
-

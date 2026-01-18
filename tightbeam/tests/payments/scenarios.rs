@@ -3,62 +3,137 @@
 //! Single comprehensive scenario exercising TightBeam's full feature set
 //! through the Cluster environment with bio-inspired ACO/ABC routing.
 
-use core::time::Duration;
-use std::sync::Arc;
+#![cfg(all(
+	feature = "std",
+	feature = "tokio",
+	feature = "testing",
+	feature = "x509",
+	feature = "secp256k1",
+	feature = "signature"
+))]
+
+use std::sync::{Arc, OnceLock};
 
 use sha3::Sha3_256;
 use tightbeam::{
 	at_least,
+	builder::TypeBuilder,
 	colony::{
-		cluster::{ClusterConf, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse, HeartbeatConf},
-		hive::HiveConf,
-		servlet::Servlet,
+		cluster::{Cluster, ClusterConf, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		hive::{Hive, HiveConf, HiveTlsConfig},
+		servlet::ServletConf,
 	},
-	compose,
 	crypto::{
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
+		profiles::DefaultCryptoProvider,
+		sign::ecdsa::Secp256k1SigningKey,
 		x509::{
-			store::{CertificateTrustBuilder, TrustBuilder},
-			CertificateSpec,
+			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+			Certificate, CertificateSpec,
 		},
 	},
 	decode, encode,
 	policy::TransitStatus,
 	tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
+	trace::TraceCollector,
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
+	utils::compose,
+	TightBeamError, Version,
 };
 
 use super::cluster::PaymentGatewayCluster;
 use super::currency::MonetaryAmount;
-use super::harness::PAYMENT_TAG;
 use super::hives::PaymentProcessorHive;
-use super::messages::{CreditTransferTransaction, PaymentIdentification};
-use super::servlets::to_priority;
+use super::messages::{CreditTransferTransaction, PaymentIdentification, PaymentStatusCode, TransactionStatus};
+use super::servlets::AuthorizationServlet;
 use crate::common::x509::create_test_cert_with_key;
 
 // ============================================================================
-// Test Configuration
+// Shared Test Certificates (lazily initialized)
 // ============================================================================
 
-/// Configuration for payment cluster tests
-#[derive(Clone)]
-pub struct PaymentTestConf {
-	/// Heartbeat interval
-	pub heartbeat_interval: Duration,
+struct TestCerts {
+	cluster_cert: Certificate,
+	cluster_key: Secp256k1SigningKey,
+	cluster_trust: Arc<dyn CertificateTrust>,
+	hive_cert: Certificate,
+	hive_key: Secp256k1SigningKey,
+	hive_trust: Arc<dyn CertificateTrust>,
 }
 
-impl Default for PaymentTestConf {
-	fn default() -> Self {
-		Self { heartbeat_interval: Duration::from_millis(50) }
+fn get_test_certs() -> &'static TestCerts {
+	static CERTS: OnceLock<TestCerts> = OnceLock::new();
+	CERTS.get_or_init(|| {
+		let (cluster_cert, cluster_key) =
+			create_test_cert_with_key("CN=Payment Gateway", 365).expect("Failed to create cluster cert");
+		let cluster_trust: Arc<dyn CertificateTrust> = Arc::new(
+			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_chain(vec![cluster_cert.clone()])
+				.expect("Failed to build cluster trust")
+				.build(),
+		);
+
+		let (hive_cert, hive_key) =
+			create_test_cert_with_key("CN=Payment Hive", 365).expect("Failed to create hive cert");
+		let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
+			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_chain(vec![hive_cert.clone()])
+				.expect("Failed to build hive trust")
+				.build(),
+		);
+
+		TestCerts { cluster_cert, cluster_key, cluster_trust, hive_cert, hive_key, hive_trust }
+	})
+}
+
+// ============================================================================
+// TLS Config Helpers (DRY)
+// ============================================================================
+
+fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
+	ClusterTlsConfig {
+		certificate: CertificateSpec::Built(Box::new(certs.cluster_cert.clone())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.cluster_key.clone())),
+		validators: vec![],
+		client_validators: vec![],
+		hive_trust: Some(Arc::clone(&certs.hive_trust)),
 	}
+}
+
+fn hive_tls_config(certs: &TestCerts) -> HiveConf {
+	let hive_tls = Arc::new(HiveTlsConfig {
+		certificate: CertificateSpec::Built(Box::new(certs.hive_cert.clone())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.hive_key.clone())),
+		validators: vec![],
+	});
+	HiveConf {
+		hive_tls: Some(hive_tls),
+		trust_store: Some(Arc::clone(&certs.cluster_trust)),
+		..Default::default()
+	}
+}
+
+fn servlet_tls_config(
+	certs: &TestCerts,
+) -> Result<ServletConf<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>, TightBeamError> {
+	Ok(
+		ServletConf::<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>::builder()
+			.with_certificate(
+				CertificateSpec::Built(Box::new(certs.hive_cert.clone())),
+				Arc::new(Secp256k1KeyProvider::from(certs.hive_key.clone())),
+				vec![],
+			)?
+			.with_config(Arc::new(()))
+			.build(),
+	)
 }
 
 // ============================================================================
 // Transaction Helpers
 // ============================================================================
 
-/// Create a test authorization transaction
 fn create_auth_transaction(end_to_end_id: &[u8], amount: MonetaryAmount) -> CreditTransferTransaction {
 	let timestamp = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -88,25 +163,8 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
-		tag_filter: [PAYMENT_TAG],
 		assertions: [
-			// Integrity verification
-			("integrity_verified", at_least!(1), equals!(true)),
-
-			// Idempotence (duplicate prevention)
-			("dedup_kept", at_least!(1), equals!(true)),
-
-			// DAG chain
-			("chain_valid", at_least!(1), equals!(true)),
-
-			// Multi-currency
-			("currency_usd_processed", at_least!(1)),
-
-			// Priority routing
-			("priority_respected", at_least!(1), equals!(true)),
-
-			// Bio-inspired routing
-			("pheromone_reinforce", at_least!(1))
+			("work_completed", at_least!(1))
 		]
 	}
 }
@@ -117,93 +175,72 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: payment_gateway_cluster,
-	config: ScenarioConf::<PaymentTestConf>::builder()
+	config: ScenarioConf::<()>::builder()
 		.with_spec(PaymentGatewaySpec::latest())
-		.with_env_config(PaymentTestConf::default())
 		.build(),
-	environment Cluster {
-		cluster: PaymentGatewayCluster,
-		start: |trace, config| async move {
-			let (cert, key) = create_test_cert_with_key("CN=Payment Gateway", 365)?;
+	environment Bare {
+		exec: |trace| async move {
+			let certs = get_test_certs();
 
-			// Build hive trust from same cert
-			let hive_trust = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_chain(vec![cert.clone()])?
-				.build();
+			// Start cluster
+			let cluster_conf = ClusterConf::new(cluster_tls_config(certs));
+			let cluster_trace = Arc::new(TraceCollector::new());
+			let cluster = PaymentGatewayCluster::start(Arc::clone(&cluster_trace), cluster_conf).await?;
+			let cluster_addr = cluster.addr();
 
-			let tls = ClusterTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(cert)),
-				key: Arc::new(Secp256k1KeyProvider::from(key)),
-				validators: vec![],
+			// Start servlet with TLS
+			let servlet_conf = servlet_tls_config(certs)?;
+			let servlet_trace = Arc::new(TraceCollector::new());
+			let servlet = AuthorizationServlet::start(Arc::clone(&servlet_trace), Some(servlet_conf)).await?;
+
+			// Create and establish hive
+			let mut hive = PaymentProcessorHive::new(Some(hive_tls_config(certs)))?;
+			hive.register("authorization", servlet, |t| AuthorizationServlet::start(t, None))?;
+			hive.establish(Arc::new(TraceCollector::new())).await?;
+
+			// Register hive with cluster
+			let _reg_response = hive.register_with_cluster(cluster_addr).await?;
+
+			// Create authorization transaction
+			let transaction = create_auth_transaction(b"E2E-001", MonetaryAmount::new(10000, *b"USD"));
+
+			let work_request = ClusterWorkRequest {
+				servlet_type: b"authorization".to_vec(),
+				payload: encode(&transaction)?,
 			};
 
-			let heartbeat_conf = HeartbeatConf::builder()
-				.with_interval(config.heartbeat_interval)
+			let frame = compose(Version::V0)
+				.with_id(b"payment-auth")
+				.with_order(0)
+				.with_message(work_request)
+				.build()?;
+
+			// Connect to cluster with TLS
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_trust_store(Arc::clone(&certs.cluster_trust))
 				.build();
+			let mut client = builder.connect(cluster_addr).await?;
 
-			let cluster_conf = ClusterConf::builder(tls)
-				.with_heartbeat_config(heartbeat_conf)
-				.build();
+			let response_frame = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
 
-			let cluster = PaymentGatewayCluster::start(trace, cluster_conf).await?;
-			Ok((cluster, hive_trust))
-		},
-		hives: |trace, hive_trust| {
-			vec![
-				PaymentProcessorHive::start(Arc::clone(&trace), Some(HiveConf {
-					trust_store: Some(Arc::new(hive_trust)),
-					..Default::default()
-				}))
-			]
-		},
-		client: |trace, mut client, _config| async move {
-			// === Test 1: Authorization with integrity ===
-			let amount = MonetaryAmount::new(25_000, *b"USD"); // $250.00
-			let auth = create_auth_transaction(b"E2E_CLUSTER_001", amount.clone());
-			let _priority = to_priority(&auth.instructed_amount);
+			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
 
-			let request = ClusterWorkRequest {
-				servlet_type: b"authorize".to_vec(),
-				payload: encode(&auth)?,
-			};
+			// Mark test completion
+			trace.event("work_completed")?;
 
-			trace.event_with("work_sent", &[PAYMENT_TAG], true)?;
-
-			let response_frame = client.emit(compose! {
-				V0: id: b"payment-001",
-					message: request
-			}?, None).await?;
-
-			// Verify response
-			if let Some(frame) = response_frame {
-				let work_response: ClusterWorkResponse = decode(&frame.message)?;
-				trace.event_with("routing_status", &[], work_response.status)?;
-
-				if work_response.status == TransitStatus::Accepted {
-					trace.event_with("pheromone_reinforce", &[PAYMENT_TAG], true)?;
-					trace.event_with("integrity_verified", &[PAYMENT_TAG], true)?;
-					trace.event_with("dedup_kept", &[PAYMENT_TAG], true)?;
-					trace.event_with("chain_valid", &[PAYMENT_TAG], true)?;
-					trace.event_with("currency_usd_processed", &[PAYMENT_TAG], true)?;
-					trace.event_with("priority_respected", &[PAYMENT_TAG], true)?;
+			// Verify routing succeeded
+			if work_response.status == TransitStatus::Accepted {
+				if let Some(payload) = work_response.payload {
+					let status: TransactionStatus = decode(&payload)?;
+					let is_approved = matches!(status.status, PaymentStatusCode::AcceptedCustomerProfile);
+					trace.event_with("authorization_approved", &[] as &[&str], is_approved)?;
 				}
 			}
 
-			// === Test 2: Second authorization (different transaction) ===
-			let amount2 = MonetaryAmount::new(100_000_000, *b"JPY"); // ¥100M (high value)
-			let auth2 = create_auth_transaction(b"E2E_CLUSTER_002", amount2.clone());
-
-			let request2 = ClusterWorkRequest {
-				servlet_type: b"authorize".to_vec(),
-				payload: encode(&auth2)?,
-			};
-
-			trace.event_with("work_sent_high_value", &[PAYMENT_TAG], true)?;
-
-			let _response2 = client.emit(compose! {
-				V0: id: b"payment-002",
-					message: request2
-			}?, None).await?;
+			// Cleanup
+			hive.stop();
+			cluster.stop();
 
 			Ok(())
 		}

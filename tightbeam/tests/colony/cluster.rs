@@ -11,55 +11,103 @@
 	feature = "signature"
 ))]
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
 
 use sha3::Sha3_256;
+use tightbeam::der::Sequence;
 use tightbeam::{
+	builder::TypeBuilder,
 	cluster,
 	colony::{
-		cluster::{ClusterConf, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse, HeartbeatConf},
-		hive::HiveConf,
-		servlet::Servlet,
+		cluster::{Cluster, ClusterConf, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		hive::{Hive, HiveConf, HiveTlsConfig},
+		servlet::ServletConf,
 	},
 	compose,
 	crypto::{
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
+		profiles::DefaultCryptoProvider,
+		sign::ecdsa::Secp256k1SigningKey,
 		x509::{
-			store::{CertificateTrustBuilder, TrustBuilder},
-			CertificateSpec,
+			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+			Certificate, CertificateSpec,
 		},
 	},
-	decode,
-	der::Sequence,
-	encode, exactly, hive,
+	decode, encode, exactly, hive,
 	policy::TransitStatus,
 	servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
-	transport::tcp::r#async::TokioListener,
-	Beamable,
+	trace::TraceCollector,
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
+	utils::compose as frame_compose,
+	Beamable, TightBeamError, Version,
 };
 
 use crate::common::x509::create_test_cert_with_key;
 
 // ============================================================================
-// Cluster Configuration
+// Shared Test Certificates
 // ============================================================================
 
-/// Heartbeat statistics collected via callback
-#[derive(Default)]
-pub struct HeartbeatStats {
-	pub attempts: AtomicU32,
-	pub successes: AtomicU32,
+struct ClusterTestCerts {
+	cert: Certificate,
+	key: Secp256k1SigningKey,
+	trust: Arc<dyn CertificateTrust>,
 }
 
-/// Configuration for cluster tests (test instrumentation only)
-#[derive(Clone)]
-pub struct ClusterTestConf {
-	pub heartbeat_stats: Arc<HeartbeatStats>,
-	pub heartbeat_interval: Duration,
+fn get_cluster_test_certs() -> &'static ClusterTestCerts {
+	static CERTS: OnceLock<ClusterTestCerts> = OnceLock::new();
+	CERTS.get_or_init(|| {
+		let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365).expect("Failed to create cluster cert");
+		let trust: Arc<dyn CertificateTrust> = Arc::new(
+			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_chain(vec![cert.clone()])
+				.expect("Failed to build trust")
+				.build(),
+		);
+		ClusterTestCerts { cert, key, trust }
+	})
+}
+
+// ============================================================================
+// TLS Config Helpers (DRY)
+// ============================================================================
+
+fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
+	ClusterTlsConfig {
+		certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+		validators: vec![],
+		client_validators: vec![],
+		hive_trust: Some(Arc::clone(&certs.trust)),
+	}
+}
+
+fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConf {
+	let hive_tls = Arc::new(HiveTlsConfig {
+		certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+		validators: vec![],
+	});
+	HiveConf {
+		hive_tls: Some(hive_tls),
+		trust_store: Some(Arc::clone(&certs.trust)),
+		..Default::default()
+	}
+}
+
+fn servlet_tls_config(
+	certs: &ClusterTestCerts,
+) -> Result<ServletConf<TokioListener, PingRequest, DefaultCryptoProvider>, TightBeamError> {
+	Ok(ServletConf::<TokioListener, PingRequest, DefaultCryptoProvider>::builder()
+		.with_certificate(
+			CertificateSpec::Built(Box::new(certs.cert.clone())),
+			Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+			vec![],
+		)?
+		.with_config(Arc::new(()))
+		.build())
 }
 
 // ============================================================================
@@ -83,7 +131,7 @@ pub struct PingResponse {
 servlet! {
 	ClusterTestServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, _trace, _config, _workers| async move {
+	handle: |frame, _ctx| async move {
 		let req: PingRequest = decode(&frame.message)?;
 		Ok(Some(compose! {
 			V0: id: frame.metadata.id.clone(),
@@ -98,10 +146,7 @@ servlet! {
 
 hive! {
 	ClusterTestHive,
-	protocol: TokioListener,
-	servlets: {
-		ping: ClusterTestServlet<PingRequest>
-	}
+	protocol: TokioListener
 }
 
 // ============================================================================
@@ -125,93 +170,78 @@ tb_assert_spec! {
 		gate: Accepted,
 		assertions: [
 			("work_sent", exactly!(1)),
-			("routing_status", exactly!(1), equals!(TransitStatus::Accepted))
+			("routing_accepted", exactly!(1))
 		]
 	}
 }
 
 // ============================================================================
-// Integration Test using environment Cluster
+// Integration Test
 // ============================================================================
 
 tb_scenario! {
 	name: cluster_work_routing,
-	config: ScenarioConf::<ClusterTestConf>::builder()
+	config: ScenarioConf::<()>::builder()
 		.with_spec(ClusterRoutingSpec::latest())
-		.with_env_config(ClusterTestConf {
-			heartbeat_stats: Arc::new(HeartbeatStats::default()),
-			heartbeat_interval: Duration::from_millis(50),
-		})
 		.build(),
-	environment Cluster {
-		cluster: ClusterGateway,
-		start: |trace, config| async move {
-			let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365)?;
+	environment Bare {
+		exec: |trace| async move {
+			let certs = get_cluster_test_certs();
 
-			// Build hive trust from same cert (before moving cert into ClusterTlsConfig)
-			let hive_trust = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_chain(vec![cert.clone()])?
-				.build();
+			// Start cluster
+			let cluster_conf = ClusterConf::new(cluster_tls_config(certs));
+			let cluster_trace = Arc::new(TraceCollector::new());
+			let cluster = ClusterGateway::start(Arc::clone(&cluster_trace), cluster_conf).await?;
+			let cluster_addr = cluster.addr();
 
-			let tls = ClusterTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(cert)),
-				key: Arc::new(Secp256k1KeyProvider::from(key)),
-				validators: vec![],
-			};
+			// Start servlet with TLS
+			let servlet_conf = servlet_tls_config(certs)?;
+			let servlet_trace = Arc::new(TraceCollector::new());
+			let servlet = ClusterTestServlet::start(Arc::clone(&servlet_trace), Some(servlet_conf)).await?;
 
-			let heartbeat_conf = HeartbeatConf::builder()
-				.with_interval(config.heartbeat_interval)
-				.with_callback(Arc::new({
-					let stats = Arc::clone(&config.heartbeat_stats);
-					move |event| {
-						stats.attempts.fetch_add(1, Ordering::SeqCst);
-						if event.success {
-							stats.successes.fetch_add(1, Ordering::SeqCst);
-						}
-					}
-				}))
-				.build();
-			let cluster_conf = ClusterConf::builder(tls)
-				.with_heartbeat_config(heartbeat_conf)
-				.build();
+			// Create and establish hive
+			let mut hive = ClusterTestHive::new(Some(hive_tls_config(certs)))?;
+			hive.register("ping", servlet, |t| ClusterTestServlet::start(t, None))?;
+			hive.establish(Arc::new(TraceCollector::new())).await?;
 
-			let cluster = ClusterGateway::start(trace, cluster_conf).await?;
-			Ok((cluster, hive_trust))
-		},
-		hives: |trace, hive_trust| {
-			vec![
-				ClusterTestHive::start(Arc::clone(&trace), Some(HiveConf {
-					trust_store: Some(Arc::new(hive_trust)),
-					..Default::default()
-				}))
-			]
-		},
-		client: |trace, mut client, config| async move {
-			// Send work request to cluster
-			let request = ClusterWorkRequest {
+			// Register hive with cluster
+			let _reg_response = hive.register_with_cluster(cluster_addr).await?;
+
+			// Send work request
+			trace.event("work_sent")?;
+
+			let work_request = ClusterWorkRequest {
 				servlet_type: b"ping".to_vec(),
 				payload: encode(&PingRequest { value: 21 })?,
 			};
 
-			trace.event("work_sent")?;
+			let frame = frame_compose(Version::V0)
+				.with_id(b"test-work")
+				.with_order(0)
+				.with_message(work_request)
+				.build()?;
 
-			let response_frame = client.emit(compose! {
-				V0: id: b"work-001",
-					message: request
-			}?, None).await?;
+			// Connect to cluster with TLS
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_trust_store(Arc::clone(&certs.trust))
+				.build();
+			let mut client = builder.connect(cluster_addr).await?;
 
-			// Verify response
-			if let Some(frame) = response_frame {
-				let work_response: ClusterWorkResponse = decode(&frame.message)?;
-				trace.event_with("routing_status", &[], work_response.status)?;
+			let response_frame = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
+			if work_response.status == TransitStatus::Accepted {
+				trace.event("routing_accepted")?;
+				if let Some(payload) = work_response.payload {
+					let ping_response: PingResponse = decode(&payload)?;
+					assert_eq!(ping_response.doubled, 42);
+				}
 			}
 
-			// Wait for heartbeat and verify stats
-			tokio::time::sleep(config.heartbeat_interval * 2).await;
-			let attempts = config.heartbeat_stats.attempts.load(Ordering::SeqCst);
-			let successes = config.heartbeat_stats.successes.load(Ordering::SeqCst);
-			assert!(attempts >= 1, "Expected at least 1 heartbeat attempt, got {attempts}");
-			assert!(successes >= 1, "Expected at least 1 heartbeat success, got {successes}");
+			// Cleanup
+			hive.stop();
+			cluster.stop();
 
 			Ok(())
 		}

@@ -48,6 +48,9 @@ pub mod private {
 	#[cfg(feature = "aead")]
 	pub trait SealedAeadOid<C: AssociatedOid> {}
 
+	#[cfg(feature = "ecdh")]
+	pub trait SealedCurveOid<C: AssociatedOid> {}
+
 	#[cfg(feature = "signature")]
 	pub trait SealedSignatureOid<S: SignatureAlgorithmIdentifier> {}
 }
@@ -61,6 +64,11 @@ pub trait CheckDigestOid<D: AssociatedOid>: private::SealedDigestOid<D> {
 
 #[cfg(feature = "aead")]
 pub trait CheckAeadOid<C: AssociatedOid>: private::SealedAeadOid<C> {
+	const RESULT: ();
+}
+
+#[cfg(feature = "ecdh")]
+pub trait CheckCurveOid<C: AssociatedOid>: private::SealedCurveOid<C> {
 	const RESULT: ();
 }
 
@@ -323,7 +331,8 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	pub fn with_cipher<C, Cipher>(mut self, cipher: Cipher) -> Self
+	/// Set the AEAD cipher for symmetric encryption
+	pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
 	where
 		C: AssociatedOid,
 		Cipher: Aead + 'static,
@@ -351,6 +360,39 @@ impl<T: Message> FrameBuilder<T> {
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
 			let encrypted_content = <Cipher as Encryptor<C>>::encrypt_content(&cipher, plaintext, &nonce, message_oid)?;
 			Ok(encrypted_content)
+		}));
+
+		self
+	}
+
+	/// Use a custom encryptor for asymmetric encryption (e.g., ECIES).
+	pub fn with_encryptor<C, E>(mut self, encryptor: E) -> Self
+	where
+		C: AssociatedOid,
+		E: Encryptor<C> + 'static,
+	{
+		// Runtime validation: check either AEAD OID or Curve OID
+		if T::HAS_PROFILE {
+			let aead_match = C::OID == <T::Profile as SecurityProfile>::AeadOid::OID;
+			#[cfg(feature = "ecdh")]
+			let curve_match = C::OID == <T::Profile as SecurityProfile>::CurveOid::OID;
+			#[cfg(not(feature = "ecdh"))]
+			let curve_match = false;
+
+			if !aead_match && !curve_match {
+				self.errors
+					.push(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+						C::OID,
+						<T::Profile as SecurityProfile>::AeadOid::OID,
+					))));
+				return self;
+			}
+		}
+
+		let message_oid = self.message_oid;
+		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
+			// Encryptor handles nonce generation internally (e.g., ECIES)
+			encryptor.encrypt_content(plaintext, [], message_oid)
 		}));
 
 		self
@@ -708,7 +750,7 @@ mod tests {
 			.with_message(msg)
 			.with_id("test_v1_with_encryption")
 			.with_order(1696521600)
-			.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+			.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 			.with_signer::<Secp256k1Signature, _>(signing_key)
 			.build()
 		},
@@ -755,7 +797,7 @@ mod tests {
 			.with_id("test_v1_with_compression")
 			.with_order(1696521600)
 			.with_compression(ZstdCompression)
-			.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+			.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 			.with_signer::<Secp256k1Signature, _>(signing_key)
 			.build()
 		},
@@ -811,7 +853,7 @@ mod tests {
 				.with_witness_hasher::<Sha3_256>()
 				.with_compression(ZstdCompression)
 				.with_rng(Box::new(rng))
-				.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher)
+				.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 				.with_signer::<Secp256k1Signature, _>(signing_key)
 				.with_priority(crate::MessagePriority::High)
 				.with_lifetime(3600)
@@ -897,17 +939,16 @@ mod tests {
 	#[cfg(feature = "derive")]
 	fn test_compose_macro() -> Result<()> {
 		let message = create_test_message(None);
-		let result = compose! {
+		let frame = compose! {
 			V0:
 				id: "test-id",
 				order: 1696521600,
 				message: message,
 				message_integrity: type Sha3_256
-		};
-		let tightbeam = result?;
-		assert_eq!(tightbeam.version, Version::V0);
-		assert_eq!(tightbeam.metadata.id, b"test-id");
-		assert_eq!(tightbeam.metadata.order, 1696521600);
+		}?;
+		assert_eq!(frame.version, Version::V0);
+		assert_eq!(frame.metadata.id, b"test-id");
+		assert_eq!(frame.metadata.order, 1696521600);
 		Ok(())
 	}
 
@@ -1198,8 +1239,6 @@ mod tests {
 			for (name, _attrs, confidential, nonrepudiable, message_integrity, frame_integrity, min_version) in
 				test_cases
 			{
-				use crate::core::Message;
-
 				// Generate the appropriate test message struct based on the test case
 				match (confidential, nonrepudiable, message_integrity, frame_integrity, min_version) {
 					(false, false, false, false, Version::V0) => {

@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use tightbeam::{
 	colony::hive::{Hive, HiveConf, HiveTlsConfig},
-	colony::servlet::Servlet,
 	compose,
 	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
 	decode,
@@ -41,7 +40,8 @@ pub struct HiveTestResponse {
 servlet! {
 	HiveTestServlet<HiveTestRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, trace, _config, _workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
 		trace.event("servlet_receive")?;
 		let req: HiveTestRequest = decode(&frame.message)?;
 
@@ -59,10 +59,7 @@ servlet! {
 
 hive! {
 	HiveX509Test,
-	protocol: TokioListener,
-	servlets: {
-		test_servlet: HiveTestServlet<HiveTestRequest>
-	}
+	protocol: TokioListener
 }
 
 // ============================================================================
@@ -110,20 +107,24 @@ tb_scenario! {
 				..Default::default()
 			};
 
-			// Start the hive
-			let mut hive = HiveX509Test::start(
-				Arc::new(TraceCollector::new()),
-				Some(hive_conf),
-			).await?;
+			// Start servlet independently
+			let servlet_trace = Arc::new(TraceCollector::new());
+			let servlet = HiveTestServlet::start(Arc::clone(&servlet_trace), None).await?;
 
-			// Establish the hive - spawns min_instances of each servlet type
-			hive.establish_hive().await?;
+			// Create hive
+			let mut hive = HiveX509Test::new(Some(hive_conf))?;
+
+			// Register servlet with spawner for auto-scaling
+			hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
+
+			// Establish hive
+			hive.establish(Arc::new(TraceCollector::new())).await?;
 
 			trace.event("hive_established")?;
 
-			// Verify servlets are running
-			let servlet_addrs = hive.servlet_addresses().await;
-			assert!(!servlet_addrs.is_empty(), "Hive should have running servlets");
+			// Verify servlets are registered
+			let servlet_addrs = hive.servlet_addresses();
+			assert!(!servlet_addrs.is_empty(), "Hive should have registered servlets");
 
 			// Clean up
 			hive.stop();
@@ -143,23 +144,24 @@ tb_scenario! {
 		exec: |trace| async move {
 			trace.event("hive_started")?;
 
-			// Configure hive without TLS
-			let hive_conf = HiveConf::default();
+			// Start servlet independently
+			let servlet_trace = Arc::new(TraceCollector::new());
+			let servlet = HiveTestServlet::start(Arc::clone(&servlet_trace), None).await?;
 
-			// Start the hive
-			let mut hive = HiveX509Test::start(
-				Arc::new(TraceCollector::new()),
-				Some(hive_conf),
-			).await?;
+			// Create hive with default config
+			let mut hive = HiveX509Test::new(None)?;
 
-			// Establish the hive
-			hive.establish_hive().await?;
+			// Register servlet with spawner for auto-scaling
+			hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
+
+			// Establish hive
+			hive.establish(Arc::new(TraceCollector::new())).await?;
 
 			trace.event("hive_established")?;
 
-			// Verify servlets are running
-			let servlet_addrs = hive.servlet_addresses().await;
-			assert!(!servlet_addrs.is_empty(), "Hive should have running servlets");
+			// Verify servlets are registered
+			let servlet_addrs = hive.servlet_addresses();
+			assert!(!servlet_addrs.is_empty(), "Hive should have registered servlets");
 
 			// Clean up
 			hive.stop();

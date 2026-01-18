@@ -31,6 +31,9 @@ pub enum ClusterError {
 	/// Frame signing error
 	#[cfg_attr(feature = "derive", error("Frame signing error"))]
 	SigningError,
+	/// Invalid servlet address format
+	#[cfg_attr(feature = "derive", error("Invalid address: {:#?}"))]
+	InvalidAddress(Vec<u8>),
 }
 
 #[cfg(not(feature = "derive"))]
@@ -50,6 +53,9 @@ impl core::fmt::Display for ClusterError {
 			ClusterError::RegistrationFailed => write!(f, "Registration failed"),
 			ClusterError::EncodingError => write!(f, "Frame encoding error"),
 			ClusterError::SigningError => write!(f, "Frame signing error"),
+			ClusterError::InvalidAddress(addr) => {
+				write!(f, "Invalid address: {}", String::from_utf8_lossy(addr))
+			}
 		}
 	}
 }

@@ -164,7 +164,9 @@ servlet! {
 	/// Mission Control receives telemetry and sends commands to Rover via relays
 	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+		let config: &MissionControlServletConf = ctx.env_config()?;
 		let frame_order = frame.metadata.order;
 
 		// Verify signature using trait method
@@ -182,7 +184,7 @@ servlet! {
 						RelayMessage::Telemetry(telemetry) => {
 							// WORKER: Handle telemetry analysis and command decision
 							let request = TelemetryHandlerRequest { telemetry };
-							let result = workers.relay::<MissionControlTelemetryHandlerWorker>(Arc::new(request)).await??;
+							let result = ctx.relay::<MissionControlTelemetryHandlerWorker>(Arc::new(request)).await??;
 							if result.should_send_command {
 								if let Some(next_cmd) = result.next_command {
 									let (next_order, previous_digest) = config.chain_processor.prepare_outgoing()?;
@@ -212,13 +214,13 @@ servlet! {
 						RelayMessage::CommandAck(ack) => {
 							// WORKER: Handle ACK processing
 							let request = CommandAckHandlerRequest { ack };
-							workers.relay::<CommandAckHandlerWorker>(Arc::new(request)).await??;
+							ctx.relay::<CommandAckHandlerWorker>(Arc::new(request)).await??;
 						},
 						RelayMessage::FrameRequest(request) => {
 							// WORKER: Decide what to do with frame request
 							let node_name = config.node_name().to_string();
 							let worker_request = FrameRequestHandlerRequest { request, node_name };
-							let result = workers.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
+							let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
 							match result.action {
 								FrameRequestAction::Respond(_) => {
 									let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
@@ -246,7 +248,7 @@ servlet! {
 								node_name: config.node_name().to_string(),
 							};
 
-							workers.relay::<FrameResponseHandlerWorker>(Arc::new(request)).await??;
+							ctx.relay::<FrameResponseHandlerWorker>(Arc::new(request)).await??;
 						},
 						RelayMessage::Command(_) => {
 							// Invalid message type
@@ -267,7 +269,7 @@ servlet! {
 					missing_hash,
 					&config.earth_relay_pool,
 					config.earth_relay_addr,
-					&trace,
+					trace,
 				).await?;
 				Ok(None)
 			},
@@ -324,7 +326,9 @@ servlet! {
 	/// Earth Relay forwards messages between Mission Control and Mars Relay
 	pub EarthRelaySatelliteServlet<RelayMessage, EnvConfig = EarthRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+		let config: &EarthRelaySatelliteServletConf = ctx.env_config()?;
 		// Verify signature and determine source
 		let from_mission_control = if frame.nonrepudiation.is_some() {
 			if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
@@ -361,7 +365,7 @@ servlet! {
 							// WORKER: Decide what to do with frame request
 							let node_name = config.node_name().to_string();
 							let worker_request = FrameRequestHandlerRequest { request: request.clone(), node_name };
-							let result = workers.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
+							let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
 							match result.action {
 								FrameRequestAction::Respond(_) => {
 									let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
@@ -413,7 +417,7 @@ servlet! {
 								node_name: config.node_name().to_string(),
 							};
 
-							workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
+							ctx.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
 							// Servlet builds ACK
 							let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
@@ -473,7 +477,7 @@ servlet! {
 					missing_hash,
 					&config.mars_relay_pool,
 					config.mars_relay_addr,
-					&trace,
+					trace,
 				).await?;
 				Ok(None)
 			},
@@ -534,7 +538,9 @@ servlet! {
 	/// Mars Relay forwards messages between Earth Relay and Rover
 	pub MarsRelaySatelliteServlet<RelayMessage, EnvConfig = MarsRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+		let config: &MarsRelaySatelliteServletConf = ctx.env_config()?;
 		// Verify signature and determine source
 		// Earth Relay forwards messages, so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation.is_some() {
@@ -563,7 +569,7 @@ servlet! {
 							// WORKER: Decide what to do with frame request
 							let node_name = config.node_name().to_string();
 							let worker_request = FrameRequestHandlerRequest { request: request.clone(), node_name };
-							let result = workers.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
+							let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
 							match result.action {
 								FrameRequestAction::Respond(_) => {
 									let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
@@ -616,7 +622,7 @@ servlet! {
 								node_name: config.node_name().to_string(),
 							};
 
-							workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
+							ctx.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
 							// Servlet builds ACK
 							let stateless_ack = config.frame_builder.build_stateless_ack_frame(frame_order)?;
@@ -696,7 +702,7 @@ servlet! {
 					missing_hash,
 					upstream_pool,
 					upstream_addr,
-					&trace,
+					trace,
 				).await?;
 
 				Ok(None)
@@ -758,7 +764,9 @@ servlet! {
 	/// Mars Rover executes commands and sends telemetry
 	pub RoverServlet<RelayMessage, EnvConfig = RoverServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+		let config: &RoverServletConf = ctx.env_config()?;
 		// Verify signature
 		if frame.nonrepudiation.is_some()
 			&& frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_err()
@@ -784,7 +792,7 @@ servlet! {
 					missing_hash,
 					&config.mars_relay_pool,
 					config.mars_relay_addr,
-					&trace,
+					trace,
 				).await?;
 
 				return Ok(None);
@@ -799,7 +807,7 @@ servlet! {
 					command,
 					max_rounds: config.max_rounds as u64,
 				};
-				let _result = workers.relay::<RoverCommandHandlerWorker>(Arc::new(request)).await??;
+				let _result = ctx.relay::<RoverCommandHandlerWorker>(Arc::new(request)).await??;
 
 				let (ack_order, ack_prev_digest) = config.chain_processor.prepare_outgoing()?;
 				let ack_frame = config.frame_builder.build_relay_ack_frame(
@@ -818,7 +826,7 @@ servlet! {
 			// WORKER: Decide what to do with frame request
 			let node_name = config.node_name().to_string();
 			let worker_request = FrameRequestHandlerRequest { request, node_name };
-			let result = workers.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
+			let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
 			match result.action {
 				FrameRequestAction::Respond(_) => {
 					let (order, prev_digest) = config.chain_processor.prepare_outgoing()?;
@@ -847,7 +855,7 @@ servlet! {
 				node_name: config.node_name().to_string(),
 			};
 
-			workers.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
+			ctx.relay::<FrameResponseHandlerWorker>(Arc::new(worker_request)).await??;
 
 			// Servlet builds ACK
 			let stateless_ack = config.frame_builder.build_stateless_ack_frame(command_order)?;

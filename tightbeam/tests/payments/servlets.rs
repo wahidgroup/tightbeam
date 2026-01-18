@@ -1,16 +1,22 @@
 //! Payment Servlets
 //!
-//! Defines servlets for authorization and capture handling.
+//! Defines servlets for authorization, capture, and key management.
 
 use std::sync::Arc;
 
 use tightbeam::asn1::MessagePriority;
+use tightbeam::crypto::ecies::{decrypt as ecies_decrypt, EciesPublicKeyOps, Secp256k1EciesMessage};
+use tightbeam::crypto::secret::ToInsecure;
+use tightbeam::crypto::sign::ecdsa::k256::SecretKey;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{compose, decode, servlet};
 
 use super::currency::MonetaryAmount;
-use super::harness::{BackpressureStats, PaymentHarness, PAYMENT_TAG};
-use super::messages::{CaptureTransaction, CreditTransferTransaction, PaymentIdentification, TransactionStatus};
+use super::harness::{PaymentHarness, PAYMENT_TAG};
+use super::messages::{
+	CaptureTransaction, CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest,
+	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,
+};
 
 // ============================================================================
 // Priority Calculation
@@ -43,25 +49,25 @@ pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 // ============================================================================
 
 servlet! {
-	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = BackpressureStats>,
+	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, trace, _config, _workers| async move {
-		// Create harness for validation
-		let harness = PaymentHarness::new(Arc::clone(&trace));
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
 
-		// Check for duplicates
-		if !harness.handle(&frame)? {
-			// Return cached response if available
-			if let Some(cached) = harness.dedup.get_cached(&frame) {
-				trace.event_with("dedup_cache_hit", &[PAYMENT_TAG], true)?;
-				return Ok(Some(compose! {
-					V2: id: frame.metadata.id.clone(),
-						message: cached
-				}?));
-			}
+		// Create harness for validation
+		let harness = PaymentHarness::new(Arc::clone(trace));
+
+		// Check for duplicates and return cached response if available
+		if let Some(cached) = harness.check_dedup_cache(&frame)? {
+			return Ok(Some(compose! {
+				V2: id: frame.metadata.id.clone(),
+					message: cached
+			}?));
 		}
 
 		// Decode the authorization request
+		// Note: ECIES decryption via KeyManager is available when ctx.hive_context() is Some
+		// but requires encrypted messages. For now, messages are unencrypted.
 		let req: CreditTransferTransaction = decode(&frame.message)?;
 
 		// Verify integrity
@@ -77,24 +83,21 @@ servlet! {
 			_ => trace.event_with("currency_other_processed", &[PAYMENT_TAG], true)?,
 		};
 
-		// Check priority
+		// Check priority - only emit event for high-value transactions
 		let priority = to_priority(&req.instructed_amount);
 		if priority == MessagePriority::Top {
 			trace.event_with("high_value_expedited", &[PAYMENT_TAG], true)?;
 		}
-		trace.event_with("priority_respected", &[PAYMENT_TAG], true)?;
 
 		// Generate authorization code
 		let auth_code = format!("AUTH{:08X}", req.creation_datetime as u32).into_bytes();
-
-		// Create approved response
 		let response = TransactionStatus::approved(req.payment_id.clone(), auth_code);
 
 		// Cache the response
 		harness.dedup.cache_response(&frame, response.clone())?;
 
-		// Emit pheromone reinforcement event (simulated - actual reinforcement in cluster)
-		trace.event_with("pheromone_reinforce", &[PAYMENT_TAG], true)?;
+		// Authorization approved
+		trace.event_with("authorization_approved", &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
 			V2: id: frame.metadata.id.clone(),
@@ -108,21 +111,20 @@ servlet! {
 // ============================================================================
 
 servlet! {
-	pub CaptureServlet<CaptureTransaction, EnvConfig = BackpressureStats>,
+	pub CaptureServlet<CaptureTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, trace, _config, _workers| async move {
-		// Create harness for validation
-		let harness = PaymentHarness::new(Arc::clone(&trace));
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
 
-		// Check for duplicates
-		if !harness.handle(&frame)? {
-			if let Some(cached) = harness.dedup.get_cached(&frame) {
-				trace.event_with("dedup_cache_hit", &[PAYMENT_TAG], true)?;
-				return Ok(Some(compose! {
-					V2: id: frame.metadata.id.clone(),
-						message: cached
-				}?));
-			}
+		// Create harness for validation
+		let harness = PaymentHarness::new(Arc::clone(trace));
+
+		// Check for duplicates and return cached response if available
+		if let Some(cached) = harness.check_dedup_cache(&frame)? {
+			return Ok(Some(compose! {
+				V2: id: frame.metadata.id.clone(),
+					message: cached
+			}?));
 		}
 
 		// Decode the capture request
@@ -144,20 +146,75 @@ servlet! {
 
 		// Generate settlement code
 		let settlement_code = format!("SETTLE{:08X}", req.capture_datetime as u32).into_bytes();
-
-		// Create captured response
 		let response = TransactionStatus::captured(payment_id, settlement_code);
 
 		// Cache the response
 		harness.dedup.cache_response(&frame, response.clone())?;
 
-		// Emit pheromone reinforcement
-		trace.event_with("pheromone_reinforce", &[PAYMENT_TAG], true)?;
+		// Capture completed
+		trace.event_with("capture_completed", &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
 			V2: id: frame.metadata.id.clone(),
 				message: response
 		}?))
+	}
+}
+
+// ============================================================================
+// KeyManager Servlet
+// ============================================================================
+
+/// Wrapper enum for KeyManager requests (public key or decrypt)
+#[derive(tightbeam::Beamable, tightbeam::der::Choice, Clone, Debug, PartialEq, Eq)]
+pub enum KeyManagerRequest {
+	/// Request to get the public key
+	GetPublicKey(GetPublicKeyRequest),
+	/// Request to decrypt ciphertext
+	Decrypt(DecryptRequest),
+}
+
+servlet! {
+	pub KeyManagerServlet<KeyManagerRequest, EnvConfig = Arc<SecretKey>>,
+	protocol: TokioListener,
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+		let secret_key: &Arc<SecretKey> = ctx.env_config()?;
+
+		// Decode the request
+		let req: KeyManagerRequest = decode(&frame.message)?;
+
+		match req {
+			KeyManagerRequest::GetPublicKey(_) => {
+				// Return the public key derived from the secret key
+				let response = GetPublicKeyResponse {
+					public_key: secret_key.public_key().to_bytes(),
+				};
+				trace.event_with("keymanager_pubkey_served", &[PAYMENT_TAG], true)?;
+				Ok(Some(compose! {
+					V2: id: frame.metadata.id.clone(),
+						message: response
+				}?))
+			}
+			KeyManagerRequest::Decrypt(decrypt_req) => {
+				// Parse the ECIES message from ciphertext bytes
+				let ecies_msg = Secp256k1EciesMessage::from_bytes(&decrypt_req.ciphertext)?;
+				// Decrypt using the secret key
+				let plaintext_secret = ecies_decrypt(
+					secret_key.as_ref(),
+					&ecies_msg,
+					None,
+				)?;
+				// Convert SecretSlice<u8> to Vec<u8>
+				let plaintext = plaintext_secret.to_insecure()?.to_vec();
+				let response = DecryptResponse { plaintext };
+				trace.event_with("keymanager_decrypt_success", &[PAYMENT_TAG], true)?;
+				Ok(Some(compose! {
+					V2: id: frame.metadata.id.clone(),
+						message: response
+				}?))
+			}
+		}
 	}
 }
 

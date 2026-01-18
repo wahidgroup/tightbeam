@@ -10,9 +10,8 @@ use crate::transport::client::pool::PoolConfig;
 use crate::transport::policy::{RestartExponentialBackoff, RestartPolicy};
 
 use super::{
-	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf,
-	DEFAULT_HEARTBEAT_INTERVAL_SECS, DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT,
-	DEFAULT_MAX_FAILURES,
+	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf, DEFAULT_HEARTBEAT_INTERVAL_SECS,
+	DEFAULT_HEARTBEAT_TIMEOUT_SECS, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_FAILURES,
 };
 use crate::colony::common::LeastLoaded;
 use crate::colony::hive::LoadBalancer;

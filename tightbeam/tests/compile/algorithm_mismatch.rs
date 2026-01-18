@@ -41,5 +41,5 @@ fn main() {
 		.with_id("test_algorithm_mismatch")
 		.with_order(1696521600)
 		// ERROR: OID mismatch! Should fail to compile
-		.with_cipher::<Aes256GcmOid, Aes256Gcm>(cipher);
+		.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher);
 }

@@ -323,9 +323,10 @@ fn default_batch() -> WorkBatch {
 servlet! {
 	QueueServlet<WorkOrder, EnvConfig = BackPressureStats>,
 	protocol: TokioListener,
-	handle: |frame, trace, _config, _workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
 		// Process the frame - collector gate handles back-pressure automatically
-		let harness = QueueHarness::new(Arc::clone(&trace));
+		let harness = QueueHarness::new(Arc::clone(trace));
 		harness.handle(&frame)?;
 		Ok(None)
 	}

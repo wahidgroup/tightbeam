@@ -430,7 +430,7 @@ let frame = compose::<SecureMessage>(Version::V1)
 	.with_id(b"msg-001")
 	.with_order(timestamp)
 	.with_message_hasher::<Sha3_256>()              // ✓ Matches MyAppProfile::DigestOid
-	.with_cipher::<Aes256GcmOid, _>(&cipher)        // ✓ Matches MyAppProfile::AeadOid
+	.with_aead::<Aes256GcmOid, _>(&cipher)        // ✓ Matches MyAppProfile::AeadOid
 	.with_signer::<Secp256k1Signature, _>(&signer)  // ✓ Matches MyAppProfile::SignatureAlg
 	.build()?;
 ```
@@ -441,7 +441,7 @@ let frame = compose::<SecureMessage>(Version::V1)
 **Validation Rules**:
 - `with_message_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
 - `with_witness_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
-- `with_cipher::<C, _>()` validates `C::OID == Profile::AeadOid::OID`
+- `with_aead::<C, _>()` validates `C::OID == Profile::AeadOid::OID`
 - `with_signer::<S, _>()` validates `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`
 
 **Error Handling**: Algorithm mismatches return `TightBeamError::UnexpectedAlgorithmForProfile` with
@@ -842,7 +842,7 @@ Encryption with Associated Data (AEAD) ciphers. This requirement is enforced at
 the type system level through trait bounds:
 
 ```rust
-pub fn with_cipher<C, Cipher>(mut self, cipher: Cipher) -> Self
+pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
 where
 	C: AssociatedOid,
 	Cipher: Aead + 'static, // AEAD trait bound required
@@ -2007,8 +2007,10 @@ servlet! {
 	policies: {
 		with_collector_gate: [RateLimitGate::new(100), AuthGate::new(key)]
 	},
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
 		// Only reached if all gates pass
+		// Access trace, config, workers via ctx
+		let _trace = ctx.trace();
 		// ...
 	}
 }
@@ -2031,15 +2033,19 @@ pub struct PingPongServletConf {
 tightbeam::servlet! {
 	pub PingPongServletWithWorker<RequestMessage, EnvConfig = PingPongServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
+		// Access context members
+		let trace = ctx.trace();
+		let config: &PingPongServletConf = ctx.env_config()?;
+
 		// Handler receives Frame, not decoded message
 		let decoded = decode::<RequestMessage, _>(&frame.message)?;
 		let decoded_arc = Arc::new(decoded);
 		
-		// Workers are accessed via the workers parameter
+		// Workers are accessed via ctx.relay
 		let (ping_result, lucky_result) = tokio::join!(
-			workers.relay::<PingPongWorker>(Arc::clone(&decoded_arc)),
-			workers.relay::<LuckyNumberDeterminer>(Arc::clone(&decoded_arc))
+			ctx.relay::<PingPongWorker>(Arc::clone(&decoded_arc)),
+			ctx.relay::<LuckyNumberDeterminer>(Arc::clone(&decoded_arc))
 		);
 
 		let reply = match ping_result {

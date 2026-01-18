@@ -316,6 +316,16 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Unsupported operation"))]
 	UnsupportedOperation,
 
+	/// Hive already established
+	#[cfg(feature = "colony")]
+	#[cfg_attr(feature = "derive", error("Hive already established"))]
+	AlreadyEstablished,
+
+	/// Task join error
+	#[cfg(feature = "colony")]
+	#[cfg_attr(feature = "derive", error("Task join failed"))]
+	JoinError,
+
 	/// Multiple errors collected together
 	#[cfg_attr(feature = "derive", error("Multiple errors occurred: {0:?}"))]
 	Sequence(Vec<TightBeamError>),
@@ -425,6 +435,10 @@ impl core::fmt::Display for TightBeamError {
 				}
 				Ok(())
 			}
+			#[cfg(feature = "colony")]
+			TightBeamError::AlreadyEstablished => write!(f, "Hive already established"),
+			#[cfg(feature = "colony")]
+			TightBeamError::JoinError => write!(f, "Task join failed"),
 			TightBeamError::UnsupportedVersion(err) => {
 				write!(
 					f,

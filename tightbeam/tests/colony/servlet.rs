@@ -68,16 +68,18 @@ servlet! {
 	/// Simple test servlet that USES config and workers
 	pub CalcServlet<CalcRequest, EnvConfig = CalcServletConf>,
 	protocol: TokioListener,
-	handle: |frame, trace, config, workers| async move {
+	handle: |frame, ctx| async move {
+		let trace = ctx.trace();
+		let config: &CalcServletConf = ctx.env_config()?;
 		trace.event("servlet_receive")?;
 
 		let request: CalcRequest = decode(&frame.message)?;
 		let request_arc = Arc::new(request);
 
-		// Process with both workers in parallel
+		// Process with both workers in parallel via context
 		let (doubled_result, squared_result) = tokio::join!(
-			workers.relay::<DoublerWorker>(Arc::clone(&request_arc)),
-			workers.relay::<SquarerWorker>(Arc::clone(&request_arc))
+			ctx.relay::<DoublerWorker>(Arc::clone(&request_arc)),
+			ctx.relay::<SquarerWorker>(Arc::clone(&request_arc))
 		);
 
 		let doubled = doubled_result??;

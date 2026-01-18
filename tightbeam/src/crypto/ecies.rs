@@ -469,6 +469,111 @@ impl AssociatedOid for EciesSecp256k1Oid {
 	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.1.12.0");
 }
 
+// ============================================================================
+// Encryptor/Decryptor Trait Implementations
+// ============================================================================
+
+/// ECIES encryptor - encrypts messages to a recipient's public key.
+///
+/// This type implements the `Encryptor` trait, allowing it to be used
+/// with `FrameBuilder::with_encryptor()` for asymmetric message encryption.
+///
+/// # Example
+/// ```ignore
+/// let encryptor = EciesEncryptor::new(recipient_pubkey);
+/// let frame = compose! {
+///     V2: id: b"msg-001",
+///         message: payload,
+///         encryptor<EciesSecp256k1Oid, _>: encryptor
+/// }?;
+/// ```
+#[cfg(feature = "x509")]
+pub struct EciesEncryptor {
+	recipient_pubkey: PublicKey,
+}
+
+#[cfg(feature = "x509")]
+impl EciesEncryptor {
+	/// Create a new ECIES encryptor for the given recipient's public key.
+	pub fn new(recipient_pubkey: PublicKey) -> Self {
+		Self { recipient_pubkey }
+	}
+
+	/// Create from raw public key bytes (SEC1 format).
+	pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self> {
+		let pubkey = PublicKey::from_bytes(bytes)?;
+		Ok(Self::new(pubkey))
+	}
+}
+
+#[cfg(feature = "x509")]
+impl crate::crypto::aead::Encryptor<EciesSecp256k1Oid> for EciesEncryptor {
+	fn encrypt_content(
+		&self,
+		data: impl AsRef<[u8]>,
+		_nonce: impl AsRef<[u8]>, // Ignored - ECIES generates its own nonce
+		content_type: Option<ObjectIdentifier>,
+	) -> crate::error::Result<crate::EncryptedContentInfo> {
+		// Use existing ECIES encrypt function
+		let ecies_msg: Secp256k1EciesMessage =
+			encrypt(&self.recipient_pubkey, data.as_ref(), None, None::<&mut OsRng>)?;
+
+		// Store the full ECIES message (ephemeral pubkey + ciphertext) as encrypted content
+		let encrypted_bytes = ecies_msg.to_bytes();
+		let content_type = content_type.unwrap_or(crate::oids::DATA);
+
+		// No nonce parameter needed - ECIES embeds the ephemeral pubkey
+		let content_enc_alg = crate::AlgorithmIdentifier { oid: EciesSecp256k1Oid::OID, parameters: None };
+		let encrypted_content = Some(crate::der::asn1::OctetString::new(encrypted_bytes)?);
+
+		Ok(crate::EncryptedContentInfo { content_type, content_enc_alg, encrypted_content })
+	}
+}
+
+/// ECIES decryptor - decrypts messages with recipient's secret key.
+///
+/// This type implements the `Decryptor` trait for decrypting ECIES-encrypted
+/// messages.
+///
+/// # Example
+/// ```ignore
+/// let decryptor = EciesDecryptor::new(my_secret_key);
+/// let plaintext = frame.decrypt(&decryptor)?;
+/// ```
+#[cfg(feature = "x509")]
+pub struct EciesDecryptor {
+	secret_key: SecretKey,
+}
+
+#[cfg(feature = "x509")]
+impl EciesDecryptor {
+	/// Create a new ECIES decryptor with the given secret key.
+	pub fn new(secret_key: SecretKey) -> Self {
+		Self { secret_key }
+	}
+}
+
+#[cfg(feature = "x509")]
+impl crate::crypto::aead::Decryptor for EciesDecryptor {
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
+		// Extract the encrypted bytes
+		let encrypted_bytes = info
+			.encrypted_content
+			.as_ref()
+			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
+			.as_bytes();
+
+		// Parse as ECIES message
+		let ecies_msg = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
+		// Decrypt using ECIES
+		let plaintext = decrypt(&self.secret_key, &ecies_msg, None)?;
+
+		// Convert SecretSlice to Vec<u8>
+		use crate::crypto::secret::ToInsecure;
+		Ok(plaintext.to_insecure()?.to_vec())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

@@ -11,7 +11,7 @@ use tightbeam::{
 	crypto::{
 		aead::{Aes128Gcm, Aes128GcmOid},
 		curves::Secp256k1Oid,
-		ecies::Secp256k1EciesMessage,
+		ecies::{self, Secp256k1EciesMessage},
 		hash::Sha3_256,
 		kdf::{HkdfSha3_256, HkdfSha3_256Oid},
 		kem::Kyber1024Oid,
@@ -20,14 +20,18 @@ use tightbeam::{
 			AeadProvider, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
 			SecurityProfile, SecurityProfileDesc, SigningProvider, TightbeamProfile,
 		},
+		secret::ToInsecure,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
 	},
+	der::Decode,
 	oids::{AES_128_GCM, AES_128_WRAP, AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256},
 	testing::{
 		error::{FdrConfigError, TestingError},
 		utils::{create_test_certificate, create_test_signing_key},
 	},
-	transport::handshake::{client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer},
+	transport::handshake::{
+		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
+	},
 	TightBeamError,
 };
 
@@ -131,6 +135,7 @@ impl CapturedHandshake {
 	}
 
 	/// Get message at a specific step.
+	#[allow(dead_code)]
 	pub fn message_at(&self, step: usize) -> Option<&CapturedMessage> {
 		self.messages.iter().find(|m| m.step == step)
 	}
@@ -138,6 +143,7 @@ impl CapturedHandshake {
 
 /// Outcome of injecting a message during handshake.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum InjectionOutcome {
 	/// Handshake continued/completed (bad for replay attack tests).
 	Accepted,
@@ -149,6 +155,7 @@ pub enum InjectionOutcome {
 ///
 /// This trait abstracts the differences between ECIES and CMS handshake flows,
 /// allowing tests to work with any backend without code duplication.
+#[allow(dead_code)]
 pub trait HandshakeProtocol: Send {
 	/// Returns the backend kind for this session.
 	fn kind(&self) -> HandshakeBackendKind;
@@ -174,15 +181,29 @@ pub trait HandshakeProtocol: Send {
 pub struct ServerMaterials {
 	pub certificate: Arc<Certificate>,
 	pub key_provider: Arc<dyn SigningKeyProvider>,
+	/// Secret key for test verification (ECIES decryption).
+	/// Stored as Arc to allow Clone without copying secret material.
+	secret_key: Arc<k256::SecretKey>,
 }
 
 impl ServerMaterials {
 	pub fn generate() -> Self {
 		let signing_key = create_test_signing_key();
 		let certificate = Arc::new(create_test_certificate(&signing_key));
+
+		// Convert signing key to secret key for ECIES operations
+		// The signing key scalar is the same as the secret key scalar
+		let secret_key_bytes = signing_key.to_bytes();
+		let secret_key = k256::SecretKey::from_bytes(&secret_key_bytes).expect("valid secret key");
+
 		let server_key = Secp256k1SigningKey::from(signing_key);
 		let provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(server_key));
-		Self { certificate, key_provider: provider }
+		Self { certificate, key_provider: provider, secret_key: Arc::new(secret_key) }
+	}
+
+	/// Get the secret key for ECIES decryption (test verification only).
+	pub fn secret_key(&self) -> &k256::SecretKey {
+		&self.secret_key
 	}
 }
 
@@ -192,6 +213,7 @@ pub fn default_security_profile() -> SecurityProfileDesc {
 }
 
 /// Strong security profile (AES-256-GCM) for downgrade attack testing.
+#[allow(dead_code)]
 pub fn strong_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
 		digest: HASH_SHA3_256,
@@ -238,6 +260,7 @@ pub enum HandshakeBackendKind {
 
 impl HandshakeBackendKind {
 	/// Human-readable backend label (useful for logging/trace events).
+	#[allow(dead_code)]
 	pub fn label(self) -> &'static str {
 		match self {
 			Self::Ecies => "ecies",
@@ -283,6 +306,11 @@ impl SecurityThreatHarness {
 	/// Create a harness with a trace collector for internal event emission.
 	pub fn with_trace(trace: Arc<TraceCollector>) -> Self {
 		Self { materials: ServerMaterials::generate(), trace: Some(trace) }
+	}
+
+	/// Get access to the server materials for test verification.
+	pub fn materials(&self) -> &ServerMaterials {
+		&self.materials
 	}
 
 	/// Emit a hidden event if trace is configured.
@@ -356,6 +384,151 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 		field: "inject_at_step",
 		reason: msg,
 	}))
+}
+
+// ============================================================================
+// Message Tampering Helpers (for MITM Testing)
+// ============================================================================
+
+/// Tamper with a message payload by flipping bits at strategic positions.
+///
+/// This simulates a MITM attacker modifying message bytes in transit.
+/// The tampering is designed to:
+/// 1. Preserve DER structure validity (where possible)
+/// 2. Cause transcript hash mismatch
+/// 3. Invalidate signatures over the original content
+///
+/// # Parameters
+/// - `payload`: Original message bytes
+///
+/// # Returns
+/// Modified payload with flipped bits
+pub fn tamper_payload(payload: &[u8]) -> Vec<u8> {
+	let mut tampered = payload.to_vec();
+	if tampered.is_empty() {
+		return tampered;
+	}
+
+	// Flip bits in the middle of the payload to avoid DER header corruption
+	// This targets the actual content rather than structural bytes
+	let mid = tampered.len() / 2;
+	let positions = [mid, mid.saturating_add(1), mid.saturating_add(2)];
+
+	for pos in positions {
+		if pos < tampered.len() {
+			tampered[pos] ^= 0xFF;
+		}
+	}
+
+	tampered
+}
+
+/// Tamper with a message by appending extra bytes.
+///
+/// This simulates a MITM attacker adding data to a message.
+#[allow(dead_code)]
+pub fn tamper_payload_append(payload: &[u8], extra: &[u8]) -> Vec<u8> {
+	let mut tampered = payload.to_vec();
+	tampered.extend_from_slice(extra);
+	tampered
+}
+
+/// Tamper with a message by truncating bytes.
+///
+/// This simulates a MITM attacker truncating a message.
+#[allow(dead_code)]
+pub fn tamper_payload_truncate(payload: &[u8], keep_bytes: usize) -> Vec<u8> {
+	payload.iter().take(keep_bytes).copied().collect()
+}
+
+// ============================================================================
+// ECIES Decryption Helpers (for Confidentiality Testing)
+// ============================================================================
+
+/// Result of attempting to decrypt an ECIES payload.
+#[derive(Debug)]
+pub enum DecryptionResult {
+	/// Decryption succeeded, plaintext has expected size (64 bytes for session material).
+	Success { plaintext_len: usize },
+	/// Decryption failed (wrong key, corrupted ciphertext, etc.).
+	Failed,
+}
+
+/// Extract the ECIES encrypted data from a ClientKeyExchange message.
+///
+/// # Parameters
+/// - `client_kex_der`: DER-encoded ClientKeyExchange message
+///
+/// # Returns
+/// The encrypted ECIES blob bytes
+pub fn extract_ecies_ciphertext(client_kex_der: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+	let client_kex = ClientKeyExchange::from_der(client_kex_der)?;
+	Ok(client_kex.encrypted_data.as_bytes().to_vec())
+}
+
+/// Extract the ephemeral public key from an ECIES ciphertext.
+///
+/// The ephemeral public key is the first 33 bytes (compressed secp256k1 point)
+/// of the ECIES message.
+///
+/// # Parameters
+/// - `ecies_ciphertext`: The raw ECIES blob
+///
+/// # Returns
+/// The 33-byte ephemeral public key
+pub fn extract_ephemeral_pubkey(ecies_ciphertext: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+	// ECIES message format: [ephemeral_pubkey (33 bytes) || nonce+ciphertext+tag]
+	const EPHEMERAL_PUBKEY_SIZE: usize = 33;
+
+	if ecies_ciphertext.len() < EPHEMERAL_PUBKEY_SIZE {
+		return Err(TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
+			field: "ephemeral_pubkey",
+			reason: "ECIES ciphertext too short",
+		})));
+	}
+
+	Ok(ecies_ciphertext[..EPHEMERAL_PUBKEY_SIZE].to_vec())
+}
+
+/// Default AAD used by the handshake for ECIES encryption.
+pub const HANDSHAKE_AAD: &[u8] = b"tb/aead/v1";
+
+/// Attempt to decrypt an ECIES ciphertext using the provided secret key.
+///
+/// # Parameters
+/// - `ciphertext`: The ECIES encrypted blob
+/// - `secret_key`: The recipient's secret key
+/// - `aad`: Optional AAD (defaults to HANDSHAKE_AAD if None)
+///
+/// # Returns
+/// `DecryptionResult::Success` with plaintext length if decryption worked,
+/// `DecryptionResult::Failed` if decryption failed (wrong key, invalid data, etc.)
+pub fn try_decrypt_ecies(ciphertext: &[u8], secret_key: &k256::SecretKey, aad: Option<&[u8]>) -> DecryptionResult {
+	// Parse the ECIES message
+	let message = match Secp256k1EciesMessage::from_bytes(ciphertext) {
+		Ok(m) => m,
+		Err(_) => return DecryptionResult::Failed,
+	};
+
+	// Use provided AAD or default to handshake AAD
+	let aad = aad.or(Some(HANDSHAKE_AAD));
+
+	// Attempt decryption
+	match ecies::decrypt(secret_key, &message, aad) {
+		Ok(plaintext) => {
+			let plaintext_bytes = match plaintext.to_insecure() {
+				Ok(b) => b,
+				Err(_) => return DecryptionResult::Failed,
+			};
+			DecryptionResult::Success { plaintext_len: plaintext_bytes.len() }
+		}
+		Err(_) => DecryptionResult::Failed,
+	}
+}
+
+/// Generate a random secret key for testing decryption with wrong key.
+pub fn generate_wrong_secret_key() -> k256::SecretKey {
+	k256::SecretKey::random(&mut rand_core::OsRng)
 }
 
 // ============================================================================

@@ -47,7 +47,7 @@ macro_rules! __tightbeam_servlet_common_methods {
 	};
 }
 
-// Helper macro: Generate servlet struct and workers struct definitions
+// Helper macro: Generate servlet struct definition
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __servlet_structs {
@@ -58,43 +58,7 @@ macro_rules! __servlet_structs {
 				server_pool_handles: Vec<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
 				addr: <$protocol as $crate::transport::Protocol>::Address,
 				trace_handle: ::std::sync::Arc<::std::sync::Mutex<::std::sync::Arc<$crate::trace::TraceCollector>>>,
-				#[allow(dead_code)]
-				workers: ::std::sync::Arc<[<$servlet_name Workers>]>,
 				_phantom: ::core::marker::PhantomData<$env_config>,
-			}
-
-			$vis struct [<$servlet_name Workers>] {
-				#[allow(dead_code)]
-				inner: ::std::collections::HashMap<String, Box<dyn $crate::colony::servlet::WorkerBox>>,
-				#[allow(dead_code)]
-				trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-			}
-		}
-	};
-}
-
-// Helper macro: Generate workers implementation (get, relay methods)
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __servlet_workers_impl {
-	($vis:vis, $servlet_name:ident) => {
-		$crate::paste::paste! {
-			impl [<$servlet_name Workers>] {
-				#[allow(dead_code)]
-				$vis fn get<W: 'static>(&self, name: &str) -> Option<&W> {
-					self.inner.get(name)?.downcast_ref()
-				}
-
-				#[allow(dead_code)]
-				$vis async fn relay<W>(&self, input: ::std::sync::Arc<W::Input>)
-					-> Result<W::Output, $crate::TightBeamError>
-				where
-					W: $crate::colony::worker::Worker + $crate::colony::worker::WorkerMetadata + 'static,
-				{
-					let name = W::name();
-					let worker = self.get::<W>(name).ok_or($crate::TightBeamError::MissingConfiguration)?;
-					worker.relay(input).await.map_err(|e| e.into())
-				}
 			}
 		}
 	};
@@ -108,29 +72,20 @@ macro_rules! __servlet_create_server {
 		$protocol:path,
 		$listener:ident,
 		$collector_gates:ident,
-		$config_for_handler:ident,
-		$workers_for_handler:ident,
-		$trace_for_handler:ident,
-		$env_config:ty,
-		$message:ident,
-		$trace_param:ident,
-		$config_param:ident,
-		$workers_param:ident,
+		$servlet_context:ident,
+		$trace_handle:ident,
+		$frame:ident,
+		$ctx:ident,
 		$handler_body:block
 	) => {
 		if $collector_gates.is_empty() {
 			$crate::server! {
 				protocol $protocol: $listener,
-				handle: move |$message| {
-					let config_clone = ::std::sync::Arc::clone(&$config_for_handler);
-					let workers_clone = ::std::sync::Arc::clone(&$workers_for_handler);
-					let trace_clone = ::std::sync::Arc::clone(&$trace_for_handler);
+				handle: move |frame_in| {
+					let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
 					async move {
-						let $trace_param = ::std::sync::Arc::clone(&*trace_clone.lock()?);
-						let config_arc = ::std::sync::Arc::downcast::<$env_config>(config_clone)
-							.map_err(|_| $crate::TightBeamError::MissingConfiguration)?;
-						let $config_param: &$env_config = &*config_arc;
-						let $workers_param = &*workers_clone;
+						let $frame = frame_in;
+						let $ctx = &*ctx_clone;
 						$handler_body
 					}
 				}
@@ -147,34 +102,24 @@ macro_rules! __servlet_create_server {
 									transport = transport.with_collector_gate(::std::sync::Arc::clone(gate));
 								}
 
-								let config_clone = ::std::sync::Arc::clone(&$config_for_handler);
-								let workers_clone = ::std::sync::Arc::clone(&$workers_for_handler);
-								let trace_clone = ::std::sync::Arc::clone(&$trace_for_handler);
+								let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
 
 								$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 									let mut transport = transport;
 									loop {
-										let (frame, status) = match transport.collect_message().await {
+										let (frame_arc, status) = match transport.collect_message().await {
 											Ok(result) => result,
 											Err(_err) => break,
 										};
 
-										let frame_owned = ::std::sync::Arc::try_unwrap(frame)
+										let frame_owned = ::std::sync::Arc::try_unwrap(frame_arc)
 											.unwrap_or_else(|arc| arc.as_ref().clone());
 										let response = if status == $crate::policy::TransitStatus::Accepted {
-											let $message = frame_owned;
-											let trace_for_handler = ::std::sync::Arc::clone(&trace_clone);
-											let config_for_handler = ::std::sync::Arc::clone(&config_clone);
-											let workers_for_handler = ::std::sync::Arc::clone(&workers_clone);
+											let ctx_for_handler = ::std::sync::Arc::clone(&ctx_clone);
 											let result: Result<Option<$crate::Frame>, $crate::TightBeamError> =
 												async move {
-													let $trace_param =
-														::std::sync::Arc::clone(&*trace_for_handler.lock()?);
-													let config_arc =
-														::std::sync::Arc::downcast::<$env_config>(config_for_handler)
-															.map_err(|_| $crate::TightBeamError::MissingConfiguration)?;
-													let $config_param: &$env_config = &*config_arc;
-													let $workers_param = &*workers_for_handler;
+													let $frame = frame_owned;
+													let $ctx = &*ctx_for_handler;
 													$handler_body
 												}
 												.await;
@@ -212,10 +157,8 @@ macro_rules! __servlet_start_impl {
 		$protocol:path,
 		$input:ty,
 		$env_config:ty,
-		$message:ident,
-		$trace_param:ident,
-		$config_param:ident,
-		$workers_param:ident,
+		$frame:ident,
+		$ctx:ident,
 		$handler_body:block
 	) => {
 		$crate::paste::paste! {
@@ -238,13 +181,15 @@ macro_rules! __servlet_start_impl {
 				#[cfg(not(feature = "x509"))]
 				let (listener, addr) = <$protocol as $crate::transport::Protocol>::bind(bind_addr).await?;
 
-				let config_any = ::std::sync::Arc::clone(
+				let env_config = ::std::sync::Arc::clone(
 					servlet_conf.to_servlet_conf_ref()
 						.ok_or($crate::TightBeamError::MissingConfiguration)?
 				);
 
 				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::sync::Arc::clone(&trace)));
 				let collector_gates = servlet_conf.collector_gates_ref().to_vec();
+				let hive_context = servlet_conf.hive_context().cloned();
+				// to_workers() takes ownership, so call after other borrows
 				let workers_map = servlet_conf.to_workers();
 
 				// Auto-start all workers with servlet trace
@@ -254,26 +199,22 @@ macro_rules! __servlet_start_impl {
 					started_workers.insert(name, started);
 				}
 
-				let workers = ::std::sync::Arc::new([<$servlet_name Workers>] {
-					inner: started_workers,
-					trace: ::std::sync::Arc::clone(&trace),
-				});
-				let config_for_handler = ::std::sync::Arc::clone(&config_any);
-				let workers_for_handler = ::std::sync::Arc::clone(&workers);
-				let trace_for_handler = ::std::sync::Arc::clone(&trace_handle);
+				// Create the unified servlet context
+				let servlet_context = ::std::sync::Arc::new($crate::colony::servlet::ServletContext::new(
+					::std::sync::Arc::clone(&trace),
+					env_config,
+					started_workers,
+					hive_context,
+				));
 
 				let server_handle = $crate::__servlet_create_server!(
 					$protocol,
 					listener,
 					collector_gates,
-					config_for_handler,
-					workers_for_handler,
-					trace_for_handler,
-					$env_config,
-					$message,
-					$trace_param,
-					$config_param,
-					$workers_param,
+					servlet_context,
+					trace_handle,
+					$frame,
+					$ctx,
 					$handler_body
 				);
 
@@ -282,7 +223,6 @@ macro_rules! __servlet_start_impl {
 					server_pool_handles: Vec::new(),
 					addr,
 					trace_handle,
-					workers,
 					_phantom: ::core::marker::PhantomData,
 				})
 			}
@@ -359,6 +299,31 @@ macro_rules! __servlet_drop_impl {
 	};
 }
 
+// Helper macro: Generate ServletBox trait implementation for hive registration
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __servlet_box_impl {
+	($servlet_name:ident, $protocol:path) => {
+		impl $crate::colony::hive::ServletBox for $servlet_name {
+			fn addr_bytes(&self) -> Vec<u8> {
+				let addr = self.addr();
+				let addr_string: String = addr.to_string();
+				addr_string.into_bytes()
+			}
+
+			fn stop_boxed(self: Box<Self>) {
+				(*self).stop()
+			}
+
+			fn utilization(&self) -> Option<$crate::utils::BasisPoints> {
+				// Servlets can override this via the Servlet trait's utilization method
+				use $crate::colony::servlet::Servlet;
+				<Self as Servlet<_>>::utilization(self)
+			}
+		}
+	};
+}
+
 /// Servlet macro for creating containerized tightbeam applications
 #[macro_export]
 macro_rules! servlet {
@@ -367,17 +332,16 @@ macro_rules! servlet {
 		$(#[$meta:meta])*
 		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path,
-		handle: |$message:ident, $trace_param:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
+		handle: |$frame:ident, $ctx:ident| async move $handler_body:block
 	) => {
 		$crate::paste::paste! {
 			$(#[$meta])*
 			$crate::__servlet_structs!(pub, $servlet_name, $protocol, $env_config);
-			$crate::__servlet_workers_impl!(pub, $servlet_name);
 
 			impl $servlet_name {
 				$crate::__servlet_start_impl!(
 					$servlet_name, $protocol, $input, $env_config,
-					$message, $trace_param, $config_param, $workers_param,
+					$frame, $ctx,
 					$handler_body
 				);
 			}
@@ -385,6 +349,7 @@ macro_rules! servlet {
 			$crate::__servlet_impl_methods!(pub, $servlet_name, $protocol, $input);
 			$crate::__servlet_trait_impl!($servlet_name, $protocol, $input);
 			$crate::__servlet_drop_impl!($servlet_name);
+			$crate::__servlet_box_impl!($servlet_name, $protocol);
 		}
 	};
 
@@ -393,17 +358,16 @@ macro_rules! servlet {
 		$(#[$meta:meta])*
 		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path,
-		handle: |$message:ident, $trace_param:ident, $config_param:ident, $workers_param:ident| async move $handler_body:block
+		handle: |$frame:ident, $ctx:ident| async move $handler_body:block
 	) => {
 		$crate::paste::paste! {
 			$(#[$meta])*
 			$crate::__servlet_structs!(, $servlet_name, $protocol, $env_config);
-			$crate::__servlet_workers_impl!(, $servlet_name);
 
 			impl $servlet_name {
 				$crate::__servlet_start_impl!(
 					$servlet_name, $protocol, $input, $env_config,
-					$message, $trace_param, $config_param, $workers_param,
+					$frame, $ctx,
 					$handler_body
 				);
 			}
@@ -411,6 +375,7 @@ macro_rules! servlet {
 			$crate::__servlet_impl_methods!(pub, $servlet_name, $protocol, $input);
 			$crate::__servlet_trait_impl!($servlet_name, $protocol, $input);
 			$crate::__servlet_drop_impl!($servlet_name);
+			$crate::__servlet_box_impl!($servlet_name, $protocol);
 		}
 	};
 }

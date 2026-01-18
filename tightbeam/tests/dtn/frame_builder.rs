@@ -36,7 +36,7 @@ macro_rules! apply_common_builder_patterns {
 			.with_message_hasher::<Sha3_256>()
 			.with_witness_hasher::<Sha3_256>()
 			.with_compression(ZstdCompression)
-			.with_cipher::<Aes256GcmOid, _>($cipher.to_owned())
+			.with_aead::<Aes256GcmOid, _>($cipher.to_owned())
 			.with_signer::<Secp256k1Signature, _>($signing_key.to_owned());
 
 		// Set previous_frame if not the first frame
