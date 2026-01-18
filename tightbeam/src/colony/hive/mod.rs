@@ -85,6 +85,17 @@ pub trait ServletBox: Send + Sync {
 	fn utilization(&self) -> Option<BasisPoints> {
 		None
 	}
+
+	/// Check if the servlet is healthy and responsive.
+	///
+	/// Used by the scaling task for self-healing: unhealthy servlets
+	/// may be stopped and respawned. Implementations can check internal
+	/// state, connectivity, or other health indicators.
+	///
+	/// Default implementation returns `true`, assuming the servlet is healthy.
+	fn is_healthy(&self) -> bool {
+		true
+	}
 }
 
 // =============================================================================
@@ -403,6 +414,31 @@ pub trait HiveContext: Send + Sync {
 	/// * `Ok(Vec<u8>)` - The serialized response from the target servlet
 	/// * `Err(TightBeamError)` - If the servlet is not found or the call fails
 	fn call<'a>(&'a self, servlet_type: &'a [u8], request: Vec<u8>) -> CallFuture<'a>;
+}
+
+/// Type-safe call with automatic encode/decode.
+///
+/// Encodes the request, calls the sibling servlet, and decodes the response.
+/// The request type must implement `der::Encode`, and the response type must
+/// implement `der::Decode` for owned data.
+///
+/// This is a free function rather than a trait method to maintain dyn-compatibility
+/// of [`HiveContext`], allowing it to be used as `Arc<dyn HiveContext>`.
+pub fn call_typed<'a, Req, Resp>(
+	ctx: &'a (dyn HiveContext + Sync),
+	servlet_type: &'a [u8],
+	request: &Req,
+) -> Pin<Box<dyn Future<Output = Result<Resp, TightBeamError>> + Send + 'a>>
+where
+	Req: der::Encode,
+	Resp: for<'de> der::Decode<'de> + Send + 'a,
+{
+	let req_result = crate::encode(request);
+	Box::pin(async move {
+		let req_bytes = req_result?;
+		let resp_bytes = ctx.call(servlet_type, req_bytes).await?;
+		crate::decode(&resp_bytes)
+	})
 }
 
 // =============================================================================

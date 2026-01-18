@@ -2,10 +2,17 @@
 //!
 //! Types for auto-scaling servlet instances based on utilization metrics.
 
+use core::time::Duration;
+
 use crate::utils::BasisPoints;
 
+/// Default scale-up cooldown (30 seconds)
+const DEFAULT_SCALE_UP_COOLDOWN: Duration = Duration::from_secs(30);
+/// Default scale-down cooldown (60 seconds)
+const DEFAULT_SCALE_DOWN_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// Per-servlet-type scaling configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ServletScaleConf {
 	/// Minimum instances to maintain (default: 1)
 	pub min_instances: usize,
@@ -15,6 +22,17 @@ pub struct ServletScaleConf {
 	pub scale_up_threshold: BasisPoints,
 	/// Scale-down threshold in basis points (default: 2000 = 20%)
 	pub scale_down_threshold: BasisPoints,
+	/// Cooldown after scale-up before next scale-up (default: 30s)
+	///
+	/// Prevents rapid scaling up during load spikes. After spawning
+	/// an instance, this duration must elapse before another scale-up.
+	pub scale_up_cooldown: Duration,
+	/// Cooldown after scale-down before next scale-down (default: 60s)
+	///
+	/// Prevents oscillation by requiring more stable low utilization
+	/// before removing additional instances. Longer than scale-up cooldown
+	/// to avoid thrashing during variable load.
+	pub scale_down_cooldown: Duration,
 }
 
 impl Default for ServletScaleConf {
@@ -24,6 +42,8 @@ impl Default for ServletScaleConf {
 			max_instances: 10,
 			scale_up_threshold: BasisPoints::new(8000),
 			scale_down_threshold: BasisPoints::new(2000),
+			scale_up_cooldown: DEFAULT_SCALE_UP_COOLDOWN,
+			scale_down_cooldown: DEFAULT_SCALE_DOWN_COOLDOWN,
 		}
 	}
 }

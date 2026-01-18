@@ -1,6 +1,10 @@
 //! Latency and utilization tracking for servlets
 
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use crate::utils::BasisPoints;
 
@@ -123,10 +127,17 @@ impl Default for LatencyTracker {
 // Utilization Reporter
 // ============================================================================
 
+/// Default latency weight in basis points (70%)
+const DEFAULT_LATENCY_WEIGHT_BPS: u16 = 7000;
+
 /// Helper for servlets to track and report utilization.
 ///
 /// Wraps a `LatencyTracker` with a convenient interface for recording
 /// request latencies and reporting utilization to the hive.
+///
+/// Optionally combines latency-based utilization with queue depth for
+/// more accurate load measurement. Use [`with_queue`](Self::with_queue) to
+/// enable queue-aware utilization.
 ///
 /// Servlets can embed this and return `Some(reporter.utilization())` from
 /// `ServletBox::utilization()`.
@@ -158,6 +169,12 @@ impl Default for LatencyTracker {
 #[derive(Debug)]
 pub struct UtilizationReporter {
 	tracker: LatencyTracker,
+	/// Optional queue metrics for combined utilization
+	queue: Option<Arc<ServletMetrics>>,
+	/// Queue capacity for utilization percentage (default: 100)
+	queue_capacity: u32,
+	/// Weight for latency in basis points (default: 7000 = 70%)
+	latency_weight_bps: u16,
 }
 
 impl UtilizationReporter {
@@ -167,7 +184,41 @@ impl UtilizationReporter {
 	/// * `alpha_bps` - Smoothing factor (0-10000). Higher = more weight on new samples.
 	/// * `target_us` - Target latency in microseconds (100% utilization point).
 	pub const fn new(alpha_bps: u16, target_us: u64) -> Self {
-		Self { tracker: LatencyTracker::new(alpha_bps, target_us) }
+		Self {
+			tracker: LatencyTracker::new(alpha_bps, target_us),
+			queue: None,
+			queue_capacity: 100,
+			latency_weight_bps: DEFAULT_LATENCY_WEIGHT_BPS,
+		}
+	}
+
+	/// Create a utilization reporter that combines latency with queue depth.
+	///
+	/// The combined utilization is calculated as:
+	/// `(latency_weight * latency_util + (1 - latency_weight) * queue_util)`
+	///
+	/// where `queue_util = (queue_depth / capacity) * 10000`.
+	///
+	/// # Arguments
+	/// * `alpha_bps` - Smoothing factor for latency EMA (0-10000).
+	/// * `target_us` - Target latency in microseconds (100% utilization point).
+	/// * `queue` - Shared queue metrics to track.
+	/// * `capacity` - Queue capacity for utilization calculation.
+	/// * `latency_weight_bps` - Weight for latency component (0-10000).
+	///   7000 (70% latency, 30% queue) is a good default.
+	pub fn with_queue(
+		alpha_bps: u16,
+		target_us: u64,
+		queue: Arc<ServletMetrics>,
+		capacity: u32,
+		latency_weight_bps: u16,
+	) -> Self {
+		Self {
+			tracker: LatencyTracker::new(alpha_bps, target_us),
+			queue: Some(queue),
+			queue_capacity: capacity,
+			latency_weight_bps,
+		}
 	}
 
 	/// Record a latency sample from a request duration.
@@ -181,8 +232,29 @@ impl UtilizationReporter {
 	}
 
 	/// Get current utilization as basis points (0-10000).
+	///
+	/// If queue metrics are configured, returns a weighted combination
+	/// of latency and queue utilization. Otherwise returns latency-only.
 	pub fn utilization(&self) -> BasisPoints {
-		self.tracker.utilization()
+		let latency_util = self.tracker.utilization().get() as u32;
+
+		let Some(ref queue) = self.queue else {
+			return self.tracker.utilization();
+		};
+
+		// Calculate queue utilization: (depth / capacity) * 10000
+		let queue_util = if self.queue_capacity == 0 {
+			0
+		} else {
+			queue.queue_depth().saturating_mul(10000) / self.queue_capacity
+		};
+
+		// Weighted average: (latency_weight * latency + queue_weight * queue) / 10000
+		let latency_weight = self.latency_weight_bps as u32;
+		let queue_weight = 10000u32.saturating_sub(latency_weight);
+		let combined = (latency_weight.saturating_mul(latency_util) + queue_weight.saturating_mul(queue_util)) / 10000;
+
+		BasisPoints::new_saturating(combined.min(10000) as u16)
 	}
 
 	/// Get the raw EMA latency in microseconds.
@@ -190,14 +262,19 @@ impl UtilizationReporter {
 		self.tracker.ema_microseconds()
 	}
 
-	/// Reset the tracker to zero.
+	/// Get the current queue depth (if queue tracking is enabled).
+	pub fn queue_depth(&self) -> Option<u32> {
+		self.queue.as_ref().map(|q| q.queue_depth())
+	}
+
+	/// Reset the latency tracker to zero.
 	pub fn reset(&self) {
 		self.tracker.reset();
 	}
 }
 
 impl Default for UtilizationReporter {
-	/// Default: 20% alpha, 100ms target latency
+	/// Default: 20% alpha, 100ms target latency, no queue tracking
 	fn default() -> Self {
 		Self::new(2000, 100_000)
 	}
