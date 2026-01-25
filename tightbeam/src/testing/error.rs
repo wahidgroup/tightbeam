@@ -60,24 +60,16 @@ pub enum TestingError {
 	SchedulabilityViolation(SchedulabilityViolationDetail),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for TestingError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			Self::FuzzInputExhausted => write!(f, "Fuzz input exhausted"),
-			Self::FuzzInputUnavailable => write!(f, "Fuzz input unavailable"),
-			Self::FuzzInputLockPoisoned => write!(f, "Fuzz input lock poisoned"),
-			Self::InvalidTimingConstraint => write!(f, "Invalid timing constraint configuration"),
-			Self::InvalidSlack => write!(f, "Slack exceeds deadline duration"),
-			Self::InvalidFdrConfig(detail) => write!(f, "Invalid FDR configuration: {}", detail),
-			Self::InvalidFaultModel => write!(f, "Invalid fault model configuration"),
-			Self::SchedulabilityViolation(detail) => write!(f, "Schedulability violation: {}", detail),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for TestingError {}
+crate::impl_error_display!(TestingError {
+	FuzzInputExhausted => "Fuzz input exhausted",
+	FuzzInputUnavailable => "Fuzz input unavailable",
+	FuzzInputLockPoisoned => "Fuzz input lock poisoned",
+	InvalidTimingConstraint => "Invalid timing constraint configuration",
+	InvalidSlack => "Slack exceeds deadline duration",
+	InvalidFdrConfig(detail) => "Invalid FDR configuration: {detail}",
+	InvalidFaultModel => "Invalid fault model configuration",
+	SchedulabilityViolation(detail) => "Schedulability violation: {detail}",
+});
 
 #[cfg(feature = "std")]
 impl<T> From<std::sync::PoisonError<T>> for TestingError {

@@ -18,17 +18,9 @@ pub enum CryptoPolicyError {
 	UnsupportedAlgorithm(ObjectIdentifier),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for CryptoPolicyError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			CryptoPolicyError::UnsupportedAlgorithm(oid) => write!(f, "Unsupported algorithm: {}", oid),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for CryptoPolicyError {}
+crate::impl_error_display!(CryptoPolicyError {
+	UnsupportedAlgorithm(oid) => "Unsupported algorithm: {oid}",
+});
 
 /// Trait for cryptographic verification policies.
 ///

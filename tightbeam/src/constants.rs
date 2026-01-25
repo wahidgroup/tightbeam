@@ -40,6 +40,29 @@ pub const MAX_HKDF_OUTPUT_SIZE: usize = 128;
 /// Minimum secure key size in bytes
 pub const MIN_KEY_SIZE: usize = 16;
 
+// ----------------------------------------------------------------------------
+// Elliptic Curve Key Sizes
+// ----------------------------------------------------------------------------
+
+/// Compressed secp256k1/P-256 public key size (SEC1 format: 0x02/0x03 prefix + 32 bytes)
+pub const EC_PUBKEY_COMPRESSED_SIZE: usize = 33;
+
+/// Uncompressed secp256k1/P-256 public key size (SEC1 format: 0x04 prefix + 64 bytes)
+pub const EC_PUBKEY_UNCOMPRESSED_SIZE: usize = 65;
+
+/// ECDH shared secret size for 256-bit curves (secp256k1, P-256, X25519)
+pub const ECDH_SHARED_SECRET_SIZE: usize = 32;
+
+// ----------------------------------------------------------------------------
+// AES-GCM Constants
+// ----------------------------------------------------------------------------
+
+/// AES-GCM nonce size (96 bits per NIST SP 800-38D recommendation)
+pub const AES_GCM_NONCE_SIZE: usize = 12;
+
+/// AES-GCM authentication tag size (128 bits)
+pub const AES_GCM_TAG_SIZE: usize = 16;
+
 // ============================================================================
 // Testing & Verification Constants
 // ============================================================================

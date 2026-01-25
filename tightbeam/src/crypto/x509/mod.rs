@@ -13,9 +13,6 @@ use crate::TightBeamError;
 ///
 /// This enum allows certificates to be specified in multiple ways for flexible
 /// configuration in const contexts (e.g., servlet! macro).
-// TODO: Consider changing `Built(Box<Certificate>)` to `Built(Arc<Certificate>)`
-// to make cloning cheap. Currently clones happen only at initialization (cold path),
-// so not urgent. See also: ClusterTlsConfig, HiveTlsConfig.
 #[derive(Debug, Clone)]
 pub enum CertificateSpec {
 	/// PEM-encoded certificate string

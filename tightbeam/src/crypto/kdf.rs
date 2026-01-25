@@ -36,10 +36,11 @@
 
 pub use hkdf::Hkdf;
 
-use crate::constants::{MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE};
+use crate::constants::{
+	ECDH_SHARED_SECRET_SIZE, EC_PUBKEY_COMPRESSED_SIZE, EC_PUBKEY_UNCOMPRESSED_SIZE, MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE,
+};
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
-use crate::der::oid::{AssociatedOid, ObjectIdentifier};
 use crate::zeroize::Zeroizing;
 use crate::ZeroizingArray;
 
@@ -118,14 +119,12 @@ pub trait KdfFunction {
 /// Default HKDF-SHA3-256 provider
 pub struct HkdfSha3_256;
 
-/// OID wrapper for HKDF-SHA3-256
-/// Note: No standard OID exists for HKDF-SHA3-256, using NIST SHA3-256 base OID
-pub struct HkdfSha3_256Oid;
-
-impl AssociatedOid for HkdfSha3_256Oid {
-	/// HKDF-SHA3-256 OID (NIST SHA3-256 base: 2.16.840.1.101.3.4.2.8)
-	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8");
-}
+crate::define_oid_wrapper!(
+	/// OID wrapper for HKDF-SHA3-256
+	/// Note: No standard OID exists for HKDF-SHA3-256, using NIST SHA3-256 base OID
+	HkdfSha3_256Oid,
+	"2.16.840.1.101.3.4.2.8"
+);
 
 impl KdfFunction for HkdfSha3_256 {
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
@@ -281,47 +280,52 @@ pub enum KdfError {
 	InvalidSaltLength(usize),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for KdfError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			KdfError::DerivationFailed(e) => write!(f, "Key derivation failed: {}", e),
-			KdfError::InvalidPublicKeyLength(len) => {
-				write!(f, "Invalid ephemeral public key length: expected 33 or 65 bytes, got {}", len)
-			}
-			KdfError::InvalidSharedSecretLength(len) => {
-				write!(f, "Invalid shared secret length: expected 32 bytes, got {}", len)
-			}
-			KdfError::InvalidSaltLength(len) => {
-				write!(f, "Invalid salt length: must be at least 16 bytes, got {}", len)
-			}
-		}
-	}
-}
+crate::impl_error_display!(KdfError {
+	DerivationFailed(e) => "Key derivation failed: {e}",
+	InvalidPublicKeyLength(len) => "Invalid ephemeral public key length: expected 33 or 65 bytes, got {len}",
+	InvalidSharedSecretLength(len) => "Invalid shared secret length: expected 32 bytes, got {len}",
+	InvalidSaltLength(len) => "Invalid salt length: must be at least 16 bytes, got {len}",
+});
 
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for KdfError {}
+// ============================================================================
+// Input Validation Helpers
+// ============================================================================
 
-/// Validate common KDF inputs (ephemeral pubkey, shared secret, and optional salt)
+/// Validate shared secret length for 256-bit curves.
 #[inline]
-fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: Option<&[u8]>) -> Result<()> {
-	// Validate ephemeral public key length for secp256k1 (33 bytes compressed, 65 bytes uncompressed)
-	if ephemeral_pubkey.len() != 33 && ephemeral_pubkey.len() != 65 {
-		return Err(KdfError::InvalidPublicKeyLength(ephemeral_pubkey.len()));
-	}
-
-	// Validate shared secret length (32 bytes for 256-bit curves)
-	if shared_secret.len() != 32 {
+fn assert_valid_shared_secret(shared_secret: &[u8]) -> Result<()> {
+	if shared_secret.len() != ECDH_SHARED_SECRET_SIZE {
 		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
 	}
+	Ok(())
+}
 
-	// Validate salt length if provided (minimum 16 bytes for security)
+/// Validate salt length if provided (minimum 16 bytes for security).
+#[inline]
+fn assert_valid_salt(salt: Option<&[u8]>) -> Result<()> {
 	if let Some(salt_bytes) = salt {
 		if !salt_bytes.is_empty() && salt_bytes.len() < MIN_KEY_SIZE {
 			return Err(KdfError::InvalidSaltLength(salt_bytes.len()));
 		}
 	}
+	Ok(())
+}
 
+/// Validate ephemeral public key length (SEC1 format: compressed or uncompressed).
+#[inline]
+fn assert_valid_ephemeral_pubkey(ephemeral_pubkey: &[u8]) -> Result<()> {
+	if ephemeral_pubkey.len() != EC_PUBKEY_COMPRESSED_SIZE && ephemeral_pubkey.len() != EC_PUBKEY_UNCOMPRESSED_SIZE {
+		return Err(KdfError::InvalidPublicKeyLength(ephemeral_pubkey.len()));
+	}
+	Ok(())
+}
+
+/// Validate common KDF inputs (ephemeral pubkey, shared secret, and optional salt)
+#[inline]
+fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: Option<&[u8]>) -> Result<()> {
+	assert_valid_ephemeral_pubkey(ephemeral_pubkey)?;
+	assert_valid_shared_secret(shared_secret)?;
+	assert_valid_salt(salt)?;
 	Ok(())
 }
 
@@ -432,15 +436,8 @@ pub fn ecies_kdf_with_shared_info<P: KdfFunction>(
 ) -> Result<ZeroizingArray<32>> {
 	let insecure_shared_secret = shared_secret.to_insecure()?;
 	let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
-	if shared_secret.len() != 32 {
-		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
-	}
-
-	if let Some(salt_bytes) = salt {
-		if !salt_bytes.is_empty() && salt_bytes.len() < MIN_KEY_SIZE {
-			return Err(KdfError::InvalidSaltLength(salt_bytes.len()));
-		}
-	}
+	assert_valid_shared_secret(shared_secret)?;
+	assert_valid_salt(salt)?;
 
 	P::derive_key::<32>(shared_secret, shared_info, salt)
 }
@@ -454,15 +451,8 @@ pub fn ecies_kdf_with_shared_info_and_size<P: KdfFunction, const N: usize>(
 ) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
 	let insecure_shared_secret = shared_secret.to_insecure()?;
 	let (shared_secret, shared_info) = (insecure_shared_secret.as_ref(), shared_info.as_ref());
-	if shared_secret.len() != 32 {
-		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
-	}
-
-	if let Some(salt_bytes) = salt {
-		if !salt_bytes.is_empty() && salt_bytes.len() < MIN_KEY_SIZE {
-			return Err(KdfError::InvalidSaltLength(salt_bytes.len()));
-		}
-	}
+	assert_valid_shared_secret(shared_secret)?;
+	assert_valid_salt(salt)?;
 
 	P::derive_dual_keys::<N>(shared_secret, shared_info, salt)
 }

@@ -39,24 +39,16 @@ pub enum KariBuilderError {
 	CmsBuilderError(crate::cms::builder::Error),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for KariBuilderError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			KariBuilderError::MissingSenderPrivateKey => write!(f, "Sender private key not set"),
-			KariBuilderError::MissingSenderPublicKeySpki => write!(f, "Sender public key SPKI not set"),
-			KariBuilderError::MissingRecipientPublicKey => write!(f, "Recipient public key not set"),
-			KariBuilderError::MissingRecipientIdentifier => write!(f, "Recipient identifier not set"),
-			KariBuilderError::MissingUkm => write!(f, "User Keying Material (UKM) not set"),
-			KariBuilderError::MissingKeyEncryptionAlgorithm => write!(f, "Key encryption algorithm not set"),
-			KariBuilderError::DerError(e) => write!(f, "DER error: {}", e),
-			KariBuilderError::CmsBuilderError(e) => write!(f, "CMS builder error: {}", e),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for KariBuilderError {}
+crate::impl_error_display!(KariBuilderError {
+	MissingSenderPrivateKey => "Sender private key not set",
+	MissingSenderPublicKeySpki => "Sender public key SPKI not set",
+	MissingRecipientPublicKey => "Recipient public key not set",
+	MissingRecipientIdentifier => "Recipient identifier not set",
+	MissingUkm => "User Keying Material (UKM) not set",
+	MissingKeyEncryptionAlgorithm => "Key encryption algorithm not set",
+	DerError(e) => "DER error: {e}",
+	CmsBuilderError(e) => "CMS builder error: {e}",
+});
 
 #[cfg(not(feature = "derive"))]
 crate::impl_from!(der::Error => KariBuilderError::DerError);

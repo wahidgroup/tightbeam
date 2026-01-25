@@ -436,17 +436,10 @@ pub enum UkmBuilderError {
 	ExtensionTooLarge { tag: u8, len: usize },
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for UkmBuilderError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			UkmBuilderError::DuplicateTag { tag } => write!(f, "Duplicate tag: {}", tag),
-			UkmBuilderError::ExtensionTooLarge { tag, len } => {
-				write!(f, "Extension too large (tag {} len {})", tag, len)
-			}
-		}
-	}
-}
+crate::impl_error_display!(UkmBuilderError {
+	DuplicateTag { tag } => "Duplicate tag: {tag}",
+	ExtensionTooLarge { tag, len } => "Extension too large (tag {tag} len {len})",
+});
 
 pub type UkmResult<T> = ::core::result::Result<T, UkmBuilderError>;
 

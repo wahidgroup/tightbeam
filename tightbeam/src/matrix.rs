@@ -14,20 +14,10 @@ pub enum MatrixError {
 	LengthMismatch { n: u8, len: usize },
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for MatrixError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			MatrixError::InvalidN(n) => write!(f, "Asn1Matrix: n MUST be in 1..=255 (got {n})"),
-			MatrixError::LengthMismatch { n, len } => {
-				write!(f, "Asn1Matrix: data length MUST equal n*n (n={n}, len={len})")
-			}
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for MatrixError {}
+crate::impl_error_display!(MatrixError {
+	InvalidN(n) => "Asn1Matrix: n MUST be in 1..=255 (got {n})",
+	LengthMismatch { n, len } => "Asn1Matrix: data length MUST equal n*n (n={n}, len={len})",
+});
 
 /// A common interface for NxN flag matrices (u8 cells), row-major.
 pub trait MatrixLike {

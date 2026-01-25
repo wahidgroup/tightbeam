@@ -49,39 +49,17 @@ impl From<ISOError> for StandardError {
 	}
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for RFCError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			RFCError::InvalidSeverityValue(v) => write!(f, "invalid RFC5424 severity value: {v}"),
-			RFCError::InvalidSeverityName(s) => write!(f, "invalid RFC5424 severity name: {s}"),
-			RFCError::Der(e) => write!(f, "DER error: {e}"),
-		}
-	}
-}
+#[cfg(feature = "standards-rfc")]
+crate::impl_error_display!(RFCError {
+	RFC5424Error(e) => "{e}",
+});
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for ISOError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			ISOError::Message(s) => write!(f, "ISO error: {s}"),
-		}
-	}
-}
+#[cfg(feature = "standards-iso")]
+crate::impl_error_display!(ISOError {
+	Message(s) => "ISO error: {s}",
+});
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for StandardError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			StandardError::RFC(e) => write!(f, "{e}"),
-			StandardError::ISO(e) => write!(f, "{e}"),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for RFCError {}
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for ISOError {}
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for StandardError {}
+crate::impl_error_display!(StandardError {
+	RFC(e) => "{e}",
+	ISO(e) => "{e}",
+});

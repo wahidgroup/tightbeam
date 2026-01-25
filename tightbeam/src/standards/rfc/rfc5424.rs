@@ -77,15 +77,7 @@ pub enum RFC5424Error {
 	InvalidSeverityName(String),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for RFC5424Error {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			RFC5424Error::InvalidSeverityValue(v) => write!(f, "invalid RFC5424 severity value: {v}"),
-			RFC5424Error::InvalidSeverityName(s) => write!(f, "invalid RFC5424 severity name: {s}"),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for RFC5424Error {}
+crate::impl_error_display!(RFC5424Error {
+	InvalidSeverityValue(v) => "invalid RFC5424 severity value: {v}",
+	InvalidSeverityName(s) => "invalid RFC5424 severity name: {s}",
+});

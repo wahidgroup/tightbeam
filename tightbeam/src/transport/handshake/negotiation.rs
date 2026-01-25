@@ -75,19 +75,11 @@ pub enum NegotiationError {
 	DerError(crate::der::Error),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for NegotiationError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			Self::NoMutualProfile => write!(f, "No mutually supported security profile"),
-			Self::EmptyOffer => write!(f, "Security offer is empty"),
-			Self::DerError(e) => write!(f, "DER encoding error: {}", e),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for NegotiationError {}
+crate::impl_error_display!(NegotiationError {
+	NoMutualProfile => "No mutually supported security profile",
+	EmptyOffer => "Security offer is empty",
+	DerError(e) => "DER encoding error: {e}",
+});
 
 impl From<crate::der::Error> for NegotiationError {
 	fn from(e: crate::der::Error) -> Self {

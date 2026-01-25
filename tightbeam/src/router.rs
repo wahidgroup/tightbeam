@@ -20,17 +20,9 @@ pub enum RouterError {
 	UnknownRoute,
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for RouterError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			RouterError::UnknownRoute(msg) => write!("No route configured for provided message"),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for RouterError {}
+crate::impl_error_display!(RouterError {
+	UnknownRoute => "No route configured for provided message",
+});
 
 pub trait RouterPolicy: Send + Sync {
 	fn dispatch<T: Message + Send + 'static>(&self, message: Arc<Frame>) -> Result<()>;

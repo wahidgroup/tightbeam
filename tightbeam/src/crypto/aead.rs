@@ -5,38 +5,35 @@ pub use aes_gcm::{Aes128Gcm, Aes256Gcm, Key as Aes256GcmKey, Nonce as Aes256GcmN
 #[cfg(feature = "transport")]
 pub use aes_kw;
 
-#[cfg(feature = "aes-gcm")]
-use crate::der::oid::{AssociatedOid, ObjectIdentifier};
-
+use crate::asn1::ObjectIdentifier;
 use crate::crypto::common::typenum::Unsigned;
+use crate::der::oid::AssociatedOid;
 
-/// Wrapper type for AES-128-GCM with the OID
+// OID wrapper types for AEAD ciphers
 #[cfg(feature = "aes-gcm")]
-pub struct Aes128GcmOid;
+mod oid_wrappers {
+	crate::define_oid_wrapper!(
+		/// AES-128-GCM cipher OID wrapper
+		Aes128GcmOid,
+		"2.16.840.1.101.3.4.1.6"
+	);
 
-#[cfg(feature = "aes-gcm")]
-impl AssociatedOid for Aes128GcmOid {
-	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.6");
+	crate::define_oid_wrapper!(
+		/// AES-256-GCM cipher OID wrapper
+		/// Note: The `aes-gcm` crate does not implement `AssociatedOid` directly.
+		Aes256GcmOid,
+		"2.16.840.1.101.3.4.1.46"
+	);
+
+	crate::define_oid_wrapper!(
+		/// AES-128-CM cipher OID wrapper
+		Aes128cmOid,
+		"2.16.840.1.101.3.4.1.6"
+	);
 }
 
-/// Wrapper type for AES-256-GCM with the OID
-/// Note: The `aes-gcm` crate does not implement `AssociatedOid` directly.
 #[cfg(feature = "aes-gcm")]
-pub struct Aes256GcmOid;
-
-#[cfg(feature = "aes-gcm")]
-impl AssociatedOid for Aes256GcmOid {
-	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.46");
-}
-
-/// Wrapper type for AES-128-GCM with the OID
-#[cfg(feature = "aes-gcm")]
-pub struct Aes128cmOid;
-
-#[cfg(feature = "aes-gcm")]
-impl AssociatedOid for Aes128cmOid {
-	const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.6");
-}
+pub use oid_wrappers::*;
 
 /// Object-safe AEAD trait for runtime polymorphism.
 ///
@@ -120,6 +117,61 @@ impl RuntimeAead {
 	}
 }
 
+// ============================================================================
+// Helper Functions for EncryptedContentInfo
+// ============================================================================
+
+/// Build an EncryptedContentInfo structure from components.
+///
+/// This helper encapsulates the common logic for constructing EncryptedContentInfo
+/// from a ciphertext, nonce, content type, and algorithm OID.
+#[inline]
+fn build_encrypted_content_info(
+	ciphertext: Vec<u8>,
+	nonce: &[u8],
+	content_type: Option<ObjectIdentifier>,
+	algorithm_oid: ObjectIdentifier,
+) -> crate::error::Result<crate::EncryptedContentInfo> {
+	let content_type = content_type.unwrap_or(crate::oids::DATA);
+
+	// Store the nonce in the algorithm parameters as an OctetString
+	let nonce_octet_string = crate::der::asn1::OctetString::new(nonce)?;
+	let parameters = Some(crate::der::Any::encode_from(&nonce_octet_string)?);
+
+	let content_enc_alg = crate::AlgorithmIdentifier { oid: algorithm_oid, parameters };
+	let encrypted_content = Some(crate::der::asn1::OctetString::new(ciphertext)?);
+
+	Ok(crate::EncryptedContentInfo { content_type, content_enc_alg, encrypted_content })
+}
+
+/// Extract nonce and ciphertext from EncryptedContentInfo.
+///
+/// Returns (nonce_bytes, ciphertext_bytes) extracted from the info structure.
+#[inline]
+fn extract_nonce_and_ciphertext(info: &crate::EncryptedContentInfo) -> crate::error::Result<(Vec<u8>, &[u8])> {
+	// Extract ciphertext
+	let ciphertext = info
+		.encrypted_content
+		.as_ref()
+		.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
+		.as_bytes();
+
+	// Extract nonce from algorithm parameters
+	let nonce_any = info
+		.content_enc_alg
+		.parameters
+		.as_ref()
+		.ok_or(crate::TightBeamError::MissingEncryptionInfo)?;
+
+	// Decode the nonce from the Any type - use decode_as to get the OctetString
+	let nonce_octet_string: crate::der::asn1::OctetString = nonce_any.decode_as()?;
+	Ok((nonce_octet_string.into_bytes(), ciphertext))
+}
+
+// ============================================================================
+// Encryptor/Decryptor Traits
+// ============================================================================
+
 /// Trait for encrypting data and producing EncryptedContentInfo
 pub trait Encryptor<C>
 where
@@ -153,17 +205,9 @@ where
 		nonce: impl AsRef<[u8]>,
 		content_type: Option<ObjectIdentifier>,
 	) -> crate::error::Result<crate::EncryptedContentInfo> {
-		let nonce_ref = nonce.as_ref().into();
-		let ciphertext = self.encrypt(nonce_ref, data.as_ref())?;
-		let content_type = content_type.unwrap_or(crate::oids::DATA);
-
-		// Store the nonce in the algorithm parameters as an OctetString
-		let nonce_octet_string = crate::der::asn1::OctetString::new(nonce.as_ref())?;
-		let parameters = Some(crate::der::Any::encode_from(&nonce_octet_string)?);
-
-		let content_enc_alg = crate::AlgorithmIdentifier { oid: C::OID, parameters };
-		let encrypted_content = Some(crate::der::asn1::OctetString::new(ciphertext)?);
-		Ok(crate::EncryptedContentInfo { content_type, content_enc_alg, encrypted_content })
+		let nonce_bytes = nonce.as_ref();
+		let ciphertext = self.encrypt(nonce_bytes.into(), data.as_ref())?;
+		build_encrypted_content_info(ciphertext, nonce_bytes, content_type, C::OID)
 	}
 }
 
@@ -173,26 +217,8 @@ where
 	A: Aead,
 {
 	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
-		// Extract ciphertext
-		let ciphertext = info
-			.encrypted_content
-			.as_ref()
-			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
-			.as_bytes();
-
-		// Extract nonce from algorithm parameters
-		let nonce_any = info
-			.content_enc_alg
-			.parameters
-			.as_ref()
-			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?;
-
-		// Decode the nonce from the Any type - use decode_as to get the OctetString
-		let nonce_octet_string: crate::der::asn1::OctetString = nonce_any.decode_as()?;
-		let nonce_ref = nonce_octet_string.as_bytes().into();
-
-		// Decrypt
-		let plaintext = self.decrypt(nonce_ref, ciphertext)?;
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info)?;
+		let plaintext = self.decrypt(nonce_bytes.as_slice().into(), ciphertext)?;
 		Ok(plaintext)
 	}
 }
@@ -209,43 +235,17 @@ impl RuntimeAead {
 		nonce: impl AsRef<[u8]>,
 		content_type: Option<ObjectIdentifier>,
 	) -> crate::error::Result<crate::EncryptedContentInfo> {
-		let ciphertext = self.cipher.encrypt_bytes(nonce.as_ref(), data.as_ref())?;
-		let content_type = content_type.unwrap_or(crate::oids::DATA);
-
-		// Store the nonce in the algorithm parameters as an OctetString
-		let nonce_octet_string = crate::der::asn1::OctetString::new(nonce.as_ref())?;
-		let parameters = Some(crate::der::Any::encode_from(&nonce_octet_string)?);
-
-		// Use the runtime OID stored in this RuntimeAead
-		let content_enc_alg = crate::AlgorithmIdentifier { oid: self.oid, parameters };
-		let encrypted_content = Some(crate::der::asn1::OctetString::new(ciphertext)?);
-		Ok(crate::EncryptedContentInfo { content_type, content_enc_alg, encrypted_content })
+		let nonce_bytes = nonce.as_ref();
+		let ciphertext = self.cipher.encrypt_bytes(nonce_bytes, data.as_ref())?;
+		build_encrypted_content_info(ciphertext, nonce_bytes, content_type, self.oid)
 	}
 }
 
 // Implement Decryptor for RuntimeAead
 impl Decryptor for RuntimeAead {
 	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
-		// Extract ciphertext
-		let ciphertext = info
-			.encrypted_content
-			.as_ref()
-			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
-			.as_bytes();
-
-		// Extract nonce from algorithm parameters
-		let nonce_any = info
-			.content_enc_alg
-			.parameters
-			.as_ref()
-			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?;
-
-		// Decode the nonce from the Any type - use decode_as to get the OctetString
-		let nonce_octet_string: crate::der::asn1::OctetString = nonce_any.decode_as()?;
-		let nonce_bytes = nonce_octet_string.as_bytes();
-
-		// Decrypt using the type-erased cipher
-		let plaintext = self.cipher.decrypt_bytes(nonce_bytes, ciphertext)?;
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info)?;
+		let plaintext = self.cipher.decrypt_bytes(&nonce_bytes, ciphertext)?;
 		Ok(plaintext)
 	}
 }

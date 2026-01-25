@@ -98,42 +98,26 @@ pub enum CertificateValidationError {
 	SkidCollision,
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for CertificateValidationError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			CertificateValidationError::Expired => write!(f, "Certificate has expired"),
-			CertificateValidationError::NotYetValid => write!(f, "Certificate is not yet valid"),
-			CertificateValidationError::EmptyPublicKey => write!(f, "Certificate has empty subject public key"),
-			CertificateValidationError::EmptySignature => write!(f, "Certificate has empty signature"),
-			CertificateValidationError::InvalidTimestamp => write!(f, "Invalid timestamp"),
-			CertificateValidationError::UnsupportedAlgorithm(oid) => {
-				write!(f, "Unsupported signature algorithm: {}", oid)
-			}
-			CertificateValidationError::PublicKeyError(e) => write!(f, "Invalid public key: {}", e),
-			CertificateValidationError::SignatureVerificationFailed(e) => {
-				write!(f, "Signature verification failed: {}", e)
-			}
-			CertificateValidationError::EncodingError(e) => write!(f, "DER encoding error: {}", e),
-			CertificateValidationError::AlgorithmMismatch => {
-				write!(f, "Signature algorithm mismatch between TBS certificate and certificate")
-			}
-			CertificateValidationError::SpkiError(e) => write!(f, "SPKI error: {}", e),
-			CertificateValidationError::PublicKeyNotPinned => write!(f, "Public key not in pinned set"),
-			CertificateValidationError::CertificateNotPinned => {
-				write!(f, "Certificate fingerprint not in pinned set")
-			}
-			CertificateValidationError::CertificateDenied => write!(f, "Certificate is denied"),
-			CertificateValidationError::InvalidCertificateEncoding => write!(f, "Invalid certificate encoding"),
-			CertificateValidationError::StoreSealed => write!(f, "Trust store is sealed"),
-			CertificateValidationError::CertificateNotTrusted => write!(f, "Certificate not trusted"),
-			CertificateValidationError::InvalidChain => write!(f, "Invalid certificate chain"),
-			CertificateValidationError::EmptyChain => write!(f, "Empty certificate chain"),
-			CertificateValidationError::UnsupportedOperation => write!(f, "Operation not supported"),
-			CertificateValidationError::SkidCollision => write!(f, "SKID collision detected"),
-		}
-	}
-}
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for CertificateValidationError {}
+crate::impl_error_display!(CertificateValidationError {
+	Expired => "Certificate has expired",
+	NotYetValid => "Certificate is not yet valid",
+	EmptyPublicKey => "Certificate has empty subject public key",
+	EmptySignature => "Certificate has empty signature",
+	InvalidTimestamp => "Invalid timestamp",
+	UnsupportedAlgorithm(oid) => "Unsupported signature algorithm: {oid}",
+	PublicKeyError(e) => "Invalid public key: {e}",
+	SignatureVerificationFailed(e) => "Signature verification failed: {e}",
+	EncodingError(e) => "DER encoding error: {e}",
+	AlgorithmMismatch => "Signature algorithm mismatch between TBS certificate and certificate",
+	SpkiError(e) => "SPKI error: {e}",
+	PublicKeyNotPinned => "Public key not in pinned set",
+	CertificateNotPinned => "Certificate fingerprint not in pinned set",
+	CertificateDenied => "Certificate is denied",
+	InvalidCertificateEncoding => "Invalid certificate encoding",
+	StoreSealed => "Trust store is sealed",
+	CertificateNotTrusted => "Certificate not trusted",
+	InvalidChain => "Invalid certificate chain",
+	EmptyChain => "Empty certificate chain",
+	UnsupportedOperation => "Operation not supported",
+	SkidCollision => "SKID collision detected",
+});
