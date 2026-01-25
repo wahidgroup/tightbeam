@@ -9,6 +9,10 @@
 /// - Academic tools (UPPAAL, TIMES) via XML/TCTL formats
 /// - Documentation tools via Markdown reports
 /// - Standards compliance (DO-178C) via human-readable reports
+///
+/// Default implementations return stub content indicating the format
+/// is not yet implemented. Override in concrete types to provide
+/// actual export functionality.
 pub trait ScenarioResultExport {
 	/// Export to Markdown (human-readable report)
 	///
@@ -21,8 +25,7 @@ pub trait ScenarioResultExport {
 	///
 	/// A Markdown-formatted string containing all test results
 	fn to_markdown(&self) -> String {
-		// TODO: Generate Markdown report for documentation
-		todo!("Markdown export not yet implemented")
+		String::from("<!-- Markdown export not yet implemented -->")
 	}
 
 	/// Export to UPPAAL XML format for timed automata verification
@@ -34,8 +37,7 @@ pub trait ScenarioResultExport {
 	///
 	/// An UPPAAL-compatible XML string
 	fn to_uppaal(&self) -> String {
-		// TODO: Generate UPPAAL XML format
-		todo!("UPPAAL export not yet implemented")
+		String::from("<!-- UPPAAL export not yet implemented -->")
 	}
 
 	/// Export to TCTL (Timed Computation Tree Logic) specification
@@ -47,8 +49,7 @@ pub trait ScenarioResultExport {
 	///
 	/// A TCTL specification string
 	fn to_tctl(&self) -> String {
-		// TODO: Generate TCTL specification
-		todo!("TCTL export not yet implemented")
+		String::from("-- TCTL export not yet implemented")
 	}
 
 	/// Export to FDR4 format
@@ -60,7 +61,6 @@ pub trait ScenarioResultExport {
 	///
 	/// A FDR4 format string
 	fn to_fdr4(&self) -> String {
-		// TODO: Generate FDR4 format
-		todo!("FDR4 export not yet implemented")
+		String::from("-- FDR4 export not yet implemented")
 	}
 }

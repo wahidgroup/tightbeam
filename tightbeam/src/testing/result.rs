@@ -200,29 +200,5 @@ impl Display for ScenarioResult {
 	}
 }
 
-// Implement ScenarioResultExport trait with stub implementations
-impl ScenarioResultExport for ScenarioResult {
-	/// Export to Markdown (human-readable report)
-	fn to_markdown(&self) -> String {
-		// Implementation deferred - return error indicating not yet implemented
-		todo!("Markdown export not yet implemented")
-	}
-
-	/// Export to UPPAAL XML format for timed automata verification
-	fn to_uppaal(&self) -> String {
-		// Implementation deferred - return error indicating not yet implemented
-		todo!("UPPAAL export not yet implemented")
-	}
-
-	/// Export to TCTL (Timed Computation Tree Logic) specification
-	fn to_tctl(&self) -> String {
-		// Implementation deferred - return error indicating not yet implemented
-		todo!("TCTL export not yet implemented")
-	}
-
-	// Export to FDR4 format
-	fn to_fdr4(&self) -> String {
-		// Implementation deferred - return error indicating not yet implemented
-		todo!("FDR4 export not yet implemented")
-	}
-}
+// Use trait default implementations (non-panicking stubs)
+impl ScenarioResultExport for ScenarioResult {}

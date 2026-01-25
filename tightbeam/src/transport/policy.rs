@@ -11,29 +11,48 @@ use crate::transport::error::TransportFailure;
 use crate::{Frame, Message};
 
 /// Trait for transports that support policy configuration
+///
+/// Default implementations are no-ops that return `self` unchanged.
+/// Transports that support specific policies should override the
+/// relevant methods.
 pub trait PolicyConf
 where
 	Self: Sized,
 {
+	/// Configure restart policy for the transport.
+	///
+	/// Default: no-op (policy ignored if transport doesn't support it).
 	fn with_restart<P: RestartPolicy + 'static>(self, _: P) -> Self {
-		unimplemented!("Restart policy is not supported on this transport");
+		self
 	}
 
+	/// Configure emitter gate policy.
+	///
+	/// Default: no-op (policy ignored if transport doesn't support it).
 	fn with_emitter_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
-		unimplemented!("Emitter gate is not supported on this transport");
+		self
 	}
 
+	/// Configure collector gate policy.
+	///
+	/// Default: no-op (policy ignored if transport doesn't support it).
 	fn with_collector_gate<G: GatePolicy + 'static>(self, _: G) -> Self {
-		unimplemented!("Collector gate is not supported on this transport");
+		self
 	}
 
+	/// Configure receptor gate policy.
+	///
+	/// Default: no-op (policy ignored if transport doesn't support it).
 	fn with_receptor_gate<T: Message, R: ReceptorPolicy<T> + 'static>(self, _: R) -> Self {
-		unimplemented!("Receptor policy is not supported on this transport");
+		self
 	}
 
+	/// Configure timeout for transport operations.
+	///
+	/// Default: no-op (timeout ignored if transport doesn't support it).
 	#[cfg(feature = "std")]
 	fn with_timeout(self, _: std::time::Duration) -> Self {
-		unimplemented!("Timeout is not supported on this transport");
+		self
 	}
 }
 
