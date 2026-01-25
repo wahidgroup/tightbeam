@@ -4,17 +4,17 @@
 //! for pure spec-driven CBVOC testing. Specs declaratively describe
 //! expected behavior; the framework automatically verifies traces.
 
+use super::error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation};
 use crate::error::ReceivedExpectedError;
-use crate::policy::TransitStatus;
 use crate::testing::assertions::AssertionContract;
 use crate::trace::{ConsumedTrace, ExecutionMode};
 use crate::utils::urn::Urn;
 use crate::Frame;
 
-use super::error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation};
-
 #[cfg(feature = "instrument")]
 use super::error::EventOrderViolationDetail;
+#[cfg(feature = "policy")]
+use crate::policy::TransitStatus;
 
 /// Spec trait defining expected test behavior.
 ///

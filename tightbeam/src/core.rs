@@ -1,4 +1,5 @@
 use crate::asn1::OctetString;
+#[cfg(feature = "crypto")]
 use crate::crypto::profiles::SecurityProfile;
 use crate::der::{Encode, EncodeValue, Tagged};
 use crate::error::Result;
@@ -6,6 +7,8 @@ use crate::{Frame, Metadata, TightBeamError, Version};
 
 #[cfg(feature = "compress")]
 use crate::compress::Inflator;
+#[cfg(not(feature = "compress"))]
+pub trait Inflator {}
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{SignatureEncoding, Verifier};
 #[cfg(feature = "aead")]
@@ -265,7 +268,6 @@ impl Frame {
 	/// Returns an error if:
 	/// - Compression was used but no inflator was provided
 	/// - Decompression fails
-	#[cfg(feature = "compress")]
 	pub fn decompress(plaintext: Vec<u8>, was_compressed: bool, inflator: Option<&dyn Inflator>) -> Result<Vec<u8>> {
 		if was_compressed {
 			let inflator = inflator.ok_or(TightBeamError::MissingInflator)?;
@@ -274,11 +276,13 @@ impl Frame {
 			Ok(plaintext)
 		}
 	}
+}
 
+#[cfg(not(feature = "compress"))]
+impl Frame {
 	/// Decompress the plaintext bytes if compression was used.
 	///
 	/// This is a no-op when the `compress` feature is disabled.
-	#[cfg(not(feature = "compress"))]
 	pub fn decompress(plaintext: Vec<u8>, was_compressed: bool, _inflator: Option<&dyn Inflator>) -> Result<Vec<u8>> {
 		if was_compressed {
 			Err(TightBeamError::MissingFeature("compress"))

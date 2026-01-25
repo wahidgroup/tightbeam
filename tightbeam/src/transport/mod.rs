@@ -35,7 +35,7 @@ pub use builders::{EnvelopeBuilder, EnvelopeLimits};
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, MessageIO, Pingable};
-pub use messaging::{MessageCollector, MessageEmitter, ResponseHandler, Transport};
+pub use messaging::{MessageCollector, ResponseHandler, Transport};
 pub use protocols::{
 	AsyncListenerTrait, EncryptedProtocol, Mycelial, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
 	X509ClientConfig,
@@ -47,6 +47,8 @@ pub use client::GenericClient;
 pub use client::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
 pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
+#[cfg(feature = "transport-policy")]
+pub use messaging::MessageEmitter;
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;

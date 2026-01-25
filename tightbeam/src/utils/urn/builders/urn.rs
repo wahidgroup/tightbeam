@@ -1,5 +1,7 @@
 //! URN builder for constructing URNs with validation
 
+use crate::utils::urn::{Urn, UrnComponents, UrnSpec, UrnValidationError};
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
@@ -9,8 +11,8 @@ use alloc::{borrow::Cow, boxed::Box, vec::Vec};
 #[cfg(feature = "std")]
 use std::{borrow::Cow, boxed::Box, collections::HashMap};
 
+#[cfg(feature = "builder")]
 use crate::builder::TypeBuilder;
-use crate::utils::urn::{Urn, UrnComponents, UrnSpec, UrnValidationError};
 
 /// Spec builder function type
 type SpecBuilderFn<'a> = dyn FnOnce(&mut UrnBuilder<'a>) -> Result<Cow<'static, str>, UrnValidationError> + 'a;

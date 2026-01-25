@@ -16,24 +16,27 @@ use alloc::{
 	sync::{Arc, Mutex},
 };
 
-use crate::crypto::hash::{Digest, Sha3_256};
-use crate::policy::TransitStatus;
 use crate::testing::assertions::{Assertion, AssertionLabel, AssertionValue};
 use crate::trace::TraceConfigBuilder;
-use crate::transport::error::TransportError;
 use crate::utils::urn::Urn;
 use crate::Frame;
 
 #[cfg(feature = "testing-fault")]
 use crate::constants::DEFAULT_FAULT_SEED;
+#[cfg(feature = "digest")]
+use crate::crypto::hash::{Digest, Sha3_256};
 #[cfg(feature = "instrument")]
 use crate::instrumentation::{events, TbEvent, TbInstrumentationConfig};
+#[cfg(feature = "policy")]
+use crate::policy::TransitStatus;
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::FaultModel;
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::InjectionStrategy;
 #[cfg(feature = "logging")]
 use crate::trace::logging::LogRecord;
+#[cfg(feature = "transport")]
+use crate::transport::error::TransportError;
 
 /// Trait for converting types into event labels
 pub trait IntoEventLabel {

@@ -76,6 +76,7 @@ full = [
 	"transport",
 	"transport-policy",
 	"transport-cms",
+	"transport-ecies",
 	"tcp",
 	"aead",
 	"x509",
@@ -125,7 +126,7 @@ colony = ["full"]
 testing = ["std"]
 testing-csp = ["testing"]
 testing-fdr = ["testing", "testing-csp"]
-testing-timing = ["testing", "time"]
+testing-timing = ["testing", "time", "instrument"]
 testing-schedulability = ["testing", "testing-timing"]
 testing-fault = ["testing", "testing-fdr"]
 testing-fmea = ["testing", "testing-fault"]
@@ -162,7 +163,7 @@ digest = ["crypto", "dep:digest", "tightbeam-derive?/digest"]
 x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
 ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
-ecdh = []
+ecdh = ["elliptic-curve/ecdh"]
 kem = ["crypto", "dep:kem"]
 
 ## Security features
@@ -177,8 +178,10 @@ secp256k1 = ["crypto", "dep:k256"]
 ## Handshake protocol features
 transport-cms = [
 	"transport",
+	"transport-policy",
 	"builder",
 	"aead",
+	"aes-gcm",
 	"signature",
 	"digest",
 	"kdf",
@@ -186,8 +189,23 @@ transport-cms = [
 	"sha3",
 	"secp256k1",
 	"x509",
+	"ecdh",
 ]
-transport-ecies = ["transport", "ecies", "x509"]
+transport-ecies = [
+	"transport",
+	"transport-policy",
+	"builder",
+	"ecies",
+	"aead",
+	"aes-gcm",
+	"signature",
+	"digest",
+	"kdf",
+	"sha3",
+	"secp256k1",
+	"x509",
+	"ecdh",
+]
 
 # Derive macro support
 derive = ["dep:tightbeam-derive"]

@@ -13,7 +13,6 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 use std::borrow::Cow;
 
 use crate::asn1::{MessagePriority, Version};
-use crate::instrumentation::events::TIGHTBEAM_INSTRUMENTATION_NSS;
 use crate::testing::macros::Cardinality;
 
 #[cfg(feature = "policy")]
@@ -29,7 +28,7 @@ impl AssertionLabel {
 	///
 	/// Returns true if:
 	/// - Labels are exactly equal, OR
-	/// - `self` (recorded) contains `instrumentation:event/{other}` (shorthand)
+	/// - `self` (recorded) ends with `/{other}` (shorthand)
 	///
 	/// This allows specs to use shorthand like `"create_frame_start"` to match
 	/// recorded URNs like `"urn:tightbeam:instrumentation:event/create_frame_start"`.
@@ -38,10 +37,10 @@ impl AssertionLabel {
 			return true;
 		}
 
-		// Try shorthand matching: recorded contains "instrumentation:event/{expected}"
+		// Try shorthand matching: recorded ends with /{expected}
 		let (Self::Custom(recorded), Self::Custom(expected)) = (self, other);
-		let suffix = [TIGHTBEAM_INSTRUMENTATION_NSS, expected.as_ref()].concat();
-		recorded.contains(&suffix)
+		let pattern = ["/", expected.as_ref()].concat();
+		recorded.ends_with(&pattern)
 	}
 }
 

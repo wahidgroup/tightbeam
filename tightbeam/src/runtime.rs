@@ -111,6 +111,7 @@ pub mod rt {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
+#[allow(unsafe_code)]
 pub mod rt {
 	use core::{
 		future::Future,

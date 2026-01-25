@@ -11,21 +11,27 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 #[cfg(feature = "std")]
 use std::time::Instant;
 
-use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::{key::SigningKeyProvider, x509::CertificateSpec};
 use crate::transport::client::GenericClient;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::handshake::HandshakeKeyManager;
-use crate::transport::policy::PolicyConf;
 use crate::transport::protocols::{PersistentConnection, Protocol};
-use crate::transport::{MessageCollector, MessageEmitter, TransportResult, X509ClientConfig};
+use crate::transport::MessageCollector;
+use crate::transport::{TransportResult, X509ClientConfig};
 
+#[cfg(feature = "aes-gcm")]
+use crate::crypto::profiles::DefaultCryptoProvider;
 #[cfg(feature = "x509")]
 use crate::crypto::x509::store::CertificateTrust;
 #[cfg(feature = "x509")]
 use crate::crypto::x509::Certificate;
 #[cfg(not(feature = "x509"))]
 use crate::transport::client::ClientBuilder;
+#[cfg(feature = "transport-policy")]
+use crate::transport::policy::PolicyConf;
+#[cfg(feature = "transport-policy")]
+use crate::transport::MessageEmitter;
 
 /// Builder trait for connection configuration
 ///

@@ -70,10 +70,6 @@ setup:
 build:
 	@echo "Building tightbeam..."
 	cargo build --release $(if $(features),--features "$(features)")
-	@echo "Generating feature test scripts..."
-	mkdir -p built
-	rustc utils/generate_feature_tests.rs -o built/generate_feature_tests
-	./built/generate_feature_tests --output-dir built
 
 # Clean build artifacts
 clean:
@@ -93,9 +89,9 @@ test: build
 	cargo test $(if $(features),--features "$(features)") $(if $(no-default),--no-default-features)
 
 # Run tests with all feature combinations
-test-all: build
+test-all: build  ## Run curated feature combination tests
 	@echo "Running tests with all feature combinations..."
-	./built/test_all_features.sh
+	./scripts/test_features.sh
 
 # Build AFL-instrumented fuzz targets
 fuzz-build:

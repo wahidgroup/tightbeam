@@ -179,7 +179,6 @@ use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientI
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
 use crate::crypto::aead::{KeyInit, RuntimeAead};
-use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -191,12 +190,18 @@ use crate::der::asn1::SetOfVec;
 use crate::der::{Decode, Encode, Enumerated, Sequence};
 use crate::spki::EncodePublicKey;
 use crate::transport::error::TransportError;
-use crate::transport::handshake::client::EciesHandshakeClient;
-use crate::transport::handshake::client::ExtractVerifyingKey;
 use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
-use crate::transport::handshake::server::EciesHandshakeServer;
 use crate::Beamable;
+
+#[cfg(feature = "transport-ecies")]
+use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+#[cfg(feature = "transport-ecies")]
+use crate::transport::handshake::client::EciesHandshakeClient;
+#[cfg(feature = "transport-ecies")]
+use crate::transport::handshake::client::ExtractVerifyingKey;
+#[cfg(feature = "transport-ecies")]
+use crate::transport::handshake::server::EciesHandshakeServer;
 
 #[cfg(feature = "std")]
 use std::time::Instant;
@@ -362,6 +367,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	///
 	/// # Returns
 	/// A boxed ECIES server handshake orchestrator that uses the encapsulated key provider
+	#[cfg(feature = "transport-ecies")]
 	pub fn create_ecies_server<'a>(
 		&'a self,
 		server_cert: Arc<Certificate>,
@@ -398,6 +404,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	///
 	/// # Returns
 	/// An ECIES client handshake orchestrator that uses the encapsulated key provider
+	#[cfg(feature = "transport-ecies")]
 	pub fn create_ecies_client<'a, M>(
 		&'a self,
 		_server_cert: Option<Arc<Certificate>>,

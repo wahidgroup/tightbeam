@@ -11,14 +11,20 @@ use core::time::Duration;
 
 use super::GenericClient;
 use crate::asn1::Frame;
-use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::error::TransportFailure;
-use crate::transport::{ConnectionBuilder, MessageCollector, MessageEmitter, Protocol, TransportResult};
+use crate::transport::{ConnectionBuilder, MessageCollector, Protocol, TransportResult};
+
+#[cfg(feature = "policy")]
+use crate::policy::{GatePolicy, TransitStatus};
+#[cfg(feature = "transport-policy")]
+use crate::transport::MessageEmitter;
 
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::key::SigningKeyProvider;
-	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+	pub use crate::crypto::profiles::CryptoProvider;
+	#[cfg(feature = "aes-gcm")]
+	pub use crate::crypto::profiles::DefaultCryptoProvider;
 	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::crypto::x509::CertificateSpec;
 	pub use crate::transport::handshake::HandshakeKeyManager;

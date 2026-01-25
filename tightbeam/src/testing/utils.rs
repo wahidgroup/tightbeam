@@ -113,18 +113,19 @@ pub fn create_v0_tightbeam(content: Option<&str>, id: Option<&str>) -> Frame {
 	let order: u64 = 1_700_000_000;
 
 	// Get a random id
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
 	let id = id.unwrap_or({
 		use crate::crypto::hash::{Digest, Sha3_256};
-		let mut bytes: [u8; 32] = [0; 32];
+		use crate::random::generate_random_bytes;
 
-		crate::random::generate_random_bytes(&mut bytes, None).expect("Failed to generate random bytes");
+		let mut bytes: [u8; 32] = [0; 32];
+		generate_random_bytes(&mut bytes, None).expect("Failed to generate random bytes");
 
 		let hash = Sha3_256::digest(bytes);
 		Box::leak(format!("{hash:x}").into_boxed_str())
 	});
 
-	#[cfg(not(feature = "std"))]
+	#[cfg(not(all(feature = "std", feature = "digest", feature = "random")))]
 	let id = id.unwrap_or("test-message-id");
 
 	#[cfg(feature = "derive")]

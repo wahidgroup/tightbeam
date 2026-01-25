@@ -26,7 +26,6 @@ mod x509 {
 	pub use crate::cms::enveloped_data::EnvelopedData;
 	pub use crate::cms::signed_data::SignedData;
 	pub use crate::crypto::aead::{Decryptor, KeyInit, RuntimeAead};
-	pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
 	pub use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc, TightbeamProfile};
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -35,19 +34,25 @@ mod x509 {
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::spki::EncodePublicKey;
 	pub use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
-	pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
 	pub use crate::transport::handshake::{
 		ClientHandshakeProtocol, ClientHello, ClientKeyExchange, HandshakeError, HandshakeFinalization,
 		HandshakeProtocolKind, ServerHandshake, TcpHandshakeState,
 	};
 	pub use crate::transport::state::EncryptedProtocolState;
+
+	#[cfg(feature = "transport-ecies")]
+	pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+	#[cfg(feature = "transport-ecies")]
+	pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
 }
 
 #[cfg(feature = "x509")]
 use x509::*;
 
-#[cfg(all(feature = "x509", feature = "tcp"))]
+#[cfg(all(feature = "transport-ecies", feature = "tcp"))]
 const HANDSHAKE_MAX_WIRE: usize = crate::transport::tcp::HANDSHAKE_MAX_WIRE;
+#[cfg(all(feature = "transport-ecies", not(feature = "tcp")))]
+const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB default
 
 /// Base I/O operations for message transport
 pub trait MessageIO: ResponseHandler {
@@ -253,7 +258,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 
 	/// Ensure handshake is complete, performing it if needed
-	#[cfg(feature = "x509")]
+	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn ensure_handshake_complete<P>(&mut self) -> TransportResult<()>
 	where
@@ -287,7 +292,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Perform client-side ECIES handshake without mutual authentication (K=() variant)
 	/// This is a helper method because K=() cannot be cast to trait object due to missing Signer bound
-	#[cfg(feature = "x509")]
+	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_client_handshake_no_mutual_auth<P>(&mut self) -> TransportResult<()>
 	where
@@ -389,7 +394,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 
 	/// Perform client-side handshake (extracted from macro)
-	#[cfg(feature = "x509")]
+	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_client_handshake<P>(&mut self) -> TransportResult<()>
 	where
@@ -429,6 +434,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let key_manager = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
 		let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = HandshakeError>> =
 			match (self.to_handshake_protocol_kind(), key_manager) {
+				#[cfg(feature = "transport-ecies")]
 				(HandshakeProtocolKind::Ecies, key) => {
 					// With trust store, validation happens via the validator callback
 					key.create_ecies_client::<crate::crypto::ecies::Secp256k1EciesMessage>(
@@ -437,6 +443,11 @@ pub trait EncryptedMessageIO: MessageIO {
 						None, // Use default AAD domain tag
 						validator,
 					)?
+				}
+
+				#[cfg(not(feature = "transport-ecies"))]
+				(HandshakeProtocolKind::Ecies, _) => {
+					return Err(TransportError::MissingEncryption); // ECIES not enabled
 				}
 
 				#[cfg(feature = "transport-cms")]
@@ -535,7 +546,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 
 	/// Perform server-side handshake (extracted from macro)
-	#[cfg(feature = "x509")]
+	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_server_handshake<P>(&mut self, handshake_bytes: &[u8]) -> TransportResult<()>
 	where
@@ -596,13 +607,13 @@ pub trait EncryptedMessageIO: MessageIO {
 					)?
 				}
 
-				#[cfg(all(feature = "aead", feature = "signature"))]
+				#[cfg(feature = "transport-cms")]
 				HandshakeProtocolKind::Cms => {
 					// Use factory method to create CMS server with concrete key type
 					key_manager.create_cms_server(client_validators.clone(), vec![])?
 				}
 
-				#[cfg(not(all(feature = "aead", feature = "signature")))]
+				#[cfg(not(feature = "transport-cms"))]
 				HandshakeProtocolKind::Cms => {
 					return Err(TransportError::MissingEncryption); // CMS not enabled
 				}

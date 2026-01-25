@@ -92,7 +92,7 @@
 
 // TODO Find a way
 #![allow(macro_expanded_macro_exports_accessed_by_absolute_paths)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]
@@ -132,7 +132,6 @@ pub mod compress;
 pub mod crypto;
 #[cfg(feature = "doc")]
 pub mod doc;
-#[cfg(feature = "builder")]
 pub mod macros;
 #[cfg(feature = "policy")]
 pub mod policy;

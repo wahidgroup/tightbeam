@@ -1,4 +1,7 @@
-use crate::{Asn1Matrix, Errorizable};
+use crate::Asn1Matrix;
+
+#[cfg(feature = "derive")]
+use crate::Errorizable;
 
 pub type MatrixResult<T> = core::result::Result<T, MatrixError>;
 

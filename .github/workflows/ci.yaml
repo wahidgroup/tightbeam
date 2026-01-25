@@ -37,12 +37,12 @@ jobs:
       - name: Run all feature combination tests
         run: make test-all
 
-  test-no-default:
-    name: Test (no default features)
+  test-features:
+    name: Feature Combinations
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests without default features
-        run: make test no-default=true features="testing"
+      - name: Run feature combination tests
+        run: ./scripts/test_features.sh

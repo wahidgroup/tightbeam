@@ -13,14 +13,14 @@ use core::time::Duration;
 
 use crate::testing::fdr::config::{Failure, FdrConfig, RefusalSet, Trace};
 use crate::testing::fdr::explorer::{ExplorationCore, ExplorationState, SeedResult, SeededRng};
-use crate::testing::fdr::subsys::timing::check_timing_violations;
 use crate::testing::specs::csp::{Action, Event, Process, State};
 
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::config::{FaultInjection, FaultModel, InjectedFaultRecord};
-
 #[cfg(feature = "testing-timing")]
 use crate::testing::fdr::subsys::timing::check_event_wcet_violation;
+#[cfg(feature = "testing-timing")]
+use crate::testing::fdr::subsys::timing::check_timing_violations;
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::{TimingConstraint, TimingConstraints};
 

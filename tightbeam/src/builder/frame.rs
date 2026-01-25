@@ -279,20 +279,20 @@ impl<T: Message> FrameBuilder<T> {
 		}
 
 		// Check if encryption is set when required
-		let has_encryption = self.encryptor.is_some();
-		if T::MUST_BE_CONFIDENTIAL && !has_encryption {
+		#[cfg(feature = "aead")]
+		if T::MUST_BE_CONFIDENTIAL && self.encryptor.is_none() {
 			return Err(TightBeamError::MissingEncryptionInfo);
 		}
 
 		// Check if signature is set when required
-		let has_signer = self.signer.is_some();
-		if T::MUST_BE_NON_REPUDIABLE && !has_signer {
+		#[cfg(feature = "signature")]
+		if T::MUST_BE_NON_REPUDIABLE && self.signer.is_none() {
 			return Err(TightBeamError::MissingSignatureInfo);
 		}
 
 		// Check if compression is set when required
-		let has_compression = self.compressor.is_some();
-		if T::MUST_BE_COMPRESSED && !has_compression {
+		#[cfg(feature = "compress")]
+		if T::MUST_BE_COMPRESSED && self.compressor.is_none() {
 			return Err(TightBeamError::MissingCompressedData);
 		}
 
@@ -301,8 +301,8 @@ impl<T: Message> FrameBuilder<T> {
 			return Err(TightBeamError::MissingDigestInfo);
 		}
 
-		let has_frame_integrity = self.witness.is_some();
-		if T::MUST_HAVE_FRAME_INTEGRITY && !has_frame_integrity {
+		#[cfg(feature = "digest")]
+		if T::MUST_HAVE_FRAME_INTEGRITY && self.witness.is_none() {
 			return Err(TightBeamError::MissingDigestInfo);
 		}
 

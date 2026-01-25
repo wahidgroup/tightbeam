@@ -23,6 +23,7 @@ pub mod urn;
 pub use basis_points::BasisPoints;
 
 // Re-exports
+#[cfg(feature = "hex")]
 pub use ::hex_literal::hex;
 
 /// Macro to implement From trait for both reference and owned types

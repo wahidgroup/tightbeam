@@ -20,7 +20,6 @@ use crate::transport::TransportResult;
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::aead::{Decryptor, KeyInit};
-	pub use crate::crypto::ecies::EciesPublicKeyOps;
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -29,6 +28,9 @@ mod x509 {
 	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::io::EncryptedMessageIO;
 	pub use crate::transport::state::EncryptedProtocolState;
+
+	#[cfg(feature = "transport-ecies")]
+	pub use crate::crypto::ecies::EciesPublicKeyOps;
 }
 
 #[cfg(feature = "x509")]
@@ -382,7 +384,7 @@ pub trait MessageCollector: MessageIO {
 	}
 
 	/// X509-enabled collect_message with encryption and handshake support
-	#[cfg(feature = "x509")]
+	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
 	where

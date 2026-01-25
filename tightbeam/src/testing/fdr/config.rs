@@ -225,12 +225,11 @@ impl Default for FdrConfig {
 			specs: Vec::new(),
 			fail_fast: true,
 			expect_failure: false,
+			scheduler_model: None,
 			#[cfg(feature = "testing-fault")]
 			scheduler_count: None,
 			#[cfg(feature = "testing-fault")]
 			process_count: None,
-			#[cfg(feature = "testing-fault")]
-			scheduler_model: None,
 			#[cfg(feature = "testing-fault")]
 			fault_model: None,
 			#[cfg(feature = "testing-fmea")]

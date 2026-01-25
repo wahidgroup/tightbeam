@@ -8,8 +8,8 @@ mod cms;
 #[cfg(feature = "transport-cms")]
 pub use cms::CmsHandshakeClient;
 
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 mod ecies;
 
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 pub use ecies::{EciesHandshakeClient, ExtractVerifyingKey};

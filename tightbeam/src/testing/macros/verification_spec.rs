@@ -2,23 +2,25 @@
 //! Provides label helpers, cardinality utilities, and the `BuiltAssertSpec`
 //! wrapper that implements `TBSpec`.
 
-use crate::crypto::hash::{Digest, Sha3_256};
-use crate::policy::TransitStatus;
 use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionValue};
 use crate::testing::specs::{SpecViolation, TBSpec};
 use crate::trace::{ConsumedTrace, ExecutionMode};
-use crate::Errorizable;
 
-#[cfg(feature = "testing-timing")]
-use crate::testing::schedulability::{SchedulerType, TaskSet};
-
-// TbEventKind removed - use events module constants instead
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(not(feature = "std"))]
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "std")]
 use std::borrow::Cow;
+
+#[cfg(feature = "digest")]
+use crate::crypto::hash::{Digest, Sha3_256};
+#[cfg(feature = "policy")]
+use crate::policy::TransitStatus;
+#[cfg(feature = "testing-timing")]
+use crate::testing::schedulability::{SchedulerType, TaskSet};
+#[cfg(feature = "derive")]
+use crate::Errorizable;
 
 // ---------------------------------------------------------------------------
 // Cardinality core

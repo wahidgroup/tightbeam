@@ -21,14 +21,15 @@
 
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::secret::Secret;
-use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
 use crate::transport::handshake::error::HandshakeError;
 
+#[cfg(feature = "ecdh")]
+use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 #[cfg(feature = "zeroize")]
-use zeroize::Zeroize;
+use crate::zeroize::Zeroize;
 
 /// Derive the shared secret via ECDH and wrap in Secret<Vec<u8>> for automatic zeroization.
 fn derive_shared_secret<C>(priv_key: &SecretKey<C>, peer_pub: &PublicKey<C>) -> Result<Secret<Vec<u8>>, HandshakeError>

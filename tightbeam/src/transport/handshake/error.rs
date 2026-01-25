@@ -212,6 +212,7 @@ pub enum HandshakeError {
 	InvalidTimestamp,
 
 	// ---------------- ECIES / encryption path ----------------
+	#[cfg(feature = "ecies")]
 	#[cfg_attr(feature = "derive", error("ECIES operation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	EciesError(crate::crypto::ecies::EciesError),

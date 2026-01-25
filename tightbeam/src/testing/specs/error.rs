@@ -1,13 +1,13 @@
 //! Spec verification error types
 
 use crate::error::ReceivedExpectedError;
-use crate::policy::TransitStatus;
 use crate::testing::assertions::AssertionLabel;
 use crate::trace::ExecutionMode;
 
+#[cfg(feature = "policy")]
+use crate::policy::TransitStatus;
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulabilityError, SchedulabilityResult};
-
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 

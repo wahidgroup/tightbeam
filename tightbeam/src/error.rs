@@ -13,6 +13,7 @@ use crate::Errorizable;
 pub type Result<T> = core::result::Result<T, TightBeamError>;
 
 /// A specialized Result type for compression operations
+#[cfg(feature = "compress")]
 pub type CompressionResult<T> = core::result::Result<T, CompressionError>;
 
 /// Error indicating a mismatch between received and expected values
@@ -189,6 +190,7 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	EciesError(crate::crypto::ecies::EciesError),
 
+	#[cfg(feature = "crypto")]
 	#[cfg_attr(feature = "derive", error("Crypto policy error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	CryptoPolicyError(crate::crypto::policy::CryptoPolicyError),
@@ -199,11 +201,13 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	CertificateValidationError(crate::crypto::x509::error::CertificateValidationError),
 
+	#[cfg(feature = "kdf")]
 	#[cfg_attr(feature = "derive", error("Key derivation error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	KeyDerivationError(crate::crypto::kdf::KdfError),
 
 	/// Error from key provider operations
+	#[cfg(feature = "crypto")]
 	#[cfg_attr(feature = "derive", error("Key provider error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	KeyError(crate::crypto::key::KeyError),
@@ -293,7 +297,6 @@ pub enum TightBeamError {
 	MissingDigestInfo,
 
 	/// Missing Compression Info
-	#[cfg(feature = "compress")]
 	#[cfg_attr(feature = "derive", error("Missing compression info"))]
 	MissingCompressedData,
 
@@ -407,7 +410,6 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingSignatureInfo => write!(f, "Missing signature info"),
 			#[cfg(feature = "signature")]
 			TightBeamError::MissingSignature => write!(f, "Missing signature"),
-			#[cfg(feature = "compress")]
 			TightBeamError::MissingCompressedData => write!(f, "Missing compression info"),
 			TightBeamError::InvalidAlgorithm => write!(f, "Invalid algorithm for message profile"),
 			TightBeamError::UnexpectedAlgorithm(err) => {
@@ -472,11 +474,11 @@ crate::impl_from!(der::Error => TightBeamError::SerializationError);
 crate::impl_from!(crate::matrix::MatrixError => TightBeamError::MatrixError);
 #[cfg(not(feature = "derive"))]
 crate::impl_from!(crate::utils::urn::UrnValidationError => TightBeamError::UrnValidationError);
-#[cfg(not(feature = "derive"))]
+#[cfg(all(feature = "crypto", not(feature = "derive")))]
 crate::impl_from!(crate::crypto::policy::CryptoPolicyError => TightBeamError::CryptoPolicyError);
-#[cfg(not(feature = "derive"))]
+#[cfg(all(feature = "kdf", not(feature = "derive")))]
 crate::impl_from!(crate::crypto::kdf::KdfError => TightBeamError::KeyDerivationError);
-#[cfg(not(feature = "derive"))]
+#[cfg(all(feature = "crypto", not(feature = "derive")))]
 crate::impl_from!(crate::crypto::key::KeyError => TightBeamError::KeyError);
 
 #[cfg(all(feature = "std", not(feature = "derive")))]

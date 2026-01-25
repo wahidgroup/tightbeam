@@ -318,7 +318,7 @@ pub trait KdfProvider {
 #[cfg(feature = "ecdh")]
 pub trait CurveProvider {
 	type Curve: Curve + CurveArithmetic;
-	#[cfg(feature = "x509")]
+	#[cfg(feature = "ecies")]
 	type EciesMessage: crate::crypto::ecies::EciesMessageOps;
 }
 
@@ -408,7 +408,7 @@ impl KdfProvider for DefaultCryptoProvider {
 #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 impl CurveProvider for DefaultCryptoProvider {
 	type Curve = k256::Secp256k1;
-	#[cfg(feature = "x509")]
+	#[cfg(feature = "ecies")]
 	type EciesMessage = crate::crypto::ecies::Secp256k1EciesMessage;
 }
 
