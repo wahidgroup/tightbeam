@@ -70,23 +70,23 @@ rayon = { version = "1.11.0", default-features = false }
 rand_core = { version = "0.6", default-features = false, features = [
 	"getrandom",
 ] }
-tokio = { version = "1.48.0", default-features = false, features = ["full"] }
-time = { version = "0.3.44", default-features = false, features = [
+tokio = { version = "1.50.0", default-features = false, features = ["full"] }
+time = { version = "0.3.47", default-features = false, features = [
 	"macros",
 	"alloc",
 ] }
 
 # Async utilities
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+futures = { version = "0.3.32", default-features = false, features = ["alloc"] }
 
 # Compression dependencies
-zeekstd = { version = "0.6.1", default-features = false }
+zeekstd = { version = "0.6.2", default-features = false }
 
 # Dev dependencies
 paste = { version = "1.0.15" }
 gumdrop = { version = "0.8.1" }
 rand = { version = "0.9" }
-trybuild = { version = "1.0", features = ["diff"] }
+trybuild = { version = "1.0.116", features = ["diff"] }
 fake = { version = "=4.3.0", features = [
 	"derive",
 	"uuid",
@@ -96,9 +96,9 @@ fake = { version = "=4.3.0", features = [
 ] }
 
 # Proc macro dependencies
-proc-macro2 = "1.0.103"
-quote = "1.0.42"
-syn = { version = "2.0.111", features = ["full", "derive"] }
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "2.0.117", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
-afl = { version = "0.17.0" }
+afl = { version = "0.17.1" }
