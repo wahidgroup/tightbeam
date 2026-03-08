@@ -1,10 +1,14 @@
-.PHONY: help help-ref version setup check build clean test lint doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz
+.PHONY: help help-ref version setup check build clean test lint doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release check-yanked
 
 # Project metadata for help/version
 PROJECT := tightbeam
 VERSION := $(shell awk -F\" '/^\s*version\s*=\s*"/{print $$2; exit}' Cargo.toml 2>/dev/null)
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null)
 GIT_DIRTY := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo "+dirty")
+
+# Extract version and flags from positional args (e.g., `make release v0.7.0 --derive`)
+RELEASE_VERSION := $(filter v%,$(MAKECMDGOALS))
+RELEASE_FLAGS   := $(filter-out --,$(filter --%,$(MAKECMDGOALS)))
 
 # Print wrapper function
 define PRINT_PAGER
@@ -35,7 +39,9 @@ help-body:
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
 	@printf '    lint            Run linters (pass extra clippy args via ARGS)\n'
-	@printf '    doc             Build documentation (all features)\n\n'
+	@printf '    doc             Build documentation (all features)\n'
+	@printf '    release         Release workflow (make release v0.7.0 [--dry-run] [--allow-staged] [--yank] [--derive])\n'
+	@printf '    check-yanked    Check if current version has been yanked\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'
 	@printf '    no-default      If set (e.g., 1/true), passes --no-default-features to Cargo\n'
@@ -252,6 +258,16 @@ endif
 	@:
 --%:
 	@:
+v%:
+	@:
+
+# Check if current version has been yanked
+check-yanked:
+	@./scripts/check-yanked.sh
+
+# Release workflow
+release:
+	@./scripts/release.sh "$(RELEASE_VERSION)" $(RELEASE_FLAGS)
 
 # Run linters
 lint:
