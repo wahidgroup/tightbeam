@@ -87,6 +87,10 @@ bump_version() {
 
 	mv "$tmpfile" "$toml_path"
 	git add "$toml_path"
+	if [[ -f Cargo.lock ]]; then
+		cargo generate-lockfile --quiet 2>/dev/null || true
+		git add Cargo.lock
+	fi
 
 	if [[ "$replaced" == true ]]; then
 		ok "Version updated to ${version} in ${toml_path}"
