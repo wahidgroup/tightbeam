@@ -4,8 +4,12 @@ error[E0277]: the trait bound `Aes128Message: CheckAeadOid<Aes256GcmOid>` is not
 44 |         .with_aead::<Aes256GcmOid, Aes256Gcm>(cipher);
    |          ^^^^^^^^^ unsatisfied trait bound
    |
-   = help: the trait `CheckAeadOid<Aes256GcmOid>` is not implemented for `Aes128Message`
-           but trait `CheckAeadOid<Aes128GcmOid>` is implemented for it
+help: the trait `CheckAeadOid<Aes256GcmOid>` is not implemented for `Aes128Message`
+      but trait `CheckAeadOid<Aes128GcmOid>` is implemented for it
+  --> tests/compile/algorithm_mismatch.rs:26:10
+   |
+26 | #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+   |          ^^^^^^^^
    = help: for that trait implementation, expected `Aes128GcmOid`, found `Aes256GcmOid`
 note: required by a bound in `FrameBuilder::<T>::with_aead`
   --> src/builder/frame.rs
@@ -15,3 +19,4 @@ note: required by a bound in `FrameBuilder::<T>::with_aead`
 ...
    |         T: CheckAeadOid<C>,
    |            ^^^^^^^^^^^^^^^ required by this bound in `FrameBuilder::<T>::with_aead`
+   = note: this error originates in the derive macro `Beamable` (in Nightly builds, run with -Z macro-backtrace for more info)
