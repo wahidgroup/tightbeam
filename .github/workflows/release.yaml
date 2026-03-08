@@ -59,13 +59,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Extract tag name
-        id: tag
-        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+      - name: Extract release metadata
+        id: meta
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          if [[ "$tag" == releases/derive/* ]]; then
+            version="${tag#releases/derive/}"
+            title="tightbeam-derive ${version}"
+          else
+            version="${tag#releases/}"
+            title="tightbeam ${version}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "title=${title}" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release
         run: |
-          gh release create "${{ steps.tag.outputs.tag }}" \
-            --title "${{ steps.tag.outputs.tag }}" \
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "${{ steps.meta.outputs.title }}" \
             --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
