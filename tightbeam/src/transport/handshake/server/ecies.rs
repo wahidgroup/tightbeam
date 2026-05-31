@@ -150,7 +150,10 @@ where
 			.subject_public_key
 			.raw_bytes();
 
-		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes);
+		// Bind the negotiated profile into the transcript so a tampered
+		// security_accept invalidates the server signature.
+		let accept_der = security_accept.to_der()?;
+		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes, &accept_der);
 		self.transcript_hash = Some(transcript_digest);
 		self.invariants.lock_transcript()?;
 
@@ -265,11 +268,13 @@ where
 		client_random: &[u8; 32],
 		server_random: &[u8; 32],
 		spki_bytes: &[u8],
+		accept_der: &[u8],
 	) -> [u8; 32] {
-		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len());
+		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len() + accept_der.len());
 		data.extend_from_slice(client_random);
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
+		data.extend_from_slice(accept_der);
 		compute_transcript_digest::<P::Digest>(&data)
 	}
 

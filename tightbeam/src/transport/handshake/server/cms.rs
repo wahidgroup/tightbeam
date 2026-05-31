@@ -790,8 +790,9 @@ mod tests {
 			assert!(server.session_key().is_some());
 
 			// Verify a profile was selected (dealer's choice)
-			assert!(server.selected_profile.is_some());
-			let selected = server.selected_profile.unwrap();
+			let Some(selected) = server.selected_profile.as_ref() else {
+				return Err(crate::error::TightBeamError::MissingConfiguration.into());
+			};
 			assert!(selected.aead.is_some()); // Must have selected an AEAD
 
 			// Complete handshake flow

@@ -3,10 +3,11 @@
 use core::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
+use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Event;
 use tightbeam::testing::{ScenarioConf, TestHooks};
-use tightbeam::{exactly, wcet};
+use tightbeam::{exactly, wcet, TightBeamError};
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario};
 
 // Define a real-time process with timing and schedulability constraints
@@ -72,7 +73,10 @@ tb_scenario! {
 				assert!(result.assert_spec.is_some(), "Assert spec should be present");
 				assert!(result.process.is_some(), "Process should be present");
 
-				let constraints = result.timing_constraints.as_ref().expect("Timing constraints should be present");
+				let constraints = result
+					.timing_constraints
+					.as_ref()
+					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
 				assert!(constraints.has_constraint(&Event("task1")), "Should have task1 constraint");
 				assert!(constraints.has_constraint(&Event("task2")), "Should have task2 constraint");
 				Ok(())

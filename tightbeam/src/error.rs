@@ -212,6 +212,12 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", from)]
 	KeyError(crate::crypto::key::KeyError),
 
+	/// Secret material was unavailable
+	#[cfg(feature = "crypto")]
+	#[cfg_attr(feature = "derive", error("Secret unavailable: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	SecretUnavailable(crate::crypto::secret::SecretError),
+
 	/// Error obtaining random bytes from the OS
 	#[cfg(feature = "random")]
 	#[cfg_attr(feature = "derive", error("OS random number generator error: {0}"))]
@@ -402,6 +408,8 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
 			TightBeamError::KeyError(err) => write!(f, "Key provider error: {err}"),
+			#[cfg(feature = "crypto")]
+			TightBeamError::SecretUnavailable(err) => write!(f, "Secret unavailable: {err}"),
 			#[cfg(feature = "digest")]
 			TightBeamError::MissingDigestInfo => write!(f, "Missing integrity info"),
 			#[cfg(feature = "aead")]
@@ -480,6 +488,8 @@ crate::impl_from!(crate::crypto::policy::CryptoPolicyError => TightBeamError::Cr
 crate::impl_from!(crate::crypto::kdf::KdfError => TightBeamError::KeyDerivationError);
 #[cfg(all(feature = "crypto", not(feature = "derive")))]
 crate::impl_from!(crate::crypto::key::KeyError => TightBeamError::KeyError);
+#[cfg(all(feature = "crypto", not(feature = "derive")))]
+crate::impl_from!(crate::crypto::secret::SecretError => TightBeamError::SecretUnavailable);
 
 #[cfg(all(feature = "std", not(feature = "derive")))]
 crate::impl_from!(std::io::Error => TightBeamError::IoError);

@@ -232,7 +232,7 @@ mod tests {
 		}
 
 		#[test]
-		fn test_basic_enveloped_data() {
+		fn test_basic_enveloped_data() -> Result<(), Box<dyn core::error::Error>> {
 			// 1. Create test KARI builder
 			let kari_builder = create_test_kari_builder();
 
@@ -241,23 +241,25 @@ mod tests {
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 
 			// 3. Verify structure
-			let enveloped_data = builder.build(plaintext, None).unwrap();
+			let enveloped_data = builder.build(plaintext, None)?;
 			assert_eq!(enveloped_data.version, CmsVersion::V3);
 			assert_eq!(enveloped_data.recip_infos.0.len(), 1);
 			assert!(enveloped_data.encrypted_content.encrypted_content.is_some());
 			assert_eq!(enveloped_data.encrypted_content.content_type, DATA);
+
+			Ok(())
 		}
 
 		#[test]
-		fn test_with_unprotected_attributes() {
+		fn test_with_unprotected_attributes() -> Result<(), Box<dyn core::error::Error>> {
 			// 1. Create test KARI builder
 			let kari_builder = create_test_kari_builder();
 
 			// 2. Create test attributes
 			let client_nonce = [0x11u8; 32];
 			let server_nonce = [0x22u8; 32];
-			let attr1 = encode_client_nonce(&client_nonce).unwrap();
-			let attr2 = encode_server_nonce(&server_nonce).unwrap();
+			let attr1 = encode_client_nonce(&client_nonce)?;
+			let attr2 = encode_server_nonce(&server_nonce)?;
 
 			// 3. Build EnvelopedData with attributes
 			let plaintext = b"Authenticated message";
@@ -266,32 +268,37 @@ mod tests {
 				.with_unprotected_attr(attr2);
 
 			// 4. Verify attributes are present
-			let enveloped_data = builder.build(plaintext, None).unwrap();
-			assert!(enveloped_data.unprotected_attrs.is_some());
+			let enveloped_data = builder.build(plaintext, None)?;
 
 			// 5. Verify correct number of attributes
-			let attrs = enveloped_data.unprotected_attrs.unwrap();
+			let Some(attrs) = enveloped_data.unprotected_attrs.as_ref() else {
+				return Err(crate::testing::error::TestingError::InvariantViolated.into());
+			};
 			assert_eq!(attrs.len(), 2);
+
+			Ok(())
 		}
 
 		#[test]
-		fn test_der_encoding() {
+		fn test_der_encoding() -> Result<(), Box<dyn core::error::Error>> {
 			// 1. Create test KARI builder
 			let kari_builder = create_test_kari_builder();
 
 			// 2. Build and encode
 			let plaintext = b"DER encoding test";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let built = builder.build(plaintext, None).unwrap();
-			let der_bytes = built.to_der().unwrap();
+			let built = builder.build(plaintext, None)?;
+			let der_bytes = built.to_der()?;
 
 			// 3. Verify we can decode it back
-			let decoded = EnvelopedData::from_der(&der_bytes).unwrap();
+			let decoded = EnvelopedData::from_der(&der_bytes)?;
 			assert_eq!(decoded.version, CmsVersion::V3);
+
+			Ok(())
 		}
 
 		#[test]
-		fn test_content_info_wrapper() {
+		fn test_content_info_wrapper() -> Result<(), Box<dyn core::error::Error>> {
 			// 1. Create test KARI builder
 			let kari_builder = create_test_kari_builder();
 
@@ -300,12 +307,14 @@ mod tests {
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 
 			// 3. Verify ContentInfo structure
-			let content_info = builder.build_content_info(plaintext, None).unwrap();
+			let content_info = builder.build_content_info(plaintext, None)?;
 			assert_eq!(content_info.content_type, ENVELOPED_DATA);
 
 			// 4. Decode inner EnvelopedData
-			let enveloped_data: EnvelopedData = content_info.content.decode_as().unwrap();
+			let enveloped_data: EnvelopedData = content_info.content.decode_as()?;
 			assert_eq!(enveloped_data.version, CmsVersion::V3);
+
+			Ok(())
 		}
 	}
 }

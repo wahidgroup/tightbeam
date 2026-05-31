@@ -40,6 +40,9 @@ pub const MAX_HKDF_OUTPUT_SIZE: usize = 128;
 /// Minimum secure key size in bytes
 pub const MIN_KEY_SIZE: usize = 16;
 
+/// Minimum HKDF salt size in bytes (when a non-empty salt is supplied)
+pub const MIN_SALT_SIZE: usize = 16;
+
 // ----------------------------------------------------------------------------
 // Elliptic Curve Key Sizes
 // ----------------------------------------------------------------------------

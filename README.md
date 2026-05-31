@@ -414,7 +414,7 @@ struct SecureMessage { data: Vec<u8> }
 let frame = compose! {
 	V1: id: b"msg-001",
 		order: 1696521900,
-		message_integrity: type Sha3_256,
+		message_integrity<Sha3_256>: salt,
 		confidentiality<Aes256GcmOid, _>: &cipher,
 		nonrepudiation<Secp256k1Signature, _>: &signing_key,
 		message: message
@@ -429,7 +429,7 @@ let frame = compose::<SecureMessage>(Version::V1)
 	.with_message(msg)
 	.with_id(b"msg-001")
 	.with_order(timestamp)
-	.with_message_hasher::<Sha3_256>()              // ✓ Matches MyAppProfile::DigestOid
+	.with_message_hasher::<Sha3_256>(salt)          // ✓ Matches MyAppProfile::DigestOid
 	.with_aead::<Aes256GcmOid, _>(&cipher)        // ✓ Matches MyAppProfile::AeadOid
 	.with_signer::<Secp256k1Signature, _>(&signer)  // ✓ Matches MyAppProfile::SignatureAlg
 	.build()?;
@@ -439,7 +439,7 @@ let frame = compose::<SecureMessage>(Version::V1)
 	functionality and traits for direct/manual implementation.
 
 **Validation Rules**:
-- `with_message_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
+- `with_message_hasher::<D>(salt)` validates `D::OID == Profile::DigestOid::OID`
 - `with_witness_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
 - `with_aead::<C, _>()` validates `C::OID == Profile::AeadOid::OID`
 - `with_signer::<S, _>()` validates `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`
@@ -3350,7 +3350,7 @@ divergence_refines) are only meaningful when specs are provided in FdrConfig.
 
 **Traces Model**: Verifies that all observable event sequences produced by the
 implementation are allowed by the specification. This ensures basic behavioral
-correctness—the system never produces an unexpected sequence of external events.
+correctness - the system never produces an unexpected sequence of external events.
 
 **Stable Failures Model**: Extends trace verification by checking what events a
 process can *refuse* after each trace. A stable state is one where no internal
@@ -3382,7 +3382,7 @@ tb_process_spec! {
 ```
 
 **Observable events** represent the process's contract with its environment.
-These form the basis of trace refinement—implementations and specifications must
+These form the basis of trace refinement - implementations and specifications must
 agree on observable behavior.
 
 **Hidden events** model internal implementation details. They enable refinement
@@ -3758,7 +3758,7 @@ tb_scenario! {
 	environment ServiceClient {
 		worker_threads: 2,
 		server: |trace| async move {
-			let bind_addr = "127.0.0.1:0".parse().unwrap();
+			let bind_addr = "127.0.0.1:0".parse().expect("invalid bind address");
 			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 			let handle = server! {
 				protocol TokioListener: listener,
@@ -4926,8 +4926,10 @@ tb_scenario! {
 
 			// Test winning case
 			let ping_message = generate_message(42, None)?;
-			let response = client.emit(ping_message, None).await?;
-			let response_message: ResponseMessage = decode(&response.unwrap().message)?;
+			let Some(response) = client.emit(ping_message, None).await? else {
+				return Err(TightBeamError::MissingResponse);
+			};
+			let response_message: ResponseMessage = decode(&response.message)?;
 
 			// Emit value assertions for spec verification
 			trace.event_with("response_result", &[], response_message.result)?;

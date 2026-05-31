@@ -245,6 +245,21 @@ impl Frame {
 	pub fn to_message_integrity_ref(&self) -> Option<&crate::DigestInfo> {
 		self.metadata.integrity.as_ref()
 	}
+
+	/// Verify a disclosed [`Opening`](crate::crypto::commitment::Opening) against
+	/// this frame's message commitment.
+	///
+	/// Returns `Ok(false)` when no message integrity value is present or the
+	/// opening does not match the commitment.
+	pub fn verify_message_commitment<D>(&self, opening: &crate::crypto::commitment::Opening) -> Result<bool>
+	where
+		D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
+	{
+		match self.metadata.integrity.as_ref() {
+			Some(commitment) => opening.verify::<D>(commitment),
+			None => Ok(false),
+		}
+	}
 }
 
 #[cfg(feature = "compress")]
@@ -413,7 +428,7 @@ mod tests {
 	fn decode_truncated_should_fail() -> Result<()> {
 		// Create a valid encoding then truncate it
 		let original = SimpleMessage { id: 100, name: "test".to_string() };
-		let mut encoded = crate::encode(&original).unwrap();
+		let mut encoded = crate::encode(&original)?;
 		encoded.truncate(5);
 
 		let result: Result<SimpleMessage> = crate::decode(&encoded);
@@ -499,7 +514,7 @@ mod tests {
 					message: message,
 					confidentiality<Aes256GcmOid, _>: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
-					message_integrity: type Sha3_256,
+					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::Bulk,
 					lifetime: 3600
 			}.unwrap()
@@ -545,7 +560,7 @@ mod tests {
 					message: message,
 					confidentiality<Aes256GcmOid, _>: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
-					message_integrity: type Sha3_256,
+					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::Top,
 					lifetime: 60
 			}.unwrap()
@@ -610,7 +625,7 @@ mod tests {
 					message: message,
 					confidentiality<Aes256GcmOid, _>: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
-					message_integrity: type Sha3_256,
+					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::High,
 					lifetime: 120
 			}.unwrap()

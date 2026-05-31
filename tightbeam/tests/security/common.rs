@@ -15,20 +15,16 @@ use tightbeam::{
 		hash::Sha3_256,
 		kdf::{HkdfSha3_256, HkdfSha3_256Oid},
 		kem::Kyber1024Oid,
-		key::{Secp256k1KeyProvider, SigningKeyProvider},
 		profiles::{
 			AeadProvider, CryptoProvider, CurveProvider, DefaultCryptoProvider, DigestProvider, KdfProvider,
-			SecurityProfile, SecurityProfileDesc, SigningProvider, TightbeamProfile,
+			SecurityProfile, SecurityProfileDesc, SigningProvider,
 		},
 		secret::ToInsecure,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
 	},
 	der::Decode,
-	oids::{AES_128_GCM, AES_128_WRAP, AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256},
-	testing::{
-		error::{FdrConfigError, TestingError},
-		utils::{create_test_certificate, create_test_signing_key},
-	},
+	oids::AES_128_WRAP,
+	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
 		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
 	},
@@ -36,9 +32,11 @@ use tightbeam::{
 };
 
 #[cfg(feature = "transport-cms")]
-use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
-
-use tightbeam::x509::Certificate;
+use tightbeam::{
+	crypto::key::{Secp256k1KeyProvider, SigningKeyProvider},
+	testing::utils::{create_test_certificate, create_test_signing_key},
+	transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer},
+};
 
 // ============================================================================
 // AES-128 Crypto Provider for Downgrade Attack Testing
@@ -173,73 +171,14 @@ pub trait HandshakeProtocol: Send {
 }
 
 // ============================================================================
-// Server Materials
+// Server Materials & Profiles
 // ============================================================================
 
-/// Generated server-side credentials for handshake orchestration.
-#[derive(Clone)]
-pub struct ServerMaterials {
-	pub certificate: Arc<Certificate>,
-	pub key_provider: Arc<dyn SigningKeyProvider>,
-	/// Secret key for test verification (ECIES decryption).
-	/// Stored as Arc to allow Clone without copying secret material.
-	secret_key: Arc<k256::SecretKey>,
-}
-
-impl ServerMaterials {
-	pub fn generate() -> Self {
-		let signing_key = create_test_signing_key();
-		let certificate = Arc::new(create_test_certificate(&signing_key));
-
-		// Convert signing key to secret key for ECIES operations
-		// The signing key scalar is the same as the secret key scalar
-		let secret_key_bytes = signing_key.to_bytes();
-		let secret_key = k256::SecretKey::from_bytes(&secret_key_bytes).expect("valid secret key");
-
-		let server_key = Secp256k1SigningKey::from(signing_key);
-		let provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(server_key));
-		Self { certificate, key_provider: provider, secret_key: Arc::new(secret_key) }
-	}
-
-	/// Get the secret key for ECIES decryption (test verification only).
-	pub fn secret_key(&self) -> &k256::SecretKey {
-		&self.secret_key
-	}
-}
-
-/// Default profile descriptor reused across threats.
-pub fn default_security_profile() -> SecurityProfileDesc {
-	SecurityProfileDesc::from(&TightbeamProfile)
-}
-
-/// Strong security profile (AES-256-GCM) for downgrade attack testing.
-#[allow(dead_code)]
-pub fn strong_security_profile() -> SecurityProfileDesc {
-	SecurityProfileDesc {
-		digest: HASH_SHA3_256,
-		aead: Some(AES_256_GCM),
-		aead_key_size: Some(32), // 256-bit key
-		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),
-		kdf: Some(HASH_SHA3_256),
-		curve: Some(CURVE_SECP256K1),
-		key_wrap: None,
-		kem: None,
-	}
-}
-
-/// Weak security profile (AES-128-GCM) for downgrade attack testing.
-pub fn weak_security_profile() -> SecurityProfileDesc {
-	SecurityProfileDesc {
-		digest: HASH_SHA3_256,
-		aead: Some(AES_128_GCM),
-		aead_key_size: Some(16), // 128-bit key (weaker)
-		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),
-		kdf: Some(HASH_SHA3_256),
-		curve: Some(CURVE_SECP256K1),
-		key_wrap: None,
-		kem: None,
-	}
-}
+// Shared fixtures live in the crate-wide `common` module so threat suites do
+// not depend on one another's helpers.
+pub use crate::common::security::{
+	default_security_profile, expectation_failure, weak_security_profile, ServerMaterials,
+};
 
 // ============================================================================
 // Backend Kind

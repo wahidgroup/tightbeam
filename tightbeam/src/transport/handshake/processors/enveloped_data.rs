@@ -279,9 +279,9 @@ mod tests {
 
 			// 5. Verify attributes were extracted correctly
 			let attrs = processor.extract_unprotected_attributes(&enveloped_data);
-			assert!(attrs.is_some());
-
-			let attrs = attrs.unwrap();
+			let Some(attrs) = attrs else {
+				return Err(crate::testing::error::TestingError::InvariantViolated.into());
+			};
 			assert_eq!(attrs.len(), 1);
 			assert_eq!(attrs[0].oid, test_oid);
 

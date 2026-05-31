@@ -24,12 +24,6 @@ mod oid_wrappers {
 		Aes256GcmOid,
 		"2.16.840.1.101.3.4.1.46"
 	);
-
-	crate::define_oid_wrapper!(
-		/// AES-128-CM cipher OID wrapper
-		Aes128cmOid,
-		"2.16.840.1.101.3.4.1.6"
-	);
 }
 
 #[cfg(feature = "aes-gcm")]
@@ -229,6 +223,10 @@ impl RuntimeAead {
 	///
 	/// This method is equivalent to `Encryptor::encrypt_content` but uses the
 	/// runtime OID stored in this `RuntimeAead` instead of a compile-time generic.
+	///
+	/// # Nonce
+	/// The caller supplies `nonce` and is responsible for its uniqueness. For
+	/// GCM ciphers a `(key, nonce)` pair MUST never repeat.
 	pub fn encrypt_content(
 		&self,
 		data: impl AsRef<[u8]>,

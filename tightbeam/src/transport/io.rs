@@ -14,12 +14,12 @@ use alloc::sync::Arc;
 
 use crate::asn1::Frame;
 use crate::der::{Decode, Encode};
+use crate::encode;
 use crate::policy::TransitStatus;
 use crate::transport::envelopes::{TransportEnvelope, WireEnvelope, WireMode};
 use crate::transport::error::TransportError;
 use crate::transport::messaging::ResponseHandler;
 use crate::transport::TransportResult;
-use crate::{encode, TightBeamError};
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -158,9 +158,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: EncryptedProtocolState,
 	{
 		let wire_bytes = self.read_envelope().await?;
-		let wire_envelope = WireEnvelope::from_der(&wire_bytes)
-			.map_err(TightBeamError::from)
-			.map_err(TransportError::from)?;
+		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 
 		match wire_envelope {
 			WireEnvelope::Cleartext(transport_envelope) => {
@@ -172,10 +170,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				Ok(transport_envelope)
 			}
 			WireEnvelope::Encrypted(encrypted_info) => {
-				let decrypted_bytes = self
-					.to_decryptor_ref()?
-					.decrypt_content(&encrypted_info)
-					.map_err(TransportError::from)?;
+				let decrypted_bytes = self.to_decryptor_ref()?.decrypt_content(&encrypted_info)?;
 
 				Self::decode_envelope(&decrypted_bytes)
 			}
@@ -190,20 +185,14 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let wire_envelope = if encrypt {
 			let envelope_bytes = Self::encode_envelope(&envelope)?;
-			let encrypted_info = self
-				.to_encryptor_ref()?
-				.encrypt_content(&envelope_bytes, [], None)
-				.map_err(TransportError::from)?;
+			let encrypted_info = self.to_encryptor_ref()?.encrypt_content(&envelope_bytes, [], None)?;
 
 			WireEnvelope::Encrypted(encrypted_info)
 		} else {
 			WireEnvelope::Cleartext(envelope)
 		};
 
-		let wire_bytes = wire_envelope
-			.to_der()
-			.map_err(TightBeamError::from)
-			.map_err(TransportError::from)?;
+		let wire_bytes = wire_envelope.to_der()?;
 
 		self.write_envelope(&wire_bytes).await
 	}
@@ -241,17 +230,12 @@ pub trait EncryptedMessageIO: MessageIO {
 	where
 		Self: EncryptedProtocolState,
 	{
-		let wire_envelope = WireEnvelope::from_der(&wire_bytes)
-			.map_err(TightBeamError::from)
-			.map_err(TransportError::from)?;
+		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
 
 		match wire_envelope {
 			WireEnvelope::Cleartext(env) => Ok(env),
 			WireEnvelope::Encrypted(encrypted_info) => {
-				let decrypted_bytes = self
-					.to_decryptor_ref()?
-					.decrypt_content(&encrypted_info)
-					.map_err(TransportError::from)?;
+				let decrypted_bytes = self.to_decryptor_ref()?.decrypt_content(&encrypted_info)?;
 				Self::decode_envelope(&decrypted_bytes)
 			}
 		}

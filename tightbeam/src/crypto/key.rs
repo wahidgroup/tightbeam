@@ -35,8 +35,10 @@ mod signing {
 	pub use crate::crypto::sign::elliptic_curve::sec1::ModulusSize;
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::subtle::CtOption;
+	#[cfg(feature = "ecdh")]
+	pub use crate::crypto::sign::elliptic_curve::PublicKey;
 	pub use crate::crypto::sign::elliptic_curve::{
-		AffinePoint, CurveArithmetic, Error as EllipticCurveError, FieldBytesSize, PrimeCurve, PublicKey,
+		AffinePoint, CurveArithmetic, Error as EllipticCurveError, FieldBytesSize, PrimeCurve,
 	};
 	pub use crate::crypto::sign::{
 		Error as SignatureError, Keypair, SignatureAlgorithmIdentifier, SignatureEncoding, Signer,
@@ -49,7 +51,7 @@ use signing::*;
 #[cfg(feature = "aead")]
 mod encryption {
 	pub use crate::crypto::aead::{
-		Aead, AeadCore, Aes128Gcm, Aes128cmOid, Aes256Gcm, Aes256GcmOid, Error as AeadError, Nonce,
+		Aead, AeadCore, Aes128Gcm, Aes128GcmOid, Aes256Gcm, Aes256GcmOid, Error as AeadError, Nonce,
 	};
 	pub use crate::crypto::common::typenum::Unsigned;
 }
@@ -501,7 +503,8 @@ pub trait EncryptingKeyProvider: Send + Sync + Debug {
 	///
 	/// # Arguments
 	///
-	/// * `nonce` - The nonce/IV for this encryption operation
+	/// * `nonce` - The nonce/IV for this encryption operation. The caller MUST
+	///   ensure the `(key, nonce)` pair is never reused for AEAD ciphers.
 	/// * `plaintext` - The data to encrypt
 	///
 	/// # Returns
@@ -672,7 +675,7 @@ pub type Aes256GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes256Gcm, Aes256G
 
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 /// Type alias for AES-128-GCM encryption key provider
-pub type Aes128GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes128Gcm, Aes128cmOid>;
+pub type Aes128GcmKeyProvider = InMemoryEncryptingKeyProvider<Aes128Gcm, Aes128GcmOid>;
 
 #[cfg(test)]
 mod tests {

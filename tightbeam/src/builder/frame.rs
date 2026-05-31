@@ -401,8 +401,10 @@ impl<T: Message> FrameBuilder<T> {
 
 #[cfg(feature = "digest")]
 impl<T: Message> FrameBuilder<T> {
-	/// Automatically hash the message body using the specified digest algorithm
-	pub fn with_message_hasher<D>(mut self) -> Self
+	/// Commit to the message body using the specified digest algorithm.
+	///
+	/// Computes `H(salt || DER(message))` and stores it as the integrity value.
+	pub fn with_message_hasher<D>(mut self, salt: impl AsRef<[u8]>) -> Self
 	where
 		D: Digest + AssociatedOid,
 		T: CheckDigestOid<D>,
@@ -433,7 +435,7 @@ impl<T: Message> FrameBuilder<T> {
 			}
 		};
 
-		match crate::utils::digest::<D>(&encoded) {
+		match crate::crypto::commitment::commit_digest::<D>(salt.as_ref(), &encoded) {
 			Ok(hash_info) => {
 				self.metadata_builder = self.metadata_builder.with_integrity_info(hash_info);
 			}
@@ -849,7 +851,7 @@ mod tests {
 				.with_message(msg)
 				.with_id("test_v2_full")
 				.with_order(1696521600)
-				.with_message_hasher::<Sha3_256>()
+				.with_message_hasher::<Sha3_256>([])
 				.with_witness_hasher::<Sha3_256>()
 				.with_compression(ZstdCompression)
 				.with_rng(Box::new(rng))
@@ -879,7 +881,7 @@ mod tests {
 			// Verify Message Integrity (MI): compute hash over original message and compare
 			let message_der = crate::encode(&message)?;
 			let expected_mi = crate::utils::digest::<Sha3_256>(&message_der)?;
-			let actual_mi = tightbeam.metadata.integrity.as_ref().expect("Message integrity should be present");
+			let actual_mi = tightbeam.metadata.integrity.as_ref().ok_or(TightBeamError::MissingDigestInfo)?;
 			assert_eq!(actual_mi.digest.as_bytes(), expected_mi.digest.as_bytes());
 
 			// Verify Frame Integrity (FI): compute hash over envelope (version + metadata) and compare
@@ -889,7 +891,7 @@ mod tests {
 			};
 			let scaffold_der = crate::encode(&scaffold)?;
 			let expected_fi = crate::utils::digest::<Sha3_256>(&scaffold_der)?;
-			let actual_fi = tightbeam.integrity.as_ref().expect("Frame integrity should be present");
+			let actual_fi = tightbeam.integrity.as_ref().ok_or(TightBeamError::MissingDigestInfo)?;
 			assert_eq!(actual_fi.digest.as_bytes(), expected_fi.digest.as_bytes());
 
 			// Body should be encrypted+compressed (not directly decodable)
@@ -916,7 +918,7 @@ mod tests {
 		let result = FrameBuilder::<TestMessage>::from(Version::V0)
 			.with_id("no-message")
 			.with_order(1696521600)
-			.with_message_hasher::<Sha3_256>()
+			.with_message_hasher::<Sha3_256>([])
 			.build();
 		assert!(result.is_err());
 	}
@@ -928,7 +930,7 @@ mod tests {
 		let result = FrameBuilder::from(Version::V0)
 			.with_id("error-test")
 			.with_order(1696521600)
-			.with_message_hasher::<Sha3_256>()
+			.with_message_hasher::<Sha3_256>([])
 			.with_message(message)
 			.build();
 		assert!(result.is_err());
@@ -944,7 +946,7 @@ mod tests {
 				id: "test-id",
 				order: 1696521600,
 				message: message,
-				message_integrity: type Sha3_256
+				message_integrity<Sha3_256>: [] // no salt
 		}?;
 		assert_eq!(frame.version, Version::V0);
 		assert_eq!(frame.metadata.id, b"test-id");
@@ -1147,13 +1149,13 @@ mod tests {
 						V2: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
 						nonrepudiation<Secp256k1Signature, _>: signing_key,
-						message_integrity: type Sha3_256,
+						message_integrity<Sha3_256>: [],
 						frame_integrity: type Sha3_256
 					},
 					(true, false, true, _) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
-						message_integrity: type Sha3_256
+						message_integrity<Sha3_256>: []
 					},
 					(true, false, false, _) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
@@ -1162,7 +1164,7 @@ mod tests {
 					(false, true, true, _) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
 						nonrepudiation<Secp256k1Signature, _>: signing_key,
-						message_integrity: type Sha3_256
+						message_integrity<Sha3_256>: []
 					},
 					(false, true, false, _) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
@@ -1170,12 +1172,12 @@ mod tests {
 					},
 					(false, false, true, true) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
-						message_integrity: type Sha3_256,
+						message_integrity<Sha3_256>: [],
 						frame_integrity: type Sha3_256
 					},
 					(false, false, true, false) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
-						message_integrity: type Sha3_256
+						message_integrity<Sha3_256>: []
 					},
 					(false, false, false, true) => compose! {
 						V1: id: test_name, order: 1u64, message: message.clone(),
@@ -1188,7 +1190,7 @@ mod tests {
 						V2: id: test_name, order: 1u64, message: message.clone(),
 						confidentiality<Aes256GcmOid, _>: cipher,
 						nonrepudiation<Secp256k1Signature, _>: signing_key,
-						message_integrity: type Sha3_256
+						message_integrity<Sha3_256>: []
 					},
 					(true, true, false, true) => compose! {
 						V2: id: test_name, order: 1u64, message: message.clone(),

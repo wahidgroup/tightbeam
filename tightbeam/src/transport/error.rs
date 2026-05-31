@@ -82,6 +82,25 @@ impl core::fmt::Display for TransportError {
 	}
 }
 
+/// Narrows [`TightBeamError`](crate::error::TightBeamError) into [`TransportError`];
+/// variants without a transport counterpart collapse to [`TransportError::InvalidMessage`].
+impl From<crate::error::TightBeamError> for TransportError {
+	fn from(err: crate::error::TightBeamError) -> Self {
+		use crate::error::TightBeamError;
+		match err {
+			TightBeamError::TransportError(t) => t,
+			TightBeamError::SerializationError(e) => TransportError::DerError(e),
+			#[cfg(feature = "x509")]
+			TightBeamError::HandshakeError(h) => TransportError::HandshakeError(h),
+			#[cfg(feature = "x509")]
+			TightBeamError::CertificateValidationError(e) => TransportError::InvalidCertificate(e),
+			#[cfg(feature = "std")]
+			TightBeamError::IoError(e) => TransportError::IoError(e),
+			_ => TransportError::InvalidMessage,
+		}
+	}
+}
+
 impl From<TransitStatus> for TransportError {
 	fn from(status: TransitStatus) -> Self {
 		match status {

@@ -1,41 +1,36 @@
-//! Forward Secrecy threat test.
+//! # Forward secrecy threat
 //!
-//! Tests that each handshake uses fresh ephemeral keys, ensuring that
-//! compromise of the server's long-term key doesn't affect past sessions.
+//! ## Weakness
+//! Reusing ephemeral key material across handshakes means compromise of the
+//! server's long-term key (or a single ephemeral key) can expose past sessions.
 //!
-//! ## Control
+//! ## Attack
+//! Multiple handshakes are run and their ephemeral public keys compared for
+//! uniqueness and randomness.
 //!
-//! Ephemeral client keys. New ephemeral key per handshake; compromise
-//! doesn't affect past sessions.
+//! ## Expected control
+//! Each handshake MUST generate a fresh, random ephemeral key, so session keys
+//! from different handshakes are independent and past traffic stays protected.
 //!
-//! ## What This Test Proves
-//!
-//! 1. Each handshake generates a unique ephemeral public key
-//! 2. The ephemeral keys are cryptographically random (not reused)
-//! 3. Session keys derived from different handshakes are independent
+//! ## References
+//! - CWE-323: Reusing a Nonce, Key Pair in Encryption
+//!   <https://cwe.mitre.org/data/definitions/323.html>
+//! - NIST SP 800-56A Rev. 3 §5.6: ephemeral key-pair generation
 
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{error::FdrConfigError, error::TestingError, ScenarioConf},
-	trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
 	TightBeamError,
 };
 
 use crate::security::common::{
-	extract_ecies_ciphertext, extract_ephemeral_pubkey, Direction, HandshakeBackendKind, SecurityThreatHarness,
+	expectation_failure, extract_ecies_ciphertext, extract_ephemeral_pubkey, Direction, HandshakeBackendKind,
+	SecurityThreatHarness,
 };
 
 /// Number of handshakes to perform for forward secrecy verification.
 const HANDSHAKE_COUNT: usize = 5;
-
-fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
-		field: "forward_secrecy",
-		reason,
-	}))
-}
 
 tb_assert_spec! {
 	pub ForwardSecrecySpec,

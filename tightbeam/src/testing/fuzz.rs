@@ -710,7 +710,7 @@ mod tests {
 			.add_transition(State("S0"), event, State("S1"))
 			.add_terminal(State("S1"))
 			.build()
-			.unwrap()
+			.expect("fixture process builder has a valid initial state")
 	}
 
 	/// Build a two-step linear process: S0 --e1--> S1 --e2--> S2 (terminal)
@@ -724,7 +724,7 @@ mod tests {
 			.add_transition(State("S1"), e2, State("S2"))
 			.add_terminal(State("S2"))
 			.build()
-			.unwrap()
+			.expect("fixture process builder has a valid initial state")
 	}
 
 	/// Build a three-step linear process: S0 --a--> S1 --b--> S2 --c--> S3 (terminal)
@@ -740,7 +740,7 @@ mod tests {
 			.add_transition(State("S2"), "c", State("S3"))
 			.add_terminal(State("S3"))
 			.build()
-			.unwrap()
+			.expect("fixture process builder has a valid initial state")
 	}
 
 	/// Build a choice process: S0 --choice--> {S1, S2} (both terminal)
@@ -755,7 +755,7 @@ mod tests {
 			.add_terminal(State("S1"))
 			.add_terminal(State("S2"))
 			.build()
-			.unwrap()
+			.expect("fixture process builder has a valid initial state")
 	}
 
 	/// Build a branching process: S0 --{a,b,c}--> {S1, S2, S3} (all terminal)
@@ -773,7 +773,7 @@ mod tests {
 			.add_terminal(State("S2"))
 			.add_terminal(State("S3"))
 			.build()
-			.unwrap()
+			.expect("fixture process builder has a valid initial state")
 	}
 
 	// ===== IJON Feature Tests =====

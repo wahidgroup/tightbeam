@@ -10,7 +10,7 @@ use crate::asn1::GeneralizedTime;
 use crate::crypto::hash::Digest;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
-use crate::crypto::x509::utils::validate_certificate_expiry;
+use crate::crypto::x509::utils::{ensure_signature_algorithm_consistency, validate_certificate_expiry};
 use crate::crypto::x509::Certificate;
 use crate::der::Encode;
 
@@ -34,7 +34,7 @@ pub trait CertificateValidation: Send + Sync {
 	///
 	/// # Returns
 	/// * `Ok(())` if validation succeeds
-	/// * `Err(CertificateValidationError)` with specific error details
+	/// * `Err(_)` with specific error details
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError>;
 }
 
@@ -56,7 +56,7 @@ pub trait SignatureVerification: CertificateValidation {
 	///
 	/// # Returns
 	/// * `Ok(())` if validation succeeds
-	/// * `Err(CertificateValidationError)` with specific error details
+	/// * `Err(_)` with specific error details
 	fn verify_with_policy(
 		&self,
 		cert: &Certificate,
@@ -68,6 +68,10 @@ pub trait SignatureVerification: CertificateValidation {
 
 // ============================================================================
 // Built-in Validators
+//
+// The pinning and denylist validators below implement direct-trust models
+// (trust-on-first-use / key pinning, cf. RFC 7469), not RFC 5280 §6.1
+// certification-path validation.
 // ============================================================================
 
 /// Validate only certificate expiry.
@@ -79,6 +83,7 @@ pub struct ExpiryValidator;
 
 impl CertificateValidation for ExpiryValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
+		// RFC 5280 §6.1.3(a)(2): validity-period check only.
 		validate_certificate_expiry(cert)
 	}
 }
@@ -240,18 +245,25 @@ where
 	}
 }
 
-/// Full PKI certificate validator.
+/// Direct-trust certificate validator.
 ///
-/// Validates:
-/// 1. Certificate expiration
-/// 2. Signature verification with expected public key
-/// 3. Optional trust chain validation
+/// This is **not** a full RFC 5280 §6.1 certification-path validator: it does
+/// not build paths, walk name chains, or check `basicConstraints`/`keyUsage`.
+///
+/// - [`CertificateValidation::evaluate`]: validity period
+///   (RFC 5280 §6.1.3(a)(2)) plus direct-trust anchoring - the presented
+///   certificate must itself be a configured trust anchor (RFC 5280 §6.1.1).
+/// - [`SignatureVerification::verify_with_policy`]: single-certificate validity,
+///   algorithm-identifier consistency (RFC 5280 §4.1.1.2), and signature
+///   verification against a caller-supplied issuer key (RFC 5280 §6.1.3(a)(1)).
+///
+/// See <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1>.
 #[derive(Default, Clone)]
-pub struct FullValidator {
+pub struct DirectTrustValidator {
 	trust_chain: Vec<Certificate>,
 }
 
-impl FullValidator {
+impl DirectTrustValidator {
 	/// Add a trust chain to the validator.
 	///
 	/// # Arguments
@@ -262,14 +274,30 @@ impl FullValidator {
 	}
 }
 
-impl CertificateValidation for FullValidator {
+impl CertificateValidation for DirectTrustValidator {
 	fn evaluate(&self, cert: &Certificate) -> Result<(), CertificateValidationError> {
-		// Check expiry first (simple validation)
-		validate_certificate_expiry(cert)
+		// RFC 5280 §6.1.3(a)(2): the certificate must be within its validity period.
+		validate_certificate_expiry(cert)?;
+
+		// Without a configured anchor there is nothing to chain to; expiry-only.
+		if self.trust_chain.is_empty() {
+			return Ok(());
+		}
+
+		// RFC 5280 §6.1.1: direct trust - the presented certificate must itself
+		// be a configured trust anchor (no path building is performed here).
+		let cert_der = cert.to_der()?;
+		for anchor in &self.trust_chain {
+			if anchor.to_der()? == cert_der {
+				return Ok(());
+			}
+		}
+
+		Err(CertificateValidationError::CertificateNotTrusted)
 	}
 }
 
-impl SignatureVerification for FullValidator {
+impl SignatureVerification for DirectTrustValidator {
 	fn verify_with_policy(
 		&self,
 		cert: &Certificate,
@@ -277,7 +305,7 @@ impl SignatureVerification for FullValidator {
 		public_key_der: &[u8],
 		policy: &dyn VerificationPolicy,
 	) -> Result<(), CertificateValidationError> {
-		// Validate expiration with provided time
+		// RFC 5280 §6.1.3(a)(2): notBefore <= current time <= notAfter.
 		let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
 		let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
 		let now_duration = GeneralizedTime::from_unix_duration(Duration::from_secs(curr_time))
@@ -287,29 +315,26 @@ impl SignatureVerification for FullValidator {
 		if now_duration < not_before {
 			return Err(CertificateValidationError::NotYetValid);
 		}
-
 		if now_duration > not_after {
 			return Err(CertificateValidationError::Expired);
 		}
 
-		// Extract and validate the subject public key
+		// RFC 5280 §4.1.2.7: the subjectPublicKeyInfo must carry a key.
 		let subject_public_key = cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
 		if subject_public_key.is_empty() {
 			return Err(CertificateValidationError::EmptyPublicKey);
 		}
 
-		// Verify signature
+		// RFC 5280 §4.1.1.3: the signatureValue must be present.
 		let signature_bytes = cert.signature.raw_bytes();
 		if signature_bytes.is_empty() {
 			return Err(CertificateValidationError::EmptySignature);
 		}
 
-		// Verify algorithm consistency
-		if cert.signature_algorithm.oid != cert.tbs_certificate.signature.oid {
-			return Err(CertificateValidationError::AlgorithmMismatch);
-		}
+		// RFC 5280 §4.1.1.2: signatureAlgorithm must match tbsCertificate.signature.
+		ensure_signature_algorithm_consistency(cert)?;
 
-		// Delegate cryptographic verification to the policy
+		// RFC 5280 §6.1.3(a)(1): verify the signature using the issuer's key.
 		let message = cert.tbs_certificate.to_der()?;
 		policy.verify_signature(&cert.signature_algorithm.oid, public_key_der, &message, signature_bytes)
 	}
@@ -364,6 +389,78 @@ mod tests {
 				// Expected error
 			}
 			other => panic!("Expected Expired error, got: {other:?}"),
+		}
+	}
+
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
+	mod direct_trust {
+		use k256::ecdsa::SigningKey;
+
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::error::CertificateValidationError;
+		use crate::crypto::x509::policy::{CertificateValidation, DirectTrustValidator, SignatureVerification};
+		use crate::crypto::x509::Certificate;
+		use crate::oids::SIGNER_ECDSA_WITH_SHA256;
+		use crate::spki::EncodePublicKey;
+		use crate::testing::utils::{create_test_certificate, create_test_signing_key};
+
+		fn test_cert() -> Certificate {
+			create_test_certificate(&create_test_signing_key())
+		}
+
+		/// Run the out-of-the-box policy over `cert`, supplying the issuer key
+		/// that matches `signing_key`.
+		fn verify(signing_key: &SigningKey, cert: &Certificate) -> Result<(), CertificateValidationError> {
+			let issuer_pub = signing_key.verifying_key().to_public_key_der()?;
+			DirectTrustValidator::default().verify_with_policy(cert, 1_000, issuer_pub.as_bytes(), &Secp256k1Policy)
+		}
+
+		#[test]
+		fn accepts_configured_anchor() {
+			let cert = test_cert();
+			let validator = DirectTrustValidator::default().with_trust_chain(vec![cert.clone()]);
+			assert!(validator.evaluate(&cert).is_ok());
+		}
+
+		#[test]
+		fn rejects_non_anchor() -> Result<(), Box<dyn core::error::Error>> {
+			let validator = DirectTrustValidator::default().with_trust_chain(vec![test_cert()]);
+			let other = create_test_certificate(&SigningKey::from_bytes(&[7u8; 32].into())?);
+			assert!(matches!(
+				validator.evaluate(&other),
+				Err(CertificateValidationError::CertificateNotTrusted)
+			));
+			Ok(())
+		}
+
+		#[test]
+		fn without_anchor_is_expiry_only() {
+			assert!(DirectTrustValidator::default().evaluate(&test_cert()).is_ok());
+		}
+
+		#[test]
+		fn rejects_algorithm_mismatch() {
+			let key = create_test_signing_key();
+			let mut cert = create_test_certificate(&key);
+			// signatureAlgorithm disagrees with tbsCertificate.signature (RFC 5280 §4.1.1.2).
+			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
+			assert!(matches!(
+				verify(&key, &cert),
+				Err(CertificateValidationError::AlgorithmMismatch)
+			));
+		}
+
+		#[test]
+		fn rejects_foreign_algorithm() {
+			let key = create_test_signing_key();
+			let mut cert = create_test_certificate(&key);
+			// Consistent identifiers, but an algorithm the out-of-the-box policy refuses.
+			cert.signature_algorithm.oid = SIGNER_ECDSA_WITH_SHA256;
+			cert.tbs_certificate.signature.oid = SIGNER_ECDSA_WITH_SHA256;
+			assert!(matches!(
+				verify(&key, &cert),
+				Err(CertificateValidationError::UnsupportedAlgorithm(_))
+			));
 		}
 	}
 }

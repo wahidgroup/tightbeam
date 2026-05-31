@@ -281,7 +281,7 @@ mod tests {
 
 	// CSP reachability analysis tests
 	#[test]
-	fn test_analyze_effects_terminal_state_reachable() {
+	fn test_analyze_effects_terminal_state_reachable() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("TestProcess")
 			.add_observable("start")
 			.add_observable("finish")
@@ -289,28 +289,30 @@ mod tests {
 			.add_terminal(State("Success"))
 			.add_transition(State("Init"), "start", State("Running"))
 			.add_transition(State("Running"), "finish", State("Success"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		let effects = analyze_effects(&create_fault("Init", "start"), &process);
 		assert_effect_contains(&effects, "terminal state", "Terminal state detection");
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_analyze_effects_deadlock_detection() {
+	fn test_analyze_effects_deadlock_detection() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("DeadlockProcess")
 			.add_observable("start")
 			.initial_state(State("Init"))
 			.add_transition(State("Init"), "start", State("Blocked"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		let effects = analyze_effects(&create_fault("Init", "start"), &process);
 		assert_effect_contains(&effects, "deadlock", "Deadlock detection");
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_analyze_effects_state_space_restriction() {
+	fn test_analyze_effects_state_space_restriction() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("RestrictedProcess")
 			.add_observable("to_a")
 			.add_observable("to_b")
@@ -319,28 +321,30 @@ mod tests {
 			.add_transition(State("Init"), "to_a", State("A"))
 			.add_transition(State("A"), "to_b", State("B"))
 			.add_transition(State("B"), "to_c", State("C"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		let effects = analyze_effects(&create_fault("A", "to_b"), &process);
 		assert_effect_contains(&effects, "Restricts reachable states", "State space restriction");
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_analyze_effects_unknown_state() {
+	fn test_analyze_effects_unknown_state() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("SimpleProcess")
 			.add_observable("event")
 			.initial_state(State("Known"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		let effects = analyze_effects(&create_fault("UnknownState", "event"), &process);
 		assert_eq!(effects.len(), 1);
 		assert!(effects[0].contains("unknown state"));
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_analyze_effects_default_message() {
+	fn test_analyze_effects_default_message() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("NormalProcess")
 			.add_observable("event1")
 			.add_observable("event2")
@@ -348,10 +352,11 @@ mod tests {
 			.add_transition(State("S1"), "event1", State("S2"))
 			.add_transition(State("S2"), "event2", State("S3"))
 			.add_transition(State("S3"), "event1", State("S1"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		let effects = analyze_effects(&create_fault("S1", "event1"), &process);
 		assert_effect_contains(&effects, "state transition failure", "Default message");
+
+		Ok(())
 	}
 }

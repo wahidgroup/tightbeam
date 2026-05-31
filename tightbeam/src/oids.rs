@@ -61,8 +61,8 @@ pub const HASH_SHA3_512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.8
 /// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
 pub const SIGNER_ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 
-/// ecdsa-with-SHA3-256 (kept for backwards compatibility, maps to same OID as ecdsa-with-SHA256)
-/// See `<https://oid-base.com/get/1.2.840.10045.4.3.2>`
+/// ecdsa-with-SHA3-256
+/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.3.10>`
 pub const SIGNER_ECDSA_WITH_SHA3_256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10");
 
 /// ecdsa-with-SHA3-512

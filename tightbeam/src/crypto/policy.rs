@@ -73,15 +73,22 @@ pub struct Secp256k1Policy;
 impl VerificationPolicy for Secp256k1Policy {
 	fn verify_signature(
 		&self,
-		_algorithm_oid: &ObjectIdentifier,
+		algorithm_oid: &ObjectIdentifier,
 		public_key_der: &[u8],
 		message: &[u8],
 		signature: &[u8],
 	) -> Result<(), CertificateValidationError> {
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
 		use crate::crypto::sign::Verifier;
+		use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 		use crate::spki::DecodePublicKey;
 
+		// This policy implements exactly one algorithm; refuse any other advertised OID.
+		if algorithm_oid != &SIGNER_ECDSA_WITH_SHA3_256 {
+			return Err(CertificateValidationError::UnsupportedAlgorithm(*algorithm_oid));
+		}
+
+		// RFC 5280 §6.1.3(a)(1): cryptographic signature verification primitive.
 		let verifying_key = Secp256k1VerifyingKey::from_public_key_der(public_key_der)?;
 		let sig = Secp256k1Signature::try_from(signature)?;
 

@@ -286,6 +286,7 @@ pub struct DecryptResponse {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use tightbeam::TightBeamError;
 
 	#[test]
 	fn payment_id_creation() {
@@ -322,21 +323,23 @@ mod tests {
 	}
 
 	#[test]
-	fn get_public_key_request_roundtrip() {
+	fn get_public_key_request_roundtrip() -> Result<(), TightBeamError> {
 		use tightbeam::{decode, encode};
 		let req = super::GetPublicKeyRequest { _placeholder: None };
-		let encoded = encode(&req).unwrap();
-		let decoded: super::GetPublicKeyRequest = decode(&encoded).unwrap();
+		let encoded = encode(&req)?;
+		let decoded: super::GetPublicKeyRequest = decode(&encoded)?;
 		assert_eq!(decoded, req);
+		Ok(())
 	}
 
 	#[test]
-	fn decrypt_request_roundtrip() {
+	fn decrypt_request_roundtrip() -> Result<(), TightBeamError> {
 		use tightbeam::{decode, encode};
 		let req = super::DecryptRequest { ciphertext: b"encrypted_data".to_vec() };
-		let encoded = encode(&req).unwrap();
-		let decoded: super::DecryptRequest = decode(&encoded).unwrap();
+		let encoded = encode(&req)?;
+		let decoded: super::DecryptRequest = decode(&encoded)?;
 		assert_eq!(decoded.ciphertext, req.ciphertext);
+		Ok(())
 	}
 
 	#[test]

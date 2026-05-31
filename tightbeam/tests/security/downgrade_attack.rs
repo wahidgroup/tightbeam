@@ -1,62 +1,42 @@
-//! Downgrade attack threat test.
+//! # Cipher downgrade threat
 //!
-//! Tests that a MITM cannot force weaker cryptography by capturing and substituting
-//! handshake messages from sessions using different cipher strengths.
+//! ## Weakness
+//! A negotiated handshake may complete with a weaker cipher than both parties
+//! support if message substitution across cipher strengths is not detected by
+//! the signed transcript.
 //!
-//! ## Attack Scenario
+//! ## Attack
+//! 1. Victim offers AES-256-GCM (strong); the `SecurityOffer` in `ClientHello`
+//!    carries the AEAD OID (`...3.4.1.46`).
+//! 2. A MITM captures its own AES-128-GCM (weak) handshake (OID `...3.4.1.6`).
+//! 3. The MITM substitutes the victim's `ClientHello` with the weak one.
+//! 4. The server signs a transcript containing the weak hello; the victim
+//!    verifies against a transcript containing the strong hello.
 //!
-//! 1. Victim initiates handshake with AES-256-GCM (strong)
-//! 2. MITM captures their own AES-128-GCM (weak) handshake
-//! 3. MITM substitutes victim's ClientHello with the weak one
-//! 4. Server processes the weak ClientHello
-//! 5. Server's response signature is over transcript with weak ClientHello
-//! 6. Victim verifies signature against transcript with STRONG ClientHello
-//! 7. MISMATCH → Attack detected
+//! ## Expected control
+//! The transcript MUST bind the negotiated cipher: strong and weak sessions
+//! produce different wire bytes, so substitution MUST cause a transcript-hash
+//! mismatch and signature-verification failure.
 //!
-//! ## What This Test Proves
-//!
-//! - AES-256 sessions produce different wire bytes than AES-128 sessions
-//! - Substitution of weak message into strong session is detectable
-//! - Transcript integrity prevents downgrade attacks
-//!
-//! ## Technical Details
-//!
-//! This test uses TWO DIFFERENT CryptoProviders:
-//!
-//! 1. `DefaultCryptoProvider` (AES-256-GCM)
-//!    - `type AeadCipher = Aes256Gcm`
-//!    - `type AeadOid = Aes256GcmOid` (OID: 2.16.840.1.101.3.4.1.46)
-//!
-//! 2. `Aes128CryptoProvider` (AES-128-GCM)
-//!    - `type AeadCipher = Aes128Gcm`
-//!    - `type AeadOid = Aes128GcmOid` (OID: 2.16.840.1.101.3.4.1.6)
-//!
-//! The `SecurityOffer` embedded in `ClientHello` contains the AEAD OID, so:
-//! - Strong hello bytes include OID `...3.4.1.46` (AES-256)
-//! - Weak hello bytes include OID `...3.4.1.6` (AES-128)
-//!
-//! This difference means:
-//! - Transcript hash differs based on which hello is in the transcript
-//! - Substituting one for the other causes hash mismatch
-//! - Server signature won't verify for the victim
+//! ## References
+//! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm Downgrade')
+//!   <https://cwe.mitre.org/data/definitions/757.html>
+//! - CAPEC-220: Client-Server Protocol Manipulation
+//!   <https://capec.mitre.org/data/definitions/220.html>
+//! - CAPEC-620: Drop Encryption Level
+//!   <https://capec.mitre.org/data/definitions/620.html>
+//! - RFC 8446 (TLS 1.3) §4.1.3: downgrade protection
 
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{error::FdrConfigError, error::TestingError, ScenarioConf},
-	trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
 	TightBeamError,
 };
 
-use crate::security::common::{HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32};
-
-fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
-		field: "downgrade_attack",
-		reason,
-	}))
-}
+use crate::security::common::{
+	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
+};
 
 tb_assert_spec! {
 	pub DowngradeAttackSpec,

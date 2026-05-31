@@ -24,7 +24,7 @@ pub const BUILDER_CONFIGS: &[MacroConf] = &[MacroConf {
 		("id", "with_id", false, true),
 		("order", "with_order", false, true),
 		("message", "with_message", false, true),
-		("message_integrity", "with_message_hasher", true, false),
+		("message_integrity", "with_message_hasher", false, false),
 		("frame_integrity", "with_witness_hasher", true, false),
 		("confidentiality", "with_aead", false, false),
 		("encryptor", "with_encryptor", false, false),
@@ -44,12 +44,18 @@ pub fn generate_builder_macro(config: &MacroConf) -> proc_macro2::TokenStream {
 
 	// $crate-qualified paths
 	let builder_rest = config.builder_path.strip_prefix("crate::").unwrap_or(config.builder_path);
-	let builder_rest_path: syn::Path = syn::parse_str(builder_rest).unwrap();
+	let builder_rest_path: syn::Path = match syn::parse_str(builder_rest) {
+		Ok(path) => path,
+		Err(err) => return err.to_compile_error(),
+	};
 	let builder_path_tokens = quote! { $crate::#builder_rest_path };
 
 	let variant_path_tokens = if let Some(variant_enum) = config.variant_enum {
 		let variant_rest = variant_enum.strip_prefix("crate::").unwrap_or(variant_enum);
-		let variant_rest_path: syn::Path = syn::parse_str(variant_rest).unwrap();
+		let variant_rest_path: syn::Path = match syn::parse_str(variant_rest) {
+			Ok(path) => path,
+			Err(err) => return err.to_compile_error(),
+		};
 		Some(quote! { $crate::#variant_rest_path })
 	} else {
 		None

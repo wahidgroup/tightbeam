@@ -1,39 +1,34 @@
-//! Nonce reuse attack threat test.
+//! # Nonce reuse / replay threat
 //!
-//! Tests that duplicate nonces are detected and rejected to prevent replay attacks.
-//! This test runs against all enabled backends (ECIES, CMS).
+//! ## Weakness
+//! Reusing an AEAD nonce under the same key breaks confidentiality and enables
+//! message replay if duplicate nonces are not detected.
 //!
-//! ## Attack Scenario
+//! ## Attack
+//! A valid handshake message carrying a nonce is captured and replayed verbatim
+//! (same nonce) to the server (all enabled backends: ECIES, CMS).
 //!
-//! 1. Attacker captures a valid handshake message with a nonce
-//! 2. Attacker attempts to replay the exact same message (same nonce)
-//! 3. Server detects duplicate nonce and rejects
+//! ## Expected control
+//! Per-message nonces MUST be unique (monotonic counter + XOR derivation), and
+//! `NonceReplaySet` MUST track seen nonces and reject duplicates.
 //!
-//! ## Control
-//!
-//! Monotonic counter + XOR for per-message nonce derivation.
-//! `NonceReplaySet` tracks seen nonces and rejects duplicates.
-//!
-//! ## What This Test Proves
-//!
-//! - Duplicate nonces are detected by the replay set
-//! - Same message replayed to same server is rejected
-//! - Nonce tracking provides replay protection
+//! ## References
+//! - CWE-323: Reusing a Nonce, Key Pair in Encryption
+//!   <https://cwe.mitre.org/data/definitions/323.html>
+//! - CWE-294: Authentication Bypass by Capture-replay
+//!   <https://cwe.mitre.org/data/definitions/294.html>
+//! - NIST SP 800-38D §8: IV/nonce uniqueness requirements for GCM
 
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{error::FdrConfigError, error::TestingError, ScenarioConf},
-	trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
 	TightBeamError,
 };
 
-use crate::security::common::{HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32};
-
-fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError { field: "nonce_reuse", reason }))
-}
+use crate::security::common::{
+	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
+};
 
 tb_assert_spec! {
 	pub NonceReuseSpec,

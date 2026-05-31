@@ -384,54 +384,64 @@ mod tests {
 	}
 
 	#[test]
-	fn test_hiding_basic() {
+	fn test_hiding_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process();
 		let hidden_events = [Event("a")].iter().copied().collect();
 
-		let result = p.hide(hidden_events).expect("Hide failed");
+		let result = p.hide(hidden_events)?;
 		assert!(result.hidden.contains(&Event("a")));
 		assert!(!result.observable.contains(&Event("a")));
 		assert!(result.observable.contains(&Event("b")));
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_renaming_basic() {
+	fn test_renaming_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process();
 		let mut mapping = HashMap::new();
 		mapping.insert(Event("a"), Event("x"));
 
-		let result = p.rename(mapping).expect("Rename failed");
+		let result = p.rename(mapping)?;
 		assert!(result.observable.contains(&Event("x")));
 		assert!(!result.observable.contains(&Event("a")));
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_sequential_basic() {
+	fn test_sequential_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process();
 		let q = simple_process();
 
-		let result = Process::sequential(&p, &q).expect("Sequential failed");
+		let result = Process::sequential(&p, &q)?;
 		assert!(result.name.contains(";"));
 		assert!(result.states.len() >= p.states.len() + q.states.len());
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_external_choice_basic() {
+	fn test_external_choice_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process();
 		let q = simple_process();
 
-		let result = Process::external_choice(&p, &q).expect("External choice failed");
+		let result = Process::external_choice(&p, &q)?;
 		assert!(result.name.contains("[]"));
 		assert!(result.states.len() >= 3);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_internal_choice_basic() {
+	fn test_internal_choice_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process();
 		let q = simple_process();
 
-		let result = Process::internal_choice(&p, &q).expect("Internal choice failed");
+		let result = Process::internal_choice(&p, &q)?;
 		assert!(result.name.contains("|~|"));
 		assert!(result.states.len() >= 3);
+
+		Ok(())
 	}
 }

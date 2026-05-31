@@ -162,6 +162,11 @@ pub enum EciesError {
 	#[cfg_attr(feature = "derive", error("ECIES key derivation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	Kdf(#[cfg_attr(feature = "derive", from)] KdfError),
+
+	/// Secret material was unavailable
+	#[cfg_attr(feature = "derive", error("Secret unavailable: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	SecretUnavailable(crate::crypto::secret::SecretError),
 }
 
 crate::impl_error_display!(EciesError {
@@ -171,7 +176,11 @@ crate::impl_error_display!(EciesError {
 	EncryptionFailed(e) => "ECIES encryption failed: {e}",
 	DecryptionFailed(e) => "ECIES decryption failed: {e}",
 	Kdf(e) => "ECIES key derivation failed: {e}",
+	SecretUnavailable(e) => "Secret unavailable: {e}",
 });
+
+#[cfg(not(feature = "derive"))]
+crate::impl_from!(crate::crypto::secret::SecretError => EciesError::SecretUnavailable);
 
 /// A specialized Result type for ECIES operations
 pub type Result<T> = core::result::Result<T, EciesError>;
@@ -678,11 +687,8 @@ mod tests {
 		let (secret2, _) = keypair();
 
 		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage>(&public1, plaintext, None, None::<&mut OsRng>)?;
-		let result = decrypt(&secret2, &encrypted, None);
-
-		if let Ok(decrypted) = result {
-			assert_ne!(&plaintext[..], &decrypted.to_insecure().map_err(EciesError::from)?[..]);
-		}
+		// Wrong recipient derives a different ECDH shared secret, so AEAD tag verification must fail.
+		assert!(decrypt(&secret2, &encrypted, None).is_err());
 
 		// Tampered ciphertext should fail authentication
 		let (secret, public) = keypair();

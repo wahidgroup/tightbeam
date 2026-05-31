@@ -114,7 +114,8 @@ mod tests {
 				oid: ObjectIdentifier::new_unwrap("1.2.840.10045.2.1"),
 				parameters: None,
 			},
-			subject_public_key: BitString::from_bytes(&[0x04, 0x01, 0x02]).unwrap(),
+			subject_public_key: BitString::from_bytes(&[0x04, 0x01, 0x02])
+				.expect("fixed point bytes form a valid BitString"),
 		}
 	}
 

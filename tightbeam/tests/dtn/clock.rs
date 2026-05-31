@@ -16,18 +16,30 @@ pub fn init_mission_clock() {
 
 /// Get current mission elapsed time (milliseconds)
 pub fn mission_time_ms() -> u64 {
-	*MISSION_CLOCK.get().expect("Mission clock not initialized").read().unwrap()
+	*MISSION_CLOCK
+		.get()
+		.expect("Mission clock not initialized")
+		.read()
+		.expect("mission clock lock not poisoned")
 }
 
 /// Advance mission clock by specified duration
 pub fn advance_clock(duration_ms: u64) {
-	let mut time = MISSION_CLOCK.get().expect("Mission clock not initialized").write().unwrap();
+	let mut time = MISSION_CLOCK
+		.get()
+		.expect("Mission clock not initialized")
+		.write()
+		.expect("mission clock lock not poisoned");
 	*time += duration_ms;
 }
 
 /// Advance clock to specific absolute time
 pub fn advance_to(target_ms: u64) {
-	let mut time = MISSION_CLOCK.get().expect("Mission clock not initialized").write().unwrap();
+	let mut time = MISSION_CLOCK
+		.get()
+		.expect("Mission clock not initialized")
+		.write()
+		.expect("mission clock lock not poisoned");
 	if target_ms > *time {
 		*time = target_ms;
 	}

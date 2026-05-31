@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use tightbeam::{asn1::Frame, TightBeamError};
+use tightbeam::{asn1::Frame, testing::error::TestingError, TightBeamError};
 
 /// Invalid sequence error - out-of-sequence frame
 #[derive(Debug, Clone)]
@@ -180,12 +180,16 @@ mod tests {
 
 		// Process in order
 		let result1 = buffer.insert(frame1)?;
-		assert!(result1.is_some());
-		assert_eq!(result1.unwrap().len(), 1);
+		let Some(result1) = result1 else {
+			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
+		};
+		assert_eq!(result1.len(), 1);
 
 		let result2 = buffer.insert(frame2)?;
-		assert!(result2.is_some());
-		assert_eq!(result2.unwrap().len(), 1);
+		let Some(result2) = result2 else {
+			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
+		};
+		assert_eq!(result2.len(), 1);
 
 		assert_eq!(buffer.next_expected(), 3);
 		assert_eq!(buffer.buffered_count(), 0);
@@ -233,8 +237,10 @@ mod tests {
 
 		// Insert frame 1 (in order)
 		let result1 = buffer.insert(frame1)?;
-		assert!(result1.is_some());
-		assert_eq!(result1.unwrap().len(), 1);
+		let Some(result1) = result1 else {
+			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
+		};
+		assert_eq!(result1.len(), 1);
 		assert_eq!(buffer.next_expected(), 2);
 
 		// Insert frame 3 (out of order, should buffer)
@@ -245,8 +251,9 @@ mod tests {
 
 		// Insert frame 2 (fills gap, should return both 2 and 3)
 		let result2 = buffer.insert(frame2)?;
-		assert!(result2.is_some());
-		let frames = result2.unwrap();
+		let Some(frames) = result2 else {
+			return Err(TightBeamError::TestingError(TestingError::InvariantViolated));
+		};
 		assert_eq!(frames.len(), 2);
 		assert_eq!(frames[0].metadata.order, 2);
 		assert_eq!(frames[1].metadata.order, 3);

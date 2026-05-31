@@ -54,7 +54,7 @@ pub enum AssertionValue {
 	U64(u64),
 	I32(i32),
 	I64(i64),
-	F64(f64), // f64 implements PartialOrd and PartialEq — not Ord or Eq
+	F64(f64), // f64 implements PartialOrd and PartialEq - not Ord or Eq
 	MessagePriority(MessagePriority),
 	Version(Version),
 	Some(Box<AssertionValue>),

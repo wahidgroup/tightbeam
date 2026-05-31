@@ -14,8 +14,10 @@ use crate::Errorizable;
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
+#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+use crate::crypto::aead::Aes256Gcm;
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
-use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid};
+use crate::crypto::aead::Aes256GcmOid;
 #[cfg(feature = "ecdh")]
 use crate::crypto::curves::Secp256k1Oid;
 #[cfg(feature = "sha3")]
@@ -25,8 +27,10 @@ use crate::crypto::kdf::{HkdfSha3_256, HkdfSha3_256Oid, KdfFunction};
 #[cfg(feature = "kem")]
 use crate::crypto::kem::{Decapsulator, EncappedKey, Encapsulator, Kyber1024Oid};
 #[cfg(feature = "signature")]
-use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
-#[cfg(feature = "signature")]
+use crate::crypto::sign::ecdsa::Secp256k1Signature;
+#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
+#[cfg(feature = "ecdh")]
 use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
@@ -338,7 +342,6 @@ pub trait KemProvider {
 /// This is a convenience trait that composes all role-based provider traits.
 /// Components can use specific role traits (e.g., `SigningProvider + DigestProvider`)
 /// instead of requiring the full `CryptoProvider` to reduce trait bound complexity.
-// TODO RustCrypto currently does not support KEMs.
 #[cfg(all(
 	feature = "digest",
 	feature = "aead",
@@ -412,7 +415,7 @@ impl CurveProvider for DefaultCryptoProvider {
 	type EciesMessage = crate::crypto::ecies::Secp256k1EciesMessage;
 }
 
-// TODO RustCrypto currently does not support KEMs.
+// TODO: KEM wiring deferred - RustCrypto lacks stable KEM provider traits.
 // #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 // impl KemProvider for DefaultCryptoProvider {
 // 	type EncappedKey = Kyber1024EncappedKey;

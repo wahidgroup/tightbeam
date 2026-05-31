@@ -38,7 +38,7 @@ pub trait SignatureAlgorithmIdentifier {
 	const ALGORITHM_OID: ObjectIdentifier;
 }
 
-/// TODO Petition RustCrypto to adopt AssociatedOid for all
+/// Signing key that can emit a CMS [`SignerInfo`] over content.
 pub trait Signatory<S>: Signer<S> + Keypair
 where
 	S: SignatureEncoding,
@@ -77,7 +77,6 @@ where
 		})
 	}
 
-	/// Get the signature algorithm identifier
 	/// Get the signature algorithm identifier
 	fn signature_algorithm(&self) -> AlgorithmIdentifierOwned;
 
@@ -266,6 +265,6 @@ where
 
 #[cfg(feature = "secp256k1")]
 impl SignatureAlgorithmIdentifier for ecdsa::Secp256k1Signature {
-	/// ECDSA with SHA-256: `1.2.840.10045.4.3.2`
+	/// ECDSA with SHA3-256: `2.16.840.1.101.3.4.3.10`
 	const ALGORITHM_OID: ObjectIdentifier = SIGNER_ECDSA_WITH_SHA3_256;
 }

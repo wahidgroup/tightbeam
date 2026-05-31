@@ -116,7 +116,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 
 	#[test]
-	fn test_multi_input_kdf() {
+	fn test_multi_input_kdf() -> Result<(), Box<dyn core::error::Error>> {
 		let input1 = [0x42u8; 32];
 		let input2 = [0x99u8; 32];
 		let salt = [0xAAu8; 32];
@@ -124,8 +124,10 @@ mod tests {
 		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], &salt, b"test-info");
 		assert!(result.is_ok());
 
-		let key = result.unwrap();
+		let key = result?;
 		assert_eq!(key.len(), 32);
+
+		Ok(())
 	}
 
 	#[test]
@@ -139,7 +141,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_kdf_chain() {
+	fn test_kdf_chain() -> Result<(), Box<dyn core::error::Error>> {
 		let input1 = [0x11u8; 32];
 		let input2 = [0x22u8; 32];
 		let initial_salt = [0xFFu8; 32];
@@ -147,8 +149,10 @@ mod tests {
 		let result = kdf_chain::<DefaultCryptoProvider>(&[(&input1, b"stage1"), (&input2, b"stage2")], &initial_salt);
 		assert!(result.is_ok());
 
-		let key = result.unwrap();
+		let key = result?;
 		assert_eq!(key.len(), 32);
+
+		Ok(())
 	}
 
 	#[test]

@@ -305,12 +305,9 @@ mod tests {
 	}
 
 	#[test]
-	fn test_event_wcet_violation() {
+	fn test_event_wcet_violation() -> Result<(), Box<dyn core::error::Error>> {
 		let mut constraints = TimingConstraints::default();
-		let wcet_config = WcetConfigBuilder::default()
-			.with_duration(Duration::from_millis(100))
-			.build()
-			.unwrap();
+		let wcet_config = WcetConfigBuilder::default().with_duration(Duration::from_millis(100)).build()?;
 		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
 
 		// WCET within constraint: no violation
@@ -338,5 +335,7 @@ mod tests {
 			Duration::from_millis(1000),
 			&constraints
 		));
+
+		Ok(())
 	}
 }

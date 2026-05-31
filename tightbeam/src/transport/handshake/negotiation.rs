@@ -153,7 +153,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_select_first_mutual() {
+	fn test_select_first_mutual() -> Result<(), Box<dyn core::error::Error>> {
 		let p1 = mock_profile(1);
 		let p2 = mock_profile(2);
 		let p3 = mock_profile(3);
@@ -161,8 +161,10 @@ mod tests {
 		let offer = SecurityOffer::new(Vec::from([p1, p2, p3]));
 		let supported = [p2, p3];
 
-		let selected = select_profile(&offer, &supported).unwrap();
+		let selected = select_profile(&offer, &supported)?;
 		assert_eq!(selected, p2); // p2 comes first in offer
+
+		Ok(())
 	}
 
 	#[test]
@@ -189,7 +191,7 @@ mod tests {
 
 	#[cfg(feature = "aead")]
 	#[test]
-	fn test_select_profile_multiple_aead_ciphers() {
+	fn test_select_profile_multiple_aead_ciphers() -> Result<(), Box<dyn core::error::Error>> {
 		use crate::oids::{
 			AES_128_GCM, AES_128_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA256,
 			SIGNER_ECDSA_WITH_SHA256,
@@ -225,7 +227,7 @@ mod tests {
 		let server_supported = [aes256_gcm, aes128_gcm];
 
 		// Should select AES-128-GCM (client's first choice)
-		let selected = select_profile(&client_offer, &server_supported).unwrap();
+		let selected = select_profile(&client_offer, &server_supported)?;
 		assert_eq!(selected.aead, Some(AES_128_GCM));
 		assert_eq!(selected.aead_key_size, Some(16));
 
@@ -233,7 +235,7 @@ mod tests {
 		let client_offer_256 = SecurityOffer::new(Vec::from([aes256_gcm, aes128_gcm]));
 
 		// Should select AES-256-GCM (client's first choice)
-		let selected_256 = select_profile(&client_offer_256, &server_supported).unwrap();
+		let selected_256 = select_profile(&client_offer_256, &server_supported)?;
 		assert_eq!(selected_256.aead, Some(AES_256_GCM));
 		assert_eq!(selected_256.aead_key_size, Some(32));
 
@@ -241,8 +243,10 @@ mod tests {
 		let server_256_only = [aes256_gcm];
 
 		// Client offers AES-128 first, should fallback to AES-256
-		let selected_fallback = select_profile(&client_offer, &server_256_only).unwrap();
+		let selected_fallback = select_profile(&client_offer, &server_256_only)?;
 		assert_eq!(selected_fallback.aead, Some(AES_256_GCM));
 		assert_eq!(selected_fallback.aead_key_size, Some(32));
+
+		Ok(())
 	}
 }

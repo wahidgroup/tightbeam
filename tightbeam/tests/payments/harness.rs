@@ -252,18 +252,19 @@ mod tests {
 	}
 
 	#[test]
-	fn dedup_first_frame_accepted() {
+	fn dedup_first_frame_accepted() -> Result<(), TightBeamError> {
 		let trace = Arc::new(TraceCollector::default());
 		let dedup = DedupBook::new(trace);
 		let frame = test_frame(b"txn1", 1);
 
 		let result = dedup.record(&frame);
 		assert!(result.is_ok());
-		assert!(result.unwrap());
+		assert!(result?);
+		Ok(())
 	}
 
 	#[test]
-	fn dedup_duplicate_rejected() {
+	fn dedup_duplicate_rejected() -> Result<(), TightBeamError> {
 		let trace = Arc::new(TraceCollector::default());
 		let dedup = DedupBook::new(trace);
 		let frame = test_frame(b"txn1", 1);
@@ -271,11 +272,12 @@ mod tests {
 		let _ = dedup.record(&frame);
 		let result = dedup.record(&frame);
 		assert!(result.is_ok());
-		assert!(!result.unwrap());
+		assert!(!result?);
+		Ok(())
 	}
 
 	#[test]
-	fn dedup_different_order_accepted() {
+	fn dedup_different_order_accepted() -> Result<(), TightBeamError> {
 		let trace = Arc::new(TraceCollector::default());
 		let dedup = DedupBook::new(trace);
 		let frame1 = test_frame(b"txn1", 1);
@@ -284,6 +286,7 @@ mod tests {
 		let _ = dedup.record(&frame1);
 		let result = dedup.record(&frame2);
 		assert!(result.is_ok());
-		assert!(result.unwrap());
+		assert!(result?);
+		Ok(())
 	}
 }

@@ -1,38 +1,40 @@
-//! Certificate Forgery threat test.
+//! # Certificate forgery threat
 //!
-//! Tests that the handshake rejects invalid, forged, or untrusted certificates.
-//! This validates the X.509 chain validation control.
+//! ## Weakness
+//! If the handshake does not enforce a configured certificate validator, a
+//! forged or untrusted certificate can pass validation and be accepted.
 //!
-//! ## Control
+//! ## Attack
+//! A certificate bearing the wrong (forged) public key is presented during the
+//! handshake alongside a genuine certificate, exercising the configured
+//! validators (here, key pinning).
 //!
-//! X.509 chain validation. Verify root of trust.
-//! Note: Application responsibility - the application must configure validators.
+//! ## Expected control
+//! Certificate validation MUST be enforced during the handshake: a forged
+//! certificate MUST be rejected and a valid certificate MUST pass. Validator
+//! configuration is the application's responsibility.
 //!
-//! ## What This Test Proves
-//!
-//! 1. A certificate with wrong public key (forged) is rejected via pinning
-//! 2. A valid certificate passes validation
-//! 3. Certificate validation is enforced during handshake
+//! ## References
+//! - CWE-295: Improper Certificate Validation
+//!   <https://cwe.mitre.org/data/definitions/295.html>
+//! - CWE-347: Improper Verification of Cryptographic Signature
+//!   <https://cwe.mitre.org/data/definitions/347.html>
+//! - CAPEC-459: Creating a Rogue Certification Authority Certificate
+//!   <https://capec.mitre.org/data/definitions/459.html>
+//! - RFC 5280 §6: Certification Path Validation
 
 use std::sync::Arc;
 
 use tightbeam::{
 	crypto::x509::{error::CertificateValidationError, policy::CertificateValidation, Certificate},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{error::FdrConfigError, error::TestingError, ScenarioConf},
+	testing::ScenarioConf,
 	trace::TraceCollector,
 	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer},
 	TightBeamError,
 };
 
-use crate::security::common::{default_security_profile, ServerMaterials};
-
-fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
-		field: "certificate_forgery",
-		reason,
-	}))
-}
+use crate::security::common::{default_security_profile, expectation_failure, ServerMaterials};
 
 /// A validator that always rejects certificates (for testing rejection path).
 #[derive(Debug, Clone, Copy)]

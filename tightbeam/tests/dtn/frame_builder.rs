@@ -33,7 +33,7 @@ pub struct FrameBuilderHelper {
 macro_rules! apply_common_builder_patterns {
 	($builder:expr, $previous_digest:expr, $signing_key:expr, $cipher:expr) => {{
 		let mut builder = $builder
-			.with_message_hasher::<Sha3_256>()
+			.with_message_hasher::<Sha3_256>([])
 			.with_witness_hasher::<Sha3_256>()
 			.with_compression(ZstdCompression)
 			.with_aead::<Aes256GcmOid, _>($cipher.to_owned())
