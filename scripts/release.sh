@@ -121,21 +121,40 @@ compile_changelog() {
 	local merge_subjects
 	merge_subjects=$(git log "${last_tag}..HEAD" --merges --format="%s")
 
+	local labels_file
+	labels_file=$(mktemp)
+
 	if [[ -n "$merge_subjects" ]]; then
 		while IFS= read -r subject; do
 			[[ -z "$subject" ]] && continue
 			local pr_num
 			pr_num=$(echo "$subject" | grep -oE '#[0-9]+' | head -1 | tr -d '#') || true
 			[[ -z "$pr_num" ]] && continue
-			local pr_line
-			pr_line=$(gh pr view "$pr_num" \
-				--json number,title,url,author \
-				--jq '"- [#\(.number)](\(.url)) \(.title) (@\(.author.login))"' \
+
+			local pr_json
+			pr_json=$(gh pr view "$pr_num" \
+				--json number,title,url,author,headRefName,labels \
 				2>/dev/null || true)
+			[[ -z "$pr_json" ]] && continue
+
+			local is_release_pr
+			is_release_pr=$(echo "$pr_json" \
+				| jq -r '.headRefName | startswith("process/")')
+			[[ "$is_release_pr" == "true" ]] && continue
+
+			local pr_line
+			pr_line=$(echo "$pr_json" \
+				| jq -r '"- [#\(.number)](\(.url)) \(.title) (@\(.author.login))"')
 			[[ -z "$pr_line" ]] && continue
+
 			body+="${pr_line}"$'\n'
+
+			echo "$pr_json" | jq -r '.labels[].name' >> "$labels_file"
 		done <<< "$merge_subjects"
 	fi
+
+	RELEASE_LABELS=$(sort -u "$labels_file" 2>/dev/null || true)
+	rm -f "$labels_file"
 
 	CHANGELOG="${changelog_title}
 
@@ -193,6 +212,16 @@ poll_pr() {
 			"$pr_number" "$state" "$elapsed"
 		sleep 10
 	done
+}
+
+ensure_label() {
+	local label="$1"
+	if ! gh label create "$label" \
+		--color "0e8a16" \
+		--description "Release PR (auto-managed by scripts/release.sh)" \
+		--force >/dev/null 2>&1; then
+		fail "Failed to ensure label '${label}' exists. Check repo write permissions."
+	fi
 }
 
 semver_compare() {
@@ -708,11 +737,11 @@ if [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" ]]; then
 	step $STEP "Commit release"
 	if git diff --cached --quiet; then
 		info "Nothing staged — creating empty release marker commit"
-		git commit --allow-empty -m "Release: ${TARGET_CRATE} v${VERSION}"
+		git commit --allow-empty -m "chore(release): ${TARGET_CRATE} v${VERSION}"
 	else
-		git commit -m "Release: ${TARGET_CRATE} v${VERSION}"
+		git commit -m "chore(release): ${TARGET_CRATE} v${VERSION}"
 	fi
-	ok "Committed Release: ${TARGET_CRATE} v${VERSION}"
+	ok "Committed chore(release): ${TARGET_CRATE} v${VERSION}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -728,11 +757,21 @@ if [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" || "$RESUME_STATE
 	fi
 
 	compile_changelog
-	PR_URL=$(gh pr create \
-		--title "Release: ${TARGET_CRATE} v${VERSION}" \
-		--body "$CHANGELOG" \
-		--base "$PR_BASE" \
-		--head "$BRANCH")
+
+	ensure_label "release"
+
+	PR_CREATE_ARGS=(
+		--title "chore(release): ${TARGET_CRATE} v${VERSION}"
+		--body "$CHANGELOG"
+		--base "$PR_BASE"
+		--head "$BRANCH"
+		--assignee "@me"
+	)
+	while IFS= read -r label; do
+		[[ -n "$label" ]] && PR_CREATE_ARGS+=(--label "$label")
+	done < <({ printf 'release\n'; printf '%s\n' "${RELEASE_LABELS:-}"; } | sort -u)
+
+	PR_URL=$(gh pr create "${PR_CREATE_ARGS[@]}")
 	PR_NUMBER="${PR_URL##*/}"
 	ok "PR #${PR_NUMBER} created: ${PR_URL}"
 fi
