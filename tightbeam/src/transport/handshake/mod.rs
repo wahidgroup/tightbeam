@@ -185,10 +185,8 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::{SignatureEncoding, Verifier};
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::store::CertificateTrust;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Decode, Encode, Enumerated, Sequence};
-use crate::spki::EncodePublicKey;
 use crate::transport::error::TransportError;
 use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
@@ -196,6 +194,10 @@ use crate::Beamable;
 
 #[cfg(feature = "transport-ecies")]
 use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+#[cfg(feature = "transport-cms")]
+use crate::crypto::x509::store::CertificateTrust;
+#[cfg(feature = "transport-cms")]
+use crate::spki::EncodePublicKey;
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::client::EciesHandshakeClient;
 #[cfg(feature = "transport-ecies")]

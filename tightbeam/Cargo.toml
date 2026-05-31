@@ -43,6 +43,7 @@ k256 = { workspace = true, optional = true }
 
 # Non-RustCrypto dependencies
 rand_core = { workspace = true, optional = true }
+getrandom = { version = "0.2", optional = true }
 tokio = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
@@ -229,6 +230,10 @@ std = [
 	"time?/std",
 	"rand_core?/std",
 ]
+
+# WebAssembly (browser) support: forwards the `js` RNG backend to the transitive
+# getrandom so wasm32-unknown-unknown links a working source of randomness.
+wasm = ["dep:getrandom", "getrandom/js"]
 
 # NON-RustCrypto features
 time = ["dep:time", "der/time"]

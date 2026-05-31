@@ -1,8 +1,8 @@
 //! X.509 certificate utility functions and helpers.
 
+#[cfg(feature = "time")]
 use core::time::Duration;
 
-use crate::asn1::GeneralizedTime;
 use crate::cms::signed_data::SignerIdentifier;
 use crate::crypto::hash::Digest;
 use crate::crypto::x509::error::CertificateValidationError;
@@ -12,6 +12,9 @@ use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::der::DecodeOwned;
 use crate::spki::EncodePublicKey;
+
+#[cfg(feature = "time")]
+use crate::asn1::GeneralizedTime;
 
 #[macro_export]
 macro_rules! pem {

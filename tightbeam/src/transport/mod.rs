@@ -32,6 +32,7 @@ pub mod tcp;
 
 // Re-exports from submodules
 pub use builders::{EnvelopeBuilder, EnvelopeLimits};
+pub use client::GenericClient;
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, MessageIO, Pingable};
@@ -41,14 +42,14 @@ pub use protocols::{
 	X509ClientConfig,
 };
 
-pub use client::GenericClient;
-
 #[cfg(feature = "builder")]
 pub use client::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
 pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 #[cfg(feature = "transport-policy")]
 pub use messaging::MessageEmitter;
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+pub use tcp::r#async::{AsyncProtocolStream, TcpTransport, TokioListener};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;

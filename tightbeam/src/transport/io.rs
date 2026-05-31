@@ -54,6 +54,41 @@ const HANDSHAKE_MAX_WIRE: usize = crate::transport::tcp::HANDSHAKE_MAX_WIRE;
 #[cfg(all(feature = "transport-ecies", not(feature = "tcp")))]
 const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB default
 
+/// Parse a DER length field into its numeric value.
+pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> usize {
+	if first_byte & 0x80 == 0 {
+		first_byte as usize
+	} else {
+		let mut length = 0usize;
+		for &byte in length_octets.iter() {
+			length = (length << 8) | (byte as usize);
+		}
+
+		length
+	}
+}
+
+/// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
+pub(crate) fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets: &[u8], content: &[u8]) -> Vec<u8> {
+	let length_bytes_count = if length_first & 0x80 == 0 {
+		1
+	} else {
+		1 + length_octets.len()
+	};
+
+	let mut buffer = Vec::with_capacity(1 + length_bytes_count + content.len());
+	buffer.push(tag);
+	buffer.push(length_first);
+
+	if length_first & 0x80 != 0 {
+		buffer.extend_from_slice(length_octets);
+	}
+
+	buffer.extend_from_slice(content);
+
+	buffer
+}
+
 /// Base I/O operations for message transport
 pub trait MessageIO: ResponseHandler {
 	/// Read raw DER-encoded bytes from the transport
@@ -114,37 +149,12 @@ pub trait MessageIO: ResponseHandler {
 
 	/// Helper for parsing DER length encoding
 	fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> usize {
-		if first_byte & 0x80 == 0 {
-			first_byte as usize
-		} else {
-			let mut length = 0usize;
-			for &byte in length_octets.iter() {
-				length = (length << 8) | (byte as usize);
-			}
-			length
-		}
+		parse_der_length(first_byte, length_octets)
 	}
 
 	/// Helper to reconstruct full DER encoding from parts
 	fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets: &[u8], content: &[u8]) -> Vec<u8> {
-		let length_bytes_count = if length_first & 0x80 == 0 {
-			1
-		} else {
-			1 + length_octets.len()
-		};
-
-		let mut buffer = Vec::with_capacity(1 + length_bytes_count + content.len());
-
-		buffer.push(tag);
-		buffer.push(length_first);
-
-		if length_first & 0x80 != 0 {
-			buffer.extend_from_slice(length_octets);
-		}
-
-		buffer.extend_from_slice(content);
-
-		buffer
+		reconstruct_der_encoding(tag, length_first, length_octets, content)
 	}
 }
 
