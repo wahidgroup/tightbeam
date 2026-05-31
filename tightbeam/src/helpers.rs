@@ -494,9 +494,9 @@ mod tests {
 			let provider = Secp256k1KeyProvider::from(signing_key);
 
 			let signed_frame = frame.sign_with_provider::<Sha3_256, _>(&provider).await?;
-			assert!(signed_frame.nonrepudiation.is_some());
-
-			let signer_info = signed_frame.nonrepudiation.as_ref().unwrap();
+			let Some(signer_info) = signed_frame.nonrepudiation.as_ref() else {
+				return Err(crate::error::TightBeamError::MissingSignatureInfo);
+			};
 			assert_eq!(signer_info.version, CmsVersion::V1);
 			assert!(matches!(signer_info.sid, SignerIdentifier::SubjectKeyIdentifier(_)));
 

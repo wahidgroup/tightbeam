@@ -12,3 +12,12 @@
 	feature = "tokio"
 ))]
 pub mod x509;
+
+#[cfg(all(
+	feature = "x509",
+	feature = "secp256k1",
+	feature = "signature",
+	feature = "sha3",
+	feature = "transport"
+))]
+pub mod security;

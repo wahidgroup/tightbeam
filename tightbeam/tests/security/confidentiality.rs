@@ -1,40 +1,38 @@
-//! Confidentiality threat test.
+//! # Session-key confidentiality threat
 //!
-//! Tests that session keys are encrypted in transit and can only be decrypted
-//! with the correct private key. This proves ECDH + HKDF key derivation works.
+//! ## Weakness
+//! If session-key material is transmitted in the clear (or "encryption" is not
+//! actually applied), an observer can recover it.
 //!
-//! ## Control
+//! ## Attack
+//! Captured ECIES ciphertext is examined: decrypted with the correct key,
+//! attempted with a wrong key, and compared across two handshakes.
 //!
-//! ECDH + HKDF derived AEAD key. Session key never transmitted in the clear;
-//! derived from ECDH shared secret.
+//! ## Expected control
+//! The session key MUST never be transmitted in the clear; it MUST be derived
+//! via ECDH + HKDF into an AEAD key. Decryption MUST succeed only with the
+//! correct private key, yield the expected 64-byte plaintext
+//! (`base_session_key || client_random`), and produce fresh ciphertext per
+//! handshake.
 //!
-//! ## What This Test Proves
-//!
-//! 1. Captured ECIES ciphertext can be decrypted with correct server key
-//! 2. Decryption produces valid 64-byte plaintext (base_session_key || client_random)
-//! 3. Decryption with wrong key fails (proving encryption is real)
-//! 4. Different handshakes produce different ciphertexts (fresh encryption)
+//! ## References
+//! - CWE-311: Missing Encryption of Sensitive Data
+//!   <https://cwe.mitre.org/data/definitions/311.html>
+//! - CAPEC-157: Sniffing Attacks
+//!   <https://capec.mitre.org/data/definitions/157.html>
+//! - RFC 9180 (HPKE): ECDH + KDF + AEAD construction
 
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{error::FdrConfigError, error::TestingError, ScenarioConf},
-	trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
 	TightBeamError,
 };
 
 use crate::security::common::{
-	extract_ecies_ciphertext, generate_wrong_secret_key, try_decrypt_ecies, DecryptionResult, Direction,
-	HandshakeBackendKind, SecurityThreatHarness,
+	expectation_failure, extract_ecies_ciphertext, generate_wrong_secret_key, try_decrypt_ecies, DecryptionResult,
+	Direction, HandshakeBackendKind, SecurityThreatHarness,
 };
-
-fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
-		field: "confidentiality",
-		reason,
-	}))
-}
 
 tb_assert_spec! {
 	pub ConfidentialitySpec,
@@ -143,6 +141,7 @@ job! {
 				if plaintext_len != 64 {
 					return Err(expectation_failure("decrypted plaintext is not 64 bytes"));
 				}
+
 				trace.event("conf_decrypt_correct_key")?;
 			}
 			DecryptionResult::Failed => {

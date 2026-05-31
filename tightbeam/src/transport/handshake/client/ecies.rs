@@ -192,7 +192,14 @@ where
 			.subject_public_key
 			.raw_bytes();
 
-		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes);
+		// Bind the negotiated profile into the transcript; a tampered
+		// security_accept yields a different hash and fails signature verification.
+		let accept_der = match &server_handshake.security_accept {
+			Some(accept) => accept.to_der()?,
+			None => Vec::new(),
+		};
+
+		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes, &accept_der);
 		self.transcript_hash = Some(transcript_digest);
 		// Invariant: transcript becomes immutable after hash computed
 		self.invariants.lock_transcript()?;
@@ -412,11 +419,13 @@ where
 		client_random: &[u8; 32],
 		server_random: &[u8; 32],
 		spki_bytes: &[u8],
+		accept_der: &[u8],
 	) -> [u8; 32] {
-		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len());
+		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len() + accept_der.len());
 		data.extend_from_slice(client_random);
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
+		data.extend_from_slice(accept_der);
 
 		compute_transcript_digest::<P::Digest>(&data)
 	}
@@ -600,8 +609,11 @@ mod tests {
 
 		// And: Server creates a valid server handshake response
 		let test_cert = create_test_certificate();
-		let client_random = client.client_random.unwrap();
+		let client_random = client
+			.client_random
+			.ok_or(crate::testing::error::TestingError::InvariantViolated)?;
 		let server_random = crate::random::generate_nonce::<32>(None)?;
+		let accept_der = SecurityAccept::new(create_default_test_profile()).to_der()?;
 		let transcript_hash = compute_test_transcript_hash(
 			&client_random,
 			&server_random,
@@ -611,6 +623,7 @@ mod tests {
 				.subject_public_key_info
 				.subject_public_key
 				.raw_bytes(),
+			&accept_der,
 		);
 
 		let signature_bytes: Secp256k1Signature = test_cert.signing_key.try_sign(&transcript_hash)?;
@@ -696,6 +709,7 @@ mod tests {
 		                              server_random: [u8; 32],
 		                              accepted_profile: &SecurityProfileDesc|
 		 -> Result<Vec<u8>, Box<dyn core::error::Error>> {
+			let accept_der = SecurityAccept::new(*accepted_profile).to_der()?;
 			let transcript_hash = compute_test_transcript_hash(
 				client_random,
 				&server_random,
@@ -705,6 +719,7 @@ mod tests {
 					.subject_public_key_info
 					.subject_public_key
 					.raw_bytes(),
+				&accept_der,
 			);
 			let signature: Secp256k1Signature = test_cert.signing_key.try_sign(&transcript_hash)?;
 			let signature_bytes = signature.to_bytes().to_vec();

@@ -9,6 +9,8 @@ use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::ext::pkix::SubjectKeyIdentifier;
 use crate::crypto::x509::Certificate;
 use crate::der::asn1::OctetString;
+use crate::der::oid::AssociatedOid;
+use crate::der::DecodeOwned;
 use crate::spki::EncodePublicKey;
 
 #[macro_export]
@@ -23,6 +25,10 @@ macro_rules! pem {
 }
 
 /// Validate certificate expiry (not_before <= current_time <= not_after).
+///
+/// Implements the validity-period check of RFC 5280 §6.1.3(a)(2) over the
+/// `Validity` field (§4.1.2.5):
+/// <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3>.
 ///
 /// This is a lightweight validation that only checks temporal validity.
 /// For full certificate validation including signatures and trust chains,
@@ -136,6 +142,42 @@ pub fn extract_verifying_key_bytes(cert: &Certificate) -> &[u8] {
 	cert.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes()
 }
 
+/// Enforce algorithm-identifier consistency within a certificate.
+///
+/// RFC 5280 §4.1.1.2: the outer `signatureAlgorithm` field MUST contain the
+/// same algorithm identifier (OID and parameters) as `tbsCertificate.signature`
+/// (§4.1.2.3). <https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2>.
+pub fn ensure_signature_algorithm_consistency(cert: &Certificate) -> Result<(), CertificateValidationError> {
+	if cert.signature_algorithm != cert.tbs_certificate.signature {
+		return Err(CertificateValidationError::AlgorithmMismatch);
+	}
+
+	Ok(())
+}
+
+/// Decode a typed X.509 extension by its associated OID, if present.
+///
+/// Locates the certificate extension (RFC 5280 §4.2) whose `extnID` matches the
+/// requested type's [`AssociatedOid`] and decodes its `extnValue`. Returns
+/// `Ok(None)` when the certificate carries no such extension.
+/// <https://datatracker.ietf.org/doc/html/rfc5280#section-4.2>.
+pub fn certificate_extension<T>(cert: &Certificate) -> Result<Option<T>, CertificateValidationError>
+where
+	T: AssociatedOid + DecodeOwned,
+{
+	let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
+		return Ok(None);
+	};
+
+	for extension in extensions {
+		if extension.extn_id == T::OID {
+			return Ok(Some(T::from_der(extension.extn_value.as_bytes())?));
+		}
+	}
+
+	Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
 	use crate::crypto::x509::error::CertificateValidationError;
@@ -209,6 +251,29 @@ mod tests {
 				// Expected error
 			}
 			other => panic!("Expected Expired error, got: {other:?}"),
+		}
+	}
+
+	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]
+	mod certificate_extension {
+		use crate::crypto::x509::ext::pkix::BasicConstraints;
+		use crate::crypto::x509::utils::certificate_extension;
+		use crate::testing::utils::create_test_certificate_chain;
+
+		#[test]
+		fn reads_basic_constraints() -> Result<(), Box<dyn core::error::Error>> {
+			let chain = create_test_certificate_chain();
+			let basic_constraints = certificate_extension::<BasicConstraints>(&chain.root)?
+				.ok_or(crate::testing::error::TestingError::InvariantViolated)?;
+			assert!(basic_constraints.ca);
+			Ok(())
+		}
+
+		#[test]
+		fn absent_returns_none() -> Result<(), Box<dyn core::error::Error>> {
+			let chain = create_test_certificate_chain();
+			assert!(certificate_extension::<BasicConstraints>(&chain.leaf)?.is_none());
+			Ok(())
 		}
 	}
 }

@@ -1,3 +1,8 @@
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::string::ToString;
+
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
@@ -268,6 +273,11 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Random generation failed"))]
 	RandomGenerationFailed,
 
+	/// Secret material was unavailable
+	#[cfg_attr(feature = "derive", error("Secret unavailable: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	SecretUnavailable(crate::crypto::secret::SecretError),
+
 	// ---------------- Generic octet string length (server_random/client_random etc.) ----------------
 	#[cfg_attr(feature = "derive", error("Invalid OCTET STRING length: {0}"))]
 	InvalidOctetStringLength(&'static str),
@@ -345,6 +355,7 @@ impl core::fmt::Display for HandshakeError {
 			#[cfg(all(feature = "builder", feature = "aead"))]
 			HandshakeError::AesKeyWrap(e) => write!(f, "AES key wrap operation failed: {}", e),
 			HandshakeError::RandomGenerationFailed => write!(f, "Random generation failed"),
+			HandshakeError::SecretUnavailable(e) => write!(f, "Secret unavailable: {}", e),
 			HandshakeError::InvalidOctetStringLength(m) => write!(f, "Invalid OCTET STRING length: {}", m),
 			HandshakeError::NonceLengthError(e) => write!(f, "Nonce length mismatch: {}", e),
 			HandshakeError::OctetStringLengthError(e) => write!(f, "OCTET STRING length mismatch: {}", e),
@@ -359,6 +370,58 @@ impl core::error::Error for HandshakeError {}
 impl From<crate::crypto::kdf::KdfError> for HandshakeError {
 	fn from(_: crate::crypto::kdf::KdfError) -> Self {
 		HandshakeError::KeyDerivationFailed(crate::crypto::aead::Error)
+	}
+}
+
+/// Narrows [`TightBeamError`](crate::error::TightBeamError) into [`HandshakeError`];
+/// variants without a handshake counterpart collapse to [`HandshakeError::InvalidState`].
+impl From<crate::error::TightBeamError> for HandshakeError {
+	fn from(err: crate::error::TightBeamError) -> Self {
+		use crate::error::TightBeamError;
+		match err {
+			TightBeamError::HandshakeError(h) => h,
+			TightBeamError::SerializationError(e) => HandshakeError::DerError(e),
+			#[cfg(feature = "x509")]
+			TightBeamError::SpkiError(e) => HandshakeError::SpkiError(e),
+			#[cfg(feature = "x509")]
+			TightBeamError::CertificateValidationError(e) => HandshakeError::CertificateValidationError(e),
+			#[cfg(feature = "crypto")]
+			TightBeamError::CryptoPolicyError(e) => HandshakeError::CertificatePolicyError(e),
+			#[cfg(feature = "crypto")]
+			TightBeamError::KeyError(e) => HandshakeError::KeyError(e),
+			#[cfg(feature = "signature")]
+			TightBeamError::SignatureError(e) => HandshakeError::SignatureError(e),
+			#[cfg(feature = "ecies")]
+			TightBeamError::EciesError(e) => HandshakeError::EciesError(e),
+			#[cfg(feature = "crypto")]
+			TightBeamError::SecretUnavailable(e) => HandshakeError::SecretUnavailable(e),
+			#[cfg(feature = "random")]
+			TightBeamError::OsRngError(_) => HandshakeError::RandomGenerationFailed,
+			_ => HandshakeError::InvalidState,
+		}
+	}
+}
+
+#[cfg(all(feature = "crypto", not(feature = "derive")))]
+impl From<crate::crypto::secret::SecretError> for HandshakeError {
+	fn from(err: crate::crypto::secret::SecretError) -> Self {
+		HandshakeError::SecretUnavailable(err)
+	}
+}
+
+/// Narrows [`HandshakeError`] into the foreign [`crate::cms::builder::Error`];
+/// variants without a counterpart collapse into
+/// [`Builder`](crate::cms::builder::Error::Builder) via their `Display`.
+#[cfg(all(feature = "builder", feature = "aead"))]
+impl From<HandshakeError> for crate::cms::builder::Error {
+	fn from(err: HandshakeError) -> Self {
+		match err {
+			HandshakeError::CmsBuilderError(e) => e,
+			HandshakeError::DerError(e) => crate::cms::builder::Error::Asn1(e),
+			HandshakeError::Asn1Error(e) => crate::cms::builder::Error::Asn1(e),
+			HandshakeError::SpkiError(e) => crate::cms::builder::Error::PublicKey(e),
+			other => crate::cms::builder::Error::Builder(other.to_string()),
+		}
 	}
 }
 

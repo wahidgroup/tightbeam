@@ -339,8 +339,17 @@ mod tests {
 		assert_eq!(stat_m.n(), 3);
 
 		// Row views match source bytes
-		assert_eq!(dyn_m.row(1).unwrap(), &[3, 4, 5]);
-		assert_eq!(stat_m.row(1).unwrap().as_slice(), &[3, 4, 5]);
+		assert_eq!(
+			dyn_m.row(1).ok_or(crate::testing::error::TestingError::InvariantViolated)?,
+			&[3, 4, 5]
+		);
+		assert_eq!(
+			stat_m
+				.row(1)
+				.ok_or(crate::testing::error::TestingError::InvariantViolated)?
+				.as_slice(),
+			&[3, 4, 5]
+		);
 
 		// Indexing
 		assert_eq!(dyn_m.get(2, 2), 8);
@@ -382,7 +391,12 @@ mod tests {
 		// Byte view length and static reconstruction
 		assert_eq!(dyn_m.as_bytes().len(), 9);
 		let stat_bytes = Matrix::<3>::from_row_major(&bytes);
-		assert_eq!(stat_bytes.row(0).unwrap(), &[0, 1, 2]);
+		assert_eq!(
+			stat_bytes
+				.row(0)
+				.ok_or(crate::testing::error::TestingError::InvariantViolated)?,
+			&[0, 1, 2]
+		);
 
 		// Invalid constructor length rejected
 		assert!(MatrixDyn::from_row_major(3, vec![0u8; 8]).is_none());

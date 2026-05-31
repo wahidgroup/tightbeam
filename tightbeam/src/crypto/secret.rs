@@ -11,8 +11,24 @@ use core::str::FromStr;
 use core::{any, fmt};
 
 use crate::der::{self, Decode, Encode, FixedTag};
-use crate::error::TightBeamError;
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
+#[cfg(feature = "derive")]
+use crate::Errorizable;
+
+/// Error returned by [`Secret`] accessors when the wrapped value is
+/// unavailable, e.g. already consumed via [`ToInsecure::to_insecure`] or
+/// never present.
+#[cfg_attr(feature = "derive", derive(Errorizable))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretError {
+	/// Secret value is unavailable (already consumed or never set).
+	#[cfg_attr(feature = "derive", error("Secret value is unavailable"))]
+	Unavailable,
+}
+
+crate::impl_error_display!(SecretError {
+	Unavailable => "Secret value is unavailable",
+});
 
 /// A secret wrapper that zeroizes its inner value on drop.
 ///
@@ -30,10 +46,10 @@ impl<S: Zeroize + ?Sized> Secret<S> {
 
 	/// Ephemeral immutable access to the inner secret via a closure to allow
 	/// for secure introspection.
-	pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> Result<R, TightBeamError> {
+	pub fn with<R>(&self, f: impl FnOnce(&S) -> R) -> Result<R, SecretError> {
 		match self.inner.as_ref() {
 			Some(inner) => Ok(f(inner.as_ref())),
-			None => Err(TightBeamError::InvalidMetadata),
+			None => Err(SecretError::Unavailable),
 		}
 	}
 }
@@ -127,16 +143,16 @@ impl FromStr for SecretString {
 ///   `Box<[T]>` or `Box<str>`.
 pub trait ToInsecure {
 	type Raw;
-	fn to_insecure(self) -> Result<Self::Raw, TightBeamError>;
+	fn to_insecure(self) -> Result<Self::Raw, SecretError>;
 }
 
 impl<S: Zeroize> ToInsecure for Secret<S> {
 	type Raw = S;
-	fn to_insecure(self) -> Result<S, TightBeamError> {
+	fn to_insecure(self) -> Result<S, SecretError> {
 		let mut this = self;
 		match this.inner.take() {
 			Some(inner_box) => Ok(*inner_box),
-			None => Err(TightBeamError::InvalidMetadata),
+			None => Err(SecretError::Unavailable),
 		}
 	}
 }
@@ -148,11 +164,11 @@ where
 {
 	type Raw = Box<[T]>;
 
-	fn to_insecure(self) -> Result<Box<[T]>, TightBeamError> {
+	fn to_insecure(self) -> Result<Box<[T]>, SecretError> {
 		let mut this = self;
 		match this.inner.take() {
 			Some(inner) => Ok(inner),
-			None => Err(TightBeamError::InvalidMetadata),
+			None => Err(SecretError::Unavailable),
 		}
 	}
 }
@@ -160,11 +176,11 @@ where
 impl ToInsecure for Secret<str> {
 	type Raw = Box<str>;
 
-	fn to_insecure(self) -> Result<Box<str>, TightBeamError> {
+	fn to_insecure(self) -> Result<Box<str>, SecretError> {
 		let mut this = self;
 		match this.inner.take() {
 			Some(inner) => Ok(inner),
-			None => Err(TightBeamError::InvalidMetadata),
+			None => Err(SecretError::Unavailable),
 		}
 	}
 }

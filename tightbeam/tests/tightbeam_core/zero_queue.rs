@@ -118,7 +118,7 @@ fn build_frame(
 		builder = builder.with_previous_hash(parent);
 	}
 
-	builder = builder.with_message_hasher::<Sha3_256>();
+	builder = builder.with_message_hasher::<Sha3_256>([]);
 
 	let frame = builder.build()?;
 	let digest = utils::digest::<Sha3_256>(&frame.message)?;
@@ -145,7 +145,7 @@ impl ChainState {
 	}
 
 	fn record(&self, frame: &Frame) -> Result<(), TightBeamError> {
-		let mut guard = self.state.lock().unwrap();
+		let mut guard = self.state.lock().expect("chain state mutex not poisoned");
 		let expected = guard.last_digest.clone();
 		let actual = frame.metadata.previous_frame.as_ref();
 		let prev_ok = match (expected.as_ref(), actual) {
@@ -184,7 +184,7 @@ impl DedupBook {
 
 	fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		let key = (frame.metadata.id.clone(), frame.metadata.order);
-		let mut guard = self.seen.lock().unwrap();
+		let mut guard = self.seen.lock().expect("seen-set mutex not poisoned");
 		let inserted = guard.insert(key);
 		if inserted {
 			self.trace.event_with("dedup_kept", &[QUEUE_TAG], true)?;
@@ -244,7 +244,7 @@ struct BackPressureStats {
 
 impl BackPressureStats {
 	fn mark_throttled(&self, order: u64) -> bool {
-		let mut guard = self.throttled.lock().unwrap();
+		let mut guard = self.throttled.lock().expect("throttle mutex not poisoned");
 		if guard.contains(&order) {
 			false
 		} else {

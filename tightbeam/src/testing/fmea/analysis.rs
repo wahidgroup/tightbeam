@@ -286,14 +286,15 @@ mod tests {
 	}
 
 	#[test]
-	fn test_severity_unknown_state() {
+	fn test_severity_unknown_state() -> Result<(), Box<dyn core::error::Error>> {
 		let process = Process::builder("SimpleProcess")
 			.add_observable("event")
 			.initial_state(State("Known"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		assert_severity_both_scales(&create_fault("UnknownState"), &process, 5, 2, "Unknown state returns mid-value");
+
+		Ok(())
 	}
 
 	#[test]

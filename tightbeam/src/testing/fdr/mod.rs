@@ -1,4 +1,4 @@
-//! Layer 3: FDR/Refinement checking
+//! Layer 3: Failures-Divergences Refinement checking
 //!
 //! This module provides bounded refinement checking following CSP theory.
 //! Feature gated: requires `testing-fdr`

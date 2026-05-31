@@ -261,11 +261,11 @@ mod tests {
 	}
 
 	#[test]
-	fn test_basic_analyzer_single_value() {
+	fn test_basic_analyzer_single_value() -> Result<(), Box<dyn core::error::Error>> {
 		let analyzer = DefaultStatisticalAnalyzer;
 		let durations = vec![100_000_000]; // 100ms
 
-		let result = analyzer.analyze(&durations).unwrap();
+		let result = analyzer.analyze(&durations)?;
 		assert_eq!(result.count, 1);
 		assert_eq!(result.mean, 100_000_000);
 		assert_eq!(result.median, 100_000_000);
@@ -277,15 +277,17 @@ mod tests {
 				.map(|pv| pv.value),
 			Some(100_000_000)
 		);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_basic_analyzer_multiple_values() {
+	fn test_basic_analyzer_multiple_values() -> Result<(), Box<dyn core::error::Error>> {
 		let analyzer = DefaultStatisticalAnalyzer;
 		// Durations: 10ms, 20ms, 30ms, 40ms, 50ms
 		let durations = vec![10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000];
 
-		let result = analyzer.analyze(&durations).unwrap();
+		let result = analyzer.analyze(&durations)?;
 		assert_eq!(result.count, 5);
 		assert_eq!(result.mean, 30_000_000);
 		assert_eq!(result.median, 30_000_000); // P50
@@ -305,32 +307,36 @@ mod tests {
 				.map(|pv| pv.value),
 			Some(50_000_000)
 		);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_basic_analyzer_confidence_intervals() {
+	fn test_basic_analyzer_confidence_intervals() -> Result<(), Box<dyn core::error::Error>> {
 		let analyzer = DefaultStatisticalAnalyzer;
 		// Generate 30+ values for confidence interval calculation
 		let durations: Vec<u64> = (1..=50).map(|i| i * 1_000_000).collect();
 
-		let result = analyzer.analyze(&durations).unwrap();
-		assert!(result.confidence_intervals.is_some());
-
-		let ci = result.confidence_intervals.unwrap();
+		let result = analyzer.analyze(&durations)?;
+		let Some(ci) = result.confidence_intervals else {
+			return Err(crate::testing::error::TestingError::InvariantViolated.into());
+		};
 		assert_eq!(ci.level, 9500);
 		assert!(ci.lower < ci.upper);
 		assert!(ci.lower <= result.mean);
 		assert!(ci.upper >= result.mean);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_basic_analyzer_percentiles() {
+	fn test_basic_analyzer_percentiles() -> Result<(), Box<dyn core::error::Error>> {
 		let analyzer = DefaultStatisticalAnalyzer;
 		// 100 values from 1ms to 100ms
 		let durations: Vec<u64> = (1..=100).map(|i| i * 1_000_000).collect();
 
 		// Check all percentiles are present
-		let result = analyzer.analyze(&durations).unwrap();
+		let result = analyzer.analyze(&durations)?;
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P50));
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P90));
 		assert!(result.percentiles.iter().any(|pv| pv.percentile == Percentile::P95));
@@ -343,37 +349,37 @@ mod tests {
 			.percentiles
 			.iter()
 			.find(|pv| pv.percentile == Percentile::P50)
-			.unwrap()
+			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
 			.value;
 		let p90 = result
 			.percentiles
 			.iter()
 			.find(|pv| pv.percentile == Percentile::P90)
-			.unwrap()
+			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
 			.value;
 		let p95 = result
 			.percentiles
 			.iter()
 			.find(|pv| pv.percentile == Percentile::P95)
-			.unwrap()
+			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
 			.value;
 		let p99 = result
 			.percentiles
 			.iter()
 			.find(|pv| pv.percentile == Percentile::P99)
-			.unwrap()
+			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
 			.value;
 		let p99_9 = result
 			.percentiles
 			.iter()
 			.find(|pv| pv.percentile == Percentile::P99_9)
-			.unwrap()
+			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
 			.value;
 		let p99_99 = result
 			.percentiles
 			.iter()
 			.find(|pv| pv.percentile == Percentile::P99_99)
-			.unwrap()
+			.ok_or(crate::testing::error::TestingError::InvariantViolated)?
 			.value;
 
 		assert!(p50 <= p90);
@@ -381,5 +387,7 @@ mod tests {
 		assert!(p95 <= p99);
 		assert!(p99 <= p99_9);
 		assert!(p99_9 <= p99_99);
+
+		Ok(())
 	}
 }

@@ -192,7 +192,8 @@ tb_scenario! {
 			// Emit trace events unconditionally - assertion spec validates them
 			trace.event_with("response_received", &[], Presence::of_option(&response_frame))?;
 
-			let response: AuthResponse = decode(&response_frame.unwrap().message)?;
+			let response_frame = response_frame.ok_or(TightBeamError::MissingResponse)?;
+			let response: AuthResponse = decode(&response_frame.message)?;
 
 			trace.event_with("server_id", &[], response.server_id)?;
 			trace.event_with("authenticated", &[], response.authenticated)?;

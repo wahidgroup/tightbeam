@@ -1,44 +1,37 @@
-//! Man-in-the-Middle (MITM) attack threat test.
+//! # Man-in-the-middle tampering threat
 //!
-//! Tests that transcript signatures protect against message tampering by a MITM.
-//! This test runs against all enabled backends (ECIES, CMS).
+//! ## Weakness
+//! Handshake messages that are not integrity-bound to a verified transcript can
+//! be modified in transit without detection.
 //!
-//! ## Attack Scenario
+//! ## Attack
+//! 1. Client and server begin a handshake (all enabled backends: ECIES, CMS).
+//! 2. A MITM intercepts and modifies a message in transit.
+//! 3. The recipient processes the tampered message.
 //!
-//! 1. Client and Server begin handshake
-//! 2. MITM intercepts and modifies a message in transit
-//! 3. Recipient processes the tampered message
-//! 4. Signature verification fails due to:
-//!    - ECIES: Tampered ServerHandshake has invalid signature over transcript
-//!    - CMS: Tampered Finished messages have invalid SignedData signatures
+//! ## Expected control
+//! Both parties MUST sign `transcript_hash`, verified against certificates. Any
+//! modification MUST cause signature-verification failure (ECIES: tampered
+//! `ServerHandshake`; CMS: tampered `Finished` `SignedData`).
 //!
-//! ## Control
-//!
-//! Both parties sign transcript_hash; verified against certificates.
-//! Any modification to handshake messages causes signature verification failure.
-//!
-//! ## What This Test Proves
-//!
-//! - Tampered messages are detected and rejected
-//! - Transcript integrity prevents MITM attacks
-//! - Signature verification catches content modifications
+//! ## References
+//! - CWE-300: Channel Accessible by Non-Endpoint
+//!   <https://cwe.mitre.org/data/definitions/300.html>
+//! - CAPEC-94: Adversary in the Middle (AiTM)
+//!   <https://capec.mitre.org/data/definitions/94.html>
+//! - RFC 8446 (TLS 1.3) §4.4.3: transcript-bound CertificateVerify/Finished
 
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{error::FdrConfigError, error::TestingError, ScenarioConf},
-	trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
 	TightBeamError,
 };
 
 use crate::security::common::{
-	tamper_payload, Direction, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
+	expectation_failure, tamper_payload, Direction, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness,
+	BACKEND_COUNT_U32,
 };
-
-fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError { field: "mitm_attack", reason }))
-}
 
 tb_assert_spec! {
 	pub MitmAttackSpec,

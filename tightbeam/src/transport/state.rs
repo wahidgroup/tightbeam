@@ -96,9 +96,7 @@ pub trait EncryptedProtocolState {
 	/// Get mutable reference to server handshake orchestrator
 	fn to_server_handshake_mut(
 		&mut self,
-	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>> {
-		panic!("server_handshake_mut not implemented")
-	}
+	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>>;
 
 	/// Get handshake timeout
 	fn to_handshake_timeout(&self) -> Duration {

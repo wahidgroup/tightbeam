@@ -291,44 +291,52 @@ mod tests {
 	}
 
 	#[test]
-	fn test_synchronized_parallel_basic() {
+	fn test_synchronized_parallel_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process_p();
 		let q = simple_process_q();
 
-		let composed = Process::synchronized_parallel(&p, &q).expect("Composition failed");
+		let composed = Process::synchronized_parallel(&p, &q)?;
 		assert_eq!(composed.name, "(P || Q)");
 		assert!(composed.states.len() >= 2);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_interleaved_parallel_basic() {
+	fn test_interleaved_parallel_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process_p();
 		let q = simple_process_q();
 
-		let composed = Process::interleaved_parallel(&p, &q).expect("Composition failed");
+		let composed = Process::interleaved_parallel(&p, &q)?;
 		assert_eq!(composed.name, "(P ||| Q)");
 		assert!(composed.states.len() >= 2);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_interface_parallel_basic() {
+	fn test_interface_parallel_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process_p();
 		let q = simple_process_q();
 		let sync_alphabet = [Event("b")].iter().copied().collect();
 
-		let composed = Process::interface_parallel(&p, &q, sync_alphabet).expect("Composition failed");
+		let composed = Process::interface_parallel(&p, &q, sync_alphabet)?;
 		assert_eq!(composed.name, "(P [|A|] Q)");
 		assert!(composed.states.len() >= 2);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_alphabetized_parallel_basic() {
+	fn test_alphabetized_parallel_basic() -> Result<(), Box<dyn core::error::Error>> {
 		let p = simple_process_p();
 		let q = simple_process_q();
 		let alpha_p = [Event("a"), Event("b")].iter().copied().collect();
 		let alpha_q = [Event("b"), Event("c")].iter().copied().collect();
 
-		let composed = Process::alphabetized_parallel(&p, alpha_p, &q, alpha_q).expect("Composition failed");
+		let composed = Process::alphabetized_parallel(&p, alpha_p, &q, alpha_q)?;
 		assert!(composed.states.len() >= 2);
+
+		Ok(())
 	}
 }

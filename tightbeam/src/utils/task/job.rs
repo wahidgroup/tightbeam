@@ -257,8 +257,10 @@ mod tests {
 			assert_eq!(frame.metadata.id, b"spawn-req");
 
 			let request: HiveManagementRequest = crate::decode(&frame.message)?;
-			assert!(request.spawn.is_some());
-			assert_eq!(request.spawn.expect("spawn should be Some").servlet_type, b"worker_servlet");
+			let Some(spawn) = request.spawn.as_ref() else {
+				return Err(crate::testing::error::TestingError::InvariantViolated.into());
+			};
+			assert_eq!(spawn.servlet_type, b"worker_servlet");
 			Ok(())
 		}
 	}
@@ -284,8 +286,10 @@ mod tests {
 			assert_eq!(frame.metadata.id, b"stop-req");
 
 			let request: HiveManagementRequest = crate::decode(&frame.message)?;
-			assert!(request.stop.is_some());
-			assert_eq!(request.stop.expect("stop should be Some").servlet_id, b"worker_servlet_127.0.0.1:8080");
+			let Some(stop) = request.stop.as_ref() else {
+				return Err(crate::testing::error::TestingError::InvariantViolated.into());
+			};
+			assert_eq!(stop.servlet_id, b"worker_servlet_127.0.0.1:8080");
 			Ok(())
 		}
 	}

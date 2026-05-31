@@ -153,11 +153,13 @@ pub fn create_test_certificate(signing_key: &k256::ecdsa::SigningKey) -> crate::
 	use crate::spki::EncodePublicKey;
 
 	let verifying_key = *signing_key.verifying_key();
-	let public_key_der = verifying_key.to_public_key_der().unwrap();
+	let public_key_der = verifying_key
+		.to_public_key_der()
+		.expect("test verifying key encodes to SPKI DER");
 
 	let tbs_cert = crate::x509::TbsCertificate {
 		version: crate::x509::Version::V3,
-		serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).unwrap(),
+		serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).expect("single-byte serial is valid"),
 		signature: crate::spki::AlgorithmIdentifierOwned {
 			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
 			parameters: None,
@@ -165,14 +167,17 @@ pub fn create_test_certificate(signing_key: &k256::ecdsa::SigningKey) -> crate::
 		issuer: x509_cert::name::RdnSequence::default(),
 		validity: crate::x509::time::Validity {
 			not_before: crate::x509::time::Time::UtcTime(
-				crate::der::asn1::UtcTime::from_unix_duration(core::time::Duration::from_secs(0)).unwrap(),
+				crate::der::asn1::UtcTime::from_unix_duration(core::time::Duration::from_secs(0))
+					.expect("epoch is a valid UtcTime"),
 			),
 			not_after: crate::x509::time::Time::UtcTime(
-				crate::der::asn1::UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000)).unwrap(),
+				crate::der::asn1::UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000))
+					.expect("fixed not-after is a valid UtcTime"),
 			),
 		},
 		subject: x509_cert::name::RdnSequence::default(),
-		subject_public_key_info: crate::spki::SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).unwrap(),
+		subject_public_key_info: crate::spki::SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())
+			.expect("freshly encoded SPKI re-decodes"),
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		extensions: None,
@@ -184,8 +189,39 @@ pub fn create_test_certificate(signing_key: &k256::ecdsa::SigningKey) -> crate::
 			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
 			parameters: None,
 		},
-		signature: crate::der::asn1::BitString::new(0, vec![0; 64]).unwrap(),
+		signature: crate::der::asn1::BitString::new(0, vec![0; 64]).expect("64-byte placeholder is a valid BitString"),
 	}
+}
+
+/// Wrap a DER-encodable extension value in an `Extension` (RFC 5280 §4.2).
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_extension<T>(value: &T) -> crate::x509::ext::Extension
+where
+	T: crate::der::oid::AssociatedOid + crate::der::Encode,
+{
+	crate::x509::ext::Extension {
+		extn_id: T::OID,
+		critical: true,
+		extn_value: crate::der::asn1::OctetString::new(value.to_der().expect("extension value encodes to DER"))
+			.expect("DER bytes wrap in an OctetString"),
+	}
+}
+
+/// Build CA issuer extensions: `basicConstraints` (RFC 5280 §4.2.1.9) and
+/// `keyUsage` (§4.2.1.3), as required for certificate-path validation.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub fn ca_extensions(ca: bool, key_cert_sign: bool, path_len: Option<u8>) -> Vec<crate::x509::ext::Extension> {
+	use crate::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
+
+	let basic_constraints = BasicConstraints { ca, path_len_constraint: path_len };
+	let usage = if key_cert_sign {
+		KeyUsages::KeyCertSign
+	} else {
+		KeyUsages::DigitalSignature
+	};
+	let key_usage = KeyUsage(usage.into());
+
+	vec![test_extension(&basic_constraints), test_extension(&key_usage)]
 }
 
 /// A certificate chain with root -> intermediate -> leaf certificates.
@@ -219,103 +255,123 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 	use crate::x509::name::RelativeDistinguishedName;
 
 	// Generate keys for each level
-	let root_key = SigningKey::from_bytes(&[1u8; 32].into()).unwrap();
-	let intermediate_key = SigningKey::from_bytes(&[2u8; 32].into()).unwrap();
-	let leaf_key = SigningKey::from_bytes(&[3u8; 32].into()).unwrap();
+	let root_key = SigningKey::from_bytes(&[1u8; 32].into()).expect("fixed root key bytes are valid secp256k1");
+	let intermediate_key =
+		SigningKey::from_bytes(&[2u8; 32].into()).expect("fixed intermediate key bytes are valid secp256k1");
+	let leaf_key = SigningKey::from_bytes(&[3u8; 32].into()).expect("fixed leaf key bytes are valid secp256k1");
 
 	// Create unique Subject DNs for each certificate (CN=Root, CN=Intermediate, CN=Leaf)
 	let cn_oid = crate::der::oid::ObjectIdentifier::new_unwrap("2.5.4.3"); // commonName
 
-	let root_cn_str = PrintableString::new("Root").unwrap();
+	let root_cn_str = PrintableString::new("Root").expect("\"Root\" is a valid PrintableString");
 	let root_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&root_cn_str) };
 	let root_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
-		SetOfVec::try_from(vec![root_cn]).unwrap(),
+		SetOfVec::try_from(vec![root_cn]).expect("single RDN forms a valid SetOfVec"),
 	)]);
 
-	let inter_cn_str = PrintableString::new("Intermediate").unwrap();
+	let inter_cn_str = PrintableString::new("Intermediate").expect("\"Intermediate\" is a valid PrintableString");
 	let inter_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&inter_cn_str) };
 	let inter_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
-		SetOfVec::try_from(vec![inter_cn]).unwrap(),
+		SetOfVec::try_from(vec![inter_cn]).expect("single RDN forms a valid SetOfVec"),
 	)]);
 
-	let leaf_cn_str = PrintableString::new("Leaf").unwrap();
+	let leaf_cn_str = PrintableString::new("Leaf").expect("\"Leaf\" is a valid PrintableString");
 	let leaf_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&leaf_cn_str) };
 	let leaf_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
-		SetOfVec::try_from(vec![leaf_cn]).unwrap(),
+		SetOfVec::try_from(vec![leaf_cn]).expect("single RDN forms a valid SetOfVec"),
 	)]);
 
 	// Common validity period
 	let validity = Validity {
-		not_before: Time::UtcTime(UtcTime::from_unix_duration(core::time::Duration::from_secs(0)).unwrap()),
-		not_after: Time::UtcTime(UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000)).unwrap()),
+		not_before: Time::UtcTime(
+			UtcTime::from_unix_duration(core::time::Duration::from_secs(0)).expect("epoch is a valid UtcTime"),
+		),
+		not_after: Time::UtcTime(
+			UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000))
+				.expect("fixed not-after is a valid UtcTime"),
+		),
 	};
 
 	let algorithm = AlgorithmIdentifierOwned { oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
 
 	// Root certificate (self-signed)
-	let root_pub_der = root_key.verifying_key().to_public_key_der().unwrap();
+	let root_pub_der = root_key
+		.verifying_key()
+		.to_public_key_der()
+		.expect("root verifying key encodes to SPKI DER");
 	let root_tbs = TbsCertificate {
 		version: Version::V3,
-		serial_number: SerialNumber::new(&[1]).unwrap(),
+		serial_number: SerialNumber::new(&[1]).expect("single-byte serial is valid"),
 		signature: algorithm.clone(),
 		issuer: root_name.clone(),
 		validity,
 		subject: root_name.clone(),
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes()).unwrap(),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes())
+			.expect("freshly encoded root SPKI re-decodes"),
 		issuer_unique_id: None,
 		subject_unique_id: None,
-		extensions: None,
+		// RFC 5280 §6.1.4(k),(n): root is a CA permitted to sign certificates.
+		extensions: Some(ca_extensions(true, true, None)),
 	};
-	let root_tbs_der = root_tbs.to_der().unwrap();
+	let root_tbs_der = root_tbs.to_der().expect("root TBS certificate encodes to DER");
 	let root_sig: Signature<Secp256k1> = root_key.sign(&root_tbs_der);
 	let root = Certificate {
 		tbs_certificate: root_tbs,
 		signature_algorithm: algorithm.clone(),
-		signature: BitString::new(0, root_sig.to_vec()).unwrap(),
+		signature: BitString::new(0, root_sig.to_vec()).expect("root signature bytes form a valid BitString"),
 	};
 
 	// Intermediate certificate (signed by root)
-	let inter_pub_der = intermediate_key.verifying_key().to_public_key_der().unwrap();
+	let inter_pub_der = intermediate_key
+		.verifying_key()
+		.to_public_key_der()
+		.expect("intermediate verifying key encodes to SPKI DER");
 	let inter_tbs = TbsCertificate {
 		version: Version::V3,
-		serial_number: SerialNumber::new(&[2]).unwrap(),
+		serial_number: SerialNumber::new(&[2]).expect("single-byte serial is valid"),
 		signature: algorithm.clone(),
 		issuer: root_name,
 		validity,
 		subject: inter_name.clone(),
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes()).unwrap(),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes())
+			.expect("freshly encoded intermediate SPKI re-decodes"),
 		issuer_unique_id: None,
 		subject_unique_id: None,
-		extensions: None,
+		// RFC 5280 §6.1.4(k),(n): intermediate is a CA permitted to sign certificates.
+		extensions: Some(ca_extensions(true, true, None)),
 	};
-	let inter_tbs_der = inter_tbs.to_der().unwrap();
+	let inter_tbs_der = inter_tbs.to_der().expect("intermediate TBS certificate encodes to DER");
 	let inter_sig: Signature<Secp256k1> = root_key.sign(&inter_tbs_der);
 	let intermediate = Certificate {
 		tbs_certificate: inter_tbs,
 		signature_algorithm: algorithm.clone(),
-		signature: BitString::new(0, inter_sig.to_vec()).unwrap(),
+		signature: BitString::new(0, inter_sig.to_vec()).expect("intermediate signature bytes form a valid BitString"),
 	};
 
 	// Leaf certificate (signed by intermediate)
-	let leaf_pub_der = leaf_key.verifying_key().to_public_key_der().unwrap();
+	let leaf_pub_der = leaf_key
+		.verifying_key()
+		.to_public_key_der()
+		.expect("leaf verifying key encodes to SPKI DER");
 	let leaf_tbs = TbsCertificate {
 		version: Version::V3,
-		serial_number: SerialNumber::new(&[3]).unwrap(),
+		serial_number: SerialNumber::new(&[3]).expect("single-byte serial is valid"),
 		signature: algorithm.clone(),
 		issuer: inter_name,
 		validity,
 		subject: leaf_name,
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes()).unwrap(),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes())
+			.expect("freshly encoded leaf SPKI re-decodes"),
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		extensions: None,
 	};
-	let leaf_tbs_der = leaf_tbs.to_der().unwrap();
+	let leaf_tbs_der = leaf_tbs.to_der().expect("leaf TBS certificate encodes to DER");
 	let leaf_sig: Signature<Secp256k1> = intermediate_key.sign(&leaf_tbs_der);
 	let leaf = Certificate {
 		tbs_certificate: leaf_tbs,
 		signature_algorithm: algorithm,
-		signature: BitString::new(0, leaf_sig.to_vec()).unwrap(),
+		signature: BitString::new(0, leaf_sig.to_vec()).expect("leaf signature bytes form a valid BitString"),
 	};
 
 	TestCertificateChain { root, intermediate, leaf, root_key, intermediate_key, leaf_key }
@@ -426,7 +482,9 @@ pub fn create_test_encryption_info() -> crate::EncryptedContentInfo {
 			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.42"), // AES-256-GCM
 			parameters: None,
 		},
-		encrypted_content: Some(crate::der::asn1::OctetString::new(vec![0u8; 12]).unwrap()),
+		encrypted_content: Some(
+			crate::der::asn1::OctetString::new(vec![0u8; 12]).expect("12-byte placeholder wraps in an OctetString"),
+		),
 	}
 }
 
@@ -436,7 +494,7 @@ pub fn create_test_signer_info() -> crate::SignerInfo {
 	use crate::der::asn1::OctetString;
 	use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
-	let skid = SubjectKeyIdentifier::from(OctetString::new([0u8; 20]).unwrap());
+	let skid = SubjectKeyIdentifier::from(OctetString::new([0u8; 20]).expect("20-byte SKID wraps in an OctetString"));
 
 	crate::SignerInfo {
 		version: CmsVersion::V1,
@@ -447,7 +505,7 @@ pub fn create_test_signer_info() -> crate::SignerInfo {
 			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
 			parameters: None,
 		},
-		signature: OctetString::new([0u8; 64]).unwrap(),
+		signature: OctetString::new([0u8; 64]).expect("64-byte placeholder wraps in an OctetString"),
 		unsigned_attrs: None,
 	}
 }

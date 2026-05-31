@@ -96,6 +96,22 @@ pub enum CertificateValidationError {
 	/// Certificates with different fingerprints have the same SKID
 	#[cfg_attr(feature = "derive", error("SKID collision detected"))]
 	SkidCollision,
+
+	/// Configured digest produces fewer than the 20 bytes required for a SKID
+	#[cfg_attr(feature = "derive", error("Digest output too short for SKID"))]
+	DigestTooShort,
+
+	/// Issuer certificate is not a CA (RFC 5280 §6.1.4(k))
+	#[cfg_attr(feature = "derive", error("Issuer certificate is not a CA"))]
+	IssuerNotCa,
+
+	/// Issuer keyUsage extension does not assert keyCertSign (RFC 5280 §6.1.4(n))
+	#[cfg_attr(feature = "derive", error("Issuer keyUsage does not permit certificate signing"))]
+	MissingKeyCertSign,
+
+	/// Certification path exceeds an issuer's pathLenConstraint (RFC 5280 §6.1.4(m))
+	#[cfg_attr(feature = "derive", error("Certification path length constraint exceeded"))]
+	PathLenExceeded,
 }
 
 crate::impl_error_display!(CertificateValidationError {
@@ -120,4 +136,8 @@ crate::impl_error_display!(CertificateValidationError {
 	EmptyChain => "Empty certificate chain",
 	UnsupportedOperation => "Operation not supported",
 	SkidCollision => "SKID collision detected",
+	DigestTooShort => "Digest output too short for SKID",
+	IssuerNotCa => "Issuer certificate is not a CA",
+	MissingKeyCertSign => "Issuer keyUsage does not permit certificate signing",
+	PathLenExceeded => "Certification path length constraint exceeded",
 });

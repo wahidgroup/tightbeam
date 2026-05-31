@@ -260,7 +260,7 @@ ensure_release_branch() {
 	if (( patch > 0 )); then
 		base_tag="${TAG_PREFIX}v${major}.${minor}.0"
 		if ! git rev-parse --verify "${base_tag}^{commit}" &>/dev/null; then
-			fail "Base tag ${base_tag} not found — release v${major}.${minor}.0 first"
+			fail "Base tag ${base_tag} not found - release v${major}.${minor}.0 first"
 		fi
 	else
 		local latest_branch
@@ -302,7 +302,7 @@ interactive_cherry_pick() {
 	local count
 	count=$(echo "$commits" | wc -l | tr -d ' ')
 	if (( count > 50 )); then
-		info "${count} commits available — consider narrowing your selection"
+		info "${count} commits available - consider narrowing your selection"
 	fi
 
 	local selected=""
@@ -406,15 +406,15 @@ CURRENT_VERSION=$(detect_version "$CARGO_TOML_PATH" "$VERSION_SECTION")
 
 if [[ "$YANK" == true ]]; then
 	if [[ "$DRY_RUN" == true ]]; then
-		header "Yank (dry run) — ${TARGET_CRATE}"
+		header "Yank (dry run) - ${TARGET_CRATE}"
 	else
-		header "Yank — ${TARGET_CRATE}"
+		header "Yank - ${TARGET_CRATE}"
 	fi
 else
 	if [[ "$DRY_RUN" == true ]]; then
-		header "Release (dry run) — ${TARGET_CRATE}"
+		header "Release (dry run) - ${TARGET_CRATE}"
 	else
-		header "Release — ${TARGET_CRATE}"
+		header "Release - ${TARGET_CRATE}"
 	fi
 fi
 
@@ -515,7 +515,7 @@ if [[ "$YANK" == true ]]; then
 	fi
 
 	if ! git ls-remote --tags origin "$TAG" 2>/dev/null | grep -q "$TAG"; then
-		fail "Release tag ${TAG} does not exist on remote — nothing to yank"
+		fail "Release tag ${TAG} does not exist on remote - nothing to yank"
 	fi
 
 	if [[ "$DRY_RUN" == true ]]; then
@@ -601,7 +601,7 @@ if [[ "$RESUME_STATE" == "fresh" && "$RELEASE_MODE" == "forward" && -n "$CURRENT
 		if git ls-remote --tags origin "$TAG" 2>/dev/null | grep -q "$TAG"; then
 			fail "Already released v${VERSION}"
 		fi
-		info "Version already at ${VERSION} — resuming incomplete release"
+		info "Version already at ${VERSION} - resuming incomplete release"
 	elif [[ "$cmp" == "lt" ]]; then
 		fail "Requested version ${VERSION} is older than current ${CURRENT_VERSION}"
 	fi
@@ -736,7 +736,7 @@ if [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" ]]; then
 	STEP=$((STEP + 1))
 	step $STEP "Commit release"
 	if git diff --cached --quiet; then
-		info "Nothing staged — creating empty release marker commit"
+		info "Nothing staged - creating empty release marker commit"
 		git commit --allow-empty -m "chore(release): ${TARGET_CRATE} v${VERSION}"
 	else
 		git commit -m "chore(release): ${TARGET_CRATE} v${VERSION}"
@@ -799,7 +799,7 @@ fi
 STEP=$((STEP + 1))
 step $STEP "Create signed tag"
 if [[ -n "$(git tag --list "$TAG")" ]]; then
-	ok "Tag ${TAG} already exists locally — skipping creation"
+	ok "Tag ${TAG} already exists locally - skipping creation"
 else
 	compile_changelog
 	git tag -s -a "$TAG" -m "$CHANGELOG"

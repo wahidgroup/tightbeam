@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::instrumentation::TbInstrumentationConfig;
+use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{ScenarioConf, TestHooks};
 use tightbeam::trace::TraceConfig;
-use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
+use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet, TightBeamError};
 
 tb_process_spec! {
 	pub SimpleWcetProcess,
@@ -78,7 +79,10 @@ tb_scenario! {
 			on_pass: Some(Arc::new(|result| {
 				// Verify timing constraints exist on process
 				let process = SimpleWcetProcess::process();
-				let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");
+				let constraints = process
+					.timing_constraints
+					.as_ref()
+					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
 
 				// Verify timing constraints against trace
 				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
@@ -120,7 +124,10 @@ tb_scenario! {
 			on_pass: Some(Arc::new(|result| {
 				// Verify timing constraints exist on process
 				let process = SimpleWcetProcess::process();
-				let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");
+				let constraints = process
+					.timing_constraints
+					.as_ref()
+					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
 
 				// Verify timing constraints against trace
 				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
@@ -161,7 +168,10 @@ tb_scenario! {
 		.with_hooks(TestHooks {
 			on_pass: Some(Arc::new(|result| {
 				let process = SimpleWcetProcess::process();
-				let constraints = process.timing_constraints.as_ref().expect("Process should have timing constraints");
+				let constraints = process
+					.timing_constraints
+					.as_ref()
+					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
 				let timing_result = constraints.verify_with_process(&result.trace, Some(&process))?;
 				assert!(!timing_result.passed, "Timing verification should fail for duration exceeding constraint. Result: {timing_result:?}");
 				assert!(!timing_result.wcet_violations.is_empty(), "WCET violations should be detected");

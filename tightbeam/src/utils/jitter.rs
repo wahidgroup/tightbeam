@@ -167,48 +167,56 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn test_min_max_jitter() {
+	fn test_min_max_jitter() -> Result<(), Box<dyn core::error::Error>> {
 		let calculator = MinMaxJitter;
 		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
-		assert_eq!(calculator.calculate(&[100]).unwrap(), 0);
-		assert_eq!(calculator.calculate(&[100, 200]).unwrap(), 100);
-		assert_eq!(calculator.calculate(&[50, 100, 150, 200]).unwrap(), 150);
+		assert_eq!(calculator.calculate(&[100])?, 0);
+		assert_eq!(calculator.calculate(&[100, 200])?, 100);
+		assert_eq!(calculator.calculate(&[50, 100, 150, 200])?, 150);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_variance_jitter() {
+	fn test_variance_jitter() -> Result<(), Box<dyn core::error::Error>> {
 		let calculator = VarianceJitter;
 		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
-		assert_eq!(calculator.calculate(&[100]).unwrap(), 0);
+		assert_eq!(calculator.calculate(&[100])?, 0);
 
 		// Test with known values: [100, 200]
 		// Mean = 150, variance = ((100-150)² + (200-150)²) / 2 = (2500 + 2500) / 2 = 2500
-		let result = calculator.calculate(&[100, 200]).unwrap();
+		let result = calculator.calculate(&[100, 200])?;
 		assert_eq!(result, 2500);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_std_dev_jitter() {
+	fn test_std_dev_jitter() -> Result<(), Box<dyn core::error::Error>> {
 		let calculator = StdDevJitter;
 		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
-		assert_eq!(calculator.calculate(&[100]).unwrap(), 0);
+		assert_eq!(calculator.calculate(&[100])?, 0);
 
 		// Test with known values: [100, 200]
 		// Variance = 2500, std_dev = sqrt(2500) = 50
-		let result = calculator.calculate(&[100, 200]).unwrap();
+		let result = calculator.calculate(&[100, 200])?;
 		assert_eq!(result, 50);
+
+		Ok(())
 	}
 
 	#[test]
-	fn test_decorrelated_jitter() {
+	fn test_decorrelated_jitter() -> Result<(), Box<dyn core::error::Error>> {
 		let calculator = DecorrelatedJitterCalculator;
 		assert!(matches!(calculator.calculate(&[]), Err(TightBeamError::InvalidMetadata)));
-		assert_eq!(calculator.calculate(&[100]).unwrap(), 0);
+		assert_eq!(calculator.calculate(&[100])?, 0);
 
 		// Test with max = 300: range = 300 - (300/3) = 300 - 100 = 200
-		assert_eq!(calculator.calculate(&[100, 200, 300]).unwrap(), 200);
+		assert_eq!(calculator.calculate(&[100, 200, 300])?, 200);
 
 		// Test with max = 150: range = 150 - (150/3) = 150 - 50 = 100
-		assert_eq!(calculator.calculate(&[50, 100, 150]).unwrap(), 100);
+		assert_eq!(calculator.calculate(&[50, 100, 150])?, 100);
+
+		Ok(())
 	}
 }

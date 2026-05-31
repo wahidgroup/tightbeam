@@ -37,7 +37,8 @@
 pub use hkdf::Hkdf;
 
 use crate::constants::{
-	ECDH_SHARED_SECRET_SIZE, EC_PUBKEY_COMPRESSED_SIZE, EC_PUBKEY_UNCOMPRESSED_SIZE, MAX_HKDF_OUTPUT_SIZE, MIN_KEY_SIZE,
+	ECDH_SHARED_SECRET_SIZE, EC_PUBKEY_COMPRESSED_SIZE, EC_PUBKEY_UNCOMPRESSED_SIZE, MAX_HKDF_OUTPUT_SIZE,
+	MIN_KEY_SIZE, MIN_SALT_SIZE,
 };
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
@@ -130,7 +131,9 @@ impl KdfFunction for HkdfSha3_256 {
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
 		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
 		let mut output = Zeroizing::new([0u8; N]);
+
 		hk.expand(info, &mut output[..]).map_err(KdfError::DerivationFailed)?;
+
 		Ok(output)
 	}
 
@@ -170,6 +173,7 @@ impl KdfFunction for HkdfSha3_256 {
 		let mut k_mac = Zeroizing::new([0u8; N]);
 		k_enc[..].copy_from_slice(&combined[..N]);
 		k_mac[..].copy_from_slice(&combined[N..N * 2]);
+
 		Ok((k_enc, k_mac))
 	}
 }
@@ -185,15 +189,20 @@ impl KdfFunction for X963Sha3_256 {
 		let mut counter: u32 = 1;
 		while offset < N {
 			let mut hasher = Sha3_256::new();
+
 			hasher.update(ikm); // Z only
 			hasher.update(counter.to_be_bytes());
 			hasher.update(info); // SharedInfo/OtherInfo
+
 			let block = hasher.finalize();
 			let take = core::cmp::min(block.len(), N - offset);
 			out[offset..offset + take].copy_from_slice(&block[..take]);
 			offset += take;
-			counter = counter.wrapping_add(1);
+			if offset < N {
+				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(hkdf::InvalidLength))?;
+			}
 		}
+
 		Ok(out)
 	}
 
@@ -213,41 +222,26 @@ impl KdfFunction for X963Sha3_256 {
 		let mut counter: u32 = 1;
 		while offset < key_size {
 			let mut hasher = Sha3_256::new();
+
 			hasher.update(ikm);
 			hasher.update(counter.to_be_bytes());
 			hasher.update(info);
+
 			let block = hasher.finalize();
 			let take = core::cmp::min(block.len(), key_size - offset);
 			out[offset..offset + take].copy_from_slice(&block[..take]);
 			offset += take;
-			counter = counter.wrapping_add(1);
+			if offset < key_size {
+				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(hkdf::InvalidLength))?;
+			}
 		}
+
 		Ok(Zeroizing::new(out))
 	}
 
-	fn derive_dual_keys<const N: usize>(
-		ikm: &[u8],
-		info: &[u8],
-		_salt: Option<&[u8]>,
-	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
-		// Derive two independent keys via distinct SharedInfo labels
-		// Use stack-allocated arrays where possible to avoid heap allocation
-		let mut enc_info = [0u8; 256]; // Reasonable max size for info + suffix
-		let mut mac_info = [0u8; 256];
-
-		let enc_info_len = core::cmp::min(enc_info.len(), info.len() + 11);
-		let mac_info_len = core::cmp::min(mac_info.len(), info.len() + 4);
-
-		enc_info[..info.len()].copy_from_slice(info);
-		enc_info[info.len()..info.len() + 11].copy_from_slice(b"-encryption");
-
-		mac_info[..info.len()].copy_from_slice(info);
-		mac_info[info.len()..info.len() + 4].copy_from_slice(b"-mac");
-
-		let k_enc = Self::derive_key::<N>(ikm, &enc_info[..enc_info_len], None)?;
-		let k_mac = Self::derive_key::<N>(ikm, &mac_info[..mac_info_len], None)?;
-		Ok((k_enc, k_mac))
-	}
+	// `derive_dual_keys` intentionally omitted: the trait default already derives
+	// independent encryption/MAC keys via distinct SharedInfo labels, and X9.63
+	// ignores `salt`, so an override would be byte-identical duplication.
 }
 
 /// Errors specific to KDF operations
@@ -278,6 +272,11 @@ pub enum KdfError {
 		error("Invalid salt length: must be at least 16 bytes, got {0}")
 	)]
 	InvalidSaltLength(usize),
+
+	/// Secret material was unavailable during derivation
+	#[cfg_attr(feature = "derive", error("Secret unavailable: {0}"))]
+	#[cfg_attr(feature = "derive", from)]
+	SecretUnavailable(crate::crypto::secret::SecretError),
 }
 
 crate::impl_error_display!(KdfError {
@@ -285,7 +284,11 @@ crate::impl_error_display!(KdfError {
 	InvalidPublicKeyLength(len) => "Invalid ephemeral public key length: expected 33 or 65 bytes, got {len}",
 	InvalidSharedSecretLength(len) => "Invalid shared secret length: expected 32 bytes, got {len}",
 	InvalidSaltLength(len) => "Invalid salt length: must be at least 16 bytes, got {len}",
+	SecretUnavailable(e) => "Secret unavailable: {e}",
 });
+
+#[cfg(not(feature = "derive"))]
+crate::impl_from!(crate::crypto::secret::SecretError => KdfError::SecretUnavailable);
 
 // ============================================================================
 // Input Validation Helpers
@@ -304,7 +307,7 @@ fn assert_valid_shared_secret(shared_secret: &[u8]) -> Result<()> {
 #[inline]
 fn assert_valid_salt(salt: Option<&[u8]>) -> Result<()> {
 	if let Some(salt_bytes) = salt {
-		if !salt_bytes.is_empty() && salt_bytes.len() < MIN_KEY_SIZE {
+		if !salt_bytes.is_empty() && salt_bytes.len() < MIN_SALT_SIZE {
 			return Err(KdfError::InvalidSaltLength(salt_bytes.len()));
 		}
 	}
@@ -521,14 +524,12 @@ mod tests {
 	#[test]
 	fn test_ecies_kdf_basic_functionality() -> crate::error::Result<()> {
 		// Test cases for basic functionality and determinism
-		let basic_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-		let same_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let basic_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
+		let same_key = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
 		// Test cases for input variation (different inputs should produce different outputs)
-		let different_pubkey =
-			ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33_ALT, shared_secret_32(), INFO_V1, None).unwrap();
-		let different_info = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None).unwrap();
-		let with_salt =
-			ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT)).unwrap();
+		let different_pubkey = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33_ALT, shared_secret_32(), INFO_V1, None)?;
+		let different_info = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None)?;
+		let with_salt = ecies_kdf::<HkdfSha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT))?;
 
 		// Test case for uncompressed pubkey (65 bytes)
 		let mut uncompressed_pubkey = [0u8; 65];
@@ -549,7 +550,7 @@ mod tests {
 		assert_keys_different(&basic_key, &with_salt); // With vs without salt
 												 // Uncompressed pubkey: should work and produce 32-byte key
 		assert!(uncompressed_result.is_ok());
-		assert_key_length(&uncompressed_result.unwrap(), 32);
+		assert_key_length(&uncompressed_result?, 32);
 
 		Ok(())
 	}
@@ -558,12 +559,9 @@ mod tests {
 	#[test]
 	fn test_ecies_kdf_size_variations() -> crate::error::Result<()> {
 		// Test different key sizes
-		let keys_16 =
-			ecies_kdf_with_size::<HkdfSha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-		let keys_32 =
-			ecies_kdf_with_size::<HkdfSha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-		let keys_64 =
-			ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let keys_16 = ecies_kdf_with_size::<HkdfSha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
+		let keys_32 = ecies_kdf_with_size::<HkdfSha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
+		let keys_64 = ecies_kdf_with_size::<HkdfSha3_256, 64>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
 
 		let (k_enc_16, k_mac_16) = keys_16;
 		let (k_enc_32, k_mac_32) = keys_32;
@@ -612,14 +610,14 @@ mod tests {
 		let info = b"test_info";
 
 		// Test different key sizes
-		let key_16 = hkdf::<HkdfSha3_256, 16>(ikm, info, None).unwrap();
-		let key_32 = hkdf::<HkdfSha3_256, 32>(ikm, info, None).unwrap();
-		let key_64 = hkdf::<HkdfSha3_256, 64>(ikm, info, None).unwrap();
+		let key_16 = hkdf::<HkdfSha3_256, 16>(ikm, info, None)?;
+		let key_32 = hkdf::<HkdfSha3_256, 32>(ikm, info, None)?;
+		let key_64 = hkdf::<HkdfSha3_256, 64>(ikm, info, None)?;
 
 		// Determinism test
-		let key_32_again = hkdf::<HkdfSha3_256, 32>(ikm, info, None).unwrap();
+		let key_32_again = hkdf::<HkdfSha3_256, 32>(ikm, info, None)?;
 		// Different inputs test
-		let key_different = hkdf::<HkdfSha3_256, 32>(b"different_ikm", info, None).unwrap();
+		let key_different = hkdf::<HkdfSha3_256, 32>(b"different_ikm", info, None)?;
 
 		// Check key lengths
 		assert_key_length!(key_16, 16);
@@ -645,7 +643,7 @@ mod tests {
 
 		// Maximum allowed size should work
 		assert!(max_size_result.is_ok());
-		let (k_enc, k_mac) = max_size_result.unwrap();
+		let (k_enc, k_mac) = max_size_result?;
 		assert_key_pair_lengths!(k_enc, k_mac, 64);
 
 		// Oversized key should fail with DerivationFailed
@@ -658,12 +656,11 @@ mod tests {
 	// Smoke tests for ANSI X9.63 provider over SHA3-256
 	#[test]
 	fn test_x963_ecies_kdf_basic() -> crate::error::Result<()> {
-		let key1 = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-		let key1_again = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-		let key_diff_info = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None).unwrap();
+		let key1 = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
+		let key1_again = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
+		let key_diff_info = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V2, None)?;
 		// Salt is ignored by X9.63; with vs without salt should be equal
-		let key_with_salt =
-			ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT)).unwrap();
+		let key_with_salt = ecies_kdf::<X963Sha3_256>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, Some(SALT))?;
 
 		assert_key_length(&key1, 32);
 		assert_keys_equal(&key1, &key1_again);
@@ -675,16 +672,27 @@ mod tests {
 
 	#[test]
 	fn test_x963_ecies_kdf_size_variations() -> crate::error::Result<()> {
-		let keys_16 =
-			ecies_kdf_with_size::<X963Sha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
-		let keys_32 =
-			ecies_kdf_with_size::<X963Sha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None).unwrap();
+		let keys_16 = ecies_kdf_with_size::<X963Sha3_256, 16>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
+		let keys_32 = ecies_kdf_with_size::<X963Sha3_256, 32>(EPHEMERAL_PUBKEY_33, shared_secret_32(), INFO_V1, None)?;
 
 		let (k_enc_16, k_mac_16) = keys_16;
 		let (k_enc_32, k_mac_32) = keys_32;
 		assert_key_pair_lengths!(k_enc_16, k_mac_16, 16);
 		assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
 		assert_keys_different!(k_enc_32, k_mac_32);
+		Ok(())
+	}
+
+	// SharedInfo longer than the former fixed 256-byte buffer must derive
+	// without panicking.
+	#[test]
+	fn test_x963_dual_keys_large_shared_info() -> crate::error::Result<()> {
+		let large_info = vec![0xABu8; 300];
+		let (k_enc, k_mac) =
+			ecies_kdf_with_shared_info_and_size::<X963Sha3_256, 32>(shared_secret_32(), &large_info, None)?;
+
+		assert_key_pair_lengths!(k_enc, k_mac, 32);
+		assert_keys_different!(k_enc, k_mac);
 		Ok(())
 	}
 }

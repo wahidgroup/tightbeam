@@ -1,25 +1,32 @@
-//! Replay attack threat test.
+//! # Handshake replay threat
 //!
-//! Tests that captured handshake messages cannot be replayed to establish
-//! unauthorized sessions. This test runs against all enabled backends (ECIES, CMS).
+//! ## Weakness
+//! Captured handshake messages could be replayed to establish an unauthorized
+//! session if completed handshakes are not bound to fresh, single-use state.
+//!
+//! ## Attack
+//! A valid client handshake message is captured and re-sent to the server (all
+//! enabled backends: ECIES, CMS).
+//!
+//! ## Expected control
+//! Replayed handshake messages MUST be rejected.
+//!
+//! ## References
+//! - CWE-294: Authentication Bypass by Capture-replay
+//!   <https://cwe.mitre.org/data/definitions/294.html>
+//! - CAPEC-60: Reusing Session IDs (aka Session Replay)
+//!   <https://capec.mitre.org/data/definitions/60.html>
 
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{error::FdrConfigError, error::TestingError, ScenarioConf},
-	trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
 	TightBeamError,
 };
 
-use crate::security::common::{HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32};
-
-fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError {
-		field: "replay_attack",
-		reason,
-	}))
-}
+use crate::security::common::{
+	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
+};
 
 tb_assert_spec! {
 	pub ReplayAttackSpec,

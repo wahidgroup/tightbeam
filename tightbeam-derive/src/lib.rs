@@ -447,23 +447,16 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 
 				// Generate From impl if #[from] is present and there's exactly one field
 				if has_from && field_count == 1 {
-					let field_type = &fields.unnamed.first().unwrap().ty;
-					from_impls.push(quote! {
-						impl From<#field_type> for #name {
-							fn from(err: #field_type) -> Self {
-								#name::#variant_name(err)
-							}
-						}
-
-						impl From<#name> for #field_type {
-							fn from(err: #name) -> Self {
-								match err {
-									#name::#variant_name(inner) => inner,
-									_ => panic!("Cannot convert {} to {}", stringify!(#name), stringify!(#field_type)),
+					if let Some(field) = fields.unnamed.first() {
+						let field_type = &field.ty;
+						from_impls.push(quote! {
+							impl From<#field_type> for #name {
+								fn from(err: #field_type) -> Self {
+									#name::#variant_name(err)
 								}
 							}
-						}
-					});
+						});
+					}
 				}
 			}
 			syn::Fields::Named(fields) => {

@@ -1,5 +1,10 @@
 //! Builder-specific errors for CMS handshake construction.
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::string::ToString;
+
 /// Errors that can occur during KARI builder construction.
 #[cfg_attr(feature = "derive", derive(crate::Errorizable))]
 #[derive(Debug)]
@@ -54,3 +59,16 @@ crate::impl_error_display!(KariBuilderError {
 crate::impl_from!(der::Error => KariBuilderError::DerError);
 #[cfg(not(feature = "derive"))]
 crate::impl_from!(crate::cms::builder::Error => KariBuilderError::CmsBuilderError);
+
+/// Narrows [`KariBuilderError`] into the foreign [`crate::cms::builder::Error`].
+/// `Missing*` config variants lack a structured `cms` counterpart, so collapse
+/// into [`Builder`](crate::cms::builder::Error::Builder) via their `Display`.
+impl From<KariBuilderError> for crate::cms::builder::Error {
+	fn from(err: KariBuilderError) -> Self {
+		match err {
+			KariBuilderError::DerError(e) => crate::cms::builder::Error::Asn1(e),
+			KariBuilderError::CmsBuilderError(e) => e,
+			other => crate::cms::builder::Error::Builder(other.to_string()),
+		}
+	}
+}

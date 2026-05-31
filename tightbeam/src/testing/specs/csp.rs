@@ -592,7 +592,7 @@ mod tests {
 	use crate::{compose, exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
 
 	#[test]
-	fn builder_creates_valid_process() {
+	fn builder_creates_valid_process() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("TestProc")
 			.initial_state(State("S0"))
 			.add_observable("start")
@@ -603,25 +603,25 @@ mod tests {
 			.add_transition(State("S2"), "send", State("S3"))
 			.add_terminal(State("S3"))
 			.description("Simple test process")
-			.build()
-			.expect("Failed to build process");
+			.build()?;
 
 		assert_eq!(proc.name, "TestProc");
 		assert_eq!(proc.initial, State("S0"));
 		assert_eq!(proc.observable.len(), 2);
 		assert_eq!(proc.hidden.len(), 1);
 		assert!(proc.is_terminal(State("S3")));
+
+		Ok(())
 	}
 
 	#[test]
-	fn step_executes_transitions() {
+	fn step_executes_transitions() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("StepTest")
 			.initial_state(State("S0"))
 			.add_observable("go")
 			.add_transition(State("S0"), "go", State("S1"))
 			.add_terminal(State("S1"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		let targets = proc.step(State("S0"), &Event("go"));
 		assert_eq!(targets.len(), 1);
@@ -629,10 +629,12 @@ mod tests {
 
 		let no_targets = proc.step(State("S0"), &Event("missing"));
 		assert_eq!(no_targets.len(), 0);
+
+		Ok(())
 	}
 
 	#[test]
-	fn enabled_returns_possible_actions() {
+	fn enabled_returns_possible_actions() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("EnabledTest")
 			.initial_state(State("S0"))
 			.add_observable("a")
@@ -642,8 +644,7 @@ mod tests {
 			.add_transition(State("S0"), "tau", State("S2"))
 			.add_terminal(State("S1"))
 			.add_terminal(State("S2"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		let enabled = proc.enabled(State("S0"));
 		assert_eq!(enabled.len(), 2);
@@ -651,10 +652,12 @@ mod tests {
 		let events: Vec<&str> = enabled.iter().map(|a| a.event.0).collect();
 		assert!(events.contains(&"a"));
 		assert!(events.contains(&"tau"));
+
+		Ok(())
 	}
 
 	#[test]
-	fn nondeterministic_choice() {
+	fn nondeterministic_choice() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("ChoiceTest")
 			.initial_state(State("S0"))
 			.add_observable("choice")
@@ -663,8 +666,7 @@ mod tests {
 			.add_choice(State("S0"))
 			.add_terminal(State("S1"))
 			.add_terminal(State("S2"))
-			.build()
-			.unwrap();
+			.build()?;
 
 		let targets = proc.step(State("S0"), &Event("choice"));
 		assert_eq!(targets.len(), 2);
@@ -672,10 +674,12 @@ mod tests {
 		assert!(targets.contains(&State("S2")));
 
 		assert!(proc.is_choice(State("S0")));
+
+		Ok(())
 	}
 
 	#[test]
-	fn handshake_process_example() {
+	fn handshake_process_example() -> Result<(), Box<dyn core::error::Error>> {
 		// CSP handshake with queued or direct send
 		let proc = Process::builder("Handshake")
 			.initial_state(State("S0"))
@@ -705,8 +709,7 @@ mod tests {
 			// Nondeterministic choice
 			.add_choice(State("S1"))
 			.description("Queued or direct send")
-			.build()
-			.unwrap();
+			.build()?;
 
 		// Verify initial state
 		assert_eq!(proc.initial, State("S0"));
@@ -729,6 +732,8 @@ mod tests {
 		// Verify terminal states
 		assert!(proc.is_terminal(State("S3")));
 		assert!(proc.is_terminal(State("S3f")));
+
+		Ok(())
 	}
 
 	// Test CSP process spec integration with assert spec and ServiceClient environment

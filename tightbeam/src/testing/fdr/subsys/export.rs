@@ -67,7 +67,9 @@ impl<'a> CspmExporter<'a> {
 						first = false;
 
 						let next_states = self.process.step(*state, &action.event);
-						let next = next_states.first().unwrap(); // Take first for simplicity
+						let next = next_states
+							.first()
+							.expect("non-terminal state with enabled actions has a successor"); // Take first for simplicity
 
 						if action.is_observable() {
 							write!(writer, "obs.{} -> {}Process", action.event.0, next.0)?;

@@ -42,7 +42,6 @@ use tightbeam::{
 		policy::Secp256k1Policy,
 		sign::ecdsa::{Secp256k1, Secp256k1SigningKey},
 		x509::{
-			error::CertificateValidationError,
 			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 			Certificate, CertificateSpec,
 		},
@@ -99,7 +98,7 @@ use crate::dtn::{
 // Test Helpers
 // ============================================================================
 
-fn make_trust_store(cert_spec: CertificateSpec) -> Result<Arc<dyn CertificateTrust>, CertificateValidationError> {
+fn make_trust_store(cert_spec: CertificateSpec) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let cert = Certificate::try_from(cert_spec)?;
 	Ok(Arc::new(
 		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
@@ -1059,7 +1058,7 @@ tb_scenario! {
 			Ok(rover_servlet)
 		},
 		setup: |_rover_addr, config: Arc<DtnScenarioConfig>| async move {
-			let mars_relay_addr = (*config.mars_relay_addr.read()?).expect("Mars Relay address must be set");
+			let mars_relay_addr = (*config.mars_relay_addr.read()?).ok_or(TightBeamError::MissingConfiguration)?;
 
 			// Connect Rover client to Mars Relay
 			let client = ClientBuilder::<TokioListener>::builder()

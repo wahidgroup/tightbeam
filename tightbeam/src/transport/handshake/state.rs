@@ -120,7 +120,7 @@ use std::collections::{HashMap, VecDeque};
 /// - `N`: Nonce size in bytes (e.g., 32 for ECIES client_random, 64 for CMS UKM)
 ///
 /// # Security Properties
-/// - Constant-time lookup via HashMap
+/// - Amortized O(1) lookup via HashMap (not constant-time)
 /// - Bounded memory usage (cap * N bytes + overhead)
 /// - LRU eviction ensures recent nonces are always tracked
 /// - No silent failures: all nonces are either tracked or evict oldest

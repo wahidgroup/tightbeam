@@ -58,6 +58,8 @@ pub enum TestingError {
 	InvalidFaultModel,
 	#[cfg_attr(feature = "derive", error("Schedulability violation: {0}"))]
 	SchedulabilityViolation(SchedulabilityViolationDetail),
+	#[cfg_attr(feature = "derive", error("Invariant violated"))]
+	InvariantViolated,
 }
 
 crate::impl_error_display!(TestingError {
@@ -69,6 +71,7 @@ crate::impl_error_display!(TestingError {
 	InvalidFdrConfig(detail) => "Invalid FDR configuration: {detail}",
 	InvalidFaultModel => "Invalid fault model configuration",
 	SchedulabilityViolation(detail) => "Schedulability violation: {detail}",
+	InvariantViolated => "Invariant violated",
 });
 
 #[cfg(feature = "std")]

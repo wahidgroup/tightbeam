@@ -390,13 +390,15 @@ mod tests {
 	}
 
 	#[test]
-	fn test_join_pipelines() {
+	fn test_join_pipelines() -> Result<(), Box<dyn core::error::Error>> {
 		let pipe1: Result<i32, &str> = Ok(10);
 		let pipe2: Result<i32, &str> = Ok(20);
 
-		let (a, b) = join(pipe1, pipe2).run().unwrap();
+		let (a, b) = join(pipe1, pipe2).run()?;
 		assert_eq!(a, 10);
 		assert_eq!(b, 20);
+
+		Ok(())
 	}
 
 	#[test]

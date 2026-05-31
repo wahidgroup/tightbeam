@@ -132,8 +132,9 @@ mod tests {
 			artifact.timing_results.slack_violations.len(),
 			decoded.timing_results.slack_violations.len()
 		);
-		assert!(decoded.statistical_analysis.is_some());
-		let decoded_stats = decoded.statistical_analysis.unwrap();
+		let Some(decoded_stats) = decoded.statistical_analysis.as_ref() else {
+			return Err(crate::testing::error::TestingError::InvariantViolated.into());
+		};
 		assert_eq!(decoded_stats.count, 100);
 		assert_eq!(decoded_stats.mean, 50_000_000);
 		assert_eq!(decoded_stats.percentiles.len(), 2);

@@ -338,7 +338,6 @@ pub trait KemProvider {
 /// This is a convenience trait that composes all role-based provider traits.
 /// Components can use specific role traits (e.g., `SigningProvider + DigestProvider`)
 /// instead of requiring the full `CryptoProvider` to reduce trait bound complexity.
-// TODO RustCrypto currently does not support KEMs.
 #[cfg(all(
 	feature = "digest",
 	feature = "aead",
@@ -412,7 +411,7 @@ impl CurveProvider for DefaultCryptoProvider {
 	type EciesMessage = crate::crypto::ecies::Secp256k1EciesMessage;
 }
 
-// TODO RustCrypto currently does not support KEMs.
+// TODO: KEM wiring deferred - RustCrypto lacks stable KEM provider traits.
 // #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
 // impl KemProvider for DefaultCryptoProvider {
 // 	type EncappedKey = Kyber1024EncappedKey;

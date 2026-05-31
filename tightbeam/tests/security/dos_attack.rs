@@ -1,42 +1,38 @@
-//! Denial of Service (DoS) attack threat test.
+//! # Denial-of-service (oversized message) threat
 //!
-//! Tests that oversized handshake messages are rejected to prevent resource exhaustion.
-//! This test runs against all enabled backends (ECIES, CMS).
+//! ## Weakness
+//! Processing attacker-sized handshake messages without an up-front bound lets a
+//! single request exhaust memory/CPU.
 //!
-//! ## Attack Scenario
+//! ## Attack
+//! An oversized handshake message (>16 KiB) is sent to the peer (all enabled
+//! backends: ECIES, CMS).
 //!
-//! 1. Attacker sends an oversized handshake message (>16 KiB)
-//! 2. Server/Client should reject before full processing
-//! 3. Resource exhaustion is prevented
+//! ## Expected control
+//! A 16 KiB handshake size cap (`HANDSHAKE_MAX_WIRE`) MUST reject oversized
+//! messages before full processing; normal-sized messages MUST still work.
 //!
-//! ## Control
-//!
-//! 16 KiB handshake size cap (`HANDSHAKE_MAX_WIRE`).
-//! Reject oversized handshake messages before processing.
-//!
-//! ## What This Test Proves
-//!
-//! - Oversized messages are rejected at the protocol level
-//! - The size limit prevents resource exhaustion attacks
-//! - Normal-sized messages still work correctly
+//! ## References
+//! - CWE-400: Uncontrolled Resource Consumption
+//!   <https://cwe.mitre.org/data/definitions/400.html>
+//! - CWE-770: Allocation of Resources Without Limits or Throttling
+//!   <https://cwe.mitre.org/data/definitions/770.html>
+//! - CAPEC-130: Excessive Allocation
+//!   <https://capec.mitre.org/data/definitions/130.html>
 
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{error::FdrConfigError, error::TestingError, ScenarioConf},
-	trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
 	TightBeamError,
 };
 
-use crate::security::common::{HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32};
+use crate::security::common::{
+	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
+};
 
 /// Maximum handshake message size (16 KiB) as defined in transport layer.
 const HANDSHAKE_MAX_SIZE: usize = 16 * 1024;
-
-fn expectation_failure(reason: &'static str) -> TightBeamError {
-	TightBeamError::TestingError(TestingError::InvalidFdrConfig(FdrConfigError { field: "dos_attack", reason }))
-}
 
 tb_assert_spec! {
 	pub DosAttackSpec,
