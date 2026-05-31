@@ -35,8 +35,10 @@ mod signing {
 	pub use crate::crypto::sign::elliptic_curve::sec1::ModulusSize;
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::subtle::CtOption;
+	#[cfg(feature = "ecdh")]
+	pub use crate::crypto::sign::elliptic_curve::PublicKey;
 	pub use crate::crypto::sign::elliptic_curve::{
-		AffinePoint, CurveArithmetic, Error as EllipticCurveError, FieldBytesSize, PrimeCurve, PublicKey,
+		AffinePoint, CurveArithmetic, Error as EllipticCurveError, FieldBytesSize, PrimeCurve,
 	};
 	pub use crate::crypto::sign::{
 		Error as SignatureError, Keypair, SignatureAlgorithmIdentifier, SignatureEncoding, Signer,

@@ -20,16 +20,23 @@ use crate::der::oid::AssociatedOid;
 use crate::error::Result;
 use crate::{DigestInfo, Message};
 
-/// Compute the commitment digest `H(salt || data)`.
+/// Compute the commitment digest over `salt` and `data`.
 ///
-/// An empty `salt` yields `H(data)`, matching a plain message digest. The salt
-/// is concatenated without length framing, so a deployment MUST use a
-/// fixed-length salt to avoid prefix ambiguity.
+/// An empty `salt` yields `H(data)`, matching a plain message digest for
+/// backwards compatibility. A non-empty salt is length-framed as
+/// `H(len(salt) || salt || data)` with an 8-byte big-endian length, so distinct
+/// `(salt, data)` pairs cannot collide into the same preimage and the binding
+/// property holds for variable-length salts.
 pub(crate) fn commit_digest<D>(salt: &[u8], data: &[u8]) -> Result<DigestInfo>
 where
 	D: Digest + AssociatedOid,
 {
-	let mut buffer = Vec::with_capacity(salt.len() + data.len());
+	if salt.is_empty() {
+		return crate::utils::digest::<D>(data);
+	}
+
+	let mut buffer = Vec::with_capacity(8 + salt.len() + data.len());
+	buffer.extend_from_slice(&(salt.len() as u64).to_be_bytes());
 	buffer.extend_from_slice(salt);
 	buffer.extend_from_slice(data);
 
@@ -139,6 +146,15 @@ mod tests {
 		let (unsalted, _) = commit(1, &[])?;
 		let (salted, _) = commit(1, &[7u8; 32])?;
 		assert_ne!(unsalted.digest.as_bytes(), salted.digest.as_bytes());
+		Ok(())
+	}
+
+	#[test]
+	fn salt_framing_prevents_prefix_collision() -> Result<()> {
+		// Raw concatenation collides into [1, 2, 3]; length framing must not.
+		let split_salt = commit_digest::<Sha3_256>(&[1], &[2, 3])?;
+		let split_data = commit_digest::<Sha3_256>(&[1, 2], &[3])?;
+		assert_ne!(split_salt.digest.as_bytes(), split_data.digest.as_bytes());
 		Ok(())
 	}
 

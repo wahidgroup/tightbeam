@@ -3350,7 +3350,7 @@ divergence_refines) are only meaningful when specs are provided in FdrConfig.
 
 **Traces Model**: Verifies that all observable event sequences produced by the
 implementation are allowed by the specification. This ensures basic behavioral
-correctness-the system never produces an unexpected sequence of external events.
+correctness - the system never produces an unexpected sequence of external events.
 
 **Stable Failures Model**: Extends trace verification by checking what events a
 process can *refuse* after each trace. A stable state is one where no internal
@@ -3382,7 +3382,7 @@ tb_process_spec! {
 ```
 
 **Observable events** represent the process's contract with its environment.
-These form the basis of trace refinement-implementations and specifications must
+These form the basis of trace refinement - implementations and specifications must
 agree on observable behavior.
 
 **Hidden events** model internal implementation details. They enable refinement
