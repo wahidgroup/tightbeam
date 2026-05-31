@@ -4,11 +4,16 @@
 //! itself a pipeline. Jobs compose seamlessly with standard Rust code using
 //! familiar Result methods.
 
+#[cfg(any(test, feature = "testing"))]
 use std::borrow::Cow;
+#[cfg(any(test, feature = "testing"))]
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "testing"))]
 use crate::error::TightBeamError;
+#[cfg(any(test, feature = "testing"))]
 use crate::trace::TraceCollector;
+#[cfg(any(test, feature = "testing"))]
 use crate::utils::urn::Urn;
 
 /// Pipeline trait - extends Result with trace and retry capabilities
@@ -115,6 +120,7 @@ where
 /// - `suite::jobs::CreateTestFrame::run` -> `create_test_frame`
 /// - `my_crate::ValidateConfig::run` -> `validate_config`
 /// - `CreateHandshakeRequest` -> `create_handshake_request` (fallback)
+#[cfg(any(test, feature = "testing"))]
 fn to_snake_case(type_name: &str) -> String {
 	// Split by "::" and collect segments
 	let segments: Vec<&str> = type_name.split("::").collect();
@@ -147,6 +153,7 @@ fn to_snake_case(type_name: &str) -> String {
 /// Create a tightbeam instrumentation event URN
 ///
 /// Format: `urn:tightbeam:instrumentation:event/<job_name>_<suffix>`
+#[cfg(any(test, feature = "testing"))]
 fn make_event_urn(job_name: &str, suffix: &str) -> Urn<'static> {
 	Urn {
 		nid: Cow::Borrowed("tightbeam"),
@@ -158,11 +165,13 @@ fn make_event_urn(job_name: &str, suffix: &str) -> Urn<'static> {
 ///
 /// TracedResult wraps a Result and automatically emits trace events when jobs execute.
 /// Job names are automatically derived from their type names using snake_case conversion.
+#[cfg(any(test, feature = "testing"))]
 pub struct TracedResult<T, E> {
 	result: Result<T, E>,
 	trace: Arc<TraceCollector>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl<T, E> TracedResult<T, E> {
 	/// Create a new TracedResult
 	pub fn new(result: Result<T, E>, trace: Arc<TraceCollector>) -> Self {
@@ -175,6 +184,7 @@ impl<T, E> TracedResult<T, E> {
 	}
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl<T, E> Pipeline for TracedResult<T, E>
 where
 	E: From<TightBeamError>,
@@ -237,10 +247,12 @@ where
 ///
 /// PipelineBuilder initializes a pipeline with trace context, enabling automatic
 /// trace event emission for all jobs in the pipeline.
+#[cfg(any(test, feature = "testing"))]
 pub struct PipelineBuilder {
 	trace: Arc<TraceCollector>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl PipelineBuilder {
 	/// Create a new pipeline builder with trace context
 	pub fn new(trace: Arc<TraceCollector>) -> Self {

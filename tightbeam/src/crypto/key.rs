@@ -26,6 +26,7 @@ mod signing {
 		DigestPrimitive, Secp256k1, Secp256k1Signature, Secp256k1SigningKey, SignPrimitive, Signature, SignatureSize,
 		SigningKey, VerifyPrimitive,
 	};
+	#[cfg(feature = "ecdh")]
 	pub use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 	pub use crate::crypto::sign::elliptic_curve::generic_array::{ArrayLength, GenericArray};
 	pub use crate::crypto::sign::elliptic_curve::ops::{Invert, Reduce};
@@ -421,6 +422,7 @@ where
 		Box::pin(async move { Ok(bytes) })
 	}
 
+	#[cfg(feature = "ecdh")]
 	fn key_agreement(
 		&self,
 		peer_public_key: &[u8],

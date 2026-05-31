@@ -10,7 +10,7 @@ pub mod flags;
 pub mod policy;
 #[cfg(feature = "builder")]
 pub mod relay;
-#[cfg(feature = "builder")]
+#[cfg(all(feature = "builder", feature = "transport"))]
 pub mod server;
 
 #[cfg(feature = "x509")]

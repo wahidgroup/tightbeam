@@ -243,11 +243,11 @@ impl UtilizationReporter {
 		};
 
 		// Calculate queue utilization: (depth / capacity) * 10000
-		let queue_util = if self.queue_capacity == 0 {
-			0
-		} else {
-			queue.queue_depth().saturating_mul(10000) / self.queue_capacity
-		};
+		let queue_util = queue
+			.queue_depth()
+			.saturating_mul(10000)
+			.checked_div(self.queue_capacity)
+			.unwrap_or(0);
 
 		// Weighted average: (latency_weight * latency + queue_weight * queue) / 10000
 		let latency_weight = self.latency_weight_bps as u32;
