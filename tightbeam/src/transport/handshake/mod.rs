@@ -128,10 +128,10 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-#[cfg(feature = "std")]
-pub use std::sync::Arc;
 #[cfg(not(feature = "std"))]
 pub use alloc::sync::Arc;
+#[cfg(feature = "std")]
+pub use std::sync::Arc;
 
 mod attributes;
 mod common;

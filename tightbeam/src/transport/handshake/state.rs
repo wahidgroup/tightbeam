@@ -109,10 +109,10 @@ impl ServerHandshakeState {
 // Replay / Nonce Tracking
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "std")]
-use std::collections::{HashMap, VecDeque};
 #[cfg(not(feature = "std"))]
 use alloc::collections::{BTreeMap as HashMap, VecDeque};
+#[cfg(feature = "std")]
+use std::collections::{HashMap, VecDeque};
 
 /// Nonce replay detection with LRU eviction.
 ///

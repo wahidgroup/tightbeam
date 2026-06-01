@@ -3,13 +3,13 @@
 use core::cell::Cell;
 use core::time::Duration;
 
+#[cfg(all(feature = "std", feature = "testing-fault"))]
+use std::collections::HashMap;
 #[cfg(feature = "std")]
 use std::{
 	borrow::Cow,
 	sync::{Arc, Mutex},
 };
-#[cfg(all(feature = "std", feature = "testing-fault"))]
-use std::collections::HashMap;
 
 #[cfg(not(feature = "std"))]
 use alloc::{

@@ -202,7 +202,9 @@ impl KdfFunction for X963Sha3_256 {
 			out[offset..offset + take].copy_from_slice(&block[..take]);
 			offset += take;
 			if offset < N {
-				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength))?;
+				counter = counter
+					.checked_add(1)
+					.ok_or(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength))?;
 			}
 		}
 
@@ -235,7 +237,9 @@ impl KdfFunction for X963Sha3_256 {
 			out[offset..offset + take].copy_from_slice(&block[..take]);
 			offset += take;
 			if offset < key_size {
-				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength))?;
+				counter = counter
+					.checked_add(1)
+					.ok_or(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength))?;
 			}
 		}
 

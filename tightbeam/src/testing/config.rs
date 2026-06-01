@@ -11,10 +11,10 @@
 
 #![allow(unexpected_cfgs)]
 
-#[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec::Vec};
 #[cfg(all(not(feature = "std"), feature = "testing-csp"))]
 use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::{sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
 use std::{sync::Arc, vec::Vec};
 

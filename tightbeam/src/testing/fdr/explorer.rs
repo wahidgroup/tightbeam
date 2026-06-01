@@ -5,9 +5,10 @@
 //! - `RefinementChecker`: Refinement checking algorithms (trace, failures, divergence)
 //! - `MemoizationCache`: Caching layer for expensive computations
 
+use std::collections::HashSet;
+
 #[cfg(feature = "testing-timing")]
 use core::time::Duration;
-use std::collections::HashSet;
 #[cfg(feature = "testing-timing")]
 use std::collections::HashMap;
 

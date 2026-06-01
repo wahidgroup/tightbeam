@@ -7,8 +7,6 @@ use std::collections::HashSet;
 #[cfg(feature = "testing-fault")]
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-#[cfg(feature = "testing-fault")]
-use crate::{constants::DEFAULT_FAULT_SEED, error::TightBeamError, testing::error::FdrConfigError, utils::BasisPoints};
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
 
@@ -16,6 +14,8 @@ use crate::testing::specs::csp::{Event, Process, State};
 use crate::testing::fault::{ProcessEvent, ProcessState};
 #[cfg(feature = "testing-fmea")]
 use crate::testing::fmea::{FmeaConfig, FmeaReport};
+#[cfg(feature = "testing-fault")]
+use crate::{constants::DEFAULT_FAULT_SEED, error::TightBeamError, testing::error::FdrConfigError, utils::BasisPoints};
 
 /// CSP trace: sequence of observable events
 pub type Trace = Vec<Event>;
