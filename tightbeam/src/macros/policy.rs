@@ -133,7 +133,6 @@ macro_rules! policy {
 mod tests {
 	#![allow(unused_variables)]
 
-	use crate::compose;
 	use crate::der::Sequence;
 	use crate::policy::{GatePolicy, ReceptorPolicy, TransitStatus};
 	use crate::transport::policy::RetryAction;

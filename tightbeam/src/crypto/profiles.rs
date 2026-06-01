@@ -1,16 +1,21 @@
 //! Associated-type based cryptographic provider abstraction.
 
 use crate::constants::TIGHTBEAM_UKM_PREFIX;
-use crate::crypto::hash::Digest;
 use crate::der::asn1::ObjectIdentifier;
-use crate::der::oid::AssociatedOid;
 use crate::der::Sequence;
 use crate::oids::AES_256_WRAP;
-use crate::spki::AlgorithmIdentifierOwned;
-use crate::Beamable;
 
-#[cfg(feature = "derive")]
-use crate::Errorizable;
+#[cfg(any(
+	feature = "digest",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh",
+	feature = "kem"
+))]
+use crate::der::oid::AssociatedOid;
+#[cfg(any(feature = "digest", feature = "aead", feature = "signature"))]
+use crate::spki::AlgorithmIdentifierOwned;
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
@@ -20,6 +25,8 @@ use crate::crypto::aead::Aes256Gcm;
 use crate::crypto::aead::Aes256GcmOid;
 #[cfg(feature = "ecdh")]
 use crate::crypto::curves::Secp256k1Oid;
+#[cfg(feature = "digest")]
+use crate::crypto::hash::Digest;
 #[cfg(feature = "sha3")]
 use crate::crypto::hash::Sha3_256;
 #[cfg(feature = "kdf")]
@@ -36,6 +43,10 @@ use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic};
 use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
 #[cfg(feature = "transport")]
 use crate::transport::handshake::HandshakeError;
+#[cfg(feature = "derive")]
+use crate::Beamable;
+#[cfg(feature = "derive")]
+use crate::Errorizable;
 
 /// Macro to generate key wrapper implementations.
 /// Reduces duplication across AES-128/192/256 variants.

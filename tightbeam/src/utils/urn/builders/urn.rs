@@ -148,9 +148,7 @@ impl<'a, S: UrnSpec> From<S> for UrnBuilder<'a> {
 	}
 }
 
-impl<'a> TypeBuilder<Urn<'a>> for UrnBuilder<'a> {
-	type Error = UrnValidationError;
-
+impl<'a> UrnBuilder<'a> {
 	/// Build the URN using the configured NSS mode
 	///
 	/// The NSS can be provided via:
@@ -173,7 +171,7 @@ impl<'a> TypeBuilder<Urn<'a>> for UrnBuilder<'a> {
 	/// - NID format is invalid (not RFC 8141 compliant)
 	/// - Both `with_nss()` and `with_spec()` were called (mutually exclusive)
 	/// - NSS cannot be constructed (empty components when using default mode)
-	fn build(mut self) -> Result<Urn<'a>, UrnValidationError> {
+	pub fn build(mut self) -> Result<Urn<'a>, UrnValidationError> {
 		// Validate NID format first
 		let nid_ref = self.nid.as_ref().ok_or(UrnValidationError::RequiredFieldMissing("nid"))?;
 
@@ -225,10 +223,18 @@ impl<'a> TypeBuilder<Urn<'a>> for UrnBuilder<'a> {
 	}
 }
 
+#[cfg(feature = "builder")]
+impl<'a> TypeBuilder<Urn<'a>> for UrnBuilder<'a> {
+	type Error = UrnValidationError;
+
+	fn build(self) -> Result<Urn<'a>, Self::Error> {
+		UrnBuilder::build(self)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::builder::TypeBuilder;
 	use crate::utils::urn::builders::spec::Pattern;
 
 	#[cfg(feature = "derive")]

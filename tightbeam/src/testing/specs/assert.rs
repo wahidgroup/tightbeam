@@ -8,6 +8,7 @@ use super::error::{AssertionViolationDetail, GateDecisionMismatch, SpecViolation
 use crate::error::ReceivedExpectedError;
 use crate::testing::assertions::AssertionContract;
 use crate::trace::{ConsumedTrace, ExecutionMode};
+#[cfg(feature = "instrument")]
 use crate::utils::urn::Urn;
 use crate::Frame;
 

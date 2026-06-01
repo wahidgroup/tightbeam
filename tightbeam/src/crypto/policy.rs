@@ -4,6 +4,7 @@
 
 use core::fmt::Debug;
 
+#[cfg(feature = "x509")]
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::der::oid::ObjectIdentifier;
 
@@ -31,6 +32,7 @@ crate::impl_error_display!(CryptoPolicyError {
 /// # Object Safety
 ///
 /// This trait is object-safe and can be used with `Arc<dyn VerificationPolicy>`.
+#[cfg(feature = "x509")]
 pub trait VerificationPolicy: Send + Sync + Debug {
 	/// Verify a signature given algorithm OID, public key, message, and signature bytes.
 	///
@@ -65,11 +67,11 @@ pub trait VerificationPolicy: Send + Sync + Debug {
 ///
 /// Handles parsing and verification of secp256k1 signatures internally.
 /// Supports ECDSA signatures on the secp256k1 curve.
-#[cfg(all(feature = "secp256k1", feature = "signature"))]
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Secp256k1Policy;
 
-#[cfg(all(feature = "secp256k1", feature = "signature"))]
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 impl VerificationPolicy for Secp256k1Policy {
 	fn verify_signature(
 		&self,

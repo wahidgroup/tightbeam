@@ -23,7 +23,6 @@
 //!
 //! ```rust
 //! use tightbeam::utils::urn::{Urn, UrnBuilder, UrnValidationError};
-//! use tightbeam::builder::TypeBuilder;
 //!
 //! fn main() -> Result<(), UrnValidationError> {
 //!     // Build a URN with direct NSS

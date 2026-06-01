@@ -95,7 +95,6 @@ mod tests {
 	use std::sync::{mpsc, Arc};
 	use std::time::Duration;
 
-	use crate::compose;
 	use crate::der::Sequence;
 	use crate::router::RouterPolicy;
 	use crate::Beamable;

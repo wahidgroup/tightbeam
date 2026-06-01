@@ -357,6 +357,11 @@ impl core::fmt::Display for TightBeamError {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		match self {
 			TightBeamError::SerializationError(err) => write!(f, "Serialization error: {err}"),
+			TightBeamError::MatrixError(err) => write!(f, "Matrix error: {err}"),
+			#[cfg(feature = "std")]
+			TightBeamError::IoError(err) => write!(f, "I/O error: {err}"),
+			#[cfg(feature = "crypto")]
+			TightBeamError::CryptoPolicyError(err) => write!(f, "Crypto policy error: {err}"),
 			#[cfg(feature = "router")]
 			TightBeamError::RouterError(err) => write!(f, "Route error: {err}"),
 			TightBeamError::InvalidMetadata => write!(f, "Invalid metadata"),
@@ -514,7 +519,7 @@ crate::impl_from!(crate::transport::handshake::HandshakeError => TightBeamError:
 crate::impl_from!(crate::transport::error::TransportError => TightBeamError::TransportError);
 
 #[cfg(all(feature = "random", not(feature = "derive")))]
-crate::impl_from!(getrandom::Error => TightBeamError::OsRngError);
+crate::impl_from!(rand_core::Error => TightBeamError::OsRngError);
 
 #[cfg(all(feature = "x509", not(feature = "derive")))]
 crate::impl_from!(spki::Error => TightBeamError::SpkiError);

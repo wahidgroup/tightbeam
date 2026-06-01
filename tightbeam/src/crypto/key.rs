@@ -7,18 +7,23 @@
 //! Concrete implementations (e.g., [`InMemoryKeyProvider`]) handle algorithm-specific
 //! encoding/decoding.
 
+use core::fmt::Debug;
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
+#[cfg(all(not(feature = "std"), any(feature = "signature", feature = "aead")))]
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 
-#[cfg(feature = "std")]
-use std::sync::Arc;
-
-use core::fmt::Debug;
+#[cfg(any(feature = "signature", feature = "aead"))]
 use core::future::Future;
+#[cfg(any(feature = "signature", feature = "aead"))]
 use core::marker::PhantomData;
+#[cfg(any(feature = "signature", feature = "aead"))]
 use core::pin::Pin;
+#[cfg(all(feature = "std", any(feature = "signature", feature = "aead")))]
+use std::sync::Arc;
 
 #[cfg(feature = "signature")]
 mod signing {
@@ -59,11 +64,13 @@ mod encryption {
 #[cfg(feature = "aead")]
 use encryption::*;
 
+#[cfg(any(feature = "signature", feature = "aead"))]
 mod common {
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
 }
 
+#[cfg(any(feature = "signature", feature = "aead"))]
 use common::*;
 
 #[cfg(feature = "derive")]

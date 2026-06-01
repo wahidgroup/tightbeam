@@ -36,6 +36,7 @@ macro_rules! __tb_if_tokio {
 #[doc(hidden)]
 macro_rules! __tb_if_builder {
 	({ $($body:tt)* }) => { { $($body)* } };
+	($($item:item)*) => { $($item)* };
 }
 
 #[cfg(not(feature = "builder"))]
@@ -43,6 +44,63 @@ macro_rules! __tb_if_builder {
 #[doc(hidden)]
 macro_rules! __tb_if_builder {
 	({ $($body:tt)* }) => {{}};
+	($($item:item)*) => {};
+}
+
+#[cfg(feature = "crypto")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_crypto {
+	($($item:item)*) => { $($item)* };
+}
+
+#[cfg(not(feature = "crypto"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_crypto {
+	($($item:item)*) => {};
+}
+
+#[cfg(feature = "digest")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_digest {
+	($($item:item)*) => { $($item)* };
+}
+
+#[cfg(not(feature = "digest"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_digest {
+	($($item:item)*) => {};
+}
+
+#[cfg(feature = "aead")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_aead {
+	($($item:item)*) => { $($item)* };
+}
+
+#[cfg(not(feature = "aead"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_aead {
+	($($item:item)*) => {};
+}
+
+#[cfg(feature = "signature")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_signature {
+	($($item:item)*) => { $($item)* };
+}
+
+#[cfg(not(feature = "signature"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __tb_if_signature {
+	($($item:item)*) => {};
 }
 
 #[cfg(feature = "builder")]

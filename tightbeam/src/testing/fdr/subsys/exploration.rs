@@ -4,6 +4,7 @@
 //! functions for the FDR exploration loop. These handle state space traversal,
 //! seed management, and basic property verification.
 
+#[cfg(feature = "testing-fault")]
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;

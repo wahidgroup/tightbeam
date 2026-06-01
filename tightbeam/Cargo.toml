@@ -113,8 +113,8 @@ full = [
 
 # Core features
 constants = ["hex"]
-crypto = ["random"]
-builder = ["derive", "x509-cert/builder"]
+crypto = ["random", "dep:crypto-common", "zeroize"]
+builder = ["derive", "x509-cert/builder", "crypto"]
 policy = []
 router = []
 transport = ["cms/builder"]

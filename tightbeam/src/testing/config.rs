@@ -12,9 +12,11 @@
 #![allow(unexpected_cfgs)]
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
+#[cfg(all(not(feature = "std"), feature = "testing-csp"))]
+use alloc::boxed::Box;
 #[cfg(feature = "std")]
-use std::{boxed::Box, sync::Arc, vec::Vec};
+use std::{sync::Arc, vec::Vec};
 
 use crate::error::TightBeamError;
 use crate::testing::macros::{BuiltAssertSpec, TraceCollector};

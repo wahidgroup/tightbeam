@@ -100,6 +100,11 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+// Before other modules so `compose!` is in crate-wide textual scope.
+#[cfg(feature = "builder")]
+#[macro_use]
+mod compose;
+
 pub(crate) mod frame;
 /// The Version is a fundamental constraint
 pub(crate) mod version;
@@ -179,11 +184,10 @@ pub use crate::error::TightBeamError;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-#[cfg(feature = "builder")]
-tightbeam_derive::generate_builders!();
-
 /// Secure bytes type
+#[cfg(feature = "zeroize")]
 pub type ZeroizingBytes = zeroize::Zeroizing<Vec<u8>>;
+#[cfg(feature = "zeroize")]
 pub type ZeroizingArray<const N: usize> = zeroize::Zeroizing<[u8; N]>;
 
 #[cfg(test)]

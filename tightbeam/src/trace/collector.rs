@@ -6,9 +6,10 @@ use core::time::Duration;
 #[cfg(feature = "std")]
 use std::{
 	borrow::Cow,
-	collections::HashMap,
 	sync::{Arc, Mutex},
 };
+#[cfg(all(feature = "std", feature = "testing-fault"))]
+use std::collections::HashMap;
 
 #[cfg(not(feature = "std"))]
 use alloc::{
@@ -24,6 +25,7 @@ use crate::Frame;
 #[cfg(feature = "testing-fault")]
 use crate::constants::DEFAULT_FAULT_SEED;
 #[cfg(feature = "digest")]
+#[cfg(feature = "instrument")]
 use crate::crypto::hash::{Digest, Sha3_256};
 #[cfg(feature = "instrument")]
 use crate::instrumentation::{events, TbEvent, TbInstrumentationConfig};
@@ -646,22 +648,32 @@ impl TraceCollector {
 
 impl From<TraceConfig> for TraceCollector {
 	fn from(config: TraceConfig) -> Self {
-		let mut collector = Self::default();
+		#[cfg(any(feature = "instrument", feature = "logging"))]
+		{
+			let mut collector = Self::default();
 
-		#[cfg(feature = "instrument")]
-		if let Some(instrumentation) = config.instrumentation {
-			collector = Self::with_config(instrumentation);
+			#[cfg(feature = "instrument")]
+			if let Some(instrumentation) = config.instrumentation {
+				collector = Self::with_config(instrumentation);
+			}
+
+			#[cfg(feature = "logging")]
+			if let Some(logger) = config.logger {
+				collector = collector.with_logger(logger);
+			}
+
+			collector
 		}
 
-		#[cfg(feature = "logging")]
-		if let Some(logger) = config.logger {
-			collector = collector.with_logger(logger);
+		#[cfg(not(any(feature = "instrument", feature = "logging")))]
+		{
+			let _ = config;
+			Self::default()
 		}
-
-		collector
 	}
 }
 
+#[cfg(feature = "instrument")]
 fn hash_payload(payload: &[u8]) -> [u8; 32] {
 	let mut hasher = Sha3_256::new();
 	hasher.update(payload);

@@ -1,10 +1,11 @@
 //! Utility modules and functions
 
 use crate::error::TightBeamError;
-use crate::{Message, Version};
 
 #[cfg(feature = "builder")]
 use crate::builder::FrameBuilder;
+#[cfg(feature = "builder")]
+use crate::{Message, Version};
 #[cfg(feature = "compress")]
 use crate::{
 	compress::{Compressor, Inflator},
@@ -241,6 +242,7 @@ pub fn decode<'a, T: der::Decode<'a>>(content: &'a impl AsRef<[u8]>) -> Result<T
 /// This is a convenience function for creating frames without using the
 /// `compose!` macro. Useful in contexts where macros cannot be used
 /// (e.g., within other macro definitions).
+#[cfg(feature = "builder")]
 pub fn compose<T: Message>(version: Version) -> FrameBuilder<T> {
 	FrameBuilder::from(version)
 }

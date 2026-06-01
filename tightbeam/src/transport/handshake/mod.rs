@@ -183,7 +183,9 @@ use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-use crate::crypto::sign::{SignatureEncoding, Verifier};
+#[cfg(feature = "transport-ecies")]
+use crate::crypto::sign::SignatureEncoding;
+use crate::crypto::sign::Verifier;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Decode, Encode, Enumerated, Sequence};

@@ -5,8 +5,11 @@
 //! - `RefinementChecker`: Refinement checking algorithms (trace, failures, divergence)
 //! - `MemoizationCache`: Caching layer for expensive computations
 
+#[cfg(feature = "testing-timing")]
 use core::time::Duration;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+#[cfg(feature = "testing-timing")]
+use std::collections::HashMap;
 
 use super::config::{Failure, FdrConfig, Trace};
 use crate::testing::specs::csp::{Event, Process, State};

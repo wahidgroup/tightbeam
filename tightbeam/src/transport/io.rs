@@ -23,27 +23,33 @@ use crate::transport::TransportResult;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::cms::enveloped_data::EnvelopedData;
-	pub use crate::cms::signed_data::SignedData;
-	pub use crate::crypto::aead::{Decryptor, KeyInit, RuntimeAead};
-	pub use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc, TightbeamProfile};
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-	pub use crate::crypto::sign::{SignatureEncoding, Verifier};
-	pub use crate::crypto::x509::policy::CertificateValidation;
-	pub use crate::der::oid::AssociatedOid;
-	pub use crate::spki::EncodePublicKey;
+	pub use crate::crypto::aead::Decryptor;
 	pub use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
-	pub use crate::transport::handshake::{
-		ClientHandshakeProtocol, ClientHello, ClientKeyExchange, HandshakeError, HandshakeFinalization,
-		HandshakeProtocolKind, ServerHandshake, TcpHandshakeState,
-	};
+	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::state::EncryptedProtocolState;
 
 	#[cfg(feature = "transport-ecies")]
-	pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+	mod ecies {
+		pub use crate::cms::enveloped_data::EnvelopedData;
+		pub use crate::cms::signed_data::SignedData;
+		pub use crate::crypto::aead::{KeyInit, RuntimeAead};
+		pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+		pub use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc, TightbeamProfile};
+		pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+		pub use crate::crypto::sign::{SignatureEncoding, Verifier};
+		pub use crate::crypto::x509::policy::CertificateValidation;
+		pub use crate::der::oid::AssociatedOid;
+		pub use crate::spki::EncodePublicKey;
+		pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
+		pub use crate::transport::handshake::{
+			ClientHandshakeProtocol, ClientHello, ClientKeyExchange, HandshakeError, HandshakeFinalization,
+			HandshakeProtocolKind, ServerHandshake,
+		};
+	}
+
 	#[cfg(feature = "transport-ecies")]
-	pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
+	pub use ecies::*;
 }
 
 #[cfg(feature = "x509")]

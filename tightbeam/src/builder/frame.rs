@@ -7,26 +7,29 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use std::time::SystemTime;
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
-use crate::crypto::hash::Digest;
-use crate::crypto::profiles::SecurityProfile;
-use crate::der::oid::{AssociatedOid, ObjectIdentifier};
+use crate::der::oid::ObjectIdentifier;
 use crate::der::Sequence;
 use crate::error::Result;
 use crate::error::{ReceivedExpectedError, TightBeamError};
 use crate::matrix::{IntoMatrixDyn, MatrixDyn};
 use crate::{Frame, Message, Metadata, Version};
 
+#[cfg(feature = "compress")]
+use crate::compress::Compressor;
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Encryptor;
+#[cfg(feature = "digest")]
+use crate::crypto::hash::Digest;
+#[cfg(any(feature = "aead", feature = "digest", feature = "signature"))]
+use crate::crypto::profiles::SecurityProfile;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::SignatureEncoding;
-
-#[cfg(feature = "compress")]
-use crate::compress::Compressor;
 #[cfg(feature = "signature")]
 use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier};
+#[cfg(any(feature = "digest", feature = "aead", feature = "ecdh"))]
+use crate::der::oid::AssociatedOid;
 #[cfg(feature = "digest")]
 use crate::helpers::Digestor;
 
@@ -40,6 +43,7 @@ type SignerFn = Box<dyn FnOnce(&[u8]) -> Result<crate::SignerInfo>>;
 /// Prevents external impls while allowing conditional enforcement
 #[doc(hidden)]
 pub mod private {
+	#[cfg(any(feature = "digest", feature = "aead", feature = "ecdh", feature = "signature"))]
 	use super::*;
 
 	#[cfg(feature = "digest")]
@@ -173,6 +177,7 @@ pub struct FrameBuilder<T: Message> {
 	#[cfg(feature = "aead")]
 	#[allow(clippy::type_complexity)]
 	encryptor: Option<Box<dyn FnOnce(&[u8]) -> Result<crate::EncryptedContentInfo>>>,
+	#[cfg(feature = "aead")]
 	rng: Option<Box<dyn rand_core::CryptoRngCore>>,
 	#[cfg(feature = "digest")]
 	witness: Option<Digestor>,
@@ -193,6 +198,7 @@ impl<T: Message> From<Version> for FrameBuilder<T> {
 			compressor: None,
 			#[cfg(feature = "aead")]
 			encryptor: None,
+			#[cfg(feature = "aead")]
 			rng: None,
 			#[cfg(feature = "digest")]
 			witness: None,
@@ -296,9 +302,12 @@ impl<T: Message> FrameBuilder<T> {
 			return Err(TightBeamError::MissingCompressedData);
 		}
 
-		let has_message_integrity = self.metadata_builder.has_hash();
-		if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
-			return Err(TightBeamError::MissingDigestInfo);
+		#[cfg(feature = "digest")]
+		{
+			let has_message_integrity = self.metadata_builder.has_hash();
+			if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
+				return Err(TightBeamError::MissingDigestInfo);
+			}
 		}
 
 		#[cfg(feature = "digest")]
@@ -629,10 +638,14 @@ impl<T: Message> FrameBuilder<T> {
 	/// Build message bytes through encoding, compression, and encryption pipeline.
 	fn build_message_bytes(
 		message: T,
-		mut metadata_builder: MetadataBuilder,
+		metadata_builder: MetadataBuilder,
 		#[cfg(feature = "compress")] compressor: Option<Box<dyn Compressor>>,
 		#[cfg(feature = "aead")] encryptor: Option<EncryptorFn>,
 	) -> Result<(Vec<u8>, MetadataBuilder)> {
+		// Reassigned only by the compression/encryption stages below.
+		#[cfg(any(feature = "compress", feature = "aead"))]
+		let mut metadata_builder = metadata_builder;
+
 		// 1. Encode ASN.1
 		let bytes = crate::encode(&message)?;
 
@@ -709,7 +722,7 @@ mod tests {
 	use super::*;
 	use crate::compress::ZstdCompression;
 	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
-	use crate::{compose, test_builder};
+	use crate::test_builder;
 
 	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
 	use crate::crypto::hash::Sha3_256;

@@ -1,12 +1,15 @@
-use crate::asn1::OctetString;
-#[cfg(feature = "crypto")]
-use crate::crypto::profiles::SecurityProfile;
-use crate::der::{Encode, EncodeValue, Tagged};
+use crate::der::{EncodeValue, Tagged};
 use crate::error::Result;
 use crate::{Frame, Metadata, TightBeamError, Version};
 
+#[cfg(feature = "aead")]
+use crate::asn1::OctetString;
 #[cfg(feature = "compress")]
 use crate::compress::Inflator;
+#[cfg(feature = "crypto")]
+use crate::crypto::profiles::SecurityProfile;
+#[cfg(feature = "signature")]
+use crate::der::Encode;
 #[cfg(not(feature = "compress"))]
 pub trait Inflator {}
 #[cfg(feature = "signature")]
@@ -42,6 +45,7 @@ pub trait Message:
 
 	/// The security profile that constrains which cryptographic algorithms
 	/// can be used with this message type. Defaults to TightbeamProfile.
+	#[cfg(feature = "crypto")]
 	type Profile: SecurityProfile;
 }
 
@@ -329,7 +333,6 @@ mod tests {
 		vec::Vec,
 	};
 
-	use crate::compose;
 	use crate::testing::create_test_cipher_key;
 	use crate::testing::{create_test_message, create_test_signing_key};
 	use crate::Beamable;
