@@ -126,14 +126,12 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::sync::Arc as ArcAlloc;
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
+#[cfg(not(feature = "std"))]
+pub use alloc::sync::Arc;
 #[cfg(feature = "std")]
 pub use std::sync::Arc;
-#[cfg(not(feature = "std"))]
-pub use ArcAlloc as Arc;
 
 mod attributes;
 mod common;
@@ -183,12 +181,12 @@ use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-use crate::crypto::sign::{SignatureEncoding, Verifier};
+#[cfg(feature = "transport-ecies")]
+use crate::crypto::sign::SignatureEncoding;
+use crate::crypto::sign::Verifier;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::store::CertificateTrust;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Decode, Encode, Enumerated, Sequence};
-use crate::spki::EncodePublicKey;
 use crate::transport::error::TransportError;
 use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
@@ -196,6 +194,10 @@ use crate::Beamable;
 
 #[cfg(feature = "transport-ecies")]
 use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+#[cfg(feature = "transport-cms")]
+use crate::crypto::x509::store::CertificateTrust;
+#[cfg(feature = "transport-cms")]
+use crate::spki::EncodePublicKey;
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::client::EciesHandshakeClient;
 #[cfg(feature = "transport-ecies")]
@@ -203,7 +205,7 @@ use crate::transport::handshake::client::ExtractVerifyingKey;
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::server::EciesHandshakeServer;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::time::Instant;
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
@@ -522,19 +524,19 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 pub enum TcpHandshakeState {
 	#[default]
 	None,
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	AwaitingServerResponse {
 		initiated_at: Instant,
 	},
-	#[cfg(not(feature = "std"))]
+	#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 	AwaitingServerResponse {
 		initiated_at: u64,
 	},
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	AwaitingClientFinish {
 		initiated_at: Instant,
 	},
-	#[cfg(not(feature = "std"))]
+	#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 	AwaitingClientFinish {
 		initiated_at: u64,
 	},

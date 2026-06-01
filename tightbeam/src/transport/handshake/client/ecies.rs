@@ -2,6 +2,11 @@
 //!
 //! Implements the client side of the TightBeam ECIES handshake protocol.
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::asn1::OctetString;
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 use crate::crypto::aead::{KeyInit, RuntimeAead};

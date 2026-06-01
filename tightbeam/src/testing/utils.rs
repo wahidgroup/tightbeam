@@ -4,8 +4,6 @@ use crate::asn1::Frame;
 use crate::der::Sequence;
 
 #[cfg(feature = "derive")]
-use crate::compose;
-#[cfg(feature = "derive")]
 use crate::Beamable;
 
 /// Simple test message

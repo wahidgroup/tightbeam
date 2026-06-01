@@ -50,6 +50,7 @@ pub use crate::transport::tcp::TightBeamSocketAddr;
 // Macros
 #[cfg(feature = "derive")]
 pub mod tb {
+	#[cfg(feature = "builder")]
 	pub use crate::flagset;
 
 	#[cfg(feature = "transport")]

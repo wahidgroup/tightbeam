@@ -1,5 +1,8 @@
 //! Flags utilize the Matrix to create Flat World.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::matrix::{Matrix, MatrixLike};
 
 /// A fixed-size array of flags, where each flag is a `u8`

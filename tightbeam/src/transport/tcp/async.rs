@@ -1,17 +1,23 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "tokio")]
+use std::time::Instant;
 
+#[cfg(feature = "tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "tokio")]
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
+#[cfg(feature = "tokio")]
 use crate::transport::protocols::PersistentConnection;
 use crate::transport::ResponsePackage;
+#[cfg(feature = "tokio")]
+use crate::transport::{AsyncListenerTrait, Protocol};
 use crate::transport::{
-	AsyncListenerTrait, EnvelopeBuilder, EnvelopeLimits, MessageIO, Pingable, Protocol, TransportError,
-	TransportResult, WireMode,
+	EnvelopeBuilder, EnvelopeLimits, MessageIO, Pingable, TransportError, TransportResult, WireMode,
 };
 use crate::Frame;
 
@@ -25,7 +31,9 @@ mod x509 {
 		HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 	};
 	pub use crate::transport::state::EncryptedProtocolState;
-	pub use crate::transport::{EncryptedMessageIO, EncryptedProtocol, TransportEncryptionConfig};
+	#[cfg(feature = "tokio")]
+	pub use crate::transport::EncryptedProtocol;
+	pub use crate::transport::{EncryptedMessageIO, TransportEncryptionConfig};
 	pub use crate::x509::Certificate;
 }
 
@@ -41,29 +49,106 @@ mod policy {
 #[cfg(feature = "transport-policy")]
 use policy::*;
 
-pub trait AsyncProtocolStream: Send + Unpin {
+/// Marker relaxing `Send` on non-`wasm32` targets only.
+///
+/// Native transports run on multi-threaded executors and MUST stay `Send`; the
+/// browser is single-threaded and its stream (gloo) is `!Send`, so on `wasm32`
+/// this collapses to a no-op bound, letting the same transport core compile
+/// without `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send> MaybeSend for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSend for T {}
+
+/// A frame-oriented async byte transport carrying DER-encoded envelopes.
+pub trait AsyncProtocolStream: MaybeSend + Unpin {
 	type Error: Into<TransportError>;
-	fn inner_mut(&mut self) -> &mut TcpStream;
+
+	/// Read one complete DER-encoded envelope from the transport.
+	///
+	/// `max_len` is the largest envelope content length the caller accepts; an
+	/// implementation MUST reject a frame whose declared length exceeds it
+	/// before allocating, to bound memory use.
+	fn read_frame(
+		&mut self,
+		max_len: Option<usize>,
+	) -> impl core::future::Future<Output = Result<Vec<u8>, Self::Error>> + MaybeSend;
+
+	/// Write one complete DER-encoded envelope to the transport.
+	fn write_frame(&mut self, buffer: &[u8])
+		-> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
+
+	/// Report whether the underlying transport still appears connected.
+	fn is_alive(&self) -> bool;
 }
 
+#[cfg(feature = "tokio")]
 pub struct TokioStream {
 	stream: TcpStream,
 }
 
+#[cfg(feature = "tokio")]
 impl AsyncProtocolStream for TokioStream {
 	type Error = std::io::Error;
 
-	fn inner_mut(&mut self) -> &mut TcpStream {
-		&mut self.stream
+	async fn read_frame(&mut self, max_len: Option<usize>) -> Result<Vec<u8>, Self::Error> {
+		let stream = &mut self.stream;
+
+		let mut tag = [0u8; 1];
+		stream.read_exact(&mut tag).await?;
+
+		let mut length_first = [0u8; 1];
+		stream.read_exact(&mut length_first).await?;
+
+		let (length_octets, content_length) = if length_first[0] & 0x80 == 0 {
+			(Vec::new(), length_first[0] as usize)
+		} else {
+			let octet_count = (length_first[0] & 0x7F) as usize;
+			let mut length_octets = vec![0u8; octet_count];
+			stream.read_exact(&mut length_octets).await?;
+			let length = crate::transport::io::parse_der_length(length_first[0], &length_octets);
+			(length_octets, length)
+		};
+
+		if let Some(max) = max_len {
+			if content_length > max {
+				return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+			}
+		}
+
+		let mut content = vec![0u8; content_length];
+		stream.read_exact(&mut content).await?;
+
+		Ok(crate::transport::io::reconstruct_der_encoding(
+			tag[0],
+			length_first[0],
+			&length_octets,
+			&content,
+		))
+	}
+
+	async fn write_frame(&mut self, buffer: &[u8]) -> Result<(), Self::Error> {
+		self.stream.write_all(buffer).await
+	}
+
+	fn is_alive(&self) -> bool {
+		self.stream.peer_addr().is_ok()
 	}
 }
 
+#[cfg(feature = "tokio")]
 impl From<TcpStream> for TokioStream {
 	fn from(stream: TcpStream) -> Self {
 		Self { stream }
 	}
 }
 
+#[cfg(feature = "tokio")]
 pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	listener: TcpListener,
 	#[cfg(feature = "x509")]
@@ -82,6 +167,7 @@ pub struct TokioListener<P: CryptoProvider = DefaultCryptoProvider> {
 	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
 }
 
+#[cfg(feature = "tokio")]
 impl<P: CryptoProvider> TokioListener<P> {
 	pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
 		self.listener.local_addr()
@@ -153,6 +239,7 @@ impl<P: CryptoProvider> TokioListener<P> {
 	}
 }
 
+#[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> Protocol for TokioListener<P> {
 	type Listener = TokioListener<P>;
 	type Stream = TokioStream;
@@ -205,7 +292,7 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TokioListener<P> {
 	}
 }
 
-#[cfg(feature = "x509")]
+#[cfg(all(feature = "tokio", feature = "x509"))]
 impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TokioListener<P> {
 	type Encryptor = RuntimeAead;
 	type Decryptor = RuntimeAead;
@@ -329,6 +416,24 @@ where
 #[cfg(feature = "x509")]
 impl<S: AsyncProtocolStream> EncryptedMessageIO for TcpTransport<S> where TransportError: From<S::Error> {}
 
+#[cfg(feature = "x509")]
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
+where
+	TransportError: From<S::Error>,
+{
+	/// Configure this transport as an encrypted server endpoint.
+	pub fn with_server_encryption(mut self, config: TransportEncryptionConfig<P>) -> Self {
+		self.server_identity = Some(Arc::new(config.certificate));
+		self.client_validators = config.client_validators;
+		self.aad_domain_tag = Some(config.aad_domain_tag);
+		self.max_cleartext_envelope = Some(config.max_cleartext_envelope);
+		self.max_encrypted_envelope = Some(config.max_encrypted_envelope);
+		self.handshake_timeout = config.handshake_timeout;
+		self.key_manager = Some(config.key_manager);
+		self
+	}
+}
+
 // Ensure symmetric key material is dropped when the transport is dropped
 impl<S: AsyncProtocolStream, P: crate::crypto::profiles::CryptoProvider> Drop for TcpTransport<S, P> {
 	fn drop(&mut self) {
@@ -336,6 +441,7 @@ impl<S: AsyncProtocolStream, P: crate::crypto::profiles::CryptoProvider> Drop fo
 	}
 }
 
+#[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		let (stream, addr) = self.listener.accept().await?;
@@ -360,6 +466,7 @@ impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
 	}
 }
 
+#[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> crate::transport::Mycelial for TokioListener<P> {
 	async fn try_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		// Bind to an available port (0.0.0.0:0 lets the OS choose)
@@ -447,7 +554,11 @@ where
 	TransportError: From<std::io::Error>,
 {
 	fn ping(&mut self) -> TransportResult<()> {
-		self.stream.inner_mut().peer_addr().map(|_| ()).map_err(TransportError::from)
+		if self.stream.is_alive() {
+			Ok(())
+		} else {
+			Err(TransportError::ConnectionClosed)
+		}
 	}
 }
 
@@ -458,111 +569,92 @@ where
 	TransportError: From<S::Error>,
 {
 	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
-		use tokio::time::timeout;
-
-		// Determine timeout duration: prefer handshake_timeout during
-		// handshake, operation_timeout otherwise
+		// Conservative pre-allocation ceiling: we cannot tell encrypted from
+		// cleartext at this point, so choose the larger cap.
 		#[cfg(feature = "x509")]
-		let timeout_duration: Option<Duration> = {
-			match self.to_handshake_state() {
-				TcpHandshakeState::AwaitingServerResponse { initiated_at }
-				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
-					let now = Instant::now();
-					let deadline = initiated_at + self.handshake_timeout;
-					if now >= deadline {
-						return Err(TransportError::OperationFailed(TransportFailure::Timeout));
-					}
-					Some(deadline.saturating_duration_since(now))
-				}
-				_ => {
-					// Not in handshake - use operation_timeout if configured
-					#[cfg(feature = "transport-policy")]
-					{
-						self.operation_timeout
-					}
-					#[cfg(not(feature = "transport-policy"))]
-					{
-						None
-					}
-				}
-			}
-		};
+		let max_len = Some(
+			self.max_encrypted_envelope
+				.or(self.max_cleartext_envelope)
+				.unwrap_or(512 * 1024),
+		);
 
 		#[cfg(not(feature = "x509"))]
-		let timeout_duration: Option<Duration> = {
-			#[cfg(feature = "transport-policy")]
-			{
-				self.operation_timeout
-			}
-			#[cfg(not(feature = "transport-policy"))]
-			{
-				None
-			}
-		};
+		let max_len = None;
 
-		let stream = self.stream.inner_mut();
+		// The tokio runtime supplies `tokio::time::timeout`; non-tokio runtimes
+		// (e.g. wasm/gloo) have no portable timer here, so they read without a
+		// deadline. The handshake clock is likewise absent off-tokio.
+		#[cfg(feature = "tokio")]
+		{
+			use tokio::time::timeout;
 
-		// Helper macro to apply timeout if configured
-		macro_rules! with_timeout {
-			($op:expr) => {
-				if let Some(dur) = timeout_duration {
-					timeout(dur, $op).await??
-				} else {
-					$op.await?
+			// Determine timeout duration: prefer handshake_timeout during
+			// handshake, operation_timeout otherwise
+			#[cfg(feature = "x509")]
+			let timeout_duration: Option<Duration> = {
+				match self.to_handshake_state() {
+					TcpHandshakeState::AwaitingServerResponse { initiated_at }
+					| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
+						let now = Instant::now();
+						let deadline = initiated_at + self.handshake_timeout;
+						if now >= deadline {
+							return Err(TransportError::OperationFailed(TransportFailure::Timeout));
+						}
+						Some(deadline.saturating_duration_since(now))
+					}
+					_ => {
+						// Not in handshake - use operation_timeout if configured
+						#[cfg(feature = "transport-policy")]
+						{
+							self.operation_timeout
+						}
+						#[cfg(not(feature = "transport-policy"))]
+						{
+							None
+						}
+					}
 				}
 			};
+
+			#[cfg(not(feature = "x509"))]
+			let timeout_duration: Option<Duration> = {
+				#[cfg(feature = "transport-policy")]
+				{
+					self.operation_timeout
+				}
+				#[cfg(not(feature = "transport-policy"))]
+				{
+					None
+				}
+			};
+
+			let buffer = if let Some(dur) = timeout_duration {
+				timeout(dur, self.stream.read_frame(max_len)).await??
+			} else {
+				self.stream.read_frame(max_len).await?
+			};
+
+			Ok(buffer)
 		}
 
-		let mut tag = [0u8; 1];
-		with_timeout!(stream.read_exact(&mut tag));
-
-		let mut length_first = [0u8; 1];
-		with_timeout!(stream.read_exact(&mut length_first));
-
-		let (length_octets, content_length) = if length_first[0] & 0x80 == 0 {
-			(vec![], length_first[0] as usize)
-		} else {
-			let octet_count = (length_first[0] & 0x7F) as usize;
-			let mut length_octets = vec![0u8; octet_count];
-			with_timeout!(stream.read_exact(&mut length_octets));
-			let length = Self::parse_der_length(length_first[0], &length_octets);
-			(length_octets, length)
-		};
-
-		// Enforce size ceilings if configured
-		#[cfg(feature = "x509")]
+		#[cfg(not(feature = "tokio"))]
 		{
-			// We can't tell encrypted vs cleartext at this point,
-			// so choose the larger cap conservatively
-			let max_allowed = self
-				.max_encrypted_envelope
-				.or(self.max_cleartext_envelope)
-				.unwrap_or(512 * 1024);
-			if content_length > max_allowed {
-				return Err(TransportError::InvalidMessage);
-			}
+			let buffer = self.stream.read_frame(max_len).await?;
+			Ok(buffer)
 		}
-
-		let mut content = vec![0u8; content_length];
-		with_timeout!(stream.read_exact(&mut content));
-
-		let buffer = Self::reconstruct_der_encoding(tag[0], length_first[0], &length_octets, &content);
-		Ok(buffer)
 	}
 
 	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()> {
-		let stream = self.stream.inner_mut();
-
-		// Apply operation timeout if configured
-		#[cfg(feature = "transport-policy")]
+		// Apply operation timeout if configured (tokio only; see read_envelope).
+		#[cfg(all(feature = "tokio", feature = "transport-policy"))]
 		if let Some(dur) = self.operation_timeout {
-			tokio::time::timeout(dur, stream.write_all(buffer)).await??;
+			tokio::time::timeout(dur, self.stream.write_frame(buffer)).await??;
 		} else {
-			stream.write_all(buffer).await?;
+			self.stream.write_frame(buffer).await?;
 		}
 
-		#[cfg(not(feature = "transport-policy"))]
-		stream.write_all(buffer).await?;
+		#[cfg(not(all(feature = "tokio", feature = "transport-policy")))]
+		self.stream.write_frame(buffer).await?;
 
 		Ok(())
 	}
@@ -632,25 +724,34 @@ where
 		// Ensure handshake is complete
 		self.ensure_handshake_complete().await?;
 
-		// Perform send/receive with optional timeout
-		let timeout_duration = self.operation_timeout;
-		if let Some(duration) = timeout_duration {
-			use tokio::time::timeout;
-			match timeout(duration, async { self.perform_emit_cycle(message).await }).await {
-				Ok(result) => result,
-				Err(_) => Err(TransportError::OperationFailed(TransportFailure::Timeout)),
+		// Perform send/receive with optional timeout (tokio only; non-tokio
+		// runtimes have no portable timer and emit without a deadline).
+		#[cfg(feature = "tokio")]
+		{
+			let timeout_duration = self.operation_timeout;
+			if let Some(duration) = timeout_duration {
+				use tokio::time::timeout;
+				match timeout(duration, async { self.perform_emit_cycle(message).await }).await {
+					Ok(result) => result,
+					Err(_) => Err(TransportError::OperationFailed(TransportFailure::Timeout)),
+				}
+			} else {
+				self.perform_emit_cycle(message).await
 			}
-		} else {
+		}
+
+		#[cfg(not(feature = "tokio"))]
+		{
 			self.perform_emit_cycle(message).await
 		}
 	}
 }
 
+#[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		// Check TCP connection via peer_addr - if it fails, connection is dead
-		// This is lightweight and doesn't perform I/O
-		transport.stream.stream.peer_addr().is_ok()
+		// Lightweight liveness check delegated to the stream; performs no I/O.
+		transport.stream.is_alive()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {
@@ -660,7 +761,7 @@ impl<P: CryptoProvider + Send + Sync> PersistentConnection for TokioListener<P> 
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
 	use super::*;
 	use crate::crypto::sign::ecdsa::Secp256k1VerifyingKey;

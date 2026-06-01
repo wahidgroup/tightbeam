@@ -6,6 +6,9 @@ pub mod utils;
 // Re-exports
 pub use x509_cert::*;
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::der::{Decode, DecodePem};
 use crate::TightBeamError;
 

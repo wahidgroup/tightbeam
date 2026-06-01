@@ -1,12 +1,18 @@
-use crate::asn1::OctetString;
-#[cfg(feature = "crypto")]
-use crate::crypto::profiles::SecurityProfile;
-use crate::der::{Encode, EncodeValue, Tagged};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use crate::der::{EncodeValue, Tagged};
 use crate::error::Result;
 use crate::{Frame, Metadata, TightBeamError, Version};
 
+#[cfg(feature = "aead")]
+use crate::asn1::OctetString;
 #[cfg(feature = "compress")]
 use crate::compress::Inflator;
+#[cfg(feature = "crypto")]
+use crate::crypto::profiles::SecurityProfile;
+#[cfg(feature = "signature")]
+use crate::der::Encode;
 #[cfg(not(feature = "compress"))]
 pub trait Inflator {}
 #[cfg(feature = "signature")]
@@ -42,6 +48,7 @@ pub trait Message:
 
 	/// The security profile that constrains which cryptographic algorithms
 	/// can be used with this message type. Defaults to TightbeamProfile.
+	#[cfg(feature = "crypto")]
 	type Profile: SecurityProfile;
 }
 
@@ -183,7 +190,7 @@ impl Frame {
 			.ok_or(TightBeamError::MissingEncryptionInfo)?;
 
 		// The encrypted content is stored in the message field - move it into the info
-		let message = OctetString::new(std::mem::take(&mut self.message))?;
+		let message = OctetString::new(core::mem::take(&mut self.message))?;
 		encrypted_content_info.encrypted_content = Some(message);
 
 		// Decrypt using the Decryptor trait
@@ -225,7 +232,7 @@ impl TightBeamLike for Frame {}
 
 impl From<Frame> for Metadata {
 	fn from(mut frame: Frame) -> Self {
-		std::mem::take(&mut frame.metadata)
+		core::mem::take(&mut frame.metadata)
 	}
 }
 
@@ -329,7 +336,6 @@ mod tests {
 		vec::Vec,
 	};
 
-	use crate::compose;
 	use crate::testing::create_test_cipher_key;
 	use crate::testing::{create_test_message, create_test_signing_key};
 	use crate::Beamable;

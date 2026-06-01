@@ -3,12 +3,6 @@
 //! Provides functions for computing cryptographic hashes over handshake
 //! message sequences, ensuring transcript integrity.
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::CryptoProvider;
 

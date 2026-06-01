@@ -3,14 +3,14 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+#[cfg(all(feature = "x509", not(feature = "std")))]
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-
+#[cfg(feature = "x509")]
+use core::time::Duration;
 #[cfg(feature = "std")]
 use std::sync::Arc;
-
-#[cfg(all(feature = "x509", feature = "std"))]
-use core::time::Duration;
 
 // Module declarations
 pub mod builders;
@@ -27,11 +27,12 @@ pub mod state;
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
 
 // Re-exports from submodules
 pub use builders::{EnvelopeBuilder, EnvelopeLimits};
+pub use client::GenericClient;
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
 pub use io::{EncryptedMessageIO, MessageIO, Pingable};
@@ -41,14 +42,16 @@ pub use protocols::{
 	X509ClientConfig,
 };
 
-pub use client::GenericClient;
-
 #[cfg(feature = "builder")]
 pub use client::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
 pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 #[cfg(feature = "transport-policy")]
 pub use messaging::MessageEmitter;
+#[cfg(all(feature = "tcp", feature = "tokio"))]
+pub use tcp::r#async::TokioListener;
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+pub use tcp::r#async::{AsyncProtocolStream, TcpTransport};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -67,7 +70,7 @@ use crate::transport::handshake::HandshakeKeyManager;
 
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 
-#[cfg(all(feature = "x509", feature = "std"))]
+#[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub certificate: Certificate,
@@ -79,7 +82,7 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub handshake_timeout: Duration,
 }
 
-#[cfg(all(feature = "x509", feature = "std"))]
+#[cfg(feature = "x509")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager<P>) -> Self {
 		Self {

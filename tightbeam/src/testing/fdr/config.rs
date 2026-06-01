@@ -3,21 +3,19 @@
 //! This module contains the core configuration structures and result types
 //! used by the FDR exploration engine.
 
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
+#[cfg(feature = "testing-fault")]
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-use crate::constants::DEFAULT_FAULT_SEED;
-use crate::error::TightBeamError;
-use crate::testing::error::FdrConfigError;
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
-use crate::utils::BasisPoints;
 
 #[cfg(feature = "testing-fault")]
 use crate::testing::fault::{ProcessEvent, ProcessState};
 #[cfg(feature = "testing-fmea")]
 use crate::testing::fmea::{FmeaConfig, FmeaReport};
+#[cfg(feature = "testing-fault")]
+use crate::{constants::DEFAULT_FAULT_SEED, error::TightBeamError, testing::error::FdrConfigError, utils::BasisPoints};
 
 /// CSP trace: sequence of observable events
 pub type Trace = Vec<Event>;

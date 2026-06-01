@@ -50,8 +50,7 @@ where
 	/// Configure timeout for transport operations.
 	///
 	/// Default: no-op (timeout ignored if transport doesn't support it).
-	#[cfg(feature = "std")]
-	fn with_timeout(self, _: std::time::Duration) -> Self {
+	fn with_timeout(self, _: core::time::Duration) -> Self {
 		self
 	}
 }
@@ -159,13 +158,6 @@ impl Default for RestartExponentialBackoff {
 	}
 }
 
-#[cfg(not(feature = "std"))]
-impl Default for RestartExponentialBackoff {
-	fn default() -> Self {
-		Self { max_attempts: 5, scale_factor: 1000, jitter: Box::new(NoJitter) }
-	}
-}
-
 /// Linear backoff restart policy.
 ///
 /// Retries on errors with linearly increasing delays.
@@ -179,6 +171,7 @@ pub struct RestartLinearBackoff {
 	pub jitter: Option<Box<dyn JitterStrategy>>,
 }
 
+#[cfg(feature = "std")]
 impl RestartLinearBackoff {
 	pub fn new(
 		max_attempts: usize,
@@ -199,13 +192,6 @@ impl Default for RestartLinearBackoff {
 			scale_factor: 1,
 			jitter: Some(Box::new(DecorrelatedJitter)),
 		}
-	}
-}
-
-#[cfg(not(feature = "std"))]
-impl Default for RestartLinearBackoff {
-	fn default() -> Self {
-		Self { max_attempts: 5, interval_ms: 1000, scale_factor: 1, jitter: None }
 	}
 }
 

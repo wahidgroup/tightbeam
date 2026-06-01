@@ -4,22 +4,22 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec::Vec};
-
+use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
 use crate::asn1::Frame;
-use crate::der::{Decode, Encode};
+use crate::der::Encode;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelope};
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
 use crate::transport::TransportResult;
 
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 mod x509 {
 	pub use crate::crypto::aead::{Decryptor, KeyInit};
+	pub use crate::crypto::ecies::EciesPublicKeyOps;
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -28,14 +28,13 @@ mod x509 {
 	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::io::EncryptedMessageIO;
 	pub use crate::transport::state::EncryptedProtocolState;
-
-	#[cfg(feature = "transport-ecies")]
-	pub use crate::crypto::ecies::EciesPublicKeyOps;
 }
 
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 use x509::*;
 
+#[cfg(feature = "transport-ecies")]
+use crate::der::Decode;
 #[cfg(feature = "transport-policy")]
 use crate::transport::policy::{RestartPolicy, RetryAction};
 

@@ -122,7 +122,6 @@ impl UrnSpec for TightbeamUrnSpec {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::builder::TypeBuilder;
 	use crate::testing::ScenarioConf;
 	use crate::utils::urn::UrnBuilder;
 

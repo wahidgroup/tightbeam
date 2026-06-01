@@ -1,9 +1,9 @@
 #![allow(clippy::type_complexity)]
 
+use core::{future::Future, pin::Pin};
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-
-use core::{future::Future, pin::Pin};
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, sync::Arc};
@@ -22,7 +22,7 @@ where
 {
 	let handler = Arc::new(handler);
 	Arc::new(move |frame: Frame| -> HandlerFuture {
-		let handler = ::std::sync::Arc::clone(&handler);
+		let handler = Arc::clone(&handler);
 		Box::pin(async move { handler(frame).await })
 	})
 }
@@ -477,37 +477,33 @@ macro_rules! server {
 	}};
 
 	($protocol:path: $listener:expr, handle: $handler:expr) => {{
-		#[cfg(feature = "std")]
-		{
+		$crate::__tb_if_std!({
 			let __listener = $listener;
 			$crate::server!(@sync_loop $protocol, __listener, $handler,)
-		}
+		})
 	}};
 
 	($protocol:path: bind $addr:expr, handle: $handler:expr) => {{
-		#[cfg(feature = "std")]
-		{
+		$crate::__tb_if_std!({
 			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler,)
-		}
+		})
 	}};
 
 	($protocol:path: $listener:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
-		#[cfg(feature = "std")]
-		{
+		$crate::__tb_if_std!({
 			let __listener = $listener;
 			$crate::server!(@sync_loop $protocol, __listener, $handler, $($policy_name: [ $( $policy_expr ),* ]),*);
-		}
+		})
 	}};
 
 	($protocol:path: bind $addr:expr, policies: { $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)? }, handle: $handler:expr) => {{
-		#[cfg(feature = "std")]
-		{
+		$crate::__tb_if_std!({
 			let (listener, _) = <$protocol as $crate::transport::Protocol>::bind($addr)?;
 			let __server = <$protocol>::from(listener);
 			$crate::server!(@sync_loop $protocol, __server, $handler, $($policy_name: [ $( $policy_expr ),* ]),*);
-		}
+		})
 	}};
 
 	(protocol $protocol:path: $listener:expr, handle: $handler:expr) => {{

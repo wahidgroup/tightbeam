@@ -3,13 +3,21 @@
 //! Provides common cryptographic and state management utilities used across
 //! handshake builders, processors, and orchestrators.
 
-use crate::asn1::OctetString;
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::handshake::error::HandshakeError;
 use crate::x509::Certificate;
-use spki::AlgorithmIdentifierOwned;
+
+#[cfg(feature = "transport-ecies")]
+use crate::asn1::OctetString;
 
 /// Generate a random 32-byte CEK for AES-256-GCM.
 ///
@@ -166,6 +174,7 @@ where
 ///
 /// # Errors
 /// - `HandshakeError::OctetStringLengthError` if length is not exactly 32 bytes
+#[cfg(feature = "transport-ecies")]
 pub fn octet_string_to_32_byte_array(octet_string: &OctetString) -> Result<[u8; 32], HandshakeError> {
 	let bytes = octet_string.as_bytes();
 	if bytes.len() != 32 {
@@ -216,6 +225,7 @@ where
 /// # Security
 /// This function ensures sensitive data is overwritten before deallocation,
 /// preventing potential memory scraping attacks.
+#[cfg(feature = "transport-ecies")]
 pub fn clear_session_randoms(
 	base_session_key: &mut Option<[u8; 32]>,
 	client_random: &mut Option<[u8; 32]>,

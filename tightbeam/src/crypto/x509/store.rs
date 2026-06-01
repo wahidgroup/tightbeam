@@ -5,10 +5,16 @@
 
 use core::fmt::Debug;
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::crypto::x509::Certificate;
+
+#[cfg(feature = "std")]
+use crate::crypto::x509::utils::validate_certificate_expiry;
+#[cfg(feature = "std")]
 use crate::der::Encode;
 
 #[cfg(feature = "std")]

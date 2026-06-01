@@ -17,6 +17,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+#[cfg(feature = "testing-schedulability")]
 use core::time::Duration;
 
 use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
@@ -589,7 +590,7 @@ mod tests {
 	use crate::transport::Protocol;
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
-	use crate::{compose, exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
+	use crate::{exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
 
 	#[test]
 	fn builder_creates_valid_process() -> Result<(), Box<dyn core::error::Error>> {

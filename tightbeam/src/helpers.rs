@@ -1,6 +1,14 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "signature", feature = "digest", feature = "kdf", feature = "aead")
+))]
+use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 // Re-exports
 #[cfg(feature = "zeroize")]
 pub use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -12,6 +20,9 @@ use crate::error::Result;
 use crate::matrix::MatrixError;
 use crate::{Asn1Matrix, Frame};
 
+#[cfg(any(feature = "signature", feature = "digest", feature = "kdf", feature = "aead"))]
+use crate::TightBeamError;
+
 #[cfg(feature = "signature")]
 mod signature {
 	pub use crate::cms::content_info::CmsVersion;
@@ -22,7 +33,7 @@ mod signature {
 	pub use crate::der::Any;
 	pub use crate::spki::AlgorithmIdentifierOwned;
 	pub use crate::x509::ext::pkix::SubjectKeyIdentifier;
-	pub use crate::{SignerInfo, TightBeamError};
+	pub use crate::SignerInfo;
 }
 
 #[cfg(feature = "signature")]

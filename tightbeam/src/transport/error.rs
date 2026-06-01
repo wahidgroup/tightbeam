@@ -1,7 +1,10 @@
 use crate::asn1::Frame;
 use crate::policy::TransitStatus;
+
 #[cfg(feature = "derive")]
 use crate::Errorizable;
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
 
 pub type Result<T> = core::result::Result<T, TransportError>;
 

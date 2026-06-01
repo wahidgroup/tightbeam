@@ -3,8 +3,6 @@
 //! This crate provides the `#[derive(Beamable)]` macro that automatically
 //! implements the `Message` trait for structs.
 
-mod build;
-
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::Parser;
@@ -215,16 +213,19 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	};
 
 	let _has_profile = profile_type.is_some();
+	// `Message::Profile` is gated behind tightbeam's `crypto` feature, so the
+	// associated-type definition is emitted through `__tb_if_crypto!`, which is
+	// resolved in tightbeam's feature context rather than the consumer's.
 	let profile_type_impl = if let Some(profile_ty) = &profile_type {
 		quote! {
 			const HAS_PROFILE: bool = true;
-			type Profile = #profile_ty;
+			::tightbeam::__tb_if_crypto! { type Profile = #profile_ty; }
 		}
 	} else {
 		// Always define HAS_PROFILE, even when false (needed for checker trait impls)
 		quote! {
 			const HAS_PROFILE: bool = false;
-			type Profile = ::tightbeam::crypto::profiles::TightbeamProfile;
+			::tightbeam::__tb_if_crypto! { type Profile = ::tightbeam::crypto::profiles::TightbeamProfile; }
 		}
 	};
 
@@ -236,93 +237,93 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		// We know the profile type, so we can reference its associated types directly
 		// ONLY implement for the exact OID types from the profile - wrong OIDs will fail to compile
 		quote! {
-			#[cfg(feature = "digest")]
-			impl ::tightbeam::builder::private::SealedDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
-			where
-				#name: ::tightbeam::Message,
-			{}
+			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_digest! {
+				impl ::tightbeam::builder::private::SealedDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
+				where
+					#name: ::tightbeam::Message,
+				{}
 
-			#[cfg(feature = "digest")]
-			impl ::tightbeam::builder::CheckDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
-			where
-				#name: ::tightbeam::Message,
-			{
-				const RESULT: () = ();
-			}
+				impl ::tightbeam::builder::CheckDigestOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::DigestOid> for #name
+				where
+					#name: ::tightbeam::Message,
+				{
+					const RESULT: () = ();
+				}
+			} }
 
-			#[cfg(feature = "aead")]
-			impl ::tightbeam::builder::private::SealedAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
-			where
-				#name: ::tightbeam::Message,
-			{}
+			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_aead! {
+				impl ::tightbeam::builder::private::SealedAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
+				where
+					#name: ::tightbeam::Message,
+				{}
 
-			#[cfg(feature = "aead")]
-			impl ::tightbeam::builder::CheckAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
-			where
-				#name: ::tightbeam::Message,
-			{
-				const RESULT: () = ();
-			}
+				impl ::tightbeam::builder::CheckAeadOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::AeadOid> for #name
+				where
+					#name: ::tightbeam::Message,
+				{
+					const RESULT: () = ();
+				}
+			} }
 
-			#[cfg(feature = "signature")]
-			impl ::tightbeam::builder::private::SealedSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
-			where
-				#name: ::tightbeam::Message,
-			{}
+			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_signature! {
+				impl ::tightbeam::builder::private::SealedSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
+				where
+					#name: ::tightbeam::Message,
+				{}
 
-			#[cfg(feature = "signature")]
-			impl ::tightbeam::builder::CheckSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
-			where
-				#name: ::tightbeam::Message,
-			{
-				const RESULT: () = ();
-			}
+				impl ::tightbeam::builder::CheckSignatureOid<<#profile_ty as ::tightbeam::crypto::profiles::SecurityProfile>::SignatureAlg> for #name
+				where
+					#name: ::tightbeam::Message,
+				{
+					const RESULT: () = ();
+				}
+			} }
 		}
 	} else {
 		// When HAS_PROFILE = false, generate generic impls for all OID types (no enforcement)
 		// These allow FrameBuilder methods to work for types without profiles
 		quote! {
-			#[cfg(feature = "digest")]
-			impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedDigestOid<D> for #name
-			where
-				#name: ::tightbeam::Message,
-			{}
+			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_digest! {
+				impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedDigestOid<D> for #name
+				where
+					#name: ::tightbeam::Message,
+				{}
 
-			#[cfg(feature = "digest")]
-			impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckDigestOid<D> for #name
-			where
-				#name: ::tightbeam::Message,
-			{
-				const RESULT: () = ();
-			}
+				impl<D: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckDigestOid<D> for #name
+				where
+					#name: ::tightbeam::Message,
+				{
+					const RESULT: () = ();
+				}
+			} }
 
-			#[cfg(feature = "aead")]
-			impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedAeadOid<C> for #name
-			where
-				#name: ::tightbeam::Message,
-			{}
+			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_aead! {
+				impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::private::SealedAeadOid<C> for #name
+				where
+					#name: ::tightbeam::Message,
+				{}
 
-			#[cfg(feature = "aead")]
-			impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckAeadOid<C> for #name
-			where
-				#name: ::tightbeam::Message,
-			{
-				const RESULT: () = ();
-			}
+				impl<C: ::tightbeam::der::oid::AssociatedOid> ::tightbeam::builder::CheckAeadOid<C> for #name
+				where
+					#name: ::tightbeam::Message,
+				{
+					const RESULT: () = ();
+				}
+			} }
 
-			#[cfg(feature = "signature")]
-			impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::private::SealedSignatureOid<S> for #name
-			where
-				#name: ::tightbeam::Message,
-			{}
+			::tightbeam::__tb_if_builder! { ::tightbeam::__tb_if_signature! {
+				impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::private::SealedSignatureOid<S> for #name
+				where
+					#name: ::tightbeam::Message,
+				{}
 
-			#[cfg(feature = "signature")]
-			impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::CheckSignatureOid<S> for #name
-			where
-				#name: ::tightbeam::Message,
-			{
-				const RESULT: () = ();
-			}
+				impl<S: ::tightbeam::crypto::sign::SignatureAlgorithmIdentifier> ::tightbeam::builder::CheckSignatureOid<S> for #name
+				where
+					#name: ::tightbeam::Message,
+				{
+					const RESULT: () = ();
+				}
+			} }
 		}
 	};
 
@@ -505,16 +506,4 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 	};
 
 	TokenStream::from(expanded)
-}
-
-/// Generate all configured builder macros
-#[proc_macro]
-pub fn generate_builders(_input: TokenStream) -> TokenStream {
-	let macros: Vec<_> = build::BUILDER_CONFIGS.iter().map(build::generate_builder_macro).collect();
-
-	let output = quote! {
-		#(#macros)*
-	};
-
-	output.into()
 }

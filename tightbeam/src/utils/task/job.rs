@@ -185,7 +185,6 @@ macro_rules! job {
 #[cfg(test)]
 mod tests {
 	use crate::colony::hive::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
-	use crate::compose;
 	use crate::error::Result;
 	use crate::Frame;
 

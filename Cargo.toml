@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tightbeam", "tightbeam-derive"]
+members = ["tightbeam", "tightbeam-derive", "consumer-test"]
 
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]

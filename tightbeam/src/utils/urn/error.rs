@@ -1,20 +1,12 @@
 //! URN validation error types
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
-#[cfg(not(feature = "std"))]
-use alloc::string::String;
-
-#[cfg(feature = "derive")]
-use crate::Errorizable;
-
 #[cfg(not(feature = "derive"))]
 use core::fmt;
 
 use crate::utils::urn::builders::spec::Pattern;
+
+#[cfg(feature = "derive")]
+use crate::Errorizable;
 
 /// Errors that can occur during URN validation and construction
 #[cfg_attr(feature = "derive", derive(Errorizable))]

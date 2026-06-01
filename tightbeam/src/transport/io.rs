@@ -4,13 +4,11 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
-
-#[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
 
 use crate::asn1::Frame;
 use crate::der::{Decode, Encode};
@@ -23,27 +21,34 @@ use crate::transport::TransportResult;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::cms::enveloped_data::EnvelopedData;
-	pub use crate::cms::signed_data::SignedData;
-	pub use crate::crypto::aead::{Decryptor, KeyInit, RuntimeAead};
-	pub use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc, TightbeamProfile};
-	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-	pub use crate::crypto::sign::{SignatureEncoding, Verifier};
-	pub use crate::crypto::x509::policy::CertificateValidation;
-	pub use crate::der::oid::AssociatedOid;
-	pub use crate::spki::EncodePublicKey;
+	pub use crate::crypto::aead::Decryptor;
 	pub use crate::transport::builders::{EnvelopeBuilder, EnvelopeLimits};
-	pub use crate::transport::handshake::{
-		ClientHandshakeProtocol, ClientHello, ClientKeyExchange, HandshakeError, HandshakeFinalization,
-		HandshakeProtocolKind, ServerHandshake, TcpHandshakeState,
-	};
+	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::state::EncryptedProtocolState;
 
 	#[cfg(feature = "transport-ecies")]
-	pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+	mod ecies {
+		pub use crate::cms::enveloped_data::EnvelopedData;
+		pub use crate::cms::signed_data::SignedData;
+		pub use crate::crypto::aead::{KeyInit, RuntimeAead};
+		pub use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+		pub use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc, TightbeamProfile};
+		pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+		pub use crate::crypto::sign::{SignatureEncoding, Verifier};
+		#[cfg(feature = "std")]
+		pub use crate::crypto::x509::policy::CertificateValidation;
+		pub use crate::der::oid::AssociatedOid;
+		pub use crate::spki::EncodePublicKey;
+		pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
+		pub use crate::transport::handshake::{
+			ClientHandshakeProtocol, ClientHello, ClientKeyExchange, HandshakeError, HandshakeFinalization,
+			HandshakeProtocolKind, ServerHandshake,
+		};
+	}
+
 	#[cfg(feature = "transport-ecies")]
-	pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
+	pub use ecies::*;
 }
 
 #[cfg(feature = "x509")]
@@ -53,6 +58,41 @@ use x509::*;
 const HANDSHAKE_MAX_WIRE: usize = crate::transport::tcp::HANDSHAKE_MAX_WIRE;
 #[cfg(all(feature = "transport-ecies", not(feature = "tcp")))]
 const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB default
+
+/// Parse a DER length field into its numeric value.
+pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> usize {
+	if first_byte & 0x80 == 0 {
+		first_byte as usize
+	} else {
+		let mut length = 0usize;
+		for &byte in length_octets.iter() {
+			length = (length << 8) | (byte as usize);
+		}
+
+		length
+	}
+}
+
+/// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
+pub(crate) fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets: &[u8], content: &[u8]) -> Vec<u8> {
+	let length_bytes_count = if length_first & 0x80 == 0 {
+		1
+	} else {
+		1 + length_octets.len()
+	};
+
+	let mut buffer = Vec::with_capacity(1 + length_bytes_count + content.len());
+	buffer.push(tag);
+	buffer.push(length_first);
+
+	if length_first & 0x80 != 0 {
+		buffer.extend_from_slice(length_octets);
+	}
+
+	buffer.extend_from_slice(content);
+
+	buffer
+}
 
 /// Base I/O operations for message transport
 pub trait MessageIO: ResponseHandler {
@@ -114,37 +154,12 @@ pub trait MessageIO: ResponseHandler {
 
 	/// Helper for parsing DER length encoding
 	fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> usize {
-		if first_byte & 0x80 == 0 {
-			first_byte as usize
-		} else {
-			let mut length = 0usize;
-			for &byte in length_octets.iter() {
-				length = (length << 8) | (byte as usize);
-			}
-			length
-		}
+		parse_der_length(first_byte, length_octets)
 	}
 
 	/// Helper to reconstruct full DER encoding from parts
 	fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets: &[u8], content: &[u8]) -> Vec<u8> {
-		let length_bytes_count = if length_first & 0x80 == 0 {
-			1
-		} else {
-			1 + length_octets.len()
-		};
-
-		let mut buffer = Vec::with_capacity(1 + length_bytes_count + content.len());
-
-		buffer.push(tag);
-		buffer.push(length_first);
-
-		if length_first & 0x80 != 0 {
-			buffer.extend_from_slice(length_octets);
-		}
-
-		buffer.extend_from_slice(content);
-
-		buffer
+		reconstruct_der_encoding(tag, length_first, length_octets, content)
 	}
 }
 
@@ -319,13 +334,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		{
 			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse {
 				initiated_at: std::time::Instant::now(),
 			});
 		}
-		#[cfg(not(feature = "std"))]
+		#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 		{
 			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse { initiated_at: 0 });
 		}
@@ -461,13 +476,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		{
 			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse {
 				initiated_at: std::time::Instant::now(),
 			});
 		}
-		#[cfg(not(feature = "std"))]
+		#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 		{
 			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse { initiated_at: 0 });
 		}
@@ -624,13 +639,13 @@ pub trait EncryptedMessageIO: MessageIO {
 			self.write_envelope(&wire_envelope.to_der()?).await?;
 
 			// Set server awaiting state with timeout tracking
-			#[cfg(feature = "std")]
+			#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 			{
 				self.set_handshake_state(TcpHandshakeState::AwaitingClientFinish {
 					initiated_at: std::time::Instant::now(),
 				});
 			}
-			#[cfg(not(feature = "std"))]
+			#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 			{
 				self.set_handshake_state(TcpHandshakeState::AwaitingClientFinish { initiated_at: 0 });
 			}

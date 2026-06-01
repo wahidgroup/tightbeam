@@ -10,24 +10,23 @@ use alloc::sync::Arc;
 #[allow(unused_imports)] // Used in macro expansion
 use std::sync::Arc;
 
+#[cfg(feature = "tcp")]
 pub mod sync;
 
-#[cfg(feature = "tokio")]
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub mod r#async;
 
-use crate::transport::{Protocol, ProtocolStream};
-
-#[cfg(not(feature = "tokio"))]
-use crate::transport::tcp::r#async::TcpTransport;
-#[cfg(feature = "std")]
-use crate::transport::{tcp::sync::TcpTransport, Mycelial};
+#[cfg(feature = "tcp")]
+use crate::transport::{tcp::sync::TcpTransport, Mycelial, Protocol, ProtocolStream};
 
 /// Maximum wire size allowed for handshake-phase messages.
 /// Handshake messages are small (cert + SPKI + nonces + signature + ECIES blob),
 /// therefore we use a much tighter cap than general envelopes to reduce DoS risk.
+#[cfg(feature = "tcp")]
 pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
 
 /// Abstract TCP listener trait for different networking backends.
+#[cfg(feature = "tcp")]
 pub trait TcpListenerTrait: Protocol + Send {
 	#[cfg(feature = "std")]
 	fn accept(&self) -> Result<(Self::Stream, std::net::SocketAddr), Self::Error>;
@@ -44,7 +43,7 @@ pub enum SocketAddr {
 	V6 { ip: [u8; 16], port: u16 },
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "tcp"))]
 impl Protocol for std::net::TcpListener {
 	type Listener = std::net::TcpListener;
 	type Stream = std::net::TcpStream;
@@ -79,7 +78,7 @@ impl Protocol for std::net::TcpListener {
 
 // The EncryptedProtocol impl for sync TCP lives on the wrapper in sync.rs
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "tcp"))]
 impl Mycelial for std::net::TcpListener {
 	async fn try_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let addr = "0.0.0.0:0"
@@ -89,7 +88,7 @@ impl Mycelial for std::net::TcpListener {
 	}
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "tcp"))]
 impl TcpListenerTrait for std::net::TcpListener {
 	fn accept(&self) -> Result<(Self::Stream, std::net::SocketAddr), Self::Error> {
 		std::net::TcpListener::accept(self)
@@ -97,7 +96,7 @@ impl TcpListenerTrait for std::net::TcpListener {
 }
 
 // std::net implementations when std is available
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "tcp"))]
 impl ProtocolStream for std::net::TcpStream {
 	type Error = std::io::Error;
 

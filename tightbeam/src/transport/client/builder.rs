@@ -1,35 +1,39 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use core::time::Duration;
+
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-
 #[cfg(feature = "std")]
 use std::sync::Arc;
-
-use core::time::Duration;
 
 use super::GenericClient;
 use crate::asn1::Frame;
 use crate::transport::error::TransportFailure;
-use crate::transport::{ConnectionBuilder, MessageCollector, Protocol, TransportResult};
+use crate::transport::{MessageCollector, Protocol, TransportResult};
 
 #[cfg(feature = "policy")]
 use crate::policy::{GatePolicy, TransitStatus};
+#[cfg(feature = "std")]
+use crate::transport::ConnectionBuilder;
 #[cfg(feature = "transport-policy")]
 use crate::transport::MessageEmitter;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::crypto::key::SigningKeyProvider;
 	pub use crate::crypto::profiles::CryptoProvider;
-	#[cfg(feature = "aes-gcm")]
-	pub use crate::crypto::profiles::DefaultCryptoProvider;
 	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::crypto::x509::CertificateSpec;
 	pub use crate::transport::handshake::HandshakeKeyManager;
 	pub use crate::transport::X509ClientConfig;
 	pub use crate::x509::Certificate;
+
+	#[cfg(feature = "std")]
+	pub use crate::crypto::key::SigningKeyProvider;
+	#[cfg(feature = "aes-gcm")]
+	pub use crate::crypto::profiles::DefaultCryptoProvider;
+	#[cfg(feature = "std")]
+	pub use crate::crypto::x509::CertificateSpec;
 }
 
 #[cfg(feature = "x509")]

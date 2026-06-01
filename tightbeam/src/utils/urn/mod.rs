@@ -23,7 +23,6 @@
 //!
 //! ```rust
 //! use tightbeam::utils::urn::{Urn, UrnBuilder, UrnValidationError};
-//! use tightbeam::builder::TypeBuilder;
 //!
 //! fn main() -> Result<(), UrnValidationError> {
 //!     // Build a URN with direct NSS
@@ -52,8 +51,10 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::{borrow::Cow, string::String};
-
+use alloc::{
+	borrow::Cow,
+	string::{String, ToString},
+};
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 
