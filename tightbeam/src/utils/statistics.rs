@@ -7,6 +7,9 @@ use crate::der::{Enumerated, Sequence};
 use crate::error::TightBeamError;
 use crate::utils::math::integer_sqrt;
 
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec::Vec};
+
 /// Trait for statistical analysis of timing data.
 ///
 /// Allows plugging in custom statistical models without modifying core

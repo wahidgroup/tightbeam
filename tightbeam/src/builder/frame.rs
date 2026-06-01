@@ -1,8 +1,13 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
 
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "aead", feature = "signature", feature = "compress")
+))]
+use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::time::SystemTime;
 
@@ -721,8 +726,8 @@ impl<T: Message> FrameBuilder<T> {
 mod tests {
 	use super::*;
 	use crate::compress::ZstdCompression;
-	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
 	use crate::test_builder;
+	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
 
 	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
 	use crate::crypto::hash::Sha3_256;

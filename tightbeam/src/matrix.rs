@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::Asn1Matrix;
 
 #[cfg(feature = "derive")]
@@ -252,7 +255,7 @@ impl TryFrom<MatrixDyn> for Asn1Matrix {
 			return Err(crate::matrix::MatrixError::LengthMismatch { n, len: matrix.data.len() });
 		}
 
-		let data = std::mem::take(&mut matrix.data);
+		let data = core::mem::take(&mut matrix.data);
 		Ok(Self { n, data })
 	}
 }

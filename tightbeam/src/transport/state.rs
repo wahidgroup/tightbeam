@@ -3,12 +3,12 @@
 //! This module separates protocol state accessors from I/O operations,
 //! following the Single Responsibility Principle.
 
+use core::time::Duration;
+
 #[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
-
-use core::time::Duration;
 
 use crate::crypto::aead::RuntimeAead;
 use crate::crypto::profiles::CryptoProvider;

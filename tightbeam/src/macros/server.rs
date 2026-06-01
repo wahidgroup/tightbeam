@@ -1,9 +1,9 @@
 #![allow(clippy::type_complexity)]
 
+use core::{future::Future, pin::Pin};
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-
-use core::{future::Future, pin::Pin};
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, sync::Arc};
@@ -22,7 +22,7 @@ where
 {
 	let handler = Arc::new(handler);
 	Arc::new(move |frame: Frame| -> HandlerFuture {
-		let handler = ::std::sync::Arc::clone(&handler);
+		let handler = Arc::clone(&handler);
 		Box::pin(async move { handler(frame).await })
 	})
 }

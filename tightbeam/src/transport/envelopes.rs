@@ -4,8 +4,7 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec::Vec};
-
+use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 

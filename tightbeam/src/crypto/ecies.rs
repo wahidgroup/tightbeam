@@ -34,6 +34,9 @@
 
 use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::asn1::ObjectIdentifier;
 use crate::constants::{AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ECIES_KDF_INFO};
 use crate::der::oid::AssociatedOid;

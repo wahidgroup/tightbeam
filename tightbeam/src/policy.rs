@@ -1,8 +1,3 @@
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
-
 use crate::der::Enumerated;
 use crate::{Frame, Message};
 

@@ -4,14 +4,11 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec::Vec};
-
+use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
 use crate::asn1::Frame;
-#[cfg(feature = "transport-ecies")]
-use crate::der::Decode;
 use crate::der::Encode;
 use crate::policy::{GatePolicy, TransitStatus};
 use crate::transport::envelopes::{ResponsePackage, TransportEnvelope, WireEnvelope};
@@ -36,6 +33,8 @@ mod x509 {
 #[cfg(feature = "transport-ecies")]
 use x509::*;
 
+#[cfg(feature = "transport-ecies")]
+use crate::der::Decode;
 #[cfg(feature = "transport-policy")]
 use crate::transport::policy::{RestartPolicy, RetryAction};
 

@@ -109,7 +109,10 @@ impl ServerHandshakeState {
 // Replay / Nonce Tracking
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "std")]
 use std::collections::{HashMap, VecDeque};
+#[cfg(not(feature = "std"))]
+use alloc::collections::{BTreeMap as HashMap, VecDeque};
 
 /// Nonce replay detection with LRU eviction.
 ///
@@ -139,7 +142,10 @@ pub struct NonceReplaySet<const N: usize> {
 impl<const N: usize> NonceReplaySet<N> {
 	pub fn new(cap: usize) -> Self {
 		Self {
+			#[cfg(feature = "std")]
 			seen: HashMap::with_capacity(cap),
+			#[cfg(not(feature = "std"))]
+			seen: HashMap::new(),
 			order: VecDeque::with_capacity(cap),
 			cap,
 			counter: 0,

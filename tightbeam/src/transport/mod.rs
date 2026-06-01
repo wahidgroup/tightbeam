@@ -3,14 +3,14 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+#[cfg(all(feature = "x509", not(feature = "std")))]
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-
+#[cfg(feature = "x509")]
+use core::time::Duration;
 #[cfg(feature = "std")]
 use std::sync::Arc;
-
-#[cfg(all(feature = "x509", feature = "std"))]
-use core::time::Duration;
 
 // Module declarations
 pub mod builders;
@@ -68,7 +68,7 @@ use crate::transport::handshake::HandshakeKeyManager;
 
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
 
-#[cfg(all(feature = "x509", feature = "std"))]
+#[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub certificate: Certificate,
@@ -80,7 +80,7 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 	pub handshake_timeout: Duration,
 }
 
-#[cfg(all(feature = "x509", feature = "std"))]
+#[cfg(feature = "x509")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager<P>) -> Self {
 		Self {

@@ -11,10 +11,9 @@ use core::fmt::Debug;
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
+
 #[cfg(all(not(feature = "std"), any(feature = "signature", feature = "aead")))]
-use alloc::sync::Arc;
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 #[cfg(any(feature = "signature", feature = "aead"))]
 use core::future::Future;

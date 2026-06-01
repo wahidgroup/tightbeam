@@ -6,8 +6,7 @@ use crate::utils::urn::{Urn, UrnComponents, UrnSpec, UrnValidationError};
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{borrow::Cow, boxed::Box, vec::Vec};
-
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap as HashMap, vec::Vec};
 #[cfg(feature = "std")]
 use std::{borrow::Cow, boxed::Box, collections::HashMap};
 

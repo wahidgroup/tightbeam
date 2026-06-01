@@ -4,13 +4,11 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
-
-#[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
 
 use crate::asn1::Frame;
 use crate::der::{Decode, Encode};
@@ -38,6 +36,7 @@ mod x509 {
 		pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 		pub use crate::crypto::sign::{SignatureEncoding, Verifier};
+		#[cfg(feature = "std")]
 		pub use crate::crypto::x509::policy::CertificateValidation;
 		pub use crate::der::oid::AssociatedOid;
 		pub use crate::spki::EncodePublicKey;

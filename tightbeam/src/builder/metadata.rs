@@ -1,7 +1,8 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
+
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::builder::error::{BuildError, MetadataError};
 use crate::cms::enveloped_data::EncryptedContentInfo;

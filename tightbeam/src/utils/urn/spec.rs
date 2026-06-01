@@ -1,13 +1,10 @@
 //! URN specification trait
 
-#![cfg_attr(not(feature = "std"), no_std)]
-
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 use alloc::borrow::Cow;
-
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 

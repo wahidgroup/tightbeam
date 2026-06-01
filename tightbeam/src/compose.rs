@@ -12,10 +12,10 @@
 ///
 /// ```ignore
 /// let frame = compose! {
-/// 	V0:
-/// 		id: message_id,
-/// 		order: sequence,
-/// 		message: payload,
+///     V0:
+///         id: message_id,
+///         order: sequence,
+///         message: payload,
 /// }?;
 /// ```
 ///

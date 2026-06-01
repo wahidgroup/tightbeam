@@ -34,7 +34,10 @@
 //! - IEEE 1363a: Standard Specifications for Public-Key Cryptography (ECIES/KEM-DEM)
 //! - ISO/IEC 18033-2: Asymmetric ciphers (ECIES)
 
-pub use hkdf::Hkdf;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+pub use crate::crypto::hkdf::Hkdf;
 
 use crate::constants::{
 	ECDH_SHARED_SECRET_SIZE, EC_PUBKEY_COMPRESSED_SIZE, EC_PUBKEY_UNCOMPRESSED_SIZE, MAX_HKDF_OUTPUT_SIZE,
@@ -139,7 +142,7 @@ impl KdfFunction for HkdfSha3_256 {
 
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<Zeroizing<Vec<u8>>> {
 		if !(MIN_KEY_SIZE..=MAX_HKDF_OUTPUT_SIZE).contains(&key_size) {
-			return Err(KdfError::DerivationFailed(hkdf::InvalidLength));
+			return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
 		}
 
 		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
@@ -158,7 +161,7 @@ impl KdfFunction for HkdfSha3_256 {
 	) -> Result<(ZeroizingArray<N>, ZeroizingArray<N>)> {
 		// Provider-specific safety bound for the temporary buffer used below.
 		if N * 2 > MAX_HKDF_OUTPUT_SIZE {
-			return Err(KdfError::DerivationFailed(hkdf::InvalidLength));
+			return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
 		}
 		// Optimized implementation: single HKDF expansion for both keys
 		// This is functionally equivalent to separate derivations but more
@@ -199,7 +202,7 @@ impl KdfFunction for X963Sha3_256 {
 			out[offset..offset + take].copy_from_slice(&block[..take]);
 			offset += take;
 			if offset < N {
-				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(hkdf::InvalidLength))?;
+				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength))?;
 			}
 		}
 
@@ -213,7 +216,7 @@ impl KdfFunction for X963Sha3_256 {
 		key_size: usize,
 	) -> Result<Zeroizing<Vec<u8>>> {
 		if key_size < MIN_KEY_SIZE {
-			return Err(KdfError::DerivationFailed(hkdf::InvalidLength));
+			return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
 		}
 
 		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
@@ -232,7 +235,7 @@ impl KdfFunction for X963Sha3_256 {
 			out[offset..offset + take].copy_from_slice(&block[..take]);
 			offset += take;
 			if offset < key_size {
-				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(hkdf::InvalidLength))?;
+				counter = counter.checked_add(1).ok_or(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength))?;
 			}
 		}
 
@@ -250,7 +253,7 @@ impl KdfFunction for X963Sha3_256 {
 pub enum KdfError {
 	/// Key derivation failed (HKDF expansion error)
 	#[cfg_attr(feature = "derive", error("Key derivation failed: {0}"))]
-	DerivationFailed(hkdf::InvalidLength),
+	DerivationFailed(crate::crypto::hkdf::InvalidLength),
 
 	/// Invalid ephemeral public key length
 	#[cfg_attr(

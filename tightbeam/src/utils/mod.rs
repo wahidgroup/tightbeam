@@ -2,16 +2,19 @@
 
 use crate::error::TightBeamError;
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 #[cfg(feature = "builder")]
 use crate::builder::FrameBuilder;
-#[cfg(feature = "builder")]
-use crate::{Message, Version};
 #[cfg(feature = "compress")]
 use crate::{
 	compress::{Compressor, Inflator},
 	error::CompressionError,
 	CompressedData,
 };
+#[cfg(feature = "builder")]
+use crate::{Message, Version};
 
 // Submodules
 pub mod basis_points;

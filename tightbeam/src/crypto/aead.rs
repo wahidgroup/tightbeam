@@ -9,6 +9,9 @@ use crate::asn1::ObjectIdentifier;
 use crate::crypto::common::typenum::Unsigned;
 use crate::der::oid::AssociatedOid;
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 // OID wrapper types for AEAD ciphers
 #[cfg(feature = "aes-gcm")]
 mod oid_wrappers {

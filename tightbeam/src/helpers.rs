@@ -1,6 +1,14 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "signature", feature = "digest", feature = "kdf", feature = "aead")
+))]
+use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 // Re-exports
 #[cfg(feature = "zeroize")]
 pub use zeroize::{Zeroize, ZeroizeOnDrop};

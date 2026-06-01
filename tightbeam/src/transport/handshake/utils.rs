@@ -3,14 +3,21 @@
 //! Provides common cryptographic and state management utilities used across
 //! handshake builders, processors, and orchestrators.
 
-#[cfg(feature = "transport-ecies")]
-use crate::asn1::OctetString;
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::crypto::secret::Secret;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::handshake::error::HandshakeError;
 use crate::x509::Certificate;
-use spki::AlgorithmIdentifierOwned;
+
+#[cfg(feature = "transport-ecies")]
+use crate::asn1::OctetString;
 
 /// Generate a random 32-byte CEK for AES-256-GCM.
 ///

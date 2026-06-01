@@ -10,8 +10,12 @@
 use core::str::FromStr;
 use core::{any, fmt};
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+
 use crate::der::{self, Decode, Encode, FixedTag};
 use crate::zeroize::{Zeroize, ZeroizeOnDrop};
+
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 

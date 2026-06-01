@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::der::{EncodeValue, Tagged};
 use crate::error::Result;
 use crate::{Frame, Metadata, TightBeamError, Version};
@@ -187,7 +190,7 @@ impl Frame {
 			.ok_or(TightBeamError::MissingEncryptionInfo)?;
 
 		// The encrypted content is stored in the message field - move it into the info
-		let message = OctetString::new(std::mem::take(&mut self.message))?;
+		let message = OctetString::new(core::mem::take(&mut self.message))?;
 		encrypted_content_info.encrypted_content = Some(message);
 
 		// Decrypt using the Decryptor trait
@@ -229,7 +232,7 @@ impl TightBeamLike for Frame {}
 
 impl From<Frame> for Metadata {
 	fn from(mut frame: Frame) -> Self {
-		std::mem::take(&mut frame.metadata)
+		core::mem::take(&mut frame.metadata)
 	}
 }
 

@@ -6,6 +6,9 @@
 use core::marker::PhantomData;
 use core::time::Duration;
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::asn1::GeneralizedTime;
 use crate::crypto::hash::Digest;
 use crate::crypto::policy::VerificationPolicy;
