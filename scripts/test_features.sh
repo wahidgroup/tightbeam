@@ -75,7 +75,7 @@ echo "[16/16] Check: wasm32 transport-ecies + async-transport (no tokio)"
 if rustup target list --installed | grep -q '^wasm32-unknown-unknown$'; then
 	cargo check --target wasm32-unknown-unknown --package tightbeam-rs --no-default-features --features "std,transport-ecies,async-transport,wasm"
 else
-	echo "  FAIL: wasm32-unknown-unknown target missing (run: rustup target add wasm32-unknown-unknown)" >&2
+	echo "  FAIL: wasm32-unknown-unknown target missing (run: make setup)" >&2
 	exit 1
 fi
 

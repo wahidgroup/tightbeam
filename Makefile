@@ -38,20 +38,26 @@ help-body:
 	@printf '    fuzz-test       Build and run AFL fuzz testing for 60 seconds\n'
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
-	@printf '    lint            Run linters (pass extra clippy args via ARGS)\n'
+	@printf '    lint            Run linters (fix mode via fix=1; extra clippy args via ARGS)\n'
 	@printf '    doc             Build documentation (all features)\n'
 	@printf '    release         Release workflow (make release v0.7.0 [--dry-run] [--allow-staged] [--yank] [--derive])\n'
+	@printf '                    Combined (both crates): make release v0.7.0 derive=0.1.5  |  interactive: make release both=1\n'
 	@printf '    check-yanked    Check if current version has been yanked\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'
 	@printf '    no-default      If set (e.g., 1/true), passes --no-default-features to Cargo\n'
-	@printf '    ARGS            Extra arguments for clippy (e.g., "--fix --allow-matrixd")\n\n'
+	@printf '    ARGS            Extra arguments for clippy (e.g., "--allow-dirty --allow-staged")\n'
+	@printf '    fix             If set (e.g., fix=1), apply fixes: cargo fmt + clippy --fix\n'
+	@printf '    derive          tightbeam-derive version for a combined release (e.g., derive=0.1.5)\n'
+	@printf '    both            If set (e.g., both=1), release both crates, prompting for each version\n\n'
 	@printf 'ENVIRONMENT:\n'
 	@printf '    CARGO_TERM_COLOR, RUSTFLAGS, RUSTC_WRAPPER (honored by Cargo/rustc)\n\n'
 	@printf 'EXAMPLES:\n'
 	@printf '    make build features="std,tcp,tokio"\n'
 	@printf '    make test no-default=1 features="testing"\n'
-	@printf '    make lint ARGS="--fix --allow-matrixd"\n\n'
+	@printf '    make lint fix=1\n'
+	@printf '    make release v0.7.0 derive=0.1.5\n'
+	@printf '    make release both=1\n\n'
 	@printf 'EXIT STATUS:\n'
 	@printf '    0    Success\n'
 	@printf '    >0   Error occurred\n\n'
@@ -71,6 +77,8 @@ setup:
 	@echo "Setting up the development environment..."
 	@echo "Installing development tools..."
 	rustup component add rustfmt clippy
+	@echo "Installing cross-compilation targets..."
+	rustup target add wasm32-unknown-unknown
 
 # Build all projects
 build:
@@ -232,24 +240,17 @@ clean-fuzz:
 	rm -rf built/fuzz/out
 	@echo "Fuzz output directory cleaned."
 
-# Collect extra args passed after the target (e.g., `make lint -- --fix ...`)
-# Strip the target name and the bare `--` separator
-LINT_ARGS := $(filter-out lint,$(MAKECMDGOALS))
-LINT_ARGS := $(filter-out --,$(LINT_ARGS))
-# Back-compat: also honor ARGS=... if provided
-ifneq ($(strip $(ARGS)),)
-LINT_ARGS += $(ARGS)
-endif
-
-# Decide fmt/clippy behavior based on presence of --fix
-ifeq (,$(findstring --fix,$(LINT_ARGS)))
-FMT_CMD := cargo fmt --all --check
-CLIPPY_EXTRA := -- -D warnings
-LINT_MODE := check
+# Linters: enable fix mode with `fix=1`; pass extra clippy args via ARGS="...".
+ifneq ($(strip $(fix)),)
+FMT_CMD     := cargo fmt --all
+CLIPPY_MODE := --fix
+CLIPPY_DENY :=
+LINT_MODE   := fix
 else
-FMT_CMD := cargo fmt --all
-CLIPPY_EXTRA :=
-LINT_MODE := fix
+FMT_CMD     := cargo fmt --all --check
+CLIPPY_MODE :=
+CLIPPY_DENY := -- -D warnings
+LINT_MODE   := check
 endif
 
 # Swallow option-like extra MAKECMDGOALS so make doesn't error on them
@@ -267,15 +268,15 @@ check-yanked:
 
 # Release workflow
 release:
-	@./scripts/release.sh "$(RELEASE_VERSION)" $(RELEASE_FLAGS)
+	@./scripts/release.sh "$(RELEASE_VERSION)" $(RELEASE_FLAGS) $(if $(derive),--derive=$(derive)) $(if $(both),--both)
 
 # Run linters
 lint:
 	@echo "Running linters (mode: $(LINT_MODE))..."
 	@echo "Formatting: $(FMT_CMD)"
 	$(FMT_CMD)
-	@echo "Clippy: cargo clippy --all-targets --all-features $(LINT_ARGS) $(CLIPPY_EXTRA)"
-	cargo clippy --all-targets --all-features $(LINT_ARGS) $(CLIPPY_EXTRA)
+	@echo "Clippy: cargo clippy --all-targets --all-features $(CLIPPY_MODE) $(ARGS) $(CLIPPY_DENY)"
+	cargo clippy --all-targets --all-features $(CLIPPY_MODE) $(ARGS) $(CLIPPY_DENY)
 
 # Build documentation
 doc:

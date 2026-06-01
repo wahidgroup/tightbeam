@@ -1,4 +1,4 @@
-//! Downstream-consumer regression test for the `#[derive(Beamable)]` cfg-leak.
+//! Consumer regression test for the `#[derive(Beamable)]` cfg-leak.
 //!
 //! This crate does not declare any Cargo features, yet enables tightbeam's
 //! crypto features transitively.

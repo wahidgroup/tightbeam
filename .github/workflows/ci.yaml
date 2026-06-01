@@ -28,21 +28,21 @@ jobs:
         run: make lint
 
   test:
-    name: Test All Features
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Test All Features
+            run: make test-all
+          - name: Feature Combinations
+            run: ./scripts/test_features.sh
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run all feature combination tests
-        run: make test-all
-
-  test-features:
-    name: Feature Combinations
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run feature combination tests
-        run: ./scripts/test_features.sh
+      - name: Set up toolchain targets
+        run: make setup
+      - name: Run tests
+        run: ${{ matrix.run }}
