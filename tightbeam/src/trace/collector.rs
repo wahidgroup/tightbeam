@@ -24,7 +24,6 @@ use crate::Frame;
 
 #[cfg(feature = "testing-fault")]
 use crate::constants::DEFAULT_FAULT_SEED;
-#[cfg(feature = "digest")]
 #[cfg(feature = "instrument")]
 use crate::crypto::hash::{Digest, Sha3_256};
 #[cfg(feature = "instrument")]

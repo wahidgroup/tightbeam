@@ -27,7 +27,7 @@ pub mod state;
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
 
 // Re-exports from submodules
@@ -49,7 +49,9 @@ pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 #[cfg(feature = "transport-policy")]
 pub use messaging::MessageEmitter;
 #[cfg(all(feature = "tcp", feature = "tokio"))]
-pub use tcp::r#async::{AsyncProtocolStream, TcpTransport, TokioListener};
+pub use tcp::r#async::TokioListener;
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+pub use tcp::r#async::{AsyncProtocolStream, TcpTransport};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;

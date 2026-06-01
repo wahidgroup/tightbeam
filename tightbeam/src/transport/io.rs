@@ -334,13 +334,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		{
 			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse {
 				initiated_at: std::time::Instant::now(),
 			});
 		}
-		#[cfg(not(feature = "std"))]
+		#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 		{
 			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse { initiated_at: 0 });
 		}
@@ -476,13 +476,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
 		// Update state machine
-		#[cfg(feature = "std")]
+		#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 		{
 			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse {
 				initiated_at: std::time::Instant::now(),
 			});
 		}
-		#[cfg(not(feature = "std"))]
+		#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 		{
 			self.set_handshake_state(TcpHandshakeState::AwaitingServerResponse { initiated_at: 0 });
 		}
@@ -639,13 +639,13 @@ pub trait EncryptedMessageIO: MessageIO {
 			self.write_envelope(&wire_envelope.to_der()?).await?;
 
 			// Set server awaiting state with timeout tracking
-			#[cfg(feature = "std")]
+			#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 			{
 				self.set_handshake_state(TcpHandshakeState::AwaitingClientFinish {
 					initiated_at: std::time::Instant::now(),
 				});
 			}
-			#[cfg(not(feature = "std"))]
+			#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 			{
 				self.set_handshake_state(TcpHandshakeState::AwaitingClientFinish { initiated_at: 0 });
 			}

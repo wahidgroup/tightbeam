@@ -205,7 +205,7 @@ use crate::transport::handshake::client::ExtractVerifyingKey;
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::server::EciesHandshakeServer;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::time::Instant;
 
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
@@ -524,19 +524,19 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 pub enum TcpHandshakeState {
 	#[default]
 	None,
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	AwaitingServerResponse {
 		initiated_at: Instant,
 	},
-	#[cfg(not(feature = "std"))]
+	#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 	AwaitingServerResponse {
 		initiated_at: u64,
 	},
-	#[cfg(feature = "std")]
+	#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 	AwaitingClientFinish {
 		initiated_at: Instant,
 	},
-	#[cfg(not(feature = "std"))]
+	#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
 	AwaitingClientFinish {
 		initiated_at: u64,
 	},
