@@ -1,4 +1,36 @@
 use crate::asn1::{Frame, Version};
+#[cfg(feature = "digest")]
+use crate::der::{Encode, EncodeValue, FixedTag, Length, Tag, Writer};
+#[cfg(feature = "digest")]
+use crate::Metadata;
+
+/// Envelope-only view (version + metadata) used to compute Frame Integrity
+/// (FI). The message field is excluded by construction: FI MUST be computed
+/// over the envelope only. Borrows its fields so the builder and the verifier
+/// share one zero-copy encoding, preventing the digest preimage from drifting.
+#[cfg(feature = "digest")]
+pub(crate) struct FrameIntegrityScaffold<'a> {
+	pub(crate) version: &'a Version,
+	pub(crate) metadata: &'a Metadata,
+}
+
+#[cfg(feature = "digest")]
+impl FixedTag for FrameIntegrityScaffold<'_> {
+	const TAG: Tag = Tag::Sequence;
+}
+
+#[cfg(feature = "digest")]
+impl EncodeValue for FrameIntegrityScaffold<'_> {
+	fn value_len(&self) -> crate::der::Result<Length> {
+		self.version.encoded_len()? + self.metadata.encoded_len()?
+	}
+
+	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
+		self.version.encode(encoder)?;
+		self.metadata.encode(encoder)?;
+		Ok(())
+	}
+}
 
 impl Frame {
 	/// Validate that the frame's version is compatible with its metadata fields.

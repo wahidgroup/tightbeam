@@ -468,8 +468,12 @@ where
 		)?;
 
 		// TODO decouple OsRng
-		let encrypted_message =
-			encrypt::<_, _, _, M>(&recipient_pubkey, &plaintext, associated_data, Some(&mut rand_core::OsRng))?;
+		let encrypted_message = encrypt::<_, _, _, M, P::Kdf, P::AeadCipher>(
+			&recipient_pubkey,
+			&plaintext,
+			associated_data,
+			Some(&mut rand_core::OsRng),
+		)?;
 
 		Ok(encrypted_message.to_bytes())
 	}

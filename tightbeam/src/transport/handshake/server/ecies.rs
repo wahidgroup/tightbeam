@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use crate::asn1::OctetString;
 use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_ECIES_KDF_INFO};
-use crate::crypto::aead::{Aead, Aes256Gcm, Key, KeyInit, Nonce, Payload};
+use crate::crypto::aead::{Aead, AeadCore, KeyInit, Nonce, Payload};
+use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::ecies::EciesError;
-use crate::crypto::ecies::{EciesMessageOps, Secp256k1EciesMessage};
-use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256};
+use crate::crypto::ecies::EciesMessageOps;
+use crate::crypto::kdf::ecies_kdf;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
@@ -320,34 +321,37 @@ where
 	}
 
 	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		// Parse the ECIES message from bytes
-		let encrypted_message = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
-		// Get ephemeral public key bytes from message
-		let ephemeral_pubkey_bytes = encrypted_message.ephemeral_pubkey();
-		// Use KeyProvider to perform ECDH
-		let shared_secret_bytes = self.server_key_provider.key_agreement(ephemeral_pubkey_bytes).await?;
+		// Parse the ECIES message using the negotiated curve's wire format.
+		let (ephemeral_pubkey, ciphertext_bytes) = {
+			let encrypted_message = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_bytes)?;
+			(
+				encrypted_message.ephemeral_pubkey().to_vec(),
+				encrypted_message.ciphertext().to_vec(),
+			)
+		};
 
-		// Derive encryption key using KDF
-		let k_enc = ecies_kdf::<HkdfSha3_256>(
-			ephemeral_pubkey_bytes,
-			shared_secret_bytes.into(),
-			TIGHTBEAM_ECIES_KDF_INFO,
-			None,
-		)?;
+		// Use KeyProvider to perform ECDH
+		let shared_secret_bytes = self.server_key_provider.key_agreement(&ephemeral_pubkey).await?;
+		// Derive encryption key using the negotiated KDF.
+		let k_enc = ecies_kdf::<P::Kdf>(&ephemeral_pubkey, shared_secret_bytes.into(), TIGHTBEAM_ECIES_KDF_INFO, None)?;
+
+		// AEAD geometry comes from the negotiated cipher, not literals.
+		let nonce_size = <P::AeadCipher as AeadCore>::NonceSize::USIZE;
+		let tag_size = <P::AeadCipher as AeadCore>::TagSize::USIZE;
+		let key_size = <P::AeadCipher as KeySizeUser>::KeySize::USIZE;
 
 		// Extract nonce and ciphertext
-		let ciphertext_bytes = encrypted_message.ciphertext();
-		if ciphertext_bytes.len() < 12 + 16 {
+		let ciphertext_bytes = ciphertext_bytes.as_slice();
+		if ciphertext_bytes.len() < nonce_size + tag_size {
 			return Err(HandshakeError::EciesError(EciesError::InvalidCiphertext));
 		}
 
-		let nonce_bytes = &ciphertext_bytes[0..12];
-		let nonce = Nonce::<Aes256Gcm>::from_slice(nonce_bytes);
-		let ciphertext_with_tag = &ciphertext_bytes[12..];
+		let nonce = Nonce::<P::AeadCipher>::from_slice(&ciphertext_bytes[..nonce_size]);
+		let ciphertext_with_tag = &ciphertext_bytes[nonce_size..];
 
-		// Decrypt using AES-256-GCM
-		let key = Key::<Aes256Gcm>::from_slice(&k_enc[..32]);
-		let cipher = Aes256Gcm::new(key);
+		// Build the negotiated cipher from the derived key material.
+		let cipher = <P::AeadCipher as KeyInit>::new_from_slice(&k_enc[..key_size])
+			.map_err(|_| HandshakeError::InvalidKeySize { expected: key_size, received: k_enc.len() })?;
 
 		let payload = match self.aad_domain_tag {
 			Some(aad) => Payload { msg: ciphertext_with_tag, aad },
@@ -718,6 +722,7 @@ mod tests {
 	) -> Result<Vec<u8>, Box<dyn std::error::Error>>
 	where
 		P: CryptoProvider,
+		P::AeadCipher: KeyInit,
 	{
 		use crate::crypto::ecies::encrypt;
 
@@ -743,7 +748,7 @@ mod tests {
 		// Use server's AAD domain tag (or default if None)
 		let aad = server.aad_domain_tag.or(Some(crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG));
 		// Encrypt with ECIES
-		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage>(
+		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage, P::Kdf, P::AeadCipher>(
 			&server_pubkey,
 			&plaintext,
 			aad,

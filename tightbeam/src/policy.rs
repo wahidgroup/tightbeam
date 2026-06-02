@@ -78,6 +78,36 @@ impl GatePolicy for AcceptAllGate {
 	}
 }
 
+/// Gate that requires every frame to carry a valid frame integrity (FI) digest.
+///
+/// A frame is [`TransitStatus::Accepted`] only when it carries an FI value that
+/// recomputes to the same digest under `D`. Every other case is rejected with
+/// [`TransitStatus::Forbidden`].
+#[cfg(feature = "digest")]
+pub struct FrameIntegrityGate<D> {
+	_marker: core::marker::PhantomData<fn() -> D>,
+}
+
+#[cfg(feature = "digest")]
+impl<D> Default for FrameIntegrityGate<D> {
+	fn default() -> Self {
+		Self { _marker: core::marker::PhantomData }
+	}
+}
+
+#[cfg(feature = "digest")]
+impl<D> GatePolicy for FrameIntegrityGate<D>
+where
+	D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
+{
+	fn evaluate(&self, message: &Frame) -> TransitStatus {
+		match message.verify_frame_integrity::<D>() {
+			Ok(true) => TransitStatus::Accepted,
+			_ => TransitStatus::Forbidden,
+		}
+	}
+}
+
 /// Middleware wrapper for gate policies that observes evaluations.
 ///
 /// Wraps any `GatePolicy` and calls a closure with the evaluation result.
@@ -117,5 +147,37 @@ where
 		(self.observer)(message, &status);
 
 		status
+	}
+}
+
+#[cfg(all(test, feature = "digest", feature = "builder", feature = "sha3"))]
+mod tests {
+	use super::*;
+	use crate::crypto::hash::Sha3_256;
+	use crate::testing::{create_frame_with_frame_integrity, create_test_message};
+
+	#[test]
+	fn accepts_intact_frame() {
+		let gate = FrameIntegrityGate::<Sha3_256>::default();
+		assert!(matches!(
+			gate.evaluate(&create_frame_with_frame_integrity()),
+			TransitStatus::Accepted
+		));
+	}
+
+	#[test]
+	fn rejects_tampered_frame() {
+		let mut frame = create_frame_with_frame_integrity();
+		frame.metadata.id = b"tampered".to_vec();
+		let gate = FrameIntegrityGate::<Sha3_256>::default();
+		assert!(matches!(gate.evaluate(&frame), TransitStatus::Forbidden));
+	}
+
+	#[test]
+	fn rejects_frame_without_integrity() {
+		let message = create_test_message(None);
+		let frame = compose! { V0: id: "gate-no-fi", order: 1u64, message: message }.unwrap();
+		let gate = FrameIntegrityGate::<Sha3_256>::default();
+		assert!(matches!(gate.evaluate(&frame), TransitStatus::Forbidden));
 	}
 }

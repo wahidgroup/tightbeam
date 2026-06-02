@@ -99,6 +99,81 @@ Contributors SHOULD:
   test: add integration tests for V2 features
   ```
 
+## Pull Requests
+
+All pull requests MUST conform to the title, body, and metadata specifications below. Three CI checks (`PR Title`, `PR Body`, `PR Metadata`) block merge on non-compliance.
+
+### Title
+
+PR titles MUST follow the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) specification:
+
+```
+<type>[optional scope]: <Subject>
+```
+
+#### Type
+
+The type MUST be one of:
+
+| Type       | Purpose                                                 | Semver |
+| ---------- | ------------------------------------------------------- | ------ |
+| `feat`     | New feature                                             | MINOR  |
+| `fix`      | Bug fix                                                 | PATCH  |
+| `docs`     | Documentation only                                      | —      |
+| `style`    | Formatting, whitespace, no logic change                 | —      |
+| `refactor` | Code change that neither fixes a bug nor adds a feature | —      |
+| `perf`     | Performance improvement                                 | PATCH  |
+| `test`     | Adding or correcting tests                              | —      |
+| `build`    | Build system or dependency changes                      | —      |
+| `ci`       | CI configuration changes                                | —      |
+| `chore`    | Maintenance, no production code change                  | —      |
+
+#### Scope
+
+The scope is OPTIONAL and identifies the affected area of the codebase. Recommended scopes:
+
+- Crate: `tightbeam`, `tightbeam-derive`
+- Layer: `transport`, `crypto`, `colony`, `builder`, `asn1`, `docs`
+
+#### Subject
+
+The subject MUST:
+
+- Start with an uppercase letter (or a version like `v1.2.3` for release PRs)
+- Use imperative mood ("Add" not "Added")
+- NOT end with a period
+- Be under 72 characters
+
+#### Breaking Changes
+
+Append `!` after the type or scope to indicate a breaking change:
+
+```
+feat!: Drop support for the legacy handshake
+refactor(transport)!: Rename handshake processor trait
+```
+
+### Body
+
+The PR body MUST contain these five sections, each with non-empty content:
+
+| Section               | Purpose                                                                 |
+| --------------------- | ----------------------------------------------------------------------- |
+| `## Summary`          | WHY this change exists and WHAT it accomplishes                         |
+| `## Related Issues`   | Issue links (`Fixes #N`, `Closes #N`, `Refs #N`, or `None`)             |
+| `## Changes Made`     | Bullet list of user/system-visible changes                              |
+| `## Testing`          | How a reviewer verifies the change (commands, steps, expected outcomes) |
+| `## Breaking Changes` | Migration path for consumers, or `None`                                 |
+
+The PR template at `.github/PULL_REQUEST_TEMPLATE.md` auto-populates these sections. Release PRs (head branch `process/*`) are exempt from body validation.
+
+### Metadata
+
+Each PR MUST have:
+
+- At least one **assignee** (the person responsible for landing the PR)
+- At least one **label** (for categorization and triage)
+
 ## Types of Contributions
 
 ### Bug Reports

@@ -235,7 +235,7 @@ mod tests {
 				content_enc_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB, parameters: None },
 				encrypted_content: Some(der::asn1::OctetString::new(vec![0; 50])?),
 			}),
-			priority: Some(MessagePriority::Normal),
+			priority: Some(MessagePriority::Standard),
 			lifetime: Some(3600),
 			previous_frame: Some(DigestInfo {
 				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },

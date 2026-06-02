@@ -207,8 +207,8 @@ impl PriorityLedger {
 	}
 
 	fn assign(&self, frame: &Frame) -> Result<u8, TightBeamError> {
-		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Normal);
-		let worker = if priority <= MessagePriority::High {
+		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Standard);
+		let worker = if priority >= MessagePriority::LowLatency {
 			0
 		} else {
 			1
@@ -226,7 +226,7 @@ impl PriorityLedger {
 
 		self.trace.event_with(label, vec![QUEUE_TAG, tag], worker)?;
 
-		let respected = if priority <= MessagePriority::High {
+		let respected = if priority >= MessagePriority::LowLatency {
 			worker == 0
 		} else {
 			worker == 1
@@ -268,10 +268,10 @@ impl AdaptiveGate {
 
 impl GatePolicy for AdaptiveGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
-		// Throttle Normal+ priority frames on first encounter
+		// Throttle Standard-or-lower priority frames on first encounter
 		// Subsequent attempts (same order) will be accepted
-		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Normal);
-		if priority >= MessagePriority::Normal && self.stats.mark_throttled(frame.metadata.order) {
+		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Standard);
+		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata.order) {
 			// Emit trace event for test verification
 			let _ = self.trace.event_with("throttle_engaged", &[QUEUE_TAG], true);
 			TransitStatus::Busy
@@ -314,9 +314,9 @@ impl QueueHarness {
 
 fn default_batch() -> WorkBatch {
 	let mut batch = WorkBatch::new(WorkId::new("queue-free::work"), 1);
-	batch.push(b"critical-order", MessagePriority::Top);
-	batch.push(b"normal-scan", MessagePriority::Normal);
-	batch.push(b"high-followup", MessagePriority::High);
+	batch.push(b"critical-order", MessagePriority::Expedited);
+	batch.push(b"normal-scan", MessagePriority::Standard);
+	batch.push(b"high-followup", MessagePriority::LowLatency);
 	batch
 }
 

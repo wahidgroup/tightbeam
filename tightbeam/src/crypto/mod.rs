@@ -1,5 +1,3 @@
-mod utils;
-
 /// Macro to define OID wrapper types with `AssociatedOid` implementation.
 ///
 /// This reduces boilerplate for creating simple marker types that implement

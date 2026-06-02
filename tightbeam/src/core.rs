@@ -267,6 +267,27 @@ impl Frame {
 			None => Ok(false),
 		}
 	}
+
+	/// Verify this frame's frame-integrity (FI) digest.
+	///
+	/// Recomputes `H(SEQUENCE { version, metadata })` with `D` and compares it
+	/// against the stored digest.
+	pub fn verify_frame_integrity<D>(&self) -> Result<bool>
+	where
+		D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
+	{
+		let info = match self.integrity.as_ref() {
+			Some(info) => info,
+			None => return Ok(false),
+		};
+		if info.algorithm.oid != D::OID {
+			return Ok(false);
+		}
+
+		let scaffold = crate::frame::FrameIntegrityScaffold { version: &self.version, metadata: &self.metadata };
+		let recomputed = crate::utils::digest::<D>(&crate::encode(&scaffold)?)?;
+		Ok(recomputed.digest.as_bytes() == info.digest.as_bytes())
+	}
 }
 
 #[cfg(feature = "compress")]
@@ -521,7 +542,7 @@ mod tests {
 					confidentiality<Aes256GcmOid, _>: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity<Sha3_256>: [],
-					priority: MessagePriority::Bulk,
+					priority: MessagePriority::HighThroughput,
 					lifetime: 3600
 			}.unwrap()
 		},
@@ -567,7 +588,7 @@ mod tests {
 					confidentiality<Aes256GcmOid, _>: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity<Sha3_256>: [],
-					priority: MessagePriority::Top,
+					priority: MessagePriority::Expedited,
 					lifetime: 60
 			}.unwrap()
 		} => Version,
@@ -632,7 +653,7 @@ mod tests {
 					confidentiality<Aes256GcmOid, _>: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key,
 					message_integrity<Sha3_256>: [],
-					priority: MessagePriority::High,
+					priority: MessagePriority::LowLatency,
 					lifetime: 120
 			}.unwrap()
 		} => EncryptedContentInfo,
@@ -705,5 +726,38 @@ mod tests {
 		assert!(!NumericProfileMessage::HAS_PROFILE);
 		assert!(TypeProfileMessage::HAS_PROFILE);
 		assert!(!NoProfileMessage::HAS_PROFILE);
+	}
+
+	#[cfg(all(feature = "builder", feature = "sha3"))]
+	mod frame_integrity {
+		use super::*;
+		use crate::crypto::hash::{Sha3_256, Sha3_512};
+		use crate::testing::create_frame_with_frame_integrity;
+
+		#[test]
+		fn verifies_intact_envelope() {
+			let frame = create_frame_with_frame_integrity();
+			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(true)));
+		}
+
+		#[test]
+		fn rejects_tampered_envelope() {
+			let mut frame = create_frame_with_frame_integrity();
+			frame.metadata.id = b"tampered".to_vec();
+			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(false)));
+		}
+
+		#[test]
+		fn rejects_algorithm_mismatch() {
+			let frame = create_frame_with_frame_integrity();
+			assert!(matches!(frame.verify_frame_integrity::<Sha3_512>(), Ok(false)));
+		}
+
+		#[test]
+		fn absent_integrity_is_false() {
+			let message = create_test_message(None);
+			let frame = compose! { V0: id: "no-fi", order: 1u64, message: message }.unwrap();
+			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(false)));
+		}
 	}
 }

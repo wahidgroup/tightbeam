@@ -62,9 +62,9 @@ worker! {
 
 			// Determine priority based on battery level
 			let priority = if request.telemetry.battery_percent < 20 {
-				MessagePriority::High
+				MessagePriority::LowLatency
 			} else {
-				MessagePriority::Normal
+				MessagePriority::Standard
 			};
 
 			trace.event("mission_control_send_command")?;

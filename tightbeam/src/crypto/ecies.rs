@@ -41,44 +41,14 @@ use crate::asn1::ObjectIdentifier;
 use crate::constants::{AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ECIES_KDF_INFO};
 use crate::der::oid::AssociatedOid;
 
-use crate::crypto::aead::{Aead, Aes256Gcm, KeyInit, Payload};
-use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256, KdfError};
+use crate::crypto::aead::{Aead, AeadCore, Aes256Gcm, Key, KeyInit, Nonce, Payload};
+use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
+use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256, KdfError, KdfFunction};
 use crate::crypto::secret::{Secret, SecretSlice};
 use crate::crypto::sign::ecdsa::k256::ecdh::EphemeralSecret;
 use crate::crypto::sign::ecdsa::k256::elliptic_curve::sec1::ToEncodedPoint;
 use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
-
-// ============================================================================
-// RNG Wrapper for Trait Object Compatibility
-// ============================================================================
-
-/// Wrapper to adapt `dyn CryptoRngCore` to the `CryptoRng + RngCore` bounds
-/// required by `EphemeralSecret::random`.
-///
-/// `EphemeralSecret::random` requires a `Sized` RNG parameter, but we want to
-/// accept trait objects for flexibility. This wrapper forwards all RNG methods
-/// to the underlying trait object.
-struct RngWrapper<'a>(&'a mut dyn CryptoRngCore);
-
-impl RngCore for RngWrapper<'_> {
-	fn next_u32(&mut self) -> u32 {
-		self.0.next_u32()
-	}
-
-	fn next_u64(&mut self) -> u64 {
-		self.0.next_u64()
-	}
-
-	fn fill_bytes(&mut self, dest: &mut [u8]) {
-		self.0.fill_bytes(dest)
-	}
-
-	fn try_fill_bytes(&mut self, dest: &mut [u8]) -> core::result::Result<(), rand_core::Error> {
-		self.0.try_fill_bytes(dest)
-	}
-}
-
-impl CryptoRng for RngWrapper<'_> {}
+use crate::random::RngWrapper;
 
 // ============================================================================
 // Generic ECIES Traits
@@ -373,7 +343,9 @@ impl EciesMessageOps for Secp256k1EciesMessage {
 /// * `P` - Plaintext type that can be converted to bytes
 /// * `R` - Random number generator type (optional, defaults to OsRng)
 /// * `M` - Message type implementing EciesMessageOps
-pub fn encrypt<PK, P, R, M>(
+/// * `K` - KDF used to derive the content-encryption key
+/// * `A` - AEAD cipher used to seal the plaintext
+pub fn encrypt<PK, P, R, M, K, A>(
 	recipient_pubkey: &PK,
 	plaintext: P,
 	associated_data: Option<&[u8]>,
@@ -385,8 +357,11 @@ where
 	P: AsRef<[u8]>,
 	R: CryptoRng + RngCore,
 	M: EciesMessageOps,
+	K: KdfFunction,
+	A: Aead + KeyInit,
 {
 	let plaintext = plaintext.as_ref();
+	let key_size = <A as KeySizeUser>::KeySize::USIZE;
 
 	// Helper macro to avoid code duplication
 	macro_rules! do_encrypt {
@@ -394,17 +369,16 @@ where
 			// Use the trait method to generate ephemeral key and shared secret
 			let (ephemeral_bytes, shared_secret) = PK::SecretKey::generate_ephemeral(recipient_pubkey, $rng)?;
 
-			// Derive encryption key using KDF (includes C0 for non-malleability)
-			let k_enc = ecies_kdf::<HkdfSha3_256>(&ephemeral_bytes, shared_secret, TIGHTBEAM_ECIES_KDF_INFO, None)?;
+			// Derive encryption key using the negotiated KDF (binds C0 for non-malleability).
+			let k_enc = ecies_kdf::<K>(&ephemeral_bytes, shared_secret, TIGHTBEAM_ECIES_KDF_INFO, None)?;
 
-			// Encrypt using AES-256-GCM
-			let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
-			let cipher = Aes256Gcm::new(&key);
+			// Build the negotiated AEAD cipher from the derived key material.
+			let key = Key::<A>::from_slice(&k_enc[..key_size]);
+			let cipher = A::new(key);
 
-			// Generate random nonce (96 bits for GCM)
-			let mut nonce_bytes = [0u8; AES_GCM_NONCE_SIZE];
-			$rng.fill_bytes(&mut nonce_bytes);
-			let nonce = crate::crypto::utils::nonce_from_slice::<Aes256Gcm>(&nonce_bytes);
+			// Generate a random nonce sized for the negotiated cipher.
+			let mut nonce = Nonce::<A>::default();
+			$rng.fill_bytes(nonce.as_mut_slice());
 
 			// Prepare payload with optional AAD
 			let payload = match associated_data {
@@ -415,8 +389,8 @@ where
 			// Encrypt and prepend nonce in a single allocation
 			let ciphertext = cipher.encrypt(&nonce, payload).map_err(EciesError::EncryptionFailed)?;
 			let encrypted_len = ciphertext.len();
-			let mut final_ciphertext = Vec::with_capacity(AES_GCM_NONCE_SIZE + encrypted_len);
-			final_ciphertext.extend_from_slice(&nonce_bytes);
+			let mut final_ciphertext = Vec::with_capacity(nonce.len() + encrypted_len);
+			final_ciphertext.extend_from_slice(nonce.as_slice());
 			final_ciphertext.extend_from_slice(&ciphertext);
 
 			// Construct message from concatenated bytes (avoid extra allocation)
@@ -435,31 +409,58 @@ where
 	}
 }
 
-pub fn decrypt<SK, M>(recipient_seckey: &SK, message: &M, associated_data: Option<&[u8]>) -> Result<SecretSlice<u8>>
+pub fn decrypt<SK, M, K, A>(
+	recipient_seckey: &SK,
+	message: &M,
+	associated_data: Option<&[u8]>,
+) -> Result<SecretSlice<u8>>
 where
 	SK: EciesSecretKeyOps,
 	M: EciesMessageOps,
+	K: KdfFunction,
+	A: Aead + KeyInit,
 {
-	// 1. Parse ephemeral public key
+	// Compute the shared secret S = d·R, then derive the key and open.
 	let ephemeral_pubkey = <SK::PublicKey as EciesPublicKeyOps>::from_bytes(message.ephemeral_pubkey())?;
-	// 2. Perform ECDH to get shared secret
 	let shared_secret = recipient_seckey.diffie_hellman(&ephemeral_pubkey);
-	// 3. Derive encryption key using KDF (includes C0 for non-malleability)
-	// Uses SHA3-256 with protocol versioning via info parameter
-	// Derives 32-byte key for AES-256-GCM authenticated encryption
-	let k_enc = ecies_kdf::<HkdfSha3_256>(message.ephemeral_pubkey(), shared_secret, TIGHTBEAM_ECIES_KDF_INFO, None)?;
+	decrypt_with_shared_secret::<M, K, A>(message, shared_secret, associated_data)
+}
 
-	// 4. Extract nonce and ciphertext
+/// Decrypt an ECIES message from a precomputed ECDH shared secret.
+///
+/// Splits the `d·R` step out of [`decrypt`] so the recipient private key can
+/// live behind an external boundary (HSM, KMS, secure enclave). Callers obtain
+/// the shared secret out-of-band (e.g. `SigningKeyProvider::key_agreement`) and
+/// pass it here for key derivation and AEAD opening.
+pub fn decrypt_with_shared_secret<M, K, A>(
+	message: &M,
+	shared_secret: SecretSlice<u8>,
+	associated_data: Option<&[u8]>,
+) -> Result<SecretSlice<u8>>
+where
+	M: EciesMessageOps,
+	K: KdfFunction,
+	A: Aead + KeyInit,
+{
+	// Derive encryption key using the negotiated KDF (binds C0 for non-malleability).
+	let k_enc = ecies_kdf::<K>(message.ephemeral_pubkey(), shared_secret, TIGHTBEAM_ECIES_KDF_INFO, None)?;
+
+	// AEAD geometry comes from the negotiated cipher, not literals.
+	let nonce_size = <A as AeadCore>::NonceSize::USIZE;
+	let tag_size = <A as AeadCore>::TagSize::USIZE;
+	let key_size = <A as KeySizeUser>::KeySize::USIZE;
+
 	let ciphertext_bytes = message.ciphertext();
-	if ciphertext_bytes.len() < AES_GCM_NONCE_SIZE + AES_GCM_TAG_SIZE {
+	if ciphertext_bytes.len() < nonce_size + tag_size {
 		return Err(EciesError::InvalidCiphertext);
 	}
-	let nonce = crate::crypto::utils::nonce_from_slice::<Aes256Gcm>(&ciphertext_bytes[0..AES_GCM_NONCE_SIZE]);
-	let ciphertext_with_tag = &ciphertext_bytes[AES_GCM_NONCE_SIZE..];
 
-	// 5. Decrypt using AES-256-GCM
-	let key = crate::crypto::utils::key_from_slice(&k_enc[..32]);
-	let cipher = Aes256Gcm::new(&key);
+	let nonce = Nonce::<A>::from_slice(&ciphertext_bytes[..nonce_size]);
+	let ciphertext_with_tag = &ciphertext_bytes[nonce_size..];
+
+	// Build the negotiated AEAD cipher from the derived key material.
+	let key = Key::<A>::from_slice(&k_enc[..key_size]);
+	let cipher = A::new(key);
 
 	// Prepare payload with optional AAD
 	let payload = match associated_data {
@@ -468,8 +469,16 @@ where
 	};
 
 	// Decrypt and verify tag
-	let plaintext = cipher.decrypt(&nonce, payload).map_err(EciesError::DecryptionFailed)?;
+	let plaintext = cipher.decrypt(nonce, payload).map_err(EciesError::DecryptionFailed)?;
 	Ok(Secret::from(plaintext.into_boxed_slice()))
+}
+
+/// Borrow the ephemeral public key from raw ECIES wire bytes without copying.
+pub fn ephemeral_pubkey_bytes<M>(bytes: &[u8]) -> Result<&[u8]>
+where
+	M: EciesMessageOps,
+{
+	bytes.get(..M::PUBKEY_SIZE).ok_or(EciesError::InvalidCiphertext)
 }
 
 #[cfg(feature = "x509")]
@@ -524,9 +533,13 @@ impl crate::crypto::aead::Encryptor<EciesSecp256k1Oid> for EciesEncryptor {
 		_nonce: impl AsRef<[u8]>, // Ignored - ECIES generates its own nonce
 		content_type: Option<ObjectIdentifier>,
 	) -> crate::error::Result<crate::EncryptedContentInfo> {
-		// Use existing ECIES encrypt function
-		let ecies_msg: Secp256k1EciesMessage =
-			encrypt(&self.recipient_pubkey, data.as_ref(), None, None::<&mut OsRng>)?;
+		// Use existing ECIES encrypt function with the secp256k1 suite.
+		let ecies_msg = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
+			&self.recipient_pubkey,
+			data.as_ref(),
+			None,
+			None::<&mut OsRng>,
+		)?;
 
 		// Store the full ECIES message (ephemeral pubkey + ciphertext) as encrypted content
 		let encrypted_bytes = ecies_msg.to_bytes();
@@ -575,11 +588,72 @@ impl crate::crypto::aead::Decryptor for EciesDecryptor {
 
 		// Parse as ECIES message
 		let ecies_msg = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
-		// Decrypt using ECIES
-		let plaintext = decrypt(&self.secret_key, &ecies_msg, None)?;
+		// Decrypt using the secp256k1 ECIES suite.
+		let plaintext = decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&self.secret_key, &ecies_msg, None)?;
 
 		// Convert SecretSlice to Vec<u8>
 		use crate::crypto::secret::ToInsecure;
+		Ok(plaintext.to_insecure()?.to_vec())
+	}
+}
+
+/// ECIES decryptor driven by a precomputed ECDH shared secret.
+///
+/// Pairs with [`ephemeral_pubkey_bytes`] and an async key-agreement backend
+/// (`SigningKeyProvider::key_agreement`) so the recipient private key can stay
+/// inside an HSM/KMS/secure enclave.
+#[cfg(all(
+	feature = "digest",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+pub struct EciesSharedSecretDecryptor<P> {
+	shared_secret: SecretSlice<u8>,
+	_provider: core::marker::PhantomData<P>,
+}
+
+#[cfg(all(
+	feature = "digest",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+impl<P> EciesSharedSecretDecryptor<P> {
+	/// Build a decryptor from a precomputed ECDH shared secret.
+	pub fn new(shared_secret: impl Into<SecretSlice<u8>>) -> Self {
+		Self { shared_secret: shared_secret.into(), _provider: core::marker::PhantomData }
+	}
+}
+
+#[cfg(all(
+	feature = "digest",
+	feature = "aead",
+	feature = "signature",
+	feature = "kdf",
+	feature = "ecdh"
+))]
+impl<P> crate::crypto::aead::Decryptor for EciesSharedSecretDecryptor<P>
+where
+	P: crate::crypto::profiles::CryptoProvider,
+	P::AeadCipher: KeyInit,
+{
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
+		use crate::crypto::secret::ToInsecure;
+
+		let encrypted_bytes = info
+			.encrypted_content
+			.as_ref()
+			.ok_or(crate::TightBeamError::MissingEncryptionInfo)?
+			.as_bytes();
+
+		let ecies_msg = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_bytes)?;
+		let shared_secret = self.shared_secret.with(|bytes| SecretSlice::from(bytes.to_vec()))?;
+		let plaintext =
+			decrypt_with_shared_secret::<P::EciesMessage, P::Kdf, P::AeadCipher>(&ecies_msg, shared_secret, None)?;
+
 		Ok(plaintext.to_insecure()?.to_vec())
 	}
 }
@@ -601,8 +675,13 @@ mod tests {
 	// Helper for encryption roundtrip
 	fn roundtrip(plaintext: &[u8], aad: Option<&[u8]>) -> Result<()> {
 		let (secret, public) = keypair();
-		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, aad, None::<&mut OsRng>)?;
-		let decrypted = decrypt(&secret, &encrypted, aad)?;
+		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
+			&public,
+			plaintext,
+			aad,
+			None::<&mut OsRng>,
+		)?;
+		let decrypted = decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&secret, &encrypted, aad)?;
 		assert_eq!(plaintext, &decrypted.to_insecure().map_err(EciesError::from)?[..]);
 		Ok(())
 	}
@@ -635,8 +714,12 @@ mod tests {
 		let correct_aad = b"authenticated data";
 
 		// Test with explicit RNG to verify RNG parameter works
-		let encrypted =
-			encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, Some(correct_aad), Some(&mut rng))?;
+		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
+			&public,
+			plaintext,
+			Some(correct_aad),
+			Some(&mut rng),
+		)?;
 		// Test cases: (aad, should_succeed)
 		let cases = [
 			(Some(&correct_aad[..]), true),
@@ -646,7 +729,7 @@ mod tests {
 		];
 
 		for (aad, should_succeed) in cases {
-			let result = decrypt(&secret, &encrypted, aad);
+			let result = decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&secret, &encrypted, aad);
 			assert_eq!(result.is_ok(), should_succeed);
 			if should_succeed {
 				assert_eq!(&plaintext[..], &result?.to_insecure().map_err(EciesError::from)?[..]);
@@ -662,10 +745,15 @@ mod tests {
 		let plaintext = b"Test serialization";
 
 		// Message serialization roundtrip
-		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, None, None::<&mut OsRng>)?;
+		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
+			&public,
+			plaintext,
+			None,
+			None::<&mut OsRng>,
+		)?;
 		let bytes = encrypted.to_bytes();
 		let parsed = Secp256k1EciesMessage::from_bytes(&bytes)?;
-		let decrypted = decrypt(&secret, &parsed, None)?;
+		let decrypted = decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&secret, &parsed, None)?;
 		assert_eq!(&plaintext[..], &decrypted.to_insecure().map_err(EciesError::from)?[..]);
 
 		// Key serialization roundtrip using traits
@@ -689,9 +777,14 @@ mod tests {
 		let (_, public1) = keypair();
 		let (secret2, _) = keypair();
 
-		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage>(&public1, plaintext, None, None::<&mut OsRng>)?;
+		let encrypted = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
+			&public1,
+			plaintext,
+			None,
+			None::<&mut OsRng>,
+		)?;
 		// Wrong recipient derives a different ECDH shared secret, so AEAD tag verification must fail.
-		assert!(decrypt(&secret2, &encrypted, None).is_err());
+		assert!(decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&secret2, &encrypted, None).is_err());
 
 		// Tampered ciphertext should fail authentication
 		let (secret, public) = keypair();
@@ -719,10 +812,14 @@ mod tests {
 		];
 
 		for tamper_fn in tamper_functions {
-			let mut encrypted =
-				encrypt::<_, _, _, Secp256k1EciesMessage>(&public, plaintext, None, None::<&mut OsRng>)?;
+			let mut encrypted = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
+				&public,
+				plaintext,
+				None,
+				None::<&mut OsRng>,
+			)?;
 			tamper_fn(&mut encrypted);
-			assert!(decrypt(&secret, &encrypted, None).is_err());
+			assert!(decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&secret, &encrypted, None).is_err());
 		}
 
 		Ok(())
@@ -746,6 +843,41 @@ mod tests {
 		assert!(PublicKey::from_bytes([0xFFu8; 33]).is_err());
 		assert!(SecretKey::try_from(Secret::from(vec![0x00u8; 32].into_boxed_slice())).is_err());
 
+		Ok(())
+	}
+
+	/// Decrypt an ECIES payload with the recipient private key held behind a
+	/// `SigningKeyProvider`: the `d·R` step runs via `key_agreement`, then the
+	/// shared-secret decryptor opens it through the standard `Decryptor` seam.
+	#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh", feature = "tokio"))]
+	#[tokio::test]
+	async fn shared_secret_decryptor_via_provider() -> crate::error::Result<()> {
+		use crate::crypto::aead::{Decryptor, Encryptor};
+		use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+		use crate::crypto::profiles::DefaultCryptoProvider;
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+
+		let plaintext = b"hsm-backed ecies decryption";
+		let (secret, public) = keypair();
+
+		// Sender encrypts to the recipient public key (in-memory Encryptor seam).
+		let info = EciesEncryptor::new(public).encrypt_content(plaintext, [], None)?;
+		let wire = info.encrypted_content.as_ref().ok_or(EciesError::InvalidCiphertext)?.as_bytes();
+
+		// Recipient: borrow the ephemeral pubkey, run d·R behind the provider.
+		let epk = ephemeral_pubkey_bytes::<Secp256k1EciesMessage>(wire)?;
+		let provider = Secp256k1KeyProvider::from(Secp256k1SigningKey::from(secret));
+		let shared = provider.key_agreement(epk).await?;
+
+		// Open via the standard Decryptor seam (what Frame::decrypt_bytes calls).
+		let decryptor = EciesSharedSecretDecryptor::<DefaultCryptoProvider>::new(shared);
+		let opened = decryptor.decrypt_content(&info)?;
+
+		assert_eq!(
+			opened.as_slice(),
+			plaintext,
+			"provider key agreement must reproduce the ECIES plaintext"
+		);
 		Ok(())
 	}
 }

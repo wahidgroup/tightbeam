@@ -139,6 +139,21 @@ pub fn create_v0_tightbeam(content: Option<&str>, id: Option<&str>) -> Frame {
 	result.expect("Failed to create TightBeam message")
 }
 
+/// Build a V1 frame carrying a Sha3-256 frame integrity (FI) digest.
+#[cfg(all(feature = "builder", feature = "digest", feature = "sha3"))]
+pub fn create_frame_with_frame_integrity() -> Frame {
+	use crate::crypto::hash::Sha3_256;
+
+	let message = create_test_message(None);
+	compose! {
+		V1: id: "fi-frame",
+			order: 1u64,
+			message: message,
+			frame_integrity: type Sha3_256
+	}
+	.expect("Failed to create frame with frame integrity")
+}
+
 #[cfg(all(feature = "secp256k1", feature = "signature"))]
 pub fn create_test_signing_key() -> k256::ecdsa::SigningKey {
 	let secret_bytes = [1u8; 32];

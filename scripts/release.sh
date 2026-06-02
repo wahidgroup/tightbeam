@@ -702,7 +702,7 @@ run_combined_release() {
 DRY_RUN=false
 ALLOW_STAGED=false
 YANK=false
-COMBINED=false
+COMBINED=true
 VERSION=""
 DERIVE_VERSION=""
 TARGET_CRATE=""
@@ -715,12 +715,16 @@ for arg in "$@"; do
 		ALLOW_STAGED=true
 	elif [[ "$arg" == "--yank" ]]; then
 		YANK=true
+		COMBINED=false
 	elif [[ "$arg" == "--both" ]]; then
 		COMBINED=true
+	elif [[ "$arg" == "--single" ]]; then
+		COMBINED=false
 	elif [[ "$arg" == --derive=* ]]; then
 		COMBINED=true
 		DERIVE_VERSION="${arg#--derive=}"
 	elif [[ "$arg" == "--derive" ]]; then
+		COMBINED=false
 		CRATE_INDEX=1
 	elif [[ -z "$VERSION" ]]; then
 		VERSION="$arg"

@@ -55,8 +55,6 @@ where
 
 		// Sign the data
 		let signature: S = self.try_sign(data.as_ref())?;
-		let signature_bytes = signature.to_bytes();
-		let signature_value = SignatureValue::new(signature_bytes.as_ref())?;
 
 		// Build digest algorithm identifier
 		let digest_alg = AlgorithmIdentifierOwned { oid: Self::DigestAlgorithm::OID, parameters: None };
@@ -66,15 +64,7 @@ where
 		// Get signer identifier
 		let sid = self.signer_identifier()?;
 
-		Ok(SignerInfo {
-			version: CmsVersion::V1,
-			sid,
-			digest_alg,
-			signed_attrs: None,
-			signature_algorithm,
-			signature: signature_value,
-			unsigned_attrs: None,
-		})
+		SignerInfo::from_parts(signature.to_bytes(), signature_algorithm, digest_alg, sid)
 	}
 
 	/// Get the signature algorithm identifier
@@ -82,6 +72,43 @@ where
 
 	/// Get the signer's identifier
 	fn signer_identifier(&self) -> Result<SignerIdentifier>;
+}
+
+/// Assemble a CMS [`SignerInfo`] from a precomputed signature.
+///
+/// Enables detached / two-phase signing: the to-be-signed bytes come from
+/// `Frame::to_tbs`, get signed by any external backend (HSM, KMS, etc.),
+/// then the resulting signature is reattached without tightbeam ever holding
+/// the private key.
+pub trait SignerInfoExt: Sized {
+	/// Build a [`SignerInfo`] from a precomputed signature and its identifiers.
+	fn from_parts(
+		signature: impl AsRef<[u8]>,
+		signature_algorithm: AlgorithmIdentifierOwned,
+		digest_alg: AlgorithmIdentifierOwned,
+		sid: SignerIdentifier,
+	) -> Result<Self>;
+}
+
+impl SignerInfoExt for SignerInfo {
+	fn from_parts(
+		signature: impl AsRef<[u8]>,
+		signature_algorithm: AlgorithmIdentifierOwned,
+		digest_alg: AlgorithmIdentifierOwned,
+		sid: SignerIdentifier,
+	) -> Result<Self> {
+		let signature = SignatureValue::new(signature.as_ref())?;
+
+		Ok(SignerInfo {
+			version: CmsVersion::V1,
+			sid,
+			digest_alg,
+			signed_attrs: None,
+			signature_algorithm,
+			signature,
+			unsigned_attrs: None,
+		})
+	}
 }
 
 #[cfg(feature = "secp256k1")]

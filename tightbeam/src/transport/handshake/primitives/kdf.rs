@@ -12,11 +12,12 @@ use alloc::vec::Vec;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::CryptoProvider;
 use crate::transport::handshake::error::HandshakeError;
+use crate::zeroize::Zeroizing;
 
 /// Multi-input HKDF combining multiple secrets with length prefixing.
 ///
 /// Concatenates all input secrets with 4-byte big-endian length prefixes,
-/// then derives a 32-byte key using the provider's KDF.
+/// then derives a `key_size`-byte key using the provider's KDF.
 ///
 /// # Length Prefixing
 /// Each input is prefixed with its length as `u32` in big-endian format.
@@ -26,9 +27,11 @@ use crate::transport::handshake::error::HandshakeError;
 /// - `inputs`: Array of input secret slices to combine
 /// - `salt`: Salt bytes for KDF (minimum 16 bytes recommended)
 /// - `info`: Application-specific context string
+/// - `key_size`: Desired output key length in bytes (e.g. KEK size from the
+///   negotiated key-wrap algorithm)
 ///
 /// # Returns
-/// 32-byte derived key
+/// Zeroizing vector containing the derived key
 ///
 /// # Example
 /// ```rust,ignore
@@ -39,27 +42,26 @@ use crate::transport::handshake::error::HandshakeError;
 /// let combined = multi_input_kdf::<DefaultCryptoProvider>(
 ///     &[&dh_secret, &kem_secret],
 ///     &salt,
-///     b"MyApp-PQXDH-v1"
+///     b"MyApp-PQXDH-v1",
+///     32,
 /// )?;
 /// ```
 pub fn multi_input_kdf<P: CryptoProvider>(
 	inputs: &[&[u8]],
 	salt: &[u8],
 	info: &[u8],
-) -> Result<[u8; 32], HandshakeError> {
-	// Concatenate all inputs with length prefixes
-	let mut combined = Vec::new();
+	key_size: usize,
+) -> Result<Zeroizing<Vec<u8>>, HandshakeError> {
+	// Concatenate all inputs with length prefixes. The buffer holds secret
+	// material, so it is zeroized on drop.
+	let mut combined = Zeroizing::new(Vec::new());
 	for input in inputs {
-		combined.extend_from_slice(&(input.len() as u32).to_be_bytes());
+		let len = u32::try_from(input.len()).map_err(|_| HandshakeError::IntegerOutOfRange)?;
+		combined.extend_from_slice(&len.to_be_bytes());
 		combined.extend_from_slice(input);
 	}
 
-	// Derive 32-byte key using provider's KDF
-	let derived = P::Kdf::derive_dynamic_key(&combined, info, Some(salt), 32)?;
-
-	let mut result = [0u8; 32];
-	result.copy_from_slice(&derived);
-	Ok(result)
+	Ok(P::Kdf::derive_dynamic_key(&combined, info, Some(salt), key_size)?)
 }
 
 /// Chain multiple KDF operations where each output becomes the next salt.
@@ -121,7 +123,7 @@ mod tests {
 		let input2 = [0x99u8; 32];
 		let salt = [0xAAu8; 32];
 
-		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], &salt, b"test-info");
+		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], &salt, b"test-info", 32);
 		assert!(result.is_ok());
 
 		let key = result?;
@@ -136,7 +138,7 @@ mod tests {
 		let input2 = [0x99u8; 48];
 		let salt = [0xAAu8; 32];
 
-		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], &salt, b"test-info");
+		let result = multi_input_kdf::<DefaultCryptoProvider>(&[&input1, &input2], &salt, b"test-info", 32);
 		assert!(result.is_ok());
 	}
 

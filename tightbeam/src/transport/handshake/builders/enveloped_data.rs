@@ -8,16 +8,17 @@ use crate::cms::builder::RecipientInfoBuilder;
 use crate::cms::content_info::{CmsVersion, ContentInfo};
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo, RecipientInfos};
 use crate::crypto::aead::{AeadCore, Encryptor, KeyInit};
-use crate::crypto::common::typenum::Unsigned;
+use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, FieldBytesSize};
 use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::der::asn1::{Any, SetOfVec};
 use crate::oids::{DATA, ENVELOPED_DATA};
+use crate::random::{CryptoRngCore, OsRng};
 use crate::transport::handshake::attributes::HandshakeAttribute;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::utils::generate_cek;
 
 /// Builder for constructing CMS EnvelopedData messages.
 ///
@@ -105,17 +106,24 @@ where
 		Ok(RecipientInfos::try_from(vec![recipient_info])?)
 	}
 
-	fn generate_nonce() -> Vec<u8> {
-		use rand_core::RngCore;
-
+	fn generate_nonce(rng: &mut dyn CryptoRngCore) -> Vec<u8> {
 		let mut nonce_bytes = vec![0u8; <P::AeadCipher as AeadCore>::NonceSize::USIZE];
-		rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+		rng.fill_bytes(&mut nonce_bytes);
 		nonce_bytes
 	}
 
+	/// Generate a random CEK sized to the negotiated AEAD cipher key length.
+	fn generate_cek(rng: &mut dyn CryptoRngCore) -> SecretSlice<u8> {
+		let mut cek = vec![0u8; <P::AeadCipher as KeySizeUser>::KeySize::USIZE];
+		rng.fill_bytes(&mut cek);
+		cek.into()
+	}
+
 	fn create_cipher_from_cek(cek_bytes: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
-		P::AeadCipher::new_from_slice(cek_bytes)
-			.map_err(|_| HandshakeError::InvalidKeySize { expected: 32, received: cek_bytes.len() })
+		P::AeadCipher::new_from_slice(cek_bytes).map_err(|_| HandshakeError::InvalidKeySize {
+			expected: <P::AeadCipher as KeySizeUser>::KeySize::USIZE,
+			received: cek_bytes.len(),
+		})
 	}
 
 	fn encrypt_content_with_cipher(
@@ -134,6 +142,7 @@ where
 	/// # Parameters
 	/// - `plaintext`: The content to encrypt
 	/// - `aad`: Optional additional authenticated data for AEAD cipher (currently unused)
+	/// - `rng`: Optional random number generator
 	///
 	/// # Returns
 	/// A complete CMS EnvelopedData structure with:
@@ -141,12 +150,21 @@ where
 	/// - Encrypted content
 	/// - Content encryption algorithm identifier
 	/// - Optional unprotected attributes
-	pub fn build(mut self, plaintext: &[u8], _aad: Option<&[u8]>) -> Result<EnvelopedData, HandshakeError> {
+	pub fn build(
+		mut self,
+		plaintext: &[u8],
+		_aad: Option<&[u8]>,
+		rng: Option<&mut dyn CryptoRngCore>,
+	) -> Result<EnvelopedData, HandshakeError> {
 		// 1. Validate builder state
 		self.validate_builder_state()?;
 
-		// 2. Generate CEK (content-encryption key) wrapped in Secret
-		let cek = generate_cek()?;
+		// 2. Resolve the RNG once (defaulting to OsRng) then generate the CEK
+		//    sized to the negotiated AEAD cipher key length and a content nonce.
+		let mut os = OsRng;
+		let rng: &mut dyn CryptoRngCore = rng.unwrap_or(&mut os);
+		let cek = Self::generate_cek(rng);
+		let nonce = Self::generate_nonce(rng);
 
 		// 3. Build KARI with wrapped CEK
 		let recipient_info = cek.with(|cek_bytes| self.build_kari_with_cek(cek_bytes))??;
@@ -154,7 +172,6 @@ where
 		// 4. Encrypt plaintext with CEK
 		let encrypted_content = cek.with(|cek_bytes| {
 			let cipher = Self::create_cipher_from_cek(cek_bytes)?;
-			let nonce = Self::generate_nonce();
 			Self::encrypt_content_with_cipher(&cipher, plaintext, &nonce)
 		})??;
 
@@ -175,8 +192,13 @@ where
 	}
 
 	/// Build and wrap in ContentInfo structure.
-	pub fn build_content_info(self, plaintext: &[u8], aad: Option<&[u8]>) -> Result<ContentInfo, HandshakeError> {
-		let enveloped_data = self.build(plaintext, aad)?;
+	pub fn build_content_info(
+		self,
+		plaintext: &[u8],
+		aad: Option<&[u8]>,
+		rng: Option<&mut dyn CryptoRngCore>,
+	) -> Result<ContentInfo, HandshakeError> {
+		let enveloped_data = self.build(plaintext, aad, rng)?;
 		let content = Any::encode_from(&enveloped_data)?;
 		Ok(ContentInfo { content_type: ENVELOPED_DATA, content })
 	}
@@ -241,7 +263,7 @@ mod tests {
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 
 			// 3. Verify structure
-			let enveloped_data = builder.build(plaintext, None)?;
+			let enveloped_data = builder.build(plaintext, None, None)?;
 			assert_eq!(enveloped_data.version, CmsVersion::V3);
 			assert_eq!(enveloped_data.recip_infos.0.len(), 1);
 			assert!(enveloped_data.encrypted_content.encrypted_content.is_some());
@@ -268,7 +290,7 @@ mod tests {
 				.with_unprotected_attr(attr2);
 
 			// 4. Verify attributes are present
-			let enveloped_data = builder.build(plaintext, None)?;
+			let enveloped_data = builder.build(plaintext, None, None)?;
 
 			// 5. Verify correct number of attributes
 			let Some(attrs) = enveloped_data.unprotected_attrs.as_ref() else {
@@ -287,7 +309,7 @@ mod tests {
 			// 2. Build and encode
 			let plaintext = b"DER encoding test";
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let built = builder.build(plaintext, None)?;
+			let built = builder.build(plaintext, None, None)?;
 			let der_bytes = built.to_der()?;
 
 			// 3. Verify we can decode it back
@@ -307,7 +329,7 @@ mod tests {
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 
 			// 3. Verify ContentInfo structure
-			let content_info = builder.build_content_info(plaintext, None)?;
+			let content_info = builder.build_content_info(plaintext, None, None)?;
 			assert_eq!(content_info.content_type, ENVELOPED_DATA);
 
 			// 4. Decode inner EnvelopedData

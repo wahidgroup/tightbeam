@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tightbeam::{
 	crypto::{
-		aead::{Aes128Gcm, Aes128GcmOid},
+		aead::{Aes128Gcm, Aes128GcmOid, Aes256Gcm},
 		curves::Secp256k1Oid,
 		ecies::{self, Secp256k1EciesMessage},
 		hash::Sha3_256,
@@ -453,7 +453,7 @@ pub fn try_decrypt_ecies(ciphertext: &[u8], secret_key: &k256::SecretKey, aad: O
 	let aad = aad.or(Some(HANDSHAKE_AAD));
 
 	// Attempt decryption
-	match ecies::decrypt(secret_key, &message, aad) {
+	match ecies::decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(secret_key, &message, aad) {
 		Ok(plaintext) => {
 			let plaintext_bytes = match plaintext.to_insecure() {
 				Ok(b) => b,
@@ -754,7 +754,7 @@ impl HandshakeProtocol for CmsSession {
 			let session_key = vec![0xA5; 32];
 
 			// Step 0: Key Exchange (C -> S)
-			let key_exchange = self.client.build_key_exchange(session_key)?;
+			let key_exchange = self.client.build_key_exchange(session_key, None)?;
 			messages.push(CapturedMessage {
 				step: 0,
 				direction: Direction::ClientToServer,
@@ -813,7 +813,7 @@ impl HandshakeProtocol for CmsSession {
 				}
 				2 => {
 					// Run step 0-1 normally, then inject at ServerFinished
-					let key_exchange = self.client.build_key_exchange(session_key)?;
+					let key_exchange = self.client.build_key_exchange(session_key, None)?;
 					self.server.process_key_exchange(&key_exchange).await?;
 					// Now inject the message as server finished
 					match self.client.process_server_finished(&msg) {
@@ -823,7 +823,7 @@ impl HandshakeProtocol for CmsSession {
 				}
 				4 => {
 					// Run steps 0-3 normally, then inject at ClientFinished
-					let key_exchange = self.client.build_key_exchange(session_key)?;
+					let key_exchange = self.client.build_key_exchange(session_key, None)?;
 					self.server.process_key_exchange(&key_exchange).await?;
 					let server_finished = self.server.build_server_finished().await?;
 					self.client.process_server_finished(&server_finished)?;

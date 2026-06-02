@@ -124,7 +124,7 @@ fn build_version_frame(
 
 	if version >= tb::Version::V2 {
 		builder = builder
-			.with_priority(tb::MessagePriority::Top)
+			.with_priority(tb::MessagePriority::Expedited)
 			.with_lifetime(3_600)
 			.with_previous_hash(message_hash.clone());
 	}
@@ -183,7 +183,7 @@ tb_assert_spec! {
 			("sig_valid", exactly!(1), equals!(true)),
 			("integrity_ok", exactly!(1), equals!(true)),
 			("confidentiality", exactly!(1), equals!(IsSome)),
-			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Top))),
+			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
 			("lifetime", exactly!(1), equals!(Some(3_600u64))),
 			("previous_frame", exactly!(1), equals!(IsSome)),
 			("matrix", exactly!(1), equals!(IsNone)),
@@ -199,7 +199,7 @@ tb_assert_spec! {
 			("sig_valid", exactly!(1), equals!(true)),
 			("integrity_ok", exactly!(1), equals!(true)),
 			("confidentiality", exactly!(1), equals!(IsSome)),
-			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Top))),
+			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
 			("lifetime", exactly!(1), equals!(Some(3_600u64))),
 			("previous_frame", exactly!(1), equals!(IsSome)),
 			("matrix", exactly!(1), equals!(IsSome)),

@@ -281,8 +281,8 @@ impl BackpressureGate {
 
 impl GatePolicy for BackpressureGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
-		// Heartbeat always passes through (pheromone signal channel)
-		if frame.metadata.priority == Some(crate::MessagePriority::Heartbeat) {
+		// Network-control traffic (keep-alive pheromone signal channel) always passes through
+		if frame.metadata.priority == Some(crate::MessagePriority::NetworkControl) {
 			return TransitStatus::Accepted;
 		}
 

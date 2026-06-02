@@ -1,0 +1,47 @@
+name: PR Metadata
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - labeled
+      - unlabeled
+      - assigned
+      - unassigned
+    branches: [master]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate assignee and label
+        env:
+          ASSIGNEES_JSON: ${{ toJSON(github.event.pull_request.assignees) }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels) }}
+        run: |
+          set -euo pipefail
+
+          assignee_count=$(printf '%s' "$ASSIGNEES_JSON" | jq 'length')
+          label_count=$(printf '%s' "$LABELS_JSON" | jq 'length')
+
+          failed=0
+          if [ "$assignee_count" -eq 0 ]; then
+            echo "PR MUST have at least one assignee."
+            failed=1
+          fi
+          if [ "$label_count" -eq 0 ]; then
+            echo "PR MUST have at least one label."
+            failed=1
+          fi
+          if [ "$failed" -eq 1 ]; then
+            echo ""
+            echo "See CONTRIBUTING.md for the PR requirements."
+            exit 1
+          fi
+          echo "PR metadata OK: ${assignee_count} assignee(s), ${label_count} label(s)."

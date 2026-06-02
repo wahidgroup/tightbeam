@@ -4,6 +4,7 @@
 
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo};
 use crate::crypto::aead::{Decryptor, KeyInit};
+use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use crate::der::oid::AssociatedOid;
 use crate::transport::handshake::error::HandshakeError;
@@ -89,8 +90,10 @@ where
 	}
 
 	fn create_cipher_from_cek(cek: &[u8]) -> Result<P::AeadCipher, HandshakeError> {
-		P::AeadCipher::new_from_slice(cek)
-			.map_err(|_| HandshakeError::InvalidKeySize { expected: 32, received: cek.len() })
+		P::AeadCipher::new_from_slice(cek).map_err(|_| HandshakeError::InvalidKeySize {
+			expected: <P::AeadCipher as KeySizeUser>::KeySize::USIZE,
+			received: cek.len(),
+		})
 	}
 
 	fn decrypt_content(
@@ -216,7 +219,7 @@ mod tests {
 
 			// 4. Build EnvelopedData (sender side)
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let enveloped_data = builder.build(plaintext, None)?;
+			let enveloped_data = builder.build(plaintext, None, None)?;
 
 			// 5. Create recipient processor
 			let kari_recipient = TightBeamKariRecipient::with_defaults(recipient_key);
@@ -239,7 +242,7 @@ mod tests {
 			// 2. Create KARI builder and build EnvelopedData
 			let kari_builder = create_test_kari_builder(sender_key, sender_spki, recipient_pubkey);
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let enveloped_data = builder.build(b"Test message", None)?;
+			let enveloped_data = builder.build(b"Test message", None, None)?;
 
 			// 3. Create processor with invalid recipient index
 			let processor =
@@ -272,7 +275,7 @@ mod tests {
 			let kari_builder = create_test_kari_builder(sender_key, sender_spki, recipient_pubkey);
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
 			let builder = builder.with_unprotected_attr(test_attr.clone());
-			let enveloped_data = builder.build(b"Test with attributes", None)?;
+			let enveloped_data = builder.build(b"Test with attributes", None, None)?;
 
 			// 4. Extract attributes using processor
 			let processor = TightBeamEnvelopedDataProcessor::with_defaults(DummyRecipientProcessor);

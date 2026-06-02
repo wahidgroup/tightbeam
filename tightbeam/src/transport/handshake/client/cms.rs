@@ -24,7 +24,7 @@ use crate::crypto::x509::Certificate;
 use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
 use crate::der::{Decode, Encode};
-use crate::random::{generate_nonce, OsRng};
+use crate::random::{generate_nonce, CryptoRngCore, OsRng, RngWrapper};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
 use crate::transport::handshake::error::HandshakeError;
@@ -173,8 +173,11 @@ where
 	}
 
 	/// Create ephemeral keypair for the sender.
-	fn create_ephemeral_keypair(&self) -> Result<(SecretKey<P::Curve>, SubjectPublicKeyInfoOwned), HandshakeError> {
-		let sender_ephemeral = SecretKey::<P::Curve>::random(&mut OsRng);
+	fn create_ephemeral_keypair(
+		&self,
+		rng: &mut dyn CryptoRngCore,
+	) -> Result<(SecretKey<P::Curve>, SubjectPublicKeyInfoOwned), HandshakeError> {
+		let sender_ephemeral = SecretKey::<P::Curve>::random(&mut RngWrapper(rng));
 		let sender_public = sender_ephemeral.public_key();
 		let sender_pub_spki = sender_public.to_public_key_der()?;
 		let sender_pub_spki = SubjectPublicKeyInfoOwned::from_der(sender_pub_spki.as_bytes())?;
@@ -240,25 +243,37 @@ where
 	///
 	/// # Parameters
 	/// - `session_key`: The session key to wrap and send
+	/// - `rng`: Optional CSPRNG for the ephemeral key, UKM, CEK, and content
+	///   nonce. `None` defaults to `OsRng`; supply one on `no_std` targets
+	///   without an OS-backed `getrandom`.
 	///
 	/// # Returns
 	/// DER-encoded EnvelopedData
-	pub fn build_key_exchange(&mut self, session_key: Vec<u8>) -> Result<Vec<u8>, HandshakeError> {
+	pub fn build_key_exchange(
+		&mut self,
+		session_key: Vec<u8>,
+		rng: Option<&mut dyn CryptoRngCore>,
+	) -> Result<Vec<u8>, HandshakeError> {
 		// 1. Validate state and certificate
 		self.validate_key_exchange_prerequisites()?;
 
-		// 2. Extract cryptographic material
-		let (server_public_key, sender_ephemeral, sender_pub_spki) = self.extract_key_exchange_crypto_material()?;
+		// 2. Resolve the RNG once (defaulting to OsRng) then reborrow it for
+		//    each randomness draw in the key-exchange path.
+		let mut os = OsRng;
+		let rng: &mut dyn CryptoRngCore = rng.unwrap_or(&mut os);
 
-		// 3. Create UKM and recipient identifier
-		let ukm = self.create_user_keying_material()?;
+		// 3. Extract cryptographic material
+		let (server_public_key, sender_ephemeral, sender_pub_spki) = self.extract_key_exchange_crypto_material(rng)?;
+
+		// 4. Create UKM and recipient identifier
+		let ukm = self.create_user_keying_material(rng)?;
 		let rid = self.build_recipient_identifier();
 
-		// 4. Build KARI structure
+		// 5. Build KARI structure
 		let kari_builder = self.build_kari_structure(sender_ephemeral, sender_pub_spki, server_public_key, rid, ukm)?;
 
-		// 5. Create EnvelopedData with optional security offer
-		let enveloped_data_der = self.build_enveloped_data(kari_builder, &session_key)?;
+		// 6. Create EnvelopedData with optional security offer
+		let enveloped_data_der = self.build_enveloped_data(kari_builder, &session_key, rng)?;
 
 		// 6. Update transcript and state
 		self.finalize_key_exchange(&enveloped_data_der, session_key)?;
@@ -371,15 +386,16 @@ where
 	#[allow(clippy::type_complexity)]
 	fn extract_key_exchange_crypto_material(
 		&self,
+		rng: &mut dyn CryptoRngCore,
 	) -> Result<(PublicKey<P::Curve>, SecretKey<P::Curve>, SubjectPublicKeyInfoOwned), HandshakeError> {
 		let server_public_key = self.extract_server_public_key()?;
-		let (sender_ephemeral, sender_pub_spki) = self.create_ephemeral_keypair()?;
+		let (sender_ephemeral, sender_pub_spki) = self.create_ephemeral_keypair(rng)?;
 		Ok((server_public_key, sender_ephemeral, sender_pub_spki))
 	}
 
 	/// Create user keying material for the key agreement.
-	fn create_user_keying_material(&self) -> Result<UserKeyingMaterial, HandshakeError> {
-		let ukm_bytes = generate_nonce::<64>(None)?;
+	fn create_user_keying_material(&self, rng: &mut dyn CryptoRngCore) -> Result<UserKeyingMaterial, HandshakeError> {
+		let ukm_bytes = generate_nonce::<64>(Some(rng))?;
 		UserKeyingMaterial::new(ukm_bytes.to_vec()).map_err(Into::into)
 	}
 
@@ -412,6 +428,7 @@ where
 		&self,
 		kari_builder: TightBeamKariBuilder<P>,
 		session_key: &[u8],
+		rng: &mut dyn CryptoRngCore,
 	) -> Result<Vec<u8>, HandshakeError> {
 		let mut enveloped_builder = TightBeamEnvelopedDataBuilder::new(kari_builder);
 
@@ -421,7 +438,7 @@ where
 			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
 		}
 
-		let enveloped_data = enveloped_builder.build(session_key, None)?;
+		let enveloped_data = enveloped_builder.build(session_key, None, Some(rng))?;
 		enveloped_data.to_der().map_err(Into::into)
 	}
 
@@ -556,7 +573,7 @@ where
 	type Error = HandshakeError;
 
 	fn start<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>> {
-		Box::pin(async move { self.build_key_exchange(vec![0u8; 32]) })
+		Box::pin(async move { self.build_key_exchange(vec![0u8; 32], None) })
 	}
 
 	fn handle_response<'a, 'b>(
@@ -638,7 +655,7 @@ mod tests {
 
 		// When: Client builds a valid key exchange
 		let session_key = vec![2u8; 32];
-		let key_exchange = client.build_key_exchange(session_key.clone())?;
+		let key_exchange = client.build_key_exchange(session_key.clone(), None)?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		// Verify session key is stored
 		assert!(client.session_key().is_some());

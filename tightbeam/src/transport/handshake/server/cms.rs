@@ -22,6 +22,7 @@ use crate::cms::enveloped_data::{EnvelopedData, OriginatorIdentifierOrKey, Recip
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::aead::{Decryptor, KeyInit};
+use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
@@ -38,6 +39,7 @@ use crate::spki::AlgorithmIdentifierOwned;
 use crate::spki::EncodePublicKey;
 use crate::transport::handshake::attributes;
 use crate::transport::handshake::error::HandshakeError;
+use crate::transport::handshake::kari::{derive_kek, key_wrap_key_size, unwrap_with_kek, wrap_with_kek};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
@@ -309,30 +311,21 @@ where
 		// Perform ECDH using KeyProvider (takes SEC1 bytes directly)
 		let shared_secret_bytes = self.server_key_provider.key_agreement(originator_pub_bytes).await?;
 
-		// Derive KEK using HKDF via provider
+		// Derive KEK using HKDF via provider, sized to the negotiated key-wrap algorithm.
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let provider = P::default();
 
-		let kdf = provider.as_key_deriver::<HandshakeError, 32>();
+		let key_size = key_wrap_key_size::<P>()?;
 		let secret_bytes = Secret::from(shared_secret_bytes);
-		let mut kek = secret_bytes.with(|ss| kdf(ss, ukm.as_bytes(), TIGHTBEAM_KARI_KDF_INFO))??;
+		let kek = derive_kek::<P>(&secret_bytes, ukm.as_bytes(), TIGHTBEAM_KARI_KDF_INFO, key_size)?;
 
 		// Unwrap CEK
 		let wrapped_key = kari.recipient_enc_keys[0].enc_key.as_bytes();
-		let unwrapper = provider.as_key_unwrapper_32::<HandshakeError>();
-		let cek = unwrapper(wrapped_key, &kek)?;
+		let cek = unwrap_with_kek(&provider, kek.as_slice(), wrapped_key)?;
 
-		// Re-wrap for constant-time validation
-		let wrapper = provider.as_key_wrapper_32::<HandshakeError>();
-		let rewrapped = wrapper(&cek, &kek)?;
+		// Re-wrap for constant-time validation (KEK is zeroized on drop).
+		let rewrapped = wrap_with_kek(&provider, kek.as_slice(), &cek)?;
 		let valid = rewrapped.as_slice() == wrapped_key;
-
-		// Zeroize KEK
-		#[cfg(feature = "zeroize")]
-		{
-			use zeroize::Zeroize;
-			kek.zeroize();
-		}
 
 		if !valid {
 			return Err(HandshakeError::AesKeyWrap(
@@ -341,8 +334,10 @@ where
 		}
 
 		// Decrypt session key from encrypted content
-		let cipher = P::AeadCipher::new_from_slice(&cek)
-			.map_err(|_| HandshakeError::InvalidKeySize { expected: 32, received: cek.len() })?;
+		let cipher = P::AeadCipher::new_from_slice(&cek).map_err(|_| HandshakeError::InvalidKeySize {
+			expected: <P::AeadCipher as KeySizeUser>::KeySize::USIZE,
+			received: cek.len(),
+		})?;
 		let session_key_bytes = cipher.decrypt_content(&enveloped_data.encrypted_content)?;
 
 		self.session_key = Some(Secret::from(session_key_bytes));
@@ -843,7 +838,7 @@ mod tests {
 				.with_key_enc_alg(key_enc_alg);
 
 			let enveloped_builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let enveloped_data = enveloped_builder.build(session_key, None)?;
+			let enveloped_data = enveloped_builder.build(session_key, None, None)?;
 			Ok(enveloped_data.to_der()?)
 		}
 
