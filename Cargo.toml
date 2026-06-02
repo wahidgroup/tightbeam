@@ -4,7 +4,7 @@ members = ["tightbeam", "tightbeam-derive", "consumer-test"]
 
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.85.1"
 license = "MIT OR Apache-2.0"
@@ -16,7 +16,7 @@ keywords = ["cryptography", "security", "messaging", "protocol"]
 categories = ["cryptography", "network-programming"]
 
 [workspace.dependencies]
-tightbeam-derive = { version = "0.1.0", path = "tightbeam-derive" }
+tightbeam-derive = { version = "0.1.6", path = "tightbeam-derive" }
 
 # RustCrypto dependencies
 spki = { version = "0.7", default-features = false }
