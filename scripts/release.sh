@@ -102,6 +102,36 @@ bump_version() {
 	fi
 }
 
+# Sync the tightbeam-derive requirement in [workspace.dependencies] to match
+# the derive crate's released version.
+bump_workspace_derive_dep() {
+	local version="$1"
+	local toml_path="Cargo.toml"
+	local dep_re='^(tightbeam-derive[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*")[0-9]+\.[0-9]+\.[0-9]+(".*)$'
+
+	local replaced=false
+	local tmpfile
+	tmpfile=$(mktemp)
+
+	while IFS= read -r line; do
+		if [[ "$replaced" == false && "$line" =~ $dep_re ]]; then
+			printf '%s%s%s\n' "${BASH_REMATCH[1]}" "$version" "${BASH_REMATCH[2]}" >> "$tmpfile"
+			replaced=true
+		else
+			printf '%s\n' "$line" >> "$tmpfile"
+		fi
+	done < "$toml_path"
+
+	mv "$tmpfile" "$toml_path"
+	git add "$toml_path"
+
+	if [[ "$replaced" == true ]]; then
+		ok "Workspace dependency tightbeam-derive set to ${version}"
+	else
+		fail "Could not find tightbeam-derive in [workspace.dependencies] of ${toml_path}"
+	fi
+}
+
 # ---------------------------------------------------------------------------
 # General helpers
 # ---------------------------------------------------------------------------
@@ -593,8 +623,7 @@ run_combined_release() {
 	local dv_changed=true
 	if [[ "$dv_ver" == "$dv_current" ]]; then
 		dv_changed=false
-		dv_done=true
-		info "tightbeam-derive unchanged at ${dv_ver} - skipping derive release"
+		info "tightbeam-derive unchanged at ${dv_ver} - skipping version bump"
 	fi
 
 	detect_pr_resume_state "$branch"
@@ -648,6 +677,7 @@ run_combined_release() {
 
 		if [[ "$dv_changed" == true ]]; then
 			bump_version "$dv_ver" "$dv_toml" "$dv_section"
+			bump_workspace_derive_dep "$dv_ver"
 		fi
 		bump_version "$tb_ver" "$tb_toml" "$tb_section"
 
@@ -690,7 +720,7 @@ run_combined_release() {
 		push_crate_tag "$dv_tag" "$dv_ver" "releases/derive/"
 		wait_for_crate "tightbeam-derive" "$dv_ver"
 	else
-		info "tightbeam-derive ${dv_ver} unchanged/released - skipping derive tag"
+		info "tightbeam-derive ${dv_ver} already released - skipping derive tag"
 	fi
 
 	if [[ "$tb_done" == false ]]; then
