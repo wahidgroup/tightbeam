@@ -717,6 +717,10 @@ run_combined_release() {
 	if [[ "$dv_done" == false ]]; then
 		n=$((n + 1))
 		step $n "Tag tightbeam-derive (${dv_tag})"
+		local dv_manifest
+		dv_manifest=$(detect_version "$dv_toml" "$dv_section")
+		[[ "$dv_manifest" == "$dv_ver" ]] \
+			|| fail "tightbeam-derive manifest is ${dv_manifest:-unknown}, expected ${dv_ver} before tagging ${dv_tag}"
 		push_crate_tag "$dv_tag" "$dv_ver" "releases/derive/"
 		wait_for_crate "tightbeam-derive" "$dv_ver"
 	else
