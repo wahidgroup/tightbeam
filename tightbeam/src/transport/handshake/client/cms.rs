@@ -275,7 +275,7 @@ where
 		// 6. Create EnvelopedData with optional security offer
 		let enveloped_data_der = self.build_enveloped_data(kari_builder, &session_key, rng)?;
 
-		// 6. Update transcript and state
+		// 7. Update transcript and state
 		self.finalize_key_exchange(&enveloped_data_der, session_key)?;
 
 		Ok(enveloped_data_der)
