@@ -1031,7 +1031,7 @@ tb_scenario! {
 			{
 				let initial_cmd = RoverCommand::ProbeLocation { x: 100, y: 200 };
 				let (next_order, previous_digest) = mc_processor.prepare_outgoing()?;
-				let command = EarthCommand::new(initial_cmd, MessagePriority::Normal, mission_time_ms());
+				let command = EarthCommand::new(initial_cmd, MessagePriority::Standard, mission_time_ms());
 
 				trace.event("mission_control_send_command")?;
 

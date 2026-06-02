@@ -25,10 +25,10 @@ use crate::TightBeamError;
 
 #[cfg(feature = "signature")]
 mod signature {
-	pub use crate::cms::content_info::CmsVersion;
-	pub use crate::cms::signed_data::{SignatureValue, SignerIdentifier};
+	pub use crate::cms::signed_data::SignerIdentifier;
 	pub use crate::crypto::hash::Digest;
 	pub use crate::crypto::key::SigningKeyProvider;
+	pub use crate::crypto::sign::SignerInfoExt;
 	pub use crate::der::oid::AssociatedOid;
 	pub use crate::der::Any;
 	pub use crate::spki::AlgorithmIdentifierOwned;
@@ -311,7 +311,7 @@ impl crate::Frame {
 	///
 	/// # Returns
 	/// The signed frame with the `nonrepudiation` field populated.
-	pub async fn sign_with_provider<D, P>(mut self, provider: &P) -> Result<Self>
+	pub async fn sign_with_provider<D, P>(self, provider: &P) -> Result<Self>
 	where
 		D: Digest + AssociatedOid,
 		P: SigningKeyProvider + ?Sized,
@@ -321,7 +321,6 @@ impl crate::Frame {
 
 		// 2. Sign the frame
 		let signature_bytes = provider.sign(&unsigned_bytes).await?;
-		let signature_value = SignatureValue::new(signature_bytes.as_slice())?;
 
 		// 3. Get signature algorithm from provider
 		let signature_algorithm = provider.algorithm();
@@ -339,20 +338,35 @@ impl crate::Frame {
 		// 5. Build digest algorithm identifier
 		let digest_alg = AlgorithmIdentifierOwned { oid: D::OID, parameters: None };
 
-		// 6. Create SignerInfo
-		let signer_info = SignerInfo {
-			version: CmsVersion::V1,
-			sid,
-			digest_alg,
-			signed_attrs: None,
-			signature_algorithm,
-			signature: signature_value,
-			unsigned_attrs: None,
-		};
+		// 6. Assemble and attach the SignerInfo
+		let signer_info = SignerInfo::from_parts(signature_bytes, signature_algorithm, digest_alg, sid)?;
 
+		Ok(self.attach_signer_info(signer_info))
+	}
+
+	/// Attach a precomputed [`SignerInfo`] to the frame's `nonrepudiation` field.
+	///
+	/// Completes detached / two-phase signing: pair with `Frame::to_tbs` to sign
+	/// the canonical to-be-signed bytes with any external backend, then reattach
+	/// the result here.
+	pub fn attach_signer_info(mut self, signer_info: SignerInfo) -> Self {
 		self.nonrepudiation = Some(signer_info);
+		self
+	}
 
-		Ok(self)
+	/// Attach a precomputed signature from its raw parts.
+	///
+	/// Convenience over [`Frame::attach_signer_info`] that assembles the
+	/// [`SignerInfo`] from the signature bytes and algorithm identifiers.
+	pub fn attach_signature(
+		self,
+		signature: impl AsRef<[u8]>,
+		signature_algorithm: AlgorithmIdentifierOwned,
+		digest_alg: AlgorithmIdentifierOwned,
+		sid: SignerIdentifier,
+	) -> Result<Self> {
+		let signer_info = SignerInfo::from_parts(signature, signature_algorithm, digest_alg, sid)?;
+		Ok(self.attach_signer_info(signer_info))
 	}
 }
 
@@ -510,6 +524,73 @@ mod tests {
 			};
 			assert_eq!(signer_info.version, CmsVersion::V1);
 			assert!(matches!(signer_info.sid, SignerIdentifier::SubjectKeyIdentifier(_)));
+
+			Ok(())
+		}
+	}
+
+	#[cfg(all(feature = "signature", feature = "secp256k1"))]
+	mod detached_sign {
+		use crate::builder::frame::FrameBuilder;
+		use crate::builder::TypeBuilder;
+		use crate::cms::content_info::CmsVersion;
+		use crate::cms::signed_data::SignerIdentifier;
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::sign::ecdsa::Secp256k1Signature;
+		use crate::crypto::sign::{secp256k1_signer_identifier, SignatureAlgorithmIdentifier, Signer, SignerInfoExt};
+		use crate::der::oid::AssociatedOid;
+		use crate::error::Result;
+		use crate::spki::AlgorithmIdentifierOwned;
+		use crate::testing::{create_test_message, create_test_signing_key};
+		use crate::{SignerInfo, Version};
+
+		fn unsigned_frame() -> Result<crate::Frame> {
+			let message = create_test_message(None);
+			FrameBuilder::from(Version::V1)
+				.with_id("test-detached")
+				.with_order(1696521600)
+				.with_message(message)
+				.build()
+		}
+
+		#[test]
+		fn test_attach_signature_roundtrip() -> Result<()> {
+			let frame = unsigned_frame()?;
+			let signing_key = create_test_signing_key();
+
+			let tbs = frame.to_tbs()?;
+			let signature: Secp256k1Signature = signing_key.sign(&tbs);
+
+			let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
+			let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
+			let sid = secp256k1_signer_identifier(signing_key.verifying_key())?;
+
+			let signed = frame.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)?;
+			assert!(signed.nonrepudiation.is_some());
+
+			signed.verify::<Secp256k1Signature>(signing_key.verifying_key())?;
+
+			Ok(())
+		}
+
+		#[test]
+		fn test_attach_signer_info_from_parts() -> Result<()> {
+			let frame = unsigned_frame()?;
+			let signing_key = create_test_signing_key();
+
+			let tbs = frame.to_tbs()?;
+			let signature: Secp256k1Signature = signing_key.sign(&tbs);
+
+			let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
+			let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
+			let sid = secp256k1_signer_identifier(signing_key.verifying_key())?;
+
+			let signer_info = SignerInfo::from_parts(signature.to_bytes(), sig_alg, digest_alg, sid)?;
+			assert_eq!(signer_info.version, CmsVersion::V1);
+			assert!(matches!(signer_info.sid, SignerIdentifier::SubjectKeyIdentifier(_)));
+
+			let signed = frame.attach_signer_info(signer_info);
+			signed.verify::<Secp256k1Signature>(signing_key.verifying_key())?;
 
 			Ok(())
 		}

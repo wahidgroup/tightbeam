@@ -16,9 +16,10 @@ extern crate alloc;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 #[cfg(any(feature = "signature", feature = "aead"))]
-use core::future::Future;
-#[cfg(any(feature = "signature", feature = "aead"))]
 use core::marker::PhantomData;
+
+#[cfg(any(feature = "signature", feature = "aead"))]
+use core::future::Future;
 #[cfg(any(feature = "signature", feature = "aead"))]
 use core::pin::Pin;
 #[cfg(all(feature = "std", any(feature = "signature", feature = "aead")))]

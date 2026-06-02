@@ -588,7 +588,7 @@ macro_rules! hive {
 				} else {
 					$crate::policy::TransitStatus::Accepted
 				};
-				return hive!(@reply_priority $frame, $crate::MessagePriority::Heartbeat,
+				return hive!(@reply_priority $frame, $crate::MessagePriority::NetworkControl,
 					$crate::colony::common::ClusterCommandResponse::heartbeat(status, util, active_count())
 				);
 			}

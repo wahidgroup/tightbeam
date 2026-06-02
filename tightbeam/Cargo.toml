@@ -234,7 +234,10 @@ std = [
 
 # WebAssembly (browser) support: forwards the `js` RNG backend to the transitive
 # getrandom so wasm32-unknown-unknown links a working source of randomness.
-wasm = ["dep:getrandom", "getrandom/js"]
+# Browser support: forward the `js` RNG backend, and—when `time` is enabled—the
+# time crate's `wasm-bindgen` backend so `OffsetDateTime::now_utc() reads the 
+# JS clock instead of panicking on the absent wasm32 `SystemTime`/clock.
+wasm = ["dep:getrandom", "getrandom/js", "time?/wasm-bindgen"]
 
 # NON-RustCrypto features
 time = ["dep:time", "der/time"]

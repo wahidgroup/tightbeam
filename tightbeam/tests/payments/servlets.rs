@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use tightbeam::asn1::MessagePriority;
+use tightbeam::crypto::aead::Aes256Gcm;
 use tightbeam::crypto::ecies::{decrypt as ecies_decrypt, EciesPublicKeyOps, Secp256k1EciesMessage};
+use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::k256::SecretKey;
 use tightbeam::transport::tcp::r#async::TokioListener;
@@ -24,7 +26,7 @@ use super::messages::{
 
 /// Calculate message priority based on transaction amount
 ///
-/// High-value transactions (> 100,000 quanta normalized to USD) get Top priority.
+/// High-value transactions (> 100,000 quanta normalized to USD) get Expedited priority.
 pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 	// Normalize to USD-equivalent quanta (rough approximation)
 	let normalized = match &amount.currency {
@@ -36,11 +38,11 @@ pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 	};
 
 	if normalized > 100_000 {
-		MessagePriority::Top
+		MessagePriority::Expedited
 	} else if normalized > 10_000 {
-		MessagePriority::High
+		MessagePriority::LowLatency
 	} else {
-		MessagePriority::Normal
+		MessagePriority::Standard
 	}
 }
 
@@ -85,7 +87,7 @@ servlet! {
 
 		// Check priority - only emit event for high-value transactions
 		let priority = to_priority(&req.instructed_amount);
-		if priority == MessagePriority::Top {
+		if priority == MessagePriority::Expedited {
 			trace.event_with("high_value_expedited", &[PAYMENT_TAG], true)?;
 		}
 
@@ -200,11 +202,7 @@ servlet! {
 				// Parse the ECIES message from ciphertext bytes
 				let ecies_msg = Secp256k1EciesMessage::from_bytes(&decrypt_req.ciphertext)?;
 				// Decrypt using the secret key
-				let plaintext_secret = ecies_decrypt(
-					secret_key.as_ref(),
-					&ecies_msg,
-					None,
-				)?;
+				let plaintext_secret = ecies_decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(secret_key.as_ref(), &ecies_msg, None)?;
 				// Convert SecretSlice<u8> to Vec<u8>
 				let plaintext = plaintext_secret.to_insecure()?.to_vec();
 				let response = DecryptResponse { plaintext };
@@ -229,29 +227,29 @@ mod tests {
 	#[test]
 	fn priority_low_value_normal() {
 		let amount = MonetaryAmount::new(1000, *b"USD"); // $10.00
-		assert_eq!(to_priority(&amount), MessagePriority::Normal);
+		assert_eq!(to_priority(&amount), MessagePriority::Standard);
 	}
 
 	#[test]
 	fn priority_high_value_top() {
 		let amount = MonetaryAmount::new(1_000_000, *b"USD"); // $10,000.00
-		assert_eq!(to_priority(&amount), MessagePriority::Top);
+		assert_eq!(to_priority(&amount), MessagePriority::Expedited);
 	}
 
 	#[test]
 	fn priority_jpy_normalized() {
 		// 1,000,100 JPY / 100 = 10,001 normalized (High, not Top)
 		let amount = MonetaryAmount::new(1_000_100, *b"JPY");
-		assert_eq!(to_priority(&amount), MessagePriority::High);
+		assert_eq!(to_priority(&amount), MessagePriority::LowLatency);
 
 		// 100,000,000 JPY / 100 = 1,000,000 normalized (Top)
 		let amount_large = MonetaryAmount::new(100_000_000, *b"JPY");
-		assert_eq!(to_priority(&amount_large), MessagePriority::Top);
+		assert_eq!(to_priority(&amount_large), MessagePriority::Expedited);
 	}
 
 	#[test]
 	fn priority_medium_value_high() {
 		let amount = MonetaryAmount::new(50_000, *b"USD"); // $500.00
-		assert_eq!(to_priority(&amount), MessagePriority::High);
+		assert_eq!(to_priority(&amount), MessagePriority::LowLatency);
 	}
 }

@@ -8,10 +8,7 @@
 [![Project Chat][chat-image]][chat-link]
 
 ## Status
-> Warning: This project is under active development. Public APIs and file
-formats MAY change WITHOUT notice. It is NOT yet production-ready.
-> Warning: Only the `full` feature is currently supported.
-> Info: Information documented in this README is functional but unreleased.
+> Warning: This project is under active development. Public APIs and file formats MAY change WITHOUT notice. Additionally, not all feature combinations are currently supported. Currently, `no_std` and WASM support is limited.
 
 **Security Disclaimer:** A SECURITY AUDIT HAS NOT BEEN CONDUCTED. USE AT YOUR OWN RISK.
 
@@ -21,181 +18,176 @@ Copyright (C) Tanveer Wahid, WahidGroup, LLC (2025).  All Rights Reserved.
 
 ## Abstract
 
-tightbeam is a Layer-5 messaging framework using ASN.1 DER encoding with
-versioned metadata structures for high-fidelity information transmission.
+tightbeam is a Layer-5 messaging framework using Abstract Syntax Notation One (ASN.1) with Distinguished Encoding Rules (DER) for serialization, paired with versioned metadata structures for high-fidelity information transmission.
 
 > Zero-Copy, Zero-Panic, no_std-Ready
 
 ## Table of Contents
 
 1. [Introduction](#1-introduction)
-	- 1.1. [Information Fidelity Constraint](#11-information-fidelity-constraint)
-	- 1.2. [Requirements Language](#12-requirements-language)
+    - 1.1. [Information Fidelity Constraint](#11-information-fidelity-constraint)
+    - 1.2. [Requirements Language](#12-requirements-language)
+    - 1.3. [Document Conventions](#13-document-conventions)
 2. [Terminology](#2-terminology)
 3. [Architecture](#3-architecture)
-	- 3.1. [Information Theory Properties](#31-information-theory-properties)
+    - 3.1. [Information Theory Properties](#31-information-theory-properties)
 4. [Protocol Specification](#4-protocol-specification)
-	- 4.1. [Version Evolution](#41-version-evolution)
-		- 4.1.1. [SecurityProfile Trait Architecture](#411-securityprofile-trait-architecture)
-		- 4.1.2. [Security Profile Types](#412-security-profile-types)
-		- 4.1.3. [Numeric Security Levels](#413-numeric-security-levels)
-		- 4.1.4. [Message-Level Security Requirements](#414-message-level-security-requirements)
-		- 4.1.5. [CryptoProvider System](#415-cryptoprovider-system)
-	- 4.2. [Frame Structure](#42-frame-structure)
-	- 4.3. [Metadata Specification](#43-metadata-specification)
-	- 4.4. [Frame Encapsulation](#44-frame-encapsulation)
+    - 4.1. [Version Evolution](#41-version-evolution)
+    - 4.2. [Frame Structure](#42-frame-structure)
+    - 4.3. [Metadata Specification](#43-metadata-specification)
+    - 4.4. [Frame Encapsulation](#44-frame-encapsulation)
 5. [ASN.1 Formal Specification](#5-asn1-formal-specification)
-	- 5.1. [Core Types](#51-core-types)
-	- 5.2. [Cryptographic Structures](#52-cryptographic-structures)
-	- 5.3. [Message Structure](#53-message-structure)
-	- 5.4. [External Dependencies](#54-external-dependencies)
-	- 5.5. [Encoding Rules](#55-encoding-rules)
-	- 5.6. [Version-Specific Constraints](#56-version-specific-constraints)
-	- 5.7. [Semantic Constraints](#57-semantic-constraints)
-		- 5.7.1. [Message Ordering](#571-message-ordering)
-		- 5.7.2. [Compression Requirements](#572-compression-requirements)
-		- 5.7.3. [Integrity Semantics: Order of Operations](#573-integrity-semantics-order-of-operations)
-		- 5.7.4. [Previous Frame Chaining](#574-previous-frame-chaining)
-		- 5.7.5. [Nonrepudiation Coverage and Binding](#575-nonrepudiation-coverage-and-binding)
-		- 5.7.6. [Security Property Chain](#576-security-property-chain)
-	- 5.8. [What is the Matrix?](#58-what-is-the-matrix)
-		- 5.8.1. [Why Use the Matrix?](#581-why-use-the-matrix)
-		- 5.8.2. [The Simple View](#582-the-simple-view)
-		- 5.8.3. [Wire Format (Technical Details)](#583-wire-format-technical-details)
-		- 5.8.4. [Usage Rules](#584-usage-rules)
-		- 5.8.5. [Example: Flag System](#585-example-flag-system)
-		- 5.8.6. [Advanced: Modeling with Matrix and Previous Frame](#586-advanced-modeling-with-matrix-and-previous-frame)
-		- 5.8.7. [Summary](#587-summary)
-	- 5.9. [Complete ASN.1 Module](#59-complete-asn1-module)
-6. [Implementation](#6-implementation)
-	- 6.1. [Requirements](#61-requirements)
-		- 6.1.1. [Message Security Enforcement](#611-message-security-enforcement)
-	- 6.2. [Transport Layer](#62-transport-layer)
-	- 6.3. [Cryptographic Key Management](#63-cryptographic-key-management)
-7. [Security Considerations](#7-security-considerations)
-	- 7.1. [Cryptographic Requirements](#71-cryptographic-requirements)
-	- 7.2. [Version Security](#72-version-security)
-	- 7.3. [ASN.1 Security Considerations](#73-asn1-security-considerations)
+    - 5.1. [Enumerated Types](#51-enumerated-types)
+    - 5.2. [Cryptographic Structures](#52-cryptographic-structures)
+    - 5.3. [Message Structure](#53-message-structure)
+    - 5.4. [External Dependencies](#54-external-dependencies)
+    - 5.5. [Encoding Rules](#55-encoding-rules)
+    - 5.6. [Version-Specific Constraints](#56-version-specific-constraints)
+    - 5.7. [Semantic Constraints](#57-semantic-constraints)
+        - 5.7.1. [Message Ordering](#571-message-ordering)
+        - 5.7.2. [Compression Requirements](#572-compression-requirements)
+        - 5.7.3. [Integrity Semantics: Order of Operations](#573-integrity-semantics-order-of-operations)
+        - 5.7.4. [Previous Frame Chaining](#574-previous-frame-chaining)
+        - 5.7.5. [Nonrepudiation Coverage and Binding](#575-nonrepudiation-coverage-and-binding)
+        - 5.7.6. [Security Property Chain](#576-security-property-chain)
+    - 5.8. [What is the Matrix?](#58-what-is-the-matrix)
+        - 5.8.1. [Why Use the Matrix?](#581-why-use-the-matrix)
+        - 5.8.2. [The Simple View](#582-the-simple-view)
+        - 5.8.3. [Wire Format (Technical Details)](#583-wire-format-technical-details)
+        - 5.8.4. [Usage Rules](#584-usage-rules)
+        - 5.8.5. [Example: Flag System](#585-example-flag-system)
+        - 5.8.6. [Advanced: Modeling with Matrix and Previous Frame](#586-advanced-modeling-with-matrix-and-previous-frame)
+        - 5.8.7. [Summary](#587-summary)
+    - 5.9. [Complete ASN.1 Module](#59-complete-asn1-module)
+6. [Security Model](#6-security-model)
+    - 6.1. [SecurityProfile Trait Architecture](#61-securityprofile-trait-architecture)
+    - 6.2. [Security Profile Types](#62-security-profile-types)
+    - 6.3. [Numeric Security Levels](#63-numeric-security-levels)
+    - 6.4. [Message-Level Security Requirements](#64-message-level-security-requirements)
+    - 6.5. [CryptoProvider System](#65-cryptoprovider-system)
+    - 6.6. [Cryptographic Requirements](#66-cryptographic-requirements)
+    - 6.7. [Version Security](#67-version-security)
+    - 6.8. [ASN.1 Security Considerations](#68-asn1-security-considerations)
+7. [Implementation](#7-implementation)
+    - 7.1. [Requirements](#71-requirements)
+        - 7.1.1. [Message Security Enforcement](#711-message-security-enforcement)
+    - 7.2. [Transport Layer](#72-transport-layer)
+    - 7.3. [Cryptographic Key Management](#73-cryptographic-key-management)
 8. [Transport Layer](#8-transport-layer)
-	- 8.1. [Transport Architecture](#81-transport-architecture)
-		- 8.1.1. [Design Principles](#811-design-principles)
-		- 8.1.2. [Core Transport Traits](#812-core-transport-traits)
-	- 8.2. [Wire Format](#82-wire-format)
-	- 8.3. [TCP Transport](#83-tcp-transport)
-	- 8.4. [Transport Policies](#84-transport-policies)
-		- 8.4.1. [Concept](#841-concept)
-		- 8.4.2. [Specification](#842-specification)
-		- 8.4.3. [Implementation](#843-implementation)
-	- 8.5. [Handshake Protocols](#85-handshake-protocols)
-		- 8.5.1. [Concept: Security Goals and Protocol Selection](#851-concept-security-goals-and-protocol-selection)
-		- 8.5.2. [Specification: Handshake Flow and State Management](#852-specification-handshake-flow-and-state-management)
-		- 8.5.3. [Implementation: CMS-Based Handshake Protocol](#853-implementation-cms-based-handshake-protocol)
-		- 8.5.4. [Implementation: ECIES-Based Handshake Protocol](#854-implementation-ecies-based-handshake-protocol)
-		- 8.5.5. [Security Profile Negotiation](#855-security-profile-negotiation)
-		- 8.5.6. [Negotiation & Failure Modes](#856-negotiation--failure-modes)
-		- 8.5.7. [Threat → Control Mapping](#857-threat--control-mapping)
-	- 8.6. [Connection Pooling](#86-connection-pooling)
-	- 8.7. [Audit](#87-audit)
+    - 8.1. [Transport Architecture](#81-transport-architecture)
+        - 8.1.1. [Design Principles](#811-design-principles)
+        - 8.1.2. [Core Transport Traits](#812-core-transport-traits)
+    - 8.2. [Wire Format](#82-wire-format)
+    - 8.3. [TCP Transport](#83-tcp-transport)
+    - 8.4. [Transport Policies](#84-transport-policies)
+        - 8.4.1. [Concept](#841-concept)
+        - 8.4.2. [Specification](#842-specification)
+        - 8.4.3. [Implementation](#843-implementation)
+    - 8.5. [Handshake Protocols](#85-handshake-protocols)
+        - 8.5.1. [Concept: Security Goals and Protocol Selection](#851-concept-security-goals-and-protocol-selection)
+        - 8.5.2. [Specification: Handshake Flow and State Management](#852-specification-handshake-flow-and-state-management)
+        - 8.5.3. [Implementation: CMS-Based Handshake Protocol](#853-implementation-cms-based-handshake-protocol)
+        - 8.5.4. [Implementation: ECIES-Based Handshake Protocol](#854-implementation-ecies-based-handshake-protocol)
+        - 8.5.5. [Security Profile Negotiation](#855-security-profile-negotiation)
+        - 8.5.6. [Negotiation & Failure Modes](#856-negotiation--failure-modes)
+        - 8.5.7. [Threat → Control Mapping](#857-threat--control-mapping)
+    - 8.6. [Connection Pooling](#86-connection-pooling)
+    - 8.7. [Audit](#87-audit)
 9. [Network Theory](#9-network-theory)
-	- 9.1. [Network Architecture](#91-network-architecture)
-	- 9.2. [Efficient Exchange-Compute Interconnect](#92-efficient-exchange-compute-interconnect)
-	- 9.3. [Components](#93-components)
-		- 9.3.1. [E: Workers](#931-e-workers)
-		- 9.3.2. [E: Servlets](#932-e-servlets)
-		- 9.3.3. [C: Clusters - WIP](#933-c-clusters-wip)
-		- 9.3.4. [I: Hives](#934-i-hives)
-10. [Testing Framework](#10-testing-framework)
-	- 10.1. [Architecture and Concepts](#101-architecture-and-concepts)
-		- 10.1.1. [Three-Layer Progressive Verification](#1011-three-layer-progressive-verification)
-		- 10.1.2. [Unified Entry Point: tb_scenario!](#1012-unified-entry-point-tb_scenario)
-		- 10.1.3. [Feature Flag Architecture](#1013-feature-flag-architecture)
-	- 10.2. [Layer 1: Assertion Specifications](#102-layer-1-assertion-specifications)
-		- 10.2.1. [Concept](#1021-concept)
-		- 10.2.2. [Specification: tb_assert_spec! Syntax](#1022-specification-tb_assert_spec-syntax)
-		- 10.2.3. [Implementation Examples](#1023-implementation-examples)
-		- 10.2.4. [Generated API](#1024-generated-api)
-		- 10.2.5. [Cardinality Helpers](#1025-cardinality-helpers)
-		- 10.2.6. [Value Assertion Helpers](#1026-value-assertion-helpers)
-		- 10.2.7. [Tag-Based Assertion Filtering](#1027-tag-based-assertion-filtering)
-		- 10.2.8. [Recording Trace Events](#1028-recording-trace-events)
-		- 10.2.9. [Schedulability Analysis](#1029-schedulability-analysis)
-	- 10.3. [Layer 2: Process Specifications (CSP)](#103-layer-2-process-specifications-csp)
-		- 10.3.1. [Concept](#1031-concept)
-		- 10.3.2. [Specification: tb_process_spec! Syntax](#1032-specification-tb_process_spec-syntax)
-		- 10.3.3. [Validation Rules](#1033-validation-rules)
-		- 10.3.4. [Example: CSP Process Specification](#1034-example-csp-process-specification)
-		- 10.3.5. [Timing and Schedulability Verification](#1035-timing-and-schedulability-verification)
-		- 10.3.6. [Process Composition: tb_compose_spec!](#1036-process-composition-tb_compose_spec)
-	- 10.4. [Layer 3: Refinement Checking (FDR)](#104-layer-3-refinement-checking-fdr)
-		- 10.4.1. [Concept](#1041-concept)
-		- 10.4.2. [Specification: FdrConfig Syntax](#1042-specification-fdrconfig-syntax)
-		- 10.4.3. [Implementation Examples](#1043-implementation-examples)
-		- 10.4.4. [Multi-Seed Exploration](#1044-multi-seed-exploration)
-		- 10.4.5. [FDR Verdict Structure](#1045-fdr-verdict-structure)
-	- 10.5. [Formal CSP Theory](#105-formal-csp-theory)
-		- 10.5.1. [Three Semantic Models](#1051-three-semantic-models)
-		- 10.5.2. [Observable vs. Hidden Events](#1052-observable-vs-hidden-events)
-		- 10.5.3. [Nondeterministic Choice and Refusal Sets](#1053-nondeterministic-choice-and-refusal-sets)
-		- 10.5.4. [Multi-Seed Exploration and Scheduler Interleaving](#1054-multi-seed-exploration-and-scheduler-interleaving)
-		- 10.5.5. [CSPM Export for FDR4 Integration](#1055-cspm-export-for-fdr4-integration)
-		- 10.5.6. [Trace Analysis Extensions](#1056-trace-analysis-extensions)
-	- 10.6. [Fault Injection](#106-fault-injection)
-		- 10.6.1. [FaultModel Configuration](#1061-faultmodel-configuration)
-		- 10.6.2. [Injection Strategies](#1062-injection-strategies)
-		- 10.6.3. [Type-Safe State and Event Identifiers](#1063-type-safe-state-and-event-identifiers)
-		- 10.6.4. [Integration with FDR](#1064-integration-with-fdr)
-	- 10.7. [Unified Testing: tb_scenario! Macro](#107-unified-testing-tb_scenario-macro)
-		- 10.7.1. [Syntax](#1071-syntax)
-		- 10.7.2. [Examples](#1072-examples)
-		- 10.7.3. [Hook Semantics](#1073-hook-semantics)
-	- 10.8. [Coverage-Guided Fuzzing with AFL](#108-coverage-guided-fuzzing-with-afl)
-		- 10.8.1. [Concept](#1081-concept)
-		- 10.8.2. [Creating Fuzz Targets](#1082-creating-fuzz-targets)
-		- 10.8.3. [Building and Running Fuzz Targets](#1083-building-and-running-fuzz-targets)
-		- 10.8.4. [Advanced: CSP Oracle Integration](#1084-advanced-csp-oracle-integration)
-		- 10.8.5. [IJON Integration: Input-to-State Correspondence](#1085-ijon-integration-input-to-state-correspondence)
-	- 10.9. [Feature Matrix](#109-feature-matrix)
-	- 10.10. [Standards Compliance Mapping](#1010-standards-compliance-mapping)
-		- 10.10.1. [DO-178C DAL A / ISO 26262 ASIL-D](#10101-do-178c-dal-a--iso-26262-asil-d)
-		- 10.10.2. [IEC 61508 SIL 4](#10102-iec-61508-sil-4)
-		- 10.10.3. [NASA/ESA ECSS-E-HB-40A](#10103-nasaesa-ecss-e-hb-40a)
-		- 10.10.4. [Common Criteria EAL7](#10104-common-criteria-eal7)
-		- 10.10.5. [FMEA/FMECA (MIL-STD-1629, ISO 26262)](#10105-fmeafmeca-mil-std-1629-iso-26262)
-		- 10.10.6. [Standards Compliance Summary](#10106-standards-compliance-summary)
-11. [Instrumentation](#11-instrumentation)
-	- 11.1. [Objectives](#111-objectives)
-	- 11.2. [Event Kind Taxonomy](#112-event-kind-taxonomy)
-	- 11.3. [Event Structure](#113-event-structure)
-	- 11.4. [Payload Representation](#114-payload-representation)
-	- 11.5. [Configuration](#115-configuration)
-	- 11.6. [Evidence Artifact Format](#116-evidence-artifact-format)
-	- 11.7. [Failure Handling](#117-failure-handling)
-	- 11.8. [Logging Subsystem](#118-logging-subsystem)
-12. [Misc](#12-misc)
-	- 12.1. [Utilities](#121-utilities)
-		- 12.1.1. [URNs](#1211-urns)
-		- 12.1.2. [Jobs](#1212-jobs)
-		- 12.1.3. [Job Pipelines](#1213-job-pipelines)
+    - 9.1. [Network Architecture](#91-network-architecture)
+    - 9.2. [Efficient Exchange-Interconnect-Compute](#92-efficient-exchange-interconnect-compute)
+    - 9.3. [Components](#93-components)
+        - 9.3.1. [E: Workers](#931-e-workers)
+        - 9.3.2. [E: Servlets](#932-e-servlets)
+        - 9.3.3. [I: Hives](#933-i-hives)
+        - 9.3.4. [C: Clusters](#934-c-clusters)
+10. [Instrumentation](#10-instrumentation)
+    - 10.1. [Objectives](#101-objectives)
+    - 10.2. [Event Kind Taxonomy](#102-event-kind-taxonomy)
+    - 10.3. [Event Structure](#103-event-structure)
+    - 10.4. [Payload Representation](#104-payload-representation)
+    - 10.5. [Configuration](#105-configuration)
+    - 10.6. [Evidence Artifact Format](#106-evidence-artifact-format)
+    - 10.7. [Failure Handling](#107-failure-handling)
+    - 10.8. [Logging Subsystem](#108-logging-subsystem)
+11. [Misc](#11-misc)
+    - 11.1. [Utilities](#111-utilities)
+        - 11.1.1. [URNs](#1111-urns)
+        - 11.1.2. [Jobs](#1112-jobs)
+        - 11.1.3. [Job Pipelines](#1113-job-pipelines)
+12. [Testing Framework](#12-testing-framework)
+    - 12.1. [Architecture and Concepts](#121-architecture-and-concepts)
+        - 12.1.1. [Three-Layer Progressive Verification](#1211-three-layer-progressive-verification)
+        - 12.1.2. [Unified Entry Point: tb_scenario!](#1212-unified-entry-point-tb_scenario)
+        - 12.1.3. [Feature Flag Architecture](#1213-feature-flag-architecture)
+    - 12.2. [Layer 1: Assertion Specifications](#122-layer-1-assertion-specifications)
+        - 12.2.1. [Concept](#1221-concept)
+        - 12.2.2. [Specification: tb_assert_spec! Syntax](#1222-specification-tb_assert_spec-syntax)
+        - 12.2.3. [Implementation Examples](#1223-implementation-examples)
+        - 12.2.4. [Generated API](#1224-generated-api)
+        - 12.2.5. [Cardinality Helpers](#1225-cardinality-helpers)
+        - 12.2.6. [Value Assertion Helpers](#1226-value-assertion-helpers)
+        - 12.2.7. [Tag-Based Assertion Filtering](#1227-tag-based-assertion-filtering)
+        - 12.2.8. [Recording Trace Events](#1228-recording-trace-events)
+        - 12.2.9. [Schedulability Analysis](#1229-schedulability-analysis)
+    - 12.3. [Layer 2: Process Specifications (CSP)](#123-layer-2-process-specifications-csp)
+        - 12.3.1. [Concept](#1231-concept)
+        - 12.3.2. [Specification: tb_process_spec! Syntax](#1232-specification-tb_process_spec-syntax)
+        - 12.3.3. [Validation Rules](#1233-validation-rules)
+        - 12.3.4. [Example: CSP Process Specification](#1234-example-csp-process-specification)
+        - 12.3.5. [Timing and Schedulability Verification](#1235-timing-and-schedulability-verification)
+        - 12.3.6. [Process Composition: tb_compose_spec!](#1236-process-composition-tb_compose_spec)
+    - 12.4. [Layer 3: Refinement Checking (FDR)](#124-layer-3-refinement-checking-fdr)
+        - 12.4.1. [Concept](#1241-concept)
+        - 12.4.2. [Specification: FdrConfig Syntax](#1242-specification-fdrconfig-syntax)
+        - 12.4.3. [Implementation Examples](#1243-implementation-examples)
+        - 12.4.4. [Multi-Seed Exploration](#1244-multi-seed-exploration)
+        - 12.4.5. [FDR Verdict Structure](#1245-fdr-verdict-structure)
+    - 12.5. [Formal CSP Theory](#125-formal-csp-theory)
+        - 12.5.1. [Three Semantic Models](#1251-three-semantic-models)
+        - 12.5.2. [Observable vs. Hidden Events](#1252-observable-vs-hidden-events)
+        - 12.5.3. [Nondeterministic Choice and Refusal Sets](#1253-nondeterministic-choice-and-refusal-sets)
+        - 12.5.4. [Multi-Seed Exploration and Scheduler Interleaving](#1254-multi-seed-exploration-and-scheduler-interleaving)
+        - 12.5.5. [CSPM Export for FDR4 Integration](#1255-cspm-export-for-fdr4-integration)
+        - 12.5.6. [Trace Analysis Extensions](#1256-trace-analysis-extensions)
+    - 12.6. [Fault Injection](#126-fault-injection)
+        - 12.6.1. [FaultModel Configuration](#1261-faultmodel-configuration)
+        - 12.6.2. [Injection Strategies](#1262-injection-strategies)
+        - 12.6.3. [Type-Safe State and Event Identifiers](#1263-type-safe-state-and-event-identifiers)
+        - 12.6.4. [Integration with FDR](#1264-integration-with-fdr)
+    - 12.7. [Unified Testing: tb_scenario! Macro](#127-unified-testing-tb_scenario-macro)
+        - 12.7.1. [Syntax](#1271-syntax)
+        - 12.7.2. [Examples](#1272-examples)
+        - 12.7.3. [Hook Semantics](#1273-hook-semantics)
+    - 12.8. [Coverage-Guided Fuzzing with AFL](#128-coverage-guided-fuzzing-with-afl)
+        - 12.8.1. [Concept](#1281-concept)
+        - 12.8.2. [Creating Fuzz Targets](#1282-creating-fuzz-targets)
+        - 12.8.3. [Building and Running Fuzz Targets](#1283-building-and-running-fuzz-targets)
+        - 12.8.4. [Advanced: CSP Oracle Integration](#1284-advanced-csp-oracle-integration)
+        - 12.8.5. [IJON Integration: Input-to-State Correspondence](#1285-ijon-integration-input-to-state-correspondence)
+    - 12.9. [Feature Matrix](#129-feature-matrix)
+    - 12.10. [Standards Compliance Mapping](#1210-standards-compliance-mapping)
+        - 12.10.1. [DO-178C DAL A / ISO 26262 ASIL-D](#12101-do-178c-dal-a--iso-26262-asil-d)
+        - 12.10.2. [IEC 61508 SIL 4](#12102-iec-61508-sil-4)
+        - 12.10.3. [NASA/ESA ECSS-E-HB-40A](#12103-nasaesa-ecss-e-hb-40a)
+        - 12.10.4. [Common Criteria EAL7](#12104-common-criteria-eal7)
+        - 12.10.5. [FMEA/FMECA (MIL-STD-1629, ISO 26262)](#12105-fmeafmeca-mil-std-1629-iso-26262)
+        - 12.10.6. [Standards Compliance Summary](#12106-standards-compliance-summary)
 13. [End-to-End Examples](#13-end-to-end-examples)
-	- 13.1. [Complete Client-Server Application](#131-complete-client-server-application)
+    - 13.1. [Complete Client-Server Application](#131-complete-client-server-application)
 14. [References](#14-references)
-	- 14.1. [Normative References](#141-normative-references)
-	- 14.2. [Standards References](#142-standards-references)
-	- 14.3. [ASN.1 References](#143-asn1-references)
+    - 14.1. [Normative References](#141-normative-references)
+    - 14.2. [Informative References](#142-informative-references)
 15. [License](#15-license)
 16. [Implementation Notes](#16-implementation-notes)
 
 ## 1. Introduction
 
-tightbeam defines a structured, versioned messaging protocol with an
-information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Its philosophy is
-predicated upon a return to first order principles. Sections follow
-a [concept → specification → implementation → testing] pattern.
+tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Its philosophy is predicated upon a return to first order principles.
 
 ### 1.1 Information Fidelity Constraint
 
-tightbeam's design is based on the principle that information transmission
-maintains bounded fidelity: **I(t) ∈ (0,1)** for all time t.
+tightbeam's design is based on the principle that information transmission maintains bounded fidelity: **I(t) ∈ (0,1)** for all time t.
 
 This means:
 - Information fidelity is never perfect (< 1) due to physical and encoding limits
@@ -206,9 +198,16 @@ The I(t) constraint informs all protocol design decisions.
 
 ### 1.2 Requirements Language
 
-The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
-"SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
-interpreted as described in [RFC2119](https://datatracker.ietf.org/doc/html/rfc2119).
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119][rfc2119].
+
+### 1.3 Document Conventions
+
+This document adheres to the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322] for structure and editorial style:
+
+- **Section pattern**: Normative sections progress through concept → specification → implementation → testing.
+- **Requirements language**: Key words are interpreted per [RFC 2119][rfc2119] (see [§1.2 Requirements Language](#12-requirements-language)).
+- **Terminology**: Project terms are defined once in [§2 Terminology](#2-terminology) and used consistently thereafter.
+- **Citations**: External standards are cited by name and linked on their first mention within a section. Full references are recorded in [§14 References](#14-references); every entry there is cited at least once in the text, and every in-text citation resolves to an entry there.
 
 ## 2. Terminology
 The following project terms MUST be used consistently:
@@ -224,8 +223,7 @@ The following project terms MUST be used consistently:
 
 ### 3.1 Information Theory Properties
 
-tightbeam implements high-fidelity information transmission through the
-following bounds:
+tightbeam implements high-fidelity information transmission through the following bounds:
 
 - **STRUCTURE**: Perfect encoding via ASN.1 DER
 - **FRAME**: Incremental versioning system
@@ -257,256 +255,13 @@ following bounds:
 
 - VERSION 2
   - Inherits: All V1 features
-  - OPTIONAL: Priority levels (7-level enumeration)
+  - OPTIONAL: Priority levels (6-level enumeration)
   - OPTIONAL: Message lifetime (64-bit TTL)
   - OPTIONAL: State chaining (previous message integrity)
 
 - VERSION 3
   - Inherits: All V2 features
   - OPTIONAL: Matrix control (NxN matrix flags)
-
-### 4.1.1 SecurityProfile Trait Architecture
-
-tightbeam uses a trait-based security profile system that separates compile-time
-algorithm constraints from runtime protocol behavior.
-
-#### Design Principles
-
-The `SecurityProfile` trait defines a pure metadata layer that declares
-algorithm identifiers (OIDs) for cryptographic operations:
-
-```rust
-pub trait SecurityProfile {
-	type DigestOid: AssociatedOid;
-	type AeadOid: AssociatedOid + AeadKeySize;
-	type SignatureAlg: SignatureAlgorithmIdentifier;
-	type CurveOid: AssociatedOid;
-	type KemOid: AssociatedOid;
-	
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
-}
-```
-
-#### Role-Based Provider Traits
-
-tightbeam separates cryptographic concerns through specialized provider traits:
-
-- **`DigestProvider`**: Hash/digest operations (SHA-256, SHA3-256, etc.)
-- **`AeadProvider`**: Authenticated encryption (AES-GCM variants)
-- **`SigningProvider`**: Signature generation and verification (ECDSA, Ed25519)
-- **`KdfProvider`**: Key derivation functions (HKDF)
-- **`CurveProvider`**: Elliptic curve operations (secp256k1, P-384)
-
-These traits compose into `CryptoProvider`, allowing components to specify only
-the cryptographic capabilities they require rather than depending on the full
-provider.
-
-### 4.1.2 Security Profile Types
-
-Applications implement the `SecurityProfile` trait to define their own
-cryptographic algorithm constraints:
-
-#### Implementing Custom Profiles
-
-```rust
-// Example: Custom application profile
-pub struct MyAppProfile;
-
-impl SecurityProfile for MyAppProfile {
-	type DigestOid = Sha3_256;
-	type AeadOid = Aes256GcmOid;
-	type SignatureAlg = Secp256k1Signature;
-	type CurveOid = Secp256k1Oid;
-	type KemOid = Kyber1024Oid;
-	
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
-}
-```
-
-#### Built-in Default Profile
-
-tightbeam provides `TightbeamProfile` as a reference implementation and default:
-
-```rust
-pub struct TightbeamProfile;
-
-impl SecurityProfile for TightbeamProfile {
-	type DigestOid = Sha3_256;
-	type AeadOid = Aes256GcmOid;
-	type SignatureAlg = Secp256k1Signature;
-	type CurveOid = Secp256k1Oid;
-	type KemOid = Kyber1024Oid;
-	
-	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
-}
-```
-
-Applications can define multiple profiles for different security contexts (e.g.,
-`HighSecurityProfile`, `LegacyProfile`, `QuantumResistantProfile`) and use them
-with different message types.
-
-### 4.1.3 Numeric Security Levels
-
-Numeric security levels are a convenience shorthand:
-- Level 1 or 2 → Sets `confidential + nonrepudiable + min_version = V1`
-- Does NOT enable algorithm OID validation (use type-based profiles for that)
-
-### 4.1.4 Message-Level Security Requirements
-
-tightbeam supports run-time security profile enforcement at the message type
-level through the `Message` trait and compile-time security enforcement at
-the message composition level:
-
-```rust
-pub trait Message: /* trait bounds */ {
-	const MIN_VERSION: Version = Version::V0;
-	const MUST_BE_NON_REPUDIABLE: bool = false;
-	const MUST_BE_CONFIDENTIAL: bool = false;
-	const MUST_BE_COMPRESSED: bool = false;
-	const MUST_BE_PRIORITIZED: bool = false;
-	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
-	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
-	const HAS_PROFILE: bool = false;
-	type Profile: SecurityProfile;
-}
-```
-
-#### Profile-Based Algorithm Constraints
-
-**HAS_PROFILE**: Controls whether the message type enforces algorithm constraints
-- When `false` (default): Message uses `TightbeamProfile` but does not enforce algorithm OID matching
-- When `true`: FrameBuilder validates that all cryptographic operations use algorithms from the message's `Profile` type
-
-**Profile Type**: Specifies which `SecurityProfile` implementation constrains algorithm selection
-- Defaults to `TightbeamProfile` if not specified
-- Can be set to any type implementing `SecurityProfile`
-- Affects compile-time validation when `HAS_PROFILE = true`
-
-**Algorithm Validation**: When `HAS_PROFILE = true`, the following validations occur at compile time:
-- Digest algorithms must match `<Profile::DigestOid as AssociatedOid>::OID`
-- AEAD ciphers must match `<Profile::AeadOid as AssociatedOid>::OID`
-- Signature algorithms must match `<Profile::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID`
-
-This ensures that message types with specific security profiles can only be
-composed with compatible cryptographic algorithms.
-
-#### Security Requirement Semantics
-- When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
-- When a message type specifies `MUST_BE_CONFIDENTIAL = true`, the Frame's metadata MUST include a `confidentiality` field
-- When a message type specifies `MUST_BE_COMPRESSED = true`, the Frame's metadata `compactness` field MUST NOT be `none`
-- When a message type specifies `MUST_BE_PRIORITIZED = true`, the Frame's metadata MUST include a `priority` field (V2+ only)
-- The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
-
-#### Profile Validation in FrameBuilder
-
-When composing frames with `FrameBuilder`, profile constraints are enforced at
-compile time if the message type has `HAS_PROFILE = true`:
-
-**Using the `compose!` Macro:**
-
-```rust
-// Example: Message with custom profile
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[beam(profile(MyAppProfile))]
-struct SecureMessage { data: Vec<u8> }
-
-// compose! macro validates algorithm OIDs match MyAppProfile
-let frame = compose! {
-	V1: id: b"msg-001",
-		order: 1696521900,
-		message_integrity<Sha3_256>: salt,
-		confidentiality<Aes256GcmOid, _>: &cipher,
-		nonrepudiation<Secp256k1Signature, _>: &signing_key,
-		message: message
-}?;
-```
-
-**Using FrameBuilder Directly:**
-
-```rust
-// FrameBuilder validates algorithm OIDs match MyAppProfile
-let frame = compose::<SecureMessage>(Version::V1)
-	.with_message(msg)
-	.with_id(b"msg-001")
-	.with_order(timestamp)
-	.with_message_hasher::<Sha3_256>(salt)          // ✓ Matches MyAppProfile::DigestOid
-	.with_aead::<Aes256GcmOid, _>(&cipher)        // ✓ Matches MyAppProfile::AeadOid
-	.with_signer::<Secp256k1Signature, _>(&signer)  // ✓ Matches MyAppProfile::SignatureAlg
-	.build()?;
-```
-
-> Note: All tightbeam macros are entirely optional and contain underlying
-	functionality and traits for direct/manual implementation.
-
-**Validation Rules**:
-- `with_message_hasher::<D>(salt)` validates `D::OID == Profile::DigestOid::OID`
-- `with_witness_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
-- `with_aead::<C, _>()` validates `C::OID == Profile::AeadOid::OID`
-- `with_signer::<S, _>()` validates `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`
-
-**Error Handling**: Algorithm mismatches return `TightBeamError::UnexpectedAlgorithmForProfile` with
-expected and received OIDs for debugging.
-
-#### Implementation Enforcement
-These requirements are enforced at:
-- **Compile Time**: Type system prevents composition of messages that don't meet requirements
-- **Runtime Validation**: Frame validation ensures expected frame shape to meet requirements
-- **Profile Compliance**: Security profiles can reference message types with specific requirements
-
-#### Derive Macro Usage
-
-The `#[derive(Beamable)]` macro implements the `Message` trait with these attributes:
-
-**Security attributes:**
-- `#[beam(message_integrity)]`, `#[beam(frame_integrity)]`
-- `#[beam(nonrepudiable)]`, `#[beam(confidential)]`
-- `#[beam(compressed)]`, `#[beam(prioritized)]`
-- `#[beam(min_version = "V1")]`
-
-**Profile attributes:**
-- `#[beam(profile = 1)]` or `#[beam(profile = 2)]` - Numeric levels (sets confidential + nonrepudiable, no OID validation)
-- `#[beam(profile(TypeName))]` - Type-based profile (enables compile-time OID validation)
-
-#### Example Message Types
-
-```rust
-// Numeric security level (convenience)
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[beam(profile = 1)]
-struct PaymentInstruction { /* fields */ }
-
-// Type-based profile with algorithm enforcement
-#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
-#[beam(profile(MyAppProfile), confidential, nonrepudiable, min_version = "V1")]
-struct HighSecurityTransfer { /* fields */ }
-```
-
-### 4.1.5 CryptoProvider System
-
-The `CryptoProvider` trait composes role-based provider traits to bind concrete
-cryptographic implementations to `SecurityProfile` metadata:
-
-```rust
-pub trait CryptoProvider:
-	Default +
-	Copy + // zero-sized type (ZST),
-	DigestProvider +
-	AeadProvider +
-	SigningProvider +
-	KdfProvider +
-	CurveProvider
-{
-	type Profile: SecurityProfile + Default;
-	fn profile(&self) -> &Self::Profile;
-}
-```
-
-**DefaultCryptoProvider**: Reference implementation combining:
-- **Digest**: SHA3-256 (Keccak-based hash)
-- **AEAD**: AES-256-GCM (authenticated encryption)
-- **Signature**: secp256k1 ECDSA (Bitcoin/Ethereum curve)
-- **KDF**: HKDF-SHA3-256 (key derivation)
-- **Curve**: secp256k1 (elliptic curve operations)
 
 ### 4.2 Frame Structure
 
@@ -578,40 +333,41 @@ pub struct Frame {
 
 ## 5. ASN.1 Formal Specification
 
-This section provides the complete ASN.1 definitions for all tightbeam protocol
-structures, encoded using Distinguished Encoding Rules (DER).
+This section provides the complete ASN.1 definitions for all tightbeam protocol structures. All structures use the ASN.1 notation defined in [ITU-T X.680][itu-x680] and are encoded using Distinguished Encoding Rules (DER).
 
-### 5.1 Core Types
+### 5.1 Enumerated Types
 
-#### Version Enumeration
+#### Version Enumeration (tightbeam-specific)
 ```asn1
 Version ::= ENUMERATED {
 	v0(0),
 	v1(1),
-	v2(2)
+	v2(2),
 	v3(3)
 }
 ```
 
-#### Message Priority Levels
+> `Version` enumerates the protocol generation carried by every frame. See [§4.1 Version Evolution](#41-version-evolution) for the negotiation and backward-compatibility rules governing each value. The zero-indexed named version field follows the established ASN.1 idiom of X.509 ([RFC 5280][rfc5280], `Version ::= INTEGER { v1(0), v2(1), v3(2) }`) and CMS ([RFC 5652][rfc5652], `CMSVersion`); like the latter, tightbeam numbers `vN` as integer `N`.
+
+#### Message Priority Levels ([RFC 2474][rfc2474] - DiffServ)
 ```asn1
 MessagePriority ::= ENUMERATED {
-	critical(0),  -- System/security alerts, emergency notifications
-	top(1),       -- High-priority interactive traffic, real-time responses
-	high(2),      -- Important business messages, time-sensitive data
-	normal(3),    -- Standard message traffic (default)
-	low(4),       -- Non-urgent notifications, background updates
-	bulk(5),      -- Batch processing, large data transfers, logs
-	heartbeat(6)  -- Keep-alive signals, periodic status updates
+	lowEffort(0),       -- LE PHB: background, non-urgent traffic, logs
+	standard(1),        -- DF/CS0: best-effort default
+	highThroughput(2),  -- AF1: batch processing, large data transfers
+	lowLatency(3),      -- CS4: time-sensitive interactive data
+	expedited(4),       -- EF: real-time interactive responses
+	networkControl(5)   -- CS6/CS7: control plane, security/emergency alerts, keep-alive
 }
 ```
 
+> Priority levels are anchored to the IETF Differentiated Services (DiffServ) architecture, mapping each level to a Per-Hop Behavior (PHB) or service class defined in [RFC 2474][rfc2474] (DS field / Class Selectors), [RFC 4594][rfc4594] (service classes), [RFC 3246][rfc3246] (Expedited Forwarding), and [RFC 8622][rfc8622] (Lower-Effort). Ordering is DSCP-faithful: a higher value denotes higher priority. A secondary mapping to ITU-T X.400/X.420 ([ITU-T X.400][itu-x400], [ITU-T X.420][itu-x420]) message importance (low/normal/high) is retained for message-handling interoperability.
+
 ### 5.2 Cryptographic Structures
 
-tightbeam uses standard CMS (Cryptographic Message Syntax) structures from
-RFC 5652 and PKCS standards for cryptographic operations.
+tightbeam uses standard CMS (Cryptographic Message Syntax) structures from [RFC 5652][rfc5652] and PKCS standards for cryptographic operations.
 
-#### Digest Information ([RFC 3447](https://datatracker.ietf.org/doc/html/rfc3447) - PKCS #1)
+#### Digest Information ([RFC 3447][rfc3447] - PKCS #1)
 
 From RFC 3447 Section 9.2:
 
@@ -622,9 +378,9 @@ DigestInfo ::= SEQUENCE {
 }
 ```
 
-Used in `Metadata.integrity`, `Metadata.previous_frame`, and `Frame.integrity` fields.
+> Used in `Metadata.integrity`, `Metadata.previous_frame`, and `Frame.integrity` fields.
 
-#### Encrypted Content Information ([RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652) - CMS)
+#### Encrypted Content Information ([RFC 5652][rfc5652] - CMS)
 
 From RFC 5652 Section 6.1:
 
@@ -636,9 +392,9 @@ EncryptedContentInfo ::= SEQUENCE {
 }
 ```
 
-Used in `Metadata.confidentiality` field for message-level encryption.
+> Used in `Metadata.confidentiality` field for message-level encryption.
 
-#### Signer Information ([RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652) - CMS)
+#### Signer Information ([RFC 5652][rfc5652] - CMS)
 
 From RFC 5652 Section 5.3:
 
@@ -654,9 +410,9 @@ SignerInfo ::= SEQUENCE {
 }
 ```
 
-Used in `Frame.nonrepudiation` field for digital signatures.
+> Used in `Frame.nonrepudiation` field for digital signatures.
 
-#### Compressed Data ([RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274) - CMS)
+#### Compressed Data ([RFC 3274][rfc3274] - CMS)
 
 From RFC 3274 Section 2:
 
@@ -668,15 +424,17 @@ CompressedData ::= SEQUENCE {
 }
 ```
 
-Used in `Metadata.compactness` field for message compression.
+> Used in `Metadata.compactness` field for message compression.
 
-#### Matrix (TightBeam-specific)
+#### Matrix (tightbeam-specific)
 ```asn1
 Matrix ::= SEQUENCE {
 	n     INTEGER (1..255),
 	data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
 }
 ```
+
+> Used in `Metadata.matrix` field for NxN matrix control flags. See [§5.8 What is the Matrix?](#58-what-is-the-matrix) for more details.
 
 ### 5.3 Message Structure
 
@@ -717,7 +475,7 @@ Frame ::= SEQUENCE {
 
 The protocol relies on standard ASN.1 structures from established RFCs.
 
-#### Algorithm Identifier ([RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652))
+#### Algorithm Identifier ([RFC 5652][rfc5652] - CMS)
 
 From RFC 5652 Section 10.1.2:
 
@@ -728,9 +486,9 @@ AlgorithmIdentifier ::= SEQUENCE {
 }
 ```
 
-Implemented via the [spki](https://crates.io/crates/spki) crate.
+> Implemented via the [spki](https://crates.io/crates/spki) crate.
 
-#### Compression Algorithm Identifiers ([RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274))
+#### Compression Algorithm Identifiers ([RFC 3274][rfc3274] - CMS)
 
 From RFC 3274 Section 2:
 
@@ -741,13 +499,13 @@ CompressionAlgorithmIdentifier ::= AlgorithmIdentifier
 id-alg-zlibCompress OBJECT IDENTIFIER ::= { iso(1) member-body(2)
 	us(840) rsadsi(113549) pkcs(1) pkcs-9(9) smime(16) alg(3) 8 }
 
--- TightBeam also supports zstd compression
+-- tightbeam also supports zstd compression
 id-alg-zstdCompress OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 50274 1 1 }
 ```
 
-Implemented via the [cms](https://crates.io/crates/cms) crate.
+> Implemented via the [cms](https://crates.io/crates/cms) crate.
 
-#### Hash and Signature Algorithms ([RFC 5246](https://datatracker.ietf.org/doc/html/rfc5246))
+#### Hash and Signature Algorithms ([RFC 5246][rfc5246] - TLS)
 
 From RFC 5246 Section 7.4.1.4.1 (informative):
 
@@ -761,12 +519,11 @@ enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
 	SignatureAlgorithm;
 ```
 
-> Note: TightBeam implementations SHOULD use SHA-256 or stronger hash algorithms
-and SHOULD NOT use MD5 or SHA-1 for new deployments.
+> Note: tightbeam implementations SHOULD use SHA-256 or stronger hash algorithms and SHOULD NOT use MD5 or SHA-1 for new deployments.
 
 ### 5.5 Encoding Rules
 
-- **Encoding**: Distinguished Encoding Rules (DER) as specified in [ITU-T X.690](https://www.itu.int/rec/T-REC-X.690)
+- **Encoding**: Distinguished Encoding Rules (DER) as specified in [ITU-T X.690][itu-x690]
 - **Byte Order**: Network byte order (big-endian) for multi-byte integers
 - **String Encoding**: UTF-8 for textual content, raw bytes for binary data
 - **Optional Fields**: Absent optional fields MUST NOT be encoded (DER requirement)
@@ -796,50 +553,47 @@ and SHOULD NOT use MD5 or SHA-1 for new deployments.
 
 #### 5.7.1 Message Ordering
 - `order` field MUST be monotonically increasing within a message sequence
-- `order` values SHOULD be based on reliable timestamp sources
-- Duplicate `order` values within the same `id` namespace MUST be rejected
+- `order` values SHOULD be based on reliable sources when time-based ordering is used
+- Duplicate `order` values within the same message namespace MUST be rejected
 
 #### 5.7.2 Compression Requirements
-- When `compactness` is present (not `None`), the `message` field MUST contain
-compressed data encoded as `CompressedData` per RFC 3274
-- The `encapContentInfo` within `CompressedData` MUST use the `id-data` content
-type OID if the compressed data does not conform to any recognized content type
-- Compression algorithm identifiers MUST be valid OIDs (e.g.,
-`id-alg-zlibCompress` for zlib, custom OIDs for zstd -- tightbeam uses
-1.2.840.113549.1.9.16.3 pending formal assignment)
-- Compression level parameters, when specified in
-`compressionAlgorithm.parameters`, MUST be within algorithm-specific valid ranges
+- When `compactness` is present (not `None`), the `message` field MUST contain compressed data encoded as `CompressedData` per RFC 3274
+- The `encapContentInfo` within `CompressedData` MUST use the `id-data` content type OID if the compressed data does not conform to any recognized content type
+- Compression algorithm identifiers MUST be valid OIDs (e.g., `id-alg-zlibCompress` for zlib, custom OIDs for zstd -- tightbeam uses 1.2.840.113549.1.9.16.3 pending formal assignment)
+- Compression level parameters, when specified in `compressionAlgorithm.parameters`, MUST be within algorithm-specific valid ranges
 
 #### 5.7.3 Integrity Semantics: Order of Operations
 
-This section clarifies the relationship between message integrity and frame
-integrity. The goals are: (1) unambiguous validation semantics, and (2) clear
-data retention choices.
+This section clarifies the relationship between message integrity and frame integrity. The goals are: (1) unambiguous validation semantics, and (2) clear data retention choices.
 
-- Message Integrity (MI): MI MUST be computed over the message payload bytes.
-When present at the metadata level (i.e., `Metadata.integrity`), MI MUST bind
-the message body.
-- Frame Integrity (FI): FI MUST be computed over the frame only (version +
-metadata; it MUST exclude the message) using DER-canonical encoding. FI MUST
-bind the frame around the message and the metadata itself.
+- Message Integrity (MI): MI MUST be computed over the message payload bytes. When present at the metadata level (i.e., `Metadata.integrity`), MI MUST bind the message body.
+- Frame Integrity (FI): FI MUST be computed over the frame only (version + metadata; it MUST exclude the message) using DER-canonical encoding. FI MUST bind the frame around the message and the metadata itself.
 
 Important properties:
-- FI alone MUST NOT be used to prove message content correctness; it ONLY proves
-the integrity of the frame (version + metadata).
-- MI MUST be used to prove message content correctness. Because MI lives in
-metadata and FI commits to the frame that contains that metadata, FI
-therefore witnesses MI. When FI is authenticated (e.g., covered by a signature
-via nonrepudiation or finalized via consensus), any tampering with MI MUST cause
-the authenticated FI validation to fail. Receivers SHOULD treat the pair
-(valid MI, authenticated FI) as sufficient evidence that both frame and
-message are intact. Note: an in-band, unsigned FI MUST NOT be relied upon to
-prevent an active attacker from changing both MI and FI.
+- FI alone MUST NOT be used to prove message content correctness; it ONLY proves the integrity of the frame (version + metadata).
+- MI MUST be used to prove message content correctness. Because MI lives in metadata and FI commits to the frame that contains that metadata, FI therefore witnesses MI. When FI is authenticated (e.g., covered by a signature via nonrepudiation or finalized via consensus), any tampering with MI MUST cause the authenticated FI validation to fail. Receivers SHOULD treat the pair (valid MI, authenticated FI) as sufficient evidence that both frame and message are intact.
+> Note: an in-band, unsigned FI MUST NOT be relied upon to prevent an active attacker from changing both MI and FI.
+
+##### Optional Hiding Commitment (Salt)
+
+By default MI is a bare digest `H(message)`: binding, but not hiding. A low-entropy message body can be recovered (if encrypted) by brute-forcing candidate preimages against the digest, which travels in cleartext metadata. An application MAY instead store a *hiding commitment* in the same `Metadata.integrity` field by salting the body with a secret, high-entropy blinding value. tightbeam computes the commitment as `H(len(salt) || salt || DER(message))` -- 8-byte big-endian length framing, so distinct `(salt, message)` pairs cannot collide -- exposes it through `Opening::prove` / `Opening::verify`, and treats an empty salt as the plain `H(message)` digest. Disclosing the opening `(salt, message)` proves the committed content in constant time: the salted-hash disclose-then-verify construction standardized by SD-JWT ([RFC 9901][rfc9901]) and ISO mdoc ([ISO/IEC 18013-5][iso-18013-5]).
+
+> Note: The salt is NOT a tightbeam responsibility. tightbeam neither generates, encrypts, stores, nor transmits the salt; callers MUST source salt entropy, decide where the opening is retained, and control its disclosure. An application that needs self-contained openings -- for example, a credential carrying its salt encrypted alongside the body for later selective disclosure -- MUST define that envelope itself.
+
+**Recommended pattern.** When confidentiality is enabled, carry the salt *inside* the sealed body so the opening is self-contained -- recoverable by decryption alone, with no out-of-band state. Wrap the payload with its blinding salt, commit to the payload with `Opening::prove`, then encrypt the wrapper to the recipient and use the ciphertext as the frame `message`:
+
+```asn1
+SealedBody ::= SEQUENCE {
+	salt   OCTET STRING,   -- random, fixed-length blinding value
+	value  Payload         -- the application message type
+}
+```
+
+A recipient decrypts the body, recovers the opening `(salt, DER(value))`, and MAY later disclose it to a third party to prove the committed `value` in constant time -- without revealing the content key.
 
 ##### Message Integrity with AEAD
 
-When confidentiality is enabled, tightbeam implementations MUST use Authenticated
-Encryption with Associated Data (AEAD) ciphers. This requirement is enforced at
-the type system level through trait bounds:
+When confidentiality is enabled, tightbeam implementations MUST use Authenticated Encryption with Associated Data (AEAD) ciphers. This requirement is enforced at the type system level through trait bounds:
 
 ```rust
 pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
@@ -852,17 +606,11 @@ where
 This design ensures MI over plaintext is cryptographically sound:
 
 - **Type-level guarantee**: Non-AEAD ciphers cannot be used (compile-time enforcement)
-- **Ciphertext authentication**: AEAD provides built-in authentication tags that prove
-the ciphertext has not been tampered with (e.g., AES-GCM, ChaCha20-Poly1305)
+- **Ciphertext authentication**: AEAD provides built-in authentication tags that prove the ciphertext has not been tampered with (e.g., AES-GCM ([FIPS 197][fips197]), ChaCha20-Poly1305 ([RFC 8439][rfc8439]))
 - **MI purpose**: Proves the decrypted plaintext matches the original message content
-- **Layered security**: AEAD prevents ciphertext tampering, MI proves plaintext
-correctness, FI witnesses MI in metadata, signatures cover the entire frame
+- **Layered security**: AEAD prevents ciphertext tampering, MI proves plaintext correctness, FI witnesses MI in metadata, signatures cover the entire frame
 
-This approach is cryptographically equivalent to Encrypt-then-MAC when AEAD is
-enforced, as AEAD ciphers provide both confidentiality and authenticity of the
-ciphertext. An attacker cannot modify the ciphertext (AEAD authentication fails),
-cannot modify MI without breaking FI (when FI is signed/consensus-finalized),
-and cannot decrypt without the key.
+This approach is cryptographically equivalent to Encrypt-then-MAC when AEAD is enforced, as AEAD ciphers provide both confidentiality and authenticity of the ciphertext. An attacker cannot modify the ciphertext (AEAD authentication fails), cannot modify MI without breaking FI (enforced through signing), and cannot decrypt without the key.
 
 #### 5.7.4 Previous Frame Chaining
 - The ``previous_frame`` field creates a cryptographic hash chain linking frames
@@ -879,22 +627,16 @@ and cannot decrypt without the key.
 
 This section specifies what the nonrepudiation signature covers when present.
 
-- Signature scope (MUST): The signature MUST be computed over the canonical
-DER encoding of the Frame fields EXCLUDING the `nonrepudiation` field itself;
-concretely, it MUST cover:
+- Signature scope (MUST): The signature MUST be computed over the canonical DER encoding of the Frame fields EXCLUDING the `nonrepudiation` field itself; concretely, it MUST cover:
 	- `version`
 	- `metadata` (including MI when present)
 	- `message`
 	- `integrity` (FI) when present
-
-- Security consequence: Any modification to version, metadata (including MI),
-message, or FI invalidates the signature. This yields the transitive binding:
-	Signature → FI (envelope) → MI (in metadata) → Message body
+- Security consequence: Any modification to version, metadata (including MI), message, or FI invalidates the signature. This yields the transitive binding: Signature → FI (envelope) → MI (in metadata) → Message body
 
 #### 5.7.6 Security Property Chain
 
-When all security features are enabled (MI, FI, AEAD encryption, and signatures),
-the complete security property chain operates as follows:
+When all security features are enabled (MI, FI, AEAD encryption, and signatures), the complete security property chain operates as follows:
 
 **Sender operations (in order):**
 1. Compute MI over plaintext message
@@ -922,14 +664,11 @@ This layered approach provides defense in depth:
 - MI ensures message integrity (proves plaintext correctness after decryption)
 - Signature ensures nonrepudiation (cryptographically binds sender to entire frame)
 
-Any tampering at any layer causes verification to fail, ensuring end-to-end
-integrity and authenticity guarantees.
+Any tampering at any layer causes verification to fail, ensuring end-to-end integrity and authenticity guarantees.
 
 ### 5.8 What is the Matrix?
 
-The Matrix is a compact, flexible structure for transmitting state information.
-It uses a grid of cells, encoded with ASN.1 DER, to represent application-defined
-states with perfect structure, aligning with tightbeam's core constraint: **I(t) ∈ (0,1)**.
+The Matrix is a compact, flexible structure for transmitting state information. It uses a grid of cells, encoded with ASN.1 DER, to represent application-defined states with perfect structure, aligning with tightbeam's core constraint: **I(t) ∈ (0,1)**.
 
 #### 5.8.1 Why Use the Matrix?
 
@@ -941,13 +680,7 @@ The matrix enables applications to:
 
 #### 5.8.2 The Simple View
 
-The matrix is a 2D grid where each cell holds a number from 0 to 255, with
-meanings defined by the application (e.g., flags, counters, states, functions).
-Mathematically, it is a 2D array **M** of size **n × n** (**n ≤ 255**),
-with elements **M[r,c] ∈ {0, ..., 255}**.
-Maximum entropy for a full matrix is **H = n² log₂ 256 = 8n²** bits,
-assuming uniform distribution. Sparse matrices, using fewer cells, have lower
-entropy (e.g., 8k bits for k used cells).
+The matrix is a 2D grid where each cell holds a number from 0 to 255, with meanings defined by the application (e.g., flags, counters, states, functions). Mathematically, it is a 2D array **M** of size **n × n** (**n ≤ 255**), with elements **M[r,c] ∈ {0, ..., 255}**. Maximum entropy for a full matrix is **H = n² log₂ 256 = 8n²** bits, assuming uniform distribution. Sparse matrices, using fewer cells, have lower entropy (e.g., 8k bits for k used cells).
 
 **Key Dimensions**:
 1. **Row (r)**: 0 to **n-1**, vertical position.
@@ -1018,16 +751,11 @@ let frame = compose! {
 [0, 0, 0]
 ```
 
-This supports up to 255 flags, extensible by adding new diagonal entries.
-For structured data, use non-diagonal cells (e.g., **M[0,1] = 10** for a
-count, or map public keys to coordinate regions).
+This supports up to 255 flags, extensible by adding new diagonal entries. For structured data, use non-diagonal cells (e.g., **M[0,1] = 10** for a count, or map public keys to coordinate regions).
 
 #### 5.8.6 Advanced: Modeling with Matrix and Previous Frame
 
-The matrix, combined with the `previous_frame` field, enables sophisticated
-state tracking, modeled as a directed acyclic graph (DAG) of state transitions.
-Mathematically, frames form a Markov chain where each matrix **M_t** at time
-t depends on **M_{t-1}**, linked via cryptographic hashes in `previous_frame`.
+The matrix, combined with the `previous_frame` field, enables sophisticated state tracking, modeled as a directed acyclic graph (DAG) of state transitions. Mathematically, frames form a Markov chain where each matrix **M_t** at time `t` depends on **M_{t-1}**, linked via cryptographic hashes in `previous_frame`.
 
 **State Evolution**:
 - **Snapshots**: Each matrix **M_t** is a state snapshot, with entropy up to **8n²** bits.
@@ -1036,16 +764,11 @@ t depends on **M_{t-1}**, linked via cryptographic hashes in `previous_frame`.
 - **Branching**: Multiple frames sharing a `previous_frame` but differing in **M_t** represent alternative states.
 
 **Mathematical Model**:
-Applications define a transition probability **P(M_t | M_{t-1})**,
-where changes reflect logic or noise.
-For example, **I(t) = I(M_t; M_{t-1}) / H(M_t) ∈ (0,1)** may measure
-fidelity based on shared state, but I(t) is application-defined, constrained
-by hash consistency and partial state recovery.
+Applications define a transition probability **P(M_t | M_{t-1})**, where changes reflect logic or noise. For example, **I(t) = I(M_t; M_{t-1}) / H(M_t) ∈ (0,1)** may measure fidelity based on shared state, but I(t) is application-defined, constrained by hash consistency and partial state recovery.
 
 #### 5.8.7 Summary
 
-The matrix supports flexible state representation, from simple flags to
-structured data encoding allowing for dynamic computation.
+The matrix supports flexible state representation, from simple flags to structured data encoding allowing for dynamic computation.
 
 ### 5.9 Complete ASN.1 Module
 
@@ -1082,7 +805,7 @@ MessagePriority ::= ENUMERATED {
 	heartbeat(6)
 }
 
--- TightBeam-specific matrix structure
+-- tightbeam-specific matrix structure
 Matrix ::= SEQUENCE {
 	n     INTEGER (1..255),
 	data  OCTET STRING (SIZE(1..(255*255)))  -- MUST be exactly n*n octets; row-major
@@ -1112,21 +835,271 @@ Frame ::= SEQUENCE {
 END
 ```
 
-## 6. Implementation
+## 6. Security Model
 
-### 6.1 Requirements
+### 6.1 SecurityProfile Trait Architecture
 
-Implementations MUST provide:
+tightbeam uses a trait-based security profile system that separates compile-time algorithm constraints from runtime protocol behavior.
+
+#### Design Principles
+
+The `SecurityProfile` trait defines a pure metadata layer that declares algorithm identifiers (OIDs) for cryptographic operations:
+
+```rust
+pub trait SecurityProfile {
+	type DigestOid: AssociatedOid;
+	type AeadOid: AssociatedOid + AeadKeySize;
+	type SignatureAlg: SignatureAlgorithmIdentifier;
+	type CurveOid: AssociatedOid;
+	type KemOid: AssociatedOid;
+
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = None;
+}
+```
+
+#### Role-Based Provider Traits
+
+tightbeam separates cryptographic concerns through specialized provider traits:
+
+- **`DigestProvider`**: Hash/digest operations (SHA-256 ([FIPS 180-4][fips180-4]), SHA3-256 ([FIPS 202][fips202]), etc.)
+- **`AeadProvider`**: Authenticated encryption (AES-GCM variants)
+- **`SigningProvider`**: Signature generation and verification (ECDSA ([FIPS 186-5][fips186-5]), Ed25519 ([RFC 8032][rfc8032]))
+- **`KdfProvider`**: Key derivation functions (HKDF, [RFC 5869][rfc5869])
+- **`CurveProvider`**: Elliptic curve operations (secp256k1, P-384 ([RFC 5480][rfc5480]), X25519 ([RFC 7748][rfc7748]))
+
+These traits compose into `CryptoProvider`, allowing components to specify only the cryptographic capabilities they require rather than depending on the full provider.
+
+### 6.2 Security Profile Types
+
+Applications implement the `SecurityProfile` trait to define their own cryptographic algorithm constraints:
+
+#### Implementing Custom Profiles
+
+```rust
+// Example: Custom application profile
+pub struct MyAppProfile;
+
+impl SecurityProfile for MyAppProfile {
+	type DigestOid = Sha3_256;
+	type AeadOid = Aes256GcmOid;
+	type SignatureAlg = Secp256k1Signature;
+	type CurveOid = Secp256k1Oid;
+	type KemOid = Kyber1024Oid;
+
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
+}
+```
+
+#### Built-in Default Profile
+
+tightbeam provides `TightbeamProfile` as a reference implementation and default:
+
+```rust
+pub struct TightbeamProfile;
+
+impl SecurityProfile for TightbeamProfile {
+	type DigestOid = Sha3_256;
+	type AeadOid = Aes256GcmOid;
+	type SignatureAlg = Secp256k1Signature;
+	type CurveOid = Secp256k1Oid;
+	type KemOid = Kyber1024Oid;
+
+	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
+}
+```
+
+Applications can define multiple profiles for different security contexts (e.g., `HighSecurityProfile`, `LegacyProfile`, `QuantumResistantProfile`) and use them with different message types.
+
+### 6.3 Numeric Security Levels
+
+Numeric security levels are a convenience shorthand:
+- Level 1 or 2 → Sets `confidential + nonrepudiable + min_version = V1`
+- Does NOT enable algorithm OID validation (use type-based profiles for that)
+
+### 6.4 Message-Level Security Requirements
+
+tightbeam supports run-time security profile enforcement at the message type level through the `Message` trait and compile-time security enforcement at the message composition level:
+
+```rust
+pub trait Message: /* trait bounds */ {
+	const MIN_VERSION: Version = Version::V0;
+	const MUST_BE_NON_REPUDIABLE: bool = false;
+	const MUST_BE_CONFIDENTIAL: bool = false;
+	const MUST_BE_COMPRESSED: bool = false;
+	const MUST_BE_PRIORITIZED: bool = false;
+	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
+	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
+	const HAS_PROFILE: bool = false;
+	type Profile: SecurityProfile;
+}
+```
+
+#### Profile-Based Algorithm Constraints
+
+**HAS_PROFILE**: Controls whether the message type enforces algorithm constraints
+- When `false` (default): Message uses `TightbeamProfile` but does not enforce algorithm OID matching
+- When `true`: FrameBuilder validates that all cryptographic operations use algorithms from the message's `Profile` type
+
+**Profile Type**: Specifies which `SecurityProfile` implementation constrains algorithm selection
+- Defaults to `TightbeamProfile` if not specified
+- Can be set to any type implementing `SecurityProfile`
+- Affects compile-time validation when `HAS_PROFILE = true`
+
+**Algorithm Validation**: When `HAS_PROFILE = true`, the following validations occur at compile time:
+- Digest algorithms must match `<Profile::DigestOid as AssociatedOid>::OID`
+- AEAD ciphers must match `<Profile::AeadOid as AssociatedOid>::OID`
+- Signature algorithms must match `<Profile::SignatureAlg as SignatureAlgorithmIdentifier>::ALGORITHM_OID`
+
+This ensures that message types with specific security profiles can only be composed with compatible cryptographic algorithms.
+
+#### Security Requirement Semantics
+- When a message type specifies `MUST_BE_NON_REPUDIABLE = true`, the Frame MUST include a `nonrepudiation` field
+- When a message type specifies `MUST_BE_CONFIDENTIAL = true`, the Frame's metadata MUST include a `confidentiality` field
+- When a message type specifies `MUST_BE_COMPRESSED = true`, the Frame's metadata `compactness` field MUST NOT be `none`
+- When a message type specifies `MUST_BE_PRIORITIZED = true`, the Frame's metadata MUST include a `priority` field (V2+ only)
+- The Frame's `version` field MUST be >= the message type's `MIN_VERSION` requirement
+
+#### Profile Validation in FrameBuilder
+
+When composing frames with `FrameBuilder`, profile constraints are enforced at compile time if the message type has `HAS_PROFILE = true`:
+
+**Using the `compose!` Macro:**
+
+```rust
+// Example: Message with custom profile
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(profile(MyAppProfile))]
+struct SecureMessage { data: Vec<u8> }
+
+// compose! macro validates algorithm OIDs match MyAppProfile
+let frame = compose! {
+	V1: id: b"msg-001",
+		order: 1696521900,
+		message_integrity<Sha3_256>: salt,
+		confidentiality<Aes256GcmOid, _>: &cipher,
+		nonrepudiation<Secp256k1Signature, _>: &signing_key,
+		message: message
+}?;
+```
+
+**Using FrameBuilder Directly:**
+
+```rust
+// FrameBuilder validates algorithm OIDs match MyAppProfile
+let frame = compose::<SecureMessage>(Version::V1)
+	.with_message(msg)
+	.with_id(b"msg-001")
+	.with_order(timestamp)
+	.with_message_hasher::<Sha3_256>(salt)          // ✓ Matches MyAppProfile::DigestOid
+	.with_aead::<Aes256GcmOid, _>(&cipher)          // ✓ Matches MyAppProfile::AeadOid
+	.with_signer::<Secp256k1Signature, _>(&signer)  // ✓ Matches MyAppProfile::SignatureAlg
+	.build()?;
+```
+
+> Note: All tightbeam macros are entirely optional and contain underlying functionality and traits for direct/manual implementation.
+
+**Validation Rules**:
+- `with_message_hasher::<D>(salt)` validates `D::OID == Profile::DigestOid::OID`
+- `with_witness_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
+- `with_aead::<C, _>()` validates `C::OID == Profile::AeadOid::OID`
+- `with_signer::<S, _>()` validates `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`
+
+**Error Handling**: Algorithm mismatches return `TightBeamError::UnexpectedAlgorithmForProfile` with expected and received OIDs for debugging.
+
+#### Implementation Enforcement
+These requirements are enforced at:
+- **Compile Time**: Type system prevents composition of messages that do not meet requirements
+- **Runtime Validation**: Frame validation ensures expected frame shape to meet requirements
+- **Profile Compliance**: Security profiles can reference message types with specific requirements
+
+#### Derive Macro Usage
+
+The `#[derive(Beamable)]` macro implements the `Message` trait with these attributes:
+
+**Security attributes:**
+- `#[beam(message_integrity)]`, `#[beam(frame_integrity)]`
+- `#[beam(nonrepudiable)]`, `#[beam(confidential)]`
+- `#[beam(compressed)]`, `#[beam(prioritized)]`
+- `#[beam(min_version = "V1")]`
+
+**Profile attributes:**
+- `#[beam(profile = 1)]` or `#[beam(profile = 2)]` - Numeric levels (sets confidential + nonrepudiable, no OID validation)
+- `#[beam(profile(TypeName))]` - Type-based profile (enables compile-time OID validation)
+
+#### Example Message Types
+
+```rust
+// Numeric security level (convenience)
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(profile = 1)]
+struct PaymentInstruction { /* fields */ }
+
+// Type-based profile with algorithm enforcement
+#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+#[beam(profile(MyAppProfile), confidential, nonrepudiable, min_version = "V1")]
+struct HighSecurityTransfer { /* fields */ }
+```
+
+### 6.5 CryptoProvider System
+
+The `CryptoProvider` trait composes role-based provider traits to bind concrete cryptographic implementations to `SecurityProfile` metadata:
+
+```rust
+pub trait CryptoProvider:
+	Default +
+	Copy + // zero-sized type (ZST),
+	DigestProvider +
+	AeadProvider +
+	SigningProvider +
+	KdfProvider +
+	CurveProvider
+{
+	type Profile: SecurityProfile + Default;
+	fn profile(&self) -> &Self::Profile;
+}
+```
+
+**DefaultCryptoProvider**: Reference implementation combining:
+- **Digest**: SHA3-256 (Keccak-based hash)
+- **AEAD**: AES-256-GCM (authenticated encryption)
+- **Signature**: secp256k1 ECDSA (Bitcoin/Ethereum curve)
+- **KDF**: HKDF-SHA3-256 (key derivation)
+- **Curve**: secp256k1 (elliptic curve operations)
+
+### 6.6 Cryptographic Requirements
+
+- Integrity MUST use cryptographically secure hash functions
+- Confidentiality MUST use authenticated encryption (AEAD)
+- Non-repudiation MUST use digital signatures with secure key pairs
+
+### 6.7 Version Security
+
+- V0: No security features
+- V1: Optional integrity and confidentiality support
+- V2: Enhanced with priority, lifetime, and state chaining
+- V3: Enhanced with matrix controls
+
+### 6.8 ASN.1 Security Considerations
+
+- DER encoding prevents ambiguous parsing attacks
+- Context-specific tags prevent field confusion
+- Explicit versioning prevents downgrade attacks
+- Optional field handling prevents injection attacks
+
+## 7. Implementation
+
+### 7.1 Requirements
+
+Implementations MUST minimally provide:
 - Memory safety AND ownership guarantees (Rust)
 - Abstract Syntax Notation One (ASN.1) DER encoding/decoding
 - Frame and Metadata exactly as specified in ASN.1
 - Message-level security requirement enforcement
-- ASN.1 DER encoding/decoding
-
-Implementations MUST OPTIONALLY provide:
+- Frame composition and verification
 - Cryptographic abstraction for confidentiality, integrity and non-repudiation
+- Protocol abstraction for transport layer
 
-### 6.1.1 Message Security Enforcement
+### 7.1.1 Message Security Enforcement
 
 Implementations MUST enforce message-level security requirements through:
 
@@ -1139,24 +1112,21 @@ Implementations MUST enforce message-level security requirements through:
 - Frame validation against message type requirements during encoding/decoding
 - Graceful error handling for requirement violations
 
-### 6.2 Transport Layer
+### 7.2 Transport Layer
 
-tightbeam MUST operate over ANY transport protocol:
-- TCP (built-in async/sync support)
+tightbeam MUST operate over ANY transport protocol. The TCP transport layer is built-in and provides both synchronous and asynchronous support.
 
-### 6.3 Cryptographic Key Management
+### 7.3 Cryptographic Key Management
 
-tightbeam accepts standard key formats (X.509 certificates, raw key material, CMS structures)
-and delegates key lifecycle management to applications:
+tightbeam accepts standard key formats (X.509 certificates, raw key material, CMS structures) and delegates key lifecycle management ([NIST SP 800-57][nist-800-57]) to applications:
 
 - **Key Formats**: X.509 certificates, raw keys, CMS structures
 - **Handshake Protocols**: CMS-based and ECIES-based handshakes for session establishment
-- **Application Responsibilities**: Key generation, storage, rotation, certificate validation, revocation checking
+- **Application Responsibilities**: Key generation, storage, rotation, certificate validation, revocation checking ([RFC 6960][rfc6960])
 
 #### Trust Stores
 
-The `CertificateTrust` trait provides certificate chain verification and trust 
-anchor management. Trust stores are used for:
+The `CertificateTrust` trait provides certificate chain verification and trust anchor management. Trust stores are used for:
 - Verifying peer certificates during connection establishment
 - Validating certificate chains (root -> intermediate -> leaf)
 - Looking up signer certificates for frame signature verification
@@ -1178,39 +1148,15 @@ let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
     .build();
 ```
 
-## 7. Security Considerations
-
-### 7.1 Cryptographic Requirements
-
-- Integrity MUST use cryptographically secure hash functions
-- Confidentiality MUST use authenticated encryption (AEAD)
-- Non-repudiation MUST use digital signatures with secure key pairs
-
-### 7.2 Version Security
-
-- V0: No security features
-- V1: Optional integrity and confidentiality support
-- V2: Enhanced with priority, lifetime, and state chaining
-- V3: Enhanced with matrix controls
-
-### 7.3 ASN.1 Security Considerations
-
-- DER encoding prevents ambiguous parsing attacks
-- Context-specific tags prevent field confusion
-- Explicit versioning prevents downgrade attacks
-- Optional field handling prevents injection attacks
-
 ## 8. Transport Layer
 
 ### 8.1 Transport Architecture
 
-The tightbeam transport layer provides a pluggable framework for moving bytes
-between endpoints while enforcing security policies. The transport layer is
-responsible for the following:
+The tightbeam transport layer provides a pluggable framework for moving bytes between endpoints while enforcing security policies. The transport layer is responsible for the following:
 - Establishing connections
 - Sending and receiving messages
 - Enforcing security policies
-- Managing cryptographic state
+- Managing transmission cryptographic state
 
 #### 8.1.1 Design Principles
 
@@ -1243,8 +1189,7 @@ DER tag-length-value encoding provides inherent framing. Default size limits:
 
 ### 8.3 TCP Transport
 
-TCP transport bridges byte streams with message-oriented Frame API using DER
-length-prefixed envelopes. Supports both `std::net` (sync) and `tokio` (async).
+TCP transport bridges byte streams with message-oriented Frame API using DER length-prefixed envelopes. Supports both `std::net` (sync) and `tokio` (async).
 
 **Example:**
 ```rust
@@ -1300,8 +1245,8 @@ pub trait RestartPolicy: Send + Sync {
 	/// # Returns
 	/// * `RetryAction` - What action to take (retry with frame, or no retry)
 	fn evaluate(
-		&self, frame: Box<Frame>, 
-		failure: &TransportFailure, 
+		&self, frame: Box<Frame>,
+		failure: &TransportFailure,
 		attempt: usize
 	) -> RetryAction;
 }
@@ -1438,17 +1383,16 @@ let mut client = builder.connect(addr).await?;
 
 #### 8.5.1 Concept: Security Goals and Protocol Selection
 
-TightBeam implements two handshake protocols for mutual authentication and
-session key establishment:
+tightbeam implements two handshake protocols for mutual authentication and session key establishment:
 
-- **CMS-Based**: Full PKI with X.509 certificates, certificate validation chains, RFC 5652 compliance
+- **CMS-Based**: Full PKI with X.509 certificates, certificate validation chains, [RFC 5652][rfc5652] compliance
 - **ECIES-Based**: Lightweight alternative with minimal overhead
 
 **Security Goals:**
 - **Mutual Authentication**: Both parties prove identity via certificates
-- **Perfect Forward Secrecy**: Ephemeral ECDH keys ensure past sessions remain secure if long-term keys are compromised
+- **Perfect Forward Secrecy**: Ephemeral ECDH ([NIST SP 800-56A][nist-800-56a]) keys ensure past sessions remain secure if long-term keys are compromised
 - **Replay Protection**: Nonces prevent replay attacks
-- **Downgrade Prevention**: Transcript hash covers all handshake messages including profile negotiation
+- **Downgrade Prevention**: Transcript hash covers all handshake messages including profile negotiation ([RFC 8446][rfc8446] §4.1.3, analogous)
 - **Confidentiality**: Session keys derived via HKDF protect all subsequent messages
 
 #### 8.5.2 Specification: Handshake Flow and State Management
@@ -1516,8 +1460,7 @@ Uses RFC 5652 Cryptographic Message Syntax with:
 
 **Mutual Authentication Flow:**
 
-For mutual authentication, client includes certificate and signs transcript in
-ClientKeyExchange:
+For mutual authentication, client includes certificate and signs transcript in `ClientKeyExchange`:
 
 ```
 Client Side - Building ClientKeyExchange:
@@ -1567,9 +1510,7 @@ Server Side - Verifying Client Authentication:
 
 **Overview:**
 
-Lightweight alternative using ECIES (Elliptic Curve Integrated Encryption
-Scheme) for key encapsulation. Compact structures without ASN.1
-EnvelopedData/SignedData overhead requiring minimal wire format complexity.
+Lightweight alternative using ECIES (Elliptic Curve Integrated Encryption Scheme) for key encapsulation. Compact structures without ASN.1 EnvelopedData/SignedData overhead requiring minimal wire format complexity.
 
 **Key Differences from CMS:**
 - **Simplified Structure**: Raw ECIES encryption instead of nested CMS EnvelopedData
@@ -1579,8 +1520,7 @@ EnvelopedData/SignedData overhead requiring minimal wire format complexity.
 
 **Mutual Authentication Flow:**
 
-For mutual authentication, client includes certificate and signs transcript in
-ClientKeyExchange:
+For mutual authentication, client includes certificate and signs transcript in ClientKeyExchange:
 
 ```
 Client Side - Building ClientKeyExchange:
@@ -1692,7 +1632,7 @@ ECIES-Encrypt(plaintext, recipient_pub_key):
 | Signatures | SignedData structure | Raw signatures in ASN.1 |
 | Size Overhead | ~400-600 bytes | ~200-300 bytes |
 | Parsing Complexity | Multi-level ASN.1 nesting | Flat ASN.1 structures |
-| Standards Compliance | RFC 5652, RFC 5753 | SECG SEC 1 + custom ASN.1 |
+| Standards Compliance | RFC 5652, [RFC 5753][rfc5753] | [SECG SEC 1][secg-sec1] + custom ASN.1 |
 
 **Performance Characteristics:**
 
@@ -1712,8 +1652,7 @@ Both protocols provide identical security properties:
 
 #### 8.5.5 Security Profile Negotiation
 
-Both CMS and ECIES handshake protocols support cryptographic algorithm
-negotiation through `SecurityProfile` descriptors:
+Both CMS and ECIES handshake protocols support cryptographic algorithm negotiation through `SecurityProfile` descriptors:
 
 **Negotiation Process:**
 
@@ -1787,16 +1726,14 @@ let security_accept = SecurityAccept {
 | **Downgrade Attack** | Profile list in signed transcript | Transcript hash covers SecurityOffer/SecurityAccept |
 | **MITM** | Transcript signatures | Both parties sign transcript_hash; verified against certificates |
 | **Confidentiality** | ECDH + HKDF derived AEAD key | Session key never transmitted; derived from ECDH shared secret |
-| **Forward Secrecy** | Ephemeral client keys | New ephemeral key per handshake; compromise doesn't affect past sessions |
+| **Forward Secrecy** | Ephemeral client keys | New ephemeral key per handshake; compromise does not affect past sessions |
 | **DoS** | 16 KiB handshake size cap | Reject oversized handshake messages before processing |
 | **Certificate Forgery** | X.509 chain validation | Verify root of trust Note: Application responsibility |
 | **Nonce Reuse** | Monotonic counter + XOR | Per-message nonce derived from seed XOR counter |
 
 ### 8.6 Connection Pooling
 
-Connection pooling enables efficient connection reuse across multiple requests. 
-`ConnectionPool` uses a builder pattern where the pool is configured once 
-via `.builder()`, then `.connect()` retrieves connections from the pool.
+Connection pooling enables efficient connection reuse across multiple requests. `ConnectionPool` uses a builder pattern where the pool is configured once via `.builder()`, then `.connect()` retrieves connections from the pool.
 
 **Example**:
 
@@ -1822,8 +1759,7 @@ client.emit(frame, None).await?;
 
 ### 8.7 Audit
 
-The tightbeam transport layer and handshake protocols have not yet been
-independently audited. We welcome help in this area.
+The tightbeam transport layer and handshake protocols have not yet been independently audited. We welcome help in this area.
 
 ## 9. Network Theory
 
@@ -1833,41 +1769,28 @@ independently audited. We welcome help in this area.
 - Retry and Egress client policy
 - Service orchestration via Colony Monodomy/Polydomy patterns
 
-### 9.2 Efficient Exchange-Compute Interconnect
+### 9.2 Efficient Exchange-Interconnect-Compute
 
-The Efficient Exchange-Compute Interconnect or EECI is a software development
-paradigm inspired by the entomological world. As threads and tunnels underpin
-the basics of processing and communication, we can start at these base levels
-and develop from here. The goal of EECI is to operate on these base layers
-across any transmission protocol:
+The Efficient Exchange-Interconnect-Compute or EEIC is a software development paradigm inspired by the entomological world. As threads and tunnels underpin the basics of processing and communication, we can start at these base levels and develop from here. The goal of EEIC is to operate on these base layers across any transmission protocol:
 - thread-thread.
 - thread-protocol-thread.
 
 ### 9.3 Components
 
-There are four main components to EECI:
+There are four main components to EEIC:
 - [Workers](#931-e-workers) - Efficient processing units
 - [Servlets](#932-e-servlets) - Exchange endpoints
-- [Clusters](#933-c-clusters) - Compute orchestration
-- [Hives](#934-i-hives) - Interconnected infrastructure
+- [Hives](#933-i-hives) - Interconnected infrastructure
+- [Clusters](#934-c-clusters) - Compute orchestration
 
-Think of workers as ants, servlets as ant hills, and clusters as ant colonies.
-Insects have specific functions for which they process organic matter
-using local information. These functions are often simple, but when combined
-in large numbers, they can perform complex tasks. The efficiency of each unit
-is attributed to  their fungible nature--how well it can accomplish its
-singular task.
+Think of workers as ants, servlets as ant hills, and clusters as ant colonies. Insects have specific functions with which they process organic matter using local information. These functions are often simple, but when combined in large numbers, they can perform complex tasks. The efficiency of each unit is attributed to their fungible nature--how well it can accomplish its singular task.
 
 #### 9.3.1 E: Workers
 
-Workers are the smallest unit of computation in the EECI--the "ants" that do the
-actual work. They exist because of a fundamental insight: most business logic
-doesn't need network context. A function that doubles a number doesn't care
-whether the input came from TCP, UDP, or an in-memory channel. By isolating
-this logic into workers, we gain:
+Workers are the smallest unit of computation in the EEIC--the "ants" that do the actual work. They exist because of a fundamental insight: most business logic does not need network context. A function that doubles a number does not care whether the input came from TCP, UDP, or an in-memory channel. By isolating this logic into workers, we gain:
 
 - **Parallelism**: Multiple workers can process messages concurrently
-- **Fault Isolation**: A failing worker doesn't crash the servlet
+- **Fault Isolation**: A failing worker does not crash the servlet
 - **Testability**: Workers can be tested without network setup
 - **Reusability**: The same worker can serve multiple servlets
 
@@ -1879,17 +1802,13 @@ Workers are intentionally constrained:
 2. **Message-only**: Workers receive decoded messages, not raw Frames
 3. **Stateless between messages**: Configuration is fixed at creation time
 
-These constraints enable the parallelism and fault isolation that make EECI
-effective. Workers don't coordinate with each other--they just transform
-input to output.
+These constraints enable the parallelism and fault isolation that make EEIC effective. Workers do not coordinate with each other--they just transform input to output.
 
-> Note: It is highly discouraged to workaround the Frame limitation by passing
-	the Frame in a message parameter.
+> Note: It is highly discouraged to workaround the Frame limitation by passing the Frame in a message parameter--you should do something else.
 
 ##### The `worker!` Macro
 
-Workers follow an insect-inspired structure: a "head" (configuration), optional
-"receptors" (gates), a "thorax" (isolation container), and an "abdomen" (handler).
+Workers follow an insect-inspired structure: a "head" (configuration), optional "receptors" (gates), a "thorax" (isolation container), and an "abdomen" (handler).
 
 ```rust
 tightbeam::worker! {
@@ -1908,8 +1827,7 @@ tightbeam::worker! {
 }
 ```
 
-The handler receives the message, a trace collector for instrumentation, and the
-worker's configuration. It returns the output message type.
+The handler receives the message, a trace collector for instrumentation, and the worker's configuration. It returns the output message type.
 
 ##### Testing
 
@@ -1943,10 +1861,10 @@ tb_scenario! {
 		},
 		stimulus: |trace, worker| async move {
 			trace.event_with("worker_called", &[], ())?;
-			
+
 			let request = RequestMessage { content: "ping".to_string() };
 			let response = worker.relay(Arc::new(request)).await?;
-			
+
 			trace.event_with("response_received", &[], response.result)?;
 			Ok(())
 		}
@@ -1960,10 +1878,7 @@ The `environment Worker` syntax provides:
 
 #### 9.3.2 E: Servlets
 
-Servlets are the network endpoints of the EECI--the "anthills" where messages
-arrive and are processed. While workers handle pure business logic, servlets
-handle the protocol layer: accepting connections, decoding frames, dispatching
-to workers, and sending responses.
+Servlets are the network endpoints of the EEIC--the "anthills" where messages arrive and are processed. While workers handle pure business logic, servlets handle the protocol layer: accepting connections, decoding frames, dispatching to workers, and sending responses.
 
 ##### Architecture
 
@@ -1975,14 +1890,11 @@ Servlets sit between the network and workers:
 4. **Dispatch** to one or more workers for processing
 5. **Compose** the response Frame and send it back
 
-This separation means servlets handle concerns like connection management,
-frame validation, and response composition--things workers shouldn't know about.
+This separation means servlets handle concerns like connection management, frame validation, and response composition--things workers should not know about.
 
 ##### Single Message Type Rule
 
-Each servlet is responsible for exactly one message type. This keeps servlets
-focused and predictable. When you need to handle multiple related message types,
-use an ASN.1 Choice type to group them:
+Each servlet is responsible for exactly one message type. This keeps servlets focused and predictable. When you need to handle multiple related message types, use an ASN.1 Choice type to group them:
 
 ```rust
 // A Choice type groups related messages
@@ -1996,9 +1908,7 @@ pub enum CalcRequest {
 
 ##### Gate Policies
 
-Servlets can apply gate policies to filter or validate incoming messages before
-processing. Common use cases include rate limiting, authentication, and input
-validation:
+Servlets can apply gate policies to filter or validate incoming messages before processing:
 
 ```rust
 servlet! {
@@ -2023,7 +1933,7 @@ servlet! {
 ```rust
 #[derive(Clone)]
 pub struct PingPongServletConf {
-	pub lotto_number: u32,
+	pub service_name: String,
 }
 ```
 
@@ -2037,11 +1947,12 @@ tightbeam::servlet! {
 		// Access context members
 		let trace = ctx.trace();
 		let config: &PingPongServletConf = ctx.env_config()?;
+		trace.event_with("request_received", &[], config.service_name.clone())?;
 
 		// Handler receives Frame, not decoded message
 		let decoded = decode::<RequestMessage, _>(&frame.message)?;
 		let decoded_arc = Arc::new(decoded);
-		
+
 		// Workers are accessed via ctx.relay
 		let (ping_result, lucky_result) = tokio::join!(
 			ctx.relay::<PingPongWorker>(Arc::clone(&decoded_arc)),
@@ -2080,7 +1991,7 @@ let lucky_number_worker = LuckyNumberDeterminer::new(LuckyNumberDeterminerConf {
 
 // Build servlet configuration
 let servlet_conf = ServletConf::<TokioListener, RequestMessage>::builder()
-	.with_config(Arc::new(PingPongServletConf { lotto_number: 42 }))
+	.with_config(Arc::new(PingPongServletConf { service_name: "ping-pong".to_string() }))
 	.with_worker(ping_pong_worker)
 	.with_worker(lucky_number_worker)
 	.build();
@@ -2100,8 +2011,7 @@ When workers are added to a servlet via `ServletConf::builder().with_worker(work
 - Workers inherit the servlet's trace collector for instrumentation
 - All worker events are captured in the servlet's trace
 
-For standalone worker testing (outside servlets), use the `Worker` trait's 
-`start()` method explicitly:
+For standalone worker testing (outside servlets), use the `Worker` trait's `start()` method explicitly:
 ```rust
 let worker = MyWorker::new(config);
 let trace = Arc::new(TraceCollector::new());
@@ -2110,8 +2020,7 @@ let started_worker = worker.start(trace).await?;
 
 **Efficient Parallel Worker Processing**
 
-Workers accept `Arc<Input>` instead of owned `Input` to enable efficient
-parallel processing. When calling multiple workers in parallel:
+Workers accept `Arc<Input>` instead of owned `Input` to enable efficient parallel processing. When calling multiple workers in parallel:
 
 **Example using `tokio::join!`:**
 ```rust
@@ -2153,12 +2062,12 @@ tb_scenario! {
 		servlet: CalcServlet,
 		start: |trace, config| async move {
 			let worker = DoublerWorker::new(());
-			
+
 			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
 				.with_worker(worker)
 				.build();
-			
+
 			CalcServlet::start(trace, Some(servlet_conf)).await
 		},
 		setup: |servlet_addr, _config| async move {
@@ -2171,11 +2080,11 @@ tb_scenario! {
 				V0: id: b"calc-req",
 					message: CalcRequest { value: 5 }
 			}?;
-			
+
 			let response_frame = client.emit(request, None).await?
 				.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
-			
+
 			trace.event_with("result_verified", &[], response.result)?;
 			Ok(())
 		}
@@ -2188,28 +2097,169 @@ The `environment Servlet` syntax provides:
 - `setup`: Creates the client connection to the servlet
 - `client`: Sends requests and validates responses via trace events
 
-#### 9.3.3 C: Clusters
+#### 9.3.3 I: Hives
 
-Clusters are the "ant colonies" of the EECI--centralized gateways that coordinate
-distributed hives. While hives manage individual servlets, clusters provide the
-higher-level orchestration: routing work requests to the right hive, monitoring
-hive health, and balancing load across the swarm.
+Hives are the intermediary layer between clusters and servlets. While a servlet handles a single message type on a single listener, a hive can manage multiple servlets and coordinate with a cluster for work distribution. Think of hives as "ant nests" that house multiple specialized workers (servlets).
+
+##### Operating Modes
+
+Hives support two distinct operating modes:
+
+**Single-Servlet Mode** allows a hive to "morph" between different servlet types dynamically. The cluster sends an `ActivateServletRequest`, and the hive stops its current servlet and starts the requested one. This is useful for dynamic workload reallocation--a hive can switch from handling "analysis" requests to "calculation" requests based on cluster demand.
+
+**Multi-Servlet Mode** enables a hive to run all its registered servlets simultaneously, each on a different port. This requires a "mycelial" protocol (like TCP) that supports multiple endpoints. Call `establish_hive()` to spawn all servlets, then register with a cluster to advertise all available capabilities.
+
+The mode is determined by the protocol's capabilities. On mycelial protocols, you typically want multi-servlet mode for maximum throughput.
+
+##### Mycelial Protocols
+
+The term "mycelial" refers to protocols that can spawn multiple endpoints from a single base address--like how fungal mycelium branches from a central point. TCP is mycelial because a single host address (e.g., `192.168.1.100`) can bind multiple ports (`SocketAddress`). This allows a hive to spawn servlets on ports 8001, 8002, 8003, etc., each handling different message types.
+
+Non-mycelial protocols (like in-memory channels) are limited to single-servlet mode.
+
+##### The `hive!` Macro
+
+Define a hive type with its available servlets:
+
+```rust
+hive! {
+	pub MyHive,
+	protocol: TokioListener,
+	servlets: {
+		ping: PingServlet<PingRequest>,
+		calc: CalculatorServlet<CalcRequest>
+	}
+}
+```
+
+Add security policies to gate incoming messages:
+
+```rust
+hive! {
+	pub SecureHive,
+	protocol: TokioListener,
+	policies: {
+		with_collector_gate: [SignatureGate::new(verifying_key)]
+	},
+	servlets: {
+		ping: PingServlet<PingRequest>
+	}
+}
+```
+
+##### Hive Lifecycle
+
+A typical hive lifecycle with cluster integration:
+
+```rust
+// 1. Start the hive
+let mut hive = MyHive::start(trace, Some(HiveConf::default())).await?;
+
+// 2. Establish multi-servlet mode (spawns all servlets on separate ports)
+hive.establish_hive().await?;
+
+// 3. Register with cluster (announces available servlet types)
+let response = hive.register_with_cluster(cluster_addr).await?;
+
+// 4. Hive now receives work routed by the cluster
+
+// 5. Clean shutdown
+hive.stop();
+```
+
+##### Cluster Trust
+
+For hives to accept commands from a cluster (heartbeats, management requests), they must trust the cluster's certificate. Configure this via `HiveConf.trust_store`:
+
+```rust
+let hive_conf = HiveConf {
+	trust_store: Some(Arc::new(cluster_trust_store)),
+	..Default::default()
+};
+```
+
+Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores) for building trust stores from cluster certificates.
+
+##### Resilience Features
+
+Hives include built-in resilience mechanisms:
+
+**Backpressure**: When utilization exceeds the threshold (default: 90%), the hive signals to the cluster that it is overloaded. The cluster can then route new work to less-loaded hives.
+
+**Circuit Breaker**: After consecutive failures (default: 3), the circuit opens and the hive temporarily stops accepting work, allowing time for recovery before resuming.
+
+These are configured via `HiveConf`:
+
+```rust
+let hive_conf = HiveConf {
+	backpressure_threshold: BasisPoints::new(8000),  // 80%
+	circuit_breaker_threshold: 5,                    // Open after 5 failures
+	circuit_breaker_cooldown_ms: 60_000,             // 1 minute cooldown
+	..Default::default()
+};
+```
+
+##### Load Balancing and Routing
+
+When a hive manages multiple servlet instances of the same type (for scaling), it uses a `LoadBalancer` to select which instance handles each request. The default `LeastLoaded` strategy routes to the instance with lowest utilization.
+
+The `MessageRouter` determines which servlet type handles a given message. The default `TypeBasedRouter` uses the message's type information for routing.
+
+##### TLS Configuration
+
+For secure communication, configure TLS on the hive:
+
+```rust
+let tls_config = Arc::new(HiveTlsConfig {
+	certificate: CertificateSpec::Built(Box::new(cert)),
+	key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
+	validators: vec![],  // Optional: validate client certificates
+});
+
+let hive_conf = HiveConf {
+	hive_tls: Some(tls_config),
+	..Default::default()
+};
+```
+
+##### HiveConf Reference
+
+```rust
+pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedRouter> {
+	pub load_balancer: L,
+	pub router: R,
+	pub default_scale: ServletScaleConf,
+	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
+	pub cooldown: Duration,                         // Default: 5s
+	pub queue_capacity: u32,                        // Default: 100
+	pub backpressure_threshold: BasisPoints,        // Default: 9000 (90%)
+	pub circuit_breaker_threshold: u8,              // Default: 3
+	pub circuit_breaker_cooldown_ms: u64,           // Default: 30_000
+	pub servlet_pool_size: usize,                   // Default: 8
+	pub servlet_pool_idle_timeout: Option<Duration>,// Default: 30s
+	pub drain_timeout: Duration,                    // Default: 30s
+	pub trust_store: Option<Arc<dyn CertificateTrust>>,
+	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+}
+```
+
+##### Testing
+
+Hives are typically tested in the context of a cluster environment. See the [Cluster Testing](#cluster-testing) section below for examples using `environment Cluster`, which demonstrates how to configure hives with trust stores and verify cluster-hive communication.
+
+#### 9.3.4 C: Clusters
+
+Clusters are the "ant colonies" of the EEIC--centralized gateways that coordinate distributed hives. While hives manage individual servlets, clusters provide the higher-level orchestration: routing work requests to the right hive, monitoring hive health, and balancing load across the swarm.
 
 ##### Architecture
 
 A cluster operates as a gateway server with three primary responsibilities:
 
-1. **Hive Registry**: Maintains a dynamic registry of connected hives and their
-   available servlet types. Hives register themselves on startup, announcing
-   which servlet types they can handle.
+1. **Hive Registry**: Maintains a dynamic registry of connected hives and their available servlet types. Hives register themselves on startup, announcing which servlet types they can handle.
 
-2. **Work Routing**: Receives `ClusterWorkRequest` messages from external clients,
-   looks up which hives support the requested servlet type, selects one via load
-   balancing, and forwards the request.
+2. **Work Routing**: Receives `ClusterWorkRequest` messages from external clients, looks up which hives support the requested servlet type, selects one via load balancing, and forwards the request.
 
-3. **Health Monitoring**: Periodically sends heartbeats to all registered hives.
-   Unresponsive hives are evicted after consecutive failures, ensuring clients
-   are never routed to dead endpoints.
+3. **Health Monitoring**: Periodically sends heartbeats to all registered hives. Unresponsive hives are evicted after consecutive failures, ensuring clients are never routed to dead endpoints.
 
 ##### The `cluster!` Macro
 
@@ -2223,8 +2273,7 @@ cluster! {
 }
 ```
 
-The macro accepts an optional `digest` parameter for custom hash algorithms used
-in frame integrity verification:
+The macro accepts an optional `digest` parameter for custom hash algorithms used in frame integrity verification:
 
 ```rust
 cluster! {
@@ -2237,10 +2286,7 @@ cluster! {
 
 ##### Mutual TLS
 
-Clusters require TLS configuration for secure communication with hives. The cluster
-acts as a TLS client when connecting to hives, presenting its certificate for
-mutual authentication. This ensures both parties can verify identity before
-exchanging work.
+Clusters require TLS configuration for secure communication with hives. The cluster acts as a TLS client when connecting to hives, presenting its certificate for mutual authentication. This ensures both parties can verify identity before exchanging work.
 
 ```rust
 let tls = ClusterTlsConfig {
@@ -2250,19 +2296,14 @@ let tls = ClusterTlsConfig {
 };
 ```
 
-For hives to trust cluster commands (like heartbeats), they must have the cluster's
-certificate in their trust store. See [Trust Stores](#trust-stores) for details.
+For hives to trust cluster commands (like heartbeats), they must have the cluster's certificate in their trust store. See [Trust Stores](#trust-stores) for details.
 
 ##### Heartbeat Mechanism
 
-Clusters continuously monitor hive health through heartbeats. Each heartbeat is a
-signed frame sent to the hive, which responds with its current utilization. This
-serves two purposes:
+Clusters continuously monitor hive health through heartbeats. Each heartbeat is a signed frame sent to the hive, which responds with its current utilization. This serves two purposes:
 
-- **Liveness Detection**: Hives that fail to respond are marked unhealthy and
-  eventually evicted from the registry.
-- **Load Metrics**: Utilization data informs the load balancer, enabling smarter
-  routing decisions.
+- **Liveness Detection**: Hives that fail to respond are marked unhealthy and eventually evicted from the registry.
+- **Load Metrics**: Utilization data informs the load balancer, enabling smarter routing decisions.
 
 Configure heartbeat behavior via `HeartbeatConf`:
 
@@ -2285,11 +2326,7 @@ The `on_heartbeat` callback enables monitoring and metrics collection:
 
 ##### Load Balancing
 
-When multiple hives support the same servlet type, the cluster uses a `LoadBalancer`
-to select one. The default is `LeastLoaded`, which routes to the hive with the
-lowest reported utilization. Other strategies include `RoundRobin` and
-`PowerOfTwoChoices`. Custom strategies can be created by implementin the 
-`LoadBalancer` trait.
+When multiple hives support the same servlet type, the cluster uses a `LoadBalancer` to select one. The default is `LeastLoaded`, which routes to the hive with the lowest reported utilization. Other strategies include `RoundRobin` and `PowerOfTwoChoices`. Custom strategies can be created by implementing the `LoadBalancer` trait.
 
 ##### Work Request Flow
 
@@ -2337,7 +2374,7 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 }
 ```
 
-##### Testing
+##### Cluster Testing
 
 Clusters can be tested using `environment Cluster`:
 
@@ -2437,230 +2474,526 @@ The `environment Cluster` syntax provides:
 - `hives`: Creates hive instances that register with the cluster (receives trust from `start`)
 - `client`: Sends work requests and validates routing via trace events
 
-#### 9.3.4 I: Hives
-
-Hives are the intermediary layer between clusters and servlets. While a servlet
-handles a single message type on a single port, a hive can manage multiple servlets
-and coordinate with a cluster for work distribution. Think of hives as "ant nests"
-that house multiple specialized workers (servlets).
-
-##### Operating Modes
-
-Hives support two distinct operating modes:
-
-**Single-Servlet Mode** allows a hive to "morph" between different servlet types
-dynamically. The cluster sends an `ActivateServletRequest`, and the hive stops its
-current servlet and starts the requested one. This is useful for dynamic workload
-reallocation--a hive can switch from handling "ping" requests to "calculator"
-requests based on cluster demand.
-
-**Multi-Servlet Mode** enables a hive to run all its registered servlets
-simultaneously, each on a different port. This requires a "mycelial" protocol
-(like TCP) that supports multiple endpoints. Call `establish_hive()` to spawn all
-servlets, then register with a cluster to advertise all available capabilities.
-
-The mode is determined by the protocol's capabilities. On mycelial protocols, you
-typically want multi-servlet mode for maximum throughput.
-
-##### Mycelial Protocols
-
-The term "mycelial" refers to protocols that can spawn multiple endpoints from a
-single base address--like how fungal mycelium branches from a central point. TCP
-is mycelial because a single host address (e.g., `192.168.1.10`) can bind multiple
-ports. This allows a hive to spawn servlets on ports 8001, 8002, 8003, etc., each
-handling different message types.
-
-Non-mycelial protocols (like in-memory channels) are limited to single-servlet mode.
-
-##### The `hive!` Macro
-
-Define a hive type with its available servlets:
-
-```rust
-hive! {
-	pub MyHive,
-	protocol: TokioListener,
-	servlets: {
-		ping: PingServlet<PingRequest>,
-		calc: CalculatorServlet<CalcRequest>
-	}
-}
-```
-
-Add security policies to gate incoming messages:
-
-```rust
-hive! {
-	pub SecureHive,
-	protocol: TokioListener,
-	policies: {
-		with_collector_gate: [SignatureGate::new(verifying_key)]
-	},
-	servlets: {
-		ping: PingServlet<PingRequest>
-	}
-}
-```
-
-##### Hive Lifecycle
-
-A typical hive lifecycle with cluster integration:
-
-```rust
-// 1. Start the hive
-let mut hive = MyHive::start(trace, Some(HiveConf::default())).await?;
-
-// 2. Establish multi-servlet mode (spawns all servlets on separate ports)
-hive.establish_hive().await?;
-
-// 3. Register with cluster (announces available servlet types)
-let response = hive.register_with_cluster(cluster_addr).await?;
-
-// 4. Hive now receives work routed by the cluster
-
-// 5. Clean shutdown
-hive.stop();
-```
-
-##### Cluster Trust
-
-For hives to accept commands from a cluster (heartbeats, management requests),
-they must trust the cluster's certificate. Configure this via `HiveConf.trust_store`:
-
-```rust
-let hive_conf = HiveConf {
-	trust_store: Some(Arc::new(cluster_trust_store)),
-	..Default::default()
-};
-```
-
-Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores)
-for building trust stores from cluster certificates.
-
-##### Resilience Features
-
-Hives include built-in resilience mechanisms:
-
-**Backpressure**: When utilization exceeds the threshold (default: 90%), the hive
-signals to the cluster that it's overloaded. The cluster can then route new work
-to less-loaded hives.
-
-**Circuit Breaker**: After consecutive failures (default: 3), the circuit opens
-and the hive temporarily stops accepting work, allowing time for recovery before
-resuming.
-
-These are configured via `HiveConf`:
-
-```rust
-let hive_conf = HiveConf {
-	backpressure_threshold: BasisPoints::new(8000),  // 80%
-	circuit_breaker_threshold: 5,                    // Open after 5 failures
-	circuit_breaker_cooldown_ms: 60_000,             // 1 minute cooldown
-	..Default::default()
-};
-```
-
-##### Load Balancing and Routing
-
-When a hive manages multiple servlet instances of the same type (for scaling), it
-uses a `LoadBalancer` to select which instance handles each request. The default
-`LeastLoaded` strategy routes to the instance with lowest utilization.
-
-The `MessageRouter` determines which servlet type handles a given message. The
-default `TypeBasedRouter` uses the message's type information for routing.
-
-##### TLS Configuration
-
-For secure communication, configure TLS on the hive:
-
-```rust
-let tls_config = Arc::new(HiveTlsConfig {
-	certificate: CertificateSpec::Built(Box::new(cert)),
-	key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
-	validators: vec![],  // Optional: validate client certificates
-});
-
-let hive_conf = HiveConf {
-	hive_tls: Some(tls_config),
-	..Default::default()
-};
-```
-
-##### HiveConf Reference
-
-```rust
-pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedRouter> {
-	pub load_balancer: L,
-	pub router: R,
-	pub default_scale: ServletScaleConf,
-	pub servlet_overrides: HashMap<Vec<u8>, ServletScaleConf>,
-	pub cooldown: Duration,                         // Default: 5s
-	pub queue_capacity: u32,                        // Default: 100
-	pub backpressure_threshold: BasisPoints,        // Default: 9000 (90%)
-	pub circuit_breaker_threshold: u8,              // Default: 3
-	pub circuit_breaker_cooldown_ms: u64,           // Default: 30_000
-	pub servlet_pool_size: usize,                   // Default: 8
-	pub servlet_pool_idle_timeout: Option<Duration>,// Default: 30s
-	pub drain_timeout: Duration,                    // Default: 30s
-	pub trust_store: Option<Arc<dyn CertificateTrust>>,
-	pub hive_tls: Option<Arc<HiveTlsConfig>>,
-}
-```
-
-##### Testing
-
-Hives are typically tested in the context of a cluster environment. See the
-[Cluster Testing](#testing) section above for examples using `environment Cluster`,
-which demonstrates how to configure hives with trust stores and verify cluster-hive
-communication.
-
 ##### Conclusion
 
-How you wish to model your colonies is beyond the scope of this document.
-However, it is important to understand the basic building blocks and how they
-can be combined to create complex systems. The swarm is yours to command.
+How you wish to model your colonies is beyond the scope of this document. However, it is important to understand the basic building blocks and how they can be combined to create complex systems. The swarm is yours to command.
 
-## 10. Testing Framework
+## 10. Instrumentation
 
-The tightbeam testing framework provides three progressive verification layers
-for rigorous behavioral testing of protocol implementations.
+This section normatively specifies the tightbeam instrumentation subsystem. Instrumentation produces a semantic event sequence consumed by verification logic. Tests MUST NOT assert against instrumentation events procedurally--inspecting or branching on individual events at runtime. Instead, tests MUST declare expectations as a spec, and verification MUST treat the finalized event stream as the authoritative ground truth for a single execution.
 
-### 10.1 Architecture and Concepts
+Feature Gating:
+- Instrumentation can be enabled only by the standalone crate feature `instrument`.
 
-The tightbeam testing framework is built on two foundational concepts from
-formal methods and statistical testing theory:
+### 10.1 Objectives
+- Emission MUST be amortized O(1) per event.
+- Ordering MUST be strictly increasing by sequence number per trace.
+- Evidence artifacts MUST be deterministic and hash‑stable given identical executions.
+- Detail level MUST be feature‑gated to avoid unnecessary overhead.
+- Payload handling MUST preserve privacy (hash or summarize; never emit secret raw bytes).
+
+### 10.2 Event Kind Taxonomy
+Each event MUST have one kind from a closed, feature‑gated set:
+- External: `gate_accept`, `gate_reject`, `request_recv`, `response_send`
+- Assertion: `assert_label`, `assert_payload`
+- Internal (hidden): `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`
+- Process (requires `testing-csp`): `process_transition`, `process_hidden`
+- Exploration (requires `testing-fdr`): `seed_start`, `seed_end`, `state_expand`, `state_prune`, `divergence_detect`, `refusal_snapshot`, `enabled_set_sample`
+- Meta: `start`, `end`, `warn`, `error`
+
+Hidden/internal events MUST use the internal category.
+
+Instrumentation events are also identified by **URNs** defined in `tightbeam::utils::urn::specs::TightbeamUrnSpec`. The `TightbeamUrnSpec` format `urn:tightbeam:instrumentation:<resource_type>/<resource_id>` provides stable names for traces, events, seeds, and verdicts, and is used by the instrumentation subsystem to label evidence artifacts.
+
+**Shorthand Event Matching**: In `tb_assert_spec!` and `tb_process_spec!`, you can use shorthand labels instead of full URNs. The shorthand `"foo"` matches any event containing `instrumentation:event/foo`, such as `urn:tightbeam:instrumentation:event/foo` or `urn:custom:instrumentation:event/foo`.
+
+### 10.3 Event Structure
+Conceptual fixed layout (names illustrative):
+```
+trace_id | seq | kind | label? | payload? | phase? | dur_ns? | flags | extras
+```
+Requirements:
+- `trace_id` MUST uniquely identify the execution instance.
+- `seq` MUST start at 0 and increment by 1 for each emitted event.
+- `kind` MUST be a valid taxonomy member.
+- `label` MUST be present for assertion and labeled process events; otherwise absent.
+- `payload` MAY be present only if the label is declared payload‑capable.
+- `phase` SHOULD map to one of: Gate, Handler, Assertion, Response, Crypto, Compression, Routing, Policy, Process, Exploration.
+- `dur_ns` MAY appear on exit or boundary events and MUST represent a monotonic duration in nanoseconds.
+- `flags` MUST represent a bitset (e.g. ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
+- `extras` MAY supply fixed numeric slots and a bounded byte sketch for extended metrics (e.g. enabled set cardinality).
+
+### 10.4 Payload Representation
+Runtime values captured under `assert_payload` MUST be transformed before emission:
+- Algorithm: SHA3‑256 digest over canonical byte representation.
+- Representation: First 32 bytes (full SHA3‑256 output) MUST be stored; NO truncation below 32 bytes.
+- Literal integers MAY be emitted directly as 64‑bit unsigned values IF NOT sensitive.
+- Structured values SHOULD emit a static schema tag plus digest.
+
+> Warning: Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
+
+### 10.5 Configuration
+Instrumentation behavior MUST be controlled by a configuration object (conceptual fields). Configuration existence itself is gated by `instrument`:
+```rust
+TbInstrumentationConfig {
+	enable_payloads: bool,
+	enable_internal_detail: bool,
+	sample_enabled_sets: bool,
+	sample_refusals: bool,
+	divergence_heuristics: bool,
+	max_events: u32,
+	record_durations: bool,
+}
+```
+Defaults (instrument only):
+- `enable_payloads = false`
+- `enable_internal_detail = false`
+- `sample_enabled_sets = false`
+- `sample_refusals = false`
+- `divergence_heuristics = false`
+- `record_durations = false`
+- `max_events = 1024`
+
+Layer Interaction (informative): Enabling testing layers does NOT alter these defaults; tests MAY explicitly override fields per scenario.
+
+If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, emit a single `warn` event, and drop subsequent events.
+
+### 10.6 Evidence Artifact Format
+For every finalized trace an artifact MUST be producible in a canonical binary form (ASN.1 DER).
+
+Canonical ASN.1 DER Schema (conceptual):
+```
+EvidenceArtifact ::= SEQUENCE {
+	specHash   OCTET STRING,               -- SHA3-256(spec definition)
+	traceId    INTEGER,                    -- Unique per execution
+	seed       INTEGER OPTIONAL,           -- Exploration seed (testing-fdr only)
+	outcome    ENUMERATED { acceptResponse(0), acceptNoResponse(1), reject(2), error(3) },
+	metrics    SEQUENCE {
+		countEvents   INTEGER,
+		durationNs    INTEGER OPTIONAL,
+		overflow      BOOLEAN OPTIONAL
+	},
+	events     SEQUENCE OF Event
+}
+
+Event ::= SEQUENCE {
+	i           INTEGER,                   -- sequence number
+	k           ENUMERATED { start(0), end(1), warn(2), error(3), gate_accept(4), gate_reject(5), request_recv(6), response_send(7), assert_label(8), assert_payload(9), handler_enter(10), handler_exit(11), crypto_step(12), compress_step(13), route_step(14), policy_eval(15), process_transition(16), process_hidden(17), seed_start(18), seed_end(19), state_expand(20), state_prune(21), divergence_detect(22), refusal_snapshot(23), enabled_set_sample(24) },
+	l           UTF8String OPTIONAL,       -- label
+	payloadHash OCTET STRING OPTIONAL,     -- SHA3-256(payload canonical bytes) if captured
+	durationNs  INTEGER OPTIONAL,          -- monotonic duration for boundary/exit events
+	flags       BIT STRING OPTIONAL,       -- ASSERT_FAIL | HIDDEN | DIVERGENCE | OVERFLOW ...
+	extras      OCTET STRING OPTIONAL      -- bounded auxiliary metrics sketch
+}
+```
+
+Binary Serialization Requirements:
+- DER MUST omit absent OPTIONAL fields.
+- Field ordering MUST follow the schema strictly.
+- BIT STRING unused bits MUST be zero.
+- `payloadHash` MUST be 32 bytes when present (SHA3-256).
+
+Artifact Integrity:
+- `trace_hash` MUST be SHA3-256 over the DER encoding of the Events sequence ONLY (excluding surrounding fields).
+- `evidence_hash` SHOULD be SHA3-256(specHash || trace_hash) where `||` denotes raw byte concatenation.
+
+Privacy:
+- Raw payload bytes MUST NOT appear; only hashed representation or numeric scalar (non-sensitive) values MAY be represented.
+
+### 10.7 Failure Handling
+- Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
+- Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
+
+### 10.8 Logging Subsystem
+
+Implements [RFC 5424][rfc5424]-compliant logging with trait-based backends.
+
+#### RFC 5424 Severity Levels
+
+```rust
+pub enum LogLevel {
+	Emergency = 0,
+	Alert = 1,
+	Critical = 2,
+	Error = 3,
+	Warning = 4,
+	Notice = 5,
+	Info = 6,
+	Debug = 7,
+}
+```
+
+#### LogBackend Trait
+
+```rust
+pub trait LogBackend: Send + Sync {
+	fn emit(&self, record: &LogRecord) -> Result<(), LogError>;
+	fn accepts(&self, level: LogLevel) -> bool;
+	fn flush(&self) -> Result<(), LogError> { Ok(()) }
+}
+```
+
+Built-in backends: `StdoutBackend` (std only), `MultiplexBackend` (fan-out).
+
+#### Log Filtering
+
+```rust
+let filter = LogFilter::new(LogLevel::Warning)
+	.with_component("security", LogLevel::Debug);
+```
+
+#### Integration
+
+```rust
+use tightbeam::trace::{TraceConfig, logging::*};
+
+let backend = Box::new(StdoutBackend);
+let filter = LogFilter::new(LogLevel::Warning);
+let config = LoggerConfig::new(backend, filter)
+	.with_default_level(LogLevel::Info);
+
+let trace: TraceCollector = TraceConfig::builder()
+	.with_logger(config)
+	.build();
+
+trace.event("msg")?.with_log_level(LogLevel::Error).emit();
+```
+
+> Note: The event emit may be ellided as events are emitted on drop.
+
+## 11. Misc
+
+### 11.1 Utilities
+
+tightbeam provides a small `utils` module family for cross-cutting concerns.
+
+#### 11.1.1 URNs
+
+**Module**: `tightbeam::utils::urn`
+
+The URN subsystem provides:
+
+- `Urn<'a>`: [RFC 8141][rfc8141]-compliant `urn:<nid>:<nss>` representation.
+- `UrnBuilder`: a fluent builder for constructing and validating URNs from either a raw NID/NSS or structured components.
+- `UrnSpec` / `UrnValidationError`: traits and error types for namespace‑specific validation logic.
+- `tightbeam::utils::urn::specs::TightbeamUrnSpec`: a built‑in spec for instrumentation URNs of the form `urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
+
+`TightbeamUrnSpec` constrains:
+
+- **`resource_type`**: one of `trace`, `event`, `seed`, `verdict` (case‑insensitive, normalized to lowercase), and
+- **`resource_id`**: an application‑defined identifier that must match an alphanumeric‑with‑hyphen pattern.
+
+These URNs can be used by applications to name any kind of resource in a stable, parseable way. Internally, they are also used by the instrumentation subsystem (§10) to tag traces, events, seeds, and verdicts with globally unique identifiers for evidence artifacts and external analysis.
+
+**Example: Building a custom application URN**
+
+```rust
+use tightbeam::utils::urn::{UrnBuilder, UrnValidationError};
+
+fn build_customer_urn() -> Result<(), UrnValidationError> {
+	let urn = UrnBuilder::default()
+		.with_nid("example")
+		.with_nss("customer:1234")
+		.build()?;
+
+	assert_eq!(urn.to_string(), "urn:example:customer:1234");
+
+	Ok(())
+}
+```
+
+#### 11.1.2 Jobs
+
+**Module**: `tightbeam::utils::task`
+
+The `job!` macro implements the **Command Pattern** for encapsulating executable units of work as zero-sized types (ZST). Jobs provide a lightweight abstraction for reusable, composable, and testable logic without runtime overhead.
+
+**Imports**:
+
+```rust
+// Macros are exported at crate root
+use tightbeam::job;
+
+// Traits and types are in utils::task
+use tightbeam::utils::task::{Job, AsyncJob, Pipeline, join};
+```
+
+**Key Properties**:
+- **Zero-Cost**: Generates a ZST struct with a single static method
+- **Namespace Organization**: Groups related functionality under a type name
+- **Composable**: Jobs can be passed as types and invoked uniformly
+- **Testable**: Stateless functions are easy to test in isolation
+- **Protocol Independence**: Works with both sync and async execution contexts
+
+**Design Rationale**: Jobs serve as a fundamental behavioral unit in tightbeam, analogous to functions-as-objects in object-oriented design. They provide a consistent interface for executable commands across different contexts.
+
+**Syntax**:
+
+```rust
+// Async job with tuple input (implements AsyncJob trait)
+job! {
+	name: JobName,
+	async fn run((param1, param2): (Type1, Type2)) -> ReturnType {
+		// Implementation
+	}
+}
+
+// Sync job with tuple input (implements Job trait)
+job! {
+	name: JobName,
+	fn run((param1, param2): (Type1, Type2)) -> ReturnType {
+		// Implementation
+	}
+}
+
+// No-parameter job (implements Job/AsyncJob with Input = ())
+job! {
+	name: NoParamJob,
+	fn run() -> ReturnType {
+		// Implementation
+	}
+}
+```
+
+**Traits**:
+
+The `job!` macro automatically implements marker traits for job handling:
+
+```rust
+/// Synchronous job trait
+pub trait Job {
+	type Input;
+	type Output;
+	fn run(input: Self::Input) -> Self::Output;
+}
+
+/// Asynchronous job trait
+pub trait AsyncJob {
+	type Input;
+	type Output;
+	fn run(input: Self::Input) -> impl Future<Output = Self::Output> + Send;
+}
+```
+
+#### 11.1.3 Job Pipelines
+
+**Module**: `tightbeam::utils::task`
+
+The `Pipeline` trait extends Rust's `Result<T, E>` with job composition capabilities, making Result itself a pipeline. This design enables seamless integration between jobs and standard Rust code with zero learning curve.
+
+**Imports**:
+
+```rust
+use tightbeam::job;  // Macro for creating jobs
+use tightbeam::utils::task::{Pipeline, join};
+```
+
+**Core Concept**: If you know how to use `Result`, you already know how to use pipelines.
+
+**Design Principles**:
+
+1. **Result is a Pipeline** - `Result<T, E>` implements `Pipeline` directly
+2. **Organic Integration** - Mix jobs with standard Result methods seamlessly
+3. **Minimal Learning Curve** - Uses familiar Result methods (`and_then`, `map`, `or_else`)
+4. **Optional Trace** - Use `PipelineBuilder` for automatic trace event emission
+5. **Idiomatic Rust** - Follows Result/Future conventions
+
+**Basic Usage - Jobs as Pipelines**:
+
+```rust
+use tightbeam::utils::task::Pipeline;
+
+// Jobs return Results, which are pipelines
+let frame = CreateHandshakeRequest::run(client_id, nonce)
+	.map(|req| req.with_timestamp(now()))             // Core Result::map
+	.and_then(|req| ValidateRequest::run(req))        // Job
+	.map_err(|e| TightBeamError::ValidationFailed(e)) // Core Result::map_err
+	.and_then(|req| SendRequest::run(req))            // Another job
+	.run()?;                                          // Execute the pipeline
+```
+
+**Mixed Composition**:
+
+```rust
+// Start from existing Result
+let config: Result<Config, Error> = parse_config_file(path);
+
+// Chain jobs onto it organically
+config
+	.and_then(|cfg| ValidateConfig::run(cfg))
+	.and_then(|cfg| SaveConfig::run(cfg))
+	.map(|_| "Configuration saved successfully")
+	.and_then(|msg| NotifyUser::run(msg))
+	.run()?;
+```
+
+**Parallel Execution with `join()`**:
+
+```rust
+use tightbeam::utils::task::join;
+
+// Both return Results, both implement Pipeline
+let (encrypted, signed) = join(
+	EncryptPayload::run(payload),
+	SignPayload::run(payload)
+).run()?;
+
+// Use results
+SendRequest::run(encrypted, signed)?;
+```
+
+**Fallback Handling**:
+
+```rust
+// Fallback to alternative on error
+let frame = SendRequest::run(request)
+	.or(|| UseCachedResponse::run())  // Try fallback on error
+	.or_else(|e| HandleError::run(e)) // Error recovery
+	.run()?;
+```
+
+**Automatic Trace with `PipelineBuilder`**:
+
+When you need trace event emission, use `PipelineBuilder` to create a traced pipeline. Job names are automatically converted to snake_case URN events:
+
+```rust
+use tightbeam::utils::task::PipelineBuilder;
+
+// Create pipeline with trace context
+PipelineBuilder::new(trace)
+	.start((client_id, nonce))
+	// Auto-emits: urn:tightbeam:instrumentation:event/create_handshake_request_start
+	//             urn:tightbeam:instrumentation:event/create_handshake_request_success
+	.and_then(|(id, n)| CreateHandshakeRequest::run(id, n))
+	.map(|req| req.validate())  // No trace event (standard map)
+	// Auto-emits: urn:tightbeam:instrumentation:event/validate_request_*
+	.and_then(|req| ValidateRequest::run(req))
+	// Auto-emits: urn:tightbeam:instrumentation:event/send_request_*
+	.and_then(|req| SendRequest::run(req))
+	.run()?;
+```
+
+**Testing Integration**:
+
+Pipelines work seamlessly with `tb_scenario!`:
+
+```rust
+// L1: Assertion specification
+tb_assert_spec! {
+	pub PipelineSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			// Shorthand labels match full URNs
+			("create_handshake_request_start", exactly!(1)),
+			("create_handshake_request_success", exactly!(1)),
+			("validate_request_start", exactly!(1)),
+			("validate_request_success", exactly!(1))
+		]
+	}
+}
+
+// L2: CSP process specification
+tb_process_spec! {
+	pub PipelineProcess,
+	events {
+		observable {
+			"create_handshake_request_start",
+			"create_handshake_request_success",
+			"validate_request_start",
+			"validate_request_success"
+		}
+		hidden {}
+	}
+	states {
+		Idle     => { "create_handshake_request_start" => Creating },
+		Creating => { "create_handshake_request_success" => Validating },
+		Validating => { "validate_request_start" => ValidatingRun },
+		ValidatingRun => { "validate_request_success" => Done },
+		Done => {}
+	}
+	terminal { Done }
+}
+
+tb_scenario! {
+	name: test_pipeline_workflow,
+	config: ScenarioConf::builder()
+		.with_spec(PipelineSpec::latest())
+		.with_csp(PipelineProcess)
+		.build(),
+	environment Pipeline {
+		exec: |pipeline| {
+			let input = ("test-001".to_string(), "nonce".to_string());
+			pipeline
+				.start(input)
+				.and_then(|x| CreateHandshakeRequest::run(x, nonce))
+				.map(|req| req.with_metadata())
+				.and_then(|req| ValidateRequest::run(req))
+				.run()
+		}
+	}
+}
+```
+
+**Complete Example**:
+
+```rust
+use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
+
+// Mix everything: jobs, Results, parallel execution, fallbacks, trace
+let session_id = PipelineBuilder::new(trace)
+	.start(client_id)
+	// Job with auto-trace
+	.and_then(|id| CreateHandshakeRequest::run(id, nonce))
+	// Standard Result operation
+	.map(|req| req.add_timestamp(now()))
+	// Parallel execution
+	.and_then(|req| {
+		let encrypted = EncryptPayload::run(payload);
+		let signed = SignPayload::run(payload);
+
+		join(encrypted, signed).map(|(e, s)| (req, e, s))
+	})
+	// Send request
+	.and_then(|(req, enc, sig)| SendRequest::run((req, enc, sig)))
+	// Fallback on error
+	.or(|| UseCachedResponse::run())
+	// Error recovery
+	.or_else(|e| HandleError::run(e))
+	// Extract result
+	.and_then(|resp| ExtractSessionId::run(resp))
+	.run()?;
+```
+
+## 12. Testing Framework
+
+The tightbeam testing framework provides three progressive verification layers for rigorous behavioral testing of protocol implementations.
+
+### 12.1 Architecture and Concepts
+
+The tightbeam testing framework is built on two foundational concepts from formal methods and statistical testing theory:
 
 #### Communicating Sequential Processes (CSP)
 
-CSP is a formal language for describing patterns of interaction in concurrent
-systems, developed by Tony Hoare.[^hoare1978][^roscoe2010] In tightbeam, CSP
-provides the mathematical foundation for modeling protocol behavior as labeled
-transition systems (LTS). Each process specification defines:
+CSP is a formal language for describing patterns of interaction in concurrent systems, developed by Tony Hoare.[^hoare1978][^roscoe2010] In tightbeam, CSP provides the mathematical foundation for modeling protocol behavior as labeled transition systems (LTS). Each process specification defines:
 
 - **Alphabet (Σ, τ)**: Observable events visible to the environment (Σ) and hidden internal events (τ)
 - **State Space**: Named states representing protocol phases
 - **Transitions**: Labeled edges defining valid state changes
 - **Refinement**: Hierarchical relationship where implementation traces must be valid specification traces
 
-CSP enables us to express protocol correctness as refinement relations:
-`Implementation ⊑ Specification`, where ⊑ denotes trace refinement (⊑T) or
-failures refinement (⊑F).
+CSP enables us to express protocol correctness as refinement relations: `Implementation ⊑ Specification`, where ⊑ denotes trace refinement (⊑T) or failures refinement (⊑F).
 
 #### Failures-Divergences Refinement (FDR)
 
-FDR is a model checking methodology that verifies CSP refinement relations
-through exhaustive exploration.[^fdr4] The framework checks three key
-properties:
+FDR is a model checking methodology that verifies CSP refinement relations through exhaustive exploration.[^fdr4] The framework checks three key properties:
 
 1. **Trace Refinement (⊑T)**: Every observable trace of the implementation is a valid trace of the specification
 2. **Failures Refinement (⊑F)**: The implementation cannot refuse events that the specification accepts at any state
 3. **Divergence Freedom**: The system cannot enter infinite internal-only loops (livelock)
 
-In tightbeam, FDR-style verification uses multi-seed exploration to account for
-scheduler nondeterminism in cooperatively scheduled systems. This approach,
-based on research by Pedersen & Chalmers,[^pedersen2024] recognizes that
-refinement verification in systems with cooperative scheduling depends on
-resource availability and execution interleaving.
+In tightbeam, FDR-style verification uses multi-seed exploration to account for scheduler nondeterminism in cooperatively scheduled systems. This approach, based on research by Pedersen & Chalmers,[^pedersen2024] recognizes that refinement verification in systems with cooperative scheduling depends on resource availability and execution interleaving.
 
 #### Integration in tightbeam
 
@@ -2669,13 +3002,11 @@ The three-layer architecture progressively applies these concepts:
 - **Layer 2 (CSP)**: State machine modeling with observable/hidden event distinction
 - **Layer 3 (FDR)**: Refinement checking via multi-seed exploration
 
-This progressive approach allows developers to start with simple assertions and
-incrementally add formal verification as protocol complexity grows.
+This progressive approach allows developers to start with simple assertions and incrementally add formal verification as protocol complexity grows.
 
-#### 10.1.1 Three-Layer Progressive Verification
+#### 12.1.1 Three-Layer Progressive Verification
 
-Tightbeam implements formal verification through three complementary layers,
-each building upon the previous:
+tightbeam implements formal verification through three complementary layers, each building upon the previous:
 
 | Layer | Feature Flag | Purpose | Specification | Usage |
 |-------|--------------|---------|---------------|-------|
@@ -2683,20 +3014,13 @@ each building upon the previous:
 | L2 ProcessSpec | `testing-csp` | CSP state machine modeling | `tb_process_spec!` | Optional: `.with_csp()` |
 | L3 Refinement | `testing-fdr` | Trace/failures refinement | Inline config | Optional: `.with_fdr()` |
 
-**Layer 1 (Assertions)**: Verifies that expected events occur with correct
-cardinality. This provides basic behavioral correctness through declarative
-assertion specifications.
+**Layer 1 (Assertions)**: Verifies that expected events occur with correct cardinality. This provides basic behavioral correctness through declarative assertion specifications.
 
-**Layer 2 (CSP Process Models)**: Adds formal state machine modeling using
-Communicating Sequential Processes (CSP) theory. Validates that execution traces
-follow valid state transitions and distinguishes between observable (external)
-and hidden (internal) events.
+**Layer 2 (CSP Process Models)**: Adds formal state machine modeling using Communicating Sequential Processes (CSP) theory. Validates that execution traces follow valid state transitions and distinguishes between observable (external) and hidden (internal) events.
 
-**Layer 3 (FDR Refinement)**: Enables multi-seed exploration for exhaustive
-verification of trace refinement, failures refinement, and divergence freedom.
-Based on FDR (Failures-Divergences Refinement) model checking methodology.
+**Layer 3 (FDR Refinement)**: Enables multi-seed exploration for exhaustive verification of trace refinement, failures refinement, and divergence freedom. Based on FDR (Failures-Divergences Refinement) model checking methodology.
 
-#### 10.1.2 Unified Entry Point: tb_scenario!
+#### 12.1.2 Unified Entry Point: tb_scenario!
 
 All three layers are accessed through the `tb_scenario!` macro, which provides:
 - Consistent syntax across all verification layers
@@ -2705,7 +3029,7 @@ All three layers are accessed through the `tb_scenario!` macro, which provides:
 - Instrumentation integration
 - Policy enforcement
 
-#### 10.1.3 Feature Flag Architecture
+#### 12.1.3 Feature Flag Architecture
 
 The testing framework uses progressive feature flags:
 - `testing`: Enables L1 assertion verification (foundation)
@@ -2714,25 +3038,22 @@ The testing framework uses progressive feature flags:
 - `testing-timing`: Enables timing verification (WCET, deadline, jitter, slack) - requires `testing`
 - `testing-schedulability`: Enables schedulability analysis (RMA/EDF) - requires `testing-timing`
 
-Each layer builds on the previous, ensuring consistent semantics across
-verification levels.
+Each layer builds on the previous, ensuring consistent semantics across verification levels.
 
-### 10.2 Layer 1: Assertion Specifications
+### 12.2 Layer 1: Assertion Specifications
 
-#### 10.2.1 Concept
+#### 12.2.1 Concept
 
-AssertSpec defines expected behavioral invariants through declarative assertion
-specifications. Each specification version declares:
+AssertSpec defines expected behavioral invariants through declarative assertion specifications. Each specification version declares:
 - Expected assertion labels (event identifiers)
 - Cardinality constraints (exactly, at_least, at_most, between)
 - Value assertions (equals) for verifying assertion payload values
 - Execution mode (Accept, Reject)
 - Gate policy (Accepted, Rejected, etc.)
 
-Specifications are versioned using semantic versioning (major.minor.patch) and
-produce deterministic SHA3-256 hashes over their canonical representation.
+Specifications are versioned using semantic versioning (major.minor.patch) and produce deterministic SHA3-256 hashes over their canonical representation.
 
-#### 10.2.2 Specification: tb_assert_spec! Syntax
+#### 12.2.2 Specification: tb_assert_spec! Syntax
 
 ```rust
 tb_assert_spec! {
@@ -2779,7 +3100,7 @@ V(major, minor, patch): {
 ```
 
 **Deterministic Hashing**: Each version produces a 32-byte SHA3-256 hash over:
-- Domain tag `"TBSP"` (TightBeam Spec Protocol)
+- Domain tag `"TBSP"` (tightbeam Spec Protocol)
 - Version triple (major, minor, patch)
 - Spec identifier
 - Mode code
@@ -2789,7 +3110,7 @@ V(major, minor, patch): {
 - Optional event kinds
 - Optional schedulability parameters (when `testing-schedulability` enabled)
 
-#### 10.2.3 Implementation Examples
+#### 12.2.3 Implementation Examples
 
 **Basic Specification**:
 ```rust
@@ -2816,7 +3137,7 @@ tb_assert_spec! {
 }
 ```
 
-#### 10.2.4 Generated API
+#### 12.2.4 Generated API
 
 Each `tb_assert_spec!` generates a type with the following methods:
 
@@ -2833,7 +3154,7 @@ impl MySpec {
 }
 ```
 
-#### 10.2.5 Cardinality Helpers
+#### 12.2.5 Cardinality Helpers
 
 The framework provides cardinality constraint macros:
 - `exactly!(n)`: Exactly n occurrences
@@ -2843,7 +3164,7 @@ The framework provides cardinality constraint macros:
 - `present!()`: At least one occurrence
 - `absent!()`: Zero occurrences
 
-#### 10.2.6 Value Assertion Helpers
+#### 12.2.6 Value Assertion Helpers
 
 The framework provides value assertion helpers for verifying assertion payload values:
 - `equals!(value)`: Verify assertion value equality
@@ -2851,14 +3172,14 @@ The framework provides value assertion helpers for verifying assertion payload v
 **Supported Types**:
 - **Primitives**: `String`, `&str`, `bool`, `u8`, `u32`, `u64`, `i32`, `i64`, `f64`
 - **Numeric literals**: `equals!(3_600)`, `equals!(42u32)`
-- **Enums**: `MessagePriority`, `Version` (e.g., `equals!(MessagePriority::High)`, `equals!(Version::V2)`)
+- **Enums**: `MessagePriority`, `Version` (e.g., `equals!(MessagePriority::LowLatency)`, `equals!(Version::V2)`)
 - **Options**: `equals!(Some(value))`, `equals!(None)`
 - **Option presence**: `equals!(IsSome)` (matches any `Some(_)`), `equals!(IsNone)` (matches `None`)
 
 **Examples**:
 ```rust
 assertions: [
-	("priority", exactly!(1), equals!(MessagePriority::High)),
+	("priority", exactly!(1), equals!(MessagePriority::LowLatency)),
 	("lifetime", exactly!(1), equals!(3_600)),
 	("version", exactly!(1), equals!(Version::V2)),
 	("confidentiality", exactly!(1), equals!(IsSome)),
@@ -2866,11 +3187,11 @@ assertions: [
 ]
 ```
 
-#### 10.2.7 Tag-Based Assertion Filtering
+#### 12.2.7 Tag-Based Assertion Filtering
 
 Assertions can be tagged with arbitrary string labels for flexible categorization and filtering. Tags enable version-scoped testing where a single scenario can validate multiple protocol versions.
 
-#### 10.2.8 Recording Trace Events
+#### 12.2.8 Recording Trace Events
 
 `TraceCollector` exposes two entry points:
 
@@ -2926,14 +3247,11 @@ tb_scenario! {
 }
 ```
 
-All such events are emitted via the instrumentation subsystem described in §11.
-Layer 1–3 verification operates over this event stream as the authoritative
-trace for a single execution.
+All such events are emitted via the instrumentation subsystem described in §10. Layer 1–3 verification operates over this event stream as the authoritative trace for a single execution.
 
-#### 10.2.9 Schedulability Analysis
+#### 12.2.9 Schedulability Analysis
 
-Assertion specs support schedulability verification via the `schedulability: { }` 
-block when `testing-schedulability` is enabled:
+Assertion specs support schedulability verification via the `schedulability: { }` block when `testing-schedulability` is enabled:
 
 ```rust
 schedulability: {
@@ -2948,17 +3266,13 @@ Supported schedulers:
 - **Earliest Deadline First (EDF)**: Dynamic priority scheduling with utilization bound ≤ 1.0
 - **Response Time Analysis (RTA)**: Exact schedulability test for both RMA and EDF
 
-Additional features include percentile-based WCET analysis (P50-P99.99), 
-confidence intervals, and fixed-point arithmetic for deterministic calculations.
-See §10.3.5 for timing constraints in process specifications
+Additional features include percentile-based WCET analysis (P50-P99.99), confidence intervals, and fixed-point arithmetic for deterministic calculations. See §12.3.5 for timing constraints in process specifications
 
-### 10.3 Layer 2: Process Specifications (CSP)
+### 12.3 Layer 2: Process Specifications (CSP)
 
-#### 10.3.1 Concept
+#### 12.3.1 Concept
 
-ProcessSpec defines labeled transition systems (LTS) for formal process
-modeling using Communicating Sequential Processes (CSP) theory. A process
-specification declares:
+ProcessSpec defines labeled transition systems (LTS) for formal process modeling using Communicating Sequential Processes (CSP) theory. A process specification declares:
 - **Observable alphabet (Σ)**: External events visible to the environment
 - **Hidden alphabet (τ)**: Internal events not visible externally
 - **State space**: Named states and their transitions
@@ -2967,7 +3281,7 @@ specification declares:
 
 Enabled with `testing-csp` feature flag.
 
-#### 10.3.2 Specification: tb_process_spec! Syntax
+#### 12.3.2 Specification: tb_process_spec! Syntax
 
 ```rust
 tb_process_spec! {
@@ -3003,7 +3317,7 @@ tb_process_spec! {
 }
 ```
 
-#### 10.3.3 Validation Rules
+#### 12.3.3 Validation Rules
 
 When CSP is configured via `.with_csp()` in `tb_scenario!`:
 
@@ -3011,7 +3325,7 @@ When CSP is configured via `.with_csp()` in `tb_scenario!`:
 2. **Runtime**: Observed events MUST form valid CSP trace (framework tracks state)
 3. **Post-Execution**: Trace MUST terminate in valid terminal state
 
-#### 10.3.4 Example: CSP Process Specification
+#### 12.3.4 Example: CSP Process Specification
 
 ```rust
 use tightbeam::testing::*;
@@ -3032,10 +3346,9 @@ tb_process_spec! {
 }
 ```
 
-#### 10.3.5 Timing and Schedulability Verification
+#### 12.3.5 Timing and Schedulability Verification
 
-When `testing-timing` is enabled, process specifications support timing 
-constraints and timed automata semantics.
+When `testing-timing` is enabled, process specifications support timing constraints and timed automata semantics.
 
 **Timing Constraints:**
 
@@ -3064,25 +3377,18 @@ Timing violations automatically prune traces during FDR exploration:
 - Path-based WCET violations prune compositional violations
 - Timed transitions filter based on guard satisfaction
 
-When `testing-schedulability` is also enabled, timing constraints and task 
-periods are combined into task sets for Rate Monotonic or EDF analysis. 
-See §10.2.9 for schedulability configuration in assertion specs.
+When `testing-schedulability` is also enabled, timing constraints and task periods are combined into task sets for Rate Monotonic or EDF analysis. See §12.2.9 for schedulability configuration in assertion specs.
 
-#### 10.3.6 Process Composition: tb_compose_spec!
+#### 12.3.6 Process Composition: tb_compose_spec!
 
-In addition to individual `ProcessSpec` models, tightbeam supports **composed
-processes** via the `CompositionSpec` trait and the `tb_compose_spec!` macro.
-Compositions allow you to build larger CSP models from smaller ones using
-standard parallel composition operators:
+In addition to individual `ProcessSpec` models, tightbeam supports **composed processes** via the `CompositionSpec` trait and the `tb_compose_spec!` macro. Compositions allow you to build larger CSP models from smaller ones using standard parallel composition operators:
 
 - **Synchronized**: All shared events synchronize (`P || Q`)
 - **Interleaved**: No synchronization, pure interleaving (`P ||| Q`)
 - **Interface**: Synchronize on an explicit event set (`P [| A |] Q`)
 - **Alphabetized**: Per-process alphabets with synchronization on intersection (`P [| αP | αQ |] Q`)
 
-The `tb_compose_spec!` macro generates a type that implements `CompositionSpec`
-and, via a blanket impl, `ProcessSpec`, so it can be used anywhere a process
-spec is expected (including with `.with_csp()` in `tb_scenario!`).
+The `tb_compose_spec!` macro generates a type that implements `CompositionSpec` and, via a blanket impl, `ProcessSpec`, so it can be used anywhere a process spec is expected (including with `.with_csp()` in `tb_scenario!`).
 
 **Example: Interleaved request/response and retry flows**
 
@@ -3142,19 +3448,13 @@ tb_scenario! {
 }
 ```
 
-Composition properties (`deadlock_free`, `livelock_free`, `deterministic`) are
-checked by the composition verification layer (§10.4, §10.5) and provide an
-early sanity check before enabling full FDR refinement.
+Composition properties (`deadlock_free`, `livelock_free`, `deterministic`) are checked by the composition verification layer (§12.4, §12.5) and provide an early sanity check before enabling full FDR refinement.
 
-### 10.4 Layer 3: Refinement Checking (FDR)
+### 12.4 Layer 3: Refinement Checking (FDR)
 
-#### 10.4.1 Concept
+#### 12.4.1 Concept
 
-Refinement checking provides multi-seed exploration for trace and failures
-refinement verification. Formal definitions of traces, failures, and divergences
-are given in §10.1.1 and §10.5; this section focuses on configuration and
-verdict structure. Based on the Failures-Divergences Refinement (FDR)
-methodology from CSP theory. Enabled with `testing-fdr` feature flag.
+Refinement checking provides multi-seed exploration for trace and failures refinement verification. Formal definitions of traces, failures, and divergences are given in §12.1.1 and §12.5; this section focuses on configuration and verdict structure. Based on the Failures-Divergences Refinement (FDR) methodology from CSP theory. Enabled with `testing-fdr` feature flag.
 
 **Verification Properties**:
 - **Trace Refinement (⊑T)**: All observed traces ∈ spec traces
@@ -3162,11 +3462,9 @@ methodology from CSP theory. Enabled with `testing-fdr` feature flag.
 - **Divergence Freedom**: No internal-only loops exceeding threshold
 - **Determinism**: Branching only at declared nondeterministic states
 
-**Requirements**: Layer 3 requires `testing-fdr` feature flag. Refinement
-checking requires the `specs` field in `FdrConfig` to be populated with
-specification processes.
+**Requirements**: Layer 3 requires `testing-fdr` feature flag. Refinement checking requires the `specs` field in `FdrConfig` to be populated with specification processes.
 
-#### 10.4.2 Specification: FdrConfig Syntax
+#### 12.4.2 Specification: FdrConfig Syntax
 
 ```rust
 fdr: FdrConfig {
@@ -3197,22 +3495,16 @@ fdr: FdrConfig {
 - `specs`: Specification processes for refinement checking (empty vector = exploration mode)
 - `fail_fast`: Stop on first refinement violation (default: true)
 - `expect_failure`: Expect refinement to fail for negative tests (default: false)
-- `scheduler_count` / `process_count` (feature `testing-fault`): Optional
-  resource-modeling parameters where `scheduler_count ≤ process_count`; when
-  set, refinement explores traces under constrained scheduler availability
-  (§10.5.4).
-- `scheduler_model` (feature `testing-fault`): Chooses between cooperative and
-  preemptive scheduler models for refinement.
-- `fault_model` (feature `testing-fault`): Enables CSP state-driven fault
-  injection during FDR exploration (e.g., link drops, node failures).
-- `fmea_config` (feature `testing-fmea`): Configures Failure Modes and Effects
-  Analysis integrated with refinement runs.
+- `scheduler_count` / `process_count` (feature `testing-fault`): Optional resource-modeling parameters where `scheduler_count ≤ process_count`; when set, refinement explores traces under constrained scheduler availability (§12.5.4).
+- `scheduler_model` (feature `testing-fault`): Chooses between cooperative and preemptive scheduler models for refinement.
+- `fault_model` (feature `testing-fault`): Enables CSP state-driven fault injection during FDR exploration (e.g., link drops, node failures).
+- `fmea_config` (feature `testing-fmea`): Configures Failure Modes and Effects Analysis integrated with refinement runs.
 
 **Operational Modes**:
 - **Mode 1** (specs empty): Single-process exploration - verifies determinism, deadlock freedom, divergence freedom
 - **Mode 2** (specs provided): Refinement checking - verifies Spec ⊑ Impl (trace/failures/divergence refinement)
 
-#### 10.4.3 Implementation Examples
+#### 12.4.3 Implementation Examples
 
 **Simple Example**:
 ```rust
@@ -3268,11 +3560,9 @@ tb_scenario! {
 }
 ```
 
-#### 10.4.4 Multi-Seed Exploration
+#### 12.4.4 Multi-Seed Exploration
 
-The `seeds` parameter controls how many different execution paths are explored
-during verification. Each seed produces a different scheduling of concurrent
-operations, uncovering race conditions and nondeterministic behavior:
+The `seeds` parameter controls how many different execution paths are explored during verification. Each seed produces a different scheduling of concurrent operations, uncovering race conditions and nondeterministic behavior:
 
 ```rust
 fdr: FdrConfig {
@@ -3280,11 +3570,9 @@ fdr: FdrConfig {
 	// ...
 }
 ```
-Each seed explores different interleaving at nondeterministic choice points,
-verifying trace refinement, failures refinement, and divergence freedom across
-all executions.
+Each seed explores different interleaving at nondeterministic choice points, verifying trace refinement, failures refinement, and divergence freedom across all executions.
 
-#### 10.4.5 FDR Verdict Structure
+#### 12.4.5 FDR Verdict Structure
 
 After multi-seed exploration, tightbeam produces a verdict:
 
@@ -3335,37 +3623,27 @@ pub struct FdrVerdict {
 - **deadlock_witness**: (seed, trace, state) if found
 - **failing_seed**: Seed that caused failure, if any
 
-**Note**: Refinement properties (trace_refines, failures_refines,
-divergence_refines) are only meaningful when specs are provided in FdrConfig.
+> Note: Refinement properties (trace_refines, failures_refines, divergence_refines) are only meaningful when specs are provided in FdrConfig.
 
-### 10.5 Formal CSP Theory
+### 12.5 Formal CSP Theory
 
-#### 10.5.1 Three Semantic Models
+#### 12.5.1 Three Semantic Models
 
-| CSP Model | Tightbeam Layer | Verification Property | Refinement Check |
+| CSP Model | tightbeam Layer | Verification Property | Refinement Check |
 |-----------|-----------------|----------------------|------------------|
 | **Traces (T)** | L1 AssertSpec | Observable event sequences | traces(Impl) ⊆ traces(Spec) |
 | **Stable Failures (F)** | L2 ProcessSpec | Valid refusals at choice points | failures(Impl) ⊆ failures(Spec) |
 | **Failures-Divergences (FD)** | L3 FDR | Livelock freedom (no τ-loops) | divergences(Impl) = ∅ |
 
-**Traces Model**: Verifies that all observable event sequences produced by the
-implementation are allowed by the specification. This ensures basic behavioral
-correctness - the system never produces an unexpected sequence of external events.
+**Traces Model**: Verifies that all observable event sequences produced by the implementation are allowed by the specification. This ensures basic behavioral correctness - the system never produces an unexpected sequence of external events.
 
-**Stable Failures Model**: Extends trace verification by checking what events a
-process can *refuse* after each trace. A stable state is one where no internal
-progress (τ-transitions) can occur. At choice points, the implementation must
-not refuse events the specification accepts, preventing incorrect nondeterminism.
+**Stable Failures Model**: Extends trace verification by checking what events a process can *refuse* after each trace. A stable state is one where no internal progress (τ-transitions) can occur. At choice points, the implementation must not refuse events the specification accepts, preventing incorrect nondeterminism.
 
-**Failures-Divergences Model**: Adds divergence detection to identify processes
-that can make infinite internal progress without external interaction. A divergence
-is a τ-loop where the process never becomes stable. The `max_internal_run`
-parameter bounds consecutive hidden events to detect such livelocks.
+**Failures-Divergences Model**: Adds divergence detection to identify processes that can make infinite internal progress without external interaction. A divergence is a τ-loop where the process never becomes stable. The `max_internal_run` parameter bounds consecutive hidden events to detect such livelocks.
 
-#### 10.5.2 Observable vs. Hidden Events
+#### 12.5.2 Observable vs. Hidden Events
 
-CSP distinguishes between observable events (external alphabet Σ) and hidden
-events (internal actions τ). This distinction is fundamental to process refinement:
+CSP distinguishes between observable events (external alphabet Σ) and hidden events (internal actions τ). This distinction is fundamental to process refinement:
 
 ```rust
 tb_process_spec! {
@@ -3381,27 +3659,21 @@ tb_process_spec! {
 }
 ```
 
-**Observable events** represent the process's contract with its environment.
-These form the basis of trace refinement - implementations and specifications must
-agree on observable behavior.
+**Observable events** represent the process's contract with its environment. These form the basis of trace refinement - implementations and specifications must agree on observable behavior.
 
-**Hidden events** model internal implementation details. They enable refinement
-checking where implementations contain details absent from abstract specifications.
-Hidden events are projected away when comparing traces: `trace \ {τ}`.
+**Hidden events** model internal implementation details. They enable refinement checking where implementations contain details absent from abstract specifications. Hidden events are projected away when comparing traces: `trace \ {τ}`.
 
-The instrumentation taxonomy (§11.2) maps tightbeam events to categories:
+The instrumentation taxonomy (§10.2) maps tightbeam events to categories:
 - **Observable**: `gate_accept`, `gate_reject`, `request_recv`, `response_send`, `assert_label`
 - **Hidden (τ)**: `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`, `process_hidden`
 
-#### 10.5.3 Nondeterministic Choice and Refusal Sets
+#### 12.5.3 Nondeterministic Choice and Refusal Sets
 
 CSP provides two choice operators:
 - **External choice (□)**: Environment selects which event occurs
 - **Internal choice (⊓)**: Process selects non-deterministically
 
-At choice points, a process has an *acceptance set* (events it can engage) and
-*refusal set* (events it cannot engage in stable state). Failures refinement
-ensures implementations don't introduce invalid refusals:
+At choice points, a process has an *acceptance set* (events it can engage) and *refusal set* (events it cannot engage in stable state). Failures refinement ensures implementations do not introduce invalid refusals:
 
 ```rust
 states {
@@ -3414,21 +3686,13 @@ states {
 choice { Processing }  // Annotate nondeterministic states
 ```
 
-The `choice` annotation declares states where internal nondeterminism may occur.
-FDR exploration uses different seeds to explore all possible nondeterministic
-branches, ensuring the specification covers all implementation behaviors.
+The `choice` annotation declares states where internal nondeterminism may occur. FDR exploration uses different seeds to explore all possible nondeterministic branches, ensuring the specification covers all implementation behaviors.
 
-#### 10.5.4 Multi-Seed Exploration and Scheduler Interleaving
+#### 12.5.4 Multi-Seed Exploration and Scheduler Interleaving
 
-Based on research by Pedersen & Chalmers,[^pedersen2024] refinement in cooperatively
-scheduled systems depends on resource availability. With `n` concurrent processes
-and `m` schedulers where `m < n`, some traces become impossible due to scheduling
-constraints.
+Based on research by Pedersen & Chalmers,[^pedersen2024] refinement in cooperatively scheduled systems depends on resource availability. With `n` concurrent processes and `m` schedulers where `m < n`, some traces become impossible due to scheduling constraints.
 
-**Tightbeam addresses this through multi-seed exploration**: Each seed represents
-a different scheduling strategy, exploring alternative interleaving of concurrent
-events. This is analogous to testing with different numbers of schedulers to
-verify behavior across resource constraints:
+**tightbeam addresses this through multi-seed exploration**: Each seed represents a different scheduling strategy, exploring alternative interleaving of concurrent events. This is analogous to testing with different numbers of schedulers to verify behavior across resource constraints:
 
 ```rust
 fdr: FdrConfig {
@@ -3439,16 +3703,14 @@ fdr: FdrConfig {
 }
 ```
 
-At nondeterministic choice points, the seed determines which branch to explore.
-Across all seeds, the framework verifies that:
+At nondeterministic choice points, the seed determines which branch to explore. Across all seeds, the framework verifies that:
 1. **Trace refinement**: All observable traces are valid
 2. **Failures refinement**: No invalid refusals at choice points
 3. **Divergence freedom**: No seed produces infinite τ-loops
 
-#### 10.5.5 CSPM Export for FDR4 Integration
+#### 12.5.5 CSPM Export for FDR4 Integration
 
-Tightbeam can export process specifications as CSPM (CSP Machine-readable)
-format for verification with external tools like FDR4:[^fdr4]
+tightbeam can export process specifications as CSPM (CSP Machine-readable) format for verification with external tools like FDR4:[^fdr4]
 
 ```rust
 use tightbeam::testing::fdr::CspmExporter;
@@ -3471,7 +3733,7 @@ This enables:
 2. **Algebraic proofs** using CSP laws and theorems
 3. **Integration** with existing CSP toolchains and specifications
 
-#### 10.5.6 Trace Analysis Extensions
+#### 12.5.6 Trace Analysis Extensions
 
 The `FdrTraceExt` trait extends `ConsumedTrace` with CSP-specific analysis:
 
@@ -3514,15 +3776,13 @@ hooks {
 }
 ```
 
-These queries enable CSP-style reasoning about process behavior at specific 
-states, validating that the implementation matches the formal specification.
+These queries enable CSP-style reasoning about process behavior at specific states, validating that the implementation matches the formal specification.
 
-### 10.6 Fault Injection
+### 12.6 Fault Injection
 
-Fault injection enables systematic error testing through CSP state-driven fault 
-injection during refinement checking. Requires `testing-fault` feature flag.
+Fault injection enables systematic error testing through CSP state-driven fault injection during refinement checking. Requires `testing-fault` feature flag.
 
-#### 10.6.1 FaultModel Configuration
+#### 12.6.1 FaultModel Configuration
 
 ```rust
 use tightbeam::testing::{FaultModel, InjectionStrategy};
@@ -3538,7 +3798,7 @@ let fault_model = FaultModel::from(InjectionStrategy::Deterministic)
 	.with_seed(0xDEADBEEF);           // Reproducibility
 ```
 
-#### 10.6.2 Injection Strategies
+#### 12.6.2 Injection Strategies
 
 **Deterministic (Counter-Based):**
 ```rust
@@ -3546,7 +3806,7 @@ InjectionStrategy::Deterministic
 ```
 - Call counters per event label
 - Predictable fault sequences
-- Ideal for DO-178C DAL A, IEC 61508 SIL 4
+- Ideal for [DO-178C][do-178c] DAL A, [IEC 61508][iec-61508] SIL 4
 
 **Random (Seeded RNG):**
 ```rust
@@ -3556,7 +3816,7 @@ InjectionStrategy::Random
 - Statistical coverage analysis
 - Same seed produces same fault sequence
 
-#### 10.6.3 Type-Safe State and Event Identifiers
+#### 12.6.3 Type-Safe State and Event Identifiers
 
 Generate type-safe enums via `tb_gen_process_types!`:
 
@@ -3582,7 +3842,7 @@ pub trait ProcessEvent: Copy + Debug {
 }
 ```
 
-#### 10.6.4 Integration with FDR
+#### 12.6.4 Integration with FDR
 
 ```rust
 fdr: FdrConfig {
@@ -3593,18 +3853,13 @@ fdr: FdrConfig {
 }
 ```
 
-Faults are injected during CSP exploration before state transitions. Injected 
-faults are recorded in `FdrVerdict::faults_injected` with full traceability 
-(state, event, error message, probability).
+Faults are injected during CSP exploration before state transitions. Injected faults are recorded in `FdrVerdict::faults_injected` with full traceability (state, event, error message, probability).
 
-**Example:** See `tightbeam/tests/fault/basic.rs` for a full fault injection 
-demonstration.
+**Example:** See `tightbeam/tests/fault/basic.rs` for a full fault injection demonstration.
 
-### 10.7 Unified Testing: tb_scenario! Macro
+### 12.7 Unified Testing: tb_scenario! Macro
 
-The `tb_scenario!` macro is the unified entry point for all testing layers,
-executing AssertSpec verifications under selectable environments with optional
-CSP and FDR verification.
+The `tb_scenario!` macro is the unified entry point for all testing layers, executing AssertSpec verifications under selectable environments with optional CSP and FDR verification.
 
 **Design Principles**:
 - Single consistent syntax across all verification layers
@@ -3613,7 +3868,7 @@ CSP and FDR verification.
 - Instrumentation integration
 - Policy enforcement
 
-#### 10.7.1 Syntax
+#### 12.7.1 Syntax
 
 ```rust
 tb_scenario! {
@@ -3622,7 +3877,7 @@ tb_scenario! {
 		.with_spec(AssertSpecType::latest())          // Layer 1 assertion spec
 		.with_csp(ProcessSpecType)                    // OPTIONAL: Layer 2 CSP model (requires testing-csp)
 		.with_fdr(FdrConfig { ... })                  // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
-		.with_trace(TraceConfig::builder()            // OPTIONAL: unified trace config (§11)
+		.with_trace(TraceConfig::builder()            // OPTIONAL: unified trace config (§10)
 			.with_instrumentation(TbInstrumentationConfig { ... })
 			.with_logger(LoggerConfig::new(...))
 			.build())
@@ -3635,7 +3890,7 @@ tb_scenario! {
 
 See sections 10.3.4 and 10.4 for detailed environment examples.
 
-#### 10.7.2 Examples
+#### 12.7.2 Examples
 
 **Bare Environment Example**: Pure logic/function invocation
 
@@ -3799,29 +4054,21 @@ This test verifies:
 - **L2**: Valid state transitions with internal events
 - **L3**: Trace refinement across multiple exploration seeds
 
-#### 10.7.3 Hook Semantics
+#### 12.7.3 Hook Semantics
 
 Hooks provide optional callbacks that can observe and override test outcomes:
 
-- Configured via `.with_hooks(TestHooks { on_pass: Some(...), on_fail: Some(...) })`
-	in the `ScenarioConf` builder.
-- Each hook is a closure wrapped in `Arc`, of type
-	`Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>` for `on_pass`
-	and `Arc<dyn Fn(&HookContext, &SpecViolation) -> Result<(), TightBeamError> + Send + Sync>` for `on_fail`.
+- Configured via `.with_hooks(TestHooks { on_pass: Some(...), on_fail: Some(...) })` in the `ScenarioConf` builder.
+- Each hook is a closure wrapped in `Arc`, of type `Arc<dyn Fn(&HookContext) -> Result<(), TightBeamError> + Send + Sync>` for `on_pass` and `Arc<dyn Fn(&HookContext, &SpecViolation) -> Result<(), TightBeamError> + Send + Sync>` for `on_fail`.
 - `Ok(())` means the hook accepts the outcome and the test passes.
 - `Err(e)` means the hook rejects the outcome and the test fails
-- Hooks receive `HookContext` containing the consumed trace, FDR verdict 
-	(if enabled), process spec, timing constraints, and assertion spec, allowing 
-	inspection of all verification results.
+- Hooks receive `HookContext` containing the consumed trace, FDR verdict (if enabled), process spec, timing constraints, and assertion spec, allowing inspection of all verification results.
 
-### 10.8 Coverage-Guided Fuzzing with AFL
+### 12.8 Coverage-Guided Fuzzing with AFL
 
-#### 10.8.1 Concept
+#### 12.8.1 Concept
 
-TightBeam integrates [AFL.rs](https://github.com/rust-fuzz/afl.rs), a Rust port
-of American Fuzzy Lop, for coverage-guided fuzzing of protocol implementations.
-Unlike deterministic random testing, AFL uses evolutionary algorithms with
-compile-time instrumentation to discover inputs that trigger new code paths.
+tightbeam integrates [AFL.rs](https://github.com/rust-fuzz/afl.rs), a Rust port of American Fuzzy Lop, for coverage-guided fuzzing of protocol implementations. Unlike deterministic random testing, AFL uses evolutionary algorithms with compile-time instrumentation to discover inputs that trigger new code paths.
 
 **How AFL Works**:
 1. **Instrumentation**: Code is compiled with coverage tracking (edge counters)
@@ -3829,8 +4076,7 @@ compile-time instrumentation to discover inputs that trigger new code paths.
 3. **Feedback Loop**: Monitors code coverage, keeps inputs that discover new paths
 4. **Crash Detection**: Automatically detects crashes, hangs, and assertion failures
 
-**Integration with tb_scenario!**: The `fuzz: afl` parameter generates
-AFL-compatible fuzz targets that leverage the oracle for guided exploration:
+**Integration with tb_scenario!**: The `fuzz: afl` parameter generates AFL-compatible fuzz targets that leverage the oracle for guided exploration:
 
 ```rust
 tb_scenario! {
@@ -3861,7 +4107,7 @@ tb_scenario! {
 - `cargo-afl` installed: `cargo install cargo-afl`
 - `std` feature flag (required for most fuzz targets)
 
-#### 10.8.2 Creating Fuzz Targets
+#### 12.8.2 Creating Fuzz Targets
 
 **Example Fuzz Target**:
 
@@ -3927,7 +4173,7 @@ tb_scenario! {
 }
 ```
 
-#### 10.8.3 Building and Running Fuzz Targets
+#### 12.8.3 Building and Running Fuzz Targets
 
 **Prerequisites**:
 ```bash
@@ -3949,10 +4195,9 @@ FUZZ_TARGET=$(ls target/debug/deps/fuzzing-* 2>/dev/null | grep -v '\.d$' | head
 cargo afl fuzz -i fuzz_in -o fuzz_out "$FUZZ_TARGET"
 ```
 
-#### 10.8.4 Advanced: CSP Oracle Integration
+#### 12.8.4 Advanced: CSP Oracle Integration
 
-The `CspOracle` interprets AFL's random bytes as state machine navigation choices,
-ensuring fuzz inputs trigger valid protocol behavior:
+The `CspOracle` interprets AFL's random bytes as state machine navigation choices, ensuring fuzz inputs trigger valid protocol behavior:
 
 **How It Works**:
 ```
@@ -3976,11 +4221,9 @@ State: S0 → S1 → S1 → S2
 Result: Crash at state S1 after "action_b"
 ```
 
-#### 10.8.5 IJON Integration: Input-to-State Correspondence
+#### 12.8.5 IJON Integration: Input-to-State Correspondence
 
-TightBeam optionally integrates with AFL's IJON extension[^ijon2020] for
-state-aware fuzzing. IJON enables "input-to-state correspondence" - bridging
-the semantic gap between fuzzer input mutations and program state exploration.
+tightbeam optionally integrates with AFL's IJON extension[^ijon2020] for state-aware fuzzing. IJON enables "input-to-state correspondence" - bridging the semantic gap between fuzzer input mutations and program state exploration.
 
 **IJON Core Concepts**:
 - **Annotation-Based Guidance**: Developers annotate interesting state variables
@@ -3988,12 +4231,11 @@ the semantic gap between fuzzer input mutations and program state exploration.
 - **Set Tracking**: `ijon_set(label, value)` - fuzzer discovers unique values
 - **Hash Tracking**: `ijon_hashint(label, value)` - track integer distributions
 
-**TightBeam's CSP-Based Approach**:
+**tightbeam's CSP-Based Approach**:
 
-TightBeam automatically derives IJON annotations from CSP process specifications,
-eliminating manual annotation while providing formal state coverage guarantees:
+tightbeam automatically derives IJON annotations from CSP process specifications, eliminating manual annotation while providing formal state coverage guarantees:
 
-| Aspect | Standard IJON | TightBeam CSP Oracle |
+| Aspect | Standard IJON | tightbeam CSP Oracle |
 |--------|---------------|---------------------|
 | **State Definition** | Manual annotations of raw variables | Formal CSP process states (automatic) |
 | **Annotation Burden** | Developer must identify & annotate | Derived from `tb_process_spec!` |
@@ -4004,13 +4246,11 @@ eliminating manual annotation while providing formal state coverage guarantees:
 
 **Automatic IJON Integration**:
 
-When built with `--features testing-fuzz-ijon`, tightbeam's `tb_scenario!` macro
-automatically inserts IJON calls after each successful fuzz execution
+When built with `--features testing-fuzz-ijon`, tightbeam's `tb_scenario!` macro automatically inserts IJON calls after each successful fuzz execution
 
 **Comparison with Pure AFL**:
 
-Without IJON, AFL relies solely on code coverage (edge hit counts). With
-tightbeam's oracle + IJON:
+Without IJON, AFL relies solely on code coverage (edge hit counts). With tightbeam's oracle + IJON:
 
 - **AFL alone**: Discovers `branch_A`, `branch_B`, `branch_C` (syntax)
 - **AFL + CSP oracle**: Discovers `State_Init → State_Processing → State_Done` (semantics)
@@ -4028,7 +4268,7 @@ if (input[0] == 0xDEADBEEF) {
 }
 ```
 
-TightBeam equivalent - no manual annotation needed:
+tightbeam equivalent - no manual annotation needed:
 
 ```rust
 tb_process_spec! {
@@ -4042,7 +4282,7 @@ tb_process_spec! {
 }
 ```
 
-### 10.9 Feature Matrix
+### 12.9 Feature Matrix
 
 The following table summarizes capabilities available across the testing layers:
 
@@ -4079,98 +4319,76 @@ The following table summarizes capabilities available across the testing layers:
 | CSP oracle for fuzzing | – | – | – | `csp` + `fuzz` |
 | IJON state annotations | – | – | – | `csp` + `fuzz-ijon` |
 
-### 10.10 Standards Compliance Mapping
+### 12.10 Standards Compliance Mapping
 
-This section maps tightbeam's verification capabilities to common high-assurance
-standards and regulations. The framework provides native support for many
-certification requirements, though final certification evidence and process
-compliance remain the responsibility of the integrator.
+This section maps tightbeam's verification capabilities to common high-assurance standards and regulations. The framework provides native support for many certification requirements, though final certification evidence and process compliance remain the responsibility of the integrator.
 
-#### 10.10.1 DO-178C DAL A / ISO 26262 ASIL-D
+#### 12.10.1 DO-178C DAL A / ISO 26262 ASIL-D
 
-**Requirements**: 100% MC/DC coverage, systematic fault injection, and complete
-traceability from requirements to test evidence.
+**Requirements**: 100% MC/DC coverage, systematic fault injection, and complete traceability from requirements to test evidence.
 
 **tightbeam Support**:
-- Deterministic fault injection tied to CSP states/events via `FaultModel`
-  (§10.4.2), configured with `with_fault()` for specific state-event pairs
-- Probabilistic fault coverage with `BasisPoints` (0-10000) for precise
-  injection rates
-- `InjectedFaultRecord` tracking in `FdrVerdict::faults_injected` provides
-  complete fault campaign traceability
-- URN-based evidence artifacts (§11, §12.1.1) link instrumentation events to
-  test assertions
-- CSP process specifications (§10.3) model state machines for formal trace
-  verification
+- Deterministic fault injection tied to CSP states/events via `FaultModel` (§12.4.2), configured with `with_fault()` for specific state-event pairs
+- Probabilistic fault coverage with `BasisPoints` (0-10000) for precise injection rates
+- `InjectedFaultRecord` tracking in `FdrVerdict::faults_injected` provides complete fault campaign traceability
+- URN-based evidence artifacts (§10, §11.1.1) link instrumentation events to test assertions
+- CSP process specifications (§12.3) model state machines for formal trace verification
 
-#### 10.10.2 IEC 61508 SIL 4
+#### 12.10.2 IEC 61508 SIL 4
 
-**Requirements**: Systematic fault injection with proof that all error paths 
-are exercised and tested.
+**Requirements**: Systematic fault injection with proof that all error paths are exercised and tested.
 
 **tightbeam Support**:
-- `FaultModel` with `InjectionStrategy::Deterministic` ensures reproducible
-  fault campaigns (§10.4.2)
-- FDR refinement checking (§10.4) explores all modeled error paths across
-  multiple seeds
-- `FdrVerdict` tracks error recovery success/failure counts via
-  `error_recovery_successful` and `error_recovery_failed` fields
-- Multi-seed exploration (default 64 seeds) verifies behavior under different
-  scheduling interleavings
+- `FaultModel` with `InjectionStrategy::Deterministic` ensures reproducible fault campaigns (§12.4.2)
+- FDR refinement checking (§12.4) explores all modeled error paths across multiple seeds
+- `FdrVerdict` tracks error recovery success/failure counts via `error_recovery_successful` and `error_recovery_failed` fields
+- Multi-seed exploration (default 64 seeds) verifies behavior under different scheduling interleavings
 
-#### 10.10.3 NASA/ESA ECSS-E-HB-40A
+#### 12.10.3 NASA/ESA ECSS-E-HB-40A
 
-**Requirements**: Fault tree analysis with coverage of all single-event upsets
-(SEUs) and failure propagation paths.
+**Requirements**: Fault tree analysis with coverage of all single-event upsets (SEUs) and failure propagation paths.
 
 **tightbeam Support**:
 - Per-transition fault injection models SEUs at the CSP state machine level
 - FDR exploration traces fault propagation through the state space
-- `CompositionSpec` (§10.3.6) enables hierarchical fault tree modeling via CSP parallel composition
-- Instrumentation events (§11) capture fault propagation sequences for post-hoc analysis
+- `CompositionSpec` (§12.3.6) enables hierarchical fault tree modeling via CSP parallel composition
+- Instrumentation events (§10) capture fault propagation sequences for post-hoc analysis
 
-#### 10.10.4 Common Criteria EAL7
+#### 12.10.4 Common Criteria EAL7
 
-**Requirements**: Formal verification methods with machine-checkable evidence
-and complete attack/failure tree coverage.
+**Requirements**: Formal verification methods with machine-checkable evidence and complete attack/failure tree coverage.
 
 **tightbeam Support**:
-- CSP formal semantics with trace/failures/divergence refinement checking (§10.4)
-- Instrumentation evidence artifacts tagged with RFC 8141-compliant URNs (§12.1.1)
+- CSP formal semantics with trace/failures/divergence refinement checking (§12.4)
+- Instrumentation evidence artifacts tagged with [RFC 8141][rfc8141]-compliant URNs (§11.1.1)
 - `FdrVerdict` provides machine-readable witnesses to violations (trace/failure/divergence witnesses)
 - Process specifications export to standard CSP notations for external tool verification
 
-#### 10.10.5 FMEA/FMECA (MIL-STD-1629, ISO 26262)
+#### 12.10.5 FMEA/FMECA (MIL-STD-1629, ISO 26262)
 
-**Requirements**: Enumerate all failure modes, inject each mode, observe effects,
-and calculate Risk Priority Numbers (RPN) based on Severity × Occurrence ×
-Detection ratings.
+**Requirements**: Enumerate all failure modes, inject each mode, observe effects, and calculate Risk Priority Numbers (RPN) based on Severity × Occurrence × Detection ratings.
 
 **tightbeam Support**:
-- `FmeaConfig` with configurable severity scales (`MilStd1629`, `Iso26262`) 
-	and RPN thresholds (default: 100)
+- `FmeaConfig` with configurable severity scales (`MilStd1629`, `Iso26262`) and RPN thresholds (default: 100)
 - Auto-generated `FmeaReport` from FDR verdicts via `fmea_config` field, containing:
   - `failure_modes`: enumerated failure modes with severity/occurrence/detection
   - `total_rpn`: aggregate risk priority
   - `critical_failures`: indices of failures exceeding RPN threshold
-- `FaultModel::with_fault()` allows precise failure mode specification with
-	error factories and injection probabilities
-- `FdrVerdict::faults_injected` records all injected faults with CSP context
-	for traceability
+- `FaultModel::with_fault()` allows precise failure mode specification with error factories and injection probabilities
+- `FdrVerdict::faults_injected` records all injected faults with CSP context for traceability
 
 **Automatic FMEA Calculation**:
 
-tightbeam automatically calculates Severity, Occurrence, and Detection ratings
-from FDR exploration results using CSP-based criticality analysis:
+tightbeam automatically calculates Severity, Occurrence, and Detection ratings from FDR exploration results using CSP-based criticality analysis:
 
 1. **Severity** (calculated via CSP reachability analysis):
-   - **MIL-STD-1629 scale (1-10)**:
+   - **[MIL-STD-1629][mil-std-1629] scale (1-10)**:
      - 10: Deadlock (system completely stops)
      - 9: Cannot reach terminal states (cannot complete normal operation)
      - 7: Severe restriction (<50% of states reachable)
      - 5: Moderate restriction (50-80% states reachable)
      - 3: Minor impact (>80% states reachable)
-   - **ISO 26262 scale (1-4)**:
+   - **[ISO 26262][iso-26262] scale (1-4)**:
      - 4: Catastrophic (deadlock or cannot reach terminal)
      - 3: Hazardous (<50% states reachable)
      - 2: Major (50-80% states reachable)
@@ -4211,7 +4429,7 @@ pub struct FailureMode {
 fdr: FdrConfig {
 	fault_model: Some(FaultModel::default()
 		.with_fault(
-			State::Active, 
+			State::Active,
 			Event::Send,
 			|| TightBeamError::Unavailable,
 			BasisPoints::new(2500)  // 25% occurrence
@@ -4226,10 +4444,9 @@ fdr: FdrConfig {
 }
 ```
 
-#### 10.10.6 Standards Compliance Summary
+#### 12.10.6 Standards Compliance Summary
 
-The following table summarizes tightbeam's native support for high-assurance
-standards requirements:
+The following table summarizes tightbeam's native support for high-assurance standards requirements:
 
 | Standard | Level | Key Requirements | tightbeam Features | Feature Flags |
 |----------|-------|------------------|-------------------|---------------|
@@ -4247,534 +4464,13 @@ standards requirements:
 - `testing-fmea` enables automatic FMEA report generation
 - `instrument` enables URN-based evidence artifacts (independent of testing)
 
-## 11. Instrumentation
-
-This section normatively specifies the TightBeam instrumentation subsystem.
-Instrumentation produces a semantic event sequence consumed by verification
-logic. It is an observation facility, NOT an application logging API. Tests
-MUST NOT depend on instrumentation events imperatively; verification MUST treat
-the event stream as authoritative ground truth for one execution.
-
-Feature Gating:
-- Instrumentation can be enabled only by the standalone crate feature `instrument`.
-
-### 11.1 Objectives
-- Emission MUST be amortized O(1) per event.
-- Ordering MUST be strictly increasing by sequence number per trace.
-- Evidence artifacts MUST be deterministic and hash‑stable given identical executions.
-- Detail level MUST be feature‑gated to avoid unnecessary overhead.
-- Payload handling MUST preserve privacy (hash or summarize; never emit secret raw bytes).
-
-### 11.2 Event Kind Taxonomy
-Each event MUST have one kind from a closed, feature‑gated set:
-- External: `gate_accept`, `gate_reject`, `request_recv`, `response_send`
-- Assertion: `assert_label`, `assert_payload`
-- Internal (hidden): `handler_enter`, `handler_exit`, `crypto_step`, `compress_step`, `route_step`, `policy_eval`
-- Process (requires `testing-csp`): `process_transition`, `process_hidden`
-- Exploration (requires `testing-fdr`): `seed_start`, `seed_end`, `state_expand`, `state_prune`, `divergence_detect`, `refusal_snapshot`, `enabled_set_sample`
-- Meta: `start`, `end`, `warn`, `error`
-
-Hidden/internal events MUST use the internal category.
-
-Instrumentation events are also identified by **URNs** defined in
-`tightbeam::utils::urn::specs::TightbeamUrnSpec`. The `TightbeamUrnSpec` format
-`urn:tightbeam:instrumentation:<resource_type>/<resource_id>` provides stable
-names for traces, events, seeds, and verdicts, and is used by the
-instrumentation subsystem to label evidence artifacts.
-
-**Shorthand Event Matching**: In `tb_assert_spec!` and `tb_process_spec!`, you 
-can use shorthand labels instead of full URNs. The shorthand `"foo"` matches 
-any event containing `instrumentation:event/foo`, such as 
-`urn:tightbeam:instrumentation:event/foo` or `urn:custom:instrumentation:event/foo`.
-
-### 11.3 Event Structure
-Conceptual fixed layout (names illustrative):
-```
-trace_id | seq | kind | label? | payload? | phase? | dur_ns? | flags | extras
-```
-Requirements:
-- `trace_id` MUST uniquely identify the execution instance.
-- `seq` MUST start at 0 and increment by 1 for each emitted event.
-- `kind` MUST be a valid taxonomy member.
-- `label` MUST be present for assertion and labeled process events; otherwise absent.
-- `payload` MAY be present only if the label is declared payload‑capable.
-- `phase` SHOULD map to one of: Gate, Handler, Assertion, Response, Crypto, Compression, Routing, Policy, Process, Exploration.
-- `dur_ns` MAY appear on exit or boundary events and MUST represent a monotonic duration in nanoseconds.
-- `flags` MUST represent a bitset (e.g. ASSERT_FAIL, HIDDEN, DIVERGENCE, OVERFLOW).
-- `extras` MAY supply fixed numeric slots and a bounded byte sketch for extended metrics (e.g. enabled set cardinality).
-
-### 11.4 Payload Representation
-Runtime values captured under `assert_payload` MUST be transformed before emission:
-- Algorithm: SHA3‑256 digest over canonical byte representation.
-- Representation: First 32 bytes (full SHA3‑256 output) MUST be stored; NO truncation below 32 bytes.
-- Literal integers MAY be emitted directly as 64‑bit unsigned values IF NOT sensitive.
-- Structured values SHOULD emit a static schema tag plus digest.
-
-> Warning: Secret or potentially sensitive raw data MUST NOT be emitted verbatim.
-
-### 11.5 Configuration
-Instrumentation behavior MUST be controlled by a configuration object 
-(conceptual fields). Configuration existence itself is gated by `instrument`:
-```rust
-TbInstrumentationConfig {
-	enable_payloads: bool,
-	enable_internal_detail: bool,
-	sample_enabled_sets: bool,
-	sample_refusals: bool,
-	divergence_heuristics: bool,
-	max_events: u32,
-	record_durations: bool,
-}
-```
-Defaults (instrument only):
-- `enable_payloads = false`
-- `enable_internal_detail = false`
-- `sample_enabled_sets = false`
-- `sample_refusals = false`
-- `divergence_heuristics = false`
-- `record_durations = false`
-- `max_events = 1024`
-
-Layer Interaction (informative): Enabling testing layers does NOT alter these 
-defaults; tests MAY explicitly override fields per scenario.
-
-If `max_events` is exceeded, the implementation MUST set an OVERFLOW flag, 
-emit a single `warn` event, and drop subsequent events.
-
-### 11.6 Evidence Artifact Format
-For every finalized trace an artifact MUST be producible in a canonical binary 
-form (ASN.1 DER).
-
-Canonical ASN.1 DER Schema (conceptual):
-```
-EvidenceArtifact ::= SEQUENCE {
-	specHash   OCTET STRING,               -- SHA3-256(spec definition)
-	traceId    INTEGER,                    -- Unique per execution
-	seed       INTEGER OPTIONAL,           -- Exploration seed (testing-fdr only)
-	outcome    ENUMERATED { acceptResponse(0), acceptNoResponse(1), reject(2), error(3) },
-	metrics    SEQUENCE {
-		countEvents   INTEGER,
-		durationNs    INTEGER OPTIONAL,
-		overflow      BOOLEAN OPTIONAL
-	},
-	events     SEQUENCE OF Event
-}
-
-Event ::= SEQUENCE {
-	i           INTEGER,                   -- sequence number
-	k           ENUMERATED { start(0), end(1), warn(2), error(3), gate_accept(4), gate_reject(5), request_recv(6), response_send(7), assert_label(8), assert_payload(9), handler_enter(10), handler_exit(11), crypto_step(12), compress_step(13), route_step(14), policy_eval(15), process_transition(16), process_hidden(17), seed_start(18), seed_end(19), state_expand(20), state_prune(21), divergence_detect(22), refusal_snapshot(23), enabled_set_sample(24) },
-	l           UTF8String OPTIONAL,       -- label
-	payloadHash OCTET STRING OPTIONAL,     -- SHA3-256(payload canonical bytes) if captured
-	durationNs  INTEGER OPTIONAL,          -- monotonic duration for boundary/exit events
-	flags       BIT STRING OPTIONAL,       -- ASSERT_FAIL | HIDDEN | DIVERGENCE | OVERFLOW ...
-	extras      OCTET STRING OPTIONAL      -- bounded auxiliary metrics sketch
-}
-```
-
-Binary Serialization Requirements:
-- DER MUST omit absent OPTIONAL fields.
-- Field ordering MUST follow the schema strictly.
-- BIT STRING unused bits MUST be zero.
-- `payloadHash` MUST be 32 bytes when present (SHA3-256).
-
-Artifact Integrity:
-- `trace_hash` MUST be SHA3-256 over the DER encoding of the Events sequence ONLY (excluding surrounding fields).
-- `evidence_hash` SHOULD be SHA3-256(specHash || trace_hash) where `||` denotes raw byte concatenation.
-
-Privacy:
-- Raw payload bytes MUST NOT appear; only hashed representation or numeric scalar (non-sensitive) values MAY be represented.
-
-### 11.7 Failure Handling
-- Emission errors MUST NOT panic; they MUST degrade gracefully (e.g. drop event + OVERFLOW flag).
-- Verification MUST treat missing expected instrumentation events as spec violations (e.g. absent assertion label).
-
-### 11.8 Logging Subsystem
-
-Implements RFC 5424-compliant logging with trait-based backends.
-
-#### RFC 5424 Severity Levels
-
-```rust
-pub enum LogLevel {
-	Emergency = 0, 
-	Alert = 1, 
-	Critical = 2, 
-	Error = 3,
-	Warning = 4, 
-	Notice = 5, 
-	Info = 6, 
-	Debug = 7,
-}
-```
-
-#### LogBackend Trait
-
-```rust
-pub trait LogBackend: Send + Sync {
-	fn emit(&self, record: &LogRecord) -> Result<(), LogError>;
-	fn accepts(&self, level: LogLevel) -> bool;
-	fn flush(&self) -> Result<(), LogError> { Ok(()) }
-}
-```
-
-Built-in backends: `StdoutBackend` (std only), `MultiplexBackend` (fan-out).
-
-#### Log Filtering
-
-```rust
-let filter = LogFilter::new(LogLevel::Warning)
-	.with_component("security", LogLevel::Debug);
-```
-
-#### Integration
-
-```rust
-use tightbeam::trace::{TraceConfig, logging::*};
-
-let backend = Box::new(StdoutBackend);
-let filter = LogFilter::new(LogLevel::Warning);
-let config = LoggerConfig::new(backend, filter)
-	.with_default_level(LogLevel::Info);
-
-let trace: TraceCollector = TraceConfig::builder()
-	.with_logger(config)
-	.build();
-
-trace.event("msg")?.with_log_level(LogLevel::Error).emit();
-```
-
-> Note: The event emit may be ellided as events are emitted on drop.
-
-## 12. Misc
-
-### 12.1 Utilities
-
-tightbeam provides a small `utils` module family for cross-cutting concerns.
-
-#### 12.1.1 URNs
-
-**Module**: `tightbeam::utils::urn`
-
-The URN subsystem provides:
-
-- `Urn<'a>`: RFC 8141-compliant `urn:<nid>:<nss>` representation.
-- `UrnBuilder`: a fluent builder for constructing and validating URNs from 
-	either a raw NID/NSS or structured components.
-- `UrnSpec` / `UrnValidationError`: traits and error types for 
-	namespace‑specific validation logic.
-- `tightbeam::utils::urn::specs::TightbeamUrnSpec`: a built‑in spec for 
-	instrumentation URNs of the form
-	`urn:tightbeam:instrumentation:<resource_type>/<resource_id>`.
-
-`TightbeamUrnSpec` constrains:
-
-- **`resource_type`**: one of `trace`, `event`, `seed`, `verdict`
-  (case‑insensitive, normalized to lowercase), and
-- **`resource_id`**: an application‑defined identifier that must match an
-  alphanumeric‑with‑hyphen pattern.
-
-These URNs can be used by applications to name any kind of resource in a
-stable, parseable way. Internally, they are also used by the instrumentation
-subsystem (§11) to tag traces, events, seeds, and verdicts with globally
-unique identifiers for evidence artifacts and external analysis.
-
-**Example: Building a custom application URN**
-
-```rust
-use tightbeam::utils::urn::{UrnBuilder, UrnValidationError};
-
-fn build_customer_urn() -> Result<(), UrnValidationError> {
-	let urn = UrnBuilder::default()
-		.with_nid("example")
-		.with_nss("customer:1234")
-		.build()?;
-
-	assert_eq!(urn.to_string(), "urn:example:customer:1234");
-
-	Ok(())
-}
-```
-
-#### 12.1.2 Jobs
-
-**Module**: `tightbeam::utils::task`
-
-The `job!` macro implements the **Command Pattern** for encapsulating executable
-units of work as zero-sized types (ZST). Jobs provide a lightweight abstraction
-for reusable, composable, and testable logic without runtime overhead.
-
-**Imports**:
-
-```rust
-// Macros are exported at crate root
-use tightbeam::job;
-
-// Traits and types are in utils::task
-use tightbeam::utils::task::{Job, AsyncJob, Pipeline, join};
-```
-
-**Key Properties**:
-- **Zero-Cost**: Generates a ZST struct with a single static method
-- **Namespace Organization**: Groups related functionality under a type name
-- **Composable**: Jobs can be passed as types and invoked uniformly
-- **Testable**: Stateless functions are easy to test in isolation
-- **Protocol Independence**: Works with both sync and async execution contexts
-
-**Design Rationale**: Jobs serve as a fundamental behavioral unit in tightbeam,
-analogous to functions-as-objects in object-oriented design. They provide a
-consistent interface for executable commands across different contexts.
-
-**Syntax**:
-
-```rust
-// Async job with tuple input (implements AsyncJob trait)
-job! {
-	name: JobName,
-	async fn run((param1, param2): (Type1, Type2)) -> ReturnType {
-		// Implementation
-	}
-}
-
-// Sync job with tuple input (implements Job trait)
-job! {
-	name: JobName,
-	fn run((param1, param2): (Type1, Type2)) -> ReturnType {
-		// Implementation
-	}
-}
-
-// No-parameter job (implements Job/AsyncJob with Input = ())
-job! {
-	name: NoParamJob,
-	fn run() -> ReturnType {
-		// Implementation
-	}
-}
-```
-
-**Traits**:
-
-The `job!` macro automatically implements marker traits for job handling:
-
-```rust
-/// Synchronous job trait
-pub trait Job {
-	type Input;
-	type Output;
-	fn run(input: Self::Input) -> Self::Output;
-}
-
-/// Asynchronous job trait
-pub trait AsyncJob {
-	type Input;
-	type Output;
-	fn run(input: Self::Input) -> impl Future<Output = Self::Output> + Send;
-}
-```
-
-#### 12.1.3 Job Pipelines
-
-**Module**: `tightbeam::utils::task`
-
-The `Pipeline` trait extends Rust's `Result<T, E>` with job composition 
-capabilities, making Result itself a pipeline. This design enables seamless 
-integration between jobs and standard Rust code with zero learning curve.
-
-**Imports**:
-
-```rust
-use tightbeam::job;  // Macro for creating jobs
-use tightbeam::utils::task::{Pipeline, join};
-```
-
-**Core Concept**: If you know how to use `Result`, you already know how to use pipelines.
-
-**Design Principles**:
-
-1. **Result is a Pipeline** - `Result<T, E>` implements `Pipeline` directly
-2. **Organic Integration** - Mix jobs with standard Result methods seamlessly
-3. **Minimal Learning Curve** - Uses familiar Result methods (`and_then`, `map`, `or_else`)
-4. **Optional Trace** - Use `PipelineBuilder` for automatic trace event emission
-5. **Idiomatic Rust** - Follows Result/Future conventions
-
-**Basic Usage - Jobs as Pipelines**:
-
-```rust
-use tightbeam::utils::task::Pipeline;
-
-// Jobs return Results, which are pipelines
-let frame = CreateHandshakeRequest::run(client_id, nonce)
-	.map(|req| req.with_timestamp(now()))             // Core Result::map
-	.and_then(|req| ValidateRequest::run(req))        // Job
-	.map_err(|e| TightBeamError::ValidationFailed(e)) // Core Result::map_err
-	.and_then(|req| SendRequest::run(req))            // Another job
-	.run()?;                                          // Execute the pipeline
-```
-
-**Mixed Composition**:
-
-```rust
-// Start from existing Result
-let config: Result<Config, Error> = parse_config_file(path);
-
-// Chain jobs onto it organically
-config
-	.and_then(|cfg| ValidateConfig::run(cfg))
-	.and_then(|cfg| SaveConfig::run(cfg))
-	.map(|_| "Configuration saved successfully")
-	.and_then(|msg| NotifyUser::run(msg))
-	.run()?;
-```
-
-**Parallel Execution with `join()`**:
-
-```rust
-use tightbeam::utils::task::join;
-
-// Both return Results, both implement Pipeline
-let (encrypted, signed) = join(
-	EncryptPayload::run(payload),
-	SignPayload::run(payload)
-).run()?;
-
-// Use results
-SendRequest::run(encrypted, signed)?;
-```
-
-**Fallback Handling**:
-
-```rust
-// Fallback to alternative on error
-let frame = SendRequest::run(request)
-	.or(|| UseCachedResponse::run())  // Try fallback on error
-	.or_else(|e| HandleError::run(e)) // Error recovery
-	.run()?;
-```
-
-**Automatic Trace with `PipelineBuilder`**:
-
-When you need trace event emission, use `PipelineBuilder` to create a traced 
-pipeline. Job names are automatically converted to snake_case URN events:
-
-```rust
-use tightbeam::utils::task::PipelineBuilder;
-
-// Create pipeline with trace context
-PipelineBuilder::new(trace)
-	.start((client_id, nonce))
-	// Auto-emits: urn:tightbeam:instrumentation:event/create_handshake_request_start
-	//             urn:tightbeam:instrumentation:event/create_handshake_request_success
-	.and_then(|(id, n)| CreateHandshakeRequest::run(id, n))
-	.map(|req| req.validate())  // No trace event (standard map)
-	// Auto-emits: urn:tightbeam:instrumentation:event/validate_request_*
-	.and_then(|req| ValidateRequest::run(req))
-	// Auto-emits: urn:tightbeam:instrumentation:event/send_request_*
-	.and_then(|req| SendRequest::run(req))
-	.run()?;
-```
-
-**Testing Integration**:
-
-Pipelines work seamlessly with `tb_scenario!`:
-
-```rust
-// L1: Assertion specification
-tb_assert_spec! {
-	pub PipelineSpec,
-	V(1,0,0): {
-		mode: Accept,
-		gate: Accepted,
-		assertions: [
-			// Shorthand labels match full URNs
-			("create_handshake_request_start", exactly!(1)),
-			("create_handshake_request_success", exactly!(1)),
-			("validate_request_start", exactly!(1)),
-			("validate_request_success", exactly!(1))
-		]
-	}
-}
-
-// L2: CSP process specification
-tb_process_spec! {
-	pub PipelineProcess,
-	events {
-		observable {
-			"create_handshake_request_start",
-			"create_handshake_request_success",
-			"validate_request_start",
-			"validate_request_success"
-		}
-		hidden {}
-	}
-	states {
-		Idle     => { "create_handshake_request_start" => Creating },
-		Creating => { "create_handshake_request_success" => Validating },
-		Validating => { "validate_request_start" => ValidatingRun },
-		ValidatingRun => { "validate_request_success" => Done },
-		Done => {}
-	}
-	terminal { Done }
-}
-
-tb_scenario! {
-	name: test_pipeline_workflow,
-	config: ScenarioConf::builder()
-		.with_spec(PipelineSpec::latest())
-		.with_csp(PipelineProcess)
-		.build(),
-	environment Pipeline {
-		exec: |pipeline| {
-			let input = ("test-001".to_string(), "nonce".to_string());
-			pipeline
-				.start(input)
-				.and_then(|x| CreateHandshakeRequest::run(x, nonce))
-				.map(|req| req.with_metadata())
-				.and_then(|req| ValidateRequest::run(req))
-				.run()
-		}
-	}
-}
-```
-
-**Complete Example**:
-
-```rust
-use tightbeam::utils::task::{Pipeline, PipelineBuilder, join};
-
-// Mix everything: jobs, Results, parallel execution, fallbacks, trace
-let session_id = PipelineBuilder::new(trace)
-	.start(client_id)
-	// Job with auto-trace
-	.and_then(|id| CreateHandshakeRequest::run(id, nonce))
-	// Standard Result operation
-	.map(|req| req.add_timestamp(now()))
-	// Parallel execution
-	.and_then(|req| {
-		let encrypted = EncryptPayload::run(payload);
-		let signed = SignPayload::run(payload);
-		
-		join(encrypted, signed).map(|(e, s)| (req, e, s))
-	})
-	// Send request
-	.and_then(|(req, enc, sig)| SendRequest::run((req, enc, sig)))
-	// Fallback on error
-	.or(|| UseCachedResponse::run())
-	// Error recovery
-	.or_else(|e| HandleError::run(e))
-	// Extract result
-	.and_then(|resp| ExtractSessionId::run(resp))
-	.run()?;
-```
-
 ## 13. End-to-End Examples
 
 This section contains complete, runnable examples demonstrating usage patterns.
 
 ### 13.1 Complete Client-Server Application
 
-This example demonstrates an end-to-end worker and servlet setup tested with
-`tb_scenario!`, covering assertion specs, CSP process specs, and environment
-integration.
+This example demonstrates an end-to-end worker and servlet setup tested with `tb_scenario!`, covering assertion specs, CSP process specs, and environment integration.
 
 #### Worker Integration Example
 
@@ -4915,9 +4611,9 @@ tb_scenario! {
 					lucky_number,
 				};
 
-				compose! { 
-					V0: id: b"test-ping", 
-						message: message 
+				compose! {
+					V0: id: b"test-ping",
+						message: message
 				}
 			}
 
@@ -4958,45 +4654,49 @@ tb_scenario! {
 
 ### 14.1 Normative References
 
-- [RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119): Key words for use in RFCs to Indicate Requirement Levels
-- [ITU-T X.690](https://www.itu.int/rec/T-REC-X.690): ASN.1 Distinguished Encoding Rules (DER)
-- [RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274): Compressed Data Content Type for Cryptographic Message Syntax (CMS)
-- [RFC 3447](https://datatracker.ietf.org/doc/html/rfc3447): Public-Key Cryptography Standards (PKCS) #1: RSA Cryptography Specifications Version 2.1
-- [RFC 5246](https://datatracker.ietf.org/doc/html/rfc5246): The Transport Layer Security (TLS) Protocol Version 1.2
-- [RFC 5280](https://datatracker.ietf.org/doc/html/rfc5280): Internet X.509 Public Key Infrastructure Certificate and CRL Profile
-- [RFC 5424](https://datatracker.ietf.org/doc/html/rfc5424): The Syslog Protocol
-- [RFC 5480](https://datatracker.ietf.org/doc/html/rfc5480): Elliptic Curve Cryptography Subject Public Key Information
-- [RFC 5652](https://datatracker.ietf.org/doc/html/rfc5652): Cryptographic Message Syntax (CMS)
-- [RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869): HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
-- [RFC 6460](https://datatracker.ietf.org/doc/html/rfc6460): Suite B Profile for Transport Layer Security (TLS)
-- [RFC 6960](https://datatracker.ietf.org/doc/html/rfc6960): X.509 Internet Public Key Infrastructure Online Certificate Status Protocol (OCSP)
-- [RFC 7748](https://datatracker.ietf.org/doc/html/rfc7748): Elliptic Curves for Security
-- [RFC 8032](https://datatracker.ietf.org/doc/html/rfc8032): Edwards-Curve Digital Signature Algorithm (EdDSA)
-- [RFC 8439](https://datatracker.ietf.org/doc/html/rfc8439): ChaCha20 and Poly1305 for IETF Protocols
-- [RFC 8446](https://datatracker.ietf.org/doc/html/rfc8446): The Transport Layer Security (TLS) Protocol Version 1.3
+- [FIPS 180-4][fips180-4]: Secure Hash Standard (SHS)
+- [FIPS 186-5][fips186-5]: Digital Signature Standard (DSS)
+- [FIPS 197][fips197]: Advanced Encryption Standard (AES)
+- [FIPS 202][fips202]: SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions
+- [ITU-T X.680][itu-x680]: ASN.1 Specification of basic notation
+- [ITU-T X.690][itu-x690]: ASN.1 Distinguished Encoding Rules (DER)
+- [NIST SP 800-56A][nist-800-56a]: Recommendation for Pair-Wise Key Establishment Schemes Using Discrete Logarithm Cryptography
+- [RFC 2119][rfc2119]: Key words for use in RFCs to Indicate Requirement Levels
+- [RFC 3274][rfc3274]: Compressed Data Content Type for Cryptographic Message Syntax (CMS)
+- [RFC 3447][rfc3447]: Public-Key Cryptography Standards (PKCS) #1: RSA Cryptography Specifications Version 2.1
+- [RFC 5246][rfc5246]: The Transport Layer Security (TLS) Protocol Version 1.2
+- [RFC 5280][rfc5280]: Internet X.509 Public Key Infrastructure Certificate and CRL Profile
+- [RFC 5480][rfc5480]: Elliptic Curve Cryptography Subject Public Key Information
+- [RFC 5652][rfc5652]: Cryptographic Message Syntax (CMS)
+- [RFC 5753][rfc5753]: Use of Elliptic Curve Cryptography (ECC) Algorithms in Cryptographic Message Syntax (CMS)
+- [RFC 5869][rfc5869]: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
+- [RFC 8032][rfc8032]: Edwards-Curve Digital Signature Algorithm (EdDSA)
+- [RFC 8141][rfc8141]: Uniform Resource Names (URNs)
+- [RFC 8439][rfc8439]: ChaCha20 and Poly1305 for IETF Protocols
+- [SECG SEC 1][secg-sec1]: Elliptic Curve Cryptography (Standards for Efficient Cryptography)
 
-### 14.2 Standards References
+### 14.2 Informative References
 
-- [FIPS 140-2](https://csrc.nist.gov/publications/detail/fips/140/2/final): Security Requirements for Cryptographic Modules
-- [FIPS 140-3](https://csrc.nist.gov/publications/detail/fips/140/3/final): Security Requirements for Cryptographic Modules
-- [FIPS 180-4](https://csrc.nist.gov/publications/detail/fips/180/4/final): Secure Hash Standard (SHS)
-- [FIPS 186-4](https://csrc.nist.gov/publications/detail/fips/186/4/final): Digital Signature Standard (DSS)
-- [FIPS 197](https://csrc.nist.gov/publications/detail/fips/197/final): Advanced Encryption Standard (AES)
-- [FIPS 202](https://csrc.nist.gov/publications/detail/fips/202/final): SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions
-- [NIST SP 800-56A](https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final): Recommendation for Pair-Wise Key Establishment Schemes Using Discrete Logarithm Cryptography
-- [NIST SP 800-57](https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final): Recommendation for Key Management: Part 1 - General
-- [NIST SP 800-131A](https://csrc.nist.gov/publications/detail/sp/800-131a/rev-2/final): Transitioning the Use of Cryptographic Algorithms and Key Lengths
-
-### 14.3 ASN.1 References
-
-- [ITU-T X.680](https://www.itu.int/rec/T-REC-X.680): ASN.1 Specification of basic notation
-- [ITU-T X.681](https://www.itu.int/rec/T-REC-X.681): ASN.1 Information object specification
-- [ITU-T X.682](https://www.itu.int/rec/T-REC-X.682): ASN.1 Constraint specification
-- [ITU-T X.683](https://www.itu.int/rec/T-REC-X.683): ASN.1 Parameterization of ASN.1 specifications
-- [RFC 2474](https://datatracker.ietf.org/doc/html/rfc2474): Definition of the Differentiated Services Field (DS Field) in the IPv4 and IPv6 Headers
-- [RFC 3246](https://datatracker.ietf.org/doc/html/rfc3246): An Expedited Forwarding PHB (Per-Hop Behavior)
-- [ITU-T X.400](https://www.itu.int/rec/T-REC-X.400): Message Handling Systems (MHS): System and service overview
-- [ITU-T X.420](https://www.itu.int/rec/T-REC-X.420): Message Handling Systems (MHS): Interpersonal messaging system
+- [DO-178C][do-178c]: Software Considerations in Airborne Systems and Equipment Certification
+- [FIPS 140-3][fips140-3]: Security Requirements for Cryptographic Modules
+- [IEC 61508-1:2010][iec-61508]: Functional safety of electrical/electronic/programmable electronic safety-related systems -- Part 1: General requirements
+- [ISO 26262-1:2018][iso-26262]: Road vehicles -- Functional safety -- Part 1: Vocabulary
+- [ISO/IEC 18013-5][iso-18013-5]: Personal identification -- ISO-compliant driving licence -- Part 5: Mobile driving licence (mDL) application
+- [ITU-T X.400][itu-x400]: Message Handling Systems (MHS): System and service overview
+- [ITU-T X.420][itu-x420]: Message Handling Systems (MHS): Interpersonal messaging system
+- [MIL-STD-1629A][mil-std-1629]: Procedures for Performing a Failure Mode, Effects and Criticality Analysis (FMECA)
+- [NIST SP 800-57][nist-800-57]: Recommendation for Key Management: Part 1 - General
+- [RFC 2474][rfc2474]: Definition of the Differentiated Services Field (DS Field) in the IPv4 and IPv6 Headers
+- [RFC 3246][rfc3246]: An Expedited Forwarding PHB (Per-Hop Behavior)
+- [RFC 4594][rfc4594]: Configuration Guidelines for DiffServ Service Classes
+- [RFC 5424][rfc5424]: The Syslog Protocol
+- [RFC 6960][rfc6960]: X.509 Internet Public Key Infrastructure Online Certificate Status Protocol (OCSP)
+- [RFC 7322][rfc7322]: RFC Style Guide
+- [RFC 7748][rfc7748]: Elliptic Curves for Security
+- [RFC 8446][rfc8446]: The Transport Layer Security (TLS) Protocol Version 1.3
+- [RFC 8622][rfc8622]: A Lower-Effort Per-Hop Behavior (LE PHB) for Differentiated Services
+- [RFC 9901][rfc9901]: Selective Disclosure for JSON Web Tokens (SD-JWT)
+- [RFC Editor Style Guide][rfc-style-guide]: Web Portion of the Style Guide
 
 ## 15. License
 
@@ -5014,9 +4714,7 @@ This project is licensed under either of
 
 ### For Contributors (Inbound Licensing)
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
 **This means contributors grant rights under BOTH licenses**, providing:
 - MIT's simplicity for users who prefer it
@@ -5032,13 +4730,13 @@ The workspace consists of the following components:
 - **tightbeam/src/lib.rs**: Library root
 - **tightbeam/tests/**: Integration test suites
 
-[crate-image]: https://img.shields.io/crates/v/tightbeam.svg
+[crate-image]: https://img.shields.io/crates/v/tightbeam-rs.svg
 [crate-link]: https://crates.io/crates/tightbeam-rs
 
 [docs-image]: https://img.shields.io/docsrs/tightbeam-rs
 [docs-link]: https://docs.rs/tightbeam-rs
 
-[build-image]: https://img.shields.io/github/actions/workflow/status/wahidgroup/tightbeam/ci.yaml?branch=main
+[build-image]: https://img.shields.io/github/actions/workflow/status/wahidgroup/tightbeam/ci.yaml?branch=master
 [build-link]: https://github.com/wahidgroup/tightbeam/actions/workflows/ci.yaml
 
 [license-image]: https://img.shields.io/badge/license-MIT%2FApache--2.0-blue
@@ -5049,3 +4747,44 @@ The workspace consists of the following components:
 
 #### Future
 - tightbeam-os
+
+[rfc-style-guide]: https://www.rfc-editor.org/styleguide/part2/
+[rfc2119]: https://datatracker.ietf.org/doc/html/rfc2119
+[rfc2474]: https://datatracker.ietf.org/doc/html/rfc2474
+[rfc3246]: https://datatracker.ietf.org/doc/html/rfc3246
+[rfc3274]: https://datatracker.ietf.org/doc/html/rfc3274
+[rfc3447]: https://datatracker.ietf.org/doc/html/rfc3447
+[rfc4594]: https://datatracker.ietf.org/doc/html/rfc4594
+[rfc5246]: https://datatracker.ietf.org/doc/html/rfc5246
+[rfc5280]: https://datatracker.ietf.org/doc/html/rfc5280
+[rfc5424]: https://datatracker.ietf.org/doc/html/rfc5424
+[rfc5480]: https://datatracker.ietf.org/doc/html/rfc5480
+[rfc5652]: https://datatracker.ietf.org/doc/html/rfc5652
+[rfc5753]: https://datatracker.ietf.org/doc/html/rfc5753
+[rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
+[rfc6960]: https://datatracker.ietf.org/doc/html/rfc6960
+[rfc7322]: https://datatracker.ietf.org/doc/html/rfc7322
+[rfc7748]: https://datatracker.ietf.org/doc/html/rfc7748
+[rfc8032]: https://datatracker.ietf.org/doc/html/rfc8032
+[rfc8141]: https://datatracker.ietf.org/doc/html/rfc8141
+[rfc8439]: https://datatracker.ietf.org/doc/html/rfc8439
+[rfc8446]: https://datatracker.ietf.org/doc/html/rfc8446
+[rfc8622]: https://datatracker.ietf.org/doc/html/rfc8622
+[rfc9901]: https://datatracker.ietf.org/doc/html/rfc9901
+[itu-x680]: https://www.itu.int/rec/T-REC-X.680
+[itu-x690]: https://www.itu.int/rec/T-REC-X.690
+[itu-x400]: https://www.itu.int/rec/T-REC-X.400
+[itu-x420]: https://www.itu.int/rec/T-REC-X.420
+[fips140-3]: https://csrc.nist.gov/publications/detail/fips/140/3/final
+[fips180-4]: https://csrc.nist.gov/publications/detail/fips/180/4/final
+[fips186-5]: https://csrc.nist.gov/pubs/fips/186-5/final
+[fips197]: https://csrc.nist.gov/publications/detail/fips/197/final
+[fips202]: https://csrc.nist.gov/publications/detail/fips/202/final
+[nist-800-56a]: https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final
+[nist-800-57]: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final
+[iso-18013-5]: https://www.iso.org/standard/69084.html
+[iso-26262]: https://www.iso.org/standard/68383.html
+[iec-61508]: https://webstore.iec.ch/publication/5515
+[do-178c]: https://www.rtca.org/do-178/
+[mil-std-1629]: https://everyspec.com/MIL-STD/MIL-STD-1600-1699/MIL_STD_1629A_1556/
+[secg-sec1]: https://www.secg.org/sec1-v2.pdf

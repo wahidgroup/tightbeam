@@ -1,0 +1,17 @@
+# cargo-audit configuration (consumed by `make audit`).
+#
+# Advisories listed here are acknowledged but suppressed because no fixed
+# release exists. Each entry MUST carry a justification and be revisited when
+# an upstream fix ships.
+
+[advisories]
+ignore = [
+	# rsa: Marvin Attack timing side-channel. No fixed upgrade available.
+	# Pulled transitively by cms 0.2.3's `builder` feature, which welds in the
+	# RSA KeyTrans recipient path. tightbeam uses only KARI/ECDH key agreement,
+	# so the affected RSA code path is never exercised.
+	"RUSTSEC-2023-0071",
+
+	# paste: crate is archived as there is nothing further to do.
+	"RUSTSEC-2024-0436",
+]

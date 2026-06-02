@@ -43,43 +43,40 @@ pub enum Version {
 
 /// Message priority levels (V2+)
 ///
-/// Priority levels inspired by various standards:
-/// - RFC 3246: Expedited Forwarding PHB
-/// - RFC 2474: Differentiated Services Field
-/// - X.400/X.420: Message Handling Systems
-/// - SIP RFC 3261: Session priority mechanisms
+/// IETF Differentiated Services (DiffServ) architecture.
+/// Each level maps to a DiffServ Per-Hop Behavior (PHB) or service class.
 ///
-/// Values arranged from highest (0) to lowest (5) priority:
-/// - Critical: System/security alerts, emergency notifications
-/// - Top: High-priority interactive traffic, real-time responses
-/// - High: Important business messages, time-sensitive data
-/// - Normal: Standard message traffic (default)
-/// - Low: Non-urgent notifications, background updates
-/// - Bulk: Batch processing, large data transfers, logs
-/// - Heartbeat: Keep-alive signals, periodic status updates
+/// Mapping (lowest to highest priority):
+/// - LowEffort: LE PHB (RFC 8622) -- background, non-urgent traffic, logs
+/// - Standard: Default Forwarding / CS0 (RFC 2474) -- best-effort default
+/// - HighThroughput: High-Throughput Data / AF1 (RFC 4594) -- batch, large transfers
+/// - LowLatency: Real-Time Interactive / CS4 (RFC 4594) -- time-sensitive data
+/// - Expedited: Expedited Forwarding (RFC 3246) -- real-time interactive responses
+/// - NetworkControl: Network Control / CS6-CS7 (RFC 2474, RFC 4594) -- control
+///   plane, security/emergency alerts, keep-alive signals
+///
+/// Secondary mapping: ITU-T X.400/X.420 message importance (low/normal/high).
 ///
 /// ASN.1 Definition:
 /// ```asn1
 /// MessagePriority ::= ENUMERATED {
-///     critical(0),
-///     top(1),
-///     high(2),
-///     normal(3),
-///     low(4),
-///     bulk(5),
-///     heartbeat(6)
+///     lowEffort(0),
+///     standard(1),
+///     highThroughput(2),
+///     lowLatency(3),
+///     expedited(4),
+///     networkControl(5)
 /// }
 /// ```
 #[repr(u8)]
 #[derive(Enumerated, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MessagePriority {
-	Critical = 0,
-	Top = 1,
-	High = 2,
-	Normal = 3,
-	Low = 4,
-	Bulk = 5,
-	Heartbeat = 6,
+	LowEffort = 0,
+	Standard = 1,
+	HighThroughput = 2,
+	LowLatency = 3,
+	Expedited = 4,
+	NetworkControl = 5,
 }
 
 /// NxN matrix control flags

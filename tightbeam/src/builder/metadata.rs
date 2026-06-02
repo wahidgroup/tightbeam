@@ -269,7 +269,7 @@ mod tests {
 			.with_id("test-id-v2")
 			.with_order(1696521600u64)
 			.with_integrity_info(create_test_hash_info())
-			.with_priority(MessagePriority::High)
+			.with_priority(MessagePriority::LowLatency)
 			.with_lifetime(3600)
 	);
 
@@ -280,7 +280,7 @@ mod tests {
 			.with_id("test-id-v3")
 			.with_order(1696521600u64)
 			.with_integrity_info(create_test_hash_info())
-			.with_priority(MessagePriority::High)
+			.with_priority(MessagePriority::LowLatency)
 			.with_lifetime(3600)
 			.with_matrix(MatrixDyn::try_from(2u8).unwrap())
 	);

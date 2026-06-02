@@ -13,11 +13,10 @@ use std::time::SystemTime;
 
 use crate::builder::{MetadataBuilder, TypeBuilder};
 use crate::der::oid::ObjectIdentifier;
-use crate::der::Sequence;
 use crate::error::Result;
 use crate::error::{ReceivedExpectedError, TightBeamError};
 use crate::matrix::{IntoMatrixDyn, MatrixDyn};
-use crate::{Frame, Message, Metadata, Version};
+use crate::{Frame, Message, Version};
 
 #[cfg(feature = "compress")]
 use crate::compress::Compressor;
@@ -126,6 +125,7 @@ impl ErrorAccumulator {
 							vec.push(err);
 						}
 					}
+
 					vec.push(error);
 					*self = Self::Heap(vec);
 				}
@@ -160,14 +160,6 @@ impl From<ErrorAccumulator> for Vec<TightBeamError> {
 			ErrorAccumulator::Heap(errors) => errors,
 		}
 	}
-}
-
-/// Scaffold: envelope-only structure (version + metadata) for computing Frame Integrity.
-/// Excludes the message field per spec: FI MUST be computed over envelope only.
-#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
-pub struct FrameIntegrityScaffold {
-	pub version: Version,
-	pub metadata: Metadata,
 }
 
 /// A fluent builder for creating tightbeam messages with metadata generation
@@ -271,6 +263,7 @@ impl<T: Message> FrameBuilder<T> {
 				self.errors.push(TightBeamError::MatrixError(e));
 			}
 		}
+
 		self
 	}
 
@@ -478,23 +471,6 @@ impl<T: Message> FrameBuilder<T> {
 		self.witness = Some(Box::new(|tbs_der: &[u8]| crate::utils::digest::<D>(tbs_der)));
 		self
 	}
-
-	/// Encode Frame Integrity scaffold (version + metadata).
-	fn encode_frame_integrity_scaffold(version: &Version, metadata: &Metadata) -> Result<Vec<u8>> {
-		use crate::der::Encode;
-
-		let mut scaffold_data = Vec::new();
-		version.encode(&mut scaffold_data)?;
-		metadata.encode(&mut scaffold_data)?;
-
-		// Wrap in sequence
-		let mut buffer = Vec::new();
-		let sequence_len = crate::der::Length::try_from(scaffold_data.len())?;
-		buffer.push(crate::der::Tag::Sequence.into());
-		sequence_len.encode(&mut buffer)?;
-		buffer.extend(scaffold_data);
-		Ok(buffer)
-	}
 }
 
 #[cfg(feature = "signature")]
@@ -688,8 +664,8 @@ impl<T: Message> FrameBuilder<T> {
 	#[cfg(feature = "digest")]
 	fn build_frame_integrity(tbs: &mut Frame, witness: Option<Digestor>) -> Result<()> {
 		if let Some(witness_fn) = witness {
-			// Zero-copy: encode version + metadata directly without cloning metadata
-			let scaffold_der = Self::encode_frame_integrity_scaffold(&tbs.version, &tbs.metadata)?;
+			let scaffold = crate::frame::FrameIntegrityScaffold { version: &tbs.version, metadata: &tbs.metadata };
+			let scaffold_der = crate::encode(&scaffold)?;
 			let witness_info = witness_fn(&scaffold_der)?;
 			tbs.integrity = Some(witness_info);
 		}
@@ -875,7 +851,7 @@ mod tests {
 				.with_rng(Box::new(rng))
 				.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 				.with_signer::<Secp256k1Signature, _>(signing_key)
-				.with_priority(crate::MessagePriority::High)
+				.with_priority(crate::MessagePriority::LowLatency)
 				.with_lifetime(3600)
 				.with_previous_hash(previous_hash)
 				// Matrix removed - V2 doesn't support it (V3+ only)
@@ -887,7 +863,7 @@ mod tests {
 			let tightbeam = result?;
 			assert_eq!(tightbeam.version, Version::V2);
 			assert_eq!(tightbeam.metadata.id, b"test_v2_full");
-			assert_eq!(tightbeam.metadata.priority, Some(crate::MessagePriority::High));
+			assert_eq!(tightbeam.metadata.priority, Some(crate::MessagePriority::LowLatency));
 			assert_eq!(tightbeam.metadata.lifetime, Some(3600));
 			assert!(tightbeam.metadata.confidentiality.is_some());
 			assert!(tightbeam.metadata.compactness.is_some());
@@ -903,9 +879,9 @@ mod tests {
 			assert_eq!(actual_mi.digest.as_bytes(), expected_mi.digest.as_bytes());
 
 			// Verify Frame Integrity (FI): compute hash over envelope (version + metadata) and compare
-			let scaffold = FrameIntegrityScaffold {
-				version: tightbeam.version,
-				metadata: tightbeam.metadata.clone(),
+			let scaffold = crate::frame::FrameIntegrityScaffold {
+				version: &tightbeam.version,
+				metadata: &tightbeam.metadata,
 			};
 			let scaffold_der = crate::encode(&scaffold)?;
 			let expected_fi = crate::utils::digest::<Sha3_256>(&scaffold_der)?;

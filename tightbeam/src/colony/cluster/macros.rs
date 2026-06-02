@@ -641,7 +641,7 @@ macro_rules! cluster {
 			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V1)
 				.with_id(b"heartbeat")
 				.with_message(cmd)
-				.with_priority($crate::MessagePriority::Heartbeat)
+				.with_priority($crate::MessagePriority::NetworkControl)
 				.with_witness_hasher::<$digest>()
 				.build()?;
 

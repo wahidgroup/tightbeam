@@ -2,6 +2,35 @@
 pub use rand_core::{CryptoRngCore, OsRng, RngCore};
 
 use crate::error::Result;
+use rand_core::CryptoRng;
+
+/// Adapts a `&mut dyn CryptoRngCore` to the `Sized` `CryptoRng + RngCore`
+/// bounds required by generic constructors such as `SecretKey::random`.
+///
+/// A `dyn` RNG is unsized, so it cannot satisfy `impl CryptoRngCore` bounds
+/// directly. This wrapper forwards every method to the underlying trait object,
+/// letting callers inject their own CSPRNG.
+pub(crate) struct RngWrapper<'a>(pub(crate) &'a mut dyn CryptoRngCore);
+
+impl RngCore for RngWrapper<'_> {
+	fn next_u32(&mut self) -> u32 {
+		self.0.next_u32()
+	}
+
+	fn next_u64(&mut self) -> u64 {
+		self.0.next_u64()
+	}
+
+	fn fill_bytes(&mut self, dest: &mut [u8]) {
+		self.0.fill_bytes(dest)
+	}
+
+	fn try_fill_bytes(&mut self, dest: &mut [u8]) -> core::result::Result<(), rand_core::Error> {
+		self.0.try_fill_bytes(dest)
+	}
+}
+
+impl CryptoRng for RngWrapper<'_> {}
 
 /// Generate a cryptographically random nonce.
 ///

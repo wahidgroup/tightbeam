@@ -49,21 +49,7 @@ mod policy {
 #[cfg(feature = "transport-policy")]
 use policy::*;
 
-/// Marker relaxing `Send` on non-`wasm32` targets only.
-///
-/// Native transports run on multi-threaded executors and MUST stay `Send`; the
-/// browser is single-threaded and its stream (gloo) is `!Send`, so on `wasm32`
-/// this collapses to a no-op bound, letting the same transport core compile
-/// without `Send`.
-#[cfg(not(target_arch = "wasm32"))]
-pub trait MaybeSend: Send {}
-#[cfg(not(target_arch = "wasm32"))]
-impl<T: Send> MaybeSend for T {}
-
-#[cfg(target_arch = "wasm32")]
-pub trait MaybeSend {}
-#[cfg(target_arch = "wasm32")]
-impl<T> MaybeSend for T {}
+pub use crate::utils::marker::MaybeSend;
 
 /// A frame-oriented async byte transport carrying DER-encoded envelopes.
 pub trait AsyncProtocolStream: MaybeSend + Unpin {

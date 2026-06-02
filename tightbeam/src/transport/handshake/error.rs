@@ -257,6 +257,11 @@ pub enum HandshakeError {
 		error("Key wrap algorithm not configured in security profile")
 	)]
 	MissingKeyWrapAlgorithm,
+	#[cfg_attr(
+		feature = "derive",
+		error("Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)")
+	)]
+	UnsupportedKeyWrapAlgorithm,
 	#[cfg(all(feature = "builder", feature = "aead"))]
 	#[cfg_attr(feature = "derive", error("AES key wrap operation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -351,6 +356,12 @@ impl core::fmt::Display for HandshakeError {
 			HandshakeError::MissingContentEncryptionAlgorithm => write!(f, "Content encryption algorithm not set"),
 			HandshakeError::MissingKeyWrapAlgorithm => {
 				write!(f, "Key wrap algorithm not configured in security profile")
+			}
+			HandshakeError::UnsupportedKeyWrapAlgorithm => {
+				write!(
+					f,
+					"Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)"
+				)
 			}
 			#[cfg(all(feature = "builder", feature = "aead"))]
 			HandshakeError::AesKeyWrap(e) => write!(f, "AES key wrap operation failed: {}", e),

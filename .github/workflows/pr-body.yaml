@@ -1,0 +1,60 @@
+name: PR Body
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches: [master]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate:
+    if: ${{ !startsWith(github.head_ref, 'process/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required sections
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          required=("Summary" "Related Issues" "Changes Made" "Testing" "Breaking Changes")
+
+          body=$(printf '%s' "$PR_BODY" | perl -0pe 's/<!--.*?-->//gs')
+
+          missing=()
+          empty=()
+
+          for section in "${required[@]}"; do
+            if ! printf '%s\n' "$body" | grep -qE "^##[[:space:]]+${section}[[:space:]]*$"; then
+              missing+=("## ${section}")
+              continue
+            fi
+            content=$(printf '%s\n' "$body" | awk -v hdr="${section}" '
+              $0 ~ "^##[[:space:]]+"hdr"[[:space:]]*$" { capture=1; next }
+              /^##[[:space:]]/ { capture=0 }
+              capture { print }
+            ' | sed -E 's/^[[:space:]]*[-*][[:space:]]*$//' | tr -d '[:space:]')
+            if [ "${#content}" -lt 3 ]; then
+              empty+=("## ${section}")
+            fi
+          done
+
+          failed=0
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required sections:"
+            printf '  - %s\n' "${missing[@]}"
+            failed=1
+          fi
+          if [ "${#empty[@]}" -gt 0 ]; then
+            echo "Empty required sections (must contain at least 3 non-whitespace chars):"
+            printf '  - %s\n' "${empty[@]}"
+            failed=1
+          fi
+          if [ "$failed" -eq 1 ]; then
+            echo ""
+            echo "See CONTRIBUTING.md for the PR body specification."
+            exit 1
+          fi
+          echo "PR body OK."
