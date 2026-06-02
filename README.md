@@ -27,6 +27,7 @@ tightbeam is a Layer-5 messaging framework using Abstract Syntax Notation One (A
 1. [Introduction](#1-introduction)
     - 1.1. [Information Fidelity Constraint](#11-information-fidelity-constraint)
     - 1.2. [Requirements Language](#12-requirements-language)
+    - 1.3. [Document Conventions](#13-document-conventions)
 2. [Terminology](#2-terminology)
 3. [Architecture](#3-architecture)
     - 3.1. [Information Theory Properties](#31-information-theory-properties)
@@ -176,16 +177,13 @@ tightbeam is a Layer-5 messaging framework using Abstract Syntax Notation One (A
     - 13.1. [Complete Client-Server Application](#131-complete-client-server-application)
 14. [References](#14-references)
     - 14.1. [Normative References](#141-normative-references)
-    - 14.2. [Standards References](#142-standards-references)
-    - 14.3. [ASN.1 References](#143-asn1-references)
-    - 14.4. [Compliance and Safety References](#144-compliance-and-safety-references)
-    - 14.5. [Documentation References](#145-documentation-references)
+    - 14.2. [Informative References](#142-informative-references)
 15. [License](#15-license)
 16. [Implementation Notes](#16-implementation-notes)
 
 ## 1. Introduction
 
-tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Its philosophy is predicated upon a return to first order principles. Sections follow a [concept → specification → implementation → testing] pattern.
+tightbeam defines a structured, versioned messaging protocol with an information fidelity constraint: I(t) ∈ (0,1) for all t ∈ T. Its philosophy is predicated upon a return to first order principles.
 
 ### 1.1 Information Fidelity Constraint
 
@@ -201,6 +199,15 @@ The I(t) constraint informs all protocol design decisions.
 ### 1.2 Requirements Language
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119][rfc2119].
+
+### 1.3 Document Conventions
+
+This document adheres to the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322] for structure and editorial style:
+
+- **Section pattern**: Normative sections progress through concept → specification → implementation → testing.
+- **Requirements language**: Key words are interpreted per [RFC 2119][rfc2119] (see [§1.2 Requirements Language](#12-requirements-language)).
+- **Terminology**: Project terms are defined once in [§2 Terminology](#2-terminology) and used consistently thereafter.
+- **Citations**: External standards are cited by name and linked on their first mention within a section. Full references are recorded in [§14 References](#14-references); every entry there is cited at least once in the text, and every in-text citation resolves to an entry there.
 
 ## 2. Terminology
 The following project terms MUST be used consistently:
@@ -354,7 +361,7 @@ MessagePriority ::= ENUMERATED {
 }
 ```
 
-> Priority levels are anchored to the IETF Differentiated Services (DiffServ) architecture, mapping each level to a Per-Hop Behavior (PHB) or service class defined in [RFC 2474][rfc2474] (DS field / Class Selectors), [RFC 4594][rfc4594] (service classes), [RFC 3246][rfc3246] (Expedited Forwarding), and [RFC 8622][rfc8622] (Lower-Effort). Ordering is DSCP-faithful: a higher value denotes higher priority. A secondary mapping to ITU-T X.400/X.420 message importance (low/normal/high) is retained for message-handling interoperability.
+> Priority levels are anchored to the IETF Differentiated Services (DiffServ) architecture, mapping each level to a Per-Hop Behavior (PHB) or service class defined in [RFC 2474][rfc2474] (DS field / Class Selectors), [RFC 4594][rfc4594] (service classes), [RFC 3246][rfc3246] (Expedited Forwarding), and [RFC 8622][rfc8622] (Lower-Effort). Ordering is DSCP-faithful: a higher value denotes higher priority. A secondary mapping to ITU-T X.400/X.420 ([ITU-T X.400][itu-x400], [ITU-T X.420][itu-x420]) message importance (low/normal/high) is retained for message-handling interoperability.
 
 ### 5.2 Cryptographic Structures
 
@@ -599,7 +606,7 @@ where
 This design ensures MI over plaintext is cryptographically sound:
 
 - **Type-level guarantee**: Non-AEAD ciphers cannot be used (compile-time enforcement)
-- **Ciphertext authentication**: AEAD provides built-in authentication tags that prove the ciphertext has not been tampered with (e.g., AES-GCM, ChaCha20-Poly1305)
+- **Ciphertext authentication**: AEAD provides built-in authentication tags that prove the ciphertext has not been tampered with (e.g., AES-GCM ([FIPS 197][fips197]), ChaCha20-Poly1305 ([RFC 8439][rfc8439]))
 - **MI purpose**: Proves the decrypted plaintext matches the original message content
 - **Layered security**: AEAD prevents ciphertext tampering, MI proves plaintext correctness, FI witnesses MI in metadata, signatures cover the entire frame
 
@@ -854,11 +861,11 @@ pub trait SecurityProfile {
 
 tightbeam separates cryptographic concerns through specialized provider traits:
 
-- **`DigestProvider`**: Hash/digest operations (SHA-256, SHA3-256, etc.)
+- **`DigestProvider`**: Hash/digest operations (SHA-256 ([FIPS 180-4][fips180-4]), SHA3-256 ([FIPS 202][fips202]), etc.)
 - **`AeadProvider`**: Authenticated encryption (AES-GCM variants)
-- **`SigningProvider`**: Signature generation and verification (ECDSA, Ed25519)
-- **`KdfProvider`**: Key derivation functions (HKDF)
-- **`CurveProvider`**: Elliptic curve operations (secp256k1, P-384)
+- **`SigningProvider`**: Signature generation and verification (ECDSA ([FIPS 186-5][fips186-5]), Ed25519 ([RFC 8032][rfc8032]))
+- **`KdfProvider`**: Key derivation functions (HKDF, [RFC 5869][rfc5869])
+- **`CurveProvider`**: Elliptic curve operations (secp256k1, P-384 ([RFC 5480][rfc5480]), X25519 ([RFC 7748][rfc7748]))
 
 These traits compose into `CryptoProvider`, allowing components to specify only the cryptographic capabilities they require rather than depending on the full provider.
 
@@ -1111,11 +1118,11 @@ tightbeam MUST operate over ANY transport protocol. The TCP transport layer is b
 
 ### 7.3 Cryptographic Key Management
 
-tightbeam accepts standard key formats (X.509 certificates, raw key material, CMS structures) and delegates key lifecycle management to applications:
+tightbeam accepts standard key formats (X.509 certificates, raw key material, CMS structures) and delegates key lifecycle management ([NIST SP 800-57][nist-800-57]) to applications:
 
 - **Key Formats**: X.509 certificates, raw keys, CMS structures
 - **Handshake Protocols**: CMS-based and ECIES-based handshakes for session establishment
-- **Application Responsibilities**: Key generation, storage, rotation, certificate validation,  revocation checking
+- **Application Responsibilities**: Key generation, storage, rotation, certificate validation, revocation checking ([RFC 6960][rfc6960])
 
 #### Trust Stores
 
@@ -1383,9 +1390,9 @@ tightbeam implements two handshake protocols for mutual authentication and sessi
 
 **Security Goals:**
 - **Mutual Authentication**: Both parties prove identity via certificates
-- **Perfect Forward Secrecy**: Ephemeral ECDH keys ensure past sessions remain secure if long-term keys are compromised
+- **Perfect Forward Secrecy**: Ephemeral ECDH ([NIST SP 800-56A][nist-800-56a]) keys ensure past sessions remain secure if long-term keys are compromised
 - **Replay Protection**: Nonces prevent replay attacks
-- **Downgrade Prevention**: Transcript hash covers all handshake messages including profile negotiation
+- **Downgrade Prevention**: Transcript hash covers all handshake messages including profile negotiation ([RFC 8446][rfc8446] §4.1.3, analogous)
 - **Confidentiality**: Session keys derived via HKDF protect all subsequent messages
 
 #### 8.5.2 Specification: Handshake Flow and State Management
@@ -4635,8 +4642,6 @@ tb_scenario! {
 
 ## 14. References
 
-> **Citation convention.** This document follows the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322]: each external standard is cited by name and linked on its first mention within a section, with the full reference recorded below. Every reference listed here is cited in the text, and every in-text citation resolves to an entry below.
-
 [^hoare1978]: C.A.R. Hoare, "Communicating sequential processes," *Communications of the ACM*, vol. 21, no. 8, pp. 666-677, August 1978. DOI: [10.1145/359576.359585](https://doi.org/10.1145/359576.359585)
 
 [^roscoe2010]: A.W. Roscoe, *Understanding Concurrent Systems*. Springer-Verlag, 2010. ISBN: 978-1-84882-257-3. DOI: [10.1007/978-1-84882-258-0](https://doi.org/10.1007/978-1-84882-258-0)
@@ -4649,63 +4654,48 @@ tb_scenario! {
 
 ### 14.1 Normative References
 
-- [RFC 2119][rfc2119]: Key words for use in RFCs to Indicate Requirement Levels
+- [FIPS 180-4][fips180-4]: Secure Hash Standard (SHS)
+- [FIPS 186-5][fips186-5]: Digital Signature Standard (DSS)
+- [FIPS 197][fips197]: Advanced Encryption Standard (AES)
+- [FIPS 202][fips202]: SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions
+- [ITU-T X.680][itu-x680]: ASN.1 Specification of basic notation
 - [ITU-T X.690][itu-x690]: ASN.1 Distinguished Encoding Rules (DER)
+- [NIST SP 800-56A][nist-800-56a]: Recommendation for Pair-Wise Key Establishment Schemes Using Discrete Logarithm Cryptography
+- [RFC 2119][rfc2119]: Key words for use in RFCs to Indicate Requirement Levels
 - [RFC 3274][rfc3274]: Compressed Data Content Type for Cryptographic Message Syntax (CMS)
 - [RFC 3447][rfc3447]: Public-Key Cryptography Standards (PKCS) #1: RSA Cryptography Specifications Version 2.1
-- [RFC 4594][rfc4594]: Configuration Guidelines for DiffServ Service Classes
 - [RFC 5246][rfc5246]: The Transport Layer Security (TLS) Protocol Version 1.2
 - [RFC 5280][rfc5280]: Internet X.509 Public Key Infrastructure Certificate and CRL Profile
-- [RFC 5424][rfc5424]: The Syslog Protocol
 - [RFC 5480][rfc5480]: Elliptic Curve Cryptography Subject Public Key Information
 - [RFC 5652][rfc5652]: Cryptographic Message Syntax (CMS)
 - [RFC 5753][rfc5753]: Use of Elliptic Curve Cryptography (ECC) Algorithms in Cryptographic Message Syntax (CMS)
 - [RFC 5869][rfc5869]: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
-- [RFC 6460][rfc6460]: Suite B Profile for Transport Layer Security (TLS)
-- [RFC 6960][rfc6960]: X.509 Internet Public Key Infrastructure Online Certificate Status Protocol (OCSP)
-- [RFC 7748][rfc7748]: Elliptic Curves for Security
 - [RFC 8032][rfc8032]: Edwards-Curve Digital Signature Algorithm (EdDSA)
 - [RFC 8141][rfc8141]: Uniform Resource Names (URNs)
 - [RFC 8439][rfc8439]: ChaCha20 and Poly1305 for IETF Protocols
+- [SECG SEC 1][secg-sec1]: Elliptic Curve Cryptography (Standards for Efficient Cryptography)
+
+### 14.2 Informative References
+
+- [DO-178C][do-178c]: Software Considerations in Airborne Systems and Equipment Certification
+- [FIPS 140-3][fips140-3]: Security Requirements for Cryptographic Modules
+- [IEC 61508-1:2010][iec-61508]: Functional safety of electrical/electronic/programmable electronic safety-related systems -- Part 1: General requirements
+- [ISO 26262-1:2018][iso-26262]: Road vehicles -- Functional safety -- Part 1: Vocabulary
+- [ISO/IEC 18013-5][iso-18013-5]: Personal identification -- ISO-compliant driving licence -- Part 5: Mobile driving licence (mDL) application
+- [ITU-T X.400][itu-x400]: Message Handling Systems (MHS): System and service overview
+- [ITU-T X.420][itu-x420]: Message Handling Systems (MHS): Interpersonal messaging system
+- [MIL-STD-1629A][mil-std-1629]: Procedures for Performing a Failure Mode, Effects and Criticality Analysis (FMECA)
+- [NIST SP 800-57][nist-800-57]: Recommendation for Key Management: Part 1 - General
+- [RFC 2474][rfc2474]: Definition of the Differentiated Services Field (DS Field) in the IPv4 and IPv6 Headers
+- [RFC 3246][rfc3246]: An Expedited Forwarding PHB (Per-Hop Behavior)
+- [RFC 4594][rfc4594]: Configuration Guidelines for DiffServ Service Classes
+- [RFC 5424][rfc5424]: The Syslog Protocol
+- [RFC 6960][rfc6960]: X.509 Internet Public Key Infrastructure Online Certificate Status Protocol (OCSP)
+- [RFC 7322][rfc7322]: RFC Style Guide
+- [RFC 7748][rfc7748]: Elliptic Curves for Security
 - [RFC 8446][rfc8446]: The Transport Layer Security (TLS) Protocol Version 1.3
 - [RFC 8622][rfc8622]: A Lower-Effort Per-Hop Behavior (LE PHB) for Differentiated Services
 - [RFC 9901][rfc9901]: Selective Disclosure for JSON Web Tokens (SD-JWT)
-
-### 14.2 Standards References
-
-- [FIPS 140-2][fips140-2]: Security Requirements for Cryptographic Modules
-- [FIPS 140-3][fips140-3]: Security Requirements for Cryptographic Modules
-- [FIPS 180-4][fips180-4]: Secure Hash Standard (SHS)
-- [FIPS 186-4][fips186-4]: Digital Signature Standard (DSS)
-- [FIPS 197][fips197]: Advanced Encryption Standard (AES)
-- [FIPS 202][fips202]: SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions
-- [NIST SP 800-56A][nist-800-56a]: Recommendation for Pair-Wise Key Establishment Schemes Using Discrete Logarithm Cryptography
-- [NIST SP 800-57][nist-800-57]: Recommendation for Key Management: Part 1 - General
-- [NIST SP 800-131A][nist-800-131a]: Transitioning the Use of Cryptographic Algorithms and Key Lengths
-- [ISO/IEC 18013-5][iso-18013-5]: Personal identification -- ISO-compliant driving licence -- Part 5: Mobile driving licence (mDL) application
-- [SECG SEC 1][secg-sec1]: Elliptic Curve Cryptography (Standards for Efficient Cryptography)
-
-### 14.3 ASN.1 References
-
-- [ITU-T X.680][itu-x680]: ASN.1 Specification of basic notation
-- [ITU-T X.681][itu-x681]: ASN.1 Information object specification
-- [ITU-T X.682][itu-x682]: ASN.1 Constraint specification
-- [ITU-T X.683][itu-x683]: ASN.1 Parameterization of ASN.1 specifications
-- [RFC 2474][rfc2474]: Definition of the Differentiated Services Field (DS Field) in the IPv4 and IPv6 Headers
-- [RFC 3246][rfc3246]: An Expedited Forwarding PHB (Per-Hop Behavior)
-- [ITU-T X.400][itu-x400]: Message Handling Systems (MHS): System and service overview
-- [ITU-T X.420][itu-x420]: Message Handling Systems (MHS): Interpersonal messaging system
-
-### 14.4 Compliance and Safety References
-
-- [DO-178C][do-178c]: Software Considerations in Airborne Systems and Equipment Certification
-- [ISO 26262-1:2018][iso-26262]: Road vehicles -- Functional safety -- Part 1: Vocabulary
-- [IEC 61508-1:2010][iec-61508]: Functional safety of electrical/electronic/programmable electronic safety-related systems -- Part 1: General requirements
-- [MIL-STD-1629A][mil-std-1629]: Procedures for Performing a Failure Mode, Effects and Criticality Analysis (FMECA)
-
-### 14.5 Documentation References
-
-- [RFC 7322][rfc7322]: RFC Style Guide
 - [RFC Editor Style Guide][rfc-style-guide]: Web Portion of the Style Guide
 
 ## 15. License
@@ -4772,7 +4762,6 @@ The workspace consists of the following components:
 [rfc5652]: https://datatracker.ietf.org/doc/html/rfc5652
 [rfc5753]: https://datatracker.ietf.org/doc/html/rfc5753
 [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
-[rfc6460]: https://datatracker.ietf.org/doc/html/rfc6460
 [rfc6960]: https://datatracker.ietf.org/doc/html/rfc6960
 [rfc7322]: https://datatracker.ietf.org/doc/html/rfc7322
 [rfc7748]: https://datatracker.ietf.org/doc/html/rfc7748
@@ -4783,24 +4772,19 @@ The workspace consists of the following components:
 [rfc8622]: https://datatracker.ietf.org/doc/html/rfc8622
 [rfc9901]: https://datatracker.ietf.org/doc/html/rfc9901
 [itu-x680]: https://www.itu.int/rec/T-REC-X.680
-[itu-x681]: https://www.itu.int/rec/T-REC-X.681
-[itu-x682]: https://www.itu.int/rec/T-REC-X.682
-[itu-x683]: https://www.itu.int/rec/T-REC-X.683
 [itu-x690]: https://www.itu.int/rec/T-REC-X.690
 [itu-x400]: https://www.itu.int/rec/T-REC-X.400
 [itu-x420]: https://www.itu.int/rec/T-REC-X.420
-[fips140-2]: https://csrc.nist.gov/publications/detail/fips/140/2/final
 [fips140-3]: https://csrc.nist.gov/publications/detail/fips/140/3/final
 [fips180-4]: https://csrc.nist.gov/publications/detail/fips/180/4/final
-[fips186-4]: https://csrc.nist.gov/publications/detail/fips/186/4/final
+[fips186-5]: https://csrc.nist.gov/pubs/fips/186-5/final
 [fips197]: https://csrc.nist.gov/publications/detail/fips/197/final
 [fips202]: https://csrc.nist.gov/publications/detail/fips/202/final
 [nist-800-56a]: https://csrc.nist.gov/publications/detail/sp/800-56a/rev-3/final
 [nist-800-57]: https://csrc.nist.gov/publications/detail/sp/800-57-part-1/rev-5/final
-[nist-800-131a]: https://csrc.nist.gov/publications/detail/sp/800-131a/rev-2/final
 [iso-18013-5]: https://www.iso.org/standard/69084.html
 [iso-26262]: https://www.iso.org/standard/68383.html
 [iec-61508]: https://webstore.iec.ch/publication/5515
 [do-178c]: https://www.rtca.org/do-178/
-[mil-std-1629]: http://everyspec.com/MIL-STD/MIL-STD-1600-1699/MIL-STD-1629A_31478/
+[mil-std-1629]: https://everyspec.com/MIL-STD/MIL-STD-1600-1699/MIL_STD_1629A_1556/
 [secg-sec1]: https://www.secg.org/sec1-v2.pdf
