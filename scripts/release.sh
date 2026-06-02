@@ -590,6 +590,13 @@ run_combined_release() {
 		return 0
 	fi
 
+	local dv_changed=true
+	if [[ "$dv_ver" == "$dv_current" ]]; then
+		dv_changed=false
+		dv_done=true
+		info "tightbeam-derive unchanged at ${dv_ver} - skipping derive release"
+	fi
+
 	detect_pr_resume_state "$branch"
 	local resume="$RESUME_STATE"
 	ok "Release state: ${resume}"
@@ -627,7 +634,10 @@ run_combined_release() {
 		return 0
 	fi
 
-	local commit_msg="chore(release): tightbeam v${tb_ver} + tightbeam-derive v${dv_ver}"
+	local commit_msg="chore(release): tightbeam v${tb_ver}"
+	[[ "$dv_changed" == true ]] && commit_msg+=" + tightbeam-derive v${dv_ver}"
+	local pr_title="chore(release): v${tb_ver}"
+	[[ "$dv_changed" == true ]] && pr_title+=" + tightbeam-derive v${dv_ver}"
 	local n=0
 
 	if [[ "$resume" == "fresh" ]]; then
@@ -636,7 +646,9 @@ run_combined_release() {
 		git checkout -b "$branch"
 		ok "Branch created"
 
-		bump_version "$dv_ver" "$dv_toml" "$dv_section"
+		if [[ "$dv_changed" == true ]]; then
+			bump_version "$dv_ver" "$dv_toml" "$dv_section"
+		fi
 		bump_version "$tb_ver" "$tb_toml" "$tb_section"
 
 		n=$((n + 1))
@@ -655,7 +667,7 @@ run_combined_release() {
 			git push -u origin "$branch"
 			ok "Branch pushed to origin"
 		fi
-		create_release_pr "$commit_msg" "$DEFAULT_BRANCH" "$branch"
+		create_release_pr "$pr_title" "$DEFAULT_BRANCH" "$branch"
 	fi
 
 	if [[ "$resume" == "fresh" || "$resume" == "pr" || "$resume" == "poll" ]]; then
@@ -678,7 +690,7 @@ run_combined_release() {
 		push_crate_tag "$dv_tag" "$dv_ver" "releases/derive/"
 		wait_for_crate "tightbeam-derive" "$dv_ver"
 	else
-		info "tightbeam-derive ${dv_ver} already released - skipping derive tag"
+		info "tightbeam-derive ${dv_ver} unchanged/released - skipping derive tag"
 	fi
 
 	if [[ "$tb_done" == false ]]; then
@@ -1055,7 +1067,7 @@ if [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" || "$RESUME_STATE
 		ok "Branch pushed to origin"
 	fi
 
-	create_release_pr "chore(release): ${TARGET_CRATE} v${VERSION}" "$PR_BASE" "$BRANCH"
+	create_release_pr "chore(release): v${VERSION}" "$PR_BASE" "$BRANCH"
 fi
 
 # ---------------------------------------------------------------------------
