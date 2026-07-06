@@ -445,6 +445,7 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::EllipticCurveError(_) => write!(f, "Elliptic curve error"),
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureEncodingError => write!(f, "Signature encoding error"),
+			#[cfg(feature = "crypto")]
 			TightBeamError::KeyError(err) => write!(f, "Key provider error: {err}"),
 			#[cfg(feature = "crypto")]
 			TightBeamError::SecretUnavailable(err) => write!(f, "Secret unavailable: {err}"),

@@ -182,12 +182,14 @@ pub trait EncryptedMessageIO: MessageIO {
 					// Server has encryption configured, reject cleartext
 					return Err(TransportError::MissingEncryption);
 				}
+
 				Ok(transport_envelope)
 			}
 			WireEnvelope::Encrypted(encrypted_info) => {
 				let decrypted_bytes = self.to_decryptor_ref()?.decrypt_content(&encrypted_info)?;
-
-				Self::decode_envelope(&decrypted_bytes)
+				decrypted_bytes
+					.with(|bytes| Self::decode_envelope(bytes))
+					.map_err(crate::error::TightBeamError::from)?
 			}
 		}
 	}
@@ -246,12 +248,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: EncryptedProtocolState,
 	{
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-
 		match wire_envelope {
 			WireEnvelope::Cleartext(env) => Ok(env),
 			WireEnvelope::Encrypted(encrypted_info) => {
 				let decrypted_bytes = self.to_decryptor_ref()?.decrypt_content(&encrypted_info)?;
-				Self::decode_envelope(&decrypted_bytes)
+				decrypted_bytes
+					.with(|bytes| Self::decode_envelope(bytes))
+					.map_err(crate::error::TightBeamError::from)?
 			}
 		}
 	}

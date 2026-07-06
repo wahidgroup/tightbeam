@@ -6,6 +6,7 @@ use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientI
 use crate::crypto::aead::{Decryptor, KeyInit};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::secret::SecretSlice;
 use crate::der::oid::AssociatedOid;
 use crate::transport::handshake::error::HandshakeError;
 
@@ -99,7 +100,7 @@ where
 	fn decrypt_content(
 		cipher: &P::AeadCipher,
 		encrypted_content_info: &EncryptedContentInfo,
-	) -> Result<Vec<u8>, HandshakeError>
+	) -> Result<SecretSlice<u8>, HandshakeError>
 	where
 		P::AeadCipher: Decryptor,
 	{
@@ -118,8 +119,8 @@ where
 	/// - `enveloped_data`: The EnvelopedData structure to process
 	///
 	/// # Returns
-	/// The decrypted plaintext content
-	pub fn process(&self, enveloped_data: &EnvelopedData) -> Result<Vec<u8>, HandshakeError> {
+	/// The decrypted plaintext content, wrapped so it zeroizes on drop
+	pub fn process(&self, enveloped_data: &EnvelopedData) -> Result<SecretSlice<u8>, HandshakeError> {
 		// 1. Validate recipient index
 		self.validate_recipient_index(enveloped_data)?;
 
@@ -229,7 +230,8 @@ mod tests {
 
 			// 7. Verify roundtrip success
 			let decrypted = processor.process(&enveloped_data)?;
-			assert_eq!(decrypted, plaintext);
+			let decrypted = crate::crypto::secret::ToInsecure::to_insecure(decrypted)?;
+			assert_eq!(&decrypted[..], &plaintext[..]);
 
 			Ok(())
 		}

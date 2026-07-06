@@ -81,7 +81,7 @@ pub fn default_security_profile() -> SecurityProfileDesc {
 /// Strong profile (AES-256-GCM) for downgrade testing.
 pub fn strong_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		digest: HASH_SHA3_256,
+		digest: Some(HASH_SHA3_256),
 		aead: Some(AES_256_GCM),
 		aead_key_size: Some(32),
 		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),
@@ -95,7 +95,7 @@ pub fn strong_security_profile() -> SecurityProfileDesc {
 /// Weak profile (AES-128-GCM) for downgrade testing.
 pub fn weak_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		digest: HASH_SHA3_256,
+		digest: Some(HASH_SHA3_256),
 		aead: Some(AES_128_GCM),
 		aead_key_size: Some(16),
 		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),

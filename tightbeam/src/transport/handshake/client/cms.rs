@@ -476,7 +476,7 @@ where
 
 	/// Sign the finished digest using the client key provider.
 	async fn sign_finished_digest(&self, digest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		let signature_bytes = self.client_key_provider.sign(digest).await?;
+		let signature_bytes = self.client_key_provider.sign_prehash(digest).await?;
 		Ok(signature_bytes)
 	}
 
@@ -667,7 +667,8 @@ mod tests {
 		let kari_processor = TightBeamKariRecipient::new(provider, server_secret);
 		let processor = TightBeamEnvelopedDataProcessor::<DefaultCryptoProvider>::new(kari_processor);
 		let decrypted = processor.process(&enveloped_data)?;
-		assert_eq!(decrypted, session_key);
+		let decrypted = crate::crypto::secret::ToInsecure::to_insecure(decrypted)?;
+		assert_eq!(&decrypted[..], &session_key[..]);
 
 		// When: Client processes server Finished
 		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };

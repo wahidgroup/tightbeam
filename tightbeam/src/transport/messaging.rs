@@ -455,7 +455,9 @@ pub trait MessageCollector: MessageIO {
 							return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 						}
 					};
-					Self::decode_envelope(&decrypted_bytes)?
+					decrypted_bytes
+						.with(|bytes| Self::decode_envelope(bytes))
+						.map_err(crate::error::TightBeamError::from)??
 				}
 			};
 

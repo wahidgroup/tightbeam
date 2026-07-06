@@ -29,7 +29,7 @@ use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-use crate::crypto::sign::{SignatureEncoding, Verifier};
+use crate::crypto::sign::{PrehashVerifier, SignatureEncoding};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
@@ -185,7 +185,7 @@ where
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 		for<'a> P::Signature: TryFrom<&'a [u8]>,
-		P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
+		P::VerifyingKey: PrehashVerifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
 		// 1. Validate current state is ServerHelloSent
 		self.validate_expected_state(ServerHandshakeState::ServerHelloSent)?;
@@ -295,7 +295,7 @@ where
 
 	async fn sign_transcript_hash(&self, transcript_digest: &[u8; 32]) -> Result<Vec<u8>, HandshakeError> {
 		// Use KeyProvider to sign - returns k256::ecdsa::Signature
-		let sig = self.server_key_provider.sign(transcript_digest).await?;
+		let sig = self.server_key_provider.sign_prehash(transcript_digest).await?;
 		Ok(sig.to_vec())
 	}
 
@@ -399,7 +399,7 @@ where
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 		for<'a> P::Signature: TryFrom<&'a [u8]>,
-		P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
+		P::VerifyingKey: PrehashVerifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	{
 		if let Some(validators) = &self.client_validators {
 			// Client cert is required when validators are present
@@ -431,8 +431,9 @@ where
 			// Create verifying key from public key
 			let verifying_key = P::VerifyingKey::from(&public_key);
 
-			// Verify signature over transcript hash
-			verifying_key.verify(&transcript_hash, &signature)?;
+			// Canonical convention: the transcript hash is the prehash; the
+			// client signed it directly (no second hash).
+			verifying_key.verify_prehash(&transcript_hash, &signature)?;
 
 			// Store validated cert (identity is now locked)
 			self.validated_client_cert = Some(Arc::new(client_cert));
@@ -481,7 +482,7 @@ where
 	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
-	P::VerifyingKey: Verifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
+	P::VerifyingKey: PrehashVerifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
 	P::Signature: SignatureEncoding,
 {
@@ -660,11 +661,11 @@ mod tests {
 		};
 
 		let mk_profile = |id: u8| SecurityProfileDesc {
-			digest: match id {
+			digest: Some(match id {
 				1 => HASH_SHA3_256,
 				2 => HASH_SHA3_384,
 				_ => HASH_SHA3_512,
-			},
+			}),
 			aead: Some(AES_256_GCM),
 			aead_key_size: Some(32),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),

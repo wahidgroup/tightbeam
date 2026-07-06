@@ -268,7 +268,6 @@ where
 			expected_sid,
 		);
 		let processor = TightBeamSignedDataProcessor::new(verifier);
-
 		// Verify content matches our transcript hash
 		let digest_oid = P::Digest::OID;
 		let verified_content = processor.process_der(signed_data_der, &digest_oid)?;
@@ -340,7 +339,10 @@ where
 		})?;
 		let session_key_bytes = cipher.decrypt_content(&enveloped_data.encrypted_content)?;
 
-		self.session_key = Some(Secret::from(session_key_bytes));
+		// Re-box into the stored `Secret<Vec<u8>>` shape; the inner buffer moves,
+		// no plaintext copy is left behind.
+		use crate::crypto::secret::ToInsecure;
+		self.session_key = Some(Secret::from(session_key_bytes.to_insecure()?.into_vec()));
 
 		Ok(())
 	}
@@ -410,7 +412,7 @@ where
 
 	/// Sign the finished digest using the server key provider.
 	async fn sign_server_finished_digest(&self, digest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		let signature_bytes = self.server_key_provider.sign(digest).await?;
+		let signature_bytes = self.server_key_provider.sign_prehash(digest).await?;
 		Ok(signature_bytes)
 	}
 
@@ -870,7 +872,7 @@ mod tests {
 			};
 
 			SecurityProfileDesc {
-				digest: HASH_SHA256,
+				digest: Some(HASH_SHA256),
 				aead: Some(aead_oid),
 				aead_key_size: Some(key_size),
 				signature: Some(SIGNER_ECDSA_WITH_SHA256),

@@ -156,6 +156,12 @@ aead = [
 ]
 signature = [
 	"crypto",
+	"digest",
+	"sha3",
+	"secp256k1",
+	"dep:ecdsa",
+	"ecdsa/verifying",
+	"ecdsa/pem",
 	"tightbeam-derive?/signature",
 	"dep:signature",
 	"cms/signature",

@@ -253,8 +253,9 @@ pub struct TestCertificateChain {
 /// All certificates have proper issuer/subject chaining and valid signatures.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub fn create_test_certificate_chain() -> TestCertificateChain {
+	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::sign::ecdsa::{Secp256k1, Signature, SigningKey};
-	use crate::crypto::sign::Signer;
+	use crate::crypto::sign::sign_canonical;
 	use crate::der::asn1::{BitString, UtcTime};
 	use crate::der::{Decode, Encode};
 	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -327,7 +328,8 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 		extensions: Some(ca_extensions(true, true, None)),
 	};
 	let root_tbs_der = root_tbs.to_der().expect("root TBS certificate encodes to DER");
-	let root_sig: Signature<Secp256k1> = root_key.sign(&root_tbs_der);
+	let root_sig: Signature<Secp256k1> =
+		sign_canonical::<Sha3_256, _>(&root_key, &root_tbs_der).expect("root TBS signs under canonical convention");
 	let root = Certificate {
 		tbs_certificate: root_tbs,
 		signature_algorithm: algorithm.clone(),
@@ -354,7 +356,8 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 		extensions: Some(ca_extensions(true, true, None)),
 	};
 	let inter_tbs_der = inter_tbs.to_der().expect("intermediate TBS certificate encodes to DER");
-	let inter_sig: Signature<Secp256k1> = root_key.sign(&inter_tbs_der);
+	let inter_sig: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(&root_key, &inter_tbs_der)
+		.expect("intermediate TBS signs under canonical convention");
 	let intermediate = Certificate {
 		tbs_certificate: inter_tbs,
 		signature_algorithm: algorithm.clone(),
@@ -380,7 +383,8 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 		extensions: None,
 	};
 	let leaf_tbs_der = leaf_tbs.to_der().expect("leaf TBS certificate encodes to DER");
-	let leaf_sig: Signature<Secp256k1> = intermediate_key.sign(&leaf_tbs_der);
+	let leaf_sig: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(&intermediate_key, &leaf_tbs_der)
+		.expect("leaf TBS signs under canonical convention");
 	let leaf = Certificate {
 		tbs_certificate: leaf_tbs,
 		signature_algorithm: algorithm,

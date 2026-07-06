@@ -40,7 +40,7 @@ use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 #[cfg(feature = "ecdh")]
 use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic};
 #[cfg(feature = "signature")]
-use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
+use crate::crypto::sign::{PrehashVerifier, Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
 #[cfg(any(
 	feature = "digest",
 	feature = "aead",
@@ -121,10 +121,13 @@ impl AeadKeySize for crate::crypto::aead::Aes256GcmOid {
 }
 
 /// Negotiation descriptor: pure OID set for a security profile.
+///
+/// Every field is `Option`: `None` uniformly means "algorithm not part of
+/// this profile" (feature disabled on the producing side).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence)]
 #[cfg_attr(feature = "derive", derive(Beamable))]
 pub struct SecurityProfileDesc {
-	pub digest: ObjectIdentifier,
+	pub digest: Option<ObjectIdentifier>,
 	pub aead: Option<ObjectIdentifier>,
 	pub aead_key_size: Option<u16>,
 	pub signature: Option<ObjectIdentifier>,
@@ -138,9 +141,9 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 	fn from(_p: &P) -> Self {
 		SecurityProfileDesc {
 			#[cfg(feature = "digest")]
-			digest: <P::DigestOid as AssociatedOid>::OID,
+			digest: Some(<P::DigestOid as AssociatedOid>::OID),
 			#[cfg(not(feature = "digest"))]
-			digest: ObjectIdentifier::new_unwrap("0.0.0.0"),
+			digest: None,
 			#[cfg(feature = "aead")]
 			aead: Some(<P::AeadOid as AssociatedOid>::OID),
 			#[cfg(not(feature = "aead"))]
@@ -306,7 +309,7 @@ pub trait AeadProvider {
 pub trait SigningProvider {
 	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync;
 	type SigningKey: Signatory<Self::Signature>;
-	type VerifyingKey: Send + Sync;
+	type VerifyingKey: PrehashVerifier<Self::Signature> + Send + Sync;
 
 	fn to_signature_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned {

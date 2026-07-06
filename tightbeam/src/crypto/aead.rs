@@ -7,6 +7,7 @@ pub use aes_kw;
 
 use crate::asn1::ObjectIdentifier;
 use crate::crypto::common::typenum::Unsigned;
+use crate::crypto::secret::SecretSlice;
 use crate::der::oid::AssociatedOid;
 
 #[cfg(not(feature = "std"))]
@@ -185,9 +186,12 @@ where
 
 /// Trait for decrypting EncryptedContentInfo
 pub trait Decryptor {
-	/// Decrypt encrypted content info and return the plaintext bytes
-	/// The nonce is extracted from the algorithm parameters in the EncryptedContentInfo
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>>;
+	/// Decrypt encrypted content info and return the plaintext bytes.
+	/// The nonce is extracted from the algorithm parameters in the
+	/// EncryptedContentInfo.
+	///
+	/// The plaintext is returned as a [`SecretSlice`] so it zeroizes on drop.
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>>;
 }
 
 // Implement Encryptor for any AEAD cipher
@@ -213,10 +217,10 @@ impl<A> Decryptor for A
 where
 	A: Aead,
 {
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>> {
 		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info)?;
 		let plaintext = self.decrypt(nonce_bytes.as_slice().into(), ciphertext)?;
-		Ok(plaintext)
+		Ok(SecretSlice::from(plaintext))
 	}
 }
 
@@ -244,9 +248,9 @@ impl RuntimeAead {
 
 // Implement Decryptor for RuntimeAead
 impl Decryptor for RuntimeAead {
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>> {
 		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info)?;
 		let plaintext = self.cipher.decrypt_bytes(&nonce_bytes, ciphertext)?;
-		Ok(plaintext)
+		Ok(SecretSlice::from(plaintext))
 	}
 }

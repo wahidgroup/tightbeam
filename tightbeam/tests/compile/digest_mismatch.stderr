@@ -1,16 +1,16 @@
-error[E0277]: the trait bound `DigestMessage: CheckDigestOid<CoreWrapper<Sha3_512Core>>` is not satisfied
+error[E0277]: the trait bound `DigestMessage: CheckDigestOid<CoreWrapper<sha3::Sha3_512Core>>` is not satisfied
   --> tests/compile/digest_mismatch.rs:43:4
    |
 43 |         .with_message_hasher::<Sha3_512>([]);
    |          ^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
-help: the trait `CheckDigestOid<CoreWrapper<Sha3_512Core>>` is not implemented for `DigestMessage`
-      but trait `CheckDigestOid<CoreWrapper<Sha3_256Core>>` is implemented for it
+help: the trait `CheckDigestOid<CoreWrapper<sha3::Sha3_512Core>>` is not implemented for `DigestMessage`
+      but trait `CheckDigestOid<CoreWrapper<sha3::Sha3_256Core>>` is implemented for it
   --> tests/compile/digest_mismatch.rs:26:10
    |
 26 | #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
    |          ^^^^^^^^
-   = help: for that trait implementation, expected `Sha3_256Core`, found `Sha3_512Core`
+   = help: for that trait implementation, expected `sha3::Sha3_256Core`, found `sha3::Sha3_512Core`
 note: required by a bound in `FrameBuilder::<T>::with_message_hasher`
   --> src/builder/frame.rs
    |

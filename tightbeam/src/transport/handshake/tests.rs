@@ -67,7 +67,7 @@ use time_imports::*;
 /// Create a default test security profile for handshake tests.
 pub fn create_default_test_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		digest: HASH_SHA3_256,
+		digest: Some(HASH_SHA3_256),
 		aead: Some(AES_256_GCM),
 		aead_key_size: Some(32), // AES-256 uses 32-byte keys
 		signature: Some(SIGNER_ECDSA_WITH_SHA3_512),

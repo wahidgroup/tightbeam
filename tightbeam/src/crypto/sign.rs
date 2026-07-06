@@ -16,6 +16,7 @@ pub mod ecdsa {
 
 // Re-exports
 pub use elliptic_curve;
+pub use signature::hazmat::{PrehashSigner, PrehashVerifier};
 pub use signature::{Error, Keypair, SignatureEncoding, Signer, Verifier};
 
 use crate::cms::content_info::CmsVersion;
@@ -38,8 +39,40 @@ pub trait SignatureAlgorithmIdentifier {
 	const ALGORITHM_OID: ObjectIdentifier;
 }
 
+/// Canonical bytes-to-sign derivation: hash `content` exactly once with `D`
+/// and sign the resulting digest as an ECDSA prehash.
+pub fn sign_canonical<D, S>(signer: &impl PrehashSigner<S>, content: impl AsRef<[u8]>) -> core::result::Result<S, Error>
+where
+	D: Digest,
+{
+	let mut hasher = D::new();
+	hasher.update(content.as_ref());
+
+	signer.sign_prehash(&hasher.finalize())
+}
+
+/// Verify a signature produced under the canonical convention: hash
+/// `content` once with `D`, verify the signature against that prehash.
+///
+/// Counterpart of [`sign_canonical`]: every tightbeam verifier must route
+/// through this function so producers and verifiers cannot diverge on the
+/// bytes-to-sign formula.
+pub fn verify_canonical<D, S>(
+	verifier: &impl PrehashVerifier<S>,
+	content: impl AsRef<[u8]>,
+	signature: &S,
+) -> core::result::Result<(), Error>
+where
+	D: Digest,
+{
+	let mut hasher = D::new();
+	hasher.update(content.as_ref());
+
+	verifier.verify_prehash(&hasher.finalize(), signature)
+}
+
 /// Signing key that can emit a CMS [`SignerInfo`] over content.
-pub trait Signatory<S>: Signer<S> + Keypair
+pub trait Signatory<S>: PrehashSigner<S> + Keypair
 where
 	S: SignatureEncoding,
 {
@@ -47,14 +80,11 @@ where
 	type DigestAlgorithm: Digest + AssociatedOid;
 
 	/// Sign data and return the signature information
-	fn to_signer_info(&self, data: impl AsRef<[u8]>) -> Result<SignerInfo> {
-		// Compute digest first
-		let mut hasher = Self::DigestAlgorithm::new();
-		hasher.update(&data);
-		hasher.finalize();
-
-		// Sign the data
-		let signature: S = self.try_sign(data.as_ref())?;
+	fn to_signer_info(&self, data: impl AsRef<[u8]>) -> Result<SignerInfo>
+	where
+		Self: Sized,
+	{
+		let signature: S = sign_canonical::<Self::DigestAlgorithm, S>(self, data)?;
 
 		// Build digest algorithm identifier
 		let digest_alg = AlgorithmIdentifierOwned { oid: Self::DigestAlgorithm::OID, parameters: None };
@@ -134,7 +164,11 @@ impl Signatory<ecdsa::Signature<ecdsa::Secp256k1>> for ecdsa::SigningKey<ecdsa::
 	}
 }
 
-// Local wrapper that supplies the SHA3-256 ECDSA AlgorithmIdentifier
+/// Local wrapper that signs under the canonical SHA3-256 convention and
+/// supplies the matching `ecdsa-with-SHA3-256` AlgorithmIdentifier.
+///
+/// Used for X.509 building, where the `x509-cert` builders hand raw TBS
+/// bytes to a [`Signer`].
 pub struct Sha3Signer<'a, S>(&'a S);
 
 impl<'a, S> crate::spki::DynSignatureAlgorithmIdentifier for Sha3Signer<'a, S> {
@@ -156,10 +190,10 @@ where
 
 impl<'a, S, Sig> signature::Signer<Sig> for Sha3Signer<'a, S>
 where
-	S: signature::Signer<Sig>,
+	S: PrehashSigner<Sig>,
 {
 	fn try_sign(&self, msg: &[u8]) -> core::result::Result<Sig, signature::Error> {
-		self.0.try_sign(msg)
+		sign_canonical::<sha3::Sha3_256, Sig>(self.0, msg)
 	}
 }
 
@@ -206,7 +240,7 @@ pub trait SignatureVerifier {
 #[cfg(all(feature = "signature", feature = "secp256k1"))]
 pub struct EcdsaSignatureVerifier<V, S, D>
 where
-	V: Verifier<S>,
+	V: PrehashVerifier<S>,
 	S: SignatureEncoding,
 	D: Digest,
 {
@@ -218,7 +252,7 @@ where
 #[cfg(all(feature = "signature", feature = "secp256k1"))]
 impl<V, S, D> EcdsaSignatureVerifier<V, S, D>
 where
-	V: Verifier<S>,
+	V: PrehashVerifier<S>,
 	S: SignatureEncoding,
 	D: Digest,
 {
@@ -259,27 +293,20 @@ where
 #[cfg(all(feature = "signature", feature = "secp256k1"))]
 impl<V, S, D> SignatureVerifier for EcdsaSignatureVerifier<V, S, D>
 where
-	V: Verifier<S>,
+	V: PrehashVerifier<S>,
 	S: SignatureEncoding,
 	D: Digest,
 {
 	fn verify_signature(&self, content: &[u8], signature_bytes: &[u8], signer_id: &SignerIdentifier) -> Result<()> {
-		// 1. Validate SID if expected
+		// Validate SID if expected
 		if let Some(ref expected_sid) = self.expected_sid {
 			if signer_id != expected_sid {
 				return Err(TightBeamError::SignatureEncodingError);
 			}
 		}
 
-		// 2. Hash the content
-		let mut hasher = D::new();
-		hasher.update(content);
-		let digest = hasher.finalize();
-
-		// 3. Parse and verify signature
 		let signature = S::try_from(signature_bytes).map_err(|_| TightBeamError::SignatureEncodingError)?;
-		self.verifying_key
-			.verify(digest.as_slice(), &signature)
+		verify_canonical::<D, S>(&self.verifying_key, content, &signature)
 			.map_err(|_| TightBeamError::SignatureEncodingError)?;
 
 		Ok(())
@@ -294,4 +321,51 @@ where
 impl SignatureAlgorithmIdentifier for ecdsa::Secp256k1Signature {
 	/// ECDSA with SHA3-256: `2.16.840.1.101.3.4.3.10`
 	const ALGORITHM_OID: ObjectIdentifier = SIGNER_ECDSA_WITH_SHA3_256;
+}
+
+#[cfg(all(test, feature = "secp256k1"))]
+mod tests {
+	use signature::hazmat::PrehashVerifier;
+
+	use super::*;
+	use crate::crypto::hash::Sha3_256;
+	use crate::random::OsRng;
+
+	type SigningKey = ecdsa::Secp256k1SigningKey;
+	type Signature = ecdsa::Secp256k1Signature;
+	type VerifyingKey = ecdsa::Secp256k1VerifyingKey;
+
+	const CONTENT: &[u8] = b"cross-convention signing content";
+
+	// One canonical bytes-to-sign convention: a SignerInfo produced by
+	// `to_signer_info` must verify through `EcdsaSignatureVerifier` over the
+	// same content.
+	#[test]
+	fn signer_info_verifies_through_ecdsa_verifier() -> crate::error::Result<()> {
+		let signing_key = SigningKey::random(&mut OsRng);
+		let signer_info = signing_key.to_signer_info(CONTENT)?;
+
+		let verifier = EcdsaSignatureVerifier::<VerifyingKey, Signature, Sha3_256>::from_signing_key(&signing_key)?;
+		verifier.verify_signature(CONTENT, signer_info.signature.as_bytes(), &signer_info.sid)?;
+
+		Ok(())
+	}
+
+	// The advertised OID is ecdsa-with-SHA3-256, so a spec-conformant
+	// external verifier checks the signature against the SHA3-256 prehash of
+	// the content. Anything else is an algorithm-identifier lie on the wire.
+	#[test]
+	fn signature_matches_advertised_sha3_oid() -> crate::error::Result<()> {
+		let signing_key = SigningKey::random(&mut OsRng);
+		let signer_info = signing_key.to_signer_info(CONTENT)?;
+
+		let mut hasher = Sha3_256::new();
+		hasher.update(CONTENT);
+
+		let prehash = hasher.finalize();
+		let signature = Signature::from_slice(signer_info.signature.as_bytes())?;
+		signing_key.verifying_key().verify_prehash(&prehash, &signature)?;
+
+		Ok(())
+	}
 }

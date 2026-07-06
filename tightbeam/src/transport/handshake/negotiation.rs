@@ -127,7 +127,7 @@ mod tests {
 
 	fn mock_profile(id: u8) -> SecurityProfileDesc {
 		SecurityProfileDesc {
-			digest: HASH_SHA3_256,
+			digest: Some(HASH_SHA3_256),
 			aead: Some(AES_256_GCM),
 			aead_key_size: Some(32),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
@@ -199,7 +199,7 @@ mod tests {
 
 		// AES-128-GCM profile
 		let aes128_gcm = SecurityProfileDesc {
-			digest: HASH_SHA256,
+			digest: Some(HASH_SHA256),
 			aead: Some(AES_128_GCM),
 			aead_key_size: Some(16),
 			signature: Some(SIGNER_ECDSA_WITH_SHA256),
@@ -211,7 +211,7 @@ mod tests {
 
 		// AES-256-GCM profile
 		let aes256_gcm = SecurityProfileDesc {
-			digest: HASH_SHA256,
+			digest: Some(HASH_SHA256),
 			aead: Some(AES_256_GCM),
 			aead_key_size: Some(32),
 			signature: Some(SIGNER_ECDSA_WITH_SHA256),

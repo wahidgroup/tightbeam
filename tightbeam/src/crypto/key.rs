@@ -31,8 +31,6 @@ mod signing {
 		DigestPrimitive, Secp256k1, Secp256k1Signature, Secp256k1SigningKey, SignPrimitive, Signature, SignatureSize,
 		SigningKey, VerifyPrimitive,
 	};
-	#[cfg(feature = "ecdh")]
-	pub use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 	pub use crate::crypto::sign::elliptic_curve::generic_array::{ArrayLength, GenericArray};
 	pub use crate::crypto::sign::elliptic_curve::ops::{Invert, Reduce};
 	pub use crate::crypto::sign::elliptic_curve::point::PointCompression;
@@ -40,14 +38,17 @@ mod signing {
 	pub use crate::crypto::sign::elliptic_curve::sec1::ModulusSize;
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::subtle::CtOption;
-	#[cfg(feature = "ecdh")]
-	pub use crate::crypto::sign::elliptic_curve::PublicKey;
 	pub use crate::crypto::sign::elliptic_curve::{
 		AffinePoint, CurveArithmetic, Error as EllipticCurveError, FieldBytesSize, PrimeCurve,
 	};
 	pub use crate::crypto::sign::{
-		Error as SignatureError, Keypair, SignatureAlgorithmIdentifier, SignatureEncoding, Signer,
+		Error as SignatureError, Keypair, PrehashSigner, SignatureAlgorithmIdentifier, SignatureEncoding,
 	};
+
+	#[cfg(feature = "ecdh")]
+	pub use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
+	#[cfg(feature = "ecdh")]
+	pub use crate::crypto::sign::elliptic_curve::PublicKey;
 }
 
 #[cfg(feature = "signature")]
@@ -73,73 +74,57 @@ mod common {
 #[cfg(any(feature = "signature", feature = "aead"))]
 use common::*;
 
-#[cfg(feature = "derive")]
-use crate::Errorizable;
-
 // =============================================================================
 // KeyError
 // =============================================================================
 
 /// Errors from key provider operations.
-#[cfg_attr(feature = "derive", derive(Errorizable))]
+///
+/// Deliberately does not derive `Errorizable`: this module builds without
+/// the `derive` feature, so the message strings live in exactly one place --
+/// the `impl_error_display!` block below.
 #[derive(Debug)]
 pub enum KeyError {
 	/// SPKI encoding/decoding error
-	#[cfg_attr(feature = "derive", error("SPKI error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	SpkiError(crate::spki::Error),
 
 	/// Elliptic curve operation error
 	#[cfg(feature = "signature")]
-	#[cfg_attr(feature = "derive", error("Elliptic curve error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	EllipticCurveError(EllipticCurveError),
 
 	/// Signature/ECDSA error (e.g., invalid key bytes)
 	#[cfg(feature = "signature")]
-	#[cfg_attr(feature = "derive", error("Signature error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	SignatureError(SignatureError),
 
 	/// AEAD encryption/decryption error
 	#[cfg(feature = "aead")]
-	#[cfg_attr(feature = "derive", error("AEAD error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	AeadError(AeadError),
 
 	/// Nonce length mismatch
 	#[cfg(feature = "aead")]
-	#[cfg_attr(
-		feature = "derive",
-		error("Nonce length mismatch: expected {expected}, got {received}")
-	)]
 	NonceLengthError(crate::error::ReceivedExpectedError<usize, usize>),
 
 	/// Operation not supported by this key provider
-	#[cfg_attr(feature = "derive", error("Operation not supported by this key provider"))]
 	UnsupportedOperation,
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for KeyError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			KeyError::SpkiError(e) => write!(f, "SPKI error: {}", e),
-			#[cfg(feature = "signature")]
-			KeyError::EllipticCurveError(e) => write!(f, "Elliptic curve error: {}", e),
-			#[cfg(feature = "signature")]
-			KeyError::SignatureError(e) => write!(f, "Signature error: {}", e),
-			#[cfg(feature = "aead")]
-			KeyError::AeadError(e) => write!(f, "AEAD error: {}", e),
-			#[cfg(feature = "aead")]
-			KeyError::NonceLengthError(e) => write!(f, "Nonce length mismatch: {}", e),
-			KeyError::UnsupportedOperation => write!(f, "Operation not supported by this key provider"),
-		}
-	}
-}
+crate::impl_error_display!(unconditional KeyError {
+	SpkiError(e) => "SPKI error: {e}",
+	#[cfg(feature = "signature")]
+	EllipticCurveError(e) => "Elliptic curve error: {e}",
+	#[cfg(feature = "signature")]
+	SignatureError(e) => "Signature error: {e}",
+	#[cfg(feature = "aead")]
+	AeadError(e) => "AEAD error: {e}",
+	#[cfg(feature = "aead")]
+	NonceLengthError(e) => "Nonce length mismatch: {e}",
+	UnsupportedOperation => "Operation not supported by this key provider",
+});
 
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for KeyError {}
+crate::impl_from!(crate::spki::Error => KeyError::SpkiError);
+crate::impl_from!(#[cfg(feature = "signature")] EllipticCurveError => KeyError::EllipticCurveError);
+crate::impl_from!(#[cfg(feature = "signature")] SignatureError => KeyError::SignatureError);
+crate::impl_from!(#[cfg(feature = "aead")] AeadError => KeyError::AeadError);
 
 /// Specification for providing a cryptographic signing key in various formats.
 ///
@@ -173,7 +158,7 @@ impl SigningKeySpec {
 		SignatureSize<C>: ArrayLength<u8>,
 		FieldBytesSize<C>: ModulusSize,
 		AffinePoint<C>: VerifyPrimitive<C> + FromEncodedPoint<C> + ToEncodedPoint<C>,
-		SigningKey<C>: Signer<Signature<C>> + Keypair + Send + Sync + Debug + 'static,
+		SigningKey<C>: PrehashSigner<Signature<C>> + Keypair + Send + Sync + Debug + 'static,
 		<SigningKey<C> as Keypair>::VerifyingKey: EncodePublicKey,
 		Signature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync + 'static,
 	{
@@ -214,16 +199,21 @@ pub trait SigningKeyProvider: Send + Sync + Debug {
 	/// Returns [`KeyError`] if the backend cannot retrieve the public key.
 	fn to_public_key_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
 
-	/// Signs data using this provider's private key.
+	/// Signs a precomputed digest (prehash) using this provider's private key.
+	///
+	/// The canonical tightbeam convention hashes content exactly once (see
+	/// `crypto::sign::sign_canonical`); providers MUST sign the given prehash
+	/// directly and MUST NOT rehash it, so the produced signature matches the
+	/// advertised signature-algorithm OID regardless of backend.
 	///
 	/// # Arguments
 	///
-	/// * `data` - The data to sign (typically a message or hash)
+	/// * `prehash` - The digest of the content to sign
 	///
 	/// # Returns
 	///
 	/// DER-encoded signature bytes.
-	fn sign(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
+	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
 
 	/// Performs key agreement (ECDH, X25519, etc).
 	///
@@ -267,7 +257,7 @@ pub trait SigningKeyProvider: Send + Sync + Debug {
 #[cfg(feature = "signature")]
 pub struct InMemorySigningKeyProvider<K, S>
 where
-	K: Signer<S> + Keypair,
+	K: PrehashSigner<S> + Keypair,
 	S: SignatureEncoding,
 {
 	signing_key: K,
@@ -277,7 +267,7 @@ where
 #[cfg(feature = "signature")]
 impl<K, S> From<K> for InMemorySigningKeyProvider<K, S>
 where
-	K: Signer<S> + Keypair,
+	K: PrehashSigner<S> + Keypair,
 	S: SignatureEncoding,
 {
 	fn from(signing_key: K) -> Self {
@@ -288,7 +278,7 @@ where
 #[cfg(feature = "signature")]
 impl<K, S> Debug for InMemorySigningKeyProvider<K, S>
 where
-	K: Signer<S> + Keypair + Debug,
+	K: PrehashSigner<S> + Keypair + Debug,
 	S: SignatureEncoding,
 {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -301,7 +291,7 @@ where
 #[cfg(feature = "signature")]
 impl<K, S> SigningKeyProvider for InMemorySigningKeyProvider<K, S>
 where
-	K: Signer<S> + Keypair + Send + Sync + Debug + 'static,
+	K: PrehashSigner<S> + Keypair + Send + Sync + Debug + 'static,
 	K::VerifyingKey: EncodePublicKey,
 	S: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync + 'static,
 {
@@ -316,13 +306,18 @@ where
 			.to_public_key_der()
 			.map(|der| der.into_vec())
 			.map_err(KeyError::from);
+
 		Box::pin(async move { result })
 	}
 
-	fn sign(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
-		let signature: S = self.signing_key.sign(data);
-		let bytes = signature.to_bytes().as_ref().to_vec();
-		Box::pin(async move { Ok(bytes) })
+	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		let result = self
+			.signing_key
+			.sign_prehash(prehash)
+			.map(|signature: S| signature.to_bytes().as_ref().to_vec())
+			.map_err(KeyError::from);
+
+		Box::pin(async move { result })
 	}
 }
 
@@ -330,7 +325,7 @@ where
 #[cfg(feature = "signature")]
 impl<K, S> SigningKeyProvider for Arc<InMemorySigningKeyProvider<K, S>>
 where
-	K: Signer<S> + Keypair + Send + Sync + Debug + 'static,
+	K: PrehashSigner<S> + Keypair + Send + Sync + Debug + 'static,
 	K::VerifyingKey: EncodePublicKey,
 	S: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync + 'static,
 {
@@ -342,8 +337,8 @@ where
 		self.as_ref().to_public_key_bytes()
 	}
 
-	fn sign(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
-		self.as_ref().sign(data)
+	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		self.as_ref().sign_prehash(prehash)
 	}
 }
 
@@ -407,7 +402,7 @@ where
 	SignatureSize<C>: ArrayLength<u8>,
 	FieldBytesSize<C>: ModulusSize,
 	AffinePoint<C>: VerifyPrimitive<C> + FromEncodedPoint<C> + ToEncodedPoint<C>,
-	SigningKey<C>: Signer<Signature<C>> + Keypair + Send + Sync + Debug,
+	SigningKey<C>: PrehashSigner<Signature<C>> + Keypair + Send + Sync + Debug,
 	<SigningKey<C> as Keypair>::VerifyingKey: EncodePublicKey,
 	Signature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync,
 {
@@ -422,13 +417,18 @@ where
 			.to_public_key_der()
 			.map(|der| der.into_vec())
 			.map_err(KeyError::from);
+
 		Box::pin(async move { result })
 	}
 
-	fn sign(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
-		let signature: Signature<C> = self.signing_key.sign(data);
-		let bytes: Vec<u8> = signature.to_bytes().as_ref().to_vec();
-		Box::pin(async move { Ok(bytes) })
+	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		let result = self
+			.signing_key
+			.sign_prehash(prehash)
+			.map(|signature: Signature<C>| signature.to_bytes().as_ref().to_vec())
+			.map_err(KeyError::from);
+
+		Box::pin(async move { result })
 	}
 
 	#[cfg(feature = "ecdh")]
@@ -455,7 +455,7 @@ where
 	SignatureSize<C>: ArrayLength<u8>,
 	FieldBytesSize<C>: ModulusSize,
 	AffinePoint<C>: VerifyPrimitive<C> + FromEncodedPoint<C> + ToEncodedPoint<C>,
-	SigningKey<C>: Signer<Signature<C>> + Keypair + Send + Sync + Debug,
+	SigningKey<C>: PrehashSigner<Signature<C>> + Keypair + Send + Sync + Debug,
 	<SigningKey<C> as Keypair>::VerifyingKey: EncodePublicKey,
 	Signature<C>: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync,
 {
@@ -467,8 +467,8 @@ where
 		self.as_ref().to_public_key_bytes()
 	}
 
-	fn sign(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
-		self.as_ref().sign(data)
+	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+		self.as_ref().sign_prehash(prehash)
 	}
 
 	fn key_agreement(
@@ -689,8 +689,15 @@ mod tests {
 	use rand_core::OsRng;
 
 	use super::*;
+	use crate::crypto::hash::{Digest, Sha3_256};
 	use crate::crypto::sign::ecdsa::k256::ecdsa::SigningKey;
-	use crate::crypto::sign::Verifier;
+	use crate::crypto::sign::PrehashVerifier;
+
+	fn prehash(data: &[u8]) -> Vec<u8> {
+		let mut hasher = Sha3_256::new();
+		hasher.update(data);
+		hasher.finalize().to_vec()
+	}
 
 	#[tokio::test]
 	async fn test_secp256k1_provider_public_key() -> Result<(), Box<dyn std::error::Error>> {
@@ -708,12 +715,12 @@ mod tests {
 		let signing_key = SigningKey::random(&mut OsRng);
 		let provider = Secp256k1KeyProvider::from(signing_key.clone());
 
-		let data = b"test data to sign";
-		let signature_bytes = provider.sign(data).await?;
+		let digest = prehash(b"test data to sign");
+		let signature_bytes = provider.sign_prehash(&digest).await?;
 
 		// Verify signature using the public key
 		let signature = Secp256k1Signature::from_slice(&signature_bytes)?;
-		signing_key.verifying_key().verify(data, &signature)?;
+		signing_key.verifying_key().verify_prehash(&digest, &signature)?;
 
 		Ok(())
 	}
@@ -744,12 +751,12 @@ mod tests {
 		let signing_key = SigningKey::random(&mut OsRng);
 		let provider: Secp256k1Provider = InMemorySigningKeyProvider::from(signing_key.clone());
 
-		let data = b"test data to sign";
-		let signature_bytes = provider.sign(data).await?;
+		let digest = prehash(b"test data to sign");
+		let signature_bytes = provider.sign_prehash(&digest).await?;
 
 		// Verify signature using the public key
 		let signature = Secp256k1Signature::from_slice(&signature_bytes)?;
-		signing_key.verifying_key().verify(data, &signature)?;
+		signing_key.verifying_key().verify_prehash(&digest, &signature)?;
 
 		Ok(())
 	}
@@ -764,11 +771,11 @@ mod tests {
 		// DER-encoded SPKI for secp256k1 is 88 bytes
 		assert_eq!(public_key_bytes.len(), 88);
 
-		let data = b"test";
-		let signature_bytes = provider.sign(data).await?;
+		let digest = prehash(b"test");
+		let signature_bytes = provider.sign_prehash(&digest).await?;
 
 		let signature = Secp256k1Signature::from_slice(&signature_bytes)?;
-		signing_key.verifying_key().verify(data, &signature)?;
+		signing_key.verifying_key().verify_prehash(&digest, &signature)?;
 
 		Ok(())
 	}

@@ -183,7 +183,7 @@ mod tests {
 
 	fn create_test_profile(aead_oid: ObjectIdentifier, key_size: u16) -> SecurityProfileDesc {
 		SecurityProfileDesc {
-			digest: HASH_SHA256,
+			digest: Some(HASH_SHA256),
 			aead: Some(aead_oid),
 			aead_key_size: Some(key_size),
 			signature: Some(SIGNER_ECDSA_WITH_SHA256),

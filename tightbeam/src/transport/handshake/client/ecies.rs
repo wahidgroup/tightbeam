@@ -16,8 +16,8 @@ use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+use crate::crypto::sign::PrehashVerifier;
 use crate::crypto::sign::SignatureEncoding;
-use crate::crypto::sign::Verifier;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::der::{Decode, Encode};
@@ -72,7 +72,7 @@ where
 	P::Signature: SignatureEncoding,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
-	P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey,
+	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey,
 	P::AeadCipher: KeyInit,
 	M: EciesMessageOps,
 {
@@ -348,12 +348,12 @@ where
 			// Server requires mutual auth - ensure we have client identity
 			let cert = self.client_certificate.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
 			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-			let signature_bytes = key_provider.sign(&transcript_digest).await?;
+			let signature_bytes = key_provider.sign_prehash(&transcript_digest).await?;
 			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(signature_bytes)?)))
 		} else if let Some(cert) = &self.client_certificate {
 			// Client wants mutual auth but server doesn't require it
 			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let signature_bytes = key_provider.sign(&transcript_digest).await?;
+			let signature_bytes = key_provider.sign_prehash(&transcript_digest).await?;
 			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(signature_bytes)?)))
 		} else {
 			// No mutual auth
@@ -443,7 +443,7 @@ where
 	) -> Result<(), HandshakeError> {
 		let signature = P::Signature::try_from(signature_bytes).map_err(|e| e.into())?;
 
-		verifying_key.verify(digest, &signature)?;
+		verifying_key.verify_prehash(digest, &signature)?;
 
 		Ok(())
 	}
@@ -509,7 +509,7 @@ where
 	P::Signature: SignatureEncoding + Send + Sync,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
-	P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + Send + Sync,
+	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey + Send + Sync,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
 	M: EciesMessageOps + Send + Sync,
 {
@@ -594,7 +594,7 @@ mod tests {
 	use crate::crypto::ecies::Secp256k1EciesMessage;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
-	use crate::crypto::sign::Signer;
+	use crate::crypto::sign::PrehashSigner;
 	use crate::der::Encode;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 	use crate::transport::handshake::tests::*;
@@ -635,7 +635,7 @@ mod tests {
 			&accept_der,
 		);
 
-		let signature_bytes: Secp256k1Signature = test_cert.signing_key.try_sign(&transcript_hash)?;
+		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 		let server_handshake_der =
 			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
 
@@ -681,11 +681,11 @@ mod tests {
 	#[tokio::test]
 	async fn test_client_profile_validation() -> Result<(), Box<dyn core::error::Error>> {
 		let mk_profile = |id: u8| SecurityProfileDesc {
-			digest: match id {
+			digest: Some(match id {
 				1 => HASH_SHA3_256,
 				2 => HASH_SHA3_384,
 				_ => HASH_SHA3_512,
-			},
+			}),
 			aead: Some(AES_256_GCM),
 			aead_key_size: Some(32),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
@@ -730,7 +730,7 @@ mod tests {
 					.raw_bytes(),
 				&accept_der,
 			);
-			let signature: Secp256k1Signature = test_cert.signing_key.try_sign(&transcript_hash)?;
+			let signature: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 			let signature_bytes = signature.to_bytes().to_vec();
 
 			let response = ServerHandshake {

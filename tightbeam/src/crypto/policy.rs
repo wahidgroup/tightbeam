@@ -80,8 +80,9 @@ impl VerificationPolicy for Secp256k1Policy {
 		message: &[u8],
 		signature: &[u8],
 	) -> Result<(), CertificateValidationError> {
+		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
-		use crate::crypto::sign::Verifier;
+		use crate::crypto::sign::verify_canonical;
 		use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
 		use crate::spki::DecodePublicKey;
 
@@ -90,11 +91,12 @@ impl VerificationPolicy for Secp256k1Policy {
 			return Err(CertificateValidationError::UnsupportedAlgorithm(*algorithm_oid));
 		}
 
-		// RFC 5280 §6.1.3(a)(1): cryptographic signature verification primitive.
+		// RFC 5280 §6.1.3(a)(1): cryptographic signature verification primitive
+		// under the canonical convention (SHA3-256 prehash).
 		let verifying_key = Secp256k1VerifyingKey::from_public_key_der(public_key_der)?;
 		let sig = Secp256k1Signature::try_from(signature)?;
 
-		verifying_key.verify(message, &sig)?;
+		verify_canonical::<Sha3_256, _>(&verifying_key, message, &sig)?;
 		Ok(())
 	}
 }

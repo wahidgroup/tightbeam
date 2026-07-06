@@ -7,12 +7,18 @@ use crate::{Frame, Metadata, TightBeamError, Version};
 
 #[cfg(feature = "aead")]
 use crate::asn1::OctetString;
+#[cfg(feature = "signature")]
+use crate::crypto::hash::Digest;
 #[cfg(feature = "crypto")]
 use crate::crypto::profiles::SecurityProfile;
 #[cfg(feature = "signature")]
-use crate::crypto::sign::{SignatureEncoding, Verifier};
+use crate::crypto::sign::{verify_canonical, PrehashVerifier, SignatureEncoding};
+#[cfg(feature = "signature")]
+use crate::der::oid::AssociatedOid;
 #[cfg(feature = "signature")]
 use crate::der::Encode;
+#[cfg(feature = "signature")]
+use crate::error::ReceivedExpectedError;
 #[cfg(feature = "aead")]
 use crate::EncryptedContentInfo;
 #[cfg(feature = "signature")]
@@ -109,7 +115,9 @@ impl Frame {
 
 	/// Verify the signature of the TightBeam message
 	///
-	/// This verifies the signature against the entire TightBeam structure.
+	/// This verifies the signature against the entire TightBeam structure
+	/// under the canonical convention: the TBS encoding is hashed once with
+	/// `D` and the signature is checked against that prehash.
 	///
 	/// # Arguments
 	/// * `verifier` - The verifier to use for signature verification
@@ -120,13 +128,26 @@ impl Frame {
 	/// # Errors
 	/// Returns an error if:
 	/// - The TightBeam doesn't contain a signature
+	/// - The SignerInfo advertises a digest other than `D`
 	/// - Signature verification fails
-	pub fn verify<S>(&self, verifier: &impl Verifier<S>) -> Result<()>
+	pub fn verify<S, D>(&self, verifier: &impl PrehashVerifier<S>) -> Result<()>
 	where
 		S: SignatureEncoding,
+		D: Digest + AssociatedOid,
 	{
 		// Extract signature info from the Frame
 		let signature_info = self.nonrepudiation.as_ref().ok_or(TightBeamError::MissingSignature)?;
+
+		// The canonical convention binds the signature to the digest declared
+		// in the SignerInfo; a mismatch is algorithm confusion, not merely a
+		// bad signature.
+		if signature_info.digest_alg.oid != D::OID {
+			return Err(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+				signature_info.digest_alg.oid,
+				D::OID,
+			))));
+		}
+
 		let signature_bytes: &[u8] = signature_info.signature.as_bytes();
 
 		// Decode the signature
@@ -136,7 +157,7 @@ impl Frame {
 		let tbs_der = self.to_tbs()?;
 
 		// Verify signature
-		verifier.verify(&tbs_der, &signature)?;
+		verify_canonical::<D, S>(verifier, &tbs_der, &signature)?;
 
 		Ok(())
 	}
@@ -156,14 +177,20 @@ impl Frame {
 	/// * `decryptor` - The AEAD decryptor to use for decryption
 	///
 	/// # Returns
-	/// The decrypted plaintext bytes. If the frame was compressed, these bytes
-	/// are still compressed and need to be decompressed separately.
+	/// The decrypted plaintext as a [`SecretSlice`](crate::crypto::secret::SecretSlice)
+	/// that zeroizes on drop. If the frame was compressed, these bytes are
+	/// still compressed and need to be decompressed separately. Callers that
+	/// need a raw copy opt out explicitly via
+	/// [`ToInsecure`](crate::crypto::secret::ToInsecure).
 	///
 	/// # Errors
 	/// Returns an error if:
 	/// - The metadata doesn't contain encryption info (V0 metadata)
 	/// - Decryption fails
-	pub fn decrypt_bytes(mut self, decryptor: &impl crate::crypto::aead::Decryptor) -> Result<Vec<u8>> {
+	pub fn decrypt_bytes(
+		mut self,
+		decryptor: &impl crate::crypto::aead::Decryptor,
+	) -> Result<crate::crypto::secret::SecretSlice<u8>> {
 		let mut encrypted_content_info = self
 			.metadata
 			.confidentiality
@@ -202,9 +229,12 @@ impl Frame {
 	where
 		T: Message,
 	{
+		use crate::crypto::secret::ToInsecure;
+
 		let was_compressed = self.metadata.compactness.is_some();
-		let plaintext = self.decrypt_bytes(decryptor)?;
-		let decompressed = Self::decompress(plaintext, was_compressed, inflator)?;
+		let plaintext = self.decrypt_bytes(decryptor)?.to_insecure()?;
+		let decompressed = Self::decompress(plaintext.into_vec(), was_compressed, inflator)?;
+
 		crate::decode::<T>(&decompressed)
 	}
 }

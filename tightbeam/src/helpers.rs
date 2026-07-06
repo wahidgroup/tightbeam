@@ -30,6 +30,8 @@ mod signature {
 	pub use crate::crypto::key::SigningKeyProvider;
 	pub use crate::crypto::sign::SignerInfoExt;
 	pub use crate::der::oid::AssociatedOid;
+	// `Any` is only consumed by the AEAD helpers below.
+	#[cfg(feature = "aead")]
 	pub use crate::der::Any;
 	pub use crate::spki::AlgorithmIdentifierOwned;
 	pub use crate::x509::ext::pkix::SubjectKeyIdentifier;
@@ -311,8 +313,14 @@ impl crate::Frame {
 		// 1. Encode the frame (without signature field)
 		let unsigned_bytes = self.to_tbs()?;
 
-		// 2. Sign the frame
-		let signature_bytes = provider.sign(&unsigned_bytes).await?;
+		// 2. Sign under the canonical convention: hash the TBS bytes once
+		// with `D`, then have the provider sign that prehash. The digest
+		// algorithm recorded in the SignerInfo below is therefore the digest
+		// actually used by the signature.
+		let mut tbs_hasher = D::new();
+		tbs_hasher.update(&unsigned_bytes);
+
+		let signature_bytes = provider.sign_prehash(&tbs_hasher.finalize()).await?;
 
 		// 3. Get signature algorithm from provider
 		let signature_algorithm = provider.algorithm();
@@ -573,44 +581,47 @@ mod tests {
 		use crate::testing::{create_test_message, create_test_signing_key};
 		use crate::{TightBeamError, Version};
 
-		/// Digest whose output (8 bytes) is shorter than the 20-byte SKID
+		/// Digest whose output (16 bytes) is shorter than the 20-byte SKID
 		/// truncation window; exercises the guard in `sign_with_provider`.
+		/// 16 bytes keeps the prehash long enough for k256's `sign_prehash`
+		/// (which rejects prehashes below half the field size), so the SKID
+		/// guard -- not the signature backend -- is what trips.
 		#[derive(Clone, Default)]
-		struct EightByteDigest(Sha3_256);
+		struct SixteenByteDigest(Sha3_256);
 
-		impl digest::Update for EightByteDigest {
+		impl digest::Update for SixteenByteDigest {
 			fn update(&mut self, data: &[u8]) {
 				digest::Update::update(&mut self.0, data);
 			}
 		}
 
-		impl digest::OutputSizeUser for EightByteDigest {
-			type OutputSize = digest::consts::U8;
+		impl digest::OutputSizeUser for SixteenByteDigest {
+			type OutputSize = digest::consts::U16;
 		}
 
-		impl digest::FixedOutput for EightByteDigest {
+		impl digest::FixedOutput for SixteenByteDigest {
 			fn finalize_into(self, out: &mut digest::Output<Self>) {
 				let full = digest::FixedOutput::finalize_fixed(self.0);
-				out.copy_from_slice(&full[..8]);
+				out.copy_from_slice(&full[..16]);
 			}
 		}
 
-		impl digest::Reset for EightByteDigest {
+		impl digest::Reset for SixteenByteDigest {
 			fn reset(&mut self) {
 				digest::Reset::reset(&mut self.0);
 			}
 		}
 
-		impl digest::FixedOutputReset for EightByteDigest {
+		impl digest::FixedOutputReset for SixteenByteDigest {
 			fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
 				let full = digest::FixedOutputReset::finalize_fixed_reset(&mut self.0);
-				out.copy_from_slice(&full[..8]);
+				out.copy_from_slice(&full[..16]);
 			}
 		}
 
-		impl digest::HashMarker for EightByteDigest {}
+		impl digest::HashMarker for SixteenByteDigest {}
 
-		impl AssociatedOid for EightByteDigest {
+		impl AssociatedOid for SixteenByteDigest {
 			const OID: crate::der::asn1::ObjectIdentifier = crate::oids::HASH_SHA256;
 		}
 
@@ -626,7 +637,7 @@ mod tests {
 			let signing_key = create_test_signing_key();
 			let provider = Secp256k1KeyProvider::from(signing_key);
 
-			let result = frame.sign_with_provider::<EightByteDigest, _>(&provider).await;
+			let result = frame.sign_with_provider::<SixteenByteDigest, _>(&provider).await;
 			assert!(matches!(result, Err(TightBeamError::InvalidAlgorithm)));
 
 			Ok(())
@@ -664,7 +675,9 @@ mod tests {
 		use crate::cms::signed_data::SignerIdentifier;
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::Secp256k1Signature;
-		use crate::crypto::sign::{secp256k1_signer_identifier, SignatureAlgorithmIdentifier, Signer, SignerInfoExt};
+		use crate::crypto::sign::{
+			secp256k1_signer_identifier, sign_canonical, SignatureAlgorithmIdentifier, SignerInfoExt,
+		};
 		use crate::der::oid::AssociatedOid;
 		use crate::error::Result;
 		use crate::spki::AlgorithmIdentifierOwned;
@@ -685,8 +698,10 @@ mod tests {
 			let frame = unsigned_frame()?;
 			let signing_key = create_test_signing_key();
 
+			// External backends must follow the canonical convention:
+			// SHA3-256 over the TBS bytes, ECDSA over that prehash.
 			let tbs = frame.to_tbs()?;
-			let signature: Secp256k1Signature = signing_key.sign(&tbs);
+			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;
 
 			let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
 			let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
@@ -695,7 +710,7 @@ mod tests {
 			let signed = frame.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)?;
 			assert!(signed.nonrepudiation.is_some());
 
-			signed.verify::<Secp256k1Signature>(signing_key.verifying_key())?;
+			signed.verify::<Secp256k1Signature, Sha3_256>(signing_key.verifying_key())?;
 
 			Ok(())
 		}
@@ -706,7 +721,7 @@ mod tests {
 			let signing_key = create_test_signing_key();
 
 			let tbs = frame.to_tbs()?;
-			let signature: Secp256k1Signature = signing_key.sign(&tbs);
+			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;
 
 			let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
 			let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
@@ -717,7 +732,7 @@ mod tests {
 			assert!(matches!(signer_info.sid, SignerIdentifier::SubjectKeyIdentifier(_)));
 
 			let signed = frame.attach_signer_info(signer_info);
-			signed.verify::<Secp256k1Signature>(signing_key.verifying_key())?;
+			signed.verify::<Secp256k1Signature, Sha3_256>(signing_key.verifying_key())?;
 
 			Ok(())
 		}

@@ -904,7 +904,7 @@ mod tests {
 			// Verify signature before decrypting (decrypt consumes the frame)
 			let signing_key = create_test_signing_key();
 			let verifying_key = signing_key.verifying_key();
-			assert!(tightbeam.verify::<Secp256k1Signature>(verifying_key).is_ok());
+			assert!(tightbeam.verify::<Secp256k1Signature, Sha3_256>(verifying_key).is_ok());
 
 			// Decrypt (automatically decompresses) and verify
 			let (_, cipher) = create_test_cipher_key();
