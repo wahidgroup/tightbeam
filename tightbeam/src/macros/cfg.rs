@@ -8,6 +8,9 @@
 #[doc(hidden)]
 macro_rules! __tb_if_std {
 	({ $($body:tt)* }) => { { $($body)* } };
+	// Associated-item form: emits the tokens verbatim (e.g. a method with a
+	// `self` receiver, which the `item` fragment cannot parse).
+	($($body:tt)*) => { $($body)* };
 }
 
 #[cfg(not(feature = "std"))]
@@ -15,6 +18,7 @@ macro_rules! __tb_if_std {
 #[doc(hidden)]
 macro_rules! __tb_if_std {
 	({ $($body:tt)* }) => {{}};
+	($($body:tt)*) => {};
 }
 
 #[cfg(feature = "tokio")]

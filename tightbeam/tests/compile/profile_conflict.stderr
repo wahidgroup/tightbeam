@@ -1,0 +1,16 @@
+error: Cannot specify both numeric profile (= N) and type-based profile (Type) simultaneously
+  --> tests/compile/profile_conflict.rs:8:1
+   |
+ 8 | / #[beam(profile = 1, profile(TightbeamProfile))]
+ 9 | | struct ConflictedMessage {
+10 | |     content: String,
+11 | | }
+   | |_^
+
+warning: unused import: `tightbeam::crypto::profiles::TightbeamProfile`
+ --> tests/compile/profile_conflict.rs:1:5
+  |
+1 | use tightbeam::crypto::profiles::TightbeamProfile;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

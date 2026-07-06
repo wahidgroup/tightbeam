@@ -86,8 +86,8 @@ pub trait CheckSignatureOid<S: SignatureAlgorithmIdentifier>: private::SealedSig
 }
 
 /// Zero-allocation error accumulator for FrameBuilder.
-/// Uses fixed-size storage for up to 5 errors (the maximum possible),
-/// falling back to Vec only if exceeded.
+/// Stores up to 5 errors inline, which covers the common case of one
+/// deferred error per builder method; spills to a Vec beyond that.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Default)]
 enum ErrorAccumulator {
@@ -137,8 +137,15 @@ impl ErrorAccumulator {
 		}
 	}
 
-	fn is_empty(&self) -> bool {
-		matches!(self, Self::None)
+	/// Collapse into the terminal build error: a single deferred error
+	/// surfaces bare so callers can match on it directly; only genuinely
+	/// multiple errors are wrapped in `Sequence`.
+	fn into_error(self) -> Option<TightBeamError> {
+		match self {
+			Self::None => None,
+			Self::One(error) => Some(error),
+			other => Some(TightBeamError::Sequence(other.into())),
+		}
 	}
 }
 
@@ -250,7 +257,7 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Set a custom reality (V2+ only)
+	/// Set the routing matrix (V3+ only)
 	pub fn with_matrix<M>(mut self, matrix: M) -> Self
 	where
 		M: IntoMatrixDyn,
@@ -267,7 +274,7 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Set a custom reality (V2+ only) - convenience method for MatrixDyn
+	/// Set the routing matrix (V3+ only) - convenience method for MatrixDyn
 	pub fn with_matrix_dyn(mut self, matrix: MatrixDyn) -> Self {
 		self.metadata_builder = self.metadata_builder.with_matrix(matrix);
 		self
@@ -302,7 +309,7 @@ impl<T: Message> FrameBuilder<T> {
 
 		#[cfg(feature = "digest")]
 		{
-			let has_message_integrity = self.metadata_builder.has_hash();
+			let has_message_integrity = self.metadata_builder.has_integrity();
 			if T::MUST_HAVE_MESSAGE_INTEGRITY && !has_message_integrity {
 				return Err(TightBeamError::MissingDigestInfo);
 			}
@@ -355,16 +362,18 @@ impl<T: Message> FrameBuilder<T> {
 			return self;
 		}
 
-		// Get the concrete RNG or default to OS RNG
-		let rng: &mut dyn rand_core::CryptoRngCore = match self.rng.as_mut() {
-			Some(boxed_rng) => &mut **boxed_rng,
-			None => &mut rand_core::OsRng,
-		};
-
-		// Generate nonce
-		let nonce = Cipher::generate_nonce(rng);
+		// The nonce is generated inside the closure so it is bound to the
+		// encryption, not to the builder configuration: a builder that is
+		// ever made reusable must not reuse a captured nonce.
+		let rng = self.rng.take();
 		let message_oid = self.message_oid;
 		self.encryptor = Some(Box::new(move |plaintext: &[u8]| {
+			let mut rng = rng;
+			let rng: &mut dyn rand_core::CryptoRngCore = match rng.as_mut() {
+				Some(boxed_rng) => &mut **boxed_rng,
+				None => &mut rand_core::OsRng,
+			};
+			let nonce = Cipher::generate_nonce(rng);
 			let encrypted_content = <Cipher as Encryptor<C>>::encrypt_content(&cipher, plaintext, &nonce, message_oid)?;
 			Ok(encrypted_content)
 		}));
@@ -517,9 +526,9 @@ impl<T: Message> TypeBuilder<Frame> for FrameBuilder<T> {
 	/// - Required fields are missing
 	/// - Metadata validation fails
 	/// - Signing fails (if signer was provided)
-	fn build(self) -> Result<Frame> {
-		if !self.errors.is_empty() {
-			return Err(TightBeamError::Sequence(self.errors.into()));
+	fn build(mut self) -> Result<Frame> {
+		if let Some(error) = core::mem::take(&mut self.errors).into_error() {
+			return Err(error);
 		}
 
 		// 0. Validate message restrictions
@@ -917,9 +926,12 @@ mod tests {
 		assert!(result.is_err());
 	}
 
+	// Hashing before the message is set defers an `InvalidBody` error; a
+	// single deferred error surfaces bare rather than as a one-element
+	// `Sequence`.
 	#[test]
 	#[cfg(feature = "sha3")]
-	fn test_error_accumulation() {
+	fn test_single_deferred_error_surfaces_bare() {
 		let message = create_test_message(None);
 		let result = FrameBuilder::from(Version::V0)
 			.with_id("error-test")
@@ -927,24 +939,40 @@ mod tests {
 			.with_message_hasher::<Sha3_256>([])
 			.with_message(message)
 			.build();
-		assert!(result.is_err());
-		assert!(matches!(result, Err(TightBeamError::Sequence(_))));
+		assert!(matches!(result, Err(TightBeamError::InvalidBody)));
 	}
 
+	#[test]
+	#[cfg(feature = "sha3")]
+	fn test_multiple_deferred_errors_surface_as_sequence() {
+		let message = create_test_message(None);
+		let result = FrameBuilder::from(Version::V0)
+			.with_id("error-test")
+			.with_order(1696521600)
+			.with_message_hasher::<Sha3_256>([])
+			.with_message_hasher::<Sha3_256>([])
+			.with_message(message)
+			.build();
+		assert!(matches!(result, Err(TightBeamError::Sequence(ref errors)) if errors.len() == 2));
+	}
+
+	// V1 is the first version whose metadata carries integrity info; V0 with
+	// `message_integrity` is rejected by `MetadataBuilder::build`.
 	#[test]
 	#[cfg(feature = "derive")]
 	fn test_compose_macro() -> Result<()> {
 		let message = create_test_message(None);
 		let frame = compose! {
-			V0:
+			V1:
 				id: "test-id",
 				order: 1696521600,
 				message: message,
 				message_integrity<Sha3_256>: [] // no salt
 		}?;
-		assert_eq!(frame.version, Version::V0);
+		assert_eq!(frame.version, Version::V1);
 		assert_eq!(frame.metadata.id, b"test-id");
 		assert_eq!(frame.metadata.order, 1696521600);
+		assert!(frame.metadata.integrity.is_some());
 		Ok(())
 	}
 
@@ -1114,186 +1142,140 @@ mod tests {
 			};
 		}
 
-		#[test]
-		fn test_message_traits() {
-			let (_, cipher) = create_test_cipher_key();
-			let signing_key = create_test_signing_key();
-
-			// Helper to compose frames based on requirements
-			#[allow(clippy::too_many_arguments)]
-			fn compose_frame<T>(
-				test_name: &str,
-				message: T,
-				cipher: Aes256Gcm,
-				signing_key: Secp256k1SigningKey,
-				confidential: bool,
-				nonrepudiable: bool,
-				message_integrity: bool,
-				frame_integrity: bool,
-			) -> crate::error::Result<crate::Frame>
-			where
-				T: crate::Message
-					+ crate::builder::CheckAeadOid<Aes256GcmOid>
-					+ crate::builder::CheckSignatureOid<Secp256k1Signature>
-					+ crate::builder::CheckDigestOid<Sha3_256>
-					+ Clone,
-			{
-				match (confidential, nonrepudiable, message_integrity, frame_integrity) {
-					(true, true, true, true) => compose! {
-						V2: id: test_name, order: 1u64, message: message.clone(),
-						confidentiality<Aes256GcmOid, _>: cipher,
-						nonrepudiation<Secp256k1Signature, _>: signing_key,
-						message_integrity<Sha3_256>: [],
-						frame_integrity: type Sha3_256
-					},
-					(true, false, true, _) => compose! {
-						V1: id: test_name, order: 1u64, message: message.clone(),
-						confidentiality<Aes256GcmOid, _>: cipher,
-						message_integrity<Sha3_256>: []
-					},
-					(true, false, false, _) => compose! {
-						V1: id: test_name, order: 1u64, message: message.clone(),
-						confidentiality<Aes256GcmOid, _>: cipher
-					},
-					(false, true, true, _) => compose! {
-						V1: id: test_name, order: 1u64, message: message.clone(),
-						nonrepudiation<Secp256k1Signature, _>: signing_key,
-						message_integrity<Sha3_256>: []
-					},
-					(false, true, false, _) => compose! {
-						V1: id: test_name, order: 1u64, message: message.clone(),
-						nonrepudiation<Secp256k1Signature, _>: signing_key
-					},
-					(false, false, true, true) => compose! {
-						V1: id: test_name, order: 1u64, message: message.clone(),
-						message_integrity<Sha3_256>: [],
-						frame_integrity: type Sha3_256
-					},
-					(false, false, true, false) => compose! {
-						V1: id: test_name, order: 1u64, message: message.clone(),
-						message_integrity<Sha3_256>: []
-					},
-					(false, false, false, true) => compose! {
-						V1: id: test_name, order: 1u64, message: message.clone(),
-						frame_integrity: type Sha3_256
-					},
-					(false, false, false, false) => compose! {
-						V0: id: test_name, order: 1u64, message: message.clone()
-					},
-					(true, true, true, false) => compose! {
-						V2: id: test_name, order: 1u64, message: message.clone(),
-						confidentiality<Aes256GcmOid, _>: cipher,
-						nonrepudiation<Secp256k1Signature, _>: signing_key,
-						message_integrity<Sha3_256>: []
-					},
-					(true, true, false, true) => compose! {
-						V2: id: test_name, order: 1u64, message: message.clone(),
-						confidentiality<Aes256GcmOid, _>: cipher,
-						nonrepudiation<Secp256k1Signature, _>: signing_key,
-						frame_integrity: type Sha3_256
-					},
-					(true, true, false, false) => compose! {
-						V1: id: test_name, order: 1u64, message: message.clone(),
-						confidentiality<Aes256GcmOid, _>: cipher,
-						nonrepudiation<Secp256k1Signature, _>: signing_key
-					},
-				}
-			}
-
-			// Test cases: (name, attrs, confidential, nonrepudiable, message_integrity, frame_integrity, min_version)
-			let test_cases = [
-				("BasicMessage", "", false, false, false, false, Version::V0),
-				(
-					"ConfidentialMessage",
-					"confidential, min_version = \"V1\"",
-					true,
-					false,
-					false,
-					false,
-					Version::V1,
-				),
-				(
-					"NonrepudiableMessage",
-					"nonrepudiable, min_version = \"V1\"",
-					false,
-					true,
-					false,
-					false,
-					Version::V1,
-				),
-				(
-					"FullSecurityMessage",
-					"confidential, nonrepudiable, message_integrity, frame_integrity, min_version = \"V2\"",
-					true,
-					true,
-					true,
-					true,
-					Version::V2,
-				),
-			];
-
-			for (name, _attrs, confidential, nonrepudiable, message_integrity, frame_integrity, min_version) in
-				test_cases
-			{
-				// Generate the appropriate test message struct based on the test case
-				match (confidential, nonrepudiable, message_integrity, frame_integrity, min_version) {
-					(false, false, false, false, Version::V0) => {
-						test_msg_struct!(false, false, false, false, V0);
-						run_tests!(
-							name,
-							confidential,
-							nonrepudiable,
-							message_integrity,
-							frame_integrity,
-							min_version,
-							&cipher,
-							&signing_key
-						);
-					}
-					(true, false, false, false, Version::V1) => {
-						test_msg_struct!(true, false, false, false, V1);
-						run_tests!(
-							name,
-							confidential,
-							nonrepudiable,
-							message_integrity,
-							frame_integrity,
-							min_version,
-							&cipher,
-							&signing_key
-						);
-					}
-					(false, true, false, false, Version::V1) => {
-						test_msg_struct!(false, true, false, false, V1);
-						run_tests!(
-							name,
-							confidential,
-							nonrepudiable,
-							message_integrity,
-							frame_integrity,
-							min_version,
-							&cipher,
-							&signing_key
-						);
-					}
-					(true, true, true, true, Version::V2) => {
-						test_msg_struct!(true, true, true, true, V2);
-						run_tests!(
-							name,
-							confidential,
-							nonrepudiable,
-							message_integrity,
-							frame_integrity,
-							min_version,
-							&cipher,
-							&signing_key
-						);
-					}
-					_ => panic!(
-						"Unhandled test case combination: ({confidential}, {nonrepudiable}, {message_integrity}, {frame_integrity}, {min_version:?})"
-					),
-				}
+		// Compose a frame satisfying the given security requirements; the
+		// requirement tuple selects the matching `compose!` invocation.
+		#[allow(clippy::too_many_arguments)]
+		fn compose_frame<T>(
+			test_name: &str,
+			message: T,
+			cipher: Aes256Gcm,
+			signing_key: Secp256k1SigningKey,
+			confidential: bool,
+			nonrepudiable: bool,
+			message_integrity: bool,
+			frame_integrity: bool,
+		) -> crate::error::Result<crate::Frame>
+		where
+			T: crate::Message
+				+ crate::builder::CheckAeadOid<Aes256GcmOid>
+				+ crate::builder::CheckSignatureOid<Secp256k1Signature>
+				+ crate::builder::CheckDigestOid<Sha3_256>
+				+ Clone,
+		{
+			match (confidential, nonrepudiable, message_integrity, frame_integrity) {
+				(true, true, true, true) => compose! {
+					V2: id: test_name, order: 1u64, message: message.clone(),
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					message_integrity<Sha3_256>: [],
+					frame_integrity: type Sha3_256
+				},
+				(true, false, true, _) => compose! {
+					V1: id: test_name, order: 1u64, message: message.clone(),
+					confidentiality<Aes256GcmOid, _>: cipher,
+					message_integrity<Sha3_256>: []
+				},
+				(true, false, false, _) => compose! {
+					V1: id: test_name, order: 1u64, message: message.clone(),
+					confidentiality<Aes256GcmOid, _>: cipher
+				},
+				(false, true, true, _) => compose! {
+					V1: id: test_name, order: 1u64, message: message.clone(),
+					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					message_integrity<Sha3_256>: []
+				},
+				(false, true, false, _) => compose! {
+					V1: id: test_name, order: 1u64, message: message.clone(),
+					nonrepudiation<Secp256k1Signature, _>: signing_key
+				},
+				(false, false, true, true) => compose! {
+					V1: id: test_name, order: 1u64, message: message.clone(),
+					message_integrity<Sha3_256>: [],
+					frame_integrity: type Sha3_256
+				},
+				(false, false, true, false) => compose! {
+					V1: id: test_name, order: 1u64, message: message.clone(),
+					message_integrity<Sha3_256>: []
+				},
+				(false, false, false, true) => compose! {
+					V1: id: test_name, order: 1u64, message: message.clone(),
+					frame_integrity: type Sha3_256
+				},
+				(false, false, false, false) => compose! {
+					V0: id: test_name, order: 1u64, message: message.clone()
+				},
+				(true, true, true, false) => compose! {
+					V2: id: test_name, order: 1u64, message: message.clone(),
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					message_integrity<Sha3_256>: []
+				},
+				(true, true, false, true) => compose! {
+					V2: id: test_name, order: 1u64, message: message.clone(),
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key,
+					frame_integrity: type Sha3_256
+				},
+				(true, true, false, false) => compose! {
+					V1: id: test_name, order: 1u64, message: message.clone(),
+					confidentiality<Aes256GcmOid, _>: cipher,
+					nonrepudiation<Secp256k1Signature, _>: signing_key
+				},
 			}
 		}
+
+		// One named test per requirement combination: the struct definition
+		// and the shared assertions are both driven by the same flag tuple,
+		// so no dispatch logic is needed inside the tests themselves.
+		macro_rules! message_trait_test {
+			($test:ident, $name:expr, $confidential:tt, $nonrepudiable:tt, $message_integrity:tt, $frame_integrity:tt, $version:ident) => {
+				#[test]
+				fn $test() {
+					let (_, cipher) = create_test_cipher_key();
+					let signing_key = create_test_signing_key();
+
+					test_msg_struct!($confidential, $nonrepudiable, $message_integrity, $frame_integrity, $version);
+					run_tests!(
+						$name,
+						$confidential,
+						$nonrepudiable,
+						$message_integrity,
+						$frame_integrity,
+						Version::$version,
+						&cipher,
+						&signing_key
+					);
+				}
+			};
+		}
+
+		message_trait_test!(test_basic_message_traits, "BasicMessage", false, false, false, false, V0);
+		message_trait_test!(
+			test_confidential_message_traits,
+			"ConfidentialMessage",
+			true,
+			false,
+			false,
+			false,
+			V1
+		);
+		message_trait_test!(
+			test_nonrepudiable_message_traits,
+			"NonrepudiableMessage",
+			false,
+			true,
+			false,
+			false,
+			V1
+		);
+		message_trait_test!(
+			test_full_security_message_traits,
+			"FullSecurityMessage",
+			true,
+			true,
+			true,
+			true,
+			V2
+		);
 	}
 }

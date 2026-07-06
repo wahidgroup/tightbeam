@@ -19,7 +19,6 @@ quote = { workspace = true }
 syn = { workspace = true }
 
 [features]
-builder = []
 aead = []
 digest = []
 signature = []

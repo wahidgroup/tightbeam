@@ -327,6 +327,9 @@ macro_rules! server {
 		$transport.$other($policy_expr)
 	}};
 
+	// Fire-and-forget loop: the sync path has no error channel, so transport
+	// and handler failures terminate or skip the affected connection without
+	// reporting. Use the tokio path when operators need error visibility.
 	(@sync_loop_body $protocol:path, $listener:ident, $handler:ident, $($policy_name:ident: [ $( $policy_expr:expr ),* $(,)? ]),* $(,)?) => {{
 		loop {
 			match $listener.accept() {
@@ -345,7 +348,7 @@ macro_rules! server {
 							// Read message
 							let (frame, status) = match $crate::macros::server::server_runtime::rt::block_on(__transport.collect_message()) {
 								Ok(result) => result,
-								Err(err) => {
+								Err(_err) => {
 									break;
 								}
 							};
@@ -360,7 +363,7 @@ macro_rules! server {
 							// Send response
 							match $crate::macros::server::server_runtime::rt::block_on(__transport.send_response(status, response)) {
 								Ok(()) => continue,
-								Err(err) => {
+								Err(_err) => {
 									break;
 								}
 							}
@@ -408,7 +411,13 @@ macro_rules! server {
 							let response = if status == $crate::policy::TransitStatus::Accepted {
 								match (__handler_clone)(frame_owned).await {
 									Ok(opt) => opt,
-									Err(_err) => {
+									// Handler failures answer with no response
+									// but are reported so operators can
+									// observe them.
+									Err(err) => {
+										if let Some(tx) = __error_channel.as_mut() {
+											let _ = tx.send(::core::convert::Into::into(err)).await;
+										}
 										None
 									}
 								}

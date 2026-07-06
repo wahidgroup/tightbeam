@@ -9,98 +9,121 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::{parse_macro_input, Attribute, DeriveInput, Meta, Token};
 
-fn has_flag(attrs: &[Attribute], name: &str) -> bool {
+/// Apply `f` to every meta item found inside `#[beam(...)]` attributes.
+///
+/// `#[beam(...)]` mixes bare identifiers (`confidential`) with name-value
+/// pairs (`min_version = "V1"`) and lists (`profile(MyProfile)`), so every
+/// reader shares this parse-and-walk shell instead of re-implementing it.
+fn for_each_beam_meta<F>(attrs: &[Attribute], mut f: F) -> syn::Result<()>
+where
+	F: FnMut(Meta) -> syn::Result<()>,
+{
 	for attr in attrs {
 		if !attr.path().is_ident("beam") {
 			continue;
 		}
-		if let Meta::List(list) = &attr.meta {
-			// Allow mixing identifiers and name-value pairs in #[beam(...)]
-			let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
-			if let Ok(metas) = parser.parse2(list.tokens.clone()) {
-				for meta in metas {
-					if let Meta::Path(path) = meta {
-						if path.is_ident(name) {
-							return true;
-						}
-					}
-				}
-			}
+
+		let Meta::List(list) = &attr.meta else {
+			continue;
+		};
+
+		let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
+		for meta in parser.parse2(list.tokens.clone())? {
+			f(meta)?;
 		}
 	}
-	false
+
+	Ok(())
 }
 
-fn get_version_value(attrs: &[Attribute]) -> Option<syn::Ident> {
-	for attr in attrs {
-		if !attr.path().is_ident("beam") {
-			continue;
-		}
-		if let Meta::List(list) = &attr.meta {
-			let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
-			if let Ok(metas) = parser.parse2(list.tokens.clone()) {
-				for meta in metas {
-					if let Meta::NameValue(nv) = meta {
-						if nv.path.is_ident("min_version") {
-							if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(lit_str), .. }) = &nv.value {
-								return Some(syn::Ident::new(&lit_str.value(), lit_str.span()));
-							}
-						}
-					}
-				}
+fn has_flag(attrs: &[Attribute], name: &str) -> syn::Result<bool> {
+	let mut found = false;
+	for_each_beam_meta(attrs, |meta| {
+		if let Meta::Path(path) = &meta {
+			if path.is_ident(name) {
+				found = true;
 			}
 		}
-	}
-	None
+
+		Ok(())
+	})?;
+
+	Ok(found)
 }
 
-fn get_profile_value(attrs: &[Attribute]) -> Option<u8> {
-	for attr in attrs {
-		if !attr.path().is_ident("beam") {
-			continue;
+fn get_version_value(attrs: &[Attribute]) -> syn::Result<Option<syn::Ident>> {
+	let mut version = None;
+	for_each_beam_meta(attrs, |meta| {
+		let Meta::NameValue(nv) = &meta else {
+			return Ok(());
+		};
+
+		if !nv.path.is_ident("min_version") {
+			return Ok(());
 		}
-		if let Meta::List(list) = &attr.meta {
-			let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
-			if let Ok(metas) = parser.parse2(list.tokens.clone()) {
-				for meta in metas {
-					if let Meta::NameValue(nv) = meta {
-						if nv.path.is_ident("profile") {
-							if let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(lit_int), .. }) = &nv.value {
-								if let Ok(profile) = lit_int.base10_parse::<u8>() {
-									return Some(profile);
-								}
-							}
-						}
-					}
-				}
-			}
+
+		let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(lit_str), .. }) = &nv.value else {
+			return Err(syn::Error::new_spanned(
+				&nv.value,
+				"min_version expects a string literal, e.g. min_version = \"V1\"",
+			));
+		};
+
+		let value = lit_str.value();
+		if syn::parse_str::<syn::Ident>(&value).is_err() {
+			return Err(syn::Error::new_spanned(
+				lit_str,
+				format!("`{value}` is not a valid version identifier (expected e.g. \"V1\")"),
+			));
 		}
-	}
-	None
+
+		version = Some(syn::Ident::new(&value, lit_str.span()));
+		Ok(())
+	})?;
+	Ok(version)
 }
 
-fn get_profile_type(attrs: &[Attribute]) -> Option<syn::Type> {
-	for attr in attrs {
-		if !attr.path().is_ident("beam") {
-			continue;
+fn get_profile_value(attrs: &[Attribute]) -> syn::Result<Option<(u8, proc_macro2::Span)>> {
+	let mut profile = None;
+	for_each_beam_meta(attrs, |meta| {
+		let Meta::NameValue(nv) = &meta else {
+			return Ok(());
+		};
+
+		if !nv.path.is_ident("profile") {
+			return Ok(());
 		}
-		if let Meta::List(list) = &attr.meta {
-			let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
-			if let Ok(metas) = parser.parse2(list.tokens.clone()) {
-				for meta in metas {
-					if let Meta::List(profile_list) = meta {
-						if profile_list.path.is_ident("profile") {
-							// Parse the content inside profile(...) as a type
-							if let Ok(ty) = syn::parse2::<syn::Type>(profile_list.tokens.clone()) {
-								return Some(ty);
-							}
-						}
-					}
-				}
-			}
+
+		let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(lit_int), .. }) = &nv.value else {
+			return Err(syn::Error::new_spanned(
+				&nv.value,
+				"numeric profile expects an integer literal, e.g. profile = 1",
+			));
+		};
+
+		profile = Some((lit_int.base10_parse::<u8>()?, lit_int.span()));
+		Ok(())
+	})?;
+
+	Ok(profile)
+}
+
+fn get_profile_type(attrs: &[Attribute]) -> syn::Result<Option<syn::Type>> {
+	let mut profile = None;
+	for_each_beam_meta(attrs, |meta| {
+		let Meta::List(profile_list) = &meta else {
+			return Ok(());
+		};
+
+		if !profile_list.path.is_ident("profile") {
+			return Ok(());
 		}
-	}
-	None
+
+		profile = Some(syn::parse2::<syn::Type>(profile_list.tokens.clone())?);
+		Ok(())
+	})?;
+
+	Ok(profile)
 }
 
 fn has_attr(attrs: &[Attribute], name: &str) -> bool {
@@ -124,37 +147,66 @@ fn get_error_message(attrs: &[Attribute]) -> Option<String> {
 ///
 /// This macro can be applied to any struct that implements the necessary
 /// serialization traits (typically `der::Sequence`).
+///
+/// # Attributes
+///
+/// All configuration lives in a `#[beam(...)]` attribute:
+///
+/// - `confidential`, `nonrepudiable`, `compressed`, `prioritized`,
+///   `message_integrity`, `frame_integrity` - set the corresponding
+///   `MUST_*` constant to `true`
+/// - `min_version = "V1"` - minimum protocol version for the type
+/// - `profile(MyProfile)` - pin the type to a `SecurityProfile`; the digest,
+///   AEAD, and signature OIDs used by the builder are then enforced at
+///   compile time
+/// - `profile = N` - numeric shorthand for a predefined security level:
+///
+///   | N | Profile  | Effect                                          |
+///   |---|----------|-------------------------------------------------|
+///   | 1 | FIPS     | confidential + non-repudiable, `MIN_VERSION` V1 |
+///   | 2 | Standard | confidential + non-repudiable, `MIN_VERSION` V1 |
+///
+///   Any other number is rejected at compile time. `profile = N` and
+///   `profile(Type)` are mutually exclusive.
 #[proc_macro_derive(Beamable, attributes(beam))]
 pub fn derive_beamable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
+	expand_beamable(&input).unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+fn expand_beamable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 	let name = &input.ident;
 
-	let confidential = has_flag(&input.attrs, "confidential");
-	let nonrep = has_flag(&input.attrs, "nonrepudiable");
-	let compressed = has_flag(&input.attrs, "compressed");
-	let prioritized = has_flag(&input.attrs, "prioritized");
-	let message_integrity = has_flag(&input.attrs, "message_integrity");
-	let frame_integrity = has_flag(&input.attrs, "frame_integrity");
-	let min_version = get_version_value(&input.attrs);
-	let profile_value = get_profile_value(&input.attrs);
-	let profile_type = get_profile_type(&input.attrs);
+	let confidential = has_flag(&input.attrs, "confidential")?;
+	let nonrep = has_flag(&input.attrs, "nonrepudiable")?;
+	let compressed = has_flag(&input.attrs, "compressed")?;
+	let prioritized = has_flag(&input.attrs, "prioritized")?;
+	let message_integrity = has_flag(&input.attrs, "message_integrity")?;
+	let frame_integrity = has_flag(&input.attrs, "frame_integrity")?;
+	let min_version = get_version_value(&input.attrs)?;
+	let profile_value = get_profile_value(&input.attrs)?;
+	let profile_type = get_profile_type(&input.attrs)?;
 
 	// Validate that we don't have both numeric and type-based profiles
 	if profile_value.is_some() && profile_type.is_some() {
-		return syn::Error::new_spanned(
-			&input,
+		return Err(syn::Error::new_spanned(
+			input,
 			"Cannot specify both numeric profile (= N) and type-based profile (Type) simultaneously",
-		)
-		.to_compile_error()
-		.into();
+		));
 	}
 
-	// Profile-based security requirements
+	// Profile-based security requirements (see the profile table in the
+	// derive rustdoc). FIPS and Standard currently impose identical
+	// requirements; they are kept distinct as wire-visible policy levels.
 	let (profile_confidential, profile_nonrep, profile_min_version) = match profile_value {
-		Some(1) => (true, true, Some(syn::Ident::new("V1", name.span()))), // FIPS
-		Some(2) => (true, true, Some(syn::Ident::new("V1", name.span()))), // Standard
-		Some(p) if p > 2 => (false, false, None),
-		_ => (false, false, None),
+		Some((1 | 2, _)) => (true, true, Some(syn::Ident::new("V1", name.span()))),
+		Some((n, span)) => {
+			return Err(syn::Error::new(
+				span,
+				format!("unknown numeric profile `{n}`; known profiles: 1 (FIPS), 2 (Standard)"),
+			));
+		}
+		None => (false, false, None),
 	};
 
 	// Apply profile requirements (override individual flags)
@@ -212,7 +264,6 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		quote! { ::tightbeam::Version::V0 }
 	};
 
-	let _has_profile = profile_type.is_some();
 	// `Message::Profile` is gated behind tightbeam's `crypto` feature, so the
 	// associated-type definition is emitted through `__tb_if_crypto!`, which is
 	// resolved in tightbeam's feature context rather than the consumer's.
@@ -327,7 +378,7 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		}
 	};
 
-	let expanded = quote! {
+	Ok(quote! {
 		const _: () = {
 			#(#feature_checks)*
 		};
@@ -344,22 +395,43 @@ pub fn derive_beamable(input: TokenStream) -> TokenStream {
 		}
 
 		#oid_validation_helpers
-	};
-
-	TokenStream::from(expanded)
+	})
 }
 
 /// Derive macro for implementing flag enum traits
 ///
 /// This macro automatically adds the necessary attributes and trait
 /// implementations for flag enums used with the TightBeam flag system.
+///
+/// The target must be a fieldless enum: the generated conversions cast
+/// variants with `as u8`, which only exists for C-like enums.
 #[proc_macro_derive(Flaggable)]
 pub fn derive_flaggable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
+	expand_flaggable(&input).unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+fn expand_flaggable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 	let name = &input.ident;
 	let name_str = name.to_string();
 
-	let expanded = quote! {
+	let syn::Data::Enum(data_enum) = &input.data else {
+		return Err(syn::Error::new_spanned(
+			input,
+			"Flaggable can only be derived for fieldless enums",
+		));
+	};
+
+	for variant in &data_enum.variants {
+		if !matches!(variant.fields, syn::Fields::Unit) {
+			return Err(syn::Error::new_spanned(
+				variant,
+				"Flaggable requires a fieldless enum: variants with fields cannot be cast to u8",
+			));
+		}
+	}
+
+	Ok(quote! {
 		impl From<#name> for u8 {
 			fn from(val: #name) -> u8 {
 				val as u8
@@ -375,9 +447,18 @@ pub fn derive_flaggable(input: TokenStream) -> TokenStream {
 		impl #name {
 			pub const TYPE_NAME: &'static str = #name_str;
 		}
-	};
+	})
+}
 
-	TokenStream::from(expanded)
+/// Whether a type is (by name) the crate's paired received/expected error,
+/// whose display formatting uses `{expected}`/`{received}` field accessors.
+fn is_received_expected_error(ty: &syn::Type) -> bool {
+	if let syn::Type::Path(type_path) = ty {
+		if let Some(segment) = type_path.path.segments.last() {
+			return segment.ident == "ReceivedExpectedError";
+		}
+	}
+	false
 }
 
 /// Derive macro for implementing error traits with automatic Display and From
@@ -390,29 +471,39 @@ pub fn derive_flaggable(input: TokenStream) -> TokenStream {
 ///
 /// - `#[error("format string")]` - Specifies the display format for the variant
 /// - `#[from]` - Automatically implements `From` for the wrapped type
-#[proc_macro_derive(Errorizable, attributes(error, from))]
+/// - `#[source]` - Reports the wrapped value through `Error::source`
+#[proc_macro_derive(Errorizable, attributes(error, from, source))]
 pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
+	expand_errorizable(&input).unwrap_or_else(syn::Error::into_compile_error).into()
+}
+
+fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 	let name = &input.ident;
 
-	let data_enum = match &input.data {
-		syn::Data::Enum(data) => data,
-		_ => {
-			return syn::Error::new_spanned(&input, "Errorizable can only be derived for enums")
-				.to_compile_error()
-				.into();
-		}
+	let syn::Data::Enum(data_enum) = &input.data else {
+		return Err(syn::Error::new_spanned(input, "Errorizable can only be derived for enums"));
 	};
 
 	let mut display_arms = Vec::new();
 	let mut from_impls = Vec::new();
+	let mut source_arms = Vec::new();
 
 	for variant in &data_enum.variants {
 		let variant_name = &variant.ident;
+		let variant_cfgs: Vec<_> = variant.attrs.iter().filter(|attr| attr.path().is_ident("cfg")).collect();
 
 		// Get the error message from #[error("...")] attribute
 		let error_msg = get_error_message(&variant.attrs);
 		let has_from = has_attr(&variant.attrs, "from");
+		let has_source = has_attr(&variant.attrs, "source");
+
+		if has_source && !matches!(&variant.fields, syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1) {
+			return Err(syn::Error::new_spanned(
+				variant,
+				"#[source] requires a tuple variant with exactly one field",
+			));
+		}
 
 		// Build the display match arm based on variant fields
 		match &variant.fields {
@@ -422,17 +513,31 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 					.map(|i| syn::Ident::new(&format!("f{i}"), variant_name.span()))
 					.collect();
 
+				// `{expected}`/`{received}` accessors are only meaningful on
+				// a `ReceivedExpectedError` wrapper. Every other tuple
+				// variant formats positionally. Gating on the field type
+				// keeps unrelated messages containing the literal
+				// `{expected` from mis-expanding.
+				let formats_by_accessor = field_count == 1
+					&& fields
+						.unnamed
+						.first()
+						.is_some_and(|field| is_received_expected_error(&field.ty))
+					&& error_msg
+						.as_ref()
+						.is_some_and(|msg| msg.contains("{expected") || msg.contains("{received"));
+
 				if let Some(msg) = error_msg {
-					// Check if format string contains field accessors like {expected} or {received}
-					if msg.contains("{expected") || msg.contains("{received") {
-						// Assume single field with .expected and .received properties
+					if formats_by_accessor {
 						display_arms.push(quote! {
+							#(#variant_cfgs)*
 							#name::#variant_name(ref f0) => {
 								write!(f, #msg, expected = f0.expected, received = f0.received)
 							}
 						});
 					} else {
 						display_arms.push(quote! {
+							#(#variant_cfgs)*
 							#name::#variant_name(#(ref #field_bindings),*) => {
 								write!(f, #msg, #(#field_bindings),*)
 							}
@@ -440,6 +545,7 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 					}
 				} else {
 					display_arms.push(quote! {
+						#(#variant_cfgs)*
 						#name::#variant_name(#(ref #field_bindings),*) => {
 							write!(f, "{}", stringify!(#variant_name))
 						}
@@ -451,6 +557,7 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 					if let Some(field) = fields.unnamed.first() {
 						let field_type = &field.ty;
 						from_impls.push(quote! {
+							#(#variant_cfgs)*
 							impl From<#field_type> for #name {
 								fn from(err: #field_type) -> Self {
 									#name::#variant_name(err)
@@ -459,18 +566,28 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 						});
 					}
 				}
+
+				// Wrapper variants preserve their cause chain (C-GOOD-ERR).
+				if has_source {
+					source_arms.push(quote! {
+						#(#variant_cfgs)*
+						#name::#variant_name(ref f0) => Some(f0),
+					});
+				}
 			}
 			syn::Fields::Named(fields) => {
 				let field_names: Vec<_> = fields.named.iter().map(|f| &f.ident).collect();
 
 				if let Some(msg) = error_msg {
 					display_arms.push(quote! {
+						#(#variant_cfgs)*
 						#name::#variant_name { #(ref #field_names),* } => {
 							write!(f, #msg, #(#field_names = #field_names),*)
 						}
 					});
 				} else {
 					display_arms.push(quote! {
+						#(#variant_cfgs)*
 						#name::#variant_name { .. } => {
 							write!(f, "{}", stringify!(#variant_name))
 						}
@@ -480,10 +597,12 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 			syn::Fields::Unit => {
 				if let Some(msg) = error_msg {
 					display_arms.push(quote! {
+						#(#variant_cfgs)*
 						#name::#variant_name => write!(f, #msg)
 					});
 				} else {
 					display_arms.push(quote! {
+						#(#variant_cfgs)*
 						#name::#variant_name => write!(f, "{}", stringify!(#variant_name))
 					});
 				}
@@ -491,7 +610,26 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 		}
 	}
 
-	let expanded = quote! {
+	// `source()` requires each wrapped type to implement `Error`; some
+	// dependencies (e.g. `rand_core`) only do so with `std`, so the method
+	// is emitted through tightbeam's `std`-gated delegation macro.
+	let source_impl = if source_arms.is_empty() {
+		quote! {}
+	} else {
+		quote! {
+			::tightbeam::__tb_if_std! {
+				fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+					#[allow(unreachable_patterns)]
+					match self {
+						#(#source_arms)*
+						_ => None,
+					}
+				}
+			}
+		}
+	};
+
+	Ok(quote! {
 		impl core::fmt::Display for #name {
 			fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 				match self {
@@ -500,10 +638,10 @@ pub fn derive_errorizable(input: TokenStream) -> TokenStream {
 			}
 		}
 
-		impl core::error::Error for #name {}
+		impl core::error::Error for #name {
+			#source_impl
+		}
 
 		#(#from_impls)*
-	};
-
-	TokenStream::from(expanded)
+	})
 }

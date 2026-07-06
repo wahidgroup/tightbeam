@@ -91,7 +91,7 @@ impl MetadataBuilder {
 		self
 	}
 
-	/// Set custom flags (V2+ only)
+	/// Set the routing matrix (V3+ only)
 	pub fn with_matrix(mut self, matrix: MatrixDyn) -> Self {
 		self.matrix = Some(matrix);
 		self
@@ -100,8 +100,8 @@ impl MetadataBuilder {
 	/// Build the metadata based on the protocol version
 	///
 	/// # Errors
-	/// Returns an error if required fields are missing for the specified
-	/// version
+	/// Returns an error if required fields are missing, or if a set field is
+	/// not permitted by the specified version
 	pub fn build(self) -> Result<Metadata, BuildError> {
 		let Self {
 			version,
@@ -118,48 +118,41 @@ impl MetadataBuilder {
 
 		let id = id.ok_or(BuildError::InvalidMetadata(MetadataError::MissingId))?;
 		let order = order.ok_or(BuildError::InvalidMetadata(MetadataError::MissingTimestamp))?;
+
+		macro_rules! reject_unsupported {
+			($value:ident, $allows:ident) => {
+				if $value.is_some() && !version.$allows() {
+					return Err(BuildError::InvalidMetadata(MetadataError::UnsupportedField {
+						field: stringify!($value),
+						version,
+					}));
+				}
+			};
+		}
+
+		reject_unsupported!(integrity, allows_integrity);
+		reject_unsupported!(confidentiality, allows_confidentiality);
+		reject_unsupported!(priority, allows_priority);
+		reject_unsupported!(lifetime, allows_lifetime);
+		reject_unsupported!(previous_frame, allows_previous_frame);
+		reject_unsupported!(matrix, allows_matrix);
+
 		let matrix = if let Some(m) = matrix {
 			Some(Asn1Matrix::try_from(m)?)
 		} else {
 			None
 		};
 
-		// Use VersionCapabilities trait to determine which fields are allowed
-		// This keeps the specification with Version and instruments the builder
 		Ok(Metadata {
 			id,
 			order,
 			compactness,
-			integrity: if version.allows_integrity() {
-				integrity
-			} else {
-				None
-			},
-			confidentiality: if version.allows_confidentiality() {
-				confidentiality
-			} else {
-				None
-			},
-			priority: if version.allows_priority() {
-				priority
-			} else {
-				None
-			},
-			lifetime: if version.allows_lifetime() {
-				lifetime
-			} else {
-				None
-			},
-			previous_frame: if version.allows_previous_frame() {
-				previous_frame
-			} else {
-				None
-			},
-			matrix: if version.allows_matrix() {
-				matrix
-			} else {
-				None
-			},
+			integrity,
+			confidentiality,
+			priority,
+			lifetime,
+			previous_frame,
+			matrix,
 		})
 	}
 
@@ -178,8 +171,8 @@ impl MetadataBuilder {
 		self.order.is_some()
 	}
 
-	/// Check if TTL is set
-	pub fn has_ttl(&self) -> bool {
+	/// Check if lifetime is set
+	pub fn has_lifetime(&self) -> bool {
 		self.lifetime.is_some()
 	}
 
@@ -188,8 +181,8 @@ impl MetadataBuilder {
 		self.previous_frame.is_some()
 	}
 
-	/// Check if flags are set
-	pub fn has_flags(&self) -> bool {
+	/// Check if matrix is set
+	pub fn has_matrix(&self) -> bool {
 		self.matrix.is_some()
 	}
 
@@ -198,8 +191,8 @@ impl MetadataBuilder {
 		self.compactness.is_some()
 	}
 
-	/// Check if hash is set
-	pub fn has_hash(&self) -> bool {
+	/// Check if integrity info is set
+	pub fn has_integrity(&self) -> bool {
 		self.integrity.is_some()
 	}
 }
@@ -244,13 +237,14 @@ mod tests {
 		};
 	}
 
+	// V0 permits no integrity info; setting one is covered by the rejection
+	// tests below.
 	test_metadata_builder!(
 		test_metadata_builder_v0,
 		Version::V0,
 		MetadataBuilder::from(Version::V0)
 			.with_id("test-id-v0")
 			.with_order(1696521600u64)
-			.with_integrity_info(create_test_hash_info())
 	);
 
 	test_metadata_builder!(
@@ -338,18 +332,65 @@ mod tests {
 					builder: || MetadataBuilder::from(Version::V2).with_id("test-id"),
 					expected_error: MetadataError::MissingTimestamp,
 				},
+				ErrorTestCase {
+					name: "V0 rejects integrity",
+					builder: || {
+						MetadataBuilder::from(Version::V0)
+							.with_id("test-id")
+							.with_order(1696521600)
+							.with_integrity_info(create_test_hash_info())
+					},
+					expected_error: MetadataError::UnsupportedField { field: "integrity", version: Version::V0 },
+				},
+				ErrorTestCase {
+					name: "V0 rejects priority",
+					builder: || {
+						MetadataBuilder::from(Version::V0)
+							.with_id("test-id")
+							.with_order(1696521600)
+							.with_priority(MessagePriority::LowLatency)
+					},
+					expected_error: MetadataError::UnsupportedField { field: "priority", version: Version::V0 },
+				},
+				ErrorTestCase {
+					name: "V1 rejects lifetime",
+					builder: || {
+						MetadataBuilder::from(Version::V1)
+							.with_id("test-id")
+							.with_order(1696521600)
+							.with_lifetime(3600)
+					},
+					expected_error: MetadataError::UnsupportedField { field: "lifetime", version: Version::V1 },
+				},
+				ErrorTestCase {
+					name: "V0 rejects previous_frame",
+					builder: || {
+						MetadataBuilder::from(Version::V0)
+							.with_id("test-id")
+							.with_order(1696521600)
+							.previous_frame(create_test_hash_info())
+					},
+					expected_error: MetadataError::UnsupportedField { field: "previous_frame", version: Version::V0 },
+				},
+				ErrorTestCase {
+					name: "V2 rejects matrix",
+					builder: || {
+						MetadataBuilder::from(Version::V2)
+							.with_id("test-id")
+							.with_order(1696521600)
+							.with_matrix(MatrixDyn::default())
+					},
+					expected_error: MetadataError::UnsupportedField { field: "matrix", version: Version::V2 },
+				},
 			];
 
 			for case in test_cases {
 				let result = (case.builder)().build();
-				assert!(result.is_err());
-
-				match result.unwrap_err() {
-					BuildError::InvalidMetadata(err) => {
-						assert_eq!(err, case.expected_error);
-					}
-					other => panic!("Test case '{}' failed: expected InvalidMetadata, got {:?}", case.name, other),
-				}
+				assert!(
+					matches!(result, Err(BuildError::InvalidMetadata(ref err)) if *err == case.expected_error),
+					"{}",
+					case.name
+				);
 			}
 		}
 	}

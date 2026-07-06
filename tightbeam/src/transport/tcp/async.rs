@@ -1,21 +1,23 @@
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "tokio")]
-use std::time::Instant;
 
 #[cfg(feature = "tokio")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+mod tokio_rt {
+	pub use std::time::Instant;
+
+	pub use crate::transport::protocols::PersistentConnection;
+	pub use crate::transport::{AsyncListenerTrait, Protocol};
+	pub use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	pub use tokio::net::{TcpListener, TcpStream};
+}
+
 #[cfg(feature = "tokio")]
-use tokio::net::{TcpListener, TcpStream};
+use tokio_rt::*;
 
 use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
-#[cfg(feature = "tokio")]
-use crate::transport::protocols::PersistentConnection;
 use crate::transport::ResponsePackage;
-#[cfg(feature = "tokio")]
-use crate::transport::{AsyncListenerTrait, Protocol};
 use crate::transport::{
 	EnvelopeBuilder, EnvelopeLimits, MessageIO, Pingable, TransportError, TransportResult, WireMode,
 };
@@ -31,10 +33,11 @@ mod x509 {
 		HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 	};
 	pub use crate::transport::state::EncryptedProtocolState;
-	#[cfg(feature = "tokio")]
-	pub use crate::transport::EncryptedProtocol;
 	pub use crate::transport::{EncryptedMessageIO, TransportEncryptionConfig};
 	pub use crate::x509::Certificate;
+
+	#[cfg(feature = "tokio")]
+	pub use crate::transport::EncryptedProtocol;
 }
 
 #[cfg(feature = "x509")]
@@ -96,7 +99,9 @@ impl AsyncProtocolStream for TokioStream {
 		} else {
 			let octet_count = (length_first[0] & 0x7F) as usize;
 			let mut length_octets = vec![0u8; octet_count];
+
 			stream.read_exact(&mut length_octets).await?;
+
 			let length = crate::transport::io::parse_der_length(length_first[0], &length_octets);
 			(length_octets, length)
 		};
@@ -830,15 +835,12 @@ mod tests {
 		let sha3_signer = Sha3Signer::from(&signing_key);
 		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
 
-		let not_before = std::time::Instant::now();
-		let not_after = not_before + Duration::from_secs(365 * 24 * 60 * 60);
-
 		// Create a self-signed root certificate
 		let cert = crate::cert!(
 			profile: Root,
 			subject: "CN=Test Root CA,O=Test Org,C=US",
 			serial: 1u32,
-			validity: (not_before, not_after),
+			duration: Duration::from_secs(365 * 24 * 60 * 60),
 			signer: &sha3_signer,
 			subject_public_key: spki
 		)?;

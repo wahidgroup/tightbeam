@@ -1,0 +1,22 @@
+error[E0277]: the trait bound `SignatureMessage: CheckSignatureOid<tightbeam::crypto::sign::ecdsa::Signature<Secp256k1>>` is not satisfied
+  --> tests/compile/signature_mismatch.rs:55:4
+   |
+55 |         .with_signer::<Secp256k1Signature, _>(signing_key);
+   |          ^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `CheckSignatureOid<tightbeam::crypto::sign::ecdsa::Signature<Secp256k1>>` is not implemented for `SignatureMessage`
+      but trait `CheckSignatureOid<OtherSignature>` is implemented for it
+  --> tests/compile/signature_mismatch.rs:37:10
+   |
+37 | #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
+   |          ^^^^^^^^
+   = help: for that trait implementation, expected `OtherSignature`, found `tightbeam::crypto::sign::ecdsa::Signature<Secp256k1>`
+note: required by a bound in `FrameBuilder::<T>::with_signer`
+  --> src/builder/frame.rs
+   |
+   |     pub fn with_signer<S, X>(mut self, signer: X) -> Self
+   |            ----------- required by a bound in this associated function
+...
+   |         T: CheckSignatureOid<S>,
+   |            ^^^^^^^^^^^^^^^^^^^^ required by this bound in `FrameBuilder::<T>::with_signer`
+   = note: this error originates in the derive macro `Beamable` (in Nightly builds, run with -Z macro-backtrace for more info)

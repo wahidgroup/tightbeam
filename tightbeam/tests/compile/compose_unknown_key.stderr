@@ -1,0 +1,14 @@
+error: unknown builder key: bogus
+  --> tests/compile/compose_unknown_key.rs:16:10
+   |
+16 |       let _ = compose! {
+   |  _____________^
+17 | |         V0:
+18 | |             id: "test-id",
+19 | |             order: 1696521600u64,
+20 | |             message: message,
+21 | |             bogus: 42
+22 | |     };
+   | |_____^
+   |
+   = note: this error originates in the macro `__compose_call` which comes from the expansion of the macro `compose` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,24 @@
+error: cert!(profile: Root, ...) requires `subject_public_key: <SPKI>`.
+       Pass the subject's SPKI explicitly to avoid argument shifting.
+       If you want it derived from the signer, please specify how to obtain SPKI from your signer type.
+  --> tests/compile/cert_missing_spki.rs:9:10
+   |
+ 9 |       let _ = cert! {
+   |  _____________^
+10 | |         profile: Root,
+11 | |         subject: "CN=Test Root",
+12 | |         serial: 1u64,
+13 | |         duration: Duration::from_secs(3600),
+14 | |         signer: &signing_key
+15 | |     };
+   | |_____^
+   |
+   = note: this error originates in the macro `cert` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused import: `core::time::Duration`
+ --> tests/compile/cert_missing_spki.rs:1:5
+  |
+1 | use core::time::Duration;
+  |     ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

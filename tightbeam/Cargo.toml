@@ -209,7 +209,6 @@ transport-ecies = [
 	"ecdh",
 ]
 
-# Derive macro support
 derive = ["dep:tightbeam-derive"]
 
 # Standard library support

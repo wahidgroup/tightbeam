@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use core::time::Duration;
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use tightbeam::{
 	cert,
@@ -31,15 +31,13 @@ pub fn create_test_cert_with_key(subject: &str, validity_days: u64) -> Result<(C
 	let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 	let sha3_signer = Sha3Signer::from(&signing_key);
 	let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
-
-	let not_before = Instant::now();
-	let not_after = not_before + Duration::from_secs(validity_days * 24 * 60 * 60);
+	let validity_duration = Duration::from_secs(validity_days * 24 * 60 * 60);
 
 	let cert = cert! {
 		profile: Root,
 		subject: subject,
 		serial: 1u32,
-		validity: (not_before, not_after),
+		duration: validity_duration,
 		signer: &sha3_signer,
 		subject_public_key: spki
 	}?;

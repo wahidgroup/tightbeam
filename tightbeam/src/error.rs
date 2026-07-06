@@ -44,10 +44,12 @@ pub enum CompressionError {
 	#[cfg(feature = "zstd")]
 	#[cfg_attr(feature = "derive", error("ZSTD compression/decompression error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	ZSTD(zeekstd::Error),
 
 	#[cfg_attr(feature = "derive", error("I/O error during compression/decompression: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	IO(std::io::Error),
 }
 
@@ -76,39 +78,46 @@ pub enum TightBeamError {
 	/// Error from the matrix implementation
 	#[cfg_attr(feature = "derive", error("Matrix error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	MatrixError(crate::matrix::MatrixError),
 
 	#[cfg(feature = "router")]
 	#[cfg_attr(feature = "derive", error("Route error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	RouterError(crate::router::RouterError),
 
 	/// Error from the message builder
 	#[cfg(feature = "builder")]
 	#[cfg_attr(feature = "derive", error("Build error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	BuildError(crate::builder::error::BuildError),
 
 	/// StandardError
 	#[cfg(feature = "standards")]
 	#[cfg_attr(feature = "derive", error("Standard error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	StandardError(crate::standards::error::StandardError),
 
 	#[cfg(feature = "colony")]
 	#[cfg_attr(feature = "derive", error("Hive error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	HiveError(crate::colony::hive::HiveError),
 
 	#[cfg(feature = "colony")]
 	#[cfg_attr(feature = "derive", error("Worker relay error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	WorkerRelay(crate::colony::worker::WorkerRelayError),
 
 	#[cfg(feature = "std")]
 	/// I/O error
 	#[cfg_attr(feature = "derive", error("I/O error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	IoError(std::io::Error),
 
 	#[cfg(feature = "std")]
@@ -124,34 +133,40 @@ pub enum TightBeamError {
 	#[cfg(feature = "signature")]
 	#[cfg_attr(feature = "derive", error("Signature verification or generation error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	SignatureError(crate::crypto::sign::Error),
 
 	/// Error from elliptic curve operations
 	#[cfg(feature = "signature")]
 	#[cfg_attr(feature = "derive", error("Elliptic curve error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	EllipticCurveError(crate::crypto::sign::elliptic_curve::Error),
 
 	/// Error during serialization
 	#[cfg_attr(feature = "derive", error("Serialization error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	SerializationError(crate::der::Error),
 
 	/// Error during compression or decompression
 	#[cfg(feature = "compress")]
 	#[cfg_attr(feature = "derive", error("Compression error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	CompressionError(CompressionError),
 
 	/// Error during handshake operations
 	#[cfg(feature = "transport")]
 	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	HandshakeError(crate::transport::handshake::HandshakeError),
 
 	#[cfg(feature = "transport")]
 	#[cfg_attr(feature = "derive", error("Transport error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	TransportError(crate::transport::error::TransportError),
 
 	/// Unsupported protocol version
@@ -165,75 +180,88 @@ pub enum TightBeamError {
 	#[cfg(feature = "testing")]
 	#[cfg_attr(feature = "derive", error("Testing error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	TestingError(crate::testing::error::TestingError),
 
 	/// Error during URN validation
 	#[cfg_attr(feature = "derive", error("URN validation error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	UrnValidationError(crate::utils::urn::UrnValidationError),
 
 	/// Error during encryption or decryption
 	#[cfg(feature = "aead")]
 	#[cfg_attr(feature = "derive", error("Encryption or decryption error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	EncryptionError(crate::crypto::aead::Error),
 
 	/// Invalid key length for cryptographic operations
 	#[cfg(feature = "aead")]
 	#[cfg_attr(feature = "derive", error("Invalid key length: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	InvalidKeyLength(crypto_common::InvalidLength),
 
 	/// Error during ECIES operations
 	#[cfg(feature = "ecies")]
 	#[cfg_attr(feature = "derive", error("ECIES error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	EciesError(crate::crypto::ecies::EciesError),
 
 	#[cfg(feature = "crypto")]
 	#[cfg_attr(feature = "derive", error("Crypto policy error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	CryptoPolicyError(crate::crypto::policy::CryptoPolicyError),
 
 	/// Error during certificate validation
 	#[cfg(feature = "x509")]
 	#[cfg_attr(feature = "derive", error("Certificate validation error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	CertificateValidationError(crate::crypto::x509::error::CertificateValidationError),
 
 	#[cfg(feature = "kdf")]
 	#[cfg_attr(feature = "derive", error("Key derivation error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	KeyDerivationError(crate::crypto::kdf::KdfError),
 
 	/// Error from key provider operations
 	#[cfg(feature = "crypto")]
 	#[cfg_attr(feature = "derive", error("Key provider error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	KeyError(crate::crypto::key::KeyError),
 
 	/// Secret material was unavailable
 	#[cfg(feature = "crypto")]
 	#[cfg_attr(feature = "derive", error("Secret unavailable: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	SecretUnavailable(crate::crypto::secret::SecretError),
 
 	/// Error obtaining random bytes from the OS
 	#[cfg(feature = "random")]
 	#[cfg_attr(feature = "derive", error("OS random number generator error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	OsRngError(rand_core::Error),
 
 	/// Error during SPKI operations
 	#[cfg(feature = "x509")]
 	#[cfg_attr(feature = "derive", error("SPKI error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	SpkiError(crate::spki::Error),
 
 	/// Error during X.509 certificate building
 	#[cfg(feature = "x509")]
 	#[cfg_attr(feature = "derive", error("X.509 builder error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
+	#[cfg_attr(feature = "derive", source)]
 	X509BuilderError(x509_cert::builder::Error),
 
 	/// Error receiving from channel with timeout
@@ -281,6 +309,10 @@ pub enum TightBeamError {
 	/// Missing response
 	#[cfg_attr(feature = "derive", error("Missing response"))]
 	MissingResponse,
+
+	/// Channel closed: the receiving end was dropped before the send
+	#[cfg_attr(feature = "derive", error("Channel closed"))]
+	ChannelClosed,
 
 	/// Signature is missing
 	#[cfg(feature = "signature")]
@@ -375,6 +407,7 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingOrder => write!(f, "Missing order"),
 			TightBeamError::MissingPriority => write!(f, "Missing priority"),
 			TightBeamError::MissingResponse => write!(f, "Missing response"),
+			TightBeamError::ChannelClosed => write!(f, "Channel closed"),
 			TightBeamError::MissingFeature(feature) => write!(f, "Missing feature: {feature}"),
 			TightBeamError::MissingConfiguration => write!(f, "Missing configuration"),
 			TightBeamError::UnsupportedOperation => write!(f, "Unsupported operation"),
@@ -563,5 +596,27 @@ impl core::error::Error for CompressionError {}
 impl<T> From<std::sync::PoisonError<T>> for TightBeamError {
 	fn from(_: std::sync::PoisonError<T>) -> Self {
 		TightBeamError::LockPoisoned
+	}
+}
+
+#[cfg(all(test, feature = "derive", feature = "std"))]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn source_annotated_wrappers_expose_their_cause() {
+		let err = TightBeamError::from(crate::matrix::MatrixError::InvalidN(0));
+
+		let source = core::error::Error::source(&err);
+
+		assert!(matches!(err, TightBeamError::MatrixError(_)));
+		assert!(source.is_some());
+	}
+
+	#[test]
+	fn unit_variants_have_no_source() {
+		let err = TightBeamError::InvalidBody;
+
+		assert!(core::error::Error::source(&err).is_none());
 	}
 }
