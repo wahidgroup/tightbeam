@@ -9,12 +9,12 @@ use core::time::Duration;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::asn1::GeneralizedTime;
 use crate::crypto::hash::Digest;
 use crate::crypto::policy::VerificationPolicy;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::crypto::x509::utils::{ensure_signature_algorithm_consistency, validate_certificate_expiry};
 use crate::crypto::x509::Certificate;
+use crate::der::asn1::GeneralizedTime;
 use crate::der::Encode;
 
 /// Trait for certificate validation strategies.

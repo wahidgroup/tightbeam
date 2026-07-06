@@ -266,7 +266,7 @@ pub fn compress(
 /// Decompress data using the specified algorithm.
 #[cfg(feature = "compress")]
 #[inline]
-pub fn decompress(data: impl AsRef<[u8]>, inflator: &impl Inflator) -> Result<Vec<u8>, CompressionError> {
+pub fn decompress(data: impl AsRef<[u8]>, inflator: &impl Inflator) -> Result<Vec<u8>, TightBeamError> {
 	let data = data.as_ref();
 	inflator.decompress(data)
 }
@@ -336,7 +336,7 @@ mod tests {
 
 	#[test]
 	#[cfg(feature = "compress")]
-	fn test_compress_decompress() -> Result<(), CompressionError> {
+	fn test_compress_decompress() -> Result<(), TightBeamError> {
 		use crate::compress::ZstdCompression;
 
 		// Data-driven cases

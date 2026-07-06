@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 // ============================================================================
 // Handshake Protocol Constants
 // ============================================================================
@@ -81,10 +79,6 @@ pub const AES_GCM_TAG_SIZE: usize = 16;
 /// Used by:
 /// - FDR exploration for deterministic state space traversal
 /// - Runtime fault injection for reproducible test sequences
-///
-/// Certification compliance:
-/// - DO-178C DAL A: Deterministic, reproducible pseudorandom sequences
-/// - IEC 61508 SIL 4: Systematic fault injection with known seed behavior
 pub const LCG_MULTIPLIER: u64 = 6364136223846793005;
 
 /// Linear Congruential Generator (LCG) increment constant
@@ -92,12 +86,11 @@ pub const LCG_MULTIPLIER: u64 = 6364136223846793005;
 /// Source: Numerical Recipes (3rd Ed., 2007), Section 7.1.4
 /// - Must be odd for full period
 /// - Co-prime with 2^64 (guaranteed since it's odd)
-/// - Combined with LCG_MULTIPLIER provides good randomness properties
+/// - Combined with [`LCG_MULTIPLIER`] provides good randomness properties
 ///
-/// Certification compliance:
+/// Properties:
 /// - Same seed produces identical sequences across all platforms
 /// - No floating-point operations (pure integer arithmetic)
-/// - Suitable for embedded/bare-metal environments (no_std compatible)
 pub const LCG_INCREMENT: u64 = 1442695040888963407;
 
 /// Default seed for fault injection reproducibility
@@ -122,10 +115,3 @@ pub const DEFAULT_FAULT_SEED: u64 = 0xDEADBEEF;
 /// When aggregate utilization exceeds this threshold, the hive signals
 /// `TransitStatus::Busy` to the cluster, indicating it should route work elsewhere.
 pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
-
-// ============================================================================
-// Bitcoin Constants
-// ============================================================================
-
-#[cfg(feature = "bitcoin")]
-const BITCOIN_GENESIS_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";

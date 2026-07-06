@@ -90,8 +90,6 @@
 //! A lightweight, versioned messaging protocol with cryptographic primitives
 //! built on ASN.1 DER encoding.
 
-// TODO Find a way
-#![allow(macro_expanded_macro_exports_accessed_by_absolute_paths)]
 #![deny(unsafe_code)]
 #![cfg_attr(not(feature = "std"), no_std)]
 

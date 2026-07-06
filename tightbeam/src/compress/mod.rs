@@ -1,9 +1,11 @@
 use crate::{
 	cms::{content_info::CmsVersion, signed_data::EncapsulatedContentInfo},
-	error::CompressionResult,
+	error::{CompressionError, CompressionResult},
 	spki::AlgorithmIdentifierOwned,
 	CompressedData,
 };
+
+pub use crate::core::Inflator;
 
 /// Trait for compressing data
 pub trait Compressor {
@@ -13,12 +15,6 @@ pub trait Compressor {
 		data: &[u8],
 		content_info: Option<EncapsulatedContentInfo>,
 	) -> CompressionResult<(Vec<u8>, CompressedData)>;
-}
-
-/// Trait for decompressing data
-pub trait Inflator {
-	/// Decompress data and return the decompressed bytes along with compression metadata
-	fn decompress(&self, data: &[u8]) -> CompressionResult<Vec<u8>>;
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,14 +43,14 @@ impl Compressor for ZstdCompression {
 }
 
 impl Inflator for ZstdCompression {
-	fn decompress(&self, data: &[u8]) -> CompressionResult<Vec<u8>> {
+	fn decompress(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
 		use std::io::Cursor;
 
 		let cursor = Cursor::new(data);
-		let mut decoder = zeekstd::Decoder::new(cursor)?;
+		let mut decoder = zeekstd::Decoder::new(cursor).map_err(CompressionError::from)?;
 		let mut out: Vec<u8> = Vec::new();
 
-		std::io::copy(&mut decoder, &mut out)?;
+		std::io::copy(&mut decoder, &mut out).map_err(CompressionError::from)?;
 		Ok(out)
 	}
 }

@@ -1,6 +1,3 @@
-// TODO Why do I need this?
-#![allow(unused_assignments)]
-
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
@@ -12,15 +9,13 @@ pub use crate::cms::compressed_data::CompressedData;
 pub use crate::cms::content_info::ContentInfo;
 pub use crate::cms::enveloped_data::EncryptedContentInfo;
 pub use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfo};
-pub use crate::der::asn1::OctetString;
-pub use crate::der::asn1::*;
+pub use crate::der::asn1::{Any, BitString, ObjectIdentifier, OctetString};
 pub use crate::der::{Choice, Enumerated, Sequence};
 pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
 pub use crate::x509::ext::pkix::HashAlgorithm;
 pub use crate::x509::ext::pkix::SignatureAlgorithm;
 
-/// id-data
 /// Protocol version determines metadata structure and features
 ///
 /// ASN.1 Definition:

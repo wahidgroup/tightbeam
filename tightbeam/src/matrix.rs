@@ -77,8 +77,10 @@ pub struct MatrixDyn {
 }
 
 impl Default for MatrixDyn {
+	/// Smallest valid matrix (1×1, zeroed) so the `data.len() == n*n`
+	/// invariant holds for every reachable value.
 	fn default() -> Self {
-		Self { n: 1, data: Vec::new() }
+		Self { n: 1, data: vec![0u8; 1] }
 	}
 }
 
@@ -97,15 +99,14 @@ impl MatrixDyn {
 		}
 	}
 
+	/// Defense in depth: bounds by the actual buffer as well as `n`, so a
+	/// value constructed in violation of the `data.len() == n*n` invariant
+	/// cannot produce an out-of-bounds index.
 	#[inline]
 	fn idx(&self, r: u8, c: u8) -> Option<usize> {
 		let n = self.n as usize;
 		let (ru, cu) = (r as usize, c as usize);
-		if ru < n && cu < n {
-			Some(ru * n + cu)
-		} else {
-			None
-		}
+		(ru < n && cu < n).then(|| ru * n + cu).filter(|i| *i < self.data.len())
 	}
 
 	/// Borrow the underlying row-major bytes.
@@ -120,12 +121,13 @@ impl MatrixDyn {
 
 	/// Borrow a single row as a slice.
 	pub fn row(&self, r: u8) -> Option<&[u8]> {
-		let n = self.n;
-		if r >= n {
+		if r >= self.n {
 			return None;
 		}
-		let start = r as usize * n as usize;
-		Some(&self.data[start..start + n as usize])
+
+		let n = self.n as usize;
+		let start = r as usize * n;
+		self.data.get(start..start + n)
 	}
 }
 
@@ -152,6 +154,15 @@ impl MatrixLike for MatrixDyn {
 }
 
 /// Compile-time N×N matrix of u8 flags (row-major).
+///
+/// The wire format bounds the dimension to 1..=255; constructing a matrix
+/// with `N` outside that range is rejected at compile time:
+///
+/// ```compile_fail
+/// use tightbeam::matrix::Matrix;
+///
+/// let rejected = Matrix::<256>::new();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Matrix<const N: usize> {
 	data: [[u8; N]; N],
@@ -159,11 +170,17 @@ pub struct Matrix<const N: usize> {
 
 impl<const N: usize> Default for Matrix<N> {
 	fn default() -> Self {
+		const { Self::VALID_N };
 		Self { data: [[0u8; N]; N] }
 	}
 }
 
 impl<const N: usize> Matrix<N> {
+	/// Compile-time guard: the wire format bounds the dimension to 1..=255
+	/// (`MatrixLike::n` returns `u8`). Evaluated by every constructor so an
+	/// out-of-range `N` is rejected at monomorphization.
+	const VALID_N: () = assert!(N >= 1 && N <= 255, "Matrix dimension must be 1..=255");
+
 	/// Create a zero-initialized matrix.
 	pub fn new() -> Self {
 		Self::default()
@@ -290,18 +307,8 @@ impl TryFrom<&Asn1Matrix> for MatrixDyn {
 	type Error = MatrixError;
 	fn try_from(m: &Asn1Matrix) -> Result<Self, Self::Error> {
 		asn1_to_matrix_dyn_impl!(m);
-		let n_u8 = m.n;
 
-		let mut md = MatrixDyn::try_from(n_u8)?;
-		let mut i = 0usize;
-		for r in 0..n_u8 {
-			for c in 0..n_u8 {
-				md.set(r, c, m.data[i]);
-				i += 1;
-			}
-		}
-
-		Ok(md)
+		MatrixDyn::from_row_major(m.n, m.data.clone()).ok_or(MatrixError::LengthMismatch { n: m.n, len: m.data.len() })
 	}
 }
 
@@ -318,6 +325,27 @@ impl TryFrom<Option<Asn1Matrix>> for MatrixDyn {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	#[cfg(feature = "std")]
+	fn default_matrix_dyn_upholds_invariant() {
+		let matrix = MatrixDyn::default();
+		assert_eq!(matrix.n(), 1);
+		assert_eq!(matrix.as_bytes(), &[0u8]);
+		assert_eq!(matrix.get(0, 0), 0);
+		assert!(matrix.row(0).is_some());
+	}
+
+	#[test]
+	#[cfg(feature = "std")]
+	fn absent_asn1_matrix_converts_to_valid_default() -> crate::error::Result<()> {
+		let matrix = MatrixDyn::try_from(None::<Asn1Matrix>)?;
+		assert_eq!(matrix.n(), 1);
+		assert_eq!(matrix.get(0, 0), 0);
+		assert!(matrix.row(0).is_some());
+
+		Ok(())
+	}
 
 	#[test]
 	#[cfg(feature = "std")]
@@ -393,6 +421,7 @@ mod tests {
 
 		// Byte view length and static reconstruction
 		assert_eq!(dyn_m.as_bytes().len(), 9);
+
 		let stat_bytes = Matrix::<3>::from_row_major(&bytes);
 		assert_eq!(
 			stat_bytes
@@ -422,7 +451,6 @@ mod tests {
 		for (n, data) in &test_matrices {
 			// Valid construction
 			let asn1_matrix = Asn1Matrix { n: *n, data: data.clone() };
-
 			// Validate n bounds
 			assert!(*n >= 1);
 

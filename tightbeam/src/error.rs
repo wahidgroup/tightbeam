@@ -96,7 +96,7 @@ pub enum TightBeamError {
 	StandardError(crate::standards::error::StandardError),
 
 	#[cfg(feature = "colony")]
-	#[cfg_attr(feature = "derive", error("Drone error: {0}"))]
+	#[cfg_attr(feature = "derive", error("Hive error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	HiveError(crate::colony::hive::HiveError),
 
@@ -381,7 +381,7 @@ impl core::fmt::Display for TightBeamError {
 			#[cfg(feature = "transport")]
 			TightBeamError::HandshakeError(err) => write!(f, "Handshake error: {err}"),
 			#[cfg(feature = "colony")]
-			TightBeamError::HiveError(err) => write!(f, "Drone error: {err}"),
+			TightBeamError::HiveError(err) => write!(f, "Hive error: {err}"),
 			#[cfg(feature = "std")]
 			TightBeamError::LockPoisoned => write!(f, "Lock poisoned"),
 			#[cfg(feature = "standards")]
