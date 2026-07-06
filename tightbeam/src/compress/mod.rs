@@ -1,9 +1,10 @@
-use crate::{
-	cms::{content_info::CmsVersion, signed_data::EncapsulatedContentInfo},
-	error::{CompressionError, CompressionResult},
-	spki::AlgorithmIdentifierOwned,
-	CompressedData,
-};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use crate::{cms::signed_data::EncapsulatedContentInfo, error::CompressionResult, CompressedData};
+
+#[cfg(feature = "zstd")]
+use crate::{cms::content_info::CmsVersion, error::CompressionError, spki::AlgorithmIdentifierOwned};
 
 pub use crate::core::Inflator;
 
@@ -17,9 +18,12 @@ pub trait Compressor {
 	) -> CompressionResult<(Vec<u8>, CompressedData)>;
 }
 
+/// zstd-backed compressor; requires `std` I/O, hence lives behind `zstd`.
+#[cfg(feature = "zstd")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ZstdCompression;
 
+#[cfg(feature = "zstd")]
 impl Compressor for ZstdCompression {
 	fn compress(
 		&self,
@@ -42,6 +46,7 @@ impl Compressor for ZstdCompression {
 	}
 }
 
+#[cfg(feature = "zstd")]
 impl Inflator for ZstdCompression {
 	fn decompress(&self, data: &[u8]) -> crate::error::Result<Vec<u8>> {
 		use std::io::Cursor;
@@ -55,12 +60,14 @@ impl Inflator for ZstdCompression {
 	}
 }
 
+#[cfg(feature = "zstd")]
 impl From<&ZstdCompression> for AlgorithmIdentifierOwned {
 	fn from(_: &ZstdCompression) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned { oid: crate::oids::COMPRESSION_ZSTD, parameters: None }
 	}
 }
 
+#[cfg(feature = "zstd")]
 impl From<ZstdCompression> for AlgorithmIdentifierOwned {
 	fn from(_: ZstdCompression) -> AlgorithmIdentifierOwned {
 		(&ZstdCompression).into()

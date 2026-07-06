@@ -210,11 +210,19 @@ where
 
 		#[cfg(not(feature = "rayon"))]
 		{
-			for seed in 0..config.seeds {
-				let (result, visited) =
-					DefaultExplorationEngine::explore_seed_static(spec_process, config, seed as u64);
-				self.update_verdict_from_result(seed as u64, &result);
-				self.explorer.add_seed_result(seed as u64, result);
+			// Collect first: exploration borrows `self.config` immutably while
+			// the verdict updates below need `&mut self`.
+			let results: Vec<_> = (0..config.seeds)
+				.map(|seed| {
+					let seed = seed as u64;
+					let (result, visited) = DefaultExplorationEngine::explore_seed_static(spec_process, config, seed);
+					(seed, result, visited)
+				})
+				.collect();
+
+			for (seed, result, visited) in results {
+				self.update_verdict_from_result(seed, &result);
+				self.explorer.add_seed_result(seed, result);
 				self.explorer.update_visited_states(&visited);
 			}
 		}

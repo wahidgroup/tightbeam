@@ -256,6 +256,8 @@ where
 /// - [`CertificateValidation::evaluate`]: validity period
 ///   (RFC 5280 §6.1.3(a)(2)) plus direct-trust anchoring - the presented
 ///   certificate must itself be a configured trust anchor (RFC 5280 §6.1.1).
+///   With no anchors configured (e.g. `Default`), every certificate is
+///   rejected. Configure anchors via [`Self::with_trust_chain`].
 /// - [`SignatureVerification::verify_with_policy`]: single-certificate validity,
 ///   algorithm-identifier consistency (RFC 5280 §4.1.1.2), and signature
 ///   verification against a caller-supplied issuer key (RFC 5280 §6.1.3(a)(1)).
@@ -282,13 +284,11 @@ impl CertificateValidation for DirectTrustValidator {
 		// RFC 5280 §6.1.3(a)(2): the certificate must be within its validity period.
 		validate_certificate_expiry(cert)?;
 
-		// Without a configured anchor there is nothing to chain to; expiry-only.
-		if self.trust_chain.is_empty() {
-			return Ok(());
-		}
-
 		// RFC 5280 §6.1.1: direct trust - the presented certificate must itself
 		// be a configured trust anchor (no path building is performed here).
+		// An empty anchor set therefore trusts nothing: fail closed rather
+		// than silently degrade to expiry-only checking (CWE-1188 insecure
+		// default). Use [`ExpiryValidator`] for deliberate expiry-only checks.
 		let cert_der = cert.to_der()?;
 		for anchor in &self.trust_chain {
 			if anchor.to_der()? == cert_der {
@@ -436,9 +436,16 @@ mod tests {
 			Ok(())
 		}
 
+		/// A default-constructed (anchorless) validator must fail closed:
+		/// accepting any in-date certificate would turn a forgotten
+		/// `with_trust_chain` into a silent authentication bypass
+		/// (CWE-1188). Expiry-only checking is `ExpiryValidator`'s job.
 		#[test]
-		fn without_anchor_is_expiry_only() {
-			assert!(DirectTrustValidator::default().evaluate(&test_cert()).is_ok());
+		fn without_anchor_fails_closed() {
+			assert!(matches!(
+				DirectTrustValidator::default().evaluate(&test_cert()),
+				Err(CertificateValidationError::CertificateNotTrusted)
+			));
 		}
 
 		#[test]

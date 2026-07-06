@@ -629,12 +629,22 @@ fn expand_errorizable(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 		}
 	};
 
+	// Feature-gated variants are cfg-stripped before the derive runs, so the
+	// enum can be uninhabited here.
+	let display_body = if data_enum.variants.is_empty() {
+		quote! { match *self {} }
+	} else {
+		quote! {
+			match self {
+				#(#display_arms,)*
+			}
+		}
+	};
+
 	Ok(quote! {
 		impl core::fmt::Display for #name {
 			fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-				match self {
-					#(#display_arms,)*
-				}
+				#display_body
 			}
 		}
 

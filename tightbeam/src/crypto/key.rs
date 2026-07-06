@@ -68,7 +68,10 @@ use encryption::*;
 #[cfg(any(feature = "signature", feature = "aead"))]
 mod common {
 	pub use crate::der::oid::AssociatedOid;
-	pub use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey};
+	pub use crate::spki::AlgorithmIdentifierOwned;
+
+	#[cfg(feature = "signature")]
+	pub use crate::spki::EncodePublicKey;
 }
 
 #[cfg(any(feature = "signature", feature = "aead"))]

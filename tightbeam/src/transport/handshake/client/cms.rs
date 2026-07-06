@@ -3,6 +3,9 @@
 //! Implements the client side of the TightBeam handshake protocol using
 //! CMS builders and processors.
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use core::future::Future;
 use core::pin::Pin;
 

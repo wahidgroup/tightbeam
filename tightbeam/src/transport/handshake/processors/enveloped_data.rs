@@ -2,6 +2,9 @@
 //!
 //! Processes received EnvelopedData structures to decrypt content.
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo};
 use crate::crypto::aead::{Decryptor, KeyInit};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};

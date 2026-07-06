@@ -47,6 +47,7 @@ pub enum CompressionError {
 	#[cfg_attr(feature = "derive", source)]
 	ZSTD(zeekstd::Error),
 
+	#[cfg(feature = "std")]
 	#[cfg_attr(feature = "derive", error("I/O error during compression/decompression: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	#[cfg_attr(feature = "derive", source)]
@@ -59,7 +60,12 @@ impl core::fmt::Display for CompressionError {
 		match self {
 			#[cfg(feature = "zstd")]
 			CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
+			#[cfg(feature = "std")]
 			CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
+			// Without zstd/std the enum is uninhabited; this arm is
+			// unreachable but keeps the match exhaustive for the compiler.
+			#[cfg(not(any(feature = "zstd", feature = "std")))]
+			_ => write!(f, ""),
 		}
 	}
 }
@@ -258,7 +264,7 @@ pub enum TightBeamError {
 	SpkiError(crate::spki::Error),
 
 	/// Error during X.509 certificate building
-	#[cfg(feature = "x509")]
+	#[cfg(feature = "builder")]
 	#[cfg_attr(feature = "derive", error("X.509 builder error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	#[cfg_attr(feature = "derive", source)]
@@ -394,6 +400,10 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::IoError(err) => write!(f, "I/O error: {err}"),
 			#[cfg(feature = "crypto")]
 			TightBeamError::CryptoPolicyError(err) => write!(f, "Crypto policy error: {err}"),
+			#[cfg(feature = "x509")]
+			TightBeamError::CertificateValidationError(err) => {
+				write!(f, "Certificate validation error: {err}")
+			}
 			#[cfg(feature = "router")]
 			TightBeamError::RouterError(err) => write!(f, "Route error: {err}"),
 			TightBeamError::InvalidMetadata => write!(f, "Invalid metadata"),
@@ -423,7 +433,7 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::OsRngError(err) => write!(f, "OS random number generator error: {err}"),
 			#[cfg(feature = "x509")]
 			TightBeamError::SpkiError(err) => write!(f, "SPKI error: {err}"),
-			#[cfg(feature = "x509")]
+			#[cfg(feature = "builder")]
 			TightBeamError::X509BuilderError(err) => write!(f, "X.509 builder error: {err}"),
 			#[cfg(feature = "std")]
 			TightBeamError::RecvTimeoutError => write!(f, "Channel receive timeout error"),
@@ -437,6 +447,8 @@ impl core::fmt::Display for TightBeamError {
 			}
 			#[cfg(feature = "ecies")]
 			TightBeamError::EciesError(err) => write!(f, "ECIES error: {err}"),
+			#[cfg(feature = "kdf")]
+			TightBeamError::KeyDerivationError(err) => write!(f, "Key derivation error: {err}"),
 			#[cfg(feature = "signature")]
 			TightBeamError::SignatureError(err) => {
 				write!(f, "Signature verification or generation error: {err}")
@@ -467,13 +479,7 @@ impl core::fmt::Display for TightBeamError {
 				)
 			}
 			#[cfg(feature = "compress")]
-			TightBeamError::CompressionError(err) => match err {
-				#[cfg(feature = "zstd")]
-				CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
-				CompressionError::IO(e) => {
-					write!(f, "I/O error during compression/decompression: {e}")
-				}
-			},
+			TightBeamError::CompressionError(err) => write!(f, "Compression error: {err}"),
 			TightBeamError::Sequence(errors) => {
 				write!(f, "Multiple errors: ")?;
 				for (i, error) in errors.iter().enumerate() {
@@ -557,7 +563,7 @@ crate::impl_from!(rand_core::Error => TightBeamError::OsRngError);
 
 #[cfg(all(feature = "x509", not(feature = "derive")))]
 crate::impl_from!(spki::Error => TightBeamError::SpkiError);
-#[cfg(all(feature = "x509", not(feature = "derive")))]
+#[cfg(all(feature = "builder", not(feature = "derive")))]
 crate::impl_from!(x509_cert::builder::Error => TightBeamError::X509BuilderError);
 
 #[cfg(all(feature = "compress", not(feature = "derive")))]
@@ -571,7 +577,7 @@ crate::impl_from!(aead::Error => TightBeamError::EncryptionError);
 crate::impl_from!(crypto_common::InvalidLength => TightBeamError::InvalidKeyLength);
 
 #[cfg(all(feature = "ecies", not(feature = "derive")))]
-crate::impl_from!(EciesError => TightBeamError::EciesError);
+crate::impl_from!(crate::crypto::ecies::EciesError => TightBeamError::EciesError);
 
 #[cfg(all(feature = "signature", not(feature = "derive")))]
 crate::impl_from!(signature::Error => TightBeamError::SignatureError);

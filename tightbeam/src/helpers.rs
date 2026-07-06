@@ -6,7 +6,7 @@ extern crate alloc;
 	any(feature = "signature", feature = "digest", feature = "kdf", feature = "aead")
 ))]
 use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), any(feature = "kdf", feature = "aead")))]
 use alloc::vec::Vec;
 
 // Re-exports
@@ -30,12 +30,11 @@ mod signature {
 	pub use crate::crypto::key::SigningKeyProvider;
 	pub use crate::crypto::sign::SignerInfoExt;
 	pub use crate::der::oid::AssociatedOid;
-	// `Any` is only consumed by the AEAD helpers below.
-	#[cfg(feature = "aead")]
-	pub use crate::der::Any;
-	pub use crate::spki::AlgorithmIdentifierOwned;
 	pub use crate::x509::ext::pkix::SubjectKeyIdentifier;
 	pub use crate::SignerInfo;
+
+	#[cfg(not(feature = "aead"))]
+	pub use crate::spki::AlgorithmIdentifierOwned;
 }
 
 #[cfg(feature = "signature")]
@@ -44,6 +43,8 @@ use signature::*;
 #[cfg(feature = "aead")]
 mod encryption {
 	pub use crate::crypto::key::EncryptingKeyProvider;
+	pub use crate::der::Any;
+	pub use crate::spki::AlgorithmIdentifierOwned;
 	pub use crate::EncryptedContentInfo;
 }
 
@@ -576,54 +577,11 @@ mod tests {
 		use crate::cms::signed_data::SignerIdentifier;
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::key::Secp256k1KeyProvider;
-		use crate::der::oid::AssociatedOid;
+
 		use crate::error::Result;
+		use crate::testing::utils::SixteenByteDigest;
 		use crate::testing::{create_test_message, create_test_signing_key};
 		use crate::{TightBeamError, Version};
-
-		/// Digest whose output (16 bytes) is shorter than the 20-byte SKID
-		/// truncation window; exercises the guard in `sign_with_provider`.
-		/// 16 bytes keeps the prehash long enough for k256's `sign_prehash`
-		/// (which rejects prehashes below half the field size), so the SKID
-		/// guard -- not the signature backend -- is what trips.
-		#[derive(Clone, Default)]
-		struct SixteenByteDigest(Sha3_256);
-
-		impl digest::Update for SixteenByteDigest {
-			fn update(&mut self, data: &[u8]) {
-				digest::Update::update(&mut self.0, data);
-			}
-		}
-
-		impl digest::OutputSizeUser for SixteenByteDigest {
-			type OutputSize = digest::consts::U16;
-		}
-
-		impl digest::FixedOutput for SixteenByteDigest {
-			fn finalize_into(self, out: &mut digest::Output<Self>) {
-				let full = digest::FixedOutput::finalize_fixed(self.0);
-				out.copy_from_slice(&full[..16]);
-			}
-		}
-
-		impl digest::Reset for SixteenByteDigest {
-			fn reset(&mut self) {
-				digest::Reset::reset(&mut self.0);
-			}
-		}
-
-		impl digest::FixedOutputReset for SixteenByteDigest {
-			fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
-				let full = digest::FixedOutputReset::finalize_fixed_reset(&mut self.0);
-				out.copy_from_slice(&full[..16]);
-			}
-		}
-
-		impl digest::HashMarker for SixteenByteDigest {}
-
-		impl AssociatedOid for SixteenByteDigest {
-			const OID: crate::der::asn1::ObjectIdentifier = crate::oids::HASH_SHA256;
-		}
 
 		#[tokio::test]
 		async fn rejects_digest_shorter_than_skid_window() -> Result<()> {

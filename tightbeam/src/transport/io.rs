@@ -2,11 +2,13 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-
+#[cfg(all(not(feature = "std"), feature = "transport-ecies"))]
+use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
+
 #[cfg(feature = "std")]
 use std::sync::Arc;
 

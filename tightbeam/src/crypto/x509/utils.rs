@@ -118,6 +118,15 @@ where
 	compute_signer_identifier_from_der::<D>(public_key_der.as_bytes())
 }
 
+/// Borrow the 20-byte SKID truncation window from digest output (RFC 5280
+/// SKID recommendation).
+///
+/// Fails with [`CertificateValidationError::DigestTooShort`] when the
+/// configured digest produces fewer than 20 bytes.
+pub fn skid_window(digest_bytes: &[u8]) -> Result<&[u8], CertificateValidationError> {
+	digest_bytes.get(..20).ok_or(CertificateValidationError::DigestTooShort)
+}
+
 /// Compute a SubjectKeyIdentifier-based SignerIdentifier from DER-encoded public key bytes.
 ///
 /// This is the byte-based variant for use with `KeyProvider::to_public_key_bytes()`.
@@ -131,7 +140,7 @@ where
 	Digest::update(&mut hasher, public_key_der);
 	let digest_bytes = Digest::finalize(hasher);
 
-	let skid_octets = OctetString::new(&digest_bytes.as_slice()[..20])?;
+	let skid_octets = OctetString::new(skid_window(digest_bytes.as_slice())?)?;
 	let skid = SubjectKeyIdentifier::from(skid_octets);
 
 	Ok(SignerIdentifier::SubjectKeyIdentifier(skid))
@@ -255,6 +264,16 @@ mod tests {
 			}
 			other => panic!("Expected Expired error, got: {other:?}"),
 		}
+	}
+
+	#[cfg(all(feature = "digest", feature = "sha3"))]
+	#[test]
+	fn signer_identifier_rejects_short_digest() {
+		use crate::crypto::x509::utils::compute_signer_identifier_from_der;
+		use crate::testing::utils::SixteenByteDigest;
+
+		let result = compute_signer_identifier_from_der::<SixteenByteDigest>(b"any-public-key-der");
+		assert!(matches!(result, Err(CertificateValidationError::DigestTooShort)));
 	}
 
 	#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509", feature = "std"))]

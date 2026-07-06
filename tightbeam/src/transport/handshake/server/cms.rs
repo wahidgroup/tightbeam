@@ -5,15 +5,13 @@
 //!
 //! Generic over `P: CryptoProvider` for cryptographic operations.
 
+use core::marker::PhantomData;
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
-#[cfg(not(feature = "std"))]
-use core::marker::PhantomData;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
-#[cfg(feature = "std")]
-use std::marker::PhantomData;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 

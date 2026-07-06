@@ -10,22 +10,27 @@ extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::crypto::secret::Secret;
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::handshake::error::HandshakeError;
-use crate::x509::Certificate;
 
 #[cfg(feature = "transport-ecies")]
 use crate::asn1::OctetString;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::x509::Certificate;
 
 /// Generate a random 32-byte CEK for AES-256-GCM.
 ///
 /// Returns the CEK wrapped in `Secret<[u8; 32]>` for automatic zeroization.
 pub fn generate_cek() -> Result<Secret<[u8; 32]>, HandshakeError> {
 	use rand_core::RngCore;
+
 	let mut cek = [0u8; 32];
 	rand_core::OsRng.fill_bytes(&mut cek);
+
 	Ok(Secret::from(Box::new(cek)))
 }
 
@@ -91,7 +96,6 @@ pub fn aes_gcm_decrypt(key: &[u8], ciphertext: &[u8], aad: Option<&[u8]>) -> Res
 	}
 
 	let cipher = Aes256Gcm::new_from_slice(key)?;
-
 	// Extract nonce and ciphertext
 	let nonce = Nonce::from_slice(&ciphertext[..12]);
 	let ct = &ciphertext[12..];
@@ -125,6 +129,7 @@ pub fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
 /// # Returns
 /// - `Ok(())` if states match
 /// - `Err(HandshakeError::InvalidState)` if states don't match
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[inline]
 pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), HandshakeError> {
 	if current != expected {
@@ -151,6 +156,7 @@ pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), Hands
 ///
 /// # Errors
 /// - `HandshakeError`: If key extraction or parsing fails
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub fn extract_verifying_key_from_cert<C>(cert: &Certificate) -> Result<PublicKey<C>, HandshakeError>
 where
 	C: Curve + CurveArithmetic,
@@ -202,6 +208,7 @@ pub fn octet_string_to_32_byte_array(octet_string: &OctetString) -> Result<[u8; 
 /// # Note
 /// This function assumes the digest algorithm produces at least 32 bytes.
 /// It will truncate to 32 bytes if the digest is longer.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub fn compute_transcript_digest<D>(data: &[u8]) -> [u8; 32]
 where
 	D: crate::crypto::hash::Digest,

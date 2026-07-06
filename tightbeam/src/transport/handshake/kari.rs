@@ -19,6 +19,9 @@
 //! ECDH with post-quantum KEM shared secrets for hybrid security. This is useful
 //! for protocols like PQXDH that require both classical and post-quantum strength.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile};
 use crate::crypto::secret::Secret;

@@ -37,18 +37,24 @@ use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::asn1::ObjectIdentifier;
 use crate::constants::{AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ECIES_KDF_INFO};
-use crate::der::oid::AssociatedOid;
-
-use crate::crypto::aead::{Aead, AeadCore, Aes256Gcm, Key, KeyInit, Nonce, Payload};
+use crate::crypto::aead::{Aead, AeadCore, Key, KeyInit, Nonce, Payload};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
-use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256, KdfError, KdfFunction};
+use crate::crypto::k256::ecdh::{diffie_hellman, EphemeralSecret};
+use crate::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
+use crate::crypto::k256::{PublicKey, SecretKey};
+use crate::crypto::kdf::{ecies_kdf, KdfError, KdfFunction};
 use crate::crypto::secret::{Secret, SecretSlice};
-use crate::crypto::sign::ecdsa::k256::ecdh::EphemeralSecret;
-use crate::crypto::sign::ecdsa::k256::elliptic_curve::sec1::ToEncodedPoint;
-use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
 use crate::random::RngWrapper;
+
+#[cfg(feature = "x509")]
+use crate::asn1::ObjectIdentifier;
+#[cfg(feature = "x509")]
+use crate::crypto::aead::Aes256Gcm;
+#[cfg(feature = "x509")]
+use crate::crypto::kdf::HkdfSha3_256;
+#[cfg(feature = "x509")]
+use crate::der::oid::AssociatedOid;
 
 // ============================================================================
 // Generic ECIES Traits
@@ -115,10 +121,10 @@ pub enum EciesError {
 	InvalidCiphertext,
 
 	/// Invalid public key
-	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
+	InvalidPublicKey(crate::crypto::k256::elliptic_curve::Error),
 
 	/// Invalid secret key
-	InvalidSecretKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
+	InvalidSecretKey(crate::crypto::k256::elliptic_curve::Error),
 
 	/// Encryption failed
 	EncryptionFailed(crate::crypto::aead::Error),
@@ -182,7 +188,7 @@ impl EciesSecretKeyOps for SecretKey {
 	}
 
 	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> SecretSlice<u8> {
-		let shared_secret = k256::ecdh::diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
+		let shared_secret = diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
 		let v = shared_secret.raw_secret_bytes().to_vec().into_boxed_slice();
 		Secret::from(v)
 	}
@@ -389,6 +395,7 @@ where
 			let mut wire_bytes = Vec::with_capacity(total_len);
 			wire_bytes.extend_from_slice(&ephemeral_bytes);
 			wire_bytes.extend_from_slice(&final_ciphertext);
+
 			M::from_bytes(&wire_bytes)
 		}};
 	}

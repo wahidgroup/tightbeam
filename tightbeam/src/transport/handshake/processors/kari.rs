@@ -2,6 +2,9 @@
 //!
 //! Processes received KARI structures to extract the content-encryption key (CEK).
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::cms::enveloped_data::{KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, RecipientInfo};
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};

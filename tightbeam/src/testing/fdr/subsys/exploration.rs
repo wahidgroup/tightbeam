@@ -70,9 +70,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 		})
 	}
 
-	/// Static version of explore_seed for parallel execution
+	/// Static version of explore_seed usable from both the rayon-parallel and
+	/// sequential exploration loops.
 	/// Returns (SeedResult, visited_states)
-	#[cfg(feature = "rayon")]
 	pub fn explore_seed_static(process: &Process, config: &FdrConfig, seed: u64) -> (SeedResult, HashSet<State>) {
 		let mut visited_states = HashSet::new();
 		let result = Self::explore_seed_core(process, config, seed, |state| {

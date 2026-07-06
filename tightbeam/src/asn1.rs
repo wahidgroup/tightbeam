@@ -13,8 +13,9 @@ pub use crate::der::asn1::{Any, BitString, ObjectIdentifier, OctetString};
 pub use crate::der::{Choice, Enumerated, Sequence};
 pub use crate::pkcs12::digest_info::DigestInfo;
 pub use crate::spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned};
-pub use crate::x509::ext::pkix::HashAlgorithm;
-pub use crate::x509::ext::pkix::SignatureAlgorithm;
+
+#[cfg(feature = "x509")]
+pub use crate::x509::ext::pkix::{HashAlgorithm, SignatureAlgorithm};
 
 /// Protocol version determines metadata structure and features
 ///

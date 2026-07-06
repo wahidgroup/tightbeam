@@ -96,7 +96,7 @@
 #[cfg(not(feature = "std"))]
 #[macro_use]
 extern crate alloc;
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), feature = "zeroize"))]
 use alloc::vec::Vec;
 
 // Before other modules so `compose!` is in crate-wide textual scope.
@@ -159,7 +159,6 @@ pub use der;
 pub use paste;
 pub use pkcs12;
 pub use spki;
-pub use x509_cert as x509;
 
 #[cfg(feature = "hex")]
 pub use hex_literal::hex;
@@ -169,6 +168,8 @@ pub use std::sync::mpsc;
 pub use time;
 #[cfg(feature = "tokio")]
 pub use tokio::sync::mpsc;
+#[cfg(feature = "x509")]
+pub use x509_cert as x509;
 
 pub use utils::{decode, encode};
 

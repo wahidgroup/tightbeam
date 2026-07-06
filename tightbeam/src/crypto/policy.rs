@@ -8,18 +8,18 @@ use core::fmt::Debug;
 use crate::crypto::x509::error::CertificateValidationError;
 use crate::der::oid::ObjectIdentifier;
 
-#[cfg(feature = "derive")]
-use crate::Errorizable;
-
 /// Errors specific to cryptographic policy enforcement
-#[cfg_attr(feature = "derive", derive(Errorizable))]
+///
+/// Deliberately does not derive `Errorizable`: this module builds without
+/// the `derive` feature, so the message strings live in exactly one place --
+/// the `impl_error_display!` block below.
 #[derive(Debug)]
 pub enum CryptoPolicyError {
-	#[cfg_attr(feature = "derive", error("Unsupported algorithm: {0}"))]
+	/// Algorithm not supported by this policy
 	UnsupportedAlgorithm(ObjectIdentifier),
 }
 
-crate::impl_error_display!(CryptoPolicyError {
+crate::impl_error_display!(unconditional CryptoPolicyError {
 	UnsupportedAlgorithm(oid) => "Unsupported algorithm: {oid}",
 });
 
@@ -97,6 +97,49 @@ impl VerificationPolicy for Secp256k1Policy {
 		let sig = Secp256k1Signature::try_from(signature)?;
 
 		verify_canonical::<Sha3_256, _>(&verifying_key, message, &sig)?;
+		Ok(())
+	}
+}
+
+#[cfg(all(
+	test,
+	feature = "secp256k1",
+	feature = "signature",
+	feature = "x509",
+	feature = "sha3"
+))]
+mod tests {
+	use signature::DigestSigner;
+
+	use super::{Secp256k1Policy, VerificationPolicy};
+	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
+	use crate::oids::SIGNER_ECDSA_WITH_SHA3_256;
+	use crate::spki::EncodePublicKey;
+	use crate::testing::create_test_signing_key;
+
+	/// Interop: a signature produced by the `ecdsa` crate's own
+	/// `DigestSigner<Sha3_256>` path -- independent of this crate's
+	/// `sign_canonical` -- must verify under the advertised
+	/// ecdsa-with-SHA3-256 OID. Guards against the label/math mismatch that
+	/// previously made the PKI a closed ecosystem (B-15).
+	#[test]
+	fn verifies_independent_sha3_ecdsa_signature() -> Result<(), Box<dyn std::error::Error>> {
+		let signing_key: Secp256k1SigningKey = create_test_signing_key();
+		let message = b"independent sha3-ecdsa interop";
+
+		let mut digest = Sha3_256::default();
+		digest::Digest::update(&mut digest, message);
+
+		let signature: Secp256k1Signature = signing_key.try_sign_digest(digest)?;
+		let public_key_der = signing_key.verifying_key().to_public_key_der()?;
+		Secp256k1Policy.verify_signature(
+			&SIGNER_ECDSA_WITH_SHA3_256,
+			public_key_der.as_bytes(),
+			message,
+			&signature.to_bytes(),
+		)?;
+
 		Ok(())
 	}
 }

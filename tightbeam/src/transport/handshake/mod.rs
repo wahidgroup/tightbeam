@@ -176,14 +176,9 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
-use crate::crypto::aead::{KeyInit, RuntimeAead};
+use crate::crypto::aead::RuntimeAead;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-#[cfg(feature = "transport-ecies")]
-use crate::crypto::sign::SignatureEncoding;
-use crate::crypto::sign::Verifier;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Decode, Encode, Enumerated, Sequence};
@@ -192,8 +187,18 @@ use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 use crate::Beamable;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::aead::KeyInit;
 #[cfg(feature = "transport-ecies")]
 use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+#[cfg(feature = "transport-ecies")]
+use crate::crypto::sign::SignatureEncoding;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::Verifier;
 #[cfg(feature = "transport-cms")]
 use crate::crypto::x509::store::CertificateTrust;
 #[cfg(feature = "transport-cms")]

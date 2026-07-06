@@ -42,6 +42,14 @@ use crate::der::{Decode, Encode, Reader, Writer};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BasisPoints(u16);
 
+/// Round-half-up for non-negative values already range-checked by the caller.
+///
+/// `f64::round` lives on `std` (core has no float intrinsics), so add-then-
+/// truncate keeps this module no_std-compatible.
+fn round_non_negative(value: f64) -> u16 {
+	(value + 0.5) as u16
+}
+
 impl BasisPoints {
 	/// Maximum value (100%)
 	pub const MAX: Self = Self(10000);
@@ -118,7 +126,7 @@ impl BasisPoints {
 	/// ```
 	pub fn from_percentage(percentage: f64) -> Self {
 		assert!((0.0..=100.0).contains(&percentage), "Percentage must be 0.0-100.0");
-		Self((percentage * 100.0).round() as u16)
+		Self(round_non_negative(percentage * 100.0))
 	}
 
 	/// Create from fraction (0.0-1.0)
@@ -137,7 +145,7 @@ impl BasisPoints {
 	/// ```
 	pub fn from_fraction(fraction: f64) -> Self {
 		assert!((0.0..=1.0).contains(&fraction), "Fraction must be 0.0-1.0");
-		Self((fraction * 10000.0).round() as u16)
+		Self(round_non_negative(fraction * 10000.0))
 	}
 
 	/// Create a new BasisPoints value, saturating at MAX (10000)

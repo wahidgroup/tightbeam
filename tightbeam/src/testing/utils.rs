@@ -237,6 +237,54 @@ pub fn ca_extensions(ca: bool, key_cert_sign: bool, path_len: Option<u8>) -> Vec
 	vec![test_extension(&basic_constraints), test_extension(&key_usage)]
 }
 
+/// Digest whose output (16 bytes) is shorter than the 20-byte SKID
+/// truncation window.
+#[cfg(all(feature = "digest", feature = "sha3"))]
+#[derive(Clone, Default)]
+pub struct SixteenByteDigest(crate::crypto::hash::Sha3_256);
+
+#[cfg(all(feature = "digest", feature = "sha3"))]
+mod sixteen_byte_digest {
+	use super::SixteenByteDigest;
+	use crate::der::oid::AssociatedOid;
+
+	impl digest::Update for SixteenByteDigest {
+		fn update(&mut self, data: &[u8]) {
+			digest::Update::update(&mut self.0, data);
+		}
+	}
+
+	impl digest::OutputSizeUser for SixteenByteDigest {
+		type OutputSize = digest::consts::U16;
+	}
+
+	impl digest::FixedOutput for SixteenByteDigest {
+		fn finalize_into(self, out: &mut digest::Output<Self>) {
+			let full = digest::FixedOutput::finalize_fixed(self.0);
+			out.copy_from_slice(&full[..16]);
+		}
+	}
+
+	impl digest::Reset for SixteenByteDigest {
+		fn reset(&mut self) {
+			digest::Reset::reset(&mut self.0);
+		}
+	}
+
+	impl digest::FixedOutputReset for SixteenByteDigest {
+		fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
+			let full = digest::FixedOutputReset::finalize_fixed_reset(&mut self.0);
+			out.copy_from_slice(&full[..16]);
+		}
+	}
+
+	impl digest::HashMarker for SixteenByteDigest {}
+
+	impl AssociatedOid for SixteenByteDigest {
+		const OID: crate::der::asn1::ObjectIdentifier = crate::oids::HASH_SHA256;
+	}
+}
+
 /// A certificate chain with root -> intermediate -> leaf certificates.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub struct TestCertificateChain {
