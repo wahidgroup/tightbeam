@@ -38,6 +38,7 @@ use crate::spki::EncodePublicKey;
 use crate::transport::handshake::attributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::kari::{derive_kek, key_wrap_key_size, unwrap_with_kek, wrap_with_kek};
+use crate::transport::handshake::negotiation::ProfileStrengthPolicy;
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
@@ -71,6 +72,7 @@ where
 	transcript_buffer: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
 	supported_profiles: Vec<SecurityProfileDesc>,
+	strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	selected_profile: Option<SecurityProfileDesc>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	invariants: HandshakeInvariant,
@@ -106,6 +108,7 @@ where
 			transcript_buffer: Vec::new(),
 			session_key: None,
 			supported_profiles: Vec::new(),
+			strength_policy: None, // Defaults to DefaultStrengthFloor
 			selected_profile: None,
 			client_validators,
 			invariants: { HandshakeInvariant::default() },
@@ -133,6 +136,16 @@ where
 	#[must_use]
 	pub fn with_supported_profiles(mut self, profiles: Vec<SecurityProfileDesc>) -> Self {
 		self.supported_profiles = profiles;
+		self
+	}
+
+	/// Override the minimum-strength policy applied during negotiation.
+	///
+	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit digest).
+	/// Pass `NoStrengthFloor` only where weaker profiles must remain negotiable.
+	#[must_use]
+	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
+		self.strength_policy = Some(policy);
 		self
 	}
 
@@ -175,7 +188,7 @@ where
 	/// Compute transcript hash from the accumulated buffer.
 	///
 	/// Uses SHA3-256 for consistency with the protocol.
-	fn compute_transcript_hash(&self) -> [u8; 32] {
+	fn compute_transcript_hash(&self) -> Result<[u8; 32], HandshakeError> {
 		compute_transcript_digest::<P::Digest>(&self.transcript_buffer)
 	}
 
@@ -397,7 +410,7 @@ where
 	fn prepare_server_finished_digest(&mut self) -> Result<Vec<u8>, HandshakeError> {
 		// Compute transcript hash if not already set
 		if self.transcript_hash.is_none() {
-			self.transcript_hash = Some(self.compute_transcript_hash());
+			self.transcript_hash = Some(self.compute_transcript_hash()?);
 		}
 
 		// Hash the transcript hash
@@ -576,6 +589,14 @@ where
 	fn supported_profiles(&self) -> &[SecurityProfileDesc] {
 		&self.supported_profiles
 	}
+
+	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
+		if let Some(policy) = &self.strength_policy {
+			return policy.as_ref();
+		}
+
+		&crate::transport::handshake::negotiation::DefaultStrengthFloor
+	}
 }
 
 impl<P> HandshakeFinalization<P> for CmsHandshakeServer<P>
@@ -703,7 +724,7 @@ mod tests {
 		/// Test the full server state flow through a complete handshake.
 		///
 		/// Verifies that the server correctly transitions through all states:
-		/// Init → KeyExchangeReceived → ServerFinishedSent → ClientFinishedReceived → Complete
+		/// Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> Complete
 		#[tokio::test]
 		async fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
 			let transcript_hash = [1u8; 32];

@@ -90,7 +90,7 @@ tightbeam is a Layer-5 messaging framework using Abstract Syntax Notation One (A
         - 8.5.4. [Implementation: ECIES-Based Handshake Protocol](#854-implementation-ecies-based-handshake-protocol)
         - 8.5.5. [Security Profile Negotiation](#855-security-profile-negotiation)
         - 8.5.6. [Negotiation & Failure Modes](#856-negotiation--failure-modes)
-        - 8.5.7. [Threat → Control Mapping](#857-threat--control-mapping)
+        - 8.5.7. [Threat -> Control Mapping](#857-threat--control-mapping)
     - 8.6. [Connection Pooling](#86-connection-pooling)
     - 8.7. [Audit](#87-audit)
 9. [Network Theory](#9-network-theory)
@@ -204,7 +204,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 This document adheres to the [RFC Editor Style Guide][rfc-style-guide] and [RFC 7322][rfc7322] for structure and editorial style:
 
-- **Section pattern**: Normative sections progress through concept → specification → implementation → testing.
+- **Section pattern**: Normative sections progress through concept -> specification -> implementation -> testing.
 - **Requirements language**: Key words are interpreted per [RFC 2119][rfc2119] (see [§1.2 Requirements Language](#12-requirements-language)).
 - **Terminology**: Project terms are defined once in [§2 Terminology](#2-terminology) and used consistently thereafter.
 - **Citations**: External standards are cited by name and linked on their first mention within a section. Full references are recorded in [§14 References](#14-references); every entry there is cited at least once in the text, and every in-text citation resolves to an entry there.
@@ -632,7 +632,7 @@ This section specifies what the nonrepudiation signature covers when present.
 	- `metadata` (including MI when present)
 	- `message`
 	- `integrity` (FI) when present
-- Security consequence: Any modification to version, metadata (including MI), message, or FI invalidates the signature. This yields the transitive binding: Signature → FI (envelope) → MI (in metadata) → Message body
+- Security consequence: Any modification to version, metadata (including MI), message, or FI invalidates the signature. This yields the transitive binding: Signature -> FI (envelope) -> MI (in metadata) -> Message body
 
 #### 5.7.6 Security Property Chain
 
@@ -643,7 +643,7 @@ When all security features are enabled (MI, FI, AEAD encryption, and signatures)
 - Store DigestInfo in Metadata
 2. Optionally compress the plaintext message
 - Store CompressedData in Metadata
-3. Encrypt with AEAD cipher → produce authenticated ciphertext
+3. Encrypt with AEAD cipher -> produce authenticated ciphertext
 - Store EncryptedContentInfo in Metadata
 - Store ciphertext in Frame.message
 4. Compute FI over envelope (Version + Metadata containing MI)
@@ -759,7 +759,7 @@ The matrix, combined with the `previous_frame` field, enables sophisticated stat
 
 **State Evolution**:
 - **Snapshots**: Each matrix **M_t** is a state snapshot, with entropy up to **8n²** bits.
-- **Causal Links**: `previous_frame` hashes ensure a DAG, where **M_t → M_{t-1}** via hash verification.
+- **Causal Links**: `previous_frame` hashes ensure a DAG, where **M_t -> M_{t-1}** via hash verification.
 - **Transitions**: Changes in **M_t[r,c]** across frames model state updates.
 - **Branching**: Multiple frames sharing a `previous_frame` but differing in **M_t** represent alternative states.
 
@@ -913,7 +913,7 @@ Applications can define multiple profiles for different security contexts (e.g.,
 ### 6.3 Numeric Security Levels
 
 Numeric security levels are a convenience shorthand:
-- Level 1 or 2 → Sets `confidential + nonrepudiable + min_version = V1`
+- Level 1 or 2 -> Sets `confidential + nonrepudiable + min_version = V1`
 - Does NOT enable algorithm OID validation (use type-based profiles for that)
 
 ### 6.4 Message-Level Security Requirements
@@ -1400,7 +1400,7 @@ tightbeam implements two handshake protocols for mutual authentication and sessi
 **Three-Phase Exchange:**
 
 ```
-Phase 1: Client → Server
+Phase 1: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
 │ ClientHello (ECIES) or KeyExchange (CMS)                │
 │ - Client nonce (32 bytes)                               │
@@ -1408,7 +1408,7 @@ Phase 1: Client → Server
 │ - Ephemeral public key (CMS: in KARI structure)         │
 └─────────────────────────────────────────────────────────┘
 
-Phase 2: Server → Client
+Phase 2: Server -> Client
 ┌─────────────────────────────────────────────────────────┐
 │ ServerHandshake (ECIES) or ServerFinished (CMS)         │
 │ - Server certificate                                    │
@@ -1417,7 +1417,7 @@ Phase 2: Server → Client
 │ - Signature over transcript hash                        │
 └─────────────────────────────────────────────────────────┘
 
-Phase 3: Client → Server
+Phase 3: Client -> Server
 ┌─────────────────────────────────────────────────────────┐
 │ ClientKeyExchange (ECIES) or ClientFinished (CMS)       │
 │ - Encrypted session key                                 │
@@ -1430,12 +1430,12 @@ Phase 3: Client → Server
 
 Client States:
 ```
-Init → HelloSent → KeyExchangeSent → ServerFinishedReceived → ClientFinishedSent → Completed
+Init -> HelloSent -> KeyExchangeSent -> ServerFinishedReceived -> ClientFinishedSent -> Completed
 ```
 
 Server States:
 ```
-Init → KeyExchangeReceived → ServerFinishedSent → ClientFinishedReceived → Completed
+Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> Completed
 ```
 
 **Transcript Hash:**
@@ -1718,7 +1718,7 @@ let security_accept = SecurityAccept {
 | `InvalidState` | Out-of-order message | Reset state machine |
 | `DecryptionFailed` | Wrong key or corrupted data | Abort handshake |
 
-#### 8.5.7 Threat → Control Mapping
+#### 8.5.7 Threat -> Control Mapping
 
 | Threat | Control | Implementation |
 |--------|---------|----------------|
@@ -2367,9 +2367,9 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	/// Connection pool configuration for hive connections
 	pub pool_config: PoolConfig,
-	/// Default retry policy for all cluster → hive communication
+	/// Default retry policy for all cluster -> hive communication
 	pub retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
-	/// TLS configuration for cluster → hive connections
+	/// TLS configuration for cluster -> hive connections
 	pub tls: ClusterTlsConfig,
 }
 ```
@@ -3024,7 +3024,7 @@ tightbeam implements formal verification through three complementary layers, eac
 
 All three layers are accessed through the `tb_scenario!` macro, which provides:
 - Consistent syntax across all verification layers
-- Progressive enhancement (L1 → L1+L2 → L1+L2+L3)
+- Progressive enhancement (L1 -> L1+L2 -> L1+L2+L3)
 - Environment abstraction (ServiceClient, Servlet, Worker, Bare)
 - Instrumentation integration
 - Policy enforcement
@@ -3863,7 +3863,7 @@ The `tb_scenario!` macro is the unified entry point for all testing layers, exec
 
 **Design Principles**:
 - Single consistent syntax across all verification layers
-- Progressive enhancement (L1 → L1+L2 → L1+L2+L3)
+- Progressive enhancement (L1 -> L1+L2 -> L1+L2+L3)
 - Environment abstraction (ServiceClient, Servlet, Worker, Bare)
 - Instrumentation integration
 - Policy enforcement
@@ -4203,7 +4203,7 @@ The `CspOracle` interprets AFL's random bytes as state machine navigation choice
 ```
 AFL Random Bytes          CspOracle                State Machine
 ─────────────────  ───►  ───────────────  ───►  ─────────────────
-[0x7A, 0x3F, ...]        byte % events.len()     S0 → S1 → S2 → ...
+[0x7A, 0x3F, ...]        byte % events.len()     S0 -> S1 -> S2 -> ...
                          selects valid event      (valid trace)
 ```
 
@@ -4216,8 +4216,8 @@ AFL Random Bytes          CspOracle                State Machine
 **Example Trace** (from crash analysis):
 ```
 Input: [0x00, 0x01, 0x00, 0x02]
-Trace: "start" → "action_a" → "action_b" → "done"
-State: S0 → S1 → S1 → S2
+Trace: "start" -> "action_a" -> "action_b" -> "done"
+State: S0 -> S1 -> S1 -> S2
 Result: Crash at state S1 after "action_b"
 ```
 
@@ -4253,7 +4253,7 @@ When built with `--features testing-fuzz-ijon`, tightbeam's `tb_scenario!` macro
 Without IJON, AFL relies solely on code coverage (edge hit counts). With tightbeam's oracle + IJON:
 
 - **AFL alone**: Discovers `branch_A`, `branch_B`, `branch_C` (syntax)
-- **AFL + CSP oracle**: Discovers `State_Init → State_Processing → State_Done` (semantics)
+- **AFL + CSP oracle**: Discovers `State_Init -> State_Processing -> State_Done` (semantics)
 - **AFL + CSP + IJON**: Prioritizes inputs that maximize unique states visited
 
 **Example: Magic Value Discovery**:
@@ -4395,14 +4395,14 @@ tightbeam automatically calculates Severity, Occurrence, and Detection ratings f
      - 1: Minor (>80% states reachable)
 
 2. **Occurrence** (converted from `BasisPoints` injection probability):
-   - MIL-STD-1629: `probability_bps / 1000` (0-10000 → 1-10)
-   - ISO 26262: `probability_bps / 2500` (0-10000 → 1-4)
+   - MIL-STD-1629: `probability_bps / 1000` (0-10000 -> 1-10)
+   - ISO 26262: `probability_bps / 2500` (0-10000 -> 1-4)
 
 3. **Detection** (calculated from error recovery statistics):
    - Based on `FdrVerdict::error_recovery_successful` vs `error_recovery_failed` counts
    - Inverted success rate: high recovery = low detection number (easily detected)
-   - 100% recovery success → Detection = 1 (easily detected/recoverable)
-   - 0% recovery success → Detection = max scale (undetectable/unrecoverable)
+   - 100% recovery success -> Detection = 1 (easily detected/recoverable)
+   - 0% recovery success -> Detection = max scale (undetectable/unrecoverable)
 
 **FMEA Report Structure**:
 ```rust

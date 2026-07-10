@@ -116,9 +116,17 @@
 //!
 //! ## State Machine
 //!
-//! Handshakes follow a strict state machine to prevent protocol violations:
-//! - **Client**: Init → HelloSent → KeyExchangeSent → Complete
-//! - **Server**: Init → ServerHelloSent → KeyExchangeReceived → Complete
+//! Handshakes follow a strict state machine to prevent protocol violations.
+//! Each role machine is deliberately the *union* of the ECIES and CMS message
+//! flows. The orchestrator owns selecting the correct sequence for its
+//! protocol (see [`state`]):
+//! - **Client**: Init -> HelloSent -> ServerHelloReceived -> KeyExchangeSent ->
+//!   ServerFinishedReceived -> ClientFinishedSent -> Completed, with ECIES
+//!   short-circuits Init -> KeyExchangeSent and KeyExchangeSent -> Completed
+//! - **Server**: Init -> ClientHelloReceived -> ServerHelloSent ->
+//!   KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived ->
+//!   Completed, with the matching ECIES short-circuits
+//! - Any non-terminal state may classify to the Aborted or Failed terminals
 //!
 //! Invalid state transitions return `HandshakeError::InvalidState`.
 
@@ -164,7 +172,7 @@ pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generat
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
 #[cfg(feature = "transport-cms")]
 pub use kari::{kari_unwrap, kari_wrap};
-#[cfg(all(feature = "transport-cms", feature = "kem"))]
+#[cfg(all(feature = "transport-cms", feature = "kem", feature = "unstable-pqxdh"))]
 pub use kari::{kari_unwrap_hybrid, kari_wrap_hybrid};
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};

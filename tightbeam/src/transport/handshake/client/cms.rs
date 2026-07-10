@@ -213,7 +213,7 @@ where
 	/// Compute transcript hash from the accumulated buffer.
 	///
 	/// Uses the provider's digest algorithm for consistency with signatures.
-	fn compute_transcript_hash(&self) -> [u8; 32] {
+	fn compute_transcript_hash(&self) -> Result<[u8; 32], HandshakeError> {
 		compute_transcript_digest::<P::Digest>(&self.transcript_buffer)
 	}
 
@@ -297,7 +297,7 @@ where
 
 		// 2. Compute transcript hash BEFORE adding server_finished (to match server's hash)
 		if self.transcript_hash.is_none() {
-			self.transcript_hash = Some(self.compute_transcript_hash());
+			self.transcript_hash = Some(self.compute_transcript_hash()?);
 		}
 
 		// 3. Extract cryptographic material

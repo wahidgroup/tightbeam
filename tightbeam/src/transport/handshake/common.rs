@@ -13,7 +13,9 @@ use crate::crypto::x509::attr::{Attribute, Attributes};
 use crate::oids::HANDSHAKE_ABORT_ALERT;
 use crate::transport::handshake::attributes::{extract_alert_x509, find_x509};
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::{select_profile, SecurityOffer};
+use crate::transport::handshake::negotiation::{
+	select_profile, DefaultStrengthFloor, NegotiationError, ProfileStrengthPolicy, SecurityOffer,
+};
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -25,11 +27,25 @@ use alloc::vec::Vec;
 /// both client-offered and dealer's choice modes.
 ///
 /// # Usage
-/// - **Negotiation mode**: Client sends `SecurityOffer`, server selects first mutual profile
-/// - **Dealer's choice mode**: Client sends no offer, server uses first configured profile
+/// - **Negotiation mode**: Client sends `SecurityOffer`, server selects the first mutual
+///   profile in *server* preference order
+/// - **Dealer's choice mode**: Client sends no offer, server uses its first configured
+///   profile that meets the strength policy
+///
+/// # Security
+/// Both modes filter profiles through [`ProfileStrengthPolicy`] before selection,
+/// so a weak profile left in `supported_profiles()` for compatibility cannot be
+/// negotiated (CWE-757 downgrade resistance).
 pub trait HandshakeNegotiation {
-	/// Get the list of supported security profiles.
+	/// Get the list of supported security profiles (first = most preferred).
 	fn supported_profiles(&self) -> &[SecurityProfileDesc];
+
+	/// Minimum-strength policy applied before selection.
+	///
+	/// Defaults to [`DefaultStrengthFloor`] (256-bit AEAD key, >= 256-bit digest).
+	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
+		&DefaultStrengthFloor
+	}
 
 	/// Negotiate a security profile with the peer.
 	///
@@ -41,6 +57,7 @@ pub trait HandshakeNegotiation {
 	///
 	/// # Errors
 	/// - `NoSupportedProfiles`: No profiles configured on server
+	/// - `NegotiationError(BelowStrengthFloor)`: No configured profile meets the policy
 	/// - `NegotiationError`: No mutually supported profile found
 	fn negotiate_profile(&self, offer: Option<&SecurityOffer>) -> Result<SecurityProfileDesc, HandshakeError> {
 		let supported = self.supported_profiles();
@@ -48,9 +65,19 @@ pub trait HandshakeNegotiation {
 			return Err(HandshakeError::NoSupportedProfiles);
 		}
 
+		let policy = self.strength_policy();
+		let eligible: Vec<SecurityProfileDesc> = supported
+			.iter()
+			.filter(|profile| policy.meets_floor(profile))
+			.copied()
+			.collect();
+		if eligible.is_empty() {
+			return Err(NegotiationError::BelowStrengthFloor.into());
+		}
+
 		match offer {
-			Some(offer) => Ok(select_profile(offer, supported)?),
-			None => Ok(supported[0]), // Dealer's choice
+			Some(offer) => Ok(select_profile(offer, &eligible)?),
+			None => Ok(eligible[0]), // Dealer's choice
 		}
 	}
 }
@@ -93,7 +120,7 @@ where
 		P::AeadCipher: KeyInit,
 	{
 		let profile = self.selected_profile().ok_or(HandshakeError::InvalidState)?;
-		let key_size = profile.aead_key_size.ok_or(HandshakeError::InvalidState)? as usize;
+		let key_size = usize::from(profile.aead_key_size.ok_or(HandshakeError::InvalidState)?);
 
 		// Enforce minimum salt entropy for both protocols
 		if salt.len() < MIN_SALT_ENTROPY_BYTES {
@@ -122,6 +149,11 @@ where
 /// - `FinishedIntegrityFail`: Transcript hash mismatch
 pub trait HandshakeAlertHandler {
 	/// Check for abort alert in unprotected attributes.
+	///
+	/// # Security
+	/// Abort alerts exist in *unprotected* attributes and are therefore
+	/// advisory and unauthenticated (as in TLS): a MITM can inject a spurious
+	/// abort (DoS) or suppress a real one.
 	///
 	/// # Parameters
 	/// - `attrs`: Optional X.509 attributes from CMS unprotected attributes
@@ -155,6 +187,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::oids::{AES_128_GCM, AES_256_GCM, CURVE_SECP256K1, HASH_SHA256, SIGNER_ECDSA_WITH_SHA256};
+	use crate::transport::handshake::negotiation::NegotiationError;
 
 	// Mock struct for testing negotiation
 	struct MockServer {
@@ -195,28 +228,43 @@ mod tests {
 	}
 
 	#[test]
-	fn test_negotiate_profile_with_offer() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_negotiate_profile_with_offer_enforces_floor() -> Result<(), Box<dyn std::error::Error>> {
 		let p_a = create_test_profile(AES_128_GCM, 16);
 		let p_b = create_test_profile(AES_256_GCM, 32);
 
 		let server = MockServer { profiles: vec![p_a, p_b] };
 
+		// 128-bit AEAD fails the default strength floor; only p_b survives.
 		let offer = SecurityOffer::new(vec![p_a, p_b]);
 		let selected = server.negotiate_profile(Some(&offer))?;
-		assert_eq!(selected.aead_key_size, Some(16)); // Should select p_a (client's first preference)
+		assert_eq!(selected.aead_key_size, Some(32));
 		Ok(())
 	}
 
 	#[test]
-	fn test_negotiate_profile_dealers_choice() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_negotiate_profile_dealers_choice_skips_below_floor() -> Result<(), Box<dyn std::error::Error>> {
 		let p_a = create_test_profile(AES_128_GCM, 16);
 		let p_b = create_test_profile(AES_256_GCM, 32);
 
 		let server = MockServer { profiles: vec![p_a, p_b] };
 
 		let selected = server.negotiate_profile(None)?;
-		assert_eq!(selected.aead_key_size, Some(16)); // Should select first (p_a)
+		assert_eq!(selected.aead_key_size, Some(32));
 		Ok(())
+	}
+
+	#[test]
+	fn test_negotiate_profile_all_below_floor() {
+		let p_a = create_test_profile(AES_128_GCM, 16);
+
+		let server = MockServer { profiles: vec![p_a] };
+
+		let offer = SecurityOffer::new(vec![p_a]);
+		let result = server.negotiate_profile(Some(&offer));
+		assert!(matches!(
+			result,
+			Err(HandshakeError::NegotiationError(NegotiationError::BelowStrengthFloor))
+		));
 	}
 
 	#[test]

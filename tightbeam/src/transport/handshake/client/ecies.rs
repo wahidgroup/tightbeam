@@ -204,7 +204,8 @@ where
 			None => Vec::new(),
 		};
 
-		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes, &accept_der);
+		let transcript_digest =
+			self.compute_transcript_hash(&client_random, &server_random, spki_bytes, &accept_der)?;
 		self.transcript_hash = Some(transcript_digest);
 		// Invariant: transcript becomes immutable after hash computed
 		self.invariants.lock_transcript()?;
@@ -425,7 +426,7 @@ where
 		server_random: &[u8; 32],
 		spki_bytes: &[u8],
 		accept_der: &[u8],
-	) -> [u8; 32] {
+	) -> Result<[u8; 32], HandshakeError> {
 		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len() + accept_der.len());
 		data.extend_from_slice(client_random);
 		data.extend_from_slice(server_random);
@@ -743,7 +744,7 @@ mod tests {
 			Ok(response.to_der()?)
 		};
 
-		// Test 1: Client offers [A, B], server accepts B → OK
+		// Test 1: Client offers [A, B], server accepts B -> OK
 		{
 			let (mut client, client_random) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
 			let server_response = create_server_response(&client_random, [2u8; 32], &p_b)?;
@@ -751,7 +752,7 @@ mod tests {
 			assert_eq!(client.selected_profile, Some(p_b));
 		}
 
-		// Test 2: Client offers [A, B], server accepts C (not in offer) → FAIL
+		// Test 2: Client offers [A, B], server accepts C (not in offer) -> FAIL
 		{
 			let (mut client, client_random) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
 			let server_response = create_server_response(&client_random, [3u8; 32], &p_c)?;
@@ -759,7 +760,7 @@ mod tests {
 			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 		}
 
-		// Test 3: No offer, server picks → OK (dealer's choice)
+		// Test 3: No offer, server picks -> OK (dealer's choice)
 		{
 			let (mut client, client_random) = setup_client(None)?;
 			let server_response = create_server_response(&client_random, [4u8; 32], &p_a)?;

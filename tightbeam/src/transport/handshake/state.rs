@@ -263,6 +263,10 @@ impl ClientStateMachine {
 		self.state
 	}
 
+	// Deliberately the union of the ECIES and CMS transition tables: both
+	// protocols share this machine, so a transition legal in either flow is
+	// accepted here. Protocol-confusion is prevented by the orchestrators,
+	// which drive a fixed sequence.
 	fn can_transition(&self, to: ClientHandshakeState) -> bool {
 		use ClientHandshakeState::*;
 		match (self.state, to) {
@@ -311,6 +315,7 @@ impl ServerStateMachine {
 		self.state
 	}
 
+	// Union of ECIES and CMS transition tables; see ClientStateMachine note.
 	fn can_transition(&self, to: ServerHandshakeState) -> bool {
 		use ServerHandshakeState::*;
 		match (self.state, to) {

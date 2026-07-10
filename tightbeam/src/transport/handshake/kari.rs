@@ -18,6 +18,7 @@
 //! The `kari_wrap_hybrid` and `kari_unwrap_hybrid` functions combine classical
 //! ECDH with post-quantum KEM shared secrets for hybrid security. This is useful
 //! for protocols like PQXDH that require both classical and post-quantum strength.
+//! UNSTABLE: no orchestrator consumes them yet; gated behind `unstable-pqxdh`.
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -44,8 +45,8 @@ where
 	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
 {
 	let shared = diffie_hellman(priv_key.to_nonzero_scalar(), peer_pub.as_affine());
-	let vec = shared.raw_secret_bytes().as_ref().to_vec();
-	Ok(vec.into())
+	// Move the copy straight into Secret so no plain binding outlives this line
+	Ok(Secret::from(shared.raw_secret_bytes().as_ref().to_vec()))
 }
 
 /// Map a negotiated AES key-wrap OID to its KEK byte length.
@@ -223,7 +224,7 @@ where
 ///
 /// # Returns
 /// Wrapped CEK bytes (RFC 3394 format)
-#[cfg(feature = "kem")]
+#[cfg(all(feature = "kem", feature = "unstable-pqxdh"))]
 pub fn kari_wrap_hybrid<P, C>(
 	provider: &P,
 	sender_ec_priv: &SecretKey<C>,
@@ -268,7 +269,7 @@ where
 ///
 /// # Returns
 /// Unwrapped CEK bytes
-#[cfg(feature = "kem")]
+#[cfg(all(feature = "kem", feature = "unstable-pqxdh"))]
 pub fn kari_unwrap_hybrid<P, C>(
 	provider: &P,
 	recipient_ec_priv: &SecretKey<C>,

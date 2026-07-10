@@ -1353,8 +1353,8 @@ macro_rules! __tb_scenario_verify_impl {
 				expect_failure = config.expect_failure;
 
 				// AUTOMATIC MODE SELECTION:
-				// If fault_model + specs provided → explore spec WITH faults (specification robustness)
-				// Otherwise → explore execution trace (normal behavior / implementation resilience)
+				// If fault_model + specs provided -> explore spec WITH faults (specification robustness)
+				// Otherwise -> explore execution trace (normal behavior / implementation resilience)
 				#[cfg(feature = "testing-fault")]
 				let process_to_explore = if config.fault_model.is_some() && !config.specs.is_empty() {
 					&config.specs[0]

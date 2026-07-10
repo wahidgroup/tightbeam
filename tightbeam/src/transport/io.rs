@@ -56,8 +56,9 @@ mod x509 {
 #[cfg(feature = "x509")]
 use x509::*;
 
+/// Maximum wire size allowed for handshake-phase messages.
 #[cfg(feature = "transport-ecies")]
-const HANDSHAKE_MAX_WIRE: usize = crate::transport::tcp::HANDSHAKE_MAX_WIRE;
+pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
 
 /// Parse a DER length field into its numeric value.
 pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
@@ -487,7 +488,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		// Parse ClientHello and wrap in SignedData → TransportEnvelope
+		// Parse ClientHello and wrap in SignedData -> TransportEnvelope
 		let client_hello = ClientHello::from_der(&initial_message)?;
 		let signed_data: SignedData = (&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
 		let initial_envelope = TransportEnvelope::SignedData(Box::new(signed_data));
@@ -650,7 +651,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				return Err(TransportError::InvalidMessage);
 			}
 
-			// Parse ServerHandshake and wrap in SignedData → TransportEnvelope
+			// Parse ServerHandshake and wrap in SignedData -> TransportEnvelope
 			let server_handshake = ServerHandshake::from_der(&response)?;
 			let signed_data: SignedData = (&server_handshake).try_into().map_err(|_| TransportError::InvalidMessage)?;
 			let server_envelope = TransportEnvelope::SignedData(Box::new(signed_data));

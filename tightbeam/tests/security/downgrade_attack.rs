@@ -137,7 +137,7 @@ job! {
 
 			// ========================================
 			// Step 3: Verify wire bytes are DIFFERENT
-			// Different cipher OIDs → different SecurityOffer → different bytes
+			// Different cipher OIDs -> different SecurityOffer -> different bytes
 			// ========================================
 			let strong_hello = strong_handshake
 				.client_messages()

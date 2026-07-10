@@ -34,7 +34,7 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::SecurityAccept;
+use crate::transport::handshake::negotiation::{ProfileStrengthPolicy, SecurityAccept};
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::{
@@ -67,6 +67,7 @@ where
 	transcript_hash: Option<[u8; 32]>,
 	aad_domain_tag: Option<&'static [u8]>,
 	supported_profiles: Vec<SecurityProfileDesc>,
+	strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	selected_profile: Option<SecurityProfileDesc>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	validated_client_cert: Option<Arc<Certificate>>,
@@ -103,6 +104,7 @@ where
 			transcript_hash: None,
 			aad_domain_tag: aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG)),
 			supported_profiles: Vec::new(), // Must be set via with_supported_profiles()
+			strength_policy: None,          // Defaults to DefaultStrengthFloor
 			selected_profile: None,
 			client_validators,
 			validated_client_cert: None,
@@ -114,6 +116,15 @@ where
 	/// Server must have at least one supported profile configured.
 	pub fn with_supported_profiles(mut self, profiles: Vec<SecurityProfileDesc>) -> Self {
 		self.supported_profiles = profiles;
+		self
+	}
+
+	/// Override the minimum-strength policy applied during negotiation.
+	///
+	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit digest).
+	/// Pass `NoStrengthFloor` only where weaker profiles must remain negotiable.
+	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
+		self.strength_policy = Some(policy);
 		self
 	}
 
@@ -154,7 +165,8 @@ where
 		// Bind the negotiated profile into the transcript so a tampered
 		// security_accept invalidates the server signature.
 		let accept_der = security_accept.to_der()?;
-		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes, &accept_der);
+		let transcript_digest =
+			self.compute_transcript_hash(&client_random, &server_random, spki_bytes, &accept_der)?;
 		self.transcript_hash = Some(transcript_digest);
 		self.invariants.lock_transcript()?;
 
@@ -270,7 +282,7 @@ where
 		server_random: &[u8; 32],
 		spki_bytes: &[u8],
 		accept_der: &[u8],
-	) -> [u8; 32] {
+	) -> Result<[u8; 32], HandshakeError> {
 		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len() + accept_der.len());
 		data.extend_from_slice(client_random);
 		data.extend_from_slice(server_random);
@@ -458,6 +470,14 @@ where
 	fn supported_profiles(&self) -> &[SecurityProfileDesc] {
 		&self.supported_profiles
 	}
+
+	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
+		if let Some(policy) = &self.strength_policy {
+			return policy.as_ref();
+		}
+
+		&crate::transport::handshake::negotiation::DefaultStrengthFloor
+	}
 }
 
 impl<P> HandshakeFinalization<P> for EciesHandshakeServer<P>
@@ -585,7 +605,7 @@ mod tests {
 	/// Test the full server state flow through a complete handshake.
 	///
 	/// Verifies that the server correctly transitions through all states:
-	/// Init → ServerHelloSent → KeyExchangeReceived → Complete
+	/// Init -> ServerHelloSent -> KeyExchangeReceived -> Complete
 	#[tokio::test]
 	async fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
 		let mut server = TestEciesServerBuilder::new().build()?;
@@ -678,7 +698,7 @@ mod tests {
 
 		let (p_a, p_b, p_c) = (mk_profile(1), mk_profile(2), mk_profile(3));
 
-		// Mode 1: Negotiation - client offers [A, B], server supports [B, C] → selects B
+		// Mode 1: Negotiation - client offers [A, B], server supports [B, C] -> selects B
 		{
 			let offer = SecurityOffer::new(vec![p_a, p_b]);
 			let selected = select_profile(&offer, &[p_b, p_c])?;

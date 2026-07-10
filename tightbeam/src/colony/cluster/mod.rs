@@ -136,7 +136,7 @@ pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 // TLS Configuration
 // ============================================================================
 
-/// TLS configuration for cluster → hive connections
+/// TLS configuration for cluster -> hive connections
 ///
 /// Contains certificate, key, and validators for encrypted transport.
 /// Used by the connection pool for mutual TLS with hives.
@@ -146,9 +146,9 @@ pub struct ClusterTlsConfig {
 	pub certificate: CertificateSpec,
 	/// Private key provider for signing operations (supports HSM/KMS)
 	pub key: Arc<dyn SigningKeyProvider>,
-	/// Server certificate validators for hive connections (cluster→hive)
+	/// Server certificate validators for hive connections (cluster->hive)
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
-	/// Client certificate validators for mutual auth (client→cluster)
+	/// Client certificate validators for mutual auth (client->cluster)
 	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
 	/// Trust store for validating hive/servlet server certificates (outbound connections)
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
@@ -183,7 +183,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 /// Configuration for clusters
 ///
 /// Contains settings for load balancing, health checks, gateway policies,
-/// and cryptographic signing for cluster → hive communication.
+/// and cryptographic signing for cluster -> hive communication.
 ///
 /// # Type Parameters
 /// - `L`: Load balancing strategy (default: `LeastLoaded`)
@@ -199,9 +199,9 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	/// Connection pool configuration for hive connections
 	pub pool_config: PoolConfig,
-	/// Default retry policy for all cluster → hive communication
+	/// Default retry policy for all cluster -> hive communication
 	pub retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
-	/// TLS configuration for cluster → hive connections
+	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
 	/// Phantom data for digest type

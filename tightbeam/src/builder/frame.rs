@@ -1011,14 +1011,14 @@ mod tests {
 
 				let frame = result.unwrap();
 
-				// Test 3: Verify README semantics - MUST fields → Frame fields MUST be present
-				// README line 363: MUST_BE_NON_REPUDIABLE=true → Frame MUST include nonrepudiation field
+				// Test 3: Verify README semantics - MUST fields -> Frame fields MUST be present
+				// README line 363: MUST_BE_NON_REPUDIABLE=true -> Frame MUST include nonrepudiation field
 				assert_eq!(frame.nonrepudiation.is_some(), $nonrepudiable);
-				// README line 364: MUST_BE_CONFIDENTIAL=true → Frame MUST include confidentiality field
+				// README line 364: MUST_BE_CONFIDENTIAL=true -> Frame MUST include confidentiality field
 				assert_eq!(frame.metadata.confidentiality.is_some(), $confidential);
-				// MUST_HAVE_MESSAGE_INTEGRITY=true → Frame metadata MUST include integrity field
+				// MUST_HAVE_MESSAGE_INTEGRITY=true -> Frame metadata MUST include integrity field
 				assert_eq!(frame.metadata.integrity.is_some(), $message_integrity);
-				// MUST_HAVE_FRAME_INTEGRITY=true → Frame MUST include integrity field
+				// MUST_HAVE_FRAME_INTEGRITY=true -> Frame MUST include integrity field
 				assert_eq!(frame.integrity.is_some(), $frame_integrity);
 
 				// Test 4: Verify version enforcement

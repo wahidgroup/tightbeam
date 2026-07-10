@@ -133,7 +133,7 @@ fn to_snake_case(type_name: &str) -> String {
 		segments.last().copied().unwrap_or(type_name)
 	};
 
-	// Worst case: every char is uppercase → "ABC" becomes "a_b_c" (2n - 1 chars)
+	// Worst case: every char is uppercase -> "ABC" becomes "a_b_c" (2n - 1 chars)
 	let capacity = name.len().saturating_mul(2);
 	let mut result = String::with_capacity(capacity);
 	for (i, ch) in name.chars().enumerate() {

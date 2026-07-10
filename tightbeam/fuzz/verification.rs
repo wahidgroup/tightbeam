@@ -55,17 +55,17 @@ tb_process_spec! {
 	/// The process flows through verification checkpoints matching the evidence chain:
 	///
 	/// ```text
-	/// Initial → Compiled → WorkspaceConfigured → FeaturesOk → BinaryVerified
-	///   → OracleVerified → FullyVerified
+	/// Initial -> Compiled -> WorkspaceConfigured -> FeaturesOk -> BinaryVerified
+	///   -> OracleVerified -> FullyVerified
 	/// ```
 	///
 	/// Each transition validates a specific aspect of the integration:
-	/// 1. **Initial → Compiled**: Code compiles without errors
-	/// 2. **Compiled → WorkspaceConfigured**: AFL dependency properly configured in Cargo.toml
-	/// 3. **WorkspaceConfigured → FeaturesOk**: Feature flags enable correct code paths
-	/// 4. **FeaturesOk → BinaryVerified**: IJON and AFL symbols present in binary
-	/// 5. **BinaryVerified → OracleVerified**: Oracle methods work correctly
-	/// 6. **OracleVerified → FullyVerified**: All proofs complete
+	/// 1. **Initial -> Compiled**: Code compiles without errors
+	/// 2. **Compiled -> WorkspaceConfigured**: AFL dependency properly configured in Cargo.toml
+	/// 3. **WorkspaceConfigured -> FeaturesOk**: Feature flags enable correct code paths
+	/// 4. **FeaturesOk -> BinaryVerified**: IJON and AFL symbols present in binary
+	/// 5. **BinaryVerified -> OracleVerified**: Oracle methods work correctly
+	/// 6. **OracleVerified -> FullyVerified**: All proofs complete
 	pub VerificationProcess,
 	events {
 		observable {

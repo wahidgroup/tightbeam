@@ -1,7 +1,8 @@
 //! Integration test for security profile negotiation.
 //!
-//! Demonstrates how a server configured with multiple security profiles (AES-256-GCM with SHA3-512
-//! and AES-128-GCM with SHA3-256) negotiates with a client that offers profiles in preference order.
+//! Demonstrates how a server configured with multiple security profiles
+//! (AES-256-GCM with SHA3-512 and AES-128-GCM with SHA3-256) negotiates
+//! with a client that offers profiles in preference order.
 
 #![cfg(all(feature = "transport", feature = "x509", feature = "aead"))]
 
@@ -212,7 +213,8 @@ tb_scenario! {
 			let _client_cipher = client.complete()?;
 			let _server_cipher = server.complete()?;
 
-			// Verify: Server selected client's first preference (AES-256-GCM/SHA3-512)
+			// Verify: server preference + strength floor select AES-256-GCM/SHA3-512
+			// (AES-128 fails the default 256-bit floor)
 			if server.selected_profile() == Some(profile_aes256_sha512) &&
 			   client.selected_profile() == Some(profile_aes256_sha512) {
 				trace.event("profile_verified")?;

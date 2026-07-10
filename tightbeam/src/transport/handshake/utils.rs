@@ -29,7 +29,9 @@ pub fn generate_cek() -> Result<Secret<[u8; 32]>, HandshakeError> {
 	use rand_core::RngCore;
 
 	let mut cek = [0u8; 32];
-	rand_core::OsRng.fill_bytes(&mut cek);
+	rand_core::OsRng
+		.try_fill_bytes(&mut cek)
+		.map_err(|_| HandshakeError::RandomGenerationFailed)?;
 
 	Ok(Secret::from(Box::new(cek)))
 }
@@ -56,7 +58,9 @@ pub fn aes_gcm_encrypt(key: &[u8], plaintext: &[u8], aad: Option<&[u8]>) -> Resu
 
 	// Generate random 12-byte nonce
 	let mut nonce_bytes = [0u8; 12];
-	rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+	rand_core::OsRng
+		.try_fill_bytes(&mut nonce_bytes)
+		.map_err(|_| HandshakeError::RandomGenerationFailed)?;
 	let nonce = Nonce::from_slice(&nonce_bytes);
 
 	// Encrypt
@@ -87,12 +91,9 @@ pub fn aes_gcm_decrypt(key: &[u8], ciphertext: &[u8], aad: Option<&[u8]>) -> Res
 		return Err(HandshakeError::InvalidKeySize { expected: 32, received: key.len() });
 	}
 
+	// Need at least nonce (12) + tag (16)
 	if ciphertext.len() < 12 + 16 {
-		// Need at least nonce (12) + tag (16)
-		return Err(HandshakeError::InvalidKeySize {
-			expected: 28, // minimum size
-			received: ciphertext.len(),
-		});
+		return Err(HandshakeError::CiphertextTooShort { minimum: 28, received: ciphertext.len() });
 	}
 
 	let cipher = Aes256Gcm::new_from_slice(key)?;
@@ -203,20 +204,17 @@ pub fn octet_string_to_32_byte_array(octet_string: &OctetString) -> Result<[u8; 
 /// - `data`: The data to hash
 ///
 /// # Returns
-/// 32-byte digest array
+/// 32-byte digest array. Wider digests (e.g. SHA3-512) are truncated to their
+/// leading 32 bytes (SHA-512/256 style; retains 256-bit collision resistance).
 ///
-/// # Note
-/// This function assumes the digest algorithm produces at least 32 bytes.
-/// It will truncate to 32 bytes if the digest is longer.
+/// # Errors
+/// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-pub fn compute_transcript_digest<D>(data: &[u8]) -> [u8; 32]
+pub fn compute_transcript_digest<D>(data: &[u8]) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
-	let digest_arr = D::digest(data);
-	let mut digest = [0u8; 32];
-	digest.copy_from_slice(&digest_arr[..32]);
-	digest
+	crate::transport::handshake::primitives::transcript::digest_output_to_array(&D::digest(data))
 }
 
 /// Clear sensitive session data by zeroizing and dropping.
@@ -287,6 +285,20 @@ mod tests {
 		let ciphertext = aes_gcm_encrypt(&key, plaintext, aad)?;
 		let result = aes_gcm_decrypt(&key, &ciphertext, wrong_aad);
 		assert!(result.is_err());
+		Ok(())
+	}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[test]
+	fn test_compute_transcript_digest_widths() -> Result<(), HandshakeError> {
+		use crate::crypto::hash::{Digest, Sha3_256, Sha3_512};
+
+		let digest = compute_transcript_digest::<Sha3_256>(b"transcript")?;
+		assert_eq!(digest.len(), 32);
+
+		// Wider digests truncate to their leading 32 bytes (SHA-512/256 style).
+		let wide = compute_transcript_digest::<Sha3_512>(b"transcript")?;
+		assert_eq!(wide.as_slice(), &Sha3_512::digest(b"transcript")[..32]);
 		Ok(())
 	}
 

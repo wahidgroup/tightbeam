@@ -66,10 +66,12 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 
 /// Chain multiple KDF operations where each output becomes the next salt.
 ///
+/// UNSTABLE: no caller in the crate yet; gated behind `unstable-pqxdh`.
+///
 /// Implements key derivation chaining as used in protocols like PQXDH:
 /// ```text
-/// KDF₁(input₁, salt₀, info₁) → output₁
-/// KDF₂(input₂, output₁, info₂) → output₂
+/// KDF₁(input₁, salt₀, info₁) -> output₁
+/// KDF₂(input₂, output₁, info₂) -> output₂
 /// ...
 /// ```
 ///
@@ -81,7 +83,7 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 /// - `initial_salt`: Initial salt for first KDF stage
 ///
 /// # Returns
-/// Final derived key (32 bytes)
+/// Final derived key (32 bytes), zeroized on drop
 ///
 /// # Example
 /// ```rust,ignore
@@ -100,16 +102,23 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 ///     b"InitialSalt"
 /// )?;
 /// ```
-pub fn kdf_chain<P: CryptoProvider>(stages: &[(&[u8], &[u8])], initial_salt: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-	let mut current_salt = initial_salt.to_vec();
-	let mut current_key = Vec::new();
-	for (input, info) in stages {
-		let derived = P::Kdf::derive_dynamic_key(input, info, Some(&current_salt), 32)?;
-		current_key = derived.to_vec();
-		current_salt = derived.to_vec(); // Next salt is previous output
+#[cfg(feature = "unstable-pqxdh")]
+pub fn kdf_chain<P: CryptoProvider>(
+	stages: &[(&[u8], &[u8])],
+	initial_salt: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, HandshakeError> {
+	if stages.is_empty() {
+		return Ok(Zeroizing::new(Vec::new()));
 	}
 
-	Ok(current_key)
+	// Each intermediate output is key material; keep every stage in a
+	// Zeroizing buffer so nothing lingers in the allocator.
+	let mut current = Zeroizing::new(initial_salt.to_vec());
+	for (input, info) in stages {
+		current = P::Kdf::derive_dynamic_key(input, info, Some(&current), 32)?;
+	}
+
+	Ok(current)
 }
 
 #[cfg(test)]
@@ -142,6 +151,7 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
+	#[cfg(feature = "unstable-pqxdh")]
 	#[test]
 	fn test_kdf_chain() -> Result<(), Box<dyn core::error::Error>> {
 		let input1 = [0x11u8; 32];
@@ -157,6 +167,7 @@ mod tests {
 		Ok(())
 	}
 
+	#[cfg(feature = "unstable-pqxdh")]
 	#[test]
 	fn test_kdf_chain_single_stage() {
 		let input = [0x42u8; 32];

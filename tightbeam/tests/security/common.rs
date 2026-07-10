@@ -26,7 +26,10 @@ use tightbeam::{
 	oids::AES_128_WRAP,
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
-		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
+		client::EciesHandshakeClient,
+		negotiation::{NoStrengthFloor, ProfileStrengthPolicy, SecurityOffer},
+		server::EciesHandshakeServer,
+		ClientKeyExchange,
 	},
 	TightBeamError,
 };
@@ -287,7 +290,12 @@ impl SecurityThreatHarness {
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
 				self.emit("harness_spawn_cms").ok();
-				Box::new(CmsSession::with_profiles(&self.materials, client_profiles, server_profiles))
+				Box::new(CmsSession::with_profiles(
+					&self.materials,
+					client_profiles,
+					server_profiles,
+					None,
+				))
 			}
 		}
 	}
@@ -306,11 +314,13 @@ impl SecurityThreatHarness {
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
 				self.emit("harness_spawn_cms_weak").ok();
-				// CMS with AES-128 would require Aes128CmsSession - use default for now
+				// CMS with AES-128 would require Aes128CmsSession - use default for now.
+				// Weak profiles fail the default floor, so opt out explicitly.
 				Box::new(CmsSession::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
 					vec![weak_security_profile()],
+					Some(Arc::new(NoStrengthFloor)),
 				))
 			}
 		}
@@ -607,13 +617,16 @@ impl Aes128EciesSession {
 		let client = EciesHandshakeClient::<Aes128CryptoProvider, Secp256k1EciesMessage>::new(None)
 			.with_security_offer(SecurityOffer::new(vec![weak_profile]));
 
+		// Deliberately weak session: opt out of the default strength floor so
+		// the downgrade harness can capture AES-128 wire bytes.
 		let server = EciesHandshakeServer::<Aes128CryptoProvider>::new(
 			Arc::clone(&materials.key_provider),
 			Arc::clone(&materials.certificate),
 			None,
 			None,
 		)
-		.with_supported_profiles(vec![weak_profile]);
+		.with_supported_profiles(vec![weak_profile])
+		.with_strength_policy(Arc::new(NoStrengthFloor));
 
 		Self { client, server }
 	}
@@ -712,10 +725,14 @@ pub struct CmsSession {
 #[cfg(feature = "transport-cms")]
 impl CmsSession {
 	/// Create session with specific client and server profiles.
+	///
+	/// `strength_policy` overrides the server's default strength floor
+	/// (needed for deliberately weak downgrade-testing sessions).
 	fn with_profiles(
 		materials: &ServerMaterials,
 		client_profiles: Vec<SecurityProfileDesc>,
 		server_profiles: Vec<SecurityProfileDesc>,
+		strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	) -> Self {
 		// Create client credentials
 		let client_key = create_test_signing_key();
@@ -734,6 +751,9 @@ impl CmsSession {
 		let server_key_provider = Arc::clone(&materials.key_provider);
 		let mut server = CmsHandshakeServer::<DefaultCryptoProvider>::new(server_key_provider, None)
 			.with_supported_profiles(server_profiles);
+		if let Some(policy) = strength_policy {
+			server = server.with_strength_policy(policy);
+		}
 
 		// Set client certificate on server for mutual auth
 		server.set_client_certificate((*client_cert).clone()).ok();

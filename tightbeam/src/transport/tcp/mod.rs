@@ -19,10 +19,8 @@ pub mod r#async;
 #[cfg(feature = "tcp")]
 use crate::transport::{tcp::sync::TcpTransport, Mycelial, Protocol, ProtocolStream};
 
-/// Maximum wire size allowed for handshake-phase messages.
-/// Handshake messages are small (cert + SPKI + nonces + signature + ECIES blob),
-/// therefore we use a much tighter cap than general envelopes to reduce DoS risk.
-pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
+// Canonical definition lives in transport::io so it exists without the TCP features.
+pub(crate) use crate::transport::io::HANDSHAKE_MAX_WIRE;
 
 /// Abstract TCP listener trait for different networking backends.
 #[cfg(feature = "tcp")]

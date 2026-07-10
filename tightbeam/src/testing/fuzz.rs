@@ -134,7 +134,7 @@ use crate::testing::specs::csp::{Event, Process, State};
 ///
 /// ## Core Functionality
 /// - **State Machine Tracking**: Maintains current state in CSP process
-/// - **Event Interpretation**: Maps input bytes → valid event choices
+/// - **Event Interpretation**: Maps input bytes -> valid event choices
 /// - **Coverage Metrics**: Tracks visited states/transitions for analysis
 /// - **Crash Triage**: Provides execution context when fuzz targets fail
 ///
