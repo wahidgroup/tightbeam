@@ -1,6 +1,11 @@
 //! TODO Multiplexing support for concurrent requests on a single connection
 //!
 //! This module provides stub interfaces for HTTP/2-style multiplexing.
+//!
+//! # Stability
+//!
+//! UNSTABLE: trait surface only, no implementation exists yet. The API
+//! may change or be removed without a major version bump.
 
 use core::future::Future;
 

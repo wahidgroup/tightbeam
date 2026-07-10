@@ -258,6 +258,89 @@ tb_scenario! {
 }
 
 // ============================================================================
+// Regression: connection accounting across reuse cycles
+// ============================================================================
+
+/// A full acquire -> release -> reuse -> release cycle must leave the pool's
+/// connection accounting intact: a subsequent brand-new connection (different
+/// destination, so the reuse path cannot serve it) must still be admitted.
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-policy",
+	feature = "secp256k1",
+	feature = "signature",
+	feature = "sha3",
+	feature = "aead"
+))]
+#[tokio::test]
+async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn std::error::Error>> {
+	pub struct AccountingServletConf {
+		message_count: Arc<AtomicUsize>,
+	}
+
+	servlet! {
+		AccountingServlet<TestMessage, EnvConfig = AccountingServletConf>,
+		protocol: TokioListener,
+		handle: |frame, ctx| async move {
+			let config: &AccountingServletConf = ctx.env_config()?;
+			config.message_count.fetch_add(1, Ordering::SeqCst);
+			Ok(Some(frame))
+		}
+	}
+
+	let start_servlet = |count: &Arc<AtomicUsize>| {
+		let conf = ServletConf::<TokioListener, TestMessage>::builder()
+			.with_certificate(
+				SERVER_CERT,
+				SERVER_KEY.to_provider::<Secp256k1>()?,
+				vec![Arc::new(CLIENT_PINNING)],
+			)?
+			.with_config(Arc::new(AccountingServletConf { message_count: Arc::clone(count) }))
+			.build();
+		Ok::<_, TightBeamError>(conf)
+	};
+
+	let count1 = Arc::new(AtomicUsize::new(0));
+	let count2 = Arc::new(AtomicUsize::new(0));
+	let servlet1 = AccountingServlet::start(Arc::new(TraceCollector::default()), Some(start_servlet(&count1)?)).await?;
+	let servlet2 = AccountingServlet::start(Arc::new(TraceCollector::default()), Some(start_servlet(&count2)?)).await?;
+	let addr1 = servlet1.addr();
+	let addr2 = servlet2.addr();
+
+	let pool = Arc::new(
+		ConnectionPool::<TokioListener>::builder()
+			.with_trust_store(make_server_trust_store()?)
+			.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
+			.build(),
+	);
+
+	// Cycle 1: fresh connection, released healthy back to the pool.
+	let mut first = pool.connect(addr1).await?;
+	let first_reply = first.conn()?.emit(create_v0_tightbeam(Some("cycle-1"), None), None).await?;
+	assert!(first_reply.is_some(), "first acquire must round-trip a message");
+	drop(first);
+
+	// Cycle 2: same destination, must be served from the pool (reuse path).
+	let mut second = pool.connect(addr1).await?;
+	let second_reply = second.conn()?.emit(create_v0_tightbeam(Some("cycle-2"), None), None).await?;
+	assert!(second_reply.is_some(), "reused connection must round-trip a message");
+	drop(second);
+
+	// A new destination cannot be served from addr1's idle set, so the pool
+	// must admit a brand-new connection; a wedged counter reports Busy here.
+	let third = pool.connect(addr2).await;
+	assert!(
+		third.is_ok(),
+		"pool refused a new connection after a reuse cycle: {:?}",
+		third.err()
+	);
+
+	assert_eq!(count1.load(Ordering::SeqCst), 2, "both cycles must have reached servlet 1");
+
+	Ok(())
+}
+
+// ============================================================================
 // Scenario: Pool Per-Destination Isolation
 // ============================================================================
 

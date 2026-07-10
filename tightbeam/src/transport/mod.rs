@@ -23,7 +23,11 @@ pub mod messaging;
 pub mod protocols;
 pub mod state;
 
+/// UNSTABLE: trait surface only, no implementation yet. Opt-in via the
+/// `transport-multiplex` feature; the API may change or be removed without a
+/// major version bump.
 #[cfg(feature = "transport-multiplex")]
+#[doc(hidden)]
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;

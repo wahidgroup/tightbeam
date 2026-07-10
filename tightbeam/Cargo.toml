@@ -129,6 +129,7 @@ transport = [
 doc = []
 compress = ["tightbeam-derive?/compress"]
 transport-policy = ["policy"]
+# UNSTABLE: trait surface only, no implementation yet; excluded from `full`.
 transport-multiplex = ["transport"]
 tcp = ["transport", "std", "transport-ecies"]
 async-transport = ["transport", "std", "transport-ecies"]

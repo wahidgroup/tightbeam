@@ -26,7 +26,7 @@ use crate::Frame;
 #[cfg(feature = "x509")]
 mod x509 {
 	pub use crate::crypto::aead::RuntimeAead;
-	pub use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::policy::CertificateValidation;
 	pub use crate::crypto::x509::store::CertificateTrust;
 	pub use crate::transport::handshake::{
@@ -36,6 +36,9 @@ mod x509 {
 	pub use crate::transport::{EncryptedMessageIO, TransportEncryptionConfig};
 	pub use crate::x509::Certificate;
 
+	// Only the tokio listener names the default provider explicitly.
+	#[cfg(feature = "tokio")]
+	pub use crate::crypto::profiles::DefaultCryptoProvider;
 	#[cfg(feature = "tokio")]
 	pub use crate::transport::EncryptedProtocol;
 }
@@ -102,7 +105,8 @@ impl AsyncProtocolStream for TokioStream {
 
 			stream.read_exact(&mut length_octets).await?;
 
-			let length = crate::transport::io::parse_der_length(length_first[0], &length_octets);
+			let length = crate::transport::io::parse_der_length(length_first[0], &length_octets)
+				.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
 			(length_octets, length)
 		};
 
@@ -425,13 +429,6 @@ where
 	}
 }
 
-// Ensure symmetric key material is dropped when the transport is dropped
-impl<S: AsyncProtocolStream, P: crate::crypto::profiles::CryptoProvider> Drop for TcpTransport<S, P> {
-	fn drop(&mut self) {
-		let _ = self.symmetric_key.take();
-	}
-}
-
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for TokioListener<P> {
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
@@ -468,77 +465,6 @@ impl<P: CryptoProvider + Send + Sync> crate::transport::Mycelial for TokioListen
 	}
 }
 
-#[cfg(not(feature = "transport-policy"))]
-pub struct TcpTransport<S: AsyncProtocolStream, P: CryptoProvider = DefaultCryptoProvider> {
-	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
-	#[cfg(feature = "x509")]
-	trust_store: Option<Arc<dyn CertificateTrust>>,
-	#[cfg(feature = "x509")]
-	server_identity: Option<Arc<Certificate>>,
-	#[cfg(feature = "x509")]
-	client_certificate: Option<Arc<Certificate>>,
-	#[cfg(feature = "x509")]
-	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	#[cfg(feature = "x509")]
-	peer_certificate: Option<Certificate>,
-	#[cfg(feature = "x509")]
-	aad_domain_tag: Option<&'static [u8]>,
-	#[cfg(feature = "x509")]
-	max_cleartext_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
-	max_encrypted_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
-	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
-	#[cfg(feature = "x509")]
-	handshake_state: TcpHandshakeState,
-	#[cfg(feature = "x509")]
-	handshake_timeout: Duration,
-	#[cfg(feature = "x509")]
-	symmetric_key: Option<RuntimeAead>,
-	_phantom: core::marker::PhantomData<P>,
-}
-
-// (single Drop impl above covers both feature variants)
-#[cfg(feature = "transport-policy")]
-pub struct TcpTransport<S: AsyncProtocolStream, P: CryptoProvider = DefaultCryptoProvider> {
-	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
-	restart_policy: Box<dyn RestartPolicy>,
-	emitter_gate: Box<dyn GatePolicy>,
-	collector_gate: Box<dyn GatePolicy>,
-	operation_timeout: Option<Duration>,
-	#[cfg(feature = "x509")]
-	trust_store: Option<Arc<dyn CertificateTrust>>,
-	#[cfg(feature = "x509")]
-	server_identity: Option<Arc<Certificate>>,
-	#[cfg(feature = "x509")]
-	client_certificate: Option<Arc<Certificate>>,
-	#[cfg(feature = "x509")]
-	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	#[cfg(feature = "x509")]
-	peer_certificate: Option<Certificate>,
-	#[cfg(feature = "x509")]
-	aad_domain_tag: Option<&'static [u8]>,
-	#[cfg(feature = "x509")]
-	max_cleartext_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
-	max_encrypted_envelope: Option<usize>,
-	#[cfg(feature = "x509")]
-	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
-	#[cfg(feature = "x509")]
-	handshake_state: TcpHandshakeState,
-	#[cfg(feature = "x509")]
-	handshake_timeout: Duration,
-	#[cfg(feature = "x509")]
-	symmetric_key: Option<RuntimeAead>,
-	#[cfg(feature = "x509")]
-	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>>,
-	#[cfg(feature = "x509")]
-	handshake_protocol_kind: HandshakeProtocolKind,
-	_phantom: core::marker::PhantomData<P>,
-}
-
 impl<S: AsyncProtocolStream> Pingable for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -553,6 +479,7 @@ where
 	}
 }
 
+// Generates the TcpTransport struct definition and common implementations
 crate::impl_tcp_common!(TcpTransport, AsyncProtocolStream);
 
 impl<S: AsyncProtocolStream> MessageIO for TcpTransport<S>
@@ -560,14 +487,18 @@ where
 	TransportError: From<S::Error>,
 {
 	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
-		// Conservative pre-allocation ceiling: we cannot tell encrypted from
-		// cleartext at this point, so choose the larger cap.
+		// Reads from an unauthenticated peer (handshake pending) get the
+		// tight handshake cap.
 		#[cfg(feature = "x509")]
-		let max_len = Some(
-			self.max_encrypted_envelope
-				.or(self.max_cleartext_envelope)
-				.unwrap_or(512 * 1024),
-		);
+		let max_len = if self.is_handshake_pending() {
+			Some(crate::transport::tcp::HANDSHAKE_MAX_WIRE)
+		} else {
+			Some(
+				self.max_encrypted_envelope
+					.or(self.max_cleartext_envelope)
+					.unwrap_or(512 * 1024),
+			)
+		};
 
 		#[cfg(not(feature = "x509"))]
 		let max_len = None;
@@ -580,7 +511,7 @@ where
 			use tokio::time::timeout;
 
 			// Determine timeout duration: prefer handshake_timeout during
-			// handshake, operation_timeout otherwise
+			// handshake operation_timeout otherwise.
 			#[cfg(feature = "x509")]
 			let timeout_duration: Option<Duration> = {
 				match self.to_handshake_state() {
@@ -593,6 +524,7 @@ where
 						}
 						Some(deadline.saturating_duration_since(now))
 					}
+					_ if self.is_handshake_pending() => Some(self.handshake_timeout),
 					_ => {
 						// Not in handshake - use operation_timeout if configured
 						#[cfg(feature = "transport-policy")]
@@ -791,6 +723,84 @@ mod tests {
 		assert_eq!(response.clone(), Some(expected_response));
 
 		server_handle.await??;
+		Ok(())
+	}
+
+	#[cfg(all(feature = "x509", feature = "transport-policy"))]
+	fn encrypted_test_config() -> TransportResult<TransportEncryptionConfig<DefaultCryptoProvider>> {
+		use crate::spki::SubjectPublicKeyInfoOwned;
+
+		let signing_key = create_test_signing_key();
+		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
+		let sha3_signer = Sha3Signer::from(&signing_key);
+		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
+
+		let cert = crate::cert!(
+			profile: Root,
+			subject: "CN=Test Root CA,O=Test Org,C=US",
+			serial: 1u32,
+			duration: Duration::from_secs(365 * 24 * 60 * 60),
+			signer: &sha3_signer,
+			subject_public_key: spki
+		)?;
+
+		Ok(TransportEncryptionConfig::new(cert, signing_key.into()))
+	}
+
+	#[cfg(all(feature = "x509", feature = "transport-policy"))]
+	#[tokio::test]
+	async fn handshake_read_deadline_bounds_silent_client() -> TransportResult<()> {
+		use core::str::FromStr;
+
+		use crate::prelude::TightBeamSocketAddr;
+
+		let mut config = encrypted_test_config()?;
+		config.handshake_timeout = Duration::from_millis(500);
+
+		let addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
+		let (listener, socket_addr) = TokioListener::bind_with(addr, config).await?;
+
+		let server_handle = tokio::spawn(async move {
+			let (mut transport, _) = listener.accept().await?;
+			transport.handle_request().await
+		});
+
+		let _silent_client = TcpStream::connect(*socket_addr).await?;
+
+		let joined = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+		assert!(matches!(joined, Ok(Ok(Err(_)))));
+		Ok(())
+	}
+
+	/// A handshake-phase frame whose declared length exceeds the 16 KiB
+	/// handshake cap must be rejected on the declared length, before the body
+	/// is read.
+	#[cfg(all(feature = "x509", feature = "transport-policy"))]
+	#[tokio::test]
+	async fn handshake_read_rejects_oversize_frame_before_body() -> TransportResult<()> {
+		use core::str::FromStr;
+
+		use crate::prelude::TightBeamSocketAddr;
+
+		let mut config = encrypted_test_config()?;
+		config.handshake_timeout = Duration::from_secs(5);
+
+		let addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
+		let (listener, socket_addr) = TokioListener::bind_with(addr, config).await?;
+
+		let server_handle = tokio::spawn(async move {
+			let (mut transport, _) = listener.accept().await?;
+			transport.handle_request().await
+		});
+
+		let mut stream = TcpStream::connect(*socket_addr).await?;
+		// SEQUENCE header declaring 65536 content bytes, body never sent.
+		stream.write_all(&[0x30, 0x83, 0x01, 0x00, 0x00]).await?;
+
+		let started = std::time::Instant::now();
+		let joined = tokio::time::timeout(Duration::from_secs(4), server_handle).await;
+		assert!(matches!(joined, Ok(Ok(Err(_)))));
+		assert!(started.elapsed() < Duration::from_secs(2));
 		Ok(())
 	}
 

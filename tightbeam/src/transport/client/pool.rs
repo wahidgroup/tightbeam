@@ -204,7 +204,8 @@ struct DestinationPool<P: Protocol> {
 /// Connection pool for protocol P with global connection limit
 ///
 /// # Invariants
-/// - Total connections across all destinations <= `config.max_connections`
+/// - `total_connections` counts live connections and stays within
+///   `0..=config.max_connections`: +1 when a socket is created.
 /// - Idle connections exceeding `PoolConfig::idle_timeout` are pruned lazily
 /// - Lock poisoning never panics; callers receive `TransportFailure::Busy` instead
 #[cfg(feature = "std")]
@@ -220,6 +221,18 @@ pub struct ConnectionPool<P: Protocol, C: CryptoProvider = DefaultCryptoProvider
 	/// Shared TLS assets reused across pooled connections
 	#[cfg(feature = "x509")]
 	tls: PoolTlsConfig<C>,
+}
+
+#[cfg(feature = "std")]
+impl<P: Protocol, C: CryptoProvider> ConnectionPool<P, C> {
+	/// Decrement the live-connection count for a discarded connection,
+	/// saturating at zero so an accounting defect can never wrap the counter
+	/// and wedge the pool into permanent `Busy`.
+	fn release_connection_count(&self) {
+		let _ = self
+			.total_connections
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_sub(1));
+	}
 }
 
 #[cfg(feature = "std")]
@@ -270,20 +283,28 @@ where
 					dest_pool.in_use += 1;
 					return Ok(Some(entry.client));
 				}
+				// Dead candidate is discarded here, so it leaves the live set.
+				self.release_connection_count();
 			}
 		}
 		Ok(None)
 	}
 
 	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, C>> {
-		// Check global limit
-		let current = self.total_connections.load(Ordering::Acquire);
-		if current >= self.config.max_connections {
+		// Single atomic check-and-increment so concurrent callers cannot all
+		// pass a separate limit check and overshoot max_connections.
+		let reserved = self
+			.total_connections
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+				if current >= self.config.max_connections {
+					None
+				} else {
+					Some(current + 1)
+				}
+			});
+		if reserved.is_err() {
 			return Err(TransportError::OperationFailed(TransportFailure::Busy));
 		}
-
-		// Atomically increment global counter
-		self.total_connections.fetch_add(1, Ordering::AcqRel);
 
 		let mut pools = self.write_pools()?;
 		let dest_pool = pools
@@ -302,6 +323,8 @@ where
 			while let Some(entry) = dest_pool.available.front() {
 				if now.duration_since(entry.last_used) >= timeout {
 					dest_pool.available.pop_front();
+					// Pruned idle connection is closed, so it leaves the live set.
+					self.release_connection_count();
 				} else {
 					break;
 				}
@@ -411,22 +434,25 @@ where
 			None => return,
 		};
 
-		// Decrement global counter
-		self.pool.total_connections.fetch_sub(1, Ordering::AcqRel);
+		let mut returned_to_pool = false;
 
 		let is_healthy = <P as PersistentConnection>::is_connected(client.transport());
-		let mut pools = match self.pool.pools.write() {
-			Ok(p) => p,
-			Err(_) => return,
-		};
-
-		if let Some(dest_pool) = pools.get_mut(&self.addr) {
-			dest_pool.in_use = dest_pool.in_use.saturating_sub(1);
-			if is_healthy {
-				dest_pool
-					.available
-					.push_back(AvailableEntry { client, last_used: Instant::now() });
+		if let Ok(mut pools) = self.pool.pools.write() {
+			if let Some(dest_pool) = pools.get_mut(&self.addr) {
+				dest_pool.in_use = dest_pool.in_use.saturating_sub(1);
+				if is_healthy {
+					dest_pool
+						.available
+						.push_back(AvailableEntry { client, last_used: Instant::now() });
+					returned_to_pool = true;
+				}
 			}
+		}
+
+		// A connection parked in `available` is still live and stays counted;
+		// only a discarded (unhealthy or unparkable) connection leaves the set.
+		if !returned_to_pool {
+			self.pool.release_connection_count();
 		}
 	}
 }
@@ -465,8 +491,8 @@ where
 			return;
 		}
 
-		// Decrement global counter
-		self.pool.total_connections.fetch_sub(1, Ordering::AcqRel);
+		// The reserved connection never materialized, so it leaves the live set.
+		self.pool.release_connection_count();
 
 		let pools = self.pool.pools.write();
 		if let Ok(mut pools) = pools {

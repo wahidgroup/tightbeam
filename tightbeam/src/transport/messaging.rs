@@ -16,6 +16,9 @@ use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
 use crate::transport::TransportResult;
 
+#[cfg(not(feature = "x509"))]
+use crate::transport::envelopes::RequestPackage;
+
 #[cfg(feature = "transport-ecies")]
 mod x509 {
 	pub use crate::crypto::aead::{Decryptor, KeyInit};
@@ -219,14 +222,10 @@ pub trait MessageEmitter: MessageIO {
 		&mut self,
 		message: Frame,
 	) -> TransportResult<(TransitStatus, Option<Frame>, Option<Frame>)> {
-		// Wrap in envelope and send
-		let envelope = TransportEnvelope::new_request(message);
-
-		// Extract Arc for potential return
-		let frame_arc = match &envelope {
-			TransportEnvelope::Request(pkg) => Arc::clone(&pkg.message),
-			_ => unreachable!("new_request always creates Request variant"),
-		};
+		// Build the request around a shared Arc so the frame stays available
+		// for retry without pattern-matching the envelope back apart.
+		let frame_arc = Arc::new(message);
+		let envelope = TransportEnvelope::Request(RequestPackage { message: Arc::clone(&frame_arc) });
 
 		// Send the envelope
 		self.write_envelope(&envelope.to_der()?).await?;

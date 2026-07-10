@@ -56,23 +56,37 @@ mod x509 {
 #[cfg(feature = "x509")]
 use x509::*;
 
-#[cfg(all(feature = "transport-ecies", feature = "tcp"))]
+#[cfg(feature = "transport-ecies")]
 const HANDSHAKE_MAX_WIRE: usize = crate::transport::tcp::HANDSHAKE_MAX_WIRE;
-#[cfg(all(feature = "transport-ecies", not(feature = "tcp")))]
-const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB default
 
 /// Parse a DER length field into its numeric value.
-pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> usize {
+pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
 	if first_byte & 0x80 == 0 {
-		first_byte as usize
-	} else {
-		let mut length = 0usize;
-		for &byte in length_octets.iter() {
-			length = (length << 8) | (byte as usize);
-		}
-
-		length
+		return Some(first_byte as usize);
 	}
+
+	let octet_count = (first_byte & 0x7F) as usize;
+	// 0x80 is the BER indefinite-length marker, forbidden in DER.
+	if octet_count == 0 || octet_count != length_octets.len() || octet_count > core::mem::size_of::<usize>() {
+		return None;
+	}
+
+	// Canonical form: no leading zero octet, and the long form is only used
+	// for values the short form cannot express (>= 128).
+	if length_octets[0] == 0 {
+		return None;
+	}
+
+	let mut length = 0usize;
+	for &byte in length_octets.iter() {
+		length = (length << 8) | (byte as usize);
+	}
+
+	if length < 0x80 {
+		return None;
+	}
+
+	Some(length)
 }
 
 /// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
@@ -154,8 +168,9 @@ pub trait MessageIO: ResponseHandler {
 		self.handler().and_then(|handler| handler(frame))
 	}
 
-	/// Helper for parsing DER length encoding
-	fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> usize {
+	/// Helper for parsing DER length encoding.
+	/// Returns `None` for non-canonical or indefinite-length encodings.
+	fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
 		parse_der_length(first_byte, length_octets)
 	}
 
@@ -334,7 +349,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		let client_hello = ClientHello::from_der(&initial_message)?;
 		let signed_data: SignedData = (&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
-		let initial_envelope = TransportEnvelope::SignedData(signed_data);
+		let initial_envelope = TransportEnvelope::SignedData(Box::new(signed_data));
 		let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
@@ -367,7 +382,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			_ => return Err(TransportError::InvalidMessage),
 		};
 		let server_handshake: ServerHandshake =
-			(&signed_data).try_into().map_err(|_| TransportError::InvalidMessage)?;
+			signed_data.as_ref().try_into().map_err(|_| TransportError::InvalidMessage)?;
 		let response_bytes = server_handshake.to_der()?;
 		if response_bytes.len() > HANDSHAKE_MAX_WIRE {
 			return Err(TransportError::InvalidMessage);
@@ -382,7 +397,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Step 4: Send client key exchange
 		let client_kex = ClientKeyExchange::from_der(&next_message_bytes)?;
 		let enveloped_data: EnvelopedData = (&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
-		let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
+		let msg_envelope = TransportEnvelope::EnvelopedData(Box::new(enveloped_data));
 		let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
@@ -475,7 +490,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Parse ClientHello and wrap in SignedData → TransportEnvelope
 		let client_hello = ClientHello::from_der(&initial_message)?;
 		let signed_data: SignedData = (&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
-		let initial_envelope = TransportEnvelope::SignedData(signed_data);
+		let initial_envelope = TransportEnvelope::SignedData(Box::new(signed_data));
 
 		let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
 		self.write_envelope(&wire_envelope.to_der()?).await?;
@@ -514,7 +529,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			_ => return Err(TransportError::InvalidMessage),
 		};
 		let server_handshake: ServerHandshake =
-			(&signed_data).try_into().map_err(|_| TransportError::InvalidMessage)?;
+			signed_data.as_ref().try_into().map_err(|_| TransportError::InvalidMessage)?;
 
 		let response_bytes = server_handshake.to_der()?;
 		if response_bytes.len() > HANDSHAKE_MAX_WIRE {
@@ -533,7 +548,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			// Parse ClientKeyExchange and wrap in EnvelopedData
 			let client_kex = ClientKeyExchange::from_der(&msg_bytes)?;
 			let enveloped_data: EnvelopedData = (&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
-			let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
+			let msg_envelope = TransportEnvelope::EnvelopedData(Box::new(enveloped_data));
 
 			let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
 			self.write_envelope(&wire_envelope.to_der()?).await?;
@@ -573,13 +588,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		let raw_message = match &transport_envelope {
 			TransportEnvelope::SignedData(sd) => {
 				// This is ClientHello (first message from client)
-				ClientHello::try_from(sd)
+				ClientHello::try_from(sd.as_ref())
 					.map_err(|_| TransportError::InvalidMessage)?
 					.to_der()?
 			}
 			TransportEnvelope::EnvelopedData(ed) => {
 				// This is ClientKeyExchange (second message from client)
-				ClientKeyExchange::try_from(ed)
+				ClientKeyExchange::try_from(ed.as_ref())
 					.map_err(|_| TransportError::InvalidMessage)?
 					.to_der()?
 			}
@@ -638,7 +653,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			// Parse ServerHandshake and wrap in SignedData → TransportEnvelope
 			let server_handshake = ServerHandshake::from_der(&response)?;
 			let signed_data: SignedData = (&server_handshake).try_into().map_err(|_| TransportError::InvalidMessage)?;
-			let server_envelope = TransportEnvelope::SignedData(signed_data);
+			let server_envelope = TransportEnvelope::SignedData(Box::new(signed_data));
 
 			let wire_envelope = WireEnvelope::Cleartext(server_envelope);
 			self.write_envelope(&wire_envelope.to_der()?).await?;
@@ -724,4 +739,44 @@ pub trait EncryptedMessageIO: MessageIO {
 pub trait Pingable {
 	/// Ping the transport layer to check connectivity
 	fn ping(&mut self) -> TransportResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn parse_short_form_length() {
+		assert_eq!(parse_der_length(0x00, &[]), Some(0));
+		assert_eq!(parse_der_length(0x7F, &[]), Some(127));
+	}
+
+	#[test]
+	fn parse_minimal_long_form_length() {
+		assert_eq!(parse_der_length(0x81, &[0x80]), Some(128));
+		assert_eq!(parse_der_length(0x81, &[0xFF]), Some(255));
+		assert_eq!(parse_der_length(0x82, &[0x01, 0x00]), Some(256));
+	}
+
+	#[test]
+	fn reject_indefinite_length_marker() {
+		assert_eq!(parse_der_length(0x80, &[]), None);
+	}
+
+	#[test]
+	fn reject_non_minimal_long_form() {
+		assert_eq!(parse_der_length(0x81, &[0x05]), None);
+		assert_eq!(parse_der_length(0x82, &[0x00, 0x80]), None);
+	}
+
+	#[test]
+	fn reject_length_wider_than_usize() {
+		assert_eq!(parse_der_length(0x89, &[0x01; 9]), None);
+	}
+
+	#[test]
+	fn reject_octet_count_mismatch() {
+		assert_eq!(parse_der_length(0x82, &[0x01]), None);
+		assert_eq!(parse_der_length(0x81, &[]), None);
+	}
 }

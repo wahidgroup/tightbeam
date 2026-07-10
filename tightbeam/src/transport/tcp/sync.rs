@@ -41,49 +41,6 @@ mod policy {
 #[cfg(feature = "transport-policy")]
 use policy::*;
 
-pub struct TcpTransport<S: ProtocolStream, P: CryptoProvider = DefaultCryptoProvider> {
-	stream: S,
-	handler: Option<Box<dyn Fn(Frame) -> Option<Frame> + Send + Sync>>,
-	#[cfg(feature = "transport-policy")]
-	restart_policy: Box<dyn RestartPolicy>,
-	#[cfg(feature = "transport-policy")]
-	emitter_gate: Box<dyn GatePolicy>,
-	#[cfg(feature = "transport-policy")]
-	collector_gate: Box<dyn GatePolicy>,
-	#[cfg(feature = "std")]
-	operation_timeout: Option<std::time::Duration>,
-
-	trust_store: Option<Arc<dyn CertificateTrust>>,
-
-	server_identity: Option<Arc<Certificate>>,
-
-	client_certificate: Option<Arc<Certificate>>,
-
-	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-
-	peer_certificate: Option<Certificate>,
-
-	aad_domain_tag: Option<&'static [u8]>,
-
-	max_cleartext_envelope: Option<usize>,
-
-	max_encrypted_envelope: Option<usize>,
-
-	key_manager: Option<Arc<HandshakeKeyManager<P>>>,
-
-	handshake_state: TcpHandshakeState,
-
-	handshake_timeout: Duration,
-
-	symmetric_key: Option<RuntimeAead>,
-
-	server_handshake: Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>>,
-
-	handshake_protocol_kind: HandshakeProtocolKind,
-
-	_phantom: core::marker::PhantomData<P>,
-}
-
 impl<S: ProtocolStream> Pingable for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
@@ -94,27 +51,71 @@ where
 	}
 }
 
-// Use the macro to generate common implementations
+// Generates the TcpTransport struct definition and common implementations
 crate::impl_tcp_common!(TcpTransport, ProtocolStream);
+
+/// Slice sizes for deadline-bounded content reads. The stream timeout is
+/// per-recv (SO_RCVTIMEO), so the absolute budget is only re-checked between
+/// slices: the worst-case overrun past the deadline is one slice of
+/// per-recv resets.
+#[cfg(feature = "std")]
+const HANDSHAKE_READ_SLICE: usize = 64;
+#[cfg(feature = "std")]
+const ESTABLISHED_READ_SLICE: usize = 1024;
+
+#[cfg(feature = "std")]
+impl<S: ProtocolStream, P: CryptoProvider> TcpTransport<S, P>
+where
+	TransportError: From<S::Error>,
+{
+	/// Re-arm the stream's per-recv timeout with the budget remaining until
+	/// `deadline`, failing with `Timeout` once the budget is exhausted.
+	fn arm_read_deadline(&mut self, deadline: Option<std::time::Instant>) -> TransportResult<()> {
+		let Some(deadline) = deadline else {
+			return Ok(());
+		};
+		let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+		if remaining.is_zero() {
+			return Err(TransportError::OperationFailed(TransportFailure::Timeout));
+		}
+		self.stream.set_timeout(Some(remaining))?;
+		Ok(())
+	}
+}
 
 impl<S: ProtocolStream> MessageIO for TcpTransport<S>
 where
 	TransportError: From<S::Error>,
 {
 	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
-		// Apply operation timeout if configured
-		#[cfg(feature = "std")]
-		if let Some(timeout) = self.operation_timeout {
-			self.stream.set_timeout(Some(timeout))?;
-		}
+		let handshake_pending = self.is_handshake_pending();
 
-		// Perform all reads - timeout will apply to all operations
+		// Absolute deadline for the whole envelope read; every stage below
+		// re-arms the per-recv timeout with the *remaining* budget. Handshake
+		// reads face an unauthenticated peer, so the handshake deadline
+		// applies from the first byte onward; established sessions use the
+		// optional operation timeout.
+		#[cfg(feature = "std")]
+		let deadline = if handshake_pending {
+			match self.to_handshake_state() {
+				TcpHandshakeState::AwaitingServerResponse { initiated_at }
+				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.handshake_timeout),
+				_ => Some(std::time::Instant::now() + self.handshake_timeout),
+			}
+		} else {
+			self.operation_timeout.map(|timeout| std::time::Instant::now() + timeout)
+		};
+
 		let result = (|| -> TransportResult<Vec<u8>> {
 			// Read tag byte
+			#[cfg(feature = "std")]
+			self.arm_read_deadline(deadline)?;
 			let mut tag_byte = [0u8; 1];
 			self.stream.read_exact(&mut tag_byte)?;
 
 			// Read length encoding
+			#[cfg(feature = "std")]
+			self.arm_read_deadline(deadline)?;
 			let mut length_first = [0u8; 1];
 			self.stream.read_exact(&mut length_first)?;
 
@@ -125,40 +126,56 @@ where
 				// Long form
 				let num_length_octets = (length_first[0] & 0x7F) as usize;
 				let mut length_octets = vec![0u8; num_length_octets];
+				#[cfg(feature = "std")]
+				self.arm_read_deadline(deadline)?;
 				self.stream.read_exact(&mut length_octets)?;
 
-				let length = Self::parse_der_length(length_first[0], &length_octets);
+				let length =
+					Self::parse_der_length(length_first[0], &length_octets).ok_or(TransportError::InvalidMessage)?;
 				(length_octets, length)
 			};
 
-			// Enforce size ceilings if configured
+			// Enforce size ceilings: unauthenticated handshake reads get the
+			// tight handshake cap, established sessions the envelope limits.
 			{
-				let max_allowed = self
-					.max_encrypted_envelope
-					.or(self.max_cleartext_envelope)
-					.unwrap_or(512 * 1024);
+				let max_allowed = if handshake_pending {
+					crate::transport::tcp::HANDSHAKE_MAX_WIRE
+				} else {
+					self.max_encrypted_envelope
+						.or(self.max_cleartext_envelope)
+						.unwrap_or(512 * 1024)
+				};
 				if content_length > max_allowed {
 					return Err(TransportError::InvalidMessage);
 				}
 			}
 
-			// If in handshake waiting state, optionally enforce timeout by
-			// short read deadline using std only
+			// Read content. Without a deadline one read suffices; with one,
+			// read in slices and re-check the remaining budget between them
+			// so a byte-dripping peer cannot stretch the read via per-recv
+			// timeout resets inside a single large read_exact.
+			let mut content = vec![0u8; content_length];
+			#[cfg(feature = "std")]
 			{
-				match self.to_handshake_state() {
-					TcpHandshakeState::AwaitingServerResponse { initiated_at }
-					| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
-						let now = std::time::Instant::now();
-						if now >= initiated_at + self.handshake_timeout {
-							return Err(TransportError::OperationFailed(TransportFailure::Timeout));
-						}
+				if deadline.is_some() {
+					let slice_len = if handshake_pending {
+						HANDSHAKE_READ_SLICE
+					} else {
+						ESTABLISHED_READ_SLICE
+					};
+
+					let mut filled = 0;
+					while filled < content_length {
+						self.arm_read_deadline(deadline)?;
+						let end = usize::min(filled + slice_len, content_length);
+						self.stream.read_exact(&mut content[filled..end])?;
+						filled = end;
 					}
-					_ => {}
+				} else {
+					self.stream.read_exact(&mut content)?;
 				}
 			}
-
-			// Read content
-			let mut content = vec![0u8; content_length];
+			#[cfg(not(feature = "std"))]
 			self.stream.read_exact(&mut content)?;
 
 			// Reconstruct full DER encoding using the helper
@@ -168,7 +185,7 @@ where
 
 		// Clear timeout before handling result
 		#[cfg(feature = "std")]
-		if self.operation_timeout.is_some() {
+		if deadline.is_some() {
 			let _ = self.stream.set_timeout(None);
 		}
 
@@ -560,6 +577,55 @@ mod tests {
 
 		// Response should be None since no handler is set
 		assert_eq!(response, None);
+		Ok(())
+	}
+
+	/// Under the per-recv-only scheme this read complete after ~6s of dripping
+	/// the absolute deadline aborts it at the first slice boundary past
+	/// the budget.
+	#[cfg(feature = "x509")]
+	#[tokio::test]
+	async fn handshake_read_deadline_bounds_byte_drip() -> TransportResult<()> {
+		use std::io::Write;
+
+		let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+		let addr = listener.local_addr()?;
+
+		let server_handle = std::thread::spawn(move || {
+			let (stream, _) = listener.accept().unwrap();
+			let mut transport: TcpTransport<std::net::TcpStream> = TcpTransport::from(stream);
+			// Configured client validation marks the endpoint as expecting a
+			// handshake, putting the first read under the handshake clock.
+			transport.client_validators = Some(Arc::new(Vec::new()));
+			transport.handshake_timeout = Duration::from_millis(250);
+
+			let rt = tokio::runtime::Runtime::new().unwrap();
+			let started = std::time::Instant::now();
+			let result = rt.block_on(transport.read_envelope());
+			(result, started.elapsed())
+		});
+
+		// SEQUENCE header declaring 600 content bytes, sent whole; the body
+		// then drips one byte per 10ms (well under any per-recv timeout).
+		let mut stream = TcpStream::connect(addr)?;
+		Write::write_all(&mut stream, &[0x30, 0x82, 0x02, 0x58])?;
+		let drip_handle = std::thread::spawn(move || {
+			for _ in 0..600 {
+				if Write::write_all(&mut stream, &[0u8]).is_err() {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+		});
+
+		let (result, elapsed) = server_handle.join().unwrap();
+		drip_handle.join().unwrap();
+
+		assert!(result.is_err(), "dripped read must fail: {result:?}");
+		assert!(
+			elapsed < Duration::from_secs(5),
+			"read must abort near the deadline, took {elapsed:?}"
+		);
 		Ok(())
 	}
 

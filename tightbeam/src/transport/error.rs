@@ -78,12 +78,27 @@ pub enum TransportError {
 	IoError(std::io::Error),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for TransportError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		write!(f, "{self:?}")
-	}
-}
+crate::impl_error_display!(TransportError {
+	ConnectionClosed => "Connection closed gracefully",
+	ConnectionFailed => "Connection failed",
+	SendFailed => "Send failed",
+	MissingEncryption => "Encryption required but not provided",
+	InvalidMessage => "Invalid message",
+	InvalidReply => "Invalid reply",
+	MissingRequest => "Missing request",
+	MaxRetriesExceeded => "Max retries exceeded",
+	InvalidAddress => "Invalid address",
+	InvalidState => "Invalid state",
+	#[cfg(feature = "x509")]
+	InvalidCertificate(err) => "Invalid certificate: {err}",
+	MessageNotSent(frame, failure) => "Message not sent: {failure:?} - {frame:?}",
+	OperationFailed(failure) => "Operation failed: {failure:?}",
+	#[cfg(feature = "x509")]
+	HandshakeError(err) => "Handshake error: {err}",
+	DerError(err) => "DER error: {err}",
+	#[cfg(feature = "std")]
+	IoError(err) => "I/O error: {err}",
+});
 
 /// Narrows [`TightBeamError`](crate::error::TightBeamError) into [`TransportError`];
 /// variants without a transport counterpart collapse to [`TransportError::InvalidMessage`].
@@ -116,9 +131,6 @@ impl From<TransitStatus> for TransportError {
 		}
 	}
 }
-
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for TransportError {}
 
 #[cfg(all(feature = "std", not(feature = "derive")))]
 crate::impl_from!(std::io::Error => TransportError::IoError);

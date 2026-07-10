@@ -121,8 +121,7 @@ mod tests {
 	/// Interop: a signature produced by the `ecdsa` crate's own
 	/// `DigestSigner<Sha3_256>` path -- independent of this crate's
 	/// `sign_canonical` -- must verify under the advertised
-	/// ecdsa-with-SHA3-256 OID. Guards against the label/math mismatch that
-	/// previously made the PKI a closed ecosystem (B-15).
+	/// ecdsa-with-SHA3-256 OID.
 	#[test]
 	fn verifies_independent_sha3_ecdsa_signature() -> Result<(), Box<dyn std::error::Error>> {
 		let signing_key: Secp256k1SigningKey = create_test_signing_key();
