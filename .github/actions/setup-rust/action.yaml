@@ -1,0 +1,10 @@
+name: Setup Rust
+description: Install the toolchain pinned in rust-toolchain.toml and configure the build cache
+
+runs:
+  using: composite
+  steps:
+    - name: Install toolchain (rust-toolchain.toml)
+      run: rustup toolchain install
+      shell: bash
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
