@@ -184,11 +184,14 @@ macro_rules! job {
 
 #[cfg(test)]
 mod tests {
-	use crate::colony::hive::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
 	use crate::error::Result;
 	use crate::Frame;
 
+	#[cfg(feature = "colony")]
+	use crate::colony::hive::{HiveManagementRequest, ListServletsParams, SpawnServletParams, StopServletParams};
+
 	// Sync job with tuple input - implements Job trait
+	#[cfg(feature = "colony")]
 	job! {
 		name: SpawnServletJob,
 		fn run((servlet_type, config): (Vec<u8>, Option<Vec<u8>>)) -> Result<Frame> {
@@ -207,6 +210,7 @@ mod tests {
 	}
 
 	// Sync job with no params - implements Job trait with Input = ()
+	#[cfg(feature = "colony")]
 	job! {
 		name: ListServletsJob,
 		fn run() -> Result<Frame> {
@@ -222,6 +226,7 @@ mod tests {
 	}
 
 	// Sync job with single tuple input
+	#[cfg(feature = "colony")]
 	job! {
 		name: StopServletJob,
 		fn run((servlet_id,): (Vec<u8>,)) -> Result<Frame> {
@@ -248,6 +253,7 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "colony")]
 	test_job! {
 		name: test_spawn_servlet_job,
 		job: SpawnServletJob::run((b"worker_servlet".to_vec(), None)),
@@ -264,6 +270,7 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "colony")]
 	test_job! {
 		name: test_list_servlets_job,
 		job: ListServletsJob::run(),
@@ -277,6 +284,7 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "colony")]
 	test_job! {
 		name: test_stop_servlet_job,
 		job: StopServletJob::run((b"worker_servlet_127.0.0.1:8080".to_vec(),)),

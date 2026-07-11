@@ -4758,7 +4758,7 @@ The workspace consists of the following components:
 [build-link]: https://github.com/wahidgroup/tightbeam/actions/workflows/ci.yaml
 
 [license-image]: https://img.shields.io/badge/license-MIT%2FApache--2.0-blue
-[rustc-image]: https://img.shields.io/badge/rustc-1.85.1%2B-orange?logo=rust
+[rustc-image]: https://img.shields.io/badge/rustc-1.88.0%2B-orange?logo=rust
 
 [chat-image]: https://img.shields.io/badge/chat-Discussions-blue?logo=github
 [chat-link]: https://github.com/wahidgroup/tightbeam/discussions

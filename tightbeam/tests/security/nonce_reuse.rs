@@ -9,8 +9,11 @@
 //! (same nonce) to the server (all enabled backends: ECIES, CMS).
 //!
 //! ## Expected control
-//! Per-message nonces MUST be unique (monotonic counter + XOR derivation), and
-//! `NonceReplaySet` MUST track seen nonces and reject duplicates.
+//! Per-message nonces MUST be unique (monotonic counter + XOR derivation).
+//! Handshake freshness is provided by the server's per-connection random,
+//! which is bound into the signed transcript, so a captured client message
+//! cannot be replayed into a fresh session (the server contributes new
+//! randomness the attacker cannot influence).
 //!
 //! ## References
 //! - CWE-323: Reusing a Nonce, Key Pair in Encryption
@@ -81,7 +84,7 @@ tb_process_spec! {
 		ReplayAttempted => { "nonce_replay_rejected" => Idle }
 	}
 	terminal { Idle }
-	annotations { description: "Nonce reuse attack: duplicate nonce detection via NonceReplaySet" }
+	annotations { description: "Nonce reuse attack: freshness via server random bound into signed transcript" }
 }
 
 tb_scenario! {

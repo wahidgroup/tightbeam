@@ -8,8 +8,6 @@ on:
     tags:
       - 'v*'
   pull_request:
-    branches:
-      - master
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,6 +21,25 @@ jobs:
       - uses: ./.github/actions/setup-rust
       - name: Run linters
         run: make lint
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - name: Install MSRV toolchain
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Resolve MSRV-compatible dependencies
+        run: |
+          mkdir -p .cargo
+          printf '[resolver]\nincompatible-rust-versions = "fallback"\n' > .cargo/config.toml
+          cargo +${{ steps.msrv.outputs.version }} update
+      - name: Check workspace on MSRV
+        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-features
 
   test:
     name: ${{ matrix.name }}

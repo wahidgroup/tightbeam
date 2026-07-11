@@ -4,7 +4,12 @@
 //! (AES-256-GCM with SHA3-512 and AES-128-GCM with SHA3-256) negotiates
 //! with a client that offers profiles in preference order.
 
-#![cfg(all(feature = "transport", feature = "x509", feature = "aead"))]
+#![cfg(all(
+	feature = "transport",
+	feature = "transport-ecies",
+	feature = "x509",
+	feature = "aead"
+))]
 
 use std::sync::Arc;
 use tightbeam::crypto::aead::{Aes128Gcm, Aes128GcmOid, Aes256Gcm, Aes256GcmOid};
@@ -43,6 +48,7 @@ impl SecurityProfile for Aes256Sha3_512Profile {
 	type SignatureAlg = Secp256k1Signature;
 	type KdfOid = HkdfSha3_256Oid;
 	type CurveOid = Secp256k1Oid;
+	#[cfg(feature = "kem")]
 	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
@@ -97,6 +103,7 @@ impl SecurityProfile for Aes128Sha3_256Profile {
 	type SignatureAlg = Secp256k1Signature;
 	type KdfOid = HkdfSha3_256Oid;
 	type CurveOid = Secp256k1Oid;
+	#[cfg(feature = "kem")]
 	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_128_WRAP);
 }

@@ -163,15 +163,15 @@ job! {
 
 			match attack_session.inject_at_step(weak_hello.step, &weak_hello.payload).await? {
 				InjectionOutcome::Rejected(_) => {
-					// Downgrade substitution rejected - protection works
+					// Downgrade substitution rejected - the strong server's
+					// strength floor refuses the AES-128 offer, and the
+					// negotiated cipher is bound into the signed transcript.
 					trace.event("downgrade_substitution_rejected")?;
 				}
 				InjectionOutcome::Accepted => {
-					// Server accepted the weak message. In a real attack:
-					// - Server transcript = H(weak_hello + ...)
-					// - Victim transcript = H(strong_hello + ...)
-					// - Signature over server's transcript won't verify for victim
-					trace.event("downgrade_substitution_rejected")?;
+					// A strong session that accepts a weak ClientHello is a
+					// downgrade. The control MUST reject it.
+					return Err(expectation_failure("downgrade substitution was accepted"));
 				}
 			}
 		}

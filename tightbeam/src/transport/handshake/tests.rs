@@ -15,10 +15,11 @@ use std::sync::Arc;
 use crate::asn1::OctetString;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
-use crate::crypto::profiles::SecurityProfileDesc;
+use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 use crate::der::asn1::BitString;
+use crate::der::asn1::GeneralizedTime;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::{Decode, Encode};
 use crate::oids::{
@@ -28,22 +29,22 @@ use crate::oids::{
 use crate::random::OsRng;
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::negotiation::SecurityAccept;
-use crate::transport::handshake::server::EciesHandshakeServer;
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake};
 use crate::x509::serial_number::SerialNumber;
+use crate::x509::time::Time;
 use crate::x509::time::Validity;
 use crate::x509::Certificate;
 use crate::x509::{name::RdnSequence, TbsCertificate};
 
-#[cfg(feature = "x509")]
-mod x509 {
+#[cfg(feature = "transport-ecies")]
+mod ecies {
 	pub use crate::crypto::ecies::Secp256k1EciesMessage;
-	pub use crate::crypto::profiles::DefaultCryptoProvider;
 	pub use crate::transport::handshake::client::EciesHandshakeClient;
+	pub use crate::transport::handshake::server::EciesHandshakeServer;
 }
 
-#[cfg(feature = "x509")]
-use x509::*;
+#[cfg(feature = "transport-ecies")]
+use ecies::*;
 
 #[cfg(feature = "transport-cms")]
 mod cms {
@@ -54,15 +55,6 @@ mod cms {
 
 #[cfg(feature = "transport-cms")]
 use cms::*;
-
-#[cfg(feature = "time")]
-mod time_imports {
-	pub use crate::der::asn1::GeneralizedTime;
-	pub use crate::x509::time::Time;
-}
-
-#[cfg(feature = "time")]
-use time_imports::*;
 
 /// Create a default test security profile for handshake tests.
 pub fn create_default_test_profile() -> SecurityProfileDesc {
@@ -115,7 +107,6 @@ pub fn create_test_certificate_from_key(
 }
 
 /// Internal function to create a certificate from a signing key.
-#[cfg(feature = "time")]
 fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn std::error::Error>> {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key.to_public_key_der()?;
@@ -289,14 +280,14 @@ pub fn into_provider(signing_key: Secp256k1SigningKey) -> std::sync::Arc<dyn Sig
 // ============================================================================
 
 /// Builder for creating test ECIES handshake servers with sensible defaults.
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 pub struct TestEciesServerBuilder {
 	key: Option<Secp256k1SigningKey>,
 	cert: Option<Certificate>,
 	aad_domain: Option<&'static [u8]>,
 }
 
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 impl TestEciesServerBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
@@ -347,7 +338,7 @@ impl TestEciesServerBuilder {
 	}
 }
 
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 impl Default for TestEciesServerBuilder {
 	fn default() -> Self {
 		Self::new()
@@ -355,12 +346,12 @@ impl Default for TestEciesServerBuilder {
 }
 
 /// Builder for creating test ECIES handshake clients with sensible defaults.
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 pub struct TestEciesClientBuilder {
 	aad_domain: Option<&'static [u8]>,
 }
 
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 impl TestEciesClientBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
@@ -379,7 +370,7 @@ impl TestEciesClientBuilder {
 	}
 }
 
-#[cfg(feature = "x509")]
+#[cfg(feature = "transport-ecies")]
 impl Default for TestEciesClientBuilder {
 	fn default() -> Self {
 		Self::new()

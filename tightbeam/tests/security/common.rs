@@ -339,13 +339,12 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 // Message Tampering Helpers (for MITM Testing)
 // ============================================================================
 
-/// Tamper with a message payload by flipping bits at strategic positions.
+/// Tamper with a message payload by flipping bits deep in the trailing content.
 ///
-/// This simulates a MITM attacker modifying message bytes in transit.
-/// The tampering is designed to:
-/// 1. Preserve DER structure validity (where possible)
-/// 2. Cause transcript hash mismatch
-/// 3. Invalidate signatures over the original content
+/// This simulates a MITM attacker modifying message bytes in transit. The
+/// tampering targets bytes in the last quarter of the payload, which for a
+/// certificate-bearing handshake message lands inside the signature / signed
+/// content rather than on the outer DER tag+length octets at the front.
 ///
 /// # Parameters
 /// - `payload`: Original message bytes
@@ -358,10 +357,10 @@ pub fn tamper_payload(payload: &[u8]) -> Vec<u8> {
 		return tampered;
 	}
 
-	// Flip bits in the middle of the payload to avoid DER header corruption
-	// This targets the actual content rather than structural bytes
-	let mid = tampered.len() / 2;
-	let positions = [mid, mid.saturating_add(1), mid.saturating_add(2)];
+	// Anchor in the final quarter (past the front tag+length header) and flip
+	// a short run of content bytes so the DER framing stays intact.
+	let anchor = tampered.len().saturating_sub(tampered.len() / 4).min(tampered.len() - 1);
+	let positions = [anchor, anchor.saturating_add(1), anchor.saturating_add(2)];
 
 	for pos in positions {
 		if pos < tampered.len() {

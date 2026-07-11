@@ -6,7 +6,7 @@ members = ["tightbeam", "tightbeam-derive", "consumer-test"]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
 version = "0.8.0"
 edition = "2021"
-rust-version = "1.85.1"
+rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wahidgroup/tightbeam"
 homepage = "https://github.com/wahidgroup/tightbeam"
@@ -86,7 +86,7 @@ zeekstd = { version = "0.6.2", default-features = false }
 paste = { version = "1.0.15" }
 gumdrop = { version = "0.8.1" }
 rand = { version = "0.9" }
-trybuild = { version = "1.0.116", features = ["diff"] }
+trybuild = { version = "1.0.117", features = ["diff"] }
 fake = { version = "=4.3.0", features = [
 	"derive",
 	"uuid",
@@ -97,8 +97,8 @@ fake = { version = "=4.3.0", features = [
 
 # Proc macro dependencies
 proc-macro2 = "1.0.106"
-quote = "1.0.45"
-syn = { version = "2.0.117", features = ["full", "derive"] }
+quote = "1.0.46"
+syn = { version = "2.0.118", features = ["full", "derive"] }
 
 ## Fuzzing dependencies
 afl = { version = "0.17.1" }

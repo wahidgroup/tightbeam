@@ -101,7 +101,9 @@ job! {
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
 
-		// Only test ECIES (CMS uses different encryption structure)
+		// This test decrypts the ECIES ClientKeyExchange blob directly. CMS
+		// transports the session key inside an EnvelopedData/KARI structure, so
+		// its confidentiality is verified separately in the loopback suite.
 		let kind = HandshakeBackendKind::Ecies;
 
 		// ========================================

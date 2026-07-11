@@ -710,10 +710,11 @@ impl<T: Message> FrameBuilder<T> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::compress::ZstdCompression;
 	use crate::test_builder;
 	use crate::testing::{create_test_cipher_key, create_test_message, create_test_signing_key, TestMessage};
 
+	#[cfg(feature = "compress")]
+	use crate::compress::ZstdCompression;
 	#[cfg(all(feature = "aes-gcm", feature = "sha3"))]
 	use crate::crypto::hash::Sha3_256;
 

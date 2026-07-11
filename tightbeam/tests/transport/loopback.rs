@@ -8,12 +8,11 @@
 //! - The derived `RuntimeAead` keys match (bidirectional encrypt/decrypt)
 //! - CMS session keys are random per handshake, never constant (CWE-321)
 
-#![cfg(all(feature = "transport", feature = "x509", feature = "aead"))]
+#![cfg(all(feature = "transport", feature = "x509", feature = "aead", feature = "tokio"))]
 
 use std::sync::Arc;
 
 use tightbeam::crypto::aead::Decryptor;
-use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::exactly;
@@ -21,11 +20,15 @@ use tightbeam::random::generate_nonce;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::config::ScenarioConf;
-use tightbeam::transport::handshake::client::EciesHandshakeClient;
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
-use tightbeam::transport::handshake::server::EciesHandshakeServer;
 use tightbeam::transport::handshake::{ClientHandshakeProtocol, ServerHandshakeProtocol};
 use tightbeam::TightBeamError;
+
+#[cfg(feature = "transport-ecies")]
+use tightbeam::{
+	crypto::ecies::Secp256k1EciesMessage,
+	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer},
+};
 
 #[cfg(feature = "transport-cms")]
 use tightbeam::{
@@ -41,15 +44,18 @@ use crate::common::security::{default_security_profile, expectation_failure, Ser
 /// Number of CMS loopback passes (0 when the feature is disabled).
 const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;
 
+/// Number of ECIES loopback passes (0 when the feature is disabled).
+const ECIES_RUNS: u32 = cfg!(feature = "transport-ecies") as u32;
+
 tb_assert_spec! {
 	pub HandshakeLoopbackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("loopback_ecies_complete", exactly!(1)),
-			("loopback_ecies_roundtrip", exactly!(1)),
-			("loopback_ecies_profile_agreed", exactly!(1)),
+			("loopback_ecies_complete", exactly!(ECIES_RUNS)),
+			("loopback_ecies_roundtrip", exactly!(ECIES_RUNS)),
+			("loopback_ecies_profile_agreed", exactly!(ECIES_RUNS)),
 			("loopback_cms_complete", exactly!(CMS_RUNS)),
 			("loopback_cms_roundtrip", exactly!(CMS_RUNS)),
 			("loopback_cms_profile_agreed", exactly!(CMS_RUNS)),
@@ -67,6 +73,7 @@ tb_scenario! {
 		exec: |trace| async move {
 			let materials = ServerMaterials::generate();
 
+			#[cfg(feature = "transport-ecies")]
 			ecies_loopback(&trace, &materials).await?;
 
 			#[cfg(feature = "transport-cms")]
@@ -117,6 +124,7 @@ fn assert_bidirectional_roundtrip(
 }
 
 /// ECIES loopback through the orchestrator trait surface.
+#[cfg(feature = "transport-ecies")]
 async fn ecies_loopback(
 	trace: &tightbeam::trace::TraceCollector,
 	materials: &ServerMaterials,
@@ -226,6 +234,23 @@ async fn cms_loopback(
 
 	// KeyExchange -> ServerFinished -> ClientFinished -> (no reply)
 	let key_exchange = ClientHandshakeProtocol::start(&mut client).await?;
+
+	// Confidentiality (CWE-311): the CMS backend transports the session key
+	// wrapped inside the KeyExchange EnvelopedData, so the raw key MUST NOT
+	// appear anywhere in the cleartext wire bytes. This is the CMS analogue of
+	// the ECIES `confidentiality` threat test, exercised on the real
+	// random-key path (not the harness's constant test key).
+	let session_key = client
+		.session_key()
+		.ok_or_else(|| expectation_failure("CMS client must hold a session key after start"))?
+		.with(|bytes| bytes.clone())?;
+	assert!(
+		!key_exchange
+			.windows(session_key.len())
+			.any(|window| window == session_key.as_slice()),
+		"CMS session key must not appear in cleartext KeyExchange wire bytes"
+	);
+
 	let server_finished = server
 		.handle_request(&key_exchange)
 		.await?

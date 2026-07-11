@@ -10,8 +10,11 @@
 use tightbeam::der::Sequence;
 use tightbeam::testing::ScenarioConf;
 use tightbeam::utils::task::Pipeline;
-use tightbeam::{compose, exactly, job, tb_assert_spec, tb_process_spec, tb_scenario};
+use tightbeam::{compose, exactly, job, tb_assert_spec, tb_scenario};
 use tightbeam::{Beamable, Frame, TightBeamError};
+
+#[cfg(feature = "testing-csp")]
+use tightbeam::tb_process_spec;
 
 // Test message types
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
@@ -96,6 +99,7 @@ tb_scenario! {
 // L1: Assertion Specification - Auto URN Events from PipelineBuilder
 // ============================================================================
 
+#[cfg(feature = "testing-csp")]
 tb_assert_spec! {
 	pub AutoTraceSpec,
 	V(1,0,0): {
@@ -117,6 +121,7 @@ tb_assert_spec! {
 // L2: CSP Process Specification - Valid State Transitions
 // ============================================================================
 
+#[cfg(feature = "testing-csp")]
 tb_process_spec! {
 	pub PipelineProcess,
 	events {
@@ -141,6 +146,7 @@ tb_process_spec! {
 	terminal { Done }
 }
 
+#[cfg(feature = "testing-csp")]
 tb_scenario! {
 	name: test_pipeline_auto_trace_urns,
 	config: ScenarioConf::<()>::builder()

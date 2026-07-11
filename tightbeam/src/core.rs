@@ -459,6 +459,13 @@ mod tests {
 		flag: bool,
 	}
 
+	/// Pin `decoded` to the type of `original`: with reduced feature sets the
+	/// `serde_json` dev-dependency's `PartialEq<Value>` impls for integers make
+	/// a bare `assert_eq!` on `decode`'s inferred output ambiguous.
+	fn assert_round_trip<T: PartialEq + core::fmt::Debug>(original: &T, decoded: &T) {
+		assert_eq!(original, decoded);
+	}
+
 	/// Macro to generate encode/decode round-trip tests
 	macro_rules! test_encode_decode {
 		($($name:ident: $value:expr,)*) => {
@@ -473,7 +480,7 @@ mod tests {
 
 					// Decode
 					let decoded = crate::decode(&encoded).unwrap();
-					assert_eq!(original, decoded);
+					assert_round_trip(&original, &decoded);
 
 					// Verify it's valid DER (encode again and compare)
 					let re_encoded = crate::encode(&decoded).unwrap();
