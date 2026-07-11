@@ -38,12 +38,13 @@ use crate::transport::handshake::negotiation::{ProfileStrengthPolicy, SecurityAc
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::{
-	clear_session_randoms, compute_transcript_digest, extract_verifying_key_from_cert, octet_string_to_32_byte_array,
-	validate_state,
+	clear_session_randoms, compute_client_auth_digest, compute_transcript_digest, extract_verifying_key_from_cert,
+	octet_string_to_32_byte_array, validate_state,
 };
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeProtocol};
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 use crate::x509::Certificate;
+use crate::zeroize::Zeroizing;
 
 /// Server-side ECIES handshake orchestrator.
 ///
@@ -162,11 +163,12 @@ where
 			.subject_public_key
 			.raw_bytes();
 
-		// Bind the negotiated profile into the transcript so a tampered
-		// security_accept invalidates the server signature.
+		// Bind the full ClientHello DER (offer included) and the
+		// negotiated profile into the transcript so tampering with either
+		// invalidates the server signature.
 		let accept_der = security_accept.to_der()?;
 		let transcript_digest =
-			self.compute_transcript_hash(&client_random, &server_random, spki_bytes, &accept_der)?;
+			self.compute_transcript_hash(client_hello_der, &server_random, spki_bytes, &accept_der)?;
 		self.transcript_hash = Some(transcript_digest);
 		self.invariants.lock_transcript()?;
 
@@ -244,10 +246,10 @@ where
 		let server_random = self.server_random.as_ref().ok_or(HandshakeError::MissingServerRandom)?;
 
 		// 3. Derive final session key using trait finalization (client_random || server_random)
-		let mut salt = [0u8; 64];
+		let mut salt = Zeroizing::new([0u8; 64]);
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
-		let session_key = self.derive_session_aead(base_session_key, &salt)?;
+		let session_key = self.derive_session_aead(base_session_key, salt.as_slice())?;
 		self.invariants.derive_aead_once()?;
 
 		// 4. Transition to complete state
@@ -278,13 +280,13 @@ where
 
 	fn compute_transcript_hash(
 		&self,
-		client_random: &[u8; 32],
+		client_hello: &[u8],
 		server_random: &[u8; 32],
 		spki_bytes: &[u8],
 		accept_der: &[u8],
 	) -> Result<[u8; 32], HandshakeError> {
-		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len() + accept_der.len());
-		data.extend_from_slice(client_random);
+		let mut data = Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len());
+		data.extend_from_slice(client_hello);
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
 		data.extend_from_slice(accept_der);
@@ -425,13 +427,23 @@ where
 				validator.evaluate(&client_cert)?;
 			}
 
-			// Verify client signature over transcript hash
+			// Verify client signature over the bound auth digest
 			let client_signature = client_kex
 				.client_signature
 				.as_ref()
 				.ok_or(HandshakeError::SignatureVerificationFailed)?;
 
 			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+
+			// Recompute the digest the client signed: transcript hash bound to
+			// this exact encrypted payload and this exact certificate,
+			// so the signature cannot be spliced from another exchange.
+			let cert_der = client_cert.to_der()?;
+			let auth_digest = compute_client_auth_digest::<P::Digest>(
+				&transcript_hash,
+				client_kex.encrypted_data.as_bytes(),
+				&cert_der,
+			)?;
 
 			// Extract public key from client certificate
 			// Parse public key
@@ -443,9 +455,7 @@ where
 			// Create verifying key from public key
 			let verifying_key = P::VerifyingKey::from(&public_key);
 
-			// Canonical convention: the transcript hash is the prehash; the
-			// client signed it directly (no second hash).
-			verifying_key.verify_prehash(&transcript_hash, &signature)?;
+			verifying_key.verify_prehash(&auth_digest, &signature)?;
 
 			// Store validated cert (identity is now locked)
 			self.validated_client_cert = Some(Arc::new(client_cert));
@@ -540,31 +550,14 @@ where
 		Box<dyn core::future::Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>,
 	> {
 		Box::pin(async move {
-			// 1. Validate current state is KeyExchangeReceived
-			self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
-
-			// 2. Get required values for key derivation
-			let base_session_key = self.base_session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
-
-			// 3. Get negotiated profile and AEAD OID
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
-			// 4. Derive final session key as P::AeadCipher (client_random || server_random)
-			let mut salt = [0u8; 64];
-			salt[..32].copy_from_slice(client_random);
-			salt[32..].copy_from_slice(server_random);
-			let cipher = self.derive_session_aead(base_session_key, &salt)?;
+			// Delegate to the inherent method: single source of truth for state
+			// validation, AEAD derivation, invariants, and cleanup.
+			let cipher = EciesHandshakeServer::complete(self)?;
 
-			// 5. Transition to complete state
-			self.state.transition(ServerHandshakeState::Completed)?;
-
-			// 6. Clear sensitive data
-			self.clear_sensitive_data();
-
-			// 7. Wrap cipher in RuntimeAead with negotiated OID
+			// Wrap cipher in RuntimeAead with negotiated OID
 			Ok(crate::crypto::aead::RuntimeAead::new(cipher, aead_oid))
 		})
 	}

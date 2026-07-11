@@ -217,6 +217,40 @@ where
 	crate::transport::handshake::primitives::transcript::digest_output_to_array(&D::digest(data))
 }
 
+/// Compute the ECIES client mutual-auth digest.
+///
+/// Binds the transcript hash, the ECIES-encrypted key exchange payload, and
+/// the client certificate into a single digest that the client signs. This
+/// prevents splicing a valid client signature onto a different key exchange
+/// or a different identity (CWE-347).
+///
+/// # Type Parameters
+/// - `D`: The digest algorithm (e.g., `Sha3_256`)
+///
+/// # Parameters
+/// - `transcript_hash`: The 32-byte handshake transcript hash
+/// - `encrypted_data`: The ECIES-encrypted key exchange bytes
+/// - `client_cert_der`: DER encoding of the client certificate
+///
+/// # Errors
+/// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
+#[cfg(feature = "transport-ecies")]
+pub fn compute_client_auth_digest<D>(
+	transcript_hash: &[u8; 32],
+	encrypted_data: &[u8],
+	client_cert_der: &[u8],
+) -> Result<[u8; 32], HandshakeError>
+where
+	D: crate::crypto::hash::Digest,
+{
+	let mut data = Vec::with_capacity(32 + encrypted_data.len() + client_cert_der.len());
+	data.extend_from_slice(transcript_hash);
+	data.extend_from_slice(encrypted_data);
+	data.extend_from_slice(client_cert_der);
+
+	compute_transcript_digest::<D>(&data)
+}
+
 /// Clear sensitive session data by zeroizing and dropping.
 ///
 /// Used in ECIES handshakes to securely erase ephemeral key material
@@ -228,23 +262,20 @@ where
 /// - `server_random`: Optional server random to clear
 ///
 /// # Security
-/// This function ensures sensitive data is overwritten before deallocation,
-/// preventing potential memory scraping attacks.
+/// Zeroizes each array in place (the `Option<Z>` impl clears the payload
+/// before setting `None`), so the original stack slots are overwritten
+/// rather than a moved copy (CWE-226).
 #[cfg(feature = "transport-ecies")]
 pub fn clear_session_randoms(
 	base_session_key: &mut Option<[u8; 32]>,
 	client_random: &mut Option<[u8; 32]>,
 	server_random: &mut Option<[u8; 32]>,
 ) {
-	if let Some(mut bk) = base_session_key.take() {
-		bk.fill(0);
-	}
-	if let Some(mut cr) = client_random.take() {
-		cr.fill(0);
-	}
-	if let Some(mut sr) = server_random.take() {
-		sr.fill(0);
-	}
+	use crate::zeroize::Zeroize;
+
+	base_session_key.zeroize();
+	client_random.zeroize();
+	server_random.zeroize();
 }
 
 #[cfg(test)]

@@ -128,7 +128,7 @@ transport = [
 ]
 doc = []
 compress = ["tightbeam-derive?/compress"]
-transport-policy = ["policy"]
+transport-policy = ["transport", "policy"]
 # UNSTABLE: trait surface only, no implementation yet; excluded from `full`.
 transport-multiplex = ["transport"]
 # UNSTABLE: PQXDH prekey/kdf-chain/hybrid-KEM primitives.

@@ -38,7 +38,7 @@ use crate::spki::EncodePublicKey;
 use crate::transport::handshake::attributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::kari::{derive_kek, key_wrap_key_size, unwrap_with_kek, wrap_with_kek};
-use crate::transport::handshake::negotiation::ProfileStrengthPolicy;
+use crate::transport::handshake::negotiation::{ProfileStrengthPolicy, SecurityAccept};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
@@ -417,6 +417,7 @@ where
 		let content = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
 		let mut hasher = P::Digest::new();
 		hasher.update(content);
+
 		let digest = hasher.finalize();
 		Ok(digest.to_vec())
 	}
@@ -441,6 +442,26 @@ where
 		Ok((signer_id, digest_alg, signature_alg))
 	}
 
+	/// Build the SecurityAccept unsigned attribute for the server Finished.
+	///
+	/// Advisory like TLS ServerHello extensions pre-Finished: the attribute is
+	/// unauthenticated, but tampering yields a client-side profile/key mismatch
+	/// and the handshake fails closed.
+	fn build_security_accept_attrs(&self) -> Result<Option<Attributes>, HandshakeError> {
+		let profile = match self.selected_profile {
+			Some(profile) => profile,
+			None => return Ok(None),
+		};
+
+		let accept_attr = attributes::encode_security_accept(&SecurityAccept::new(profile))?;
+		let x509_attr = crate::x509::attr::Attribute {
+			oid: accept_attr.attr_type,
+			values: crate::der::asn1::SetOfVec::try_from(accept_attr.attr_values)?,
+		};
+
+		Ok(Some(Attributes::try_from(vec![x509_attr])?))
+	}
+
 	/// Build the complete SignedData structure.
 	fn build_server_signed_data(
 		&self,
@@ -457,7 +478,7 @@ where
 			signed_attrs: None,
 			signature_algorithm: signature_alg,
 			signature: OctetString::new(signature_bytes)?,
-			unsigned_attrs: None,
+			unsigned_attrs: self.build_security_accept_attrs()?,
 		};
 
 		let octet_string = OctetString::new(transcript_hash)?;

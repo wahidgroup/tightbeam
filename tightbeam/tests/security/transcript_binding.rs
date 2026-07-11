@@ -4,17 +4,24 @@
 //! If the ECIES handshake transcript omits the negotiated `security_accept` -
 //! covering only `client_random || server_random || server_spki` - the signed
 //! transcript does not authenticate the chosen profile, leaving negotiation
-//! unbound.
+//! unbound. Likewise, if only the client *random* (not the full `ClientHello`)
+//! is bound, the client's `SecurityOffer` can be rewritten in transit.
 //!
 //! ## Attack
-//! An adversary-in-the-middle rewrites `security_accept` to a weaker (still
-//! offered) profile in transit. Randoms, certificate, and server signature are
-//! untouched, so the transcript still verifies and the client silently adopts
-//! the weaker profile.
+//! 1. An adversary-in-the-middle rewrites `security_accept` to a weaker (still
+//!    offered) profile in transit. Randoms, certificate, and server signature
+//!    are untouched, so the transcript still verifies and the client silently
+//!    adopts the weaker profile.
+//! 2. The MITM strips or rewrites the `SecurityOffer` inside `ClientHello`
+//!    while preserving `client_random`. The server signs a transcript over the
+//!    modified hello; if the client only bound its random, the signature still
+//!    verifies and negotiation happened over an offer the client never made.
 //!
 //! ## Expected control
 //! Negotiated parameters MUST be authenticated by the signed transcript. The
-//! client MUST reject a `security_accept` it did not receive under signature.
+//! client MUST reject a `security_accept` it did not receive under signature,
+//! and MUST reject a server signature computed over a `ClientHello` that
+//! differs from the exact DER bytes it sent (TLS-style full-message binding).
 //!
 //! ## References
 //! - CWE-757: Selection of Less-Secure Algorithm During Negotiation ('Algorithm Downgrade')
@@ -37,7 +44,7 @@ use tightbeam::{
 		client::EciesHandshakeClient,
 		negotiation::{SecurityAccept, SecurityOffer},
 		server::EciesHandshakeServer,
-		ServerHandshake,
+		ClientHello, ServerHandshake,
 	},
 	TightBeamError,
 };
@@ -50,7 +57,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("tampered_accept_rejected", exactly!(1u32))
+			("tampered_accept_rejected", exactly!(1u32)),
+			("stripped_offer_rejected", exactly!(1u32))
 		]
 	}
 }
@@ -58,15 +66,16 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub TranscriptBindingProcess,
 	events {
-		observable { "tampered_accept_rejected" }
+		observable { "tampered_accept_rejected", "stripped_offer_rejected" }
 		hidden { }
 	}
 	states {
-		Idle => { "tampered_accept_rejected" => Done },
+		Idle => { "tampered_accept_rejected" => AcceptBound },
+		AcceptBound => { "stripped_offer_rejected" => Done },
 		Done => { }
 	}
 	terminal { Done }
-	annotations { description: "Transcript binding: negotiated profile must be authenticated" }
+	annotations { description: "Transcript binding: negotiated profile and client offer must be authenticated" }
 }
 
 tb_scenario! {
@@ -117,6 +126,37 @@ job! {
 				trace.event("tampered_accept_rejected")?;
 			}
 			Ok(_) => return Err(expectation_failure("client accepted a tampered, unauthenticated security_accept")),
+		}
+
+		// Phase 2: MITM strips the SecurityOffer from ClientHello.
+		// client_random is preserved, so a random-only transcript would still
+		// verify. The full ClientHello DER binding must make the client reject.
+		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
+			.with_security_offer(SecurityOffer::new(vec![strong, weak]));
+
+		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
+			Arc::clone(&materials.key_provider),
+			Arc::clone(&materials.certificate),
+			None,
+			None,
+		)
+		.with_supported_profiles(vec![strong, weak]);
+
+		let client_hello = client.build_client_hello()?;
+		let mut stripped_hello = ClientHello::from_der(&client_hello)?;
+		stripped_hello.security_offer = None;
+
+		let stripped_hello = stripped_hello.to_der()?;
+		if stripped_hello == client_hello {
+			return Err(expectation_failure("offer stripping produced identical ClientHello bytes"));
+		}
+
+		let server_handshake_der = server.process_client_hello(&stripped_hello).await?;
+		match client.process_server_handshake(&server_handshake_der).await {
+			Err(_) => {
+				trace.event("stripped_offer_rejected")?;
+			}
+			Ok(_) => return Err(expectation_failure("client accepted a signature over a rewritten ClientHello")),
 		}
 
 		Ok(())

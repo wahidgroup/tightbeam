@@ -28,4 +28,5 @@ pub mod forward_secrecy;
 pub mod mitm_attack;
 pub mod nonce_reuse;
 pub mod replay_attack;
+pub mod splice_attack;
 pub mod transcript_binding;

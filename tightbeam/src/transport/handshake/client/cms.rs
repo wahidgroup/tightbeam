@@ -308,14 +308,63 @@ where
 		let verified_content =
 			self.verify_signature(signed_data_der, server_verifying_key, expected_signer_identifier)?;
 
-		// 5. Add server finished to transcript AFTER verification
+		// 5. Process SecurityAccept from unsigned attributes: the
+		//    attribute is advisory, but the selection is validated against our
+		//    own offer, so tampering can only cause a failed handshake.
+		self.process_security_accept(signed_data_der)?;
+
+		// 6. Add server finished to transcript AFTER verification
 		self.transcript_buffer.extend_from_slice(signed_data_der);
 
-		// 6. Transition state & lock transcript (transcript hash verified)
+		// 7. Transition state & lock transcript (transcript hash verified)
 		self.state.transition(ClientHandshakeState::ServerFinishedReceived)?;
 		self.invariants.lock_transcript()?;
 
 		Ok(verified_content)
+	}
+
+	/// Extract and validate the server's `SecurityAccept` from the Finished
+	/// message's unsigned attributes, then store the selected profile.
+	///
+	/// # Validation
+	/// - Offer sent: accepted profile must be a member of the offer
+	/// - No offer (dealer's choice): any accepted profile is stored
+	/// - No attribute present: selection stays `None` (trait-level `complete()`
+	///   then fails closed rather than proceeding with an unknown profile)
+	fn process_security_accept(&mut self, signed_data_der: &[u8]) -> Result<(), HandshakeError> {
+		let signed_data = SignedData::from_der(signed_data_der)?;
+		let accept = signed_data
+			.signer_infos
+			.0
+			.iter()
+			.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref())
+			.flat_map(|attrs| attrs.iter())
+			.find(|attr| attr.oid == crate::oids::HANDSHAKE_SECURITY_ACCEPT)
+			.map(|attr| {
+				let handshake_attr = crate::transport::handshake::attributes::HandshakeAttribute::from(attr);
+				crate::transport::handshake::attributes::extract_security_accept(&handshake_attr)
+			})
+			.transpose()?;
+
+		match (accept, &self.security_offer) {
+			(Some(accept), Some(offer)) => {
+				if !offer.profiles.contains(&accept.profile) {
+					return Err(HandshakeError::InvalidProfileSelection);
+				}
+				self.selected_profile = Some(accept.profile);
+			}
+			(Some(accept), None) => {
+				// Dealer's choice: accept the server's selection
+				self.selected_profile = Some(accept.profile);
+			}
+			(None, Some(_)) => {
+				// We offered profiles but the server did not answer
+				return Err(HandshakeError::InvalidProfileSelection);
+			}
+			(None, None) => {}
+		}
+
+		Ok(())
 	}
 
 	/// Build client Finished message (SignedData over transcript hash).
@@ -576,7 +625,12 @@ where
 	type Error = HandshakeError;
 
 	fn start<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>> {
-		Box::pin(async move { self.build_key_exchange(vec![0u8; 32], None) })
+		Box::pin(async move {
+			// Fresh random session key per handshake: a constant key
+			// would make every session trivially decryptable (CWE-321).
+			let session_key = crate::zeroize::Zeroizing::new(generate_nonce::<32>(None)?);
+			self.build_key_exchange(session_key.to_vec(), None)
+		})
 	}
 
 	fn handle_response<'a, 'b>(
@@ -712,6 +766,61 @@ mod tests {
 		// When: Trying to build client finished before processing server finished
 		let result = client.build_client_finished().await;
 		assert!(result.is_err());
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_process_security_accept_rejects_unoffered_profile() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+		use crate::oids::{HANDSHAKE_SECURITY_ACCEPT, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+		use crate::transport::handshake::attributes::encode_security_accept;
+		use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
+		use crate::x509::attr::{Attribute, Attributes};
+
+		let offered = create_default_test_profile();
+		let mut unoffered = create_default_test_profile();
+		unoffered.aead_key_size = Some(16);
+
+		let build_finished_with_accept = |profile| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+			let signing_key = Secp256k1SigningKey::random(&mut crate::random::OsRng);
+			let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+			let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
+			let builder =
+				TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(&signing_key, digest_alg, signature_alg)?;
+			let mut signed_data = builder.build(&[7u8; 32])?;
+
+			let accept_attr = encode_security_accept(&SecurityAccept::new(profile))?;
+			let x509_attr = Attribute {
+				oid: HANDSHAKE_SECURITY_ACCEPT,
+				values: crate::der::asn1::SetOfVec::try_from(accept_attr.attr_values)?,
+			};
+
+			let attrs = Attributes::try_from(vec![x509_attr])?;
+			let mut signer_infos: Vec<_> = signed_data.signer_infos.0.iter().cloned().collect();
+
+			signer_infos[0].unsigned_attrs = Some(attrs);
+			signed_data.signer_infos = signer_infos.try_into()?;
+
+			Ok(signed_data.to_der()?)
+		};
+
+		let mut client = TestCmsClientBuilder::new()
+			.build()?
+			.with_security_offer(SecurityOffer::new(vec![offered]));
+
+		let accepted = build_finished_with_accept(offered)?;
+		client.process_security_accept(&accepted)?;
+		assert_eq!(client.selected_profile, Some(offered), "offered profile must be accepted");
+
+		let rejected = build_finished_with_accept(unoffered)?;
+		assert!(
+			matches!(
+				client.process_security_accept(&rejected),
+				Err(crate::transport::handshake::error::HandshakeError::InvalidProfileSelection)
+			),
+			"a profile outside the client offer must be rejected"
+		);
 
 		Ok(())
 	}

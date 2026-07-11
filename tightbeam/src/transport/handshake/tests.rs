@@ -159,19 +159,18 @@ pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn std::
 	Ok(TestHandshakeData { client_random, server_random, base_session_key, transcript_hash })
 }
 
-/// Compute a test transcript hash from client random, server random, and SPKI bytes.
-///
-/// This mirrors the transcript hash computation used in the actual handshake protocols.
+/// Compute a test transcript hash from the ClientHello DER, server random,
+/// and SPKI bytes.
 pub fn compute_test_transcript_hash(
-	client_random: &[u8; 32],
+	client_hello: &[u8],
 	server_random: &[u8; 32],
 	spki_bytes: &[u8],
 	accept_der: &[u8],
 ) -> [u8; 32] {
 	use crate::crypto::hash::{Digest, Sha3_256};
 
-	let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len() + accept_der.len());
-	data.extend_from_slice(client_random);
+	let mut data = Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len());
+	data.extend_from_slice(client_hello);
 	data.extend_from_slice(server_random);
 	data.extend_from_slice(spki_bytes);
 	data.extend_from_slice(accept_der);
