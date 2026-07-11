@@ -36,10 +36,7 @@ use crate::testing::timing::{TimedTransition, TimingConstraints, TimingGuard};
 /// The engine keys [`State`]/[`Event`] on `&'static str` for `Copy`
 /// ergonomics, so runtime-built names (product states, decoded events,
 /// owned assertion labels) must be promoted to `'static`. Interning
-/// deduplicates before leaking: each distinct name costs one allocation
-/// for the process lifetime instead of one per call, so repeated
-/// composition/FDR/fuzz runs reuse pooled names rather than growing
-/// without bound (CWE-401).
+/// deduplicates before leaking (CWE-401).
 static INTERN_POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
 /// Promote a runtime string to `&'static str` via the intern pool.

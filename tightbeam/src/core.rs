@@ -27,8 +27,7 @@ use crate::SignerInfo;
 /// Decompresses message bodies.
 ///
 /// A single always-present trait so downstream code compiles identically
-/// under every feature combination; only the implementations are
-/// feature-gated (e.g. `ZstdCompression` behind `compress`).
+/// under every feature combination.
 pub trait Inflator {
 	/// Decompress `data`, returning the decompressed bytes.
 	///

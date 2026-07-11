@@ -15,13 +15,12 @@ pub const TRANSCRIPT_HASH_LEN: usize = 32;
 /// Digests wider than [`TRANSCRIPT_HASH_LEN`] are *deliberately* truncated to
 /// their leading 32 bytes, following the NIST SHA-512/256 construction: the
 /// wire format carries exactly 32 bytes and the leading bytes of a wider
-/// digest retain full 256-bit collision resistance. Digests narrower than 32
-/// bytes cannot fill the array and are rejected (CWE-1240; the previous
-/// unchecked slice panicked here).
+/// digest retain full 256-bit collision resistance (CWE-1240).
 pub(crate) fn digest_output_to_array(bytes: &[u8]) -> Result<[u8; TRANSCRIPT_HASH_LEN], HandshakeError> {
 	if bytes.len() < TRANSCRIPT_HASH_LEN {
 		return Err(HandshakeError::TranscriptDigestLength { expected: TRANSCRIPT_HASH_LEN, received: bytes.len() });
 	}
+
 	let mut out = [0u8; TRANSCRIPT_HASH_LEN];
 	out.copy_from_slice(&bytes[..TRANSCRIPT_HASH_LEN]);
 	Ok(out)

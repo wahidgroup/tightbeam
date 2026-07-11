@@ -53,7 +53,7 @@ pub trait CertificateTrust: CertificateValidation + Debug + Send + Sync {
 	/// 3. Issuer/subject DN chaining (RFC 5280 §6.1.3(a)(4))
 	/// 4. Cryptographic signature verification (RFC 5280 §6.1.3(a)(1))
 	/// 5. Issuer `basicConstraints.cA` / `keyUsage.keyCertSign` and
-	///    `pathLenConstraint` (RFC 5280 §6.1.4(k),(m),(n))
+	///    `pathLenConstraint` (RFC 5280 §6.1.4(k),(l),(m),(n))
 	///
 	/// Not yet enforced: extension criticality (RFC 5280 §6.1.3(f)), name
 	/// constraints/policies (§6.1.3-§6.1.5), and revocation (CRL/OCSP). See
@@ -126,6 +126,10 @@ pub trait TrustBuilder: Sized {
 /// present with `cA` asserted. §6.1.4(n): when a `keyUsage` extension is
 /// present it MUST assert `keyCertSign`.
 /// <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4>.
+///
+/// Stricter than the RFC: (k) is version-conditional there (v1/v2 CAs may be
+/// verified out-of-band); this enforces it unconditionally, so v1/v2 CA
+/// certificates are rejected (see [`CertificateTrustStore::validate_path`]).
 #[cfg(feature = "std")]
 fn ensure_issuer_is_ca(issuer: &Certificate) -> Result<(), CertificateValidationError> {
 	match certificate_extension::<BasicConstraints>(issuer)? {
@@ -144,10 +148,13 @@ fn ensure_issuer_is_ca(issuer: &Certificate) -> Result<(), CertificateValidation
 
 /// Enforce `pathLenConstraint` over an ordered chain (root -> leaf).
 ///
-/// RFC 5280 §6.1.4(m): a CA certificate's `pathLenConstraint` bounds the number
-/// of intermediate certificates that may follow it in the path before the
-/// end-entity. `None` imposes no limit.
+/// RFC 5280 §6.1.4(l),(m): a CA certificate's `pathLenConstraint` bounds the
+/// number of intermediate certificates that may follow it in the path before
+/// the end-entity. `None` imposes no limit.
 /// <https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4>.
+///
+/// Stricter than the RFC: self-issued intermediates count toward the bound
+/// ((l) exempts them; see [`CertificateTrustStore::validate_path`]).
 #[cfg(feature = "std")]
 fn ensure_path_len(chain: &[&Certificate]) -> Result<(), CertificateValidationError> {
 	for (index, cert) in chain.iter().enumerate() {
@@ -221,20 +228,37 @@ impl CertificateTrustStore {
 
 	/// Validate an ordered certification path (issuer-first: anchor -> leaf).
 	///
-	/// RFC 5280 §6.1 checks shared by both public entry points
+	/// [RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1)
+	/// checks shared by both public entry points
 	/// ([`CertificateValidation::evaluate`] and
 	/// [`CertificateTrust::verify_chain`]) so the two cannot diverge on
 	/// validation strength (e.g. `pathLenConstraint`).
 	///
 	/// Performs, over the whole path:
-	/// 1. Validity period (RFC 5280 §6.1.3(a)(2))
-	/// 2. Algorithm-identifier consistency (RFC 5280 §4.1.1.2)
-	/// 3. Issuer/subject name chaining (RFC 5280 §6.1.3(a)(4))
-	/// 4. Issuer `basicConstraints.cA` / `keyUsage.keyCertSign` (RFC 5280 §6.1.4(k),(n))
-	/// 5. Cryptographic signature verification (RFC 5280 §6.1.3(a)(1))
-	/// 6. `pathLenConstraint` (RFC 5280 §6.1.4(m))
+	/// 1. Validity period ([RFC 5280 §6.1.3(a)(2)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
+	/// 2. Algorithm-identifier consistency ([RFC 5280 §4.1.1.2](https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.1.2))
+	/// 3. Issuer/subject name chaining ([RFC 5280 §6.1.3(a)(4)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
+	/// 4. Issuer `basicConstraints.cA` / `keyUsage.keyCertSign` ([RFC 5280 §6.1.4(k),(n)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4))
+	/// 5. Cryptographic signature verification ([RFC 5280 §6.1.3(a)(1)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
+	/// 6. `pathLenConstraint` ([RFC 5280 §6.1.4(l),(m)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4))
 	///
-	/// Trust anchoring is the caller's responsibility; this routine validates
+	/// Deliberately stricter than RFC 5280 in four fail-closed ways. TightBeam
+	/// runs a closed, self-managed PKI, so the interop these rules exist for
+	/// (legacy web roots, cross-signing, cross-vendor DN encoding slop) never
+	/// applies, and rejecting it removes attack surface:
+	/// - §6.1.4(k) is enforced on every issuer, not just v3 -- v1/v2 CA
+	///   certificates are rejected outright (the RFC permits rejecting).
+	/// - Self-issued intermediates count against `pathLenConstraint`
+	///   (§6.1.4(l) exempts them) -- key rollover here re-issues the trust
+	///   store rather than cross-signing.
+	/// - The trust anchor itself is subject to checks 1, 2, 4, and 6
+	///   (§6.1.1(d) treats it as exempt input) -- an expired or non-CA pinned
+	///   root fails loudly.
+	/// - Name chaining is DER byte equality, not §7.1 case-insensitive
+	///   matching -- both encoders are in-house, and binary comparison
+	///   forecloses canonicalization ambiguity.
+	///
+	/// Trust anchoring is the caller's responsibility. This routine validates
 	/// path structure and cryptography only.
 	fn validate_path(&self, path: &[&Certificate]) -> Result<(), CertificateValidationError> {
 		// RFC 5280 §6.1.3(a)(2): every certificate must be within its validity period.
