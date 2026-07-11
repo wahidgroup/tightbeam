@@ -258,8 +258,9 @@ pub const REPLAY_GUARD_CAPACITY: usize = 1024;
 /// A command is accepted when its `issued_at_ms` lies within
 /// `window_ms` of the hive clock (either direction, tolerating skew)
 /// AND its signature has not already been seen inside the window.
-/// Entries older than the window are pruned on each check, so memory is
-/// bounded by [`REPLAY_GUARD_CAPACITY`].
+/// Entries more than the window away from the current clock (either
+/// direction, tolerating backward clock steps) are pruned on each check,
+/// so memory is bounded by [`REPLAY_GUARD_CAPACITY`].
 #[cfg(feature = "x509")]
 pub struct ReplayGuard {
 	seen: Mutex<HashMap<Vec<u8>, u64>>,
@@ -288,17 +289,23 @@ impl ReplayGuard {
 			return false;
 		};
 
-		seen.retain(|_, ts| now_ms.saturating_sub(*ts) <= self.window_ms);
+		// After a backward clock step the recorded timestamps sit in the
+		// future, and a past-only check would retain them until the clock
+		// re-passes them, pinning the guard at capacity (fail-closed) for
+		// the duration. Replays of the pruned signatures stay rejected by
+		// the is_fresh check, which is more than window_ms out of range for
+		// the same reason.
+		seen.retain(|_, ts| now_ms.abs_diff(*ts) <= self.window_ms);
 
 		if seen.contains_key(signature) {
 			return false;
 		}
-
 		if seen.len() >= REPLAY_GUARD_CAPACITY {
 			return false;
 		}
 
 		seen.insert(signature.to_vec(), now_ms);
+
 		true
 	}
 }
@@ -389,12 +396,12 @@ impl GatePolicy for ClusterSecurityGate {
 		if !self.replay_guard.is_fresh(command.issued_at_ms, now) {
 			return TransitStatus::Forbidden;
 		}
-
 		if !self.replay_guard.check_and_insert(signer_info.signature.as_bytes(), now) {
 			return TransitStatus::Forbidden;
 		}
 
 		self.circuit_breaker.record_success();
+
 		TransitStatus::Accepted
 	}
 }
@@ -499,7 +506,6 @@ mod tests {
 	#[test]
 	fn replay_guard_accepts_first_rejects_second() {
 		let guard = ReplayGuard::new(30_000);
-
 		assert!(guard.check_and_insert(b"sig-a", 1_000));
 		assert!(!guard.check_and_insert(b"sig-a", 2_000));
 		assert!(guard.check_and_insert(b"sig-b", 2_000));
@@ -509,9 +515,16 @@ mod tests {
 	#[test]
 	fn replay_guard_prunes_expired_entries() {
 		let guard = ReplayGuard::new(1_000);
-
 		assert!(guard.check_and_insert(b"sig-a", 1_000));
 		assert!(guard.check_and_insert(b"sig-a", 3_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_prunes_future_dated_entries_after_clock_regression() {
+		let guard = ReplayGuard::new(1_000);
+		assert!(guard.check_and_insert(b"sig-a", 10_000));
+		assert!(guard.check_and_insert(b"sig-a", 5_000));
 	}
 
 	#[cfg(feature = "x509")]

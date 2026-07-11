@@ -11,7 +11,7 @@ use std::io::Write;
 use crate::policy::TransitStatus;
 use crate::testing::assertions::AssertionLabel;
 use crate::testing::fdr::config::AcceptanceSet;
-use crate::testing::specs::csp::{Event, Process, State, TransitionRelation};
+use crate::testing::specs::csp::{intern, Event, Process, State, TransitionRelation};
 use crate::trace::ConsumedTrace;
 
 /// State labels used in FDR trace analysis
@@ -298,8 +298,9 @@ impl FdrTraceExt for ConsumedTrace {
 			let AssertionLabel::Custom(label) = &assertion.label;
 			let static_label: &'static str = match label {
 				Cow::Borrowed(s) => s,
-				Cow::Owned(s) => Box::leak(s.clone().into_boxed_str()),
+				Cow::Owned(s) => intern(s.as_str()),
 			};
+
 			events.push(TraceEvent::Assertion { seq: assertion.seq, label: static_label });
 		}
 
@@ -363,6 +364,7 @@ impl FdrTraceExt for ConsumedTrace {
 				#[cfg(feature = "instrument")]
 				TraceEvent::ObservableInstrumentation { seq, .. } | TraceEvent::HiddenInstrumentation { seq, .. } => *seq as u64,
 			};
+
 			seq_a.cmp(&seq_b)
 		});
 
@@ -373,15 +375,9 @@ impl FdrTraceExt for ConsumedTrace {
 				let (event, is_hidden) = match event {
 					TraceEvent::Assertion { label, .. } => (Event(label), false),
 					#[cfg(feature = "instrument")]
-					TraceEvent::ObservableInstrumentation { label, .. } => {
-						let static_label: &'static str = Box::leak(label.clone().into_boxed_str());
-						(Event(static_label), false)
-					}
+					TraceEvent::ObservableInstrumentation { label, .. } => (Event(intern(label.as_str())), false),
 					#[cfg(feature = "instrument")]
-					TraceEvent::HiddenInstrumentation { label, .. } => {
-						let static_label: &'static str = Box::leak(label.clone().into_boxed_str());
-						(Event(static_label), true)
-					}
+					TraceEvent::HiddenInstrumentation { label, .. } => (Event(intern(label.as_str())), true),
 				};
 
 				// Add to appropriate alphabet
@@ -395,9 +391,9 @@ impl FdrTraceExt for ConsumedTrace {
 				let to_state = if idx == events.len() - 1 {
 					s_terminal
 				} else {
-					let state_name: &'static str = Box::leak(format!("trace_state_{idx}").into_boxed_str());
-					let to_state = State(state_name);
+					let to_state = State(intern(format!("trace_state_{idx}")));
 					states.insert(to_state);
+
 					to_state
 				};
 

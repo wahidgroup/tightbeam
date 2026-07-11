@@ -427,7 +427,7 @@ mod tests {
 	use super::*;
 	use crate::builder::TypeBuilder;
 	use crate::instrumentation::events;
-	use crate::testing::specs::csp::{Process, State};
+	use crate::testing::specs::csp::{Process, ProcessBuildError, State};
 	use crate::testing::timing::{DeadlineBuilder, PathWcet, WcetConfig, WcetConfigBuilder};
 	use crate::utils::jitter::VarianceJitter;
 	use crate::utils::urn::Urn;
@@ -969,7 +969,7 @@ mod tests {
 	// ========================================================================
 
 	/// Helper to create a simple test process: start -> process -> end
-	fn create_path_test_process() -> Result<Process, &'static str> {
+	fn create_path_test_process() -> Result<Process, ProcessBuildError> {
 		Process::builder("test")
 			.initial_state(State("s0"))
 			.add_terminal(State("s2"))

@@ -2180,6 +2180,8 @@ let hive_conf = HiveConf {
 
 Without a trust store, all cluster commands are rejected. See [Trust Stores](#trust-stores) for building trust stores from cluster certificates.
 
+Signed commands are additionally checked for freshness: each `ClusterCommand` carries an `issued_at_ms` timestamp, and the hive rejects commands outside `command_freshness_window_ms` of its clock or whose signature was already seen inside that window (replay protection).
+
 ##### Resilience Features
 
 Hives include built-in resilience mechanisms:
@@ -2222,6 +2224,8 @@ let hive_conf = HiveConf {
 };
 ```
 
+When `hive_tls` is set, the hive control server binds with TLS and outbound control frames (registration, scaling updates) are signed with the hive key. Clusters configured with `hive_trust` reject unsigned control frames.
+
 ##### HiveConf Reference
 
 ```rust
@@ -2238,6 +2242,8 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 	pub servlet_pool_size: usize,                   // Default: 8
 	pub servlet_pool_idle_timeout: Option<Duration>,// Default: 30s
 	pub drain_timeout: Duration,                    // Default: 30s
+	pub command_freshness_window_ms: u64,           // Default: 30_000 (replay window)
+	pub cluster_notify_retry: Arc<dyn CoreRetryPolicy + Send + Sync>,
 	pub trust_store: Option<Arc<dyn CertificateTrust>>,
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
 }
@@ -2268,8 +2274,7 @@ Define a cluster type using the `cluster!` macro:
 ```rust
 cluster! {
 	pub MyCluster,
-	protocol: TokioListener,
-	config: ClusterConf::default()
+	protocol: TokioListener
 }
 ```
 
@@ -2279,9 +2284,14 @@ The macro accepts an optional `digest` parameter for custom hash algorithms used
 cluster! {
 	pub MyCluster,
 	protocol: TokioListener,
-	digest: Blake3,
-	config: ClusterConf::default()
+	digest: Blake3
 }
+```
+
+Runtime configuration is supplied to `Cluster::start`:
+
+```rust
+let cluster = MyCluster::start(trace, ClusterConf::new(tls)).await?;
 ```
 
 ##### Mutual TLS
@@ -2292,11 +2302,15 @@ Clusters require TLS configuration for secure communication with hives. The clus
 let tls = ClusterTlsConfig {
 	certificate: CertificateSpec::Built(Box::new(cert)),
 	key: Arc::new(Secp256k1KeyProvider::from(key)),
-	validators: vec![],  // Optional: validators for hive certificates
+	validators: vec![],         // Optional: validators for hive certificates
+	client_validators: vec![],  // Non-empty: gateway requires client certs (mTLS)
+	hive_trust: Some(trust),    // Trust store for verifying signed hive control frames
 };
 ```
 
 For hives to trust cluster commands (like heartbeats), they must have the cluster's certificate in their trust store. See [Trust Stores](#trust-stores) for details.
+
+When `hive_trust` is configured, the gateway rejects unsigned hive-origin control frames (registration, servlet address updates): registration replies carry `TransitStatus::Unauthorized` for missing signatures and `TransitStatus::Forbidden` for signatures that fail verification. Leaving `hive_trust` as `None` accepts unsigned control frames and is intended for development only.
 
 ##### Heartbeat Mechanism
 
@@ -2363,12 +2377,12 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	pub load_balancer: L,
 	/// Heartbeat configuration
 	pub heartbeat: HeartbeatConf,
-	/// Gate policies for the gateway (rate limiting, auth, etc.)
+	/// Pheromone configuration for bio-inspired routing
+	pub pheromone: PheromoneConf,
+	/// Gate policies evaluated on every gateway frame before decoding
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	/// Connection pool configuration for hive connections
 	pub pool_config: PoolConfig,
-	/// Default retry policy for all cluster -> hive communication
-	pub retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
 	/// TLS configuration for cluster -> hive connections
 	pub tls: ClusterTlsConfig,
 }
@@ -2416,6 +2430,8 @@ tb_scenario! {
 				certificate: CertificateSpec::Built(Box::new(cert)),
 				key: Arc::new(Secp256k1KeyProvider::from(key)),
 				validators: vec![],
+				client_validators: vec![],
+				hive_trust: Some(Arc::new(hive_trust.clone())),
 			};
 
 			let heartbeat_conf = HeartbeatConf::builder()

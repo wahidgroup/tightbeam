@@ -6,11 +6,6 @@ use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionVal
 use crate::testing::specs::{SpecViolation, TBSpec};
 use crate::trace::{ConsumedTrace, ExecutionMode};
 
-#[cfg(not(feature = "std"))]
-use alloc::{borrow::Cow, string::String, vec::Vec};
-#[cfg(not(feature = "std"))]
-use core::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "std")]
 use std::borrow::Cow;
 
 #[cfg(feature = "digest")]
@@ -627,51 +622,23 @@ macro_rules! __tb_assert_spec_build_all {
 			$(, schedulability: { $($schedule_content:tt)* })?
 		)+
 	) => {{
-		#[cfg(feature = "std")]
-		{
-			static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
-			CELL.get_or_init(|| {
-				let mut v = Vec::new();
-				$crate::__tb_assert_spec_build_all_impl!(
-					v, $base, $desc_opt,
+		static CELL: std::sync::OnceLock<Vec<$crate::testing::macros::BuiltAssertSpec>> = std::sync::OnceLock::new();
+		CELL.get_or_init(|| {
+			let mut v = Vec::new();
+			$crate::__tb_assert_spec_build_all_impl!(
+				v, $base, $desc_opt,
+				$(
+					$maj, $min, $patch, $mode, $gate,
+					assertions: [ $( $assertion ),* ],
 					$(
-						$maj, $min, $patch, $mode, $gate,
-						assertions: [ $( $assertion ),* ],
-						$(
-							events: [ $($events_tt)* ],
-						)?
-						$(, tag_filter: [ $( $tag ),* ])?
-						$(, schedulability: { $($schedule_content)* })?
-					)+
-				);
-				v
-			}).as_slice()
-		}
-		#[cfg(not(feature = "std"))]
-		{
-			use core::sync::atomic::{AtomicBool, Ordering};
-			static INIT: AtomicBool = AtomicBool::new(false);
-			static mut VEC: Option<Vec<$crate::testing::macros::BuiltAssertSpec>> = None;
-			if !INIT.load(Ordering::Acquire) {
-				let desc_opt = $desc_opt;
-				let mut v = Vec::new();
-				$crate::__tb_assert_spec_build_all_impl!(
-					v, $base, desc_opt,
-					$(
-						$maj, $min, $patch, $mode, $gate,
-						assertions: [ $( $assertion ),* ],
-						$(
-							events: [ $($events_tt)* ],
-						)?
-						$(, tag_filter: [ $( $tag ),* ])?
-						$(, schedulability: { $($schedule_content)* })?
-					)+
-				);
-				unsafe { VEC = Some(v); }
-				INIT.store(true, Ordering::Release);
-			}
-			unsafe { VEC.as_ref().unwrap().as_slice() }
-		}
+						events: [ $($events_tt)* ],
+					)?
+					$(, tag_filter: [ $( $tag ),* ])?
+					$(, schedulability: { $($schedule_content)* })?
+				)+
+			);
+			v
+		}).as_slice()
 	}};
 }
 

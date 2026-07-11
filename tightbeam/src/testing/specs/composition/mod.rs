@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::testing::specs::csp::{CspValidationResult, Event, Process, ProcessSpec, State};
+use crate::testing::specs::csp::{CspValidationResult, Event, Process, ProcessBuildError, ProcessSpec, State};
 use crate::trace::ConsumedTrace;
 
 // Submodules
@@ -145,7 +145,13 @@ pub enum CompositionError {
 	InvalidComposition { reason: String },
 
 	/// Process construction failed
-	ProcessConstructionFailed { reason: String },
+	ProcessConstructionFailed(ProcessBuildError),
+}
+
+impl From<ProcessBuildError> for CompositionError {
+	fn from(source: ProcessBuildError) -> Self {
+		Self::ProcessConstructionFailed(source)
+	}
 }
 
 impl fmt::Display for CompositionError {
@@ -162,14 +168,21 @@ impl fmt::Display for CompositionError {
 				write!(f, "Non-determinism at state {}: events {:?}", state, events)
 			}
 			Self::InvalidComposition { reason } => write!(f, "Invalid composition: {}", reason),
-			Self::ProcessConstructionFailed { reason } => {
-				write!(f, "Process construction failed: {}", reason)
+			Self::ProcessConstructionFailed(source) => {
+				write!(f, "Process construction failed: {}", source)
 			}
 		}
 	}
 }
 
-impl std::error::Error for CompositionError {}
+impl std::error::Error for CompositionError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::ProcessConstructionFailed(source) => Some(source),
+			_ => None,
+		}
+	}
+}
 
 /// Process expression AST for composition
 ///
