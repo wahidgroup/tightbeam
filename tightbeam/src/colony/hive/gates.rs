@@ -20,16 +20,17 @@ use crate::utils::BasisPoints;
 use crate::Frame;
 
 #[cfg(feature = "x509")]
-use std::collections::HashMap;
-#[cfg(feature = "x509")]
-use std::sync::Mutex;
+mod x509 {
+	pub use std::collections::HashMap;
+	pub use std::sync::Mutex;
+
+	pub use crate::colony::common::ClusterCommand;
+	pub use crate::crypto::x509::store::CertificateTrust;
+	pub use crate::der::Encode;
+}
 
 #[cfg(feature = "x509")]
-use crate::colony::common::ClusterCommand;
-#[cfg(feature = "x509")]
-use crate::crypto::x509::store::CertificateTrust;
-#[cfg(feature = "x509")]
-use crate::der::Encode;
+use x509::*;
 
 // ============================================================================
 // Circuit Breaker
