@@ -55,11 +55,12 @@ where
 
 	let leaked: &'static str = Box::leak(name.into().into_boxed_str());
 	pool.insert(leaked);
+
 	leaked
 }
 
 /// Process state in the LTS
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct State(pub &'static str);
 
 impl fmt::Display for State {
@@ -73,7 +74,7 @@ impl fmt::Display for State {
 /// Represents a named event in a CSP process specification. Also used by
 /// timing verification to identify events with timing constraints (WCET,
 /// deadlines, jitter) and in violation reports.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Event(pub &'static str);
 
 impl fmt::Display for Event {
@@ -187,6 +188,11 @@ impl TransitionRelation {
 	/// Check if nondeterministic: from --\[event\]--> {s1, s2, ...}
 	pub fn is_nondeterministic(&self, from: State, event: &Event) -> bool {
 		self.transitions.get(&(from, *event)).map(|v| v.len() > 1).unwrap_or(false)
+	}
+
+	/// Iterate over all `((from, event), targets)` entries.
+	pub fn iter(&self) -> impl Iterator<Item = (&(State, Event), &Vec<State>)> {
+		self.transitions.iter()
 	}
 }
 
@@ -302,6 +308,49 @@ impl Process {
 	/// Check if state is nondeterministic choice point
 	pub fn is_choice(&self, state: State) -> bool {
 		self.choice.contains(&state)
+	}
+
+	/// Structural digest over the LTS: initial state, sorted states,
+	/// terminals, choice points, alphabets, and transition triples.
+	///
+	/// Two processes share a digest iff they have identical structure, so
+	/// it is a sound memoization key where `name` is not (algebra
+	/// operators such as `hide`/`rename` produce constant names for
+	/// structurally different results).
+	///
+	/// The digest is only stable within one program run (`DefaultHasher`
+	/// seeds vary across runs); do not persist it.
+	pub fn structure_digest(&self) -> u64 {
+		use core::hash::{Hash, Hasher};
+		use std::collections::hash_map::DefaultHasher;
+
+		fn sorted_names<'a, I>(items: I) -> Vec<&'a str>
+		where
+			I: Iterator<Item = &'a str>,
+		{
+			let mut names: Vec<&str> = items.collect();
+			names.sort_unstable();
+			names
+		}
+
+		let mut hasher = DefaultHasher::new();
+		self.initial.0.hash(&mut hasher);
+
+		sorted_names(self.states.iter().map(|s| s.0)).hash(&mut hasher);
+		sorted_names(self.terminal.iter().map(|s| s.0)).hash(&mut hasher);
+		sorted_names(self.choice.iter().map(|s| s.0)).hash(&mut hasher);
+		sorted_names(self.observable.iter().map(|e| e.0)).hash(&mut hasher);
+		sorted_names(self.hidden.iter().map(|e| e.0)).hash(&mut hasher);
+
+		let mut triples: Vec<(&str, &str, &str)> = self
+			.transitions
+			.iter()
+			.flat_map(|((from, event), targets)| targets.iter().map(move |to| (from.0, event.0, to.0)))
+			.collect();
+		triples.sort_unstable();
+		triples.hash(&mut hasher);
+
+		hasher.finish()
 	}
 
 	/// Generate TaskSet from timing constraints and schedulability periods
@@ -470,7 +519,7 @@ impl Process {
 
 	/// All states reachable from `states` via hidden (τ) transitions only,
 	/// including the input states. Worklist traversal, no recursion.
-	fn tau_closure(&self, states: &[State]) -> Vec<State> {
+	pub(crate) fn tau_closure(&self, states: &[State]) -> Vec<State> {
 		let mut closure: Vec<State> = states.to_vec();
 		let mut seen: HashSet<State> = states.iter().copied().collect();
 		let mut idx = 0;

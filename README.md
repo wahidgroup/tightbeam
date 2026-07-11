@@ -3278,9 +3278,9 @@ schedulability: {
 ```
 
 Supported schedulers:
-- **Rate Monotonic Analysis (RMA)**: Fixed-priority scheduling with utilization bounds
-- **Earliest Deadline First (EDF)**: Dynamic priority scheduling with utilization bound ≤ 1.0
-- **Response Time Analysis (RTA)**: Exact schedulability test for both RMA and EDF
+- **Rate Monotonic Analysis (RMA)**: Fixed-priority scheduling. The Liu & Layland utilization bound is a sufficient-only fast path (implicit deadlines), with RTA arbitrating above the bound or for constrained deadlines
+- **Earliest Deadline First (EDF)**: Dynamic priority scheduling with utilization bound ≤ 1.0 (exact for implicit deadlines)
+- **Response Time Analysis (RTA)**: Exact schedulability test for fixed-priority task sets (D ≤ T); EDF task sets are rejected since the fixed-priority recurrence does not model dynamic priorities
 
 Additional features include percentile-based WCET analysis (P50-P99.99), confidence intervals, and fixed-point arithmetic for deterministic calculations. See §12.3.5 for timing constraints in process specifications
 
@@ -4222,6 +4222,8 @@ AFL Random Bytes          CspOracle                State Machine
 [0x7A, 0x3F, ...]        byte % events.len()     S0 -> S1 -> S2 -> ...
                          selects valid event      (valid trace)
 ```
+
+Valid events are sorted by label, so the byte-to-event mapping is deterministic across runs (AFL crash inputs replay). When a chosen event has multiple target states (nondeterministic transition), the oracle consumes one additional byte to select the target (`byte % targets.len()` over name-sorted targets), so every branch is reachable under mutation.
 
 **Benefits**:
 1. **Valid Traces Only**: Oracle ensures all fuzz inputs produce valid traces

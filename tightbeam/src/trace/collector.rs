@@ -263,7 +263,8 @@ impl<'a> EventBuilder<'a> {
 						events::ASSERT_LABEL
 					};
 
-					self.collector.emit_internal(urn, Some(&label), self.payload, self.duration_ns);
+					self.collector
+						.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
 				}
 
 				#[cfg(feature = "testing-fuzz")]
@@ -280,6 +281,7 @@ impl<'a> EventBuilder<'a> {
 						Some(&label),
 						Some(value_str.as_bytes()),
 						self.duration_ns,
+						None,
 					);
 				}
 
@@ -594,7 +596,14 @@ impl TraceCollector {
 	}
 
 	#[cfg(feature = "instrument")]
-	fn emit_internal(&self, urn: Urn<'static>, label: Option<&str>, payload: Option<&[u8]>, duration_ns: Option<u64>) {
+	fn emit_internal(
+		&self,
+		urn: Urn<'static>,
+		label: Option<&str>,
+		payload: Option<&[u8]>,
+		duration_ns: Option<u64>,
+		timestamp_ns: Option<u64>,
+	) {
 		let cfg = self.state.config;
 
 		// Capacity check and push happen under one lock acquisition so
@@ -622,6 +631,7 @@ impl TraceCollector {
 				} else {
 					None
 				},
+				timestamp_ns,
 				flags: 0,
 				extras: None,
 			});
@@ -635,12 +645,21 @@ impl TraceCollector {
 
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_payload(&self, event_urn: Urn<'static>, label: impl AsRef<str>, payload: Option<&[u8]>) {
-		self.emit_internal(event_urn, Some(label.as_ref()), payload, None);
+		self.emit_internal(event_urn, Some(label.as_ref()), payload, None, None);
 	}
 
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_timing(&self, event_urn: Urn<'static>, label: impl AsRef<str>, duration: Duration) {
-		self.emit_internal(event_urn, Some(label.as_ref()), None, Some(duration.as_nanos() as u64));
+		self.emit_internal(event_urn, Some(label.as_ref()), None, Some(duration.as_nanos() as u64), None);
+	}
+
+	/// Emit an event stamped with a point-in-time instant (relative to the
+	/// trace clock origin), e.g. deadline start/end markers. Durations and
+	/// timestamps are distinct `TbEvent` fields: a duration is a span length,
+	/// a timestamp is when the event occurred.
+	#[cfg(feature = "instrument")]
+	pub fn emit_with_timestamp(&self, event_urn: Urn<'static>, label: impl AsRef<str>, timestamp: Duration) {
+		self.emit_internal(event_urn, Some(label.as_ref()), None, None, Some(timestamp.as_nanos() as u64));
 	}
 
 	/// Drain assertions into a vector

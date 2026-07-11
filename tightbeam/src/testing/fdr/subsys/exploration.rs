@@ -35,12 +35,20 @@ pub struct DefaultExplorationEngine<'a> {
 	seed_results: Vec<(u64, SeedResult)>,
 	/// States visited (for statistics)
 	visited_states: HashSet<State>,
+	/// Branches pruned for timing violations across all seeds
+	timing_pruned: usize,
 }
 
 impl<'a> DefaultExplorationEngine<'a> {
 	/// Create new exploration engine
 	pub fn new(process: &'a Process, config: Arc<FdrConfig>) -> Self {
-		Self { process, config, seed_results: Vec::new(), visited_states: HashSet::new() }
+		Self {
+			process,
+			config,
+			seed_results: Vec::new(),
+			visited_states: HashSet::new(),
+			timing_pruned: 0,
+		}
 	}
 
 	/// Get seed results (for use by FdrExplorer)
@@ -65,24 +73,57 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 	/// Explore single seed (different scheduling)
 	fn explore_seed_internal(&mut self, seed: u64) -> SeedResult {
-		Self::explore_seed_core(self.process, &self.config, seed, |state| {
-			self.visited_states.insert(state);
-		})
+		let mut pruned = 0usize;
+		let result = Self::explore_seed_core(
+			self.process,
+			&self.config,
+			seed,
+			|state| {
+				self.visited_states.insert(state);
+			},
+			&mut pruned,
+		);
+
+		self.timing_pruned += pruned;
+
+		result
 	}
 
 	/// Static version of explore_seed usable from both the rayon-parallel and
 	/// sequential exploration loops.
-	/// Returns (SeedResult, visited_states)
-	pub fn explore_seed_static(process: &Process, config: &FdrConfig, seed: u64) -> (SeedResult, HashSet<State>) {
+	/// Returns (SeedResult, visited_states, timing_pruned_count)
+	pub fn explore_seed_static(
+		process: &Process,
+		config: &FdrConfig,
+		seed: u64,
+	) -> (SeedResult, HashSet<State>, usize) {
 		let mut visited_states = HashSet::new();
-		let result = Self::explore_seed_core(process, config, seed, |state| {
-			visited_states.insert(state);
-		});
-		(result, visited_states)
+		let mut pruned = 0usize;
+		let result = Self::explore_seed_core(
+			process,
+			config,
+			seed,
+			|state| {
+				visited_states.insert(state);
+			},
+			&mut pruned,
+		);
+
+		(result, visited_states, pruned)
 	}
 
 	/// Core exploration logic shared between internal and static versions
-	fn explore_seed_core<F>(process: &Process, config: &FdrConfig, seed: u64, mut track_visited: F) -> SeedResult
+	///
+	/// `timing_pruned` counts branches dropped for WCET/deadline
+	/// violations so model-level timing violations surface in the verdict
+	/// instead of silently vanishing from exploration.
+	fn explore_seed_core<F>(
+		process: &Process,
+		config: &FdrConfig,
+		seed: u64,
+		mut track_visited: F,
+		timing_pruned: &mut usize,
+	) -> SeedResult
 	where
 		F: FnMut(State),
 	{
@@ -97,7 +138,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 		let mut longest_trace = Vec::new();
 		let mut failures = Vec::new();
 		#[cfg(feature = "testing-fault")]
-		let mut injected_faults = Vec::new();
+		let mut injected_faults: Vec<InjectedFaultRecord> = Vec::new();
 
 		while let Some(state) = queue.pop_front() {
 			// Track visited states
@@ -118,6 +159,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 
 			// Divergence detection
 			if state.internal_run > config.max_internal_run {
+				#[cfg(feature = "testing-fault")]
+				return SeedResult::Divergence(state.trace.clone(), state.hidden_events.clone(), injected_faults);
+				#[cfg(not(feature = "testing-fault"))]
 				return SeedResult::Divergence(state.trace.clone(), state.hidden_events.clone());
 			}
 
@@ -138,6 +182,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 			let actions = process.enabled(state.process_state);
 			if actions.is_empty() {
 				// Deadlock: no enabled actions in non-terminal state
+				#[cfg(feature = "testing-fault")]
+				return SeedResult::Deadlock(state.trace.clone(), state.process_state, injected_faults);
+				#[cfg(not(feature = "testing-fault"))]
 				return SeedResult::Deadlock(state.trace.clone(), state.process_state);
 			}
 
@@ -147,24 +194,44 @@ impl<'a> DefaultExplorationEngine<'a> {
 				failures.push((state.trace.clone(), refusals));
 			}
 
-			// Select action using seeded RNG at choice points
+			// Select action, retrying past fault-suppressed transitions.
+			// An injected fault makes the chosen event fail: the transition
+			// is not taken and exploration falls back to the remaining
+			// enabled actions. A state left with no usable action is a
+			// fault-induced deadlock (recovery failure).
+			#[cfg(feature = "testing-fault")]
+			let action = {
+				let mut candidates: Vec<&Action> = actions.iter().collect();
+				loop {
+					let candidate =
+						Self::select_action_helper_from(&mut rng, process, state.process_state, &candidates);
+					let fault = config.fault_model.as_ref().and_then(|fault_model| {
+						Self::check_fault_injection(
+							fault_model,
+							process,
+							state.process_state,
+							&candidate.event,
+							&mut rng,
+						)
+					});
+
+					let Some(fault_record) = fault else {
+						break candidate;
+					};
+
+					injected_faults.push(fault_record);
+					candidates.retain(|a| a.event != candidate.event);
+
+					if candidates.is_empty() {
+						return SeedResult::Deadlock(state.trace.clone(), state.process_state, injected_faults);
+					}
+				}
+			};
+			#[cfg(not(feature = "testing-fault"))]
 			let action = Self::select_action_helper(&mut rng, process, state.process_state, &actions);
 
-			// Check for fault injection (if feature enabled)
-			#[cfg(feature = "testing-fault")]
-			if let Some(ref fault_model) = config.fault_model {
-				if let Some(fault_record) =
-					Self::check_fault_injection(fault_model, process, state.process_state, &action.event, &mut rng)
-				{
-					// Fault injected - record for verdict tracking
-					injected_faults.push(fault_record);
-					// For now, we continue exploration (fault is noted but doesn't stop execution)
-					// Future enhancement: add error recovery transitions
-				}
-			}
-
 			// Execute transition
-			Self::execute_transition_helper(process, &state, action, &mut queue);
+			Self::execute_transition_helper(process, &state, action, &mut queue, timing_pruned);
 		}
 
 		// Return success with longest trace found and collected failures
@@ -228,6 +295,14 @@ impl<'a> ExplorationCore for DefaultExplorationEngine<'a> {
 		self.seed_results.len() as u32
 	}
 
+	fn timing_pruned(&self) -> usize {
+		self.timing_pruned
+	}
+
+	fn add_timing_pruned(&mut self, count: usize) {
+		self.timing_pruned += count;
+	}
+
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult) {
 		self.seed_results.push((seed, result));
 	}
@@ -271,6 +346,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 	}
 
 	/// Select action at a choice point using RNG
+	#[cfg(not(feature = "testing-fault"))]
 	fn select_action_helper<'b>(
 		rng: &mut SeededRng,
 		process: &'b Process,
@@ -289,6 +365,24 @@ impl<'a> DefaultExplorationEngine<'a> {
 		}
 	}
 
+	/// Select action from a candidate list (fault mode)
+	///
+	/// Same policy as `select_action_helper`, over the remaining
+	/// candidates after fault suppression removed failing events.
+	#[cfg(feature = "testing-fault")]
+	fn select_action_helper_from<'b>(
+		rng: &mut SeededRng,
+		process: &Process,
+		process_state: State,
+		actions: &[&'b Action],
+	) -> &'b Action {
+		if actions.len() > 1 || process.choice.contains(&process_state) {
+			rng.choose(actions).copied().unwrap_or(actions[0])
+		} else {
+			actions[0]
+		}
+	}
+
 	/// Check for fault injection at current (state, event) combination
 	#[cfg(feature = "testing-fault")]
 	fn check_fault_injection(
@@ -298,7 +392,8 @@ impl<'a> DefaultExplorationEngine<'a> {
 		event: &Event,
 		rng: &mut SeededRng,
 	) -> Option<InjectedFaultRecord> {
-		// Construct lookup key with zero-allocation Cow::Borrowed for lookup
+		// One allocation for the "proc.state" lookup key; borrowed into the
+		// Cow-keyed map so the fault-injection table itself is not cloned.
 		let state_key_str = format!("{}.{}", process.name, state.0);
 		let lookup_key = (Cow::Borrowed(state_key_str.as_str()), Cow::Borrowed(event.0));
 
@@ -325,12 +420,20 @@ impl<'a> DefaultExplorationEngine<'a> {
 	}
 
 	/// Execute transition and enqueue next states
+	///
+	/// Branches violating WCET/deadline constraints are dropped from
+	/// exploration; each drop increments `timing_pruned` so the verdict
+	/// records that timing-violating paths existed.
 	fn execute_transition_helper(
 		process: &Process,
 		state: &ExplorationState,
 		action: &Action,
 		queue: &mut VecDeque<ExplorationState>,
+		timing_pruned: &mut usize,
 	) {
+		#[cfg(not(feature = "testing-timing"))]
+		let _ = &timing_pruned;
+
 		#[cfg(feature = "testing-timing")]
 		{
 			use crate::testing::fdr::subsys::timing::check_timed_transition_guard;
@@ -370,6 +473,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 								let wcet = Self::lookup_wcet(&action.event, constraints);
 								if check_event_wcet_violation(&action.event, wcet, constraints) {
 									// Prune this branch: WCET violation
+									*timing_pruned += 1;
 									continue;
 								}
 
@@ -380,11 +484,9 @@ impl<'a> DefaultExplorationEngine<'a> {
 								// Check other timing violations (deadline, path WCET) before adding to queue
 								if Self::check_timing_violations(&next_exploration, constraints) {
 									// Prune this branch: timing violation
+									*timing_pruned += 1;
 									continue;
 								}
-							} else {
-								// No timing constraints: advance clocks by zero (or skip)
-								// For now, we skip clock advancement if no timing constraints
 							}
 						}
 
@@ -417,6 +519,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 						let wcet = Self::lookup_wcet(&action.event, constraints);
 						if check_event_wcet_violation(&action.event, wcet, constraints) {
 							// Prune this branch: WCET violation
+							*timing_pruned += 1;
 							continue;
 						}
 
@@ -427,6 +530,7 @@ impl<'a> DefaultExplorationEngine<'a> {
 						// Check other timing violations (deadline, path WCET) before adding to queue
 						if Self::check_timing_violations(&next_exploration, constraints) {
 							// Prune this branch: timing violation
+							*timing_pruned += 1;
 							continue;
 						}
 					}

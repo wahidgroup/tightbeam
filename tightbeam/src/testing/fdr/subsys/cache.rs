@@ -9,13 +9,18 @@ use crate::testing::fdr::config::{Failure, Trace};
 use crate::testing::fdr::explorer::MemoizationCache;
 
 /// Default memoization cache implementation
+///
+/// Keyed on [`Process::structure_digest`] values so structurally
+/// different processes never share entries, even when algebra operators
+/// give them identical names. Each entry stores the completeness
+/// flag of the computation that produced it.
 pub struct DefaultCache {
-	/// Memoization cache: process name -> traces
-	traces_cache: RefCell<HashMap<String, Vec<Trace>>>,
-	/// Memoization cache: process name -> failures
-	failures_cache: RefCell<HashMap<String, Vec<Failure>>>,
-	/// Memoization cache: process name -> divergences
-	divergences_cache: RefCell<HashMap<String, Vec<Trace>>>,
+	/// Memoization cache: structure digest -> (traces, complete)
+	traces_cache: RefCell<HashMap<u64, (Vec<Trace>, bool)>>,
+	/// Memoization cache: structure digest -> (failures, complete)
+	failures_cache: RefCell<HashMap<u64, (Vec<Failure>, bool)>>,
+	/// Memoization cache: structure digest -> (divergences, complete)
+	divergences_cache: RefCell<HashMap<u64, (Vec<Trace>, bool)>>,
 }
 
 impl DefaultCache {
@@ -36,27 +41,27 @@ impl Default for DefaultCache {
 }
 
 impl MemoizationCache for DefaultCache {
-	fn get_cached_traces(&self, process_name: &str) -> Option<Vec<Trace>> {
-		self.traces_cache.borrow().get(process_name).cloned()
+	fn get_cached_traces(&self, structure: u64) -> Option<(Vec<Trace>, bool)> {
+		self.traces_cache.borrow().get(&structure).cloned()
 	}
 
-	fn cache_traces(&mut self, process_name: String, traces: Vec<Trace>) {
-		self.traces_cache.borrow_mut().insert(process_name, traces);
+	fn cache_traces(&mut self, structure: u64, traces: Vec<Trace>, complete: bool) {
+		self.traces_cache.borrow_mut().insert(structure, (traces, complete));
 	}
 
-	fn get_cached_failures(&self, process_name: &str) -> Option<Vec<Failure>> {
-		self.failures_cache.borrow().get(process_name).cloned()
+	fn get_cached_failures(&self, structure: u64) -> Option<(Vec<Failure>, bool)> {
+		self.failures_cache.borrow().get(&structure).cloned()
 	}
 
-	fn cache_failures(&mut self, process_name: String, failures: Vec<Failure>) {
-		self.failures_cache.borrow_mut().insert(process_name, failures);
+	fn cache_failures(&mut self, structure: u64, failures: Vec<Failure>, complete: bool) {
+		self.failures_cache.borrow_mut().insert(structure, (failures, complete));
 	}
 
-	fn get_cached_divergences(&self, process_name: &str) -> Option<Vec<Trace>> {
-		self.divergences_cache.borrow().get(process_name).cloned()
+	fn get_cached_divergences(&self, structure: u64) -> Option<(Vec<Trace>, bool)> {
+		self.divergences_cache.borrow().get(&structure).cloned()
 	}
 
-	fn cache_divergences(&mut self, process_name: String, divergences: Vec<Trace>) {
-		self.divergences_cache.borrow_mut().insert(process_name, divergences);
+	fn cache_divergences(&mut self, structure: u64, divergences: Vec<Trace>, complete: bool) {
+		self.divergences_cache.borrow_mut().insert(structure, (divergences, complete));
 	}
 }

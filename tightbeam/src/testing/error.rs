@@ -28,12 +28,14 @@ pub struct SchedulabilityViolationDetail {
 impl core::fmt::Display for SchedulabilityViolationDetail {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		write!(f, "Task '{}': {}", self.task_id, self.message)?;
+
 		if let Some(u) = self.utilization {
 			write!(f, " (utilization: {u:.3})")?;
 		}
 		if let Some(d) = self.deadline_miss {
 			write!(f, " (deadline miss: {d:?})")?;
 		}
+
 		Ok(())
 	}
 }
@@ -44,6 +46,10 @@ impl core::fmt::Display for SchedulabilityViolationDetail {
 pub enum TestingError {
 	#[cfg_attr(feature = "derive", error("Fuzz input exhausted"))]
 	FuzzInputExhausted,
+	#[cfg_attr(feature = "derive", error("Fuzz oracle deadlock in state {0}"))]
+	FuzzDeadlock(&'static str),
+	#[cfg_attr(feature = "derive", error("Fuzz oracle rejected event {0}"))]
+	FuzzEventRejected(&'static str),
 	#[cfg_attr(feature = "derive", error("Fuzz input unavailable"))]
 	FuzzInputUnavailable,
 	#[cfg_attr(feature = "derive", error("Fuzz input lock poisoned"))]
@@ -64,6 +70,8 @@ pub enum TestingError {
 
 crate::impl_error_display!(TestingError {
 	FuzzInputExhausted => "Fuzz input exhausted",
+	FuzzDeadlock(state) => "Fuzz oracle deadlock in state {state}",
+	FuzzEventRejected(event) => "Fuzz oracle rejected event {event}",
 	FuzzInputUnavailable => "Fuzz input unavailable",
 	FuzzInputLockPoisoned => "Fuzz input lock poisoned",
 	InvalidTimingConstraint => "Invalid timing constraint configuration",

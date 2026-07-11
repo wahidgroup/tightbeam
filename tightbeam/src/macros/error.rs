@@ -3,7 +3,7 @@
 /// Two entry forms:
 ///
 /// - `impl_error_display!(Type { ... })` emits only when the `derive`
-///   feature is disabled, mirroring the strings of an `Errorizable` derive.
+///   feature is disabled, following the strings of an `Errorizable` derive.
 ///   The message strings exist twice (attribute + macro), so this form is
 ///   reserved for types that need `Errorizable`'s extra codegen.
 /// - `impl_error_display!(unconditional Type { ... })` emits regardless of
@@ -18,7 +18,7 @@ macro_rules! impl_error_display {
 		$crate::impl_error_display!(@impls $error_type { $($body)* });
 	};
 
-	// Derive-mirroring entry: only when the derive feature is disabled.
+	// Derive entry: only when the derive feature is disabled.
 	($error_type:ident { $($body:tt)* }) => {
 		#[cfg(not(feature = "derive"))]
 		$crate::impl_error_display!(@impls $error_type { $($body)* });

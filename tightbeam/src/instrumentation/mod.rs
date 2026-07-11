@@ -117,6 +117,7 @@ pub mod stub {
 		pub label: Option<String>,
 		pub payload_hash: Option<[u8; 32]>,
 		pub duration_ns: Option<u64>,
+		pub timestamp_ns: Option<u64>,
 		pub flags: u32,
 		pub extras: Option<Vec<u8>>,
 	}
@@ -163,21 +164,51 @@ pub mod stub {
 #[cfg(feature = "instrument")]
 pub mod active {
 	use crate::crypto::hash::{Digest, Sha3_256};
-	use crate::der::asn1::OctetString;
-	use crate::der::{Decode, Encode, FixedTag, Sequence, Tag};
+	use crate::der::asn1::{ContextSpecific, OctetString};
+	use crate::der::{Decode, Encode, FixedTag, Sequence, Tag, TagMode, TagNumber};
 	use crate::utils::urn::Urn;
 	use crate::Beamable;
 	use crate::TightBeamError;
 
 	#[derive(Clone, Debug, PartialEq)]
 	pub struct TbEvent {
+		/// Sequence number within the trace
 		pub seq: u32,
+		/// Event kind URN
 		pub urn: Urn<'static>,
+		/// Optional event label
 		pub label: Option<String>,
+		/// Optional SHA3-256 payload hash
 		pub payload_hash: Option<[u8; 32]>,
+		/// Elapsed time of the instrumented operation (a span length)
 		pub duration_ns: Option<u64>,
+		/// Instant the event occurred, relative to the trace clock origin
+		/// (a point in time; used for deadline start/end matching)
+		pub timestamp_ns: Option<u64>,
+		/// Event flags
 		pub flags: u32,
+		/// Optional opaque extension bytes
 		pub extras: Option<Vec<u8>>,
+	}
+
+	/// Context-specific tag numbers for `TbEvent` optional fields.
+	///
+	/// Every OPTIONAL field carries an EXPLICIT context tag so adjacent
+	/// optionals of the same universal type (`duration_ns`/`timestamp_ns`,
+	/// `payload_hash`/`extras`) stay unambiguous on the wire when any subset
+	/// is absent.
+	mod tb_event_tags {
+		use crate::der::TagNumber;
+
+		pub const LABEL: TagNumber = TagNumber::N0;
+		pub const PAYLOAD_HASH: TagNumber = TagNumber::N1;
+		pub const DURATION_NS: TagNumber = TagNumber::N2;
+		pub const TIMESTAMP_NS: TagNumber = TagNumber::N3;
+		pub const EXTRAS: TagNumber = TagNumber::N4;
+	}
+
+	fn tagged<T>(tag_number: TagNumber, value: T) -> ContextSpecific<T> {
+		ContextSpecific { tag_number, tag_mode: TagMode::Explicit, value }
 	}
 
 	// Manual DER implementation: Sequence derive can't handle Urn<'static>
@@ -189,44 +220,27 @@ pub mod active {
 	impl crate::der::EncodeValue for TbEvent {
 		fn value_len(&self) -> crate::der::Result<crate::der::Length> {
 			let mut len = self.seq.encoded_len()?;
-
-			// Encode Urn directly (it implements EncodeValue)
-			len = match self.urn.encoded_len() {
-				Ok(l) => (len + l)?,
-				Err(e) => return Err(e),
-			};
+			len = (len + self.urn.encoded_len()?)?;
 
 			if let Some(ref label) = self.label {
-				len = match label.encoded_len() {
-					Ok(l) => (len + l)?,
-					Err(e) => return Err(e),
-				};
+				len = (len + tagged(tb_event_tags::LABEL, label.clone()).encoded_len()?)?;
 			}
 			if let Some(ref payload_hash) = self.payload_hash {
 				let os = OctetString::new(payload_hash.as_slice())?;
-				len = match os.encoded_len() {
-					Ok(l) => (len + l)?,
-					Err(e) => return Err(e),
-				};
+				len = (len + tagged(tb_event_tags::PAYLOAD_HASH, os).encoded_len()?)?;
 			}
 			if let Some(duration_ns) = self.duration_ns {
-				len = match duration_ns.encoded_len() {
-					Ok(l) => (len + l)?,
-					Err(e) => return Err(e),
-				};
+				len = (len + tagged(tb_event_tags::DURATION_NS, duration_ns).encoded_len()?)?;
+			}
+			if let Some(timestamp_ns) = self.timestamp_ns {
+				len = (len + tagged(tb_event_tags::TIMESTAMP_NS, timestamp_ns).encoded_len()?)?;
 			}
 
-			len = match self.flags.encoded_len() {
-				Ok(l) => (len + l)?,
-				Err(e) => return Err(e),
-			};
+			len = (len + self.flags.encoded_len()?)?;
 
 			if let Some(ref extras) = self.extras {
 				let os = OctetString::new(extras.as_slice())?;
-				len = match os.encoded_len() {
-					Ok(l) => (len + l)?,
-					Err(e) => return Err(e),
-				};
+				len = (len + tagged(tb_event_tags::EXTRAS, os).encoded_len()?)?;
 			}
 
 			Ok(len)
@@ -234,26 +248,27 @@ pub mod active {
 
 		fn encode_value(&self, encoder: &mut impl crate::der::Writer) -> crate::der::Result<()> {
 			self.seq.encode(encoder)?;
-
-			// Encode Urn directly (it implements Encode)
 			self.urn.encode(encoder)?;
 
 			if let Some(ref label) = self.label {
-				label.encode(encoder)?;
+				tagged(tb_event_tags::LABEL, label.clone()).encode(encoder)?;
 			}
 			if let Some(ref payload_hash) = self.payload_hash {
 				let os = OctetString::new(payload_hash.as_slice())?;
-				os.encode(encoder)?;
+				tagged(tb_event_tags::PAYLOAD_HASH, os).encode(encoder)?;
 			}
 			if let Some(duration_ns) = self.duration_ns {
-				duration_ns.encode(encoder)?;
+				tagged(tb_event_tags::DURATION_NS, duration_ns).encode(encoder)?;
+			}
+			if let Some(timestamp_ns) = self.timestamp_ns {
+				tagged(tb_event_tags::TIMESTAMP_NS, timestamp_ns).encode(encoder)?;
 			}
 
 			self.flags.encode(encoder)?;
 
 			if let Some(ref extras) = self.extras {
 				let os = OctetString::new(extras.as_slice())?;
-				os.encode(encoder)?;
+				tagged(tb_event_tags::EXTRAS, os).encode(encoder)?;
 			}
 
 			Ok(())
@@ -269,22 +284,30 @@ pub mod active {
 				let seq_val = u32::decode(seq)?;
 				let urn_decoded = Urn::decode(seq)?;
 				let urn: Urn<'static> = urn_decoded.into_owned();
-				let label = Option::<String>::decode(seq)?;
-				let payload_hash: Option<[u8; 32]> = Option::<OctetString>::decode(seq)?.and_then(|os| {
-					let bytes = os.as_bytes();
-					if bytes.len() == 32 {
-						let mut hash = [0u8; 32];
-						hash.copy_from_slice(bytes);
-						Some(hash)
-					} else {
-						None
-					}
-				});
 
-				let duration_ns = Option::<u64>::decode(seq)?;
+				let label = ContextSpecific::<String>::decode_explicit(seq, tb_event_tags::LABEL)?.map(|cs| cs.value);
+				let payload_hash: Option<[u8; 32]> =
+					ContextSpecific::<OctetString>::decode_explicit(seq, tb_event_tags::PAYLOAD_HASH)?.and_then(|cs| {
+						let bytes = cs.value.as_bytes();
+						if bytes.len() == 32 {
+							let mut hash = [0u8; 32];
+							hash.copy_from_slice(bytes);
+							Some(hash)
+						} else {
+							None
+						}
+					});
+
+				let duration_ns =
+					ContextSpecific::<u64>::decode_explicit(seq, tb_event_tags::DURATION_NS)?.map(|cs| cs.value);
+				let timestamp_ns =
+					ContextSpecific::<u64>::decode_explicit(seq, tb_event_tags::TIMESTAMP_NS)?.map(|cs| cs.value);
+
 				let flags = u32::decode(seq)?;
-				let extras = Option::<OctetString>::decode(seq)?.map(|os| os.as_bytes().to_vec());
-				Ok(TbEvent { seq: seq_val, urn, label, payload_hash, duration_ns, flags, extras })
+				let extras = ContextSpecific::<OctetString>::decode_explicit(seq, tb_event_tags::EXTRAS)?
+					.map(|cs| cs.value.as_bytes().to_vec());
+
+				Ok(TbEvent { seq: seq_val, urn, label, payload_hash, duration_ns, timestamp_ns, flags, extras })
 			})
 		}
 	}
@@ -354,6 +377,7 @@ pub mod active {
 				}
 				bytes.extend_from_slice(&ev.flags.to_be_bytes());
 				bytes.extend_from_slice(&ev.duration_ns.unwrap_or_default().to_be_bytes());
+				bytes.extend_from_slice(&ev.timestamp_ns.unwrap_or_default().to_be_bytes());
 				match &ev.extras {
 					Some(ex) => {
 						bytes.extend_from_slice(&(ex.len() as u32).to_be_bytes());

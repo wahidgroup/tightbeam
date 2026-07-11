@@ -13,7 +13,7 @@ pub const TRANSCRIPT_HASH_LEN: usize = 32;
 /// Convert a digest output into the fixed transcript-hash array.
 ///
 /// Digests wider than [`TRANSCRIPT_HASH_LEN`] are *deliberately* truncated to
-/// their leading 32 bytes, mirroring the NIST SHA-512/256 construction: the
+/// their leading 32 bytes, following the NIST SHA-512/256 construction: the
 /// wire format carries exactly 32 bytes and the leading bytes of a wider
 /// digest retain full 256-bit collision resistance. Digests narrower than 32
 /// bytes cannot fill the array and are rejected (CWE-1240; the previous

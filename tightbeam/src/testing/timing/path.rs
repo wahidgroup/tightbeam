@@ -239,6 +239,7 @@ mod tests {
 					label: Some(label.to_string()),
 					payload_hash: None,
 					duration_ns: Some(*duration_ns),
+					timestamp_ns: None,
 					flags: 0,
 					extras: None,
 				})

@@ -83,8 +83,7 @@ impl LoadBalancer for LeastLoaded {
 /// the single least-loaded instance.
 ///
 /// Randomness comes from per-balancer SplitMix64 state advanced atomically
-/// on every call, so selections within the same instant still draw fresh
-/// pairs. Clones share the state, mirroring [`RoundRobin`]'s shared counter.
+/// on every call, so selections within the same instant still draw fresh pairs.
 #[derive(Debug, Clone)]
 pub struct PowerOfTwoChoices {
 	rng: Arc<AtomicU64>,

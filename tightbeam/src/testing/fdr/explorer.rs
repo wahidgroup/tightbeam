@@ -44,11 +44,21 @@ pub trait ExplorationCore {
 	/// Get number of seeds completed
 	fn seeds_completed(&self) -> u32;
 
+	/// Accumulate timing-pruned branch count (for parallel aggregation)
+	fn add_timing_pruned(&mut self, _count: usize) {}
+
 	/// Add a seed result (for use when aggregating parallel results)
 	fn add_seed_result(&mut self, seed: u64, result: SeedResult);
 
 	/// Update visited states (for use when aggregating parallel results)
 	fn update_visited_states(&mut self, visited: &HashSet<State>);
+
+	/// Number of exploration branches pruned for timing violations
+	///
+	/// Timed exploration drops branches whose WCET/deadline constraints fail.
+	fn timing_pruned(&self) -> usize {
+		0
+	}
 
 	/// Compute refusal set at a given state
 	///
@@ -80,6 +90,23 @@ pub trait ExplorationCore {
 	}
 }
 
+/// Outcome of a single refinement check
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefinementOutcome<W> {
+	/// Refinement holds for everything explored. `complete` is false when
+	/// resource bounds truncated the explored set (bounded-verification
+	/// claim only).
+	Holds {
+		/// Whether the underlying trace/failure sets were computed without
+		/// hitting resource limits
+		complete: bool,
+	},
+	/// Refinement violated; witness is the offending trace/failure
+	Violated(W),
+	/// Timeout or resource limits prevented deciding the relation
+	Inconclusive,
+}
+
 /// Refinement checking algorithms
 ///
 /// Implements the three main refinement checks:
@@ -100,22 +127,31 @@ pub trait RefinementChecker {
 	const MAX_VISITED: usize = 20000;
 
 	/// Check trace refinement: traces(impl_process) ⊆ traces(spec_process)
-	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> (bool, Option<Trace>);
+	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace>;
 
 	/// Check failures refinement: failures(impl_process) ⊆ failures(spec_process)
-	fn check_failures_refinement(&mut self, spec: &Process, impl_process: &Process) -> (bool, Option<Failure>);
+	fn check_failures_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Failure>;
 
 	/// Check divergence refinement: divergences(impl_process) ⊆ divergences(spec_process)
-	fn check_divergence_refinement(&mut self, spec: &Process, impl_process: &Process) -> (bool, Option<Trace>);
+	fn check_divergence_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace>;
 
 	/// Compute all traces of a process up to max_depth
-	fn compute_traces(&mut self, process: &Process, max_depth: usize) -> HashSet<Trace>;
+	///
+	/// The `bool` is true when the trace set is complete up to `max_depth`
+	/// (no timeout or resource limit truncated the exploration).
+	fn compute_traces(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool);
 
 	/// Compute all failures of a process up to max_depth
-	fn compute_failures(&mut self, process: &Process, max_depth: usize) -> Vec<Failure>;
+	///
+	/// The `bool` is true when the failure set is complete up to
+	/// `max_depth` (no resource limit truncated the exploration).
+	fn compute_failures(&mut self, process: &Process, max_depth: usize) -> (Vec<Failure>, bool);
 
 	/// Compute all divergences of a process up to max_depth
-	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> HashSet<Trace>;
+	///
+	/// The `bool` is true when the divergence set is complete up to
+	/// `max_depth`.
+	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool);
 
 	/// Compute refusal set at a given state
 	fn compute_refusals(&self, process: &Process, state: State) -> HashSet<Event>;
@@ -125,27 +161,36 @@ pub trait RefinementChecker {
 ///
 /// Caches results of trace/failure/divergence computations to avoid
 /// redundant work when checking multiple refinements.
+///
+/// Keys are structural digests ([`Process::structure_digest`]), not
+/// process names: algebra operators (`hide`, `rename`) produce constant
+/// names for structurally different results, so name keys collide and
+/// silently serve wrong verdicts.
 pub trait MemoizationCache {
-	/// Get cached traces for a process, or None if not cached
-	fn get_cached_traces(&self, process_name: &str) -> Option<Vec<Trace>>;
+	/// Get cached traces for a process structure, or None if not cached
+	fn get_cached_traces(&self, structure: u64) -> Option<(Vec<Trace>, bool)>;
 
-	/// Cache traces for a process
-	fn cache_traces(&mut self, process_name: String, traces: Vec<Trace>);
+	/// Cache traces for a process structure
+	fn cache_traces(&mut self, structure: u64, traces: Vec<Trace>, complete: bool);
 
-	/// Get cached failures for a process, or None if not cached
-	fn get_cached_failures(&self, process_name: &str) -> Option<Vec<Failure>>;
+	/// Get cached failures for a process structure, or None if not cached
+	fn get_cached_failures(&self, structure: u64) -> Option<(Vec<Failure>, bool)>;
 
-	/// Cache failures for a process
-	fn cache_failures(&mut self, process_name: String, failures: Vec<Failure>);
+	/// Cache failures for a process structure
+	fn cache_failures(&mut self, structure: u64, failures: Vec<Failure>, complete: bool);
 
-	/// Get cached divergences for a process, or None if not cached
-	fn get_cached_divergences(&self, process_name: &str) -> Option<Vec<Trace>>;
+	/// Get cached divergences for a process structure, or None if not cached
+	fn get_cached_divergences(&self, structure: u64) -> Option<(Vec<Trace>, bool)>;
 
-	/// Cache divergences for a process
-	fn cache_divergences(&mut self, process_name: String, divergences: Vec<Trace>);
+	/// Cache divergences for a process structure
+	fn cache_divergences(&mut self, structure: u64, divergences: Vec<Trace>, complete: bool);
 }
 
 /// Result of exploring a single seed
+///
+/// With `testing-fault`, every variant carries the fault records injected
+/// during the seed so recovery statistics can attribute failures after a
+/// fault (see `FdrVerdict::error_recovery_failed`).
 #[derive(Debug, Clone)]
 pub enum SeedResult {
 	/// Exploration completed successfully
@@ -154,8 +199,14 @@ pub enum SeedResult {
 	#[cfg(not(feature = "testing-fault"))]
 	Success(Trace, Vec<Failure>),
 	/// Divergence detected (τ-loop)
+	#[cfg(feature = "testing-fault")]
+	Divergence(Trace, Vec<Event>, Vec<InjectedFaultRecord>),
+	#[cfg(not(feature = "testing-fault"))]
 	Divergence(Trace, Vec<Event>),
 	/// Deadlock detected (unexpected STOP)
+	#[cfg(feature = "testing-fault")]
+	Deadlock(Trace, State, Vec<InjectedFaultRecord>),
+	#[cfg(not(feature = "testing-fault"))]
 	Deadlock(Trace, State),
 }
 

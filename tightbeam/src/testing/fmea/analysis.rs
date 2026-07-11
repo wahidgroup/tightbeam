@@ -18,8 +18,16 @@ use std::collections::{HashSet, VecDeque};
 /// - Significantly restricts state space = Major
 /// - Minor state restriction = Minor
 pub fn calculate_severity(fault: &InjectedFaultRecord, process: &Process, scale: SeverityScale) -> u8 {
+	// Production fault records key states as "process.state". bare state names
+	// are accepted for records built directly against a process.
+	let state_name = fault
+		.csp_state
+		.strip_prefix(process.name)
+		.and_then(|rest| rest.strip_prefix('.'))
+		.unwrap_or(fault.csp_state.as_str());
+
 	// Find the state where the fault occurs
-	let fault_state = process.states.iter().find(|s| s.0 == fault.csp_state.as_str()).copied();
+	let fault_state = process.states.iter().find(|s| s.0 == state_name).copied();
 	let Some(fault_state) = fault_state else {
 		// Unknown state = medium severity (uncertain impact)
 		return scale.mid_value();
@@ -27,9 +35,10 @@ pub fn calculate_severity(fault: &InjectedFaultRecord, process: &Process, scale:
 
 	// BFS to explore reachable states from fault point
 	let mut visited = HashSet::new();
+	visited.insert(fault_state);
+
 	let mut queue = VecDeque::new();
 	queue.push_back(fault_state);
-	visited.insert(fault_state);
 
 	let mut has_deadlock = false;
 	let mut can_reach_terminal = false;
@@ -150,17 +159,11 @@ mod tests {
 		}
 	}
 
-	fn assert_severity_both_scales(
-		fault: &InjectedFaultRecord,
-		process: &Process,
-		expected_mil: u8,
-		expected_iso: u8,
-		context: &str,
-	) {
+	fn assert_severity_both_scales(fault: &InjectedFaultRecord, process: &Process, expected_mil: u8, expected_iso: u8) {
 		let severity_mil = calculate_severity(fault, process, SeverityScale::MilStd1629);
 		let severity_iso = calculate_severity(fault, process, SeverityScale::Iso26262);
-		assert_eq!(severity_mil, expected_mil, "{} (MIL-STD-1629 1-10 scale)", context);
-		assert_eq!(severity_iso, expected_iso, "{} (ISO 26262 1-4 scale)", context);
+		assert_eq!(severity_mil, expected_mil);
+		assert_eq!(severity_iso, expected_iso);
 	}
 
 	macro_rules! process_spec {
@@ -201,13 +204,7 @@ mod tests {
 			terminals: [],
 			transitions: [("Init", "start", "Blocked")]
 		);
-		assert_severity_both_scales(
-			&create_fault("Init"),
-			&process,
-			10,
-			4,
-			"Deadlock (no transitions, not terminal) is catastrophic",
-		);
+		assert_severity_both_scales(&create_fault("DeadlockProcess.Init"), &process, 10, 4);
 	}
 
 	#[test]
@@ -221,13 +218,7 @@ mod tests {
 				("Loop", "loop_back", "Loop")
 			]
 		);
-		assert_severity_both_scales(
-			&create_fault("Init"),
-			&process,
-			9,
-			4,
-			"Cannot reach terminal state is critical/catastrophic",
-		);
+		assert_severity_both_scales(&create_fault("NoTerminalProcess.Init"), &process, 9, 4);
 	}
 
 	#[test]
@@ -245,7 +236,7 @@ mod tests {
 				("D", "done", "Done")
 			]
 		);
-		assert_severity_both_scales(&create_fault("A"), &process, 7, 3, "Severe restriction (<50% states reachable)");
+		assert_severity_both_scales(&create_fault("RestrictedProcess.A"), &process, 7, 3);
 	}
 
 	#[test]
@@ -262,13 +253,7 @@ mod tests {
 				("Alt", "done", "Done")
 			]
 		);
-		assert_severity_both_scales(
-			&create_fault("A"),
-			&process,
-			5,
-			2,
-			"Moderate restriction (50-80% states reachable)",
-		);
+		assert_severity_both_scales(&create_fault("ModerateProcess.A"), &process, 5, 2);
 	}
 
 	#[test]
@@ -282,7 +267,18 @@ mod tests {
 				("S2", "event", "S1")
 			]
 		);
-		assert_severity_both_scales(&create_fault("S1"), &process, 3, 1, "Minor impact (all states reachable)");
+		assert_severity_both_scales(&create_fault("MinorProcess.S1"), &process, 3, 1);
+	}
+
+	#[test]
+	fn test_severity_bare_state_name_accepted() {
+		let process = process_spec!(
+			"BareProcess",
+			initial: "Init",
+			terminals: [],
+			transitions: [("Init", "start", "Blocked")]
+		);
+		assert_severity_both_scales(&create_fault("Init"), &process, 10, 4);
 	}
 
 	#[test]
@@ -292,7 +288,7 @@ mod tests {
 			.initial_state(State("Known"))
 			.build()?;
 
-		assert_severity_both_scales(&create_fault("UnknownState"), &process, 5, 2, "Unknown state returns mid-value");
+		assert_severity_both_scales(&create_fault("SimpleProcess.UnknownState"), &process, 5, 2);
 
 		Ok(())
 	}
@@ -309,57 +305,26 @@ mod tests {
 		];
 
 		for (bps, scale, expected) in test_cases {
-			assert_eq!(
-				convert_occurrence(bps, scale),
-				expected,
-				"Occurrence for {} bps with {:?}",
-				bps,
-				scale
-			);
+			assert_eq!(convert_occurrence(bps, scale), expected);
 		}
 	}
 
 	#[test]
 	fn test_detection_ratings() {
-		struct DetectionTestCase {
-			success: usize,
-			failed: usize,
-			scale: SeverityScale,
-			expected: u8,
-			description: &'static str,
-		}
-
+		// (recoveries successful, recoveries failed, scale, expected rating)
 		let test_cases = [
-			DetectionTestCase {
-				success: 10,
-				failed: 0,
-				scale: SeverityScale::MilStd1629,
-				expected: 1,
-				description: "All recoveries successful (easily detected)",
-			},
-			DetectionTestCase {
-				success: 0,
-				failed: 10,
-				scale: SeverityScale::MilStd1629,
-				expected: 10,
-				description: "All recoveries failed (undetectable)",
-			},
-			DetectionTestCase {
-				success: 5,
-				failed: 5,
-				scale: SeverityScale::MilStd1629,
-				expected: 5,
-				description: "50/50 recovery rate (moderate detection)",
-			},
+			(10, 0, SeverityScale::MilStd1629, 1),
+			(0, 10, SeverityScale::MilStd1629, 10),
+			(5, 5, SeverityScale::MilStd1629, 5),
 		];
 
-		for case in &test_cases {
+		for (success, failed, scale, expected) in test_cases {
 			let verdict = FdrVerdict {
-				error_recovery_successful: case.success,
-				error_recovery_failed: case.failed,
+				error_recovery_successful: success,
+				error_recovery_failed: failed,
 				..Default::default()
 			};
-			assert_eq!(calculate_detection(&verdict, case.scale), case.expected, "{}", case.description);
+			assert_eq!(calculate_detection(&verdict, scale), expected);
 		}
 	}
 }

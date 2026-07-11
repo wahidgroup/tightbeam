@@ -54,7 +54,7 @@ pub trait ResponseHandler {
 
 #[cfg(feature = "transport-policy")]
 #[derive(Debug)]
-/// Helper that mirrors a physical letter being routed through retries.
+/// Helper that represents a physical letter being routed through retries.
 pub(crate) struct Letter {
 	frame: Option<Frame>,
 }
