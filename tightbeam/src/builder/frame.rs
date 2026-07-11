@@ -801,7 +801,7 @@ mod tests {
 			.with_message(msg)
 			.with_id("test_v1_with_compression")
 			.with_order(1696521600)
-			.with_compression(ZstdCompression)
+			.with_compression(ZstdCompression::default())
 			.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 			.with_signer::<Secp256k1Signature, _>(signing_key)
 			.build()
@@ -818,7 +818,7 @@ mod tests {
 
 			// Decrypt (automatically decompresses) and verify
 			let (_, cipher) = create_test_cipher_key();
-			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression))?;
+			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
 
 			Ok(())
@@ -856,7 +856,7 @@ mod tests {
 				.with_order(1696521600)
 				.with_message_hasher::<Sha3_256>([])
 				.with_witness_hasher::<Sha3_256>()
-				.with_compression(ZstdCompression)
+				.with_compression(ZstdCompression::default())
 				.with_rng(Box::new(rng))
 				.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 				.with_signer::<Secp256k1Signature, _>(signing_key)
@@ -908,7 +908,7 @@ mod tests {
 
 			// Decrypt (automatically decompresses) and verify
 			let (_, cipher) = create_test_cipher_key();
-			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression))?;
+			let decrypted = tightbeam.decrypt::<TestMessage>(&cipher, Some(&ZstdCompression::default()))?;
 			assert_eq!(decrypted, message);
 
 			Ok(())

@@ -52,6 +52,10 @@ pub enum CompressionError {
 	#[cfg_attr(feature = "derive", from)]
 	#[cfg_attr(feature = "derive", source)]
 	IO(std::io::Error),
+
+	#[cfg(feature = "zstd")]
+	#[cfg_attr(feature = "derive", error("decompressed output exceeds the {0}-byte limit"))]
+	OutputLimitExceeded(usize),
 }
 
 #[cfg(all(feature = "compress", not(feature = "derive")))]
@@ -62,6 +66,10 @@ impl core::fmt::Display for CompressionError {
 			CompressionError::ZSTD(e) => write!(f, "ZSTD compression/decompression error: {e}"),
 			#[cfg(feature = "std")]
 			CompressionError::IO(e) => write!(f, "I/O error during compression/decompression: {e}"),
+			#[cfg(feature = "zstd")]
+			CompressionError::OutputLimitExceeded(limit) => {
+				write!(f, "decompressed output exceeds the {limit}-byte limit")
+			}
 			// Without zstd/std the enum is uninhabited; this arm is
 			// unreachable but keeps the match exhaustive for the compiler.
 			#[cfg(not(any(feature = "zstd", feature = "std")))]

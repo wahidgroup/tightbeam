@@ -591,18 +591,18 @@ mod tests {
 		let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
 		let addr = listener.local_addr()?;
 
-		let server_handle = std::thread::spawn(move || {
-			let (stream, _) = listener.accept().unwrap();
+		let server_handle = std::thread::spawn(move || -> TransportResult<(TransportResult<Vec<u8>>, Duration)> {
+			let (stream, _) = listener.accept()?;
 			let mut transport: TcpTransport<std::net::TcpStream> = TcpTransport::from(stream);
 			// Configured client validation marks the endpoint as expecting a
 			// handshake, putting the first read under the handshake clock.
 			transport.client_validators = Some(Arc::new(Vec::new()));
 			transport.handshake_timeout = Duration::from_millis(250);
 
-			let rt = tokio::runtime::Runtime::new().unwrap();
+			let rt = tokio::runtime::Runtime::new()?;
 			let started = std::time::Instant::now();
 			let result = rt.block_on(transport.read_envelope());
-			(result, started.elapsed())
+			Ok((result, started.elapsed()))
 		});
 
 		// SEQUENCE header declaring 600 content bytes, sent whole; the body
@@ -618,14 +618,15 @@ mod tests {
 			}
 		});
 
-		let (result, elapsed) = server_handle.join().unwrap();
-		drip_handle.join().unwrap();
+		// A panicked server thread surfaces as an I/O error rather than a
+		// re-panic; the closure itself only fails through `?`.
+		let (result, elapsed) = server_handle
+			.join()
+			.map_err(|_| TransportError::IoError(std::io::Error::from(std::io::ErrorKind::Other)))??;
+		drip_handle.join().ok();
 
-		assert!(result.is_err(), "dripped read must fail: {result:?}");
-		assert!(
-			elapsed < Duration::from_secs(5),
-			"read must abort near the deadline, took {elapsed:?}"
-		);
+		assert!(result.is_err());
+		assert!(elapsed < Duration::from_secs(5));
 		Ok(())
 	}
 

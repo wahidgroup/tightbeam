@@ -25,7 +25,7 @@ pub mod statistics;
 pub mod task;
 pub mod urn;
 
-pub use basis_points::BasisPoints;
+pub use basis_points::{BasisPoints, BasisPointsOutOfRange};
 
 // Re-exports
 #[cfg(feature = "hex")]
@@ -351,7 +351,7 @@ mod tests {
 			&big_repeat,
 		];
 
-		let compressor = ZstdCompression;
+		let compressor = ZstdCompression::default();
 		for &data in &cases {
 			let (compressed, _info) = compress(data, &compressor, None)?;
 			let decompressed = decompress(&compressed, &compressor)?;

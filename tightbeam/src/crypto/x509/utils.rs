@@ -284,7 +284,7 @@ mod tests {
 
 		#[test]
 		fn reads_basic_constraints() -> Result<(), Box<dyn core::error::Error>> {
-			let chain = create_test_certificate_chain();
+			let chain = create_test_certificate_chain()?;
 			let basic_constraints = certificate_extension::<BasicConstraints>(&chain.root)?
 				.ok_or(crate::testing::error::TestingError::InvariantViolated)?;
 			assert!(basic_constraints.ca);
@@ -293,7 +293,7 @@ mod tests {
 
 		#[test]
 		fn absent_returns_none() -> Result<(), Box<dyn core::error::Error>> {
-			let chain = create_test_certificate_chain();
+			let chain = create_test_certificate_chain()?;
 			assert!(certificate_extension::<BasicConstraints>(&chain.leaf)?.is_none());
 			Ok(())
 		}

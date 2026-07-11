@@ -903,13 +903,15 @@ mod tests {
 		}
 
 		#[test]
-		fn verdict_reports_absent() {
+		fn verdict_reports_absent() -> Result<()> {
 			let message = create_test_message(None);
-			let frame = compose! { V0: id: "no-fi-verdict", order: 1u64, message: message }.unwrap();
+			let frame = compose! { V0: id: "no-fi-verdict", order: 1u64, message: message }?;
 			assert!(matches!(
 				frame.frame_integrity_verdict::<Sha3_256>(),
 				Ok(IntegrityVerdict::Absent)
 			));
+
+			Ok(())
 		}
 	}
 }

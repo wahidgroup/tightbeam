@@ -811,16 +811,13 @@ mod tests {
 
 		let accepted = build_finished_with_accept(offered)?;
 		client.process_security_accept(&accepted)?;
-		assert_eq!(client.selected_profile, Some(offered), "offered profile must be accepted");
+		assert_eq!(client.selected_profile, Some(offered));
 
 		let rejected = build_finished_with_accept(unoffered)?;
-		assert!(
-			matches!(
-				client.process_security_accept(&rejected),
-				Err(crate::transport::handshake::error::HandshakeError::InvalidProfileSelection)
-			),
-			"a profile outside the client offer must be rejected"
-		);
+		assert!(matches!(
+			client.process_security_accept(&rejected),
+			Err(crate::transport::handshake::error::HandshakeError::InvalidProfileSelection)
+		));
 
 		Ok(())
 	}

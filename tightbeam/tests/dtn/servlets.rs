@@ -75,8 +75,9 @@ trait DtnNode {
 	/// Helper: Decrypt relay message
 	fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
 		if frame.metadata.confidentiality.is_some() {
+			let zstd = ZstdCompression::default();
 			let inflator: Option<&dyn Inflator> = if frame.metadata.compactness.is_some() {
-				Some(&ZstdCompression)
+				Some(&zstd)
 			} else {
 				None
 			};

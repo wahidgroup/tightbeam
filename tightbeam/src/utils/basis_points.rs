@@ -21,6 +21,18 @@
 
 use crate::der::{Decode, Encode, Reader, Writer};
 
+/// Error for values outside the 0-10000 basis-point range
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasisPointsOutOfRange;
+
+impl core::fmt::Display for BasisPointsOutOfRange {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		write!(f, "value outside the 0-10000 basis-point range")
+	}
+}
+
+impl core::error::Error for BasisPointsOutOfRange {}
+
 /// Probability in basis points (0-10000, where 10000 = 100%)
 ///
 /// Enforces valid range at compile time via const constructor.
@@ -57,12 +69,17 @@ impl BasisPoints {
 	/// Minimum value (0%)
 	pub const MIN: Self = Self(0);
 
-	/// Create a new BasisPoints value (0-10000)
+	/// Create a new BasisPoints value (0-10000) from a literal
+	///
+	/// Intended for `const` contexts and literal arguments, where an
+	/// out-of-range value fails at compile time. Runtime-valued inputs
+	/// MUST use [`TryFrom<u16>`] or [`new_saturating`](Self::new_saturating)
+	/// instead, since those cannot panic.
 	///
 	/// # Panics
 	///
-	/// Panics at compile time if value > 10000 (when used in const context).
-	/// Panics at runtime otherwise.
+	/// Panics if value > 10000: at compile time in const contexts, at
+	/// runtime otherwise.
 	///
 	/// # Examples
 	///
@@ -112,40 +129,54 @@ impl BasisPoints {
 
 	/// Create from percentage (0.0-100.0)
 	///
-	/// # Panics
+	/// # Errors
 	///
-	/// Panics if percentage is outside [0.0, 100.0] range.
+	/// Returns [`BasisPointsOutOfRange`] if percentage is NaN or outside
+	/// the [0.0, 100.0] range.
 	///
 	/// # Example
 	///
 	/// ```
-	/// use tightbeam::utils::BasisPoints;
+	/// use tightbeam::utils::{BasisPoints, BasisPointsOutOfRange};
 	///
-	/// let bps = BasisPoints::from_percentage(75.5);
+	/// # fn main() -> Result<(), BasisPointsOutOfRange> {
+	/// let bps = BasisPoints::from_percentage(75.5)?;
 	/// assert_eq!(bps.get(), 7550);
+	/// # Ok(())
+	/// # }
 	/// ```
-	pub fn from_percentage(percentage: f64) -> Self {
-		assert!((0.0..=100.0).contains(&percentage), "Percentage must be 0.0-100.0");
-		Self(round_non_negative(percentage * 100.0))
+	pub fn from_percentage(percentage: f64) -> Result<Self, BasisPointsOutOfRange> {
+		if !(0.0..=100.0).contains(&percentage) {
+			return Err(BasisPointsOutOfRange);
+		}
+
+		Ok(Self(round_non_negative(percentage * 100.0)))
 	}
 
 	/// Create from fraction (0.0-1.0)
 	///
-	/// # Panics
+	/// # Errors
 	///
-	/// Panics if fraction is outside [0.0, 1.0] range.
+	/// Returns [`BasisPointsOutOfRange`] if fraction is NaN or outside
+	/// the [0.0, 1.0] range.
 	///
 	/// # Example
 	///
 	/// ```
-	/// use tightbeam::utils::BasisPoints;
+	/// use tightbeam::utils::{BasisPoints, BasisPointsOutOfRange};
 	///
-	/// let bps = BasisPoints::from_fraction(0.75);
+	/// # fn main() -> Result<(), BasisPointsOutOfRange> {
+	/// let bps = BasisPoints::from_fraction(0.75)?;
 	/// assert_eq!(bps.get(), 7500);
+	/// # Ok(())
+	/// # }
 	/// ```
-	pub fn from_fraction(fraction: f64) -> Self {
-		assert!((0.0..=1.0).contains(&fraction), "Fraction must be 0.0-1.0");
-		Self(round_non_negative(fraction * 10000.0))
+	pub fn from_fraction(fraction: f64) -> Result<Self, BasisPointsOutOfRange> {
+		if !(0.0..=1.0).contains(&fraction) {
+			return Err(BasisPointsOutOfRange);
+		}
+
+		Ok(Self(round_non_negative(fraction * 10000.0)))
 	}
 
 	/// Create a new BasisPoints value, saturating at MAX (10000)
@@ -174,6 +205,24 @@ impl Default for BasisPoints {
 	/// Default is 0 basis points (0%)
 	fn default() -> Self {
 		Self::MIN
+	}
+}
+
+impl TryFrom<u16> for BasisPoints {
+	type Error = BasisPointsOutOfRange;
+
+	fn try_from(value: u16) -> Result<Self, Self::Error> {
+		if value > 10000 {
+			return Err(BasisPointsOutOfRange);
+		}
+
+		Ok(Self(value))
+	}
+}
+
+impl From<BasisPoints> for u16 {
+	fn from(bps: BasisPoints) -> u16 {
+		bps.get()
 	}
 }
 
@@ -244,18 +293,40 @@ mod tests {
 
 	#[test]
 	fn from_percentage() {
-		assert_eq!(BasisPoints::from_percentage(0.0).get(), 0);
-		assert_eq!(BasisPoints::from_percentage(50.0).get(), 5000);
-		assert_eq!(BasisPoints::from_percentage(100.0).get(), 10000);
-		assert_eq!(BasisPoints::from_percentage(75.5).get(), 7550);
+		assert_eq!(BasisPoints::from_percentage(0.0), Ok(BasisPoints::new(0)));
+		assert_eq!(BasisPoints::from_percentage(50.0), Ok(BasisPoints::new(5000)));
+		assert_eq!(BasisPoints::from_percentage(100.0), Ok(BasisPoints::new(10000)));
+		assert_eq!(BasisPoints::from_percentage(75.5), Ok(BasisPoints::new(7550)));
+	}
+
+	#[test]
+	fn from_percentage_rejects_out_of_range() {
+		assert_eq!(BasisPoints::from_percentage(-0.1), Err(BasisPointsOutOfRange));
+		assert_eq!(BasisPoints::from_percentage(100.1), Err(BasisPointsOutOfRange));
+		assert_eq!(BasisPoints::from_percentage(f64::NAN), Err(BasisPointsOutOfRange));
 	}
 
 	#[test]
 	fn from_fraction() {
-		assert_eq!(BasisPoints::from_fraction(0.0).get(), 0);
-		assert_eq!(BasisPoints::from_fraction(0.5).get(), 5000);
-		assert_eq!(BasisPoints::from_fraction(1.0).get(), 10000);
-		assert_eq!(BasisPoints::from_fraction(0.25).get(), 2500);
+		assert_eq!(BasisPoints::from_fraction(0.0), Ok(BasisPoints::new(0)));
+		assert_eq!(BasisPoints::from_fraction(0.5), Ok(BasisPoints::new(5000)));
+		assert_eq!(BasisPoints::from_fraction(1.0), Ok(BasisPoints::new(10000)));
+		assert_eq!(BasisPoints::from_fraction(0.25), Ok(BasisPoints::new(2500)));
+	}
+
+	#[test]
+	fn from_fraction_rejects_out_of_range() {
+		assert_eq!(BasisPoints::from_fraction(-0.1), Err(BasisPointsOutOfRange));
+		assert_eq!(BasisPoints::from_fraction(1.1), Err(BasisPointsOutOfRange));
+		assert_eq!(BasisPoints::from_fraction(f64::NAN), Err(BasisPointsOutOfRange));
+	}
+
+	#[test]
+	fn try_from_validates_range() {
+		assert_eq!(BasisPoints::try_from(0u16), Ok(BasisPoints::MIN));
+		assert_eq!(BasisPoints::try_from(5000u16), Ok(BasisPoints::new(5000)));
+		assert_eq!(BasisPoints::try_from(10000u16), Ok(BasisPoints::MAX));
+		assert_eq!(BasisPoints::try_from(10001u16), Err(BasisPointsOutOfRange));
 	}
 
 	#[test]

@@ -328,8 +328,9 @@ pub mod active {
 	impl EvidenceArtifact {
 		/// Finalize evidence artifact from events
 		///
-		/// Takes events as parameter instead of reading from global state.
-		pub fn finalize(spec_hash: [u8; 32], events: Vec<TbEvent>) -> Result<Self, TightBeamError> {
+		/// `overflow` MUST reflect whether the collector dropped events at
+		/// its `max_events` bound (see `TraceCollector::overflowed`).
+		pub fn finalize(spec_hash: [u8; 32], events: Vec<TbEvent>, overflow: bool) -> Result<Self, TightBeamError> {
 			// Canonical byte representation (stable ordering) for trace hash
 			let mut bytes = Vec::with_capacity(events.len() * 64);
 			for ev in &events {
@@ -376,13 +377,7 @@ pub mod active {
 			let evidence_hash = OctetString::new(evidence_hash_vec.as_slice())?;
 			let spec_hash_os = OctetString::new(spec_hash)?;
 
-			Ok(Self {
-				spec_hash: spec_hash_os,
-				trace_hash,
-				evidence_hash,
-				events,
-				overflow: false, // Overflow tracking moved to TraceCollector
-			})
+			Ok(Self { spec_hash: spec_hash_os, trace_hash, evidence_hash, events, overflow })
 		}
 	}
 }
@@ -391,3 +386,19 @@ pub mod active {
 pub use active::*;
 #[cfg(not(feature = "instrument"))]
 pub use stub::*;
+
+#[cfg(all(test, feature = "instrument"))]
+mod tests {
+	use super::*;
+	use crate::error::Result;
+
+	#[test]
+	fn finalize_propagates_overflow_flag() -> Result<()> {
+		let truncated = EvidenceArtifact::finalize([0u8; 32], Vec::new(), true)?;
+		let complete = EvidenceArtifact::finalize([0u8; 32], Vec::new(), false)?;
+		assert!(truncated.overflow);
+		assert!(!complete.overflow);
+
+		Ok(())
+	}
+}

@@ -6,7 +6,8 @@
 //! # Features
 //!
 //! - `tokio`: Uses tokio runtime primitives (recommended for async workloads)
-//! - `std` (without tokio): Falls back to std threads with manual polling
+//! - `std` (without tokio): Falls back to std threads, bounded sync channels,
+//!   and a parking `block_on` executor
 
 /// Runtime primitives module
 ///
@@ -111,17 +112,19 @@ pub mod rt {
 }
 
 #[cfg(all(not(feature = "tokio"), feature = "std"))]
-#[allow(unsafe_code)]
 pub mod rt {
 	use core::{
 		future::Future,
-		pin::Pin,
-		task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+		pin::pin,
+		task::{Context, Poll, Waker},
 	};
 	use std::{
 		io::{Error, ErrorKind},
 		sync::mpsc,
+		sync::Arc,
+		task::Wake,
 		thread,
+		thread::Thread,
 	};
 
 	// =========================================================================
@@ -134,16 +137,16 @@ pub mod rt {
 	/// Error returned when joining a thread fails
 	pub type JoinError = Error;
 
-	/// Multi-producer, single-consumer channel sender (std)
-	pub type Sender<T> = mpsc::Sender<T>;
+	/// Multi-producer, single-consumer bounded channel sender (std)
+	pub type Sender<T> = mpsc::SyncSender<T>;
 
-	/// Multi-producer, single-consumer channel receiver (std)
+	/// Multi-producer, single-consumer bounded channel receiver (std)
 	pub type Receiver<T> = mpsc::Receiver<T>;
 
-	/// One-shot channel sender (simulated with mpsc)
-	pub type OneshotSender<T> = mpsc::Sender<T>;
+	/// One-shot channel sender (simulated with a capacity-1 bounded mpsc)
+	pub type OneshotSender<T> = mpsc::SyncSender<T>;
 
-	/// One-shot channel receiver (simulated with mpsc)
+	/// One-shot channel receiver (simulated with a capacity-1 bounded mpsc)
 	pub type OneshotReceiver<T> = mpsc::Receiver<T>;
 
 	// =========================================================================
@@ -172,16 +175,17 @@ pub mod rt {
 	// Channels
 	// =========================================================================
 
-	/// Create an unbounded multi-producer, single-consumer channel
+	/// Create a bounded multi-producer, single-consumer channel
 	///
-	/// Note: std mpsc doesn't support bounded channels, capacity is ignored.
-	pub fn channel<T>(_capacity: usize) -> (Sender<T>, Receiver<T>) {
-		mpsc::channel()
+	/// [`send`] blocks once `capacity` messages are queued, matching the
+	/// backpressure semantics of the tokio implementation.
+	pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+		mpsc::sync_channel(capacity)
 	}
 
-	/// Create a one-shot channel (simulated with mpsc)
+	/// Create a one-shot channel (simulated with a capacity-1 bounded mpsc)
 	pub fn oneshot<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
-		mpsc::channel()
+		mpsc::sync_channel(1)
 	}
 
 	/// Send a value through a channel (blocking)
@@ -208,30 +212,34 @@ pub mod rt {
 	// Blocking
 	// =========================================================================
 
-	/// Block on a future using a minimal executor
-	pub fn block_on<F: Future>(mut future: F) -> F::Output {
-		fn raw_waker() -> RawWaker {
-			fn clone(_: *const ()) -> RawWaker {
-				raw_waker()
-			}
-			fn wake(_: *const ()) {}
-			fn wake_by_ref(_: *const ()) {}
-			fn drop(_: *const ()) {}
+	/// Waker that unparks the executor thread when the future is ready to
+	/// make progress
+	struct ThreadWaker(Thread);
 
-			static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-			RawWaker::new(core::ptr::null(), &VTABLE)
+	impl Wake for ThreadWaker {
+		fn wake(self: Arc<Self>) {
+			self.0.unpark();
 		}
 
-		let waker = unsafe { Waker::from_raw(raw_waker()) };
-		let mut cx = Context::from_waker(&waker);
+		fn wake_by_ref(self: &Arc<Self>) {
+			self.0.unpark();
+		}
+	}
 
-		// SAFETY: we never move `future` after pinning
-		let mut future = unsafe { Pin::new_unchecked(&mut future) };
+	/// Block on a future using a parking executor
+	///
+	/// The current thread parks between polls and is unparked by the waker,
+	/// so a `Pending` future consumes no CPU while it waits. Spurious
+	/// unparks only cost an extra poll.
+	pub fn block_on<F: Future>(future: F) -> F::Output {
+		let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+		let mut cx = Context::from_waker(&waker);
+		let mut future = pin!(future);
 
 		loop {
 			match future.as_mut().poll(&mut cx) {
 				Poll::Ready(result) => return result,
-				Poll::Pending => thread::yield_now(),
+				Poll::Pending => thread::park(),
 			}
 		}
 	}

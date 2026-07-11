@@ -153,3 +153,12 @@ pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 /// before inside the window. Bounds the replay surface of captured
 /// commands (CWE-294).
 pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
+
+/// Default ceiling for decompressed message bodies (16 MiB)
+///
+/// Compressed frame bodies arrive from the wire under the transport's
+/// envelope ceiling, but zstd can expand a small input by several orders
+/// of magnitude. Capping the inflated size bounds the memory an attacker
+/// can force with a decompression bomb (CWE-409). Override per inflator
+/// via `ZstdCompression::with_max_output`.
+pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;

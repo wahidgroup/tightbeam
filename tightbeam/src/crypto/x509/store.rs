@@ -576,7 +576,7 @@ mod tests {
 
 	#[test]
 	fn builder_validates_chain_structure() -> TestResult {
-		let chain = create_test_certificate_chain();
+		let chain = create_test_certificate_chain()?;
 		assert!(TestBuilder::from(Secp256k1Policy)
 			.with_chain(vec![chain.root, chain.intermediate, chain.leaf])
 			.is_ok());
@@ -600,7 +600,7 @@ mod tests {
 
 	#[test]
 	fn evaluate_chain_walking() -> TestResult {
-		let chain = create_test_certificate_chain();
+		let chain = create_test_certificate_chain()?;
 		for (store_certs, eval_target, should_succeed) in EVALUATE_CASES {
 			let store = build_store(&chain, *store_certs)?;
 			let cert = target_cert(&chain, *eval_target);
@@ -623,7 +623,7 @@ mod tests {
 			.with_certificate(create_test_certificate(&create_test_signing_key()))?
 			.build();
 
-		let other_chain = create_test_certificate_chain();
+		let other_chain = create_test_certificate_chain()?;
 		assert!(store.evaluate(&other_chain.leaf).is_err());
 		Ok(())
 	}
@@ -634,7 +634,7 @@ mod tests {
 
 	#[test]
 	fn verify_chain_cases() -> TestResult {
-		let chain = create_test_certificate_chain();
+		let chain = create_test_certificate_chain()?;
 		let cases: &[(StoreCerts, &[&Certificate], bool)] = &[
 			// Empty chain fails
 			(StoreCerts::Root, &[], false),
@@ -677,11 +677,12 @@ mod tests {
 	#[test]
 	fn verify_chain_enforces_issuer_constraints() -> TestResult {
 		for (ca, key_cert_sign, path_len, expected) in ISSUER_CONSTRAINT_CASES {
-			let chain = create_test_certificate_chain();
+			let chain = create_test_certificate_chain()?;
+
 			let mut root = chain.root.clone();
 			root.tbs_certificate.extensions = Some(ca_extensions(*ca, *key_cert_sign, *path_len));
-			let store = TestBuilder::from(Secp256k1Policy).with_certificate(root.clone())?.build();
 
+			let store = TestBuilder::from(Secp256k1Policy).with_certificate(root.clone())?.build();
 			let result = store.verify_chain(&[root, chain.intermediate, chain.leaf]);
 			assert!(matches!(result, Err(ref e) if core::mem::discriminant(e) == core::mem::discriminant(expected)));
 		}
@@ -691,7 +692,8 @@ mod tests {
 
 	#[test]
 	fn evaluate_enforces_path_len_constraint() -> TestResult {
-		let chain = create_test_certificate_chain();
+		let chain = create_test_certificate_chain()?;
+
 		let mut root = chain.root.clone();
 		root.tbs_certificate.extensions = Some(ca_extensions(true, true, Some(0)));
 
@@ -699,7 +701,6 @@ mod tests {
 			.with_certificate(root)?
 			.with_certificate(chain.intermediate)?
 			.build();
-
 		assert!(matches!(
 			store.evaluate(&chain.leaf),
 			Err(CertificateValidationError::PathLenExceeded)
@@ -713,7 +714,8 @@ mod tests {
 
 	#[test]
 	fn rejects_algorithm_identifier_mismatch() -> TestResult {
-		let chain = create_test_certificate_chain();
+		let chain = create_test_certificate_chain()?;
+
 		let mut leaf = chain.leaf.clone();
 		leaf.signature_algorithm.oid = crate::oids::SIGNER_ECDSA_WITH_SHA256;
 

@@ -25,6 +25,12 @@ crate::impl_error_display!(RouterError {
 });
 
 pub trait RouterPolicy: Send + Sync {
+	/// Route `message` to the handler registered for message type `T`
+	///
+	/// Routing keys on the caller-supplied `T` (by `TypeId`), not on the
+	/// frame contents: the frame body is never validated against `T`, so a
+	/// wrong turbofish silently delivers the frame to the wrong handler.
+	/// Callers own the pairing between decoded type and type parameter.
 	fn dispatch<T: Message + Send + 'static>(&self, message: Arc<Frame>) -> Result<()>;
 }
 
