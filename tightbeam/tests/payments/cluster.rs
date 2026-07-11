@@ -11,6 +11,5 @@ use tightbeam::transport::tcp::r#async::TokioListener;
 
 cluster! {
 	pub PaymentGatewayCluster,
-	protocol: TokioListener,
-	config: ClusterConf::default()
+	protocol: TokioListener
 }

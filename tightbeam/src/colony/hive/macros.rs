@@ -236,9 +236,34 @@ macro_rules! hive {
 
 					self.trace = trace;
 
-					// Bind control server
+					// Bind control server. With hive_tls configured the
+					// control plane is encrypted end to end: spawn/stop
+					// commands otherwise travel plaintext and are trivially
+					// observable/injectable on the network path.
 					let bind_addr = <$protocol as Protocol>::default_bind_address()?;
+
+					#[cfg(feature = "x509")]
+					let (listener, addr) = match self.config.hive_tls.as_ref() {
+						Some(hive_tls) => {
+							let cert_obj = $crate::crypto::x509::Certificate::try_from(hive_tls.certificate.clone())?;
+							let key_mgr = $crate::transport::handshake::HandshakeKeyManager::new(
+								::std::sync::Arc::clone(&hive_tls.key)
+							);
+
+							let mut encryption_config = $crate::transport::TransportEncryptionConfig::new(cert_obj, key_mgr);
+							if !hive_tls.validators.is_empty() {
+								let validators: Vec<_> = hive_tls.validators.iter().map(::std::sync::Arc::clone).collect();
+								encryption_config = encryption_config.with_client_validators(validators);
+							}
+
+							<$protocol as $crate::transport::EncryptedProtocol>::bind_with(bind_addr, encryption_config).await?
+						}
+						None => <$protocol as Protocol>::bind(bind_addr).await?,
+					};
+
+					#[cfg(not(feature = "x509"))]
 					let (listener, addr) = <$protocol as Protocol>::bind(bind_addr).await?;
+
 					self.addr = addr;
 
 					// Build spawner map from registrations (keyed by &'static str)
@@ -278,6 +303,9 @@ macro_rules! hive {
 					let trust_store = self.config.trust_store.clone();
 					let cb_threshold = self.config.circuit_breaker_threshold;
 					let cb_cooldown_ms = self.config.circuit_breaker_cooldown_ms;
+					let bp_threshold = self.config.backpressure_threshold;
+					#[cfg(feature = "x509")]
+					let freshness_window_ms = self.config.command_freshness_window_ms;
 
 					// Start control server
 					let control_server_handle = hive!(
@@ -292,7 +320,9 @@ macro_rules! hive {
 						hive_context_for_server,
 						trust_store,
 						cb_threshold,
-						cb_cooldown_ms
+						cb_cooldown_ms,
+						bp_threshold,
+						freshness_window_ms
 					);
 					self.control_server_handle = Some(control_server_handle);
 
@@ -332,19 +362,9 @@ macro_rules! hive {
 					self.servlets.drain_all().into_iter().for_each(|(_, reg)| reg.servlet.stop_boxed());
 				}
 
-				#[cfg(feature = "tokio")]
 				async fn join(mut self) -> Result<(), $crate::TightBeamError> {
 					if let Some(handle) = self.control_server_handle.take() {
 						$crate::colony::servlet::servlet_runtime::rt::join(handle).await
-							.map_err(|_| $crate::TightBeamError::JoinError)?;
-					}
-					Ok(())
-				}
-
-				#[cfg(all(not(feature = "tokio"), feature = "std"))]
-				async fn join(mut self) -> Result<(), $crate::TightBeamError> {
-					if let Some(handle) = self.control_server_handle.take() {
-						$crate::colony::servlet::servlet_runtime::rt::join(handle)
 							.map_err(|_| $crate::TightBeamError::JoinError)?;
 					}
 					Ok(())
@@ -392,14 +412,9 @@ macro_rules! hive {
 						}
 					}
 
-					let frame = {
-						use $crate::builder::TypeBuilder;
-						$crate::utils::compose($crate::Version::V0)
-							.with_id(b"hive-registration")
-							.with_order(0)
-							.with_message(request)
-							.build()?
-					};
+					#[cfg(feature = "x509")]
+					let hive_tls_for_frame = self.config.hive_tls.clone();
+					let frame = hive!(@control_frame b"hive-registration", request, hive_tls_for_frame);
 
 					let response_frame = transport.emit(frame, None).await?
 						.ok_or($crate::TightBeamError::MissingResponse)?;
@@ -474,12 +489,19 @@ macro_rules! hive {
 		$hive_context:ident,
 		$trust_store:ident,
 		$cb_threshold:ident,
-		$cb_cooldown_ms:ident
+		$cb_cooldown_ms:ident,
+		$bp_threshold:ident,
+		$freshness_window_ms:ident
 	) => {{
 		#[cfg(feature = "x509")]
 		let circuit_breaker = ::std::sync::Arc::new(
 			$crate::colony::hive::ClusterCircuitBreaker::new($cb_threshold, $cb_cooldown_ms)
 		);
+		#[cfg(feature = "x509")]
+		let replay_guard = ::std::sync::Arc::new(
+			$crate::colony::hive::ReplayGuard::new($freshness_window_ms)
+		);
+		let bp_threshold = $bp_threshold;
 
 		$crate::server! {
 			protocol $protocol: $listener,
@@ -493,6 +515,8 @@ macro_rules! hive {
 				let hive_context = ::std::sync::Arc::clone(&$hive_context);
 				#[cfg(feature = "x509")]
 				let circuit_breaker = ::std::sync::Arc::clone(&circuit_breaker);
+				#[cfg(feature = "x509")]
+				let replay_guard = ::std::sync::Arc::clone(&replay_guard);
 				#[cfg(feature = "x509")]
 				let trust_store = $trust_store.clone();
 
@@ -508,7 +532,9 @@ macro_rules! hive {
 						spawners,
 						hive_context,
 						circuit_breaker,
-						trust_store
+						replay_guard,
+						trust_store,
+						bp_threshold
 					)
 				}
 			}
@@ -529,7 +555,9 @@ macro_rules! hive {
 		$spawners:ident,
 		$hive_context:ident,
 		$circuit_breaker:ident,
-		$trust_store:ident
+		$replay_guard:ident,
+		$trust_store:ident,
+		$bp_threshold:ident
 	) => {{
 		let current_util = || $crate::utils::BasisPoints::new_saturating(
 			$utilization.load(::core::sync::atomic::Ordering::Relaxed)
@@ -555,6 +583,7 @@ macro_rules! hive {
 					let gate = $crate::colony::hive::ClusterSecurityGate::new(
 						::std::sync::Arc::clone(&$circuit_breaker),
 						::std::sync::Arc::clone(store),
+						::std::sync::Arc::clone(&$replay_guard),
 					);
 					$crate::policy::GatePolicy::evaluate(&gate, &$frame)
 				}
@@ -568,22 +597,26 @@ macro_rules! hive {
 			}
 		}
 
-		// Backpressure gate
-		let bp_gate = $crate::colony::hive::BackpressureGate::new(
-			::std::sync::Arc::clone(&$utilization),
-			$crate::utils::BasisPoints::new(9000)
-		);
-		if $crate::policy::GatePolicy::evaluate(&bp_gate, &$frame) == $crate::policy::TransitStatus::Busy {
-			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
-				$crate::policy::TransitStatus::Busy, current_util(), active_count()
-			));
+		// Backpressure gate. Authenticated heartbeats are exempted HERE,
+		// after the security gate, so health monitoring survives load
+		// without giving unauthenticated peers a priority-flag bypass.
+		if !is_heartbeat {
+			let bp_gate = $crate::colony::hive::BackpressureGate::new(
+				::std::sync::Arc::clone(&$utilization),
+				$bp_threshold
+			);
+			if $crate::policy::GatePolicy::evaluate(&bp_gate, &$frame) == $crate::policy::TransitStatus::Busy {
+				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
+					$crate::policy::TransitStatus::Busy, current_util(), active_count()
+				));
+			}
 		}
 
 		// Parse and handle command
 		if let Ok(cmd) = $crate::decode::<$crate::colony::common::ClusterCommand>(&$frame.message) {
 			if cmd.heartbeat.is_some() {
 				let util = current_util();
-				let status = if util.get() >= 9000 {
+				let status = if util.get() >= $bp_threshold.get() {
 					$crate::policy::TransitStatus::Busy
 				} else {
 					$crate::policy::TransitStatus::Accepted
@@ -709,6 +742,8 @@ macro_rules! hive {
 		let hive_context = $hive_context;
 		let hive_addr: Vec<u8> = $hive_addr.into();
 		let config = $config;
+		#[cfg(feature = "x509")]
+		let hive_tls_for_notify = config.hive_tls.clone();
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			let mut last_scale_up: std::collections::HashMap<Vec<u8>, std::time::Instant> = std::collections::HashMap::new();
@@ -716,6 +751,14 @@ macro_rules! hive {
 
 			loop {
 				hive!(@sleep config.cooldown);
+
+				// Scaling decisions are per type, but the shared utilization
+				// atomic feeds backpressure and heartbeats for the WHOLE
+				// hive, so it is stored once per cycle from the totals below
+				// -- never per type, which would leave whichever type
+				// iterated last masking every other type's load.
+				let mut hive_total_util = 0u64;
+				let mut hive_total_count = 0usize;
 
 				for (&servlet_type, spawner) in spawners.iter() {
 					let type_bytes = servlet_type.as_bytes();
@@ -727,23 +770,22 @@ macro_rules! hive {
 
 					// Collect metrics using mutable captures (FnMut allows this)
 					let mut count = 0usize;
-					let mut util_sum = 0u32;
+					let mut util_sum = 0u64;
 					{
 						let util_guard = utilization_map.lock();
 						servlets.for_each_by_type(type_bytes, |key, reg| {
 							count += 1;
 							util_sum += reg.servlet.utilization()
-								.map(|bp| bp.get() as u32)
-								.or_else(|| util_guard.as_ref().ok().and_then(|g| g.get(key).map(|&v| v as u32)))
-								.unwrap_or(5000);
+								.map(|bp| bp.get() as u64)
+								.or_else(|| util_guard.as_ref().ok().and_then(|g| g.get(key).map(|&v| v as u64)))
+								.unwrap_or($crate::constants::UNKNOWN_SERVLET_UTILIZATION_BPS as u64);
 						});
 					}
 
-					let util_bps = match count {
-						0 => $crate::utils::BasisPoints::MAX,
-						n => $crate::utils::BasisPoints::new_saturating((util_sum / n as u32) as u16),
-					};
-					utilization.store(util_bps.get(), ::core::sync::atomic::Ordering::Relaxed);
+					hive_total_util += util_sum;
+					hive_total_count += count;
+
+					let util_bps = $crate::colony::common::aggregate_utilization(util_sum, count);
 
 					let metrics = $crate::colony::common::ScalingMetrics {
 						servlet_type: type_key.clone(),
@@ -776,7 +818,8 @@ macro_rules! hive {
 									address: addr_bytes,
 								},
 								true,
-								::std::sync::Arc::clone(&config.cluster_notify_retry)
+								::std::sync::Arc::clone(&config.cluster_notify_retry),
+								hive_tls_for_notify
 							);
 
 							let registration = $crate::colony::hive::ServletRegistration {
@@ -795,7 +838,9 @@ macro_rules! hive {
 								continue;
 							}
 
-						// Find and remove oldest instance of this type
+						// Remove one instance of this type. Registry iteration
+						// order is unspecified (HashMap-backed), so the victim
+						// is arbitrary, not the oldest.
 						let Some(key) = servlets.keys()
 							.into_iter()
 							.filter(|k| k.starts_with(type_bytes))
@@ -818,7 +863,8 @@ macro_rules! hive {
 									address: addr,
 								},
 								false,
-								::std::sync::Arc::clone(&config.cluster_notify_retry)
+								::std::sync::Arc::clone(&config.cluster_notify_retry),
+								hive_tls_for_notify
 							);
 
 							last_scale_down.insert(type_key.clone(), std::time::Instant::now());
@@ -826,6 +872,9 @@ macro_rules! hive {
 						$crate::colony::common::ScalingDecision::Hold => {}
 					}
 				}
+
+				let aggregate = $crate::colony::common::aggregate_utilization(hive_total_util, hive_total_count);
+				utilization.store(aggregate.get(), ::core::sync::atomic::Ordering::Relaxed);
 			}
 		})
 	}};
@@ -869,12 +918,14 @@ macro_rules! hive {
 	// Cluster Notification
 	// ==========================================================================
 
-	(@notify_cluster $protocol:path, $cluster_addr:expr, $hive_addr:expr, $servlet_info:expr, $is_added:expr, $retry_policy:expr) => {{
+	(@notify_cluster $protocol:path, $cluster_addr:expr, $hive_addr:expr, $servlet_info:expr, $is_added:expr, $retry_policy:expr, $hive_tls:ident) => {{
 		let cluster_addr_arc = $cluster_addr;
 		let hive_id = $hive_addr;
 		let servlet_info = $servlet_info;
 		let is_added = $is_added;
 		let retry_policy = $retry_policy;
+		#[cfg(feature = "x509")]
+		let hive_tls = $hive_tls.clone();
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			use $crate::transport::policy::CoreRetryPolicy;
@@ -901,14 +952,10 @@ macro_rules! hive {
 				}
 			};
 
-			let Ok(frame) = (|| -> Result<$crate::Frame, $crate::TightBeamError> {
-				use $crate::builder::TypeBuilder;
-				$crate::utils::compose($crate::Version::V0)
-					.with_id(b"scaling-update")
-					.with_order(0)
-					.with_message(update)
-					.build()
-			})() else { return };
+			let frame_result: Result<$crate::Frame, $crate::TightBeamError> = async {
+				Ok(hive!(@control_frame b"scaling-update", update, hive_tls))
+			}.await;
+			let Ok(frame) = frame_result else { return };
 
 			let max_attempts = retry_policy.max_attempts();
 			for attempt in 0..=max_attempts {
@@ -939,38 +986,55 @@ macro_rules! hive {
 		}
 	}};
 
-	// Sleep helper - abstracts tokio/std sleep
+	// Sleep helper (colony requires tokio)
 	(@sleep $duration:expr) => {{
-		#[cfg(feature = "tokio")]
 		tokio::time::sleep($duration).await;
-		#[cfg(all(not(feature = "tokio"), feature = "std"))]
-		std::thread::sleep($duration);
 	}};
 
 	// ==========================================================================
-	// Response Helpers
+	// Frame Helpers
 	// ==========================================================================
 
-	(@reply $frame:ident, $message:expr) => {{
+	// Hive -> cluster control-plane frame (registration, scaling updates).
+	// Signed with the hive identity when hive_tls is configured: clusters
+	// enforcing hive trust reject unsigned registrations/updates.
+	(@control_frame $id:expr, $message:expr, $hive_tls:ident) => {{
 		use $crate::builder::TypeBuilder;
-		Ok(Some(
-			$crate::utils::compose($crate::Version::V0)
-				.with_id($frame.metadata.id.clone())
+
+		#[cfg(feature = "x509")]
+		let frame = match $hive_tls.as_ref() {
+			Some(hive_tls) => {
+				let unsigned = $crate::utils::compose($crate::Version::V0)
+					.with_id($id)
+					.with_order(0)
+					.with_message($message)
+					.build()?;
+				unsigned
+					.sign_with_provider::<$crate::crypto::hash::Sha3_256, _>(hive_tls.key.as_ref())
+					.await?
+			}
+			None => $crate::utils::compose($crate::Version::V0)
+				.with_id($id)
 				.with_order(0)
 				.with_message($message)
-				.build()?
-		))
+				.build()?,
+		};
+
+		#[cfg(not(feature = "x509"))]
+		let frame = $crate::utils::compose($crate::Version::V0)
+			.with_id($id)
+			.with_order(0)
+			.with_message($message)
+			.build()?;
+
+		frame
 	}};
 
-	(@reply_priority $frame:ident, $priority:expr, $message:expr) => {{
-		use $crate::builder::TypeBuilder;
-		Ok(Some(
-			$crate::utils::compose($crate::Version::V0)
-				.with_id($frame.metadata.id.clone())
-				.with_order(0)
-				.with_priority($priority)
-				.with_message($message)
-				.build()?
-		))
-	}};
+	(@reply $frame:ident, $message:expr) => {
+		$crate::colony::common::reply_frame($frame.metadata.id.clone(), $message)
+	};
+
+	(@reply_priority $frame:ident, $priority:expr, $message:expr) => {
+		$crate::colony::common::reply_frame_with_priority($frame.metadata.id.clone(), $priority, $message)
+	};
 }

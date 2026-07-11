@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::constants::LCG_MULTIPLIER;
+use crate::constants::{SPLITMIX64_GAMMA, SPLITMIX64_MIX_1, SPLITMIX64_MIX_2};
 use crate::utils::BasisPoints;
 
 pub use messages::*;
@@ -76,13 +76,45 @@ impl LoadBalancer for LeastLoaded {
 
 /// Power of Two Choices (P2C) load balancer
 ///
-/// Picks two random candidates and selects the one with lower utilization.
-/// Better than pure least-loaded under high concurrency as it avoids
-/// thundering herd while still achieving good balance.
+/// Picks two distinct uniformly-random candidates per call and selects the
+/// one with lower utilization (Mitzenmacher, "The Power of Two Choices in
+/// Randomized Load Balancing", IEEE TPDS 12(10), 2001). The random probe
+/// pair spreads concurrent routers across the pool instead of converging on
+/// the single least-loaded instance.
 ///
-/// Used by Envoy, gRPC, and other modern load balancers.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PowerOfTwoChoices;
+/// Randomness comes from per-balancer SplitMix64 state advanced atomically
+/// on every call, so selections within the same instant still draw fresh
+/// pairs. Clones share the state, mirroring [`RoundRobin`]'s shared counter.
+#[derive(Debug, Clone)]
+pub struct PowerOfTwoChoices {
+	rng: Arc<AtomicU64>,
+}
+
+/// Gamma-stepped sequence so each balancer starts on a distinct SplitMix64
+/// stream even when constructed within the same millisecond.
+static P2C_SEED_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+impl Default for PowerOfTwoChoices {
+	fn default() -> Self {
+		let sequence = P2C_SEED_SEQUENCE.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed);
+		Self { rng: Arc::new(AtomicU64::new(sequence ^ current_timestamp_ms())) }
+	}
+}
+
+/// Advance SplitMix64 state atomically and return the mixed output
+///
+/// Reference implementation: Vigna, `splitmix64.c` (2015); see
+/// [`SPLITMIX64_GAMMA`]. The single `fetch_add` claims a unique state value
+/// per call, so concurrent callers never observe the same draw.
+fn splitmix64_next(state: &AtomicU64) -> u64 {
+	let mut z = state
+		.fetch_add(SPLITMIX64_GAMMA, Ordering::Relaxed)
+		.wrapping_add(SPLITMIX64_GAMMA);
+
+	z = (z ^ (z >> 30)).wrapping_mul(SPLITMIX64_MIX_1);
+	z = (z ^ (z >> 27)).wrapping_mul(SPLITMIX64_MIX_2);
+	z ^ (z >> 31)
+}
 
 impl LoadBalancer for PowerOfTwoChoices {
 	fn select(&self, candidates: &[InstanceMetrics]) -> Option<usize> {
@@ -90,7 +122,7 @@ impl LoadBalancer for PowerOfTwoChoices {
 			0 => None,
 			1 => Some(0),
 			2 => {
-				// Exactly 2: pick least loaded
+				// Exactly 2: probing "two random" is probing both
 				if candidates[0].utilization <= candidates[1].utilization {
 					Some(0)
 				} else {
@@ -98,22 +130,18 @@ impl LoadBalancer for PowerOfTwoChoices {
 				}
 			}
 			n => {
-				// Pick 2 random indices using simple LCG for no_std compatibility
-				let seed = current_timestamp_ms();
-				let i1 = (seed as usize) % n;
-				let i2 = ((seed.wrapping_mul(LCG_MULTIPLIER).wrapping_add(1)) as usize) % n;
-				// Ensure different indices
-				let i2 = if i1 == i2 {
-					(i2 + 1) % n
-				} else {
-					i2
-				};
+				// One draw yields 64 bits; the halves index a uniformly
+				// distinct pair: second is drawn from [0, n-1) and shifted
+				// past first, so (first, second) covers all ordered pairs.
+				let draw = splitmix64_next(&self.rng);
+				let first = ((draw >> 32) as usize) % n;
+				let offset = ((draw & u64::from(u32::MAX)) as usize) % (n - 1);
+				let second = offset + usize::from(offset >= first);
 
-				// Select least loaded of the two
-				if candidates[i1].utilization <= candidates[i2].utilization {
-					Some(i1)
+				if candidates[first].utilization <= candidates[second].utilization {
+					Some(first)
 				} else {
-					Some(i2)
+					Some(second)
 				}
 			}
 		}
@@ -175,7 +203,7 @@ impl ScoringPolicy for PheromoneScoring {
 	fn score(&self, pheromone: u64, _utilization: BasisPoints) -> BasisPoints {
 		// Invert: MAX - pheromone so LeastLoaded picks highest pheromone
 		let inverted = 10000u64.saturating_sub(pheromone);
-		BasisPoints::new(inverted as u16)
+		BasisPoints::new_saturating(inverted as u16)
 	}
 }
 
@@ -217,7 +245,7 @@ impl ScoringPolicy for CombinedScoring {
 
 		// Weighted average
 		let combined = (pheromone_score * pw + util_score * uw) / 10000;
-		BasisPoints::new(combined as u16)
+		BasisPoints::new_saturating(combined as u16)
 	}
 }
 
@@ -263,7 +291,9 @@ impl MessageRouter for TypeBasedRouter {
 // ============================================================================
 
 /// Get current timestamp in milliseconds since UNIX epoch
-#[cfg(feature = "std")]
+///
+/// Always backed by the system clock: `colony` implies `std`, so no
+/// fallback stub exists.
 pub fn current_timestamp_ms() -> u64 {
 	std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -271,10 +301,151 @@ pub fn current_timestamp_ms() -> u64 {
 		.unwrap_or(0)
 }
 
-/// Timestamp stub for no_std environments
+// ============================================================================
+// Utilization Aggregation
+// ============================================================================
+
+/// Mean utilization across all servlet instances of a hive
 ///
-/// Embedded systems should provide their own time source.
-#[cfg(not(feature = "std"))]
-pub fn current_timestamp_ms() -> u64 {
-	0 // Embedded systems need external time source
+/// `total_utilization` is the sum of per-instance basis points and
+/// `instance_count` the number of instances summed. A hive with zero
+/// instances reports [`BasisPoints::MAX`]: it cannot absorb work, so
+/// backpressure and heartbeats must signal saturation (per-type scaling
+/// still sees the zero count and spawns).
+pub fn aggregate_utilization(total_utilization: u64, instance_count: usize) -> BasisPoints {
+	match instance_count {
+		0 => BasisPoints::MAX,
+		n => BasisPoints::new_saturating((total_utilization / n as u64) as u16),
+	}
+}
+
+// ============================================================================
+// Control-Plane Reply Frames
+// ============================================================================
+
+/// Build a V0 response frame echoing a request id
+///
+/// Single implementation behind the `hive!` and `cluster!` `@reply`
+/// macro arms.
+pub fn reply_frame<M: crate::Message>(
+	id: impl AsRef<[u8]>,
+	message: M,
+) -> Result<Option<crate::Frame>, crate::TightBeamError> {
+	use crate::builder::TypeBuilder;
+
+	let frame = crate::utils::compose(crate::Version::V0)
+		.with_id(id)
+		.with_order(0)
+		.with_message(message)
+		.build()?;
+
+	Ok(Some(frame))
+}
+
+/// Build a V0 response frame with an explicit priority
+///
+/// Used for heartbeat replies, which carry `NetworkControl` priority so
+/// monitoring stays distinguishable from work traffic.
+pub fn reply_frame_with_priority<M: crate::Message>(
+	id: impl AsRef<[u8]>,
+	priority: crate::MessagePriority,
+	message: M,
+) -> Result<Option<crate::Frame>, crate::TightBeamError> {
+	use crate::builder::TypeBuilder;
+
+	let frame = crate::utils::compose(crate::Version::V0)
+		.with_id(id)
+		.with_order(0)
+		.with_priority(priority)
+		.with_message(message)
+		.build()?;
+
+	Ok(Some(frame))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashSet;
+
+	use super::{InstanceMetrics, LoadBalancer, PowerOfTwoChoices};
+	use crate::utils::BasisPoints;
+
+	fn candidates(count: usize) -> Vec<InstanceMetrics> {
+		(0..count)
+			.map(|index| InstanceMetrics {
+				servlet_id: vec![index as u8],
+				utilization: BasisPoints::new(5000),
+				active_requests: 0,
+			})
+			.collect()
+	}
+
+	#[test]
+	fn p2c_returns_none_for_empty_pool() {
+		let balancer = PowerOfTwoChoices::default();
+		assert_eq!(balancer.select(&[]), None);
+	}
+
+	#[test]
+	fn p2c_returns_sole_candidate() {
+		let balancer = PowerOfTwoChoices::default();
+		assert_eq!(balancer.select(&candidates(1)), Some(0));
+	}
+
+	#[test]
+	fn p2c_picks_least_loaded_of_two() {
+		let balancer = PowerOfTwoChoices::default();
+		let mut pool = candidates(2);
+		pool[1].utilization = BasisPoints::new(100);
+
+		assert_eq!(balancer.select(&pool), Some(1));
+	}
+
+	#[test]
+	fn p2c_covers_all_indices_under_uniform_load() {
+		let balancer = PowerOfTwoChoices::default();
+		let pool = candidates(8);
+
+		let seen: HashSet<usize> = (0..4096).filter_map(|_| balancer.select(&pool)).collect();
+		assert_eq!(seen.len(), pool.len());
+	}
+
+	#[test]
+	fn p2c_escapes_loaded_leading_pair() {
+		let balancer = PowerOfTwoChoices::default();
+		let mut pool = candidates(4);
+		pool[0].utilization = BasisPoints::MAX;
+		pool[1].utilization = BasisPoints::MAX;
+
+		let seen: HashSet<usize> = (0..4096).filter_map(|_| balancer.select(&pool)).collect();
+		assert!(seen.contains(&2));
+		assert!(seen.contains(&3));
+	}
+
+	#[test]
+	fn p2c_balancers_draw_distinct_streams() {
+		let first = PowerOfTwoChoices::default();
+		let second = PowerOfTwoChoices::default();
+		let pool = candidates(64);
+
+		let first_picks: Vec<Option<usize>> = (0..16).map(|_| first.select(&pool)).collect();
+		let second_picks: Vec<Option<usize>> = (0..16).map(|_| second.select(&pool)).collect();
+		assert_ne!(first_picks, second_picks);
+	}
+
+	/// Cases: (total_utilization, instance_count, expected_bps)
+	const AGGREGATE_CASES: &[(u64, usize, u16)] = &[
+		(0, 0, 10000),     // no instances -> saturated, route elsewhere
+		(0, 4, 0),         // all idle
+		(20000, 4, 5000),  // uniform mean
+		(10000, 2, 5000),  // one loaded type + one idle type
+		(40000, 4, 10000), // fully loaded
+	];
+
+	#[test]
+	fn aggregate_utilization_means_across_all_instances() {
+		for &(total, count, expected) in AGGREGATE_CASES {
+			assert_eq!(super::aggregate_utilization(total, count).get(), expected);
+		}
+	}
 }

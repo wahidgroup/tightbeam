@@ -7,7 +7,6 @@ use std::sync::Arc;
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::policy::GatePolicy;
 use crate::transport::client::pool::PoolConfig;
-use crate::transport::policy::{RestartExponentialBackoff, RestartPolicy};
 
 use super::{
 	ClusterConf, ClusterTlsConfig, HeartbeatCallback, HeartbeatConf, PheromoneConf, DEFAULT_HEARTBEAT_INTERVAL_SECS,
@@ -24,7 +23,6 @@ use crate::colony::hive::LoadBalancer;
 pub struct HeartbeatConfBuilder {
 	interval: Duration,
 	timeout: Duration,
-	retry_policy: Option<Arc<dyn RestartPolicy + Send + Sync>>,
 	max_concurrent: usize,
 	max_failures: u32,
 	on_heartbeat: Option<HeartbeatCallback>,
@@ -35,7 +33,6 @@ impl Default for HeartbeatConfBuilder {
 		Self {
 			interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
 			timeout: Duration::from_secs(DEFAULT_HEARTBEAT_TIMEOUT_SECS),
-			retry_policy: None,
 			max_concurrent: DEFAULT_MAX_CONCURRENT,
 			max_failures: DEFAULT_MAX_FAILURES,
 			on_heartbeat: None,
@@ -81,18 +78,11 @@ impl HeartbeatConfBuilder {
 		self
 	}
 
-	/// Set the retry policy for heartbeat requests
-	pub fn with_retry_policy(mut self, policy: Arc<dyn RestartPolicy + Send + Sync>) -> Self {
-		self.retry_policy = Some(policy);
-		self
-	}
-
 	/// Build the HeartbeatConf
 	pub fn build(self) -> HeartbeatConf {
 		HeartbeatConf {
 			interval: self.interval,
 			timeout: self.timeout,
-			retry_policy: self.retry_policy,
 			max_concurrent: self.max_concurrent,
 			max_failures: self.max_failures,
 			on_heartbeat: self.on_heartbeat,
@@ -112,7 +102,6 @@ pub struct ClusterConfBuilder<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_25
 	pheromone: PheromoneConf,
 	policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pool_config: PoolConfig,
-	retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
 	tls: ClusterTlsConfig,
 	_digest: PhantomData<D>,
 }
@@ -127,7 +116,6 @@ impl ClusterConf {
 			pheromone: PheromoneConf::default(),
 			policies: Vec::new(),
 			pool_config: PoolConfig::default(),
-			retry_policy: Arc::new(RestartExponentialBackoff::default()),
 			tls,
 			_digest: PhantomData,
 		}
@@ -156,7 +144,6 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 			pheromone: self.pheromone,
 			policies: self.policies,
 			pool_config: self.pool_config,
-			retry_policy: self.retry_policy,
 			tls: self.tls,
 			_digest: PhantomData,
 		}
@@ -174,12 +161,6 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 		self
 	}
 
-	/// Set the retry policy
-	pub fn with_retry_policy(mut self, policy: Arc<dyn RestartPolicy + Send + Sync>) -> Self {
-		self.retry_policy = policy;
-		self
-	}
-
 	/// Build the ClusterConf
 	pub fn build(self) -> ClusterConf<L, D> {
 		ClusterConf {
@@ -188,7 +169,6 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 			pheromone: self.pheromone,
 			policies: self.policies,
 			pool_config: self.pool_config,
-			retry_policy: self.retry_policy,
 			tls: self.tls,
 			_digest: PhantomData,
 		}

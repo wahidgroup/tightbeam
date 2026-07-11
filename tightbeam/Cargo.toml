@@ -135,7 +135,20 @@ transport-multiplex = ["transport"]
 unstable-pqxdh = []
 tcp = ["transport", "std", "transport-ecies"]
 async-transport = ["transport", "std", "transport-ecies"]
-colony = ["full"]
+colony = [
+	"std",
+	"tokio",
+	"builder",
+	"policy",
+	"router",
+	"derive",
+	"transport",
+	"x509",
+	"signature",
+	"digest",
+	"sha3",
+	"testing",
+]
 testing = ["std", "transport"]
 testing-csp = ["testing"]
 testing-fdr = ["testing", "testing-csp"]

@@ -181,8 +181,9 @@ impl HiveRegistry {
 
 	/// Evict stale hives that haven't sent heartbeat within timeout
 	///
-	/// Returns the number of hives evicted.
-	pub fn evict_stale(&self) -> Result<usize, ClusterError> {
+	/// Returns the evicted entries so callers can retire dependent state
+	/// (e.g. servlet registry rows) for each evicted hive.
+	pub fn evict_stale(&self) -> Result<Vec<HiveEntry>, ClusterError> {
 		let now = Instant::now();
 		let stale_ids: Vec<SharedId> = {
 			let hives = self.hives.read()?;
@@ -193,12 +194,14 @@ impl HiveRegistry {
 				.collect()
 		};
 
-		let count = stale_ids.len();
+		let mut evicted = Vec::with_capacity(stale_ids.len());
 		for id in &stale_ids {
-			self.unregister(id)?;
+			if let Some(entry) = self.unregister(id)? {
+				evicted.push(entry);
+			}
 		}
 
-		Ok(count)
+		Ok(evicted)
 	}
 
 	/// List all available servlet types across all registered hives
@@ -228,5 +231,48 @@ impl HiveRegistry {
 impl Default for HiveRegistry {
 	fn default() -> Self {
 		Self::new(Duration::from_secs(15))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::colony::hive::ServletInfo;
+
+	fn request(addr: &[u8], servlets: &[&[u8]]) -> RegisterHiveRequest {
+		RegisterHiveRequest {
+			hive_addr: addr.to_vec(),
+			metadata: None,
+			servlet_addresses: servlets
+				.iter()
+				.map(|s| ServletInfo { servlet_id: s.to_vec(), address: addr.to_vec() })
+				.collect(),
+		}
+	}
+
+	#[test]
+	fn evict_stale_returns_evicted_entries() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::new(Duration::ZERO);
+		registry.register(request(b"hive1", &[b"ping"]))?;
+		std::thread::sleep(Duration::from_millis(1));
+
+		let evicted = registry.evict_stale()?;
+		assert_eq!(evicted.len(), 1);
+		assert_eq!(evicted[0].address.as_ref(), b"hive1");
+		assert_eq!(registry.len()?, 0);
+
+		Ok(())
+	}
+
+	#[test]
+	fn evict_stale_keeps_fresh_hives() -> Result<(), ClusterError> {
+		let registry = HiveRegistry::new(Duration::from_secs(3600));
+		registry.register(request(b"hive1", &[b"ping"]))?;
+
+		let evicted = registry.evict_stale()?;
+		assert!(evicted.is_empty());
+		assert_eq!(registry.len()?, 1);
+
+		Ok(())
 	}
 }

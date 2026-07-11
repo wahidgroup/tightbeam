@@ -282,10 +282,15 @@ pub enum ClusterStatus {
 ///
 /// **Security**: Requires nonrepudiation signature and frame integrity.
 /// Frames without proper authentication will be rejected and may trigger
-/// the circuit breaker.
+/// the circuit breaker. `issued_at_ms` binds the signature to a point in
+/// time: hives reject commands outside their freshness window and replays
+/// of already-seen signatures within it (CWE-294).
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 #[beam(frame_integrity)]
 pub struct ClusterCommand {
+	/// Issue time in milliseconds since UNIX epoch (freshness binding)
+	pub issued_at_ms: u64,
+
 	/// Heartbeat request [context 0]
 	#[asn1(context_specific = "0", optional = "true")]
 	pub heartbeat: Option<HeartbeatParams>,

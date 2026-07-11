@@ -35,13 +35,13 @@ use tightbeam::{
 		},
 	},
 	decode, encode, exactly, hive,
-	policy::TransitStatus,
+	policy::{GatePolicy, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	utils::compose as frame_compose,
-	Beamable, TightBeamError, Version,
+	Beamable, Frame, TightBeamError, Version,
 };
 
 use crate::common::x509::create_test_cert_with_key;
@@ -155,8 +155,7 @@ hive! {
 
 cluster! {
 	ClusterGateway,
-	protocol: TokioListener,
-	config: ClusterConf::default()
+	protocol: TokioListener
 }
 
 // ============================================================================
@@ -240,6 +239,142 @@ tb_scenario! {
 			}
 
 			// Cleanup
+			hive.stop();
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Gate Policy Enforcement (B-50)
+// ============================================================================
+
+struct RejectAllPolicy;
+
+impl GatePolicy for RejectAllPolicy {
+	fn evaluate(&self, _message: &Frame) -> TransitStatus {
+		TransitStatus::Forbidden
+	}
+}
+
+tb_assert_spec! {
+	pub ClusterPolicySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("work_sent", exactly!(1)),
+			("policy_blocked", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: cluster_policy_gate_blocks,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ClusterPolicySpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let certs = get_cluster_test_certs();
+
+			let cluster_conf = ClusterConf::builder(cluster_tls_config(certs))
+				.with_gate_policy(Arc::new(RejectAllPolicy))
+				.build();
+			let cluster = ClusterGateway::start(Arc::new(TraceCollector::new()), cluster_conf).await?;
+			let cluster_addr = cluster.addr();
+
+			let work_request = ClusterWorkRequest {
+				servlet_type: b"ping".to_vec(),
+				payload: encode(&PingRequest { value: 21 })?,
+			};
+
+			let frame = frame_compose(Version::V0)
+				.with_id(b"policy-test")
+				.with_order(0)
+				.with_message(work_request)
+				.build()?;
+
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_trust_store(Arc::clone(&certs.trust))
+				.build();
+			let mut client = builder.connect(cluster_addr).await?;
+
+			trace.event("work_sent")?;
+
+			let response_frame = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
+			assert_eq!(
+				work_response.status,
+				TransitStatus::Forbidden,
+				"gate policy must reject the request before decoding"
+			);
+			assert!(work_response.payload.is_none(), "rejected request must not carry a payload");
+			trace.event("policy_blocked")?;
+
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Unsigned Registration Rejection (B-49)
+// ============================================================================
+
+tb_assert_spec! {
+	pub ClusterUnsignedRegistrationSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("registration_sent", exactly!(1)),
+			("registration_unauthorized", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: cluster_rejects_unsigned_registration,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ClusterUnsignedRegistrationSpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let certs = get_cluster_test_certs();
+
+			// Cluster requires signed hive-origin frames (hive_trust set)
+			let cluster_conf = ClusterConf::new(cluster_tls_config(certs));
+			let cluster = ClusterGateway::start(Arc::new(TraceCollector::new()), cluster_conf).await?;
+			let cluster_addr = cluster.addr();
+
+			// Hive validates the cluster's TLS certificate but has no
+			// signing identity of its own: control frames go out unsigned
+			let hive_conf = HiveConf {
+				trust_store: Some(Arc::clone(&certs.trust)),
+				..Default::default()
+			};
+			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
+			hive.establish(Arc::new(TraceCollector::new())).await?;
+
+			trace.event("registration_sent")?;
+
+			let response = hive.register_with_cluster(cluster_addr).await?;
+
+			assert_eq!(
+				response.status,
+				TransitStatus::Unauthorized,
+				"unsigned registration must be rejected when hive_trust is configured"
+			);
+			assert!(response.hive_id.is_none(), "rejected registration must not assign a hive id");
+			assert_eq!(cluster.hive_count(), 0, "rejected hive must not enter the registry");
+			trace.event("registration_unauthorized")?;
+
 			hive.stop();
 			cluster.stop();
 

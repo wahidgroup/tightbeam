@@ -713,9 +713,8 @@ macro_rules! test_worker {
 				$assertions_body.await
 			};
 
-			// Worker will be dropped automatically at end of test
-			// Explicitly killing causes nested runtime issues when called from async tests
-			drop(worker);
+			// Graceful shutdown: close the queue and await run-loop exit
+			worker.kill().await?;
 
 			result
 		}

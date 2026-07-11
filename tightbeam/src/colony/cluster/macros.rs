@@ -2,21 +2,22 @@
 
 /// Macro for creating clusters with pre-configured settings
 ///
+/// The runtime configuration is supplied to `Cluster::start`, not to the
+/// macro.
+///
 /// # Syntax
 ///
 /// ```ignore
 /// cluster! {
 ///     pub MyCluster,
-///     protocol: TokioListener,
-///     config: ClusterConf::default()
+///     protocol: TokioListener
 /// }
 ///
 /// // With custom digest:
 /// cluster! {
 ///     pub MyCluster,
 ///     protocol: TokioListener,
-///     digest: Blake3,
-///     config: ClusterConf::default()
+///     digest: Blake3
 /// }
 /// ```
 #[macro_export]
@@ -26,20 +27,18 @@ macro_rules! cluster {
 		$(#[$meta:meta])*
 		pub $cluster_name:ident,
 		protocol: $protocol:path,
-		digest: $digest:path,
-		config: $config:expr
+		digest: $digest:path
 	) => {
-		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $digest, pub, [$(#[$meta])*]);
+		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $digest, [pub], [$(#[$meta])*]);
 	};
 
 	// Public with default digest (Sha3_256)
 	(
 		$(#[$meta:meta])*
 		pub $cluster_name:ident,
-		protocol: $protocol:path,
-		config: $config:expr
+		protocol: $protocol:path
 	) => {
-		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $crate::crypto::hash::Sha3_256, pub, [$(#[$meta])*]);
+		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $crate::crypto::hash::Sha3_256, [pub], [$(#[$meta])*]);
 	};
 
 	// Private with custom digest
@@ -47,45 +46,24 @@ macro_rules! cluster {
 		$(#[$meta:meta])*
 		$cluster_name:ident,
 		protocol: $protocol:path,
-		digest: $digest:path,
-		config: $config:expr
+		digest: $digest:path
 	) => {
-		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $digest, , [$(#[$meta])*]);
+		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $digest, [], [$(#[$meta])*]);
 	};
 
 	// Private with default digest (Sha3_256)
 	(
 		$(#[$meta:meta])*
 		$cluster_name:ident,
-		protocol: $protocol:path,
-		config: $config:expr
+		protocol: $protocol:path
 	) => {
-		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $crate::crypto::hash::Sha3_256, , [$(#[$meta])*]);
+		$crate::cluster!(@impl_cluster $cluster_name, $protocol, $crate::crypto::hash::Sha3_256, [], [$(#[$meta])*]);
 	};
 
-	// Generate cluster struct (public)
-	(@impl_cluster $cluster_name:ident, $protocol:path, $digest:path, pub, [$(#[$meta:meta])*]) => {
+	// Generate cluster struct
+	(@impl_cluster $cluster_name:ident, $protocol:path, $digest:path, [$($vis:tt)*], [$(#[$meta:meta])*]) => {
 		$(#[$meta])*
-		pub struct $cluster_name {
-			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
-			servlet_registry: ::std::sync::Arc<$crate::colony::cluster::ServletRegistry>,
-			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
-			pool: ::std::sync::Arc<$crate::transport::client::pool::ConnectionPool<$protocol>>,
-			server_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
-			heartbeat_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
-			evaporation_handle: Option<$crate::colony::servlet::servlet_runtime::rt::JoinHandle>,
-			addr: <$protocol as $crate::transport::Protocol>::Address,
-			trace: ::std::sync::Arc<$crate::trace::TraceCollector>,
-		}
-
-		$crate::cluster!(@impl_cluster_trait $cluster_name, $protocol, $digest);
-		$crate::cluster!(@impl_drop $cluster_name);
-	};
-
-	// Generate cluster struct (private)
-	(@impl_cluster $cluster_name:ident, $protocol:path, $digest:path, , [$(#[$meta:meta])*]) => {
-		$(#[$meta])*
-		struct $cluster_name {
+		$($vis)* struct $cluster_name {
 			registry: ::std::sync::Arc<$crate::colony::cluster::HiveRegistry>,
 			servlet_registry: ::std::sync::Arc<$crate::colony::cluster::ServletRegistry>,
 			config: ::std::sync::Arc<$crate::colony::cluster::ClusterConf>,
@@ -182,114 +160,59 @@ macro_rules! cluster {
 					trace_for_server
 				);
 
-				// Start the heartbeat loop - 3-tier implementation
+				// Start the heartbeat loop (colony requires tokio):
+				// JoinSet gives bounded concurrency per cycle.
 				let heartbeat_handle = {
 					let registry = ::std::sync::Arc::clone(&registry);
 					let servlet_registry_for_hb = ::std::sync::Arc::clone(&servlet_registry);
 					let config = ::std::sync::Arc::clone(&config);
 					let pool = ::std::sync::Arc::clone(&pool);
 
-					// Tier 1: Tokio - use JoinSet for bounded concurrency
-					#[cfg(feature = "tokio")]
-					{
-						$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
-							loop {
-								let hives = registry.all_hives().unwrap_or_default();
-								let max_concurrent = config.heartbeat.max_concurrent;
-								let mut set = ::tokio::task::JoinSet::new();
+					$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
+						loop {
+							let hives = registry.all_hives().unwrap_or_default();
+							let max_concurrent = config.heartbeat.max_concurrent;
+							let mut set = ::tokio::task::JoinSet::new();
 
-								let tasks: Vec<_> = hives
-									.into_iter()
-									.filter_map(|hive| $crate::cluster!(@parse_hive_addr hive))
-									.collect();
+							let tasks: Vec<_> = hives
+								.into_iter()
+								.filter_map(|hive| $crate::cluster!(@parse_hive_addr hive))
+								.collect();
 
-								for (hive_addr, addr) in tasks {
-									// Bounded: wait if at capacity
-									while set.len() >= max_concurrent {
-										let _ = set.join_next().await;
-									}
-
-									let registry = ::std::sync::Arc::clone(&registry);
-									let servlet_registry = ::std::sync::Arc::clone(&servlet_registry_for_hb);
-									let config = ::std::sync::Arc::clone(&config);
-									let pool = ::std::sync::Arc::clone(&pool);
-									let max_failures = config.heartbeat.max_failures;
-
-									set.spawn(async move {
-										let result = $crate::cluster!(@send_heartbeat_async pool, config, addr, $digest);
-										$crate::cluster!(@process_heartbeat_result registry, servlet_registry, hive_addr, result, max_failures, config);
-									});
+							for (hive_addr, addr) in tasks {
+								// Bounded: wait if at capacity
+								while set.len() >= max_concurrent {
+									let _ = set.join_next().await;
 								}
 
-								// Drain remaining tasks
-								while set.join_next().await.is_some() {}
+								let registry = ::std::sync::Arc::clone(&registry);
+								let servlet_registry = ::std::sync::Arc::clone(&servlet_registry_for_hb);
+								let config = ::std::sync::Arc::clone(&config);
+								let pool = ::std::sync::Arc::clone(&pool);
+								let max_failures = config.heartbeat.max_failures;
 
-								$crate::colony::servlet::servlet_runtime::rt::sleep(config.heartbeat.interval).await;
-							}
-						})
-					}
-
-					// Tier 2: std + futures - use block_on with for_each_concurrent
-					#[cfg(all(not(feature = "tokio"), feature = "std", feature = "futures"))]
-					{
-						use futures::{executor::block_on, stream::{self, StreamExt}};
-
-						$crate::colony::servlet::servlet_runtime::rt::spawn(move || {
-							loop {
-								let hives = registry.all_hives().unwrap_or_default();
-								let max_concurrent = config.heartbeat.max_concurrent;
-
-								block_on(async {
-									stream::iter(hives.into_iter().filter_map(|hive| {
-										$crate::cluster!(@parse_hive_addr hive)
-									}))
-									.for_each_concurrent(max_concurrent, |(hive_addr, addr)| {
-										let registry = ::std::sync::Arc::clone(&registry);
-										let servlet_registry = ::std::sync::Arc::clone(&servlet_registry_for_hb);
-										let config = ::std::sync::Arc::clone(&config);
-										let pool = ::std::sync::Arc::clone(&pool);
-										let max_failures = config.heartbeat.max_failures;
-									async move {
-										let result = $crate::cluster!(@send_heartbeat_async pool, config, addr, $digest);
-										$crate::cluster!(@process_heartbeat_result registry, servlet_registry, hive_addr, result, max_failures, config);
-									}
-									})
-									.await;
+								set.spawn(async move {
+									let result = $crate::cluster!(@send_heartbeat_async pool, config, addr, $digest);
+									$crate::cluster!(@process_heartbeat_result registry, servlet_registry, hive_addr, result, max_failures, config);
 								});
-
-								$crate::colony::servlet::servlet_runtime::rt::sleep(config.heartbeat.interval);
 							}
-						})
-					}
 
-					// Tier 3: std only - sequential fallback
-					#[cfg(all(not(feature = "tokio"), feature = "std", not(feature = "futures")))]
-					{
-						$crate::colony::servlet::servlet_runtime::rt::spawn(move || {
-							loop {
-								registry
-									.all_hives()
-									.unwrap_or_default()
-									.into_iter()
-									.filter_map(|hive| $crate::cluster!(@parse_hive_addr hive))
-									.for_each(|(hive_addr, _addr)| {
-										// Note: Sequential sync version - no async pool available
-										// This tier is a placeholder for sync transport implementations
-										// Fire callback with failure (no async executor available)
-										if let Some(ref callback) = config.heartbeat.on_heartbeat {
-											let event = $crate::colony::cluster::HeartbeatEvent {
-												hive_addr: ::std::sync::Arc::clone(&hive_addr),
-												success: false,
-												utilization: None,
-											};
-											callback(event);
-										}
-										let _ = registry.increment_failure(&hive_addr);
-									});
-								$crate::colony::servlet::servlet_runtime::rt::sleep(config.heartbeat.interval);
+							// Drain remaining tasks
+							while set.join_next().await.is_some() {}
+
+							// Evict hives that exceeded the heartbeat timeout
+							// (covers hives that were never reachable and thus
+							// never accumulated per-send failures) and retire
+							// their servlet routing entries with them.
+							if let Ok(evicted) = registry.evict_stale() {
+								for entry in evicted {
+									let _ = servlet_registry_for_hb.remove_by_hive(&entry.address);
+								}
 							}
-						})
-					}
+
+							$crate::colony::servlet::servlet_runtime::rt::sleep(config.heartbeat.interval).await;
+						}
+					})
 				};
 
 				// Start the evaporation loop for bio-inspired routing
@@ -297,27 +220,13 @@ macro_rules! cluster {
 					let servlet_registry = ::std::sync::Arc::clone(&servlet_registry);
 					let evaporation_interval = config.pheromone.evaporation_interval;
 
-					#[cfg(feature = "tokio")]
-					{
-						$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
-							loop {
-								$crate::colony::servlet::servlet_runtime::rt::sleep(evaporation_interval).await;
-								let _ = servlet_registry.evaporate();
-								let _ = servlet_registry.remove_abandoned();
-							}
-						})
-					}
-
-					#[cfg(all(not(feature = "tokio"), feature = "std"))]
-					{
-						$crate::colony::servlet::servlet_runtime::rt::spawn(move || {
-							loop {
-								$crate::colony::servlet::servlet_runtime::rt::sleep(evaporation_interval);
-								let _ = servlet_registry.evaporate();
-								let _ = servlet_registry.remove_abandoned();
-							}
-						})
-					}
+					$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
+						loop {
+							$crate::colony::servlet::servlet_runtime::rt::sleep(evaporation_interval).await;
+							let _ = servlet_registry.evaporate();
+							let _ = servlet_registry.remove_abandoned();
+						}
+					})
 				};
 
 				Ok(Self {
@@ -361,19 +270,9 @@ macro_rules! cluster {
 				}
 			}
 
-			#[cfg(feature = "tokio")]
 			async fn join(mut self) -> Result<(), $crate::colony::servlet::servlet_runtime::rt::JoinError> {
 				if let Some(handle) = self.server_handle.take() {
 					$crate::colony::servlet::servlet_runtime::rt::join(handle).await
-				} else {
-					Ok(())
-				}
-			}
-
-			#[cfg(all(not(feature = "tokio"), feature = "std"))]
-			async fn join(mut self) -> Result<(), $crate::colony::servlet::servlet_runtime::rt::JoinError> {
-				if let Some(handle) = self.server_handle.take() {
-					$crate::colony::servlet::servlet_runtime::rt::join(handle)
 				} else {
 					Ok(())
 				}
@@ -418,21 +317,49 @@ macro_rules! cluster {
 	};
 
 	// Helper: Build response frame (DRY)
-	(@reply $frame:ident, $message:expr) => {{
-		use $crate::builder::TypeBuilder;
-		Ok(Some(
-			$crate::utils::compose($crate::Version::V0)
-				.with_id($frame.metadata.id.clone())
-				.with_order(0)
-				.with_message($message)
-				.build()?
-		))
-	}};
+	(@reply $frame:ident, $message:expr) => {
+		$crate::colony::common::reply_frame($frame.metadata.id.clone(), $message)
+	};
 
 	// Handle gateway requests (registration + work)
 	(@handle_gateway_request $frame:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident) => {{
+		// Gate policies run before ANY decoding: an unevaluated policy
+		// list is indistinguishable from an open gateway.
+		for policy in $config.policies.iter() {
+			let status = $crate::policy::GatePolicy::evaluate(policy.as_ref(), &$frame);
+			if status != $crate::policy::TransitStatus::Accepted {
+				return $crate::cluster!(@reply $frame,
+					$crate::colony::cluster::ClusterWorkResponse::err(status)
+				);
+			}
+		}
+
+		// Hive-origin control frames (registration, address updates) must
+		// carry a signature verifiable against `tls.hive_trust` when it is
+		// configured. Without a trust store the gateway accepts unsigned
+		// frames -- development mode only.
+		#[cfg(feature = "x509")]
+		let verify_hive_origin = || match $config.tls.hive_trust.as_ref() {
+			Some(trust) => match $crate::colony::hive::verify_frame_signature(trust.as_ref(), &$frame) {
+				$crate::colony::hive::TrustVerification::Verified => $crate::policy::TransitStatus::Accepted,
+				$crate::colony::hive::TrustVerification::MissingSignature => $crate::policy::TransitStatus::Unauthorized,
+				_ => $crate::policy::TransitStatus::Forbidden,
+			},
+			None => $crate::policy::TransitStatus::Accepted,
+		};
+		#[cfg(not(feature = "x509"))]
+		let verify_hive_origin = || $crate::policy::TransitStatus::Accepted;
+
 		// Try to decode as RegisterHiveRequest (hive registration)
 		if let Ok(request) = $crate::decode::<$crate::colony::hive::RegisterHiveRequest>(&$frame.message) {
+			let origin_status = verify_hive_origin();
+			if origin_status != $crate::policy::TransitStatus::Accepted {
+				return $crate::cluster!(@reply $frame, $crate::colony::hive::RegisterHiveResponse {
+					status: origin_status,
+					hive_id: None,
+				});
+			}
+
 			// Extract data before consuming request (zero-copy: single Arc allocation)
 			let hive_addr: ::std::sync::Arc<[u8]> = request.hive_addr.clone().into();
 
@@ -474,6 +401,13 @@ macro_rules! cluster {
 
 		// Try to decode as ServletAddressUpdate (scaling notification from hive)
 		if let Ok(update) = $crate::decode::<$crate::colony::hive::ServletAddressUpdate>(&$frame.message) {
+			let origin_status = verify_hive_origin();
+			if origin_status != $crate::policy::TransitStatus::Accepted {
+				return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
+					status: origin_status,
+				});
+			}
+
 			let hive_id: ::std::sync::Arc<[u8]> = update.hive_id.into();
 
 			// Add new servlet entries
@@ -588,15 +522,15 @@ macro_rules! cluster {
 
 			// Connect to servlet and send
 			let mut client = $pool.connect(parsed_addr).await
-				.map_err(|_| $crate::colony::cluster::ClusterError::HiveCommunicationFailed(b"connect failed".to_vec()))?;
+				.map_err(|_| $crate::colony::cluster::ClusterError::ConnectFailed)?;
 
 			let response = match client.conn()?.emit(frame, None).await {
 				Ok(Some(r)) => r,
 				Ok(None) => {
-					return Err($crate::colony::cluster::ClusterError::HiveCommunicationFailed(b"no response".to_vec()));
+					return Err($crate::colony::cluster::ClusterError::NoResponse);
 				}
-				Err(_) => {
-					return Err($crate::colony::cluster::ClusterError::HiveCommunicationFailed(b"transport error".to_vec()));
+				Err(e) => {
+					return Err($crate::colony::cluster::ClusterError::from(e));
 				}
 			};
 
@@ -632,6 +566,7 @@ macro_rules! cluster {
 			use $crate::builder::TypeBuilder;
 
 			let cmd = $crate::colony::common::ClusterCommand {
+				issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 				heartbeat: Some($crate::colony::common::HeartbeatParams {
 					cluster_status: $crate::colony::common::ClusterStatus::Healthy,
 				}),
@@ -652,13 +587,11 @@ macro_rules! cluster {
 			let mut client = $pool.connect($addr).await?;
 
 			let response = client.conn()?.emit(signed_frame, None).await?
-				.ok_or($crate::colony::cluster::ClusterError::HiveCommunicationFailed(
-					$crate::colony::cluster::error::NO_RESPONSE_MSG.to_vec()
-				))?;
+				.ok_or($crate::colony::cluster::ClusterError::NoResponse)?;
 
 			let cmd_response: $crate::colony::common::ClusterCommandResponse =
 				$crate::decode(&response.message)?;
-			cmd_response.heartbeat.ok_or($crate::colony::cluster::ClusterError::EncodingError)
+			cmd_response.heartbeat.ok_or($crate::colony::cluster::ClusterError::MalformedResponse)
 		}.await
 	};
 

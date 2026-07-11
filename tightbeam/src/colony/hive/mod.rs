@@ -8,7 +8,10 @@ pub mod gates;
 
 // Re-export submodule types
 pub use error::HiveError;
-pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker, ClusterSecurityGate};
+pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker};
+
+#[cfg(feature = "x509")]
+pub use gates::{verify_frame_signature, ClusterSecurityGate, ReplayGuard, TrustVerification};
 
 // Re-export common types used by hives
 pub use crate::colony::common::{
@@ -475,6 +478,12 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 	pub servlet_pool_idle_timeout: Option<Duration>,
 	/// Drain timeout before force-stop (default: 30s)
 	pub drain_timeout: Duration,
+	/// Freshness window for signed cluster commands in milliseconds
+	/// (default: 30_000). Commands with `issued_at_ms` outside this
+	/// window of the hive clock, or whose signature was already seen
+	/// inside it, are rejected. See [`ReplayGuard`].
+	#[cfg(feature = "x509")]
+	pub command_freshness_window_ms: u64,
 	/// Retry policy for cluster notifications (scaling events).
 	/// Default: exponential backoff with 3 attempts, 500ms base delay.
 	#[cfg(feature = "std")]
@@ -500,8 +509,10 @@ impl<L: LoadBalancer + core::fmt::Debug, R: MessageRouter + core::fmt::Debug> co
 			.field("queue_capacity", &self.queue_capacity)
 			.field("backpressure_threshold", &self.backpressure_threshold)
 			.field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
-			.field("circuit_breaker_cooldown_ms", &self.circuit_breaker_cooldown_ms)
-			.field("servlet_pool_size", &self.servlet_pool_size)
+			.field("circuit_breaker_cooldown_ms", &self.circuit_breaker_cooldown_ms);
+		#[cfg(feature = "x509")]
+		d.field("command_freshness_window_ms", &self.command_freshness_window_ms);
+		d.field("servlet_pool_size", &self.servlet_pool_size)
 			.field("servlet_pool_idle_timeout", &self.servlet_pool_idle_timeout)
 			.field("drain_timeout", &self.drain_timeout);
 		#[cfg(feature = "std")]
@@ -529,6 +540,8 @@ impl Default for HiveConf {
 			servlet_pool_size: 8,
 			servlet_pool_idle_timeout: Some(Duration::from_secs(30)),
 			drain_timeout: Duration::from_secs(30),
+			#[cfg(feature = "x509")]
+			command_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			#[cfg(feature = "std")]
 			cluster_notify_retry: Arc::new(crate::transport::policy::RestartExponentialBackoff {
 				max_attempts: 3,
