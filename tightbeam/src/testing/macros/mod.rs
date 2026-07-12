@@ -840,6 +840,8 @@ macro_rules! tb_scenario {
 		let exec_result = $crate::testing::macros::__tb_call_exec_closure_arc($exec_closure, std::sync::Arc::clone(&trace));
 
 		// Build hook context and verify
+		// `mut` only used when testing-fdr + testing-timing set timing_constraints below.
+		#[allow(unused_mut)]
 		let mut hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
 
 		// Extract timing constraints from FDR specs if available (Bare-specific)

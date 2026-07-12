@@ -8,7 +8,8 @@
 	feature = "transport",
 	feature = "transport-ecies",
 	feature = "x509",
-	feature = "aead"
+	feature = "aead",
+	feature = "tokio"
 ))]
 
 use std::sync::Arc;

@@ -184,7 +184,9 @@ macro_rules! job {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(any(feature = "colony", feature = "tokio"))]
 	use crate::error::Result;
+	#[cfg(any(feature = "colony", feature = "tokio"))]
 	use crate::Frame;
 
 	#[cfg(feature = "colony")]
@@ -242,6 +244,7 @@ mod tests {
 	}
 
 	// Async job with tuple input - implements AsyncJob trait
+	#[cfg(feature = "tokio")]
 	job! {
 		name: AsyncCalculationJob,
 		async fn run((x, y): (u64, u64)) -> Result<Frame> {
@@ -301,6 +304,7 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "tokio")]
 	test_job! {
 		name: test_async_job,
 		job: AsyncCalculationJob::run((10, 32)),

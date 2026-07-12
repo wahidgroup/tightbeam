@@ -122,17 +122,16 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::Frame;
 	use crate::testing::create_v0_tightbeam;
 	use crate::transport::error::TransportFailure;
-	use crate::transport::policy::PolicyConf;
 
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn test_server_and_client_macros() -> TransportResult<()> {
 		use std::sync::{mpsc, Arc};
 
-		use crate::transport::policy::RestartLinearBackoff;
+		use crate::asn1::Frame;
+		use crate::transport::policy::{PolicyConf, RestartLinearBackoff};
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::tcp::TightBeamSocketAddr;
 
