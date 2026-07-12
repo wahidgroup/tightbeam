@@ -388,6 +388,7 @@ macro_rules! hive {
 
 					let request = $crate::colony::common::ClusterRequest::RegisterHive(
 						$crate::colony::hive::RegisterHiveRequest {
+							issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 							hive_addr: self.addr.into(),
 							servlet_addresses: servlet_info_list,
 							metadata: Some(b"hive".to_vec()),
@@ -974,6 +975,7 @@ macro_rules! hive {
 			let update = if is_added {
 				$crate::colony::common::ClusterRequest::ServletAddressUpdate(
 					$crate::colony::hive::ServletAddressUpdate {
+						issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 						hive_id,
 						added: vec![servlet_info],
 						removed: vec![],
@@ -982,6 +984,7 @@ macro_rules! hive {
 			} else {
 				$crate::colony::common::ClusterRequest::ServletAddressUpdate(
 					$crate::colony::hive::ServletAddressUpdate {
+						issued_at_ms: $crate::colony::common::current_timestamp_ms(),
 						hive_id,
 						added: vec![],
 						removed: vec![servlet_info.address],

@@ -193,6 +193,10 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	/// Connection pool configuration for hive connections
 	pub pool_config: PoolConfig,
+	/// Freshness window in milliseconds for signed hive control frames
+	/// (registration, address updates); stale or replayed frames inside
+	/// the window are rejected (CWE-294)
+	pub control_freshness_window_ms: u64,
 	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
@@ -216,6 +220,7 @@ impl<L: LoadBalancer, D: Digest> core::fmt::Debug for ClusterConf<L, D> {
 			.field("pheromone", &self.pheromone)
 			.field("policies", &format!("[{} policies]", self.policies.len()))
 			.field("pool_config", &self.pool_config)
+			.field("control_freshness_window_ms", &self.control_freshness_window_ms)
 			.field("tls", &self.tls)
 			.finish()
 	}
@@ -327,6 +332,7 @@ mod tests {
 
 	fn request(addr: &[u8], servlets: &[&[u8]]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
+			issued_at_ms: 0,
 			hive_addr: addr.to_vec(),
 			metadata: None,
 			servlet_addresses: servlets
@@ -338,6 +344,7 @@ mod tests {
 
 	fn request_with_meta(addr: &[u8], servlets: &[&[u8]], meta: &[u8]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
+			issued_at_ms: 0,
 			hive_addr: addr.to_vec(),
 			metadata: Some(meta.to_vec()),
 			servlet_addresses: servlets

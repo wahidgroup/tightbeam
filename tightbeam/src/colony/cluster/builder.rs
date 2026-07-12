@@ -102,6 +102,7 @@ pub struct ClusterConfBuilder<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_25
 	pheromone: PheromoneConf,
 	policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	pool_config: PoolConfig,
+	control_freshness_window_ms: u64,
 	tls: ClusterTlsConfig,
 	_digest: PhantomData<D>,
 }
@@ -116,6 +117,7 @@ impl ClusterConf {
 			pheromone: PheromoneConf::default(),
 			policies: Vec::new(),
 			pool_config: PoolConfig::default(),
+			control_freshness_window_ms: crate::constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 			tls,
 			_digest: PhantomData,
 		}
@@ -144,6 +146,7 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 			pheromone: self.pheromone,
 			policies: self.policies,
 			pool_config: self.pool_config,
+			control_freshness_window_ms: self.control_freshness_window_ms,
 			tls: self.tls,
 			_digest: PhantomData,
 		}
@@ -161,6 +164,12 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 		self
 	}
 
+	/// Set the freshness window for signed hive control frames
+	pub fn with_control_freshness_window_ms(mut self, window_ms: u64) -> Self {
+		self.control_freshness_window_ms = window_ms;
+		self
+	}
+
 	/// Build the ClusterConf
 	pub fn build(self) -> ClusterConf<L, D> {
 		ClusterConf {
@@ -169,6 +178,7 @@ impl<L: LoadBalancer, D: Digest> ClusterConfBuilder<L, D> {
 			pheromone: self.pheromone,
 			policies: self.policies,
 			pool_config: self.pool_config,
+			control_freshness_window_ms: self.control_freshness_window_ms,
 			tls: self.tls,
 			_digest: PhantomData,
 		}

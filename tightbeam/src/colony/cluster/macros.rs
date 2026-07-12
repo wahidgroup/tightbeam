@@ -149,6 +149,16 @@ macro_rules! cluster {
 				let pool_for_server = ::std::sync::Arc::clone(&pool);
 				let trace_for_server = ::std::sync::Arc::clone(&trace);
 
+				// Freshness window + replay set for signed hive control frames
+				// (registration, address updates); shared across all gateway
+				// requests (CWE-294)
+				#[cfg(feature = "x509")]
+				let replay_guard_for_server = ::std::sync::Arc::new(
+					$crate::colony::hive::ReplayGuard::new(config.control_freshness_window_ms)
+				);
+				#[cfg(not(feature = "x509"))]
+				let replay_guard_for_server = ();
+
 				// Start the gateway server
 				let server_handle = $crate::cluster!(
 					@build_gateway_server $protocol,
@@ -157,7 +167,8 @@ macro_rules! cluster {
 					servlet_registry_for_server,
 					config_for_server,
 					pool_for_server,
-					trace_for_server
+					trace_for_server,
+					replay_guard_for_server
 				);
 
 				// Start the heartbeat loop (colony requires tokio):
@@ -300,7 +311,7 @@ macro_rules! cluster {
 	};
 
 	// Build gateway server
-	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident) => {
+	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident, $replay_guard:ident) => {
 		$crate::server! {
 			protocol $protocol: $listener,
 			handle: move |frame: $crate::Frame| {
@@ -309,8 +320,9 @@ macro_rules! cluster {
 				let config = ::std::sync::Arc::clone(&$config);
 				let pool = ::std::sync::Arc::clone(&$pool);
 				let _trace = ::std::sync::Arc::clone(&$trace);
+				let _replay_guard = ::core::clone::Clone::clone(&$replay_guard);
 				async move {
-					$crate::cluster!(@handle_gateway_request frame, registry, servlet_registry, config, pool)
+					$crate::cluster!(@handle_gateway_request frame, registry, servlet_registry, config, pool, _replay_guard)
 				}
 			}
 		}
@@ -322,7 +334,7 @@ macro_rules! cluster {
 	};
 
 	// Handle gateway requests (registration + work)
-	(@handle_gateway_request $frame:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident) => {{
+	(@handle_gateway_request $frame:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $replay_guard:ident) => {{
 		// Gate policies run before ANY decoding: an unevaluated policy
 		// list is indistinguishable from an open gateway.
 		for policy in $config.policies.iter() {
@@ -350,6 +362,33 @@ macro_rules! cluster {
 		#[cfg(not(feature = "x509"))]
 		let verify_hive_origin = || $crate::policy::TransitStatus::Accepted;
 
+		// Signed control frames must additionally be fresh and unseen: a
+		// captured registration or address update carries a valid signature,
+		// so signature verification alone cannot stop replay (CWE-294).
+		// Enforced only when a trust store is configured.
+		#[cfg(feature = "x509")]
+		let verify_control_freshness = |issued_at_ms: u64| {
+			if $config.tls.hive_trust.is_none() {
+				return $crate::policy::TransitStatus::Accepted;
+			}
+
+			let now = $crate::colony::common::current_timestamp_ms();
+			if !$replay_guard.is_fresh(issued_at_ms, now) {
+				return $crate::policy::TransitStatus::Forbidden;
+			}
+
+			let Some(signer_info) = $frame.nonrepudiation.as_ref() else {
+				return $crate::policy::TransitStatus::Unauthorized;
+			};
+			if !$replay_guard.check_and_insert(signer_info.signature.as_bytes(), now) {
+				return $crate::policy::TransitStatus::Forbidden;
+			}
+
+			$crate::policy::TransitStatus::Accepted
+		};
+		#[cfg(not(feature = "x509"))]
+		let verify_control_freshness = |_issued_at_ms: u64| $crate::policy::TransitStatus::Accepted;
+
 		// Single decode of the CHOICE envelope: the tag discriminates
 		// the request type. Undecodable input is rejected fail-closed.
 		let cluster_request = match $crate::decode::<$crate::colony::common::ClusterRequest>(&$frame.message) {
@@ -367,6 +406,14 @@ macro_rules! cluster {
 			if origin_status != $crate::policy::TransitStatus::Accepted {
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::RegisterHiveResponse {
 					status: origin_status,
+					hive_id: None,
+				});
+			}
+
+			let freshness_status = verify_control_freshness(request.issued_at_ms);
+			if freshness_status != $crate::policy::TransitStatus::Accepted {
+				return $crate::cluster!(@reply $frame, $crate::colony::hive::RegisterHiveResponse {
+					status: freshness_status,
 					hive_id: None,
 				});
 			}
@@ -415,6 +462,13 @@ macro_rules! cluster {
 			if origin_status != $crate::policy::TransitStatus::Accepted {
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
 					status: origin_status,
+				});
+			}
+
+			let freshness_status = verify_control_freshness(update.issued_at_ms);
+			if freshness_status != $crate::policy::TransitStatus::Accepted {
+				return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
+					status: freshness_status,
 				});
 			}
 
@@ -605,14 +659,25 @@ macro_rules! cluster {
 
 	// Helper: Process heartbeat result - updates registry based on success/failure
 	(@process_heartbeat_result $registry:expr, $servlet_registry:expr, $hive_addr:expr, $result:expr, $max_failures:expr, $config:expr) => {
-		// Fire callback if configured
-		$crate::cluster!(@fire_heartbeat_callback $config, $hive_addr, $result);
+		// A decoded heartbeat only proves the hive answered, not that it is
+		// healthy: gate rejections (Forbidden/Unauthorized) come back
+		// heartbeat-shaped and must count as failures.
+		let alive = matches!(
+			&$result,
+			Ok(hb) if matches!(
+				hb.status,
+				$crate::policy::TransitStatus::Accepted | $crate::policy::TransitStatus::Busy
+			)
+		);
 
-		match $result {
-			Ok(hb) => {
+		// Fire callback if configured
+		$crate::cluster!(@fire_heartbeat_callback $config, $hive_addr, $result, alive);
+
+		match (alive, $result) {
+			(true, Ok(hb)) => {
 				let _ = $registry.touch(&$hive_addr, hb.utilization);
 			}
-			Err(_) => {
+			_ => {
 				if let Ok(failures) = $registry.increment_failure(&$hive_addr) {
 					if failures >= $max_failures {
 						// Remove from HiveRegistry
@@ -626,11 +691,11 @@ macro_rules! cluster {
 	};
 
 	// Helper: Fire heartbeat callback if configured
-	(@fire_heartbeat_callback $config:expr, $hive_addr:expr, $result:expr) => {
+	(@fire_heartbeat_callback $config:expr, $hive_addr:expr, $result:expr, $alive:expr) => {
 		if let Some(ref callback) = $config.heartbeat.on_heartbeat {
 			let event = $crate::colony::cluster::HeartbeatEvent {
 				hive_addr: ::std::sync::Arc::clone(&$hive_addr),
-				success: $result.is_ok(),
+				success: $alive,
 				utilization: $result.as_ref().ok().map(|r| r.utilization),
 			};
 			callback(event);

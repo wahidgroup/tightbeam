@@ -246,6 +246,7 @@ mod tests {
 
 	fn request(addr: &[u8], servlets: &[&[u8]]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
+			issued_at_ms: 0,
 			hive_addr: addr.to_vec(),
 			metadata: None,
 			servlet_addresses: servlets
@@ -259,6 +260,7 @@ mod tests {
 	fn evict_stale_returns_evicted_entries() -> Result<(), ClusterError> {
 		let registry = HiveRegistry::new(Duration::ZERO);
 		registry.register(request(b"hive1", &[b"ping"]))?;
+
 		std::thread::sleep(Duration::from_millis(1));
 
 		let evicted = registry.evict_stale()?;

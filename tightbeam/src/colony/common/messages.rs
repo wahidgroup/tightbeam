@@ -80,6 +80,9 @@ pub enum ClusterRequest {
 /// its availability and capabilities, including actual servlet addresses.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct RegisterHiveRequest {
+	/// Issue time in unix milliseconds. Binds the signed frame to a
+	/// freshness window so captured registrations cannot be replayed (CWE-294)
+	pub issued_at_ms: u64,
 	/// The address where this hive can be reached (for heartbeats)
 	pub hive_addr: Vec<u8>,
 	/// Servlet type-to-address mappings for direct routing
@@ -103,6 +106,9 @@ pub struct RegisterHiveResponse {
 /// Enables push-based cluster registry updates.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ServletAddressUpdate {
+	/// Issue time in unix milliseconds. Binds the signed frame to a
+	/// freshness window so captured updates cannot be replayed (CWE-294)
+	pub issued_at_ms: u64,
 	/// Hive identifier (matches hive_addr from registration)
 	pub hive_id: Vec<u8>,
 	/// Newly spawned servlet addresses
@@ -429,6 +435,7 @@ mod tests {
 	#[test]
 	fn cluster_request_register_hive_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::RegisterHive(RegisterHiveRequest {
+			issued_at_ms: 1_000,
 			hive_addr: b"127.0.0.1:9000".to_vec(),
 			servlet_addresses: vec![ServletInfo { servlet_id: b"ping".to_vec(), address: b"127.0.0.1:9001".to_vec() }],
 			metadata: None,
@@ -438,6 +445,7 @@ mod tests {
 	#[test]
 	fn cluster_request_servlet_address_update_round_trips() -> Result<()> {
 		round_trip(ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
+			issued_at_ms: 1_000,
 			hive_id: b"127.0.0.1:9000".to_vec(),
 			added: vec![],
 			removed: vec![b"127.0.0.1:9100".to_vec()],

@@ -11,6 +11,8 @@
 	feature = "signature"
 ))]
 
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 use std::sync::{Arc, OnceLock};
 
 use sha3::Sha3_256;
@@ -19,11 +21,19 @@ use tightbeam::{
 	builder::TypeBuilder,
 	cluster,
 	colony::{
-		cluster::{Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
-		hive::{Hive, HiveConf, HiveTlsConfig},
+		cluster::{
+			Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse,
+			HeartbeatConf,
+		},
+		common::current_timestamp_ms,
+		hive::{
+			Hive, HiveConf, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
+			ServletAddressUpdateResponse, ServletInfo,
+		},
 		servlet::ServletConf,
 	},
 	compose,
+	constants::DEFAULT_COMMAND_FRESHNESS_WINDOW_MS,
 	crypto::{
 		key::Secp256k1KeyProvider,
 		policy::Secp256k1Policy,
@@ -313,6 +323,7 @@ tb_scenario! {
 				"gate policy must reject the request before decoding"
 			);
 			assert!(work_response.payload.is_none(), "rejected request must not carry a payload");
+
 			trace.event("policy_blocked")?;
 
 			cluster.stop();
@@ -358,13 +369,13 @@ tb_scenario! {
 				trust_store: Some(Arc::clone(&certs.trust)),
 				..Default::default()
 			};
+
 			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 
 			trace.event("registration_sent")?;
 
 			let response = hive.register_with_cluster(cluster_addr).await?;
-
 			assert_eq!(
 				response.status,
 				TransitStatus::Unauthorized,
@@ -372,7 +383,248 @@ tb_scenario! {
 			);
 			assert!(response.hive_id.is_none(), "rejected registration must not assign a hive id");
 			assert_eq!(cluster.hive_count(), 0, "rejected hive must not enter the registry");
+
 			trace.event("registration_unauthorized")?;
+
+			hive.stop();
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Replayed / Stale Control Frame Rejection
+// ============================================================================
+
+async fn signed_control_frame(
+	certs: &ClusterTestCerts,
+	id: &[u8],
+	request: ClusterRequest,
+) -> Result<Frame, TightBeamError> {
+	let unsigned = frame_compose(Version::V0)
+		.with_id(id)
+		.with_order(0)
+		.with_message(request)
+		.build()?;
+	let provider = Secp256k1KeyProvider::from(certs.key.clone());
+	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+}
+
+fn registration_request(issued_at_ms: u64, hive_addr: &[u8]) -> ClusterRequest {
+	ClusterRequest::RegisterHive(RegisterHiveRequest {
+		issued_at_ms,
+		hive_addr: hive_addr.to_vec(),
+		servlet_addresses: vec![],
+		metadata: None,
+	})
+}
+
+tb_assert_spec! {
+	pub ClusterReplaySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("fresh_registration_accepted", exactly!(1)),
+			("replayed_registration_rejected", exactly!(1)),
+			("stale_registration_rejected", exactly!(1)),
+			("fresh_update_accepted", exactly!(1)),
+			("replayed_update_rejected", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: cluster_rejects_replayed_and_stale_control_frames,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ClusterReplaySpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let certs = get_cluster_test_certs();
+
+			let cluster_conf = ClusterConf::new(cluster_tls_config(certs));
+			let cluster = ClusterGateway::start(Arc::new(TraceCollector::new()), cluster_conf).await?;
+			let cluster_addr = cluster.addr();
+
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_trust_store(Arc::clone(&certs.trust))
+				.build();
+			let mut client = builder.connect(cluster_addr).await?;
+
+			// Fresh signed registration is accepted
+			let fresh = signed_control_frame(
+				certs,
+				b"replay-reg",
+				registration_request(current_timestamp_ms(), b"127.0.0.1:65000"),
+			).await?;
+			let replayed = fresh.clone();
+
+			let response_frame = client.emit(fresh, None).await?.ok_or(TightBeamError::MissingResponse)?;
+			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			assert_eq!(response.status, TransitStatus::Accepted, "fresh signed registration must be accepted");
+			assert_eq!(cluster.hive_count(), 1, "fresh registration must enter the registry");
+
+			trace.event("fresh_registration_accepted")?;
+
+			// Byte-identical resend carries an already-seen signature
+			let response_frame = client.emit(replayed, None).await?.ok_or(TightBeamError::MissingResponse)?;
+			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			assert_eq!(response.status, TransitStatus::Forbidden, "replayed registration must be rejected");
+
+			trace.event("replayed_registration_rejected")?;
+
+			// Valid signature but issued outside the freshness window
+			let stale_ts = current_timestamp_ms() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
+			let stale = signed_control_frame(
+				certs,
+				b"stale-reg",
+				registration_request(stale_ts, b"127.0.0.1:65000"),
+			).await?;
+
+			let response_frame = client.emit(stale, None).await?.ok_or(TightBeamError::MissingResponse)?;
+			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			assert_eq!(response.status, TransitStatus::Forbidden, "stale registration must be rejected");
+
+			trace.event("stale_registration_rejected")?;
+
+			// Same enforcement on servlet address updates
+			let update = ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
+				issued_at_ms: current_timestamp_ms(),
+				hive_id: b"127.0.0.1:65000".to_vec(),
+				added: vec![ServletInfo { servlet_id: b"ping".to_vec(), address: b"127.0.0.1:65001".to_vec() }],
+				removed: vec![],
+			});
+			let fresh_update = signed_control_frame(certs, b"replay-update", update).await?;
+			let replayed_update = fresh_update.clone();
+
+			let response_frame = client.emit(fresh_update, None).await?.ok_or(TightBeamError::MissingResponse)?;
+			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			assert_eq!(response.status, TransitStatus::Accepted, "fresh signed update must be accepted");
+
+			trace.event("fresh_update_accepted")?;
+
+			let response_frame = client.emit(replayed_update, None).await?.ok_or(TightBeamError::MissingResponse)?;
+			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
+			assert_eq!(response.status, TransitStatus::Forbidden, "replayed update must be rejected");
+
+			trace.event("replayed_update_rejected")?;
+
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Rejected Heartbeats Evict The Hive
+// ============================================================================
+
+tb_assert_spec! {
+	pub ClusterHeartbeatRejectionSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("hive_registered", exactly!(1)),
+			("rejected_heartbeat_decoded", exactly!(1)),
+			("hive_evicted", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: cluster_evicts_hive_on_rejected_heartbeats,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ClusterHeartbeatRejectionSpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let certs = get_cluster_test_certs();
+
+			// The hive has no trust store, so its security gate fails
+			// closed and answers cluster heartbeats with a Forbidden
+			// heartbeat-shaped response. A decoded rejection must count
+			// as a failure, not reset the failure count.
+			let rejected_decoded = Arc::new(AtomicBool::new(false));
+			let rejected_flag = Arc::clone(&rejected_decoded);
+			let heartbeat = HeartbeatConf::builder()
+				.with_interval(Duration::from_millis(100))
+				.with_max_failures(1)
+				.with_callback(Arc::new(move |event| {
+					// utilization is only Some when the heartbeat response
+					// decoded, proving the failure came from the rejected
+					// status rather than a transport error
+					if !event.success && event.utilization.is_some() {
+						rejected_flag.store(true, Ordering::SeqCst);
+					}
+				}))
+				.build();
+
+			let cluster_conf = ClusterConf::builder(cluster_tls_config(certs))
+				.with_heartbeat_config(heartbeat)
+				.build();
+			let cluster = ClusterGateway::start(Arc::new(TraceCollector::new()), cluster_conf).await?;
+			let cluster_addr = cluster.addr();
+
+			// Hive serves the shared cert (cluster trusts it for TLS) but
+			// configures no trust store for inbound commands
+			let hive_tls = Arc::new(HiveTlsConfig {
+				certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
+				key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+				validators: vec![],
+			});
+			let hive_conf = HiveConf {
+				hive_tls: Some(hive_tls),
+				..Default::default()
+			};
+
+			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
+			hive.establish(Arc::new(TraceCollector::new())).await?;
+
+			// Register the hive out-of-band with a validly signed frame
+			let hive_addr_bytes = hive.addr().to_string().into_bytes();
+			let registration = signed_control_frame(
+				certs,
+				b"hb-reject-reg",
+				registration_request(current_timestamp_ms(), &hive_addr_bytes),
+			).await?;
+
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_trust_store(Arc::clone(&certs.trust))
+				.build();
+			let mut client = builder.connect(cluster_addr).await?;
+
+			let response_frame = client.emit(registration, None).await?.ok_or(TightBeamError::MissingResponse)?;
+			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			assert_eq!(response.status, TransitStatus::Accepted, "signed registration must be accepted");
+			assert_eq!(cluster.hive_count(), 1, "registered hive must enter the registry");
+
+			trace.event("hive_registered")?;
+
+			// Heartbeats run every 100ms with max_failures = 1: the first
+			// Forbidden heartbeat must evict the hive
+			for _ in 0..50 {
+				if cluster.hive_count() == 0 {
+					break;
+				}
+
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			}
+
+			assert!(
+				rejected_decoded.load(Ordering::SeqCst),
+				"hive must answer with a decodable rejected heartbeat"
+			);
+
+			trace.event("rejected_heartbeat_decoded")?;
+
+			assert_eq!(cluster.hive_count(), 0, "hive with rejected heartbeats must be evicted");
+
+			trace.event("hive_evicted")?;
 
 			hive.stop();
 			cluster.stop();
