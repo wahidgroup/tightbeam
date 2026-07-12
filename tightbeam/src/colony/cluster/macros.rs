@@ -432,7 +432,7 @@ macro_rules! cluster {
 				))
 				.collect();
 
-				let status = match $registry.register(request) {
+			let response = match $registry.register(request) {
 				Ok(()) => {
 					// Store actual servlet addresses in ServletRegistry
 					for (servlet_type, servlet_addr) in &servlet_info {
@@ -445,14 +445,26 @@ macro_rules! cluster {
 						);
 						let _ = $servlet_registry.add(entry);
 					}
-					$crate::policy::TransitStatus::Accepted
+					$crate::colony::hive::RegisterHiveResponse {
+						status: $crate::policy::TransitStatus::Accepted,
+						hive_id: Some(hive_addr.to_vec()),
+					}
 				}
-				Err(_) => $crate::policy::TransitStatus::Forbidden,
-			};
+				Err(_) => {
+					// The signature was recorded before the registry ran;
+					// forget it so a legitimate retry of the same signed
+					// frame is not rejected as a replay. A failed
+					// registration must not hand out an identity either.
+					#[cfg(feature = "x509")]
+					if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
+						$replay_guard.forget(signer_info.signature.as_bytes());
+					}
 
-			let response = $crate::colony::hive::RegisterHiveResponse {
-				status,
-				hive_id: Some(hive_addr.to_vec()),
+					$crate::colony::hive::RegisterHiveResponse {
+						status: $crate::policy::TransitStatus::Forbidden,
+						hive_id: None,
+					}
+				}
 			};
 
 			return $crate::cluster!(@reply $frame, response);

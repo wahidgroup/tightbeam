@@ -317,6 +317,23 @@ impl ReplayGuard {
 
 		true
 	}
+
+	/// Remove a recorded signature so the frame may be retried
+	///
+	/// The signature is recorded before the guarded operation runs. When
+	/// that operation fails, the record must be released or a legitimate
+	/// retry of the same signed frame is rejected as a replay until the
+	/// window expires.
+	pub fn forget(&self, signature: &[u8]) {
+		let Ok(mut seen) = self.seen.lock() else {
+			return;
+		};
+
+		seen.retain(|_, sigs| {
+			sigs.remove(signature);
+			!sigs.is_empty()
+		});
+	}
 }
 
 // =============================================================================
@@ -561,6 +578,15 @@ mod tests {
 		let guard = ReplayGuard::new(30_000);
 		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
 		assert!(!guard.check_and_insert(b"signer-2", b"sig-a", 1_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_forget_permits_retry() {
+		let guard = ReplayGuard::new(30_000);
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
+		guard.forget(b"sig-a");
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 2_000));
 	}
 
 	#[cfg(feature = "x509")]
