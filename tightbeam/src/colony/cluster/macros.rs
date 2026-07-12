@@ -432,10 +432,15 @@ macro_rules! cluster {
 				))
 				.collect();
 
-			let response = match $registry.register(request) {
-				Ok(()) => {
-					// Store actual servlet addresses in ServletRegistry
-					for (servlet_type, servlet_addr) in &servlet_info {
+			// Registration is complete only when the hive entry AND its
+			// servlet routes are all installed: reporting success on a
+			// partial install leaves the hive believing it is routable
+			// while the cluster's tables are incomplete. A route failure
+			// rolls the hive entry back so no half-registered state lingers.
+			let registered = $registry.register(request).and_then(|()| {
+				servlet_info
+					.iter()
+					.try_for_each(|(servlet_type, servlet_addr)| {
 						let entry = $crate::colony::cluster::ServletEntry::new(
 							::std::sync::Arc::clone(servlet_addr),  // Actual servlet address!
 							::std::sync::Arc::clone(servlet_type),
@@ -443,13 +448,19 @@ macro_rules! cluster {
 							$config.pheromone.initial_pheromone,
 							$config.pheromone.abandonment_limit,
 						);
-						let _ = $servlet_registry.add(entry);
-					}
-					$crate::colony::hive::RegisterHiveResponse {
-						status: $crate::policy::TransitStatus::Accepted,
-						hive_id: Some(hive_addr.to_vec()),
-					}
-				}
+						$servlet_registry.add(entry)
+					})
+					.inspect_err(|_| {
+						let _ = $registry.unregister(&hive_addr);
+						let _ = $servlet_registry.remove_by_hive(&hive_addr);
+					})
+			});
+
+			let response = match registered {
+				Ok(()) => $crate::colony::hive::RegisterHiveResponse {
+					status: $crate::policy::TransitStatus::Accepted,
+					hive_id: Some(hive_addr.to_vec()),
+				},
 				Err(_) => {
 					// The signature was recorded before the registry ran;
 					// forget it so a legitimate retry of the same signed
@@ -487,26 +498,45 @@ macro_rules! cluster {
 
 			let hive_id: ::std::sync::Arc<[u8]> = update.hive_id.into();
 
-			// Add new servlet entries
-			for info in &update.added {
-				let entry = $crate::colony::cluster::ServletEntry::new(
-					::std::sync::Arc::from(info.address.as_slice()),
-					::std::sync::Arc::from(info.servlet_id.as_slice()),
-					::std::sync::Arc::clone(&hive_id),
-					$config.pheromone.initial_pheromone,
-					$config.pheromone.abandonment_limit,
-				);
-				let _ = $servlet_registry.add(entry);
-			}
+			// Every add and remove must land or the hive's view diverges
+			// from the routing tables; a partial update is reported as
+			// Forbidden so the hive knows its routes are not installed.
+			// Removals key by network address.
+			let updated = update
+				.added
+				.iter()
+				.try_for_each(|info| {
+					let entry = $crate::colony::cluster::ServletEntry::new(
+						::std::sync::Arc::from(info.address.as_slice()),
+						::std::sync::Arc::from(info.servlet_id.as_slice()),
+						::std::sync::Arc::clone(&hive_id),
+						$config.pheromone.initial_pheromone,
+						$config.pheromone.abandonment_limit,
+					);
+					$servlet_registry.add(entry)
+				})
+				.and_then(|()| {
+					update
+						.removed
+						.iter()
+						.try_for_each(|address| $servlet_registry.remove(address).map(|_| ()))
+				});
 
-			// Remove stopped servlet entries (registry keys by network address)
-			for address in &update.removed {
-				let _ = $servlet_registry.remove(address);
-			}
+			let status = match updated {
+				Ok(()) => $crate::policy::TransitStatus::Accepted,
+				Err(_) => {
+					// Release the replay record so the hive can resend the
+					// same signed update after the failure clears.
+					#[cfg(feature = "x509")]
+					if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
+						$replay_guard.forget(signer_info.signature.as_bytes());
+					}
 
-			return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
-				status: $crate::policy::TransitStatus::Accepted,
-			});
+					$crate::policy::TransitStatus::Forbidden
+				}
+			};
+
+			return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse { status });
 		}
 
 		$crate::colony::common::ClusterRequest::Work(request) => {

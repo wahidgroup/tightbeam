@@ -133,6 +133,19 @@ pub(crate) fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets:
 	buffer
 }
 
+/// Check that every frame carried by an inbound envelope satisfies the same
+/// version/metadata compatibility the builder enforces at construction.
+fn envelope_versions_compatible(envelope: &TransportEnvelope) -> bool {
+	match envelope {
+		TransportEnvelope::Request(pkg) => pkg.message.validate_version_compatibility(),
+		TransportEnvelope::Response(pkg) => {
+			pkg.message.as_ref().is_none_or(|frame| frame.validate_version_compatibility())
+		}
+		#[cfg(feature = "x509")]
+		TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => true,
+	}
+}
+
 /// Base I/O operations for message transport
 pub trait MessageIO: ResponseHandler {
 	/// Read raw DER-encoded bytes from the transport
@@ -145,7 +158,12 @@ pub trait MessageIO: ResponseHandler {
 
 	/// Decode envelope from DER bytes
 	fn decode_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
-		Ok(TransportEnvelope::from_der(buffer)?)
+		let envelope = TransportEnvelope::from_der(buffer)?;
+		if !envelope_versions_compatible(&envelope) {
+			return Err(TransportError::InvalidMessage);
+		}
+
+		Ok(envelope)
 	}
 
 	/// Encode envelope to DER bytes
@@ -961,6 +979,9 @@ pub trait Pingable {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::asn1::{MessagePriority, Metadata};
+	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
+	use crate::Version;
 
 	#[test]
 	fn parse_short_form_length() {
@@ -995,5 +1016,39 @@ mod tests {
 	fn reject_octet_count_mismatch() {
 		assert_eq!(parse_der_length(0x82, &[0x01]), None);
 		assert_eq!(parse_der_length(0x81, &[]), None);
+	}
+
+	fn frame_with_priority(version: Version) -> Frame {
+		let mut metadata = Metadata::default();
+		metadata.priority = Some(MessagePriority::Standard);
+
+		Frame { version, metadata, message: Vec::new(), integrity: None, nonrepudiation: None }
+	}
+
+	#[test]
+	fn request_with_incompatible_metadata_rejected() {
+		let envelope = TransportEnvelope::Request(RequestPackage::new(frame_with_priority(Version::V0)));
+		assert!(!envelope_versions_compatible(&envelope));
+	}
+
+	#[test]
+	fn request_with_compatible_metadata_accepted() {
+		let envelope = TransportEnvelope::Request(RequestPackage::new(frame_with_priority(Version::V2)));
+		assert!(envelope_versions_compatible(&envelope));
+	}
+
+	#[test]
+	fn response_with_incompatible_metadata_rejected() {
+		let envelope = TransportEnvelope::Response(ResponsePackage::new(
+			TransitStatus::Accepted,
+			Some(frame_with_priority(Version::V0)),
+		));
+		assert!(!envelope_versions_compatible(&envelope));
+	}
+
+	#[test]
+	fn response_without_frame_accepted() {
+		let envelope = TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Accepted, None));
+		assert!(envelope_versions_compatible(&envelope));
 	}
 }
