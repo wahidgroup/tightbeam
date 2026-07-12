@@ -244,12 +244,12 @@ pub fn verify_frame_signature(trust_store: &dyn CertificateTrust, frame: &Frame)
 // Replay Guard
 // ============================================================================
 
-/// Maximum distinct signatures remembered per freshness window
+/// Maximum distinct signatures remembered per signer per freshness window
 ///
-/// Legitimate traffic is bounded by the cluster's command rate inside
-/// one window; the guard fails closed at capacity rather than evicting,
-/// because an attacker cannot mint the fresh valid signatures needed to
-/// fill it.
+/// Legitimate traffic is bounded by a signer's command rate inside one
+/// window. Each signer's partition fails closed at capacity rather than
+/// evicting, because an unauthenticated attacker cannot create the fresh
+/// valid signatures needed to fill it.
 #[cfg(feature = "x509")]
 pub const REPLAY_GUARD_CAPACITY: usize = 1024;
 
@@ -258,12 +258,16 @@ pub const REPLAY_GUARD_CAPACITY: usize = 1024;
 /// A command is accepted when its `issued_at_ms` lies within
 /// `window_ms` of the hive clock (either direction, tolerating skew)
 /// AND its signature has not already been seen inside the window.
-/// Entries more than the window away from the current clock (either
-/// direction, tolerating backward clock steps) are pruned on each check,
-/// so memory is bounded by [`REPLAY_GUARD_CAPACITY`].
+/// Signatures are tracked per signer so one signer saturating its
+/// partition cannot block the others. Entries more than the window away
+/// from the current clock are pruned on each check, so memory is bounded by
+/// [`REPLAY_GUARD_CAPACITY`] per trusted signer.
+#[cfg(feature = "x509")]
+type SignerPartitions = HashMap<Vec<u8>, HashMap<Vec<u8>, u64>>;
+
 #[cfg(feature = "x509")]
 pub struct ReplayGuard {
-	seen: Mutex<HashMap<Vec<u8>, u64>>,
+	seen: Mutex<SignerPartitions>,
 	window_ms: u64,
 }
 
@@ -279,32 +283,37 @@ impl ReplayGuard {
 		now_ms.abs_diff(issued_at_ms) <= self.window_ms
 	}
 
-	/// Record `signature` if unseen within the window
+	/// Record `signature` for `signer` if unseen within the window
 	///
 	/// Returns `true` when the signature is new (and now recorded).
-	/// Returns `false` for replays, and fails closed when the guard is
-	/// at capacity or its lock is poisoned.
-	pub fn check_and_insert(&self, signature: &[u8], now_ms: u64) -> bool {
+	/// Returns `false` for replays, and fails closed when the signer's
+	/// partition is at capacity or the lock is poisoned.
+	pub fn check_and_insert(&self, signer: &[u8], signature: &[u8], now_ms: u64) -> bool {
 		let Ok(mut seen) = self.seen.lock() else {
 			return false;
 		};
 
 		// After a backward clock step the recorded timestamps sit in the
 		// future, and a past-only check would retain them until the clock
-		// re-passes them, pinning the guard at capacity (fail-closed) for
-		// the duration. Replays of the pruned signatures stay rejected by
-		// the is_fresh check, which is more than window_ms out of range for
-		// the same reason.
-		seen.retain(|_, ts| now_ms.abs_diff(*ts) <= self.window_ms);
+		// re-passes them, pinning partitions at capacity the duration.
+		seen.retain(|_, sigs| {
+			sigs.retain(|_, ts| now_ms.abs_diff(*ts) <= self.window_ms);
+			!sigs.is_empty()
+		});
 
-		if seen.contains_key(signature) {
+		// Replay detection spans all partitions: the same certificate can be
+		// named by either SignerIdentifier CHOICE arm, so a partition-local
+		// check would grant one extra replay per alternate encoding.
+		if seen.values().any(|sigs| sigs.contains_key(signature)) {
 			return false;
 		}
-		if seen.len() >= REPLAY_GUARD_CAPACITY {
+
+		let sigs = seen.entry(signer.to_vec()).or_default();
+		if sigs.len() >= REPLAY_GUARD_CAPACITY {
 			return false;
 		}
 
-		seen.insert(signature.to_vec(), now_ms);
+		sigs.insert(signature.to_vec(), now_ms);
 
 		true
 	}
@@ -396,7 +405,15 @@ impl GatePolicy for ClusterSecurityGate {
 		if !self.replay_guard.is_fresh(command.issued_at_ms, now) {
 			return TransitStatus::Forbidden;
 		}
-		if !self.replay_guard.check_and_insert(signer_info.signature.as_bytes(), now) {
+		// Signer identifier keys the replay partition; an unencodable
+		// identifier cannot be attributed, so it fails closed.
+		let Ok(signer_id) = signer_info.sid.to_der() else {
+			return TransitStatus::Forbidden;
+		};
+		if !self
+			.replay_guard
+			.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now)
+		{
 			return TransitStatus::Forbidden;
 		}
 
@@ -506,25 +523,44 @@ mod tests {
 	#[test]
 	fn replay_guard_accepts_first_rejects_second() {
 		let guard = ReplayGuard::new(30_000);
-		assert!(guard.check_and_insert(b"sig-a", 1_000));
-		assert!(!guard.check_and_insert(b"sig-a", 2_000));
-		assert!(guard.check_and_insert(b"sig-b", 2_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
+		assert!(!guard.check_and_insert(b"signer-1", b"sig-a", 2_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-b", 2_000));
 	}
 
 	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_prunes_expired_entries() {
 		let guard = ReplayGuard::new(1_000);
-		assert!(guard.check_and_insert(b"sig-a", 1_000));
-		assert!(guard.check_and_insert(b"sig-a", 3_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 3_000));
 	}
 
 	#[cfg(feature = "x509")]
 	#[test]
 	fn replay_guard_prunes_future_dated_entries_after_clock_regression() {
 		let guard = ReplayGuard::new(1_000);
-		assert!(guard.check_and_insert(b"sig-a", 10_000));
-		assert!(guard.check_and_insert(b"sig-a", 5_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 10_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 5_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_saturated_signer_does_not_block_others() {
+		let guard = ReplayGuard::new(30_000);
+		for i in 0..REPLAY_GUARD_CAPACITY {
+			assert!(guard.check_and_insert(b"signer-1", &i.to_be_bytes(), 1_000));
+		}
+		assert!(!guard.check_and_insert(b"signer-1", b"sig-overflow", 1_000));
+		assert!(guard.check_and_insert(b"signer-2", b"sig-a", 1_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_rejects_replay_across_signer_partitions() {
+		let guard = ReplayGuard::new(30_000);
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
+		assert!(!guard.check_and_insert(b"signer-2", b"sig-a", 1_000));
 	}
 
 	#[cfg(feature = "x509")]

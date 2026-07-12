@@ -2224,7 +2224,7 @@ let hive_conf = HiveConf {
 };
 ```
 
-When `hive_tls` is set, the hive control server binds with TLS and outbound control frames (registration, scaling updates) are signed with the hive key. Clusters configured with `hive_trust` reject unsigned control frames.
+When `hive_tls` is set, the hive control server binds with TLS and outbound control frames (registration, scaling updates) are signed with the hive key. Cluster gateways reject control frames they cannot verify against `hive_trust`, so hives participating in a cluster require a signing identity.
 
 ##### HiveConf Reference
 
@@ -2310,7 +2310,7 @@ let tls = ClusterTlsConfig {
 
 For hives to trust cluster commands (like heartbeats), they must have the cluster's certificate in their trust store. See [Trust Stores](#trust-stores) for details.
 
-When `hive_trust` is configured, the gateway rejects unsigned hive-origin control frames (registration, servlet address updates): registration replies carry `TransitStatus::Unauthorized` for missing signatures and `TransitStatus::Forbidden` for signatures that fail verification. Leaving `hive_trust` as `None` accepts unsigned control frames and is intended for development only.
+The gateway requires `hive_trust` for hive-origin control frames (registration, servlet address updates): registration replies carry `TransitStatus::Unauthorized` for missing signatures and `TransitStatus::Forbidden` for signatures that fail verification. Leaving `hive_trust` as `None` fails closed -- all control frames are rejected with `TransitStatus::Forbidden`, mirroring the hive-side trust store requirement.
 
 ##### Heartbeat Mechanism
 

@@ -347,9 +347,9 @@ macro_rules! cluster {
 		}
 
 		// Hive-origin control frames (registration, address updates) must
-		// carry a signature verifiable against `tls.hive_trust` when it is
-		// configured. Without a trust store the gateway accepts unsigned
-		// frames -- development mode only.
+		// carry a signature verifiable against `tls.hive_trust`. A gateway
+		// without a trust store fails closed because accepting unauthenticated
+		// control frames lets any network peer poison routing state (CWE-306).
 		#[cfg(feature = "x509")]
 		let verify_hive_origin = || match $config.tls.hive_trust.as_ref() {
 			Some(trust) => match $crate::colony::hive::verify_frame_signature(trust.as_ref(), &$frame) {
@@ -357,7 +357,7 @@ macro_rules! cluster {
 				$crate::colony::hive::TrustVerification::MissingSignature => $crate::policy::TransitStatus::Unauthorized,
 				_ => $crate::policy::TransitStatus::Forbidden,
 			},
-			None => $crate::policy::TransitStatus::Accepted,
+			None => $crate::policy::TransitStatus::Forbidden,
 		};
 		#[cfg(not(feature = "x509"))]
 		let verify_hive_origin = || $crate::policy::TransitStatus::Accepted;
@@ -365,13 +365,8 @@ macro_rules! cluster {
 		// Signed control frames must additionally be fresh and unseen: a
 		// captured registration or address update carries a valid signature,
 		// so signature verification alone cannot stop replay (CWE-294).
-		// Enforced only when a trust store is configured.
 		#[cfg(feature = "x509")]
 		let verify_control_freshness = |issued_at_ms: u64| {
-			if $config.tls.hive_trust.is_none() {
-				return $crate::policy::TransitStatus::Accepted;
-			}
-
 			let now = $crate::colony::common::current_timestamp_ms();
 			if !$replay_guard.is_fresh(issued_at_ms, now) {
 				return $crate::policy::TransitStatus::Forbidden;
@@ -380,7 +375,13 @@ macro_rules! cluster {
 			let Some(signer_info) = $frame.nonrepudiation.as_ref() else {
 				return $crate::policy::TransitStatus::Unauthorized;
 			};
-			if !$replay_guard.check_and_insert(signer_info.signature.as_bytes(), now) {
+
+			// Signer identifier keys the replay partition; an unencodable
+			// identifier cannot be attributed.
+			let Ok(signer_id) = $crate::der::Encode::to_der(&signer_info.sid) else {
+				return $crate::policy::TransitStatus::Forbidden;
+			};
+			if !$replay_guard.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now) {
 				return $crate::policy::TransitStatus::Forbidden;
 			}
 

@@ -395,6 +395,76 @@ tb_scenario! {
 }
 
 // ============================================================================
+// Missing Trust Store Fails Closed
+// ============================================================================
+
+tb_assert_spec! {
+	pub ClusterNoTrustStoreSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("registration_sent", exactly!(1)),
+			("registration_forbidden", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: cluster_without_hive_trust_rejects_control_frames,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ClusterNoTrustStoreSpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let certs = get_cluster_test_certs();
+
+			// Gateway without hive_trust cannot authenticate control
+			// frames and must fail closed: even a validly signed
+			// registration is rejected.
+			let tls = ClusterTlsConfig {
+				certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
+				key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+				validators: vec![],
+				client_validators: vec![],
+				hive_trust: None,
+			};
+			let cluster = ClusterGateway::start(Arc::new(TraceCollector::new()), ClusterConf::new(tls)).await?;
+			let cluster_addr = cluster.addr();
+
+			let builder = ClientBuilder::<TokioListener>::builder()
+				.with_trust_store(Arc::clone(&certs.trust))
+				.build();
+			let mut client = builder.connect(cluster_addr).await?;
+
+			let signed = signed_control_frame(
+				certs,
+				b"no-trust-reg",
+				registration_request(current_timestamp_ms(), b"127.0.0.1:65000"),
+			).await?;
+
+			trace.event("registration_sent")?;
+
+			let response_frame = client.emit(signed, None).await?.ok_or(TightBeamError::MissingResponse)?;
+			let response: RegisterHiveResponse = decode(&response_frame.message)?;
+			assert_eq!(
+				response.status,
+				TransitStatus::Forbidden,
+				"gateway without hive_trust must reject signed control frames"
+			);
+			assert!(response.hive_id.is_none(), "rejected registration must not assign a hive id");
+			assert_eq!(cluster.hive_count(), 0, "rejected hive must not enter the registry");
+
+			trace.event("registration_forbidden")?;
+
+			cluster.stop();
+
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
 // Replayed / Stale Control Frame Rejection
 // ============================================================================
 
@@ -544,11 +614,6 @@ tb_scenario! {
 	environment Bare {
 		exec: |trace| async move {
 			let certs = get_cluster_test_certs();
-
-			// The hive has no trust store, so its security gate fails
-			// closed and answers cluster heartbeats with a Forbidden
-			// heartbeat-shaped response. A decoded rejection must count
-			// as a failure, not reset the failure count.
 			let rejected_decoded = Arc::new(AtomicBool::new(false));
 			let rejected_flag = Arc::clone(&rejected_decoded);
 			let heartbeat = HeartbeatConf::builder()
