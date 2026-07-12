@@ -67,9 +67,11 @@ impl HiveRegistry {
 
 		let metadata: Option<Arc<[u8]>> = request.metadata.map(Into::into);
 
+		let address = Arc::clone(&hive_id);
+		let entry_servlet_types = Arc::clone(&servlet_types);
 		let entry = HiveEntry {
-			address: Arc::clone(&hive_id),
-			servlet_types: Arc::clone(&servlet_types),
+			address,
+			servlet_types: entry_servlet_types,
 			utilization: BasisPoints::default(),
 			last_seen: Instant::now(),
 			metadata,
@@ -82,13 +84,16 @@ impl HiveRegistry {
 		// Add to hives map
 		{
 			let mut hives = self.hives.write()?;
-			hives.insert(Arc::clone(&hive_id), entry);
+			let hive_id = Arc::clone(&hive_id);
+			hives.insert(hive_id, entry);
 		}
 
 		{
 			let mut index = self.servlet_index.write()?;
 			for servlet_type in servlet_types.iter() {
-				index.entry(Arc::clone(servlet_type)).or_default().push(Arc::clone(&hive_id));
+				let servlet_type = Arc::clone(servlet_type);
+				let hive_id = Arc::clone(&hive_id);
+				index.entry(servlet_type).or_default().push(hive_id);
 			}
 		}
 

@@ -399,9 +399,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 		P::Signature: SignatureEncoding,
 	{
-		let server =
-			EciesHandshakeServer::<P>::new(Arc::clone(&self.provider), server_cert, aad_domain_tag, client_validators)
-				.with_supported_profiles(supported_profiles);
+		let provider = Arc::clone(&self.provider);
+		let mut server = EciesHandshakeServer::<P>::new(provider, server_cert, aad_domain_tag, client_validators);
+		server = server.with_supported_profiles(supported_profiles);
 
 		Ok(Box::new(server))
 	}
@@ -444,11 +444,13 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 
 		let client = EciesHandshakeClient::<P, M>::new_with_identity(aad_domain_tag, client_cert, provider_opt);
 
-		Ok(Box::new(if let Some(val) = validator {
-			client.with_certificate_validator(val)
+		let client = if let Some(validator) = validator {
+			client.with_certificate_validator(validator)
 		} else {
 			client
-		}))
+		};
+
+		Ok(Box::new(client))
 	}
 
 	/// Create a CMS client handshake orchestrator using the encapsulated key provider.
@@ -480,11 +482,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::AeadCipher: Send + Sync + KeyInit,
 	{
 		let provider = P::default();
-		let mut client = crate::transport::handshake::client::CmsHandshakeClient::<P>::new(
-			provider,
-			Arc::clone(&self.provider),
-			server_cert,
-		);
+		let key_provider = Arc::clone(&self.provider);
+		let mut client =
+			crate::transport::handshake::client::CmsHandshakeClient::<P>::new(provider, key_provider, server_cert);
 
 		if let Some(store) = trust_store {
 			client = client.with_trust_store(store);
@@ -518,11 +518,10 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::Digest: Send + 'static,
 		P::AeadCipher: Send + Sync + KeyInit + 'static,
 	{
-		let server = crate::transport::handshake::server::CmsHandshakeServer::<P>::new(
-			Arc::clone(&self.provider),
-			client_validators,
-		)
-		.with_supported_profiles(supported_profiles);
+		let provider = Arc::clone(&self.provider);
+
+		let mut server = crate::transport::handshake::server::CmsHandshakeServer::<P>::new(provider, client_validators);
+		server = server.with_supported_profiles(supported_profiles);
 
 		Ok(Box::new(server))
 	}

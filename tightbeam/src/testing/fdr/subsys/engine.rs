@@ -418,9 +418,12 @@ impl<'a> DefaultFdrExplorer<'a> {
 	/// Accepts either owned `FdrConfig` or `Arc<FdrConfig>`.
 	pub fn with_defaults(process: &'a Process, config: impl Into<Arc<FdrConfig>>) -> Self {
 		let config = config.into();
-		let explorer = DefaultExplorationEngine::new(process, Arc::clone(&config));
+		let explorer_config = Arc::clone(&config);
+		let explorer = DefaultExplorationEngine::new(process, explorer_config);
 		let cache = Rc::new(RefCell::new(DefaultCache::new()));
-		let refinement = DefaultRefinementChecker::new(process, Arc::clone(&config), cache);
+		let refinement_config = Arc::clone(&config);
+		let refinement = DefaultRefinementChecker::new(process, refinement_config, cache);
+
 		FdrExplorer::new_with_arc(process, config, explorer, refinement)
 	}
 }

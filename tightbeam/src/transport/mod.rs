@@ -89,9 +89,10 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 #[cfg(feature = "x509")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager<P>) -> Self {
+		let key_manager = Arc::new(key_manager);
 		Self {
 			certificate,
-			key_manager: Arc::new(key_manager),
+			key_manager,
 			client_validators: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			max_cleartext_envelope: 128 * 1024,
@@ -101,7 +102,8 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	}
 
 	pub fn with_client_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
-		self.client_validators = Some(Arc::new(validators));
+		let validators = Arc::new(validators);
+		self.client_validators = Some(validators);
 		self
 	}
 }

@@ -279,7 +279,8 @@ mod tests {
 			// 3. Create KARI builder and build EnvelopedData with unprotected attributes
 			let kari_builder = create_test_kari_builder(sender_key, sender_spki, recipient_pubkey);
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let builder = builder.with_unprotected_attr(test_attr.clone());
+			let attr = test_attr.clone();
+			let builder = builder.with_unprotected_attr(attr);
 			let enveloped_data = builder.build(b"Test with attributes", None, None)?;
 
 			// 4. Extract attributes using processor

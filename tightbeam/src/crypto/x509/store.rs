@@ -560,10 +560,15 @@ mod tests {
 		let builder: TestBuilder = Secp256k1Policy.into();
 		let builder = match certs {
 			StoreCerts::None => builder,
-			StoreCerts::Root => builder.with_certificate(chain.root.clone())?,
-			StoreCerts::RootAndIntermediate => builder
-				.with_certificate(chain.root.clone())?
-				.with_certificate(chain.intermediate.clone())?,
+			StoreCerts::Root => {
+				let certificate = chain.root.clone();
+				builder.with_certificate(certificate)?
+			}
+			StoreCerts::RootAndIntermediate => {
+				let root = chain.root.clone();
+				let intermediate = chain.intermediate.clone();
+				builder.with_certificate(root)?.with_certificate(intermediate)?
+			}
 		};
 
 		Ok(builder.build())
@@ -592,7 +597,8 @@ mod tests {
 	#[test]
 	fn is_trusted_matches_fingerprint() -> TestResult {
 		let cert = create_test_certificate(&create_test_signing_key());
-		let store = TestBuilder::from(Secp256k1Policy).with_certificate(cert.clone())?.build();
+		let certificate = cert.clone();
+		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 		assert!(store.is_trusted(&cert));
 		assert!(!store.is_trusted(&create_test_certificate(&SigningKey::from_bytes(&[2u8; 32].into())?)));
 		Ok(())
@@ -601,9 +607,8 @@ mod tests {
 	#[test]
 	fn builder_validates_chain_structure() -> TestResult {
 		let chain = create_test_certificate_chain()?;
-		assert!(TestBuilder::from(Secp256k1Policy)
-			.with_chain(vec![chain.root, chain.intermediate, chain.leaf])
-			.is_ok());
+		let chain = vec![chain.root, chain.intermediate, chain.leaf];
+		assert!(TestBuilder::from(Secp256k1Policy).with_chain(chain).is_ok());
 
 		Ok(())
 	}
@@ -706,7 +711,8 @@ mod tests {
 			let mut root = chain.root.clone();
 			root.tbs_certificate.extensions = Some(ca_extensions(*ca, *key_cert_sign, *path_len));
 
-			let store = TestBuilder::from(Secp256k1Policy).with_certificate(root.clone())?.build();
+			let certificate = root.clone();
+			let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 			let result = store.verify_chain(&[root, chain.intermediate, chain.leaf]);
 			assert!(matches!(result, Err(ref e) if core::mem::discriminant(e) == core::mem::discriminant(expected)));
 		}
@@ -764,7 +770,8 @@ mod tests {
 	fn find_by_signer_info_skid() -> TestResult {
 		let key = create_test_signing_key();
 		let cert = create_test_certificate(&key);
-		let store = TestBuilder::from(Secp256k1Policy).with_certificate(cert.clone())?.build();
+		let certificate = cert.clone();
+		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 
 		// Create signer info via Signatory trait (uses SHA3-256 for SKID)
 		let signer_info = key.to_signer_info(b"test")?;

@@ -235,9 +235,12 @@ where
 
 		if self.to_handshake_state() == TcpHandshakeState::Complete {
 			let encryptor = self.to_encryptor_ref()?;
-			builder = builder.with_wire_mode(WireMode::Encrypted).with_encryptor(encryptor);
+			let wire_mode = WireMode::Encrypted;
+			builder = builder.with_wire_mode(wire_mode);
+			builder = builder.with_encryptor(encryptor);
 		} else {
-			builder = builder.with_wire_mode(WireMode::Cleartext);
+			let wire_mode = WireMode::Cleartext;
+			builder = builder.with_wire_mode(wire_mode);
 		}
 
 		let wire_envelope = builder.build()?;
@@ -522,17 +525,21 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<std::net
 	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
 		let listener = std::net::TcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
+		let certificate = Arc::new(config.certificate);
+		let client_validators = config.client_validators.as_ref().map(Arc::clone);
+		let key_manager = Arc::clone(&config.key_manager);
+
 		Ok((
 			TcpListener {
 				listener,
-				certificate: Some(Arc::new(config.certificate)),
+				certificate: Some(certificate),
 				#[cfg(feature = "x509")]
-				client_validators: config.client_validators.as_ref().map(Arc::clone),
+				client_validators,
 				aad_domain_tag: Some(config.aad_domain_tag),
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 
-				key_manager: Some(Arc::clone(&config.key_manager)),
+				key_manager: Some(key_manager),
 				handshake_timeout: Some(config.handshake_timeout),
 			},
 			TightBeamSocketAddr(bound_addr),

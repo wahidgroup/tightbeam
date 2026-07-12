@@ -850,6 +850,7 @@ mod tests {
 			// Create a previous message hash for linking
 			let previous_hash = crate::utils::digest::<Sha3_256>(b"previous-message-data")?;
 			let rng = rand_core::OsRng;
+			let rng = Box::new(rng);
 
 			builder
 				.with_message(msg)
@@ -858,7 +859,7 @@ mod tests {
 				.with_message_hasher::<Sha3_256>([])
 				.with_witness_hasher::<Sha3_256>()
 				.with_compression(ZstdCompression::default())
-				.with_rng(Box::new(rng))
+				.with_rng(rng)
 				.with_aead::<Aes256GcmOid, Aes256Gcm>(cipher)
 				.with_signer::<Secp256k1Signature, _>(signing_key)
 				.with_priority(crate::MessagePriority::LowLatency)

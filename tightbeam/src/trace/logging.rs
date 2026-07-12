@@ -342,7 +342,10 @@ mod tests {
 	#[test]
 	fn test_logger_config_default_level() -> Result<(), crate::TightBeamError> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-		let backend = CaptureBackend::with_captured(Arc::clone(&captured));
+		let backend = {
+			let captured = Arc::clone(&captured);
+			CaptureBackend::with_captured(captured)
+		};
 		let config =
 			LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Info);
 		let trace = TraceCollector::default().with_logger(config);
@@ -364,7 +367,10 @@ mod tests {
 	#[test]
 	fn test_logger_config_no_default_level() -> Result<(), crate::TightBeamError> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-		let backend = CaptureBackend::with_captured(Arc::clone(&captured));
+		let backend = {
+			let captured = Arc::clone(&captured);
+			CaptureBackend::with_captured(captured)
+		};
 		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 
@@ -383,7 +389,11 @@ mod tests {
 	#[test]
 	fn test_log_filter_with_logger() -> Result<(), crate::TightBeamError> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-		let backend = CaptureBackend::with_captured(Arc::clone(&captured));
+		let backend = {
+			let captured = Arc::clone(&captured);
+			CaptureBackend::with_captured(captured)
+		};
+
 		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Warning));
 		let trace = TraceCollector::default().with_logger(config);
 
@@ -409,11 +419,16 @@ mod tests {
 		let captured1 = Arc::new(std::sync::Mutex::new(Vec::new()));
 		let captured2 = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-		let backend1 = CaptureBackend::with_captured(Arc::clone(&captured1));
-		let backend2 = CaptureBackend::with_captured(Arc::clone(&captured2));
+		let backend1 = {
+			let captured = Arc::clone(&captured1);
+			CaptureBackend::with_captured(captured)
+		};
+		let backend2 = {
+			let captured = Arc::clone(&captured2);
+			CaptureBackend::with_captured(captured)
+		};
 
 		let multiplex = MultiplexBackend::new(vec![Box::new(backend1), Box::new(backend2)]);
-
 		let config = LoggerConfig::new(Box::new(multiplex), LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 

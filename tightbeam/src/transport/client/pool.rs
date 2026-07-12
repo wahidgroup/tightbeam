@@ -95,7 +95,10 @@ impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 	}
 
 	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager<C>) {
-		self.client_identity = Some(ClientIdentity { certificate: Arc::new(cert), key: Arc::new(key) });
+		let certificate = Arc::new(cert);
+		let key = Arc::new(key);
+
+		self.client_identity = Some(ClientIdentity { certificate, key });
 	}
 
 	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
@@ -105,7 +108,8 @@ impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 	{
 		let mut configured = transport;
 		if let Some(store) = &self.trust_store {
-			configured = configured.with_trust_store(Arc::clone(store));
+			let store = Arc::clone(store);
+			configured = configured.with_trust_store(store);
 		}
 
 		if let Some(identity) = &self.client_identity {
@@ -316,7 +320,9 @@ where
 
 		dest_pool.in_use += 1;
 
-		Ok(SlotGuard::new(Arc::clone(self), addr.clone()))
+		let pool = Arc::clone(self);
+		let addr = addr.clone();
+		Ok(SlotGuard::new(pool, addr))
 	}
 
 	fn prune_idle_locked(&self, dest_pool: &mut DestinationPool<P>, now: Instant) {

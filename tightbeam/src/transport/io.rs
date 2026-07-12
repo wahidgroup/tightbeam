@@ -250,9 +250,12 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		if self.to_handshake_state() == TcpHandshakeState::Complete {
 			let encryptor = self.to_encryptor_ref()?;
-			builder = builder.with_wire_mode(WireMode::Encrypted).with_encryptor(encryptor);
+			let wire_mode = WireMode::Encrypted;
+			builder = builder.with_wire_mode(wire_mode);
+			builder = builder.with_encryptor(encryptor);
 		} else {
-			builder = builder.with_wire_mode(WireMode::Cleartext);
+			let wire_mode = WireMode::Cleartext;
+			builder = builder.with_wire_mode(wire_mode);
 		}
 
 		builder.finish()
@@ -339,7 +342,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Use trust store for server certificate validation
 		#[cfg(all(feature = "x509", feature = "std"))]
 		if let Some(store) = self.to_trust_store_ref() {
-			client = client.with_certificate_validator(Arc::clone(store) as Arc<dyn CertificateValidation>);
+			let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
+			client = client.with_certificate_validator(validator);
 		}
 
 		// Step 1: Build and send client hello

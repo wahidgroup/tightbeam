@@ -486,9 +486,11 @@ where
 		key: Arc<dyn SigningKeyProvider>,
 		validators: Vec<Arc<dyn CertificateValidation>>,
 	) -> Result<Self, TightBeamError> {
-		let cert_obj = Certificate::try_from(cert)?;
-		let key_mgr: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
-		self.x509_config = Some(TransportEncryptionConfig::new(cert_obj, key_mgr).with_client_validators(validators));
+		let certificate = Certificate::try_from(cert)?;
+		let key_manager: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
+		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+
+		self.x509_config = Some(encryption_config.with_client_validators(validators));
 		Ok(self)
 	}
 
@@ -514,7 +516,8 @@ where
 	where
 		G: GatePolicy + Send + Sync + 'static,
 	{
-		self.collector_gates.push(Arc::new(gate));
+		let gate = Arc::new(gate);
+		self.collector_gates.push(gate);
 		self
 	}
 
@@ -530,7 +533,8 @@ where
 	where
 		D: Decryptor + Send + Sync + 'static,
 	{
-		self.message_decryptor = Some(Arc::new(decryptor));
+		let decryptor = Arc::new(decryptor);
+		self.message_decryptor = Some(decryptor);
 		self
 	}
 
@@ -539,7 +543,8 @@ where
 	where
 		I: Inflator + Send + Sync + 'static,
 	{
-		self.message_inflator = Some(Arc::new(inflator));
+		let inflator = Arc::new(inflator);
+		self.message_inflator = Some(inflator);
 		self
 	}
 
@@ -588,7 +593,8 @@ where
 	where
 		G: GatePolicy + Send + Sync + 'static,
 	{
-		self.collector_gates.push(Arc::new(gate));
+		let gate = Arc::new(gate);
+		self.collector_gates.push(gate);
 		self
 	}
 
@@ -604,7 +610,8 @@ where
 	where
 		D: Decryptor + Send + Sync + 'static,
 	{
-		self.message_decryptor = Some(Arc::new(decryptor));
+		let decryptor = Arc::new(decryptor);
+		self.message_decryptor = Some(decryptor);
 		self
 	}
 
@@ -613,7 +620,8 @@ where
 	where
 		I: Inflator + Send + Sync + 'static,
 	{
-		self.message_inflator = Some(Arc::new(inflator));
+		let inflator = Arc::new(inflator);
+		self.message_inflator = Some(inflator);
 		self
 	}
 

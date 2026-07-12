@@ -225,7 +225,8 @@ pub trait MessageEmitter: MessageIO {
 		// Build the request around a shared Arc so the frame stays available
 		// for retry without pattern-matching the envelope back apart.
 		let frame_arc = Arc::new(message);
-		let envelope = TransportEnvelope::Request(RequestPackage { message: Arc::clone(&frame_arc) });
+		let message = Arc::clone(&frame_arc);
+		let envelope = TransportEnvelope::Request(RequestPackage { message });
 
 		// Send the envelope
 		self.write_envelope(&envelope.to_der()?).await?;

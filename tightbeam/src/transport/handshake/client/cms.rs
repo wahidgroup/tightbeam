@@ -124,7 +124,8 @@ where
 
 	/// Set client certificate for mutual authentication.
 	pub fn with_client_certificate(mut self, certificate: impl Into<Certificate>) -> Self {
-		self.client_certificate = Some(Arc::new(certificate.into()));
+		let certificate = Arc::new(certificate.into());
+		self.client_certificate = Some(certificate);
 		self
 	}
 
@@ -704,8 +705,9 @@ mod tests {
 		// Given: A CMS client in init state with a server certificate
 		let transcript_hash = [1u8; 32];
 		let server_test_cert = create_test_certificate();
+		let server_cert = server_test_cert.certificate.clone();
 		let mut client = TestCmsClientBuilder::new()
-			.with_server_cert(server_test_cert.certificate.clone())
+			.with_server_cert(server_cert)
 			.with_transcript_hash(transcript_hash)
 			.build()?;
 		assert_eq!(client.state(), ClientHandshakeState::Init);
@@ -805,9 +807,8 @@ mod tests {
 			Ok(signed_data.to_der()?)
 		};
 
-		let mut client = TestCmsClientBuilder::new()
-			.build()?
-			.with_security_offer(SecurityOffer::new(vec![offered]));
+		let offer = SecurityOffer::new(vec![offered]);
+		let mut client = TestCmsClientBuilder::new().build()?.with_security_offer(offer);
 
 		let accepted = build_finished_with_accept(offered)?;
 		client.process_security_accept(&accepted)?;

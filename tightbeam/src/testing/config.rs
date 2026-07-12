@@ -240,7 +240,8 @@ mod tests {
 		}
 
 		let custom_config = TestEnvConfig { value: 123 };
-		let config = ScenarioConf::builder().with_env_config(custom_config.clone()).build();
+		let env_config = custom_config.clone();
+		let config = ScenarioConf::builder().with_env_config(env_config).build();
 		assert_eq!(config.env_config().value, 123);
 	}
 }

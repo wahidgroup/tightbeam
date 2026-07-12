@@ -15,6 +15,11 @@ readme = "README.md"
 keywords = ["cryptography", "security", "messaging", "protocol"]
 categories = ["cryptography", "network-programming"]
 
+[workspace.lints.clippy]
+# Zero-copy: Arc/Rc refcount bumps must be written as `Arc::clone(&x)` so they
+# disambiguated from deep copies.
+clone_on_ref_ptr = "deny"
+
 [workspace.dependencies]
 tightbeam-derive = { version = "0.1.6", path = "tightbeam-derive" }
 

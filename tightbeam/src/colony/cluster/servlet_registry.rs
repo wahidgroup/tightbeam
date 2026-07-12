@@ -225,7 +225,8 @@ impl ServletRegistry {
 
 		let previous = {
 			let mut entries = self.entries.write()?;
-			entries.insert(Arc::clone(&addr), entry)
+			let addr = Arc::clone(&addr);
+			entries.insert(addr, entry)
 		};
 
 		if let Some(ref prev) = previous {
@@ -235,7 +236,8 @@ impl ServletRegistry {
 		// Add to type index
 		{
 			let mut type_idx = self.type_index.write()?;
-			type_idx.entry(servlet_type).or_default().push(Arc::clone(&addr));
+			let addr = Arc::clone(&addr);
+			type_idx.entry(servlet_type).or_default().push(addr);
 		}
 
 		// Add to hive index

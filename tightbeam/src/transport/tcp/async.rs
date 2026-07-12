@@ -299,16 +299,20 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TokioListener<P> {
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await?;
 		let bound_addr = listener.local_addr()?;
+		let certificate = Arc::new(config.certificate);
+		let client_validators = config.client_validators.as_ref().map(Arc::clone);
+		let key_manager = Arc::clone(&config.key_manager);
+
 		Ok((
 			Self {
 				listener,
-				certificate: Some(Arc::new(config.certificate)),
-				client_validators: config.client_validators.as_ref().map(Arc::clone),
+				certificate: Some(certificate),
+				client_validators,
 				aad_domain_tag: Some(config.aad_domain_tag),
 				max_cleartext_envelope: Some(config.max_cleartext_envelope),
 				max_encrypted_envelope: Some(config.max_encrypted_envelope),
 				handshake_timeout: Some(config.handshake_timeout),
-				key_manager: Some(Arc::clone(&config.key_manager)),
+				key_manager: Some(key_manager),
 			},
 			crate::transport::tcp::TightBeamSocketAddr(bound_addr),
 		))
@@ -418,7 +422,8 @@ where
 {
 	/// Configure this transport as an encrypted server endpoint.
 	pub fn with_server_encryption(mut self, config: TransportEncryptionConfig<P>) -> Self {
-		self.server_identity = Some(Arc::new(config.certificate));
+		let certificate = Arc::new(config.certificate);
+		self.server_identity = Some(certificate);
 		self.client_validators = config.client_validators;
 		self.aad_domain_tag = Some(config.aad_domain_tag);
 		self.max_cleartext_envelope = Some(config.max_cleartext_envelope);
@@ -610,9 +615,12 @@ where
 
 		if self.to_handshake_state() == TcpHandshakeState::Complete {
 			let encryptor = self.to_encryptor_ref()?;
-			builder = builder.with_wire_mode(WireMode::Encrypted).with_encryptor(encryptor);
+			let wire_mode = WireMode::Encrypted;
+			builder = builder.with_wire_mode(wire_mode);
+			builder = builder.with_encryptor(encryptor);
 		} else {
-			builder = builder.with_wire_mode(WireMode::Cleartext);
+			let wire_mode = WireMode::Cleartext;
+			builder = builder.with_wire_mode(wire_mode);
 		}
 
 		let wire_envelope = builder.build()?;
@@ -706,10 +714,11 @@ mod tests {
 		let server = listener;
 		let server_handle = tokio::spawn(async move {
 			let (transport, _) = server.accept().await?;
-			let mut transport = transport.with_handler(Box::new(move |msg: Frame| {
+			let handler = Box::new(move |msg: Frame| {
 				let _ = tx.try_send(msg);
 				Some(response_msg.clone())
-			}));
+			});
+			let mut transport = transport.with_handler(handler);
 
 			transport.handle_request().await
 		});
@@ -864,13 +873,11 @@ mod tests {
 		let (tx, mut rx) = tokio::sync::mpsc::channel(2);
 		let server_handle = tokio::spawn(async move {
 			let (transport, _) = server.accept().await?;
-			let mut transport =
-				transport
-					.with_collector_gate(BusyFirstGate::new())
-					.with_handler(Box::new(move |msg: Frame| {
-						let _ = tx.try_send(msg.clone());
-						Some(msg)
-					}));
+			let handler = Box::new(move |msg: Frame| {
+				let _ = tx.try_send(msg.clone());
+				Some(msg)
+			});
+			let mut transport = transport.with_collector_gate(BusyFirstGate::new()).with_handler(handler);
 
 			// First handle_request: processes handshake (ClientHello + ClientKeyExchange)
 			// and first application message. Gate returns Busy for first app message.

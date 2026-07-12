@@ -421,7 +421,8 @@ mod tests {
 		#[test]
 		fn accepts_configured_anchor() {
 			let cert = test_cert();
-			let validator = DirectTrustValidator::default().with_trust_chain(vec![cert.clone()]);
+			let trust_chain = vec![cert.clone()];
+			let validator = DirectTrustValidator::default().with_trust_chain(trust_chain);
 			assert!(validator.evaluate(&cert).is_ok());
 		}
 

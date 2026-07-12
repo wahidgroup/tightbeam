@@ -728,9 +728,8 @@ mod tests {
 	fn run_wcet_test_case(case: &WcetTestCase) -> Result<(), TestingError> {
 		let result = verify_constraints(
 			|constraints| {
-				let wcet_config = WcetConfigBuilder::default()
-					.with_duration(Duration::from_millis(case.constraint_ms))
-					.build()?;
+				let duration = Duration::from_millis(case.constraint_ms);
+				let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
 				constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
 				Ok(())
 			},
@@ -760,13 +759,17 @@ mod tests {
 	fn run_deadline_test_case(case: &DeadlineTestCase) -> Result<(), TestingError> {
 		let result = verify_constraints(
 			|constraints| {
+				let duration = Duration::from_millis(case.deadline_ms);
+				let start_event = Event(case.start_event);
+				let end_event = Event(case.end_event);
 				let mut builder = DeadlineBuilder::default()
-					.with_duration(Duration::from_millis(case.deadline_ms))
-					.with_start_event(Event(case.start_event))
-					.with_end_event(Event(case.end_event));
+					.with_duration(duration)
+					.with_start_event(start_event)
+					.with_end_event(end_event);
 
 				if let Some(slack_ms) = case.min_slack_ms {
-					builder = builder.with_min_slack(Duration::from_millis(slack_ms));
+					let min_slack = Duration::from_millis(slack_ms);
+					builder = builder.with_min_slack(min_slack);
 				}
 
 				constraints.add_deadline(builder.build()?);
@@ -832,7 +835,8 @@ mod tests {
 	#[test]
 	fn test_wcet_no_duration() -> Result<(), TestingError> {
 		let mut constraints = TimingConstraints::default();
-		let wcet_config = WcetConfigBuilder::default().with_duration(Duration::from_millis(100)).build()?;
+		let duration = Duration::from_millis(100);
+		let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
 		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
 
 		let mut trace = ConsumedTrace::new();
@@ -862,15 +866,20 @@ mod tests {
 
 	/// Helper to create WCET config
 	fn create_wcet_config(ms: u64) -> Result<WcetConfig, TestingError> {
-		WcetConfigBuilder::default().with_duration(Duration::from_millis(ms)).build()
+		let duration = Duration::from_millis(ms);
+		WcetConfigBuilder::default().with_duration(duration).build()
 	}
 
 	/// Helper to create deadline
 	fn create_deadline(ms: u64, start: &'static str, end: &'static str) -> Result<Deadline, TestingError> {
+		let duration = Duration::from_millis(ms);
+		let start_event = Event(start);
+		let end_event = Event(end);
+
 		DeadlineBuilder::default()
-			.with_duration(Duration::from_millis(ms))
-			.with_start_event(Event(start))
-			.with_end_event(Event(end))
+			.with_duration(duration)
+			.with_start_event(start_event)
+			.with_end_event(end_event)
 			.build()
 	}
 

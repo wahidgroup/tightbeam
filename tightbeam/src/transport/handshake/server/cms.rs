@@ -168,12 +168,11 @@ where
 			}
 		}
 
-		// Store the cert (used for extracting public key later)
-		let cert_arc = Arc::new(cert);
-		self.client_cert = Some(Arc::clone(&cert_arc));
+		let cert = Arc::new(cert);
+		self.client_cert = Some(Arc::clone(&cert));
 
 		// Store as validated cert (identity is now locked)
-		self.validated_client_cert = Some(cert_arc);
+		self.validated_client_cert = Some(cert);
 
 		Ok(())
 	}
@@ -871,10 +870,11 @@ mod tests {
 			});
 
 			let key_enc_alg = AlgorithmIdentifierOwned { oid: AES_128_WRAP, parameters: None };
+			let recipient_pub = *recipient_public_key;
 			let kari_builder = TightBeamKariBuilder::default()
 				.with_sender_priv(sender_ephemeral)
 				.with_sender_pub_spki(sender_pub_spki)
-				.with_recipient_pub(*recipient_public_key)
+				.with_recipient_pub(recipient_pub)
 				.with_recipient_rid(rid)
 				.with_ukm(ukm)
 				.with_key_enc_alg(key_enc_alg);

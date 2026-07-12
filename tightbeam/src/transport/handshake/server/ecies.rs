@@ -458,7 +458,8 @@ where
 			verifying_key.verify_prehash(&auth_digest, &signature)?;
 
 			// Store validated cert (identity is now locked)
-			self.validated_client_cert = Some(Arc::new(client_cert));
+			let client_cert = Arc::new(client_cert);
+			self.validated_client_cert = Some(client_cert);
 		}
 
 		Ok(())

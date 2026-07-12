@@ -186,10 +186,14 @@ mod tests {
 
 	/// Helper to create deadline constraint
 	fn create_deadline_constraint(ms: u64, start: &'static str, end: &'static str) -> Result<Deadline, TestingError> {
+		let duration = Duration::from_millis(ms);
+		let start_event = Event(start);
+		let end_event = Event(end);
+
 		DeadlineBuilder::default()
-			.with_duration(Duration::from_millis(ms))
-			.with_start_event(Event(start))
-			.with_end_event(Event(end))
+			.with_duration(duration)
+			.with_start_event(start_event)
+			.with_end_event(end_event)
 			.build()
 	}
 
@@ -290,6 +294,7 @@ mod tests {
 		for case in TIMING_VIOLATION_TEST_CASES {
 			run_timing_violation_test_case(case)?;
 		}
+
 		Ok(())
 	}
 
@@ -307,7 +312,8 @@ mod tests {
 	#[test]
 	fn test_event_wcet_violation() -> Result<(), Box<dyn core::error::Error>> {
 		let mut constraints = TimingConstraints::default();
-		let wcet_config = WcetConfigBuilder::default().with_duration(Duration::from_millis(100)).build()?;
+		let duration = Duration::from_millis(100);
+		let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
 		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
 
 		// WCET within constraint: no violation

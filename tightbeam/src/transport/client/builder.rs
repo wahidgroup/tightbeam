@@ -93,7 +93,8 @@ impl ClientPolicies {
 	where
 		G: GatePolicy + Send + Sync + 'static,
 	{
-		self.emitter_gates.push(DynGate(Arc::new(gate)));
+		let gate = Arc::new(gate);
+		self.emitter_gates.push(DynGate(gate));
 		self
 	}
 
@@ -101,7 +102,8 @@ impl ClientPolicies {
 	where
 		G: GatePolicy + Send + Sync + 'static,
 	{
-		self.collector_gates.push(DynGate(Arc::new(gate)));
+		let gate = Arc::new(gate);
+		self.collector_gates.push(DynGate(gate));
 		self
 	}
 
@@ -219,7 +221,10 @@ where
 			transport = transport.with_trust_store(store);
 		}
 		if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
-			transport = transport.with_client_identity(Arc::new(cert), Arc::new(key));
+			let cert = Arc::new(cert);
+			let key = Arc::new(key);
+
+			transport = transport.with_client_identity(cert, key);
 		}
 
 		let configured = self.policies.apply::<P>(transport);
