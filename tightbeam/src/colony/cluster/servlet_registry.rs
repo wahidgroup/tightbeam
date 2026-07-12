@@ -328,6 +328,68 @@ impl ServletRegistry {
 		Ok(removed)
 	}
 
+	/// Apply a batch of servlet address adds/removes for one hive.
+	///
+	/// Atomic: either every change lands or the registry is unchanged.
+	/// Rejects adds/removes that reference another hive's routes.
+	pub fn apply_address_update(
+		&self,
+		hive_id: &[u8],
+		added: Vec<ServletEntry>,
+		removed: &[&[u8]],
+	) -> Result<(), ClusterError> {
+		for entry in &added {
+			if entry.hive_id.as_ref() != hive_id {
+				return Err(ClusterError::ServletNotOwned);
+			}
+		}
+
+		{
+			let entries = self.entries.read()?;
+			for addr in removed {
+				if let Some(entry) = entries.get(*addr) {
+					if entry.hive_id.as_ref() != hive_id {
+						return Err(ClusterError::ServletNotOwned);
+					}
+				}
+			}
+		}
+
+		let mut applied_addrs: Vec<SharedId> = Vec::with_capacity(added.len());
+		for entry in added {
+			let addr = Arc::clone(&entry.address);
+			if let Err(err) = self.add(entry) {
+				for applied in &applied_addrs {
+					let _ = self.remove(applied);
+				}
+
+				return Err(err);
+			}
+
+			applied_addrs.push(addr);
+		}
+
+		let mut removed_entries: Vec<ServletEntry> = Vec::with_capacity(removed.len());
+		for addr in removed {
+			match self.remove(addr) {
+				Ok(Some(entry)) => removed_entries.push(entry),
+				Ok(None) => {}
+				Err(err) => {
+					for entry in removed_entries {
+						let _ = self.add(entry);
+					}
+					for applied in &applied_addrs {
+						let _ = self.remove(applied);
+					}
+
+					return Err(err);
+				}
+			}
+		}
+
+		Ok(())
+	}
+
 	/// Get entries for a servlet type (for load balancing)
 	pub fn entries_for_type(&self, servlet_type: &[u8]) -> Result<Vec<ServletEntry>, ClusterError> {
 		let addresses: Vec<SharedId> = {
@@ -546,11 +608,16 @@ mod tests {
 		assert_eq!(found[0].address.as_ref(), b"addr1");
 	}
 
-	#[test]
-	fn registry_reregistration_does_not_duplicate_indices() {
+	fn seed_reregistered_registry() -> ServletRegistry {
 		let registry = ServletRegistry::default();
 		registry.add(named_entry(b"addr1", b"calculator", b"hive1")).ok();
 		registry.add(named_entry(b"addr1", b"calculator", b"hive1")).ok();
+		registry
+	}
+
+	#[test]
+	fn registry_reregistration_does_not_duplicate_indices() {
+		let registry = seed_reregistered_registry();
 
 		let found = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
 		assert_eq!(found.len(), 1);
@@ -575,10 +642,7 @@ mod tests {
 
 	#[test]
 	fn registry_remove_after_reregistration_clears_entry() {
-		let registry = ServletRegistry::default();
-		registry.add(named_entry(b"addr1", b"calculator", b"hive1")).ok();
-		registry.add(named_entry(b"addr1", b"calculator", b"hive1")).ok();
-
+		let registry = seed_reregistered_registry();
 		registry.remove(b"addr1").ok();
 
 		let found = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
@@ -601,5 +665,57 @@ mod tests {
 
 		assert!(matches!(registry.remove_abandoned().ok(), Some(1)));
 		assert!(matches!(registry.len().ok(), Some(0)));
+	}
+
+	struct ApplyAddressUpdateCase {
+		seed: (&'static [u8], &'static [u8], &'static [u8]),
+		caller_hive: &'static [u8],
+		add: Option<(&'static [u8], &'static [u8], &'static [u8])>,
+		remove: &'static [&'static [u8]],
+		expect_ok: bool,
+		expected_addrs: &'static [&'static [u8]],
+	}
+
+	fn apply_address_update_cases() -> Vec<ApplyAddressUpdateCase> {
+		const VICTIM: &[&[u8]] = &[b"victim"];
+		const OLD: &[&[u8]] = &[b"old"];
+		const NEW: &[&[u8]] = &[b"new"];
+
+		vec![
+			ApplyAddressUpdateCase {
+				seed: (b"victim", b"calc", b"hive-a"),
+				caller_hive: b"hive-b",
+				add: Some((b"poison", b"calc", b"hive-b")),
+				remove: VICTIM,
+				expect_ok: false,
+				expected_addrs: VICTIM,
+			},
+			ApplyAddressUpdateCase {
+				seed: (b"old", b"calc", b"hive-a"),
+				caller_hive: b"hive-a",
+				add: Some((b"new", b"calc", b"hive-a")),
+				remove: OLD,
+				expect_ok: true,
+				expected_addrs: NEW,
+			},
+		]
+	}
+
+	#[test]
+	fn apply_address_update_ownership_and_atomicity() {
+		for case in apply_address_update_cases() {
+			let registry = ServletRegistry::default();
+			registry.add(named_entry(case.seed.0, case.seed.1, case.seed.2)).ok();
+
+			let added = case.add.map(|(a, t, h)| named_entry(a, t, h)).into_iter().collect();
+			let result = registry.apply_address_update(case.caller_hive, added, case.remove);
+			assert_eq!(result.is_ok(), case.expect_ok);
+
+			let found = registry.entries_for_type(b"calc").ok().unwrap_or_default();
+			assert_eq!(found.len(), case.expected_addrs.len());
+			for (entry, addr) in found.iter().zip(case.expected_addrs.iter()) {
+				assert_eq!(entry.address.as_ref(), *addr);
+			}
+		}
 	}
 }

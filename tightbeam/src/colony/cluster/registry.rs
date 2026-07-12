@@ -27,6 +27,8 @@ pub struct HiveEntry {
 	pub metadata: Option<Arc<[u8]>>,
 	/// Consecutive heartbeat failures
 	pub failure_count: u32,
+	/// DER-encoded signer identifier bound at registration (x509 control plane)
+	pub signer_id: Option<SharedId>,
 }
 
 /// Registry of hives with servlet type indexing
@@ -57,6 +59,19 @@ impl HiveRegistry {
 	/// If the hive was already registered, updates its entry and re-indexes.
 	/// Takes ownership for zero-copy conversion to `Arc<[u8]>`.
 	pub fn register(&self, request: RegisterHiveRequest) -> Result<(), ClusterError> {
+		self.register_with_signer(request, None)
+	}
+
+	/// Register a hive and bind the authenticated control-plane signer
+	///
+	/// `signer_id` is the DER-encoded `SignerIdentifier` from the registration
+	/// frame. Later `ServletAddressUpdate` calls must present the same signer
+	/// for this hive id (CWE-639).
+	pub fn register_with_signer(
+		&self,
+		request: RegisterHiveRequest,
+		signer_id: Option<SharedId>,
+	) -> Result<(), ClusterError> {
 		let hive_id: SharedId = request.hive_addr.into();
 		// Extract servlet types from servlet_addresses
 		let servlet_types: Arc<[SharedId]> = request
@@ -76,6 +91,7 @@ impl HiveRegistry {
 			last_seen: Instant::now(),
 			metadata,
 			failure_count: 0,
+			signer_id,
 		};
 
 		// Remove old index entries if re-registering
@@ -98,6 +114,12 @@ impl HiveRegistry {
 		}
 
 		Ok(())
+	}
+
+	/// Signer bound to `hive_id` at registration, if any
+	pub fn signer_for(&self, hive_id: &[u8]) -> Result<Option<SharedId>, ClusterError> {
+		let hives = self.hives.read()?;
+		Ok(hives.get(hive_id).and_then(|entry| entry.signer_id.clone()))
 	}
 
 	/// Unregister a hive and remove from indices
@@ -132,6 +154,7 @@ impl HiveRegistry {
 			Some(ids) => ids.clone(),
 			None => return Ok(Vec::new()),
 		};
+
 		drop(index);
 
 		let hives = self.hives.read()?;
@@ -256,29 +279,21 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn evict_stale_returns_evicted_entries() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::new(Duration::ZERO);
-		registry.register(request(b"hive1", &[b"ping"]))?;
-
-		std::thread::sleep(Duration::from_millis(1));
-
-		let evicted = registry.evict_stale()?;
-		assert_eq!(evicted.len(), 1);
-		assert_eq!(evicted[0].address.as_ref(), b"hive1");
-		assert_eq!(registry.len()?, 0);
-
-		Ok(())
-	}
+	/// (ttl, expected_evicted_len, expected_remaining_len)
+	const EVICT_STALE_CASES: &[(Duration, usize, usize)] = &[(Duration::ZERO, 1, 0), (Duration::from_secs(3600), 0, 1)];
 
 	#[test]
-	fn evict_stale_keeps_fresh_hives() -> Result<(), ClusterError> {
-		let registry = HiveRegistry::new(Duration::from_secs(3600));
-		registry.register(request(b"hive1", &[b"ping"]))?;
+	fn evict_stale_behavior() -> Result<(), ClusterError> {
+		for &(ttl, evicted_len, remaining_len) in EVICT_STALE_CASES {
+			let registry = HiveRegistry::new(ttl);
+			registry.register(request(b"hive1", &[b"ping"]))?;
 
-		let evicted = registry.evict_stale()?;
-		assert!(evicted.is_empty());
-		assert_eq!(registry.len()?, 1);
+			std::thread::sleep(Duration::from_millis(1));
+
+			let evicted = registry.evict_stale()?;
+			assert_eq!(evicted.len(), evicted_len);
+			assert_eq!(registry.len()?, remaining_len);
+		}
 
 		Ok(())
 	}

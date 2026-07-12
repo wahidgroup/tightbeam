@@ -53,6 +53,10 @@ pub enum ClusterError {
 	/// Invalid servlet address format
 	#[error("Invalid address: {:#?}")]
 	InvalidAddress(Vec<u8>),
+
+	/// Servlet address update referenced a route owned by a different hive
+	#[error("Servlet not owned by hive")]
+	ServletNotOwned,
 }
 
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {

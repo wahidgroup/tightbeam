@@ -432,12 +432,21 @@ macro_rules! cluster {
 				))
 				.collect();
 
+			#[cfg(feature = "x509")]
+			let signer_id: ::std::option::Option<::std::sync::Arc<[u8]>> = $frame
+				.nonrepudiation
+				.as_ref()
+				.and_then(|info| $crate::der::Encode::to_der(&info.sid).ok())
+				.map(::std::sync::Arc::from);
+			#[cfg(not(feature = "x509"))]
+			let signer_id: ::std::option::Option<::std::sync::Arc<[u8]>> = ::std::option::Option::None;
+
 			// Registration is complete only when the hive entry AND its
 			// servlet routes are all installed: reporting success on a
 			// partial install leaves the hive believing it is routable
 			// while the cluster's tables are incomplete. A route failure
 			// rolls the hive entry back so no half-registered state lingers.
-			let registered = $registry.register(request).and_then(|()| {
+			let registered = $registry.register_with_signer(request, signer_id).and_then(|()| {
 				servlet_info
 					.iter()
 					.try_for_each(|(servlet_type, servlet_addr)| {
@@ -498,30 +507,49 @@ macro_rules! cluster {
 
 			let hive_id: ::std::sync::Arc<[u8]> = update.hive_id.into();
 
-			// Every add and remove must land or the hive's view diverges
-			// from the routing tables; a partial update is reported as
-			// Forbidden so the hive knows its routes are not installed.
-			// Removals key by network address.
-			let updated = update
+			// Bind the authenticated signer to the claimed hive_id. A trusted
+			// certificate must not update another hive's routes (CWE-639).
+			#[cfg(feature = "x509")]
+			{
+				let bound_ok = match (
+					$frame.nonrepudiation.as_ref(),
+					$registry.signer_for(&hive_id),
+				) {
+					(Some(signer_info), Ok(Some(bound))) => {
+						match $crate::der::Encode::to_der(&signer_info.sid) {
+							Ok(sid) => sid.as_slice() == bound.as_ref(),
+							Err(_) => false,
+						}
+					}
+					_ => false,
+				};
+				if !bound_ok {
+					if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
+						$replay_guard.forget(signer_info.signature.as_bytes());
+					}
+
+					return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
+						status: $crate::policy::TransitStatus::Forbidden,
+					});
+				}
+			}
+
+			let added: Vec<$crate::colony::cluster::ServletEntry> = update
 				.added
 				.iter()
-				.try_for_each(|info| {
-					let entry = $crate::colony::cluster::ServletEntry::new(
+				.map(|info| {
+					$crate::colony::cluster::ServletEntry::new(
 						::std::sync::Arc::from(info.address.as_slice()),
 						::std::sync::Arc::from(info.servlet_id.as_slice()),
 						::std::sync::Arc::clone(&hive_id),
 						$config.pheromone.initial_pheromone,
 						$config.pheromone.abandonment_limit,
-					);
-					$servlet_registry.add(entry)
+					)
 				})
-				.and_then(|()| {
-					update
-						.removed
-						.iter()
-						.try_for_each(|address| $servlet_registry.remove(address).map(|_| ()))
-				});
+				.collect();
 
+			let removed: Vec<&[u8]> = update.removed.iter().map(|address| address.as_slice()).collect();
+			let updated = $servlet_registry.apply_address_update(&hive_id, added, &removed);
 			let status = match updated {
 				Ok(()) => $crate::policy::TransitStatus::Accepted,
 				Err(_) => {

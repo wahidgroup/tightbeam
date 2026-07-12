@@ -652,8 +652,8 @@ macro_rules! hive {
 				);
 			}
 
-			if let Some(manage) = cmd.manage {
-				return hive!(@handle_manage $frame, manage, $servlets, $trace, $spawners, $hive_context);
+				if let Some(manage) = cmd.manage {
+				return hive!(@handle_manage $frame, manage, $servlets, $trace, $spawners, $hive_context, $replay_guard);
 			}
 		}
 
@@ -664,7 +664,16 @@ macro_rules! hive {
 	// Management Handler
 	// ==========================================================================
 
-	(@handle_manage $frame:ident, $request:ident, $servlets:ident, $trace:ident, $spawners:ident, $hive_context:ident) => {{
+	(@handle_manage $frame:ident, $request:ident, $servlets:ident, $trace:ident, $spawners:ident, $hive_context:ident, $replay_guard:ident) => {{
+		#[cfg(feature = "x509")]
+		let forget_replay = || {
+			if let Some(signer_info) = $frame.nonrepudiation.as_ref() {
+				$replay_guard.forget(signer_info.signature.as_bytes());
+			}
+		};
+		#[cfg(not(feature = "x509"))]
+		let forget_replay = || {};
+
 		// Spawn request
 		if let Some(spawn) = $request.spawn {
 			let type_bytes = &spawn.servlet_type;
@@ -690,12 +699,16 @@ macro_rules! hive {
 						));
 					}
 					Err(_) => {
+						forget_replay();
+
 						return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
 							$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
 						));
 					}
 				}
 			} else {
+				forget_replay();
+
 				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
 					$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
 				));
@@ -735,6 +748,8 @@ macro_rules! hive {
 					));
 				}
 			}
+
+			forget_replay();
 
 			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
 				$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Forbidden)

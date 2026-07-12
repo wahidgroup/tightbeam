@@ -84,27 +84,34 @@ fn get_cluster_test_certs() -> &'static ClusterTestCerts {
 // TLS Config Helpers (DRY)
 // ============================================================================
 
-fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
+fn cluster_tls_config_with_trust(
+	certs: &ClusterTestCerts,
+	hive_trust: Option<Arc<dyn CertificateTrust>>,
+) -> ClusterTlsConfig {
 	ClusterTlsConfig {
 		certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
 		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
 		validators: vec![],
 		client_validators: vec![],
-		hive_trust: Some(Arc::clone(&certs.trust)),
+		hive_trust,
 	}
 }
 
-fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConf {
+fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
+	cluster_tls_config_with_trust(certs, Some(Arc::clone(&certs.trust)))
+}
+
+fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConf {
 	let hive_tls = Arc::new(HiveTlsConfig {
 		certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
 		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
 		validators: vec![],
 	});
-	HiveConf {
-		hive_tls: Some(hive_tls),
-		trust_store: Some(Arc::clone(&certs.trust)),
-		..Default::default()
-	}
+	HiveConf { hive_tls: Some(hive_tls), ..Default::default() }
+}
+
+fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConf {
+	HiveConf { trust_store: Some(Arc::clone(&certs.trust)), ..hive_tls_config_no_trust(certs) }
 }
 
 fn servlet_tls_config(
@@ -152,8 +159,8 @@ fn assert_register_status(
 	}
 }
 
-async fn signed_control_frame(
-	certs: &ClusterTestCerts,
+async fn signed_control_frame_with(
+	key: &Secp256k1SigningKey,
 	id: &[u8],
 	request: ClusterRequest,
 ) -> Result<Frame, TightBeamError> {
@@ -162,9 +169,17 @@ async fn signed_control_frame(
 		.with_order(0)
 		.with_message(request)
 		.build()?;
-	let provider = Secp256k1KeyProvider::from(certs.key.clone());
 
+	let provider = Secp256k1KeyProvider::from(key.clone());
 	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
+}
+
+async fn signed_control_frame(
+	certs: &ClusterTestCerts,
+	id: &[u8],
+	request: ClusterRequest,
+) -> Result<Frame, TightBeamError> {
+	signed_control_frame_with(&certs.key, id, request).await
 }
 
 fn registration_request(issued_at_ms: u64, hive_addr: &[u8]) -> ClusterRequest {
@@ -174,6 +189,19 @@ fn registration_request(issued_at_ms: u64, hive_addr: &[u8]) -> ClusterRequest {
 		servlet_addresses: vec![],
 		metadata: None,
 	})
+}
+
+fn servlet_address_update(hive_id: &[u8], added: Vec<ServletInfo>) -> ClusterRequest {
+	ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
+		issued_at_ms: current_timestamp_ms(),
+		hive_id: hive_id.to_vec(),
+		added,
+		removed: vec![],
+	})
+}
+
+fn servlet_info(servlet_id: &[u8], address: &[u8]) -> ServletInfo {
+	ServletInfo { servlet_id: servlet_id.to_vec(), address: address.to_vec() }
 }
 
 /// Poll until the registry is empty or attempts exhaust. Branching lives here, not in scenarios.
@@ -569,15 +597,10 @@ tb_scenario! {
 			trace.event("stale_registration_rejected")?;
 
 			// Same enforcement on servlet address updates
-			let update = ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
-				issued_at_ms: current_timestamp_ms(),
-				hive_id: b"127.0.0.1:65000".to_vec(),
-				added: vec![ServletInfo {
-					servlet_id: b"ping".to_vec(),
-					address: b"127.0.0.1:65001".to_vec(),
-				}],
-				removed: vec![],
-			});
+			let update = servlet_address_update(
+				b"127.0.0.1:65000",
+				vec![servlet_info(b"ping", b"127.0.0.1:65001")],
+			);
 			let fresh_update = signed_control_frame(certs, b"replay-update", update).await?;
 			let replayed_update = fresh_update.clone();
 
@@ -647,17 +670,7 @@ tb_scenario! {
 
 			// Hive serves the shared cert (cluster trusts it for TLS) but
 			// configures no trust store for inbound commands
-			let hive_tls = Arc::new(HiveTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
-				key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
-				validators: vec![],
-			});
-			let hive_conf = HiveConf {
-				hive_tls: Some(hive_tls),
-				..Default::default()
-			};
-
-			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
+			let mut hive = ClusterTestHive::new(Some(hive_tls_config_no_trust(certs)))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 
 			// Register the hive out-of-band with a validly signed frame
@@ -694,6 +707,129 @@ tb_scenario! {
 			hive.stop();
 			cluster.stop();
 
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Signer-bound ServletAddressUpdate (cross-hive tampering)
+// ============================================================================
+
+struct DualHiveCerts {
+	gateway: &'static ClusterTestCerts,
+	hive_a: (Certificate, Secp256k1SigningKey),
+	hive_b: (Certificate, Secp256k1SigningKey),
+	hive_trust: Arc<dyn CertificateTrust>,
+}
+
+fn dual_hive_certs() -> DualHiveCerts {
+	use tightbeam::random::OsRng;
+	use tightbeam::testing::utils::create_test_certificate;
+
+	let gateway = get_cluster_test_certs();
+	let raw_a = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let raw_b = k256::ecdsa::SigningKey::random(&mut OsRng);
+	let cert_a = create_test_certificate(&raw_a);
+	let cert_b = create_test_certificate(&raw_b);
+	let key_a = Secp256k1SigningKey::from(raw_a);
+	let key_b = Secp256k1SigningKey::from(raw_b);
+	let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
+		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			.with_certificate(cert_a.clone())
+			.expect("hive A trust")
+			.with_certificate(cert_b.clone())
+			.expect("hive B trust")
+			.build(),
+	);
+
+	DualHiveCerts { gateway, hive_a: (cert_a, key_a), hive_b: (cert_b, key_b), hive_trust }
+}
+
+async fn register_signed_hive(
+	client: &mut GenericClient<TokioListener>,
+	key: &Secp256k1SigningKey,
+	id: &[u8],
+	addr: &[u8],
+) -> Result<RegisterHiveResponse, TightBeamError> {
+	let frame = signed_control_frame_with(key, id, registration_request(current_timestamp_ms(), addr)).await?;
+	decode(&emit_frame(client, frame).await?.message)
+}
+
+async fn emit_servlet_update(
+	client: &mut GenericClient<TokioListener>,
+	key: &Secp256k1SigningKey,
+	id: &[u8],
+	request: ClusterRequest,
+) -> Result<ServletAddressUpdateResponse, TightBeamError> {
+	let frame = signed_control_frame_with(key, id, request).await?;
+	decode(&emit_frame(client, frame).await?.message)
+}
+
+tb_assert_spec! {
+	pub ClusterCrossHiveUpdateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("hives_registered", exactly!(1)),
+			("cross_hive_update_forbidden", exactly!(1)),
+			("owner_update_accepted", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: cluster_rejects_cross_hive_servlet_address_update,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ClusterCrossHiveUpdateSpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let certs = dual_hive_certs();
+			let cluster = start_cluster(ClusterConf::new(cluster_tls_config_with_trust(
+				certs.gateway,
+				Some(Arc::clone(&certs.hive_trust)),
+			)))
+			.await?;
+			let cluster_addr = cluster.addr();
+			let mut client = connect_cluster(certs.gateway, cluster_addr).await?;
+
+			let hive_a_addr = b"127.0.0.1:65010".as_slice();
+			let hive_b_addr = b"127.0.0.1:65011".as_slice();
+
+			let response_a = register_signed_hive(&mut client, &certs.hive_a.1, b"reg-a", hive_a_addr).await?;
+			let response_b = register_signed_hive(&mut client, &certs.hive_b.1, b"reg-b", hive_b_addr).await?;
+			assert_eq!(response_a.status, TransitStatus::Accepted);
+			assert_eq!(response_b.status, TransitStatus::Accepted);
+			assert_eq!(cluster.hive_count(), 2);
+
+			trace.event("hives_registered")?;
+
+			let update_cases = [
+				(
+					&certs.hive_b.1,
+					b"cross-update".as_slice(),
+					servlet_address_update(hive_a_addr, vec![servlet_info(b"poison", b"127.0.0.1:65099")]),
+					TransitStatus::Forbidden,
+					"cross_hive_update_forbidden",
+				),
+				(
+					&certs.hive_a.1,
+					b"owner-update".as_slice(),
+					servlet_address_update(hive_a_addr, vec![servlet_info(b"ping", b"127.0.0.1:65012")]),
+					TransitStatus::Accepted,
+					"owner_update_accepted",
+				),
+			];
+
+			for (key, id, request, expected, event) in update_cases {
+				let response = emit_servlet_update(&mut client, key, id, request).await?;
+				assert_eq!(response.status, expected);
+				trace.event(event)?;
+			}
+
+			cluster.stop();
 			Ok(())
 		}
 	}

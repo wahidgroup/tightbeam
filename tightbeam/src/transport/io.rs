@@ -983,39 +983,26 @@ mod tests {
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::Version;
 
-	#[test]
-	fn parse_short_form_length() {
-		assert_eq!(parse_der_length(0x00, &[]), Some(0));
-		assert_eq!(parse_der_length(0x7F, &[]), Some(127));
-	}
+	/// (first length octet, remaining octets, expected decode)
+	const PARSE_DER_LENGTH_CASES: &[(u8, &[u8], Option<usize>)] = &[
+		(0x00, &[], Some(0)),
+		(0x7F, &[], Some(127)),
+		(0x81, &[0x80], Some(128)),
+		(0x81, &[0xFF], Some(255)),
+		(0x82, &[0x01, 0x00], Some(256)),
+		(0x80, &[], None),
+		(0x81, &[0x05], None),
+		(0x82, &[0x00, 0x80], None),
+		(0x89, &[0x01; 9], None),
+		(0x82, &[0x01], None),
+		(0x81, &[], None),
+	];
 
 	#[test]
-	fn parse_minimal_long_form_length() {
-		assert_eq!(parse_der_length(0x81, &[0x80]), Some(128));
-		assert_eq!(parse_der_length(0x81, &[0xFF]), Some(255));
-		assert_eq!(parse_der_length(0x82, &[0x01, 0x00]), Some(256));
-	}
-
-	#[test]
-	fn reject_indefinite_length_marker() {
-		assert_eq!(parse_der_length(0x80, &[]), None);
-	}
-
-	#[test]
-	fn reject_non_minimal_long_form() {
-		assert_eq!(parse_der_length(0x81, &[0x05]), None);
-		assert_eq!(parse_der_length(0x82, &[0x00, 0x80]), None);
-	}
-
-	#[test]
-	fn reject_length_wider_than_usize() {
-		assert_eq!(parse_der_length(0x89, &[0x01; 9]), None);
-	}
-
-	#[test]
-	fn reject_octet_count_mismatch() {
-		assert_eq!(parse_der_length(0x82, &[0x01]), None);
-		assert_eq!(parse_der_length(0x81, &[]), None);
+	fn parse_der_length_cases() {
+		for &(first, rest, expected) in PARSE_DER_LENGTH_CASES {
+			assert_eq!(parse_der_length(first, rest), expected);
+		}
 	}
 
 	fn frame_with_priority(version: Version) -> Frame {
@@ -1025,30 +1012,72 @@ mod tests {
 		Frame { version, metadata, message: Vec::new(), integrity: None, nonrepudiation: None }
 	}
 
-	#[test]
-	fn request_with_incompatible_metadata_rejected() {
-		let envelope = TransportEnvelope::Request(RequestPackage::new(frame_with_priority(Version::V0)));
-		assert!(!envelope_versions_compatible(&envelope));
+	/// Minimal `MessageIO` probe so ingress goes through `decode_envelope`.
+	struct DecodeProbe;
+
+	impl crate::transport::ResponseHandler for DecodeProbe {
+		fn with_handler<F>(self, _handler: F) -> Self
+		where
+			F: Fn(Frame) -> Option<Frame> + Send + Sync + 'static,
+		{
+			self
+		}
+
+		fn handler(&self) -> Option<&(dyn Fn(Frame) -> Option<Frame> + Send + Sync)> {
+			None
+		}
+	}
+
+	impl MessageIO for DecodeProbe {
+		async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
+			Err(TransportError::ConnectionClosed)
+		}
+
+		async fn write_envelope(&mut self, _buffer: &[u8]) -> TransportResult<()> {
+			Ok(())
+		}
+	}
+
+	/// (label, envelope, must be version-compatible)
+	fn version_envelope_cases() -> Vec<(&'static str, TransportEnvelope, bool)> {
+		vec![
+			(
+				"request V0+priority",
+				TransportEnvelope::Request(RequestPackage::new(frame_with_priority(Version::V0))),
+				false,
+			),
+			(
+				"request V2+priority",
+				TransportEnvelope::Request(RequestPackage::new(frame_with_priority(Version::V2))),
+				true,
+			),
+			(
+				"response V0+priority",
+				TransportEnvelope::Response(ResponsePackage::new(
+					TransitStatus::Accepted,
+					Some(frame_with_priority(Version::V0)),
+				)),
+				false,
+			),
+			(
+				"response without frame",
+				TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Accepted, None)),
+				true,
+			),
+		]
 	}
 
 	#[test]
-	fn request_with_compatible_metadata_accepted() {
-		let envelope = TransportEnvelope::Request(RequestPackage::new(frame_with_priority(Version::V2)));
-		assert!(envelope_versions_compatible(&envelope));
-	}
+	fn envelope_version_compatibility_and_decode_ingress() {
+		for (_label, envelope, compatible) in version_envelope_cases() {
+			assert_eq!(envelope_versions_compatible(&envelope), compatible);
 
-	#[test]
-	fn response_with_incompatible_metadata_rejected() {
-		let envelope = TransportEnvelope::Response(ResponsePackage::new(
-			TransitStatus::Accepted,
-			Some(frame_with_priority(Version::V0)),
-		));
-		assert!(!envelope_versions_compatible(&envelope));
-	}
-
-	#[test]
-	fn response_without_frame_accepted() {
-		let envelope = TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Accepted, None));
-		assert!(envelope_versions_compatible(&envelope));
+			let bytes = crate::encode(&envelope).expect("encode probe envelope");
+			let decoded = <DecodeProbe as MessageIO>::decode_envelope(&bytes);
+			assert_eq!(decoded.is_ok(), compatible);
+			if !compatible {
+				assert!(matches!(decoded, Err(TransportError::InvalidMessage)));
+			}
+		}
 	}
 }

@@ -10,7 +10,7 @@ use tightbeam::{
 	colony::{
 		common::{
 			current_timestamp_ms, ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams,
-			HiveManagementRequest, StopServletParams,
+			HiveManagementRequest, SpawnServletParams, StopServletParams,
 		},
 		hive::{Hive, HiveConf, HiveTlsConfig},
 	},
@@ -93,6 +93,21 @@ tb_assert_spec! {
 // Integration Test
 // ============================================================================
 
+async fn establish_registered_hive(trace: &TraceCollector, conf: Option<HiveConf>) -> Result<(), TightBeamError> {
+	trace.event("hive_started")?;
+
+	let servlet = HiveTestServlet::start(Arc::new(TraceCollector::new()), None).await?;
+	let mut hive = HiveX509Test::new(conf)?;
+	hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
+	hive.establish(Arc::new(TraceCollector::new())).await?;
+
+	trace.event("hive_established")?;
+
+	assert!(!hive.servlet_addresses().is_empty(), "Hive should have registered servlets");
+	hive.stop();
+	Ok(())
+}
+
 tb_scenario! {
 	name: hive_establish_with_x509,
 	config: ScenarioConf::<()>::builder()
@@ -100,49 +115,18 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |trace| async move {
-			trace.event("hive_started")?;
-
-			// Generate test certificate and key
 			let (cert, signing_key) = create_test_cert_with_key("CN=Hive Test Server", 365)?;
-
-			let key = Arc::new(Secp256k1KeyProvider::from(signing_key));
 			let tls_config = Arc::new(HiveTlsConfig {
 				certificate: CertificateSpec::Built(Box::new(cert)),
-				key,
+				key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
 				validators: vec![],
 			});
 
-			// Configure hive with TLS
-			let hive_conf = HiveConf {
-				hive_tls: Some(tls_config),
-				..Default::default()
-			};
-
-			// Start servlet independently
-			let servlet_trace = Arc::new(TraceCollector::new());
-			let servlet_start_trace = Arc::clone(&servlet_trace);
-			let servlet = HiveTestServlet::start(servlet_start_trace, None).await?;
-
-			// Create hive
-			let mut hive = HiveX509Test::new(Some(hive_conf))?;
-
-			// Register servlet with spawner for auto-scaling
-			hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
-
-			// Establish hive
-			let hive_trace = Arc::new(TraceCollector::new());
-			hive.establish(hive_trace).await?;
-
-			trace.event("hive_established")?;
-
-			// Verify servlets are registered
-			let servlet_addrs = hive.servlet_addresses();
-			assert!(!servlet_addrs.is_empty(), "Hive should have registered servlets");
-
-			// Clean up
-			hive.stop();
-
-			Ok(())
+			establish_registered_hive(
+				&trace,
+				Some(HiveConf { hive_tls: Some(tls_config), ..Default::default() }),
+			)
+			.await
 		}
 	}
 }
@@ -184,6 +168,37 @@ fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 	command_frame(id, manage_cmd)
 }
 
+/// Manage command with a spawn request.
+fn spawn_command_frame(id: &[u8], servlet_type: &[u8]) -> Result<Frame, TightBeamError> {
+	let manage_cmd = ClusterCommand {
+		issued_at_ms: current_timestamp_ms(),
+		heartbeat: None,
+		manage: Some(HiveManagementRequest {
+			spawn: Some(SpawnServletParams { servlet_type: servlet_type.to_vec(), config: None }),
+			list: None,
+			stop: None,
+		}),
+	};
+
+	command_frame(id, manage_cmd)
+}
+
+/// Unestablished hive + signer pinned by the hive trust store.
+struct TrustedHiveParts {
+	hive: HiveX509Test,
+	provider: Secp256k1KeyProvider,
+}
+
+fn trusted_hive_parts(subject: &str, mut conf: HiveConf) -> Result<TrustedHiveParts, TightBeamError> {
+	let (cert, signing_key) = create_test_cert_with_key(subject, 365)?;
+
+	conf.trust_store = Some(pinning_trust_store(&cert)?);
+
+	let provider = Secp256k1KeyProvider::from(signing_key);
+	let hive = HiveX509Test::new(Some(conf))?;
+	Ok(TrustedHiveParts { hive, provider })
+}
+
 /// Established hive + connected client + signer pinned by the hive trust store.
 struct TrustedHiveSession {
 	hive: HiveX509Test,
@@ -191,18 +206,11 @@ struct TrustedHiveSession {
 	provider: Secp256k1KeyProvider,
 }
 
-async fn trusted_hive_session(subject: &str, mut conf: HiveConf) -> Result<TrustedHiveSession, TightBeamError> {
-	let (cert, signing_key) = create_test_cert_with_key(subject, 365)?;
-
-	conf.trust_store = Some(pinning_trust_store(&cert)?);
-
-	let provider = Secp256k1KeyProvider::from(signing_key);
-
-	let mut hive = HiveX509Test::new(Some(conf))?;
+async fn trusted_hive_session(subject: &str, conf: HiveConf) -> Result<TrustedHiveSession, TightBeamError> {
+	let TrustedHiveParts { mut hive, provider } = trusted_hive_parts(subject, conf)?;
 	hive.establish(Arc::new(TraceCollector::new())).await?;
 
 	let client = ClientBuilder::<TokioListener>::builder().build().connect(hive.addr()).await?;
-
 	Ok(TrustedHiveSession { hive, client, provider })
 }
 
@@ -235,6 +243,15 @@ fn assert_manage_stop_shape(response: &ClusterCommandResponse, status: TransitSt
 	assert_eq!(stop.status, status);
 }
 
+/// Manage/spawn CHOICE present; heartbeat CHOICE absent.
+fn assert_manage_spawn_shape(response: &ClusterCommandResponse, status: TransitStatus) {
+	assert!(response.heartbeat.is_none(), "manage response must not use the heartbeat shape");
+
+	let manage = response.manage.as_ref().expect("manage CHOICE required");
+	let spawn = manage.spawn.as_ref().expect("spawn result required");
+	assert_eq!(spawn.status, status);
+}
+
 async fn signed_heartbeat_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
 	command_frame(id, heartbeat_command(current_timestamp_ms()))?
 		.sign_with_provider::<Sha3_256, _>(provider)
@@ -243,6 +260,16 @@ async fn signed_heartbeat_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> R
 
 async fn signed_stop_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
 	stop_command_frame(id)?.sign_with_provider::<Sha3_256, _>(provider).await
+}
+
+async fn signed_spawn_frame(
+	provider: &Secp256k1KeyProvider,
+	id: &[u8],
+	servlet_type: &[u8],
+) -> Result<Frame, TightBeamError> {
+	spawn_command_frame(id, servlet_type)?
+		.sign_with_provider::<Sha3_256, _>(provider)
+		.await
 }
 
 tb_assert_spec! {
@@ -412,33 +439,66 @@ tb_scenario! {
 		.with_spec(HiveEstablishSpec::latest())
 		.build(),
 	environment Bare {
+		exec: |trace| async move { establish_registered_hive(&trace, None).await }
+	}
+}
+
+// ============================================================================
+// Replay forget on manage handler failure
+// ============================================================================
+
+tb_assert_spec! {
+	pub HiveSpawnRetrySpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("first_spawn_forbidden", exactly!(1)),
+			("retry_spawn_accepted", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: hive_manage_failure_allows_signed_retry,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(HiveSpawnRetrySpec::latest())
+		.build(),
+	environment Bare {
 		exec: |trace| async move {
-			trace.event("hive_started")?;
+			use core::sync::atomic::{AtomicBool, Ordering};
 
-			// Start servlet independently
-			let servlet_trace = Arc::new(TraceCollector::new());
-			let servlet_start_trace = Arc::clone(&servlet_trace);
-			let servlet = HiveTestServlet::start(servlet_start_trace, None).await?;
+			let TrustedHiveParts { mut hive, provider } =
+				trusted_hive_parts("CN=Hive Spawn Retry", HiveConf::default())?;
+			let fail_once = Arc::new(AtomicBool::new(true));
+			let fail_flag = Arc::clone(&fail_once);
 
-			// Create hive with default config
-			let mut hive = HiveX509Test::new(None)?;
+			let seed = HiveTestServlet::start(Arc::new(TraceCollector::new()), None).await?;
+			hive.register("flaky", seed, move |t| {
+				let fail_flag = Arc::clone(&fail_flag);
+				async move {
+					if fail_flag.swap(false, Ordering::SeqCst) {
+						return Err(TightBeamError::MissingResponse);
+					}
 
-			// Register servlet with spawner for auto-scaling
-			hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
+					HiveTestServlet::start(t, None).await
+				}
+			})?;
+			hive.establish(Arc::new(TraceCollector::new())).await?;
 
-			// Establish hive
-			let hive_trace = Arc::new(TraceCollector::new());
-			hive.establish(hive_trace).await?;
+			let mut client = ClientBuilder::<TokioListener>::builder().build().connect(hive.addr()).await?;
+			let signed = signed_spawn_frame(&provider, b"spawn-retry", b"flaky").await?;
+			let replay = signed.clone();
 
-			trace.event("hive_established")?;
+			let first = emit_command(&mut client, signed).await?;
+			assert_manage_spawn_shape(&first, TransitStatus::Forbidden);
+			trace.event("first_spawn_forbidden")?;
 
-			// Verify servlets are registered
-			let servlet_addrs = hive.servlet_addresses();
-			assert!(!servlet_addrs.is_empty(), "Hive should have registered servlets");
+			let second = emit_command(&mut client, replay).await?;
+			assert_manage_spawn_shape(&second, TransitStatus::Accepted);
+			trace.event("retry_spawn_accepted")?;
 
-			// Clean up
 			hive.stop();
-
 			Ok(())
 		}
 	}
