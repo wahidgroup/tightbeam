@@ -2,7 +2,10 @@
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
@@ -491,7 +494,9 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		// Use trust store for server certificate validation
 		#[cfg(all(feature = "x509", feature = "std"))]
-		let validator = self.to_trust_store_ref().map(|store| Arc::clone(store) as Arc<dyn CertificateValidation>);
+		let validator = self
+			.to_trust_store_ref()
+			.map(|store| Arc::clone(store) as Arc<dyn CertificateValidation>);
 
 		#[cfg(not(all(feature = "x509", feature = "std")))]
 		let validator = None;
@@ -499,7 +504,12 @@ pub trait EncryptedMessageIO: MessageIO {
 		let key = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
 		let client_cert = self.to_client_certificate_ref().map(Arc::clone);
 
-		Ok(key.create_ecies_client::<crate::crypto::ecies::Secp256k1EciesMessage>(None, client_cert, None, validator)?)
+		Ok(key.create_ecies_client::<crate::crypto::ecies::Secp256k1EciesMessage>(
+			None,
+			client_cert,
+			None,
+			validator,
+		)?)
 	}
 
 	/// Build the CMS client orchestrator from transport state.
@@ -536,7 +546,12 @@ pub trait EncryptedMessageIO: MessageIO {
 		let security_offer = Some(SecurityOffer::new(vec![SecurityProfileDesc::from(&TightbeamProfile)]));
 		let client_certificate = self.to_client_certificate_ref().map(Arc::clone);
 
-		Ok(key.create_cms_client(CmsClientConfig { server_identity, trust_store, security_offer, client_certificate })?)
+		Ok(key.create_cms_client(CmsClientConfig {
+			server_identity,
+			trust_store,
+			security_offer,
+			client_certificate,
+		})?)
 	}
 
 	/// Protocol-agnostic client handshake state machine: bytes in, bytes out.

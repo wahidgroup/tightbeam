@@ -5,7 +5,10 @@ extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
-#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(
+	not(feature = "std"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::sync::Arc;
@@ -438,7 +441,10 @@ pub trait MessageCollector: MessageIO {
 }
 
 /// Outcome of one protocol-agnostic collector step.
-#[cfg(all(feature = "transport-policy", any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(
+	feature = "transport-policy",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 enum CollectStep {
 	/// Cleartext handshake container to feed the server-side dispatcher.
 	Handshake(Vec<u8>),
@@ -450,7 +456,10 @@ enum CollectStep {
 ///
 /// Protocol-agnostic: handshake containers are surfaced as raw bytes for the
 /// caller's dispatcher, everything else is decrypted and returned.
-#[cfg(all(feature = "transport-policy", any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(
+	feature = "transport-policy",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 async fn collect_step<T>(transport: &mut T) -> TransportResult<CollectStep>
 where
 	T: EncryptedMessageIO + EncryptedProtocolState + Sized,
@@ -521,7 +530,10 @@ where
 }
 
 /// Extract the application request from a collected envelope and gate it.
-#[cfg(all(feature = "transport-policy", any(feature = "transport-cms", feature = "transport-ecies")))]
+#[cfg(all(
+	feature = "transport-policy",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
 fn gate_collected_envelope<G>(gate: &G, envelope: TransportEnvelope) -> TransportResult<(Arc<Frame>, TransitStatus)>
 where
 	G: GatePolicy + ?Sized,
