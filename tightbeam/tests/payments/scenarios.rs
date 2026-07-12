@@ -19,7 +19,7 @@ use tightbeam::{
 	at_least,
 	builder::TypeBuilder,
 	colony::{
-		cluster::{Cluster, ClusterConf, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		cluster::{Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
 		hive::{Hive, HiveConf, HiveTlsConfig},
 		servlet::ServletConf,
 	},
@@ -203,11 +203,10 @@ tb_scenario! {
 
 			// Create authorization transaction
 			let transaction = create_auth_transaction(b"E2E-001", MonetaryAmount::new(10000, *b"USD"));
-
-			let work_request = ClusterWorkRequest {
+			let work_request = ClusterRequest::Work(ClusterWorkRequest {
 				servlet_type: b"authorization".to_vec(),
 				payload: encode(&transaction)?,
-			};
+			});
 
 			let frame = compose(Version::V0)
 				.with_id(b"payment-auth")

@@ -30,12 +30,10 @@ use std::sync::Arc;
 
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::key::SigningKeyProvider;
-use crate::der::Sequence;
-use crate::policy::{GatePolicy, TransitStatus};
+use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
 use crate::transport::{Protocol, TightBeamAddress};
-use crate::Beamable;
 
 #[cfg(feature = "x509")]
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
@@ -227,40 +225,7 @@ impl<L: LoadBalancer, D: Digest> core::fmt::Debug for ClusterConf<L, D> {
 // Work Request/Response Messages
 // =============================================================================
 
-/// Work request envelope for cluster routing
-///
-/// Clients send this to the cluster gateway. The cluster routes based on
-/// `servlet_type` and forwards `payload` to the selected hive.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
-pub struct ClusterWorkRequest {
-	/// Target servlet type (e.g., b"ping_servlet")
-	pub servlet_type: Vec<u8>,
-	/// Raw message payload (encoded inner message)
-	pub payload: Vec<u8>,
-}
-
-/// Work response from cluster
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
-pub struct ClusterWorkResponse {
-	/// Status of the routing/execution
-	pub status: TransitStatus,
-	/// Response payload from servlet (if successful)
-	pub payload: Option<Vec<u8>>,
-}
-
-impl ClusterWorkResponse {
-	/// Create a successful response with payload
-	#[inline]
-	pub fn ok(payload: Vec<u8>) -> Self {
-		Self { status: TransitStatus::Accepted, payload: Some(payload) }
-	}
-
-	/// Create an error response with status
-	#[inline]
-	pub fn err(status: TransitStatus) -> Self {
-		Self { status, payload: None }
-	}
-}
+pub use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
 
 // =============================================================================
 // Cluster Trait
@@ -337,6 +302,7 @@ mod tests {
 	use crate::colony::hive::ServletInfo;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::policy::TransitStatus;
 	use crate::testing::create_test_signing_key;
 	use crate::utils::BasisPoints;
 

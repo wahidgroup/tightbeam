@@ -350,8 +350,19 @@ macro_rules! cluster {
 		#[cfg(not(feature = "x509"))]
 		let verify_hive_origin = || $crate::policy::TransitStatus::Accepted;
 
-		// Try to decode as RegisterHiveRequest (hive registration)
-		if let Ok(request) = $crate::decode::<$crate::colony::hive::RegisterHiveRequest>(&$frame.message) {
+		// Single decode of the CHOICE envelope: the tag discriminates
+		// the request type. Undecodable input is rejected fail-closed.
+		let cluster_request = match $crate::decode::<$crate::colony::common::ClusterRequest>(&$frame.message) {
+			Ok(request) => request,
+			Err(_) => {
+				return $crate::cluster!(@reply $frame,
+					$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Forbidden)
+				);
+			}
+		};
+
+		match cluster_request {
+		$crate::colony::common::ClusterRequest::RegisterHive(request) => {
 			let origin_status = verify_hive_origin();
 			if origin_status != $crate::policy::TransitStatus::Accepted {
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::RegisterHiveResponse {
@@ -399,8 +410,7 @@ macro_rules! cluster {
 			return $crate::cluster!(@reply $frame, response);
 		}
 
-		// Try to decode as ServletAddressUpdate (scaling notification from hive)
-		if let Ok(update) = $crate::decode::<$crate::colony::hive::ServletAddressUpdate>(&$frame.message) {
+		$crate::colony::common::ClusterRequest::ServletAddressUpdate(update) => {
 			let origin_status = verify_hive_origin();
 			if origin_status != $crate::policy::TransitStatus::Accepted {
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
@@ -432,8 +442,7 @@ macro_rules! cluster {
 			});
 		}
 
-		// Try to decode as ClusterWorkRequest (work routing)
-		if let Ok(request) = $crate::decode::<$crate::colony::cluster::ClusterWorkRequest>(&$frame.message) {
+		$crate::colony::common::ClusterRequest::Work(request) => {
 			// Look up servlet entries by type (bio-inspired routing)
 			let entries = match $servlet_registry.entries_for_type(&request.servlet_type) {
 				Ok(e) if !e.is_empty() => e,
@@ -494,9 +503,7 @@ macro_rules! cluster {
 				}
 			}
 		}
-
-		// Unknown message type
-		Ok(None)
+		}
 	}};
 
 	// Helper: Forward work to a servlet

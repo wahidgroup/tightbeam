@@ -8,7 +8,6 @@ use tightbeam::{
 	colony::hive::{Hive, HiveConf, HiveTlsConfig},
 	compose,
 	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
-	decode,
 	der::Sequence,
 	exactly, hive, servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
@@ -40,12 +39,11 @@ pub struct HiveTestResponse {
 servlet! {
 	HiveTestServlet<HiveTestRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
 		trace.event("servlet_receive")?;
-		let req: HiveTestRequest = decode(&frame.message)?;
-
 		trace.event("servlet_respond")?;
+
 		Ok(Some(compose! {
 			V0: id: frame.metadata.id.clone(),
 				message: HiveTestResponse { doubled: req.value * 2 }

@@ -169,7 +169,7 @@ servlet! {
 	/// Mission Control receives telemetry and sends commands to Rover via relays
 	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConf>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &MissionControlServletConf = ctx.env_config()?;
 		let frame_order = frame.metadata.order;
@@ -332,7 +332,7 @@ servlet! {
 	/// Earth Relay forwards messages between Mission Control and Mars Relay
 	pub EarthRelaySatelliteServlet<RelayMessage, EnvConfig = EarthRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &EarthRelaySatelliteServletConf = ctx.env_config()?;
 		// Verify signature and determine source
@@ -545,7 +545,7 @@ servlet! {
 	/// Mars Relay forwards messages between Earth Relay and Rover
 	pub MarsRelaySatelliteServlet<RelayMessage, EnvConfig = MarsRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &MarsRelaySatelliteServletConf = ctx.env_config()?;
 		// Verify signature and determine source
@@ -771,7 +771,7 @@ servlet! {
 	/// Mars Rover executes commands and sends telemetry
 	pub RoverServlet<RelayMessage, EnvConfig = RoverServletConf>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &RoverServletConf = ctx.env_config()?;
 		// Verify signature

@@ -236,6 +236,86 @@ impl Frame {
 
 		crate::decode::<T>(&decompressed)
 	}
+
+	/// Decrypt the message body in place, turning an encrypted frame into
+	/// its cleartext equivalent.
+	///
+	/// Frame-level `integrity` and `nonrepudiation` cover the encrypted
+	/// body and are left untouched: verify them *before* calling, they
+	/// will no longer match afterwards.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingEncryptionInfo`] -- frame is not encrypted.
+	/// - [`TightBeamError::MissingInflator`] -- body is compressed with no inflator.
+	/// - Decryption or decompression errors from the underlying implementations.
+	pub fn decrypt_in_place(
+		&mut self,
+		decryptor: &dyn crate::crypto::aead::Decryptor,
+		inflator: Option<&dyn Inflator>,
+	) -> Result<()> {
+		use crate::crypto::secret::ToInsecure;
+
+		let Some(mut encrypted) = self.metadata.confidentiality.take() else {
+			return Err(TightBeamError::MissingEncryptionInfo);
+		};
+
+		if self.metadata.compactness.is_some() && inflator.is_none() {
+			self.metadata.confidentiality = Some(encrypted);
+			return Err(TightBeamError::MissingInflator);
+		}
+
+		encrypted.encrypted_content = Some(OctetString::new(core::mem::take(&mut self.message))?);
+
+		match decryptor.decrypt_content(&encrypted) {
+			Ok(plaintext) => {
+				let was_compressed = self.metadata.compactness.take().is_some();
+				let plaintext = plaintext.to_insecure()?;
+
+				self.message = Self::decompress(plaintext.into_vec(), was_compressed, inflator)?;
+
+				Ok(())
+			}
+			Err(err) => {
+				if let Some(content) = encrypted.encrypted_content.take() {
+					self.message = content.into_bytes();
+				}
+				self.metadata.confidentiality = Some(encrypted);
+				Err(err)
+			}
+		}
+	}
+}
+
+impl Frame {
+	/// Decompress the message body in place for a cleartext-but-compressed
+	/// frame, clearing `compactness` on success.
+	///
+	/// A frame without `compactness` is returned unchanged. On
+	/// decompression failure the frame is restored unchanged.
+	///
+	/// # Errors
+	///
+	/// Returns the underlying codec error when the inflator rejects the
+	/// body.
+	pub fn inflate_in_place(&mut self, inflator: &dyn Inflator) -> Result<()> {
+		let Some(compactness) = self.metadata.compactness.take() else {
+			return Ok(());
+		};
+
+		let compressed = core::mem::take(&mut self.message);
+		match inflator.decompress(&compressed) {
+			Ok(plaintext) => {
+				self.message = plaintext;
+				Ok(())
+			}
+			Err(err) => {
+				self.message = compressed;
+				self.metadata.compactness = Some(compactness);
+				Err(err)
+			}
+		}
+	}
 }
 
 impl TightBeamLike for Frame {}
@@ -252,14 +332,6 @@ crate::impl_from!(Frame, tb => Version: tb.version);
 crate::impl_try_from!(Frame, tb => SignerInfo: nonrepudiation, TightBeamError::MissingSignature);
 
 /// Outcome of an integrity verification check.
-///
-/// Distinguishes the three conditions a boolean collapses: "nothing to
-/// verify", "wrong algorithm", and "covered bytes changed". Absence is a
-/// protocol-level policy decision, not a verification success or failure --
-/// callers enforcing integrity MUST decide how to treat
-/// [`IntegrityVerdict::Absent`] instead of folding it into a boolean, since a
-/// stripped integrity field is otherwise indistinguishable from a frame that
-/// never carried one.
 #[cfg(feature = "digest")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrityVerdict {
@@ -917,6 +989,148 @@ mod tests {
 				Ok(IntegrityVerdict::Absent)
 			));
 
+			Ok(())
+		}
+	}
+
+	#[cfg(feature = "aead")]
+	mod decrypt_in_place {
+		use super::*;
+		use crate::crypto::aead::Aes256GcmOid;
+		use crate::error::Result;
+		use crate::testing::TestMessage;
+
+		fn encrypted_frame() -> Result<Frame> {
+			let message = create_test_message(Some("in-place"));
+			let (_, cipher) = create_test_cipher_key();
+			compose! {
+				V1: id: "dip-001",
+					order: 1u64,
+					message: message,
+					confidentiality<Aes256GcmOid, _>: cipher
+			}
+		}
+
+		#[test]
+		fn yields_cleartext_frame_with_decodable_body() -> Result<()> {
+			let (_, cipher) = create_test_cipher_key();
+			let mut frame = encrypted_frame()?;
+
+			frame.decrypt_in_place(&cipher, None)?;
+
+			assert!(frame.metadata.confidentiality.is_none());
+
+			let decoded: TestMessage = crate::decode(&frame.message)?;
+			assert_eq!(decoded, create_test_message(Some("in-place")));
+			Ok(())
+		}
+
+		#[test]
+		fn wrong_key_restores_frame() -> Result<()> {
+			use crate::crypto::aead::{Aes256Gcm, KeyInit};
+			use crate::crypto::common::Key;
+
+			let mut frame = encrypted_frame()?;
+			let original = frame.clone();
+			let wrong_cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from([0x44; 32]));
+
+			let result = frame.decrypt_in_place(&wrong_cipher, None);
+			assert!(result.is_err());
+			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		#[test]
+		fn cleartext_frame_rejected() -> Result<()> {
+			let message = create_test_message(None);
+			let (_, cipher) = create_test_cipher_key();
+			let mut frame = compose! { V0: id: "dip-002", order: 1u64, message: message }?;
+
+			let result = frame.decrypt_in_place(&cipher, None);
+			assert!(matches!(result, Err(TightBeamError::MissingEncryptionInfo)));
+			Ok(())
+		}
+
+		#[test]
+		fn compressed_without_inflator_fails_before_mutation() -> Result<()> {
+			use crate::cms::compressed_data::CompressedData;
+			use crate::cms::content_info::CmsVersion;
+			use crate::cms::signed_data::EncapsulatedContentInfo;
+			use crate::oids::{COMPRESSION_ZSTD, DATA};
+			use crate::spki::AlgorithmIdentifier;
+
+			let (_, cipher) = create_test_cipher_key();
+			let mut frame = encrypted_frame()?;
+			frame.metadata.compactness = Some(CompressedData {
+				version: CmsVersion::V0,
+				compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZSTD, parameters: None },
+				encap_content_info: EncapsulatedContentInfo { econtent_type: DATA, econtent: None },
+			});
+
+			let original = frame.clone();
+			let result = frame.decrypt_in_place(&cipher, None);
+			assert!(matches!(result, Err(TightBeamError::MissingInflator)));
+			assert_eq!(frame, original);
+			Ok(())
+		}
+	}
+
+	#[cfg(feature = "compress")]
+	mod inflate_in_place {
+		use super::*;
+		use crate::compress::{Compressor, ZstdCompression};
+		use crate::error::Result;
+
+		fn compressed_frame(body: &[u8]) -> Result<Frame> {
+			let zstd = ZstdCompression::default();
+			let (compressed, compression_info) = zstd.compress(body, None)?;
+
+			let mut metadata = Metadata::default();
+			metadata.id = b"inf-001".to_vec();
+			metadata.compactness = Some(compression_info);
+
+			Ok(Frame {
+				version: Version::V0,
+				metadata,
+				message: compressed,
+				integrity: None,
+				nonrepudiation: None,
+			})
+		}
+
+		#[test]
+		fn restores_original_body_and_clears_compactness() -> Result<()> {
+			let body = b"inflate me".repeat(64);
+			let mut frame = compressed_frame(&body)?;
+
+			frame.inflate_in_place(&ZstdCompression::default())?;
+
+			assert!(frame.metadata.compactness.is_none());
+			assert_eq!(frame.message, body);
+			Ok(())
+		}
+
+		#[test]
+		fn corrupt_body_restores_frame() -> Result<()> {
+			let mut frame = compressed_frame(b"inflate me")?;
+			frame.message = vec![0xFF; 8];
+
+			let original = frame.clone();
+			let result = frame.inflate_in_place(&ZstdCompression::default());
+			assert!(result.is_err());
+			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		#[test]
+		fn uncompressed_frame_untouched() -> Result<()> {
+			let message = create_test_message(None);
+			let mut frame = compose! { V0: id: "inf-002", order: 1u64, message: message }?;
+			let original = frame.clone();
+
+			frame.inflate_in_place(&ZstdCompression::default())?;
+
+			assert_eq!(frame, original);
 			Ok(())
 		}
 	}

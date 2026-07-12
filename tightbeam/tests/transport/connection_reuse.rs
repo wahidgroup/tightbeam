@@ -161,7 +161,7 @@ tb_scenario! {
 			servlet! {
 				EchoServlet<TestMessage, EnvConfig = ()>,
 				protocol: TokioListener,
-				handle: |frame, _ctx| async move {
+				handle: |_msg, frame, _ctx| async move {
 					Ok(Some(frame))
 				}
 			}
@@ -215,7 +215,7 @@ tb_scenario! {
 			servlet! {
 				TlsEchoServlet<TestMessage, EnvConfig = ()>,
 				protocol: TokioListener,
-				handle: |frame, _ctx| async move {
+				handle: |_msg, frame, _ctx| async move {
 					Ok(Some(frame))
 				}
 			}

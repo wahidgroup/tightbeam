@@ -1409,7 +1409,7 @@ mod tests {
 	servlet! {
 		pub TestServletForScenario<crate::testing::utils::TestMessage, EnvConfig = ()>,
 		protocol: TokioListener,
-		handle: |frame, ctx| async move {
+		handle: |_msg, frame, ctx| async move {
 			let trace = ctx.trace();
 			// Server-side assertions
 			trace.event("Received")?;

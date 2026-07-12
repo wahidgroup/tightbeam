@@ -189,7 +189,8 @@ macro_rules! __servlet_start_impl {
 				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::sync::Arc::clone(&trace)));
 				let collector_gates = servlet_conf.collector_gates_ref().to_vec();
 				let hive_context = servlet_conf.hive_context().cloned();
-				// to_workers() takes ownership, so call after other borrows
+				let message_decryptor = servlet_conf.to_message_decryptor();
+				let message_inflator = servlet_conf.to_message_inflator();
 				let workers_map = servlet_conf.to_workers();
 
 				// Auto-start all workers with servlet trace
@@ -200,12 +201,16 @@ macro_rules! __servlet_start_impl {
 				}
 
 				// Create the unified servlet context
-				let servlet_context = ::std::sync::Arc::new($crate::colony::servlet::ServletContext::new(
-					::std::sync::Arc::clone(&trace),
-					env_config,
-					started_workers,
-					hive_context,
-				));
+				let servlet_context = ::std::sync::Arc::new(
+					$crate::colony::servlet::ServletContext::new(
+						::std::sync::Arc::clone(&trace),
+						env_config,
+						started_workers,
+						hive_context,
+					)
+					.with_message_decryptor(message_decryptor)
+					.with_message_inflator(message_inflator)
+				);
 
 				let server_handle = $crate::__servlet_create_server!(
 					$protocol,
@@ -324,15 +329,62 @@ macro_rules! __servlet_box_impl {
 	};
 }
 
-/// Servlet macro for creating containerized tightbeam applications
+/// Servlet macro for creating containerized tightbeam applications.
+///
+/// Two handler forms:
+///
+/// - `handle: |msg, frame, ctx|` -- typed delivery (default). Encrypted or
+///   compressed bodies are normalized in place via the decryptor/inflator.
+/// - `handle: raw |frame, ctx|` -- opt-out for servlets that own the frame
+///   lifecycle themselves.
 #[macro_export]
 macro_rules! servlet {
-	// PUBLIC SERVLET WITH ENVCONFIG
+	// PUBLIC SERVLET, TYPED DELIVERY
 	(
 		$(#[$meta:meta])*
 		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path,
-		handle: |$frame:ident, $ctx:ident| async move $handler_body:block
+		handle: |$msg:ident, $frame:ident, $ctx:ident| async move $handler_body:block
+	) => {
+		$crate::servlet! {
+			$(#[$meta])*
+			pub $servlet_name<$input, EnvConfig = $env_config>,
+			protocol: $protocol,
+			handle: raw |$frame, $ctx| async move {
+				let mut $frame = $frame;
+				$crate::colony::servlet::prepare_typed_frame(&mut $frame, $ctx)?;
+				let $msg: $input = $crate::decode(&$frame.message)?;
+				$handler_body
+			}
+		}
+	};
+
+	// PRIVATE SERVLET, TYPED DELIVERY
+	(
+		$(#[$meta:meta])*
+		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
+		protocol: $protocol:path,
+		handle: |$msg:ident, $frame:ident, $ctx:ident| async move $handler_body:block
+	) => {
+		$crate::servlet! {
+			$(#[$meta])*
+			$servlet_name<$input, EnvConfig = $env_config>,
+			protocol: $protocol,
+			handle: raw |$frame, $ctx| async move {
+				let mut $frame = $frame;
+				$crate::colony::servlet::prepare_typed_frame(&mut $frame, $ctx)?;
+				let $msg: $input = $crate::decode(&$frame.message)?;
+				$handler_body
+			}
+		}
+	};
+
+	// PUBLIC SERVLET, RAW FRAME
+	(
+		$(#[$meta:meta])*
+		pub $servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
+		protocol: $protocol:path,
+		handle: raw |$frame:ident, $ctx:ident| async move $handler_body:block
 	) => {
 		$crate::paste::paste! {
 			$(#[$meta])*
@@ -353,12 +405,12 @@ macro_rules! servlet {
 		}
 	};
 
-	// PRIVATE SERVLET WITH ENVCONFIG
+	// PRIVATE SERVLET, RAW FRAME
 	(
 		$(#[$meta:meta])*
 		$servlet_name:ident<$input:ty, EnvConfig = $env_config:ty>,
 		protocol: $protocol:path,
-		handle: |$frame:ident, $ctx:ident| async move $handler_body:block
+		handle: raw |$frame:ident, $ctx:ident| async move $handler_body:block
 	) => {
 		$crate::paste::paste! {
 			$(#[$meta])*

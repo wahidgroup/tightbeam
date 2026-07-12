@@ -385,11 +385,13 @@ macro_rules! hive {
 						});
 					});
 
-					let request = $crate::colony::hive::RegisterHiveRequest {
-						hive_addr: self.addr.into(),
-						servlet_addresses: servlet_info_list,
-						metadata: Some(b"hive".to_vec()),
-					};
+					let request = $crate::colony::common::ClusterRequest::RegisterHive(
+						$crate::colony::hive::RegisterHiveRequest {
+							hive_addr: self.addr.into(),
+							servlet_addresses: servlet_info_list,
+							metadata: Some(b"hive".to_vec()),
+						}
+					);
 
 					// Connect to cluster
 					let stream = <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await?;
@@ -939,17 +941,21 @@ macro_rules! hive {
 			};
 
 			let update = if is_added {
-				$crate::colony::hive::ServletAddressUpdate {
-					hive_id,
-					added: vec![servlet_info],
-					removed: vec![],
-				}
+				$crate::colony::common::ClusterRequest::ServletAddressUpdate(
+					$crate::colony::hive::ServletAddressUpdate {
+						hive_id,
+						added: vec![servlet_info],
+						removed: vec![],
+					}
+				)
 			} else {
-				$crate::colony::hive::ServletAddressUpdate {
-					hive_id,
-					added: vec![],
-					removed: vec![servlet_info.address],
-				}
+				$crate::colony::common::ClusterRequest::ServletAddressUpdate(
+					$crate::colony::hive::ServletAddressUpdate {
+						hive_id,
+						added: vec![],
+						removed: vec![servlet_info.address],
+					}
+				)
 			};
 
 			let frame_result: Result<$crate::Frame, $crate::TightBeamError> = async {

@@ -19,7 +19,7 @@ use tightbeam::{
 	builder::TypeBuilder,
 	cluster,
 	colony::{
-		cluster::{Cluster, ClusterConf, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
+		cluster::{Cluster, ClusterConf, ClusterRequest, ClusterTlsConfig, ClusterWorkRequest, ClusterWorkResponse},
 		hive::{Hive, HiveConf, HiveTlsConfig},
 		servlet::ServletConf,
 	},
@@ -131,8 +131,7 @@ pub struct PingResponse {
 servlet! {
 	ClusterTestServlet<PingRequest, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, _ctx| async move {
-		let req: PingRequest = decode(&frame.message)?;
+	handle: |req, frame, _ctx| async move {
 		Ok(Some(compose! {
 			V0: id: frame.metadata.id.clone(),
 				message: PingResponse { doubled: req.value * 2 }
@@ -209,10 +208,10 @@ tb_scenario! {
 			// Send work request
 			trace.event("work_sent")?;
 
-			let work_request = ClusterWorkRequest {
+			let work_request = ClusterRequest::Work(ClusterWorkRequest {
 				servlet_type: b"ping".to_vec(),
 				payload: encode(&PingRequest { value: 21 })?,
-			};
+			});
 
 			let frame = frame_compose(Version::V0)
 				.with_id(b"test-work")
@@ -286,10 +285,10 @@ tb_scenario! {
 			let cluster = ClusterGateway::start(Arc::new(TraceCollector::new()), cluster_conf).await?;
 			let cluster_addr = cluster.addr();
 
-			let work_request = ClusterWorkRequest {
+			let work_request = ClusterRequest::Work(ClusterWorkRequest {
 				servlet_type: b"ping".to_vec(),
 				payload: encode(&PingRequest { value: 21 })?,
-			};
+			});
 
 			let frame = frame_compose(Version::V0)
 				.with_id(b"policy-test")

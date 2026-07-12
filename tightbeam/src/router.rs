@@ -1,15 +1,17 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
-#[cfg(not(feature = "std"))]
-use alloc::sync::Arc;
-
-#[cfg(feature = "std")]
-use std::sync::Arc;
 
 use crate::{Frame, Message};
 
 #[cfg(feature = "derive")]
 use crate::Errorizable;
+
+/// Single `Arc` spelling for both std and no_std builds so [`routes!`]
+/// can emit one `dispatch` body via `$crate::router::Arc`.
+#[cfg(not(feature = "std"))]
+pub use alloc::sync::Arc;
+#[cfg(feature = "std")]
+pub use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, RouterError>;
 
@@ -18,75 +20,100 @@ pub type Result<T> = core::result::Result<T, RouterError>;
 pub enum RouterError {
 	#[cfg_attr(feature = "derive", error("No route configured for provided message"))]
 	UnknownRoute,
+	#[cfg_attr(
+		feature = "derive",
+		error("Frame body failed to decode as the dispatched type: {0}")
+	)]
+	DecodeFailed(crate::der::Error),
+	#[cfg_attr(feature = "derive", error("Frame body is encrypted; decrypt before routing"))]
+	ConfidentialFrame,
+	#[cfg_attr(feature = "derive", error("Frame body is compressed; inflate before routing"))]
+	CompressedFrame,
 }
 
 crate::impl_error_display!(RouterError {
 	UnknownRoute => "No route configured for provided message",
+	DecodeFailed(source) => "Frame body failed to decode as the dispatched type: {source}",
+	ConfidentialFrame => "Frame body is encrypted; decrypt before routing",
+	CompressedFrame => "Frame body is compressed; inflate before routing",
 });
 
-pub trait RouterPolicy: Send + Sync {
-	/// Route `message` to the handler registered for message type `T`
-	///
-	/// Routing keys on the caller-supplied `T` (by `TypeId`), not on the
-	/// frame contents: the frame body is never validated against `T`, so a
-	/// wrong turbofish silently delivers the frame to the wrong handler.
-	/// Callers own the pairing between decoded type and type parameter.
-	fn dispatch<T: Message + Send + 'static>(&self, message: Arc<Frame>) -> Result<()>;
+crate::impl_from!(crate::der::Error => RouterError::DecodeFailed);
+
+/// Reject frames whose body cannot be type-validated at routing time.
+///
+/// The router is strictly cleartext: an encrypted or compressed body
+/// cannot be decoded as the dispatched type, so validation would be
+/// impossible and misdelivery silent. Decrypt/inflate upstream, then
+/// route. Hand-written [`RouterPolicy`] impls MUST call this before
+/// decoding.
+///
+/// # Errors
+///
+/// - [`RouterError::ConfidentialFrame`] -- `metadata.confidentiality` is set.
+/// - [`RouterError::CompressedFrame`] -- `metadata.compactness` is set.
+pub fn ensure_cleartext(frame: &Frame) -> Result<()> {
+	if frame.metadata.confidentiality.is_some() {
+		return Err(RouterError::ConfidentialFrame);
+	}
+	if frame.metadata.compactness.is_some() {
+		return Err(RouterError::CompressedFrame);
+	}
+
+	Ok(())
 }
 
+pub trait RouterPolicy: Send + Sync {
+	/// Route `frame` to the handler registered for message type `T`,
+	/// delivering the body decoded as `T`.
+	///
+	/// Dispatch decodes the cleartext body exactly once and hands the
+	/// typed value to the handler, so a mismatched turbofish fails
+	/// loudly at the dispatch site instead of silently delivering
+	/// foreign bytes. Opaque payloads are rejected before any decode
+	/// attempt (see [`ensure_cleartext`]).
+	///
+	/// Residual: two DER-structurally-identical types still cross-decode
+	/// (the wire format carries no type discriminator by design -- the
+	/// receiver decides the type, never the sender). [`routes!`] keeps
+	/// each type adjacent to its handler to confine that risk.
+	///
+	/// # Errors
+	///
+	/// - [`RouterError::ConfidentialFrame`] -- body is encrypted.
+	/// - [`RouterError::CompressedFrame`] -- body is compressed.
+	/// - [`RouterError::DecodeFailed`] -- body did not decode as `T`.
+	/// - [`RouterError::UnknownRoute`] -- no handler registered for `T`.
+	fn dispatch<T: Message + Send + 'static>(&self, frame: Arc<Frame>) -> Result<()>;
+}
+
+/// Declare a router struct and its [`RouterPolicy`] impl.
+///
+/// Each route pairs a message type with a handler receiving
+/// `|router, frame, msg|`: the router's fields, the original
+/// [`Frame`] (metadata access), and the body already decoded as the
+/// registered type.
 #[macro_export]
 macro_rules! routes {
-	// Helper for generating dispatch logic
-	(@dispatch $self:ident, $message:ident, [ $( ($MsgTy:ty, $this:ident, $arg:pat_param, $handler:block) ),* ]) => {
-		$(
-			if std::any::TypeId::of::<T>() == std::any::TypeId::of::<$MsgTy>() {
-				let $arg = $message;
-				let $this = $self;
-				{ $handler }
-				return Ok(());
-			}
-		)*
-		Err($crate::router::RouterError::UnknownRoute)
-	};
-
-	// Helper for generating dispatch logic (1-arg form)
-	(@dispatch $self:ident, $message:ident, [ $( ($MsgTy:ty, $arg:pat_param, $handler:block) ),* ]) => {
-		$(
-			if std::any::TypeId::of::<T>() == std::any::TypeId::of::<$MsgTy>() {
-				let $arg = $message;
-				{ $handler }
-			 return Ok(());
-			}
-		)*
-		Err($crate::router::RouterError::UnknownRoute)
-	};
-
 	(
 		$RouterName:ident { $( $field:ident : $fty:ty ),* $(,)? } :
 		$(
-			$MsgTy:ty | $($arg:ident),* | $handler:block
+			$MsgTy:ty | $router:ident, $frame:ident, $msg:ident | $handler:block
 		)+
 	) => {
 		struct $RouterName { $( $field : $fty ),* }
-		impl $crate::router::RouterPolicy for $RouterName {
-			#[cfg(not(feature = "std"))]
-			fn dispatch<T: $crate::Message + Send + 'static>(&self, message: alloc::sync::Arc<$crate::Frame>) -> $crate::router::Result<()> {
-				$(
-					if std::any::TypeId::of::<T>() == std::any::TypeId::of::<$MsgTy>() {
-						let ($($arg),*) = (self, message);
-						$handler;
-						return Ok(());
-					}
-				)*
-				Err($crate::router::RouterError::UnknownRoute)
-			}
 
-			#[cfg(feature = "std")]
-			fn dispatch<T: $crate::Message + Send + 'static>(&self, message: std::sync::Arc<$crate::Frame>) -> $crate::router::Result<()> {
+		impl $crate::router::RouterPolicy for $RouterName {
+			fn dispatch<T: $crate::Message + Send + 'static>(
+				&self,
+				frame: $crate::router::Arc<$crate::Frame>,
+			) -> $crate::router::Result<()> {
+				$crate::router::ensure_cleartext(&frame)?;
 				$(
-					if std::any::TypeId::of::<T>() == std::any::TypeId::of::<$MsgTy>() {
-						let ($($arg),*) = (self, message);
-						$handler;
+					if core::any::TypeId::of::<T>() == core::any::TypeId::of::<$MsgTy>() {
+						let decoded: $MsgTy = $crate::der::Decode::from_der(frame.message.as_slice())?;
+						let ($router, $frame, $msg) = (self, frame, decoded);
+						{ $handler }
 						return Ok(());
 					}
 				)*
@@ -96,133 +123,167 @@ macro_rules! routes {
 	};
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "builder"))]
 mod tests {
 	use std::sync::{mpsc, Arc};
 	use std::time::Duration;
 
-	use crate::der::Sequence;
-	use crate::router::RouterPolicy;
+	use crate::cms::compressed_data::CompressedData;
+	use crate::cms::content_info::CmsVersion;
+	use crate::cms::enveloped_data::EncryptedContentInfo;
+	use crate::cms::signed_data::EncapsulatedContentInfo;
+	use crate::der::asn1::OctetString;
+	use crate::der::{Decode, Encode, Sequence};
+	use crate::oids::{COMPRESSION_ZSTD, DATA};
+	use crate::router::{RouterError, RouterPolicy};
+	use crate::spki::AlgorithmIdentifier;
 	use crate::Beamable;
 	use crate::Frame;
 
-	#[cfg(not(feature = "derive"))]
-	use crate::router::RouterPolicy;
-
-	#[cfg_attr(feature = "derive", derive(Beamable))]
-	#[derive(Sequence, Clone, Debug, PartialEq)]
+	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 	pub struct HealthCheck {
 		pub uptime: u64,
 	}
 
-	#[cfg(not(feature = "derive"))]
-	impl crate::Message for HealthCheck {
-		const MUST_BE_CONFIDENTIAL: bool = false;
-		const MUST_BE_NON_REPUDIABLE: bool = false;
-		const MUST_BE_COMPRESSED: bool = false;
-		const MUST_BE_PRIORITIZED: bool = false;
-		const MIN_VERSION: crate::Version = crate::Version::V0;
-	}
-
-	#[cfg_attr(feature = "derive", derive(Beamable))]
-	#[derive(Sequence, Clone, Debug, PartialEq)]
+	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
 	pub struct Payment {
 		pub from: String,
 		pub amount: u64,
 	}
 
-	#[cfg(not(feature = "derive"))]
-	impl crate::Message for Payment {
-		const MUST_BE_CONFIDENTIAL: bool = false;
-		const MUST_BE_NON_REPUDIABLE: bool = false;
-		const MUST_BE_COMPRESSED: bool = false;
-		const MUST_BE_PRIORITIZED: bool = false;
-		const MIN_VERSION: crate::Version = crate::Version::V0;
+	#[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
+	pub struct Unrouted {
+		pub note: String,
+	}
+
+	type Delivery<T> = (Arc<Frame>, T);
+
+	routes! {
+		ChannelRouter {
+			payment_tx: mpsc::Sender<Delivery<Payment>>,
+			health_tx: mpsc::Sender<Delivery<HealthCheck>>,
+		}:
+			Payment |router, frame, msg| {
+				let _ = router.payment_tx.send((frame, msg));
+			}
+			HealthCheck |router, frame, msg| {
+				let _ = router.health_tx.send((frame, msg));
+			}
+	}
+
+	fn build_router() -> (
+		ChannelRouter,
+		mpsc::Receiver<Delivery<Payment>>,
+		mpsc::Receiver<Delivery<HealthCheck>>,
+	) {
+		let (payment_tx, payment_rx) = mpsc::channel();
+		let (health_tx, health_rx) = mpsc::channel();
+		(ChannelRouter { payment_tx, health_tx }, payment_rx, health_rx)
+	}
+
+	fn compose_payment(index: u64) -> Result<Frame, Box<dyn std::error::Error>> {
+		let frame = compose! {
+			V0: id: format!("p-{index}"),
+				order: 1u64,
+				message: Payment {
+					from: "alice".into(),
+					amount: index
+				}
+		}?;
+		Ok(frame)
+	}
+
+	fn compose_health(index: u64) -> Result<Frame, Box<dyn std::error::Error>> {
+		let frame = compose! {
+			V0: id: format!("h-{index}"),
+				order: 1u64,
+				message: HealthCheck { uptime: index }
+		}?;
+		Ok(frame)
 	}
 
 	#[test]
-	fn test_mpsc_channel_routing() -> Result<(), Box<dyn std::error::Error>> {
-		#[cfg(feature = "derive")]
-		routes! {
-			ChannelRouter {
-				payment_tx: mpsc::Sender<Arc<Frame>>,
-				health_tx: mpsc::Sender<Arc<Frame>>,
-			}:
-				Payment |router, msg| {
-					let _ = router.payment_tx.send(msg);
-				}
-				HealthCheck |router, msg| {
-					let _ = router.health_tx.send(msg);
-				}
-		}
+	fn dispatch_delivers_decoded_message_per_route() -> Result<(), Box<dyn std::error::Error>> {
+		let (router, payment_rx, health_rx) = build_router();
 
-		#[cfg(not(feature = "derive"))]
-		struct ChannelRouter {
-			payment_tx: mpsc::Sender<Arc<Frame>>,
-			health_tx: mpsc::Sender<Arc<Frame>>,
-		}
-
-		#[cfg(not(feature = "derive"))]
-		impl super::RouterPolicy for ChannelRouter {
-			fn dispatch<M: Message>(&self, message: Arc<Frame>) -> crate::router::Result<()> {
-				if std::any::TypeId::of::<M>() == std::any::TypeId::of::<Payment>() {
-					let _ = self.payment_tx.send(message);
-					return Ok(());
-				}
-
-				if std::any::TypeId::of::<M>() == std::any::TypeId::of::<HealthCheck>() {
-					let _ = self.health_tx.send(message);
-					return Ok(());
-				}
-
-				Err(super::RouterError::UnknownRoute)
-			}
-		}
-
-		let (payment_tx, payment_rx) = mpsc::channel::<Arc<Frame>>();
-		let (health_tx, health_rx) = mpsc::channel::<Arc<Frame>>();
-		let router = ChannelRouter { payment_tx, health_tx };
-
-		let n = 5usize;
+		let n = 5u64;
 		for i in 0..n {
-			// Compose Payment
-			let payment = compose! {
-				V0: id: format!("p-{i}"),
-					order: 1u64,
-					message: Payment {
-						from: "alice".into(),
-						amount: i as u64
-					}
-			}?;
-			// Route
-			router.dispatch::<Payment>(Arc::new(payment))?;
-
-			// Compose HealthCheck
-			let health = compose! {
-				V0: id: format!("h-{i}"),
-					order: 1u64,
-					message: HealthCheck {
-						uptime: i as u64
-					}
-			}?;
-			// Route
-			router.dispatch::<HealthCheck>(Arc::new(health))?;
+			router.dispatch::<Payment>(Arc::new(compose_payment(i)?))?;
+			router.dispatch::<HealthCheck>(Arc::new(compose_health(i)?))?;
 		}
 
-		// Verify n messages per channel
 		let timeout = Duration::from_millis(200);
 		for i in 0..n {
-			let received_payment = payment_rx.recv_timeout(timeout)?;
-			let message: Payment = crate::decode(&received_payment.message)?;
-			assert_eq!(&received_payment.metadata.id, &format!("p-{i}").as_bytes());
-			assert_eq!(message, Payment { from: "alice".into(), amount: i as u64 });
+			let (payment_frame, payment) = payment_rx.recv_timeout(timeout)?;
+			assert_eq!(&payment_frame.metadata.id, &format!("p-{i}").as_bytes());
+			assert_eq!(payment, Payment { from: "alice".into(), amount: i });
 
-			let received_health = health_rx.recv_timeout(timeout)?;
-			let message: HealthCheck = crate::decode(&received_health.message)?;
-			assert_eq!(received_health.metadata.id, format!("h-{i}").as_bytes());
-			assert_eq!(message, HealthCheck { uptime: i as u64 });
+			let (health_frame, health) = health_rx.recv_timeout(timeout)?;
+			assert_eq!(&health_frame.metadata.id, &format!("h-{i}").as_bytes());
+			assert_eq!(health, HealthCheck { uptime: i });
 		}
 
+		Ok(())
+	}
+
+	#[test]
+	fn dispatch_rejects_misdelivered_type() -> Result<(), Box<dyn std::error::Error>> {
+		let (router, payment_rx, _health_rx) = build_router();
+
+		let result = router.dispatch::<Payment>(Arc::new(compose_health(0)?));
+		assert!(matches!(result, Err(RouterError::DecodeFailed(_))));
+		assert!(matches!(
+			payment_rx.recv_timeout(Duration::from_millis(50)),
+			Err(mpsc::RecvTimeoutError::Timeout)
+		));
+		Ok(())
+	}
+
+	#[test]
+	fn dispatch_rejects_unregistered_type() -> Result<(), Box<dyn std::error::Error>> {
+		let (router, _payment_rx, _health_rx) = build_router();
+
+		let result = router.dispatch::<Unrouted>(Arc::new(compose_payment(0)?));
+		assert!(matches!(result, Err(RouterError::UnknownRoute)));
+		Ok(())
+	}
+
+	#[test]
+	fn dispatch_rejects_confidential_frame() -> Result<(), Box<dyn std::error::Error>> {
+		let (router, payment_rx, _health_rx) = build_router();
+
+		let mut frame = compose_payment(0)?;
+		frame.metadata.confidentiality = Some(EncryptedContentInfo {
+			content_type: DATA,
+			content_enc_alg: AlgorithmIdentifier { oid: DATA, parameters: None },
+			encrypted_content: Some(OctetString::new(vec![0; 16])?),
+		});
+
+		let result = router.dispatch::<Payment>(Arc::new(frame));
+		assert!(matches!(result, Err(RouterError::ConfidentialFrame)));
+		assert!(matches!(
+			payment_rx.recv_timeout(Duration::from_millis(50)),
+			Err(mpsc::RecvTimeoutError::Timeout)
+		));
+		Ok(())
+	}
+
+	#[test]
+	fn dispatch_rejects_compressed_frame() -> Result<(), Box<dyn std::error::Error>> {
+		let (router, _payment_rx, _health_rx) = build_router();
+
+		let mut frame = compose_payment(0)?;
+		frame.metadata.compactness = Some(CompressedData {
+			version: CmsVersion::V0,
+			compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZSTD, parameters: None },
+			encap_content_info: EncapsulatedContentInfo {
+				econtent_type: DATA,
+				econtent: Some(crate::der::Any::from_der(&OctetString::new(vec![0; 8])?.to_der()?)?),
+			},
+		});
+
+		let result = router.dispatch::<Payment>(Arc::new(frame));
+		assert!(matches!(result, Err(RouterError::CompressedFrame)));
 		Ok(())
 	}
 }
