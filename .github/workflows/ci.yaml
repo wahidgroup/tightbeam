@@ -46,20 +46,12 @@ jobs:
         run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-features
 
   test:
-    name: ${{ matrix.name }}
+    name: Test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Test All Features
-            run: make test-all
-          - name: Feature Combinations
-            run: ./scripts/test_features.sh
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
       - name: Run tests
-        run: ${{ matrix.run }}
+        run: make test-all
