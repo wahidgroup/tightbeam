@@ -67,13 +67,27 @@ impl HiveRegistry {
 	/// `signer_id` is the DER-encoded `SignerIdentifier` from the registration
 	/// frame. Later `ServletAddressUpdate` calls must present the same signer
 	/// for this hive id (CWE-639).
+	///
+	/// Re-registration of an existing hive is allowed only when the incoming
+	/// signer matches the already-bound signer.
 	pub fn register_with_signer(
 		&self,
 		request: RegisterHiveRequest,
 		signer_id: Option<SharedId>,
 	) -> Result<(), ClusterError> {
 		let hive_id: SharedId = request.hive_addr.into();
-		// Extract servlet types from servlet_addresses
+
+		{
+			let hives = self.hives.read()?;
+			if let Some(existing) = hives.get(hive_id.as_ref()) {
+				match (&existing.signer_id, &signer_id) {
+					(Some(bound), Some(incoming)) if bound.as_ref() == incoming.as_ref() => {}
+					(Some(_), _) => return Err(ClusterError::SignerMismatch),
+					(None, _) => {}
+				}
+			}
+		}
+
 		let servlet_types: Arc<[SharedId]> = request
 			.servlet_addresses
 			.iter()
@@ -94,10 +108,8 @@ impl HiveRegistry {
 			signer_id,
 		};
 
-		// Remove old index entries if re-registering
 		self.unregister(&hive_id)?;
 
-		// Add to hives map
 		{
 			let mut hives = self.hives.write()?;
 			let hive_id = Arc::clone(&hive_id);
@@ -293,6 +305,61 @@ mod tests {
 			let evicted = registry.evict_stale()?;
 			assert_eq!(evicted.len(), evicted_len);
 			assert_eq!(registry.len()?, remaining_len);
+		}
+
+		Ok(())
+	}
+
+	struct SignerRebindCase {
+		first: Option<&'static [u8]>,
+		second: Option<&'static [u8]>,
+		expect_ok: bool,
+		bound_after: Option<&'static [u8]>,
+	}
+
+	fn signer_rebind_cases() -> Vec<SignerRebindCase> {
+		vec![
+			SignerRebindCase {
+				first: Some(b"sid-a"),
+				second: Some(b"sid-b"),
+				expect_ok: false,
+				bound_after: Some(b"sid-a"),
+			},
+			SignerRebindCase {
+				first: Some(b"sid-a"),
+				second: Some(b"sid-a"),
+				expect_ok: true,
+				bound_after: Some(b"sid-a"),
+			},
+			SignerRebindCase {
+				first: None,
+				second: Some(b"sid-a"),
+				expect_ok: true,
+				bound_after: Some(b"sid-a"),
+			},
+			SignerRebindCase {
+				first: Some(b"sid-a"),
+				second: None,
+				expect_ok: false,
+				bound_after: Some(b"sid-a"),
+			},
+		]
+	}
+
+	#[test]
+	fn register_with_signer_rejects_cross_signer_hijack() -> Result<(), ClusterError> {
+		for case in signer_rebind_cases() {
+			let registry = HiveRegistry::new(Duration::from_secs(3600));
+			registry.register_with_signer(request(b"hive1", &[b"ping"]), case.first.map(Arc::from))?;
+
+			let result = registry.register_with_signer(request(b"hive1", &[b"ping"]), case.second.map(Arc::from));
+			assert_eq!(result.is_ok(), case.expect_ok);
+			if !case.expect_ok {
+				assert!(matches!(result, Err(ClusterError::SignerMismatch)));
+			}
+
+			let bound = registry.signer_for(b"hive1")?;
+			assert_eq!(bound.as_deref(), case.bound_after);
 		}
 
 		Ok(())

@@ -57,6 +57,10 @@ pub enum ClusterError {
 	/// Servlet address update referenced a route owned by a different hive
 	#[error("Servlet not owned by hive")]
 	ServletNotOwned,
+
+	/// Re-registration presented a signer that does not match the bound hive signer
+	#[error("Signer does not match hive binding")]
+	SignerMismatch,
 }
 
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {

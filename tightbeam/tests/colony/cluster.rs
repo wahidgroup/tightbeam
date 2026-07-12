@@ -834,3 +834,62 @@ tb_scenario! {
 		}
 	}
 }
+
+tb_assert_spec! {
+	pub ClusterRegistrationHijackSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("owner_registered", exactly!(1)),
+			("hijack_forbidden", exactly!(1)),
+			("owner_bind_intact", exactly!(1))
+		]
+	}
+}
+
+tb_scenario! {
+	name: cluster_rejects_cross_hive_registration_hijack,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(ClusterRegistrationHijackSpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let certs = dual_hive_certs();
+			let cluster = start_cluster(ClusterConf::new(cluster_tls_config_with_trust(
+				certs.gateway,
+				Some(Arc::clone(&certs.hive_trust)),
+			)))
+			.await?;
+			let mut client = connect_cluster(certs.gateway, cluster.addr()).await?;
+
+			let hive_a_addr = b"127.0.0.1:65020".as_slice();
+
+			let owner = register_signed_hive(&mut client, &certs.hive_a.1, b"owner-reg", hive_a_addr).await?;
+			assert_eq!(owner.status, TransitStatus::Accepted);
+			assert_eq!(cluster.hive_count(), 1);
+
+			trace.event("owner_registered")?;
+
+			let hijack = register_signed_hive(&mut client, &certs.hive_b.1, b"hijack-reg", hive_a_addr).await?;
+			assert_eq!(hijack.status, TransitStatus::Forbidden);
+			assert_eq!(cluster.hive_count(), 1);
+
+			trace.event("hijack_forbidden")?;
+
+			let owned = emit_servlet_update(
+				&mut client,
+				&certs.hive_a.1,
+				b"owner-still-bound",
+				servlet_address_update(hive_a_addr, vec![servlet_info(b"ping", b"127.0.0.1:65021")]),
+			)
+			.await?;
+			assert_eq!(owned.status, TransitStatus::Accepted);
+
+			trace.event("owner_bind_intact")?;
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
