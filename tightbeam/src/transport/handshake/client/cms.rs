@@ -220,7 +220,7 @@ where
 				store.verify_chain(chain)?;
 				let leaf = chain.last().ok_or(HandshakeError::MissingServerCertificate)?;
 				if pinned.as_ref().is_some_and(|cert| *leaf != **cert) {
-					return Err(HandshakeError::PeerIdentityMismatch);
+					return Err(HandshakeError::PinnedCertificateMismatch);
 				}
 			}
 			(None, Some(cert)) => store.evaluate(cert)?,
@@ -784,6 +784,7 @@ mod tests {
 	use crate::oids::{HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
+	use crate::transport::handshake::error::HandshakeError;
 	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	use crate::transport::handshake::state::ClientHandshakeState;
 	use crate::transport::handshake::tests::*;
@@ -859,10 +860,7 @@ mod tests {
 		);
 
 		let result = client.build_key_exchange(vec![2u8; 32], None);
-		assert!(matches!(
-			result,
-			Err(crate::transport::handshake::error::HandshakeError::MissingTrustStore)
-		));
+		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
 		Ok(())
 	}
 
@@ -912,12 +910,36 @@ mod tests {
 		let mut client = chain_client(std::sync::Arc::from(vec![chain.root, chain.intermediate, chain.leaf]), None)?;
 
 		let result = client.build_key_exchange(vec![2u8; 32], None);
-		assert!(matches!(
-			result,
-			Err(crate::transport::handshake::error::HandshakeError::CertificateValidationError(
-				_
-			))
-		));
+		assert!(matches!(result, Err(HandshakeError::CertificateValidationError(_))));
+		Ok(())
+	}
+
+	/// A pinned server certificate that differs from the provisioned chain
+	/// leaf is a configuration mismatch, distinct from a re-handshake
+	/// identity violation.
+	#[test]
+	fn pinned_certificate_mismatch_rejected() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+
+		let chain = crate::testing::utils::create_test_certificate_chain()?;
+		let store: std::sync::Arc<dyn CertificateTrust> = std::sync::Arc::new(
+			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_certificate(chain.root.clone())?
+				.build(),
+		);
+		let pinned = std::sync::Arc::new(create_test_certificate().certificate);
+		let mut client = super::CmsHandshakeClient::<DefaultCryptoProvider>::new(
+			DefaultCryptoProvider::default(),
+			into_provider(create_test_certificate().signing_key),
+			pinned,
+		)
+		.with_server_certificate_chain(std::sync::Arc::from(vec![chain.root, chain.intermediate, chain.leaf]))
+		.with_trust_store(store);
+
+		let result = client.build_key_exchange(vec![2u8; 32], None);
+		assert!(matches!(result, Err(HandshakeError::PinnedCertificateMismatch)));
 		Ok(())
 	}
 
@@ -927,10 +949,7 @@ mod tests {
 		let mut client = chain_client(std::sync::Arc::from(Vec::new()), Some(chain.root))?;
 
 		let result = client.build_key_exchange(vec![2u8; 32], None);
-		assert!(matches!(
-			result,
-			Err(crate::transport::handshake::error::HandshakeError::MissingServerCertificate)
-		));
+		assert!(matches!(result, Err(HandshakeError::MissingServerCertificate)));
 		Ok(())
 	}
 
@@ -993,10 +1012,9 @@ mod tests {
 		assert_eq!(client.selected_profile, Some(offered));
 
 		let rejected = build_finished_with_accept(unoffered)?;
-		assert!(matches!(
-			client.apply_security_accept(super::extract_security_accept_attr(&rejected)?),
-			Err(crate::transport::handshake::error::HandshakeError::InvalidProfileSelection)
-		));
+		let attrs = super::extract_security_accept_attr(&rejected)?;
+		let result = client.apply_security_accept(attrs);
+		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 
 		Ok(())
 	}

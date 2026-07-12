@@ -139,6 +139,13 @@ pub enum HandshakeError {
 	)]
 	PeerIdentityMismatch,
 
+	/// Provisioned certificate chain leaf does not match the pinned server certificate
+	#[cfg_attr(
+		feature = "derive",
+		error("Provisioned certificate chain leaf does not match pinned server certificate")
+	)]
+	PinnedCertificateMismatch,
+
 	/// Missing client random
 	#[cfg_attr(feature = "derive", error("Missing client random from ClientHello"))]
 	MissingClientRandom,
@@ -349,6 +356,7 @@ crate::impl_error_display!(HandshakeError {
 	TranscriptDigestLength { expected, received } => "Transcript digest length invalid: expected {expected} bytes, got {received}",
 	MutualAuthRequired => "Server requires mutual authentication but client has no identity",
 	PeerIdentityMismatch => "Peer identity changed during re-handshake - connection identity is immutable",
+	PinnedCertificateMismatch => "Provisioned certificate chain leaf does not match pinned server certificate",
 	MissingClientRandom => "Missing client random from ClientHello",
 	MissingBaseSessionKey => "Missing base session key",
 	MissingClientRandomState => "Missing client random",
