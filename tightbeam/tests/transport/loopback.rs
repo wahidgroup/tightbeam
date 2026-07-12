@@ -128,6 +128,52 @@ fn assert_bidirectional_roundtrip(
 	Ok(())
 }
 
+/// Complete both peers, prove AEAD key agreement, and assert negotiated profile.
+async fn assert_session_ready<C, S>(
+	client: &mut C,
+	server: &mut S,
+	profile: tightbeam::crypto::profiles::SecurityProfileDesc,
+	trace: &tightbeam::trace::TraceCollector,
+	events: (&'static str, &'static str, &'static str),
+	label: &str,
+) -> Result<(), TightBeamError>
+where
+	C: ClientHandshakeProtocol,
+	S: ServerHandshakeProtocol,
+	TightBeamError: From<C::Error> + From<S::Error>,
+{
+	let (complete_event, roundtrip_event, profile_event) = events;
+
+	let client_aead = ClientHandshakeProtocol::complete(client).await?;
+	let server_aead = ServerHandshakeProtocol::complete(server).await?;
+	assert!(
+		ClientHandshakeProtocol::is_complete(client),
+		"{label} client must report completion"
+	);
+	assert!(
+		ServerHandshakeProtocol::is_complete(server),
+		"{label} server must report completion"
+	);
+
+	trace.event(complete_event)?;
+	assert_bidirectional_roundtrip(&client_aead, &server_aead)?;
+	trace.event(roundtrip_event)?;
+
+	assert_eq!(
+		ClientHandshakeProtocol::selected_profile(client),
+		Some(profile),
+		"{label} client must record the negotiated profile"
+	);
+	assert_eq!(
+		ServerHandshakeProtocol::selected_profile(server),
+		Some(profile),
+		"{label} server must record the negotiated profile"
+	);
+
+	trace.event(profile_event)?;
+	Ok(())
+}
+
 /// ECIES loopback through the orchestrator trait surface.
 #[cfg(feature = "transport-ecies")]
 async fn ecies_loopback(
@@ -161,35 +207,19 @@ async fn ecies_loopback(
 	let no_reply = server.handle_request(&client_kex).await?;
 	assert!(no_reply.is_none(), "ECIES server must not reply to ClientKeyExchange");
 
-	let client_aead = ClientHandshakeProtocol::complete(&mut client).await?;
-	let server_aead = ServerHandshakeProtocol::complete(&mut server).await?;
-	assert!(
-		ClientHandshakeProtocol::is_complete(&client),
-		"ECIES client must report completion"
-	);
-	assert!(
-		ServerHandshakeProtocol::is_complete(&server),
-		"ECIES server must report completion"
-	);
-
-	trace.event("loopback_ecies_complete")?;
-	assert_bidirectional_roundtrip(&client_aead, &server_aead)?;
-	trace.event("loopback_ecies_roundtrip")?;
-
-	assert_eq!(
-		ClientHandshakeProtocol::selected_profile(&client),
-		Some(profile),
-		"ECIES client must record the negotiated profile"
-	);
-	assert_eq!(
-		ServerHandshakeProtocol::selected_profile(&server),
-		Some(profile),
-		"ECIES server must record the negotiated profile"
-	);
-
-	trace.event("loopback_ecies_profile_agreed")?;
-
-	Ok(())
+	assert_session_ready(
+		&mut client,
+		&mut server,
+		profile,
+		trace,
+		(
+			"loopback_ecies_complete",
+			"loopback_ecies_roundtrip",
+			"loopback_ecies_profile_agreed",
+		),
+		"ECIES",
+	)
+	.await
 }
 
 /// Build a CMS client/server pair sharing the harness server identity.
@@ -273,35 +303,15 @@ async fn cms_loopback(
 	let no_reply = server.handle_request(&client_finished).await?;
 	assert!(no_reply.is_none(), "CMS server must not reply to ClientFinished");
 
-	let client_aead = ClientHandshakeProtocol::complete(&mut client).await?;
-	let server_aead = ServerHandshakeProtocol::complete(&mut server).await?;
-	assert!(
-		ClientHandshakeProtocol::is_complete(&client),
-		"CMS client must report completion"
-	);
-	assert!(
-		ServerHandshakeProtocol::is_complete(&server),
-		"CMS server must report completion"
-	);
-
-	trace.event("loopback_cms_complete")?;
-	assert_bidirectional_roundtrip(&client_aead, &server_aead)?;
-	trace.event("loopback_cms_roundtrip")?;
-
-	assert_eq!(
-		ClientHandshakeProtocol::selected_profile(&client),
-		Some(profile),
-		"CMS client must learn the negotiated profile from SecurityAccept"
-	);
-	assert_eq!(
-		ServerHandshakeProtocol::selected_profile(&server),
-		Some(profile),
-		"CMS server must record the negotiated profile"
-	);
-
-	trace.event("loopback_cms_profile_agreed")?;
-
-	Ok(())
+	assert_session_ready(
+		&mut client,
+		&mut server,
+		profile,
+		trace,
+		("loopback_cms_complete", "loopback_cms_roundtrip", "loopback_cms_profile_agreed"),
+		"CMS",
+	)
+	.await
 }
 
 /// CMS session keys must be random per handshake (CWE-321).

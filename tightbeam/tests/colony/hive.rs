@@ -15,14 +15,7 @@ use tightbeam::{
 		hive::{Hive, HiveConf, HiveTlsConfig},
 	},
 	compose,
-	crypto::{
-		key::Secp256k1KeyProvider,
-		policy::Secp256k1Policy,
-		x509::{
-			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
-			CertificateSpec,
-		},
-	},
+	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
 	decode,
 	der::Sequence,
 	exactly, hive,
@@ -30,11 +23,12 @@ use tightbeam::{
 	servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
 	trace::TraceCollector,
-	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, GenericClient},
 	utils::BasisPoints,
 	Beamable, Frame, TightBeamError, Version,
 };
 
+use crate::common::security::pinning_trust_store;
 use crate::common::x509::create_test_cert_with_key;
 
 // ============================================================================
@@ -154,7 +148,7 @@ tb_scenario! {
 }
 
 // ============================================================================
-// Gate Reply Shapes
+// Gate Reply Shapes — fixtures / harness
 // ============================================================================
 
 /// Fresh heartbeat command (unique `issued_at_ms` per call site via clock).
@@ -175,7 +169,7 @@ fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError
 		.build()
 }
 
-/// Signed manage command with a stop request (unique id per call site).
+/// Manage command with a stop request (unique id per call site).
 fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 	let manage_cmd = ClusterCommand {
 		issued_at_ms: current_timestamp_ms(),
@@ -188,6 +182,67 @@ fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 	};
 
 	command_frame(id, manage_cmd)
+}
+
+/// Established hive + connected client + signer pinned by the hive trust store.
+struct TrustedHiveSession {
+	hive: HiveX509Test,
+	client: GenericClient<TokioListener>,
+	provider: Secp256k1KeyProvider,
+}
+
+async fn trusted_hive_session(subject: &str, mut conf: HiveConf) -> Result<TrustedHiveSession, TightBeamError> {
+	let (cert, signing_key) = create_test_cert_with_key(subject, 365)?;
+
+	conf.trust_store = Some(pinning_trust_store(&cert)?);
+
+	let provider = Secp256k1KeyProvider::from(signing_key);
+
+	let mut hive = HiveX509Test::new(Some(conf))?;
+	hive.establish(Arc::new(TraceCollector::new())).await?;
+
+	let client = ClientBuilder::<TokioListener>::builder().build().connect(hive.addr()).await?;
+
+	Ok(TrustedHiveSession { hive, client, provider })
+}
+
+async fn emit_command(
+	client: &mut GenericClient<TokioListener>,
+	frame: Frame,
+) -> Result<ClusterCommandResponse, TightBeamError> {
+	let response = client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
+	decode(&response.message)
+}
+
+/// Heartbeat CHOICE present; manage CHOICE absent. Optional sealed capacity (no leak).
+fn assert_heartbeat_shape(response: &ClusterCommandResponse, status: TransitStatus, sealed_capacity: bool) {
+	assert!(response.manage.is_none(), "heartbeat response must not use the manage shape");
+
+	let heartbeat = response.heartbeat.as_ref().expect("heartbeat CHOICE required");
+	assert_eq!(heartbeat.status, status);
+	if sealed_capacity {
+		assert_eq!(heartbeat.utilization.get(), 0, "pre-auth reject must not leak utilization");
+		assert_eq!(heartbeat.active_servlets, 0, "pre-auth reject must not leak servlet count");
+	}
+}
+
+/// Manage/stop CHOICE present; heartbeat CHOICE absent.
+fn assert_manage_stop_shape(response: &ClusterCommandResponse, status: TransitStatus) {
+	assert!(response.heartbeat.is_none(), "manage response must not use the heartbeat shape");
+
+	let manage = response.manage.as_ref().expect("manage CHOICE required");
+	let stop = manage.stop.as_ref().expect("stop result required");
+	assert_eq!(stop.status, status);
+}
+
+async fn signed_heartbeat_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
+	command_frame(id, heartbeat_command(current_timestamp_ms()))?
+		.sign_with_provider::<Sha3_256, _>(provider)
+		.await
+}
+
+async fn signed_stop_frame(provider: &Secp256k1KeyProvider, id: &[u8]) -> Result<Frame, TightBeamError> {
+	stop_command_frame(id)?.sign_with_provider::<Sha3_256, _>(provider).await
 }
 
 tb_assert_spec! {
@@ -226,92 +281,44 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |trace| async move {
-			let (cert, signing_key) = create_test_cert_with_key("CN=Hive Gate Cluster", 365)?;
-			let certificate = cert;
-			let trust: Arc<dyn CertificateTrust> = Arc::new(
-				CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-					.with_certificate(certificate)?
-					.build(),
-			);
-
-			let provider = Secp256k1KeyProvider::from(signing_key);
-
-			let hive_conf = HiveConf {
-				trust_store: {
-					let trust_store = Arc::clone(&trust);
-					Some(trust_store)
+			let mut session = trusted_hive_session(
+				"CN=Hive Gate Cluster",
+				HiveConf {
+					circuit_breaker_threshold: 1,
+					circuit_breaker_cooldown_ms: 60_000,
+					..Default::default()
 				},
-				circuit_breaker_threshold: 1,
-				circuit_breaker_cooldown_ms: 60_000,
-				..Default::default()
-			};
-
-			let mut hive = HiveX509Test::new(Some(hive_conf))?;
-			let hive_trace = Arc::new(TraceCollector::new());
-			hive.establish(hive_trace).await?;
-
-			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let mut client = builder.connect(hive.addr()).await?;
+			)
+			.await?;
 
 			// Unsigned heartbeat: heartbeat CHOICE, no capacity data pre-auth
-			let frame = command_frame(b"hb-unsigned", heartbeat_command(current_timestamp_ms()))?;
-			let response = client.emit(frame, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let response: ClusterCommandResponse = decode(&response.message)?;
-			assert!(response.manage.is_none(), "heartbeat reject must not use the manage shape");
-
-			let heartbeat = response.heartbeat
-				.ok_or(TightBeamError::MissingResponse)?;
-			assert_eq!(heartbeat.status, TransitStatus::Unauthorized, "unsigned heartbeat must be unauthorized");
-			assert_eq!(heartbeat.utilization.get(), 0, "pre-auth reject must not leak utilization");
-			assert_eq!(heartbeat.active_servlets, 0, "pre-auth reject must not leak servlet count");
+			let unsigned_heartbeat = command_frame(b"hb-unsigned", heartbeat_command(current_timestamp_ms()))?;
+			let response = emit_command(&mut session.client, unsigned_heartbeat).await?;
+			assert_heartbeat_shape(&response, TransitStatus::Unauthorized, true);
 
 			trace.event("unsigned_heartbeat_heartbeat_shape")?;
 
 			// Unsigned manage: manage CHOICE (security verdict, no drain probe)
-			let frame = stop_command_frame(b"manage-unsigned")?;
-			let response = client.emit(frame, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let response: ClusterCommandResponse = decode(&response.message)?;
-			assert!(response.heartbeat.is_none(), "manage reject must not use the heartbeat shape");
-
-			let manage = response.manage.ok_or(TightBeamError::MissingResponse)?;
-			let stop = manage.stop.ok_or(TightBeamError::MissingResponse)?;
-			assert_eq!(stop.status, TransitStatus::Unauthorized, "unsigned manage must be unauthorized");
+			let unsigned_stop = stop_command_frame(b"manage-unsigned")?;
+			let response = emit_command(&mut session.client, unsigned_stop).await?;
+			assert_manage_stop_shape(&response, TransitStatus::Unauthorized);
 
 			trace.event("unsigned_manage_manage_shape")?;
 
 			// Signed heartbeat: accepted end-to-end
-			let frame = command_frame(b"hb-signed", heartbeat_command(current_timestamp_ms()))?
-				.sign_with_provider::<Sha3_256, _>(&provider)
-				.await?;
-			let response = client.emit(frame, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let response: ClusterCommandResponse = decode(&response.message)?;
-			let heartbeat = response.heartbeat.ok_or(TightBeamError::MissingResponse)?;
-			assert_eq!(heartbeat.status, TransitStatus::Accepted, "signed heartbeat must be accepted");
+			let signed_heartbeat = signed_heartbeat_frame(&session.provider, b"hb-signed").await?;
+			let response = emit_command(&mut session.client, signed_heartbeat).await?;
+			assert_heartbeat_shape(&response, TransitStatus::Accepted, false);
 
 			trace.event("signed_heartbeat_accepted")?;
 
 			// A signed manage command during drain must come back Busy in
 			// the manage CHOICE.
-			hive.drain().await?;
+			session.hive.drain().await?;
 
-			let frame = stop_command_frame(b"manage-draining")?
-				.sign_with_provider::<Sha3_256, _>(&provider)
-				.await?;
-			let response = client.emit(frame, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let response: ClusterCommandResponse = decode(&response.message)?;
-			assert!(response.heartbeat.is_none(), "draining manage reject must not use the heartbeat shape");
-
-			let manage = response.manage.ok_or(TightBeamError::MissingResponse)?;
-			let stop = manage.stop.ok_or(TightBeamError::MissingResponse)?;
-			assert_eq!(stop.status, TransitStatus::Busy, "draining manage must be busy");
+			let signed_stop = signed_stop_frame(&session.provider, b"manage-draining").await?;
+			let response = emit_command(&mut session.client, signed_stop).await?;
+			assert_manage_stop_shape(&response, TransitStatus::Busy);
 
 			trace.event("draining_manage_manage_shape")?;
 
@@ -319,39 +326,25 @@ tb_scenario! {
 			// signature transplanted from a different frame is the one failure
 			// class the breaker counts.
 			let now = current_timestamp_ms();
-			let donor = command_frame(b"hb-donor", heartbeat_command(now))?
-				.sign_with_provider::<Sha3_256, _>(&provider)
-				.await?;
+			let donor_heartbeat = command_frame(b"hb-donor", heartbeat_command(now))?;
+			let donor = donor_heartbeat.sign_with_provider::<Sha3_256, _>(&session.provider).await?;
 
 			let mut forged = command_frame(b"hb-forged", heartbeat_command(now.saturating_add(1)))?;
 			forged.nonrepudiation = donor.nonrepudiation.clone();
 
-			let response = client.emit(forged, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let response: ClusterCommandResponse = decode(&response.message)?;
-			let heartbeat = response.heartbeat.ok_or(TightBeamError::MissingResponse)?;
-			assert_eq!(heartbeat.status, TransitStatus::Forbidden, "forged signature must be forbidden");
+			let response = emit_command(&mut session.client, forged).await?;
+			assert_heartbeat_shape(&response, TransitStatus::Forbidden, false);
 
 			// Open breaker: a valid heartbeat is rejected during cooldown but
 			// keeps the heartbeat CHOICE, so the cluster records a reply
 			// instead of MalformedResponse eviction pressure.
-			let frame = command_frame(b"hb-open", heartbeat_command(current_timestamp_ms()))?
-				.sign_with_provider::<Sha3_256, _>(&provider)
-				.await?;
-			let response = client.emit(frame, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let response: ClusterCommandResponse = decode(&response.message)?;
-			assert!(response.manage.is_none(), "open-breaker heartbeat reject must not use the manage shape");
-
-			let heartbeat = response.heartbeat.ok_or(TightBeamError::MissingResponse)?;
-			assert_eq!(heartbeat.status, TransitStatus::Forbidden, "open breaker must reject during cooldown");
-			assert_eq!(heartbeat.utilization.get(), 0, "open-breaker reject must not leak utilization");
+			let signed_heartbeat = signed_heartbeat_frame(&session.provider, b"hb-open").await?;
+			let response = emit_command(&mut session.client, signed_heartbeat).await?;
+			assert_heartbeat_shape(&response, TransitStatus::Forbidden, true);
 
 			trace.event("open_breaker_heartbeat_shape")?;
 
-			hive.stop();
+			session.hive.stop();
 
 			Ok(())
 		}
@@ -380,67 +373,32 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |trace| async move {
-			let (cert, signing_key) = create_test_cert_with_key("CN=Hive Backpressure Cluster", 365)?;
-			let certificate = cert;
-			let trust: Arc<dyn CertificateTrust> = Arc::new(
-				CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-					.with_certificate(certificate)?
-					.build(),
-			);
-
-			let provider = Secp256k1KeyProvider::from(signing_key);
-
 			// Threshold zero: idle utilization already saturates the gate,
 			// so every manage command sees the backpressure verdict.
-			let hive_conf = HiveConf {
-				trust_store: {
-					let trust_store = Arc::clone(&trust);
-					Some(trust_store)
+			let mut session = trusted_hive_session(
+				"CN=Hive Backpressure Cluster",
+				HiveConf {
+					backpressure_threshold: BasisPoints::default(),
+					..Default::default()
 				},
-				backpressure_threshold: BasisPoints::default(),
-				..Default::default()
-			};
+			)
+			.await?;
 
-			let mut hive = HiveX509Test::new(Some(hive_conf))?;
-			let hive_trace = Arc::new(TraceCollector::new());
-			hive.establish(hive_trace).await?;
-
-			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let mut client = builder.connect(hive.addr()).await?;
-
-			// Signed manage under backpressure: Busy in the manage CHOICE
-			let frame = stop_command_frame(b"manage-bp")?
-				.sign_with_provider::<Sha3_256, _>(&provider)
-				.await?;
-			let response = client.emit(frame, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let response: ClusterCommandResponse = decode(&response.message)?;
-			assert!(response.heartbeat.is_none(), "backpressure manage reject must not use the heartbeat shape");
-
-			let manage = response.manage.ok_or(TightBeamError::MissingResponse)?;
-			let stop = manage.stop.ok_or(TightBeamError::MissingResponse)?;
-			assert_eq!(stop.status, TransitStatus::Busy, "backpressure manage must be busy");
+			let signed_stop = signed_stop_frame(&session.provider, b"manage-bp").await?;
+			let response = emit_command(&mut session.client, signed_stop).await?;
+			assert_manage_stop_shape(&response, TransitStatus::Busy);
 
 			trace.event("backpressure_manage_manage_shape")?;
 
 			// Signed heartbeat is exempt from the gate: heartbeat CHOICE
 			// with real capacity data (Busy status reflects saturation).
-			let frame = command_frame(b"hb-bp", heartbeat_command(current_timestamp_ms()))?
-				.sign_with_provider::<Sha3_256, _>(&provider)
-				.await?;
-			let response = client.emit(frame, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
-
-			let response: ClusterCommandResponse = decode(&response.message)?;
-			assert!(response.manage.is_none(), "heartbeat under backpressure must not use the manage shape");
-
-			let heartbeat = response.heartbeat.ok_or(TightBeamError::MissingResponse)?;
-			assert_eq!(heartbeat.status, TransitStatus::Busy, "saturated heartbeat must report busy");
+			let signed_heartbeat = signed_heartbeat_frame(&session.provider, b"hb-bp").await?;
+			let response = emit_command(&mut session.client, signed_heartbeat).await?;
+			assert_heartbeat_shape(&response, TransitStatus::Busy, false);
 
 			trace.event("backpressure_heartbeat_heartbeat_shape")?;
 
-			hive.stop();
+			session.hive.stop();
 
 			Ok(())
 		}

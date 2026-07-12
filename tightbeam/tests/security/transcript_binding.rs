@@ -35,7 +35,7 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	crypto::{ecies::Secp256k1EciesMessage, profiles::DefaultCryptoProvider},
+	crypto::{ecies::Secp256k1EciesMessage, profiles::DefaultCryptoProvider, profiles::SecurityProfileDesc},
 	der::{Decode, Encode},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::ScenarioConf,
@@ -52,6 +52,9 @@ use tightbeam::{
 use crate::common::security::{
 	expectation_failure, pinning_validator, strong_security_profile, weak_security_profile, ServerMaterials,
 };
+
+type EciesClient = EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>;
+type EciesServer = EciesHandshakeServer<DefaultCryptoProvider>;
 
 tb_assert_spec! {
 	pub TranscriptBindingSpec,
@@ -93,78 +96,94 @@ tb_scenario! {
 	}
 }
 
+fn strong_weak_pair(
+	materials: &ServerMaterials,
+) -> (EciesClient, EciesServer, SecurityProfileDesc, SecurityProfileDesc) {
+	let strong = strong_security_profile();
+	let weak = weak_security_profile();
+	let validator = pinning_validator(&materials.certificate);
+
+	let client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
+		.with_security_offer(SecurityOffer::new(vec![strong, weak]))
+		.with_certificate_validator(validator);
+
+	let server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
+		Arc::clone(&materials.key_provider),
+		Arc::clone(&materials.certificate),
+		None,
+		None,
+	)
+	.with_supported_profiles(vec![strong, weak]);
+
+	(client, server, strong, weak)
+}
+
+async fn expect_client_reject<E>(
+	result: Result<Vec<u8>, E>,
+	trace: &TraceCollector,
+	event: &'static str,
+	on_accept: &'static str,
+) -> Result<(), TightBeamError> {
+	match result {
+		Err(_) => {
+			trace.event(event)?;
+			Ok(())
+		}
+		Ok(_) => Err(expectation_failure(on_accept)),
+	}
+}
+
 job! {
 	name: TranscriptBindingScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let materials = ServerMaterials::generate();
-		let strong = strong_security_profile();
-		let weak = weak_security_profile();
-		let validator = pinning_validator(&materials.certificate);
 
-		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(vec![strong, weak]))
-			.with_certificate_validator(validator);
-
-		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-			Arc::clone(&materials.key_provider),
-			Arc::clone(&materials.certificate),
-			None,
-			None,
-		)
-		.with_supported_profiles(vec![strong, weak]);
-
+		// Phase 1: MITM downgrade — swap accepted profile without touching
+		// randoms, cert, or signature.
+		let (mut client, mut server, strong, weak) = strong_weak_pair(&materials);
 		let client_hello = client.build_client_hello()?;
 		let server_handshake_der = server.process_client_hello(&client_hello).await?;
 
-		// MITM downgrade: swap the accepted profile without touching randoms, cert, or signature.
 		let mut server_handshake = ServerHandshake::from_der(&server_handshake_der)?;
-		if server_handshake.security_accept.as_ref().map(|a| a.profile) != Some(strong) {
-			return Err(expectation_failure("server did not select the strong profile"));
-		}
+		assert_eq!(
+			server_handshake.security_accept.as_ref().map(|a| a.profile),
+			Some(strong),
+			"server must select the strong profile"
+		);
 
 		server_handshake.security_accept = Some(SecurityAccept::new(weak));
 
 		let tampered = server_handshake.to_der()?;
-		match client.process_server_handshake(&tampered).await {
-			Err(_) => {
-				trace.event("tampered_accept_rejected")?;
-			}
-			Ok(_) => return Err(expectation_failure("client accepted a tampered, unauthenticated security_accept")),
-		}
+		expect_client_reject(
+			client.process_server_handshake(&tampered).await,
+			&trace,
+			"tampered_accept_rejected",
+			"client accepted a tampered, unauthenticated security_accept",
+		)
+		.await?;
 
-		// Phase 2: MITM strips the SecurityOffer from ClientHello.
+		// Phase 2: MITM strips SecurityOffer from ClientHello.
 		// client_random is preserved, so a random-only transcript would still
 		// verify. The full ClientHello DER binding must make the client reject.
-		let offer = SecurityOffer::new(vec![strong, weak]);
-		let validator = pinning_validator(&materials.certificate);
-		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(offer)
-			.with_certificate_validator(validator);
-
-		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
-			Arc::clone(&materials.key_provider),
-			Arc::clone(&materials.certificate),
-			None,
-			None,
-		)
-		.with_supported_profiles(vec![strong, weak]);
-
+		let (mut client, mut server, _strong, _weak) = strong_weak_pair(&materials);
 		let client_hello = client.build_client_hello()?;
 		let mut stripped_hello = ClientHello::from_der(&client_hello)?;
 		stripped_hello.security_offer = None;
 
 		let stripped_hello = stripped_hello.to_der()?;
-		if stripped_hello == client_hello {
-			return Err(expectation_failure("offer stripping produced identical ClientHello bytes"));
-		}
+		assert_ne!(
+			stripped_hello, client_hello,
+			"offer stripping must change ClientHello bytes"
+		);
 
 		let server_handshake_der = server.process_client_hello(&stripped_hello).await?;
-		match client.process_server_handshake(&server_handshake_der).await {
-			Err(_) => {
-				trace.event("stripped_offer_rejected")?;
-			}
-			Ok(_) => return Err(expectation_failure("client accepted a signature over a rewritten ClientHello")),
-		}
+		expect_client_reject(
+			client.process_server_handshake(&server_handshake_der).await,
+			&trace,
+			"stripped_offer_rejected",
+			"client accepted a signature over a rewritten ClientHello",
+		)
+		.await?;
 
 		Ok(())
 	}
