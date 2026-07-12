@@ -5,6 +5,8 @@ extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
+#[cfg(all(not(feature = "std"), any(feature = "transport-cms", feature = "transport-ecies")))]
+use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
@@ -19,10 +21,9 @@ use crate::transport::TransportResult;
 #[cfg(not(feature = "x509"))]
 use crate::transport::envelopes::RequestPackage;
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 mod x509 {
 	pub use crate::crypto::aead::{Decryptor, KeyInit};
-	pub use crate::crypto::ecies::EciesPublicKeyOps;
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
@@ -31,12 +32,15 @@ mod x509 {
 	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::io::EncryptedMessageIO;
 	pub use crate::transport::state::EncryptedProtocolState;
+
+	#[cfg(feature = "transport-ecies")]
+	pub use crate::crypto::ecies::EciesPublicKeyOps;
 }
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use x509::*;
 
-#[cfg(feature = "transport-ecies")]
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::der::Decode;
 #[cfg(feature = "transport-policy")]
 use crate::transport::policy::{RestartPolicy, RetryAction};
@@ -398,85 +402,144 @@ pub trait MessageCollector: MessageIO {
 		P::AeadCipher: KeyInit,
 	{
 		loop {
-			// Read wire envelope
-			// Enforce size ceilings
-			let wire_bytes = self.read_envelope().await?;
-			let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-			match &wire_envelope {
-				WireEnvelope::Cleartext(_) => {
-					if let Some(max) = self.to_max_cleartext_envelope() {
-						if wire_bytes.len() > max {
-							return Err(TransportError::InvalidMessage);
-						}
-					}
-				}
-				WireEnvelope::Encrypted(_) => {
-					if let Some(max) = self.to_max_encrypted_envelope() {
-						if wire_bytes.len() > max {
-							return Err(TransportError::InvalidMessage);
-						}
-					}
-				}
+			match collect_step(self).await? {
+				CollectStep::Handshake(handshake_bytes) => self.perform_server_handshake(&handshake_bytes).await?,
+				CollectStep::Envelope(envelope) => return gate_collected_envelope(self.collector_gate(), envelope),
 			}
-
-			let has_certificate = self.to_server_certificate_ref().is_some();
-			let decoded_envelope = match wire_envelope {
-				WireEnvelope::Cleartext(envelope) => {
-					if has_certificate {
-						match envelope {
-							TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-								let handshake_bytes = envelope.to_der()?;
-								self.perform_server_handshake(&handshake_bytes).await?;
-								continue;
-							}
-							TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
-								// Circuit breaker
-								self.set_handshake_state(TcpHandshakeState::None);
-								self.unset_symmetric_key();
-								return Err(TransportError::MissingEncryption);
-							}
-						}
-					} else {
-						envelope
-					}
-				}
-				WireEnvelope::Encrypted(encrypted_info) => {
-					if self.to_handshake_state() != TcpHandshakeState::Complete {
-						self.set_handshake_state(TcpHandshakeState::None);
-						self.unset_symmetric_key();
-						return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
-					}
-
-					let decrypted_bytes = match self.to_decryptor_ref()?.decrypt_content(&encrypted_info) {
-						Ok(bytes) => bytes,
-						Err(_) => {
-							self.set_handshake_state(TcpHandshakeState::None);
-							self.unset_symmetric_key();
-							return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
-						}
-					};
-					decrypted_bytes
-						.with(|bytes| Self::decode_envelope(bytes))
-						.map_err(crate::error::TightBeamError::from)??
-				}
-			};
-
-			let request = match decoded_envelope {
-				TransportEnvelope::Request(msg) => msg.message,
-				TransportEnvelope::Response(_) => return Err(TransportError::InvalidMessage),
-				TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-					return Err(TransportError::InvalidMessage)
-				}
-			};
-
-			let status = self.collector_gate().evaluate(&request);
-			if status == TransitStatus::Request {
-				return Err(TransportError::InvalidReply);
-			}
-
-			return Ok((request, status));
 		}
 	}
+
+	/// X509-enabled collect_message with encryption and handshake support
+	/// (CMS-only build variant).
+	///
+	/// Trait where-clauses do not elaborate to callers, so the method is
+	/// declared per feature combination with that build's predicate set.
+	#[cfg(all(not(feature = "transport-ecies"), feature = "transport-cms"))]
+	#[allow(async_fn_in_trait)]
+	async fn collect_message_with_encryption<P>(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)>
+	where
+		Self: EncryptedMessageIO + Sized + EncryptedProtocolState<CryptoProvider = P>,
+		P: CryptoProvider + Send + Sync + 'static,
+		P::Curve: Curve + CurveArithmetic,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
+		P::Signature: 'static,
+		P::Digest: Send + 'static,
+		P::AeadCipher: KeyInit + Send + Sync + 'static,
+	{
+		loop {
+			match collect_step(self).await? {
+				CollectStep::Handshake(handshake_bytes) => self.perform_server_handshake(&handshake_bytes).await?,
+				CollectStep::Envelope(envelope) => return gate_collected_envelope(self.collector_gate(), envelope),
+			}
+		}
+	}
+}
+
+/// Outcome of one protocol-agnostic collector step.
+#[cfg(all(feature = "transport-policy", any(feature = "transport-cms", feature = "transport-ecies")))]
+enum CollectStep {
+	/// Cleartext handshake container to feed the server-side dispatcher.
+	Handshake(Vec<u8>),
+	/// Decrypted (or legitimately cleartext) application envelope.
+	Envelope(TransportEnvelope),
+}
+
+/// Read one wire envelope, enforce size ceilings, and classify it.
+///
+/// Protocol-agnostic: handshake containers are surfaced as raw bytes for the
+/// caller's dispatcher, everything else is decrypted and returned.
+#[cfg(all(feature = "transport-policy", any(feature = "transport-cms", feature = "transport-ecies")))]
+async fn collect_step<T>(transport: &mut T) -> TransportResult<CollectStep>
+where
+	T: EncryptedMessageIO + EncryptedProtocolState + Sized,
+{
+	// Read wire envelope
+	// Enforce size ceilings
+	let wire_bytes = transport.read_envelope().await?;
+	let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+	match &wire_envelope {
+		WireEnvelope::Cleartext(_) => {
+			if let Some(max) = transport.to_max_cleartext_envelope() {
+				if wire_bytes.len() > max {
+					return Err(TransportError::InvalidMessage);
+				}
+			}
+		}
+		WireEnvelope::Encrypted(_) => {
+			if let Some(max) = transport.to_max_encrypted_envelope() {
+				if wire_bytes.len() > max {
+					return Err(TransportError::InvalidMessage);
+				}
+			}
+		}
+	}
+
+	let has_certificate = transport.to_server_certificate_ref().is_some();
+	match wire_envelope {
+		WireEnvelope::Cleartext(envelope) => {
+			if has_certificate {
+				match envelope {
+					TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+						Ok(CollectStep::Handshake(envelope.to_der()?))
+					}
+					TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
+						// Circuit breaker
+						transport.set_handshake_state(TcpHandshakeState::None);
+						transport.unset_symmetric_key();
+						Err(TransportError::MissingEncryption)
+					}
+				}
+			} else {
+				Ok(CollectStep::Envelope(envelope))
+			}
+		}
+		WireEnvelope::Encrypted(encrypted_info) => {
+			if transport.to_handshake_state() != TcpHandshakeState::Complete {
+				transport.set_handshake_state(TcpHandshakeState::None);
+				transport.unset_symmetric_key();
+				return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
+			}
+
+			let decrypted_bytes = match transport.to_decryptor_ref()?.decrypt_content(&encrypted_info) {
+				Ok(bytes) => bytes,
+				Err(_) => {
+					transport.set_handshake_state(TcpHandshakeState::None);
+					transport.unset_symmetric_key();
+					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
+				}
+			};
+
+			let envelope = decrypted_bytes
+				.with(|bytes| T::decode_envelope(bytes))
+				.map_err(crate::error::TightBeamError::from)??;
+
+			Ok(CollectStep::Envelope(envelope))
+		}
+	}
+}
+
+/// Extract the application request from a collected envelope and gate it.
+#[cfg(all(feature = "transport-policy", any(feature = "transport-cms", feature = "transport-ecies")))]
+fn gate_collected_envelope<G>(gate: &G, envelope: TransportEnvelope) -> TransportResult<(Arc<Frame>, TransitStatus)>
+where
+	G: GatePolicy + ?Sized,
+{
+	let request = match envelope {
+		TransportEnvelope::Request(msg) => msg.message,
+		TransportEnvelope::Response(_) => return Err(TransportError::InvalidMessage),
+		TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
+			return Err(TransportError::InvalidMessage)
+		}
+	};
+
+	let status = gate.evaluate(&request);
+	if status == TransitStatus::Request {
+		return Err(TransportError::InvalidReply);
+	}
+
+	Ok((request, status))
 }
 
 #[cfg(not(feature = "transport-policy"))]

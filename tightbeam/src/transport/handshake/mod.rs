@@ -146,6 +146,9 @@ mod common;
 mod error;
 mod utils;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+mod wire;
+
 #[cfg(test)]
 mod tests;
 
@@ -744,9 +747,11 @@ pub enum HandshakeProtocolKind {
 	Ecies,
 	/// CMS-based handshake (X.509 signed/enveloped data).
 	///
-	/// TODO: Not implemented into the TCP transport: selecting this kind fails
-	/// closed with `TransportError::UnsupportedHandshakeProtocol`. Use the CMS
-	/// orchestrators directly until the wire integration lands.
+	/// Key-transport handshake: the client encrypts the session key to the
+	/// server's leaf certificate in its first message, so a trust store and
+	/// a provisioned server certificate chain are mandatory on the client.
+	/// Missing either fails closed, as does selecting this kind without the
+	/// `transport-cms` feature.
 	Cms,
 }
 

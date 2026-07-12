@@ -10,7 +10,9 @@
 	feature = "tcp",
 	feature = "tokio",
 	feature = "builder",
-	feature = "testing"
+	feature = "testing",
+	feature = "colony",
+	feature = "hex"
 ))]
 
 use std::sync::Arc;

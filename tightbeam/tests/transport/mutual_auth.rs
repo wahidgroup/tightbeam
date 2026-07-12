@@ -12,7 +12,9 @@
 	feature = "signature",
 	feature = "sha3",
 	feature = "aead",
-	feature = "builder"
+	feature = "builder",
+	feature = "colony",
+	feature = "hex"
 ))]
 
 use std::sync::Arc;

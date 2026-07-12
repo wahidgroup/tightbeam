@@ -967,7 +967,8 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "transport-policy")]
+	// Exercises the default (ECIES) handshake end to end.
+	#[cfg(all(feature = "transport-policy", feature = "transport-ecies"))]
 	#[tokio::test]
 	async fn async_with_encrypted_and_gate_policy() -> TransportResult<()> {
 		use core::str::FromStr;

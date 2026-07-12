@@ -1,5 +1,16 @@
 //! Transport layer for TightBeam protocol
 
+// Cargo features cannot express "at least one of"; a protocol-less TCP
+// transport has no handshake and cannot collect messages, so fail the build
+// early with a clear message instead of a missing-method error.
+#[cfg(all(
+	any(feature = "tcp", feature = "async-transport"),
+	not(any(feature = "transport-cms", feature = "transport-ecies"))
+))]
+compile_error!(
+	"the `tcp` and `async-transport` features require a handshake protocol: enable `transport-ecies` and/or `transport-cms`"
+);
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
