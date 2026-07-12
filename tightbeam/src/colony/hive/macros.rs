@@ -403,7 +403,8 @@ macro_rules! hive {
 						use $crate::transport::X509ClientConfig;
 
 						if let Some(ref store) = self.config.trust_store {
-							transport = transport.with_trust_store(::std::sync::Arc::clone(store));
+							let store = ::std::sync::Arc::clone(store);
+							transport = transport.with_trust_store(store);
 						}
 
 						if let Some(ref hive_tls) = self.config.hive_tls {
@@ -411,11 +412,10 @@ macro_rules! hive {
 							let key_mgr = $crate::transport::handshake::HandshakeKeyManager::new(
 								::std::sync::Arc::clone(&hive_tls.key)
 							);
+							let cert = ::std::sync::Arc::new(cert);
+							let key = ::std::sync::Arc::new(key_mgr);
 
-							transport = transport.with_client_identity(
-								::std::sync::Arc::new(cert),
-								::std::sync::Arc::new(key_mgr)
-							);
+							transport = transport.with_client_identity(cert, key);
 						}
 					}
 
@@ -612,10 +612,13 @@ macro_rules! hive {
 			}
 		}
 
-		// Reject non-heartbeat when draining
+		// Reject non-heartbeat when draining. Busy replies in the manage
+		// CHOICE shape: these branches only see manage commands, and a
+		// heartbeat-shaped verdict would decode as MalformedResponse on the
+		// cluster and evict the hive over a transient rejection.
 		if is_draining && !is_heartbeat {
-			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
-				$crate::policy::TransitStatus::Busy, current_util(), active_count()
+			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+				$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Busy)
 			));
 		}
 
@@ -628,8 +631,8 @@ macro_rules! hive {
 				$bp_threshold
 			);
 			if $crate::policy::GatePolicy::evaluate(&bp_gate, &$frame) == $crate::policy::TransitStatus::Busy {
-				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
-					$crate::policy::TransitStatus::Busy, current_util(), active_count()
+				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
+					$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Busy)
 				));
 			}
 		}
@@ -1002,8 +1005,10 @@ macro_rules! hive {
 					let key_mgr = $crate::transport::handshake::HandshakeKeyManager::new(
 						::std::sync::Arc::clone(&hive_tls.key)
 					);
+					let cert = ::std::sync::Arc::new(cert);
+					let key = ::std::sync::Arc::new(key_mgr);
 
-					Some((::std::sync::Arc::new(cert), ::std::sync::Arc::new(key_mgr)))
+					Some((cert, key))
 				}
 				None => None,
 			};
@@ -1025,14 +1030,14 @@ macro_rules! hive {
 					use $crate::transport::X509ClientConfig;
 
 					if let Some(ref store) = trust_store {
-						transport = transport.with_trust_store(::std::sync::Arc::clone(store));
+						let store = ::std::sync::Arc::clone(store);
+						transport = transport.with_trust_store(store);
 					}
 
 					if let Some((ref cert, ref key_mgr)) = client_identity {
-						transport = transport.with_client_identity(
-							::std::sync::Arc::clone(cert),
-							::std::sync::Arc::clone(key_mgr)
-						);
+						let cert = ::std::sync::Arc::clone(cert);
+						let key = ::std::sync::Arc::clone(key_mgr);
+						transport = transport.with_client_identity(cert, key);
 					}
 				}
 

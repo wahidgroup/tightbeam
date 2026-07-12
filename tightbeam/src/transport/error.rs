@@ -50,6 +50,11 @@ pub enum TransportError {
 		error("Handshake protocol not supported by this transport: {0:?}")
 	)]
 	UnsupportedHandshakeProtocol(crate::transport::handshake::HandshakeProtocolKind),
+	#[cfg_attr(
+		feature = "derive",
+		error("Server certificate chain required but not provisioned")
+	)]
+	MissingServerCertificateChain,
 	#[cfg_attr(feature = "derive", error("Invalid message"))]
 	InvalidMessage,
 	#[cfg_attr(feature = "derive", error("Invalid reply"))]
@@ -89,6 +94,7 @@ crate::impl_error_display!(TransportError {
 	SendFailed => "Send failed",
 	MissingEncryption => "Encryption required but not provided",
 	UnsupportedHandshakeProtocol(kind) => "Handshake protocol not supported by this transport: {kind:?}",
+	MissingServerCertificateChain => "Server certificate chain required but not provisioned",
 	InvalidMessage => "Invalid message",
 	InvalidReply => "Invalid reply",
 	MissingRequest => "Missing request",
@@ -146,6 +152,8 @@ crate::impl_from!(std::io::Error => TransportError::IoError);
 crate::impl_from!(der::Error => TransportError::DerError);
 #[cfg(all(feature = "x509", not(feature = "derive")))]
 crate::impl_from!(crate::transport::handshake::HandshakeError => TransportError::HandshakeError);
+#[cfg(all(feature = "x509", not(feature = "derive")))]
+crate::impl_from!(crate::crypto::x509::error::CertificateValidationError => TransportError::InvalidCertificate);
 
 crate::impl_from!(
 	spki::Error => TransportError::DerError extract spki::Error::Asn1(der_err) =>

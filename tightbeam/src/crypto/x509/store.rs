@@ -27,6 +27,7 @@ mod std_imports {
 	pub use crate::crypto::hash::Sha3_256;
 	pub use crate::crypto::policy::VerificationPolicy;
 	pub use crate::crypto::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
+	pub use crate::crypto::x509::name::Name;
 	pub use crate::crypto::x509::utils::{certificate_extension, ensure_signature_algorithm_consistency};
 	pub use crate::der::oid::AssociatedOid;
 }
@@ -70,12 +71,15 @@ impl RevocationChecker for NoRevocation {
 
 /// Operator-pushed static revocation denylist.
 ///
-/// Revokes by certificate fingerprint (exact) or serial number.
+/// Revokes by certificate fingerprint (exact) or by issuer-scoped serial number.
 #[cfg(feature = "std")]
 #[derive(Debug, Default)]
 pub struct StaticRevocationList {
 	fingerprints: HashSet<Fingerprint>,
-	serials: HashSet<Vec<u8>>,
+	/// Revoked serial numbers keyed by issuer DN DER: RFC 5280 §4.1.2.2
+	/// guarantees serial uniqueness only within one CA, so an unscoped
+	/// serial would falsely revoke unrelated certificates.
+	serials: HashMap<Vec<u8>, HashSet<Vec<u8>>>,
 }
 
 #[cfg(feature = "std")]
@@ -92,10 +96,13 @@ impl StaticRevocationList {
 		Ok(self.with_fingerprint(fingerprint))
 	}
 
-	/// Revoke by raw serial-number bytes (issuer-agnostic).
-	pub fn with_serial(mut self, serial: impl AsRef<[u8]>) -> Self {
-		self.serials.insert(serial.as_ref().to_vec());
-		self
+	/// Revoke by issuer and raw serial-number bytes (CRL entry scope).
+	pub fn with_serial(mut self, issuer: &Name, serial: impl AsRef<[u8]>) -> Result<Self, CertificateValidationError> {
+		self.serials
+			.entry(issuer.to_der()?)
+			.or_default()
+			.insert(serial.as_ref().to_vec());
+		Ok(self)
 	}
 }
 
@@ -103,9 +110,19 @@ impl StaticRevocationList {
 impl RevocationChecker for StaticRevocationList {
 	fn check(&self, _issuer: &Certificate, cert: &Certificate) -> Result<(), CertificateValidationError> {
 		let fingerprint = CertificateTrustStore::to_fingerprint(cert)?;
-		let serial_bytes = cert.tbs_certificate.serial_number.as_bytes();
+		if self.fingerprints.contains(&fingerprint) {
+			return Err(CertificateValidationError::CertificateRevoked);
+		}
+		if self.serials.is_empty() {
+			return Ok(());
+		}
 
-		if self.fingerprints.contains(&fingerprint) || self.serials.contains(serial_bytes) {
+		let issuer_der = cert.tbs_certificate.issuer.to_der()?;
+		let revoked = self
+			.serials
+			.get(issuer_der.as_slice())
+			.is_some_and(|serials| serials.contains(cert.tbs_certificate.serial_number.as_bytes()));
+		if revoked {
 			return Err(CertificateValidationError::CertificateRevoked);
 		}
 
@@ -1026,12 +1043,26 @@ mod tests {
 	#[test]
 	fn verify_chain_rejects_leaf_revoked_by_serial() -> TestResult {
 		let chain = create_test_certificate_chain()?;
+		let issuer = chain.leaf.tbs_certificate.issuer.clone();
 		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
-		let revocation = StaticRevocationList::default().with_serial(serial);
+		let revocation = StaticRevocationList::default().with_serial(&issuer, serial)?;
 
 		let store = build_store_with_revocation(&chain, revocation)?;
 		let result = store.verify_chain(&[chain.root, chain.intermediate, chain.leaf]);
 		assert!(matches!(result, Err(CertificateValidationError::CertificateRevoked)));
+		Ok(())
+	}
+
+	#[test]
+	fn serial_revocation_is_scoped_to_issuer() -> TestResult {
+		let chain = create_test_certificate_chain()?;
+		let other_issuer = chain.leaf.tbs_certificate.subject.clone();
+		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
+		let revocation = StaticRevocationList::default().with_serial(&other_issuer, serial)?;
+
+		let store = build_store_with_revocation(&chain, revocation)?;
+		let result = store.verify_chain(&[chain.root, chain.intermediate, chain.leaf]);
+		assert!(result.is_ok());
 		Ok(())
 	}
 

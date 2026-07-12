@@ -93,6 +93,11 @@ pub trait EncryptedProtocolState {
 		None
 	}
 
+	/// Get the provisioned server certificate chain, ordered root to leaf
+	fn to_server_certificate_chain_ref(&self) -> Option<&Arc<[Certificate]>> {
+		None
+	}
+
 	/// Get mutable reference to server handshake orchestrator
 	fn to_server_handshake_mut(
 		&mut self,

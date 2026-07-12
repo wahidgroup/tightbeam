@@ -388,6 +388,10 @@ where
 		self.trust_store.as_ref()
 	}
 
+	fn to_server_certificate_chain_ref(&self) -> Option<&Arc<[Certificate]>> {
+		self.server_certificate_chain.as_ref()
+	}
+
 	fn to_server_handshake_mut(
 		&mut self,
 	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>> {
@@ -735,19 +739,13 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(all(feature = "x509", feature = "transport-ecies"))]
-	#[tokio::test]
-	async fn cms_protocol_kind_fails_closed() -> TransportResult<()> {
+	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	fn cms_test_client(stream: TcpStream) -> TcpTransport<TokioStream> {
 		use std::sync::Arc;
 
 		use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 		use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
-		use crate::transport::io::EncryptedMessageIO;
-
-		let listener: TokioListener = TokioListener::bind("127.0.0.1:0").await?;
-		let addr = listener.local_addr()?;
-		let stream = TcpStream::connect(addr).await?;
 
 		let signing_key = Secp256k1SigningKey::from(create_test_signing_key());
 		let provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
@@ -756,11 +754,138 @@ mod tests {
 		transport.handshake_protocol_kind = HandshakeProtocolKind::Cms;
 		transport.key_manager = Some(Arc::new(HandshakeKeyManager::new(provider)));
 
+		transport
+	}
+
+	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[tokio::test]
+	async fn cms_client_without_trust_store_fails_closed() -> TransportResult<()> {
+		use crate::transport::handshake::HandshakeError;
+		use crate::transport::io::EncryptedMessageIO;
+
+		let listener: TokioListener = TokioListener::bind("127.0.0.1:0").await?;
+		let addr = listener.local_addr()?;
+		let stream = TcpStream::connect(addr).await?;
+
+		let mut transport = cms_test_client(stream);
+
 		let result = transport.perform_client_handshake().await;
 		assert!(matches!(
 			result,
-			Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms))
+			Err(TransportError::HandshakeError(HandshakeError::MissingTrustStore))
 		));
+		Ok(())
+	}
+
+	#[cfg(all(feature = "x509", feature = "transport-cms"))]
+	#[tokio::test]
+	async fn cms_client_without_server_chain_fails_closed() -> TransportResult<()> {
+		use std::sync::Arc;
+
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+		use crate::transport::io::EncryptedMessageIO;
+		use crate::transport::X509ClientConfig;
+
+		let listener: TokioListener = TokioListener::bind("127.0.0.1:0").await?;
+		let addr = listener.local_addr()?;
+		let stream = TcpStream::connect(addr).await?;
+
+		let trust_store: Arc<dyn CertificateTrust> =
+			Arc::new(CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy).build());
+		let mut transport = cms_test_client(stream).with_trust_store(trust_store);
+
+		let result = transport.perform_client_handshake().await;
+		assert!(matches!(result, Err(TransportError::MissingServerCertificateChain)));
+		Ok(())
+	}
+
+	#[cfg(all(feature = "transport-cms", feature = "transport-policy"))]
+	#[tokio::test]
+	async fn async_cms_round_trip() -> TransportResult<()> {
+		use core::str::FromStr;
+		use std::sync::Arc;
+
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, SigningKey};
+		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+		use crate::prelude::TightBeamSocketAddr;
+		use crate::spki::SubjectPublicKeyInfoOwned;
+		use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
+		use crate::transport::{TransportEncryptionConfig, X509ClientConfig};
+
+		let signing_key = create_test_signing_key();
+		let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
+		let sha3_signer = Sha3Signer::from(&signing_key);
+		let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
+
+		let server_cert = crate::cert!(
+			profile: Root,
+			subject: "CN=Test Root CA,O=Test Org,C=US",
+			serial: 1u32,
+			duration: Duration::from_secs(365 * 24 * 60 * 60),
+			signer: &sha3_signer,
+			subject_public_key: spki
+		)?;
+
+		let addr = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
+		let config = TransportEncryptionConfig::new(server_cert.clone(), signing_key.into());
+		let (listener, socket_addr) = TokioListener::bind_with(addr, config).await?;
+
+		let test_message = create_v0_tightbeam(None, None);
+		let expected_response = create_v0_tightbeam(None, None);
+
+		let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+		let response_msg = expected_response.clone();
+		let server_handle = tokio::spawn(async move {
+			let (mut transport, _) = listener.accept().await?;
+			transport.handshake_protocol_kind = HandshakeProtocolKind::Cms;
+
+			let handler = Box::new(move |msg: Frame| {
+				let _ = tx.try_send(msg);
+				Some(response_msg.clone())
+			});
+
+			let mut transport = transport.with_handler(handler);
+			transport.handle_request().await
+		});
+
+		// Distinct client identity: its own key pair and self-signed certificate.
+		let client_key = SigningKey::from_bytes(&[2u8; 32].into()).map_err(|_| TransportError::InvalidState)?;
+		let client_cert = create_test_certificate(&client_key);
+		let signing_key = Secp256k1SigningKey::from(client_key);
+		let key_provider = Secp256k1KeyProvider::from(signing_key);
+		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(key_provider);
+
+		let trust_store: Arc<dyn CertificateTrust> = {
+			let certificate = server_cert.clone();
+			Arc::new(
+				CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+					.with_certificate(certificate)?
+					.build(),
+			)
+		};
+
+		let cert = Arc::new(client_cert);
+		let key = Arc::new(HandshakeKeyManager::new(client_provider));
+		let chain = Arc::from(vec![server_cert]);
+
+		let stream = TcpStream::connect(*socket_addr).await?;
+		let mut transport = TcpTransport::from(TokioStream::from(stream));
+		transport = transport.with_trust_store(trust_store);
+		transport = transport.with_client_identity(cert, key);
+		transport = transport.with_server_certificate_chain(chain);
+		transport = transport.with_handshake_protocol(HandshakeProtocolKind::Cms);
+
+		let response = transport.emit(test_message.clone(), None).await?;
+		let received = rx.recv().await;
+		assert_eq!(Some(test_message), received);
+		assert_eq!(response, Some(expected_response));
+
+		server_handle.await??;
 		Ok(())
 	}
 

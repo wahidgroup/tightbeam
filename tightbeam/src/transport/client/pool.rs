@@ -22,16 +22,27 @@ use crate::transport::{TransportResult, X509ClientConfig};
 
 #[cfg(feature = "aes-gcm")]
 use crate::crypto::profiles::DefaultCryptoProvider;
-#[cfg(feature = "x509")]
-use crate::crypto::x509::store::CertificateTrust;
-#[cfg(feature = "x509")]
-use crate::crypto::x509::Certificate;
 #[cfg(not(feature = "x509"))]
 use crate::transport::client::ClientBuilder;
+
+#[cfg(feature = "x509")]
+mod x509 {
+	pub use crate::crypto::x509::store::CertificateTrust;
+	pub use crate::crypto::x509::Certificate;
+	pub use crate::transport::handshake::HandshakeProtocolKind;
+}
+
+#[cfg(feature = "x509")]
+use x509::*;
+
 #[cfg(feature = "transport-policy")]
-use crate::transport::policy::PolicyConf;
+mod policy {
+	pub use crate::transport::policy::PolicyConf;
+	pub use crate::transport::MessageEmitter;
+}
+
 #[cfg(feature = "transport-policy")]
-use crate::transport::MessageEmitter;
+use policy::*;
 
 /// Builder trait for connection configuration
 ///
@@ -86,10 +97,12 @@ struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
 struct PoolTlsConfig<C: CryptoProvider = DefaultCryptoProvider> {
 	trust_store: Option<Arc<dyn CertificateTrust>>,
 	client_identity: Option<ClientIdentity<C>>,
+	server_certificate_chain: Option<Arc<[Certificate]>>,
+	handshake_protocol: Option<HandshakeProtocolKind>,
 }
 
 #[cfg(feature = "x509")]
-impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
+impl<C: CryptoProvider> PoolTlsConfig<C> {
 	fn set_trust_store(&mut self, store: Arc<dyn CertificateTrust>) {
 		self.trust_store = Some(store);
 	}
@@ -99,6 +112,14 @@ impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 		let key = Arc::new(key);
 
 		self.client_identity = Some(ClientIdentity { certificate, key });
+	}
+
+	fn set_server_certificate_chain(&mut self, chain: Arc<[Certificate]>) {
+		self.server_certificate_chain = Some(chain);
+	}
+
+	fn set_handshake_protocol(&mut self, kind: HandshakeProtocolKind) {
+		self.handshake_protocol = Some(kind);
 	}
 
 	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
@@ -111,12 +132,17 @@ impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 			let store = Arc::clone(store);
 			configured = configured.with_trust_store(store);
 		}
-
 		if let Some(identity) = &self.client_identity {
 			let cert = Arc::clone(&identity.certificate);
 			let key = Arc::clone(&identity.key);
-
 			configured = configured.with_client_identity(cert, key);
+		}
+		if let Some(chain) = &self.server_certificate_chain {
+			let chain = Arc::clone(chain);
+			configured = configured.with_server_certificate_chain(chain);
+		}
+		if let Some(kind) = self.handshake_protocol {
+			configured = configured.with_handshake_protocol(kind);
 		}
 
 		configured
@@ -147,6 +173,21 @@ impl<P: Protocol, C: CryptoProvider> Default for ConnectionPoolBuilder<P, C> {
 impl<P: Protocol, C: CryptoProvider> ConnectionPoolBuilder<P, C> {
 	pub fn with_config(mut self, config: PoolConfig) -> Self {
 		self.config = config;
+		self
+	}
+
+	/// Provision the expected server certificate chain, ordered root to
+	/// leaf, shared by every pooled connection.
+	#[cfg(feature = "x509")]
+	pub fn with_server_certificate_chain(mut self, chain: impl Into<Arc<[Certificate]>>) -> Self {
+		self.tls.set_server_certificate_chain(chain.into());
+		self
+	}
+
+	/// Select the handshake protocol used by every pooled connection.
+	#[cfg(feature = "x509")]
+	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
+		self.tls.set_handshake_protocol(kind);
 		self
 	}
 }

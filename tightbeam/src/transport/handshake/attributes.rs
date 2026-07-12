@@ -182,6 +182,18 @@ pub fn encode_security_accept(accept: &SecurityAccept) -> Result<HandshakeAttrib
 	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT, any)
 }
 
+/// Canonical DER bytes of a `SecurityAccept` for transcript binding.
+///
+/// Both handshake sides append these bytes to the transcript before the
+/// Finished hash is computed, binding the negotiated profile to the
+/// signature (CWE-345): a tampered accept attribute changes the client's
+/// transcript hash and fails signature verification.
+pub fn security_accept_transcript_bytes(accept: &SecurityAccept) -> Result<Vec<u8>, HandshakeError> {
+	use crate::der::Encode;
+
+	Ok(Any::encode_from(accept)?.to_der()?)
+}
+
 // -------------------------- Decoders --------------------------
 
 pub fn extract_nonce(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeError> {

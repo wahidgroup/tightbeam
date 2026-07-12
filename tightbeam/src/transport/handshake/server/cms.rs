@@ -405,9 +405,16 @@ where
 	}
 
 	/// Prepare transcript hash and compute digest for signing.
+	///
+	/// The negotiated `SecurityAccept` is appended to the transcript before
+	/// hashing so the Finished signature binds the profile selection (CWE-345).
 	fn prepare_server_finished_digest(&mut self) -> Result<Vec<u8>, HandshakeError> {
 		// Compute transcript hash if not already set
 		if self.transcript_hash.is_none() {
+			if let Some(profile) = self.selected_profile {
+				let accept_bytes = attributes::security_accept_transcript_bytes(&SecurityAccept::new(profile))?;
+				self.transcript_buffer.extend_from_slice(&accept_bytes);
+			}
 			self.transcript_hash = Some(self.compute_transcript_hash()?);
 		}
 
@@ -554,15 +561,22 @@ where
 			self.transcript_buffer.extend_from_slice(signed_data_der);
 		}
 
-		// 3. Extract cryptographic material
+		// 3. Authenticate a wire-embedded client certificate before use:
+		//    set_client_certificate runs the validator chain and enforces
+		//    identity immutability across re-handshakes.
+		if let Some(cert) = extract_embedded_certificate(signed_data_der)? {
+			self.set_client_certificate(cert)?;
+		}
+
+		// 4. Extract cryptographic material
 		let client_verifying_key = self.extract_client_verifying_key()?;
 		let expected_signer_identifier = self.compute_client_signer_identifier(&client_verifying_key)?;
 
-		// 4. Verify signature and content
+		// 5. Verify signature and content
 		let verified_content =
 			self.verify_client_signature(signed_data_der, client_verifying_key, expected_signer_identifier)?;
 
-		// 5. Transition state
+		// 6. Transition state
 		self.state.transition(ServerHandshakeState::ClientFinishedReceived)?;
 
 		Ok(verified_content)
@@ -595,6 +609,22 @@ where
 	pub fn session_key(&self) -> Option<&Secret<Vec<u8>>> {
 		self.session_key.as_ref()
 	}
+}
+
+/// Extract the first X.509 certificate embedded in a Finished message's
+/// `certificates` field, if any.
+fn extract_embedded_certificate(signed_data_der: &[u8]) -> Result<Option<Certificate>, HandshakeError> {
+	use crate::cms::cert::CertificateChoices;
+
+	let signed_data = SignedData::from_der(signed_data_der)?;
+	let certificate = signed_data.certificates.as_ref().and_then(|set| {
+		set.0.iter().find_map(|choice| match choice {
+			CertificateChoices::Certificate(cert) => Some(cert.clone()),
+			CertificateChoices::Other(_) => None,
+		})
+	});
+
+	Ok(certificate)
 }
 
 // ============================================================================

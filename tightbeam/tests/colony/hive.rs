@@ -31,6 +31,7 @@ use tightbeam::{
 	testing::ScenarioConf,
 	trace::TraceCollector,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
+	utils::BasisPoints,
 	Beamable, Frame, TightBeamError, Version,
 };
 
@@ -110,10 +111,10 @@ tb_scenario! {
 			// Generate test certificate and key
 			let (cert, signing_key) = create_test_cert_with_key("CN=Hive Test Server", 365)?;
 
-			// Configure TLS for servlets (no client validation for this test)
+			let key = Arc::new(Secp256k1KeyProvider::from(signing_key));
 			let tls_config = Arc::new(HiveTlsConfig {
 				certificate: CertificateSpec::Built(Box::new(cert)),
-				key: Arc::new(Secp256k1KeyProvider::from(signing_key)),
+				key,
 				validators: vec![],
 			});
 
@@ -125,7 +126,8 @@ tb_scenario! {
 
 			// Start servlet independently
 			let servlet_trace = Arc::new(TraceCollector::new());
-			let servlet = HiveTestServlet::start(Arc::clone(&servlet_trace), None).await?;
+			let servlet_start_trace = Arc::clone(&servlet_trace);
+			let servlet = HiveTestServlet::start(servlet_start_trace, None).await?;
 
 			// Create hive
 			let mut hive = HiveX509Test::new(Some(hive_conf))?;
@@ -134,7 +136,8 @@ tb_scenario! {
 			hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
 
 			// Establish hive
-			hive.establish(Arc::new(TraceCollector::new())).await?;
+			let hive_trace = Arc::new(TraceCollector::new());
+			hive.establish(hive_trace).await?;
 
 			trace.event("hive_established")?;
 
@@ -172,6 +175,21 @@ fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError
 		.build()
 }
 
+/// Signed manage command with a stop request (unique id per call site).
+fn stop_command_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
+	let manage_cmd = ClusterCommand {
+		issued_at_ms: current_timestamp_ms(),
+		heartbeat: None,
+		manage: Some(HiveManagementRequest {
+			spawn: None,
+			list: None,
+			stop: Some(StopServletParams { servlet_id: b"none".to_vec() }),
+		}),
+	};
+
+	command_frame(id, manage_cmd)
+}
+
 tb_assert_spec! {
 	pub HiveGateShapeSpec,
 	V(1,0,0): {
@@ -181,6 +199,17 @@ tb_assert_spec! {
 			("unsigned_heartbeat_heartbeat_shape", exactly!(1)),
 			("unsigned_manage_manage_shape", exactly!(1)),
 			("signed_heartbeat_accepted", exactly!(1)),
+			("open_breaker_heartbeat_shape", exactly!(1))
+		]
+	},
+	V(1,1,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("unsigned_heartbeat_heartbeat_shape", exactly!(1)),
+			("unsigned_manage_manage_shape", exactly!(1)),
+			("signed_heartbeat_accepted", exactly!(1)),
+			("draining_manage_manage_shape", exactly!(1)),
 			("open_breaker_heartbeat_shape", exactly!(1))
 		]
 	}
@@ -198,23 +227,28 @@ tb_scenario! {
 	environment Bare {
 		exec: |trace| async move {
 			let (cert, signing_key) = create_test_cert_with_key("CN=Hive Gate Cluster", 365)?;
+			let certificate = cert;
 			let trust: Arc<dyn CertificateTrust> = Arc::new(
 				CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-					.with_certificate(cert)?
+					.with_certificate(certificate)?
 					.build(),
 			);
 
 			let provider = Secp256k1KeyProvider::from(signing_key);
 
 			let hive_conf = HiveConf {
-				trust_store: Some(Arc::clone(&trust)),
+				trust_store: {
+					let trust_store = Arc::clone(&trust);
+					Some(trust_store)
+				},
 				circuit_breaker_threshold: 1,
 				circuit_breaker_cooldown_ms: 60_000,
 				..Default::default()
 			};
 
 			let mut hive = HiveX509Test::new(Some(hive_conf))?;
-			hive.establish(Arc::new(TraceCollector::new())).await?;
+			let hive_trace = Arc::new(TraceCollector::new());
+			hive.establish(hive_trace).await?;
 
 			let builder = ClientBuilder::<TokioListener>::builder().build();
 			let mut client = builder.connect(hive.addr()).await?;
@@ -236,16 +270,7 @@ tb_scenario! {
 			trace.event("unsigned_heartbeat_heartbeat_shape")?;
 
 			// Unsigned manage: manage CHOICE (security verdict, no drain probe)
-			let manage_cmd = ClusterCommand {
-				issued_at_ms: current_timestamp_ms(),
-				heartbeat: None,
-				manage: Some(HiveManagementRequest {
-					spawn: None,
-					list: None,
-					stop: Some(StopServletParams { servlet_id: b"none".to_vec() }),
-				}),
-			};
-			let frame = command_frame(b"manage-unsigned", manage_cmd)?;
+			let frame = stop_command_frame(b"manage-unsigned")?;
 			let response = client.emit(frame, None).await?
 				.ok_or(TightBeamError::MissingResponse)?;
 
@@ -270,6 +295,25 @@ tb_scenario! {
 			assert_eq!(heartbeat.status, TransitStatus::Accepted, "signed heartbeat must be accepted");
 
 			trace.event("signed_heartbeat_accepted")?;
+
+			// A signed manage command during drain must come back Busy in
+			// the manage CHOICE.
+			hive.drain().await?;
+
+			let frame = stop_command_frame(b"manage-draining")?
+				.sign_with_provider::<Sha3_256, _>(&provider)
+				.await?;
+			let response = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let response: ClusterCommandResponse = decode(&response.message)?;
+			assert!(response.heartbeat.is_none(), "draining manage reject must not use the heartbeat shape");
+
+			let manage = response.manage.ok_or(TightBeamError::MissingResponse)?;
+			let stop = manage.stop.ok_or(TightBeamError::MissingResponse)?;
+			assert_eq!(stop.status, TransitStatus::Busy, "draining manage must be busy");
+
+			trace.event("draining_manage_manage_shape")?;
 
 			// Trip the breaker (threshold 1): a trusted signer identity with a
 			// signature transplanted from a different frame is the one failure
@@ -314,6 +358,95 @@ tb_scenario! {
 	}
 }
 
+tb_assert_spec! {
+	pub HiveBackpressureShapeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("backpressure_manage_manage_shape", exactly!(1)),
+			("backpressure_heartbeat_heartbeat_shape", exactly!(1))
+		]
+	}
+}
+
+// Backpressure Busy must also come back in the sender's CHOICE. Only manage
+// commands hit the gate (heartbeats are exempt), so the Busy verdict must
+// use the manage shape.
+tb_scenario! {
+	name: hive_backpressure_reply_shape,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(HiveBackpressureShapeSpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let (cert, signing_key) = create_test_cert_with_key("CN=Hive Backpressure Cluster", 365)?;
+			let certificate = cert;
+			let trust: Arc<dyn CertificateTrust> = Arc::new(
+				CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+					.with_certificate(certificate)?
+					.build(),
+			);
+
+			let provider = Secp256k1KeyProvider::from(signing_key);
+
+			// Threshold zero: idle utilization already saturates the gate,
+			// so every manage command sees the backpressure verdict.
+			let hive_conf = HiveConf {
+				trust_store: {
+					let trust_store = Arc::clone(&trust);
+					Some(trust_store)
+				},
+				backpressure_threshold: BasisPoints::default(),
+				..Default::default()
+			};
+
+			let mut hive = HiveX509Test::new(Some(hive_conf))?;
+			let hive_trace = Arc::new(TraceCollector::new());
+			hive.establish(hive_trace).await?;
+
+			let builder = ClientBuilder::<TokioListener>::builder().build();
+			let mut client = builder.connect(hive.addr()).await?;
+
+			// Signed manage under backpressure: Busy in the manage CHOICE
+			let frame = stop_command_frame(b"manage-bp")?
+				.sign_with_provider::<Sha3_256, _>(&provider)
+				.await?;
+			let response = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let response: ClusterCommandResponse = decode(&response.message)?;
+			assert!(response.heartbeat.is_none(), "backpressure manage reject must not use the heartbeat shape");
+
+			let manage = response.manage.ok_or(TightBeamError::MissingResponse)?;
+			let stop = manage.stop.ok_or(TightBeamError::MissingResponse)?;
+			assert_eq!(stop.status, TransitStatus::Busy, "backpressure manage must be busy");
+
+			trace.event("backpressure_manage_manage_shape")?;
+
+			// Signed heartbeat is exempt from the gate: heartbeat CHOICE
+			// with real capacity data (Busy status reflects saturation).
+			let frame = command_frame(b"hb-bp", heartbeat_command(current_timestamp_ms()))?
+				.sign_with_provider::<Sha3_256, _>(&provider)
+				.await?;
+			let response = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let response: ClusterCommandResponse = decode(&response.message)?;
+			assert!(response.manage.is_none(), "heartbeat under backpressure must not use the manage shape");
+
+			let heartbeat = response.heartbeat.ok_or(TightBeamError::MissingResponse)?;
+			assert_eq!(heartbeat.status, TransitStatus::Busy, "saturated heartbeat must report busy");
+
+			trace.event("backpressure_heartbeat_heartbeat_shape")?;
+
+			hive.stop();
+
+			Ok(())
+		}
+	}
+}
+
 // Test without TLS to verify basic hive functionality
 tb_scenario! {
 	name: hive_establish_no_tls,
@@ -326,15 +459,18 @@ tb_scenario! {
 
 			// Start servlet independently
 			let servlet_trace = Arc::new(TraceCollector::new());
-			let servlet = HiveTestServlet::start(Arc::clone(&servlet_trace), None).await?;
+			let servlet_start_trace = Arc::clone(&servlet_trace);
+			let servlet = HiveTestServlet::start(servlet_start_trace, None).await?;
 
 			// Create hive with default config
 			let mut hive = HiveX509Test::new(None)?;
 
 			// Register servlet with spawner for auto-scaling
 			hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
+
 			// Establish hive
-			hive.establish(Arc::new(TraceCollector::new())).await?;
+			let hive_trace = Arc::new(TraceCollector::new());
+			hive.establish(hive_trace).await?;
 
 			trace.event("hive_established")?;
 

@@ -19,7 +19,7 @@ use std::sync::Arc;
 mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::transport::handshake::HandshakeKeyManager;
+	pub use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
 	pub use crate::transport::TransportEncryptionConfig;
 	pub use crate::x509::Certificate;
 }
@@ -112,6 +112,17 @@ pub trait X509ClientConfig: Sized {
 	/// Takes Arcs so pooled connections can share one identity without
 	/// deep-copying the certificate per connection.
 	fn with_client_identity(self, cert: Arc<Certificate>, key: Arc<HandshakeKeyManager<Self::CryptoProvider>>) -> Self;
+
+	/// Provision the expected server certificate chain, ordered root to
+	/// leaf.
+	///
+	/// Required for key-transport handshakes (CMS): the client encrypts the
+	/// session key to the server's public key in its first message, before
+	/// the server can present a certificate on the wire.
+	fn with_server_certificate_chain(self, chain: Arc<[Certificate]>) -> Self;
+
+	/// Select the handshake protocol used when encryption is enabled.
+	fn with_handshake_protocol(self, kind: HandshakeProtocolKind) -> Self;
 }
 
 /// This protocol can operate as a mycelial network (ie. TCP SocketAddress)

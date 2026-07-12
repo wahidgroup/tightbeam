@@ -377,6 +377,10 @@ where
 		self.trust_store.as_ref()
 	}
 
+	fn to_server_certificate_chain_ref(&self) -> Option<&Arc<[Certificate]>> {
+		self.server_certificate_chain.as_ref()
+	}
+
 	fn to_server_handshake_mut(
 		&mut self,
 	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>> {

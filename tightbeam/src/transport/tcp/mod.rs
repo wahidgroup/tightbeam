@@ -197,6 +197,8 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "x509")]
 			pub(crate) client_certificate: Option<Arc<$crate::x509::Certificate>>,
 			#[cfg(feature = "x509")]
+			pub(crate) server_certificate_chain: Option<Arc<[$crate::x509::Certificate]>>,
+			#[cfg(feature = "x509")]
 			pub(crate) client_validators:
 				Option<Arc<Vec<Arc<dyn $crate::crypto::x509::policy::CertificateValidation>>>>,
 			#[cfg(feature = "x509")]
@@ -251,6 +253,8 @@ macro_rules! impl_tcp_common {
 					server_identity: None,
 					#[cfg(feature = "x509")]
 					client_certificate: None,
+					#[cfg(feature = "x509")]
+					server_certificate_chain: None,
 					#[cfg(feature = "x509")]
 					client_validators: None,
 					#[cfg(feature = "x509")]
@@ -315,16 +319,26 @@ macro_rules! impl_tcp_common {
 				self
 			}
 
-		fn with_client_identity(
-			mut self,
-			cert: Arc<$crate::x509::Certificate>,
-			key: Arc<$crate::transport::handshake::HandshakeKeyManager<P>>,
-		) -> Self {
-			self.client_certificate = Some(cert);
-			self.key_manager = Some(key);
+			fn with_client_identity(
+				mut self,
+				cert: Arc<$crate::x509::Certificate>,
+				key: Arc<$crate::transport::handshake::HandshakeKeyManager<P>>,
+			) -> Self {
+				self.client_certificate = Some(cert);
+				self.key_manager = Some(key);
 
-			self
-		}
+				self
+			}
+
+			fn with_server_certificate_chain(mut self, chain: Arc<[$crate::x509::Certificate]>) -> Self {
+				self.server_certificate_chain = Some(chain);
+				self
+			}
+
+			fn with_handshake_protocol(mut self, kind: $crate::transport::handshake::HandshakeProtocolKind) -> Self {
+				self.handshake_protocol_kind = kind;
+				self
+			}
 		}
 
 		#[cfg(feature = "x509")]

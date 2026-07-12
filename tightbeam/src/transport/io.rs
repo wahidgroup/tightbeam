@@ -38,8 +38,6 @@ mod x509 {
 		pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 		pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 		pub use crate::crypto::sign::{SignatureEncoding, Verifier};
-		#[cfg(feature = "std")]
-		pub use crate::crypto::x509::policy::CertificateValidation;
 		pub use crate::der::oid::AssociatedOid;
 		pub use crate::spki::EncodePublicKey;
 		pub use crate::transport::handshake::client::{EciesHandshakeClient, ExtractVerifyingKey};
@@ -47,10 +45,22 @@ mod x509 {
 			ClientHandshakeProtocol, ClientHello, ClientKeyExchange, HandshakeError, HandshakeFinalization,
 			HandshakeProtocolKind, ServerHandshake,
 		};
+
+		#[cfg(feature = "std")]
+		pub use crate::crypto::x509::policy::CertificateValidation;
 	}
 
 	#[cfg(feature = "transport-ecies")]
 	pub use ecies::*;
+
+	#[cfg(feature = "transport-cms")]
+	mod cms {
+		pub use crate::transport::handshake::negotiation::SecurityOffer;
+		pub use crate::transport::handshake::CmsClientConfig;
+	}
+
+	#[cfg(feature = "transport-cms")]
+	pub use cms::*;
 }
 
 #[cfg(feature = "x509")]
@@ -59,6 +69,82 @@ use x509::*;
 /// Maximum wire size allowed for handshake-phase messages.
 #[cfg(feature = "transport-ecies")]
 pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
+
+/// Wrap the client's first handshake message in its wire envelope.
+///
+/// ECIES starts with a signed ClientHello; CMS starts with the key-transport
+/// EnvelopedData itself.
+#[cfg(feature = "transport-ecies")]
+fn client_start_envelope(kind: HandshakeProtocolKind, message: &[u8]) -> TransportResult<TransportEnvelope> {
+	match kind {
+		HandshakeProtocolKind::Ecies => {
+			let client_hello = ClientHello::from_der(message)?;
+			let signed_data: SignedData = (&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
+			let signed_data = Box::new(signed_data);
+			Ok(TransportEnvelope::SignedData(signed_data))
+		}
+		#[cfg(feature = "transport-cms")]
+		HandshakeProtocolKind::Cms => {
+			let enveloped_data = EnvelopedData::from_der(message)?;
+			let enveloped_data = Box::new(enveloped_data);
+			Ok(TransportEnvelope::EnvelopedData(enveloped_data))
+		}
+		#[cfg(not(feature = "transport-cms"))]
+		HandshakeProtocolKind::Cms => Err(TransportError::UnsupportedHandshakeProtocol(kind)),
+	}
+}
+
+/// Extract the raw handshake bytes the client orchestrator consumes from the
+/// server's response envelope.
+///
+/// Both protocols answer with SignedData; ECIES carries a ServerHandshake
+/// inside it, while the CMS orchestrator consumes the SignedData directly.
+#[cfg(feature = "transport-ecies")]
+fn server_response_handshake_bytes(
+	kind: HandshakeProtocolKind,
+	envelope: TransportEnvelope,
+) -> TransportResult<Vec<u8>> {
+	let signed_data = match envelope {
+		TransportEnvelope::SignedData(sd) => sd,
+		_ => return Err(TransportError::InvalidMessage),
+	};
+
+	match kind {
+		HandshakeProtocolKind::Ecies => {
+			let server_handshake: ServerHandshake =
+				signed_data.as_ref().try_into().map_err(|_| TransportError::InvalidMessage)?;
+			Ok(server_handshake.to_der()?)
+		}
+		#[cfg(feature = "transport-cms")]
+		HandshakeProtocolKind::Cms => Ok(signed_data.to_der()?),
+		#[cfg(not(feature = "transport-cms"))]
+		HandshakeProtocolKind::Cms => Err(TransportError::UnsupportedHandshakeProtocol(kind)),
+	}
+}
+
+/// Wrap the client's follow-up handshake message in its wire envelope.
+///
+/// ECIES follows up with a key exchange (EnvelopedData); CMS follows up with
+/// the signed client Finished (SignedData).
+#[cfg(feature = "transport-ecies")]
+fn client_followup_envelope(kind: HandshakeProtocolKind, message: &[u8]) -> TransportResult<TransportEnvelope> {
+	match kind {
+		HandshakeProtocolKind::Ecies => {
+			let client_kex = ClientKeyExchange::from_der(message)?;
+			let enveloped_data: EnvelopedData = (&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
+			let enveloped_data = Box::new(enveloped_data);
+			Ok(TransportEnvelope::EnvelopedData(enveloped_data))
+		}
+		#[cfg(feature = "transport-cms")]
+		HandshakeProtocolKind::Cms => {
+			let signed_data = SignedData::from_der(message)?;
+			let signed_data = Box::new(signed_data);
+			Ok(TransportEnvelope::SignedData(signed_data))
+		}
+		#[cfg(not(feature = "transport-cms"))]
+		HandshakeProtocolKind::Cms => Err(TransportError::UnsupportedHandshakeProtocol(kind)),
+	}
+}
 
 /// Parse a DER length field into its numeric value.
 pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
@@ -192,7 +278,6 @@ pub trait EncryptedMessageIO: MessageIO {
 	{
 		let wire_bytes = self.read_envelope().await?;
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-
 		match wire_envelope {
 			WireEnvelope::Cleartext(transport_envelope) => {
 				// Check if server expects encryption but received cleartext
@@ -354,7 +439,8 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		let client_hello = ClientHello::from_der(&initial_message)?;
 		let signed_data: SignedData = (&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
-		let initial_envelope = TransportEnvelope::SignedData(Box::new(signed_data));
+		let signed_data = Box::new(signed_data);
+		let initial_envelope = TransportEnvelope::SignedData(signed_data);
 		let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
@@ -402,7 +488,8 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Step 4: Send client key exchange
 		let client_kex = ClientKeyExchange::from_der(&next_message_bytes)?;
 		let enveloped_data: EnvelopedData = (&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
-		let msg_envelope = TransportEnvelope::EnvelopedData(Box::new(enveloped_data));
+		let enveloped_data = Box::new(enveloped_data);
+		let msg_envelope = TransportEnvelope::EnvelopedData(enveloped_data);
 		let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
@@ -431,18 +518,23 @@ pub trait EncryptedMessageIO: MessageIO {
 		PublicKey<P::Curve>: EciesPublicKeyOps + EncodePublicKey,
 		<PublicKey<P::Curve> as EciesPublicKeyOps>::SecretKey: EciesEphemeral<PublicKey = PublicKey<P::Curve>>,
 		// Signature bounds
-		P::Signature: SignatureEncoding,
+		P::Signature: SignatureEncoding + 'static,
 		for<'b> P::Signature: TryFrom<&'b [u8]>,
 		for<'b> <P::Signature as TryFrom<&'b [u8]>>::Error: Into<HandshakeError>,
-		P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + From<PublicKey<P::Curve>> + EncodePublicKey,
-		// AEAD bound
-		P::AeadCipher: KeyInit,
+		P::VerifyingKey:
+			Verifier<P::Signature> + ExtractVerifyingKey + From<PublicKey<P::Curve>> + EncodePublicKey + 'static,
+		// Digest and AEAD bounds
+		P::Digest: Send + 'static,
+		P::AeadCipher: KeyInit + Send + Sync,
 	{
 		// Use trust store for server certificate validation
 		#[cfg(all(feature = "x509", feature = "std"))]
-		let validator = self
-			.to_trust_store_ref()
-			.map(|store| Arc::clone(store) as Arc<dyn CertificateValidation>);
+		let validator = if let Some(store) = self.to_trust_store_ref() {
+			let validator = Arc::clone(store) as Arc<dyn CertificateValidation>;
+			Some(validator)
+		} else {
+			None
+		};
 
 		#[cfg(not(all(feature = "x509", feature = "std")))]
 		let validator = None;
@@ -454,17 +546,19 @@ pub trait EncryptedMessageIO: MessageIO {
 			return self.perform_client_handshake_no_mutual_auth().await;
 		}
 
+		let protocol_kind = self.to_handshake_protocol_kind();
+
 		// Path: Mutual auth clients - use trait object via factory
 		let key_manager = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
 		let mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = HandshakeError>> =
-			match (self.to_handshake_protocol_kind(), key_manager) {
+			match (protocol_kind, key_manager) {
 				#[cfg(feature = "transport-ecies")]
 				(HandshakeProtocolKind::Ecies, key) => {
-					// With trust store, validation happens via the validator callback
+					let client_cert = self.to_client_certificate_ref().map(Arc::clone);
 					key.create_ecies_client::<crate::crypto::ecies::Secp256k1EciesMessage>(
-						None, // Trust store validates instead of explicit cert matching
-						self.to_client_certificate_ref().map(Arc::clone),
-						None, // Use default AAD domain tag
+						None,
+						client_cert,
+						None,
 						validator,
 					)?
 				}
@@ -475,8 +569,31 @@ pub trait EncryptedMessageIO: MessageIO {
 					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Ecies));
 				}
 
-				// Fail closed: the CMS orchestrator is not wired into the TCP
-				// transport.
+				// CMS encrypts the session key to the server's public key up
+				// front, so the server identity comes from the chain.
+				#[cfg(feature = "transport-cms")]
+				(HandshakeProtocolKind::Cms, key) => {
+					let store = self
+						.to_trust_store_ref()
+						.ok_or(TransportError::HandshakeError(HandshakeError::MissingTrustStore))?;
+					let chain = self
+						.to_server_certificate_chain_ref()
+						.ok_or(TransportError::MissingServerCertificateChain)?;
+
+					let trust_store = Arc::clone(store);
+					let server_identity = Arc::clone(chain).into();
+					let security_offer = Some(SecurityOffer::new(vec![SecurityProfileDesc::from(&TightbeamProfile)]));
+					let client_certificate = self.to_client_certificate_ref().map(Arc::clone);
+
+					key.create_cms_client(CmsClientConfig {
+						server_identity,
+						trust_store,
+						security_offer,
+						client_certificate,
+					})?
+				}
+
+				#[cfg(not(feature = "transport-cms"))]
 				(HandshakeProtocolKind::Cms, _) => {
 					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms));
 				}
@@ -488,11 +605,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		// Parse ClientHello and wrap in SignedData -> TransportEnvelope
-		let client_hello = ClientHello::from_der(&initial_message)?;
-		let signed_data: SignedData = (&client_hello).try_into().map_err(|_| TransportError::InvalidMessage)?;
-		let initial_envelope = TransportEnvelope::SignedData(Box::new(signed_data));
-
+		let initial_envelope = client_start_envelope(protocol_kind, &initial_message)?;
 		let wire_envelope = WireEnvelope::Cleartext(initial_envelope);
 		self.write_envelope(&wire_envelope.to_der()?).await?;
 
@@ -524,15 +637,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			}
 		};
 
-		// Extract SignedData and convert to ServerHandshake
-		let signed_data = match response_envelope {
-			TransportEnvelope::SignedData(sd) => sd,
-			_ => return Err(TransportError::InvalidMessage),
-		};
-		let server_handshake: ServerHandshake =
-			signed_data.as_ref().try_into().map_err(|_| TransportError::InvalidMessage)?;
-
-		let response_bytes = server_handshake.to_der()?;
+		let response_bytes = server_response_handshake_bytes(protocol_kind, response_envelope)?;
 		if response_bytes.len() > HANDSHAKE_MAX_WIRE {
 			return Err(TransportError::InvalidMessage);
 		}
@@ -546,11 +651,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				return Err(TransportError::InvalidMessage);
 			}
 
-			// Parse ClientKeyExchange and wrap in EnvelopedData
-			let client_kex = ClientKeyExchange::from_der(&msg_bytes)?;
-			let enveloped_data: EnvelopedData = (&client_kex).try_into().map_err(|_| TransportError::InvalidMessage)?;
-			let msg_envelope = TransportEnvelope::EnvelopedData(Box::new(enveloped_data));
-
+			let msg_envelope = client_followup_envelope(protocol_kind, &msg_bytes)?;
 			let wire_envelope = WireEnvelope::Cleartext(msg_envelope);
 			self.write_envelope(&wire_envelope.to_der()?).await?;
 		}
@@ -576,29 +677,38 @@ pub trait EncryptedMessageIO: MessageIO {
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
 		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 		PublicKey<P::Curve>: EciesPublicKeyOps,
-		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature>,
+		P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + Verifier<P::Signature> + 'static,
 		for<'b> P::VerifyingKey: From<&'b PublicKey<P::Curve>>,
-		P::AeadCipher: KeyInit,
+		P::Signature: 'static,
+		P::Digest: Send + 'static,
+		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
 		if handshake_bytes.len() > HANDSHAKE_MAX_WIRE {
 			return Err(TransportError::InvalidMessage);
 		}
 
-		// Parse TransportEnvelope and extract the handshake message
+		let protocol_kind = self.to_handshake_protocol_kind();
+
+		// Parse TransportEnvelope and extract the handshake message. ECIES
+		// carries its own message types inside the CMS envelopes.
 		let transport_envelope = TransportEnvelope::from_der(handshake_bytes)?;
-		let raw_message = match &transport_envelope {
-			TransportEnvelope::SignedData(sd) => {
+		let raw_message = match (protocol_kind, &transport_envelope) {
+			(HandshakeProtocolKind::Ecies, TransportEnvelope::SignedData(sd)) => {
 				// This is ClientHello (first message from client)
 				ClientHello::try_from(sd.as_ref())
 					.map_err(|_| TransportError::InvalidMessage)?
 					.to_der()?
 			}
-			TransportEnvelope::EnvelopedData(ed) => {
+			(HandshakeProtocolKind::Ecies, TransportEnvelope::EnvelopedData(ed)) => {
 				// This is ClientKeyExchange (second message from client)
 				ClientKeyExchange::try_from(ed.as_ref())
 					.map_err(|_| TransportError::InvalidMessage)?
 					.to_der()?
 			}
+			#[cfg(feature = "transport-cms")]
+			(HandshakeProtocolKind::Cms, TransportEnvelope::EnvelopedData(ed)) => ed.to_der()?,
+			#[cfg(feature = "transport-cms")]
+			(HandshakeProtocolKind::Cms, TransportEnvelope::SignedData(sd)) => sd.to_der()?,
 			_ => return Err(TransportError::InvalidMessage),
 		};
 
@@ -606,29 +716,26 @@ pub trait EncryptedMessageIO: MessageIO {
 		let cert_arc = self.to_server_certificate_arc().ok_or(TransportError::MissingEncryption)?;
 		let key_manager = self.to_key_manager_ref().ok_or(TransportError::MissingEncryption)?;
 		let key_manager = Arc::clone(key_manager);
-		let protocol_kind = self.to_handshake_protocol_kind();
 		let client_validators = self.to_client_validators_ref().map(Arc::clone);
 
 		// Get or create handshake orchestrator (persists state across multiple messages)
 		let server_handshake_opt = self.to_server_handshake_mut();
 		if server_handshake_opt.is_none() {
+			// Create default security profile for negotiation
+			let default_profile = TightbeamProfile;
+			let profile_desc = SecurityProfileDesc::from(&default_profile);
+			let supported_profiles = vec![profile_desc];
+			let client_validators = client_validators.as_ref().map(Arc::clone);
+
 			*server_handshake_opt = Some(match protocol_kind {
 				HandshakeProtocolKind::Ecies => {
-					// Create default security profile for negotiation
-					let default_profile = TightbeamProfile;
-					let profile_desc = SecurityProfileDesc::from(&default_profile);
-
-					// Use factory method to create ECIES server with concrete key type
-					key_manager.create_ecies_server(
-						cert_arc,
-						None, // Use default AAD domain tag
-						vec![profile_desc],
-						client_validators.as_ref().map(Arc::clone),
-					)?
+					key_manager.create_ecies_server(cert_arc, None, supported_profiles, client_validators)?
 				}
 
-				// Fail closed: a CMS server built here would run with empty
-				// supported profiles and no wire-sourced client certificate.
+				#[cfg(feature = "transport-cms")]
+				HandshakeProtocolKind::Cms => key_manager.create_cms_server(client_validators, supported_profiles)?,
+
+				#[cfg(not(feature = "transport-cms"))]
 				HandshakeProtocolKind::Cms => {
 					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms));
 				}
@@ -646,11 +753,23 @@ pub trait EncryptedMessageIO: MessageIO {
 				return Err(TransportError::InvalidMessage);
 			}
 
-			// Parse ServerHandshake and wrap in SignedData -> TransportEnvelope
-			let server_handshake = ServerHandshake::from_der(&response)?;
-			let signed_data: SignedData = (&server_handshake).try_into().map_err(|_| TransportError::InvalidMessage)?;
-			let server_envelope = TransportEnvelope::SignedData(Box::new(signed_data));
+			// Both protocols answer with SignedData: ECIES wraps its
+			// ServerHandshake, CMS emits the signed server Finished directly.
+			let signed_data = match protocol_kind {
+				HandshakeProtocolKind::Ecies => {
+					let server_handshake = ServerHandshake::from_der(&response)?;
+					(&server_handshake).try_into().map_err(|_| TransportError::InvalidMessage)?
+				}
+				#[cfg(feature = "transport-cms")]
+				HandshakeProtocolKind::Cms => SignedData::from_der(&response)?,
+				#[cfg(not(feature = "transport-cms"))]
+				HandshakeProtocolKind::Cms => {
+					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms));
+				}
+			};
 
+			let signed_data = Box::new(signed_data);
+			let server_envelope = TransportEnvelope::SignedData(signed_data);
 			let wire_envelope = WireEnvelope::Cleartext(server_envelope);
 			self.write_envelope(&wire_envelope.to_der()?).await?;
 

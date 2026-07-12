@@ -290,17 +290,12 @@ pub trait ServerHandshakeKey: Send + Sync {
 	/// The orchestrator borrows the encapsulated signing key, ensuring zero-copy
 	/// key management and proper encapsulation.
 	///
-	/// # Parameters
-	/// - `server_cert`: The server's certificate for key agreement
-	/// - `validators`: Optional certificate validators to apply to server certificate
-	///
 	/// # Returns
 	/// A CMS client handshake orchestrator that borrows the encapsulated key
 	#[cfg(feature = "transport-cms")]
 	fn create_cms_client(
 		&self,
-		server_cert: Arc<Certificate>,
-		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		config: CmsClientConfig,
 	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
 
 	/// Create a CMS server handshake orchestrator.
@@ -310,6 +305,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	///
 	/// # Parameters
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
+	/// - `supported_profiles`: Security profiles for negotiation
 	///
 	/// # Returns
 	/// A CMS server handshake orchestrator that borrows the encapsulated key
@@ -317,7 +313,55 @@ pub trait ServerHandshakeKey: Send + Sync {
 	fn create_cms_server(
 		&self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		supported_profiles: Vec<SecurityProfileDesc>,
 	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>;
+}
+
+/// Provisioned server identity for a CMS client handshake.
+///
+/// The session key is encrypted to the identity's leaf certificate, so it
+/// must be supplied up front rather than learned from the wire.
+#[cfg(feature = "transport-cms")]
+pub enum CmsServerIdentity {
+	/// A bare server certificate, evaluated directly against the trust store.
+	Certificate(Arc<Certificate>),
+	/// Full server chain, ordered root to leaf. Path validation runs over the
+	/// chain (RFC 5280 §6.1) and the leaf becomes the encryption target.
+	Chain(Arc<[Certificate]>),
+}
+
+#[cfg(feature = "transport-cms")]
+impl From<Arc<Certificate>> for CmsServerIdentity {
+	fn from(certificate: Arc<Certificate>) -> Self {
+		Self::Certificate(certificate)
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+impl From<Arc<[Certificate]>> for CmsServerIdentity {
+	fn from(chain: Arc<[Certificate]>) -> Self {
+		Self::Chain(chain)
+	}
+}
+
+/// Configuration for a CMS client handshake orchestrator.
+///
+/// CMS is a key-transport handshake: the client encrypts the session key to
+/// the server's public key in its first message, so the server identity must
+/// be provisioned up front rather than learned from the wire.
+#[cfg(feature = "transport-cms")]
+pub struct CmsClientConfig {
+	/// The provisioned server identity the session key is encrypted to.
+	pub server_identity: CmsServerIdentity,
+	/// Trust store that authenticates the server identity. Mandatory:
+	/// a CMS handshake without a trust store cannot authenticate anyone
+	/// (CWE-295).
+	pub trust_store: Arc<dyn CertificateTrust>,
+	/// Profiles offered to the server for negotiation.
+	pub security_offer: Option<SecurityOffer>,
+	/// Client certificate embedded in the Finished message for mutual
+	/// authentication.
+	pub client_certificate: Option<Arc<Certificate>>,
 }
 
 /// Encapsulated server key manager for handshake protocols.
@@ -458,17 +502,12 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// The orchestrator uses the key provider for cryptographic operations,
 	/// ensuring proper encapsulation and enabling HSM/KMS integration.
 	///
-	/// # Parameters
-	/// - `server_cert`: The server's certificate for key agreement
-	/// - `validators`: Optional certificate validators to apply during handshake
-	///
 	/// # Returns
 	/// A CMS client handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_client<'a>(
 		&'a self,
-		server_cert: Arc<Certificate>,
-		trust_store: Option<Arc<dyn CertificateTrust>>,
+		config: CmsClientConfig,
 	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>
 	where
 		P: Default + 'static,
@@ -481,13 +520,21 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::Digest: Send + 'static,
 		P::AeadCipher: Send + Sync + KeyInit,
 	{
+		use crate::transport::handshake::client::CmsHandshakeClient;
+
 		let provider = P::default();
 		let key_provider = Arc::clone(&self.provider);
-		let mut client =
-			crate::transport::handshake::client::CmsHandshakeClient::<P>::new(provider, key_provider, server_cert);
+		let mut client = match config.server_identity {
+			CmsServerIdentity::Certificate(cert) => CmsHandshakeClient::<P>::new(provider, key_provider, cert),
+			CmsServerIdentity::Chain(chain) => CmsHandshakeClient::<P>::from_chain(provider, key_provider, chain),
+		}
+		.with_trust_store(config.trust_store);
 
-		if let Some(store) = trust_store {
-			client = client.with_trust_store(store);
+		if let Some(offer) = config.security_offer {
+			client = client.with_security_offer(offer);
+		}
+		if let Some(cert) = config.client_certificate {
+			client = client.with_client_certificate(cert);
 		}
 
 		Ok(Box::new(client))
