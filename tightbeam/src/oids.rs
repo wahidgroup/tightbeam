@@ -4,8 +4,6 @@
 //! protocol implementation. OIDs are used to identify cryptographic algorithms,
 //! data formats, and protocol elements in a standardized way.
 
-#![allow(dead_code)]
-
 use crate::der::asn1::ObjectIdentifier;
 
 // ============================================================================
@@ -24,7 +22,7 @@ pub const ENVELOPED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.8
 
 /// id-ct-compressedData OBJECT IDENTIFIER ::= {
 ///     iso(1)   member-body(2)  us(840)    rsadsi(113549)
-///     pkcs(1)  pkcs-9(9)       smime(16)  alg(3) 8
+///     pkcs(1)  pkcs-9(9)       smime(16)  ct(1) 9
 /// }
 /// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
 pub const COMPRESSION_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.9");
@@ -36,25 +34,33 @@ pub const COMPRESSION_CONTENT: ObjectIdentifier = ObjectIdentifier::new_unwrap("
 /// See `<https://datatracker.ietf.org/doc/html/rfc3274>`
 pub const COMPRESSION_ZLIB: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3.8");
 
-/// OID for zstd compression defined in RFC 8878
+/// Zstandard (zstd) compression, RFC 8878.
+///
+/// RFC 8878 defines the format and media type only; neither IETF nor the
+/// S/MIME algorithm registry (RFC 7107) assigns an OID for zstd. This value
+/// lives under the same placeholder enterprise arc as the handshake attribute
+/// OIDs below and MUST be replaced together with them once a Private
+/// Enterprise Number is assigned.
 /// See `<https://datatracker.ietf.org/doc/html/rfc8878>`
-/// See `<https://oid-base.com/get/1.3.6.1.4.1.50274.1.1>`
-pub const COMPRESSION_ZSTD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.3");
+pub const COMPRESSION_ZSTD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.2.1");
 
 /// sha-256
 /// See `<https://oid-base.com/get/2.16.840.1.101.3.4.2.1>`
 pub const HASH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 
-/// sha3-256
-/// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
+/// id-sha3-256 (NIST CSOR hash algorithms arc)
+/// See `<https://csrc.nist.gov/projects/computer-security-objects-register/algorithm-registration>`
+/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.2.8>`
 pub const HASH_SHA3_256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.8");
 
-/// sha3-384
-/// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
+/// id-sha3-384 (NIST CSOR hash algorithms arc)
+/// See `<https://csrc.nist.gov/projects/computer-security-objects-register/algorithm-registration>`
+/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.2.9>`
 pub const HASH_SHA3_384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.9");
 
-/// sha3-512
-/// See `<https://datatracker.ietf.org/doc/html/rfc6234>`
+/// id-sha3-512 (NIST CSOR hash algorithms arc)
+/// See `<https://csrc.nist.gov/projects/computer-security-objects-register/algorithm-registration>`
+/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.2.10>`
 pub const HASH_SHA3_512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.10");
 
 /// ecdsa-with-SHA256
@@ -66,7 +72,7 @@ pub const SIGNER_ECDSA_WITH_SHA256: ObjectIdentifier = ObjectIdentifier::new_unw
 pub const SIGNER_ECDSA_WITH_SHA3_256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.10");
 
 /// ecdsa-with-SHA3-512
-/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.3.10>`
+/// See `<https://oid-base.com/get/2.16.840.1.101.3.4.3.12>`
 pub const SIGNER_ECDSA_WITH_SHA3_512: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.12");
 
 /// id-aes128-gcm - AES-GCM with 128-bit key
@@ -171,3 +177,59 @@ pub const CLIENT_CERTIFICATE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1
 
 /// Client signature OID
 pub const CLIENT_SIGNATURE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.14");
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Regression pin: every OID constant is asserted against its
+	/// dotted-decimal value so an accidental edit cannot silently change what
+	/// is used for transport.
+	#[test]
+	fn oid_values_are_pinned() {
+		let pinned: &[(ObjectIdentifier, &str)] = &[
+			(DATA, "1.2.840.113549.1.7.1"),
+			(ENVELOPED_DATA, "1.2.840.113549.1.7.3"),
+			(COMPRESSION_CONTENT, "1.2.840.113549.1.9.16.1.9"),
+			(COMPRESSION_ZLIB, "1.2.840.113549.1.9.16.3.8"),
+			(COMPRESSION_ZSTD, "1.3.6.1.4.1.55555.2.1"),
+			(HASH_SHA256, "2.16.840.1.101.3.4.2.1"),
+			(HASH_SHA3_256, "2.16.840.1.101.3.4.2.8"),
+			(HASH_SHA3_384, "2.16.840.1.101.3.4.2.9"),
+			(HASH_SHA3_512, "2.16.840.1.101.3.4.2.10"),
+			(SIGNER_ECDSA_WITH_SHA256, "1.2.840.10045.4.3.2"),
+			(SIGNER_ECDSA_WITH_SHA3_256, "2.16.840.1.101.3.4.3.10"),
+			(SIGNER_ECDSA_WITH_SHA3_512, "2.16.840.1.101.3.4.3.12"),
+			(AES_128_GCM, "2.16.840.1.101.3.4.1.6"),
+			(AES_256_GCM, "2.16.840.1.101.3.4.1.46"),
+			(AES_128_WRAP, "2.16.840.1.101.3.4.1.5"),
+			(AES_192_WRAP, "2.16.840.1.101.3.4.1.25"),
+			(AES_256_WRAP, "2.16.840.1.101.3.4.1.45"),
+			(CURVE_SECP256K1, "1.3.132.0.10"),
+			(CURVE_NIST_P256, "1.2.840.10045.3.1.7"),
+			(CURVE_NIST_P384, "1.3.132.0.34"),
+			(CURVE_NIST_P521, "1.3.132.0.35"),
+			(CURVE_X25519, "1.3.101.110"),
+			(KEM_ML_KEM_1024, "2.16.840.1.101.3.4.4.4"),
+			(HANDSHAKE_PROTOCOL_VERSION, "1.3.6.1.4.1.55555.1.1"),
+			(HANDSHAKE_ALGORITHM_PROFILE, "1.3.6.1.4.1.55555.1.2"),
+			(HANDSHAKE_CLIENT_NONCE, "1.3.6.1.4.1.55555.1.3"),
+			(HANDSHAKE_SELECT_VERSION, "1.3.6.1.4.1.55555.1.4"),
+			(HANDSHAKE_SELECT_ALGORITHM, "1.3.6.1.4.1.55555.1.5"),
+			(HANDSHAKE_SERVER_NONCE, "1.3.6.1.4.1.55555.1.6"),
+			(HANDSHAKE_ABORT_ALERT, "1.3.6.1.4.1.55555.1.7"),
+			(HANDSHAKE_TRANSCRIPT_HASH, "1.3.6.1.4.1.55555.1.8"),
+			(HANDSHAKE_SUPPORTED_CURVES, "1.3.6.1.4.1.55555.1.9"),
+			(HANDSHAKE_SELECTED_CURVE, "1.3.6.1.4.1.55555.1.10"),
+			(HANDSHAKE_SECURITY_OFFER, "1.3.6.1.4.1.55555.1.11"),
+			(HANDSHAKE_SECURITY_ACCEPT, "1.3.6.1.4.1.55555.1.12"),
+			(HANDSHAKE_PROFILE_ECIES_GCM, "1.3.6.1.4.1.55555.1.100"),
+			(CLIENT_CERTIFICATE, "1.3.6.1.4.1.55555.1.13"),
+			(CLIENT_SIGNATURE, "1.3.6.1.4.1.55555.1.14"),
+		];
+
+		for (oid, expected) in pinned {
+			assert_eq!(*oid, ObjectIdentifier::new_unwrap(expected));
+		}
+	}
+}

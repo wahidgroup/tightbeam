@@ -3,13 +3,16 @@
 //! Implements the client side of the TightBeam handshake protocol using
 //! CMS builders and processors.
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use core::future::Future;
 use core::pin::Pin;
 
+use crate::cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
-use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerInfo};
-use crate::cms::{cert::IssuerAndSerialNumber, signed_data::SignerIdentifier};
+use crate::cms::signed_data::{CertificateSet, EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
@@ -28,7 +31,7 @@ use crate::random::{generate_nonce, CryptoRngCore, OsRng, RngWrapper};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::SecurityOffer;
+use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
@@ -52,7 +55,8 @@ where
 	state: ClientStateMachine,
 	client_key_provider: Arc<dyn SigningKeyProvider>,
 	client_certificate: Option<Arc<Certificate>>,
-	server_cert: Arc<Certificate>,
+	server_cert: Option<Arc<Certificate>>,
+	server_chain: Option<Arc<[Certificate]>>,
 	transcript_hash: Option<[u8; 32]>,
 	transcript_buffer: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
@@ -87,11 +91,34 @@ where
 	/// If you need to provide an external transcript hash (for testing),
 	/// use `with_transcript_hash()` after construction.
 	pub fn new(provider: P, client_key_provider: Arc<dyn SigningKeyProvider>, server_cert: Arc<Certificate>) -> Self {
+		Self::with_identity(provider, client_key_provider, Some(server_cert), None)
+	}
+
+	/// Create a new CMS handshake client from a server certificate chain.
+	///
+	/// The chain leaf is the encryption target, borrowed in place: no
+	/// separate leaf certificate is cloned out of the chain. Path validation
+	/// runs over the whole chain during key exchange.
+	pub fn from_chain(
+		provider: P,
+		client_key_provider: Arc<dyn SigningKeyProvider>,
+		chain: Arc<[Certificate]>,
+	) -> Self {
+		Self::with_identity(provider, client_key_provider, None, Some(chain))
+	}
+
+	fn with_identity(
+		provider: P,
+		client_key_provider: Arc<dyn SigningKeyProvider>,
+		server_cert: Option<Arc<Certificate>>,
+		server_chain: Option<Arc<[Certificate]>>,
+	) -> Self {
 		Self {
 			state: ClientStateMachine::default(),
 			client_key_provider,
 			client_certificate: None,
 			server_cert,
+			server_chain,
 			transcript_hash: None,
 			transcript_buffer: Vec::new(),
 			session_key: None,
@@ -119,9 +146,22 @@ where
 		self
 	}
 
+	/// Provision the server certificate chain, ordered root to leaf.
+	///
+	/// When set, server authentication validates the full chain against the
+	/// trust store (RFC 5280 §6.1) instead of evaluating the bare certificate.
+	#[must_use]
+	pub fn with_server_certificate_chain(mut self, chain: Arc<[Certificate]>) -> Self {
+		self.server_chain = Some(chain);
+		self
+	}
+
 	/// Set client certificate for mutual authentication.
-	pub fn with_client_certificate(mut self, certificate: impl Into<Certificate>) -> Self {
-		self.client_certificate = Some(Arc::new(certificate.into()));
+	///
+	/// The certificate is embedded in the client Finished message so the
+	/// server can authenticate the client from the wire.
+	pub fn with_client_certificate(mut self, certificate: impl Into<Arc<Certificate>>) -> Self {
+		self.client_certificate = Some(certificate.into());
 		self
 	}
 
@@ -147,15 +187,44 @@ where
 		validate_state(self.state.state(), expected)
 	}
 
+	/// The server certificate the session key is encrypted to: the pinned
+	/// certificate when set, otherwise the provisioned chain's leaf.
+	fn server_leaf(&self) -> Result<&Certificate, HandshakeError> {
+		if let Some(cert) = &self.server_cert {
+			return Ok(cert);
+		}
+
+		self.server_chain
+			.as_ref()
+			.and_then(|chain| chain.last())
+			.ok_or(HandshakeError::MissingServerCertificate)
+	}
+
 	/// Validate state and server certificate for key exchange.
+	///
+	/// Fail-closed (CWE-295): a configured trust store is mandatory. Expiry
+	/// alone authenticates nobody, so a missing store aborts the handshake
+	/// instead of silently degrading.
+	///
+	/// With a provisioned chain, the full path is validated (RFC 5280 §6.1)
+	/// and the leaf must be the configured server certificate; otherwise the
+	/// bare certificate is evaluated against the store directly.
 	fn validate_state_and_certificate(&self) -> Result<(), HandshakeError> {
 		self.validate_expected_state(ClientHandshakeState::Init)?;
 
-		// Validate server certificate using trust store or default expiry check
-		if let Some(store) = &self.trust_store {
-			store.evaluate(&self.server_cert)?;
-		} else {
-			validate_certificate_expiry(&self.server_cert)?;
+		let store = self.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
+		validate_certificate_expiry(self.server_leaf()?)?;
+
+		match (&self.server_chain, &self.server_cert) {
+			(Some(chain), pinned) => {
+				store.verify_chain(chain)?;
+				let leaf = chain.last().ok_or(HandshakeError::MissingServerCertificate)?;
+				if pinned.as_ref().is_some_and(|cert| *leaf != **cert) {
+					return Err(HandshakeError::PinnedCertificateMismatch);
+				}
+			}
+			(None, Some(cert)) => store.evaluate(cert)?,
+			(None, None) => return Err(HandshakeError::MissingServerCertificate),
 		}
 
 		Ok(())
@@ -164,7 +233,7 @@ where
 	/// Extract the server's public key from certificate.
 	fn extract_server_public_key(&self) -> Result<PublicKey<P::Curve>, HandshakeError> {
 		Ok(PublicKey::<P::Curve>::from_sec1_bytes(
-			self.server_cert
+			self.server_leaf()?
 				.tbs_certificate
 				.subject_public_key_info
 				.subject_public_key
@@ -186,12 +255,14 @@ where
 	}
 
 	/// Build the recipient identifier from server certificate.
-	fn build_recipient_identifier(&self) -> KeyAgreeRecipientIdentifier {
+	fn build_recipient_identifier(&self) -> Result<KeyAgreeRecipientIdentifier, HandshakeError> {
+		let leaf = self.server_leaf()?;
+
 		// Cloning here is cheaper than Arc
-		KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
-			issuer: self.server_cert.tbs_certificate.issuer.clone(),
-			serial_number: self.server_cert.tbs_certificate.serial_number.clone(),
-		})
+		Ok(KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
+			issuer: leaf.tbs_certificate.issuer.clone(),
+			serial_number: leaf.tbs_certificate.serial_number.clone(),
+		}))
 	}
 
 	/// Extract the server's verifying key from a certificate or similar.
@@ -210,7 +281,7 @@ where
 	/// Compute transcript hash from the accumulated buffer.
 	///
 	/// Uses the provider's digest algorithm for consistency with signatures.
-	fn compute_transcript_hash(&self) -> [u8; 32] {
+	fn compute_transcript_hash(&self) -> Result<[u8; 32], HandshakeError> {
 		compute_transcript_digest::<P::Digest>(&self.transcript_buffer)
 	}
 
@@ -267,7 +338,7 @@ where
 
 		// 4. Create UKM and recipient identifier
 		let ukm = self.create_user_keying_material(rng)?;
-		let rid = self.build_recipient_identifier();
+		let rid = self.build_recipient_identifier()?;
 
 		// 5. Build KARI structure
 		let kari_builder = self.build_kari_structure(sender_ephemeral, sender_pub_spki, server_public_key, rid, ukm)?;
@@ -292,27 +363,67 @@ where
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
-		// 2. Compute transcript hash BEFORE adding server_finished (to match server's hash)
+		// 2. Extract the server's SecurityAccept before hashing: the accept
+		//    bytes are part of the signed transcript, so the hash must cover
+		//    them to match the server's (CWE-345). A tampered attribute
+		//    diverges the hashes and fails signature verification below.
+		let accept = extract_security_accept_attr(signed_data_der)?;
 		if self.transcript_hash.is_none() {
-			self.transcript_hash = Some(self.compute_transcript_hash());
+			if let Some(ref accept) = accept {
+				let accept_bytes = crate::transport::handshake::attributes::security_accept_transcript_bytes(accept)?;
+				self.transcript_buffer.extend_from_slice(&accept_bytes);
+			}
+			self.transcript_hash = Some(self.compute_transcript_hash()?);
 		}
 
 		// 3. Extract cryptographic material
-		let server_verifying_key = self.extract_server_verifying_key(&self.server_cert)?;
+		let server_verifying_key = self.extract_server_verifying_key(self.server_leaf()?)?;
 		let expected_signer_identifier = self.compute_signer_identifier(&server_verifying_key)?;
 
 		// 4. Verify signature and content
 		let verified_content =
 			self.verify_signature(signed_data_der, server_verifying_key, expected_signer_identifier)?;
 
-		// 5. Add server finished to transcript AFTER verification
+		// 5. Validate the selection against our own offer and store it
+		self.apply_security_accept(accept)?;
+
+		// 6. Add server finished to transcript AFTER verification
 		self.transcript_buffer.extend_from_slice(signed_data_der);
 
-		// 6. Transition state & lock transcript (transcript hash verified)
+		// 7. Transition state & lock transcript (transcript hash verified)
 		self.state.transition(ClientHandshakeState::ServerFinishedReceived)?;
 		self.invariants.lock_transcript()?;
 
 		Ok(verified_content)
+	}
+
+	/// Validate the server's `SecurityAccept` selection and store the profile.
+	///
+	/// # Validation
+	/// - Offer sent: accepted profile must be a member of the offer
+	/// - No offer (dealer's choice): any accepted profile is stored
+	/// - No attribute present: selection stays `None` (trait-level `complete()`
+	///   then fails closed rather than proceeding with an unknown profile)
+	fn apply_security_accept(&mut self, accept: Option<SecurityAccept>) -> Result<(), HandshakeError> {
+		match (accept, &self.security_offer) {
+			(Some(accept), Some(offer)) => {
+				if !offer.profiles.contains(&accept.profile) {
+					return Err(HandshakeError::InvalidProfileSelection);
+				}
+				self.selected_profile = Some(accept.profile);
+			}
+			(Some(accept), None) => {
+				// Dealer's choice: accept the server's selection
+				self.selected_profile = Some(accept.profile);
+			}
+			(None, Some(_)) => {
+				// We offered profiles but the server did not answer
+				return Err(HandshakeError::InvalidProfileSelection);
+			}
+			(None, None) => {}
+		}
+
+		Ok(())
 	}
 
 	/// Build client Finished message (SignedData over transcript hash).
@@ -476,7 +587,7 @@ where
 
 	/// Sign the finished digest using the client key provider.
 	async fn sign_finished_digest(&self, digest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
-		let signature_bytes = self.client_key_provider.sign(digest).await?;
+		let signature_bytes = self.client_key_provider.sign_prehash(digest).await?;
 		Ok(signature_bytes)
 	}
 
@@ -495,6 +606,9 @@ where
 	}
 
 	/// Build the complete SignedData structure.
+	///
+	/// A configured client certificate is embedded in the `certificates`
+	/// field so the server can authenticate the client from the wire.
 	fn build_signed_data(
 		&self,
 		transcript_hash: [u8; 32],
@@ -519,11 +633,20 @@ where
 		let encap_content_info =
 			EncapsulatedContentInfo { econtent_type: crate::oids::DATA, econtent: Some(econtent_any) };
 
+		let certificates = self
+			.client_certificate
+			.as_ref()
+			.map(|cert| {
+				let choice = CertificateChoices::Certificate(cert.as_ref().clone());
+				Ok::<_, HandshakeError>(CertificateSet(vec![choice].try_into()?))
+			})
+			.transpose()?;
+
 		let signed_data = SignedData {
 			version: CmsVersion::V1,
 			digest_algorithms: vec![digest_alg].try_into()?,
 			encap_content_info,
-			certificates: None,
+			certificates,
 			crls: None,
 			signer_infos: vec![signer_info].try_into()?,
 		};
@@ -537,6 +660,24 @@ where
 		self.invariants.mark_finished_sent()?;
 		Ok(())
 	}
+}
+
+/// Extract the server's `SecurityAccept` from a Finished message's unsigned
+/// attributes, if present.
+fn extract_security_accept_attr(signed_data_der: &[u8]) -> Result<Option<SecurityAccept>, HandshakeError> {
+	let signed_data = SignedData::from_der(signed_data_der)?;
+	signed_data
+		.signer_infos
+		.0
+		.iter()
+		.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref())
+		.flat_map(|attrs| attrs.iter())
+		.find(|attr| attr.oid == crate::oids::HANDSHAKE_SECURITY_ACCEPT)
+		.map(|attr| {
+			let handshake_attr = crate::transport::handshake::attributes::HandshakeAttribute::from(attr);
+			crate::transport::handshake::attributes::extract_security_accept(&handshake_attr)
+		})
+		.transpose()
 }
 
 // ============================================================================
@@ -573,7 +714,12 @@ where
 	type Error = HandshakeError;
 
 	fn start<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>> {
-		Box::pin(async move { self.build_key_exchange(vec![0u8; 32], None) })
+		Box::pin(async move {
+			// Fresh random session key per handshake: a constant key
+			// would make every session trivially decryptable (CWE-321).
+			let session_key = crate::zeroize::Zeroizing::new(generate_nonce::<32>(None)?);
+			self.build_key_exchange(session_key.to_vec(), None)
+		})
 	}
 
 	fn handle_response<'a, 'b>(
@@ -638,6 +784,7 @@ mod tests {
 	use crate::oids::{HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 	use crate::spki::AlgorithmIdentifierOwned;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
+	use crate::transport::handshake::error::HandshakeError;
 	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	use crate::transport::handshake::state::ClientHandshakeState;
 	use crate::transport::handshake::tests::*;
@@ -647,8 +794,9 @@ mod tests {
 		// Given: A CMS client in init state with a server certificate
 		let transcript_hash = [1u8; 32];
 		let server_test_cert = create_test_certificate();
+		let server_cert = server_test_cert.certificate.clone();
 		let mut client = TestCmsClientBuilder::new()
-			.with_server_cert(server_test_cert.certificate.clone())
+			.with_server_cert(server_cert)
 			.with_transcript_hash(transcript_hash)
 			.build()?;
 		assert_eq!(client.state(), ClientHandshakeState::Init);
@@ -667,7 +815,8 @@ mod tests {
 		let kari_processor = TightBeamKariRecipient::new(provider, server_secret);
 		let processor = TightBeamEnvelopedDataProcessor::<DefaultCryptoProvider>::new(kari_processor);
 		let decrypted = processor.process(&enveloped_data)?;
-		assert_eq!(decrypted, session_key);
+		let decrypted = crate::crypto::secret::ToInsecure::to_insecure(decrypted)?;
+		assert_eq!(&decrypted[..], &session_key[..]);
 
 		// When: Client processes server Finished
 		let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
@@ -696,6 +845,114 @@ mod tests {
 		Ok(())
 	}
 
+	/// A client without a trust store must abort instead of degrading to
+	/// expiry-only server authentication (CWE-295).
+	#[test]
+	fn test_missing_trust_store_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+		let server_cert = create_test_certificate().certificate;
+		let test_cert = create_test_certificate();
+		let server_cert = std::sync::Arc::new(server_cert);
+		let provider = into_provider(test_cert.signing_key);
+		let mut client = super::CmsHandshakeClient::<DefaultCryptoProvider>::new(
+			DefaultCryptoProvider::default(),
+			provider,
+			server_cert,
+		);
+
+		let result = client.build_key_exchange(vec![2u8; 32], None);
+		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
+		Ok(())
+	}
+
+	fn chain_client(
+		chain: std::sync::Arc<[crate::x509::Certificate]>,
+		store_root: Option<crate::x509::Certificate>,
+	) -> Result<super::CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn std::error::Error>> {
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+
+		let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
+		if let Some(root) = store_root {
+			builder = builder.with_certificate(root)?;
+		}
+
+		let store: std::sync::Arc<dyn CertificateTrust> = std::sync::Arc::new(builder.build());
+		let client = super::CmsHandshakeClient::<DefaultCryptoProvider>::from_chain(
+			DefaultCryptoProvider::default(),
+			into_provider(create_test_certificate().signing_key),
+			chain,
+		)
+		.with_trust_store(store);
+
+		Ok(client)
+	}
+
+	/// A chain-provisioned client path-validates the chain and encrypts to
+	/// its leaf; no separate pinned certificate is needed.
+	#[test]
+	fn from_chain_validates_and_targets_leaf() -> Result<(), Box<dyn std::error::Error>> {
+		let chain = crate::testing::utils::create_test_certificate_chain()?;
+		let mut client = chain_client(
+			std::sync::Arc::from(vec![chain.root.clone(), chain.intermediate, chain.leaf.clone()]),
+			Some(chain.root),
+		)?;
+
+		client.build_key_exchange(vec![2u8; 32], None)?;
+		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
+		assert_eq!(client.server_leaf()?, &chain.leaf);
+		Ok(())
+	}
+
+	#[test]
+	fn from_chain_rejects_untrusted_chain() -> Result<(), Box<dyn std::error::Error>> {
+		let chain = crate::testing::utils::create_test_certificate_chain()?;
+		let mut client = chain_client(std::sync::Arc::from(vec![chain.root, chain.intermediate, chain.leaf]), None)?;
+
+		let result = client.build_key_exchange(vec![2u8; 32], None);
+		assert!(matches!(result, Err(HandshakeError::CertificateValidationError(_))));
+		Ok(())
+	}
+
+	/// A pinned server certificate that differs from the provisioned chain
+	/// leaf is a configuration mismatch, distinct from a re-handshake
+	/// identity violation.
+	#[test]
+	fn pinned_certificate_mismatch_rejected() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+
+		let chain = crate::testing::utils::create_test_certificate_chain()?;
+		let store: std::sync::Arc<dyn CertificateTrust> = std::sync::Arc::new(
+			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+				.with_certificate(chain.root.clone())?
+				.build(),
+		);
+		let pinned = std::sync::Arc::new(create_test_certificate().certificate);
+		let mut client = super::CmsHandshakeClient::<DefaultCryptoProvider>::new(
+			DefaultCryptoProvider::default(),
+			into_provider(create_test_certificate().signing_key),
+			pinned,
+		)
+		.with_server_certificate_chain(std::sync::Arc::from(vec![chain.root, chain.intermediate, chain.leaf]))
+		.with_trust_store(store);
+
+		let result = client.build_key_exchange(vec![2u8; 32], None);
+		assert!(matches!(result, Err(HandshakeError::PinnedCertificateMismatch)));
+		Ok(())
+	}
+
+	#[test]
+	fn from_chain_rejects_empty_chain() -> Result<(), Box<dyn std::error::Error>> {
+		let chain = crate::testing::utils::create_test_certificate_chain()?;
+		let mut client = chain_client(std::sync::Arc::from(Vec::new()), Some(chain.root))?;
+
+		let result = client.build_key_exchange(vec![2u8; 32], None);
+		assert!(matches!(result, Err(HandshakeError::MissingServerCertificate)));
+		Ok(())
+	}
+
 	#[tokio::test]
 	async fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
 		// Given: A CMS client in init state
@@ -708,6 +965,56 @@ mod tests {
 		// When: Trying to build client finished before processing server finished
 		let result = client.build_client_finished().await;
 		assert!(result.is_err());
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_process_security_accept_rejects_unoffered_profile() -> Result<(), Box<dyn std::error::Error>> {
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+		use crate::oids::{HANDSHAKE_SECURITY_ACCEPT, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+		use crate::transport::handshake::attributes::encode_security_accept;
+		use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
+		use crate::x509::attr::{Attribute, Attributes};
+
+		let offered = create_default_test_profile();
+		let mut unoffered = create_default_test_profile();
+		unoffered.aead_key_size = Some(16);
+
+		let build_finished_with_accept = |profile| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+			let signing_key = Secp256k1SigningKey::random(&mut crate::random::OsRng);
+			let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+			let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
+			let builder =
+				TightBeamSignedDataBuilder::<DefaultCryptoProvider, _>::new(&signing_key, digest_alg, signature_alg)?;
+			let mut signed_data = builder.build(&[7u8; 32])?;
+
+			let accept_attr = encode_security_accept(&SecurityAccept::new(profile))?;
+			let x509_attr = Attribute {
+				oid: HANDSHAKE_SECURITY_ACCEPT,
+				values: crate::der::asn1::SetOfVec::try_from(accept_attr.attr_values)?,
+			};
+
+			let attrs = Attributes::try_from(vec![x509_attr])?;
+			let mut signer_infos: Vec<_> = signed_data.signer_infos.0.iter().cloned().collect();
+
+			signer_infos[0].unsigned_attrs = Some(attrs);
+			signed_data.signer_infos = signer_infos.try_into()?;
+
+			Ok(signed_data.to_der()?)
+		};
+
+		let offer = SecurityOffer::new(vec![offered]);
+		let mut client = TestCmsClientBuilder::new().build()?.with_security_offer(offer);
+
+		let accepted = build_finished_with_accept(offered)?;
+		client.apply_security_accept(super::extract_security_accept_attr(&accepted)?)?;
+		assert_eq!(client.selected_profile, Some(offered));
+
+		let rejected = build_finished_with_accept(unoffered)?;
+		let attrs = super::extract_security_accept_attr(&rejected)?;
+		let result = client.apply_security_accept(attrs);
+		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 
 		Ok(())
 	}

@@ -10,22 +10,29 @@ extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::crypto::secret::Secret;
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::transport::handshake::error::HandshakeError;
-use crate::x509::Certificate;
 
 #[cfg(feature = "transport-ecies")]
 use crate::asn1::OctetString;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::x509::Certificate;
 
 /// Generate a random 32-byte CEK for AES-256-GCM.
 ///
 /// Returns the CEK wrapped in `Secret<[u8; 32]>` for automatic zeroization.
 pub fn generate_cek() -> Result<Secret<[u8; 32]>, HandshakeError> {
 	use rand_core::RngCore;
+
 	let mut cek = [0u8; 32];
-	rand_core::OsRng.fill_bytes(&mut cek);
+	rand_core::OsRng
+		.try_fill_bytes(&mut cek)
+		.map_err(|_| HandshakeError::RandomGenerationFailed)?;
+
 	Ok(Secret::from(Box::new(cek)))
 }
 
@@ -51,7 +58,9 @@ pub fn aes_gcm_encrypt(key: &[u8], plaintext: &[u8], aad: Option<&[u8]>) -> Resu
 
 	// Generate random 12-byte nonce
 	let mut nonce_bytes = [0u8; 12];
-	rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+	rand_core::OsRng
+		.try_fill_bytes(&mut nonce_bytes)
+		.map_err(|_| HandshakeError::RandomGenerationFailed)?;
 	let nonce = Nonce::from_slice(&nonce_bytes);
 
 	// Encrypt
@@ -82,16 +91,12 @@ pub fn aes_gcm_decrypt(key: &[u8], ciphertext: &[u8], aad: Option<&[u8]>) -> Res
 		return Err(HandshakeError::InvalidKeySize { expected: 32, received: key.len() });
 	}
 
+	// Need at least nonce (12) + tag (16)
 	if ciphertext.len() < 12 + 16 {
-		// Need at least nonce (12) + tag (16)
-		return Err(HandshakeError::InvalidKeySize {
-			expected: 28, // minimum size
-			received: ciphertext.len(),
-		});
+		return Err(HandshakeError::CiphertextTooShort { minimum: 28, received: ciphertext.len() });
 	}
 
 	let cipher = Aes256Gcm::new_from_slice(key)?;
-
 	// Extract nonce and ciphertext
 	let nonce = Nonce::from_slice(&ciphertext[..12]);
 	let ct = &ciphertext[12..];
@@ -125,6 +130,7 @@ pub fn aes_256_gcm_algorithm() -> AlgorithmIdentifierOwned {
 /// # Returns
 /// - `Ok(())` if states match
 /// - `Err(HandshakeError::InvalidState)` if states don't match
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 #[inline]
 pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), HandshakeError> {
 	if current != expected {
@@ -151,6 +157,7 @@ pub fn validate_state<S: PartialEq>(current: S, expected: S) -> Result<(), Hands
 ///
 /// # Errors
 /// - `HandshakeError`: If key extraction or parsing fails
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub fn extract_verifying_key_from_cert<C>(cert: &Certificate) -> Result<PublicKey<C>, HandshakeError>
 where
 	C: Curve + CurveArithmetic,
@@ -197,19 +204,51 @@ pub fn octet_string_to_32_byte_array(octet_string: &OctetString) -> Result<[u8; 
 /// - `data`: The data to hash
 ///
 /// # Returns
-/// 32-byte digest array
+/// 32-byte digest array. Wider digests (e.g. SHA3-512) are truncated to their
+/// leading 32 bytes (SHA-512/256 style; retains 256-bit collision resistance).
 ///
-/// # Note
-/// This function assumes the digest algorithm produces at least 32 bytes.
-/// It will truncate to 32 bytes if the digest is longer.
-pub fn compute_transcript_digest<D>(data: &[u8]) -> [u8; 32]
+/// # Errors
+/// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub fn compute_transcript_digest<D>(data: &[u8]) -> Result<[u8; 32], HandshakeError>
 where
 	D: crate::crypto::hash::Digest,
 {
-	let digest_arr = D::digest(data);
-	let mut digest = [0u8; 32];
-	digest.copy_from_slice(&digest_arr[..32]);
-	digest
+	crate::transport::handshake::primitives::transcript::digest_output_to_array(&D::digest(data))
+}
+
+/// Compute the ECIES client mutual-auth digest.
+///
+/// Binds the transcript hash, the ECIES-encrypted key exchange payload, and
+/// the client certificate into a single digest that the client signs. This
+/// prevents splicing a valid client signature onto a different key exchange
+/// or a different identity (CWE-347).
+///
+/// # Type Parameters
+/// - `D`: The digest algorithm (e.g., `Sha3_256`)
+///
+/// # Parameters
+/// - `transcript_hash`: The 32-byte handshake transcript hash
+/// - `encrypted_data`: The ECIES-encrypted key exchange bytes
+/// - `client_cert_der`: DER encoding of the client certificate
+///
+/// # Errors
+/// - `TranscriptDigestLength`: `D` produces fewer than 32 bytes
+#[cfg(feature = "transport-ecies")]
+pub fn compute_client_auth_digest<D>(
+	transcript_hash: &[u8; 32],
+	encrypted_data: &[u8],
+	client_cert_der: &[u8],
+) -> Result<[u8; 32], HandshakeError>
+where
+	D: crate::crypto::hash::Digest,
+{
+	let mut data = Vec::with_capacity(32 + encrypted_data.len() + client_cert_der.len());
+	data.extend_from_slice(transcript_hash);
+	data.extend_from_slice(encrypted_data);
+	data.extend_from_slice(client_cert_der);
+
+	compute_transcript_digest::<D>(&data)
 }
 
 /// Clear sensitive session data by zeroizing and dropping.
@@ -223,23 +262,20 @@ where
 /// - `server_random`: Optional server random to clear
 ///
 /// # Security
-/// This function ensures sensitive data is overwritten before deallocation,
-/// preventing potential memory scraping attacks.
+/// Zeroizes each array in place (the `Option<Z>` impl clears the payload
+/// before setting `None`), so the original stack slots are overwritten
+/// rather than a moved copy (CWE-226).
 #[cfg(feature = "transport-ecies")]
 pub fn clear_session_randoms(
 	base_session_key: &mut Option<[u8; 32]>,
 	client_random: &mut Option<[u8; 32]>,
 	server_random: &mut Option<[u8; 32]>,
 ) {
-	if let Some(mut bk) = base_session_key.take() {
-		bk.fill(0);
-	}
-	if let Some(mut cr) = client_random.take() {
-		cr.fill(0);
-	}
-	if let Some(mut sr) = server_random.take() {
-		sr.fill(0);
-	}
+	use crate::zeroize::Zeroize;
+
+	base_session_key.zeroize();
+	client_random.zeroize();
+	server_random.zeroize();
 }
 
 #[cfg(test)]
@@ -280,6 +316,20 @@ mod tests {
 		let ciphertext = aes_gcm_encrypt(&key, plaintext, aad)?;
 		let result = aes_gcm_decrypt(&key, &ciphertext, wrong_aad);
 		assert!(result.is_err());
+		Ok(())
+	}
+
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+	#[test]
+	fn test_compute_transcript_digest_widths() -> Result<(), HandshakeError> {
+		use crate::crypto::hash::{Digest, Sha3_256, Sha3_512};
+
+		let digest = compute_transcript_digest::<Sha3_256>(b"transcript")?;
+		assert_eq!(digest.len(), 32);
+
+		// Wider digests truncate to their leading 32 bytes (SHA-512/256 style).
+		let wide = compute_transcript_digest::<Sha3_512>(b"transcript")?;
+		assert_eq!(wide.as_slice(), &Sha3_512::digest(b"transcript")[..32]);
 		Ok(())
 	}
 

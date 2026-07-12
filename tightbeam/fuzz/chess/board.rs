@@ -185,7 +185,7 @@ servlet! {
 	/// Chess engine servlet for processing chess moves
 	pub ChessEngineServlet<ChessMoveRequest, EnvConfig = ChessEngineServletConf>,
 	protocol: TokioListener,
-	handle: |message, ctx| async move {
+	handle: raw |message, ctx| async move {
 		let trace = ctx.trace();
 		let config: &ChessEngineServletConf = ctx.env_config()?;
 		let message_id = message.metadata.id.clone();

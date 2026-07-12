@@ -10,6 +10,9 @@ use crate::policy::{GatePolicy, ReceptorPolicy};
 use crate::transport::error::TransportFailure;
 use crate::{Frame, Message};
 
+#[cfg(feature = "std")]
+use crate::utils::jitter::decorrelated_bounds;
+
 /// Trait for transports that support policy configuration
 ///
 /// Default implementations are no-ops that return `self` unchanged.
@@ -113,8 +116,7 @@ impl JitterStrategy for DecorrelatedJitter {
 			// Use base_delay as fallback to ensure non-zero range
 			.unwrap_or(base_delay);
 
-		let min = base_delay / 3;
-		let range = base_delay.saturating_sub(min);
+		let (min, range) = decorrelated_bounds(base_delay);
 		if range == 0 {
 			return base_delay;
 		}

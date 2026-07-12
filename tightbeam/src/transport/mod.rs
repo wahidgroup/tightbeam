@@ -1,5 +1,16 @@
 //! Transport layer for TightBeam protocol
 
+// Cargo features cannot express "at least one of"; a protocol-less TCP
+// transport has no handshake and cannot collect messages, so fail the build
+// early with a clear message instead of a missing-method error.
+#[cfg(all(
+	any(feature = "tcp", feature = "async-transport"),
+	not(any(feature = "transport-cms", feature = "transport-ecies"))
+))]
+compile_error!(
+	"the `tcp` and `async-transport` features require a handshake protocol: enable `transport-ecies` and/or `transport-cms`"
+);
+
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
@@ -23,7 +34,11 @@ pub mod messaging;
 pub mod protocols;
 pub mod state;
 
+/// UNSTABLE: trait surface only, no implementation yet. Opt-in via the
+/// `transport-multiplex` feature; the API may change or be removed without a
+/// major version bump.
 #[cfg(feature = "transport-multiplex")]
+#[doc(hidden)]
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
@@ -85,9 +100,10 @@ pub struct TransportEncryptionConfig<P: CryptoProvider> {
 #[cfg(feature = "x509")]
 impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	pub fn new(certificate: Certificate, key_manager: HandshakeKeyManager<P>) -> Self {
+		let key_manager = Arc::new(key_manager);
 		Self {
 			certificate,
-			key_manager: Arc::new(key_manager),
+			key_manager,
 			client_validators: None,
 			aad_domain_tag: TIGHTBEAM_AAD_DOMAIN_TAG,
 			max_cleartext_envelope: 128 * 1024,
@@ -97,7 +113,8 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 	}
 
 	pub fn with_client_validators(mut self, validators: Vec<Arc<dyn CertificateValidation>>) -> Self {
-		self.client_validators = Some(Arc::new(validators));
+		let validators = Arc::new(validators);
+		self.client_validators = Some(validators);
 		self
 	}
 }
@@ -105,17 +122,16 @@ impl<P: CryptoProvider> TransportEncryptionConfig<P> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::asn1::Frame;
 	use crate::testing::create_v0_tightbeam;
 	use crate::transport::error::TransportFailure;
-	use crate::transport::policy::PolicyConf;
 
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn test_server_and_client_macros() -> TransportResult<()> {
 		use std::sync::{mpsc, Arc};
 
-		use crate::transport::policy::RestartLinearBackoff;
+		use crate::asn1::Frame;
+		use crate::transport::policy::{PolicyConf, RestartLinearBackoff};
 		use crate::transport::tcp::r#async::TokioListener;
 		use crate::transport::tcp::TightBeamSocketAddr;
 

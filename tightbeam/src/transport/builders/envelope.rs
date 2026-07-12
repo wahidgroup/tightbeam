@@ -3,7 +3,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 #[cfg(feature = "std")]
 use std::sync::Arc;
@@ -17,10 +17,9 @@ use crate::transport::{ResponsePackage, TransportEnvelope, TransportResult, Wire
 #[cfg(feature = "x509")]
 use crate::crypto::aead::RuntimeAead;
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum EnvelopePayload {
-	Request { message: Frame },
+	Request { message: Box<Frame> },
 	Response { package: ResponsePackage },
 	Transport { envelope: TransportEnvelope },
 }
@@ -28,7 +27,7 @@ pub(crate) enum EnvelopePayload {
 impl EnvelopePayload {
 	pub(crate) fn materialize(self) -> TransportEnvelope {
 		match self {
-			Self::Request { message } => TransportEnvelope::new_request(message),
+			Self::Request { message } => TransportEnvelope::new_request(*message),
 			Self::Response { package } => TransportEnvelope::from(package),
 			Self::Transport { envelope } => envelope,
 		}
@@ -99,7 +98,7 @@ impl<'a> EnvelopeBuilder<'a> {
 
 	/// Create a builder configured for a request frame.
 	pub fn request(message: Frame) -> Self {
-		Self::new(EnvelopePayload::Request { message })
+		Self::new(EnvelopePayload::Request { message: Box::new(message) })
 	}
 
 	/// Create a builder configured for a response package.
@@ -154,7 +153,8 @@ impl<'a> EnvelopeBuilder<'a> {
 
 		let with_frame = move |failure: TransportFailure| -> TransportError {
 			request_frame
-				.clone() // Arc clone
+				.as_ref()
+				.map(Arc::clone)
 				.map(|arc| {
 					// Non-hot path clone
 					let frame = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());

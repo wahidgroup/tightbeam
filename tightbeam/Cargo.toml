@@ -13,6 +13,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "A secure, high-performance messaging protocol library"
 
+[lints]
+workspace = true
+
 [lib]
 name = "tightbeam"
 
@@ -117,22 +120,47 @@ crypto = ["random", "dep:crypto-common", "zeroize"]
 builder = ["derive", "x509-cert/builder", "crypto"]
 policy = []
 router = []
-transport = ["cms/builder"]
+transport = [
+	"cms/builder",
+	"builder",
+	"transport-policy",
+	"aead",
+	"signature",
+	"kdf",
+	"ecdh",
+]
 doc = []
 compress = ["tightbeam-derive?/compress"]
 transport-policy = ["transport", "policy"]
+# UNSTABLE: trait surface only, no implementation yet; excluded from `full`.
 transport-multiplex = ["transport"]
-tcp = ["transport"]
+# UNSTABLE: PQXDH prekey/kdf-chain/hybrid-KEM primitives.
+unstable-pqxdh = []
+tcp = ["transport", "std"]
 async-transport = ["transport", "std"]
-colony = ["full"]
-testing = ["std"]
+colony = [
+	"std",
+	"tokio",
+	"builder",
+	"policy",
+	"router",
+	"derive",
+	"transport",
+	"transport-ecies",
+	"x509",
+	"signature",
+	"digest",
+	"sha3",
+	"testing",
+]
+testing = ["std", "transport"]
 testing-csp = ["testing"]
 testing-fdr = ["testing", "testing-csp"]
-testing-timing = ["testing", "time", "instrument"]
+testing-timing = ["testing", "testing-csp", "time", "instrument"]
 testing-schedulability = ["testing", "testing-timing"]
 testing-fault = ["testing", "testing-fdr"]
-testing-fmea = ["testing", "testing-fault"]
-testing-fuzz = ["testing", "dep:afl"]
+testing-fmea = ["testing", "testing-fault", "instrument"]
+testing-fuzz = ["testing", "testing-csp", "dep:afl"]
 testing-fuzz-ijon = ["testing-fuzz"]
 instrument = ["std", "sha3", "digest", "derive"]
 logging = []
@@ -153,16 +181,24 @@ aead = [
 	"aead/rand_core",
 	"dep:aes",
 	"dep:aes-kw",
+	"aes-gcm",
 ]
 signature = [
 	"crypto",
+	"digest",
+	"sha3",
+	"secp256k1",
+	"x509",
+	"dep:ecdsa",
+	"ecdsa/verifying",
+	"ecdsa/pem",
 	"tightbeam-derive?/signature",
 	"dep:signature",
 	"cms/signature",
 	"x509-cert/signature",
 ]
-digest = ["crypto", "dep:digest", "tightbeam-derive?/digest"]
-x509 = ["crypto", "dep:x509-cert", "ecdsa/pem"]
+digest = ["crypto", "dep:digest", "tightbeam-derive?/digest", "sha3"]
+x509 = ["crypto", "dep:x509-cert", "ecdsa/pem", "digest"]
 kdf = ["crypto", "random", "zeroize", "digest", "dep:hkdf"]
 ecies = ["crypto", "kdf", "aead", "k256/ecdh", "secp256k1", "sha3"]
 ecdh = ["elliptic-curve/ecdh"]
@@ -172,9 +208,8 @@ kem = ["crypto", "dep:kem"]
 random = ["dep:rand_core"]
 zeroize = ["dep:zeroize", "der/zeroize", "cms/zeroize", "aes-gcm?/zeroize"]
 
-## Cryptographic algorithm features
-aes-gcm = ["crypto", "aead", "dep:aes-gcm", "cms/aes"]
-sha3 = ["crypto", "dep:sha3"]
+aes-gcm = ["crypto", "dep:aes-gcm", "cms/aes"]
+sha3 = ["crypto", "dep:sha3", "dep:digest"]
 secp256k1 = ["crypto", "dep:k256"]
 
 ## Handshake protocol features
@@ -209,7 +244,6 @@ transport-ecies = [
 	"ecdh",
 ]
 
-# Derive macro support
 derive = ["dep:tightbeam-derive"]
 
 # Standard library support
@@ -240,7 +274,7 @@ std = [
 wasm = ["dep:getrandom", "getrandom/js", "time?/wasm-bindgen"]
 
 # NON-RustCrypto features
-time = ["dep:time", "der/time"]
+time = ["dep:time", "time/std", "der/time", "der/std"]
 tokio = ["dep:tokio", "std", "async-transport"]
 futures = ["dep:futures"]
 rayon = ["dep:rayon"]
@@ -274,4 +308,4 @@ required-features = ["std", "testing-fuzz"]
 [[bin]]
 name = "fuzz_chess"
 path = "fuzz/chess/mod.rs"
-required-features = ["std", "testing-fuzz"]
+required-features = ["full", "testing-fuzz"]

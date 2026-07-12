@@ -128,13 +128,52 @@ use std::sync::{Arc, Mutex};
 use crate::testing::error::TestingError;
 use crate::testing::specs::csp::{Event, Process, State};
 
+/// Oracle-guided fuzz execution error
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuzzError {
+	/// No valid events available in a non-terminal state
+	Deadlock { state: State },
+	/// Input bytes ran out before reaching a terminal state
+	InputExhausted { state: State },
+	/// Oracle rejected an event it reported as valid (internal invariant)
+	EventRejected { state: State, event: Event },
+}
+
+impl core::fmt::Display for FuzzError {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		match self {
+			Self::Deadlock { state } => {
+				write!(f, "deadlock: no valid events in non-terminal state {}", state.0)
+			}
+			Self::InputExhausted { state } => {
+				write!(f, "input exhausted before terminal state (stopped in {})", state.0)
+			}
+			Self::EventRejected { state, event } => {
+				write!(f, "oracle rejected valid event {} in state {}", event.0, state.0)
+			}
+		}
+	}
+}
+
+impl core::error::Error for FuzzError {}
+
+impl From<FuzzError> for TestingError {
+	fn from(error: FuzzError) -> Self {
+		match error {
+			FuzzError::Deadlock { state } => TestingError::FuzzDeadlock(state.0),
+			FuzzError::InputExhausted { .. } => TestingError::FuzzInputExhausted,
+			FuzzError::EventRejected { event, .. } => TestingError::FuzzEventRejected(event.0),
+		}
+	}
+}
+
 /// CSP state oracle for AFL-guided fuzzing
 ///
 /// The oracle bridges AFL's byte-level mutation with CSP protocol semantics:
 ///
 /// ## Core Functionality
 /// - **State Machine Tracking**: Maintains current state in CSP process
-/// - **Event Interpretation**: Maps input bytes → valid event choices
+/// - **Event Interpretation**: Maps input bytes -> valid event choices
 /// - **Coverage Metrics**: Tracks visited states/transitions for analysis
 /// - **Crash Triage**: Provides execution context when fuzz targets fail
 ///
@@ -204,6 +243,10 @@ impl CspOracle {
 	///
 	/// Returns only observable events that can be taken from the current state.
 	/// Returns empty if in terminal state.
+	///
+	/// The list is sorted by event label (via `Process::enabled`), so the
+	/// byte -> index mapping in [`Self::fuzz_from_bytes`] is deterministic
+	/// across runs -- the contract AFL replay and corpus minimization rely on.
 	pub fn valid_events(&self) -> Vec<Event> {
 		if self.is_terminal() {
 			return Vec::new();
@@ -221,19 +264,31 @@ impl CspOracle {
 	///
 	/// Returns `true` if transition succeeded, `false` if event not enabled.
 	/// Updates current state and tracking metrics on success.
+	///
+	/// Nondeterministic transitions resolve to the first target. Use
+	/// [`Self::step_with_target`] to select among multiple targets.
 	pub fn step(&mut self, event: &Event) -> bool {
-		let next_states = self.process.step(self.current_state, event);
+		self.step_with_target(event, 0)
+	}
+
+	/// Attempt a transition, resolving nondeterministic targets by choice byte
+	///
+	/// Targets are sorted by state name before indexing (`choice % targets`),
+	/// so the same choice byte selects the same target on every run.
+	pub fn step_with_target(&mut self, event: &Event, choice: u8) -> bool {
+		let mut next_states = self.process.step(self.current_state, event);
 
 		if next_states.is_empty() {
 			return false;
 		}
 
+		next_states.sort_unstable();
+
 		// Record transition
 		self.visited_transitions.insert((self.current_state, *event));
 		self.trace.push(*event);
 
-		// Take first state (deterministic or first choice)
-		self.current_state = next_states[0];
+		self.current_state = next_states[(choice as usize) % next_states.len()];
 		self.visited_states.insert(self.current_state);
 
 		true
@@ -375,9 +430,11 @@ impl CspOracle {
 	/// ## How It Works
 	/// 1. Reset oracle to initial state
 	/// 2. For each input byte:
-	///    - Get valid events at current state
+	///    - Get valid events at current state (sorted for deterministic replay)
 	///    - Use byte value to choose event: `choice = byte % valid_events.len()`
-	///    - Take transition with chosen event
+	///    - When the chosen event has multiple target states, consume one more
+	///      byte to choose the target: `target = byte % targets.len()`
+	///    - Take transition with chosen event and target
 	///    - Update state and coverage tracking
 	///    - Report to IJON (if `testing-fuzz-ijon` feature enabled)
 	/// 3. Return `Ok(())` if terminal state reached, `Err` otherwise
@@ -399,40 +456,55 @@ impl CspOracle {
 	///
 	/// ## Returns
 	/// - `Ok(())`: Execution reached terminal state successfully
-	/// - `Err("deadlock")`: No valid events available (stuck in non-terminal state)
-	/// - `Err("oracle rejected")`: Internal oracle error (should not happen)
-	/// - `Err("input exhausted")`: Ran out of input bytes before terminal state
+	/// - [`FuzzError::Deadlock`]: No valid events available (stuck in non-terminal state)
+	/// - [`FuzzError::EventRejected`]: Internal oracle error (should not happen)
+	/// - [`FuzzError::InputExhausted`]: Ran out of input bytes before terminal state
 	///
 	/// ## Crash Triage
 	/// If this panics, check:
 	/// - `self.current_state()` - where execution stopped
 	/// - `self.trace()` - sequence of events taken
 	/// - `self.visited_states()` - states explored
-	pub fn fuzz_from_bytes(&mut self, input: &[u8]) -> Result<(), &'static str> {
+	pub fn fuzz_from_bytes(&mut self, input: &[u8]) -> Result<(), FuzzError> {
 		self.reset();
-		let mut byte_idx = 0;
 
+		let mut byte_idx = 0;
 		while !self.is_terminal() && byte_idx < input.len() {
 			let valid = self.valid_events();
 			if valid.is_empty() {
-				return Err("deadlock: no valid events");
+				return Err(FuzzError::Deadlock { state: self.current_state });
 			}
 
 			// Use input byte to choose which event to take
 			let choice = (input[byte_idx] as usize) % valid.len();
-			let event = &valid[choice];
-
-			if !self.step(event) {
-				return Err("oracle rejected valid event");
-			}
+			let event = valid[choice];
 
 			byte_idx += 1;
+
+			// Nondeterministic transitions consume one more byte so every
+			// target state stays reachable under AFL mutation.
+			let target_count = self.process.step(self.current_state, &event).len();
+			let target_choice = if target_count > 1 {
+				let Some(byte) = input.get(byte_idx) else {
+					return Err(FuzzError::InputExhausted { state: self.current_state });
+				};
+
+				byte_idx += 1;
+
+				*byte
+			} else {
+				0
+			};
+
+			if !self.step_with_target(&event, target_choice) {
+				return Err(FuzzError::EventRejected { state: self.current_state, event });
+			}
 		}
 
 		if self.is_terminal() {
 			Ok(())
 		} else {
-			Err("input exhausted before terminal state")
+			Err(FuzzError::InputExhausted { state: self.current_state })
 		}
 	}
 }
@@ -499,14 +571,16 @@ impl FuzzContext {
 	/// Run oracle-guided fuzzing from the input buffer
 	///
 	/// Interprets input bytes as choices for which events to take at each state.
-	/// Returns `Ok(())` if execution reaches terminal state.
+	/// Returns `Ok(())` if execution reaches terminal state. Deadlocks, oracle
+	/// rejections, and input exhaustion map to distinct [`TestingError`]
+	/// variants so a real deadlock finding is not reported as exhaustion.
 	pub fn fuzz_from_bytes(&self) -> Result<(), TestingError> {
 		let mut guard = self.inner.lock()?;
 		let input = guard.input.clone();
-		guard
-			.oracle
-			.fuzz_from_bytes(&input)
-			.map_err(|_| TestingError::FuzzInputExhausted)
+
+		guard.oracle.fuzz_from_bytes(&input)?;
+
+		Ok(())
 	}
 
 	/// Get the execution trace of events
@@ -594,6 +668,7 @@ impl FuzzContext {
 		if guard.cursor + 2 > guard.input.len() {
 			return Err(TestingError::FuzzInputExhausted);
 		}
+
 		let bytes = [guard.input[guard.cursor], guard.input[guard.cursor + 1]];
 
 		guard.cursor += 2;
@@ -930,7 +1005,41 @@ mod tests {
 				fn oracle_fuzz_from_bytes_fails_on_insufficient_input() {
 					let mut oracle = super::CspOracle::new(super::build_two_step_process("a", "b"));
 					let input = vec![0];
-					assert_eq!(oracle.fuzz_from_bytes(&input), Err("input exhausted before terminal state"));
+					assert!(matches!(
+						oracle.fuzz_from_bytes(&input),
+						Err(super::FuzzError::InputExhausted { .. })
+					));
+				}
+
+				#[test]
+				fn oracle_deadlock_reported_as_deadlock() {
+					let process = super::Process::builder("TestProc")
+						.initial_state(super::State("S0"))
+						.add_observable("go")
+						.add_transition(super::State("S0"), "go", super::State("Stuck"))
+						.build()
+						.expect("fixture process builder has a valid initial state");
+
+					let mut oracle = super::CspOracle::new(process);
+					assert!(matches!(
+						oracle.fuzz_from_bytes(&[0, 0]),
+						Err(super::FuzzError::Deadlock { state: super::State("Stuck") })
+					));
+				}
+
+				#[test]
+				fn oracle_byte_mapping_deterministic_across_oracles() {
+					let traces: Vec<Vec<super::Event>> = (0..8)
+						.map(|_| {
+							let mut oracle = super::CspOracle::new(super::build_branching_process());
+							oracle.fuzz_from_bytes(&[1]).expect("branching process reaches terminal");
+							oracle.trace().to_vec()
+						})
+						.collect();
+
+					for trace in &traces {
+						assert_eq!(trace, &traces[0]);
+					}
 				}
 
 				#[test]
@@ -951,7 +1060,9 @@ mod tests {
 				fn oracle_track_state_differs_between_states() {
 					let mut oracle = super::CspOracle::new(super::build_simple_process("go"));
 					let hash_s0 = oracle.track_state();
+
 					oracle.step(&super::Event("go"));
+
 					let hash_s1 = oracle.track_state();
 					assert_ne!(hash_s0, hash_s1);
 				}
@@ -1021,7 +1132,6 @@ mod tests {
 					let ctx2 = ctx1.clone();
 
 					let _ = ctx1.fuzz_from_bytes();
-
 					assert_eq!(ctx1.current_state(), ctx2.current_state());
 				}
 			}
@@ -1066,8 +1176,16 @@ mod tests {
 				fn oracle_choice_point_fuzzing() {
 					let proc = super::build_choice_process();
 					let mut oracle = super::CspOracle::new(proc);
-					assert!(oracle.fuzz_from_bytes(&[0]).is_ok());
+					assert!(oracle.fuzz_from_bytes(&[0, 0]).is_ok());
 					assert_eq!(oracle.current_state(), super::State("S1"));
+				}
+
+				#[test]
+				fn oracle_target_byte_reaches_second_nondeterministic_target() {
+					let proc = super::build_choice_process();
+					let mut oracle = super::CspOracle::new(proc);
+					assert!(oracle.fuzz_from_bytes(&[0, 1]).is_ok());
+					assert_eq!(oracle.current_state(), super::State("S2"));
 				}
 
 				#[test]

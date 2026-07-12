@@ -8,10 +8,67 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::der::{Enumerated, Sequence};
+use crate::der::{Choice, Enumerated, Sequence};
 use crate::policy::TransitStatus;
 use crate::utils::BasisPoints;
 use crate::Beamable;
+
+// =============================================================================
+// Cluster Inbound Protocol
+// =============================================================================
+
+/// Work request envelope for cluster routing
+///
+/// Clients send this to the cluster gateway. The cluster routes based on
+/// `servlet_type` and forwards `payload` to the selected hive.
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct ClusterWorkRequest {
+	/// Target servlet type (e.g., b"ping_servlet")
+	pub servlet_type: Vec<u8>,
+	/// Raw message payload (encoded inner message)
+	pub payload: Vec<u8>,
+}
+
+/// Work response from cluster
+#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
+pub struct ClusterWorkResponse {
+	/// Status of the routing/execution
+	pub status: TransitStatus,
+	/// Response payload from servlet (if successful)
+	pub payload: Option<Vec<u8>>,
+}
+
+impl ClusterWorkResponse {
+	/// Create a successful response with payload
+	#[inline]
+	pub fn ok(payload: Vec<u8>) -> Self {
+		Self { status: TransitStatus::Accepted, payload: Some(payload) }
+	}
+
+	/// Create an error response with status
+	#[inline]
+	pub fn err(status: TransitStatus) -> Self {
+		Self { status, payload: None }
+	}
+}
+
+/// Inbound message envelope for the cluster gateway - ASN.1 CHOICE.
+///
+/// Every frame sent to a cluster carries exactly one of these variants.
+/// The context-specific tag discriminates the type on the wire, so the
+/// gateway decodes once and matches.
+#[derive(Debug, Beamable, Choice, Clone, PartialEq)]
+pub enum ClusterRequest {
+	/// Hive announcing its servlets [context 0]
+	#[asn1(context_specific = "0", constructed = "true")]
+	RegisterHive(RegisterHiveRequest),
+	/// Hive scaling notification [context 1]
+	#[asn1(context_specific = "1", constructed = "true")]
+	ServletAddressUpdate(ServletAddressUpdate),
+	/// Client work submission [context 2]
+	#[asn1(context_specific = "2", constructed = "true")]
+	Work(ClusterWorkRequest),
+}
 
 // =============================================================================
 // Hive Registration Messages
@@ -23,6 +80,9 @@ use crate::Beamable;
 /// its availability and capabilities, including actual servlet addresses.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct RegisterHiveRequest {
+	/// Issue time in unix milliseconds. Binds the signed frame to a
+	/// freshness window so captured registrations cannot be replayed (CWE-294)
+	pub issued_at_ms: u64,
 	/// The address where this hive can be reached (for heartbeats)
 	pub hive_addr: Vec<u8>,
 	/// Servlet type-to-address mappings for direct routing
@@ -46,11 +106,14 @@ pub struct RegisterHiveResponse {
 /// Enables push-based cluster registry updates.
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ServletAddressUpdate {
+	/// Issue time in unix milliseconds. Binds the signed frame to a
+	/// freshness window so captured updates cannot be replayed (CWE-294)
+	pub issued_at_ms: u64,
 	/// Hive identifier (matches hive_addr from registration)
 	pub hive_id: Vec<u8>,
 	/// Newly spawned servlet addresses
 	pub added: Vec<ServletInfo>,
-	/// Removed servlet IDs (servlet_id field from ServletInfo)
+	/// Removed servlet network addresses.
 	pub removed: Vec<Vec<u8>>,
 }
 
@@ -282,10 +345,15 @@ pub enum ClusterStatus {
 ///
 /// **Security**: Requires nonrepudiation signature and frame integrity.
 /// Frames without proper authentication will be rejected and may trigger
-/// the circuit breaker.
+/// the circuit breaker. `issued_at_ms` binds the signature to a point in
+/// time: hives reject commands outside their freshness window and replays
+/// of already-seen signatures within it (CWE-294).
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 #[beam(frame_integrity)]
 pub struct ClusterCommand {
+	/// Issue time in milliseconds since UNIX epoch (freshness binding)
+	pub issued_at_ms: u64,
+
 	/// Heartbeat request [context 0]
 	#[asn1(context_specific = "0", optional = "true")]
 	pub heartbeat: Option<HeartbeatParams>,
@@ -349,5 +417,55 @@ impl ClusterCommandResponse {
 	#[inline]
 	pub fn manage(response: HiveManagementResponse) -> Self {
 		Self { heartbeat: None, manage: Some(response) }
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::error::Result;
+
+	fn round_trip(original: ClusterRequest) -> Result<()> {
+		let encoded = crate::encode(&original)?;
+		let decoded: ClusterRequest = crate::decode(&encoded)?;
+		assert_eq!(original, decoded);
+		Ok(())
+	}
+
+	#[test]
+	fn cluster_request_register_hive_round_trips() -> Result<()> {
+		round_trip(ClusterRequest::RegisterHive(RegisterHiveRequest {
+			issued_at_ms: 1_000,
+			hive_addr: b"127.0.0.1:9000".to_vec(),
+			servlet_addresses: vec![ServletInfo { servlet_id: b"ping".to_vec(), address: b"127.0.0.1:9001".to_vec() }],
+			metadata: None,
+		}))
+	}
+
+	#[test]
+	fn cluster_request_servlet_address_update_round_trips() -> Result<()> {
+		round_trip(ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
+			issued_at_ms: 1_000,
+			hive_id: b"127.0.0.1:9000".to_vec(),
+			added: vec![],
+			removed: vec![b"127.0.0.1:9100".to_vec()],
+		}))
+	}
+
+	#[test]
+	fn cluster_request_work_round_trips() -> Result<()> {
+		round_trip(ClusterRequest::Work(ClusterWorkRequest {
+			servlet_type: b"ping".to_vec(),
+			payload: vec![0x02, 0x01, 0x2A],
+		}))
+	}
+
+	#[test]
+	fn bare_inner_type_rejected_without_envelope_tag() -> Result<()> {
+		let bare = crate::encode(&ClusterWorkRequest { servlet_type: b"ping".to_vec(), payload: vec![] })?;
+
+		let decoded = crate::decode::<ClusterRequest>(&bare);
+		assert!(decoded.is_err());
+		Ok(())
 	}
 }

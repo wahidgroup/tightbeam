@@ -235,9 +235,9 @@ tb_scenario! {
 			trace.event_with("roundtrip_ok", &["v0"], v0_roundtrip == message)?;
 
 			// V1+ signature checks (before decrypt, which consumes the frame)
-			trace.event_with("sig_valid", &["v1"], v1_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
-			trace.event_with("sig_valid", &["v2"], v2_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
-			trace.event_with("sig_valid", &["v3"], v3_frame.verify::<Secp256k1Signature>(&crypto.verifying_key).is_ok())?;
+			trace.event_with("sig_valid", &["v1"], v1_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
+			trace.event_with("sig_valid", &["v2"], v2_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
+			trace.event_with("sig_valid", &["v3"], v3_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
 
 			// V1+ integrity checks (before decrypt)
 			let v1_integrity = v1_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;

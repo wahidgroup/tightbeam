@@ -2,6 +2,7 @@
 pub use rand_core::{CryptoRngCore, OsRng, RngCore};
 
 use crate::error::Result;
+#[cfg(any(feature = "ecies", feature = "transport-cms"))]
 use rand_core::CryptoRng;
 
 /// Adapts a `&mut dyn CryptoRngCore` to the `Sized` `CryptoRng + RngCore`
@@ -10,8 +11,10 @@ use rand_core::CryptoRng;
 /// A `dyn` RNG is unsized, so it cannot satisfy `impl CryptoRngCore` bounds
 /// directly. This wrapper forwards every method to the underlying trait object,
 /// letting callers inject their own CSPRNG.
+#[cfg(any(feature = "ecies", feature = "transport-cms"))]
 pub(crate) struct RngWrapper<'a>(pub(crate) &'a mut dyn CryptoRngCore);
 
+#[cfg(any(feature = "ecies", feature = "transport-cms"))]
 impl RngCore for RngWrapper<'_> {
 	fn next_u32(&mut self) -> u32 {
 		self.0.next_u32()
@@ -30,6 +33,7 @@ impl RngCore for RngWrapper<'_> {
 	}
 }
 
+#[cfg(any(feature = "ecies", feature = "transport-cms"))]
 impl CryptoRng for RngWrapper<'_> {}
 
 /// Generate a cryptographically random nonce.
@@ -56,6 +60,7 @@ pub fn generate_nonce<const N: usize>(rng: Option<&mut dyn CryptoRngCore>) -> Re
 	};
 
 	rng.fill_bytes(&mut nonce);
+
 	Ok(nonce)
 }
 
@@ -68,6 +73,7 @@ pub fn generate_random_number<const N: usize>(rng: Option<&mut dyn RngCore>) -> 
 
 	let mut bytes = [0u8; USIZE_BYTES];
 	generate_random_bytes(&mut bytes[..N], rng)?;
+
 	Ok(usize::from_le_bytes(bytes))
 }
 
@@ -108,8 +114,10 @@ mod tests {
 			(24, |rng| {
 				let mut n1 = [0u8; 24];
 				generate_random_bytes(&mut n1, Some(rng))?;
+
 				let mut n2 = [0u8; 24];
 				generate_random_bytes(&mut n2, None)?;
+
 				Ok((n1.to_vec(), n2.to_vec()))
 			}),
 		];

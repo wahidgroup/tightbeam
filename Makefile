@@ -77,10 +77,8 @@ version:
 # Setup local development
 setup:
 	@echo "Setting up the development environment..."
-	@echo "Installing development tools..."
-	rustup component add rustfmt clippy
-	@echo "Installing cross-compilation targets..."
-	rustup target add wasm32-unknown-unknown
+	@echo "Installing pinned toolchain, components, and targets (rust-toolchain.toml)..."
+	rustup toolchain install
 
 # Build all projects
 build:
@@ -100,12 +98,12 @@ check:
 	cargo check $(if $(features),--features "$(features)")
 
 # Run all tests
-test: build
+test:
 	@echo "Running tests..."
 	cargo test $(if $(features),--features "$(features)") $(if $(no-default),--no-default-features)
 
 # Run tests with all feature combinations
-test-all: build  ## Run curated feature combination tests
+test-all:  ## Run curated feature combination tests
 	@echo "Running tests with all feature combinations..."
 	./scripts/test_features.sh
 

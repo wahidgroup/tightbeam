@@ -295,7 +295,9 @@ mod tests {
 		];
 
 		for (nid, nss, expected) in test_cases {
-			let urn = UrnBuilder::default().with_nid(*nid).with_nss(*nss).build()?;
+			let nid = *nid;
+			let nss = *nss;
+			let urn = UrnBuilder::default().with_nid(nid).with_nss(nss).build()?;
 			assert_eq!(urn.nid, *nid);
 			assert_eq!(urn.nss, *nss);
 			assert_eq!(urn.to_string(), *expected);
@@ -316,7 +318,8 @@ mod tests {
 		];
 
 		for (nid, components, expected) in test_cases {
-			let mut builder = UrnBuilder::default().with_nid(*nid);
+			let nid = *nid;
+			let mut builder = UrnBuilder::default().with_nid(nid);
 			for (key, value) in *components {
 				builder = builder.set(key, *value);
 			}
@@ -333,7 +336,8 @@ mod tests {
 	fn test_urn_builder_missing_nid() {
 		let test_cases: &[&str] = &["test", "resource:path", ""];
 		for nss in test_cases {
-			let result = UrnBuilder::default().with_nss(*nss).build();
+			let nss = *nss;
+			let result = UrnBuilder::default().with_nss(nss).build();
 			assert!(matches!(result, Err(UrnValidationError::RequiredFieldMissing(_))));
 		}
 	}
@@ -424,7 +428,8 @@ mod tests {
 	fn test_urn_builder_empty_components() {
 		let test_cases: &[&str] = &["tightbeam", "test", "example"];
 		for nid in test_cases {
-			let result = UrnBuilder::default().with_nid(*nid).build();
+			let nid = *nid;
+			let result = UrnBuilder::default().with_nid(nid).build();
 			assert!(matches!(result, Err(UrnValidationError::RequiredFieldMissing(_))));
 		}
 	}

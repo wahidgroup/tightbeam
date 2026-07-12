@@ -19,7 +19,7 @@ use crate::oids::AES_256_WRAP;
 
 #[cfg(feature = "aead")]
 use crate::crypto::aead::Aead;
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::aead::Aes256Gcm;
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 use crate::crypto::aead::Aes256GcmOid;
@@ -27,20 +27,22 @@ use crate::crypto::aead::Aes256GcmOid;
 use crate::crypto::curves::Secp256k1Oid;
 #[cfg(feature = "digest")]
 use crate::crypto::hash::Digest;
-#[cfg(feature = "sha3")]
+#[cfg(all(feature = "digest", feature = "sha3"))]
 use crate::crypto::hash::Sha3_256;
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
+use crate::crypto::kdf::HkdfSha3_256;
 #[cfg(feature = "kdf")]
-use crate::crypto::kdf::{HkdfSha3_256, HkdfSha3_256Oid, KdfFunction};
+use crate::crypto::kdf::{HkdfSha3_256Oid, KdfFunction};
 #[cfg(feature = "kem")]
 use crate::crypto::kem::{Decapsulator, EncappedKey, Encapsulator, Kyber1024Oid};
 #[cfg(feature = "signature")]
 use crate::crypto::sign::ecdsa::Secp256k1Signature;
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 #[cfg(feature = "ecdh")]
 use crate::crypto::sign::elliptic_curve::{Curve, CurveArithmetic};
 #[cfg(feature = "signature")]
-use crate::crypto::sign::{Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
+use crate::crypto::sign::{PrehashVerifier, Signatory, SignatureAlgorithmIdentifier, SignatureEncoding};
 #[cfg(any(
 	feature = "digest",
 	feature = "aead",
@@ -109,22 +111,25 @@ pub trait AeadKeySize {
 }
 
 /// AES-128-GCM key size (16 bytes)
-#[cfg(feature = "aes-gcm")]
+#[cfg(all(feature = "aead", feature = "aes-gcm"))]
 impl AeadKeySize for crate::crypto::aead::Aes128GcmOid {
 	const KEY_SIZE: usize = 16;
 }
 
 /// AES-256-GCM key size (32 bytes)
-#[cfg(feature = "aes-gcm")]
+#[cfg(all(feature = "aead", feature = "aes-gcm"))]
 impl AeadKeySize for crate::crypto::aead::Aes256GcmOid {
 	const KEY_SIZE: usize = 32;
 }
 
 /// Negotiation descriptor: pure OID set for a security profile.
+///
+/// Every field is `Option`: `None` uniformly means "algorithm not part of
+/// this profile" (feature disabled on the producing side).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Sequence)]
 #[cfg_attr(feature = "derive", derive(Beamable))]
 pub struct SecurityProfileDesc {
-	pub digest: ObjectIdentifier,
+	pub digest: Option<ObjectIdentifier>,
 	pub aead: Option<ObjectIdentifier>,
 	pub aead_key_size: Option<u16>,
 	pub signature: Option<ObjectIdentifier>,
@@ -138,9 +143,9 @@ impl<P: SecurityProfile> From<&P> for SecurityProfileDesc {
 	fn from(_p: &P) -> Self {
 		SecurityProfileDesc {
 			#[cfg(feature = "digest")]
-			digest: <P::DigestOid as AssociatedOid>::OID,
+			digest: Some(<P::DigestOid as AssociatedOid>::OID),
 			#[cfg(not(feature = "digest"))]
-			digest: ObjectIdentifier::new_unwrap("0.0.0.0"),
+			digest: None,
 			#[cfg(feature = "aead")]
 			aead: Some(<P::AeadOid as AssociatedOid>::OID),
 			#[cfg(not(feature = "aead"))]
@@ -306,7 +311,7 @@ pub trait AeadProvider {
 pub trait SigningProvider {
 	type Signature: SignatureEncoding + SignatureAlgorithmIdentifier + Send + Sync;
 	type SigningKey: Signatory<Self::Signature>;
-	type VerifyingKey: Send + Sync;
+	type VerifyingKey: PrehashVerifier<Self::Signature> + Send + Sync;
 
 	fn to_signature_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {
 		AlgorithmIdentifierOwned {
@@ -400,37 +405,37 @@ impl SecurityProfile for TightbeamProfile {
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
 
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultCryptoProvider {
 	profile: TightbeamProfile,
 }
 
 // Implement role traits for DefaultCryptoProvider
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl DigestProvider for DefaultCryptoProvider {
 	type Digest = Sha3_256;
 }
 
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl AeadProvider for DefaultCryptoProvider {
 	type AeadCipher = Aes256Gcm;
 	type AeadOid = Aes256GcmOid;
 }
 
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl SigningProvider for DefaultCryptoProvider {
 	type Signature = Secp256k1Signature;
 	type SigningKey = Secp256k1SigningKey;
 	type VerifyingKey = Secp256k1VerifyingKey;
 }
 
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl KdfProvider for DefaultCryptoProvider {
 	type Kdf = HkdfSha3_256;
 }
 
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl CurveProvider for DefaultCryptoProvider {
 	type Curve = k256::Secp256k1;
 	#[cfg(feature = "ecies")]
@@ -438,13 +443,13 @@ impl CurveProvider for DefaultCryptoProvider {
 }
 
 // TODO: KEM wiring deferred - RustCrypto lacks stable KEM provider traits.
-// #[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+// #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 // impl KemProvider for DefaultCryptoProvider {
 // 	type EncappedKey = Kyber1024EncappedKey;
 // 	type Kem = Kyber1024;
 // }
 
-#[cfg(all(feature = "aes-gcm", feature = "secp256k1", feature = "sha3", feature = "kdf"))]
+#[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 impl CryptoProvider for DefaultCryptoProvider {
 	type Profile = TightbeamProfile;
 

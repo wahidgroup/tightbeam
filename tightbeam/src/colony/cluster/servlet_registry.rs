@@ -128,11 +128,14 @@ impl ServletEntry {
 
 	/// Reinforce pheromone on success
 	///
-	/// Quality is added directly to pheromone, capped at MAX_PHEROMONE
+	/// Quality is added directly to pheromone, capped at MAX_PHEROMONE.
+	/// Read-modify-write is a single `fetch_update` so a concurrent
+	/// evaporation cycle cannot silently drop the reinforcement.
 	pub fn reinforce(&self, quality: u64) {
-		let current = self.pheromone.load(Ordering::Relaxed);
-		let new_value = current.saturating_add(quality).min(MAX_PHEROMONE);
-		self.pheromone.store(new_value, Ordering::Relaxed);
+		let _ = self.pheromone.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+			Some(current.saturating_add(quality).min(MAX_PHEROMONE))
+		});
+
 		// Reset trial count on success
 		self.trial_count.store(0, Ordering::Relaxed);
 	}
@@ -148,8 +151,9 @@ impl ServletEntry {
 	pub fn weaken_with_penalty(&self, penalty: u64) {
 		self.trial_count.fetch_add(1, Ordering::Relaxed);
 		if penalty > 0 {
-			let current = self.pheromone.load(Ordering::Relaxed);
-			self.pheromone.store(current.saturating_sub(penalty), Ordering::Relaxed);
+			let _ = self.pheromone.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+				Some(current.saturating_sub(penalty))
+			});
 		}
 	}
 
@@ -157,10 +161,10 @@ impl ServletEntry {
 	///
 	/// Rate is in basis points (1000 = 10% decay)
 	pub fn evaporate(&self, rate: BasisPoints) {
-		let current = self.pheromone.load(Ordering::Relaxed);
-		let decay = (current * rate.get() as u64) / 10000;
-		let new_value = current.saturating_sub(decay);
-		self.pheromone.store(new_value, Ordering::Relaxed);
+		let _ = self.pheromone.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+			let decay = current.saturating_mul(rate.get() as u64) / 10000;
+			Some(current.saturating_sub(decay))
+		});
 	}
 }
 
@@ -209,27 +213,62 @@ impl ServletRegistry {
 	}
 
 	/// Add a servlet entry
+	///
+	/// Re-registering an address replaces the previous entry and retires
+	/// its index rows first: otherwise a reconnecting hive accumulates
+	/// duplicate addresses in the type/hive indices, multiplying its
+	/// load-balancer selection weight.
 	pub fn add(&self, entry: ServletEntry) -> Result<(), ClusterError> {
 		let addr = Arc::clone(&entry.address);
 		let servlet_type = Arc::clone(&entry.servlet_type);
 		let hive_id = Arc::clone(&entry.hive_id);
 
-		// Add to main entries map
-		{
+		let previous = {
 			let mut entries = self.entries.write()?;
-			entries.insert(Arc::clone(&addr), entry);
+			let addr = Arc::clone(&addr);
+			entries.insert(addr, entry)
+		};
+
+		if let Some(ref prev) = previous {
+			self.remove_index_rows(prev, &addr)?;
 		}
 
 		// Add to type index
 		{
 			let mut type_idx = self.type_index.write()?;
-			type_idx.entry(servlet_type).or_default().push(Arc::clone(&addr));
+			let addr = Arc::clone(&addr);
+			type_idx.entry(servlet_type).or_default().push(addr);
 		}
 
 		// Add to hive index
 		{
 			let mut hive_idx = self.hive_index.write()?;
 			hive_idx.entry(hive_id).or_default().push(addr);
+		}
+
+		Ok(())
+	}
+
+	/// Remove the type/hive index rows recorded for `entry` under `address`
+	fn remove_index_rows(&self, entry: &ServletEntry, address: &[u8]) -> Result<(), ClusterError> {
+		{
+			let mut type_idx = self.type_index.write()?;
+			if let Some(addrs) = type_idx.get_mut(&entry.servlet_type) {
+				addrs.retain(|a| a.as_ref() != address);
+				if addrs.is_empty() {
+					type_idx.remove(&entry.servlet_type);
+				}
+			}
+		}
+
+		{
+			let mut hive_idx = self.hive_index.write()?;
+			if let Some(addrs) = hive_idx.get_mut(&entry.hive_id) {
+				addrs.retain(|a| a.as_ref() != address);
+				if addrs.is_empty() {
+					hive_idx.remove(&entry.hive_id);
+				}
+			}
 		}
 
 		Ok(())
@@ -266,27 +305,7 @@ impl ServletRegistry {
 		};
 
 		if let Some(ref e) = entry {
-			// Remove from type index
-			{
-				let mut type_idx = self.type_index.write()?;
-				if let Some(addrs) = type_idx.get_mut(&e.servlet_type) {
-					addrs.retain(|a| a.as_ref() != address);
-					if addrs.is_empty() {
-						type_idx.remove(&e.servlet_type);
-					}
-				}
-			}
-
-			// Remove from hive index
-			{
-				let mut hive_idx = self.hive_index.write()?;
-				if let Some(addrs) = hive_idx.get_mut(&e.hive_id) {
-					addrs.retain(|a| a.as_ref() != address);
-					if addrs.is_empty() {
-						hive_idx.remove(&e.hive_id);
-					}
-				}
-			}
+			self.remove_index_rows(e, address)?;
 		}
 
 		Ok(entry)
@@ -307,6 +326,68 @@ impl ServletRegistry {
 		}
 
 		Ok(removed)
+	}
+
+	/// Apply a batch of servlet address adds/removes for one hive.
+	///
+	/// Atomic: either every change lands or the registry is unchanged.
+	/// Rejects adds/removes that reference another hive's routes.
+	pub fn apply_address_update(
+		&self,
+		hive_id: &[u8],
+		added: Vec<ServletEntry>,
+		removed: &[&[u8]],
+	) -> Result<(), ClusterError> {
+		for entry in &added {
+			if entry.hive_id.as_ref() != hive_id {
+				return Err(ClusterError::ServletNotOwned);
+			}
+		}
+
+		{
+			let entries = self.entries.read()?;
+			for addr in removed {
+				if let Some(entry) = entries.get(*addr) {
+					if entry.hive_id.as_ref() != hive_id {
+						return Err(ClusterError::ServletNotOwned);
+					}
+				}
+			}
+		}
+
+		let mut applied_addrs: Vec<SharedId> = Vec::with_capacity(added.len());
+		for entry in added {
+			let addr = Arc::clone(&entry.address);
+			if let Err(err) = self.add(entry) {
+				for applied in &applied_addrs {
+					let _ = self.remove(applied);
+				}
+
+				return Err(err);
+			}
+
+			applied_addrs.push(addr);
+		}
+
+		let mut removed_entries: Vec<ServletEntry> = Vec::with_capacity(removed.len());
+		for addr in removed {
+			match self.remove(addr) {
+				Ok(Some(entry)) => removed_entries.push(entry),
+				Ok(None) => {}
+				Err(err) => {
+					for entry in removed_entries {
+						let _ = self.add(entry);
+					}
+					for applied in &applied_addrs {
+						let _ = self.remove(applied);
+					}
+
+					return Err(err);
+				}
+			}
+		}
+
+		Ok(())
 	}
 
 	/// Get entries for a servlet type (for load balancing)
@@ -527,6 +608,47 @@ mod tests {
 		assert_eq!(found[0].address.as_ref(), b"addr1");
 	}
 
+	fn seed_reregistered_registry() -> ServletRegistry {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"addr1", b"calculator", b"hive1")).ok();
+		registry.add(named_entry(b"addr1", b"calculator", b"hive1")).ok();
+		registry
+	}
+
+	#[test]
+	fn registry_reregistration_does_not_duplicate_indices() {
+		let registry = seed_reregistered_registry();
+
+		let found = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
+		assert_eq!(found.len(), 1);
+		assert!(matches!(registry.len().ok(), Some(1)));
+	}
+
+	#[test]
+	fn registry_reregistration_moves_entry_across_types() {
+		let registry = ServletRegistry::default();
+		registry.add(named_entry(b"addr1", b"calculator", b"hive1")).ok();
+		registry.add(named_entry(b"addr1", b"auth", b"hive2")).ok();
+
+		let calculator = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
+		let auth = registry.entries_for_type(b"auth").ok().unwrap_or_default();
+		assert!(calculator.is_empty());
+		assert_eq!(auth.len(), 1);
+
+		// Old hive index rows retired alongside the type rows
+		let removed = registry.remove_by_hive(b"hive1").ok().unwrap_or_default();
+		assert!(removed.is_empty());
+	}
+
+	#[test]
+	fn registry_remove_after_reregistration_clears_entry() {
+		let registry = seed_reregistered_registry();
+		registry.remove(b"addr1").ok();
+
+		let found = registry.entries_for_type(b"calculator").ok().unwrap_or_default();
+		assert!(found.is_empty());
+	}
+
 	#[test]
 	fn registry_remove_abandoned_prunes_entries() {
 		let limit = 2;
@@ -543,5 +665,57 @@ mod tests {
 
 		assert!(matches!(registry.remove_abandoned().ok(), Some(1)));
 		assert!(matches!(registry.len().ok(), Some(0)));
+	}
+
+	struct ApplyAddressUpdateCase {
+		seed: (&'static [u8], &'static [u8], &'static [u8]),
+		caller_hive: &'static [u8],
+		add: Option<(&'static [u8], &'static [u8], &'static [u8])>,
+		remove: &'static [&'static [u8]],
+		expect_ok: bool,
+		expected_addrs: &'static [&'static [u8]],
+	}
+
+	fn apply_address_update_cases() -> Vec<ApplyAddressUpdateCase> {
+		const VICTIM: &[&[u8]] = &[b"victim"];
+		const OLD: &[&[u8]] = &[b"old"];
+		const NEW: &[&[u8]] = &[b"new"];
+
+		vec![
+			ApplyAddressUpdateCase {
+				seed: (b"victim", b"calc", b"hive-a"),
+				caller_hive: b"hive-b",
+				add: Some((b"poison", b"calc", b"hive-b")),
+				remove: VICTIM,
+				expect_ok: false,
+				expected_addrs: VICTIM,
+			},
+			ApplyAddressUpdateCase {
+				seed: (b"old", b"calc", b"hive-a"),
+				caller_hive: b"hive-a",
+				add: Some((b"new", b"calc", b"hive-a")),
+				remove: OLD,
+				expect_ok: true,
+				expected_addrs: NEW,
+			},
+		]
+	}
+
+	#[test]
+	fn apply_address_update_ownership_and_atomicity() {
+		for case in apply_address_update_cases() {
+			let registry = ServletRegistry::default();
+			registry.add(named_entry(case.seed.0, case.seed.1, case.seed.2)).ok();
+
+			let added = case.add.map(|(a, t, h)| named_entry(a, t, h)).into_iter().collect();
+			let result = registry.apply_address_update(case.caller_hive, added, case.remove);
+			assert_eq!(result.is_ok(), case.expect_ok);
+
+			let found = registry.entries_for_type(b"calc").ok().unwrap_or_default();
+			assert_eq!(found.len(), case.expected_addrs.len());
+			for (entry, addr) in found.iter().zip(case.expected_addrs.iter()) {
+				assert_eq!(entry.address.as_ref(), *addr);
+			}
+		}
 	}
 }

@@ -21,14 +21,16 @@ use crate::colony::hive::HiveContext;
 use crate::colony::servlet::servlet_runtime::rt;
 use crate::colony::worker::Worker;
 use crate::colony::worker::WorkerMetadata;
-use crate::core::Message;
+use crate::core::{Inflator, Message};
+use crate::crypto::aead::Decryptor;
 use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::policy::GatePolicy;
+use crate::router::RouterError;
 use crate::trace::TraceCollector;
 use crate::transport::Protocol;
 use crate::transport::TightBeamAddress;
 use crate::utils::BasisPoints;
-use crate::TightBeamError;
+use crate::{Frame, TightBeamError};
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -85,6 +87,8 @@ pub struct ServletContext {
 	env_config: Arc<dyn Any + Send + Sync>,
 	workers: HashMap<String, Box<dyn WorkerBox>>,
 	hive_context: Option<Arc<dyn HiveContext>>,
+	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
+	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 }
 
 impl ServletContext {
@@ -95,7 +99,38 @@ impl ServletContext {
 		workers: HashMap<String, Box<dyn WorkerBox>>,
 		hive_context: Option<Arc<dyn HiveContext>>,
 	) -> Self {
-		Self { trace, env_config, workers, hive_context }
+		Self {
+			trace,
+			env_config,
+			workers,
+			hive_context,
+			message_decryptor: None,
+			message_inflator: None,
+		}
+	}
+
+	/// Attach the decryptor used for frame-level (message body) decryption
+	#[must_use]
+	pub fn with_message_decryptor(mut self, decryptor: Option<Arc<dyn Decryptor + Send + Sync>>) -> Self {
+		self.message_decryptor = decryptor;
+		self
+	}
+
+	/// Attach the inflator used for message body decompression
+	#[must_use]
+	pub fn with_message_inflator(mut self, inflator: Option<Arc<dyn Inflator + Send + Sync>>) -> Self {
+		self.message_inflator = inflator;
+		self
+	}
+
+	/// Get the frame-level message decryptor, when configured
+	pub fn message_decryptor(&self) -> Option<&dyn Decryptor> {
+		self.message_decryptor.as_deref().map(|decryptor| decryptor as &dyn Decryptor)
+	}
+
+	/// Get the message body inflator, when configured
+	pub fn message_inflator(&self) -> Option<&dyn Inflator> {
+		self.message_inflator.as_deref().map(|inflator| inflator as &dyn Inflator)
 	}
 
 	/// Get the trace collector
@@ -131,6 +166,36 @@ impl ServletContext {
 	}
 }
 
+/// Normalize a frame to cleartext before typed delivery.
+///
+/// Applies the servlet's configured message-body capabilities in place,
+/// fail-closed: an encrypted body without a configured decryptor and a
+/// compressed body without a configured inflator are rejected before any
+/// decode attempt. On success the frame is cleartext and its body can be
+/// decoded as the servlet's declared input type.
+///
+/// # Errors
+///
+/// - [`RouterError::ConfidentialFrame`] -- encrypted body, no decryptor.
+/// - [`RouterError::CompressedFrame`] -- compressed body, no inflator.
+/// - Decryption or decompression errors from the configured
+///   implementations.
+pub fn prepare_typed_frame(frame: &mut Frame, ctx: &ServletContext) -> Result<(), TightBeamError> {
+	if frame.metadata.confidentiality.is_some() {
+		let decryptor = ctx.message_decryptor().ok_or(RouterError::ConfidentialFrame)?;
+		frame.decrypt_in_place(decryptor, ctx.message_inflator())?;
+
+		return Ok(());
+	}
+
+	if frame.metadata.compactness.is_some() {
+		let inflator = ctx.message_inflator().ok_or(RouterError::CompressedFrame)?;
+		frame.inflate_in_place(inflator)?;
+	}
+
+	Ok(())
+}
+
 // =============================================================================
 // Servlet Configuration
 // =============================================================================
@@ -150,6 +215,8 @@ where
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
+	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 }
 
 /// Configuration for a servlet, containing application config and workers
@@ -165,6 +232,8 @@ where
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
 	pub(crate) collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	pub(crate) message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
+	pub(crate) message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 }
 
 /// Builder for ServletConf
@@ -179,6 +248,8 @@ where
 	hive_context: Option<Arc<dyn HiveContext>>,
 	workers: HashMap<String, Box<dyn WorkerBox>>,
 	collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
+	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 	_phantom: PhantomData<(P, M, C)>,
 }
 
@@ -193,6 +264,8 @@ where
 	hive_context: Option<Arc<dyn HiveContext>>,
 	workers: HashMap<String, Box<dyn WorkerBox>>,
 	collector_gates: Vec<Arc<dyn GatePolicy + Send + Sync>>,
+	message_decryptor: Option<Arc<dyn Decryptor + Send + Sync>>,
+	message_inflator: Option<Arc<dyn Inflator + Send + Sync>>,
 	_phantom: PhantomData<(P, M)>,
 }
 
@@ -247,6 +320,16 @@ where
 	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
 		self.hive_context.as_ref()
 	}
+
+	/// Get the frame-level message decryptor, when configured
+	pub fn to_message_decryptor(&self) -> Option<Arc<dyn Decryptor + Send + Sync>> {
+		self.message_decryptor.as_ref().map(Arc::clone)
+	}
+
+	/// Get the message body inflator, when configured
+	pub fn to_message_inflator(&self) -> Option<Arc<dyn Inflator + Send + Sync>> {
+		self.message_inflator.as_ref().map(Arc::clone)
+	}
 }
 
 #[cfg(not(feature = "x509"))]
@@ -294,6 +377,16 @@ where
 	pub fn hive_context(&self) -> Option<&Arc<dyn HiveContext>> {
 		self.hive_context.as_ref()
 	}
+
+	/// Get the frame-level message decryptor, when configured
+	pub fn to_message_decryptor(&self) -> Option<Arc<dyn Decryptor + Send + Sync>> {
+		self.message_decryptor.as_ref().map(Arc::clone)
+	}
+
+	/// Get the message body inflator, when configured
+	pub fn to_message_inflator(&self) -> Option<Arc<dyn Inflator + Send + Sync>> {
+		self.message_inflator.as_ref().map(Arc::clone)
+	}
 }
 
 #[cfg(feature = "x509")]
@@ -313,6 +406,8 @@ where
 			hive_context: None,
 			workers: HashMap::new(),
 			collector_gates: Vec::new(),
+			message_decryptor: None,
+			message_inflator: None,
 		}
 	}
 }
@@ -331,6 +426,8 @@ where
 			hive_context: None,
 			workers: HashMap::new(),
 			collector_gates: Vec::new(),
+			message_decryptor: None,
+			message_inflator: None,
 		}
 	}
 }
@@ -349,6 +446,8 @@ where
 			hive_context: None,
 			workers: HashMap::new(),
 			collector_gates: Vec::new(),
+			message_decryptor: None,
+			message_inflator: None,
 			_phantom: PhantomData,
 		}
 	}
@@ -366,6 +465,8 @@ where
 			hive_context: None,
 			workers: HashMap::new(),
 			collector_gates: Vec::new(),
+			message_decryptor: None,
+			message_inflator: None,
 			_phantom: PhantomData,
 		}
 	}
@@ -385,9 +486,11 @@ where
 		key: Arc<dyn SigningKeyProvider>,
 		validators: Vec<Arc<dyn CertificateValidation>>,
 	) -> Result<Self, TightBeamError> {
-		let cert_obj = Certificate::try_from(cert)?;
-		let key_mgr: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
-		self.x509_config = Some(TransportEncryptionConfig::new(cert_obj, key_mgr).with_client_validators(validators));
+		let certificate = Certificate::try_from(cert)?;
+		let key_manager: HandshakeKeyManager<C> = HandshakeKeyManager::new(key);
+		let encryption_config = TransportEncryptionConfig::new(certificate, key_manager);
+
+		self.x509_config = Some(encryption_config.with_client_validators(validators));
 		Ok(self)
 	}
 
@@ -413,7 +516,8 @@ where
 	where
 		G: GatePolicy + Send + Sync + 'static,
 	{
-		self.collector_gates.push(Arc::new(gate));
+		let gate = Arc::new(gate);
+		self.collector_gates.push(gate);
 		self
 	}
 
@@ -421,6 +525,26 @@ where
 	#[must_use]
 	pub fn with_hive_context(mut self, ctx: Arc<dyn HiveContext>) -> Self {
 		self.hive_context = Some(ctx);
+		self
+	}
+
+	/// Add a decryptor so typed handlers can receive encrypted frames
+	pub fn with_message_decryptor<D>(mut self, decryptor: D) -> Self
+	where
+		D: Decryptor + Send + Sync + 'static,
+	{
+		let decryptor = Arc::new(decryptor);
+		self.message_decryptor = Some(decryptor);
+		self
+	}
+
+	/// Add an inflator so typed handlers can receive compressed frames
+	pub fn with_message_inflator<I>(mut self, inflator: I) -> Self
+	where
+		I: Inflator + Send + Sync + 'static,
+	{
+		let inflator = Arc::new(inflator);
+		self.message_inflator = Some(inflator);
 		self
 	}
 
@@ -435,6 +559,8 @@ where
 			hive_context: self.hive_context,
 			workers: self.workers,
 			collector_gates: self.collector_gates,
+			message_decryptor: self.message_decryptor,
+			message_inflator: self.message_inflator,
 		}
 	}
 }
@@ -467,7 +593,8 @@ where
 	where
 		G: GatePolicy + Send + Sync + 'static,
 	{
-		self.collector_gates.push(Arc::new(gate));
+		let gate = Arc::new(gate);
+		self.collector_gates.push(gate);
 		self
 	}
 
@@ -475,6 +602,26 @@ where
 	#[must_use]
 	pub fn with_hive_context(mut self, ctx: Arc<dyn HiveContext>) -> Self {
 		self.hive_context = Some(ctx);
+		self
+	}
+
+	/// Add a decryptor so typed handlers can receive encrypted frames
+	pub fn with_message_decryptor<D>(mut self, decryptor: D) -> Self
+	where
+		D: Decryptor + Send + Sync + 'static,
+	{
+		let decryptor = Arc::new(decryptor);
+		self.message_decryptor = Some(decryptor);
+		self
+	}
+
+	/// Add an inflator so typed handlers can receive compressed frames
+	pub fn with_message_inflator<I>(mut self, inflator: I) -> Self
+	where
+		I: Inflator + Send + Sync + 'static,
+	{
+		let inflator = Arc::new(inflator);
+		self.message_inflator = Some(inflator);
 		self
 	}
 
@@ -487,6 +634,8 @@ where
 			hive_context: self.hive_context,
 			workers: self.workers,
 			collector_gates: self.collector_gates,
+			message_decryptor: self.message_decryptor,
+			message_inflator: self.message_inflator,
 		}
 	}
 }

@@ -1,5 +1,9 @@
 //! ASN.1 structures for prekey-based handshake protocols.
 //!
+//! UNSTABLE: gated behind the `unstable-pqxdh` feature. No orchestrator
+//! consumes these structures yet; the API may change or be removed before
+//! an end-to-end PQXDH protocol ships.
+//!
 //! Provides standard structures for asynchronous key agreement protocols
 //! like PQXDH where one party publishes prekey bundles offline.
 

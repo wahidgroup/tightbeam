@@ -30,22 +30,16 @@ use std::sync::Arc;
 
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::key::SigningKeyProvider;
-use crate::der::Sequence;
-use crate::policy::{GatePolicy, TransitStatus};
+use crate::policy::GatePolicy;
 use crate::trace::TraceCollector;
 use crate::transport::client::pool::PoolConfig;
-use crate::transport::policy::RestartPolicy;
 use crate::transport::{Protocol, TightBeamAddress};
-use crate::Beamable;
 
 #[cfg(feature = "x509")]
 use crate::crypto::x509::{policy::CertificateValidation, CertificateSpec};
 
 use super::common::LeastLoaded;
 use super::hive::LoadBalancer;
-
-#[cfg(feature = "tokio")]
-use crate::colony::servlet::servlet_runtime::rt;
 
 // =============================================================================
 // Configuration
@@ -58,13 +52,15 @@ pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 10;
 pub(crate) const DEFAULT_MAX_FAILURES: u32 = 3;
 
 /// Configuration for cluster heartbeat behavior
+///
+/// Retry semantics are expressed through `interval` (cadence) and
+/// `max_failures` (tolerance): a failed heartbeat is retried on the next
+/// cycle rather than through a separate retry policy.
 pub struct HeartbeatConf {
 	/// Interval between heartbeat checks
 	pub interval: Duration,
 	/// Timeout before evicting unresponsive hives
 	pub timeout: Duration,
-	/// Optional retry policy override (uses ClusterConf.retry_policy if None)
-	pub retry_policy: Option<Arc<dyn RestartPolicy + Send + Sync>>,
 	/// Maximum concurrent heartbeat requests
 	pub max_concurrent: usize,
 	/// Failed heartbeats before eviction
@@ -78,7 +74,6 @@ impl Default for HeartbeatConf {
 		Self {
 			interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
 			timeout: Duration::from_secs(DEFAULT_HEARTBEAT_TIMEOUT_SECS),
-			retry_policy: None,
 			max_concurrent: DEFAULT_MAX_CONCURRENT,
 			max_failures: DEFAULT_MAX_FAILURES,
 			on_heartbeat: None,
@@ -91,7 +86,6 @@ impl core::fmt::Debug for HeartbeatConf {
 		f.debug_struct("HeartbeatConf")
 			.field("interval", &self.interval)
 			.field("timeout", &self.timeout)
-			.field("retry_policy", &self.retry_policy.as_ref().map(|_| "Some(...)"))
 			.field("max_concurrent", &self.max_concurrent)
 			.field("max_failures", &self.max_failures)
 			.field("on_heartbeat", &self.on_heartbeat.as_ref().map(|_| "Some(...)"))
@@ -136,7 +130,7 @@ pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 // TLS Configuration
 // ============================================================================
 
-/// TLS configuration for cluster → hive connections
+/// TLS configuration for cluster -> hive connections
 ///
 /// Contains certificate, key, and validators for encrypted transport.
 /// Used by the connection pool for mutual TLS with hives.
@@ -146,9 +140,9 @@ pub struct ClusterTlsConfig {
 	pub certificate: CertificateSpec,
 	/// Private key provider for signing operations (supports HSM/KMS)
 	pub key: Arc<dyn SigningKeyProvider>,
-	/// Server certificate validators for hive connections (cluster→hive)
+	/// Server certificate validators for hive connections (cluster->hive)
 	pub validators: Vec<Arc<dyn CertificateValidation>>,
-	/// Client certificate validators for mutual auth (client→cluster)
+	/// Client certificate validators for mutual auth (client->cluster)
 	pub client_validators: Vec<Arc<dyn CertificateValidation>>,
 	/// Trust store for validating hive/servlet server certificates (outbound connections)
 	pub hive_trust: Option<Arc<dyn crate::crypto::x509::store::CertificateTrust>>,
@@ -160,8 +154,8 @@ impl Clone for ClusterTlsConfig {
 		Self {
 			certificate: self.certificate.clone(),
 			key: Arc::clone(&self.key),
-			validators: self.validators.clone(),
-			client_validators: self.client_validators.clone(),
+			validators: self.validators.iter().map(Arc::clone).collect(),
+			client_validators: self.client_validators.iter().map(Arc::clone).collect(),
 			hive_trust: self.hive_trust.as_ref().map(Arc::clone),
 		}
 	}
@@ -183,7 +177,7 @@ impl core::fmt::Debug for ClusterTlsConfig {
 /// Configuration for clusters
 ///
 /// Contains settings for load balancing, health checks, gateway policies,
-/// and cryptographic signing for cluster → hive communication.
+/// and cryptographic signing for cluster -> hive communication.
 ///
 /// # Type Parameters
 /// - `L`: Load balancing strategy (default: `LeastLoaded`)
@@ -199,9 +193,11 @@ pub struct ClusterConf<L: LoadBalancer = LeastLoaded, D: Digest = Sha3_256> {
 	pub policies: Vec<Arc<dyn GatePolicy + Send + Sync>>,
 	/// Connection pool configuration for hive connections
 	pub pool_config: PoolConfig,
-	/// Default retry policy for all cluster → hive communication
-	pub retry_policy: Arc<dyn RestartPolicy + Send + Sync>,
-	/// TLS configuration for cluster → hive connections
+	/// Freshness window in milliseconds for signed hive control frames
+	/// (registration, address updates); stale or replayed frames inside
+	/// the window are rejected (CWE-294)
+	pub control_freshness_window_ms: u64,
+	/// TLS configuration for cluster -> hive connections
 	#[cfg(feature = "x509")]
 	pub tls: ClusterTlsConfig,
 	/// Phantom data for digest type
@@ -224,6 +220,7 @@ impl<L: LoadBalancer, D: Digest> core::fmt::Debug for ClusterConf<L, D> {
 			.field("pheromone", &self.pheromone)
 			.field("policies", &format!("[{} policies]", self.policies.len()))
 			.field("pool_config", &self.pool_config)
+			.field("control_freshness_window_ms", &self.control_freshness_window_ms)
 			.field("tls", &self.tls)
 			.finish()
 	}
@@ -233,40 +230,7 @@ impl<L: LoadBalancer, D: Digest> core::fmt::Debug for ClusterConf<L, D> {
 // Work Request/Response Messages
 // =============================================================================
 
-/// Work request envelope for cluster routing
-///
-/// Clients send this to the cluster gateway. The cluster routes based on
-/// `servlet_type` and forwards `payload` to the selected hive.
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
-pub struct ClusterWorkRequest {
-	/// Target servlet type (e.g., b"ping_servlet")
-	pub servlet_type: Vec<u8>,
-	/// Raw message payload (encoded inner message)
-	pub payload: Vec<u8>,
-}
-
-/// Work response from cluster
-#[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
-pub struct ClusterWorkResponse {
-	/// Status of the routing/execution
-	pub status: TransitStatus,
-	/// Response payload from servlet (if successful)
-	pub payload: Option<Vec<u8>>,
-}
-
-impl ClusterWorkResponse {
-	/// Create a successful response with payload
-	#[inline]
-	pub fn ok(payload: Vec<u8>) -> Self {
-		Self { status: TransitStatus::Accepted, payload: Some(payload) }
-	}
-
-	/// Create an error response with status
-	#[inline]
-	pub fn err(status: TransitStatus) -> Self {
-		Self { status, payload: None }
-	}
-}
+pub use crate::colony::common::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
 
 // =============================================================================
 // Cluster Trait
@@ -322,150 +286,14 @@ pub trait Cluster: Sized + Send + Sync {
 	///
 	/// Builds a signed heartbeat frame and sends it via the connection pool.
 	/// Returns the heartbeat result from the hive.
+	///
+	/// The heartbeat loop itself is generated by the `cluster!` macro
+	/// (tokio `JoinSet` with bounded concurrency); it is not part of the
+	/// trait surface.
 	fn send_heartbeat(
 		&self,
 		addr: Self::Address,
 	) -> impl Future<Output = Result<super::common::HeartbeatResult, ClusterError>> + Send;
-
-	/// Process a heartbeat result, updating registry accordingly
-	///
-	/// On success, updates the hive's utilization metric.
-	/// On failure, increments the failure counter and evicts if threshold exceeded.
-	fn process_heartbeat_result(&self, hive_addr: &[u8], result: Result<super::common::HeartbeatResult, ClusterError>) {
-		match result {
-			Ok(hb) => {
-				let _ = self.registry().touch(hive_addr, hb.utilization);
-			}
-			Err(_) => {
-				if let Ok(failures) = self.registry().increment_failure(hive_addr) {
-					if failures >= self.heartbeat_config().max_failures {
-						let _ = self.registry().unregister(hive_addr);
-					}
-				}
-			}
-		}
-	}
-
-	// =========================================================================
-	// Heartbeat Loop - Default Trait Implementation
-	// =========================================================================
-	//
-	// Note: The cluster! macro provides optimized implementations with proper
-	// concurrency. These trait defaults are simpler fallbacks.
-
-	/// Tier 1: Tokio - sequential async processing
-	///
-	/// Default implementation processes heartbeats sequentially.
-	/// The macro-generated implementation uses JoinSet for concurrency.
-	#[cfg(feature = "tokio")]
-	fn run_heartbeat_loop(&self) -> impl Future<Output = ()> + Send
-	where
-		Self::Address: core::str::FromStr,
-	{
-		async move {
-			loop {
-				// Collect parsed addresses first
-				let tasks: Vec<_> = self
-					.registry()
-					.all_hives()
-					.unwrap_or_default()
-					.into_iter()
-					.filter_map(|hive| {
-						let hive_addr = Arc::clone(&hive.address);
-						core::str::from_utf8(&hive_addr)
-							.ok()
-							.and_then(|s| s.parse().ok())
-							.map(|addr| (hive_addr, addr))
-					})
-					.collect();
-
-				// Concurrent processing with futures
-				#[cfg(feature = "futures")]
-				{
-					use futures::stream::{self, StreamExt};
-
-					let max_concurrent = self.heartbeat_config().max_concurrent;
-					stream::iter(tasks)
-						.for_each_concurrent(max_concurrent, |(hive_addr, addr)| async move {
-							let result = self.send_heartbeat(addr).await;
-							self.process_heartbeat_result(&hive_addr, result);
-						})
-						.await;
-				}
-
-				// Sequential fallback without futures
-				#[cfg(not(feature = "futures"))]
-				for (hive_addr, addr) in tasks {
-					let result = self.send_heartbeat(addr).await;
-					self.process_heartbeat_result(&hive_addr, result);
-				}
-
-				rt::sleep(self.heartbeat_config().interval).await;
-			}
-		}
-	}
-
-	/// Tier 2: std + futures - sequential with block_on
-	///
-	/// For non-tokio builds with futures crate.
-	#[cfg(all(not(feature = "tokio"), feature = "std", feature = "futures"))]
-	fn run_heartbeat_loop(&self)
-	where
-		Self::Address: core::str::FromStr,
-	{
-		use futures::executor::block_on;
-
-		loop {
-			self.registry()
-				.all_hives()
-				.unwrap_or_default()
-				.into_iter()
-				.filter_map(|hive| {
-					let hive_addr = Arc::clone(&hive.address);
-					core::str::from_utf8(&hive_addr)
-						.ok()
-						.and_then(|s| s.parse().ok())
-						.map(|addr| (hive_addr, addr))
-				})
-				.for_each(|(hive_addr, addr)| {
-					let result = block_on(self.send_heartbeat(addr));
-					self.process_heartbeat_result(&hive_addr, result);
-				});
-
-			std::thread::sleep(self.heartbeat_config().interval);
-		}
-	}
-
-	/// Tier 3: std only - placeholder
-	///
-	/// For std builds without tokio or futures.
-	/// Cannot call async send_heartbeat - placeholder only.
-	#[cfg(all(not(feature = "tokio"), feature = "std", not(feature = "futures")))]
-	fn run_heartbeat_loop(&self)
-	where
-		Self::Address: core::str::FromStr,
-	{
-		loop {
-			self.registry()
-				.all_hives()
-				.unwrap_or_default()
-				.into_iter()
-				.filter_map(|hive| {
-					let hive_addr = Arc::clone(&hive.address);
-					core::str::from_utf8(&hive_addr)
-						.ok()
-						.and_then(|s| s.parse::<Self::Address>().ok())
-						.map(|addr| (hive_addr, addr))
-				})
-				.for_each(|(hive_addr, _addr)| {
-					// Note: Cannot call async send_heartbeat without executor
-					// Increment failure as placeholder behavior
-					let _ = self.registry().increment_failure(&hive_addr);
-				});
-
-			std::thread::sleep(self.heartbeat_config().interval);
-		}
-	}
 }
 
 // =============================================================================
@@ -479,6 +307,7 @@ mod tests {
 	use crate::colony::hive::ServletInfo;
 	use crate::crypto::key::Secp256k1KeyProvider;
 	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use crate::policy::TransitStatus;
 	use crate::testing::create_test_signing_key;
 	use crate::utils::BasisPoints;
 
@@ -503,6 +332,7 @@ mod tests {
 
 	fn request(addr: &[u8], servlets: &[&[u8]]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
+			issued_at_ms: 0,
 			hive_addr: addr.to_vec(),
 			metadata: None,
 			servlet_addresses: servlets
@@ -514,6 +344,7 @@ mod tests {
 
 	fn request_with_meta(addr: &[u8], servlets: &[&[u8]], meta: &[u8]) -> RegisterHiveRequest {
 		RegisterHiveRequest {
+			issued_at_ms: 0,
 			hive_addr: addr.to_vec(),
 			metadata: Some(meta.to_vec()),
 			servlet_addresses: servlets

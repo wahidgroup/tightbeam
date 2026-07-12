@@ -1,10 +1,8 @@
 //! Logging subsystem with RFC 5424 severity levels
 //!
 //! Provides trait-based logging backends with runtime injection for flexible
-//! output targets (stdout, file, SIEM, etc.) while maintaining no_std compatibility
-//! for core traits.
-
-#![cfg_attr(not(feature = "std"), no_std)]
+//! output targets (stdout, file, SIEM, etc.) while maintaining no_std
+//! compatibility for core traits.
 
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, collections::BTreeMap as HashMap, vec::Vec};
@@ -313,19 +311,20 @@ mod tests {
 		assert!(filter.should_log(LogLevel::Info, Some("security")));
 	}
 
-	// Mock backend for testing - uses Arc internally to share captured records
+	// Capture backend: records real emitted output into a shared Vec so
+	// tests can assert on it (spy, not a stubbed dependency)
 	#[derive(Debug, Clone)]
-	struct MockBackend {
+	struct CaptureBackend {
 		captured: Arc<std::sync::Mutex<Vec<(LogLevel, String)>>>,
 	}
 
-	impl MockBackend {
+	impl CaptureBackend {
 		fn with_captured(captured: Arc<std::sync::Mutex<Vec<(LogLevel, String)>>>) -> Self {
 			Self { captured }
 		}
 	}
 
-	impl LogBackend for MockBackend {
+	impl LogBackend for CaptureBackend {
 		fn emit(&self, record: &LogRecord) -> Result<(), LogError> {
 			self.captured
 				.lock()
@@ -343,7 +342,10 @@ mod tests {
 	#[test]
 	fn test_logger_config_default_level() -> Result<(), crate::TightBeamError> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-		let backend = MockBackend::with_captured(Arc::clone(&captured));
+		let backend = {
+			let captured = Arc::clone(&captured);
+			CaptureBackend::with_captured(captured)
+		};
 		let config =
 			LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Info);
 		let trace = TraceCollector::default().with_logger(config);
@@ -365,7 +367,10 @@ mod tests {
 	#[test]
 	fn test_logger_config_no_default_level() -> Result<(), crate::TightBeamError> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-		let backend = MockBackend::with_captured(Arc::clone(&captured));
+		let backend = {
+			let captured = Arc::clone(&captured);
+			CaptureBackend::with_captured(captured)
+		};
 		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 
@@ -384,7 +389,11 @@ mod tests {
 	#[test]
 	fn test_log_filter_with_logger() -> Result<(), crate::TightBeamError> {
 		let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-		let backend = MockBackend::with_captured(Arc::clone(&captured));
+		let backend = {
+			let captured = Arc::clone(&captured);
+			CaptureBackend::with_captured(captured)
+		};
+
 		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Warning));
 		let trace = TraceCollector::default().with_logger(config);
 
@@ -410,11 +419,16 @@ mod tests {
 		let captured1 = Arc::new(std::sync::Mutex::new(Vec::new()));
 		let captured2 = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-		let backend1 = MockBackend::with_captured(Arc::clone(&captured1));
-		let backend2 = MockBackend::with_captured(Arc::clone(&captured2));
+		let backend1 = {
+			let captured = Arc::clone(&captured1);
+			CaptureBackend::with_captured(captured)
+		};
+		let backend2 = {
+			let captured = Arc::clone(&captured2);
+			CaptureBackend::with_captured(captured)
+		};
 
 		let multiplex = MultiplexBackend::new(vec![Box::new(backend1), Box::new(backend2)]);
-
 		let config = LoggerConfig::new(Box::new(multiplex), LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 

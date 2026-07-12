@@ -14,6 +14,7 @@ use tightbeam::{
 	compress::{Inflator, ZstdCompression},
 	crypto::{
 		aead::Aes256Gcm,
+		hash::Sha3_256,
 		sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey},
 	},
 	decode,
@@ -61,22 +62,26 @@ trait DtnNode {
 		if frame.nonrepudiation.is_none() {
 			return Ok(false);
 		}
+
 		for key in self.verifying_keys() {
-			if frame.verify::<Secp256k1Signature>(key).is_ok() {
+			if frame.verify::<Secp256k1Signature, Sha3_256>(key).is_ok() {
 				return Ok(true);
 			}
 		}
+
 		Ok(false)
 	}
 
 	/// Helper: Decrypt relay message
 	fn decrypt_relay_message(&self, frame: Frame) -> Result<RelayMessage, TightBeamError> {
 		if frame.metadata.confidentiality.is_some() {
+			let zstd = ZstdCompression::default();
 			let inflator: Option<&dyn Inflator> = if frame.metadata.compactness.is_some() {
-				Some(&ZstdCompression)
+				Some(&zstd)
 			} else {
 				None
 			};
+
 			frame.decrypt::<RelayMessage>(self.cipher(), inflator)
 		} else {
 			decode(&frame.message)
@@ -164,7 +169,7 @@ servlet! {
 	/// Mission Control receives telemetry and sends commands to Rover via relays
 	pub MissionControlServlet<RelayMessage, EnvConfig = MissionControlServletConf>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &MissionControlServletConf = ctx.env_config()?;
 		let frame_order = frame.metadata.order;
@@ -271,6 +276,7 @@ servlet! {
 					config.earth_relay_addr,
 					trace,
 				).await?;
+
 				Ok(None)
 			},
 		}
@@ -326,14 +332,14 @@ servlet! {
 	/// Earth Relay forwards messages between Mission Control and Mars Relay
 	pub EarthRelaySatelliteServlet<RelayMessage, EnvConfig = EarthRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &EarthRelaySatelliteServletConf = ctx.env_config()?;
 		// Verify signature and determine source
 		let from_mission_control = if frame.nonrepudiation.is_some() {
-			if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
+			if frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_ok() {
 				true
-			} else if frame.verify::<Secp256k1Signature>(&config.rover_verifying_key).is_ok() {
+			} else if frame.verify::<Secp256k1Signature, Sha3_256>(&config.rover_verifying_key).is_ok() {
 				false
 			} else {
 				return Err(TightBeamError::MissingSignature);
@@ -479,6 +485,7 @@ servlet! {
 					config.mars_relay_addr,
 					trace,
 				).await?;
+
 				Ok(None)
 			},
 		}
@@ -538,15 +545,15 @@ servlet! {
 	/// Mars Relay forwards messages between Earth Relay and Rover
 	pub MarsRelaySatelliteServlet<RelayMessage, EnvConfig = MarsRelaySatelliteServletConf>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &MarsRelaySatelliteServletConf = ctx.env_config()?;
 		// Verify signature and determine source
 		// Earth Relay forwards messages, so could be from Mission Control or Rover
 		let from_rover = if frame.nonrepudiation.is_some() {
-			if frame.verify::<Secp256k1Signature>(&config.rover_verifying_key).is_ok() {
+			if frame.verify::<Secp256k1Signature, Sha3_256>(&config.rover_verifying_key).is_ok() {
 				true
-			} else if frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_ok() {
+			} else if frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_ok() {
 				false
 			} else {
 				return Err(TightBeamError::MissingSignature);
@@ -764,13 +771,13 @@ servlet! {
 	/// Mars Rover executes commands and sends telemetry
 	pub RoverServlet<RelayMessage, EnvConfig = RoverServletConf>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: raw |frame, ctx| async move {
 		let trace = ctx.trace();
 		let config: &RoverServletConf = ctx.env_config()?;
 		// Verify signature
 		if frame.nonrepudiation.is_some()
-			&& frame.verify::<Secp256k1Signature>(&config.mission_control_verifying_key).is_err()
-			&& frame.verify::<Secp256k1Signature>(&config.mars_relay_verifying_key).is_err()
+			&& frame.verify::<Secp256k1Signature, Sha3_256>(&config.mission_control_verifying_key).is_err()
+			&& frame.verify::<Secp256k1Signature, Sha3_256>(&config.mars_relay_verifying_key).is_err()
 		{
 			return Err(TightBeamError::MissingSignature);
 		}

@@ -83,7 +83,7 @@ impl TimingConstraints {
 	}
 
 	/// Extract timing events from trace
-	/// Looks for events with duration_ns set (timing information)
+	/// Looks for events with timing URNs or timing fields set
 	fn extract_timing_events(trace: &ConsumedTrace) -> Vec<&TbEvent> {
 		#[cfg(feature = "instrument")]
 		{
@@ -91,11 +91,11 @@ impl TimingConstraints {
 				.instrument_events
 				.iter()
 				.filter(|ev| {
-					// Include events with timing URNs or any event with duration_ns set
 					ev.urn == events::TIMING_WCET
 						|| ev.urn == events::TIMING_DEADLINE
 						|| ev.urn == events::TIMING_JITTER
 						|| ev.duration_ns.is_some()
+						|| ev.timestamp_ns.is_some()
 				})
 				.collect()
 		}
@@ -214,12 +214,14 @@ impl TimingConstraints {
 			let start_label = deadline.start_event.0;
 			let end_label = deadline.end_event.0;
 
-			// Filter for timing-deadline URN or any event with duration_ns
+			// Deadline pairing consumes point-in-time markers only: the
+			// timing-deadline URN with a timestamp. WCET events carry
+			// durations (span lengths) and must not cross-match here.
 			let start_events: Vec<&TbEvent> = events_by_label
 				.get(start_label)
 				.map(|v| {
 					v.iter()
-						.filter(|e| e.urn == events::TIMING_DEADLINE || e.duration_ns.is_some())
+						.filter(|e| e.urn == events::TIMING_DEADLINE && e.timestamp_ns.is_some())
 						.copied()
 						.collect()
 				})
@@ -228,7 +230,7 @@ impl TimingConstraints {
 				.get(end_label)
 				.map(|v| {
 					v.iter()
-						.filter(|e| e.urn == events::TIMING_DEADLINE || e.duration_ns.is_some())
+						.filter(|e| e.urn == events::TIMING_DEADLINE && e.timestamp_ns.is_some())
 						.copied()
 						.collect()
 				})
@@ -247,9 +249,9 @@ impl TimingConstraints {
 		result: &mut TimingVerificationResult,
 	) {
 		for start_event in start_events.iter() {
-			if let Some(start_ns) = start_event.duration_ns {
+			if let Some(start_ns) = start_event.timestamp_ns {
 				if let Some(end_event) = Self::find_matching_end_event(start_ns, end_events) {
-					if let Some(end_ns) = end_event.duration_ns {
+					if let Some(end_ns) = end_event.timestamp_ns {
 						let latency_ns = end_ns.saturating_sub(start_ns);
 						Self::check_deadline_violation(
 							deadline,
@@ -271,7 +273,7 @@ impl TimingConstraints {
 	fn find_matching_end_event<'a>(start_ns: u64, end_events: &'a [&TbEvent]) -> Option<&'a TbEvent> {
 		end_events
 			.iter()
-			.find(|ev| ev.duration_ns.map(|end_ns| end_ns > start_ns).unwrap_or(false))
+			.find(|ev| ev.timestamp_ns.map(|end_ns| end_ns > start_ns).unwrap_or(false))
 			.copied()
 	}
 
@@ -427,7 +429,7 @@ mod tests {
 	use super::*;
 	use crate::builder::TypeBuilder;
 	use crate::instrumentation::events;
-	use crate::testing::specs::csp::{Process, State};
+	use crate::testing::specs::csp::{Process, ProcessBuildError, State};
 	use crate::testing::timing::{DeadlineBuilder, PathWcet, WcetConfig, WcetConfigBuilder};
 	use crate::utils::jitter::VarianceJitter;
 	use crate::utils::urn::Urn;
@@ -439,7 +441,7 @@ mod tests {
 	/// Test case for WCET constraint verification
 	struct WcetTestCase {
 		constraint_ms: u64,
-		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, duration_ns)
+		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, value_ns)
 		expected_passed: bool,
 		expected_violations: usize,
 	}
@@ -450,7 +452,7 @@ mod tests {
 		start_event: &'static str,
 		end_event: &'static str,
 		min_slack_ms: Option<u64>,
-		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, duration_ns)
+		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, value_ns)
 		expected_passed: bool,
 		expected_deadline_misses: usize,
 		expected_slack_violations: usize,
@@ -460,7 +462,7 @@ mod tests {
 	struct JitterTestCase {
 		max_jitter_ms: u64,
 		event_label: &'static str,
-		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, duration_ns)
+		events: &'static [(Urn<'static>, &'static str, u64)], // (event_urn, label, value_ns)
 		expected_passed: bool,
 		expected_violations: usize,
 	}
@@ -659,14 +661,25 @@ mod tests {
 	// Test Helpers
 	// ========================================================================
 
-	/// Create a timing event with duration
-	fn timing_event(event_urn: Urn<'static>, label: &str, duration_ns: u64, seq: u32) -> TbEvent {
+	/// Create a timing event; deadline markers carry the value as a
+	/// timestamp, every other timing URN carries it as a duration
+	fn timing_event(event_urn: Urn<'static>, label: &str, value_ns: u64, seq: u32) -> TbEvent {
+		let is_deadline = event_urn == events::TIMING_DEADLINE;
 		TbEvent {
 			seq,
 			urn: event_urn,
 			label: Some(label.to_string()),
 			payload_hash: None,
-			duration_ns: Some(duration_ns),
+			duration_ns: if is_deadline {
+				None
+			} else {
+				Some(value_ns)
+			},
+			timestamp_ns: if is_deadline {
+				Some(value_ns)
+			} else {
+				None
+			},
 			flags: 0,
 			extras: None,
 		}
@@ -692,15 +705,7 @@ mod tests {
 		events
 			.iter()
 			.enumerate()
-			.map(|(seq, (event_urn, label, duration_ns))| TbEvent {
-				seq: seq as u32,
-				urn: event_urn.clone(),
-				label: Some(label.to_string()),
-				payload_hash: None,
-				duration_ns: Some(*duration_ns),
-				flags: 0,
-				extras: None,
-			})
+			.map(|(seq, (event_urn, label, value_ns))| timing_event(event_urn.clone(), label, *value_ns, seq as u32))
 			.collect()
 	}
 
@@ -723,9 +728,8 @@ mod tests {
 	fn run_wcet_test_case(case: &WcetTestCase) -> Result<(), TestingError> {
 		let result = verify_constraints(
 			|constraints| {
-				let wcet_config = WcetConfigBuilder::default()
-					.with_duration(Duration::from_millis(case.constraint_ms))
-					.build()?;
+				let duration = Duration::from_millis(case.constraint_ms);
+				let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
 				constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
 				Ok(())
 			},
@@ -755,13 +759,17 @@ mod tests {
 	fn run_deadline_test_case(case: &DeadlineTestCase) -> Result<(), TestingError> {
 		let result = verify_constraints(
 			|constraints| {
+				let duration = Duration::from_millis(case.deadline_ms);
+				let start_event = Event(case.start_event);
+				let end_event = Event(case.end_event);
 				let mut builder = DeadlineBuilder::default()
-					.with_duration(Duration::from_millis(case.deadline_ms))
-					.with_start_event(Event(case.start_event))
-					.with_end_event(Event(case.end_event));
+					.with_duration(duration)
+					.with_start_event(start_event)
+					.with_end_event(end_event);
 
 				if let Some(slack_ms) = case.min_slack_ms {
-					builder = builder.with_min_slack(Duration::from_millis(slack_ms));
+					let min_slack = Duration::from_millis(slack_ms);
+					builder = builder.with_min_slack(min_slack);
 				}
 
 				constraints.add_deadline(builder.build()?);
@@ -827,7 +835,8 @@ mod tests {
 	#[test]
 	fn test_wcet_no_duration() -> Result<(), TestingError> {
 		let mut constraints = TimingConstraints::default();
-		let wcet_config = WcetConfigBuilder::default().with_duration(Duration::from_millis(100)).build()?;
+		let duration = Duration::from_millis(100);
+		let wcet_config = WcetConfigBuilder::default().with_duration(duration).build()?;
 		constraints.add(Event("process"), TimingConstraint::Wcet(wcet_config));
 
 		let mut trace = ConsumedTrace::new();
@@ -839,6 +848,7 @@ mod tests {
 				label: Some("process".to_string()),
 				payload_hash: None,
 				duration_ns: None, // No duration
+				timestamp_ns: None,
 				flags: 0,
 				extras: None,
 			});
@@ -856,15 +866,20 @@ mod tests {
 
 	/// Helper to create WCET config
 	fn create_wcet_config(ms: u64) -> Result<WcetConfig, TestingError> {
-		WcetConfigBuilder::default().with_duration(Duration::from_millis(ms)).build()
+		let duration = Duration::from_millis(ms);
+		WcetConfigBuilder::default().with_duration(duration).build()
 	}
 
 	/// Helper to create deadline
 	fn create_deadline(ms: u64, start: &'static str, end: &'static str) -> Result<Deadline, TestingError> {
+		let duration = Duration::from_millis(ms);
+		let start_event = Event(start);
+		let end_event = Event(end);
+
 		DeadlineBuilder::default()
-			.with_duration(Duration::from_millis(ms))
-			.with_start_event(Event(start))
-			.with_end_event(Event(end))
+			.with_duration(duration)
+			.with_start_event(start_event)
+			.with_end_event(end_event)
 			.build()
 	}
 
@@ -969,7 +984,7 @@ mod tests {
 	// ========================================================================
 
 	/// Helper to create a simple test process: start -> process -> end
-	fn create_path_test_process() -> Result<Process, &'static str> {
+	fn create_path_test_process() -> Result<Process, ProcessBuildError> {
 		Process::builder("test")
 			.initial_state(State("s0"))
 			.add_terminal(State("s2"))

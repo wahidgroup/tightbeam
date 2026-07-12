@@ -7,22 +7,38 @@ use crate::{Frame, Metadata, TightBeamError, Version};
 
 #[cfg(feature = "aead")]
 use crate::asn1::OctetString;
-#[cfg(feature = "compress")]
-use crate::compress::Inflator;
+#[cfg(feature = "signature")]
+use crate::crypto::hash::Digest;
 #[cfg(feature = "crypto")]
 use crate::crypto::profiles::SecurityProfile;
 #[cfg(feature = "signature")]
-use crate::der::Encode;
-#[cfg(not(feature = "compress"))]
-pub trait Inflator {}
+use crate::crypto::sign::{verify_canonical, PrehashVerifier, SignatureEncoding};
 #[cfg(feature = "signature")]
-use crate::crypto::sign::{SignatureEncoding, Verifier};
+use crate::der::oid::AssociatedOid;
+#[cfg(feature = "signature")]
+use crate::der::Encode;
+#[cfg(feature = "signature")]
+use crate::error::ReceivedExpectedError;
 #[cfg(feature = "aead")]
 use crate::EncryptedContentInfo;
 #[cfg(feature = "signature")]
 use crate::SignerInfo;
 
-/// A marker trait for that can be used as the body of a TightBeam message.
+/// Decompresses message bodies.
+///
+/// A single always-present trait so downstream code compiles identically
+/// under every feature combination.
+pub trait Inflator {
+	/// Decompress `data`, returning the decompressed bytes.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the underlying codec rejects the input.
+	fn decompress(&self, data: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// A marker trait for types that can be used as the body of a TightBeam
+/// message.
 pub trait Message:
 	EncodeValue + Tagged + for<'a> crate::der::Decode<'a> + Clone + PartialEq + core::fmt::Debug + Sized + Send + Sync
 {
@@ -40,7 +56,6 @@ pub trait Message:
 	const MUST_HAVE_MESSAGE_INTEGRITY: bool = false;
 	/// Whether this message type requires frame integrity (hashing)
 	const MUST_HAVE_FRAME_INTEGRITY: bool = false;
-	// TODO MUST_BE_ORDERED: bool = - with_genesis<hash>
 
 	/// Whether this message type has a custom security profile that
 	/// constrains algorithms.
@@ -76,33 +91,32 @@ impl Frame {
 #[cfg(feature = "signature")]
 impl Frame {
 	/// Get a reference to the signature info if present.
-	pub fn to_signature_info_ref(&self) -> Option<&SignerInfo> {
+	pub fn signature_info(&self) -> Option<&SignerInfo> {
 		self.nonrepudiation.as_ref()
 	}
 
-	/// Encode the Frame for signature verification (TBS - to-be-signed)
-	/// This excludes the signature field to avoid cloning the entire structure
+	/// Encode the Frame for signature verification (TBS - to-be-signed).
+	///
+	/// Excludes `nonrepudiation` without cloning the frame: the borrowing
+	/// [`TbsScaffold`](crate::frame::TbsScaffold) reuses the derived field
+	/// encoders, so these bytes are bit-identical to the DER encoding of the
+	/// frame with `nonrepudiation` set to `None`.
 	pub fn to_tbs(&self) -> Result<Vec<u8>> {
-		// Manually encode the sequence without the signature field
-		let mut tbs_data = Vec::new();
+		let scaffold = crate::frame::TbsScaffold {
+			version: &self.version,
+			metadata: &self.metadata,
+			message: &self.message,
+			integrity: self.integrity.as_ref(),
+		};
 
-		// Encode version, metadata, and message
-		self.version.encode(&mut tbs_data)?;
-		self.metadata.encode(&mut tbs_data)?;
-		self.message.encode(&mut tbs_data)?;
-
-		// Encode integrity if present (context-specific tag 0)
-		if let Some(ref integrity) = self.integrity {
-			self.encode_tagged_integrity(&mut tbs_data, integrity)?;
-		}
-
-		// Wrap in sequence
-		self.wrap_in_sequence(tbs_data)
+		Ok(scaffold.to_der()?)
 	}
 
 	/// Verify the signature of the TightBeam message
 	///
-	/// This verifies the signature against the entire TightBeam structure.
+	/// This verifies the signature against the entire TightBeam structure
+	/// under the canonical convention: the TBS encoding is hashed once with
+	/// `D` and the signature is checked against that prehash.
 	///
 	/// # Arguments
 	/// * `verifier` - The verifier to use for signature verification
@@ -113,13 +127,26 @@ impl Frame {
 	/// # Errors
 	/// Returns an error if:
 	/// - The TightBeam doesn't contain a signature
+	/// - The SignerInfo advertises a digest other than `D`
 	/// - Signature verification fails
-	pub fn verify<S>(&self, verifier: &impl Verifier<S>) -> Result<()>
+	pub fn verify<S, D>(&self, verifier: &impl PrehashVerifier<S>) -> Result<()>
 	where
 		S: SignatureEncoding,
+		D: Digest + AssociatedOid,
 	{
 		// Extract signature info from the Frame
 		let signature_info = self.nonrepudiation.as_ref().ok_or(TightBeamError::MissingSignature)?;
+
+		// The canonical convention binds the signature to the digest declared
+		// in the SignerInfo; a mismatch is algorithm confusion, not merely a
+		// bad signature.
+		if signature_info.digest_alg.oid != D::OID {
+			return Err(TightBeamError::UnexpectedAlgorithm(ReceivedExpectedError::from((
+				signature_info.digest_alg.oid,
+				D::OID,
+			))));
+		}
+
 		let signature_bytes: &[u8] = signature_info.signature.as_bytes();
 
 		// Decode the signature
@@ -129,42 +156,16 @@ impl Frame {
 		let tbs_der = self.to_tbs()?;
 
 		// Verify signature
-		verifier.verify(&tbs_der, &signature)?;
+		verify_canonical::<D, S>(verifier, &tbs_der, &signature)?;
 
 		Ok(())
-	}
-
-	/// Encode integrity field with context-specific tagging
-	fn encode_tagged_integrity(&self, buffer: &mut Vec<u8>, integrity: &crate::DigestInfo) -> Result<()> {
-		let integrity_bytes = integrity.to_der()?;
-
-		let mut tagged_integrity = Vec::new();
-		tagged_integrity.push(0xA0); // Context-specific tag 0
-
-		let len = crate::der::Length::try_from(integrity_bytes.len())?;
-		len.encode(&mut tagged_integrity)?;
-
-		tagged_integrity.extend(integrity_bytes);
-		buffer.extend(tagged_integrity);
-		Ok(())
-	}
-
-	/// Wrap data in a DER sequence
-	fn wrap_in_sequence(&self, data: Vec<u8>) -> Result<Vec<u8>> {
-		let mut buffer = Vec::new();
-		let sequence_len = crate::der::Length::try_from(data.len())?;
-
-		buffer.push(crate::der::Tag::Sequence.into());
-		sequence_len.encode(&mut buffer)?;
-		buffer.extend(data);
-		Ok(buffer)
 	}
 }
 
 #[cfg(feature = "aead")]
 impl Frame {
 	/// Get a reference to the encrypted content info if present.
-	pub fn to_encrypted_content_info_ref(&self) -> Option<&EncryptedContentInfo> {
+	pub fn encrypted_content_info(&self) -> Option<&EncryptedContentInfo> {
 		self.metadata.confidentiality.as_ref()
 	}
 
@@ -175,14 +176,20 @@ impl Frame {
 	/// * `decryptor` - The AEAD decryptor to use for decryption
 	///
 	/// # Returns
-	/// The decrypted plaintext bytes. If the frame was compressed, these bytes
-	/// are still compressed and need to be decompressed separately.
+	/// The decrypted plaintext as a [`SecretSlice`](crate::crypto::secret::SecretSlice)
+	/// that zeroizes on drop. If the frame was compressed, these bytes are
+	/// still compressed and need to be decompressed separately. Callers that
+	/// need a raw copy opt out explicitly via
+	/// [`ToInsecure`](crate::crypto::secret::ToInsecure).
 	///
 	/// # Errors
 	/// Returns an error if:
 	/// - The metadata doesn't contain encryption info (V0 metadata)
 	/// - Decryption fails
-	pub fn decrypt_bytes(mut self, decryptor: &impl crate::crypto::aead::Decryptor) -> Result<Vec<u8>> {
+	pub fn decrypt_bytes(
+		mut self,
+		decryptor: &impl crate::crypto::aead::Decryptor,
+	) -> Result<crate::crypto::secret::SecretSlice<u8>> {
 		let mut encrypted_content_info = self
 			.metadata
 			.confidentiality
@@ -221,10 +228,93 @@ impl Frame {
 	where
 		T: Message,
 	{
+		use crate::crypto::secret::ToInsecure;
+
 		let was_compressed = self.metadata.compactness.is_some();
-		let plaintext = self.decrypt_bytes(decryptor)?;
-		let decompressed = Self::decompress(plaintext, was_compressed, inflator)?;
+		let plaintext = self.decrypt_bytes(decryptor)?.to_insecure()?;
+		let decompressed = Self::decompress(plaintext.into_vec(), was_compressed, inflator)?;
+
 		crate::decode::<T>(&decompressed)
+	}
+
+	/// Decrypt the message body in place, turning an encrypted frame into
+	/// its cleartext equivalent.
+	///
+	/// Frame-level `integrity` and `nonrepudiation` cover the encrypted
+	/// body and are left untouched: verify them *before* calling, they
+	/// will no longer match afterwards.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::MissingEncryptionInfo`] -- frame is not encrypted.
+	/// - [`TightBeamError::MissingInflator`] -- body is compressed with no inflator.
+	/// - Decryption or decompression errors from the underlying implementations.
+	pub fn decrypt_in_place(
+		&mut self,
+		decryptor: &dyn crate::crypto::aead::Decryptor,
+		inflator: Option<&dyn Inflator>,
+	) -> Result<()> {
+		use crate::crypto::secret::ToInsecure;
+
+		let Some(mut encrypted) = self.metadata.confidentiality.take() else {
+			return Err(TightBeamError::MissingEncryptionInfo);
+		};
+
+		if self.metadata.compactness.is_some() && inflator.is_none() {
+			self.metadata.confidentiality = Some(encrypted);
+			return Err(TightBeamError::MissingInflator);
+		}
+
+		encrypted.encrypted_content = Some(OctetString::new(core::mem::take(&mut self.message))?);
+
+		match decryptor.decrypt_content(&encrypted) {
+			Ok(plaintext) => {
+				let was_compressed = self.metadata.compactness.take().is_some();
+				let plaintext = plaintext.to_insecure()?;
+
+				self.message = Self::decompress(plaintext.into_vec(), was_compressed, inflator)?;
+
+				Ok(())
+			}
+			Err(err) => {
+				if let Some(content) = encrypted.encrypted_content.take() {
+					self.message = content.into_bytes();
+				}
+				self.metadata.confidentiality = Some(encrypted);
+				Err(err)
+			}
+		}
+	}
+}
+
+impl Frame {
+	/// Decompress the message body in place for a cleartext-but-compressed
+	/// frame, clearing `compactness` on success.
+	///
+	/// A frame without `compactness` is returned unchanged. On
+	/// decompression failure the frame is restored unchanged.
+	///
+	/// # Errors
+	///
+	/// Returns the underlying codec error when the inflator rejects the
+	/// body.
+	pub fn inflate_in_place(&mut self, inflator: &dyn Inflator) -> Result<()> {
+		let Some(compactness) = self.metadata.compactness.take() else {
+			return Ok(());
+		};
+
+		let compressed = core::mem::take(&mut self.message);
+		match inflator.decompress(&compressed) {
+			Ok(plaintext) => {
+				self.message = plaintext;
+				Ok(())
+			}
+			Err(err) => {
+				self.message = compressed;
+				self.metadata.compactness = Some(compactness);
+				Err(err)
+			}
+		}
 	}
 }
 
@@ -241,59 +331,121 @@ crate::impl_from!(Frame, tb => Version: tb.version);
 #[cfg(feature = "signature")]
 crate::impl_try_from!(Frame, tb => SignerInfo: nonrepudiation, TightBeamError::MissingSignature);
 
+/// Outcome of an integrity verification check.
+#[cfg(feature = "digest")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityVerdict {
+	/// Recomputed digest matches the stored value.
+	Verified,
+	/// The frame carries no integrity value to check.
+	Absent,
+	/// The stored digest was produced by a different algorithm than `D`.
+	AlgorithmMismatch,
+	/// Recomputed digest differs: the covered bytes changed after digesting.
+	Mismatch,
+}
+
+#[cfg(feature = "digest")]
+impl IntegrityVerdict {
+	/// `true` only for [`IntegrityVerdict::Verified`].
+	pub fn is_verified(self) -> bool {
+		matches!(self, IntegrityVerdict::Verified)
+	}
+}
+
 #[cfg(feature = "digest")]
 impl Frame {
 	/// Get a reference to the frame integrity info if present.
-	pub fn to_integrity_info_ref(&self) -> Option<&crate::DigestInfo> {
+	pub fn integrity_info(&self) -> Option<&crate::DigestInfo> {
 		self.integrity.as_ref()
 	}
 
 	/// Get a reference to the message integrity info if present.
-	pub fn to_message_integrity_ref(&self) -> Option<&crate::DigestInfo> {
+	pub fn message_integrity(&self) -> Option<&crate::DigestInfo> {
 		self.metadata.integrity.as_ref()
 	}
 
-	/// Verify a disclosed [`Opening`](crate::crypto::commitment::Opening) against
-	/// this frame's message commitment.
+	/// Check a disclosed [`Opening`](crate::crypto::commitment::Opening)
+	/// against this frame's message commitment, reporting which condition
+	/// held.
+	pub fn message_commitment_verdict<D>(
+		&self,
+		opening: &crate::crypto::commitment::Opening,
+	) -> Result<IntegrityVerdict>
+	where
+		D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
+	{
+		let Some(commitment) = self.metadata.integrity.as_ref() else {
+			return Ok(IntegrityVerdict::Absent);
+		};
+		if commitment.algorithm.oid != D::OID {
+			return Ok(IntegrityVerdict::AlgorithmMismatch);
+		}
+
+		if opening.verify::<D>(commitment)? {
+			Ok(IntegrityVerdict::Verified)
+		} else {
+			Ok(IntegrityVerdict::Mismatch)
+		}
+	}
+
+	/// Verify a disclosed [`Opening`](crate::crypto::commitment::Opening)
+	/// against this frame's message commitment.
 	///
-	/// Returns `Ok(false)` when no message integrity value is present or the
-	/// opening does not match the commitment.
+	/// Convenience over [`Frame::message_commitment_verdict`]: returns
+	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch alike.
+	/// Callers that must distinguish a stripped commitment from a tampered one
+	/// use the verdict method.
 	pub fn verify_message_commitment<D>(&self, opening: &crate::crypto::commitment::Opening) -> Result<bool>
 	where
 		D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
 	{
-		match self.metadata.integrity.as_ref() {
-			Some(commitment) => opening.verify::<D>(commitment),
-			None => Ok(false),
+		Ok(self.message_commitment_verdict::<D>(opening)?.is_verified())
+	}
+
+	/// Check this frame's frame-integrity (FI) digest, reporting which
+	/// condition held.
+	///
+	/// Recomputes `H(SEQUENCE { version, metadata })` with `D` and compares it
+	/// against the stored digest.
+	pub fn frame_integrity_verdict<D>(&self) -> Result<IntegrityVerdict>
+	where
+		D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
+	{
+		let Some(info) = self.integrity.as_ref() else {
+			return Ok(IntegrityVerdict::Absent);
+		};
+		if info.algorithm.oid != D::OID {
+			return Ok(IntegrityVerdict::AlgorithmMismatch);
+		}
+
+		let scaffold = crate::frame::FrameIntegrityScaffold { version: &self.version, metadata: &self.metadata };
+		let recomputed = crate::utils::digest::<D>(&crate::encode(&scaffold)?)?;
+		if recomputed.digest.as_bytes() == info.digest.as_bytes() {
+			Ok(IntegrityVerdict::Verified)
+		} else {
+			Ok(IntegrityVerdict::Mismatch)
 		}
 	}
 
 	/// Verify this frame's frame-integrity (FI) digest.
 	///
-	/// Recomputes `H(SEQUENCE { version, metadata })` with `D` and compares it
-	/// against the stored digest.
+	/// Convenience over [`Frame::frame_integrity_verdict`]: returns
+	/// `Ok(false)` for absence, algorithm mismatch, and digest mismatch alike.
+	/// Callers that must distinguish a stripped FI field from a tampered
+	/// envelope use the verdict method.
 	pub fn verify_frame_integrity<D>(&self) -> Result<bool>
 	where
 		D: crate::crypto::hash::Digest + crate::der::oid::AssociatedOid,
 	{
-		let info = match self.integrity.as_ref() {
-			Some(info) => info,
-			None => return Ok(false),
-		};
-		if info.algorithm.oid != D::OID {
-			return Ok(false);
-		}
-
-		let scaffold = crate::frame::FrameIntegrityScaffold { version: &self.version, metadata: &self.metadata };
-		let recomputed = crate::utils::digest::<D>(&crate::encode(&scaffold)?)?;
-		Ok(recomputed.digest.as_bytes() == info.digest.as_bytes())
+		Ok(self.frame_integrity_verdict::<D>()?.is_verified())
 	}
 }
 
 #[cfg(feature = "compress")]
 impl Frame {
 	/// Get a reference to the compressed data info if present.
-	pub fn to_compressed_data_ref(&self) -> Option<&crate::CompressedData> {
+	pub fn compressed_data(&self) -> Option<&crate::CompressedData> {
 		self.metadata.compactness.as_ref()
 	}
 
@@ -314,7 +466,7 @@ impl Frame {
 	pub fn decompress(plaintext: Vec<u8>, was_compressed: bool, inflator: Option<&dyn Inflator>) -> Result<Vec<u8>> {
 		if was_compressed {
 			let inflator = inflator.ok_or(TightBeamError::MissingInflator)?;
-			Ok(inflator.decompress(&plaintext)?)
+			inflator.decompress(&plaintext)
 		} else {
 			Ok(plaintext)
 		}
@@ -378,6 +530,13 @@ mod tests {
 		flag: bool,
 	}
 
+	/// Pin `decoded` to the type of `original`: with reduced feature sets the
+	/// `serde_json` dev-dependency's `PartialEq<Value>` impls for integers make
+	/// a bare `assert_eq!` on `decode`'s inferred output ambiguous.
+	fn assert_round_trip<T: PartialEq + core::fmt::Debug>(original: &T, decoded: &T) {
+		assert_eq!(original, decoded);
+	}
+
 	/// Macro to generate encode/decode round-trip tests
 	macro_rules! test_encode_decode {
 		($($name:ident: $value:expr,)*) => {
@@ -392,7 +551,7 @@ mod tests {
 
 					// Decode
 					let decoded = crate::decode(&encoded).unwrap();
-					assert_eq!(original, decoded);
+					assert_round_trip(&original, &decoded);
 
 					// Verify it's valid DER (encode again and compare)
 					let re_encoded = crate::encode(&decoded).unwrap();
@@ -728,6 +887,39 @@ mod tests {
 		assert!(!NoProfileMessage::HAS_PROFILE);
 	}
 
+	#[cfg(all(feature = "signature", feature = "builder", feature = "sha3"))]
+	mod tbs_encoding {
+		use super::*;
+		use crate::testing::create_frame_with_frame_integrity;
+
+		/// Signature validity depends on `to_tbs` staying bit-identical to the
+		/// derived DER encoding of a frame with `nonrepudiation` stripped.
+		#[test]
+		fn tbs_matches_derived_encoding_with_integrity() -> Result<()> {
+			let frame = create_frame_with_frame_integrity();
+
+			let mut unsigned = frame.clone();
+			unsigned.nonrepudiation = None;
+
+			assert_eq!(frame.to_tbs()?, crate::encode(&unsigned)?);
+
+			Ok(())
+		}
+
+		#[test]
+		fn tbs_matches_derived_encoding_without_integrity() -> Result<()> {
+			let message = create_test_message(None);
+			let frame = compose! { V0: id: "tbs-basic", order: 1u64, message: message }?;
+
+			let mut unsigned = frame.clone();
+			unsigned.nonrepudiation = None;
+
+			assert_eq!(frame.to_tbs()?, crate::encode(&unsigned)?);
+
+			Ok(())
+		}
+	}
+
 	#[cfg(all(feature = "builder", feature = "sha3"))]
 	mod frame_integrity {
 		use super::*;
@@ -758,6 +950,188 @@ mod tests {
 			let message = create_test_message(None);
 			let frame = compose! { V0: id: "no-fi", order: 1u64, message: message }.unwrap();
 			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(false)));
+		}
+
+		#[test]
+		fn verdict_reports_verified() {
+			let frame = create_frame_with_frame_integrity();
+			assert!(matches!(
+				frame.frame_integrity_verdict::<Sha3_256>(),
+				Ok(IntegrityVerdict::Verified)
+			));
+		}
+
+		#[test]
+		fn verdict_reports_mismatch_on_tamper() {
+			let mut frame = create_frame_with_frame_integrity();
+			frame.metadata.id = b"tampered".to_vec();
+			assert!(matches!(
+				frame.frame_integrity_verdict::<Sha3_256>(),
+				Ok(IntegrityVerdict::Mismatch)
+			));
+		}
+
+		#[test]
+		fn verdict_reports_algorithm_mismatch() {
+			let frame = create_frame_with_frame_integrity();
+			assert!(matches!(
+				frame.frame_integrity_verdict::<Sha3_512>(),
+				Ok(IntegrityVerdict::AlgorithmMismatch)
+			));
+		}
+
+		#[test]
+		fn verdict_reports_absent() -> Result<()> {
+			let message = create_test_message(None);
+			let frame = compose! { V0: id: "no-fi-verdict", order: 1u64, message: message }?;
+			assert!(matches!(
+				frame.frame_integrity_verdict::<Sha3_256>(),
+				Ok(IntegrityVerdict::Absent)
+			));
+
+			Ok(())
+		}
+	}
+
+	#[cfg(feature = "aead")]
+	mod decrypt_in_place {
+		use super::*;
+		use crate::crypto::aead::Aes256GcmOid;
+		use crate::error::Result;
+		use crate::testing::TestMessage;
+
+		fn encrypted_frame() -> Result<Frame> {
+			let message = create_test_message(Some("in-place"));
+			let (_, cipher) = create_test_cipher_key();
+			compose! {
+				V1: id: "dip-001",
+					order: 1u64,
+					message: message,
+					confidentiality<Aes256GcmOid, _>: cipher
+			}
+		}
+
+		#[test]
+		fn yields_cleartext_frame_with_decodable_body() -> Result<()> {
+			let (_, cipher) = create_test_cipher_key();
+			let mut frame = encrypted_frame()?;
+
+			frame.decrypt_in_place(&cipher, None)?;
+
+			assert!(frame.metadata.confidentiality.is_none());
+
+			let decoded: TestMessage = crate::decode(&frame.message)?;
+			assert_eq!(decoded, create_test_message(Some("in-place")));
+			Ok(())
+		}
+
+		#[test]
+		fn wrong_key_restores_frame() -> Result<()> {
+			use crate::crypto::aead::{Aes256Gcm, KeyInit};
+			use crate::crypto::common::Key;
+
+			let mut frame = encrypted_frame()?;
+			let original = frame.clone();
+			let wrong_cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from([0x44; 32]));
+
+			let result = frame.decrypt_in_place(&wrong_cipher, None);
+			assert!(result.is_err());
+			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		#[test]
+		fn cleartext_frame_rejected() -> Result<()> {
+			let message = create_test_message(None);
+			let (_, cipher) = create_test_cipher_key();
+			let mut frame = compose! { V0: id: "dip-002", order: 1u64, message: message }?;
+
+			let result = frame.decrypt_in_place(&cipher, None);
+			assert!(matches!(result, Err(TightBeamError::MissingEncryptionInfo)));
+			Ok(())
+		}
+
+		#[test]
+		fn compressed_without_inflator_fails_before_mutation() -> Result<()> {
+			use crate::cms::compressed_data::CompressedData;
+			use crate::cms::content_info::CmsVersion;
+			use crate::cms::signed_data::EncapsulatedContentInfo;
+			use crate::oids::{COMPRESSION_ZSTD, DATA};
+			use crate::spki::AlgorithmIdentifier;
+
+			let (_, cipher) = create_test_cipher_key();
+			let mut frame = encrypted_frame()?;
+			frame.metadata.compactness = Some(CompressedData {
+				version: CmsVersion::V0,
+				compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZSTD, parameters: None },
+				encap_content_info: EncapsulatedContentInfo { econtent_type: DATA, econtent: None },
+			});
+
+			let original = frame.clone();
+			let result = frame.decrypt_in_place(&cipher, None);
+			assert!(matches!(result, Err(TightBeamError::MissingInflator)));
+			assert_eq!(frame, original);
+			Ok(())
+		}
+	}
+
+	#[cfg(feature = "compress")]
+	mod inflate_in_place {
+		use super::*;
+		use crate::compress::{Compressor, ZstdCompression};
+		use crate::error::Result;
+
+		fn compressed_frame(body: &[u8]) -> Result<Frame> {
+			let zstd = ZstdCompression::default();
+			let (compressed, compression_info) = zstd.compress(body, None)?;
+
+			let mut metadata = Metadata::default();
+			metadata.id = b"inf-001".to_vec();
+			metadata.compactness = Some(compression_info);
+
+			Ok(Frame {
+				version: Version::V0,
+				metadata,
+				message: compressed,
+				integrity: None,
+				nonrepudiation: None,
+			})
+		}
+
+		#[test]
+		fn restores_original_body_and_clears_compactness() -> Result<()> {
+			let body = b"inflate me".repeat(64);
+			let mut frame = compressed_frame(&body)?;
+
+			frame.inflate_in_place(&ZstdCompression::default())?;
+
+			assert!(frame.metadata.compactness.is_none());
+			assert_eq!(frame.message, body);
+			Ok(())
+		}
+
+		#[test]
+		fn corrupt_body_restores_frame() -> Result<()> {
+			let mut frame = compressed_frame(b"inflate me")?;
+			frame.message = vec![0xFF; 8];
+
+			let original = frame.clone();
+			let result = frame.inflate_in_place(&ZstdCompression::default());
+			assert!(result.is_err());
+			assert_eq!(frame, original);
+			Ok(())
+		}
+
+		#[test]
+		fn uncompressed_frame_untouched() -> Result<()> {
+			let message = create_test_message(None);
+			let mut frame = compose! { V0: id: "inf-002", order: 1u64, message: message }?;
+			let original = frame.clone();
+
+			frame.inflate_in_place(&ZstdCompression::default())?;
+
+			assert_eq!(frame, original);
+			Ok(())
 		}
 	}
 }

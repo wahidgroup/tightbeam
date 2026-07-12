@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use crate::crypto::x509::attr::Attribute;
 use crate::der::asn1::{ObjectIdentifier, OctetString, UintRef};
-use crate::der::{asn1::Any, Sequence};
+use crate::der::{asn1::Any, Sequence, Tagged};
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 
 use super::{HandshakeAlert, HandshakeError};
@@ -16,6 +16,11 @@ use crate::oids::{
 	HANDSHAKE_SELECT_VERSION, HANDSHAKE_SERVER_NONCE, HANDSHAKE_SUPPORTED_CURVES, HANDSHAKE_TRANSCRIPT_HASH,
 };
 
+/// Maximum number of curve OIDs accepted in a supported-curves attribute.
+///
+/// Bounds pre-authentication decode work against offer-flood DoS (CWE-770).
+pub const MAX_SUPPORTED_CURVES: usize = 32;
+
 /// CMS Attribute simplified (profile enforces single value only)
 #[derive(Sequence, Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeAttribute {
@@ -23,7 +28,8 @@ pub struct HandshakeAttribute {
 	pub attr_values: Vec<Any>, // MUST contain exactly one value under profile
 }
 
-// Provide ordering for canonical DER SET OF encoding. Order by attr_type OID bytes then encoded first value.
+// Provide ordering for canonical DER SET OF encoding. Order by attr_type OID bytes,
+// then lexicographically by each value's encoding (tag octet, then content octets).
 impl core::cmp::PartialOrd for HandshakeAttribute {
 	fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
 		Some(self.cmp(other))
@@ -37,8 +43,15 @@ impl core::cmp::Ord for HandshakeAttribute {
 			return oid_ord;
 		}
 
-		core::cmp::Ordering::Equal
+		let lhs = self.attr_values.iter().map(any_encoding_key);
+		let rhs = other.attr_values.iter().map(any_encoding_key);
+		lhs.cmp(rhs)
 	}
+}
+
+/// Deterministic comparison key for an `Any`: tag octet followed by content octets.
+fn any_encoding_key(any: &Any) -> (u8, &[u8]) {
+	(u8::from(any.tag()), any.value())
 }
 
 impl HandshakeAttribute {
@@ -169,6 +182,18 @@ pub fn encode_security_accept(accept: &SecurityAccept) -> Result<HandshakeAttrib
 	HandshakeAttribute::new_single(HANDSHAKE_SECURITY_ACCEPT, any)
 }
 
+/// Canonical DER bytes of a `SecurityAccept` for transcript binding.
+///
+/// Both handshake sides append these bytes to the transcript before the
+/// Finished hash is computed, binding the negotiated profile to the
+/// signature (CWE-345): a tampered accept attribute changes the client's
+/// transcript hash and fails signature verification.
+pub fn security_accept_transcript_bytes(accept: &SecurityAccept) -> Result<Vec<u8>, HandshakeError> {
+	use crate::der::Encode;
+
+	Ok(Any::encode_from(accept)?.to_der()?)
+}
+
 // -------------------------- Decoders --------------------------
 
 pub fn extract_nonce(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeError> {
@@ -185,22 +210,22 @@ pub fn extract_nonce(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeErr
 	Ok(out)
 }
 
-pub fn extract_u16(attr: &HandshakeAttribute) -> Result<u16, HandshakeError> {
-	let any = attr.value()?;
+/// Decode a one- or two-byte unsigned INTEGER from an `Any`.
+fn u16_from_any(any: &Any) -> Result<u16, HandshakeError> {
 	let uint_ref: UintRef = any.decode_as().map_err(|_| HandshakeError::InvalidIntegerEncoding)?;
-
 	let b = uint_ref.as_bytes();
 	if b.is_empty() || b.len() > 2 {
 		return Err(HandshakeError::IntegerOutOfRange);
 	}
+	if b.len() == 1 {
+		return Ok(b[0] as u16);
+	}
 
-	let v = if b.len() == 1 {
-		b[0] as u16
-	} else {
-		((b[0] as u16) << 8) | b[1] as u16
-	};
+	Ok(((b[0] as u16) << 8) | b[1] as u16)
+}
 
-	Ok(v)
+pub fn extract_u16(attr: &HandshakeAttribute) -> Result<u16, HandshakeError> {
+	u16_from_any(attr.value()?)
 }
 
 pub fn extract_transcript_hash(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeError> {
@@ -218,9 +243,14 @@ pub fn extract_supported_curves(attr: &HandshakeAttribute) -> Result<Vec<ObjectI
 	if attr.attr_type != HANDSHAKE_SUPPORTED_CURVES {
 		return Err(HandshakeError::MissingAttribute);
 	}
-
 	if attr.attr_values.is_empty() {
 		return Err(HandshakeError::MissingAttribute);
+	}
+	if attr.attr_values.len() > MAX_SUPPORTED_CURVES {
+		return Err(HandshakeError::TooManySupportedCurves {
+			count: attr.attr_values.len(),
+			max: MAX_SUPPORTED_CURVES,
+		});
 	}
 
 	let mut curves = Vec::with_capacity(attr.attr_values.len());
@@ -279,16 +309,28 @@ pub fn extract_security_accept(attr: &HandshakeAttribute) -> Result<SecurityAcce
 	Ok(any.decode_as()?)
 }
 
-pub fn extract_alert(attr: &HandshakeAttribute) -> Result<HandshakeAlert, HandshakeError> {
-	let code = extract_u16(attr)? as u8;
-	match code {
+/// Decode an alert code from a single INTEGER-bearing `Any`.
+///
+/// Alert codes occupy the u8 domain; wider values are rejected outright so a
+/// two-byte code can never alias a valid alert through truncation.
+fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
+	let code = u16_from_any(any)?;
+	if code > u8::MAX as u16 {
+		return Err(HandshakeError::IntegerOutOfRange);
+	}
+
+	match code as u8 {
 		1 => Ok(HandshakeAlert::AuthRequired),
 		2 => Ok(HandshakeAlert::VersionMismatch),
 		3 => Ok(HandshakeAlert::AlgorithmMismatch),
 		4 => Ok(HandshakeAlert::DecryptFail),
 		5 => Ok(HandshakeAlert::FinishedIntegrityFail),
-		_ => Err(HandshakeError::UnknownAlertCode(code)),
+		code => Err(HandshakeError::UnknownAlertCode(code)),
 	}
+}
+
+pub fn extract_alert(attr: &HandshakeAttribute) -> Result<HandshakeAlert, HandshakeError> {
+	alert_from_any(attr.value()?)
 }
 
 /// Extract alert from X.509 attribute without cloning
@@ -299,28 +341,7 @@ pub fn extract_alert_x509(attr: &Attribute) -> Result<HandshakeAlert, HandshakeE
 		return Err(HandshakeError::InvalidAttributeArity);
 	}
 
-	let any = &values[0];
-	let uint_ref: UintRef = any.decode_as().map_err(|_| HandshakeError::InvalidIntegerEncoding)?;
-
-	let b = uint_ref.as_bytes();
-	if b.is_empty() || b.len() > 2 {
-		return Err(HandshakeError::IntegerOutOfRange);
-	}
-
-	let code = if b.len() == 1 {
-		b[0] as u16
-	} else {
-		((b[0] as u16) << 8) | b[1] as u16
-	} as u8;
-
-	match code {
-		1 => Ok(HandshakeAlert::AuthRequired),
-		2 => Ok(HandshakeAlert::VersionMismatch),
-		3 => Ok(HandshakeAlert::AlgorithmMismatch),
-		4 => Ok(HandshakeAlert::DecryptFail),
-		5 => Ok(HandshakeAlert::FinishedIntegrityFail),
-		_ => Err(HandshakeError::UnknownAlertCode(code)),
-	}
+	alert_from_any(&values[0])
 }
 
 // -------------------------- Attribute search --------------------------
@@ -549,6 +570,39 @@ mod tests {
 	fn empty_supported_curves_fails() {
 		let result = encode_supported_curves(&[]);
 		assert!(matches!(result.unwrap_err(), HandshakeError::MissingAttribute));
+	}
+
+	#[test]
+	fn oversized_supported_curves_rejected() -> Result<(), HandshakeError> {
+		let any = Any::encode_from(&CURVE_SECP256K1)?;
+		let values = vec![any; MAX_SUPPORTED_CURVES + 1];
+		let attr = HandshakeAttribute { attr_type: HANDSHAKE_SUPPORTED_CURVES, attr_values: values };
+
+		let result = extract_supported_curves(&attr);
+		assert!(matches!(
+			result.unwrap_err(),
+			HandshakeError::TooManySupportedCurves { count: 33, max: 32 }
+		));
+		Ok(())
+	}
+
+	#[test]
+	fn attribute_ord_tiebreaks_on_value() -> Result<(), der::Error> {
+		let low = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE, attr_values: vec![mk_integer(&[0x01])?] };
+		let high = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE, attr_values: vec![mk_integer(&[0x02])?] };
+		assert_eq!(low.cmp(&high), core::cmp::Ordering::Less);
+		assert_eq!(high.cmp(&low), core::cmp::Ordering::Greater);
+		assert_eq!(low.cmp(&low.clone()), core::cmp::Ordering::Equal);
+		Ok(())
+	}
+
+	#[test]
+	fn alert_code_above_255_rejected() -> Result<(), der::Error> {
+		// 0x0101 = 257; truncating to u8 would alias alert code 1 (AuthRequired)
+		let any = mk_integer(&[0x01, 0x01])?;
+		let attr = HandshakeAttribute { attr_type: HANDSHAKE_ABORT_ALERT, attr_values: vec![any] };
+		assert!(matches!(extract_alert(&attr).unwrap_err(), HandshakeError::IntegerOutOfRange));
+		Ok(())
 	}
 
 	#[test]

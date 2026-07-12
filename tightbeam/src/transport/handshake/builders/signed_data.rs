@@ -7,8 +7,7 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::crypto::hash::Digest;
 use crate::crypto::profiles::CryptoProvider;
-use crate::crypto::sign::Signer;
-use crate::crypto::sign::{Keypair, SignatureEncoding};
+use crate::crypto::sign::{sign_canonical, Keypair, PrehashSigner, SignatureEncoding};
 use crate::crypto::x509::utils::compute_signer_identifier;
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::oid::AssociatedOid;
@@ -46,7 +45,7 @@ where
 	P: CryptoProvider,
 	P::Signature: SignatureEncoding,
 	P::Digest: Digest + AssociatedOid,
-	K: Signer<P::Signature> + Keypair,
+	K: PrehashSigner<P::Signature> + Keypair,
 	K::VerifyingKey: EncodePublicKey,
 {
 	/// Create a new SignedData builder.
@@ -93,15 +92,9 @@ where
 	/// # Returns
 	/// A complete CMS SignedData structure with signature
 	pub fn build(self, content: &[u8]) -> Result<SignedData, HandshakeError> {
-		// 1. Hash the content
-		let mut hasher = P::Digest::new();
-		hasher.update(content);
-
-		let digest = hasher.finalize();
-		let digest_bytes = digest.as_slice();
-
-		// 2. Sign the digest
-		let signature = self.signer.try_sign(digest_bytes)?;
+		// 1. Sign under the canonical convention: SHA3 digest once, ECDSA
+		// over the prehash, matching the advertised signature-algorithm OID.
+		let signature = sign_canonical::<P::Digest, P::Signature>(self.signer, content)?;
 		let signature_bytes = signature.to_bytes();
 
 		// 3. Create SignerInfo (move values instead of cloning)

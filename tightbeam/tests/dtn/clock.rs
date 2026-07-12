@@ -63,19 +63,19 @@ pub mod delays {
 	#[allow(dead_code)]
 	pub const MAX_LIGHT_TIME_MS: u64 = 22 * 60 * 1000;
 
-	/// Rover → Relay delay (Mars orbit): ~1-2 seconds
+	/// Rover -> Relay delay (Mars orbit): ~1-2 seconds
 	pub const ROVER_TO_RELAY_MS: u64 = 1500;
 
-	/// Relay → Earth delay (use average for test)
+	/// Relay -> Earth delay (use average for test)
 	pub const RELAY_TO_EARTH_MS: u64 = AVG_LIGHT_TIME_MS;
 
-	/// Earth → Relay delay
+	/// Earth -> Relay delay
 	pub const EARTH_TO_RELAY_MS: u64 = AVG_LIGHT_TIME_MS;
 
-	/// Relay → Rover delay
+	/// Relay -> Rover delay
 	pub const RELAY_TO_ROVER_MS: u64 = 1500;
 
-	/// Total round-trip time (Rover → Earth → Rover)
+	/// Total round-trip time (Rover -> Earth -> Rover)
 	/// NOTE: Useful for calculating expected completion times in tests
 	#[allow(dead_code)]
 	pub const ROUND_TRIP_MS: u64 = ROVER_TO_RELAY_MS + RELAY_TO_EARTH_MS + EARTH_TO_RELAY_MS + RELAY_TO_ROVER_MS;

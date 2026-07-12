@@ -1,7 +1,7 @@
 //! Gate policies for hive security and backpressure
 //!
-//! Contains circuit breaker and security gate implementations for
-//! cluster command authentication and capacity management.
+//! Contains circuit breaker, replay guard, and security gate implementations
+//! for cluster command authentication and capacity management.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -20,9 +20,17 @@ use crate::utils::BasisPoints;
 use crate::Frame;
 
 #[cfg(feature = "x509")]
-use crate::crypto::x509::store::CertificateTrust;
+mod x509 {
+	pub use std::collections::HashMap;
+	pub use std::sync::Mutex;
+
+	pub use crate::colony::common::ClusterCommand;
+	pub use crate::crypto::x509::store::CertificateTrust;
+	pub use crate::der::Encode;
+}
+
 #[cfg(feature = "x509")]
-use crate::der::Encode;
+use x509::*;
 
 // ============================================================================
 // Circuit Breaker
@@ -39,22 +47,29 @@ pub enum CircuitState {
 	Closed = 0,
 	/// Tripped - rejecting all requests
 	Open = 1,
-	/// Testing - allowing single request to check recovery
+	/// Testing - allowing probe requests to check recovery
 	HalfOpen = 2,
 }
 
 /// Circuit breaker for cluster authentication failures
 ///
 /// Trips after consecutive auth failures, halting all cluster communication.
-/// After a cooldown period, transitions to half-open to allow a probe request.
+/// After a cooldown period, transitions to half-open to allow probe requests.
+///
+/// Only failures attributable to a *known* signer count toward the
+/// threshold (see [`ClusterSecurityGate`]): unauthenticated garbage must
+/// not be able to sever the control plane between hive and legitimate
+/// cluster (CWE-645).
 ///
 /// # Thread Safety
 ///
-/// All state is managed via atomics for lock-free concurrent access.
+/// All state is managed via atomics for lock-free concurrent access. The
+/// `Open -> HalfOpen` transition is a compare-and-swap, so exactly one
+/// caller performs it per cooldown expiry.
 pub struct ClusterCircuitBreaker {
 	/// Current state (CircuitState as u8)
 	state: AtomicU8,
-	/// Consecutive failure count
+	/// Consecutive failure count (saturating)
 	failures: AtomicU8,
 	/// Timestamp when breaker opened (ms since UNIX epoch)
 	opened_at: AtomicU64,
@@ -88,18 +103,28 @@ impl ClusterCircuitBreaker {
 		match self.state() {
 			CircuitState::Closed => true,
 			CircuitState::Open => {
-				// Check if cooldown has elapsed
 				let now = current_timestamp_ms();
 				let opened = self.opened_at.load(Ordering::Relaxed);
-				if now.saturating_sub(opened) >= self.cooldown_ms {
-					// Transition to half-open for probe
-					self.state.store(CircuitState::HalfOpen as u8, Ordering::Release);
-					true
-				} else {
-					false
+				if now.saturating_sub(opened) < self.cooldown_ms {
+					return false;
 				}
+
+				// Compare-and-swap so concurrent callers racing the same
+				// cooldown expiry produce a single state transition.
+				self.state
+					.compare_exchange(
+						CircuitState::Open as u8,
+						CircuitState::HalfOpen as u8,
+						Ordering::AcqRel,
+						Ordering::Acquire,
+					)
+					.is_ok()
 			}
-			CircuitState::HalfOpen => true, // Allow probe request
+			// Probes stay allowed until one resolves via record_success or
+			// record_auth_failure. Rejecting here instead would deadlock the
+			// breaker when a probe slot is consumed by a frame that resolves
+			// neither way.
+			CircuitState::HalfOpen => true,
 		}
 	}
 
@@ -113,13 +138,27 @@ impl ClusterCircuitBreaker {
 
 	/// Record an authentication failure
 	///
-	/// Increments failure count. If threshold is reached, trips the circuit.
+	/// Increments failure count (saturating). If the threshold is reached,
+	/// trips the circuit. A failure while half-open re-opens immediately
+	/// and restarts the cooldown.
 	pub fn record_auth_failure(&self) {
-		let failures = self.failures.fetch_add(1, Ordering::AcqRel) + 1;
-		if failures >= self.failure_threshold {
-			self.state.store(CircuitState::Open as u8, Ordering::Release);
-			self.opened_at.store(current_timestamp_ms(), Ordering::Relaxed);
+		if self.state() == CircuitState::HalfOpen {
+			self.trip();
+			return;
 		}
+
+		let previous = self
+			.failures
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| Some(count.saturating_add(1)))
+			.unwrap_or(u8::MAX);
+		if previous.saturating_add(1) >= self.failure_threshold {
+			self.trip();
+		}
+	}
+
+	fn trip(&self) {
+		self.opened_at.store(current_timestamp_ms(), Ordering::Relaxed);
+		self.state.store(CircuitState::Open as u8, Ordering::Release);
 	}
 
 	/// Get the current circuit state
@@ -143,30 +182,194 @@ impl ClusterCircuitBreaker {
 	}
 }
 
+// ============================================================================
+// Trust Verification
+// ============================================================================
+
+/// Outcome of verifying a frame signature against a trust store
+///
+/// Distinguishes "no identity claimed" and "unknown identity claimed"
+/// from "trusted identity claimed with a bad signature" so callers can
+/// apply different consequences (the circuit breaker only counts the
+/// last one).
+#[cfg(feature = "x509")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustVerification {
+	/// Frame carries no nonrepudiation signature
+	MissingSignature,
+	/// Signer is not present in the trust store
+	UnknownSigner,
+	/// Signer is trusted but the signature does not verify
+	Invalid,
+	/// Signature verified against a trusted certificate
+	Verified,
+}
+
+/// Verify a frame's nonrepudiation signature against a trust store
+///
+/// Looks up the signer certificate via the frame's `SignerInfo` and
+/// verifies the signature over the frame's to-be-signed bytes. Shared by
+/// [`ClusterSecurityGate`] (hive side) and the cluster gateway's
+/// registration authentication.
+#[cfg(feature = "x509")]
+pub fn verify_frame_signature(trust_store: &dyn CertificateTrust, frame: &Frame) -> TrustVerification {
+	let Some(signer_info) = frame.nonrepudiation.as_ref() else {
+		return TrustVerification::MissingSignature;
+	};
+
+	let Some(cert) = trust_store.find_by_signer_info(signer_info) else {
+		return TrustVerification::UnknownSigner;
+	};
+
+	let algorithm_oid = signer_info.signature_algorithm.oid;
+	let signature = signer_info.signature.as_bytes();
+	let Ok(public_key_der) = cert.tbs_certificate.subject_public_key_info.to_der() else {
+		return TrustVerification::Invalid;
+	};
+
+	let Ok(message) = frame.to_tbs() else {
+		return TrustVerification::Invalid;
+	};
+
+	match trust_store
+		.to_policy_ref()
+		.verify_signature(&algorithm_oid, &public_key_der, &message, signature)
+	{
+		Ok(()) => TrustVerification::Verified,
+		Err(_) => TrustVerification::Invalid,
+	}
+}
+
+// ============================================================================
+// Replay Guard
+// ============================================================================
+
+/// Maximum distinct signatures remembered per signer per freshness window
+///
+/// Legitimate traffic is bounded by a signer's command rate inside one
+/// window. Each signer's partition fails closed at capacity rather than
+/// evicting, because an unauthenticated attacker cannot create the fresh
+/// valid signatures needed to fill it.
+#[cfg(feature = "x509")]
+pub const REPLAY_GUARD_CAPACITY: usize = 1024;
+
+/// Bounded freshness and replay window for signed cluster commands
+///
+/// A command is accepted when its `issued_at_ms` lies within
+/// `window_ms` of the hive clock (either direction, tolerating skew)
+/// AND its signature has not already been seen inside the window.
+/// Signatures are tracked per signer so one signer saturating its
+/// partition cannot block the others. Entries more than the window away
+/// from the current clock are pruned on each check, so memory is bounded by
+/// [`REPLAY_GUARD_CAPACITY`] per trusted signer.
+#[cfg(feature = "x509")]
+type SignerPartitions = HashMap<Vec<u8>, HashMap<Vec<u8>, u64>>;
+
+#[cfg(feature = "x509")]
+pub struct ReplayGuard {
+	seen: Mutex<SignerPartitions>,
+	window_ms: u64,
+}
+
+#[cfg(feature = "x509")]
+impl ReplayGuard {
+	/// Create a guard with the given freshness window in milliseconds
+	pub fn new(window_ms: u64) -> Self {
+		Self { seen: Mutex::new(HashMap::new()), window_ms }
+	}
+
+	/// Whether `issued_at_ms` is within the freshness window of `now_ms`
+	pub fn is_fresh(&self, issued_at_ms: u64, now_ms: u64) -> bool {
+		now_ms.abs_diff(issued_at_ms) <= self.window_ms
+	}
+
+	/// Record `signature` for `signer` if unseen within the window
+	///
+	/// Returns `true` when the signature is new (and now recorded).
+	/// Returns `false` for replays, and fails closed when the signer's
+	/// partition is at capacity or the lock is poisoned.
+	pub fn check_and_insert(&self, signer: &[u8], signature: &[u8], now_ms: u64) -> bool {
+		let Ok(mut seen) = self.seen.lock() else {
+			return false;
+		};
+
+		// After a backward clock step the recorded timestamps sit in the
+		// future, and a past-only check would retain them until the clock
+		// re-passes them, pinning partitions at capacity the duration.
+		seen.retain(|_, sigs| {
+			sigs.retain(|_, ts| now_ms.abs_diff(*ts) <= self.window_ms);
+			!sigs.is_empty()
+		});
+
+		// Replay detection spans all partitions: the same certificate can be
+		// named by either SignerIdentifier CHOICE arm, so a partition-local
+		// check would grant one extra replay per alternate encoding.
+		if seen.values().any(|sigs| sigs.contains_key(signature)) {
+			return false;
+		}
+
+		let sigs = seen.entry(signer.to_vec()).or_default();
+		if sigs.len() >= REPLAY_GUARD_CAPACITY {
+			return false;
+		}
+
+		sigs.insert(signature.to_vec(), now_ms);
+
+		true
+	}
+
+	/// Remove a recorded signature so the frame may be retried
+	///
+	/// The signature is recorded before the guarded operation runs. When
+	/// that operation fails, the record must be released or a legitimate
+	/// retry of the same signed frame is rejected as a replay until the
+	/// window expires.
+	pub fn forget(&self, signature: &[u8]) {
+		let Ok(mut seen) = self.seen.lock() else {
+			return;
+		};
+
+		seen.retain(|_, sigs| {
+			sigs.remove(signature);
+			!sigs.is_empty()
+		});
+	}
+}
+
 // =============================================================================
 // Gate Policies
 // =============================================================================
 
 /// Gate policy for certificate-based cluster command security
 ///
-/// Enforces nonrepudiation and integrity requirements on cluster commands
-/// using certificate-based trust verification.
+/// Enforces nonrepudiation, integrity, freshness, and replay requirements
+/// on cluster commands using certificate-based trust verification.
 ///
 /// # Security Flow
 ///
 /// 1. Check circuit breaker - reject if open
-/// 2. Verify nonrepudiation signature present
-/// 3. Verify frame integrity present
-/// 4. Look up signer certificate in trust store
-/// 5. Verify signature using certificate's public key
-/// 6. On failure: record auth failure (may trip breaker)
-/// 7. On success: record success (resets breaker)
+/// 2. Verify nonrepudiation signature present (else `Unauthorized`, not counted)
+/// 3. Verify frame integrity present (else `Unauthorized`, not counted)
+/// 4. Look up signer certificate in trust store (unknown signer: `Forbidden`, not counted)
+/// 5. Verify signature using certificate's public key (invalid: `Forbidden`, **counted**)
+/// 6. Decode the command and check `issued_at_ms` freshness (stale: `Forbidden`, not counted)
+/// 7. Reject signatures already seen inside the window (replay: `Forbidden`, not counted)
+/// 8. On success: record success (resets breaker)
+///
+/// Only step 5 counts toward the circuit breaker: it is the sole failure
+/// that proves someone holds a trusted identity claim with a bad key.
+/// Counting anything an unauthenticated peer can send would let garbage
+/// frames sever the hive from its legitimate cluster (CWE-645). Steps 6-7
+/// are not counted either: a replayed capture carries a *valid* signature,
+/// and counting it would let a replay attacker trip the breaker.
 #[cfg(feature = "x509")]
 pub struct ClusterSecurityGate {
 	/// Circuit breaker for tracking auth failures
 	circuit_breaker: Arc<ClusterCircuitBreaker>,
 	/// Trust store for certificate lookup and signature verification
 	trust_store: Arc<dyn CertificateTrust>,
+	/// Freshness window and replay set for signed commands
+	replay_guard: Arc<ReplayGuard>,
 }
 
 #[cfg(feature = "x509")]
@@ -176,76 +379,64 @@ impl ClusterSecurityGate {
 	/// # Arguments
 	/// * `circuit_breaker` - Shared circuit breaker for tracking auth failures
 	/// * `trust_store` - Trust store containing trusted certificates
-	pub fn new(circuit_breaker: Arc<ClusterCircuitBreaker>, trust_store: Arc<dyn CertificateTrust>) -> Self {
-		Self { circuit_breaker, trust_store }
+	/// * `replay_guard` - Freshness window and replay set for commands
+	pub fn new(
+		circuit_breaker: Arc<ClusterCircuitBreaker>,
+		trust_store: Arc<dyn CertificateTrust>,
+		replay_guard: Arc<ReplayGuard>,
+	) -> Self {
+		Self { circuit_breaker, trust_store, replay_guard }
 	}
 }
 
 #[cfg(feature = "x509")]
 impl GatePolicy for ClusterSecurityGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
-		// Check circuit breaker first
 		if !self.circuit_breaker.allow_request() {
 			return TransitStatus::Forbidden;
 		}
 
-		// Check nonrepudiation (required by #[beam(nonrepudiable)])
-		let signer_info = match frame.nonrepudiation.as_ref() {
-			Some(info) => info,
-			None => {
-				self.circuit_breaker.record_auth_failure();
-				return TransitStatus::Unauthorized;
-			}
+		let Some(signer_info) = frame.nonrepudiation.as_ref() else {
+			return TransitStatus::Unauthorized;
 		};
 
-		// Check integrity
 		if frame.integrity.is_none() {
-			self.circuit_breaker.record_auth_failure();
 			return TransitStatus::Unauthorized;
 		}
 
-		// Look up signer certificate - if found, signer is trusted
-		let cert = match self.trust_store.find_by_signer_info(signer_info) {
-			Some(c) => c,
-			None => {
+		match verify_frame_signature(self.trust_store.as_ref(), frame) {
+			TrustVerification::MissingSignature => return TransitStatus::Unauthorized,
+			TrustVerification::UnknownSigner => return TransitStatus::Forbidden,
+			TrustVerification::Invalid => {
 				self.circuit_breaker.record_auth_failure();
 				return TransitStatus::Forbidden;
 			}
-		};
-
-		// Verify signature using certificate's public key
-		let algorithm_oid = signer_info.signature_algorithm.oid;
-		let signature = signer_info.signature.as_bytes();
-		let public_key_der = match cert.tbs_certificate.subject_public_key_info.to_der() {
-			Ok(der) => der,
-			Err(_) => {
-				self.circuit_breaker.record_auth_failure();
-				return TransitStatus::Forbidden;
-			}
-		};
-
-		let message = match frame.to_tbs() {
-			Ok(tbs) => tbs,
-			Err(_) => {
-				self.circuit_breaker.record_auth_failure();
-				return TransitStatus::Forbidden;
-			}
-		};
-
-		match self
-			.trust_store
-			.to_policy_ref()
-			.verify_signature(&algorithm_oid, &public_key_der, &message, signature)
-		{
-			Ok(()) => {
-				self.circuit_breaker.record_success();
-				TransitStatus::Accepted
-			}
-			Err(_) => {
-				self.circuit_breaker.record_auth_failure();
-				TransitStatus::Forbidden
-			}
+			TrustVerification::Verified => {}
 		}
+
+		let Ok(command) = crate::decode::<ClusterCommand>(&frame.message) else {
+			return TransitStatus::Forbidden;
+		};
+
+		let now = current_timestamp_ms();
+		if !self.replay_guard.is_fresh(command.issued_at_ms, now) {
+			return TransitStatus::Forbidden;
+		}
+		// Signer identifier keys the replay partition; an unencodable
+		// identifier cannot be attributed, so it fails closed.
+		let Ok(signer_id) = signer_info.sid.to_der() else {
+			return TransitStatus::Forbidden;
+		};
+		if !self
+			.replay_guard
+			.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now)
+		{
+			return TransitStatus::Forbidden;
+		}
+
+		self.circuit_breaker.record_success();
+
+		TransitStatus::Accepted
 	}
 }
 
@@ -254,8 +445,10 @@ impl GatePolicy for ClusterSecurityGate {
 /// Returns `TransitStatus::Busy` when utilization exceeds threshold,
 /// signaling to the cluster that it should route work elsewhere or queue.
 ///
-/// **Exception**: Heartbeat priority frames always pass through to ensure
-/// health monitoring continues even under load.
+/// The gate itself grants no exemptions: any bypass keyed on
+/// frame-controlled data (e.g. message priority) is attacker-selectable.
+/// Callers that must keep specific traffic flowing under load (heartbeats)
+/// exempt it explicitly *after* authentication.
 pub struct BackpressureGate {
 	/// Current aggregate utilization (basis points as u16)
 	utilization: Arc<AtomicU16>,
@@ -280,18 +473,166 @@ impl BackpressureGate {
 }
 
 impl GatePolicy for BackpressureGate {
-	fn evaluate(&self, frame: &Frame) -> TransitStatus {
-		// Network-control traffic (keep-alive pheromone signal channel) always passes through
-		if frame.metadata.priority == Some(crate::MessagePriority::NetworkControl) {
-			return TransitStatus::Accepted;
-		}
-
-		// Check utilization against threshold
+	fn evaluate(&self, _frame: &Frame) -> TransitStatus {
 		let current = self.utilization.load(Ordering::Relaxed);
 		if current >= self.threshold.get() {
 			TransitStatus::Busy
 		} else {
 			TransitStatus::Accepted
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn breaker_trips_after_threshold() {
+		let breaker = ClusterCircuitBreaker::new(3, 60_000);
+
+		breaker.record_auth_failure();
+		breaker.record_auth_failure();
+		assert_eq!(breaker.state(), CircuitState::Closed);
+
+		breaker.record_auth_failure();
+		assert_eq!(breaker.state(), CircuitState::Open);
+		assert!(!breaker.allow_request());
+	}
+
+	#[test]
+	fn breaker_probe_success_closes() {
+		let breaker = ClusterCircuitBreaker::new(1, 0);
+
+		breaker.record_auth_failure();
+		assert!(breaker.allow_request());
+		assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+		breaker.record_success();
+		assert_eq!(breaker.state(), CircuitState::Closed);
+	}
+
+	#[test]
+	fn breaker_probe_failure_reopens() {
+		let breaker = ClusterCircuitBreaker::new(1, 0);
+
+		breaker.record_auth_failure();
+		assert!(breaker.allow_request());
+		assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+		breaker.record_auth_failure();
+		assert_eq!(breaker.state(), CircuitState::Open);
+	}
+
+	#[test]
+	fn breaker_reset_clears_state() {
+		let breaker = ClusterCircuitBreaker::new(1, 60_000);
+
+		breaker.record_auth_failure();
+		assert!(breaker.is_open());
+
+		breaker.reset();
+		assert_eq!(breaker.state(), CircuitState::Closed);
+		assert!(breaker.allow_request());
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_accepts_first_rejects_second() {
+		let guard = ReplayGuard::new(30_000);
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
+		assert!(!guard.check_and_insert(b"signer-1", b"sig-a", 2_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-b", 2_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_prunes_expired_entries() {
+		let guard = ReplayGuard::new(1_000);
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 3_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_prunes_future_dated_entries_after_clock_regression() {
+		let guard = ReplayGuard::new(1_000);
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 10_000));
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 5_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_saturated_signer_does_not_block_others() {
+		let guard = ReplayGuard::new(30_000);
+		for i in 0..REPLAY_GUARD_CAPACITY {
+			assert!(guard.check_and_insert(b"signer-1", &i.to_be_bytes(), 1_000));
+		}
+		assert!(!guard.check_and_insert(b"signer-1", b"sig-overflow", 1_000));
+		assert!(guard.check_and_insert(b"signer-2", b"sig-a", 1_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_rejects_replay_across_signer_partitions() {
+		let guard = ReplayGuard::new(30_000);
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
+		assert!(!guard.check_and_insert(b"signer-2", b"sig-a", 1_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_forget_permits_retry() {
+		let guard = ReplayGuard::new(30_000);
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 1_000));
+		guard.forget(b"sig-a");
+		assert!(guard.check_and_insert(b"signer-1", b"sig-a", 2_000));
+	}
+
+	#[cfg(feature = "x509")]
+	#[test]
+	fn replay_guard_freshness_window_is_bidirectional() {
+		let guard = ReplayGuard::new(1_000);
+		assert!(guard.is_fresh(9_500, 10_000));
+		assert!(guard.is_fresh(10_500, 10_000));
+		assert!(!guard.is_fresh(8_999, 10_000));
+		assert!(!guard.is_fresh(11_001, 10_000));
+	}
+
+	fn work_frame(priority: Option<crate::MessagePriority>) -> Result<Frame, crate::TightBeamError> {
+		use crate::builder::TypeBuilder;
+
+		// V2: priority is a V2+ metadata field
+		let mut builder = crate::utils::compose(crate::Version::V2)
+			.with_id(b"work")
+			.with_order(0)
+			.with_message(crate::testing::TestMessage { content: "payload".into() });
+		if let Some(priority) = priority {
+			builder = builder.with_priority(priority);
+		}
+
+		builder.build()
+	}
+
+	#[test]
+	fn backpressure_gate_ignores_priority() -> Result<(), crate::TightBeamError> {
+		let utilization = Arc::new(AtomicU16::new(9_500));
+		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
+
+		let frame = work_frame(Some(crate::MessagePriority::NetworkControl))?;
+		assert_eq!(GatePolicy::evaluate(&gate, &frame), TransitStatus::Busy);
+
+		Ok(())
+	}
+
+	#[test]
+	fn backpressure_gate_accepts_below_threshold() -> Result<(), crate::TightBeamError> {
+		let utilization = Arc::new(AtomicU16::new(1_000));
+		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
+
+		let frame = work_frame(None)?;
+		assert_eq!(GatePolicy::evaluate(&gate, &frame), TransitStatus::Accepted);
+
+		Ok(())
 	}
 }

@@ -26,7 +26,10 @@ use tightbeam::{
 	oids::AES_128_WRAP,
 	testing::error::{FdrConfigError, TestingError},
 	transport::handshake::{
-		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
+		client::EciesHandshakeClient,
+		negotiation::{NoStrengthFloor, ProfileStrengthPolicy, SecurityOffer},
+		server::EciesHandshakeServer,
+		ClientKeyExchange,
 	},
 	TightBeamError,
 };
@@ -177,7 +180,8 @@ pub trait HandshakeProtocol: Send {
 // Shared fixtures live in the crate-wide `common` module so threat suites do
 // not depend on one another's helpers.
 pub use crate::common::security::{
-	default_security_profile, expectation_failure, weak_security_profile, ServerMaterials,
+	default_security_profile, expectation_failure, pinning_trust_store, pinning_validator, weak_security_profile,
+	ServerMaterials,
 };
 
 // ============================================================================
@@ -287,7 +291,12 @@ impl SecurityThreatHarness {
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
 				self.emit("harness_spawn_cms").ok();
-				Box::new(CmsSession::with_profiles(&self.materials, client_profiles, server_profiles))
+				Box::new(CmsSession::with_profiles(
+					&self.materials,
+					client_profiles,
+					server_profiles,
+					None,
+				))
 			}
 		}
 	}
@@ -306,11 +315,13 @@ impl SecurityThreatHarness {
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
 				self.emit("harness_spawn_cms_weak").ok();
-				// CMS with AES-128 would require Aes128CmsSession - use default for now
+				// CMS with AES-128 would require Aes128CmsSession - use default for now.
+				// Weak profiles fail the default floor, so opt out explicitly.
 				Box::new(CmsSession::with_profiles(
 					&self.materials,
 					vec![weak_security_profile()],
 					vec![weak_security_profile()],
+					Some(Arc::new(NoStrengthFloor)),
 				))
 			}
 		}
@@ -329,13 +340,12 @@ fn invalid_step_error(msg: &'static str) -> TightBeamError {
 // Message Tampering Helpers (for MITM Testing)
 // ============================================================================
 
-/// Tamper with a message payload by flipping bits at strategic positions.
+/// Tamper with a message payload by flipping bits deep in the trailing content.
 ///
-/// This simulates a MITM attacker modifying message bytes in transit.
-/// The tampering is designed to:
-/// 1. Preserve DER structure validity (where possible)
-/// 2. Cause transcript hash mismatch
-/// 3. Invalidate signatures over the original content
+/// This simulates a MITM attacker modifying message bytes in transit. The
+/// tampering targets bytes in the last quarter of the payload, which for a
+/// certificate-bearing handshake message lands inside the signature / signed
+/// content rather than on the outer DER tag+length octets at the front.
 ///
 /// # Parameters
 /// - `payload`: Original message bytes
@@ -348,10 +358,10 @@ pub fn tamper_payload(payload: &[u8]) -> Vec<u8> {
 		return tampered;
 	}
 
-	// Flip bits in the middle of the payload to avoid DER header corruption
-	// This targets the actual content rather than structural bytes
-	let mid = tampered.len() / 2;
-	let positions = [mid, mid.saturating_add(1), mid.saturating_add(2)];
+	// Anchor in the final quarter (past the front tag+length header) and flip
+	// a short run of content bytes so the DER framing stays intact.
+	let anchor = tampered.len().saturating_sub(tampered.len() / 4).min(tampered.len() - 1);
+	let positions = [anchor, anchor.saturating_add(1), anchor.saturating_add(2)];
 
 	for pos in positions {
 		if pos < tampered.len() {
@@ -487,8 +497,11 @@ impl EciesSession {
 		client_profiles: Vec<SecurityProfileDesc>,
 		server_profiles: Vec<SecurityProfileDesc>,
 	) -> Self {
+		let offer = SecurityOffer::new(client_profiles);
+		let validator = pinning_validator(&materials.certificate);
 		let client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(client_profiles));
+			.with_security_offer(offer)
+			.with_certificate_validator(validator);
 
 		let server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 			Arc::clone(&materials.key_provider),
@@ -603,17 +616,21 @@ impl Aes128EciesSession {
 	/// Create session with the weak AES-128 profile.
 	fn new(materials: &ServerMaterials) -> Self {
 		let weak_profile = weak_security_profile();
-
+		let validator = pinning_validator(&materials.certificate);
 		let client = EciesHandshakeClient::<Aes128CryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(vec![weak_profile]));
+			.with_security_offer(SecurityOffer::new(vec![weak_profile]))
+			.with_certificate_validator(validator);
 
+		// Deliberately weak session: opt out of the default strength floor so
+		// the downgrade harness can capture AES-128 wire bytes.
 		let server = EciesHandshakeServer::<Aes128CryptoProvider>::new(
 			Arc::clone(&materials.key_provider),
 			Arc::clone(&materials.certificate),
 			None,
 			None,
 		)
-		.with_supported_profiles(vec![weak_profile]);
+		.with_supported_profiles(vec![weak_profile])
+		.with_strength_policy(Arc::new(NoStrengthFloor));
 
 		Self { client, server }
 	}
@@ -712,10 +729,14 @@ pub struct CmsSession {
 #[cfg(feature = "transport-cms")]
 impl CmsSession {
 	/// Create session with specific client and server profiles.
+	///
+	/// `strength_policy` overrides the server's default strength floor
+	/// (needed for deliberately weak downgrade-testing sessions).
 	fn with_profiles(
 		materials: &ServerMaterials,
 		client_profiles: Vec<SecurityProfileDesc>,
 		server_profiles: Vec<SecurityProfileDesc>,
+		strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	) -> Self {
 		// Create client credentials
 		let client_key = create_test_signing_key();
@@ -724,16 +745,22 @@ impl CmsSession {
 		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
 
 		// Use internal transcript computation for proper replay detection
+		let trust_store =
+			pinning_trust_store(&materials.certificate).expect("trust store builds from server certificate");
 		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
 			DefaultCryptoProvider::default(),
 			client_provider,
 			Arc::clone(&materials.certificate),
 		)
-		.with_security_offer(SecurityOffer::new(client_profiles));
+		.with_security_offer(SecurityOffer::new(client_profiles))
+		.with_trust_store(trust_store);
 
 		let server_key_provider = Arc::clone(&materials.key_provider);
 		let mut server = CmsHandshakeServer::<DefaultCryptoProvider>::new(server_key_provider, None)
 			.with_supported_profiles(server_profiles);
+		if let Some(policy) = strength_policy {
+			server = server.with_strength_policy(policy);
+		}
 
 		// Set client certificate on server for mutual auth
 		server.set_client_certificate((*client_cert).clone()).ok();

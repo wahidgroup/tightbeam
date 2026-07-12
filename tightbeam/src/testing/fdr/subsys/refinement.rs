@@ -9,8 +9,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::testing::fdr::config::{Failure, FdrConfig, Trace};
-use crate::testing::fdr::explorer::{MemoizationCache, RefinementChecker};
-use crate::testing::specs::csp::{Action, Event, Process, State};
+use crate::testing::fdr::explorer::{MemoizationCache, RefinementChecker, RefinementOutcome};
+use crate::testing::specs::csp::{Event, Process, State};
+
+/// Result of searching for a single trace in a specification
+///
+/// Distinguishes a definitive absence from a search cut short by timeout or
+/// resource limits, so bounded search is never reported as a counter-example.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceSearch {
+	Found,
+	Absent,
+	Inconclusive,
+}
 
 /// Timeout checker helper
 struct TimeoutChecker {
@@ -192,6 +203,9 @@ where
 	}
 
 	/// Generic BFS helper for trace and failure computation
+	///
+	/// The returned `bool` is true when the traversal ran to exhaustion;
+	/// false when queue/visited limits truncated it.
 	fn bfs_with_callbacks<T, FState, FTransition>(
 		&self,
 		process: &Process,
@@ -199,17 +213,19 @@ where
 		mut data: T,
 		mut on_state: FState,
 		mut on_transition: FTransition,
-	) -> T
+	) -> (T, bool)
 	where
 		FState: FnMut(&mut T, State, &Trace, usize) -> bool,
 		FTransition: FnMut(&mut T, &mut VecDeque<(State, Trace, usize)>, State, Trace, usize, &Event, State),
 	{
 		let mut queue = VecDeque::new();
 		let mut visited = HashSet::new();
+		let mut complete = true;
 		queue.push_back((process.initial, Vec::new(), 0usize));
 
 		while let Some((state, trace, depth)) = queue.pop_front() {
 			if queue.len() >= Self::max_queue_size() || visited.len() >= Self::max_visited() {
+				complete = false;
 				break;
 			}
 
@@ -235,87 +251,13 @@ where
 			}
 		}
 
-		data
+		(data, complete)
 	}
 
 	/// Check if a τ-transition would create a cycle
 	fn has_tau_cycle(&self, tau_states_seen: &HashSet<(State, Trace)>, next_state: State, trace: &Trace) -> bool {
 		let next_key = (next_state, trace.clone());
 		tau_states_seen.contains(&next_key)
-	}
-
-	/// Process observable events matching the next event in target trace.
-	/// Returns false if timeout or resource limits exceeded.
-	#[allow(clippy::too_many_arguments)]
-	fn process_observable_events(
-		spec: &Process,
-		state: State,
-		next_event: &Event,
-		enabled_actions: &[Action],
-		queue: &mut VecDeque<(State, usize)>,
-		visited: &mut HashSet<(State, usize)>,
-		trace_idx: usize,
-		max_queue_size: usize,
-		max_visited: usize,
-		timeout_checker: &TimeoutChecker,
-	) -> bool {
-		for action in enabled_actions {
-			if timeout_checker.is_expired() {
-				return false;
-			}
-			if &action.event == next_event {
-				for next_state in spec.step(state, &action.event) {
-					if timeout_checker.is_expired() {
-						return false;
-					}
-					if queue.len() >= max_queue_size || visited.len() >= max_visited {
-						break;
-					}
-					queue.push_back((next_state, trace_idx + 1));
-				}
-			}
-		}
-		true
-	}
-
-	/// Process τ-transitions (hidden events) with exploration limits.
-	/// Returns false if timeout or resource limits exceeded.
-	#[allow(clippy::too_many_arguments)]
-	fn process_tau_transitions(
-		spec: &Process,
-		state: State,
-		enabled_actions: &[Action],
-		queue: &mut VecDeque<(State, usize)>,
-		visited: &mut HashSet<(State, usize)>,
-		trace_idx: usize,
-		max_queue_size: usize,
-		max_visited: usize,
-		timeout_checker: &TimeoutChecker,
-	) -> bool {
-		let mut tau_count = 0;
-		const MAX_TAU_PER_STATE: usize = 10; // Limit τ-transition exploration
-
-		for action in enabled_actions {
-			if timeout_checker.is_expired() {
-				return false;
-			}
-			if spec.hidden.contains(&action.event) {
-				if tau_count >= MAX_TAU_PER_STATE {
-					break; // Limit τ-transition exploration
-				}
-				tau_count += 1;
-				for next_state in spec.step(state, &action.event) {
-					if timeout_checker.is_expired() {
-						return false;
-					}
-					if queue.len() >= max_queue_size || visited.len() >= max_visited {
-						break;
-					}
-					queue.push_back((next_state, trace_idx));
-				}
-			}
-		}
-		true
 	}
 
 	/// Check if an implementation failure exists in the specification failures.
@@ -329,78 +271,63 @@ where
 		false
 	}
 
-	/// Check if a specific trace exists in a spec without computing all traces
+	/// Search for a specific trace in a spec without computing all traces.
+	///
+	/// BFS over `(state, matched-prefix-length)` pairs: observable actions
+	/// matching the next target event advance the prefix, hidden (τ)
+	/// actions advance the state silently. τ exploration is bounded by the
+	/// shared visited set only.
+	///
+	/// Timeout or resource limits yield `Inconclusive`, never `Absent`:
+	/// a bounded search that ran out of budget is not a counterexample.
 	fn trace_exists_in_spec(
 		spec: &Process,
 		target_trace: &Trace,
 		max_depth: usize,
 		max_queue_size: usize,
 		max_visited: usize,
-		timeout_ms: u64,
-	) -> bool {
+		timeout_checker: &TimeoutChecker,
+	) -> TraceSearch {
 		if target_trace.len() > max_depth {
-			return false;
+			return TraceSearch::Absent;
 		}
 
-		let timeout_checker = TimeoutChecker::new(timeout_ms);
 		let mut queue = VecDeque::new();
 		let mut visited = HashSet::new();
 		queue.push_back((spec.initial, 0usize));
 
 		while let Some((state, trace_idx)) = queue.pop_front() {
 			if timeout_checker.is_expired() {
-				return false;
+				return TraceSearch::Inconclusive;
 			}
 
 			if queue.len() >= max_queue_size || visited.len() >= max_visited {
-				return false;
+				return TraceSearch::Inconclusive;
 			}
 
-			let visit_key = (state, trace_idx);
-			if visited.contains(&visit_key) {
+			if !visited.insert((state, trace_idx)) {
 				continue;
 			}
-			visited.insert(visit_key);
 
 			if trace_idx >= target_trace.len() {
-				return true;
+				return TraceSearch::Found;
 			}
 
-			// Process observable events first (matching the next event in target trace)
 			let next_event = &target_trace[trace_idx];
-			let enabled_actions = spec.enabled(state);
-			if !Self::process_observable_events(
-				spec,
-				state,
-				next_event,
-				&enabled_actions,
-				&mut queue,
-				&mut visited,
-				trace_idx,
-				max_queue_size,
-				max_visited,
-				&timeout_checker,
-			) {
-				return false;
-			}
-
-			// Explore τ-transitions (limit exploration to avoid state explosion)
-			if !Self::process_tau_transitions(
-				spec,
-				state,
-				&enabled_actions,
-				&mut queue,
-				&mut visited,
-				trace_idx,
-				max_queue_size,
-				max_visited,
-				&timeout_checker,
-			) {
-				return false;
+			for action in spec.enabled(state) {
+				if spec.hidden.contains(&action.event) {
+					for next_state in spec.step(state, &action.event) {
+						queue.push_back((next_state, trace_idx));
+					}
+				} else if &action.event == next_event {
+					for next_state in spec.step(state, &action.event) {
+						queue.push_back((next_state, trace_idx + 1));
+					}
+				}
 			}
 		}
 
-		false
+		TraceSearch::Absent
 	}
 }
 
@@ -408,90 +335,125 @@ impl<'a, M> RefinementChecker for DefaultRefinementChecker<'a, M>
 where
 	M: MemoizationCache,
 {
-	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> (bool, Option<Trace>) {
-		// Trace refinement: impl ⊑ spec means traces(impl) ⊆ traces(spec)
-		// For deterministic linear processes, we only check the longest trace.
-		// Reference: Pedersen & Chalmers (2024)
-		let impl_traces = self.compute_traces(impl_process, self.config.max_depth);
-		let longest_trace = impl_traces.iter().max_by_key(|t| t.len()).cloned();
-		if let Some(full_trace) = longest_trace {
-			let max_queue = Self::max_queue_size();
-			let max_visited = Self::max_visited();
+	fn check_trace_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace> {
+		// Trace refinement: impl ⊑ spec means traces(impl) ⊆ traces(spec).
+		// Every impl trace is checked -- checking only the longest trace
+		// misses forbidden events on sibling branches of a branching impl
+		// Reference: Roscoe (1998, 2010)
+		let (impl_traces, impl_complete) = self.compute_traces(impl_process, self.config.max_depth);
 
-			if !Self::trace_exists_in_spec(
+		// Sorted iteration keeps the reported witness deterministic
+		// regardless of HashSet ordering.
+		let mut ordered: Vec<&Trace> = impl_traces.iter().collect();
+		ordered.sort_unstable();
+
+		// One time budget covers the whole membership scan so a large
+		// trace set cannot multiply the configured timeout.
+		let timeout_checker = TimeoutChecker::new(self.config.timeout_ms);
+		let max_queue = Self::max_queue_size();
+		let max_visited = Self::max_visited();
+
+		let mut inconclusive = false;
+		for trace in ordered {
+			match Self::trace_exists_in_spec(
 				spec,
-				&full_trace,
+				trace,
 				self.config.max_depth,
 				max_queue,
 				max_visited,
-				self.config.timeout_ms,
+				&timeout_checker,
 			) {
-				return (false, Some(full_trace));
+				TraceSearch::Found => {}
+				TraceSearch::Absent => return RefinementOutcome::Violated(trace.clone()),
+				TraceSearch::Inconclusive => inconclusive = true,
 			}
-
-			(true, None)
-		} else {
-			(false, Some(Vec::new()))
 		}
+
+		if inconclusive {
+			return RefinementOutcome::Inconclusive;
+		}
+
+		RefinementOutcome::Holds { complete: impl_complete }
 	}
 
-	fn check_failures_refinement(&mut self, spec: &Process, impl_process: &Process) -> (bool, Option<Failure>) {
+	fn check_failures_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Failure> {
 		// Failures refinement: impl ⊑ spec means failures(impl) ⊆ failures(spec)
 		// For each impl failure (trace, impl_refusal), there must exist a spec failure
 		// (trace, spec_refusal) where impl_refusal ⊆ spec_refusal.
 		// Reference: Roscoe (1998, 2010)
-		let spec_failures = self.compute_failures(spec, self.config.max_depth);
-		let impl_failures = self.compute_failures(impl_process, self.config.max_depth);
-
+		let (spec_failures, spec_complete) = self.compute_failures(spec, self.config.max_depth);
+		let (impl_failures, impl_complete) = self.compute_failures(impl_process, self.config.max_depth);
 		for (impl_trace, impl_refusal) in &impl_failures {
 			if !<DefaultRefinementChecker<'a, M>>::failure_exists_in_spec(&spec_failures, impl_trace, impl_refusal) {
-				return (false, Some((impl_trace.clone(), impl_refusal.clone())));
+				// A missing entry in a truncated spec set is not a proven
+				// violation: it may live in the unexplored remainder.
+				if !spec_complete {
+					return RefinementOutcome::Inconclusive;
+				}
+
+				return RefinementOutcome::Violated((impl_trace.clone(), impl_refusal.clone()));
 			}
 		}
 
-		(true, None)
+		RefinementOutcome::Holds { complete: spec_complete && impl_complete }
 	}
 
-	fn check_divergence_refinement(&mut self, spec: &Process, impl_process: &Process) -> (bool, Option<Trace>) {
+	fn check_divergence_refinement(&mut self, spec: &Process, impl_process: &Process) -> RefinementOutcome<Trace> {
 		// Divergence refinement: impl ⊑ spec means divergences(impl) ⊆ divergences(spec)
 		// Reference: Roscoe (1998, 2010)
-		let spec_divergences = self.compute_divergences(spec, self.config.max_depth);
-		let impl_divergences = self.compute_divergences(impl_process, self.config.max_depth);
-		for impl_div in &impl_divergences {
+		let (spec_divergences, spec_complete) = self.compute_divergences(spec, self.config.max_depth);
+		let (impl_divergences, impl_complete) = self.compute_divergences(impl_process, self.config.max_depth);
+
+		let mut ordered: Vec<&Trace> = impl_divergences.iter().collect();
+		ordered.sort_unstable();
+
+		for impl_div in ordered {
 			if !spec_divergences.contains(impl_div) {
-				return (false, Some(impl_div.clone()));
+				if !spec_complete {
+					return RefinementOutcome::Inconclusive;
+				}
+
+				return RefinementOutcome::Violated(impl_div.clone());
 			}
 		}
 
-		(true, None)
+		RefinementOutcome::Holds { complete: spec_complete && impl_complete }
 	}
 
-	fn compute_traces(&mut self, process: &Process, max_depth: usize) -> HashSet<Trace> {
-		if let Some(cached) = self.cache.borrow().get_cached_traces(process.name) {
-			return cached.into_iter().collect();
+	fn compute_traces(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool) {
+		let structure = process.structure_digest();
+		if let Some((cached, complete)) = self.cache.borrow().get_cached_traces(structure) {
+			return (cached.into_iter().collect(), complete);
 		}
 
 		// Fast path: For linear trace processes, extract trace directly
 		if let Some(linear_trace) = Self::extract_linear_trace(process, max_depth) {
 			let mut traces = HashSet::new();
-			traces.insert(linear_trace);
-			return traces;
+			traces.insert(linear_trace.clone());
+
+			self.cache.borrow_mut().cache_traces(structure, vec![linear_trace], true);
+
+			return (traces, true);
 		}
 
 		let timeout_checker = TimeoutChecker::new(self.config.timeout_ms);
 		let mut traces = HashSet::new();
 		traces.insert(Vec::new());
 
+		let mut complete = true;
 		let mut queue = VecDeque::new();
 		let mut visited = HashSet::new();
+
 		queue.push_back((process.initial, Vec::new(), 0usize));
 
 		while let Some((state, trace, depth)) = queue.pop_front() {
 			if timeout_checker.is_expired() {
+				complete = false;
 				break;
 			}
 
 			if Self::check_limits(queue.len(), visited.len(), traces.len()) {
+				complete = false;
 				break;
 			}
 
@@ -503,6 +465,7 @@ where
 			if visited.contains(&visit_key) {
 				continue;
 			}
+
 			visited.insert(visit_key);
 
 			let enabled_actions = process.enabled(state);
@@ -510,6 +473,7 @@ where
 				let next_states = process.step(state, &action.event);
 				for next_state in next_states {
 					if Self::check_limits(queue.len(), visited.len(), traces.len()) {
+						complete = false;
 						break;
 					}
 
@@ -517,20 +481,22 @@ where
 					if !process.hidden.contains(&action.event) {
 						traces.insert(new_trace.clone());
 					}
+
 					queue.push_back((next_state, new_trace, new_depth));
 				}
 			}
 		}
 
 		let traces_vec: Vec<Trace> = traces.iter().cloned().collect();
-		self.cache.borrow_mut().cache_traces(process.name.to_string(), traces_vec);
+		self.cache.borrow_mut().cache_traces(structure, traces_vec, complete);
 
-		traces
+		(traces, complete)
 	}
 
-	fn compute_failures(&mut self, process: &Process, max_depth: usize) -> Vec<Failure> {
-		if let Some(cached) = self.cache.borrow().get_cached_failures(process.name) {
-			return cached;
+	fn compute_failures(&mut self, process: &Process, max_depth: usize) -> (Vec<Failure>, bool) {
+		let structure = process.structure_digest();
+		if let Some((cached, complete)) = self.cache.borrow().get_cached_failures(structure) {
+			return (cached, complete);
 		}
 
 		// Failures are only recorded at stable states (no τ-transitions enabled)
@@ -538,7 +504,7 @@ where
 		let failures = Vec::new();
 		let visited = HashSet::new();
 		let data = (failures, visited);
-		let (failures, _) = self.bfs_with_callbacks(
+		let ((failures, _), complete) = self.bfs_with_callbacks(
 			process,
 			max_depth,
 			data,
@@ -547,6 +513,7 @@ where
 				if visited.contains(&visit_key) {
 					return true;
 				}
+
 				visited.insert(visit_key);
 
 				if Self::is_stable_state(process, state) {
@@ -565,21 +532,21 @@ where
 			},
 		);
 
-		self.cache
-			.borrow_mut()
-			.cache_failures(process.name.to_string(), failures.clone());
+		self.cache.borrow_mut().cache_failures(structure, failures.clone(), complete);
 
-		failures
+		(failures, complete)
 	}
 
-	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> HashSet<Trace> {
-		if let Some(cached) = self.cache.borrow().get_cached_divergences(process.name) {
-			return cached.into_iter().collect();
+	fn compute_divergences(&mut self, process: &Process, max_depth: usize) -> (HashSet<Trace>, bool) {
+		let structure = process.structure_digest();
+		if let Some((cached, complete)) = self.cache.borrow().get_cached_divergences(structure) {
+			return (cached.into_iter().collect(), complete);
 		}
 
 		let mut divergences = HashSet::new();
 		let mut queue = VecDeque::new();
 		let mut initial_tau_seen = HashSet::new();
+
 		initial_tau_seen.insert((process.initial, Vec::new()));
 		queue.push_back((process.initial, Vec::new(), initial_tau_seen));
 
@@ -608,6 +575,7 @@ where
 					} else {
 						let mut new_trace = trace.clone();
 						new_trace.push(action.event);
+
 						let mut new_tau_seen = HashSet::new();
 						new_tau_seen.insert((next_state, new_trace.clone()));
 						queue.push_back((next_state, new_trace, new_tau_seen));
@@ -619,11 +587,9 @@ where
 		}
 
 		let divergences_vec: Vec<Trace> = divergences.iter().cloned().collect();
-		self.cache
-			.borrow_mut()
-			.cache_divergences(process.name.to_string(), divergences_vec);
+		self.cache.borrow_mut().cache_divergences(structure, divergences_vec, true);
 
-		divergences
+		(divergences, true)
 	}
 
 	/// Compute refusal set for a stable state.

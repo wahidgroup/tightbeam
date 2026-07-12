@@ -1,6 +1,11 @@
 //! TODO Multiplexing support for concurrent requests on a single connection
 //!
 //! This module provides stub interfaces for HTTP/2-style multiplexing.
+//!
+//! # Stability
+//!
+//! UNSTABLE: trait surface only, no implementation exists yet. The API
+//! may change or be removed without a major version bump.
 
 use core::future::Future;
 
@@ -33,7 +38,7 @@ impl StreamId {
 
 	/// Check if this is a server-initiated stream (even ID)
 	pub const fn is_server_initiated(&self) -> bool {
-		self.0 % 2 == 0
+		self.0.is_multiple_of(2)
 	}
 }
 

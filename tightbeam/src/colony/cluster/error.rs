@@ -1,82 +1,70 @@
 //! Cluster-specific error types
 
-/// Static error message for no heartbeat response
-pub const NO_RESPONSE_MSG: &[u8] = b"no response";
-
-/// Static error message for transport errors
-pub const TRANSPORT_ERROR_MSG: &[u8] = b"transport error";
+use crate::transport::error::TransportError;
+use crate::{Errorizable, TightBeamError};
 
 /// Errors specific to clusters
-#[cfg_attr(feature = "derive", derive(crate::Errorizable))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Failure modes are distinct variants (not string payloads) so callers
+/// can branch on them, and wrapper variants preserve their cause chain
+/// through [`core::error::Error::source`].
+#[derive(Errorizable, Debug)]
 pub enum ClusterError {
 	/// Lock poisoned
-	#[cfg_attr(feature = "derive", error("Lock poisoned"))]
+	#[error("Lock poisoned")]
 	LockPoisoned,
+
 	/// Unknown servlet type
-	#[cfg_attr(feature = "derive", error("Unknown servlet type: {:#?}"))]
+	#[error("Unknown servlet type: {:#?}")]
 	UnknownServletType(Vec<u8>),
+
 	/// No hives available for servlet type
-	#[cfg_attr(feature = "derive", error("No hives available for servlet type: {:#?}"))]
+	#[error("No hives available for servlet type: {:#?}")]
 	NoHivesAvailable(Vec<u8>),
-	/// Hive communication failed
-	#[cfg_attr(feature = "derive", error("Hive communication failed: {:#?}"))]
-	HiveCommunicationFailed(Vec<u8>),
+
+	/// Connection to the selected hive/servlet could not be established
+	#[error("Connect failed")]
+	ConnectFailed,
+
+	/// Peer accepted the request but returned no response frame
+	#[error("No response")]
+	NoResponse,
+
+	/// Transport-level failure while communicating with a hive/servlet
+	#[error("Transport error: {0}")]
+	#[from]
+	#[source]
+	Transport(TransportError),
+
+	/// Frame encode/decode/build/sign failure
+	#[error("Frame error: {0}")]
+	#[from]
+	#[source]
+	Frame(TightBeamError),
+
+	/// Response decoded but did not carry the expected field
+	#[error("Malformed response")]
+	MalformedResponse,
+
 	/// Registration failed
-	#[cfg_attr(feature = "derive", error("Registration failed"))]
+	#[error("Registration failed")]
 	RegistrationFailed,
-	/// Frame encoding error
-	#[cfg_attr(feature = "derive", error("Frame encoding error"))]
-	EncodingError,
-	/// Frame signing error
-	#[cfg_attr(feature = "derive", error("Frame signing error"))]
-	SigningError,
+
 	/// Invalid servlet address format
-	#[cfg_attr(feature = "derive", error("Invalid address: {:#?}"))]
+	#[error("Invalid address: {:#?}")]
 	InvalidAddress(Vec<u8>),
-}
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for ClusterError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			ClusterError::LockPoisoned => write!(f, "Lock poisoned"),
-			ClusterError::UnknownServletType(t) => {
-				write!(f, "Unknown servlet type: {}", String::from_utf8_lossy(t))
-			}
-			ClusterError::NoHivesAvailable(t) => {
-				write!(f, "No hives available for servlet type: {}", String::from_utf8_lossy(t))
-			}
-			ClusterError::HiveCommunicationFailed(msg) => {
-				write!(f, "Hive communication failed: {}", String::from_utf8_lossy(msg))
-			}
-			ClusterError::RegistrationFailed => write!(f, "Registration failed"),
-			ClusterError::EncodingError => write!(f, "Frame encoding error"),
-			ClusterError::SigningError => write!(f, "Frame signing error"),
-			ClusterError::InvalidAddress(addr) => {
-				write!(f, "Invalid address: {}", String::from_utf8_lossy(addr))
-			}
-		}
-	}
-}
+	/// Servlet address update referenced a route owned by a different hive
+	#[error("Servlet not owned by hive")]
+	ServletNotOwned,
 
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for ClusterError {}
+	/// Re-registration presented a signer that does not match the bound hive signer
+	#[error("Signer does not match hive binding")]
+	SignerMismatch,
+}
 
 impl<T> From<std::sync::PoisonError<T>> for ClusterError {
 	fn from(_: std::sync::PoisonError<T>) -> Self {
 		ClusterError::LockPoisoned
-	}
-}
-
-impl From<crate::transport::error::TransportError> for ClusterError {
-	fn from(_: crate::transport::error::TransportError) -> Self {
-		ClusterError::HiveCommunicationFailed(TRANSPORT_ERROR_MSG.to_vec())
-	}
-}
-
-impl From<crate::TightBeamError> for ClusterError {
-	fn from(_: crate::TightBeamError) -> Self {
-		ClusterError::EncodingError
 	}
 }

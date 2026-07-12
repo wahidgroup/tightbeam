@@ -6,6 +6,17 @@
 use crate::utils::math::integer_sqrt;
 use crate::TightBeamError;
 
+/// Bounds of the decorrelated-jitter window for a base value.
+///
+/// Returns `(min, range)` where the window spans `min..=min + range` with
+/// `min = base / 3`. Shared by the restart backoff strategy
+/// (`transport::policy::DecorrelatedJitter`) and
+/// [`DecorrelatedJitterCalculator`] so the algorithm is defined once.
+pub const fn decorrelated_bounds(base: u64) -> (u64, u64) {
+	let min = base / 3;
+	(min, base.saturating_sub(min))
+}
+
 /// Trait for calculating jitter from a collection of observed durations.
 ///
 /// Jitter represents the variation in execution times. Different calculation
@@ -132,11 +143,8 @@ impl JitterCalculator for StdDevJitter {
 /// Decorrelated jitter calculator.
 ///
 /// Calculates jitter using the decorrelated jitter algorithm.
-/// Uses max duration as base, calculates range from max/3 to max,
-/// and returns the range as the jitter value.
-///
-/// This is adapted from the decorrelated jitter algorithm used in
-/// restart policies (see `transport/policy.rs::DecorrelatedJitter`).
+/// Uses max duration as base and returns the width of the
+/// [`decorrelated_bounds`] window (max/3 to max) as the jitter value.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct DecorrelatedJitterCalculator;
 
@@ -155,9 +163,7 @@ impl JitterCalculator for DecorrelatedJitterCalculator {
 			return Ok(0);
 		}
 
-		// Decorrelated jitter: range from max/3 to max
-		let min = max_duration / 3;
-		let range = max_duration.saturating_sub(min);
+		let (_, range) = decorrelated_bounds(max_duration);
 		Ok(range)
 	}
 }

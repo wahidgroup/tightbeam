@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use crate::instrumentation::TbEvent;
-use crate::testing::specs::csp::{Event, Process};
+use crate::testing::specs::csp::{intern, Event, Process};
 use crate::trace::ConsumedTrace;
 
 /// Execution path with timing information
@@ -118,9 +118,7 @@ pub fn extract_paths(trace: &ConsumedTrace, process: &Process) -> Vec<ExecutionP
 			None => continue,
 		};
 
-		// Convert String to &'static str (leak for path extraction)
-		let static_label = Box::leak(event_label.clone().into_boxed_str());
-		let csp_event = Event(static_label);
+		let csp_event = Event(intern(event_label.as_str()));
 
 		// Check if event is enabled in current state
 		let enabled = process.enabled(current_state);
@@ -172,7 +170,7 @@ pub fn extract_paths(trace: &ConsumedTrace, process: &Process) -> Vec<ExecutionP
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::specs::csp::{Process, State};
+	use crate::testing::specs::csp::{Process, ProcessBuildError, State};
 
 	#[test]
 	fn test_execution_path_new() {
@@ -189,17 +187,14 @@ mod tests {
 	fn test_execution_path_matches_pattern() {
 		let events = vec![Event("start"), Event("process"), Event("end")];
 		let durations = vec![Some(10_000_000), Some(20_000_000), Some(5_000_000)];
-		let path = ExecutionPath::new(events, durations);
 
+		let path = ExecutionPath::new(events, durations);
 		// Exact match
 		assert!(path.matches_pattern(&[Event("start"), Event("process"), Event("end")]));
-
 		// Prefix match
 		assert!(path.matches_pattern(&[Event("start"), Event("process")]));
-
 		// No match
 		assert!(!path.matches_pattern(&[Event("start"), Event("wrong")]));
-
 		// Pattern too long
 		assert!(!path.matches_pattern(&[Event("start"), Event("process"), Event("end"), Event("extra")]));
 	}
@@ -208,15 +203,15 @@ mod tests {
 	fn test_path_wcet_new() {
 		let path = vec![Event("start"), Event("process"), Event("end")];
 		let max_duration = Duration::from_millis(50);
-		let path_wcet = PathWcet::new(path.clone(), max_duration);
 
+		let path_wcet = PathWcet::new(path.clone(), max_duration);
 		assert_eq!(path_wcet.path, path);
 		assert_eq!(path_wcet.max_duration, max_duration);
 		assert_eq!(path_wcet.max_duration_ns(), 50_000_000);
 	}
 
 	/// Helper to create a simple test process: start -> process -> end
-	fn create_test_process() -> Result<Process, &'static str> {
+	fn create_test_process() -> Result<Process, ProcessBuildError> {
 		Process::builder("test")
 			.initial_state(State("s0"))
 			.add_terminal(State("s2"))
@@ -244,21 +239,23 @@ mod tests {
 					label: Some(label.to_string()),
 					payload_hash: None,
 					duration_ns: Some(*duration_ns),
+					timestamp_ns: None,
 					flags: 0,
 					extras: None,
 				})
 				.collect();
 		}
+
 		trace
 	}
 
 	#[test]
-	fn test_extract_paths_simple() -> Result<(), &'static str> {
+	fn test_extract_paths_simple() -> Result<(), ProcessBuildError> {
 		let process = create_test_process()?;
 		let trace =
 			create_trace_with_timing_events(&[("start", 10_000_000), ("process", 20_000_000), ("end", 5_000_000)]);
-		let paths = extract_paths(&trace, &process);
 
+		let paths = extract_paths(&trace, &process);
 		// Should extract one path with all three events
 		assert_eq!(paths.len(), 1);
 		assert_eq!(paths[0].events.len(), 3);

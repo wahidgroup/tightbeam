@@ -2,6 +2,9 @@
 //!
 //! Processes received KARI structures to extract the content-encryption key (CEK).
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::cms::enveloped_data::{KeyAgreeRecipientInfo, OriginatorIdentifierOrKey, RecipientInfo};
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
@@ -188,8 +191,9 @@ mod tests {
 			let original_cek = [0x42u8; 32];
 
 			// SENDER SIDE: Build KARI
+			let sender_priv = sender_key.clone();
 			let mut builder = TightBeamKariBuilder::default()
-				.with_sender_priv(sender_key.clone())
+				.with_sender_priv(sender_priv)
 				.with_sender_pub_spki(sender_spki)
 				.with_recipient_pub(recipient_pubkey)
 				.with_recipient_rid(rid)

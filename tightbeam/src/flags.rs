@@ -1,4 +1,9 @@
-//! Flags utilize the Matrix to create Flat World.
+//! Diagonal-flag view over the N×N matrix wire format.
+//!
+//! [`Flags<N>`] stores N position-stable flag bytes and presents them through
+//! [`MatrixLike`] as the diagonal (r == c) of an N×N matrix, matching the
+//! profile convention documented on [`Asn1Matrix`](crate::Asn1Matrix):
+//! off-diagonal cells read as 0 and writes to them are no-ops.
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -10,10 +15,24 @@ use crate::matrix::{Matrix, MatrixLike};
 /// This struct provides a compile-time sized container for storing flag values.
 /// Each position in the array can hold a single `u8` flag value. The size `N`
 /// is determined at compile time, ensuring zero-cost abstractions.
+///
+/// The wire format bounds the dimension to 1..=255; constructing a flag set
+/// with `N` outside that range is rejected at compile time:
+///
+/// ```compile_fail
+/// use tightbeam::flags::Flags;
+///
+/// let rejected = Flags::<256>::default();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Flags<const N: usize>([u8; N]);
 
 impl<const N: usize> Flags<N> {
+	/// Compile-time guard: the wire format bounds the dimension to 1..=255
+	/// (`MatrixLike::n` returns `u8`). Evaluated by every constructor so an
+	/// out-of-range `N` is rejected at monomorphization.
+	const VALID_N: () = assert!(N >= 1 && N <= 255, "Flags dimension must be 1..=255");
+
 	pub fn set_at(&mut self, pos: usize, value: u8) {
 		if pos < N {
 			self.0[pos] = value;
@@ -31,6 +50,7 @@ impl<const N: usize> Flags<N> {
 
 impl<const N: usize> Default for Flags<N> {
 	fn default() -> Self {
+		const { Self::VALID_N };
 		Self([0u8; N])
 	}
 }
@@ -46,6 +66,7 @@ where
 	T: Into<u8>,
 {
 	fn from(arr: [T; N]) -> Self {
+		const { Self::VALID_N };
 		let mut bytes = [0u8; N];
 		for (i, item) in arr.into_iter().enumerate() {
 			bytes[i] = item.into();
@@ -56,6 +77,7 @@ where
 
 impl<const N: usize> From<&[u8]> for Flags<N> {
 	fn from(bytes: &[u8]) -> Self {
+		const { Self::VALID_N };
 		let mut array = [0; N];
 		let len = bytes.len().min(N);
 		array[..len].copy_from_slice(&bytes[..len]);

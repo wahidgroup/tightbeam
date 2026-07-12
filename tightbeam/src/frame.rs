@@ -1,8 +1,17 @@
 use crate::asn1::{Frame, Version};
-#[cfg(feature = "digest")]
+#[cfg(feature = "signature")]
+use crate::der::asn1::ContextSpecificRef;
+#[cfg(any(feature = "digest", feature = "signature"))]
 use crate::der::{Encode, EncodeValue, FixedTag, Length, Tag, Writer};
-#[cfg(feature = "digest")]
+#[cfg(feature = "signature")]
+use crate::der::{TagMode, TagNumber};
+#[cfg(feature = "signature")]
+use crate::DigestInfo;
+#[cfg(any(feature = "digest", feature = "signature"))]
 use crate::Metadata;
+
+#[cfg(all(not(feature = "std"), feature = "signature"))]
+use alloc::vec::Vec;
 
 /// Envelope-only view (version + metadata) used to compute Frame Integrity
 /// (FI). The message field is excluded by construction: FI MUST be computed
@@ -28,6 +37,59 @@ impl EncodeValue for FrameIntegrityScaffold<'_> {
 	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
 		self.version.encode(encoder)?;
 		self.metadata.encode(encoder)?;
+		Ok(())
+	}
+}
+
+/// To-be-signed view of a [`Frame`]: the first four fields, with
+/// `nonrepudiation` excluded by construction. Borrows the frame and reuses
+/// each field's derived encoder so the TBS bytes cannot drift from the DER
+/// encoding `#[derive(der::Sequence)]` produces for [`Frame`] -- the same
+/// envelope-drift defense as [`FrameIntegrityScaffold`].
+#[cfg(feature = "signature")]
+pub(crate) struct TbsScaffold<'a> {
+	pub(crate) version: &'a Version,
+	pub(crate) metadata: &'a Metadata,
+	pub(crate) message: &'a Vec<u8>,
+	pub(crate) integrity: Option<&'a DigestInfo>,
+}
+
+#[cfg(feature = "signature")]
+impl<'a> TbsScaffold<'a> {
+	/// Mirrors the derive's encoding of `integrity`: context-specific tag 0,
+	/// EXPLICIT mode.
+	fn tagged_integrity(integrity: &'a DigestInfo) -> ContextSpecificRef<'a, DigestInfo> {
+		ContextSpecificRef { tag_number: TagNumber::N0, tag_mode: TagMode::Explicit, value: integrity }
+	}
+}
+
+#[cfg(feature = "signature")]
+impl FixedTag for TbsScaffold<'_> {
+	const TAG: Tag = Tag::Sequence;
+}
+
+#[cfg(feature = "signature")]
+impl EncodeValue for TbsScaffold<'_> {
+	fn value_len(&self) -> crate::der::Result<Length> {
+		let mut len = (self.version.encoded_len()? + self.metadata.encoded_len()?)?;
+		len = (len + self.message.encoded_len()?)?;
+
+		if let Some(integrity) = self.integrity {
+			len = (len + Self::tagged_integrity(integrity).encoded_len()?)?;
+		}
+
+		Ok(len)
+	}
+
+	fn encode_value(&self, encoder: &mut impl Writer) -> crate::der::Result<()> {
+		self.version.encode(encoder)?;
+		self.metadata.encode(encoder)?;
+		self.message.encode(encoder)?;
+
+		if let Some(integrity) = self.integrity {
+			Self::tagged_integrity(integrity).encode(encoder)?;
+		}
+
 		Ok(())
 	}
 }

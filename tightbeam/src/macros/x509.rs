@@ -1,18 +1,25 @@
+/// Construct an X.509 certificate for a given profile.
 ///
-/// This macro provides a convenient way to construct X.509 certificates with
-/// various profiles and configurations.
+/// Certificates are valid from the moment of construction for the given
+/// `duration:`; the macro does not support back-dating or scheduling a
+/// future `notBefore`. Build a
+/// [`Validity`](crate::crypto::x509::time::Validity) explicitly and use
+/// [`CertificateBuilder`](crate::crypto::x509::builder::CertificateBuilder)
+/// directly when explicit validity bounds are required.
 ///
 /// # Examples
 ///
 /// ```ignore
+/// use core::time::Duration;
+///
 /// use tightbeam::cert;
 ///
-/// // Self-signed root (unbounded path length).
+/// // Self-signed root (unbounded path length), valid for one year from now.
 /// let cert = cert!(
 ///     profile: Root,
 ///     subject: "CN=My Root CA",
 ///     serial: 1u32,
-///     validity: (not_before, not_after),
+///     duration: Duration::from_secs(365 * 24 * 60 * 60),
 ///     signer: &signing_key,
 ///     subject_public_key: spki
 /// )?;
@@ -22,7 +29,7 @@
 ///     profile: Root,
 ///     subject: "CN=My Root CA",
 ///     serial: 1u32,
-///     validity: (not_before, not_after),
+///     duration: Duration::from_secs(365 * 24 * 60 * 60),
 ///     signer: &signing_key,
 ///     subject_public_key: spki,
 ///     path_len: 2u8
@@ -49,7 +56,7 @@ macro_rules! cert {
 		profile: $profile:expr,
 		subject: $subject:expr,
 		serial: $serial:expr,
-		validity: ($not_before:expr, $not_after:expr),
+		duration: $duration:expr,
 		subject_public_key: $spki:expr,
 		signer: $signer:expr,
 		signature: $signature:ty
@@ -61,7 +68,7 @@ macro_rules! cert {
 		let mut builder = $crate::crypto::x509::builder::CertificateBuilder::new(
 			$profile,
 			$crate::crypto::x509::serial_number::SerialNumber::from($serial),
-			$crate::crypto::x509::time::Validity::from_now($not_after - $not_before)?,
+			$crate::crypto::x509::time::Validity::from_now($duration)?,
 			$subject,
 			$spki,
 			$signer,
@@ -79,7 +86,7 @@ macro_rules! cert {
 		profile: Root,
 		subject: $subject:expr,
 		serial: $serial:expr,
-		validity: ($not_before:expr, $not_after:expr),
+		duration: $duration:expr,
 		signer: $signer:expr,
 		subject_public_key: $spki:expr,
 		path_len: $path_len:expr
@@ -93,7 +100,7 @@ macro_rules! cert {
 			},
 			subject: subject,
 			serial: $serial,
-			validity: ($not_before, $not_after),
+			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
 			signature: $crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>
@@ -105,7 +112,7 @@ macro_rules! cert {
 		profile: Root,
 		subject: $subject:expr,
 		serial: $serial:expr,
-		validity: ($not_before:expr, $not_after:expr),
+		duration: $duration:expr,
 		signer: $signer:expr,
 		subject_public_key: $spki:expr
 	) => {{
@@ -113,7 +120,7 @@ macro_rules! cert {
 			profile: $crate::crypto::x509::builder::Profile::Root,
 			subject: $crate::cert!(@name $subject),
 			serial: $serial,
-			validity: ($not_before, $not_after),
+			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
 			signature: $crate::crypto::sign::ecdsa::der::Signature<$crate::crypto::sign::ecdsa::Secp256k1>
@@ -125,7 +132,7 @@ macro_rules! cert {
 		profile: Root,
 		subject: $subject:expr,
 		serial: $serial:expr,
-		validity: ($not_before:expr, $not_after:expr),
+		duration: $duration:expr,
 		signer: $signer:expr
 	) => {{
 		compile_error!(
@@ -141,7 +148,7 @@ macro_rules! cert {
 		subject: $subject:expr,
 		issuer: $issuer:expr,
 		serial: $serial:expr,
-		validity: ($not_before:expr, $not_after:expr),
+		duration: $duration:expr,
 		subject_public_key: $spki:expr,
 		signer: $signer:expr
 		$(, extensions: [$($ext:expr),* $(,)?])?
@@ -153,7 +160,7 @@ macro_rules! cert {
 			},
 			subject: $crate::cert!(@name $subject),
 			serial: $serial,
-			validity: ($not_before, $not_after),
+			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
 			signature: $crate::crypto::sign::Signer
@@ -167,7 +174,7 @@ macro_rules! cert {
 		subject: $subject:expr,
 		issuer: $issuer:expr,
 		serial: $serial:expr,
-		validity: ($not_before:expr, $not_after:expr),
+		duration: $duration:expr,
 		subject_public_key: $spki:expr,
 		signer: $signer:expr
 		$(, path_len: $path_len:expr)?
@@ -179,7 +186,7 @@ macro_rules! cert {
 			},
 			subject: $crate::cert!(@name $subject),
 			serial: $serial,
-			validity: ($not_before, $not_after),
+			duration: $duration,
 			subject_public_key: $spki,
 			signer: $signer,
 			signature: $crate::crypto::sign::Signer
@@ -248,23 +255,20 @@ mod tests {
 		Ok((signing_key, spki))
 	}
 
-	fn one_year() -> (std::time::Instant, std::time::Instant) {
-		let not_before = std::time::Instant::now();
-
-		(not_before, not_before + std::time::Duration::from_secs(365 * 24 * 60 * 60))
+	fn one_year() -> core::time::Duration {
+		core::time::Duration::from_secs(365 * 24 * 60 * 60)
 	}
 
 	#[test]
 	fn test_cert_macro_root() -> TestResult {
 		let (signing_key, spki) = signing_material()?;
 		let signer = Sha3Signer::from(&signing_key);
-		let (not_before, not_after) = one_year();
 
 		let cert = cert!(
 			profile: Root,
 			subject: SUBJECT,
 			serial: 1u32,
-			validity: (not_before, not_after),
+			duration: one_year(),
 			signer: &signer,
 			subject_public_key: spki
 		)?;
@@ -278,13 +282,12 @@ mod tests {
 	fn test_cert_macro_root_path_len() -> TestResult {
 		let (signing_key, spki) = signing_material()?;
 		let signer = Sha3Signer::from(&signing_key);
-		let (not_before, not_after) = one_year();
 
 		let cert = cert!(
 			profile: Root,
 			subject: SUBJECT,
 			serial: 1u32,
-			validity: (not_before, not_after),
+			duration: one_year(),
 			signer: &signer,
 			subject_public_key: spki,
 			path_len: 2u8

@@ -3,6 +3,9 @@
 //! Verifies CMS SignedData structures, particularly signatures on handshake
 //! messages like the Finished message.
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::cms::signed_data::SignedData;
 use crate::crypto::sign::SignatureVerifier;
 use crate::der::asn1::{ObjectIdentifier, OctetString};

@@ -24,7 +24,7 @@ use crate::transport::MessageEmitter;
 mod x509 {
 	pub use crate::crypto::profiles::CryptoProvider;
 	pub use crate::crypto::x509::store::CertificateTrust;
-	pub use crate::transport::handshake::HandshakeKeyManager;
+	pub use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
 	pub use crate::transport::X509ClientConfig;
 	pub use crate::x509::Certificate;
 
@@ -93,7 +93,8 @@ impl ClientPolicies {
 	where
 		G: GatePolicy + Send + Sync + 'static,
 	{
-		self.emitter_gates.push(DynGate(Arc::new(gate)));
+		let gate = Arc::new(gate);
+		self.emitter_gates.push(DynGate(gate));
 		self
 	}
 
@@ -101,7 +102,8 @@ impl ClientPolicies {
 	where
 		G: GatePolicy + Send + Sync + 'static,
 	{
-		self.collector_gates.push(DynGate(Arc::new(gate)));
+		let gate = Arc::new(gate);
+		self.collector_gates.push(DynGate(gate));
 		self
 	}
 
@@ -139,6 +141,10 @@ pub struct ClientBuilder<P: Protocol, C: CryptoProvider + 'static = DefaultCrypt
 	client_certificate: Option<Certificate>,
 	#[cfg(feature = "x509")]
 	client_key: Option<HandshakeKeyManager<C>>,
+	#[cfg(feature = "x509")]
+	server_certificate_chain: Option<Arc<[Certificate]>>,
+	#[cfg(feature = "x509")]
+	handshake_protocol: Option<HandshakeProtocolKind>,
 	_ph: core::marker::PhantomData<(P, C)>,
 }
 
@@ -152,6 +158,10 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 			client_certificate: None,
 			#[cfg(feature = "x509")]
 			client_key: None,
+			#[cfg(feature = "x509")]
+			server_certificate_chain: None,
+			#[cfg(feature = "x509")]
+			handshake_protocol: None,
 			_ph: core::marker::PhantomData,
 		}
 	}
@@ -190,6 +200,21 @@ impl<P: Protocol, C: CryptoProvider + 'static> ClientBuilder<P, C> {
 		self.trust_store = Some(store);
 		self
 	}
+
+	/// Provision the expected server certificate chain, ordered root to
+	/// leaf, for key-transport handshakes (CMS).
+	#[cfg(feature = "x509")]
+	pub fn with_server_certificate_chain(mut self, chain: impl Into<Arc<[Certificate]>>) -> Self {
+		self.server_certificate_chain = Some(chain.into());
+		self
+	}
+
+	/// Select the handshake protocol used when encryption is enabled.
+	#[cfg(feature = "x509")]
+	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
+		self.handshake_protocol = Some(kind);
+		self
+	}
 }
 
 #[cfg(not(feature = "x509"))]
@@ -202,6 +227,7 @@ where
 		let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 		let transport = P::create_transport(stream);
 		let configured = self.policies.apply::<P>(transport);
+
 		Ok(GenericClient::from_transport_with_addr(configured, addr))
 	}
 }
@@ -219,7 +245,16 @@ where
 			transport = transport.with_trust_store(store);
 		}
 		if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
+			let cert = Arc::new(cert);
+			let key = Arc::new(key);
+
 			transport = transport.with_client_identity(cert, key);
+		}
+		if let Some(chain) = self.server_certificate_chain {
+			transport = transport.with_server_certificate_chain(chain);
+		}
+		if let Some(kind) = self.handshake_protocol {
+			transport = transport.with_handshake_protocol(kind);
 		}
 
 		let configured = self.policies.apply::<P>(transport);

@@ -35,7 +35,7 @@ macro_rules! apply_common_builder_patterns {
 		let mut builder = $builder
 			.with_message_hasher::<Sha3_256>([])
 			.with_witness_hasher::<Sha3_256>()
-			.with_compression(ZstdCompression)
+			.with_compression(ZstdCompression::default())
 			.with_aead::<Aes256GcmOid, _>($cipher.to_owned())
 			.with_signer::<Secp256k1Signature, _>($signing_key.to_owned());
 

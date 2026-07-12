@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
-	TightBeamError,
+	transport::handshake::HandshakeError, TightBeamError,
 };
 
 use crate::security::common::{
@@ -139,8 +139,15 @@ job! {
 
 			// Inject the tampered message at the same step
 			match attack_session.inject_at_step(target.step, &tampered_payload).await? {
-				InjectionOutcome::Rejected(_) => {
-					// Tampering detected - signature verification failed
+				InjectionOutcome::Rejected(err) => {
+					let TightBeamError::HandshakeError(handshake_err) = &err else {
+						return Err(expectation_failure("MITM rejection must be a handshake error"));
+					};
+					assert!(
+						!matches!(handshake_err, HandshakeError::DerError(_)),
+						"MITM tampering must fail signature/transcript verification, not DER parsing (got {handshake_err:?})"
+					);
+
 					trace.event("mitm_tampering_detected")?;
 				}
 				InjectionOutcome::Accepted => {

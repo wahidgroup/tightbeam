@@ -16,17 +16,21 @@ use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+use crate::crypto::sign::PrehashVerifier;
 use crate::crypto::sign::SignatureEncoding;
-use crate::crypto::sign::Verifier;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::utils::validate_certificate_expiry;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
+use crate::zeroize::{Zeroize, Zeroizing};
+
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::SecurityOffer;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
-use crate::transport::handshake::utils::{compute_transcript_digest, octet_string_to_32_byte_array, validate_state};
+use crate::transport::handshake::utils::{
+	compute_client_auth_digest, compute_transcript_digest, octet_string_to_32_byte_array, validate_state,
+};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake};
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization}; // for derive_session_aead
 use crate::x509::Certificate;
@@ -42,6 +46,9 @@ where
 {
 	state: ClientStateMachine,
 	client_random: Option<[u8; 32]>,
+	/// Exact DER bytes of the sent `ClientHello`, bound into the transcript so a
+	/// MITM cannot rewrite the offer undetected (CWE-757).
+	client_hello: Option<Vec<u8>>,
 	base_session_key: Option<[u8; 32]>,
 	server_random: Option<[u8; 32]>,
 	transcript_hash: Option<[u8; 32]>,
@@ -72,7 +79,7 @@ where
 	P::Signature: SignatureEncoding,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
-	P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey,
+	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey,
 	P::AeadCipher: KeyInit,
 	M: EciesMessageOps,
 {
@@ -84,6 +91,7 @@ where
 		Self {
 			state: ClientStateMachine::default(),
 			client_random: None,
+			client_hello: None,
 			base_session_key: None,
 			server_random: None,
 			transcript_hash: None,
@@ -113,6 +121,7 @@ where
 		Self {
 			state: ClientStateMachine::default(),
 			client_random: None,
+			client_hello: None,
 			base_session_key: None,
 			server_random: None,
 			transcript_hash: None,
@@ -162,18 +171,19 @@ where
 	}
 
 	/// Validate server handshake and extract components.
+	///
+	/// Fail-closed (CWE-295): a configured certificate validator is
+	/// mandatory. Expiry alone authenticates nobody, so a missing validator
+	/// aborts the handshake instead of silently degrading.
 	fn validate_and_extract_server_handshake(
 		&self,
 		server_handshake_der: &[u8],
 	) -> Result<ServerHandshake, HandshakeError> {
-		// Decode ServerHandshake
-		// Use provided validator if available, otherwise default to expiry check
 		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
-		if let Some(validator) = &self.certificate_validator {
-			validator.evaluate(&server_handshake.certificate)?;
-		} else {
-			validate_certificate_expiry(&server_handshake.certificate)?;
-		}
+		let validator = self.certificate_validator.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
+
+		validate_certificate_expiry(&server_handshake.certificate)?;
+		validator.evaluate(&server_handshake.certificate)?;
 
 		Ok(server_handshake)
 	}
@@ -188,7 +198,7 @@ where
 
 	/// Compute and store transcript hash.
 	fn compute_and_store_transcript_hash(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
-		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
+		let client_hello = self.client_hello.as_deref().ok_or(HandshakeError::InvalidState)?;
 		let server_random = self.server_random.ok_or(HandshakeError::InvalidState)?;
 		let spki_bytes = server_handshake
 			.certificate
@@ -204,7 +214,7 @@ where
 			None => Vec::new(),
 		};
 
-		let transcript_digest = self.compute_transcript_hash(&client_random, &server_random, spki_bytes, &accept_der);
+		let transcript_digest = self.compute_transcript_hash(client_hello, &server_random, spki_bytes, &accept_der)?;
 		self.transcript_hash = Some(transcript_digest);
 		// Invariant: transcript becomes immutable after hash computed
 		self.invariants.lock_transcript()?;
@@ -238,9 +248,14 @@ where
 			security_offer: self.security_offer.clone(),
 		};
 
+		// Retain the exact DER for transcript binding: the full
+		// ClientHello (offer included) is hashed on both sides.
+		let client_hello_der = client_hello.to_der()?;
+		self.client_hello = Some(client_hello_der.clone());
+
 		// Transition: mark hello sent
 		self.state.transition(ClientHandshakeState::HelloSent)?;
-		Ok(client_hello.to_der()?)
+		Ok(client_hello_der)
 	}
 
 	/// Process ServerHandshake message and build ClientKeyExchange.
@@ -273,8 +288,9 @@ where
 		// 7. Generate and encrypt session key
 		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake)?;
 
-		// 8. Handle mutual authentication
-		let (client_certificate, client_signature) = self.prepare_client_auth(&server_handshake).await?;
+		// 8. Handle mutual authentication (signature commits to encrypted_bytes)
+		let (client_certificate, client_signature) =
+			self.prepare_client_auth(&server_handshake, &encrypted_bytes).await?;
 
 		// 10. Build and encode ClientKeyExchange
 		let client_kex = ClientKeyExchange {
@@ -285,7 +301,7 @@ where
 			client_signature,
 		};
 
-		// 11. Transition through intermediate ServerHelloReceived then KeyExchangeSent
+		// 11. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex.to_der()?)
@@ -296,7 +312,6 @@ where
 	/// Handles both negotiation mode (client sent offer) and dealer's choice mode (no offer).
 	fn validate_profile_selection(&mut self, server_handshake: &ServerHandshake) -> Result<(), HandshakeError> {
 		let accept = server_handshake.security_accept.as_ref().ok_or(HandshakeError::InvalidState)?;
-
 		match &self.security_offer {
 			Some(offer) => {
 				// Mode 1: Negotiation - verify server's selection is from our offer
@@ -337,28 +352,35 @@ where
 
 	/// Prepare client authentication materials if required or available.
 	///
+	/// The signature covers `Digest(transcript_hash || encrypted_data || cert_der)`
+	/// so it cannot be spliced onto a different key exchange or identity.
+	///
 	/// Returns tuple of (optional certificate, optional signature).
 	async fn prepare_client_auth(
 		&self,
 		server_handshake: &ServerHandshake,
+		encrypted_data: &[u8],
 	) -> Result<(Option<Certificate>, Option<OctetString>), HandshakeError> {
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
-		if server_handshake.client_cert_required {
-			// Server requires mutual auth - ensure we have client identity
-			let cert = self.client_certificate.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
-			let signature_bytes = key_provider.sign(&transcript_digest).await?;
-			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(signature_bytes)?)))
-		} else if let Some(cert) = &self.client_certificate {
-			// Client wants mutual auth but server doesn't require it
-			let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let signature_bytes = key_provider.sign(&transcript_digest).await?;
-			Ok((Some(Certificate::clone(cert)), Some(OctetString::new(signature_bytes)?)))
-		} else {
-			// No mutual auth
-			Ok((None, None))
-		}
+		let cert = match (&self.client_certificate, server_handshake.client_cert_required) {
+			(Some(cert), _) => cert,
+			(None, true) => return Err(HandshakeError::MutualAuthRequired),
+			(None, false) => return Ok((None, None)),
+		};
+		let key_provider = match (&self.client_key_provider, server_handshake.client_cert_required) {
+			(Some(provider), _) => provider,
+			(None, true) => return Err(HandshakeError::MutualAuthRequired),
+			(None, false) => return Err(HandshakeError::InvalidState),
+		};
+
+		let cert_der = cert.to_der()?;
+		let auth_digest = compute_client_auth_digest::<P::Digest>(&transcript_digest, encrypted_data, &cert_der)?;
+		let signature_bytes = key_provider.sign_prehash(&auth_digest).await?;
+
+		let cert = Certificate::clone(cert);
+		let signature = OctetString::new(signature_bytes)?;
+		Ok((Some(cert), Some(signature)))
 	}
 	/// Complete the handshake and derive the final session key.
 	///
@@ -374,26 +396,20 @@ where
 		let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 
 		// Concatenate client_random || server_random as salt for AEAD derivation
-		let mut salt = [0u8; 64];
+		let mut salt = Zeroizing::new([0u8; 64]);
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
-		let session_key = self.derive_session_aead(base_key, &salt)?;
+		let session_key = self.derive_session_aead(base_key, salt.as_slice())?;
 		// Invariant: AEAD key derivation occurs exactly once after transcript locked
 		self.invariants.derive_aead_once()?;
 
 		// 3. Transition to complete
 		self.state.transition(ClientHandshakeState::Completed)?;
 
-		// 4. Clear sensitive data
-		if let Some(mut bk) = self.base_session_key.take() {
-			bk.fill(0);
-		}
-		if let Some(mut cr) = self.client_random.take() {
-			cr.fill(0);
-		}
-		if let Some(mut sr) = self.server_random.take() {
-			sr.fill(0);
-		}
+		// 4. Clear sensitive data in place (Option impl zeroes payload, then None)
+		self.base_session_key.zeroize();
+		self.client_random.zeroize();
+		self.server_random.zeroize();
 
 		Ok(session_key)
 	}
@@ -421,13 +437,13 @@ where
 
 	fn compute_transcript_hash(
 		&self,
-		client_random: &[u8; 32],
+		client_hello: &[u8],
 		server_random: &[u8; 32],
 		spki_bytes: &[u8],
 		accept_der: &[u8],
-	) -> [u8; 32] {
-		let mut data = Vec::with_capacity(32 + 32 + spki_bytes.len() + accept_der.len());
-		data.extend_from_slice(client_random);
+	) -> Result<[u8; 32], HandshakeError> {
+		let mut data = Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len());
+		data.extend_from_slice(client_hello);
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
 		data.extend_from_slice(accept_der);
@@ -443,7 +459,7 @@ where
 	) -> Result<(), HandshakeError> {
 		let signature = P::Signature::try_from(signature_bytes).map_err(|e| e.into())?;
 
-		verifying_key.verify(digest, &signature)?;
+		verifying_key.verify_prehash(digest, &signature)?;
 
 		Ok(())
 	}
@@ -455,7 +471,7 @@ where
 		server_certificate: &Certificate,
 		associated_data: Option<&[u8]>,
 	) -> Result<Vec<u8>, HandshakeError> {
-		let mut plaintext = [0u8; 64];
+		let mut plaintext = Zeroizing::new([0u8; 64]);
 		plaintext[..32].copy_from_slice(base_key);
 		plaintext[32..].copy_from_slice(client_random);
 
@@ -470,7 +486,7 @@ where
 		// TODO decouple OsRng
 		let encrypted_message = encrypt::<_, _, _, M, P::Kdf, P::AeadCipher>(
 			&recipient_pubkey,
-			&plaintext,
+			plaintext.as_slice(),
 			associated_data,
 			Some(&mut rand_core::OsRng),
 		)?;
@@ -509,7 +525,7 @@ where
 	P::Signature: SignatureEncoding + Send + Sync,
 	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	for<'a> <P::Signature as TryFrom<&'a [u8]>>::Error: Into<HandshakeError>,
-	P::VerifyingKey: Verifier<P::Signature> + ExtractVerifyingKey + Send + Sync,
+	P::VerifyingKey: PrehashVerifier<P::Signature> + ExtractVerifyingKey + Send + Sync,
 	P::AeadCipher: KeyInit + Send + Sync + 'static,
 	M: EciesMessageOps + Send + Sync,
 {
@@ -540,30 +556,12 @@ where
 		&'a mut self,
 	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<RuntimeAead, Self::Error>> + Send + 'a>> {
 		Box::pin(async move {
-			if self.state.state() != ClientHandshakeState::KeyExchangeSent {
-				return Err(HandshakeError::InvalidState);
-			}
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
-			let base_key = self.base_session_key.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let client_random = self.client_random.as_ref().ok_or(HandshakeError::InvalidState)?;
-			let server_random = self.server_random.as_ref().ok_or(HandshakeError::InvalidState)?;
 
-			let mut salt = [0u8; 64];
-			salt[..32].copy_from_slice(client_random);
-			salt[32..].copy_from_slice(server_random);
-
-			let cipher = self.derive_session_aead(base_key, &salt)?;
-			self.state.transition(ClientHandshakeState::Completed)?;
-			if let Some(mut bk) = self.base_session_key.take() {
-				bk.fill(0);
-			}
-			if let Some(mut cr) = self.client_random.take() {
-				cr.fill(0);
-			}
-			if let Some(mut sr) = self.server_random.take() {
-				sr.fill(0);
-			}
+			// Delegate to the inherent method: single source of truth for state
+			// validation, AEAD derivation, invariants, and cleanup.
+			let cipher = EciesHandshakeClient::complete(self)?;
 
 			Ok(RuntimeAead::new(cipher, aead_oid))
 		})
@@ -594,7 +592,7 @@ mod tests {
 	use crate::crypto::ecies::Secp256k1EciesMessage;
 	use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 	use crate::crypto::sign::ecdsa::Secp256k1Signature;
-	use crate::crypto::sign::Signer;
+	use crate::crypto::sign::PrehashSigner;
 	use crate::der::Encode;
 	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 	use crate::transport::handshake::tests::*;
@@ -607,24 +605,23 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_client_state_flow() -> Result<(), Box<dyn core::error::Error>> {
-		// Given: A client in init state
-		let mut client = TestEciesClientBuilder::new().build();
+		// Given: A client in init state that trusts the test server certificate
+		let test_cert = create_test_certificate();
+		let mut client = TestEciesClientBuilder::new()
+			.with_trusted_certificate(test_cert.certificate.clone())
+			.build();
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 
 		// When: Client builds client hello
-		let _client_hello_der = client.build_client_hello()?;
+		let client_hello_der = client.build_client_hello()?;
 		assert_eq!(client.state(), ClientHandshakeState::HelloSent); // Hello sent
 		assert!(client.client_random.is_some());
 
 		// And: Server creates a valid server handshake response
-		let test_cert = create_test_certificate();
-		let client_random = client
-			.client_random
-			.ok_or(crate::testing::error::TestingError::InvariantViolated)?;
 		let server_random = crate::random::generate_nonce::<32>(None)?;
 		let accept_der = SecurityAccept::new(create_default_test_profile()).to_der()?;
 		let transcript_hash = compute_test_transcript_hash(
-			&client_random,
+			&client_hello_der,
 			&server_random,
 			test_cert
 				.certificate
@@ -635,7 +632,7 @@ mod tests {
 			&accept_der,
 		);
 
-		let signature_bytes: Secp256k1Signature = test_cert.signing_key.try_sign(&transcript_hash)?;
+		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 		let server_handshake_der =
 			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
 
@@ -654,6 +651,36 @@ mod tests {
 		assert!(client.is_complete());
 		assert_eq!(client.state(), ClientHandshakeState::Completed);
 
+		Ok(())
+	}
+
+	/// A client without a certificate validator must abort instead of
+	/// degrading to expiry-only server authentication (CWE-295).
+	#[tokio::test]
+	async fn test_missing_validator_fails_closed() -> Result<(), Box<dyn core::error::Error>> {
+		let mut client = TestEciesClientBuilder::new().build();
+		let client_hello_der = client.build_client_hello()?;
+
+		let test_cert = create_test_certificate();
+		let server_random = crate::random::generate_nonce::<32>(None)?;
+		let accept_der = SecurityAccept::new(create_default_test_profile()).to_der()?;
+		let transcript_hash = compute_test_transcript_hash(
+			&client_hello_der,
+			&server_random,
+			test_cert
+				.certificate
+				.tbs_certificate
+				.subject_public_key_info
+				.subject_public_key
+				.raw_bytes(),
+			&accept_der,
+		);
+		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
+		let server_handshake_der =
+			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
+
+		let result = client.process_server_handshake(&server_handshake_der).await;
+		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
 		Ok(())
 	}
 
@@ -681,11 +708,11 @@ mod tests {
 	#[tokio::test]
 	async fn test_client_profile_validation() -> Result<(), Box<dyn core::error::Error>> {
 		let mk_profile = |id: u8| SecurityProfileDesc {
-			digest: match id {
+			digest: Some(match id {
 				1 => HASH_SHA3_256,
 				2 => HASH_SHA3_384,
 				_ => HASH_SHA3_512,
-			},
+			}),
 			aead: Some(AES_256_GCM),
 			aead_key_size: Some(32),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
@@ -701,26 +728,27 @@ mod tests {
 		// Helper to create client with security offer and build hello
 		#[allow(clippy::type_complexity)]
 		let setup_client = |offer: Option<SecurityOffer>| -> Result<
-			(EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>, [u8; 32]),
+			(EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>, Vec<u8>),
 			Box<dyn std::error::Error>,
 		> {
-			let mut client = TestEciesClientBuilder::new().build();
+			let mut client = TestEciesClientBuilder::new()
+				.with_trusted_certificate(test_cert.certificate.clone())
+				.build();
 			if let Some(offer) = offer {
 				client = client.with_security_offer(offer);
 			}
-			let _hello = client.build_client_hello()?;
-			let client_random = client.client_random.ok_or("No client random")?;
-			Ok((client, client_random))
+			let hello = client.build_client_hello()?;
+			Ok((client, hello))
 		};
 
 		// Helper to create signed server handshake
-		let create_server_response = |client_random: &[u8; 32],
+		let create_server_response = |client_hello_der: &[u8],
 		                              server_random: [u8; 32],
 		                              accepted_profile: &SecurityProfileDesc|
 		 -> Result<Vec<u8>, Box<dyn core::error::Error>> {
 			let accept_der = SecurityAccept::new(*accepted_profile).to_der()?;
 			let transcript_hash = compute_test_transcript_hash(
-				client_random,
+				client_hello_der,
 				&server_random,
 				test_cert
 					.certificate
@@ -730,7 +758,7 @@ mod tests {
 					.raw_bytes(),
 				&accept_der,
 			);
-			let signature: Secp256k1Signature = test_cert.signing_key.try_sign(&transcript_hash)?;
+			let signature: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
 			let signature_bytes = signature.to_bytes().to_vec();
 
 			let response = ServerHandshake {
@@ -743,26 +771,26 @@ mod tests {
 			Ok(response.to_der()?)
 		};
 
-		// Test 1: Client offers [A, B], server accepts B → OK
+		// Test 1: Client offers [A, B], server accepts B -> OK
 		{
-			let (mut client, client_random) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
-			let server_response = create_server_response(&client_random, [2u8; 32], &p_b)?;
+			let (mut client, client_hello_der) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
+			let server_response = create_server_response(&client_hello_der, [2u8; 32], &p_b)?;
 			let _kex = client.process_server_handshake(&server_response).await?;
 			assert_eq!(client.selected_profile, Some(p_b));
 		}
 
-		// Test 2: Client offers [A, B], server accepts C (not in offer) → FAIL
+		// Test 2: Client offers [A, B], server accepts C (not in offer) -> FAIL
 		{
-			let (mut client, client_random) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
-			let server_response = create_server_response(&client_random, [3u8; 32], &p_c)?;
+			let (mut client, client_hello_der) = setup_client(Some(SecurityOffer::new(vec![p_a, p_b])))?;
+			let server_response = create_server_response(&client_hello_der, [3u8; 32], &p_c)?;
 			let result = client.process_server_handshake(&server_response).await;
 			assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 		}
 
-		// Test 3: No offer, server picks → OK (dealer's choice)
+		// Test 3: No offer, server picks -> OK (dealer's choice)
 		{
-			let (mut client, client_random) = setup_client(None)?;
-			let server_response = create_server_response(&client_random, [4u8; 32], &p_a)?;
+			let (mut client, client_hello_der) = setup_client(None)?;
+			let server_response = create_server_response(&client_hello_der, [4u8; 32], &p_a)?;
 			let _kex = client.process_server_handshake(&server_response).await?;
 			assert_eq!(client.selected_profile, Some(p_a));
 		}

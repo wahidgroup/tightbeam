@@ -22,6 +22,9 @@ use crate::trace::TraceConfigBuilder;
 use crate::utils::urn::Urn;
 use crate::Frame;
 
+#[cfg(feature = "instrument")]
+use core::sync::atomic::{AtomicBool, Ordering};
+
 #[cfg(feature = "testing-fault")]
 use crate::constants::DEFAULT_FAULT_SEED;
 #[cfg(feature = "instrument")]
@@ -260,7 +263,8 @@ impl<'a> EventBuilder<'a> {
 						events::ASSERT_LABEL
 					};
 
-					self.collector.emit_internal(urn, Some(&label), self.payload, self.duration_ns);
+					self.collector
+						.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
 				}
 
 				#[cfg(feature = "testing-fuzz")]
@@ -277,6 +281,7 @@ impl<'a> EventBuilder<'a> {
 						Some(&label),
 						Some(value_str.as_bytes()),
 						self.duration_ns,
+						None,
 					);
 				}
 
@@ -313,6 +318,11 @@ struct TraceState {
 	config: TbInstrumentationConfig,
 	#[cfg(feature = "instrument")]
 	seq: Mutex<u32>,
+	/// Set when an event is dropped because `max_events` was reached;
+	/// propagated into `EvidenceArtifact.overflow` so under-reporting
+	/// traces cannot claim completeness
+	#[cfg(feature = "instrument")]
+	overflow: AtomicBool,
 	#[cfg(feature = "testing-fuzz")]
 	oracle: Option<crate::testing::fuzz::FuzzContext>,
 	#[cfg(feature = "testing-fault")]
@@ -335,6 +345,8 @@ impl Default for TraceState {
 			config: TbInstrumentationConfig::default(),
 			#[cfg(feature = "instrument")]
 			seq: Mutex::new(0),
+			#[cfg(feature = "instrument")]
+			overflow: AtomicBool::new(false),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
 			#[cfg(feature = "testing-fault")]
@@ -357,6 +369,7 @@ impl TraceState {
 			events: Mutex::new(Vec::new()),
 			config,
 			seq: Mutex::new(0),
+			overflow: AtomicBool::new(false),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
 			#[cfg(feature = "testing-fault")]
@@ -380,6 +393,8 @@ impl TraceState {
 			config: TbInstrumentationConfig::default(),
 			#[cfg(feature = "instrument")]
 			seq: Mutex::new(0),
+			#[cfg(feature = "instrument")]
+			overflow: AtomicBool::new(false),
 			oracle: Some(crate::testing::fuzz::FuzzContext::new(input, process)),
 			#[cfg(feature = "testing-fault")]
 			runtime_fault_model: None,
@@ -434,7 +449,14 @@ impl TraceCollector {
 		Self { state: Arc::new(TraceState::with_oracle(input, process)) }
 	}
 
-	/// Get the fuzz oracle, panicking if not configured
+	/// Get the fuzz oracle
+	///
+	/// # Panics
+	///
+	/// Panics when no oracle is configured. This accessor exists for
+	/// `tb_scenario!`-generated fuzz harnesses (feature `testing-fuzz`),
+	/// where a missing `csp:` parameter is a harness construction bug that
+	/// must abort the fuzz run rather than continue unguided.
 	#[cfg(feature = "testing-fuzz")]
 	pub fn oracle(&self) -> &crate::testing::fuzz::FuzzContext {
 		self.state
@@ -574,39 +596,45 @@ impl TraceCollector {
 	}
 
 	#[cfg(feature = "instrument")]
-	fn emit_internal(&self, urn: Urn<'static>, label: Option<&str>, payload: Option<&[u8]>, duration_ns: Option<u64>) {
+	fn emit_internal(
+		&self,
+		urn: Urn<'static>,
+		label: Option<&str>,
+		payload: Option<&[u8]>,
+		duration_ns: Option<u64>,
+		timestamp_ns: Option<u64>,
+	) {
 		let cfg = self.state.config;
-		let seq = self.next_seq();
 
-		// Check overflow
-		if let Ok(events) = self.state.events.lock() {
+		// Capacity check and push happen under one lock acquisition so
+		// concurrent emitters cannot overshoot `max_events` between the
+		// check and the insert.
+		if let Ok(mut events) = self.state.events.lock() {
 			if (events.len() as u32) >= cfg.max_events {
+				self.state.overflow.store(true, Ordering::Relaxed);
 				return;
 			}
-		}
 
-		let payload_hash = if cfg.enable_payloads {
-			payload.map(hash_payload)
-		} else {
-			None
-		};
-
-		let event = TbEvent {
-			seq,
-			urn,
-			label: label.map(|l| l.to_string()),
-			payload_hash,
-			duration_ns: if cfg.record_durations {
-				duration_ns
+			let payload_hash = if cfg.enable_payloads {
+				payload.map(hash_payload)
 			} else {
 				None
-			},
-			flags: 0,
-			extras: None,
-		};
+			};
 
-		if let Ok(mut events) = self.state.events.lock() {
-			events.push(event);
+			events.push(TbEvent {
+				seq: self.next_seq(),
+				urn,
+				label: label.map(|l| l.to_string()),
+				payload_hash,
+				duration_ns: if cfg.record_durations {
+					duration_ns
+				} else {
+					None
+				},
+				timestamp_ns,
+				flags: 0,
+				extras: None,
+			});
 		}
 	}
 
@@ -617,12 +645,21 @@ impl TraceCollector {
 
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_payload(&self, event_urn: Urn<'static>, label: impl AsRef<str>, payload: Option<&[u8]>) {
-		self.emit_internal(event_urn, Some(label.as_ref()), payload, None);
+		self.emit_internal(event_urn, Some(label.as_ref()), payload, None, None);
 	}
 
 	#[cfg(feature = "instrument")]
 	pub fn emit_with_timing(&self, event_urn: Urn<'static>, label: impl AsRef<str>, duration: Duration) {
-		self.emit_internal(event_urn, Some(label.as_ref()), None, Some(duration.as_nanos() as u64));
+		self.emit_internal(event_urn, Some(label.as_ref()), None, Some(duration.as_nanos() as u64), None);
+	}
+
+	/// Emit an event stamped with a point-in-time instant (relative to the
+	/// trace clock origin), e.g. deadline start/end markers. Durations and
+	/// timestamps are distinct `TbEvent` fields: a duration is a span length,
+	/// a timestamp is when the event occurred.
+	#[cfg(feature = "instrument")]
+	pub fn emit_with_timestamp(&self, event_urn: Urn<'static>, label: impl AsRef<str>, timestamp: Duration) {
+		self.emit_internal(event_urn, Some(label.as_ref()), None, None, Some(timestamp.as_nanos() as u64));
 	}
 
 	/// Drain assertions into a vector
@@ -642,6 +679,16 @@ impl TraceCollector {
 		} else {
 			Vec::new()
 		}
+	}
+
+	/// Whether any event was dropped because `max_events` was reached
+	///
+	/// Feed this into [`EvidenceArtifact::finalize`]
+	/// (crate::instrumentation::EvidenceArtifact::finalize) so evidence
+	/// built from a truncated trace reports `overflow = true`.
+	#[cfg(feature = "instrument")]
+	pub fn overflowed(&self) -> bool {
+		self.state.overflow.load(Ordering::Relaxed)
 	}
 }
 
@@ -847,6 +894,40 @@ mod tests {
 				trace.event("beta")?;
 				Ok(())
 			}
+		}
+	}
+
+	#[cfg(feature = "instrument")]
+	mod overflow {
+		use crate::instrumentation::{events, TbInstrumentationConfig};
+		use crate::trace::{TraceCollector, TraceConfig};
+
+		fn collector_with_max_events(max_events: u32) -> TraceCollector {
+			let config = TbInstrumentationConfig { max_events, ..Default::default() };
+			TraceCollector::from(TraceConfig::with_instrumentation(config))
+		}
+
+		#[test]
+		fn events_within_bound_do_not_overflow() {
+			let collector = collector_with_max_events(2);
+
+			collector.emit(events::START, "first");
+			collector.emit(events::END, "second");
+
+			assert!(!collector.overflowed());
+			assert_eq!(collector.drain_events().len(), 2);
+		}
+
+		#[test]
+		fn events_past_bound_are_dropped_and_flagged() {
+			let collector = collector_with_max_events(2);
+
+			collector.emit(events::START, "first");
+			collector.emit(events::END, "second");
+			collector.emit(events::END, "third");
+
+			assert!(collector.overflowed());
+			assert_eq!(collector.drain_events().len(), 2);
 		}
 	}
 }

@@ -11,7 +11,7 @@ use tightbeam::crypto::kdf::HkdfSha3_256;
 use tightbeam::crypto::secret::ToInsecure;
 use tightbeam::crypto::sign::ecdsa::k256::SecretKey;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::{compose, decode, servlet};
+use tightbeam::{compose, servlet};
 
 use super::currency::MonetaryAmount;
 use super::harness::{PaymentHarness, PAYMENT_TAG};
@@ -53,7 +53,7 @@ pub fn to_priority(amount: &MonetaryAmount) -> MessagePriority {
 servlet! {
 	pub AuthorizationServlet<CreditTransferTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
 
 		// Create harness for validation
@@ -66,11 +66,6 @@ servlet! {
 					message: cached
 			}?));
 		}
-
-		// Decode the authorization request
-		// Note: ECIES decryption via KeyManager is available when ctx.hive_context() is Some
-		// but requires encrypted messages. For now, messages are unencrypted.
-		let req: CreditTransferTransaction = decode(&frame.message)?;
 
 		// Verify integrity
 		if frame.integrity.is_some() {
@@ -115,7 +110,7 @@ servlet! {
 servlet! {
 	pub CaptureServlet<CaptureTransaction, EnvConfig = ()>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
 
 		// Create harness for validation
@@ -128,9 +123,6 @@ servlet! {
 					message: cached
 			}?));
 		}
-
-		// Decode the capture request
-		let req: CaptureTransaction = decode(&frame.message)?;
 
 		// Verify chain linkage (previous_frame should link to authorization)
 		if frame.metadata.previous_frame.is_some() {
@@ -179,12 +171,9 @@ pub enum KeyManagerRequest {
 servlet! {
 	pub KeyManagerServlet<KeyManagerRequest, EnvConfig = Arc<SecretKey>>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
 		let secret_key: &Arc<SecretKey> = ctx.env_config()?;
-
-		// Decode the request
-		let req: KeyManagerRequest = decode(&frame.message)?;
 
 		match req {
 			KeyManagerRequest::GetPublicKey(_) => {

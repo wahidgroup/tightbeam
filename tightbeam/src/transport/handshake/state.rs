@@ -1,12 +1,8 @@
 //! State machine infrastructure for TightBeam handshake protocol.
 //!
 //! This redesigned module provides role-specific handshake state machines
-//! with explicit terminal states, granular failure classification, replay
-//! (nonce) tracking, and invariant enforcement hooks.
-//!
-//! Breaking changes: the previous `HandshakeState` enum is replaced by
-//! `ClientHandshakeState` and `ServerHandshakeState`. Transition APIs are
-//! now role-specific (`ClientStateMachine` / `ServerStateMachine`).
+//! with explicit terminal states, granular failure classification, and
+//! invariant enforcement hooks.
 
 use crate::transport::handshake::error::HandshakeError;
 
@@ -106,97 +102,6 @@ impl ServerHandshakeState {
 }
 
 // ---------------------------------------------------------------------------
-// Replay / Nonce Tracking
-// ---------------------------------------------------------------------------
-
-#[cfg(not(feature = "std"))]
-use alloc::collections::{BTreeMap as HashMap, VecDeque};
-#[cfg(feature = "std")]
-use std::collections::{HashMap, VecDeque};
-
-/// Nonce replay detection with LRU eviction.
-///
-/// Maintains a bounded set of recently seen nonces to prevent replay attacks.
-/// When capacity is reached, the oldest nonce is evicted (FIFO/LRU).
-///
-/// # Type Parameters
-/// - `N`: Nonce size in bytes (e.g., 32 for ECIES client_random, 64 for CMS UKM)
-///
-/// # Security Properties
-/// - Amortized O(1) lookup via HashMap (not constant-time)
-/// - Bounded memory usage (cap * N bytes + overhead)
-/// - LRU eviction ensures recent nonces are always tracked
-/// - No silent failures: all nonces are either tracked or evict oldest
-#[derive(Debug)]
-pub struct NonceReplaySet<const N: usize> {
-	/// Maps nonce -> insertion order for O(1) lookup
-	seen: HashMap<[u8; N], usize>,
-	/// Queue of nonces in insertion order for LRU eviction
-	order: VecDeque<[u8; N]>,
-	/// Maximum number of nonces to track
-	cap: usize,
-	/// Monotonic counter for insertion order
-	counter: usize,
-}
-
-impl<const N: usize> NonceReplaySet<N> {
-	pub fn new(cap: usize) -> Self {
-		Self {
-			#[cfg(feature = "std")]
-			seen: HashMap::with_capacity(cap),
-			#[cfg(not(feature = "std"))]
-			seen: HashMap::new(),
-			order: VecDeque::with_capacity(cap),
-			cap,
-			counter: 0,
-		}
-	}
-
-	/// Check if nonce is a replay and insert if new.
-	///
-	/// Returns `true` if the nonce was already seen (replay attack).
-	/// Returns `false` if the nonce is new (inserted successfully).
-	///
-	/// When at capacity, evicts the oldest nonce (LRU).
-	pub fn insert_or_replay(&mut self, n: [u8; N]) -> bool {
-		// Check for replay
-		if self.seen.contains_key(&n) {
-			return true; // Replay detected
-		}
-
-		// Evict oldest if at capacity
-		if self.seen.len() >= self.cap {
-			if let Some(oldest) = self.order.pop_front() {
-				self.seen.remove(&oldest);
-			}
-		}
-
-		// Insert new nonce
-		self.seen.insert(n, self.counter);
-		self.order.push_back(n);
-		self.counter = self.counter.wrapping_add(1);
-
-		false // Not a replay
-	}
-
-	pub fn clear(&mut self) {
-		self.seen.clear();
-		self.order.clear();
-		self.counter = 0;
-	}
-
-	/// Get the number of nonces currently tracked.
-	pub fn len(&self) -> usize {
-		self.seen.len()
-	}
-
-	/// Check if the replay set is empty.
-	pub fn is_empty(&self) -> bool {
-		self.seen.is_empty()
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Invariant Tracking
 // ---------------------------------------------------------------------------
 
@@ -263,6 +168,10 @@ impl ClientStateMachine {
 		self.state
 	}
 
+	// Deliberately the union of the ECIES and CMS transition tables: both
+	// protocols share this machine, so a transition legal in either flow is
+	// accepted here. Protocol-confusion is prevented by the orchestrators,
+	// which drive a fixed sequence.
 	fn can_transition(&self, to: ClientHandshakeState) -> bool {
 		use ClientHandshakeState::*;
 		match (self.state, to) {
@@ -311,6 +220,7 @@ impl ServerStateMachine {
 		self.state
 	}
 
+	// Union of ECIES and CMS transition tables; see ClientStateMachine note.
 	fn can_transition(&self, to: ServerHandshakeState) -> bool {
 		use ServerHandshakeState::*;
 		match (self.state, to) {
@@ -407,113 +317,5 @@ mod tests {
 			.transition(ServerHandshakeState::Failed(FailureKind::ProtocolViolation))
 			.is_ok());
 		assert!(sm2.state().is_failed());
-	}
-
-	// ---------------------------------------------------------------------------
-	// Nonce Replay Set Tests
-	// ---------------------------------------------------------------------------
-
-	#[test]
-	fn test_nonce_replay_detection() {
-		let mut set = NonceReplaySet::<32>::new(3);
-		let nonce1 = [1u8; 32];
-		let nonce2 = [2u8; 32];
-
-		// First insertion should succeed
-		assert!(!set.insert_or_replay(nonce1));
-		assert_eq!(set.len(), 1);
-
-		// Replay should be detected
-		assert!(set.insert_or_replay(nonce1));
-		assert_eq!(set.len(), 1);
-
-		// Different nonce should succeed
-		assert!(!set.insert_or_replay(nonce2));
-		assert_eq!(set.len(), 2);
-	}
-
-	#[test]
-	fn test_nonce_lru_eviction() {
-		let mut set = NonceReplaySet::<32>::new(3);
-		let nonce1 = [1u8; 32];
-		let nonce2 = [2u8; 32];
-		let nonce3 = [3u8; 32];
-		let nonce4 = [4u8; 32];
-
-		// Fill to capacity: [nonce1, nonce2, nonce3]
-		assert!(!set.insert_or_replay(nonce1));
-		assert!(!set.insert_or_replay(nonce2));
-		assert!(!set.insert_or_replay(nonce3));
-		assert_eq!(set.len(), 3);
-
-		// Insert 4th nonce - should evict nonce1 (oldest)
-		// Now: [nonce2, nonce3, nonce4]
-		assert!(!set.insert_or_replay(nonce4));
-		assert_eq!(set.len(), 3);
-
-		// nonce1 should no longer be tracked (evicted)
-		assert!(!set.insert_or_replay(nonce1)); // Not a replay!
-		assert_eq!(set.len(), 3);
-
-		// But nonce3, nonce4, nonce1 should still be in the set
-		// (nonce2 was evicted when we inserted nonce1)
-		// Current state: [nonce3, nonce4, nonce1]
-		assert!(set.insert_or_replay(nonce3)); // Replay!
-		assert!(set.insert_or_replay(nonce4)); // Replay!
-		assert!(set.insert_or_replay(nonce1)); // Replay!
-	}
-
-	#[test]
-	fn test_nonce_clear() {
-		let mut set = NonceReplaySet::<32>::new(10);
-		let nonce = [42u8; 32];
-
-		set.insert_or_replay(nonce);
-		assert_eq!(set.len(), 1);
-
-		set.clear();
-		assert_eq!(set.len(), 0);
-		assert!(set.is_empty());
-
-		// After clear, same nonce should not be detected as replay
-		assert!(!set.insert_or_replay(nonce));
-	}
-
-	#[test]
-	fn test_nonce_capacity_boundary() {
-		let mut set = NonceReplaySet::<32>::new(1);
-		let nonce1 = [1u8; 32];
-		let nonce2 = [2u8; 32];
-
-		// Insert first nonce
-		assert!(!set.insert_or_replay(nonce1));
-		assert_eq!(set.len(), 1);
-
-		// Insert second nonce - should evict first
-		assert!(!set.insert_or_replay(nonce2));
-		assert_eq!(set.len(), 1);
-
-		// First nonce should be evicted
-		assert!(!set.insert_or_replay(nonce1));
-		assert_eq!(set.len(), 1);
-	}
-
-	#[test]
-	fn test_nonce_64byte_ukm() {
-		let mut set = NonceReplaySet::<64>::new(3);
-		let ukm1 = [1u8; 64];
-		let ukm2 = [2u8; 64];
-
-		// First insertion should succeed
-		assert!(!set.insert_or_replay(ukm1));
-		assert_eq!(set.len(), 1);
-
-		// Replay should be detected
-		assert!(set.insert_or_replay(ukm1));
-		assert_eq!(set.len(), 1);
-
-		// Different UKM should succeed
-		assert!(!set.insert_or_replay(ukm2));
-		assert_eq!(set.len(), 2);
 	}
 }

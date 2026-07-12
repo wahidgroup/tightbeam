@@ -237,6 +237,54 @@ pub fn ca_extensions(ca: bool, key_cert_sign: bool, path_len: Option<u8>) -> Vec
 	vec![test_extension(&basic_constraints), test_extension(&key_usage)]
 }
 
+/// Digest whose output (16 bytes) is shorter than the 20-byte SKID
+/// truncation window.
+#[cfg(all(feature = "digest", feature = "sha3"))]
+#[derive(Clone, Default)]
+pub struct SixteenByteDigest(crate::crypto::hash::Sha3_256);
+
+#[cfg(all(feature = "digest", feature = "sha3"))]
+mod sixteen_byte_digest {
+	use super::SixteenByteDigest;
+	use crate::der::oid::AssociatedOid;
+
+	impl digest::Update for SixteenByteDigest {
+		fn update(&mut self, data: &[u8]) {
+			digest::Update::update(&mut self.0, data);
+		}
+	}
+
+	impl digest::OutputSizeUser for SixteenByteDigest {
+		type OutputSize = digest::consts::U16;
+	}
+
+	impl digest::FixedOutput for SixteenByteDigest {
+		fn finalize_into(self, out: &mut digest::Output<Self>) {
+			let full = digest::FixedOutput::finalize_fixed(self.0);
+			out.copy_from_slice(&full[..16]);
+		}
+	}
+
+	impl digest::Reset for SixteenByteDigest {
+		fn reset(&mut self) {
+			digest::Reset::reset(&mut self.0);
+		}
+	}
+
+	impl digest::FixedOutputReset for SixteenByteDigest {
+		fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
+			let full = digest::FixedOutputReset::finalize_fixed_reset(&mut self.0);
+			out.copy_from_slice(&full[..16]);
+		}
+	}
+
+	impl digest::HashMarker for SixteenByteDigest {}
+
+	impl AssociatedOid for SixteenByteDigest {
+		const OID: crate::der::asn1::ObjectIdentifier = crate::oids::HASH_SHA256;
+	}
+}
+
 /// A certificate chain with root -> intermediate -> leaf certificates.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub struct TestCertificateChain {
@@ -251,10 +299,15 @@ pub struct TestCertificateChain {
 /// Create a valid certificate chain: root -> intermediate -> leaf.
 ///
 /// All certificates have proper issuer/subject chaining and valid signatures.
+///
+/// # Errors
+///
+/// Returns an error if key material, DER encoding, or signing fails.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-pub fn create_test_certificate_chain() -> TestCertificateChain {
+pub fn create_test_certificate_chain() -> crate::error::Result<TestCertificateChain> {
+	use crate::crypto::hash::Sha3_256;
 	use crate::crypto::sign::ecdsa::{Secp256k1, Signature, SigningKey};
-	use crate::crypto::sign::Signer;
+	use crate::crypto::sign::sign_canonical;
 	use crate::der::asn1::{BitString, UtcTime};
 	use crate::der::{Decode, Encode};
 	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
@@ -268,126 +321,102 @@ pub fn create_test_certificate_chain() -> TestCertificateChain {
 	use crate::x509::name::RelativeDistinguishedName;
 
 	// Generate keys for each level
-	let root_key = SigningKey::from_bytes(&[1u8; 32].into()).expect("fixed root key bytes are valid secp256k1");
-	let intermediate_key =
-		SigningKey::from_bytes(&[2u8; 32].into()).expect("fixed intermediate key bytes are valid secp256k1");
-	let leaf_key = SigningKey::from_bytes(&[3u8; 32].into()).expect("fixed leaf key bytes are valid secp256k1");
+	let root_key = SigningKey::from_bytes(&[1u8; 32].into())?;
+	let intermediate_key = SigningKey::from_bytes(&[2u8; 32].into())?;
+	let leaf_key = SigningKey::from_bytes(&[3u8; 32].into())?;
 
 	// Create unique Subject DNs for each certificate (CN=Root, CN=Intermediate, CN=Leaf)
 	let cn_oid = crate::der::oid::ObjectIdentifier::new_unwrap("2.5.4.3"); // commonName
 
-	let root_cn_str = PrintableString::new("Root").expect("\"Root\" is a valid PrintableString");
+	let root_cn_str = PrintableString::new("Root")?;
 	let root_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&root_cn_str) };
-	let root_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
-		SetOfVec::try_from(vec![root_cn]).expect("single RDN forms a valid SetOfVec"),
-	)]);
+	let root_name = RdnSequence::from(vec![RelativeDistinguishedName::from(SetOfVec::try_from(vec![root_cn])?)]);
 
-	let inter_cn_str = PrintableString::new("Intermediate").expect("\"Intermediate\" is a valid PrintableString");
+	let inter_cn_str = PrintableString::new("Intermediate")?;
 	let inter_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&inter_cn_str) };
-	let inter_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
-		SetOfVec::try_from(vec![inter_cn]).expect("single RDN forms a valid SetOfVec"),
-	)]);
+	let inter_name = RdnSequence::from(vec![RelativeDistinguishedName::from(SetOfVec::try_from(vec![inter_cn])?)]);
 
-	let leaf_cn_str = PrintableString::new("Leaf").expect("\"Leaf\" is a valid PrintableString");
+	let leaf_cn_str = PrintableString::new("Leaf")?;
 	let leaf_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&leaf_cn_str) };
-	let leaf_name = RdnSequence::from(vec![RelativeDistinguishedName::from(
-		SetOfVec::try_from(vec![leaf_cn]).expect("single RDN forms a valid SetOfVec"),
-	)]);
+	let leaf_name = RdnSequence::from(vec![RelativeDistinguishedName::from(SetOfVec::try_from(vec![leaf_cn])?)]);
 
 	// Common validity period
 	let validity = Validity {
-		not_before: Time::UtcTime(
-			UtcTime::from_unix_duration(core::time::Duration::from_secs(0)).expect("epoch is a valid UtcTime"),
-		),
-		not_after: Time::UtcTime(
-			UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000))
-				.expect("fixed not-after is a valid UtcTime"),
-		),
+		not_before: Time::UtcTime(UtcTime::from_unix_duration(core::time::Duration::from_secs(0))?),
+		not_after: Time::UtcTime(UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000))?),
 	};
 
 	let algorithm = AlgorithmIdentifierOwned { oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
 
 	// Root certificate (self-signed)
-	let root_pub_der = root_key
-		.verifying_key()
-		.to_public_key_der()
-		.expect("root verifying key encodes to SPKI DER");
+	let root_pub_der = root_key.verifying_key().to_public_key_der()?;
 	let root_tbs = TbsCertificate {
 		version: Version::V3,
-		serial_number: SerialNumber::new(&[1]).expect("single-byte serial is valid"),
+		serial_number: SerialNumber::new(&[1])?,
 		signature: algorithm.clone(),
 		issuer: root_name.clone(),
 		validity,
 		subject: root_name.clone(),
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes())
-			.expect("freshly encoded root SPKI re-decodes"),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes())?,
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		// RFC 5280 §6.1.4(k),(n): root is a CA permitted to sign certificates.
 		extensions: Some(ca_extensions(true, true, None)),
 	};
-	let root_tbs_der = root_tbs.to_der().expect("root TBS certificate encodes to DER");
-	let root_sig: Signature<Secp256k1> = root_key.sign(&root_tbs_der);
+	let root_tbs_der = root_tbs.to_der()?;
+	let root_sig: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(&root_key, &root_tbs_der)?;
 	let root = Certificate {
 		tbs_certificate: root_tbs,
 		signature_algorithm: algorithm.clone(),
-		signature: BitString::new(0, root_sig.to_vec()).expect("root signature bytes form a valid BitString"),
+		signature: BitString::new(0, root_sig.to_vec())?,
 	};
 
 	// Intermediate certificate (signed by root)
-	let inter_pub_der = intermediate_key
-		.verifying_key()
-		.to_public_key_der()
-		.expect("intermediate verifying key encodes to SPKI DER");
+	let inter_pub_der = intermediate_key.verifying_key().to_public_key_der()?;
 	let inter_tbs = TbsCertificate {
 		version: Version::V3,
-		serial_number: SerialNumber::new(&[2]).expect("single-byte serial is valid"),
+		serial_number: SerialNumber::new(&[2])?,
 		signature: algorithm.clone(),
 		issuer: root_name,
 		validity,
 		subject: inter_name.clone(),
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes())
-			.expect("freshly encoded intermediate SPKI re-decodes"),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes())?,
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		// RFC 5280 §6.1.4(k),(n): intermediate is a CA permitted to sign certificates.
 		extensions: Some(ca_extensions(true, true, None)),
 	};
-	let inter_tbs_der = inter_tbs.to_der().expect("intermediate TBS certificate encodes to DER");
-	let inter_sig: Signature<Secp256k1> = root_key.sign(&inter_tbs_der);
+	let inter_tbs_der = inter_tbs.to_der()?;
+	let inter_sig: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(&root_key, &inter_tbs_der)?;
 	let intermediate = Certificate {
 		tbs_certificate: inter_tbs,
 		signature_algorithm: algorithm.clone(),
-		signature: BitString::new(0, inter_sig.to_vec()).expect("intermediate signature bytes form a valid BitString"),
+		signature: BitString::new(0, inter_sig.to_vec())?,
 	};
 
 	// Leaf certificate (signed by intermediate)
-	let leaf_pub_der = leaf_key
-		.verifying_key()
-		.to_public_key_der()
-		.expect("leaf verifying key encodes to SPKI DER");
+	let leaf_pub_der = leaf_key.verifying_key().to_public_key_der()?;
 	let leaf_tbs = TbsCertificate {
 		version: Version::V3,
-		serial_number: SerialNumber::new(&[3]).expect("single-byte serial is valid"),
+		serial_number: SerialNumber::new(&[3])?,
 		signature: algorithm.clone(),
 		issuer: inter_name,
 		validity,
 		subject: leaf_name,
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes())
-			.expect("freshly encoded leaf SPKI re-decodes"),
+		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes())?,
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		extensions: None,
 	};
-	let leaf_tbs_der = leaf_tbs.to_der().expect("leaf TBS certificate encodes to DER");
-	let leaf_sig: Signature<Secp256k1> = intermediate_key.sign(&leaf_tbs_der);
+	let leaf_tbs_der = leaf_tbs.to_der()?;
+	let leaf_sig: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(&intermediate_key, &leaf_tbs_der)?;
 	let leaf = Certificate {
 		tbs_certificate: leaf_tbs,
 		signature_algorithm: algorithm,
-		signature: BitString::new(0, leaf_sig.to_vec()).expect("leaf signature bytes form a valid BitString"),
+		signature: BitString::new(0, leaf_sig.to_vec())?,
 	};
 
-	TestCertificateChain { root, intermediate, leaf, root_key, intermediate_key, leaf_key }
+	Ok(TestCertificateChain { root, intermediate, leaf, root_key, intermediate_key, leaf_key })
 }
 
 #[cfg(feature = "aead")]
@@ -661,9 +690,8 @@ macro_rules! test_worker {
 				$assertions_body.await
 			};
 
-			// Worker will be dropped automatically at end of test
-			// Explicitly killing causes nested runtime issues when called from async tests
-			drop(worker);
+			// Graceful shutdown: close the queue and await run-loop exit
+			worker.kill().await?;
 
 			result
 		}

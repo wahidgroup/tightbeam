@@ -3,6 +3,8 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+#[cfg(all(not(feature = "std"), feature = "x509"))]
+use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 #[cfg(feature = "std")]
@@ -132,15 +134,14 @@ pub enum TransportEnvelope {
 	Response(ResponsePackage),
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "2", constructed = "true")]
-	EnvelopedData(EnvelopedData),
+	EnvelopedData(Box<EnvelopedData>),
 	#[cfg(feature = "x509")]
 	#[asn1(context_specific = "3", constructed = "true")]
-	SignedData(SignedData),
+	SignedData(Box<SignedData>),
 }
 
 /// Wire-level envelope that can be either cleartext or encrypted
 #[derive(Choice, Clone, Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum WireEnvelope {
 	#[asn1(context_specific = "0", constructed = "true")]
 	Cleartext(TransportEnvelope),

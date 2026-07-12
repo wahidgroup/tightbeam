@@ -10,10 +10,14 @@ use crate::crypto::aead::KeyInit;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::x509::attr::{Attribute, Attributes};
+use crate::der::asn1::ObjectIdentifier;
 use crate::oids::HANDSHAKE_ABORT_ALERT;
+use crate::oids::{AES_128_GCM, AES_256_GCM};
 use crate::transport::handshake::attributes::{extract_alert_x509, find_x509};
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::{select_profile, SecurityOffer};
+use crate::transport::handshake::negotiation::{
+	select_profile, DefaultStrengthFloor, NegotiationError, ProfileStrengthPolicy, SecurityOffer,
+};
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -25,11 +29,25 @@ use alloc::vec::Vec;
 /// both client-offered and dealer's choice modes.
 ///
 /// # Usage
-/// - **Negotiation mode**: Client sends `SecurityOffer`, server selects first mutual profile
-/// - **Dealer's choice mode**: Client sends no offer, server uses first configured profile
+/// - **Negotiation mode**: Client sends `SecurityOffer`, server selects the first mutual
+///   profile in *server* preference order
+/// - **Dealer's choice mode**: Client sends no offer, server uses its first configured
+///   profile that meets the strength policy
+///
+/// # Security
+/// Both modes filter profiles through [`ProfileStrengthPolicy`] before selection,
+/// so a weak profile left in `supported_profiles()` for compatibility cannot be
+/// negotiated (CWE-757 downgrade resistance).
 pub trait HandshakeNegotiation {
-	/// Get the list of supported security profiles.
+	/// Get the list of supported security profiles (first = most preferred).
 	fn supported_profiles(&self) -> &[SecurityProfileDesc];
+
+	/// Minimum-strength policy applied before selection.
+	///
+	/// Defaults to [`DefaultStrengthFloor`] (256-bit AEAD key, >= 256-bit digest).
+	fn strength_policy(&self) -> &dyn ProfileStrengthPolicy {
+		&DefaultStrengthFloor
+	}
 
 	/// Negotiate a security profile with the peer.
 	///
@@ -41,6 +59,7 @@ pub trait HandshakeNegotiation {
 	///
 	/// # Errors
 	/// - `NoSupportedProfiles`: No profiles configured on server
+	/// - `NegotiationError(BelowStrengthFloor)`: No configured profile meets the policy
 	/// - `NegotiationError`: No mutually supported profile found
 	fn negotiate_profile(&self, offer: Option<&SecurityOffer>) -> Result<SecurityProfileDesc, HandshakeError> {
 		let supported = self.supported_profiles();
@@ -48,10 +67,34 @@ pub trait HandshakeNegotiation {
 			return Err(HandshakeError::NoSupportedProfiles);
 		}
 
-		match offer {
-			Some(offer) => Ok(select_profile(offer, supported)?),
-			None => Ok(supported[0]), // Dealer's choice
+		let policy = self.strength_policy();
+		let eligible: Vec<SecurityProfileDesc> = supported
+			.iter()
+			.filter(|profile| policy.meets_floor(profile))
+			.copied()
+			.collect();
+		if eligible.is_empty() {
+			return Err(NegotiationError::BelowStrengthFloor.into());
 		}
+
+		match offer {
+			Some(offer) => Ok(select_profile(offer, &eligible)?),
+			None => Ok(eligible[0]), // Dealer's choice
+		}
+	}
+}
+
+/// Map a negotiated AEAD OID to its key byte length.
+///
+/// The peer-declared `aead_key_size` is advisory input. The
+/// negotiated OID is the authoritative binding (CWE-345).
+fn aead_key_size_from_oid(oid: ObjectIdentifier) -> Result<usize, HandshakeError> {
+	if oid == AES_128_GCM {
+		Ok(16)
+	} else if oid == AES_256_GCM {
+		Ok(32)
+	} else {
+		Err(HandshakeError::UnsupportedAeadAlgorithm)
 	}
 }
 
@@ -85,7 +128,9 @@ where
 	/// Initialized AEAD cipher ready for encryption/decryption
 	///
 	/// # Errors
-	/// - `InvalidState`: No profile selected or profile missing AEAD key size
+	/// - `InvalidState`: No profile selected or profile missing AEAD OID/key size
+	/// - `UnsupportedAeadAlgorithm`: Negotiated AEAD OID has no known key size
+	/// - `AeadKeySizeMismatch`: Peer-declared key size disagrees with the OID
 	/// - `InsufficientSaltEntropy`: Salt shorter than `MIN_SALT_ENTROPY_BYTES`
 	/// - `KeyDerivationFailed`: HKDF or cipher initialization failed
 	fn derive_session_aead(&self, input_key: &[u8], salt: &[u8]) -> Result<P::AeadCipher, HandshakeError>
@@ -93,7 +138,14 @@ where
 		P::AeadCipher: KeyInit,
 	{
 		let profile = self.selected_profile().ok_or(HandshakeError::InvalidState)?;
-		let key_size = profile.aead_key_size.ok_or(HandshakeError::InvalidState)? as usize;
+		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
+		let key_size = usize::from(profile.aead_key_size.ok_or(HandshakeError::InvalidState)?);
+
+		// CWE-345: the negotiated OID is authoritative for the HKDF output length.
+		let expected = aead_key_size_from_oid(aead_oid)?;
+		if key_size != expected {
+			return Err(HandshakeError::AeadKeySizeMismatch { declared: key_size, expected });
+		}
 
 		// Enforce minimum salt entropy for both protocols
 		if salt.len() < MIN_SALT_ENTROPY_BYTES {
@@ -122,6 +174,11 @@ where
 /// - `FinishedIntegrityFail`: Transcript hash mismatch
 pub trait HandshakeAlertHandler {
 	/// Check for abort alert in unprotected attributes.
+	///
+	/// # Security
+	/// Abort alerts exist in *unprotected* attributes and are therefore
+	/// advisory and unauthenticated (as in TLS): a MITM can inject a spurious
+	/// abort (DoS) or suppress a real one.
 	///
 	/// # Parameters
 	/// - `attrs`: Optional X.509 attributes from CMS unprotected attributes
@@ -155,6 +212,7 @@ mod tests {
 	use crate::crypto::profiles::DefaultCryptoProvider;
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::oids::{AES_128_GCM, AES_256_GCM, CURVE_SECP256K1, HASH_SHA256, SIGNER_ECDSA_WITH_SHA256};
+	use crate::transport::handshake::negotiation::NegotiationError;
 
 	// Mock struct for testing negotiation
 	struct MockServer {
@@ -183,7 +241,7 @@ mod tests {
 
 	fn create_test_profile(aead_oid: ObjectIdentifier, key_size: u16) -> SecurityProfileDesc {
 		SecurityProfileDesc {
-			digest: HASH_SHA256,
+			digest: Some(HASH_SHA256),
 			aead: Some(aead_oid),
 			aead_key_size: Some(key_size),
 			signature: Some(SIGNER_ECDSA_WITH_SHA256),
@@ -195,28 +253,43 @@ mod tests {
 	}
 
 	#[test]
-	fn test_negotiate_profile_with_offer() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_negotiate_profile_with_offer_enforces_floor() -> Result<(), Box<dyn std::error::Error>> {
 		let p_a = create_test_profile(AES_128_GCM, 16);
 		let p_b = create_test_profile(AES_256_GCM, 32);
 
 		let server = MockServer { profiles: vec![p_a, p_b] };
 
+		// 128-bit AEAD fails the default strength floor; only p_b survives.
 		let offer = SecurityOffer::new(vec![p_a, p_b]);
 		let selected = server.negotiate_profile(Some(&offer))?;
-		assert_eq!(selected.aead_key_size, Some(16)); // Should select p_a (client's first preference)
+		assert_eq!(selected.aead_key_size, Some(32));
 		Ok(())
 	}
 
 	#[test]
-	fn test_negotiate_profile_dealers_choice() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_negotiate_profile_dealers_choice_skips_below_floor() -> Result<(), Box<dyn std::error::Error>> {
 		let p_a = create_test_profile(AES_128_GCM, 16);
 		let p_b = create_test_profile(AES_256_GCM, 32);
 
 		let server = MockServer { profiles: vec![p_a, p_b] };
 
 		let selected = server.negotiate_profile(None)?;
-		assert_eq!(selected.aead_key_size, Some(16)); // Should select first (p_a)
+		assert_eq!(selected.aead_key_size, Some(32));
 		Ok(())
+	}
+
+	#[test]
+	fn test_negotiate_profile_all_below_floor() {
+		let p_a = create_test_profile(AES_128_GCM, 16);
+
+		let server = MockServer { profiles: vec![p_a] };
+
+		let offer = SecurityOffer::new(vec![p_a]);
+		let result = server.negotiate_profile(Some(&offer));
+		assert!(matches!(
+			result,
+			Err(HandshakeError::NegotiationError(NegotiationError::BelowStrengthFloor))
+		));
 	}
 
 	#[test]
@@ -256,6 +329,39 @@ mod tests {
 			result,
 			Err(HandshakeError::InsufficientSaltEntropy { actual: 8, minimum: 16 })
 		));
+	}
+
+	#[test]
+	fn test_derive_session_aead_rejects_key_size_oid_mismatch() {
+		// Peer declares 16 bytes against an AES-256-GCM OID (CWE-345).
+		let profile = create_test_profile(AES_256_GCM, 16);
+		let client = MockClient { profile: Some(profile) };
+
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+
+		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
+			&client, &input_key, &salt,
+		);
+		assert!(matches!(
+			result,
+			Err(HandshakeError::AeadKeySizeMismatch { declared: 16, expected: 32 })
+		));
+	}
+
+	#[test]
+	fn test_derive_session_aead_rejects_unknown_aead_oid() {
+		// A digest OID is not an AEAD algorithm; no key size can be bound.
+		let profile = create_test_profile(HASH_SHA256, 32);
+		let client = MockClient { profile: Some(profile) };
+
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+
+		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
+			&client, &input_key, &salt,
+		);
+		assert!(matches!(result, Err(HandshakeError::UnsupportedAeadAlgorithm)));
 	}
 
 	#[test]

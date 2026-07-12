@@ -16,6 +16,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 #[cfg(feature = "testing-schedulability")]
 use core::time::Duration;
@@ -30,8 +31,33 @@ use crate::testing::schedulability::{SchedulabilityError, SchedulerType, TaskSet
 #[cfg(feature = "testing-timing")]
 use crate::testing::timing::{TimedTransition, TimingConstraints, TimingGuard};
 
+/// Intern pool for CSP state/event names constructed at runtime.
+///
+/// The engine keys [`State`]/[`Event`] on `&'static str` for `Copy`
+/// ergonomics, so runtime-built names (product states, decoded events,
+/// owned assertion labels) must be promoted to `'static`. Interning
+/// deduplicates before leaking (CWE-401).
+static INTERN_POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+
+/// Promote a runtime string to `&'static str` via the intern pool.
+pub(crate) fn intern<S>(name: S) -> &'static str
+where
+	S: AsRef<str> + Into<String>,
+{
+	let pool = INTERN_POOL.get_or_init(|| Mutex::new(HashSet::new()));
+	let mut pool = pool.lock().unwrap_or_else(PoisonError::into_inner);
+	if let Some(existing) = pool.get(name.as_ref()) {
+		return existing;
+	}
+
+	let leaked: &'static str = Box::leak(name.into().into_boxed_str());
+	pool.insert(leaked);
+
+	leaked
+}
+
 /// Process state in the LTS
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct State(pub &'static str);
 
 impl fmt::Display for State {
@@ -45,7 +71,7 @@ impl fmt::Display for State {
 /// Represents a named event in a CSP process specification. Also used by
 /// timing verification to identify events with timing constraints (WCET,
 /// deadlines, jitter) and in violation reports.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Event(pub &'static str);
 
 impl fmt::Display for Event {
@@ -79,12 +105,8 @@ impl EncodeValue for Event {
 
 impl<'a> DecodeValue<'a> for Event {
 	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> crate::der::Result<Self> {
-		// Decode as String first
 		let s = String::decode_value(reader, header)?;
-		// Convert String to &'static str by leaking (only for decoded data)
-		// This is safe because decoded Events are typically short-lived
-		let leaked = Box::leak(s.into_boxed_str());
-		Ok(Event(leaked))
+		Ok(Event(intern(s)))
 	}
 }
 
@@ -163,6 +185,11 @@ impl TransitionRelation {
 	/// Check if nondeterministic: from --\[event\]--> {s1, s2, ...}
 	pub fn is_nondeterministic(&self, from: State, event: &Event) -> bool {
 		self.transitions.get(&(from, *event)).map(|v| v.len() > 1).unwrap_or(false)
+	}
+
+	/// Iterate over all `((from, event), targets)` entries.
+	pub fn iter(&self) -> impl Iterator<Item = (&(State, Event), &Vec<State>)> {
+		self.transitions.iter()
 	}
 }
 
@@ -245,6 +272,10 @@ impl Process {
 	}
 
 	/// Get enabled actions from state
+	///
+	/// Sorted by event name (observable before hidden on a name collision)
+	/// so violation reports and byte-driven exploration are reproducible
+	/// regardless of `HashSet` iteration order.
 	pub fn enabled(&self, state: State) -> Vec<Action> {
 		let mut actions = Vec::new();
 
@@ -262,6 +293,7 @@ impl Process {
 			}
 		}
 
+		actions.sort_by(|a, b| a.event.0.cmp(b.event.0).then_with(|| a.is_hidden().cmp(&b.is_hidden())));
 		actions
 	}
 
@@ -273,6 +305,49 @@ impl Process {
 	/// Check if state is nondeterministic choice point
 	pub fn is_choice(&self, state: State) -> bool {
 		self.choice.contains(&state)
+	}
+
+	/// Structural digest over the LTS: initial state, sorted states,
+	/// terminals, choice points, alphabets, and transition triples.
+	///
+	/// Two processes share a digest iff they have identical structure, so
+	/// it is a sound memoization key where `name` is not (algebra
+	/// operators such as `hide`/`rename` produce constant names for
+	/// structurally different results).
+	///
+	/// The digest is only stable within one program run (`DefaultHasher`
+	/// seeds vary across runs); do not persist it.
+	pub fn structure_digest(&self) -> u64 {
+		use core::hash::{Hash, Hasher};
+		use std::collections::hash_map::DefaultHasher;
+
+		fn sorted_names<'a, I>(items: I) -> Vec<&'a str>
+		where
+			I: Iterator<Item = &'a str>,
+		{
+			let mut names: Vec<&str> = items.collect();
+			names.sort_unstable();
+			names
+		}
+
+		let mut hasher = DefaultHasher::new();
+		self.initial.0.hash(&mut hasher);
+
+		sorted_names(self.states.iter().map(|s| s.0)).hash(&mut hasher);
+		sorted_names(self.terminal.iter().map(|s| s.0)).hash(&mut hasher);
+		sorted_names(self.choice.iter().map(|s| s.0)).hash(&mut hasher);
+		sorted_names(self.observable.iter().map(|e| e.0)).hash(&mut hasher);
+		sorted_names(self.hidden.iter().map(|e| e.0)).hash(&mut hasher);
+
+		let mut triples: Vec<(&str, &str, &str)> = self
+			.transitions
+			.iter()
+			.flat_map(|((from, event), targets)| targets.iter().map(move |to| (from.0, event.0, to.0)))
+			.collect();
+		triples.sort_unstable();
+		triples.hash(&mut hasher);
+
+		hasher.finish()
 	}
 
 	/// Generate TaskSet from timing constraints and schedulability periods
@@ -348,61 +423,132 @@ impl std::fmt::Display for CspViolation {
 
 impl Process {
 	/// Validate a consumed trace against this CSP process
+	///
+	/// # Trace contract
+	///
+	/// Traces are sequences of observable events: every assertion label is
+	/// matched against the observable alphabet only. Hidden (τ) events are
+	/// internal to the process and never appear in a consumed trace
+	/// (Roscoe: behaviors are recorded "by an observer who cannot see the
+	/// internal action τ"). Per the operational semantics, τ transitions
+	/// happen silently: before matching each observable event the validator
+	/// expands the candidate states by τ-closure, so processes with hidden
+	/// steps on the path (e.g. `sequential`'s `tau_seq` bridge or
+	/// `internal_choice`'s `tau_choice_*`) validate correctly. An event
+	/// that is only enabled as hidden is reported as
+	/// [`CspViolation::EventNotEnabled`].
+	///
+	/// # Nondeterminism
+	///
+	/// The validator tracks the *set* of states the process may occupy
+	/// (subset construction), so all branches of a nondeterministic choice
+	/// are followed simultaneously. Multiple targets for a `(state, event)`
+	/// pair are legal at states registered via
+	/// [`ProcessBuilder::add_choice`]; multiple targets at an *undeclared*
+	/// state are reported as [`CspViolation::NondeterministicChoice`].
 	pub fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		let mut violations = Vec::new();
-		let mut current_state = self.initial;
+		let mut current_states = vec![self.initial];
 
 		// Map assertion labels to events
-		for assertion in &trace.assertions {
-			// Extract event from assertion label
-			let event_name: &'static str = match &assertion.label {
-				AssertionLabel::Custom(s) => match s {
-					Cow::Borrowed(static_str) => static_str,
-					Cow::Owned(owned) => Box::leak(owned.clone().into_boxed_str()),
-				},
-			};
+		let events: Vec<Event> = trace
+			.assertions
+			.iter()
+			.map(|assertion| {
+				let AssertionLabel::Custom(s) = &assertion.label;
+				match s {
+					Cow::Borrowed(static_str) => Event(static_str),
+					Cow::Owned(owned) => Event(intern(owned.as_str())),
+				}
+			})
+			.collect();
 
-			let event = Event(event_name);
-			let action = Action::observable(event_name);
+		for event in &events {
+			let closure = self.tau_closure(&current_states);
+			let action = Action { event: *event, alphabet: Alphabet::Observable };
 
-			// Check if in terminal state
-			if self.is_terminal(current_state) {
-				violations.push(CspViolation::AfterTermination { event, terminal_state: current_state });
+			// Termination check: every state the process may occupy is STOP
+			if closure.iter().all(|state| self.is_terminal(*state)) {
+				if let Some(terminal_state) = closure.first().copied() {
+					violations.push(CspViolation::AfterTermination { event: *event, terminal_state });
+				}
+
 				continue;
 			}
 
-			// Check if event is enabled
-			let enabled = self.enabled(current_state);
-			if !enabled.contains(&action) {
-				violations.push(CspViolation::EventNotEnabled {
-					event,
-					state: current_state,
-					enabled: enabled.clone(),
-				});
-				continue;
-			}
+			// Step on the observable event from every candidate state
+			let mut seen = HashSet::new();
+			let mut next_states = Vec::new();
+			for state in closure.iter().filter(|state| self.enabled(**state).contains(&action)) {
+				let targets = self.step(*state, event);
 
-			// Perform transition
-			let next_states = self.step(current_state, &event);
+				if targets.len() > 1 && !self.is_choice(*state) {
+					violations.push(CspViolation::NondeterministicChoice {
+						event: *event,
+						state: *state,
+						next_states: targets.clone(),
+					});
+				}
+
+				for target in targets {
+					if seen.insert(target) {
+						next_states.push(target);
+					}
+				}
+			}
 
 			if next_states.is_empty() {
-				violations.push(CspViolation::Deadlock { event, state: current_state });
+				let state = closure.first().copied().unwrap_or(self.initial);
+				violations.push(CspViolation::EventNotEnabled {
+					event: *event,
+					state,
+					enabled: self.enabled_from_set(&closure),
+				});
+
 				continue;
 			}
 
-			if next_states.len() > 1 {
-				violations.push(CspViolation::NondeterministicChoice {
-					event,
-					state: current_state,
-					next_states: next_states.clone(),
-				});
-			}
-
-			// Take first state for continuation (deterministic or first choice)
-			current_state = next_states[0];
+			current_states = next_states;
 		}
 
 		CspValidationResult { valid: violations.is_empty(), violations }
+	}
+
+	/// All states reachable from `states` via hidden (τ) transitions only,
+	/// including the input states. Worklist traversal, no recursion.
+	pub(crate) fn tau_closure(&self, states: &[State]) -> Vec<State> {
+		let mut closure: Vec<State> = states.to_vec();
+		let mut seen: HashSet<State> = states.iter().copied().collect();
+		let mut idx = 0;
+		while let Some(state) = closure.get(idx).copied() {
+			idx += 1;
+
+			for hidden_action in self.enabled(state).iter().filter(|action| action.is_hidden()) {
+				for target in self.step(state, &hidden_action.event) {
+					if seen.insert(target) {
+						closure.push(target);
+					}
+				}
+			}
+		}
+
+		closure
+	}
+
+	/// Union of enabled actions across a state set, deduplicated and sorted
+	/// for reproducible violation reports
+	fn enabled_from_set(&self, states: &[State]) -> Vec<Action> {
+		let mut actions: Vec<Action> = Vec::new();
+		for state in states {
+			for action in self.enabled(*state) {
+				if !actions.contains(&action) {
+					actions.push(action);
+				}
+			}
+		}
+
+		actions.sort_by(|a, b| a.event.0.cmp(b.event.0).then_with(|| a.is_hidden().cmp(&b.is_hidden())));
+		actions
 	}
 }
 
@@ -415,6 +561,23 @@ impl ProcessSpec for Process {
 		Cow::Borrowed(self)
 	}
 }
+
+/// Error building a [`Process`] from a [`ProcessBuilder`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessBuildError {
+	/// [`ProcessBuilder::initial_state`] was never called
+	MissingInitialState,
+}
+
+impl fmt::Display for ProcessBuildError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::MissingInitialState => write!(f, "initial state not set"),
+		}
+	}
+}
+
+impl core::error::Error for ProcessBuildError {}
 
 /// Builder for CSP Process
 #[derive(Debug)]
@@ -553,8 +716,8 @@ impl ProcessBuilder {
 		self
 	}
 
-	pub fn build(self) -> Result<Process, &'static str> {
-		let initial = self.initial.ok_or("Initial state not set")?;
+	pub fn build(self) -> Result<Process, ProcessBuildError> {
+		let initial = self.initial.ok_or(ProcessBuildError::MissingInitialState)?;
 
 		Ok(Process {
 			name: self.name,
@@ -582,6 +745,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use super::*;
+	use crate::testing::assertions::Assertion;
 	use crate::testing::create_test_message;
 	use crate::testing::{ScenarioConf, TestHooks};
 	use crate::transport::tcp::r#async::TokioListener;
@@ -675,6 +839,149 @@ mod tests {
 		assert!(targets.contains(&State("S2")));
 
 		assert!(proc.is_choice(State("S0")));
+
+		Ok(())
+	}
+
+	fn trace_of(labels: &[&'static str]) -> ConsumedTrace {
+		let mut trace = ConsumedTrace::new();
+		for (seq, label) in labels.iter().enumerate() {
+			trace.assertions.push(Assertion::new(
+				seq,
+				AssertionLabel::Custom(Cow::Borrowed(label)),
+				Vec::new(),
+				None,
+			));
+		}
+
+		trace
+	}
+
+	fn branching_process(declared_choice: bool) -> Result<Process, ProcessBuildError> {
+		let builder = Process::builder("Branching")
+			.initial_state(State("S0"))
+			.add_observable("go")
+			.add_observable("x")
+			.add_observable("y")
+			.add_transition(State("S0"), "go", State("S1"))
+			.add_transition(State("S0"), "go", State("S2"))
+			.add_transition(State("S1"), "x", State("T"))
+			.add_transition(State("S2"), "y", State("T"))
+			.add_terminal(State("T"));
+
+		if declared_choice {
+			builder.add_choice(State("S0")).build()
+		} else {
+			builder.build()
+		}
+	}
+
+	#[test]
+	fn declared_choice_validates_both_branches() -> Result<(), ProcessBuildError> {
+		let proc = branching_process(true)?;
+
+		let via_first = proc.validate_trace(&trace_of(&["go", "x"]));
+		let via_second = proc.validate_trace(&trace_of(&["go", "y"]));
+		assert!(via_first.valid);
+		assert!(via_second.valid);
+
+		Ok(())
+	}
+
+	#[test]
+	fn tau_transitions_traversed_silently() -> Result<(), ProcessBuildError> {
+		let proc = Process::builder("TauBridge")
+			.initial_state(State("S0"))
+			.add_hidden("tau")
+			.add_observable("a")
+			.add_transition(State("S0"), "tau", State("S1"))
+			.add_transition(State("S1"), "a", State("T"))
+			.add_terminal(State("T"))
+			.build()?;
+
+		let result = proc.validate_trace(&trace_of(&["a"]));
+		assert!(result.valid);
+
+		Ok(())
+	}
+
+	#[test]
+	fn tau_chain_traversed_across_multiple_hidden_steps() -> Result<(), ProcessBuildError> {
+		let proc = Process::builder("TauChain")
+			.initial_state(State("S0"))
+			.add_hidden("tau_1")
+			.add_hidden("tau_2")
+			.add_observable("a")
+			.add_observable("b")
+			.add_transition(State("S0"), "a", State("S1"))
+			.add_transition(State("S1"), "tau_1", State("S2"))
+			.add_transition(State("S2"), "tau_2", State("S3"))
+			.add_transition(State("S3"), "b", State("T"))
+			.add_terminal(State("T"))
+			.build()?;
+
+		let result = proc.validate_trace(&trace_of(&["a", "b"]));
+		assert!(result.valid);
+
+		Ok(())
+	}
+
+	#[test]
+	fn undeclared_nondeterminism_is_flagged() -> Result<(), ProcessBuildError> {
+		let proc = branching_process(false)?;
+
+		let result = proc.validate_trace(&trace_of(&["go", "x"]));
+		assert!(!result.valid);
+		assert!(result
+			.violations
+			.iter()
+			.any(|v| matches!(v, CspViolation::NondeterministicChoice { .. })));
+
+		Ok(())
+	}
+
+	#[test]
+	fn hidden_only_event_in_trace_is_not_enabled() -> Result<(), ProcessBuildError> {
+		let proc = Process::builder("HiddenOnly")
+			.initial_state(State("S0"))
+			.add_hidden("tau")
+			.add_transition(State("S0"), "tau", State("S1"))
+			.add_terminal(State("S1"))
+			.build()?;
+
+		let result = proc.validate_trace(&trace_of(&["tau"]));
+
+		assert!(!result.valid);
+		assert!(result
+			.violations
+			.iter()
+			.any(|v| matches!(v, CspViolation::EventNotEnabled { .. })));
+
+		Ok(())
+	}
+
+	#[test]
+	fn intern_deduplicates_across_calls() {
+		let first = intern(String::from("intern_dedupe_probe"));
+		let second = intern("intern_dedupe_probe");
+		assert_eq!(first.as_ptr(), second.as_ptr());
+	}
+
+	#[test]
+	fn enabled_is_sorted_by_event_name() -> Result<(), ProcessBuildError> {
+		let proc = Process::builder("Sorted")
+			.initial_state(State("S0"))
+			.add_observable("b")
+			.add_observable("a")
+			.add_hidden("c")
+			.add_transition(State("S0"), "b", State("S1"))
+			.add_transition(State("S0"), "a", State("S1"))
+			.add_transition(State("S0"), "c", State("S1"))
+			.add_terminal(State("S1"))
+			.build()?;
+
+		let names: Vec<&str> = proc.enabled(State("S0")).iter().map(|a| a.event.0).collect();
+		assert_eq!(names, vec!["a", "b", "c"]);
 
 		Ok(())
 	}
@@ -1102,7 +1409,7 @@ mod tests {
 	servlet! {
 		pub TestServletForScenario<crate::testing::utils::TestMessage, EnvConfig = ()>,
 		protocol: TokioListener,
-		handle: |frame, ctx| async move {
+		handle: |_msg, frame, ctx| async move {
 			let trace = ctx.trace();
 			// Server-side assertions
 			trace.event("Received")?;

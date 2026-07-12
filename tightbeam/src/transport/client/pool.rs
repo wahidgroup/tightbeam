@@ -22,16 +22,27 @@ use crate::transport::{TransportResult, X509ClientConfig};
 
 #[cfg(feature = "aes-gcm")]
 use crate::crypto::profiles::DefaultCryptoProvider;
-#[cfg(feature = "x509")]
-use crate::crypto::x509::store::CertificateTrust;
-#[cfg(feature = "x509")]
-use crate::crypto::x509::Certificate;
 #[cfg(not(feature = "x509"))]
 use crate::transport::client::ClientBuilder;
+
+#[cfg(feature = "x509")]
+mod x509 {
+	pub use crate::crypto::x509::store::CertificateTrust;
+	pub use crate::crypto::x509::Certificate;
+	pub use crate::transport::handshake::HandshakeProtocolKind;
+}
+
+#[cfg(feature = "x509")]
+use x509::*;
+
 #[cfg(feature = "transport-policy")]
-use crate::transport::policy::PolicyConf;
+mod policy {
+	pub use crate::transport::policy::PolicyConf;
+	pub use crate::transport::MessageEmitter;
+}
+
 #[cfg(feature = "transport-policy")]
-use crate::transport::MessageEmitter;
+use policy::*;
 
 /// Builder trait for connection configuration
 ///
@@ -86,16 +97,29 @@ struct ClientIdentity<C: CryptoProvider = DefaultCryptoProvider> {
 struct PoolTlsConfig<C: CryptoProvider = DefaultCryptoProvider> {
 	trust_store: Option<Arc<dyn CertificateTrust>>,
 	client_identity: Option<ClientIdentity<C>>,
+	server_certificate_chain: Option<Arc<[Certificate]>>,
+	handshake_protocol: Option<HandshakeProtocolKind>,
 }
 
 #[cfg(feature = "x509")]
-impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
+impl<C: CryptoProvider> PoolTlsConfig<C> {
 	fn set_trust_store(&mut self, store: Arc<dyn CertificateTrust>) {
 		self.trust_store = Some(store);
 	}
 
 	fn set_client_identity(&mut self, cert: Certificate, key: HandshakeKeyManager<C>) {
-		self.client_identity = Some(ClientIdentity { certificate: Arc::new(cert), key: Arc::new(key) });
+		let certificate = Arc::new(cert);
+		let key = Arc::new(key);
+
+		self.client_identity = Some(ClientIdentity { certificate, key });
+	}
+
+	fn set_server_certificate_chain(&mut self, chain: Arc<[Certificate]>) {
+		self.server_certificate_chain = Some(chain);
+	}
+
+	fn set_handshake_protocol(&mut self, kind: HandshakeProtocolKind) {
+		self.handshake_protocol = Some(kind);
 	}
 
 	fn apply<Pro>(&self, transport: Pro::Transport) -> Pro::Transport
@@ -105,13 +129,20 @@ impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 	{
 		let mut configured = transport;
 		if let Some(store) = &self.trust_store {
-			configured = configured.with_trust_store(Arc::clone(store));
+			let store = Arc::clone(store);
+			configured = configured.with_trust_store(store);
 		}
-
 		if let Some(identity) = &self.client_identity {
-			let cert = (*identity.certificate).clone();
-			let key = (*identity.key).clone();
+			let cert = Arc::clone(&identity.certificate);
+			let key = Arc::clone(&identity.key);
 			configured = configured.with_client_identity(cert, key);
+		}
+		if let Some(chain) = &self.server_certificate_chain {
+			let chain = Arc::clone(chain);
+			configured = configured.with_server_certificate_chain(chain);
+		}
+		if let Some(kind) = self.handshake_protocol {
+			configured = configured.with_handshake_protocol(kind);
 		}
 
 		configured
@@ -142,6 +173,21 @@ impl<P: Protocol, C: CryptoProvider> Default for ConnectionPoolBuilder<P, C> {
 impl<P: Protocol, C: CryptoProvider> ConnectionPoolBuilder<P, C> {
 	pub fn with_config(mut self, config: PoolConfig) -> Self {
 		self.config = config;
+		self
+	}
+
+	/// Provision the expected server certificate chain, ordered root to
+	/// leaf, shared by every pooled connection.
+	#[cfg(feature = "x509")]
+	pub fn with_server_certificate_chain(mut self, chain: impl Into<Arc<[Certificate]>>) -> Self {
+		self.tls.set_server_certificate_chain(chain.into());
+		self
+	}
+
+	/// Select the handshake protocol used by every pooled connection.
+	#[cfg(feature = "x509")]
+	pub fn with_handshake_protocol(mut self, kind: HandshakeProtocolKind) -> Self {
+		self.tls.set_handshake_protocol(kind);
 		self
 	}
 }
@@ -204,7 +250,8 @@ struct DestinationPool<P: Protocol> {
 /// Connection pool for protocol P with global connection limit
 ///
 /// # Invariants
-/// - Total connections across all destinations <= `config.max_connections`
+/// - `total_connections` counts live connections and stays within
+///   `0..=config.max_connections`: +1 when a socket is created.
 /// - Idle connections exceeding `PoolConfig::idle_timeout` are pruned lazily
 /// - Lock poisoning never panics; callers receive `TransportFailure::Busy` instead
 #[cfg(feature = "std")]
@@ -220,6 +267,18 @@ pub struct ConnectionPool<P: Protocol, C: CryptoProvider = DefaultCryptoProvider
 	/// Shared TLS assets reused across pooled connections
 	#[cfg(feature = "x509")]
 	tls: PoolTlsConfig<C>,
+}
+
+#[cfg(feature = "std")]
+impl<P: Protocol, C: CryptoProvider> ConnectionPool<P, C> {
+	/// Decrement the live-connection count for a discarded connection,
+	/// saturating at zero so an accounting defect can never wrap the counter
+	/// and wedge the pool into permanent `Busy`.
+	fn release_connection_count(&self) {
+		let _ = self
+			.total_connections
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_sub(1));
+	}
 }
 
 #[cfg(feature = "std")]
@@ -270,20 +329,28 @@ where
 					dest_pool.in_use += 1;
 					return Ok(Some(entry.client));
 				}
+				// Dead candidate is discarded here, so it leaves the live set.
+				self.release_connection_count();
 			}
 		}
 		Ok(None)
 	}
 
 	fn reserve_slot(self: &Arc<Self>, addr: &P::Address) -> TransportResult<SlotGuard<P, C>> {
-		// Check global limit
-		let current = self.total_connections.load(Ordering::Acquire);
-		if current >= self.config.max_connections {
+		// Single atomic check-and-increment so concurrent callers cannot all
+		// pass a separate limit check and overshoot max_connections.
+		let reserved = self
+			.total_connections
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+				if current >= self.config.max_connections {
+					None
+				} else {
+					Some(current + 1)
+				}
+			});
+		if reserved.is_err() {
 			return Err(TransportError::OperationFailed(TransportFailure::Busy));
 		}
-
-		// Atomically increment global counter
-		self.total_connections.fetch_add(1, Ordering::AcqRel);
 
 		let mut pools = self.write_pools()?;
 		let dest_pool = pools
@@ -294,7 +361,9 @@ where
 
 		dest_pool.in_use += 1;
 
-		Ok(SlotGuard::new(Arc::clone(self), addr.clone()))
+		let pool = Arc::clone(self);
+		let addr = addr.clone();
+		Ok(SlotGuard::new(pool, addr))
 	}
 
 	fn prune_idle_locked(&self, dest_pool: &mut DestinationPool<P>, now: Instant) {
@@ -302,6 +371,8 @@ where
 			while let Some(entry) = dest_pool.available.front() {
 				if now.duration_since(entry.last_used) >= timeout {
 					dest_pool.available.pop_front();
+					// Pruned idle connection is closed, so it leaves the live set.
+					self.release_connection_count();
 				} else {
 					break;
 				}
@@ -411,22 +482,25 @@ where
 			None => return,
 		};
 
-		// Decrement global counter
-		self.pool.total_connections.fetch_sub(1, Ordering::AcqRel);
+		let mut returned_to_pool = false;
 
 		let is_healthy = <P as PersistentConnection>::is_connected(client.transport());
-		let mut pools = match self.pool.pools.write() {
-			Ok(p) => p,
-			Err(_) => return,
-		};
-
-		if let Some(dest_pool) = pools.get_mut(&self.addr) {
-			dest_pool.in_use = dest_pool.in_use.saturating_sub(1);
-			if is_healthy {
-				dest_pool
-					.available
-					.push_back(AvailableEntry { client, last_used: Instant::now() });
+		if let Ok(mut pools) = self.pool.pools.write() {
+			if let Some(dest_pool) = pools.get_mut(&self.addr) {
+				dest_pool.in_use = dest_pool.in_use.saturating_sub(1);
+				if is_healthy {
+					dest_pool
+						.available
+						.push_back(AvailableEntry { client, last_used: Instant::now() });
+					returned_to_pool = true;
+				}
 			}
+		}
+
+		// A connection parked in `available` is still live and stays counted;
+		// only a discarded (unhealthy or unparkable) connection leaves the set.
+		if !returned_to_pool {
+			self.pool.release_connection_count();
 		}
 	}
 }
@@ -465,8 +539,8 @@ where
 			return;
 		}
 
-		// Decrement global counter
-		self.pool.total_connections.fetch_sub(1, Ordering::AcqRel);
+		// The reserved connection never materialized, so it leaves the live set.
+		self.pool.release_connection_count();
 
 		let pools = self.pool.pools.write();
 		if let Ok(mut pools) = pools {

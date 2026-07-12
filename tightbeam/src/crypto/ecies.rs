@@ -27,9 +27,9 @@
 //!
 //! # Security
 //!
-//! This implementation uses constant-time cryptographic primitives
+//! The underlying primitives are constant-time:
 //! - ECDH operations (k256): constant-time scalar multiplication
-//! - AES-256-GCM: constant-time encryption and tag verification  
+//! - AES-256-GCM: constant-time encryption and tag verification
 //! - HKDF-SHA3-256: constant-time key derivation
 
 use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
@@ -37,18 +37,24 @@ use rand_core::{CryptoRng, CryptoRngCore, OsRng, RngCore};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::asn1::ObjectIdentifier;
 use crate::constants::{AES_GCM_NONCE_SIZE, AES_GCM_TAG_SIZE, EC_PUBKEY_COMPRESSED_SIZE, TIGHTBEAM_ECIES_KDF_INFO};
-use crate::der::oid::AssociatedOid;
-
-use crate::crypto::aead::{Aead, AeadCore, Aes256Gcm, Key, KeyInit, Nonce, Payload};
+use crate::crypto::aead::{Aead, AeadCore, Key, KeyInit, Nonce, Payload};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
-use crate::crypto::kdf::{ecies_kdf, HkdfSha3_256, KdfError, KdfFunction};
+use crate::crypto::k256::ecdh::{diffie_hellman, EphemeralSecret};
+use crate::crypto::k256::elliptic_curve::sec1::ToEncodedPoint;
+use crate::crypto::k256::{PublicKey, SecretKey};
+use crate::crypto::kdf::{ecies_kdf, KdfError, KdfFunction};
 use crate::crypto::secret::{Secret, SecretSlice};
-use crate::crypto::sign::ecdsa::k256::ecdh::EphemeralSecret;
-use crate::crypto::sign::ecdsa::k256::elliptic_curve::sec1::ToEncodedPoint;
-use crate::crypto::sign::ecdsa::k256::{PublicKey, SecretKey};
 use crate::random::RngWrapper;
+
+#[cfg(feature = "x509")]
+use crate::asn1::ObjectIdentifier;
+#[cfg(feature = "x509")]
+use crate::crypto::aead::Aes256Gcm;
+#[cfg(feature = "x509")]
+use crate::crypto::kdf::HkdfSha3_256;
+#[cfg(feature = "x509")]
+use crate::der::oid::AssociatedOid;
 
 // ============================================================================
 // Generic ECIES Traits
@@ -104,45 +110,36 @@ pub trait EciesEphemeral {
 // secp256k1 Implementation
 // ============================================================================
 
-#[cfg(feature = "derive")]
-use crate::Errorizable;
-
 /// Errors specific to ECIES operations
-#[cfg_attr(feature = "derive", derive(Errorizable))]
+///
+/// Deliberately does not derive `Errorizable`: this module builds without
+/// the `derive` feature, so the message strings live in exactly one place --
+/// the `impl_error_display!` block below.
 #[derive(Debug, Clone)]
 pub enum EciesError {
 	/// Invalid ciphertext format
-	#[cfg_attr(feature = "derive", error("Invalid ECIES ciphertext format"))]
 	InvalidCiphertext,
 
 	/// Invalid public key
-	#[cfg_attr(feature = "derive", error("Invalid ECIES public key: {0}"))]
-	InvalidPublicKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
+	InvalidPublicKey(crate::crypto::k256::elliptic_curve::Error),
 
 	/// Invalid secret key
-	#[cfg_attr(feature = "derive", error("Invalid ECIES secret key: {0}"))]
-	InvalidSecretKey(crate::crypto::sign::ecdsa::k256::elliptic_curve::Error),
+	InvalidSecretKey(crate::crypto::k256::elliptic_curve::Error),
 
 	/// Encryption failed
-	#[cfg_attr(feature = "derive", error("ECIES encryption failed: {0}"))]
 	EncryptionFailed(crate::crypto::aead::Error),
 
 	/// Decryption failed
-	#[cfg_attr(feature = "derive", error("ECIES decryption failed: {0}"))]
 	DecryptionFailed(crate::crypto::aead::Error),
 
 	/// Key derivation failed
-	#[cfg_attr(feature = "derive", error("ECIES key derivation failed: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
-	Kdf(#[cfg_attr(feature = "derive", from)] KdfError),
+	Kdf(KdfError),
 
 	/// Secret material was unavailable
-	#[cfg_attr(feature = "derive", error("Secret unavailable: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	SecretUnavailable(crate::crypto::secret::SecretError),
 }
 
-crate::impl_error_display!(EciesError {
+crate::impl_error_display!(unconditional EciesError {
 	InvalidCiphertext => "Invalid ECIES ciphertext format",
 	InvalidPublicKey(e) => "Invalid ECIES public key: {e}",
 	InvalidSecretKey(e) => "Invalid ECIES secret key: {e}",
@@ -152,7 +149,7 @@ crate::impl_error_display!(EciesError {
 	SecretUnavailable(e) => "Secret unavailable: {e}",
 });
 
-#[cfg(not(feature = "derive"))]
+crate::impl_from!(KdfError => EciesError::Kdf);
 crate::impl_from!(crate::crypto::secret::SecretError => EciesError::SecretUnavailable);
 
 /// A specialized Result type for ECIES operations
@@ -191,7 +188,7 @@ impl EciesSecretKeyOps for SecretKey {
 	}
 
 	fn diffie_hellman(&self, public_key: &Self::PublicKey) -> SecretSlice<u8> {
-		let shared_secret = k256::ecdh::diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
+		let shared_secret = diffie_hellman(self.to_nonzero_scalar(), public_key.as_affine());
 		let v = shared_secret.raw_secret_bytes().to_vec().into_boxed_slice();
 		Secret::from(v)
 	}
@@ -398,6 +395,7 @@ where
 			let mut wire_bytes = Vec::with_capacity(total_len);
 			wire_bytes.extend_from_slice(&ephemeral_bytes);
 			wire_bytes.extend_from_slice(&final_ciphertext);
+
 			M::from_bytes(&wire_bytes)
 		}};
 	}
@@ -578,7 +576,7 @@ impl EciesDecryptor {
 
 #[cfg(feature = "x509")]
 impl crate::crypto::aead::Decryptor for EciesDecryptor {
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>> {
 		// Extract the encrypted bytes
 		let encrypted_bytes = info
 			.encrypted_content
@@ -589,11 +587,7 @@ impl crate::crypto::aead::Decryptor for EciesDecryptor {
 		// Parse as ECIES message
 		let ecies_msg = Secp256k1EciesMessage::from_bytes(encrypted_bytes)?;
 		// Decrypt using the secp256k1 ECIES suite.
-		let plaintext = decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&self.secret_key, &ecies_msg, None)?;
-
-		// Convert SecretSlice to Vec<u8>
-		use crate::crypto::secret::ToInsecure;
-		Ok(plaintext.to_insecure()?.to_vec())
+		Ok(decrypt::<_, _, HkdfSha3_256, Aes256Gcm>(&self.secret_key, &ecies_msg, None)?)
 	}
 }
 
@@ -640,9 +634,7 @@ where
 	P: crate::crypto::profiles::CryptoProvider,
 	P::AeadCipher: KeyInit,
 {
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
-		use crate::crypto::secret::ToInsecure;
-
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>> {
 		let encrypted_bytes = info
 			.encrypted_content
 			.as_ref()
@@ -651,10 +643,11 @@ where
 
 		let ecies_msg = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_bytes)?;
 		let shared_secret = self.shared_secret.with(|bytes| SecretSlice::from(bytes.to_vec()))?;
-		let plaintext =
-			decrypt_with_shared_secret::<P::EciesMessage, P::Kdf, P::AeadCipher>(&ecies_msg, shared_secret, None)?;
-
-		Ok(plaintext.to_insecure()?.to_vec())
+		Ok(decrypt_with_shared_secret::<P::EciesMessage, P::Kdf, P::AeadCipher>(
+			&ecies_msg,
+			shared_secret,
+			None,
+		)?)
 	}
 }
 
@@ -871,10 +864,10 @@ mod tests {
 
 		// Open via the standard Decryptor seam (what Frame::decrypt_bytes calls).
 		let decryptor = EciesSharedSecretDecryptor::<DefaultCryptoProvider>::new(shared);
-		let opened = decryptor.decrypt_content(&info)?;
+		let opened = decryptor.decrypt_content(&info)?.to_insecure()?;
 
 		assert_eq!(
-			opened.as_slice(),
+			&opened[..],
 			plaintext,
 			"provider key agreement must reproduce the ECIES plaintext"
 		);

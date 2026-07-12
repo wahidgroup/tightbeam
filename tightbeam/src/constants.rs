@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 // ============================================================================
 // Handshake Protocol Constants
 // ============================================================================
@@ -81,10 +79,6 @@ pub const AES_GCM_TAG_SIZE: usize = 16;
 /// Used by:
 /// - FDR exploration for deterministic state space traversal
 /// - Runtime fault injection for reproducible test sequences
-///
-/// Certification compliance:
-/// - DO-178C DAL A: Deterministic, reproducible pseudorandom sequences
-/// - IEC 61508 SIL 4: Systematic fault injection with known seed behavior
 pub const LCG_MULTIPLIER: u64 = 6364136223846793005;
 
 /// Linear Congruential Generator (LCG) increment constant
@@ -92,13 +86,33 @@ pub const LCG_MULTIPLIER: u64 = 6364136223846793005;
 /// Source: Numerical Recipes (3rd Ed., 2007), Section 7.1.4
 /// - Must be odd for full period
 /// - Co-prime with 2^64 (guaranteed since it's odd)
-/// - Combined with LCG_MULTIPLIER provides good randomness properties
+/// - Combined with [`LCG_MULTIPLIER`] provides good randomness properties
 ///
-/// Certification compliance:
+/// Properties:
 /// - Same seed produces identical sequences across all platforms
 /// - No floating-point operations (pure integer arithmetic)
-/// - Suitable for embedded/bare-metal environments (no_std compatible)
 pub const LCG_INCREMENT: u64 = 1442695040888963407;
+
+/// SplitMix64 golden-gamma increment constant
+///
+/// Source: Sebastiano Vigna, `splitmix64.c` (2015, public domain),
+/// <https://xoshiro.di.unimi.it/splitmix64.c> -- the fixed-increment
+/// version of Java 8's `SplittableRandom` (Steele, Lea & Flood,
+/// OOPSLA 2014, doi:10.1145/2714064.2660195).
+///
+/// Value: floor(((1+sqrt(5))/2) * 2^64) mod 2^64 (64-bit golden ratio).
+/// Any 64-bit seed is valid, including zero.
+///
+/// Used by:
+/// - `PowerOfTwoChoices` load balancer for candidate-pair selection
+pub const SPLITMIX64_GAMMA: u64 = 0x9E3779B97F4A7C15;
+
+/// SplitMix64 finalizer multiplier 1 (David Stafford's Mix13 variant of
+/// the MurmurHash3 64-bit finalizer). See [`SPLITMIX64_GAMMA`] for source.
+pub const SPLITMIX64_MIX_1: u64 = 0xBF58476D1CE4E5B9;
+
+/// SplitMix64 finalizer multiplier 2. See [`SPLITMIX64_GAMMA`] for source.
+pub const SPLITMIX64_MIX_2: u64 = 0x94D049BB133111EB;
 
 /// Default seed for fault injection reproducibility
 ///
@@ -123,9 +137,28 @@ pub const DEFAULT_FAULT_SEED: u64 = 0xDEADBEEF;
 /// `TransitStatus::Busy` to the cluster, indicating it should route work elsewhere.
 pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
 
-// ============================================================================
-// Bitcoin Constants
-// ============================================================================
+/// Utilization assumed for servlets that do not report one (50% = 5000 bps)
+///
+/// The scaling task needs a per-instance figure to average; a servlet
+/// without self-reported or hive-tracked utilization counts as half
+/// loaded so it neither forces scale-up (as 100% would) nor masks load
+/// on its siblings (as 0% would).
+pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 
-#[cfg(feature = "bitcoin")]
-const BITCOIN_GENESIS_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+/// Default freshness window for signed cluster commands (30 seconds)
+///
+/// A hive accepts a signed `ClusterCommand` only when its `issued_at_ms`
+/// is within this many milliseconds of the hive's own clock (both
+/// directions, tolerating skew), and its signature has not been seen
+/// before inside the window. Bounds the replay surface of captured
+/// commands (CWE-294).
+pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
+
+/// Default ceiling for decompressed message bodies (16 MiB)
+///
+/// Compressed frame bodies arrive from the wire under the transport's
+/// envelope ceiling, but zstd can expand a small input by several orders
+/// of magnitude. Capping the inflated size bounds the memory an attacker
+/// can force with a decompression bomb (CWE-409). Override per inflator
+/// via `ZstdCompression::with_max_output`.
+pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;

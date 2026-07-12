@@ -2,10 +2,14 @@
 //!
 //! Processes received EnvelopedData structures to decrypt content.
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfo};
 use crate::crypto::aead::{Decryptor, KeyInit};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use crate::crypto::secret::SecretSlice;
 use crate::der::oid::AssociatedOid;
 use crate::transport::handshake::error::HandshakeError;
 
@@ -99,7 +103,7 @@ where
 	fn decrypt_content(
 		cipher: &P::AeadCipher,
 		encrypted_content_info: &EncryptedContentInfo,
-	) -> Result<Vec<u8>, HandshakeError>
+	) -> Result<SecretSlice<u8>, HandshakeError>
 	where
 		P::AeadCipher: Decryptor,
 	{
@@ -118,8 +122,8 @@ where
 	/// - `enveloped_data`: The EnvelopedData structure to process
 	///
 	/// # Returns
-	/// The decrypted plaintext content
-	pub fn process(&self, enveloped_data: &EnvelopedData) -> Result<Vec<u8>, HandshakeError> {
+	/// The decrypted plaintext content, wrapped so it zeroizes on drop
+	pub fn process(&self, enveloped_data: &EnvelopedData) -> Result<SecretSlice<u8>, HandshakeError> {
 		// 1. Validate recipient index
 		self.validate_recipient_index(enveloped_data)?;
 
@@ -229,7 +233,8 @@ mod tests {
 
 			// 7. Verify roundtrip success
 			let decrypted = processor.process(&enveloped_data)?;
-			assert_eq!(decrypted, plaintext);
+			let decrypted = crate::crypto::secret::ToInsecure::to_insecure(decrypted)?;
+			assert_eq!(&decrypted[..], &plaintext[..]);
 
 			Ok(())
 		}
@@ -274,7 +279,8 @@ mod tests {
 			// 3. Create KARI builder and build EnvelopedData with unprotected attributes
 			let kari_builder = create_test_kari_builder(sender_key, sender_spki, recipient_pubkey);
 			let builder = TightBeamEnvelopedDataBuilder::with_defaults(kari_builder);
-			let builder = builder.with_unprotected_attr(test_attr.clone());
+			let attr = test_attr.clone();
+			let builder = builder.with_unprotected_attr(attr);
 			let enveloped_data = builder.build(b"Test with attributes", None, None)?;
 
 			// 4. Extract attributes using processor

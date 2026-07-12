@@ -13,7 +13,7 @@
 //! - Simulated mission clock with realistic Mars-Earth delays
 //! - Cryptographic chain validation using previous_frame hash chains
 //! - Matrix bit field for rover fault flags
-//! - Graceful fault handling (low power → recharge → resume)
+//! - Graceful fault handling (low power -> recharge -> resume)
 //! - Cascading gap recovery
 //!
 //! ## Realistic Timeline
@@ -223,7 +223,7 @@ const COMMAND_ROUND_TRIPS: usize = 6;
 // DTN Process Specifications - Parallel Composition
 // ============================================================================
 
-// Telemetry Flow: Rover → Mars Relay → Earth Relay → Mission Control
+// Telemetry Flow: Rover -> Mars Relay -> Earth Relay -> Mission Control
 tb_process_spec! {
 	pub DtnTelemetryFlow,
 	events {
@@ -275,7 +275,7 @@ tb_process_spec! {
 	}
 }
 
-// Command Flow: Mission Control → Earth Relay → Mars Relay → Rover → ACK back
+// Command Flow: Mission Control -> Earth Relay -> Mars Relay -> Rover -> ACK back
 tb_process_spec! {
 	pub DtnCommandFlow,
 	events {
@@ -552,9 +552,9 @@ async fn send_telemetry_to_mars_relay(
 /// Run the rover mission loop: sends telemetry periodically
 ///
 /// Fully async architecture:
-/// - Rover sends telemetry → Satellite → Earth
-/// - Earth responds with command → Satellite → Rover
-/// - Rover sends ACK → Satellite → Earth
+/// - Rover sends telemetry -> Satellite -> Earth
+/// - Earth responds with command -> Satellite -> Rover
+/// - Rover sends ACK -> Satellite -> Earth
 /// - Rover executes command and sends next telemetry
 #[allow(clippy::too_many_arguments)]
 async fn run_mission_loop(
@@ -606,7 +606,7 @@ async fn run_mission_loop(
 			}
 		}
 
-		// Send telemetry to Mars Relay (which forwards to Earth Relay → Mission
+		// Send telemetry to Mars Relay (which forwards to Earth Relay -> Mission
 		// Control)
 		send_telemetry_to_mars_relay(
 			trace,
@@ -699,7 +699,7 @@ tb_scenario! {
 		start: |trace, config| async move {
 			// ================================================================
 			// 4-TIER DTN ARCHITECTURE SETUP
-			// Start: Rover → Mars Relay → Earth Relay → Mission Control
+			// Start: Rover -> Mars Relay -> Earth Relay -> Mission Control
 			// This ensures each servlet has the addresses it needs to connect
 			// ================================================================
 
@@ -769,42 +769,42 @@ tb_scenario! {
 			// Pool configuration for relay connections (max 3 per destination)
 			let pool_config = PoolConfig { idle_timeout: None, max_connections: 3 };
 
-			// Mission Control → Earth Relay pool
+			// Mission Control -> Earth Relay pool
 			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
 				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
 				.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
-			// Earth Relay → Mission Control pool
+			// Earth Relay -> Mission Control pool
 			let earth_mc_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
 				.with_trust_store(make_trust_store(MISSION_CONTROL_CERT)?)
 				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
-			// Earth Relay → Mars Relay pool
+			// Earth Relay -> Mars Relay pool
 			let earth_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
 				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
-			// Mars Relay → Earth Relay pool
+			// Mars Relay -> Earth Relay pool
 			let mars_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
 				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
 				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
-			// Mars Relay → Rover pool
+			// Mars Relay -> Rover pool
 			let mars_rover_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config.clone())
 				.with_trust_store(make_trust_store(ROVER_CERT)?)
 				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
-			// Rover → Mars Relay pool
+			// Rover -> Mars Relay pool
 			let rover_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
 				.with_config(pool_config)
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)

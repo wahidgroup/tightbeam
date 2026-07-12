@@ -1,9 +1,16 @@
 //! Integration test for security profile negotiation.
 //!
-//! Demonstrates how a server configured with multiple security profiles (AES-256-GCM with SHA3-512
-//! and AES-128-GCM with SHA3-256) negotiates with a client that offers profiles in preference order.
+//! Demonstrates how a server configured with multiple security profiles
+//! (AES-256-GCM with SHA3-512 and AES-128-GCM with SHA3-256) negotiates
+//! with a client that offers profiles in preference order.
 
-#![cfg(all(feature = "transport", feature = "x509", feature = "aead"))]
+#![cfg(all(
+	feature = "transport",
+	feature = "transport-ecies",
+	feature = "x509",
+	feature = "aead",
+	feature = "tokio"
+))]
 
 use std::sync::Arc;
 use tightbeam::crypto::aead::{Aes128Gcm, Aes128GcmOid, Aes256Gcm, Aes256GcmOid};
@@ -42,6 +49,7 @@ impl SecurityProfile for Aes256Sha3_512Profile {
 	type SignatureAlg = Secp256k1Signature;
 	type KdfOid = HkdfSha3_256Oid;
 	type CurveOid = Secp256k1Oid;
+	#[cfg(feature = "kem")]
 	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_256_WRAP);
 }
@@ -96,6 +104,7 @@ impl SecurityProfile for Aes128Sha3_256Profile {
 	type SignatureAlg = Secp256k1Signature;
 	type KdfOid = HkdfSha3_256Oid;
 	type CurveOid = Secp256k1Oid;
+	#[cfg(feature = "kem")]
 	type KemOid = tightbeam::crypto::kem::Kyber1024Oid;
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_128_WRAP);
 }
@@ -183,8 +192,10 @@ tb_scenario! {
 
 			// Create client with offer: [AES-256, AES-128] (AES-256 preferred)
 			let client_offer = SecurityOffer::new(vec![profile_aes256_sha512, profile_aes128_sha256]);
+			let validator = crate::common::security::pinning_validator(&server_cert);
 			let mut client = EciesHandshakeClient::<Aes256Sha3_512Provider, Secp256k1EciesMessage>::new(None)
-				.with_security_offer(client_offer);
+				.with_security_offer(client_offer)
+				.with_certificate_validator(validator);
 
 			// Create server supporting: [AES-128, AES-256] (different order to test negotiation)
 			let mut server = EciesHandshakeServer::<Aes256Sha3_512Provider>::new(
@@ -212,7 +223,8 @@ tb_scenario! {
 			let _client_cipher = client.complete()?;
 			let _server_cipher = server.complete()?;
 
-			// Verify: Server selected client's first preference (AES-256-GCM/SHA3-512)
+			// Verify: server preference + strength floor select AES-256-GCM/SHA3-512
+			// (AES-128 fails the default 256-bit floor)
 			if server.selected_profile() == Some(profile_aes256_sha512) &&
 			   client.selected_profile() == Some(profile_aes256_sha512) {
 				trace.event("profile_verified")?;

@@ -312,13 +312,25 @@ pub struct FdrVerdict {
 	/// Overall pass/fail status
 	pub passed: bool,
 
+	/// Whether analysis ran without hitting resource bounds or timeouts
+	///
+	/// False when trace/failure sets were truncated (bounded claim) or a
+	/// refinement check was inconclusive. See the type-level docs.
+	pub complete: bool,
+
 	/// Divergence freedom: no infinite τ-loops detected
 	pub divergence_free: bool,
 
 	/// Deadlock freedom: no unexpected STOP states
 	pub deadlock_free: bool,
 
-	/// Determinism: no witnesses to nondeterminism found
+	/// Determinism: structural proof that the LTS is deterministic
+	///
+	/// True only when the process has no hidden (τ) actions and no
+	/// multi-target `(state, event)` transition -- a sufficient structural
+	/// condition for CSP determinism (Roscoe 2010, §10.5). Informational:
+	/// nondeterminism is a modeling choice, not a failure, so this flag
+	/// does not affect `passed`.
 	pub is_deterministic: bool,
 
 	/// Trace refinement: traces(Impl) ⊆ traces(Spec)
@@ -342,8 +354,10 @@ pub struct FdrVerdict {
 	/// Witness to divergence refinement violation: divergent trace in Impl but not in Spec
 	pub divergence_refinement_witness: Option<Trace>,
 
-	/// Witness to nondeterminism: (seed, trace, event) where different seeds diverge
-	pub determinism_witness: Option<(u64, Trace, Event)>,
+	/// Witness to structural nondeterminism: first `(state, event)` with a
+	/// hidden action or multiple transition targets (sorted state order,
+	/// reproducible)
+	pub determinism_witness: Option<(State, Event)>,
 
 	/// Witness to divergence: (seed, τ-loop sequence) if found
 	pub divergence_witness: Option<(u64, Vec<Event>)>,
@@ -363,15 +377,24 @@ pub struct FdrVerdict {
 	/// Seed that caused failure, if any
 	pub failing_seed: Option<u64>,
 
+	/// Number of exploration branches pruned for timing violations
+	///
+	/// Timed exploration drops branches whose WCET/deadline constraints
+	/// fail. A non-zero count means model-level timing violations exist
+	/// even though the surviving paths passed.
+	pub timing_pruned: usize,
+
 	/// Faults that were injected during exploration
 	#[cfg(feature = "testing-fault")]
 	pub faults_injected: Vec<InjectedFaultRecord>,
 
-	/// Number of successfully recovered errors
+	/// Seeds that completed (reached exhaustion or terminal states)
+	/// despite at least one injected fault suppressing a transition
 	#[cfg(feature = "testing-fault")]
 	pub error_recovery_successful: usize,
 
-	/// Number of failed error recoveries
+	/// Seeds that deadlocked or diverged after at least one injected
+	/// fault suppressed a transition
 	#[cfg(feature = "testing-fault")]
 	pub error_recovery_failed: usize,
 
@@ -384,6 +407,7 @@ impl Default for FdrVerdict {
 	fn default() -> Self {
 		Self {
 			passed: true,
+			complete: true,
 			divergence_free: true,
 			deadlock_free: true,
 			is_deterministic: true,
@@ -400,6 +424,7 @@ impl Default for FdrVerdict {
 			states_visited: 0,
 			seeds_completed: 0,
 			failing_seed: None,
+			timing_pruned: 0,
 			#[cfg(feature = "testing-fault")]
 			faults_injected: Vec::new(),
 			#[cfg(feature = "testing-fault")]
@@ -523,7 +548,6 @@ mod tests {
 				.with_fault(TestState, TestEvent, || TestError, BasisPoints::new(1000))
 				.with_fault(TestState, AnotherEvent, || TestError, BasisPoints::new(2000))
 				.with_fault(AnotherState, TestEvent, || TestError, BasisPoints::new(3000));
-
 			assert_eq!(model.injection_points.len(), 3);
 
 			let key1 = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));

@@ -105,28 +105,6 @@ macro_rules! policy {
 
 		$crate::policy! { $($rest)* }
 	};
-(RestartPolicy: $name:ident { $($body:tt)* } $($rest:tt)*) => {
-	#[derive(Default)]
-	pub struct $name;
-
-	impl $crate::transport::policy::CoreRetryPolicy for $name {
-		fn max_attempts(&self) -> usize { 1 }
-		fn delay_ms(&self, _attempt: usize) -> u64 { 0 }
-	}
-
-	impl $crate::transport::policy::RestartPolicy for $name {
-		#[allow(unused_variables)]
-		fn evaluate(
-			&self,
-			result: &$crate::transport::TransportResult<&$crate::Frame>,
-			attempt: usize,
-		) -> $crate::transport::policy::RetryAction {
-			$($body)*
-		}
-	}
-
-	$crate::policy! { $($rest)* }
-};
 }
 
 #[cfg(test)]
@@ -143,11 +121,19 @@ mod tests {
 		value: u64,
 	}
 
+	// Every public arm is invoked here so broken expansions fail `cargo test`
+	// instead of surviving until a consumer expands them.
 	policy! {
 		GatePolicy: TestGateBusy |_frame| {
 			TransitStatus::Busy
 		}
 		GatePolicy: TestGateAccept |_frame| {
+			TransitStatus::Accepted
+		}
+		// Implicit-argument arms: macro hygiene hides the generated binding
+		// from the caller's body, so these arms serve input-independent
+		// policies only.
+		GatePolicy: TestGateImplicitArg {
 			TransitStatus::Accepted
 		}
 		ReceptorPolicy<DummyMessage>: TestReceptorReject |message| {
@@ -157,7 +143,16 @@ mod tests {
 				TransitStatus::Accepted
 			}
 		}
+		ReceptorPolicy<DummyMessage>: TestReceptorImplicitArg {
+			TransitStatus::Accepted
+		}
 		RestartPolicy: TestRestart |frame, _failure, _attempt| {
+			RetryAction::Retry(frame)
+		}
+		RestartPolicy: TestRestartMaxOnly (2) |frame, _failure, _attempt| {
+			RetryAction::Retry(frame)
+		}
+		RestartPolicy: TestRestartConfigured (3, 250) |frame, _failure, _attempt| {
 			RetryAction::Retry(frame)
 		}
 	}
@@ -184,5 +179,31 @@ mod tests {
 		let receptor = TestReceptorReject;
 		assert_eq!(receptor.evaluate(&DummyMessage { value: 1 }), TransitStatus::Accepted);
 		assert_eq!(receptor.evaluate(&DummyMessage { value: 0 }), TransitStatus::Forbidden);
+	}
+
+	#[test]
+	fn test_implicit_argument_arms() -> Result<(), crate::TightBeamError> {
+		let frame = compose! {
+			V0: id: b"test", message: DummyMessage { value: 42 }
+		}?;
+		assert_eq!(TestGateImplicitArg.evaluate(&frame), TransitStatus::Accepted);
+		assert_eq!(
+			TestReceptorImplicitArg.evaluate(&DummyMessage { value: 42 }),
+			TransitStatus::Accepted
+		);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_restart_policy_retry_configuration() {
+		use crate::transport::policy::CoreRetryPolicy;
+
+		assert_eq!(TestRestart.max_attempts(), 1);
+		assert_eq!(TestRestart.delay_ms(0), 0);
+		assert_eq!(TestRestartMaxOnly.max_attempts(), 2);
+		assert_eq!(TestRestartMaxOnly.delay_ms(1), 0);
+		assert_eq!(TestRestartConfigured.max_attempts(), 3);
+		assert_eq!(TestRestartConfigured.delay_ms(1), 500);
 	}
 }

@@ -45,6 +45,16 @@ pub enum TransportError {
 	SendFailed,
 	#[cfg_attr(feature = "derive", error("Encryption required but not provided"))]
 	MissingEncryption,
+	#[cfg_attr(
+		feature = "derive",
+		error("Handshake protocol not supported by this transport: {0:?}")
+	)]
+	UnsupportedHandshakeProtocol(crate::transport::handshake::HandshakeProtocolKind),
+	#[cfg_attr(
+		feature = "derive",
+		error("Server certificate chain required but not provisioned")
+	)]
+	MissingServerCertificateChain,
 	#[cfg_attr(feature = "derive", error("Invalid message"))]
 	InvalidMessage,
 	#[cfg_attr(feature = "derive", error("Invalid reply"))]
@@ -78,12 +88,30 @@ pub enum TransportError {
 	IoError(std::io::Error),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for TransportError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		write!(f, "{self:?}")
-	}
-}
+crate::impl_error_display!(TransportError {
+	ConnectionClosed => "Connection closed gracefully",
+	ConnectionFailed => "Connection failed",
+	SendFailed => "Send failed",
+	MissingEncryption => "Encryption required but not provided",
+	UnsupportedHandshakeProtocol(kind) => "Handshake protocol not supported by this transport: {kind:?}",
+	MissingServerCertificateChain => "Server certificate chain required but not provisioned",
+	InvalidMessage => "Invalid message",
+	InvalidReply => "Invalid reply",
+	MissingRequest => "Missing request",
+	MaxRetriesExceeded => "Max retries exceeded",
+	InvalidAddress => "Invalid address",
+	InvalidState => "Invalid state",
+	MessageNotSent(frame, failure) => "Message not sent: {failure:?} - {frame:?}",
+	OperationFailed(failure) => "Operation failed: {failure:?}",
+	DerError(err) => "DER error: {err}",
+
+	#[cfg(feature = "x509")]
+	InvalidCertificate(err) => "Invalid certificate: {err}",
+	#[cfg(feature = "x509")]
+	HandshakeError(err) => "Handshake error: {err}",
+	#[cfg(feature = "std")]
+	IoError(err) => "I/O error: {err}",
+});
 
 /// Narrows [`TightBeamError`](crate::error::TightBeamError) into [`TransportError`];
 /// variants without a transport counterpart collapse to [`TransportError::InvalidMessage`].
@@ -93,6 +121,7 @@ impl From<crate::error::TightBeamError> for TransportError {
 		match err {
 			TightBeamError::TransportError(t) => t,
 			TightBeamError::SerializationError(e) => TransportError::DerError(e),
+
 			#[cfg(feature = "x509")]
 			TightBeamError::HandshakeError(h) => TransportError::HandshakeError(h),
 			#[cfg(feature = "x509")]
@@ -117,15 +146,14 @@ impl From<TransitStatus> for TransportError {
 	}
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for TransportError {}
-
 #[cfg(all(feature = "std", not(feature = "derive")))]
 crate::impl_from!(std::io::Error => TransportError::IoError);
 #[cfg(not(feature = "derive"))]
 crate::impl_from!(der::Error => TransportError::DerError);
 #[cfg(all(feature = "x509", not(feature = "derive")))]
 crate::impl_from!(crate::transport::handshake::HandshakeError => TransportError::HandshakeError);
+#[cfg(all(feature = "x509", not(feature = "derive")))]
+crate::impl_from!(crate::crypto::x509::error::CertificateValidationError => TransportError::InvalidCertificate);
 
 crate::impl_from!(
 	spki::Error => TransportError::DerError extract spki::Error::Asn1(der_err) =>

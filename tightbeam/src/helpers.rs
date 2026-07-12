@@ -6,7 +6,7 @@ extern crate alloc;
 	any(feature = "signature", feature = "digest", feature = "kdf", feature = "aead")
 ))]
 use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), any(feature = "kdf", feature = "aead")))]
 use alloc::vec::Vec;
 
 // Re-exports
@@ -15,7 +15,7 @@ pub use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::der::asn1::OctetString;
 use crate::der::{Decode, Encode};
-use crate::der::{DecodeValue, EncodeValue, Header, Length, Reader, Tag, Tagged, Writer};
+use crate::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader, Tag, Writer};
 use crate::error::Result;
 use crate::matrix::MatrixError;
 use crate::{Asn1Matrix, Frame};
@@ -30,10 +30,11 @@ mod signature {
 	pub use crate::crypto::key::SigningKeyProvider;
 	pub use crate::crypto::sign::SignerInfoExt;
 	pub use crate::der::oid::AssociatedOid;
-	pub use crate::der::Any;
-	pub use crate::spki::AlgorithmIdentifierOwned;
 	pub use crate::x509::ext::pkix::SubjectKeyIdentifier;
 	pub use crate::SignerInfo;
+
+	#[cfg(not(feature = "aead"))]
+	pub use crate::spki::AlgorithmIdentifierOwned;
 }
 
 #[cfg(feature = "signature")]
@@ -42,6 +43,8 @@ use signature::*;
 #[cfg(feature = "aead")]
 mod encryption {
 	pub use crate::crypto::key::EncryptingKeyProvider;
+	pub use crate::der::Any;
+	pub use crate::spki::AlgorithmIdentifierOwned;
 	pub use crate::EncryptedContentInfo;
 }
 
@@ -80,36 +83,35 @@ impl Asn1Matrix {
 }
 
 impl Default for Asn1Matrix {
+	/// Smallest valid matrix (1×1, zeroed) so the `data.len() == n*n`
+	/// invariant holds for every reachable value. The encoder rejects
+	/// non-conforming lengths.
 	fn default() -> Self {
-		Self { n: 1, data: Vec::new() }
+		Self { n: 1, data: vec![0u8; 1] }
 	}
 }
 
-impl Tagged for Asn1Matrix {
-	fn tag(&self) -> Tag {
-		Tag::Sequence
-	}
+impl FixedTag for Asn1Matrix {
+	const TAG: Tag = Tag::Sequence;
 }
 
 impl<'a> DecodeValue<'a> for Asn1Matrix {
 	fn decode_value<R: Reader<'a>>(reader: &mut R, _header: Header) -> crate::der::Result<Self> {
-		reader.sequence(|seq: &mut der::NestedReader<'_, R>| {
-			let n = u8::decode(seq)?;
-			let data_os = OctetString::decode(seq)?;
+		let n = u8::decode(reader)?;
+		let data_os = OctetString::decode(reader)?;
 
-			// Validate per spec
-			if n == 0 {
-				return Err(crate::der::ErrorKind::Value { tag: Tag::Integer }.into());
-			}
+		// Strict validation at the untrusted decode boundary, per spec.
+		if n == 0 {
+			return Err(crate::der::ErrorKind::Value { tag: Tag::Integer }.into());
+		}
 
-			let data = data_os.as_bytes();
-			let n2 = (n as usize) * (n as usize);
-			if data.len() != n2 {
-				return Err(crate::der::ErrorKind::Length { tag: Tag::OctetString }.into());
-			}
+		let data = data_os.as_bytes();
+		let n2 = (n as usize) * (n as usize);
+		if data.len() != n2 {
+			return Err(crate::der::ErrorKind::Length { tag: Tag::OctetString }.into());
+		}
 
-			Ok(Self { n, data: data.to_vec() })
-		})
+		Ok(Self { n, data: data.to_vec() })
 	}
 }
 
@@ -139,13 +141,6 @@ impl EncodeValue for Asn1Matrix {
 
 		let os = crate::der::asn1::OctetString::new(self.data.as_slice())?;
 		os.encode(encoder)
-	}
-}
-
-impl<'a> Decode<'a> for Asn1Matrix {
-	fn decode<R: Reader<'a>>(reader: &mut R) -> crate::der::Result<Self> {
-		let header = reader.peek_header()?;
-		Self::decode_value(reader, header)
 	}
 }
 
@@ -212,8 +207,9 @@ macro_rules! rwlock {
 
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
-				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
-					|> std::sync::Arc::clone
+				std::sync::Arc::clone(
+					[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
+				)
 			}
 		}
 	};
@@ -225,8 +221,9 @@ macro_rules! rwlock {
 
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
-				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Default::default())))
-					.clone()
+				std::sync::Arc::clone(
+					[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Default::default())))
+				)
 			}
 		}
 	};
@@ -249,8 +246,9 @@ macro_rules! mutex {
 
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
-				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new($default)))
-					.clone()
+				std::sync::Arc::clone(
+					[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new($default)))
+				)
 			}
 		}
 	};
@@ -262,8 +260,9 @@ macro_rules! mutex {
 
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
-				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Default::default())))
-					.clone()
+				std::sync::Arc::clone(
+					[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Default::default())))
+				)
 			}
 		}
 	};
@@ -319,8 +318,14 @@ impl crate::Frame {
 		// 1. Encode the frame (without signature field)
 		let unsigned_bytes = self.to_tbs()?;
 
-		// 2. Sign the frame
-		let signature_bytes = provider.sign(&unsigned_bytes).await?;
+		// 2. Sign under the canonical convention: hash the TBS bytes once
+		// with `D`, then have the provider sign that prehash. The digest
+		// algorithm recorded in the SignerInfo below is therefore the digest
+		// actually used by the signature.
+		let mut tbs_hasher = D::new();
+		tbs_hasher.update(&unsigned_bytes);
+
+		let signature_bytes = provider.sign_prehash(&tbs_hasher.finalize()).await?;
 
 		// 3. Get signature algorithm from provider
 		let signature_algorithm = provider.algorithm();
@@ -330,8 +335,11 @@ impl crate::Frame {
 		let mut hasher = D::new();
 		hasher.update(&public_key_der);
 
+		// RFC 5280 s4.2.1.2 method (1): SKID is a 160-bit (20-byte) hash of the
+		// public key. Digests shorter than the window are a caller error.
 		let skid_digest = hasher.finalize();
-		let skid_octets = OctetString::new(&skid_digest.as_slice()[..20])?;
+		let skid_bytes = skid_digest.as_slice().get(..20).ok_or(TightBeamError::InvalidAlgorithm)?;
+		let skid_octets = OctetString::new(skid_bytes)?;
 		let skid = SubjectKeyIdentifier::from(skid_octets);
 		let sid = SignerIdentifier::SubjectKeyIdentifier(skid);
 
@@ -472,6 +480,78 @@ mod tests {
 	#[cfg(not(feature = "std"))]
 	use alloc::string::ToString;
 
+	#[cfg(feature = "std")]
+	mod statics {
+		#[derive(Debug, Default, PartialEq)]
+		struct Counter(u64);
+
+		rwlock!(SHARED_RWLOCK_DEFAULTED: Counter = Counter(7));
+		rwlock!(SHARED_RWLOCK: Counter);
+		mutex!(SHARED_MUTEX_DEFAULTED: Counter = Counter(7));
+		mutex!(SHARED_MUTEX: Counter);
+		rwlock! {
+			MULTI_RWLOCK_A: Counter,
+			MULTI_RWLOCK_B: Counter = Counter(3),
+		}
+		mutex! {
+			MULTI_MUTEX_A: Counter,
+			MULTI_MUTEX_B: Counter = Counter(3),
+		}
+
+		#[test]
+		fn rwlock_arms_initialize_and_share_state() -> crate::error::Result<()> {
+			assert_eq!(*SHARED_RWLOCK_DEFAULTED().read()?, Counter(7));
+			assert_eq!(*SHARED_RWLOCK().read()?, Counter(0));
+			assert_eq!(*MULTI_RWLOCK_A().read()?, Counter(0));
+			assert_eq!(*MULTI_RWLOCK_B().read()?, Counter(3));
+
+			SHARED_RWLOCK().write()?.0 = 42;
+			assert_eq!(*SHARED_RWLOCK().read()?, Counter(42));
+
+			Ok(())
+		}
+
+		#[test]
+		fn mutex_arms_initialize_and_share_state() -> crate::error::Result<()> {
+			assert_eq!(*SHARED_MUTEX_DEFAULTED().lock()?, Counter(7));
+			assert_eq!(*SHARED_MUTEX().lock()?, Counter(0));
+			assert_eq!(*MULTI_MUTEX_A().lock()?, Counter(0));
+			assert_eq!(*MULTI_MUTEX_B().lock()?, Counter(3));
+
+			SHARED_MUTEX().lock()?.0 = 42;
+			assert_eq!(*SHARED_MUTEX().lock()?, Counter(42));
+
+			Ok(())
+		}
+	}
+
+	mod asn1_matrix {
+		use crate::error::Result;
+		use crate::Asn1Matrix;
+
+		#[test]
+		fn default_upholds_invariant() -> Result<()> {
+			let matrix = Asn1Matrix::default();
+			assert_eq!(matrix.n, 1);
+			assert_eq!(matrix.data.as_slice(), &[0u8]);
+
+			matrix.validate()?;
+
+			Ok(())
+		}
+
+		#[test]
+		fn default_round_trips_through_der() -> Result<()> {
+			let matrix = Asn1Matrix::default();
+
+			let encoded = crate::encode(&matrix)?;
+			let decoded: Asn1Matrix = crate::decode(&encoded)?;
+			assert_eq!(decoded, matrix);
+
+			Ok(())
+		}
+	}
+
 	#[cfg(feature = "signature")]
 	mod notarize {
 		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
@@ -501,9 +581,29 @@ mod tests {
 		use crate::cms::signed_data::SignerIdentifier;
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::key::Secp256k1KeyProvider;
+
 		use crate::error::Result;
+		use crate::testing::utils::SixteenByteDigest;
 		use crate::testing::{create_test_message, create_test_signing_key};
-		use crate::Version;
+		use crate::{TightBeamError, Version};
+
+		#[tokio::test]
+		async fn rejects_digest_shorter_than_skid_window() -> Result<()> {
+			let message = create_test_message(None);
+			let frame = FrameBuilder::from(Version::V1)
+				.with_id("test-short-digest")
+				.with_order(1696521600)
+				.with_message(message)
+				.build()?;
+
+			let signing_key = create_test_signing_key();
+			let provider = Secp256k1KeyProvider::from(signing_key);
+
+			let result = frame.sign_with_provider::<SixteenByteDigest, _>(&provider).await;
+			assert!(matches!(result, Err(TightBeamError::InvalidAlgorithm)));
+
+			Ok(())
+		}
 
 		#[tokio::test]
 		async fn test_frame_sign_with_key_provider() -> Result<()> {
@@ -537,7 +637,9 @@ mod tests {
 		use crate::cms::signed_data::SignerIdentifier;
 		use crate::crypto::hash::Sha3_256;
 		use crate::crypto::sign::ecdsa::Secp256k1Signature;
-		use crate::crypto::sign::{secp256k1_signer_identifier, SignatureAlgorithmIdentifier, Signer, SignerInfoExt};
+		use crate::crypto::sign::{
+			secp256k1_signer_identifier, sign_canonical, SignatureAlgorithmIdentifier, SignerInfoExt,
+		};
 		use crate::der::oid::AssociatedOid;
 		use crate::error::Result;
 		use crate::spki::AlgorithmIdentifierOwned;
@@ -558,8 +660,10 @@ mod tests {
 			let frame = unsigned_frame()?;
 			let signing_key = create_test_signing_key();
 
+			// External backends must follow the canonical convention:
+			// SHA3-256 over the TBS bytes, ECDSA over that prehash.
 			let tbs = frame.to_tbs()?;
-			let signature: Secp256k1Signature = signing_key.sign(&tbs);
+			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;
 
 			let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
 			let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
@@ -568,7 +672,7 @@ mod tests {
 			let signed = frame.attach_signature(signature.to_bytes(), sig_alg, digest_alg, sid)?;
 			assert!(signed.nonrepudiation.is_some());
 
-			signed.verify::<Secp256k1Signature>(signing_key.verifying_key())?;
+			signed.verify::<Secp256k1Signature, Sha3_256>(signing_key.verifying_key())?;
 
 			Ok(())
 		}
@@ -579,7 +683,7 @@ mod tests {
 			let signing_key = create_test_signing_key();
 
 			let tbs = frame.to_tbs()?;
-			let signature: Secp256k1Signature = signing_key.sign(&tbs);
+			let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, &tbs)?;
 
 			let sig_alg = AlgorithmIdentifierOwned { oid: Secp256k1Signature::ALGORITHM_OID, parameters: None };
 			let digest_alg = AlgorithmIdentifierOwned { oid: Sha3_256::OID, parameters: None };
@@ -590,7 +694,7 @@ mod tests {
 			assert!(matches!(signer_info.sid, SignerIdentifier::SubjectKeyIdentifier(_)));
 
 			let signed = frame.attach_signer_info(signer_info);
-			signed.verify::<Secp256k1Signature>(signing_key.verifying_key())?;
+			signed.verify::<Secp256k1Signature, Sha3_256>(signing_key.verifying_key())?;
 
 			Ok(())
 		}

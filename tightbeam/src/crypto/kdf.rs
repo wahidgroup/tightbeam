@@ -130,8 +130,36 @@ crate::define_oid_wrapper!(
 	"2.16.840.1.101.3.4.2.8"
 );
 
+/// Reject key sizes below `MIN_KEY_SIZE` (too weak for cryptographic use).
+///
+/// Shared by the const-generic and dynamic entry points of every provider so
+/// the two cannot diverge on validation.
+#[inline]
+fn assert_min_key_size(key_size: usize) -> Result<()> {
+	if key_size < MIN_KEY_SIZE {
+		return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
+	}
+
+	Ok(())
+}
+
+/// Reject key sizes outside `[MIN_KEY_SIZE, MAX_HKDF_OUTPUT_SIZE]`.
+///
+/// HKDF-provider counterpart of [`assert_min_key_size`]: HKDF output is
+/// additionally capped by this crate's `MAX_HKDF_OUTPUT_SIZE` policy.
+#[inline]
+fn assert_hkdf_key_size(key_size: usize) -> Result<()> {
+	if !(MIN_KEY_SIZE..=MAX_HKDF_OUTPUT_SIZE).contains(&key_size) {
+		return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
+	}
+
+	Ok(())
+}
+
 impl KdfFunction for HkdfSha3_256 {
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
+		assert_hkdf_key_size(N)?;
+
 		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
 		let mut output = Zeroizing::new([0u8; N]);
 
@@ -141,9 +169,7 @@ impl KdfFunction for HkdfSha3_256 {
 	}
 
 	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<Zeroizing<Vec<u8>>> {
-		if !(MIN_KEY_SIZE..=MAX_HKDF_OUTPUT_SIZE).contains(&key_size) {
-			return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
-		}
+		assert_hkdf_key_size(key_size)?;
 
 		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
 		let mut okm = vec![0u8; key_size];
@@ -163,11 +189,11 @@ impl KdfFunction for HkdfSha3_256 {
 		if N * 2 > MAX_HKDF_OUTPUT_SIZE {
 			return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
 		}
-		// Optimized implementation: single HKDF expansion for both keys
-		// This is functionally equivalent to separate derivations but more
-		// efficient ECIES standards require separate encryption/MAC keys,
-		// which this provides by splitting the expanded output into two
-		// distinct key portions
+
+		// Single HKDF expansion, split into two distinct key portions. ECIES
+		// standards require separate encryption/MAC keys: one expansion of
+		// 2N bytes is functionally equivalent to two separate derivations
+		// while invoking HKDF once.
 		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
 		let mut combined = Zeroizing::new([0u8; MAX_HKDF_OUTPUT_SIZE]);
 		hk.expand(info, &mut combined[..N * 2]).map_err(KdfError::DerivationFailed)?;
@@ -186,6 +212,8 @@ pub struct X963Sha3_256;
 
 impl KdfFunction for X963Sha3_256 {
 	fn derive_key<const N: usize>(ikm: &[u8], info: &[u8], _salt: Option<&[u8]>) -> Result<ZeroizingArray<N>> {
+		assert_min_key_size(N)?;
+
 		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
 		let mut out = Zeroizing::new([0u8; N]);
 		let mut offset = 0usize;
@@ -217,9 +245,7 @@ impl KdfFunction for X963Sha3_256 {
 		_salt: Option<&[u8]>,
 		key_size: usize,
 	) -> Result<Zeroizing<Vec<u8>>> {
-		if key_size < MIN_KEY_SIZE {
-			return Err(KdfError::DerivationFailed(crate::crypto::hkdf::InvalidLength));
-		}
+		assert_min_key_size(key_size)?;
 
 		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
 		let mut out = vec![0u8; key_size];
@@ -252,41 +278,29 @@ impl KdfFunction for X963Sha3_256 {
 }
 
 /// Errors specific to KDF operations
-#[cfg_attr(feature = "derive", derive(crate::Errorizable))]
+///
+/// Deliberately does not derive `Errorizable`: this module builds without
+/// the `derive` feature, so the message strings live in exactly one place --
+/// the `impl_error_display!` block below.
 #[derive(Debug, Clone)]
 pub enum KdfError {
 	/// Key derivation failed (HKDF expansion error)
-	#[cfg_attr(feature = "derive", error("Key derivation failed: {0}"))]
 	DerivationFailed(crate::crypto::hkdf::InvalidLength),
 
 	/// Invalid ephemeral public key length
-	#[cfg_attr(
-		feature = "derive",
-		error("Invalid ephemeral public key length: expected 33 or 65 bytes, got {0}")
-	)]
 	InvalidPublicKeyLength(usize),
 
 	/// Invalid shared secret length
-	#[cfg_attr(
-		feature = "derive",
-		error("Invalid shared secret length: expected 32 bytes, got {0}")
-	)]
 	InvalidSharedSecretLength(usize),
 
 	/// Invalid salt length
-	#[cfg_attr(
-		feature = "derive",
-		error("Invalid salt length: must be at least 16 bytes, got {0}")
-	)]
 	InvalidSaltLength(usize),
 
 	/// Secret material was unavailable during derivation
-	#[cfg_attr(feature = "derive", error("Secret unavailable: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
 	SecretUnavailable(crate::crypto::secret::SecretError),
 }
 
-crate::impl_error_display!(KdfError {
+crate::impl_error_display!(unconditional KdfError {
 	DerivationFailed(e) => "Key derivation failed: {e}",
 	InvalidPublicKeyLength(len) => "Invalid ephemeral public key length: expected 33 or 65 bytes, got {len}",
 	InvalidSharedSecretLength(len) => "Invalid shared secret length: expected 32 bytes, got {len}",
@@ -294,7 +308,6 @@ crate::impl_error_display!(KdfError {
 	SecretUnavailable(e) => "Secret unavailable: {e}",
 });
 
-#[cfg(not(feature = "derive"))]
 crate::impl_from!(crate::crypto::secret::SecretError => KdfError::SecretUnavailable);
 
 // ============================================================================
@@ -388,7 +401,8 @@ pub fn ecies_kdf<P: KdfFunction>(
 /// - Key of length `N`
 ///
 /// Safety
-/// - `N` SHOULD be >= 16 bytes for cryptographic use.
+/// - `N` MUST be >= [`MIN_KEY_SIZE`]; the provider rejects smaller sizes
+///   with [`KdfError::DerivationFailed`].
 pub fn hkdf<P: KdfFunction, const N: usize>(
 	ikm: impl AsRef<[u8]>,
 	info: impl AsRef<[u8]>,
@@ -688,6 +702,20 @@ mod tests {
 		assert_key_pair_lengths!(k_enc_32, k_mac_32, 32);
 		assert_keys_different!(k_enc_32, k_mac_32);
 		Ok(())
+	}
+
+	// Both derive_key entry points must enforce the same bounds as their
+	// derive_dynamic_key counterparts: sub-MIN_KEY_SIZE outputs are rejected
+	// for both providers, and the HKDF provider also rejects outputs beyond
+	// MAX_HKDF_OUTPUT_SIZE.
+	#[test]
+	fn test_derive_key_bounds_match_dynamic() {
+		let hkdf_below_min = HkdfSha3_256::derive_key::<8>(b"ikm", b"info", None);
+		let hkdf_above_max = HkdfSha3_256::derive_key::<129>(b"ikm", b"info", None);
+		let x963_below_min = X963Sha3_256::derive_key::<8>(b"ikm", b"info", None);
+		assert!(matches!(hkdf_below_min, Err(KdfError::DerivationFailed(_))));
+		assert!(matches!(hkdf_above_max, Err(KdfError::DerivationFailed(_))));
+		assert!(matches!(x963_below_min, Err(KdfError::DerivationFailed(_))));
 	}
 
 	// SharedInfo longer than the former fixed 256-byte buffer must derive

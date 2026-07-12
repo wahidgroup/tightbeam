@@ -552,16 +552,20 @@ macro_rules! tb_scenario {
 
 						// Merge verdicts: spec exploration + trace validation
 						verdict.trace_refines = trace_verdict.trace_refines;
+						verdict.failures_refines = trace_verdict.failures_refines;
 						verdict.divergence_refines = trace_verdict.divergence_refines;
 						verdict.trace_refinement_witness = trace_verdict.trace_refinement_witness;
+						verdict.failures_refinement_witness = trace_verdict.failures_refinement_witness;
 						verdict.divergence_refinement_witness = trace_verdict.divergence_refinement_witness;
-						verdict.passed = verdict.passed && trace_verdict.trace_refines && trace_verdict.divergence_refines;
+						verdict.complete = verdict.complete && trace_verdict.complete;
+						verdict.passed = verdict.passed && trace_verdict.passed;
 					}
 					verdict
 				} else {
 					// Mode B: No CSP spec - explore runtime trace
 					let trace_process = hook_ctx.trace.to_process();
 					let fdr_cfg_arc = std::sync::Arc::clone(fdr_cfg);
+
 					let mut explorer = DefaultFdrExplorer::with_defaults(&trace_process, fdr_cfg_arc);
 					explorer.explore()
 				};
@@ -836,6 +840,8 @@ macro_rules! tb_scenario {
 		let exec_result = $crate::testing::macros::__tb_call_exec_closure_arc($exec_closure, std::sync::Arc::clone(&trace));
 
 		// Build hook context and verify
+		// `mut` only used when testing-fdr + testing-timing set timing_constraints below.
+		#[allow(unused_mut)]
 		let mut hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, exec_result);
 
 		// Extract timing constraints from FDR specs if available (Bare-specific)

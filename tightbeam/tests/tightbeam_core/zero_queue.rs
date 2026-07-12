@@ -156,6 +156,7 @@ impl ChainState {
 
 		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata.order > prev);
 		let valid = prev_ok && order_ok;
+
 		self.trace.event_with("chain_valid", &[QUEUE_TAG], valid)?;
 
 		if valid {
@@ -185,6 +186,7 @@ impl DedupBook {
 	fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		let key = (frame.metadata.id.clone(), frame.metadata.order);
 		let mut guard = self.seen.lock().expect("seen-set mutex not poisoned");
+
 		let inserted = guard.insert(key);
 		if inserted {
 			self.trace.event_with("dedup_kept", &[QUEUE_TAG], true)?;
@@ -305,6 +307,7 @@ impl QueueHarness {
 		}
 
 		self.chain.record(frame)?;
+
 		let worker = self.priority.assign(frame)?;
 		self.trace.event_with("worker_commit", &[QUEUE_TAG], worker as u64)?;
 		self.trace.event_with("response_ready", &[QUEUE_TAG], frame.metadata.order)?;
@@ -317,17 +320,20 @@ fn default_batch() -> WorkBatch {
 	batch.push(b"critical-order", MessagePriority::Expedited);
 	batch.push(b"normal-scan", MessagePriority::Standard);
 	batch.push(b"high-followup", MessagePriority::LowLatency);
+
 	batch
 }
 
 servlet! {
 	QueueServlet<WorkOrder, EnvConfig = BackPressureStats>,
 	protocol: TokioListener,
-	handle: |frame, ctx| async move {
+	handle: |_msg, frame, ctx| async move {
 		let trace = ctx.trace();
+
 		// Process the frame - collector gate handles back-pressure automatically
 		let harness = QueueHarness::new(Arc::clone(trace));
 		harness.handle(&frame)?;
+
 		Ok(None)
 	}
 }
@@ -397,6 +403,7 @@ tb_scenario! {
 						return Err(err);
 					}
 				};
+
 				prev_hash = Some(digest);
 
 				trace.event_with("adaptive_behavior", &[QUEUE_TAG], spec.order)?;

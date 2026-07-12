@@ -3,6 +3,9 @@
 //! Constructs complete CMS EnvelopedData messages with encrypted content using
 //! KeyAgreeRecipientInfo for key transport.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use super::kari::TightBeamKariBuilder;
 use crate::cms::builder::RecipientInfoBuilder;
 use crate::cms::content_info::{CmsVersion, ContentInfo};

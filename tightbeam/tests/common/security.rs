@@ -6,9 +6,13 @@ use std::sync::Arc;
 
 use tightbeam::{
 	crypto::{
+		hash::Sha3_256,
 		key::{Secp256k1KeyProvider, SigningKeyProvider},
+		policy::Secp256k1Policy,
 		profiles::{SecurityProfileDesc, TightbeamProfile},
 		sign::ecdsa::Secp256k1SigningKey,
+		x509::policy::{CertificateValidation, DirectTrustValidator},
+		x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 	},
 	oids::{AES_128_GCM, AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256},
 	random::OsRng,
@@ -58,6 +62,25 @@ impl ServerMaterials {
 	}
 }
 
+/// Direct-trust validator pinning the given server certificate.
+///
+/// Handshake clients fail closed without a validator (CWE-295), so every
+/// session pins the identity of the server it orchestrates against.
+pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
+	let trust_chain = vec![certificate.clone()];
+	let data = DirectTrustValidator::default().with_trust_chain(trust_chain);
+
+	Arc::new(data)
+}
+
+/// Trust store pinning the given server certificate (for CMS clients).
+pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
+	let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		.with_certificate(certificate.clone())?
+		.build();
+	Ok(Arc::new(store))
+}
+
 /// Deterministic signing key (fixed seed) for stable single-identity fixtures.
 pub fn deterministic_signing_key() -> Secp256k1SigningKey {
 	create_test_signing_key()
@@ -81,7 +104,7 @@ pub fn default_security_profile() -> SecurityProfileDesc {
 /// Strong profile (AES-256-GCM) for downgrade testing.
 pub fn strong_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		digest: HASH_SHA3_256,
+		digest: Some(HASH_SHA3_256),
 		aead: Some(AES_256_GCM),
 		aead_key_size: Some(32),
 		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),
@@ -95,7 +118,7 @@ pub fn strong_security_profile() -> SecurityProfileDesc {
 /// Weak profile (AES-128-GCM) for downgrade testing.
 pub fn weak_security_profile() -> SecurityProfileDesc {
 	SecurityProfileDesc {
-		digest: HASH_SHA3_256,
+		digest: Some(HASH_SHA3_256),
 		aead: Some(AES_128_GCM),
 		aead_key_size: Some(16),
 		signature: Some(SIGNER_ECDSA_WITH_SHA3_256),

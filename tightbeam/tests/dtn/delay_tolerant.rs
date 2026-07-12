@@ -1,6 +1,6 @@
 //! Comprehensive multi-hop DTN test demonstrating tightbeam's delay tolerance
 //!
-//! ## Test Scenario: Earth → Relay → Mars Communication
+//! ## Test Scenario: Earth -> Relay -> Mars Communication
 //!
 //! This test simulates realistic interplanetary communication with:
 //! - **20-minute delays** between each hop (simulating light-speed delays)
@@ -267,4 +267,3 @@ async fn dtn_comparison_traditional_vs_tightbeam() -> Result<(), TightBeamError>
 
 	Ok(())
 }
-

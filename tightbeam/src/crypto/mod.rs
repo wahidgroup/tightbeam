@@ -38,7 +38,7 @@ pub mod commitment;
 pub mod curves;
 #[cfg(feature = "ecies")]
 pub mod ecies;
-#[cfg(feature = "digest")]
+#[cfg(any(feature = "digest", feature = "sha3"))]
 pub mod hash;
 #[cfg(feature = "kdf")]
 pub mod kdf;
@@ -54,8 +54,5 @@ pub use crypto_common as common;
 
 #[cfg(feature = "kdf")]
 pub use hkdf;
-
 #[cfg(feature = "secp256k1")]
-pub const ECDSA_PUBKEY_SIZE: usize = 33;
-#[cfg(feature = "secp256k1")]
-pub const ECDSA_SECRET_SIZE: usize = 32;
+pub use k256;

@@ -99,6 +99,13 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Missing server key"))]
 	MissingServerKey,
 
+	/// No trust store / certificate validator configured
+	#[cfg_attr(
+		feature = "derive",
+		error("Trust store required: refusing expiry-only peer certificate validation")
+	)]
+	MissingTrustStore,
+
 	/// Missing server certificate
 	#[cfg_attr(feature = "derive", error("Missing server certificate"))]
 	MissingServerCertificate,
@@ -110,6 +117,13 @@ pub enum HandshakeError {
 	/// Invalid transcript hash length or format
 	#[cfg_attr(feature = "derive", error("Invalid transcript hash"))]
 	InvalidTranscriptHash,
+
+	/// Digest output width does not match the required transcript hash width
+	#[cfg_attr(
+		feature = "derive",
+		error("Transcript digest length invalid: expected {expected} bytes, got {received}")
+	)]
+	TranscriptDigestLength { expected: usize, received: usize },
 
 	/// Server requires mutual authentication but client has no identity configured
 	#[cfg_attr(
@@ -124,6 +138,13 @@ pub enum HandshakeError {
 		error("Peer identity changed during re-handshake - connection identity is immutable")
 	)]
 	PeerIdentityMismatch,
+
+	/// Provisioned certificate chain leaf does not match the pinned server certificate
+	#[cfg_attr(
+		feature = "derive",
+		error("Provisioned certificate chain leaf does not match pinned server certificate")
+	)]
+	PinnedCertificateMismatch,
 
 	/// Missing client random
 	#[cfg_attr(feature = "derive", error("Missing client random from ClientHello"))]
@@ -195,6 +216,11 @@ pub enum HandshakeError {
 	DuplicateAttribute,
 	#[cfg_attr(feature = "derive", error("Required attribute missing"))]
 	MissingAttribute,
+	#[cfg_attr(
+		feature = "derive",
+		error("Too many supported curves: {count} exceeds cap of {max}")
+	)]
+	TooManySupportedCurves { count: usize, max: usize },
 	#[cfg_attr(feature = "derive", error("Nonce value not valid OCTET STRING"))]
 	InvalidNonceEncoding,
 	#[cfg_attr(feature = "derive", error("Nonce length mismatch: {0}"))]
@@ -238,6 +264,11 @@ pub enum HandshakeError {
 		error("Invalid key size: expected {expected}, got {received}")
 	)]
 	InvalidKeySize { expected: usize, received: usize },
+	#[cfg_attr(
+		feature = "derive",
+		error("Ciphertext too short: {received} bytes (minimum {minimum} required)")
+	)]
+	CiphertextTooShort { minimum: usize, received: usize },
 	#[cfg_attr(feature = "derive", error("ASN.1 encoding error: {0}"))]
 	Asn1Error(der::Error),
 	#[cfg_attr(feature = "derive", error("Invalid recipient index"))]
@@ -262,6 +293,16 @@ pub enum HandshakeError {
 		error("Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)")
 	)]
 	UnsupportedKeyWrapAlgorithm,
+	#[cfg_attr(
+		feature = "derive",
+		error("Negotiated AEAD algorithm unsupported (expected AES-128/256 GCM)")
+	)]
+	UnsupportedAeadAlgorithm,
+	#[cfg_attr(
+		feature = "derive",
+		error("Peer aead_key_size {declared} does not match negotiated AEAD key size {expected}")
+	)]
+	AeadKeySizeMismatch { declared: usize, expected: usize },
 	#[cfg(all(feature = "builder", feature = "aead"))]
 	#[cfg_attr(feature = "derive", error("AES key wrap operation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -288,95 +329,89 @@ pub enum HandshakeError {
 	InvalidOctetStringLength(&'static str),
 }
 
-#[cfg(not(feature = "derive"))]
-impl core::fmt::Display for HandshakeError {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		match self {
-			HandshakeError::InvalidClientKeyExchange => write!(f, "Invalid client key exchange message"),
-			HandshakeError::InvalidServerKeyExchange => write!(f, "Invalid server key exchange message"),
-			HandshakeError::InvalidPublicKey(e) => write!(f, "Invalid public key in handshake: {}", e),
-			HandshakeError::CertificateValidationError(e) => write!(f, "Invalid certificate: {}", e),
-			HandshakeError::SpkiError(e) => write!(f, "SPKI error: {}", e),
-			HandshakeError::KeyError(e) => write!(f, "Key provider error: {}", e),
-			HandshakeError::CmsBuilderError(e) => write!(f, "CMS builder error: {}", e),
-			HandshakeError::SignatureVerificationFailed => write!(f, "Handshake signature verification failed"),
-			HandshakeError::KeyDerivationFailed(e) => write!(f, "Handshake key derivation failed: {}", e),
-			HandshakeError::InvalidState => write!(f, "Invalid handshake state"),
-			HandshakeError::MissingServerKey => write!(f, "Missing server key"),
-			HandshakeError::MissingServerCertificate => write!(f, "Missing server certificate"),
-			HandshakeError::MissingClientCertificate => write!(f, "Missing client certificate"),
-			HandshakeError::InvalidTranscriptHash => write!(f, "Invalid transcript hash"),
-			HandshakeError::MissingClientRandom => write!(f, "Missing client random from ClientHello"),
-			HandshakeError::MissingBaseSessionKey => write!(f, "Missing base session key"),
-			HandshakeError::MissingClientRandomState => write!(f, "Missing client random"),
-			HandshakeError::MissingServerRandom => write!(f, "Missing server random"),
-			HandshakeError::InsufficientSaltEntropy { actual, minimum } => {
-				write!(f, "CMS salt too short: {} bytes (minimum {} required)", actual, minimum)
-			}
-			HandshakeError::AbortReceived(alert) => write!(f, "Handshake aborted by peer: {:?}", alert),
-			HandshakeError::Timeout => write!(f, "Handshake timeout"),
-			HandshakeError::InvalidProfileSelection => write!(f, "Server selected profile not in client's offer"),
-			HandshakeError::NegotiationError(e) => write!(f, "Profile negotiation failed: {}", e),
-			HandshakeError::NoMutualProfiles => write!(f, "No mutually supported cryptographic profiles found"),
-			HandshakeError::NoSupportedProfiles => {
-				write!(f, "Dealer's choice failed: no supported profiles configured")
-			}
-			HandshakeError::NegotiationRequired => {
-				write!(f, "Profile negotiation required but no profiles configured on server")
-			}
-			HandshakeError::CertificatePolicyError(e) => write!(f, "Certificate rejected by policy: {}", e),
-			HandshakeError::DerError(e) => write!(f, "DER error: {}", e),
-			HandshakeError::InvalidAttributeArity => write!(f, "Attribute must contain exactly one value"),
-			HandshakeError::DuplicateAttribute => write!(f, "Duplicate attribute present"),
-			HandshakeError::MissingAttribute => write!(f, "Required attribute missing"),
-			HandshakeError::InvalidNonceEncoding => write!(f, "Nonce value not valid OCTET STRING"),
-			HandshakeError::NonceLengthError(e) => write!(f, "Nonce length mismatch: {}", e),
-			HandshakeError::OctetStringLengthError(e) => write!(f, "OCTET STRING length mismatch: {}", e),
-			HandshakeError::InvalidIntegerEncoding => write!(f, "Version/alert value not valid INTEGER"),
-			HandshakeError::IntegerOutOfRange => write!(f, "INTEGER out of range"),
-			HandshakeError::UnknownAlertCode(code) => write!(f, "Unknown alert code: {code}"),
-			HandshakeError::CertificateNotYetValid => write!(f, "Certificate not yet valid"),
-			HandshakeError::CertificateExpired => write!(f, "Certificate expired"),
-			HandshakeError::InvalidTimestamp => write!(f, "Invalid timestamp"),
-			HandshakeError::EciesError(e) => write!(f, "ECIES operation failed: {}", e),
-			HandshakeError::MissingEncryptedContent => write!(f, "Missing encrypted content in ECIES message"),
-			HandshakeError::InvalidDecryptedPayloadSize => write!(f, "Invalid decrypted payload size"),
-			HandshakeError::ClientRandomMismatchReplay => write!(f, "client_random mismatch - possible replay attack"),
-			HandshakeError::EcdhFailed => write!(f, "ECDH operation failed"),
-			HandshakeError::KdfError => write!(f, "KDF operation failed"),
-			HandshakeError::InvalidKeySize { expected, received } => {
-				write!(f, "Invalid key size: expected {}, got {}", expected, received)
-			}
-			HandshakeError::Asn1Error(e) => write!(f, "ASN.1 encoding error: {}", e),
-			HandshakeError::InvalidRecipientIndex => write!(f, "Invalid recipient index"),
-			HandshakeError::MissingUkm => write!(f, "Missing UKM in KeyAgreeRecipientInfo"),
-			HandshakeError::InvalidOriginatorPublicKey => write!(f, "Failed to parse originator public key"),
-			HandshakeError::UnsupportedOriginatorIdentifier => write!(f, "Unsupported originator identifier type"),
-			HandshakeError::KariBuilderConsumed => write!(f, "KARI builder already consumed"),
-			HandshakeError::MissingContentEncryptionAlgorithm => write!(f, "Content encryption algorithm not set"),
-			HandshakeError::MissingKeyWrapAlgorithm => {
-				write!(f, "Key wrap algorithm not configured in security profile")
-			}
-			HandshakeError::UnsupportedKeyWrapAlgorithm => {
-				write!(
-					f,
-					"Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)"
-				)
-			}
-			#[cfg(all(feature = "builder", feature = "aead"))]
-			HandshakeError::AesKeyWrap(e) => write!(f, "AES key wrap operation failed: {}", e),
-			HandshakeError::RandomGenerationFailed => write!(f, "Random generation failed"),
-			HandshakeError::SecretUnavailable(e) => write!(f, "Secret unavailable: {}", e),
-			HandshakeError::InvalidOctetStringLength(m) => write!(f, "Invalid OCTET STRING length: {}", m),
-			HandshakeError::NonceLengthError(e) => write!(f, "Nonce length mismatch: {}", e),
-			HandshakeError::OctetStringLengthError(e) => write!(f, "OCTET STRING length mismatch: {}", e),
-			HandshakeError::UnknownAlertCode(code) => write!(f, "Unknown alert code: {code}"),
-		}
-	}
-}
+// Mirrors the `#[error(...)]` strings above; compiled only without `derive`.
+crate::impl_error_display!(HandshakeError {
+	TranscriptAlreadyLocked => "Handshake invariant violation: transcript already locked",
+	TranscriptNotLocked => "Handshake invariant violation: transcript not locked",
+	AeadAlreadyDerived => "Handshake invariant violation: AEAD key already derived",
+	FinishedAlreadySent => "Handshake invariant violation: Finished already sent",
+	FinishedBeforeTranscriptLock => "Handshake invariant violation: Finished before transcript lock",
+	InvalidClientKeyExchange => "Invalid client key exchange message",
+	InvalidServerKeyExchange => "Invalid server key exchange message",
+	InvalidPublicKey(e) => "Invalid public key in handshake: {e}",
+	CertificateValidationError(e) => "Invalid certificate: {e}",
+	SignatureVerificationFailed => "Handshake signature verification failed",
+	SignatureError(e) => "Signature error: {e}",
+	KeyDerivationFailed(e) => "Handshake key derivation failed: {e}",
+	DerError(e) => "DER error: {e}",
+	SpkiError(e) => "SPKI error: {e}",
+	KeyError(e) => "Key provider error: {e}",
+	CmsBuilderError(e) => "CMS builder error: {e}",
+	InvalidState => "Invalid handshake state",
+	MissingServerKey => "Missing server key",
+	MissingTrustStore => "Trust store required: refusing expiry-only peer certificate validation",
+	MissingServerCertificate => "Missing server certificate",
+	MissingClientCertificate => "Missing client certificate",
+	InvalidTranscriptHash => "Invalid transcript hash",
+	TranscriptDigestLength { expected, received } => "Transcript digest length invalid: expected {expected} bytes, got {received}",
+	MutualAuthRequired => "Server requires mutual authentication but client has no identity",
+	PeerIdentityMismatch => "Peer identity changed during re-handshake - connection identity is immutable",
+	PinnedCertificateMismatch => "Provisioned certificate chain leaf does not match pinned server certificate",
+	MissingClientRandom => "Missing client random from ClientHello",
+	MissingBaseSessionKey => "Missing base session key",
+	MissingClientRandomState => "Missing client random",
+	MissingServerRandom => "Missing server random",
+	InsufficientSaltEntropy { actual, minimum } => "CMS salt too short: {actual} bytes (minimum {minimum} required)",
+	AbortReceived(alert) => "Handshake aborted by peer: {alert:?}",
+	Timeout => "Handshake timeout",
+	InvalidProfileSelection => "Server selected profile not in client's offer",
+	NegotiationError(e) => "Profile negotiation failed: {e}",
+	NoMutualProfiles => "No mutually supported cryptographic profiles found",
+	NoSupportedProfiles => "Dealer's choice failed: no supported profiles configured",
+	NegotiationRequired => "Profile negotiation required but no profiles configured on server",
+	CertificatePolicyError(e) => "Certificate rejected by policy: {e}",
+	InvalidAttributeArity => "Attribute must contain exactly one value",
+	DuplicateAttribute => "Duplicate attribute present",
+	MissingAttribute => "Required attribute missing",
+	TooManySupportedCurves { count, max } => "Too many supported curves: {count} exceeds cap of {max}",
+	InvalidNonceEncoding => "Nonce value not valid OCTET STRING",
+	NonceLengthError(e) => "Nonce length mismatch: {e}",
+	OctetStringLengthError(e) => "OCTET STRING length mismatch: {e}",
+	InvalidIntegerEncoding => "Version/alert value not valid INTEGER",
+	IntegerOutOfRange => "INTEGER out of range",
+	UnknownAlertCode(code) => "Unknown alert code: {code:?}",
+	CertificateNotYetValid => "Certificate not yet valid",
+	CertificateExpired => "Certificate expired",
+	InvalidTimestamp => "Invalid timestamp",
+	MissingEncryptedContent => "Missing encrypted content in ECIES message",
+	InvalidDecryptedPayloadSize => "Invalid decrypted payload size",
+	ClientRandomMismatchReplay => "client_random mismatch - possible replay attack",
+	EcdhFailed => "ECDH operation failed",
+	KdfError => "KDF operation failed",
+	InvalidKeySize { expected, received } => "Invalid key size: expected {expected}, got {received}",
+	CiphertextTooShort { minimum, received } => "Ciphertext too short: {received} bytes (minimum {minimum} required)",
+	Asn1Error(e) => "ASN.1 encoding error: {e}",
+	InvalidRecipientIndex => "Invalid recipient index",
+	MissingUkm => "Missing UKM in KeyAgreeRecipientInfo",
+	InvalidOriginatorPublicKey => "Failed to parse originator public key",
+	UnsupportedOriginatorIdentifier => "Unsupported originator identifier type",
+	KariBuilderConsumed => "KARI builder already consumed",
+	MissingContentEncryptionAlgorithm => "Content encryption algorithm not set",
+	MissingKeyWrapAlgorithm => "Key wrap algorithm not configured in security profile",
+	UnsupportedKeyWrapAlgorithm => "Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)",
+	UnsupportedAeadAlgorithm => "Negotiated AEAD algorithm unsupported (expected AES-128/256 GCM)",
+	AeadKeySizeMismatch { declared, expected } => "Peer aead_key_size {declared} does not match negotiated AEAD key size {expected}",
+	RandomGenerationFailed => "Random generation failed",
+	SecretUnavailable(e) => "Secret unavailable: {e}",
+	InvalidOctetStringLength(m) => "Invalid OCTET STRING length: {m}",
 
-#[cfg(not(feature = "derive"))]
-impl core::error::Error for HandshakeError {}
+	#[cfg(feature = "ecies")]
+	EciesError(e) => "ECIES operation failed: {e}",
+	#[cfg(all(feature = "builder", feature = "aead"))]
+	AesKeyWrap(e) => "AES key wrap operation failed: {e}",
+	#[cfg(feature = "kem")]
+	HybridKariIntegrityCheckFailed => "Hybrid key agreement integrity check failed: combined ECDH+KEM key validation error",
+});
 
 impl From<crate::crypto::kdf::KdfError> for HandshakeError {
 	fn from(_: crate::crypto::kdf::KdfError) -> Self {

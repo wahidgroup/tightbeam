@@ -18,10 +18,14 @@
 //! The `kari_wrap_hybrid` and `kari_unwrap_hybrid` functions combine classical
 //! ECDH with post-quantum KEM shared secrets for hybrid security. This is useful
 //! for protocols like PQXDH that require both classical and post-quantum strength.
+//! UNSTABLE: no orchestrator consumes them yet; gated behind `unstable-pqxdh`.
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile};
-use crate::crypto::secret::Secret;
+use crate::crypto::secret::SecretSlice;
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::subtle::ConstantTimeEq;
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey, SecretKey};
@@ -33,16 +37,16 @@ use crate::zeroize::Zeroizing;
 #[cfg(feature = "ecdh")]
 use crate::crypto::sign::elliptic_curve::ecdh::diffie_hellman;
 
-/// Derive the shared secret via ECDH and wrap in Secret<Vec<u8>> for automatic zeroization.
-fn derive_shared_secret<C>(priv_key: &SecretKey<C>, peer_pub: &PublicKey<C>) -> Result<Secret<Vec<u8>>, HandshakeError>
+/// Derive the shared secret via ECDH and wrap in [`SecretSlice`] for automatic zeroization.
+fn derive_shared_secret<C>(priv_key: &SecretKey<C>, peer_pub: &PublicKey<C>) -> Result<SecretSlice<u8>, HandshakeError>
 where
 	C: Curve + CurveArithmetic,
 	<C as Curve>::FieldBytesSize: ModulusSize,
 	AffinePoint<C>: FromEncodedPoint<C> + ToEncodedPoint<C>,
 {
 	let shared = diffie_hellman(priv_key.to_nonzero_scalar(), peer_pub.as_affine());
-	let vec = shared.raw_secret_bytes().as_ref().to_vec();
-	Ok(vec.into())
+	// Move the copy straight into SecretSlice so no plain binding outlives this line
+	Ok(SecretSlice::from(shared.raw_secret_bytes().as_ref().to_vec()))
 }
 
 /// Map a negotiated AES key-wrap OID to its KEK byte length.
@@ -70,7 +74,7 @@ pub(crate) fn key_wrap_key_size<P: CryptoProvider>() -> Result<usize, HandshakeE
 /// Derive a KEK of `key_size` bytes using the provider's HKDF
 /// (shared_secret as IKM, UKM as salt, info as context).
 pub(crate) fn derive_kek<P>(
-	shared_secret: &Secret<Vec<u8>>,
+	shared_secret: &SecretSlice<u8>,
 	ukm: &[u8],
 	kdf_info: &[u8],
 	key_size: usize,
@@ -82,8 +86,8 @@ where
 		return Err(HandshakeError::MissingUkm);
 	}
 
-	let kek = shared_secret
-		.with(|ss| <P::Kdf as KdfFunction>::derive_dynamic_key(ss.as_ref(), kdf_info, Some(ukm), key_size))??;
+	let kek =
+		shared_secret.with(|ss| <P::Kdf as KdfFunction>::derive_dynamic_key(ss, kdf_info, Some(ukm), key_size))??;
 	Ok(kek)
 }
 
@@ -220,7 +224,7 @@ where
 ///
 /// # Returns
 /// Wrapped CEK bytes (RFC 3394 format)
-#[cfg(feature = "kem")]
+#[cfg(all(feature = "kem", feature = "unstable-pqxdh"))]
 pub fn kari_wrap_hybrid<P, C>(
 	provider: &P,
 	sender_ec_priv: &SecretKey<C>,
@@ -265,7 +269,7 @@ where
 ///
 /// # Returns
 /// Unwrapped CEK bytes
-#[cfg(feature = "kem")]
+#[cfg(all(feature = "kem", feature = "unstable-pqxdh"))]
 pub fn kari_unwrap_hybrid<P, C>(
 	provider: &P,
 	recipient_ec_priv: &SecretKey<C>,

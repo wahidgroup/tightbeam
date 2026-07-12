@@ -3,8 +3,10 @@ pub mod policy;
 pub mod store;
 pub mod utils;
 
-// Re-exports
-pub use x509_cert::*;
+pub use x509_cert::{attr, ext, name, serial_number, time, Certificate, TbsCertificate, Version};
+
+#[cfg(feature = "builder")]
+pub use x509_cert::builder;
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};

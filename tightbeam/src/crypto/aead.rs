@@ -7,6 +7,7 @@ pub use aes_kw;
 
 use crate::asn1::ObjectIdentifier;
 use crate::crypto::common::typenum::Unsigned;
+use crate::crypto::secret::SecretSlice;
 use crate::der::oid::AssociatedOid;
 
 #[cfg(not(feature = "std"))]
@@ -143,9 +144,14 @@ fn build_encrypted_content_info(
 
 /// Extract nonce and ciphertext from EncryptedContentInfo.
 ///
-/// Returns (nonce_bytes, ciphertext_bytes) extracted from the info structure.
+/// Both slices borrow directly from `info`. The nonce length is validated
+/// against `expected_nonce_len`: NIST SP 800-38D §8.2 fixes the GCM nonce at
+/// the cipher's nonce size (96 bits for AES-GCM here).
 #[inline]
-fn extract_nonce_and_ciphertext(info: &crate::EncryptedContentInfo) -> crate::error::Result<(Vec<u8>, &[u8])> {
+fn extract_nonce_and_ciphertext(
+	info: &crate::EncryptedContentInfo,
+	expected_nonce_len: usize,
+) -> crate::error::Result<(&[u8], &[u8])> {
 	// Extract ciphertext
 	let ciphertext = info
 		.encrypted_content
@@ -160,9 +166,16 @@ fn extract_nonce_and_ciphertext(info: &crate::EncryptedContentInfo) -> crate::er
 		.as_ref()
 		.ok_or(crate::TightBeamError::MissingEncryptionInfo)?;
 
-	// Decode the nonce from the Any type - use decode_as to get the OctetString
-	let nonce_octet_string: crate::der::asn1::OctetString = nonce_any.decode_as()?;
-	Ok((nonce_octet_string.into_bytes(), ciphertext))
+	// Borrow the nonce bytes out of the Any without an owned OctetString copy
+	let nonce_octet_string: crate::der::asn1::OctetStringRef<'_> = nonce_any.decode_as()?;
+	let nonce = nonce_octet_string.as_bytes();
+	if nonce.len() != expected_nonce_len {
+		return Err(crate::TightBeamError::InvalidNonceLength(
+			(nonce.len(), expected_nonce_len).into(),
+		));
+	}
+
+	Ok((nonce, ciphertext))
 }
 
 // ============================================================================
@@ -185,9 +198,17 @@ where
 
 /// Trait for decrypting EncryptedContentInfo
 pub trait Decryptor {
-	/// Decrypt encrypted content info and return the plaintext bytes
-	/// The nonce is extracted from the algorithm parameters in the EncryptedContentInfo
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>>;
+	/// Decrypt encrypted content info and return the plaintext bytes.
+	/// The nonce is extracted from the algorithm parameters in the
+	/// EncryptedContentInfo and validated against the cipher's nonce size.
+	///
+	/// Algorithm binding: [`RuntimeAead`] rejects a `content_enc_alg.oid`
+	/// that differs from its negotiated OID. The blanket impl for bare
+	/// `Aead` ciphers has no OID to compare against (the RustCrypto cipher
+	/// types carry none), so callers of that impl pre-bind the cipher choice.
+	///
+	/// The plaintext is returned as a [`SecretSlice`] so it zeroizes on drop.
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>>;
 }
 
 // Implement Encryptor for any AEAD cipher
@@ -213,10 +234,10 @@ impl<A> Decryptor for A
 where
 	A: Aead,
 {
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
-		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info)?;
-		let plaintext = self.decrypt(nonce_bytes.as_slice().into(), ciphertext)?;
-		Ok(plaintext)
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>> {
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info, <A as AeadCore>::NonceSize::USIZE)?;
+		let plaintext = self.decrypt(nonce_bytes.into(), ciphertext)?;
+		Ok(SecretSlice::from(plaintext))
 	}
 }
 
@@ -242,11 +263,104 @@ impl RuntimeAead {
 	}
 }
 
-// Implement Decryptor for RuntimeAead
+// Implement Decryptor for RuntimeAead (see trait docs for algorithm binding)
 impl Decryptor for RuntimeAead {
-	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<Vec<u8>> {
-		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info)?;
-		let plaintext = self.cipher.decrypt_bytes(&nonce_bytes, ciphertext)?;
-		Ok(plaintext)
+	fn decrypt_content(&self, info: &crate::EncryptedContentInfo) -> crate::error::Result<SecretSlice<u8>> {
+		// Bind the wire-declared algorithm to the negotiated cipher: a
+		// mismatched OID must never reach key material (CWE-345).
+		if info.content_enc_alg.oid != self.oid {
+			return Err(crate::TightBeamError::UnexpectedAlgorithm(
+				(info.content_enc_alg.oid, self.oid).into(),
+			));
+		}
+
+		let (nonce_bytes, ciphertext) = extract_nonce_and_ciphertext(info, self.cipher.nonce_size())?;
+		let plaintext = self.cipher.decrypt_bytes(nonce_bytes, ciphertext)?;
+		Ok(SecretSlice::from(plaintext))
+	}
+}
+
+#[cfg(all(test, feature = "aes-gcm"))]
+mod tests {
+	use super::*;
+	use crate::error::ReceivedExpectedError;
+	use crate::TightBeamError;
+
+	const NONCE: [u8; 12] = [0x24; 12];
+	const PLAINTEXT: &[u8] = b"aead round trip";
+
+	fn test_cipher() -> Aes256Gcm {
+		Aes256Gcm::new(&[0x42u8; 32].into())
+	}
+
+	fn encrypted_info() -> crate::EncryptedContentInfo {
+		Encryptor::<Aes256GcmOid>::encrypt_content(&test_cipher(), PLAINTEXT, NONCE, None).unwrap()
+	}
+
+	/// Re-encode the algorithm parameters with a nonce of the given length.
+	fn with_nonce_len(mut info: crate::EncryptedContentInfo, len: usize) -> crate::EncryptedContentInfo {
+		let nonce = crate::der::asn1::OctetString::new(vec![0x24; len]).unwrap();
+		info.content_enc_alg.parameters = Some(crate::der::Any::encode_from(&nonce).unwrap());
+		info
+	}
+
+	#[test]
+	fn decrypt_content_round_trips() {
+		let plaintext = test_cipher().decrypt_content(&encrypted_info()).unwrap();
+		assert!(plaintext.with(|p| p == PLAINTEXT).unwrap());
+	}
+
+	#[test]
+	fn decrypt_content_rejects_short_nonce() {
+		let info = with_nonce_len(encrypted_info(), 8);
+		let result = test_cipher().decrypt_content(&info);
+		assert!(matches!(
+			result,
+			Err(TightBeamError::InvalidNonceLength(ReceivedExpectedError {
+				received: 8,
+				expected: 12
+			}))
+		));
+	}
+
+	#[test]
+	fn decrypt_content_rejects_long_nonce() {
+		let info = with_nonce_len(encrypted_info(), 16);
+		let result = test_cipher().decrypt_content(&info);
+		assert!(matches!(
+			result,
+			Err(TightBeamError::InvalidNonceLength(ReceivedExpectedError {
+				received: 16,
+				expected: 12
+			}))
+		));
+	}
+
+	#[test]
+	fn runtime_aead_round_trips() {
+		let runtime = RuntimeAead::new(test_cipher(), crate::oids::AES_256_GCM);
+		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None).unwrap();
+		let plaintext = runtime.decrypt_content(&info).unwrap();
+		assert!(plaintext.with(|p| p == PLAINTEXT).unwrap());
+	}
+
+	#[test]
+	fn runtime_aead_rejects_algorithm_oid_mismatch() {
+		let runtime = RuntimeAead::new(test_cipher(), crate::oids::AES_256_GCM);
+		let mut info = runtime.encrypt_content(PLAINTEXT, NONCE, None).unwrap();
+		info.content_enc_alg.oid = crate::oids::AES_128_GCM;
+
+		let result = runtime.decrypt_content(&info);
+		assert!(matches!(result, Err(TightBeamError::UnexpectedAlgorithm(_))));
+	}
+
+	#[test]
+	fn runtime_aead_rejects_wire_nonce_length() {
+		let runtime = RuntimeAead::new(test_cipher(), crate::oids::AES_256_GCM);
+		let info = runtime.encrypt_content(PLAINTEXT, NONCE, None).unwrap();
+		let info = with_nonce_len(info, 8);
+
+		let result = runtime.decrypt_content(&info);
+		assert!(matches!(result, Err(TightBeamError::InvalidNonceLength(_))));
 	}
 }

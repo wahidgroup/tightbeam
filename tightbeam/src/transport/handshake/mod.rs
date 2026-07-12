@@ -116,9 +116,17 @@
 //!
 //! ## State Machine
 //!
-//! Handshakes follow a strict state machine to prevent protocol violations:
-//! - **Client**: Init → HelloSent → KeyExchangeSent → Complete
-//! - **Server**: Init → ServerHelloSent → KeyExchangeReceived → Complete
+//! Handshakes follow a strict state machine to prevent protocol violations.
+//! Each role machine is deliberately the *union* of the ECIES and CMS message
+//! flows. The orchestrator owns selecting the correct sequence for its
+//! protocol (see [`state`]):
+//! - **Client**: Init -> HelloSent -> ServerHelloReceived -> KeyExchangeSent ->
+//!   ServerFinishedReceived -> ClientFinishedSent -> Completed, with ECIES
+//!   short-circuits Init -> KeyExchangeSent and KeyExchangeSent -> Completed
+//! - **Server**: Init -> ClientHelloReceived -> ServerHelloSent ->
+//!   KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived ->
+//!   Completed, with the matching ECIES short-circuits
+//! - Any non-terminal state may classify to the Aborted or Failed terminals
 //!
 //! Invalid state transitions return `HandshakeError::InvalidState`.
 
@@ -137,6 +145,9 @@ mod attributes;
 mod common;
 mod error;
 mod utils;
+
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -164,7 +175,7 @@ pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generat
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
 #[cfg(feature = "transport-cms")]
 pub use kari::{kari_unwrap, kari_wrap};
-#[cfg(all(feature = "transport-cms", feature = "kem"))]
+#[cfg(all(feature = "transport-cms", feature = "kem", feature = "unstable-pqxdh"))]
 pub use kari::{kari_unwrap_hybrid, kari_wrap_hybrid};
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
@@ -176,14 +187,9 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
-use crate::crypto::aead::{KeyInit, RuntimeAead};
+use crate::crypto::aead::RuntimeAead;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
-use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
-use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
-#[cfg(feature = "transport-ecies")]
-use crate::crypto::sign::SignatureEncoding;
-use crate::crypto::sign::Verifier;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Decode, Encode, Enumerated, Sequence};
@@ -192,8 +198,18 @@ use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 use crate::Beamable;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::aead::KeyInit;
 #[cfg(feature = "transport-ecies")]
 use crate::crypto::ecies::{EciesEphemeral, EciesMessageOps, EciesPublicKeyOps};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
+#[cfg(feature = "transport-ecies")]
+use crate::crypto::sign::SignatureEncoding;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::crypto::sign::Verifier;
 #[cfg(feature = "transport-cms")]
 use crate::crypto::x509::store::CertificateTrust;
 #[cfg(feature = "transport-cms")]
@@ -277,17 +293,12 @@ pub trait ServerHandshakeKey: Send + Sync {
 	/// The orchestrator borrows the encapsulated signing key, ensuring zero-copy
 	/// key management and proper encapsulation.
 	///
-	/// # Parameters
-	/// - `server_cert`: The server's certificate for key agreement
-	/// - `validators`: Optional certificate validators to apply to server certificate
-	///
 	/// # Returns
 	/// A CMS client handshake orchestrator that borrows the encapsulated key
 	#[cfg(feature = "transport-cms")]
 	fn create_cms_client(
 		&self,
-		server_cert: Arc<Certificate>,
-		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		config: CmsClientConfig,
 	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
 
 	/// Create a CMS server handshake orchestrator.
@@ -297,6 +308,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	///
 	/// # Parameters
 	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
+	/// - `supported_profiles`: Security profiles for negotiation
 	///
 	/// # Returns
 	/// A CMS server handshake orchestrator that borrows the encapsulated key
@@ -304,7 +316,55 @@ pub trait ServerHandshakeKey: Send + Sync {
 	fn create_cms_server(
 		&self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		supported_profiles: Vec<SecurityProfileDesc>,
 	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>;
+}
+
+/// Provisioned server identity for a CMS client handshake.
+///
+/// The session key is encrypted to the identity's leaf certificate, so it
+/// must be supplied up front rather than learned from the wire.
+#[cfg(feature = "transport-cms")]
+pub enum CmsServerIdentity {
+	/// A bare server certificate, evaluated directly against the trust store.
+	Certificate(Arc<Certificate>),
+	/// Full server chain, ordered root to leaf. Path validation runs over the
+	/// chain (RFC 5280 §6.1) and the leaf becomes the encryption target.
+	Chain(Arc<[Certificate]>),
+}
+
+#[cfg(feature = "transport-cms")]
+impl From<Arc<Certificate>> for CmsServerIdentity {
+	fn from(certificate: Arc<Certificate>) -> Self {
+		Self::Certificate(certificate)
+	}
+}
+
+#[cfg(feature = "transport-cms")]
+impl From<Arc<[Certificate]>> for CmsServerIdentity {
+	fn from(chain: Arc<[Certificate]>) -> Self {
+		Self::Chain(chain)
+	}
+}
+
+/// Configuration for a CMS client handshake orchestrator.
+///
+/// CMS is a key-transport handshake: the client encrypts the session key to
+/// the server's public key in its first message, so the server identity must
+/// be provisioned up front rather than learned from the wire.
+#[cfg(feature = "transport-cms")]
+pub struct CmsClientConfig {
+	/// The provisioned server identity the session key is encrypted to.
+	pub server_identity: CmsServerIdentity,
+	/// Trust store that authenticates the server identity. Mandatory:
+	/// a CMS handshake without a trust store cannot authenticate anyone
+	/// (CWE-295).
+	pub trust_store: Arc<dyn CertificateTrust>,
+	/// Profiles offered to the server for negotiation.
+	pub security_offer: Option<SecurityOffer>,
+	/// Client certificate embedded in the Finished message for mutual
+	/// authentication.
+	pub client_certificate: Option<Arc<Certificate>>,
 }
 
 /// Encapsulated server key manager for handshake protocols.
@@ -386,9 +446,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 		P::Signature: SignatureEncoding,
 	{
-		let server =
-			EciesHandshakeServer::<P>::new(Arc::clone(&self.provider), server_cert, aad_domain_tag, client_validators)
-				.with_supported_profiles(supported_profiles);
+		let provider = Arc::clone(&self.provider);
+		let mut server = EciesHandshakeServer::<P>::new(provider, server_cert, aad_domain_tag, client_validators);
+		server = server.with_supported_profiles(supported_profiles);
 
 		Ok(Box::new(server))
 	}
@@ -431,11 +491,13 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 
 		let client = EciesHandshakeClient::<P, M>::new_with_identity(aad_domain_tag, client_cert, provider_opt);
 
-		Ok(Box::new(if let Some(val) = validator {
-			client.with_certificate_validator(val)
+		let client = if let Some(validator) = validator {
+			client.with_certificate_validator(validator)
 		} else {
 			client
-		}))
+		};
+
+		Ok(Box::new(client))
 	}
 
 	/// Create a CMS client handshake orchestrator using the encapsulated key provider.
@@ -443,17 +505,12 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// The orchestrator uses the key provider for cryptographic operations,
 	/// ensuring proper encapsulation and enabling HSM/KMS integration.
 	///
-	/// # Parameters
-	/// - `server_cert`: The server's certificate for key agreement
-	/// - `validators`: Optional certificate validators to apply during handshake
-	///
 	/// # Returns
 	/// A CMS client handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-cms")]
 	pub fn create_cms_client<'a>(
 		&'a self,
-		server_cert: Arc<Certificate>,
-		trust_store: Option<Arc<dyn CertificateTrust>>,
+		config: CmsClientConfig,
 	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>
 	where
 		P: Default + 'static,
@@ -466,15 +523,21 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::Digest: Send + 'static,
 		P::AeadCipher: Send + Sync + KeyInit,
 	{
-		let provider = P::default();
-		let mut client = crate::transport::handshake::client::CmsHandshakeClient::<P>::new(
-			provider,
-			Arc::clone(&self.provider),
-			server_cert,
-		);
+		use crate::transport::handshake::client::CmsHandshakeClient;
 
-		if let Some(store) = trust_store {
-			client = client.with_trust_store(store);
+		let provider = P::default();
+		let key_provider = Arc::clone(&self.provider);
+		let mut client = match config.server_identity {
+			CmsServerIdentity::Certificate(cert) => CmsHandshakeClient::<P>::new(provider, key_provider, cert),
+			CmsServerIdentity::Chain(chain) => CmsHandshakeClient::<P>::from_chain(provider, key_provider, chain),
+		}
+		.with_trust_store(config.trust_store);
+
+		if let Some(offer) = config.security_offer {
+			client = client.with_security_offer(offer);
+		}
+		if let Some(cert) = config.client_certificate {
+			client = client.with_client_certificate(cert);
 		}
 
 		Ok(Box::new(client))
@@ -505,11 +568,10 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::Digest: Send + 'static,
 		P::AeadCipher: Send + Sync + KeyInit + 'static,
 	{
-		let server = crate::transport::handshake::server::CmsHandshakeServer::<P>::new(
-			Arc::clone(&self.provider),
-			client_validators,
-		)
-		.with_supported_profiles(supported_profiles);
+		let provider = Arc::clone(&self.provider);
+
+		let mut server = crate::transport::handshake::server::CmsHandshakeServer::<P>::new(provider, client_validators);
+		server = server.with_supported_profiles(supported_profiles);
 
 		Ok(Box::new(server))
 	}
@@ -683,7 +745,13 @@ pub enum HandshakeProtocolKind {
 	/// Use ECIES-based handshake (default, lighter weight)
 	#[default]
 	Ecies,
-	/// Use CMS-based handshake (full X.509 PKI support)
+	/// CMS-based handshake (X.509 signed/enveloped data).
+	///
+	/// Key-transport handshake: the client encrypts the session key to the
+	/// server's leaf certificate in its first message, so a trust store and
+	/// a provisioned server certificate chain are mandatory on the client.
+	/// Missing either fails closed, as does selecting this kind without the
+	/// `transport-cms` feature.
 	Cms,
 }
 

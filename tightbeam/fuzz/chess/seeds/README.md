@@ -12,7 +12,7 @@ Example (pawn double-step):
 ```
 [0x01, 0x06, 0x04, 0x04, 0x04]
   │     └────┬────┘
-  │          └─ move 1: (6,4) → (4,4)
+  │          └─ move 1: (6,4) -> (4,4)
   └─ total moves: 1
 ```
 
@@ -24,8 +24,8 @@ for each chess piece. All seeds live under `basic/`.
 | File | Moves | Purpose |
 | --- | --- | --- |
 | `seed_pawn.txt` | 1 | Pawn double-step from e2 to e4 |
-| `seed_knight.txt` | 1 | Kingside knight hop g1→f3 |
-| `seed_bishop.txt` | 2 | Opens the diagonal (pawn d2→d4) then bishop c1→f4 |
+| `seed_knight.txt` | 1 | Kingside knight hop g1->f3 |
+| `seed_bishop.txt` | 2 | Opens the diagonal (pawn d2->d4) then bishop c1->f4 |
 | `seed_rook.txt` | 2 | Clears the a-file pawn and advances the rook |
 | `seed_queen.txt` | 2 | Frees the queen’s pawn then develops the queen vertically |
 | `seed_king.txt` | 2 | Moves the king’s pawn then slides the king forward |
@@ -46,4 +46,3 @@ If you add a new canonical seed, please:
 1. Follow the byte layout above.
 2. Keep it deterministic (no randomness-dependent behavior).
 3. Document the file in the table so future contributors know its intent.
-
