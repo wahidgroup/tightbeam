@@ -735,6 +735,35 @@ mod tests {
 		Ok(())
 	}
 
+	#[cfg(all(feature = "x509", feature = "transport-ecies"))]
+	#[tokio::test]
+	async fn cms_protocol_kind_fails_closed() -> TransportResult<()> {
+		use std::sync::Arc;
+
+		use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+		use crate::transport::handshake::{HandshakeKeyManager, HandshakeProtocolKind};
+		use crate::transport::io::EncryptedMessageIO;
+
+		let listener: TokioListener = TokioListener::bind("127.0.0.1:0").await?;
+		let addr = listener.local_addr()?;
+		let stream = TcpStream::connect(addr).await?;
+
+		let signing_key = Secp256k1SigningKey::from(create_test_signing_key());
+		let provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+
+		let mut transport = TcpTransport::from(TokioStream::from(stream));
+		transport.handshake_protocol_kind = HandshakeProtocolKind::Cms;
+		transport.key_manager = Some(Arc::new(HandshakeKeyManager::new(provider)));
+
+		let result = transport.perform_client_handshake().await;
+		assert!(matches!(
+			result,
+			Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms))
+		));
+		Ok(())
+	}
+
 	#[cfg(all(feature = "x509", feature = "transport-policy"))]
 	fn encrypted_test_config() -> TransportResult<TransportEncryptionConfig<DefaultCryptoProvider>> {
 		use crate::spki::SubjectPublicKeyInfoOwned;

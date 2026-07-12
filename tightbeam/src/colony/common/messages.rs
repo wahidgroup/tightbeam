@@ -107,7 +107,7 @@ pub struct ServletAddressUpdate {
 	pub hive_id: Vec<u8>,
 	/// Newly spawned servlet addresses
 	pub added: Vec<ServletInfo>,
-	/// Removed servlet IDs (servlet_id field from ServletInfo)
+	/// Removed servlet network addresses.
 	pub removed: Vec<Vec<u8>>,
 }
 
@@ -440,7 +440,7 @@ mod tests {
 		round_trip(ClusterRequest::ServletAddressUpdate(ServletAddressUpdate {
 			hive_id: b"127.0.0.1:9000".to_vec(),
 			added: vec![],
-			removed: vec![b"ping".to_vec()],
+			removed: vec![b"127.0.0.1:9100".to_vec()],
 		}))
 	}
 

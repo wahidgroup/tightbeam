@@ -432,9 +432,9 @@ macro_rules! cluster {
 				let _ = $servlet_registry.add(entry);
 			}
 
-			// Remove stopped servlet entries
-			for servlet_id in &update.removed {
-				let _ = $servlet_registry.remove(servlet_id);
+			// Remove stopped servlet entries (registry keys by network address)
+			for address in &update.removed {
+				let _ = $servlet_registry.remove(address);
 			}
 
 			return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
@@ -579,7 +579,9 @@ macro_rules! cluster {
 				manage: None,
 			};
 
-			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V1)
+			// Priority is a V2+ metadata field; composing it on V1 fails at
+			// build time and every heartbeat would count as a send failure.
+			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
 				.with_id(b"heartbeat")
 				.with_message(cmd)
 				.with_priority($crate::MessagePriority::NetworkControl)

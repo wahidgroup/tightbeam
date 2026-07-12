@@ -171,18 +171,19 @@ where
 	}
 
 	/// Validate server handshake and extract components.
+	///
+	/// Fail-closed (CWE-295): a configured certificate validator is
+	/// mandatory. Expiry alone authenticates nobody, so a missing validator
+	/// aborts the handshake instead of silently degrading.
 	fn validate_and_extract_server_handshake(
 		&self,
 		server_handshake_der: &[u8],
 	) -> Result<ServerHandshake, HandshakeError> {
-		// Decode ServerHandshake
-		// Use provided validator if available, otherwise default to expiry check
 		let server_handshake = ServerHandshake::from_der(server_handshake_der)?;
-		if let Some(validator) = &self.certificate_validator {
-			validator.evaluate(&server_handshake.certificate)?;
-		} else {
-			validate_certificate_expiry(&server_handshake.certificate)?;
-		}
+		let validator = self.certificate_validator.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
+
+		validate_certificate_expiry(&server_handshake.certificate)?;
+		validator.evaluate(&server_handshake.certificate)?;
 
 		Ok(server_handshake)
 	}
@@ -604,8 +605,11 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_client_state_flow() -> Result<(), Box<dyn core::error::Error>> {
-		// Given: A client in init state
-		let mut client = TestEciesClientBuilder::new().build();
+		// Given: A client in init state that trusts the test server certificate
+		let test_cert = create_test_certificate();
+		let mut client = TestEciesClientBuilder::new()
+			.with_trusted_certificate(test_cert.certificate.clone())
+			.build();
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 
 		// When: Client builds client hello
@@ -614,7 +618,6 @@ mod tests {
 		assert!(client.client_random.is_some());
 
 		// And: Server creates a valid server handshake response
-		let test_cert = create_test_certificate();
 		let server_random = crate::random::generate_nonce::<32>(None)?;
 		let accept_der = SecurityAccept::new(create_default_test_profile()).to_der()?;
 		let transcript_hash = compute_test_transcript_hash(
@@ -648,6 +651,36 @@ mod tests {
 		assert!(client.is_complete());
 		assert_eq!(client.state(), ClientHandshakeState::Completed);
 
+		Ok(())
+	}
+
+	/// A client without a certificate validator must abort instead of
+	/// degrading to expiry-only server authentication (CWE-295).
+	#[tokio::test]
+	async fn test_missing_validator_fails_closed() -> Result<(), Box<dyn core::error::Error>> {
+		let mut client = TestEciesClientBuilder::new().build();
+		let client_hello_der = client.build_client_hello()?;
+
+		let test_cert = create_test_certificate();
+		let server_random = crate::random::generate_nonce::<32>(None)?;
+		let accept_der = SecurityAccept::new(create_default_test_profile()).to_der()?;
+		let transcript_hash = compute_test_transcript_hash(
+			&client_hello_der,
+			&server_random,
+			test_cert
+				.certificate
+				.tbs_certificate
+				.subject_public_key_info
+				.subject_public_key
+				.raw_bytes(),
+			&accept_der,
+		);
+		let signature_bytes: Secp256k1Signature = test_cert.signing_key.sign_prehash(&transcript_hash)?;
+		let server_handshake_der =
+			create_test_server_handshake(&test_cert.certificate, &server_random, &signature_bytes.to_bytes())?;
+
+		let result = client.process_server_handshake(&server_handshake_der).await;
+		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
 		Ok(())
 	}
 
@@ -698,7 +731,9 @@ mod tests {
 			(EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage>, Vec<u8>),
 			Box<dyn std::error::Error>,
 		> {
-			let mut client = TestEciesClientBuilder::new().build();
+			let mut client = TestEciesClientBuilder::new()
+				.with_trusted_certificate(test_cert.certificate.clone())
+				.build();
 			if let Some(offer) = offer {
 				client = client.with_security_offer(offer);
 			}

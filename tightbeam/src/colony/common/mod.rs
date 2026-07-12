@@ -341,7 +341,7 @@ pub fn reply_frame<M: crate::Message>(
 	Ok(Some(frame))
 }
 
-/// Build a V0 response frame with an explicit priority
+/// Build a V2 response frame with an explicit priority
 ///
 /// Used for heartbeat replies, which carry `NetworkControl` priority so
 /// monitoring stays distinguishable from work traffic.
@@ -352,7 +352,7 @@ pub fn reply_frame_with_priority<M: crate::Message>(
 ) -> Result<Option<crate::Frame>, crate::TightBeamError> {
 	use crate::builder::TypeBuilder;
 
-	let frame = crate::utils::compose(crate::Version::V0)
+	let frame = crate::utils::compose(crate::Version::V2)
 		.with_id(id)
 		.with_order(0)
 		.with_priority(priority)

@@ -10,7 +10,9 @@ use crate::crypto::aead::KeyInit;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
 use crate::crypto::x509::attr::{Attribute, Attributes};
+use crate::der::asn1::ObjectIdentifier;
 use crate::oids::HANDSHAKE_ABORT_ALERT;
+use crate::oids::{AES_128_GCM, AES_256_GCM};
 use crate::transport::handshake::attributes::{extract_alert_x509, find_x509};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
@@ -82,6 +84,20 @@ pub trait HandshakeNegotiation {
 	}
 }
 
+/// Map a negotiated AEAD OID to its key byte length.
+///
+/// The peer-declared `aead_key_size` is advisory input. The
+/// negotiated OID is the authoritative binding (CWE-345).
+fn aead_key_size_from_oid(oid: ObjectIdentifier) -> Result<usize, HandshakeError> {
+	if oid == AES_128_GCM {
+		Ok(16)
+	} else if oid == AES_256_GCM {
+		Ok(32)
+	} else {
+		Err(HandshakeError::UnsupportedAeadAlgorithm)
+	}
+}
+
 /// Provides session key finalization logic for all handshake orchestrators.
 ///
 /// Orchestrators must implement `selected_profile()` to expose the negotiated
@@ -112,7 +128,9 @@ where
 	/// Initialized AEAD cipher ready for encryption/decryption
 	///
 	/// # Errors
-	/// - `InvalidState`: No profile selected or profile missing AEAD key size
+	/// - `InvalidState`: No profile selected or profile missing AEAD OID/key size
+	/// - `UnsupportedAeadAlgorithm`: Negotiated AEAD OID has no known key size
+	/// - `AeadKeySizeMismatch`: Peer-declared key size disagrees with the OID
 	/// - `InsufficientSaltEntropy`: Salt shorter than `MIN_SALT_ENTROPY_BYTES`
 	/// - `KeyDerivationFailed`: HKDF or cipher initialization failed
 	fn derive_session_aead(&self, input_key: &[u8], salt: &[u8]) -> Result<P::AeadCipher, HandshakeError>
@@ -120,7 +138,14 @@ where
 		P::AeadCipher: KeyInit,
 	{
 		let profile = self.selected_profile().ok_or(HandshakeError::InvalidState)?;
+		let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 		let key_size = usize::from(profile.aead_key_size.ok_or(HandshakeError::InvalidState)?);
+
+		// CWE-345: the negotiated OID is authoritative for the HKDF output length.
+		let expected = aead_key_size_from_oid(aead_oid)?;
+		if key_size != expected {
+			return Err(HandshakeError::AeadKeySizeMismatch { declared: key_size, expected });
+		}
 
 		// Enforce minimum salt entropy for both protocols
 		if salt.len() < MIN_SALT_ENTROPY_BYTES {
@@ -304,6 +329,39 @@ mod tests {
 			result,
 			Err(HandshakeError::InsufficientSaltEntropy { actual: 8, minimum: 16 })
 		));
+	}
+
+	#[test]
+	fn test_derive_session_aead_rejects_key_size_oid_mismatch() {
+		// Peer declares 16 bytes against an AES-256-GCM OID (CWE-345).
+		let profile = create_test_profile(AES_256_GCM, 16);
+		let client = MockClient { profile: Some(profile) };
+
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+
+		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
+			&client, &input_key, &salt,
+		);
+		assert!(matches!(
+			result,
+			Err(HandshakeError::AeadKeySizeMismatch { declared: 16, expected: 32 })
+		));
+	}
+
+	#[test]
+	fn test_derive_session_aead_rejects_unknown_aead_oid() {
+		// A digest OID is not an AEAD algorithm; no key size can be bound.
+		let profile = create_test_profile(HASH_SHA256, 32);
+		let client = MockClient { profile: Some(profile) };
+
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+
+		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
+			&client, &input_key, &salt,
+		);
+		assert!(matches!(result, Err(HandshakeError::UnsupportedAeadAlgorithm)));
 	}
 
 	#[test]

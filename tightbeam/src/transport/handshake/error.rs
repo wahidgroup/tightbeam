@@ -99,6 +99,13 @@ pub enum HandshakeError {
 	#[cfg_attr(feature = "derive", error("Missing server key"))]
 	MissingServerKey,
 
+	/// No trust store / certificate validator configured
+	#[cfg_attr(
+		feature = "derive",
+		error("Trust store required: refusing expiry-only peer certificate validation")
+	)]
+	MissingTrustStore,
+
 	/// Missing server certificate
 	#[cfg_attr(feature = "derive", error("Missing server certificate"))]
 	MissingServerCertificate,
@@ -279,6 +286,16 @@ pub enum HandshakeError {
 		error("Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)")
 	)]
 	UnsupportedKeyWrapAlgorithm,
+	#[cfg_attr(
+		feature = "derive",
+		error("Negotiated AEAD algorithm unsupported (expected AES-128/256 GCM)")
+	)]
+	UnsupportedAeadAlgorithm,
+	#[cfg_attr(
+		feature = "derive",
+		error("Peer aead_key_size {declared} does not match negotiated AEAD key size {expected}")
+	)]
+	AeadKeySizeMismatch { declared: usize, expected: usize },
 	#[cfg(all(feature = "builder", feature = "aead"))]
 	#[cfg_attr(feature = "derive", error("AES key wrap operation failed: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
@@ -325,6 +342,7 @@ crate::impl_error_display!(HandshakeError {
 	CmsBuilderError(e) => "CMS builder error: {e}",
 	InvalidState => "Invalid handshake state",
 	MissingServerKey => "Missing server key",
+	MissingTrustStore => "Trust store required: refusing expiry-only peer certificate validation",
 	MissingServerCertificate => "Missing server certificate",
 	MissingClientCertificate => "Missing client certificate",
 	InvalidTranscriptHash => "Invalid transcript hash",
@@ -373,6 +391,8 @@ crate::impl_error_display!(HandshakeError {
 	MissingContentEncryptionAlgorithm => "Content encryption algorithm not set",
 	MissingKeyWrapAlgorithm => "Key wrap algorithm not configured in security profile",
 	UnsupportedKeyWrapAlgorithm => "Negotiated key wrap algorithm unsupported (expected AES-128/192/256 key wrap)",
+	UnsupportedAeadAlgorithm => "Negotiated AEAD algorithm unsupported (expected AES-128/256 GCM)",
+	AeadKeySizeMismatch { declared, expected } => "Peer aead_key_size {declared} does not match negotiated AEAD key size {expected}",
 	RandomGenerationFailed => "Random generation failed",
 	SecretUnavailable(e) => "Secret unavailable: {e}",
 	InvalidOctetStringLength(m) => "Invalid OCTET STRING length: {m}",

@@ -180,7 +180,8 @@ pub trait HandshakeProtocol: Send {
 // Shared fixtures live in the crate-wide `common` module so threat suites do
 // not depend on one another's helpers.
 pub use crate::common::security::{
-	default_security_profile, expectation_failure, weak_security_profile, ServerMaterials,
+	default_security_profile, expectation_failure, pinning_trust_store, pinning_validator, weak_security_profile,
+	ServerMaterials,
 };
 
 // ============================================================================
@@ -496,8 +497,11 @@ impl EciesSession {
 		client_profiles: Vec<SecurityProfileDesc>,
 		server_profiles: Vec<SecurityProfileDesc>,
 	) -> Self {
+		let offer = SecurityOffer::new(client_profiles);
+		let validator = pinning_validator(&materials.certificate);
 		let client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(client_profiles));
+			.with_security_offer(offer)
+			.with_certificate_validator(validator);
 
 		let server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 			Arc::clone(&materials.key_provider),
@@ -612,9 +616,10 @@ impl Aes128EciesSession {
 	/// Create session with the weak AES-128 profile.
 	fn new(materials: &ServerMaterials) -> Self {
 		let weak_profile = weak_security_profile();
-
+		let validator = pinning_validator(&materials.certificate);
 		let client = EciesHandshakeClient::<Aes128CryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(vec![weak_profile]));
+			.with_security_offer(SecurityOffer::new(vec![weak_profile]))
+			.with_certificate_validator(validator);
 
 		// Deliberately weak session: opt out of the default strength floor so
 		// the downgrade harness can capture AES-128 wire bytes.
@@ -740,12 +745,15 @@ impl CmsSession {
 		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
 
 		// Use internal transcript computation for proper replay detection
+		let trust_store =
+			pinning_trust_store(&materials.certificate).expect("trust store builds from server certificate");
 		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
 			DefaultCryptoProvider::default(),
 			client_provider,
 			Arc::clone(&materials.certificate),
 		)
-		.with_security_offer(SecurityOffer::new(client_profiles));
+		.with_security_offer(SecurityOffer::new(client_profiles))
+		.with_trust_store(trust_store);
 
 		let server_key_provider = Arc::clone(&materials.key_provider);
 		let mut server = CmsHandshakeServer::<DefaultCryptoProvider>::new(server_key_provider, None)

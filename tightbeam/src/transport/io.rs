@@ -471,18 +471,14 @@ pub trait EncryptedMessageIO: MessageIO {
 
 				#[cfg(not(feature = "transport-ecies"))]
 				(HandshakeProtocolKind::Ecies, _) => {
-					return Err(TransportError::MissingEncryption); // ECIES not enabled
+					// ECIES not compiled in
+					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Ecies));
 				}
 
-				#[cfg(feature = "transport-cms")]
+				// Fail closed: the CMS orchestrator is not wired into the TCP
+				// transport.
 				(HandshakeProtocolKind::Cms, _) => {
-					// CMS requires explicit server certificate
-					return Err(TransportError::MissingEncryption);
-				}
-
-				#[cfg(not(feature = "transport-cms"))]
-				(HandshakeProtocolKind::Cms, _) => {
-					return Err(TransportError::MissingEncryption); // CMS not enabled
+					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms));
 				}
 			};
 
@@ -631,15 +627,10 @@ pub trait EncryptedMessageIO: MessageIO {
 					)?
 				}
 
-				#[cfg(feature = "transport-cms")]
+				// Fail closed: a CMS server built here would run with empty
+				// supported profiles and no wire-sourced client certificate.
 				HandshakeProtocolKind::Cms => {
-					// Use factory method to create CMS server with concrete key type
-					key_manager.create_cms_server(client_validators.as_ref().map(Arc::clone), vec![])?
-				}
-
-				#[cfg(not(feature = "transport-cms"))]
-				HandshakeProtocolKind::Cms => {
-					return Err(TransportError::MissingEncryption); // CMS not enabled
+					return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Cms));
 				}
 			});
 		}

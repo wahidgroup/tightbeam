@@ -344,10 +344,11 @@ where
 			)
 		};
 
-		// Use KeyProvider to perform ECDH
-		let shared_secret_bytes = self.server_key_provider.key_agreement(&ephemeral_pubkey).await?;
+		// Use KeyProvider to perform ECDH; the shared secret arrives already
+		// wrapped in SecretSlice.
+		let shared_secret = self.server_key_provider.key_agreement(&ephemeral_pubkey).await?;
 		// Derive encryption key using the negotiated KDF.
-		let k_enc = ecies_kdf::<P::Kdf>(&ephemeral_pubkey, shared_secret_bytes.into(), TIGHTBEAM_ECIES_KDF_INFO, None)?;
+		let k_enc = ecies_kdf::<P::Kdf>(&ephemeral_pubkey, shared_secret, TIGHTBEAM_ECIES_KDF_INFO, None)?;
 
 		// AEAD geometry comes from the negotiated cipher, not literals.
 		let nonce_size = <P::AeadCipher as AeadCore>::NonceSize::USIZE;

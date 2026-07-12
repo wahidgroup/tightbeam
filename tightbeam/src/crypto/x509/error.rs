@@ -76,6 +76,18 @@ pub enum CertificateValidationError {
 	/// Certification path exceeds an issuer's pathLenConstraint (RFC 5280 §6.1.4(m))
 	PathLenExceeded,
 
+	/// Certificate carries a critical extension this validator does not process (RFC 5280 §4.2)
+	UnprocessedCriticalExtension(der::asn1::ObjectIdentifier),
+
+	/// End-entity certificate asserts `basicConstraints.cA`
+	EndEntityIsCa,
+
+	/// Certificate is revoked (RFC 5280 §6.1.3(a)(3))
+	CertificateRevoked,
+
+	/// Revocation status could not be established
+	RevocationStatusUnknown,
+
 	/// Invalid public key
 	#[cfg(feature = "signature")]
 	PublicKeyError(crate::crypto::sign::elliptic_curve::Error),
@@ -109,6 +121,10 @@ crate::impl_error_display!(unconditional CertificateValidationError {
 	IssuerNotCa => "Issuer certificate is not a CA",
 	MissingKeyCertSign => "Issuer keyUsage does not permit certificate signing",
 	PathLenExceeded => "Certification path length constraint exceeded",
+	UnprocessedCriticalExtension(oid) => "Unprocessed critical extension: {oid}",
+	EndEntityIsCa => "End-entity certificate asserts the CA basic constraint",
+	CertificateRevoked => "Certificate is revoked",
+	RevocationStatusUnknown => "Certificate revocation status could not be established",
 
 	#[cfg(feature = "signature")]
 	PublicKeyError(e) => "Invalid public key: {e}",

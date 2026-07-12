@@ -4,16 +4,34 @@
 
 use std::sync::Arc;
 
+use sha3::Sha3_256;
 use tightbeam::{
-	colony::hive::{Hive, HiveConf, HiveTlsConfig},
+	builder::{frame::FrameBuilder, TypeBuilder},
+	colony::{
+		common::{
+			current_timestamp_ms, ClusterCommand, ClusterCommandResponse, ClusterStatus, HeartbeatParams,
+			HiveManagementRequest, StopServletParams,
+		},
+		hive::{Hive, HiveConf, HiveTlsConfig},
+	},
 	compose,
-	crypto::{key::Secp256k1KeyProvider, x509::CertificateSpec},
+	crypto::{
+		key::Secp256k1KeyProvider,
+		policy::Secp256k1Policy,
+		x509::{
+			store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
+			CertificateSpec,
+		},
+	},
+	decode,
 	der::Sequence,
-	exactly, hive, servlet, tb_assert_spec, tb_scenario,
+	exactly, hive,
+	policy::TransitStatus,
+	servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
 	trace::TraceCollector,
-	transport::tcp::r#async::TokioListener,
-	Beamable,
+	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
+	Beamable, Frame, TightBeamError, Version,
 };
 
 use crate::common::x509::create_test_cert_with_key;
@@ -132,6 +150,170 @@ tb_scenario! {
 	}
 }
 
+// ============================================================================
+// Gate Reply Shapes
+// ============================================================================
+
+/// Fresh heartbeat command (unique `issued_at_ms` per call site via clock).
+fn heartbeat_command(issued_at_ms: u64) -> ClusterCommand {
+	ClusterCommand {
+		issued_at_ms,
+		heartbeat: Some(HeartbeatParams { cluster_status: ClusterStatus::Healthy }),
+		manage: None,
+	}
+}
+
+/// Command frame with integrity witness (unsigned until the caller signs it).
+fn command_frame(id: &[u8], cmd: ClusterCommand) -> Result<Frame, TightBeamError> {
+	FrameBuilder::from(Version::V1)
+		.with_id(id)
+		.with_message(cmd)
+		.with_witness_hasher::<Sha3_256>()
+		.build()
+}
+
+tb_assert_spec! {
+	pub HiveGateShapeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			("unsigned_heartbeat_heartbeat_shape", exactly!(1)),
+			("unsigned_manage_manage_shape", exactly!(1)),
+			("signed_heartbeat_accepted", exactly!(1)),
+			("open_breaker_heartbeat_shape", exactly!(1))
+		]
+	}
+}
+
+// Security rejects must come back in the CHOICE the sender expects:
+// a heartbeat rejected in the manage shape decodes as MalformedResponse
+// on the cluster and counts toward eviction, severing a control plane
+// whose breaker would otherwise recover after cooldown.
+tb_scenario! {
+	name: hive_gate_reply_shapes,
+	config: ScenarioConf::<()>::builder()
+		.with_spec(HiveGateShapeSpec::latest())
+		.build(),
+	environment Bare {
+		exec: |trace| async move {
+			let (cert, signing_key) = create_test_cert_with_key("CN=Hive Gate Cluster", 365)?;
+			let trust: Arc<dyn CertificateTrust> = Arc::new(
+				CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+					.with_certificate(cert)?
+					.build(),
+			);
+
+			let provider = Secp256k1KeyProvider::from(signing_key);
+
+			let hive_conf = HiveConf {
+				trust_store: Some(Arc::clone(&trust)),
+				circuit_breaker_threshold: 1,
+				circuit_breaker_cooldown_ms: 60_000,
+				..Default::default()
+			};
+
+			let mut hive = HiveX509Test::new(Some(hive_conf))?;
+			hive.establish(Arc::new(TraceCollector::new())).await?;
+
+			let builder = ClientBuilder::<TokioListener>::builder().build();
+			let mut client = builder.connect(hive.addr()).await?;
+
+			// Unsigned heartbeat: heartbeat CHOICE, no capacity data pre-auth
+			let frame = command_frame(b"hb-unsigned", heartbeat_command(current_timestamp_ms()))?;
+			let response = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let response: ClusterCommandResponse = decode(&response.message)?;
+			assert!(response.manage.is_none(), "heartbeat reject must not use the manage shape");
+
+			let heartbeat = response.heartbeat
+				.ok_or(TightBeamError::MissingResponse)?;
+			assert_eq!(heartbeat.status, TransitStatus::Unauthorized, "unsigned heartbeat must be unauthorized");
+			assert_eq!(heartbeat.utilization.get(), 0, "pre-auth reject must not leak utilization");
+			assert_eq!(heartbeat.active_servlets, 0, "pre-auth reject must not leak servlet count");
+
+			trace.event("unsigned_heartbeat_heartbeat_shape")?;
+
+			// Unsigned manage: manage CHOICE (security verdict, no drain probe)
+			let manage_cmd = ClusterCommand {
+				issued_at_ms: current_timestamp_ms(),
+				heartbeat: None,
+				manage: Some(HiveManagementRequest {
+					spawn: None,
+					list: None,
+					stop: Some(StopServletParams { servlet_id: b"none".to_vec() }),
+				}),
+			};
+			let frame = command_frame(b"manage-unsigned", manage_cmd)?;
+			let response = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let response: ClusterCommandResponse = decode(&response.message)?;
+			assert!(response.heartbeat.is_none(), "manage reject must not use the heartbeat shape");
+
+			let manage = response.manage.ok_or(TightBeamError::MissingResponse)?;
+			let stop = manage.stop.ok_or(TightBeamError::MissingResponse)?;
+			assert_eq!(stop.status, TransitStatus::Unauthorized, "unsigned manage must be unauthorized");
+
+			trace.event("unsigned_manage_manage_shape")?;
+
+			// Signed heartbeat: accepted end-to-end
+			let frame = command_frame(b"hb-signed", heartbeat_command(current_timestamp_ms()))?
+				.sign_with_provider::<Sha3_256, _>(&provider)
+				.await?;
+			let response = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let response: ClusterCommandResponse = decode(&response.message)?;
+			let heartbeat = response.heartbeat.ok_or(TightBeamError::MissingResponse)?;
+			assert_eq!(heartbeat.status, TransitStatus::Accepted, "signed heartbeat must be accepted");
+
+			trace.event("signed_heartbeat_accepted")?;
+
+			// Trip the breaker (threshold 1): a trusted signer identity with a
+			// signature transplanted from a different frame is the one failure
+			// class the breaker counts.
+			let now = current_timestamp_ms();
+			let donor = command_frame(b"hb-donor", heartbeat_command(now))?
+				.sign_with_provider::<Sha3_256, _>(&provider)
+				.await?;
+
+			let mut forged = command_frame(b"hb-forged", heartbeat_command(now.saturating_add(1)))?;
+			forged.nonrepudiation = donor.nonrepudiation.clone();
+
+			let response = client.emit(forged, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let response: ClusterCommandResponse = decode(&response.message)?;
+			let heartbeat = response.heartbeat.ok_or(TightBeamError::MissingResponse)?;
+			assert_eq!(heartbeat.status, TransitStatus::Forbidden, "forged signature must be forbidden");
+
+			// Open breaker: a valid heartbeat is rejected during cooldown but
+			// keeps the heartbeat CHOICE, so the cluster records a reply
+			// instead of MalformedResponse eviction pressure.
+			let frame = command_frame(b"hb-open", heartbeat_command(current_timestamp_ms()))?
+				.sign_with_provider::<Sha3_256, _>(&provider)
+				.await?;
+			let response = client.emit(frame, None).await?
+				.ok_or(TightBeamError::MissingResponse)?;
+
+			let response: ClusterCommandResponse = decode(&response.message)?;
+			assert!(response.manage.is_none(), "open-breaker heartbeat reject must not use the manage shape");
+
+			let heartbeat = response.heartbeat.ok_or(TightBeamError::MissingResponse)?;
+			assert_eq!(heartbeat.status, TransitStatus::Forbidden, "open breaker must reject during cooldown");
+			assert_eq!(heartbeat.utilization.get(), 0, "open-breaker reject must not leak utilization");
+
+			trace.event("open_breaker_heartbeat_shape")?;
+
+			hive.stop();
+
+			Ok(())
+		}
+	}
+}
+
 // Test without TLS to verify basic hive functionality
 tb_scenario! {
 	name: hive_establish_no_tls,
@@ -151,7 +333,6 @@ tb_scenario! {
 
 			// Register servlet with spawner for auto-scaling
 			hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
-
 			// Establish hive
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 

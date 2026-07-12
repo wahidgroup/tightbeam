@@ -41,6 +41,11 @@ use tightbeam::{
 
 use crate::common::security::{default_security_profile, expectation_failure, ServerMaterials};
 
+#[cfg(feature = "transport-cms")]
+use crate::common::security::pinning_trust_store;
+#[cfg(feature = "transport-ecies")]
+use crate::common::security::pinning_validator;
+
 /// Number of CMS loopback passes (0 when the feature is disabled).
 const CMS_RUNS: u32 = cfg!(feature = "transport-cms") as u32;
 
@@ -132,7 +137,8 @@ async fn ecies_loopback(
 	let profile = default_security_profile();
 
 	let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-		.with_security_offer(SecurityOffer::new(vec![profile]));
+		.with_security_offer(SecurityOffer::new(vec![profile]))
+		.with_certificate_validator(pinning_validator(&materials.certificate));
 	let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 		Arc::clone(&materials.key_provider),
 		Arc::clone(&materials.certificate),
@@ -202,18 +208,22 @@ fn build_cms_pair(
 
 	let client_key = k256::ecdsa::SigningKey::random(&mut OsRng);
 	let client_cert = create_test_certificate(&client_key);
-	let client_provider: Arc<dyn SigningKeyProvider> =
-		Arc::new(Secp256k1KeyProvider::from(Secp256k1SigningKey::from(client_key)));
+	let signing_key = Secp256k1SigningKey::from(client_key);
+	let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+	let offer = SecurityOffer::new(vec![profile]);
+	let trust_store = pinning_trust_store(&materials.certificate)?;
 
 	let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
 		DefaultCryptoProvider::default(),
 		client_provider,
 		Arc::clone(&materials.certificate),
 	)
-	.with_security_offer(SecurityOffer::new(vec![profile]));
+	.with_security_offer(offer)
+	.with_trust_store(trust_store);
 
-	let mut server = CmsHandshakeServer::<DefaultCryptoProvider>::new(Arc::clone(&materials.key_provider), None)
-		.with_supported_profiles(vec![profile]);
+	let key_provider = Arc::clone(&materials.key_provider);
+	let mut server =
+		CmsHandshakeServer::<DefaultCryptoProvider>::new(key_provider, None).with_supported_profiles(vec![profile]);
 	server.set_client_certificate(client_cert)?;
 
 	Ok((client, server))

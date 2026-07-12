@@ -191,8 +191,10 @@ tb_scenario! {
 
 			// Create client with offer: [AES-256, AES-128] (AES-256 preferred)
 			let client_offer = SecurityOffer::new(vec![profile_aes256_sha512, profile_aes128_sha256]);
+			let validator = crate::common::security::pinning_validator(&server_cert);
 			let mut client = EciesHandshakeClient::<Aes256Sha3_512Provider, Secp256k1EciesMessage>::new(None)
-				.with_security_offer(client_offer);
+				.with_security_offer(client_offer)
+				.with_certificate_validator(validator);
 
 			// Create server supporting: [AES-128, AES-256] (different order to test negotiation)
 			let mut server = EciesHandshakeServer::<Aes256Sha3_512Provider>::new(

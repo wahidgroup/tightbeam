@@ -39,6 +39,7 @@ use crate::x509::{name::RdnSequence, TbsCertificate};
 #[cfg(feature = "transport-ecies")]
 mod ecies {
 	pub use crate::crypto::ecies::Secp256k1EciesMessage;
+	pub use crate::crypto::x509::policy::DirectTrustValidator;
 	pub use crate::transport::handshake::client::EciesHandshakeClient;
 	pub use crate::transport::handshake::server::EciesHandshakeServer;
 }
@@ -349,13 +350,14 @@ impl Default for TestEciesServerBuilder {
 #[cfg(feature = "transport-ecies")]
 pub struct TestEciesClientBuilder {
 	aad_domain: Option<&'static [u8]>,
+	trusted_certificate: Option<Certificate>,
 }
 
 #[cfg(feature = "transport-ecies")]
 impl TestEciesClientBuilder {
 	/// Create a new builder with default settings.
 	pub fn new() -> Self {
-		Self { aad_domain: None }
+		Self { aad_domain: None, trusted_certificate: None }
 	}
 
 	/// Set the AAD domain tag for ECIES operations.
@@ -364,9 +366,24 @@ impl TestEciesClientBuilder {
 		self
 	}
 
+	/// Trust the given server certificate (attaches a direct-trust validator).
+	///
+	/// The client fails closed without a validator, so any test that
+	/// processes a `ServerHandshake` must pin the server certificate here.
+	pub fn with_trusted_certificate(mut self, certificate: Certificate) -> Self {
+		self.trusted_certificate = Some(certificate);
+		self
+	}
+
 	/// Build the ECIES handshake client.
 	pub fn build(self) -> EciesHandshakeClient<DefaultCryptoProvider, Secp256k1EciesMessage> {
-		EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(self.aad_domain)
+		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(self.aad_domain);
+		if let Some(certificate) = self.trusted_certificate {
+			let validator = DirectTrustValidator::default().with_trust_chain(vec![certificate]);
+			client = client.with_certificate_validator(Arc::new(validator));
+		}
+
+		client
 	}
 }
 
@@ -469,18 +486,30 @@ impl TestCmsClientBuilder {
 	}
 
 	/// Build the CMS handshake client.
+	///
+	/// A trust store pinning the server certificate is attached
+	/// automatically: the client fails closed without one.
 	pub fn build(self) -> Result<CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn std::error::Error>> {
+		use crate::crypto::hash::Sha3_256;
+		use crate::crypto::policy::Secp256k1Policy;
+		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+
 		let client_key = self.client_key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let server_cert = match self.server_cert {
 			Some(cert) => cert,
 			None => create_test_certificate_from_key(&create_test_certificate().signing_key)?,
 		};
 
+		let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+			.with_certificate(server_cert.clone())?
+			.build();
+
 		let mut client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
 			DefaultCryptoProvider::default(),
 			into_provider(client_key),
 			Arc::new(server_cert),
-		);
+		)
+		.with_trust_store(Arc::new(trust_store) as Arc<dyn CertificateTrust>);
 
 		// Apply transcript hash if explicitly set
 		if let Some(hash) = self.transcript_hash {

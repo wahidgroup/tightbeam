@@ -6,9 +6,13 @@ use std::sync::Arc;
 
 use tightbeam::{
 	crypto::{
+		hash::Sha3_256,
 		key::{Secp256k1KeyProvider, SigningKeyProvider},
+		policy::Secp256k1Policy,
 		profiles::{SecurityProfileDesc, TightbeamProfile},
 		sign::ecdsa::Secp256k1SigningKey,
+		x509::policy::{CertificateValidation, DirectTrustValidator},
+		x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder},
 	},
 	oids::{AES_128_GCM, AES_256_GCM, CURVE_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256},
 	random::OsRng,
@@ -56,6 +60,25 @@ impl ServerMaterials {
 	pub fn secret_key(&self) -> &k256::SecretKey {
 		&self.secret_key
 	}
+}
+
+/// Direct-trust validator pinning the given server certificate.
+///
+/// Handshake clients fail closed without a validator (CWE-295), so every
+/// session pins the identity of the server it orchestrates against.
+pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
+	let trust_chain = vec![certificate.clone()];
+	let data = DirectTrustValidator::default().with_trust_chain(trust_chain);
+
+	Arc::new(data)
+}
+
+/// Trust store pinning the given server certificate (for CMS clients).
+pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
+	let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
+		.with_certificate(certificate.clone())?
+		.build();
+	Ok(Arc::new(store))
 }
 
 /// Deterministic signing key (fixed seed) for stable single-identity fixtures.

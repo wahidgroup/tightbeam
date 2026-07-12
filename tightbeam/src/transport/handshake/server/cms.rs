@@ -298,9 +298,9 @@ where
 	/// 3. Decrypt encrypted content using CEK
 	/// 4. Store the session key securely
 	async fn decrypt_session_key(&mut self, enveloped_data_der: &[u8]) -> Result<(), HandshakeError> {
-		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
+		use crate::crypto::secret::ToInsecure;
 
-		// Extract KARI from recipient infos
+		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 		let kari = enveloped_data
 			.recip_infos
 			.0
@@ -317,16 +317,16 @@ where
 			_ => return Err(HandshakeError::InvalidClientKeyExchange),
 		};
 
-		// Perform ECDH using KeyProvider (takes SEC1 bytes directly)
-		let shared_secret_bytes = self.server_key_provider.key_agreement(originator_pub_bytes).await?;
+		// Perform ECDH using KeyProvider (takes SEC1 bytes directly);
+		// the shared secret arrives already wrapped in SecretSlice.
+		let shared_secret = self.server_key_provider.key_agreement(originator_pub_bytes).await?;
 
 		// Derive KEK using HKDF via provider, sized to the negotiated key-wrap algorithm.
 		let ukm = kari.ukm.as_ref().ok_or(HandshakeError::MissingUkm)?;
 		let provider = P::default();
 
 		let key_size = key_wrap_key_size::<P>()?;
-		let secret_bytes = Secret::from(shared_secret_bytes);
-		let kek = derive_kek::<P>(&secret_bytes, ukm.as_bytes(), TIGHTBEAM_KARI_KDF_INFO, key_size)?;
+		let kek = derive_kek::<P>(&shared_secret, ukm.as_bytes(), TIGHTBEAM_KARI_KDF_INFO, key_size)?;
 
 		// Unwrap CEK
 		let wrapped_key = kari.recipient_enc_keys[0].enc_key.as_bytes();
@@ -347,11 +347,10 @@ where
 			expected: <P::AeadCipher as KeySizeUser>::KeySize::USIZE,
 			received: cek.len(),
 		})?;
-		let session_key_bytes = cipher.decrypt_content(&enveloped_data.encrypted_content)?;
 
 		// Re-box into the stored `Secret<Vec<u8>>` shape; the inner buffer moves,
 		// no plaintext copy is left behind.
-		use crate::crypto::secret::ToInsecure;
+		let session_key_bytes = cipher.decrypt_content(&enveloped_data.encrypted_content)?;
 		self.session_key = Some(Secret::from(session_key_bytes.to_insecure()?.into_vec()));
 
 		Ok(())

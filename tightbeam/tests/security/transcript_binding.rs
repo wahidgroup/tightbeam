@@ -49,7 +49,9 @@ use tightbeam::{
 	TightBeamError,
 };
 
-use crate::common::security::{expectation_failure, strong_security_profile, weak_security_profile, ServerMaterials};
+use crate::common::security::{
+	expectation_failure, pinning_validator, strong_security_profile, weak_security_profile, ServerMaterials,
+};
 
 tb_assert_spec! {
 	pub TranscriptBindingSpec,
@@ -97,9 +99,11 @@ job! {
 		let materials = ServerMaterials::generate();
 		let strong = strong_security_profile();
 		let weak = weak_security_profile();
+		let validator = pinning_validator(&materials.certificate);
 
 		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(vec![strong, weak]));
+			.with_security_offer(SecurityOffer::new(vec![strong, weak]))
+			.with_certificate_validator(validator);
 
 		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 			Arc::clone(&materials.key_provider),
@@ -131,8 +135,11 @@ job! {
 		// Phase 2: MITM strips the SecurityOffer from ClientHello.
 		// client_random is preserved, so a random-only transcript would still
 		// verify. The full ClientHello DER binding must make the client reject.
+		let offer = SecurityOffer::new(vec![strong, weak]);
+		let validator = pinning_validator(&materials.certificate);
 		let mut client = EciesHandshakeClient::<DefaultCryptoProvider, Secp256k1EciesMessage>::new(None)
-			.with_security_offer(SecurityOffer::new(vec![strong, weak]));
+			.with_security_offer(offer)
+			.with_certificate_validator(validator);
 
 		let mut server = EciesHandshakeServer::<DefaultCryptoProvider>::new(
 			Arc::clone(&materials.key_provider),

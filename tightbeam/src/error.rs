@@ -343,6 +343,14 @@ pub enum TightBeamError {
 	#[cfg_attr(feature = "derive", error("Missing encryption info"))]
 	MissingEncryptionInfo,
 
+	/// AEAD nonce length does not match the cipher's nonce size
+	#[cfg(feature = "aead")]
+	#[cfg_attr(
+		feature = "derive",
+		error("Invalid AEAD nonce length: expected {expected:?}, got {received:?}")
+	)]
+	InvalidNonceLength(ReceivedExpectedError<usize, usize>),
+
 	/// Missing Integrity Info
 	#[cfg(feature = "digest")]
 	#[cfg_attr(feature = "derive", error("Missing integrity info"))]
@@ -473,6 +481,14 @@ impl core::fmt::Display for TightBeamError {
 			TightBeamError::MissingDigestInfo => write!(f, "Missing integrity info"),
 			#[cfg(feature = "aead")]
 			TightBeamError::MissingEncryptionInfo => write!(f, "Missing encryption info"),
+			#[cfg(feature = "aead")]
+			TightBeamError::InvalidNonceLength(err) => {
+				write!(
+					f,
+					"Invalid AEAD nonce length: expected {:?}, got {:?}",
+					err.expected, err.received
+				)
+			}
 			#[cfg(feature = "signature")]
 			TightBeamError::MissingSignatureInfo => write!(f, "Missing signature info"),
 			#[cfg(feature = "signature")]

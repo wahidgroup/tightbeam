@@ -575,14 +575,8 @@ macro_rules! hive {
 			.map(|cmd| cmd.heartbeat.is_some())
 			.unwrap_or(false);
 
-		// Reject non-heartbeat when draining
-		if is_draining && !is_heartbeat {
-			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
-				$crate::policy::TransitStatus::Busy, current_util(), active_count()
-			));
-		}
-
-		// Security gate (x509 feature)
+		// Security gate (x509 feature). Runs before the drain check so
+		// unauthenticated peers cannot probe the draining state.
 		#[cfg(feature = "x509")]
 		{
 			let security_status = match &$trust_store {
@@ -598,10 +592,31 @@ macro_rules! hive {
 			};
 
 			if security_status != $crate::policy::TransitStatus::Accepted {
+				// Rejects reply in the CHOICE variant the sender decodes:
+				// heartbeat commands get a heartbeat-shaped verdict, manage
+				// commands a manage-shaped one. A mismatched shape decodes
+				// as MalformedResponse on the cluster, counts toward
+				// max_failures, and evicts the hive over a transient
+				// rejection (e.g. breaker cooldown).
+				if is_heartbeat {
+					return hive!(@reply_priority $frame, $crate::MessagePriority::NetworkControl,
+						$crate::colony::common::ClusterCommandResponse::heartbeat(
+							security_status, $crate::utils::BasisPoints::default(), 0
+						)
+					);
+				}
+
 				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
 					$crate::colony::hive::HiveManagementResponse::stop_err(security_status)
 				));
 			}
+		}
+
+		// Reject non-heartbeat when draining
+		if is_draining && !is_heartbeat {
+			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::heartbeat(
+				$crate::policy::TransitStatus::Busy, current_util(), active_count()
+			));
 		}
 
 		// Backpressure gate. Authenticated heartbeats are exempted HERE,
@@ -749,8 +764,11 @@ macro_rules! hive {
 		let hive_context = $hive_context;
 		let hive_addr: Vec<u8> = $hive_addr.into();
 		let config = $config;
+
 		#[cfg(feature = "x509")]
 		let hive_tls_for_notify = config.hive_tls.as_ref().map(::std::sync::Arc::clone);
+		#[cfg(feature = "x509")]
+		let trust_store_for_notify = config.trust_store.as_ref().map(::std::sync::Arc::clone);
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			let mut last_scale_up: std::collections::HashMap<Vec<u8>, std::time::Instant> = std::collections::HashMap::new();
@@ -826,7 +844,8 @@ macro_rules! hive {
 								},
 								true,
 								::std::sync::Arc::clone(&config.cluster_notify_retry),
-								hive_tls_for_notify
+								hive_tls_for_notify,
+								trust_store_for_notify
 							);
 
 							let registration = $crate::colony::hive::ServletRegistration {
@@ -871,7 +890,8 @@ macro_rules! hive {
 								},
 								false,
 								::std::sync::Arc::clone(&config.cluster_notify_retry),
-								hive_tls_for_notify
+								hive_tls_for_notify,
+								trust_store_for_notify
 							);
 
 							last_scale_down.insert(type_key.clone(), std::time::Instant::now());
@@ -925,7 +945,7 @@ macro_rules! hive {
 	// Cluster Notification
 	// ==========================================================================
 
-	(@notify_cluster $protocol:path, $cluster_addr:expr, $hive_addr:expr, $servlet_info:expr, $is_added:expr, $retry_policy:expr, $hive_tls:ident) => {{
+	(@notify_cluster $protocol:path, $cluster_addr:expr, $hive_addr:expr, $servlet_info:expr, $is_added:expr, $retry_policy:expr, $hive_tls:ident, $trust_store:ident) => {{
 		let cluster_addr_arc = $cluster_addr;
 		let hive_id = $hive_addr;
 		let servlet_info = $servlet_info;
@@ -934,6 +954,8 @@ macro_rules! hive {
 
 		#[cfg(feature = "x509")]
 		let hive_tls = $hive_tls.as_ref().map(::std::sync::Arc::clone);
+		#[cfg(feature = "x509")]
+		let trust_store = $trust_store.as_ref().map(::std::sync::Arc::clone);
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			use $crate::transport::policy::CoreRetryPolicy;
@@ -969,6 +991,23 @@ macro_rules! hive {
 			}.await;
 			let Ok(frame) = frame_result else { return };
 
+			// The hive identity is converted once. A hive that registered over
+			// TLS must not fallback to cleartext for scaling updates (CWE-319).
+			#[cfg(feature = "x509")]
+			let client_identity = match hive_tls.as_ref() {
+				Some(hive_tls) => {
+					let Ok(cert) = $crate::crypto::x509::Certificate::try_from(hive_tls.certificate.clone()) else {
+						return;
+					};
+					let key_mgr = $crate::transport::handshake::HandshakeKeyManager::new(
+						::std::sync::Arc::clone(&hive_tls.key)
+					);
+
+					Some((::std::sync::Arc::new(cert), ::std::sync::Arc::new(key_mgr)))
+				}
+				None => None,
+			};
+
 			let max_attempts = retry_policy.max_attempts();
 			for attempt in 0..=max_attempts {
 				let stream = match <$protocol as $crate::transport::Protocol>::connect(cluster_addr).await {
@@ -980,6 +1019,22 @@ macro_rules! hive {
 				};
 
 				let mut transport = <$protocol as $crate::transport::Protocol>::create_transport(stream);
+
+				#[cfg(feature = "x509")]
+				{
+					use $crate::transport::X509ClientConfig;
+
+					if let Some(ref store) = trust_store {
+						transport = transport.with_trust_store(::std::sync::Arc::clone(store));
+					}
+
+					if let Some((ref cert, ref key_mgr)) = client_identity {
+						transport = transport.with_client_identity(
+							::std::sync::Arc::clone(cert),
+							::std::sync::Arc::clone(key_mgr)
+						);
+					}
+				}
 
 				use $crate::transport::MessageEmitter;
 				if transport.emit(frame.clone(), None).await.is_ok() {

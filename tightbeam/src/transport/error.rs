@@ -45,6 +45,11 @@ pub enum TransportError {
 	SendFailed,
 	#[cfg_attr(feature = "derive", error("Encryption required but not provided"))]
 	MissingEncryption,
+	#[cfg_attr(
+		feature = "derive",
+		error("Handshake protocol not supported by this transport: {0:?}")
+	)]
+	UnsupportedHandshakeProtocol(crate::transport::handshake::HandshakeProtocolKind),
 	#[cfg_attr(feature = "derive", error("Invalid message"))]
 	InvalidMessage,
 	#[cfg_attr(feature = "derive", error("Invalid reply"))]
@@ -83,19 +88,21 @@ crate::impl_error_display!(TransportError {
 	ConnectionFailed => "Connection failed",
 	SendFailed => "Send failed",
 	MissingEncryption => "Encryption required but not provided",
+	UnsupportedHandshakeProtocol(kind) => "Handshake protocol not supported by this transport: {kind:?}",
 	InvalidMessage => "Invalid message",
 	InvalidReply => "Invalid reply",
 	MissingRequest => "Missing request",
 	MaxRetriesExceeded => "Max retries exceeded",
 	InvalidAddress => "Invalid address",
 	InvalidState => "Invalid state",
-	#[cfg(feature = "x509")]
-	InvalidCertificate(err) => "Invalid certificate: {err}",
 	MessageNotSent(frame, failure) => "Message not sent: {failure:?} - {frame:?}",
 	OperationFailed(failure) => "Operation failed: {failure:?}",
+	DerError(err) => "DER error: {err}",
+
+	#[cfg(feature = "x509")]
+	InvalidCertificate(err) => "Invalid certificate: {err}",
 	#[cfg(feature = "x509")]
 	HandshakeError(err) => "Handshake error: {err}",
-	DerError(err) => "DER error: {err}",
 	#[cfg(feature = "std")]
 	IoError(err) => "I/O error: {err}",
 });
@@ -108,6 +115,7 @@ impl From<crate::error::TightBeamError> for TransportError {
 		match err {
 			TightBeamError::TransportError(t) => t,
 			TightBeamError::SerializationError(e) => TransportError::DerError(e),
+
 			#[cfg(feature = "x509")]
 			TightBeamError::HandshakeError(h) => TransportError::HandshakeError(h),
 			#[cfg(feature = "x509")]

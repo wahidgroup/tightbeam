@@ -152,15 +152,16 @@ where
 	}
 
 	/// Validate state and server certificate for key exchange.
+	///
+	/// Fail-closed (CWE-295): a configured trust store is mandatory. Expiry
+	/// alone authenticates nobody, so a missing store aborts the handshake
+	/// instead of silently degrading.
 	fn validate_state_and_certificate(&self) -> Result<(), HandshakeError> {
 		self.validate_expected_state(ClientHandshakeState::Init)?;
 
-		// Validate server certificate using trust store or default expiry check
-		if let Some(store) = &self.trust_store {
-			store.evaluate(&self.server_cert)?;
-		} else {
-			validate_certificate_expiry(&self.server_cert)?;
-		}
+		let store = self.trust_store.as_ref().ok_or(HandshakeError::MissingTrustStore)?;
+		validate_certificate_expiry(&self.server_cert)?;
+		store.evaluate(&self.server_cert)?;
 
 		Ok(())
 	}
@@ -753,6 +754,26 @@ mod tests {
 		assert!(client.is_complete());
 		assert_eq!(client.state(), ClientHandshakeState::Completed);
 
+		Ok(())
+	}
+
+	/// A client without a trust store must abort instead of degrading to
+	/// expiry-only server authentication (CWE-295).
+	#[test]
+	fn test_missing_trust_store_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+		let server_cert = create_test_certificate().certificate;
+		let test_cert = create_test_certificate();
+		let mut client = super::CmsHandshakeClient::<DefaultCryptoProvider>::new(
+			DefaultCryptoProvider::default(),
+			into_provider(test_cert.signing_key),
+			std::sync::Arc::new(server_cert),
+		);
+
+		let result = client.build_key_exchange(vec![2u8; 32], None);
+		assert!(matches!(
+			result,
+			Err(crate::transport::handshake::error::HandshakeError::MissingTrustStore)
+		));
 		Ok(())
 	}
 

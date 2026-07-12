@@ -77,6 +77,9 @@ mod common {
 #[cfg(any(feature = "signature", feature = "aead"))]
 use common::*;
 
+#[cfg(feature = "signature")]
+use crate::crypto::secret::SecretSlice;
+
 // =============================================================================
 // KeyError
 // =============================================================================
@@ -229,7 +232,8 @@ pub trait SigningKeyProvider: Send + Sync + Debug {
 	///
 	/// # Returns
 	///
-	/// The computed shared secret bytes.
+	/// The computed shared secret, wrapped in [`SecretSlice`] so it is
+	/// zeroized on drop (CWE-212).
 	///
 	/// # Default
 	///
@@ -237,7 +241,7 @@ pub trait SigningKeyProvider: Send + Sync + Debug {
 	fn key_agreement(
 		&self,
 		_peer_public_key: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
 		Box::pin(async { Err(KeyError::UnsupportedOperation) })
 	}
 }
@@ -438,14 +442,15 @@ where
 	fn key_agreement(
 		&self,
 		peer_public_key: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
 		let pk_result = PublicKey::<C>::from_sec1_bytes(peer_public_key);
 		let secret_key = *self.signing_key.as_nonzero_scalar();
 
 		Box::pin(async move {
 			let pk = pk_result?;
 			let shared_secret = diffie_hellman(secret_key, pk.as_affine());
-			Ok(shared_secret.raw_secret_bytes().to_vec())
+
+			Ok(SecretSlice::from(shared_secret.raw_secret_bytes().to_vec()))
 		})
 	}
 }
@@ -477,7 +482,7 @@ where
 	fn key_agreement(
 		&self,
 		peer_public_key: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
 		self.as_ref().key_agreement(peer_public_key)
 	}
 }
@@ -693,6 +698,7 @@ mod tests {
 
 	use super::*;
 	use crate::crypto::hash::{Digest, Sha3_256};
+	use crate::crypto::secret::ToInsecure;
 	use crate::crypto::sign::ecdsa::k256::ecdsa::SigningKey;
 	use crate::crypto::sign::PrehashVerifier;
 
@@ -741,8 +747,8 @@ mod tests {
 		let public2 = signing_key2.verifying_key().to_encoded_point(false).as_bytes().to_vec();
 
 		// Both sides should compute the same shared secret
-		let shared1 = provider1.key_agreement(&public2).await?;
-		let shared2 = provider2.key_agreement(&public1).await?;
+		let shared1 = provider1.key_agreement(&public2).await?.to_insecure()?;
+		let shared2 = provider2.key_agreement(&public1).await?.to_insecure()?;
 
 		assert_eq!(shared1, shared2);
 		assert_eq!(shared1.len(), 32); // secp256k1 shared secret is 32 bytes

@@ -695,7 +695,11 @@ pub enum HandshakeProtocolKind {
 	/// Use ECIES-based handshake (default, lighter weight)
 	#[default]
 	Ecies,
-	/// Use CMS-based handshake (full X.509 PKI support)
+	/// CMS-based handshake (X.509 signed/enveloped data).
+	///
+	/// TODO: Not implemented into the TCP transport: selecting this kind fails
+	/// closed with `TransportError::UnsupportedHandshakeProtocol`. Use the CMS
+	/// orchestrators directly until the wire integration lands.
 	Cms,
 }
 
