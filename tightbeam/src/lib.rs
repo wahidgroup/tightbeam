@@ -91,6 +91,7 @@
 //! built on ASN.1 DER encoding.
 
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::clone_on_ref_ptr))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]

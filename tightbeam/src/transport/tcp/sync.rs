@@ -337,7 +337,7 @@ where
 	}
 
 	fn to_server_certificate_arc(&self) -> Option<Arc<Certificate>> {
-		self.server_identity.clone()
+		self.server_identity.as_ref().map(Arc::clone)
 	}
 
 	fn set_symmetric_key(&mut self, key: RuntimeAead) {

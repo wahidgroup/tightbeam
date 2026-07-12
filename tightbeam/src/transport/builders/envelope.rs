@@ -153,7 +153,8 @@ impl<'a> EnvelopeBuilder<'a> {
 
 		let with_frame = move |failure: TransportFailure| -> TransportError {
 			request_frame
-				.clone() // Arc clone
+				.as_ref()
+				.map(Arc::clone)
 				.map(|arc| {
 					// Non-hot path clone
 					let frame = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());

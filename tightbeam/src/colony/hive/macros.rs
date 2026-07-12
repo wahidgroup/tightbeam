@@ -299,11 +299,12 @@ macro_rules! hive {
 					let spawners_for_server = ::std::sync::Arc::clone(&self.spawners);
 					let hive_context_for_server = ::std::sync::Arc::clone(&self.hive_context);
 
-					#[cfg(feature = "x509")]
-					let trust_store = self.config.trust_store.clone();
 					let cb_threshold = self.config.circuit_breaker_threshold;
 					let cb_cooldown_ms = self.config.circuit_breaker_cooldown_ms;
 					let bp_threshold = self.config.backpressure_threshold;
+
+					#[cfg(feature = "x509")]
+					let trust_store = self.config.trust_store.as_ref().map(::std::sync::Arc::clone);
 					#[cfg(feature = "x509")]
 					let freshness_window_ms = self.config.command_freshness_window_ms;
 
@@ -410,12 +411,16 @@ macro_rules! hive {
 							let key_mgr = $crate::transport::handshake::HandshakeKeyManager::new(
 								::std::sync::Arc::clone(&hive_tls.key)
 							);
-							transport = transport.with_client_identity(cert, key_mgr);
+
+							transport = transport.with_client_identity(
+								::std::sync::Arc::new(cert),
+								::std::sync::Arc::new(key_mgr)
+							);
 						}
 					}
 
 					#[cfg(feature = "x509")]
-					let hive_tls_for_frame = self.config.hive_tls.clone();
+					let hive_tls_for_frame = self.config.hive_tls.as_ref().map(::std::sync::Arc::clone);
 					let frame = hive!(@control_frame b"hive-registration", request, hive_tls_for_frame);
 
 					let response_frame = transport.emit(frame, None).await?
@@ -745,7 +750,7 @@ macro_rules! hive {
 		let hive_addr: Vec<u8> = $hive_addr.into();
 		let config = $config;
 		#[cfg(feature = "x509")]
-		let hive_tls_for_notify = config.hive_tls.clone();
+		let hive_tls_for_notify = config.hive_tls.as_ref().map(::std::sync::Arc::clone);
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			let mut last_scale_up: std::collections::HashMap<Vec<u8>, std::time::Instant> = std::collections::HashMap::new();
@@ -814,7 +819,7 @@ macro_rules! hive {
 
 							hive!(@add_to_context hive_context, key_bytes.clone(), addr_bytes.clone(), type_bytes);
 
-							hive!(@notify_cluster $protocol, cluster_addr.clone(), hive_addr.clone(),
+							hive!(@notify_cluster $protocol, ::std::sync::Arc::clone(&cluster_addr), hive_addr.clone(),
 								$crate::colony::hive::ServletInfo {
 									servlet_id: type_key.clone(),
 									address: addr_bytes,
@@ -859,7 +864,7 @@ macro_rules! hive {
 							reg.servlet.stop_boxed();
 							hive!(@remove_from_context hive_context, key, type_bytes, addr.clone());
 
-							hive!(@notify_cluster $protocol, cluster_addr.clone(), hive_addr.clone(),
+							hive!(@notify_cluster $protocol, ::std::sync::Arc::clone(&cluster_addr), hive_addr.clone(),
 								$crate::colony::hive::ServletInfo {
 									servlet_id: type_key.clone(),
 									address: addr,
@@ -926,8 +931,9 @@ macro_rules! hive {
 		let servlet_info = $servlet_info;
 		let is_added = $is_added;
 		let retry_policy = $retry_policy;
+
 		#[cfg(feature = "x509")]
-		let hive_tls = $hive_tls.clone();
+		let hive_tls = $hive_tls.as_ref().map(::std::sync::Arc::clone);
 
 		$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 			use $crate::transport::policy::CoreRetryPolicy;

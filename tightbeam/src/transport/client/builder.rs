@@ -219,7 +219,7 @@ where
 			transport = transport.with_trust_store(store);
 		}
 		if let (Some(cert), Some(key)) = (self.client_certificate, self.client_key) {
-			transport = transport.with_client_identity(cert, key);
+			transport = transport.with_client_identity(Arc::new(cert), Arc::new(key));
 		}
 
 		let configured = self.policies.apply::<P>(transport);

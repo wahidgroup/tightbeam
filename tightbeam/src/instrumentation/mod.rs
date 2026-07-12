@@ -164,7 +164,7 @@ pub mod stub {
 #[cfg(feature = "instrument")]
 pub mod active {
 	use crate::crypto::hash::{Digest, Sha3_256};
-	use crate::der::asn1::{ContextSpecific, OctetString};
+	use crate::der::asn1::{ContextSpecific, ContextSpecificRef, OctetString, OctetStringRef};
 	use crate::der::{Decode, Encode, FixedTag, Sequence, Tag, TagMode, TagNumber};
 	use crate::utils::urn::Urn;
 	use crate::Beamable;
@@ -211,6 +211,12 @@ pub mod active {
 		ContextSpecific { tag_number, tag_mode: TagMode::Explicit, value }
 	}
 
+	/// Borrowing variant for encode-only paths: avoids cloning the value
+	/// just to wrap it in a context-specific tag.
+	fn tagged_ref<T>(tag_number: TagNumber, value: &T) -> ContextSpecificRef<'_, T> {
+		ContextSpecificRef { tag_number, tag_mode: TagMode::Explicit, value }
+	}
+
 	// Manual DER implementation: Sequence derive can't handle Urn<'static>
 	// lifetime
 	impl FixedTag for TbEvent {
@@ -223,10 +229,10 @@ pub mod active {
 			len = (len + self.urn.encoded_len()?)?;
 
 			if let Some(ref label) = self.label {
-				len = (len + tagged(tb_event_tags::LABEL, label.clone()).encoded_len()?)?;
+				len = (len + tagged_ref(tb_event_tags::LABEL, label).encoded_len()?)?;
 			}
 			if let Some(ref payload_hash) = self.payload_hash {
-				let os = OctetString::new(payload_hash.as_slice())?;
+				let os = OctetStringRef::new(payload_hash.as_slice())?;
 				len = (len + tagged(tb_event_tags::PAYLOAD_HASH, os).encoded_len()?)?;
 			}
 			if let Some(duration_ns) = self.duration_ns {
@@ -239,7 +245,7 @@ pub mod active {
 			len = (len + self.flags.encoded_len()?)?;
 
 			if let Some(ref extras) = self.extras {
-				let os = OctetString::new(extras.as_slice())?;
+				let os = OctetStringRef::new(extras.as_slice())?;
 				len = (len + tagged(tb_event_tags::EXTRAS, os).encoded_len()?)?;
 			}
 
@@ -251,10 +257,10 @@ pub mod active {
 			self.urn.encode(encoder)?;
 
 			if let Some(ref label) = self.label {
-				tagged(tb_event_tags::LABEL, label.clone()).encode(encoder)?;
+				tagged_ref(tb_event_tags::LABEL, label).encode(encoder)?;
 			}
 			if let Some(ref payload_hash) = self.payload_hash {
-				let os = OctetString::new(payload_hash.as_slice())?;
+				let os = OctetStringRef::new(payload_hash.as_slice())?;
 				tagged(tb_event_tags::PAYLOAD_HASH, os).encode(encoder)?;
 			}
 			if let Some(duration_ns) = self.duration_ns {
@@ -267,7 +273,7 @@ pub mod active {
 			self.flags.encode(encoder)?;
 
 			if let Some(ref extras) = self.extras {
-				let os = OctetString::new(extras.as_slice())?;
+				let os = OctetStringRef::new(extras.as_slice())?;
 				tagged(tb_event_tags::EXTRAS, os).encode(encoder)?;
 			}
 

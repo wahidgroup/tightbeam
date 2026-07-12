@@ -207,8 +207,9 @@ macro_rules! rwlock {
 
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
-				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
-					.clone()
+				std::sync::Arc::clone(
+					[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new($default)))
+				)
 			}
 		}
 	};
@@ -220,8 +221,9 @@ macro_rules! rwlock {
 
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::RwLock<$ty>> {
-				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Default::default())))
-					.clone()
+				std::sync::Arc::clone(
+					[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(Default::default())))
+				)
 			}
 		}
 	};
@@ -244,8 +246,9 @@ macro_rules! mutex {
 
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
-				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new($default)))
-					.clone()
+				std::sync::Arc::clone(
+					[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new($default)))
+				)
 			}
 		}
 	};
@@ -257,8 +260,9 @@ macro_rules! mutex {
 
 			#[allow(non_snake_case)]
 			fn $name() -> std::sync::Arc<std::sync::Mutex<$ty>> {
-				[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Default::default())))
-					.clone()
+				std::sync::Arc::clone(
+					[<$name _CELL>].get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Default::default())))
+				)
 			}
 		}
 	};

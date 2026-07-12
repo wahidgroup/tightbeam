@@ -2,6 +2,9 @@
 //!
 //! Organized test suites for various components of the TightBeam protocol.
 
+// Tests are exempt from the zero-copy Arc::clone discipline (workspace lints)
+#![allow(clippy::clone_on_ref_ptr)]
+
 // Common test helpers
 mod common;
 

@@ -13,6 +13,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "A secure, high-performance messaging protocol library"
 
+[lints]
+workspace = true
+
 [lib]
 name = "tightbeam"
 

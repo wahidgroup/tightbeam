@@ -108,7 +108,10 @@ pub trait X509ClientConfig: Sized {
 	fn with_trust_store(self, store: Arc<dyn CertificateTrust>) -> Self;
 
 	/// Set the client's identity for mutual authentication.
-	fn with_client_identity(self, cert: Certificate, key: HandshakeKeyManager<Self::CryptoProvider>) -> Self;
+	///
+	/// Takes Arcs so pooled connections can share one identity without
+	/// deep-copying the certificate per connection.
+	fn with_client_identity(self, cert: Arc<Certificate>, key: Arc<HandshakeKeyManager<Self::CryptoProvider>>) -> Self;
 }
 
 /// This protocol can operate as a mycelial network (ie. TCP SocketAddress)

@@ -531,7 +531,7 @@ macro_rules! cluster {
 			let mut client = $pool.connect(parsed_addr).await
 				.map_err(|_| $crate::colony::cluster::ClusterError::ConnectFailed)?;
 
-			let response = match client.conn()?.emit(frame, None).await {
+			let mut response = match client.conn()?.emit(frame, None).await {
 				Ok(Some(r)) => r,
 				Ok(None) => {
 					return Err($crate::colony::cluster::ClusterError::NoResponse);
@@ -541,8 +541,7 @@ macro_rules! cluster {
 				}
 			};
 
-			// Clone the message to avoid moving out of Frame (which has Drop)
-			Ok::<_, $crate::colony::cluster::ClusterError>(response.message.clone())
+			Ok::<_, $crate::colony::cluster::ClusterError>(::core::mem::take(&mut response.message))
 		}.await
 	}};
 

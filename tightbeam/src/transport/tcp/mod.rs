@@ -317,11 +317,12 @@ macro_rules! impl_tcp_common {
 
 		fn with_client_identity(
 			mut self,
-			cert: $crate::x509::Certificate,
-			key: $crate::transport::handshake::HandshakeKeyManager<P>,
+			cert: Arc<$crate::x509::Certificate>,
+			key: Arc<$crate::transport::handshake::HandshakeKeyManager<P>>,
 		) -> Self {
-			self.client_certificate = Some(Arc::new(cert));
-			self.key_manager = Some(Arc::new(key));
+			self.client_certificate = Some(cert);
+			self.key_manager = Some(key);
+
 			self
 		}
 		}

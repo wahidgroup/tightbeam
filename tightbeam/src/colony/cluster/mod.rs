@@ -154,8 +154,8 @@ impl Clone for ClusterTlsConfig {
 		Self {
 			certificate: self.certificate.clone(),
 			key: Arc::clone(&self.key),
-			validators: self.validators.clone(),
-			client_validators: self.client_validators.clone(),
+			validators: self.validators.iter().map(Arc::clone).collect(),
+			client_validators: self.client_validators.iter().map(Arc::clone).collect(),
 			hive_trust: self.hive_trust.as_ref().map(Arc::clone),
 		}
 	}

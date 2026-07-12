@@ -109,8 +109,9 @@ impl<C: CryptoProvider + Send + Sync + 'static> PoolTlsConfig<C> {
 		}
 
 		if let Some(identity) = &self.client_identity {
-			let cert = (*identity.certificate).clone();
-			let key = (*identity.key).clone();
+			let cert = Arc::clone(&identity.certificate);
+			let key = Arc::clone(&identity.key);
+
 			configured = configured.with_client_identity(cert, key);
 		}
 

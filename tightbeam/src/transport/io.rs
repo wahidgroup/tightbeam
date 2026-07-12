@@ -623,14 +623,14 @@ pub trait EncryptedMessageIO: MessageIO {
 						cert_arc,
 						None, // Use default AAD domain tag
 						vec![profile_desc],
-						client_validators.clone(),
+						client_validators.as_ref().map(Arc::clone),
 					)?
 				}
 
 				#[cfg(feature = "transport-cms")]
 				HandshakeProtocolKind::Cms => {
 					// Use factory method to create CMS server with concrete key type
-					key_manager.create_cms_server(client_validators.clone(), vec![])?
+					key_manager.create_cms_server(client_validators.as_ref().map(Arc::clone), vec![])?
 				}
 
 				#[cfg(not(feature = "transport-cms"))]
