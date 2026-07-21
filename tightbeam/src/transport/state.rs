@@ -6,7 +6,7 @@
 use core::time::Duration;
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
