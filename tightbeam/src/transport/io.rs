@@ -52,8 +52,8 @@ mod x509 {
 		pub use crate::crypto::sign::Verifier;
 		pub use crate::spki::EncodePublicKey;
 		pub use crate::transport::handshake::{
-			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError,
-			HandshakeProtocolKind, ServerHandshakeProtocol,
+			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError, HandshakeProtocolKind,
+			ServerHandshakeProtocol,
 		};
 	}
 
