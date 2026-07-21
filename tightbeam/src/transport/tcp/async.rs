@@ -572,6 +572,21 @@ where
 }
 
 #[cfg(feature = "x509")]
+impl<R> TransportReader<R>
+where
+	R: AsyncReadStream,
+	TransportError: From<R::Error>,
+{
+	/// Override the receive cipher's rekey record limit (RFC 8446 § 5.5).
+	/// MUST be at least the peer's send limit or legitimate records near
+	/// the limit are refused.
+	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
+		self.recv_key = self.recv_key.with_rekey_limit(limit);
+		self
+	}
+}
+
+#[cfg(feature = "x509")]
 impl<R> EnvelopeSource for TransportReader<R>
 where
 	R: AsyncReadStream,

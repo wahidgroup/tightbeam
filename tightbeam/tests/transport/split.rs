@@ -8,6 +8,8 @@
 //! - Splitting before handshake completion fails closed
 //! - A writer at its AEAD record limit fails closed with `RekeyRequired`
 //!   (RFC 8446 § 5.5 analog) instead of reusing the key
+//! - A reader facing a counter past its record limit fails closed with
+//!   `RekeyRequired` (peer overran the volume bound) instead of decrypting
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -43,7 +45,8 @@ tb_assert_spec! {
 		assertions: [
 			("split_encrypted_roundtrip", exactly!(1), equals!(true)),
 			("split_rejects_pre_handshake", exactly!(1), equals!(true)),
-			("split_rekey_limit_fails_closed", exactly!(1), equals!(true))
+			("split_rekey_limit_fails_closed", exactly!(1), equals!(true)),
+			("split_recv_rekey_limit_fails_closed", exactly!(1), equals!(true))
 		]
 	}
 }
@@ -58,6 +61,7 @@ tb_scenario! {
 			split_encrypted_roundtrip(&trace).await?;
 			split_rejects_pre_handshake(&trace).await?;
 			split_rekey_limit_fails_closed(&trace).await?;
+			split_recv_rekey_limit_fails_closed(&trace).await?;
 			Ok(())
 		}
 	}
@@ -165,5 +169,39 @@ async fn split_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(), Ti
 	await_ok(server_handle, "server task must not panic").await?;
 
 	trace.event_with("split_rekey_limit_fails_closed", &[], rekey_required)?;
+	Ok(())
+}
+
+/// A reader facing a counter past its record limit must fail closed with
+/// `RekeyRequired` (the peer overran the AES-GCM volume bound), surfacing
+/// it as `OperationFailed(RekeyRequired)` rather than a generic
+/// `InvalidMessage`.
+async fn split_recv_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(), TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let (listener, addr) = bind_encrypted_listener(&materials).await?;
+
+	let server_handle = tokio::spawn(async move {
+		let (_reader, mut writer) = accept_handshaken_split(listener).await?;
+
+		writer.write_envelope(request_envelope()).await?;
+		writer.write_envelope(request_envelope()).await?;
+
+		Ok::<(), TightBeamError>(())
+	});
+
+	let (reader, _writer) = connect_handshaken_split(addr, &materials.certificate).await?;
+	let mut reader = reader.with_rekey_limit(1);
+
+	let within_limit = reader.read_envelope().await?;
+	let arrived = matches!(within_limit, TransportEnvelope::Request(_));
+
+	// The peer's second record carries a counter at the clamped limit: the
+	// reader must demand a rekey instead of decrypting it.
+	let over_limit = reader.read_envelope().await;
+	let rekey_required = matches!(over_limit, Err(TransportError::OperationFailed(TransportFailure::RekeyRequired)));
+
+	await_ok(server_handle, "server task must not panic").await?;
+
+	trace.event_with("split_recv_rekey_limit_fails_closed", &[], arrived && rekey_required)?;
 	Ok(())
 }

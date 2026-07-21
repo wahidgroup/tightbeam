@@ -31,7 +31,8 @@ pub enum TransportFailure {
 	EncryptorUnavailable,
 	/// Random nonce generation failed
 	NonceGenerationFailed,
-	/// Send cipher hit its record limit. Reestablish the session to rekey
+	/// AEAD record limit reached: send cipher halted or peer overran the
+	/// volume bound. Reestablish the session to rekey
 	RekeyRequired,
 	/// Inbound AEAD sequence violation: replay, reorder, or deletion of an
 	/// envelope on the connection (CWE-345)
@@ -152,6 +153,10 @@ impl From<TightBeamError> for TransportError {
 			// indistinguishable from tampering. Surface them as such.
 			#[cfg(feature = "aead")]
 			TightBeamError::NonceReplayed(_) => TransportError::OperationFailed(TransportFailure::TamperDetected),
+			// Receive side hits this only when the peer overran the per-key
+			// volume bound. Session unusable either way.
+			#[cfg(feature = "aead")]
+			TightBeamError::RekeyRequired => TransportError::OperationFailed(TransportFailure::RekeyRequired),
 			_ => TransportError::InvalidMessage,
 		}
 	}
