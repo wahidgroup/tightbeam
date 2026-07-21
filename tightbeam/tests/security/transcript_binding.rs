@@ -138,7 +138,7 @@ job! {
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let materials = ServerMaterials::generate();
 
-		// Phase 1: MITM downgrade — swap accepted profile without touching
+		// Phase 1: MITM downgrade: swap accepted profile without touching
 		// randoms, cert, or signature.
 		let (mut client, mut server, strong, weak) = strong_weak_pair(&materials);
 		let client_hello = client.build_client_hello()?;

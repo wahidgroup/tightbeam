@@ -167,7 +167,7 @@ pub mod kari;
 pub mod processors;
 
 pub use attributes::*;
-pub use common::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
+pub use common::{DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 pub use error::HandshakeError;
 pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generate_cek};
 
@@ -180,22 +180,30 @@ pub use kari::{kari_unwrap_hybrid, kari_wrap_hybrid};
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 
+use core::future::Future;
 use core::marker::PhantomData;
+use core::pin::Pin;
+use core::result::Result as CoreResult;
 
 use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
 use crate::cms::signed_data::SignedData;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
-use crate::crypto::aead::RuntimeAead;
+use crate::crypto::aead::SessionKeys;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
 use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::SetOfVec;
-use crate::der::{Decode, Encode, Enumerated, Sequence};
+use crate::der::{Any, Decode, Encode, Enumerated, Sequence, Tag};
+use crate::oids::{CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA};
 use crate::transport::error::TransportError;
 use crate::transport::handshake::error::Result;
-use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
+use crate::transport::handshake::negotiation::{
+	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
+};
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::server::CmsHandshakeServer;
 use crate::Beamable;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -362,6 +370,8 @@ pub struct CmsClientConfig {
 	pub trust_store: Arc<dyn CertificateTrust>,
 	/// Profiles offered to the server for negotiation.
 	pub security_offer: Option<SecurityOffer>,
+	/// Transport capabilities (multiplexing) offered to the server.
+	pub transport_offer: Option<TransportOffer>,
 	/// Client certificate embedded in the Finished message for mutual
 	/// authentication.
 	pub client_certificate: Option<Arc<Certificate>>,
@@ -436,6 +446,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		aad_domain_tag: Option<&'static [u8]>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+		transport_config: Option<TransportOffer>,
 	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>
 	where
 		P::Curve: Curve + CurveArithmetic,
@@ -449,6 +460,10 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		let provider = Arc::clone(&self.provider);
 		let mut server = EciesHandshakeServer::<P>::new(provider, server_cert, aad_domain_tag, client_validators);
 		server = server.with_supported_profiles(supported_profiles);
+
+		if let Some(config) = transport_config {
+			server = server.with_transport_config(config);
+		}
 
 		Ok(Box::new(server))
 	}
@@ -473,6 +488,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		client_cert: Option<Arc<Certificate>>,
 		aad_domain_tag: Option<&'static [u8]>,
 		validator: Option<Arc<dyn CertificateValidation>>,
+		transport_offer: Option<TransportOffer>,
 	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>
 	where
 		M: EciesMessageOps + Send + Sync + 'static,
@@ -489,13 +505,14 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	{
 		let provider_opt = client_cert.as_ref().map(|_| Arc::clone(&self.provider));
 
-		let client = EciesHandshakeClient::<P, M>::new_with_identity(aad_domain_tag, client_cert, provider_opt);
+		let mut client = EciesHandshakeClient::<P, M>::new_with_identity(aad_domain_tag, client_cert, provider_opt);
 
-		let client = if let Some(validator) = validator {
-			client.with_certificate_validator(validator)
-		} else {
-			client
-		};
+		if let Some(validator) = validator {
+			client = client.with_certificate_validator(validator);
+		}
+		if let Some(offer) = transport_offer {
+			client = client.with_transport_offer(offer);
+		}
 
 		Ok(Box::new(client))
 	}
@@ -536,6 +553,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		if let Some(offer) = config.security_offer {
 			client = client.with_security_offer(offer);
 		}
+		if let Some(offer) = config.transport_offer {
+			client = client.with_transport_offer(offer);
+		}
 		if let Some(cert) = config.client_certificate {
 			client = client.with_client_certificate(cert);
 		}
@@ -558,6 +578,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		&'a self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 		supported_profiles: Vec<SecurityProfileDesc>,
+		transport_config: Option<TransportOffer>,
 	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>
 	where
 		P::Curve: Curve + CurveArithmetic,
@@ -570,8 +591,12 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	{
 		let provider = Arc::clone(&self.provider);
 
-		let mut server = crate::transport::handshake::server::CmsHandshakeServer::<P>::new(provider, client_validators);
+		let mut server = CmsHandshakeServer::<P>::new(provider, client_validators);
 		server = server.with_supported_profiles(supported_profiles);
+
+		if let Some(config) = transport_config {
+			server = server.with_transport_config(config);
+		}
 
 		Ok(Box::new(server))
 	}
@@ -636,9 +661,7 @@ pub trait ClientHandshakeProtocol: Send {
 
 	/// Start the handshake, returns the first message to send to the server.
 	#[allow(clippy::type_complexity)]
-	fn start<'a>(
-		&'a mut self,
-	) -> core::pin::Pin<Box<dyn core::future::Future<Output = ::core::result::Result<Vec<u8>, Self::Error>> + Send + 'a>>;
+	fn start<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<Vec<u8>, Self::Error>> + Send + 'a>>;
 
 	/// Handle a response from the server.
 	///
@@ -648,24 +671,19 @@ pub trait ClientHandshakeProtocol: Send {
 	fn handle_response<'a, 'b>(
 		&'a mut self,
 		msg: &'b [u8],
-	) -> core::pin::Pin<
-		Box<dyn core::future::Future<Output = ::core::result::Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>,
-	>
+	) -> Pin<Box<dyn Future<Output = CoreResult<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
 	where
 		'b: 'a;
 
-	/// Complete the handshake and extract the session key as RuntimeAead.
+	/// Complete the handshake and extract the directional session keys.
 	///
 	/// Should be called after the handshake is complete (when `is_complete()` returns true).
-	/// Returns a RuntimeAead containing the negotiated cipher with the derived session key.
+	/// Returns role-mapped [`SessionKeys`]: the client sends on the
+	/// client-to-server key and receives on the server-to-client key.
 	/// The cipher type is determined by the CryptoProvider's AeadCipher associated type,
 	/// and the OID is taken from the negotiated security profile.
 	#[cfg(feature = "aead")]
-	fn complete<'a>(
-		&'a mut self,
-	) -> core::pin::Pin<
-		Box<dyn core::future::Future<Output = ::core::result::Result<RuntimeAead, Self::Error>> + Send + 'a>,
-	>;
+	fn complete<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<SessionKeys, Self::Error>> + Send + 'a>>;
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
@@ -676,6 +694,14 @@ pub trait ClientHandshakeProtocol: Send {
 	/// after successful profile negotiation during handshake. Returns `None` if
 	/// negotiation has not occurred yet.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
+
+	/// Get the negotiated multiplexing settings.
+	///
+	/// Returns `Some(MuxSettings)` only when both sides negotiated
+	/// multiplexing during the handshake. `None` means lock-step.
+	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		None
+	}
 }
 
 /// Server-side handshake protocol trait.
@@ -694,24 +720,19 @@ pub trait ServerHandshakeProtocol: Send {
 	fn handle_request<'a, 'b>(
 		&'a mut self,
 		msg: &'b [u8],
-	) -> core::pin::Pin<
-		Box<dyn core::future::Future<Output = ::core::result::Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>,
-	>
+	) -> Pin<Box<dyn Future<Output = CoreResult<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
 	where
 		'b: 'a;
 
-	/// Complete the handshake and extract the session key as RuntimeAead.
+	/// Complete the handshake and extract the directional session keys.
 	///
 	/// Should be called after the handshake is complete (when `is_complete()` returns true).
-	/// Returns a RuntimeAead containing the negotiated cipher with the derived session key.
+	/// Returns role-mapped [`SessionKeys`]: the server sends on the
+	/// server-to-client key and receives on the client-to-server key.
 	/// The cipher type is determined by the CryptoProvider's AeadCipher associated type,
 	/// and the OID is taken from the negotiated security profile.
 	#[cfg(feature = "aead")]
-	fn complete<'a>(
-		&'a mut self,
-	) -> core::pin::Pin<
-		Box<dyn core::future::Future<Output = ::core::result::Result<RuntimeAead, Self::Error>> + Send + 'a>,
-	>;
+	fn complete<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<SessionKeys, Self::Error>> + Send + 'a>>;
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
@@ -733,6 +754,14 @@ pub trait ServerHandshakeProtocol: Send {
 	/// after successful profile negotiation during handshake. Returns `None` if
 	/// negotiation has not occurred yet.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
+
+	/// Get the negotiated multiplexing settings.
+	///
+	/// Returns `Some(MuxSettings)` only when both sides negotiated
+	/// multiplexing during the handshake. `None` means lock-step.
+	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		None
+	}
 }
 
 // ============================================================================
@@ -764,6 +793,10 @@ pub struct ClientHello {
 	pub client_random: OctetString,
 	#[asn1(optional = "true")]
 	pub security_offer: Option<SecurityOffer>,
+	/// Transport capability offer (multiplexing). Context-tagged so it can
+	/// never be confused with the preceding optional SEQUENCE.
+	#[asn1(context_specific = "0", optional = "true")]
+	pub transport_offer: Option<TransportOffer>,
 }
 
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
@@ -777,6 +810,10 @@ pub struct ServerHandshake {
 	/// Indicates if the server requires client certificate for mutual authentication.
 	/// When true, client must provide certificate in ClientKeyExchange.
 	pub client_cert_required: bool,
+	/// Transport capability accept (multiplexing). Present only when the
+	/// client offered and the server enabled multiplexing locally.
+	#[asn1(context_specific = "0", optional = "true")]
+	pub transport_accept: Option<TransportAccept>,
 }
 
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
@@ -803,12 +840,12 @@ fn encodable_to_signed_data<T: Encode>(message: &T) -> Result<SignedData> {
 	let message_der = message.to_der()?;
 	let octet_string = OctetString::new(message_der)?;
 	// Create der::Any directly from the OctetString's DER encoding
-	let econtent = crate::der::Any::new(crate::der::Tag::OctetString, octet_string.to_der()?)?;
+	let econtent = Any::new(Tag::OctetString, octet_string.to_der()?)?;
 
 	Ok(SignedData {
 		version: CmsVersion::V1,
 		digest_algorithms: Default::default(),
-		encap_content_info: EncapsulatedContentInfo { econtent_type: crate::oids::DATA, econtent: Some(econtent) },
+		encap_content_info: EncapsulatedContentInfo { econtent_type: DATA, econtent: Some(econtent) },
 		certificates: None,
 		crls: None,
 		signer_infos: SignerInfos::try_from(Vec::new())?,
@@ -833,7 +870,7 @@ fn signed_data_to_decodable<T: for<'a> Decode<'a>>(signed_data: &SignedData) -> 
 impl TryFrom<&ClientHello> for SignedData {
 	type Error = HandshakeError;
 
-	fn try_from(hello: &ClientHello) -> ::core::result::Result<Self, Self::Error> {
+	fn try_from(hello: &ClientHello) -> CoreResult<Self, Self::Error> {
 		encodable_to_signed_data(hello)
 	}
 }
@@ -842,7 +879,7 @@ impl TryFrom<&ClientHello> for SignedData {
 impl TryFrom<&SignedData> for ClientHello {
 	type Error = HandshakeError;
 
-	fn try_from(signed_data: &SignedData) -> ::core::result::Result<Self, Self::Error> {
+	fn try_from(signed_data: &SignedData) -> CoreResult<Self, Self::Error> {
 		signed_data_to_decodable(signed_data)
 	}
 }
@@ -851,7 +888,7 @@ impl TryFrom<&SignedData> for ClientHello {
 impl TryFrom<&ServerHandshake> for SignedData {
 	type Error = HandshakeError;
 
-	fn try_from(handshake: &ServerHandshake) -> ::core::result::Result<Self, Self::Error> {
+	fn try_from(handshake: &ServerHandshake) -> CoreResult<Self, Self::Error> {
 		encodable_to_signed_data(handshake)
 	}
 }
@@ -860,7 +897,7 @@ impl TryFrom<&ServerHandshake> for SignedData {
 impl TryFrom<&SignedData> for ServerHandshake {
 	type Error = HandshakeError;
 
-	fn try_from(signed_data: &SignedData) -> ::core::result::Result<Self, Self::Error> {
+	fn try_from(signed_data: &SignedData) -> CoreResult<Self, Self::Error> {
 		signed_data_to_decodable(signed_data)
 	}
 }
@@ -875,17 +912,19 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 		// Wrap certificate DER in OCTET STRING since certs are SEQUENCE internally
 		let cert_octet = OctetString::new(cert_der)?;
 		let cert_der_wrapped = cert_octet.to_der()?;
-		let cert_any = crate::der::Any::new(crate::der::Tag::OctetString, cert_der_wrapped)?;
+		let cert_any = Any::new(Tag::OctetString, cert_der_wrapped)?;
 		let cert_values = SetOfVec::try_from(vec![AttributeValue::from(cert_any)])?;
-		attrs.push(Attribute { oid: crate::oids::CLIENT_CERTIFICATE, values: cert_values });
+
+		attrs.push(Attribute { oid: CLIENT_CERTIFICATE, values: cert_values });
 	}
 
 	if let Some(sig) = &kex.client_signature {
 		// Signature is already an OCTET STRING
 		let sig_der = sig.to_der()?;
-		let sig_any = crate::der::Any::new(crate::der::Tag::OctetString, sig_der)?;
+		let sig_any = Any::new(Tag::OctetString, sig_der)?;
 		let sig_values = SetOfVec::try_from(vec![AttributeValue::from(sig_any)])?;
-		attrs.push(Attribute { oid: crate::oids::CLIENT_SIGNATURE, values: sig_values });
+
+		attrs.push(Attribute { oid: CLIENT_SIGNATURE, values: sig_values });
 	}
 
 	if attrs.is_empty() {
@@ -898,20 +937,20 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 /// Helper function to parse unprotected attributes from EnvelopedData
 #[cfg(feature = "x509")]
 fn parse_client_key_exchange_attrs(
-	enveloped_data: &crate::cms::enveloped_data::EnvelopedData,
+	enveloped_data: &EnvelopedData,
 ) -> Result<(Option<Certificate>, Option<OctetString>)> {
 	let mut cert = None;
 	let mut sig = None;
 
 	if let Some(attrs) = &enveloped_data.unprotected_attrs {
 		for attr in attrs.iter() {
-			if attr.oid == crate::oids::CLIENT_CERTIFICATE {
+			if attr.oid == CLIENT_CERTIFICATE {
 				if let Some(value) = attr.values.iter().next() {
 					let octet_bytes = value.value();
 					let cert_octet = OctetString::from_der(octet_bytes)?;
 					cert = Some(Certificate::from_der(cert_octet.as_bytes())?);
 				}
-			} else if attr.oid == crate::oids::CLIENT_SIGNATURE {
+			} else if attr.oid == CLIENT_SIGNATURE {
 				if let Some(value) = attr.values.iter().next() {
 					let octet_bytes = value.value();
 					sig = Some(OctetString::from_der(octet_bytes)?);
@@ -924,10 +963,10 @@ fn parse_client_key_exchange_attrs(
 }
 
 /// Convert ClientKeyExchange to EnvelopedData (opaque wrapper for ECIES ciphertext)
-impl TryFrom<&ClientKeyExchange> for crate::cms::enveloped_data::EnvelopedData {
+impl TryFrom<&ClientKeyExchange> for EnvelopedData {
 	type Error = HandshakeError;
 
-	fn try_from(kex: &ClientKeyExchange) -> ::core::result::Result<Self, Self::Error> {
+	fn try_from(kex: &ClientKeyExchange) -> CoreResult<Self, Self::Error> {
 		// Build unprotected attributes for client certificate and signature
 		#[cfg(feature = "x509")]
 		let unprotected_attrs = build_client_key_exchange_attrs(kex)?;
@@ -940,8 +979,8 @@ impl TryFrom<&ClientKeyExchange> for crate::cms::enveloped_data::EnvelopedData {
 			originator_info: None,
 			recip_infos: RecipientInfos::try_from(Vec::new())?,
 			encrypted_content: EncryptedContentInfo {
-				content_type: crate::oids::DATA,
-				content_enc_alg: crate::transport::handshake::utils::aes_256_gcm_algorithm(),
+				content_type: DATA,
+				content_enc_alg: aes_256_gcm_algorithm(),
 				encrypted_content: Some(OctetString::new(kex.encrypted_data.as_bytes())?),
 			},
 			unprotected_attrs,
@@ -950,12 +989,10 @@ impl TryFrom<&ClientKeyExchange> for crate::cms::enveloped_data::EnvelopedData {
 }
 
 /// Extract ClientKeyExchange from EnvelopedData
-impl TryFrom<&crate::cms::enveloped_data::EnvelopedData> for ClientKeyExchange {
+impl TryFrom<&EnvelopedData> for ClientKeyExchange {
 	type Error = HandshakeError;
 
-	fn try_from(
-		enveloped_data: &crate::cms::enveloped_data::EnvelopedData,
-	) -> ::core::result::Result<Self, Self::Error> {
+	fn try_from(enveloped_data: &EnvelopedData) -> CoreResult<Self, Self::Error> {
 		let encrypted_bytes = enveloped_data
 			.encrypted_content
 			.encrypted_content

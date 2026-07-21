@@ -24,6 +24,7 @@ pub mod common;
 pub mod confidentiality;
 pub mod dos_attack;
 pub mod downgrade_attack;
+pub mod envelope_tamper;
 pub mod forward_secrecy;
 pub mod mitm_attack;
 pub mod nonce_reuse;

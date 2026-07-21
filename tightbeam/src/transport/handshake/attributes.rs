@@ -4,16 +4,19 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use core::cmp::{Ord, Ordering, PartialOrd};
+
 use crate::crypto::x509::attr::Attribute;
 use crate::der::asn1::{ObjectIdentifier, OctetString, UintRef};
 use crate::der::{asn1::Any, Sequence, Tagged};
-use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
+use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
 
 use super::{HandshakeAlert, HandshakeError};
 use crate::oids::{
 	HANDSHAKE_ABORT_ALERT, HANDSHAKE_ALGORITHM_PROFILE, HANDSHAKE_CLIENT_NONCE, HANDSHAKE_PROTOCOL_VERSION,
 	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SELECTED_CURVE, HANDSHAKE_SELECT_ALGORITHM,
 	HANDSHAKE_SELECT_VERSION, HANDSHAKE_SERVER_NONCE, HANDSHAKE_SUPPORTED_CURVES, HANDSHAKE_TRANSCRIPT_HASH,
+	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER,
 };
 
 /// Maximum number of curve OIDs accepted in a supported-curves attribute.
@@ -30,16 +33,16 @@ pub struct HandshakeAttribute {
 
 // Provide ordering for canonical DER SET OF encoding. Order by attr_type OID bytes,
 // then lexicographically by each value's encoding (tag octet, then content octets).
-impl core::cmp::PartialOrd for HandshakeAttribute {
-	fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+impl PartialOrd for HandshakeAttribute {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
-impl core::cmp::Ord for HandshakeAttribute {
-	fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+impl Ord for HandshakeAttribute {
+	fn cmp(&self, other: &Self) -> Ordering {
 		let oid_ord = self.attr_type.as_bytes().cmp(other.attr_type.as_bytes());
-		if oid_ord != core::cmp::Ordering::Equal {
+		if oid_ord != Ordering::Equal {
 			return oid_ord;
 		}
 
@@ -194,6 +197,33 @@ pub fn security_accept_transcript_bytes(accept: &SecurityAccept) -> Result<Vec<u
 	Ok(Any::encode_from(accept)?.to_der()?)
 }
 
+/// Encode TransportOffer for wire transmission.
+///
+/// Client uses this to advertise transport capabilities (multiplexing).
+pub fn encode_transport_offer(offer: &TransportOffer) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(offer)?;
+	HandshakeAttribute::new_single(HANDSHAKE_TRANSPORT_OFFER, any)
+}
+
+/// Encode TransportAccept for wire transmission.
+///
+/// Server uses this to activate multiplexing offered by the client.
+pub fn encode_transport_accept(accept: &TransportAccept) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(accept)?;
+	HandshakeAttribute::new_single(HANDSHAKE_TRANSPORT_ACCEPT, any)
+}
+
+/// Canonical DER bytes of a `TransportAccept` for transcript binding.
+///
+/// Same contract as [`security_accept_transcript_bytes`]: a tampered
+/// transport accept attribute changes the transcript hash and fails
+/// signature verification (CWE-345).
+pub fn transport_accept_transcript_bytes(accept: &TransportAccept) -> Result<Vec<u8>, HandshakeError> {
+	use crate::der::Encode;
+
+	Ok(Any::encode_from(accept)?.to_der()?)
+}
+
 // -------------------------- Decoders --------------------------
 
 pub fn extract_nonce(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeError> {
@@ -302,6 +332,26 @@ pub fn extract_security_offer(attr: &HandshakeAttribute) -> Result<SecurityOffer
 /// The decoded SecurityAccept
 pub fn extract_security_accept(attr: &HandshakeAttribute) -> Result<SecurityAccept, HandshakeError> {
 	if attr.attr_type != HANDSHAKE_SECURITY_ACCEPT {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let any = attr.value()?;
+	Ok(any.decode_as()?)
+}
+
+/// Extract TransportOffer from unprotected attributes.
+pub fn extract_transport_offer(attr: &HandshakeAttribute) -> Result<TransportOffer, HandshakeError> {
+	if attr.attr_type != HANDSHAKE_TRANSPORT_OFFER {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let any = attr.value()?;
+	Ok(any.decode_as()?)
+}
+
+/// Extract TransportAccept from unprotected attributes.
+pub fn extract_transport_accept(attr: &HandshakeAttribute) -> Result<TransportAccept, HandshakeError> {
+	if attr.attr_type != HANDSHAKE_TRANSPORT_ACCEPT {
 		return Err(HandshakeError::MissingAttribute);
 	}
 
@@ -590,9 +640,9 @@ mod tests {
 	fn attribute_ord_tiebreaks_on_value() -> Result<(), der::Error> {
 		let low = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE, attr_values: vec![mk_integer(&[0x01])?] };
 		let high = HandshakeAttribute { attr_type: HANDSHAKE_CLIENT_NONCE, attr_values: vec![mk_integer(&[0x02])?] };
-		assert_eq!(low.cmp(&high), core::cmp::Ordering::Less);
-		assert_eq!(high.cmp(&low), core::cmp::Ordering::Greater);
-		assert_eq!(low.cmp(&low.clone()), core::cmp::Ordering::Equal);
+		assert_eq!(low.cmp(&high), Ordering::Less);
+		assert_eq!(high.cmp(&low), Ordering::Greater);
+		assert_eq!(low.cmp(&low.clone()), Ordering::Equal);
 		Ok(())
 	}
 

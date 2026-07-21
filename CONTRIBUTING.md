@@ -49,7 +49,7 @@ The following commands MAY be used during development:
 # Basic development
 make help                              # Help
 make build                             # Build all projects
-make clean                             # Clean build artifacts  
+make clean                             # Clean build artifacts
 make test                              # Run all tests
 make lint                              # Run linters
 make lint ARGS="--fix --allow-matrixd" # Run linters with fixes
@@ -62,7 +62,7 @@ make build features="zstd,compress"
 make build features="x509,signature"
 
 # Testing with specific features
-make test features="testing,std,tcp,tokio" 
+make test features="testing,std,tcp,tokio"
 make test features="testing" no-default=1
 
 # Development server (from project root)
@@ -90,9 +90,10 @@ Contributors SHOULD:
 - Keep commits focused on a single change
 - Reference issues in commit messages when applicable
 - Follow conventional commit format where possible:
+
   ```
   type(scope): description
-  
+
   feat: add new compression algorithm
   fix: resolve race condition in transport layer
   docs: update ASN.1 specification examples
@@ -119,14 +120,14 @@ The type MUST be one of:
 | ---------- | ------------------------------------------------------- | ------ |
 | `feat`     | New feature                                             | MINOR  |
 | `fix`      | Bug fix                                                 | PATCH  |
-| `docs`     | Documentation only                                      | —      |
-| `style`    | Formatting, whitespace, no logic change                 | —      |
-| `refactor` | Code change that neither fixes a bug nor adds a feature | —      |
+| `docs`     | Documentation only                                      | -      |
+| `style`    | Formatting, whitespace, no logic change                 | -      |
+| `refactor` | Code change that neither fixes a bug nor adds a feature | -      |
 | `perf`     | Performance improvement                                 | PATCH  |
-| `test`     | Adding or correcting tests                              | —      |
-| `build`    | Build system or dependency changes                      | —      |
-| `ci`       | CI configuration changes                                | —      |
-| `chore`    | Maintenance, no production code change                  | —      |
+| `test`     | Adding or correcting tests                              | -      |
+| `build`    | Build system or dependency changes                      | -      |
+| `ci`       | CI configuration changes                                | -      |
+| `chore`    | Maintenance, no production code change                  | -      |
 
 #### Scope
 
@@ -227,5 +228,5 @@ For significant changes, contributors MUST follow the TIP process:
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the 
+By contributing, you agree that your contributions will be licensed under the
 same dual MIT/Apache-2.0 license as the project.

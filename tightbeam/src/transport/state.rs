@@ -10,10 +10,11 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use crate::crypto::aead::RuntimeAead;
+use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
+use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 use crate::transport::handshake::{
 	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
 };
@@ -29,11 +30,11 @@ pub trait EncryptedProtocolState {
 	/// The crypto provider used by this transport
 	type CryptoProvider: CryptoProvider + Send + Sync + 'static;
 
-	/// Get the encryptor instance (RuntimeAead)
-	fn to_encryptor_ref(&self) -> TransportResult<&RuntimeAead>;
+	/// Get the send-direction cipher (counter-nonce encryptor)
+	fn to_encryptor_ref(&self) -> TransportResult<&SendCipher>;
 
-	/// Get the decryptor instance (RuntimeAead)
-	fn to_decryptor_ref(&self) -> TransportResult<&RuntimeAead>;
+	/// Get the receive-direction cipher (replay-rejecting decryptor)
+	fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher>;
 
 	/// Get current handshake state (pure accessor)
 	fn to_handshake_state(&self) -> TcpHandshakeState;
@@ -44,19 +45,25 @@ pub trait EncryptedProtocolState {
 	/// Get server certificate if present (pure accessor)
 	fn to_server_certificate_ref(&self) -> Option<&Certificate>;
 
+	/// Set the directional session keys (pure mutator)
+	fn set_session_keys(&mut self, keys: SessionKeys);
+
+	/// Helper to clear session keys (for circuit breaker)
+	fn unset_session_keys(&mut self);
+
+	/// Get the local transport capability advertisement (multiplexing)
+	fn to_mux_config(&self) -> Option<TransportOffer>;
+
+	/// Store the negotiated multiplexing settings (pure mutator)
+	fn set_mux_settings(&mut self, settings: Option<MuxSettings>);
+
+	/// Set peer certificate after mutual auth
+	fn set_peer_certificate(&mut self, _cert: Certificate);
+
 	/// Get server certificate Arc if present (zero-copy accessor)
 	fn to_server_certificate_arc(&self) -> Option<Arc<Certificate>> {
 		None
 	}
-
-	/// Set symmetric encryption key (pure mutator)
-	fn set_symmetric_key(&mut self, key: RuntimeAead);
-
-	/// Helper to clear symmetric key (for circuit breaker)
-	fn unset_symmetric_key(&mut self);
-
-	/// Set peer certificate after mutual auth
-	fn set_peer_certificate(&mut self, _cert: Certificate);
 
 	/// Maximum allowed size for cleartext envelopes (bytes)
 	fn to_max_cleartext_envelope(&self) -> Option<usize> {

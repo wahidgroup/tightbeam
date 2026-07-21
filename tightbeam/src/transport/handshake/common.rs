@@ -5,7 +5,7 @@
 //! - AEAD session key finalization (all orchestrators)
 //! - Alert attribute processing (all orchestrators)
 
-use crate::constants::{MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_SESSION_KDF_INFO};
+use crate::constants::{MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
@@ -98,6 +98,18 @@ fn aead_key_size_from_oid(oid: ObjectIdentifier) -> Result<usize, HandshakeError
 	}
 }
 
+/// Directional session ciphers derived at handshake completion.
+///
+/// Field names use the canonical client-to-server and server-to-client
+/// directions. Role mapping into send and receive sides happens in
+/// [`crate::crypto::aead::SessionKeys`].
+pub struct DirectionalCiphers<C> {
+	/// Cipher for the client-to-server direction.
+	pub client_to_server: C,
+	/// Cipher for the server-to-client direction.
+	pub server_to_client: C,
+}
+
 /// Provides session key finalization logic for all handshake orchestrators.
 ///
 /// Orchestrators must implement `selected_profile()` to expose the negotiated
@@ -106,7 +118,9 @@ fn aead_key_size_from_oid(oid: ObjectIdentifier) -> Result<usize, HandshakeError
 ///
 /// # Security Properties
 /// - Enforces minimum `MIN_SALT_ENTROPY_BYTES` salt entropy
-/// - Uses HKDF with `TIGHTBEAM_SESSION_KDF_INFO` domain separation
+/// - Uses HKDF with per-direction domain separation (`TIGHTBEAM_C2S_KDF_INFO`,
+///   `TIGHTBEAM_S2C_KDF_INFO`), the RFC 5869 info-label pattern behind the
+///   TLS 1.3 directional traffic secrets (RFC 8446, § 7.3)
 /// - Derives key size dynamically from negotiated AEAD cipher profile
 /// - Constant-time operations via underlying crypto primitives
 pub trait HandshakeFinalization<P>
@@ -116,7 +130,7 @@ where
 	/// Get the selected/negotiated security profile.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
 
-	/// Derive the final session AEAD cipher from input key material.
+	/// Derive the directional session AEAD ciphers from input key material.
 	///
 	/// # Parameters
 	/// - `input_key`: Base key material (CEK for CMS, base session key for ECIES)
@@ -125,7 +139,7 @@ where
 	///   - **ECIES**: client_random || server_random (64 bytes)
 	///
 	/// # Returns
-	/// Initialized AEAD cipher ready for encryption/decryption
+	/// Initialized client-to-server and server-to-client AEAD ciphers
 	///
 	/// # Errors
 	/// - `InvalidState`: No profile selected or profile missing AEAD OID/key size
@@ -133,7 +147,11 @@ where
 	/// - `AeadKeySizeMismatch`: Peer-declared key size disagrees with the OID
 	/// - `InsufficientSaltEntropy`: Salt shorter than `MIN_SALT_ENTROPY_BYTES`
 	/// - `KeyDerivationFailed`: HKDF or cipher initialization failed
-	fn derive_session_aead(&self, input_key: &[u8], salt: &[u8]) -> Result<P::AeadCipher, HandshakeError>
+	fn derive_directional_aead(
+		&self,
+		input_key: &[u8],
+		salt: &[u8],
+	) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError>
 	where
 		P::AeadCipher: KeyInit,
 	{
@@ -155,9 +173,26 @@ where
 			});
 		}
 
-		let final_key_bytes = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_SESSION_KDF_INFO, Some(salt), key_size)?;
-		Ok(P::AeadCipher::new_from_slice(&final_key_bytes[..])?)
+		let client_to_server = derive_labeled_cipher::<P>(input_key, salt, TIGHTBEAM_C2S_KDF_INFO, key_size)?;
+		let server_to_client = derive_labeled_cipher::<P>(input_key, salt, TIGHTBEAM_S2C_KDF_INFO, key_size)?;
+		Ok(DirectionalCiphers { client_to_server, server_to_client })
 	}
+}
+
+/// Derive one direction's cipher under the given KDF info label.
+fn derive_labeled_cipher<P>(
+	input_key: &[u8],
+	salt: &[u8],
+	info: &[u8],
+	key_size: usize,
+) -> Result<P::AeadCipher, HandshakeError>
+where
+	P: CryptoProvider,
+	P::AeadCipher: KeyInit,
+{
+	let key_bytes = P::Kdf::derive_dynamic_key(input_key, info, Some(salt), key_size)?;
+	let cipher = P::AeadCipher::new_from_slice(&key_bytes[..])?;
+	Ok(cipher)
 }
 
 /// Provides alert attribute processing for all handshake orchestrators.
@@ -209,10 +244,11 @@ pub trait HandshakeAlertHandler {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::profiles::{AeadProvider, DefaultCryptoProvider};
 	use crate::der::asn1::ObjectIdentifier;
 	use crate::oids::{AES_128_GCM, AES_256_GCM, CURVE_SECP256K1, HASH_SHA256, SIGNER_ECDSA_WITH_SHA256};
 	use crate::transport::handshake::negotiation::NegotiationError;
+	use std::error::Error;
 
 	// Mock struct for testing negotiation
 	struct MockServer {
@@ -253,7 +289,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_negotiate_profile_with_offer_enforces_floor() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_negotiate_profile_with_offer_enforces_floor() -> Result<(), Box<dyn Error>> {
 		let p_a = create_test_profile(AES_128_GCM, 16);
 		let p_b = create_test_profile(AES_256_GCM, 32);
 
@@ -267,7 +303,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_negotiate_profile_dealers_choice_skips_below_floor() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_negotiate_profile_dealers_choice_skips_below_floor() -> Result<(), Box<dyn Error>> {
 		let p_a = create_test_profile(AES_128_GCM, 16);
 		let p_b = create_test_profile(AES_256_GCM, 32);
 
@@ -300,31 +336,78 @@ mod tests {
 		assert!(matches!(result, Err(HandshakeError::NoSupportedProfiles)));
 	}
 
+	fn derive_directional(
+		client: &MockClient,
+		input_key: &[u8],
+		salt: &[u8],
+	) -> Result<DirectionalCiphers<<DefaultCryptoProvider as AeadProvider>::AeadCipher>, HandshakeError> {
+		<MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_directional_aead(client, input_key, salt)
+	}
+
 	#[test]
-	fn test_derive_session_aead_success() {
+	fn test_derive_directional_aead_success() {
 		let profile = create_test_profile(AES_256_GCM, 32);
 		let client = MockClient { profile: Some(profile) };
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
 
-		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
-			&client, &input_key, &salt,
-		);
+		let result = derive_directional(&client, &input_key, &salt);
 		assert!(result.is_ok());
 	}
 
 	#[test]
-	fn test_derive_session_aead_insufficient_salt() {
+	fn test_derive_directional_aead_directions_differ() {
+		use crate::crypto::aead::Aead;
+
+		let profile = create_test_profile(AES_256_GCM, 32);
+		let client = MockClient { profile: Some(profile) };
+
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+
+		let ciphers = derive_directional(&client, &input_key, &salt).unwrap();
+
+		// Same nonce and plaintext under both directions must produce
+		// different ciphertexts, proving the info labels separate the keys.
+		let nonce = [0u8; 12];
+		let plaintext = b"directional key separation";
+		let c2s_ciphertext = ciphers.client_to_server.encrypt((&nonce).into(), plaintext.as_slice()).unwrap();
+		let s2c_ciphertext = ciphers.server_to_client.encrypt((&nonce).into(), plaintext.as_slice()).unwrap();
+		assert_ne!(c2s_ciphertext, s2c_ciphertext);
+	}
+
+	#[test]
+	fn test_derive_directional_aead_is_deterministic() {
+		use crate::crypto::aead::Aead;
+
+		let profile = create_test_profile(AES_256_GCM, 32);
+		let client = MockClient { profile: Some(profile) };
+
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+
+		let first = derive_directional(&client, &input_key, &salt).unwrap();
+		let second = derive_directional(&client, &input_key, &salt).unwrap();
+
+		// Both derivations agree, so two independent endpoints derive the
+		// same directional keys from shared input material.
+		let nonce = [0u8; 12];
+		let plaintext = b"deterministic derivation";
+		let first_ciphertext = first.client_to_server.encrypt((&nonce).into(), plaintext.as_slice()).unwrap();
+		let second_ciphertext = second.client_to_server.encrypt((&nonce).into(), plaintext.as_slice()).unwrap();
+		assert_eq!(first_ciphertext, second_ciphertext);
+	}
+
+	#[test]
+	fn test_derive_directional_aead_insufficient_salt() {
 		let profile = create_test_profile(AES_256_GCM, 32);
 		let client = MockClient { profile: Some(profile) };
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 8]; // Only 8 bytes
 
-		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
-			&client, &input_key, &salt,
-		);
+		let result = derive_directional(&client, &input_key, &salt);
 		assert!(matches!(
 			result,
 			Err(HandshakeError::InsufficientSaltEntropy { actual: 8, minimum: 16 })
@@ -332,7 +415,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_derive_session_aead_rejects_key_size_oid_mismatch() {
+	fn test_derive_directional_aead_rejects_key_size_oid_mismatch() {
 		// Peer declares 16 bytes against an AES-256-GCM OID (CWE-345).
 		let profile = create_test_profile(AES_256_GCM, 16);
 		let client = MockClient { profile: Some(profile) };
@@ -340,9 +423,7 @@ mod tests {
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
 
-		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
-			&client, &input_key, &salt,
-		);
+		let result = derive_directional(&client, &input_key, &salt);
 		assert!(matches!(
 			result,
 			Err(HandshakeError::AeadKeySizeMismatch { declared: 16, expected: 32 })
@@ -350,7 +431,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_derive_session_aead_rejects_unknown_aead_oid() {
+	fn test_derive_directional_aead_rejects_unknown_aead_oid() {
 		// A digest OID is not an AEAD algorithm; no key size can be bound.
 		let profile = create_test_profile(HASH_SHA256, 32);
 		let client = MockClient { profile: Some(profile) };
@@ -358,22 +439,18 @@ mod tests {
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
 
-		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
-			&client, &input_key, &salt,
-		);
+		let result = derive_directional(&client, &input_key, &salt);
 		assert!(matches!(result, Err(HandshakeError::UnsupportedAeadAlgorithm)));
 	}
 
 	#[test]
-	fn test_derive_session_aead_no_profile() {
+	fn test_derive_directional_aead_no_profile() {
 		let client = MockClient { profile: None };
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
 
-		let result = <MockClient as HandshakeFinalization<DefaultCryptoProvider>>::derive_session_aead(
-			&client, &input_key, &salt,
-		);
+		let result = derive_directional(&client, &input_key, &salt);
 		assert!(matches!(result, Err(HandshakeError::InvalidState)));
 	}
 }

@@ -1,5 +1,15 @@
 use crate::asn1::Frame;
+use crate::crypto::x509::error::CertificateValidationError;
+use crate::error::TightBeamError;
 use crate::policy::TransitStatus;
+use crate::transport::handshake::{HandshakeError, HandshakeProtocolKind};
+
+#[cfg(feature = "std")]
+use std::io::Error as IoError;
+#[cfg(all(feature = "std", feature = "tcp"))]
+use std::io::ErrorKind;
+#[cfg(all(feature = "std", feature = "tcp"))]
+use std::net::AddrParseError;
 
 #[cfg(feature = "derive")]
 use crate::Errorizable;
@@ -21,6 +31,11 @@ pub enum TransportFailure {
 	EncryptorUnavailable,
 	/// Random nonce generation failed
 	NonceGenerationFailed,
+	/// Send cipher hit its record limit. Reestablish the session to rekey
+	RekeyRequired,
+	/// Inbound AEAD sequence violation: replay, reorder, or deletion of an
+	/// envelope on the connection (CWE-345)
+	TamperDetected,
 	/// Gate policy rejected (busy)
 	Busy,
 	/// Gate policy rejected (forbidden)
@@ -49,7 +64,7 @@ pub enum TransportError {
 		feature = "derive",
 		error("Handshake protocol not supported by this transport: {0:?}")
 	)]
-	UnsupportedHandshakeProtocol(crate::transport::handshake::HandshakeProtocolKind),
+	UnsupportedHandshakeProtocol(HandshakeProtocolKind),
 	#[cfg_attr(
 		feature = "derive",
 		error("Server certificate chain required but not provisioned")
@@ -67,10 +82,13 @@ pub enum TransportError {
 	InvalidAddress,
 	#[cfg_attr(feature = "derive", error("Invalid state"))]
 	InvalidState,
+	#[cfg(feature = "transport-multiplex")]
+	#[cfg_attr(feature = "derive", error("Connection draining after GoAway. No new streams"))]
+	Draining,
 	#[cfg(feature = "x509")]
 	#[cfg_attr(feature = "derive", error("Invalid certificate: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	InvalidCertificate(crate::crypto::x509::error::CertificateValidationError),
+	InvalidCertificate(CertificateValidationError),
 	#[cfg_attr(feature = "derive", error("Message not sent: {1:?} - {0:?}"))]
 	MessageNotSent(Box<Frame>, TransportFailure),
 	#[cfg_attr(feature = "derive", error("Operation failed: {0:?}"))]
@@ -78,14 +96,14 @@ pub enum TransportError {
 	#[cfg(feature = "x509")]
 	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	HandshakeError(crate::transport::handshake::HandshakeError),
+	HandshakeError(HandshakeError),
 	#[cfg_attr(feature = "derive", error("DER error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
 	DerError(der::Error),
 	#[cfg(feature = "std")]
 	#[cfg_attr(feature = "derive", error("I/O error: {0}"))]
 	#[cfg_attr(feature = "derive", from)]
-	IoError(std::io::Error),
+	IoError(IoError),
 }
 
 crate::impl_error_display!(TransportError {
@@ -105,6 +123,8 @@ crate::impl_error_display!(TransportError {
 	OperationFailed(failure) => "Operation failed: {failure:?}",
 	DerError(err) => "DER error: {err}",
 
+	#[cfg(feature = "transport-multiplex")]
+	Draining => "Connection draining after GoAway. No new streams",
 	#[cfg(feature = "x509")]
 	InvalidCertificate(err) => "Invalid certificate: {err}",
 	#[cfg(feature = "x509")]
@@ -115,8 +135,8 @@ crate::impl_error_display!(TransportError {
 
 /// Narrows [`TightBeamError`](crate::error::TightBeamError) into [`TransportError`];
 /// variants without a transport counterpart collapse to [`TransportError::InvalidMessage`].
-impl From<crate::error::TightBeamError> for TransportError {
-	fn from(err: crate::error::TightBeamError) -> Self {
+impl From<TightBeamError> for TransportError {
+	fn from(err: TightBeamError) -> Self {
 		use crate::error::TightBeamError;
 		match err {
 			TightBeamError::TransportError(t) => t,
@@ -128,6 +148,10 @@ impl From<crate::error::TightBeamError> for TransportError {
 			TightBeamError::CertificateValidationError(e) => TransportError::InvalidCertificate(e),
 			#[cfg(feature = "std")]
 			TightBeamError::IoError(e) => TransportError::IoError(e),
+			// Exact-next counter nonces make replay, reorder, and deletion
+			// indistinguishable from tampering. Surface them as such.
+			#[cfg(feature = "aead")]
+			TightBeamError::NonceReplayed(_) => TransportError::OperationFailed(TransportFailure::TamperDetected),
 			_ => TransportError::InvalidMessage,
 		}
 	}
@@ -147,13 +171,13 @@ impl From<TransitStatus> for TransportError {
 }
 
 #[cfg(all(feature = "std", not(feature = "derive")))]
-crate::impl_from!(std::io::Error => TransportError::IoError);
+crate::impl_from!(IoError => TransportError::IoError);
 #[cfg(not(feature = "derive"))]
 crate::impl_from!(der::Error => TransportError::DerError);
 #[cfg(all(feature = "x509", not(feature = "derive")))]
-crate::impl_from!(crate::transport::handshake::HandshakeError => TransportError::HandshakeError);
+crate::impl_from!(HandshakeError => TransportError::HandshakeError);
 #[cfg(all(feature = "x509", not(feature = "derive")))]
-crate::impl_from!(crate::crypto::x509::error::CertificateValidationError => TransportError::InvalidCertificate);
+crate::impl_from!(CertificateValidationError => TransportError::InvalidCertificate);
 
 crate::impl_from!(
 	spki::Error => TransportError::DerError extract spki::Error::Asn1(der_err) =>
@@ -167,24 +191,30 @@ crate::impl_from!(
 
 // Wrap AddrParseError in IoError
 #[cfg(all(feature = "std", feature = "tcp"))]
-impl From<std::net::AddrParseError> for TransportError {
-	fn from(err: std::net::AddrParseError) -> Self {
-		TransportError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, err))
+impl From<AddrParseError> for TransportError {
+	fn from(err: AddrParseError) -> Self {
+		TransportError::IoError(IoError::new(ErrorKind::InvalidInput, err))
 	}
+}
+
+#[cfg(feature = "tokio")]
+mod tokio_rt {
+	pub use tokio::task::JoinError;
+	pub use tokio::time::error::Elapsed;
 }
 
 // Wrap JoinError in IoError
 #[cfg(feature = "tokio")]
-impl From<tokio::task::JoinError> for TransportError {
-	fn from(err: tokio::task::JoinError) -> Self {
-		TransportError::IoError(std::io::Error::other(err))
+impl From<tokio_rt::JoinError> for TransportError {
+	fn from(err: tokio_rt::JoinError) -> Self {
+		TransportError::IoError(IoError::other(err))
 	}
 }
 
 // Convert timeout errors
 #[cfg(feature = "tokio")]
-impl From<tokio::time::error::Elapsed> for TransportError {
-	fn from(_: tokio::time::error::Elapsed) -> Self {
+impl From<tokio_rt::Elapsed> for TransportError {
+	fn from(_: tokio_rt::Elapsed) -> Self {
 		TransportError::OperationFailed(TransportFailure::Timeout)
 	}
 }
@@ -193,7 +223,7 @@ impl From<tokio::time::error::Elapsed> for TransportError {
 #[cfg(all(feature = "x509", feature = "secp256k1"))]
 impl From<k256::ecdsa::Error> for TransportError {
 	fn from(err: k256::ecdsa::Error) -> Self {
-		TransportError::HandshakeError(crate::transport::handshake::HandshakeError::from(err))
+		TransportError::HandshakeError(HandshakeError::from(err))
 	}
 }
 
@@ -203,7 +233,7 @@ impl TransportError {
 	}
 
 	/// Extract Frame from error if present, otherwise returns None
-	pub fn take_frame(self) -> Option<crate::asn1::Frame> {
+	pub fn take_frame(self) -> Option<Frame> {
 		match self {
 			TransportError::MessageNotSent(frame, _) => Some(*frame),
 			_ => None,
@@ -211,7 +241,7 @@ impl TransportError {
 	}
 
 	/// Extract Frame from error if present without consuming the error
-	pub fn frame(&self) -> Option<&crate::asn1::Frame> {
+	pub fn frame(&self) -> Option<&Frame> {
 		match self {
 			TransportError::MessageNotSent(frame, _) => Some(frame),
 			_ => None,

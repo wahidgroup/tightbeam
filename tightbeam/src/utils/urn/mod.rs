@@ -131,7 +131,7 @@ impl<'a> Urn<'a> {
 		S::validate(&builder as &dyn UrnComponents)
 	}
 
-	/// Validate that the NID conforms to RFC 8141 Section 2.3.1
+	/// Validate that the NID conforms to RFC 8141 § 2.3.1
 	/// See: `<https://datatracker.ietf.org/doc/html/rfc8141#section-2.1>`
 	///
 	/// NID must be 2-32 characters, alphanumeric plus hyphens, starting with a letter.

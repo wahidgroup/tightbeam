@@ -1,16 +1,33 @@
-//! TODO Multiplexing support for concurrent requests on a single connection
+//! HTTP/2-style multiplexing: concurrent request/response streams over a
+//! single encrypted connection.
 //!
-//! This module provides stub interfaces for HTTP/2-style multiplexing.
+//! A [`MuxTransport`] is built from the split halves of a handshaken
+//! transport ([`TransportReader`]/[`TransportWriter`], see
+//! [`TcpTransport::into_split`](crate::transport::TcpTransport::into_split))
+//! plus the [`MuxSettings`] negotiated during the handshake. It decomposes
+//! into four parts:
 //!
-//! # Stability
+//! - [`MuxWriterDriver`]: single serialization point. Drains an outbound
+//!   queue, encrypts with the send key, writes to the write half.
+//! - [`MuxReaderDriver`]: reads from the read half, decrypts with the recv
+//!   key, routes responses to their pending streams and requests to the
+//!   responder.
+//! - [`MuxHandle`]: cloneable client handle. [`MuxHandle::emit_on_stream`]
+//!   allocates a stream, sends the request, and awaits the correlated
+//!   response.
+//! - [`MuxResponder`]: serves peer-initiated streams with a caller-supplied
+//!   handler, enforcing the advertised concurrency cap.
 //!
-//! UNSTABLE: trait surface only, no implementation exists yet. The API
-//! may change or be removed without a major version bump.
+//! Stream ID rules follow RFC 9113 § 5.1.1/5.1.2: odd IDs are
+//! client-initiated, even IDs server-initiated, ID 0 is reserved and never
+//! allocated, and each endpoint allocates strictly monotonically. Per-stream
+//! timeouts compose externally: wrap the emit future in a timeout and the
+//! drop guard cancels the stream on expiry.
 
 use core::future::Future;
 
-use crate::transport::protocols::Protocol;
 use crate::transport::TransportResult;
+use crate::utils::marker::MaybeSend;
 use crate::Frame;
 
 /// Stream identifier for multiplexed protocols
@@ -42,54 +59,11 @@ impl StreamId {
 	}
 }
 
-/// Multiplexed frame with stream correlation
-///
-/// Wraps a TightBeam frame with stream metadata for concurrent
-/// request/response handling on a single connection.
-#[derive(Debug, Clone)]
-pub struct MultiplexedFrame {
-	/// Stream ID for correlation
-	pub stream_id: StreamId,
-	/// The actual TightBeam frame
-	pub frame: Frame,
-}
-
-/// Protocol multiplexing (multiple concurrent requests on one connection)
-///
-/// Implementations provide HTTP/2-style stream multiplexing over a single
-/// physical connection, enabling concurrent request/response pairs without
-/// head-of-line blocking.
-pub trait MultiplexedProtocol: Protocol {
-	/// Maximum number of concurrent streams allowed
-	///
-	/// Similar to HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS.
-	/// Returns 0 for unlimited (not recommended).
-	fn max_concurrent_streams() -> u32;
-
-	/// Send frame on a specific stream
-	///
-	/// If the stream does not exist, it is implicitly created.
-	/// Returns the response frame (if any) for this stream.
-	#[allow(async_fn_in_trait)]
-	fn emit_on_stream(
-		&mut self,
-		stream_id: StreamId,
-		frame: Frame,
-	) -> impl Future<Output = TransportResult<Option<Frame>>> + Send;
-
-	/// Allocate a new stream ID
-	///
-	/// Returns None if max concurrent streams reached.
-	/// Client implementations should return odd IDs, server implementations even IDs.
-	fn allocate_stream_id(&mut self) -> Option<StreamId>;
-
-	/// Close a specific stream
-	///
-	/// Best-effort close, should not panic.
-	fn close_stream(&mut self, stream_id: StreamId);
-}
-
 /// Stream state for multiplexed transports
+///
+/// Streams in `Open`, `HalfClosedLocal`, or `HalfClosedRemote` count toward
+/// the peer-advertised concurrency cap. `Idle` and `Closed` do not
+/// (RFC 9113 § 5.1.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
 	/// Stream is idle (not yet used)
@@ -104,4 +78,938 @@ pub enum StreamState {
 	Closed,
 }
 
-// TODO Implement multiplexed transport
+/// Endpoint role on a multiplexed connection, fixing odd/even stream IDs:
+/// clients allocate odd IDs, servers even IDs (HTTP/2 convention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxRole {
+	/// Handshake initiator. Allocates odd stream IDs
+	Client,
+	/// Handshake responder. Allocates even stream IDs
+	Server,
+}
+
+impl MuxRole {
+	const fn first_local_stream_id(self) -> u32 {
+		match self {
+			MuxRole::Client => 1,
+			MuxRole::Server => 2,
+		}
+	}
+
+	/// Whether this role is the initiator of `stream_id` (ID 0 belongs to
+	/// no role).
+	const fn initiates(self, stream_id: u32) -> bool {
+		match self {
+			MuxRole::Client => !stream_id.is_multiple_of(2),
+			MuxRole::Server => stream_id != 0 && stream_id.is_multiple_of(2),
+		}
+	}
+
+	const fn peer(self) -> MuxRole {
+		match self {
+			MuxRole::Client => MuxRole::Server,
+			MuxRole::Server => MuxRole::Client,
+		}
+	}
+}
+
+/// Protocol multiplexing (multiple concurrent requests on one connection)
+///
+/// Implementations provide HTTP/2-style stream multiplexing over a single
+/// physical connection, enabling concurrent request/response pairs without
+/// head-of-line blocking.
+pub trait MultiplexedProtocol {
+	/// Negotiated cap on concurrent locally-initiated streams
+	///
+	/// Similar to HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS. The peer
+	/// advertised this value during the handshake.
+	fn max_concurrent_streams(&self) -> u32;
+
+	/// Send a request on a freshly allocated stream and await its response
+	///
+	/// Allocates the next stream ID (odd or even per role), registers the
+	/// pending response slot, and resolves when the correlated response
+	/// arrives. Dropping the returned future before it resolves cancels the
+	/// stream and frees its concurrency slot.
+	fn emit_on_stream(&self, frame: Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend;
+
+	/// Cancel a locally-initiated in-flight stream
+	///
+	/// Best-effort: removes the pending entry, frees the concurrency slot,
+	/// and notifies the peer without blocking. Never panics.
+	fn close_stream(&self, stream_id: StreamId);
+}
+
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+mod router {
+	use core::future::{poll_fn, Future};
+	use core::pin::Pin;
+	use core::task::{Context, Poll, Waker};
+	use std::collections::{BTreeMap, HashMap};
+	use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+	use futures::channel::{mpsc, oneshot};
+	use futures::future::{AbortHandle, Abortable, Aborted};
+	use futures::stream::FuturesUnordered;
+	use futures::{SinkExt, Stream, StreamExt};
+
+	use super::{MultiplexedProtocol, MuxRole, StreamId};
+	use crate::constants::DEFAULT_MUX_CANCEL_BUDGET;
+	use crate::policy::TransitStatus;
+	use crate::transport::envelopes::{
+		CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxedRequestPackage, MuxedResponsePackage,
+		ResponsePackage, TransportEnvelope,
+	};
+	use crate::transport::error::TransportFailure;
+	use crate::transport::handshake::negotiation::MuxSettings;
+	use crate::transport::tcp::r#async::{AsyncReadStream, AsyncWriteStream, TransportReader, TransportWriter};
+	use crate::transport::{TransportError, TransportResult};
+	use crate::utils::marker::MaybeSend;
+	use crate::Frame;
+
+	fn cap_as_usize(cap: u32) -> usize {
+		usize::try_from(cap).unwrap_or(usize::MAX)
+	}
+
+	/// Outcome delivered to a pending stream's oneshot slot.
+	enum StreamOutcome {
+		/// Correlated response arrived
+		Response(ResponsePackage),
+		/// Peer cancelled or refused the stream
+		Cancelled(CancelReason),
+		/// Peer sent GoAway with `last_stream_id` below this stream
+		Draining,
+	}
+
+	/// Command consumed by the writer pump.
+	enum Outbound {
+		Envelope(TransportEnvelope),
+		Close,
+	}
+
+	/// Peer-initiated event routed from the reader to the responder.
+	enum InboundEvent {
+		Request(u32, Arc<Frame>),
+		Cancel(u32),
+	}
+
+	/// Disposition of an incoming peer-initiated stream.
+	enum PeerStream {
+		Accept,
+		/// GoAway already sent and the stream is newer than its
+		/// `last_stream_id`. Refuse without processing.
+		RejectDraining,
+	}
+
+	struct MuxState {
+		/// Next locally-initiated stream ID. `None` once the ID space is
+		/// exhausted (strictly monotonic, never reuses, never allocates 0)
+		next_stream_id: Option<u32>,
+		/// Highest peer-initiated stream ID seen (0 = none yet)
+		last_peer_stream_id: u32,
+		/// Open locally-initiated streams awaiting their response. The map
+		/// size is the cap-relevant open-stream count
+		pending: BTreeMap<u32, oneshot::Sender<StreamOutcome>>,
+		/// `last_stream_id` advertised in our GoAway, once sent
+		goaway_sent: Option<u32>,
+		/// `last_stream_id` received in the peer's GoAway
+		goaway_received: Option<u32>,
+		/// Wakers parked on pending-table drain (shutdown)
+		drain_wakers: Vec<Waker>,
+	}
+
+	impl MuxState {
+		fn wake_drain_waiters(&mut self) {
+			for waker in self.drain_wakers.drain(..) {
+				waker.wake();
+			}
+		}
+	}
+
+	struct MuxShared {
+		role: MuxRole,
+		local_cap: u32,
+		state: Mutex<MuxState>,
+	}
+
+	impl MuxShared {
+		fn lock(&self) -> MutexGuard<'_, MuxState> {
+			self.state.lock().unwrap_or_else(PoisonError::into_inner)
+		}
+
+		/// Allocate the next stream ID and register its response slot.
+		fn allocate(&self, sender: oneshot::Sender<StreamOutcome>) -> TransportResult<u32> {
+			let mut state = self.lock();
+			if state.goaway_sent.is_some() || state.goaway_received.is_some() {
+				return Err(TransportError::Draining);
+			}
+			if state.pending.len() >= cap_as_usize(self.local_cap) {
+				return Err(TransportError::OperationFailed(TransportFailure::Busy));
+			}
+
+			let stream_id = state.next_stream_id.ok_or(TransportError::Draining)?;
+			state.next_stream_id = stream_id.checked_add(2);
+			state.pending.insert(stream_id, sender);
+
+			Ok(stream_id)
+		}
+
+		fn remove_pending(&self, stream_id: u32) -> Option<oneshot::Sender<StreamOutcome>> {
+			let mut state = self.lock();
+			let entry = state.pending.remove(&stream_id);
+			if entry.is_some() {
+				state.wake_drain_waiters();
+			}
+
+			entry
+		}
+
+		/// Resolve a pending stream. Unknown IDs are silently discarded
+		/// (tolerates cancel/response races on the connection).
+		fn resolve(&self, stream_id: u32, outcome: StreamOutcome) {
+			if let Some(sender) = self.remove_pending(stream_id) {
+				let _ = sender.send(outcome);
+			}
+		}
+
+		/// Drop every pending slot on connection failure. Receivers observe
+		/// cancellation.
+		fn fail_all_pending(&self) {
+			let mut state = self.lock();
+			state.pending.clear();
+			state.wake_drain_waiters();
+		}
+
+		/// Resolve pending streams above `last_stream_id` as draining
+		/// (peer GoAway: it will never process them).
+		fn fail_pending_above(&self, last_stream_id: u32) {
+			let mut state = self.lock();
+			state.goaway_received = Some(last_stream_id);
+			if let Some(first_dropped) = last_stream_id.checked_add(1) {
+				for (_, sender) in state.pending.split_off(&first_dropped) {
+					let _ = sender.send(StreamOutcome::Draining);
+				}
+			}
+
+			state.wake_drain_waiters();
+		}
+
+		/// Halt the allocator and record the GoAway watermark. Returns the
+		/// `last_stream_id` to advertise, or `None` if already shutting down.
+		fn begin_shutdown(&self) -> Option<u32> {
+			let mut state = self.lock();
+			if state.goaway_sent.is_some() {
+				return None;
+			}
+
+			state.goaway_sent = Some(state.last_peer_stream_id);
+			Some(state.last_peer_stream_id)
+		}
+
+		/// Validate and record an incoming peer-initiated stream ID
+		/// (RFC 9113 § 5.1.1: odd/even role match, nonzero, strictly increasing).
+		fn register_peer_stream(&self, stream_id: u32) -> TransportResult<PeerStream> {
+			let mut state = self.lock();
+			if !self.role.peer().initiates(stream_id) || stream_id <= state.last_peer_stream_id {
+				return Err(TransportError::InvalidMessage);
+			}
+
+			state.last_peer_stream_id = stream_id;
+
+			if let Some(last) = state.goaway_sent {
+				if stream_id > last {
+					return Ok(PeerStream::RejectDraining);
+				}
+			}
+
+			Ok(PeerStream::Accept)
+		}
+
+		fn last_peer_stream_id(&self) -> u32 {
+			self.lock().last_peer_stream_id
+		}
+	}
+
+	/// Resolves once the pending table drains (all in-flight local streams
+	/// completed, cancelled, or failed).
+	struct DrainPending {
+		shared: Arc<MuxShared>,
+	}
+
+	impl Future for DrainPending {
+		type Output = ();
+
+		fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+			let mut state = self.shared.lock();
+			if state.pending.is_empty() {
+				return Poll::Ready(());
+			}
+
+			state.drain_wakers.push(cx.waker().clone());
+
+			Poll::Pending
+		}
+	}
+
+	/// Cancels the stream if the owning emit future is dropped before its
+	/// response arrives: frees the cap slot and notifies the peer
+	/// (best-effort, RFC 9113 § 6.4 analog).
+	struct CancelOnDrop {
+		shared: Arc<MuxShared>,
+		outbound: mpsc::Sender<Outbound>,
+		stream_id: u32,
+		armed: bool,
+	}
+
+	impl CancelOnDrop {
+		fn disarm(&mut self) {
+			self.armed = false;
+		}
+	}
+
+	fn enqueue_stream_cancel(shared: &MuxShared, outbound: &mpsc::Sender<Outbound>, stream_id: u32) {
+		if shared.remove_pending(stream_id).is_some() {
+			let package = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
+			let _ = outbound.clone().try_send(Outbound::Envelope(package.into()));
+		}
+	}
+
+	impl Drop for CancelOnDrop {
+		fn drop(&mut self) {
+			if !self.armed {
+				return;
+			}
+
+			enqueue_stream_cancel(&self.shared, &self.outbound, self.stream_id);
+		}
+	}
+
+	fn unwrap_frame(frame: Arc<Frame>) -> Frame {
+		Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone())
+	}
+
+	fn cancel_error(reason: CancelReason) -> TransportError {
+		match reason {
+			CancelReason::Cancelled => TransportError::OperationFailed(TransportFailure::PolicyRejection),
+			CancelReason::Timeout => TransportError::OperationFailed(TransportFailure::Timeout),
+			CancelReason::Rejected => TransportError::OperationFailed(TransportFailure::Busy),
+		}
+	}
+
+	fn resolve_response(response: ResponsePackage) -> TransportResult<Option<Frame>> {
+		match response.status() {
+			TransitStatus::Accepted => Ok(response.message.map(unwrap_frame)),
+			status => Err(TransportError::from(status)),
+		}
+	}
+
+	/// Cloneable client handle for a multiplexed connection.
+	#[derive(Clone)]
+	pub struct MuxHandle {
+		shared: Arc<MuxShared>,
+		outbound: mpsc::Sender<Outbound>,
+	}
+
+	impl MuxHandle {
+		/// Send a request on a freshly allocated stream and await its
+		/// response.
+		///
+		/// Dropping the returned future before it resolves cancels the
+		/// stream: the pending entry is removed, the cap slot freed, and a
+		/// best-effort [`MuxCancelPackage`] sent. Per-stream timeouts
+		/// compose by wrapping this future in the caller's timer.
+		///
+		/// # Errors
+		/// - `OperationFailed(Busy)`: local-initiated cap exhausted, or the
+		///   peer refused the stream
+		/// - `Draining`: GoAway sent or received. No new streams
+		/// - `ConnectionClosed`: connection failed before the response
+		pub async fn emit_on_stream(&self, frame: Frame) -> TransportResult<Option<Frame>> {
+			let (sender, receiver) = oneshot::channel();
+			let stream_id = self.shared.allocate(sender)?;
+			let mut guard = CancelOnDrop {
+				shared: Arc::clone(&self.shared),
+				outbound: self.outbound.clone(),
+				stream_id,
+				armed: true,
+			};
+
+			let request = MuxedRequestPackage::new(stream_id, frame);
+			let mut outbound = self.outbound.clone();
+			outbound
+				.send(Outbound::Envelope(request.into()))
+				.await
+				.map_err(|_| TransportError::ConnectionClosed)?;
+
+			let outcome = receiver.await;
+
+			guard.disarm();
+
+			match outcome {
+				Ok(StreamOutcome::Response(response)) => resolve_response(response),
+				Ok(StreamOutcome::Cancelled(reason)) => Err(cancel_error(reason)),
+				Ok(StreamOutcome::Draining) => Err(TransportError::Draining),
+				Err(_) => Err(TransportError::ConnectionClosed),
+			}
+		}
+
+		/// Cancel a locally-initiated in-flight stream (best-effort).
+		pub fn close_stream(&self, stream_id: StreamId) {
+			enqueue_stream_cancel(&self.shared, &self.outbound, stream_id.value());
+		}
+
+		/// Gracefully shut the connection down (RFC 9113 § 6.8
+		/// analog): sends GoAway, halts the allocator, awaits pending-table
+		/// drain, then closes the writer pump.
+		///
+		/// A drain deadline composes by wrapping this future in the
+		/// caller's timer.
+		pub async fn shutdown(&self) -> TransportResult<()> {
+			if let Some(last_peer) = self.shared.begin_shutdown() {
+				let package = GoAwayPackage::new(last_peer, GoAwayReason::Shutdown);
+				let mut outbound = self.outbound.clone();
+				outbound
+					.send(Outbound::Envelope(package.into()))
+					.await
+					.map_err(|_| TransportError::ConnectionClosed)?;
+			}
+
+			DrainPending { shared: Arc::clone(&self.shared) }.await;
+
+			let mut outbound = self.outbound.clone();
+			let _ = outbound.send(Outbound::Close).await;
+			Ok(())
+		}
+	}
+
+	impl MultiplexedProtocol for MuxHandle {
+		fn max_concurrent_streams(&self) -> u32 {
+			self.shared.local_cap
+		}
+
+		fn emit_on_stream(&self, frame: Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend {
+			MuxHandle::emit_on_stream(self, frame)
+		}
+
+		fn close_stream(&self, stream_id: StreamId) {
+			MuxHandle::close_stream(self, stream_id);
+		}
+	}
+
+	/// Writer pump: single serialization point for the connection.
+	///
+	/// Drains the outbound queue and writes each envelope through the
+	/// encrypting [`TransportWriter`]. Spawn [`MuxWriterDriver::drive`] on
+	/// the caller's executor.
+	pub struct MuxWriterDriver<W>
+	where
+		W: AsyncWriteStream,
+	{
+		writer: TransportWriter<W>,
+		commands: mpsc::Receiver<Outbound>,
+		shared: Arc<MuxShared>,
+		/// Records reserved for draining (peer-owed responses plus the
+		/// GoAway itself) before the send cipher halts.
+		drain_headroom: u64,
+	}
+
+	impl<W> MuxWriterDriver<W>
+	where
+		W: AsyncWriteStream,
+		TransportError: From<W::Error>,
+	{
+		/// Run the pump until shutdown or write failure.
+		pub async fn drive(mut self) -> TransportResult<()> {
+			while let Some(command) = self.commands.next().await {
+				match command {
+					Outbound::Envelope(envelope) => {
+						self.writer.write_envelope(envelope).await?;
+						self.enforce_rekey_limit().await?;
+					}
+					Outbound::Close => break,
+				}
+			}
+
+			Ok(())
+		}
+
+		/// RFC 8446 § 5.5 analog: when the send cipher nears its
+		/// record limit, drain the connection via GoAway while enough
+		/// records remain to answer in-flight peer streams. The caller
+		/// then reestablishes the session for fresh keys.
+		async fn enforce_rekey_limit(&mut self) -> TransportResult<()> {
+			if self.writer.remaining_records() > self.drain_headroom {
+				return Ok(());
+			}
+			if let Some(last_peer) = self.shared.begin_shutdown() {
+				let package = GoAwayPackage::new(last_peer, GoAwayReason::Shutdown);
+				self.writer.write_envelope(package.into()).await?;
+			}
+
+			Ok(())
+		}
+	}
+
+	/// Reader pump: routes decrypted envelopes off the read half.
+	///
+	/// Responses resolve their pending stream (unknown IDs silently
+	/// discarded: cancel/response races are benign). Requests flow to the
+	/// [`MuxResponder`]. Protocol violations answer with a GoAway and fail
+	/// the pump. Spawn [`MuxReaderDriver::drive`] on the caller's executor.
+	pub struct MuxReaderDriver<R>
+	where
+		R: AsyncReadStream,
+	{
+		reader: TransportReader<R>,
+		shared: Arc<MuxShared>,
+		inbound: mpsc::Sender<InboundEvent>,
+		outbound: mpsc::Sender<Outbound>,
+	}
+
+	impl<R> MuxReaderDriver<R>
+	where
+		R: AsyncReadStream,
+		TransportError: From<R::Error>,
+	{
+		/// Run the pump until the connection ends. Pending streams observe
+		/// the failure.
+		pub async fn drive(mut self) -> TransportResult<()> {
+			let result = self.pump().await;
+
+			self.shared.fail_all_pending();
+
+			result
+		}
+
+		async fn pump(&mut self) -> TransportResult<()> {
+			loop {
+				let envelope = self.reader.read_envelope().await?;
+				match envelope {
+					TransportEnvelope::MuxedResponse(package) => self.route_response(package)?,
+					TransportEnvelope::MuxedRequest(package) => self.route_request(package).await?,
+					TransportEnvelope::MuxCancel(package) => self.route_cancel(package).await?,
+					TransportEnvelope::GoAway(package) => self.shared.fail_pending_above(package.last_stream_id()),
+					_ => return Err(self.protocol_violation()),
+				}
+			}
+		}
+
+		fn route_response(&mut self, package: MuxedResponsePackage) -> TransportResult<()> {
+			let stream_id = package.stream_id();
+			if !self.shared.role.initiates(stream_id) {
+				return Err(self.protocol_violation());
+			}
+			self.shared.resolve(stream_id, StreamOutcome::Response(package.response));
+			Ok(())
+		}
+
+		async fn route_request(&mut self, package: MuxedRequestPackage) -> TransportResult<()> {
+			let stream_id = package.stream_id();
+			match self.shared.register_peer_stream(stream_id) {
+				Ok(PeerStream::Accept) => {
+					let event = InboundEvent::Request(stream_id, Arc::clone(package.message()));
+					if self.inbound.send(event).await.is_err() {
+						// No responder is serving this connection
+						self.refuse_stream(stream_id);
+					}
+					Ok(())
+				}
+				Ok(PeerStream::RejectDraining) => {
+					self.refuse_stream(stream_id);
+					Ok(())
+				}
+				Err(_) => Err(self.protocol_violation()),
+			}
+		}
+
+		async fn route_cancel(&mut self, package: MuxCancelPackage) -> TransportResult<()> {
+			let stream_id = package.stream_id();
+			if self.shared.role.initiates(stream_id) {
+				// Peer cancelled/refused a stream we initiated
+				self.shared.resolve(stream_id, StreamOutcome::Cancelled(package.reason()));
+				return Ok(());
+			}
+			if self.shared.role.peer().initiates(stream_id) {
+				// Peer withdrew its own request. Abort the handler
+				let _ = self.inbound.send(InboundEvent::Cancel(stream_id)).await;
+				return Ok(());
+			}
+
+			Err(self.protocol_violation())
+		}
+
+		fn refuse_stream(&mut self, stream_id: u32) {
+			let package = MuxCancelPackage::new(stream_id, CancelReason::Rejected);
+			let _ = self.outbound.try_send(Outbound::Envelope(package.into()));
+		}
+
+		fn protocol_violation(&mut self) -> TransportError {
+			let package = GoAwayPackage::new(self.shared.last_peer_stream_id(), GoAwayReason::ProtocolError);
+			let _ = self.outbound.try_send(Outbound::Envelope(package.into()));
+
+			TransportError::InvalidMessage
+		}
+	}
+
+	/// Event multiplexer for the responder loop: handler completions take
+	/// priority over new inbound work.
+	enum ResponderEvent {
+		Request(u32, Arc<Frame>),
+		Cancelled(u32),
+		Finished(u32, ResponsePackage),
+		Aborted,
+		Closed,
+	}
+
+	async fn next_responder_event<Fut>(
+		inbound: &mut mpsc::Receiver<InboundEvent>,
+		tasks: &mut FuturesUnordered<Abortable<Fut>>,
+		inbound_open: bool,
+	) -> ResponderEvent
+	where
+		Fut: Future<Output = (u32, ResponsePackage)>,
+	{
+		poll_fn(|cx| {
+			if let Poll::Ready(Some(completion)) = Pin::new(&mut *tasks).poll_next(cx) {
+				let event = match completion {
+					Ok((stream_id, response)) => ResponderEvent::Finished(stream_id, response),
+					Err(Aborted) => ResponderEvent::Aborted,
+				};
+				return Poll::Ready(event);
+			}
+			if inbound_open {
+				match Pin::new(&mut *inbound).poll_next(cx) {
+					Poll::Ready(Some(InboundEvent::Request(stream_id, frame))) => {
+						return Poll::Ready(ResponderEvent::Request(stream_id, frame));
+					}
+					Poll::Ready(Some(InboundEvent::Cancel(stream_id))) => {
+						return Poll::Ready(ResponderEvent::Cancelled(stream_id));
+					}
+					Poll::Ready(None) => return Poll::Ready(ResponderEvent::Closed),
+					Poll::Pending => {}
+				}
+			}
+			Poll::Pending
+		})
+		.await
+	}
+
+	/// Serves peer-initiated streams with a caller-supplied handler.
+	///
+	/// Handlers for distinct streams run concurrently (no head-of-line
+	/// blocking). Cap exhaustion answers with [`TransitStatus::Busy`]. A
+	/// peer cancel aborts the in-flight handler and sends no response.
+	///
+	/// Cancels of in-flight handlers draw on a per-connection budget
+	/// (CVE-2023-44487 "Rapid Reset" hardening): a peer that opens streams
+	/// only to cancel them exhausts the budget and is told to go away.
+	pub struct MuxResponder {
+		inbound: mpsc::Receiver<InboundEvent>,
+		outbound: mpsc::Sender<Outbound>,
+		peer_cap: u32,
+		cancel_budget: u32,
+	}
+
+	impl MuxResponder {
+		/// Run the responder until the connection ends.
+		///
+		/// # Errors
+		/// - `ConnectionClosed`: writer pump gone
+		/// - `OperationFailed(PolicyRejection)`: peer exhausted the cancel
+		///   budget. A [`GoAwayReason::EnhanceYourCalm`] was sent
+		pub async fn serve<H, Fut>(mut self, handler: H) -> TransportResult<()>
+		where
+			H: Fn(Arc<Frame>) -> Fut,
+			Fut: Future<Output = ResponsePackage> + MaybeSend,
+		{
+			let mut in_flight: HashMap<u32, AbortHandle> = HashMap::new();
+			let mut tasks = FuturesUnordered::new();
+			let mut inbound_open = true;
+			let mut last_stream_id = 0;
+
+			loop {
+				if !inbound_open && tasks.is_empty() {
+					return Ok(());
+				}
+				match next_responder_event(&mut self.inbound, &mut tasks, inbound_open).await {
+					ResponderEvent::Closed => inbound_open = false,
+					ResponderEvent::Aborted => {}
+					ResponderEvent::Cancelled(stream_id) => {
+						if let Some(handle) = in_flight.remove(&stream_id) {
+							handle.abort();
+							if self.cancel_budget == 0 {
+								return Err(self.refuse_cancel_abuse(last_stream_id).await);
+							}
+							self.cancel_budget -= 1;
+						}
+					}
+					ResponderEvent::Request(stream_id, frame) => {
+						last_stream_id = stream_id;
+						if in_flight.len() >= cap_as_usize(self.peer_cap) {
+							self.respond(stream_id, ResponsePackage::new(TransitStatus::Busy, None)).await?;
+							continue;
+						}
+
+						let (handle, registration) = AbortHandle::new_pair();
+
+						in_flight.insert(stream_id, handle);
+
+						let work = handler(frame);
+						tasks.push(Abortable::new(async move { (stream_id, work.await) }, registration));
+					}
+					ResponderEvent::Finished(stream_id, response) => {
+						in_flight.remove(&stream_id);
+						self.respond(stream_id, response).await?;
+					}
+				}
+			}
+		}
+
+		async fn respond(&mut self, stream_id: u32, response: ResponsePackage) -> TransportResult<()> {
+			let package = MuxedResponsePackage::new(stream_id, response);
+			self.outbound
+				.send(Outbound::Envelope(package.into()))
+				.await
+				.map_err(|_| TransportError::ConnectionClosed)
+		}
+
+		/// CVE-2023-44487 hardening: too many cancels of in-flight
+		/// handlers ends the connection with a best-effort GoAway.
+		async fn refuse_cancel_abuse(&mut self, last_stream_id: u32) -> TransportError {
+			let package = GoAwayPackage::new(last_stream_id, GoAwayReason::EnhanceYourCalm);
+			let _ = self.outbound.send(Outbound::Envelope(package.into())).await;
+
+			TransportError::OperationFailed(TransportFailure::PolicyRejection)
+		}
+	}
+
+	/// Multiplexed transport assembled from split encrypted halves and the
+	/// handshake-negotiated [`MuxSettings`].
+	pub struct MuxTransport<R, W>
+	where
+		R: AsyncReadStream,
+		W: AsyncWriteStream,
+	{
+		handle: MuxHandle,
+		reader: MuxReaderDriver<R>,
+		writer: MuxWriterDriver<W>,
+		responder: MuxResponder,
+	}
+
+	impl<R, W> MuxTransport<R, W>
+	where
+		R: AsyncReadStream,
+		W: AsyncWriteStream,
+	{
+		/// Assemble a multiplexed transport over split halves.
+		///
+		/// `role` fixes odd/even stream IDs and MUST match the endpoint's
+		/// handshake role. `settings` MUST come from
+		/// [`negotiated_mux`](crate::transport::TcpTransport::negotiated_mux).
+		/// A peer that never negotiated multiplexing rejects every muxed
+		/// envelope as invalid.
+		pub fn new(
+			reader: TransportReader<R>,
+			writer: TransportWriter<W>,
+			role: MuxRole,
+			settings: MuxSettings,
+		) -> Self {
+			let outbound_capacity =
+				cap_as_usize(settings.local_initiated_cap.saturating_add(settings.peer_initiated_cap)).max(1);
+			let inbound_capacity = cap_as_usize(settings.peer_initiated_cap).max(1);
+			let (outbound_sender, outbound_receiver) = mpsc::channel(outbound_capacity);
+			let (inbound_sender, inbound_receiver) = mpsc::channel(inbound_capacity);
+
+			let shared = Arc::new(MuxShared {
+				role,
+				local_cap: settings.local_initiated_cap,
+				state: Mutex::new(MuxState {
+					next_stream_id: Some(role.first_local_stream_id()),
+					last_peer_stream_id: 0,
+					pending: BTreeMap::new(),
+					goaway_sent: None,
+					goaway_received: None,
+					drain_wakers: Vec::new(),
+				}),
+			});
+
+			// The drain reserves one record per in-flight peer stream (their
+			// responses) plus one for the GoAway itself.
+			let drain_headroom = u64::from(settings.peer_initiated_cap).saturating_add(1);
+
+			Self {
+				handle: MuxHandle { shared: Arc::clone(&shared), outbound: outbound_sender.clone() },
+				reader: MuxReaderDriver {
+					reader,
+					shared: Arc::clone(&shared),
+					inbound: inbound_sender,
+					outbound: outbound_sender.clone(),
+				},
+				writer: MuxWriterDriver { writer, commands: outbound_receiver, shared, drain_headroom },
+				responder: MuxResponder {
+					inbound: inbound_receiver,
+					outbound: outbound_sender,
+					peer_cap: settings.peer_initiated_cap,
+					cancel_budget: DEFAULT_MUX_CANCEL_BUDGET,
+				},
+			}
+		}
+
+		/// Override the peer cancel budget (CVE-2023-44487 hardening).
+		pub fn with_cancel_budget(mut self, budget: u32) -> Self {
+			self.responder.cancel_budget = budget;
+			self
+		}
+
+		/// Clone the client handle without decomposing the transport.
+		pub fn handle(&self) -> MuxHandle {
+			self.handle.clone()
+		}
+
+		/// Decompose into the handle, the two driver pumps to spawn, and
+		/// the responder.
+		pub fn into_parts(self) -> (MuxHandle, MuxReaderDriver<R>, MuxWriterDriver<W>, MuxResponder) {
+			(self.handle, self.reader, self.writer, self.responder)
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		fn test_shared(role: MuxRole, local_cap: u32) -> MuxShared {
+			MuxShared {
+				role,
+				local_cap,
+				state: Mutex::new(MuxState {
+					next_stream_id: Some(role.first_local_stream_id()),
+					last_peer_stream_id: 0,
+					pending: BTreeMap::new(),
+					goaway_sent: None,
+					goaway_received: None,
+					drain_wakers: Vec::new(),
+				}),
+			}
+		}
+
+		fn slot() -> oneshot::Sender<StreamOutcome> {
+			oneshot::channel().0
+		}
+
+		#[test]
+		fn test_client_allocates_odd_monotonic() {
+			let shared = test_shared(MuxRole::Client, 8);
+			assert!(matches!(shared.allocate(slot()), Ok(1)));
+			assert!(matches!(shared.allocate(slot()), Ok(3)));
+			assert!(matches!(shared.allocate(slot()), Ok(5)));
+		}
+
+		#[test]
+		fn test_server_allocates_even_monotonic_never_zero() {
+			let shared = test_shared(MuxRole::Server, 8);
+			assert!(matches!(shared.allocate(slot()), Ok(2)));
+			assert!(matches!(shared.allocate(slot()), Ok(4)));
+		}
+
+		#[test]
+		fn test_cap_exhaustion_reports_busy() {
+			let shared = test_shared(MuxRole::Client, 2);
+			assert!(matches!(shared.allocate(slot()), Ok(1)));
+			assert!(matches!(shared.allocate(slot()), Ok(3)));
+			assert!(matches!(
+				shared.allocate(slot()),
+				Err(TransportError::OperationFailed(TransportFailure::Busy))
+			));
+		}
+
+		#[test]
+		fn test_completed_stream_frees_cap_slot() {
+			let shared = test_shared(MuxRole::Client, 1);
+			assert!(matches!(shared.allocate(slot()), Ok(1)));
+			assert!(shared.remove_pending(1).is_some());
+			assert!(matches!(shared.allocate(slot()), Ok(3)));
+		}
+
+		#[test]
+		fn test_allocation_halts_after_shutdown() {
+			let shared = test_shared(MuxRole::Client, 8);
+			assert!(matches!(shared.begin_shutdown(), Some(0)));
+			assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
+			assert!(shared.begin_shutdown().is_none());
+		}
+
+		#[test]
+		fn test_allocation_halts_after_peer_goaway() {
+			let shared = test_shared(MuxRole::Client, 8);
+			shared.fail_pending_above(0);
+			assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
+		}
+
+		#[test]
+		fn test_id_space_exhaustion_reports_draining() {
+			let shared = test_shared(MuxRole::Client, 8);
+			shared.lock().next_stream_id = Some(u32::MAX);
+			assert!(matches!(shared.allocate(slot()), Ok(u32::MAX)));
+			assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
+		}
+
+		#[test]
+		fn test_peer_stream_rejects_zero_and_wrong_parity() {
+			let server = test_shared(MuxRole::Server, 8);
+			assert!(matches!(server.register_peer_stream(0), Err(TransportError::InvalidMessage)));
+			assert!(matches!(server.register_peer_stream(2), Err(TransportError::InvalidMessage)));
+			assert!(matches!(server.register_peer_stream(1), Ok(PeerStream::Accept)));
+		}
+
+		#[test]
+		fn test_peer_stream_rejects_non_increasing() {
+			let server = test_shared(MuxRole::Server, 8);
+			assert!(matches!(server.register_peer_stream(5), Ok(PeerStream::Accept)));
+			assert!(matches!(server.register_peer_stream(3), Err(TransportError::InvalidMessage)));
+			assert!(matches!(server.register_peer_stream(5), Err(TransportError::InvalidMessage)));
+			assert!(matches!(server.register_peer_stream(7), Ok(PeerStream::Accept)));
+		}
+
+		#[test]
+		fn test_peer_stream_above_goaway_watermark_refused() {
+			let server = test_shared(MuxRole::Server, 8);
+			assert!(matches!(server.register_peer_stream(1), Ok(PeerStream::Accept)));
+			assert!(matches!(server.begin_shutdown(), Some(1)));
+			assert!(matches!(server.register_peer_stream(3), Ok(PeerStream::RejectDraining)));
+		}
+
+		#[test]
+		fn test_goaway_fails_pending_above_watermark_only() {
+			let shared = test_shared(MuxRole::Client, 8);
+			let (sender_low, mut receiver_low) = oneshot::channel();
+			let (sender_high, mut receiver_high) = oneshot::channel();
+
+			shared.lock().pending.insert(1, sender_low);
+			shared.lock().pending.insert(3, sender_high);
+
+			shared.fail_pending_above(1);
+
+			assert!(matches!(receiver_low.try_recv(), Ok(None)));
+			assert!(matches!(receiver_high.try_recv(), Ok(Some(StreamOutcome::Draining))));
+		}
+
+		#[test]
+		fn test_cancel_reason_error_mapping() {
+			assert!(matches!(
+				cancel_error(CancelReason::Rejected),
+				TransportError::OperationFailed(TransportFailure::Busy)
+			));
+			assert!(matches!(
+				cancel_error(CancelReason::Timeout),
+				TransportError::OperationFailed(TransportFailure::Timeout)
+			));
+			assert!(matches!(
+				cancel_error(CancelReason::Cancelled),
+				TransportError::OperationFailed(TransportFailure::PolicyRejection)
+			));
+		}
+	}
+}
+
+#[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
+pub use router::{MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver};

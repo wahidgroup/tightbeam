@@ -7,6 +7,16 @@
 /// KDF info string for ECIES session key derivation (HKDF)
 pub const TIGHTBEAM_SESSION_KDF_INFO: &[u8] = b"tb/session/kdf/v1";
 
+/// KDF info string for the client-to-server session key (HKDF)
+///
+/// Distinct info labels yield independent directional keys from the same
+/// input key material (RFC 5869 domain separation), the same property
+/// TLS 1.3 obtains from per-direction traffic secrets (RFC 8446, 7.1).
+pub const TIGHTBEAM_C2S_KDF_INFO: &[u8] = b"tb/session/kdf/c2s/v1";
+
+/// KDF info string for the server-to-client session key (HKDF)
+pub const TIGHTBEAM_S2C_KDF_INFO: &[u8] = b"tb/session/kdf/s2c/v1";
+
 /// KDF info string for CMS KARI (Key Agreement Recipient Info) KEK derivation
 pub const TIGHTBEAM_KARI_KDF_INFO: &[u8] = b"tb/kari/kdf/v1";
 
@@ -64,13 +74,25 @@ pub const AES_GCM_NONCE_SIZE: usize = 12;
 /// AES-GCM authentication tag size (128 bits)
 pub const AES_GCM_TAG_SIZE: usize = 16;
 
+/// AEAD record limit per directional key before a rekey is required (2^24)
+///
+/// RFC 8446 § 5.5 bounds AES-GCM at about 2^24.5 full-size records
+/// per key to keep an authenticated-encryption safety margin of 2^-57.
+/// RFC 9846 upgrades acting before the limit to a MUST. TightBeam has no
+/// in-band key update, so [`crate::crypto::aead::SendCipher`] fails closed
+/// with `RekeyRequired` just under the bound and the session must be
+/// reestablished (fresh handshake derives fresh directional keys).
+/// Multiplexed writers drain gracefully first via GoAway as the limit
+/// nears. Override per cipher via `SendCipher::with_rekey_limit`.
+pub const DEFAULT_REKEY_RECORD_LIMIT: u64 = 1 << 24;
+
 // ============================================================================
 // Testing & Verification Constants
 // ============================================================================
 
 /// Linear Congruential Generator (LCG) multiplier constant
 ///
-/// Source: Numerical Recipes (3rd Ed., 2007), Section 7.1.4 "Linear Congruential Generators"
+/// Source: Numerical Recipes (3rd Ed., 2007), § 7.1.4 "Linear Congruential Generators"
 /// - Authors: Press, Teukolsky, Vetterling, Flannery
 /// - Value derived from Donald Knuth's MMIX LCG parameters
 /// - Period: 2^64 (full period for 64-bit state)
@@ -83,7 +105,7 @@ pub const LCG_MULTIPLIER: u64 = 6364136223846793005;
 
 /// Linear Congruential Generator (LCG) increment constant
 ///
-/// Source: Numerical Recipes (3rd Ed., 2007), Section 7.1.4
+/// Source: Numerical Recipes (3rd Ed., 2007), § 7.1.4
 /// - Must be odd for full period
 /// - Co-prime with 2^64 (guaranteed since it's odd)
 /// - Combined with [`LCG_MULTIPLIER`] provides good randomness properties
@@ -154,11 +176,23 @@ pub const UNKNOWN_SERVLET_UTILIZATION_BPS: u16 = 5000;
 /// commands (CWE-294).
 pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
 
+/// Default per-connection budget of peer cancels that abort in-flight
+/// multiplexed handlers
+///
+/// A peer that opens streams only to cancel them forces spawn/abort cycle
+/// while staying under the concurrent-stream cap, the cost asymmetry
+/// behind CVE-2023-44487 ("HTTP/2 Rapid Reset", CWE-400). Cancels of
+/// already-completed streams are free. Each cancel that aborts a live
+/// handler draws on this budget, and exhausting it ends the connection
+/// with a GoAway. Only authenticated peers reach this path, so the budget
+/// is generous. Tighten per connection via `MuxTransport::with_cancel_budget`.
+pub const DEFAULT_MUX_CANCEL_BUDGET: u32 = 1024;
+
 /// Default ceiling for decompressed message bodies (16 MiB)
 ///
-/// Compressed frame bodies arrive from the wire under the transport's
-/// envelope ceiling, but zstd can expand a small input by several orders
-/// of magnitude. Capping the inflated size bounds the memory an attacker
-/// can force with a decompression bomb (CWE-409). Override per inflator
-/// via `ZstdCompression::with_max_output`.
+/// Compressed frame bodies arrive under the transport's envelope ceiling,
+/// but zstd can expand a small input by several orders of magnitude.
+/// Capping the inflated size bounds the memory an attacker can force with
+/// a decompression bomb (CWE-409). Override per inflator via
+/// `ZstdCompression::with_max_output`.
 pub const DEFAULT_MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;

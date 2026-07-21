@@ -7,6 +7,8 @@
 extern crate alloc;
 
 use crate::crypto::profiles::SecurityProfileDesc;
+use crate::der::asn1::ObjectIdentifier;
+use crate::der::Error as DerDecodeError;
 use crate::der::Sequence;
 use crate::Beamable;
 
@@ -64,6 +66,102 @@ impl SecurityAccept {
 	}
 }
 
+/// Transport capability offer (multiplexing).
+///
+/// Each side advertises how many streams its *peer* may concurrently initiate
+/// (RFC 9113 § 5.1.2 directional semantics). Sent by the client inside its
+/// handshake opening message so the offer is bound into the transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
+pub struct TransportOffer {
+	/// Sender supports stream multiplexing.
+	pub mux: bool,
+	/// Concurrent streams the peer may initiate toward the sender.
+	pub max_peer_initiated_streams: u32,
+}
+
+impl TransportOffer {
+	/// Create a multiplexing offer advertising the given peer-initiated cap.
+	pub fn mux(max_peer_initiated_streams: u32) -> Self {
+		Self { mux: true, max_peer_initiated_streams }
+	}
+}
+
+/// Transport capability accept (multiplexing).
+///
+/// Same shape as [`TransportOffer`]: the server advertises how many streams
+/// the client may concurrently initiate. Sent inside the server's handshake
+/// response and bound into the transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
+pub struct TransportAccept {
+	/// Sender supports stream multiplexing.
+	pub mux: bool,
+	/// Concurrent streams the peer may initiate toward the sender.
+	pub max_peer_initiated_streams: u32,
+}
+
+/// Negotiated multiplexing settings for one connection.
+///
+/// Caps are directional (RFC 9113 § 5.1.2): each endpoint enforces the
+/// value it advertised and respects the value its peer advertised. There is
+/// no symmetric min-collapse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MuxSettings {
+	/// Concurrent streams this endpoint may initiate (peer-advertised).
+	pub local_initiated_cap: u32,
+	/// Concurrent streams the peer may initiate (locally advertised, locally enforced).
+	pub peer_initiated_cap: u32,
+}
+
+/// Server-side accept rule: multiplexing activates only when the peer
+/// offered it AND it is locally enabled. No offer or no local config means
+/// no accept, which keeps the connection lock-step.
+pub fn accept_transport(offer: Option<&TransportOffer>, local: Option<&TransportOffer>) -> Option<TransportAccept> {
+	let offer = offer?;
+	let local = local?;
+	if !offer.mux || !local.mux {
+		return None;
+	}
+
+	Some(TransportAccept { mux: true, max_peer_initiated_streams: local.max_peer_initiated_streams })
+}
+
+/// Client-side settings rule: validates the server's accept against the
+/// local offer and derives the directional caps.
+///
+/// An accept without a matching offer is a protocol violation (a peer must
+/// never activate an unrequested capability) and fails closed.
+pub fn client_mux_settings(
+	offer: Option<&TransportOffer>,
+	accept: Option<&TransportAccept>,
+) -> Result<Option<MuxSettings>, NegotiationError> {
+	let accept = match accept {
+		Some(accept) => accept,
+		None => return Ok(None),
+	};
+	if !accept.mux {
+		return Ok(None);
+	}
+
+	match offer {
+		Some(offer) if offer.mux => Ok(Some(MuxSettings {
+			local_initiated_cap: accept.max_peer_initiated_streams,
+			peer_initiated_cap: offer.max_peer_initiated_streams,
+		})),
+		_ => Err(NegotiationError::UnsolicitedTransportAccept),
+	}
+}
+
+/// Server-side settings rule: derives the directional caps from the client's
+/// offer and the accept the server just emitted.
+pub fn server_mux_settings(offer: &TransportOffer, accept: &TransportAccept) -> MuxSettings {
+	MuxSettings {
+		local_initiated_cap: offer.max_peer_initiated_streams,
+		peer_initiated_cap: accept.max_peer_initiated_streams,
+	}
+}
+
 /// Errors during profile negotiation.
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,9 +185,16 @@ pub enum NegotiationError {
 	)]
 	OfferTooLarge { count: usize, max: usize },
 
+	/// Peer accepted a transport capability that was never offered.
+	#[cfg_attr(
+		feature = "derive",
+		error("Peer accepted a transport capability that was never offered")
+	)]
+	UnsolicitedTransportAccept,
+
 	/// DER encoding/decoding error.
 	#[cfg_attr(feature = "derive", error("DER encoding error: {0}"))]
-	DerError(crate::der::Error),
+	DerError(DerDecodeError),
 }
 
 crate::impl_error_display!(NegotiationError {
@@ -97,11 +202,12 @@ crate::impl_error_display!(NegotiationError {
 	EmptyOffer => "Security offer is empty",
 	BelowStrengthFloor => "No profile meets the minimum-strength policy",
 	OfferTooLarge { count, max } => "Security offer too large: {count} profiles exceeds cap of {max}",
+	UnsolicitedTransportAccept => "Peer accepted a transport capability that was never offered",
 	DerError(e) => "DER encoding error: {e}",
 });
 
-impl From<crate::der::Error> for NegotiationError {
-	fn from(e: crate::der::Error) -> Self {
+impl From<DerDecodeError> for NegotiationError {
+	fn from(e: DerDecodeError) -> Self {
 		Self::DerError(e)
 	}
 }
@@ -122,7 +228,7 @@ pub trait ProfileStrengthPolicy {
 pub struct DefaultStrengthFloor;
 
 /// Security strength in bits of a known digest OID; `0` for unknown OIDs (fail closed).
-fn digest_bits(oid: &crate::der::asn1::ObjectIdentifier) -> u16 {
+fn digest_bits(oid: &ObjectIdentifier) -> u16 {
 	use crate::oids::{HASH_SHA256, HASH_SHA3_256, HASH_SHA3_384, HASH_SHA3_512};
 
 	if *oid == HASH_SHA256 || *oid == HASH_SHA3_256 {
@@ -196,9 +302,12 @@ pub fn select_profile(
 
 #[cfg(test)]
 mod tests {
+	use core::error::Error;
+
 	use super::*;
 	use crate::oids::{
-		AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_512,
+		AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
+		SIGNER_ECDSA_WITH_SHA3_512,
 	};
 
 	fn mock_profile(id: u8) -> SecurityProfileDesc {
@@ -208,7 +317,7 @@ mod tests {
 			aead_key_size: Some(32),
 			signature: Some(SIGNER_ECDSA_WITH_SHA3_512),
 			kdf: Some(HASH_SHA3_256),
-			curve: Some(crate::oids::CURVE_SECP256K1),
+			curve: Some(CURVE_SECP256K1),
 			// Use different key wrap algorithms to differentiate profiles
 			key_wrap: match id {
 				1 => Some(AES_128_WRAP),
@@ -229,7 +338,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_select_first_mutual() -> Result<(), Box<dyn core::error::Error>> {
+	fn test_select_first_mutual() -> Result<(), Box<dyn Error>> {
 		let p1 = mock_profile(1);
 		let p2 = mock_profile(2);
 		let p3 = mock_profile(3);
@@ -244,7 +353,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_select_follows_server_preference_not_client_order() -> Result<(), Box<dyn core::error::Error>> {
+	fn test_select_follows_server_preference_not_client_order() -> Result<(), Box<dyn Error>> {
 		let p1 = mock_profile(1);
 		let p2 = mock_profile(2);
 
@@ -291,9 +400,69 @@ mod tests {
 		assert!(matches!(result, Err(NegotiationError::EmptyOffer)));
 	}
 
+	#[test]
+	fn test_accept_transport_requires_offer_and_local_config() {
+		let offer = TransportOffer::mux(8);
+		let local = TransportOffer::mux(4);
+
+		let accept = accept_transport(Some(&offer), Some(&local));
+		assert!(matches!(
+			accept,
+			Some(TransportAccept { mux: true, max_peer_initiated_streams: 4 })
+		));
+
+		assert!(accept_transport(None, Some(&local)).is_none());
+		assert!(accept_transport(Some(&offer), None).is_none());
+
+		let disabled = TransportOffer { mux: false, max_peer_initiated_streams: 8 };
+		assert!(accept_transport(Some(&disabled), Some(&local)).is_none());
+		assert!(accept_transport(Some(&offer), Some(&disabled)).is_none());
+	}
+
+	#[test]
+	fn test_mux_settings_directional_caps() -> Result<(), NegotiationError> {
+		let offer = TransportOffer::mux(8);
+		let accept = TransportAccept { mux: true, max_peer_initiated_streams: 4 };
+
+		let client =
+			client_mux_settings(Some(&offer), Some(&accept))?.ok_or(NegotiationError::UnsolicitedTransportAccept)?;
+		assert_eq!(client.local_initiated_cap, 4);
+		assert_eq!(client.peer_initiated_cap, 8);
+
+		let server = server_mux_settings(&offer, &accept);
+		assert_eq!(server.local_initiated_cap, 8);
+		assert_eq!(server.peer_initiated_cap, 4);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_unsolicited_transport_accept_fails_closed() {
+		let accept = TransportAccept { mux: true, max_peer_initiated_streams: 4 };
+
+		let result = client_mux_settings(None, Some(&accept));
+		assert!(matches!(result, Err(NegotiationError::UnsolicitedTransportAccept)));
+
+		let disabled = TransportOffer { mux: false, max_peer_initiated_streams: 8 };
+		let result = client_mux_settings(Some(&disabled), Some(&accept));
+		assert!(matches!(result, Err(NegotiationError::UnsolicitedTransportAccept)));
+	}
+
+	#[test]
+	fn test_no_accept_means_lock_step() -> Result<(), NegotiationError> {
+		let offer = TransportOffer::mux(8);
+		assert!(client_mux_settings(Some(&offer), None)?.is_none());
+		assert!(client_mux_settings(None, None)?.is_none());
+
+		let declined = TransportAccept { mux: false, max_peer_initiated_streams: 0 };
+		assert!(client_mux_settings(Some(&offer), Some(&declined))?.is_none());
+
+		Ok(())
+	}
+
 	#[cfg(feature = "aead")]
 	#[test]
-	fn test_select_profile_multiple_aead_ciphers() -> Result<(), Box<dyn core::error::Error>> {
+	fn test_select_profile_multiple_aead_ciphers() -> Result<(), Box<dyn Error>> {
 		use crate::oids::{
 			AES_128_GCM, AES_128_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA256,
 			SIGNER_ECDSA_WITH_SHA256,

@@ -16,6 +16,23 @@ pub mod sync;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub mod r#async;
 
+#[cfg(feature = "std")]
+use core::fmt;
+#[cfg(feature = "std")]
+use core::ops;
+#[cfg(feature = "std")]
+use core::str::FromStr;
+#[cfg(all(feature = "std", feature = "tcp"))]
+use std::io::{Error as IoError, ErrorKind, Read, Write};
+#[cfg(feature = "std")]
+use std::net::{AddrParseError, SocketAddr};
+#[cfg(all(feature = "std", feature = "tcp"))]
+use std::net::{TcpListener, TcpStream};
+#[cfg(all(feature = "std", feature = "tcp"))]
+use std::time::Duration;
+
+#[cfg(feature = "std")]
+use crate::transport::TightBeamAddress;
 #[cfg(feature = "tcp")]
 use crate::transport::{tcp::sync::TcpTransport, Mycelial, Protocol, ProtocolStream};
 
@@ -26,7 +43,7 @@ pub(crate) use crate::transport::io::HANDSHAKE_MAX_WIRE;
 #[cfg(feature = "tcp")]
 pub trait TcpListenerTrait: Protocol + Send {
 	#[cfg(feature = "std")]
-	fn accept(&self) -> Result<(Self::Stream, std::net::SocketAddr), Self::Error>;
+	fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error>;
 
 	#[cfg(not(feature = "std"))]
 	fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error>;
@@ -41,27 +58,27 @@ pub enum SocketAddr {
 }
 
 #[cfg(all(feature = "std", feature = "tcp"))]
-impl Protocol for std::net::TcpListener {
-	type Listener = std::net::TcpListener;
-	type Stream = std::net::TcpStream;
-	type Error = std::io::Error;
+impl Protocol for TcpListener {
+	type Listener = TcpListener;
+	type Stream = TcpStream;
+	type Error = IoError;
 	type Transport = TcpTransport<Self::Stream>;
 	type Address = TightBeamSocketAddr;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
 		"127.0.0.1:0"
 			.parse()
-			.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid default address"))
+			.map_err(|_| IoError::new(ErrorKind::InvalidInput, "Invalid default address"))
 	}
 
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = std::net::TcpListener::bind(addr.0)?;
+		let listener = TcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
 		Ok((listener, TightBeamSocketAddr(bound_addr)))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
-		std::net::TcpStream::connect(addr.0)
+		TcpStream::connect(addr.0)
 	}
 
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
@@ -76,36 +93,36 @@ impl Protocol for std::net::TcpListener {
 // The EncryptedProtocol impl for sync TCP lives on the wrapper in sync.rs
 
 #[cfg(all(feature = "std", feature = "tcp"))]
-impl Mycelial for std::net::TcpListener {
+impl Mycelial for TcpListener {
 	async fn try_available_connect(&self) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let addr = "0.0.0.0:0"
 			.parse::<TightBeamSocketAddr>()
-			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-		<std::net::TcpListener as Protocol>::bind(addr).await
+			.map_err(|e| IoError::new(ErrorKind::InvalidInput, e))?;
+		<TcpListener as Protocol>::bind(addr).await
 	}
 }
 
 #[cfg(all(feature = "std", feature = "tcp"))]
-impl TcpListenerTrait for std::net::TcpListener {
-	fn accept(&self) -> Result<(Self::Stream, std::net::SocketAddr), Self::Error> {
-		std::net::TcpListener::accept(self)
+impl TcpListenerTrait for TcpListener {
+	fn accept(&self) -> Result<(Self::Stream, SocketAddr), Self::Error> {
+		TcpListener::accept(self)
 	}
 }
 
 // std::net implementations when std is available
 #[cfg(all(feature = "std", feature = "tcp"))]
-impl ProtocolStream for std::net::TcpStream {
-	type Error = std::io::Error;
+impl ProtocolStream for TcpStream {
+	type Error = IoError;
 
 	fn write_all(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
-		std::io::Write::write_all(self, buf)
+		Write::write_all(self, buf)
 	}
 
 	fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Self::Error> {
-		std::io::Read::read_exact(self, buf)
+		Read::read_exact(self, buf)
 	}
 
-	fn set_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<(), Self::Error> {
+	fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Self::Error> {
 		self.set_read_timeout(timeout)?;
 		self.set_write_timeout(timeout)?;
 		Ok(())
@@ -115,17 +132,17 @@ impl ProtocolStream for std::net::TcpStream {
 // New type wrapper for SocketAddr that implements Into<Vec<u8>>
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TightBeamSocketAddr(pub std::net::SocketAddr);
+pub struct TightBeamSocketAddr(pub SocketAddr);
 
 #[cfg(feature = "std")]
-impl From<std::net::SocketAddr> for TightBeamSocketAddr {
-	fn from(addr: std::net::SocketAddr) -> Self {
+impl From<SocketAddr> for TightBeamSocketAddr {
+	fn from(addr: SocketAddr) -> Self {
 		Self(addr)
 	}
 }
 
 #[cfg(feature = "std")]
-impl From<TightBeamSocketAddr> for std::net::SocketAddr {
+impl From<TightBeamSocketAddr> for SocketAddr {
 	fn from(addr: TightBeamSocketAddr) -> Self {
 		addr.0
 	}
@@ -139,15 +156,15 @@ impl From<TightBeamSocketAddr> for Vec<u8> {
 }
 
 #[cfg(feature = "std")]
-impl core::fmt::Display for TightBeamSocketAddr {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl fmt::Display for TightBeamSocketAddr {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		self.0.fmt(f)
 	}
 }
 
 #[cfg(feature = "std")]
-impl core::str::FromStr for TightBeamSocketAddr {
-	type Err = std::net::AddrParseError;
+impl FromStr for TightBeamSocketAddr {
+	type Err = AddrParseError;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		Ok(Self(s.parse()?))
@@ -155,8 +172,8 @@ impl core::str::FromStr for TightBeamSocketAddr {
 }
 
 #[cfg(feature = "std")]
-impl core::ops::Deref for TightBeamSocketAddr {
-	type Target = std::net::SocketAddr;
+impl ops::Deref for TightBeamSocketAddr {
+	type Target = SocketAddr;
 
 	fn deref(&self) -> &Self::Target {
 		&self.0
@@ -164,7 +181,7 @@ impl core::ops::Deref for TightBeamSocketAddr {
 }
 
 #[cfg(feature = "std")]
-impl crate::transport::TightBeamAddress for TightBeamSocketAddr {}
+impl TightBeamAddress for TightBeamSocketAddr {}
 
 /// Macro to generate common transport implementation for both sync and async.
 ///
@@ -216,7 +233,11 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "x509")]
 			pub(crate) handshake_timeout: core::time::Duration,
 			#[cfg(feature = "x509")]
-			pub(crate) symmetric_key: Option<$crate::crypto::aead::RuntimeAead>,
+			pub(crate) session_keys: Option<$crate::crypto::aead::SessionKeys>,
+			#[cfg(feature = "x509")]
+			pub(crate) mux_config: Option<$crate::transport::handshake::negotiation::TransportOffer>,
+			#[cfg(feature = "x509")]
+			pub(crate) mux_settings: Option<$crate::transport::handshake::negotiation::MuxSettings>,
 			#[cfg(feature = "x509")]
 			pub(crate) server_handshake: Option<
 				Box<
@@ -272,21 +293,17 @@ macro_rules! impl_tcp_common {
 					#[cfg(feature = "x509")]
 					handshake_timeout: core::time::Duration::from_secs(1),
 					#[cfg(feature = "x509")]
-					symmetric_key: None,
+					session_keys: None,
+					#[cfg(feature = "x509")]
+					mux_config: None,
+					#[cfg(feature = "x509")]
+					mux_settings: None,
 					#[cfg(feature = "x509")]
 					server_handshake: None,
 					#[cfg(feature = "x509")]
 					handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind::default(),
 					_phantom: core::marker::PhantomData,
 				}
-			}
-		}
-
-		// Ensure symmetric key material is dropped when the transport is dropped
-		#[cfg(feature = "x509")]
-		impl<S: $stream_trait, P: $crate::crypto::profiles::CryptoProvider> Drop for $transport<S, P> {
-			fn drop(&mut self) {
-				let _ = self.symmetric_key.take();
 			}
 		}
 
@@ -350,6 +367,22 @@ macro_rules! impl_tcp_common {
 			/// Returns None if mutual auth was not performed or handshake not complete.
 			pub fn peer_certificate(&self) -> Option<&$crate::x509::Certificate> {
 				self.peer_certificate.as_ref()
+			}
+
+			/// Configure the local transport capability advertisement
+			/// (multiplexing). Clients offer it in their handshake opening.
+			pub fn with_mux_config(
+				mut self,
+				config: $crate::transport::handshake::negotiation::TransportOffer,
+			) -> Self {
+				self.mux_config = Some(config);
+				self
+			}
+
+			/// Get the negotiated multiplexing settings from a completed
+			/// handshake. `None` means the connection is lock-step.
+			pub fn negotiated_mux(&self) -> Option<$crate::transport::handshake::negotiation::MuxSettings> {
+				self.mux_settings
 			}
 
 			/// True while this endpoint expects an encryption handshake that has

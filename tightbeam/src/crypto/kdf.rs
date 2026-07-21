@@ -95,7 +95,7 @@ pub trait KdfFunction {
 	///   overlap.
 	///
 	/// References
-	/// - RFC 5869 (HKDF): Section 2.2 (the `info` field for context separation)
+	/// - RFC 5869 (HKDF): § 2.2 (the `info` field for context separation)
 	/// - NIST SP 800-56C Rev. 2: HMAC-based KDFs and context information (“OtherInfo”)
 	/// - SECG SEC 1 v2.0 / IEEE 1363a / ISO/IEC 18033-2: ECIES key separation requirement
 	fn derive_dual_keys<const N: usize>(

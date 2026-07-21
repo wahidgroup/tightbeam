@@ -190,11 +190,8 @@ where
 	// Re-wrap for constant-time validation
 	let rewrapped = wrap_with_kek(provider, kek.as_slice(), &cek)?;
 
-	core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-	let valid: bool = rewrapped.as_slice().ct_eq(wrapped).into();
-	core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
 	// KEK is zeroized on drop.
+	let valid: bool = rewrapped.as_slice().ct_eq(wrapped).into();
 	if !valid {
 		return Err(HandshakeError::AesKeyWrap(
 			crate::crypto::aead::aes_kw::Error::IntegrityCheckFailed,
@@ -300,11 +297,8 @@ where
 	// Re-wrap for constant-time validation
 	let rewrapped = wrap_with_kek(provider, combined_key.as_slice(), &cek)?;
 
-	core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-	let valid: bool = rewrapped.as_slice().ct_eq(wrapped).into();
-	core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
 	// Combined key is zeroized on drop.
+	let valid: bool = rewrapped.as_slice().ct_eq(wrapped).into();
 	if !valid {
 		return Err(HandshakeError::HybridKariIntegrityCheckFailed);
 	}

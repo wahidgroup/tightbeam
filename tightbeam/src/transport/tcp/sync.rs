@@ -7,11 +7,20 @@ use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+#[cfg(feature = "std")]
+use std::io::{Error as IoError, ErrorKind};
+#[cfg(feature = "std")]
+use std::net::{SocketAddr, TcpListener as NetTcpListener, TcpStream as NetTcpStream};
+#[cfg(feature = "std")]
+use std::time::{Duration, Instant};
+
 use core::str::FromStr;
-use core::time::Duration;
+
+use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
+use crate::transport::tcp::HANDSHAKE_MAX_WIRE;
 
 use crate::builder::TypeBuilder;
-use crate::crypto::aead::RuntimeAead;
+use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
@@ -70,14 +79,15 @@ where
 {
 	/// Re-arm the stream's per-recv timeout with the budget remaining until
 	/// `deadline`, failing with `Timeout` once the budget is exhausted.
-	fn arm_read_deadline(&mut self, deadline: Option<std::time::Instant>) -> TransportResult<()> {
+	fn arm_read_deadline(&mut self, deadline: Option<Instant>) -> TransportResult<()> {
 		let Some(deadline) = deadline else {
 			return Ok(());
 		};
-		let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+		let remaining = deadline.saturating_duration_since(Instant::now());
 		if remaining.is_zero() {
 			return Err(TransportError::OperationFailed(TransportFailure::Timeout));
 		}
+
 		self.stream.set_timeout(Some(remaining))?;
 		Ok(())
 	}
@@ -93,17 +103,16 @@ where
 		// Absolute deadline for the whole envelope read; every stage below
 		// re-arms the per-recv timeout with the *remaining* budget. Handshake
 		// reads face an unauthenticated peer, so the handshake deadline
-		// applies from the first byte onward; established sessions use the
-		// optional operation timeout.
+		// applies from the first byte onward.
 		#[cfg(feature = "std")]
 		let deadline = if handshake_pending {
 			match self.to_handshake_state() {
 				TcpHandshakeState::AwaitingServerResponse { initiated_at }
 				| TcpHandshakeState::AwaitingClientFinish { initiated_at } => Some(initiated_at + self.handshake_timeout),
-				_ => Some(std::time::Instant::now() + self.handshake_timeout),
+				_ => Some(Instant::now() + self.handshake_timeout),
 			}
 		} else {
-			self.operation_timeout.map(|timeout| std::time::Instant::now() + timeout)
+			self.operation_timeout.map(|timeout| Instant::now() + timeout)
 		};
 
 		let result = (|| -> TransportResult<Vec<u8>> {
@@ -139,7 +148,7 @@ where
 			// tight handshake cap, established sessions the envelope limits.
 			{
 				let max_allowed = if handshake_pending {
-					crate::transport::tcp::HANDSHAKE_MAX_WIRE
+					HANDSHAKE_MAX_WIRE
 				} else {
 					self.max_encrypted_envelope
 						.or(self.max_cleartext_envelope)
@@ -291,7 +300,7 @@ where
 			// Convert I/O timeout errors to TransportError::OperationFailed
 			result.map_err(|e| {
 				if let TransportError::IoError(io_err) = &e {
-					if io_err.kind() == std::io::ErrorKind::TimedOut {
+					if io_err.kind() == ErrorKind::TimedOut {
 						return TransportError::OperationFailed(TransportFailure::Timeout);
 					}
 				}
@@ -315,15 +324,17 @@ where
 {
 	type CryptoProvider = P;
 
-	fn to_encryptor_ref(&self) -> TransportResult<&RuntimeAead> {
-		self.symmetric_key
-			.as_ref()
+	fn to_encryptor_ref(&self) -> TransportResult<&SendCipher> {
+		let session_keys = self.session_keys.as_ref();
+		session_keys
+			.map(SessionKeys::send)
 			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
 	}
 
-	fn to_decryptor_ref(&self) -> TransportResult<&RuntimeAead> {
-		self.symmetric_key
-			.as_ref()
+	fn to_decryptor_ref(&self) -> TransportResult<&RecvCipher> {
+		let session_keys = self.session_keys.as_ref();
+		session_keys
+			.map(SessionKeys::recv)
 			.ok_or(TransportError::OperationFailed(TransportFailure::EncryptorUnavailable))
 	}
 
@@ -343,10 +354,10 @@ where
 		self.server_identity.as_ref().map(Arc::clone)
 	}
 
-	fn set_symmetric_key(&mut self, key: RuntimeAead) {
-		// Replace existing key, ensuring the old key material is dropped immediately
-		let _ = self.symmetric_key.take();
-		self.symmetric_key = Some(key);
+	fn set_session_keys(&mut self, keys: SessionKeys) {
+		// Replace existing keys, ensuring the old key material is dropped immediately
+		let _ = self.session_keys.take();
+		self.session_keys = Some(keys);
 	}
 
 	fn to_max_cleartext_envelope(&self) -> Option<usize> {
@@ -399,8 +410,16 @@ where
 		self.client_validators.as_ref()
 	}
 
-	fn unset_symmetric_key(&mut self) {
-		self.symmetric_key = None;
+	fn unset_session_keys(&mut self) {
+		self.session_keys = None;
+	}
+
+	fn to_mux_config(&self) -> Option<TransportOffer> {
+		self.mux_config
+	}
+
+	fn set_mux_settings(&mut self, settings: Option<MuxSettings>) {
+		self.mux_settings = settings;
 	}
 }
 
@@ -421,21 +440,21 @@ pub struct TcpListener<L: TcpListenerTrait, P: CryptoProvider = DefaultCryptoPro
 }
 
 #[cfg(feature = "std")]
-impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<std::net::TcpListener, P> {
-	type Listener = TcpListener<std::net::TcpListener, P>;
-	type Stream = std::net::TcpStream;
-	type Error = std::io::Error;
-	type Transport = TcpTransport<std::net::TcpStream, P>;
+impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<NetTcpListener, P> {
+	type Listener = TcpListener<NetTcpListener, P>;
+	type Stream = NetTcpStream;
+	type Error = IoError;
+	type Transport = TcpTransport<NetTcpStream, P>;
 	type Address = TightBeamSocketAddr;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
-		std::net::SocketAddr::from_str("127.0.0.1:0")
+		SocketAddr::from_str("127.0.0.1:0")
 			.map(TightBeamSocketAddr)
-			.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+			.map_err(|e| IoError::new(ErrorKind::InvalidInput, e))
 	}
 
 	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let listener = std::net::TcpListener::bind(addr.0)?;
+		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
 		Ok((
 			TcpListener {
@@ -454,7 +473,7 @@ impl<P: CryptoProvider + Send + Sync> Protocol for TcpListener<std::net::TcpList
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
-		std::net::TcpStream::connect(addr.0)
+		NetTcpStream::connect(addr.0)
 	}
 
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
@@ -518,16 +537,16 @@ where
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<std::net::TcpListener, P> {
-	type Encryptor = RuntimeAead;
-	type Decryptor = RuntimeAead;
+impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<NetTcpListener, P> {
+	type Encryptor = SendCipher;
+	type Decryptor = RecvCipher;
 	type CryptoProvider = P;
 
 	async fn bind_with(
 		addr: <Self as Protocol>::Address,
 		config: TransportEncryptionConfig<P>,
 	) -> Result<(Self::Listener, <Self as Protocol>::Address), <Self as Protocol>::Error> {
-		let listener = std::net::TcpListener::bind(addr.0)?;
+		let listener = NetTcpListener::bind(addr.0)?;
 		let bound_addr = listener.local_addr()?;
 		let certificate = Arc::new(config.certificate);
 		let client_validators = config.client_validators.as_ref().map(Arc::clone);
@@ -554,21 +573,25 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for TcpListener<std::net
 #[cfg(test)]
 mod tests {
 	#![allow(unused_imports)]
-	use std::net::TcpStream;
+	use std::io::Write;
+	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::sync::mpsc;
+	use std::thread;
 
 	use super::*;
+	use crate::policy::TransitStatus;
 	use crate::testing::*;
+	use crate::transport::policy::PolicyConf;
 
 	#[cfg(not(feature = "x509"))]
 	#[tokio::test]
 	async fn test_tcp_transport_emit_collect() -> TransportResult<()> {
 		let message = create_v0_tightbeam(None, None);
-		let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+		let listener = NetTcpListener::bind("127.0.0.1:0")?;
 		let addr = listener.local_addr()?;
 		let (ready_tx, ready_rx) = mpsc::channel();
 
-		let server_handle = std::thread::spawn(move || {
+		let server_handle = thread::spawn(move || {
 			let server = TcpListener::from_listener(listener);
 			let _ = ready_tx.send(());
 			let mut transport = server.accept().unwrap();
@@ -580,7 +603,7 @@ mod tests {
 		// Await server ready signal
 		let _ = ready_rx.recv();
 
-		let stream = TcpStream::connect(addr)?;
+		let stream = NetTcpStream::connect(addr)?;
 		let mut client_transport = TcpTransport::from(stream);
 		let response = client_transport.emit(message, None).await?;
 
@@ -597,35 +620,33 @@ mod tests {
 	#[cfg(feature = "x509")]
 	#[tokio::test]
 	async fn handshake_read_deadline_bounds_byte_drip() -> TransportResult<()> {
-		use std::io::Write;
-
-		let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+		let listener = NetTcpListener::bind("127.0.0.1:0")?;
 		let addr = listener.local_addr()?;
 
-		let server_handle = std::thread::spawn(move || -> TransportResult<(TransportResult<Vec<u8>>, Duration)> {
+		let server_handle = thread::spawn(move || -> TransportResult<(TransportResult<Vec<u8>>, Duration)> {
 			let (stream, _) = listener.accept()?;
-			let mut transport: TcpTransport<std::net::TcpStream> = TcpTransport::from(stream);
+			let mut transport: TcpTransport<NetTcpStream> = TcpTransport::from(stream);
 			// Configured client validation marks the endpoint as expecting a
 			// handshake, putting the first read under the handshake clock.
 			transport.client_validators = Some(Arc::new(Vec::new()));
 			transport.handshake_timeout = Duration::from_millis(250);
 
 			let rt = tokio::runtime::Runtime::new()?;
-			let started = std::time::Instant::now();
+			let started = Instant::now();
 			let result = rt.block_on(transport.read_envelope());
 			Ok((result, started.elapsed()))
 		});
 
 		// SEQUENCE header declaring 600 content bytes, sent whole; the body
 		// then drips one byte per 10ms (well under any per-recv timeout).
-		let mut stream = TcpStream::connect(addr)?;
+		let mut stream = NetTcpStream::connect(addr)?;
 		Write::write_all(&mut stream, &[0x30, 0x82, 0x02, 0x58])?;
-		let drip_handle = std::thread::spawn(move || {
+		let drip_handle = thread::spawn(move || {
 			for _ in 0..600 {
 				if Write::write_all(&mut stream, &[0u8]).is_err() {
 					break;
 				}
-				std::thread::sleep(Duration::from_millis(10));
+				thread::sleep(Duration::from_millis(10));
 			}
 		});
 
@@ -633,7 +654,7 @@ mod tests {
 		// re-panic; the closure itself only fails through `?`.
 		let (result, elapsed) = server_handle
 			.join()
-			.map_err(|_| TransportError::IoError(std::io::Error::from(std::io::ErrorKind::Other)))??;
+			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;
 		drip_handle.join().ok();
 
 		assert!(result.is_err());
@@ -644,11 +665,6 @@ mod tests {
 	#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
 	#[tokio::test]
 	async fn test_tcp_transport_with_gate_policy() -> TransportResult<()> {
-		use std::sync::atomic::{AtomicBool, Ordering};
-
-		use crate::policy::TransitStatus;
-		use crate::transport::policy::PolicyConf;
-
 		/// Policy: first Busy, then Accepted
 		struct BusyFirstGate {
 			first: AtomicBool,
@@ -671,11 +687,11 @@ mod tests {
 		}
 
 		let message = create_v0_tightbeam(None, None);
-		let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+		let listener = NetTcpListener::bind("127.0.0.1:0")?;
 		let addr = listener.local_addr()?;
 		let (ready_tx, ready_rx) = mpsc::channel();
 
-		let server_handle = std::thread::spawn(move || {
+		let server_handle = thread::spawn(move || {
 			let server = TcpListener::from_listener(listener);
 			let _ = ready_tx.send(());
 			let mut transport = server.accept().unwrap().with_collector_gate(BusyFirstGate::new());
@@ -691,7 +707,7 @@ mod tests {
 
 		let _ = ready_rx.recv();
 
-		let stream = TcpStream::connect(addr)?;
+		let stream = NetTcpStream::connect(addr)?;
 		let mut transport = TcpTransport::from(stream);
 
 		// First attempt - server responds with Busy

@@ -34,11 +34,7 @@ pub mod messaging;
 pub mod protocols;
 pub mod state;
 
-/// UNSTABLE: trait surface only, no implementation yet. Opt-in via the
-/// `transport-multiplex` feature; the API may change or be removed without a
-/// major version bump.
 #[cfg(feature = "transport-multiplex")]
-#[doc(hidden)]
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
@@ -66,7 +62,9 @@ pub use messaging::MessageEmitter;
 #[cfg(all(feature = "tcp", feature = "tokio"))]
 pub use tcp::r#async::TokioListener;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
-pub use tcp::r#async::{AsyncProtocolStream, TcpTransport};
+pub use tcp::r#async::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream, TcpTransport};
+#[cfg(all(any(feature = "tokio", feature = "async-transport"), feature = "x509"))]
+pub use tcp::r#async::{TransportReader, TransportWriter};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -124,6 +122,7 @@ mod tests {
 	use super::*;
 	use crate::testing::create_v0_tightbeam;
 	use crate::transport::error::TransportFailure;
+	use std::error::Error;
 
 	#[cfg(feature = "tokio")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -179,13 +178,13 @@ mod tests {
 
 	#[cfg(feature = "aes-gcm")]
 	#[test]
-	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit, RuntimeAead};
+	fn test_envelope_builder_encrypted_limit_returns_message() -> Result<(), Box<dyn Error>> {
+		use crate::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit, RuntimeAead, SendCipher};
 		use crate::der::oid::AssociatedOid;
 
 		let frame = create_v0_tightbeam(None, None);
 		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32]).map_err(|_| "Invalid key")?;
-		let encryptor = RuntimeAead::new(cipher, Aes256GcmOid::OID);
+		let encryptor = SendCipher::new(RuntimeAead::new(cipher, Aes256GcmOid::OID));
 
 		let err = builders::EnvelopeBuilder::request(frame.clone())
 			.with_wire_mode(WireMode::Encrypted)

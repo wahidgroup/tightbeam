@@ -178,6 +178,12 @@ pub const CLIENT_CERTIFICATE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1
 /// Client signature OID
 pub const CLIENT_SIGNATURE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.14");
 
+/// Handshake transport capability offer OID (multiplexing)
+pub const HANDSHAKE_TRANSPORT_OFFER: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.15");
+
+/// Handshake transport capability accept OID (multiplexing)
+pub const HANDSHAKE_TRANSPORT_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.16");
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -226,6 +232,8 @@ mod tests {
 			(HANDSHAKE_PROFILE_ECIES_GCM, "1.3.6.1.4.1.55555.1.100"),
 			(CLIENT_CERTIFICATE, "1.3.6.1.4.1.55555.1.13"),
 			(CLIENT_SIGNATURE, "1.3.6.1.4.1.55555.1.14"),
+			(HANDSHAKE_TRANSPORT_OFFER, "1.3.6.1.4.1.55555.1.15"),
+			(HANDSHAKE_TRANSPORT_ACCEPT, "1.3.6.1.4.1.55555.1.16"),
 		];
 
 		for (oid, expected) in pinned {
