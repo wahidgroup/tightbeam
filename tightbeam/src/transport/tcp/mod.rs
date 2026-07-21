@@ -239,14 +239,7 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "x509")]
 			pub(crate) mux_settings: Option<$crate::transport::handshake::negotiation::MuxSettings>,
 			#[cfg(feature = "x509")]
-			pub(crate) server_handshake: Option<
-				Box<
-					dyn $crate::transport::handshake::ServerHandshakeProtocol<
-							Error = $crate::transport::handshake::HandshakeError,
-						> + Send
-						+ Sync,
-				>,
-			>,
+			pub(crate) server_handshake: Option<$crate::transport::handshake::BoxedServerHandshake>,
 			#[cfg(feature = "x509")]
 			pub(crate) handshake_protocol_kind: $crate::transport::handshake::HandshakeProtocolKind,
 			pub(crate) _phantom: core::marker::PhantomData<P>,

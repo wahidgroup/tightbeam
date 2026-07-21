@@ -16,20 +16,18 @@ use std::time::{Duration, Instant};
 
 use core::str::FromStr;
 
-use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
-use crate::transport::tcp::HANDSHAKE_MAX_WIRE;
-
 use crate::builder::TypeBuilder;
 use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
+use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::{
-	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
+	BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
 };
 use crate::transport::state::EncryptedProtocolState;
-use crate::transport::tcp::{TcpListenerTrait, TightBeamSocketAddr};
+use crate::transport::tcp::{HANDSHAKE_MAX_WIRE, TcpListenerTrait, TightBeamSocketAddr};
 use crate::transport::{
 	EncryptedMessageIO, EncryptedProtocol, MessageCollector, MessageEmitter, MessageIO, Pingable, Protocol,
 	ResponsePackage, TransportEncryptionConfig, TransportResult,
@@ -392,9 +390,7 @@ where
 		self.server_certificate_chain.as_ref()
 	}
 
-	fn to_server_handshake_mut(
-		&mut self,
-	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>> {
+	fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
 		&mut self.server_handshake
 	}
 

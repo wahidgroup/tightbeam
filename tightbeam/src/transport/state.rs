@@ -16,7 +16,7 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 use crate::transport::handshake::{
-	HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
+	BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
 };
 use crate::transport::TransportResult;
 use crate::x509::Certificate;
@@ -106,9 +106,7 @@ pub trait EncryptedProtocolState {
 	}
 
 	/// Get mutable reference to server handshake orchestrator
-	fn to_server_handshake_mut(
-		&mut self,
-	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>>;
+	fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake>;
 
 	/// Get handshake timeout
 	fn to_handshake_timeout(&self) -> Duration {

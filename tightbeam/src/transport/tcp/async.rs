@@ -54,7 +54,7 @@ mod x509 {
 	pub use crate::der::Decode;
 	pub use crate::transport::envelopes::{TransportEnvelope, WireEnvelope};
 	pub use crate::transport::handshake::{
-		HandshakeError, HandshakeKeyManager, HandshakeProtocolKind, ServerHandshakeProtocol, TcpHandshakeState,
+		BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
 	};
 	pub use crate::transport::state::EncryptedProtocolState;
 	pub use crate::transport::{EncryptedMessageIO, TransportEncryptionConfig};
@@ -482,9 +482,7 @@ where
 		self.server_certificate_chain.as_ref()
 	}
 
-	fn to_server_handshake_mut(
-		&mut self,
-	) -> &mut Option<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync>> {
+	fn to_server_handshake_mut(&mut self) -> &mut Option<BoxedServerHandshake> {
 		&mut self.server_handshake
 	}
 

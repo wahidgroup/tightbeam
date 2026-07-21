@@ -136,8 +136,7 @@ where
 
 	let client_aead = ClientHandshakeProtocol::complete(client).await?;
 	let server_aead = ServerHandshakeProtocol::complete(server).await?;
-	let complete =
-		ClientHandshakeProtocol::is_complete(client) && ServerHandshakeProtocol::is_complete(server);
+	let complete = ClientHandshakeProtocol::is_complete(client) && ServerHandshakeProtocol::is_complete(server);
 	trace.event_with(complete_event, &[], complete)?;
 
 	let roundtrip = bidirectional_roundtrip_ok(&client_aead, &server_aead)?;
@@ -306,9 +305,8 @@ async fn cms_unique_session_keys(trace: &TraceCollector, materials: &ServerMater
 	let key_a = session_key_bytes(&client_a, "CMS client A must hold a session key after start")?;
 	let key_b = session_key_bytes(&client_b, "CMS client B must hold a session key after start")?;
 
-	let unique_keys = key_a.as_slice() != ZERO_KEY.as_slice()
-		&& key_b.as_slice() != ZERO_KEY.as_slice()
-		&& key_a != key_b;
+	let unique_keys =
+		key_a.as_slice() != ZERO_KEY.as_slice() && key_b.as_slice() != ZERO_KEY.as_slice() && key_a != key_b;
 	trace.event_with("loopback_cms_unique_keys", &[], unique_keys)?;
 
 	Ok(())

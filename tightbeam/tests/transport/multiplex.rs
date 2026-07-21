@@ -228,12 +228,7 @@ mod negotiated {
 		let (client_end, client_responder) = spawn_mux_endpoint(client, MuxRole::Client)?;
 		let (server_end, server_responder) = spawn_mux_endpoint(server, MuxRole::Server)?;
 
-		Ok(MuxPair {
-			client: client_end,
-			server: server_end,
-			client_responder,
-			server_responder,
-		})
+		Ok(MuxPair { client: client_end, server: server_end, client_responder, server_responder })
 	}
 
 	/// Muxed client against raw server halves (test owns wire ordering).
@@ -264,17 +259,11 @@ mod negotiated {
 		server_cap: u32,
 		server_config: MuxEndpointConfig,
 	) -> Result<ServerMuxClientRaw, TightBeamError> {
-		let (client, server) =
-			establish_transports(Some(mux_offer(client_cap)), Some(mux_offer(server_cap))).await?;
+		let (client, server) = establish_transports(Some(mux_offer(client_cap)), Some(mux_offer(server_cap))).await?;
 		let (server_end, responder) = spawn_mux_endpoint_with(server, MuxRole::Server, server_config)?;
 		let (client_reader, client_writer) = client.into_split()?;
 
-		Ok(ServerMuxClientRaw {
-			server: server_end,
-			responder,
-			client_reader,
-			client_writer,
-		})
+		Ok(ServerMuxClientRaw { server: server_end, responder, client_reader, client_writer })
 	}
 
 	fn echo_response(frame: &Arc<Frame>) -> ResponsePackage {
@@ -390,11 +379,7 @@ mod negotiated {
 		Ok(frame)
 	}
 
-	async fn write_muxed_request(
-		writer: &mut SplitWriter,
-		stream_id: u32,
-		frame: Frame,
-	) -> Result<(), TightBeamError> {
+	async fn write_muxed_request(writer: &mut SplitWriter, stream_id: u32, frame: Frame) -> Result<(), TightBeamError> {
 		let request = MuxedRequestPackage::new(stream_id, frame);
 		writer.write_envelope(request.into()).await?;
 		Ok(())
@@ -421,11 +406,7 @@ mod negotiated {
 	}
 
 	/// Write a muxed request then its cancel (Rapid Reset open/cancel pair).
-	async fn write_open_cancel(
-		writer: &mut SplitWriter,
-		stream_id: u32,
-		frame: Frame,
-	) -> Result<(), TightBeamError> {
+	async fn write_open_cancel(writer: &mut SplitWriter, stream_id: u32, frame: Frame) -> Result<(), TightBeamError> {
 		write_muxed_request(writer, stream_id, frame).await?;
 		let cancel = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
 		writer.write_envelope(cancel.into()).await?;
@@ -475,10 +456,7 @@ mod negotiated {
 	}
 
 	fn is_policy_rejection(result: &Result<(), TransportError>) -> bool {
-		matches!(
-			result,
-			Err(TransportError::OperationFailed(TransportFailure::PolicyRejection))
-		)
+		matches!(result, Err(TransportError::OperationFailed(TransportFailure::PolicyRejection)))
 	}
 
 	fn is_goaway(envelope: &TransportEnvelope, reason: GoAwayReason, last_stream_id: Option<u32>) -> bool {
@@ -522,7 +500,6 @@ mod negotiated {
 			(self.rekey_limit - headroom) as u32
 		}
 	}
-
 
 	/// Two concurrent streams: server answers reverse order. Correlate by ID.
 	async fn mux_interleaved_out_of_order(trace: &TraceCollector) -> Result<(), TightBeamError> {
@@ -769,12 +746,9 @@ mod negotiated {
 		let frame_kept = mux_frame("mux-kept");
 		let kept_id = client_stream_id(0);
 		let kept_task = spawn_emit(&link.client.handle, frame_kept.clone());
-		let kept_message = expect_muxed_request(
-			&mut link.server_reader,
-			kept_id,
-			"first client-initiated stream must be id 1",
-		)
-		.await?;
+		let kept_message =
+			expect_muxed_request(&mut link.server_reader, kept_id, "first client-initiated stream must be id 1")
+				.await?;
 
 		let dropped_id = client_stream_id(1);
 		let dropped_task = spawn_emit(&link.client.handle, mux_frame("mux-dropped"));
@@ -796,11 +770,7 @@ mod negotiated {
 		let late = link.client.handle.emit_on_stream(mux_frame("mux-after-peer-goaway")).await;
 		let late_ok = is_draining(&late);
 
-		trace.event_with(
-			"mux_peer_goaway_fails_pending_above",
-			&[],
-			dropped_ok && kept_ok && late_ok,
-		)?;
+		trace.event_with("mux_peer_goaway_fails_pending_above", &[], dropped_ok && kept_ok && late_ok)?;
 		Ok(())
 	}
 
@@ -826,11 +796,7 @@ mod negotiated {
 		let failed = join_task(inflight_task, "in-flight emit task must not panic").await?;
 		let closed_ok = is_connection_closed(&failed);
 
-		trace.event_with(
-			"mux_protocol_violation_goaway_and_pending_fail",
-			&[],
-			goaway_ok && closed_ok,
-		)?;
+		trace.event_with("mux_protocol_violation_goaway_and_pending_fail", &[], goaway_ok && closed_ok)?;
 		Ok(())
 	}
 
@@ -853,7 +819,6 @@ mod negotiated {
 		trace.event_with("mux_connection_drop_mid_emit", &[], is_connection_closed(&failed))?;
 		Ok(())
 	}
-
 }
 
 #[cfg(not(feature = "transport-multiplex"))]

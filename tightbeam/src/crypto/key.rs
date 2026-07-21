@@ -22,6 +22,9 @@ use core::marker::PhantomData;
 use core::future::Future;
 #[cfg(any(feature = "signature", feature = "aead"))]
 use core::pin::Pin;
+
+#[cfg(feature = "signature")]
+use crate::utils::marker::{MaybeSend, MaybeSendFuture, MaybeSync};
 #[cfg(all(feature = "std", any(feature = "signature", feature = "aead")))]
 use std::sync::Arc;
 
@@ -193,8 +196,14 @@ impl SigningKeySpec {
 /// - **Uniform Interface**: In-memory and remote backends use identical APIs
 /// - **Async by Default**: All operations async for maximum flexibility
 /// - **Algorithm Agnostic**: Byte encoding allows any signature/key algorithm
+///
+/// # Threading
+///
+/// `Send`/`Sync` are required on every target except `wasm32`, where the
+/// single-threaded executor lets JavaScript-backed providers (WebAuthn,
+/// wallets, remote KMS bridges) implement the trait.
 #[cfg(feature = "signature")]
-pub trait SigningKeyProvider: Send + Sync + Debug {
+pub trait SigningKeyProvider: MaybeSend + MaybeSync + Debug {
 	/// Returns the algorithm identifier for this key.
 	fn algorithm(&self) -> AlgorithmIdentifierOwned;
 
@@ -203,7 +212,7 @@ pub trait SigningKeyProvider: Send + Sync + Debug {
 	/// # Errors
 	///
 	/// Returns [`KeyError`] if the backend cannot retrieve the public key.
-	fn to_public_key_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
+	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>>;
 
 	/// Signs a precomputed digest (prehash) using this provider's private key.
 	///
@@ -219,7 +228,7 @@ pub trait SigningKeyProvider: Send + Sync + Debug {
 	/// # Returns
 	///
 	/// DER-encoded signature bytes.
-	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>>;
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>>;
 
 	/// Performs key agreement (ECDH, X25519, etc).
 	///
@@ -238,10 +247,7 @@ pub trait SigningKeyProvider: Send + Sync + Debug {
 	/// # Default
 	///
 	/// Returns `UnsupportedOperation` - not all key types support key agreement.
-	fn key_agreement(
-		&self,
-		_peer_public_key: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
+	fn key_agreement(&self, _peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
 		Box::pin(async { Err(KeyError::UnsupportedOperation) })
 	}
 }
@@ -306,7 +312,7 @@ where
 		AlgorithmIdentifierOwned { oid: S::ALGORITHM_OID, parameters: None }
 	}
 
-	fn to_public_key_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let result = self
 			.signing_key
 			.verifying_key()
@@ -317,7 +323,7 @@ where
 		Box::pin(async move { result })
 	}
 
-	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let result = self
 			.signing_key
 			.sign_prehash(prehash)
@@ -340,11 +346,11 @@ where
 		self.as_ref().algorithm()
 	}
 
-	fn to_public_key_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		self.as_ref().to_public_key_bytes()
 	}
 
-	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		self.as_ref().sign_prehash(prehash)
 	}
 }
@@ -417,7 +423,7 @@ where
 		AlgorithmIdentifierOwned { oid: Signature::<C>::ALGORITHM_OID, parameters: None }
 	}
 
-	fn to_public_key_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let result = self
 			.signing_key
 			.verifying_key()
@@ -428,7 +434,7 @@ where
 		Box::pin(async move { result })
 	}
 
-	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let result = self
 			.signing_key
 			.sign_prehash(prehash)
@@ -439,10 +445,7 @@ where
 	}
 
 	#[cfg(feature = "ecdh")]
-	fn key_agreement(
-		&self,
-		peer_public_key: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
+	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
 		let pk_result = PublicKey::<C>::from_sec1_bytes(peer_public_key);
 		let secret_key = *self.signing_key.as_nonzero_scalar();
 
@@ -471,18 +474,15 @@ where
 		self.as_ref().algorithm()
 	}
 
-	fn to_public_key_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		self.as_ref().to_public_key_bytes()
 	}
 
-	fn sign_prehash(&self, prehash: &[u8]) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, KeyError>> + Send + '_>> {
+	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		self.as_ref().sign_prehash(prehash)
 	}
 
-	fn key_agreement(
-		&self,
-		peer_public_key: &[u8],
-	) -> Pin<Box<dyn Future<Output = Result<SecretSlice<u8>, KeyError>> + Send + '_>> {
+	fn key_agreement(&self, peer_public_key: &[u8]) -> MaybeSendFuture<'_, Result<SecretSlice<u8>, KeyError>> {
 		self.as_ref().key_agreement(peer_public_key)
 	}
 }

@@ -5,9 +5,7 @@
 //!
 //! Generic over `P: CryptoProvider` for cryptographic operations.
 
-use core::future::Future;
 use core::marker::PhantomData;
-use core::pin::Pin;
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -51,6 +49,7 @@ use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachin
 use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
 use crate::transport::handshake::ServerHandshakeProtocol;
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
+use crate::utils::marker::MaybeSendFuture;
 use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::Certificate;
 
@@ -724,10 +723,7 @@ where
 {
 	type Error = HandshakeError;
 
-	fn handle_request<'a, 'b>(
-		&'a mut self,
-		msg: &'b [u8],
-	) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	fn handle_request<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
 	where
 		'b: 'a,
 	{
@@ -751,7 +747,7 @@ where
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<SessionKeys, Self::Error>> + Send + 'a>> {
+	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
 		Box::pin(async move {
 			// 1. Validate state
 			if self.state.state() != ServerHandshakeState::ClientFinishedReceived {

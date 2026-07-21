@@ -17,9 +17,6 @@ use std::marker::PhantomData;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
-use core::future::Future;
-use core::pin::Pin;
-
 use crate::asn1::OctetString;
 use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_ECIES_KDF_INFO};
 use crate::crypto::aead::{Aead, AeadCore, KeyInit, Nonce, Payload, SessionKeys};
@@ -51,6 +48,7 @@ use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshak
 use crate::transport::handshake::{
 	DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation,
 };
+use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::Zeroizing;
 
@@ -558,10 +556,7 @@ where
 {
 	type Error = HandshakeError;
 
-	fn handle_request<'a, 'b>(
-		&'a mut self,
-		msg: &'b [u8],
-	) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	fn handle_request<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
 	where
 		'b: 'a,
 	{
@@ -584,7 +579,7 @@ where
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<SessionKeys, Self::Error>> + Send + 'a>> {
+	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
 		Box::pin(async move {
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;

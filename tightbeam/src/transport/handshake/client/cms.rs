@@ -6,9 +6,6 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-use core::future::Future;
-use core::pin::Pin;
-
 use crate::cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
@@ -46,6 +43,7 @@ use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
 use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
+use crate::utils::marker::MaybeSendFuture;
 use crate::zeroize::Zeroizing;
 
 /// Client-side CMS handshake orchestrator.
@@ -762,7 +760,7 @@ where
 {
 	type Error = HandshakeError;
 
-	fn start<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>> {
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<Vec<u8>, Self::Error>> {
 		Box::pin(async move {
 			// Fresh random session key per handshake: a constant key
 			// would make every session trivially decryptable (CWE-321).
@@ -771,10 +769,7 @@ where
 		})
 	}
 
-	fn handle_response<'a, 'b>(
-		&'a mut self,
-		msg: &'b [u8],
-	) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	fn handle_response<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
 	where
 		'b: 'a,
 	{
@@ -789,7 +784,7 @@ where
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<SessionKeys, Self::Error>> + Send + 'a>> {
+	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
 		Box::pin(async move {
 			// 1. Validate state
 			if self.state.state() != ClientHandshakeState::ClientFinishedSent {

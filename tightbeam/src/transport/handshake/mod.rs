@@ -27,15 +27,15 @@
 //! ├────────────────────────────────────────────────────────────────────────┤
 //! │                                                                        │
 //! │ Client ─────────────────────────── Server                              │
-//! │  │                           │                                         |
-//! |  │── ClientHello ───────────►│  (client_rand, security_offer?)         |
-//! |  │                           │                                         |
-//! |  │◄─ ServerHandshake ────────│  (server_rand, cert, sig, accept?, ma?) |
-//! |  │                           │                                         |
-//! |  │── ClientKeyExchange ─────►│  (encrypted_key, [cert, sig]?)          |
-//! |  │                           │                                         |
-//! |  │ ◄═ Session Established ═► ║  (AEAD keys derived)                    |
-//! |  │                           │                                         |
+//! │  │                           │                                         │
+//! │  │── ClientHello ───────────►│  (client_rand, security_offer?)         │
+//! │  │                           │                                         │
+//! │  │◄─ ServerHandshake ────────│  (server_rand, cert, sig, accept?, ma?) │
+//! │  │                           │                                         │
+//! │  │── ClientKeyExchange ─────►│  (encrypted_key, [cert, sig]?)          │
+//! │  │                           │                                         │
+//! │  │ ◄═ Session Established ═► │  (AEAD keys derived)                    │
+//! │  │                           │                                         │
 //! │  └───────────────────────────┘                                         │
 //! └────────────────────────────────────────────────────────────────────────┘
 //! **Legend:**
@@ -180,9 +180,7 @@ pub use kari::{kari_unwrap_hybrid, kari_wrap_hybrid};
 #[cfg(feature = "transport-cms")]
 pub use processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 
-use core::future::Future;
 use core::marker::PhantomData;
-use core::pin::Pin;
 use core::result::Result as CoreResult;
 
 use crate::asn1::OctetString;
@@ -202,6 +200,8 @@ use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
+use crate::utils::marker::{MaybeSend, MaybeSendFuture};
+
 #[cfg(feature = "transport-cms")]
 use crate::transport::handshake::server::CmsHandshakeServer;
 use crate::Beamable;
@@ -273,7 +273,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		aad_domain_tag: Option<&'static [u8]>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>;
+	) -> Result<BoxedServerHandshake>;
 
 	/// Create an ECIES client handshake orchestrator.
 	///
@@ -294,7 +294,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		client_cert: Option<Arc<Certificate>>,
 		aad_domain_tag: Option<&'static [u8]>,
 		validator: Option<Arc<dyn CertificateValidation>>,
-	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
+	) -> Result<BoxedClientHandshake>;
 
 	/// Create a CMS client handshake orchestrator.
 	///
@@ -304,10 +304,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 	/// # Returns
 	/// A CMS client handshake orchestrator that borrows the encapsulated key
 	#[cfg(feature = "transport-cms")]
-	fn create_cms_client(
-		&self,
-		config: CmsClientConfig,
-	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>;
+	fn create_cms_client(&self, config: CmsClientConfig) -> Result<BoxedClientHandshake>;
 
 	/// Create a CMS server handshake orchestrator.
 	///
@@ -325,7 +322,7 @@ pub trait ServerHandshakeKey: Send + Sync {
 		&self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 		supported_profiles: Vec<SecurityProfileDesc>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>;
+	) -> Result<BoxedServerHandshake>;
 }
 
 /// Provisioned server identity for a CMS client handshake.
@@ -440,14 +437,14 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// # Returns
 	/// A boxed ECIES server handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-ecies")]
-	pub fn create_ecies_server<'a>(
-		&'a self,
+	pub fn create_ecies_server(
+		&self,
 		server_cert: Arc<Certificate>,
 		aad_domain_tag: Option<&'static [u8]>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 		transport_config: Option<TransportOffer>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>
+	) -> Result<BoxedServerHandshake>
 	where
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -482,14 +479,14 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// # Returns
 	/// An ECIES client handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-ecies")]
-	pub fn create_ecies_client<'a, M>(
-		&'a self,
+	pub fn create_ecies_client<M>(
+		&self,
 		_server_cert: Option<Arc<Certificate>>,
 		client_cert: Option<Arc<Certificate>>,
 		aad_domain_tag: Option<&'static [u8]>,
 		validator: Option<Arc<dyn CertificateValidation>>,
 		transport_offer: Option<TransportOffer>,
-	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>
+	) -> Result<BoxedClientHandshake>
 	where
 		M: EciesMessageOps + Send + Sync + 'static,
 		P::Curve: Curve + CurveArithmetic,
@@ -525,10 +522,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// # Returns
 	/// A CMS client handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-cms")]
-	pub fn create_cms_client<'a>(
-		&'a self,
-		config: CmsClientConfig,
-	) -> Result<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>
+	pub fn create_cms_client(&self, config: CmsClientConfig) -> Result<BoxedClientHandshake>
 	where
 		P: Default + 'static,
 		P::Curve: elliptic_curve::Curve + elliptic_curve::CurveArithmetic,
@@ -574,12 +568,12 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// # Returns
 	/// A CMS server handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-cms")]
-	pub fn create_cms_server<'a>(
-		&'a self,
+	pub fn create_cms_server(
+		&self,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		transport_config: Option<TransportOffer>,
-	) -> Result<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>
+	) -> Result<BoxedServerHandshake>
 	where
 		P::Curve: Curve + CurveArithmetic,
 		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
@@ -656,12 +650,15 @@ pub enum HandshakeAlert {
 ///
 /// Supports multi-round handshakes where the client may need to send multiple
 /// messages before completing the handshake.
-pub trait ClientHandshakeProtocol: Send {
+///
+/// `Send` is required on every target except `wasm32`, where the
+/// single-threaded executor lets JS-backed signing providers participate.
+pub trait ClientHandshakeProtocol: MaybeSend {
 	type Error: Into<TransportError> + Send;
 
 	/// Start the handshake, returns the first message to send to the server.
 	#[allow(clippy::type_complexity)]
-	fn start<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<Vec<u8>, Self::Error>> + Send + 'a>>;
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<Vec<u8>, Self::Error>>;
 
 	/// Handle a response from the server.
 	///
@@ -671,7 +668,7 @@ pub trait ClientHandshakeProtocol: Send {
 	fn handle_response<'a, 'b>(
 		&'a mut self,
 		msg: &'b [u8],
-	) -> Pin<Box<dyn Future<Output = CoreResult<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	) -> MaybeSendFuture<'a, CoreResult<Option<Vec<u8>>, Self::Error>>
 	where
 		'b: 'a;
 
@@ -683,7 +680,7 @@ pub trait ClientHandshakeProtocol: Send {
 	/// The cipher type is determined by the CryptoProvider's AeadCipher associated type,
 	/// and the OID is taken from the negotiated security profile.
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<SessionKeys, Self::Error>> + Send + 'a>>;
+	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<SessionKeys, Self::Error>>;
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
@@ -708,7 +705,10 @@ pub trait ClientHandshakeProtocol: Send {
 ///
 /// Supports multi-round handshakes where the server may need to handle multiple
 /// requests from the client before completing the handshake.
-pub trait ServerHandshakeProtocol: Send {
+///
+/// `Send` is required on every target except `wasm32`, where the
+/// single-threaded executor lets JS-backed signing providers participate.
+pub trait ServerHandshakeProtocol: MaybeSend {
 	type Error: Into<TransportError> + Send;
 
 	/// Handle a request from the client.
@@ -720,7 +720,7 @@ pub trait ServerHandshakeProtocol: Send {
 	fn handle_request<'a, 'b>(
 		&'a mut self,
 		msg: &'b [u8],
-	) -> Pin<Box<dyn Future<Output = CoreResult<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	) -> MaybeSendFuture<'a, CoreResult<Option<Vec<u8>>, Self::Error>>
 	where
 		'b: 'a;
 
@@ -732,7 +732,7 @@ pub trait ServerHandshakeProtocol: Send {
 	/// The cipher type is determined by the CryptoProvider's AeadCipher associated type,
 	/// and the OID is taken from the negotiated security profile.
 	#[cfg(feature = "aead")]
-	fn complete<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CoreResult<SessionKeys, Self::Error>> + Send + 'a>>;
+	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, CoreResult<SessionKeys, Self::Error>>;
 
 	/// Check if the handshake is complete.
 	fn is_complete(&self) -> bool;
@@ -763,6 +763,30 @@ pub trait ServerHandshakeProtocol: Send {
 		None
 	}
 }
+
+/// Boxed client handshake orchestrator.
+///
+/// `Send` on every target except `wasm32`, where JS-backed signing providers
+/// make the orchestrator `!Send`. A `dyn` object cannot carry the non-auto
+/// [`MaybeSend`] bound, so the auto-trait list is target-gated here.
+#[cfg(not(target_arch = "wasm32"))]
+pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>;
+
+/// Boxed client handshake orchestrator (`wasm32`: `Send` relaxed).
+#[cfg(target_arch = "wasm32")]
+pub type BoxedClientHandshake = Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + 'static>;
+
+/// Boxed server handshake orchestrator.
+///
+/// `Send + Sync` on every target except `wasm32`, where JS-backed signing
+/// providers make the orchestrator `!Send`. A `dyn` object cannot carry the
+/// non-auto [`MaybeSend`] bound, so the auto-trait list is target-gated here.
+#[cfg(not(target_arch = "wasm32"))]
+pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>;
+
+/// Boxed server handshake orchestrator (`wasm32`: `Send + Sync` relaxed).
+#[cfg(target_arch = "wasm32")]
+pub type BoxedServerHandshake = Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + 'static>;
 
 // ============================================================================
 // Protocol Selection Enums
@@ -824,7 +848,7 @@ pub struct ClientKeyExchange {
 	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]
 	pub client_certificate: Option<Certificate>,
-	/// Signature over the handshake transcript (ClientHello || ServerHandshake || encrypted_data)
+	/// Signature over the handshake transcript (ClientHello ││ ServerHandshake ││ encrypted_data)
 	/// proving possession of the client certificate's private key.
 	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]

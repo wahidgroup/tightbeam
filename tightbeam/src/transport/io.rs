@@ -24,8 +24,6 @@ use std::time::Instant;
 use core::mem;
 
 use crate::asn1::Frame;
-#[cfg(feature = "transport-ecies")]
-use crate::crypto::ecies::Secp256k1EciesMessage;
 use crate::der::{Decode, Encode};
 use crate::encode;
 use crate::policy::TransitStatus;
@@ -34,6 +32,9 @@ use crate::transport::error::TransportError;
 use crate::transport::messaging::ResponseHandler;
 use crate::transport::TransportResult;
 use crate::TightBeamError;
+
+#[cfg(feature = "transport-ecies")]
+use crate::crypto::ecies::Secp256k1EciesMessage;
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -51,7 +52,8 @@ mod x509 {
 		pub use crate::crypto::sign::Verifier;
 		pub use crate::spki::EncodePublicKey;
 		pub use crate::transport::handshake::{
-			ClientHandshakeProtocol, HandshakeError, HandshakeProtocolKind, ServerHandshakeProtocol,
+			BoxedClientHandshake, BoxedServerHandshake, ClientHandshakeProtocol, HandshakeError,
+			HandshakeProtocolKind, ServerHandshakeProtocol,
 		};
 	}
 
@@ -525,9 +527,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Build the ECIES client orchestrator (mutual-auth path) from transport state.
 	#[cfg(feature = "transport-ecies")]
-	fn build_ecies_client_orchestrator<P>(
-		&self,
-	) -> TransportResult<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>
+	fn build_ecies_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: CryptoProvider + Default + Send + Sync + 'static,
@@ -569,9 +569,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	/// the server identity comes from the provisioned chain; missing trust
 	/// store or chain fails closed.
 	#[cfg(feature = "transport-cms")]
-	fn build_cms_client_orchestrator<P>(
-		&self,
-	) -> TransportResult<Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send + 'static>>
+	fn build_cms_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: CryptoProvider + Default + Send + Sync + 'static,
@@ -615,7 +613,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	async fn drive_client_handshake(
 		&mut self,
 		kind: HandshakeProtocolKind,
-		mut orchestrator: Box<dyn ClientHandshakeProtocol<Error = HandshakeError> + Send>,
+		mut orchestrator: BoxedClientHandshake,
 	) -> TransportResult<()>
 	where
 		Self: Sized + MessageIO + EncryptedProtocolState,
@@ -765,9 +763,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Build the ECIES server orchestrator from transport state.
 	#[cfg(feature = "transport-ecies")]
-	fn build_ecies_server_orchestrator<P>(
-		&self,
-	) -> TransportResult<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>
+	fn build_ecies_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: CryptoProvider + Send + Sync + 'static,
@@ -795,9 +791,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 	/// Build the CMS server orchestrator from transport state.
 	#[cfg(feature = "transport-cms")]
-	fn build_cms_server_orchestrator<P>(
-		&self,
-	) -> TransportResult<Box<dyn ServerHandshakeProtocol<Error = HandshakeError> + Send + Sync + 'static>>
+	fn build_cms_server_orchestrator<P>(&self) -> TransportResult<BoxedServerHandshake>
 	where
 		Self: EncryptedProtocolState<CryptoProvider = P>,
 		P: CryptoProvider + Send + Sync + 'static,

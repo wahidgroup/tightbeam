@@ -172,10 +172,7 @@ async fn pump_verbatim_frames(mut reader: TokioReadHalf, mut writer: TokioWriteH
 }
 
 fn is_tamper_detected(result: &Result<TransportEnvelope, TransportError>) -> bool {
-	matches!(
-		result,
-		Err(TransportError::OperationFailed(TransportFailure::TamperDetected))
-	)
+	matches!(result, Err(TransportError::OperationFailed(TransportFailure::TamperDetected)))
 }
 
 async fn write_plain_requests(
