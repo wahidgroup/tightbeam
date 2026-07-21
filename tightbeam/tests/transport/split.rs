@@ -164,7 +164,10 @@ async fn split_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(), Ti
 	// bytes leave the writer.
 	let second_request = request_envelope();
 	let limited = writer.write_envelope(second_request).await;
-	let rekey_required = matches!(limited, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired)));
+	let rekey_required = matches!(
+		limited,
+		Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired))
+	);
 
 	await_ok(server_handle, "server task must not panic").await?;
 
@@ -198,7 +201,10 @@ async fn split_recv_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(
 	// The peer's second record carries a counter at the clamped limit: the
 	// reader must demand a rekey instead of decrypting it.
 	let over_limit = reader.read_envelope().await;
-	let rekey_required = matches!(over_limit, Err(TransportError::OperationFailed(TransportFailure::RekeyRequired)));
+	let rekey_required = matches!(
+		over_limit,
+		Err(TransportError::OperationFailed(TransportFailure::RekeyRequired))
+	);
 
 	await_ok(server_handle, "server task must not panic").await?;
 
