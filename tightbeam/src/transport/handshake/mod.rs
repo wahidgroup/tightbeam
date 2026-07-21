@@ -848,7 +848,7 @@ pub struct ClientKeyExchange {
 	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]
 	pub client_certificate: Option<Certificate>,
-	/// Signature over the handshake transcript (ClientHello ││ ServerHandshake ││ encrypted_data)
+	/// Signature over the handshake transcript (ClientHello || ServerHandshake || encrypted_data)
 	/// proving possession of the client certificate's private key.
 	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]

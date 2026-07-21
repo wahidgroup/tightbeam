@@ -53,6 +53,7 @@ make clean                             # Clean build artifacts
 make test                              # Run all tests
 make lint                              # Run linters
 make lint ARGS="--fix --allow-matrixd" # Run linters with fixes
+make ci                                # Lint + build + test-all (local CI)
 make doc                               # Build documentation
 
 # Feature-specific builds (feature gating needs work See: `<issue link>`)
@@ -75,7 +76,7 @@ Contributors MUST:
 
 - Use hard tabs (this repository enforces tabs)
 - Follow standard Rust formatting (`cargo fmt`)
-- Use `make lint` and address all warnings before submitting
+- Use `make ci` (or at least `make lint`) and address all warnings before submitting
 - Write comprehensive documentation for public APIs
 
 Contributors SHOULD:
