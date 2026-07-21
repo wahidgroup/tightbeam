@@ -64,7 +64,9 @@ pub use tcp::r#async::TokioListener;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use tcp::r#async::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream, TcpTransport};
 #[cfg(all(any(feature = "tokio", feature = "async-transport"), feature = "x509"))]
-pub use tcp::r#async::{TransportReader, TransportWriter};
+pub use tcp::r#async::{
+	CleartextReader, CleartextWriter, EnvelopeSink, EnvelopeSource, TransportReader, TransportWriter,
+};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;

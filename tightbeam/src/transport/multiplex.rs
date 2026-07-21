@@ -1,17 +1,18 @@
 //! HTTP/2-style multiplexing: concurrent request/response streams over a
-//! single encrypted connection.
+//! single connection.
 //!
-//! A [`MuxTransport`] is built from the split halves of a handshaken
-//! transport ([`TransportReader`]/[`TransportWriter`], see
-//! [`TcpTransport::into_split`](crate::transport::TcpTransport::into_split))
-//! plus the [`MuxSettings`] negotiated during the handshake. It decomposes
-//! into four parts:
+//! A [`MuxTransport`] is built from split envelope halves plus
+//! [`MuxSettings`]. Encrypted halves come from
+//! [`TcpTransport::into_split`](crate::transport::TcpTransport::into_split)
+//! with handshake-negotiated settings. Cleartext halves come from
+//! [`TcpTransport::into_split_cleartext`](crate::transport::TcpTransport::into_split_cleartext)
+//! with out-of-band symmetric settings and NO confidentiality, integrity,
+//! replay, or deletion protection. It decomposes into four parts:
 //!
 //! - [`MuxWriterDriver`]: single serialization point. Drains an outbound
-//!   queue, encrypts with the send key, writes to the write half.
-//! - [`MuxReaderDriver`]: reads from the read half, decrypts with the recv
-//!   key, routes responses to their pending streams and requests to the
-//!   responder.
+//!   queue and writes each envelope through the send half.
+//! - [`MuxReaderDriver`]: reads envelopes off the read half, routes
+//!   responses to their pending streams and requests to the responder.
 //! - [`MuxHandle`]: cloneable client handle. [`MuxHandle::emit_on_stream`]
 //!   allocates a stream, sends the request, and awaits the correlated
 //!   response.
@@ -162,7 +163,7 @@ mod router {
 	};
 	use crate::transport::error::TransportFailure;
 	use crate::transport::handshake::negotiation::MuxSettings;
-	use crate::transport::tcp::r#async::{AsyncReadStream, AsyncWriteStream, TransportReader, TransportWriter};
+	use crate::transport::tcp::r#async::{EnvelopeSink, EnvelopeSource};
 	use crate::transport::{TransportError, TransportResult};
 	use crate::utils::marker::MaybeSend;
 	use crate::Frame;
@@ -181,7 +182,6 @@ mod router {
 		Draining,
 	}
 
-	/// Command consumed by the writer pump.
 	enum Outbound {
 		Envelope(TransportEnvelope),
 		Close,
@@ -458,9 +458,9 @@ mod router {
 			enqueue_stream_cancel(&self.shared, &self.outbound, stream_id.value());
 		}
 
-		/// Gracefully shut the connection down (RFC 9113 § 6.8
-		/// analog): sends GoAway, halts the allocator, awaits pending-table
-		/// drain, then closes the writer pump.
+		/// Gracefully shut the connection down (RFC 9113 § 6.8 analog): sends
+		/// GoAway, halts the allocator, awaits pending-table drain, then
+		/// closes the writer driver.
 		///
 		/// A drain deadline composes by wrapping this future in the
 		/// caller's timer.
@@ -496,16 +496,16 @@ mod router {
 		}
 	}
 
-	/// Writer pump: single serialization point for the connection.
+	/// Writer driver: single serialization point for the connection.
 	///
 	/// Drains the outbound queue and writes each envelope through the
-	/// encrypting [`TransportWriter`]. Spawn [`MuxWriterDriver::drive`] on
-	/// the caller's executor.
+	/// [`EnvelopeSink`] (encrypting or cleartext). Spawn
+	/// [`MuxWriterDriver::drive`] on the caller's executor.
 	pub struct MuxWriterDriver<W>
 	where
-		W: AsyncWriteStream,
+		W: EnvelopeSink,
 	{
-		writer: TransportWriter<W>,
+		writer: W,
 		commands: mpsc::Receiver<Outbound>,
 		shared: Arc<MuxShared>,
 		/// Records reserved for draining (peer-owed responses plus the
@@ -515,10 +515,9 @@ mod router {
 
 	impl<W> MuxWriterDriver<W>
 	where
-		W: AsyncWriteStream,
-		TransportError: From<W::Error>,
+		W: EnvelopeSink,
 	{
-		/// Run the pump until shutdown or write failure.
+		/// Run the driver until shutdown or write failure.
 		pub async fn drive(mut self) -> TransportResult<()> {
 			while let Some(command) = self.commands.next().await {
 				match command {
@@ -550,17 +549,17 @@ mod router {
 		}
 	}
 
-	/// Reader pump: routes decrypted envelopes off the read half.
+	/// Reader driver: routes inbound envelopes off the read half.
 	///
 	/// Responses resolve their pending stream (unknown IDs silently
 	/// discarded: cancel/response races are benign). Requests flow to the
 	/// [`MuxResponder`]. Protocol violations answer with a GoAway and fail
-	/// the pump. Spawn [`MuxReaderDriver::drive`] on the caller's executor.
+	/// the driver. Spawn [`MuxReaderDriver::drive`] on the caller's executor.
 	pub struct MuxReaderDriver<R>
 	where
-		R: AsyncReadStream,
+		R: EnvelopeSource,
 	{
-		reader: TransportReader<R>,
+		reader: R,
 		shared: Arc<MuxShared>,
 		inbound: mpsc::Sender<InboundEvent>,
 		outbound: mpsc::Sender<Outbound>,
@@ -568,20 +567,20 @@ mod router {
 
 	impl<R> MuxReaderDriver<R>
 	where
-		R: AsyncReadStream,
-		TransportError: From<R::Error>,
+		R: EnvelopeSource,
 	{
-		/// Run the pump until the connection ends. Pending streams observe
+		/// Run the driver until the connection ends. Pending streams observe
 		/// the failure.
 		pub async fn drive(mut self) -> TransportResult<()> {
-			let result = self.pump().await;
+			let result = self.route_envelopes().await;
 
 			self.shared.fail_all_pending();
 
 			result
 		}
 
-		async fn pump(&mut self) -> TransportResult<()> {
+		/// Route inbound envelopes to their pending streams or handlers.
+		async fn route_envelopes(&mut self) -> TransportResult<()> {
 			loop {
 				let envelope = self.reader.read_envelope().await?;
 				match envelope {
@@ -675,6 +674,7 @@ mod router {
 					Ok((stream_id, response)) => ResponderEvent::Finished(stream_id, response),
 					Err(Aborted) => ResponderEvent::Aborted,
 				};
+
 				return Poll::Ready(event);
 			}
 			if inbound_open {
@@ -689,6 +689,7 @@ mod router {
 					Poll::Pending => {}
 				}
 			}
+
 			Poll::Pending
 		})
 		.await
@@ -714,7 +715,7 @@ mod router {
 		/// Run the responder until the connection ends.
 		///
 		/// # Errors
-		/// - `ConnectionClosed`: writer pump gone
+		/// - `ConnectionClosed`: writer driver gone
 		/// - `OperationFailed(PolicyRejection)`: peer exhausted the cancel
 		///   budget. A [`GoAwayReason::EnhanceYourCalm`] was sent
 		pub async fn serve<H, Fut>(mut self, handler: H) -> TransportResult<()>
@@ -783,12 +784,12 @@ mod router {
 		}
 	}
 
-	/// Multiplexed transport assembled from split encrypted halves and the
-	/// handshake-negotiated [`MuxSettings`].
+	/// Multiplexed transport assembled from split envelope halves and
+	/// [`MuxSettings`].
 	pub struct MuxTransport<R, W>
 	where
-		R: AsyncReadStream,
-		W: AsyncWriteStream,
+		R: EnvelopeSource,
+		W: EnvelopeSink,
 	{
 		handle: MuxHandle,
 		reader: MuxReaderDriver<R>,
@@ -798,22 +799,20 @@ mod router {
 
 	impl<R, W> MuxTransport<R, W>
 	where
-		R: AsyncReadStream,
-		W: AsyncWriteStream,
+		R: EnvelopeSource,
+		W: EnvelopeSink,
 	{
 		/// Assemble a multiplexed transport over split halves.
 		///
 		/// `role` fixes odd/even stream IDs and MUST match the endpoint's
-		/// handshake role. `settings` MUST come from
+		/// connection role (initiator = client). On encrypted halves,
+		/// `settings` MUST come from
 		/// [`negotiated_mux`](crate::transport::TcpTransport::negotiated_mux).
 		/// A peer that never negotiated multiplexing rejects every muxed
-		/// envelope as invalid.
-		pub fn new(
-			reader: TransportReader<R>,
-			writer: TransportWriter<W>,
-			role: MuxRole,
-			settings: MuxSettings,
-		) -> Self {
+		/// envelope as invalid. On cleartext halves there is no
+		/// negotiation: both endpoints MUST agree on the same settings out
+		/// of band ([`MuxSettings::symmetric`]).
+		pub fn new(reader: R, writer: W, role: MuxRole, settings: MuxSettings) -> Self {
 			let outbound_capacity =
 				cap_as_usize(settings.local_initiated_cap.saturating_add(settings.peer_initiated_cap)).max(1);
 			let inbound_capacity = cap_as_usize(settings.peer_initiated_cap).max(1);
@@ -866,7 +865,7 @@ mod router {
 			self.handle.clone()
 		}
 
-		/// Decompose into the handle, the two driver pumps to spawn, and
+		/// Decompose into the handle, the two drivers to spawn, and
 		/// the responder.
 		pub fn into_parts(self) -> (MuxHandle, MuxReaderDriver<R>, MuxWriterDriver<W>, MuxResponder) {
 			(self.handle, self.reader, self.writer, self.responder)

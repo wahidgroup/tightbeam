@@ -32,7 +32,7 @@ use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportFailure;
 use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
-use crate::transport::io::decode_transport_envelope;
+use crate::transport::io::{decode_transport_envelope, ensure_compatible_versions};
 use crate::transport::tcp::HANDSHAKE_MAX_WIRE;
 use crate::transport::ResponsePackage;
 use crate::transport::{
@@ -534,6 +534,29 @@ where
 	}
 }
 
+/// Receive side of a split envelope link.
+///
+/// Decouples the [`MuxTransport`](crate::transport::multiplex::MuxTransport)
+/// router from the link's protection policy: [`TransportReader`] decrypts
+/// and enforces AEAD sequencing, [`CleartextReader`] enforces neither.
+#[cfg(feature = "x509")]
+pub trait EnvelopeSource: MaybeSend {
+	fn read_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend;
+}
+
+/// Send side of a split envelope link.
+///
+/// Send-direction counterpart of [`EnvelopeSource`].
+#[cfg(feature = "x509")]
+pub trait EnvelopeSink: MaybeSend {
+	fn write_envelope(&mut self, envelope: TransportEnvelope) -> impl Future<Output = TransportResult<()>> + MaybeSend;
+
+	/// Envelopes still writable before the link demands a rekey.
+	///
+	/// Links without keys never rekey and report `u64::MAX`.
+	fn remaining_records(&self) -> u64;
+}
+
 /// Exclusive receive half of a split encrypted transport.
 ///
 /// Owns the receive-direction cipher, so decryption needs no locks and can
@@ -549,7 +572,7 @@ where
 }
 
 #[cfg(feature = "x509")]
-impl<R> TransportReader<R>
+impl<R> EnvelopeSource for TransportReader<R>
 where
 	R: AsyncReadStream,
 	TransportError: From<R::Error>,
@@ -558,7 +581,7 @@ where
 	///
 	/// The split exists only after handshake completion, so every inbound
 	/// wire envelope must be encrypted.
-	pub async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
 		let max_len = self.max_encrypted_envelope.unwrap_or(DEFAULT_MAX_ENVELOPE);
 		let wire_bytes = self.stream.read_frame(Some(max_len)).await?;
 
@@ -602,14 +625,16 @@ where
 		self.send_key = self.send_key.with_rekey_limit(limit);
 		self
 	}
+}
 
-	/// Records still writable before the send cipher demands a rekey.
-	pub fn remaining_records(&self) -> u64 {
-		self.send_key.remaining_records()
-	}
-
+#[cfg(feature = "x509")]
+impl<W> EnvelopeSink for TransportWriter<W>
+where
+	W: AsyncWriteStream,
+	TransportError: From<W::Error>,
+{
 	/// Encrypt and write one transport envelope.
-	pub async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
+	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
 		let limits = EnvelopeLimits::from_pair(None, self.max_encrypted_envelope);
 		let mut builder = limits.apply(EnvelopeBuilder::transport(envelope));
 		builder = builder.with_wire_mode(WireMode::Encrypted);
@@ -621,6 +646,81 @@ where
 		self.stream.write_frame(&wire_bytes).await?;
 		Ok(())
 	}
+
+	/// Records still writable before the send cipher demands a rekey.
+	fn remaining_records(&self) -> u64 {
+		self.send_key.remaining_records()
+	}
+}
+
+/// Exclusive receive half of a split cleartext transport.
+///
+/// Carries envelopes with NO confidentiality, integrity, replay, or deletion
+/// protection. Only the size cap and frame version checks apply. Use only on
+/// links trusted by other means.
+#[cfg(feature = "x509")]
+pub struct CleartextReader<R>
+where
+	R: AsyncReadStream,
+{
+	stream: R,
+	max_cleartext_envelope: Option<usize>,
+}
+
+#[cfg(feature = "x509")]
+impl<R> EnvelopeSource for CleartextReader<R>
+where
+	R: AsyncReadStream,
+	TransportError: From<R::Error>,
+{
+	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
+		let max_len = self.max_cleartext_envelope.unwrap_or(DEFAULT_MAX_ENVELOPE);
+		let wire_bytes = self.stream.read_frame(Some(max_len)).await?;
+
+		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
+		match wire_envelope {
+			WireEnvelope::Cleartext(envelope) => ensure_compatible_versions(envelope),
+			WireEnvelope::Encrypted(_) => Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed)),
+		}
+	}
+}
+
+/// Exclusive send half of a split cleartext transport.
+///
+/// Writes envelopes with NO confidentiality, integrity, replay, or deletion
+/// protection. See [`CleartextReader`] for the trust prerequisites.
+#[cfg(feature = "x509")]
+pub struct CleartextWriter<W>
+where
+	W: AsyncWriteStream,
+{
+	stream: W,
+	max_cleartext_envelope: Option<usize>,
+}
+
+#[cfg(feature = "x509")]
+impl<W> EnvelopeSink for CleartextWriter<W>
+where
+	W: AsyncWriteStream,
+	TransportError: From<W::Error>,
+{
+	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
+		let limits = EnvelopeLimits::from_pair(self.max_cleartext_envelope, None);
+		let builder = limits
+			.apply(EnvelopeBuilder::transport(envelope))
+			.with_wire_mode(WireMode::Cleartext);
+
+		let wire_envelope = builder.finish()?;
+		let wire_bytes = wire_envelope.to_der()?;
+
+		self.stream.write_frame(&wire_bytes).await?;
+		Ok(())
+	}
+
+	/// Cleartext link never rekeys.
+	fn remaining_records(&self) -> u64 {
+		u64::MAX
+	}
 }
 
 /// Read/write halves produced by [`TcpTransport::into_split`].
@@ -628,6 +728,13 @@ where
 pub type SplitTransport<S> = (
 	TransportReader<<S as SplittableStream>::ReadHalf>,
 	TransportWriter<<S as SplittableStream>::WriteHalf>,
+);
+
+/// Read/write halves produced by [`TcpTransport::into_split_cleartext`].
+#[cfg(feature = "x509")]
+pub type CleartextSplitTransport<S> = (
+	CleartextReader<<S as SplittableStream>::ReadHalf>,
+	CleartextWriter<<S as SplittableStream>::WriteHalf>,
 );
 
 #[cfg(feature = "x509")]
@@ -662,6 +769,32 @@ where
 
 		let reader = TransportReader { stream: read_half, recv_key, max_encrypted_envelope };
 		let writer = TransportWriter { stream: write_half, send_key, max_encrypted_envelope };
+		Ok((reader, writer))
+	}
+
+	/// Split a never-handshaken transport into exclusive cleartext halves.
+	///
+	/// The halves carry envelopes with NO confidentiality, integrity, replay,
+	/// or deletion protection. See [`CleartextReader`].
+	///
+	/// # Errors
+	/// - `InvalidState`: handshake started or completed.
+	/// - `MissingEncryption`: encryption material is configured.
+	pub fn into_split_cleartext(self) -> TransportResult<CleartextSplitTransport<S>> {
+		if self.to_handshake_state() != TcpHandshakeState::None {
+			return Err(TransportError::InvalidState);
+		}
+
+		let encryption_configured = self.server_identity.is_some() || self.key_manager.is_some();
+		if encryption_configured {
+			return Err(TransportError::MissingEncryption);
+		}
+
+		let max_cleartext_envelope = self.max_cleartext_envelope;
+		let (read_half, write_half) = self.stream.into_split();
+
+		let reader = CleartextReader { stream: read_half, max_cleartext_envelope };
+		let writer = CleartextWriter { stream: write_half, max_cleartext_envelope };
 		Ok((reader, writer))
 	}
 }

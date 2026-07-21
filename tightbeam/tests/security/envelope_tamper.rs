@@ -45,7 +45,9 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::{
 	AsyncReadStream, AsyncWriteStream, SplittableStream, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader,
 };
-use tightbeam::transport::{TransportEnvelope, TransportError, TransportFailure, TransportWriter};
+use tightbeam::transport::{
+	EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure, TransportWriter,
+};
 use tightbeam::TightBeamError;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -136,8 +138,8 @@ async fn spawn_tamper_relay(upstream: SocketAddr, rule: TamperRule) -> Result<So
 		let (client_read, client_write) = TokioStream::from(inbound).into_split();
 		let (server_read, server_write) = TokioStream::from(outbound).into_split();
 		tokio::join!(
-			pump_tampered_frames(client_read, server_write, rule),
-			pump_verbatim_frames(server_read, client_write),
+			forward_tampered_frames(client_read, server_write, rule),
+			forward_unchanged_frames(server_read, client_write),
 		);
 	});
 	Ok(relay_addr)
@@ -151,7 +153,7 @@ fn tamper_repeats(rule: TamperRule, index: usize) -> usize {
 	}
 }
 
-async fn pump_tampered_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf, rule: TamperRule) {
+async fn forward_tampered_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf, rule: TamperRule) {
 	let mut index = 0usize;
 	while let Ok(frame) = reader.read_frame(None).await {
 		index += 1;
@@ -163,7 +165,7 @@ async fn pump_tampered_frames(mut reader: TokioReadHalf, mut writer: TokioWriteH
 	}
 }
 
-async fn pump_verbatim_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf) {
+async fn forward_unchanged_frames(mut reader: TokioReadHalf, mut writer: TokioWriteHalf) {
 	while let Ok(frame) = reader.read_frame(None).await {
 		if writer.write_frame(&frame).await.is_err() {
 			return;

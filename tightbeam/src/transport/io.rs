@@ -152,6 +152,11 @@ pub(crate) fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets:
 /// transport halves.
 pub(crate) fn decode_transport_envelope(buffer: &[u8]) -> TransportResult<TransportEnvelope> {
 	let envelope = TransportEnvelope::from_der(buffer)?;
+	ensure_compatible_versions(envelope)
+}
+
+/// Reject an inbound envelope whose frames fail version validation.
+pub(crate) fn ensure_compatible_versions(envelope: TransportEnvelope) -> TransportResult<TransportEnvelope> {
 	if !envelope_versions_compatible(&envelope) {
 		return Err(TransportError::InvalidMessage);
 	}

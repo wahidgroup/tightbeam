@@ -15,6 +15,8 @@
 //! - Peer GoAway fails pending above `last_stream_id` and rejects new streams
 //! - Non-mux envelope on a mux peer: GoAway(ProtocolError) and pending fail
 //! - Connection drop mid-emit: `ConnectionClosed`
+//! - Cleartext mux (no handshake, symmetric settings): interleaved echo and
+//!   cancel-budget GoAway parallel the encrypted scenarios
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -32,6 +34,7 @@ mod negotiated {
 	use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 	use std::sync::Arc;
 
+	use tightbeam::crypto::profiles::DefaultCryptoProvider;
 	use tightbeam::exactly;
 	use tightbeam::policy::TransitStatus;
 	use tightbeam::tb_assert_spec;
@@ -42,16 +45,17 @@ mod negotiated {
 	use tightbeam::transport::envelopes::{
 		CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxedRequestPackage, MuxedResponsePackage,
 	};
-	use tightbeam::transport::handshake::negotiation::TransportOffer;
+	use tightbeam::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 	use tightbeam::transport::multiplex::{MuxHandle, MuxResponder, MuxRole, MuxTransport};
 	use tightbeam::transport::tcp::r#async::{
-		TcpTransport, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader, TransportWriter,
+		TcpTransport, TokioListener, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader, TransportWriter,
 	};
 	use tightbeam::transport::{
-		EncryptedMessageIO, MessageCollector, ResponseHandler, ResponsePackage, TransportEnvelope, TransportError,
-		TransportFailure,
+		EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageCollector, ResponseHandler, ResponsePackage,
+		TransportEnvelope, TransportError, TransportFailure,
 	};
 	use tightbeam::{Frame, TightBeamError};
+	use tokio::net::TcpStream;
 	use tokio::sync::Notify;
 	use tokio::task::JoinHandle;
 
@@ -83,7 +87,9 @@ mod negotiated {
 				("mux_server_initiated_roundtrip", exactly!(1), equals!(true)),
 				("mux_peer_goaway_fails_pending_above", exactly!(1), equals!(true)),
 				("mux_protocol_violation_goaway_and_pending_fail", exactly!(1), equals!(true)),
-				("mux_connection_drop_mid_emit", exactly!(1), equals!(true))
+				("mux_connection_drop_mid_emit", exactly!(1), equals!(true)),
+				("mux_cleartext_interleaved_echo", exactly!(1), equals!(true)),
+				("mux_cleartext_cancel_budget", exactly!(1), equals!(true))
 
 			]
 		}
@@ -108,6 +114,8 @@ mod negotiated {
 				mux_peer_goaway_fails_pending_above(&trace).await?;
 				mux_protocol_violation_goaway_and_pending_fail(&trace).await?;
 				mux_connection_drop_mid_emit(&trace).await?;
+				mux_cleartext_interleaved_echo(&trace).await?;
+				mux_cleartext_cancel_budget(&trace).await?;
 				Ok(())
 			}
 		}
@@ -164,7 +172,7 @@ mod negotiated {
 		establish_transports(Some(offer), Some(offer)).await
 	}
 
-	/// Split a handshaken transport and spawn its mux driver pumps.
+	/// Split a handshaken transport and spawn its mux drivers.
 	struct MuxEndpoint {
 		handle: MuxHandle,
 		_reader_task: ServeTask,
@@ -186,6 +194,28 @@ mod negotiated {
 		cancel_budget: Option<u32>,
 	}
 
+	/// Apply the optional cancel budget and spawn both drivers.
+	///
+	/// Shared tail of the encrypted and cleartext endpoint constructors.
+	fn spawn_mux_tasks<R, W>(mut mux: MuxTransport<R, W>, cancel_budget: Option<u32>) -> (MuxEndpoint, MuxResponder)
+	where
+		R: EnvelopeSource + Send + 'static,
+		W: EnvelopeSink + Send + 'static,
+	{
+		if let Some(budget) = cancel_budget {
+			mux = mux.with_cancel_budget(budget);
+		}
+
+		let (handle, reader_driver, writer_driver, responder) = mux.into_parts();
+		let endpoint = MuxEndpoint {
+			handle,
+			_reader_task: tokio::spawn(reader_driver.drive()),
+			_writer_task: tokio::spawn(writer_driver.drive()),
+		};
+
+		(endpoint, responder)
+	}
+
 	fn spawn_mux_endpoint_with(
 		transport: TcpTransport<TokioStream>,
 		role: MuxRole,
@@ -200,19 +230,9 @@ mod negotiated {
 			writer = writer.with_rekey_limit(limit);
 		}
 
-		let mut mux = MuxTransport::new(reader, writer, role, settings);
-		if let Some(budget) = config.cancel_budget {
-			mux = mux.with_cancel_budget(budget);
-		}
-
-		let (handle, reader_driver, writer_driver, responder) = mux.into_parts();
-		let endpoint = MuxEndpoint {
-			handle,
-			_reader_task: tokio::spawn(reader_driver.drive()),
-			_writer_task: tokio::spawn(writer_driver.drive()),
-		};
-
-		Ok((endpoint, responder))
+		let mux = MuxTransport::new(reader, writer, role, settings);
+		let endpoint_pair = spawn_mux_tasks(mux, config.cancel_budget);
+		Ok(endpoint_pair)
 	}
 
 	fn spawn_mux_endpoint(
@@ -220,6 +240,40 @@ mod negotiated {
 		role: MuxRole,
 	) -> Result<(MuxEndpoint, MuxResponder), TightBeamError> {
 		spawn_mux_endpoint_with(transport, role, MuxEndpointConfig::default())
+	}
+
+	/// Split a never-handshaken transport into cleartext halves and spawn
+	/// its mux drivers with caller-supplied symmetric settings.
+	fn spawn_cleartext_mux_endpoint(
+		transport: TcpTransport<TokioStream>,
+		role: MuxRole,
+		settings: MuxSettings,
+		cancel_budget: Option<u32>,
+	) -> Result<(MuxEndpoint, MuxResponder), TightBeamError> {
+		let (reader, writer) = transport.into_split_cleartext()?;
+		let mux = MuxTransport::new(reader, writer, role, settings);
+		let endpoint_pair = spawn_mux_tasks(mux, cancel_budget);
+		Ok(endpoint_pair)
+	}
+
+	/// Raw TCP pair with no handshake and no encryption material.
+	async fn establish_cleartext_transports(
+	) -> Result<(TcpTransport<TokioStream>, TcpTransport<TokioStream>), TightBeamError> {
+		let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0")
+			.await
+			.map_err(TransportError::from)?;
+		let addr = listener.local_addr().map_err(TransportError::from)?;
+
+		let accept_task = tokio::spawn(async move {
+			let (transport, _) = listener.accept().await.map_err(TransportError::from)?;
+			Ok::<_, TightBeamError>(transport)
+		});
+
+		let stream = TcpStream::connect(addr).await.map_err(TransportError::from)?;
+		let client = TcpTransport::from(TokioStream::from(stream));
+
+		let server = await_ok(accept_task, "cleartext accept task must not panic").await?;
+		Ok((client, server))
 	}
 
 	/// Handshake with matching mux caps and spawn both endpoints.
@@ -358,7 +412,7 @@ mod negotiated {
 		);
 	}
 
-	async fn read_muxed_request(reader: &mut SplitReader) -> Result<(u32, Arc<Frame>), TightBeamError> {
+	async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u32, Arc<Frame>), TightBeamError> {
 		let envelope = reader.read_envelope().await?;
 		match envelope {
 			TransportEnvelope::MuxedRequest(package) => Ok((package.stream_id(), Arc::clone(package.message()))),
@@ -379,7 +433,11 @@ mod negotiated {
 		Ok(frame)
 	}
 
-	async fn write_muxed_request(writer: &mut SplitWriter, stream_id: u32, frame: Frame) -> Result<(), TightBeamError> {
+	async fn write_muxed_request<W: EnvelopeSink>(
+		writer: &mut W,
+		stream_id: u32,
+		frame: Frame,
+	) -> Result<(), TightBeamError> {
 		let request = MuxedRequestPackage::new(stream_id, frame);
 		writer.write_envelope(request.into()).await?;
 		Ok(())
@@ -406,7 +464,11 @@ mod negotiated {
 	}
 
 	/// Write a muxed request then its cancel (Rapid Reset open/cancel pair).
-	async fn write_open_cancel(writer: &mut SplitWriter, stream_id: u32, frame: Frame) -> Result<(), TightBeamError> {
+	async fn write_open_cancel<W: EnvelopeSink>(
+		writer: &mut W,
+		stream_id: u32,
+		frame: Frame,
+	) -> Result<(), TightBeamError> {
 		write_muxed_request(writer, stream_id, frame).await?;
 		let cancel = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
 		writer.write_envelope(cancel.into()).await?;
@@ -698,33 +760,51 @@ mod negotiated {
 		Ok(())
 	}
 
+	/// Exhaust a server's cancel budget from raw client halves: budget + 1
+	/// open/cancel pairs must yield GoAway(EnhanceYourCalm) and
+	/// PolicyRejection from the responder. Shared by the encrypted and
+	/// cleartext cancel-abuse scenarios.
+	async fn run_cancel_abuse<R, W>(
+		mut client_reader: R,
+		mut client_writer: W,
+		responder: MuxResponder,
+		cancel_budget: u32,
+	) -> Result<bool, TightBeamError>
+	where
+		R: EnvelopeSource,
+		W: EnvelopeSink,
+	{
+		// Handlers park forever so every cancel aborts a live handler.
+		let (_started, _never_released, serve_task) = spawn_gated_echo(responder);
+
+		let stream_ids: Vec<u32> = (0..=cancel_budget).map(client_stream_id).collect();
+		let abuse_stream_id = client_stream_id(cancel_budget);
+		let frame = mux_frame("mux-abuse");
+		for stream_id in stream_ids {
+			write_open_cancel(&mut client_writer, stream_id, frame.clone()).await?;
+		}
+
+		let goaway = client_reader.read_envelope().await?;
+		let goaway_ok = is_goaway(&goaway, GoAwayReason::EnhanceYourCalm, Some(abuse_stream_id));
+
+		let refused = join_task(serve_task, "responder task must not panic").await?;
+		let refused_ok = is_policy_rejection(&refused);
+
+		Ok(goaway_ok && refused_ok)
+	}
+
 	/// Budget N: N aborting cancels OK. N+1 yields GoAway(EnhanceYourCalm) and PolicyRejection.
 	async fn mux_cancel_budget_boundary(trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let cancel_budget = 2;
-		let mut link = establish_server_mux_client_raw(
+		let link = establish_server_mux_client_raw(
 			8,
 			8,
 			MuxEndpointConfig { rekey_limit: None, cancel_budget: Some(cancel_budget) },
 		)
 		.await?;
 
-		// Handlers park forever so every cancel aborts a live handler.
-		let (_started, _never_released, serve_task) = spawn_gated_echo(link.responder);
-
-		let stream_ids = [client_stream_id(0), client_stream_id(1), client_stream_id(2)];
-		let abuse_stream_id = stream_ids[cancel_budget as usize];
-		let frame = mux_frame("mux-abuse");
-		for stream_id in stream_ids {
-			write_open_cancel(&mut link.client_writer, stream_id, frame.clone()).await?;
-		}
-
-		let goaway = link.client_reader.read_envelope().await?;
-		let goaway_ok = is_goaway(&goaway, GoAwayReason::EnhanceYourCalm, Some(abuse_stream_id));
-
-		let refused = join_task(serve_task, "responder task must not panic").await?;
-		let refused_ok = is_policy_rejection(&refused);
-
-		trace.event_with("mux_cancel_budget_boundary", &[], goaway_ok && refused_ok)?;
+		let ok = run_cancel_abuse(link.client_reader, link.client_writer, link.responder, cancel_budget).await?;
+		trace.event_with("mux_cancel_budget_boundary", &[], ok)?;
 		Ok(())
 	}
 
@@ -817,6 +897,45 @@ mod negotiated {
 
 		let failed = join_task(emit_task, "emit task must not panic").await?;
 		trace.event_with("mux_connection_drop_mid_emit", &[], is_connection_closed(&failed))?;
+		Ok(())
+	}
+
+	/// Cleartext mux over raw TCP: no handshake, symmetric out-of-band
+	/// settings, two interleaved streams answered out of order.
+	async fn mux_cleartext_interleaved_echo(trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let (client, server) = establish_cleartext_transports().await?;
+		let settings = MuxSettings::symmetric(4);
+		let (client_end, _client_responder) = spawn_cleartext_mux_endpoint(client, MuxRole::Client, settings, None)?;
+		let (_server_end, server_responder) = spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, None)?;
+
+		let frame_first = mux_frame("clear-first");
+		let frame_second = mux_frame("clear-second");
+		let gate = Arc::new(Notify::new());
+		let handler = order_forcing_echo(frame_first.clone(), gate);
+		let _server_serve = tokio::spawn(server_responder.serve(handler));
+
+		let (first, second) = tokio::join!(
+			client_end.handle.emit_on_stream(frame_first.clone()),
+			client_end.handle.emit_on_stream(frame_second.clone()),
+		);
+
+		let ok = is_echo(first?, &frame_first) && is_echo(second?, &frame_second);
+		trace.event_with("mux_cleartext_interleaved_echo", &[], ok)?;
+		Ok(())
+	}
+
+	/// Cancel-budget hardening holds on cleartext links too: budget + 1
+	/// open/cancel pairs answered with GoAway(EnhanceYourCalm).
+	async fn mux_cleartext_cancel_budget(trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let (client, server) = establish_cleartext_transports().await?;
+		let cancel_budget = 2;
+		let settings = MuxSettings::symmetric(8);
+		let (_server_end, responder) =
+			spawn_cleartext_mux_endpoint(server, MuxRole::Server, settings, Some(cancel_budget))?;
+		let (client_reader, client_writer) = client.into_split_cleartext()?;
+
+		let ok = run_cancel_abuse(client_reader, client_writer, responder, cancel_budget).await?;
+		trace.event_with("mux_cleartext_cancel_budget", &[], ok)?;
 		Ok(())
 	}
 }

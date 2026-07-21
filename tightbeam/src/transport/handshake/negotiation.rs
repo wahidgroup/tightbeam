@@ -114,6 +114,15 @@ pub struct MuxSettings {
 	pub peer_initiated_cap: u32,
 }
 
+impl MuxSettings {
+	/// Equal caps in both directions, for links without handshake
+	/// negotiation (cleartext multiplexing). Both endpoints MUST configure
+	/// the same value or their concurrency enforcement diverges.
+	pub fn symmetric(cap: u32) -> Self {
+		Self { local_initiated_cap: cap, peer_initiated_cap: cap }
+	}
+}
+
 /// Server-side accept rule: multiplexing activates only when the peer
 /// offered it AND it is locally enabled. No offer or no local config means
 /// no accept, which keeps the connection lock-step.

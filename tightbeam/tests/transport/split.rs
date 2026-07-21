@@ -26,7 +26,9 @@ use tightbeam::testing::config::ScenarioConf;
 use tightbeam::testing::create_v0_tightbeam;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
-use tightbeam::transport::{ResponsePackage, TransportEnvelope, TransportError, TransportFailure};
+use tightbeam::transport::{
+	EnvelopeSink, EnvelopeSource, ResponsePackage, TransportEnvelope, TransportError, TransportFailure,
+};
 use tightbeam::{Frame, TightBeamError};
 use tokio::net::TcpStream;
 
