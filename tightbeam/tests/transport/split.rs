@@ -164,10 +164,7 @@ async fn split_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(), Ti
 	// bytes leave the writer.
 	let second_request = request_envelope();
 	let limited = writer.write_envelope(second_request).await;
-	let rekey_required = matches!(
-		limited,
-		Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired))
-	);
+	let rekey_required = matches!(limited, Err(TransportError::MessageNotSent(_, TransportFailure::RekeyRequired)));
 
 	await_ok(server_handle, "server task must not panic").await?;
 
