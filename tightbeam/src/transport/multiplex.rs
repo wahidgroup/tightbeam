@@ -172,6 +172,26 @@ mod router {
 		usize::try_from(cap).unwrap_or(usize::MAX)
 	}
 
+	/// Records the writer must reserve so a graceful rekey drain can finish
+	/// after the GoAway fires (RFC 8446 § 5.5 analog).
+	///
+	/// At the moment the limit check trips, the connection can still owe:
+	/// - envelopes already queued outbound, at most the channel capacity of
+	///   `local_cap + peer_cap`
+	/// - responses to in-flight peer streams, at most `peer_cap`
+	/// - drop-guard cancels for pending local streams, at most `local_cap`
+	/// - the GoAway itself, exactly 1
+	///
+	/// Total: `2 * (local_cap + peer_cap) + 1`. A hostile peer that keeps
+	/// opening streams after the GoAway draws refusal cancels beyond any
+	/// bound and only exhausts the cipher of its own dying connection.
+	fn drain_headroom(settings: &MuxSettings) -> u64 {
+		u64::from(settings.local_initiated_cap)
+			.saturating_add(u64::from(settings.peer_initiated_cap))
+			.saturating_mul(2)
+			.saturating_add(1)
+	}
+
 	/// Outcome delivered to a pending stream's oneshot slot.
 	enum StreamOutcome {
 		/// Correlated response arrived
@@ -508,8 +528,8 @@ mod router {
 		writer: W,
 		commands: mpsc::Receiver<Outbound>,
 		shared: Arc<MuxShared>,
-		/// Records reserved for draining (peer-owed responses plus the
-		/// GoAway itself) before the send cipher halts.
+		/// Records reserved for draining before the send cipher halts.
+		/// See [`drain_headroom`] for the bound derivation.
 		drain_headroom: u64,
 	}
 
@@ -832,9 +852,7 @@ mod router {
 				}),
 			});
 
-			// The drain reserves one record per in-flight peer stream (their
-			// responses) plus one for the GoAway itself.
-			let drain_headroom = u64::from(settings.peer_initiated_cap).saturating_add(1);
+			let drain_headroom = drain_headroom(&settings);
 
 			Self {
 				handle: MuxHandle { shared: Arc::clone(&shared), outbound: outbound_sender.clone() },
@@ -990,6 +1008,12 @@ mod router {
 
 			assert!(matches!(receiver_low.try_recv(), Ok(None)));
 			assert!(matches!(receiver_high.try_recv(), Ok(Some(StreamOutcome::Draining))));
+		}
+
+		#[test]
+		fn test_drain_headroom_covers_queue_responses_cancels_goaway() {
+			let settings = MuxSettings { local_initiated_cap: 3, peer_initiated_cap: 5 };
+			assert_eq!(drain_headroom(&settings), 17);
 		}
 
 		#[test]

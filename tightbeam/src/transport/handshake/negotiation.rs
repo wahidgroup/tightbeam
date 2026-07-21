@@ -6,6 +6,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+use crate::constants::MAX_MUX_STREAM_CAP;
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::der::asn1::ObjectIdentifier;
 use crate::der::Error as DerDecodeError;
@@ -110,17 +111,26 @@ pub struct TransportAccept {
 pub struct MuxSettings {
 	/// Concurrent streams this endpoint may initiate (peer-advertised).
 	pub local_initiated_cap: u32,
-	/// Concurrent streams the peer may initiate (locally advertised, locally enforced).
+	/// Concurrent streams the peer may initiate.
 	pub peer_initiated_cap: u32,
 }
 
 impl MuxSettings {
 	/// Equal caps in both directions, for links without handshake
 	/// negotiation (cleartext multiplexing). Both endpoints MUST configure
-	/// the same value or their concurrency enforcement diverges.
+	/// the same value or their concurrency enforcement diverges. The cap is
+	/// clamped to [`MAX_MUX_STREAM_CAP`].
 	pub fn symmetric(cap: u32) -> Self {
+		let cap = clamp_stream_cap(cap);
 		Self { local_initiated_cap: cap, peer_initiated_cap: cap }
 	}
+}
+
+/// Clamp a wire-advertised concurrent-stream cap to
+/// [`MAX_MUX_STREAM_CAP`] (CWE-770). Applied identically by both endpoints
+/// to the same wire value, so directional views stay lock-step.
+fn clamp_stream_cap(cap: u32) -> u32 {
+	cap.min(MAX_MUX_STREAM_CAP)
 }
 
 /// Server-side accept rule: multiplexing activates only when the peer
@@ -137,7 +147,8 @@ pub fn accept_transport(offer: Option<&TransportOffer>, local: Option<&Transport
 }
 
 /// Client-side settings rule: validates the server's accept against the
-/// local offer and derives the directional caps.
+/// local offer and derives the directional caps, each clamped to
+/// [`MAX_MUX_STREAM_CAP`].
 ///
 /// An accept without a matching offer is a protocol violation (a peer must
 /// never activate an unrequested capability) and fails closed.
@@ -155,19 +166,20 @@ pub fn client_mux_settings(
 
 	match offer {
 		Some(offer) if offer.mux => Ok(Some(MuxSettings {
-			local_initiated_cap: accept.max_peer_initiated_streams,
-			peer_initiated_cap: offer.max_peer_initiated_streams,
+			local_initiated_cap: clamp_stream_cap(accept.max_peer_initiated_streams),
+			peer_initiated_cap: clamp_stream_cap(offer.max_peer_initiated_streams),
 		})),
 		_ => Err(NegotiationError::UnsolicitedTransportAccept),
 	}
 }
 
-/// Server-side settings rule: derives the directional caps from the client's
-/// offer and the accept the server just emitted.
+/// Server-side settings rule: derives the directional caps from the
+/// client's offer and the accept the server just emitted, each clamped
+/// to [`MAX_MUX_STREAM_CAP`].
 pub fn server_mux_settings(offer: &TransportOffer, accept: &TransportAccept) -> MuxSettings {
 	MuxSettings {
-		local_initiated_cap: offer.max_peer_initiated_streams,
-		peer_initiated_cap: accept.max_peer_initiated_streams,
+		local_initiated_cap: clamp_stream_cap(offer.max_peer_initiated_streams),
+		peer_initiated_cap: clamp_stream_cap(accept.max_peer_initiated_streams),
 	}
 }
 
@@ -443,6 +455,30 @@ mod tests {
 		assert_eq!(server.peer_initiated_cap, 4);
 
 		Ok(())
+	}
+
+	#[test]
+	fn test_mux_settings_clamp_peer_advertised_caps() -> Result<(), NegotiationError> {
+		let offer = TransportOffer::mux(u32::MAX);
+		let accept = TransportAccept { mux: true, max_peer_initiated_streams: u32::MAX };
+
+		let client =
+			client_mux_settings(Some(&offer), Some(&accept))?.ok_or(NegotiationError::UnsolicitedTransportAccept)?;
+		assert_eq!(client.local_initiated_cap, MAX_MUX_STREAM_CAP);
+		assert_eq!(client.peer_initiated_cap, MAX_MUX_STREAM_CAP);
+
+		let server = server_mux_settings(&offer, &accept);
+		assert_eq!(server.local_initiated_cap, MAX_MUX_STREAM_CAP);
+		assert_eq!(server.peer_initiated_cap, MAX_MUX_STREAM_CAP);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_symmetric_settings_clamp_cap() {
+		let settings = MuxSettings::symmetric(u32::MAX);
+		assert_eq!(settings.local_initiated_cap, MAX_MUX_STREAM_CAP);
+		assert_eq!(settings.peer_initiated_cap, MAX_MUX_STREAM_CAP);
 	}
 
 	#[test]

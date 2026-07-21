@@ -9,7 +9,7 @@
 //! - Cancelling an in-flight stream frees its cap slot and aborts the handler
 //! - A response racing a cancel on the connection is discarded cleanly
 //! - GoAway drains in-flight streams and rejects new ones
-//! - Rekey drain headroom table (`peer_cap + 1` vs record limit)
+//! - Rekey drain headroom table (`2 * (local_cap + peer_cap) + 1` vs record limit)
 //! - Cancel-budget boundary: N cancels OK, N+1 yields GoAway(EnhanceYourCalm)
 //! - Server-initiated stream roundtrip (client `serve`, server `emit_on_stream`)
 //! - Peer GoAway fails pending above `last_stream_id` and rejects new streams
@@ -545,15 +545,20 @@ mod negotiated {
 		}
 	}
 
-	/// One rekey headroom case: `drain_headroom = peer_cap + 1`.
+	/// One rekey headroom case:
+	/// `drain_headroom = 2 * (local_cap + peer_cap) + 1`.
 	struct RekeyCase {
+		server_local_cap: u32,
 		server_peer_cap: u32,
 		rekey_limit: u64,
 	}
 
 	impl RekeyCase {
 		fn headroom(&self) -> u64 {
-			u64::from(self.server_peer_cap).saturating_add(1)
+			u64::from(self.server_local_cap)
+				.saturating_add(u64::from(self.server_peer_cap))
+				.saturating_mul(2)
+				.saturating_add(1)
 		}
 
 		fn responses_before_goaway(&self) -> u32 {
@@ -718,7 +723,7 @@ mod negotiated {
 	async fn run_rekey_case(case: RekeyCase) -> Result<bool, TightBeamError> {
 		let responses_before_goaway = case.responses_before_goaway();
 		let mut link = establish_server_mux_client_raw(
-			4,
+			case.server_local_cap,
 			case.server_peer_cap,
 			MuxEndpointConfig { rekey_limit: Some(case.rekey_limit), cancel_budget: None },
 		)
@@ -744,14 +749,15 @@ mod negotiated {
 		Ok(responses_ok && goaway_ok && draining_ok)
 	}
 
-	/// Table of rekey drain headroom points: peer_cap + 1 vs record limit.
+	/// Table of rekey drain headroom points:
+	/// `2 * (local_cap + peer_cap) + 1` vs record limit.
 	async fn mux_rekey_headroom_table(trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let mut ok = true;
 		for case in [
-			RekeyCase { server_peer_cap: 1, rekey_limit: 3 },
-			RekeyCase { server_peer_cap: 1, rekey_limit: 4 },
-			RekeyCase { server_peer_cap: 2, rekey_limit: 4 },
-			RekeyCase { server_peer_cap: 2, rekey_limit: 5 },
+			RekeyCase { server_local_cap: 2, server_peer_cap: 1, rekey_limit: 8 },
+			RekeyCase { server_local_cap: 2, server_peer_cap: 1, rekey_limit: 9 },
+			RekeyCase { server_local_cap: 4, server_peer_cap: 2, rekey_limit: 14 },
+			RekeyCase { server_local_cap: 4, server_peer_cap: 2, rekey_limit: 15 },
 		] {
 			ok &= run_rekey_case(case).await?;
 		}

@@ -83,7 +83,9 @@ pub const AES_GCM_TAG_SIZE: usize = 16;
 /// with `RekeyRequired` just under the bound and the session must be
 /// reestablished (fresh handshake derives fresh directional keys).
 /// Multiplexed writers drain gracefully first via GoAway as the limit
-/// nears. Override per cipher via `SendCipher::with_rekey_limit`.
+/// nears, and [`crate::crypto::aead::RecvCipher`] refuses counters at or
+/// past the limit (an honest peer never emits them). Override per cipher
+/// via `SendCipher::with_rekey_limit` / `RecvCipher::with_rekey_limit`.
 pub const DEFAULT_REKEY_RECORD_LIMIT: u64 = 1 << 24;
 
 // ============================================================================
@@ -187,6 +189,17 @@ pub const DEFAULT_COMMAND_FRESHNESS_WINDOW_MS: u64 = 30_000;
 /// with a GoAway. Only authenticated peers reach this path, so the budget
 /// is generous. Tighten per connection via `MuxTransport::with_cancel_budget`.
 pub const DEFAULT_MUX_CANCEL_BUDGET: u32 = 1024;
+
+/// Ceiling on negotiated per-direction concurrent-stream caps
+///
+/// Handshake transport offers/accepts carry peer-chosen
+/// `max_peer_initiated_streams` values. Deriving [`MuxSettings`] clamps
+/// both directions to this ceiling so an absurd advertisement cannot
+/// inflate bookkeeping bounds far beyond useful concurrency (CWE-770). Both
+/// endpoints apply the same clamp to the same wire values.
+///
+/// [`MuxSettings`]: crate::transport::handshake::negotiation::MuxSettings
+pub const MAX_MUX_STREAM_CAP: u32 = 1024;
 
 /// Default ceiling for decompressed message bodies (16 MiB)
 ///

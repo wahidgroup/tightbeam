@@ -77,14 +77,15 @@ where
 
 /// Runtime-polymorphic AEAD cipher wrapper.
 ///
-/// This allows the handshake orchestrator (which knows `P::AeadCipher` at compile time)
-/// to construct the appropriate cipher, then pass it to the transport layer which stores
-/// it as a type-erased `RuntimeAead`. The OID is stored alongside the cipher so encryption
-/// produces correct `EncryptedContentInfo` structures.
+/// This allows the handshake orchestrator (which knows `P::AeadCipher` at
+/// compile time) to construct the appropriate cipher, then pass it to the
+/// transport layer which stores it as a type-erased `RuntimeAead`. The OID
+/// is stored alongside the cipher so encryption produces correct
+/// `EncryptedContentInfo` structures.
 ///
-/// The handshake negotiates the security profile and constructs the correct concrete
-/// cipher type (e.g., `Aes256Gcm`, `Aes128Gcm`), then wraps it in `RuntimeAead` for
-/// storage in the transport layer.
+/// The handshake negotiates the security profile and constructs the correct
+/// concrete cipher type (e.g., `Aes256Gcm`, `Aes128Gcm`), then wraps it in
+/// `RuntimeAead` for storage in the transport layer.
 ///
 /// # Example
 /// ```ignore
@@ -128,8 +129,9 @@ impl RuntimeAead {
 
 /// Build an EncryptedContentInfo structure from components.
 ///
-/// This helper encapsulates the common logic for constructing EncryptedContentInfo
-/// from a ciphertext, nonce, content type, and algorithm OID.
+/// This helper encapsulates the common logic for constructing
+/// EncryptedContentInfo from a ciphertext, nonce, content type, and
+/// algorithm OID.
 #[inline]
 fn build_encrypted_content_info(
 	ciphertext: Vec<u8>,
@@ -409,16 +411,36 @@ impl SendCipher {
 /// the receiver-side sequence discipline of RFC 8446 § 5.3: an active
 /// attacker excising an envelope from the stream desynchronizes the counter
 /// and is detected on the very next message (CWE-345).
+///
+/// The receive direction enforces the same record limit as the send
+/// direction: an honest peer halts its [`SendCipher`] at
+/// [`DEFAULT_REKEY_RECORD_LIMIT`](crate::constants::DEFAULT_REKEY_RECORD_LIMIT),
+/// so a counter at or past the limit means the peer ignored the AES-GCM
+/// volume bound (RFC 8446 § 5.5) and decryption fails closed with
+/// [`TightBeamError::RekeyRequired`].
 pub struct RecvCipher {
 	aead: RuntimeAead,
 	/// Exact counter value the next message must carry.
 	expected_counter: AtomicU64,
+	rekey_limit: u64,
 }
 
 impl RecvCipher {
 	/// Expected counter starts at zero.
 	pub fn new(aead: RuntimeAead) -> Self {
-		Self { aead, expected_counter: AtomicU64::new(0) }
+		Self {
+			aead,
+			expected_counter: AtomicU64::new(0),
+			rekey_limit: DEFAULT_REKEY_RECORD_LIMIT,
+		}
+	}
+
+	/// Override the record limit at which decryption demands a rekey.
+	/// MUST be at least the peer's send limit or legitimate records near
+	/// the limit are refused.
+	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
+		self.rekey_limit = limit;
+		self
 	}
 
 	pub fn algorithm_oid(&self) -> ObjectIdentifier {
@@ -430,6 +452,12 @@ impl Decryptor for RecvCipher {
 	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>> {
 		let (nonce_bytes, _) = extract_nonce_and_ciphertext(info, self.aead.nonce_size())?;
 		let counter = parse_counter_nonce(nonce_bytes)?;
+
+		// Fail closed once the peer exceeds the per-key volume bound: an
+		// honest sender halts its own cipher before this counter exists.
+		if counter >= self.rekey_limit {
+			return Err(TightBeamError::RekeyRequired);
+		}
 
 		// Cheap pre-check so forged counters never reach the AEAD. The
 		// authoritative check is the compare-exchange after authentication.
@@ -688,6 +716,20 @@ mod tests {
 
 		let still_limited = sender.encrypt_next(PLAINTEXT, None);
 		assert!(matches!(still_limited, Err(TightBeamError::RekeyRequired)));
+		Ok(())
+	}
+
+	#[test]
+	fn recv_cipher_fails_closed_at_rekey_limit() -> TbResult<()> {
+		let sender = SendCipher::new(test_runtime());
+		let first = sender.encrypt_next(PLAINTEXT, None)?;
+		let second = sender.encrypt_next(PLAINTEXT, None)?;
+
+		let receiver = RecvCipher::new(test_runtime()).with_rekey_limit(1);
+		receiver.decrypt_content(&first)?;
+
+		let over_limit = receiver.decrypt_content(&second);
+		assert!(matches!(over_limit, Err(TightBeamError::RekeyRequired)));
 		Ok(())
 	}
 
