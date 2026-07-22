@@ -470,17 +470,48 @@ where
 	}
 
 	fn prune_idle_locked(&self, dest_pool: &mut DestinationPool<P>, now: Instant) {
-		if let Some(timeout) = self.config.idle_timeout {
-			while let Some(entry) = dest_pool.available.front() {
-				if now.duration_since(entry.last_used) >= timeout {
-					dest_pool.available.pop_front();
-					// Pruned idle connection is closed, so it leaves the live set.
-					self.release_connection_count();
-				} else {
-					break;
-				}
+		let Some(timeout) = self.config.idle_timeout else {
+			return;
+		};
+
+		while let Some(entry) = dest_pool.available.front() {
+			if now.duration_since(entry.last_used) >= timeout {
+				dest_pool.available.pop_front();
+				// Pruned idle connection is closed, so it leaves the live set.
+				self.release_connection_count();
+			} else {
+				break;
 			}
 		}
+
+		// Shared mux entries idle out on the mux plane's own activity
+		// measure: emits bypass the pool lock, so a pool-side timestamp
+		// would prune connections that are actively emitting.
+		#[cfg(all(
+			feature = "x509",
+			feature = "tokio",
+			feature = "transport-policy",
+			feature = "transport-multiplex",
+			any(feature = "transport-cms", feature = "transport-ecies")
+		))]
+		dest_pool.mux.retain(|entry| {
+			let expired = entry.handle.idle_for(now) >= timeout;
+			if expired {
+				// GoAway before close (RFC 9113 § 6.8): the reader task
+				// ends on the resulting EOF. A stream racing this drain
+				// observes `Draining`, which the lease lifecycle already
+				// maps to eviction.
+				let handle = entry.handle.clone();
+				rt::spawn(async move {
+					let _ = handle.shutdown().await;
+				});
+
+				// Pruned idle connection leaves the live set.
+				self.release_connection_count();
+			}
+
+			!expired
+		});
 	}
 
 	#[cfg(not(feature = "x509"))]
@@ -677,6 +708,8 @@ pooled_mux! {
 				Some(dest_pool) => dest_pool,
 				None => return Ok(None),
 			};
+
+			self.prune_idle_locked(dest_pool, Instant::now());
 
 			dest_pool.mux.retain(|entry| {
 				let alive = !entry.reader_task.is_finished();

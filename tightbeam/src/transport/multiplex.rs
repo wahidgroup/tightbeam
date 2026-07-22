@@ -211,8 +211,10 @@ mod router {
 	use core::future::{poll_fn, Future};
 	use core::pin::Pin;
 	use core::task::{Context, Poll, Waker};
+	use core::time::Duration;
 	use std::collections::{BTreeMap, HashMap};
 	use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+	use std::time::Instant;
 
 	use futures::channel::{mpsc, oneshot};
 	use futures::future::{AbortHandle, Abortable, Aborted};
@@ -300,6 +302,9 @@ mod router {
 		next_ping_opaque: u64,
 		/// Local pings awaiting their ack, keyed by correlation value
 		pending_pings: BTreeMap<u64, oneshot::Sender<()>>,
+		/// When the last stream opened in either direction. Pings do not
+		/// count: keepalive probes must not defeat idle reclamation
+		last_activity: Instant,
 		/// `last_stream_id` advertised in our GoAway, once sent
 		goaway_sent: Option<u32>,
 		/// `last_stream_id` received in the peer's GoAway
@@ -340,6 +345,7 @@ mod router {
 			let stream_id = state.next_stream_id.ok_or(TransportError::Draining)?;
 			state.next_stream_id = stream_id.checked_add(2);
 			state.pending.insert(stream_id, sender);
+			state.last_activity = Instant::now();
 
 			Ok(stream_id)
 		}
@@ -439,6 +445,7 @@ mod router {
 			}
 
 			state.last_peer_stream_id = stream_id;
+			state.last_activity = Instant::now();
 
 			if let Some(last) = state.goaway_sent {
 				if stream_id > last {
@@ -451,6 +458,17 @@ mod router {
 
 		fn last_peer_stream_id(&self) -> u32 {
 			self.lock().last_peer_stream_id
+		}
+
+		/// Time since the last stream opened, or zero while any
+		/// locally-initiated stream is still in flight.
+		fn idle_for(&self, now: Instant) -> Duration {
+			let state = self.lock();
+			if !state.pending.is_empty() {
+				return Duration::ZERO;
+			}
+
+			now.duration_since(state.last_activity)
 		}
 	}
 
@@ -612,15 +630,22 @@ mod router {
 			enqueue_stream_cancel(&self.shared, &self.outbound, stream_id.value());
 		}
 
+		/// Time since the last stream opened in either direction, or zero
+		/// while any locally-initiated stream is still in flight.
+		///
+		/// Pings deliberately do not count as activity: keepalive probes
+		/// must not defeat idle reclamation.
+		pub fn idle_for(&self, now: Instant) -> Duration {
+			self.shared.idle_for(now)
+		}
+
 		/// Connection-level liveness probe
 		/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)
 		/// analog): resolves when the peer's ack arrives.
 		///
 		/// No stream is allocated and the peer's application handler never
 		/// runs, so this doubles as an idle keepalive for links whose
-		/// carrier cannot ping itself. Scheduling composes externally: wrap in
-		/// the caller's timer for dead-peer detection, repeat on the caller's
-		/// interval for keepalive.
+		/// carrier cannot ping itself.
 		///
 		/// # Errors
 		/// - `Draining`: GoAway sent or received. The connection is ending
@@ -628,7 +653,8 @@ mod router {
 		pub async fn ping(&self) -> TransportResult<()> {
 			let (sender, receiver) = oneshot::channel();
 			let opaque = self.shared.allocate_ping(sender)?;
-			let mut guard = ForgetPingOnDrop { shared: Arc::clone(&self.shared), opaque, armed: true };
+			let shared = Arc::clone(&self.shared);
+			let mut guard = ForgetPingOnDrop { shared, opaque, armed: true };
 
 			let probe = MuxPingPackage::new(false, opaque);
 			let mut outbound = self.outbound.clone();
@@ -1101,6 +1127,7 @@ mod router {
 					pending: BTreeMap::new(),
 					next_ping_opaque: 0,
 					pending_pings: BTreeMap::new(),
+					last_activity: Instant::now(),
 					goaway_sent: None,
 					goaway_received: None,
 					drain_wakers: Vec::new(),
@@ -1159,6 +1186,7 @@ mod router {
 					pending: BTreeMap::new(),
 					next_ping_opaque: 0,
 					pending_pings: BTreeMap::new(),
+					last_activity: Instant::now(),
 					goaway_sent: None,
 					goaway_received: None,
 					drain_wakers: Vec::new(),
@@ -1321,6 +1349,44 @@ mod router {
 
 			shared.fail_all_pending();
 			assert!(receiver.try_recv().is_err());
+		}
+
+		#[test]
+		fn test_idle_zero_while_stream_in_flight() {
+			let shared = test_shared(MuxRole::Client, 8);
+			assert!(matches!(shared.allocate(slot()), Ok(1)));
+
+			let later = Instant::now() + Duration::from_secs(60);
+			assert_eq!(shared.idle_for(later), Duration::ZERO);
+		}
+
+		#[test]
+		fn test_idle_grows_after_streams_resolve() {
+			let shared = test_shared(MuxRole::Client, 8);
+			assert!(matches!(shared.allocate(slot()), Ok(1)));
+			assert!(shared.remove_pending(1).is_some());
+
+			let later = Instant::now() + Duration::from_secs(60);
+			assert!(shared.idle_for(later) >= Duration::from_secs(60));
+		}
+
+		#[test]
+		fn test_new_stream_resets_idle_measure() {
+			let shared = test_shared(MuxRole::Client, 8);
+			shared.lock().last_activity = Instant::now() - Duration::from_secs(60);
+
+			assert!(matches!(shared.allocate(slot()), Ok(1)));
+			assert!(shared.remove_pending(1).is_some());
+			assert!(shared.idle_for(Instant::now()) < Duration::from_secs(60));
+		}
+
+		#[test]
+		fn test_peer_stream_resets_idle_measure() {
+			let server = test_shared(MuxRole::Server, 8);
+			server.lock().last_activity = Instant::now() - Duration::from_secs(60);
+
+			assert!(matches!(server.register_peer_stream(1), Ok(PeerStream::Accept)));
+			assert!(server.idle_for(Instant::now()) < Duration::from_secs(60));
 		}
 
 		#[test]

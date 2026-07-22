@@ -9,6 +9,7 @@
 //! - Pool-capacity exhaustion surfaces `Busy` instead of failing over
 //! - A peer that declines multiplexing yields an exclusive lease
 //! - A dead multiplexed connection is evicted and re-established
+//! - An idle multiplexed connection is pruned after the idle timeout
 //! - Single-flight clients round-trip against a mux-offering server
 
 #![cfg(all(
@@ -21,6 +22,7 @@
 	feature = "testing"
 ))]
 
+use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +39,7 @@ use tightbeam::transport::{
 use tightbeam::{Frame, TightBeamError};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 use crate::common::security::{pinning_trust_store, ServerMaterials};
 use crate::transport::support::bind_encrypted_listener;
@@ -101,13 +104,14 @@ async fn start_gated_mux_echo_server(offer: Option<TransportOffer>) -> Result<Ga
 	Ok(GatedMuxServer { server, started, release })
 }
 
-fn mux_pool(
+fn mux_pool_with_idle_timeout(
 	materials: &ServerMaterials,
 	offer: Option<TransportOffer>,
 	max_connections: usize,
+	idle_timeout: Option<Duration>,
 ) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
 	let trust_store = pinning_trust_store(&materials.certificate)?;
-	let config = PoolConfig { idle_timeout: None, max_connections, mux_offer: offer };
+	let config = PoolConfig { idle_timeout, max_connections, mux_offer: offer };
 	let pool = Arc::new(
 		ConnectionPool::<TokioListener>::builder()
 			.with_config(config)
@@ -116,6 +120,14 @@ fn mux_pool(
 	);
 
 	Ok(pool)
+}
+
+fn mux_pool(
+	materials: &ServerMaterials,
+	offer: Option<TransportOffer>,
+	max_connections: usize,
+) -> Result<Arc<ConnectionPool<TokioListener>>, TightBeamError> {
+	mux_pool_with_idle_timeout(materials, offer, max_connections, None)
 }
 
 /// Two leases against a pool capped at ONE connection: emits succeed
@@ -363,6 +375,42 @@ async fn pooled_mux_evicts_dead_connection_and_reconnects() -> Result<(), TightB
 		Some(frame_after),
 		"pool must evict the dead connection and re-establish"
 	);
+	Ok(())
+}
+
+/// An idle multiplexed connection is pruned after `idle_timeout`: the
+/// pruned entry releases its pool slot (a cap-1 redial would otherwise
+/// report `Busy`) and the next connect dials a fresh connection. The
+/// manual server registers three tasks per connection, so a second
+/// accepted connection doubles the registry.
+#[tokio::test]
+async fn pooled_mux_prunes_idle_connection() -> Result<(), TightBeamError> {
+	let server = start_manual_mux_echo_server().await?;
+	let idle_timeout = Duration::from_millis(50);
+	let pool = mux_pool_with_idle_timeout(&server.materials, Some(TransportOffer::mux(4)), 1, Some(idle_timeout))?;
+
+	let mut lease = pool.connect(server.addr).await?;
+	let frame_before = create_v0_tightbeam(Some("mux-idle-before"), None);
+	let reply_before = lease.emit(frame_before.clone(), None).await?;
+	assert_eq!(reply_before, Some(frame_before), "emit must round-trip before idling out");
+	drop(lease);
+
+	sleep(idle_timeout * 2).await;
+
+	let mut fresh = pool.connect(server.addr).await?;
+	let frame_after = create_v0_tightbeam(Some("mux-idle-after"), None);
+	let reply_after = fresh.emit(frame_after.clone(), None).await?;
+	assert_eq!(
+		reply_after,
+		Some(frame_after),
+		"connect after the idle timeout must round-trip on a fresh connection"
+	);
+
+	let connection_tasks = match server.connection_tasks.lock() {
+		Ok(tasks) => tasks.len(),
+		Err(poisoned) => poisoned.into_inner().len(),
+	};
+	assert_eq!(connection_tasks, 6, "idle entry must be pruned and a fresh connection dialed");
 	Ok(())
 }
 
