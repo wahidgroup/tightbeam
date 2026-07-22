@@ -27,6 +27,87 @@ where
 	})
 }
 
+/// Mux takeover for one accepted connection (async accept loop only).
+///
+/// Drives the server handshake and, when the peer negotiated multiplexing,
+/// serves the whole connection through the mux plane ending the connection
+/// task. Falls through to the single-flight loop when the peer declined.
+#[cfg(all(
+	feature = "x509",
+	feature = "tokio",
+	feature = "transport-policy",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tightbeam_server_mux_takeover {
+	($transport:ident, $handler:ident, $error_tx:ident, $ok_tx:ident) => {
+		match $crate::transport::multiplex::MuxAcceptor::negotiate_mux(&mut $transport).await {
+			Ok(Some(__mux_settings)) => {
+				// Handler failures answer with no response but are reported
+				// so operators can observe them.
+				let __mux_handler = {
+					let __handler = ::std::sync::Arc::clone(&$handler);
+					let __handler_errors = $error_tx.clone();
+					move |frame: $crate::Frame| {
+						let __handler = ::std::sync::Arc::clone(&__handler);
+						let mut __handler_errors = __handler_errors.clone();
+						async move {
+							let response = match (*__handler)(frame).await {
+								Ok(response) => response,
+								Err(err) => {
+									if let Some(tx) = __handler_errors.as_mut() {
+										let _ = tx.send(::core::convert::Into::into(err)).await;
+									}
+
+									None
+								}
+							};
+							Ok::<_, $crate::TightBeamError>(response)
+						}
+					}
+				};
+				match $crate::transport::serve::serve_mux($transport, __mux_settings, __mux_handler, None).await {
+					Ok(()) => {
+						if let Some(tx) = $ok_tx.as_mut() {
+							let _ = tx.send(()).await;
+						}
+					}
+					Err(err) => {
+						if let Some(tx) = $error_tx.as_mut() {
+							let _ = tx.send(err).await;
+						}
+					}
+				}
+
+				return;
+			}
+			Ok(None) => {}
+			Err(err) => {
+				if let Some(tx) = $error_tx.as_mut() {
+					let _ = tx.send(err).await;
+				}
+
+				return;
+			}
+		}
+	};
+}
+
+#[cfg(not(all(
+	feature = "x509",
+	feature = "tokio",
+	feature = "transport-policy",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+)))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tightbeam_server_mux_takeover {
+	($transport:ident, $handler:ident, $error_tx:ident, $ok_tx:ident) => {};
+}
+
 #[cfg(feature = "tokio")]
 #[macro_export]
 macro_rules! __tightbeam_server_protocol_handle {
@@ -392,6 +473,7 @@ macro_rules! server {
 					use $crate::transport::MessageCollector;
 					$crate::macros::server::server_runtime::rt::spawn(async move {
 						let mut __transport = __transport;
+						$crate::__tightbeam_server_mux_takeover!(__transport, __handler_clone, __error_channel, __ok_channel);
 						loop {
 							// Read message
 							let (frame, status) = match __transport.collect_message().await {

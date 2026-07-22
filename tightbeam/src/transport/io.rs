@@ -21,6 +21,7 @@ use std::sync::Arc;
 ))]
 use std::time::Instant;
 
+use core::future::Future;
 use core::mem;
 
 use crate::asn1::Frame;
@@ -31,6 +32,7 @@ use crate::transport::envelopes::{TransportEnvelope, WireEnvelope, WireMode};
 use crate::transport::error::TransportError;
 use crate::transport::messaging::ResponseHandler;
 use crate::transport::TransportResult;
+use crate::utils::marker::MaybeSend;
 use crate::TightBeamError;
 
 #[cfg(feature = "transport-ecies")]
@@ -179,6 +181,27 @@ fn envelope_versions_compatible(envelope: &TransportEnvelope) -> bool {
 		#[cfg(feature = "transport-multiplex")]
 		TransportEnvelope::Mux(_) => true,
 	}
+}
+
+/// Receive side of a split envelope link.
+///
+/// Decouples the [`MuxTransport`](crate::transport::multiplex::MuxTransport)
+/// router from the link's protection policy: an encrypting implementation
+/// decrypts and enforces AEAD sequencing, a cleartext one enforces neither.
+pub trait EnvelopeSource: MaybeSend {
+	fn read_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend;
+}
+
+/// Send side of a split envelope link.
+///
+/// Send-direction counterpart of [`EnvelopeSource`].
+pub trait EnvelopeSink: MaybeSend {
+	fn write_envelope(&mut self, envelope: TransportEnvelope) -> impl Future<Output = TransportResult<()>> + MaybeSend;
+
+	/// Envelopes still writable before the link demands a rekey.
+	///
+	/// Links without keys never rekey and report `u64::MAX`.
+	fn remaining_records(&self) -> u64;
 }
 
 /// Base I/O operations for message transport

@@ -27,6 +27,7 @@ use crate::crypto::profiles::DefaultCryptoProvider;
 use crate::policy::GatePolicy;
 use crate::router::RouterError;
 use crate::trace::TraceCollector;
+use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::Protocol;
 use crate::transport::TightBeamAddress;
 use crate::utils::BasisPoints;
@@ -211,6 +212,7 @@ where
 	pub(crate) _message: PhantomData<M>,
 	pub(crate) _crypto: PhantomData<C>,
 	pub(crate) x509_config: Option<TransportEncryptionConfig<C>>,
+	pub(crate) mux_offer: Option<TransportOffer>,
 	pub(crate) servlet_config: Option<Arc<dyn Any + Send + Sync>>,
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
@@ -228,6 +230,7 @@ where
 {
 	pub(crate) _protocol: PhantomData<P>,
 	pub(crate) _message: PhantomData<M>,
+	pub(crate) mux_offer: Option<TransportOffer>,
 	pub(crate) servlet_config: Option<Arc<dyn Any + Send + Sync>>,
 	pub(crate) hive_context: Option<Arc<dyn HiveContext>>,
 	pub(crate) workers: HashMap<String, Box<dyn WorkerBox>>,
@@ -244,6 +247,7 @@ where
 	M: Message,
 {
 	x509_config: Option<TransportEncryptionConfig<C>>,
+	mux_offer: Option<TransportOffer>,
 	servlet_config: Option<Arc<dyn Any + Send + Sync>>,
 	hive_context: Option<Arc<dyn HiveContext>>,
 	workers: HashMap<String, Box<dyn WorkerBox>>,
@@ -260,6 +264,7 @@ where
 	P: Protocol,
 	M: Message,
 {
+	mux_offer: Option<TransportOffer>,
 	servlet_config: Option<Arc<dyn Any + Send + Sync>>,
 	hive_context: Option<Arc<dyn HiveContext>>,
 	workers: HashMap<String, Box<dyn WorkerBox>>,
@@ -330,6 +335,11 @@ where
 	pub fn to_message_inflator(&self) -> Option<Arc<dyn Inflator + Send + Sync>> {
 		self.message_inflator.as_ref().map(Arc::clone)
 	}
+
+	/// Get the multiplexing advertisement for accepted connections
+	pub fn mux_offer(&self) -> Option<TransportOffer> {
+		self.mux_offer
+	}
 }
 
 #[cfg(not(feature = "x509"))]
@@ -387,6 +397,11 @@ where
 	pub fn to_message_inflator(&self) -> Option<Arc<dyn Inflator + Send + Sync>> {
 		self.message_inflator.as_ref().map(Arc::clone)
 	}
+
+	/// Get the multiplexing advertisement for accepted connections
+	pub fn mux_offer(&self) -> Option<TransportOffer> {
+		self.mux_offer
+	}
 }
 
 #[cfg(feature = "x509")]
@@ -402,6 +417,7 @@ where
 			_message: PhantomData,
 			_crypto: PhantomData,
 			x509_config: None,
+			mux_offer: None,
 			servlet_config: Some(Arc::new(())),
 			hive_context: None,
 			workers: HashMap::new(),
@@ -422,6 +438,7 @@ where
 		Self {
 			_protocol: PhantomData,
 			_message: PhantomData,
+			mux_offer: None,
 			servlet_config: Some(Arc::new(())),
 			hive_context: None,
 			workers: HashMap::new(),
@@ -442,6 +459,7 @@ where
 	fn default() -> Self {
 		Self {
 			x509_config: None,
+			mux_offer: None,
 			servlet_config: None,
 			hive_context: None,
 			workers: HashMap::new(),
@@ -461,6 +479,7 @@ where
 {
 	fn default() -> Self {
 		Self {
+			mux_offer: None,
 			servlet_config: None,
 			hive_context: None,
 			workers: HashMap::new(),
@@ -492,6 +511,15 @@ where
 
 		self.x509_config = Some(encryption_config.with_client_validators(validators));
 		Ok(self)
+	}
+
+	/// Advertise multiplexing on accepted connections. Requires an
+	/// encrypted transport: the offer is bound into the handshake
+	/// transcript, so cleartext servlets never negotiate it
+	#[must_use]
+	pub fn with_mux_offer(mut self, offer: Option<TransportOffer>) -> Self {
+		self.mux_offer = offer;
+		self
 	}
 
 	/// Add servlet application configuration
@@ -555,6 +583,7 @@ where
 			_message: PhantomData,
 			_crypto: PhantomData,
 			x509_config: self.x509_config,
+			mux_offer: self.mux_offer,
 			servlet_config: self.servlet_config,
 			hive_context: self.hive_context,
 			workers: self.workers,
@@ -571,6 +600,15 @@ where
 	P: Protocol,
 	M: Message,
 {
+	/// Advertise multiplexing on accepted connections. Requires an
+	/// encrypted transport: the offer is bound into the handshake
+	/// transcript, so cleartext servlets never negotiate it
+	#[must_use]
+	pub fn with_mux_offer(mut self, offer: Option<TransportOffer>) -> Self {
+		self.mux_offer = offer;
+		self
+	}
+
 	/// Add servlet application configuration
 	#[must_use]
 	pub fn with_config<Cfg: Send + Sync + 'static>(mut self, config: Arc<Cfg>) -> Self {
@@ -630,6 +668,7 @@ where
 		ServletConf {
 			_protocol: PhantomData,
 			_message: PhantomData,
+			mux_offer: self.mux_offer,
 			servlet_config: self.servlet_config,
 			hive_context: self.hive_context,
 			workers: self.workers,

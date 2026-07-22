@@ -38,6 +38,14 @@ pub mod state;
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
+#[cfg(all(
+	feature = "x509",
+	feature = "tokio",
+	feature = "transport-policy",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub mod serve;
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
 
@@ -46,7 +54,7 @@ pub use builders::{EnvelopeBuilder, EnvelopeLimits};
 pub use client::GenericClient;
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
-pub use io::{EncryptedMessageIO, MessageIO, Pingable};
+pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO, Pingable};
 pub use messaging::{MessageCollector, ResponseHandler, Transport};
 pub use protocols::{
 	AsyncListenerTrait, EncryptedProtocol, Mycelial, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
@@ -64,9 +72,7 @@ pub use tcp::r#async::TokioListener;
 #[cfg(any(feature = "tokio", feature = "async-transport"))]
 pub use tcp::r#async::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream, TcpTransport};
 #[cfg(all(any(feature = "tokio", feature = "async-transport"), feature = "x509"))]
-pub use tcp::r#async::{
-	CleartextReader, CleartextWriter, EnvelopeSink, EnvelopeSource, TransportReader, TransportWriter,
-};
+pub use tcp::r#async::{CleartextReader, CleartextWriter, TransportReader, TransportWriter};
 
 /// Transport-agnostic result type
 pub type TransportResult<T> = Result<T, TransportError>;

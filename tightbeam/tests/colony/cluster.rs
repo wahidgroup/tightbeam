@@ -49,7 +49,10 @@ use tightbeam::{
 	servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
 	trace::TraceCollector,
-	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, GenericClient},
+	transport::{
+		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
+		GenericClient,
+	},
 	utils::compose as frame_compose,
 	Beamable, Frame, TightBeamError, Version,
 };
@@ -107,7 +110,11 @@ fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConf {
 		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
 		validators: vec![],
 	});
-	HiveConf { hive_tls: Some(hive_tls), ..Default::default() }
+	HiveConf {
+		hive_tls: Some(hive_tls),
+		mux_offer: Some(TransportOffer::mux(8)),
+		..Default::default()
+	}
 }
 
 fn hive_tls_config(certs: &ClusterTestCerts) -> HiveConf {
@@ -123,6 +130,7 @@ fn servlet_tls_config(
 			Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
 			vec![],
 		)?
+		.with_mux_offer(Some(TransportOffer::mux(8)))
 		.with_config(Arc::new(()))
 		.build())
 }

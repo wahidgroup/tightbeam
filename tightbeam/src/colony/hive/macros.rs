@@ -129,7 +129,7 @@ macro_rules! hive {
 						let mut pooled_conn = (&self.pool).connect(addr).await?;
 						let frame = Self::build_frame(b"hive-call", request);
 
-						pooled_conn.conn()?.emit(frame, None).await?
+						pooled_conn.emit(frame, None).await?
 							.map(|mut r| core::mem::take(&mut r.message))
 							.ok_or($crate::TightBeamError::MissingResponse)
 					})
@@ -156,6 +156,7 @@ macro_rules! hive {
 					let pool_config = $crate::transport::client::pool::PoolConfig {
 						idle_timeout: config.servlet_pool_idle_timeout,
 						max_connections: config.servlet_pool_size,
+						mux_offer: config.mux_offer,
 					};
 					let servlet_pool = ::std::sync::Arc::new(
 						$crate::transport::client::pool::ConnectionPool::<$protocol>::builder()
@@ -307,6 +308,7 @@ macro_rules! hive {
 					let trust_store = self.config.trust_store.as_ref().map(::std::sync::Arc::clone);
 					#[cfg(feature = "x509")]
 					let freshness_window_ms = self.config.command_freshness_window_ms;
+					let mux_offer_for_server = self.config.mux_offer;
 
 					// Start control server
 					let control_server_handle = hive!(
@@ -323,7 +325,8 @@ macro_rules! hive {
 						cb_threshold,
 						cb_cooldown_ms,
 						bp_threshold,
-						freshness_window_ms
+						freshness_window_ms,
+						mux_offer_for_server
 					);
 					self.control_server_handle = Some(control_server_handle);
 
@@ -499,7 +502,8 @@ macro_rules! hive {
 		$cb_threshold:ident,
 		$cb_cooldown_ms:ident,
 		$bp_threshold:ident,
-		$freshness_window_ms:ident
+		$freshness_window_ms:ident,
+		$mux_offer:ident
 	) => {{
 		#[cfg(feature = "x509")]
 		let circuit_breaker = ::std::sync::Arc::new(
@@ -513,6 +517,7 @@ macro_rules! hive {
 
 		$crate::server! {
 			protocol $protocol: $listener,
+			policies: { with_mux_offer: [ $mux_offer ] },
 			handle: move |frame: $crate::Frame| {
 				let servlets = ::std::sync::Arc::clone(&$servlets);
 				let trace = ::std::sync::Arc::clone(&$trace);

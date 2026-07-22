@@ -362,18 +362,8 @@ macro_rules! impl_tcp_common {
 				self.peer_certificate.as_ref()
 			}
 
-			/// Configure the local transport capability advertisement
-			/// (multiplexing). Clients offer it in their handshake opening.
-			pub fn with_mux_config(
-				mut self,
-				config: $crate::transport::handshake::negotiation::TransportOffer,
-			) -> Self {
-				self.mux_config = Some(config);
-				self
-			}
-
 			/// Get the negotiated multiplexing settings from a completed
-			/// handshake. `None` means the connection is lock-step.
+			/// handshake. `None` means the connection is single-flight.
 			pub fn negotiated_mux(&self) -> Option<$crate::transport::handshake::negotiation::MuxSettings> {
 				self.mux_settings
 			}

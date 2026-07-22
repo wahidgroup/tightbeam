@@ -147,6 +147,7 @@ colony = [
 	"derive",
 	"transport",
 	"transport-ecies",
+	"transport-multiplex",
 	"x509",
 	"signature",
 	"digest",

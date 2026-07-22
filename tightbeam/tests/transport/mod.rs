@@ -6,5 +6,6 @@ mod loopback;
 mod multiplex;
 mod mutual_auth;
 mod negotiation;
+mod pool_mux;
 mod split;
 pub(crate) mod support;

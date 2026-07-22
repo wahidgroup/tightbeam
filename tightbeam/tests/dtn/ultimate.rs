@@ -767,7 +767,7 @@ tb_scenario! {
 			// ================================================================
 
 			// Pool configuration for relay connections (max 3 per destination)
-			let pool_config = PoolConfig { idle_timeout: None, max_connections: 3 };
+			let pool_config = PoolConfig { idle_timeout: None, max_connections: 3, mux_offer: None };
 
 			// Mission Control -> Earth Relay pool
 			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()

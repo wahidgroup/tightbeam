@@ -70,8 +70,9 @@ impl SecurityAccept {
 /// Transport capability offer (multiplexing).
 ///
 /// Each side advertises how many streams its *peer* may concurrently initiate
-/// (RFC 9113 § 5.1.2 directional semantics). Sent by the client inside its
-/// handshake opening message so the offer is bound into the transcript.
+/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)
+/// directional semantics). Sent by the client inside its handshake opening
+/// message so the offer is bound into the transcript.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct TransportOffer {
@@ -104,9 +105,10 @@ pub struct TransportAccept {
 
 /// Negotiated multiplexing settings for one connection.
 ///
-/// Caps are directional (RFC 9113 § 5.1.2): each endpoint enforces the
-/// value it advertised and respects the value its peer advertised. There is
-/// no symmetric min-collapse.
+/// Caps are directional
+/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)):
+/// each endpoint enforces the value it advertised and respects the value its
+/// peer advertised. There is no symmetric min-collapse.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MuxSettings {
 	/// Concurrent streams this endpoint may initiate (peer-advertised).

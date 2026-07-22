@@ -23,7 +23,10 @@ use tightbeam::{
 	servlet, tb_assert_spec, tb_scenario,
 	testing::ScenarioConf,
 	trace::TraceCollector,
-	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder, GenericClient},
+	transport::{
+		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
+		GenericClient,
+	},
 	utils::BasisPoints,
 	Beamable, Frame, TightBeamError, Version,
 };
@@ -124,7 +127,11 @@ tb_scenario! {
 
 			establish_registered_hive(
 				&trace,
-				Some(HiveConf { hive_tls: Some(tls_config), ..Default::default() }),
+				Some(HiveConf {
+					hive_tls: Some(tls_config),
+					mux_offer: Some(TransportOffer::mux(4)),
+					..Default::default()
+				}),
 			)
 			.await
 		}

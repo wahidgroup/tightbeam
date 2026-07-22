@@ -311,9 +311,12 @@ macro_rules! cluster {
 	};
 
 	// Build gateway server
-	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident, $replay_guard:ident) => {
+	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident, $replay_guard:ident) => {{
+		// Copied out before the handler closure captures the config.
+		let __mux_offer = $config.pool_config.mux_offer;
 		$crate::server! {
 			protocol $protocol: $listener,
+			policies: { with_mux_offer: [ __mux_offer ] },
 			handle: move |frame: $crate::Frame| {
 				let registry = ::std::sync::Arc::clone(&$registry);
 				let servlet_registry = ::std::sync::Arc::clone(&$servlet_registry);
@@ -326,7 +329,7 @@ macro_rules! cluster {
 				}
 			}
 		}
-	};
+	}};
 
 	// Helper: Build response frame (DRY)
 	(@reply $frame:ident, $message:expr) => {
@@ -656,7 +659,7 @@ macro_rules! cluster {
 			let mut client = $pool.connect(parsed_addr).await
 				.map_err(|_| $crate::colony::cluster::ClusterError::ConnectFailed)?;
 
-			let mut response = match client.conn()?.emit(frame, None).await {
+			let mut response = match client.emit(frame, None).await {
 				Ok(Some(r)) => r,
 				Ok(None) => {
 					return Err($crate::colony::cluster::ClusterError::NoResponse);
@@ -719,7 +722,7 @@ macro_rules! cluster {
 
 			let mut client = $pool.connect($addr).await?;
 
-			let response = client.conn()?.emit(signed_frame, None).await?
+			let response = client.emit(signed_frame, None).await?
 				.ok_or($crate::colony::cluster::ClusterError::NoResponse)?;
 
 			let cmd_response: $crate::colony::common::ClusterCommandResponse =

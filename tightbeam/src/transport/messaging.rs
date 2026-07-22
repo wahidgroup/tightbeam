@@ -445,7 +445,7 @@ pub trait MessageCollector: MessageIO {
 	feature = "transport-policy",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
-enum CollectStep {
+pub(crate) enum CollectStep {
 	/// Cleartext handshake container to feed the server-side dispatcher.
 	Handshake(Vec<u8>),
 	/// Decrypted (or legitimately cleartext) application envelope.
@@ -460,7 +460,7 @@ enum CollectStep {
 	feature = "transport-policy",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
-async fn collect_step<T>(transport: &mut T) -> TransportResult<CollectStep>
+pub(crate) async fn collect_step<T>(transport: &mut T) -> TransportResult<CollectStep>
 where
 	T: EncryptedMessageIO + EncryptedProtocolState + Sized,
 {
