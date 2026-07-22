@@ -386,6 +386,8 @@ where
 	where
 		P: PersistentConnection,
 	{
+		let pool = Arc::clone(self);
+
 		PooledClient {
 			client: Some(client),
 			#[cfg(all(
@@ -396,7 +398,7 @@ where
 				any(feature = "transport-cms", feature = "transport-ecies")
 			))]
 			mux: None,
-			pool: Arc::clone(self),
+			pool,
 			addr,
 		}
 	}
@@ -715,7 +717,15 @@ pooled_mux! {
 		}
 
 		fn wrap_mux_client(self: &Arc<Self>, handle: MuxHandle, id: u64, addr: P::Address) -> PooledClient<P, C> {
-			PooledClient { client: None, mux: Some(MuxLease { id, handle }), pool: Arc::clone(self), addr }
+			let lease = MuxLease { id, handle };
+			let pool = Arc::clone(self);
+
+			PooledClient {
+				client: None,
+				mux: Some(lease),
+				pool,
+				addr,
+			}
 		}
 	}
 
