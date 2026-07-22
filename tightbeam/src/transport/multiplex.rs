@@ -156,9 +156,10 @@ mod router {
 
 	use super::{MultiplexedProtocol, MuxRole, StreamId};
 	use crate::constants::DEFAULT_MUX_CANCEL_BUDGET;
+	use crate::der::{Decode, Encode};
 	use crate::policy::TransitStatus;
 	use crate::transport::envelopes::{
-		CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxedRequestPackage, MuxedResponsePackage,
+		CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxEndPackage, MuxEnvelope, MuxOpenPackage,
 		ResponsePackage, TransportEnvelope,
 	};
 	use crate::transport::error::TransportFailure;
@@ -413,6 +414,8 @@ mod router {
 			CancelReason::Cancelled => TransportError::OperationFailed(TransportFailure::PolicyRejection),
 			CancelReason::Timeout => TransportError::OperationFailed(TransportFailure::Timeout),
 			CancelReason::Rejected => TransportError::OperationFailed(TransportFailure::Busy),
+			// Application codes carry no transport-failure mapping of their own
+			CancelReason::Application(_) => TransportError::OperationFailed(TransportFailure::PolicyRejection),
 		}
 	}
 
@@ -445,6 +448,9 @@ mod router {
 		/// - `Draining`: GoAway sent or received. No new streams
 		/// - `ConnectionClosed`: connection failed before the response
 		pub async fn emit_on_stream(&self, frame: Frame) -> TransportResult<Option<Frame>> {
+			// Encode before allocating so an encoding failure never burns
+			// a stream ID or queues a cancel for a stream the peer never saw.
+			let payload = frame.to_der()?;
 			let (sender, receiver) = oneshot::channel();
 			let stream_id = self.shared.allocate(sender)?;
 			let mut guard = CancelOnDrop {
@@ -454,7 +460,7 @@ mod router {
 				armed: true,
 			};
 
-			let request = MuxedRequestPackage::new(stream_id, frame);
+			let request = MuxOpenPackage::new(stream_id, true, payload)?;
 			let mut outbound = self.outbound.clone();
 			outbound
 				.send(Outbound::Envelope(request.into()))
@@ -603,30 +609,71 @@ mod router {
 		async fn route_envelopes(&mut self) -> TransportResult<()> {
 			loop {
 				let envelope = self.reader.read_envelope().await?;
-				match envelope {
-					TransportEnvelope::MuxedResponse(package) => self.route_response(package)?,
-					TransportEnvelope::MuxedRequest(package) => self.route_request(package).await?,
-					TransportEnvelope::MuxCancel(package) => self.route_cancel(package).await?,
-					TransportEnvelope::GoAway(package) => self.shared.fail_pending_above(package.last_stream_id()),
-					_ => return Err(self.protocol_violation()),
+				let TransportEnvelope::Mux(mux) = envelope else {
+					return Err(self.protocol_violation());
+				};
+				match mux {
+					MuxEnvelope::End(package) => self.route_end(package)?,
+					MuxEnvelope::Open(package) => self.route_open(package).await?,
+					MuxEnvelope::Cancel(package) => self.route_cancel(package).await?,
+					MuxEnvelope::GoAway(package) => self.shared.fail_pending_above(package.last_stream_id()),
+					// The handshake never negotiates chunking, so no
+					// conforming peer sends continuation chunks or
+					// credit grants
+					MuxEnvelope::Data(_) | MuxEnvelope::Credit(_) => return Err(self.protocol_violation()),
 				}
 			}
 		}
 
-		fn route_response(&mut self, package: MuxedResponsePackage) -> TransportResult<()> {
+		/// Decode a reassembled stream payload into its message frame.
+		///
+		/// Empty payload = message-less trailer. Version validation happens
+		/// here rather than at the io layer because chunked payloads only
+		/// become a frame after reassembly.
+		fn decode_stream_frame(&mut self, payload: &[u8]) -> TransportResult<Option<Frame>> {
+			if payload.is_empty() {
+				return Ok(None);
+			}
+
+			let frame = match Frame::from_der(payload) {
+				Ok(frame) => frame,
+				Err(_) => return Err(self.protocol_violation()),
+			};
+			if !frame.validate_version_compatibility() {
+				return Err(self.protocol_violation());
+			}
+
+			Ok(Some(frame))
+		}
+
+		fn route_end(&mut self, package: MuxEndPackage) -> TransportResult<()> {
 			let stream_id = package.stream_id();
 			if !self.shared.role.initiates(stream_id) {
 				return Err(self.protocol_violation());
 			}
-			self.shared.resolve(stream_id, StreamOutcome::Response(package.response));
+
+			let message = self.decode_stream_frame(package.payload())?;
+			let response = ResponsePackage::new(package.status(), message);
+			self.shared.resolve(stream_id, StreamOutcome::Response(response));
 			Ok(())
 		}
 
-		async fn route_request(&mut self, package: MuxedRequestPackage) -> TransportResult<()> {
+		async fn route_open(&mut self, package: MuxOpenPackage) -> TransportResult<()> {
 			let stream_id = package.stream_id();
+			// The handshake never negotiates chunking, so every
+			// conforming open carries its whole frame as the last chunk
+			if !package.last() {
+				return Err(self.protocol_violation());
+			}
+
 			match self.shared.register_peer_stream(stream_id) {
 				Ok(PeerStream::Accept) => {
-					let event = InboundEvent::Request(stream_id, Arc::clone(package.message()));
+					let frame = match self.decode_stream_frame(package.payload())? {
+						Some(frame) => frame,
+						// A request stream must carry a message
+						None => return Err(self.protocol_violation()),
+					};
+					let event = InboundEvent::Request(stream_id, Arc::new(frame));
 					if self.inbound.send(event).await.is_err() {
 						// No responder is serving this connection
 						self.refuse_stream(stream_id);
@@ -787,7 +834,12 @@ mod router {
 		}
 
 		async fn respond(&mut self, stream_id: u32, response: ResponsePackage) -> TransportResult<()> {
-			let package = MuxedResponsePackage::new(stream_id, response);
+			let payload = match response.message() {
+				Some(frame) => frame.as_ref().to_der()?,
+				None => Vec::new(),
+			};
+			let package = MuxEndPackage::new(stream_id, response.status(), payload)?;
+
 			self.outbound
 				.send(Outbound::Envelope(package.into()))
 				.await
@@ -1028,6 +1080,10 @@ mod router {
 			));
 			assert!(matches!(
 				cancel_error(CancelReason::Cancelled),
+				TransportError::OperationFailed(TransportFailure::PolicyRejection)
+			));
+			assert!(matches!(
+				cancel_error(CancelReason::Application(0x1000)),
 				TransportError::OperationFailed(TransportFailure::PolicyRejection)
 			));
 		}

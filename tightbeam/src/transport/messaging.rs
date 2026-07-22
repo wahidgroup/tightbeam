@@ -287,10 +287,7 @@ fn lockstep_request_frame(envelope: TransportEnvelope) -> TransportResult<Arc<Fr
 		#[cfg(feature = "x509")]
 		TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => Err(TransportError::InvalidMessage),
 		#[cfg(feature = "transport-multiplex")]
-		TransportEnvelope::MuxedRequest(_)
-		| TransportEnvelope::MuxedResponse(_)
-		| TransportEnvelope::MuxCancel(_)
-		| TransportEnvelope::GoAway(_) => Err(TransportError::InvalidMessage),
+		TransportEnvelope::Mux(_) => Err(TransportError::InvalidMessage),
 	}
 }
 
