@@ -72,6 +72,7 @@ macro_rules! __servlet_create_server {
 		$protocol:path,
 		$listener:ident,
 		$collector_gates:ident,
+		$mux_offer:ident,
 		$servlet_context:ident,
 		$trace_handle:ident,
 		$frame:ident,
@@ -81,6 +82,7 @@ macro_rules! __servlet_create_server {
 		if $collector_gates.is_empty() {
 			$crate::server! {
 				protocol $protocol: $listener,
+				policies: { with_mux_offer: [ $mux_offer ] },
 				handle: move |frame_in| {
 					let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
 					async move {
@@ -101,11 +103,37 @@ macro_rules! __servlet_create_server {
 								for gate in &$collector_gates {
 									transport = transport.with_collector_gate(::std::sync::Arc::clone(gate));
 								}
+								transport = transport.with_mux_offer($mux_offer);
 
 								let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
 
 								$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 									let mut transport = transport;
+									let __servlet_mux_handler = {
+										let __ctx = ::std::sync::Arc::clone(&ctx_clone);
+										::std::sync::Arc::new(move |frame_in: $crate::Frame| {
+											let __ctx = ::std::sync::Arc::clone(&__ctx);
+											async move {
+												let $frame = frame_in;
+												let $ctx = &*__ctx;
+												let __response: ::core::result::Result<
+													::core::option::Option<$crate::Frame>,
+													$crate::TightBeamError,
+												> = $handler_body;
+												__response
+											}
+										})
+									};
+									let mut __servlet_error_tx =
+										$crate::macros::server::server_runtime::rt::empty_error_channel();
+									let mut __servlet_ok_tx =
+										$crate::macros::server::server_runtime::rt::empty_ok_channel();
+									$crate::__tightbeam_server_mux_takeover!(
+										transport,
+										__servlet_mux_handler,
+										__servlet_error_tx,
+										__servlet_ok_tx
+									);
 									loop {
 										let (frame_arc, status) = match transport.collect_message().await {
 											Ok(result) => result,
@@ -188,6 +216,7 @@ macro_rules! __servlet_start_impl {
 
 				let trace_handle = ::std::sync::Arc::new(::std::sync::Mutex::new(::std::sync::Arc::clone(&trace)));
 				let collector_gates = servlet_conf.collector_gates_ref().to_vec();
+				let mux_offer = servlet_conf.mux_offer();
 				let hive_context = servlet_conf.hive_context().cloned();
 				let message_decryptor = servlet_conf.to_message_decryptor();
 				let message_inflator = servlet_conf.to_message_inflator();
@@ -216,6 +245,7 @@ macro_rules! __servlet_start_impl {
 					$protocol,
 					listener,
 					collector_gates,
+					mux_offer,
 					servlet_context,
 					trace_handle,
 					$frame,

@@ -234,6 +234,26 @@ async fn pooled_mux_declined_falls_back_to_exclusive_lease() -> Result<(), Tight
 	Ok(())
 }
 
+/// After a declined offer, the returned exclusive connection is idle in the
+/// pool: the next connect must reuse it instead of dialing (at cap 1, a
+/// dial would report `Busy`).
+#[tokio::test]
+async fn pooled_mux_declined_reuses_idle_exclusive_lease() -> Result<(), TightBeamError> {
+	let server = start_mux_echo_server(None).await?;
+	let pool = mux_pool(&server.materials, Some(TransportOffer::mux(8)), 1)?;
+
+	let first_lease = pool.connect(server.addr).await?;
+	drop(first_lease);
+
+	let mut reused_lease = pool.connect(server.addr).await?;
+	assert!(reused_lease.conn().is_ok(), "reused lease must be exclusive");
+
+	let frame = create_v0_tightbeam(Some("mux-idle-reuse"), None);
+	let reply = reused_lease.emit(frame.clone(), None).await?;
+	assert_eq!(reply, Some(frame), "idle exclusive connection must be reused and round-trip");
+	Ok(())
+}
+
 /// Per-connection driver and responder tasks of a [`ManualMuxServer`].
 type ConnectionTasks = Arc<Mutex<Vec<JoinHandle<Result<(), TransportError>>>>>;
 

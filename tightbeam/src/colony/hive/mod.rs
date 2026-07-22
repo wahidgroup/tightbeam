@@ -498,7 +498,9 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 	#[cfg(feature = "x509")]
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
 	/// Multiplexing advertisement for the servlet pool and the control
-	/// server (default: `None` = single-flight)
+	/// server (default: `None` = single-flight). Pool connections to a
+	/// servlet multiplex only when the servlet also advertises via
+	/// [`ServletConfBuilder::with_mux_offer`](crate::colony::servlet::ServletConfBuilder::with_mux_offer)
 	pub mux_offer: Option<TransportOffer>,
 }
 
