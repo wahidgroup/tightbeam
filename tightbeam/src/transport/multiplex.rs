@@ -15,7 +15,8 @@
 //!   responses to their pending streams and requests to the responder.
 //! - [`MuxHandle`]: cloneable client handle. [`MuxHandle::emit_on_stream`]
 //!   allocates a stream, sends the request, and awaits the correlated
-//!   response.
+//!   response. [`MuxHandle::ping`] probes connection liveness without
+//!   touching a stream or the peer's handler.
 //! - [`MuxResponder`]: serves peer-initiated streams with a caller-supplied
 //!   handler, enforcing the advertised concurrency cap.
 //!
@@ -224,7 +225,7 @@ mod router {
 	use crate::policy::TransitStatus;
 	use crate::transport::envelopes::{
 		CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxEndPackage, MuxEnvelope, MuxOpenPackage,
-		ResponsePackage, TransportEnvelope,
+		MuxPingPackage, ResponsePackage, TransportEnvelope,
 	};
 	use crate::transport::error::TransportFailure;
 	use crate::transport::handshake::negotiation::MuxSettings;
@@ -295,6 +296,10 @@ mod router {
 		/// Open locally-initiated streams awaiting their response. The map
 		/// size is the cap-relevant open-stream count
 		pending: BTreeMap<u32, oneshot::Sender<StreamOutcome>>,
+		/// Next correlation value for a locally-initiated ping
+		next_ping_opaque: u64,
+		/// Local pings awaiting their ack, keyed by correlation value
+		pending_pings: BTreeMap<u64, oneshot::Sender<()>>,
 		/// `last_stream_id` advertised in our GoAway, once sent
 		goaway_sent: Option<u32>,
 		/// `last_stream_id` received in the peer's GoAway
@@ -357,11 +362,45 @@ mod router {
 			}
 		}
 
+		/// Register a locally-initiated ping and return its correlation
+		/// value. Refused while draining: a peer that honors the GoAway
+		/// contract reserves its remaining records for owed stream
+		/// traffic and never acks (see [`drain_headroom`]).
+		fn allocate_ping(&self, sender: oneshot::Sender<()>) -> TransportResult<u64> {
+			let mut state = self.lock();
+			if state.goaway_sent.is_some() || state.goaway_received.is_some() {
+				return Err(TransportError::Draining);
+			}
+
+			let opaque = state.next_ping_opaque;
+			state.next_ping_opaque = opaque.wrapping_add(1);
+			state.pending_pings.insert(opaque, sender);
+
+			Ok(opaque)
+		}
+
+		/// Resolve a pending ping. Unknown correlation values are silently
+		/// discarded (stale ack racing a dropped ping future is benign).
+		fn resolve_ping(&self, opaque: u64) {
+			if let Some(sender) = self.lock().pending_pings.remove(&opaque) {
+				let _ = sender.send(());
+			}
+		}
+
+		fn remove_pending_ping(&self, opaque: u64) {
+			self.lock().pending_pings.remove(&opaque);
+		}
+
+		fn shutdown_begun(&self) -> bool {
+			self.lock().goaway_sent.is_some()
+		}
+
 		/// Drop every pending slot on connection failure. Receivers observe
 		/// cancellation.
 		fn fail_all_pending(&self) {
 			let mut state = self.lock();
 			state.pending.clear();
+			state.pending_pings.clear();
 			state.wake_drain_waiters();
 		}
 
@@ -469,6 +508,31 @@ mod router {
 		}
 	}
 
+	/// Forgets the pending ping if the owning ping future is dropped
+	/// before its ack arrives. A later ack resolves nothing (discarded
+	/// like a stale response), so no peer notification is needed.
+	struct ForgetPingOnDrop {
+		shared: Arc<MuxShared>,
+		opaque: u64,
+		armed: bool,
+	}
+
+	impl ForgetPingOnDrop {
+		fn disarm(&mut self) {
+			self.armed = false;
+		}
+	}
+
+	impl Drop for ForgetPingOnDrop {
+		fn drop(&mut self) {
+			if !self.armed {
+				return;
+			}
+
+			self.shared.remove_pending_ping(self.opaque);
+		}
+	}
+
 	fn unwrap_frame(frame: Arc<Frame>) -> Frame {
 		Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone())
 	}
@@ -546,6 +610,40 @@ mod router {
 		/// Cancel a locally-initiated in-flight stream (best-effort).
 		pub fn close_stream(&self, stream_id: StreamId) {
 			enqueue_stream_cancel(&self.shared, &self.outbound, stream_id.value());
+		}
+
+		/// Connection-level liveness probe
+		/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)
+		/// analog): resolves when the peer's ack arrives.
+		///
+		/// No stream is allocated and the peer's application handler never
+		/// runs, so this doubles as an idle keepalive for links whose
+		/// carrier cannot ping itself. Scheduling composes externally: wrap in
+		/// the caller's timer for dead-peer detection, repeat on the caller's
+		/// interval for keepalive.
+		///
+		/// # Errors
+		/// - `Draining`: GoAway sent or received. The connection is ending
+		/// - `ConnectionClosed`: connection failed before the ack
+		pub async fn ping(&self) -> TransportResult<()> {
+			let (sender, receiver) = oneshot::channel();
+			let opaque = self.shared.allocate_ping(sender)?;
+			let mut guard = ForgetPingOnDrop { shared: Arc::clone(&self.shared), opaque, armed: true };
+
+			let probe = MuxPingPackage::new(false, opaque);
+			let mut outbound = self.outbound.clone();
+			outbound
+				.send(Outbound::Envelope(probe.into()))
+				.await
+				.map_err(|_| TransportError::ConnectionClosed)?;
+
+			let outcome = receiver.await;
+
+			guard.disarm();
+
+			outcome.map_err(|_| TransportError::ConnectionClosed)?;
+
+			Ok(())
 		}
 
 		/// Gracefully shut the connection down (RFC 9113 § 6.8 analog): sends
@@ -680,6 +778,7 @@ mod router {
 					MuxEnvelope::End(package) => self.route_end(package)?,
 					MuxEnvelope::Open(package) => self.route_open(package).await?,
 					MuxEnvelope::Cancel(package) => self.route_cancel(package).await?,
+					MuxEnvelope::Ping(package) => self.route_ping(package).await?,
 					MuxEnvelope::GoAway(package) => self.shared.fail_pending_above(package.last_stream_id()),
 					// The handshake never negotiates chunking, so no
 					// conforming peer sends continuation chunks or
@@ -778,6 +877,32 @@ mod router {
 			}
 
 			Err(self.protocol_violation())
+		}
+
+		/// Answer a peer probe with its ack. Terminates here: pings never
+		/// reach the responder or the application handler.
+		async fn route_ping(&mut self, package: MuxPingPackage) -> TransportResult<()> {
+			if package.ack() {
+				self.shared.resolve_ping(package.opaque());
+				return Ok(());
+			}
+
+			// After our GoAway the writer's remaining records are reserved
+			// for owed stream traffic (see `drain_headroom`), so peer
+			// probes draw no acks. Combined with the bounded outbound
+			// queue's backpressure this caps what a ping flood can extract
+			// (CVE-2019-9512 hardening).
+			if self.shared.shutdown_begun() {
+				return Ok(());
+			}
+
+			let ack = MuxPingPackage::new(true, package.opaque());
+			self.outbound
+				.send(Outbound::Envelope(ack.into()))
+				.await
+				.map_err(|_| TransportError::ConnectionClosed)?;
+
+			Ok(())
 		}
 
 		fn refuse_stream(&mut self, stream_id: u32) {
@@ -974,6 +1099,8 @@ mod router {
 					next_stream_id: Some(role.first_local_stream_id()),
 					last_peer_stream_id: 0,
 					pending: BTreeMap::new(),
+					next_ping_opaque: 0,
+					pending_pings: BTreeMap::new(),
 					goaway_sent: None,
 					goaway_received: None,
 					drain_wakers: Vec::new(),
@@ -1030,6 +1157,8 @@ mod router {
 					next_stream_id: Some(role.first_local_stream_id()),
 					last_peer_stream_id: 0,
 					pending: BTreeMap::new(),
+					next_ping_opaque: 0,
+					pending_pings: BTreeMap::new(),
 					goaway_sent: None,
 					goaway_received: None,
 					drain_wakers: Vec::new(),
@@ -1142,6 +1271,56 @@ mod router {
 		fn test_drain_headroom_covers_queue_responses_cancels_goaway() {
 			let settings = MuxSettings { local_initiated_cap: 3, peer_initiated_cap: 5 };
 			assert_eq!(drain_headroom(&settings), 17);
+		}
+
+		fn ping_slot() -> oneshot::Sender<()> {
+			oneshot::channel().0
+		}
+
+		#[test]
+		fn test_ping_allocates_monotonic_opaque() {
+			let shared = test_shared(MuxRole::Client, 8);
+			assert!(matches!(shared.allocate_ping(ping_slot()), Ok(0)));
+			assert!(matches!(shared.allocate_ping(ping_slot()), Ok(1)));
+			assert!(matches!(shared.allocate_ping(ping_slot()), Ok(2)));
+		}
+
+		#[test]
+		fn test_ping_ack_resolves_pending() {
+			let shared = test_shared(MuxRole::Client, 8);
+			let (sender, mut receiver) = oneshot::channel();
+			assert!(matches!(shared.allocate_ping(sender), Ok(0)));
+
+			shared.resolve_ping(0);
+			assert!(matches!(receiver.try_recv(), Ok(Some(()))));
+		}
+
+		#[test]
+		fn test_stale_ping_ack_discarded() {
+			let shared = test_shared(MuxRole::Client, 8);
+			let (sender, mut receiver) = oneshot::channel();
+			assert!(matches!(shared.allocate_ping(sender), Ok(0)));
+
+			shared.remove_pending_ping(0);
+			shared.resolve_ping(0);
+			assert!(receiver.try_recv().is_err());
+		}
+
+		#[test]
+		fn test_ping_refused_while_draining() {
+			let shared = test_shared(MuxRole::Client, 8);
+			shared.begin_shutdown();
+			assert!(matches!(shared.allocate_ping(ping_slot()), Err(TransportError::Draining)));
+		}
+
+		#[test]
+		fn test_connection_failure_fails_pending_pings() {
+			let shared = test_shared(MuxRole::Client, 8);
+			let (sender, mut receiver) = oneshot::channel();
+			assert!(matches!(shared.allocate_ping(sender), Ok(0)));
+
+			shared.fail_all_pending();
+			assert!(receiver.try_recv().is_err());
 		}
 
 		#[test]

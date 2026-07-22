@@ -386,6 +386,36 @@ impl MuxCancelPackage {
 	}
 }
 
+/// Connection-level liveness probe
+/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7) analog).
+///
+/// `opaque` is an initiator-chosen correlation value echoed unchanged in
+/// the ack. Pings never allocate a stream and never reach the application
+/// handler, so they keep idle connections alive through intermediaries.
+#[cfg(feature = "transport-multiplex")]
+#[derive(Sequence, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxPingPackage {
+	pub(crate) ack: bool,
+	pub(crate) opaque: u64,
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl MuxPingPackage {
+	pub fn new(ack: bool, opaque: u64) -> Self {
+		Self { ack, opaque }
+	}
+
+	/// Whether this ping answers a peer probe
+	pub fn ack(&self) -> bool {
+		self.ack
+	}
+
+	/// Correlation value chosen by the probe initiator
+	pub fn opaque(&self) -> u64 {
+		self.opaque
+	}
+}
+
 /// Graceful connection shutdown: streams at or below `last_stream_id`
 /// drain to completion, newer ones are rejected.
 #[cfg(feature = "transport-multiplex")]
@@ -428,6 +458,8 @@ pub enum MuxEnvelope {
 	Cancel(MuxCancelPackage),
 	#[asn1(context_specific = "5", constructed = "true")]
 	GoAway(GoAwayPackage),
+	#[asn1(context_specific = "6", constructed = "true")]
+	Ping(MuxPingPackage),
 }
 
 /// Transport envelope wrapping all messages at the transport layer.
@@ -523,6 +555,7 @@ impl_mux_envelope_from! {
 	MuxCreditPackage => Credit,
 	MuxCancelPackage => Cancel,
 	GoAwayPackage => GoAway,
+	MuxPingPackage => Ping,
 }
 
 impl TransportEnvelope {
@@ -744,6 +777,16 @@ mod tests {
 
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
+	fn test_mux_ping_package_encode_decode() -> Result<(), Box<dyn Error>> {
+		assert_round_trip([
+			MuxPingPackage::new(false, 0),
+			MuxPingPackage::new(true, 1),
+			MuxPingPackage::new(false, u64::MAX),
+		])
+	}
+
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
 	fn test_go_away_package_encode_decode() -> Result<(), Box<dyn Error>> {
 		assert_round_trip([
 			GoAwayPackage::new(0, GoAwayReason::Shutdown),
@@ -814,6 +857,7 @@ mod tests {
 			TransportEnvelope::from(MuxCreditPackage::new(1, 128)),
 			TransportEnvelope::from(MuxCancelPackage::new(5, CancelReason::Cancelled)),
 			TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),
+			TransportEnvelope::from(MuxPingPackage::new(false, 7)),
 		])
 	}
 }

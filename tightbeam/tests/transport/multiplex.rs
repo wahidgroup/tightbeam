@@ -18,6 +18,9 @@
 //! - Stream-grammar violations: GoAway(ProtocolError)
 //! - Connection drop mid-emit: `ConnectionClosed`
 //! - Cleartext mux: interleaved echo and cancel-budget GoAway
+//! - Ping round-trip both directions without touching the handler
+//! - Ping probe answered with its ack on the wire, stale acks tolerated
+//! - Ping refused as `Draining` once GoAway is sent
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -56,7 +59,7 @@ mod negotiated {
 	use tightbeam::trace::TraceCollector;
 	use tightbeam::transport::envelopes::{
 		CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxCreditPackage, MuxDataPackage, MuxEndPackage,
-		MuxEnvelope, MuxOpenPackage,
+		MuxEnvelope, MuxOpenPackage, MuxPingPackage,
 	};
 	use tightbeam::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 	use tightbeam::transport::multiplex::{MuxHandle, MuxResponder, MuxRole, MuxTransport};
@@ -104,8 +107,10 @@ mod negotiated {
 				("mux_stream_grammar_violations_rejected", exactly!(1), equals!(true)),
 				("mux_connection_drop_mid_emit", exactly!(1), equals!(true)),
 				("mux_cleartext_interleaved_echo", exactly!(1), equals!(true)),
-				("mux_cleartext_cancel_budget", exactly!(1), equals!(true))
-
+				("mux_cleartext_cancel_budget", exactly!(1), equals!(true)),
+				("mux_ping_roundtrip", exactly!(1), equals!(true)),
+				("mux_ping_wire_ack", exactly!(1), equals!(true)),
+				("mux_ping_draining", exactly!(1), equals!(true))
 			]
 		}
 	}
@@ -133,6 +138,9 @@ mod negotiated {
 				mux_connection_drop_mid_emit(&trace).await?;
 				mux_cleartext_interleaved_echo(&trace).await?;
 				mux_cleartext_cancel_budget(&trace).await?;
+				mux_ping_roundtrip(&trace).await?;
+				mux_ping_wire_ack(&trace).await?;
+				mux_ping_draining(&trace).await?;
 				Ok(())
 			}
 		}
@@ -1056,6 +1064,83 @@ mod negotiated {
 
 		let ok = run_cancel_abuse(client_reader, client_writer, responder, cancel_budget).await?;
 		trace.event_with("mux_cleartext_cancel_budget", &[], ok)?;
+		Ok(())
+	}
+
+	/// Ping resolves in both directions and never invokes the handler.
+	/// The server-to-client probe is acked with no responder serving the
+	/// client side, proving the ack terminates in the reader driver.
+	async fn mux_ping_roundtrip(trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let pair = establish_mux_pair(4).await?;
+
+		let calls = Arc::new(AtomicU32::new(0));
+		let counter = Arc::clone(&calls);
+		let handler = move |frame: Arc<Frame>| {
+			counter.fetch_add(1, Ordering::SeqCst);
+			core::future::ready(echo_response(&frame))
+		};
+		let _server_serve = tokio::spawn(pair.server_responder.serve(handler));
+
+		let client_ping_ok = pair.client.handle.ping().await.is_ok();
+		let server_ping_ok = pair.server.handle.ping().await.is_ok();
+
+		let frame = mux_frame("mux-ping-alive");
+		let echoed = pair.client.handle.emit_on_stream(&frame).await?;
+		let handler_untouched = calls.load(Ordering::SeqCst) == 1;
+
+		let ok = client_ping_ok && server_ping_ok && is_echo(echoed, &frame) && handler_untouched;
+		trace.event_with("mux_ping_roundtrip", &[], ok)?;
+		Ok(())
+	}
+
+	/// A probe written on raw halves is answered with its ack, and an
+	/// unsolicited ack is discarded without tearing down the connection.
+	async fn mux_ping_wire_ack(trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let mut link = establish_client_mux_server_raw(4).await?;
+
+		let probe = MuxPingPackage::new(false, 42);
+		link.server_writer.write_envelope(probe.into()).await?;
+
+		let ack = link.server_reader.read_envelope().await?;
+		let ack_ok = matches!(
+			&ack,
+			TransportEnvelope::Mux(MuxEnvelope::Ping(package)) if package.ack() && package.opaque() == 42
+		);
+
+		let stray_ack = MuxPingPackage::new(true, 999);
+		link.server_writer.write_envelope(stray_ack.into()).await?;
+
+		let frame_followup = mux_frame("mux-ping-follow-up");
+		let followup_task = spawn_emit(&link.client.handle, frame_followup.clone());
+		let (followup_id, followup_message) = read_muxed_request(&mut link.server_reader).await?;
+		write_muxed_echo(&mut link.server_writer, followup_id, &followup_message).await?;
+		let echoed = await_ok(followup_task, "follow-up emit task must not panic").await?;
+
+		let ok = ack_ok && is_echo(echoed, &frame_followup);
+		trace.event_with("mux_ping_wire_ack", &[], ok)?;
+		Ok(())
+	}
+
+	/// Once GoAway is sent, new pings are refused as `Draining` while the
+	/// in-flight stream still drains to completion.
+	async fn mux_ping_draining(trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let pair = establish_mux_pair(4).await?;
+		let (started, release, _server_serve) = spawn_gated_echo(pair.server_responder);
+
+		let frame_inflight = mux_frame("mux-ping-inflight");
+		let inflight_task = spawn_emit(&pair.client.handle, frame_inflight.clone());
+		started.notified().await;
+
+		let shutdown_future = kick_shutdown(&pair.client.handle).await;
+		let refused = pair.client.handle.ping().await;
+		let refused_ok = matches!(refused, Err(TransportError::Draining));
+
+		release.notify_one();
+		let echoed = await_ok(inflight_task, "in-flight emit task must not panic").await?;
+		let drain_ok = is_echo(echoed, &frame_inflight);
+		shutdown_future.await?;
+
+		trace.event_with("mux_ping_draining", &[], refused_ok && drain_ok)?;
 		Ok(())
 	}
 
