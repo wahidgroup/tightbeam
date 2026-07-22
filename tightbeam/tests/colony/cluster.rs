@@ -28,7 +28,7 @@ use tightbeam::{
 		common::current_timestamp_ms,
 		hive::{
 			Hive, HiveConf, HiveTlsConfig, RegisterHiveRequest, RegisterHiveResponse, ServletAddressUpdate,
-			ServletAddressUpdateResponse, ServletInfo,
+			ServletAddressUpdateResponse, ServletBox, ServletInfo,
 		},
 		servlet::ServletConf,
 	},
@@ -382,6 +382,67 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			assert_ping_work_routes(&trace, &certs, &cluster).await?;
 			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+// ============================================================================
+// Environment Teardown
+// ============================================================================
+
+tb_assert_spec! {
+	pub ClusterTeardownSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(hive_registered, exactly!(1), equals!(1u64)),
+			(servlet_stopped, exactly!(1))
+		]
+	}
+}
+
+/// Records the teardown call instead of serving traffic: `stop_boxed` is
+/// the observable under test.
+struct StopProbeServlet {
+	trace: TraceCollector,
+}
+
+impl ServletBox for StopProbeServlet {
+	fn addr_bytes(&self) -> Vec<u8> {
+		b"127.0.0.1:0".to_vec()
+	}
+
+	fn stop_boxed(self: Box<Self>) {
+		let _ = self.trace.event(ClusterTeardownSpec::servlet_stopped);
+	}
+}
+
+// Environment teardown must run `Hive::stop`, which drains registered
+// servlets through `stop_boxed`. Plain drop only aborts control tasks.
+tb_scenario! {
+	name: cluster_env_teardown_stops_hive_servlets,
+	spec: ClusterTeardownSpec,
+	environment Cluster {
+		context: ClusterTestCerts::generate(),
+		start: |SetupEnv { context: certs, .. }| async move {
+			start_cluster(routing_cluster_conf(&certs, None)).await
+		},
+		hives: |SetupEnv { trace, context: certs }| vec![async move {
+			let mut hive = ClusterTestHive::new(Some(hive_tls_config(&certs)))?;
+			hive.register("probe", StopProbeServlet { trace: trace.share() }, |t| async move {
+				Ok(StopProbeServlet { trace: t.share() })
+			})?;
+			hive.establish(Arc::new(trace.share())).await?;
+
+			Ok::<_, TightBeamError>(hive)
+		}],
+		client: |ClusterEnv { trace, cluster, .. }| async move {
+			trace.event_with(ClusterTeardownSpec::hive_registered, &[], cluster.hive_count() as u64)?;
+
+			cluster.stop();
+
 			Ok(())
 		}
 	}

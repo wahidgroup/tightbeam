@@ -945,8 +945,11 @@ macro_rules! tb_scenario {
 		.await
 		.expect("Failed to start cluster");
 
+		// Type-erased as consuming closures because `Hive::stop(self)`
+		// needs the concrete type: plain drop only aborts control tasks
+		// and would leak registered servlets.
 		#[allow(unused_mut)]
-		let mut hive_handles: Vec<Box<dyn ::std::any::Any + Send>> = Vec::new();
+		let mut hive_stops: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
 		$(
 			let cluster_addr = cluster_instance.addr();
 			let hive_futures = ($hives_closure)($crate::testing::env::SetupEnv {
@@ -956,7 +959,7 @@ macro_rules! tb_scenario {
 			for hive_future in hive_futures {
 				let hive = hive_future.await.expect("Failed to start hive");
 				hive.register_with_cluster(cluster_addr).await.expect("Failed to register hive");
-				hive_handles.push(Box::new(hive));
+				hive_stops.push(Box::new(move || hive.stop()));
 			}
 		)?
 
@@ -972,7 +975,9 @@ macro_rules! tb_scenario {
 		)
 		.await;
 
-		drop(hive_handles);
+		for stop_hive in hive_stops {
+			stop_hive();
+		}
 
 		let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, client_result);
 		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, client_result);
