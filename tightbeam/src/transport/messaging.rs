@@ -21,6 +21,12 @@ use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::io::MessageIO;
 use crate::transport::TransportResult;
 
+#[cfg(all(
+	feature = "transport-policy",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use crate::TightBeamError;
+
 #[cfg(not(feature = "x509"))]
 use crate::transport::envelopes::RequestPackage;
 
@@ -31,6 +37,7 @@ mod x509 {
 	pub use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 	pub use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 	pub use crate::crypto::sign::Verifier;
+	pub use crate::der::Decode;
 	pub use crate::spki::EncodePublicKey;
 	pub use crate::transport::handshake::TcpHandshakeState;
 	pub use crate::transport::io::EncryptedMessageIO;
@@ -43,10 +50,13 @@ mod x509 {
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use x509::*;
 
-#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
-use crate::der::Decode;
 #[cfg(feature = "transport-policy")]
-use crate::transport::policy::{RestartPolicy, RetryAction};
+mod policy {
+	pub use crate::transport::policy::{RestartPolicy, RetryAction};
+}
+
+#[cfg(feature = "transport-policy")]
+use policy::*;
 
 /// Trait for transports that support custom response handlers
 pub trait ResponseHandler {
@@ -248,7 +258,7 @@ pub trait MessageEmitter: MessageIO {
 			TransportEnvelope::Request(_) => {
 				return Err(TransportError::InvalidMessage);
 			}
-			#[cfg(feature = "x509")]
+			#[cfg(any(feature = "x509", feature = "transport-multiplex"))]
 			_ => {
 				return Err(TransportError::InvalidMessage);
 			}
@@ -269,6 +279,21 @@ pub trait MessageEmitter: MessageIO {
 	}
 }
 
+/// Extract the application request frame from a lock-step envelope.
+fn lockstep_request_frame(envelope: TransportEnvelope) -> TransportResult<Arc<Frame>> {
+	match envelope {
+		TransportEnvelope::Request(msg) => Ok(msg.message),
+		TransportEnvelope::Response(_) => Err(TransportError::InvalidMessage),
+		#[cfg(feature = "x509")]
+		TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => Err(TransportError::InvalidMessage),
+		#[cfg(feature = "transport-multiplex")]
+		TransportEnvelope::MuxedRequest(_)
+		| TransportEnvelope::MuxedResponse(_)
+		| TransportEnvelope::MuxCancel(_)
+		| TransportEnvelope::GoAway(_) => Err(TransportError::InvalidMessage),
+	}
+}
+
 /// Message collector trait - receives TightBeam messages
 #[cfg(feature = "transport-policy")]
 pub trait MessageCollector: MessageIO {
@@ -283,18 +308,7 @@ pub trait MessageCollector: MessageIO {
 	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
 		// Read and decode the envelope (can be overridden for encryption)
 		let decoded_envelope = self.read_decoded_envelope().await?;
-		let request = match decoded_envelope {
-			TransportEnvelope::Request(msg) => msg.message,
-			TransportEnvelope::Response(_) => {
-				// Only requests are valid here
-				return Err(TransportError::InvalidMessage);
-			}
-			#[cfg(feature = "x509")]
-			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-				// Handshake messages not expected here
-				return Err(TransportError::InvalidMessage);
-			}
-		};
+		let request = lockstep_request_frame(decoded_envelope)?;
 
 		// Evaluate gate policy
 		let status = self.collector_gate().evaluate(&request);
@@ -318,18 +332,7 @@ pub trait MessageCollector: MessageIO {
 			None => return Ok(None), // Connection closed gracefully
 		};
 
-		let request = match decoded_envelope {
-			TransportEnvelope::Request(msg) => msg.message,
-			TransportEnvelope::Response(_) => {
-				// Only requests are valid here
-				return Err(TransportError::InvalidMessage);
-			}
-			#[cfg(feature = "x509")]
-			TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-				// Handshake messages not expected here
-				return Err(TransportError::InvalidMessage);
-			}
-		};
+		let request = lockstep_request_frame(decoded_envelope)?;
 
 		// Evaluate gate policy
 		let status = self.collector_gate().evaluate(&request);
@@ -493,10 +496,11 @@ where
 					TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
 						Ok(CollectStep::Handshake(envelope.to_der()?))
 					}
-					TransportEnvelope::Request(_) | TransportEnvelope::Response(_) => {
-						// Circuit breaker
+					// Circuit breaker: application traffic must never arrive
+					// cleartext once encryption is configured.
+					_ => {
 						transport.set_handshake_state(TcpHandshakeState::None);
-						transport.unset_symmetric_key();
+						transport.unset_session_keys();
 						Err(TransportError::MissingEncryption)
 					}
 				}
@@ -507,7 +511,7 @@ where
 		WireEnvelope::Encrypted(encrypted_info) => {
 			if transport.to_handshake_state() != TcpHandshakeState::Complete {
 				transport.set_handshake_state(TcpHandshakeState::None);
-				transport.unset_symmetric_key();
+				transport.unset_session_keys();
 				return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 			}
 
@@ -515,14 +519,14 @@ where
 				Ok(bytes) => bytes,
 				Err(_) => {
 					transport.set_handshake_state(TcpHandshakeState::None);
-					transport.unset_symmetric_key();
+					transport.unset_session_keys();
 					return Err(TransportError::OperationFailed(TransportFailure::EncryptionFailed));
 				}
 			};
 
 			let envelope = decrypted_bytes
 				.with(|bytes| T::decode_envelope(bytes))
-				.map_err(crate::error::TightBeamError::from)??;
+				.map_err(TightBeamError::from)??;
 
 			Ok(CollectStep::Envelope(envelope))
 		}
@@ -538,13 +542,7 @@ fn gate_collected_envelope<G>(gate: &G, envelope: TransportEnvelope) -> Transpor
 where
 	G: GatePolicy + ?Sized,
 {
-	let request = match envelope {
-		TransportEnvelope::Request(msg) => msg.message,
-		TransportEnvelope::Response(_) => return Err(TransportError::InvalidMessage),
-		TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => {
-			return Err(TransportError::InvalidMessage)
-		}
-	};
+	let request = lockstep_request_frame(envelope)?;
 
 	let status = gate.evaluate(&request);
 	if status == TransitStatus::Request {
@@ -568,7 +566,7 @@ pub trait MessageCollector: MessageIO {
 			TransportEnvelope::Response(_) => {
 				return Err(TransportError::InvalidMessage);
 			}
-			#[cfg(feature = "x509")]
+			#[cfg(any(feature = "x509", feature = "transport-multiplex"))]
 			_ => {
 				return Err(TransportError::InvalidMessage);
 			}
@@ -595,7 +593,7 @@ pub trait MessageCollector: MessageIO {
 			TransportEnvelope::Response(_) => {
 				return Err(TransportError::InvalidMessage);
 			}
-			#[cfg(feature = "x509")]
+			#[cfg(any(feature = "x509", feature = "transport-multiplex"))]
 			_ => {
 				return Err(TransportError::InvalidMessage);
 			}

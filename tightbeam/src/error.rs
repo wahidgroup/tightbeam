@@ -351,6 +351,28 @@ pub enum TightBeamError {
 	)]
 	InvalidNonceLength(ReceivedExpectedError<usize, usize>),
 
+	/// Send-direction AEAD counter nonce space exhausted
+	#[cfg(feature = "aead")]
+	#[cfg_attr(feature = "derive", error("AEAD counter nonce space exhausted"))]
+	NonceExhausted,
+
+	/// Send-direction AEAD record limit reached (RFC 8446 § 5.5)
+	#[cfg(feature = "aead")]
+	#[cfg_attr(
+		feature = "derive",
+		error("AEAD record limit reached: reestablish the session to rekey")
+	)]
+	RekeyRequired,
+
+	/// Received AEAD counter nonce is not the exact next in sequence
+	/// (replay, reorder, or deletion)
+	#[cfg(feature = "aead")]
+	#[cfg_attr(
+		feature = "derive",
+		error("Out-of-sequence AEAD nonce: expected {expected:?}, got {received:?}")
+	)]
+	NonceReplayed(ReceivedExpectedError<u64, u64>),
+
 	/// Missing Integrity Info
 	#[cfg(feature = "digest")]
 	#[cfg_attr(feature = "derive", error("Missing integrity info"))]
@@ -486,6 +508,20 @@ impl core::fmt::Display for TightBeamError {
 				write!(
 					f,
 					"Invalid AEAD nonce length: expected {:?}, got {:?}",
+					err.expected, err.received
+				)
+			}
+			#[cfg(feature = "aead")]
+			TightBeamError::NonceExhausted => write!(f, "AEAD counter nonce space exhausted"),
+			#[cfg(feature = "aead")]
+			TightBeamError::RekeyRequired => {
+				write!(f, "AEAD record limit reached: reestablish the session to rekey")
+			}
+			#[cfg(feature = "aead")]
+			TightBeamError::NonceReplayed(err) => {
+				write!(
+					f,
+					"Out-of-sequence AEAD nonce: expected {:?}, got {:?}",
 					err.expected, err.received
 				)
 			}

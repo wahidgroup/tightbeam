@@ -3,7 +3,7 @@ use crate::der::Enumerated;
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
-/// Syslog Severity (RFC 5424, Section 6.2.1)
+/// Syslog Severity (RFC 5424, § 6.2.1)
 /// See `<https://datatracker.ietf.org/doc/html/rfc5424#section-6.2.1>`
 /// Values: 0 (Emergency) .. 7 (Debug)
 #[derive(Enumerated, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]

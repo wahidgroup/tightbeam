@@ -13,9 +13,10 @@ use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::transport::error::{TransportError, TransportFailure};
 use crate::transport::{ResponsePackage, TransportEnvelope, TransportResult, WireEnvelope, WireMode};
+use crate::TightBeamError;
 
 #[cfg(feature = "x509")]
-use crate::crypto::aead::RuntimeAead;
+use crate::crypto::aead::SendCipher;
 
 #[derive(Debug)]
 pub(crate) enum EnvelopePayload {
@@ -38,7 +39,7 @@ impl EnvelopePayload {
 /// size validation and encryption logic.
 pub struct EnvelopeBuilder<'a> {
 	pub(crate) payload: EnvelopePayload,
-	pub(crate) encryptor: Option<&'a RuntimeAead>,
+	pub(crate) encryptor: Option<&'a SendCipher>,
 	pub(crate) max_cleartext_envelope: Option<usize>,
 	pub(crate) max_encrypted_envelope: Option<usize>,
 	pub(crate) wire_mode: WireMode,
@@ -111,7 +112,7 @@ impl<'a> EnvelopeBuilder<'a> {
 		Self::new(EnvelopePayload::Transport { envelope })
 	}
 
-	pub fn with_encryptor(mut self, encryptor: &'a RuntimeAead) -> Self {
+	pub fn with_encryptor(mut self, encryptor: &'a SendCipher) -> Self {
 		self.encryptor = Some(encryptor);
 		self
 	}
@@ -181,16 +182,22 @@ impl<'a> EnvelopeBuilder<'a> {
 	fn build_encrypted(
 		envelope: TransportEnvelope,
 		max_encrypted: Option<usize>,
-		encryptor: Option<&'a RuntimeAead>,
+		encryptor: Option<&'a SendCipher>,
 	) -> TransportResult<WireEnvelope> {
 		let (encoded, with_frame) = Self::encode_and_validate(&envelope, max_encrypted)?;
-		let nonce = crate::random::generate_nonce::<12>(None)
-			.map_err(|_| with_frame(TransportFailure::NonceGenerationFailed))?;
 
+		// The send cipher owns the counter nonce. No random nonce is drawn.
 		let encryptor = encryptor.ok_or_else(|| with_frame(TransportFailure::EncryptorUnavailable))?;
-		let encrypted = encryptor
-			.encrypt_content(&encoded, nonce, None)
-			.map_err(|_| with_frame(TransportFailure::EncryptionFailed))?;
+		let encrypted = encryptor.encrypt_next(&encoded, None).map_err(|error| {
+			// Rekey exhaustion stays distinguishable: the caller must
+			// reestablish the session, not retry the write.
+			let failure = match error {
+				#[cfg(feature = "aead")]
+				TightBeamError::RekeyRequired => TransportFailure::RekeyRequired,
+				_ => TransportFailure::EncryptionFailed,
+			};
+			with_frame(failure)
+		})?;
 
 		Ok(WireEnvelope::Encrypted(encrypted))
 	}

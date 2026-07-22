@@ -1,4 +1,4 @@
-.PHONY: help help-ref version setup check build clean test lint doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release check-yanked audit
+.PHONY: all help help-ref version setup check build clean test lint doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release check-yanked audit ci
 
 # Project metadata for help/version
 PROJECT := tightbeam
@@ -15,7 +15,9 @@ define PRINT_PAGER
 @{ $(1); } | less -FRX
 endef
 
-# Default target (prints help)
+# Default target
+all: setup clean build
+
 help:
 	$(call PRINT_PAGER,$(MAKE) help-body)
 
@@ -25,6 +27,7 @@ help-body:
 	@printf 'DESCRIPTION:\n'
 	@printf '    Build, lint, test, and document the %s workspace following POSIX/GNU CLI conventions.\n\n' '$(PROJECT)'
 	@printf 'TARGETS:\n'
+	@printf '    all             Default: setup, clean, then build\n'
 	@printf '    help            Show this help and exit\n'
 	@printf '    help-ref        Show reference documentation links\n'
 	@printf '    version         Show project version information\n'
@@ -40,6 +43,7 @@ help-body:
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
 	@printf '    lint            Run linters (fix mode via fix=1; extra clippy args via ARGS)\n'
 	@printf '    audit           Run security audit (RustSec cargo-audit)\n'
+	@printf '    ci              Lint + build + test-all\n'
 	@printf '    doc             Build documentation (all features)\n'
 	@printf '    release         Release both crates by default, prompting for each version (make release [--dry-run] [--allow-staged])\n'
 	@printf '                    Single crate: make release v0.7.0 single=1 (tightbeam) | make release v0.1.5 --derive (derive) | --yank\n'
@@ -172,6 +176,8 @@ lint:
 	$(FMT_CMD)
 	@echo "Clippy: cargo clippy --all-targets --all-features $(CLIPPY_MODE) $(ARGS) $(CLIPPY_DENY)"
 	cargo clippy --all-targets --all-features $(CLIPPY_MODE) $(ARGS) $(CLIPPY_DENY)
+
+ci: lint build test-all
 
 # Build documentation
 doc:

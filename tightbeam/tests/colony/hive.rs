@@ -132,7 +132,7 @@ tb_scenario! {
 }
 
 // ============================================================================
-// Gate Reply Shapes — fixtures / harness
+// Gate Reply Shapes - fixtures
 // ============================================================================
 
 /// Fresh heartbeat command (unique `issued_at_ms` per call site via clock).

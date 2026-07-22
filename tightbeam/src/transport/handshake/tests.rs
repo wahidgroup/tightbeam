@@ -9,15 +9,20 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::sync::Arc;
 
-#[cfg(feature = "std")]
+use core::time::Duration;
+use std::error::Error;
 use std::sync::Arc;
 
 use crate::asn1::OctetString;
+use crate::cms::cert::IssuerAndSerialNumber;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
+use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+use crate::crypto::policy::Secp256k1Policy;
 use crate::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
 use crate::crypto::sign::ecdsa::k256::{Secp256k1, SecretKey};
 use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
+use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use crate::der::asn1::BitString;
 use crate::der::asn1::GeneralizedTime;
 use crate::der::asn1::ObjectIdentifier;
@@ -26,7 +31,7 @@ use crate::oids::{
 	AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA256, SIGNER_ECDSA_WITH_SHA3_256,
 	SIGNER_ECDSA_WITH_SHA3_512,
 };
-use crate::random::OsRng;
+use crate::random::{generate_nonce, OsRng};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::negotiation::SecurityAccept;
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake};
@@ -34,7 +39,7 @@ use crate::x509::serial_number::SerialNumber;
 use crate::x509::time::Time;
 use crate::x509::time::Validity;
 use crate::x509::Certificate;
-use crate::x509::{name::RdnSequence, TbsCertificate};
+use crate::x509::{name::RdnSequence, TbsCertificate, Version};
 
 #[cfg(feature = "transport-ecies")]
 mod ecies {
@@ -101,27 +106,23 @@ pub fn create_test_certificate() -> TestCertificate {
 ///
 /// This creates a certificate using the provided signing key, ensuring the
 /// certificate's public key matches the private key.
-pub fn create_test_certificate_from_key(
-	signing_key: &Secp256k1SigningKey,
-) -> Result<Certificate, Box<dyn std::error::Error>> {
+pub fn create_test_certificate_from_key(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn Error>> {
 	create_test_certificate_inner(signing_key)
 }
 
 /// Internal function to create a certificate from a signing key.
-fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn std::error::Error>> {
+fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Certificate, Box<dyn Error>> {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key.to_public_key_der()?;
 
 	let tbs_cert = TbsCertificate {
-		version: crate::x509::Version::V3,
+		version: Version::V3,
 		serial_number: SerialNumber::new(&[1])?,
 		signature: AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA256, parameters: None },
 		issuer: RdnSequence::default(),
 		validity: Validity {
-			not_before: Time::GeneralTime(GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(0))?),
-			not_after: Time::GeneralTime(GeneralizedTime::from_unix_duration(core::time::Duration::from_secs(
-				u32::MAX as u64,
-			))?),
+			not_before: Time::GeneralTime(GeneralizedTime::from_unix_duration(Duration::from_secs(0))?),
+			not_after: Time::GeneralTime(GeneralizedTime::from_unix_duration(Duration::from_secs(u32::MAX as u64))?),
 		},
 		subject: RdnSequence::default(),
 		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())?,
@@ -141,10 +142,10 @@ fn create_test_certificate_inner(signing_key: &Secp256k1SigningKey) -> Result<Ce
 ///
 /// Creates cryptographically random values for client random, server random,
 /// and base session key, then computes the transcript hash.
-pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn std::error::Error>> {
-	let client_random = crate::random::generate_nonce::<32>(None)?;
-	let server_random = crate::random::generate_nonce::<32>(None)?;
-	let base_session_key = crate::random::generate_nonce::<32>(None)?;
+pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn Error>> {
+	let client_random = generate_nonce::<32>(None)?;
+	let server_random = generate_nonce::<32>(None)?;
+	let base_session_key = generate_nonce::<32>(None)?;
 
 	let transcript_hash = compute_test_transcript_hash(&client_random, &server_random, &[], &[]);
 
@@ -159,8 +160,6 @@ pub fn compute_test_transcript_hash(
 	spki_bytes: &[u8],
 	accept_der: &[u8],
 ) -> [u8; 32] {
-	use crate::crypto::hash::{Digest, Sha3_256};
-
 	let mut data = Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len());
 	data.extend_from_slice(client_hello);
 	data.extend_from_slice(server_random);
@@ -175,8 +174,12 @@ pub fn compute_test_transcript_hash(
 }
 
 /// Create a test ClientHello message with the given client random.
-pub fn create_test_client_hello(client_random: &[u8; 32]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-	let client_hello = ClientHello { client_random: OctetString::new(*client_random)?, security_offer: None };
+pub fn create_test_client_hello(client_random: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {
+	let client_hello = ClientHello {
+		client_random: OctetString::new(*client_random)?,
+		security_offer: None,
+		transport_offer: None,
+	};
 	Ok(client_hello.to_der()?)
 }
 
@@ -185,20 +188,21 @@ pub fn create_test_server_handshake(
 	certificate: &Certificate,
 	server_random: &[u8; 32],
 	signature: &[u8],
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, Box<dyn Error>> {
 	let server_handshake = ServerHandshake {
 		certificate: certificate.clone(),
 		server_random: OctetString::new(*server_random)?,
 		signature: OctetString::new(signature)?,
 		security_accept: Some(SecurityAccept::new(create_default_test_profile())),
 		client_cert_required: false,
+		transport_accept: None,
 	};
 
 	Ok(server_handshake.to_der()?)
 }
 
 /// Create a test ClientKeyExchange message with the given encrypted data.
-pub fn create_test_client_key_exchange(encrypted_data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub fn create_test_client_key_exchange(encrypted_data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
 	let client_kex = ClientKeyExchange {
 		encrypted_data: OctetString::new(encrypted_data)?,
 		#[cfg(feature = "x509")]
@@ -248,7 +252,7 @@ pub fn create_test_keypair() -> (
 
 /// Create test User Keying Material (UKM) for key agreement.
 pub fn create_test_ukm() -> UserKeyingMaterial {
-	let ukm_bytes = crate::random::generate_nonce::<64>(None).expect("UKM generation should succeed");
+	let ukm_bytes = generate_nonce::<64>(None).expect("UKM generation should succeed");
 	UserKeyingMaterial::new(ukm_bytes.to_vec()).expect("UKM creation should succeed")
 }
 
@@ -257,7 +261,7 @@ pub fn create_test_recipient_id() -> KeyAgreeRecipientIdentifier {
 	use x509_cert::name::Name;
 	use x509_cert::serial_number::SerialNumber;
 
-	KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(crate::cms::cert::IssuerAndSerialNumber {
+	KeyAgreeRecipientIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
 		issuer: Name::default(),
 		serial_number: SerialNumber::new(&[0x01]).expect("Serial number creation should succeed"),
 	})
@@ -272,8 +276,8 @@ pub fn create_test_key_enc_alg() -> AlgorithmIdentifierOwned {
 ///
 /// This is a convenience function for tests and simple use cases where
 /// you want to quickly wrap a signing key in a KeyProvider trait object.
-pub fn into_provider(signing_key: Secp256k1SigningKey) -> std::sync::Arc<dyn SigningKeyProvider> {
-	std::sync::Arc::new(Secp256k1KeyProvider::from(signing_key))
+pub fn into_provider(signing_key: Secp256k1SigningKey) -> Arc<dyn SigningKeyProvider> {
+	Arc::new(Secp256k1KeyProvider::from(signing_key))
 }
 
 // ============================================================================
@@ -314,13 +318,13 @@ impl TestEciesServerBuilder {
 	}
 
 	/// Build the ECIES handshake server.
-	pub fn build(self) -> Result<EciesHandshakeServer<DefaultCryptoProvider>, Box<dyn std::error::Error>> {
+	pub fn build(self) -> Result<EciesHandshakeServer<DefaultCryptoProvider>, Box<dyn Error>> {
 		let test_cert_data = if let Some(cert) = self.cert {
 			let key = self.key.unwrap_or_else(|| create_test_certificate().signing_key);
 			TestCertificate { signing_key: key, certificate: cert }
 		} else {
 			self.key
-				.map(|key| -> Result<TestCertificate, Box<dyn std::error::Error>> {
+				.map(|key| -> Result<TestCertificate, Box<dyn Error>> {
 					let cert = create_test_certificate_from_key(&key)?;
 					Ok(TestCertificate { signing_key: key, certificate: cert })
 				})
@@ -489,11 +493,7 @@ impl TestCmsClientBuilder {
 	///
 	/// A trust store pinning the server certificate is attached
 	/// automatically: the client fails closed without one.
-	pub fn build(self) -> Result<CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn std::error::Error>> {
-		use crate::crypto::hash::Sha3_256;
-		use crate::crypto::policy::Secp256k1Policy;
-		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-
+	pub fn build(self) -> Result<CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn Error>> {
 		let client_key = self.client_key.unwrap_or_else(|| create_test_certificate().signing_key);
 		let server_cert = match self.server_cert {
 			Some(cert) => cert,

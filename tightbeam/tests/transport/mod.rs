@@ -3,5 +3,8 @@
 mod connection_pool;
 mod connection_reuse;
 mod loopback;
+mod multiplex;
 mod mutual_auth;
 mod negotiation;
+mod split;
+pub(crate) mod support;

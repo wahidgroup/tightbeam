@@ -6,14 +6,11 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-use core::future::Future;
-use core::pin::Pin;
-
 use crate::cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
 use crate::cms::signed_data::{CertificateSet, EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
-use crate::crypto::aead::KeyInit;
+use crate::crypto::aead::{KeyInit, SessionKeys};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfile, SecurityProfileDesc};
@@ -22,21 +19,32 @@ use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, T
 use crate::crypto::sign::elliptic_curve::{AffinePoint, PublicKey, SecretKey};
 use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier};
 use crate::crypto::x509::store::CertificateTrust;
-use crate::crypto::x509::utils::validate_certificate_expiry;
+use crate::crypto::x509::utils::{
+	compute_signer_identifier, compute_signer_identifier_from_der, validate_certificate_expiry,
+};
 use crate::crypto::x509::Certificate;
 use crate::der::asn1::OctetString;
 use crate::der::oid::AssociatedOid;
-use crate::der::{Decode, Encode};
+use crate::der::{Any, Decode, Encode};
+use crate::oids::{DATA, HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_TRANSPORT_ACCEPT};
 use crate::random::{generate_nonce, CryptoRngCore, OsRng, RngWrapper};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
+use crate::transport::handshake::attributes::{
+	encode_security_offer, encode_transport_offer, extract_security_accept, extract_transport_accept,
+	security_accept_transcript_bytes, transport_accept_transcript_bytes, HandshakeAttribute,
+};
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
+use crate::transport::handshake::negotiation::{
+	client_mux_settings, MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
+};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
 use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
 use crate::transport::handshake::{Arc, ClientHandshakeProtocol, HandshakeAlertHandler, HandshakeFinalization};
+use crate::utils::marker::MaybeSendFuture;
+use crate::zeroize::Zeroizing;
 
 /// Client-side CMS handshake orchestrator.
 ///
@@ -61,6 +69,8 @@ where
 	transcript_buffer: Vec<u8>,
 	session_key: Option<Secret<Vec<u8>>>,
 	security_offer: Option<SecurityOffer>,
+	transport_offer: Option<TransportOffer>,
+	mux_settings: Option<MuxSettings>,
 	selected_profile: Option<SecurityProfileDesc>,
 	provider: P,
 	trust_store: Option<Arc<dyn CertificateTrust>>,
@@ -123,6 +133,8 @@ where
 			transcript_buffer: Vec::new(),
 			session_key: None,
 			security_offer: None,
+			transport_offer: None,
+			mux_settings: None,
 			selected_profile: None,
 			provider,
 			trust_store: None,
@@ -172,6 +184,16 @@ where
 	#[must_use]
 	pub fn with_security_offer(mut self, offer: SecurityOffer) -> Self {
 		self.security_offer = Some(offer);
+		self
+	}
+
+	/// Configures the transport capability offer (multiplexing).
+	///
+	/// When configured, the offer travels as an unprotected attribute in the
+	/// key exchange. The server answers with a transport accept attribute.
+	#[must_use]
+	pub fn with_transport_offer(mut self, offer: TransportOffer) -> Self {
+		self.transport_offer = Some(offer);
 		self
 	}
 
@@ -273,9 +295,7 @@ where
 
 	/// Compute the signer identifier from the server's verifying key.
 	fn compute_signer_identifier(&self, verifying_key: &P::VerifyingKey) -> Result<SignerIdentifier, HandshakeError> {
-		Ok(crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(
-			verifying_key,
-		)?)
+		Ok(compute_signer_identifier::<P::Digest, _>(verifying_key)?)
 	}
 
 	/// Compute transcript hash from the accumulated buffer.
@@ -363,16 +383,23 @@ where
 		// 1. Validation
 		self.validate_expected_state(ClientHandshakeState::KeyExchangeSent)?;
 
-		// 2. Extract the server's SecurityAccept before hashing: the accept
-		//    bytes are part of the signed transcript, so the hash must cover
-		//    them to match the server's (CWE-345). A tampered attribute
-		//    diverges the hashes and fails signature verification below.
+		// 2. Extract the server's SecurityAccept and TransportAccept before
+		//    hashing: the accept bytes are part of the signed transcript, so
+		//    the hash must cover them to match the server's (CWE-345). A
+		//    tampered attribute diverges the hashes and fails signature
+		//    verification below.
 		let accept = extract_security_accept_attr(signed_data_der)?;
+		let transport_accept = extract_transport_accept_attr(signed_data_der)?;
 		if self.transcript_hash.is_none() {
 			if let Some(ref accept) = accept {
-				let accept_bytes = crate::transport::handshake::attributes::security_accept_transcript_bytes(accept)?;
+				let accept_bytes = security_accept_transcript_bytes(accept)?;
 				self.transcript_buffer.extend_from_slice(&accept_bytes);
 			}
+			if let Some(ref accept) = transport_accept {
+				let accept_bytes = transport_accept_transcript_bytes(accept)?;
+				self.transcript_buffer.extend_from_slice(&accept_bytes);
+			}
+
 			self.transcript_hash = Some(self.compute_transcript_hash()?);
 		}
 
@@ -384,8 +411,9 @@ where
 		let verified_content =
 			self.verify_signature(signed_data_der, server_verifying_key, expected_signer_identifier)?;
 
-		// 5. Validate the selection against our own offer and store it
+		// 5. Validate the selections against our own offers and store them
 		self.apply_security_accept(accept)?;
+		self.mux_settings = client_mux_settings(self.transport_offer.as_ref(), transport_accept.as_ref())?;
 
 		// 6. Add server finished to transcript AFTER verification
 		self.transcript_buffer.extend_from_slice(signed_data_der);
@@ -522,7 +550,6 @@ where
 		let key_wrap_oid =
 			<P::Profile as SecurityProfile>::KEY_WRAP_OID.ok_or(HandshakeError::MissingKeyWrapAlgorithm)?;
 		let key_enc_alg = AlgorithmIdentifierOwned { oid: key_wrap_oid, parameters: None };
-
 		let kari_builder = TightBeamKariBuilder::new(self.provider)
 			.with_sender_priv(sender_ephemeral)
 			.with_sender_pub_spki(sender_pub_spki)
@@ -545,7 +572,12 @@ where
 
 		// Add SecurityOffer as unprotected attribute if configured
 		if let Some(ref offer) = self.security_offer {
-			let offer_attr = crate::transport::handshake::attributes::encode_security_offer(offer)?;
+			let offer_attr = encode_security_offer(offer)?;
+			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
+		}
+		// Add TransportOffer as unprotected attribute if configured
+		if let Some(ref offer) = self.transport_offer {
+			let offer_attr = encode_transport_offer(offer)?;
 			enveloped_builder = enveloped_builder.with_unprotected_attr(offer_attr);
 		}
 
@@ -595,8 +627,6 @@ where
 	async fn build_finished_crypto_components(
 		&self,
 	) -> Result<(SignerIdentifier, AlgorithmIdentifierOwned, AlgorithmIdentifierOwned), HandshakeError> {
-		use crate::crypto::x509::utils::compute_signer_identifier_from_der;
-
 		let public_key_bytes = self.client_key_provider.to_public_key_bytes().await?;
 		let signer_id = compute_signer_identifier_from_der::<P::Digest>(&public_key_bytes)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
@@ -629,9 +659,8 @@ where
 
 		let octet_string = OctetString::new(transcript_hash)?;
 		let econtent_der = octet_string.to_der()?;
-		let econtent_any = crate::der::Any::from_der(&econtent_der)?;
-		let encap_content_info =
-			EncapsulatedContentInfo { econtent_type: crate::oids::DATA, econtent: Some(econtent_any) };
+		let econtent_any = Any::from_der(&econtent_der)?;
+		let encap_content_info = EncapsulatedContentInfo { econtent_type: DATA, econtent: Some(econtent_any) };
 
 		let certificates = self
 			.client_certificate
@@ -672,10 +701,28 @@ fn extract_security_accept_attr(signed_data_der: &[u8]) -> Result<Option<Securit
 		.iter()
 		.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref())
 		.flat_map(|attrs| attrs.iter())
-		.find(|attr| attr.oid == crate::oids::HANDSHAKE_SECURITY_ACCEPT)
+		.find(|attr| attr.oid == HANDSHAKE_SECURITY_ACCEPT)
 		.map(|attr| {
-			let handshake_attr = crate::transport::handshake::attributes::HandshakeAttribute::from(attr);
-			crate::transport::handshake::attributes::extract_security_accept(&handshake_attr)
+			let handshake_attr = HandshakeAttribute::from(attr);
+			extract_security_accept(&handshake_attr)
+		})
+		.transpose()
+}
+
+/// Extract the server's `TransportAccept` from a Finished message's unsigned
+/// attributes, if present.
+fn extract_transport_accept_attr(signed_data_der: &[u8]) -> Result<Option<TransportAccept>, HandshakeError> {
+	let signed_data = SignedData::from_der(signed_data_der)?;
+	signed_data
+		.signer_infos
+		.0
+		.iter()
+		.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref())
+		.flat_map(|attrs| attrs.iter())
+		.find(|attr| attr.oid == HANDSHAKE_TRANSPORT_ACCEPT)
+		.map(|attr| {
+			let handshake_attr = HandshakeAttribute::from(attr);
+			extract_transport_accept(&handshake_attr)
 		})
 		.transpose()
 }
@@ -713,19 +760,16 @@ where
 {
 	type Error = HandshakeError;
 
-	fn start<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Self::Error>> + Send + 'a>> {
+	fn start<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<Vec<u8>, Self::Error>> {
 		Box::pin(async move {
 			// Fresh random session key per handshake: a constant key
 			// would make every session trivially decryptable (CWE-321).
-			let session_key = crate::zeroize::Zeroizing::new(generate_nonce::<32>(None)?);
+			let session_key = Zeroizing::new(generate_nonce::<32>(None)?);
 			self.build_key_exchange(session_key.to_vec(), None)
 		})
 	}
 
-	fn handle_response<'a, 'b>(
-		&'a mut self,
-		msg: &'b [u8],
-	) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	fn handle_response<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
 	where
 		'b: 'a,
 	{
@@ -740,9 +784,7 @@ where
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(
-		&'a mut self,
-	) -> Pin<Box<dyn Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>> {
+	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
 		Box::pin(async move {
 			// 1. Validate state
 			if self.state.state() != ClientHandshakeState::ClientFinishedSent {
@@ -755,14 +797,18 @@ where
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 			let transcript_hash = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
-			// 3. Derive final session key as P::AeadCipher
-			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, &transcript_hash))??;
+			// 3. Derive directional session keys as P::AeadCipher
+			let ciphers = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, &transcript_hash))??;
 
 			// 4. Transition to complete
 			self.state.transition(ClientHandshakeState::Completed)?;
 
-			// 5. Wrap cipher in RuntimeAead with negotiated OID
-			Ok(crate::crypto::aead::RuntimeAead::new(cipher, aead_oid))
+			// 5. Role-map the directional ciphers with the negotiated OID
+			Ok(SessionKeys::for_client(
+				ciphers.client_to_server,
+				ciphers.server_to_client,
+				aead_oid,
+			))
 		})
 	}
 
@@ -773,24 +819,44 @@ where
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
+
+	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		self.mux_settings
+	}
 }
 
 #[cfg(test)]
 mod tests {
+	use std::error::Error;
+	use std::sync::Arc;
+
+	use super::{extract_security_accept_attr, CmsHandshakeClient};
 	use crate::cms::enveloped_data::EnvelopedData;
+	use crate::crypto::hash::Sha3_256;
+	use crate::crypto::policy::Secp256k1Policy;
 	use crate::crypto::profiles::DefaultCryptoProvider;
+	use crate::crypto::secret::ToInsecure;
+	use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
 	use crate::crypto::sign::elliptic_curve::SecretKey;
+	use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+	use crate::der::asn1::SetOfVec;
 	use crate::der::{Decode, Encode};
-	use crate::oids::{HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+	use crate::oids::{HANDSHAKE_SECURITY_ACCEPT, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+	use crate::random::OsRng;
 	use crate::spki::AlgorithmIdentifierOwned;
+	use crate::testing::utils::create_test_certificate_chain;
+	use crate::transport::handshake::attributes::encode_security_accept;
 	use crate::transport::handshake::builders::TightBeamSignedDataBuilder;
 	use crate::transport::handshake::error::HandshakeError;
+	use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
 	use crate::transport::handshake::processors::{TightBeamEnvelopedDataProcessor, TightBeamKariRecipient};
 	use crate::transport::handshake::state::ClientHandshakeState;
 	use crate::transport::handshake::tests::*;
+	use crate::x509::attr::{Attribute, Attributes};
+	use crate::x509::Certificate;
 
 	#[tokio::test]
-	async fn test_client_state_flow() -> Result<(), Box<dyn std::error::Error>> {
+	async fn test_client_state_flow() -> Result<(), Box<dyn Error>> {
 		// Given: A CMS client in init state with a server certificate
 		let transcript_hash = [1u8; 32];
 		let server_test_cert = create_test_certificate();
@@ -815,7 +881,7 @@ mod tests {
 		let kari_processor = TightBeamKariRecipient::new(provider, server_secret);
 		let processor = TightBeamEnvelopedDataProcessor::<DefaultCryptoProvider>::new(kari_processor);
 		let decrypted = processor.process(&enveloped_data)?;
-		let decrypted = crate::crypto::secret::ToInsecure::to_insecure(decrypted)?;
+		let decrypted = ToInsecure::to_insecure(decrypted)?;
 		assert_eq!(&decrypted[..], &session_key[..]);
 
 		// When: Client processes server Finished
@@ -848,16 +914,13 @@ mod tests {
 	/// A client without a trust store must abort instead of degrading to
 	/// expiry-only server authentication (CWE-295).
 	#[test]
-	fn test_missing_trust_store_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+	fn test_missing_trust_store_fails_closed() -> Result<(), Box<dyn Error>> {
 		let server_cert = create_test_certificate().certificate;
 		let test_cert = create_test_certificate();
-		let server_cert = std::sync::Arc::new(server_cert);
+		let server_cert = Arc::new(server_cert);
 		let provider = into_provider(test_cert.signing_key);
-		let mut client = super::CmsHandshakeClient::<DefaultCryptoProvider>::new(
-			DefaultCryptoProvider::default(),
-			provider,
-			server_cert,
-		);
+		let mut client =
+			CmsHandshakeClient::<DefaultCryptoProvider>::new(DefaultCryptoProvider::default(), provider, server_cert);
 
 		let result = client.build_key_exchange(vec![2u8; 32], None);
 		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
@@ -865,20 +928,16 @@ mod tests {
 	}
 
 	fn chain_client(
-		chain: std::sync::Arc<[crate::x509::Certificate]>,
-		store_root: Option<crate::x509::Certificate>,
-	) -> Result<super::CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn std::error::Error>> {
-		use crate::crypto::hash::Sha3_256;
-		use crate::crypto::policy::Secp256k1Policy;
-		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-
+		chain: Arc<[Certificate]>,
+		store_root: Option<Certificate>,
+	) -> Result<CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn Error>> {
 		let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
 		if let Some(root) = store_root {
 			builder = builder.with_certificate(root)?;
 		}
 
-		let store: std::sync::Arc<dyn CertificateTrust> = std::sync::Arc::new(builder.build());
-		let client = super::CmsHandshakeClient::<DefaultCryptoProvider>::from_chain(
+		let store: Arc<dyn CertificateTrust> = Arc::new(builder.build());
+		let client = CmsHandshakeClient::<DefaultCryptoProvider>::from_chain(
 			DefaultCryptoProvider::default(),
 			into_provider(create_test_certificate().signing_key),
 			chain,
@@ -891,10 +950,10 @@ mod tests {
 	/// A chain-provisioned client path-validates the chain and encrypts to
 	/// its leaf; no separate pinned certificate is needed.
 	#[test]
-	fn from_chain_validates_and_targets_leaf() -> Result<(), Box<dyn std::error::Error>> {
-		let chain = crate::testing::utils::create_test_certificate_chain()?;
+	fn from_chain_validates_and_targets_leaf() -> Result<(), Box<dyn Error>> {
+		let chain = create_test_certificate_chain()?;
 		let mut client = chain_client(
-			std::sync::Arc::from(vec![chain.root.clone(), chain.intermediate, chain.leaf.clone()]),
+			Arc::from(vec![chain.root.clone(), chain.intermediate, chain.leaf.clone()]),
 			Some(chain.root),
 		)?;
 
@@ -905,9 +964,9 @@ mod tests {
 	}
 
 	#[test]
-	fn from_chain_rejects_untrusted_chain() -> Result<(), Box<dyn std::error::Error>> {
-		let chain = crate::testing::utils::create_test_certificate_chain()?;
-		let mut client = chain_client(std::sync::Arc::from(vec![chain.root, chain.intermediate, chain.leaf]), None)?;
+	fn from_chain_rejects_untrusted_chain() -> Result<(), Box<dyn Error>> {
+		let chain = create_test_certificate_chain()?;
+		let mut client = chain_client(Arc::from(vec![chain.root, chain.intermediate, chain.leaf]), None)?;
 
 		let result = client.build_key_exchange(vec![2u8; 32], None);
 		assert!(matches!(result, Err(HandshakeError::CertificateValidationError(_))));
@@ -918,24 +977,20 @@ mod tests {
 	/// leaf is a configuration mismatch, distinct from a re-handshake
 	/// identity violation.
 	#[test]
-	fn pinned_certificate_mismatch_rejected() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::crypto::hash::Sha3_256;
-		use crate::crypto::policy::Secp256k1Policy;
-		use crate::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
-
-		let chain = crate::testing::utils::create_test_certificate_chain()?;
-		let store: std::sync::Arc<dyn CertificateTrust> = std::sync::Arc::new(
+	fn pinned_certificate_mismatch_rejected() -> Result<(), Box<dyn Error>> {
+		let chain = create_test_certificate_chain()?;
+		let store: Arc<dyn CertificateTrust> = Arc::new(
 			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
 				.with_certificate(chain.root.clone())?
 				.build(),
 		);
-		let pinned = std::sync::Arc::new(create_test_certificate().certificate);
-		let mut client = super::CmsHandshakeClient::<DefaultCryptoProvider>::new(
+		let pinned = Arc::new(create_test_certificate().certificate);
+		let mut client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
 			DefaultCryptoProvider::default(),
 			into_provider(create_test_certificate().signing_key),
 			pinned,
 		)
-		.with_server_certificate_chain(std::sync::Arc::from(vec![chain.root, chain.intermediate, chain.leaf]))
+		.with_server_certificate_chain(Arc::from(vec![chain.root, chain.intermediate, chain.leaf]))
 		.with_trust_store(store);
 
 		let result = client.build_key_exchange(vec![2u8; 32], None);
@@ -944,9 +999,9 @@ mod tests {
 	}
 
 	#[test]
-	fn from_chain_rejects_empty_chain() -> Result<(), Box<dyn std::error::Error>> {
-		let chain = crate::testing::utils::create_test_certificate_chain()?;
-		let mut client = chain_client(std::sync::Arc::from(Vec::new()), Some(chain.root))?;
+	fn from_chain_rejects_empty_chain() -> Result<(), Box<dyn Error>> {
+		let chain = create_test_certificate_chain()?;
+		let mut client = chain_client(Arc::from(Vec::new()), Some(chain.root))?;
 
 		let result = client.build_key_exchange(vec![2u8; 32], None);
 		assert!(matches!(result, Err(HandshakeError::MissingServerCertificate)));
@@ -954,7 +1009,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
+	async fn test_invalid_state_transitions() -> Result<(), Box<dyn Error>> {
 		// Given: A CMS client in init state
 		let mut client = TestCmsClientBuilder::new().build()?;
 
@@ -970,19 +1025,13 @@ mod tests {
 	}
 
 	#[test]
-	fn test_process_security_accept_rejects_unoffered_profile() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::crypto::sign::ecdsa::Secp256k1SigningKey;
-		use crate::oids::{HANDSHAKE_SECURITY_ACCEPT, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
-		use crate::transport::handshake::attributes::encode_security_accept;
-		use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer};
-		use crate::x509::attr::{Attribute, Attributes};
-
+	fn test_process_security_accept_rejects_unoffered_profile() -> Result<(), Box<dyn Error>> {
 		let offered = create_default_test_profile();
 		let mut unoffered = create_default_test_profile();
 		unoffered.aead_key_size = Some(16);
 
-		let build_finished_with_accept = |profile| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-			let signing_key = Secp256k1SigningKey::random(&mut crate::random::OsRng);
+		let build_finished_with_accept = |profile| -> Result<Vec<u8>, Box<dyn Error>> {
+			let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 			let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
 			let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
 			let builder =
@@ -992,7 +1041,7 @@ mod tests {
 			let accept_attr = encode_security_accept(&SecurityAccept::new(profile))?;
 			let x509_attr = Attribute {
 				oid: HANDSHAKE_SECURITY_ACCEPT,
-				values: crate::der::asn1::SetOfVec::try_from(accept_attr.attr_values)?,
+				values: SetOfVec::try_from(accept_attr.attr_values)?,
 			};
 
 			let attrs = Attributes::try_from(vec![x509_attr])?;
@@ -1008,11 +1057,11 @@ mod tests {
 		let mut client = TestCmsClientBuilder::new().build()?.with_security_offer(offer);
 
 		let accepted = build_finished_with_accept(offered)?;
-		client.apply_security_accept(super::extract_security_accept_attr(&accepted)?)?;
+		client.apply_security_accept(extract_security_accept_attr(&accepted)?)?;
 		assert_eq!(client.selected_profile, Some(offered));
 
 		let rejected = build_finished_with_accept(unoffered)?;
-		let attrs = super::extract_security_accept_attr(&rejected)?;
+		let attrs = extract_security_accept_attr(&rejected)?;
 		let result = client.apply_security_accept(attrs);
 		assert!(matches!(result, Err(HandshakeError::InvalidProfileSelection)));
 

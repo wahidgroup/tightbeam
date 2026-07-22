@@ -19,33 +19,38 @@ use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EnvelopedData, OriginatorIdentifierOrKey, RecipientInfo};
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo};
 use crate::constants::TIGHTBEAM_KARI_KDF_INFO;
-use crate::crypto::aead::{Decryptor, KeyInit};
+use crate::crypto::aead::{aes_kw, Decryptor, KeyInit, SessionKeys};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::hash::Digest;
 use crate::crypto::key::SigningKeyProvider;
 use crate::crypto::profiles::{CryptoProvider, SecurityProfileDesc};
-use crate::crypto::secret::Secret;
+use crate::crypto::secret::{Secret, ToInsecure};
 use crate::crypto::sign::elliptic_curve::sec1::{FromEncodedPoint, ModulusSize, ToEncodedPoint};
 use crate::crypto::sign::elliptic_curve::{AffinePoint, Curve, CurveArithmetic, PublicKey};
 use crate::crypto::sign::{EcdsaSignatureVerifier, SignatureAlgorithmIdentifier, Verifier};
 use crate::crypto::x509::policy::CertificateValidation;
-use crate::der::asn1::OctetString;
+use crate::crypto::x509::utils::{compute_signer_identifier, compute_signer_identifier_from_der};
+use crate::der::asn1::{OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
-use crate::der::{Decode, Encode};
-use crate::oids;
+use crate::der::{Any, Decode, Encode};
+use crate::oids::{self, DATA};
 use crate::spki::AlgorithmIdentifierOwned;
 use crate::spki::EncodePublicKey;
 use crate::transport::handshake::attributes;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::kari::{derive_kek, key_wrap_key_size, unwrap_with_kek, wrap_with_kek};
-use crate::transport::handshake::negotiation::{ProfileStrengthPolicy, SecurityAccept};
+use crate::transport::handshake::negotiation::{
+	accept_transport, server_mux_settings, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept,
+	TransportAccept, TransportOffer,
+};
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::{compute_transcript_digest, extract_verifying_key_from_cert, validate_state};
 use crate::transport::handshake::ServerHandshakeProtocol;
 use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
-use crate::x509::attr::Attributes;
+use crate::utils::marker::MaybeSendFuture;
+use crate::x509::attr::{Attribute, Attributes};
 use crate::x509::Certificate;
 
 /// Server-side CMS handshake orchestrator.
@@ -74,6 +79,9 @@ where
 	supported_profiles: Vec<SecurityProfileDesc>,
 	strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	selected_profile: Option<SecurityProfileDesc>,
+	transport_config: Option<TransportOffer>,
+	transport_accept: Option<TransportAccept>,
+	mux_settings: Option<MuxSettings>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	invariants: HandshakeInvariant,
 	_phantom: PhantomData<P>,
@@ -110,6 +118,9 @@ where
 			supported_profiles: Vec::new(),
 			strength_policy: None, // Defaults to DefaultStrengthFloor
 			selected_profile: None,
+			transport_config: None,
+			transport_accept: None,
+			mux_settings: None,
 			client_validators,
 			invariants: { HandshakeInvariant::default() },
 			_phantom: PhantomData,
@@ -146,6 +157,14 @@ where
 	#[must_use]
 	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
 		self.strength_policy = Some(policy);
+		self
+	}
+
+	/// Enable transport multiplexing with the given local advertisement.
+	/// Multiplexing activates only when the client also offers it.
+	#[must_use]
+	pub fn with_transport_config(mut self, config: TransportOffer) -> Self {
+		self.transport_config = Some(config);
 		self
 	}
 
@@ -228,6 +247,26 @@ where
 		Ok(())
 	}
 
+	/// Process the client's TransportOffer attribute, if present.
+	///
+	/// Multiplexing activates only when the client offered it AND it is
+	/// locally enabled. Otherwise the connection stays lock-step.
+	fn process_transport_offer(&mut self, unprotected_attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
+		let offer = unprotected_attrs.and_then(|attrs| {
+			let handshake_attrs = self.convert_to_handshake_attributes(attrs).ok()?;
+			let offer_attr = attributes::find(&handshake_attrs, &oids::HANDSHAKE_TRANSPORT_OFFER).ok()?;
+
+			attributes::extract_transport_offer(offer_attr).ok()
+		});
+
+		self.transport_accept = accept_transport(offer.as_ref(), self.transport_config.as_ref());
+		if let (Some(offer), Some(accept)) = (offer.as_ref(), self.transport_accept.as_ref()) {
+			self.mux_settings = Some(server_mux_settings(offer, accept));
+		}
+
+		Ok(())
+	}
+
 	/// Convert Attributes to HandshakeAttribute format.
 	fn convert_to_handshake_attributes(
 		&self,
@@ -261,9 +300,7 @@ where
 		&self,
 		client_verifying_key: &P::VerifyingKey,
 	) -> Result<SignerIdentifier, HandshakeError> {
-		Ok(crate::crypto::x509::utils::compute_signer_identifier::<P::Digest, _>(
-			client_verifying_key,
-		)?)
+		Ok(compute_signer_identifier::<P::Digest, _>(client_verifying_key)?)
 	}
 
 	/// Verify the signature and content of the SignedData.
@@ -298,8 +335,6 @@ where
 	/// 3. Decrypt encrypted content using CEK
 	/// 4. Store the session key securely
 	async fn decrypt_session_key(&mut self, enveloped_data_der: &[u8]) -> Result<(), HandshakeError> {
-		use crate::crypto::secret::ToInsecure;
-
 		let enveloped_data = EnvelopedData::from_der(enveloped_data_der)?;
 		let kari = enveloped_data
 			.recip_infos
@@ -337,9 +372,7 @@ where
 		let valid = rewrapped.as_slice() == wrapped_key;
 
 		if !valid {
-			return Err(HandshakeError::AesKeyWrap(
-				crate::crypto::aead::aes_kw::Error::IntegrityCheckFailed,
-			));
+			return Err(HandshakeError::AesKeyWrap(aes_kw::Error::IntegrityCheckFailed));
 		}
 
 		// Decrypt session key from encrypted content
@@ -385,6 +418,9 @@ where
 		// 6. Process SecurityOffer and perform profile negotiation
 		self.process_security_offer(enveloped_data.unprotected_attrs.as_ref())?;
 
+		// 6b. Process TransportOffer and negotiate multiplexing
+		self.process_transport_offer(enveloped_data.unprotected_attrs.as_ref())?;
+
 		// 7. Decrypt and store session key
 		self.decrypt_session_key(enveloped_data_der).await?;
 
@@ -406,8 +442,9 @@ where
 
 	/// Prepare transcript hash and compute digest for signing.
 	///
-	/// The negotiated `SecurityAccept` is appended to the transcript before
-	/// hashing so the Finished signature binds the profile selection (CWE-345).
+	/// The negotiated `SecurityAccept` and `TransportAccept` are appended to
+	/// the transcript before hashing so the Finished signature binds both
+	/// selections (CWE-345).
 	fn prepare_server_finished_digest(&mut self) -> Result<Vec<u8>, HandshakeError> {
 		// Compute transcript hash if not already set
 		if self.transcript_hash.is_none() {
@@ -415,6 +452,11 @@ where
 				let accept_bytes = attributes::security_accept_transcript_bytes(&SecurityAccept::new(profile))?;
 				self.transcript_buffer.extend_from_slice(&accept_bytes);
 			}
+			if let Some(ref accept) = self.transport_accept {
+				let accept_bytes = attributes::transport_accept_transcript_bytes(accept)?;
+				self.transcript_buffer.extend_from_slice(&accept_bytes);
+			}
+
 			self.transcript_hash = Some(self.compute_transcript_hash()?);
 		}
 
@@ -437,8 +479,6 @@ where
 	async fn build_server_finished_crypto_components(
 		&self,
 	) -> Result<(SignerIdentifier, AlgorithmIdentifierOwned, AlgorithmIdentifierOwned), HandshakeError> {
-		use crate::crypto::x509::utils::compute_signer_identifier_from_der;
-
 		let public_key_bytes = self.server_key_provider.to_public_key_bytes().await?;
 		let signer_id = compute_signer_identifier_from_der::<P::Digest>(&public_key_bytes)?;
 		let digest_alg = AlgorithmIdentifierOwned { oid: P::Digest::OID, parameters: None };
@@ -447,24 +487,32 @@ where
 		Ok((signer_id, digest_alg, signature_alg))
 	}
 
-	/// Build the SecurityAccept unsigned attribute for the server Finished.
+	/// Build the SecurityAccept and TransportAccept unsigned attributes for
+	/// the server Finished.
 	///
-	/// Advisory like TLS ServerHello extensions pre-Finished: the attribute is
-	/// unauthenticated, but tampering yields a client-side profile/key mismatch
-	/// and the handshake fails closed.
+	/// Advisory like TLS ServerHello extensions pre-Finished: the attributes
+	/// are unauthenticated, but tampering yields a client-side transcript
+	/// mismatch and the handshake fails closed.
 	fn build_security_accept_attrs(&self) -> Result<Option<Attributes>, HandshakeError> {
-		let profile = match self.selected_profile {
-			Some(profile) => profile,
-			None => return Ok(None),
-		};
+		let mut x509_attrs = Vec::new();
 
-		let accept_attr = attributes::encode_security_accept(&SecurityAccept::new(profile))?;
-		let x509_attr = crate::x509::attr::Attribute {
-			oid: accept_attr.attr_type,
-			values: crate::der::asn1::SetOfVec::try_from(accept_attr.attr_values)?,
-		};
+		if let Some(profile) = self.selected_profile {
+			let accept_attr = attributes::encode_security_accept(&SecurityAccept::new(profile))?;
+			x509_attrs
+				.push(Attribute { oid: accept_attr.attr_type, values: SetOfVec::try_from(accept_attr.attr_values)? });
+		}
 
-		Ok(Some(Attributes::try_from(vec![x509_attr])?))
+		if let Some(ref accept) = self.transport_accept {
+			let accept_attr = attributes::encode_transport_accept(accept)?;
+			x509_attrs
+				.push(Attribute { oid: accept_attr.attr_type, values: SetOfVec::try_from(accept_attr.attr_values)? });
+		}
+
+		if x509_attrs.is_empty() {
+			return Ok(None);
+		}
+
+		Ok(Some(Attributes::try_from(x509_attrs)?))
 	}
 
 	/// Build the complete SignedData structure.
@@ -488,9 +536,8 @@ where
 
 		let octet_string = OctetString::new(transcript_hash)?;
 		let econtent_der = octet_string.to_der()?;
-		let econtent_any = crate::der::Any::from_der(&econtent_der)?;
-		let encap_content_info =
-			EncapsulatedContentInfo { econtent_type: crate::oids::DATA, econtent: Some(econtent_any) };
+		let econtent_any = Any::from_der(&econtent_der)?;
+		let encap_content_info = EncapsulatedContentInfo { econtent_type: DATA, econtent: Some(econtent_any) };
 
 		let signed_data = SignedData {
 			version: CmsVersion::V1,
@@ -644,7 +691,7 @@ where
 			return policy.as_ref();
 		}
 
-		&crate::transport::handshake::negotiation::DefaultStrengthFloor
+		&DefaultStrengthFloor
 	}
 }
 
@@ -676,10 +723,7 @@ where
 {
 	type Error = HandshakeError;
 
-	fn handle_request<'a, 'b>(
-		&'a mut self,
-		msg: &'b [u8],
-	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	fn handle_request<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
 	where
 		'b: 'a,
 	{
@@ -703,11 +747,7 @@ where
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(
-		&'a mut self,
-	) -> core::pin::Pin<
-		Box<dyn core::future::Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>,
-	> {
+	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
 		Box::pin(async move {
 			// 1. Validate state
 			if self.state.state() != ServerHandshakeState::ClientFinishedReceived {
@@ -719,16 +759,18 @@ where
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
-			// 3. Derive final session key as P::AeadCipher using transcript hash as salt
-			use crate::transport::handshake::HandshakeFinalization;
 			let transcript = self.transcript_hash.as_ref().ok_or(HandshakeError::InvalidTranscriptHash)?;
-			let cipher = cek.with(|key_bytes| self.derive_session_aead(key_bytes, transcript))??;
+			let ciphers = cek.with(|key_bytes| self.derive_directional_aead(key_bytes, transcript))??;
 
 			// 4. Transition to complete
 			self.state.transition(ServerHandshakeState::Completed)?;
 
-			// 5. Wrap cipher in RuntimeAead with negotiated OID
-			Ok(crate::crypto::aead::RuntimeAead::new(cipher, aead_oid))
+			// 5. Role-map the directional ciphers with the negotiated OID
+			Ok(SessionKeys::for_server(
+				ciphers.client_to_server,
+				ciphers.server_to_client,
+				aead_oid,
+			))
 		})
 	}
 
@@ -744,11 +786,17 @@ where
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
+
+	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		self.mux_settings
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	mod server {
+		use std::error::Error;
+
 		use super::super::*;
 		use crate::cms::cert::IssuerAndSerialNumber;
 		use crate::cms::enveloped_data::{KeyAgreeRecipientIdentifier, UserKeyingMaterial};
@@ -769,13 +817,14 @@ mod tests {
 			TightBeamEnvelopedDataBuilder, TightBeamKariBuilder, TightBeamSignedDataBuilder,
 		};
 		use crate::transport::handshake::tests::*;
+		use crate::TightBeamError;
 
 		/// Test the full server state flow through a complete handshake.
 		///
 		/// Verifies that the server correctly transitions through all states:
 		/// Init -> KeyExchangeReceived -> ServerFinishedSent -> ClientFinishedReceived -> Complete
 		#[tokio::test]
-		async fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
+		async fn test_server_state_flow() -> Result<(), Box<dyn Error>> {
 			let transcript_hash = [1u8; 32];
 			let (mut server, server_public_key) =
 				TestCmsServerBuilder::new().with_transcript_hash(transcript_hash).build();
@@ -815,7 +864,7 @@ mod tests {
 		///
 		/// Verifies that operations fail when called in the wrong state.
 		#[tokio::test]
-		async fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
+		async fn test_invalid_state_transitions() -> Result<(), Box<dyn Error>> {
 			let (mut server, _) = TestCmsServerBuilder::new().build();
 			// Cannot build server finished before processing key exchange
 			assert!(server.build_server_finished().await.is_err());
@@ -830,7 +879,7 @@ mod tests {
 		/// Verifies that when the client doesn't send an explicit offer, the server
 		/// selects a profile from its configured list and completes the handshake.
 		#[tokio::test]
-		async fn test_cms_end_to_end_with_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
+		async fn test_cms_end_to_end_with_profile_negotiation() -> Result<(), Box<dyn Error>> {
 			let transcript_hash = [1u8; 32];
 			let (mut server, server_public_key) =
 				TestCmsServerBuilder::new().with_transcript_hash(transcript_hash).build();
@@ -856,7 +905,7 @@ mod tests {
 
 			// Verify a profile was selected (dealer's choice)
 			let Some(selected) = server.selected_profile.as_ref() else {
-				return Err(crate::error::TightBeamError::MissingConfiguration.into());
+				return Err(TightBeamError::MissingConfiguration.into());
 			};
 			assert!(selected.aead.is_some()); // Must have selected an AEAD
 
@@ -884,7 +933,7 @@ mod tests {
 		fn build_test_key_exchange(
 			recipient_public_key: &PublicKey<k256::Secp256k1>,
 			session_key: &[u8],
-		) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+		) -> Result<Vec<u8>, Box<dyn Error>> {
 			let sender_ephemeral = SecretKey::<k256::Secp256k1>::random(&mut OsRng);
 			let sender_public = sender_ephemeral.public_key();
 			let sender_pub_spki = sender_public.to_public_key_der()?;
@@ -917,7 +966,7 @@ mod tests {
 		fn build_test_client_finished(
 			signing_key: &Secp256k1SigningKey,
 			transcript_hash: &[u8],
-		) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+		) -> Result<Vec<u8>, Box<dyn Error>> {
 			let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
 			let signature_alg = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
 			let builder =

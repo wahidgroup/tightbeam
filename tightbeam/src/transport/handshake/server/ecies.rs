@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::asn1::OctetString;
 use crate::constants::{TIGHTBEAM_AAD_DOMAIN_TAG, TIGHTBEAM_ECIES_KDF_INFO};
-use crate::crypto::aead::{Aead, AeadCore, KeyInit, Nonce, Payload};
+use crate::crypto::aead::{Aead, AeadCore, KeyInit, Nonce, Payload, SessionKeys};
 use crate::crypto::common::{typenum::Unsigned, KeySizeUser};
 use crate::crypto::ecies::EciesError;
 use crate::crypto::ecies::EciesMessageOps;
@@ -34,7 +34,10 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
-use crate::transport::handshake::negotiation::{ProfileStrengthPolicy, SecurityAccept};
+use crate::transport::handshake::negotiation::{
+	accept_transport, server_mux_settings, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept,
+	TransportAccept, TransportOffer,
+};
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
 use crate::transport::handshake::utils::{
@@ -42,7 +45,10 @@ use crate::transport::handshake::utils::{
 	octet_string_to_32_byte_array, validate_state,
 };
 use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeProtocol};
-use crate::transport::handshake::{HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
+use crate::transport::handshake::{
+	DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation,
+};
+use crate::utils::marker::MaybeSendFuture;
 use crate::x509::Certificate;
 use crate::zeroize::Zeroizing;
 
@@ -70,6 +76,8 @@ where
 	supported_profiles: Vec<SecurityProfileDesc>,
 	strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	selected_profile: Option<SecurityProfileDesc>,
+	transport_config: Option<TransportOffer>,
+	mux_settings: Option<MuxSettings>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	validated_client_cert: Option<Arc<Certificate>>,
 	_phantom: PhantomData<P>,
@@ -107,6 +115,8 @@ where
 			supported_profiles: Vec::new(), // Must be set via with_supported_profiles()
 			strength_policy: None,          // Defaults to DefaultStrengthFloor
 			selected_profile: None,
+			transport_config: None,
+			mux_settings: None,
 			client_validators,
 			validated_client_cert: None,
 			_phantom: PhantomData,
@@ -129,6 +139,13 @@ where
 		self
 	}
 
+	/// Enable transport multiplexing with the given local advertisement.
+	/// Multiplexing activates only when the client also offers it.
+	pub fn with_transport_config(mut self, config: TransportOffer) -> Self {
+		self.transport_config = Some(config);
+		self
+	}
+
 	/// Process ClientHello and build ServerHandshake message.
 	///
 	/// # Parameters
@@ -148,6 +165,13 @@ where
 		self.selected_profile = Some(selected);
 		let security_accept = SecurityAccept::new(selected);
 
+		// 3b. Transport capability negotiation: mux activates only when
+		// offered AND locally enabled.
+		let transport_accept = accept_transport(client_hello.transport_offer.as_ref(), self.transport_config.as_ref());
+		if let (Some(offer), Some(accept)) = (client_hello.transport_offer.as_ref(), transport_accept.as_ref()) {
+			self.mux_settings = Some(server_mux_settings(offer, accept));
+		}
+
 		// 4. Extract and store client random
 		let client_random = octet_string_to_32_byte_array(&client_hello.client_random)?;
 		self.client_random = Some(client_random);
@@ -163,12 +187,21 @@ where
 			.subject_public_key
 			.raw_bytes();
 
-		// Bind the full ClientHello DER (offer included) and the
-		// negotiated profile into the transcript so tampering with either
-		// invalidates the server signature.
+		// Bind the full ClientHello DER (offers included), the negotiated
+		// profile, and the transport accept into the transcript so
+		// tampering with any of them invalidates the server signature.
 		let accept_der = security_accept.to_der()?;
-		let transcript_digest =
-			self.compute_transcript_hash(client_hello_der, &server_random, spki_bytes, &accept_der)?;
+		let transport_accept_der = match &transport_accept {
+			Some(accept) => accept.to_der()?,
+			None => Vec::new(),
+		};
+		let transcript_digest = self.compute_transcript_hash(
+			client_hello_der,
+			&server_random,
+			spki_bytes,
+			&accept_der,
+			&transport_accept_der,
+		)?;
 		self.transcript_hash = Some(transcript_digest);
 		self.invariants.lock_transcript()?;
 
@@ -177,7 +210,7 @@ where
 
 		// 8. Build and encode ServerHandshake
 		let server_handshake_der =
-			self.build_server_handshake(server_random, signature_bytes, Some(security_accept))?;
+			self.build_server_handshake(server_random, signature_bytes, Some(security_accept), transport_accept)?;
 
 		// 9. Transition state through ServerHelloReceived to ServerHelloSent
 		self.state.transition(ServerHandshakeState::ClientHelloReceived)?;
@@ -232,11 +265,11 @@ where
 		Ok(())
 	}
 
-	/// Complete the handshake and derive the final session key.
+	/// Complete the handshake and derive the directional session keys.
 	///
 	/// # Returns
-	/// AEAD cipher session key from the provider
-	pub fn complete(&mut self) -> Result<P::AeadCipher, HandshakeError> {
+	/// Client-to-server and server-to-client AEAD ciphers from the provider
+	pub fn complete(&mut self) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError> {
 		// 1. Validate current state is KeyExchangeReceived
 		self.validate_expected_state(ServerHandshakeState::KeyExchangeReceived)?;
 
@@ -245,11 +278,12 @@ where
 		let client_random = self.client_random.as_ref().ok_or(HandshakeError::MissingClientRandomState)?;
 		let server_random = self.server_random.as_ref().ok_or(HandshakeError::MissingServerRandom)?;
 
-		// 3. Derive final session key using trait finalization (client_random || server_random)
+		// 3. Derive final session keys using trait finalization (client_random || server_random)
 		let mut salt = Zeroizing::new([0u8; 64]);
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
-		let session_key = self.derive_session_aead(base_session_key, salt.as_slice())?;
+
+		let session_ciphers = self.derive_directional_aead(base_session_key, salt.as_slice())?;
 		self.invariants.derive_aead_once()?;
 
 		// 4. Transition to complete state
@@ -258,7 +292,7 @@ where
 		// 5. Clear sensitive data
 		self.clear_sensitive_data();
 
-		Ok(session_key)
+		Ok(session_ciphers)
 	}
 
 	/// Get the current handshake state.
@@ -284,12 +318,16 @@ where
 		server_random: &[u8; 32],
 		spki_bytes: &[u8],
 		accept_der: &[u8],
+		transport_accept_der: &[u8],
 	) -> Result<[u8; 32], HandshakeError> {
-		let mut data = Vec::with_capacity(client_hello.len() + 32 + spki_bytes.len() + accept_der.len());
+		let mut data = Vec::with_capacity(
+			client_hello.len() + 32 + spki_bytes.len() + accept_der.len() + transport_accept_der.len(),
+		);
 		data.extend_from_slice(client_hello);
 		data.extend_from_slice(server_random);
 		data.extend_from_slice(spki_bytes);
 		data.extend_from_slice(accept_der);
+		data.extend_from_slice(transport_accept_der);
 		compute_transcript_digest::<P::Digest>(&data)
 	}
 
@@ -318,6 +356,7 @@ where
 		server_random: [u8; 32],
 		signature_bytes: Vec<u8>,
 		security_accept: Option<SecurityAccept>,
+		transport_accept: Option<TransportAccept>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		let server_handshake = ServerHandshake {
 			certificate: Certificate::clone(&self.server_cert),
@@ -325,6 +364,7 @@ where
 			signature: OctetString::new(signature_bytes)?,
 			security_accept,
 			client_cert_required: self.client_validators.is_some(),
+			transport_accept,
 		};
 
 		Ok(server_handshake.to_der()?)
@@ -395,11 +435,7 @@ where
 
 	fn verify_client_random(&self, client_random_from_payload: &[u8; 32]) -> Result<(), HandshakeError> {
 		let expected_client_random = self.client_random.ok_or(HandshakeError::MissingClientRandom)?;
-
-		core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 		let is_equal: bool = client_random_from_payload.ct_eq(&expected_client_random).into();
-		core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-
 		if !is_equal {
 			Err(HandshakeError::ClientRandomMismatchReplay)
 		} else {
@@ -488,7 +524,7 @@ where
 			return policy.as_ref();
 		}
 
-		&crate::transport::handshake::negotiation::DefaultStrengthFloor
+		&DefaultStrengthFloor
 	}
 }
 
@@ -520,10 +556,7 @@ where
 {
 	type Error = HandshakeError;
 
-	fn handle_request<'a, 'b>(
-		&'a mut self,
-		msg: &'b [u8],
-	) -> core::pin::Pin<Box<dyn core::future::Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send + 'a>>
+	fn handle_request<'a, 'b>(&'a mut self, msg: &'b [u8]) -> MaybeSendFuture<'a, Result<Option<Vec<u8>>, Self::Error>>
 	where
 		'b: 'a,
 	{
@@ -546,21 +579,21 @@ where
 	}
 
 	#[cfg(feature = "aead")]
-	fn complete<'a>(
-		&'a mut self,
-	) -> core::pin::Pin<
-		Box<dyn core::future::Future<Output = Result<crate::crypto::aead::RuntimeAead, Self::Error>> + Send + 'a>,
-	> {
+	fn complete<'a>(&'a mut self) -> MaybeSendFuture<'a, Result<SessionKeys, Self::Error>> {
 		Box::pin(async move {
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
 
 			// Delegate to the inherent method: single source of truth for state
 			// validation, AEAD derivation, invariants, and cleanup.
-			let cipher = EciesHandshakeServer::complete(self)?;
+			let ciphers = EciesHandshakeServer::complete(self)?;
 
-			// Wrap cipher in RuntimeAead with negotiated OID
-			Ok(crate::crypto::aead::RuntimeAead::new(cipher, aead_oid))
+			// Role-map the directional ciphers with the negotiated OID
+			Ok(SessionKeys::for_server(
+				ciphers.client_to_server,
+				ciphers.server_to_client,
+				aead_oid,
+			))
 		})
 	}
 
@@ -576,23 +609,44 @@ where
 	fn selected_profile(&self) -> Option<SecurityProfileDesc> {
 		self.selected_profile
 	}
+
+	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		self.mux_settings
+	}
 }
 
 #[cfg(test)]
 mod tests {
+	use std::error::Error;
+
 	use super::*;
+	use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
+	use crate::crypto::ecies::{encrypt, Secp256k1EciesMessage};
 	use crate::crypto::profiles::SecurityProfileDesc;
-	use crate::random::OsRng;
+	use crate::random::{generate_nonce, OsRng};
 	use crate::transport::handshake::negotiation::{select_profile, SecurityOffer};
 	use crate::transport::handshake::tests::*;
 
 	fn create_test_client_hello_with_offer(
 		client_random: &[u8; 32],
 		offer: Option<SecurityOffer>,
-	) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+	) -> Result<Vec<u8>, Box<dyn Error>> {
 		let client_hello = ClientHello {
-			client_random: crate::asn1::OctetString::new(*client_random)?,
+			client_random: OctetString::new(*client_random)?,
 			security_offer: offer,
+			transport_offer: None,
+		};
+		Ok(client_hello.to_der()?)
+	}
+
+	fn create_test_client_hello_with_transport_offer(
+		client_random: &[u8; 32],
+		transport_offer: Option<TransportOffer>,
+	) -> Result<Vec<u8>, Box<dyn Error>> {
+		let client_hello = ClientHello {
+			client_random: OctetString::new(*client_random)?,
+			security_offer: None,
+			transport_offer,
 		};
 		Ok(client_hello.to_der()?)
 	}
@@ -602,15 +656,14 @@ mod tests {
 	/// Verifies that the server correctly transitions through all states:
 	/// Init -> ServerHelloSent -> KeyExchangeReceived -> Complete
 	#[tokio::test]
-	async fn test_server_state_flow() -> Result<(), Box<dyn std::error::Error>> {
+	async fn test_server_state_flow() -> Result<(), Box<dyn Error>> {
 		let mut server = TestEciesServerBuilder::new().build()?;
 		assert_eq!(server.state(), ServerHandshakeState::Init);
 
 		// Process ClientHello
-		let client_random = crate::random::generate_nonce::<32>(None)?;
+		let client_random = generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
 		let server_handshake_der = server.process_client_hello(&client_hello_der).await?;
-
 		assert_eq!(server.state(), ServerHandshakeState::ServerHelloSent);
 		assert!(server.client_random.is_some());
 		assert!(server.server_random.is_some());
@@ -637,7 +690,7 @@ mod tests {
 	///
 	/// Verifies that operations fail when called in the wrong state.
 	#[tokio::test]
-	async fn test_invalid_state_transitions() -> Result<(), Box<dyn std::error::Error>> {
+	async fn test_invalid_state_transitions() -> Result<(), Box<dyn Error>> {
 		let mut server = TestEciesServerBuilder::new().build()?;
 		// Cannot process client key exchange before client hello
 		assert!(server.process_client_key_exchange(&[]).await.is_err());
@@ -645,7 +698,7 @@ mod tests {
 		assert!(server.complete().is_err());
 
 		// Process client hello to advance state
-		let client_random = crate::random::generate_nonce::<32>(None)?;
+		let client_random = generate_nonce::<32>(None)?;
 		let client_hello_der = create_test_client_hello(&client_random)?;
 		server.process_client_hello(&client_hello_der).await?;
 		// Cannot process client hello again
@@ -669,7 +722,7 @@ mod tests {
 	/// Verifies that the server correctly handles both explicit client offers
 	/// and dealer's choice mode when no offer is present.
 	#[tokio::test]
-	async fn test_profile_negotiation() -> Result<(), Box<dyn std::error::Error>> {
+	async fn test_profile_negotiation() -> Result<(), Box<dyn Error>> {
 		use crate::oids::{
 			AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256, HASH_SHA3_384, HASH_SHA3_512,
 			SIGNER_ECDSA_WITH_SHA3_512,
@@ -725,6 +778,71 @@ mod tests {
 		Ok(())
 	}
 
+	/// ClientHello with only a transport offer (no security offer) must
+	/// round-trip: the context tag on transport_offer prevents it from being
+	/// misparsed as the preceding optional SEQUENCE.
+	#[test]
+	fn test_client_hello_transport_offer_round_trip() -> Result<(), Box<dyn Error>> {
+		let hello_der = create_test_client_hello_with_transport_offer(&[7u8; 32], Some(TransportOffer::mux(16)))?;
+		let decoded = ClientHello::from_der(&hello_der)?;
+
+		assert_eq!(decoded.security_offer, None);
+		assert_eq!(decoded.transport_offer, Some(TransportOffer::mux(16)));
+		Ok(())
+	}
+
+	/// Transport negotiation modes: mux activates only when offered AND
+	/// locally enabled. Every other combination stays lock-step.
+	#[tokio::test]
+	async fn test_transport_negotiation() -> Result<(), Box<dyn Error>> {
+		// Offered and locally enabled: negotiated with directional caps
+		{
+			let mut server = TestEciesServerBuilder::new()
+				.build()?
+				.with_transport_config(TransportOffer::mux(4));
+			let client_hello_der =
+				create_test_client_hello_with_transport_offer(&[0u8; 32], Some(TransportOffer::mux(8)))?;
+			let response_der = server.process_client_hello(&client_hello_der).await?;
+
+			let response = ServerHandshake::from_der(&response_der)?;
+			assert_eq!(
+				response.transport_accept,
+				Some(TransportAccept { mux: true, max_peer_initiated_streams: 4 })
+			);
+			assert_eq!(
+				server.mux_settings,
+				Some(MuxSettings { local_initiated_cap: 8, peer_initiated_cap: 4 })
+			);
+		}
+
+		// Offered but not locally enabled: lock-step
+		{
+			let mut server = TestEciesServerBuilder::new().build()?;
+			let client_hello_der =
+				create_test_client_hello_with_transport_offer(&[1u8; 32], Some(TransportOffer::mux(8)))?;
+			let response_der = server.process_client_hello(&client_hello_der).await?;
+
+			let response = ServerHandshake::from_der(&response_der)?;
+			assert_eq!(response.transport_accept, None);
+			assert_eq!(server.mux_settings, None);
+		}
+
+		// Locally enabled but not offered: lock-step
+		{
+			let mut server = TestEciesServerBuilder::new()
+				.build()?
+				.with_transport_config(TransportOffer::mux(4));
+			let client_hello_der = create_test_client_hello_with_transport_offer(&[2u8; 32], None)?;
+			let response_der = server.process_client_hello(&client_hello_der).await?;
+
+			let response = ServerHandshake::from_der(&response_der)?;
+			assert_eq!(response.transport_accept, None);
+			assert_eq!(server.mux_settings, None);
+		}
+
+		Ok(())
+	}
+
 	// ========================================================================
 	// Test Helper Functions
 	// ========================================================================
@@ -733,15 +851,11 @@ mod tests {
 	///
 	/// Extracts the server's public key and stored client random, then creates
 	/// a properly encrypted payload containing [session_key || client_random].
-	fn build_test_client_key_exchange<P>(
-		server: &EciesHandshakeServer<P>,
-	) -> Result<Vec<u8>, Box<dyn std::error::Error>>
+	fn build_test_client_key_exchange<P>(server: &EciesHandshakeServer<P>) -> Result<Vec<u8>, Box<dyn Error>>
 	where
 		P: CryptoProvider,
 		P::AeadCipher: KeyInit,
 	{
-		use crate::crypto::ecies::encrypt;
-
 		// Extract server's public key from certificate
 		let server_pubkey = k256::PublicKey::from_sec1_bytes(
 			server
@@ -754,7 +868,7 @@ mod tests {
 
 		// Use the stored client_random from the server
 		let stored_client_random = server.client_random.ok_or("Missing client random")?;
-		let base_session_key = crate::random::generate_nonce::<32>(None)?;
+		let base_session_key = generate_nonce::<32>(None)?;
 
 		// Build plaintext: [session_key || client_random]
 		let mut plaintext = [0u8; 64];
@@ -762,9 +876,9 @@ mod tests {
 		plaintext[32..].copy_from_slice(&stored_client_random);
 
 		// Use server's AAD domain tag (or default if None)
-		let aad = server.aad_domain_tag.or(Some(crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG));
+		let aad = server.aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG));
 		// Encrypt with ECIES
-		let encrypted_message = encrypt::<_, _, _, crate::crypto::ecies::Secp256k1EciesMessage, P::Kdf, P::AeadCipher>(
+		let encrypted_message = encrypt::<_, _, _, Secp256k1EciesMessage, P::Kdf, P::AeadCipher>(
 			&server_pubkey,
 			&plaintext,
 			aad,

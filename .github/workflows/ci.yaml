@@ -6,23 +6,25 @@ on:
     branches:
       - master
     tags:
-      - 'v*'
+      - "v*"
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
+  ci:
+    name: CI
+    runs-on: ubuntu-latest-l
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
-      - name: Run linters
-        run: make lint
+      - name: Setup
+        run: make setup
+      - name: CI
+        run: make ci
 
   msrv:
     name: MSRV
@@ -44,14 +46,3 @@ jobs:
           cargo +${{ steps.msrv.outputs.version }} update
       - name: Check workspace on MSRV
         run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-features
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest-l
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-rust
-      - name: Run tests
-        run: make test-all
