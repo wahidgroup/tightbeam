@@ -80,7 +80,7 @@ tb_scenario! {
 	spec: ManualEventSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("pipeline_start")?;
+			trace.event(ManualEventSpec::pipeline_start)?;
 
 			// Direct Result pipeline (no PipelineBuilder = no auto-trace)
 			let _frame = CreateTestFrame::run(("test-001".to_string(), "content".to_string()))
@@ -88,7 +88,7 @@ tb_scenario! {
 				.and_then(|f| TransformContent::run((f,)))
 				.run()?;
 
-			trace.event("pipeline_complete")?;
+			trace.event(ManualEventSpec::pipeline_complete)?;
 			Ok(())
 		}
 	}
@@ -189,7 +189,7 @@ tb_scenario! {
 			// Pipeline with fallback on error
 			let failing: Result<Frame, TightBeamError> = Err(TightBeamError::InvalidOrder);
 			let _frame = failing.or_else(|_| {
-				trace.event("fallback_triggered")?;
+				trace.event(FallbackSpec::fallback_triggered)?;
 				compose! {
 					V0: id: b"fallback",
 						message: TestMessage {

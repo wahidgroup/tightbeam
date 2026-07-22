@@ -246,14 +246,14 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Valid trace: one philosopher completes full cycle
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("picks_right")?;
-			trace.event("eats")?;
-			trace.event("puts_down_left")?;
-			trace.event("puts_down_right")?;
-			trace.event("gets_up")?;
+			trace.event(ValidPhilosopherSpec::thinks)?;
+			trace.event(ValidPhilosopherSpec::sits)?;
+			trace.event(ValidPhilosopherSpec::picks_left)?;
+			trace.event(ValidPhilosopherSpec::picks_right)?;
+			trace.event(ValidPhilosopherSpec::eats)?;
+			trace.event(ValidPhilosopherSpec::puts_down_left)?;
+			trace.event(ValidPhilosopherSpec::puts_down_right)?;
+			trace.event(ValidPhilosopherSpec::gets_up)?;
 			Ok(())
 		}
 	}
@@ -292,12 +292,12 @@ tightbeam::tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Trace: Philosopher 1 picks left, Philosopher 2 picks left (deadlock)
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
+			trace.event(DeadlockPhilosopherSpec::thinks)?;
+			trace.event(DeadlockPhilosopherSpec::sits)?;
+			trace.event(DeadlockPhilosopherSpec::picks_left)?;
+			trace.event(DeadlockPhilosopherSpec::thinks)?;
+			trace.event(DeadlockPhilosopherSpec::sits)?;
+			trace.event(DeadlockPhilosopherSpec::picks_left)?;
 			Ok(())
 		}
 	}
@@ -342,23 +342,23 @@ tightbeam::tb_scenario! {
 			// Valid deadlock-free trace: P1 completes cycle, then P2 completes cycle
 			// (butler ensures they don't sit simultaneously)
 			// P1 cycle
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("picks_right")?;
-			trace.event("eats")?;
-			trace.event("puts_down_left")?;
-			trace.event("puts_down_right")?;
-			trace.event("gets_up")?;
+			trace.event(DeadlockFreePhilosopherSpec::thinks)?;
+			trace.event(DeadlockFreePhilosopherSpec::sits)?;
+			trace.event(DeadlockFreePhilosopherSpec::picks_left)?;
+			trace.event(DeadlockFreePhilosopherSpec::picks_right)?;
+			trace.event(DeadlockFreePhilosopherSpec::eats)?;
+			trace.event(DeadlockFreePhilosopherSpec::puts_down_left)?;
+			trace.event(DeadlockFreePhilosopherSpec::puts_down_right)?;
+			trace.event(DeadlockFreePhilosopherSpec::gets_up)?;
 			// P2 cycle
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("picks_right")?;
-			trace.event("eats")?;
-			trace.event("puts_down_left")?;
-			trace.event("puts_down_right")?;
-			trace.event("gets_up")?;
+			trace.event(DeadlockFreePhilosopherSpec::thinks)?;
+			trace.event(DeadlockFreePhilosopherSpec::sits)?;
+			trace.event(DeadlockFreePhilosopherSpec::picks_left)?;
+			trace.event(DeadlockFreePhilosopherSpec::picks_right)?;
+			trace.event(DeadlockFreePhilosopherSpec::eats)?;
+			trace.event(DeadlockFreePhilosopherSpec::puts_down_left)?;
+			trace.event(DeadlockFreePhilosopherSpec::puts_down_right)?;
+			trace.event(DeadlockFreePhilosopherSpec::gets_up)?;
 			Ok(())
 		}
 	}
@@ -385,12 +385,12 @@ tightbeam::tb_scenario! {
 		exec: |SetupEnv { trace, .. }| {
 			// Trace: Philosopher 1 picks left, Philosopher 2 picks left (deadlock)
 			// This should NOT refine DeadlockFreePhilosophers (butler prevents both sitting)
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
+			trace.event(DeadlockPhilosopherSpec::thinks)?;
+			trace.event(DeadlockPhilosopherSpec::sits)?;
+			trace.event(DeadlockPhilosopherSpec::picks_left)?;
+			trace.event(DeadlockPhilosopherSpec::thinks)?;
+			trace.event(DeadlockPhilosopherSpec::sits)?;
+			trace.event(DeadlockPhilosopherSpec::picks_left)?;
 			Ok(())
 		}
 	}

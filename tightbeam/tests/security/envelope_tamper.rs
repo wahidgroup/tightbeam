@@ -223,7 +223,7 @@ async fn tamper_deleted_envelope_detected(trace: &TraceCollector) -> Result<(), 
 	})
 	.await?;
 
-	trace.event_with("tamper_deleted_envelope_detected", &[], detected)?;
+	trace.event_with(EnvelopeTamperSpec::tamper_deleted_envelope_detected, &[], detected)?;
 	Ok(())
 }
 
@@ -239,6 +239,6 @@ async fn tamper_replayed_envelope_detected(trace: &TraceCollector) -> Result<(),
 	})
 	.await?;
 
-	trace.event_with("tamper_replayed_envelope_detected", &[], detected)?;
+	trace.event_with(EnvelopeTamperSpec::tamper_replayed_envelope_detected, &[], detected)?;
 	Ok(())
 }

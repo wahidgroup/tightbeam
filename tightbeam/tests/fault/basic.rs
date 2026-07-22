@@ -194,9 +194,9 @@ tb_scenario! {
 	.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("request")?;
-			trace.event("response")?;
-			trace.event("success")?;
+			trace.event(DeterministicSpec::request)?;
+			trace.event(DeterministicSpec::response)?;
+			trace.event(CoverageSpec::success)?;
 			Ok(())
 		}
 	}
@@ -277,9 +277,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("request")?;
-			trace.event("response")?;
-			trace.event("success")?;
+			trace.event(ProbabilisticSpec::request)?;
+			trace.event(ProbabilisticSpec::response)?;
+			trace.event(CoverageSpec::success)?;
 			Ok(())
 		}
 	}
@@ -369,9 +369,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("request")?;
-			trace.event("response")?;
-			trace.event("success")?;
+			trace.event(MultiFaultSpec::request)?;
+			trace.event(ProbabilisticSpec::response)?;
+			trace.event(CoverageSpec::success)?;
 			Ok(())
 		}
 	}
@@ -486,9 +486,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("request")?;
-			trace.event("response")?;
-			trace.event("success")?;
+			trace.event(CoverageSpec::request)?;
+			trace.event(CoverageSpec::response)?;
+			trace.event(CoverageSpec::success)?;
 			Ok(())
 		}
 	}

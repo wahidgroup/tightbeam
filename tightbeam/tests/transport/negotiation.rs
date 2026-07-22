@@ -179,7 +179,7 @@ tb_scenario! {
 	spec: ProfileNegotiationSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			trace.event("handshake_start")?;
+			trace.event(ProfileNegotiationSpec::handshake_start)?;
 			// Create profile descriptors
 			let profile_aes256_sha512 = SecurityProfileDesc::from(&Aes256Sha3_512Profile);
 			let profile_aes128_sha256 = SecurityProfileDesc::from(&Aes128Sha3_256Profile);
@@ -207,19 +207,19 @@ tb_scenario! {
 			.with_supported_profiles(vec![profile_aes128_sha256, profile_aes256_sha512]);
 
 			// Perform handshake
-			trace.event("client_hello_sent")?;
+			trace.event(ProfileNegotiationSpec::client_hello_sent)?;
 			let client_hello = client.build_client_hello()?;
 
-			trace.event("server_hello_received")?;
+			trace.event(ProfileNegotiationSpec::server_hello_received)?;
 			let server_handshake = server.process_client_hello(&client_hello).await?;
 
-			trace.event("client_kex_sent")?;
+			trace.event(ProfileNegotiationSpec::client_kex_sent)?;
 			let client_kex = client.process_server_handshake(&server_handshake).await?;
 
-			trace.event("server_kex_received")?;
+			trace.event(ProfileNegotiationSpec::server_kex_received)?;
 			server.process_client_key_exchange(&client_kex).await?;
 
-			trace.event("handshake_complete")?;
+			trace.event(ProfileNegotiationSpec::handshake_complete)?;
 			let _client_cipher = client.complete()?;
 			let _server_cipher = server.complete()?;
 
@@ -227,7 +227,7 @@ tb_scenario! {
 			// (AES-128 fails the default 256-bit floor)
 			if server.selected_profile() == Some(profile_aes256_sha512) &&
 			   client.selected_profile() == Some(profile_aes256_sha512) {
-				trace.event("profile_verified")?;
+				trace.event(ProfileNegotiationSpec::profile_verified)?;
 			}
 
 			Ok(())

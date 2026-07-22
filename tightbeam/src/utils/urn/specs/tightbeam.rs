@@ -266,7 +266,7 @@ mod tests {
 					.set("resource_id", "abc-123")
 					.build()?;
 
-				trace.event_with("urn_string", &[], urn.to_string())?;
+				trace.event_with(TightbeamUrnSpecSpec::urn_string, &[], urn.to_string())?;
 
 				Ok(())
 			}

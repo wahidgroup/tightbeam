@@ -126,7 +126,7 @@ job! {
 			let mut strong_session = harness.spawn(kind);
 			let strong_handshake = strong_session.capture_full().await?;
 
-			trace.event("downgrade_capture_strong")?;
+			trace.event(DowngradeAttackSpec::downgrade_capture_strong)?;
 
 			// ========================================
 			// Step 2: Capture WEAK handshake (AES-128-GCM)
@@ -135,7 +135,7 @@ job! {
 			let mut weak_session = harness.spawn_weak(kind);
 			let weak_handshake = weak_session.capture_full().await?;
 
-			trace.event("downgrade_capture_weak")?;
+			trace.event(DowngradeAttackSpec::downgrade_capture_weak)?;
 
 			// ========================================
 			// Step 3: Verify wire bytes are DIFFERENT
@@ -155,7 +155,7 @@ job! {
 				return Err(expectation_failure("AES-256 and AES-128 messages are identical"));
 			}
 
-			trace.event("downgrade_profiles_differ")?;
+			trace.event(DowngradeAttackSpec::downgrade_profiles_differ)?;
 
 			// ========================================
 			// Step 4: Attempt downgrade substitution
@@ -168,7 +168,7 @@ job! {
 					// Downgrade substitution rejected - the strong server's
 					// strength floor refuses the AES-128 offer, and the
 					// negotiated cipher is bound into the signed transcript.
-					trace.event("downgrade_substitution_rejected")?;
+					trace.event(DowngradeAttackSpec::downgrade_substitution_rejected)?;
 				}
 				InjectionOutcome::Accepted => {
 					// A strong session that accepts a weak ClientHello is a

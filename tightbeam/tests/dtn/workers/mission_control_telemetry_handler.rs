@@ -10,6 +10,7 @@ use tightbeam::{asn1::MessagePriority, der::Sequence, worker, Beamable, TightBea
 use crate::dtn::{
 	messages::{RoverCommand, RoverTelemetry},
 	servlets::MissionState,
+	ultimate::DtnEventCountSpec,
 };
 
 /// Telemetry handler request
@@ -40,8 +41,8 @@ worker! {
 		max_commands: u64,
 	},
 	handle: |request, trace, config| async move {
-		trace.event("mission_control_receive_telemetry")?;
-		trace.event("mission_control_analyze_telemetry")?;
+		trace.event(DtnEventCountSpec::mission_control_receive_telemetry)?;
+		trace.event(DtnEventCountSpec::mission_control_analyze_telemetry)?;
 
 		// Increment telemetry counter
 		let telemetry_count = {
@@ -67,7 +68,7 @@ worker! {
 				MessagePriority::Standard
 			};
 
-			trace.event("mission_control_send_command")?;
+			trace.event(DtnEventCountSpec::mission_control_send_command)?;
 
 			Ok(TelemetryHandlerResponse {
 				should_send_command: true,

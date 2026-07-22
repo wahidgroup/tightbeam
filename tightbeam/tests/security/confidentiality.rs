@@ -114,7 +114,7 @@ job! {
 		let mut session = harness.spawn(kind);
 		let captured = session.capture_full().await?;
 
-		trace.event("conf_capture_handshake")?;
+		trace.event(ConfidentialitySpec::conf_capture_handshake)?;
 
 		// ========================================
 		// Step 2: Extract ECIES ciphertext from ClientKeyExchange (step 2)
@@ -133,7 +133,7 @@ job! {
 			return Err(expectation_failure("ciphertext too short to be valid ECIES"));
 		}
 
-		trace.event("conf_extract_ciphertext")?;
+		trace.event(ConfidentialitySpec::conf_extract_ciphertext)?;
 
 		// ========================================
 		// Step 3: Decrypt with CORRECT key - proves encryption works
@@ -146,7 +146,7 @@ job! {
 					return Err(expectation_failure("decrypted plaintext is not 64 bytes"));
 				}
 
-				trace.event("conf_decrypt_correct_key")?;
+				trace.event(ConfidentialitySpec::conf_decrypt_correct_key)?;
 			}
 			DecryptionResult::Failed => {
 				return Err(expectation_failure("decryption with correct key failed"));
@@ -160,7 +160,7 @@ job! {
 		match try_decrypt_ecies(&ciphertext, &wrong_key, None) {
 			DecryptionResult::Failed => {
 				// Expected - wrong key cannot decrypt
-				trace.event("conf_decrypt_wrong_key_fails")?;
+				trace.event(ConfidentialitySpec::conf_decrypt_wrong_key_fails)?;
 			}
 			DecryptionResult::Success { .. } => {
 				return Err(expectation_failure("decryption with wrong key should fail"));
@@ -187,7 +187,7 @@ job! {
 			return Err(expectation_failure("ciphertexts are identical across handshakes"));
 		}
 
-		trace.event("conf_ciphertexts_differ")?;
+		trace.event(ConfidentialitySpec::conf_ciphertexts_differ)?;
 
 		Ok(())
 	}

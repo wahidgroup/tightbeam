@@ -86,8 +86,8 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("task1")?;
-			trace.event("task2")?;
+			trace.event(RmaAssertSpec::task1)?;
+			trace.event(RmaAssertSpec::task2)?;
 			Ok(())
 		}
 	}

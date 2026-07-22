@@ -169,13 +169,13 @@ tb_scenario! {
 			let servlet_task = EchoServlet::start(Arc::new(trace.share()), None).await?;
 			let addr = servlet_task.addr;
 
-			trace.event("client_connect")?;
+			trace.event(ConnectionReuseSpec::client_connect)?;
 
 			// Send 3 messages using the same client (connection keep-alive)
 			let client_builder = ClientBuilder::<TokioListener>::builder().build();
 			let mut client = client_builder.connect(addr).await?;
 			for i in 1..=3 {
-				trace.event("send_message")?;
+				trace.event(ConnectionReuseSpec::send_message)?;
 
 				let msg = compose! {
 					V0: id: format!("msg{}", i).as_bytes(),
@@ -183,7 +183,7 @@ tb_scenario! {
 				}?;
 
 				if client.emit(msg, None).await?.is_some() {
-					trace.event("receive_response")?;
+					trace.event(ConnectionReuseSpec::receive_response)?;
 				}
 			}
 
@@ -225,7 +225,7 @@ tb_scenario! {
 			let servlet_task = TlsEchoServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
 			let addr = servlet_task.addr;
 
-			trace.event("client_connect")?;
+			trace.event(ConnectionReuseSpec::client_connect)?;
 
 			// Configure client with TLS credentials
 			let builder = ClientBuilder::<TokioListener>::builder()
@@ -236,7 +236,7 @@ tb_scenario! {
 
 			// Send 3 messages using the same TLS client (no re-handshake, session reuse)
 			for i in 1..=3 {
-				trace.event("send_message")?;
+				trace.event(ConnectionReuseSpec::send_message)?;
 
 				let msg = compose! {
 					V0: id: format!("tls-msg{}", i).as_bytes(),
@@ -244,7 +244,7 @@ tb_scenario! {
 				}?;
 
 				if client.emit(msg, None).await?.is_some() {
-					trace.event("receive_response")?;
+					trace.event(ConnectionReuseSpec::receive_response)?;
 				}
 			}
 

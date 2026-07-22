@@ -170,7 +170,7 @@ job! {
 
 		match server.process_client_key_exchange(&spliced_der).await {
 			Err(_) => {
-				trace.event("spliced_kex_rejected")?;
+				trace.event(SpliceAttackSpec::spliced_kex_rejected)?;
 			}
 			Ok(_) => return Err(expectation_failure("server accepted a spliced key exchange under victim identity")),
 		}

@@ -81,7 +81,7 @@ job! {
 		let validator = DirectTrustValidator::default().with_trust_chain(vec![trusted_cert]);
 		match validator.evaluate(&attacker_cert) {
 			Err(_) => {
-				trace.event("untrusted_cert_rejected")?;
+				trace.event(CertificateTrustSpec::untrusted_cert_rejected)?;
 			}
 			Ok(()) => return Err(expectation_failure("certificate outside the trust chain was accepted")),
 		}

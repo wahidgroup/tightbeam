@@ -1377,8 +1377,8 @@ mod tests {
 					assertions: trace.share(),
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.event("Received")?;
-						trace.event("Responded")?;
+						trace.event(ClientServerFlowSpec::Received)?;
+						trace.event(ClientServerFlowSpec::Responded)?;
 						Ok(Some(frame))
 					}
 				};
@@ -1390,7 +1390,7 @@ mod tests {
 				let mut client = <TokioListener as Protocol>::create_transport(stream);
 
 				// Client-side assertion before sending
-				trace.event("Responded")?;
+				trace.event(ClientServerFlowSpec::Responded)?;
 
 				let test_message = create_test_message(None);
 				let test_frame = compose! {
@@ -1400,7 +1400,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event("Received")?;
+				trace.event(ClientServerFlowSpec::Received)?;
 
 				Ok(())
 			}
@@ -1415,8 +1415,8 @@ mod tests {
 		handle: |_msg, frame, ctx| async move {
 			let trace = ctx.trace();
 			// Server-side assertions
-			trace.event("Received")?;
-			trace.event("Responded")?;
+			trace.event(ClientServerFlowSpec::Received)?;
+			trace.event(ClientServerFlowSpec::Responded)?;
 			Ok(Some(frame))
 		}
 	}
@@ -1444,7 +1444,7 @@ mod tests {
 				let mut client = <TokioListener as Protocol>::create_transport(stream);
 
 				// Client-side assertion before sending
-				trace.event("Responded")?;
+				trace.event(ClientServerFlowSpec::Responded)?;
 
 				let test_message = create_test_message(None);
 				let test_frame = compose! {
@@ -1454,7 +1454,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event("Received")?;
+				trace.event(ClientServerFlowSpec::Received)?;
 
 				Ok(())
 			}

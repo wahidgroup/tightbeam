@@ -102,21 +102,21 @@ job! {
 			// Create a message that exceeds the 16 KiB limit
 			let oversized_payload = vec![0xDE; HANDSHAKE_MAX_SIZE + 1];
 
-			trace.event("dos_generate_oversized")?;
+			trace.event(DosAttackSpec::dos_generate_oversized)?;
 
 			// ========================================
 			// Step 2: Attempt to inject oversized message
 			// ========================================
 			let mut session = harness.spawn(kind);
 
-			trace.event("dos_inject_oversized")?;
+			trace.event(DosAttackSpec::dos_inject_oversized)?;
 
 			// Inject at step 0 (ClientHello for ECIES, KeyExchange for CMS)
 			// The oversized message should be rejected
 			match session.inject_at_step(0, &oversized_payload).await? {
 				InjectionOutcome::Rejected(_) => {
 					// Oversized message rejected - DoS protection works
-					trace.event("dos_oversized_rejected")?;
+					trace.event(DosAttackSpec::dos_oversized_rejected)?;
 				}
 				InjectionOutcome::Accepted => {
 					// Should not happen - oversized message should be rejected

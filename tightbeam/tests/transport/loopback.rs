@@ -21,9 +21,7 @@ use tightbeam::{
 	exactly, tb_assert_spec, tb_scenario,
 	testing::SetupEnv,
 	trace::TraceCollector,
-	transport::handshake::{
-		negotiation::SecurityOffer, ClientHandshakeProtocol, ServerHandshakeProtocol,
-	},
+	transport::handshake::{negotiation::SecurityOffer, ClientHandshakeProtocol, ServerHandshakeProtocol},
 	TightBeamError,
 };
 
@@ -308,7 +306,7 @@ async fn cms_unique_session_keys(trace: &TraceCollector, materials: &ServerMater
 
 	let unique_keys =
 		key_a.as_slice() != ZERO_KEY.as_slice() && key_b.as_slice() != ZERO_KEY.as_slice() && key_a != key_b;
-	trace.event_with("loopback_cms_unique_keys", &[], unique_keys)?;
+	trace.event_with(HandshakeLoopbackSpec::loopback_cms_unique_keys, &[], unique_keys)?;
 
 	Ok(())
 }

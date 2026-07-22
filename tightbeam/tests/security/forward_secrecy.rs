@@ -102,7 +102,7 @@ job! {
 			let mut session = harness.spawn(kind);
 			let captured = session.capture_full().await?;
 
-			trace.event("fs_capture_handshake")?;
+			trace.event(ForwardSecrecySpec::fs_capture_handshake)?;
 
 			// Extract ECIES ciphertext from ClientKeyExchange (step 2)
 			let client_kex = captured
@@ -117,7 +117,7 @@ job! {
 
 			ephemeral_keys.push(ephemeral_pubkey);
 
-			trace.event("fs_extract_ephemeral")?;
+			trace.event(ForwardSecrecySpec::fs_extract_ephemeral)?;
 		}
 
 		// ========================================
@@ -146,7 +146,7 @@ job! {
 			}
 		}
 
-		trace.event("fs_all_ephemeral_unique")?;
+		trace.event(ForwardSecrecySpec::fs_all_ephemeral_unique)?;
 
 		Ok(())
 	}

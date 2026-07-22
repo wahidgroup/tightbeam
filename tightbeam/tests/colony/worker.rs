@@ -76,7 +76,7 @@ tb_scenario! {
 			})
 		},
 		stimulus: |WorkerEnv { trace, worker, .. }| async move {
-			trace.event_with("relay_start", &[], ())?;
+			trace.event_with(WorkerSpec::relay_start, &[], ())?;
 
 			let ping_msg = PingMessage {
 				content: "PING".to_string(),
@@ -85,7 +85,7 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
-				trace.event_with("relay_success", &[], resp.result)?;
+				trace.event_with(WorkerSpec::relay_success, &[], resp.result)?;
 			}
 
 			Ok(())
@@ -101,7 +101,7 @@ tb_scenario! {
 	environment Worker {
 	setup: |_env| DefaultWorker::new(()),
 	stimulus: |WorkerEnv { trace, worker, .. }| async move {
-		trace.event_with("relay_start", &[], ())?;
+		trace.event_with(WorkerSpec::relay_start, &[], ())?;
 
 		let ping_msg = PingMessage {
 			content: "PING".to_string(),
@@ -110,7 +110,7 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
-				trace.event_with("relay_success", &[], resp.result)?;
+				trace.event_with(WorkerSpec::relay_success, &[], resp.result)?;
 			}
 
 			Ok(())

@@ -530,7 +530,7 @@ async fn send_telemetry_to_mars_relay(
 	let battery = fault_manager.battery_percent()?;
 	let fault_matrix_snapshot = fault_manager.fault_matrix()?;
 
-	trace.event("rover_send_telemetry")?;
+	trace.event(DtnEventCountSpec::rover_send_telemetry)?;
 
 	let telemetry = RoverTelemetry::new(instrument, data, mission_time_ms(), battery, -20);
 	let (next_order, previous_digest) = rover_processor.prepare_outgoing()?;
@@ -1022,7 +1022,7 @@ tb_scenario! {
 			// ================================================================
 
 			init_mission_clock();
-			trace.event("mission_start")?;
+			trace.event(DtnEventCountSpec::mission_start)?;
 
 			// ================================================================
 			// 6. SEND INITIAL COMMAND FROM MISSION CONTROL
@@ -1033,7 +1033,7 @@ tb_scenario! {
 				let (next_order, previous_digest) = mc_processor.prepare_outgoing()?;
 				let command = EarthCommand::new(initial_cmd, MessagePriority::Standard, mission_time_ms());
 
-				trace.event("mission_control_send_command")?;
+				trace.event(DtnEventCountSpec::mission_control_send_command)?;
 
 				let command_frame = mc_frame_builder.build_relay_command_frame(
 					command,
@@ -1098,7 +1098,7 @@ tb_scenario! {
 				&shared_mission_state,
 			).await?;
 
-			trace.event("mission_complete")?;
+			trace.event(DtnEventCountSpec::mission_complete)?;
 
 			Ok(())
 		}

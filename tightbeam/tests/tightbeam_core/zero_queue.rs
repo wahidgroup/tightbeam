@@ -163,7 +163,7 @@ impl ChainState {
 			guard.last_order = Some(frame.metadata.order);
 			let digest = utils::digest::<Sha3_256>(&frame.message)?;
 			guard.last_digest = Some(digest);
-			self.trace.event_with("lag_tip", &[QUEUE_TAG], 0u64)?;
+			self.trace.event_with(QueueFreeSpec::lag_tip, &[QUEUE_TAG], 0u64)?;
 		}
 
 		Ok(())
@@ -234,7 +234,8 @@ impl PriorityLedger {
 			worker == 1
 		};
 
-		self.trace.event_with("priority_respected", &[QUEUE_TAG], respected)?;
+		self.trace
+			.event_with(QueueFreeSpec::priority_respected, &[QUEUE_TAG], respected)?;
 		Ok(worker)
 	}
 }
@@ -275,7 +276,7 @@ impl GatePolicy for AdaptiveGate {
 		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Standard);
 		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata.order) {
 			// Emit trace event for test verification
-			let _ = self.trace.event_with("throttle_engaged", &[QUEUE_TAG], true);
+			let _ = self.trace.event_with(QueueFreeSpec::throttle_engaged, &[QUEUE_TAG], true);
 			TransitStatus::Busy
 		} else {
 			TransitStatus::Accepted
@@ -404,7 +405,7 @@ tb_scenario! {
 
 				prev_hash = Some(digest);
 
-				trace.event_with("adaptive_behavior", &[QUEUE_TAG], spec.order)?;
+				trace.event_with(QueueFreeSpec::adaptive_behavior, &[QUEUE_TAG], spec.order)?;
 
 				if index == 1 {
 					// For the second frame, emit it then immediately replay it

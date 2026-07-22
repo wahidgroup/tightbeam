@@ -887,8 +887,8 @@ mod tests {
 		spec: TraceCollectorSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				trace.event("alpha")?;
-				trace.event("beta")?;
+				trace.event(TraceCollectorSpec::alpha)?;
+				trace.event(TraceCollectorSpec::beta)?;
 				Ok(())
 			}
 		}

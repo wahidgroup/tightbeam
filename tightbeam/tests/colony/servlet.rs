@@ -45,7 +45,7 @@ pub struct CalcResponse {
 worker! {
 	name: DoublerWorker<CalcRequest, Result<u32, TightBeamError>>,
 	handle: |input, trace| async move {
-		trace.event("doubler_process")?;
+		trace.event(CalcServletSpec::doubler_process)?;
 		Ok(input.value * 2)
 	}
 }
@@ -57,7 +57,7 @@ worker! {
 		add_offset: u32,
 	},
 	handle: |input, trace, config| async move {
-		trace.event("squarer_process")?;
+		trace.event(CalcServletSpec::squarer_process)?;
 		Ok(input.value * input.value + config.add_offset)
 	}
 }
@@ -82,7 +82,7 @@ servlet! {
 		let trace = ctx.trace();
 		let config: &CalcServletConf = ctx.env_config()?;
 
-		trace.event("servlet_receive")?;
+		trace.event(CalcServletSpec::servlet_receive)?;
 
 		// Process with both workers in parallel via context
 		let request_arc = Arc::new(request);
@@ -98,7 +98,7 @@ servlet! {
 		let sum = doubled + squared;
 		let final_result = sum * config.final_multiplier;
 
-		trace.event("servlet_respond")?;
+		trace.event(CalcServletSpec::servlet_respond)?;
 
 		Ok(Some(compose! {
 			V0: id: b"calc-response-id",
@@ -166,9 +166,9 @@ tb_scenario! {
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			trace.event_with("verify_doubled", &[], response.doubled)?;
-			trace.event_with("verify_squared", &[], response.squared)?;
-			trace.event_with("verify_final_result", &[], response.final_result)?;
+			trace.event_with(CalcServletSpec::verify_doubled, &[], response.doubled)?;
+			trace.event_with(CalcServletSpec::verify_squared, &[], response.squared)?;
+			trace.event_with(CalcServletSpec::verify_final_result, &[], response.final_result)?;
 
 			Ok(())
 		}
@@ -209,9 +209,8 @@ servlet! {
 	protocol: TokioListener,
 	handle: |request, frame, ctx| async move {
 		let trace = ctx.trace();
-		trace.event("secure_receive")?;
-		trace.event_with(
-			"secure_frame_cleartext",
+		trace.event(SecureCalcServletSpec::secure_receive)?;
+		trace.event_with(SecureCalcServletSpec::secure_frame_cleartext,
 			&[],
 			u32::from(frame.metadata.confidentiality.is_none() && frame.metadata.compactness.is_none()),
 		)?;
@@ -278,7 +277,7 @@ tb_scenario! {
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			trace.event_with("verify_secure_doubled", &[], response.doubled)?;
+			trace.event_with(SecureCalcServletSpec::verify_secure_doubled, &[], response.doubled)?;
 
 			Ok(())
 		}

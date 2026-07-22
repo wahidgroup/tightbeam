@@ -244,7 +244,7 @@ tb_scenario! {
 					_ => ChessMove::from((0u8, 0u8, 0u8, 0u8)).to_request(),
 				};
 
-				trace.event("client_move_sent")?;
+				trace.event(ChessAssertSpec::client_move_sent)?;
 				stats.move_sent_count += 1;
 
 				// Emit piece kind event only after move is sent (not before validation)
@@ -269,7 +269,7 @@ tb_scenario! {
 				).await {
 					Ok(Ok(Some(frame))) => frame,
 					Ok(Ok(None)) => {
-						trace.event("client_no_response")?;
+						trace.event(ChessAssertSpec::client_no_response)?;
 						stats.no_response_count += 1;
 						break;
 					}
@@ -291,7 +291,7 @@ tb_scenario! {
 				let response: ChessMoveResponse = match decode(&response_frame.message) {
 					Ok(r) => r,
 					Err(_) => {
-						trace.event("client_decode_error")?;
+						trace.event(ChessAssertSpec::client_decode_error)?;
 						stats.decode_error_count += 1;
 						break;
 					}
@@ -344,9 +344,9 @@ tb_scenario! {
 			let moves_processed_balance = (stats.move_sent_count as i64) - (processed_moves as i64);
 			let server_move_balance = (stats.move_validated_count as i64) - (stats.server_move_count as i64);
 			let game_restart_balance = (stats.game_restarted_count as i64) - (stats.game_ended_count as i64);
-			trace.event_with("client_moves_processed_balance", &["balance"], moves_processed_balance)?;
-			trace.event_with("client_server_move_balance", &["balance"], server_move_balance)?;
-			trace.event_with("client_game_restart_balance", &["lifecycle"], game_restart_balance)?;
+			trace.event_with(ChessAssertSpec::client_moves_processed_balance, &["balance"], moves_processed_balance)?;
+			trace.event_with(ChessAssertSpec::client_server_move_balance, &["balance"], server_move_balance)?;
+			trace.event_with(ChessAssertSpec::client_game_restart_balance, &["lifecycle"], game_restart_balance)?;
 
 			Ok(())
 		}

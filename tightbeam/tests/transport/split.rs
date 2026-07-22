@@ -114,7 +114,7 @@ async fn split_encrypted_roundtrip(trace: &TraceCollector) -> Result<(), TightBe
 
 	await_ok(server_handle, "server task must not panic").await?;
 
-	trace.event_with("split_encrypted_roundtrip", &[], status_ok && frame_ok)?;
+	trace.event_with(SplitTransportSpec::split_encrypted_roundtrip, &[], status_ok && frame_ok)?;
 	Ok(())
 }
 
@@ -127,7 +127,7 @@ async fn split_rejects_pre_handshake(trace: &TraceCollector) -> Result<(), Tight
 	let transport: TcpTransport<TokioStream> = TcpTransport::from(TokioStream::from(stream));
 
 	let rejected = matches!(transport.into_split(), Err(TransportError::InvalidState));
-	trace.event_with("split_rejects_pre_handshake", &[], rejected)?;
+	trace.event_with(SplitTransportSpec::split_rejects_pre_handshake, &[], rejected)?;
 	Ok(())
 }
 
@@ -163,7 +163,7 @@ async fn split_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(), Ti
 
 	await_ok(server_handle, "server task must not panic").await?;
 
-	trace.event_with("split_rekey_limit_fails_closed", &[], rekey_required)?;
+	trace.event_with(SplitTransportSpec::split_rekey_limit_fails_closed, &[], rekey_required)?;
 	Ok(())
 }
 
@@ -200,6 +200,10 @@ async fn split_recv_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(
 
 	await_ok(server_handle, "server task must not panic").await?;
 
-	trace.event_with("split_recv_rekey_limit_fails_closed", &[], arrived && rekey_required)?;
+	trace.event_with(
+		SplitTransportSpec::split_recv_rekey_limit_fails_closed,
+		&[],
+		arrived && rekey_required,
+	)?;
 	Ok(())
 }

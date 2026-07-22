@@ -98,7 +98,7 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Emit timing event with duration within WCET constraint (5ms < 10ms)
-			trace.event("process")?.with_timing(Duration::from_nanos(5_000_000));
+			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(5_000_000));
 			Ok(())
 		}
 	}
@@ -142,7 +142,7 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("process")?.with_timing(Duration::from_nanos(10_000_000));
+			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(10_000_000));
 			Ok(())
 		}
 	}
@@ -187,7 +187,7 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("process")?.with_timing(Duration::from_nanos(15_000_000));
+			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(15_000_000));
 			Ok(())
 		}
 	}

@@ -124,11 +124,11 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
-			trace.event("pointA")?;
-			trace.event("pointA")?;
-			trace.event("pointB")?;
-			trace.event("pointA")?;
-			trace.event("pointA")?;
+			trace.event(ValidTennisSpec::pointA)?;
+			trace.event(ValidTennisSpec::pointA)?;
+			trace.event(ValidTennisSpec::pointB)?;
+			trace.event(ValidTennisSpec::pointA)?;
+			trace.event(ValidTennisSpec::pointA)?;
 			Ok(())
 		}
 	}
@@ -166,11 +166,11 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| {
 			// Invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
 			// This violates the tennis scoring rules - after (0,40), B should win
-			trace.event("pointA")?;
-			trace.event("pointB")?;
-			trace.event("pointB")?;
-			trace.event("pointB")?;
-			trace.event("pointB")?;
+			trace.event(InvalidTennisSpec::pointA)?;
+			trace.event(InvalidTennisSpec::pointB)?;
+			trace.event(InvalidTennisSpec::pointB)?;
+			trace.event(InvalidTennisSpec::pointB)?;
+			trace.event(InvalidTennisSpec::pointB)?;
 			Ok(())
 		}
 	}
@@ -208,14 +208,14 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Valid trace going through deuce: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
-			trace.event("pointA")?;
-			trace.event("pointB")?;
-			trace.event("pointA")?;
-			trace.event("pointB")?;
-			trace.event("pointA")?;
-			trace.event("pointB")?;
-			trace.event("pointA")?;
-			trace.event("pointA")?;
+			trace.event(DeuceTennisSpec::pointA)?;
+			trace.event(DeuceTennisSpec::pointB)?;
+			trace.event(DeuceTennisSpec::pointA)?;
+			trace.event(DeuceTennisSpec::pointB)?;
+			trace.event(DeuceTennisSpec::pointA)?;
+			trace.event(DeuceTennisSpec::pointB)?;
+			trace.event(DeuceTennisSpec::pointA)?;
+			trace.event(DeuceTennisSpec::pointA)?;
 			Ok(())
 		}
 	}
@@ -251,9 +251,9 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Create a trace that should pass failures refinement
-			trace.event("pointA")?;
-			trace.event("pointB")?;
-			trace.event("pointA")?;
+			trace.event(FailuresTennisSpec::pointA)?;
+			trace.event(FailuresTennisSpec::pointB)?;
+			trace.event(FailuresTennisSpec::pointA)?;
 			Ok(())
 		}
 	}

@@ -104,14 +104,14 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			// Execute simple request-response flow (simulated)
-			trace.event("connect")?;
-			trace.event("serialize")?;
-			trace.event("encrypt")?;
-			trace.event("request")?;
-			trace.event("decrypt")?;
-			trace.event("deserialize")?;
-			trace.event("response")?;
-			trace.event("disconnect")?;
+			trace.event(TraceAnalysisSpec::connect)?;
+			trace.event(TraceAnalysisSpec::serialize)?;
+			trace.event(TraceAnalysisSpec::encrypt)?;
+			trace.event(TraceAnalysisSpec::request)?;
+			trace.event(TraceAnalysisSpec::decrypt)?;
+			trace.event(TraceAnalysisSpec::deserialize)?;
+			trace.event(TraceAnalysisSpec::response)?;
+			trace.event(TraceAnalysisSpec::disconnect)?;
 
 			Ok(())
 		}

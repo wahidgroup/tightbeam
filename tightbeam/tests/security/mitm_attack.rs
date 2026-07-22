@@ -110,7 +110,7 @@ job! {
 			let mut session = harness.spawn(kind);
 			let captured = session.capture_full().await?;
 
-			trace.event("mitm_capture_handshake")?;
+			trace.event(MitmAttackSpec::mitm_capture_handshake)?;
 
 			// ========================================
 			// Step 2: Find a server-to-client message to tamper
@@ -131,14 +131,14 @@ job! {
 				return Err(expectation_failure("tampering did not modify payload"));
 			}
 
-			trace.event("mitm_tamper_message")?;
+			trace.event(MitmAttackSpec::mitm_tamper_message)?;
 
 			// ========================================
 			// Step 3: Inject tampered message into fresh session
 			// ========================================
 			let mut attack_session = harness.spawn(kind);
 
-			trace.event("mitm_inject_tampered")?;
+			trace.event(MitmAttackSpec::mitm_inject_tampered)?;
 
 			// Inject the tampered message at the same step
 			match attack_session.inject_at_step(target.step, &tampered_payload).await? {
@@ -151,7 +151,7 @@ job! {
 						"MITM tampering must fail signature/transcript verification, not DER parsing (got {handshake_err:?})"
 					);
 
-					trace.event("mitm_tampering_detected")?;
+					trace.event(MitmAttackSpec::mitm_tampering_detected)?;
 				}
 				InjectionOutcome::Accepted => {
 					// Should not happen - tampered message should be rejected

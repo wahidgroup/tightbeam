@@ -189,13 +189,13 @@ tb_scenario! {
 			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
 
 			// Emit trace events unconditionally - assertion spec validates them
-			trace.event_with("response_received", &[], Presence::of_option(&response_frame))?;
+			trace.event_with(MutualAuthSpec::response_received, &[], Presence::of_option(&response_frame))?;
 
 			let response_frame = response_frame.ok_or(TightBeamError::MissingResponse)?;
 			let response: AuthResponse = decode(&response_frame.message)?;
 
-			trace.event_with("server_id", &[], response.server_id)?;
-			trace.event_with("authenticated", &[], response.authenticated)?;
+			trace.event_with(MutualAuthSpec::server_id, &[], response.server_id)?;
+			trace.event_with(MutualAuthSpec::authenticated, &[], response.authenticated)?;
 
 			Ok(())
 		}

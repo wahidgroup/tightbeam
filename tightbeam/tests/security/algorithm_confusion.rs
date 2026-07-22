@@ -100,7 +100,7 @@ job! {
 		// Under an unrelated algorithm OID a sound policy must refuse it.
 		match policy.verify_signature(&AES_256_GCM, &spki_der, message, signature_bytes.as_ref()) {
 			Err(_) => {
-				trace.event("foreign_oid_rejected")?;
+				trace.event(AlgorithmConfusionSpec::foreign_oid_rejected)?;
 			}
 			Ok(_) => return Err(expectation_failure("signature accepted under an unsupported algorithm OID")),
 		}

@@ -267,7 +267,7 @@ tb_scenario! {
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
 			let server_addr = servlet.addr();
 
-			trace.event("pool_create")?;
+			trace.event(PoolReuseSpec::pool_create)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -279,21 +279,21 @@ tb_scenario! {
 			);
 
 			for i in 1..=3 {
-				trace.event("acquire_client")?;
+				trace.event(PoolReuseSpec::acquire_client)?;
 
 				let mut client = pool.connect(server_addr).await?;
 
-				trace.event("send_message")?;
+				trace.event(PoolReuseSpec::send_message)?;
 
 				let msg = create_v0_tightbeam(Some(&format!("test{i}")), None);
 				let reply = client.conn()?.emit(msg, None).await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
-				trace.event("receive_response")?;
+				trace.event(PoolReuseSpec::receive_response)?;
 
-				trace.event("release_client")?;
+				trace.event(PoolReuseSpec::release_client)?;
 			}
 
-			trace.event_with("message_count", &[], message_count.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(PoolReuseSpec::message_count, &[], message_count.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}
@@ -381,7 +381,7 @@ tb_scenario! {
 			let addr1 = servlet1.addr();
 			let addr2 = servlet2.addr();
 
-			trace.event("pool_create")?;
+			trace.event(PoolIsolationSpec::pool_create)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -391,21 +391,21 @@ tb_scenario! {
 			);
 
 			for (addr, name) in [(addr1, "addr1-test"), (addr2, "addr2-test"), (addr1, "addr1-test2")] {
-				trace.event("acquire_client")?;
+				trace.event(PoolIsolationSpec::acquire_client)?;
 
 				let mut client = pool.connect(addr).await?;
 
-				trace.event("send_message")?;
+				trace.event(PoolIsolationSpec::send_message)?;
 
 				let reply = client.conn()?.emit(create_v0_tightbeam(Some(name), None), None).await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
-				trace.event("receive_response")?;
+				trace.event(PoolIsolationSpec::receive_response)?;
 
-				trace.event("release_client")?;
+				trace.event(PoolIsolationSpec::release_client)?;
 			}
 
-			trace.event_with("servlet1_count", &[], count1.load(Ordering::SeqCst) as u64)?;
-			trace.event_with("servlet2_count", &[], count2.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(PoolIsolationSpec::servlet1_count, &[], count1.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(PoolIsolationSpec::servlet2_count, &[], count2.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}
@@ -433,7 +433,7 @@ tb_scenario! {
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
 			let server_addr = servlet.addr();
 
-			trace.event("pool_create")?;
+			trace.event(PoolReuseSpec::pool_create)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -443,11 +443,11 @@ tb_scenario! {
 			);
 
 			for _ in 0..3 {
-				trace.event("acquire_client")?;
+				trace.event(PoolReuseSpec::acquire_client)?;
 
 				let mut client = pool.connect(server_addr).await?;
 
-				trace.event("send_message")?;
+				trace.event(PoolReuseSpec::send_message)?;
 
 				let reply = client
 					.conn()?
@@ -455,11 +455,11 @@ tb_scenario! {
 					.await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
 
-				trace.event("receive_response")?;
-				trace.event("release_client")?;
+				trace.event(PoolReuseSpec::receive_response)?;
+				trace.event(PoolReuseSpec::release_client)?;
 			}
 
-			trace.event_with("message_count", &[], message_count.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(PoolReuseSpec::message_count, &[], message_count.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}

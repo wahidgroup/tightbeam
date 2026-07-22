@@ -71,9 +71,9 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("task1")?;
-			trace.event("task2")?;
-			trace.event("task3")?;
+			trace.event(EdfAssertSpec::task1)?;
+			trace.event(EdfAssertSpec::task2)?;
+			trace.event(EdfAssertSpec::task3)?;
 			Ok(())
 		}
 	}

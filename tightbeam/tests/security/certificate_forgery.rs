@@ -161,7 +161,7 @@ job! {
 			let _server_result = server.process_client_key_exchange(&client_kex).await;
 
 			// If we got here without error, the valid certificate was accepted
-			trace.event("cert_valid_accepted")?;
+			trace.event(CertificateForgerySpec::cert_valid_accepted)?;
 		}
 
 		// ========================================
@@ -189,7 +189,7 @@ job! {
 			match client.process_server_handshake(&server_handshake).await {
 				Err(_) => {
 					// Expected - certificate rejected due to wrong public key
-					trace.event("cert_wrong_key_rejected")?;
+					trace.event(CertificateForgerySpec::cert_wrong_key_rejected)?;
 				}
 				Ok(_) => {
 					return Err(expectation_failure("certificate with wrong pinned key should be rejected"));
@@ -221,7 +221,7 @@ job! {
 			match client.process_server_handshake(&server_handshake).await {
 				Err(_) => {
 					// Expected - all certificates rejected
-					trace.event("cert_reject_all_rejected")?;
+					trace.event(CertificateForgerySpec::cert_reject_all_rejected)?;
 				}
 				Ok(_) => {
 					return Err(expectation_failure("RejectAll validator should reject all certificates"));

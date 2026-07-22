@@ -101,7 +101,7 @@ job! {
 			let mut session = harness.spawn(kind);
 			let captured = session.capture_full().await?;
 
-			trace.event("replay_initial_handshake")?;
+			trace.event(ReplayAttackSpec::replay_initial_handshake)?;
 
 			// Get the final client message (replay target for all backends)
 			let target = captured
@@ -111,12 +111,12 @@ job! {
 			// Attempt replay on a fresh session
 			let mut attack_session = harness.spawn(captured.kind);
 
-			trace.event("replay_attempt")?;
+			trace.event(ReplayAttackSpec::replay_attempt)?;
 
 			match attack_session.inject_at_step(target.step, &target.payload).await? {
 				InjectionOutcome::Rejected(_) => {
-					trace.event("replay_detected")?;
-					trace.event("replay_rejected")?;
+					trace.event(ReplayAttackSpec::replay_detected)?;
+					trace.event(ReplayAttackSpec::replay_rejected)?;
 				}
 				InjectionOutcome::Accepted => {
 					return Err(expectation_failure("replay was accepted"));
