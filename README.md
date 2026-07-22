@@ -2012,7 +2012,7 @@ pub trait MultiplexedProtocol {
 	/// Allocate a stream, send `frame`, await the correlated response
 	fn emit_on_stream(
 		&self,
-		frame: Frame,
+		frame: &Frame,
 	) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend;
 
 	/// Best-effort cancel of a locally-initiated in-flight stream
@@ -2033,9 +2033,9 @@ Both sides MUST configure multiplexing before the handshake so the offer is tran
 ```
 Client Side - Offering Mux:
 ┌──────────────────────────────────────────────────────────┐
-│ 1. transport = transport.with_mux_config(                │
+│ 1. transport = transport.with_mux_offer(Some(            │
 │        TransportOffer::mux(max_peer_initiated_streams)   │
-│    )                                                     │
+│    ))                                                    │
 │ 2. Perform CMS or ECIES handshake                        │
 │ 3. settings = transport.negotiated_mux()  // Some(...)   │
 │ 4. (reader, writer) = transport.into_split()             │
@@ -2051,7 +2051,7 @@ use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
 use tightbeam::transport::ResponsePackage;
 use tightbeam::Frame;
 
-transport = transport.with_mux_config(TransportOffer::mux(32));
+transport = transport.with_mux_offer(Some(TransportOffer::mux(32)));
 // ... perform CMS or ECIES handshake ...
 
 let settings = transport.negotiated_mux().expect("mux negotiated");
@@ -2069,7 +2069,7 @@ tokio::spawn(async move {
 		.await
 });
 
-let response = handle.emit_on_stream(frame).await?;
+let response = handle.emit_on_stream(&frame).await?;
 handle.shutdown().await?;
 ```
 

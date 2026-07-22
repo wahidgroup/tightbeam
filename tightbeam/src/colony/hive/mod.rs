@@ -41,6 +41,7 @@ use core::time::Duration;
 
 use crate::constants::DEFAULT_BACKPRESSURE_THRESHOLD_BPS;
 use crate::trace::TraceCollector;
+use crate::transport::handshake::negotiation::TransportOffer;
 use crate::transport::policy::CoreRetryPolicy;
 use crate::transport::Protocol;
 use crate::utils::BasisPoints;
@@ -496,6 +497,9 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 	/// TLS configuration for spawned servlets (default: None = plain transport)
 	#[cfg(feature = "x509")]
 	pub hive_tls: Option<Arc<HiveTlsConfig>>,
+	/// Multiplexing advertisement for the servlet pool and the control
+	/// server (default: `None` = single-flight)
+	pub mux_offer: Option<TransportOffer>,
 }
 
 impl<L: LoadBalancer + core::fmt::Debug, R: MessageRouter + core::fmt::Debug> core::fmt::Debug for HiveConf<L, R> {
@@ -552,6 +556,7 @@ impl Default for HiveConf {
 			trust_store: None,
 			#[cfg(feature = "x509")]
 			hive_tls: None,
+			mux_offer: None,
 		}
 	}
 }

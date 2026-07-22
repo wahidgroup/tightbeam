@@ -39,6 +39,10 @@ pub enum TransportFailure {
 	TamperDetected,
 	/// Gate policy rejected (busy)
 	Busy,
+	/// Local stream cap exhausted on a multiplexed connection: every
+	/// concurrent stream slot is in flight. Retry after a response frees
+	/// a slot, or open another connection
+	StreamsExhausted,
 	/// Gate policy rejected (forbidden)
 	Forbidden,
 	/// Gate policy rejected (unauthorized)

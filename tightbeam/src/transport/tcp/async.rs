@@ -56,6 +56,7 @@ mod x509 {
 	pub use crate::transport::handshake::{
 		BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
 	};
+	pub use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 	pub use crate::transport::state::EncryptedProtocolState;
 	pub use crate::transport::{EncryptedMessageIO, TransportEncryptionConfig};
 	pub use crate::x509::Certificate;
@@ -534,27 +535,135 @@ where
 	}
 }
 
-/// Receive side of a split envelope link.
-///
-/// Decouples the [`MuxTransport`](crate::transport::multiplex::MuxTransport)
-/// router from the link's protection policy: [`TransportReader`] decrypts
-/// and enforces AEAD sequencing, [`CleartextReader`] enforces neither.
-#[cfg(feature = "x509")]
-pub trait EnvelopeSource: MaybeSend {
-	fn read_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend;
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+mod mux {
+	pub use crate::transport::multiplex::{MuxCapable, MuxConnector};
+
+	#[cfg(feature = "transport-policy")]
+	pub use crate::policy::AcceptAllGate;
+	#[cfg(feature = "transport-policy")]
+	pub(crate) use crate::transport::messaging::{collect_step, CollectStep};
+	#[cfg(feature = "transport-policy")]
+	pub use crate::transport::multiplex::{GatedHalves, MuxAcceptor};
 }
 
-/// Send side of a split envelope link.
-///
-/// Send-direction counterpart of [`EnvelopeSource`].
-#[cfg(feature = "x509")]
-pub trait EnvelopeSink: MaybeSend {
-	fn write_envelope(&mut self, envelope: TransportEnvelope) -> impl Future<Output = TransportResult<()>> + MaybeSend;
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use mux::*;
 
-	/// Envelopes still writable before the link demands a rekey.
+/// Async transports only: the mux plane needs split halves and spawned
+/// drivers, so advertising multiplexing anywhere else would negotiate a
+/// capability the endpoint cannot honor.
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> TcpTransport<S, P>
+where
+	TransportError: From<S::Error>,
+{
+	/// Set the local mux advertisement, bound into the handshake
+	/// transcript. `None` advertises nothing.
 	///
-	/// Links without keys never rekey and report `u64::MAX`.
-	fn remaining_records(&self) -> u64;
+	/// Inherent so concrete callers need no [`MuxCapable`] import.
+	pub fn with_mux_offer(mut self, offer: Option<TransportOffer>) -> Self {
+		self.mux_config = offer;
+		self
+	}
+}
+
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+impl<S: AsyncProtocolStream, P: CryptoProvider + Send + Sync> MuxCapable for TcpTransport<S, P>
+where
+	TransportError: From<S::Error>,
+{
+	fn with_mux_offer(self, offer: Option<TransportOffer>) -> Self {
+		// Inherent method wins lookup, so this is not self-recursion
+		self.with_mux_offer(offer)
+	}
+
+	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		// Inherent getter shared by all TCP transports
+		self.negotiated_mux()
+	}
+}
+
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+impl<S> MuxConnector for TcpTransport<S>
+where
+	S: SplittableStream,
+	S::ReadHalf: Send + 'static,
+	S::WriteHalf: Send + 'static,
+	TransportError: From<S::Error>,
+{
+	type EnvelopeReader = TransportReader<S::ReadHalf>;
+	type EnvelopeWriter = TransportWriter<S::WriteHalf>;
+
+	async fn complete_client_handshake(&mut self) -> TransportResult<()> {
+		self.ensure_handshake_complete().await
+	}
+
+	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)> {
+		self.into_split()
+	}
+}
+
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-policy",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+impl<S> MuxAcceptor for TcpTransport<S>
+where
+	S: SplittableStream,
+	S::ReadHalf: Send + 'static,
+	S::WriteHalf: Send + 'static,
+	TransportError: From<S::Error>,
+{
+	type EnvelopeReader = TransportReader<S::ReadHalf>;
+	type EnvelopeWriter = TransportWriter<S::WriteHalf>;
+
+	/// Cleartext servers (no certificate) never handshake and never mux:
+	/// `Ok(None)` without touching the wire.
+	async fn negotiate_mux(&mut self) -> TransportResult<Option<MuxSettings>> {
+		if self.to_server_certificate_ref().is_none() {
+			return Ok(None);
+		}
+
+		while self.to_handshake_state() != TcpHandshakeState::Complete {
+			match collect_step(self).await? {
+				CollectStep::Handshake(handshake_bytes) => {
+					self.perform_server_handshake(&handshake_bytes).await?;
+				}
+				CollectStep::Envelope(_) => return Err(TransportError::InvalidState),
+			}
+		}
+
+		Ok(self.negotiated_mux())
+	}
+
+	fn into_gated_halves(mut self) -> TransportResult<GatedHalves<Self>> {
+		let gate = core::mem::replace(&mut self.collector_gate, Box::new(AcceptAllGate));
+		let halves = self.into_split()?;
+		Ok((gate, halves))
+	}
 }
 
 /// Exclusive receive half of a split encrypted transport.

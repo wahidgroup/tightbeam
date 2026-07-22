@@ -27,6 +27,10 @@
 
 use core::future::Future;
 
+#[cfg(feature = "transport-policy")]
+use crate::policy::GatePolicy;
+use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
+use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::Frame;
@@ -132,13 +136,73 @@ pub trait MultiplexedProtocol {
 	/// pending response slot, and resolves when the correlated response
 	/// arrives. Dropping the returned future before it resolves cancels the
 	/// stream and frees its concurrency slot.
-	fn emit_on_stream(&self, frame: Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend;
+	fn emit_on_stream(&self, frame: &Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend;
 
 	/// Cancel a locally-initiated in-flight stream
 	///
 	/// Best-effort: removes the pending entry, frees the concurrency slot,
 	/// and notifies the peer without blocking. Never panics.
 	fn close_stream(&self, stream_id: StreamId);
+}
+
+/// Mux capability advertisement, bound into the handshake transcript.
+///
+/// Implemented only by transports that can attach the mux plane after
+/// negotiation (split envelope halves plus spawned drivers): advertising
+/// anywhere else would negotiate a capability the endpoint cannot honor.
+pub trait MuxCapable: Sized {
+	/// Set the local mux advertisement. `None` advertises nothing.
+	fn with_mux_offer(self, offer: Option<TransportOffer>) -> Self;
+
+	/// Negotiated multiplexing settings from a completed handshake.
+	/// `None` means the connection is single-flight.
+	fn negotiated_mux(&self) -> Option<MuxSettings>;
+}
+
+/// Client-side mux connection setup.
+///
+/// Abstracts the concrete transport so the connection pool stays generic
+/// over [`Protocol`](crate::transport::Protocol).
+pub trait MuxConnector: MuxCapable {
+	/// Envelope read half after splitting.
+	type EnvelopeReader: EnvelopeSource + Send + 'static;
+	/// Envelope write half after splitting.
+	type EnvelopeWriter: EnvelopeSink + Send + 'static;
+
+	/// Drive the client handshake to completion. Does nothing on transports
+	/// without encryption material, which then never negotiate mux.
+	fn complete_client_handshake(&mut self) -> impl Future<Output = TransportResult<()>> + MaybeSend;
+
+	/// Split into envelope halves for the mux drivers.
+	fn into_envelope_halves(self) -> TransportResult<(Self::EnvelopeReader, Self::EnvelopeWriter)>;
+}
+
+/// Collector gate plus envelope halves of a consumed [`MuxAcceptor`].
+#[cfg(feature = "transport-policy")]
+pub type GatedHalves<T> = (
+	Box<dyn GatePolicy>,
+	(<T as MuxAcceptor>::EnvelopeReader, <T as MuxAcceptor>::EnvelopeWriter),
+);
+
+/// Server-side counterpart of [`MuxConnector`]: negotiate multiplexing
+/// while accepting, then hand the connection to the mux plane.
+#[cfg(feature = "transport-policy")]
+pub trait MuxAcceptor: MuxCapable {
+	/// Envelope read half after splitting.
+	type EnvelopeReader: EnvelopeSource + Send + 'static;
+	/// Envelope write half after splitting.
+	type EnvelopeWriter: EnvelopeSink + Send + 'static;
+
+	/// Drive the server-side handshake to completion and report the
+	/// negotiated multiplexing settings. `Ok(None)` means the connection
+	/// MUST be served single-flight.
+	fn negotiate_mux(&mut self) -> impl Future<Output = TransportResult<Option<MuxSettings>>> + MaybeSend;
+
+	/// Consume the transport into its collector gate plus envelope halves.
+	/// Consuming means no placeholder gate ever sits inside a live
+	/// collector: the gate moves to the mux responder, the transport
+	/// ceases to exist.
+	fn into_gated_halves(self) -> TransportResult<GatedHalves<Self>>;
 }
 
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
@@ -164,7 +228,7 @@ mod router {
 	};
 	use crate::transport::error::TransportFailure;
 	use crate::transport::handshake::negotiation::MuxSettings;
-	use crate::transport::tcp::r#async::{EnvelopeSink, EnvelopeSource};
+	use crate::transport::io::{EnvelopeSink, EnvelopeSource};
 	use crate::transport::{TransportError, TransportResult};
 	use crate::utils::marker::MaybeSend;
 	use crate::Frame;
@@ -265,7 +329,7 @@ mod router {
 				return Err(TransportError::Draining);
 			}
 			if state.pending.len() >= cap_as_usize(self.local_cap) {
-				return Err(TransportError::OperationFailed(TransportFailure::Busy));
+				return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted));
 			}
 
 			let stream_id = state.next_stream_id.ok_or(TransportError::Draining)?;
@@ -443,11 +507,11 @@ mod router {
 		/// compose by wrapping this future in the caller's timer.
 		///
 		/// # Errors
-		/// - `OperationFailed(Busy)`: local-initiated cap exhausted, or the
-		///   peer refused the stream
+		/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
+		/// - `OperationFailed(Busy)`: the peer refused the stream
 		/// - `Draining`: GoAway sent or received. No new streams
 		/// - `ConnectionClosed`: connection failed before the response
-		pub async fn emit_on_stream(&self, frame: Frame) -> TransportResult<Option<Frame>> {
+		pub async fn emit_on_stream(&self, frame: &Frame) -> TransportResult<Option<Frame>> {
 			// Encode before allocating so an encoding failure never burns
 			// a stream ID or queues a cancel for a stream the peer never saw.
 			let payload = frame.to_der()?;
@@ -513,7 +577,7 @@ mod router {
 			self.shared.local_cap
 		}
 
-		fn emit_on_stream(&self, frame: Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend {
+		fn emit_on_stream(&self, frame: &Frame) -> impl Future<Output = TransportResult<Option<Frame>>> + MaybeSend {
 			MuxHandle::emit_on_stream(self, frame)
 		}
 
@@ -652,9 +716,21 @@ mod router {
 				return Err(self.protocol_violation());
 			}
 
-			let message = self.decode_stream_frame(package.payload())?;
+			// Resolve before decoding: stale ends are discarded without
+			// inspecting their payload, and non-Accepted trailers never
+			// contribute a frame, so garbage bytes on either cannot tear
+			// down the connection.
+			let Some(sender) = self.shared.remove_pending(stream_id) else {
+				return Ok(());
+			};
+
+			let message = match package.status() {
+				TransitStatus::Accepted => self.decode_stream_frame(package.payload())?,
+				_ => None,
+			};
+
 			let response = ResponsePackage::new(package.status(), message);
-			self.shared.resolve(stream_id, StreamOutcome::Response(response));
+			let _ = sender.send(StreamOutcome::Response(response));
 			Ok(())
 		}
 
@@ -987,7 +1063,7 @@ mod router {
 			assert!(matches!(shared.allocate(slot()), Ok(3)));
 			assert!(matches!(
 				shared.allocate(slot()),
-				Err(TransportError::OperationFailed(TransportFailure::Busy))
+				Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
 			));
 		}
 

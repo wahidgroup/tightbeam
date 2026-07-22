@@ -4,10 +4,11 @@
 //! assembles `MuxTransport` routers from the split halves, and verifies:
 //!
 //! - Concurrent interleaved streams with out-of-order response correlation
-//! - Local-initiated cap exhaustion answered with `Busy`
+//! - Local-initiated cap exhaustion answered with `StreamsExhausted`
 //! - Muxed envelopes rejected on a connection that never negotiated mux
 //! - Cancelling an in-flight stream frees its cap slot and aborts the handler
 //! - A response racing a cancel on the connection is discarded cleanly
+//! - Garbage payload on a stale stream is discarded without teardown
 //! - GoAway drains in-flight streams and rejects new ones
 //! - Rekey drain headroom table (`2 * (local_cap + peer_cap) + 1` vs record limit)
 //! - Cancel-budget boundary: N cancels OK, N+1 yields GoAway(EnhanceYourCalm)
@@ -89,10 +90,11 @@ mod negotiated {
 			gate: Accepted,
 			assertions: [
 				("mux_interleaved_out_of_order", exactly!(1), equals!(true)),
-				("mux_cap_exhaustion_busy", exactly!(1), equals!(true)),
+				("mux_cap_exhaustion", exactly!(1), equals!(true)),
 				("mux_non_negotiated_rejected", exactly!(1), equals!(true)),
 				("mux_cancel_frees_slot_and_aborts_handler", exactly!(1), equals!(true)),
 				("mux_cancel_response_race_discarded", exactly!(1), equals!(true)),
+				("mux_stale_stream_garbage_tolerated", exactly!(1), equals!(true)),
 				("mux_goaway_drains_and_rejects_new", exactly!(1), equals!(true)),
 				("mux_rekey_headroom_table", exactly!(1), equals!(true)),
 				("mux_cancel_budget_boundary", exactly!(1), equals!(true)),
@@ -116,10 +118,11 @@ mod negotiated {
 		environment Bare {
 			exec: |trace| async move {
 				mux_interleaved_out_of_order(&trace).await?;
-				mux_cap_exhaustion_busy(&trace).await?;
+				mux_cap_exhaustion(&trace).await?;
 				mux_non_negotiated_rejected(&trace).await?;
 				mux_cancel_frees_slot_and_aborts_handler(&trace).await?;
 				mux_cancel_response_race_discarded(&trace).await?;
+				mux_stale_stream_garbage_tolerated(&trace).await?;
 				mux_goaway_drains_and_rejects_new(&trace).await?;
 				mux_rekey_headroom_table(&trace).await?;
 				mux_cancel_budget_boundary(&trace).await?;
@@ -159,7 +162,7 @@ mod negotiated {
 		let server_task = tokio::spawn(async move {
 			let (mut transport, _) = listener.accept().await.map_err(TransportError::from)?;
 			if let Some(offer) = server_offer {
-				transport = transport.with_mux_config(offer);
+				transport = transport.with_mux_offer(Some(offer));
 			}
 
 			// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
@@ -170,7 +173,7 @@ mod negotiated {
 
 		let mut client = connect_pinned_client(addr, &materials.certificate).await?;
 		if let Some(offer) = client_offer {
-			client = client.with_mux_config(offer);
+			client = client.with_mux_offer(Some(offer));
 		}
 
 		client.perform_client_handshake().await?;
@@ -412,7 +415,7 @@ mod negotiated {
 
 	fn spawn_emit(handle: &MuxHandle, frame: Frame) -> EmitTask {
 		let handle = handle.clone();
-		tokio::spawn(async move { handle.emit_on_stream(frame).await })
+		tokio::spawn(async move { handle.emit_on_stream(&frame).await })
 	}
 
 	/// Abort an in-flight emit. Drop guard removes pending and queues MuxCancel.
@@ -520,8 +523,8 @@ mod negotiated {
 		result.as_ref() == Some(expected)
 	}
 
-	fn is_busy(result: &Result<Option<Frame>, TransportError>) -> bool {
-		matches!(result, Err(TransportError::OperationFailed(TransportFailure::Busy)))
+	fn is_streams_exhausted(result: &Result<Option<Frame>, TransportError>) -> bool {
+		matches!(result, Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)))
 	}
 
 	fn is_draining(result: &Result<Option<Frame>, TransportError>) -> bool {
@@ -598,8 +601,8 @@ mod negotiated {
 		let _server_serve = tokio::spawn(pair.server_responder.serve(handler));
 
 		let (first, second) = tokio::join!(
-			pair.client.handle.emit_on_stream(frame_first.clone()),
-			pair.client.handle.emit_on_stream(frame_second.clone()),
+			pair.client.handle.emit_on_stream(&frame_first),
+			pair.client.handle.emit_on_stream(&frame_second),
 		);
 
 		let ok = is_echo(first?, &frame_first) && is_echo(second?, &frame_second);
@@ -607,8 +610,9 @@ mod negotiated {
 		Ok(())
 	}
 
-	/// Cap=1: second concurrent emit Busy. Succeeds after the held slot frees.
-	async fn mux_cap_exhaustion_busy(trace: &TraceCollector) -> Result<(), TightBeamError> {
+	/// Cap=1: second concurrent emit StreamsExhausted. Succeeds after the
+	/// held slot frees.
+	async fn mux_cap_exhaustion(trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let (client, server) = establish_transports(Some(mux_offer(4)), Some(mux_offer(1))).await?;
 		let settings = client
 			.negotiated_mux()
@@ -623,14 +627,14 @@ mod negotiated {
 		let held_task = spawn_emit(&client_end.handle, frame_held.clone());
 		started.notified().await;
 
-		let busy = client_end.handle.emit_on_stream(mux_frame("mux-extra")).await;
-		let busy_ok = is_busy(&busy);
+		let exhausted = client_end.handle.emit_on_stream(&mux_frame("mux-extra")).await;
+		let exhausted_ok = is_streams_exhausted(&exhausted);
 		release.notify_one();
 
 		let echoed = await_ok(held_task, "held emit task must not panic").await?;
 		let echo_ok = is_echo(echoed, &frame_held);
 
-		trace.event_with("mux_cap_exhaustion_busy", &[], cap_ok && busy_ok && echo_ok)?;
+		trace.event_with("mux_cap_exhaustion", &[], cap_ok && exhausted_ok && echo_ok)?;
 		Ok(())
 	}
 
@@ -675,7 +679,7 @@ mod negotiated {
 		abort_emit(cancelled_task).await;
 
 		let frame_followup = mux_frame("mux-followup");
-		let echoed = pair.client.handle.emit_on_stream(frame_followup.clone()).await?;
+		let echoed = pair.client.handle.emit_on_stream(&frame_followup).await?;
 		let ok = is_echo(echoed, &frame_followup) && aborted.load(Ordering::SeqCst);
 
 		trace.event_with("mux_cancel_frees_slot_and_aborts_handler", &[], ok)?;
@@ -715,6 +719,33 @@ mod negotiated {
 		Ok(())
 	}
 
+	/// Garbage payload on a stale (cancelled) stream: discarded without
+	/// tearing down the connection. Later streams stay healthy.
+	async fn mux_stale_stream_garbage_tolerated(trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let mut link = establish_client_mux_server_raw(4).await?;
+
+		let stale_task = spawn_emit(&link.client.handle, mux_frame("mux-stale"));
+		let (stale_id, _) = read_muxed_request(&mut link.server_reader).await?;
+		abort_emit(stale_task).await;
+
+		let _cancel = link.server_reader.read_envelope().await?;
+
+		let garbage =
+			MuxEndPackage::new(stale_id, TransitStatus::Accepted, vec![0xDE, 0xAD]).map_err(TransportError::from)?;
+		link.server_writer.write_envelope(garbage.into()).await?;
+
+		let frame_followup = mux_frame("mux-still-alive");
+		let followup_task = spawn_emit(&link.client.handle, frame_followup.clone());
+		let (followup_id, followup_message) = read_muxed_request(&mut link.server_reader).await?;
+		write_muxed_echo(&mut link.server_writer, followup_id, &followup_message).await?;
+
+		let echoed = await_ok(followup_task, "follow-up emit task must not panic").await?;
+		let ok = is_echo(echoed, &frame_followup);
+
+		trace.event_with("mux_stale_stream_garbage_tolerated", &[], ok)?;
+		Ok(())
+	}
+
 	/// Shutdown GoAway drains in-flight work and rejects new streams as Draining.
 	async fn mux_goaway_drains_and_rejects_new(trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let pair = establish_mux_pair(4).await?;
@@ -725,7 +756,7 @@ mod negotiated {
 		started.notified().await;
 
 		let shutdown_future = kick_shutdown(&pair.client.handle).await;
-		let late = pair.client.handle.emit_on_stream(mux_frame("mux-late")).await;
+		let late = pair.client.handle.emit_on_stream(&mux_frame("mux-late")).await;
 		let draining_ok = is_draining(&late);
 
 		release.notify_one();
@@ -762,7 +793,7 @@ mod negotiated {
 
 		let goaway = link.client_reader.read_envelope().await?;
 		let goaway_ok = is_goaway(&goaway, GoAwayReason::Shutdown, Some(last_stream_id));
-		let late = link.server.handle.emit_on_stream(mux_frame("mux-rekey-late")).await;
+		let late = link.server.handle.emit_on_stream(&mux_frame("mux-rekey-late")).await;
 		let draining_ok = is_draining(&late);
 
 		Ok(responses_ok && goaway_ok && draining_ok)
@@ -839,7 +870,7 @@ mod negotiated {
 		let _client_serve = spawn_immediate_echo(pair.client_responder);
 
 		let frame = mux_frame("mux-server-init");
-		let echoed = pair.server.handle.emit_on_stream(frame.clone()).await?;
+		let echoed = pair.server.handle.emit_on_stream(&frame).await?;
 		trace.event_with("mux_server_initiated_roundtrip", &[], is_echo(echoed, &frame))?;
 		Ok(())
 	}
@@ -872,7 +903,7 @@ mod negotiated {
 		let kept = await_ok(kept_task, "kept emit task must not panic").await?;
 		let kept_ok = is_echo(kept, &frame_kept);
 
-		let late = link.client.handle.emit_on_stream(mux_frame("mux-after-peer-goaway")).await;
+		let late = link.client.handle.emit_on_stream(&mux_frame("mux-after-peer-goaway")).await;
 		let late_ok = is_draining(&late);
 
 		trace.event_with("mux_peer_goaway_fails_pending_above", &[], dropped_ok && kept_ok && late_ok)?;
@@ -1004,8 +1035,8 @@ mod negotiated {
 		let _server_serve = tokio::spawn(server_responder.serve(handler));
 
 		let (first, second) = tokio::join!(
-			client_end.handle.emit_on_stream(frame_first.clone()),
-			client_end.handle.emit_on_stream(frame_second.clone()),
+			client_end.handle.emit_on_stream(&frame_first),
+			client_end.handle.emit_on_stream(&frame_second),
 		);
 
 		let ok = is_echo(first?, &frame_first) && is_echo(second?, &frame_second);

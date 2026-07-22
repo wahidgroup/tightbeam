@@ -548,7 +548,7 @@ where
 			signer_infos: vec![signer_info].try_into()?,
 		};
 
-		signed_data.to_der().map_err(Into::into)
+		Ok(signed_data.to_der()?)
 	}
 
 	/// Finalize server finished by updating transcript and transitioning state.
