@@ -16,7 +16,7 @@ use tightbeam::{
 	exactly,
 	policy::{GatePolicy, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{create_test_signing_key, ScenarioConf},
+	testing::{create_test_signing_key, ClientEnv, ServletEnv, SetupEnv},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	worker, Beamable, Frame, TightBeamError,
 };
@@ -45,7 +45,7 @@ pub struct CalcResponse {
 worker! {
 	name: DoublerWorker<CalcRequest, Result<u32, TightBeamError>>,
 	handle: |input, trace| async move {
-		trace.event("doubler_process")?;
+		trace.event(CalcServletSpec::doubler_process)?;
 		Ok(input.value * 2)
 	}
 }
@@ -57,7 +57,7 @@ worker! {
 		add_offset: u32,
 	},
 	handle: |input, trace, config| async move {
-		trace.event("squarer_process")?;
+		trace.event(CalcServletSpec::squarer_process)?;
 		Ok(input.value * input.value + config.add_offset)
 	}
 }
@@ -82,7 +82,7 @@ servlet! {
 		let trace = ctx.trace();
 		let config: &CalcServletConf = ctx.env_config()?;
 
-		trace.event("servlet_receive")?;
+		trace.event(CalcServletSpec::servlet_receive)?;
 
 		// Process with both workers in parallel via context
 		let request_arc = Arc::new(request);
@@ -98,7 +98,7 @@ servlet! {
 		let sum = doubled + squared;
 		let final_result = sum * config.final_multiplier;
 
-		trace.event("servlet_respond")?;
+		trace.event(CalcServletSpec::servlet_respond)?;
 
 		Ok(Some(compose! {
 			V0: id: b"calc-response-id",
@@ -117,30 +117,28 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("servlet_receive", exactly!(1)),
-			("doubler_process", exactly!(1)),
-			("squarer_process", exactly!(1)),
-			("servlet_respond", exactly!(1)),
-			("verify_doubled", exactly!(1), equals!(10u32)),
-			("verify_squared", exactly!(1), equals!(35u32)),
-			("verify_final_result", exactly!(1), equals!(135u32))
+			(servlet_receive, exactly!(1)),
+			(doubler_process, exactly!(1)),
+			(squarer_process, exactly!(1)),
+			(servlet_respond, exactly!(1)),
+			(verify_doubled, exactly!(1), equals!(10u32)),
+			(verify_squared, exactly!(1), equals!(35u32)),
+			(verify_final_result, exactly!(1), equals!(135u32))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_servlet_conf_with_workers,
-	config: ScenarioConf::<CalcServletConf>::builder()
-		.with_specs(vec![CalcServletSpec::latest()])
-		.with_env_config(CalcServletConf {
+	spec: CalcServletSpec,
+	environment Servlet {
+		context: CalcServletConf {
 			squarer_offset: 10,
 			final_multiplier: 3,
 			value: 5,
-		})
-		.build(),
-	environment Servlet {
-		servlet: CalcServlet,
-		start: |trace, config| async move {
+		},
+		start: |SetupEnv { trace, context: config }| async move {
+			let trace = Arc::new(trace);
 			let doubler = DoublerWorker::new(());
 			let squarer = SquarerWorker::new(SquarerWorkerConf {
 				add_offset: config.squarer_offset
@@ -152,15 +150,14 @@ tb_scenario! {
 				.with_worker(squarer)
 				.build();
 
-			// Start servlet via trait
 			CalcServlet::start(trace, Some(servlet_conf)).await
 		},
-		setup: |servlet_addr, _config| async move {
+		setup: |ClientEnv { addr, .. }| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let client = builder.connect(servlet_addr).await?;
+			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
-		client: |trace, mut client, config| async move {
+		client: |ServletEnv { trace, mut client, context: config }| async move {
 			let request = compose! {
 				V0: id: b"calc-request-id",
 					message: CalcRequest { value: config.value }
@@ -169,10 +166,9 @@ tb_scenario! {
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			// Verify results using trace events with equals! assertions
-			trace.event_with("verify_doubled", &[], response.doubled)?;
-			trace.event_with("verify_squared", &[], response.squared)?;
-			trace.event_with("verify_final_result", &[], response.final_result)?;
+			trace.event_with(CalcServletSpec::verify_doubled, &[], response.doubled)?;
+			trace.event_with(CalcServletSpec::verify_squared, &[], response.squared)?;
+			trace.event_with(CalcServletSpec::verify_final_result, &[], response.final_result)?;
 
 			Ok(())
 		}
@@ -213,9 +209,8 @@ servlet! {
 	protocol: TokioListener,
 	handle: |request, frame, ctx| async move {
 		let trace = ctx.trace();
-		trace.event("secure_receive")?;
-		trace.event_with(
-			"secure_frame_cleartext",
+		trace.event(SecureCalcServletSpec::secure_receive)?;
+		trace.event_with(SecureCalcServletSpec::secure_frame_cleartext,
 			&[],
 			u32::from(frame.metadata.confidentiality.is_none() && frame.metadata.compactness.is_none()),
 		)?;
@@ -234,26 +229,24 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("secure_receive", exactly!(1)),
-			("secure_frame_cleartext", exactly!(1), equals!(1u32)),
-			("verify_secure_doubled", exactly!(1), equals!(14u32))
+			(secure_receive, exactly!(1)),
+			(secure_frame_cleartext, exactly!(1), equals!(1u32)),
+			(verify_secure_doubled, exactly!(1), equals!(14u32))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_typed_servlet_full_feature_stack,
-	config: ScenarioConf::<CalcServletConf>::builder()
-		.with_specs(vec![SecureCalcServletSpec::latest()])
-		.with_env_config(CalcServletConf {
+	spec: SecureCalcServletSpec,
+	environment Servlet {
+		context: CalcServletConf {
 			squarer_offset: 0,
 			final_multiplier: 1,
 			value: 7,
-		})
-		.build(),
-	environment Servlet {
-		servlet: SecureCalcServlet,
-		start: |trace, config| async move {
+		},
+		start: |SetupEnv { trace, context: config }| async move {
+			let trace = Arc::new(trace);
 			let verifying_key = *create_test_signing_key().verifying_key();
 			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
@@ -264,12 +257,12 @@ tb_scenario! {
 
 			SecureCalcServlet::start(trace, Some(servlet_conf)).await
 		},
-		setup: |servlet_addr, _config| async move {
+		setup: |ClientEnv { addr, .. }| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let client = builder.connect(servlet_addr).await?;
+			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
-		client: |trace, mut client, config| async move {
+		client: |ServletEnv { trace, mut client, context: config }| async move {
 			let request = compose! {
 				V2: id: b"secure-calc-request-id",
 					order: 1u64,
@@ -284,7 +277,7 @@ tb_scenario! {
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			trace.event_with("verify_secure_doubled", &[], response.doubled)?;
+			trace.event_with(SecureCalcServletSpec::verify_secure_doubled, &[], response.doubled)?;
 
 			Ok(())
 		}

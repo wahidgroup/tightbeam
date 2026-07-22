@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use tightbeam::colony::servlet::ServletConf;
 use tightbeam::matrix::{MatrixDyn, MatrixLike};
-use tightbeam::testing::ScenarioConf;
+use tightbeam::testing::{ScenarioConf, ServletEnv, SetupEnv};
 use tightbeam::transport::policy::RestartExponentialBackoff;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::ClientBuilder;
@@ -49,20 +49,20 @@ tb_assert_spec! {
 		gate: Accepted,
 		assertions: [
 			// Core requirement: at least one move must be sent
-			("client_move_sent", at_least!(1)),
-			("client_moves_processed_balance", exactly!(1), equals!(0i64), tags: ["balance"]),
-			("client_server_move_balance", exactly!(1), equals!(0i64), tags: ["balance"]),
-			("client_game_restart_balance", exactly!(1), equals!(0i64), tags: ["lifecycle"]),
+			(client_move_sent, at_least!(1)),
+			(client_moves_processed_balance, exactly!(1), equals!(0i64), tags: ["balance"]),
+			(client_server_move_balance, exactly!(1), equals!(0i64), tags: ["balance"]),
+			(client_game_restart_balance, exactly!(1), equals!(0i64), tags: ["lifecycle"]),
 
 			// Server-side servlet instrumentation guarantees
-			("server_move_received", at_least!(1)),
-			("server_response_emitted", at_least!(1)),
-			("server_decode_failure", exactly!(0)),
-			("server_state_lock_poisoned", exactly!(0)),
+			(server_move_received, at_least!(1)),
+			(server_response_emitted, at_least!(1)),
+			(server_decode_failure, exactly!(0)),
+			(server_state_lock_poisoned, exactly!(0)),
 
 			// Individual error bounds remain for diagnostics
-			("client_no_response", at_most!(5)),
-			("client_decode_error", at_most!(5)),
+			(client_no_response, at_most!(5)),
+			(client_decode_error, at_most!(5)),
 		]
 	},
 	annotations { description: "Comprehensive chess game assertion specification" }
@@ -151,23 +151,22 @@ tb_process_spec! {
 
 tb_scenario! {
 	fuzz: afl,
-	config: ScenarioConf::<ChessEngineServletConf>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ChessAssertSpec::latest())
 		.with_csp(ChessGameFlow)
-		.with_env_config(ChessEngineServletConf {
-			manager: ChessMatchManager::default(),
-		})
 		.build(),
 	environment Servlet {
-		servlet: ChessEngineServlet,
-		start: |trace, config| async move {
+		context: ChessEngineServletConf {
+			manager: ChessMatchManager::default(),
+		},
+		start: |SetupEnv { trace, context }| async move {
 			let servlet_conf = ServletConf::<TokioListener, ChessMoveRequest>::builder()
-				.with_config(config)
+				.with_config(context)
 				.build();
 
-			ChessEngineServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
+			ChessEngineServlet::start(Arc::new(trace), Some(servlet_conf)).await
 		},
-		setup: |addr, _config| async move {
+		setup: |env| async move {
 			// Create a custom client with exponential backoff retry policy
 			// Exponential backoff: 100ms, 200ms, 400ms, 800ms delays (max 3 attempts)
 			let restart_policy = RestartExponentialBackoff::new(3, 100, None);
@@ -175,11 +174,11 @@ tb_scenario! {
 				.with_restart(restart_policy)
 				.with_timeout(Duration::from_millis(500))
 				.build();
-			let client = client_builder.connect(addr).await?;
+			let client = client_builder.connect(env.addr).await?;
 
 			Ok(client)
 		},
-		client: |trace, mut client, _config| async move {
+		client: |ServletEnv { trace, mut client, .. }| async move {
 			#[derive(Default)]
 			struct GameStats {
 				move_sent_count: u64,
@@ -245,7 +244,7 @@ tb_scenario! {
 					_ => ChessMove::from((0u8, 0u8, 0u8, 0u8)).to_request(),
 				};
 
-				trace.event("client_move_sent")?;
+				trace.event(ChessAssertSpec::client_move_sent)?;
 				stats.move_sent_count += 1;
 
 				// Emit piece kind event only after move is sent (not before validation)
@@ -270,7 +269,7 @@ tb_scenario! {
 				).await {
 					Ok(Ok(Some(frame))) => frame,
 					Ok(Ok(None)) => {
-						trace.event("client_no_response")?;
+						trace.event(ChessAssertSpec::client_no_response)?;
 						stats.no_response_count += 1;
 						break;
 					}
@@ -292,7 +291,7 @@ tb_scenario! {
 				let response: ChessMoveResponse = match decode(&response_frame.message) {
 					Ok(r) => r,
 					Err(_) => {
-						trace.event("client_decode_error")?;
+						trace.event(ChessAssertSpec::client_decode_error)?;
 						stats.decode_error_count += 1;
 						break;
 					}
@@ -345,9 +344,9 @@ tb_scenario! {
 			let moves_processed_balance = (stats.move_sent_count as i64) - (processed_moves as i64);
 			let server_move_balance = (stats.move_validated_count as i64) - (stats.server_move_count as i64);
 			let game_restart_balance = (stats.game_restarted_count as i64) - (stats.game_ended_count as i64);
-			trace.event_with("client_moves_processed_balance", &["balance"], moves_processed_balance)?;
-			trace.event_with("client_server_move_balance", &["balance"], server_move_balance)?;
-			trace.event_with("client_game_restart_balance", &["lifecycle"], game_restart_balance)?;
+			trace.event_with(ChessAssertSpec::client_moves_processed_balance, &["balance"], moves_processed_balance)?;
+			trace.event_with(ChessAssertSpec::client_server_move_balance, &["balance"], server_move_balance)?;
+			trace.event_with(ChessAssertSpec::client_game_restart_balance, &["lifecycle"], game_restart_balance)?;
 
 			Ok(())
 		}

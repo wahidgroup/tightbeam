@@ -10,6 +10,7 @@ use tightbeam::{compose, decode, servlet, Beamable, Sequence};
 
 use super::r#move::ChessMove;
 use super::state::ChessGameState;
+use super::ChessAssertSpec;
 
 // ============================================================================
 // MATCH MANAGER
@@ -35,7 +36,7 @@ impl ChessMatchManager {
 		let mut game_state = match self.game_state.lock() {
 			Ok(gs) => gs,
 			Err(_) => {
-				trace.event("server_state_lock_poisoned")?;
+				trace.event(ChessAssertSpec::server_state_lock_poisoned)?;
 				return Err(TightBeamError::LockPoisoned);
 			}
 		};
@@ -43,7 +44,7 @@ impl ChessMatchManager {
 		let mut last_order = match self.last_order.lock() {
 			Ok(lo) => lo,
 			Err(_) => {
-				trace.event("server_state_lock_poisoned")?;
+				trace.event(ChessAssertSpec::server_state_lock_poisoned)?;
 				return Err(TightBeamError::LockPoisoned);
 			}
 		};
@@ -191,18 +192,18 @@ servlet! {
 		let message_id = message.metadata.id.clone();
 		let invalid_move = |trace: Arc<TraceCollector>, id: Vec<u8>, order: u64|
 			-> Result<Option<Frame>, TightBeamError> {
-			trace.event("server_response_emitted")?;
+			trace.event(ChessAssertSpec::server_response_emitted)?;
 			Ok(Some(create_invalid_move_response(id, order)?))
 		};
 
-		trace.event("server_move_received")?;
+		trace.event(ChessAssertSpec::server_move_received)?;
 
 		// Decode ChessMoveRequest from message
 		let move_req: ChessMoveRequest = match decode(&message.message) {
 			Ok(req) => req,
 			Err(_) => {
 				// Invalid message format - return invalid move response
-				trace.event("server_decode_failure")?;
+				trace.event(ChessAssertSpec::server_decode_failure)?;
 				return invalid_move(Arc::clone(trace), message_id, message.metadata.order);
 			}
 		};
@@ -227,7 +228,7 @@ servlet! {
 
 		// Return response with game status and updated board state
 		let response = ChessMoveResponse { game_status };
-		trace.event("server_response_emitted")?;
+		trace.event(ChessAssertSpec::server_response_emitted)?;
 
 		Ok(Some(compose! {
 			V0: id: message_id,

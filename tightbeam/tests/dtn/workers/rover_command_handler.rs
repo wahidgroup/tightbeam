@@ -10,6 +10,7 @@ use tightbeam::{der::Sequence, worker, Beamable, TightBeamError};
 use crate::dtn::{
 	messages::{EarthCommand, RoverCommand},
 	servlets::MissionState,
+	ultimate::DtnEventCountSpec,
 };
 
 /// Rover command handler request (the full command message)
@@ -32,8 +33,8 @@ worker! {
 		mission_state: Arc<RwLock<MissionState>>,
 	},
 	handle: |request, trace, config| async move {
-		trace.event("rover_receive_command")?;
-		trace.event("rover_execute_command")?;
+		trace.event(DtnEventCountSpec::rover_receive_command)?;
+		trace.event(DtnEventCountSpec::rover_execute_command)?;
 
 		// Execute command based on type (parameters are in request.command.parameters if needed)
 		let rover_command = RoverCommand::try_from(request.command.command_type)?;
@@ -53,7 +54,7 @@ worker! {
 			}
 		}
 
-		trace.event("rover_command_complete")?;
+		trace.event(DtnEventCountSpec::rover_command_complete)?;
 
 		// Update mission state
 		{

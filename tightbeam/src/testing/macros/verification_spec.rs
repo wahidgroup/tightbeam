@@ -85,6 +85,29 @@ impl Cardinality {
 pub const fn between(min: u32, max: u32) -> Cardinality {
 	Cardinality::between(min, max)
 }
+
+/// Compile-time check that `tb_assert_spec!` version blocks strictly
+/// ascend. The key constants generate from the last block in source order
+/// while `latest()` selects the highest semantic version; strict ascent
+/// makes those the same block.
+pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
+	let mut index = 1;
+	while index < versions.len() {
+		let (previous_major, previous_minor, previous_patch) = versions[index - 1];
+		let (major, minor, patch) = versions[index];
+		let ascending = major > previous_major
+			|| (major == previous_major && minor > previous_minor)
+			|| (major == previous_major && minor == previous_minor && patch > previous_patch);
+		if !ascending {
+			return false;
+		}
+
+		index += 1;
+	}
+
+	true
+}
+
 pub const fn present() -> Cardinality {
 	Cardinality::present()
 }
@@ -941,10 +964,61 @@ macro_rules! __tb_assert_spec_parse_schedulability {
 	}};
 }
 
+// Emit `pub const <key>: &str` for every ident assertion key in the
+// LATEST version block (peels leading blocks until one remains). Latest
+// is what scenarios run, so its keys are the ones event sites reference.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_keys {
+	($base:ident, $first:tt $($rest:tt)+) => {
+		$crate::__tb_assert_spec_keys!($base, $($rest)+);
+	};
+	($base:ident, [ $( $assertion:tt ),* ]) => {
+		impl $base {
+			$( $crate::__tb_assert_spec_key_const!($assertion); )*
+		}
+	};
+}
+
+// Emit one key const for an ident assertion key; string keys emit nothing
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_key_const {
+	(($label:ident, $($rest:tt)*)) => {
+		#[allow(dead_code, non_upper_case_globals)]
+		pub const $label: &'static str = stringify!($label);
+	};
+	(($label:expr, $($rest:tt)*)) => {};
+}
+
 // Helper to add individual assertions (handles tags and values)
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_add_assertion {
+	// IDENT KEY: With value and tags - match equals! specifically
+	($builder:expr, ($label:ident, $card:expr, equals!($value:expr), tags: [ $($tag:expr),* $(,)? ])) => {
+		$builder
+			.assertion_with_value(stringify!($label), vec![ $($tag),* ], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
+			.expect("duplicate label or invalid range")
+	};
+	// IDENT KEY: With value, no tags - match equals! specifically
+	($builder:expr, ($label:ident, $card:expr, equals!($value:expr))) => {
+		$builder
+			.assertion_with_value(stringify!($label), vec![], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
+			.expect("duplicate label or invalid range")
+	};
+	// IDENT KEY: With tags, no value
+	($builder:expr, ($label:ident, $card:expr, tags: [ $($tag:expr),* $(,)? ])) => {
+		$builder
+			.assertion(stringify!($label), vec![ $($tag),* ], $card)
+			.expect("duplicate label or invalid range")
+	};
+	// IDENT KEY: No tags, no value (2-element tuple)
+	($builder:expr, ($label:ident, $card:expr)) => {
+		$builder
+			.assertion(stringify!($label), vec![], $card)
+			.expect("duplicate label or invalid range")
+	};
 	// NEW SYNTAX: With value and tags - match equals! specifically
 	($builder:expr, ($label:expr, $card:expr, equals!($value:expr), tags: [ $($tag:expr),* $(,)? ])) => {
 		$builder
@@ -989,6 +1063,19 @@ macro_rules! tb_assert_spec {
 	) => {
 		$(#[$meta])*
 		$vis struct $base;
+
+		// Version blocks must strictly ascend so the emitted key constants
+		// (from the last block) belong to the `latest()` spec.
+		const _: () = assert!(
+			$crate::testing::macros::versions_strictly_ascending(
+				&[ $( ($maj as u16, $min as u16, $patch as u16) ),+ ]
+			),
+			"tb_assert_spec! version blocks must be in strictly ascending semver order"
+		);
+
+		// Key consts for the latest version's ident assertion keys
+		$crate::__tb_assert_spec_keys!($base, $( [ $( $assertion ),* ] )+);
+
 		impl $base {
 			pub fn all() -> &'static [$crate::testing::macros::BuiltAssertSpec] {
 				let desc_opt: Option<&'static str> = None::<&'static str> $(.or(Some($desc)))?;
@@ -1354,4 +1441,45 @@ macro_rules! __tb_scenario_verify_impl {
 			},)?
 		)
 	}};
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	crate::tb_assert_spec! {
+		pub VersionedKeySpec,
+		V(1,0,0): {
+			mode: Accept,
+			gate: Accepted,
+			assertions: [
+				(older_key, exactly!(1))
+			]
+		},
+		V(2,0,0): {
+			mode: Accept,
+			gate: Accepted,
+			assertions: [
+				(newer_key, exactly!(1))
+			]
+		}
+	}
+
+	#[test]
+	fn key_consts_belong_to_latest_version() {
+		let latest = VersionedKeySpec::latest();
+		let generated = AssertionLabel::Custom(Cow::Borrowed(VersionedKeySpec::newer_key));
+		assert_eq!(latest.version(), (2, 0, 0));
+		assert!(latest
+			.required_assertions()
+			.iter()
+			.any(|contract| contract.label.matches(&generated)));
+	}
+
+	#[test]
+	fn version_ascent_check_accepts_and_rejects() {
+		assert!(versions_strictly_ascending(&[(1, 0, 0), (1, 1, 0), (2, 0, 0)]));
+		assert!(!versions_strictly_ascending(&[(2, 0, 0), (1, 0, 0)]));
+		assert!(!versions_strictly_ascending(&[(1, 0, 0), (1, 0, 0)]));
+	}
 }

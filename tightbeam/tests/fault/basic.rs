@@ -14,7 +14,7 @@
 //! - IEC 61508 (Functional Safety)
 
 use tightbeam::testing::fdr::FdrConfig;
-use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConf, TestHooks};
+use tightbeam::testing::{FaultModel, InjectionStrategy, ScenarioConf, SetupEnv, TestHooks};
 use tightbeam::utils::BasisPoints;
 use tightbeam::TightBeamError;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_gen_process_types, tb_process_spec, tb_scenario};
@@ -130,9 +130,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("request", at_least!(1)),
-			("response", at_least!(0)),
-			("retry", at_least!(0))
+			(request, at_least!(1)),
+			(response, at_least!(0)),
+			(retry, at_least!(0))
 		]
 	}
 }
@@ -164,7 +164,7 @@ fn build_deterministic_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_deterministic_fault_injection,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DeterministicSpec::latest())
 		.with_fdr(build_deterministic_config())
 		.with_hooks(TestHooks {
@@ -193,10 +193,10 @@ tb_scenario! {
 	})
 	.build(),
 	environment Bare {
-		exec: |trace| {
-			trace.event("request")?;
-			trace.event("response")?;
-			trace.event("success")?;
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(DeterministicSpec::request)?;
+			trace.event(DeterministicSpec::response)?;
+			trace.event(CoverageSpec::success)?;
 			Ok(())
 		}
 	}
@@ -212,8 +212,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("request", at_least!(1)),
-			("response", at_least!(0))
+			(request, at_least!(1)),
+			(response, at_least!(0))
 		]
 	}
 }
@@ -248,7 +248,7 @@ fn build_probabilistic_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_probabilistic_fault_injection,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ProbabilisticSpec::latest())
 		.with_fdr(build_probabilistic_config())
 		.with_hooks(TestHooks {
@@ -276,10 +276,10 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			trace.event("request")?;
-			trace.event("response")?;
-			trace.event("success")?;
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(ProbabilisticSpec::request)?;
+			trace.event(ProbabilisticSpec::response)?;
+			trace.event(CoverageSpec::success)?;
 			Ok(())
 		}
 	}
@@ -295,9 +295,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("request", at_least!(1)),
-			("retry", at_least!(0)),
-			("fallback", at_least!(0))
+			(request, at_least!(1)),
+			(retry, at_least!(0)),
+			(fallback, at_least!(0))
 		]
 	}
 }
@@ -344,7 +344,7 @@ fn build_multi_fault_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_multi_fault_injection,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(MultiFaultSpec::latest())
 		.with_fdr(build_multi_fault_config())
 		.with_hooks(TestHooks {
@@ -368,10 +368,10 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			trace.event("request")?;
-			trace.event("response")?;
-			trace.event("success")?;
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(MultiFaultSpec::request)?;
+			trace.event(ProbabilisticSpec::response)?;
+			trace.event(CoverageSpec::success)?;
 			Ok(())
 		}
 	}
@@ -387,12 +387,12 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("request", exactly!(1)),
-			("response", at_least!(0)),
-			("retry", at_least!(0)),
-			("fallback", at_least!(0)),
-			("success", at_least!(0)),
-			("failure", at_least!(0))
+			(request, exactly!(1)),
+			(response, at_least!(0)),
+			(retry, at_least!(0)),
+			(fallback, at_least!(0)),
+			(success, at_least!(0)),
+			(failure, at_least!(0))
 		]
 	}
 }
@@ -450,7 +450,7 @@ fn build_coverage_config() -> FdrConfig {
 
 tb_scenario! {
 	name: test_fault_coverage_analysis,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(CoverageSpec::latest())
 		.with_fdr(build_coverage_config())
 		.with_hooks(TestHooks {
@@ -485,10 +485,10 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			trace.event("request")?;
-			trace.event("response")?;
-			trace.event("success")?;
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(CoverageSpec::request)?;
+			trace.event(CoverageSpec::response)?;
+			trace.event(CoverageSpec::success)?;
 			Ok(())
 		}
 	}

@@ -122,11 +122,10 @@ impl UrnSpec for TightbeamUrnSpec {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::ScenarioConf;
 	use crate::utils::urn::UrnBuilder;
 
 	#[cfg(feature = "testing")]
-	use crate::{exactly, tb_assert_spec, tb_scenario};
+	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};
 
 	// Macro to reduce repetition in tightbeam URN tests
 	macro_rules! build_tightbeam_urn {
@@ -250,7 +249,7 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				("urn_string", exactly!(1), equals!("urn:tightbeam:instrumentation:trace/abc-123"))
+				(urn_string, exactly!(1), equals!("urn:tightbeam:instrumentation:trace/abc-123"))
 			]
 		}
 	}
@@ -258,18 +257,16 @@ mod tests {
 	#[cfg(feature = "testing")]
 	tb_scenario! {
 		name: test_tightbeam_urn_with_spec,
-		config: ScenarioConf::<()>::builder()
-			.with_spec(TightbeamUrnSpecSpec::latest())
-			.build(),
+		spec: TightbeamUrnSpecSpec,
 		environment Bare {
-			exec: |trace| {
+			exec: |SetupEnv { trace, .. }| {
 				let urn = UrnBuilder::from(TightbeamUrnSpec)
 					.set("category", "instrumentation")
 					.set("resource_type", "trace")
 					.set("resource_id", "abc-123")
 					.build()?;
 
-				trace.event_with("urn_string", &[], urn.to_string())?;
+				trace.event_with(TightbeamUrnSpecSpec::urn_string, &[], urn.to_string())?;
 
 				Ok(())
 			}

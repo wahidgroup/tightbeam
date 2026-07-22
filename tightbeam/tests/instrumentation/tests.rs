@@ -4,7 +4,7 @@
 
 #![cfg(feature = "instrument")]
 
-use tightbeam::testing::{create_test_message, ScenarioConf};
+use tightbeam::testing::{create_test_message, ClientEnv, ScenarioConf, SetupEnv};
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::tcp::TightBeamSocketAddr;
 use tightbeam::transport::{MessageEmitter, Protocol};
@@ -36,13 +36,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_auto_instrumentation_capture,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(AutoInstrSpec::latest())
 		.with_csp(MessageFlowProc)
 		.build(),
 	environment ServiceClient {
 		worker_threads: 1,
-		server: |trace| async move {
+		server: |SetupEnv { trace, .. }| async move {
 			let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
 			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 			let handle = server! {
@@ -54,7 +54,10 @@ tb_scenario! {
 			};
 			Ok((handle, addr))
 		},
-		client: |_trace, mut client| async move {
+		client: |ClientEnv { addr, .. }| async move {
+			let stream = <TokioListener as Protocol>::connect(addr).await?;
+			let mut client = <TokioListener as Protocol>::create_transport(stream);
+
 			let test_message = create_test_message(None);
 			let test_frame = compose! {
 				V0: id: "test", order: 1u64, message: test_message

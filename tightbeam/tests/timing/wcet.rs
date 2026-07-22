@@ -10,7 +10,7 @@ use tightbeam::instrumentation::TbInstrumentationConfig;
 use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::{ScenarioConf, TestHooks};
+use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
 use tightbeam::trace::TraceConfig;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet, TightBeamError};
 
@@ -35,7 +35,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("process", exactly!(1))
+			(process, exactly!(1))
 		]
 	},
 }
@@ -63,7 +63,7 @@ fn build_timing_fdr_config(specs: Vec<Process>) -> FdrConfig {
 // The actual timing verification would be called during FDR exploration or in hooks.
 tb_scenario! {
 	name: test_wcet_constraint_passing,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(SimpleWcetSpec::latest())
 		.with_fdr(build_timing_fdr_config(vec![SimpleWcetProcess::process()]))
 		.with_trace(TraceConfig::with_instrumentation(TbInstrumentationConfig {
@@ -96,9 +96,9 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Emit timing event with duration within WCET constraint (5ms < 10ms)
-			trace.event("process")?.with_timing(Duration::from_nanos(5_000_000));
+			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(5_000_000));
 			Ok(())
 		}
 	}
@@ -108,7 +108,7 @@ tb_scenario! {
 // Tests that durations exactly equal to the constraint are acceptable
 tb_scenario! {
 	name: test_wcet_constraint_at_limit,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(SimpleWcetSpec::latest())
 		.with_fdr(build_timing_fdr_config(vec![SimpleWcetProcess::process()]))
 		.with_trace(TraceConfig::with_instrumentation(TbInstrumentationConfig {
@@ -141,8 +141,8 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			trace.event("process")?.with_timing(Duration::from_nanos(10_000_000));
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(10_000_000));
 			Ok(())
 		}
 	}
@@ -153,7 +153,7 @@ tb_scenario! {
 // observed durations exceed the WCET constraint.
 tb_scenario! {
 	name: test_wcet_constraint_violation,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(SimpleWcetSpec::latest())
 		.with_fdr(build_timing_fdr_config(vec![SimpleWcetProcess::process()]))
 		.with_trace(TraceConfig::with_instrumentation(TbInstrumentationConfig {
@@ -186,8 +186,8 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			trace.event("process")?.with_timing(Duration::from_nanos(15_000_000));
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(SimpleWcetSpec::process)?.with_timing(Duration::from_nanos(15_000_000));
 			Ok(())
 		}
 	}

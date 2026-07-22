@@ -12,17 +12,18 @@
 
 use std::sync::Arc;
 
-use tightbeam::crypto::aead::{Decryptor, SessionKeys};
-use tightbeam::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
-use tightbeam::crypto::secret::ToInsecure;
-use tightbeam::exactly;
-use tightbeam::tb_assert_spec;
-use tightbeam::tb_scenario;
-use tightbeam::testing::config::ScenarioConf;
-use tightbeam::trace::TraceCollector;
-use tightbeam::transport::handshake::negotiation::SecurityOffer;
-use tightbeam::transport::handshake::{ClientHandshakeProtocol, ServerHandshakeProtocol};
-use tightbeam::TightBeamError;
+use tightbeam::{
+	crypto::{
+		aead::{Decryptor, SessionKeys},
+		profiles::{DefaultCryptoProvider, SecurityProfileDesc},
+		secret::ToInsecure,
+	},
+	exactly, tb_assert_spec, tb_scenario,
+	testing::SetupEnv,
+	trace::TraceCollector,
+	transport::handshake::{negotiation::SecurityOffer, ClientHandshakeProtocol, ServerHandshakeProtocol},
+	TightBeamError,
+};
 
 #[cfg(feature = "transport-ecies")]
 use tightbeam::{
@@ -60,24 +61,22 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("loopback_ecies_complete", exactly!(ECIES_RUNS), equals!(true)),
-			("loopback_ecies_roundtrip", exactly!(ECIES_RUNS), equals!(true)),
-			("loopback_ecies_profile_agreed", exactly!(ECIES_RUNS), equals!(true)),
-			("loopback_cms_complete", exactly!(CMS_RUNS), equals!(true)),
-			("loopback_cms_roundtrip", exactly!(CMS_RUNS), equals!(true)),
-			("loopback_cms_profile_agreed", exactly!(CMS_RUNS), equals!(true)),
-			("loopback_cms_unique_keys", exactly!(CMS_RUNS), equals!(true))
+			(loopback_ecies_complete, exactly!(ECIES_RUNS), equals!(true)),
+			(loopback_ecies_roundtrip, exactly!(ECIES_RUNS), equals!(true)),
+			(loopback_ecies_profile_agreed, exactly!(ECIES_RUNS), equals!(true)),
+			(loopback_cms_complete, exactly!(CMS_RUNS), equals!(true)),
+			(loopback_cms_roundtrip, exactly!(CMS_RUNS), equals!(true)),
+			(loopback_cms_profile_agreed, exactly!(CMS_RUNS), equals!(true)),
+			(loopback_cms_unique_keys, exactly!(CMS_RUNS), equals!(true))
 		]
 	}
 }
 
 tb_scenario! {
 	name: handshake_loopback,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(HandshakeLoopbackSpec::latest())
-		.build(),
+	spec: HandshakeLoopbackSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			let materials = ServerMaterials::generate();
 
 			#[cfg(feature = "transport-ecies")]
@@ -307,7 +306,7 @@ async fn cms_unique_session_keys(trace: &TraceCollector, materials: &ServerMater
 
 	let unique_keys =
 		key_a.as_slice() != ZERO_KEY.as_slice() && key_b.as_slice() != ZERO_KEY.as_slice() && key_a != key_b;
-	trace.event_with("loopback_cms_unique_keys", &[], unique_keys)?;
+	trace.event_with(HandshakeLoopbackSpec::loopback_cms_unique_keys, &[], unique_keys)?;
 
 	Ok(())
 }

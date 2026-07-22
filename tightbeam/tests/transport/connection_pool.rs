@@ -29,7 +29,7 @@ use tightbeam::{
 	colony::servlet::ServletConf,
 	der::Sequence,
 	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{create_v0_tightbeam, trace::TraceCollector, ScenarioConf},
+	testing::{create_v0_tightbeam, trace::TraceCollector, SetupEnv},
 	transport::{tcp::r#async::TokioListener, ConnectionBuilder, ConnectionPool, PoolConfig},
 	Beamable,
 };
@@ -154,12 +154,12 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pool_create", exactly!(1)),
-			("acquire_client", exactly!(3)),
-			("send_message", exactly!(3)),
-			("receive_response", exactly!(3)),
-			("release_client", exactly!(3)),
-			("message_count", exactly!(1), equals!(3u64))
+			(pool_create, exactly!(1)),
+			(acquire_client, exactly!(3)),
+			(send_message, exactly!(3)),
+			(receive_response, exactly!(3)),
+			(release_client, exactly!(3)),
+			(message_count, exactly!(1), equals!(3u64))
 		]
 	}
 }
@@ -170,13 +170,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pool_create", exactly!(1)),
-			("acquire_client", exactly!(3)),
-			("send_message", exactly!(3)),
-			("receive_response", exactly!(3)),
-			("release_client", exactly!(3)),
-			("servlet1_count", exactly!(1), equals!(2u64)),
-			("servlet2_count", exactly!(1), equals!(1u64))
+			(pool_create, exactly!(1)),
+			(acquire_client, exactly!(3)),
+			(send_message, exactly!(3)),
+			(receive_response, exactly!(3)),
+			(release_client, exactly!(3)),
+			(servlet1_count, exactly!(1), equals!(2u64)),
+			(servlet2_count, exactly!(1), equals!(1u64))
 		]
 	}
 }
@@ -260,16 +260,14 @@ async fn start_pool_echo_servlet(message_count: Arc<AtomicUsize>) -> Result<Pool
 ))]
 tb_scenario! {
 	name: connection_pool_reuse,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(PoolReuseSpec::latest())
-		.build(),
+	spec: PoolReuseSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			let message_count = Arc::new(AtomicUsize::new(0));
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
 			let server_addr = servlet.addr();
 
-			trace.event("pool_create")?;
+			trace.event(PoolReuseSpec::pool_create)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -281,21 +279,21 @@ tb_scenario! {
 			);
 
 			for i in 1..=3 {
-				trace.event("acquire_client")?;
+				trace.event(PoolReuseSpec::acquire_client)?;
 
 				let mut client = pool.connect(server_addr).await?;
 
-				trace.event("send_message")?;
+				trace.event(PoolReuseSpec::send_message)?;
 
 				let msg = create_v0_tightbeam(Some(&format!("test{i}")), None);
 				let reply = client.conn()?.emit(msg, None).await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
-				trace.event("receive_response")?;
+				trace.event(PoolReuseSpec::receive_response)?;
 
-				trace.event("release_client")?;
+				trace.event(PoolReuseSpec::release_client)?;
 			}
 
-			trace.event_with("message_count", &[], message_count.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(PoolReuseSpec::message_count, &[], message_count.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}
@@ -373,11 +371,9 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 ))]
 tb_scenario! {
 	name: pool_per_destination_isolation,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(PoolIsolationSpec::latest())
-		.build(),
+	spec: PoolIsolationSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			let count1 = Arc::new(AtomicUsize::new(0));
 			let count2 = Arc::new(AtomicUsize::new(0));
 			let servlet1 = start_pool_echo_servlet(Arc::clone(&count1)).await?;
@@ -385,7 +381,7 @@ tb_scenario! {
 			let addr1 = servlet1.addr();
 			let addr2 = servlet2.addr();
 
-			trace.event("pool_create")?;
+			trace.event(PoolIsolationSpec::pool_create)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -395,21 +391,21 @@ tb_scenario! {
 			);
 
 			for (addr, name) in [(addr1, "addr1-test"), (addr2, "addr2-test"), (addr1, "addr1-test2")] {
-				trace.event("acquire_client")?;
+				trace.event(PoolIsolationSpec::acquire_client)?;
 
 				let mut client = pool.connect(addr).await?;
 
-				trace.event("send_message")?;
+				trace.event(PoolIsolationSpec::send_message)?;
 
 				let reply = client.conn()?.emit(create_v0_tightbeam(Some(name), None), None).await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
-				trace.event("receive_response")?;
+				trace.event(PoolIsolationSpec::receive_response)?;
 
-				trace.event("release_client")?;
+				trace.event(PoolIsolationSpec::release_client)?;
 			}
 
-			trace.event_with("servlet1_count", &[], count1.load(Ordering::SeqCst) as u64)?;
-			trace.event_with("servlet2_count", &[], count2.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(PoolIsolationSpec::servlet1_count, &[], count1.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(PoolIsolationSpec::servlet2_count, &[], count2.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}
@@ -430,16 +426,14 @@ tb_scenario! {
 ))]
 tb_scenario! {
 	name: pool_concurrent_access,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(PoolReuseSpec::latest())
-		.build(),
+	spec: PoolReuseSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			let message_count = Arc::new(AtomicUsize::new(0));
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
 			let server_addr = servlet.addr();
 
-			trace.event("pool_create")?;
+			trace.event(PoolReuseSpec::pool_create)?;
 
 			let pool = Arc::new(
 				ConnectionPool::<TokioListener>::builder()
@@ -449,11 +443,11 @@ tb_scenario! {
 			);
 
 			for _ in 0..3 {
-				trace.event("acquire_client")?;
+				trace.event(PoolReuseSpec::acquire_client)?;
 
 				let mut client = pool.connect(server_addr).await?;
 
-				trace.event("send_message")?;
+				trace.event(PoolReuseSpec::send_message)?;
 
 				let reply = client
 					.conn()?
@@ -461,11 +455,11 @@ tb_scenario! {
 					.await?;
 				assert!(reply.is_some(), "pooled emit must round-trip");
 
-				trace.event("receive_response")?;
-				trace.event("release_client")?;
+				trace.event(PoolReuseSpec::receive_response)?;
+				trace.event(PoolReuseSpec::release_client)?;
 			}
 
-			trace.event_with("message_count", &[], message_count.load(Ordering::SeqCst) as u64)?;
+			trace.event_with(PoolReuseSpec::message_count, &[], message_count.load(Ordering::SeqCst) as u64)?;
 
 			Ok(())
 		}

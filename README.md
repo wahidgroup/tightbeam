@@ -97,8 +97,10 @@ tightbeam is a Layer-5 messaging framework using Abstract Syntax Notation One (A
      - 8.6.2. [Specification: Stream Rules, Envelopes, and Runtime](#862-specification-stream-rules-envelopes-and-runtime)
      - 8.6.3. [Implementation: Assembling MuxTransport](#863-implementation-assembling-muxtransport)
      - 8.6.4. [Testing](#864-testing)
+     - 8.6.5. [Serving and Pooling](#865-serving-and-pooling)
    - 8.7. [Connection Pooling](#87-connection-pooling)
    - 8.8. [Audit](#88-audit)
+
 9. [Network Theory](#9-network-theory)
    - 9.1. [Network Architecture](#91-network-architecture)
    - 9.2. [Efficient Exchange-Interconnect-Compute](#92-efficient-exchange-interconnect-compute)
@@ -283,7 +285,7 @@ All versions MUST include:
 
 All versions MAY include:
 
-- Frame integrity (digest of envelope: version + metadata; excludes message)
+- Frame integrity (digest of envelope: version + metadata - excludes message)
 - Non-repudiation (cryptographic signature)
 
 ### 4.3 Metadata Specification
@@ -2096,21 +2098,99 @@ The accepting endpoint uses `MuxRole::Server` with the same assembly sequence. E
 
 #### 8.6.4 Testing
 
-Integration coverage lives in `tightbeam/tests/transport/multiplex.rs` under the `tb_scenario!` `multiplex_transport` entry point. The scenario drives ECIES handshakes with transport negotiation (and parallel cleartext cases), assembles `MuxTransport` routers from split halves, and verifies observable behavior:
+Multiplexed services are tested with `environment ServiceClient`. The `server:` closure starts a `server!` accept loop advertising `with_mux_offer`. The `client:` closure drives a mux-offering `ConnectionPool` against the bound address. Peers that decline the offer fall back to single-flight, so the same scenario shape covers both paths.
 
-- Interleaved streams with out-of-order response correlation
-- Local-initiated cap exhaustion answered with `Busy`
-- Muxed envelopes rejected when multiplexing was never negotiated
-- Cancel freeing a cap slot and aborting the peer handler
-- Cancel/response races discarded cleanly
-- GoAway draining in-flight streams and rejecting new ones
-- Rekey drain headroom table (`2 * (local_cap + peer_cap) + 1` versus the record limit)
-- Cancel-budget boundary: N cancels OK, N+1 yields GoAway(`EnhanceYourCalm`)
-- Server-initiated stream roundtrip (client `serve`, server `emit_on_stream`)
-- Peer GoAway failing pending streams above `last_stream_id`
-- Non-mux envelope on a mux peer: GoAway(`ProtocolError`) and pending fail
-- Connection drop mid-emit: `ConnectionClosed`
-- Cleartext mux: interleaved echo and cancel-budget GoAway parallel the encrypted scenarios
+```rust
+tb_assert_spec! {
+	pub EchoOverMuxSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Accepted,
+		assertions: [
+			(echo_over_mux, exactly!(1), equals!(true))
+		]
+	}
+}
+
+tb_scenario! {
+	name: echo_over_mux,
+	spec: EchoOverMuxSpec,
+	environment ServiceClient {
+		context: ServerMaterials::generate(),
+		server: |env| async move {
+			let (listener, addr) = bind_listener(&env.context).await?;
+			let handle = server! {
+				protocol TokioListener: listener,
+				policies: { with_mux_offer: [Some(TransportOffer::mux(8))] },
+				handle: move |frame: Frame| async move { Ok(Some(frame)) }
+			};
+
+			Ok((handle, addr))
+		},
+		client: |ClientEnv { trace, context: materials, addr }| async move {
+			let pool = mux_pool(&materials, Some(TransportOffer::mux(8)))?;
+			let mut lease = pool.connect(addr).await?;
+
+			let frame = create_v0_tightbeam(Some("ping"), None);
+			let reply = lease.emit(frame.clone(), None).await?;
+
+			trace.event_with(EchoOverMuxSpec::echo_over_mux, &[], reply == Some(frame))?;
+
+			Ok(())
+		}
+	}
+}
+```
+
+#### 8.6.5 Serving and Pooling
+
+`server!` and `ConnectionPool` assemble and drive the mux plane internally: one handler and one `emit` call serve both multiplexed and single-flight peers. Manual assembly remains available for custom setups.
+
+**Serving with `server!`:**
+
+The async accept loop branches per connection after the handshake. A peer that negotiated multiplexing is served through the mux plane (split halves, drivers, concurrent handlers behind the collector gate). The server advertises multiplexing per accepted transport through the policy list:
+
+```rust
+let server_handle = server! {
+	protocol TokioListener: listener,
+	policies: { with_mux_offer: [Some(TransportOffer::mux(32))] },
+	handle: move |frame: Frame| async move { Ok(Some(frame)) }
+};
+```
+
+- `with_mux_offer` takes an `Option<TransportOffer>`. `None` advertises nothing
+- `servlet!`, `hive!`, and `cluster!` servers inherit the branch through their `server!` delegation. `HiveConf::mux_offer` and `ClusterConf::pool_config.mux_offer` carry the advertisement to their listeners and pools
+- The sync (`std`-thread) serving path never multiplexes. Mux drivers need an async executor
+- Serving mux requires `transport-multiplex` (plus `x509`, `tokio`, `transport-policy`). A server built without it never advertises and keeps serving single-flight peers
+
+**Pooling with `PoolConfig::mux_offer`:**
+
+```rust
+let pool = Arc::new(ConnectionPool::<TokioListener>::builder()
+	.with_config(PoolConfig { mux_offer: Some(TransportOffer::mux(32)), ..Default::default() })
+	.with_trust_store(trust_store)
+	.build());
+
+let mut client = pool.connect(server_addr).await?;
+let response = client.emit(frame, None).await?;
+```
+
+With an offer configured, `connect` shares ONE multiplexed connection per destination. Every caller leases a clone of the same `MuxHandle` and `emit` opens a fresh stream. `PooledClient::conn()` (the exclusive-connection accessor) answers `Busy` on a mux lease. `emit` is the transport-agnostic call.
+
+**Fallback semantics** (automatic, per connection):
+
+| Client pool     | Server      | Result                                        |
+| --------------- | ----------- | --------------------------------------------- |
+| `mux_offer` set | mux-serving | One shared mux connection, concurrent streams |
+| `mux_offer` set | no offer    | Exclusive lease, unchanged behavior           |
+| No offer        | mux-serving | Exclusive lease, unchanged behavior           |
+| No offer        | no offer    | Exclusive lease, unchanged behavior           |
+
+**Mux connection lifecycle in the pool:**
+
+- Stream-cap exhaustion (`Busy`): `emit` opens an additional mux connection to the same destination (bounded by `max_connections`) and retries there once
+- `ConnectionClosed`, or `Draining` from a rekey GoAway: the entry is evicted and the failure reported. The next `connect` re-establishes with fresh keys
+- Dead entries (driver ended) are pruned on the next `connect`. Multiple live entries round-robin
 
 ### 8.7 Connection Pooling
 
@@ -2138,6 +2218,7 @@ client.emit(frame, None).await?;
 
 - `PoolConfig::max_connections`: Max connections per destination (default: 64)
 - `PoolConfig::idle_timeout`: Optional connection expiration (default: None)
+- `PoolConfig::mux_offer`: Optional multiplexing advertisement. See [8.6.5](#865-serving-and-pooling) (default: None)
 
 ### 8.8 Audit
 
@@ -2226,30 +2307,28 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("worker_called", exactly!(1)),
-			("response_received", exactly!(1), equals!("pong"))
+			(worker_called, exactly!(1)),
+			(response_received, exactly!(1), equals!("pong"))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_ping_pong_worker,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(PingPongSpec::latest())
-		.build(),
+	spec: PingPongSpec,
 	environment Worker {
-		setup: |_trace| {
+		setup: |_env| {
 			PingPongWorker::new(PingPongWorkerConf {
 				response: "pong",
 			})
 		},
-		stimulus: |trace, worker| async move {
-			trace.event_with("worker_called", &[], ())?;
+		stimulus: |WorkerEnv { trace, worker, .. }| async move {
+			trace.event_with(PingPongSpec::worker_called, &[], ())?;
 
 			let request = RequestMessage { content: "ping".to_string() };
 			let response = worker.relay(Arc::new(request)).await?;
 
-			trace.event_with("response_received", &[], response.result)?;
+			trace.event_with(PingPongSpec::response_received, &[], response.result)?;
 			Ok(())
 		}
 	}
@@ -2258,8 +2337,10 @@ tb_scenario! {
 
 The `environment Worker` syntax provides:
 
-- `setup`: Creates the worker instance with its configuration
-- `stimulus`: Sends a message to the worker via `relay()` and validates the response
+- `setup`: Creates the worker builder from a `SetupEnv` (sync)
+- `stimulus`: Drives the started worker through `WorkerEnv` via `relay()` and records trace events
+
+Ident assertion keys generate constants on the spec type (`PingPongSpec::worker_called`). Event sites and assertions share that definition. The `spec:` key is shorthand for a `ScenarioConf` with that spec's latest version.
 
 #### 9.3.2 E: Servlets
 
@@ -2433,38 +2514,36 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("servlet_receive", exactly!(1)),
-			("worker_process", exactly!(1)),
-			("servlet_respond", exactly!(1)),
-			("result_verified", exactly!(1), equals!(10u32))
+			(servlet_receive, exactly!(1)),
+			(worker_process, exactly!(1)),
+			(servlet_respond, exactly!(1)),
+			(result_verified, exactly!(1), equals!(10u32))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_calc_servlet,
-	config: ScenarioConf::<CalcServletConf>::builder()
-		.with_spec(CalcServletSpec::latest())
-		.with_env_config(CalcServletConf { multiplier: 2 })
-		.build(),
+	spec: CalcServletSpec,
 	environment Servlet {
-		servlet: CalcServlet,
-		start: |trace, config| async move {
+		context: CalcServletConf { multiplier: 2 },
+		start: |env| async move {
 			let worker = DoublerWorker::new(());
 
 			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
-				.with_config(config)
+				.with_config(env.context)
 				.with_worker(worker)
 				.build();
 
-			CalcServlet::start(trace, Some(servlet_conf)).await
+			CalcServlet::start(Arc::new(env.trace), Some(servlet_conf)).await
 		},
-		setup: |servlet_addr, _config| async move {
+		setup: |env| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let client = builder.connect(servlet_addr).await?;
+			let client = builder.connect(env.addr).await?;
 			Ok(client)
 		},
-		client: |trace, mut client, _config| async move {
+		client: |env| async move {
+			let (trace, mut client) = (env.trace, env.client);
 			let request = compose! {
 				V0: id: b"calc-req",
 					message: CalcRequest { value: 5 }
@@ -2474,7 +2553,7 @@ tb_scenario! {
 				.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			trace.event_with("result_verified", &[], response.result)?;
+			trace.event_with(CalcServletSpec::result_verified, &[], response.result)?;
 			Ok(())
 		}
 	}
@@ -2483,9 +2562,10 @@ tb_scenario! {
 
 The `environment Servlet` syntax provides:
 
-- `start`: Configures and starts the servlet with workers
-- `setup`: Creates the client connection to the servlet
-- `client`: Sends requests and validates responses via trace events
+- `context`: Scenario fixture shared as `Arc<C>` with every closure (unit when omitted)
+- `start`: Configures and starts the servlet with workers from a `SetupEnv`
+- `setup`: Builds the client connection from a `ClientEnv` (optional). Default connects a plain `TokioListener` client
+- `client`: Sends requests through `ServletEnv` and validates responses via trace events
 
 #### 9.3.3 I: Hives
 
@@ -2641,7 +2721,46 @@ pub struct HiveConf<L: LoadBalancer = LeastLoaded, R: MessageRouter = TypeBasedR
 
 ##### Testing
 
-Hives are typically tested in the context of a cluster environment. See the [Cluster Testing](#cluster-testing) section below for examples using `environment Cluster`, which demonstrates how to configure hives with trust stores and verify cluster-hive communication.
+Standalone hive behavior (control plane gates, circuit breaker, backpressure, drain) is tested with `environment Hive`:
+
+```rust
+tb_scenario! {
+	name: hive_backpressure_reply_shape,
+	spec: HiveBackpressureShapeSpec,
+	environment Hive {
+		// Signer pinned by the hive trust store
+		context: trusted_signer("CN=Hive Backpressure Cluster"),
+		// Returns the established hive
+		start: |SetupEnv { context: signer, .. }| async move {
+			start_trusted_hive(&signer, HiveConf {
+				backpressure_threshold: BasisPoints::default(),
+				..Default::default()
+			}).await
+		},
+		// Owns the hive for drain, registry checks, and stop
+		client: |HiveEnv { trace, context: signer, hive }| async move {
+			let mut client = connect_hive(&hive).await?;
+
+			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
+			let response = emit_command(&mut client, signed_stop).await?;
+			assert_manage_stop_shape(&response, TransitStatus::Busy);
+
+			trace.event(HiveBackpressureShapeSpec::backpressure_manage_manage_shape)?;
+
+			hive.stop();
+			Ok(())
+		}
+	}
+}
+```
+
+The `environment Hive` syntax provides:
+
+- `context`: Scenario fixture shared as `Arc<C>` with every closure (unit when omitted)
+- `start`: Configures and starts the hive from a `SetupEnv`, returns the established hive
+- `client`: Owns the hive through `HiveEnv`, asserts behavior, and stops it
+
+Cluster-hive communication (registration, heartbeats, routing) is covered under [Cluster Testing](#cluster-testing).
 
 #### 9.3.4 C: Clusters
 
@@ -2791,83 +2910,56 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("work_sent", exactly!(1)),
-			("routing_status", exactly!(1), equals!(TransitStatus::Accepted))
+			(work_sent, exactly!(1)),
+			(routing_accepted, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: cluster_work_routing,
-	config: ScenarioConf::<ClusterTestConf>::builder()
-		.with_spec(ClusterRoutingSpec::latest())
-		.with_env_config(ClusterTestConf {
-			heartbeat_stats: Arc::new(HeartbeatStats::default()),
-			heartbeat_interval: Duration::from_millis(50),
-		})
-		.build(),
+	spec: ClusterRoutingSpec,
 	environment Cluster {
-		cluster: ClusterGateway,
-		start: |trace, config| async move {
-			let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365)?;
-
-			// Build hive trust from cluster cert
-			let hive_trust = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_chain(vec![cert.clone()])?
-				.build();
-
-			let tls = ClusterTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(cert)),
-				key: Arc::new(Secp256k1KeyProvider::from(key)),
-				validators: vec![],
-				client_validators: vec![],
-				hive_trust: Some(Arc::new(hive_trust.clone())),
-			};
-
-			let heartbeat_conf = HeartbeatConf::builder()
-				.with_interval(config.heartbeat_interval)
-				.with_callback(Arc::new({
-					let stats = Arc::clone(&config.heartbeat_stats);
-					move |event| {
-						stats.attempts.fetch_add(1, Ordering::SeqCst);
-						if event.success {
-							stats.successes.fetch_add(1, Ordering::SeqCst);
-						}
-					}
-				}))
-				.build();
-
-			let cluster_conf = ClusterConf::builder(tls)
-				.with_heartbeat_config(heartbeat_conf)
-				.build();
-
-			let cluster = ClusterGateway::start(trace, cluster_conf).await?;
-			Ok((cluster, hive_trust))
+		// Shared as Arc<C> with every closure
+		context: ClusterTestCerts::generate(),
+		start: |SetupEnv { context: certs, .. }| async move {
+			let mut conf = ClusterConf::new(cluster_tls_config(&certs));
+			// Both offers set: client -> cluster and cluster -> hive run multiplexed
+			conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
+			ClusterGateway::start(Arc::new(TraceCollector::new()), conf).await
 		},
-		hives: |trace, hive_trust| {
-			vec![
-				TestHive::start(Arc::clone(&trace), Some(HiveConf {
-					trust_store: Some(Arc::new(hive_trust)),
-					..Default::default()
-				}))
-			]
-		},
-		client: |trace, mut client, config| async move {
+		// Optional: awaited and registered with the cluster.
+		// Omit when driving registration from the client.
+		hives: |SetupEnv { context: certs, .. }| vec![async move {
+			let servlet = PingServlet::start(Arc::new(TraceCollector::new()), None).await?;
+			let mut hive = TestHive::new(Some(HiveConf {
+				mux_offer: Some(TransportOffer::mux(8)),
+				..hive_tls_config(&certs)
+			}))?;
+			hive.register("ping", servlet, |t| PingServlet::start(t, None))?;
+			hive.establish(Arc::new(TraceCollector::new())).await?;
+			Ok(hive)
+		}],
+		// Owns the cluster for registry checks and stop
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			trace.event(ClusterRoutingSpec::work_sent)?;
+
 			let request = ClusterWorkRequest {
 				servlet_type: b"ping".to_vec(),
 				payload: encode(&PingRequest { value: 21 })?,
 			};
 
-			trace.event("work_sent")?;
+			let mut client = connect_cluster(&certs, cluster.addr()).await?;
 			let response_frame = client.emit(compose! {
-				V0: id: b"work-001", message: request
-			}?, None).await?;
+				V0: id: b"work-001", message: ClusterRequest::Work(request)
+			}?, None).await?.ok_or(TightBeamError::MissingResponse)?;
 
-			if let Some(frame) = response_frame {
-				let work_response: ClusterWorkResponse = decode(&frame.message)?;
-				trace.event_with("routing_status", &[], work_response.status)?;
-			}
+			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
+			assert_eq!(work_response.status, TransitStatus::Accepted);
 
+			trace.event(ClusterRoutingSpec::routing_accepted)?;
+
+			cluster.stop();
 			Ok(())
 		}
 	}
@@ -2876,10 +2968,12 @@ tb_scenario! {
 
 The `environment Cluster` syntax provides:
 
-- `cluster`: The cluster type to test
-- `start`: Configures and starts the cluster, returns `(Cluster, HiveTrust)` tuple
-- `hives`: Creates hive instances that register with the cluster (receives trust from `start`)
-- `client`: Sends work requests and validates routing via trace events
+- `context`: Scenario fixture (certificates, flags) shared as `Arc<C>` with every closure
+- `start`: Configures and starts the cluster from a `SetupEnv`, returns the cluster instance
+- `hives` (OPTIONAL): Returns hive futures from a `SetupEnv`. Each is awaited and registered with the cluster
+- `client`: Owns the cluster through `ClusterEnv`, builds connections from the context, asserts registry state, and stops the cluster
+
+Adversarial registration scenarios (unsigned, replayed, stale, hijacked) omit `hives:` and drive registration from the client, asserting the rejection and the registry count on the owned instance. See `tests/colony/cluster.rs`.
 
 ##### Conclusion
 
@@ -3314,10 +3408,10 @@ tb_assert_spec! {
 		gate: Accepted,
 		assertions: [
 			// Shorthand labels match full URNs
-			("create_handshake_request_start", exactly!(1)),
-			("create_handshake_request_success", exactly!(1)),
-			("validate_request_start", exactly!(1)),
-			("validate_request_success", exactly!(1))
+			(create_handshake_request_start, exactly!(1)),
+			(create_handshake_request_success, exactly!(1)),
+			(validate_request_start, exactly!(1)),
+			(validate_request_success, exactly!(1))
 		]
 	}
 }
@@ -3455,7 +3549,7 @@ All three layers are accessed through the `tb_scenario!` macro, which provides:
 
 - Consistent syntax across all verification layers
 - Progressive enhancement (L1 -> L1+L2 -> L1+L2+L3)
-- Environment abstraction (ServiceClient, Servlet, Worker, Bare)
+- Environment abstraction (ServiceClient, Servlet, Worker, Bare, Cluster, Hive)
 - Instrumentation integration
 - Policy enforcement
 
@@ -3495,8 +3589,8 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v1"],
 		assertions: [
-			("Received", exactly!(1)),
-			("Responded", exactly!(1), equals!("ok"))
+			(Received, exactly!(1)),
+			(Responded, exactly!(1), equals!("ok"))
 		]
 	},
 	V(1,1,0): {
@@ -3504,8 +3598,8 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v1.1"],
 		assertions: [
-			("Received", exactly!(1)),
-			("Responded", exactly!(2))
+			(Received, exactly!(1)),
+			(Responded, exactly!(2))
 		]
 	},
 }
@@ -3556,8 +3650,8 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v1"],
 		assertions: [
-			("A", exactly!(1)),
-			("R", exactly!(1))
+			(A, exactly!(1)),
+			(R, exactly!(1))
 		]
 	},
 	V(1,1,0): {
@@ -3565,8 +3659,8 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v1.1"],
 		assertions: [
-			("A", exactly!(1)),
-			("R", exactly!(2))
+			(A, exactly!(1)),
+			(R, exactly!(2))
 		]
 	},
 }
@@ -3618,11 +3712,11 @@ The framework provides value assertion helpers for verifying assertion payload v
 
 ```rust
 assertions: [
-	("priority", exactly!(1), equals!(MessagePriority::LowLatency)),
-	("lifetime", exactly!(1), equals!(3_600)),
-	("version", exactly!(1), equals!(Version::V2)),
-	("confidentiality", exactly!(1), equals!(IsSome)),
-	("optional_field", exactly!(1), equals!(IsNone))
+	(priority, exactly!(1), equals!(MessagePriority::LowLatency)),
+	(lifetime, exactly!(1), equals!(3_600)),
+	(version, exactly!(1), equals!(Version::V2)),
+	(confidentiality, exactly!(1), equals!(IsSome)),
+	(optional_field, exactly!(1), equals!(IsNone))
 ]
 ```
 
@@ -3658,7 +3752,7 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v0"],
 		assertions: [
-			("feature", exactly!(1), equals!(IsNone)),
+			(feature, exactly!(1), equals!(IsNone)),
 		]
 	},
 	V(1,0,0): {
@@ -3666,8 +3760,8 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v1"],
 		assertions: [
-			("feature", exactly!(1), equals!(IsNone)),
-			("v1_specific", exactly!(1))
+			(feature, exactly!(1), equals!(IsNone)),
+			(v1_specific, exactly!(1))
 		]
 	}
 }
@@ -3678,7 +3772,7 @@ tb_scenario! {
 		.with_specs(vec![VersionSpec::get(0, 0, 0), VersionSpec::get(1, 0, 0)])
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Single assertion satisfies both version specs via tags
 			trace.event_with("feature", &["v0", "v1"], Presence::of_option(&some_option))?;
 			trace.event_with("v2_specific", &["v1"], ())?;
@@ -3882,7 +3976,7 @@ tb_scenario! {
 		.with_csp(RequestWithRetry)
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			trace.event("request")?;
 			trace.event("retry")?;
 			trace.event("response")?;
@@ -3977,8 +4071,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("start", exactly!(1)),
-			("finish", exactly!(1))
+			(start, exactly!(1)),
+			(finish, exactly!(1))
 		]
 	},
 }
@@ -3999,7 +4093,7 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			trace.event("start")?;
 			trace.event("finish")?;
 			Ok(())
@@ -4195,18 +4289,19 @@ The `FdrTraceExt` trait extends `ConsumedTrace` with CSP-specific analysis:
 ```rust
 use tightbeam::testing::fdr::FdrTraceExt;
 
-hooks {
-    on_pass: |trace, result| {
-        // Refinement properties
-        if let Some(ref fdr_verdict) = result.fdr_verdict {
-            assert!(fdr_verdict.trace_refines);
-            assert!(fdr_verdict.failures_refines);
-            assert!(fdr_verdict.divergence_free);
-            assert!(fdr_verdict.is_deterministic);
-        }
-        Ok(())
-    }
-}
+.with_hooks(TestHooks {
+	on_pass: Some(Arc::new(|context| {
+		// Refinement properties
+		if let Some(ref fdr_verdict) = context.fdr_verdict {
+			assert!(fdr_verdict.trace_refines);
+			assert!(fdr_verdict.failures_refines);
+			assert!(fdr_verdict.divergence_free);
+			assert!(fdr_verdict.is_deterministic);
+		}
+		Ok(())
+	})),
+	on_fail: None,
+})
 ```
 
 **Trace Analysis in Hooks**: Query process behavior and event sequences:
@@ -4325,7 +4420,7 @@ The `tb_scenario!` macro is the unified entry point for all testing layers, exec
 
 - Single consistent syntax across all verification layers
 - Progressive enhancement (L1 -> L1+L2 -> L1+L2+L3)
-- Environment abstraction (ServiceClient, Servlet, Worker, Bare)
+- Environment abstraction (ServiceClient, Servlet, Worker, Bare, Cluster, Hive)
 - Instrumentation integration
 - Policy enforcement
 
@@ -4334,7 +4429,8 @@ The `tb_scenario!` macro is the unified entry point for all testing layers, exec
 ```rust
 tb_scenario! {
 	name: test_function_name,        // OPTIONAL: creates standalone #[test] function NOTE: Do NOT use with `fuzz: afl`
-	config: ScenarioConf::builder()  // REQUIRED: Unified configuration
+	spec: AssertSpecType,            // Layer 1 assertion spec (latest version). Use config: for anything more
+	config: ScenarioConf::builder()  // Full configuration (alternative to spec:)
 		.with_spec(AssertSpecType::latest())          // Layer 1 assertion spec
 		.with_csp(ProcessSpecType)                    // OPTIONAL: Layer 2 CSP model (requires testing-csp)
 		.with_fdr(FdrConfig { ... })                  // OPTIONAL: Layer 3 refinement (requires testing-fdr + csp)
@@ -4345,9 +4441,15 @@ tb_scenario! {
 		.with_hooks(TestHooks { ... })                // OPTIONAL: on_pass/on_fail callbacks
 		.build(),
 	fuzz: afl,                       // OPTIONAL: AFL fuzzing mode (requires testing-csp)
-	environment <Variant> { ... },   // REQUIRED: execution environment (Bare, Worker, ServiceClient, Servlet)
+	environment <Variant> { ... },   // REQUIRED: execution environment (Bare, Worker, ServiceClient, Servlet, Cluster, Hive)
 }
 ```
+
+Exactly one of `spec:` or `config:` configures the scenario. `spec:` expands to a `ScenarioConf` with that AssertSpec's latest version. `config:` accepts a full `ScenarioConf` expression.
+
+Every closure receives one environment struct from `tightbeam::testing::env`. Setup-phase closures take `SetupEnv { trace, context }`. Later phases extend that shape: `ClientEnv` adds `addr`, and `ClusterEnv` / `HiveEnv` / `ServletEnv` / `WorkerEnv` add the owned instance. The conventional parameter name is `env`. Destructure the struct in the closure pattern when field aliases read better.
+
+The `context:` key inside the environment block is evaluated once per test and shared as `Arc<C>` with every closure (unit when omitted).
 
 See sections 10.3.4 and 10.4 for detailed environment examples.
 
@@ -4364,8 +4466,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("Received", exactly!(1)),
-			("Responded", exactly!(1))
+			(Received, exactly!(1)),
+			(Responded, exactly!(1))
 		]
 	},
 }
@@ -4389,9 +4491,9 @@ tb_scenario! {
 		.with_csp(BareProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| {
-			trace.event("Received")?;
-			trace.event("Responded")?;
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(BareSpec::Received)?;
+			trace.event(BareSpec::Responded)?;
 			Ok(())
 		}
 	}
@@ -4416,11 +4518,11 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("connect", exactly!(1)),
-			("request", exactly!(1)),
-			("response", exactly!(2)),
-			("disconnect", exactly!(1)),
-			("message_content", exactly!(1), equals!("test"))
+			(connect, exactly!(1)),
+			(request, exactly!(1)),
+			(response, exactly!(2)),
+			(disconnect, exactly!(1)),
+			(message_content, exactly!(1), equals!("test"))
 		]
 	},
 }
@@ -4461,19 +4563,19 @@ tb_scenario! {
 			expect_failure: false,
 		})
 		.with_hooks(TestHooks {
-			on_pass: Some(Arc::new(|_trace, _result| {
+			on_pass: Some(Arc::new(|_context| {
 				// Optional: custom logic on test pass
 				Ok(())
 			})),
-			on_fail: Some(Arc::new(|_trace, _result, _violation| {
+			on_fail: Some(Arc::new(|_context, _violation| {
 				// Optional: custom logic on test fail
-				Err("Test failed".into())
+				Err(TightBeamError::MissingResponse)
 			})),
 		})
 		.build(),
 	environment ServiceClient {
 		worker_threads: 2,
-		server: |trace| async move {
+		server: |SetupEnv { trace, .. }| async move {
 			let bind_addr = "127.0.0.1:0".parse().expect("invalid bind address");
 			let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 			let handle = server! {
@@ -4488,7 +4590,10 @@ tb_scenario! {
 			};
 			Ok((handle, addr))
 		},
-		client: |trace, mut client| async move {
+		client: |ClientEnv { trace, addr, .. }| async move {
+			let stream = <TokioListener as Protocol>::connect(addr).await?;
+			let mut client = <TokioListener as Protocol>::create_transport(stream);
+
 			trace.event("response")?;
 			let frame = compose! {
 				V0: id: "test",
@@ -4516,6 +4621,24 @@ This test verifies:
 - **L2**: Valid state transitions with internal events
 - **L3**: Trace refinement across multiple exploration seeds
 
+`environment ServiceClient` accepts a `context:` key for state both sides need (certificates, synchronization primitives, observation flags). The expression is evaluated once and shared as `Arc<C>`. The server closure receives a `SetupEnv`. The client closure receives a `ClientEnv` with the bound server address and builds its own connection:
+
+```rust
+	environment ServiceClient {
+		context: ServerMaterials::generate(),
+		server: |env| async move {
+			let (listener, addr) = bind_encrypted_listener(&env.context).await?;
+			Ok((spawn_server(listener), TightBeamSocketAddr(addr)))
+		},
+		client: |ClientEnv { trace, context: materials, addr }| async move {
+			let pool = build_pool(&materials, mux_offer(), 1)?;
+			let mut client = pool.connect(addr).await?;
+			// ... emits and trace events ...
+			Ok(())
+		}
+	}
+```
+
 #### 12.7.3 Hook Semantics
 
 Hooks provide optional callbacks that can observe and override test outcomes:
@@ -4539,7 +4662,7 @@ tightbeam integrates [AFL.rs](https://github.com/rust-fuzz/afl.rs), a Rust port 
 3. **Feedback Loop**: Monitors code coverage, keeps inputs that discover new paths
 4. **Crash Detection**: Automatically detects crashes, hangs, and assertion failures
 
-**Integration with tb_scenario!**: The `fuzz: afl` parameter generates AFL-compatible fuzz targets that leverage the oracle for guided exploration:
+**Integration with tb_scenario!**: The `fuzz: afl` parameter generates AFL-compatible fuzz targets that use the oracle for guided exploration:
 
 ```rust
 tb_scenario! {
@@ -4549,7 +4672,7 @@ tb_scenario! {
 		.with_csp(MyProcess)          // ← oracle for valid state navigation
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// AFL provides random bytes, oracle navigates state machine
 			match trace.oracle().fuzz_from_bytes() {
 				Ok(()) => {
@@ -4590,10 +4713,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("start", exactly!(1)),
-			("action_a", at_least!(0)),
-			("action_b", at_least!(0)),
-			("done", exactly!(1))
+			(start, exactly!(1)),
+			(action_a, at_least!(0)),
+			(action_b, at_least!(0)),
+			(done, exactly!(1))
 		]
 	},
 }
@@ -4621,7 +4744,7 @@ tb_scenario! {
 		.with_csp(SimpleFuzzProc)
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// AFL provides bytes, oracle interprets as state machine choices
 			match trace.oracle().fuzz_from_bytes() {
 				Ok(()) => {
@@ -4964,10 +5087,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("relay_start", exactly!(2)),
-			("relay_success", exactly!(1)),
-			("response_result", exactly!(1), equals!("PONG")),
-			("relay_rejected", exactly!(1))
+			(relay_start, exactly!(2)),
+			(relay_success, exactly!(1)),
+			(response_result, exactly!(1), equals!("PONG")),
+			(relay_rejected, exactly!(1))
 		]
 	},
 }
@@ -4991,15 +5114,15 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_ping_pong_worker,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(PingPongWorkerSpec::latest())
 		.with_csp(PingPongWorkerProcess)
 		.build(),
 	environment Worker {
-		setup: |_trace| {
+		setup: |_env| {
 			PingPongWorker::default()
 		},
-		stimulus: |trace, worker| async move {
+		stimulus: |WorkerEnv { trace, worker, .. }| async move {
 			// Test accepted message
 			trace.event("relay_start")?;
 
@@ -5045,10 +5168,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("request_received", exactly!(1)),
-			("pong_sent", exactly!(1)),
-			("response_result", exactly!(1), equals!("PONG")),
-			("is_winner", exactly!(1), equals!(true))
+			(request_received, exactly!(1)),
+			(pong_sent, exactly!(1)),
+			(response_result, exactly!(1), equals!("PONG")),
+			(is_winner, exactly!(1), equals!(true))
 		]
 	},
 }
@@ -5077,11 +5200,11 @@ tb_scenario! {
 		.with_csp(PingPongProcess)
 		.build(),
 	environment Servlet {
-		servlet: PingPongServletWithWorker,
-		setup: |addr| async move {
-			Ok(client! { connect TokioListener: addr })
+		start: |env| async move {
+			PingPongServletWithWorker::start(Arc::new(env.trace), None).await
 		},
-		client: |trace, mut client| async move {
+		client: |env| async move {
+			let (trace, mut client) = (env.trace, env.client);
 			fn generate_message(
 				lucky_number: u32,
 				content: Option<String>

@@ -124,7 +124,6 @@ mod tests {
 	#[test]
 	fn decompress_within_limit_round_trips() -> Result<()> {
 		let compressed = compress_zeros(4096)?;
-
 		let out = ZstdCompression::with_max_output(4096).decompress(&compressed)?;
 		assert_eq!(out, vec![0u8; 4096]);
 
@@ -134,7 +133,6 @@ mod tests {
 	#[test]
 	fn decompress_over_limit_rejected() -> Result<()> {
 		let compressed = compress_zeros(4096)?;
-
 		let result = ZstdCompression::with_max_output(4095).decompress(&compressed);
 		assert!(matches!(
 			result,
@@ -149,7 +147,6 @@ mod tests {
 	#[test]
 	fn decompression_bomb_rejected_by_default_cap() -> Result<()> {
 		let compressed = compress_zeros(DEFAULT_MAX_DECOMPRESSED_LEN + 1)?;
-
 		let result = ZstdCompression::default().decompress(&compressed);
 		assert!(matches!(
 			result,

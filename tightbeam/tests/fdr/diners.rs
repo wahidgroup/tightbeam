@@ -7,7 +7,7 @@
 
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::ScenarioConf;
+use tightbeam::testing::{ScenarioConf, SetupEnv};
 
 fn build_fdr_config(
 	specs: Vec<Process>,
@@ -218,21 +218,21 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("thinks", tightbeam::exactly!(1)),
-			("sits", tightbeam::exactly!(1)),
-			("picks_left", tightbeam::exactly!(1)),
-			("picks_right", tightbeam::exactly!(1)),
-			("eats", tightbeam::exactly!(1)),
-			("puts_down_left", tightbeam::exactly!(1)),
-			("puts_down_right", tightbeam::exactly!(1)),
-			("gets_up", tightbeam::exactly!(1))
+			(thinks, tightbeam::exactly!(1)),
+			(sits, tightbeam::exactly!(1)),
+			(picks_left, tightbeam::exactly!(1)),
+			(picks_right, tightbeam::exactly!(1)),
+			(eats, tightbeam::exactly!(1)),
+			(puts_down_left, tightbeam::exactly!(1)),
+			(puts_down_right, tightbeam::exactly!(1)),
+			(gets_up, tightbeam::exactly!(1))
 		]
 	},
 }
 
 tightbeam::tb_scenario! {
 	name: test_philosophers_valid_trace_refinement,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ValidPhilosopherSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![DiningPhilosophers::process()],
@@ -244,16 +244,16 @@ tightbeam::tb_scenario! {
 		))
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Valid trace: one philosopher completes full cycle
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("picks_right")?;
-			trace.event("eats")?;
-			trace.event("puts_down_left")?;
-			trace.event("puts_down_right")?;
-			trace.event("gets_up")?;
+			trace.event(ValidPhilosopherSpec::thinks)?;
+			trace.event(ValidPhilosopherSpec::sits)?;
+			trace.event(ValidPhilosopherSpec::picks_left)?;
+			trace.event(ValidPhilosopherSpec::picks_right)?;
+			trace.event(ValidPhilosopherSpec::eats)?;
+			trace.event(ValidPhilosopherSpec::puts_down_left)?;
+			trace.event(ValidPhilosopherSpec::puts_down_right)?;
+			trace.event(ValidPhilosopherSpec::gets_up)?;
 			Ok(())
 		}
 	}
@@ -269,16 +269,16 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("thinks", tightbeam::exactly!(2)),
-			("sits", tightbeam::exactly!(2)),
-			("picks_left", tightbeam::exactly!(2))
+			(thinks, tightbeam::exactly!(2)),
+			(sits, tightbeam::exactly!(2)),
+			(picks_left, tightbeam::exactly!(2))
 		]
 	},
 }
 
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_trace_refinement,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DeadlockPhilosopherSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![DiningPhilosophers::process()],
@@ -290,14 +290,14 @@ tightbeam::tb_scenario! {
 		))
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Trace: Philosopher 1 picks left, Philosopher 2 picks left (deadlock)
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
+			trace.event(DeadlockPhilosopherSpec::thinks)?;
+			trace.event(DeadlockPhilosopherSpec::sits)?;
+			trace.event(DeadlockPhilosopherSpec::picks_left)?;
+			trace.event(DeadlockPhilosopherSpec::thinks)?;
+			trace.event(DeadlockPhilosopherSpec::sits)?;
+			trace.event(DeadlockPhilosopherSpec::picks_left)?;
 			Ok(())
 		}
 	}
@@ -312,21 +312,21 @@ tightbeam::tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("thinks", tightbeam::exactly!(2)),
-			("sits", tightbeam::exactly!(2)),
-			("picks_left", tightbeam::exactly!(2)),
-			("picks_right", tightbeam::exactly!(2)),
-			("eats", tightbeam::exactly!(2)),
-			("puts_down_left", tightbeam::exactly!(2)),
-			("puts_down_right", tightbeam::exactly!(2)),
-			("gets_up", tightbeam::exactly!(2))
+			(thinks, tightbeam::exactly!(2)),
+			(sits, tightbeam::exactly!(2)),
+			(picks_left, tightbeam::exactly!(2)),
+			(picks_right, tightbeam::exactly!(2)),
+			(eats, tightbeam::exactly!(2)),
+			(puts_down_left, tightbeam::exactly!(2)),
+			(puts_down_right, tightbeam::exactly!(2)),
+			(gets_up, tightbeam::exactly!(2))
 		]
 	},
 }
 
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_free_refinement,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DeadlockFreePhilosopherSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![DeadlockFreePhilosophers::process()],
@@ -338,27 +338,27 @@ tightbeam::tb_scenario! {
 		))
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Valid deadlock-free trace: P1 completes cycle, then P2 completes cycle
 			// (butler ensures they don't sit simultaneously)
 			// P1 cycle
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("picks_right")?;
-			trace.event("eats")?;
-			trace.event("puts_down_left")?;
-			trace.event("puts_down_right")?;
-			trace.event("gets_up")?;
+			trace.event(DeadlockFreePhilosopherSpec::thinks)?;
+			trace.event(DeadlockFreePhilosopherSpec::sits)?;
+			trace.event(DeadlockFreePhilosopherSpec::picks_left)?;
+			trace.event(DeadlockFreePhilosopherSpec::picks_right)?;
+			trace.event(DeadlockFreePhilosopherSpec::eats)?;
+			trace.event(DeadlockFreePhilosopherSpec::puts_down_left)?;
+			trace.event(DeadlockFreePhilosopherSpec::puts_down_right)?;
+			trace.event(DeadlockFreePhilosopherSpec::gets_up)?;
 			// P2 cycle
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("picks_right")?;
-			trace.event("eats")?;
-			trace.event("puts_down_left")?;
-			trace.event("puts_down_right")?;
-			trace.event("gets_up")?;
+			trace.event(DeadlockFreePhilosopherSpec::thinks)?;
+			trace.event(DeadlockFreePhilosopherSpec::sits)?;
+			trace.event(DeadlockFreePhilosopherSpec::picks_left)?;
+			trace.event(DeadlockFreePhilosopherSpec::picks_right)?;
+			trace.event(DeadlockFreePhilosopherSpec::eats)?;
+			trace.event(DeadlockFreePhilosopherSpec::puts_down_left)?;
+			trace.event(DeadlockFreePhilosopherSpec::puts_down_right)?;
+			trace.event(DeadlockFreePhilosopherSpec::gets_up)?;
 			Ok(())
 		}
 	}
@@ -370,7 +370,7 @@ tightbeam::tb_scenario! {
 // The deadlock trace (both pick left) should fail refinement against deadlock-free spec
 tightbeam::tb_scenario! {
 	name: test_philosophers_deadlock_violates_deadlock_free,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DeadlockPhilosopherSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![DeadlockFreePhilosophers::process()],
@@ -382,15 +382,15 @@ tightbeam::tb_scenario! {
 		))
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Trace: Philosopher 1 picks left, Philosopher 2 picks left (deadlock)
 			// This should NOT refine DeadlockFreePhilosophers (butler prevents both sitting)
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
-			trace.event("thinks")?;
-			trace.event("sits")?;
-			trace.event("picks_left")?;
+			trace.event(DeadlockPhilosopherSpec::thinks)?;
+			trace.event(DeadlockPhilosopherSpec::sits)?;
+			trace.event(DeadlockPhilosopherSpec::picks_left)?;
+			trace.event(DeadlockPhilosopherSpec::thinks)?;
+			trace.event(DeadlockPhilosopherSpec::sits)?;
+			trace.event(DeadlockPhilosopherSpec::picks_left)?;
 			Ok(())
 		}
 	}

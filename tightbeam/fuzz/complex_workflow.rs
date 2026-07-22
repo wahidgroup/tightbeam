@@ -11,9 +11,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("init", exactly!(1)),
-			("authenticate", exactly!(1)),
-			("complete", exactly!(1))
+			(init, exactly!(1)),
+			(authenticate, exactly!(1)),
+			(complete, exactly!(1))
 		]
 	},
 }
@@ -57,12 +57,12 @@ tb_process_spec! {
 tb_scenario! {
 	fuzz: afl,
 	csp: WorkflowFuzzProc,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(WorkflowFuzzSpec::latest())
 		.with_csp(WorkflowFuzzProc)
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Oracle-guided fuzzing through complex 6-state workflow
 			// IJON state tracking is automatic
 			trace.oracle().fuzz_from_bytes()?;

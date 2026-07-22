@@ -30,7 +30,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -44,10 +46,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("downgrade_capture_strong", exactly!(BACKEND_COUNT_U32)),
-			("downgrade_capture_weak", exactly!(BACKEND_COUNT_U32)),
-			("downgrade_profiles_differ", exactly!(BACKEND_COUNT_U32)),
-			("downgrade_substitution_rejected", exactly!(BACKEND_COUNT_U32))
+			(downgrade_capture_strong, exactly!(BACKEND_COUNT_U32)),
+			(downgrade_capture_weak, exactly!(BACKEND_COUNT_U32)),
+			(downgrade_profiles_differ, exactly!(BACKEND_COUNT_U32)),
+			(downgrade_substitution_rejected, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -100,13 +102,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: downgrade_attack,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DowngradeAttackSpec::latest())
 		.with_csp(DowngradeAttackProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			DowngradeAttackScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			DowngradeAttackScenario::run((trace.into(),)).await
 		}
 	}
 }
@@ -124,7 +126,7 @@ job! {
 			let mut strong_session = harness.spawn(kind);
 			let strong_handshake = strong_session.capture_full().await?;
 
-			trace.event("downgrade_capture_strong")?;
+			trace.event(DowngradeAttackSpec::downgrade_capture_strong)?;
 
 			// ========================================
 			// Step 2: Capture WEAK handshake (AES-128-GCM)
@@ -133,7 +135,7 @@ job! {
 			let mut weak_session = harness.spawn_weak(kind);
 			let weak_handshake = weak_session.capture_full().await?;
 
-			trace.event("downgrade_capture_weak")?;
+			trace.event(DowngradeAttackSpec::downgrade_capture_weak)?;
 
 			// ========================================
 			// Step 3: Verify wire bytes are DIFFERENT
@@ -153,7 +155,7 @@ job! {
 				return Err(expectation_failure("AES-256 and AES-128 messages are identical"));
 			}
 
-			trace.event("downgrade_profiles_differ")?;
+			trace.event(DowngradeAttackSpec::downgrade_profiles_differ)?;
 
 			// ========================================
 			// Step 4: Attempt downgrade substitution
@@ -166,7 +168,7 @@ job! {
 					// Downgrade substitution rejected - the strong server's
 					// strength floor refuses the AES-128 offer, and the
 					// negotiated cipher is bound into the signed transcript.
-					trace.event("downgrade_substitution_rejected")?;
+					trace.event(DowngradeAttackSpec::downgrade_substitution_rejected)?;
 				}
 				InjectionOutcome::Accepted => {
 					// A strong session that accepts a weak ClientHello is a

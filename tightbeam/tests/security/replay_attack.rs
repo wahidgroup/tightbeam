@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -34,10 +36,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("replay_initial_handshake", exactly!(BACKEND_COUNT_U32)),
-			("replay_attempt", exactly!(BACKEND_COUNT_U32)),
-			("replay_detected", exactly!(BACKEND_COUNT_U32)),
-			("replay_rejected", exactly!(BACKEND_COUNT_U32))
+			(replay_initial_handshake, exactly!(BACKEND_COUNT_U32)),
+			(replay_attempt, exactly!(BACKEND_COUNT_U32)),
+			(replay_detected, exactly!(BACKEND_COUNT_U32)),
+			(replay_rejected, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -79,13 +81,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: replay_attack,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ReplayAttackSpec::latest())
 		.with_csp(ReplayAttackProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			ReplayAttackScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			ReplayAttackScenario::run((trace.into(),)).await
 		}
 	}
 }
@@ -99,7 +101,7 @@ job! {
 			let mut session = harness.spawn(kind);
 			let captured = session.capture_full().await?;
 
-			trace.event("replay_initial_handshake")?;
+			trace.event(ReplayAttackSpec::replay_initial_handshake)?;
 
 			// Get the final client message (replay target for all backends)
 			let target = captured
@@ -109,12 +111,12 @@ job! {
 			// Attempt replay on a fresh session
 			let mut attack_session = harness.spawn(captured.kind);
 
-			trace.event("replay_attempt")?;
+			trace.event(ReplayAttackSpec::replay_attempt)?;
 
 			match attack_session.inject_at_step(target.step, &target.payload).await? {
 				InjectionOutcome::Rejected(_) => {
-					trace.event("replay_detected")?;
-					trace.event("replay_rejected")?;
+					trace.event(ReplayAttackSpec::replay_detected)?;
+					trace.event(ReplayAttackSpec::replay_rejected)?;
 				}
 				InjectionOutcome::Accepted => {
 					return Err(expectation_failure("replay was accepted"));

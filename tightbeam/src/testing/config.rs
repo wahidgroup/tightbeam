@@ -32,11 +32,10 @@ use crate::testing::timing::TimingConstraints;
 
 /// Unified configuration for tb_scenario! tests (zero-copy with Arc wrapping)
 #[derive(Clone)]
-pub struct ScenarioConf<E = ()> {
+pub struct ScenarioConf {
 	specs: Arc<Vec<&'static BuiltAssertSpec>>,
 	trace: Arc<TraceCollector>,
 	hooks: Option<Arc<TestHooks>>,
-	env_config: Option<Arc<E>>,
 
 	#[cfg(feature = "testing-csp")]
 	csp: Option<Arc<dyn ProcessSpec + Send + Sync>>,
@@ -44,9 +43,9 @@ pub struct ScenarioConf<E = ()> {
 	fdr: Option<Arc<FdrConfig>>,
 }
 
-impl<E> ScenarioConf<E> {
+impl ScenarioConf {
 	/// Create a new builder
-	pub fn builder() -> ScenarioConfBuilder<E> {
+	pub fn builder() -> ScenarioConfBuilder {
 		ScenarioConfBuilder::default()
 	}
 
@@ -73,22 +72,14 @@ impl<E> ScenarioConf<E> {
 	pub fn hooks(&self) -> Option<&Arc<TestHooks>> {
 		self.hooks.as_ref()
 	}
-
-	/// Get env_config (panics if not set for custom types).
-	pub fn env_config(&self) -> &Arc<E> {
-		self.env_config
-			.as_ref()
-			.expect("env_config not set - call with_env_config() before build()")
-	}
 }
 
-impl Default for ScenarioConf<()> {
+impl Default for ScenarioConf {
 	fn default() -> Self {
 		Self {
 			specs: Arc::new(Vec::new()),
 			trace: Arc::new(TraceCollector::default()),
 			hooks: None,
-			env_config: Some(Arc::new(())),
 			#[cfg(feature = "testing-csp")]
 			csp: None,
 			#[cfg(feature = "testing-fdr")]
@@ -98,11 +89,11 @@ impl Default for ScenarioConf<()> {
 }
 
 /// Builder for ScenarioConf (consumes owned values, wraps in Arc on build)
-pub struct ScenarioConfBuilder<E = ()> {
+#[derive(Default)]
+pub struct ScenarioConfBuilder {
 	specs: Vec<&'static BuiltAssertSpec>,
 	trace: TraceCollector,
 	hooks: Option<TestHooks>,
-	env_config: Option<E>,
 
 	#[cfg(feature = "testing-csp")]
 	csp: Option<Box<dyn ProcessSpec + Send + Sync>>,
@@ -110,22 +101,7 @@ pub struct ScenarioConfBuilder<E = ()> {
 	fdr: Option<FdrConfig>,
 }
 
-impl<E> Default for ScenarioConfBuilder<E> {
-	fn default() -> Self {
-		Self {
-			specs: Vec::new(),
-			trace: TraceCollector::default(),
-			hooks: None,
-			env_config: None,
-			#[cfg(feature = "testing-csp")]
-			csp: None,
-			#[cfg(feature = "testing-fdr")]
-			fdr: None,
-		}
-	}
-}
-
-impl<E> ScenarioConfBuilder<E> {
+impl ScenarioConfBuilder {
 	/// Add a single spec to the list (builder convention)
 	pub fn with_spec(mut self, spec: &'static BuiltAssertSpec) -> Self {
 		self.specs.push(spec);
@@ -160,20 +136,12 @@ impl<E> ScenarioConfBuilder<E> {
 		self
 	}
 
-	pub fn with_env_config(mut self, env_config: E) -> Self {
-		self.env_config = Some(env_config);
-		self
-	}
-}
-
-impl<E> ScenarioConfBuilder<E> {
-	/// Build ScenarioConf (requires with_env_config() for custom types).
-	pub fn build(self) -> ScenarioConf<E> {
+	/// Consumes the builder and wraps collected fields in `Arc`.
+	pub fn build(self) -> ScenarioConf {
 		ScenarioConf {
 			specs: Arc::new(self.specs),
 			trace: Arc::new(self.trace),
 			hooks: self.hooks.map(Arc::new),
-			env_config: self.env_config.map(Arc::new),
 			#[cfg(feature = "testing-csp")]
 			csp: self.csp.map(|csp| Arc::from(csp) as Arc<dyn ProcessSpec + Send + Sync>),
 			#[cfg(feature = "testing-fdr")]
@@ -227,21 +195,9 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn with_env_config_sets_value() {
-		#[derive(Debug, Clone, PartialEq)]
-		struct TestEnvConfig {
-			value: u32,
-		}
-
-		impl Default for TestEnvConfig {
-			fn default() -> Self {
-				Self { value: 42 }
-			}
-		}
-
-		let custom_config = TestEnvConfig { value: 123 };
-		let env_config = custom_config.clone();
-		let config = ScenarioConf::builder().with_env_config(env_config).build();
-		assert_eq!(config.env_config().value, 123);
+	fn builder_collects_specs_without_hooks() {
+		let config = ScenarioConf::builder().build();
+		assert!(config.specs().is_empty());
+		assert!(config.hooks().is_none());
 	}
 }

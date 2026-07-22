@@ -444,67 +444,67 @@ tb_assert_spec! {
 		gate: Accepted,
 		assertions: [
 			// Lifecycle
-			("mission_start", exactly!(1)),
-			("mission_complete", exactly!(1)),
+			(mission_start, exactly!(1)),
+			(mission_complete, exactly!(1)),
 
 			// Mission Control events
-			("mission_control_send_command", exactly!(6)),
-			("mission_control_receive_ack", exactly!(6)),
-			("mission_control_receive_telemetry", exactly!(6)),
-			("mission_control_analyze_telemetry", exactly!(6)),
+			(mission_control_send_command, exactly!(6)),
+			(mission_control_receive_ack, exactly!(6)),
+			(mission_control_receive_telemetry, exactly!(6)),
+			(mission_control_analyze_telemetry, exactly!(6)),
 
 			// Mission Control gap recovery
-			("mission_control_gap_detected", at_most!(0)),
-			("mission_control_send_frame_request", at_most!(0)),
-			("mission_control_receive_frame_request", at_most!(0)),
-			("mission_control_send_frame_response", at_most!(0)),
-			("mission_control_receive_frame_response", at_most!(0)),
+			(mission_control_gap_detected, at_most!(0)),
+			(mission_control_send_frame_request, at_most!(0)),
+			(mission_control_receive_frame_request, at_most!(0)),
+			(mission_control_send_frame_response, at_most!(0)),
+			(mission_control_receive_frame_response, at_most!(0)),
 
 			// Earth Relay events
-			("earth_relay_receive_from_mc", exactly!(6)),
-			("earth_relay_forward_to_mars", exactly!(6)),
-			("earth_relay_receive_telemetry_from_mars", exactly!(6)),
-			("earth_relay_receive_ack_from_mars", exactly!(6)),
-			("earth_relay_forward_telemetry_to_mc", exactly!(6)),
-			("earth_relay_forward_ack_to_mc", exactly!(6)),
+			(earth_relay_receive_from_mc, exactly!(6)),
+			(earth_relay_forward_to_mars, exactly!(6)),
+			(earth_relay_receive_telemetry_from_mars, exactly!(6)),
+			(earth_relay_receive_ack_from_mars, exactly!(6)),
+			(earth_relay_forward_telemetry_to_mc, exactly!(6)),
+			(earth_relay_forward_ack_to_mc, exactly!(6)),
 
 			// Earth Relay gap recovery
-			("earth_relay_gap_detected", at_most!(0)),
-			("earth_relay_send_frame_request", at_most!(0)),
-			("earth_relay_receive_frame_request", at_most!(0)),
-			("earth_relay_send_frame_response", at_most!(0)),
-			("earth_relay_receive_frame_response", at_most!(0)),
-			("earth_relay_cascade_frame_request", at_most!(0)),
+			(earth_relay_gap_detected, at_most!(0)),
+			(earth_relay_send_frame_request, at_most!(0)),
+			(earth_relay_receive_frame_request, at_most!(0)),
+			(earth_relay_send_frame_response, at_most!(0)),
+			(earth_relay_receive_frame_response, at_most!(0)),
+			(earth_relay_cascade_frame_request, at_most!(0)),
 
 			// Mars Relay events
-			("mars_relay_receive_from_earth", exactly!(6)),
-			("mars_relay_forward_to_rover", exactly!(6)),
-			("mars_relay_receive_telemetry_from_rover", exactly!(6)),
-			("mars_relay_receive_ack_from_rover", exactly!(6)),
-			("mars_relay_forward_telemetry_to_earth", exactly!(6)),
-			("mars_relay_forward_ack_to_earth", exactly!(6)),
+			(mars_relay_receive_from_earth, exactly!(6)),
+			(mars_relay_forward_to_rover, exactly!(6)),
+			(mars_relay_receive_telemetry_from_rover, exactly!(6)),
+			(mars_relay_receive_ack_from_rover, exactly!(6)),
+			(mars_relay_forward_telemetry_to_earth, exactly!(6)),
+			(mars_relay_forward_ack_to_earth, exactly!(6)),
 
 			// Mars Relay gap recovery
-			("mars_relay_gap_detected", at_most!(0)),
-			("mars_relay_send_frame_request", at_most!(0)),
-			("mars_relay_receive_frame_request", at_most!(0)),
-			("mars_relay_send_frame_response", at_most!(0)),
-			("mars_relay_receive_frame_response", at_most!(0)),
-			("mars_relay_cascade_frame_request", at_most!(0)),
+			(mars_relay_gap_detected, at_most!(0)),
+			(mars_relay_send_frame_request, at_most!(0)),
+			(mars_relay_receive_frame_request, at_most!(0)),
+			(mars_relay_send_frame_response, at_most!(0)),
+			(mars_relay_receive_frame_response, at_most!(0)),
+			(mars_relay_cascade_frame_request, at_most!(0)),
 
 			// Rover events
-			("rover_receive_command", exactly!(6)),
-			("rover_execute_command", exactly!(6)),
-			("rover_command_complete", exactly!(6)),
-			("rover_send_ack", exactly!(6)),
-			("rover_send_telemetry", exactly!(6)),
+			(rover_receive_command, exactly!(6)),
+			(rover_execute_command, exactly!(6)),
+			(rover_command_complete, exactly!(6)),
+			(rover_send_ack, exactly!(6)),
+			(rover_send_telemetry, exactly!(6)),
 
 			// Rover gap recovery
-			("rover_gap_detected", at_most!(0)),
-			("rover_send_frame_request", at_most!(0)),
-			("rover_receive_frame_request", at_most!(0)),
-			("rover_send_frame_response", at_most!(0)),
-			("rover_receive_frame_response", at_most!(0))
+			(rover_gap_detected, at_most!(0)),
+			(rover_send_frame_request, at_most!(0)),
+			(rover_receive_frame_request, at_most!(0)),
+			(rover_send_frame_response, at_most!(0)),
+			(rover_receive_frame_response, at_most!(0))
 		]
 	}
 }
@@ -530,7 +530,7 @@ async fn send_telemetry_to_mars_relay(
 	let battery = fault_manager.battery_percent()?;
 	let fault_matrix_snapshot = fault_manager.fault_matrix()?;
 
-	trace.event("rover_send_telemetry")?;
+	trace.event(DtnEventCountSpec::rover_send_telemetry)?;
 
 	let telemetry = RoverTelemetry::new(instrument, data, mission_time_ms(), battery, -20);
 	let (next_order, previous_digest) = rover_processor.prepare_outgoing()?;
@@ -671,7 +671,7 @@ fn build_dtn_fdr_config_refinement() -> FdrConfig {
 
 tb_scenario! {
 	name: dtn_ultimate_realistic,
-	config: ScenarioConf::<DtnScenarioConfig>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DtnEventCountSpec::latest())
 		.with_csp(DtnComposedSystem)
 		.with_fdr(build_dtn_fdr_config_refinement())
@@ -692,11 +692,11 @@ tb_scenario! {
 			.build()
 			.into()
 		)
-		.with_env_config(DtnScenarioConfig::default())
 		.build(),
 	environment Servlet {
-		servlet: RoverServlet,
-		start: |trace, config| async move {
+		context: DtnScenarioConfig::default(),
+		start: |env| async move {
+			let (trace, config) = (Arc::new(env.trace), env.context);
 			// ================================================================
 			// 4-TIER DTN ARCHITECTURE SETUP
 			// Start: Rover -> Mars Relay -> Earth Relay -> Mission Control
@@ -767,7 +767,7 @@ tb_scenario! {
 			// ================================================================
 
 			// Pool configuration for relay connections (max 3 per destination)
-			let pool_config = PoolConfig { idle_timeout: None, max_connections: 3, mux_offer: None };
+			let pool_config = PoolConfig { max_connections: 3, ..PoolConfig::default() };
 
 			// Mission Control -> Earth Relay pool
 			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
@@ -1022,7 +1022,7 @@ tb_scenario! {
 			// ================================================================
 
 			init_mission_clock();
-			trace.event("mission_start")?;
+			trace.event(DtnEventCountSpec::mission_start)?;
 
 			// ================================================================
 			// 6. SEND INITIAL COMMAND FROM MISSION CONTROL
@@ -1033,7 +1033,7 @@ tb_scenario! {
 				let (next_order, previous_digest) = mc_processor.prepare_outgoing()?;
 				let command = EarthCommand::new(initial_cmd, MessagePriority::Standard, mission_time_ms());
 
-				trace.event("mission_control_send_command")?;
+				trace.event(DtnEventCountSpec::mission_control_send_command)?;
 
 				let command_frame = mc_frame_builder.build_relay_command_frame(
 					command,
@@ -1057,7 +1057,8 @@ tb_scenario! {
 
 			Ok(rover_servlet)
 		},
-		setup: |_rover_addr, config: Arc<DtnScenarioConfig>| async move {
+		setup: |env| async move {
+			let config = env.context;
 			let mars_relay_addr = (*config.mars_relay_addr.read()?).ok_or(TightBeamError::MissingConfiguration)?;
 
 			// Connect Rover client to Mars Relay
@@ -1071,7 +1072,8 @@ tb_scenario! {
 
 			Ok(client)
 		},
-		client: |trace, mut rover_client, config| async move {
+		client: |env| async move {
+			let (trace, mut rover_client, config) = (env.trace, env.client, env.context);
 			// Get components from config
 			let rover_processor = Arc::clone(&config.rover_chain_processor);
 			let rover_fault_manager = Arc::new(FaultManager::from_refs(
@@ -1096,7 +1098,7 @@ tb_scenario! {
 				&shared_mission_state,
 			).await?;
 
-			trace.event("mission_complete")?;
+			trace.event(DtnEventCountSpec::mission_complete)?;
 
 			Ok(())
 		}

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tightbeam::{
 	crypto::x509::{error::CertificateValidationError, policy::CertificateValidation, Certificate},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::ScenarioConf,
+	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer},
 	TightBeamError,
@@ -87,9 +87,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("cert_valid_accepted", exactly!(1u32)),
-			("cert_wrong_key_rejected", exactly!(1u32)),
-			("cert_reject_all_rejected", exactly!(1u32))
+			(cert_valid_accepted, exactly!(1u32)),
+			(cert_wrong_key_rejected, exactly!(1u32)),
+			(cert_reject_all_rejected, exactly!(1u32))
 		]
 	}
 }
@@ -116,13 +116,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: certificate_forgery,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(CertificateForgerySpec::latest())
 		.with_csp(CertificateForgeryProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			CertificateForgeryScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			CertificateForgeryScenario::run((trace.into(),)).await
 		}
 	}
 }
@@ -161,7 +161,7 @@ job! {
 			let _server_result = server.process_client_key_exchange(&client_kex).await;
 
 			// If we got here without error, the valid certificate was accepted
-			trace.event("cert_valid_accepted")?;
+			trace.event(CertificateForgerySpec::cert_valid_accepted)?;
 		}
 
 		// ========================================
@@ -189,7 +189,7 @@ job! {
 			match client.process_server_handshake(&server_handshake).await {
 				Err(_) => {
 					// Expected - certificate rejected due to wrong public key
-					trace.event("cert_wrong_key_rejected")?;
+					trace.event(CertificateForgerySpec::cert_wrong_key_rejected)?;
 				}
 				Ok(_) => {
 					return Err(expectation_failure("certificate with wrong pinned key should be rejected"));
@@ -221,7 +221,7 @@ job! {
 			match client.process_server_handshake(&server_handshake).await {
 				Err(_) => {
 					// Expected - all certificates rejected
-					trace.event("cert_reject_all_rejected")?;
+					trace.event(CertificateForgerySpec::cert_reject_all_rejected)?;
 				}
 				Ok(_) => {
 					return Err(expectation_failure("RejectAll validator should reject all certificates"));

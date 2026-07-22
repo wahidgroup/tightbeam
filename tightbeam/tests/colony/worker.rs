@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tightbeam::colony::worker::Worker;
 use tightbeam::der::Sequence;
-use tightbeam::testing::ScenarioConf;
+use tightbeam::testing::{ScenarioConf, WorkerEnv};
 use tightbeam::Beamable;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, worker};
 
@@ -52,33 +52,31 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("relay_start", exactly!(1)),
-			("relay_success", exactly!(1), equals!("DEFAULT_PONG"))
+			(relay_start, exactly!(1)),
+			(relay_success, exactly!(1), equals!("DEFAULT_PONG"))
 		]
 	},
 	V(2,0,0): {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("relay_start", exactly!(1)),
-			("relay_success", exactly!(1), equals!("CUSTOM_RESPONSE"))
+			(relay_start, exactly!(1)),
+			(relay_success, exactly!(1), equals!("CUSTOM_RESPONSE"))
 		]
 	},
 }
 
 tb_scenario! {
 	name: test_worker_with_config,
-	config: ScenarioConf::<()>::builder()
-		.with_specs(vec![WorkerSpec::latest()])
-		.build(),
+	spec: WorkerSpec,
 	environment Worker {
-		setup: |_trace| {
+		setup: |_env| {
 			ConfigurableWorker::new(ConfigurableWorkerConf {
 				response: "CUSTOM_RESPONSE".to_string(),
 			})
 		},
-		stimulus: |trace, worker| async move {
-			trace.event_with("relay_start", &[], ())?;
+		stimulus: |WorkerEnv { trace, worker, .. }| async move {
+			trace.event_with(WorkerSpec::relay_start, &[], ())?;
 
 			let ping_msg = PingMessage {
 				content: "PING".to_string(),
@@ -87,7 +85,7 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
-				trace.event_with("relay_success", &[], resp.result)?;
+				trace.event_with(WorkerSpec::relay_success, &[], resp.result)?;
 			}
 
 			Ok(())
@@ -97,13 +95,13 @@ tb_scenario! {
 
 tb_scenario! {
 	name: test_worker_with_type,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_specs(vec![WorkerSpec::get(1, 0, 0).expect("WorkerSpec 1.0.0")])
 		.build(),
 	environment Worker {
-	setup: |_trace| DefaultWorker::new(()),
-	stimulus: |trace, worker| async move {
-		trace.event_with("relay_start", &[], ())?;
+	setup: |_env| DefaultWorker::new(()),
+	stimulus: |WorkerEnv { trace, worker, .. }| async move {
+		trace.event_with(WorkerSpec::relay_start, &[], ())?;
 
 		let ping_msg = PingMessage {
 			content: "PING".to_string(),
@@ -112,7 +110,7 @@ tb_scenario! {
 
 			let response = worker.relay(Arc::new(ping_msg)).await?;
 			if let Some(resp) = response {
-				trace.event_with("relay_success", &[], resp.result)?;
+				trace.event_with(WorkerSpec::relay_success, &[], resp.result)?;
 			}
 
 			Ok(())

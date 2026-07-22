@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -38,9 +40,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("fs_capture_handshake", exactly!(HANDSHAKE_COUNT as u32)),
-			("fs_extract_ephemeral", exactly!(HANDSHAKE_COUNT as u32)),
-			("fs_all_ephemeral_unique", exactly!(1u32))
+			(fs_capture_handshake, exactly!(HANDSHAKE_COUNT as u32)),
+			(fs_extract_ephemeral, exactly!(HANDSHAKE_COUNT as u32)),
+			(fs_all_ephemeral_unique, exactly!(1u32))
 		]
 	}
 }
@@ -75,13 +77,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: forward_secrecy,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ForwardSecrecySpec::latest())
 		.with_csp(ForwardSecrecyProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			ForwardSecrecyScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			ForwardSecrecyScenario::run((trace.into(),)).await
 		}
 	}
 }
@@ -100,7 +102,7 @@ job! {
 			let mut session = harness.spawn(kind);
 			let captured = session.capture_full().await?;
 
-			trace.event("fs_capture_handshake")?;
+			trace.event(ForwardSecrecySpec::fs_capture_handshake)?;
 
 			// Extract ECIES ciphertext from ClientKeyExchange (step 2)
 			let client_kex = captured
@@ -115,7 +117,7 @@ job! {
 
 			ephemeral_keys.push(ephemeral_pubkey);
 
-			trace.event("fs_extract_ephemeral")?;
+			trace.event(ForwardSecrecySpec::fs_extract_ephemeral)?;
 		}
 
 		// ========================================
@@ -144,7 +146,7 @@ job! {
 			}
 		}
 
-		trace.event("fs_all_ephemeral_unique")?;
+		trace.event(ForwardSecrecySpec::fs_all_ephemeral_unique)?;
 
 		Ok(())
 	}

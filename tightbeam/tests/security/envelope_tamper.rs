@@ -40,7 +40,7 @@ use tightbeam::tb_assert_spec;
 use tightbeam::tb_process_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::config::ScenarioConf;
-use tightbeam::testing::create_v0_tightbeam;
+use tightbeam::testing::{create_v0_tightbeam, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::{
 	AsyncReadStream, AsyncWriteStream, SplittableStream, TokioReadHalf, TokioStream, TokioWriteHalf, TransportReader,
@@ -64,8 +64,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("tamper_deleted_envelope_detected", exactly!(1), equals!(true)),
-			("tamper_replayed_envelope_detected", exactly!(1), equals!(true))
+			(tamper_deleted_envelope_detected, exactly!(1), equals!(true)),
+			(tamper_replayed_envelope_detected, exactly!(1), equals!(true))
 		]
 	}
 }
@@ -90,13 +90,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: envelope_tamper,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(EnvelopeTamperSpec::latest())
 		.with_csp(EnvelopeTamperProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			EnvelopeTamperScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			EnvelopeTamperScenario::run((trace.into(),)).await
 		}
 	}
 }
@@ -124,8 +124,8 @@ enum TamperRule {
 /// keeps the tampering an active-attacker envelope operation rather than
 /// a corruption the AEAD tag would already catch.
 async fn spawn_tamper_relay(upstream: SocketAddr, rule: TamperRule) -> Result<SocketAddr, TightBeamError> {
-	let listener = TcpListener::bind("127.0.0.1:0").await.map_err(TransportError::from)?;
-	let relay_addr = listener.local_addr().map_err(TransportError::from)?;
+	let listener = TcpListener::bind("127.0.0.1:0").await?;
+	let relay_addr = listener.local_addr()?;
 
 	tokio::spawn(async move {
 		let Ok((inbound, _)) = listener.accept().await else {
@@ -223,7 +223,7 @@ async fn tamper_deleted_envelope_detected(trace: &TraceCollector) -> Result<(), 
 	})
 	.await?;
 
-	trace.event_with("tamper_deleted_envelope_detected", &[], detected)?;
+	trace.event_with(EnvelopeTamperSpec::tamper_deleted_envelope_detected, &[], detected)?;
 	Ok(())
 }
 
@@ -239,6 +239,6 @@ async fn tamper_replayed_envelope_detected(trace: &TraceCollector) -> Result<(),
 	})
 	.await?;
 
-	trace.event_with("tamper_replayed_envelope_detected", &[], detected)?;
+	trace.event_with(EnvelopeTamperSpec::tamper_replayed_envelope_detected, &[], detected)?;
 	Ok(())
 }

@@ -8,13 +8,14 @@
 #![cfg(all(feature = "testing", feature = "std"))]
 
 use tightbeam::der::Sequence;
-use tightbeam::testing::ScenarioConf;
 use tightbeam::utils::task::Pipeline;
-use tightbeam::{compose, exactly, job, tb_assert_spec, tb_scenario};
+use tightbeam::{compose, exactly, job, tb_assert_spec, tb_scenario, testing::SetupEnv};
 use tightbeam::{Beamable, Frame, TightBeamError};
 
 #[cfg(feature = "testing-csp")]
 use tightbeam::tb_process_spec;
+#[cfg(feature = "testing-csp")]
+use tightbeam::testing::ScenarioConf;
 
 // Test message types
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
@@ -68,20 +69,18 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pipeline_start", exactly!(1)),
-			("pipeline_complete", exactly!(1))
+			(pipeline_start, exactly!(1)),
+			(pipeline_complete, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_pipeline_manual_events,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ManualEventSpec::latest())
-		.build(),
+	spec: ManualEventSpec,
 	environment Bare {
-		exec: |trace| {
-			trace.event("pipeline_start")?;
+		exec: |SetupEnv { trace, .. }| {
+			trace.event(ManualEventSpec::pipeline_start)?;
 
 			// Direct Result pipeline (no PipelineBuilder = no auto-trace)
 			let _frame = CreateTestFrame::run(("test-001".to_string(), "content".to_string()))
@@ -89,7 +88,7 @@ tb_scenario! {
 				.and_then(|f| TransformContent::run((f,)))
 				.run()?;
 
-			trace.event("pipeline_complete")?;
+			trace.event(ManualEventSpec::pipeline_complete)?;
 			Ok(())
 		}
 	}
@@ -107,12 +106,12 @@ tb_assert_spec! {
 		gate: Accepted,
 		assertions: [
 			// Shorthand labels match full URNs: "foo" matches "urn:*:instrumentation:event/foo"
-			("create_test_frame_start", exactly!(1)),
-			("create_test_frame_success", exactly!(1)),
-			("validate_frame_start", exactly!(1)),
-			("validate_frame_success", exactly!(1)),
-			("transform_content_start", exactly!(1)),
-			("transform_content_success", exactly!(1))
+			(create_test_frame_start, exactly!(1)),
+			(create_test_frame_success, exactly!(1)),
+			(validate_frame_start, exactly!(1)),
+			(validate_frame_success, exactly!(1)),
+			(transform_content_start, exactly!(1)),
+			(transform_content_success, exactly!(1))
 		]
 	}
 }
@@ -149,7 +148,7 @@ tb_process_spec! {
 #[cfg(feature = "testing-csp")]
 tb_scenario! {
 	name: test_pipeline_auto_trace_urns,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(AutoTraceSpec::latest())
 		.with_csp(PipelineProcess)
 		.build(),
@@ -177,22 +176,20 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("fallback_triggered", exactly!(1))
+			(fallback_triggered, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_pipeline_with_fallback,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(FallbackSpec::latest())
-		.build(),
+	spec: FallbackSpec,
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Pipeline with fallback on error
 			let failing: Result<Frame, TightBeamError> = Err(TightBeamError::InvalidOrder);
 			let _frame = failing.or_else(|_| {
-				trace.event("fallback_triggered")?;
+				trace.event(FallbackSpec::fallback_triggered)?;
 				compose! {
 					V0: id: b"fallback",
 						message: TestMessage {

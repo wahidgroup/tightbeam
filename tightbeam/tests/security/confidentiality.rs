@@ -25,7 +25,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -40,11 +42,11 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("conf_capture_handshake", exactly!(1u32)),
-			("conf_extract_ciphertext", exactly!(1u32)),
-			("conf_decrypt_correct_key", exactly!(1u32)),
-			("conf_decrypt_wrong_key_fails", exactly!(1u32)),
-			("conf_ciphertexts_differ", exactly!(1u32))
+			(conf_capture_handshake, exactly!(1u32)),
+			(conf_extract_ciphertext, exactly!(1u32)),
+			(conf_decrypt_correct_key, exactly!(1u32)),
+			(conf_decrypt_wrong_key_fails, exactly!(1u32)),
+			(conf_ciphertexts_differ, exactly!(1u32))
 		]
 	}
 }
@@ -85,13 +87,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: confidentiality,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ConfidentialitySpec::latest())
 		.with_csp(ConfidentialityProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			ConfidentialityScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			ConfidentialityScenario::run((trace.into(),)).await
 		}
 	}
 }
@@ -112,7 +114,7 @@ job! {
 		let mut session = harness.spawn(kind);
 		let captured = session.capture_full().await?;
 
-		trace.event("conf_capture_handshake")?;
+		trace.event(ConfidentialitySpec::conf_capture_handshake)?;
 
 		// ========================================
 		// Step 2: Extract ECIES ciphertext from ClientKeyExchange (step 2)
@@ -131,7 +133,7 @@ job! {
 			return Err(expectation_failure("ciphertext too short to be valid ECIES"));
 		}
 
-		trace.event("conf_extract_ciphertext")?;
+		trace.event(ConfidentialitySpec::conf_extract_ciphertext)?;
 
 		// ========================================
 		// Step 3: Decrypt with CORRECT key - proves encryption works
@@ -144,7 +146,7 @@ job! {
 					return Err(expectation_failure("decrypted plaintext is not 64 bytes"));
 				}
 
-				trace.event("conf_decrypt_correct_key")?;
+				trace.event(ConfidentialitySpec::conf_decrypt_correct_key)?;
 			}
 			DecryptionResult::Failed => {
 				return Err(expectation_failure("decryption with correct key failed"));
@@ -158,7 +160,7 @@ job! {
 		match try_decrypt_ecies(&ciphertext, &wrong_key, None) {
 			DecryptionResult::Failed => {
 				// Expected - wrong key cannot decrypt
-				trace.event("conf_decrypt_wrong_key_fails")?;
+				trace.event(ConfidentialitySpec::conf_decrypt_wrong_key_fails)?;
 			}
 			DecryptionResult::Success { .. } => {
 				return Err(expectation_failure("decryption with wrong key should fail"));
@@ -185,7 +187,7 @@ job! {
 			return Err(expectation_failure("ciphertexts are identical across handshakes"));
 		}
 
-		trace.event("conf_ciphertexts_differ")?;
+		trace.event(ConfidentialitySpec::conf_ciphertexts_differ)?;
 
 		Ok(())
 	}

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use tightbeam::testing::fdr::{FdrConfig, FdrTraceExt};
 use tightbeam::testing::specs::csp::Process;
-use tightbeam::testing::{ScenarioConf, TestHooks};
+use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 fn build_fdr_config(specs: Vec<Process>) -> FdrConfig {
@@ -34,14 +34,14 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("connect", exactly!(1)),
-			("serialize", exactly!(1)),
-			("encrypt", exactly!(1)),
-			("request", exactly!(1)),
-			("decrypt", exactly!(1)),
-			("deserialize", exactly!(1)),
-			("response", exactly!(1)),
-			("disconnect", exactly!(1))
+			(connect, exactly!(1)),
+			(serialize, exactly!(1)),
+			(encrypt, exactly!(1)),
+			(request, exactly!(1)),
+			(decrypt, exactly!(1)),
+			(deserialize, exactly!(1)),
+			(response, exactly!(1)),
+			(disconnect, exactly!(1))
 		]
 	}
 }
@@ -73,7 +73,7 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: test_trace_analysis_methods,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(TraceAnalysisSpec::latest())
 		.with_fdr(build_fdr_config(vec![SimpleRequestResponse::process()]))
 		.with_hooks(TestHooks {
@@ -102,16 +102,16 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			// Execute simple request-response flow (simulated)
-			trace.event("connect")?;
-			trace.event("serialize")?;
-			trace.event("encrypt")?;
-			trace.event("request")?;
-			trace.event("decrypt")?;
-			trace.event("deserialize")?;
-			trace.event("response")?;
-			trace.event("disconnect")?;
+			trace.event(TraceAnalysisSpec::connect)?;
+			trace.event(TraceAnalysisSpec::serialize)?;
+			trace.event(TraceAnalysisSpec::encrypt)?;
+			trace.event(TraceAnalysisSpec::request)?;
+			trace.event(TraceAnalysisSpec::decrypt)?;
+			trace.event(TraceAnalysisSpec::deserialize)?;
+			trace.event(TraceAnalysisSpec::response)?;
+			trace.event(TraceAnalysisSpec::disconnect)?;
 
 			Ok(())
 		}

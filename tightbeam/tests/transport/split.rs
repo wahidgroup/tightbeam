@@ -24,8 +24,7 @@ use tightbeam::exactly;
 use tightbeam::policy::TransitStatus;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::config::ScenarioConf;
-use tightbeam::testing::create_v0_tightbeam;
+use tightbeam::testing::{create_v0_tightbeam, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::tcp::r#async::{TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
@@ -43,21 +42,19 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("split_encrypted_roundtrip", exactly!(1), equals!(true)),
-			("split_rejects_pre_handshake", exactly!(1), equals!(true)),
-			("split_rekey_limit_fails_closed", exactly!(1), equals!(true)),
-			("split_recv_rekey_limit_fails_closed", exactly!(1), equals!(true))
+			(split_encrypted_roundtrip, exactly!(1), equals!(true)),
+			(split_rejects_pre_handshake, exactly!(1), equals!(true)),
+			(split_rekey_limit_fails_closed, exactly!(1), equals!(true)),
+			(split_recv_rekey_limit_fails_closed, exactly!(1), equals!(true))
 		]
 	}
 }
 
 tb_scenario! {
 	name: split_transport,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(SplitTransportSpec::latest())
-		.build(),
+	spec: SplitTransportSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			split_encrypted_roundtrip(&trace).await?;
 			split_rejects_pre_handshake(&trace).await?;
 			split_rekey_limit_fails_closed(&trace).await?;
@@ -117,22 +114,20 @@ async fn split_encrypted_roundtrip(trace: &TraceCollector) -> Result<(), TightBe
 
 	await_ok(server_handle, "server task must not panic").await?;
 
-	trace.event_with("split_encrypted_roundtrip", &[], status_ok && frame_ok)?;
+	trace.event_with(SplitTransportSpec::split_encrypted_roundtrip, &[], status_ok && frame_ok)?;
 	Ok(())
 }
 
 /// Splitting an un-handshaken transport must fail closed.
 async fn split_rejects_pre_handshake(trace: &TraceCollector) -> Result<(), TightBeamError> {
-	let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0")
-		.await
-		.map_err(TransportError::from)?;
+	let listener = TokioListener::<DefaultCryptoProvider>::bind("127.0.0.1:0").await?;
 
-	let addr = listener.local_addr().map_err(TransportError::from)?;
-	let stream = TcpStream::connect(addr).await.map_err(TransportError::from)?;
+	let addr = listener.local_addr()?;
+	let stream = TcpStream::connect(addr).await?;
 	let transport: TcpTransport<TokioStream> = TcpTransport::from(TokioStream::from(stream));
 
 	let rejected = matches!(transport.into_split(), Err(TransportError::InvalidState));
-	trace.event_with("split_rejects_pre_handshake", &[], rejected)?;
+	trace.event_with(SplitTransportSpec::split_rejects_pre_handshake, &[], rejected)?;
 	Ok(())
 }
 
@@ -168,7 +163,7 @@ async fn split_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(), Ti
 
 	await_ok(server_handle, "server task must not panic").await?;
 
-	trace.event_with("split_rekey_limit_fails_closed", &[], rekey_required)?;
+	trace.event_with(SplitTransportSpec::split_rekey_limit_fails_closed, &[], rekey_required)?;
 	Ok(())
 }
 
@@ -205,6 +200,10 @@ async fn split_recv_rekey_limit_fails_closed(trace: &TraceCollector) -> Result<(
 
 	await_ok(server_handle, "server task must not panic").await?;
 
-	trace.event_with("split_recv_rekey_limit_fails_closed", &[], arrived && rekey_required)?;
+	trace.event_with(
+		SplitTransportSpec::split_recv_rekey_limit_fails_closed,
+		&[],
+		arrived && rekey_required,
+	)?;
 	Ok(())
 }

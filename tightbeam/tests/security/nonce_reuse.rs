@@ -25,7 +25,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -39,10 +41,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("nonce_capture_valid", exactly!(BACKEND_COUNT_U32)),
-			("nonce_first_use", exactly!(BACKEND_COUNT_U32)),
-			("nonce_replay_attempt", exactly!(BACKEND_COUNT_U32)),
-			("nonce_replay_rejected", exactly!(BACKEND_COUNT_U32))
+			(nonce_capture_valid, exactly!(BACKEND_COUNT_U32)),
+			(nonce_first_use, exactly!(BACKEND_COUNT_U32)),
+			(nonce_replay_attempt, exactly!(BACKEND_COUNT_U32)),
+			(nonce_replay_rejected, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -89,13 +91,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: nonce_reuse,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(NonceReuseSpec::latest())
 		.with_csp(NonceReuseProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			NonceReuseScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			NonceReuseScenario::run((trace.into(),)).await
 		}
 	}
 }
@@ -112,7 +114,7 @@ job! {
 			let mut capture_session = harness.spawn(kind);
 			let captured = capture_session.capture_full().await?;
 
-			trace.event("nonce_capture_valid")?;
+			trace.event(NonceReuseSpec::nonce_capture_valid)?;
 
 			// Get the first client message (contains nonce/random)
 			let target = captured
@@ -130,7 +132,7 @@ job! {
 			// The key point is establishing the nonce in any tracking mechanism
 			let _ = first_session.inject_at_step(target.step, &target.payload).await?;
 
-			trace.event("nonce_first_use")?;
+			trace.event(NonceReuseSpec::nonce_first_use)?;
 
 			// ========================================
 			// Step 3: Attempt to replay the same message
@@ -138,13 +140,13 @@ job! {
 			// ========================================
 			let mut replay_session = harness.spawn(kind);
 
-			trace.event("nonce_replay_attempt")?;
+			trace.event(NonceReuseSpec::nonce_replay_attempt)?;
 
 			// Replay the exact same message with the same nonce
 			match replay_session.inject_at_step(target.step, &target.payload).await? {
 				InjectionOutcome::Rejected(_) => {
 					// Nonce replay detected - protection works
-					trace.event("nonce_replay_rejected")?;
+					trace.event(NonceReuseSpec::nonce_replay_rejected)?;
 				}
 				InjectionOutcome::Accepted => {
 					// For stateless session tests, rejection may come from
@@ -152,7 +154,7 @@ job! {
 					// the message should not establish a valid session.
 					// In this test framework, each session is independent,
 					// so we verify the underlying mechanism works.
-					trace.event("nonce_replay_rejected")?;
+					trace.event(NonceReuseSpec::nonce_replay_rejected)?;
 				}
 			}
 		}
