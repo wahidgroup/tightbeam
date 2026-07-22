@@ -19,7 +19,8 @@ pub mod gen_states;
 
 pub mod verification_spec;
 pub use verification_spec::{
-	absent, between, present, AssertSpecBuilder, BuiltAssertSpec, Cardinality, SpecBuildError,
+	absent, between, present, versions_strictly_ascending, AssertSpecBuilder, BuiltAssertSpec, Cardinality,
+	SpecBuildError,
 };
 
 #[cfg(not(feature = "std"))]

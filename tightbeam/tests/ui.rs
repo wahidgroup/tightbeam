@@ -33,3 +33,9 @@ fn compile_fail_profile_conflict() {
 	let t = trybuild::TestCases::new();
 	t.compile_fail("tests/compile/profile_conflict.rs");
 }
+
+#[test]
+fn compile_fail_assert_spec_version_order() {
+	let t = trybuild::TestCases::new();
+	t.compile_fail("tests/compile/assert_spec_version_order.rs");
+}

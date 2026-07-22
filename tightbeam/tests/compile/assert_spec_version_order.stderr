@@ -1,0 +1,12 @@
+error[E0080]: evaluation panicked: tb_assert_spec! version blocks must be in strictly ascending semver order
+  --> tests/compile/assert_spec_version_order.rs:6:1
+   |
+ 6 | / tb_assert_spec! {
+ 7 | |     pub OutOfOrderSpec,
+ 8 | |     V(2,0,0): {
+ 9 | |         mode: Accept,
+...  |
+22 | | }
+   | |_^ evaluation of `_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `tb_assert_spec` (in Nightly builds, run with -Z macro-backtrace for more info)
