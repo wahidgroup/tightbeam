@@ -6,6 +6,7 @@
 //! - Leases share one multiplexed connection per destination
 //! - `conn()` on a multiplexed lease reports `InvalidState`
 //! - Stream-cap exhaustion fails over to an additional connection
+//! - Failover at the pool cap reuses pooled stream headroom over dialing
 //! - Pool-capacity exhaustion surfaces `Busy` instead of failing over
 //! - A peer that declines multiplexing yields an exclusive lease
 //! - A dead multiplexed connection is evicted and re-established
@@ -203,6 +204,48 @@ async fn pooled_mux_failover_opens_additional_connection() -> Result<(), TightBe
 	Ok(())
 }
 
+/// With the pool at `max_connections`, cap-exhaustion failover must move
+/// onto the pooled connection with stream headroom instead of dialing
+/// (a dial would report `Busy`).
+#[tokio::test]
+async fn pooled_mux_failover_reuses_pooled_headroom() -> Result<(), TightBeamError> {
+	let gated = start_gated_mux_echo_server(Some(TransportOffer::mux(1))).await?;
+	let pool = mux_pool(&gated.server.materials, Some(TransportOffer::mux(4)), 2)?;
+
+	// All three leases share connection one (the only entry so far).
+	let mut held_lease = pool.connect(gated.server.addr).await?;
+	let mut fill_lease = pool.connect(gated.server.addr).await?;
+	let mut reuse_lease = pool.connect(gated.server.addr).await?;
+
+	let frame_held = create_v0_tightbeam(Some("mux-held"), None);
+	let held_task = tokio::spawn(async move { held_lease.emit(frame_held, None).await });
+	gated.started.notified().await;
+
+	// Connection one is saturated: this failover dials connection two,
+	// filling the pool.
+	let frame_fill = create_v0_tightbeam(Some("mux-fill"), None);
+	let reply_fill = fill_lease.emit(frame_fill.clone(), None).await?;
+	assert_eq!(
+		reply_fill,
+		Some(frame_fill),
+		"first failover must dial an additional connection"
+	);
+
+	let frame_reuse = create_v0_tightbeam(Some("mux-reuse"), None);
+	let reply_reuse = reuse_lease.emit(frame_reuse.clone(), None).await?;
+	assert_eq!(
+		reply_reuse,
+		Some(frame_reuse),
+		"failover at max connections must reuse pooled stream headroom"
+	);
+
+	gated.release.notify_one();
+
+	let held_reply = held_task.await.map_err(|_| TightBeamError::MissingResponse)??;
+	assert!(held_reply.is_some(), "held emit must complete after release");
+	Ok(())
+}
+
 /// Server cap 1 with NO pool headroom: the second concurrent emit cannot
 /// fail over and must surface the pool's `Busy`.
 #[tokio::test]
@@ -225,6 +268,7 @@ async fn pooled_mux_without_headroom_reports_busy() -> Result<(), TightBeamError
 	);
 
 	gated.release.notify_one();
+
 	let held_reply = held_task.await.map_err(|_| TightBeamError::MissingResponse)??;
 	assert!(held_reply.is_some(), "held emit must complete after release");
 	Ok(())

@@ -621,12 +621,23 @@ pooled_mux! {
 				None => return self.connect_single_flight(addr).await,
 			};
 
-			if let Some((id, handle)) = self.try_take_mux_handle(&addr)? {
+			self.acquire_mux(addr, offer, MuxSelection::PreferHeadroom).await
+		}
+
+		/// The acquisition funnel for every mux-offering caller: a pooled mux
+		/// entry, then an idle exclusive connection left over from a peer that
+		/// declined the mux offer at handshake, then a fresh dial. Selection
+		/// policy lives here alone so no caller can skip a reuse tier.
+		async fn acquire_mux(
+			self: &Arc<Self>,
+			addr: P::Address,
+			offer: TransportOffer,
+			selection: MuxSelection,
+		) -> TransportResult<PooledClient<P, C>> {
+			if let Some((id, handle)) = self.try_take_mux_handle(&addr, selection)? {
 				return Ok(self.wrap_mux_client(handle, id, addr));
 			}
 
-			// Idle exclusive connections (peer declined the offer earlier)
-			// are reused before dialing another socket.
 			if let Some(client) = self.try_take_ready_client(&addr)? {
 				return Ok(self.wrap_client(client, addr));
 			}
@@ -700,9 +711,14 @@ pooled_mux! {
 			Ok(self.wrap_mux_client(handle, id, addr))
 		}
 
-		/// Round-robin a live mux entry for the destination, evicting
-		/// entries whose reader driver already ended.
-		fn try_take_mux_handle(self: &Arc<Self>, addr: &P::Address) -> TransportResult<Option<(u64, MuxHandle)>> {
+		/// Round-robin a live mux entry for the destination: prunes idle
+		/// entries, evicts those whose reader driver already ended, and
+		/// prefers entries with stream headroom over saturated ones.
+		fn try_take_mux_handle(
+			self: &Arc<Self>,
+			addr: &P::Address,
+			selection: MuxSelection,
+		) -> TransportResult<Option<(u64, MuxHandle)>> {
 			let mut pools = self.write_pools()?;
 			let dest_pool = match pools.get_mut(addr) {
 				Some(dest_pool) => dest_pool,
@@ -725,8 +741,18 @@ pooled_mux! {
 				dest_pool.mux.rotate_left(1);
 			}
 
+			let with_headroom = dest_pool.mux.iter().find(|entry| entry.handle.has_stream_headroom());
+			let fallback = match selection {
+				// A saturated entry stays shareable: an in-flight stream
+				// may finish before the caller emits.
+				MuxSelection::PreferHeadroom => dest_pool.mux.first(),
+				// Cap-exhaustion failover must not land back on a
+				// saturated entry, so it falls through to a fresh dial.
+				MuxSelection::RequireHeadroom => None,
+			};
+
 			// Handle clone is a refcount bump: the entry stays pooled for other callers.
-			let selected = dest_pool.mux.first().map(|entry| (entry.id, entry.handle.clone()));
+			let selected = with_headroom.or(fallback).map(|entry| (entry.id, entry.handle.clone()));
 			Ok(selected)
 		}
 
@@ -766,6 +792,16 @@ pooled_mux! {
 	struct MuxLease {
 		id: u64,
 		handle: MuxHandle,
+	}
+
+	/// Mux entry selection policy for the acquisition funnel.
+	#[derive(Clone, Copy)]
+	enum MuxSelection {
+		/// Prefer an entry with stream headroom, fall back to a saturated
+		/// one (a slot may free before the caller emits)
+		PreferHeadroom,
+		/// Only an entry with stream headroom, `None` otherwise
+		RequireHeadroom,
 	}
 }
 
@@ -845,8 +881,9 @@ pooled_mux! {
 		/// shared mux connection, or the exclusive lease.
 		///
 		/// Mux lifecycle handling:
-		/// - `StreamsExhausted` (local stream cap full): opens an additional
-		///   connection up to `max_connections` and retries there once
+		/// - `StreamsExhausted` (local stream cap full): moves to a pooled
+		///   connection with stream headroom, or an additional one up to
+		///   `max_connections`, and retries there once
 		/// - `ConnectionClosed` / `Draining` (rekey GoAway): evicts the entry
 		///   so the next connect re-establishes, then reports the failure
 		pub async fn emit(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
@@ -859,7 +896,7 @@ pooled_mux! {
 
 			match handle.emit_on_stream(&frame).await {
 				Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)) => {
-					self.emit_on_fresh_connection(frame, attempt).await
+					self.emit_failover(frame, attempt).await
 				}
 				Err(err @ (TransportError::ConnectionClosed | TransportError::Draining)) => {
 					self.pool.evict_mux(&self.addr, lease_id);
@@ -869,20 +906,20 @@ pooled_mux! {
 			}
 		}
 
-		/// Cap-exhaustion failover: replace the lease with a fresh
-		/// connection and retry there once.
-		async fn emit_on_fresh_connection(
-			&mut self,
-			frame: Frame,
-			attempt: Option<usize>,
-		) -> TransportResult<Option<Frame>> {
+		/// Cap-exhaustion failover: move the lease through the acquisition
+		/// funnel (pooled headroom before a fresh dial) and retry there
+		/// once.
+		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 			let offer = match self.pool.config.mux_offer {
 				Some(offer) => offer,
 				// A mux lease exists only when an offer is configured
 				None => return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)),
 			};
 
-			*self = self.pool.open_mux_connection(self.addr.clone(), offer).await?;
+			*self = self
+				.pool
+				.acquire_mux(self.addr.clone(), offer, MuxSelection::RequireHeadroom)
+				.await?;
 
 			match self.mux.as_ref() {
 				Some(lease) => lease.handle.emit_on_stream(&frame).await,

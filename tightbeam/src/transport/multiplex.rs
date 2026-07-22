@@ -460,6 +460,15 @@ mod router {
 			self.lock().last_peer_stream_id
 		}
 
+		fn has_stream_headroom(&self) -> bool {
+			let state = self.lock();
+			let under_cap = state.pending.len() < cap_as_usize(self.local_cap);
+			let id_space_live = state.next_stream_id.is_some();
+			let no_goaway = state.goaway_sent.is_none() && state.goaway_received.is_none();
+
+			no_goaway && id_space_live && under_cap
+		}
+
 		/// Time since the last stream opened, or zero while any
 		/// locally-initiated stream is still in flight.
 		fn idle_for(&self, now: Instant) -> Duration {
@@ -628,6 +637,15 @@ mod router {
 		/// Cancel a locally-initiated in-flight stream (best-effort).
 		pub fn close_stream(&self, stream_id: StreamId) {
 			enqueue_stream_cancel(&self.shared, &self.outbound, stream_id.value());
+		}
+
+		/// Whether a new locally-initiated stream would be admitted now: cap
+		/// headroom, live ID space, and no GoAway either way.
+		///
+		/// Advisory: a concurrent emit can take the last slot after this
+		/// returns, so callers still handle `StreamsExhausted`.
+		pub fn has_stream_headroom(&self) -> bool {
+			self.shared.has_stream_headroom()
 		}
 
 		/// Time since the last stream opened in either direction, or zero
@@ -1349,6 +1367,26 @@ mod router {
 
 			shared.fail_all_pending();
 			assert!(receiver.try_recv().is_err());
+		}
+
+		#[test]
+		fn test_headroom_present_on_fresh_connection() {
+			let shared = test_shared(MuxRole::Client, 2);
+			assert!(shared.has_stream_headroom());
+		}
+
+		#[test]
+		fn test_headroom_gone_at_cap() {
+			let shared = test_shared(MuxRole::Client, 1);
+			assert!(matches!(shared.allocate(slot()), Ok(1)));
+			assert!(!shared.has_stream_headroom());
+		}
+
+		#[test]
+		fn test_headroom_gone_while_draining() {
+			let shared = test_shared(MuxRole::Client, 2);
+			shared.begin_shutdown();
+			assert!(!shared.has_stream_headroom());
 		}
 
 		#[test]
