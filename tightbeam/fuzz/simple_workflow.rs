@@ -17,10 +17,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("start", exactly!(1)),
-			("action_a", at_least!(0)),
-			("action_b", at_least!(0)),
-			("done", exactly!(1))
+			(start, exactly!(1)),
+			(action_a, at_least!(0)),
+			(action_b, at_least!(0)),
+			(done, exactly!(1))
 		]
 	},
 }
@@ -41,12 +41,12 @@ tb_process_spec! {
 tb_scenario! {
 	fuzz: afl,
 	csp: SimpleFuzzProc,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(SimpleFuzzSpec::latest())
 		.with_csp(SimpleFuzzProc)
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Oracle-guided fuzzing: interprets AFL input as event choices
 			trace.oracle().fuzz_from_bytes()?;
 

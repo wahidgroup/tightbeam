@@ -12,7 +12,7 @@
 	feature = "signature"
 ))]
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use sha3::Sha3_256;
 use tightbeam::{
@@ -36,9 +36,11 @@ use tightbeam::{
 	decode, encode,
 	policy::TransitStatus,
 	tb_assert_spec, tb_scenario,
-	testing::ScenarioConf,
+	testing::SetupEnv,
 	trace::TraceCollector,
-	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
+	transport::{
+		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
+	},
 	utils::compose,
 	TightBeamError, Version,
 };
@@ -63,9 +65,8 @@ struct TestCerts {
 	hive_trust: Arc<dyn CertificateTrust>,
 }
 
-fn get_test_certs() -> &'static TestCerts {
-	static CERTS: OnceLock<TestCerts> = OnceLock::new();
-	CERTS.get_or_init(|| {
+impl TestCerts {
+	fn generate() -> Self {
 		let (cluster_cert, cluster_key) =
 			create_test_cert_with_key("CN=Payment Gateway", 365).expect("Failed to create cluster cert");
 		let cluster_trust: Arc<dyn CertificateTrust> = Arc::new(
@@ -84,8 +85,8 @@ fn get_test_certs() -> &'static TestCerts {
 				.build(),
 		);
 
-		TestCerts { cluster_cert, cluster_key, cluster_trust, hive_cert, hive_key, hive_trust }
-	})
+		Self { cluster_cert, cluster_key, cluster_trust, hive_cert, hive_key, hive_trust }
+	}
 }
 
 // ============================================================================
@@ -164,7 +165,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("work_completed", at_least!(1))
+			(work_completed, at_least!(1))
 		]
 	}
 }
@@ -175,26 +176,30 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: payment_gateway_cluster,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(PaymentGatewaySpec::latest())
-		.build(),
+	spec: PaymentGatewaySpec,
 	environment Bare {
-		exec: |trace| async move {
-			let certs = get_test_certs();
+		context: TestCerts::generate(),
+		exec: |SetupEnv { trace, context: certs }| async move {
+			// Start cluster; the gateway and hive both offer mux, so the
+			// colony links run multiplexed
+			let mut cluster_conf = ClusterConf::new(cluster_tls_config(&certs));
+			cluster_conf.pool_config.mux_offer = Some(TransportOffer::mux(8));
 
-			// Start cluster
-			let cluster_conf = ClusterConf::new(cluster_tls_config(certs));
 			let cluster_trace = Arc::new(TraceCollector::new());
 			let cluster = PaymentGatewayCluster::start(Arc::clone(&cluster_trace), cluster_conf).await?;
 			let cluster_addr = cluster.addr();
 
 			// Start servlet with TLS
-			let servlet_conf = servlet_tls_config(certs)?;
+			let servlet_conf = servlet_tls_config(&certs)?;
 			let servlet_trace = Arc::new(TraceCollector::new());
 			let servlet = AuthorizationServlet::start(Arc::clone(&servlet_trace), Some(servlet_conf)).await?;
 
 			// Create and establish hive
-			let mut hive = PaymentProcessorHive::new(Some(hive_tls_config(certs)))?;
+			let mut hive = PaymentProcessorHive::new(Some(HiveConf {
+				mux_offer: Some(TransportOffer::mux(8)),
+				..hive_tls_config(&certs)
+			}))?;
+
 			hive.register("authorization", servlet, |t| AuthorizationServlet::start(t, None))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 
@@ -222,11 +227,10 @@ tb_scenario! {
 
 			let response_frame = client.emit(frame, None).await?
 				.ok_or(TightBeamError::MissingResponse)?;
-
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
 
 			// Mark test completion
-			trace.event("work_completed")?;
+			trace.event(PaymentGatewaySpec::work_completed)?;
 
 			// Verify routing succeeded
 			if work_response.status == TransitStatus::Accepted {

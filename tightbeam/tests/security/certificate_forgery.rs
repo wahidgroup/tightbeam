@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tightbeam::{
 	crypto::x509::{error::CertificateValidationError, policy::CertificateValidation, Certificate},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::ScenarioConf,
+	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{client::EciesHandshakeClient, server::EciesHandshakeServer},
 	TightBeamError,
@@ -87,9 +87,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("cert_valid_accepted", exactly!(1u32)),
-			("cert_wrong_key_rejected", exactly!(1u32)),
-			("cert_reject_all_rejected", exactly!(1u32))
+			(cert_valid_accepted, exactly!(1u32)),
+			(cert_wrong_key_rejected, exactly!(1u32)),
+			(cert_reject_all_rejected, exactly!(1u32))
 		]
 	}
 }
@@ -116,13 +116,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: certificate_forgery,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(CertificateForgerySpec::latest())
 		.with_csp(CertificateForgeryProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			CertificateForgeryScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			CertificateForgeryScenario::run((trace.into(),)).await
 		}
 	}
 }

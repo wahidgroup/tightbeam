@@ -29,7 +29,7 @@ use tightbeam::{
 	colony::servlet::ServletConf,
 	der::Sequence,
 	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::{create_v0_tightbeam, trace::TraceCollector, ScenarioConf},
+	testing::{create_v0_tightbeam, trace::TraceCollector, SetupEnv},
 	transport::{tcp::r#async::TokioListener, ConnectionBuilder, ConnectionPool, PoolConfig},
 	Beamable,
 };
@@ -154,12 +154,12 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pool_create", exactly!(1)),
-			("acquire_client", exactly!(3)),
-			("send_message", exactly!(3)),
-			("receive_response", exactly!(3)),
-			("release_client", exactly!(3)),
-			("message_count", exactly!(1), equals!(3u64))
+			(pool_create, exactly!(1)),
+			(acquire_client, exactly!(3)),
+			(send_message, exactly!(3)),
+			(receive_response, exactly!(3)),
+			(release_client, exactly!(3)),
+			(message_count, exactly!(1), equals!(3u64))
 		]
 	}
 }
@@ -170,13 +170,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pool_create", exactly!(1)),
-			("acquire_client", exactly!(3)),
-			("send_message", exactly!(3)),
-			("receive_response", exactly!(3)),
-			("release_client", exactly!(3)),
-			("servlet1_count", exactly!(1), equals!(2u64)),
-			("servlet2_count", exactly!(1), equals!(1u64))
+			(pool_create, exactly!(1)),
+			(acquire_client, exactly!(3)),
+			(send_message, exactly!(3)),
+			(receive_response, exactly!(3)),
+			(release_client, exactly!(3)),
+			(servlet1_count, exactly!(1), equals!(2u64)),
+			(servlet2_count, exactly!(1), equals!(1u64))
 		]
 	}
 }
@@ -260,11 +260,9 @@ async fn start_pool_echo_servlet(message_count: Arc<AtomicUsize>) -> Result<Pool
 ))]
 tb_scenario! {
 	name: connection_pool_reuse,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(PoolReuseSpec::latest())
-		.build(),
+	spec: PoolReuseSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			let message_count = Arc::new(AtomicUsize::new(0));
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
 			let server_addr = servlet.addr();
@@ -373,11 +371,9 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 ))]
 tb_scenario! {
 	name: pool_per_destination_isolation,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(PoolIsolationSpec::latest())
-		.build(),
+	spec: PoolIsolationSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			let count1 = Arc::new(AtomicUsize::new(0));
 			let count2 = Arc::new(AtomicUsize::new(0));
 			let servlet1 = start_pool_echo_servlet(Arc::clone(&count1)).await?;
@@ -430,11 +426,9 @@ tb_scenario! {
 ))]
 tb_scenario! {
 	name: pool_concurrent_access,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(PoolReuseSpec::latest())
-		.build(),
+	spec: PoolReuseSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			let message_count = Arc::new(AtomicUsize::new(0));
 			let servlet = start_pool_echo_servlet(Arc::clone(&message_count)).await?;
 			let server_addr = servlet.addr();

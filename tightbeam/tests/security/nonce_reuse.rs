@@ -25,7 +25,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -39,10 +41,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("nonce_capture_valid", exactly!(BACKEND_COUNT_U32)),
-			("nonce_first_use", exactly!(BACKEND_COUNT_U32)),
-			("nonce_replay_attempt", exactly!(BACKEND_COUNT_U32)),
-			("nonce_replay_rejected", exactly!(BACKEND_COUNT_U32))
+			(nonce_capture_valid, exactly!(BACKEND_COUNT_U32)),
+			(nonce_first_use, exactly!(BACKEND_COUNT_U32)),
+			(nonce_replay_attempt, exactly!(BACKEND_COUNT_U32)),
+			(nonce_replay_rejected, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -89,13 +91,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: nonce_reuse,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(NonceReuseSpec::latest())
 		.with_csp(NonceReuseProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			NonceReuseScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			NonceReuseScenario::run((trace.into(),)).await
 		}
 	}
 }

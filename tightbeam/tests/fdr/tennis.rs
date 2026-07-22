@@ -8,7 +8,7 @@
 
 #![cfg(feature = "testing-fdr")]
 
-use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConf};
+use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConf, SetupEnv};
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
 
 fn build_fdr_config(
@@ -103,15 +103,15 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pointA", exactly!(4)),
-			("pointB", exactly!(1))
+			(pointA, exactly!(4)),
+			(pointB, exactly!(1))
 		]
 	},
 }
 
 tb_scenario! {
 	name: test_tennis_valid_trace_refinement,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ValidTennisSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![TennisScorer::process()],
@@ -122,7 +122,7 @@ tb_scenario! {
 		))
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
 			trace.event("pointA")?;
 			trace.event("pointA")?;
@@ -144,15 +144,15 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pointA", exactly!(1)),
-			("pointB", exactly!(4))
+			(pointA, exactly!(1)),
+			(pointB, exactly!(4))
 		]
 	},
 }
 
 tb_scenario! {
 	name: test_tennis_invalid_trace_refinement,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(InvalidTennisSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![TennisScorer::process()],
@@ -163,7 +163,7 @@ tb_scenario! {
 		))
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
 			// This violates the tennis scoring rules - after (0,40), B should win
 			trace.event("pointA")?;
@@ -187,15 +187,15 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pointA", exactly!(5)),
-			("pointB", exactly!(3))
+			(pointA, exactly!(5)),
+			(pointB, exactly!(3))
 		]
 	},
 }
 
 tb_scenario! {
 	name: test_tennis_deuce_to_advantage,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DeuceTennisSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![TennisScorer::process()],
@@ -206,7 +206,7 @@ tb_scenario! {
 		))
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Valid trace going through deuce: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
 			trace.event("pointA")?;
 			trace.event("pointB")?;
@@ -230,15 +230,15 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("pointA", exactly!(2)),
-			("pointB", exactly!(1))
+			(pointA, exactly!(2)),
+			(pointB, exactly!(1))
 		]
 	},
 }
 
 tb_scenario! {
 	name: test_failures_refinement,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(FailuresTennisSpec::latest())
 		.with_fdr(build_fdr_config(
 			vec![TennisScorer::process()],
@@ -249,7 +249,7 @@ tb_scenario! {
 		))
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			// Create a trace that should pass failures refinement
 			trace.event("pointA")?;
 			trace.event("pointB")?;

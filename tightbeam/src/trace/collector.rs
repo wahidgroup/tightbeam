@@ -868,8 +868,7 @@ impl ExecutionMode {
 
 #[cfg(test)]
 mod tests {
-	use crate::testing::ScenarioConf;
-	use crate::{exactly, tb_assert_spec, tb_scenario};
+	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};
 
 	tb_assert_spec! {
 		pub TraceCollectorSpec,
@@ -877,19 +876,17 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				("alpha", exactly!(1)),
-				("beta", exactly!(1)),
+				(alpha, exactly!(1)),
+				(beta, exactly!(1)),
 			]
 		}
 	}
 
 	tb_scenario! {
 		name: trace_collector_records_shared_state,
-		config: ScenarioConf::<()>::builder()
-			.with_spec(TraceCollectorSpec::latest())
-			.build(),
+		spec: TraceCollectorSpec,
 		environment Bare {
-			exec: |trace| {
+			exec: |SetupEnv { trace, .. }| {
 				trace.event("alpha")?;
 				trace.event("beta")?;
 				Ok(())

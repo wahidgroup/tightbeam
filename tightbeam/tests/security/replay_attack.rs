@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -34,10 +36,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("replay_initial_handshake", exactly!(BACKEND_COUNT_U32)),
-			("replay_attempt", exactly!(BACKEND_COUNT_U32)),
-			("replay_detected", exactly!(BACKEND_COUNT_U32)),
-			("replay_rejected", exactly!(BACKEND_COUNT_U32))
+			(replay_initial_handshake, exactly!(BACKEND_COUNT_U32)),
+			(replay_attempt, exactly!(BACKEND_COUNT_U32)),
+			(replay_detected, exactly!(BACKEND_COUNT_U32)),
+			(replay_rejected, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -79,13 +81,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: replay_attack,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ReplayAttackSpec::latest())
 		.with_csp(ReplayAttackProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			ReplayAttackScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			ReplayAttackScenario::run((trace.into(),)).await
 		}
 	}
 }

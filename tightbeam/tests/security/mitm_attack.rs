@@ -24,8 +24,11 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
-	transport::handshake::HandshakeError, TightBeamError,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
+	transport::handshake::HandshakeError,
+	TightBeamError,
 };
 
 use crate::security::common::{
@@ -39,10 +42,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("mitm_capture_handshake", exactly!(BACKEND_COUNT_U32)),
-			("mitm_tamper_message", exactly!(BACKEND_COUNT_U32)),
-			("mitm_inject_tampered", exactly!(BACKEND_COUNT_U32)),
-			("mitm_tampering_detected", exactly!(BACKEND_COUNT_U32))
+			(mitm_capture_handshake, exactly!(BACKEND_COUNT_U32)),
+			(mitm_tamper_message, exactly!(BACKEND_COUNT_U32)),
+			(mitm_inject_tampered, exactly!(BACKEND_COUNT_U32)),
+			(mitm_tampering_detected, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -84,13 +87,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: mitm_attack,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(MitmAttackSpec::latest())
 		.with_csp(MitmAttackProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			MitmAttackScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			MitmAttackScenario::run((trace.into(),)).await
 		}
 	}
 }

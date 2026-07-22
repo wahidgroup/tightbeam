@@ -28,19 +28,19 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("compilation_check", exactly!(1)),
-			("workspace_has_afl", exactly!(1), equals!(true)),
-			("package_enables_afl", exactly!(1), equals!(true)),
-			("ijon_feature_enabled", exactly!(1), equals!(true)),
-			("binary_has_ijon_max", exactly!(1), equals!(true)),
-			("binary_has_ijon_set", exactly!(1), equals!(true)),
-			("binary_has_ijon_hashint", exactly!(1), equals!(true)),
-			("binary_has_ijon_map_size", exactly!(1), equals!(true)),
-			("binary_has_afl_runtime", exactly!(1), equals!(true)),
-			("coverage_score", exactly!(1), equals!(true)),
-			("track_state_stable", exactly!(1), equals!(true)),
-			("fuzz_advances_coverage", exactly!(1), equals!(true)),
-			("verification_complete", exactly!(1)),
+			(compilation_check, exactly!(1)),
+			(workspace_has_afl, exactly!(1), equals!(true)),
+			(package_enables_afl, exactly!(1), equals!(true)),
+			(ijon_feature_enabled, exactly!(1), equals!(true)),
+			(binary_has_ijon_max, exactly!(1), equals!(true)),
+			(binary_has_ijon_set, exactly!(1), equals!(true)),
+			(binary_has_ijon_hashint, exactly!(1), equals!(true)),
+			(binary_has_ijon_map_size, exactly!(1), equals!(true)),
+			(binary_has_afl_runtime, exactly!(1), equals!(true)),
+			(coverage_score, exactly!(1), equals!(true)),
+			(track_state_stable, exactly!(1), equals!(true)),
+			(fuzz_advances_coverage, exactly!(1), equals!(true)),
+			(verification_complete, exactly!(1)),
 		]
 	},
 }
@@ -117,12 +117,12 @@ tb_process_spec! {
 tb_scenario! {
 	fuzz: afl,
 	csp: VerificationProcess,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(VerificationSpec::latest())
 		.with_csp(VerificationProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			use std::fs;
 			use std::path::Path;
 

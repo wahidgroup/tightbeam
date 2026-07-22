@@ -33,7 +33,7 @@ use tightbeam::{
 	exactly, job,
 	oids::{AES_256_GCM, SIGNER_ECDSA_WITH_SHA3_256},
 	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::ScenarioConf,
+	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
 	TightBeamError,
 };
@@ -46,7 +46,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("foreign_oid_rejected", exactly!(1u32))
+			(foreign_oid_rejected, exactly!(1u32))
 		]
 	}
 }
@@ -67,13 +67,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: algorithm_confusion,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(AlgorithmConfusionSpec::latest())
 		.with_csp(AlgorithmConfusionProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			AlgorithmConfusionScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			AlgorithmConfusionScenario::run((trace.into(),)).await
 		}
 	}
 }

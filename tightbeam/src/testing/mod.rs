@@ -5,6 +5,7 @@
 
 pub mod assertions;
 pub mod config;
+pub mod env;
 pub mod error;
 pub mod export;
 pub mod macros;
@@ -28,6 +29,7 @@ pub mod timing;
 
 // Re-exports
 pub use config::{HookContext, ScenarioConf, ScenarioConfBuilder, TestHooks};
+pub use env::{ClientEnv, ClusterEnv, HiveEnv, ServletEnv, SetupEnv, WorkerEnv};
 pub use export::ScenarioResultExport;
 pub use result::ScenarioResult;
 pub use specs::{verify_trace, SpecViolation, TBSpec};
@@ -53,7 +55,7 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				("MessageReceived", exactly!(1))
+				(MessageReceived, exactly!(1))
 			]
 		}
 	}

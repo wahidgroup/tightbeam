@@ -22,7 +22,7 @@ use tightbeam::{
 	compose,
 	der::Sequence,
 	exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::ScenarioConf,
+	testing::SetupEnv,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	Beamable,
 };
@@ -141,9 +141,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("client_connect", exactly!(1)),
-			("send_message", exactly!(3)),
-			("receive_response", exactly!(3))
+			(client_connect, exactly!(1)),
+			(send_message, exactly!(3)),
+			(receive_response, exactly!(3))
 		]
 	}
 }
@@ -154,11 +154,9 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: tcp_connection_reuse,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ConnectionReuseSpec::latest())
-		.build(),
+	spec: ConnectionReuseSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			// Start echo servlet
 			servlet! {
 				EchoServlet<TestMessage, EnvConfig = ()>,
@@ -168,7 +166,7 @@ tb_scenario! {
 				}
 			}
 
-			let servlet_task = EchoServlet::start(Arc::clone(&trace), None).await?;
+			let servlet_task = EchoServlet::start(Arc::new(trace.share()), None).await?;
 			let addr = servlet_task.addr;
 
 			trace.event("client_connect")?;
@@ -208,11 +206,9 @@ tb_scenario! {
 ))]
 tb_scenario! {
 	name: tls_connection_reuse,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ConnectionReuseSpec::latest())
-		.build(),
+	spec: ConnectionReuseSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			// Start TLS echo servlet
 			servlet! {
 				TlsEchoServlet<TestMessage, EnvConfig = ()>,
@@ -226,7 +222,7 @@ tb_scenario! {
 				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
 				.build();
-			let servlet_task = TlsEchoServlet::start(Arc::clone(&trace), Some(servlet_conf)).await?;
+			let servlet_task = TlsEchoServlet::start(Arc::new(trace.share()), Some(servlet_conf)).await?;
 			let addr = servlet_task.addr;
 
 			trace.event("client_connect")?;

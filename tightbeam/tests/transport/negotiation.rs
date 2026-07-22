@@ -29,8 +29,10 @@ use tightbeam::exactly;
 use tightbeam::oids::{AES_128_WRAP, AES_256_WRAP};
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
-use tightbeam::testing::config::ScenarioConf;
-use tightbeam::testing::utils::{create_test_certificate, create_test_signing_key};
+use tightbeam::testing::{
+	utils::{create_test_certificate, create_test_signing_key},
+	SetupEnv,
+};
 use tightbeam::transport::handshake::client::EciesHandshakeClient;
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
 use tightbeam::transport::handshake::server::EciesHandshakeServer;
@@ -157,13 +159,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("handshake_start", exactly!(1)),
-			("client_hello_sent", exactly!(1)),
-			("server_hello_received", exactly!(1)),
-			("client_kex_sent", exactly!(1)),
-			("server_kex_received", exactly!(1)),
-			("handshake_complete", exactly!(1)),
-			("profile_verified", exactly!(1))
+			(handshake_start, exactly!(1)),
+			(client_hello_sent, exactly!(1)),
+			(server_hello_received, exactly!(1)),
+			(client_kex_sent, exactly!(1)),
+			(server_kex_received, exactly!(1)),
+			(handshake_complete, exactly!(1)),
+			(profile_verified, exactly!(1))
 		]
 	}
 }
@@ -174,11 +176,9 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: profile_negotiation,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ProfileNegotiationSpec::latest())
-		.build(),
+	spec: ProfileNegotiationSpec,
 	environment Bare {
-		exec: |trace| async move {
+		exec: |SetupEnv { trace, .. }| async move {
 			trace.event("handshake_start")?;
 			// Create profile descriptors
 			let profile_aes256_sha512 = SecurityProfileDesc::from(&Aes256Sha3_512Profile);

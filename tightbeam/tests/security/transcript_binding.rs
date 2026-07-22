@@ -38,7 +38,7 @@ use tightbeam::{
 	crypto::{ecies::Secp256k1EciesMessage, profiles::DefaultCryptoProvider, profiles::SecurityProfileDesc},
 	der::{Decode, Encode},
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::ScenarioConf,
+	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
 	transport::handshake::{
 		client::EciesHandshakeClient,
@@ -62,8 +62,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("tampered_accept_rejected", exactly!(1u32)),
-			("stripped_offer_rejected", exactly!(1u32))
+			(tampered_accept_rejected, exactly!(1u32)),
+			(stripped_offer_rejected, exactly!(1u32))
 		]
 	}
 }
@@ -85,13 +85,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: transcript_binding,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(TranscriptBindingSpec::latest())
 		.with_csp(TranscriptBindingProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			TranscriptBindingScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			TranscriptBindingScenario::run((trace.into(),)).await
 		}
 	}
 }

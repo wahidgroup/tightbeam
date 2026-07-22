@@ -4,7 +4,7 @@ use core::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
-use tightbeam::testing::ScenarioConf;
+use tightbeam::testing::{ScenarioConf, SetupEnv};
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
 // Define a real-time process with EDF scheduling
@@ -47,16 +47,16 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("task1", exactly!(1)),
-			("task2", exactly!(1)),
-			("task3", exactly!(1))
+			(task1, exactly!(1)),
+			(task2, exactly!(1)),
+			(task3, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_edf_with_fdr,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(EdfAssertSpec::latest())
 		.with_fdr(FdrConfig {
 			seeds: 2,
@@ -70,7 +70,7 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			trace.event("task1")?;
 			trace.event("task2")?;
 			trace.event("task3")?;

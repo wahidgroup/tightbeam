@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -38,9 +40,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("fs_capture_handshake", exactly!(HANDSHAKE_COUNT as u32)),
-			("fs_extract_ephemeral", exactly!(HANDSHAKE_COUNT as u32)),
-			("fs_all_ephemeral_unique", exactly!(1u32))
+			(fs_capture_handshake, exactly!(HANDSHAKE_COUNT as u32)),
+			(fs_extract_ephemeral, exactly!(HANDSHAKE_COUNT as u32)),
+			(fs_all_ephemeral_unique, exactly!(1u32))
 		]
 	}
 }
@@ -75,13 +77,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: forward_secrecy,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ForwardSecrecySpec::latest())
 		.with_csp(ForwardSecrecyProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			ForwardSecrecyScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			ForwardSecrecyScenario::run((trace.into(),)).await
 		}
 	}
 }

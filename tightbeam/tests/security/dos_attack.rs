@@ -23,7 +23,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -40,9 +42,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("dos_generate_oversized", exactly!(BACKEND_COUNT_U32)),
-			("dos_inject_oversized", exactly!(BACKEND_COUNT_U32)),
-			("dos_oversized_rejected", exactly!(BACKEND_COUNT_U32))
+			(dos_generate_oversized, exactly!(BACKEND_COUNT_U32)),
+			(dos_inject_oversized, exactly!(BACKEND_COUNT_U32)),
+			(dos_oversized_rejected, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -77,13 +79,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: dos_attack,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DosAttackSpec::latest())
 		.with_csp(DosAttackProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			DosAttackScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			DosAttackScenario::run((trace.into(),)).await
 		}
 	}
 }

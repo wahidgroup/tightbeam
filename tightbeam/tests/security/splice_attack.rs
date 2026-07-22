@@ -47,8 +47,10 @@ use tightbeam::{
 	exactly, job,
 	random::OsRng,
 	tb_assert_spec, tb_process_spec, tb_scenario,
-	testing::utils::{create_test_certificate, create_test_signing_key},
-	testing::ScenarioConf,
+	testing::{
+		utils::{create_test_certificate, create_test_signing_key},
+		ScenarioConf, SetupEnv,
+	},
 	trace::TraceCollector,
 	transport::handshake::{
 		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
@@ -64,7 +66,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("spliced_kex_rejected", exactly!(1u32))
+			(spliced_kex_rejected, exactly!(1u32))
 		]
 	}
 }
@@ -85,13 +87,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: splice_attack,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(SpliceAttackSpec::latest())
 		.with_csp(SpliceAttackProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			SpliceAttackScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			SpliceAttackScenario::run((trace.into(),)).await
 		}
 	}
 }

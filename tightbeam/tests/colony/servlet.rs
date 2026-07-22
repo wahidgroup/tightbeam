@@ -16,7 +16,7 @@ use tightbeam::{
 	exactly,
 	policy::{GatePolicy, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
-	testing::{create_test_signing_key, ScenarioConf},
+	testing::create_test_signing_key,
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	worker, Beamable, Frame, TightBeamError,
 };
@@ -117,30 +117,28 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("servlet_receive", exactly!(1)),
-			("doubler_process", exactly!(1)),
-			("squarer_process", exactly!(1)),
-			("servlet_respond", exactly!(1)),
-			("verify_doubled", exactly!(1), equals!(10u32)),
-			("verify_squared", exactly!(1), equals!(35u32)),
-			("verify_final_result", exactly!(1), equals!(135u32))
+			(servlet_receive, exactly!(1)),
+			(doubler_process, exactly!(1)),
+			(squarer_process, exactly!(1)),
+			(servlet_respond, exactly!(1)),
+			(verify_doubled, exactly!(1), equals!(10u32)),
+			(verify_squared, exactly!(1), equals!(35u32)),
+			(verify_final_result, exactly!(1), equals!(135u32))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_servlet_conf_with_workers,
-	config: ScenarioConf::<CalcServletConf>::builder()
-		.with_specs(vec![CalcServletSpec::latest()])
-		.with_env_config(CalcServletConf {
+	spec: CalcServletSpec,
+	environment Servlet {
+		context: CalcServletConf {
 			squarer_offset: 10,
 			final_multiplier: 3,
 			value: 5,
-		})
-		.build(),
-	environment Servlet {
-		servlet: CalcServlet,
-		start: |trace, config| async move {
+		},
+		start: |env| async move {
+			let (trace, config) = (Arc::new(env.trace), env.context);
 			let doubler = DoublerWorker::new(());
 			let squarer = SquarerWorker::new(SquarerWorkerConf {
 				add_offset: config.squarer_offset
@@ -155,12 +153,13 @@ tb_scenario! {
 			// Start servlet via trait
 			CalcServlet::start(trace, Some(servlet_conf)).await
 		},
-		setup: |servlet_addr, _config| async move {
+		setup: |env| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let client = builder.connect(servlet_addr).await?;
+			let client = builder.connect(env.addr).await?;
 			Ok(client)
 		},
-		client: |trace, mut client, config| async move {
+		client: |env| async move {
+			let (trace, mut client, config) = (env.trace, env.client, env.context);
 			let request = compose! {
 				V0: id: b"calc-request-id",
 					message: CalcRequest { value: config.value }
@@ -234,26 +233,24 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("secure_receive", exactly!(1)),
-			("secure_frame_cleartext", exactly!(1), equals!(1u32)),
-			("verify_secure_doubled", exactly!(1), equals!(14u32))
+			(secure_receive, exactly!(1)),
+			(secure_frame_cleartext, exactly!(1), equals!(1u32)),
+			(verify_secure_doubled, exactly!(1), equals!(14u32))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_typed_servlet_full_feature_stack,
-	config: ScenarioConf::<CalcServletConf>::builder()
-		.with_specs(vec![SecureCalcServletSpec::latest()])
-		.with_env_config(CalcServletConf {
+	spec: SecureCalcServletSpec,
+	environment Servlet {
+		context: CalcServletConf {
 			squarer_offset: 0,
 			final_multiplier: 1,
 			value: 7,
-		})
-		.build(),
-	environment Servlet {
-		servlet: SecureCalcServlet,
-		start: |trace, config| async move {
+		},
+		start: |env| async move {
+			let (trace, config) = (Arc::new(env.trace), env.context);
 			let verifying_key = *create_test_signing_key().verifying_key();
 			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
@@ -264,12 +261,13 @@ tb_scenario! {
 
 			SecureCalcServlet::start(trace, Some(servlet_conf)).await
 		},
-		setup: |servlet_addr, _config| async move {
+		setup: |env| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let client = builder.connect(servlet_addr).await?;
+			let client = builder.connect(env.addr).await?;
 			Ok(client)
 		},
-		client: |trace, mut client, config| async move {
+		client: |env| async move {
+			let (trace, mut client, config) = (env.trace, env.client, env.context);
 			let request = compose! {
 				V2: id: b"secure-calc-request-id",
 					order: 1u64,

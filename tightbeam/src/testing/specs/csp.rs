@@ -747,7 +747,7 @@ mod tests {
 	use super::*;
 	use crate::testing::assertions::Assertion;
 	use crate::testing::create_test_message;
-	use crate::testing::{ScenarioConf, TestHooks};
+	use crate::testing::{ClientEnv, ScenarioConf, SetupEnv, TestHooks};
 	use crate::transport::tcp::r#async::TokioListener;
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;
@@ -1302,16 +1302,16 @@ mod tests {
 
 	tb_scenario! {
 		name: test_csp_with_bare_environment,
-		config: ScenarioConf::<()>::builder()
+		config: ScenarioConf::builder()
 			.with_spec(SimpleBareFlowSpec::latest())
 			.with_csp(SimpleBareFlowProc)
 			.build(),
 		environment Bare {
-		exec: |trace| {
-			trace.event("step1")?;
-			trace.event("step2")?;
-			Ok(())
-		}
+			exec: |SetupEnv { trace, .. }| {
+				trace.event("step1")?;
+				trace.event("step2")?;
+				Ok(())
+			}
 		}
 	}
 
@@ -1322,8 +1322,8 @@ mod tests {
 			mode: Accept,
 			gate: Accepted,
 			assertions: [
-				("Received", exactly!(2)),
-				("Responded", exactly!(2))
+				(Received, exactly!(2)),
+				(Responded, exactly!(2))
 			]
 		},
 	}
@@ -1352,7 +1352,7 @@ mod tests {
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	crate::tb_scenario! {
 		name: test_csp_process_with_assert_spec_integration,
-		config: ScenarioConf::<()>::builder()
+		config: ScenarioConf::builder()
 			.with_spec(ClientServerFlowSpec::latest())
 			.with_csp(ClientServerFlowProc)
 			.with_hooks(TestHooks {
@@ -1368,7 +1368,7 @@ mod tests {
 			.build(),
 		environment ServiceClient {
 			worker_threads: 2,
-			server: |trace| async move {
+			server: |SetupEnv { trace, .. }| async move {
 				let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
 				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 
@@ -1385,7 +1385,10 @@ mod tests {
 
 				Ok((handle, addr))
 			},
-			client: |trace, mut client| async move {
+			client: |ClientEnv { trace, addr, .. }| async move {
+				let stream = <TokioListener as Protocol>::connect(addr).await?;
+				let mut client = <TokioListener as Protocol>::create_transport(stream);
+
 				// Client-side assertion before sending
 				trace.event("Responded")?;
 
@@ -1422,13 +1425,13 @@ mod tests {
 	#[cfg(all(feature = "testing-csp", feature = "tcp", feature = "tokio"))]
 	tb_scenario! {
 		name: test_servlet_environment_integration,
-		config: ScenarioConf::<()>::builder()
+		config: ScenarioConf::builder()
 			.with_spec(ClientServerFlowSpec::latest())
 			.with_csp(ClientServerFlowProc)
 			.build(),
 		environment ServiceClient {
 			worker_threads: 1,
-			server: |trace| async move {
+			server: |SetupEnv { trace, .. }| async move {
 				let servlet = TestServletForScenario::start(Arc::new(trace), None).await?;
 				let addr = servlet.addr();
 				let server_handle = tokio::spawn(async move {
@@ -1436,7 +1439,10 @@ mod tests {
 				});
 				Ok((server_handle, addr))
 			},
-			client: |trace, mut client| async move {
+			client: |ClientEnv { trace, addr, .. }| async move {
+				let stream = <TokioListener as Protocol>::connect(addr).await?;
+				let mut client = <TokioListener as Protocol>::create_transport(stream);
+
 				// Client-side assertion before sending
 				trace.event("Responded")?;
 

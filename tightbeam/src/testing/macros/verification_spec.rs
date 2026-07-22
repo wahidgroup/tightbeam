@@ -941,10 +941,61 @@ macro_rules! __tb_assert_spec_parse_schedulability {
 	}};
 }
 
+// Emit `pub const <key>: &str` for every ident assertion key in the
+// LATEST version block (peels leading blocks until one remains). Latest
+// is what scenarios run, so its keys are the ones event sites reference.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_keys {
+	($base:ident, $first:tt $($rest:tt)+) => {
+		$crate::__tb_assert_spec_keys!($base, $($rest)+);
+	};
+	($base:ident, [ $( $assertion:tt ),* ]) => {
+		impl $base {
+			$( $crate::__tb_assert_spec_key_const!($assertion); )*
+		}
+	};
+}
+
+// Emit one key const for an ident assertion key; string keys emit nothing
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __tb_assert_spec_key_const {
+	(($label:ident, $($rest:tt)*)) => {
+		#[allow(dead_code, non_upper_case_globals)]
+		pub const $label: &'static str = stringify!($label);
+	};
+	(($label:expr, $($rest:tt)*)) => {};
+}
+
 // Helper to add individual assertions (handles tags and values)
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_add_assertion {
+	// IDENT KEY: With value and tags - match equals! specifically
+	($builder:expr, ($label:ident, $card:expr, equals!($value:expr), tags: [ $($tag:expr),* $(,)? ])) => {
+		$builder
+			.assertion_with_value(stringify!($label), vec![ $($tag),* ], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
+			.expect("duplicate label or invalid range")
+	};
+	// IDENT KEY: With value, no tags - match equals! specifically
+	($builder:expr, ($label:ident, $card:expr, equals!($value:expr))) => {
+		$builder
+			.assertion_with_value(stringify!($label), vec![], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
+			.expect("duplicate label or invalid range")
+	};
+	// IDENT KEY: With tags, no value
+	($builder:expr, ($label:ident, $card:expr, tags: [ $($tag:expr),* $(,)? ])) => {
+		$builder
+			.assertion(stringify!($label), vec![ $($tag),* ], $card)
+			.expect("duplicate label or invalid range")
+	};
+	// IDENT KEY: No tags, no value (2-element tuple)
+	($builder:expr, ($label:ident, $card:expr)) => {
+		$builder
+			.assertion(stringify!($label), vec![], $card)
+			.expect("duplicate label or invalid range")
+	};
 	// NEW SYNTAX: With value and tags - match equals! specifically
 	($builder:expr, ($label:expr, $card:expr, equals!($value:expr), tags: [ $($tag:expr),* $(,)? ])) => {
 		$builder
@@ -989,6 +1040,10 @@ macro_rules! tb_assert_spec {
 	) => {
 		$(#[$meta])*
 		$vis struct $base;
+
+		// Key consts for the latest version's ident assertion keys
+		$crate::__tb_assert_spec_keys!($base, $( [ $( $assertion ),* ] )+);
+
 		impl $base {
 			pub fn all() -> &'static [$crate::testing::macros::BuiltAssertSpec] {
 				let desc_opt: Option<&'static str> = None::<&'static str> $(.or(Some($desc)))?;

@@ -345,25 +345,22 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: [QUEUE_TAG],
 		assertions: [
-			("lag_tip", present!(), equals!(0u64)),
-			("priority_respected", at_least!(1), equals!(true)),
-			("worker_fan_out_0", at_least!(1), equals!(0u8), tags: [WORKER_0_TAG]),
-			("worker_fan_out_1", at_least!(1), equals!(1u8), tags: [WORKER_1_TAG]),
-			("throttle_engaged", present!(), equals!(true)),
-			("adaptive_behavior", at_least!(1))
+			(lag_tip, present!(), equals!(0u64)),
+			(priority_respected, at_least!(1), equals!(true)),
+			(worker_fan_out_0, at_least!(1), equals!(0u8), tags: [WORKER_0_TAG]),
+			(worker_fan_out_1, at_least!(1), equals!(1u8), tags: [WORKER_1_TAG]),
+			(throttle_engaged, present!(), equals!(true)),
+			(adaptive_behavior, at_least!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: queue_free_system,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(QueueFreeSpec::latest())
-		.with_env_config(())  // TODO revisit
-		.build(),
+	spec: QueueFreeSpec,
 	environment Servlet {
-		servlet: QueueServlet,
-		start: |trace, _config| async move {
+		start: |env| async move {
+			let trace = Arc::new(env.trace);
 			let stats = Arc::new(BackPressureStats::default());
 			let adaptive_gate = AdaptiveGate::new(Arc::clone(&stats), Arc::clone(&trace));
 
@@ -374,7 +371,7 @@ tb_scenario! {
 
 			QueueServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
-		setup: |addr, _config| async move {
+		setup: |env| async move {
 			let (client_cert, client_key) = create_test_cert_with_key("CN=Test Client", 365)?;
 
 			let key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(client_key));
@@ -386,11 +383,12 @@ tb_scenario! {
 				.with_restart(restart_policy)
 				.build();
 
-			let client = builder.connect(addr).await?;
+			let client = builder.connect(env.addr).await?;
 			Ok(client)
 		},
-		client: |trace, mut client, _config| async move {
-			let trace = Arc::new(trace);
+		client: |env| async move {
+			let trace = Arc::new(env.trace);
+			let mut client = env.client;
 
 			let batch = default_batch();
 			let mut prev_hash: Option<DigestInfo> = None;

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::schedulability::SchedulerType;
-use tightbeam::testing::{ScenarioConf, SpecViolation, TestHooks};
+use tightbeam::testing::{ScenarioConf, SetupEnv, SpecViolation, TestHooks};
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario, wcet};
 
 // Minimal spec for violation tests
@@ -51,7 +51,7 @@ tb_process_spec! {
 // This test EXPECTS failure and verifies it's the right kind of failure
 tb_scenario! {
 	name: test_rma_schedulability_violation_detected,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(SchedulabilityViolationSpec::latest())
 		.with_fdr(FdrConfig {
 			seeds: 1,
@@ -80,7 +80,7 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			trace.event("task1")?;
 			trace.event("task2")?;
 			Ok(())
@@ -118,7 +118,7 @@ tb_process_spec! {
 // Test: EDF schedulability violation should be caught during FDR setup
 tb_scenario! {
 	name: test_edf_schedulability_violation_detected,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(SchedulabilityViolationSpec::latest())
 		.with_fdr(FdrConfig {
 			seeds: 1,
@@ -148,7 +148,7 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			trace.event("task1")?;
 			trace.event("task2")?;
 			Ok(())
@@ -178,7 +178,7 @@ tb_process_spec! {
 // Test: Process with periods but no timing constraints should be caught
 tb_scenario! {
 	name: test_missing_wcet_for_period_detected,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(SchedulabilityViolationSpec::latest())
 		.with_fdr(FdrConfig {
 			seeds: 1,
@@ -205,7 +205,7 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			trace.event("task1")?;
 			Ok(())
 		}

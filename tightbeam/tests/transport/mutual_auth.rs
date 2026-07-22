@@ -145,22 +145,19 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("response_received", exactly!(1), equals!(IsSome)),
-			("server_id", exactly!(1), equals!("mutual-auth-server")),
-			("authenticated", exactly!(1), equals!(true))
+			(response_received, exactly!(1), equals!(IsSome)),
+			(server_id, exactly!(1), equals!("mutual-auth-server")),
+			(authenticated, exactly!(1), equals!(true))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_mutual_auth_with_servlet,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(MutualAuthSpec::latest())
-		.with_env_config(())  // TODO revisit
-		.build(),
+	spec: MutualAuthSpec,
 	environment Servlet {
-		servlet: MutualAuthServlet,
-		start: |trace, _config| async move {
+		start: |env| async move {
+			let trace = Arc::new(env.trace);
 			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
 				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
@@ -168,16 +165,17 @@ tb_scenario! {
 
 			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
-		setup: |addr, _config| async move {
+		setup: |env| async move {
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 
-			let client = builder.connect(addr).await?;
+			let client = builder.connect(env.addr).await?;
 			Ok(client)
 		},
-		client: |trace, mut client, _config| async move {
+		client: |env| async move {
+			let (trace, mut client) = (env.trace, env.client);
 			// Send authenticated request
 			let request = AuthRequest {
 				client_id: "test-client-mutual-001".to_string(),
@@ -216,9 +214,8 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_invalid_client_cert,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(InvalidClientSpec::latest())
-		.with_env_config(())
 		.with_hooks(TestHooks {
 			on_fail: Some(Arc::new(|_context, _violation| {
 				// Expected to fail - authentication should reject invalid client cert
@@ -228,8 +225,8 @@ tb_scenario! {
 		})
 		.build(),
 	environment Servlet {
-		servlet: MutualAuthServlet,
-		start: |trace, _config| async move {
+		start: |env| async move {
+			let trace = Arc::new(env.trace);
 			let servlet_conf = ServletConf::<TokioListener, AuthRequest>::builder()
 				.with_certificate(SERVER_CERT, SERVER_KEY.to_provider::<Secp256k1>()?, vec![Arc::new(CLIENT_PINNING)])?
 				.with_config(Arc::new(()))
@@ -237,7 +234,7 @@ tb_scenario! {
 
 			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
-		setup: |addr, _config| async move {
+		setup: |env| async move {
 			use tightbeam::testing::utils::{create_test_signing_key, create_test_certificate};
 			const INVALID_KEY: SigningKeySpec = SigningKeySpec::Bytes(&hex!("9999999999999999999999999999999999999999999999999999999999999999"));
 
@@ -252,10 +249,10 @@ tb_scenario! {
 				.with_client_identity(certificate, INVALID_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 
-			let client = builder.connect(addr).await?;
+			let client = builder.connect(env.addr).await?;
 			Ok(client)
 		},
-		client: |_trace, mut _client, _config| async move {
+		client: |_env| async move {
 			Ok(())
 		}
 	}
@@ -273,9 +270,8 @@ tb_assert_spec! {
 
 tb_scenario! {
 	name: test_invalid_server_cert,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(InvalidServerSpec::latest())
-		.with_env_config(())
 		.with_hooks(TestHooks {
 			on_fail: Some(Arc::new(|_context, _violation| {
 				// Expected to fail - client should reject invalid server cert
@@ -285,8 +281,8 @@ tb_scenario! {
 		})
 		.build(),
 	environment Servlet {
-		servlet: MutualAuthServlet,
-		start: |trace, _config| async move {
+		start: |env| async move {
+			let trace = Arc::new(env.trace);
 			use tightbeam::testing::utils::{create_test_signing_key, create_test_certificate};
 			const INVALID_SERVER_KEY: SigningKeySpec = SigningKeySpec::Bytes(&hex!("8888888888888888888888888888888888888888888888888888888888888888"));
 
@@ -302,17 +298,17 @@ tb_scenario! {
 
 			MutualAuthServlet::start(Arc::clone(&trace), Some(servlet_conf)).await
 		},
-		setup: |addr, _config| async move {
+		setup: |env| async move {
 			// Client expects SERVER_CERT, but server presents different cert - should fail during handshake
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(make_server_trust_store()?)
 				.with_client_identity(CLIENT_CERT, CLIENT_KEY.to_provider::<Secp256k1>()?)?
 				.build();
 
-			let client = builder.connect(addr).await?;
+			let client = builder.connect(env.addr).await?;
 			Ok(client)
 		},
-		client: |_trace, mut _client, _config| async move {
+		client: |_env| async move {
 			Ok(())
 		}
 	}

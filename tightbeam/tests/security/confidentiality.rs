@@ -25,7 +25,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -40,11 +42,11 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("conf_capture_handshake", exactly!(1u32)),
-			("conf_extract_ciphertext", exactly!(1u32)),
-			("conf_decrypt_correct_key", exactly!(1u32)),
-			("conf_decrypt_wrong_key_fails", exactly!(1u32)),
-			("conf_ciphertexts_differ", exactly!(1u32))
+			(conf_capture_handshake, exactly!(1u32)),
+			(conf_extract_ciphertext, exactly!(1u32)),
+			(conf_decrypt_correct_key, exactly!(1u32)),
+			(conf_decrypt_wrong_key_fails, exactly!(1u32)),
+			(conf_ciphertexts_differ, exactly!(1u32))
 		]
 	}
 }
@@ -85,13 +87,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: confidentiality,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(ConfidentialitySpec::latest())
 		.with_csp(ConfidentialityProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			ConfidentialityScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			ConfidentialityScenario::run((trace.into(),)).await
 		}
 	}
 }

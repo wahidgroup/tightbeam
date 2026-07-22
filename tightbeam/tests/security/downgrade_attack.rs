@@ -30,7 +30,9 @@
 use std::sync::Arc;
 
 use tightbeam::{
-	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario, testing::ScenarioConf, trace::TraceCollector,
+	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
+	testing::{ScenarioConf, SetupEnv},
+	trace::TraceCollector,
 	TightBeamError,
 };
 
@@ -44,10 +46,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("downgrade_capture_strong", exactly!(BACKEND_COUNT_U32)),
-			("downgrade_capture_weak", exactly!(BACKEND_COUNT_U32)),
-			("downgrade_profiles_differ", exactly!(BACKEND_COUNT_U32)),
-			("downgrade_substitution_rejected", exactly!(BACKEND_COUNT_U32))
+			(downgrade_capture_strong, exactly!(BACKEND_COUNT_U32)),
+			(downgrade_capture_weak, exactly!(BACKEND_COUNT_U32)),
+			(downgrade_profiles_differ, exactly!(BACKEND_COUNT_U32)),
+			(downgrade_substitution_rejected, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -100,13 +102,13 @@ tb_process_spec! {
 
 tb_scenario! {
 	name: downgrade_attack,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(DowngradeAttackSpec::latest())
 		.with_csp(DowngradeAttackProcess)
 		.build(),
 	environment Bare {
-		exec: |trace| async move {
-			DowngradeAttackScenario::run((trace,)).await
+		exec: |SetupEnv { trace, .. }| async move {
+			DowngradeAttackScenario::run((trace.into(),)).await
 		}
 	}
 }

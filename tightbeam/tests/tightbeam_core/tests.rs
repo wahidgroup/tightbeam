@@ -14,7 +14,7 @@ use tightbeam::der::ValueOrd;
 use tightbeam::prelude::*;
 use tightbeam::testing::assertions::Presence;
 use tightbeam::testing::macros::{IsNone, IsSome};
-use tightbeam::testing::ScenarioConf;
+use tightbeam::testing::{ScenarioConf, SetupEnv};
 use tightbeam::utils;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, TightBeamError};
 
@@ -147,15 +147,15 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v0"],
 		assertions: [
-			("roundtrip_ok", exactly!(1), equals!(true)),
-			("nonrepudiation", exactly!(1), equals!(IsNone)),
-			("integrity", exactly!(1), equals!(IsNone)),
-			("confidentiality", exactly!(1), equals!(IsNone)),
-			("priority", exactly!(1), equals!(IsNone)),
-			("lifetime", exactly!(1), equals!(IsNone)),
-			("previous_frame", exactly!(1), equals!(IsNone)),
-			("matrix", exactly!(1), equals!(IsNone)),
-			("version", exactly!(1), equals!(tb::Version::V0))
+			(roundtrip_ok, exactly!(1), equals!(true)),
+			(nonrepudiation, exactly!(1), equals!(IsNone)),
+			(integrity, exactly!(1), equals!(IsNone)),
+			(confidentiality, exactly!(1), equals!(IsNone)),
+			(priority, exactly!(1), equals!(IsNone)),
+			(lifetime, exactly!(1), equals!(IsNone)),
+			(previous_frame, exactly!(1), equals!(IsNone)),
+			(matrix, exactly!(1), equals!(IsNone)),
+			(version, exactly!(1), equals!(tb::Version::V0))
 		]
 	},
 	V(1,0,0): {
@@ -163,15 +163,15 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v1"],
 		assertions: [
-			("roundtrip_ok", exactly!(1), equals!(true)),
-			("sig_valid", exactly!(1), equals!(true)),
-			("integrity_ok", exactly!(1), equals!(true)),
-			("confidentiality", exactly!(1), equals!(IsSome)),
-			("priority", exactly!(1), equals!(IsNone)),
-			("lifetime", exactly!(1), equals!(IsNone)),
-			("previous_frame", exactly!(1), equals!(IsNone)),
-			("matrix", exactly!(1), equals!(IsNone)),
-			("version", exactly!(1), equals!(tb::Version::V1))
+			(roundtrip_ok, exactly!(1), equals!(true)),
+			(sig_valid, exactly!(1), equals!(true)),
+			(integrity_ok, exactly!(1), equals!(true)),
+			(confidentiality, exactly!(1), equals!(IsSome)),
+			(priority, exactly!(1), equals!(IsNone)),
+			(lifetime, exactly!(1), equals!(IsNone)),
+			(previous_frame, exactly!(1), equals!(IsNone)),
+			(matrix, exactly!(1), equals!(IsNone)),
+			(version, exactly!(1), equals!(tb::Version::V1))
 		]
 	},
 	V(2,0,0): {
@@ -179,15 +179,15 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v2"],
 		assertions: [
-			("roundtrip_ok", exactly!(1), equals!(true)),
-			("sig_valid", exactly!(1), equals!(true)),
-			("integrity_ok", exactly!(1), equals!(true)),
-			("confidentiality", exactly!(1), equals!(IsSome)),
-			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
-			("lifetime", exactly!(1), equals!(Some(3_600u64))),
-			("previous_frame", exactly!(1), equals!(IsSome)),
-			("matrix", exactly!(1), equals!(IsNone)),
-			("version", exactly!(1), equals!(tb::Version::V2))
+			(roundtrip_ok, exactly!(1), equals!(true)),
+			(sig_valid, exactly!(1), equals!(true)),
+			(integrity_ok, exactly!(1), equals!(true)),
+			(confidentiality, exactly!(1), equals!(IsSome)),
+			(priority, exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
+			(lifetime, exactly!(1), equals!(Some(3_600u64))),
+			(previous_frame, exactly!(1), equals!(IsSome)),
+			(matrix, exactly!(1), equals!(IsNone)),
+			(version, exactly!(1), equals!(tb::Version::V2))
 		]
 	},
 	V(3,0,0): {
@@ -195,22 +195,22 @@ tb_assert_spec! {
 		gate: Accepted,
 		tag_filter: ["v3"],
 		assertions: [
-			("roundtrip_ok", exactly!(1), equals!(true)),
-			("sig_valid", exactly!(1), equals!(true)),
-			("integrity_ok", exactly!(1), equals!(true)),
-			("confidentiality", exactly!(1), equals!(IsSome)),
-			("priority", exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
-			("lifetime", exactly!(1), equals!(Some(3_600u64))),
-			("previous_frame", exactly!(1), equals!(IsSome)),
-			("matrix", exactly!(1), equals!(IsSome)),
-			("version", exactly!(1), equals!(tb::Version::V3))
+			(roundtrip_ok, exactly!(1), equals!(true)),
+			(sig_valid, exactly!(1), equals!(true)),
+			(integrity_ok, exactly!(1), equals!(true)),
+			(confidentiality, exactly!(1), equals!(IsSome)),
+			(priority, exactly!(1), equals!(Some(tb::MessagePriority::Expedited))),
+			(lifetime, exactly!(1), equals!(Some(3_600u64))),
+			(previous_frame, exactly!(1), equals!(IsSome)),
+			(matrix, exactly!(1), equals!(IsSome)),
+			(version, exactly!(1), equals!(tb::Version::V3))
 		]
 	}
 }
 
 tb_scenario! {
 	name: version_check_all,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_specs(vec![
 			VersionSpec::get(0, 0, 0).expect("VersionSpec 0.0.0"),
 			VersionSpec::get(1, 0, 0).expect("VersionSpec 1.0.0"),
@@ -219,7 +219,7 @@ tb_scenario! {
 		])
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			let message = TestMessage { content: "Hello from workflow".to_string() };
 			let crypto = build_crypto(0x44)?;
 			let message_hash = utils::digest::<Sha3_256>(&message)?;

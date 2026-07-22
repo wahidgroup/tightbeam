@@ -6,7 +6,7 @@ use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Event;
-use tightbeam::testing::{ScenarioConf, TestHooks};
+use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
 use tightbeam::{exactly, wcet, TightBeamError};
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario};
 
@@ -47,15 +47,15 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("task1", exactly!(1)),
-			("task2", exactly!(1))
+			(task1, exactly!(1)),
+			(task2, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: test_rma_with_fdr,
-	config: ScenarioConf::<()>::builder()
+	config: ScenarioConf::builder()
 		.with_spec(RmaAssertSpec::latest())
 		.with_csp(RmaSchedulableProcess)
 		.with_fdr(FdrConfig {
@@ -85,7 +85,7 @@ tb_scenario! {
 		})
 		.build(),
 	environment Bare {
-		exec: |trace| {
+		exec: |SetupEnv { trace, .. }| {
 			trace.event("task1")?;
 			trace.event("task2")?;
 			Ok(())

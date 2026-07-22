@@ -21,8 +21,7 @@ use tightbeam::transport::handshake::{HandshakeKeyManager, TcpHandshakeState};
 use tightbeam::transport::state::EncryptedProtocolState;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
 use tightbeam::transport::{
-	EncryptedMessageIO, EncryptedProtocol, MessageIO, TransportEncryptionConfig, TransportError, WireEnvelope,
-	X509ClientConfig,
+	EncryptedMessageIO, EncryptedProtocol, MessageIO, TransportEncryptionConfig, WireEnvelope, X509ClientConfig,
 };
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
@@ -77,7 +76,7 @@ pub async fn serve_one_handshake_message(transport: &mut TcpTransport<TokioStrea
 /// Accept one connection, drive the server-side ECIES handshake to
 /// completion, and split into exclusive read/write halves.
 pub async fn accept_handshaken_split(listener: TokioListener) -> Result<SplitTransport<TokioStream>, TightBeamError> {
-	let (mut transport, _) = listener.accept().await.map_err(TransportError::from)?;
+	let (mut transport, _) = listener.accept().await?;
 
 	// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
 	serve_one_handshake_message(&mut transport).await?;
@@ -121,7 +120,7 @@ pub async fn connect_pinned_client(
 			.build(),
 	);
 
-	let stream = TcpStream::connect(addr).await.map_err(TransportError::from)?;
+	let stream = TcpStream::connect(addr).await?;
 	let transport = TcpTransport::from(TokioStream::from(stream)).with_trust_store(trust_store);
 	Ok(transport)
 }

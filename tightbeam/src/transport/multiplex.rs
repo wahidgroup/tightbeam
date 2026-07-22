@@ -414,7 +414,9 @@ mod router {
 		/// (peer GoAway: it will never process them).
 		fn fail_pending_above(&self, last_stream_id: u32) {
 			let mut state = self.lock();
+
 			state.goaway_received = Some(last_stream_id);
+
 			if let Some(first_dropped) = last_stream_id.checked_add(1) {
 				for (_, sender) in state.pending.split_off(&first_dropped) {
 					let _ = sender.send(StreamOutcome::Draining);
@@ -892,11 +894,13 @@ mod router {
 						// A request stream must carry a message
 						None => return Err(self.protocol_violation()),
 					};
+
 					let event = InboundEvent::Request(stream_id, Arc::new(frame));
 					if self.inbound.send(event).await.is_err() {
 						// No responder is serving this connection
 						self.refuse_stream(stream_id);
 					}
+
 					Ok(())
 				}
 				Ok(PeerStream::RejectDraining) => {
@@ -1044,20 +1048,24 @@ mod router {
 				if !inbound_open && tasks.is_empty() {
 					return Ok(());
 				}
+
 				match next_responder_event(&mut self.inbound, &mut tasks, inbound_open).await {
 					ResponderEvent::Closed => inbound_open = false,
 					ResponderEvent::Aborted => {}
 					ResponderEvent::Cancelled(stream_id) => {
 						if let Some(handle) = in_flight.remove(&stream_id) {
 							handle.abort();
+
 							if self.cancel_budget == 0 {
 								return Err(self.refuse_cancel_abuse(last_stream_id).await);
 							}
+
 							self.cancel_budget -= 1;
 						}
 					}
 					ResponderEvent::Request(stream_id, frame) => {
 						last_stream_id = stream_id;
+
 						if in_flight.len() >= cap_as_usize(self.peer_cap) {
 							self.respond(stream_id, ResponsePackage::new(TransitStatus::Busy, None)).await?;
 							continue;
