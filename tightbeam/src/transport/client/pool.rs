@@ -592,6 +592,12 @@ pooled_mux! {
 				return Ok(self.wrap_mux_client(handle, id, addr));
 			}
 
+			// Idle exclusive connections (peer declined the offer earlier)
+			// are reused before dialing another socket.
+			if let Some(client) = self.try_take_ready_client(&addr)? {
+				return Ok(self.wrap_client(client, addr));
+			}
+
 			self.open_mux_connection(addr, offer).await
 		}
 
@@ -603,8 +609,8 @@ pooled_mux! {
 			offer: TransportOffer,
 		) -> TransportResult<PooledClient<P, C>> {
 			let mut reservation = self.reserve_slot(&addr)?;
-			let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 
+			let stream = P::connect(addr.clone()).await.map_err(|e| e.into())?;
 			let mut transport = self.tls.apply::<P>(P::create_transport(stream));
 			if let Some(timeout) = self.timeout {
 				transport = transport.with_timeout(timeout);
@@ -619,7 +625,9 @@ pooled_mux! {
 				Some(settings) => settings,
 				None => {
 					let client = GenericClient::from_transport_with_addr(transport, addr.clone());
+
 					reservation.disarm();
+
 					return Ok(self.wrap_client(client, addr));
 				}
 			};
@@ -634,7 +642,16 @@ pooled_mux! {
 			let id = self.mux_ids.fetch_add(1, Ordering::Relaxed);
 
 			{
-				let mut pools = self.write_pools()?;
+				// A failed lock must not leak the spawned drivers: aborting
+				// the reader closes the connection and ends the writer.
+				let mut pools = match self.write_pools() {
+					Ok(pools) => pools,
+					Err(err) => {
+						rt::abort(&reader_task);
+						return Err(err);
+					}
+				};
+
 				let dest_pool = pools.entry(addr.clone()).or_default();
 
 				// Handle clone is a refcount bump: pool entry and lease co-own the connection.
