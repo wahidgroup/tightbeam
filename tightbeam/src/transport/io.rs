@@ -174,15 +174,10 @@ fn envelope_versions_compatible(envelope: &TransportEnvelope) -> bool {
 		}
 		#[cfg(feature = "x509")]
 		TransportEnvelope::EnvelopedData(_) | TransportEnvelope::SignedData(_) => true,
+		// Mux payloads are chunked frame DER: only the mux router can
+		// validate versions, after reassembly
 		#[cfg(feature = "transport-multiplex")]
-		TransportEnvelope::MuxedRequest(pkg) => pkg.message.validate_version_compatibility(),
-		#[cfg(feature = "transport-multiplex")]
-		TransportEnvelope::MuxedResponse(pkg) => {
-			let message = pkg.response.message.as_ref();
-			message.is_none_or(|frame| frame.validate_version_compatibility())
-		}
-		#[cfg(feature = "transport-multiplex")]
-		TransportEnvelope::MuxCancel(_) | TransportEnvelope::GoAway(_) => true,
+		TransportEnvelope::Mux(_) => true,
 	}
 }
 
@@ -989,10 +984,7 @@ pub trait EncryptedMessageIO: MessageIO {
 				return Err(TransportError::InvalidMessage)
 			}
 			#[cfg(feature = "transport-multiplex")]
-			TransportEnvelope::MuxedRequest(_)
-			| TransportEnvelope::MuxedResponse(_)
-			| TransportEnvelope::MuxCancel(_)
-			| TransportEnvelope::GoAway(_) => return Err(TransportError::InvalidMessage),
+			TransportEnvelope::Mux(_) => return Err(TransportError::InvalidMessage),
 		};
 
 		// Return original message when status != Accepted (for retry evaluation)

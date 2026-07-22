@@ -14,9 +14,9 @@
 //! - Server-initiated stream roundtrip (client `serve`, server `emit_on_stream`)
 //! - Peer GoAway fails pending above `last_stream_id` and rejects new streams
 //! - Non-mux envelope on a mux peer: GoAway(ProtocolError) and pending fail
+//! - Stream-grammar violations: GoAway(ProtocolError)
 //! - Connection drop mid-emit: `ConnectionClosed`
-//! - Cleartext mux (no handshake, symmetric settings): interleaved echo and
-//!   cancel-budget GoAway parallel the encrypted scenarios
+//! - Cleartext mux: interleaved echo and cancel-budget GoAway
 
 #![cfg(all(
 	feature = "transport-ecies",
@@ -26,6 +26,15 @@
 	feature = "testing"
 ))]
 
+/// DER of `Mux(Open { stream_id: 1, last: true, payload: [] })`.
+///
+/// Pins the wire format from both sides: mux build asserts the encoder
+/// produces exactly these bytes, non-mux build asserts they fail to
+/// decode.
+const MUX_OPEN_WIRE_DER: [u8; 14] = [
+	0xA4, 0x0C, 0xA0, 0x0A, 0x30, 0x08, 0x02, 0x01, 0x01, 0x01, 0x01, 0xFF, 0x04, 0x00,
+];
+
 #[cfg(feature = "transport-multiplex")]
 mod negotiated {
 	use core::future::{poll_fn, Future};
@@ -34,7 +43,9 @@ mod negotiated {
 	use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 	use std::sync::Arc;
 
+	use tightbeam::asn1::{MessagePriority, Metadata, Version};
 	use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	use tightbeam::der::{Decode, Encode};
 	use tightbeam::exactly;
 	use tightbeam::policy::TransitStatus;
 	use tightbeam::tb_assert_spec;
@@ -43,7 +54,8 @@ mod negotiated {
 	use tightbeam::testing::create_v0_tightbeam;
 	use tightbeam::trace::TraceCollector;
 	use tightbeam::transport::envelopes::{
-		CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxedRequestPackage, MuxedResponsePackage,
+		CancelReason, GoAwayPackage, GoAwayReason, MuxCancelPackage, MuxCreditPackage, MuxDataPackage, MuxEndPackage,
+		MuxEnvelope, MuxOpenPackage,
 	};
 	use tightbeam::transport::handshake::negotiation::{MuxSettings, TransportOffer};
 	use tightbeam::transport::multiplex::{MuxHandle, MuxResponder, MuxRole, MuxTransport};
@@ -87,6 +99,7 @@ mod negotiated {
 				("mux_server_initiated_roundtrip", exactly!(1), equals!(true)),
 				("mux_peer_goaway_fails_pending_above", exactly!(1), equals!(true)),
 				("mux_protocol_violation_goaway_and_pending_fail", exactly!(1), equals!(true)),
+				("mux_stream_grammar_violations_rejected", exactly!(1), equals!(true)),
 				("mux_connection_drop_mid_emit", exactly!(1), equals!(true)),
 				("mux_cleartext_interleaved_echo", exactly!(1), equals!(true)),
 				("mux_cleartext_cancel_budget", exactly!(1), equals!(true))
@@ -113,6 +126,7 @@ mod negotiated {
 				mux_server_initiated_roundtrip(&trace).await?;
 				mux_peer_goaway_fails_pending_above(&trace).await?;
 				mux_protocol_violation_goaway_and_pending_fail(&trace).await?;
+				mux_stream_grammar_violations_rejected(&trace).await?;
 				mux_connection_drop_mid_emit(&trace).await?;
 				mux_cleartext_interleaved_echo(&trace).await?;
 				mux_cleartext_cancel_budget(&trace).await?;
@@ -415,8 +429,11 @@ mod negotiated {
 	async fn read_muxed_request<R: EnvelopeSource>(reader: &mut R) -> Result<(u32, Arc<Frame>), TightBeamError> {
 		let envelope = reader.read_envelope().await?;
 		match envelope {
-			TransportEnvelope::MuxedRequest(package) => Ok((package.stream_id(), Arc::clone(package.message()))),
-			_ => Err(expectation_failure("peer must receive a muxed request")),
+			TransportEnvelope::Mux(MuxEnvelope::Open(package)) if package.last() => {
+				let frame = Frame::from_der(package.payload()).map_err(TransportError::from)?;
+				Ok((package.stream_id(), Arc::new(frame)))
+			}
+			_ => Err(expectation_failure("peer must receive a single-chunk muxed open")),
 		}
 	}
 
@@ -438,7 +455,8 @@ mod negotiated {
 		stream_id: u32,
 		frame: Frame,
 	) -> Result<(), TightBeamError> {
-		let request = MuxedRequestPackage::new(stream_id, frame);
+		let payload = frame.to_der().map_err(TransportError::from)?;
+		let request = MuxOpenPackage::new(stream_id, true, payload).map_err(TransportError::from)?;
 		writer.write_envelope(request.into()).await?;
 		Ok(())
 	}
@@ -448,7 +466,8 @@ mod negotiated {
 		stream_id: u32,
 		frame: &Arc<Frame>,
 	) -> Result<(), TightBeamError> {
-		let response = MuxedResponsePackage::new(stream_id, echo_response(frame));
+		let payload = frame.as_ref().to_der().map_err(TransportError::from)?;
+		let response = MuxEndPackage::new(stream_id, TransitStatus::Accepted, payload).map_err(TransportError::from)?;
 		writer.write_envelope(response.into()).await?;
 		Ok(())
 	}
@@ -478,7 +497,7 @@ mod negotiated {
 	fn is_muxed_response(envelope: &TransportEnvelope, stream_id: u32) -> bool {
 		matches!(
 			envelope,
-			TransportEnvelope::MuxedResponse(package) if package.stream_id() == stream_id
+			TransportEnvelope::Mux(MuxEnvelope::End(package)) if package.stream_id() == stream_id
 		)
 	}
 
@@ -523,7 +542,7 @@ mod negotiated {
 
 	fn is_goaway(envelope: &TransportEnvelope, reason: GoAwayReason, last_stream_id: Option<u32>) -> bool {
 		match envelope {
-			TransportEnvelope::GoAway(package) => {
+			TransportEnvelope::Mux(MuxEnvelope::GoAway(package)) => {
 				let reason_ok = package.reason() == reason;
 				let last_ok = match last_stream_id {
 					Some(expected) => package.last_stream_id() == expected,
@@ -680,7 +699,7 @@ mod negotiated {
 		let cancel = link.server_reader.read_envelope().await?;
 		let cancel_ok = matches!(
 			&cancel,
-			TransportEnvelope::MuxCancel(package) if package.stream_id() == raced_stream_id
+			TransportEnvelope::Mux(MuxEnvelope::Cancel(package)) if package.stream_id() == raced_stream_id
 		);
 
 		write_muxed_echo(&mut link.server_writer, raced_stream_id, &Arc::new(frame_cancelled)).await?;
@@ -886,6 +905,70 @@ mod negotiated {
 		Ok(())
 	}
 
+	/// Frame claiming a V2+ field (priority) on a V0 frame: decodes fine
+	/// but must fail version validation at the mux router.
+	fn version_incompatible_frame_der() -> Result<Vec<u8>, TightBeamError> {
+		let mut metadata = Metadata::default();
+		metadata.priority = Some(MessagePriority::Standard);
+
+		let frame = Frame {
+			version: Version::V0,
+			metadata,
+			message: Vec::new(),
+			integrity: None,
+			nonrepudiation: None,
+		};
+		let der = frame.to_der().map_err(TransportError::from)?;
+		Ok(der)
+	}
+
+	/// Each offender gets a fresh mux server so one violation cannot mask
+	/// the next.
+	async fn violation_answered_with_goaway(offender: TransportEnvelope) -> Result<bool, TightBeamError> {
+		let mut link = establish_server_mux_client_raw(4, 4, MuxEndpointConfig::default()).await?;
+		let _server_serve = spawn_immediate_echo(link.responder);
+
+		link.client_writer.write_envelope(offender).await?;
+
+		let goaway = link.client_reader.read_envelope().await?;
+		let rejected = is_goaway(&goaway, GoAwayReason::ProtocolError, None);
+		Ok(rejected)
+	}
+
+	/// Every encodable stream-grammar violation must be answered with
+	/// GoAway(ProtocolError).
+	async fn mux_stream_grammar_violations_rejected(trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let chunk = mux_frame("mux-violation").to_der().map_err(TransportError::from)?;
+		let offenders: Vec<TransportEnvelope> = vec![
+			// Continuation chunk: chunking is never negotiated
+			MuxDataPackage::new(1, true, chunk.clone())
+				.map_err(TransportError::from)?
+				.into(),
+			// Credit grant: chunking is never negotiated
+			MuxCreditPackage::new(1, 8).into(),
+			// Open promising later chunks
+			MuxOpenPackage::new(1, false, chunk).map_err(TransportError::from)?.into(),
+			// Open whose payload is not a frame
+			MuxOpenPackage::new(1, true, vec![0xDE, 0xAD])
+				.map_err(TransportError::from)?
+				.into(),
+			// Open without a message (requests must carry one)
+			MuxOpenPackage::new(1, true, Vec::new()).map_err(TransportError::from)?.into(),
+			// Open whose frame claims fields its version forbids
+			MuxOpenPackage::new(1, true, version_incompatible_frame_der()?)
+				.map_err(TransportError::from)?
+				.into(),
+		];
+
+		let mut ok = true;
+		for offender in offenders {
+			ok &= violation_answered_with_goaway(offender).await?;
+		}
+
+		trace.event_with("mux_stream_grammar_violations_rejected", &[], ok)?;
+		Ok(())
+	}
+
 	/// Peer close mid-emit surfaces ConnectionClosed after reader EOF.
 	async fn mux_connection_drop_mid_emit(trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let mut link = establish_client_mux_server_raw(4).await?;
@@ -944,6 +1027,18 @@ mod negotiated {
 		trace.event_with("mux_cleartext_cancel_budget", &[], ok)?;
 		Ok(())
 	}
+
+	/// Pins [`super::MUX_OPEN_WIRE_DER`] to real encoder output so the
+	/// non-mux rejection test rejects the same bytes a mux build emits.
+	#[test]
+	fn mux_open_wire_literal_matches_encoder() -> Result<(), TightBeamError> {
+		let open_package = MuxOpenPackage::new(1, true, Vec::new()).map_err(TransportError::from)?;
+		let envelope = TransportEnvelope::from(open_package);
+
+		let encoded = envelope.to_der().map_err(TransportError::from)?;
+		assert_eq!(encoded, super::MUX_OPEN_WIRE_DER, "wire literal must match encoder output");
+		Ok(())
+	}
 }
 
 #[cfg(not(feature = "transport-multiplex"))]
@@ -951,12 +1046,14 @@ mod without_multiplex {
 	use tightbeam::der::Decode;
 	use tightbeam::transport::TransportEnvelope;
 
-	/// Context tag 4 (`MuxedRequest`) is not a valid `TransportEnvelope`
+	/// Context tag 4 (`Mux`) is not a valid `TransportEnvelope`
 	/// alternative when multiplexing is compiled out, so the envelope must
 	/// fail to decode instead of being silently misinterpreted.
 	#[test]
 	fn muxed_wire_tag_fails_decode_on_non_mux_build() {
-		let muxed_request_der = [0xA4, 0x07, 0x30, 0x05, 0x02, 0x01, 0x01, 0x30, 0x00];
-		assert!(TransportEnvelope::from_der(&muxed_request_der).is_err());
+		assert!(
+			TransportEnvelope::from_der(&super::MUX_OPEN_WIRE_DER).is_err(),
+			"mux wire tag must not decode when multiplexing is compiled out"
+		);
 	}
 }

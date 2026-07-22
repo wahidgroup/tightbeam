@@ -15,6 +15,10 @@ readme = "README.md"
 keywords = ["cryptography", "security", "messaging", "protocol"]
 categories = ["cryptography", "network-programming"]
 
+[workspace.lints.rust]
+# Catch dead imports under cfg-gated paths that `--all-features` never compiles.
+unused_imports = "deny"
+
 [workspace.lints.clippy]
 # Zero-copy: Arc/Rc refcount bumps must be written as `Arc::clone(&x)` so they
 # disambiguated from deep copies.
