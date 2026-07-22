@@ -13,7 +13,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use sha3::Sha3_256;
 use tightbeam::der::Sequence;
@@ -47,7 +47,7 @@ use tightbeam::{
 	decode, encode, exactly, hive,
 	policy::{GatePolicy, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
-	testing::ScenarioConf,
+	testing::{ClusterEnv, SetupEnv},
 	trace::TraceCollector,
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
@@ -69,9 +69,8 @@ struct ClusterTestCerts {
 	trust: Arc<dyn CertificateTrust>,
 }
 
-fn get_cluster_test_certs() -> &'static ClusterTestCerts {
-	static CERTS: OnceLock<ClusterTestCerts> = OnceLock::new();
-	CERTS.get_or_init(|| {
+impl ClusterTestCerts {
+	fn generate() -> Self {
 		let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365).expect("Failed to create cluster cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
 			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
@@ -79,8 +78,8 @@ fn get_cluster_test_certs() -> &'static ClusterTestCerts {
 				.expect("Failed to build trust")
 				.build(),
 		);
-		ClusterTestCerts { cert, key, trust }
-	})
+		Self { cert, key, trust }
+	}
 }
 
 // ============================================================================
@@ -283,8 +282,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("work_sent", exactly!(1)),
-			("routing_accepted", exactly!(1))
+			(work_sent, exactly!(1)),
+			(routing_accepted, exactly!(1))
 		]
 	}
 }
@@ -293,56 +292,96 @@ tb_assert_spec! {
 // Integration Test
 // ============================================================================
 
+/// Ping-servlet hive with an optional mux offer for both the hive control
+/// server and the hive -> cluster pool.
+async fn start_ping_hive(
+	certs: Arc<ClusterTestCerts>,
+	mux_offer: Option<TransportOffer>,
+) -> Result<ClusterTestHive, TightBeamError> {
+	let servlet_conf = servlet_tls_config(&certs)?;
+	let servlet = ClusterTestServlet::start(Arc::new(TraceCollector::new()), Some(servlet_conf)).await?;
+
+	let mut hive = ClusterTestHive::new(Some(HiveConf { mux_offer, ..hive_tls_config(&certs) }))?;
+	hive.register("ping", servlet, |t| ClusterTestServlet::start(t, None))?;
+	hive.establish(Arc::new(TraceCollector::new())).await?;
+	Ok(hive)
+}
+
+/// Cluster conf with an optional mux offer for both the gateway server
+/// and the cluster -> hive pool.
+fn routing_cluster_conf(certs: &ClusterTestCerts, mux_offer: Option<TransportOffer>) -> ClusterConf {
+	let mut conf = ClusterConf::new(cluster_tls_config(certs));
+	conf.pool_config.mux_offer = mux_offer;
+	conf
+}
+
+/// Emit one ping work request through the gateway and assert the routed
+/// response, recording the routing events.
+async fn assert_ping_work_routes(
+	trace: &TraceCollector,
+	certs: &ClusterTestCerts,
+	cluster: &ClusterGateway,
+) -> Result<(), TightBeamError> {
+	trace.event(ClusterRoutingSpec::work_sent)?;
+
+	let work_request = ClusterRequest::Work(ClusterWorkRequest {
+		servlet_type: b"ping".to_vec(),
+		payload: encode(&PingRequest { value: 21 })?,
+	});
+
+	let frame = frame_compose(Version::V0)
+		.with_id(b"test-work")
+		.with_order(0)
+		.with_message(work_request)
+		.build()?;
+
+	let mut client = connect_cluster(certs, cluster.addr()).await?;
+	let response_frame = emit_frame(&mut client, frame).await?;
+
+	let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
+	assert_eq!(work_response.status, TransitStatus::Accepted, "routed work must be accepted");
+
+	let payload = work_response.payload.expect("accepted work must carry a payload");
+	let ping_response: PingResponse = decode(&payload)?;
+	assert_eq!(ping_response.doubled, 42);
+
+	trace.event(ClusterRoutingSpec::routing_accepted)?;
+
+	Ok(())
+}
+
+// Work routing over multiplexed colony links: the gateway and hive both
+// offer mux, so client -> cluster and cluster -> hive run multiplexed.
 tb_scenario! {
 	name: cluster_work_routing,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ClusterRoutingSpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| async move {
-			let certs = get_cluster_test_certs();
-
-			let cluster = start_cluster(ClusterConf::new(cluster_tls_config(certs))).await?;
-			let cluster_addr = cluster.addr();
-
-			let servlet_conf = servlet_tls_config(certs)?;
-			let servlet =
-				ClusterTestServlet::start(Arc::new(TraceCollector::new()), Some(servlet_conf)).await?;
-
-			let mut hive = ClusterTestHive::new(Some(hive_tls_config(certs)))?;
-			hive.register("ping", servlet, |t| ClusterTestServlet::start(t, None))?;
-			hive.establish(Arc::new(TraceCollector::new())).await?;
-
-			let _reg_response = hive.register_with_cluster(cluster_addr).await?;
-
-			trace.event("work_sent")?;
-
-			let work_request = ClusterRequest::Work(ClusterWorkRequest {
-				servlet_type: b"ping".to_vec(),
-				payload: encode(&PingRequest { value: 21 })?,
-			});
-
-			let frame = frame_compose(Version::V0)
-				.with_id(b"test-work")
-				.with_order(0)
-				.with_message(work_request)
-				.build()?;
-
-			let mut client = connect_cluster(certs, cluster_addr).await?;
-			let response_frame = emit_frame(&mut client, frame).await?;
-
-			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
-			assert_eq!(work_response.status, TransitStatus::Accepted, "routed work must be accepted");
-
-			let payload = work_response.payload.expect("accepted work must carry a payload");
-			let ping_response: PingResponse = decode(&payload)?;
-			assert_eq!(ping_response.doubled, 42);
-
-			trace.event("routing_accepted")?;
-
-			hive.stop();
+	spec: ClusterRoutingSpec,
+	environment Cluster {
+		context: ClusterTestCerts::generate(),
+		start: |SetupEnv { context: certs, .. }| async move {
+			start_cluster(routing_cluster_conf(&certs, Some(TransportOffer::mux(8)))).await
+		},
+		hives: |SetupEnv { context: certs, .. }| vec![start_ping_hive(certs, Some(TransportOffer::mux(8)))],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			assert_ping_work_routes(&trace, &certs, &cluster).await?;
 			cluster.stop();
+			Ok(())
+		}
+	}
+}
 
+// Same routing path without mux offers: colony links stay single-flight.
+tb_scenario! {
+	name: cluster_work_routing_single_flight,
+	spec: ClusterRoutingSpec,
+	environment Cluster {
+		context: ClusterTestCerts::generate(),
+		start: |SetupEnv { context: certs, .. }| async move {
+			start_cluster(routing_cluster_conf(&certs, None)).await
+		},
+		hives: |SetupEnv { context: certs, .. }| vec![start_ping_hive(certs, None)],
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			assert_ping_work_routes(&trace, &certs, &cluster).await?;
+			cluster.stop();
 			Ok(())
 		}
 	}
@@ -366,25 +405,24 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("work_sent", exactly!(1)),
-			("policy_blocked", exactly!(1))
+			(work_sent, exactly!(1)),
+			(policy_blocked, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: cluster_policy_gate_blocks,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ClusterPolicySpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| async move {
-			let certs = get_cluster_test_certs();
-
-			let cluster_conf = ClusterConf::builder(cluster_tls_config(certs))
+	spec: ClusterPolicySpec,
+	environment Cluster {
+		context: ClusterTestCerts::generate(),
+		start: |SetupEnv { context: certs, .. }| async move {
+			let cluster_conf = ClusterConf::builder(cluster_tls_config(&certs))
 				.with_gate_policy(Arc::new(RejectAllPolicy))
 				.build();
-			let cluster = start_cluster(cluster_conf).await?;
+			start_cluster(cluster_conf).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let cluster_addr = cluster.addr();
 
 			let work_request = ClusterRequest::Work(ClusterWorkRequest {
@@ -398,9 +436,9 @@ tb_scenario! {
 				.with_message(work_request)
 				.build()?;
 
-			let mut client = connect_cluster(certs, cluster_addr).await?;
+			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
-			trace.event("work_sent")?;
+			trace.event(ClusterPolicySpec::work_sent)?;
 
 			let response_frame = emit_frame(&mut client, frame).await?;
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
@@ -411,7 +449,7 @@ tb_scenario! {
 			);
 			assert!(work_response.payload.is_none(), "rejected request must not carry a payload");
 
-			trace.event("policy_blocked")?;
+			trace.event(ClusterPolicySpec::policy_blocked)?;
 
 			cluster.stop();
 
@@ -430,23 +468,24 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("registration_sent", exactly!(1)),
-			("registration_unauthorized", exactly!(1))
+			(registration_sent, exactly!(1)),
+			(registration_unauthorized, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: cluster_rejects_unsigned_registration,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ClusterUnsignedRegistrationSpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| async move {
-			let certs = get_cluster_test_certs();
-
+	spec: ClusterUnsignedRegistrationSpec,
+	environment Cluster {
+		context: ClusterTestCerts::generate(),
+		// Registration itself is under test, so no `hives:` key.
+		// The client drives it and asserts the rejection.
+		start: |SetupEnv { context: certs, .. }| async move {
 			// Cluster requires signed hive-origin frames (hive_trust set)
-			let cluster = start_cluster(ClusterConf::new(cluster_tls_config(certs))).await?;
+			start_cluster(ClusterConf::new(cluster_tls_config(&certs))).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let cluster_addr = cluster.addr();
 
 			// Hive validates the cluster's TLS certificate but has no
@@ -459,12 +498,12 @@ tb_scenario! {
 			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 
-			trace.event("registration_sent")?;
+			trace.event(ClusterUnsignedRegistrationSpec::registration_sent)?;
 
 			let response = hive.register_with_cluster(cluster_addr).await?;
 			assert_register_status(&response, TransitStatus::Unauthorized, 0, &cluster);
 
-			trace.event("registration_unauthorized")?;
+			trace.event(ClusterUnsignedRegistrationSpec::registration_unauthorized)?;
 
 			hive.stop();
 			cluster.stop();
@@ -484,21 +523,18 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("registration_sent", exactly!(1)),
-			("registration_forbidden", exactly!(1))
+			(registration_sent, exactly!(1)),
+			(registration_forbidden, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: cluster_without_hive_trust_rejects_control_frames,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ClusterNoTrustStoreSpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| async move {
-			let certs = get_cluster_test_certs();
-
+	spec: ClusterNoTrustStoreSpec,
+	environment Cluster {
+		context: ClusterTestCerts::generate(),
+		start: |SetupEnv { context: certs, .. }| async move {
 			// Gateway without hive_trust cannot authenticate control
 			// frames and must fail closed: even a validly signed
 			// registration is rejected.
@@ -509,24 +545,26 @@ tb_scenario! {
 				client_validators: vec![],
 				hive_trust: None,
 			};
-			let cluster = start_cluster(ClusterConf::new(tls)).await?;
+			start_cluster(ClusterConf::new(tls)).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let cluster_addr = cluster.addr();
 
-			let mut client = connect_cluster(certs, cluster_addr).await?;
+			let mut client = connect_cluster(&certs, cluster_addr).await?;
 			let signed = signed_control_frame(
-				certs,
+				&certs,
 				b"no-trust-reg",
 				registration_request(current_timestamp_ms(), b"127.0.0.1:65000"),
 			)
 			.await?;
 
-			trace.event("registration_sent")?;
+			trace.event(ClusterNoTrustStoreSpec::registration_sent)?;
 
 			let response_frame = emit_frame(&mut client, signed).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_register_status(&response, TransitStatus::Forbidden, 0, &cluster);
 
-			trace.event("registration_forbidden")?;
+			trace.event(ClusterNoTrustStoreSpec::registration_forbidden)?;
 
 			cluster.stop();
 
@@ -545,31 +583,30 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("fresh_registration_accepted", exactly!(1)),
-			("replayed_registration_rejected", exactly!(1)),
-			("stale_registration_rejected", exactly!(1)),
-			("fresh_update_accepted", exactly!(1)),
-			("replayed_update_rejected", exactly!(1))
+			(fresh_registration_accepted, exactly!(1)),
+			(replayed_registration_rejected, exactly!(1)),
+			(stale_registration_rejected, exactly!(1)),
+			(fresh_update_accepted, exactly!(1)),
+			(replayed_update_rejected, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: cluster_rejects_replayed_and_stale_control_frames,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ClusterReplaySpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| async move {
-			let certs = get_cluster_test_certs();
-
-			let cluster = start_cluster(ClusterConf::new(cluster_tls_config(certs))).await?;
+	spec: ClusterReplaySpec,
+	environment Cluster {
+		context: ClusterTestCerts::generate(),
+		start: |SetupEnv { context: certs, .. }| async move {
+			start_cluster(ClusterConf::new(cluster_tls_config(&certs))).await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let cluster_addr = cluster.addr();
-			let mut client = connect_cluster(certs, cluster_addr).await?;
+			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
 			// Fresh signed registration is accepted
 			let fresh = signed_control_frame(
-				certs,
+				&certs,
 				b"replay-reg",
 				registration_request(current_timestamp_ms(), b"127.0.0.1:65000"),
 			)
@@ -580,19 +617,19 @@ tb_scenario! {
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_register_status(&response, TransitStatus::Accepted, 1, &cluster);
 
-			trace.event("fresh_registration_accepted")?;
+			trace.event(ClusterReplaySpec::fresh_registration_accepted)?;
 
 			// Byte-identical resend carries an already-seen signature
 			let response_frame = emit_frame(&mut client, replayed).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_eq!(response.status, TransitStatus::Forbidden, "replayed registration must be rejected");
 
-			trace.event("replayed_registration_rejected")?;
+			trace.event(ClusterReplaySpec::replayed_registration_rejected)?;
 
 			// Valid signature but issued outside the freshness window
 			let stale_ts = current_timestamp_ms() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
 			let stale = signed_control_frame(
-				certs,
+				&certs,
 				b"stale-reg",
 				registration_request(stale_ts, b"127.0.0.1:65000"),
 			)
@@ -602,27 +639,27 @@ tb_scenario! {
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_eq!(response.status, TransitStatus::Forbidden, "stale registration must be rejected");
 
-			trace.event("stale_registration_rejected")?;
+			trace.event(ClusterReplaySpec::stale_registration_rejected)?;
 
 			// Same enforcement on servlet address updates
 			let update = servlet_address_update(
 				b"127.0.0.1:65000",
 				vec![servlet_info(b"ping", b"127.0.0.1:65001")],
 			);
-			let fresh_update = signed_control_frame(certs, b"replay-update", update).await?;
+			let fresh_update = signed_control_frame(&certs, b"replay-update", update).await?;
 			let replayed_update = fresh_update.clone();
 
 			let response_frame = emit_frame(&mut client, fresh_update).await?;
 			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
 			assert_eq!(response.status, TransitStatus::Accepted, "fresh signed update must be accepted");
 
-			trace.event("fresh_update_accepted")?;
+			trace.event(ClusterReplaySpec::fresh_update_accepted)?;
 
 			let response_frame = emit_frame(&mut client, replayed_update).await?;
 			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
 			assert_eq!(response.status, TransitStatus::Forbidden, "replayed update must be rejected");
 
-			trace.event("replayed_update_rejected")?;
+			trace.event(ClusterReplaySpec::replayed_update_rejected)?;
 
 			cluster.stop();
 
@@ -641,23 +678,31 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("hive_registered", exactly!(1)),
-			("rejected_heartbeat_decoded", exactly!(1)),
-			("hive_evicted", exactly!(1))
+			(hive_registered, exactly!(1)),
+			(rejected_heartbeat_decoded, exactly!(1)),
+			(hive_evicted, exactly!(1))
 		]
 	}
 }
 
+/// Heartbeat-eviction fixture. The heartbeat callback (set in `start`)
+/// records whether a decoded rejected heartbeat was observed. The client
+/// asserts that flag after eviction.
+struct HeartbeatRejectionContext {
+	certs: ClusterTestCerts,
+	rejected_decoded: AtomicBool,
+}
+
 tb_scenario! {
 	name: cluster_evicts_hive_on_rejected_heartbeats,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ClusterHeartbeatRejectionSpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| async move {
-			let certs = get_cluster_test_certs();
-			let rejected_decoded = Arc::new(AtomicBool::new(false));
-			let rejected_flag = Arc::clone(&rejected_decoded);
+	spec: ClusterHeartbeatRejectionSpec,
+	environment Cluster {
+		context: HeartbeatRejectionContext {
+			certs: ClusterTestCerts::generate(),
+			rejected_decoded: AtomicBool::new(false),
+		},
+		start: |SetupEnv { context: rejection, .. }| async move {
+			let callback_rejection = Arc::clone(&rejection);
 			let heartbeat = HeartbeatConf::builder()
 				.with_interval(Duration::from_millis(100))
 				.with_max_failures(1)
@@ -666,14 +711,19 @@ tb_scenario! {
 					// decoded, proving the failure came from the rejected
 					// status rather than a transport error
 					let decoded_reject = !event.success && event.utilization.is_some();
-					rejected_flag.fetch_or(decoded_reject, Ordering::SeqCst);
+					callback_rejection
+						.rejected_decoded
+						.fetch_or(decoded_reject, Ordering::SeqCst);
 				}))
 				.build();
 
-			let cluster_conf = ClusterConf::builder(cluster_tls_config(certs))
+			let cluster_conf = ClusterConf::builder(cluster_tls_config(&rejection.certs))
 				.with_heartbeat_config(heartbeat)
 				.build();
-			let cluster = start_cluster(cluster_conf).await?;
+			start_cluster(cluster_conf).await
+		},
+		client: |ClusterEnv { trace, context: rejection, cluster }| async move {
+			let certs = &rejection.certs;
 			let cluster_addr = cluster.addr();
 
 			// Hive serves the shared cert (cluster trusts it for TLS) but
@@ -695,7 +745,7 @@ tb_scenario! {
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_register_status(&response, TransitStatus::Accepted, 1, &cluster);
 
-			trace.event("hive_registered")?;
+			trace.event(ClusterHeartbeatRejectionSpec::hive_registered)?;
 
 			// Heartbeats run every 100ms with max_failures = 1: the first
 			// Forbidden heartbeat must evict the hive
@@ -705,12 +755,12 @@ tb_scenario! {
 			);
 
 			assert!(
-				rejected_decoded.load(Ordering::SeqCst),
+				rejection.rejected_decoded.load(Ordering::SeqCst),
 				"hive must answer with a decodable rejected heartbeat"
 			);
 
-			trace.event("rejected_heartbeat_decoded")?;
-			trace.event("hive_evicted")?;
+			trace.event(ClusterHeartbeatRejectionSpec::rejected_heartbeat_decoded)?;
+			trace.event(ClusterHeartbeatRejectionSpec::hive_evicted)?;
 
 			hive.stop();
 			cluster.stop();
@@ -725,7 +775,7 @@ tb_scenario! {
 // ============================================================================
 
 struct DualHiveCerts {
-	gateway: &'static ClusterTestCerts,
+	gateway: ClusterTestCerts,
 	hive_a: (Certificate, Secp256k1SigningKey),
 	hive_b: (Certificate, Secp256k1SigningKey),
 	hive_trust: Arc<dyn CertificateTrust>,
@@ -735,7 +785,7 @@ fn dual_hive_certs() -> DualHiveCerts {
 	use tightbeam::random::OsRng;
 	use tightbeam::testing::utils::create_test_certificate;
 
-	let gateway = get_cluster_test_certs();
+	let gateway = ClusterTestCerts::generate();
 	let raw_a = k256::ecdsa::SigningKey::random(&mut OsRng);
 	let raw_b = k256::ecdsa::SigningKey::random(&mut OsRng);
 	let cert_a = create_test_certificate(&raw_a);
@@ -780,28 +830,28 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("hives_registered", exactly!(1)),
-			("cross_hive_update_forbidden", exactly!(1)),
-			("owner_update_accepted", exactly!(1))
+			(hives_registered, exactly!(1)),
+			(cross_hive_update_forbidden, exactly!(1)),
+			(owner_update_accepted, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: cluster_rejects_cross_hive_servlet_address_update,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ClusterCrossHiveUpdateSpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| async move {
-			let certs = dual_hive_certs();
-			let cluster = start_cluster(ClusterConf::new(cluster_tls_config_with_trust(
-				certs.gateway,
+	spec: ClusterCrossHiveUpdateSpec,
+	environment Cluster {
+		context: dual_hive_certs(),
+		start: |SetupEnv { context: certs, .. }| async move {
+			start_cluster(ClusterConf::new(cluster_tls_config_with_trust(
+				&certs.gateway,
 				Some(Arc::clone(&certs.hive_trust)),
 			)))
-			.await?;
+			.await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
 			let cluster_addr = cluster.addr();
-			let mut client = connect_cluster(certs.gateway, cluster_addr).await?;
+			let mut client = connect_cluster(&certs.gateway, cluster_addr).await?;
 
 			let hive_a_addr = b"127.0.0.1:65010".as_slice();
 			let hive_b_addr = b"127.0.0.1:65011".as_slice();
@@ -812,7 +862,7 @@ tb_scenario! {
 			assert_eq!(response_b.status, TransitStatus::Accepted);
 			assert_eq!(cluster.hive_count(), 2);
 
-			trace.event("hives_registered")?;
+			trace.event(ClusterCrossHiveUpdateSpec::hives_registered)?;
 
 			let update_cases = [
 				(
@@ -820,14 +870,14 @@ tb_scenario! {
 					b"cross-update".as_slice(),
 					servlet_address_update(hive_a_addr, vec![servlet_info(b"poison", b"127.0.0.1:65099")]),
 					TransitStatus::Forbidden,
-					"cross_hive_update_forbidden",
+					ClusterCrossHiveUpdateSpec::cross_hive_update_forbidden,
 				),
 				(
 					&certs.hive_a.1,
 					b"owner-update".as_slice(),
 					servlet_address_update(hive_a_addr, vec![servlet_info(b"ping", b"127.0.0.1:65012")]),
 					TransitStatus::Accepted,
-					"owner_update_accepted",
+					ClusterCrossHiveUpdateSpec::owner_update_accepted,
 				),
 			];
 
@@ -849,27 +899,27 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Accepted,
 		assertions: [
-			("owner_registered", exactly!(1)),
-			("hijack_forbidden", exactly!(1)),
-			("owner_bind_intact", exactly!(1))
+			(owner_registered, exactly!(1)),
+			(hijack_forbidden, exactly!(1)),
+			(owner_bind_intact, exactly!(1))
 		]
 	}
 }
 
 tb_scenario! {
 	name: cluster_rejects_cross_hive_registration_hijack,
-	config: ScenarioConf::<()>::builder()
-		.with_spec(ClusterRegistrationHijackSpec::latest())
-		.build(),
-	environment Bare {
-		exec: |trace| async move {
-			let certs = dual_hive_certs();
-			let cluster = start_cluster(ClusterConf::new(cluster_tls_config_with_trust(
-				certs.gateway,
+	spec: ClusterRegistrationHijackSpec,
+	environment Cluster {
+		context: dual_hive_certs(),
+		start: |SetupEnv { context: certs, .. }| async move {
+			start_cluster(ClusterConf::new(cluster_tls_config_with_trust(
+				&certs.gateway,
 				Some(Arc::clone(&certs.hive_trust)),
 			)))
-			.await?;
-			let mut client = connect_cluster(certs.gateway, cluster.addr()).await?;
+			.await
+		},
+		client: |ClusterEnv { trace, context: certs, cluster }| async move {
+			let mut client = connect_cluster(&certs.gateway, cluster.addr()).await?;
 
 			let hive_a_addr = b"127.0.0.1:65020".as_slice();
 
@@ -877,13 +927,13 @@ tb_scenario! {
 			assert_eq!(owner.status, TransitStatus::Accepted);
 			assert_eq!(cluster.hive_count(), 1);
 
-			trace.event("owner_registered")?;
+			trace.event(ClusterRegistrationHijackSpec::owner_registered)?;
 
 			let hijack = register_signed_hive(&mut client, &certs.hive_b.1, b"hijack-reg", hive_a_addr).await?;
 			assert_eq!(hijack.status, TransitStatus::Forbidden);
 			assert_eq!(cluster.hive_count(), 1);
 
-			trace.event("hijack_forbidden")?;
+			trace.event(ClusterRegistrationHijackSpec::hijack_forbidden)?;
 
 			let owned = emit_servlet_update(
 				&mut client,
@@ -894,7 +944,7 @@ tb_scenario! {
 			.await?;
 			assert_eq!(owned.status, TransitStatus::Accepted);
 
-			trace.event("owner_bind_intact")?;
+			trace.event(ClusterRegistrationHijackSpec::owner_bind_intact)?;
 
 			cluster.stop();
 			Ok(())

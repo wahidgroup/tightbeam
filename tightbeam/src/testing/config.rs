@@ -136,7 +136,7 @@ impl ScenarioConfBuilder {
 		self
 	}
 
-	/// Build ScenarioConf
+	/// Consumes the builder and wraps collected fields in `Arc`.
 	pub fn build(self) -> ScenarioConf {
 		ScenarioConf {
 			specs: Arc::new(self.specs),

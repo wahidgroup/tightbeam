@@ -16,7 +16,7 @@ use tightbeam::{
 	exactly,
 	policy::{GatePolicy, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
-	testing::create_test_signing_key,
+	testing::{create_test_signing_key, ClientEnv, ServletEnv, SetupEnv},
 	transport::{tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder},
 	worker, Beamable, Frame, TightBeamError,
 };
@@ -137,8 +137,8 @@ tb_scenario! {
 			final_multiplier: 3,
 			value: 5,
 		},
-		start: |env| async move {
-			let (trace, config) = (Arc::new(env.trace), env.context);
+		start: |SetupEnv { trace, context: config }| async move {
+			let trace = Arc::new(trace);
 			let doubler = DoublerWorker::new(());
 			let squarer = SquarerWorker::new(SquarerWorkerConf {
 				add_offset: config.squarer_offset
@@ -150,16 +150,14 @@ tb_scenario! {
 				.with_worker(squarer)
 				.build();
 
-			// Start servlet via trait
 			CalcServlet::start(trace, Some(servlet_conf)).await
 		},
-		setup: |env| async move {
+		setup: |ClientEnv { addr, .. }| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let client = builder.connect(env.addr).await?;
+			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
-		client: |env| async move {
-			let (trace, mut client, config) = (env.trace, env.client, env.context);
+		client: |ServletEnv { trace, mut client, context: config }| async move {
 			let request = compose! {
 				V0: id: b"calc-request-id",
 					message: CalcRequest { value: config.value }
@@ -168,7 +166,6 @@ tb_scenario! {
 			let response_frame = client.emit(request, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let response: CalcResponse = decode(&response_frame.message)?;
 
-			// Verify results using trace events with equals! assertions
 			trace.event_with("verify_doubled", &[], response.doubled)?;
 			trace.event_with("verify_squared", &[], response.squared)?;
 			trace.event_with("verify_final_result", &[], response.final_result)?;
@@ -249,8 +246,8 @@ tb_scenario! {
 			final_multiplier: 1,
 			value: 7,
 		},
-		start: |env| async move {
-			let (trace, config) = (Arc::new(env.trace), env.context);
+		start: |SetupEnv { trace, context: config }| async move {
+			let trace = Arc::new(trace);
 			let verifying_key = *create_test_signing_key().verifying_key();
 			let servlet_conf = ServletConf::<TokioListener, CalcRequest>::builder()
 				.with_config(config)
@@ -261,13 +258,12 @@ tb_scenario! {
 
 			SecureCalcServlet::start(trace, Some(servlet_conf)).await
 		},
-		setup: |env| async move {
+		setup: |ClientEnv { addr, .. }| async move {
 			let builder = ClientBuilder::<TokioListener>::builder().build();
-			let client = builder.connect(env.addr).await?;
+			let client = builder.connect(addr).await?;
 			Ok(client)
 		},
-		client: |env| async move {
-			let (trace, mut client, config) = (env.trace, env.client, env.context);
+		client: |ServletEnv { trace, mut client, context: config }| async move {
 			let request = compose! {
 				V2: id: b"secure-calc-request-id",
 					order: 1u64,

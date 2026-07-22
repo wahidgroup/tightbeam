@@ -31,30 +31,30 @@ use crate::trace::TraceCollector;
 pub struct SetupEnv<C = ()> {
 	/// Trace handle recording into the scenario's collector.
 	pub trace: TraceCollector,
-	/// Scenario context from the `context:` key.
+	/// Scenario fixture from the `context:` key, shared as `Arc<C>`.
 	pub context: Arc<C>,
 }
 
-/// ServiceClient `client` and Servlet `setup` closures: the bound server
-/// address travels with the shared context. The closure builds its own
-/// connection (pool, trusted client, raw transport).
+/// ServiceClient `client` and Servlet `setup` closures. Carries `trace`,
+/// shared `context`, and bound `addr` as separate fields. The closure
+/// builds its own connection (pool, trusted client, raw transport).
 pub struct ClientEnv<C, A> {
 	/// Trace handle recording into the scenario's collector.
 	pub trace: TraceCollector,
-	/// Scenario context from the `context:` key.
+	/// Scenario fixture from the `context:` key, shared as `Arc<C>`.
 	pub context: Arc<C>,
 	/// Bound server address reported by the server closure.
 	pub addr: A,
 }
 
-/// Cluster `client` closure: owns the cluster instance, so registry
+/// Cluster `client` closure: owns the cluster instance so registry
 /// assertions and the consuming `stop` are available.
 pub struct ClusterEnv<C, G> {
 	/// Trace handle recording into the scenario's collector.
 	pub trace: TraceCollector,
-	/// Scenario context from the `context:` key.
+	/// Scenario fixture from the `context:` key, shared as `Arc<C>`.
 	pub context: Arc<C>,
-	/// The started cluster instance, owned by the closure.
+	/// Started cluster instance, owned by the closure.
 	pub cluster: G,
 }
 
@@ -62,18 +62,18 @@ pub struct ClusterEnv<C, G> {
 pub struct HiveEnv<C, H> {
 	/// Trace handle recording into the scenario's collector.
 	pub trace: TraceCollector,
-	/// Scenario context from the `context:` key.
+	/// Scenario fixture from the `context:` key, shared as `Arc<C>`.
 	pub context: Arc<C>,
-	/// The established hive instance, owned by the closure.
+	/// Established hive instance, owned by the closure.
 	pub hive: H,
 }
 
-/// Servlet `client` closure: the connected client from the default
-/// connect or the scenario's `setup:` closure.
+/// Servlet `client` closure: connected client from the default connect
+/// or the scenario's `setup:` closure.
 pub struct ServletEnv<C, T> {
 	/// Trace handle recording into the scenario's collector.
 	pub trace: TraceCollector,
-	/// Scenario context from the `context:` key.
+	/// Scenario fixture from the `context:` key, shared as `Arc<C>`.
 	pub context: Arc<C>,
 	/// Connected client for the servlet under test.
 	pub client: T,
@@ -83,8 +83,8 @@ pub struct ServletEnv<C, T> {
 pub struct WorkerEnv<C, W> {
 	/// Trace handle recording into the scenario's collector.
 	pub trace: TraceCollector,
-	/// Scenario context from the `context:` key.
+	/// Scenario fixture from the `context:` key, shared as `Arc<C>`.
 	pub context: Arc<C>,
-	/// The worker instance, owned by the closure.
+	/// Worker instance built by `setup`, owned by the closure.
 	pub worker: W,
 }
