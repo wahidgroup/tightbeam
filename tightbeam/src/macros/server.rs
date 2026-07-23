@@ -435,7 +435,7 @@ macro_rules! server {
 							};
 
 							// Process message asynchronously
-							let response = if status == $crate::policy::TransitStatus::Accepted {
+							let response = if status == $crate::policy::TransitStatus::Ok {
 								$crate::macros::server::server_runtime::rt::block_on((__handler_clone)(frame))
 							} else {
 								None
@@ -490,7 +490,7 @@ macro_rules! server {
 							// Unwrap Arc<Frame> to Frame for handler (clone only if Arc has multiple owners)
 							let frame_owned = std::sync::Arc::try_unwrap(frame)
 								.unwrap_or_else(|arc| (*arc).clone());
-							let response = if status == $crate::policy::TransitStatus::Accepted {
+							let response = if status == $crate::policy::TransitStatus::Ok {
 								match (__handler_clone)(frame_owned).await {
 									Ok(opt) => opt,
 									// Handler failures answer with no response

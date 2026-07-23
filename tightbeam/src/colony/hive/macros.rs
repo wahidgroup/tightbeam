@@ -594,10 +594,10 @@ macro_rules! hive {
 					);
 					$crate::policy::GatePolicy::evaluate(&gate, &$frame)
 				}
-				None => $crate::policy::TransitStatus::Forbidden,
+				None => $crate::policy::TransitStatus::PermissionDenied,
 			};
 
-			if security_status != $crate::policy::TransitStatus::Accepted {
+			if security_status != $crate::policy::TransitStatus::Ok {
 				// Rejects reply in the CHOICE variant the sender decodes:
 				// heartbeat commands get a heartbeat-shaped verdict, manage
 				// commands a manage-shaped one. A mismatched shape decodes
@@ -618,13 +618,13 @@ macro_rules! hive {
 			}
 		}
 
-		// Reject non-heartbeat when draining. Busy replies in the manage
-		// CHOICE shape: these branches only see manage commands, and a
-		// heartbeat-shaped verdict would decode as MalformedResponse on the
-		// cluster and evict the hive over a transient rejection.
+		// Reject non-heartbeat when draining. Unavailable replies in the
+		// manage CHOICE shape: these branches only see manage commands, and
+		// a heartbeat-shaped verdict would decode as MalformedResponse on
+		// the cluster and evict the hive over a transient rejection.
 		if is_draining && !is_heartbeat {
 			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-				$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Busy)
+				$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Unavailable)
 			));
 		}
 
@@ -636,9 +636,9 @@ macro_rules! hive {
 				::std::sync::Arc::clone(&$utilization),
 				$bp_threshold
 			);
-			if $crate::policy::GatePolicy::evaluate(&bp_gate, &$frame) == $crate::policy::TransitStatus::Busy {
+			if $crate::policy::GatePolicy::evaluate(&bp_gate, &$frame) == $crate::policy::TransitStatus::ResourceExhausted {
 				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-					$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Busy)
+					$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::ResourceExhausted)
 				));
 			}
 		}
@@ -648,9 +648,9 @@ macro_rules! hive {
 			if cmd.heartbeat.is_some() {
 				let util = current_util();
 				let status = if util.get() >= $bp_threshold.get() {
-					$crate::policy::TransitStatus::Busy
+					$crate::policy::TransitStatus::ResourceExhausted
 				} else {
-					$crate::policy::TransitStatus::Accepted
+					$crate::policy::TransitStatus::Ok
 				};
 				return hive!(@reply_priority $frame, $crate::MessagePriority::NetworkControl,
 					$crate::colony::common::ClusterCommandResponse::heartbeat(status, util, active_count())
@@ -707,7 +707,7 @@ macro_rules! hive {
 						forget_replay();
 
 						return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-							$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
+							$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::PermissionDenied)
 						));
 					}
 				}
@@ -715,7 +715,7 @@ macro_rules! hive {
 				forget_replay();
 
 				return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-					$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::Forbidden)
+					$crate::colony::hive::HiveManagementResponse::spawn_err($crate::policy::TransitStatus::PermissionDenied)
 				));
 			}
 		}
@@ -757,7 +757,7 @@ macro_rules! hive {
 			forget_replay();
 
 			return hive!(@reply $frame, $crate::colony::common::ClusterCommandResponse::manage(
-				$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::Forbidden)
+				$crate::colony::hive::HiveManagementResponse::stop_err($crate::policy::TransitStatus::PermissionDenied)
 			));
 		}
 

@@ -144,7 +144,7 @@ tb_assert_spec! {
 	pub VersionSpec,
 	V(0,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v0"],
 		assertions: [
 			(roundtrip_ok, exactly!(1), equals!(true)),
@@ -160,7 +160,7 @@ tb_assert_spec! {
 	},
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v1"],
 		assertions: [
 			(roundtrip_ok, exactly!(1), equals!(true)),
@@ -176,7 +176,7 @@ tb_assert_spec! {
 	},
 	V(2,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v2"],
 		assertions: [
 			(roundtrip_ok, exactly!(1), equals!(true)),
@@ -192,7 +192,7 @@ tb_assert_spec! {
 	},
 	V(3,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v3"],
 		assertions: [
 			(roundtrip_ok, exactly!(1), equals!(true)),

@@ -163,7 +163,7 @@ tb_assert_spec! {
 	pub PaymentGatewaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(work_completed, at_least!(1))
 		]
@@ -233,7 +233,7 @@ tb_scenario! {
 			trace.event(PaymentGatewaySpec::work_completed)?;
 
 			// Verify routing succeeded
-			if work_response.status == TransitStatus::Accepted {
+			if work_response.status == TransitStatus::Ok {
 				if let Some(payload) = work_response.payload {
 					let status: TransactionStatus = decode(&payload)?;
 					let is_approved = matches!(status.status, PaymentStatusCode::AcceptedCustomerProfile);

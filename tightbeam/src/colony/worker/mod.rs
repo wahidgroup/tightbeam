@@ -281,9 +281,9 @@ mod tests {
 	impl ReceptorPolicy<RequestMessage> for PingGate {
 		fn evaluate(&self, maybe_ping: &RequestMessage) -> TransitStatus {
 			if maybe_ping.content == "PING" {
-				TransitStatus::Accepted
+				TransitStatus::Ok
 			} else {
-				TransitStatus::Forbidden
+				TransitStatus::PermissionDenied
 			}
 		}
 	}

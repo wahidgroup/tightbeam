@@ -1326,14 +1326,26 @@ pub trait RestartPolicy: Send + Sync {
 **TransitStatus:**
 
 ```rust
+// The gRPC canonical status registry (google.rpc.Code)
 pub enum TransitStatus {
+	Ok = 0,
+	Cancelled = 1,
 	#[default]
-	Request = 0,
-	Accepted = 1,
-	Busy = 2,
-	Unauthorized = 3,
-	Forbidden = 4,
-	Timeout = 5,
+	Unknown = 2,
+	InvalidArgument = 3,
+	DeadlineExceeded = 4,
+	NotFound = 5,
+	AlreadyExists = 6,
+	PermissionDenied = 7,
+	ResourceExhausted = 8,
+	FailedPrecondition = 9,
+	Aborted = 10,
+	OutOfRange = 11,
+	Unimplemented = 12,
+	Internal = 13,
+	Unavailable = 14,
+	DataLoss = 15,
+	Unauthenticated = 16,
 }
 ```
 
@@ -1363,9 +1375,9 @@ struct IdPatternGate;
 impl GatePolicy for IdPatternGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
 		if frame.metadata.id.starts_with(b"api-") {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		} else {
-			TransitStatus::Forbidden
+			TransitStatus::PermissionDenied
 		}
 	}
 }
@@ -1389,9 +1401,9 @@ struct PriorityGate;
 impl ReceptorPolicy<RequestMessage> for PriorityGate {
 	fn evaluate(&self, message: &RequestMessage) -> TransitStatus {
 		if message.priority >= 5 {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		} else {
-			TransitStatus::Forbidden
+			TransitStatus::PermissionDenied
 		}
 	}
 }
@@ -1415,17 +1427,17 @@ let restart = RestartExponentialBackoff::new(4, 1000, None);
 tightbeam::policy! {
 	GatePolicy: OnlyApiMessages |frame| {
 		if frame.metadata.id.starts_with(b"api-") {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		} else {
-			TransitStatus::Forbidden
+			TransitStatus::PermissionDenied
 		}
 	}
 
 	ReceptorPolicy<RequestMessage>: OnlyPingMessages |message| {
 		if message.content == "PING" {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		} else {
-			TransitStatus::Forbidden
+			TransitStatus::PermissionDenied
 		}
 	}
 
@@ -1849,7 +1861,7 @@ let security_accept = SecurityAccept {
 | **Confidentiality**        | ECDH + HKDF derived AEAD key                | Session key never transmitted; derived from ECDH shared secret                                                                                                              |
 | **Forward Secrecy**        | Ephemeral client keys                       | New ephemeral key per handshake; compromise does not affect past sessions                                                                                                   |
 | **DoS**                    | 16 KiB handshake size cap                   | Reject oversized handshake messages before processing                                                                                                                       |
-| **Stream Cap Inflation**   | Clamp + Busy                                | Caps clamped to `MAX_MUX_STREAM_CAP`; local exhaustion returns `Busy`                                                                                                       |
+| **Stream Cap Inflation**   | Clamp + ResourceExhausted                                | Caps clamped to `MAX_MUX_STREAM_CAP`; local exhaustion returns `ResourceExhausted`                                                                                                       |
 | **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`; exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113][rfc9113] §7 analog) |
 | **Certificate Forgery**    | X.509 chain validation                      | Verify root of trust Note: Application responsibility                                                                                                                       |
 | **Nonce Reuse**            | Monotonic counter + XOR                     | Per-message nonce derived from seed XOR counter                                                                                                                             |
@@ -1907,7 +1919,7 @@ Streams in `Open`, `HalfClosedLocal`, or `HalfClosedRemote` count toward the pee
 - `local_initiated_cap`: how many streams this endpoint may initiate (the value the peer advertised)
 - `peer_initiated_cap`: how many streams the peer may initiate (the value this endpoint advertised)
 
-Each endpoint MUST enforce the cap it advertised against peer-initiated streams and MUST respect the cap its peer advertised when allocating locally. Exhausting the local-initiated cap MUST return `Busy` without allocating a stream. Advertised caps MUST be clamped to `MAX_MUX_STREAM_CAP` (1024) when deriving settings so an absurd wire advertisement cannot inflate bookkeeping bounds (CWE-770).
+Each endpoint MUST enforce the cap it advertised against peer-initiated streams and MUST respect the cap its peer advertised when allocating locally. Exhausting the local-initiated cap MUST return `ResourceExhausted` without allocating a stream. Advertised caps MUST be clamped to `MAX_MUX_STREAM_CAP` (1024) when deriving settings so an absurd wire advertisement cannot inflate bookkeeping bounds (CWE-770).
 
 **Envelope Types** (`TransportEnvelope` context tag 4 nests the `MuxEnvelope` CHOICE, inner context tags 0-5):
 
@@ -2002,7 +2014,7 @@ Client (MuxHandle)                         Server (MuxResponder)
 - **MuxWriterDriver**: Single serialization point for the connection. Drains the outbound queue and writes each envelope through the send half. Spawn `drive()` on the caller's executor.
 - **MuxReaderDriver**: Reads envelopes from the receive half, routes responses to pending stream slots, and forwards peer-initiated requests to the responder. Unknown response IDs are discarded (cancel/response races are benign).
 - **MuxHandle**: Cloneable client handle. Allocates stream IDs, registers pending slots, and awaits correlated responses.
-- **MuxResponder**: Serves peer-initiated streams with a caller-supplied handler. Handlers for distinct streams run concurrently. Cap exhaustion answers with `TransitStatus::Busy`.
+- **MuxResponder**: Serves peer-initiated streams with a caller-supplied handler. Handlers for distinct streams run concurrently. Cap exhaustion answers with `TransitStatus::ResourceExhausted`.
 
 **MultiplexedProtocol Trait:**
 
@@ -2066,7 +2078,7 @@ tokio::spawn(writer_drv.drive());
 tokio::spawn(async move {
 	responder
 		.serve(|frame| async move {
-			ResponsePackage::new(TransitStatus::Accepted, Some(Frame::clone(&frame)))
+			ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(&frame)))
 		})
 		.await
 });
@@ -2079,7 +2091,7 @@ handle.shutdown().await?;
 
 **Cleartext Path:**
 
-Use only when both endpoints intentionally forgo the handshake. Settings are not negotiated; divergent caps cause asymmetric Busy/accept behavior. `into_split_cleartext` requires a never-handshaken transport with no server identity or key manager configured.
+Use only when both endpoints intentionally forgo the handshake. Settings are not negotiated; divergent caps cause asymmetric refuse/accept behavior. `into_split_cleartext` requires a never-handshaken transport with no server identity or key manager configured.
 
 ```rust
 use tightbeam::transport::handshake::negotiation::MuxSettings;
@@ -2105,7 +2117,7 @@ tb_assert_spec! {
 	pub EchoOverMuxSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(echo_over_mux, exactly!(1), equals!(true))
 		]
@@ -2175,7 +2187,7 @@ let mut client = pool.connect(server_addr).await?;
 let response = client.emit(frame, None).await?;
 ```
 
-With an offer configured, `connect` shares ONE multiplexed connection per destination. Every caller leases a clone of the same `MuxHandle` and `emit` opens a fresh stream. `PooledClient::conn()` (the exclusive-connection accessor) answers `Busy` on a mux lease. `emit` is the transport-agnostic call.
+With an offer configured, `connect` shares ONE multiplexed connection per destination. Every caller leases a clone of the same `MuxHandle` and `emit` opens a fresh stream. `PooledClient::conn()` (the exclusive-connection accessor) answers `ResourceExhausted` on a mux lease. `emit` is the transport-agnostic call.
 
 **Fallback semantics** (automatic, per connection):
 
@@ -2188,7 +2200,7 @@ With an offer configured, `connect` shares ONE multiplexed connection per destin
 
 **Mux connection lifecycle in the pool:**
 
-- Stream-cap exhaustion (`Busy`): `emit` opens an additional mux connection to the same destination (bounded by `max_connections`) and retries there once
+- Stream-cap exhaustion (`ResourceExhausted`): `emit` opens an additional mux connection to the same destination (bounded by `max_connections`) and retries there once
 - `ConnectionClosed`, or `Draining` from a rekey GoAway: the entry is evicted and the failure reported. The next `connect` re-establishes with fresh keys
 - Dead entries (driver ended) are pruned on the next `connect`. Multiple live entries round-robin
 
@@ -2305,7 +2317,7 @@ tb_assert_spec! {
 	pub PingPongSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(worker_called, exactly!(1)),
 			(response_received, exactly!(1), equals!("pong"))
@@ -2512,7 +2524,7 @@ tb_assert_spec! {
 	pub CalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(servlet_receive, exactly!(1)),
 			(worker_process, exactly!(1)),
@@ -2743,7 +2755,7 @@ tb_scenario! {
 
 			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
-			assert_manage_stop_shape(&response, TransitStatus::Busy);
+			assert_manage_stop_shape(&response, TransitStatus::ResourceExhausted);
 
 			trace.event(HiveBackpressureShapeSpec::backpressure_manage_manage_shape)?;
 
@@ -2819,7 +2831,7 @@ let tls = ClusterTlsConfig {
 
 For hives to trust cluster commands (like heartbeats), they must have the cluster's certificate in their trust store. See [Trust Stores](#trust-stores) for details.
 
-The gateway requires `hive_trust` for hive-origin control frames (registration, servlet address updates): registration replies carry `TransitStatus::Unauthorized` for missing signatures and `TransitStatus::Forbidden` for signatures that fail verification. Leaving `hive_trust` as `None` fails closed -- all control frames are rejected with `TransitStatus::Forbidden`, mirroring the hive-side trust store requirement.
+The gateway requires `hive_trust` for hive-origin control frames (registration, servlet address updates): registration replies carry `TransitStatus::Unauthenticated` for missing signatures and `TransitStatus::PermissionDenied` for signatures that fail verification. Leaving `hive_trust` as `None` fails closed -- all control frames are rejected with `TransitStatus::PermissionDenied`, mirroring the hive-side trust store requirement.
 
 ##### Heartbeat Mechanism
 
@@ -2872,8 +2884,8 @@ let request = ClusterWorkRequest {
 // Client receives:
 let response: ClusterWorkResponse = decode(&frame.message)?;
 match response.status {
-	TransitStatus::Accepted => { /* process response.payload */ }
-	TransitStatus::Forbidden => { /* no hive available */ }
+	TransitStatus::Ok => { /* process response.payload */ }
+	TransitStatus::Unavailable => { /* no hive available */ }
 	_ => { /* handle other statuses */ }
 }
 ```
@@ -2908,7 +2920,7 @@ tb_assert_spec! {
 	pub ClusterRoutingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(work_sent, exactly!(1)),
 			(routing_accepted, exactly!(1))
@@ -2955,7 +2967,7 @@ tb_scenario! {
 			}?, None).await?.ok_or(TightBeamError::MissingResponse)?;
 
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
-			assert_eq!(work_response.status, TransitStatus::Accepted);
+			assert_eq!(work_response.status, TransitStatus::Ok);
 
 			trace.event(ClusterRoutingSpec::routing_accepted)?;
 
@@ -3405,7 +3417,7 @@ tb_assert_spec! {
 	pub PipelineSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			// Shorthand labels match full URNs
 			(create_handshake_request_start, exactly!(1)),
@@ -3575,7 +3587,7 @@ AssertSpec defines expected behavioral invariants through declarative assertion 
 - Cardinality constraints (exactly, at_least, at_most, between)
 - Value assertions (equals) for verifying assertion payload values
 - Execution mode (Accept, Reject)
-- Gate policy (Accepted, Rejected, etc.)
+- Gate policy (Ok, rejection statuses, etc.)
 
 Specifications are versioned using semantic versioning (major.minor.patch) and produce deterministic SHA3-256 hashes over their canonical representation.
 
@@ -3586,7 +3598,7 @@ tb_assert_spec! {
 	pub MySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v1"],
 		assertions: [
 			(Received, exactly!(1)),
@@ -3595,7 +3607,7 @@ tb_assert_spec! {
 	},
 	V(1,1,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v1.1"],
 		assertions: [
 			(Received, exactly!(1)),
@@ -3610,7 +3622,7 @@ tb_assert_spec! {
 ```
 V(major, minor, patch): {
 	mode: <ExecutionMode>,              // Accept or Reject
-	gate: <TransitStatus>,              // Accepted, Rejected, etc.
+	gate: <TransitStatus>,              // Ok, rejection statuses, etc.
 	tag_filter: ["tag1", "tag2"],       // Optional: filter assertions by tags
 	assertions: [                       // Array of (label, cardinality) or (label, cardinality, equals!(value))
 		("label", cardinality),
@@ -3647,7 +3659,7 @@ tb_assert_spec! {
 	pub DemoSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v1"],
 		assertions: [
 			(A, exactly!(1)),
@@ -3656,7 +3668,7 @@ tb_assert_spec! {
 	},
 	V(1,1,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v1.1"],
 		assertions: [
 			(A, exactly!(1)),
@@ -3749,7 +3761,7 @@ tb_assert_spec! {
 	pub VersionSpec,
 	V(0,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v0"],
 		assertions: [
 			(feature, exactly!(1), equals!(IsNone)),
@@ -3757,7 +3769,7 @@ tb_assert_spec! {
 	},
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: ["v1"],
 		assertions: [
 			(feature, exactly!(1), equals!(IsNone)),
@@ -4069,7 +4081,7 @@ tb_assert_spec! {
 	pub SimpleSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(start, exactly!(1)),
 			(finish, exactly!(1))
@@ -4464,7 +4476,7 @@ tb_assert_spec! {
 	pub BareSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(Received, exactly!(1)),
 			(Responded, exactly!(1))
@@ -4516,7 +4528,7 @@ tb_assert_spec! {
 	pub ClientServerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(connect, exactly!(1)),
 			(request, exactly!(1)),
@@ -4711,7 +4723,7 @@ tb_assert_spec! {
 	pub SimpleFuzzSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(start, exactly!(1)),
 			(action_a, at_least!(0)),
@@ -5085,7 +5097,7 @@ tb_assert_spec! {
 	pub PingPongWorkerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(relay_start, exactly!(2)),
 			(relay_success, exactly!(1)),
@@ -5166,7 +5178,7 @@ tb_assert_spec! {
 	pub PingPongSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(request_received, exactly!(1)),
 			(pong_sent, exactly!(1)),

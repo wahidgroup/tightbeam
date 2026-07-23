@@ -85,7 +85,7 @@ tb_assert_spec! {
 	pub CertificateForgerySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(cert_valid_accepted, exactly!(1u32)),
 			(cert_wrong_key_rejected, exactly!(1u32)),

@@ -115,7 +115,7 @@ tb_assert_spec! {
 	pub CalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(servlet_receive, exactly!(1)),
 			(doubler_process, exactly!(1)),
@@ -193,9 +193,9 @@ struct SignatureGate {
 impl GatePolicy for SignatureGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
 		if frame.verify::<Secp256k1Signature, Sha3_256>(&self.verifying_key).is_ok() {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		} else {
-			TransitStatus::Forbidden
+			TransitStatus::PermissionDenied
 		}
 	}
 }
@@ -227,7 +227,7 @@ tb_assert_spec! {
 	pub SecureCalcServletSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(secure_receive, exactly!(1)),
 			(secure_frame_cleartext, exactly!(1), equals!(1u32)),

@@ -1,17 +1,43 @@
 use crate::der::Enumerated;
 use crate::{Frame, Message};
 
-/// Transport response status codes
+/// Transport response status codes.
+///
+/// The gRPC canonical status registry (`google.rpc.Code`) adopted:
+///
+/// - `Ok`: the request was processed
+/// - `Cancelled`: the caller cancelled the operation
+/// - `Unknown`: unclassified server failure.
+/// - `InvalidArgument`: the request is malformed regardless of system state.
+/// - `DeadlineExceeded`: the peer gave up waiting
+/// - `NotFound`: the requested entity does not exist.
+/// - `PermissionDenied`: the caller is identified but refused authorization.
+/// - `ResourceExhausted`: capacity refusal, retry with backoff may succeed.
+/// - `FailedPrecondition`: system state must change before a retry can succeed.
+/// - `Unimplemented`: no handler answers the requested operation.
+/// - `Unavailable`: transient unavailability, retry with backoff.
+/// - `Unauthenticated`: the caller lacks valid authentication credentials.
 #[derive(Enumerated, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransitStatus {
+	Ok = 0,
+	Cancelled = 1,
 	#[default]
-	Request = 0,
-	Accepted = 1,
-	Busy = 2,
-	Unauthorized = 3,
-	Forbidden = 4,
-	Timeout = 5,
+	Unknown = 2,
+	InvalidArgument = 3,
+	DeadlineExceeded = 4,
+	NotFound = 5,
+	AlreadyExists = 6,
+	PermissionDenied = 7,
+	ResourceExhausted = 8,
+	FailedPrecondition = 9,
+	Aborted = 10,
+	OutOfRange = 11,
+	Unimplemented = 12,
+	Internal = 13,
+	Unavailable = 14,
+	DataLoss = 15,
+	Unauthenticated = 16,
 }
 
 /// Policy trait a user implements to decide message acceptance.
@@ -74,15 +100,15 @@ pub struct AcceptAllGate;
 
 impl GatePolicy for AcceptAllGate {
 	fn evaluate(&self, _: &Frame) -> TransitStatus {
-		TransitStatus::Accepted
+		TransitStatus::Ok
 	}
 }
 
 /// Gate that requires every frame to carry a valid frame integrity (FI) digest.
 ///
-/// A frame is [`TransitStatus::Accepted`] only when it carries an FI value that
+/// A frame is [`TransitStatus::Ok`] only when it carries an FI value that
 /// recomputes to the same digest under `D`. Every other case is rejected with
-/// [`TransitStatus::Forbidden`].
+/// [`TransitStatus::PermissionDenied`].
 #[cfg(feature = "digest")]
 pub struct FrameIntegrityGate<D> {
 	_marker: core::marker::PhantomData<fn() -> D>,
@@ -102,8 +128,8 @@ where
 {
 	fn evaluate(&self, message: &Frame) -> TransitStatus {
 		match message.verify_frame_integrity::<D>() {
-			Ok(true) => TransitStatus::Accepted,
-			_ => TransitStatus::Forbidden,
+			Ok(true) => TransitStatus::Ok,
+			_ => TransitStatus::PermissionDenied,
 		}
 	}
 }
@@ -159,10 +185,7 @@ mod tests {
 	#[test]
 	fn accepts_intact_frame() {
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
-		assert!(matches!(
-			gate.evaluate(&create_frame_with_frame_integrity()),
-			TransitStatus::Accepted
-		));
+		assert!(matches!(gate.evaluate(&create_frame_with_frame_integrity()), TransitStatus::Ok));
 	}
 
 	#[test]
@@ -170,7 +193,7 @@ mod tests {
 		let mut frame = create_frame_with_frame_integrity();
 		frame.metadata.id = b"tampered".to_vec();
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
-		assert!(matches!(gate.evaluate(&frame), TransitStatus::Forbidden));
+		assert!(matches!(gate.evaluate(&frame), TransitStatus::PermissionDenied));
 	}
 
 	#[test]
@@ -178,6 +201,6 @@ mod tests {
 		let message = create_test_message(None);
 		let frame = compose! { V0: id: "gate-no-fi", order: 1u64, message: message }.unwrap();
 		let gate = FrameIntegrityGate::<Sha3_256>::default();
-		assert!(matches!(gate.evaluate(&frame), TransitStatus::Forbidden));
+		assert!(matches!(gate.evaluate(&frame), TransitStatus::PermissionDenied));
 	}
 }

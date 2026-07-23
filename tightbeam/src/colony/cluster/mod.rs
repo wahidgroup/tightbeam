@@ -373,14 +373,14 @@ mod tests {
 	#[test]
 	fn work_response_ok() {
 		let response = ClusterWorkResponse::ok(b"test".to_vec());
-		assert_eq!(response.status, TransitStatus::Accepted);
+		assert_eq!(response.status, TransitStatus::Ok);
 		assert_eq!(response.payload, Some(b"test".to_vec()));
 	}
 
 	#[test]
 	fn work_response_err() {
-		let response = ClusterWorkResponse::err(TransitStatus::Forbidden);
-		assert_eq!(response.status, TransitStatus::Forbidden);
+		let response = ClusterWorkResponse::err(TransitStatus::PermissionDenied);
+		assert_eq!(response.status, TransitStatus::PermissionDenied);
 		assert!(response.payload.is_none());
 	}
 

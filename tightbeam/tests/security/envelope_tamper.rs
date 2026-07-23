@@ -62,7 +62,7 @@ tb_assert_spec! {
 	pub EnvelopeTamperSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(tamper_deleted_envelope_detected, exactly!(1), equals!(true)),
 			(tamper_replayed_envelope_detected, exactly!(1), equals!(true))

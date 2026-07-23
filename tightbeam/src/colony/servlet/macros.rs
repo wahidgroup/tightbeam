@@ -142,7 +142,7 @@ macro_rules! __servlet_create_server {
 
 										let frame_owned = ::std::sync::Arc::try_unwrap(frame_arc)
 											.unwrap_or_else(|arc| arc.as_ref().clone());
-										let response = if status == $crate::policy::TransitStatus::Accepted {
+										let response = if status == $crate::policy::TransitStatus::Ok {
 											let ctx_for_handler = ::std::sync::Arc::clone(&ctx_clone);
 											let result: Result<Option<$crate::Frame>, $crate::TightBeamError> =
 												async move {

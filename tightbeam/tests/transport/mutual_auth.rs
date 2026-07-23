@@ -143,7 +143,7 @@ tb_assert_spec! {
 	MutualAuthSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(response_received, exactly!(1), equals!(IsSome)),
 			(server_id, exactly!(1), equals!("mutual-auth-server")),
@@ -207,7 +207,7 @@ tb_assert_spec! {
 	pub InvalidClientSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: []
 	}
 }
@@ -263,7 +263,7 @@ tb_assert_spec! {
 	pub InvalidServerSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: []
 	}
 }

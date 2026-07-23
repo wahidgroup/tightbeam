@@ -37,20 +37,44 @@ pub enum TransportFailure {
 	/// Inbound AEAD sequence violation: replay, reorder, or deletion of an
 	/// envelope on the connection (CWE-345)
 	TamperDetected,
-	/// Gate policy rejected (busy)
-	Busy,
 	/// Local stream cap exhausted on a multiplexed connection: every
 	/// concurrent stream slot is in flight. Retry after a response frees
 	/// a slot, or open another connection
 	StreamsExhausted,
-	/// Gate policy rejected (forbidden)
-	Forbidden,
-	/// Gate policy rejected (unauthorized)
-	Unauthorized,
-	/// Gate policy rejected (timeout)
-	Timeout,
 	/// Gate policy rejected (general)
 	PolicyRejection,
+	/// Peer refusal: the caller cancelled the operation
+	Cancelled,
+	/// Peer refusal: unclassified server failure
+	Unknown,
+	/// Peer refusal: the request is malformed regardless of system state
+	InvalidArgument,
+	/// Peer refusal: the peer gave up waiting
+	DeadlineExceeded,
+	/// Peer refusal: the requested entity does not exist
+	NotFound,
+	/// Peer refusal: the entity already exists
+	AlreadyExists,
+	/// Peer refusal: the caller is identified but refused authorization
+	PermissionDenied,
+	/// Peer refusal: capacity exhausted, retry with backoff may succeed
+	ResourceExhausted,
+	/// Peer refusal: system state must change before a retry can succeed
+	FailedPrecondition,
+	/// Peer refusal: concurrency conflict, retry at a higher level
+	Aborted,
+	/// Peer refusal: the operation ran past a valid range
+	OutOfRange,
+	/// Peer refusal: no handler answers the requested operation
+	Unimplemented,
+	/// Peer refusal: the peer broke an internal invariant
+	Internal,
+	/// Peer refusal: transient unavailability such as a draining peer
+	Unavailable,
+	/// Peer refusal: unrecoverable data loss or corruption
+	DataLoss,
+	/// Peer refusal: the caller lacks valid authentication credentials
+	Unauthenticated,
 }
 
 /// Transport error types
@@ -166,15 +190,40 @@ impl From<TightBeamError> for TransportError {
 	}
 }
 
+impl TryFrom<TransitStatus> for TransportFailure {
+	type Error = TransportError;
+
+	fn try_from(status: TransitStatus) -> core::result::Result<Self, Self::Error> {
+		let failure = match status {
+			// A success status is not convertible to a failure
+			TransitStatus::Ok => return Err(TransportError::InvalidMessage),
+			TransitStatus::Cancelled => TransportFailure::Cancelled,
+			TransitStatus::Unknown => TransportFailure::Unknown,
+			TransitStatus::InvalidArgument => TransportFailure::InvalidArgument,
+			TransitStatus::DeadlineExceeded => TransportFailure::DeadlineExceeded,
+			TransitStatus::NotFound => TransportFailure::NotFound,
+			TransitStatus::AlreadyExists => TransportFailure::AlreadyExists,
+			TransitStatus::PermissionDenied => TransportFailure::PermissionDenied,
+			TransitStatus::ResourceExhausted => TransportFailure::ResourceExhausted,
+			TransitStatus::FailedPrecondition => TransportFailure::FailedPrecondition,
+			TransitStatus::Aborted => TransportFailure::Aborted,
+			TransitStatus::OutOfRange => TransportFailure::OutOfRange,
+			TransitStatus::Unimplemented => TransportFailure::Unimplemented,
+			TransitStatus::Internal => TransportFailure::Internal,
+			TransitStatus::Unavailable => TransportFailure::Unavailable,
+			TransitStatus::DataLoss => TransportFailure::DataLoss,
+			TransitStatus::Unauthenticated => TransportFailure::Unauthenticated,
+		};
+
+		Ok(failure)
+	}
+}
+
 impl From<TransitStatus> for TransportError {
 	fn from(status: TransitStatus) -> Self {
-		match status {
-			TransitStatus::Request => TransportError::InvalidMessage,
-			TransitStatus::Accepted => TransportError::InvalidMessage,
-			TransitStatus::Busy => TransportError::OperationFailed(TransportFailure::Busy),
-			TransitStatus::Unauthorized => TransportError::OperationFailed(TransportFailure::Unauthorized),
-			TransitStatus::Forbidden => TransportError::OperationFailed(TransportFailure::Forbidden),
-			TransitStatus::Timeout => TransportError::OperationFailed(TransportFailure::Timeout),
+		match TransportFailure::try_from(status) {
+			Ok(failure) => TransportError::OperationFailed(failure),
+			Err(error) => error,
 		}
 	}
 }
@@ -224,7 +273,7 @@ impl From<tokio_rt::JoinError> for TransportError {
 #[cfg(feature = "tokio")]
 impl From<tokio_rt::Elapsed> for TransportError {
 	fn from(_: tokio_rt::Elapsed) -> Self {
-		TransportError::OperationFailed(TransportFailure::Timeout)
+		TransportError::OperationFailed(TransportFailure::DeadlineExceeded)
 	}
 }
 
@@ -274,7 +323,7 @@ impl TransportError {
 			self,
 			TransportError::ConnectionClosed
 				| TransportError::ConnectionFailed
-				| TransportError::OperationFailed(TransportFailure::Timeout)
+				| TransportError::OperationFailed(TransportFailure::DeadlineExceeded)
 		) || {
 			#[cfg(feature = "std")]
 			{
@@ -311,6 +360,63 @@ impl TransportFailure {
 			self.with_frame(frame)
 		} else {
 			self.into()
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	struct StatusMappingCase {
+		status: TransitStatus,
+		expected: TransportFailure,
+	}
+
+	fn refusal_cases() -> Vec<StatusMappingCase> {
+		vec![
+			StatusMappingCase { status: TransitStatus::Cancelled, expected: TransportFailure::Cancelled },
+			StatusMappingCase { status: TransitStatus::Unknown, expected: TransportFailure::Unknown },
+			StatusMappingCase {
+				status: TransitStatus::InvalidArgument,
+				expected: TransportFailure::InvalidArgument,
+			},
+			StatusMappingCase {
+				status: TransitStatus::DeadlineExceeded,
+				expected: TransportFailure::DeadlineExceeded,
+			},
+			StatusMappingCase { status: TransitStatus::NotFound, expected: TransportFailure::NotFound },
+			StatusMappingCase { status: TransitStatus::AlreadyExists, expected: TransportFailure::AlreadyExists },
+			StatusMappingCase {
+				status: TransitStatus::PermissionDenied,
+				expected: TransportFailure::PermissionDenied,
+			},
+			StatusMappingCase {
+				status: TransitStatus::ResourceExhausted,
+				expected: TransportFailure::ResourceExhausted,
+			},
+			StatusMappingCase {
+				status: TransitStatus::FailedPrecondition,
+				expected: TransportFailure::FailedPrecondition,
+			},
+			StatusMappingCase { status: TransitStatus::Aborted, expected: TransportFailure::Aborted },
+			StatusMappingCase { status: TransitStatus::OutOfRange, expected: TransportFailure::OutOfRange },
+			StatusMappingCase { status: TransitStatus::Unimplemented, expected: TransportFailure::Unimplemented },
+			StatusMappingCase { status: TransitStatus::Internal, expected: TransportFailure::Internal },
+			StatusMappingCase { status: TransitStatus::Unavailable, expected: TransportFailure::Unavailable },
+			StatusMappingCase { status: TransitStatus::DataLoss, expected: TransportFailure::DataLoss },
+			StatusMappingCase {
+				status: TransitStatus::Unauthenticated,
+				expected: TransportFailure::Unauthenticated,
+			},
+		]
+	}
+
+	#[test]
+	fn refusal_statuses_surface_their_failure() {
+		for case in refusal_cases() {
+			let error = TransportError::from(case.status);
+			assert!(matches!(error, TransportError::OperationFailed(failure) if failure == case.expected));
 		}
 	}
 }

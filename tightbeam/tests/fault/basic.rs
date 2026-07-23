@@ -128,7 +128,7 @@ tb_assert_spec! {
 	pub DeterministicSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(request, at_least!(1)),
 			(response, at_least!(0)),
@@ -210,7 +210,7 @@ tb_assert_spec! {
 	pub ProbabilisticSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(request, at_least!(1)),
 			(response, at_least!(0))
@@ -293,7 +293,7 @@ tb_assert_spec! {
 	pub MultiFaultSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(request, at_least!(1)),
 			(retry, at_least!(0)),
@@ -385,7 +385,7 @@ tightbeam::tb_assert_spec! {
 	pub CoverageSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(request, exactly!(1)),
 			(response, at_least!(0)),

@@ -224,9 +224,13 @@ impl<T: Message> FrameBuilder<T> {
 		self
 	}
 
-	/// Set the order (Unix order in seconds)
-	pub fn with_order(mut self, seconds: u64) -> Self {
-		self.metadata_builder = self.metadata_builder.with_order(seconds);
+	/// Set the order.
+	///
+	/// The value is protocol-opaque: any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted, the
+	/// build defaults it to the current Unix time in seconds.
+	pub fn with_order(mut self, order: u64) -> Self {
+		self.metadata_builder = self.metadata_builder.with_order(order);
 		self
 	}
 

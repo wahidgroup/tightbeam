@@ -46,7 +46,7 @@ tb_assert_spec! {
 	pub ChessAssertSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			// Core requirement: at least one move must be sent
 			(client_move_sent, at_least!(1)),

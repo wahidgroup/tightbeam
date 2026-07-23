@@ -39,7 +39,7 @@ tb_assert_spec! {
 	pub NonceReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(nonce_capture_valid, exactly!(BACKEND_COUNT_U32)),
 			(nonce_first_use, exactly!(BACKEND_COUNT_U32)),

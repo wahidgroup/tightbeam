@@ -342,7 +342,7 @@ macro_rules! cluster {
 		// list is indistinguishable from an open gateway.
 		for policy in $config.policies.iter() {
 			let status = $crate::policy::GatePolicy::evaluate(policy.as_ref(), &$frame);
-			if status != $crate::policy::TransitStatus::Accepted {
+			if status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@reply $frame,
 					$crate::colony::cluster::ClusterWorkResponse::err(status)
 				);
@@ -356,14 +356,14 @@ macro_rules! cluster {
 		#[cfg(feature = "x509")]
 		let verify_hive_origin = || match $config.tls.hive_trust.as_ref() {
 			Some(trust) => match $crate::colony::hive::verify_frame_signature(trust.as_ref(), &$frame) {
-				$crate::colony::hive::TrustVerification::Verified => $crate::policy::TransitStatus::Accepted,
-				$crate::colony::hive::TrustVerification::MissingSignature => $crate::policy::TransitStatus::Unauthorized,
-				_ => $crate::policy::TransitStatus::Forbidden,
+				$crate::colony::hive::TrustVerification::Verified => $crate::policy::TransitStatus::Ok,
+				$crate::colony::hive::TrustVerification::MissingSignature => $crate::policy::TransitStatus::Unauthenticated,
+				_ => $crate::policy::TransitStatus::PermissionDenied,
 			},
-			None => $crate::policy::TransitStatus::Forbidden,
+			None => $crate::policy::TransitStatus::PermissionDenied,
 		};
 		#[cfg(not(feature = "x509"))]
-		let verify_hive_origin = || $crate::policy::TransitStatus::Accepted;
+		let verify_hive_origin = || $crate::policy::TransitStatus::Ok;
 
 		// Signed control frames must additionally be fresh and unseen: a
 		// captured registration or address update carries a valid signature,
@@ -372,26 +372,26 @@ macro_rules! cluster {
 		let verify_control_freshness = |issued_at_ms: u64| {
 			let now = $crate::colony::common::current_timestamp_ms();
 			if !$replay_guard.is_fresh(issued_at_ms, now) {
-				return $crate::policy::TransitStatus::Forbidden;
+				return $crate::policy::TransitStatus::PermissionDenied;
 			}
 
 			let Some(signer_info) = $frame.nonrepudiation.as_ref() else {
-				return $crate::policy::TransitStatus::Unauthorized;
+				return $crate::policy::TransitStatus::Unauthenticated;
 			};
 
 			// Signer identifier keys the replay partition; an unencodable
 			// identifier cannot be attributed.
 			let Ok(signer_id) = $crate::der::Encode::to_der(&signer_info.sid) else {
-				return $crate::policy::TransitStatus::Forbidden;
+				return $crate::policy::TransitStatus::PermissionDenied;
 			};
 			if !$replay_guard.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now) {
-				return $crate::policy::TransitStatus::Forbidden;
+				return $crate::policy::TransitStatus::PermissionDenied;
 			}
 
-			$crate::policy::TransitStatus::Accepted
+			$crate::policy::TransitStatus::Ok
 		};
 		#[cfg(not(feature = "x509"))]
-		let verify_control_freshness = |_issued_at_ms: u64| $crate::policy::TransitStatus::Accepted;
+		let verify_control_freshness = |_issued_at_ms: u64| $crate::policy::TransitStatus::Ok;
 
 		// Single decode of the CHOICE envelope: the tag discriminates
 		// the request type. Undecodable input is rejected fail-closed.
@@ -399,7 +399,7 @@ macro_rules! cluster {
 			Ok(request) => request,
 			Err(_) => {
 				return $crate::cluster!(@reply $frame,
-					$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Forbidden)
+					$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::PermissionDenied)
 				);
 			}
 		};
@@ -407,7 +407,7 @@ macro_rules! cluster {
 		match cluster_request {
 		$crate::colony::common::ClusterRequest::RegisterHive(request) => {
 			let origin_status = verify_hive_origin();
-			if origin_status != $crate::policy::TransitStatus::Accepted {
+			if origin_status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::RegisterHiveResponse {
 					status: origin_status,
 					hive_id: None,
@@ -415,7 +415,7 @@ macro_rules! cluster {
 			}
 
 			let freshness_status = verify_control_freshness(request.issued_at_ms);
-			if freshness_status != $crate::policy::TransitStatus::Accepted {
+			if freshness_status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::RegisterHiveResponse {
 					status: freshness_status,
 					hive_id: None,
@@ -470,7 +470,7 @@ macro_rules! cluster {
 
 			let response = match registered {
 				Ok(()) => $crate::colony::hive::RegisterHiveResponse {
-					status: $crate::policy::TransitStatus::Accepted,
+					status: $crate::policy::TransitStatus::Ok,
 					hive_id: Some(hive_addr.to_vec()),
 				},
 				Err(_) => {
@@ -484,7 +484,7 @@ macro_rules! cluster {
 					}
 
 					$crate::colony::hive::RegisterHiveResponse {
-						status: $crate::policy::TransitStatus::Forbidden,
+						status: $crate::policy::TransitStatus::PermissionDenied,
 						hive_id: None,
 					}
 				}
@@ -495,14 +495,14 @@ macro_rules! cluster {
 
 		$crate::colony::common::ClusterRequest::ServletAddressUpdate(update) => {
 			let origin_status = verify_hive_origin();
-			if origin_status != $crate::policy::TransitStatus::Accepted {
+			if origin_status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
 					status: origin_status,
 				});
 			}
 
 			let freshness_status = verify_control_freshness(update.issued_at_ms);
-			if freshness_status != $crate::policy::TransitStatus::Accepted {
+			if freshness_status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
 					status: freshness_status,
 				});
@@ -532,7 +532,7 @@ macro_rules! cluster {
 					}
 
 					return $crate::cluster!(@reply $frame, $crate::colony::hive::ServletAddressUpdateResponse {
-						status: $crate::policy::TransitStatus::Forbidden,
+						status: $crate::policy::TransitStatus::PermissionDenied,
 					});
 				}
 			}
@@ -554,7 +554,7 @@ macro_rules! cluster {
 			let removed: Vec<&[u8]> = update.removed.iter().map(|address| address.as_slice()).collect();
 			let updated = $servlet_registry.apply_address_update(&hive_id, added, &removed);
 			let status = match updated {
-				Ok(()) => $crate::policy::TransitStatus::Accepted,
+				Ok(()) => $crate::policy::TransitStatus::Ok,
 				Err(_) => {
 					// Release the replay record so the hive can resend the
 					// same signed update after the failure clears.
@@ -563,7 +563,7 @@ macro_rules! cluster {
 						$replay_guard.forget(signer_info.signature.as_bytes());
 					}
 
-					$crate::policy::TransitStatus::Forbidden
+					$crate::policy::TransitStatus::PermissionDenied
 				}
 			};
 
@@ -576,7 +576,7 @@ macro_rules! cluster {
 				Ok(e) if !e.is_empty() => e,
 				_ => {
 					return $crate::cluster!(@reply $frame,
-						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Busy)
+						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Unavailable)
 					);
 				}
 			};
@@ -602,7 +602,7 @@ macro_rules! cluster {
 				Some(idx) => idx,
 				None => {
 					return $crate::cluster!(@reply $frame,
-						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Busy)
+						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Unavailable)
 					);
 				}
 			};
@@ -626,7 +626,7 @@ macro_rules! cluster {
 					// Weaken on failure using configured penalty
 					let _ = $servlet_registry.weaken_with_penalty(&selected_entry.address, $config.pheromone.weakening_penalty);
 					return $crate::cluster!(@reply $frame,
-						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Busy)
+						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Unavailable)
 					);
 				}
 			}
@@ -734,13 +734,13 @@ macro_rules! cluster {
 	// Helper: Process heartbeat result - updates registry based on success/failure
 	(@process_heartbeat_result $registry:expr, $servlet_registry:expr, $hive_addr:expr, $result:expr, $max_failures:expr, $config:expr) => {
 		// A decoded heartbeat only proves the hive answered, not that it is
-		// healthy: gate rejections (Forbidden/Unauthorized) come back
+		// healthy: gate rejections (PermissionDenied/Unauthenticated) come back
 		// heartbeat-shaped and must count as failures.
 		let alive = matches!(
 			&$result,
 			Ok(hb) if matches!(
 				hb.status,
-				$crate::policy::TransitStatus::Accepted | $crate::policy::TransitStatus::Busy
+				$crate::policy::TransitStatus::Ok | $crate::policy::TransitStatus::ResourceExhausted
 			)
 		);
 

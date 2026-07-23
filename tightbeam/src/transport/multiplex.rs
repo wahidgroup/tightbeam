@@ -609,17 +609,18 @@ mod router {
 
 	fn cancel_error(reason: CancelReason) -> TransportError {
 		match reason {
-			CancelReason::Cancelled => TransportError::OperationFailed(TransportFailure::PolicyRejection),
-			CancelReason::Timeout => TransportError::OperationFailed(TransportFailure::Timeout),
-			CancelReason::Rejected => TransportError::OperationFailed(TransportFailure::Busy),
-			// Application codes carry no transport-failure mapping of their own
-			CancelReason::Application(_) => TransportError::OperationFailed(TransportFailure::PolicyRejection),
+			CancelReason::Cancelled => TransportError::OperationFailed(TransportFailure::Cancelled),
+			CancelReason::Timeout => TransportError::OperationFailed(TransportFailure::DeadlineExceeded),
+			CancelReason::Rejected => TransportError::OperationFailed(TransportFailure::ResourceExhausted),
+			// An app-coded cancel is still a cancel; the code itself
+			// carries no transport-failure mapping of its own
+			CancelReason::Application(_) => TransportError::OperationFailed(TransportFailure::Cancelled),
 		}
 	}
 
 	fn resolve_response(response: ResponsePackage) -> TransportResult<Option<Frame>> {
 		match response.status() {
-			TransitStatus::Accepted => Ok(response.message.map(unwrap_frame)),
+			TransitStatus::Ok => Ok(response.message.map(unwrap_frame)),
 			status => Err(TransportError::from(status)),
 		}
 	}
@@ -647,7 +648,7 @@ mod router {
 		///
 		/// # Errors
 		/// - `OperationFailed(StreamsExhausted)`: local-initiated cap exhausted
-		/// - `OperationFailed(Busy)`: the peer refused the stream
+		/// - `OperationFailed(ResourceExhausted)`: the peer refused the stream
 		/// - `Draining`: GoAway sent or received. No new streams
 		/// - `ConnectionClosed`: connection failed before the response
 		pub async fn emit_on_stream(&self, frame: &Frame) -> TransportResult<Option<Frame>> {
@@ -940,7 +941,7 @@ mod router {
 			}
 
 			// Resolve before decoding: stale ends are discarded without
-			// inspecting their payload, and non-Accepted trailers never
+			// inspecting their payload, and non-Ok trailers never
 			// contribute a frame, so garbage bytes on either cannot tear
 			// down the connection.
 			let Some(sender) = self.shared.remove_pending(stream_id) else {
@@ -948,7 +949,7 @@ mod router {
 			};
 
 			let message = match package.status() {
-				TransitStatus::Accepted => self.decode_stream_frame(package.payload())?,
+				TransitStatus::Ok => self.decode_stream_frame(package.payload())?,
 				_ => None,
 			};
 
@@ -1092,7 +1093,7 @@ mod router {
 	/// Serves peer-initiated streams with a caller-supplied handler.
 	///
 	/// Handlers for distinct streams run concurrently (no head-of-line
-	/// blocking). Cap exhaustion answers with [`TransitStatus::Busy`]. A
+	/// blocking). Cap exhaustion answers with [`TransitStatus::ResourceExhausted`]. A
 	/// peer cancel aborts the in-flight handler and sends no response.
 	///
 	/// Cancels of in-flight handlers draw on a per-connection budget
@@ -1145,7 +1146,8 @@ mod router {
 						last_stream_id = stream_id;
 
 						if in_flight.len() >= cap_as_usize(self.peer_cap) {
-							self.respond(stream_id, ResponsePackage::new(TransitStatus::Busy, None)).await?;
+							self.respond(stream_id, ResponsePackage::new(TransitStatus::ResourceExhausted, None))
+								.await?;
 							continue;
 						}
 
@@ -1667,10 +1669,10 @@ mod router {
 		#[test]
 		fn test_cancel_reason_error_mapping() {
 			for (reason, failure) in [
-				(CancelReason::Rejected, TransportFailure::Busy),
-				(CancelReason::Timeout, TransportFailure::Timeout),
-				(CancelReason::Cancelled, TransportFailure::PolicyRejection),
-				(CancelReason::Application(0x1000), TransportFailure::PolicyRejection),
+				(CancelReason::Rejected, TransportFailure::ResourceExhausted),
+				(CancelReason::Timeout, TransportFailure::DeadlineExceeded),
+				(CancelReason::Cancelled, TransportFailure::Cancelled),
+				(CancelReason::Application(0x1000), TransportFailure::Cancelled),
 			] {
 				assert_cancel_maps(reason, failure);
 			}

@@ -335,7 +335,7 @@ macro_rules! worker {
         let __result: ::core::result::Result<(), $crate::policy::TransitStatus> = (|| {
             for gate in $policies.receptor_gates().iter() {
                 let status = gate.evaluate($message.as_ref());
-                if status != $crate::policy::TransitStatus::Accepted {
+                if status != $crate::policy::TransitStatus::Ok {
                     return Err(status);
                 }
             }

@@ -101,7 +101,7 @@ tb_assert_spec! {
 	pub ValidTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(pointA, exactly!(4)),
 			(pointB, exactly!(1))
@@ -142,7 +142,7 @@ tb_assert_spec! {
 	pub InvalidTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(pointA, exactly!(1)),
 			(pointB, exactly!(4))
@@ -185,7 +185,7 @@ tb_assert_spec! {
 	pub DeuceTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(pointA, exactly!(5)),
 			(pointB, exactly!(3))
@@ -228,7 +228,7 @@ tb_assert_spec! {
 	pub FailuresTennisSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(pointA, exactly!(2)),
 			(pointB, exactly!(1))

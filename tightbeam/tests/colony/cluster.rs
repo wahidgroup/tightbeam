@@ -161,7 +161,7 @@ fn assert_register_status(
 ) {
 	assert_eq!(response.status, status);
 	assert_eq!(cluster.hive_count(), hive_count);
-	if status != TransitStatus::Accepted {
+	if status != TransitStatus::Ok {
 		assert!(response.hive_id.is_none(), "rejected registration must not assign a hive id");
 	}
 }
@@ -280,7 +280,7 @@ tb_assert_spec! {
 	pub ClusterRoutingSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(work_sent, exactly!(1)),
 			(routing_accepted, exactly!(1))
@@ -339,7 +339,7 @@ async fn assert_ping_work_routes(
 	let response_frame = emit_frame(&mut client, frame).await?;
 
 	let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
-	assert_eq!(work_response.status, TransitStatus::Accepted, "routed work must be accepted");
+	assert_eq!(work_response.status, TransitStatus::Ok, "routed work must be accepted");
 
 	let payload = work_response.payload.expect("accepted work must carry a payload");
 	let ping_response: PingResponse = decode(&payload)?;
@@ -395,7 +395,7 @@ tb_assert_spec! {
 	pub ClusterTeardownSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(hive_registered, exactly!(1), equals!(1u64)),
 			(servlet_stopped, exactly!(1))
@@ -456,7 +456,7 @@ struct RejectAllPolicy;
 
 impl GatePolicy for RejectAllPolicy {
 	fn evaluate(&self, _message: &Frame) -> TransitStatus {
-		TransitStatus::Forbidden
+		TransitStatus::PermissionDenied
 	}
 }
 
@@ -464,7 +464,7 @@ tb_assert_spec! {
 	pub ClusterPolicySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(work_sent, exactly!(1)),
 			(policy_blocked, exactly!(1))
@@ -505,7 +505,7 @@ tb_scenario! {
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
 			assert_eq!(
 				work_response.status,
-				TransitStatus::Forbidden,
+				TransitStatus::PermissionDenied,
 				"gate policy must reject the request before decoding"
 			);
 			assert!(work_response.payload.is_none(), "rejected request must not carry a payload");
@@ -527,7 +527,7 @@ tb_assert_spec! {
 	pub ClusterUnsignedRegistrationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(registration_sent, exactly!(1)),
 			(registration_unauthorized, exactly!(1))
@@ -562,7 +562,7 @@ tb_scenario! {
 			trace.event(ClusterUnsignedRegistrationSpec::registration_sent)?;
 
 			let response = hive.register_with_cluster(cluster_addr).await?;
-			assert_register_status(&response, TransitStatus::Unauthorized, 0, &cluster);
+			assert_register_status(&response, TransitStatus::Unauthenticated, 0, &cluster);
 
 			trace.event(ClusterUnsignedRegistrationSpec::registration_unauthorized)?;
 
@@ -582,7 +582,7 @@ tb_assert_spec! {
 	pub ClusterNoTrustStoreSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(registration_sent, exactly!(1)),
 			(registration_forbidden, exactly!(1))
@@ -623,7 +623,7 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, signed).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_register_status(&response, TransitStatus::Forbidden, 0, &cluster);
+			assert_register_status(&response, TransitStatus::PermissionDenied, 0, &cluster);
 
 			trace.event(ClusterNoTrustStoreSpec::registration_forbidden)?;
 
@@ -642,7 +642,7 @@ tb_assert_spec! {
 	pub ClusterReplaySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(fresh_registration_accepted, exactly!(1)),
 			(replayed_registration_rejected, exactly!(1)),
@@ -676,14 +676,14 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, fresh).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_register_status(&response, TransitStatus::Accepted, 1, &cluster);
+			assert_register_status(&response, TransitStatus::Ok, 1, &cluster);
 
 			trace.event(ClusterReplaySpec::fresh_registration_accepted)?;
 
 			// Byte-identical resend carries an already-seen signature
 			let response_frame = emit_frame(&mut client, replayed).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_eq!(response.status, TransitStatus::Forbidden, "replayed registration must be rejected");
+			assert_eq!(response.status, TransitStatus::PermissionDenied, "replayed registration must be rejected");
 
 			trace.event(ClusterReplaySpec::replayed_registration_rejected)?;
 
@@ -698,7 +698,7 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, stale).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_eq!(response.status, TransitStatus::Forbidden, "stale registration must be rejected");
+			assert_eq!(response.status, TransitStatus::PermissionDenied, "stale registration must be rejected");
 
 			trace.event(ClusterReplaySpec::stale_registration_rejected)?;
 
@@ -712,13 +712,13 @@ tb_scenario! {
 
 			let response_frame = emit_frame(&mut client, fresh_update).await?;
 			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
-			assert_eq!(response.status, TransitStatus::Accepted, "fresh signed update must be accepted");
+			assert_eq!(response.status, TransitStatus::Ok, "fresh signed update must be accepted");
 
 			trace.event(ClusterReplaySpec::fresh_update_accepted)?;
 
 			let response_frame = emit_frame(&mut client, replayed_update).await?;
 			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
-			assert_eq!(response.status, TransitStatus::Forbidden, "replayed update must be rejected");
+			assert_eq!(response.status, TransitStatus::PermissionDenied, "replayed update must be rejected");
 
 			trace.event(ClusterReplaySpec::replayed_update_rejected)?;
 
@@ -737,7 +737,7 @@ tb_assert_spec! {
 	pub ClusterHeartbeatRejectionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(hive_registered, exactly!(1)),
 			(rejected_heartbeat_decoded, exactly!(1)),
@@ -804,12 +804,12 @@ tb_scenario! {
 			let mut client = connect_cluster(certs, cluster_addr).await?;
 			let response_frame = emit_frame(&mut client, registration).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
-			assert_register_status(&response, TransitStatus::Accepted, 1, &cluster);
+			assert_register_status(&response, TransitStatus::Ok, 1, &cluster);
 
 			trace.event(ClusterHeartbeatRejectionSpec::hive_registered)?;
 
 			// Heartbeats run every 100ms with max_failures = 1: the first
-			// Forbidden heartbeat must evict the hive
+			// PermissionDenied heartbeat must evict the hive
 			assert!(
 				wait_for_empty_registry(&cluster, 50, Duration::from_millis(100)).await,
 				"hive with rejected heartbeats must be evicted"
@@ -889,7 +889,7 @@ tb_assert_spec! {
 	pub ClusterCrossHiveUpdateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(hives_registered, exactly!(1)),
 			(cross_hive_update_forbidden, exactly!(1)),
@@ -919,8 +919,8 @@ tb_scenario! {
 
 			let response_a = register_signed_hive(&mut client, &certs.hive_a.1, b"reg-a", hive_a_addr).await?;
 			let response_b = register_signed_hive(&mut client, &certs.hive_b.1, b"reg-b", hive_b_addr).await?;
-			assert_eq!(response_a.status, TransitStatus::Accepted);
-			assert_eq!(response_b.status, TransitStatus::Accepted);
+			assert_eq!(response_a.status, TransitStatus::Ok);
+			assert_eq!(response_b.status, TransitStatus::Ok);
 			assert_eq!(cluster.hive_count(), 2);
 
 			trace.event(ClusterCrossHiveUpdateSpec::hives_registered)?;
@@ -930,14 +930,14 @@ tb_scenario! {
 					&certs.hive_b.1,
 					b"cross-update".as_slice(),
 					servlet_address_update(hive_a_addr, vec![servlet_info(b"poison", b"127.0.0.1:65099")]),
-					TransitStatus::Forbidden,
+					TransitStatus::PermissionDenied,
 					ClusterCrossHiveUpdateSpec::cross_hive_update_forbidden,
 				),
 				(
 					&certs.hive_a.1,
 					b"owner-update".as_slice(),
 					servlet_address_update(hive_a_addr, vec![servlet_info(b"ping", b"127.0.0.1:65012")]),
-					TransitStatus::Accepted,
+					TransitStatus::Ok,
 					ClusterCrossHiveUpdateSpec::owner_update_accepted,
 				),
 			];
@@ -958,7 +958,7 @@ tb_assert_spec! {
 	pub ClusterRegistrationHijackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(owner_registered, exactly!(1)),
 			(hijack_forbidden, exactly!(1)),
@@ -985,13 +985,13 @@ tb_scenario! {
 			let hive_a_addr = b"127.0.0.1:65020".as_slice();
 
 			let owner = register_signed_hive(&mut client, &certs.hive_a.1, b"owner-reg", hive_a_addr).await?;
-			assert_eq!(owner.status, TransitStatus::Accepted);
+			assert_eq!(owner.status, TransitStatus::Ok);
 			assert_eq!(cluster.hive_count(), 1);
 
 			trace.event(ClusterRegistrationHijackSpec::owner_registered)?;
 
 			let hijack = register_signed_hive(&mut client, &certs.hive_b.1, b"hijack-reg", hive_a_addr).await?;
-			assert_eq!(hijack.status, TransitStatus::Forbidden);
+			assert_eq!(hijack.status, TransitStatus::PermissionDenied);
 			assert_eq!(cluster.hive_count(), 1);
 
 			trace.event(ClusterRegistrationHijackSpec::hijack_forbidden)?;
@@ -1003,7 +1003,7 @@ tb_scenario! {
 				servlet_address_update(hive_a_addr, vec![servlet_info(b"ping", b"127.0.0.1:65021")]),
 			)
 			.await?;
-			assert_eq!(owned.status, TransitStatus::Accepted);
+			assert_eq!(owned.status, TransitStatus::Ok);
 
 			trace.event(ClusterRegistrationHijackSpec::owner_bind_intact)?;
 

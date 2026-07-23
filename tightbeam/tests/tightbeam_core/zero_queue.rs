@@ -277,9 +277,9 @@ impl GatePolicy for AdaptiveGate {
 		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata.order) {
 			// Emit trace event for test verification
 			let _ = self.trace.event_with(QueueFreeSpec::throttle_engaged, &[QUEUE_TAG], true);
-			TransitStatus::Busy
+			TransitStatus::ResourceExhausted
 		} else {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		}
 	}
 }
@@ -343,7 +343,7 @@ tb_assert_spec! {
 	pub QueueFreeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		tag_filter: [QUEUE_TAG],
 		assertions: [
 			(lag_tip, present!(), equals!(0u64)),

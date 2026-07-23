@@ -348,12 +348,12 @@ impl ReplayGuard {
 /// # Security Flow
 ///
 /// 1. Check circuit breaker - reject if open
-/// 2. Verify nonrepudiation signature present (else `Unauthorized`, not counted)
-/// 3. Verify frame integrity present (else `Unauthorized`, not counted)
-/// 4. Look up signer certificate in trust store (unknown signer: `Forbidden`, not counted)
-/// 5. Verify signature using certificate's public key (invalid: `Forbidden`, **counted**)
-/// 6. Decode the command and check `issued_at_ms` freshness (stale: `Forbidden`, not counted)
-/// 7. Reject signatures already seen inside the window (replay: `Forbidden`, not counted)
+/// 2. Verify nonrepudiation signature present (else `Unauthenticated`, not counted)
+/// 3. Verify frame integrity present (else `Unauthenticated`, not counted)
+/// 4. Look up signer certificate in trust store (unknown signer: `PermissionDenied`, not counted)
+/// 5. Verify signature using certificate's public key (invalid: `PermissionDenied`, **counted**)
+/// 6. Decode the command and check `issued_at_ms` freshness (stale: `PermissionDenied`, not counted)
+/// 7. Reject signatures already seen inside the window (replay: `PermissionDenied`, not counted)
 /// 8. On success: record success (resets breaker)
 ///
 /// Only step 5 counts toward the circuit breaker: it is the sole failure
@@ -393,56 +393,56 @@ impl ClusterSecurityGate {
 impl GatePolicy for ClusterSecurityGate {
 	fn evaluate(&self, frame: &Frame) -> TransitStatus {
 		if !self.circuit_breaker.allow_request() {
-			return TransitStatus::Forbidden;
+			return TransitStatus::PermissionDenied;
 		}
 
 		let Some(signer_info) = frame.nonrepudiation.as_ref() else {
-			return TransitStatus::Unauthorized;
+			return TransitStatus::Unauthenticated;
 		};
 
 		if frame.integrity.is_none() {
-			return TransitStatus::Unauthorized;
+			return TransitStatus::Unauthenticated;
 		}
 
 		match verify_frame_signature(self.trust_store.as_ref(), frame) {
-			TrustVerification::MissingSignature => return TransitStatus::Unauthorized,
-			TrustVerification::UnknownSigner => return TransitStatus::Forbidden,
+			TrustVerification::MissingSignature => return TransitStatus::Unauthenticated,
+			TrustVerification::UnknownSigner => return TransitStatus::PermissionDenied,
 			TrustVerification::Invalid => {
 				self.circuit_breaker.record_auth_failure();
-				return TransitStatus::Forbidden;
+				return TransitStatus::PermissionDenied;
 			}
 			TrustVerification::Verified => {}
 		}
 
 		let Ok(command) = crate::decode::<ClusterCommand>(&frame.message) else {
-			return TransitStatus::Forbidden;
+			return TransitStatus::PermissionDenied;
 		};
 
 		let now = current_timestamp_ms();
 		if !self.replay_guard.is_fresh(command.issued_at_ms, now) {
-			return TransitStatus::Forbidden;
+			return TransitStatus::PermissionDenied;
 		}
 		// Signer identifier keys the replay partition; an unencodable
 		// identifier cannot be attributed, so it fails closed.
 		let Ok(signer_id) = signer_info.sid.to_der() else {
-			return TransitStatus::Forbidden;
+			return TransitStatus::PermissionDenied;
 		};
 		if !self
 			.replay_guard
 			.check_and_insert(&signer_id, signer_info.signature.as_bytes(), now)
 		{
-			return TransitStatus::Forbidden;
+			return TransitStatus::PermissionDenied;
 		}
 
 		self.circuit_breaker.record_success();
 
-		TransitStatus::Accepted
+		TransitStatus::Ok
 	}
 }
 
 /// Gate policy enforcing hive capacity limits (backpressure)
 ///
-/// Returns `TransitStatus::Busy` when utilization exceeds threshold,
+/// Returns `TransitStatus::ResourceExhausted` when utilization exceeds threshold,
 /// signaling to the cluster that it should route work elsewhere or queue.
 ///
 /// The gate itself grants no exemptions: any bypass keyed on
@@ -476,9 +476,9 @@ impl GatePolicy for BackpressureGate {
 	fn evaluate(&self, _frame: &Frame) -> TransitStatus {
 		let current = self.utilization.load(Ordering::Relaxed);
 		if current >= self.threshold.get() {
-			TransitStatus::Busy
+			TransitStatus::ResourceExhausted
 		} else {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		}
 	}
 }
@@ -620,7 +620,7 @@ mod tests {
 		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
 
 		let frame = work_frame(Some(crate::MessagePriority::NetworkControl))?;
-		assert_eq!(GatePolicy::evaluate(&gate, &frame), TransitStatus::Busy);
+		assert_eq!(GatePolicy::evaluate(&gate, &frame), TransitStatus::ResourceExhausted);
 
 		Ok(())
 	}
@@ -631,7 +631,7 @@ mod tests {
 		let gate = BackpressureGate::new(utilization, BasisPoints::new_saturating(9_000));
 
 		let frame = work_frame(None)?;
-		assert_eq!(GatePolicy::evaluate(&gate, &frame), TransitStatus::Accepted);
+		assert_eq!(GatePolicy::evaluate(&gate, &frame), TransitStatus::Ok);
 
 		Ok(())
 	}

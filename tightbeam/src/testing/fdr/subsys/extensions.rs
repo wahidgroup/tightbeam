@@ -111,7 +111,7 @@ impl FdrTraceExt for ConsumedTrace {
 		}
 
 		// If gate accepted, we expect handler evidence (assertions or response)
-		if matches!(self.gate_decision, Some(TransitStatus::Accepted))
+		if matches!(self.gate_decision, Some(TransitStatus::Ok))
 			&& self.assertions.is_empty()
 			&& self.response.is_none()
 		{
@@ -131,18 +131,14 @@ impl FdrTraceExt for ConsumedTrace {
 		}
 
 		match self.gate_decision {
-			Some(TransitStatus::Accepted) => {
-				// Accepted path: should have response or assertions (indicating handler execution)
+			Some(TransitStatus::Ok) => {
+				// Ok path: should have response or assertions (indicating handler execution)
 				self.response.is_some() || !self.assertions.is_empty()
 			}
-			Some(TransitStatus::Busy)
-			| Some(TransitStatus::Unauthorized)
-			| Some(TransitStatus::Forbidden)
-			| Some(TransitStatus::Timeout) => {
-				// Rejection paths are terminal by definition
-				true
-			}
-			Some(TransitStatus::Request) | None => false, // No decision = incomplete execution
+			Some(TransitStatus::Unknown) | None => false, // No decision = incomplete execution
+			// Every other status is a rejection; rejection paths are
+			// terminal by definition
+			Some(_) => true,
 		}
 	}
 

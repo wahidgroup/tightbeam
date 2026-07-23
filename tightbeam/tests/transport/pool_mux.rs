@@ -8,7 +8,7 @@
 //! - `conn()` on a multiplexed lease reports `InvalidState`
 //! - Stream-cap exhaustion fails over to an additional connection
 //! - Failover at the pool cap reuses pooled stream headroom over dialing
-//! - Pool-capacity exhaustion surfaces `Busy` instead of failing over
+//! - Pool-capacity exhaustion surfaces `ResourceExhausted` instead of failing over
 //! - A peer that declines multiplexing yields an exclusive lease
 //! - A declined offer leaves an idle exclusive connection for reuse
 //! - A dead multiplexed connection is evicted and re-established
@@ -127,7 +127,7 @@ tb_assert_spec! {
 	pub MuxLeaseShareSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(first_lease_echoes, exactly!(1), equals!(true)),
 			(second_lease_echoes, exactly!(1), equals!(true))
@@ -167,7 +167,7 @@ tb_assert_spec! {
 	pub MuxLeaseConnSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(conn_reports_invalid_state, exactly!(1), equals!(true))
 		]
@@ -265,7 +265,7 @@ tb_assert_spec! {
 	pub MuxFailoverDialSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(overflow_emit_echoes_on_second_connection, exactly!(1), equals!(true)),
 			(held_emit_completes_after_release, exactly!(1), equals!(true))
@@ -304,7 +304,7 @@ tb_assert_spec! {
 	pub MuxFailoverReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(first_failover_echoes_on_new_dial, exactly!(1), equals!(true)),
 			(capped_failover_reuses_pooled_headroom, exactly!(1), equals!(true)),
@@ -315,7 +315,7 @@ tb_assert_spec! {
 
 // With the pool at `max_connections`, cap-exhaustion failover must move
 // onto the pooled connection with stream headroom instead of dialing
-// (a dial would report `Busy`).
+// (a dial would report `ResourceExhausted`).
 tb_scenario! {
 	name: pooled_mux_failover_reuses_pooled_headroom,
 	spec: MuxFailoverReuseSpec,
@@ -346,13 +346,13 @@ tb_scenario! {
 	}
 }
 
-// Pool-capacity exhaustion surfaces Busy
+// Pool-capacity exhaustion surfaces ResourceExhausted
 
 tb_assert_spec! {
 	pub MuxNoHeadroomSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(refused_emit_surfaces_busy, exactly!(1), equals!(true)),
 			(held_emit_completes_after_release, exactly!(1), equals!(true))
@@ -361,7 +361,7 @@ tb_assert_spec! {
 }
 
 // Server cap 1 with NO pool headroom: the second concurrent emit cannot
-// fail over and must surface the pool's `Busy`.
+// fail over and must surface the pool's `ResourceExhausted`.
 tb_scenario! {
 	name: pooled_mux_without_headroom_reports_busy,
 	spec: MuxNoHeadroomSpec,
@@ -379,7 +379,7 @@ tb_scenario! {
 			trace.event_with(
 				MuxNoHeadroomSpec::refused_emit_surfaces_busy,
 				&[],
-				matches!(refused, Err(TransportError::OperationFailed(TransportFailure::Busy))),
+				matches!(refused, Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))),
 			)?;
 
 			let held_completed = release_held_emit(&ctx, held_task).await?;
@@ -395,7 +395,7 @@ tb_assert_spec! {
 	pub MuxDeclinedFallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(declined_lease_is_exclusive, exactly!(1), equals!(true)),
 			(exclusive_lease_echoes, exactly!(1), equals!(true))
@@ -430,7 +430,7 @@ tb_assert_spec! {
 	pub MuxDeclinedIdleReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(reused_lease_is_exclusive, exactly!(1), equals!(true)),
 			(reused_lease_echoes, exactly!(1), equals!(true))
@@ -440,7 +440,7 @@ tb_assert_spec! {
 
 // After a declined offer, the returned exclusive connection is idle in the
 // pool: the next connect must reuse it instead of dialing (at cap 1, a
-// dial would report `Busy`).
+// dial would report `ResourceExhausted`).
 tb_scenario! {
 	name: pooled_mux_declined_reuses_idle_exclusive_lease,
 	spec: MuxDeclinedIdleReuseSpec,
@@ -528,7 +528,7 @@ async fn serve_manual_mux_connection(
 	let (_handle, reader_driver, writer_driver, responder) = mux.into_parts();
 
 	let echo = |frame: Arc<Frame>| {
-		let response = ResponsePackage::new(TransitStatus::Accepted, Some(Frame::clone(&frame)));
+		let response = ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(&frame)));
 		core::future::ready(response)
 	};
 	let spawned = vec![
@@ -563,7 +563,7 @@ tb_assert_spec! {
 	pub MuxEvictionSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(emit_echoes_before_teardown, exactly!(1), equals!(true)),
 			(emit_fails_on_dead_connection, exactly!(1), equals!(true)),
@@ -606,7 +606,7 @@ tb_assert_spec! {
 	pub MuxIdlePruneSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(emit_echoes_before_idle, exactly!(1), equals!(true)),
 			(fresh_connect_echoes_after_prune, exactly!(1), equals!(true)),
@@ -617,7 +617,7 @@ tb_assert_spec! {
 
 // An idle multiplexed connection is pruned after `idle_timeout`: the
 // pruned entry releases its pool slot (a cap-1 redial would otherwise
-// report `Busy`) and the next connect dials a fresh connection. The
+// report `ResourceExhausted`) and the next connect dials a fresh connection. The
 // manual server registers three tasks per connection, so a second
 // accepted connection doubles the registry.
 tb_scenario! {
@@ -653,7 +653,7 @@ tb_assert_spec! {
 	pub MuxServesSingleFlightSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(single_flight_echo_on_mux_server, exactly!(1), equals!(true))
 		]
@@ -704,7 +704,7 @@ struct ForbidAllGate;
 
 impl GatePolicy for ForbidAllGate {
 	fn evaluate(&self, _message: &Frame) -> TransitStatus {
-		TransitStatus::Forbidden
+		TransitStatus::PermissionDenied
 	}
 }
 
@@ -712,7 +712,7 @@ tb_assert_spec! {
 	pub MuxGateSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(gate_status_surfaces_to_client, exactly!(1), equals!(true)),
 			(handler_never_invoked, exactly!(1), equals!(true))
@@ -754,7 +754,7 @@ tb_scenario! {
 			trace.event_with(
 				MuxGateSpec::gate_status_surfaces_to_client,
 				&[],
-				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::Forbidden))),
+				matches!(outcome, Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))),
 			)?;
 
 			trace.event_with(MuxGateSpec::handler_never_invoked, &[], !ctx.handler_invoked.load(Ordering::SeqCst))?;

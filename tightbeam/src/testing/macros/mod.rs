@@ -367,7 +367,7 @@ macro_rules! tb_scenario {
 	(@build_hook_context $config:expr, $trace:expr, $exec_result:expr) => {{
 		let mut consumed_trace = $crate::trace::ConsumedTrace::new();
 		consumed_trace.populate_from_collector(&$trace);
-		consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Accepted);
+		consumed_trace.gate_decision = Some($crate::policy::TransitStatus::Ok);
 		if $exec_result.is_err() {
 			consumed_trace.error = Some($crate::transport::error::TransportError::InvalidMessage);
 		}

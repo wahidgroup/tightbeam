@@ -38,7 +38,7 @@ tb_assert_spec! {
 	pub ForwardSecrecySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(fs_capture_handshake, exactly!(HANDSHAKE_COUNT as u32)),
 			(fs_extract_ephemeral, exactly!(HANDSHAKE_COUNT as u32)),
