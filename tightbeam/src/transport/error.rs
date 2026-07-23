@@ -228,6 +228,36 @@ impl From<TransitStatus> for TransportError {
 	}
 }
 
+impl TryFrom<TransportFailure> for TransitStatus {
+	type Error = TransportError;
+
+	fn try_from(failure: TransportFailure) -> core::result::Result<Self, Self::Error> {
+		let status = match failure {
+			TransportFailure::Cancelled => TransitStatus::Cancelled,
+			TransportFailure::Unknown => TransitStatus::Unknown,
+			TransportFailure::InvalidArgument => TransitStatus::InvalidArgument,
+			TransportFailure::DeadlineExceeded => TransitStatus::DeadlineExceeded,
+			TransportFailure::NotFound => TransitStatus::NotFound,
+			TransportFailure::AlreadyExists => TransitStatus::AlreadyExists,
+			TransportFailure::PermissionDenied => TransitStatus::PermissionDenied,
+			TransportFailure::ResourceExhausted => TransitStatus::ResourceExhausted,
+			TransportFailure::FailedPrecondition => TransitStatus::FailedPrecondition,
+			TransportFailure::Aborted => TransitStatus::Aborted,
+			TransportFailure::OutOfRange => TransitStatus::OutOfRange,
+			TransportFailure::Unimplemented => TransitStatus::Unimplemented,
+			TransportFailure::Internal => TransitStatus::Internal,
+			TransportFailure::Unavailable => TransitStatus::Unavailable,
+			TransportFailure::DataLoss => TransitStatus::DataLoss,
+			TransportFailure::Unauthenticated => TransitStatus::Unauthenticated,
+			// Local-only failures (encoding, crypto, stream caps, ...)
+			// carry no wire status; the caller keeps the original error
+			local => return Err(TransportError::OperationFailed(local)),
+		};
+
+		Ok(status)
+	}
+}
+
 #[cfg(all(feature = "std", not(feature = "derive")))]
 crate::impl_from!(IoError => TransportError::IoError);
 #[cfg(not(feature = "derive"))]
@@ -418,5 +448,22 @@ mod tests {
 			let error = TransportError::from(case.status);
 			assert!(matches!(error, TransportError::OperationFailed(failure) if failure == case.expected));
 		}
+	}
+
+	#[test]
+	fn refusal_codes_survive_the_round_trip() {
+		for case in refusal_cases() {
+			let relayed = TransitStatus::try_from(case.expected);
+			assert!(matches!(relayed, Ok(status) if status == case.status));
+		}
+	}
+
+	#[test]
+	fn local_failures_have_no_wire_status() {
+		let relayed = TransitStatus::try_from(TransportFailure::EncodingFailed);
+		assert!(matches!(
+			relayed,
+			Err(TransportError::OperationFailed(TransportFailure::EncodingFailed))
+		));
 	}
 }

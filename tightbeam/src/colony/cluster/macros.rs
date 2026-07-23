@@ -622,11 +622,21 @@ macro_rules! cluster {
 						$crate::colony::cluster::ClusterWorkResponse::ok(response_payload)
 					);
 				}
-				Err(_) => {
+				Err(error) => {
 					// Weaken on failure using configured penalty
 					let _ = $servlet_registry.weaken_with_penalty(&selected_entry.address, $config.pheromone.weakening_penalty);
+
+					// A servlet refusal relays verbatim so the caller keeps
+					// its retryability contract.
+					let status = match error {
+						$crate::colony::cluster::ClusterError::Transport(
+							$crate::transport::error::TransportError::OperationFailed(failure),
+						) => $crate::policy::TransitStatus::try_from(failure)
+							.unwrap_or($crate::policy::TransitStatus::Unavailable),
+						_ => $crate::policy::TransitStatus::Unavailable,
+					};
 					return $crate::cluster!(@reply $frame,
-						$crate::colony::cluster::ClusterWorkResponse::err($crate::policy::TransitStatus::Unavailable)
+						$crate::colony::cluster::ClusterWorkResponse::err(status)
 					);
 				}
 			}
