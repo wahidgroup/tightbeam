@@ -304,13 +304,24 @@ mod router {
 		goaway_sent: Option<u32>,
 		/// `last_stream_id` received in the peer's GoAway
 		goaway_received: Option<u32>,
+		/// Reason carried by the peer's GoAway, once received. Local
+		/// shutdown leaves this empty: the caller already knows why
+		goaway_reason: Option<GoAwayReason>,
 		/// Wakers parked on pending-table drain (shutdown)
 		drain_wakers: Vec<Waker>,
+		/// Wakers parked on stream-slot headroom (cap full)
+		slot_wakers: Vec<Waker>,
 	}
 
 	impl MuxState {
 		fn wake_drain_waiters(&mut self) {
 			for waker in self.drain_wakers.drain(..) {
+				waker.wake();
+			}
+		}
+
+		fn wake_slot_waiters(&mut self) {
+			for waker in self.slot_wakers.drain(..) {
 				waker.wake();
 			}
 		}
@@ -349,6 +360,7 @@ mod router {
 			let entry = state.pending.remove(&stream_id);
 			if entry.is_some() {
 				state.wake_drain_waiters();
+				state.wake_slot_waiters();
 			}
 
 			entry
@@ -402,14 +414,17 @@ mod router {
 			state.pending.clear();
 			state.pending_pings.clear();
 			state.wake_drain_waiters();
+			state.wake_slot_waiters();
 		}
 
 		/// Resolve pending streams above `last_stream_id` as draining
-		/// (peer GoAway: it will never process them).
-		fn fail_pending_above(&self, last_stream_id: u32) {
+		/// (peer GoAway: it will never process them). Records the peer's
+		/// reason for [`MuxShared::goaway_reason`].
+		fn fail_pending_above(&self, last_stream_id: u32, reason: GoAwayReason) {
 			let mut state = self.lock();
 
 			state.goaway_received = Some(last_stream_id);
+			state.goaway_reason = Some(reason);
 
 			if let Some(first_dropped) = last_stream_id.checked_add(1) {
 				for (_, sender) in state.pending.split_off(&first_dropped) {
@@ -418,6 +433,7 @@ mod router {
 			}
 
 			state.wake_drain_waiters();
+			state.wake_slot_waiters();
 		}
 
 		/// Halt the allocator and record the GoAway watermark. Returns the
@@ -429,6 +445,7 @@ mod router {
 			}
 
 			state.goaway_sent = Some(state.last_peer_stream_id);
+			state.wake_slot_waiters();
 			Some(state.last_peer_stream_id)
 		}
 
@@ -466,6 +483,44 @@ mod router {
 
 		fn has_pending_streams(&self) -> bool {
 			!self.lock().pending.is_empty()
+		}
+
+		fn goaway_reason(&self) -> Option<GoAwayReason> {
+			self.lock().goaway_reason
+		}
+
+		/// Resolve once a locally-initiated stream would be admitted, or
+		/// fail with `Draining` once no stream will ever be admitted again.
+		fn poll_stream_slot(&self, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
+			let mut state = self.lock();
+
+			let goaway = state.goaway_sent.is_some() || state.goaway_received.is_some();
+			let id_space_dead = state.next_stream_id.is_none();
+			if goaway || id_space_dead {
+				return Poll::Ready(Err(TransportError::Draining));
+			}
+
+			if state.pending.len() < cap_as_usize(self.local_cap) {
+				return Poll::Ready(Ok(()));
+			}
+
+			state.slot_wakers.push(cx.waker().clone());
+
+			Poll::Pending
+		}
+	}
+
+	/// Resolves once a locally-initiated stream would be admitted. Fails
+	/// with `Draining` once no stream will ever be admitted again.
+	struct StreamSlot {
+		shared: Arc<MuxShared>,
+	}
+
+	impl Future for StreamSlot {
+		type Output = TransportResult<()>;
+
+		fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TransportResult<()>> {
+			self.shared.poll_stream_slot(cx)
 		}
 	}
 
@@ -649,6 +704,30 @@ mod router {
 			self.shared.has_pending_streams()
 		}
 
+		/// Reason carried by the peer's GoAway, or `None` while the
+		/// connection is live or was shut down locally.
+		///
+		/// Reconnect policies branch on this: `Shutdown` invites an
+		/// immediate reconnect, `EnhanceYourCalm` calls for backoff, and
+		/// `ProtocolError` points at a bug rather than a transient fault.
+		pub fn goaway_reason(&self) -> Option<GoAwayReason> {
+			self.shared.goaway_reason()
+		}
+
+		/// Resolve once a locally-initiated stream would be admitted:
+		/// cap headroom, live ID space, and no GoAway either way.
+		///
+		/// Replaces polling [`MuxHandle::has_stream_headroom`] in a loop.
+		/// Advisory like the getter: a concurrent emit can take the slot
+		/// between wake and use, so callers still handle
+		/// `StreamsExhausted`.
+		///
+		/// # Errors
+		/// - `Draining`: GoAway sent or received, or stream IDs exhausted.
+		pub fn wait_for_stream_slot(&self) -> impl Future<Output = TransportResult<()>> + MaybeSend {
+			StreamSlot { shared: Arc::clone(&self.shared) }
+		}
+
 		/// Connection-level liveness probe
 		/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)
 		/// analog): resolves when the peer's ack arrives.
@@ -689,8 +768,15 @@ mod router {
 		/// A drain deadline composes by wrapping this future in the
 		/// caller's timer.
 		pub async fn shutdown(&self) -> TransportResult<()> {
+			self.shutdown_with(GoAwayReason::Shutdown).await
+		}
+
+		/// As [`shutdown`](Self::shutdown), advertising `reason` in the
+		/// GoAway. Application-defined codes live at or above
+		/// [`MUX_APPLICATION_CODE_FLOOR`](super::super::envelopes::MUX_APPLICATION_CODE_FLOOR).
+		pub async fn shutdown_with(&self, reason: GoAwayReason) -> TransportResult<()> {
 			if let Some(last_peer) = self.shared.begin_shutdown() {
-				let package = GoAwayPackage::new(last_peer, GoAwayReason::Shutdown);
+				let package = GoAwayPackage::new(last_peer, reason);
 				let mut outbound = self.outbound.clone();
 				outbound
 					.send(Outbound::Envelope(package.into()))
@@ -815,7 +901,9 @@ mod router {
 					MuxEnvelope::Open(package) => self.route_open(package).await?,
 					MuxEnvelope::Cancel(package) => self.route_cancel(package).await?,
 					MuxEnvelope::Ping(package) => self.route_ping(package).await?,
-					MuxEnvelope::GoAway(package) => self.shared.fail_pending_above(package.last_stream_id()),
+					MuxEnvelope::GoAway(package) => {
+						self.shared.fail_pending_above(package.last_stream_id(), package.reason());
+					}
 					// The handshake never negotiates chunking, so no
 					// conforming peer sends continuation chunks or
 					// credit grants
@@ -1145,7 +1233,9 @@ mod router {
 					pending_pings: BTreeMap::new(),
 					goaway_sent: None,
 					goaway_received: None,
+					goaway_reason: None,
 					drain_wakers: Vec::new(),
+					slot_wakers: Vec::new(),
 				}),
 			});
 
@@ -1191,7 +1281,7 @@ mod router {
 	mod tests {
 		use super::*;
 
-		fn test_shared(role: MuxRole, local_cap: u32) -> MuxShared {
+		fn shared(role: MuxRole, local_cap: u32) -> MuxShared {
 			MuxShared {
 				role,
 				local_cap,
@@ -1203,7 +1293,9 @@ mod router {
 					pending_pings: BTreeMap::new(),
 					goaway_sent: None,
 					goaway_received: None,
+					goaway_reason: None,
 					drain_wakers: Vec::new(),
+					slot_wakers: Vec::new(),
 				}),
 			}
 		}
@@ -1212,26 +1304,157 @@ mod router {
 			oneshot::channel().0
 		}
 
-		#[test]
-		fn test_client_allocates_odd_monotonic() {
-			let shared = test_shared(MuxRole::Client, 8);
-			assert!(matches!(shared.allocate(slot()), Ok(1)));
-			assert!(matches!(shared.allocate(slot()), Ok(3)));
-			assert!(matches!(shared.allocate(slot()), Ok(5)));
+		fn ping_slot() -> oneshot::Sender<()> {
+			oneshot::channel().0
+		}
+
+		fn noop_cx() -> Context<'static> {
+			Context::from_waker(futures::task::noop_waker_ref())
+		}
+
+		fn allocate_ids(shared: &MuxShared, ids: &[u32]) {
+			for &id in ids {
+				assert!(matches!(shared.allocate(slot()), Ok(got) if got == id));
+			}
+		}
+
+		fn allocate_ping_ids(shared: &MuxShared, ids: &[u64]) {
+			for &id in ids {
+				assert!(matches!(shared.allocate_ping(ping_slot()), Ok(got) if got == id));
+			}
+		}
+
+		fn poll_slot(shared: &MuxShared) -> Poll<TransportResult<()>> {
+			let mut cx = noop_cx();
+			shared.poll_stream_slot(&mut cx)
+		}
+
+		fn assert_cancel_maps(reason: CancelReason, failure: TransportFailure) {
+			let error = cancel_error(reason);
+			assert!(matches!(
+				error,
+				TransportError::OperationFailed(got) if got == failure
+			));
+		}
+
+		fn assert_slot_poll(shared: &MuxShared, expect: SlotExpect) {
+			let polled = poll_slot(shared);
+			match expect {
+				SlotExpect::ReadyOk => assert!(matches!(polled, Poll::Ready(Ok(())))),
+				SlotExpect::Pending => assert!(matches!(polled, Poll::Pending)),
+				SlotExpect::Draining => {
+					assert!(matches!(polled, Poll::Ready(Err(TransportError::Draining))))
+				}
+			}
+		}
+
+		enum HeadroomSetup {
+			Fresh { cap: u32 },
+			AtCap { cap: u32 },
+			LocalShutdown { cap: u32 },
+		}
+
+		fn prepare_headroom(setup: HeadroomSetup) -> MuxShared {
+			match setup {
+				HeadroomSetup::Fresh { cap } => shared(MuxRole::Client, cap),
+				HeadroomSetup::AtCap { cap } => {
+					let shared = shared(MuxRole::Client, cap);
+					allocate_ids(&shared, &[1]);
+					shared
+				}
+				HeadroomSetup::LocalShutdown { cap } => {
+					let shared = shared(MuxRole::Client, cap);
+					shared.begin_shutdown();
+					shared
+				}
+			}
+		}
+
+		enum GoAwaySetup {
+			Live,
+			PeerEnhanceYourCalm,
+			LocalShutdown,
+		}
+
+		fn prepare_goaway(setup: GoAwaySetup) -> MuxShared {
+			let shared = shared(MuxRole::Client, 2);
+			match setup {
+				GoAwaySetup::Live => {}
+				GoAwaySetup::PeerEnhanceYourCalm => {
+					shared.fail_pending_above(0, GoAwayReason::EnhanceYourCalm);
+				}
+				GoAwaySetup::LocalShutdown => {
+					shared.begin_shutdown();
+				}
+			}
+			shared
+		}
+
+		enum SlotSetup {
+			ReadyWithHeadroom,
+			PendingAtCap,
+			DrainingLocal,
+			DrainingPeer,
+		}
+
+		enum SlotExpect {
+			ReadyOk,
+			Pending,
+			Draining,
+		}
+
+		fn prepare_slot(setup: SlotSetup) -> MuxShared {
+			let shared = shared(MuxRole::Client, 1);
+			match setup {
+				SlotSetup::ReadyWithHeadroom => {}
+				SlotSetup::PendingAtCap => allocate_ids(&shared, &[1]),
+				SlotSetup::DrainingLocal => {
+					shared.begin_shutdown();
+				}
+				SlotSetup::DrainingPeer => {
+					shared.fail_pending_above(0, GoAwayReason::Shutdown);
+				}
+			}
+			shared
+		}
+
+		/// Waker that records delivery, for slot-waiter wake assertions.
+		#[derive(Default)]
+		struct FlagWake {
+			woken: core::sync::atomic::AtomicBool,
+		}
+
+		impl FlagWake {
+			fn pair() -> (Arc<Self>, Waker) {
+				let flag = Arc::new(Self::default());
+				let waker = futures::task::waker(Arc::clone(&flag));
+
+				(flag, waker)
+			}
+
+			fn woken(&self) -> bool {
+				self.woken.load(core::sync::atomic::Ordering::SeqCst)
+			}
+		}
+
+		impl futures::task::ArcWake for FlagWake {
+			fn wake_by_ref(arc_self: &Arc<Self>) {
+				arc_self.woken.store(true, core::sync::atomic::Ordering::SeqCst);
+			}
 		}
 
 		#[test]
-		fn test_server_allocates_even_monotonic_never_zero() {
-			let shared = test_shared(MuxRole::Server, 8);
-			assert!(matches!(shared.allocate(slot()), Ok(2)));
-			assert!(matches!(shared.allocate(slot()), Ok(4)));
+		fn test_role_allocates_monotonic_ids() {
+			for (role, ids) in [(MuxRole::Client, &[1u32, 3, 5][..]), (MuxRole::Server, &[2u32, 4][..])] {
+				let shared = shared(role, 8);
+				allocate_ids(&shared, ids);
+			}
 		}
 
 		#[test]
 		fn test_cap_exhaustion_reports_busy() {
-			let shared = test_shared(MuxRole::Client, 2);
-			assert!(matches!(shared.allocate(slot()), Ok(1)));
-			assert!(matches!(shared.allocate(slot()), Ok(3)));
+			let shared = shared(MuxRole::Client, 2);
+			allocate_ids(&shared, &[1, 3]);
 			assert!(matches!(
 				shared.allocate(slot()),
 				Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted))
@@ -1240,15 +1463,15 @@ mod router {
 
 		#[test]
 		fn test_completed_stream_frees_cap_slot() {
-			let shared = test_shared(MuxRole::Client, 1);
-			assert!(matches!(shared.allocate(slot()), Ok(1)));
+			let shared = shared(MuxRole::Client, 1);
+			allocate_ids(&shared, &[1]);
 			assert!(shared.remove_pending(1).is_some());
-			assert!(matches!(shared.allocate(slot()), Ok(3)));
+			allocate_ids(&shared, &[3]);
 		}
 
 		#[test]
 		fn test_allocation_halts_after_shutdown() {
-			let shared = test_shared(MuxRole::Client, 8);
+			let shared = shared(MuxRole::Client, 8);
 			assert!(matches!(shared.begin_shutdown(), Some(0)));
 			assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
 			assert!(shared.begin_shutdown().is_none());
@@ -1256,30 +1479,30 @@ mod router {
 
 		#[test]
 		fn test_allocation_halts_after_peer_goaway() {
-			let shared = test_shared(MuxRole::Client, 8);
-			shared.fail_pending_above(0);
+			let shared = shared(MuxRole::Client, 8);
+			shared.fail_pending_above(0, GoAwayReason::Shutdown);
 			assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
 		}
 
 		#[test]
 		fn test_id_space_exhaustion_reports_draining() {
-			let shared = test_shared(MuxRole::Client, 8);
+			let shared = shared(MuxRole::Client, 8);
 			shared.lock().next_stream_id = Some(u32::MAX);
-			assert!(matches!(shared.allocate(slot()), Ok(u32::MAX)));
+			allocate_ids(&shared, &[u32::MAX]);
 			assert!(matches!(shared.allocate(slot()), Err(TransportError::Draining)));
 		}
 
 		#[test]
-		fn test_peer_stream_rejects_zero_and_wrong_parity() {
-			let server = test_shared(MuxRole::Server, 8);
-			assert!(matches!(server.register_peer_stream(0), Err(TransportError::InvalidMessage)));
-			assert!(matches!(server.register_peer_stream(2), Err(TransportError::InvalidMessage)));
-			assert!(matches!(server.register_peer_stream(1), Ok(PeerStream::Accept)));
+		fn test_peer_stream_rejects_invalid_ids() {
+			let server = shared(MuxRole::Server, 8);
+			for id in [0u32, 2] {
+				assert!(matches!(server.register_peer_stream(id), Err(TransportError::InvalidMessage)));
+			}
 		}
 
 		#[test]
 		fn test_peer_stream_rejects_non_increasing() {
-			let server = test_shared(MuxRole::Server, 8);
+			let server = shared(MuxRole::Server, 8);
 			assert!(matches!(server.register_peer_stream(5), Ok(PeerStream::Accept)));
 			assert!(matches!(server.register_peer_stream(3), Err(TransportError::InvalidMessage)));
 			assert!(matches!(server.register_peer_stream(5), Err(TransportError::InvalidMessage)));
@@ -1288,7 +1511,7 @@ mod router {
 
 		#[test]
 		fn test_peer_stream_above_goaway_watermark_refused() {
-			let server = test_shared(MuxRole::Server, 8);
+			let server = shared(MuxRole::Server, 8);
 			assert!(matches!(server.register_peer_stream(1), Ok(PeerStream::Accept)));
 			assert!(matches!(server.begin_shutdown(), Some(1)));
 			assert!(matches!(server.register_peer_stream(3), Ok(PeerStream::RejectDraining)));
@@ -1296,14 +1519,14 @@ mod router {
 
 		#[test]
 		fn test_goaway_fails_pending_above_watermark_only() {
-			let shared = test_shared(MuxRole::Client, 8);
+			let shared = shared(MuxRole::Client, 8);
 			let (sender_low, mut receiver_low) = oneshot::channel();
 			let (sender_high, mut receiver_high) = oneshot::channel();
 
 			shared.lock().pending.insert(1, sender_low);
 			shared.lock().pending.insert(3, sender_high);
 
-			shared.fail_pending_above(1);
+			shared.fail_pending_above(1, GoAwayReason::Shutdown);
 
 			assert!(matches!(receiver_low.try_recv(), Ok(None)));
 			assert!(matches!(receiver_high.try_recv(), Ok(Some(StreamOutcome::Draining))));
@@ -1315,21 +1538,15 @@ mod router {
 			assert_eq!(drain_headroom(&settings), 17);
 		}
 
-		fn ping_slot() -> oneshot::Sender<()> {
-			oneshot::channel().0
-		}
-
 		#[test]
 		fn test_ping_allocates_monotonic_opaque() {
-			let shared = test_shared(MuxRole::Client, 8);
-			assert!(matches!(shared.allocate_ping(ping_slot()), Ok(0)));
-			assert!(matches!(shared.allocate_ping(ping_slot()), Ok(1)));
-			assert!(matches!(shared.allocate_ping(ping_slot()), Ok(2)));
+			let shared = shared(MuxRole::Client, 8);
+			allocate_ping_ids(&shared, &[0, 1, 2]);
 		}
 
 		#[test]
 		fn test_ping_ack_resolves_pending() {
-			let shared = test_shared(MuxRole::Client, 8);
+			let shared = shared(MuxRole::Client, 8);
 			let (sender, mut receiver) = oneshot::channel();
 			assert!(matches!(shared.allocate_ping(sender), Ok(0)));
 
@@ -1339,7 +1556,7 @@ mod router {
 
 		#[test]
 		fn test_stale_ping_ack_discarded() {
-			let shared = test_shared(MuxRole::Client, 8);
+			let shared = shared(MuxRole::Client, 8);
 			let (sender, mut receiver) = oneshot::channel();
 			assert!(matches!(shared.allocate_ping(sender), Ok(0)));
 
@@ -1350,14 +1567,14 @@ mod router {
 
 		#[test]
 		fn test_ping_refused_while_draining() {
-			let shared = test_shared(MuxRole::Client, 8);
+			let shared = shared(MuxRole::Client, 8);
 			shared.begin_shutdown();
 			assert!(matches!(shared.allocate_ping(ping_slot()), Err(TransportError::Draining)));
 		}
 
 		#[test]
 		fn test_connection_failure_fails_pending_pings() {
-			let shared = test_shared(MuxRole::Client, 8);
+			let shared = shared(MuxRole::Client, 8);
 			let (sender, mut receiver) = oneshot::channel();
 			assert!(matches!(shared.allocate_ping(sender), Ok(0)));
 
@@ -1366,56 +1583,102 @@ mod router {
 		}
 
 		#[test]
-		fn test_headroom_present_on_fresh_connection() {
-			let shared = test_shared(MuxRole::Client, 2);
-			assert!(shared.has_stream_headroom());
-		}
-
-		#[test]
-		fn test_headroom_gone_at_cap() {
-			let shared = test_shared(MuxRole::Client, 1);
-			assert!(matches!(shared.allocate(slot()), Ok(1)));
-			assert!(!shared.has_stream_headroom());
-		}
-
-		#[test]
-		fn test_headroom_gone_while_draining() {
-			let shared = test_shared(MuxRole::Client, 2);
-			shared.begin_shutdown();
-			assert!(!shared.has_stream_headroom());
+		fn test_stream_headroom() {
+			for (setup, expect) in [
+				(HeadroomSetup::Fresh { cap: 2 }, true),
+				(HeadroomSetup::AtCap { cap: 1 }, false),
+				(HeadroomSetup::LocalShutdown { cap: 2 }, false),
+			] {
+				let shared = prepare_headroom(setup);
+				assert_eq!(shared.has_stream_headroom(), expect);
+			}
 		}
 
 		#[test]
 		fn test_pending_streams_track_in_flight() {
-			let shared = test_shared(MuxRole::Client, 8);
+			let shared = shared(MuxRole::Client, 8);
 			assert!(!shared.has_pending_streams());
-			assert!(matches!(shared.allocate(slot()), Ok(1)));
+
+			allocate_ids(&shared, &[1]);
+
 			assert!(shared.has_pending_streams());
 			assert!(shared.remove_pending(1).is_some());
 			assert!(!shared.has_pending_streams());
 		}
 
 		#[test]
+		fn test_goaway_reason_from_peer_only() {
+			for (setup, expected) in [
+				(GoAwaySetup::Live, None),
+				(GoAwaySetup::PeerEnhanceYourCalm, Some(GoAwayReason::EnhanceYourCalm)),
+				(GoAwaySetup::LocalShutdown, None),
+			] {
+				let shared = prepare_goaway(setup);
+				assert_eq!(shared.goaway_reason(), expected);
+			}
+		}
+
+		#[test]
+		fn test_stream_slot_poll_outcomes() {
+			for (setup, expect) in [
+				(SlotSetup::ReadyWithHeadroom, SlotExpect::ReadyOk),
+				(SlotSetup::PendingAtCap, SlotExpect::Pending),
+				(SlotSetup::DrainingLocal, SlotExpect::Draining),
+				(SlotSetup::DrainingPeer, SlotExpect::Draining),
+			] {
+				let shared = prepare_slot(setup);
+				assert_slot_poll(&shared, expect);
+			}
+		}
+
+		#[test]
+		fn test_stream_slot_wakes_when_slot_frees() {
+			let shared = shared(MuxRole::Client, 1);
+			allocate_ids(&shared, &[1]);
+
+			let (flag, waker) = FlagWake::pair();
+			let mut cx = Context::from_waker(&waker);
+			assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Pending));
+
+			assert!(shared.remove_pending(1).is_some());
+
+			assert!(flag.woken());
+			assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Ready(Ok(()))));
+		}
+
+		#[test]
+		fn test_stream_slot_wakes_on_shutdown() {
+			let shared = shared(MuxRole::Client, 1);
+			allocate_ids(&shared, &[1]);
+
+			let (flag, waker) = FlagWake::pair();
+			let mut cx = Context::from_waker(&waker);
+			assert!(matches!(shared.poll_stream_slot(&mut cx), Poll::Pending));
+
+			shared.begin_shutdown();
+
+			assert!(flag.woken());
+			assert!(matches!(
+				shared.poll_stream_slot(&mut cx),
+				Poll::Ready(Err(TransportError::Draining))
+			));
+		}
+
+		#[test]
 		fn test_cancel_reason_error_mapping() {
-			assert!(matches!(
-				cancel_error(CancelReason::Rejected),
-				TransportError::OperationFailed(TransportFailure::Busy)
-			));
-			assert!(matches!(
-				cancel_error(CancelReason::Timeout),
-				TransportError::OperationFailed(TransportFailure::Timeout)
-			));
-			assert!(matches!(
-				cancel_error(CancelReason::Cancelled),
-				TransportError::OperationFailed(TransportFailure::PolicyRejection)
-			));
-			assert!(matches!(
-				cancel_error(CancelReason::Application(0x1000)),
-				TransportError::OperationFailed(TransportFailure::PolicyRejection)
-			));
+			for (reason, failure) in [
+				(CancelReason::Rejected, TransportFailure::Busy),
+				(CancelReason::Timeout, TransportFailure::Timeout),
+				(CancelReason::Cancelled, TransportFailure::PolicyRejection),
+				(CancelReason::Application(0x1000), TransportFailure::PolicyRejection),
+			] {
+				assert_cancel_maps(reason, failure);
+			}
 		}
 	}
 }
 
 #[cfg(all(feature = "x509", any(feature = "tokio", feature = "async-transport")))]
 pub use router::{MuxHandle, MuxReaderDriver, MuxResponder, MuxTransport, MuxWriterDriver};
+
+pub use super::envelopes::GoAwayReason;

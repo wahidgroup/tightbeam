@@ -1005,6 +1005,91 @@ mod negotiated {
 		}
 	}
 
+	/// Drain a fresh link via `shutdown_with(reason)` and observe the
+	/// GoAway on the raw server half.
+	async fn run_shutdown_with_case(reason: GoAwayReason) -> Result<bool, TightBeamError> {
+		let mut link = establish_client_mux_server_raw(4).await?;
+
+		link.client.handle.shutdown_with(reason).await?;
+
+		let envelope = link.server_reader.read_envelope().await?;
+		Ok(is_goaway(&envelope, reason, Some(0)))
+	}
+
+	tb_assert_spec! {
+		pub MuxShutdownReasonSpec,
+		V(1,0,0): {
+			mode: Accept,
+			gate: Accepted,
+			assertions: [
+				(shutdown_with_advertises_reason, exactly!(2), equals!(true))
+			]
+		}
+	}
+
+	// `shutdown_with` advertises the caller's reason in the GoAway,
+	// including application-defined codes.
+	tb_scenario! {
+		name: mux_shutdown_with_advertises_reason,
+		spec: MuxShutdownReasonSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				for reason in [GoAwayReason::EnhanceYourCalm, GoAwayReason::Application(0x1000)] {
+					let advertised = run_shutdown_with_case(reason).await?;
+					trace.event_with(MuxShutdownReasonSpec::shutdown_with_advertises_reason, &[], advertised)?;
+				}
+
+				Ok(())
+			}
+		}
+	}
+
+	/// Answer an in-flight emit with GoAway(reason) from the raw server
+	/// half. The failed emit sequences the read: once it resolves, the
+	/// handle has recorded the peer's reason.
+	async fn run_peer_reason_case(reason: GoAwayReason) -> Result<bool, TightBeamError> {
+		let mut link = establish_client_mux_server_raw(4).await?;
+
+		let emit_task = spawn_emit(&link.client.handle, mux_frame("mux-peer-reason"));
+		let _stream_id = read_muxed_request_id(&mut link.server_reader).await?;
+
+		write_goaway(&mut link.server_writer, 0, reason).await?;
+
+		let outcome = join_task(emit_task, "drained emit task must not panic").await?;
+		let drained = is_draining(&outcome);
+		let surfaced = link.client.handle.goaway_reason() == Some(reason);
+
+		Ok(drained && surfaced)
+	}
+
+	tb_assert_spec! {
+		pub MuxPeerReasonSpec,
+		V(1,0,0): {
+			mode: Accept,
+			gate: Accepted,
+			assertions: [
+				(peer_reason_surfaces_on_handle, exactly!(2), equals!(true))
+			]
+		}
+	}
+
+	// A peer GoAway drains pending streams and its reason surfaces through
+	// `goaway_reason` for reconnect policy.
+	tb_scenario! {
+		name: mux_peer_goaway_reason_surfaces_on_handle,
+		spec: MuxPeerReasonSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				for reason in [GoAwayReason::EnhanceYourCalm, GoAwayReason::Application(0x2000)] {
+					let surfaced = run_peer_reason_case(reason).await?;
+					trace.event_with(MuxPeerReasonSpec::peer_reason_surfaces_on_handle, &[], surfaced)?;
+				}
+
+				Ok(())
+			}
+		}
+	}
+
 	/// Drive one rekey case over raw client halves against a muxed server.
 	async fn run_rekey_case(case: RekeyCase) -> Result<bool, TightBeamError> {
 		let responses_before_goaway = case.responses_before_goaway();
