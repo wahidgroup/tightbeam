@@ -249,8 +249,7 @@ impl TryFrom<TransportFailure> for TransitStatus {
 			TransportFailure::Unavailable => TransitStatus::Unavailable,
 			TransportFailure::DataLoss => TransitStatus::DataLoss,
 			TransportFailure::Unauthenticated => TransitStatus::Unauthenticated,
-			// Local-only failures (encoding, crypto, stream caps, ...)
-			// carry no wire status; the caller keeps the original error
+			// Local-only failures carry no wire status
 			local => return Err(TransportError::OperationFailed(local)),
 		};
 
