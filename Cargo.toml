@@ -92,6 +92,7 @@ futures = { version = "0.3.32", default-features = false, features = ["alloc"] }
 zeekstd = { version = "0.6.2", default-features = false }
 
 # Dev dependencies
+husky-rs = "0.3"
 paste = { version = "1.0.15" }
 gumdrop = { version = "0.8.1" }
 rand = { version = "0.9" }

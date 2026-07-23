@@ -61,6 +61,7 @@ zeekstd = { workspace = true, optional = true }
 afl = { workspace = true, optional = true }
 
 [dev-dependencies]
+husky-rs = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 fake = { workspace = true }

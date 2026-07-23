@@ -1,0 +1,47 @@
+#!/usr/bin/env sh
+set -e
+
+# Installed via husky-rs (core.hooksPath = .husky).
+# Redirect stdin so make/npm cannot consume the ref list git feeds this hook.
+if ! make lint </dev/null; then
+	echo "ERROR: make lint failed; push aborted."
+	exit 1
+fi
+
+remote="$1"
+z40=0000000000000000000000000000000000000000
+
+# Verify every commit being pushed, excluding only history the remote
+# actually has: its live default-branch tip and the old tip of each
+# pushed ref.
+remote_head=$(git ls-remote "$remote" HEAD 2>/dev/null | awk 'NR == 1 { print $1 }')
+if [ -z "$remote_head" ]; then
+	echo "ERROR: Could not query $remote for its default branch tip (network or auth error)."
+	echo "       Cannot determine which commits are new without it."
+	exit 1
+fi
+if ! git cat-file -e "${remote_head}^{commit}" 2>/dev/null; then
+	echo "ERROR: $remote default branch tip $remote_head is not present locally."
+	echo "       Run: git fetch $remote"
+	exit 1
+fi
+
+while read local_ref local_oid remote_ref remote_oid; do
+	if [ "$local_oid" = "$z40" ]; then
+		continue
+	fi
+
+	exclude="$remote_head"
+	if [ "$remote_oid" != "$z40" ]; then
+		exclude="$exclude $remote_oid"
+	fi
+
+	# $exclude is intentionally unquoted: word-split oids for --not.
+	for commit in $(git rev-list "$local_oid" --not $exclude); do
+		if ! git verify-commit "$commit" 2>/dev/null; then
+			echo "ERROR: Commit $commit has an invalid or missing signature."
+			echo "       All commits must have a valid signature before pushing."
+			exit 1
+		fi
+	done
+done

@@ -1,37 +1,52 @@
-.PHONY: all help help-ref version setup check build clean test lint doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release check-yanked audit ci
+.PHONY: all help help-body help-ref version setup check build clean test lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked audit ci
+
+.NOTPARALLEL: ci
+
+.DEFAULT_GOAL := help
 
 # Project metadata for help/version
 PROJECT := tightbeam
-VERSION := $(shell awk -F\" '/^\s*version\s*=\s*"/{print $$2; exit}' Cargo.toml 2>/dev/null)
+VERSION := $(shell awk -F\" '/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/{print $$2; exit}' Cargo.toml 2>/dev/null)
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null)
 GIT_DIRTY := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo "+dirty")
 
-# Extract version and flags from positional args (e.g., `make release v0.7.0 --derive`)
-RELEASE_VERSION := $(filter v%,$(MAKECMDGOALS))
-RELEASE_FLAGS   := $(filter-out --,$(filter --%,$(MAKECMDGOALS)))
+# Cargo feature passthroughs (e.g., `make test features="testing"`).
+CARGO_FLAGS := $(if $(features),--features "$(features)") $(if $(no-default),--no-default-features)
 
-# Print wrapper function
+ifneq ($(filter 1,$(fix)),)
+LINT_MODE := fix
+else
+LINT_MODE := check
+endif
+
+AUDIT_MODE := $(LINT_MODE)
+
+ifneq ($(filter 1,$(debug)),)
+export RUST_LOG = debug
+endif
+
+RELEASE_VERSION := $(version)
+
 define PRINT_PAGER
 @{ $(1); } | less -FRX
 endef
-
-# Default target
-all: setup clean build
 
 help:
 	$(call PRINT_PAGER,$(MAKE) help-body)
 
 help-body:
 	@printf 'USAGE:\n'
-	@printf '    make <target> [features="<comma-separated features>"] [no-default=1] [ARGS="<clippy-args>"]\n\n'
+	@printf '    make <target> [fix=1] [debug=1] [features="<comma-separated>"] [no-default=1]\n'
+	@printf '                  [version=vX.Y.Z] [dry-run=1] [allow-staged=1] [yank=1]\n'
+	@printf '                  [ARGS="<clippy-args>"]\n\n'
 	@printf 'DESCRIPTION:\n'
 	@printf '    Build, lint, test, and document the %s workspace following POSIX/GNU CLI conventions.\n\n' '$(PROJECT)'
 	@printf 'TARGETS:\n'
-	@printf '    all             Default: setup, clean, then build\n'
+	@printf '    all             Setup then build\n'
 	@printf '    help            Show this help and exit\n'
 	@printf '    help-ref        Show reference documentation links\n'
 	@printf '    version         Show project version information\n'
-	@printf '    setup           Setup the development environment\n'
+	@printf '    setup           Setup the development environment (idempotent)\n'
 	@printf '    check           Run code check (honors cargo features)\n'
 	@printf '    build           Build all projects (honors cargo features)\n'
 	@printf '    clean           Clean build artifacts\n'
@@ -41,29 +56,32 @@ help-body:
 	@printf '    fuzz-test       Build and run AFL fuzz testing for 60 seconds\n'
 	@printf '    analyze-fuzz    Analyze a specific crash/hang file (requires file=...)\n'
 	@printf '    clean-fuzz      Remove fuzz output artifacts\n'
-	@printf '    lint            Run linters (fix mode via fix=1; extra clippy args via ARGS)\n'
-	@printf '    audit           Run security audit (RustSec cargo-audit)\n'
-	@printf '    ci              Lint + build + test-all\n'
+	@printf '    lint            Lint + spellcheck (fix=1 to auto-fix; extra clippy args via ARGS)\n'
+	@printf '    spellcheck      Spellcheck the repository with typos\n'
+	@printf '    audit           Run security audit (RustSec cargo-audit; fix=1 reserved)\n'
+	@printf '    ci              Full pipeline: lint + build + test-all\n'
 	@printf '    doc             Build documentation (all features)\n'
-	@printf '    release         Release both crates by default, prompting for each version (make release [--dry-run] [--allow-staged])\n'
-	@printf '                    Single crate: make release v0.7.0 single=1 (tightbeam) | make release v0.1.5 --derive (derive) | --yank\n'
-	@printf '    check-yanked    Check if current version has been yanked\n\n'
+	@printf '    release         Release workflow (see OPTIONS)\n'
+	@printf '    release-derive  Derive-only release: tag tightbeam-derive (see OPTIONS)\n'
+	@printf '    check-yanked    Check if current version has been yanked (derive=1 for derive)\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
+	@printf '    fix             If set (e.g., fix=1), apply lint fixes: cargo fmt + clippy --fix\n'
+	@printf '    debug           If set (e.g., debug=1), export RUST_LOG=debug\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'
-	@printf '    no-default      If set (e.g., 1/true), passes --no-default-features to Cargo\n'
+	@printf '    no-default      If set (e.g., 1), passes --no-default-features to Cargo\n'
 	@printf '    ARGS            Extra arguments for clippy (e.g., "--allow-dirty --allow-staged")\n'
-	@printf '    fix             If set (e.g., fix=1), apply fixes: cargo fmt + clippy --fix\n'
-	@printf '    derive          Preset tightbeam-derive version for the combined release (e.g., derive=0.1.5)\n'
-	@printf '    single          If set (e.g., single=1), release only tightbeam instead of both crates\n\n'
-	@printf 'ENVIRONMENT:\n'
-	@printf '    CARGO_TERM_COLOR, RUSTFLAGS, RUSTC_WRAPPER (honored by Cargo/rustc)\n\n'
+	@printf '    version         Release version (e.g., version=v0.9.1)\n'
+	@printf '    dry-run         If set (e.g., dry-run=1), preview release without changes\n'
+	@printf '    allow-staged    If set (e.g., allow-staged=1), include staged files in release\n'
+	@printf '    yank            If set (e.g., yank=1), yank a published release instead\n'
+	@printf '    derive          If set (e.g., derive=1), check-yanked targets tightbeam-derive\n'
 	@printf 'EXAMPLES:\n'
 	@printf '    make build features="std,tcp,tokio"\n'
 	@printf '    make test no-default=1 features="testing"\n'
 	@printf '    make lint fix=1\n'
-	@printf '    make release\n'
-	@printf '    make release v0.7.0 derive=0.1.5\n'
-	@printf '    make release v0.7.0 single=1\n\n'
+	@printf '    make release version=v0.9.1\n'
+	@printf '    make release version=v0.9.1 dry-run=1\n'
+	@printf '    make release-derive version=v0.1.8\n\n'
 	@printf 'EXIT STATUS:\n'
 	@printf '    0    Success\n'
 	@printf '    >0   Error occurred\n\n'
@@ -71,115 +89,101 @@ help-body:
 help-ref:
 	@printf 'REFERENCES:\n'
 	@printf '    GNU CLI Guidelines: https://www.gnu.org/prep/standards/html_node/Command_002dLine-Interfaces.html\n'
-	@printf '    POSIX Utility Syntax: https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap12.html\n\n'
+	@printf '    POSIX Utility Syntax: https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap12.html\n'
+	@printf '    GNU Make Goals: https://www.gnu.org/software/make/manual/html_node/Goals.html\n\n'
 
-# Version info (similar to -V/--version in CLI tools)
 version:
 	@v='$(VERSION)'; c='$(GIT_COMMIT)'; d='$(GIT_DIRTY)'; [ -n "$$v" ] || v=unknown; \
 	printf '%s %s (%s%s)\n' '$(PROJECT)' "$$v" "$$c" "$$d"
 
-# Setup local development
 setup:
-	@echo "Setting up the development environment..."
-	@echo "Installing pinned toolchain, components, and targets (rust-toolchain.toml)..."
-	rustup toolchain install
+	@chmod +x scripts/setup.sh
+	@./scripts/setup.sh
 
-# Build all projects
-build:
-	@echo "Building tightbeam..."
-	cargo build --release $(if $(features),--features "$(features)")
+all: setup build
+	@echo "Build complete."
 
-# Clean build artifacts
+check: setup
+	@echo "Checking $(PROJECT)..."
+	cargo check $(CARGO_FLAGS)
+
+build: setup
+	@echo "Building $(PROJECT)..."
+	cargo build --release $(CARGO_FLAGS)
+
 clean:
 	@echo "Cleaning build artifacts..."
 	cargo clean
-	rm -rf built
-	rm -rf target
+	rm -rf built target .make
 
-# Check
-check:
-	@echo "Checking tightbeam..."
-	cargo check $(if $(features),--features "$(features)")
-
-# Run all tests
-test:
+test: setup
 	@echo "Running tests..."
-	cargo test $(if $(features),--features "$(features)") $(if $(no-default),--no-default-features)
+	cargo test $(CARGO_FLAGS)
 
-# Run tests with all feature combinations
-test-all:  ## Run curated feature combination tests
+test-all: setup
 	@echo "Running tests with all feature combinations..."
 	./scripts/test_features.sh
 
-# Build AFL-instrumented fuzz targets
-fuzz-build:
+fuzz-build: setup
 	@./scripts/fuzz-build.sh
 
-# Run AFL fuzz testing for a short time (60 seconds for CI/smoke testing)
 # Options:
-#   skip-missing-crashes=1  - Skip crash reporting config check (AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1)
-#   skip-cpu-freq=1         - Skip CPU frequency scaling check (AFL_SKIP_CPUFREQ=1)
+#   skip-missing-crashes=1  - Skip crash reporting config check
+#   skip-cpu-freq=1         - Skip CPU frequency scaling check
 fuzz-test: fuzz-build
 	@./scripts/fuzz-test.sh \
 		$(if $(filter 1,$(skip-missing-crashes)),--skip-missing-crashes) \
 		$(if $(filter 1,$(skip-cpu-freq)),--skip-cpu-freq)
 
-# Analyze a specific fuzz crash or hang
 # Usage: make analyze-fuzz file=built/fuzz/out/default/crashes/id:000000...
 analyze-fuzz:
 	@./scripts/fuzz-analyze.sh "$(file)"
 
-# Clean fuzz artifacts
 clean-fuzz:
 	@echo "Cleaning fuzz artifacts..."
 	rm -rf built/fuzz/out
 	@echo "Fuzz output directory cleaned."
 
-# Linters: enable fix mode with `fix=1`; pass extra clippy args via ARGS="...".
-ifneq ($(strip $(fix)),)
-FMT_CMD     := cargo fmt --all
-CLIPPY_MODE := --fix
-CLIPPY_DENY :=
-LINT_MODE   := fix
-else
-FMT_CMD     := cargo fmt --all --check
-CLIPPY_MODE :=
-CLIPPY_DENY := -- -D warnings
-LINT_MODE   := check
-endif
-
-# Swallow option-like extra MAKECMDGOALS so make doesn't error on them
-# Supports: `--`, `--foo`, `--foo=bar`
---:
-	@:
---%:
-	@:
-v%:
-	@:
-
-# Check if current version has been yanked
-check-yanked:
-	@./scripts/check-yanked.sh
-
-# Run security audit (RustSec advisory database)
-audit:
-	@./scripts/audit.sh
-
-# Release workflow
-release:
-	@./scripts/release.sh "$(RELEASE_VERSION)" $(RELEASE_FLAGS) $(if $(derive),--derive=$(derive)) $(if $(both),--both) $(if $(single),--single)
-
-# Run linters
-lint:
+lint: setup
 	@echo "Running linters (mode: $(LINT_MODE))..."
-	@echo "Formatting: $(FMT_CMD)"
-	$(FMT_CMD)
-	@echo "Clippy: cargo clippy --all-targets --all-features $(CLIPPY_MODE) $(ARGS) $(CLIPPY_DENY)"
-	cargo clippy --all-targets --all-features $(CLIPPY_MODE) $(ARGS) $(CLIPPY_DENY)
+ifeq ($(LINT_MODE),fix)
+	cargo fmt --all
+	cargo clippy --fix --all-targets --all-features $(ARGS)
+else
+	cargo fmt --all --check
+	cargo clippy --all-targets --all-features $(ARGS) -- -D warnings
+endif
+	@$(MAKE) spellcheck
 
-ci: lint build test-all
+spellcheck: setup
+	@echo "Checking spelling..."
+	typos
 
-# Build documentation
-doc:
+doc: setup
 	@echo "Building documentation..."
-	cargo doc --open --all-features
+	cargo doc --no-deps --all-features
+
+audit: setup
+	@chmod +x scripts/audit.sh
+	@AUDIT_MODE=$(AUDIT_MODE) ./scripts/audit.sh
+
+ci:
+	$(MAKE) lint
+	$(MAKE) build
+	$(MAKE) test-all
+
+release: setup
+	@chmod +x scripts/release.sh
+	@DRY_RUN="$(if $(filter 1,$(dry-run)),1,)" \
+		ALLOW_STAGED="$(if $(filter 1,$(allow-staged)),1,)" \
+		YANK="$(if $(filter 1,$(yank)),1,)" \
+		./scripts/release.sh "$(RELEASE_VERSION)"
+
+release-derive: setup
+	@chmod +x scripts/release-derive.sh
+	@DRY_RUN="$(if $(filter 1,$(dry-run)),1,)" \
+		YANK="$(if $(filter 1,$(yank)),1,)" \
+		./scripts/release-derive.sh "$(RELEASE_VERSION)"
+
+check-yanked:
+	@./scripts/check-yanked.sh $(if $(filter 1,$(derive)),--derive)

@@ -1,18 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Propagate errexit into command substitutions (see BashFAQ/105).
+# Bash 4.4+ only. Older shells (macOS default 3.2) keep default behavior.
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+	shopt -s inherit_errexit
+fi
 
 # ---------------------------------------------------------------------------
-# Project detection
+# release.sh - guided, resumable release automation for GitHub repositories
+#
+# SYNOPSIS
+#	scripts/release.sh [version] [--dry-run] [--allow-staged] [--yank]
+#	                   [--<submodule>]
+#	make release [version=vX.Y.Z] [dry-run=1] [allow-staged=1] [yank=1]
+#
+# DESCRIPTION
+#	Drives a release from version bump to signed tag as a finite state
+#	machine. Each run detects how far a previous run progressed and
+#	continues from that point, so an interrupted release is re-run with
+#	the same command:
+#
+#	  entry states:  fresh | local | pr | poll | tag
+#	  phases:        prepare -> push_pr -> wait_merge -> tag_push -> done
+#
+#	Forward releases cut process/v<version> from main. Versions older
+#	than the latest tag become backports and cut from the matching
+#	release/vX.Y branch (created on demand, commits cherry-picked).
+#	Release notes are compiled from merged PR titles and labels. Release
+#	and yank marker tags are signed (GPG or SSH).
+#
+# OPTIONS
+#	version         Release version, X.Y.Z or vX.Y.Z. Prompted if absent.
+#	--dry-run       Preview every action. No workspace mutation.
+#	--allow-staged  Include already-staged changes in the release commit.
+#	--yank          Yank a published release: delete the GitHub release,
+#	                push signed yanked/v* marker. Release tag preserved.
+#	--<submodule>   Run against the named submodule from .gitmodules.
+#
+# ENVIRONMENT
+#	DRY_RUN         Non-empty enables --dry-run (set by make dry-run=1).
+#	ALLOW_STAGED    Non-empty enables --allow-staged (allow-staged=1).
+#	YANK            Non-empty enables --yank (yank=1).
+#
+# EXIT STATUS
+#	0  Release complete (or already complete), yank complete, or dry run.
+#	1  Precondition, validation, network, or tooling failure.
+#
+# DEPENDENCIES
+#	bash 3.2+ (extra hardening on 4.4+), git, gh (authenticated), jq,
+#	cargo (when version source is Cargo.toml), node (when version source
+#	is package.json), fzf (optional picker).
+#
+# ATTRIBUTION
+#	Tanveer Wahid <tan@wahid.email> - canonical version of this script:
+#	https://gist.github.com/sephynox/be7d7f742bea7738b74a3ad723eac165
 # ---------------------------------------------------------------------------
-PROJECT_NAME="$(git remote get-url origin 2>/dev/null \
-	| sed -e 's|.*/||' -e 's/\.git$//' || echo 'unknown')"
 
-DEFAULT_BRANCH="${DEFAULT_BRANCH:-$(git remote show origin 2>/dev/null \
-	| sed -n 's/.*HEAD branch: //p' || echo 'main')}"
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DEFAULT_BRANCH="master"
 
-# ---------------------------------------------------------------------------
-# Colors and formatting
-# ---------------------------------------------------------------------------
 BOLD='\033[1m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -26,136 +74,327 @@ info()  { printf "  ${CYAN}[info]${RESET} %s\n" "$1"; }
 step()  { printf "\n${BOLD}==> Step %s: %s${RESET}\n" "$1" "$2"; }
 header(){ printf "\n${BOLD}${CYAN}%s${RESET}\n" "$1"; }
 
+next_step() {
+	STEP=$((STEP + 1))
+	step "$STEP" "$1"
+}
+
+# HTTPS (.../repo.git) and SCP (git@host:org/repo.git or git@host:repo.git).
+project_name_from_remote() {
+	local url=""
+	if [[ -n "${1:-}" ]]; then
+		url="$(git -C "$1" remote get-url origin 2>/dev/null || true)"
+	else
+		url="$(git remote get-url origin 2>/dev/null || true)"
+	fi
+	if [[ -z "$url" ]]; then
+		printf "unknown"
+		return 0
+	fi
+	printf '%s\n' "$url" | sed -e 's/\.git$//' -e 's|.*/||' -e 's|.*:||'
+}
+
+# Exact remote ref checks, fail closed: a network/auth error must abort the
+# run instead of reading as "ref absent".
+# Usage: remote_ref_exists <tags|heads> <full-ref> [repo-dir]
+remote_ref_exists() {
+	local kind="$1"
+	local ref="$2"
+	local dir="${3:-.}"
+	local status=0
+
+	git -C "$dir" ls-remote --exit-code "--${kind}" origin "$ref" \
+		>/dev/null 2>&1 || status=$?
+	if (( status == 0 )); then
+		return 0
+	fi
+	if (( status == 2 )); then
+		return 1
+	fi
+	fail "Could not query origin for ${ref} (network or auth error)"
+}
+
+remote_tag_exists() {
+	remote_ref_exists tags "refs/tags/${1}" "${2:-.}"
+}
+
+remote_head_exists() {
+	remote_ref_exists heads "refs/heads/${1}" "${2:-.}"
+}
+
+require_tty() {
+	if [[ ! -t 0 ]]; then
+		fail "$1 requires an interactive terminal (stdin is not a TTY)"
+	fi
+}
+
+fail_diverged() {
+	fail "Local ${BRANCH} and origin/${BRANCH} have diverged. Update or delete the local branch, then retry."
+}
+
 # ---------------------------------------------------------------------------
-# Crate definitions
+# Release FSM
+#
+# Resume states (entry): fresh | local | pr | poll | tag
+# Phases (pipeline):     prepare -> push_pr -> wait_merge -> tag_push -> done
+#
+# Entry maps to first phase.
+# Each phase advances via fsm_next_phase.
 # ---------------------------------------------------------------------------
-CRATES=("tightbeam" "tightbeam-derive")
-CRATE_TOML_PATHS=("Cargo.toml" "tightbeam-derive/Cargo.toml")
-CRATE_VERSION_SECTIONS=("workspace.package" "package")
+
+fsm_assert_resume_state() {
+	case "$RESUME_STATE" in
+		fresh|local|pr|poll|tag) ;;
+		*) fail "Invalid resume state: '${RESUME_STATE}'" ;;
+	esac
+}
+
+fsm_entry_phase() {
+	case "$RESUME_STATE" in
+		fresh|local) printf "prepare" ;;
+		pr)          printf "push_pr" ;;
+		poll)        printf "wait_merge" ;;
+		tag)         printf "tag_push" ;;
+		*)           fail "Invalid resume state: '${RESUME_STATE}'" ;;
+	esac
+}
+
+fsm_assert_phase() {
+	case "$1" in
+		prepare|push_pr|wait_merge|tag_push|done) ;;
+		*) fail "Invalid release phase: '${1}'" ;;
+	esac
+}
+
+fsm_next_phase() {
+	case "$1" in
+		prepare)    printf "push_pr" ;;
+		push_pr)    printf "wait_merge" ;;
+		wait_merge) printf "tag_push" ;;
+		tag_push)   printf "done" ;;
+		*)          fail "Invalid release phase: '${1}'" ;;
+	esac
+}
+
+fsm_run_phase() {
+	local phase="$1"
+	fsm_assert_phase "$phase"
+	case "$phase" in
+		prepare)    prepare_release_work ;;
+		push_pr)    push_and_open_pr ;;
+		wait_merge) wait_for_merge ;;
+		tag_push)   return_and_tag ;;
+		done)       ;;
+	esac
+}
+
+run_release_fsm() {
+	fsm_assert_resume_state
+	local phase
+	phase="$(fsm_entry_phase)"
+	info "FSM entry: state=${RESUME_STATE} phase=${phase}"
+	while [[ "$phase" != "done" ]]; do
+		fsm_run_phase "$phase"
+		phase="$(fsm_next_phase "$phase")"
+	done
+}
 
 # ---------------------------------------------------------------------------
 # Version helpers
 # ---------------------------------------------------------------------------
 
-detect_version() {
-	local toml_path="$1"
-	local section="$2"
-	local section_re='^\['"${section//./\\.}"'\]'
-	local next_section_re='^\['
-	local version_re='^version[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)"'
+# Cargo workspaces version from [workspace.package] in the root Cargo.toml.
+CARGO_VERSION_SECTION="workspace.package"
 
-	local in_section=false
-	while IFS= read -r line; do
-		if [[ "$line" =~ $section_re ]]; then
-			in_section=true
-			continue
-		fi
-		if [[ "$in_section" == true && "$line" =~ $next_section_re ]]; then
-			break
-		fi
-		if [[ "$in_section" == true && "$line" =~ $version_re ]]; then
-			printf '%s' "${BASH_REMATCH[1]}"
-			return
-		fi
-	done < "$toml_path"
+cargo_read_version() {
+	awk -v section="$CARGO_VERSION_SECTION" -F'"' '
+		$0 ~ "^\\[" section "\\]" { in_section = 1; next }
+		in_section && /^\[/ { in_section = 0 }
+		in_section && /^version[[:space:]]*=/ { print $2; exit }
+	' Cargo.toml 2>/dev/null || true
+}
+
+cargo_write_version() {
+	local version="$1"
+	local tmpfile
+	tmpfile=$(mktemp)
+	awk -v section="$CARGO_VERSION_SECTION" -v version="$version" '
+		$0 ~ "^\\[" section "\\]" { in_section = 1; print; next }
+		in_section && /^\[/ { in_section = 0 }
+		in_section && !replaced \
+			&& /^version[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"/ {
+			sub(/"[0-9]+\.[0-9]+\.[0-9]+"/, "\"" version "\"")
+			replaced = 1
+		}
+		{ print }
+		END { exit replaced ? 0 : 1 }
+	' Cargo.toml > "$tmpfile" \
+		|| fail "Could not find version field in [${CARGO_VERSION_SECTION}] of Cargo.toml"
+	mv "$tmpfile" Cargo.toml
+}
+
+detect_version_source() {
+	if [[ -f Cargo.toml ]]; then
+		printf "cargo"
+	elif [[ -f package.json ]]; then
+		printf "npm"
+	elif [[ -f VERSION ]]; then
+		printf "file"
+	fi
+}
+
+detect_version() {
+	case "$(detect_version_source)" in
+		cargo) cargo_read_version ;;
+		npm)   node -p "require('./package.json').version" 2>/dev/null || true ;;
+		file)  cat VERSION ;;
+	esac
 }
 
 bump_version() {
 	local version="$1"
-	local toml_path="$2"
-	local section="$3"
-	local section_re='^\['"${section//./\\.}"'\]'
-	local next_section_re='^\['
-	local bump_re='^(version[[:space:]]*=[[:space:]]*")[0-9]+\.[0-9]+\.[0-9]+(".*)'
+	local source
+	source="$(detect_version_source)"
+	case "$source" in
+		cargo)
+			cargo_write_version "$version"
+			git add Cargo.toml
+			if [[ -f Cargo.lock ]]; then
+				cargo generate-lockfile --offline --quiet 2>/dev/null \
+					|| cargo generate-lockfile --quiet 2>/dev/null \
+					|| true
+				git add Cargo.lock
+			fi
+			# Repo adaptation: cargo and npm share one workspace version;
+			# the release workflow verifies both against the tag.
+			if [[ -f ws/client/package.json ]]; then
+				(cd ws/client && npm version "$version" \
+					--no-git-tag-version --allow-same-version >/dev/null) \
+					|| fail "Could not bump ws/client/package.json to ${version}"
+				git add ws/client/package.json
+				if [[ -f ws/package-lock.json ]]; then
+					(cd ws && npm install --package-lock-only \
+						--ignore-scripts >/dev/null 2>&1) \
+						|| fail "Could not refresh ws/package-lock.json for ${version}"
+					git add ws/package-lock.json
+				fi
+			fi
+			;;
+		npm)
+			npm version "$version" --no-git-tag-version --allow-same-version
+			git add package.json
+			[[ -f npm-shrinkwrap.json ]] && git add npm-shrinkwrap.json
+			[[ -f package-lock.json ]] && git add package-lock.json
+			;;
+		file)
+			printf '%s\n' "$version" > VERSION
+			git add VERSION
+			;;
+		*)
+			fail "No version source found (need Cargo.toml, package.json, or VERSION)"
+			;;
+	esac
+	ok "Version updated to ${version}"
+}
 
-	local in_section=false
-	local replaced=false
-	local tmpfile
-	tmpfile=$(mktemp)
-
-	while IFS= read -r line; do
-		if [[ "$line" =~ $section_re ]]; then
-			in_section=true
-		elif [[ "$in_section" == true && "$line" =~ $next_section_re ]]; then
-			in_section=false
-		fi
-
-		if [[ "$in_section" == true && "$replaced" == false && "$line" =~ $bump_re ]]; then
-			printf '%s%s%s\n' "${BASH_REMATCH[1]}" "$version" "${BASH_REMATCH[2]}" >> "$tmpfile"
-			replaced=true
-		else
-			printf '%s\n' "$line" >> "$tmpfile"
-		fi
-	done < "$toml_path"
-
-	mv "$tmpfile" "$toml_path"
-	git add "$toml_path"
-	if [[ -f Cargo.lock ]]; then
-		cargo generate-lockfile --quiet 2>/dev/null || true
-		git add Cargo.lock
-	fi
-
-	if [[ "$replaced" == true ]]; then
-		ok "Version updated to ${version} in ${toml_path}"
-	else
-		fail "Could not find version field in [${section}] of ${toml_path}"
+# Plain X.Y.Z only; prerelease/build metadata (SemVer 2.0.0 items 9-10) is
+# rejected so arithmetic comparison below cannot silently misread it.
+assert_plain_semver() {
+	if [[ ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		fail "Invalid semver format: '${1}'. Expected X.Y.Z (e.g. 0.2.0)"
 	fi
 }
 
-# Sync the tightbeam-derive requirement in [workspace.dependencies] to match
-# the derive crate's released version.
-bump_workspace_derive_dep() {
-	local version="$1"
-	local toml_path="Cargo.toml"
-	local dep_re='^(tightbeam-derive[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*")[0-9]+\.[0-9]+\.[0-9]+(".*)$'
-
-	local replaced=false
-	local tmpfile
-	tmpfile=$(mktemp)
-
-	while IFS= read -r line; do
-		if [[ "$replaced" == false && "$line" =~ $dep_re ]]; then
-			printf '%s%s%s\n' "${BASH_REMATCH[1]}" "$version" "${BASH_REMATCH[2]}" >> "$tmpfile"
-			replaced=true
-		else
-			printf '%s\n' "$line" >> "$tmpfile"
+semver_compare() {
+	local -a a b
+	local i
+	assert_plain_semver "$1"
+	assert_plain_semver "$2"
+	IFS=. read -ra a <<< "$1"
+	IFS=. read -ra b <<< "$2"
+	for i in 0 1 2; do
+		if (( a[i] > b[i] )); then
+			printf "gt"
+			return 0
 		fi
-	done < "$toml_path"
+		if (( a[i] < b[i] )); then
+			printf "lt"
+			return 0
+		fi
+	done
+	printf "eq"
+}
 
-	mv "$tmpfile" "$toml_path"
-	git add "$toml_path"
+working_tree_clean() {
+	git diff --quiet --ignore-submodules \
+		&& git diff --cached --quiet --ignore-submodules
+}
 
-	if [[ "$replaced" == true ]]; then
-		ok "Workspace dependency tightbeam-derive set to ${version}"
-	else
-		fail "Could not find tightbeam-derive in [workspace.dependencies] of ${toml_path}"
+# Version recorded at <ref> (Cargo.toml, package.json, or VERSION); empty if none.
+version_at_ref() {
+	local ref="$1"
+	if git cat-file -e "${ref}:Cargo.toml" 2>/dev/null; then
+		git show "${ref}:Cargo.toml" | awk -v section="$CARGO_VERSION_SECTION" -F'"' '
+			$0 ~ "^\\[" section "\\]" { in_section = 1; next }
+			in_section && /^\[/ { in_section = 0 }
+			in_section && /^version[[:space:]]*=/ { print $2; exit }
+		' 2>/dev/null || true
+	elif git cat-file -e "${ref}:package.json" 2>/dev/null; then
+		git show "${ref}:package.json" \
+			| node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version" 2>/dev/null || true
+	elif git cat-file -e "${ref}:VERSION" 2>/dev/null; then
+		git show "${ref}:VERSION" | tr -d '\n' || true
 	fi
 }
 
 # ---------------------------------------------------------------------------
-# General helpers
+# Changelog / summary / gh helpers
 # ---------------------------------------------------------------------------
 
+# Usage: compile_changelog [ref]
 compile_changelog() {
+	local ref="${1:-HEAD}"
+
 	if [[ -n "${CHANGELOG:-}" ]]; then
 		return 0
 	fi
 
 	local last_tag
-	last_tag=$(git describe --tags --match "${TAG_PREFIX}*" --abbrev=0 2>/dev/null) \
-		|| last_tag=$(git rev-list --max-parents=0 HEAD)
+	last_tag=$(git describe --tags --match "releases/v*" --abbrev=0 "$ref" 2>/dev/null) \
+		|| last_tag=$(git rev-list --max-parents=0 "$ref")
 
 	local date_str
 	date_str=$(date +%Y-%m-%d)
 
 	local changelog_title="## v${VERSION} (${date_str})"
 
+	local components="" i
+	if [[ -z "$REPO_DIR" && ${#SUBMODULES[@]} -gt 0 ]]; then
+		components=$'\n### Components\n'
+		for i in "${!SUBMODULES[@]}"; do
+			local submod="${SUBMODULES[$i]}"
+			local sub_version
+			sub_version=$(cd "$submod" && detect_version)
+			local sub_sha
+			sub_sha=$(git -C "$submod" rev-parse --short HEAD)
+
+			local line="- **${submod}**"
+			if [[ -n "$sub_version" ]]; then
+				line+=" v${sub_version}"
+			fi
+			line+=" (\`${sub_sha}\`)"
+			if [[ -n "${SUBMODULE_REFS[$i]:-}" ]]; then
+				line+=" @ ${SUBMODULE_REFS[$i]}"
+			fi
+			components+="${line}"$'\n'
+		done
+	fi
+
 	local body=""
 	local merge_subjects
-	merge_subjects=$(git log "${last_tag}..HEAD" --merges --format="%s")
+	merge_subjects=$(git log "${last_tag}..${ref}" --merges --format="%s")
 
-	local labels_file
-	labels_file=$(mktemp)
+	local labels=""
 
 	if [[ -n "$merge_subjects" ]]; then
 		while IFS= read -r subject; do
@@ -172,7 +411,7 @@ compile_changelog() {
 
 			local is_release_pr
 			is_release_pr=$(echo "$pr_json" \
-				| jq -r '.headRefName | startswith("process/")')
+				| jq -r '.headRefName | startswith("process/v")')
 			[[ "$is_release_pr" == "true" ]] && continue
 
 			local pr_line
@@ -182,22 +421,35 @@ compile_changelog() {
 
 			body+="${pr_line}"$'\n'
 
-			echo "$pr_json" | jq -r '.labels[].name' >> "$labels_file"
+			labels+="$(echo "$pr_json" | jq -r '.labels[].name')"$'\n'
 		done <<< "$merge_subjects"
 	fi
 
-	RELEASE_LABELS=$(sort -u "$labels_file" 2>/dev/null || true)
-	rm -f "$labels_file"
+	RELEASE_LABELS=$(printf '%s' "$labels" | sort -u)
 
-	CHANGELOG="${changelog_title}
+	if [[ -n "$body" && -n "$components" ]]; then
+		CHANGELOG="${changelog_title}
+${components}
+### Changes
 
 ${body}"
+	elif [[ -n "$components" ]]; then
+		CHANGELOG="${changelog_title}
+${components}"
+	elif [[ -n "$body" ]]; then
+		CHANGELOG="${changelog_title}
+
+${body}"
+	else
+		CHANGELOG="$changelog_title"
+	fi
 }
 
+# Usage: print_release_notes [ref]
 print_release_notes() {
-	compile_changelog
+	compile_changelog "${1:-HEAD}"
 	printf "\n"
-	printf "  ${BOLD}Release Notes (v${VERSION})${RESET}\n"
+	printf "  ${BOLD}Release Notes (v%s)${RESET}\n" "$VERSION"
 	printf "  ──────────────────────────────────\n"
 	printf '%s\n' "$CHANGELOG" | while IFS= read -r line; do
 		printf "  %s\n" "$line"
@@ -208,12 +460,26 @@ print_release_notes() {
 print_summary() {
 	printf "\n"
 	printf "  ${BOLD}Project:${RESET}   %s\n" "$PROJECT_NAME"
-	printf "  ${BOLD}Crate:${RESET}     %s\n" "$TARGET_CRATE"
 	printf "  ${BOLD}Version:${RESET}   %s\n" "$VERSION"
 	printf "  ${BOLD}Tag:${RESET}       %s\n" "$TAG"
 	printf "  ${BOLD}Branch:${RESET}    %s\n" "$BRANCH"
 	if [[ "$RELEASE_MODE" == "backport" ]]; then
 		printf "  ${BOLD}Base:${RESET}      %s\n" "$PR_BASE"
+	fi
+	if [[ -z "$REPO_DIR" && ${#SUBMODULES[@]} -gt 0 ]]; then
+		local i pad
+		for i in "${!SUBMODULES[@]}"; do
+			local submod="${SUBMODULES[$i]}"
+			local label
+			label="$(echo "${submod:0:1}" | tr '[:lower:]' '[:upper:]')${submod:1}"
+			pad=$((10 - ${#label}))
+			if (( pad < 1 )); then
+				pad=1
+			fi
+			printf "  ${BOLD}%s:${RESET}%s%s\n" "$label" \
+				"$(printf '%*s' "$pad" '')" \
+				"${SUBMODULE_REFS[$i]:-current}"
+		done
 	fi
 	printf "\n"
 }
@@ -222,11 +488,23 @@ poll_pr() {
 	local pr_number="$1"
 	local start_time
 	start_time=$(date +%s)
+	local failures=0
 
 	info "Polling PR #${pr_number} for merge (every 10s)..."
 	while true; do
+		# Tolerate transient gh/network failures instead of dying mid-wait.
 		local state
-		state=$(gh pr view "$pr_number" --json state --jq .state)
+		if state=$(gh pr view "$pr_number" --json state --jq .state 2>/dev/null); then
+			failures=0
+		else
+			failures=$((failures + 1))
+			if (( failures >= 6 )); then
+				fail "Could not read PR #${pr_number} state after ${failures} consecutive attempts (gh or network error)"
+			fi
+			info "Could not read PR #${pr_number} state (attempt ${failures}/6) - retrying in 10s"
+			sleep 10
+			continue
+		fi
 
 		local now elapsed
 		now=$(date +%s)
@@ -257,123 +535,84 @@ ensure_label() {
 	fi
 }
 
-semver_compare() {
-	local IFS=.
-	local -a a=($1) b=($2)
-	for i in 0 1 2; do
-		if (( a[i] > b[i] )); then
-			printf "gt"; return
-		elif (( a[i] < b[i] )); then
-			printf "lt"; return
+# ---------------------------------------------------------------------------
+# Submodule helpers
+# ---------------------------------------------------------------------------
+
+detect_submodules() {
+	SUBMODULES=()
+	local name
+	if [[ -f .gitmodules ]]; then
+		while IFS= read -r name; do
+			SUBMODULES+=("$name")
+		done < <(git config --file .gitmodules --get-regexp 'submodule\..*\.path' \
+			| awk '{print $2}')
+	fi
+}
+
+resolve_submodule_ref() {
+	local name="$1"
+	local ref="$2"
+
+	git submodule update --init -- "$name"
+
+	if ! git -C "$name" diff --quiet || ! git -C "$name" diff --cached --quiet; then
+		fail "${name}: has uncommitted changes"
+	fi
+
+	git -C "$name" fetch origin --quiet --tags
+	if ! git -C "$name" rev-parse --verify "${ref}^{commit}" &>/dev/null; then
+		fail "${name}: ref '${ref}' not found (fetch returned no match)"
+	fi
+
+	if [[ "$ref" == releases/v* ]]; then
+		local yanked_tag="yanked/${ref#releases/}"
+		if remote_tag_exists "$yanked_tag" "$name"; then
+			fail "${name}: version ${ref#releases/} has been yanked"
+		fi
+	fi
+
+	local resolved
+	resolved=$(git -C "$name" rev-parse --short "${ref}^{commit}")
+	git -C "$name" checkout "$ref" --quiet
+	ok "${name}: pinned to ${ref} (${resolved})"
+}
+
+resolve_or_keep() {
+	local name="$1"
+	local ref="$2"
+
+	if [[ -n "$ref" ]]; then
+		resolve_submodule_ref "$name" "$ref"
+	else
+		git submodule update --init "$name"
+		ok "${name}: keeping committed pointer"
+	fi
+}
+
+resolve_submodules() {
+	local i
+	for i in "${!SUBMODULES[@]}"; do
+		resolve_or_keep "${SUBMODULES[$i]}" "${SUBMODULE_REFS[$i]:-}"
+	done
+}
+
+stage_submodules() {
+	local staged=false
+	local i
+
+	for i in "${!SUBMODULES[@]}"; do
+		if [[ -n "${SUBMODULE_REFS[$i]:-}" ]]; then
+			git add "${SUBMODULES[$i]}"
+			staged=true
 		fi
 	done
-	printf "eq"
-}
 
-# Abort unless a commit-signing key is configured.
-require_signing_key() {
-	local signing_key
-	signing_key=$(git config user.signingkey 2>/dev/null || true)
-	if [[ -n "$signing_key" ]]; then
-		local sign_format
-		sign_format=$(git config gpg.format 2>/dev/null || echo "openpgp")
-		ok "Signing configured (format: ${sign_format})"
-		return 0
-	fi
-
-	cat >&2 <<-SIGNING
-	
-	  ${RED}No signing key configured.${RESET}
-	
-	  Configure GPG signing:
-	    git config --global user.signingkey <GPG-KEY-ID>
-	
-	  Or configure SSH signing:
-	    git config --global gpg.format ssh
-	    git config --global user.signingkey ~/.ssh/id_ed25519.pub
-	
-	SIGNING
-	fail "Signing key is required for releases"
-}
-
-# Abort unless on the default branch and in sync with origin.
-require_default_branch_synced() {
-	local current_branch
-	current_branch=$(git branch --show-current)
-	[[ "$current_branch" == "$DEFAULT_BRANCH" ]] \
-		|| fail "Must be on branch ${DEFAULT_BRANCH} (currently on ${current_branch})"
-
-	git fetch origin "$DEFAULT_BRANCH" --quiet
-	[[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/${DEFAULT_BRANCH}")" ]] \
-		|| fail "${DEFAULT_BRANCH} is not up to date with origin/${DEFAULT_BRANCH} (pull or push first)"
-	ok "On ${DEFAULT_BRANCH}, up to date with origin"
-}
-
-# Commit the staged release changes, falling back to an empty marker commit.
-commit_release() {
-	local message="$1"
-	if git diff --cached --quiet; then
-		info "Nothing staged - creating empty release marker commit"
-		git commit --allow-empty -m "$message"
+	if [[ "$staged" == true ]]; then
+		ok "Submodule pointers updated"
 	else
-		git commit -m "$message"
+		ok "No submodule changes"
 	fi
-	ok "Committed ${message}"
-}
-
-# Inspect a release branch, setting PR_NUMBER, PR_STATE, and RESUME_STATE to one
-# of: tag (PR merged), poll (PR open), pr (remote branch only), fresh (none).
-detect_pr_resume_state() {
-	local branch="$1"
-
-	PR_NUMBER=""
-	PR_STATE=""
-	RESUME_STATE="fresh"
-
-	local pr_line
-	pr_line=$(gh pr list --head "$branch" --state all --json number,state \
-		--jq '.[0] | [.number, .state] | @tsv' 2>/dev/null || true)
-	[[ -n "$pr_line" ]] && IFS=$'\t' read -r PR_NUMBER PR_STATE <<< "$pr_line"
-
-	if [[ -n "$PR_NUMBER" && "$PR_STATE" == "MERGED" ]]; then
-		RESUME_STATE="tag"
-		info "[resume] PR #${PR_NUMBER} already merged, continuing to tag..."
-	elif [[ -n "$PR_NUMBER" && "$PR_STATE" == "OPEN" ]]; then
-		RESUME_STATE="poll"
-		info "[resume] PR #${PR_NUMBER} is open, waiting for merge..."
-	elif git ls-remote --heads origin "$branch" 2>/dev/null | grep -q "$branch"; then
-		RESUME_STATE="pr"
-		info "[resume] Branch ${branch} exists on remote, creating PR..."
-	fi
-}
-
-# Open the release PR, attaching the changelog-derived labels. Sets PR_NUMBER.
-create_release_pr() {
-	local title="$1"
-	local base="$2"
-	local head="$3"
-
-	compile_changelog
-	ensure_label "release"
-
-	local pr_args=(
-		--title "$title"
-		--body "$CHANGELOG"
-		--base "$base"
-		--head "$head"
-		--assignee "@me"
-	)
-	local labels
-	labels=$(printf 'release\n%s\n' "${RELEASE_LABELS:-}" | sort -u)
-	local label
-	while IFS= read -r label; do
-		[[ -n "$label" ]] && pr_args+=(--label "$label")
-	done <<< "$labels"
-
-	local pr_url
-	pr_url=$(gh pr create "${pr_args[@]}")
-	PR_NUMBER="${pr_url##*/}"
-	ok "PR #${PR_NUMBER} created: ${pr_url}"
 }
 
 # ---------------------------------------------------------------------------
@@ -388,7 +627,7 @@ ensure_release_branch() {
 
 	git fetch origin --quiet --tags
 
-	if git ls-remote --heads origin "$branch" 2>/dev/null | grep -q "$branch"; then
+	if remote_head_exists "$branch"; then
 		git checkout "$branch" --quiet
 		git pull origin "$branch" --quiet
 		ok "Release branch ${branch} is up to date"
@@ -397,26 +636,49 @@ ensure_release_branch() {
 
 	local base_tag=""
 	if (( patch > 0 )); then
-		base_tag="${TAG_PREFIX}v${major}.${minor}.0"
+		base_tag="releases/v${major}.${minor}.0"
 		if ! git rev-parse --verify "${base_tag}^{commit}" &>/dev/null; then
 			fail "Base tag ${base_tag} not found - release v${major}.${minor}.0 first"
 		fi
 	else
-		local latest_branch
-		latest_branch=$(git branch -r --list "origin/release/${BRANCH_PREFIX}${major}.*" \
-			--sort=-v:refname 2>/dev/null | head -1 | tr -d ' ')
+		local latest_branch=""
+		local candidate candidate_minor
+		while IFS= read -r candidate; do
+			candidate="${candidate//[[:space:]]/}"
+			[[ -z "$candidate" ]] && continue
+			candidate_minor="${candidate##*.}"
+			[[ "$candidate_minor" =~ ^[0-9]+$ ]] || continue
+			# Never fork a new minor line from a higher minor's tip
+			if (( candidate_minor < minor )); then
+				latest_branch="$candidate"
+				break
+			fi
+		done < <(git branch -r --list "origin/release/v${major}.*" --sort=-v:refname 2>/dev/null)
 		if [[ -n "$latest_branch" ]]; then
-			base_tag="${latest_branch#origin/}"
-			git checkout "$base_tag" --quiet
-			git checkout -b "$branch"
+			git checkout -b "$branch" "$latest_branch"
 			git push -u origin "$branch" --quiet
 			ok "Created release branch ${branch} from ${latest_branch}"
 			return
 		fi
 
-		base_tag=$(git tag --list "${TAG_PREFIX}v${major}.*" --sort=-v:refname | head -1)
+		base_tag=""
+		local tag_candidate tag_minor
+		while IFS= read -r tag_candidate; do
+			[[ -z "$tag_candidate" ]] && continue
+			tag_minor="${tag_candidate#"releases/v${major}."}"
+			tag_minor="${tag_minor%%.*}"
+			[[ "$tag_minor" =~ ^[0-9]+$ ]] || continue
+			# Never base a new minor line on a higher minor's tag
+			if (( tag_minor < minor )); then
+				base_tag="$tag_candidate"
+				break
+			fi
+		done < <(git tag --list "releases/v${major}.*" --sort=-v:refname)
 		if [[ -z "$base_tag" ]]; then
-			fail "No release found for major version ${major}"
+			# No lower minor line exists (always true for a new .0 line):
+			# cut from DEFAULT_BRANCH, per the standard release-lines model
+			git fetch origin "$DEFAULT_BRANCH" --quiet
+			base_tag="origin/${DEFAULT_BRANCH}"
 		fi
 	fi
 
@@ -444,13 +706,16 @@ interactive_cherry_pick() {
 		info "${count} commits available - consider narrowing your selection"
 	fi
 
-	local selected=""
+	local selected="" line i selection idx
+	local -a indices
 	if command -v fzf &>/dev/null; then
 		selected=$(echo "$commits" \
 			| fzf --multi --reverse \
 				--header "Select commits to cherry-pick (TAB to select, ENTER to confirm)" \
 			|| true)
 	else
+		require_tty "Cherry-pick selection"
+
 		local -a lines=()
 		while IFS= read -r line; do
 			lines+=("$line")
@@ -471,10 +736,14 @@ interactive_cherry_pick() {
 
 		IFS=',' read -ra indices <<< "$selection"
 		for idx in "${indices[@]}"; do
-			idx=$(( ${idx// /} - 1 ))
-			if (( idx >= 0 && idx < ${#lines[@]} )); then
-				selected+="${lines[$idx]}"$'\n'
+			idx="${idx//[[:space:]]/}"
+			if [[ ! "$idx" =~ ^[0-9]+$ ]]; then
+				fail "Invalid selection: '${idx}' (expected numbers like 1,3,5)"
 			fi
+			if (( idx < 1 || idx > ${#lines[@]} )); then
+				fail "Selection out of range: ${idx} (valid: 1-${#lines[@]})"
+			fi
+			selected+="${lines[idx - 1]}"$'\n'
 		done
 	fi
 
@@ -486,348 +755,124 @@ interactive_cherry_pick() {
 	while IFS= read -r line; do
 		[[ -z "$line" ]] && continue
 		local sha="${line%% *}"
-		if ! git cherry-pick "$sha"; then
+		if ! git cherry-pick -S "$sha"; then
 			printf "\n"
 			fail "Cherry-pick conflict on ${line}
         Resolve the conflict, then resume:
-          git cherry-pick --continue
-          make release v${VERSION}"
+          git -c commit.gpgsign=true cherry-pick --continue
+          make release version=v${VERSION}"
 		fi
 		ok "Cherry-picked ${line}"
 	done <<< "$selected"
 }
 
 # ---------------------------------------------------------------------------
-# Combined (workspace + derive) release helpers
+# Phase functions
 # ---------------------------------------------------------------------------
 
-# Prompt for a version, echoing the current value when the user enters nothing.
-prompt_version() {
-	local label="$1"
-	local current="$2"
-	local input
+parse_args() {
+	local dry_run_env="${DRY_RUN:-}"
+	local allow_staged_env="${ALLOW_STAGED:-}"
+	local yank_env="${YANK:-}"
 
-	printf "\n  Enter %s version (current: %s, enter to keep): " \
-		"$label" "${current:-unknown}" >&2
-	read -r input
-	input="${input#v}"
-	[[ -z "$input" ]] && input="$current"
+	DRY_RUN=false
+	ALLOW_STAGED=false
+	YANK=false
+	VERSION=""
+	REPO_DIR=""
 
-	printf '%s' "$input"
-}
-
-# Echo the version of a crate currently published on crates.io (empty if none).
-crates_io_version() {
-	local crate="$1"
-	cargo search "$crate" --limit 1 2>/dev/null \
-		| sed -n "s/^${crate} = \"\([^\"]*\)\".*/\1/p" | head -1
-}
-
-# Block until a crate version is queryable on crates.io, so dependents publish
-# against an indexed release instead of racing it.
-wait_for_crate() {
-	local crate="$1"
-	local want="$2"
-	local waited=0
-	local timeout=300
-
-	info "Waiting for ${crate} ${want} on crates.io..."
-	while (( waited < timeout )); do
-		local current
-		current=$(crates_io_version "$crate")
-		if [[ "$current" == "$want" ]]; then
-			ok "${crate} ${want} is live on crates.io"
-			return 0
-		fi
-		printf "  ${YELLOW}[wait]${RESET} %s on crates.io is %s (%ds elapsed)\n" \
-			"$crate" "${current:-none}" "$waited"
-		sleep 15
-		waited=$(( waited + 15 ))
-	done
-
-	fail "Timed out waiting for ${crate} ${want} on crates.io"
-}
-
-# Create (signed) and push a tag for one crate, computing its changelog against
-# the crate's own tag namespace.
-push_crate_tag() {
-	local tag="$1"
-	local crate_version="$2"
-	local tag_prefix="$3"
-
-	if [[ -n "$(git tag --list "$tag")" ]]; then
-		ok "Tag ${tag} already exists locally - skipping creation"
-	else
-		VERSION="$crate_version"
-		TAG_PREFIX="$tag_prefix"
-		CHANGELOG=""
-		compile_changelog
-		git tag -s -a "$tag" -m "$CHANGELOG"
-		ok "Tag ${tag} created (signed)"
-	fi
-
-	git push origin "$tag"
-	ok "Tag ${tag} pushed"
-}
-
-# Release tightbeam-derive and tightbeam together: one PR bumping both crates,
-# then derive is tagged/published first and tightbeam follows once derive is
-# live on crates.io.
-run_combined_release() {
-	command -v gh &>/dev/null || fail "gh CLI is required (https://cli.github.com)"
-	ok "gh CLI available"
-
-	local tb_toml="Cargo.toml"
-	local tb_section="workspace.package"
-	local dv_toml="tightbeam-derive/Cargo.toml"
-	local dv_section="package"
-
-	local tb_current dv_current
-	tb_current=$(detect_version "$tb_toml" "$tb_section")
-	dv_current=$(detect_version "$dv_toml" "$dv_section")
-
-	local tb_ver="$VERSION"
-	local dv_ver="$DERIVE_VERSION"
-	[[ -z "$tb_ver" ]] && tb_ver=$(prompt_version "tightbeam" "$tb_current")
-	[[ -z "$dv_ver" ]] && dv_ver=$(prompt_version "tightbeam-derive" "$dv_current")
-	tb_ver="${tb_ver#v}"
-	dv_ver="${dv_ver#v}"
-
-	local v
-	for v in "$tb_ver" "$dv_ver"; do
-		[[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-			|| fail "Invalid semver format: '${v}'. Expected X.Y.Z (e.g. 0.2.0)"
-	done
-
-	if [[ "$DRY_RUN" == true ]]; then
-		header "Combined release (dry run)"
-	else
-		header "Combined release"
-	fi
-	ok "tightbeam:        ${tb_current:-unknown} -> ${tb_ver}"
-	ok "tightbeam-derive: ${dv_current:-unknown} -> ${dv_ver}"
-
-	local branch="process/v${tb_ver}"
-	local tb_tag="releases/v${tb_ver}"
-	local dv_tag="releases/derive/v${dv_ver}"
-
-	local tb_done=false
-	local dv_done=false
-	git ls-remote --tags origin "$tb_tag" 2>/dev/null | grep -q "$tb_tag" && tb_done=true
-	git ls-remote --tags origin "$dv_tag" 2>/dev/null | grep -q "$dv_tag" && dv_done=true
-	if [[ "$tb_done" == true && "$dv_done" == true ]]; then
-		ok "Both tags already exist on remote - nothing to do"
-		return 0
-	fi
-
-	local dv_changed=true
-	if [[ "$dv_ver" == "$dv_current" ]]; then
-		dv_changed=false
-		info "tightbeam-derive unchanged at ${dv_ver} - skipping version bump"
-	fi
-
-	detect_pr_resume_state "$branch"
-	local resume="$RESUME_STATE"
-	ok "Release state: ${resume}"
-
-	if [[ "$resume" == "fresh" ]]; then
-		if [[ -n "$tb_current" && "$tb_done" == false \
-			&& "$(semver_compare "$tb_ver" "$tb_current")" == "lt" ]]; then
-			fail "tightbeam ${tb_ver} is older than current ${tb_current}"
-		fi
-		if [[ -n "$dv_current" && "$dv_done" == false \
-			&& "$(semver_compare "$dv_ver" "$dv_current")" == "lt" ]]; then
-			fail "tightbeam-derive ${dv_ver} is older than current ${dv_current}"
-		fi
-
-		header "Validating preconditions..."
-		require_signing_key
-
-		git diff --quiet || fail "Working tree has unstaged changes"
-		if ! git diff --cached --quiet; then
-			[[ "$ALLOW_STAGED" == true ]] || fail "Working tree has staged changes (use --allow-staged to include them)"
-			info "Staged changes will be included in the release commit"
-		fi
-
-		require_default_branch_synced
-	fi
-
-	VERSION="$tb_ver"
-	TAG_PREFIX="releases/"
-
-	if [[ "$DRY_RUN" == true ]]; then
-		header "Release notes preview"
-		print_release_notes
-		printf "\n"
-		info "Dry run complete. No changes were made."
-		return 0
-	fi
-
-	local commit_msg="chore(release): tightbeam v${tb_ver}"
-	[[ "$dv_changed" == true ]] && commit_msg+=" + tightbeam-derive v${dv_ver}"
-	local pr_title="chore(release): v${tb_ver}"
-	[[ "$dv_changed" == true ]] && pr_title+=" + tightbeam-derive v${dv_ver}"
-	local n=0
-
-	if [[ "$resume" == "fresh" ]]; then
-		n=$((n + 1))
-		step $n "Create branch ${branch}"
-		git checkout -b "$branch"
-		ok "Branch created"
-
-		if [[ "$dv_changed" == true ]]; then
-			bump_version "$dv_ver" "$dv_toml" "$dv_section"
-			bump_workspace_derive_dep "$dv_ver"
-		fi
-		bump_version "$tb_ver" "$tb_toml" "$tb_section"
-
-		n=$((n + 1))
-		step $n "Preview release notes"
-		print_release_notes
-
-		n=$((n + 1))
-		step $n "Commit release"
-		commit_release "$commit_msg"
-	fi
-
-	if [[ "$resume" == "fresh" || "$resume" == "pr" ]]; then
-		n=$((n + 1))
-		step $n "Push branch and create PR"
-		if [[ "$resume" == "fresh" ]]; then
-			git push -u origin "$branch"
-			ok "Branch pushed to origin"
-		fi
-		create_release_pr "$pr_title" "$DEFAULT_BRANCH" "$branch"
-	fi
-
-	if [[ "$resume" == "fresh" || "$resume" == "pr" || "$resume" == "poll" ]]; then
-		n=$((n + 1))
-		step $n "Wait for PR merge"
-		poll_pr "$PR_NUMBER"
-	fi
-
-	if [[ "$resume" != "tag" ]]; then
-		n=$((n + 1))
-		step $n "Return to ${DEFAULT_BRANCH}"
-		git checkout "$DEFAULT_BRANCH"
-		git pull origin "$DEFAULT_BRANCH" --quiet
-		ok "On ${DEFAULT_BRANCH} at $(git rev-parse --short HEAD)"
-	fi
-
-	if [[ "$dv_done" == false ]]; then
-		n=$((n + 1))
-		step $n "Tag tightbeam-derive (${dv_tag})"
-		local dv_manifest
-		dv_manifest=$(detect_version "$dv_toml" "$dv_section")
-		[[ "$dv_manifest" == "$dv_ver" ]] \
-			|| fail "tightbeam-derive manifest is ${dv_manifest:-unknown}, expected ${dv_ver} before tagging ${dv_tag}"
-		push_crate_tag "$dv_tag" "$dv_ver" "releases/derive/"
-		wait_for_crate "tightbeam-derive" "$dv_ver"
-	else
-		info "tightbeam-derive ${dv_ver} already released - skipping derive tag"
-	fi
-
-	if [[ "$tb_done" == false ]]; then
-		n=$((n + 1))
-		step $n "Tag tightbeam (${tb_tag})"
-		push_crate_tag "$tb_tag" "$tb_ver" "releases/"
-	else
-		info "tightbeam ${tb_ver} already released - skipping workspace tag"
-	fi
-
-	header "Combined release complete!"
-	printf "\n"
-	printf "  ${BOLD}tightbeam:${RESET}        v%s (%s)\n" "$tb_ver" "$tb_tag"
-	printf "  ${BOLD}tightbeam-derive:${RESET} v%s (%s)\n" "$dv_ver" "$dv_tag"
-	printf "\n"
-}
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-DRY_RUN=false
-ALLOW_STAGED=false
-YANK=false
-COMBINED=true
-VERSION=""
-DERIVE_VERSION=""
-TARGET_CRATE=""
-CRATE_INDEX=0
-
-for arg in "$@"; do
-	if [[ "$arg" == "--dry-run" ]]; then
+	if [[ -n "$dry_run_env" ]]; then
 		DRY_RUN=true
-	elif [[ "$arg" == "--allow-staged" ]]; then
+	fi
+	if [[ -n "$allow_staged_env" ]]; then
 		ALLOW_STAGED=true
-	elif [[ "$arg" == "--yank" ]]; then
+	fi
+	if [[ -n "$yank_env" ]]; then
 		YANK=true
-		COMBINED=false
-	elif [[ "$arg" == "--both" ]]; then
-		COMBINED=true
-	elif [[ "$arg" == "--single" ]]; then
-		COMBINED=false
-	elif [[ "$arg" == --derive=* ]]; then
-		COMBINED=true
-		DERIVE_VERSION="${arg#--derive=}"
-	elif [[ "$arg" == "--derive" ]]; then
-		COMBINED=false
-		CRATE_INDEX=1
-	elif [[ -z "$VERSION" ]]; then
-		VERSION="$arg"
 	fi
-done
 
-VERSION="${VERSION#v}"
-
-if [[ "$COMBINED" == true ]]; then
-	run_combined_release
-	exit 0
-fi
-
-TARGET_CRATE="${CRATES[$CRATE_INDEX]}"
-CARGO_TOML_PATH="${CRATE_TOML_PATHS[$CRATE_INDEX]}"
-VERSION_SECTION="${CRATE_VERSION_SECTIONS[$CRATE_INDEX]}"
-
-if [[ "$CRATE_INDEX" -eq 0 ]]; then
-	TAG_PREFIX="releases/"
-	BRANCH_PREFIX=""
-else
-	TAG_PREFIX="releases/derive/"
-	BRANCH_PREFIX="derive/"
-fi
-
-ok "Targeting crate: ${TARGET_CRATE} (${CARGO_TOML_PATH})"
-
-# ---------------------------------------------------------------------------
-# Version resolution
-# ---------------------------------------------------------------------------
-CURRENT_VERSION=""
-CURRENT_VERSION=$(detect_version "$CARGO_TOML_PATH" "$VERSION_SECTION")
-
-if [[ "$YANK" == true ]]; then
-	if [[ "$DRY_RUN" == true ]]; then
-		header "Yank (dry run) - ${TARGET_CRATE}"
-	else
-		header "Yank - ${TARGET_CRATE}"
-	fi
-else
-	if [[ "$DRY_RUN" == true ]]; then
-		header "Release (dry run) - ${TARGET_CRATE}"
-	else
-		header "Release - ${TARGET_CRATE}"
-	fi
-fi
-
-if [[ -z "$VERSION" ]]; then
-	if [[ "$YANK" == true ]]; then
-		all_tags=$(git ls-remote --tags origin 2>/dev/null \
-			| sed -n 's|.*refs/tags/\(.*\)$|\1|p' | grep -v '\^{}')
-		release_vers=$(echo "$all_tags" | grep "^${TAG_PREFIX}v" | sed "s|${TAG_PREFIX}v||" || true)
-		yanked_tag_prefix="yanked/"
-		if [[ "$CRATE_INDEX" -eq 1 ]]; then
-			yanked_tag_prefix="yanked/derive/"
+	local arg matched submod
+	for arg in "$@"; do
+		# Makefile passes an empty version argument when version= is unset.
+		if [[ -z "$arg" ]]; then
+			continue
 		fi
-		yanked_vers=$(echo "$all_tags" | grep "^${yanked_tag_prefix}v" | sed "s|${yanked_tag_prefix}v||" || true)
+		if [[ "$arg" == "--dry-run" ]]; then
+			DRY_RUN=true
+		elif [[ "$arg" == "--allow-staged" ]]; then
+			ALLOW_STAGED=true
+		elif [[ "$arg" == "--yank" ]]; then
+			YANK=true
+		else
+			matched=false
+			if (( ${#SUBMODULES[@]} > 0 )); then
+				for submod in "${SUBMODULES[@]}"; do
+					if [[ "$arg" == "--${submod}" ]]; then
+						if [[ -n "$REPO_DIR" ]]; then
+							fail "Only one --<submodule> flag allowed at a time"
+						fi
+						REPO_DIR="$submod"
+						matched=true
+						break
+					fi
+				done
+			fi
+			if [[ "$matched" == false ]]; then
+				if [[ "$arg" == --* ]]; then
+					fail "Unknown flag: ${arg}"
+				fi
+				if [[ -n "$VERSION" ]]; then
+					fail "Unexpected argument: '${arg}' (version already set to '${VERSION}')"
+				fi
+				VERSION="$arg"
+			fi
+		fi
+	done
+
+	VERSION="${VERSION#v}"
+}
+
+enter_submodule_mode() {
+	if [[ -z "$REPO_DIR" ]]; then
+		return 0
+	fi
+	if [[ ! -d "$REPO_DIR/.git" && ! -f "$REPO_DIR/.git" ]]; then
+		fail "${REPO_DIR} is not a git repository (run 'make setup' first)"
+	fi
+
+	PROJECT_NAME="$(project_name_from_remote "$REPO_DIR")"
+	cd "$REPO_DIR"
+	ok "Targeting submodule: ${PROJECT_NAME} ($(pwd))"
+}
+
+print_run_header() {
+	local kind="Release"
+	if [[ "$YANK" == true ]]; then
+		kind="Yank"
+	fi
+	if [[ "$DRY_RUN" == true ]]; then
+		header "${kind} (dry run) - ${PROJECT_NAME}"
+	else
+		header "${kind} - ${PROJECT_NAME}"
+	fi
+}
+
+resolve_version_interactive() {
+	if [[ -n "$VERSION" ]]; then
+		return 0
+	fi
+
+	require_tty "Version prompt"
+
+	if [[ "$YANK" == true ]]; then
+		local all_tags release_vers yanked_vers yankable ver
+		if ! all_tags=$(git ls-remote --tags origin 2>/dev/null); then
+			fail "Could not list tags on origin (network or auth error)"
+		fi
+		all_tags=$(printf '%s\n' "$all_tags" \
+			| sed -n 's|.*refs/tags/\(.*\)$|\1|p' | grep -v '\^{}' || true)
+		release_vers=$(echo "$all_tags" | grep '^releases/v' | sed 's|releases/v||' || true)
+		yanked_vers=$(echo "$all_tags" | grep '^yanked/v' | sed 's|yanked/v||' || true)
 
 		yankable=""
 		while IFS= read -r ver; do
@@ -852,78 +897,103 @@ if [[ -z "$VERSION" ]]; then
 	fi
 	read -r VERSION
 	VERSION="${VERSION#v}"
-fi
+}
 
-# ---------------------------------------------------------------------------
-# Semver format validation
-# ---------------------------------------------------------------------------
-if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-	fail "Invalid semver format: '${VERSION}'. Expected X.Y.Z (e.g. 0.2.0)"
-fi
-ok "Semver format valid: ${VERSION}"
+validate_semver() {
+	assert_plain_semver "$VERSION"
+	ok "Semver format valid: ${VERSION}"
+}
 
-# ---------------------------------------------------------------------------
-# Release mode detection (forward vs backport)
-# ---------------------------------------------------------------------------
-IFS='.' read -r SV_MAJOR SV_MINOR SV_PATCH <<< "$VERSION"
-RELEASE_MODE="forward"
-PR_BASE="$DEFAULT_BRANCH"
-RELEASE_BRANCH=""
+detect_release_mode() {
+	IFS='.' read -r SV_MAJOR SV_MINOR SV_PATCH <<< "$VERSION"
+	RELEASE_MODE="forward"
+	PR_BASE="$DEFAULT_BRANCH"
+	RELEASE_BRANCH=""
 
-LATEST_TAG=$(git tag --list "${TAG_PREFIX}v*" --sort=-v:refname | head -1)
-if [[ -n "$LATEST_TAG" ]]; then
-	LATEST_VER="${LATEST_TAG#${TAG_PREFIX}v}"
-	IFS='.' read -r LATEST_MAJOR LATEST_MINOR _ <<< "$LATEST_VER"
-	if (( SV_MAJOR < LATEST_MAJOR )) || \
-	   (( SV_MAJOR == LATEST_MAJOR && SV_MINOR < LATEST_MINOR )); then
-		RELEASE_MODE="backport"
+	local latest_tag latest_ver latest_major latest_minor
+	git fetch origin --tags --quiet 2>/dev/null || true
+	latest_tag=$(git tag --list "releases/v*" --sort=-v:refname | head -1)
+	if [[ -n "$latest_tag" ]]; then
+		latest_ver="${latest_tag#releases/v}"
+		IFS='.' read -r latest_major latest_minor _ <<< "$latest_ver"
+		if (( SV_MAJOR < latest_major )) || \
+		   (( SV_MAJOR == latest_major && SV_MINOR < latest_minor )); then
+			RELEASE_MODE="backport"
+		fi
 	fi
-fi
 
-if [[ "$RELEASE_MODE" == "backport" ]]; then
-	RELEASE_BRANCH="release/${BRANCH_PREFIX}${SV_MAJOR}.${SV_MINOR}"
-	PR_BASE="$RELEASE_BRANCH"
-fi
+	if [[ "$RELEASE_MODE" == "backport" ]]; then
+		RELEASE_BRANCH="release/v${SV_MAJOR}.${SV_MINOR}"
+		PR_BASE="$RELEASE_BRANCH"
+	fi
 
-ok "Release mode: ${RELEASE_MODE} (base: ${PR_BASE})"
+	ok "Release mode: ${RELEASE_MODE} (base: ${PR_BASE})"
 
-BRANCH="process/${BRANCH_PREFIX}v${VERSION}"
-TAG="${TAG_PREFIX}v${VERSION}"
+	BRANCH="process/v${VERSION}"
+	TAG="releases/v${VERSION}"
+	YANKED_TAG="yanked/v${VERSION}"
+}
 
-YANKED_TAG_PREFIX="yanked/"
-if [[ "$CRATE_INDEX" -eq 1 ]]; then
-	YANKED_TAG_PREFIX="yanked/derive/"
-fi
-YANKED_TAG="${YANKED_TAG_PREFIX}v${VERSION}"
+require_gh() {
+	if ! command -v gh &>/dev/null; then
+		fail "gh CLI is required (https://cli.github.com)"
+	fi
+	# Unauthenticated gh reads as "no PR" in state detection; fail closed here.
+	if ! gh auth status &>/dev/null; then
+		fail "gh CLI is not authenticated (run 'gh auth login')"
+	fi
+	ok "gh CLI available and authenticated"
+}
 
-# ---------------------------------------------------------------------------
-# gh CLI check
-# ---------------------------------------------------------------------------
-if command -v gh &>/dev/null; then
-	ok "gh CLI available"
-else
-	fail "gh CLI is required (https://cli.github.com)"
-fi
+require_signing_key() {
+	local signing_key sign_format
+	signing_key=$(git config user.signingkey 2>/dev/null || true)
+	if [[ -n "$signing_key" ]]; then
+		sign_format=$(git config gpg.format 2>/dev/null || echo "openpgp")
+		ok "Signing configured (format: ${sign_format})"
+		return 0
+	fi
+	cat >&2 <<-SIGNING
+	
+	  ${RED}No signing key configured.${RESET}
+	
+	  Configure GPG signing:
+	    git config --global user.signingkey <GPG-KEY-ID>
+	
+	  Or configure SSH signing:
+	    git config --global gpg.format ssh
+	    git config --global user.signingkey ~/.ssh/id_ed25519.pub
+	
+	SIGNING
+	fail "Signing key is required for releases"
+}
 
-# ---------------------------------------------------------------------------
-# Yank workflow (early exit)
-# ---------------------------------------------------------------------------
-if [[ "$YANK" == true ]]; then
-	if git ls-remote --tags origin "$YANKED_TAG" 2>/dev/null | grep -q "$YANKED_TAG"; then
+require_jq() {
+	if command -v jq &>/dev/null; then
+		ok "jq available"
+	else
+		fail "jq is required for release notes (https://jqlang.github.io/jq/)"
+	fi
+}
+
+run_yank() {
+	if remote_tag_exists "$YANKED_TAG"; then
 		ok "Version v${VERSION} is already yanked (${YANKED_TAG} exists)"
 		exit 0
 	fi
 
-	if ! git ls-remote --tags origin "$TAG" 2>/dev/null | grep -q "$TAG"; then
+	if ! remote_tag_exists "$TAG"; then
 		fail "Release tag ${TAG} does not exist on remote - nothing to yank"
 	fi
 
 	if [[ "$DRY_RUN" == true ]]; then
 		info "Would delete GitHub release for ${TAG}"
-		info "Would push marker tag ${YANKED_TAG}"
+		info "Would push signed marker tag ${YANKED_TAG}"
 		info "Dry run complete. No changes were made."
 		exit 0
 	fi
+
+	require_signing_key
 
 	step 1 "Delete GitHub release"
 	if gh release view "$TAG" &>/dev/null; then
@@ -934,67 +1004,288 @@ if [[ "$YANK" == true ]]; then
 	fi
 
 	step 2 "Push yanked marker tag"
-	git tag -a "$YANKED_TAG" \
+	# Signed like release tags: unsigned markers could be forged.
+	git tag -s "$YANKED_TAG" \
 		-m "Yanked by $(git config user.name) on $(date +%Y-%m-%d)"
 	git push origin "$YANKED_TAG"
-	ok "Marker tag ${YANKED_TAG} pushed"
+	ok "Marker tag ${YANKED_TAG} pushed (signed)"
 
 	header "Yank complete!"
 	printf "\n"
 	printf "  ${BOLD}Version:${RESET}  v%s\n" "$VERSION"
-	printf "  ${BOLD}Release:${RESET}  deleted\n"
+	printf "  ${BOLD}Release:${RESET}  %s\n" "deleted"
 	printf "  ${BOLD}Tag:${RESET}      %s (preserved)\n" "$TAG"
 	printf "  ${BOLD}Marker:${RESET}   %s\n" "$YANKED_TAG"
 	printf "\n"
 	exit 0
-fi
+}
 
-# ---------------------------------------------------------------------------
-# State detection and resumability
-# ---------------------------------------------------------------------------
-header "Detecting release state..."
+# Pure detection: sets RESUME_STATE / RESUME_NEEDS_CHECKOUT. No checkout.
+detect_resume_state() {
+	PR_NUMBER=""
+	PR_STATE=""
+	RESUME_STATE="fresh"
+	RESUME_NEEDS_CHECKOUT=false
 
-if git ls-remote --tags origin "$TAG" 2>/dev/null | grep -q "$TAG"; then
-	ok "Release v${VERSION} already complete (tag ${TAG} exists on remote)"
-	exit 0
-fi
+	header "Detecting release state..."
 
-detect_pr_resume_state "$BRANCH"
-
-if [[ "$RESUME_STATE" == "fresh" ]] && git branch --list "$BRANCH" | grep -q "$BRANCH"; then
-	if [[ "$RELEASE_MODE" == "backport" ]]; then
-		RESUME_STATE="local"
-		git checkout "$BRANCH" --quiet
-		info "[resume] Local branch ${BRANCH} found, resuming after cherry-pick..."
-	else
-		info "[cleanup] Removed stale local branch, starting fresh..."
-		git checkout "$DEFAULT_BRANCH" 2>/dev/null || true
-		git branch -D "$BRANCH" 2>/dev/null || true
+	if remote_tag_exists "$TAG"; then
+		ok "Release v${VERSION} already complete (tag ${TAG} exists on remote)"
+		exit 0
 	fi
-fi
 
-ok "Release state: ${RESUME_STATE}"
+	local pr_line tip_subject tip_version
+	if ! pr_line=$(gh pr list --head "$BRANCH" --state all --json number,state \
+		--jq '.[0] | select(. != null) | "\(.number) \(.state)"' 2>/dev/null); then
+		fail "Could not list PRs for ${BRANCH} (gh or network error)"
+	fi
+	if [[ -n "$pr_line" ]]; then
+		read -r PR_NUMBER PR_STATE <<< "$pr_line"
+	fi
 
-# ---------------------------------------------------------------------------
-# Semver comparison (fresh forward releases only)
-# ---------------------------------------------------------------------------
-if [[ "$RESUME_STATE" == "fresh" && "$RELEASE_MODE" == "forward" && -n "$CURRENT_VERSION" ]]; then
-	cmp=$(semver_compare "$VERSION" "$CURRENT_VERSION")
-	if [[ "$cmp" == "eq" ]]; then
-		if git ls-remote --tags origin "$TAG" 2>/dev/null | grep -q "$TAG"; then
-			fail "Already released v${VERSION}"
+	if [[ -n "$PR_NUMBER" && "$PR_STATE" == "MERGED" ]]; then
+		RESUME_STATE="tag"
+		info "[resume] PR #${PR_NUMBER} already merged, continuing to tag..."
+	elif [[ -n "$PR_NUMBER" && "$PR_STATE" == "OPEN" ]]; then
+		RESUME_STATE="poll"
+		info "[resume] PR #${PR_NUMBER} is open, waiting for merge..."
+	elif [[ -n "$PR_NUMBER" && "$PR_STATE" == "CLOSED" ]]; then
+		fail "Previous release PR #${PR_NUMBER} for ${BRANCH} was closed without merging. Delete the branch (git push origin --delete ${BRANCH}) or reopen PR #${PR_NUMBER}, then retry."
+	elif remote_head_exists "$BRANCH"; then
+		RESUME_STATE="pr"
+		# Need local checkout of process/v* so changelog/PR body use release history.
+		RESUME_NEEDS_CHECKOUT=true
+		info "[resume] Branch ${BRANCH} exists on remote, creating PR..."
+	elif git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+		if [[ "$RELEASE_MODE" == "backport" ]]; then
+			RESUME_STATE="local"
+			RESUME_NEEDS_CHECKOUT=true
+			info "[resume] Local branch ${BRANCH} found, resuming after cherry-pick..."
+		else
+			# Forward: inspect tip without checkout.
+			tip_subject=$(git log -1 --pretty=%s "$BRANCH" 2>/dev/null || true)
+			tip_version=$(version_at_ref "$BRANCH")
+
+			if [[ "$tip_subject" == "chore(release):"* && "$tip_version" == "$VERSION" ]]; then
+				# Finished release tip: clean tree required to resume.
+				if ! working_tree_clean; then
+					fail "Working tree has uncommitted changes; clean tree required to resume ${BRANCH}"
+				fi
+				RESUME_STATE="local"
+				RESUME_NEEDS_CHECKOUT=true
+				info "[resume] Local branch ${BRANCH} found, resuming forward release..."
+			elif [[ "$tip_subject" == "chore(release):"* ]]; then
+				# Wrong-version release tip: fail closed (do not auto-delete).
+				fail "Local branch ${BRANCH} tip is chore(release) for v${tip_version:-unknown}, not v${VERSION}. Delete it (git branch -D ${BRANCH}) or finish that release, then retry."
+			else
+				# No release commit yet: only resume if tip still equals origin/DEFAULT_BRANCH.
+				local tip_sha base_sha
+				git fetch origin "$DEFAULT_BRANCH" --quiet
+				tip_sha=$(git rev-parse "$BRANCH")
+				base_sha=$(git rev-parse "origin/${DEFAULT_BRANCH}")
+				if [[ "$tip_sha" == "$base_sha" ]]; then
+					RESUME_STATE="local"
+					RESUME_NEEDS_CHECKOUT=true
+					info "[resume] Local branch ${BRANCH} found at origin/${DEFAULT_BRANCH}, resuming forward release..."
+				else
+					fail "Local branch ${BRANCH} tip is not on origin/${DEFAULT_BRANCH} (abandoned or dirty process branch). Delete it (git branch -D ${BRANCH}) and retry from ${DEFAULT_BRANCH}."
+				fi
+			fi
 		fi
-		info "Version already at ${VERSION} - resuming incomplete release"
-	elif [[ "$cmp" == "lt" ]]; then
-		fail "Requested version ${VERSION} is older than current ${CURRENT_VERSION}"
 	fi
-	ok "Version bump: ${CURRENT_VERSION} -> ${VERSION}"
-fi
 
-# ---------------------------------------------------------------------------
-# Full validation (fresh releases only)
-# ---------------------------------------------------------------------------
-if [[ "$RESUME_STATE" == "fresh" ]]; then
+	fsm_assert_resume_state
+	ok "Release state: ${RESUME_STATE}"
+}
+
+# Prints eq|ahead|behind|diverged for local BRANCH vs origin/BRANCH.
+# Both refs must already exist (fetch first).
+branch_sync_state() {
+	local local_sha remote_sha
+	local_sha=$(git rev-parse "refs/heads/${BRANCH}")
+	remote_sha=$(git rev-parse "refs/remotes/origin/${BRANCH}")
+	if [[ "$local_sha" == "$remote_sha" ]]; then
+		printf "eq"
+	elif git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
+		printf "behind"
+	elif git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
+		printf "ahead"
+	else
+		printf "diverged"
+	fi
+}
+
+# For pr resume: local HEAD must match origin tip for changelog (ff if behind).
+align_pr_branch_to_origin() {
+	case "$(branch_sync_state)" in
+		eq)
+			;;
+		ahead)
+			# Strictly ahead: push_and_open_pr will push.
+			;;
+		behind)
+			git reset --quiet --hard "origin/${BRANCH}"
+			ok "Local ${BRANCH} aligned to origin/${BRANCH}"
+			;;
+		diverged)
+			fail_diverged
+			;;
+	esac
+}
+
+# Dry run must not checkout or reset anything.
+resolve_dry_run_notes_ref() {
+	local ref=""
+	case "$RESUME_STATE" in
+		fresh)
+			return 0
+			;;
+		local)
+			git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+			if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+				ref="refs/heads/${BRANCH}"
+			elif git rev-parse --verify "refs/remotes/origin/${BRANCH}" >/dev/null 2>&1; then
+				ref="refs/remotes/origin/${BRANCH}"
+			fi
+			;;
+		pr|poll)
+			git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+			if git rev-parse --verify "refs/remotes/origin/${BRANCH}" >/dev/null 2>&1; then
+				ref="refs/remotes/origin/${BRANCH}"
+			elif git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+				ref="refs/heads/${BRANCH}"
+			fi
+			;;
+		tag)
+			git fetch origin "$PR_BASE" --quiet 2>/dev/null || true
+			if git rev-parse --verify "refs/remotes/origin/${PR_BASE}" >/dev/null 2>&1; then
+				ref="refs/remotes/origin/${PR_BASE}"
+			fi
+			;;
+	esac
+	if [[ -z "$ref" ]]; then
+		fail "Could not resolve a ref for dry run notes preview (state: ${RESUME_STATE})"
+	fi
+	NOTES_REF="$ref"
+	info "Dry run: no checkout (notes preview uses ${NOTES_REF})"
+}
+
+# Apply workspace mutation required by detected resume state.
+# Sets NOTES_REF: the ref release-note previews read history from.
+enter_resume_workspace() {
+	NOTES_REF="HEAD"
+
+	if [[ "$DRY_RUN" == true ]]; then
+		resolve_dry_run_notes_ref
+		return 0
+	fi
+
+	if [[ "${RESUME_NEEDS_CHECKOUT}" != true ]]; then
+		return 0
+	fi
+
+	# pr resume needs origin tip; local resume may work offline from local ref.
+	if [[ "$RESUME_STATE" == "pr" ]]; then
+		if ! git fetch origin "$BRANCH" --quiet; then
+			fail "Could not fetch origin/${BRANCH}"
+		fi
+	else
+		git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+	fi
+
+	if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+		if ! git checkout "$BRANCH" --quiet; then
+			fail "Could not checkout ${BRANCH} to resume release"
+		fi
+		if [[ "$RESUME_STATE" == "pr" ]]; then
+			align_pr_branch_to_origin
+		fi
+		return 0
+	fi
+
+	if git rev-parse --verify "refs/remotes/origin/${BRANCH}" >/dev/null 2>&1; then
+		if ! git checkout -b "$BRANCH" --track "origin/${BRANCH}" --quiet; then
+			fail "Could not create local ${BRANCH} from origin/${BRANCH}"
+		fi
+		return 0
+	fi
+
+	fail "Could not checkout ${BRANCH}: no local or origin/${BRANCH} ref"
+}
+
+# Reads NOTES_REF so dry-run resume reflects the branch tip, not current HEAD.
+mark_release_commit_exists() {
+	RELEASE_COMMIT_EXISTS=false
+	if [[ "$RESUME_STATE" == "local" ]] \
+		&& [[ "$(git log -1 --pretty=%s "$NOTES_REF" 2>/dev/null)" == "chore(release):"* ]] \
+		&& [[ "$(version_at_ref "$NOTES_REF")" == "$VERSION" ]] \
+		&& working_tree_clean; then
+		RELEASE_COMMIT_EXISTS=true
+	fi
+}
+
+assert_version_bump_ok() {
+	local cmp line_tag line_ver
+
+	if [[ ( "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" ) && "$RELEASE_MODE" == "forward" && -n "$CURRENT_VERSION" ]]; then
+		cmp=$(semver_compare "$VERSION" "$CURRENT_VERSION")
+		if [[ "$cmp" == "eq" ]]; then
+			if remote_tag_exists "$TAG"; then
+				fail "Already released v${VERSION}"
+			fi
+			info "Version already at ${VERSION} - resuming incomplete release"
+		elif [[ "$cmp" == "lt" ]]; then
+			fail "Requested version ${VERSION} is older than current ${CURRENT_VERSION}"
+		else
+			ok "Version bump: ${CURRENT_VERSION} -> ${VERSION}"
+		fi
+	fi
+
+	if [[ ( "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" ) && "$RELEASE_MODE" == "backport" ]]; then
+		line_tag=$(git tag --list "releases/v${SV_MAJOR}.${SV_MINOR}.*" --sort=-v:refname | head -1)
+		if [[ -n "$line_tag" ]]; then
+			line_ver="${line_tag#releases/v}"
+			cmp=$(semver_compare "$VERSION" "$line_ver")
+			if [[ "$cmp" == "eq" ]]; then
+				if remote_tag_exists "$TAG"; then
+					fail "Already released v${VERSION} on ${RELEASE_BRANCH}"
+				fi
+				info "Version already at ${VERSION} on ${RELEASE_BRANCH} - resuming incomplete release"
+			elif [[ "$cmp" == "lt" ]]; then
+				fail "Requested version ${VERSION} is older than latest ${line_ver} on ${RELEASE_BRANCH}"
+			else
+				ok "Backport bump: ${line_ver} -> ${VERSION}"
+			fi
+		fi
+	fi
+}
+
+prompt_submodule_refs() {
+	SUBMODULE_REFS=()
+
+	if [[ "$RELEASE_COMMIT_EXISTS" == false ]] \
+		&& [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" ]] \
+		&& [[ -z "$REPO_DIR" && ${#SUBMODULES[@]} -gt 0 ]]; then
+		require_tty "Submodule ref prompt"
+
+		local prompt_suffix="" ref i
+		if [[ "$RELEASE_MODE" == "backport" ]]; then
+			prompt_suffix=" for backport"
+		fi
+		for i in "${!SUBMODULES[@]}"; do
+			printf "\n  Enter %s tag or commit hash%s (Enter to keep current): " \
+				"${SUBMODULES[$i]}" "$prompt_suffix"
+			read -r ref
+			SUBMODULE_REFS[i]="$ref"
+		done
+	fi
+}
+
+validate_preconditions() {
+	if [[ "$RESUME_STATE" != "fresh" && "$RESUME_STATE" != "local" ]]; then
+		return 0
+	fi
+
 	header "Validating preconditions..."
 
 	if [[ -z "$(git tag --list "$TAG")" ]]; then
@@ -1005,131 +1296,276 @@ if [[ "$RESUME_STATE" == "fresh" ]]; then
 
 	require_signing_key
 
-	if ! git diff --quiet; then
-		fail "Working tree has unstaged changes"
+	if ! git diff --quiet --ignore-submodules; then
+		fail "Working tree has unstaged changes (excluding submodules)"
 	fi
 
-	if ! git diff --cached --quiet; then
-		STAGED_VERSION_ONLY=true
+	if ! git diff --cached --quiet --ignore-submodules; then
+		local staged_version_only=true f
 		while IFS= read -r f; do
 			case "$f" in
-				Cargo.toml|tightbeam-derive/Cargo.toml|Cargo.lock) ;;
-				*) STAGED_VERSION_ONLY=false; break ;;
+				Cargo.toml|tightbeam-derive/Cargo.toml|Cargo.lock|package.json|package-lock.json|npm-shrinkwrap.json|VERSION) ;;
+				*) staged_version_only=false; break ;;
 			esac
-		done < <(git diff --cached --name-only)
+		done < <(git diff --cached --name-only --ignore-submodules)
 
-		if [[ "$STAGED_VERSION_ONLY" == true ]] \
-			&& [[ "$(detect_version "$CARGO_TOML_PATH" "$VERSION_SECTION")" == "$VERSION" ]]; then
+		if [[ "$staged_version_only" == true ]] \
+			&& [[ "$(detect_version)" == "$VERSION" ]]; then
 			info "Staged version bump to ${VERSION} from previous attempt"
 		elif [[ "$ALLOW_STAGED" == true ]]; then
 			info "Staged files will be included in the release commit:"
-			git diff --cached --name-only | while IFS= read -r f; do
+			git diff --cached --name-only --ignore-submodules | while IFS= read -r f; do
 				printf "    %s\n" "$f"
 			done
 		else
 			fail "Working tree has staged changes (use --allow-staged to include them)"
 		fi
 	else
-		ok "Working tree is clean"
+		ok "Working tree is clean (excluding submodules)"
 	fi
 
-	if [[ "$RELEASE_MODE" == "forward" ]]; then
-		require_default_branch_synced
-	fi
-fi
+	# Fresh forward only: must start from up-to-date DEFAULT_BRANCH.
+	# Local resume is already on process/v* with a matching release tip.
+	if [[ "$RELEASE_MODE" == "forward" && "$RESUME_STATE" == "fresh" ]]; then
+		local current_branch local_sha remote_sha
+		current_branch=$(git branch --show-current)
+		if [[ "$current_branch" == "$DEFAULT_BRANCH" ]]; then
+			ok "On branch ${DEFAULT_BRANCH}"
+		else
+			fail "Must be on branch ${DEFAULT_BRANCH} (currently on ${current_branch})"
+		fi
 
-# ---------------------------------------------------------------------------
-# Dry run: preview only, no mutations
-# ---------------------------------------------------------------------------
-if [[ "$DRY_RUN" == true ]]; then
+		git fetch origin "$DEFAULT_BRANCH" --quiet
+		local_sha=$(git rev-parse HEAD)
+		remote_sha=$(git rev-parse "origin/${DEFAULT_BRANCH}")
+		if [[ "$local_sha" == "$remote_sha" ]]; then
+			ok "${DEFAULT_BRANCH} is up to date with origin/${DEFAULT_BRANCH}"
+		else
+			fail "${DEFAULT_BRANCH} is not up to date with origin/${DEFAULT_BRANCH} (pull or push first)"
+		fi
+	fi
+
+	if [[ "$RELEASE_COMMIT_EXISTS" == false && "$DRY_RUN" != true \
+		&& "$RELEASE_MODE" == "forward" && -z "$REPO_DIR" && ${#SUBMODULES[@]} -gt 0 ]]; then
+		header "Resolving submodules..."
+		resolve_submodules
+	fi
+}
+
+run_dry_run() {
 	header "Release notes preview"
-	print_release_notes
+	print_release_notes "$NOTES_REF"
 	printf "\n"
 	info "Dry run complete. No changes were made."
 	print_summary
 	exit 0
-fi
+}
 
-# ---------------------------------------------------------------------------
-# Fresh Release
-# ---------------------------------------------------------------------------
-STEP=0
-
-if [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" ]]; then
+prepare_release_work() {
 	if [[ "$RESUME_STATE" == "fresh" ]]; then
 		if [[ "$RELEASE_MODE" == "backport" ]]; then
-			STEP=$((STEP + 1))
-			step $STEP "Prepare release branch ${RELEASE_BRANCH}"
+			next_step "Prepare release branch ${RELEASE_BRANCH}"
 			ensure_release_branch "$RELEASE_BRANCH" "$SV_MAJOR" "$SV_MINOR" "$SV_PATCH"
 
-			STEP=$((STEP + 1))
-			step $STEP "Create branch ${BRANCH}"
+			next_step "Create branch ${BRANCH}"
 			git checkout -b "$BRANCH"
 			ok "Branch created from ${RELEASE_BRANCH}"
 
-			STEP=$((STEP + 1))
-			step $STEP "Cherry-pick commits"
+			next_step "Cherry-pick commits"
 			interactive_cherry_pick "$RELEASE_BRANCH"
 		else
-			STEP=$((STEP + 1))
-			step $STEP "Create branch ${BRANCH}"
+			next_step "Create branch ${BRANCH}"
 			git checkout -b "$BRANCH"
 			ok "Branch created"
+
+			if [[ -z "$REPO_DIR" && ${#SUBMODULES[@]} -gt 0 ]]; then
+				next_step "Update submodule pointers"
+				stage_submodules
+			fi
 		fi
 	fi
 
-	bump_version "$VERSION" "$CARGO_TOML_PATH" "$VERSION_SECTION"
+	if [[ "$RELEASE_COMMIT_EXISTS" == true ]]; then
+		info "Release commit already present; skipping version bump and commit"
+	else
+		if [[ -z "$REPO_DIR" && ${#SUBMODULES[@]} -gt 0 ]]; then
+			if [[ "$RELEASE_MODE" == "backport" ]]; then
+				header "Resolving submodules..."
+				resolve_submodules
+				next_step "Update submodule pointers"
+				stage_submodules
+			elif [[ "$RESUME_STATE" == "local" ]]; then
+				# Forward local resume: pointers resolved during validation.
+				next_step "Update submodule pointers"
+				stage_submodules
+			fi
+		fi
 
-	STEP=$((STEP + 1))
-	step $STEP "Preview release notes"
-	print_release_notes
+		bump_version "$VERSION"
 
-	STEP=$((STEP + 1))
-	step $STEP "Commit release"
-	commit_release "chore(release): ${TARGET_CRATE} v${VERSION}"
-fi
+		next_step "Preview release notes"
+		print_release_notes
 
-# ---------------------------------------------------------------------------
-# Push + PR (fresh or resume from "pr")
-# ---------------------------------------------------------------------------
-if [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" || "$RESUME_STATE" == "pr" ]]; then
-	STEP=$((STEP + 1))
-	step $STEP "Push branch and create PR"
+		next_step "Commit release"
+		if git diff --cached --quiet; then
+			info "Nothing staged - creating empty release marker commit"
+			git commit -S --allow-empty -m "chore(release): v${VERSION}"
+		else
+			git commit -S -m "chore(release): v${VERSION}"
+		fi
+		ok "Committed chore(release): v${VERSION}"
+	fi
+}
+
+push_and_open_pr() {
+	next_step "Push branch and create PR"
 
 	if [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" ]]; then
 		git push -u origin "$BRANCH"
 		ok "Branch pushed to origin"
+	elif [[ "$RESUME_STATE" == "pr" ]] \
+		&& git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+		# Push only when local is strictly ahead.
+		git fetch origin "$BRANCH" --quiet
+		case "$(branch_sync_state)" in
+			eq)
+				ok "Local ${BRANCH} already matches origin"
+				;;
+			behind)
+				info "Local ${BRANCH} is behind origin - skipping push"
+				;;
+			ahead)
+				git push origin "$BRANCH"
+				ok "Local ${BRANCH} pushed to origin"
+				;;
+			diverged)
+				fail_diverged
+				;;
+		esac
 	fi
 
-	create_release_pr "chore(release): v${VERSION}" "$PR_BASE" "$BRANCH"
-fi
+	compile_changelog
 
-# ---------------------------------------------------------------------------
-# Poll for merge
-# ---------------------------------------------------------------------------
-if [[ "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" || "$RESUME_STATE" == "pr" || "$RESUME_STATE" == "poll" ]]; then
-	STEP=$((STEP + 1))
-	step $STEP "Wait for PR merge"
+	ensure_label "release"
+
+	# Only apply labels that already exist in the repo (plus 'release')
+	local existing_labels label
+	if ! existing_labels=$(gh label list --limit 200 --json name \
+		--jq '.[].name' 2>/dev/null); then
+		fail "Could not list repo labels (gh or network error)"
+	fi
+
+	local -a pr_labels=()
+	while IFS= read -r label; do
+		[[ -z "$label" ]] && continue
+		if [[ "$label" == "release" ]] || printf '%s\n' "$existing_labels" | grep -qxF "$label"; then
+			pr_labels+=("$label")
+		fi
+	done < <({ printf 'release\n'; printf '%s\n' "${RELEASE_LABELS:-}"; } | sort -u)
+
+	local -a pr_create_args=(
+		--title "chore(release): v${VERSION}"
+		--body "$CHANGELOG"
+		--base "$PR_BASE"
+		--head "$BRANCH"
+		--assignee "@me"
+	)
+	for label in "${pr_labels[@]}"; do
+		pr_create_args+=(--label "$label")
+	done
+
+	local pr_url existing_pr
+	if ! existing_pr=$(gh pr list --head "$BRANCH" --state open --json number,url \
+		--jq '.[0] | select(.number != null) | "\(.number) \(.url)"' 2>/dev/null); then
+		fail "Could not list open PRs for ${BRANCH} (gh or network error)"
+	fi
+	if [[ -n "$existing_pr" ]]; then
+		read -r PR_NUMBER pr_url <<< "$existing_pr"
+		local -a pr_edit_args=(
+			--title "chore(release): v${VERSION}"
+			--body "$CHANGELOG"
+		)
+		for label in "${pr_labels[@]}"; do
+			pr_edit_args+=(--add-label "$label")
+		done
+		gh pr edit "$PR_NUMBER" "${pr_edit_args[@]}" >/dev/null
+		ok "PR #${PR_NUMBER} already open: ${pr_url}"
+	else
+		pr_url=$(gh pr create "${pr_create_args[@]}")
+		PR_NUMBER="${pr_url##*/}"
+		ok "PR #${PR_NUMBER} created: ${pr_url}"
+	fi
+}
+
+wait_for_merge() {
+	next_step "Wait for PR merge"
 	poll_pr "$PR_NUMBER"
-fi
+}
 
-# ---------------------------------------------------------------------------
-# Tag and push
-# ---------------------------------------------------------------------------
-if [[ "$RESUME_STATE" != "tag" ]]; then
-	STEP=$((STEP + 1))
-	step $STEP "Return to ${PR_BASE}"
+return_and_tag() {
+	next_step "Return to ${PR_BASE}"
+	git fetch origin "$PR_BASE" --quiet
 	git checkout "$PR_BASE"
 	git pull origin "$PR_BASE" --quiet
 	ok "On ${PR_BASE} at $(git rev-parse --short HEAD)"
-fi
 
-STEP=$((STEP + 1))
-step $STEP "Tag and push (${TAG})"
-push_crate_tag "$TAG" "$VERSION" "$TAG_PREFIX"
+	next_step "Create signed tag"
+	if [[ -n "$(git tag --list "$TAG")" ]]; then
+		ok "Tag ${TAG} already exists locally - skipping creation"
+	else
+		# Rebuild notes from updated PR_BASE (do not reuse pre-merge CHANGELOG).
+		CHANGELOG=""
+		compile_changelog
+		git tag -s "$TAG" -m "$CHANGELOG"
+		ok "Tag ${TAG} created (signed)"
+	fi
+
+	next_step "Push tag"
+	git push origin "$TAG"
+	ok "Tag pushed to origin"
+}
 
 # ---------------------------------------------------------------------------
-# Summary
+# Entry
 # ---------------------------------------------------------------------------
-header "Release complete!"
-print_summary
+
+main() {
+	PROJECT_NAME="$(project_name_from_remote)"
+
+	detect_submodules
+	parse_args "$@"
+	enter_submodule_mode
+
+	CURRENT_VERSION=$(detect_version)
+
+	print_run_header
+	resolve_version_interactive
+	validate_semver
+	detect_release_mode
+	require_gh
+
+	if [[ "$YANK" == true ]]; then
+		run_yank
+	fi
+
+	# Tag-complete exits here (gh --jq only); external jq needed after this.
+	detect_resume_state
+	require_jq
+	enter_resume_workspace
+	mark_release_commit_exists
+	assert_version_bump_ok
+	prompt_submodule_refs
+	validate_preconditions
+
+	if [[ "$DRY_RUN" == true ]]; then
+		run_dry_run
+	fi
+
+	STEP=0
+	run_release_fsm
+
+	header "Release complete!"
+	print_summary
+}
+
+main "$@"
