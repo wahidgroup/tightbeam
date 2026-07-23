@@ -163,7 +163,9 @@ make release version=vX.Y.Z
 
 Use `dry-run=1`, `allow-staged=1`, or `yank=1` as documented in `make help`.
 
-A release bumps the workspace version, opens a release pull request, and on merge creates a signed `releases/v*` tag that publishes to crates.io (`tightbeam-derive` is published first when its version is ahead of crates.io). Bump `tightbeam-derive`'s own package version in the same PR when the derive crate itself changes. The deploy guard `check-yanked.sh` refuses yanked versions.
+A release bumps the workspace version, opens a release pull request, and on merge creates a signed `releases/v*` tag that publishes to crates.io (`tightbeam-derive` is published first when its version is ahead of crates.io). Bump `tightbeam-derive`'s own package version in the same PR when the derive crate itself changes. The release workflow runs the deploy guard `check-yanked.sh`, which refuses yanked versions.
+
+To publish or yank `tightbeam-derive` without a workspace release, bump its version in a normal PR and run `make release-derive version=vX.Y.Z` (with `yank=1` / `dry-run=1` as needed). This pushes a signed `releases/derive/v*` tag that the release workflow verifies and publishes.
 
 ## tightbeam Improvement Proposals (TIPs)
 

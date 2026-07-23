@@ -57,6 +57,14 @@ jobs:
             exit 1
           fi
 
+      - name: Refuse yanked versions
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == releases/derive/* ]]; then
+            ./scripts/check-yanked.sh --derive
+          else
+            ./scripts/check-yanked.sh
+          fi
+
       - name: Publish tightbeam-derive
         if: startsWith(github.ref, 'refs/tags/releases/derive/')
         run: cargo publish --package tightbeam-derive

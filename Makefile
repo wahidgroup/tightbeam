@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release check-yanked audit ci
+.PHONY: all help help-body help-ref version setup check build clean test lint spellcheck doc test-all fuzz-build fuzz-test analyze-fuzz clean-fuzz release release-derive check-yanked audit ci
 
 .NOTPARALLEL: ci
 
@@ -62,7 +62,8 @@ help-body:
 	@printf '    ci              Full pipeline: lint + build + test-all\n'
 	@printf '    doc             Build documentation (all features)\n'
 	@printf '    release         Release workflow (see OPTIONS)\n'
-	@printf '    check-yanked    Check if current version has been yanked\n\n'
+	@printf '    release-derive  Derive-only release: tag tightbeam-derive (see OPTIONS)\n'
+	@printf '    check-yanked    Check if current version has been yanked (derive=1 for derive)\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
 	@printf '    fix             If set (e.g., fix=1), apply lint fixes: cargo fmt + clippy --fix\n'
 	@printf '    debug           If set (e.g., debug=1), export RUST_LOG=debug\n'
@@ -73,12 +74,14 @@ help-body:
 	@printf '    dry-run         If set (e.g., dry-run=1), preview release without changes\n'
 	@printf '    allow-staged    If set (e.g., allow-staged=1), include staged files in release\n'
 	@printf '    yank            If set (e.g., yank=1), yank a published release instead\n'
+	@printf '    derive          If set (e.g., derive=1), check-yanked targets tightbeam-derive\n'
 	@printf 'EXAMPLES:\n'
 	@printf '    make build features="std,tcp,tokio"\n'
 	@printf '    make test no-default=1 features="testing"\n'
 	@printf '    make lint fix=1\n'
 	@printf '    make release version=v0.9.1\n'
-	@printf '    make release version=v0.9.1 dry-run=1\n\n'
+	@printf '    make release version=v0.9.1 dry-run=1\n'
+	@printf '    make release-derive version=v0.1.8\n\n'
 	@printf 'EXIT STATUS:\n'
 	@printf '    0    Success\n'
 	@printf '    >0   Error occurred\n\n'
@@ -145,7 +148,7 @@ lint: setup
 	@echo "Running linters (mode: $(LINT_MODE))..."
 ifeq ($(LINT_MODE),fix)
 	cargo fmt --all
-	cargo clippy --all-targets --all-features $(ARGS)
+	cargo clippy --fix --all-targets --all-features $(ARGS)
 else
 	cargo fmt --all --check
 	cargo clippy --all-targets --all-features $(ARGS) -- -D warnings
@@ -176,5 +179,11 @@ release: setup
 		YANK="$(if $(filter 1,$(yank)),1,)" \
 		./scripts/release.sh "$(RELEASE_VERSION)"
 
+release-derive: setup
+	@chmod +x scripts/release-derive.sh
+	@DRY_RUN="$(if $(filter 1,$(dry-run)),1,)" \
+		YANK="$(if $(filter 1,$(yank)),1,)" \
+		./scripts/release-derive.sh "$(RELEASE_VERSION)"
+
 check-yanked:
-	@./scripts/check-yanked.sh
+	@./scripts/check-yanked.sh $(if $(filter 1,$(derive)),--derive)
