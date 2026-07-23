@@ -66,6 +66,7 @@ macro_rules! pooled_mux {
 
 pooled_mux! {
 	use core::sync::atomic::AtomicU64;
+	use std::sync::{Mutex, PoisonError};
 
 	use crate::runtime::rt;
 	use crate::transport::multiplex::{MuxCapable, MuxConnector, MuxHandle, MuxRole};
@@ -289,6 +290,18 @@ pooled_mux! {
 		/// Reader driver task: finishes when the connection dies, so it
 		/// doubles as the entry's liveness witness.
 		reader_task: rt::JoinHandle,
+		/// When a lease last emitted on this connection.
+		///
+		/// The mux core never reads a clock
+		/// ([sans-io](https://sans-io.readthedocs.io/how-to-sans-io.html), as
+		/// [quinn-proto](https://docs.rs/quinn-proto) and [h2](https://docs.rs/h2)
+		/// keep their state machines), so the pool stamps activity at its own
+		/// emit boundary. This is the same recipe as
+		/// [hyper-util's pool `idle_at`](https://docs.rs/hyper-util/latest/src/hyper_util/client/legacy/pool.rs.html).
+		/// Shared with every lease, which stamps it outside the pool lock.
+		/// While [`MuxHandle::has_pending_streams`] returns `true`, the pruner
+		/// treats the entry as active no matter how old the stamp is.
+		last_used: Arc<Mutex<Instant>>,
 	}
 }
 
@@ -484,9 +497,10 @@ where
 			}
 		}
 
-		// Shared mux entries idle out on the mux plane's own activity
-		// measure: emits bypass the pool lock, so a pool-side timestamp
-		// would prune connections that are actively emitting.
+		// Shared mux entries are stamped by their leases at emit time
+		// (emits bypass the pool lock), so the pruner only reads. An
+		// in-flight stream pins the entry as active no matter how old
+		// the stamp is.
 		#[cfg(all(
 			feature = "x509",
 			feature = "tokio",
@@ -495,7 +509,12 @@ where
 			any(feature = "transport-cms", feature = "transport-ecies")
 		))]
 		dest_pool.mux.retain(|entry| {
-			let expired = entry.handle.idle_for(now) >= timeout;
+			if entry.handle.has_pending_streams() {
+				return true;
+			}
+
+			let last_used = *entry.last_used.lock().unwrap_or_else(PoisonError::into_inner);
+			let expired = now.duration_since(last_used) >= timeout;
 			if expired {
 				// GoAway before close (RFC 9113 § 6.8): the reader task
 				// ends on the resulting EOF. A stream racing this drain
@@ -634,8 +653,8 @@ pooled_mux! {
 			offer: TransportOffer,
 			selection: MuxSelection,
 		) -> TransportResult<PooledClient<P, C>> {
-			if let Some((id, handle)) = self.try_take_mux_handle(&addr, selection)? {
-				return Ok(self.wrap_mux_client(handle, id, addr));
+			if let Some(lease) = self.try_take_mux_handle(&addr, selection)? {
+				return Ok(self.wrap_mux_client(lease, addr));
 			}
 
 			if let Some(client) = self.try_take_ready_client(&addr)? {
@@ -684,6 +703,7 @@ pooled_mux! {
 			drop(responder);
 
 			let id = self.mux_ids.fetch_add(1, Ordering::Relaxed);
+			let last_used = Arc::new(Mutex::new(Instant::now()));
 
 			{
 				// A failed lock must not leak the spawned drivers: aborting
@@ -699,7 +719,12 @@ pooled_mux! {
 				let dest_pool = pools.entry(addr.clone()).or_default();
 
 				// Handle clone is a refcount bump: pool entry and lease co-own the connection.
-				dest_pool.mux.push(MuxEntry { id, handle: handle.clone(), reader_task });
+				dest_pool.mux.push(MuxEntry {
+					id,
+					handle: handle.clone(),
+					reader_task,
+					last_used: Arc::clone(&last_used),
+				});
 
 				// Shared mux connections are never leased exclusively, so
 				// the slot reserved above leaves the in-use count.
@@ -708,7 +733,8 @@ pooled_mux! {
 
 			reservation.disarm();
 
-			Ok(self.wrap_mux_client(handle, id, addr))
+			let lease = MuxLease { id, handle, last_used };
+			Ok(self.wrap_mux_client(lease, addr))
 		}
 
 		/// Round-robin a live mux entry for the destination: prunes idle
@@ -718,7 +744,7 @@ pooled_mux! {
 			self: &Arc<Self>,
 			addr: &P::Address,
 			selection: MuxSelection,
-		) -> TransportResult<Option<(u64, MuxHandle)>> {
+		) -> TransportResult<Option<MuxLease>> {
 			let mut pools = self.write_pools()?;
 			let dest_pool = match pools.get_mut(addr) {
 				Some(dest_pool) => dest_pool,
@@ -752,7 +778,7 @@ pooled_mux! {
 			};
 
 			// Handle clone is a refcount bump: the entry stays pooled for other callers.
-			let selected = with_headroom.or(fallback).map(|entry| (entry.id, entry.handle.clone()));
+			let selected = with_headroom.or(fallback).map(MuxLease::from);
 			Ok(selected)
 		}
 
@@ -775,8 +801,7 @@ pooled_mux! {
 			}
 		}
 
-		fn wrap_mux_client(self: &Arc<Self>, handle: MuxHandle, id: u64, addr: P::Address) -> PooledClient<P, C> {
-			let lease = MuxLease { id, handle };
+		fn wrap_mux_client(self: &Arc<Self>, lease: MuxLease, addr: P::Address) -> PooledClient<P, C> {
 			let pool = Arc::clone(self);
 
 			PooledClient {
@@ -792,6 +817,29 @@ pooled_mux! {
 	struct MuxLease {
 		id: u64,
 		handle: MuxHandle,
+		/// Shared with the pool entry: the lease stamps it on each emit
+		/// so the pruner can read idle time without a clock in the mux
+		/// core (see [`MuxEntry::last_used`]).
+		last_used: Arc<Mutex<Instant>>,
+	}
+
+	impl MuxLease {
+		/// Record activity for the pruner. Stamped at emit start: the
+		/// stream itself is covered by `has_pending_streams` while in
+		/// flight.
+		fn stamp(&self) {
+			*self.last_used.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+		}
+	}
+
+	impl From<&MuxEntry> for MuxLease {
+		fn from(entry: &MuxEntry) -> Self {
+			Self {
+				id: entry.id,
+				handle: entry.handle.clone(),
+				last_used: Arc::clone(&entry.last_used),
+			}
+		}
 	}
 
 	/// Mux entry selection policy for the acquisition funnel.
@@ -890,7 +938,11 @@ pooled_mux! {
 			// Handle clone is a refcount bump, releasing the `self.mux` borrow
 			// before the failover arm takes `&mut self`.
 			let (lease_id, handle) = match self.mux.as_ref() {
-				Some(lease) => (lease.id, lease.handle.clone()),
+				Some(lease) => {
+					lease.stamp();
+
+					(lease.id, lease.handle.clone())
+				}
 				None => return self.conn()?.emit(frame, attempt).await,
 			};
 
@@ -922,7 +974,10 @@ pooled_mux! {
 				.await?;
 
 			match self.mux.as_ref() {
-				Some(lease) => lease.handle.emit_on_stream(&frame).await,
+				Some(lease) => {
+					lease.stamp();
+					lease.handle.emit_on_stream(&frame).await
+				}
 				None => self.conn()?.emit(frame, attempt).await,
 			}
 		}
