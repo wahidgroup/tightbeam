@@ -1,0 +1,46 @@
+#!/usr/bin/env sh
+set -e
+
+# Installed via husky-rs (core.hooksPath = .husky).
+# Redirect stdin so make/npm cannot consume the ref list git feeds this hook.
+if ! make lint </dev/null; then
+	echo "ERROR: make lint failed; push aborted."
+	exit 1
+fi
+
+remote="$1"
+z40=0000000000000000000000000000000000000000
+
+# Update: remote_oid..local_oid.
+# New ref: only commits not already on remote default (HEAD/main/master).
+while read local_ref local_oid remote_ref remote_oid; do
+	if [ "$local_oid" = "$z40" ]; then
+		continue
+	fi
+
+	if [ "$remote_oid" = "$z40" ]; then
+		range=""
+		for base in "refs/remotes/$remote/HEAD" "refs/remotes/$remote/main" "refs/remotes/$remote/master"; do
+			if git rev-parse --verify "$base" >/dev/null 2>&1; then
+				range="$base..$local_oid"
+				break
+			fi
+		done
+		if [ -z "$range" ]; then
+			echo "ERROR: No local tracking ref for $remote default branch (HEAD/main/master)."
+			echo "       Run: git fetch $remote"
+			echo "       Cannot determine which commits are new without a base."
+			exit 1
+		fi
+	else
+		range="$remote_oid..$local_oid"
+	fi
+
+	for commit in $(git rev-list "$range"); do
+		if ! git verify-commit "$commit" 2>/dev/null; then
+			echo "ERROR: Commit $commit has an invalid or missing signature."
+			echo "       All commits must have a valid signature before pushing."
+			exit 1
+		fi
+	done
+done

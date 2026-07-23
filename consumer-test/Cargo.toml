@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 # Regression crate for the derive cfg-leak (#4). It deliberately depends on
 # `tightbeam` with the crypto features enabled while declaring NO features of
 # its own. If `#[derive(Beamable)]` emitted `#[cfg(feature = "...")]` into this

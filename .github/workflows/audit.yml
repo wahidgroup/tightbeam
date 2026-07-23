@@ -10,6 +10,7 @@ on:
       - "Cargo.lock"
       - "**/Cargo.toml"
   pull_request:
+    branches: [master]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -21,6 +22,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  NO_HUSKY_HOOKS: "1"
 
 jobs:
   audit:
@@ -29,7 +31,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-rust
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Setup
+        run: make setup
 
       - name: Security Audit
         run: make audit

@@ -6,23 +6,43 @@ on:
     branches:
       - master
     tags:
-      - "v*"
+      - "releases/v*"
+      - "releases/derive/v*"
   pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  NO_HUSKY_HOOKS: "1"
 
 jobs:
   ci:
     name: CI
-    runs-on: ubuntu-latest-l
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - uses: ./.github/actions/setup-rust
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
       - name: Setup
         run: make setup
+
       - name: CI
         run: make ci
 
@@ -32,17 +52,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
       - name: Read MSRV from Cargo.toml
         id: msrv
         run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install MSRV toolchain
         run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
       - name: Resolve MSRV-compatible dependencies
         run: |
           mkdir -p .cargo
           printf '[resolver]\nincompatible-rust-versions = "fallback"\n' > .cargo/config.toml
           cargo +${{ steps.msrv.outputs.version }} update
+
       - name: Check workspace on MSRV
         run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-features

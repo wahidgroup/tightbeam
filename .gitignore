@@ -15,3 +15,5 @@ temp
 # Contains mutation testing data
 **/mutants.out*/
 
+# Setup lock
+.make

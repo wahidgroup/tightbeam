@@ -1,19 +1,19 @@
 <!--
 PR Title MUST follow Conventional Commits:
-  <type>[optional scope]: <Subject>
+  <type>[optional scope][!]: <description>
 
-Types: feat | fix | docs | style | refactor | perf | test | build | ci | chore
+Types: feat | fix | docs | style | refactor | perf | test | build | ci | chore | revert
 Rules:
-  - Subject MUST start uppercase and MUST NOT end with a period
-  - Append "!" after type/scope for breaking changes (e.g. feat!: Drop legacy API)
+  - Description MUST start with a lowercase letter or digit and MUST NOT end with a period
+  - Append "!" after type/scope for breaking changes (e.g. feat!: drop legacy API)
 
 Recommended scopes: tightbeam | tightbeam-derive | transport | crypto | colony | builder | asn1 | docs
 
 Examples:
-  feat: Add zero-queue scheduler
-  fix(crypto): Correct ECIES KDF salt derivation
-  chore(tightbeam-derive): Bump syn to 2.x
-  refactor(transport)!: Rename handshake processor trait
+  feat: add zero-queue scheduler
+  fix(crypto): correct ECIES KDF salt derivation
+  chore(tightbeam-derive): bump syn to 2.x
+  refactor(transport)!: rename handshake processor trait
 
 See CONTRIBUTING.md for the full specification.
 -->

@@ -3180,7 +3180,7 @@ let trace: TraceCollector = TraceConfig::builder()
 trace.event("msg")?.with_log_level(LogLevel::Error).emit();
 ```
 
-> Note: The event emit may be ellided as events are emitted on drop.
+> Note: The event emit may be elided as events are emitted on drop.
 
 ## 11. Misc
 
