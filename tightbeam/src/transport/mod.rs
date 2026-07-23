@@ -176,7 +176,7 @@ mod tests {
 		// Verify server received the message -- TUNNEL
 		let received = rx
 			.recv_timeout(Duration::from_secs(1))
-			.map_err(|_| TransportError::OperationFailed(error::TransportFailure::Timeout))?;
+			.map_err(|_| TransportError::OperationFailed(error::TransportFailure::DeadlineExceeded))?;
 		assert_eq!(message, received);
 
 		server_handle.abort();

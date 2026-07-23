@@ -87,7 +87,7 @@ tb_assert_spec! {
 	pub HiveEstablishSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(hive_started, exactly!(1)),
 			(hive_established, exactly!(1))
@@ -288,7 +288,7 @@ tb_assert_spec! {
 	pub HiveGateShapeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(unsigned_heartbeat_heartbeat_shape, exactly!(1)),
 			(unsigned_manage_manage_shape, exactly!(1)),
@@ -298,7 +298,7 @@ tb_assert_spec! {
 	},
 	V(1,1,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(unsigned_heartbeat_heartbeat_shape, exactly!(1)),
 			(unsigned_manage_manage_shape, exactly!(1)),
@@ -335,31 +335,31 @@ tb_scenario! {
 			// Unsigned heartbeat: heartbeat CHOICE, no capacity data pre-auth
 			let unsigned_heartbeat = command_frame(b"hb-unsigned", heartbeat_command(current_timestamp_ms()))?;
 			let response = emit_command(&mut client, unsigned_heartbeat).await?;
-			assert_heartbeat_shape(&response, TransitStatus::Unauthorized, true);
+			assert_heartbeat_shape(&response, TransitStatus::Unauthenticated, true);
 
 			trace.event(HiveGateShapeSpec::unsigned_heartbeat_heartbeat_shape)?;
 
 			// Unsigned manage: manage CHOICE (security verdict, no drain probe)
 			let unsigned_stop = stop_command_frame(b"manage-unsigned")?;
 			let response = emit_command(&mut client, unsigned_stop).await?;
-			assert_manage_stop_shape(&response, TransitStatus::Unauthorized);
+			assert_manage_stop_shape(&response, TransitStatus::Unauthenticated);
 
 			trace.event(HiveGateShapeSpec::unsigned_manage_manage_shape)?;
 
 			// Signed heartbeat: accepted end-to-end
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-signed").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			assert_heartbeat_shape(&response, TransitStatus::Accepted, false);
+			assert_heartbeat_shape(&response, TransitStatus::Ok, false);
 
 			trace.event(HiveGateShapeSpec::signed_heartbeat_accepted)?;
 
-			// A signed manage command during drain must come back Busy in
-			// the manage CHOICE.
+			// A signed manage command during drain must come back
+			// Unavailable in the manage CHOICE.
 			hive.drain().await?;
 
 			let signed_stop = signed_stop_frame(&signer.provider, b"manage-draining").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
-			assert_manage_stop_shape(&response, TransitStatus::Busy);
+			assert_manage_stop_shape(&response, TransitStatus::Unavailable);
 
 			trace.event(HiveGateShapeSpec::draining_manage_manage_shape)?;
 
@@ -374,14 +374,14 @@ tb_scenario! {
 			forged.nonrepudiation = donor.nonrepudiation.clone();
 
 			let response = emit_command(&mut client, forged).await?;
-			assert_heartbeat_shape(&response, TransitStatus::Forbidden, false);
+			assert_heartbeat_shape(&response, TransitStatus::PermissionDenied, false);
 
 			// Open breaker: a valid heartbeat is rejected during cooldown but
 			// keeps the heartbeat CHOICE, so the cluster records a reply
 			// instead of MalformedResponse eviction pressure.
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-open").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			assert_heartbeat_shape(&response, TransitStatus::Forbidden, true);
+			assert_heartbeat_shape(&response, TransitStatus::PermissionDenied, true);
 
 			trace.event(HiveGateShapeSpec::open_breaker_heartbeat_shape)?;
 
@@ -396,7 +396,7 @@ tb_assert_spec! {
 	pub HiveBackpressureShapeSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(backpressure_manage_manage_shape, exactly!(1)),
 			(backpressure_heartbeat_heartbeat_shape, exactly!(1))
@@ -404,8 +404,8 @@ tb_assert_spec! {
 	}
 }
 
-// Backpressure Busy must also come back in the sender's CHOICE. Only manage
-// commands hit the gate (heartbeats are exempt), so the Busy verdict must
+// Backpressure ResourceExhausted must also come back in the sender's CHOICE. Only manage
+// commands hit the gate (heartbeats are exempt), so the ResourceExhausted verdict must
 // use the manage shape.
 tb_scenario! {
 	name: hive_backpressure_reply_shape,
@@ -429,15 +429,15 @@ tb_scenario! {
 
 			let signed_stop = signed_stop_frame(&signer.provider, b"manage-bp").await?;
 			let response = emit_command(&mut client, signed_stop).await?;
-			assert_manage_stop_shape(&response, TransitStatus::Busy);
+			assert_manage_stop_shape(&response, TransitStatus::ResourceExhausted);
 
 			trace.event(HiveBackpressureShapeSpec::backpressure_manage_manage_shape)?;
 
 			// Signed heartbeat is exempt from the gate: heartbeat CHOICE
-			// with real capacity data (Busy status reflects saturation).
+			// with real capacity data (ResourceExhausted status reflects saturation).
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-bp").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
-			assert_heartbeat_shape(&response, TransitStatus::Busy, false);
+			assert_heartbeat_shape(&response, TransitStatus::ResourceExhausted, false);
 
 			trace.event(HiveBackpressureShapeSpec::backpressure_heartbeat_heartbeat_shape)?;
 
@@ -471,7 +471,7 @@ tb_assert_spec! {
 	pub HiveSpawnRetrySpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(first_spawn_forbidden, exactly!(1)),
 			(retry_spawn_accepted, exactly!(1))
@@ -514,11 +514,11 @@ tb_scenario! {
 			let replay = signed.clone();
 
 			let first = emit_command(&mut client, signed).await?;
-			assert_manage_spawn_shape(&first, TransitStatus::Forbidden);
+			assert_manage_spawn_shape(&first, TransitStatus::PermissionDenied);
 			trace.event(HiveSpawnRetrySpec::first_spawn_forbidden)?;
 
 			let second = emit_command(&mut client, replay).await?;
-			assert_manage_spawn_shape(&second, TransitStatus::Accepted);
+			assert_manage_spawn_shape(&second, TransitStatus::Ok);
 			trace.event(HiveSpawnRetrySpec::retry_spawn_accepted)?;
 
 			hive.stop();

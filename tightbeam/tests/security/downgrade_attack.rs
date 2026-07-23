@@ -44,7 +44,7 @@ tb_assert_spec! {
 	pub DowngradeAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(downgrade_capture_strong, exactly!(BACKEND_COUNT_U32)),
 			(downgrade_capture_weak, exactly!(BACKEND_COUNT_U32)),

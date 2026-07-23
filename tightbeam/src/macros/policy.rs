@@ -125,26 +125,26 @@ mod tests {
 	// instead of surviving until a consumer expands them.
 	policy! {
 		GatePolicy: TestGateBusy |_frame| {
-			TransitStatus::Busy
+			TransitStatus::ResourceExhausted
 		}
 		GatePolicy: TestGateAccept |_frame| {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		}
 		// Implicit-argument arms: macro hygiene hides the generated binding
 		// from the caller's body, so these arms serve input-independent
 		// policies only.
 		GatePolicy: TestGateImplicitArg {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		}
 		ReceptorPolicy<DummyMessage>: TestReceptorReject |message| {
 			if message.value == 0 {
-				TransitStatus::Forbidden
+				TransitStatus::PermissionDenied
 			} else {
-				TransitStatus::Accepted
+				TransitStatus::Ok
 			}
 		}
 		ReceptorPolicy<DummyMessage>: TestReceptorImplicitArg {
-			TransitStatus::Accepted
+			TransitStatus::Ok
 		}
 		RestartPolicy: TestRestart |frame, _failure, _attempt| {
 			RetryAction::Retry(frame)
@@ -169,7 +169,7 @@ mod tests {
 		let frame = compose! {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
-		assert_eq!(gate.evaluate(&frame), TransitStatus::Busy);
+		assert_eq!(gate.evaluate(&frame), TransitStatus::ResourceExhausted);
 
 		Ok(())
 	}
@@ -177,8 +177,8 @@ mod tests {
 	#[test]
 	fn test_receptor_policy() {
 		let receptor = TestReceptorReject;
-		assert_eq!(receptor.evaluate(&DummyMessage { value: 1 }), TransitStatus::Accepted);
-		assert_eq!(receptor.evaluate(&DummyMessage { value: 0 }), TransitStatus::Forbidden);
+		assert_eq!(receptor.evaluate(&DummyMessage { value: 1 }), TransitStatus::Ok);
+		assert_eq!(receptor.evaluate(&DummyMessage { value: 0 }), TransitStatus::PermissionDenied);
 	}
 
 	#[test]
@@ -186,11 +186,8 @@ mod tests {
 		let frame = compose! {
 			V0: id: b"test", message: DummyMessage { value: 42 }
 		}?;
-		assert_eq!(TestGateImplicitArg.evaluate(&frame), TransitStatus::Accepted);
-		assert_eq!(
-			TestReceptorImplicitArg.evaluate(&DummyMessage { value: 42 }),
-			TransitStatus::Accepted
-		);
+		assert_eq!(TestGateImplicitArg.evaluate(&frame), TransitStatus::Ok);
+		assert_eq!(TestReceptorImplicitArg.evaluate(&DummyMessage { value: 42 }), TransitStatus::Ok);
 
 		Ok(())
 	}

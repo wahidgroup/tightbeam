@@ -158,7 +158,7 @@ pub const DEFAULT_FAULT_SEED: u64 = 0xDEADBEEF;
 /// Default backpressure threshold in basis points (90% = 9000 bps)
 ///
 /// When aggregate utilization exceeds this threshold, the hive signals
-/// `TransitStatus::Busy` to the cluster, indicating it should route work elsewhere.
+/// `TransitStatus::ResourceExhausted` to the cluster, indicating it should route work elsewhere.
 pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
 
 /// Utilization assumed for servlets that do not report one (50% = 5000 bps)

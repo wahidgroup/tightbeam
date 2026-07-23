@@ -1012,7 +1012,7 @@ where
 						let now = Instant::now();
 						let deadline = initiated_at + self.handshake_timeout;
 						if now >= deadline {
-							return Err(TransportError::OperationFailed(TransportFailure::Timeout));
+							return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 						}
 						Some(deadline.saturating_duration_since(now))
 					}
@@ -1146,7 +1146,7 @@ where
 			if let Some(duration) = timeout_duration {
 				match timeout(duration, async { self.perform_emit_cycle(message).await }).await {
 					Ok(result) => result,
-					Err(_) => Err(TransportError::OperationFailed(TransportFailure::Timeout)),
+					Err(_) => Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded)),
 				}
 			} else {
 				self.perform_emit_cycle(message).await
@@ -1443,9 +1443,9 @@ mod tests {
 		impl GatePolicy for BusyFirstGate {
 			fn evaluate(&self, _msg: &Frame) -> TransitStatus {
 				if self.first.swap(false, Ordering::SeqCst) {
-					TransitStatus::Busy
+					TransitStatus::ResourceExhausted
 				} else {
-					TransitStatus::Accepted
+					TransitStatus::Ok
 				}
 			}
 		}
@@ -1481,12 +1481,12 @@ mod tests {
 			let mut transport = transport.with_collector_gate(BusyFirstGate::new()).with_handler(handler);
 
 			// First handle_request: processes handshake (ClientHello + ClientKeyExchange)
-			// and first application message. Gate returns Busy for first app message.
+			// and first application message. Gate returns ResourceExhausted for first app message.
 			let result = transport.handle_request().await;
 			result?;
 
 			// Second handle_request: processes second application message
-			// Gate returns Accepted this time
+			// Gate returns Ok this time
 			transport.handle_request().await
 		});
 
@@ -1500,11 +1500,14 @@ mod tests {
 		let mut transport = TcpTransport::from(TokioStream::from(stream)).with_trust_store(trust_store);
 
 		// First emit triggers handshake, then sends encrypted message
-		// Gate policy returns Busy for first application message
+		// Gate policy returns ResourceExhausted for first application message
 		let first = transport.emit(test_message.clone(), None).await;
-		assert!(matches!(first, Err(TransportError::OperationFailed(TransportFailure::Busy))));
+		assert!(matches!(
+			first,
+			Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))
+		));
 
-		// Second emit sends encrypted message, gate returns Accepted
+		// Second emit sends encrypted message, gate returns Ok
 		transport.emit(test_message.clone(), None).await?;
 
 		let received = rx.recv().await;

@@ -247,7 +247,7 @@ mod tests {
 		pub TightbeamUrnSpecSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(urn_string, exactly!(1), equals!("urn:tightbeam:instrumentation:trace/abc-123"))
 			]

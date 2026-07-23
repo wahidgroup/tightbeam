@@ -141,8 +141,8 @@ pub trait MessageEmitter: MessageIO {
 		loop {
 			// Evaluate gate policy before sending
 			let status = self.to_emitter_gate_policy_ref().evaluate(letter.try_peek()?);
-			if status != TransitStatus::Accepted {
-				return Err(TransportError::OperationFailed(TransportFailure::Unauthorized));
+			if status != TransitStatus::Ok {
+				return Err(TransportError::from(status));
 			}
 
 			// Take message for send operation
@@ -181,17 +181,13 @@ pub trait MessageEmitter: MessageIO {
 			};
 
 			// Check transport status and handle response
-			let result: TransportResult<&Frame> = if status != TransitStatus::Accepted {
+			let result: TransportResult<&Frame> = if status != TransitStatus::Ok {
 				if let Some(msg) = original_message {
 					// Server rejected - return frame for retry
-					let failure = match status {
-						TransitStatus::Busy => TransportFailure::Busy,
-						TransitStatus::Forbidden => TransportFailure::Forbidden,
-						TransitStatus::Unauthorized => TransportFailure::Unauthorized,
-						TransitStatus::Timeout => TransportFailure::Timeout,
-						_ => TransportFailure::PolicyRejection,
-					};
-					Err(TransportError::from_failure(msg, failure))
+					match TransportFailure::try_from(status) {
+						Ok(failure) => Err(TransportError::from_failure(msg, failure)),
+						Err(error) => Err(error),
+					}
 				} else {
 					return Err(<TransportError as From<TransitStatus>>::from(status));
 				}
@@ -265,7 +261,7 @@ pub trait MessageEmitter: MessageIO {
 		};
 
 		// Return frame if rejected
-		let original = if status != TransitStatus::Accepted {
+		let original = if status != TransitStatus::Ok {
 			Some(Arc::try_unwrap(frame_arc).unwrap_or_else(|arc| (*arc).clone()))
 		} else {
 			None
@@ -309,7 +305,7 @@ pub trait MessageCollector: MessageIO {
 
 		// Evaluate gate policy
 		let status = self.collector_gate().evaluate(&request);
-		if status == TransitStatus::Request {
+		if status == TransitStatus::Unknown {
 			// Invalid status from gate
 			return Err(TransportError::InvalidReply);
 		}
@@ -333,7 +329,7 @@ pub trait MessageCollector: MessageIO {
 
 		// Evaluate gate policy
 		let status = self.collector_gate().evaluate(&request);
-		if status == TransitStatus::Request {
+		if status == TransitStatus::Unknown {
 			// Invalid status from gate
 			return Err(TransportError::InvalidReply);
 		}
@@ -372,13 +368,13 @@ pub trait MessageCollector: MessageIO {
 			#[cfg(feature = "x509")]
 			Err(TransportError::MissingEncryption) => {
 				// Client sent unencrypted message when encryption required
-				self.send_response(TransitStatus::Forbidden, None).await?;
+				self.send_response(TransitStatus::PermissionDenied, None).await?;
 				return Ok(());
 			}
 			Err(e) => return Err(e),
 		};
 
-		let message = if status == TransitStatus::Accepted {
+		let message = if status == TransitStatus::Ok {
 			// If the gate accepted it, handle the message
 			self.handle_message(request)
 		} else {
@@ -542,7 +538,7 @@ where
 	let request = lockstep_request_frame(envelope)?;
 
 	let status = gate.evaluate(&request);
-	if status == TransitStatus::Request {
+	if status == TransitStatus::Unknown {
 		return Err(TransportError::InvalidReply);
 	}
 
@@ -552,7 +548,7 @@ where
 #[cfg(not(feature = "transport-policy"))]
 pub trait MessageCollector: MessageIO {
 	/// Read and validate a message without sending a response
-	/// Returns the message (status is always Accepted without policies)
+	/// Returns the message (status is always Ok without policies)
 	#[allow(async_fn_in_trait)]
 	async fn collect_message(&mut self) -> TransportResult<(Arc<Frame>, TransitStatus)> {
 		// Read the envelope
@@ -569,7 +565,7 @@ pub trait MessageCollector: MessageIO {
 			}
 		};
 
-		Ok((request, TransitStatus::Accepted))
+		Ok((request, TransitStatus::Ok))
 	}
 
 	/// Try to collect next message without blocking on closed connections
@@ -596,7 +592,7 @@ pub trait MessageCollector: MessageIO {
 			}
 		};
 
-		Ok(Some((request, TransitStatus::Accepted)))
+		Ok(Some((request, TransitStatus::Ok)))
 	}
 
 	/// Send a response for a previously collected message
@@ -629,13 +625,13 @@ pub trait MessageCollector: MessageIO {
 			#[cfg(feature = "x509")]
 			Err(TransportError::MissingEncryption) => {
 				// Client sent unencrypted message when encryption required
-				self.send_response(TransitStatus::Forbidden, None).await?;
+				self.send_response(TransitStatus::PermissionDenied, None).await?;
 				return Ok(());
 			}
 			Err(e) => return Err(e),
 		};
 
-		let message = if status == TransitStatus::Accepted {
+		let message = if status == TransitStatus::Ok {
 			// If the gate accepted it, handle the message
 			self.handle_message(request)
 		} else {

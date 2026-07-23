@@ -83,7 +83,7 @@ where
 		};
 		let remaining = deadline.saturating_duration_since(Instant::now());
 		if remaining.is_zero() {
-			return Err(TransportError::OperationFailed(TransportFailure::Timeout));
+			return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 		}
 
 		self.stream.set_timeout(Some(remaining))?;
@@ -299,7 +299,7 @@ where
 			result.map_err(|e| {
 				if let TransportError::IoError(io_err) = &e {
 					if io_err.kind() == ErrorKind::TimedOut {
-						return TransportError::OperationFailed(TransportFailure::Timeout);
+						return TransportError::OperationFailed(TransportFailure::DeadlineExceeded);
 					}
 				}
 
@@ -661,7 +661,7 @@ mod tests {
 	#[cfg(all(feature = "transport-policy", not(feature = "x509")))]
 	#[tokio::test]
 	async fn test_tcp_transport_with_gate_policy() -> TransportResult<()> {
-		/// Policy: first Busy, then Accepted
+		/// Policy: first ResourceExhausted, then Ok
 		struct BusyFirstGate {
 			first: AtomicBool,
 		}
@@ -675,9 +675,9 @@ mod tests {
 		impl GatePolicy for BusyFirstGate {
 			fn evaluate(&self, _msg: &Frame) -> TransitStatus {
 				if self.first.swap(false, Ordering::SeqCst) {
-					TransitStatus::Busy
+					TransitStatus::ResourceExhausted
 				} else {
-					TransitStatus::Accepted
+					TransitStatus::Ok
 				}
 			}
 		}
@@ -694,10 +694,10 @@ mod tests {
 
 			let rt = tokio::runtime::Runtime::new().unwrap();
 
-			// First handle_request - gate policy returns Busy
+			// First handle_request - gate policy returns ResourceExhausted
 			rt.block_on(transport.handle_request()).ok();
 
-			// Second handle_request - gate policy returns Accepted
+			// Second handle_request - gate policy returns Ok
 			rt.block_on(transport.handle_request()).unwrap();
 		});
 
@@ -706,11 +706,14 @@ mod tests {
 		let stream = NetTcpStream::connect(addr)?;
 		let mut transport = TcpTransport::from(stream);
 
-		// First attempt - server responds with Busy
+		// First attempt - server responds with ResourceExhausted
 		let result = transport.emit(message.clone(), None).await;
-		assert!(matches!(result, Err(TransportError::OperationFailed(TransportFailure::Busy))));
+		assert!(matches!(
+			result,
+			Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))
+		));
 
-		// Second attempt - server responds with Accepted
+		// Second attempt - server responds with Ok
 		transport.emit(message.clone(), None).await?;
 
 		server_handle.join().unwrap();

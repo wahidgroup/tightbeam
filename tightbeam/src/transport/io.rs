@@ -980,7 +980,7 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 
 	/// Perform a single request-response cycle
-	/// Returns (status, response, original_message) where original_message is Some when status != Accepted
+	/// Returns (status, response, original_message) where original_message is Some when status != Ok
 	#[cfg(feature = "x509")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_emit_cycle(
@@ -1010,8 +1010,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			TransportEnvelope::Mux(_) => return Err(TransportError::InvalidMessage),
 		};
 
-		// Return original message when status != Accepted (for retry evaluation)
-		let returned_message = if status != TransitStatus::Accepted {
+		// Return original message when status != Ok (for retry evaluation)
+		let returned_message = if status != TransitStatus::Ok {
 			match wire_envelope {
 				WireEnvelope::Cleartext(TransportEnvelope::Request(pkg)) => Some(pkg.message),
 				_ => None, // Encrypted - can't extract original
@@ -1113,14 +1113,14 @@ mod tests {
 			(
 				"response V0+priority",
 				TransportEnvelope::Response(ResponsePackage::new(
-					TransitStatus::Accepted,
+					TransitStatus::Ok,
 					Some(frame_with_priority(Version::V0)),
 				)),
 				false,
 			),
 			(
 				"response without frame",
-				TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Accepted, None)),
+				TransportEnvelope::Response(ResponsePackage::new(TransitStatus::Ok, None)),
 				true,
 			),
 		]

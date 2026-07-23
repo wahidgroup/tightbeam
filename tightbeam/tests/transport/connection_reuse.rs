@@ -139,7 +139,7 @@ tb_assert_spec! {
 	pub ConnectionReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(client_connect, exactly!(1)),
 			(send_message, exactly!(3)),

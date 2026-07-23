@@ -1279,7 +1279,7 @@ mod tests {
 		pub SimpleBareFlowSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				("step1", exactly!(1)),
 				("step2", exactly!(1))
@@ -1320,7 +1320,7 @@ mod tests {
 		pub ClientServerFlowSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(Received, exactly!(2)),
 				(Responded, exactly!(2))

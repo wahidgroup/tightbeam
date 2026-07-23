@@ -53,7 +53,7 @@ mod tests {
 		pub DemoSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(MessageReceived, exactly!(1))
 			]

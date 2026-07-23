@@ -793,7 +793,7 @@ impl ConsumedTrace {
 	pub fn execution_mode(&self) -> ExecutionMode {
 		if self.error.is_some() {
 			ExecutionMode::Error
-		} else if matches!(self.gate_decision, Some(TransitStatus::Accepted)) {
+		} else if matches!(self.gate_decision, Some(TransitStatus::Ok)) {
 			ExecutionMode::Accept
 		} else if self.gate_decision.is_some() {
 			ExecutionMode::Reject
@@ -874,7 +874,7 @@ mod tests {
 		pub TraceCollectorSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(alpha, exactly!(1)),
 				(beta, exactly!(1)),

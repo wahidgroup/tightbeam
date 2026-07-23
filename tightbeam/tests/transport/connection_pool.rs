@@ -152,7 +152,7 @@ tb_assert_spec! {
 	pub PoolReuseSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(pool_create, exactly!(1)),
 			(acquire_client, exactly!(3)),
@@ -168,7 +168,7 @@ tb_assert_spec! {
 	pub PoolIsolationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(pool_create, exactly!(1)),
 			(acquire_client, exactly!(3)),
@@ -344,7 +344,7 @@ async fn pool_admits_new_connections_after_reuse_cycle() -> Result<(), Box<dyn s
 	drop(second);
 
 	// A new destination cannot be served from addr1's idle set, so the pool
-	// must admit a brand-new connection; a wedged counter reports Busy here.
+	// must admit a brand-new connection; a wedged counter reports ResourceExhausted here.
 	let third = pool.connect(addr2).await;
 	assert!(
 		third.is_ok(),

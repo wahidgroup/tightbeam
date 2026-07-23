@@ -87,16 +87,16 @@ where
 			let handler = handler.clone();
 			async move {
 				let status = gate.evaluate(&frame);
-				if status != TransitStatus::Accepted {
+				if status != TransitStatus::Ok {
 					return ResponsePackage::new(status, None);
 				}
 
 				let request = Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone());
 				match handler(request).await {
-					Ok(message) => ResponsePackage::new(TransitStatus::Accepted, message),
+					Ok(message) => ResponsePackage::new(TransitStatus::Ok, message),
 					// Handler failures answer with no response, matching
 					// the single-flight loop
-					Err(_) => ResponsePackage::new(TransitStatus::Accepted, None),
+					Err(_) => ResponsePackage::new(TransitStatus::Ok, None),
 				}
 			}
 		})

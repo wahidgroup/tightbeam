@@ -347,7 +347,7 @@ impl<P: Protocol> Default for DestinationPool<P> {
 /// - `total_connections` counts live connections and stays within
 ///   `0..=config.max_connections`: +1 when a socket is created.
 /// - Idle connections exceeding `PoolConfig::idle_timeout` are pruned lazily
-/// - Lock poisoning never panics; callers receive `TransportFailure::Busy` instead
+/// - Lock poisoning never panics; callers receive `TransportFailure::Internal` instead
 #[cfg(feature = "std")]
 pub struct ConnectionPool<P: Protocol, C: CryptoProvider = DefaultCryptoProvider> {
 	/// Per-destination sub-pools
@@ -376,7 +376,7 @@ pub struct ConnectionPool<P: Protocol, C: CryptoProvider = DefaultCryptoProvider
 impl<P: Protocol, C: CryptoProvider> ConnectionPool<P, C> {
 	/// Decrement the live-connection count for a discarded connection,
 	/// saturating at zero so an accounting defect can never wrap the counter
-	/// and wedge the pool into permanent `Busy`.
+	/// and wedge the pool into permanent refusal.
 	fn release_connection_count(&self) {
 		let _ = self
 			.total_connections
@@ -419,7 +419,7 @@ where
 	fn write_pools(&self) -> TransportResult<RwLockWriteGuard<'_, HashMap<P::Address, DestinationPool<P>>>> {
 		self.pools
 			.write()
-			.map_err(|_| TransportError::OperationFailed(TransportFailure::Busy))
+			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))
 	}
 
 	#[cfg(not(feature = "x509"))]
@@ -467,7 +467,7 @@ where
 				}
 			});
 		if reserved.is_err() {
-			return Err(TransportError::OperationFailed(TransportFailure::Busy));
+			return Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted));
 		}
 
 		let mut pools = self.write_pools()?;

@@ -8,7 +8,7 @@
 //! - Muxed envelopes rejected on a connection that never negotiated mux
 //! - Cancelling an in-flight stream frees its cap slot and aborts the handler
 //! - A response racing a cancel on the connection is discarded cleanly
-//! - Garbage End payloads on stale or non-Accepted streams never kill the connection
+//! - Garbage End payloads on stale or non-Ok streams never kill the connection
 //! - GoAway drains in-flight streams and rejects new ones
 //! - Rekey drain headroom table (`2 * (local_cap + peer_cap) + 1` vs record limit)
 //! - Cancel-budget boundary: N cancels OK, N+1 yields GoAway(EnhanceYourCalm)
@@ -349,7 +349,7 @@ mod negotiated {
 	}
 
 	fn echo_response(frame: &Arc<Frame>) -> ResponsePackage {
-		ResponsePackage::new(TransitStatus::Accepted, Some(Frame::clone(frame)))
+		ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(frame)))
 	}
 
 	/// Handler that signals `started`, parks until `release`, then echoes.
@@ -541,7 +541,7 @@ mod negotiated {
 		frame: &Arc<Frame>,
 	) -> Result<(), TightBeamError> {
 		let payload = frame.as_ref().to_der()?;
-		write_muxed_end(writer, stream_id, TransitStatus::Accepted, payload).await
+		write_muxed_end(writer, stream_id, TransitStatus::Ok, payload).await
 	}
 
 	async fn write_goaway(
@@ -597,7 +597,10 @@ mod negotiated {
 	}
 
 	fn is_busy(result: &Result<Option<Frame>, TransportError>) -> bool {
-		matches!(result, Err(TransportError::OperationFailed(TransportFailure::Busy)))
+		matches!(
+			result,
+			Err(TransportError::OperationFailed(TransportFailure::ResourceExhausted))
+		)
 	}
 
 	fn is_draining(result: &Result<Option<Frame>, TransportError>) -> bool {
@@ -667,7 +670,7 @@ mod negotiated {
 		pub MuxInterleavedSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(first_stream_echoed, exactly!(1), equals!(true)),
 				(second_stream_echoed, exactly!(1), equals!(true))
@@ -722,7 +725,7 @@ mod negotiated {
 		pub MuxCapExhaustionSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(negotiated_cap_is_one, exactly!(1), equals!(true)),
 				(second_emit_streams_exhausted, exactly!(1), equals!(true)),
@@ -779,7 +782,7 @@ mod negotiated {
 		pub MuxNonNegotiatedSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(handshake_negotiated_no_mux, exactly!(1), equals!(true)),
 				(muxed_envelope_invalid_message, exactly!(1), equals!(true))
@@ -824,7 +827,7 @@ mod negotiated {
 		pub MuxCancelAbortSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(followup_echoes_on_freed_slot, exactly!(1), equals!(true)),
 				(handler_aborted_on_cancel, exactly!(1), equals!(true))
@@ -872,7 +875,7 @@ mod negotiated {
 		pub MuxCancelRaceSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(cancel_observed_on_wire, exactly!(1), equals!(true)),
 				(followup_echoes_after_race, exactly!(1), equals!(true))
@@ -916,7 +919,7 @@ mod negotiated {
 		pub MuxEndGarbageSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(busy_garbage_resolves_as_busy, exactly!(1), equals!(true)),
 				(followup_echoes_after_garbage, exactly!(1), equals!(true))
@@ -925,7 +928,7 @@ mod negotiated {
 	}
 
 	// Garbage End payloads must stay per-stream: a stale end (cancelled
-	// stream) is discarded unread and a non-Accepted trailer resolves its
+	// stream) is discarded unread and a non-Ok trailer resolves its
 	// stream without decoding. Neither may tear down the connection.
 	tb_scenario! {
 		name: mux_end_garbage_payload_tolerated,
@@ -941,13 +944,13 @@ mod negotiated {
 
 				abort_emit(stale_task).await;
 				let _cancel = link.server_reader.read_envelope().await?;
-				write_muxed_end(&mut link.server_writer, stale_id, TransitStatus::Accepted, garbage.clone()).await?;
+				write_muxed_end(&mut link.server_writer, stale_id, TransitStatus::Ok, garbage.clone()).await?;
 
-				// Busy trailer carrying garbage. Must resolve per-stream as Busy.
+				// ResourceExhausted trailer carrying garbage. Must resolve per-stream as ResourceExhausted.
 				let busy_task = spawn_emit(&link.client.handle, mux_frame("mux-busy-garbage"));
 				let busy_id = read_muxed_request_id(&mut link.server_reader).await?;
 
-				write_muxed_end(&mut link.server_writer, busy_id, TransitStatus::Busy, garbage).await?;
+				write_muxed_end(&mut link.server_writer, busy_id, TransitStatus::ResourceExhausted, garbage).await?;
 				let busy = join_task(busy_task, "busy emit task must not panic").await?;
 				trace.event_with(MuxEndGarbageSpec::busy_garbage_resolves_as_busy, &[], is_busy(&busy))?;
 
@@ -964,7 +967,7 @@ mod negotiated {
 		pub MuxGoAwayDrainSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(late_emit_refused_draining, exactly!(1), equals!(true)),
 				(inflight_drains_to_echo, exactly!(1), equals!(true))
@@ -1020,7 +1023,7 @@ mod negotiated {
 		pub MuxShutdownReasonSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(shutdown_with_advertises_reason, exactly!(2), equals!(true))
 			]
@@ -1066,7 +1069,7 @@ mod negotiated {
 		pub MuxPeerReasonSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(peer_reason_surfaces_on_handle, exactly!(2), equals!(true))
 			]
@@ -1124,7 +1127,7 @@ mod negotiated {
 		pub MuxRekeyHeadroomSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(rekey_case_holds, exactly!(4), equals!(true))
 			]
@@ -1208,7 +1211,7 @@ mod negotiated {
 		pub MuxCancelBudgetSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(goaway_enhance_your_calm, exactly!(1), equals!(true)),
 				(responder_policy_rejection, exactly!(1), equals!(true))
@@ -1263,7 +1266,7 @@ mod negotiated {
 		pub MuxServerInitiatedSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(server_stream_echoed_by_client, exactly!(1), equals!(true))
 			]
@@ -1312,7 +1315,7 @@ mod negotiated {
 		pub MuxPeerGoAwaySpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(stream_above_watermark_draining, exactly!(1), equals!(true)),
 				(stream_at_watermark_echoed, exactly!(1), equals!(true)),
@@ -1370,7 +1373,7 @@ mod negotiated {
 		pub MuxProtocolViolationSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(goaway_protocol_error, exactly!(1), equals!(true)),
 				(pending_fails_connection_closed, exactly!(1), equals!(true))
@@ -1452,7 +1455,7 @@ mod negotiated {
 		pub MuxGrammarViolationSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(offender_answered_with_goaway, exactly!(6), equals!(true))
 			]
@@ -1496,7 +1499,7 @@ mod negotiated {
 		pub MuxConnectionDropSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(emit_fails_connection_closed, exactly!(1), equals!(true))
 			]
@@ -1538,7 +1541,7 @@ mod negotiated {
 		pub MuxCleartextInterleavedSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(first_stream_echoed, exactly!(1), equals!(true)),
 				(second_stream_echoed, exactly!(1), equals!(true))
@@ -1591,7 +1594,7 @@ mod negotiated {
 		pub MuxCleartextCancelBudgetSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(goaway_enhance_your_calm, exactly!(1), equals!(true)),
 				(responder_policy_rejection, exactly!(1), equals!(true))
@@ -1649,7 +1652,7 @@ mod negotiated {
 		pub MuxPingRoundtripSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(client_ping_acked, exactly!(1), equals!(true)),
 				(server_ping_acked, exactly!(1), equals!(true)),
@@ -1711,7 +1714,7 @@ mod negotiated {
 		pub MuxPingWireAckSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(probe_answered_with_matching_ack, exactly!(1), equals!(true)),
 				(followup_echoes_after_stray_ack, exactly!(1), equals!(true))
@@ -1754,7 +1757,7 @@ mod negotiated {
 		pub MuxPingDrainingSpec,
 		V(1,0,0): {
 			mode: Accept,
-			gate: Accepted,
+			gate: Ok,
 			assertions: [
 				(ping_refused_draining, exactly!(1), equals!(true)),
 				(inflight_drains_to_echo, exactly!(1), equals!(true))

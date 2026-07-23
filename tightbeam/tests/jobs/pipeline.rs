@@ -67,7 +67,7 @@ tb_assert_spec! {
 	pub ManualEventSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(pipeline_start, exactly!(1)),
 			(pipeline_complete, exactly!(1))
@@ -103,7 +103,7 @@ tb_assert_spec! {
 	pub AutoTraceSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			// Shorthand labels match full URNs: "foo" matches "urn:*:instrumentation:event/foo"
 			(create_test_frame_start, exactly!(1)),
@@ -174,7 +174,7 @@ tb_assert_spec! {
 	pub FallbackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(fallback_triggered, exactly!(1))
 		]

@@ -9,7 +9,7 @@ tb_assert_spec! {
 	pub WorkflowFuzzSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(init, exactly!(1)),
 			(authenticate, exactly!(1)),

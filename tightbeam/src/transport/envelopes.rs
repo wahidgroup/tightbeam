@@ -598,28 +598,33 @@ mod tests {
 		vec![
 			PackageTestCase {
 				message_value: "Hi",
-				expected_status: TransitStatus::Accepted,
+				expected_status: TransitStatus::Ok,
 				should_have_message: true,
 			},
 			PackageTestCase {
 				// cspell:disable-next-line
 				message_value: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
-				expected_status: TransitStatus::Accepted,
+				expected_status: TransitStatus::Ok,
 				should_have_message: true,
 			},
 			PackageTestCase {
 				message_value: "",
-				expected_status: TransitStatus::Accepted,
+				expected_status: TransitStatus::Ok,
 				should_have_message: true,
 			},
 			PackageTestCase {
-				message_value: "Busy",
-				expected_status: TransitStatus::Busy,
+				message_value: "ResourceExhausted",
+				expected_status: TransitStatus::ResourceExhausted,
 				should_have_message: false,
 			},
 			PackageTestCase {
-				message_value: "Unauthorized",
-				expected_status: TransitStatus::Unauthorized,
+				message_value: "Unauthenticated",
+				expected_status: TransitStatus::Unauthenticated,
+				should_have_message: false,
+			},
+			PackageTestCase {
+				message_value: "NotFound",
+				expected_status: TransitStatus::NotFound,
 				should_have_message: false,
 			},
 		]
@@ -673,7 +678,7 @@ mod tests {
 	#[test]
 	fn test_length_validation_response() -> Result<(), Box<dyn Error>> {
 		let original = ResponsePackage {
-			status: TransitStatus::Accepted,
+			status: TransitStatus::Ok,
 			message: Some(Arc::new(create_v0_tightbeam(None, None))),
 		};
 
@@ -693,7 +698,7 @@ mod tests {
 
 	#[test]
 	fn test_response_empty_message() -> Result<(), Box<dyn Error>> {
-		let original = ResponsePackage { status: TransitStatus::Busy, message: None };
+		let original = ResponsePackage { status: TransitStatus::ResourceExhausted, message: None };
 
 		let encoded = original.to_der()?;
 		let decoded = ResponsePackage::from_der(&encoded)?;
@@ -748,9 +753,9 @@ mod tests {
 	#[test]
 	fn test_mux_end_package_encode_decode() -> Result<(), Box<dyn Error>> {
 		assert_round_trip([
-			MuxEndPackage::new(1, TransitStatus::Accepted, frame_payload("end-unary")?)?,
-			MuxEndPackage::new(3, TransitStatus::Busy, Vec::new())?,
-			MuxEndPackage::new(u32::MAX, TransitStatus::Unauthorized, Vec::new())?,
+			MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("end-unary")?)?,
+			MuxEndPackage::new(3, TransitStatus::ResourceExhausted, Vec::new())?,
+			MuxEndPackage::new(u32::MAX, TransitStatus::Unauthenticated, Vec::new())?,
 		])
 	}
 
@@ -853,7 +858,7 @@ mod tests {
 		assert_round_trip([
 			TransportEnvelope::from(MuxOpenPackage::new(1, true, frame_payload("mux-open")?)?),
 			TransportEnvelope::from(MuxDataPackage::new(1, false, vec![0xEF; 16])?),
-			TransportEnvelope::from(MuxEndPackage::new(1, TransitStatus::Accepted, frame_payload("mux-end")?)?),
+			TransportEnvelope::from(MuxEndPackage::new(1, TransitStatus::Ok, frame_payload("mux-end")?)?),
 			TransportEnvelope::from(MuxCreditPackage::new(1, 128)),
 			TransportEnvelope::from(MuxCancelPackage::new(5, CancelReason::Cancelled)),
 			TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),

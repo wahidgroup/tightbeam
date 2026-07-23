@@ -40,7 +40,7 @@ tb_assert_spec! {
 	pub DosAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(dos_generate_oversized, exactly!(BACKEND_COUNT_U32)),
 			(dos_inject_oversized, exactly!(BACKEND_COUNT_U32)),

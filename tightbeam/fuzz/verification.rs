@@ -26,7 +26,7 @@ tb_assert_spec! {
 	pub VerificationSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(compilation_check, exactly!(1)),
 			(workspace_has_afl, exactly!(1), equals!(true)),

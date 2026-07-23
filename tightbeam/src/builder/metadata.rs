@@ -48,10 +48,13 @@ impl MetadataBuilder {
 		self
 	}
 
-	/// Set the order
-	/// Commonly a Unix timestamp
-	pub fn with_order(mut self, seconds: u64) -> Self {
-		self.order = Some(seconds);
+	/// Set the order.
+	///
+	/// The value is protocol-opaque: any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted, the
+	/// frame build defaults it to the current Unix time in seconds.
+	pub fn with_order(mut self, order: u64) -> Self {
+		self.order = Some(order);
 		self
 	}
 
@@ -117,7 +120,7 @@ impl MetadataBuilder {
 		} = self;
 
 		let id = id.ok_or(BuildError::InvalidMetadata(MetadataError::MissingId))?;
-		let order = order.ok_or(BuildError::InvalidMetadata(MetadataError::MissingTimestamp))?;
+		let order = order.ok_or(BuildError::InvalidMetadata(MetadataError::MissingOrder))?;
 
 		macro_rules! reject_unsupported {
 			($value:ident, $allows:ident) => {
@@ -286,7 +289,7 @@ mod tests {
 		assert!(result.is_err());
 		assert!(matches!(
 			result.unwrap_err(),
-			BuildError::InvalidMetadata(MetadataError::MissingTimestamp)
+			BuildError::InvalidMetadata(MetadataError::MissingOrder)
 		));
 	}
 
@@ -310,7 +313,7 @@ mod tests {
 				ErrorTestCase {
 					name: "V0 missing order",
 					builder: || MetadataBuilder::from(Version::V0).with_id("test-id"),
-					expected_error: MetadataError::MissingTimestamp,
+					expected_error: MetadataError::MissingOrder,
 				},
 				ErrorTestCase {
 					name: "V1 missing id",
@@ -320,7 +323,7 @@ mod tests {
 				ErrorTestCase {
 					name: "V1 missing order",
 					builder: || MetadataBuilder::from(Version::V1).with_id("test-id"),
-					expected_error: MetadataError::MissingTimestamp,
+					expected_error: MetadataError::MissingOrder,
 				},
 				ErrorTestCase {
 					name: "V2 missing id",
@@ -330,7 +333,7 @@ mod tests {
 				ErrorTestCase {
 					name: "V2 missing order",
 					builder: || MetadataBuilder::from(Version::V2).with_id("test-id"),
-					expected_error: MetadataError::MissingTimestamp,
+					expected_error: MetadataError::MissingOrder,
 				},
 				ErrorTestCase {
 					name: "V0 rejects integrity",

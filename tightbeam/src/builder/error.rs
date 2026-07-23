@@ -12,7 +12,7 @@ pub enum MetadataError {
 
 	/// Missing required order field
 	#[error("Missing required field: order")]
-	MissingTimestamp,
+	MissingOrder,
 
 	/// Missing required hash field (V2+)
 	#[error("Missing required field: hash (required for V2)")]

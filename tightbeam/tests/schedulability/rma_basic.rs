@@ -45,7 +45,7 @@ tb_assert_spec! {
 	pub RmaAssertSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(task1, exactly!(1)),
 			(task2, exactly!(1))

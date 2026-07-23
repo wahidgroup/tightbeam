@@ -40,7 +40,7 @@ tb_assert_spec! {
 	pub SplitTransportSpec,
 	V(1,0,0): {
 		mode: Accept,
-		gate: Accepted,
+		gate: Ok,
 		assertions: [
 			(split_encrypted_roundtrip, exactly!(1), equals!(true)),
 			(split_rejects_pre_handshake, exactly!(1), equals!(true)),
@@ -86,7 +86,7 @@ async fn split_encrypted_roundtrip(trace: &TraceCollector) -> Result<(), TightBe
 			_ => return Err(expectation_failure("server must receive a request envelope")),
 		};
 
-		let response = ResponsePackage::new(TransitStatus::Accepted, Some(frame));
+		let response = ResponsePackage::new(TransitStatus::Ok, Some(frame));
 		let envelope = TransportEnvelope::from(response);
 		writer.write_envelope(envelope).await?;
 
@@ -105,7 +105,7 @@ async fn split_encrypted_roundtrip(trace: &TraceCollector) -> Result<(), TightBe
 		_ => return Err(expectation_failure("client must receive a response envelope")),
 	};
 
-	let status_ok = package.status() == TransitStatus::Accepted;
+	let status_ok = package.status() == TransitStatus::Ok;
 	let echoed_frame = package
 		.message()
 		.map(|arc| Frame::clone(arc))

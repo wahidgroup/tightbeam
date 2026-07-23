@@ -42,7 +42,7 @@ impl ClusterWorkResponse {
 	/// Create a successful response with payload
 	#[inline]
 	pub fn ok(payload: Vec<u8>) -> Self {
-		Self { status: TransitStatus::Accepted, payload: Some(payload) }
+		Self { status: TransitStatus::Ok, payload: Some(payload) }
 	}
 
 	/// Create an error response with status
@@ -120,7 +120,7 @@ pub struct ServletAddressUpdate {
 /// Response to servlet address update notification
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct ServletAddressUpdateResponse {
-	/// Status of the update (Accepted = success)
+	/// Status of the update (Ok = success)
 	pub status: TransitStatus,
 }
 
@@ -153,7 +153,7 @@ impl ActivateServletResponse {
 	/// Create a successful activation response
 	#[inline]
 	pub fn ok(address: Vec<u8>) -> Self {
-		Self { status: TransitStatus::Accepted, servlet_address: Some(address) }
+		Self { status: TransitStatus::Ok, servlet_address: Some(address) }
 	}
 
 	/// Create a failed activation response
@@ -270,7 +270,7 @@ impl HiveManagementResponse {
 	pub fn spawn_ok(address: Vec<u8>, servlet_id: Vec<u8>) -> Self {
 		Self {
 			spawn: Some(SpawnServletResult {
-				status: TransitStatus::Accepted,
+				status: TransitStatus::Ok,
 				servlet_address: Some(address),
 				servlet_id: Some(servlet_id),
 			}),
@@ -294,7 +294,7 @@ impl HiveManagementResponse {
 	pub fn list_ok(servlets: Vec<ServletInfo>) -> Self {
 		Self {
 			spawn: None,
-			list: Some(ListServletsResult { status: TransitStatus::Accepted, servlets }),
+			list: Some(ListServletsResult { status: TransitStatus::Ok, servlets }),
 			stop: None,
 		}
 	}
@@ -305,7 +305,7 @@ impl HiveManagementResponse {
 		Self {
 			spawn: None,
 			list: None,
-			stop: Some(StopServletResult { status: TransitStatus::Accepted }),
+			stop: Some(StopServletResult { status: TransitStatus::Ok }),
 		}
 	}
 
@@ -391,7 +391,7 @@ pub struct ClusterCommandResponse {
 /// Heartbeat response with hive health status
 #[derive(Debug, Beamable, Sequence, Clone, PartialEq)]
 pub struct HeartbeatResult {
-	/// Overall status (Accepted = healthy, Busy = at capacity)
+	/// Overall status (Ok = healthy, ResourceExhausted = at capacity)
 	pub status: TransitStatus,
 	/// Current aggregate utilization across all servlets
 	pub utilization: BasisPoints,
