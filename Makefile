@@ -69,7 +69,7 @@ help-body:
 	@printf '    debug           If set (e.g., debug=1), export RUST_LOG=debug\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'
 	@printf '    no-default      If set (e.g., 1), passes --no-default-features to Cargo\n'
-	@printf '    ARGS            Extra arguments for clippy (e.g., "--allow-dirty --allow-staged")\n'
+	@printf '    ARGS            Extra arguments for clippy (e.g., "--no-deps")\n'
 	@printf '    version         Release version (e.g., version=v0.9.1)\n'
 	@printf '    dry-run         If set (e.g., dry-run=1), preview release without changes\n'
 	@printf '    allow-staged    If set (e.g., allow-staged=1), include staged files in release\n'
@@ -148,7 +148,7 @@ lint: setup
 	@echo "Running linters (mode: $(LINT_MODE))..."
 ifeq ($(LINT_MODE),fix)
 	cargo fmt --all
-	cargo clippy --fix --all-targets --all-features $(ARGS)
+	cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features $(ARGS)
 else
 	cargo fmt --all --check
 	cargo clippy --all-targets --all-features $(ARGS) -- -D warnings
