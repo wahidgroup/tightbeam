@@ -755,11 +755,11 @@ interactive_cherry_pick() {
 	while IFS= read -r line; do
 		[[ -z "$line" ]] && continue
 		local sha="${line%% *}"
-		if ! git cherry-pick "$sha"; then
+		if ! git cherry-pick -S "$sha"; then
 			printf "\n"
 			fail "Cherry-pick conflict on ${line}
         Resolve the conflict, then resume:
-          git cherry-pick --continue
+          git -c commit.gpgsign=true cherry-pick --continue
           make release version=v${VERSION}"
 		fi
 		ok "Cherry-picked ${line}"
@@ -1304,7 +1304,7 @@ validate_preconditions() {
 		local staged_version_only=true f
 		while IFS= read -r f; do
 			case "$f" in
-				Cargo.toml|Cargo.lock|package.json|package-lock.json|npm-shrinkwrap.json|VERSION) ;;
+				Cargo.toml|tightbeam-derive/Cargo.toml|Cargo.lock|package.json|package-lock.json|npm-shrinkwrap.json|VERSION) ;;
 				*) staged_version_only=false; break ;;
 			esac
 		done < <(git diff --cached --name-only --ignore-submodules)
@@ -1409,9 +1409,9 @@ prepare_release_work() {
 		next_step "Commit release"
 		if git diff --cached --quiet; then
 			info "Nothing staged - creating empty release marker commit"
-			git commit --allow-empty -m "chore(release): v${VERSION}"
+			git commit -S --allow-empty -m "chore(release): v${VERSION}"
 		else
-			git commit -m "chore(release): v${VERSION}"
+			git commit -S -m "chore(release): v${VERSION}"
 		fi
 		ok "Committed chore(release): v${VERSION}"
 	fi
