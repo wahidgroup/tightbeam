@@ -624,13 +624,14 @@ When confidentiality is enabled, tightbeam implementations MUST use Authenticate
 pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
 where
 	C: AssociatedOid,
-	Cipher: Aead + 'static, // AEAD trait bound required
+	Cipher: Aead + Encryptor<C> + 'static, // AEAD + canonical OID binding required
 	T: CheckAeadOid<C>;
 ```
 
 This design ensures MI over plaintext is cryptographically sound:
 
 - **Type-level guarantee**: Non-AEAD ciphers cannot be used (compile-time enforcement)
+- **Cipher-OID binding**: `Encryptor<C>` is implemented only for canonically matched cipher/OID pairs, so the wire algorithm identifier cannot diverge from the cipher -- even for message types without a security profile
 - **Ciphertext authentication**: AEAD provides built-in authentication tags that prove the ciphertext has not been tampered with (e.g., AES-GCM ([FIPS 197][fips197]), ChaCha20-Poly1305 ([RFC 8439][rfc8439]))
 - **MI purpose**: Proves the decrypted plaintext matches the original message content
 - **Layered security**: AEAD prevents ciphertext tampering, MI proves plaintext correctness, FI witnesses MI in metadata, signatures cover the entire frame
@@ -1053,6 +1054,7 @@ let frame = compose::<SecureMessage>(Version::V1)
 - `with_message_hasher::<D>(salt)` validates `D::OID == Profile::DigestOid::OID`
 - `with_witness_hasher::<D>()` validates `D::OID == Profile::DigestOid::OID`
 - `with_aead::<C, _>()` validates `C::OID == Profile::AeadOid::OID`
+  - `Encryptor<C>` bound additionally binds the cipher type to its canonical OID regardless of profile
 - `with_signer::<S, _>()` validates `S::ALGORITHM_OID == Profile::SignatureAlg::ALGORITHM_OID`
 
 **Error Handling**: Algorithm mismatches return `TightBeamError::UnexpectedAlgorithmForProfile` with expected and received OIDs for debugging.
@@ -1861,7 +1863,7 @@ let security_accept = SecurityAccept {
 | **Confidentiality**        | ECDH + HKDF derived AEAD key                | Session key never transmitted; derived from ECDH shared secret                                                                                                              |
 | **Forward Secrecy**        | Ephemeral client keys                       | New ephemeral key per handshake; compromise does not affect past sessions                                                                                                   |
 | **DoS**                    | 16 KiB handshake size cap                   | Reject oversized handshake messages before processing                                                                                                                       |
-| **Stream Cap Inflation**   | Clamp + ResourceExhausted                                | Caps clamped to `MAX_MUX_STREAM_CAP`; local exhaustion returns `ResourceExhausted`                                                                                                       |
+| **Stream Cap Inflation**   | Clamp + ResourceExhausted                   | Caps clamped to `MAX_MUX_STREAM_CAP`; local exhaustion returns `ResourceExhausted`                                                                                          |
 | **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`; exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113][rfc9113] §7 analog) |
 | **Certificate Forgery**    | X.509 chain validation                      | Verify root of trust Note: Application responsibility                                                                                                                       |
 | **Nonce Reuse**            | Monotonic counter + XOR                     | Per-message nonce derived from seed XOR counter                                                                                                                             |

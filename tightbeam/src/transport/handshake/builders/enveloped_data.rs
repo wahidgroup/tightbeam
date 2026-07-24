@@ -133,10 +133,7 @@ where
 		cipher: &P::AeadCipher,
 		plaintext: &[u8],
 		nonce: &[u8],
-	) -> Result<EncryptedContentInfo, HandshakeError>
-	where
-		P::AeadCipher: Encryptor<P::AeadOid>,
-	{
+	) -> Result<EncryptedContentInfo, HandshakeError> {
 		Ok(cipher.encrypt_content(plaintext, nonce, Some(DATA))?)
 	}
 

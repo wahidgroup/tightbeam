@@ -1,0 +1,15 @@
+error[E0277]: the trait bound `aes_gcm::AesGcm<aes::autodetect::Aes128, UInt<UInt<UInt<UInt<UTerm, B1>, B1>, B0>, B0>>: Encryptor<Aes256GcmOid>` is not satisfied
+ --> tests/compile/encryptor_oid_mismatch.rs:7:53
+  |
+7 |     let _ = Encryptor::<Aes256GcmOid>::encrypt_content(&cipher, b"x", &[0u8; 12], None);
+  |             ------------------------------------------ ^^^^^^^ unsatisfied trait bound
+  |             |
+  |             required by a bound introduced by this call
+  |
+help: the trait `Encryptor<Aes256GcmOid>` is not implemented for `aes_gcm::AesGcm<aes::autodetect::Aes128, UInt<UInt<UInt<UInt<UTerm, B1>, B1>, B0>, B0>>`
+      but trait `Encryptor<Aes128GcmOid>` is implemented for it
+ --> src/crypto/aead.rs
+  |
+  | impl Encryptor<Aes128GcmOid> for Aes128Gcm {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: for that trait implementation, expected `Aes128GcmOid`, found `Aes256GcmOid`

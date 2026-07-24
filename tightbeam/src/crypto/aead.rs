@@ -187,6 +187,11 @@ fn extract_nonce_and_ciphertext(info: &EncryptedContentInfo, expected_nonce_len:
 // ============================================================================
 
 /// Trait for encrypting data and producing EncryptedContentInfo
+///
+/// An impl binds a cipher type to the algorithm OID stamped on the wire:
+/// implement it only for canonically matched `(cipher, OID)` pairs (see the
+/// AES-GCM impls). The trait stays unsealed so custom encryptors such as
+/// ECIES remain possible.
 pub trait Encryptor<C>
 where
 	C: AssociatedOid,
@@ -207,29 +212,51 @@ pub trait Decryptor {
 	/// EncryptedContentInfo and validated against the cipher's nonce size.
 	///
 	/// Algorithm binding: [`RuntimeAead`] rejects a `content_enc_alg.oid`
-	/// that differs from its negotiated OID. The blanket impl for bare
-	/// `Aead` ciphers has no OID to compare against (the RustCrypto cipher
-	/// types carry none), so callers of that impl pre-bind the cipher choice.
+	/// that differs from its negotiated OID. Bare RustCrypto `Aead` decrypt
+	/// impls have no stored OID to compare against; encrypt-side binding is
+	/// enforced by concrete [`Encryptor`] impls (cipher type → canonical OID).
 	///
 	/// The plaintext is returned as a [`SecretSlice`] so it zeroizes on drop.
 	fn decrypt_content(&self, info: &EncryptedContentInfo) -> TbResult<SecretSlice<u8>>;
 }
 
-// Implement Encryptor for any AEAD cipher
-impl<C, A> Encryptor<C> for A
-where
-	C: AssociatedOid,
-	A: Aead,
-{
+/// Encrypt with a concrete AEAD and stamp the given algorithm OID.
+fn encrypt_aead_content<A: Aead>(
+	cipher: &A,
+	data: impl AsRef<[u8]>,
+	nonce: impl AsRef<[u8]>,
+	content_type: Option<ObjectIdentifier>,
+	algorithm_oid: ObjectIdentifier,
+) -> TbResult<EncryptedContentInfo> {
+	let nonce_bytes = nonce.as_ref();
+	let ciphertext = cipher.encrypt(nonce_bytes.into(), data.as_ref())?;
+	build_encrypted_content_info(ciphertext, nonce_bytes, content_type, algorithm_oid)
+}
+
+// Concrete Encryptor impls bind each cipher to its canonical OID. A blanket
+// `impl<C, A> Encryptor<C> for A` would let callers stamp an arbitrary OID on
+// ciphertext from an unrelated cipher (CWE-345).
+#[cfg(feature = "aes-gcm")]
+impl Encryptor<Aes256GcmOid> for Aes256Gcm {
 	fn encrypt_content(
 		&self,
 		data: impl AsRef<[u8]>,
 		nonce: impl AsRef<[u8]>,
 		content_type: Option<ObjectIdentifier>,
 	) -> TbResult<EncryptedContentInfo> {
-		let nonce_bytes = nonce.as_ref();
-		let ciphertext = self.encrypt(nonce_bytes.into(), data.as_ref())?;
-		build_encrypted_content_info(ciphertext, nonce_bytes, content_type, C::OID)
+		encrypt_aead_content(self, data, nonce, content_type, Aes256GcmOid::OID)
+	}
+}
+
+#[cfg(feature = "aes-gcm")]
+impl Encryptor<Aes128GcmOid> for Aes128Gcm {
+	fn encrypt_content(
+		&self,
+		data: impl AsRef<[u8]>,
+		nonce: impl AsRef<[u8]>,
+		content_type: Option<ObjectIdentifier>,
+	) -> TbResult<EncryptedContentInfo> {
+		encrypt_aead_content(self, data, nonce, content_type, Aes128GcmOid::OID)
 	}
 }
 
@@ -544,6 +571,26 @@ mod tests {
 
 	fn encrypted_info() -> EncryptedContentInfo {
 		Encryptor::<Aes256GcmOid>::encrypt_content(&test_cipher(), PLAINTEXT, NONCE, None).unwrap()
+	}
+
+	fn stamped_oid<C, A>(cipher: &A) -> ObjectIdentifier
+	where
+		C: AssociatedOid,
+		A: Encryptor<C>,
+	{
+		let info = Encryptor::<C>::encrypt_content(cipher, PLAINTEXT, NONCE, None).unwrap();
+		info.content_enc_alg.oid
+	}
+
+	#[test]
+	fn encryptor_stamps_canonical_aes256_oid() {
+		assert_eq!(stamped_oid::<Aes256GcmOid, _>(&test_cipher()), Aes256GcmOid::OID);
+	}
+
+	#[test]
+	fn encryptor_stamps_canonical_aes128_oid() {
+		let cipher = Aes128Gcm::new(&[0x42u8; 16].into());
+		assert_eq!(stamped_oid::<Aes128GcmOid, _>(&cipher), Aes128GcmOid::OID);
 	}
 
 	/// Re-encode the algorithm parameters with a nonce of the given length.
