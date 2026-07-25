@@ -62,7 +62,7 @@ servlet! {
 		// Check for duplicates and return cached response if available
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
-				V2: id: frame.metadata.id.clone(),
+				V2: id: &frame.metadata.id,
 					message: cached
 			}?));
 		}
@@ -88,16 +88,16 @@ servlet! {
 
 		// Generate authorization code
 		let auth_code = format!("AUTH{:08X}", req.creation_datetime as u32).into_bytes();
-		let response = TransactionStatus::approved(req.payment_id.clone(), auth_code);
+		let response = TransactionStatus::approved(req.payment_id.to_owned(), auth_code);
 
 		// Cache the response
-		harness.dedup.cache_response(&frame, response.clone())?;
+		harness.dedup.cache_response(&frame, response.to_owned())?;
 
 		// Authorization approved
 		trace.event_with("authorization_approved", &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
-			V2: id: frame.metadata.id.clone(),
+			V2: id: &frame.metadata.id,
 				message: response
 		}?))
 	}
@@ -119,7 +119,7 @@ servlet! {
 		// Check for duplicates and return cached response if available
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
-				V2: id: frame.metadata.id.clone(),
+				V2: id: &frame.metadata.id,
 					message: cached
 			}?));
 		}
@@ -134,7 +134,7 @@ servlet! {
 		// Create payment identification for response
 		let payment_id = PaymentIdentification::new(
 			b"CAPTURE",
-			req.original_end_to_end_id.clone(),
+			req.original_end_to_end_id.to_owned(),
 			format!("CAP{}", req.capture_datetime).as_bytes(),
 		);
 
@@ -143,13 +143,13 @@ servlet! {
 		let response = TransactionStatus::captured(payment_id, settlement_code);
 
 		// Cache the response
-		harness.dedup.cache_response(&frame, response.clone())?;
+		harness.dedup.cache_response(&frame, response.to_owned())?;
 
 		// Capture completed
 		trace.event_with("capture_completed", &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
-			V2: id: frame.metadata.id.clone(),
+			V2: id: &frame.metadata.id,
 				message: response
 		}?))
 	}
@@ -183,7 +183,7 @@ servlet! {
 				};
 				trace.event_with("keymanager_pubkey_served", &[PAYMENT_TAG], true)?;
 				Ok(Some(compose! {
-					V2: id: frame.metadata.id.clone(),
+					V2: id: &frame.metadata.id,
 						message: response
 				}?))
 			}
@@ -197,7 +197,7 @@ servlet! {
 				let response = DecryptResponse { plaintext };
 				trace.event_with("keymanager_decrypt_success", &[PAYMENT_TAG], true)?;
 				Ok(Some(compose! {
-					V2: id: frame.metadata.id.clone(),
+					V2: id: &frame.metadata.id,
 						message: response
 				}?))
 			}

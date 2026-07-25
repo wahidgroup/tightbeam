@@ -312,11 +312,11 @@ macro_rules! cluster {
 
 	// Build gateway server
 	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident, $replay_guard:ident) => {{
-		// Copied out before the handler closure captures the config.
-		let __mux_offer = $config.pool_config.mux_offer.clone();
+		// Must be copied out before the handler closure captures the config.
+		let __mux_offer = $config.pool_config.mux_offer.to_owned();
 		$crate::server! {
 			protocol $protocol: $listener,
-			policies: { with_mux_offer: [ __mux_offer.clone() ] },
+			policies: { with_mux_offer: [ __mux_offer.to_owned() ] },
 			handle: move |frame: $crate::Frame| {
 				let registry = ::std::sync::Arc::clone(&$registry);
 				let servlet_registry = ::std::sync::Arc::clone(&$servlet_registry);

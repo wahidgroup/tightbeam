@@ -320,7 +320,10 @@ fn clamp_stream_credit(credit: u64) -> u64 {
 /// receive-side values are advertised back, its `requested_budgets` acts
 /// as the grant ceiling, the componentwise minimum with the request.
 /// Nothing requested means nothing granted.
-pub fn accept_transport(offer: Option<&TransportOffer>, local: Option<&TransportOffer>) -> Option<TransportAccept> {
+pub(crate) fn accept_transport(
+	offer: Option<&TransportOffer>,
+	local: Option<&TransportOffer>,
+) -> Option<TransportAccept> {
 	let offer = offer?;
 	let local = local?;
 	if !offer.mux || !local.mux {
@@ -455,7 +458,7 @@ pub struct AuthorizedTransport {
 /// request: an unsolicited grant fails the client's consistency check
 /// in [`client_mux_settings`]. A challenge granted without budgets
 /// fails closed: the receipt that would carry it never exists.
-pub async fn authorize_transport(
+pub(crate) async fn authorize_transport(
 	offer: Option<&TransportOffer>,
 	local: Option<&TransportOffer>,
 	authorizer: Option<&dyn TransportAuthorizer>,
@@ -511,7 +514,7 @@ fn budget_views(granted: Option<MuxBudgets>, local_is_client: bool) -> (Option<u
 /// granted budget when none was requested, or one beyond
 /// [`MAX_MUX_SESSION_BUDGET`]: the receipt attests the wire values, so an
 /// over-cap grant is refused rather than silently clamped.
-pub fn client_mux_settings(
+pub(crate) fn client_mux_settings(
 	offer: Option<&TransportOffer>,
 	accept: Option<&TransportAccept>,
 ) -> Result<Option<MuxSettings>, NegotiationError> {
@@ -544,7 +547,7 @@ pub fn client_mux_settings(
 /// Server-side settings rule: derives the directional views from the
 /// client's offer and the accept the server just emitted, each clamped
 /// through the shared choke points.
-pub fn server_mux_settings(offer: &TransportOffer, accept: &TransportAccept) -> MuxSettings {
+pub(crate) fn server_mux_settings(offer: &TransportOffer, accept: &TransportAccept) -> MuxSettings {
 	mux_settings(offer, accept, false)
 }
 
@@ -728,7 +731,7 @@ impl ProfileStrengthPolicy for NoStrengthFloor {
 /// - [`NegotiationError::EmptyOffer`] -- peer sent an empty offer.
 /// - [`NegotiationError::OfferTooLarge`] -- offer exceeds [`MAX_OFFER_PROFILES`].
 /// - [`NegotiationError::NoMutualProfile`] -- no intersection with `supported`.
-pub fn select_profile(
+pub(crate) fn select_profile(
 	offer: &SecurityOffer,
 	supported: &[SecurityProfileDesc],
 ) -> Result<SecurityProfileDesc, NegotiationError> {
@@ -753,6 +756,7 @@ mod tests {
 	use core::error::Error;
 
 	use super::*;
+	use crate::asn1::{AlgorithmIdentifier, DigestInfo};
 	use crate::oids::{
 		AES_128_WRAP, AES_192_WRAP, AES_256_GCM, AES_256_WRAP, CURVE_SECP256K1, HASH_SHA3_256,
 		SIGNER_ECDSA_WITH_SHA3_512,
@@ -958,7 +962,7 @@ mod tests {
 		) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
 			Box::pin(async move {
 				let budgets = self.verdict?;
-				Ok(AuthorizationGrant { budgets, challenge: self.challenge.clone() })
+				Ok(AuthorizationGrant { budgets, challenge: self.challenge.to_owned() })
 			})
 		}
 	}
@@ -1034,7 +1038,7 @@ mod tests {
 		let offer = TransportOffer::mux(8).with_budgets(request);
 		let local = TransportOffer::mux(4);
 		let challenge = OctetString::new(b"invoice".as_slice()).map_err(NegotiationError::DerError)?;
-		let authorizer = FixedAuthorizer { verdict: Ok(Some(request)), challenge: Some(challenge.clone()) };
+		let authorizer = FixedAuthorizer { verdict: Ok(Some(request)), challenge: Some(challenge.to_owned()) };
 
 		let authorized = authorize_transport(Some(&offer), Some(&local), Some(&authorizer)).await?;
 		let challenge_out = authorized.and_then(|authorized| authorized.challenge);
@@ -1057,8 +1061,9 @@ mod tests {
 	}
 
 	fn settle_receipt(ancillary: Option<OctetString>) -> Result<SessionReceipt, DerDecodeError> {
+		let algorithm = AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None };
 		Ok(SessionReceipt {
-			transcript_hash: OctetString::new([0u8; 32])?,
+			transcript_hash: DigestInfo { algorithm, digest: OctetString::new([0u8; 32])? },
 			budgets: MuxBudgets { client_to_server: 1, server_to_client: 1 },
 			credit_unit: 1024,
 			ancillary,

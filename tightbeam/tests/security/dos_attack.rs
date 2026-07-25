@@ -53,25 +53,25 @@ tb_process_spec! {
 	pub DosAttackProcess,
 	events {
 		observable {
-			"dos_generate_oversized",
-			"dos_inject_oversized",
-			"dos_oversized_rejected"
+
+			DosAttackSpec::dos_generate_oversized,
+			DosAttackSpec::dos_inject_oversized,
+			DosAttackSpec::dos_oversized_rejected,
+			SecurityThreatHarness::harness_spawn_session,
+			SecurityThreatHarness::harness_spawn_ecies,
+			SecurityThreatHarness::harness_spawn_cms
 		}
-		hidden {
-			"harness_spawn_session",
-			"harness_spawn_ecies",
-			"harness_spawn_cms"
-		}
+		hidden { }
 	}
 	states {
-		Idle => { "dos_generate_oversized" => OversizedReady },
-		OversizedReady => { "harness_spawn_session" => Spawning },
+		Idle => { DosAttackSpec::dos_generate_oversized => OversizedReady },
+		OversizedReady => { SecurityThreatHarness::harness_spawn_session => Spawning },
 		Spawning => {
-			"harness_spawn_ecies" => SessionReady,
-			"harness_spawn_cms" => SessionReady
+			SecurityThreatHarness::harness_spawn_ecies => SessionReady,
+			SecurityThreatHarness::harness_spawn_cms => SessionReady
 		},
-		SessionReady => { "dos_inject_oversized" => Injected },
-		Injected => { "dos_oversized_rejected" => Idle }
+		SessionReady => { DosAttackSpec::dos_inject_oversized => Injected },
+		Injected => { DosAttackSpec::dos_oversized_rejected => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "DoS attack: oversized handshake message rejection" }

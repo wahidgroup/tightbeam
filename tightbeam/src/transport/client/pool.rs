@@ -107,6 +107,10 @@ pub struct PoolConfig {
 	/// Multiplexing advertisement for pooled connections. With an offer set,
 	/// `connect` shares multiplexed connections per destination, opening
 	/// additional ones only when stream caps fill.
+	///
+	/// TODO: store `Option<Arc<TransportOffer>>` on the config plane
+	/// (pool / transport / orchestrator) so dials share by refcount;
+	/// ASN.1 wire types stay owned. Today each fresh dial deep-copies.
 	pub mux_offer: Option<TransportOffer>,
 }
 
@@ -636,7 +640,7 @@ pooled_mux! {
 		/// [`PoolConfig::mux_offer`] is set and the peer accepts.
 		pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>> {
 			let offer = match &self.config.mux_offer {
-				Some(offer) => offer.clone(),
+				Some(offer) => offer.to_owned(),
 				None => return self.connect_single_flight(addr).await,
 			};
 
@@ -963,7 +967,7 @@ pooled_mux! {
 		/// once.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
 			let offer = match &self.pool.config.mux_offer {
-				Some(offer) => offer.clone(),
+				Some(offer) => offer.to_owned(),
 				// A mux lease exists only when an offer is configured
 				None => return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)),
 			};

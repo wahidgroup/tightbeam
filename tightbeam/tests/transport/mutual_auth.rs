@@ -126,7 +126,7 @@ servlet! {
 		};
 
 		let response_frame = compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: &frame.metadata.id,
 			message: response
 		}?;
 
@@ -186,9 +186,8 @@ tb_scenario! {
 				message: request
 			}?;
 
-			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
-
 			// Emit trace events unconditionally - assertion spec validates them
+			let response_frame: Option<Frame> = client.emit(request_frame, None).await?;
 			trace.event_with(MutualAuthSpec::response_received, &[], Presence::of_option(&response_frame))?;
 
 			let response_frame = response_frame.ok_or(TightBeamError::MissingResponse)?;

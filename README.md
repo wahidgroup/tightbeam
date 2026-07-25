@@ -583,7 +583,7 @@ enum { anonymous(0), rsa(1), dsa(2), ecdsa(3), (255) }
 
 - When `compactness` is present (not `None`), the `message` field MUST contain compressed data encoded as `CompressedData` per RFC 3274
 - The `encapContentInfo` within `CompressedData` MUST use the `id-data` content type OID if the compressed data does not conform to any recognized content type
-- Compression algorithm identifiers MUST be valid OIDs (e.g., `id-alg-zlibCompress` for zlib, custom OIDs for zstd -- tightbeam uses 1.2.840.113549.1.9.16.3 pending formal assignment)
+- Compression algorithm identifiers MUST be valid OIDs (e.g., `id-alg-zlibCompress` for zlib; zstd uses Wahid Group PEN `1.3.6.1.4.1.64586.2.1` until an S/MIME registry OID exists)
 - Compression level parameters, when specified in `compressionAlgorithm.parameters`, MUST be within algorithm-specific valid ranges
 
 #### 5.7.3 Integrity Semantics: Order of Operations
@@ -1870,7 +1870,7 @@ let security_accept = SecurityAccept {
 | **Stream Cap Inflation**   | Clamp + ResourceExhausted                   | Caps clamped to `MAX_MUX_STREAM_CAP`. Local exhaustion returns `ResourceExhausted`                                                                                                                                |
 | **Reassembly Exhaustion**  | Chunk + credit + cap clamps                 | Chunk size clamped to `MIN..=MAX_MUX_CHUNK_SIZE`, stream credit to `MAX_MUX_STREAM_CREDIT`. Per-stream reassembly memory bounded by granted credit and concurrent partial streams by the advertised cap (CWE-770) |
 | **Flow-Control Overrun**   | Receiver-side duplicate accounting          | Oversize chunks, credit overruns, and session-budget overspends each answered with GoAway(`ProtocolError`)                                                                                                        |
-| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7] analog)                                       |
+| **Rapid Reset**            | Cancel budget + GoAway                      | Peer cancels that abort in-flight handlers draw on `DEFAULT_MUX_CANCEL_BUDGET`. Exhaustion sends GoAway(`EnhanceYourCalm`) (CVE-2023-44487 / [RFC 9113 §7][rfc9113-7] analog)                                     |
 | **Certificate Forgery**    | X.509 chain validation                      | Verify root of trust Note: Application responsibility                                                                                                                                                             |
 | **Nonce Reuse**            | Monotonic counter + XOR                     | Per-message nonce derived from seed XOR counter                                                                                                                                                                   |
 
@@ -1934,15 +1934,15 @@ Each endpoint MUST enforce the cap it advertised against peer-initiated streams 
 
 **Envelope Types** (`TransportEnvelope` context tag 4 nests the `MuxEnvelope` CHOICE, inner context tags 0-6):
 
-| Variant  | Role                                                                                                       |
-| -------- | ---------------------------------------------------------------------------------------------------------- |
-| `Open`   | Open a stream and carry its first payload chunk inline (`stream_id`, `last`, `payload`)                    |
-| `Data`   | Continuation chunk on an open stream, either direction (`stream_id`, `last`, `payload`)                    |
-| `End`    | Responder trailer: `status` plus the final payload chunk inline                                            |
+| Variant  | Role                                                                                                           |
+| -------- | -------------------------------------------------------------------------------------------------------------- |
+| `Open`   | Open a stream and carry its first payload chunk inline (`stream_id`, `last`, `payload`)                        |
+| `Data`   | Continuation chunk on an open stream, either direction (`stream_id`, `last`, `payload`)                        |
+| `End`    | Responder trailer: `status` plus the final payload chunk inline                                                |
 | `Credit` | Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA analog, [RFC 9000 §4.1][rfc9000-4.1]) |
-| `Cancel` | Abort a single in-flight stream without tearing down the connection                                        |
-| `GoAway` | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected          |
-| `Ping`   | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                            |
+| `Cancel` | Abort a single in-flight stream without tearing down the connection                                            |
+| `GoAway` | Connection-level drain: streams at or below `last_stream_id` complete. Newer streams are rejected              |
+| `Ping`   | Liveness probe and ack (`opaque`, `ack`), answered without touching the handler                                |
 
 **Stream Grammar** (unified: a unary request is a degenerate stream, [RFC 9113 §8.1][rfc9113-8.1] analog):
 
@@ -1960,12 +1960,13 @@ either:     Cancel(code)  Credit(limit)
 
 **Session Authorization** (server hook between offer and accept): the offer MAY carry an opaque `authorization` token, never parsed by TightBeam. A `TransportAuthorizer` decides the budgets to grant, MAY attach a settlement challenge, or refuses the session (`AuthorizationRefused { code }`). It fires pre-authentication: keep it cheap and rate-limit upstream.
 
-**Session Receipts** (budget-bearing sessions only): every metered session produces a `SessionReceipt`, a dual-signed DER artifact binding the handshake transcript, budgets, and settlement terms under both peer identities. A third party holding the two certificates verifies the agreement from the stored receipt alone.
+**Session Receipts** (budget-bearing sessions only): every metered session produces a CMS `SignedData` artifact ([RFC 5652 §5][rfc5652-5]) whose `eContent` is the `SessionReceipt` body binding the handshake transcript (as a self-describing `DigestInfo`, [RFC 8017 §9.2][rfc8017-9.2]), budgets, and settlement terms, with one role-tagged `SignerInfo` per peer. A third party holding the two certificates verifies the agreement from the stored artifact alone.
 
-- The server signs. The client validates against the negotiated session, answers the challenge via its `ReceiptApprover`, and countersigns (domain-separated digests, CWE-347)
+- The server signs. The client validates against the negotiated session, answers the challenge via its `ReceiptApprover`, and countersigns: its `SignerInfo`'s signed attributes ([RFC 5652 §11][rfc5652-11]) bind the answer and the role, so neither can be swapped or spliced (CWE-347)
+- The client's `SignerInfo` travels only encrypted to the server (inside the ECIES key-exchange payload, or an `EnvelopedData` [RFC 5652 §6][rfc5652-6] attribute on the CMS Finished): the settlement answer is a bearer secret and never rides the cleartext wire
 - The server's `TransportAuthorizer::settle` accepts or refuses the answer. The session MUST NOT activate before it accepts. Every step fails closed, and budgets REQUIRE mutual authentication
 - A server-side `SessionObserver` records every concluded outcome, including refused and forged acknowledgements. It never vetoes
-- Both endpoints retain the receipt (`session_receipt()`). The settlement answer is application truth: never parsed, never price-checked, never persisted. The receipt makes the agreement non-repudiable, not correct
+- Both endpoints retain the completed artifact (`session_receipt()`). The settlement answer is application truth: never parsed, never price-checked, never persisted. The receipt makes the agreement non-repudiable, not correct
 
 **Reason Code Space** (open u32, HTTP/2 error-code and QUIC application-close precedent: [RFC 9113 §7][rfc9113-7], [RFC 9000 §20.2][rfc9000-20.2]): codes below `MUX_APPLICATION_CODE_FLOOR` (0x1000) are reserved for the TightBeam protocol. Applications own the rest. Unknown codes decode to `Application(code)` and MUST NOT kill the connection.
 
@@ -5402,11 +5403,15 @@ The workspace consists of the following components:
 [rfc5424]: https://datatracker.ietf.org/doc/html/rfc5424
 [rfc5480]: https://datatracker.ietf.org/doc/html/rfc5480
 [rfc5652]: https://datatracker.ietf.org/doc/html/rfc5652
+[rfc5652-5]: https://datatracker.ietf.org/doc/html/rfc5652#section-5
+[rfc5652-6]: https://datatracker.ietf.org/doc/html/rfc5652#section-6
+[rfc5652-11]: https://datatracker.ietf.org/doc/html/rfc5652#section-11
 [rfc5753]: https://datatracker.ietf.org/doc/html/rfc5753
 [rfc5869]: https://datatracker.ietf.org/doc/html/rfc5869
 [rfc6960]: https://datatracker.ietf.org/doc/html/rfc6960
 [rfc7322]: https://datatracker.ietf.org/doc/html/rfc7322
 [rfc7748]: https://datatracker.ietf.org/doc/html/rfc7748
+[rfc8017-9.2]: https://datatracker.ietf.org/doc/html/rfc8017#section-9.2
 [rfc8032]: https://datatracker.ietf.org/doc/html/rfc8032
 [rfc8141]: https://datatracker.ietf.org/doc/html/rfc8141
 [rfc8439]: https://datatracker.ietf.org/doc/html/rfc8439

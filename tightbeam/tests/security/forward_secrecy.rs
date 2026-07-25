@@ -51,23 +51,23 @@ tb_process_spec! {
 	pub ForwardSecrecyProcess,
 	events {
 		observable {
-			"fs_capture_handshake",
-			"fs_extract_ephemeral",
-			"fs_all_ephemeral_unique"
+
+			ForwardSecrecySpec::fs_capture_handshake,
+			ForwardSecrecySpec::fs_extract_ephemeral,
+			ForwardSecrecySpec::fs_all_ephemeral_unique,
+			SecurityThreatHarness::harness_spawn_session,
+			SecurityThreatHarness::harness_spawn_ecies
 		}
-		hidden {
-			"harness_spawn_session",
-			"harness_spawn_ecies"
-		}
+		hidden { }
 	}
 	states {
-		Idle => { "harness_spawn_session" => Spawning },
-		Spawning => { "harness_spawn_ecies" => SessionReady },
-		SessionReady => { "fs_capture_handshake" => Captured },
-		Captured => { "fs_extract_ephemeral" => Extracted },
+		Idle => { SecurityThreatHarness::harness_spawn_session => Spawning },
+		Spawning => { SecurityThreatHarness::harness_spawn_ecies => SessionReady },
+		SessionReady => { ForwardSecrecySpec::fs_capture_handshake => Captured },
+		Captured => { ForwardSecrecySpec::fs_extract_ephemeral => Extracted },
 		Extracted => {
-			"harness_spawn_session" => Spawning,
-			"fs_all_ephemeral_unique" => Complete
+			SecurityThreatHarness::harness_spawn_session => Spawning,
+			ForwardSecrecySpec::fs_all_ephemeral_unique => Complete
 		},
 		Complete => { }
 	}

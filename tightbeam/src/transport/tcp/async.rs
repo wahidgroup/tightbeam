@@ -505,7 +505,7 @@ where
 	}
 
 	fn to_mux_config(&self) -> Option<TransportOffer> {
-		self.mux_config.clone()
+		self.mux_config.to_owned()
 	}
 
 	fn to_transport_authorizer(&self) -> Option<Arc<dyn TransportAuthorizer>> {
@@ -1032,6 +1032,7 @@ where
 						if now >= deadline {
 							return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
 						}
+
 						Some(deadline.saturating_duration_since(now))
 					}
 					_ if self.is_handshake_pending() => Some(self.handshake_timeout),
@@ -1239,8 +1240,8 @@ mod tests {
 				let _ = tx.try_send(msg);
 				Some(response_msg.clone())
 			});
-			let mut transport = transport.with_handler(handler);
 
+			let mut transport = transport.with_handler(handler);
 			transport.handle_request().await
 		});
 
@@ -1292,8 +1293,8 @@ mod tests {
 		let addr = listener.local_addr()?;
 		let stream = TcpStream::connect(addr).await?;
 
-		let trust_store: Arc<dyn CertificateTrust> =
-			Arc::new(CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy).build());
+		let data = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy).build();
+		let trust_store: Arc<dyn CertificateTrust> = Arc::new(data);
 		let mut transport = cms_test_client(stream).with_trust_store(trust_store);
 
 		let result = transport.perform_client_handshake().await;
@@ -1496,7 +1497,9 @@ mod tests {
 				let _ = tx.try_send(msg.clone());
 				Some(msg)
 			});
-			let mut transport = transport.with_collector_gate(BusyFirstGate::new()).with_handler(handler);
+
+			let gate = BusyFirstGate::new();
+			let mut transport = transport.with_collector_gate(gate).with_handler(handler);
 
 			// First handle_request: processes handshake (ClientHello + ClientKeyExchange)
 			// and first application message. Gate returns ResourceExhausted for first app message.
@@ -1515,7 +1518,9 @@ mod tests {
 				.with_certificate(cert)?
 				.build(),
 		);
-		let mut transport = TcpTransport::from(TokioStream::from(stream)).with_trust_store(trust_store);
+
+		let stream = TokioStream::from(stream);
+		let mut transport = TcpTransport::from(stream).with_trust_store(trust_store);
 
 		// First emit triggers handshake, then sends encrypted message
 		// Gate policy returns ResourceExhausted for first application message

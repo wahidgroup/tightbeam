@@ -113,8 +113,8 @@ trait DtnNode {
 		let ctx = Arc::new(GapRecoveryContext {
 			chain_processor: Arc::clone(self.chain_processor()),
 			frame_builder: Arc::clone(self.frame_builder()),
-			signing_key: Arc::new(self.signing_key().clone()),
-			cipher: Arc::new(self.cipher().clone()),
+			signing_key: Arc::new(self.signing_key().to_owned()),
+			cipher: Arc::new(self.cipher().to_owned()),
 			pool: Arc::clone(pool),
 		});
 
@@ -371,7 +371,7 @@ servlet! {
 						RelayMessage::FrameRequest(request) => {
 							// WORKER: Decide what to do with frame request
 							let node_name = config.node_name().to_string();
-							let worker_request = FrameRequestHandlerRequest { request: request.clone(), node_name };
+							let worker_request = FrameRequestHandlerRequest { request: request.to_owned(), node_name };
 							let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
 							match result.action {
 								FrameRequestAction::Respond(_) => {
@@ -576,7 +576,7 @@ servlet! {
 						RelayMessage::FrameRequest(request) => {
 							// WORKER: Decide what to do with frame request
 							let node_name = config.node_name().to_string();
-							let worker_request = FrameRequestHandlerRequest { request: request.clone(), node_name };
+							let worker_request = FrameRequestHandlerRequest { request: request.to_owned(), node_name };
 							let result = ctx.relay::<FrameRequestHandlerWorker>(Arc::new(worker_request)).await??;
 							match result.action {
 								FrameRequestAction::Respond(_) => {

@@ -771,35 +771,35 @@ tb_scenario! {
 
 			// Mission Control -> Earth Relay pool
 			let mc_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
-				.with_config(pool_config.clone())
+				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
 				.with_client_identity(MISSION_CONTROL_CERT, MISSION_CONTROL_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Earth Relay -> Mission Control pool
 			let earth_mc_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
-				.with_config(pool_config.clone())
+				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(MISSION_CONTROL_CERT)?)
 				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Earth Relay -> Mars Relay pool
 			let earth_mars_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
-				.with_config(pool_config.clone())
+				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(MARS_RELAY_CERT)?)
 				.with_client_identity(EARTH_RELAY_CERT, EARTH_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Mars Relay -> Earth Relay pool
 			let mars_earth_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
-				.with_config(pool_config.clone())
+				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(EARTH_RELAY_CERT)?)
 				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());
 
 			// Mars Relay -> Rover pool
 			let mars_rover_pool = Arc::new(ConnectionPool::<TokioListener>::builder()
-				.with_config(pool_config.clone())
+				.with_config(pool_config.to_owned())
 				.with_trust_store(make_trust_store(ROVER_CERT)?)
 				.with_client_identity(MARS_RELAY_CERT, MARS_RELAY_KEY.to_provider::<Secp256k1>()?)?
 				.build());

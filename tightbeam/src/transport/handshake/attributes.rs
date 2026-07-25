@@ -6,20 +6,18 @@ use alloc::vec::Vec;
 
 use core::cmp::{Ord, Ordering, PartialOrd};
 
-#[cfg(feature = "transport-cms")]
 use crate::cms::signed_data::SignedData;
 use crate::crypto::x509::attr::Attribute;
 use crate::der::asn1::{ObjectIdentifier, OctetString, UintRef};
 use crate::der::{asn1::Any, Sequence, Tagged};
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
-use crate::transport::handshake::receipt::SessionReceipt;
 
 use super::{HandshakeAlert, HandshakeError};
 use crate::oids::{
 	HANDSHAKE_ABORT_ALERT, HANDSHAKE_ALGORITHM_PROFILE, HANDSHAKE_CLIENT_NONCE, HANDSHAKE_PROTOCOL_VERSION,
 	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SELECTED_CURVE, HANDSHAKE_SELECT_ALGORITHM,
 	HANDSHAKE_SELECT_VERSION, HANDSHAKE_SERVER_NONCE, HANDSHAKE_SUPPORTED_CURVES, HANDSHAKE_TRANSCRIPT_HASH,
-	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER, RECEIPT_RESPONSE, RECEIPT_SIGNATURE, SESSION_RECEIPT,
+	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER, RECEIPT_ACK, SESSION_RECEIPT,
 };
 
 /// Maximum number of curve OIDs accepted in a supported-curves attribute.
@@ -227,26 +225,20 @@ pub fn transport_accept_transcript_bytes(accept: &TransportAccept) -> Result<Vec
 	Ok(Any::encode_from(accept)?.to_der()?)
 }
 
-/// Encode a session receipt body attribute (CMS carriage).
-pub fn encode_session_receipt(receipt: &SessionReceipt) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(receipt)?;
+/// Encode a session receipt artifact attribute (CMS carriage): the
+/// server-signed receipt `SignedData`.
+pub fn encode_session_receipt(artifact: &SignedData) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(artifact)?;
 	HandshakeAttribute::new_single(SESSION_RECEIPT, any)
 }
 
-/// Encode a receipt signature attribute: the server's receipt signature
-/// in the server Finished, the client's countersignature in the client
-/// Finished.
-pub fn encode_receipt_signature(signature: &OctetString) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(signature)?;
-	HandshakeAttribute::new_single(RECEIPT_SIGNATURE, any)
-}
-
-/// Encode a receipt ancillary response attribute. The octets are a
-/// DER-encoded EnvelopedData that encrypts the settlement answer to
-/// the server. The plaintext answer never travels the cleartext wire.
-pub fn encode_receipt_response(response: &OctetString) -> Result<HandshakeAttribute, HandshakeError> {
-	let any = Any::encode_from(response)?;
-	HandshakeAttribute::new_single(RECEIPT_RESPONSE, any)
+/// Encode a receipt acknowledgement attribute. The octets are a
+/// DER-encoded EnvelopedData encrypted to the server whose plaintext is
+/// the client's receipt `SignerInfo`. Neither the countersignature nor
+/// the settlement answer bound inside it travels the cleartext wire.
+pub fn encode_receipt_ack(envelope: &OctetString) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(envelope)?;
+	HandshakeAttribute::new_single(RECEIPT_ACK, any)
 }
 
 // -------------------------- Decoders --------------------------
@@ -384,8 +376,9 @@ pub fn extract_transport_accept(attr: &HandshakeAttribute) -> Result<TransportAc
 	Ok(any.decode_as()?)
 }
 
-/// Extract the server-issued [`SessionReceipt`] from unprotected attributes.
-pub fn extract_session_receipt(attr: &HandshakeAttribute) -> Result<SessionReceipt, HandshakeError> {
+/// Extract the server-signed receipt `SignedData` artifact from
+/// unprotected attributes.
+pub fn extract_session_receipt(attr: &HandshakeAttribute) -> Result<SignedData, HandshakeError> {
 	if attr.attr_type != SESSION_RECEIPT {
 		return Err(HandshakeError::MissingAttribute);
 	}
@@ -394,19 +387,10 @@ pub fn extract_session_receipt(attr: &HandshakeAttribute) -> Result<SessionRecei
 	Ok(any.decode_as()?)
 }
 
-/// Extract a receipt signature (server or client) from unprotected attributes.
-pub fn extract_receipt_signature(attr: &HandshakeAttribute) -> Result<OctetString, HandshakeError> {
-	if attr.attr_type != RECEIPT_SIGNATURE {
-		return Err(HandshakeError::MissingAttribute);
-	}
-
-	let any = attr.value()?;
-	Ok(any.decode_as()?)
-}
-
-/// Extract the enveloped settlement-answer bytes from unprotected attributes.
-pub fn extract_receipt_response(attr: &HandshakeAttribute) -> Result<OctetString, HandshakeError> {
-	if attr.attr_type != RECEIPT_RESPONSE {
+/// Extract the enveloped receipt-acknowledgement bytes from unprotected
+/// attributes.
+pub fn extract_receipt_ack(attr: &HandshakeAttribute) -> Result<OctetString, HandshakeError> {
+	if attr.attr_type != RECEIPT_ACK {
 		return Err(HandshakeError::MissingAttribute);
 	}
 
@@ -604,6 +588,7 @@ mod tests {
 		for v in [0u16, 1, 255, 256, 65535] {
 			let attr = encode_protocol_version(v)?;
 			assert_eq!(attr.attr_type, HANDSHAKE_PROTOCOL_VERSION);
+
 			let extracted = extract_u16(&attr)?;
 			assert_eq!(extracted, v);
 		}
@@ -615,6 +600,7 @@ mod tests {
 		for v in [0u16, 5, 1024, 65535] {
 			let attr = encode_selected_version(v)?;
 			assert_eq!(attr.attr_type, HANDSHAKE_SELECT_VERSION);
+
 			let extracted = extract_u16(&attr)?;
 			assert_eq!(extracted, v);
 		}
@@ -625,6 +611,7 @@ mod tests {
 	fn algorithm_profile_attributes() -> Result<(), HandshakeError> {
 		let base = encode_algorithm_profile()?;
 		assert_eq!(base.attr_type, HANDSHAKE_ALGORITHM_PROFILE);
+
 		let sel = encode_selected_algorithm_profile()?;
 		assert_eq!(sel.attr_type, HANDSHAKE_SELECT_ALGORITHM);
 		Ok(())

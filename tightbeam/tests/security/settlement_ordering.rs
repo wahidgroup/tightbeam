@@ -149,13 +149,14 @@ tb_scenario! {
 			let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
 			let mut ciphertext = kex.encrypted_data.as_bytes().to_vec();
 			let last = ciphertext.len().checked_sub(1).ok_or_else(|| expectation_failure("empty ciphertext"))?;
+
 			ciphertext[last] ^= 0xFF;
 			kex.encrypted_data = OctetString::new(ciphertext)?;
-			let corrupted = kex.to_der()?;
 
 			// The mutual-auth signature commits to the exact ciphertext
 			// (the anti-splice control), so the corruption is caught as a
 			// signature failure before any decrypt or settlement side effect.
+			let corrupted = kex.to_der()?;
 			let kex_result = server.process_client_key_exchange(&corrupted).await;
 			let rejected = matches!(kex_result, Err(HandshakeError::SignatureError(_)));
 			trace.event_with(SettlementOrderingSpec::corrupted_key_exchange_rejected, &[], rejected)?;

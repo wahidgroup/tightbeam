@@ -98,16 +98,16 @@ tb_process_spec! {
 	pub CertificateForgeryProcess,
 	events {
 		observable {
-			"cert_valid_accepted",
-			"cert_wrong_key_rejected",
-			"cert_reject_all_rejected"
+			CertificateForgerySpec::cert_valid_accepted,
+			CertificateForgerySpec::cert_wrong_key_rejected,
+			CertificateForgerySpec::cert_reject_all_rejected
 		}
 		hidden { }
 	}
 	states {
-		Idle => { "cert_valid_accepted" => ValidDone },
-		ValidDone => { "cert_wrong_key_rejected" => WrongKeyDone },
-		WrongKeyDone => { "cert_reject_all_rejected" => Complete },
+		Idle => { CertificateForgerySpec::cert_valid_accepted => ValidDone },
+		ValidDone => { CertificateForgerySpec::cert_wrong_key_rejected => WrongKeyDone },
+		WrongKeyDone => { CertificateForgerySpec::cert_reject_all_rejected => Complete },
 		Complete => { }
 	}
 	terminal { Complete }

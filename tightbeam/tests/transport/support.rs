@@ -207,7 +207,7 @@ pub async fn connect_pinned_client(
 ) -> Result<TcpTransport<TokioStream>, TightBeamError> {
 	let trust_store: Arc<dyn CertificateTrust> = Arc::new(
 		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-			.with_certificate(server_certificate.clone())?
+			.with_certificate(server_certificate.to_owned())?
 			.build(),
 	);
 

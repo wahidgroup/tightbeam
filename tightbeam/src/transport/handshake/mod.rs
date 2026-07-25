@@ -188,6 +188,8 @@ use crate::asn1::OctetString;
 use crate::cms::content_info::CmsVersion;
 use crate::cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, RecipientInfos};
 use crate::cms::signed_data::SignedData;
+#[cfg(feature = "transport-ecies")]
+use crate::cms::signed_data::SignerInfo;
 use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
 use crate::crypto::aead::SessionKeys;
 use crate::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
@@ -195,15 +197,15 @@ use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityPro
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Any, Decode, Encode, Enumerated, Sequence, Tag};
-use crate::oids::{CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA, RECEIPT_SIGNATURE};
+use crate::oids::{CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA};
 use crate::transport::error::TransportError;
 use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
+use crate::transport::handshake::receipt::StoredReceipt;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
-use crate::transport::handshake::receipt::{SessionReceipt, StoredReceipt};
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
 use crate::Beamable;
 
@@ -888,20 +890,34 @@ pub struct ServerHandshake {
 	/// client offered and the server enabled multiplexing locally.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub transport_accept: Option<TransportAccept>,
-	/// Session receipt body for budget-bearing sessions. Carries the
-	/// transcript hash, granted budgets, and the settlement challenge.
+	/// Server-signed session receipt artifact for budget-bearing
+	/// sessions: a CMS `SignedData`
+	/// ([RFC 5652 §5](https://datatracker.ietf.org/doc/html/rfc5652#section-5))
+	/// whose `eContent` is the receipt body (transcript hash, granted
+	/// budgets, settlement challenge) and whose single `SignerInfo` is
+	/// the server's signature over it.
 	#[asn1(context_specific = "1", optional = "true")]
-	pub session_receipt: Option<SessionReceipt>,
-	/// Server signature over the domain-tagged receipt body digest.
-	#[asn1(context_specific = "2", optional = "true")]
-	pub receipt_signature: Option<OctetString>,
+	pub session_receipt: Option<SignedData>,
 }
 
-/// Fixed prefix of the ECIES key-exchange payload: `base_key(32) ||
-/// client_random(32) || u32-BE response length`. The confidential
-/// settlement answer, if any, follows this prefix.
+/// Confidential plaintext of the ECIES key exchange.
+///
+/// Decrypted only by the server: carries the base session key, the
+/// anti-replay client random, and the client's receipt
+/// countersignature (whose signed attributes bind the bearer
+/// settlement answer).
 #[cfg(feature = "transport-ecies")]
-pub(crate) const ECIES_SESSION_PREFIX_LEN: usize = 32 + 32 + 4;
+#[derive(Clone, Sequence)]
+pub(crate) struct EciesSessionPayload {
+	/// 32-byte base session key feeding the directional AEAD derivation.
+	pub base_key: OctetString,
+	/// 32-byte client random echoed back for replay resistance.
+	pub client_random: OctetString,
+	/// Client receipt `SignerInfo` countersigning the server-issued
+	/// receipt. Required exactly when the server issued one.
+	#[asn1(context_specific = "0", optional = "true")]
+	pub receipt_ack: Option<SignerInfo>,
+}
 
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientKeyExchange {
@@ -916,12 +932,6 @@ pub struct ClientKeyExchange {
 	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]
 	pub client_signature: Option<OctetString>,
-	/// Countersignature over the domain-tagged receipt body digest plus
-	/// the ancillary response. Required whenever the server issued a
-	/// session receipt.
-	#[cfg(feature = "x509")]
-	#[asn1(context_specific = "0", optional = "true")]
-	pub receipt_signature: Option<OctetString>,
 }
 
 // ============================================================================
@@ -1020,14 +1030,6 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 		attrs.push(Attribute { oid: CLIENT_SIGNATURE, values: sig_values });
 	}
 
-	if let Some(sig) = &kex.receipt_signature {
-		let sig_der = sig.to_der()?;
-		let sig_any = Any::new(Tag::OctetString, sig_der)?;
-		let sig_values = SetOfVec::try_from(vec![AttributeValue::from(sig_any)])?;
-
-		attrs.push(Attribute { oid: RECEIPT_SIGNATURE, values: sig_values });
-	}
-
 	if attrs.is_empty() {
 		Ok(None)
 	} else {
@@ -1062,8 +1064,6 @@ fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<Cli
 				}
 			} else if attr.oid == CLIENT_SIGNATURE {
 				parsed.signature = first_octet_string(attr)?;
-			} else if attr.oid == RECEIPT_SIGNATURE {
-				parsed.receipt_signature = first_octet_string(attr)?;
 			}
 		}
 	}
@@ -1077,7 +1077,6 @@ fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<Cli
 struct ClientKeyExchangeAttrs {
 	certificate: Option<Certificate>,
 	signature: Option<OctetString>,
-	receipt_signature: Option<OctetString>,
 }
 
 /// Convert ClientKeyExchange to EnvelopedData (opaque wrapper for ECIES ciphertext)
@@ -1129,8 +1128,6 @@ impl TryFrom<&EnvelopedData> for ClientKeyExchange {
 			client_certificate: attrs.certificate,
 			#[cfg(feature = "x509")]
 			client_signature: attrs.signature,
-			#[cfg(feature = "x509")]
-			receipt_signature: attrs.receipt_signature,
 		})
 	}
 }

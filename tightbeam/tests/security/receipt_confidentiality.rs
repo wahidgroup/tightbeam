@@ -61,7 +61,7 @@ impl TransportAuthorizer for SettlingAuthorizer {
 		offer: &'a TransportOffer,
 	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
 		Box::pin(async move {
-			let challenge = self.challenge.clone();
+			let challenge = self.challenge.to_owned();
 			Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: Some(challenge) })
 		})
 	}
@@ -125,8 +125,10 @@ tb_scenario! {
 			// acknowledgement.
 			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
 			server.process_key_exchange(&key_exchange).await?;
+
 			let server_finished = server.build_server_finished().await?;
 			client.process_server_finished(&server_finished)?;
+
 			let client_finished = client.build_client_finished().await?;
 			server.process_client_finished(&client_finished)?;
 			server.process_receipt_ack(&client_finished).await?;
@@ -154,9 +156,9 @@ tb_scenario! {
 			// including the plaintext answer recovered from the envelope.
 			let client_receipt = client.session_receipt();
 			let server_receipt = server.session_receipt();
-			let expected_answer = Some(OctetString::new(RESPONSE)?);
+			let expected_answer = OctetString::new(RESPONSE)?;
 			let answer_recovered =
-				server_receipt.is_some_and(|stored| stored.ancillary_response == expected_answer);
+				server_receipt.is_some_and(|stored| stored.ancillary_response() == Some(&expected_answer));
 			trace.event_with(
 				ReceiptConfidentialitySpec::server_recovers_plaintext_answer,
 				&[],

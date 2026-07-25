@@ -412,7 +412,7 @@ where
 	}
 
 	fn to_mux_config(&self) -> Option<TransportOffer> {
-		self.mux_config.clone()
+		self.mux_config.to_owned()
 	}
 
 	fn to_transport_authorizer(&self) -> Option<Arc<dyn TransportAuthorizer>> {

@@ -30,7 +30,7 @@ type IdempotencyKey = (Vec<u8>, u64);
 /// Extract idempotency key from frame (DRY helper)
 #[inline]
 fn frame_key(frame: &Frame) -> IdempotencyKey {
-	(frame.metadata.id.clone(), frame.metadata.order)
+	(frame.metadata.id.to_owned(), frame.metadata.order)
 }
 
 // ============================================================================
@@ -68,8 +68,8 @@ impl DedupBook {
 	pub fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		let key = frame_key(frame);
 		let mut guard = self.seen.lock().map_err(|_| TightBeamError::LockPoisoned)?;
-		let inserted = guard.insert(key);
 
+		let inserted = guard.insert(key);
 		if inserted {
 			self.trace.event_with("dedup_kept", &[PAYMENT_TAG], true)?;
 		} else {
@@ -84,6 +84,7 @@ impl DedupBook {
 		let key = frame_key(frame);
 		let mut guard = self.cache.lock().map_err(|_| TightBeamError::LockPoisoned)?;
 		guard.insert(key, response);
+
 		Ok(())
 	}
 
@@ -126,7 +127,7 @@ impl ChainState {
 	pub fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
 		let mut guard = self.state.lock().map_err(|_| TightBeamError::LockPoisoned)?;
 
-		let expected = guard.last_digest.clone();
+		let expected = guard.last_digest.to_owned();
 		let actual = frame.metadata.previous_frame.as_ref();
 
 		// Validate previous frame linkage
@@ -143,12 +144,12 @@ impl ChainState {
 
 		// Validate order is increasing
 		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata.order > prev);
-
 		let valid = prev_ok && order_ok;
-
 		if valid {
 			self.trace.event_with("chain_valid", &[PAYMENT_TAG], true)?;
+
 			guard.last_order = Some(frame.metadata.order);
+
 			let digest = utils::digest::<Sha3_256>(&frame.message)?;
 			guard.last_digest = Some(digest);
 		} else {
@@ -162,7 +163,7 @@ impl ChainState {
 	#[allow(dead_code)]
 	pub fn last_digest(&self) -> Option<DigestInfo> {
 		let guard = self.state.lock().ok()?;
-		guard.last_digest.clone()
+		guard.last_digest.to_owned()
 	}
 
 	/// Reset the chain state (for testing different chains)

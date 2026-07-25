@@ -450,16 +450,20 @@ impl Process {
 		let mut violations = Vec::new();
 		let mut current_states = vec![self.initial];
 
-		// Map assertion labels to events
+		// Map assertion labels onto this process's alphabet. Supports the
+		// same URN shorthand as Layer 1 (`"foo"` matches
+		// `urn:…:event/foo`). Out-of-alphabet labels are ignored.
 		let events: Vec<Event> = trace
 			.assertions
 			.iter()
-			.map(|assertion| {
-				let AssertionLabel::Custom(s) = &assertion.label;
-				match s {
-					Cow::Borrowed(static_str) => Event(static_str),
-					Cow::Owned(owned) => Event(intern(owned.as_str())),
-				}
+			.filter_map(|assertion| {
+				let AssertionLabel::Custom(recorded) = &assertion.label;
+				let recorded = recorded.as_ref();
+				self.observable
+					.iter()
+					.chain(self.hidden.iter())
+					.find(|event| recorded == event.0 || recorded.ends_with(&["/", event.0].concat()))
+					.copied()
 			})
 			.collect();
 
@@ -467,8 +471,13 @@ impl Process {
 			let closure = self.tau_closure(&current_states);
 			let action = Action { event: *event, alphabet: Alphabet::Observable };
 
-			// Termination check: every state the process may occupy is STOP
-			if closure.iter().all(|state| self.is_terminal(*state)) {
+			// Termination check: every candidate is a true STOP — terminal
+			// with no enabled actions. Accepting states that still offer
+			// transitions (cyclic `terminal { Idle }` models) stay live.
+			if closure
+				.iter()
+				.all(|state| self.is_terminal(*state) && self.enabled(*state).is_empty())
+			{
 				if let Some(terminal_state) = closure.first().copied() {
 					violations.push(CspViolation::AfterTermination { event: *event, terminal_state });
 				}

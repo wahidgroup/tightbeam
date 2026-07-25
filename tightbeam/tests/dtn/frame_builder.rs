@@ -111,7 +111,7 @@ impl FrameBuilderHelper {
 		signing_key: &Secp256k1SigningKey,
 		cipher: &Aes256Gcm,
 	) -> Result<Frame, TightBeamError> {
-		let relay_message = RelayMessage::Command(command.clone());
+		let relay_message = RelayMessage::Command(command.to_owned());
 		let builder = FrameBuilder::from(Version::V3)
 			.with_id(format!("relay-cmd-{:03}", next_order))
 			.with_order(next_order)

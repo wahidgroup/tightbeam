@@ -74,14 +74,14 @@ tb_process_spec! {
 	pub EnvelopeTamperProcess,
 	events {
 		observable {
-			"tamper_deleted_envelope_detected",
-			"tamper_replayed_envelope_detected"
+			EnvelopeTamperSpec::tamper_deleted_envelope_detected,
+			EnvelopeTamperSpec::tamper_replayed_envelope_detected
 		}
 		hidden { }
 	}
 	states {
-		Idle => { "tamper_deleted_envelope_detected" => DeletedCaught },
-		DeletedCaught => { "tamper_replayed_envelope_detected" => Done },
+		Idle => { EnvelopeTamperSpec::tamper_deleted_envelope_detected => DeletedCaught },
+		DeletedCaught => { EnvelopeTamperSpec::tamper_replayed_envelope_detected => Done },
 		Done => { }
 	}
 	terminal { Done }

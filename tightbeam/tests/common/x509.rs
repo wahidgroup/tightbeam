@@ -128,15 +128,15 @@ impl MutualAuthServer {
 		let handle = server! {
 			protocol TokioListener: listener,
 			handle: move |message: Frame| {
-				let tx = tx.clone();
+				let tx = tx.to_owned();
 				async move {
-					tx.send(message.clone()).await.map_err(|_| TightBeamError::InvalidBody)?;
+					tx.send(message.to_owned()).await.map_err(|_| TightBeamError::InvalidBody)?;
 
 					let ping: PingMessage = decode(&message.message)?;
 					let pong = PongMessage { echo: ping.data };
 
 					Ok(Some(compose! {
-						V0: id: message.metadata.id.clone(),
+						V0: id: &message.metadata.id,
 						message: pong
 					}?))
 				}

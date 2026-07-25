@@ -113,22 +113,20 @@ fn build_version_frame(
 	let mut builder = FrameBuilder::from(version)
 		.with_id("test")
 		.with_order(1_696_521_700)
-		.with_message(message.clone());
+		.with_message(message.to_owned());
 
 	if version >= tb::Version::V1 {
 		builder = builder
 			.with_message_hasher::<Sha3_256>([])
-			.with_aead::<Aes256GcmOid, _>(crypto.cipher.clone())
-			.with_signer::<Secp256k1Signature, _>(crypto.signing_key.clone());
+			.with_aead::<Aes256GcmOid, _>(crypto.cipher.to_owned())
+			.with_signer::<Secp256k1Signature, _>(crypto.signing_key.to_owned());
 	}
-
 	if version >= tb::Version::V2 {
 		builder = builder
 			.with_priority(tb::MessagePriority::Expedited)
 			.with_lifetime(3_600)
-			.with_previous_hash(message_hash.clone());
+			.with_previous_hash(message_hash.to_owned());
 	}
-
 	if version == tb::Version::V3 {
 		builder = builder.with_matrix(tightbeam::flags![
 			TestFlagSet:
@@ -240,9 +238,9 @@ tb_scenario! {
 			trace.event_with(VersionSpec::sig_valid, &["v3"], v3_frame.verify::<Secp256k1Signature, Sha3_256>(&crypto.verifying_key).is_ok())?;
 
 			// V1+ integrity checks (before decrypt)
-			let v1_integrity = v1_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
-			let v2_integrity = v2_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
-			let v3_integrity = v3_frame.metadata.integrity.clone().ok_or(TightBeamError::MissingDigestInfo)?;
+			let v1_integrity = v1_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
+			let v2_integrity = v2_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
+			let v3_integrity = v3_frame.metadata.integrity.to_owned().ok_or(TightBeamError::MissingDigestInfo)?;
 			trace.event_with(VersionSpec::integrity_ok, &["v1"], v1_integrity.value_cmp(&message_hash).is_ok())?;
 			trace.event_with(VersionSpec::integrity_ok, &["v2"], v2_integrity.value_cmp(&message_hash).is_ok())?;
 			trace.event_with(VersionSpec::integrity_ok, &["v3"], v3_integrity.value_cmp(&message_hash).is_ok())?;

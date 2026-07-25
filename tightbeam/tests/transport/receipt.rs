@@ -28,10 +28,14 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use tightbeam::asn1::Any;
+use tightbeam::cms::signed_data::{SignedData, SignerInfo};
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1VerifyingKey};
-use tightbeam::der::asn1::OctetString;
+use tightbeam::der::asn1::{OctetString, SetOfVec};
+use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
+use tightbeam::oids::RECEIPT_ANSWER;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
@@ -41,11 +45,13 @@ use tightbeam::transport::handshake::negotiation::{
 	SETTLEMENT_UNSUPPORTED_CODE,
 };
 use tightbeam::transport::handshake::receipt::{
-	ApprovalRefusal, ReceiptApprover, SessionObserver, SessionReceipt, SessionVerdict, StoredReceipt,
+	ApprovalRefusal, ReceiptApprover, ReceiptRole, SessionObserver, SessionReceipt, SessionVerdict, StoredReceipt,
 };
 use tightbeam::transport::handshake::HandshakeError;
+use tightbeam::transport::tcp::r#async::{TcpTransport, TokioStream};
 use tightbeam::transport::{EncryptedMessageIO, MessageIO, TransportError};
 use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::x509::attr::Attribute;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 
@@ -73,8 +79,20 @@ const APPROVAL_REFUSAL_CODE: u32 = MUX_APPLICATION_CODE_FLOOR + 8;
 /// Budgets requested by the client in every scenario.
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
+fn server_offer() -> TransportOffer {
+	TransportOffer::mux(4)
+}
+
 fn budget_offer() -> TransportOffer {
-	TransportOffer::mux(4).with_budgets(REQUEST)
+	server_offer().with_budgets(REQUEST)
+}
+
+fn with_budget_offer(client: TcpTransport<TokioStream>) -> TcpTransport<TokioStream> {
+	client.with_mux_offer(Some(budget_offer()))
+}
+
+fn with_budget_approver(client: TcpTransport<TokioStream>, approver: Arc<PayingApprover>) -> TcpTransport<TokioStream> {
+	with_budget_offer(client).with_receipt_approver(approver as Arc<dyn ReceiptApprover>)
 }
 
 /// Grants the requested budgets with a settlement challenge attached.
@@ -101,7 +119,7 @@ impl TransportAuthorizer for ChallengingAuthorizer {
 		offer: &'a TransportOffer,
 	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
 		Box::pin(async move {
-			let challenge = self.challenge.clone();
+			let challenge = self.challenge.to_owned();
 			Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: Some(challenge) })
 		})
 	}
@@ -164,7 +182,7 @@ impl ReceiptApprover for PayingApprover {
 				return Err(ApprovalRefusal { code });
 			}
 
-			Ok(Some(self.response.clone()))
+			Ok(Some(self.response.to_owned()))
 		})
 	}
 }
@@ -181,9 +199,7 @@ async fn establish_settled_session_observed(
 		observer,
 	};
 
-	let client_offer = budget_offer();
-	let server_offer = TransportOffer::mux(4);
-	establish_mutual_transports(client_offer, server_offer, hooks).await
+	establish_mutual_transports(budget_offer(), server_offer(), hooks).await
 }
 
 /// Establish a settled budget-bearing session without observation.
@@ -204,14 +220,19 @@ fn verifying_key_from(certificate: &Certificate) -> Result<Secp256k1VerifyingKey
 		.map_err(|_| expectation_failure("certificate must carry a valid SEC1 public key"))
 }
 
-/// Verify the artifact exactly as a third party would: keys extracted
-/// from the two certificates, checked through the library's canonical
+/// Verify the artifact exactly as a third party would: reconstructed
+/// from the `SignedData` alone, keys extracted from the two
+/// certificates, checked through the library's canonical
 /// [`StoredReceipt::verify`] entry point.
 fn third_party_verifies(
-	stored: &StoredReceipt,
+	artifact: &SignedData,
 	server_certificate: &Certificate,
 	client_certificate: &Certificate,
 ) -> Result<bool, TightBeamError> {
+	let Ok(stored) = StoredReceipt::try_from(artifact.to_owned()) else {
+		return Ok(false);
+	};
+
 	let server_key = verifying_key_from(server_certificate)?;
 	let client_key = verifying_key_from(client_certificate)?;
 	let verdict = stored.verify::<Sha3_256, Secp256k1Signature, _>(&server_key, &client_key);
@@ -225,39 +246,120 @@ fn flipped(octets: &OctetString) -> Result<OctetString, TightBeamError> {
 	Ok(OctetString::new(bytes)?)
 }
 
-/// Mutation applied to a pristine stored receipt before re-verification.
-type Tamper = fn(&mut StoredReceipt) -> Result<(), TightBeamError>;
+/// Decode, mutate, and re-embed the receipt body carried as the
+/// artifact's `eContent`.
+fn tamper_body(
+	artifact: &mut SignedData,
+	mutate: fn(&mut SessionReceipt) -> Result<(), TightBeamError>,
+) -> Result<(), TightBeamError> {
+	let econtent = artifact
+		.encap_content_info
+		.econtent
+		.as_ref()
+		.ok_or_else(|| expectation_failure("receipt artifact must carry its body"))?;
+
+	let body: OctetString = econtent.decode_as()?;
+	let mut receipt = SessionReceipt::from_der(body.as_bytes())?;
+	mutate(&mut receipt)?;
+
+	let body = OctetString::new(receipt.to_der()?)?;
+	let econtent = Any::from_der(&body.to_der()?)?;
+
+	artifact.encap_content_info.econtent = Some(econtent);
+	Ok(())
+}
+
+/// Replace one role's `SignerInfo` with a mutated copy. The pristine
+/// artifact is validated through the public [`StoredReceipt`] view to
+/// locate the role's signer.
+fn tamper_signer(
+	artifact: &mut SignedData,
+	role: ReceiptRole,
+	mutate: fn(&mut SignerInfo) -> Result<(), TightBeamError>,
+) -> Result<(), TightBeamError> {
+	let stored = StoredReceipt::try_from(artifact.to_owned())?;
+	let target = stored.signer(role)?.to_owned();
+
+	let mut rebuilt = Vec::new();
+	for signer in artifact.signer_infos.0.iter() {
+		let mut signer = signer.to_owned();
+		if signer == target {
+			mutate(&mut signer)?;
+		}
+
+		rebuilt.push(signer);
+	}
+
+	artifact.signer_infos = rebuilt.try_into()?;
+	Ok(())
+}
+
+fn flip_signature(signer: &mut SignerInfo) -> Result<(), TightBeamError> {
+	signer.signature = flipped(&signer.signature)?;
+	Ok(())
+}
+
+/// Swap (or strip, with `None`) the settlement answer bound by a client
+/// `SignerInfo`'s signed attributes.
+fn set_answer_attr(signer: &mut SignerInfo, answer: Option<&'static [u8]>) -> Result<(), TightBeamError> {
+	let attrs = signer
+		.signed_attrs
+		.take()
+		.ok_or_else(|| expectation_failure("client SignerInfo must carry signed attributes"))?;
+
+	let mut rebuilt: Vec<Attribute> = attrs
+		.iter()
+		.filter(|attribute| attribute.oid != RECEIPT_ANSWER)
+		.cloned()
+		.collect();
+	if let Some(answer) = answer {
+		let value = Any::encode_from(&OctetString::new(answer)?)?;
+		let mut values = SetOfVec::new();
+		values.insert(value)?;
+		rebuilt.push(Attribute { oid: RECEIPT_ANSWER, values });
+	}
+
+	signer.signed_attrs = Some(rebuilt.try_into()?);
+	Ok(())
+}
+
+/// Mutation applied to a pristine receipt artifact before re-verification.
+type Tamper = fn(&mut SignedData) -> Result<(), TightBeamError>;
 
 /// Every part of the dual-signed artifact a forger could touch: the
-/// signed body fields, either signature, and the countersigned response.
+/// signed body fields, either signature, and the countersigned answer.
 const TAMPER_CASES: &[(&str, Tamper)] = &[
-	("budget drift in the signed body", |stored| {
-		stored.receipt.budgets.client_to_server += 1;
-		Ok(())
+	("budget drift in the signed body", |artifact| {
+		tamper_body(artifact, |receipt| {
+			receipt.budgets.client_to_server += 1;
+			Ok(())
+		})
 	}),
-	("credit-unit drift in the signed body", |stored| {
-		stored.receipt.credit_unit += 1;
-		Ok(())
+	("credit-unit drift in the signed body", |artifact| {
+		tamper_body(artifact, |receipt| {
+			receipt.credit_unit += 1;
+			Ok(())
+		})
 	}),
-	("challenge swap in the signed body", |stored| {
-		stored.receipt.ancillary = Some(OctetString::new(*b"receipt-invoice-43")?);
-		Ok(())
+	("challenge swap in the signed body", |artifact| {
+		tamper_body(artifact, |receipt| {
+			receipt.ancillary = Some(OctetString::new(*b"receipt-invoice-43")?);
+			Ok(())
+		})
 	}),
-	("server signature bit flip", |stored| {
-		stored.server_signature = flipped(&stored.server_signature)?;
-		Ok(())
+	("server signature bit flip", |artifact| {
+		tamper_signer(artifact, ReceiptRole::Server, flip_signature)
 	}),
-	("client countersignature bit flip", |stored| {
-		stored.client_signature = flipped(&stored.client_signature)?;
-		Ok(())
+	("client countersignature bit flip", |artifact| {
+		tamper_signer(artifact, ReceiptRole::Client, flip_signature)
 	}),
-	("settlement answer swap", |stored| {
-		stored.ancillary_response = Some(OctetString::new(*b"receipt-preimage-43")?);
-		Ok(())
+	("settlement answer swap", |artifact| {
+		tamper_signer(artifact, ReceiptRole::Client, |signer| {
+			set_answer_attr(signer, Some(b"receipt-preimage-43"))
+		})
 	}),
-	("settlement answer stripped", |stored| {
-		stored.ancillary_response = None;
-		Ok(())
+	("settlement answer stripped", |artifact| {
+		tamper_signer(artifact, ReceiptRole::Client, |signer| set_answer_attr(signer, None))
 	}),
 ];
 
@@ -299,12 +401,12 @@ tb_scenario! {
 				.negotiated_mux()
 				.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
 
-			let is_budget_matched = stored.receipt.budgets == REQUEST;
-			let is_credit_unit_matched = stored.receipt.credit_unit == settings.credit_unit;
+			let is_budget_matched = stored.receipt().budgets == REQUEST;
+			let is_credit_unit_matched = stored.receipt().credit_unit == settings.credit_unit;
 			trace.event_with(ReceiptRoundTripSpec::receipt_matches_negotiation, &[], is_budget_matched && is_credit_unit_matched)?;
 
-			let challenge = stored.receipt.ancillary.as_ref().map(OctetString::as_bytes);
-			let answer = stored.ancillary_response.as_ref().map(OctetString::as_bytes);
+			let challenge = stored.receipt().ancillary.as_ref().map(OctetString::as_bytes);
+			let answer = stored.ancillary_response().map(OctetString::as_bytes);
 			trace.event_with(ReceiptRoundTripSpec::challenge_bound, &[], challenge == Some(CHALLENGE))?;
 			trace.event_with(ReceiptRoundTripSpec::answer_bound, &[], answer == Some(RESPONSE))?;
 
@@ -340,11 +442,11 @@ tb_scenario! {
 				approver: Some(Arc::new(AnsweringApprover::answering(b"")?)),
 				observer: None,
 			};
-			let session = establish_mutual_transports(budget_offer(), TransportOffer::mux(4), hooks).await?;
+			let session = establish_mutual_transports(budget_offer(), server_offer(), hooks).await?;
 
 			let client_receipt = session.client.session_receipt();
 			let server_receipt = session.server.session_receipt();
-			let stored_absent = client_receipt.is_some_and(|stored| stored.ancillary_response.is_none());
+			let stored_absent = client_receipt.is_some_and(|stored| stored.ancillary_response().is_none());
 			trace.event_with(ReceiptEmptyAnswerSpec::empty_answer_stored_as_absent, &[], stored_absent)?;
 			trace.event_with(
 				ReceiptEmptyAnswerSpec::endpoints_retain_identical_receipts,
@@ -384,12 +486,12 @@ tb_scenario! {
 				.session_receipt()
 				.ok_or_else(|| expectation_failure("client must retain the receipt"))?;
 
-			let pristine_verifies =
-				third_party_verifies(stored, &session.server_certificate, &session.client_certificate)?;
+			let artifact = stored.artifact();
+			let pristine_verifies = third_party_verifies(artifact, &session.server_certificate, &session.client_certificate)?;
 			trace.event_with(ReceiptThirdPartySpec::both_signatures_verify_offline, &[], pristine_verifies)?;
 
 			for (forgery, tamper) in TAMPER_CASES {
-				let mut tampered = stored.clone();
+				let mut tampered = stored.artifact().to_owned();
 				tamper(&mut tampered)?;
 
 				let forgery_verifies =
@@ -435,7 +537,7 @@ tb_scenario! {
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
-					.with_mux_offer(Some(TransportOffer::mux(4)))
+					.with_mux_offer(Some(server_offer()))
 					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(false)?));
 
 				serve_one_handshake_message(&mut transport).await?;
@@ -444,9 +546,7 @@ tb_scenario! {
 			});
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
-			client = client
-				.with_mux_offer(Some(budget_offer()))
-				.with_receipt_approver(Arc::new(PayingApprover::paying()?));
+			client = with_budget_approver(client, Arc::new(PayingApprover::paying()?));
 			let client_result = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -505,7 +605,7 @@ tb_scenario! {
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
-					.with_mux_offer(Some(TransportOffer::mux(4)))
+					.with_mux_offer(Some(server_offer()))
 					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(true)?));
 
 				serve_one_handshake_message(&mut transport).await?;
@@ -514,9 +614,7 @@ tb_scenario! {
 			});
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
-			client = client
-				.with_mux_offer(Some(budget_offer()))
-				.with_receipt_approver(Arc::new(PayingApprover::refusing(APPROVAL_REFUSAL_CODE)?));
+			client = with_budget_approver(client, Arc::new(PayingApprover::refusing(APPROVAL_REFUSAL_CODE)?));
 			let client_result = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -570,10 +668,10 @@ tb_scenario! {
 				.ok_or_else(|| expectation_failure("server must retain the receipt"))?;
 			let matches_stored = outcomes.first().is_some_and(|outcome| {
 				outcome.verdict == SessionVerdict::Activated
-					&& outcome.receipt == stored.receipt
-					&& outcome.server_signature == stored.server_signature
-					&& outcome.client_signature.as_ref() == Some(&stored.client_signature)
-					&& outcome.ancillary_response == stored.ancillary_response
+					&& outcome.receipt == *stored.receipt()
+					&& outcome.artifact == *stored.artifact()
+					&& outcome.countersignature.is_some()
+					&& outcome.ancillary_response.as_ref() == stored.ancillary_response()
 					&& outcome.client_certificate.as_deref() == Some(session.client_certificate.as_ref())
 			});
 			trace.event_with(ReceiptOutcomeActivatedSpec::verdict_activated_with_evidence, &[], matches_stored)?;
@@ -613,7 +711,7 @@ tb_scenario! {
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
-					.with_mux_offer(Some(TransportOffer::mux(4)))
+					.with_mux_offer(Some(server_offer()))
 					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(false)?))
 					.with_session_observer(server_observer as Arc<dyn SessionObserver>);
 
@@ -623,9 +721,7 @@ tb_scenario! {
 			});
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
-			client = client
-				.with_mux_offer(Some(budget_offer()))
-				.with_receipt_approver(Arc::new(PayingApprover::paying()?));
+			client = with_budget_approver(client, Arc::new(PayingApprover::paying()?));
 			let _ = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -642,18 +738,12 @@ tb_scenario! {
 			trace.event_with(ReceiptOutcomeRefusedSpec::refusal_outcome_recorded, &[], refusal_recorded)?;
 
 			// The refused countersigned receipt remains third-party
-			// verifiable evidence, reconstructed from the outcome alone.
+			// verifiable evidence, reconstructed from the outcome's
+			// dual-signed artifact alone.
 			let evidence = outcomes
 				.first()
-				.and_then(|outcome| {
-					let client_signature = outcome.client_signature.clone()?;
-					Some(StoredReceipt {
-						receipt: outcome.receipt.clone(),
-						server_signature: outcome.server_signature.clone(),
-						client_signature,
-						ancillary_response: outcome.ancillary_response.clone(),
-					})
-				})
+				.filter(|outcome| outcome.countersignature.is_some())
+				.map(|outcome| outcome.artifact.to_owned())
 				.ok_or_else(|| expectation_failure("refusal outcome must carry the countersignature"))?;
 			trace.event_with(
 				ReceiptOutcomeRefusedSpec::refused_receipt_verifies_offline,
@@ -693,7 +783,7 @@ tb_scenario! {
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
-					.with_mux_offer(Some(TransportOffer::mux(4)))
+					.with_mux_offer(Some(server_offer()))
 					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(true)?));
 
 				serve_one_handshake_message(&mut transport).await?;
@@ -702,7 +792,7 @@ tb_scenario! {
 			});
 
 			let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
-			client = client.with_mux_offer(Some(budget_offer()));
+			client = with_budget_offer(client);
 			let client_result = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -750,7 +840,7 @@ tb_scenario! {
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
-					.with_mux_offer(Some(TransportOffer::mux(4)))
+					.with_mux_offer(Some(server_offer()))
 					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(false)?));
 
 				serve_one_handshake_message(&mut transport).await?;
@@ -758,9 +848,7 @@ tb_scenario! {
 			});
 
 			let mut client = connect_pinned_client(addr, &materials.certificate).await?;
-			client = client
-				.with_mux_offer(Some(budget_offer()))
-				.with_receipt_approver(Arc::new(PayingApprover::paying()?));
+			client = with_budget_approver(client, Arc::new(PayingApprover::paying()?));
 			let _ = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
@@ -782,7 +870,7 @@ tb_scenario! {
 			let server_task = tokio::spawn(async move {
 				let (transport, _) = listener.accept().await?;
 				let mut transport = transport
-					.with_mux_offer(Some(TransportOffer::mux(4)))
+					.with_mux_offer(Some(server_offer()))
 					.with_transport_authorizer(Arc::new(ChallengingAuthorizer::new(false)?));
 
 				serve_one_handshake_message(&mut transport).await?;
@@ -792,15 +880,14 @@ tb_scenario! {
 
 			let approver = Arc::new(PayingApprover::paying()?);
 			let mut client = connect_pinned_client(addr, &materials.certificate).await?;
-			client = client
-				.with_mux_offer(Some(budget_offer()))
-				.with_receipt_approver(Arc::clone(&approver) as _);
+			client = with_budget_approver(client, Arc::clone(&approver));
 			let client_result = client.perform_client_handshake().await;
 
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
 			if server_result.is_ok() {
 				return Err(expectation_failure("client abort must fail the server handshake"));
 			}
+
 			let client_refused = matches!(
 				client_result,
 				Err(TransportError::HandshakeError(HandshakeError::MutualAuthRequired))

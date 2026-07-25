@@ -26,13 +26,13 @@ use crate::crypto::x509::Certificate;
 use crate::der::asn1::{OctetString, SetOfVec};
 use crate::der::oid::AssociatedOid;
 use crate::der::{Any, Decode, Encode};
-use crate::oids::{DATA, HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_TRANSPORT_ACCEPT, RECEIPT_SIGNATURE, SESSION_RECEIPT};
+use crate::oids::{DATA, HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_TRANSPORT_ACCEPT, SESSION_RECEIPT};
 use crate::random::{generate_nonce, CryptoRngCore, OsRng, RngWrapper};
 use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use crate::transport::handshake::attributes::{
-	encode_receipt_response, encode_receipt_signature, encode_security_offer, encode_transport_offer,
-	extract_receipt_signature, extract_security_accept, extract_session_receipt, extract_transport_accept,
-	find_unsigned_attr, security_accept_transcript_bytes, transport_accept_transcript_bytes,
+	encode_receipt_ack, encode_security_offer, encode_transport_offer, extract_security_accept,
+	extract_session_receipt, extract_transport_accept, find_unsigned_attr, security_accept_transcript_bytes,
+	transport_accept_transcript_bytes,
 };
 use crate::transport::handshake::builders::{TightBeamEnvelopedDataBuilder, TightBeamKariBuilder};
 use crate::transport::handshake::error::HandshakeError;
@@ -41,8 +41,9 @@ use crate::transport::handshake::negotiation::{
 };
 use crate::transport::handshake::processors::TightBeamSignedDataProcessor;
 use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, client_receipt_digest, match_receipt_to_accept, verify_server_receipt, ReceiptApprover,
-	SessionReceipt, StoredReceipt,
+	approve_or_fail_closed, certificate_signer_identifier, complete_receipt_artifact, countersign_receipt,
+	match_receipt_to_accept, receipt_from_artifact, signer_for_role, verify_receipt_signer, ReceiptApprover,
+	ReceiptRole, SessionReceipt, StoredReceipt,
 };
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
@@ -81,7 +82,7 @@ where
 	provider: P,
 	trust_store: Option<Arc<dyn CertificateTrust>>,
 	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
-	pending_receipt: Option<(SessionReceipt, OctetString)>,
+	pending_receipt: Option<(SessionReceipt, SignedData)>,
 	stored_receipt: Option<StoredReceipt>,
 	invariants: HandshakeInvariant,
 }
@@ -101,6 +102,7 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
 	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	P::Signature: 'static,
 	P::Digest: Send + 'static,
 	P::AeadCipher: KeyInit,
@@ -272,6 +274,7 @@ where
 		match (&self.server_chain, &self.server_cert) {
 			(Some(chain), pinned) => {
 				store.verify_chain(chain)?;
+
 				let leaf = chain.last().ok_or(HandshakeError::MissingServerCertificate)?;
 				if pinned.as_ref().is_some_and(|cert| *leaf != **cert) {
 					return Err(HandshakeError::PinnedCertificateMismatch);
@@ -476,6 +479,7 @@ where
 				if !offer.profiles.contains(&accept.profile) {
 					return Err(HandshakeError::InvalidProfileSelection);
 				}
+
 				self.selected_profile = Some(accept.profile);
 			}
 			(Some(accept), None) => {
@@ -494,10 +498,10 @@ where
 
 	/// Validate the server's session receipt from the Finished attributes.
 	///
-	/// Budget-bearing accepts demand a receipt whose transcript hash,
-	/// budgets, and credit unit match the negotiated session and whose
-	/// server signature verifies. Anything else fails closed. The validated
-	/// receipt is retained for countersigning in the client Finished.
+	/// Budget-bearing accepts demand a receipt artifact whose body
+	/// matches the negotiated session and whose server `SignerInfo`
+	/// verifies. Anything else fails closed. The validated body and
+	/// artifact are retained for countersigning in the client Finished.
 	fn process_session_receipt(
 		&mut self,
 		signed_data: &SignedData,
@@ -505,22 +509,33 @@ where
 	) -> Result<(), HandshakeError> {
 		let granted = transport_accept.and_then(|accept| accept.granted_budgets);
 		let credit_unit = transport_accept.map(|accept| accept.credit_unit);
-		let extracted = extract_session_receipt_attr(signed_data)?;
+		let artifact = extract_session_receipt_attr(signed_data)?;
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
-		let Some(receipt) = match_receipt_to_accept(extracted.as_ref(), granted, credit_unit, &transcript_digest)?
+		let parsed_receipt = artifact.as_ref().map(receipt_from_artifact).transpose()?;
+		let Some(receipt) =
+			match_receipt_to_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
 		else {
 			return Ok(());
 		};
 
-		// Server signature over the receipt body: third-party verifiable
+		// Server SignerInfo over the receipt body: third-party verifiable
 		// agreement, so an unsigned receipt is no receipt at all.
-		let server_signature = extract_receipt_signature_attr(signed_data)?.ok_or(HandshakeError::ReceiptMissing)?;
-		let receipt_der = receipt.to_der()?;
-		let verifying_key = self.extract_server_verifying_key(self.server_leaf()?)?;
-		verify_server_receipt::<P::Digest, P::Signature, _>(&receipt_der, server_signature.as_bytes(), &verifying_key)?;
+		let artifact = artifact.ok_or(HandshakeError::ReceiptMissing)?;
+		let server_signer = signer_for_role(&artifact, ReceiptRole::Server)?.ok_or(HandshakeError::ReceiptMissing)?;
 
-		self.pending_receipt = Some((receipt.clone(), server_signature));
+		let receipt_der = receipt.to_der()?;
+		let expected_sid = certificate_signer_identifier::<P::Digest>(self.server_leaf()?)?;
+		let verifying_key = self.extract_server_verifying_key(self.server_leaf()?)?;
+		verify_receipt_signer::<P::Digest, P::Signature, _>(
+			&receipt_der,
+			server_signer,
+			ReceiptRole::Server,
+			&expected_sid,
+			&verifying_key,
+		)?;
+
+		self.pending_receipt = Some((receipt, artifact));
 
 		Ok(())
 	}
@@ -528,12 +543,12 @@ where
 	/// Approve, answer, and countersign the pending session receipt.
 	///
 	/// The approver (or the fail-closed default) answers the settlement
-	/// challenge, and the countersignature binds receipt body plus
+	/// challenge, and the client `SignerInfo` binds receipt body plus
 	/// answer under the client identity (non-repudiation). Returns
 	/// the unsigned attributes destined for the client Finished's
 	/// SignerInfo.
 	async fn countersign_pending_receipt(&mut self) -> Result<Option<Attributes>, HandshakeError> {
-		let Some((receipt, server_signature)) = self.pending_receipt.take() else {
+		let Some((receipt, server_artifact)) = self.pending_receipt.take() else {
 			return Ok(None);
 		};
 
@@ -547,41 +562,28 @@ where
 		}
 
 		// Approve the receipt and answer its challenge.
-		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), &receipt).await?;
+		let approver = self.receipt_approver.as_deref();
+		let response = approve_or_fail_closed(approver, &receipt).await?;
+		let answer = response.as_ref().map(OctetString::as_bytes);
+		let key_provider = self.client_key_provider.as_ref();
+		let countersignature = countersign_receipt::<P::Digest>(&receipt, answer, key_provider).await?;
 
-		let receipt_der = receipt.to_der()?;
-		let response_bytes = response.as_ref().map(OctetString::as_bytes);
-		let client_digest = client_receipt_digest::<P::Digest>(&receipt_der, response_bytes)?;
-		let signature_bytes = self.client_key_provider.sign_prehash(&client_digest).await?;
-		let countersignature = OctetString::new(signature_bytes)?;
+		// The acknowledgement is confidential: the client SignerInfo (and
+		// the bearer answer bound in its signed attributes) travels in an
+		// EnvelopedData encrypted to the server certificate, never the
+		// cleartext SignedData.
+		let mut os = OsRng;
+		let ack_der = Zeroizing::new(countersignature.to_der()?);
+		let envelope_der = self.encrypt_to_server(&ack_der, &mut os)?;
+		let envelope = OctetString::new(envelope_der)?;
+		let ack_attr = encode_receipt_ack(&envelope)?;
 
-		let mut x509_attrs = Vec::new();
-		let signature_attr = encode_receipt_signature(&countersignature)?;
-		x509_attrs.push(Attribute {
-			oid: signature_attr.attr_type,
-			values: SetOfVec::try_from(signature_attr.attr_values)?,
-		});
+		let values = SetOfVec::try_from(ack_attr.attr_values)?;
+		let x509_attrs = vec![Attribute { oid: ack_attr.attr_type, values }];
 
-		// The settlement answer is confidential: it travels in an
-		// EnvelopedData encrypted to the server certificate, not the cleartext
-		// SignedData. Confidentiality from the envelope, authentication
-		// from the countersignature already computed over the plaintext.
-		if let Some(ref response) = response {
-			let mut os = OsRng;
-			let envelope_der = self.encrypt_to_server(response.as_bytes(), &mut os)?;
-			let response_attr = encode_receipt_response(&OctetString::new(envelope_der)?)?;
-			x509_attrs.push(Attribute {
-				oid: response_attr.attr_type,
-				values: SetOfVec::try_from(response_attr.attr_values)?,
-			});
-		}
-
-		self.stored_receipt = Some(StoredReceipt {
-			receipt,
-			server_signature,
-			client_signature: countersignature,
-			ancillary_response: response,
-		});
+		// Both endpoints retain the identical completed artifact.
+		let completed = complete_receipt_artifact(server_artifact, countersignature)?;
+		self.stored_receipt = Some(StoredReceipt::try_from(completed)?);
 
 		Ok(Some(Attributes::try_from(x509_attrs)?))
 	}
@@ -767,6 +769,7 @@ where
 
 		let mut hasher = P::Digest::new();
 		hasher.update(transcript_hash);
+
 		let digest = hasher.finalize();
 		let digest_bytes = digest.to_vec();
 
@@ -804,6 +807,7 @@ where
 		let signer_info = SignerInfo {
 			version: CmsVersion::V1,
 			sid: id,
+			// Same OID lives in SignerInfo and the SignedData digestAlgorithms SET.
 			digest_alg: digest_alg.clone(),
 			signed_attrs: None,
 			signature_algorithm: signature_alg,
@@ -820,7 +824,8 @@ where
 			.client_certificate
 			.as_ref()
 			.map(|cert| {
-				let choice = CertificateChoices::Certificate(cert.as_ref().clone());
+				// CMS CertificateSet owns the cert; orchestrator keeps Arc.
+				let choice = CertificateChoices::Certificate(cert.as_ref().to_owned());
 				Ok::<_, HandshakeError>(CertificateSet(vec![choice].try_into()?))
 			})
 			.transpose()?;
@@ -861,19 +866,11 @@ fn extract_transport_accept_attr(signed_data: &SignedData) -> Result<Option<Tran
 		.transpose()
 }
 
-/// Extract the server's session receipt from a Finished message's unsigned
+/// Extract the server's receipt `SignedData` artifact from a Finished message's unsigned
 /// attributes, if present.
-fn extract_session_receipt_attr(signed_data: &SignedData) -> Result<Option<SessionReceipt>, HandshakeError> {
+fn extract_session_receipt_attr(signed_data: &SignedData) -> Result<Option<SignedData>, HandshakeError> {
 	find_unsigned_attr(signed_data, SESSION_RECEIPT)?
 		.map(|attr| extract_session_receipt(&attr))
-		.transpose()
-}
-
-/// Extract the server's receipt signature from a Finished message's unsigned
-/// attributes, if present.
-fn extract_receipt_signature_attr(signed_data: &SignedData) -> Result<Option<OctetString>, HandshakeError> {
-	find_unsigned_attr(signed_data, RECEIPT_SIGNATURE)?
-		.map(|attr| extract_receipt_signature(&attr))
 		.transpose()
 }
 
@@ -904,6 +901,7 @@ where
 	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
 	PublicKey<P::Curve>: EncodePublicKey,
 	P::VerifyingKey: From<PublicKey<P::Curve>> + EncodePublicKey + signature::Verifier<P::Signature> + 'static,
+	for<'a> P::Signature: TryFrom<&'a [u8]>,
 	P::Signature: 'static,
 	P::Digest: Send + 'static,
 	P::AeadCipher: Send + Sync + KeyInit,
@@ -1014,7 +1012,7 @@ mod tests {
 		// Given: A CMS client in init state with a server certificate
 		let transcript_hash = [1u8; 32];
 		let server_test_cert = create_test_certificate();
-		let server_cert = server_test_cert.certificate.clone();
+		let server_cert = server_test_cert.certificate.to_owned();
 		let mut client = TestCmsClientBuilder::new()
 			.with_server_cert(server_cert)
 			.with_transcript_hash(transcript_hash)
@@ -1023,14 +1021,14 @@ mod tests {
 
 		// When: Client builds a valid key exchange
 		let session_key = vec![2u8; 32];
-		let key_exchange = client.build_key_exchange(session_key.clone(), None)?;
+		let key_exchange = client.build_key_exchange(session_key.to_owned(), None)?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		// Verify session key is stored
 		assert!(client.session_key().is_some());
 
 		// Then: Server should be able to decrypt it using the matching private key
 		let enveloped_data = EnvelopedData::from_der(&key_exchange)?;
-		let server_secret = SecretKey::from(server_test_cert.signing_key.clone());
+		let server_secret = SecretKey::from(server_test_cert.signing_key.to_owned());
 		let provider = DefaultCryptoProvider::default();
 		let kari_processor = TightBeamKariRecipient::new(provider, server_secret);
 		let processor = TightBeamEnvelopedDataProcessor::<DefaultCryptoProvider>::new(kari_processor);
@@ -1065,40 +1063,46 @@ mod tests {
 		Ok(())
 	}
 
-	/// A client without a trust store must abort instead of degrading to
-	/// expiry-only server authentication (CWE-295).
-	#[test]
-	fn test_missing_trust_store_fails_closed() -> Result<(), Box<dyn Error>> {
-		let server_cert = create_test_certificate().certificate;
-		let test_cert = create_test_certificate();
-		let server_cert = Arc::new(server_cert);
-		let provider = into_provider(test_cert.signing_key);
-		let mut client =
-			CmsHandshakeClient::<DefaultCryptoProvider>::new(DefaultCryptoProvider::default(), provider, server_cert);
+	const TEST_SESSION_KEY: [u8; 32] = [2u8; 32];
 
-		let result = client.build_key_exchange(vec![2u8; 32], None);
-		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
-		Ok(())
+	fn trust_store(root: Option<Certificate>) -> Result<Arc<dyn CertificateTrust>, Box<dyn Error>> {
+		let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
+		if let Some(root) = root {
+			builder = builder.with_certificate(root)?;
+		}
+		Ok(Arc::new(builder.build()))
+	}
+
+	fn client_key() -> Arc<dyn crate::crypto::key::SigningKeyProvider> {
+		into_provider(create_test_certificate().signing_key)
 	}
 
 	fn chain_client(
 		chain: Arc<[Certificate]>,
 		store_root: Option<Certificate>,
 	) -> Result<CmsHandshakeClient<DefaultCryptoProvider>, Box<dyn Error>> {
-		let mut builder = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy);
-		if let Some(root) = store_root {
-			builder = builder.with_certificate(root)?;
-		}
-
-		let store: Arc<dyn CertificateTrust> = Arc::new(builder.build());
-		let client = CmsHandshakeClient::<DefaultCryptoProvider>::from_chain(
+		Ok(CmsHandshakeClient::<DefaultCryptoProvider>::from_chain(
 			DefaultCryptoProvider::default(),
-			into_provider(create_test_certificate().signing_key),
+			client_key(),
 			chain,
 		)
-		.with_trust_store(store);
+		.with_trust_store(trust_store(store_root)?))
+	}
 
-		Ok(client)
+	/// A client without a trust store must abort instead of degrading to
+	/// expiry-only server authentication (CWE-295).
+	#[test]
+	fn test_missing_trust_store_fails_closed() -> Result<(), Box<dyn Error>> {
+		let server = create_test_certificate();
+		let mut client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
+			DefaultCryptoProvider::default(),
+			into_provider(server.signing_key),
+			Arc::new(server.certificate),
+		);
+
+		let result = client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None);
+		assert!(matches!(result, Err(HandshakeError::MissingTrustStore)));
+		Ok(())
 	}
 
 	/// A chain-provisioned client path-validates the chain and encrypts to
@@ -1106,12 +1110,9 @@ mod tests {
 	#[test]
 	fn from_chain_validates_and_targets_leaf() -> Result<(), Box<dyn Error>> {
 		let chain = create_test_certificate_chain()?;
-		let mut client = chain_client(
-			Arc::from(vec![chain.root.clone(), chain.intermediate, chain.leaf.clone()]),
-			Some(chain.root),
-		)?;
+		let mut client = chain_client(chain.to_arc(), Some(chain.root.to_owned()))?;
 
-		client.build_key_exchange(vec![2u8; 32], None)?;
+		client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None)?;
 		assert_eq!(client.state(), ClientHandshakeState::KeyExchangeSent);
 		assert_eq!(client.server_leaf()?, &chain.leaf);
 		Ok(())
@@ -1120,9 +1121,9 @@ mod tests {
 	#[test]
 	fn from_chain_rejects_untrusted_chain() -> Result<(), Box<dyn Error>> {
 		let chain = create_test_certificate_chain()?;
-		let mut client = chain_client(Arc::from(vec![chain.root, chain.intermediate, chain.leaf]), None)?;
+		let mut client = chain_client(chain.to_arc(), None)?;
 
-		let result = client.build_key_exchange(vec![2u8; 32], None);
+		let result = client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None);
 		assert!(matches!(result, Err(HandshakeError::CertificateValidationError(_))));
 		Ok(())
 	}
@@ -1133,21 +1134,13 @@ mod tests {
 	#[test]
 	fn pinned_certificate_mismatch_rejected() -> Result<(), Box<dyn Error>> {
 		let chain = create_test_certificate_chain()?;
-		let store: Arc<dyn CertificateTrust> = Arc::new(
-			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_certificate(chain.root.clone())?
-				.build(),
-		);
 		let pinned = Arc::new(create_test_certificate().certificate);
-		let mut client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
-			DefaultCryptoProvider::default(),
-			into_provider(create_test_certificate().signing_key),
-			pinned,
-		)
-		.with_server_certificate_chain(Arc::from(vec![chain.root, chain.intermediate, chain.leaf]))
-		.with_trust_store(store);
+		let mut client =
+			CmsHandshakeClient::<DefaultCryptoProvider>::new(DefaultCryptoProvider::default(), client_key(), pinned)
+				.with_server_certificate_chain(chain.to_arc())
+				.with_trust_store(trust_store(Some(chain.root.to_owned()))?);
 
-		let result = client.build_key_exchange(vec![2u8; 32], None);
+		let result = client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None);
 		assert!(matches!(result, Err(HandshakeError::PinnedCertificateMismatch)));
 		Ok(())
 	}
@@ -1157,7 +1150,7 @@ mod tests {
 		let chain = create_test_certificate_chain()?;
 		let mut client = chain_client(Arc::from(Vec::new()), Some(chain.root))?;
 
-		let result = client.build_key_exchange(vec![2u8; 32], None);
+		let result = client.build_key_exchange(TEST_SESSION_KEY.to_vec(), None);
 		assert!(matches!(result, Err(HandshakeError::MissingServerCertificate)));
 		Ok(())
 	}

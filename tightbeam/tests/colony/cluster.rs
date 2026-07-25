@@ -74,7 +74,7 @@ impl ClusterTestCerts {
 		let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365).expect("Failed to create cluster cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
 			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_chain(vec![cert.clone()])
+				.with_chain(vec![cert.to_owned()])
 				.expect("Failed to build trust")
 				.build(),
 		);
@@ -91,8 +91,8 @@ fn cluster_tls_config_with_trust(
 	hive_trust: Option<Arc<dyn CertificateTrust>>,
 ) -> ClusterTlsConfig {
 	ClusterTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 		validators: vec![],
 		client_validators: vec![],
 		hive_trust,
@@ -105,8 +105,8 @@ fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
 
 fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConf {
 	let hive_tls = Arc::new(HiveTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 		validators: vec![],
 	});
 	HiveConf {
@@ -125,8 +125,8 @@ fn servlet_tls_config(
 ) -> Result<ServletConf<TokioListener, PingRequest, DefaultCryptoProvider>, TightBeamError> {
 	Ok(ServletConf::<TokioListener, PingRequest, DefaultCryptoProvider>::builder()
 		.with_certificate(
-			CertificateSpec::Built(Box::new(certs.cert.clone())),
-			Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 			vec![],
 		)?
 		.with_mux_offer(Some(TransportOffer::mux(8)))
@@ -177,7 +177,7 @@ async fn signed_control_frame_with(
 		.with_message(request)
 		.build()?;
 
-	let provider = Secp256k1KeyProvider::from(key.clone());
+	let provider = Secp256k1KeyProvider::from(key.to_owned());
 	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
 }
 
@@ -248,7 +248,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: |req, frame, _ctx| async move {
 		Ok(Some(compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: &frame.metadata.id,
 				message: PingResponse { doubled: req.value * 2 }
 		}?))
 	}
@@ -600,8 +600,8 @@ tb_scenario! {
 			// frames and must fail closed: even a validly signed
 			// registration is rejected.
 			let tls = ClusterTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
-				key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+				certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+				key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 				validators: vec![],
 				client_validators: vec![],
 				hive_trust: None,
@@ -672,7 +672,7 @@ tb_scenario! {
 				registration_request(current_timestamp_ms(), b"127.0.0.1:65000"),
 			)
 			.await?;
-			let replayed = fresh.clone();
+			let replayed = fresh.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
@@ -708,7 +708,7 @@ tb_scenario! {
 				vec![servlet_info(b"ping", b"127.0.0.1:65001")],
 			);
 			let fresh_update = signed_control_frame(&certs, b"replay-update", update).await?;
-			let replayed_update = fresh_update.clone();
+			let replayed_update = fresh_update.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh_update).await?;
 			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
@@ -855,9 +855,9 @@ fn dual_hive_certs() -> DualHiveCerts {
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
 		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-			.with_certificate(cert_a.clone())
+			.with_certificate(cert_a.to_owned())
 			.expect("hive A trust")
-			.with_certificate(cert_b.clone())
+			.with_certificate(cert_b.to_owned())
 			.expect("hive B trust")
 			.build(),
 	);

@@ -86,7 +86,7 @@ impl ClientMaterials {
 /// Handshake clients fail closed without a validator (CWE-295), so every
 /// session pins the identity of the server it orchestrates against.
 pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
-	let trust_chain = vec![certificate.clone()];
+	let trust_chain = vec![certificate.to_owned()];
 	let data = DirectTrustValidator::default().with_trust_chain(trust_chain);
 
 	Arc::new(data)
@@ -95,7 +95,7 @@ pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValida
 /// Trust store pinning the given server certificate (for CMS clients).
 pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-		.with_certificate(certificate.clone())?
+		.with_certificate(certificate.to_owned())?
 		.build();
 	Ok(Arc::new(store))
 }
@@ -196,7 +196,7 @@ mod receipt_fixtures {
 			offer: &'a TransportOffer,
 		) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
 			Box::pin(async move {
-				Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: self.challenge.clone() })
+				Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: self.challenge.to_owned() })
 			})
 		}
 	}
@@ -229,7 +229,7 @@ mod receipt_fixtures {
 			offer: &'a TransportOffer,
 		) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
 			Box::pin(async move {
-				Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: Some(self.challenge.clone()) })
+				Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: Some(self.challenge.to_owned()) })
 			})
 		}
 
@@ -261,7 +261,7 @@ mod receipt_fixtures {
 			&'a self,
 			_receipt: &'a SessionReceipt,
 		) -> MaybeSendFuture<'a, Result<Option<OctetString>, ApprovalRefusal>> {
-			Box::pin(async move { Ok(Some(self.response.clone())) })
+			Box::pin(async move { Ok(Some(self.response.to_owned())) })
 		}
 	}
 
@@ -274,15 +274,15 @@ mod receipt_fixtures {
 	impl RecordingObserver {
 		/// Snapshot of the outcomes recorded so far.
 		pub fn recorded(&self) -> Vec<SessionOutcome> {
-			self.outcomes.lock().map(|outcomes| outcomes.clone()).unwrap_or_default()
+			self.outcomes.lock().map(|outcomes| outcomes.to_owned()).unwrap_or_default()
 		}
 	}
 
 	impl SessionObserver for RecordingObserver {
-		fn on_outcome<'a>(&'a self, outcome: SessionOutcome) -> MaybeSendFuture<'a, ()> {
+		fn on_outcome<'a>(&'a self, outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()> {
 			Box::pin(async move {
 				if let Ok(mut outcomes) = self.outcomes.lock() {
-					outcomes.push(outcome);
+					outcomes.push(outcome.to_owned());
 				}
 			})
 		}
@@ -353,6 +353,7 @@ mod cms_fixtures {
 		.with_trust_store(trust_store)
 		.with_client_certificate(Arc::clone(&client_cert))
 		.with_transport_offer(TransportOffer::mux(4).with_budgets(request));
+
 		if let Some(approver) = hooks.approver {
 			client = client.with_receipt_approver(approver);
 		}
@@ -362,13 +363,15 @@ mod cms_fixtures {
 			CmsHandshakeServer::<DefaultCryptoProvider>::new(Arc::clone(&materials.key_provider), Some(validators))
 				.with_supported_profiles(vec![profile])
 				.with_transport_config(TransportOffer::mux(4));
+
 		if let Some(authorizer) = hooks.authorizer {
 			server = server.with_transport_authorizer(authorizer);
 		}
 		if let Some(observer) = hooks.observer {
 			server = server.with_session_observer(observer);
 		}
-		server.set_client_certificate((*client_cert).clone())?;
+
+		server.set_client_certificate((*client_cert).to_owned())?;
 
 		Ok(CmsSessionPair { client, server })
 	}

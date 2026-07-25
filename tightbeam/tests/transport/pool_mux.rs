@@ -81,7 +81,7 @@ async fn start_echo_server(
 	let (listener, addr) = bind_pool_listener(materials).await?;
 	let handle = server! {
 		protocol TokioListener: listener,
-		policies: { with_mux_offer: [ offer.clone() ] },
+		policies: { with_mux_offer: [ offer.to_owned() ] },
 		handle: move |frame: Frame| async move { Ok(Some(frame)) }
 	};
 
@@ -117,7 +117,7 @@ fn mux_pool(
 /// Round-trip one labeled frame on the lease. Returns true when echoed intact.
 async fn echo_roundtrip(client: &mut PooledClient<TokioListener>, label: &str) -> Result<bool, TightBeamError> {
 	let frame = mux_frame(label);
-	let reply = client.emit(frame.clone(), None).await?;
+	let reply = client.emit(frame.to_owned(), None).await?;
 	Ok(reply == Some(frame))
 }
 
@@ -152,7 +152,7 @@ tb_scenario! {
 			let frame_one = mux_frame("mux-share-1");
 			let frame_two = mux_frame("mux-share-2");
 			let (reply_one, reply_two) =
-				tokio::join!(lease_one.emit(frame_one.clone(), None), lease_two.emit(frame_two.clone(), None),);
+				tokio::join!(lease_one.emit(frame_one.to_owned(), None), lease_two.emit(frame_two.to_owned(), None),);
 
 			trace.event_with(MuxLeaseShareSpec::first_lease_echoes, &[], reply_one? == Some(frame_one))?;
 			trace.event_with(MuxLeaseShareSpec::second_lease_echoes, &[], reply_two? == Some(frame_two))?;
@@ -227,7 +227,7 @@ async fn start_gated_echo_server(
 	let handler_ctx = Arc::clone(ctx);
 	let handle = server! {
 		protocol TokioListener: listener,
-		policies: { with_mux_offer: [ offer.clone() ] },
+		policies: { with_mux_offer: [ offer.to_owned() ] },
 		handle: move |frame: Frame| {
 			let ctx = Arc::clone(&handler_ctx);
 			let first = Arc::clone(&first);
@@ -236,6 +236,7 @@ async fn start_gated_echo_server(
 					ctx.started.notify_one();
 					ctx.release.notified().await;
 				}
+
 				Ok(Some(frame))
 			}
 		}
@@ -678,7 +679,7 @@ tb_scenario! {
 				.await?;
 
 			let frame = mux_frame("single-flight");
-			let reply = client.emit(frame.clone(), None).await?;
+			let reply = client.emit(frame.to_owned(), None).await?;
 			trace.event_with(MuxServesSingleFlightSpec::single_flight_echo_on_mux_server, &[], reply == Some(frame))?;
 			Ok(())
 		}

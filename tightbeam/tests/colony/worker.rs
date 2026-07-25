@@ -27,7 +27,7 @@ worker! {
 	},
 	handle: |message, _trace, config| async move {
 		if message.content == "PING" {
-			Some(PongMessage { result: config.response.clone() })
+			Some(PongMessage { result: config.response.to_owned() })
 		} else {
 			None
 		}

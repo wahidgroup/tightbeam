@@ -71,12 +71,12 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub TranscriptBindingProcess,
 	events {
-		observable { "tampered_accept_rejected", "stripped_offer_rejected" }
+		observable { TranscriptBindingSpec::tampered_accept_rejected, TranscriptBindingSpec::stripped_offer_rejected }
 		hidden { }
 	}
 	states {
-		Idle => { "tampered_accept_rejected" => AcceptBound },
-		AcceptBound => { "stripped_offer_rejected" => Done },
+		Idle => { TranscriptBindingSpec::tampered_accept_rejected => AcceptBound },
+		AcceptBound => { TranscriptBindingSpec::stripped_offer_rejected => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -157,7 +157,7 @@ job! {
 		expect_client_reject(
 			client.process_server_handshake(&tampered).await,
 			&trace,
-			"tampered_accept_rejected",
+			TranscriptBindingSpec::tampered_accept_rejected,
 			"client accepted a tampered, unauthenticated security_accept",
 		)
 		.await?;
@@ -180,7 +180,7 @@ job! {
 		expect_client_reject(
 			client.process_server_handshake(&server_handshake_der).await,
 			&trace,
-			"stripped_offer_rejected",
+			TranscriptBindingSpec::stripped_offer_rejected,
 			"client accepted a signature over a rewritten ClientHello",
 		)
 		.await?;

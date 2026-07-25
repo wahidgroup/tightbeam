@@ -318,6 +318,17 @@ mod router {
 		Close,
 	}
 
+	/// Exclusive outbound handle for `SinkExt::send` / `try_send`.
+	/// `mpsc::Sender` is Arc-backed; this is a refcount bump.
+	fn outbound_handle(outbound: &mpsc::Sender<Outbound>) -> mpsc::Sender<Outbound> {
+		outbound.clone()
+	}
+
+	/// Register `cx`'s waker. Waker clone is a refcount bump, not a data copy.
+	fn park_waker(waiters: &mut Vec<Waker>, cx: &Context<'_>) {
+		waiters.push(cx.waker().clone());
+	}
+
 	/// Peer-initiated event routed from the reader to the responder.
 	enum InboundEvent {
 		Request(u32, Arc<Frame>),
@@ -502,7 +513,7 @@ mod router {
 				return Poll::Ready(Err(TransportError::OperationFailed(TransportFailure::Cancelled)));
 			};
 			if stream.sent >= stream.limit {
-				stream.credit_wakers.push(cx.waker().clone());
+				park_waker(&mut stream.credit_wakers, cx);
 				return Poll::Pending;
 			}
 
@@ -745,7 +756,7 @@ mod router {
 				return Poll::Ready(Ok(()));
 			}
 
-			state.slot_wakers.push(cx.waker().clone());
+			park_waker(&mut state.slot_wakers, cx);
 
 			Poll::Pending
 		}
@@ -862,7 +873,7 @@ mod router {
 			return Ok(());
 		};
 
-		let mut outbound = outbound.clone();
+		let mut outbound = outbound_handle(outbound);
 		outbound
 			.send(Outbound::Envelope(package.into()))
 			.await
@@ -886,7 +897,7 @@ mod router {
 				return Poll::Ready(());
 			}
 
-			state.drain_wakers.push(cx.waker().clone());
+			park_waker(&mut state.drain_wakers, cx);
 
 			Poll::Pending
 		}
@@ -912,7 +923,7 @@ mod router {
 	fn enqueue_stream_cancel(shared: &MuxShared, outbound: &mpsc::Sender<Outbound>, stream_id: u32) {
 		if shared.remove_pending(stream_id).is_some() {
 			let package = MuxCancelPackage::new(stream_id, CancelReason::Cancelled);
-			let _ = outbound.clone().try_send(Outbound::Envelope(package.into()));
+			let _ = outbound_handle(outbound).try_send(Outbound::Envelope(package.into()));
 		}
 	}
 
@@ -951,6 +962,8 @@ mod router {
 		}
 	}
 
+	/// Prefer moving the frame out of the Arc; deep-copy only when the
+	/// inbound path still holds a shared reference (dual ownership).
 	fn unwrap_frame(frame: Arc<Frame>) -> Frame {
 		Arc::try_unwrap(frame).unwrap_or_else(|shared| (*shared).clone())
 	}
@@ -975,10 +988,10 @@ mod router {
 
 	/// Cloneable client handle for a multiplexed connection.
 	///
-	/// Shares pending-stream state and the outbound queue across clones.
-	/// Does not drive I/O: spawn [`MuxReaderDriver`] and [`MuxWriterDriver`]
-	/// on the caller's executor. See [`MuxHandle::emit_on_stream`] and
-	/// [`MuxHandle::ping`].
+	/// Shares pending-stream state and the outbound queue across clones
+	/// (`Arc` + channel refcount bumps only). Does not drive I/O: spawn
+	/// [`MuxReaderDriver`] and [`MuxWriterDriver`] on the caller's executor.
+	/// See [`MuxHandle::emit_on_stream`] and [`MuxHandle::ping`].
 	#[derive(Clone)]
 	pub struct MuxHandle {
 		shared: Arc<MuxShared>,
@@ -1023,7 +1036,7 @@ mod router {
 
 			let mut guard = CancelOnDrop {
 				shared: Arc::clone(&self.shared),
-				outbound: self.outbound.clone(),
+				outbound: outbound_handle(&self.outbound),
 				stream_id,
 				armed: true,
 			};
@@ -1058,7 +1071,7 @@ mod router {
 		async fn send_request_chunks(&self, stream_id: u32, payload: &[u8]) -> TransportResult<()> {
 			let chunk_size = self.shared.send_chunk_size;
 			let total = chunk_records(payload.len(), chunk_size).max(1);
-			let mut outbound = self.outbound.clone();
+			let mut outbound = outbound_handle(&self.outbound);
 			let mut chunks = payload.chunks(chunk_size);
 			let mut sent: u64 = 0;
 
@@ -1149,7 +1162,7 @@ mod router {
 			let mut guard = ForgetPingOnDrop { shared, opaque, armed: true };
 
 			let probe = MuxPingPackage::new(false, opaque);
-			let mut outbound = self.outbound.clone();
+			let mut outbound = outbound_handle(&self.outbound);
 			outbound
 				.send(Outbound::Envelope(probe.into()))
 				.await
@@ -1183,7 +1196,7 @@ mod router {
 
 			DrainPending { shared: Arc::clone(&self.shared) }.await;
 
-			let mut outbound = self.outbound.clone();
+			let mut outbound = outbound_handle(&self.outbound);
 			let _ = outbound.send(Outbound::Close).await;
 			Ok(())
 		}
@@ -1848,7 +1861,7 @@ mod router {
 			}
 		}
 
-		let mut outbound = outbound.clone();
+		let mut outbound = outbound_handle(outbound);
 		if payload.is_empty() {
 			let package = MuxEndPackage::new(stream_id, status, payload)?;
 			return outbound
@@ -1958,7 +1971,7 @@ mod router {
 
 						let work = handler(frame);
 						let shared = Arc::clone(&self.shared);
-						let outbound = self.outbound.clone();
+						let outbound = outbound_handle(&self.outbound);
 						let task = async move {
 							let response = work.await;
 							let result = send_response(&shared, &outbound, stream_id, response).await;
@@ -2024,12 +2037,15 @@ mod router {
 			let drain_headroom = drain_headroom(&settings);
 
 			Self {
-				handle: MuxHandle { shared: Arc::clone(&shared), outbound: outbound_sender.clone() },
+				handle: MuxHandle {
+					shared: Arc::clone(&shared),
+					outbound: outbound_handle(&outbound_sender),
+				},
 				reader: MuxReaderDriver {
 					reader,
 					shared: Arc::clone(&shared),
 					inbound: inbound_sender,
-					outbound: outbound_sender.clone(),
+					outbound: outbound_handle(&outbound_sender),
 					grantor: Arc::new(BufferedGrantor::default()),
 					peer_cap: settings.peer_initiated_cap,
 					recv_chunk_size: cap_as_usize(settings.recv_chunk_size).max(1),
@@ -2070,7 +2086,8 @@ mod router {
 			self
 		}
 
-		/// Clone the client handle without decomposing the transport.
+		/// Clone the client handle without decomposing the transport
+		/// (`Arc` + channel refcount bumps).
 		pub fn handle(&self) -> MuxHandle {
 			self.handle.clone()
 		}

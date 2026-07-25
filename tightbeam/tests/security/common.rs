@@ -246,6 +246,25 @@ impl Default for SecurityThreatHarness {
 }
 
 impl SecurityThreatHarness {
+	/// Hidden CSP event: a handshake session is about to be constructed.
+	#[allow(non_upper_case_globals)]
+	pub const harness_spawn_session: &'static str = "harness_spawn_session";
+	/// Hidden CSP event: ECIES backend selected for the session.
+	#[allow(non_upper_case_globals)]
+	pub const harness_spawn_ecies: &'static str = "harness_spawn_ecies";
+	/// Hidden CSP event: CMS backend selected for the session.
+	#[allow(non_upper_case_globals)]
+	pub const harness_spawn_cms: &'static str = "harness_spawn_cms";
+	/// Hidden CSP event: weak-cipher spawn path entered.
+	#[allow(non_upper_case_globals)]
+	pub const harness_spawn_weak: &'static str = "harness_spawn_weak";
+	/// Hidden CSP event: weak ECIES backend selected.
+	#[allow(non_upper_case_globals)]
+	pub const harness_spawn_ecies_weak: &'static str = "harness_spawn_ecies_weak";
+	/// Hidden CSP event: weak CMS backend selected.
+	#[allow(non_upper_case_globals)]
+	pub const harness_spawn_cms_weak: &'static str = "harness_spawn_cms_weak";
+
 	/// Create a harness with a trace collector for internal event emission.
 	pub fn with_trace(trace: Arc<TraceCollector>) -> Self {
 		Self { materials: ServerMaterials::generate(), trace: Some(trace) }
@@ -282,15 +301,15 @@ impl SecurityThreatHarness {
 		client_profiles: Vec<SecurityProfileDesc>,
 		server_profiles: Vec<SecurityProfileDesc>,
 	) -> Box<dyn HandshakeProtocol> {
-		self.emit("harness_spawn_session").ok();
+		self.emit(Self::harness_spawn_session).ok();
 		match kind {
 			HandshakeBackendKind::Ecies => {
-				self.emit("harness_spawn_ecies").ok();
+				self.emit(Self::harness_spawn_ecies).ok();
 				Box::new(EciesSession::with_profiles(&self.materials, client_profiles, server_profiles))
 			}
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
-				self.emit("harness_spawn_cms").ok();
+				self.emit(Self::harness_spawn_cms).ok();
 				Box::new(CmsSession::with_profiles(
 					&self.materials,
 					client_profiles,
@@ -306,15 +325,15 @@ impl SecurityThreatHarness {
 	/// This uses `Aes128CryptoProvider` which actually uses AES-128 at the cipher level,
 	/// not just in the profile descriptor OIDs.
 	pub fn spawn_weak(&self, kind: HandshakeBackendKind) -> Box<dyn HandshakeProtocol> {
-		self.emit("harness_spawn_weak").ok();
+		self.emit(Self::harness_spawn_weak).ok();
 		match kind {
 			HandshakeBackendKind::Ecies => {
-				self.emit("harness_spawn_ecies_weak").ok();
+				self.emit(Self::harness_spawn_ecies_weak).ok();
 				Box::new(Aes128EciesSession::new(&self.materials))
 			}
 			#[cfg(feature = "transport-cms")]
 			HandshakeBackendKind::Cms => {
-				self.emit("harness_spawn_cms_weak").ok();
+				self.emit(Self::harness_spawn_cms_weak).ok();
 				// CMS with AES-128 would require Aes128CmsSession - use default for now.
 				// Weak profiles fail the default floor, so opt out explicitly.
 				Box::new(CmsSession::with_profiles(
@@ -529,7 +548,7 @@ impl HandshakeProtocol for EciesSession {
 			messages.push(CapturedMessage {
 				step: 0,
 				direction: Direction::ClientToServer,
-				payload: client_hello.clone(),
+				payload: client_hello.to_owned(),
 			});
 
 			// Step 1: Server Handshake (S -> C)
@@ -537,7 +556,7 @@ impl HandshakeProtocol for EciesSession {
 			messages.push(CapturedMessage {
 				step: 1,
 				direction: Direction::ServerToClient,
-				payload: server_handshake.clone(),
+				payload: server_handshake.to_owned(),
 			});
 
 			// Step 2: Client Key Exchange (C -> S)
@@ -545,7 +564,7 @@ impl HandshakeProtocol for EciesSession {
 			messages.push(CapturedMessage {
 				step: 2,
 				direction: Direction::ClientToServer,
-				payload: client_kex.clone(),
+				payload: client_kex.to_owned(),
 			});
 
 			// Step 3: Server processes KEX (no message, but completes handshake)
@@ -650,7 +669,7 @@ impl HandshakeProtocol for Aes128EciesSession {
 			messages.push(CapturedMessage {
 				step: 0,
 				direction: Direction::ClientToServer,
-				payload: client_hello.clone(),
+				payload: client_hello.to_owned(),
 			});
 
 			// Step 1: Server Handshake (S -> C)
@@ -658,7 +677,7 @@ impl HandshakeProtocol for Aes128EciesSession {
 			messages.push(CapturedMessage {
 				step: 1,
 				direction: Direction::ServerToClient,
-				payload: server_handshake.clone(),
+				payload: server_handshake.to_owned(),
 			});
 
 			// Step 2: Client Key Exchange (C -> S)
@@ -666,7 +685,7 @@ impl HandshakeProtocol for Aes128EciesSession {
 			messages.push(CapturedMessage {
 				step: 2,
 				direction: Direction::ClientToServer,
-				payload: client_kex.clone(),
+				payload: client_kex.to_owned(),
 			});
 
 			// Step 3: Server processes KEX (completes handshake)
@@ -763,7 +782,7 @@ impl CmsSession {
 		}
 
 		// Set client certificate on server for mutual auth
-		server.set_client_certificate((*client_cert).clone()).ok();
+		server.set_client_certificate((*client_cert).to_owned()).ok();
 
 		Self { client, server }
 	}
@@ -785,7 +804,7 @@ impl HandshakeProtocol for CmsSession {
 			messages.push(CapturedMessage {
 				step: 0,
 				direction: Direction::ClientToServer,
-				payload: key_exchange.clone(),
+				payload: key_exchange.to_owned(),
 			});
 
 			// Step 1: Server processes KEX (internal)
@@ -796,7 +815,7 @@ impl HandshakeProtocol for CmsSession {
 			messages.push(CapturedMessage {
 				step: 2,
 				direction: Direction::ServerToClient,
-				payload: server_finished.clone(),
+				payload: server_finished.to_owned(),
 			});
 
 			// Step 3: Client processes Server Finished (internal)
@@ -807,7 +826,7 @@ impl HandshakeProtocol for CmsSession {
 			messages.push(CapturedMessage {
 				step: 4,
 				direction: Direction::ClientToServer,
-				payload: client_finished.clone(),
+				payload: client_finished.to_owned(),
 			});
 
 			// Step 5: Server processes Client Finished
@@ -842,6 +861,7 @@ impl HandshakeProtocol for CmsSession {
 					// Run step 0-1 normally, then inject at ServerFinished
 					let key_exchange = self.client.build_key_exchange(session_key, None)?;
 					self.server.process_key_exchange(&key_exchange).await?;
+
 					// Now inject the message as server finished
 					match self.client.process_server_finished(&msg) {
 						Ok(_) => Ok(InjectionOutcome::Accepted),
@@ -852,8 +872,10 @@ impl HandshakeProtocol for CmsSession {
 					// Run steps 0-3 normally, then inject at ClientFinished
 					let key_exchange = self.client.build_key_exchange(session_key, None)?;
 					self.server.process_key_exchange(&key_exchange).await?;
+
 					let server_finished = self.server.build_server_finished().await?;
 					self.client.process_server_finished(&server_finished)?;
+
 					// Now inject the message as client finished
 					match self.server.process_client_finished(&msg) {
 						Ok(_) => Ok(InjectionOutcome::Accepted),

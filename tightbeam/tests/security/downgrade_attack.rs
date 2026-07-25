@@ -58,43 +58,43 @@ tb_process_spec! {
 	pub DowngradeAttackProcess,
 	events {
 		observable {
-			"downgrade_capture_strong",
-			"downgrade_capture_weak",
-			"downgrade_profiles_differ",
-			"downgrade_substitution_rejected"
+
+			DowngradeAttackSpec::downgrade_capture_strong,
+			DowngradeAttackSpec::downgrade_capture_weak,
+			DowngradeAttackSpec::downgrade_profiles_differ,
+			DowngradeAttackSpec::downgrade_substitution_rejected,
+			SecurityThreatHarness::harness_spawn_session,
+			SecurityThreatHarness::harness_spawn_ecies,
+			SecurityThreatHarness::harness_spawn_cms,
+			SecurityThreatHarness::harness_spawn_weak,
+			SecurityThreatHarness::harness_spawn_ecies_weak,
+			SecurityThreatHarness::harness_spawn_cms_weak
 		}
-		hidden {
-			"harness_spawn_session",
-			"harness_spawn_ecies",
-			"harness_spawn_cms",
-			"harness_spawn_weak",
-			"harness_spawn_ecies_weak",
-			"harness_spawn_cms_weak"
-		}
+		hidden { }
 	}
 	states {
 		Idle => {
-			"harness_spawn_session" => SpawningStrong,
-			"harness_spawn_weak" => SpawningWeak
+			SecurityThreatHarness::harness_spawn_session => SpawningStrong,
+			SecurityThreatHarness::harness_spawn_weak => SpawningWeak
 		},
 		SpawningStrong => {
-			"harness_spawn_ecies" => StrongReady,
-			"harness_spawn_cms" => StrongReady
+			SecurityThreatHarness::harness_spawn_ecies => StrongReady,
+			SecurityThreatHarness::harness_spawn_cms => StrongReady
 		},
-		StrongReady => { "downgrade_capture_strong" => StrongCaptured },
-		StrongCaptured => { "harness_spawn_weak" => SpawningWeak },
+		StrongReady => { DowngradeAttackSpec::downgrade_capture_strong => StrongCaptured },
+		StrongCaptured => { SecurityThreatHarness::harness_spawn_weak => SpawningWeak },
 		SpawningWeak => {
-			"harness_spawn_ecies_weak" => WeakReady,
-			"harness_spawn_cms_weak" => WeakReady
+			SecurityThreatHarness::harness_spawn_ecies_weak => WeakReady,
+			SecurityThreatHarness::harness_spawn_cms_weak => WeakReady
 		},
-		WeakReady => { "downgrade_capture_weak" => WeakCaptured },
-		WeakCaptured => { "downgrade_profiles_differ" => ProfilesDiffer },
-		ProfilesDiffer => { "harness_spawn_session" => SpawningAttack },
+		WeakReady => { DowngradeAttackSpec::downgrade_capture_weak => WeakCaptured },
+		WeakCaptured => { DowngradeAttackSpec::downgrade_profiles_differ => ProfilesDiffer },
+		ProfilesDiffer => { SecurityThreatHarness::harness_spawn_session => SpawningAttack },
 		SpawningAttack => {
-			"harness_spawn_ecies" => AttackReady,
-			"harness_spawn_cms" => AttackReady
+			SecurityThreatHarness::harness_spawn_ecies => AttackReady,
+			SecurityThreatHarness::harness_spawn_cms => AttackReady
 		},
-		AttackReady => { "downgrade_substitution_rejected" => Idle }
+		AttackReady => { DowngradeAttackSpec::downgrade_substitution_rejected => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Downgrade attack: AES-256 vs AES-128 cross-session substitution" }
@@ -117,7 +117,6 @@ job! {
 	name: DowngradeAttackScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-
 		for kind in HandshakeBackendKind::all() {
 			// ========================================
 			// Step 1: Capture STRONG handshake (AES-256-GCM)
@@ -162,7 +161,6 @@ job! {
 			// Inject WEAK hello into a STRONG session
 			// ========================================
 			let mut attack_session = harness.spawn(kind);
-
 			match attack_session.inject_at_step(weak_hello.step, &weak_hello.payload).await? {
 				InjectionOutcome::Rejected(_) => {
 					// Downgrade substitution rejected - the strong server's

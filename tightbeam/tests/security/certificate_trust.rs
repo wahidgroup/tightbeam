@@ -47,11 +47,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub CertificateTrustProcess,
 	events {
-		observable { "untrusted_cert_rejected" }
+		observable { CertificateTrustSpec::untrusted_cert_rejected }
 		hidden { }
 	}
 	states {
-		Idle => { "untrusted_cert_rejected" => Done },
+		Idle => { CertificateTrustSpec::untrusted_cert_rejected => Done },
 		Done => { }
 	}
 	terminal { Done }

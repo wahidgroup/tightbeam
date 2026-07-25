@@ -48,32 +48,32 @@ tb_process_spec! {
 	pub ReplayAttackProcess,
 	events {
 		observable {
-			"replay_initial_handshake",
-			"replay_attempt",
-			"replay_detected",
-			"replay_rejected"
+
+			ReplayAttackSpec::replay_initial_handshake,
+			ReplayAttackSpec::replay_attempt,
+			ReplayAttackSpec::replay_detected,
+			ReplayAttackSpec::replay_rejected,
+			SecurityThreatHarness::harness_spawn_session,
+			SecurityThreatHarness::harness_spawn_ecies,
+			SecurityThreatHarness::harness_spawn_cms
 		}
-		hidden {
-			"harness_spawn_session",
-			"harness_spawn_ecies",
-			"harness_spawn_cms"
-		}
+		hidden { }
 	}
 	states {
-		Idle => { "harness_spawn_session" => Spawning },
+		Idle => { SecurityThreatHarness::harness_spawn_session => Spawning },
 		Spawning => {
-			"harness_spawn_ecies" => SessionReady,
-			"harness_spawn_cms" => SessionReady
+			SecurityThreatHarness::harness_spawn_ecies => SessionReady,
+			SecurityThreatHarness::harness_spawn_cms => SessionReady
 		},
-		SessionReady => { "replay_initial_handshake" => Established },
-		Established => { "harness_spawn_session" => SpawningAttack },
+		SessionReady => { ReplayAttackSpec::replay_initial_handshake => Established },
+		Established => { SecurityThreatHarness::harness_spawn_session => SpawningAttack },
 		SpawningAttack => {
-			"harness_spawn_ecies" => AttackSessionReady,
-			"harness_spawn_cms" => AttackSessionReady
+			SecurityThreatHarness::harness_spawn_ecies => AttackSessionReady,
+			SecurityThreatHarness::harness_spawn_cms => AttackSessionReady
 		},
-		AttackSessionReady => { "replay_attempt" => AttackObserved },
-		AttackObserved => { "replay_detected" => ReplaySuppressed },
-		ReplaySuppressed => { "replay_rejected" => Idle }
+		AttackSessionReady => { ReplayAttackSpec::replay_attempt => AttackObserved },
+		AttackObserved => { ReplayAttackSpec::replay_detected => ReplaySuppressed },
+		ReplaySuppressed => { ReplayAttackSpec::replay_rejected => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Replay attack detection state machine" }

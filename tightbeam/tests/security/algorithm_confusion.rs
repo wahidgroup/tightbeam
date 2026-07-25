@@ -54,11 +54,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub AlgorithmConfusionProcess,
 	events {
-		observable { "foreign_oid_rejected" }
+		observable { AlgorithmConfusionSpec::foreign_oid_rejected }
 		hidden { }
 	}
 	states {
-		Idle => { "foreign_oid_rejected" => Done },
+		Idle => { AlgorithmConfusionSpec::foreign_oid_rejected => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -86,13 +86,11 @@ job! {
 		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
 
 		let message: &[u8] = b"tbs-certificate-bytes";
-		let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, message)
-			.map_err(|_| expectation_failure("signing failed"))?;
+		let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, message).map_err(|_| expectation_failure("signing failed"))?;
 		let signature_bytes = signature.to_bytes();
 
-		let policy = Secp256k1Policy;
-
 		// The signature genuinely verifies under the real secp256k1 ECDSA OID.
+		let policy = Secp256k1Policy;
 		policy
 			.verify_signature(&SIGNER_ECDSA_WITH_SHA3_256, &spki_der, message, signature_bytes.as_ref())
 			.map_err(|_| expectation_failure("baseline verification under the genuine OID failed"))?;

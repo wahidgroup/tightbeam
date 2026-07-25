@@ -1,10 +1,58 @@
 use std::sync::Arc;
 
-use crate::asn1::Frame;
+use crate::asn1::{
+	AlgorithmIdentifier, AlgorithmIdentifierOwned, DigestInfo, EncryptedContentInfo, Frame, ObjectIdentifier,
+	OctetString, SignerInfo,
+};
 use crate::der::Sequence;
+use crate::oids::{COMPRESSION_CONTENT, HASH_SHA256, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+use crate::{decode, Message};
+
+#[cfg(not(feature = "derive"))]
+use crate::Version;
 
 #[cfg(feature = "derive")]
 use crate::Beamable;
+
+#[cfg(feature = "aead")]
+mod aead {
+	pub use crate::crypto::aead::{Aes256Gcm, KeyInit};
+	pub use crate::crypto::common::Key;
+}
+
+#[cfg(feature = "aead")]
+use aead::*;
+
+#[cfg(any(
+	all(feature = "digest", feature = "sha3"),
+	all(feature = "secp256k1", feature = "signature", feature = "x509")
+))]
+mod hash {
+	pub use crate::crypto::hash::Sha3_256;
+}
+
+#[cfg(any(
+	all(feature = "digest", feature = "sha3"),
+	all(feature = "secp256k1", feature = "signature", feature = "x509")
+))]
+use hash::*;
+
+#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
+mod random_id {
+	pub use crate::crypto::hash::Digest;
+	pub use crate::random::generate_random_bytes;
+}
+
+#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
+use random_id::*;
+
+#[cfg(feature = "x509")]
+mod x509_certs {
+	pub use crate::x509::Certificate;
+}
+
+#[cfg(feature = "x509")]
+use x509_certs::*;
 
 /// Simple test message
 #[cfg(feature = "derive")]
@@ -21,12 +69,12 @@ pub struct TestMessage {
 }
 
 #[cfg(not(feature = "derive"))]
-impl crate::Message for TestMessage {
+impl Message for TestMessage {
 	const MUST_BE_NON_REPUDIABLE: bool = false;
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: crate::Version = crate::Version::V0;
+	const MIN_VERSION: Version = Version::V0;
 }
 
 #[cfg(feature = "derive")]
@@ -43,12 +91,12 @@ pub struct ConfidentialNote {
 }
 
 #[cfg(not(feature = "derive"))]
-impl crate::Message for ConfidentialNote {
+impl Message for ConfidentialNote {
 	const MUST_BE_CONFIDENTIAL: bool = true;
 	const MUST_BE_NON_REPUDIABLE: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: crate::Version = crate::Version::V0;
+	const MIN_VERSION: Version = Version::V0;
 }
 
 #[cfg(feature = "derive")]
@@ -72,23 +120,23 @@ pub struct ConfidentialNonrepudiableNote {
 }
 
 #[cfg(not(feature = "derive"))]
-impl crate::Message for ConfidentialNonrepudiableNote {
+impl Message for ConfidentialNonrepudiableNote {
 	const MUST_BE_CONFIDENTIAL: bool = true;
 	const MUST_BE_NON_REPUDIABLE: bool = true;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
-	const MIN_VERSION: crate::Version = crate::Version::V0;
+	const MIN_VERSION: Version = Version::V0;
 }
 
 #[cfg(not(feature = "derive"))]
-impl crate::Message for IntegralNote {
+impl Message for IntegralNote {
 	const MUST_BE_NON_REPUDIABLE: bool = false;
 	const MUST_BE_CONFIDENTIAL: bool = false;
 	const MUST_BE_COMPRESSED: bool = false;
 	const MUST_BE_PRIORITIZED: bool = false;
 	const MUST_HAVE_MESSAGE_INTEGRITY: bool = true;
 	const MUST_HAVE_FRAME_INTEGRITY: bool = true;
-	const MIN_VERSION: crate::Version = crate::Version::V0;
+	const MIN_VERSION: Version = Version::V0;
 }
 
 pub fn create_test_message(content: Option<&str>) -> TestMessage {
@@ -100,7 +148,6 @@ pub fn create_test_message(content: Option<&str>) -> TestMessage {
 pub fn create_v0_tightbeam(content: Option<&str>, id: Option<&str>) -> Frame {
 	let message = create_test_message(content);
 
-	// Get current time
 	#[cfg(feature = "std")]
 	let order = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -110,12 +157,8 @@ pub fn create_v0_tightbeam(content: Option<&str>, id: Option<&str>) -> Frame {
 	#[cfg(not(feature = "std"))]
 	let order: u64 = 1_700_000_000;
 
-	// Get a random id
 	#[cfg(all(feature = "std", feature = "digest", feature = "random"))]
 	let id = id.unwrap_or({
-		use crate::crypto::hash::{Digest, Sha3_256};
-		use crate::random::generate_random_bytes;
-
 		let mut bytes: [u8; 32] = [0; 32];
 		generate_random_bytes(&mut bytes, None).expect("Failed to generate random bytes");
 
@@ -134,7 +177,7 @@ pub fn create_v0_tightbeam(content: Option<&str>, id: Option<&str>) -> Frame {
 	};
 
 	#[cfg(not(feature = "derive"))]
-	let result = crate::Frame::new_v0(id, order, &message);
+	let result = Frame::new_v0(id, order, &message);
 
 	result.expect("Failed to create TightBeam message")
 }
@@ -142,8 +185,6 @@ pub fn create_v0_tightbeam(content: Option<&str>, id: Option<&str>) -> Frame {
 /// Build a V1 frame carrying a Sha3-256 frame integrity (FI) digest.
 #[cfg(all(feature = "builder", feature = "digest", feature = "sha3"))]
 pub fn create_frame_with_frame_integrity() -> Frame {
-	use crate::crypto::hash::Sha3_256;
-
 	let message = create_test_message(None);
 	compose! {
 		V1: id: "fi-frame",
@@ -155,85 +196,109 @@ pub fn create_frame_with_frame_integrity() -> Frame {
 }
 
 #[cfg(all(feature = "secp256k1", feature = "signature"))]
-pub fn create_test_signing_key() -> k256::ecdsa::SigningKey {
-	let secret_bytes = [1u8; 32];
-	crate::crypto::sign::ecdsa::SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
+mod signing {
+	pub use k256::ecdsa::SigningKey;
+}
+
+#[cfg(all(feature = "secp256k1", feature = "signature"))]
+use signing::*;
+
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+mod cert {
+	pub use crate::crypto::sign::ecdsa::{Secp256k1, Signature};
+	pub use crate::crypto::sign::sign_canonical;
+	pub use crate::der::asn1::{BitString, PrintableString, SetOfVec, UtcTime};
+	pub use crate::der::oid::AssociatedOid;
+	pub use crate::der::{Any, Decode, Encode};
+	pub use crate::error::Result as TbResult;
+	pub use crate::spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
+	pub use crate::x509::attr::AttributeTypeAndValue;
+	pub use crate::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
+	pub use crate::x509::ext::Extension;
+	pub use crate::x509::name::{RdnSequence, RelativeDistinguishedName};
+	pub use crate::x509::serial_number::SerialNumber;
+	pub use crate::x509::time::{Time, Validity};
+	pub use crate::x509::{TbsCertificate, Version as X509Version};
+	pub use core::time::Duration;
 }
 
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-pub fn create_test_certificate(signing_key: &k256::ecdsa::SigningKey) -> crate::x509::Certificate {
-	use crate::der::Decode;
-	use crate::spki::EncodePublicKey;
+use cert::*;
 
+#[cfg(all(feature = "secp256k1", feature = "signature"))]
+pub fn create_test_signing_key() -> SigningKey {
+	let secret_bytes = [1u8; 32];
+	SigningKey::from_bytes(&secret_bytes.into()).expect("Failed to create signing key")
+}
+
+/// Fixed test validity window: epoch through a far-future UtcTime.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_validity() -> TbResult<Validity> {
+	let not_before = Time::UtcTime(UtcTime::from_unix_duration(Duration::from_secs(0))?);
+	let not_after = Time::UtcTime(UtcTime::from_unix_duration(Duration::from_secs(2_000_000_000))?);
+	let validity = Validity { not_before, not_after };
+	Ok(validity)
+}
+
+/// ECDSA-with-SHA3-256 algorithm identifier used by the test cert fixtures.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_signature_algorithm() -> AlgorithmIdentifierOwned {
+	AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None }
+}
+
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+pub fn create_test_certificate(signing_key: &SigningKey) -> Certificate {
 	let verifying_key = *signing_key.verifying_key();
 	let public_key_der = verifying_key
 		.to_public_key_der()
 		.expect("test verifying key encodes to SPKI DER");
+	let subject_public_key_info =
+		SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes()).expect("freshly encoded SPKI re-decodes");
+	let algorithm = test_signature_algorithm();
+	let validity = test_validity().expect("fixed test validity window is valid");
+	let empty_name = RdnSequence::default();
+	let serial_number = SerialNumber::new(&[1]).expect("single-byte serial is valid");
+	let signature = BitString::new(0, vec![0; 64]).expect("64-byte placeholder is a valid BitString");
 
-	let tbs_cert = crate::x509::TbsCertificate {
-		version: crate::x509::Version::V3,
-		serial_number: crate::x509::serial_number::SerialNumber::new(&[1]).expect("single-byte serial is valid"),
-		signature: crate::spki::AlgorithmIdentifierOwned {
-			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
-			parameters: None,
-		},
-		issuer: x509_cert::name::RdnSequence::default(),
-		validity: crate::x509::time::Validity {
-			not_before: crate::x509::time::Time::UtcTime(
-				crate::der::asn1::UtcTime::from_unix_duration(core::time::Duration::from_secs(0))
-					.expect("epoch is a valid UtcTime"),
-			),
-			not_after: crate::x509::time::Time::UtcTime(
-				crate::der::asn1::UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000))
-					.expect("fixed not-after is a valid UtcTime"),
-			),
-		},
-		subject: x509_cert::name::RdnSequence::default(),
-		subject_public_key_info: crate::spki::SubjectPublicKeyInfoOwned::from_der(public_key_der.as_bytes())
-			.expect("freshly encoded SPKI re-decodes"),
+	let tbs_certificate = TbsCertificate {
+		version: X509Version::V3,
+		serial_number,
+		signature: algorithm.to_owned(),
+		issuer: empty_name.to_owned(),
+		validity,
+		subject: empty_name,
+		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		extensions: None,
 	};
 
-	crate::x509::Certificate {
-		tbs_certificate: tbs_cert,
-		signature_algorithm: crate::spki::AlgorithmIdentifierOwned {
-			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
-			parameters: None,
-		},
-		signature: crate::der::asn1::BitString::new(0, vec![0; 64]).expect("64-byte placeholder is a valid BitString"),
-	}
+	Certificate { tbs_certificate, signature_algorithm: algorithm, signature }
 }
 
 /// Wrap a DER-encodable extension value in an `Extension` (RFC 5280 §4.2).
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-fn test_extension<T>(value: &T) -> crate::x509::ext::Extension
+fn test_extension<T>(value: &T) -> Extension
 where
-	T: crate::der::oid::AssociatedOid + crate::der::Encode,
+	T: AssociatedOid + Encode,
 {
-	crate::x509::ext::Extension {
-		extn_id: T::OID,
-		critical: true,
-		extn_value: crate::der::asn1::OctetString::new(value.to_der().expect("extension value encodes to DER"))
-			.expect("DER bytes wrap in an OctetString"),
-	}
+	let extn_value = OctetString::new(value.to_der().expect("extension value encodes to DER"))
+		.expect("DER bytes wrap in an OctetString");
+	Extension { extn_id: T::OID, critical: true, extn_value }
 }
 
 /// Build CA issuer extensions: `basicConstraints` (RFC 5280 §4.2.1.9) and
 /// `keyUsage` (§4.2.1.3), as required for certificate-path validation.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-pub fn ca_extensions(ca: bool, key_cert_sign: bool, path_len: Option<u8>) -> Vec<crate::x509::ext::Extension> {
-	use crate::x509::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
-
+pub fn ca_extensions(ca: bool, key_cert_sign: bool, path_len: Option<u8>) -> Vec<Extension> {
 	let basic_constraints = BasicConstraints { ca, path_len_constraint: path_len };
 	let usage = if key_cert_sign {
 		KeyUsages::KeyCertSign
 	} else {
 		KeyUsages::DigitalSignature
 	};
-	let key_usage = KeyUsage(usage.into());
 
+	let key_usage = KeyUsage(usage.into());
 	vec![test_extension(&basic_constraints), test_extension(&key_usage)]
 }
 
@@ -241,59 +306,100 @@ pub fn ca_extensions(ca: bool, key_cert_sign: bool, path_len: Option<u8>) -> Vec
 /// truncation window.
 #[cfg(all(feature = "digest", feature = "sha3"))]
 #[derive(Clone, Default)]
-pub struct SixteenByteDigest(crate::crypto::hash::Sha3_256);
+pub struct SixteenByteDigest(Sha3_256);
 
 #[cfg(all(feature = "digest", feature = "sha3"))]
 mod sixteen_byte_digest {
 	use super::SixteenByteDigest;
+	use crate::asn1::ObjectIdentifier;
 	use crate::der::oid::AssociatedOid;
+	use crate::oids::HASH_SHA256;
+	use digest::{FixedOutput, FixedOutputReset, HashMarker, Output, OutputSizeUser, Reset, Update};
 
-	impl digest::Update for SixteenByteDigest {
+	impl Update for SixteenByteDigest {
 		fn update(&mut self, data: &[u8]) {
-			digest::Update::update(&mut self.0, data);
+			Update::update(&mut self.0, data);
 		}
 	}
 
-	impl digest::OutputSizeUser for SixteenByteDigest {
+	impl OutputSizeUser for SixteenByteDigest {
 		type OutputSize = digest::consts::U16;
 	}
 
-	impl digest::FixedOutput for SixteenByteDigest {
-		fn finalize_into(self, out: &mut digest::Output<Self>) {
-			let full = digest::FixedOutput::finalize_fixed(self.0);
+	impl FixedOutput for SixteenByteDigest {
+		fn finalize_into(self, out: &mut Output<Self>) {
+			let full = FixedOutput::finalize_fixed(self.0);
 			out.copy_from_slice(&full[..16]);
 		}
 	}
 
-	impl digest::Reset for SixteenByteDigest {
+	impl Reset for SixteenByteDigest {
 		fn reset(&mut self) {
-			digest::Reset::reset(&mut self.0);
+			Reset::reset(&mut self.0);
 		}
 	}
 
-	impl digest::FixedOutputReset for SixteenByteDigest {
-		fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
-			let full = digest::FixedOutputReset::finalize_fixed_reset(&mut self.0);
+	impl FixedOutputReset for SixteenByteDigest {
+		fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
+			let full = FixedOutputReset::finalize_fixed_reset(&mut self.0);
 			out.copy_from_slice(&full[..16]);
 		}
 	}
 
-	impl digest::HashMarker for SixteenByteDigest {}
+	impl HashMarker for SixteenByteDigest {}
 
 	impl AssociatedOid for SixteenByteDigest {
-		const OID: crate::der::asn1::ObjectIdentifier = crate::oids::HASH_SHA256;
+		const OID: ObjectIdentifier = HASH_SHA256;
 	}
 }
 
 /// A certificate chain with root -> intermediate -> leaf certificates.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
 pub struct TestCertificateChain {
-	pub root: crate::x509::Certificate,
-	pub intermediate: crate::x509::Certificate,
-	pub leaf: crate::x509::Certificate,
-	pub root_key: k256::ecdsa::SigningKey,
-	pub intermediate_key: k256::ecdsa::SigningKey,
-	pub leaf_key: k256::ecdsa::SigningKey,
+	pub root: Certificate,
+	pub intermediate: Certificate,
+	pub leaf: Certificate,
+	pub root_key: SigningKey,
+	pub intermediate_key: SigningKey,
+	pub leaf_key: SigningKey,
+}
+
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+impl TestCertificateChain {
+	/// Shared `[root, intermediate, leaf]` slice for handshake chain plumbing.
+	pub fn to_arc(&self) -> Arc<[Certificate]> {
+		Arc::from([self.root.to_owned(), self.intermediate.to_owned(), self.leaf.to_owned()])
+	}
+}
+
+/// Single-AVA `CN=<cn>` distinguished name for test certificates.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn test_cn_name(cn: &str) -> TbResult<RdnSequence> {
+	let cn_oid = ObjectIdentifier::new_unwrap("2.5.4.3");
+	let cn_str = PrintableString::new(cn)?;
+	let attr = AttributeTypeAndValue { oid: cn_oid, value: Any::from(&cn_str) };
+	let rdn = RelativeDistinguishedName::from(SetOfVec::try_from(vec![attr])?);
+
+	let name = RdnSequence::from(vec![rdn]);
+	Ok(name)
+}
+
+/// Sign `tbs` with `key` under the test ECDSA-SHA3-256 algorithm.
+#[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
+fn sign_test_certificate(
+	tbs: TbsCertificate,
+	algorithm: &AlgorithmIdentifierOwned,
+	key: &SigningKey,
+) -> TbResult<Certificate> {
+	let tbs_der = tbs.to_der()?;
+	let signature: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(key, &tbs_der)?;
+
+	let certificate = Certificate {
+		tbs_certificate: tbs,
+		signature_algorithm: algorithm.to_owned(),
+		signature: BitString::new(0, signature.to_vec())?,
+	};
+	Ok(certificate)
 }
 
 /// Create a valid certificate chain: root -> intermediate -> leaf.
@@ -304,131 +410,79 @@ pub struct TestCertificateChain {
 ///
 /// Returns an error if key material, DER encoding, or signing fails.
 #[cfg(all(feature = "secp256k1", feature = "signature", feature = "x509"))]
-pub fn create_test_certificate_chain() -> crate::error::Result<TestCertificateChain> {
-	use crate::crypto::hash::Sha3_256;
-	use crate::crypto::sign::ecdsa::{Secp256k1, Signature, SigningKey};
-	use crate::crypto::sign::sign_canonical;
-	use crate::der::asn1::{BitString, UtcTime};
-	use crate::der::{Decode, Encode};
-	use crate::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
-	use crate::x509::name::RdnSequence;
-	use crate::x509::serial_number::SerialNumber;
-	use crate::x509::time::{Time, Validity};
-	use crate::x509::{Certificate, TbsCertificate, Version};
-
-	use crate::der::asn1::{PrintableString, SetOfVec};
-	use crate::x509::attr::AttributeTypeAndValue;
-	use crate::x509::name::RelativeDistinguishedName;
-
-	// Generate keys for each level
+pub fn create_test_certificate_chain() -> TbResult<TestCertificateChain> {
 	let root_key = SigningKey::from_bytes(&[1u8; 32].into())?;
 	let intermediate_key = SigningKey::from_bytes(&[2u8; 32].into())?;
 	let leaf_key = SigningKey::from_bytes(&[3u8; 32].into())?;
 
-	// Create unique Subject DNs for each certificate (CN=Root, CN=Intermediate, CN=Leaf)
-	let cn_oid = crate::der::oid::ObjectIdentifier::new_unwrap("2.5.4.3"); // commonName
+	let root_name = test_cn_name("Root")?;
+	let inter_name = test_cn_name("Intermediate")?;
+	let leaf_name = test_cn_name("Leaf")?;
 
-	let root_cn_str = PrintableString::new("Root")?;
-	let root_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&root_cn_str) };
-	let root_name = RdnSequence::from(vec![RelativeDistinguishedName::from(SetOfVec::try_from(vec![root_cn])?)]);
-
-	let inter_cn_str = PrintableString::new("Intermediate")?;
-	let inter_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&inter_cn_str) };
-	let inter_name = RdnSequence::from(vec![RelativeDistinguishedName::from(SetOfVec::try_from(vec![inter_cn])?)]);
-
-	let leaf_cn_str = PrintableString::new("Leaf")?;
-	let leaf_cn = AttributeTypeAndValue { oid: cn_oid, value: crate::der::Any::from(&leaf_cn_str) };
-	let leaf_name = RdnSequence::from(vec![RelativeDistinguishedName::from(SetOfVec::try_from(vec![leaf_cn])?)]);
-
-	// Common validity period
-	let validity = Validity {
-		not_before: Time::UtcTime(UtcTime::from_unix_duration(core::time::Duration::from_secs(0))?),
-		not_after: Time::UtcTime(UtcTime::from_unix_duration(core::time::Duration::from_secs(2_000_000_000))?),
-	};
-
-	let algorithm = AlgorithmIdentifierOwned { oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
+	let validity = test_validity()?;
+	let algorithm = test_signature_algorithm();
 
 	// Root certificate (self-signed)
 	let root_pub_der = root_key.verifying_key().to_public_key_der()?;
+	let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes())?;
 	let root_tbs = TbsCertificate {
-		version: Version::V3,
+		version: X509Version::V3,
 		serial_number: SerialNumber::new(&[1])?,
-		signature: algorithm.clone(),
-		issuer: root_name.clone(),
+		signature: algorithm.to_owned(),
+		issuer: root_name.to_owned(),
 		validity,
-		subject: root_name.clone(),
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(root_pub_der.as_bytes())?,
+		subject: root_name.to_owned(),
+		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		// RFC 5280 §6.1.4(k),(n): root is a CA permitted to sign certificates.
 		extensions: Some(ca_extensions(true, true, None)),
 	};
-	let root_tbs_der = root_tbs.to_der()?;
-	let root_sig: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(&root_key, &root_tbs_der)?;
-	let root = Certificate {
-		tbs_certificate: root_tbs,
-		signature_algorithm: algorithm.clone(),
-		signature: BitString::new(0, root_sig.to_vec())?,
-	};
+	let root = sign_test_certificate(root_tbs, &algorithm, &root_key)?;
 
 	// Intermediate certificate (signed by root)
 	let inter_pub_der = intermediate_key.verifying_key().to_public_key_der()?;
+	let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes())?;
 	let inter_tbs = TbsCertificate {
-		version: Version::V3,
+		version: X509Version::V3,
 		serial_number: SerialNumber::new(&[2])?,
-		signature: algorithm.clone(),
+		signature: algorithm.to_owned(),
 		issuer: root_name,
 		validity,
-		subject: inter_name.clone(),
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(inter_pub_der.as_bytes())?,
+		subject: inter_name.to_owned(),
+		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		// RFC 5280 §6.1.4(k),(n): intermediate is a CA permitted to sign certificates.
 		extensions: Some(ca_extensions(true, true, None)),
 	};
-	let inter_tbs_der = inter_tbs.to_der()?;
-	let inter_sig: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(&root_key, &inter_tbs_der)?;
-	let intermediate = Certificate {
-		tbs_certificate: inter_tbs,
-		signature_algorithm: algorithm.clone(),
-		signature: BitString::new(0, inter_sig.to_vec())?,
-	};
+	let intermediate = sign_test_certificate(inter_tbs, &algorithm, &root_key)?;
 
 	// Leaf certificate (signed by intermediate)
 	let leaf_pub_der = leaf_key.verifying_key().to_public_key_der()?;
+	let subject_public_key_info = SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes())?;
 	let leaf_tbs = TbsCertificate {
-		version: Version::V3,
+		version: X509Version::V3,
 		serial_number: SerialNumber::new(&[3])?,
-		signature: algorithm.clone(),
+		signature: algorithm.to_owned(),
 		issuer: inter_name,
 		validity,
 		subject: leaf_name,
-		subject_public_key_info: SubjectPublicKeyInfoOwned::from_der(leaf_pub_der.as_bytes())?,
+		subject_public_key_info,
 		issuer_unique_id: None,
 		subject_unique_id: None,
 		extensions: None,
 	};
-	let leaf_tbs_der = leaf_tbs.to_der()?;
-	let leaf_sig: Signature<Secp256k1> = sign_canonical::<Sha3_256, _>(&intermediate_key, &leaf_tbs_der)?;
-	let leaf = Certificate {
-		tbs_certificate: leaf_tbs,
-		signature_algorithm: algorithm,
-		signature: BitString::new(0, leaf_sig.to_vec())?,
-	};
+	let leaf = sign_test_certificate(leaf_tbs, &algorithm, &intermediate_key)?;
 
 	Ok(TestCertificateChain { root, intermediate, leaf, root_key, intermediate_key, leaf_key })
 }
 
 #[cfg(feature = "aead")]
-pub fn create_test_cipher_key() -> (
-	crate::crypto::common::Key<crate::crypto::aead::Aes256Gcm>,
-	crate::crypto::aead::Aes256Gcm,
-) {
-	use crate::crypto::aead::KeyInit;
-
+pub fn create_test_cipher_key() -> (Key<Aes256Gcm>, Aes256Gcm) {
 	let key_bytes = [0x33; 32];
-	let key = crate::crypto::common::Key::<crate::crypto::aead::Aes256Gcm>::from(key_bytes);
-	let cipher = crate::crypto::aead::Aes256Gcm::new(&key);
+	let key = Key::<Aes256Gcm>::from(key_bytes);
+	let cipher = Aes256Gcm::new(&key);
 	(key, cipher)
 }
 
@@ -437,7 +491,7 @@ pub fn create_test_cipher_key() -> (
 /// This certificate (from ssl.com) expired on August 17, 2019.
 /// Useful for testing certificate expiry validation logic.
 #[cfg(feature = "x509")]
-pub fn create_expired_test_certificate() -> crate::x509::Certificate {
+pub fn create_expired_test_certificate() -> Certificate {
 	crate::pem! {"
 		-----BEGIN CERTIFICATE-----
 		MIIF1TCCBVugAwIBAgIQdBJ26pggQyU+isEPM912FDAKBggqhkjOPQQDAzByMQsw
@@ -477,14 +531,9 @@ pub fn create_expired_test_certificate() -> crate::x509::Certificate {
 	.expect("Failed to parse expired test certificate")
 }
 
-pub fn create_test_hash_info() -> crate::DigestInfo {
-	crate::DigestInfo {
-		algorithm: crate::AlgorithmIdentifier {
-			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"), // SHA-256
-			parameters: None,
-		},
-		digest: crate::asn1::OctetString::new(vec![0u8; 32]).expect("Failed to create OctetString"),
-	}
+pub fn create_test_hash_info() -> DigestInfo {
+	let digest = OctetString::new(vec![0u8; 32]).expect("Failed to create OctetString");
+	DigestInfo { algorithm: AlgorithmIdentifier { oid: HASH_SHA256, parameters: None }, digest }
 }
 
 /// Create a certificate and key pair that expires soon (within 24 hours).
@@ -493,8 +542,7 @@ pub fn create_test_hash_info() -> crate::DigestInfo {
 /// Note: This certificate was generated on 2025-11-09 and expires 2025-11-10.
 /// Tests using this will fail after the expiration date.
 #[cfg(all(feature = "x509", feature = "secp256k1", feature = "signature"))]
-pub fn create_expiring_test_certificate(
-) -> crate::error::Result<(crate::x509::Certificate, crate::crypto::sign::ecdsa::Secp256k1SigningKey)> {
+pub fn create_expiring_test_certificate() -> TbResult<(Certificate, SigningKey)> {
 	// Certificate that expires on 2025-11-10 06:35:40 UTC
 	let cert = crate::pem! {"
 		-----BEGIN CERTIFICATE-----
@@ -510,45 +558,49 @@ pub fn create_expiring_test_certificate(
 		-----END CERTIFICATE-----
 	"}?;
 
-	// Corresponding private key (fixed test key)
 	let key_bytes: [u8; 32] = [0x01; 32];
-	let signing_key = crate::crypto::sign::ecdsa::Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
+	let signing_key = SigningKey::from_bytes(&key_bytes.into())?;
 
 	Ok((cert, signing_key))
 }
 
-pub fn create_test_encryption_info() -> crate::EncryptedContentInfo {
-	crate::EncryptedContentInfo {
-		content_type: crate::oids::COMPRESSION_CONTENT,
-		content_enc_alg: crate::AlgorithmIdentifier {
-			oid: crate::der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.42"), // AES-256-GCM
-			parameters: None,
-		},
-		encrypted_content: Some(
-			crate::der::asn1::OctetString::new(vec![0u8; 12]).expect("12-byte placeholder wraps in an OctetString"),
-		),
+/// Historical fixture OID used by `create_test_encryption_info` (not
+/// [`crate::oids::AES_256_GCM`], which is a different identifier).
+const TEST_CONTENT_ENC_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.1.42");
+
+pub fn create_test_encryption_info() -> EncryptedContentInfo {
+	let encrypted_content = OctetString::new(vec![0u8; 12]).expect("12-byte placeholder wraps in an OctetString");
+	let content_enc_alg = AlgorithmIdentifier { oid: TEST_CONTENT_ENC_OID, parameters: None };
+
+	EncryptedContentInfo {
+		content_type: COMPRESSION_CONTENT,
+		content_enc_alg,
+		encrypted_content: Some(encrypted_content),
 	}
 }
 
-pub fn create_test_signer_info() -> crate::SignerInfo {
+pub fn create_test_signer_info() -> SignerInfo {
 	use crate::cms::content_info::CmsVersion;
 	use crate::cms::signed_data::SignerIdentifier;
-	use crate::der::asn1::OctetString;
 	use crate::x509::ext::pkix::SubjectKeyIdentifier;
 
-	let skid = SubjectKeyIdentifier::from(OctetString::new([0u8; 20]).expect("20-byte SKID wraps in an OctetString"));
+	let version = CmsVersion::V1;
+	let skid = OctetString::new([0u8; 20]).expect("20-byte SKID wraps in an OctetString");
+	let sid = SignerIdentifier::SubjectKeyIdentifier(SubjectKeyIdentifier::from(skid));
+	let digest_alg = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+	let signed_attrs = None;
+	let signature_algorithm = AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None };
+	let signature = OctetString::new([0u8; 64]).expect("64-byte placeholder wraps in an OctetString");
+	let unsigned_attrs = None;
 
-	crate::SignerInfo {
-		version: CmsVersion::V1,
-		sid: SignerIdentifier::SubjectKeyIdentifier(skid),
-		digest_alg: crate::AlgorithmIdentifierOwned { oid: crate::oids::HASH_SHA3_256, parameters: None },
-		signed_attrs: None,
-		signature_algorithm: crate::AlgorithmIdentifierOwned {
-			oid: crate::oids::SIGNER_ECDSA_WITH_SHA3_256,
-			parameters: None,
-		},
-		signature: OctetString::new([0u8; 64]).expect("64-byte placeholder wraps in an OctetString"),
-		unsigned_attrs: None,
+	SignerInfo {
+		version,
+		sid,
+		digest_alg,
+		signed_attrs,
+		signature_algorithm,
+		signature,
+		unsigned_attrs,
 	}
 }
 
@@ -613,7 +665,7 @@ macro_rules! test_builder {
 		#[test]
 		fn $test_name() -> $crate::error::Result<()> {
 			let $msg = $message;
-			let msg_clone = $msg.clone();
+			let msg_clone = $msg.to_owned();
 			let $builder: $builder_type = <$builder_type>::from($version);
 			let $frame_result = $setup_body;
 			let $msg_result = msg_clone;
@@ -630,19 +682,19 @@ pub trait ExpectedMatcher {
 	fn matches(&self, frame: &Frame) -> bool;
 }
 
-impl ExpectedMatcher for crate::Frame {
+impl ExpectedMatcher for Frame {
 	fn matches(&self, frame: &Frame) -> bool {
 		frame.metadata.id == self.metadata.id
 	}
 }
 
-impl ExpectedMatcher for Arc<crate::Frame> {
+impl ExpectedMatcher for Arc<Frame> {
 	fn matches(&self, frame: &Frame) -> bool {
 		self.metadata.id == frame.metadata.id
 	}
 }
 
-impl<E> ExpectedMatcher for Result<crate::Frame, E> {
+impl<E> ExpectedMatcher for Result<Frame, E> {
 	fn matches(&self, frame: &Frame) -> bool {
 		match self {
 			Ok(f) => frame.metadata.id == f.metadata.id,
@@ -653,10 +705,10 @@ impl<E> ExpectedMatcher for Result<crate::Frame, E> {
 
 impl<T> ExpectedMatcher for T
 where
-	T: crate::Message + PartialEq,
+	T: Message + PartialEq,
 {
 	fn matches(&self, frame: &Frame) -> bool {
-		if let Ok(decoded) = crate::decode::<T>(&frame.message) {
+		if let Ok(decoded) = decode::<T>(&frame.message) {
 			decoded == *self
 		} else {
 			false
@@ -946,11 +998,12 @@ mod tests {
 	use super::*;
 
 	use crate::builder::MetadataBuilder;
+	use crate::error::Result as TbResult;
 	use crate::{Metadata, Version};
 
 	#[test]
 	#[cfg(feature = "std")]
-	fn test_create_test_message() -> crate::error::Result<()> {
+	fn test_create_test_message() -> TbResult<()> {
 		let message = create_test_message(Some("Test content"));
 		assert_eq!(message.content, "Test content");
 		Ok(())

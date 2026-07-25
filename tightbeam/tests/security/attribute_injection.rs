@@ -1,7 +1,7 @@
 //! # Unsigned-attribute injection threat (CMS)
 //!
 //! ## Weakness
-//! RFC 5652 s11.4 places the receipt countersignature among the
+//! RFC 5652 s11.4 places the enveloped receipt acknowledgement among the
 //! *unsigned* attributes of the client Finished: no signature covers
 //! them, so an intermediary can add attributes without invalidating the
 //! message. If the server picks "the first" matching attribute, an
@@ -9,7 +9,7 @@
 //!
 //! ## Attack
 //! A MITM captures the client Finished `SignedData` and inserts a second
-//! `RECEIPT_SIGNATURE` unsigned attribute carrying a forged value. Every
+//! `RECEIPT_ACK` unsigned attribute carrying a forged value. Every
 //! signature on the message still verifies.
 //!
 //! ## Expected control
@@ -35,7 +35,7 @@ use tightbeam::cms::signed_data::SignedData;
 use tightbeam::der::asn1::SetOfVec;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::exactly;
-use tightbeam::oids::RECEIPT_SIGNATURE;
+use tightbeam::oids::RECEIPT_ACK;
 use tightbeam::tb_assert_spec;
 use tightbeam::tb_scenario;
 use tightbeam::testing::SetupEnv;
@@ -50,10 +50,10 @@ use crate::common::security::{
 
 const REQUEST: MuxBudgets = MuxBudgets { client_to_server: 64, server_to_client: 128 };
 
-/// Re-encode the client Finished with a second `RECEIPT_SIGNATURE`
-/// unsigned attribute carrying a forged value. No signature covers
-/// unsigned attributes, so the result stays signature-valid.
-fn inject_duplicate_receipt_signature(client_finished: &[u8]) -> Result<Vec<u8>, TightBeamError> {
+/// Re-encode the client Finished with a second `RECEIPT_ACK` unsigned
+/// attribute carrying a forged value. No signature covers unsigned
+/// attributes, so the result stays signature-valid.
+fn inject_duplicate_receipt_ack(client_finished: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 	let mut signed_data = SignedData::from_der(client_finished)?;
 	let mut signer_info = signed_data
 		.signer_infos
@@ -63,16 +63,17 @@ fn inject_duplicate_receipt_signature(client_finished: &[u8]) -> Result<Vec<u8>,
 		.cloned()
 		.ok_or_else(|| expectation_failure("client Finished must carry a SignerInfo"))?;
 
-	let forged_value = Any::encode_from(&OctetString::new(*b"forged-countersignature")?)?;
+	let forged_value = Any::encode_from(&OctetString::new(*b"forged-acknowledgement")?)?;
 	let mut values = SetOfVec::new();
 	values.insert(forged_value)?;
+
 	let mut attrs = signer_info
 		.unsigned_attrs
 		.take()
 		.ok_or_else(|| expectation_failure("client Finished must carry unsigned attributes"))?;
-	attrs.insert(Attribute { oid: RECEIPT_SIGNATURE, values })?;
-	signer_info.unsigned_attrs = Some(attrs);
+	attrs.insert(Attribute { oid: RECEIPT_ACK, values })?;
 
+	signer_info.unsigned_attrs = Some(attrs);
 	signed_data.signer_infos = vec![signer_info].try_into()?;
 	Ok(signed_data.to_der()?)
 }
@@ -90,10 +91,10 @@ tb_assert_spec! {
 	}
 }
 
-// A duplicate RECEIPT_SIGNATURE unsigned attribute passes every
-// signature check (nothing signs unsigned attributes), so the server's
-// single-use attribute rule is the only control: the receipt
-// acknowledgement must fail closed and the session must never activate.
+// A duplicate RECEIPT_ACK unsigned attribute passes every signature
+// check (nothing signs unsigned attributes), so the server's single-use
+// attribute rule is the only control: the receipt acknowledgement must
+// fail closed and the session must never activate.
 tb_scenario! {
 	name: cms_duplicate_receipt_attribute_fails_closed,
 	spec: AttributeInjectionSpec,
@@ -109,12 +110,13 @@ tb_scenario! {
 
 			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
 			server.process_key_exchange(&key_exchange).await?;
+
 			let server_finished = server.build_server_finished().await?;
 			client.process_server_finished(&server_finished)?;
-			let client_finished = client.build_client_finished().await?;
 
 			// The MITM injects the duplicate on the wire.
-			let tampered = inject_duplicate_receipt_signature(&client_finished)?;
+			let client_finished = client.build_client_finished().await?;
+			let tampered = inject_duplicate_receipt_ack(&client_finished)?;
 
 			// Signature verification cannot see the injection: the
 			// tampered Finished still authenticates.

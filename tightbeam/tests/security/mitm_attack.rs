@@ -54,32 +54,32 @@ tb_process_spec! {
 	pub MitmAttackProcess,
 	events {
 		observable {
-			"mitm_capture_handshake",
-			"mitm_tamper_message",
-			"mitm_inject_tampered",
-			"mitm_tampering_detected"
+
+			MitmAttackSpec::mitm_capture_handshake,
+			MitmAttackSpec::mitm_tamper_message,
+			MitmAttackSpec::mitm_inject_tampered,
+			MitmAttackSpec::mitm_tampering_detected,
+			SecurityThreatHarness::harness_spawn_session,
+			SecurityThreatHarness::harness_spawn_ecies,
+			SecurityThreatHarness::harness_spawn_cms
 		}
-		hidden {
-			"harness_spawn_session",
-			"harness_spawn_ecies",
-			"harness_spawn_cms"
-		}
+		hidden { }
 	}
 	states {
-		Idle => { "harness_spawn_session" => SpawningCapture },
+		Idle => { SecurityThreatHarness::harness_spawn_session => SpawningCapture },
 		SpawningCapture => {
-			"harness_spawn_ecies" => CaptureReady,
-			"harness_spawn_cms" => CaptureReady
+			SecurityThreatHarness::harness_spawn_ecies => CaptureReady,
+			SecurityThreatHarness::harness_spawn_cms => CaptureReady
 		},
-		CaptureReady => { "mitm_capture_handshake" => Captured },
-		Captured => { "mitm_tamper_message" => Tampered },
-		Tampered => { "harness_spawn_session" => SpawningAttack },
+		CaptureReady => { MitmAttackSpec::mitm_capture_handshake => Captured },
+		Captured => { MitmAttackSpec::mitm_tamper_message => Tampered },
+		Tampered => { SecurityThreatHarness::harness_spawn_session => SpawningAttack },
 		SpawningAttack => {
-			"harness_spawn_ecies" => AttackReady,
-			"harness_spawn_cms" => AttackReady
+			SecurityThreatHarness::harness_spawn_ecies => AttackReady,
+			SecurityThreatHarness::harness_spawn_cms => AttackReady
 		},
-		AttackReady => { "mitm_inject_tampered" => Injected },
-		Injected => { "mitm_tampering_detected" => Idle }
+		AttackReady => { MitmAttackSpec::mitm_inject_tampered => Injected },
+		Injected => { MitmAttackSpec::mitm_tampering_detected => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "MITM attack: message tampering detection via transcript signatures" }
@@ -102,7 +102,6 @@ job! {
 	name: MitmAttackScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-
 		for kind in HandshakeBackendKind::all() {
 			// ========================================
 			// Step 1: Capture a complete handshake
@@ -137,7 +136,6 @@ job! {
 			// Step 3: Inject tampered message into fresh session
 			// ========================================
 			let mut attack_session = harness.spawn(kind);
-
 			trace.event(MitmAttackSpec::mitm_inject_tampered)?;
 
 			// Inject the tampered message at the same step

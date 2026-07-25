@@ -51,7 +51,7 @@ job! {
 		let msg: TestMessage = tightbeam::decode(&frame.message)?;
 
 		compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: &frame.metadata.id,
 				message: TestMessage {
 					content: format!("{}_transformed", msg.content)
 				}
@@ -125,22 +125,22 @@ tb_process_spec! {
 	pub PipelineProcess,
 	events {
 		observable {
-			"create_test_frame_start",
-			"create_test_frame_success",
-			"validate_frame_start",
-			"validate_frame_success",
-			"transform_content_start",
-			"transform_content_success"
+			AutoTraceSpec::create_test_frame_start,
+			AutoTraceSpec::create_test_frame_success,
+			AutoTraceSpec::validate_frame_start,
+			AutoTraceSpec::validate_frame_success,
+			AutoTraceSpec::transform_content_start,
+			AutoTraceSpec::transform_content_success
 		}
-		hidden {}
+		hidden { }
 	}
 	states {
-		Idle => { "create_test_frame_start" => Creating },
-		Creating => { "create_test_frame_success" => Validating },
-		Validating => { "validate_frame_start" => ValidatingRun },
-		ValidatingRun => { "validate_frame_success" => Transforming },
-		Transforming => { "transform_content_start" => TransformingRun },
-		TransformingRun => { "transform_content_success" => Done }
+		Idle => { AutoTraceSpec::create_test_frame_start => Creating },
+		Creating => { AutoTraceSpec::create_test_frame_success => Validating },
+		Validating => { AutoTraceSpec::validate_frame_start => ValidatingRun },
+		ValidatingRun => { AutoTraceSpec::validate_frame_success => Transforming },
+		Transforming => { AutoTraceSpec::transform_content_start => TransformingRun },
+		TransformingRun => { AutoTraceSpec::transform_content_success => Done }
 	}
 	terminal { Done }
 }

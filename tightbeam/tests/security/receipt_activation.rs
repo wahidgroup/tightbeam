@@ -81,8 +81,10 @@ tb_scenario! {
 			// deliberately skip process_receipt_ack.
 			let key_exchange = client.build_key_exchange(vec![0xA5; 32], None)?;
 			server.process_key_exchange(&key_exchange).await?;
+
 			let server_finished = server.build_server_finished().await?;
 			client.process_server_finished(&server_finished)?;
+
 			let client_finished = client.build_client_finished().await?;
 			server.process_client_finished(&client_finished)?;
 

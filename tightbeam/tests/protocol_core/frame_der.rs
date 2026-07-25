@@ -84,7 +84,7 @@ fn build_v3_frame(message: &TestMessage) -> Result<tightbeam::Frame, TightBeamEr
 	FrameBuilder::from(tb::Version::V3)
 		.with_id("frame-der")
 		.with_order(1_696_521_700)
-		.with_message(message.clone())
+		.with_message(message.to_owned())
 		.with_message_hasher::<Sha3_256>([])
 		.with_aead::<Aes256GcmOid, _>(cipher)
 		.with_signer::<Secp256k1Signature, _>(signing_key)

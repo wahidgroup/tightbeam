@@ -64,7 +64,7 @@ servlet! {
 		trace.event("servlet_respond")?;
 
 		Ok(Some(compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: &frame.metadata.id,
 				message: HiveTestResponse { doubled: req.value * 2 }
 		}?))
 	}
@@ -371,7 +371,7 @@ tb_scenario! {
 			let donor = donor_heartbeat.sign_with_provider::<Sha3_256, _>(&signer.provider).await?;
 
 			let mut forged = command_frame(b"hb-forged", heartbeat_command(now.saturating_add(1)))?;
-			forged.nonrepudiation = donor.nonrepudiation.clone();
+			forged.nonrepudiation = donor.nonrepudiation.to_owned();
 
 			let response = emit_command(&mut client, forged).await?;
 			assert_heartbeat_shape(&response, TransitStatus::PermissionDenied, false);
@@ -511,7 +511,7 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive).await?;
 			let signed = signed_spawn_frame(&signer.provider, b"spawn-retry", b"flaky").await?;
-			let replay = signed.clone();
+			let replay = signed.to_owned();
 
 			let first = emit_command(&mut client, signed).await?;
 			assert_manage_spawn_shape(&first, TransitStatus::PermissionDenied);

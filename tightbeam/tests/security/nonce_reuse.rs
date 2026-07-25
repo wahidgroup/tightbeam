@@ -53,37 +53,37 @@ tb_process_spec! {
 	pub NonceReuseProcess,
 	events {
 		observable {
-			"nonce_capture_valid",
-			"nonce_first_use",
-			"nonce_replay_attempt",
-			"nonce_replay_rejected"
+
+			NonceReuseSpec::nonce_capture_valid,
+			NonceReuseSpec::nonce_first_use,
+			NonceReuseSpec::nonce_replay_attempt,
+			NonceReuseSpec::nonce_replay_rejected,
+			SecurityThreatHarness::harness_spawn_session,
+			SecurityThreatHarness::harness_spawn_ecies,
+			SecurityThreatHarness::harness_spawn_cms
 		}
-		hidden {
-			"harness_spawn_session",
-			"harness_spawn_ecies",
-			"harness_spawn_cms"
-		}
+		hidden { }
 	}
 	states {
-		Idle => { "harness_spawn_session" => SpawningCapture },
+		Idle => { SecurityThreatHarness::harness_spawn_session => SpawningCapture },
 		SpawningCapture => {
-			"harness_spawn_ecies" => CaptureReady,
-			"harness_spawn_cms" => CaptureReady
+			SecurityThreatHarness::harness_spawn_ecies => CaptureReady,
+			SecurityThreatHarness::harness_spawn_cms => CaptureReady
 		},
-		CaptureReady => { "nonce_capture_valid" => Captured },
-		Captured => { "harness_spawn_session" => SpawningFirst },
+		CaptureReady => { NonceReuseSpec::nonce_capture_valid => Captured },
+		Captured => { SecurityThreatHarness::harness_spawn_session => SpawningFirst },
 		SpawningFirst => {
-			"harness_spawn_ecies" => FirstUseReady,
-			"harness_spawn_cms" => FirstUseReady
+			SecurityThreatHarness::harness_spawn_ecies => FirstUseReady,
+			SecurityThreatHarness::harness_spawn_cms => FirstUseReady
 		},
-		FirstUseReady => { "nonce_first_use" => FirstUsed },
-		FirstUsed => { "harness_spawn_session" => SpawningReplay },
+		FirstUseReady => { NonceReuseSpec::nonce_first_use => FirstUsed },
+		FirstUsed => { SecurityThreatHarness::harness_spawn_session => SpawningReplay },
 		SpawningReplay => {
-			"harness_spawn_ecies" => ReplayReady,
-			"harness_spawn_cms" => ReplayReady
+			SecurityThreatHarness::harness_spawn_ecies => ReplayReady,
+			SecurityThreatHarness::harness_spawn_cms => ReplayReady
 		},
-		ReplayReady => { "nonce_replay_attempt" => ReplayAttempted },
-		ReplayAttempted => { "nonce_replay_rejected" => Idle }
+		ReplayReady => { NonceReuseSpec::nonce_replay_attempt => ReplayAttempted },
+		ReplayAttempted => { NonceReuseSpec::nonce_replay_rejected => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Nonce reuse attack: freshness via server random bound into signed transcript" }

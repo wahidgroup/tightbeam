@@ -316,7 +316,7 @@ mod tests {
 	#[test]
 	fn transaction_status_approved() {
 		let pid = PaymentIdentification::new(b"I", b"E", b"T");
-		let status = TransactionStatus::approved(pid.clone(), b"AUTH123".to_vec());
+		let status = TransactionStatus::approved(pid.to_owned(), b"AUTH123".to_vec());
 		assert_eq!(status.status, PaymentStatusCode::AcceptedCustomerProfile);
 		assert_eq!(status.authorization_code, Some(b"AUTH123".to_vec()));
 		assert!(status.reason_code.is_none());
@@ -345,7 +345,7 @@ mod tests {
 	#[test]
 	fn transaction_status_rejected() {
 		let pid = PaymentIdentification::new(b"I", b"E", b"T");
-		let status = TransactionStatus::rejected(pid.clone(), b"INSUFFICIENT_FUNDS".to_vec());
+		let status = TransactionStatus::rejected(pid.to_owned(), b"INSUFFICIENT_FUNDS".to_vec());
 		assert_eq!(status.status, PaymentStatusCode::Rejected);
 		assert!(status.authorization_code.is_none());
 		assert_eq!(status.reason_code, Some(b"INSUFFICIENT_FUNDS".to_vec()));

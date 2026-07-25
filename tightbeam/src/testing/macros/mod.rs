@@ -336,7 +336,7 @@ macro_rules! tb_scenario {
 
 	// ===== HELPER: Verify specs and call hooks (DRY) =====
 	(@verify_and_call_hooks $config:expr, $hook_ctx:expr, $exec_result:expr) => {
-		// Verify specs
+		// Verify Layer 1 assertion specs
 		for spec in $config.specs() {
 			match $crate::testing::specs::verify_trace(*spec, &$hook_ctx.trace) {
 				Err(violation) => {
@@ -348,6 +348,16 @@ macro_rules! tb_scenario {
 					panic!("Spec verification failed for {}: {:?}", spec.id(), violation);
 				}
 				Ok(()) => {}
+			}
+		}
+
+		// Verify Layer 2 CSP process (when configured)
+		#[cfg(feature = "testing-csp")]
+		if let Some(csp) = $config.csp() {
+			let csp_result =
+				$crate::testing::specs::csp::ProcessSpec::validate_trace(csp.as_ref(), &$hook_ctx.trace);
+			if !csp_result.valid {
+				panic!("CSP verification failed: {:?}", csp_result.violations);
 			}
 		}
 

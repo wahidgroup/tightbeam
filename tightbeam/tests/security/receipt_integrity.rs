@@ -90,14 +90,14 @@ tb_scenario! {
 				.negotiated_mux()
 				.ok_or_else(|| expectation_failure("client must negotiate multiplexing"))?;
 
-			let is_client_to_server_within_ceiling = stored.receipt.budgets.client_to_server <= MAX_MUX_SESSION_BUDGET;
-			let is_server_to_client_within_ceiling = stored.receipt.budgets.server_to_client <= MAX_MUX_SESSION_BUDGET;
+			let is_client_to_server_within_ceiling = stored.receipt().budgets.client_to_server <= MAX_MUX_SESSION_BUDGET;
+			let is_server_to_client_within_ceiling = stored.receipt().budgets.server_to_client <= MAX_MUX_SESSION_BUDGET;
 			trace.event_with(ReceiptBudgetClampSpec::receipt_budgets_within_ceiling, &[], is_client_to_server_within_ceiling && is_server_to_client_within_ceiling)?;
 
 			// The client's send budget is the client-to-server direction;
 			// its receive budget is the server-to-client direction.
-			let is_budget_matched = Some(stored.receipt.budgets.client_to_server) == settings.send_budget
-				&& Some(stored.receipt.budgets.server_to_client) == settings.recv_budget;
+			let is_budget_matched = Some(stored.receipt().budgets.client_to_server) == settings.send_budget
+				&& Some(stored.receipt().budgets.server_to_client) == settings.recv_budget;
 			trace.event_with(ReceiptBudgetClampSpec::receipt_matches_enforced_budget, &[], is_budget_matched)?;
 
 			Ok::<(), TightBeamError>(())

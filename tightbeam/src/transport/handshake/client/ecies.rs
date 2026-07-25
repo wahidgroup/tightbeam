@@ -5,7 +5,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, vec::Vec};
 
 use core::marker::PhantomData;
 
@@ -29,11 +29,13 @@ use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::zeroize::{Zeroize, Zeroizing};
 
+use crate::cms::signed_data::{SignedData, SignerInfo};
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{client_mux_settings, MuxSettings, SecurityOffer, TransportOffer};
 use crate::transport::handshake::receipt::{
-	approve_or_fail_closed, client_receipt_digest, match_receipt_to_accept, verify_server_receipt, ReceiptApprover,
-	StoredReceipt,
+	approve_or_fail_closed, certificate_signer_identifier, complete_receipt_artifact, countersign_receipt,
+	match_receipt_to_accept, receipt_from_artifact, signer_for_role, verify_receipt_signer, ReceiptApprover,
+	ReceiptRole, StoredReceipt,
 };
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
@@ -41,7 +43,7 @@ use crate::transport::handshake::utils::{
 	compute_client_auth_digest, compute_transcript_digest, octet_string_to_32_byte_array, validate_state,
 };
 use crate::transport::handshake::{
-	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake, ECIES_SESSION_PREFIX_LEN,
+	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, EciesSessionPayload, ServerHandshake,
 };
 use crate::transport::handshake::{DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization};
 use crate::x509::Certificate;
@@ -296,14 +298,14 @@ where
 		// 3. Build ClientHello
 		let client_hello = ClientHello {
 			client_random: OctetString::new(client_random)?,
-			security_offer: self.security_offer.clone(),
-			transport_offer: self.transport_offer.clone(),
+			security_offer: self.security_offer.to_owned(),
+			transport_offer: self.transport_offer.to_owned(),
 		};
 
 		// Retain the exact DER for transcript binding: the full
 		// ClientHello (offer included) is hashed on both sides.
 		let client_hello_der = client_hello.to_der()?;
-		self.client_hello = Some(client_hello_der.clone());
+		self.client_hello = Some(client_hello_der.to_owned());
 
 		// Transition: mark hello sent
 		self.state.transition(ClientHandshakeState::HelloSent)?;
@@ -326,7 +328,7 @@ where
 		self.state.transition(ClientHandshakeState::ServerHelloReceived)?;
 
 		// 3. Decode and validate server handshake
-		let server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
+		let mut server_handshake = self.validate_and_extract_server_handshake(server_handshake_der)?;
 
 		// 4. Validate profile negotiation
 		self.validate_profile_selection(&server_handshake)?;
@@ -344,13 +346,15 @@ where
 		self.verify_server_handshake_signature(&server_handshake)?;
 
 		// 8. Validate, approve, and countersign the session receipt
-		// (fails closed on mismatch)
-		let (receipt_signature, receipt_response) = self.process_session_receipt(&server_handshake).await?;
+		// (fails closed on mismatch). Consumes the receipt artifact out
+		// of the decoded message: its owner is the stored receipt.
+		let pending_receipt = self.process_session_receipt(&mut server_handshake).await?;
 
-		// 9. Generate and encrypt session key. The settlement answer folds
-		// into the ECIES payload, never onto the cleartext wire
-		let response_bytes = receipt_response.as_ref().map(OctetString::as_bytes);
-		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake, response_bytes)?;
+		// 9. Generate and encrypt session key. The countersignature (and
+		// the settlement answer bound inside it) folds into the ECIES
+		// payload, never onto the cleartext wire. After encoding it
+		// moves into the completed stored artifact (zero copy).
+		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake, pending_receipt)?;
 
 		// 10. Handle mutual authentication (signature commits to encrypted_bytes)
 		let (client_certificate, client_signature) =
@@ -363,8 +367,6 @@ where
 			client_certificate,
 			#[cfg(feature = "x509")]
 			client_signature,
-			#[cfg(feature = "x509")]
-			receipt_signature,
 		};
 
 		// 12. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
@@ -405,39 +407,58 @@ where
 	}
 
 	/// Generate base session key and encrypt with server's public key.
+	///
+	/// The pending countersignature rides inside the encrypted payload;
+	/// once encoded it moves back out into the completed stored
+	/// artifact, so the `SignerInfo` is never copied.
 	fn generate_and_encrypt_session_key(
 		&mut self,
 		server_handshake: &ServerHandshake,
-		response: Option<&[u8]>,
+		pending_receipt: Option<(SignedData, SignerInfo)>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		self.generate_base_session_key()?;
 		let base_key = self.base_session_key.ok_or(HandshakeError::InvalidState)?;
 		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
 
-		self.perform_ecies_encryption(
+		let (artifact, receipt_ack) = match pending_receipt {
+			Some((artifact, ack)) => (Some(artifact), Some(ack)),
+			None => (None, None),
+		};
+
+		let (encrypted_bytes, receipt_ack) = self.perform_ecies_encryption(
 			&base_key,
 			&client_random,
-			response,
+			receipt_ack,
 			&server_handshake.certificate,
 			self.aad_domain_tag,
-		)
+		)?;
+
+		if let Some(artifact) = artifact {
+			let countersignature = receipt_ack.ok_or(HandshakeError::InvalidState)?;
+			let completed = complete_receipt_artifact(artifact, countersignature)?;
+			self.stored_receipt = Some(StoredReceipt::try_from(completed)?);
+		}
+
+		Ok(encrypted_bytes)
 	}
 
 	/// Validate, approve, and countersign the server's session receipt.
 	///
-	/// Budget-bearing accepts demand a receipt whose transcript hash,
-	/// budgets, and credit unit match the negotiated session and whose
-	/// server signature verifies. Anything else fails closed. The
-	/// approver (or the fail-closed default) answers the settlement
-	/// challenge, and the countersignature binds receipt body plus
-	/// answer under the client identity (non-repudiation).
+	/// Budget-bearing accepts demand a receipt artifact whose body
+	/// matches the negotiated session and whose server `SignerInfo`
+	/// verifies. Anything else fails closed. The approver (or the
+	/// fail-closed default) answers the settlement challenge, and the
+	/// client `SignerInfo` binds receipt body plus answer under the
+	/// client identity (non-repudiation).
 	///
-	/// Returns the countersignature and the ancillary response destined
-	/// for the ClientKeyExchange.
+	/// Returns the pending artifact plus the countersignature destined
+	/// for the confidential key-exchange payload. Completion is
+	/// deferred until after payload encoding so the `SignerInfo` moves
+	/// (never copies) into the stored artifact.
 	async fn process_session_receipt(
 		&mut self,
-		server_handshake: &ServerHandshake,
-	) -> Result<(Option<OctetString>, Option<OctetString>), HandshakeError> {
+		server_handshake: &mut ServerHandshake,
+	) -> Result<Option<(SignedData, SignerInfo)>, HandshakeError> {
 		let granted = server_handshake
 			.transport_accept
 			.as_ref()
@@ -446,26 +467,31 @@ where
 		let credit_unit = server_handshake.transport_accept.as_ref().map(|accept| accept.credit_unit);
 		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
 
-		let Some(receipt) = match_receipt_to_accept(
-			server_handshake.session_receipt.as_ref(),
-			granted,
-			credit_unit,
-			&transcript_digest,
-		)?
+		// Consume the artifact: the completed copy this function stores
+		// is its only owner from here on.
+		let artifact = server_handshake.session_receipt.take();
+		let parsed_receipt = artifact.as_ref().map(receipt_from_artifact).transpose()?;
+		let Some(receipt) =
+			match_receipt_to_accept::<P::Digest>(parsed_receipt, granted, credit_unit, &transcript_digest)?
 		else {
-			return Ok((None, None));
+			return Ok(None);
 		};
 
-		// Server signature over the receipt body: third-party verifiable
+		// Server SignerInfo over the receipt body: third-party verifiable
 		// agreement, so an unsigned receipt is no receipt at all.
-		let server_signature = server_handshake
-			.receipt_signature
-			.as_ref()
-			.ok_or(HandshakeError::ReceiptMissing)?;
+		let artifact = artifact.ok_or(HandshakeError::ReceiptMissing)?;
+		let server_signer = signer_for_role(&artifact, ReceiptRole::Server)?.ok_or(HandshakeError::ReceiptMissing)?;
 
 		let receipt_der = receipt.to_der()?;
+		let expected_sid = certificate_signer_identifier::<P::Digest>(&server_handshake.certificate)?;
 		let verifying_key = self.extract_verifying_key(&server_handshake.certificate)?;
-		verify_server_receipt::<P::Digest, P::Signature, _>(&receipt_der, server_signature.as_bytes(), &verifying_key)?;
+		verify_receipt_signer::<P::Digest, P::Signature, _>(
+			&receipt_der,
+			server_signer,
+			ReceiptRole::Server,
+			&expected_sid,
+			&verifying_key,
+		)?;
 
 		// Countersigning demands a full client identity (certificate for
 		// the server's verification plus signing key): budgets without
@@ -480,20 +506,12 @@ where
 
 		// Approve the receipt and answer its challenge (fail-closed
 		// without an approver).
-		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), receipt).await?;
+		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), &receipt).await?;
 		let response_bytes = response.as_ref().map(OctetString::as_bytes);
-		let client_digest = client_receipt_digest::<P::Digest>(&receipt_der, response_bytes)?;
-		let signature_bytes = key_provider.sign_prehash(&client_digest).await?;
-		let countersignature = OctetString::new(signature_bytes)?;
+		let countersignature =
+			countersign_receipt::<P::Digest>(&receipt, response_bytes, key_provider.as_ref()).await?;
 
-		self.stored_receipt = Some(StoredReceipt {
-			receipt: receipt.clone(),
-			server_signature: server_signature.clone(),
-			client_signature: countersignature.clone(),
-			ancillary_response: response.clone(),
-		});
-
-		Ok((Some(countersignature), response))
+		Ok(Some((artifact, countersignature)))
 	}
 
 	/// Prepare client authentication materials if required or available.
@@ -546,6 +564,7 @@ where
 		salt[..32].copy_from_slice(client_random);
 		salt[32..].copy_from_slice(server_random);
 		let session_ciphers = self.derive_directional_aead(base_key, salt.as_slice())?;
+
 		// Invariant: AEAD key derivation occurs exactly once after transcript locked
 		self.invariants.derive_aead_once()?;
 
@@ -625,25 +644,29 @@ where
 		Ok(())
 	}
 
+	/// Encrypt the session payload to the server's public key.
+	///
+	/// Hands the `receipt_ack` back after encoding: the caller moves it
+	/// into the completed stored artifact instead of cloning it.
 	fn perform_ecies_encryption(
 		&self,
 		base_key: &[u8; 32],
 		client_random: &[u8; 32],
-		response: Option<&[u8]>,
+		receipt_ack: Option<SignerInfo>,
 		server_certificate: &Certificate,
 		associated_data: Option<&[u8]>,
-	) -> Result<Vec<u8>, HandshakeError> {
-		// Payload: base_key(32) || client_random(32) || u32-BE(len) ||
-		// response. The length prefix is always present (zero when no
-		// settlement answer), so the server parses one framing for every
-		// session, metered or not.
-		let response = response.unwrap_or_default();
-		let response_len = u32::try_from(response.len()).map_err(|_| HandshakeError::AnswerTooLarge)?;
-		let mut plaintext = Zeroizing::new(Vec::with_capacity(ECIES_SESSION_PREFIX_LEN + response.len()));
-		plaintext.extend_from_slice(base_key);
-		plaintext.extend_from_slice(client_random);
-		plaintext.extend_from_slice(&response_len.to_be_bytes());
-		plaintext.extend_from_slice(response);
+	) -> Result<(Vec<u8>, Option<SignerInfo>), HandshakeError> {
+		let payload = EciesSessionPayload {
+			base_key: OctetString::new(base_key.as_slice())?,
+			client_random: OctetString::new(client_random.as_slice())?,
+			receipt_ack,
+		};
+
+		// The DER buffer holds the base session key: wiped when dropped,
+		// along with the transient OCTET STRING copy inside the payload.
+		let plaintext = Zeroizing::new(payload.to_der()?);
+		payload.base_key.into_bytes().zeroize();
+		let receipt_ack = payload.receipt_ack;
 
 		let recipient_pubkey = PublicKey::<P::Curve>::from_sec1_bytes(
 			server_certificate
@@ -661,7 +684,7 @@ where
 			Some(&mut rand_core::OsRng),
 		)?;
 
-		Ok(encrypted_message.to_bytes())
+		Ok((encrypted_message.to_bytes(), receipt_ack))
 	}
 }
 
@@ -721,7 +744,6 @@ where
 		Box::pin(async move {
 			let profile = self.selected_profile.ok_or(HandshakeError::InvalidState)?;
 			let aead_oid = profile.aead.ok_or(HandshakeError::InvalidState)?;
-
 			// Delegate to the inherent method: single source of truth for state
 			// validation, AEAD derivation, invariants, and cleanup.
 			let ciphers = EciesHandshakeClient::complete(self)?;
@@ -785,7 +807,7 @@ mod tests {
 		// Given: A client in init state that trusts the test server certificate
 		let test_cert = create_test_certificate();
 		let mut client = TestEciesClientBuilder::new()
-			.with_trusted_certificate(test_cert.certificate.clone())
+			.with_trusted_certificate(test_cert.certificate.to_owned())
 			.build();
 		assert_eq!(client.state(), ClientHandshakeState::Init);
 
@@ -909,7 +931,7 @@ mod tests {
 			Box<dyn Error>,
 		> {
 			let mut client = TestEciesClientBuilder::new()
-				.with_trusted_certificate(test_cert.certificate.clone())
+				.with_trusted_certificate(test_cert.certificate.to_owned())
 				.build();
 			if let Some(offer) = offer {
 				client = client.with_security_offer(offer);
@@ -940,14 +962,13 @@ mod tests {
 			let signature_bytes = signature.to_bytes().to_vec();
 
 			let response = ServerHandshake {
-				certificate: test_cert.certificate.clone(),
+				certificate: test_cert.certificate.to_owned(),
 				server_random: OctetString::new(server_random)?,
 				signature: OctetString::new(signature_bytes)?,
 				security_accept: Some(SecurityAccept::new(*accepted_profile)),
 				client_cert_required: false,
 				transport_accept: None,
 				session_receipt: None,
-				receipt_signature: None,
 			};
 			Ok(response.to_der()?)
 		};

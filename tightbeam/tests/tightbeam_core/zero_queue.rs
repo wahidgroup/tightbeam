@@ -146,7 +146,7 @@ impl ChainState {
 
 	fn record(&self, frame: &Frame) -> Result<(), TightBeamError> {
 		let mut guard = self.state.lock().expect("chain state mutex not poisoned");
-		let expected = guard.last_digest.clone();
+		let expected = guard.last_digest.to_owned();
 		let actual = frame.metadata.previous_frame.as_ref();
 		let prev_ok = match (expected.as_ref(), actual) {
 			(None, None) => true,
@@ -163,6 +163,7 @@ impl ChainState {
 			guard.last_order = Some(frame.metadata.order);
 			let digest = utils::digest::<Sha3_256>(&frame.message)?;
 			guard.last_digest = Some(digest);
+
 			self.trace.event_with(QueueFreeSpec::lag_tip, &[QUEUE_TAG], 0u64)?;
 		}
 
@@ -184,7 +185,7 @@ impl DedupBook {
 	}
 
 	fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		let key = (frame.metadata.id.clone(), frame.metadata.order);
+		let key = (frame.metadata.id.to_owned(), frame.metadata.order);
 		let mut guard = self.seen.lock().expect("seen-set mutex not poisoned");
 
 		let inserted = guard.insert(key);
@@ -410,7 +411,7 @@ tb_scenario! {
 				if index == 1 {
 					// For the second frame, emit it then immediately replay it
 					// Server will throttle on first attempt, restart policy will retry
-					client.emit(frame.clone(), None).await?;
+					client.emit(frame.to_owned(), None).await?;
 					trace.event_with("replay_attempt", &[QUEUE_TAG], frame.metadata.order)?;
 					client.emit(frame, None).await?;
 				} else {

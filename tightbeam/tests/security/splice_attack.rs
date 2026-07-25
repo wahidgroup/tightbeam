@@ -43,7 +43,7 @@ use tightbeam::{
 		sign::ecdsa::Secp256k1SigningKey,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
-	der::{Decode, Encode},
+	der::{Decode, Encode, Sequence},
 	exactly, job,
 	random::OsRng,
 	tb_assert_spec, tb_process_spec, tb_scenario,
@@ -60,6 +60,15 @@ use tightbeam::{
 
 use crate::common::security::{default_security_profile, expectation_failure, pinning_validator, ServerMaterials};
 
+/// Attacker's-eye view of the DER key-exchange plaintext: the two
+/// leading OCTET STRINGs are all a splice needs (the trailing receipt
+/// acknowledgement is absent on this unmetered session).
+#[derive(Sequence)]
+struct SplicedPayload {
+	base_key: OctetString,
+	client_random: OctetString,
+}
+
 tb_assert_spec! {
 	pub SpliceAttackSpec,
 	V(1,0,0): {
@@ -74,11 +83,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SpliceAttackProcess,
 	events {
-		observable { "spliced_kex_rejected" }
+		observable { SpliceAttackSpec::spliced_kex_rejected }
 		hidden { }
 	}
 	states {
-		Idle => { "spliced_kex_rejected" => Done },
+		Idle => { SpliceAttackSpec::spliced_kex_rejected => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -141,19 +150,16 @@ job! {
 		)?
 		.to_insecure()?;
 
-		// Payload framing: base_key(32) || client_random(32) || u32-BE
-		// response length (zero here: this splice session is unmetered).
-		if victim_plain.len() != 68 {
-			return Err(expectation_failure("unexpected ECIES payload size"));
-		}
+		// Attacker forges a payload with its own key under the server's
+		// public key and splices it into the victim's message, preserving
+		// the victim's client_random and the DER framing.
+		let victim_payload = SplicedPayload::from_der(&victim_plain)?;
+		let forged_payload = SplicedPayload {
+			base_key: OctetString::new([0x41u8; 32])?, // attacker-chosen key
+			client_random: victim_payload.client_random,
+		};
 
-		// Attacker forges [attacker_key || victim_client_random || len] under
-		// the server's public key and splices it into the victim's message,
-		// preserving the victim's client_random and length framing.
-		let mut forged_plain = [0u8; 68];
-		forged_plain[..32].copy_from_slice(&[0x41u8; 32]); // attacker-chosen key
-		forged_plain[32..].copy_from_slice(&victim_plain[32..]); // victim client_random + length prefix
-
+		let forged_plain = forged_payload.to_der()?;
 		let recipient_pub = materials.secret_key().public_key();
 		let forged_message = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
 			&recipient_pub,
@@ -164,10 +170,10 @@ job! {
 
 		let spliced = ClientKeyExchange {
 			encrypted_data: OctetString::new(forged_message.to_bytes())?,
-			client_certificate: victim_kex.client_certificate.clone(),
-			client_signature: victim_kex.client_signature.clone(),
-			receipt_signature: victim_kex.receipt_signature.clone(),
+			client_certificate: victim_kex.client_certificate.to_owned(),
+			client_signature: victim_kex.client_signature.to_owned(),
 		};
+
 		let spliced_der = spliced.to_der()?;
 		if spliced_der == client_kex_der {
 			return Err(expectation_failure("splice produced identical ClientKeyExchange bytes"));

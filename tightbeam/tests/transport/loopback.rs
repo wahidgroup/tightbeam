@@ -244,7 +244,7 @@ fn session_key_bytes(
 	missing_msg: &'static str,
 ) -> Result<Vec<u8>, TightBeamError> {
 	let secret = client.session_key().ok_or_else(|| expectation_failure(missing_msg))?;
-	let bytes = secret.with(|bytes| bytes.clone())?;
+	let bytes = secret.with(|bytes| bytes.to_owned())?;
 	Ok(bytes)
 }
 

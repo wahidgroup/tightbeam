@@ -13,7 +13,8 @@
 ))]
 
 use std::sync::Arc;
-use tightbeam::crypto::aead::{Aes128Gcm, Aes128GcmOid, Aes256Gcm, Aes256GcmOid};
+
+use tightbeam::crypto::aead::{Aes128GcmOid, Aes256Gcm, Aes256GcmOid};
 use tightbeam::crypto::curves::Secp256k1Oid;
 use tightbeam::crypto::ecies::Secp256k1EciesMessage;
 use tightbeam::crypto::hash::{Sha3_256, Sha3_512};
@@ -37,11 +38,12 @@ use tightbeam::transport::handshake::client::EciesHandshakeClient;
 use tightbeam::transport::handshake::negotiation::SecurityOffer;
 use tightbeam::transport::handshake::server::EciesHandshakeServer;
 use tightbeam::transport::handshake::HandshakeFinalization;
+use tightbeam::x509::Certificate;
 
-// ============================================================================
-// AES-256-GCM with SHA3-512 Profile
-// ============================================================================
+use crate::common::security::pinning_validator;
 
+/// Stronger profile: AES-256-GCM with SHA3-512. Selected when both sides
+/// offer it, because AES-128 fails the default 256-bit strength floor.
 #[derive(Debug, Default, Clone, Copy)]
 struct Aes256Sha3_512Profile;
 
@@ -93,10 +95,8 @@ impl CryptoProvider for Aes256Sha3_512Provider {
 	}
 }
 
-// ============================================================================
-// AES-128-GCM with SHA3-256 Profile
-// ============================================================================
-
+/// Weaker profile: AES-128-GCM with SHA3-256. Present in both offers so
+/// negotiation must prefer the stronger peer-shared profile.
 #[derive(Debug, Default, Clone, Copy)]
 struct Aes128Sha3_256Profile;
 
@@ -111,47 +111,21 @@ impl SecurityProfile for Aes128Sha3_256Profile {
 	const KEY_WRAP_OID: Option<ObjectIdentifier> = Some(AES_128_WRAP);
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-#[allow(dead_code)]
-struct Aes128Sha3_256Provider {
-	profile: Aes128Sha3_256Profile,
+fn preferred_profile() -> SecurityProfileDesc {
+	SecurityProfileDesc::from(&Aes256Sha3_512Profile)
 }
 
-impl DigestProvider for Aes128Sha3_256Provider {
-	type Digest = Sha3_256;
+fn fallback_profile() -> SecurityProfileDesc {
+	SecurityProfileDesc::from(&Aes128Sha3_256Profile)
 }
 
-impl AeadProvider for Aes128Sha3_256Provider {
-	type AeadCipher = Aes128Gcm;
-	type AeadOid = Aes128GcmOid;
+fn server_materials() -> (Certificate, Arc<dyn SigningKeyProvider>) {
+	let server_signing_key = create_test_signing_key();
+	let server_cert = create_test_certificate(&server_signing_key);
+	let signing_key = Secp256k1SigningKey::from(server_signing_key);
+	let server_key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+	(server_cert, server_key_provider)
 }
-
-impl SigningProvider for Aes128Sha3_256Provider {
-	type Signature = Secp256k1Signature;
-	type SigningKey = Secp256k1SigningKey;
-	type VerifyingKey = Secp256k1VerifyingKey;
-}
-
-impl KdfProvider for Aes128Sha3_256Provider {
-	type Kdf = HkdfSha3_256;
-}
-
-impl CurveProvider for Aes128Sha3_256Provider {
-	type Curve = k256::Secp256k1;
-	type EciesMessage = Secp256k1EciesMessage;
-}
-
-impl CryptoProvider for Aes128Sha3_256Provider {
-	type Profile = Aes128Sha3_256Profile;
-
-	fn profile(&self) -> &Self::Profile {
-		&self.profile
-	}
-}
-
-// ============================================================================
-// Spec Definitions
-// ============================================================================
 
 tb_assert_spec! {
 	pub ProfileNegotiationSpec,
@@ -170,63 +144,54 @@ tb_assert_spec! {
 	}
 }
 
-// ============================================================================
-// Integration Test
-// ============================================================================
-
 tb_scenario! {
 	name: profile_negotiation,
 	spec: ProfileNegotiationSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			trace.event(ProfileNegotiationSpec::handshake_start)?;
-			// Create profile descriptors
-			let profile_aes256_sha512 = SecurityProfileDesc::from(&Aes256Sha3_512Profile);
-			let profile_aes128_sha256 = SecurityProfileDesc::from(&Aes128Sha3_256Profile);
 
-			// Setup server certificate and key
-			let server_signing_key = create_test_signing_key();
-			let server_cert = create_test_certificate(&server_signing_key);
-			let signing_key = Secp256k1SigningKey::from(server_signing_key);
-			let server_key_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+			let preferred = preferred_profile();
+			let fallback = fallback_profile();
+			let (server_cert, server_key_provider) = server_materials();
 
-			// Create client with offer: [AES-256, AES-128] (AES-256 preferred)
-			let client_offer = SecurityOffer::new(vec![profile_aes256_sha512, profile_aes128_sha256]);
-			let validator = crate::common::security::pinning_validator(&server_cert);
+			// Client prefers AES-256; server lists AES-128 first. Strength
+			// floor still selects AES-256 when both offer it.
+			let client_offer = SecurityOffer::new(vec![preferred, fallback]);
+			let server_profiles = vec![fallback, preferred];
+			let validator = pinning_validator(&server_cert);
+
 			let mut client = EciesHandshakeClient::<Aes256Sha3_512Provider, Secp256k1EciesMessage>::new(None)
 				.with_security_offer(client_offer)
 				.with_certificate_validator(validator);
-
-			// Create server supporting: [AES-128, AES-256] (different order to test negotiation)
 			let mut server = EciesHandshakeServer::<Aes256Sha3_512Provider>::new(
 				Arc::clone(&server_key_provider),
-				Arc::new(server_cert.clone()),
+				Arc::new(server_cert.to_owned()),
 				None,
 				None,
 			)
-			.with_supported_profiles(vec![profile_aes128_sha256, profile_aes256_sha512]);
+			.with_supported_profiles(server_profiles);
 
-			// Perform handshake
 			trace.event(ProfileNegotiationSpec::client_hello_sent)?;
+
 			let client_hello = client.build_client_hello()?;
-
 			trace.event(ProfileNegotiationSpec::server_hello_received)?;
+
 			let server_handshake = server.process_client_hello(&client_hello).await?;
-
 			trace.event(ProfileNegotiationSpec::client_kex_sent)?;
-			let client_kex = client.process_server_handshake(&server_handshake).await?;
 
+			let client_kex = client.process_server_handshake(&server_handshake).await?;
 			trace.event(ProfileNegotiationSpec::server_kex_received)?;
 			server.process_client_key_exchange(&client_kex).await?;
 
 			trace.event(ProfileNegotiationSpec::handshake_complete)?;
+
 			let _client_cipher = client.complete()?;
 			let _server_cipher = server.complete()?;
 
-			// Verify: server preference + strength floor select AES-256-GCM/SHA3-512
-			// (AES-128 fails the default 256-bit floor)
-			if server.selected_profile() == Some(profile_aes256_sha512) &&
-			   client.selected_profile() == Some(profile_aes256_sha512) {
+			let server_selected = server.selected_profile() == Some(preferred);
+			let client_selected = client.selected_profile() == Some(preferred);
+			if server_selected && client_selected {
 				trace.event(ProfileNegotiationSpec::profile_verified)?;
 			}
 
