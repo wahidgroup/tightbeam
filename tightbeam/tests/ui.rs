@@ -5,6 +5,12 @@ fn compile_fail_algorithm_mismatch() {
 }
 
 #[test]
+fn compile_fail_encryptor_oid_mismatch() {
+	let t = trybuild::TestCases::new();
+	t.compile_fail("tests/compile/encryptor_oid_mismatch.rs");
+}
+
+#[test]
 fn compile_fail_digest_mismatch() {
 	let t = trybuild::TestCases::new();
 	t.compile_fail("tests/compile/digest_mismatch.rs");

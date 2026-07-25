@@ -17,12 +17,12 @@ use crate::der::asn1::ObjectIdentifier;
 use crate::der::Sequence;
 use crate::oids::AES_256_WRAP;
 
-#[cfg(feature = "aead")]
-use crate::crypto::aead::Aead;
 #[cfg(all(feature = "aead", feature = "signature", feature = "kdf", feature = "ecdh"))]
 use crate::crypto::aead::Aes256Gcm;
 #[cfg(all(feature = "aead", feature = "aes-gcm"))]
 use crate::crypto::aead::Aes256GcmOid;
+#[cfg(feature = "aead")]
+use crate::crypto::aead::{Aead, Encryptor};
 #[cfg(feature = "ecdh")]
 use crate::crypto::curves::Secp256k1Oid;
 #[cfg(feature = "digest")]
@@ -228,9 +228,12 @@ pub trait DigestProvider {
 /// Provides AEAD cipher functionality.
 ///
 /// Separates AEAD operations (encryption/decryption) from other crypto primitives.
+///
+/// `AeadCipher` MUST implement [`Encryptor`](crate::crypto::aead::Encryptor) for
+/// `AeadOid` so the wire algorithm identifier cannot diverge from the cipher.
 #[cfg(feature = "aead")]
 pub trait AeadProvider {
-	type AeadCipher: Aead + Send + Sync;
+	type AeadCipher: Aead + Encryptor<Self::AeadOid> + Send + Sync;
 	type AeadOid: AssociatedOid;
 
 	fn to_aead_algorithm_identifier(&self) -> AlgorithmIdentifierOwned {

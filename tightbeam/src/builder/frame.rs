@@ -353,7 +353,7 @@ impl<T: Message> FrameBuilder<T> {
 	pub fn with_aead<C, Cipher>(mut self, cipher: Cipher) -> Self
 	where
 		C: AssociatedOid,
-		Cipher: Aead + 'static,
+		Cipher: Aead + Encryptor<C> + 'static,
 		T: CheckAeadOid<C>,
 	{
 		// Runtime fallback validation
