@@ -154,6 +154,7 @@ mod tests;
 
 pub mod client;
 pub mod negotiation;
+pub mod receipt;
 pub mod server;
 pub mod state;
 
@@ -194,16 +195,16 @@ use crate::crypto::profiles::{CryptoProvider, DefaultCryptoProvider, SecurityPro
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::der::asn1::SetOfVec;
 use crate::der::{Any, Decode, Encode, Enumerated, Sequence, Tag};
-use crate::oids::{CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA};
+use crate::oids::{CLIENT_CERTIFICATE, CLIENT_SIGNATURE, DATA, RECEIPT_SIGNATURE};
 use crate::transport::error::TransportError;
 use crate::transport::handshake::error::Result;
 use crate::transport::handshake::negotiation::{
 	MuxSettings, SecurityAccept, SecurityOffer, TransportAccept, TransportOffer,
 };
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
+use crate::transport::handshake::receipt::{SessionReceipt, StoredReceipt};
 use crate::utils::marker::{MaybeSend, MaybeSendFuture};
-
-#[cfg(feature = "transport-cms")]
-use crate::transport::handshake::server::CmsHandshakeServer;
 use crate::Beamable;
 
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -226,6 +227,10 @@ use crate::spki::EncodePublicKey;
 use crate::transport::handshake::client::EciesHandshakeClient;
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::client::ExtractVerifyingKey;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::transport::handshake::negotiation::TransportAuthorizer;
+#[cfg(feature = "transport-cms")]
+use crate::transport::handshake::server::CmsHandshakeServer;
 #[cfg(feature = "transport-ecies")]
 use crate::transport::handshake::server::EciesHandshakeServer;
 
@@ -334,7 +339,8 @@ pub enum CmsServerIdentity {
 	/// A bare server certificate, evaluated directly against the trust store.
 	Certificate(Arc<Certificate>),
 	/// Full server chain, ordered root to leaf. Path validation runs over the
-	/// chain (RFC 5280 §6.1) and the leaf becomes the encryption target.
+	/// chain ([RFC 5280 §6.1](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1))
+	/// and the leaf becomes the encryption target.
 	Chain(Arc<[Certificate]>),
 }
 
@@ -372,6 +378,9 @@ pub struct CmsClientConfig {
 	/// Client certificate embedded in the Finished message for mutual
 	/// authentication.
 	pub client_certificate: Option<Arc<Certificate>>,
+	/// Receipt approver consulted before countersigning a session
+	/// receipt. `None` fails closed on challenge-bearing receipts.
+	pub receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 }
 
 /// Encapsulated server key manager for handshake protocols.
@@ -437,6 +446,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// # Returns
 	/// A boxed ECIES server handshake orchestrator that uses the encapsulated key provider
 	#[cfg(feature = "transport-ecies")]
+	#[allow(clippy::too_many_arguments)]
 	pub fn create_ecies_server(
 		&self,
 		server_cert: Arc<Certificate>,
@@ -444,6 +454,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		supported_profiles: Vec<SecurityProfileDesc>,
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 		transport_config: Option<TransportOffer>,
+		transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
+		session_observer: Option<Arc<dyn SessionObserver>>,
 	) -> Result<BoxedServerHandshake>
 	where
 		P::Curve: Curve + CurveArithmetic,
@@ -460,6 +472,12 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 
 		if let Some(config) = transport_config {
 			server = server.with_transport_config(config);
+		}
+		if let Some(authorizer) = transport_authorizer {
+			server = server.with_transport_authorizer(authorizer);
+		}
+		if let Some(observer) = session_observer {
+			server = server.with_session_observer(observer);
 		}
 
 		Ok(Box::new(server))
@@ -486,6 +504,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		aad_domain_tag: Option<&'static [u8]>,
 		validator: Option<Arc<dyn CertificateValidation>>,
 		transport_offer: Option<TransportOffer>,
+		receipt_approver: Option<Arc<dyn ReceiptApprover>>,
 	) -> Result<BoxedClientHandshake>
 	where
 		M: EciesMessageOps + Send + Sync + 'static,
@@ -501,14 +520,15 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		P::AeadCipher: KeyInit + Send + Sync + 'static,
 	{
 		let provider_opt = client_cert.as_ref().map(|_| Arc::clone(&self.provider));
-
 		let mut client = EciesHandshakeClient::<P, M>::new_with_identity(aad_domain_tag, client_cert, provider_opt);
-
 		if let Some(validator) = validator {
 			client = client.with_certificate_validator(validator);
 		}
 		if let Some(offer) = transport_offer {
 			client = client.with_transport_offer(offer);
+		}
+		if let Some(approver) = receipt_approver {
+			client = client.with_receipt_approver(approver);
 		}
 
 		Ok(Box::new(client))
@@ -553,6 +573,9 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		if let Some(cert) = config.client_certificate {
 			client = client.with_client_certificate(cert);
 		}
+		if let Some(approver) = config.receipt_approver {
+			client = client.with_receipt_approver(approver);
+		}
 
 		Ok(Box::new(client))
 	}
@@ -563,7 +586,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 	/// ensuring proper encapsulation and enabling HSM/KMS integration.
 	///
 	/// # Parameters
-	/// - `client_validators`: Optional validators for client certificate authentication (mutual auth)
+	/// - `client_validators`: Optional validators for client certificate authentication
 	///
 	/// # Returns
 	/// A CMS server handshake orchestrator that uses the encapsulated key provider
@@ -573,6 +596,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 		client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 		supported_profiles: Vec<SecurityProfileDesc>,
 		transport_config: Option<TransportOffer>,
+		transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
+		session_observer: Option<Arc<dyn SessionObserver>>,
 	) -> Result<BoxedServerHandshake>
 	where
 		P::Curve: Curve + CurveArithmetic,
@@ -590,6 +615,12 @@ impl<P: CryptoProvider + Send + Sync + 'static> HandshakeKeyManager<P> {
 
 		if let Some(config) = transport_config {
 			server = server.with_transport_config(config);
+		}
+		if let Some(authorizer) = transport_authorizer {
+			server = server.with_transport_authorizer(authorizer);
+		}
+		if let Some(observer) = session_observer {
+			server = server.with_session_observer(observer);
 		}
 
 		Ok(Box::new(server))
@@ -640,6 +671,9 @@ pub enum HandshakeAlert {
 	DecryptFail = 4,
 	/// Finished (transcript hash) MAC/signature verification failure
 	FinishedIntegrityFail = 5,
+	// Code 6 is burned: it briefly named a settlement-rejected alert that
+	// never shipped. Do not reuse. The next alert takes 7 so archived
+	// captures never decode a stale meaning
 }
 
 // ============================================================================
@@ -697,6 +731,14 @@ pub trait ClientHandshakeProtocol: MaybeSend {
 	/// Returns `Some(MuxSettings)` only when both sides negotiated
 	/// multiplexing during the handshake. `None` means lock-step.
 	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		None
+	}
+
+	/// Get the dual-signed session receipt.
+	///
+	/// Returns `Some(StoredReceipt)` only after a budget-bearing
+	/// handshake completed with both signatures in place.
+	fn session_receipt(&self) -> Option<&StoredReceipt> {
 		None
 	}
 }
@@ -760,6 +802,14 @@ pub trait ServerHandshakeProtocol: MaybeSend {
 	/// Returns `Some(MuxSettings)` only when both sides negotiated
 	/// multiplexing during the handshake. `None` means lock-step.
 	fn negotiated_mux(&self) -> Option<MuxSettings> {
+		None
+	}
+
+	/// Get the dual-signed session receipt.
+	///
+	/// Returns `Some(StoredReceipt)` only after a budget-bearing
+	/// handshake completed with both signatures in place.
+	fn session_receipt(&self) -> Option<&StoredReceipt> {
 		None
 	}
 }
@@ -838,7 +888,20 @@ pub struct ServerHandshake {
 	/// client offered and the server enabled multiplexing locally.
 	#[asn1(context_specific = "0", optional = "true")]
 	pub transport_accept: Option<TransportAccept>,
+	/// Session receipt body for budget-bearing sessions. Carries the
+	/// transcript hash, granted budgets, and the settlement challenge.
+	#[asn1(context_specific = "1", optional = "true")]
+	pub session_receipt: Option<SessionReceipt>,
+	/// Server signature over the domain-tagged receipt body digest.
+	#[asn1(context_specific = "2", optional = "true")]
+	pub receipt_signature: Option<OctetString>,
 }
+
+/// Fixed prefix of the ECIES key-exchange payload: `base_key(32) ||
+/// client_random(32) || u32-BE response length`. The confidential
+/// settlement answer, if any, follows this prefix.
+#[cfg(feature = "transport-ecies")]
+pub(crate) const ECIES_SESSION_PREFIX_LEN: usize = 32 + 32 + 4;
 
 #[derive(Beamable, Sequence, Debug, Clone, PartialEq)]
 pub struct ClientKeyExchange {
@@ -853,6 +916,12 @@ pub struct ClientKeyExchange {
 	#[cfg(feature = "x509")]
 	#[asn1(optional = "true")]
 	pub client_signature: Option<OctetString>,
+	/// Countersignature over the domain-tagged receipt body digest plus
+	/// the ancillary response. Required whenever the server issued a
+	/// session receipt.
+	#[cfg(feature = "x509")]
+	#[asn1(context_specific = "0", optional = "true")]
+	pub receipt_signature: Option<OctetString>,
 }
 
 // ============================================================================
@@ -951,6 +1020,14 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 		attrs.push(Attribute { oid: CLIENT_SIGNATURE, values: sig_values });
 	}
 
+	if let Some(sig) = &kex.receipt_signature {
+		let sig_der = sig.to_der()?;
+		let sig_any = Any::new(Tag::OctetString, sig_der)?;
+		let sig_values = SetOfVec::try_from(vec![AttributeValue::from(sig_any)])?;
+
+		attrs.push(Attribute { oid: RECEIPT_SIGNATURE, values: sig_values });
+	}
+
 	if attrs.is_empty() {
 		Ok(None)
 	} else {
@@ -958,32 +1035,49 @@ fn build_client_key_exchange_attrs(kex: &ClientKeyExchange) -> Result<Option<x50
 	}
 }
 
+/// First value of an attribute decoded as an OCTET STRING.
+#[cfg(feature = "x509")]
+fn first_octet_string(attr: &Attribute) -> Result<Option<OctetString>> {
+	attr.values
+		.iter()
+		.next()
+		.map(|value| OctetString::from_der(value.value()))
+		.transpose()
+		.map_err(Into::into)
+}
+
 /// Helper function to parse unprotected attributes from EnvelopedData
 #[cfg(feature = "x509")]
-fn parse_client_key_exchange_attrs(
-	enveloped_data: &EnvelopedData,
-) -> Result<(Option<Certificate>, Option<OctetString>)> {
-	let mut cert = None;
-	let mut sig = None;
+fn parse_client_key_exchange_attrs(enveloped_data: &EnvelopedData) -> Result<ClientKeyExchangeAttrs> {
+	let mut parsed = ClientKeyExchangeAttrs::default();
 
 	if let Some(attrs) = &enveloped_data.unprotected_attrs {
 		for attr in attrs.iter() {
 			if attr.oid == CLIENT_CERTIFICATE {
-				if let Some(value) = attr.values.iter().next() {
-					let octet_bytes = value.value();
-					let cert_octet = OctetString::from_der(octet_bytes)?;
-					cert = Some(Certificate::from_der(cert_octet.as_bytes())?);
+				if let Some(cert_octet) = first_octet_string(attr)? {
+					let cert_der = cert_octet.as_bytes();
+					let cert = Certificate::from_der(cert_der)?;
+
+					parsed.certificate = Some(cert);
 				}
 			} else if attr.oid == CLIENT_SIGNATURE {
-				if let Some(value) = attr.values.iter().next() {
-					let octet_bytes = value.value();
-					sig = Some(OctetString::from_der(octet_bytes)?);
-				}
+				parsed.signature = first_octet_string(attr)?;
+			} else if attr.oid == RECEIPT_SIGNATURE {
+				parsed.receipt_signature = first_octet_string(attr)?;
 			}
 		}
 	}
 
-	Ok((cert, sig))
+	Ok(parsed)
+}
+
+/// Parsed unprotected attributes of a [`ClientKeyExchange`] envelope.
+#[cfg(feature = "x509")]
+#[derive(Default)]
+struct ClientKeyExchangeAttrs {
+	certificate: Option<Certificate>,
+	signature: Option<OctetString>,
+	receipt_signature: Option<OctetString>,
 }
 
 /// Convert ClientKeyExchange to EnvelopedData (opaque wrapper for ECIES ciphertext)
@@ -1024,16 +1118,19 @@ impl TryFrom<&EnvelopedData> for ClientKeyExchange {
 			.ok_or(HandshakeError::InvalidClientKeyExchange)?
 			.as_bytes();
 
-		// Extract client certificate and signature from unprotected_attrs
+		// Extract client certificate, signatures, and settlement answer
+		// from unprotected_attrs
 		#[cfg(feature = "x509")]
-		let (client_certificate, client_signature) = parse_client_key_exchange_attrs(enveloped_data)?;
+		let attrs = parse_client_key_exchange_attrs(enveloped_data)?;
 
 		Ok(ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
 			#[cfg(feature = "x509")]
-			client_certificate,
+			client_certificate: attrs.certificate,
 			#[cfg(feature = "x509")]
-			client_signature,
+			client_signature: attrs.signature,
+			#[cfg(feature = "x509")]
+			receipt_signature: attrs.receipt_signature,
 		})
 	}
 }

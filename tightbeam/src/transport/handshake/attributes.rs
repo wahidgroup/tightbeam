@@ -6,17 +6,20 @@ use alloc::vec::Vec;
 
 use core::cmp::{Ord, Ordering, PartialOrd};
 
+#[cfg(feature = "transport-cms")]
+use crate::cms::signed_data::SignedData;
 use crate::crypto::x509::attr::Attribute;
 use crate::der::asn1::{ObjectIdentifier, OctetString, UintRef};
 use crate::der::{asn1::Any, Sequence, Tagged};
 use crate::transport::handshake::negotiation::{SecurityAccept, SecurityOffer, TransportAccept, TransportOffer};
+use crate::transport::handshake::receipt::SessionReceipt;
 
 use super::{HandshakeAlert, HandshakeError};
 use crate::oids::{
 	HANDSHAKE_ABORT_ALERT, HANDSHAKE_ALGORITHM_PROFILE, HANDSHAKE_CLIENT_NONCE, HANDSHAKE_PROTOCOL_VERSION,
 	HANDSHAKE_SECURITY_ACCEPT, HANDSHAKE_SECURITY_OFFER, HANDSHAKE_SELECTED_CURVE, HANDSHAKE_SELECT_ALGORITHM,
 	HANDSHAKE_SELECT_VERSION, HANDSHAKE_SERVER_NONCE, HANDSHAKE_SUPPORTED_CURVES, HANDSHAKE_TRANSCRIPT_HASH,
-	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER,
+	HANDSHAKE_TRANSPORT_ACCEPT, HANDSHAKE_TRANSPORT_OFFER, RECEIPT_RESPONSE, RECEIPT_SIGNATURE, SESSION_RECEIPT,
 };
 
 /// Maximum number of curve OIDs accepted in a supported-curves attribute.
@@ -224,6 +227,28 @@ pub fn transport_accept_transcript_bytes(accept: &TransportAccept) -> Result<Vec
 	Ok(Any::encode_from(accept)?.to_der()?)
 }
 
+/// Encode a session receipt body attribute (CMS carriage).
+pub fn encode_session_receipt(receipt: &SessionReceipt) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(receipt)?;
+	HandshakeAttribute::new_single(SESSION_RECEIPT, any)
+}
+
+/// Encode a receipt signature attribute: the server's receipt signature
+/// in the server Finished, the client's countersignature in the client
+/// Finished.
+pub fn encode_receipt_signature(signature: &OctetString) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(signature)?;
+	HandshakeAttribute::new_single(RECEIPT_SIGNATURE, any)
+}
+
+/// Encode a receipt ancillary response attribute. The octets are a
+/// DER-encoded EnvelopedData that encrypts the settlement answer to
+/// the server. The plaintext answer never travels the cleartext wire.
+pub fn encode_receipt_response(response: &OctetString) -> Result<HandshakeAttribute, HandshakeError> {
+	let any = Any::encode_from(response)?;
+	HandshakeAttribute::new_single(RECEIPT_RESPONSE, any)
+}
+
 // -------------------------- Decoders --------------------------
 
 pub fn extract_nonce(attr: &HandshakeAttribute) -> Result<[u8; 32], HandshakeError> {
@@ -359,9 +384,71 @@ pub fn extract_transport_accept(attr: &HandshakeAttribute) -> Result<TransportAc
 	Ok(any.decode_as()?)
 }
 
+/// Extract the server-issued [`SessionReceipt`] from unprotected attributes.
+pub fn extract_session_receipt(attr: &HandshakeAttribute) -> Result<SessionReceipt, HandshakeError> {
+	if attr.attr_type != SESSION_RECEIPT {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let any = attr.value()?;
+	Ok(any.decode_as()?)
+}
+
+/// Extract a receipt signature (server or client) from unprotected attributes.
+pub fn extract_receipt_signature(attr: &HandshakeAttribute) -> Result<OctetString, HandshakeError> {
+	if attr.attr_type != RECEIPT_SIGNATURE {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let any = attr.value()?;
+	Ok(any.decode_as()?)
+}
+
+/// Extract the enveloped settlement-answer bytes from unprotected attributes.
+pub fn extract_receipt_response(attr: &HandshakeAttribute) -> Result<OctetString, HandshakeError> {
+	if attr.attr_type != RECEIPT_RESPONSE {
+		return Err(HandshakeError::MissingAttribute);
+	}
+
+	let any = attr.value()?;
+	Ok(any.decode_as()?)
+}
+
+/// Find at most one unsigned attribute with `oid` across the SignerInfos
+/// of a parsed Finished message, rejecting duplicates.
+///
+/// [RFC 5652 §11.4](https://datatracker.ietf.org/doc/html/rfc5652#section-11.4)
+/// permits repeated unsigned attributes, but every TightBeam handshake
+/// attribute is single-use: a duplicate is either a builder bug or an
+/// injection attempt, and fails closed.
+#[cfg(feature = "transport-cms")]
+pub fn find_unsigned_attr(
+	signed_data: &SignedData,
+	oid: ObjectIdentifier,
+) -> Result<Option<HandshakeAttribute>, HandshakeError> {
+	let mut found = None;
+	let matches = signed_data
+		.signer_infos
+		.0
+		.iter()
+		.filter_map(|signer_info| signer_info.unsigned_attrs.as_ref())
+		.flat_map(|attrs| attrs.iter())
+		.filter(|attr| attr.oid == oid);
+
+	for attr in matches {
+		if found.is_some() {
+			return Err(HandshakeError::DuplicateAttribute);
+		}
+
+		found = Some(HandshakeAttribute::from(attr));
+	}
+
+	Ok(found)
+}
+
 /// Decode an alert code from a single INTEGER-bearing `Any`.
 ///
-/// Alert codes occupy the u8 domain; wider values are rejected outright so a
+/// Alert codes occupy the u8 domain. Wider values are rejected outright so a
 /// two-byte code can never alias a valid alert through truncation.
 fn alert_from_any(any: &Any) -> Result<HandshakeAlert, HandshakeError> {
 	let code = u16_from_any(any)?;
@@ -570,13 +657,14 @@ mod tests {
 		}
 
 		// Unknown alert code
-		let unknown_any = mk_integer(&[0x06])?;
+		let unknown_any = mk_integer(&[0x07])?;
 		let unknown_attr = HandshakeAttribute { attr_type: HANDSHAKE_ABORT_ALERT, attr_values: vec![unknown_any] };
 		if let HandshakeError::UnknownAlertCode(c) = extract_alert(&unknown_attr).unwrap_err() {
-			assert_eq!(c, 6u8);
+			assert_eq!(c, 7u8);
 		} else {
 			panic!("expected UnknownAlertCode");
 		}
+
 		Ok(())
 	}
 
@@ -601,7 +689,6 @@ mod tests {
 		// Extract and verify
 		let extracted = extract_supported_curves(&attr)?;
 		assert_eq!(extracted, curves);
-
 		Ok(())
 	}
 
@@ -612,7 +699,6 @@ mod tests {
 
 		let extracted = extract_selected_curve(&attr)?;
 		assert_eq!(extracted, CURVE_NIST_P256);
-
 		Ok(())
 	}
 
@@ -648,7 +734,7 @@ mod tests {
 
 	#[test]
 	fn alert_code_above_255_rejected() -> Result<(), der::Error> {
-		// 0x0101 = 257; truncating to u8 would alias alert code 1 (AuthRequired)
+		// 0x0101 = 257. Truncating to u8 would alias alert code 1 (AuthRequired)
 		let any = mk_integer(&[0x01, 0x01])?;
 		let attr = HandshakeAttribute { attr_type: HANDSHAKE_ABORT_ALERT, attr_values: vec![any] };
 		assert!(matches!(extract_alert(&attr).unwrap_err(), HandshakeError::IntegerOutOfRange));
@@ -664,7 +750,6 @@ mod tests {
 		// Should fail because OID doesn't match
 		let result = extract_supported_curves(&wrong_attr);
 		assert!(matches!(result.unwrap_err(), HandshakeError::MissingAttribute));
-
 		Ok(())
 	}
 }

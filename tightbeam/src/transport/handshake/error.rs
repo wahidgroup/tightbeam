@@ -132,6 +132,39 @@ pub enum HandshakeError {
 	)]
 	MutualAuthRequired,
 
+	/// Budget-bearing session requires a session receipt but none arrived
+	#[cfg_attr(
+		feature = "derive",
+		error("Session receipt required for budget-bearing session but missing")
+	)]
+	ReceiptMissing,
+
+	/// Session receipt disagrees with the negotiated session parameters
+	#[cfg_attr(
+		feature = "derive",
+		error("Session receipt does not match the negotiated session")
+	)]
+	ReceiptMismatch,
+
+	/// Client countersignature required for budget-bearing session but missing
+	#[cfg_attr(
+		feature = "derive",
+		error("Receipt countersignature required for budget-bearing session but missing")
+	)]
+	CountersignatureMissing,
+
+	/// Client's receipt approver refused the session receipt
+	#[cfg_attr(feature = "derive", error("Session receipt refused by approver: code {code}"))]
+	ApprovalRefused { code: u32 },
+
+	/// Server's authorizer rejected the settlement answer
+	#[cfg_attr(feature = "derive", error("Settlement rejected: code {code}"))]
+	SettlementRejected { code: u32 },
+
+	/// The approver's settlement answer exceeds the wire length prefix
+	#[cfg_attr(feature = "derive", error("Settlement answer too large for the wire encoding"))]
+	AnswerTooLarge,
+
 	/// Peer identity mismatch during re-handshake (immutable identity violation)
 	#[cfg_attr(
 		feature = "derive",
@@ -329,7 +362,7 @@ pub enum HandshakeError {
 	InvalidOctetStringLength(&'static str),
 }
 
-// Mirrors the `#[error(...)]` strings above; compiled only without `derive`.
+// Mirrors the `#[error(...)]` strings above. Compiled only without `derive`.
 crate::impl_error_display!(HandshakeError {
 	TranscriptAlreadyLocked => "Handshake invariant violation: transcript already locked",
 	TranscriptNotLocked => "Handshake invariant violation: transcript not locked",
@@ -355,6 +388,12 @@ crate::impl_error_display!(HandshakeError {
 	InvalidTranscriptHash => "Invalid transcript hash",
 	TranscriptDigestLength { expected, received } => "Transcript digest length invalid: expected {expected} bytes, got {received}",
 	MutualAuthRequired => "Server requires mutual authentication but client has no identity",
+	ReceiptMissing => "Session receipt required for budget-bearing session but missing",
+	ReceiptMismatch => "Session receipt does not match the negotiated session",
+	CountersignatureMissing => "Receipt countersignature required for budget-bearing session but missing",
+	ApprovalRefused { code } => "Session receipt refused by approver: code {code}",
+	SettlementRejected { code } => "Settlement rejected: code {code}",
+	AnswerTooLarge => "Settlement answer too large for the wire encoding",
 	PeerIdentityMismatch => "Peer identity changed during re-handshake - connection identity is immutable",
 	PinnedCertificateMismatch => "Provisioned certificate chain leaf does not match pinned server certificate",
 	MissingClientRandom => "Missing client random from ClientHello",

@@ -22,7 +22,8 @@ use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
 use crate::der::Encode;
 use crate::transport::error::TransportFailure;
-use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
+use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
+use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
 use crate::transport::handshake::{
 	BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
 };
@@ -98,7 +99,7 @@ where
 	async fn read_envelope(&mut self) -> TransportResult<Vec<u8>> {
 		let handshake_pending = self.is_handshake_pending();
 
-		// Absolute deadline for the whole envelope read; every stage below
+		// Absolute deadline for the whole envelope read. Every stage below
 		// re-arms the per-recv timeout with the *remaining* budget. Handshake
 		// reads face an unauthenticated peer, so the handshake deadline
 		// applies from the first byte onward.
@@ -157,7 +158,7 @@ where
 				}
 			}
 
-			// Read content. Without a deadline one read suffices; with one,
+			// Read content. Without a deadline one read suffices. With one,
 			// read in slices and re-check the remaining budget between them
 			// so a byte-dripping peer cannot stretch the read via per-recv
 			// timeout resets inside a single large read_exact.
@@ -411,11 +412,27 @@ where
 	}
 
 	fn to_mux_config(&self) -> Option<TransportOffer> {
-		self.mux_config
+		self.mux_config.clone()
+	}
+
+	fn to_transport_authorizer(&self) -> Option<Arc<dyn TransportAuthorizer>> {
+		self.transport_authorizer.as_ref().map(Arc::clone)
+	}
+
+	fn to_receipt_approver(&self) -> Option<Arc<dyn ReceiptApprover>> {
+		self.receipt_approver.as_ref().map(Arc::clone)
+	}
+
+	fn to_session_observer(&self) -> Option<Arc<dyn SessionObserver>> {
+		self.session_observer.as_ref().map(Arc::clone)
 	}
 
 	fn set_mux_settings(&mut self, settings: Option<MuxSettings>) {
 		self.mux_settings = settings;
+	}
+
+	fn set_session_receipt(&mut self, receipt: Option<StoredReceipt>) {
+		self.session_receipt = receipt;
 	}
 }
 
@@ -633,21 +650,23 @@ mod tests {
 			Ok((result, started.elapsed()))
 		});
 
-		// SEQUENCE header declaring 600 content bytes, sent whole; the body
+		// SEQUENCE header declaring 600 content bytes, sent whole. The body
 		// then drips one byte per 10ms (well under any per-recv timeout).
 		let mut stream = NetTcpStream::connect(addr)?;
 		Write::write_all(&mut stream, &[0x30, 0x82, 0x02, 0x58])?;
+
 		let drip_handle = thread::spawn(move || {
 			for _ in 0..600 {
 				if Write::write_all(&mut stream, &[0u8]).is_err() {
 					break;
 				}
+
 				thread::sleep(Duration::from_millis(10));
 			}
 		});
 
 		// A panicked server thread surfaces as an I/O error rather than a
-		// re-panic; the closure itself only fails through `?`.
+		// re-panic. The closure itself only fails through `?`.
 		let (result, elapsed) = server_handle
 			.join()
 			.map_err(|_| TransportError::IoError(IoError::from(ErrorKind::Other)))??;

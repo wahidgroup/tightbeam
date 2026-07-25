@@ -1,7 +1,7 @@
 //! ASN.1 structures for prekey-based handshake protocols.
 //!
 //! UNSTABLE: gated behind the `unstable-pqxdh` feature. No orchestrator
-//! consumes these structures yet; the API may change or be removed before
+//! consumes these structures yet. The API may change or be removed before
 //! an end-to-end PQXDH protocol ships.
 //!
 //! Provides standard structures for asynchronous key agreement protocols
@@ -15,9 +15,9 @@ use crate::Beamable;
 
 /// Prekey bundle for PQXDH-style protocols.
 ///
-/// Contains the public key material that a party publishes for
-/// asynchronous key agreement. Other parties retrieve this bundle
-/// and use it to establish a shared secret without real-time interaction.
+/// Contains the public key material that a party publishes for asynchronous
+/// key agreement. Other parties retrieve this bundle and use it to establish
+/// a shared secret without real-time interaction.
 ///
 /// # Fields
 /// - `identity_key`: Long-term identity public key (EC)

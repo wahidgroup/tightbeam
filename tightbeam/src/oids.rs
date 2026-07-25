@@ -36,7 +36,7 @@ pub const COMPRESSION_ZLIB: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2
 
 /// Zstandard (zstd) compression, RFC 8878.
 ///
-/// RFC 8878 defines the format and media type only; neither IETF nor the
+/// RFC 8878 defines the format and media type only. Neither IETF nor the
 /// S/MIME algorithm registry (RFC 7107) assigns an OID for zstd. This value
 /// lives under the same placeholder enterprise arc as the handshake attribute
 /// OIDs below and MUST be replaced together with them once a Private
@@ -184,6 +184,17 @@ pub const HANDSHAKE_TRANSPORT_OFFER: ObjectIdentifier = ObjectIdentifier::new_un
 /// Handshake transport capability accept OID (multiplexing)
 pub const HANDSHAKE_TRANSPORT_ACCEPT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.16");
 
+/// Session receipt signature OID: server signature in the server's
+/// handshake message, client countersignature in the client's.
+pub const RECEIPT_SIGNATURE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.17");
+
+/// Session receipt ancillary response OID. In CMS carriage the value is
+/// an `EnvelopedData` (RFC 5652 s6) encrypted to the server certificate.
+pub const RECEIPT_RESPONSE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.18");
+
+/// Session receipt body OID (CMS attribute carriage)
+pub const SESSION_RECEIPT: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.4.1.55555.1.19");
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -234,6 +245,9 @@ mod tests {
 			(CLIENT_SIGNATURE, "1.3.6.1.4.1.55555.1.14"),
 			(HANDSHAKE_TRANSPORT_OFFER, "1.3.6.1.4.1.55555.1.15"),
 			(HANDSHAKE_TRANSPORT_ACCEPT, "1.3.6.1.4.1.55555.1.16"),
+			(RECEIPT_SIGNATURE, "1.3.6.1.4.1.55555.1.17"),
+			(RECEIPT_RESPONSE, "1.3.6.1.4.1.55555.1.18"),
+			(SESSION_RECEIPT, "1.3.6.1.4.1.55555.1.19"),
 		];
 
 		for (oid, expected) in pinned {

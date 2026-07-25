@@ -19,6 +19,10 @@ mod instrumentation;
 #[cfg(feature = "full")]
 mod tightbeam_core;
 
+// tests/core/
+#[cfg(feature = "full")]
+mod protocol_core;
+
 #[cfg(feature = "transport")]
 mod transport;
 

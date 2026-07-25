@@ -31,7 +31,8 @@ use crate::builder::TypeBuilder;
 use crate::der::Encode;
 use crate::policy::TransitStatus;
 use crate::transport::error::TransportFailure;
-use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
+use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
+use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
 use crate::transport::io::{decode_transport_envelope, ensure_compatible_versions};
 use crate::transport::tcp::HANDSHAKE_MAX_WIRE;
 use crate::transport::ResponsePackage;
@@ -504,11 +505,27 @@ where
 	}
 
 	fn to_mux_config(&self) -> Option<TransportOffer> {
-		self.mux_config
+		self.mux_config.clone()
+	}
+
+	fn to_transport_authorizer(&self) -> Option<Arc<dyn TransportAuthorizer>> {
+		self.transport_authorizer.as_ref().map(Arc::clone)
+	}
+
+	fn to_receipt_approver(&self) -> Option<Arc<dyn ReceiptApprover>> {
+		self.receipt_approver.as_ref().map(Arc::clone)
+	}
+
+	fn to_session_observer(&self) -> Option<Arc<dyn SessionObserver>> {
+		self.session_observer.as_ref().map(Arc::clone)
 	}
 
 	fn set_mux_settings(&mut self, settings: Option<MuxSettings>) {
 		self.mux_settings = settings;
+	}
+
+	fn set_session_receipt(&mut self, receipt: Option<StoredReceipt>) {
+		self.session_receipt = receipt;
 	}
 }
 
@@ -686,7 +703,7 @@ where
 	R: AsyncReadStream,
 	TransportError: From<R::Error>,
 {
-	/// Override the receive cipher's rekey record limit (RFC 8446 § 5.5).
+	/// Override the receive cipher's rekey record limit ([RFC 8446 § 5.5](https://datatracker.ietf.org/doc/html/rfc8446#section-5.5)).
 	/// MUST be at least the peer's send limit or legitimate records near
 	/// the limit are refused.
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
@@ -744,7 +761,8 @@ where
 	W: AsyncWriteStream,
 	TransportError: From<W::Error>,
 {
-	/// Override the send cipher's rekey record limit (RFC 8446 § 5.5).
+	/// Override the send cipher's rekey record limit
+	/// ([RFC 8446 § 5.5](https://datatracker.ietf.org/doc/html/rfc8446#section-5.5)).
 	pub fn with_rekey_limit(mut self, limit: u64) -> Self {
 		self.send_key = self.send_key.with_rekey_limit(limit);
 		self
@@ -1060,7 +1078,7 @@ where
 	}
 
 	async fn write_envelope(&mut self, buffer: &[u8]) -> TransportResult<()> {
-		// Apply operation timeout if configured (tokio only; see read_envelope).
+		// Apply operation timeout if configured (tokio only. See read_envelope).
 		#[cfg(all(feature = "tokio", feature = "transport-policy"))]
 		if let Some(dur) = self.operation_timeout {
 			timeout(dur, self.stream.write_frame(buffer)).await??;
@@ -1138,7 +1156,7 @@ where
 		// Ensure handshake is complete
 		self.ensure_handshake_complete().await?;
 
-		// Perform send/receive with optional timeout (tokio only; non-tokio
+		// Perform send/receive with optional timeout (tokio only. Non-tokio
 		// runtimes have no portable timer and emit without a deadline).
 		#[cfg(feature = "tokio")]
 		{
@@ -1163,7 +1181,7 @@ where
 #[cfg(feature = "tokio")]
 impl<P: CryptoProvider + Send + Sync> PersistentConnection for TokioListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		// Lightweight liveness check delegated to the stream; performs no I/O.
+		// Lightweight liveness check delegated to the stream. Performs no I/O.
 		transport.stream.is_alive()
 	}
 

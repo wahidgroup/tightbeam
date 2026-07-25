@@ -9,11 +9,11 @@
 //! attempted with a wrong key, and compared across two handshakes.
 //!
 //! ## Expected control
-//! The session key MUST never be transmitted in the clear; it MUST be derived
+//! The session key MUST never be transmitted in the clear. It MUST be derived
 //! via ECDH + HKDF into an AEAD key. Decryption MUST succeed only with the
-//! correct private key, yield the expected 64-byte plaintext
-//! (`base_session_key || client_random`), and produce fresh ciphertext per
-//! handshake.
+//! correct private key, yield the expected 68-byte plaintext
+//! (`base_session_key || client_random || u32-BE response length`), and
+//! produce fresh ciphertext per handshake.
 //!
 //! ## References
 //! - CWE-311: Missing Encryption of Sensitive Data
@@ -128,7 +128,7 @@ job! {
 		let ciphertext = extract_ecies_ciphertext(&client_kex.payload)?;
 
 		// Verify we got meaningful ciphertext
-		// ECIES overhead: 33 pubkey + 12 nonce + 16 tag + 64 plaintext = 125 bytes
+		// ECIES overhead: 33 pubkey + 12 nonce + 16 tag + 68 plaintext = 129 bytes
 		if ciphertext.len() < 100 {
 			return Err(expectation_failure("ciphertext too short to be valid ECIES"));
 		}
@@ -141,9 +141,11 @@ job! {
 		let correct_key = harness.materials().secret_key();
 		match try_decrypt_ecies(&ciphertext, correct_key, None) {
 			DecryptionResult::Success { plaintext_len } => {
-				// Plaintext must be 64 bytes: base_session_key (32) || client_random (32)
-				if plaintext_len != 64 {
-					return Err(expectation_failure("decrypted plaintext is not 64 bytes"));
+				// Plaintext must be 68 bytes: base_session_key (32) ||
+				// client_random (32) || u32-BE response length (4, zero
+				// for this unmetered session)
+				if plaintext_len != 68 {
+					return Err(expectation_failure("decrypted plaintext is not 68 bytes"));
 				}
 
 				trace.event(ConfidentialitySpec::conf_decrypt_correct_key)?;

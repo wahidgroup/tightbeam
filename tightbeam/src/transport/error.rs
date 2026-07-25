@@ -41,6 +41,9 @@ pub enum TransportFailure {
 	/// concurrent stream slot is in flight. Retry after a response frees
 	/// a slot, or open another connection
 	StreamsExhausted,
+	/// Outbound session budget exhausted on a multiplexed connection:
+	/// the epoch's remaining spendable credits cannot cover the frame.
+	BudgetExhausted,
 	/// Gate policy rejected (general)
 	PolicyRejection,
 	/// Peer refusal: the caller cancelled the operation

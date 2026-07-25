@@ -338,7 +338,7 @@ where
 
 	/// Get the multiplexing advertisement for accepted connections
 	pub fn mux_offer(&self) -> Option<TransportOffer> {
-		self.mux_offer
+		self.mux_offer.clone()
 	}
 }
 
@@ -400,7 +400,7 @@ where
 
 	/// Get the multiplexing advertisement for accepted connections
 	pub fn mux_offer(&self) -> Option<TransportOffer> {
-		self.mux_offer
+		self.mux_offer.clone()
 	}
 }
 

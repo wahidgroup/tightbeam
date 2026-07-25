@@ -76,16 +76,10 @@ pub const AES_GCM_TAG_SIZE: usize = 16;
 
 /// AEAD record limit per directional key before a rekey is required (2^24)
 ///
-/// RFC 8446 § 5.5 bounds AES-GCM at about 2^24.5 full-size records
-/// per key to keep an authenticated-encryption safety margin of 2^-57.
-/// RFC 9846 upgrades acting before the limit to a MUST. TightBeam has no
-/// in-band key update, so [`crate::crypto::aead::SendCipher`] fails closed
-/// with `RekeyRequired` just under the bound and the session must be
-/// reestablished (fresh handshake derives fresh directional keys).
-/// Multiplexed writers drain gracefully first via GoAway as the limit
-/// nears, and [`crate::crypto::aead::RecvCipher`] refuses counters at or
-/// past the limit (an honest peer never emits them). Override per cipher
-/// via `SendCipher::with_rekey_limit` / `RecvCipher::with_rekey_limit`.
+/// [RFC 8446 § 5.5](https://datatracker.ietf.org/doc/html/rfc8446#section-5.5)
+/// bounds AES-GCM near 2^24.5 records per key. No in-band key update:
+/// senders fail closed with `RekeyRequired` (mux drains via GoAway first),
+/// receivers refuse counters past the limit. Override via `with_rekey_limit`.
 pub const DEFAULT_REKEY_RECORD_LIMIT: u64 = 1 << 24;
 
 // ============================================================================
@@ -163,7 +157,7 @@ pub const DEFAULT_BACKPRESSURE_THRESHOLD_BPS: u16 = 9000;
 
 /// Utilization assumed for servlets that do not report one (50% = 5000 bps)
 ///
-/// The scaling task needs a per-instance figure to average; a servlet
+/// The scaling task needs a per-instance figure to average. A servlet
 /// without self-reported or hive-tracked utilization counts as half
 /// loaded so it neither forces scale-up (as 100% would) nor masks load
 /// on its siblings (as 0% would).
@@ -200,6 +194,59 @@ pub const DEFAULT_MUX_CANCEL_BUDGET: u32 = 1024;
 ///
 /// [`MuxSettings`]: crate::transport::handshake::negotiation::MuxSettings
 pub const MAX_MUX_STREAM_CAP: u32 = 1024;
+
+/// Floor on the negotiated per-chunk payload size (1 KiB)
+///
+/// A peer advertising a tiny receive size would force the sender to burn
+/// one AEAD record per few bytes, amplifying record-limit consumption and
+/// per-record overhead (CWE-770). Advertisements below the floor clamp up.
+pub const MIN_MUX_CHUNK_SIZE: u32 = 1024;
+
+/// Ceiling on the negotiated per-chunk payload size (64 KiB)
+///
+/// Bounds the largest single envelope a stream chunk can occupy so one
+/// stream cannot monopolize the shared writer, the motivation HTTP/2
+/// solves with its frame-size ceiling
+/// ([RFC 9113 § 4.2](https://datatracker.ietf.org/doc/html/rfc9113#section-4.2) analog).
+pub const MAX_MUX_CHUNK_SIZE: u32 = 64 * 1024;
+
+/// Default per-chunk payload size advertised when none is configured
+/// (16 KiB, the HTTP/2 default frame size,
+/// [RFC 9113 § 4.2](https://datatracker.ietf.org/doc/html/rfc9113#section-4.2))
+pub const DEFAULT_MUX_CHUNK_SIZE: u32 = 16 * 1024;
+
+/// Default bytes-per-credit unit for session budget debits
+///
+/// A chunk debits `ceil(payload_len / credit_unit)` credits from the
+/// sender's per-direction session budget.
+pub const DEFAULT_MUX_CREDIT_UNIT: u32 = 1024;
+
+/// Ceiling on the negotiated initial per-stream chunk credit window
+///
+/// The initial window bounds receive-side reassembly memory per stream
+/// (`window * chunk size`). An absurd advertisement cannot inflate that
+/// bound (CWE-770). Grants may raise a live stream's absolute limit past
+/// the initial window as reassembly drains.
+pub const MAX_MUX_STREAM_CREDIT: u64 = 4096;
+
+/// Default initial per-stream chunk credit window
+///
+/// 64 chunks at the default chunk size bounds per-stream reassembly at
+/// 1 MiB before the receiver must grant more.
+pub const DEFAULT_MUX_STREAM_CREDIT: u64 = 64;
+
+/// Ceiling on a negotiated per-direction session budget, in credits
+///
+/// Budgets meter data-chunk credits only. Control envelopes (credit
+/// grants, cancels, pings, GoAway) pass outside the budget but still
+/// consume AEAD records. Every data chunk debits at least one credit
+/// and consumes exactly one record, so capping budgets at half the
+/// per-key record limit bounds worst-case epoch data-record consumption
+/// under [`DEFAULT_REKEY_RECORD_LIMIT`]. The default batching grantor
+/// keeps control traffic at `O(data chunks / window)` records, inside
+/// the remaining half. The record limit itself stays the fail-closed
+/// backstop either way.
+pub const MAX_MUX_SESSION_BUDGET: u64 = DEFAULT_REKEY_RECORD_LIMIT / 2;
 
 /// Default ceiling for decompressed message bodies (16 MiB)
 ///

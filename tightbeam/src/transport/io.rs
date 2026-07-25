@@ -473,6 +473,11 @@ pub trait EncryptedMessageIO: MessageIO {
 			client = client.with_transport_offer(offer);
 		}
 
+		// Receipt approver for budget-bearing sessions
+		if let Some(approver) = self.to_receipt_approver() {
+			client = client.with_receipt_approver(approver);
+		}
+
 		// Step 1: Build and send client hello
 		let initial_message = client.build_client_hello()?;
 		if initial_message.len() > HANDSHAKE_MAX_WIRE {
@@ -543,6 +548,7 @@ pub trait EncryptedMessageIO: MessageIO {
 		let session_keys = SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
 		self.set_session_keys(session_keys);
 		self.set_mux_settings(client.negotiated_mux());
+		self.set_session_receipt(client.session_receipt().cloned());
 		self.set_handshake_state(TcpHandshakeState::Complete);
 
 		Ok(())
@@ -583,13 +589,14 @@ pub trait EncryptedMessageIO: MessageIO {
 			None,
 			validator,
 			self.to_mux_config(),
+			self.to_receipt_approver(),
 		)?)
 	}
 
 	/// Build the CMS client orchestrator from transport state.
 	///
 	/// CMS encrypts the session key to the server's public key up front, so
-	/// the server identity comes from the provisioned chain; missing trust
+	/// the server identity comes from the provisioned chain. Missing trust
 	/// store or chain fails closed.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
@@ -624,6 +631,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			security_offer,
 			transport_offer: self.to_mux_config(),
 			client_certificate,
+			receipt_approver: self.to_receipt_approver(),
 		})?)
 	}
 
@@ -699,9 +707,11 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Step 5: Complete handshake and get the directional session keys
 		let session_keys = orchestrator.complete().await?;
 
-		// Store session keys, negotiated mux settings, and mark handshake complete
+		// Store session keys, negotiated mux settings, the session
+		// receipt, and mark handshake complete
 		self.set_session_keys(session_keys);
 		self.set_mux_settings(orchestrator.negotiated_mux());
+		self.set_session_receipt(orchestrator.session_receipt().cloned());
 		self.set_handshake_state(TcpHandshakeState::Complete);
 
 		Ok(())
@@ -809,6 +819,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			supported_profiles,
 			client_validators,
 			self.to_mux_config(),
+			self.to_transport_authorizer(),
+			self.to_session_observer(),
 		)?)
 	}
 
@@ -830,7 +842,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		let client_validators = self.to_client_validators_ref().map(Arc::clone);
 		let supported_profiles = vec![SecurityProfileDesc::from(&TightbeamProfile)];
 
-		Ok(key_manager.create_cms_server(client_validators, supported_profiles, self.to_mux_config())?)
+		Ok(key_manager.create_cms_server(
+			client_validators,
+			supported_profiles,
+			self.to_mux_config(),
+			self.to_transport_authorizer(),
+			self.to_session_observer(),
+		)?)
 	}
 
 	/// Protocol-agnostic server handshake state machine: bytes in, bytes out.
@@ -871,6 +889,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			// No response means handshake is complete - get the directional session keys
 			let session_keys = orchestrator.complete().await?;
 			let mux_settings = orchestrator.negotiated_mux();
+			let session_receipt = orchestrator.session_receipt().cloned();
 
 			// Extract peer certificate if mutual auth was performed
 			if let Some(peer_cert) = orchestrator.peer_certificate().cloned() {
@@ -879,6 +898,7 @@ pub trait EncryptedMessageIO: MessageIO {
 
 			self.set_session_keys(session_keys);
 			self.set_mux_settings(mux_settings);
+			self.set_session_receipt(session_receipt);
 			self.set_handshake_state(TcpHandshakeState::Complete);
 
 			// Clear handshake instance - no longer needed

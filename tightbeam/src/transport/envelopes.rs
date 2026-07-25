@@ -137,11 +137,13 @@ impl<'a> Decode<'a> for ResponsePackage {
 /// First u32 code owned by applications in the multiplexing reason-code
 /// space. Codes below the floor are reserved for the TightBeam protocol
 /// (HTTP/2 error-code and QUIC application-close precedent:
-/// RFC 9113 § 7, RFC 9000 § 20.2).
+/// - [RFC 9113 § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
+/// - [RFC 9000 § 20.2](https://datatracker.ietf.org/doc/html/rfc9000#section-20.2))
 #[cfg(feature = "transport-multiplex")]
 pub const MUX_APPLICATION_CODE_FLOOR: u32 = 0x1000;
 
-/// Reason a single stream was cancelled (RFC 9113 § 6.4 analog).
+/// Reason a single stream was cancelled
+/// ([RFC 9113 § 6.4](https://datatracker.ietf.org/doc/html/rfc9113#section-6.4) analog).
 ///
 /// Open u32 code space: TB-reserved codes decode to named variants,
 /// everything else round-trips through [`CancelReason::Application`] so
@@ -186,7 +188,8 @@ impl From<u32> for CancelReason {
 	}
 }
 
-/// Reason the connection is shutting down (RFC 9113 § 6.8 analog).
+/// Reason the connection is shutting down
+/// ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8) analog).
 ///
 /// Same open u32 code space rules as [`CancelReason`].
 #[cfg(feature = "transport-multiplex")]
@@ -197,9 +200,16 @@ pub enum GoAwayReason {
 	Shutdown,
 	/// Peer violated the multiplexing protocol
 	ProtocolError,
-	/// Peer exceeded the cancel budget (RFC 9113 § 7
+	/// Peer exceeded the cancel budget
+	/// ([RFC 9113 § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
 	/// ENHANCE_YOUR_CALM analog, CVE-2023-44487 hardening)
 	EnhanceYourCalm,
+	/// Session budget spent down to the drain headroom: the epoch's
+	/// negotiated data volume is exhausted and the sender is draining
+	BudgetExhausted,
+	/// Settlement of the session agreement failed or was revoked after
+	/// activation
+	SettlementFailed,
 	/// Application-defined code (at or above
 	/// [`MUX_APPLICATION_CODE_FLOOR`]) or a TB code this build predates
 	Application(u32),
@@ -212,6 +222,8 @@ impl From<GoAwayReason> for u32 {
 			GoAwayReason::Shutdown => 0,
 			GoAwayReason::ProtocolError => 1,
 			GoAwayReason::EnhanceYourCalm => 2,
+			GoAwayReason::BudgetExhausted => 3,
+			GoAwayReason::SettlementFailed => 4,
 			GoAwayReason::Application(code) => code,
 		}
 	}
@@ -224,6 +236,8 @@ impl From<u32> for GoAwayReason {
 			0 => Self::Shutdown,
 			1 => Self::ProtocolError,
 			2 => Self::EnhanceYourCalm,
+			3 => Self::BudgetExhausted,
+			4 => Self::SettlementFailed,
 			code => Self::Application(code),
 		}
 	}
@@ -270,7 +284,9 @@ macro_rules! mux_chunk_package {
 mux_chunk_package! {
 	/// Open a stream and carry its first payload chunk inline.
 	///
-	/// One unified stream grammar (RFC 9113 § 8.1 analog, request = stream):
+	/// One unified stream grammar
+	/// ([RFC 9113 § 8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1)
+	/// analog, request = stream):
 	///
 	/// ```text
 	/// initiator:  Open(last?)   Data(...)*  Data(last)
@@ -335,8 +351,8 @@ impl MuxEndPackage {
 	}
 }
 
-/// Grant absolute cumulative chunk credit on a stream (QUIC
-/// MAX_STREAM_DATA analog, RFC 9000 § 4.1).
+/// Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA analog,
+/// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
 ///
 /// `limit` is the total chunk count the sender may have emitted on the
 /// stream, not a delta. Grants are idempotent and monotonic, so
@@ -798,6 +814,8 @@ mod tests {
 			GoAwayPackage::new(7, GoAwayReason::ProtocolError),
 			GoAwayPackage::new(9, GoAwayReason::EnhanceYourCalm),
 			GoAwayPackage::new(11, GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR)),
+			GoAwayPackage::new(13, GoAwayReason::BudgetExhausted),
+			GoAwayPackage::new(15, GoAwayReason::SettlementFailed),
 			GoAwayPackage::new(u32::MAX, GoAwayReason::Shutdown),
 		])
 	}
@@ -827,6 +845,8 @@ mod tests {
 			(0u32, GoAwayReason::Shutdown),
 			(1, GoAwayReason::ProtocolError),
 			(2, GoAwayReason::EnhanceYourCalm),
+			(3, GoAwayReason::BudgetExhausted),
+			(4, GoAwayReason::SettlementFailed),
 		];
 		for (code, reason) in known {
 			assert_eq!(GoAwayReason::from(code), reason);

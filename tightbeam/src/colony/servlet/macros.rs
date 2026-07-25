@@ -82,7 +82,7 @@ macro_rules! __servlet_create_server {
 		if $collector_gates.is_empty() {
 			$crate::server! {
 				protocol $protocol: $listener,
-				policies: { with_mux_offer: [ $mux_offer ] },
+				policies: { with_mux_offer: [ $mux_offer.clone() ] },
 				handle: move |frame_in| {
 					let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
 					async move {
@@ -103,7 +103,7 @@ macro_rules! __servlet_create_server {
 								for gate in &$collector_gates {
 									transport = transport.with_collector_gate(::std::sync::Arc::clone(gate));
 								}
-								transport = transport.with_mux_offer($mux_offer);
+								transport = transport.with_mux_offer($mux_offer.clone());
 
 								let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
 

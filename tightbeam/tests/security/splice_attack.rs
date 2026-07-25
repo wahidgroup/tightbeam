@@ -140,15 +140,19 @@ job! {
 			Some(crate::security::common::HANDSHAKE_AAD),
 		)?
 		.to_insecure()?;
-		if victim_plain.len() != 64 {
+
+		// Payload framing: base_key(32) || client_random(32) || u32-BE
+		// response length (zero here: this splice session is unmetered).
+		if victim_plain.len() != 68 {
 			return Err(expectation_failure("unexpected ECIES payload size"));
 		}
 
-		// Attacker forges [attacker_key || victim_client_random] under the
-		// server's public key and splices it into the victim's message.
-		let mut forged_plain = [0u8; 64];
+		// Attacker forges [attacker_key || victim_client_random || len] under
+		// the server's public key and splices it into the victim's message,
+		// preserving the victim's client_random and length framing.
+		let mut forged_plain = [0u8; 68];
 		forged_plain[..32].copy_from_slice(&[0x41u8; 32]); // attacker-chosen key
-		forged_plain[32..].copy_from_slice(&victim_plain[32..]); // victim client_random
+		forged_plain[32..].copy_from_slice(&victim_plain[32..]); // victim client_random + length prefix
 
 		let recipient_pub = materials.secret_key().public_key();
 		let forged_message = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
@@ -162,6 +166,7 @@ job! {
 			encrypted_data: OctetString::new(forged_message.to_bytes())?,
 			client_certificate: victim_kex.client_certificate.clone(),
 			client_signature: victim_kex.client_signature.clone(),
+			receipt_signature: victim_kex.receipt_signature.clone(),
 		};
 		let spliced_der = spliced.to_der()?;
 		if spliced_der == client_kex_der {

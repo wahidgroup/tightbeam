@@ -196,6 +196,8 @@ pub fn create_test_server_handshake(
 		security_accept: Some(SecurityAccept::new(create_default_test_profile())),
 		client_cert_required: false,
 		transport_accept: None,
+		session_receipt: None,
+		receipt_signature: None,
 	};
 
 	Ok(server_handshake.to_der()?)
@@ -209,6 +211,8 @@ pub fn create_test_client_key_exchange(encrypted_data: &[u8]) -> Result<Vec<u8>,
 		client_certificate: None,
 		#[cfg(feature = "x509")]
 		client_signature: None,
+		#[cfg(feature = "x509")]
+		receipt_signature: None,
 	};
 
 	Ok(client_kex.to_der()?)

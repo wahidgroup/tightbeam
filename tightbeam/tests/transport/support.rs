@@ -17,6 +17,8 @@ use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::der::{Decode, Encode};
 use tightbeam::prelude::TightBeamSocketAddr;
+use tightbeam::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
+use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
 use tightbeam::transport::handshake::{HandshakeKeyManager, TcpHandshakeState};
 use tightbeam::transport::state::EncryptedProtocolState;
 use tightbeam::transport::tcp::r#async::{SplitTransport, TcpTransport, TokioListener, TokioStream};
@@ -28,7 +30,7 @@ use tightbeam::TightBeamError;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
-use crate::common::security::{expectation_failure, ServerMaterials};
+use crate::common::security::{expectation_failure, pinning_validator, ClientMaterials, ServerMaterials};
 
 /// Await a spawned `Result` task. Join panics become expectation failures.
 pub async fn await_ok<T, E>(task: JoinHandle<Result<T, E>>, panic_msg: &'static str) -> Result<T, TightBeamError>
@@ -57,6 +59,95 @@ pub async fn bind_encrypted_listener(
 	let addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
 	let (listener, bound_addr) = TokioListener::bind_with(addr, config).await?;
 	Ok((listener, *bound_addr))
+}
+
+/// Bind an encrypted listener that additionally validates client
+/// certificates (mutual auth), pinned to the given client certificate.
+pub async fn bind_mutual_listener(
+	materials: &ServerMaterials,
+	client_certificate: &Certificate,
+) -> Result<(TokioListener, SocketAddr), TightBeamError> {
+	let certificate = Certificate::clone(&materials.certificate);
+	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
+	let validators = vec![pinning_validator(client_certificate)];
+	let config = TransportEncryptionConfig::new(certificate, key_manager).with_client_validators(validators);
+
+	let addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
+	let (listener, bound_addr) = TokioListener::bind_with(addr, config).await?;
+	Ok((listener, *bound_addr))
+}
+
+/// Connect a pinned client carrying its own identity for mutual auth.
+pub async fn connect_mutual_client(
+	addr: SocketAddr,
+	server_certificate: &Certificate,
+	client: &ClientMaterials,
+) -> Result<TcpTransport<TokioStream>, TightBeamError> {
+	let transport = connect_pinned_client(addr, server_certificate).await?;
+	Ok(transport.with_client_identity(Arc::clone(&client.certificate), Arc::clone(&client.key_manager)))
+}
+
+/// Optional per-session hooks for mutual-auth handshakes.
+#[derive(Default)]
+pub struct MutualSessionHooks {
+	pub authorizer: Option<Arc<dyn TransportAuthorizer>>,
+	pub approver: Option<Arc<dyn ReceiptApprover>>,
+	pub observer: Option<Arc<dyn SessionObserver>>,
+}
+
+/// Established mutual-auth transports plus the peer identities, for
+/// scenarios that verify session artifacts against the certificates.
+pub struct MutualTransports {
+	pub client: TcpTransport<TokioStream>,
+	pub server: TcpTransport<TokioStream>,
+	pub server_certificate: Arc<Certificate>,
+	pub client_certificate: Arc<Certificate>,
+}
+
+/// Full ECIES handshake with mutual authentication: budget-bearing
+/// sessions demand a client countersignature over the session receipt,
+/// so both endpoints carry identities.
+pub async fn establish_mutual_transports(
+	client_offer: TransportOffer,
+	server_offer: TransportOffer,
+	hooks: MutualSessionHooks,
+) -> Result<MutualTransports, TightBeamError> {
+	let materials = ServerMaterials::generate();
+	let client_materials = ClientMaterials::generate();
+	let (listener, addr) = bind_mutual_listener(&materials, &client_materials.certificate).await?;
+
+	let server_task = tokio::spawn(async move {
+		let (transport, _) = listener.accept().await?;
+		let mut transport = transport.with_mux_offer(Some(server_offer));
+		if let Some(authorizer) = hooks.authorizer {
+			transport = transport.with_transport_authorizer(authorizer);
+		}
+		if let Some(observer) = hooks.observer {
+			transport = transport.with_session_observer(observer);
+		}
+
+		// ECIES is exactly two client messages: ClientHello, ClientKeyExchange.
+		serve_one_handshake_message(&mut transport).await?;
+		serve_one_handshake_message(&mut transport).await?;
+		Ok::<_, TightBeamError>(transport)
+	});
+
+	let mut client = connect_mutual_client(addr, &materials.certificate, &client_materials).await?;
+	client = client.with_mux_offer(Some(client_offer));
+
+	if let Some(approver) = hooks.approver {
+		client = client.with_receipt_approver(approver);
+	}
+
+	client.perform_client_handshake().await?;
+
+	let server = await_ok(server_task, "server handshake task must not panic").await?;
+	Ok(MutualTransports {
+		client,
+		server,
+		server_certificate: Arc::clone(&materials.certificate),
+		client_certificate: Arc::clone(&client_materials.certificate),
+	})
 }
 
 /// Read one cleartext handshake container and feed it to the server dispatcher.

@@ -237,6 +237,15 @@ macro_rules! impl_tcp_common {
 			#[cfg(feature = "x509")]
 			pub(crate) mux_config: Option<$crate::transport::handshake::negotiation::TransportOffer>,
 			#[cfg(feature = "x509")]
+			pub(crate) transport_authorizer:
+				Option<Arc<dyn $crate::transport::handshake::negotiation::TransportAuthorizer>>,
+			#[cfg(feature = "x509")]
+			pub(crate) receipt_approver: Option<Arc<dyn $crate::transport::handshake::receipt::ReceiptApprover>>,
+			#[cfg(feature = "x509")]
+			pub(crate) session_observer: Option<Arc<dyn $crate::transport::handshake::receipt::SessionObserver>>,
+			#[cfg(feature = "x509")]
+			pub(crate) session_receipt: Option<$crate::transport::handshake::receipt::StoredReceipt>,
+			#[cfg(feature = "x509")]
 			pub(crate) mux_settings: Option<$crate::transport::handshake::negotiation::MuxSettings>,
 			#[cfg(feature = "x509")]
 			pub(crate) server_handshake: Option<$crate::transport::handshake::BoxedServerHandshake>,
@@ -289,6 +298,14 @@ macro_rules! impl_tcp_common {
 					session_keys: None,
 					#[cfg(feature = "x509")]
 					mux_config: None,
+					#[cfg(feature = "x509")]
+					transport_authorizer: None,
+					#[cfg(feature = "x509")]
+					receipt_approver: None,
+					#[cfg(feature = "x509")]
+					session_observer: None,
+					#[cfg(feature = "x509")]
+					session_receipt: None,
 					#[cfg(feature = "x509")]
 					mux_settings: None,
 					#[cfg(feature = "x509")]
@@ -366,6 +383,49 @@ macro_rules! impl_tcp_common {
 			/// handshake. `None` means the connection is single-flight.
 			pub fn negotiated_mux(&self) -> Option<$crate::transport::handshake::negotiation::MuxSettings> {
 				self.mux_settings
+			}
+
+			/// Get the dual-signed session receipt from a completed
+			/// budget-bearing handshake.
+			pub fn session_receipt(&self) -> Option<&$crate::transport::handshake::receipt::StoredReceipt> {
+				self.session_receipt.as_ref()
+			}
+
+			/// Override the budget-grant policy consulted between the
+			/// client's transport offer and the server's accept. Without
+			/// an authorizer the server grants its local configuration
+			/// ceiling.
+			#[must_use]
+			pub fn with_transport_authorizer(
+				mut self,
+				authorizer: Arc<dyn $crate::transport::handshake::negotiation::TransportAuthorizer>,
+			) -> Self {
+				self.transport_authorizer = Some(authorizer);
+				self
+			}
+
+			/// Set the receipt approver consulted before countersigning a
+			/// session receipt. Without one the client fails closed on
+			/// challenge-bearing receipts.
+			#[must_use]
+			pub fn with_receipt_approver(
+				mut self,
+				approver: Arc<dyn $crate::transport::handshake::receipt::ReceiptApprover>,
+			) -> Self {
+				self.receipt_approver = Some(approver);
+				self
+			}
+
+			/// Set the observer that records the session outcome of every
+			/// budget-bearing handshake this endpoint serves, successful
+			/// or refused.
+			#[must_use]
+			pub fn with_session_observer(
+				mut self,
+				observer: Arc<dyn $crate::transport::handshake::receipt::SessionObserver>,
+			) -> Self {
+				self.session_observer = Some(observer);
+				self
 			}
 
 			/// True while this endpoint expects an encryption handshake that has

@@ -31,12 +31,18 @@ use crate::zeroize::{Zeroize, Zeroizing};
 
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{client_mux_settings, MuxSettings, SecurityOffer, TransportOffer};
+use crate::transport::handshake::receipt::{
+	approve_or_fail_closed, client_receipt_digest, match_receipt_to_accept, verify_server_receipt, ReceiptApprover,
+	StoredReceipt,
+};
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ClientHandshakeState, ClientStateMachine};
 use crate::transport::handshake::utils::{
 	compute_client_auth_digest, compute_transcript_digest, octet_string_to_32_byte_array, validate_state,
 };
-use crate::transport::handshake::{Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake};
+use crate::transport::handshake::{
+	Arc, ClientHandshakeProtocol, ClientHello, ClientKeyExchange, ServerHandshake, ECIES_SESSION_PREFIX_LEN,
+};
 use crate::transport::handshake::{DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization};
 use crate::x509::Certificate;
 
@@ -65,6 +71,8 @@ where
 	certificate_validator: Option<Arc<dyn CertificateValidation>>,
 	client_certificate: Option<Arc<Certificate>>,
 	client_key_provider: Option<Arc<dyn SigningKeyProvider>>,
+	receipt_approver: Option<Arc<dyn ReceiptApprover>>,
+	stored_receipt: Option<StoredReceipt>,
 	_phantom_provider: PhantomData<P>,
 	_phantom_message: PhantomData<M>,
 	invariants: HandshakeInvariant,
@@ -110,6 +118,8 @@ where
 			certificate_validator: None,
 			client_certificate: None,
 			client_key_provider: None,
+			receipt_approver: None,
+			stored_receipt: None,
 			invariants: HandshakeInvariant::default(),
 			_phantom_provider: PhantomData,
 			_phantom_message: PhantomData,
@@ -142,6 +152,8 @@ where
 			certificate_validator: None,
 			client_certificate,
 			client_key_provider,
+			receipt_approver: None,
+			stored_receipt: None,
 			invariants: HandshakeInvariant::default(),
 			_phantom_provider: PhantomData,
 			_phantom_message: PhantomData,
@@ -149,6 +161,7 @@ where
 	}
 
 	/// Set a certificate validator for the handshake.
+	#[must_use]
 	pub fn with_certificate_validator(mut self, validator: Arc<dyn CertificateValidation>) -> Self {
 		self.certificate_validator = Some(validator);
 		self
@@ -159,6 +172,7 @@ where
 	/// # Parameters
 	/// - `certificate`: The client's X.509 certificate
 	/// - `key_provider`: The client's key provider
+	#[must_use]
 	pub fn with_client_identity(
 		mut self,
 		certificate: Arc<Certificate>,
@@ -171,6 +185,7 @@ where
 
 	/// Set the security profile offer for negotiation.
 	/// If not set, server will pick default profile (dealer's choice mode).
+	#[must_use]
 	pub fn with_security_offer(mut self, offer: SecurityOffer) -> Self {
 		self.security_offer = Some(offer);
 		self
@@ -178,8 +193,20 @@ where
 
 	/// Set the transport capability offer (multiplexing).
 	/// If not set, the connection stays lock-step.
+	#[must_use]
 	pub fn with_transport_offer(mut self, offer: TransportOffer) -> Self {
 		self.transport_offer = Some(offer);
+		self
+	}
+
+	/// Set the receipt approver deciding whether to countersign a
+	/// session receipt and answering its settlement challenge.
+	///
+	/// Without one the client fails closed: challenge-free receipts are
+	/// countersigned, challenge-bearing receipts abort the handshake.
+	#[must_use]
+	pub fn with_receipt_approver(mut self, approver: Arc<dyn ReceiptApprover>) -> Self {
+		self.receipt_approver = Some(approver);
 		self
 	}
 
@@ -270,7 +297,7 @@ where
 		let client_hello = ClientHello {
 			client_random: OctetString::new(client_random)?,
 			security_offer: self.security_offer.clone(),
-			transport_offer: self.transport_offer,
+			transport_offer: self.transport_offer.clone(),
 		};
 
 		// Retain the exact DER for transcript binding: the full
@@ -304,34 +331,43 @@ where
 		// 4. Validate profile negotiation
 		self.validate_profile_selection(&server_handshake)?;
 
-		// 4b. Validate transport capability negotiation (fails closed on an
+		// 5. Validate transport capability negotiation (fails closed on an
 		// accept the client never offered)
-		self.mux_settings =
-			client_mux_settings(self.transport_offer.as_ref(), server_handshake.transport_accept.as_ref())?;
+		let offer = self.transport_offer.as_ref();
+		let accept = server_handshake.transport_accept.as_ref();
+		self.mux_settings = client_mux_settings(offer, accept)?;
 
-		// 5. Extract server random
+		// 6. Extract server random
 		self.extract_server_random(&server_handshake)?;
 
-		// 6. Verify server signature
+		// 7. Verify server signature
 		self.verify_server_handshake_signature(&server_handshake)?;
 
-		// 7. Generate and encrypt session key
-		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake)?;
+		// 8. Validate, approve, and countersign the session receipt
+		// (fails closed on mismatch)
+		let (receipt_signature, receipt_response) = self.process_session_receipt(&server_handshake).await?;
 
-		// 8. Handle mutual authentication (signature commits to encrypted_bytes)
+		// 9. Generate and encrypt session key. The settlement answer folds
+		// into the ECIES payload, never onto the cleartext wire
+		let response_bytes = receipt_response.as_ref().map(OctetString::as_bytes);
+		let encrypted_bytes = self.generate_and_encrypt_session_key(&server_handshake, response_bytes)?;
+
+		// 10. Handle mutual authentication (signature commits to encrypted_bytes)
 		let (client_certificate, client_signature) =
 			self.prepare_client_auth(&server_handshake, &encrypted_bytes).await?;
 
-		// 10. Build and encode ClientKeyExchange
+		// 11. Build and encode ClientKeyExchange
 		let client_kex = ClientKeyExchange {
 			encrypted_data: OctetString::new(encrypted_bytes)?,
 			#[cfg(feature = "x509")]
 			client_certificate,
 			#[cfg(feature = "x509")]
 			client_signature,
+			#[cfg(feature = "x509")]
+			receipt_signature,
 		};
 
-		// 11. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
+		// 12. Advance to KeyExchangeSent (ServerHelloReceived was entered in step 2)
 		self.state.transition(ClientHandshakeState::KeyExchangeSent)?;
 
 		Ok(client_kex.to_der()?)
@@ -372,12 +408,92 @@ where
 	fn generate_and_encrypt_session_key(
 		&mut self,
 		server_handshake: &ServerHandshake,
+		response: Option<&[u8]>,
 	) -> Result<Vec<u8>, HandshakeError> {
 		self.generate_base_session_key()?;
 		let base_key = self.base_session_key.ok_or(HandshakeError::InvalidState)?;
 		let client_random = self.client_random.ok_or(HandshakeError::InvalidState)?;
 
-		self.perform_ecies_encryption(&base_key, &client_random, &server_handshake.certificate, self.aad_domain_tag)
+		self.perform_ecies_encryption(
+			&base_key,
+			&client_random,
+			response,
+			&server_handshake.certificate,
+			self.aad_domain_tag,
+		)
+	}
+
+	/// Validate, approve, and countersign the server's session receipt.
+	///
+	/// Budget-bearing accepts demand a receipt whose transcript hash,
+	/// budgets, and credit unit match the negotiated session and whose
+	/// server signature verifies. Anything else fails closed. The
+	/// approver (or the fail-closed default) answers the settlement
+	/// challenge, and the countersignature binds receipt body plus
+	/// answer under the client identity (non-repudiation).
+	///
+	/// Returns the countersignature and the ancillary response destined
+	/// for the ClientKeyExchange.
+	async fn process_session_receipt(
+		&mut self,
+		server_handshake: &ServerHandshake,
+	) -> Result<(Option<OctetString>, Option<OctetString>), HandshakeError> {
+		let granted = server_handshake
+			.transport_accept
+			.as_ref()
+			.and_then(|accept| accept.granted_budgets);
+
+		let credit_unit = server_handshake.transport_accept.as_ref().map(|accept| accept.credit_unit);
+		let transcript_digest = self.transcript_hash.ok_or(HandshakeError::InvalidState)?;
+
+		let Some(receipt) = match_receipt_to_accept(
+			server_handshake.session_receipt.as_ref(),
+			granted,
+			credit_unit,
+			&transcript_digest,
+		)?
+		else {
+			return Ok((None, None));
+		};
+
+		// Server signature over the receipt body: third-party verifiable
+		// agreement, so an unsigned receipt is no receipt at all.
+		let server_signature = server_handshake
+			.receipt_signature
+			.as_ref()
+			.ok_or(HandshakeError::ReceiptMissing)?;
+
+		let receipt_der = receipt.to_der()?;
+		let verifying_key = self.extract_verifying_key(&server_handshake.certificate)?;
+		verify_server_receipt::<P::Digest, P::Signature, _>(&receipt_der, server_signature.as_bytes(), &verifying_key)?;
+
+		// Countersigning demands a full client identity (certificate for
+		// the server's verification plus signing key): budgets without
+		// mutual authentication fail closed. Checked before approval:
+		// approving can spend an irreversible settlement answer, so every
+		// local precondition must already hold.
+		if self.client_certificate.is_none() {
+			return Err(HandshakeError::MutualAuthRequired);
+		}
+
+		let key_provider = self.client_key_provider.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+
+		// Approve the receipt and answer its challenge (fail-closed
+		// without an approver).
+		let response = approve_or_fail_closed(self.receipt_approver.as_deref(), receipt).await?;
+		let response_bytes = response.as_ref().map(OctetString::as_bytes);
+		let client_digest = client_receipt_digest::<P::Digest>(&receipt_der, response_bytes)?;
+		let signature_bytes = key_provider.sign_prehash(&client_digest).await?;
+		let countersignature = OctetString::new(signature_bytes)?;
+
+		self.stored_receipt = Some(StoredReceipt {
+			receipt: receipt.clone(),
+			server_signature: server_signature.clone(),
+			client_signature: countersignature.clone(),
+			ancillary_response: response.clone(),
+		});
+
+		Ok((Some(countersignature), response))
 	}
 
 	/// Prepare client authentication materials if required or available.
@@ -464,6 +580,12 @@ where
 		self.mux_settings
 	}
 
+	/// Get the dual-signed session receipt (if the completed handshake
+	/// carried budgets).
+	pub fn session_receipt(&self) -> Option<&StoredReceipt> {
+		self.stored_receipt.as_ref()
+	}
+
 	// Helper methods
 
 	fn extract_verifying_key(&self, cert: &Certificate) -> Result<P::VerifyingKey, HandshakeError> {
@@ -507,12 +629,21 @@ where
 		&self,
 		base_key: &[u8; 32],
 		client_random: &[u8; 32],
+		response: Option<&[u8]>,
 		server_certificate: &Certificate,
 		associated_data: Option<&[u8]>,
 	) -> Result<Vec<u8>, HandshakeError> {
-		let mut plaintext = Zeroizing::new([0u8; 64]);
-		plaintext[..32].copy_from_slice(base_key);
-		plaintext[32..].copy_from_slice(client_random);
+		// Payload: base_key(32) || client_random(32) || u32-BE(len) ||
+		// response. The length prefix is always present (zero when no
+		// settlement answer), so the server parses one framing for every
+		// session, metered or not.
+		let response = response.unwrap_or_default();
+		let response_len = u32::try_from(response.len()).map_err(|_| HandshakeError::AnswerTooLarge)?;
+		let mut plaintext = Zeroizing::new(Vec::with_capacity(ECIES_SESSION_PREFIX_LEN + response.len()));
+		plaintext.extend_from_slice(base_key);
+		plaintext.extend_from_slice(client_random);
+		plaintext.extend_from_slice(&response_len.to_be_bytes());
+		plaintext.extend_from_slice(response);
 
 		let recipient_pubkey = PublicKey::<P::Curve>::from_sec1_bytes(
 			server_certificate
@@ -613,6 +744,10 @@ where
 
 	fn negotiated_mux(&self) -> Option<MuxSettings> {
 		EciesHandshakeClient::negotiated_mux(self)
+	}
+
+	fn session_receipt(&self) -> Option<&StoredReceipt> {
+		EciesHandshakeClient::session_receipt(self)
 	}
 }
 
@@ -811,6 +946,8 @@ mod tests {
 				security_accept: Some(SecurityAccept::new(*accepted_profile)),
 				client_cert_required: false,
 				transport_accept: None,
+				session_receipt: None,
+				receipt_signature: None,
 			};
 			Ok(response.to_der()?)
 		};

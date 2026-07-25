@@ -88,7 +88,7 @@ pub const fn between(min: u32, max: u32) -> Cardinality {
 
 /// Compile-time check that `tb_assert_spec!` version blocks strictly
 /// ascend. The key constants generate from the last block in source order
-/// while `latest()` selects the highest semantic version; strict ascent
+/// while `latest()` selects the highest semantic version. Strict ascent
 /// makes those the same block.
 pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
 	let mut index = 1;
@@ -686,7 +686,7 @@ macro_rules! __tb_assert_spec_build_all_impl {
 				$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 				assertions: [ $( $assertion ),* ],
 				$(
-					events: [ $($events_tt:tt)* ],
+					events: [ $($events_tt)* ],
 				)?
 				$(, tag_filter: [ $( $tag ),* ])?
 				$(, schedulability: { $($schedule_content)* })?
@@ -715,7 +715,7 @@ macro_rules! __tb_assert_spec_build_all_impl_with_events {
 			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 			assertions: [ $( $assertion ),* ],
 			$(
-				events_tt: [ $($events_tt:tt)* ],
+				events_tt: [ $($events_tt)* ],
 			)?
 			$( tag_filter: [ $( $tag ),* ])?
 			$(, schedulability: { $($schedule_content)* })?
@@ -746,7 +746,7 @@ macro_rules! __tb_assert_spec_build {
 			$vec, $base, $maj, $min, $patch, $mode, $gate,
 			assertions: [ $( $assertion ),* ],
 			$(
-				events_tt: [ $($events_tt:tt)* ],
+				events_tt: [ $($events_tt)* ],
 			)?
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, description: $desc)?
@@ -767,7 +767,7 @@ macro_rules! __tb_assert_spec_build {
 			@build_with_events_expanded
 			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 			assertions: [ $( $assertion ),* ],
-			events_tt: [ $($events_tt:tt)* ],
+			events_tt: [ $($events_tt)* ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, schedulability: { $($schedule_content)* })?
 		}
@@ -805,7 +805,7 @@ macro_rules! __tb_assert_spec_build {
 				@build_with_events_expanded
 				$vec, $base, None, $maj, $min, $patch, $mode, $gate,
 				assertions: [ $( $assertion ),* ],
-				events_tt: [ $($events_tt:tt)* ],
+				events_tt: [ $($events_tt)* ],
 				$( tag_filter: [ $( $tag ),* $(,)? ])?
 				$(, description: $desc)?
 				$(, schedulability: { $($schedule_content)* })?
@@ -836,7 +836,7 @@ macro_rules! __tb_assert_spec_build {
 			@build_with_events
 			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 			assertions: [ $( $assertion ),* ],
-			events: [ $( $ev ),* $(,)? ],
+			events: [ $( $ev ),* ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, description: $desc)?
 			$(, schedulability: { $($schedule_content)* })?
@@ -901,7 +901,7 @@ macro_rules! __tb_assert_spec_build {
 		#[cfg(feature = "instrument")]
 		{
 			$(
-				builder = builder.required_events(&[$ev.clone()]);
+				builder = builder.required_events(::core::slice::from_ref(&$ev));
 			)*
 		}
 		$(
@@ -980,7 +980,7 @@ macro_rules! __tb_assert_spec_keys {
 	};
 }
 
-// Emit one key const for an ident assertion key; string keys emit nothing
+// Emit one key const for an ident assertion key. String keys emit nothing
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_key_const {
@@ -1086,7 +1086,7 @@ macro_rules! tb_assert_spec {
 						$maj, $min, $patch, $mode, $gate,
 						assertions: [ $( $assertion ),* ],
 						$(
-							events: [ $($events_tt:tt)* ],
+							events: [ $($events_tt)* ],
 						)?
 						$(, tag_filter: [ $( $tag ),* ])?
 						$(, schedulability: { $($schedule_content)* })?

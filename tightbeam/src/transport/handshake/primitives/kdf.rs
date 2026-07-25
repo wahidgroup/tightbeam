@@ -42,7 +42,7 @@ use crate::zeroize::Zeroizing;
 /// let combined = multi_input_kdf::<DefaultCryptoProvider>(
 ///     &[&dh_secret, &kem_secret],
 ///     &salt,
-///     b"MyApp-PQXDH-v1",
+///     b"MyApp-MIKDF-v1",
 ///     32,
 /// )?;
 /// ```
@@ -65,8 +65,6 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 }
 
 /// Chain multiple KDF operations where each output becomes the next salt.
-///
-/// UNSTABLE: no caller in the crate yet; gated behind `unstable-pqxdh`.
 ///
 /// Implements key derivation chaining as used in protocols like PQXDH:
 /// ```text
@@ -102,7 +100,6 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 ///     b"InitialSalt"
 /// )?;
 /// ```
-#[cfg(feature = "unstable-pqxdh")]
 pub fn kdf_chain<P: CryptoProvider>(
 	stages: &[(&[u8], &[u8])],
 	initial_salt: &[u8],
@@ -111,7 +108,7 @@ pub fn kdf_chain<P: CryptoProvider>(
 		return Ok(Zeroizing::new(Vec::new()));
 	}
 
-	// Each intermediate output is key material; keep every stage in a
+	// Each intermediate output is key material. Keep every stage in a
 	// Zeroizing buffer so nothing lingers in the allocator.
 	let mut current = Zeroizing::new(initial_salt.to_vec());
 	for (input, info) in stages {
@@ -151,7 +148,6 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
-	#[cfg(feature = "unstable-pqxdh")]
 	#[test]
 	fn test_kdf_chain() -> Result<(), Box<dyn core::error::Error>> {
 		let input1 = [0x11u8; 32];
@@ -167,7 +163,6 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "unstable-pqxdh")]
 	#[test]
 	fn test_kdf_chain_single_stage() {
 		let input = [0x42u8; 32];

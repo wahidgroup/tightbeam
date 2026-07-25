@@ -35,8 +35,12 @@ use crate::der::{Decode, Encode};
 use crate::random::generate_nonce;
 use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
-	accept_transport, server_mux_settings, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept,
-	TransportAccept, TransportOffer,
+	authorize_transport, server_mux_settings, DefaultStrengthFloor, MuxSettings, ProfileStrengthPolicy, SecurityAccept,
+	TransportAccept, TransportAuthorizer, TransportOffer,
+};
+use crate::transport::handshake::receipt::{
+	normalize_answer, record_receipt_outcome, settle_countersignature, sign_receipt, SessionObserver, SessionOutcome,
+	SessionReceipt, SessionVerdict, StoredReceipt,
 };
 use crate::transport::handshake::state::HandshakeInvariant;
 use crate::transport::handshake::state::{ServerHandshakeState, ServerStateMachine};
@@ -44,7 +48,9 @@ use crate::transport::handshake::utils::{
 	clear_session_randoms, compute_client_auth_digest, compute_transcript_digest, extract_verifying_key_from_cert,
 	octet_string_to_32_byte_array, validate_state,
 };
-use crate::transport::handshake::{ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeProtocol};
+use crate::transport::handshake::{
+	ClientHello, ClientKeyExchange, ServerHandshake, ServerHandshakeProtocol, ECIES_SESSION_PREFIX_LEN,
+};
 use crate::transport::handshake::{
 	DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation,
 };
@@ -77,11 +83,26 @@ where
 	strength_policy: Option<Arc<dyn ProfileStrengthPolicy + Send + Sync>>,
 	selected_profile: Option<SecurityProfileDesc>,
 	transport_config: Option<TransportOffer>,
+	transport_authorizer: Option<Arc<dyn TransportAuthorizer>>,
+	session_observer: Option<Arc<dyn SessionObserver>>,
 	mux_settings: Option<MuxSettings>,
 	client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
 	validated_client_cert: Option<Arc<Certificate>>,
+	session_receipt: Option<SessionReceipt>,
+	receipt_signature: Option<OctetString>,
+	stored_receipt: Option<StoredReceipt>,
 	_phantom: PhantomData<P>,
 	invariants: HandshakeInvariant,
+}
+
+/// Parts of the decrypted ECIES key-exchange payload: session key
+/// material, the anti-replay random, and the confidential settlement
+/// answer (absent for unmetered sessions).
+struct SessionPayload {
+	base_session_key: [u8; 32],
+	client_random: [u8; 32],
+	/// Bearer settlement answer: wiped when the payload drops.
+	response: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl<P> EciesHandshakeServer<P>
@@ -116,15 +137,21 @@ where
 			strength_policy: None,          // Defaults to DefaultStrengthFloor
 			selected_profile: None,
 			transport_config: None,
+			transport_authorizer: None,
+			session_observer: None,
 			mux_settings: None,
 			client_validators,
 			validated_client_cert: None,
+			session_receipt: None,
+			receipt_signature: None,
+			stored_receipt: None,
 			_phantom: PhantomData,
 			invariants: HandshakeInvariant::default(),
 		}
 	}
 	/// Set the server's supported security profiles for negotiation.
 	/// Server must have at least one supported profile configured.
+	#[must_use]
 	pub fn with_supported_profiles(mut self, profiles: Vec<SecurityProfileDesc>) -> Self {
 		self.supported_profiles = profiles;
 		self
@@ -134,6 +161,7 @@ where
 	///
 	/// Defaults to `DefaultStrengthFloor` (256-bit AEAD key, >= 256-bit digest).
 	/// Pass `NoStrengthFloor` only where weaker profiles must remain negotiable.
+	#[must_use]
 	pub fn with_strength_policy(mut self, policy: Arc<dyn ProfileStrengthPolicy + Send + Sync>) -> Self {
 		self.strength_policy = Some(policy);
 		self
@@ -141,8 +169,26 @@ where
 
 	/// Enable transport multiplexing with the given local advertisement.
 	/// Multiplexing activates only when the client also offers it.
+	#[must_use]
 	pub fn with_transport_config(mut self, config: TransportOffer) -> Self {
 		self.transport_config = Some(config);
+		self
+	}
+
+	/// Override the budget-grant policy consulted between the client's
+	/// transport offer and the server's accept. Without an authorizer
+	/// the server grants its local configuration ceiling.
+	#[must_use]
+	pub fn with_transport_authorizer(mut self, authorizer: Arc<dyn TransportAuthorizer>) -> Self {
+		self.transport_authorizer = Some(authorizer);
+		self
+	}
+
+	/// Set the observer that records the [`SessionOutcome`] of every
+	/// budget-bearing session, successful or refused.
+	#[must_use]
+	pub fn with_session_observer(mut self, observer: Arc<dyn SessionObserver>) -> Self {
+		self.session_observer = Some(observer);
 		self
 	}
 
@@ -165,21 +211,30 @@ where
 		self.selected_profile = Some(selected);
 		let security_accept = SecurityAccept::new(selected);
 
-		// 3b. Transport capability negotiation: mux activates only when
-		// offered AND locally enabled.
-		let transport_accept = accept_transport(client_hello.transport_offer.as_ref(), self.transport_config.as_ref());
+		// 4. Transport capability negotiation: mux activates only when
+		// offered AND locally enabled. The authorizer (when configured)
+		// decides the budget grant and the settlement challenge before
+		// the accept enters the transcript.
+		let authorized = authorize_transport(
+			client_hello.transport_offer.as_ref(),
+			self.transport_config.as_ref(),
+			self.transport_authorizer.as_deref(),
+		)
+		.await?;
+		let transport_accept = authorized.as_ref().map(|authorized| authorized.accept);
+		let settlement_challenge = authorized.and_then(|authorized| authorized.challenge);
 		if let (Some(offer), Some(accept)) = (client_hello.transport_offer.as_ref(), transport_accept.as_ref()) {
 			self.mux_settings = Some(server_mux_settings(offer, accept));
 		}
 
-		// 4. Extract and store client random
+		// 5. Extract and store client random
 		let client_random = octet_string_to_32_byte_array(&client_hello.client_random)?;
 		self.client_random = Some(client_random);
 
-		// 5. Generate and store server random
+		// 6. Generate and store server random
 		let server_random = self.generate_server_random()?;
 
-		// 6. Compute transcript hash
+		// 7. Compute transcript hash
 		let spki_bytes = self
 			.server_cert
 			.tbs_certificate
@@ -205,18 +260,61 @@ where
 		self.transcript_hash = Some(transcript_digest);
 		self.invariants.lock_transcript()?;
 
-		// 7. Sign transcript hash using KeyProvider
+		// 8. Sign transcript hash using KeyProvider
 		let signature_bytes = self.sign_transcript_hash(&transcript_digest).await?;
 
-		// 8. Build and encode ServerHandshake
+		// 9. Issue the session receipt: the transcript hash pins it to
+		// this session, the server signature makes it third-party verifiable
+		self.issue_session_receipt(&transcript_digest, transport_accept.as_ref(), settlement_challenge)
+			.await?;
+
+		// 10. Build and encode ServerHandshake
 		let server_handshake_der =
 			self.build_server_handshake(server_random, signature_bytes, Some(security_accept), transport_accept)?;
 
-		// 9. Transition state through ServerHelloReceived to ServerHelloSent
+		// 11. Transition state through ServerHelloReceived to ServerHelloSent
 		self.state.transition(ServerHandshakeState::ClientHelloReceived)?;
 		self.state.transition(ServerHandshakeState::ServerHelloSent)?;
 
 		Ok(server_handshake_der)
+	}
+
+	/// Build and sign the [`SessionReceipt`] when the accept grants
+	/// budgets.
+	///
+	/// Fail closed: budgets demand a client countersignature,
+	/// so a budget-bearing accept without mutual authentication
+	/// configured aborts the handshake.
+	async fn issue_session_receipt(
+		&mut self,
+		transcript_digest: &[u8; 32],
+		transport_accept: Option<&TransportAccept>,
+		challenge: Option<OctetString>,
+	) -> Result<(), HandshakeError> {
+		let Some(accept) = transport_accept else {
+			return Ok(());
+		};
+		let Some(granted) = accept.granted_budgets else {
+			return Ok(());
+		};
+
+		if self.client_validators.is_none() {
+			return Err(HandshakeError::MutualAuthRequired);
+		}
+
+		let (receipt, signature) = sign_receipt::<P::Digest>(
+			*transcript_digest,
+			granted,
+			accept.credit_unit,
+			challenge,
+			self.server_key_provider.as_ref(),
+		)
+		.await?;
+
+		self.receipt_signature = Some(signature);
+		self.session_receipt = Some(receipt);
+
+		Ok(())
 	}
 
 	/// Process ClientKeyExchange message (decrypt ECIES-encrypted session key).
@@ -249,17 +347,27 @@ where
 		// 5. Decrypt ECIES payload (async - uses KeyProvider for ECDH)
 		let decrypted_payload = self.decrypt_ecies_payload(encrypted_bytes).await?;
 
-		// 6. Extract base session key and client random from payload
-		let (base_session_key, client_random_from_payload) =
+		// 6. Extract base session key, client random, and the confidential
+		// settlement answer from the decrypted payload
+		let SessionPayload { base_session_key, client_random, response } =
 			self.extract_session_data_from_payload(&decrypted_payload)?;
 
 		// 7. Verify client random matches stored value (prevents replay attacks)
-		self.verify_client_random(&client_random_from_payload)?;
+		self.verify_client_random(&client_random)?;
 
-		// 8. Store base session key
+		// 8. Verify the receipt countersignature and settle, strictly
+		// after decrypt and replay verification: settlement is an
+		// irreversible external side effect, so it must be the last gate,
+		// downstream of every cheaper rejection (defense in depth behind
+		// the transcript-bound client auth signature). The settlement
+		// answer arrives confidentially inside the decrypted payload.
+		self.process_receipt_ack(&client_kex, response.as_ref().map(|bytes| bytes.as_slice()))
+			.await?;
+
+		// 9. Store base session key
 		self.base_session_key = Some(base_session_key);
 
-		// 9. Transition state to KeyExchangeReceived
+		// 10. Transition state to KeyExchangeReceived
 		self.state.transition(ServerHandshakeState::KeyExchangeReceived)?;
 
 		Ok(())
@@ -308,6 +416,12 @@ where
 	/// Get the transcript hash (if available).
 	pub fn transcript_hash(&self) -> Option<[u8; 32]> {
 		self.transcript_hash
+	}
+
+	/// Get the dual-signed session receipt (if the completed handshake
+	/// carried budgets).
+	pub fn session_receipt(&self) -> Option<&StoredReceipt> {
+		self.stored_receipt.as_ref()
 	}
 
 	// Helper methods
@@ -365,6 +479,8 @@ where
 			security_accept,
 			client_cert_required: self.client_validators.is_some(),
 			transport_accept,
+			session_receipt: self.session_receipt.clone(),
+			receipt_signature: self.receipt_signature.clone(),
 		};
 
 		Ok(server_handshake.to_der()?)
@@ -374,7 +490,7 @@ where
 		ClientKeyExchange::from_der(der_bytes).map_err(Into::into)
 	}
 
-	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+	async fn decrypt_ecies_payload(&self, encrypted_bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, HandshakeError> {
 		// Parse the ECIES message using the negotiated curve's wire format.
 		let (ephemeral_pubkey, ciphertext_bytes) = {
 			let encrypted_message = <P::EciesMessage as EciesMessageOps>::from_bytes(encrypted_bytes)?;
@@ -384,7 +500,7 @@ where
 			)
 		};
 
-		// Use KeyProvider to perform ECDH; the shared secret arrives already
+		// Use KeyProvider to perform ECDH. The shared secret arrives already
 		// wrapped in SecretSlice.
 		let shared_secret = self.server_key_provider.key_agreement(&ephemeral_pubkey).await?;
 		// Derive encryption key using the negotiated KDF.
@@ -413,24 +529,38 @@ where
 			None => Payload { msg: ciphertext_with_tag, aad: b"" },
 		};
 
-		let plaintext = cipher.decrypt(nonce, payload)?;
+		// The plaintext carries the base session key and the bearer
+		// settlement answer: wiped when the buffer drops
+		let plaintext = Zeroizing::new(cipher.decrypt(nonce, payload)?);
 		Ok(plaintext)
 	}
 
-	fn extract_session_data_from_payload(
-		&self,
-		decrypted_payload: &[u8],
-	) -> Result<([u8; 32], [u8; 32]), HandshakeError> {
-		if decrypted_payload.len() != 64 {
+	/// Parse the decrypted payload `base_key(32) || client_random(32) ||
+	/// u32-BE(len) || response` into its parts. The response is the
+	/// confidential settlement answer (empty when unmetered).
+	fn extract_session_data_from_payload(&self, decrypted_payload: &[u8]) -> Result<SessionPayload, HandshakeError> {
+		if decrypted_payload.len() < ECIES_SESSION_PREFIX_LEN {
 			return Err(HandshakeError::InvalidDecryptedPayloadSize);
 		}
 
 		let mut base_session_key = [0u8; 32];
-		let mut client_random_from_payload = [0u8; 32];
-
+		let mut client_random = [0u8; 32];
 		base_session_key.copy_from_slice(&decrypted_payload[..32]);
-		client_random_from_payload.copy_from_slice(&decrypted_payload[32..]);
-		Ok((base_session_key, client_random_from_payload))
+		client_random.copy_from_slice(&decrypted_payload[32..64]);
+
+		let mut len_bytes = [0u8; 4];
+		len_bytes.copy_from_slice(&decrypted_payload[64..ECIES_SESSION_PREFIX_LEN]);
+		let response_len = u32::from_be_bytes(len_bytes) as usize;
+
+		let response_bytes = &decrypted_payload[ECIES_SESSION_PREFIX_LEN..];
+		if response_bytes.len() != response_len {
+			return Err(HandshakeError::InvalidDecryptedPayloadSize);
+		}
+
+		// Normalized: an empty answer signs identically to an absent
+		// one, so it settles and stores as absent on both endpoints
+		let response = normalize_answer(Some(Zeroizing::new(response_bytes.to_vec())));
+		Ok(SessionPayload { base_session_key, client_random, response })
 	}
 
 	fn verify_client_random(&self, client_random_from_payload: &[u8; 32]) -> Result<(), HandshakeError> {
@@ -491,13 +621,70 @@ where
 
 			// Create verifying key from public key
 			let verifying_key = P::VerifyingKey::from(&public_key);
-
 			verifying_key.verify_prehash(&auth_digest, &signature)?;
 
 			// Store validated cert (identity is now locked)
 			let client_cert = Arc::new(client_cert);
 			self.validated_client_cert = Some(client_cert);
 		}
+
+		Ok(())
+	}
+
+	/// Verify the client's receipt countersignature and settle with the
+	/// authorizer.
+	///
+	/// Does nothing when no receipt was issued. Otherwise fails closed:
+	/// a missing or invalid countersignature aborts the handshake, and a
+	/// settle refusal aborts with the application code. The completed
+	/// [`StoredReceipt`] is retained only after both.
+	#[cfg(feature = "x509")]
+	async fn process_receipt_ack(
+		&mut self,
+		client_kex: &ClientKeyExchange,
+		response: Option<&[u8]>,
+	) -> Result<(), HandshakeError>
+	where
+		P::Curve: Curve + CurveArithmetic,
+		<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+		AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+		for<'a> P::Signature: TryFrom<&'a [u8]>,
+		P::VerifyingKey: PrehashVerifier<P::Signature> + for<'a> From<&'a PublicKey<P::Curve>>,
+	{
+		let Some(receipt) = self.session_receipt.clone() else {
+			return Ok(());
+		};
+
+		let server_signature = self.receipt_signature.clone().ok_or(HandshakeError::InvalidState)?;
+		let ancillary_response = response.map(OctetString::new).transpose()?;
+		let countersignature = client_kex.receipt_signature.clone();
+
+		let verdict = match &countersignature {
+			None => SessionVerdict::CountersignatureMissing,
+			Some(signature) => {
+				let client_cert = self.validated_client_cert.as_ref().ok_or(HandshakeError::MutualAuthRequired)?;
+				let public_key = extract_verifying_key_from_cert::<P::Curve>(client_cert)?;
+				let verifying_key = P::VerifyingKey::from(&public_key);
+				settle_countersignature::<P::Digest, P::Signature, _>(
+					&receipt,
+					response,
+					signature.as_bytes(),
+					&verifying_key,
+					self.transport_authorizer.as_deref(),
+				)
+				.await?
+			}
+		};
+
+		let outcome = SessionOutcome {
+			receipt,
+			server_signature,
+			client_signature: countersignature,
+			ancillary_response,
+			client_certificate: self.validated_client_cert.clone(),
+			verdict,
+		};
+		self.stored_receipt = Some(record_receipt_outcome(self.session_observer.as_deref(), outcome).await?);
 
 		Ok(())
 	}
@@ -613,6 +800,10 @@ where
 	fn negotiated_mux(&self) -> Option<MuxSettings> {
 		self.mux_settings
 	}
+
+	fn session_receipt(&self) -> Option<&StoredReceipt> {
+		self.stored_receipt.as_ref()
+	}
 }
 
 #[cfg(test)]
@@ -717,6 +908,57 @@ mod tests {
 		Ok(())
 	}
 
+	/// Payload framing negatives: the parser fails closed on any length
+	/// disagreement instead of guessing a response boundary.
+	#[test]
+	fn test_payload_parse_rejects_bad_framing() -> Result<(), Box<dyn Error>> {
+		let server = TestEciesServerBuilder::new().build()?;
+		let len_offset = ECIES_SESSION_PREFIX_LEN - 4;
+
+		let truncated = vec![0u8; ECIES_SESSION_PREFIX_LEN - 1];
+		assert!(matches!(
+			server.extract_session_data_from_payload(&truncated),
+			Err(HandshakeError::InvalidDecryptedPayloadSize)
+		));
+
+		let mut overclaimed = vec![0u8; ECIES_SESSION_PREFIX_LEN];
+		overclaimed[len_offset..].copy_from_slice(&8u32.to_be_bytes());
+		assert!(matches!(
+			server.extract_session_data_from_payload(&overclaimed),
+			Err(HandshakeError::InvalidDecryptedPayloadSize)
+		));
+
+		let mut underclaimed = vec![0u8; ECIES_SESSION_PREFIX_LEN + 4];
+		underclaimed[len_offset..ECIES_SESSION_PREFIX_LEN].copy_from_slice(&2u32.to_be_bytes());
+		assert!(matches!(
+			server.extract_session_data_from_payload(&underclaimed),
+			Err(HandshakeError::InvalidDecryptedPayloadSize)
+		));
+
+		Ok(())
+	}
+
+	/// A conforming length prefix recovers the answer. A zero prefix
+	/// normalizes to an absent one.
+	#[test]
+	fn test_payload_parse_recovers_response() -> Result<(), Box<dyn Error>> {
+		let server = TestEciesServerBuilder::new().build()?;
+		let len_offset = ECIES_SESSION_PREFIX_LEN - 4;
+
+		let mut answered = vec![0u8; ECIES_SESSION_PREFIX_LEN];
+		answered[len_offset..].copy_from_slice(&3u32.to_be_bytes());
+		answered.extend_from_slice(b"abc");
+
+		let payload = server.extract_session_data_from_payload(&answered)?;
+		assert_eq!(payload.response.as_ref().map(|bytes| bytes.as_slice()), Some(b"abc".as_slice()));
+
+		let unanswered = vec![0u8; ECIES_SESSION_PREFIX_LEN];
+		let payload = server.extract_session_data_from_payload(&unanswered)?;
+		assert!(payload.response.is_none());
+
+		Ok(())
+	}
+
 	/// Test profile negotiation modes (negotiation vs dealer's choice).
 	///
 	/// Verifies that the server correctly handles both explicit client offers
@@ -805,14 +1047,14 @@ mod tests {
 			let response_der = server.process_client_hello(&client_hello_der).await?;
 
 			let response = ServerHandshake::from_der(&response_der)?;
-			assert_eq!(
+			assert!(matches!(
 				response.transport_accept,
-				Some(TransportAccept { mux: true, max_peer_initiated_streams: 4 })
-			);
-			assert_eq!(
+				Some(TransportAccept { mux: true, max_peer_initiated_streams: 4, .. })
+			));
+			assert!(matches!(
 				server.mux_settings,
-				Some(MuxSettings { local_initiated_cap: 8, peer_initiated_cap: 4 })
-			);
+				Some(MuxSettings { local_initiated_cap: 8, peer_initiated_cap: 4, .. })
+			));
 		}
 
 		// Offered but not locally enabled: lock-step
@@ -870,10 +1112,11 @@ mod tests {
 		let stored_client_random = server.client_random.ok_or("Missing client random")?;
 		let base_session_key = generate_nonce::<32>(None)?;
 
-		// Build plaintext: [session_key || client_random]
-		let mut plaintext = [0u8; 64];
+		// Build plaintext: [session_key || client_random || u32-BE zero
+		// response length]
+		let mut plaintext = [0u8; ECIES_SESSION_PREFIX_LEN];
 		plaintext[..32].copy_from_slice(&base_session_key);
-		plaintext[32..].copy_from_slice(&stored_client_random);
+		plaintext[32..64].copy_from_slice(&stored_client_random);
 
 		// Use server's AAD domain tag (or default if None)
 		let aad = server.aad_domain_tag.or(Some(TIGHTBEAM_AAD_DOMAIN_TAG));

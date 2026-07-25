@@ -14,7 +14,8 @@ use crate::crypto::aead::{RecvCipher, SendCipher, SessionKeys};
 use crate::crypto::profiles::CryptoProvider;
 use crate::crypto::x509::policy::CertificateValidation;
 use crate::crypto::x509::store::CertificateTrust;
-use crate::transport::handshake::negotiation::{MuxSettings, TransportOffer};
+use crate::transport::handshake::negotiation::{MuxSettings, TransportAuthorizer, TransportOffer};
+use crate::transport::handshake::receipt::{ReceiptApprover, SessionObserver, StoredReceipt};
 use crate::transport::handshake::{
 	BoxedServerHandshake, HandshakeKeyManager, HandshakeProtocolKind, TcpHandshakeState,
 };
@@ -54,8 +55,31 @@ pub trait EncryptedProtocolState {
 	/// Get the local transport capability advertisement (multiplexing)
 	fn to_mux_config(&self) -> Option<TransportOffer>;
 
+	/// Get the budget-grant policy consulted between the client's
+	/// transport offer and the server's accept. `None` grants the local
+	/// configuration ceiling.
+	fn to_transport_authorizer(&self) -> Option<Arc<dyn TransportAuthorizer>> {
+		None
+	}
+
+	/// Get the client-side receipt approver consulted before
+	/// countersigning a session receipt. `None` fails closed on
+	/// challenge-bearing receipts.
+	fn to_receipt_approver(&self) -> Option<Arc<dyn ReceiptApprover>> {
+		None
+	}
+
+	/// Get the server-side observer that records the session outcome of
+	/// every budget-bearing handshake. `None` discards the record.
+	fn to_session_observer(&self) -> Option<Arc<dyn SessionObserver>> {
+		None
+	}
+
 	/// Store the negotiated multiplexing settings (pure mutator)
 	fn set_mux_settings(&mut self, settings: Option<MuxSettings>);
+
+	/// Store the dual-signed session receipt (pure mutator)
+	fn set_session_receipt(&mut self, _receipt: Option<StoredReceipt>) {}
 
 	/// Set peer certificate after mutual auth
 	fn set_peer_certificate(&mut self, _cert: Certificate);

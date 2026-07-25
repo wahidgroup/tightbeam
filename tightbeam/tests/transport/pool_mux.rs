@@ -81,7 +81,7 @@ async fn start_echo_server(
 	let (listener, addr) = bind_pool_listener(materials).await?;
 	let handle = server! {
 		protocol TokioListener: listener,
-		policies: { with_mux_offer: [ offer ] },
+		policies: { with_mux_offer: [ offer.clone() ] },
 		handle: move |frame: Frame| async move { Ok(Some(frame)) }
 	};
 
@@ -227,7 +227,7 @@ async fn start_gated_echo_server(
 	let handler_ctx = Arc::clone(ctx);
 	let handle = server! {
 		protocol TokioListener: listener,
-		policies: { with_mux_offer: [ offer ] },
+		policies: { with_mux_offer: [ offer.clone() ] },
 		handle: move |frame: Frame| {
 			let ctx = Arc::clone(&handler_ctx);
 			let first = Arc::clone(&first);
@@ -536,6 +536,7 @@ async fn serve_manual_mux_connection(
 		tokio::spawn(writer_driver.drive()),
 		tokio::spawn(responder.serve(echo)),
 	];
+
 	ctx.register_tasks(spawned);
 	Ok(())
 }

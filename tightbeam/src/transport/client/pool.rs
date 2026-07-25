@@ -347,7 +347,7 @@ impl<P: Protocol> Default for DestinationPool<P> {
 /// - `total_connections` counts live connections and stays within
 ///   `0..=config.max_connections`: +1 when a socket is created.
 /// - Idle connections exceeding `PoolConfig::idle_timeout` are pruned lazily
-/// - Lock poisoning never panics; callers receive `TransportFailure::Internal` instead
+/// - Lock poisoning never panics. Callers receive `TransportFailure::Internal` instead
 #[cfg(feature = "std")]
 pub struct ConnectionPool<P: Protocol, C: CryptoProvider = DefaultCryptoProvider> {
 	/// Per-destination sub-pools
@@ -635,8 +635,8 @@ pooled_mux! {
 		/// Connect to a destination, multiplexing when
 		/// [`PoolConfig::mux_offer`] is set and the peer accepts.
 		pub async fn connect(self: &Arc<Self>, addr: P::Address) -> TransportResult<PooledClient<P, C>> {
-			let offer = match self.config.mux_offer {
-				Some(offer) => offer,
+			let offer = match &self.config.mux_offer {
+				Some(offer) => offer.clone(),
 				None => return self.connect_single_flight(addr).await,
 			};
 
@@ -783,7 +783,7 @@ pooled_mux! {
 		}
 
 		/// Remove a mux entry after a terminal failure (`ConnectionClosed`
-		/// or rekey `Draining`); the next connect re-establishes.
+		/// or rekey `Draining`). The next connect re-establishes.
 		fn evict_mux(&self, addr: &P::Address, id: u64) {
 			let mut pools = match self.pools.write() {
 				Ok(pools) => pools,
@@ -883,7 +883,7 @@ where
 	/// Returns a mutable reference to the underlying connection
 	///
 	/// # Errors
-	/// - `InvalidState`: multiplexed lease; there is no exclusive
+	/// - `InvalidState`: multiplexed lease. There is no exclusive
 	///   connection to hand out. Use [`PooledClient::emit`]
 	pub fn conn(&mut self) -> TransportResult<&mut GenericClient<P>> {
 		self.client.as_mut().ok_or(TransportError::InvalidState)
@@ -962,8 +962,8 @@ pooled_mux! {
 		/// funnel (pooled headroom before a fresh dial) and retry there
 		/// once.
 		async fn emit_failover(&mut self, frame: Frame, attempt: Option<usize>) -> TransportResult<Option<Frame>> {
-			let offer = match self.pool.config.mux_offer {
-				Some(offer) => offer,
+			let offer = match &self.pool.config.mux_offer {
+				Some(offer) => offer.clone(),
 				// A mux lease exists only when an offer is configured
 				None => return Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)),
 			};
@@ -1011,8 +1011,8 @@ where
 			}
 		}
 
-		// A connection parked in `available` is still live and stays counted;
-		// only a discarded (unhealthy or unparkable) connection leaves the set.
+		// A connection parked in `available` is still live and stays counted.
+		// Only a discarded (unhealthy or unparkable) connection leaves the set.
 		if !returned_to_pool {
 			self.pool.release_connection_count();
 		}

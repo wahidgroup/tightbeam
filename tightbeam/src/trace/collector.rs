@@ -3,27 +3,18 @@
 use core::cell::Cell;
 use core::time::Duration;
 
-#[cfg(all(feature = "std", feature = "testing-fault"))]
-use std::collections::HashMap;
-#[cfg(feature = "std")]
-use std::{
-	borrow::Cow,
-	sync::{Arc, Mutex},
-};
-
-#[cfg(not(feature = "std"))]
-use alloc::{
-	borrow::Cow,
-	sync::{Arc, Mutex},
-};
-
-use crate::testing::assertions::{Assertion, AssertionLabel, AssertionValue};
-use crate::trace::TraceConfigBuilder;
-use crate::utils::urn::Urn;
-use crate::Frame;
+use std::borrow::Cow;
+use std::sync::Arc;
 
 #[cfg(feature = "instrument")]
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "testing-fault")]
+use std::collections::HashMap;
+#[cfg(any(test, feature = "testing", feature = "instrument", feature = "testing-fault"))]
+use std::sync::Mutex;
+
+use crate::trace::{AssertionValue, TraceConfigBuilder};
+use crate::utils::urn::Urn;
 
 #[cfg(feature = "testing-fault")]
 use crate::constants::DEFAULT_FAULT_SEED;
@@ -31,7 +22,7 @@ use crate::constants::DEFAULT_FAULT_SEED;
 use crate::crypto::hash::{Digest, Sha3_256};
 #[cfg(feature = "instrument")]
 use crate::instrumentation::{events, TbEvent, TbInstrumentationConfig};
-#[cfg(feature = "policy")]
+#[cfg(all(feature = "policy", any(test, feature = "testing")))]
 use crate::policy::TransitStatus;
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::FaultModel;
@@ -39,8 +30,12 @@ use crate::testing::fdr::FaultModel;
 use crate::testing::fdr::InjectionStrategy;
 #[cfg(feature = "logging")]
 use crate::trace::logging::LogRecord;
-#[cfg(feature = "transport")]
+#[cfg(any(test, feature = "testing"))]
+use crate::trace::{Assertion, AssertionLabel};
+#[cfg(all(feature = "transport", any(test, feature = "testing")))]
 use crate::transport::error::TransportError;
+#[cfg(any(test, feature = "testing"))]
+use crate::Frame;
 
 /// Trait for converting types into event labels
 pub trait IntoEventLabel {
@@ -249,52 +244,55 @@ impl<'a> EventBuilder<'a> {
 			}
 		}
 
-		let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
 		let label = core::mem::take(&mut self.label);
-		let tags = self.tags.take().map(|t| t.into_owned()).unwrap_or_default();
-		let assertion = match self.value.take() {
+		let value = self.value.take();
+
+		#[cfg(feature = "instrument")]
+		match &value {
 			Some(EventValue::None) | None => {
-				#[cfg(feature = "instrument")]
-				{
-					// Use TIMING_WCET URN if duration is specified, otherwise ASSERT_LABEL
-					let urn = if self.duration_ns.is_some() {
-						events::TIMING_WCET
-					} else {
-						events::ASSERT_LABEL
-					};
+				// Use TIMING_WCET URN if duration is specified, otherwise ASSERT_LABEL
+				let urn = if self.duration_ns.is_some() {
+					events::TIMING_WCET
+				} else {
+					events::ASSERT_LABEL
+				};
 
-					self.collector
-						.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
-				}
-
-				#[cfg(feature = "testing-fuzz")]
-				self.collector.dispatch_csp_event(&label);
-
-				Assertion::new(seq, AssertionLabel::Custom(label), tags, None)
+				self.collector
+					.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
 			}
 			Some(EventValue::Value(assertion_value)) => {
-				#[cfg(feature = "instrument")]
-				{
-					let value_str = format_assertion_value(&assertion_value);
-					self.collector.emit_internal(
-						events::ASSERT_PAYLOAD,
-						Some(&label),
-						Some(value_str.as_bytes()),
-						self.duration_ns,
-						None,
-					);
-				}
-
-				#[cfg(feature = "testing-fuzz")]
-				self.collector.dispatch_csp_event(&label);
-
-				Assertion::with_value(seq, AssertionLabel::Custom(label), tags, None, assertion_value)
+				let value_str = format_assertion_value(assertion_value);
+				self.collector.emit_internal(
+					events::ASSERT_PAYLOAD,
+					Some(&label),
+					Some(value_str.as_bytes()),
+					self.duration_ns,
+					None,
+				);
 			}
-		};
-
-		if let Ok(mut assertions) = self.collector.state.assertions.lock() {
-			assertions.push(assertion);
 		}
+
+		#[cfg(feature = "testing-fuzz")]
+		self.collector.dispatch_csp_event(&label);
+
+		#[cfg(any(test, feature = "testing"))]
+		{
+			let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
+			let tags = self.tags.take().map(|t| t.into_owned()).unwrap_or_default();
+			let assertion = match value {
+				Some(EventValue::None) | None => Assertion::new(seq, AssertionLabel::Custom(label), tags, None),
+				Some(EventValue::Value(assertion_value)) => {
+					Assertion::with_value(seq, AssertionLabel::Custom(label), tags, None, assertion_value)
+				}
+			};
+
+			if let Ok(mut assertions) = self.collector.state.assertions.lock() {
+				assertions.push(assertion);
+			}
+		}
+
+		#[cfg(not(any(test, feature = "testing")))]
+		let _ = (label, value, self.tags.take(), self.collector);
 	}
 }
 
@@ -311,6 +309,7 @@ pub struct TraceCollector {
 
 #[derive(Debug)]
 struct TraceState {
+	#[cfg(any(test, feature = "testing"))]
 	assertions: Mutex<Vec<Assertion>>,
 	#[cfg(feature = "instrument")]
 	events: Mutex<Vec<TbEvent>>,
@@ -338,6 +337,7 @@ struct TraceState {
 impl Default for TraceState {
 	fn default() -> Self {
 		Self {
+			#[cfg(any(test, feature = "testing"))]
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
 			events: Mutex::new(Vec::new()),
@@ -365,6 +365,7 @@ impl TraceState {
 	#[cfg(feature = "instrument")]
 	fn with_config(config: TbInstrumentationConfig) -> Self {
 		Self {
+			#[cfg(any(test, feature = "testing"))]
 			assertions: Mutex::new(Vec::new()),
 			events: Mutex::new(Vec::new()),
 			config,
@@ -386,6 +387,7 @@ impl TraceState {
 	#[cfg(feature = "testing-fuzz")]
 	fn with_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
 		Self {
+			// The testing-fuzz feature implies testing, so the field exists here
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
 			events: Mutex::new(Vec::new()),
@@ -663,6 +665,7 @@ impl TraceCollector {
 	}
 
 	/// Drain assertions into a vector
+	#[cfg(any(test, feature = "testing"))]
 	pub fn drain_assertions(&self) -> Vec<Assertion> {
 		if let Ok(mut assertions) = self.state.assertions.lock() {
 			assertions.drain(..).collect()
@@ -754,28 +757,34 @@ fn format_assertion_value(value: &AssertionValue) -> String {
 }
 
 /// Consumed execution trace after await completion.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct ConsumedTrace {
 	#[cfg(feature = "instrument")]
 	pub instrument_events: Vec<TbEvent>,
 	pub assertions: Vec<Assertion>,
+	#[cfg(feature = "policy")]
 	pub gate_decision: Option<TransitStatus>,
 	pub accepted_frame: Option<Frame>,
 	pub rejected_frame: Option<Frame>,
 	pub response: Option<Frame>,
+	#[cfg(feature = "transport")]
 	pub error: Option<TransportError>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ConsumedTrace {
 	pub fn new() -> Self {
 		Self {
 			#[cfg(feature = "instrument")]
 			instrument_events: Vec::new(),
 			assertions: Vec::new(),
+			#[cfg(feature = "policy")]
 			gate_decision: None,
 			accepted_frame: None,
 			rejected_frame: None,
 			response: None,
+			#[cfg(feature = "transport")]
 			error: None,
 		}
 	}
@@ -791,15 +800,23 @@ impl ConsumedTrace {
 
 	/// Determine execution mode based on trace outcome
 	pub fn execution_mode(&self) -> ExecutionMode {
+		#[cfg(feature = "transport")]
 		if self.error.is_some() {
-			ExecutionMode::Error
-		} else if matches!(self.gate_decision, Some(TransitStatus::Ok)) {
-			ExecutionMode::Accept
-		} else if self.gate_decision.is_some() {
-			ExecutionMode::Reject
-		} else {
+			return ExecutionMode::Error;
+		}
+		#[cfg(feature = "policy")]
+		{
+			if matches!(self.gate_decision, Some(TransitStatus::Ok)) {
+				return ExecutionMode::Accept;
+			}
+			if self.gate_decision.is_some() {
+				return ExecutionMode::Reject;
+			}
+
 			ExecutionMode::Error
 		}
+		#[cfg(not(feature = "policy"))]
+		ExecutionMode::Accept
 	}
 
 	pub fn has_response(&self) -> bool {
@@ -849,6 +866,7 @@ where
 }
 
 /// Execution mode classification for specs
+#[cfg(any(test, feature = "testing"))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
 	Accept,
@@ -856,6 +874,7 @@ pub enum ExecutionMode {
 	Error,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ExecutionMode {
 	pub fn as_str(&self) -> &'static str {
 		match self {
