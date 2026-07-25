@@ -576,7 +576,8 @@ fn mux_settings(offer: &TransportOffer, accept: &TransportAccept, local_is_clien
 		initial_recv_credit = accept.initial_stream_credit;
 	}
 
-	let settings = MuxSettings {
+	
+	MuxSettings {
 		local_initiated_cap: clamp_stream_cap(local_initiated_cap),
 		peer_initiated_cap: clamp_stream_cap(peer_initiated_cap),
 		send_chunk_size: clamp_chunk_size(send_chunk_size),
@@ -586,8 +587,7 @@ fn mux_settings(offer: &TransportOffer, accept: &TransportAccept, local_is_clien
 		initial_recv_credit: clamp_stream_credit(initial_recv_credit),
 		send_budget,
 		recv_budget,
-	};
-	settings
+	}
 }
 
 /// Errors during profile negotiation.
