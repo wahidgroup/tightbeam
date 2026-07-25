@@ -576,7 +576,6 @@ fn mux_settings(offer: &TransportOffer, accept: &TransportAccept, local_is_clien
 		initial_recv_credit = accept.initial_stream_credit;
 	}
 
-	
 	MuxSettings {
 		local_initiated_cap: clamp_stream_cap(local_initiated_cap),
 		peer_initiated_cap: clamp_stream_cap(peer_initiated_cap),
