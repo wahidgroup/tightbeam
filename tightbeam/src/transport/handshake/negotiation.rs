@@ -490,6 +490,7 @@ pub(crate) async fn authorize_transport(
 		(Some(requested), Some(granted)) => Some(granted.min(requested).clamped()),
 		_ => None,
 	};
+
 	accept.granted_budgets = granted_budgets;
 
 	let challenge = grant.challenge;
@@ -617,75 +618,55 @@ fn mux_settings(offer: &TransportOffer, accept: &TransportAccept, local_is_clien
 }
 
 /// Errors during profile negotiation.
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Errorizable)]
 pub enum NegotiationError {
 	/// No mutually supported profile found.
-	#[cfg_attr(feature = "derive", error("No mutually supported security profile"))]
+	#[error("No mutually supported security profile")]
 	NoMutualProfile,
 
 	/// Offer contains no profiles.
-	#[cfg_attr(feature = "derive", error("Security offer is empty"))]
+	#[error("Security offer is empty")]
 	EmptyOffer,
 
 	/// No profile meets the configured minimum-strength policy.
-	#[cfg_attr(feature = "derive", error("No profile meets the minimum-strength policy"))]
+	#[error("No profile meets the minimum-strength policy")]
 	BelowStrengthFloor,
 
 	/// Offer exceeds the maximum accepted profile count.
-	#[cfg_attr(
-		feature = "derive",
-		error("Security offer too large: {count} profiles exceeds cap of {max}")
-	)]
+	#[error("Security offer too large: {count} profiles exceeds cap of {max}")]
 	OfferTooLarge { count: usize, max: usize },
 
 	/// Peer accepted a transport capability that was never offered.
-	#[cfg_attr(
-		feature = "derive",
-		error("Peer accepted a transport capability that was never offered")
-	)]
+	#[error("Peer accepted a transport capability that was never offered")]
 	UnsolicitedTransportAccept,
 
 	/// The transport authorizer refused the session.
-	#[cfg_attr(feature = "derive", error("Transport authorization refused: code {code}"))]
+	#[error("Transport authorization refused: code {code}")]
 	AuthorizationRefused { code: u32 },
 
 	/// The authorizer issued a settlement challenge without granting
 	/// budgets: the receipt that would carry it never exists.
-	#[cfg_attr(feature = "derive", error("Settlement challenge issued without budget grant"))]
+	#[error("Settlement challenge issued without budget grant")]
 	ChallengeWithoutBudgets,
 
 	/// The peer granted budgets beyond [`MAX_MUX_SESSION_BUDGET`]. The
 	/// receipt attests the raw wire values, so an over-cap grant would
 	/// be countersigned at figures the local endpoint never enforces
 	/// (dispute ambiguity). Fail closed instead of clamping.
-	#[cfg_attr(feature = "derive", error("Granted budgets exceed the session budget cap"))]
+	#[error("Granted budgets exceed the session budget cap")]
 	BudgetBeyondCap,
 
 	/// The peer granted budgets beyond what was requested. A conforming
 	/// server derives the grant as the componentwise minimum with the
 	/// request, so an over-request grant would bind the countersignature
 	/// to figures the local endpoint never asked for. Fail closed.
-	#[cfg_attr(feature = "derive", error("Granted budgets exceed the requested budgets"))]
+	#[error("Granted budgets exceed the requested budgets")]
 	BudgetBeyondRequest,
 
 	/// DER encoding/decoding error.
-	#[cfg_attr(feature = "derive", error("DER encoding error: {0}"))]
+	#[error("DER encoding error: {0}")]
 	DerError(DerDecodeError),
 }
-
-crate::impl_error_display!(NegotiationError {
-	NoMutualProfile => "No mutually supported security profile",
-	EmptyOffer => "Security offer is empty",
-	BelowStrengthFloor => "No profile meets the minimum-strength policy",
-	OfferTooLarge { count, max } => "Security offer too large: {count} profiles exceeds cap of {max}",
-	UnsolicitedTransportAccept => "Peer accepted a transport capability that was never offered",
-	AuthorizationRefused { code } => "Transport authorization refused: code {code}",
-	ChallengeWithoutBudgets => "Settlement challenge issued without budget grant",
-	BudgetBeyondCap => "Granted budgets exceed the session budget cap",
-	BudgetBeyondRequest => "Granted budgets exceed the requested budgets",
-	DerError(e) => "DER encoding error: {e}",
-});
 
 impl From<AuthorizationRefusal> for NegotiationError {
 	fn from(refusal: AuthorizationRefusal) -> Self {

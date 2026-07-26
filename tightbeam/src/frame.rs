@@ -56,7 +56,6 @@ pub(crate) struct TbsScaffold<'a> {
 
 #[cfg(feature = "signature")]
 impl<'a> TbsScaffold<'a> {
-	/// Mirrors the derive's encoding of `integrity`: context-specific tag 0,
 	/// EXPLICIT mode.
 	fn tagged_integrity(integrity: &'a DigestInfo) -> ContextSpecificRef<'a, DigestInfo> {
 		ContextSpecificRef { tag_number: TagNumber::N0, tag_mode: TagMode::Explicit, value: integrity }

@@ -487,9 +487,7 @@ where
 			// Dual ownership by design: this copy is DER-encoded onto
 			// the wire and dropped; the retained artifact absorbs the
 			// client SignerInfo at settlement.
-			// TODO: a borrowed-encode ServerHandshake mirror would make
-			// this zero-copy at the cost of a hand-maintained Sequence
-			// impl; revisit if handshake profiling warrants it.
+			// TODO: Determine how to handle this clone.
 			session_receipt: self.receipt_artifact.clone(),
 		};
 

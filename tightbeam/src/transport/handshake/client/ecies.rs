@@ -406,11 +406,10 @@ where
 		self.verify_server_signature(&verifying_key, &transcript_digest, server_handshake.signature.as_bytes())
 	}
 
-	/// Generate base session key and encrypt with server's public key.
+	/// Generate base session key and ECIES-encrypt it to the server.
 	///
-	/// The pending countersignature rides inside the encrypted payload;
-	/// once encoded it moves back out into the completed stored
-	/// artifact, so the `SignerInfo` is never copied.
+	/// Pending receipt ack passes through encryption by value so
+	/// `SignerInfo` is not cloned into the stored receipt.
 	fn generate_and_encrypt_session_key(
 		&mut self,
 		server_handshake: &ServerHandshake,

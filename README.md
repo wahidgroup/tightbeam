@@ -1963,7 +1963,7 @@ either:     Cancel(code)  Credit(limit)
 **Session Receipts** (budget-bearing sessions only): every metered session produces a CMS `SignedData` artifact ([RFC 5652 §5][rfc5652-5]) whose `eContent` is the `SessionReceipt` body binding the handshake transcript (as a self-describing `DigestInfo`, [RFC 8017 §9.2][rfc8017-9.2]), budgets, and settlement terms, with one role-tagged `SignerInfo` per peer. A third party holding the two certificates verifies the agreement from the stored artifact alone.
 
 - The server signs. The client validates against the negotiated session, answers the challenge via its `ReceiptApprover`, and countersigns: its `SignerInfo`'s signed attributes ([RFC 5652 §11][rfc5652-11]) bind the answer and the role, so neither can be swapped or spliced (CWE-347)
-- The client's `SignerInfo` travels only encrypted to the server (inside the ECIES key-exchange payload, or an `EnvelopedData` [RFC 5652 §6][rfc5652-6] attribute on the CMS Finished): the settlement answer is a bearer secret and never rides the cleartext wire
+- The client's `SignerInfo` travels only encrypted to the server (inside the ECIES key-exchange payload, or an `EnvelopedData` [RFC 5652 §6][rfc5652-6] attribute on the CMS Finished): the settlement answer is a bearer secret and never travels on the cleartext wire
 - The server's `TransportAuthorizer::settle` accepts or refuses the answer. The session MUST NOT activate before it accepts. Every step fails closed, and budgets REQUIRE mutual authentication
 - A server-side `SessionObserver` records every concluded outcome, including refused and forged acknowledgements. It never vetoes
 - Both endpoints retain the completed artifact (`session_receipt()`). The settlement answer is application truth: never parsed, never price-checked, never persisted. The receipt makes the agreement non-repudiable, not correct
@@ -2859,7 +2859,7 @@ let tls = ClusterTlsConfig {
 
 For hives to trust cluster commands (like heartbeats), they must have the cluster's certificate in their trust store. See [Trust Stores](#trust-stores) for details.
 
-The gateway requires `hive_trust` for hive-origin control frames (registration, servlet address updates): registration replies carry `TransitStatus::Unauthenticated` for missing signatures and `TransitStatus::PermissionDenied` for signatures that fail verification. Leaving `hive_trust` as `None` fails closed -- all control frames are rejected with `TransitStatus::PermissionDenied`, mirroring the hive-side trust store requirement.
+The gateway requires `hive_trust` for hive-origin control frames (registration, servlet address updates): registration replies carry `TransitStatus::Unauthenticated` for missing signatures and `TransitStatus::PermissionDenied` for signatures that fail verification. Leaving `hive_trust` as `None` fails closed -- all control frames are rejected with `TransitStatus::PermissionDenied`.
 
 ##### Heartbeat Mechanism
 

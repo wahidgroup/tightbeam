@@ -1,4 +1,3 @@
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 
 pub type Result<T> = core::result::Result<T, TestingError>;
@@ -41,46 +40,31 @@ impl core::fmt::Display for SchedulabilityViolationDetail {
 }
 
 /// Testing error types
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug)]
+#[derive(Debug, Errorizable)]
 pub enum TestingError {
-	#[cfg_attr(feature = "derive", error("Fuzz input exhausted"))]
+	#[error("Fuzz input exhausted")]
 	FuzzInputExhausted,
-	#[cfg_attr(feature = "derive", error("Fuzz oracle deadlock in state {0}"))]
+	#[error("Fuzz oracle deadlock in state {0}")]
 	FuzzDeadlock(&'static str),
-	#[cfg_attr(feature = "derive", error("Fuzz oracle rejected event {0}"))]
+	#[error("Fuzz oracle rejected event {0}")]
 	FuzzEventRejected(&'static str),
-	#[cfg_attr(feature = "derive", error("Fuzz input unavailable"))]
+	#[error("Fuzz input unavailable")]
 	FuzzInputUnavailable,
-	#[cfg_attr(feature = "derive", error("Fuzz input lock poisoned"))]
+	#[error("Fuzz input lock poisoned")]
 	FuzzInputLockPoisoned,
-	#[cfg_attr(feature = "derive", error("Invalid timing constraint configuration"))]
+	#[error("Invalid timing constraint configuration")]
 	InvalidTimingConstraint,
-	#[cfg_attr(feature = "derive", error("Slack exceeds deadline duration"))]
+	#[error("Slack exceeds deadline duration")]
 	InvalidSlack,
-	#[cfg_attr(feature = "derive", error("Invalid FDR configuration: {0}"))]
+	#[error("Invalid FDR configuration: {0}")]
 	InvalidFdrConfig(FdrConfigError),
-	#[cfg_attr(feature = "derive", error("Invalid fault model configuration"))]
+	#[error("Invalid fault model configuration")]
 	InvalidFaultModel,
-	#[cfg_attr(feature = "derive", error("Schedulability violation: {0}"))]
+	#[error("Schedulability violation: {0}")]
 	SchedulabilityViolation(SchedulabilityViolationDetail),
-	#[cfg_attr(feature = "derive", error("Invariant violated"))]
+	#[error("Invariant violated")]
 	InvariantViolated,
 }
-
-crate::impl_error_display!(TestingError {
-	FuzzInputExhausted => "Fuzz input exhausted",
-	FuzzDeadlock(state) => "Fuzz oracle deadlock in state {state}",
-	FuzzEventRejected(event) => "Fuzz oracle rejected event {event}",
-	FuzzInputUnavailable => "Fuzz input unavailable",
-	FuzzInputLockPoisoned => "Fuzz input lock poisoned",
-	InvalidTimingConstraint => "Invalid timing constraint configuration",
-	InvalidSlack => "Slack exceeds deadline duration",
-	InvalidFdrConfig(detail) => "Invalid FDR configuration: {detail}",
-	InvalidFaultModel => "Invalid fault model configuration",
-	SchedulabilityViolation(detail) => "Schedulability violation: {detail}",
-	InvariantViolated => "Invariant violated",
-});
 
 #[cfg(feature = "std")]
 impl<T> From<std::sync::PoisonError<T>> for TestingError {

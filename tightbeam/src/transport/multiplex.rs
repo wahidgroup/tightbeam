@@ -1041,7 +1041,7 @@ mod router {
 				armed: true,
 			};
 
-			match self.send_request_chunks(stream_id, &payload).await {
+			match self.send_request_chunks(stream_id, &payload, chunk_records).await {
 				Ok(()) => {}
 				// Ledger removed mid-send: the stream resolved underneath
 				// the sender and the outcome channel carries the truth
@@ -1067,10 +1067,11 @@ mod router {
 		}
 
 		/// Segment a request payload into the initiator grammar, one
-		/// credit-gated chunk per record.
-		async fn send_request_chunks(&self, stream_id: u32, payload: &[u8]) -> TransportResult<()> {
+		/// credit-gated chunk per record. `total` is the registered
+		/// chunk count: sender and ledger share one figure by
+		/// construction.
+		async fn send_request_chunks(&self, stream_id: u32, payload: &[u8], total: u64) -> TransportResult<()> {
 			let chunk_size = self.shared.send_chunk_size;
-			let total = chunk_records(payload.len(), chunk_size).max(1);
 			let mut outbound = outbound_handle(&self.outbound);
 			let mut chunks = payload.chunks(chunk_size);
 			let mut sent: u64 = 0;

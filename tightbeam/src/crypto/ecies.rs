@@ -841,7 +841,7 @@ mod tests {
 
 	/// Decrypt an ECIES payload with the recipient private key held behind a
 	/// `SigningKeyProvider`: the `d·R` step runs via `key_agreement`, then the
-	/// shared-secret decryptor opens it through the standard `Decryptor` seam.
+	/// shared-secret decryptor opens it through the standard `Decryptor`.
 	#[cfg(all(feature = "x509", feature = "signature", feature = "ecdh", feature = "tokio"))]
 	#[tokio::test]
 	async fn shared_secret_decryptor_via_provider() -> crate::error::Result<()> {
@@ -853,7 +853,7 @@ mod tests {
 		let plaintext = b"hsm-backed ecies decryption";
 		let (secret, public) = keypair();
 
-		// Sender encrypts to the recipient public key (in-memory Encryptor seam).
+		// Sender encrypts to the recipient public key.
 		let info = EciesEncryptor::new(public).encrypt_content(plaintext, [], None)?;
 		let wire = info.encrypted_content.as_ref().ok_or(EciesError::InvalidCiphertext)?.as_bytes();
 
@@ -862,7 +862,7 @@ mod tests {
 		let provider = Secp256k1KeyProvider::from(Secp256k1SigningKey::from(secret));
 		let shared = provider.key_agreement(epk).await?;
 
-		// Open via the standard Decryptor seam (what Frame::decrypt_bytes calls).
+		// Open via the standard Decryptor (what Frame::decrypt_bytes calls).
 		let decryptor = EciesSharedSecretDecryptor::<DefaultCryptoProvider>::new(shared);
 		let opened = decryptor.decrypt_content(&info)?.to_insecure()?;
 

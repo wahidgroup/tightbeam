@@ -76,11 +76,6 @@ mod ecies {
 		}
 	}
 
-	// The ECIES countersignature rides inside the key-exchange
-	// ciphertext, covered by the client auth signature: any wire tamper
-	// that could reach it MUST be rejected before the receipt exchange
-	// concludes, settlement MUST never fire, and no outcome is recorded
-	// (the observer contract covers concluded exchanges only).
 	tb_scenario! {
 		name: ecies_tampered_countersignature_carriage_rejected,
 		spec: CountersignatureTamperSpec,
@@ -119,10 +114,8 @@ mod ecies {
 				let server_handshake = server.process_client_hello(&client_hello).await?;
 				let client_kex_der = client.process_server_handshake(&server_handshake).await?;
 
-				// The countersignature travels only inside the ECIES
-				// ciphertext, and the client auth signature covers that
-				// ciphertext: the closest a MITM can get is flipping a
-				// ciphertext byte, which the auth binding rejects.
+				// Auth signature covers encrypted_data; flip a ciphertext
+				// byte — the only wire handle a MITM has on the sealed ack.
 				let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
 				let mut forged = kex.encrypted_data.as_bytes().to_vec();
 				let middle = forged.len() / 2;
@@ -220,11 +213,6 @@ mod cms {
 		}
 	}
 
-	// A client Finished stripped of its acknowledgement attribute MUST
-	// abort the receipt acknowledgement, MUST reach the observer as
-	// CountersignatureMissing evidence, and MUST NOT activate the
-	// session. The settlement answer rides inside the stripped envelope,
-	// so nothing of it survives either.
 	tb_scenario! {
 		name: cms_missing_countersignature_recorded,
 		spec: CountersignatureMissingSpec,
@@ -265,9 +253,6 @@ mod cms {
 					ack_refused,
 				)?;
 
-				// The withheld acknowledgement is evidence: one outcome,
-				// the missing verdict, no countersignature bytes, and no
-				// answer (it rode inside the stripped envelope).
 				let outcomes = observer.recorded();
 				let missing_recorded = outcomes.len() == 1
 					&& outcomes[0].verdict == SessionVerdict::CountersignatureMissing
