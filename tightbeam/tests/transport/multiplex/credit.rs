@@ -199,7 +199,7 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let budgets = MuxBudgets { client_to_server: 0, server_to_client: 0 };
 			let client_offer = mux_offer(4).with_budgets(budgets);
-			let server_offer = mux_offer(4);
+			let server_offer = mux_offer(4).with_budgets(budgets);
 			let hooks = MutualSessionHooks::default();
 			let session = establish_mutual_transports(client_offer, server_offer, hooks).await?;
 			let config = MuxEndpointConfig::default();
@@ -247,7 +247,7 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| async move {
 			let budgets = MuxBudgets { client_to_server: 6, server_to_client: 4096 };
 			let client_offer = chunked_offer(1).with_budgets(budgets);
-			let server_offer = chunked_offer(1);
+			let server_offer = chunked_offer(1).with_budgets(budgets);
 			let hooks = MutualSessionHooks::default();
 			let session = establish_mutual_transports(client_offer, server_offer, hooks).await?;
 			let config = MuxEndpointConfig::default();
@@ -345,7 +345,7 @@ async fn reassembly_flood_rejected() -> Result<bool, TightBeamError> {
 async fn budget_overrun_rejected() -> Result<bool, TightBeamError> {
 	let budgets = MuxBudgets { client_to_server: 1, server_to_client: 4096 };
 	let client_offer = chunked_offer(4).with_budgets(budgets);
-	let server_offer = chunked_offer(4);
+	let server_offer = chunked_offer(4).with_budgets(budgets);
 	let hooks = MutualSessionHooks::default();
 	let session = establish_mutual_transports(client_offer, server_offer, hooks).await?;
 	let config = MuxEndpointConfig::default();

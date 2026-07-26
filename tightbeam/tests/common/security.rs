@@ -337,6 +337,7 @@ mod cms_fixtures {
 		hooks: CmsSessionHooks,
 	) -> Result<CmsSessionPair, TightBeamError> {
 		let profile = default_security_profile();
+		let offer = TransportOffer::mux(4).with_budgets(request);
 
 		let client_signing = create_test_signing_key();
 		let client_cert = Arc::new(create_test_certificate(&client_signing));
@@ -352,7 +353,7 @@ mod cms_fixtures {
 		.with_security_offer(SecurityOffer::new(vec![profile]))
 		.with_trust_store(trust_store)
 		.with_client_certificate(Arc::clone(&client_cert))
-		.with_transport_offer(TransportOffer::mux(4).with_budgets(request));
+		.with_transport_offer(offer.to_owned());
 
 		if let Some(approver) = hooks.approver {
 			client = client.with_receipt_approver(approver);
@@ -362,7 +363,7 @@ mod cms_fixtures {
 		let mut server =
 			CmsHandshakeServer::<DefaultCryptoProvider>::new(Arc::clone(&materials.key_provider), Some(validators))
 				.with_supported_profiles(vec![profile])
-				.with_transport_config(TransportOffer::mux(4));
+				.with_transport_config(offer);
 
 		if let Some(authorizer) = hooks.authorizer {
 			server = server.with_transport_authorizer(authorizer);

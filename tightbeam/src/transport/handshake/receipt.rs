@@ -102,13 +102,18 @@ mod x509 {
 #[cfg(feature = "x509")]
 use x509::*;
 
-/// Session agreement artifact issued by the server for every
-/// budget-bearing session.
+/// Session agreement body issued by the server for every budget-bearing
+/// session.
 ///
-/// The `transcript_hash` pins the receipt to one handshake. Replaying
-/// it against another session changes the transcript and breaks the pin.
-/// `ancillary` carries the server's settlement challenge (unsigned
-/// transaction, invoice, anything) as opaque bytes.
+/// # Binding
+///
+/// - `transcript_hash` pins the receipt to one handshake. Replaying it
+///   against another session changes the transcript and breaks the pin.
+/// - `budgets` / `credit_unit` are the metered session terms both sides
+///   countersign.
+/// - `ancillary` is the server's settlement challenge (unsigned
+///   transaction, invoice, or other opaque bytes). Public wire data,
+///   never a secret; never parsed by TightBeam.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct SessionReceipt {
@@ -529,11 +534,14 @@ where
 
 /// Completed dual-signed receipt retained after the handshake.
 ///
-/// Validated view over the CMS `SignedData` artifact: the body parses,
-/// and exactly one `SignerInfo` per role is present. Given the server
-/// and client certificates, [`StoredReceipt::verify`] confirms both
-/// signatures from the artifact alone. Endpoints hold it only for the
-/// life of the session object.
+/// Validated view over the CMS `SignedData` artifact: the body parses
+/// and exactly one `SignerInfo` per role is present.
+///
+/// # Verification
+///
+/// Given the server and client certificates, [`StoredReceipt::verify`]
+/// confirms both signatures from the artifact alone (no handshake
+/// replay). Endpoints hold it only for the life of the session object.
 #[derive(Clone)]
 pub struct StoredReceipt {
 	/// The dual-signed `SignedData` artifact, the single source of truth.
@@ -672,23 +680,31 @@ pub struct ApprovalRefusal {
 	pub code: u32,
 }
 
-/// Client hook deciding whether to countersign a [`SessionReceipt`] and
-/// answering its settlement challenge.
+/// Client policy for countersigning a [`SessionReceipt`] and answering
+/// its settlement challenge.
 ///
 /// Runs between the server's handshake response and the client's key
-/// exchange. `Ok(None)` countersigns without a settlement answer.
-/// `Ok(Some(bytes))` attaches the answer (paid invoice preimage, signed
-/// transaction, anything) in chain format. A refusal aborts the handshake.
-/// The answer travels only encrypted to the server.
+/// exchange. Awaited inline with **no library deadline**: bound long
+/// work (paying an invoice, prompting a user) yourself.
 ///
-/// Without a configured approver the client fails closed: challenge-free
-/// receipts are countersigned, challenge-bearing receipts abort.
+/// # Verdicts
 ///
-/// The hook is awaited inline in the handshake and TightBeam imposes no
-/// deadline: a slow approval (paying an invoice, prompting a user) stalls
-/// the handshake and whatever peer timeout applies, so bound long
-/// settlements with your own timeout.
+/// - `Ok(None)` - countersign without a settlement answer.
+/// - `Ok(Some(bytes))` - attach the answer (paid invoice preimage,
+///   signed transaction, or other chain-format bytes). Travels only
+///   encrypted to the server.
+/// - [`ApprovalRefusal`] - abort the handshake with its application code.
+///
+/// # When no approver is installed
+///
+/// Challenge-free receipts are countersigned unanswered.
+/// Challenge-bearing receipts abort with [`SETTLEMENT_UNSUPPORTED_CODE`].
 pub trait ReceiptApprover: MaybeSend + MaybeSync {
+	/// Approve the receipt and optionally attach a settlement answer.
+	///
+	/// # Errors
+	///
+	/// [`ApprovalRefusal`] aborts the handshake with its application code.
 	fn approve<'a>(
 		&'a self,
 		receipt: &'a SessionReceipt,
@@ -723,10 +739,13 @@ pub enum SessionVerdict {
 ///
 /// The library produces the evidence. The application owns the ledger.
 /// TightBeam is `no_std`-capable with no clock and no storage, so
-/// timestamps and persistence belong to the [`SessionObserver`] that
-/// receives this record. The receipt body pins the transcript hash (and
-/// through it identities and negotiation), so the record is
-/// third-party-verifiable against the certificates alone.
+/// timestamps and persistence belong to the [`SessionObserver`].
+///
+/// # Evidence
+///
+/// The receipt body pins the transcript hash (and through it identities
+/// and negotiation). With the peer certificates the record is
+/// third-party-verifiable without replaying the handshake.
 #[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct SessionOutcome {
@@ -765,21 +784,24 @@ impl fmt::Debug for SessionOutcome {
 }
 
 /// Server hook receiving the [`SessionOutcome`] of every budget-bearing
-/// session whose receipt exchange concluded: activated, refused by the
-/// authorizer, or aborted on a missing or invalid countersignature.
+/// session whose receipt exchange concluded.
 ///
-/// Observation is a record, not a decision: the hook cannot veto (the
-/// [`TransportAuthorizer`](crate::transport::handshake::negotiation::TransportAuthorizer)
-/// already decided) and runs after the verdict is final. Implementations
-/// stamp their own clock and persist to their own ledger, retaining the
-/// evidence for their own dispute window.
+/// Covers activated, authorizer-refused, and countersignature
+/// missing/invalid endings. Observation is a record, not a decision:
+/// the hook cannot veto
+/// ([`TransportAuthorizer`](crate::transport::handshake::negotiation::TransportAuthorizer)
+/// already decided) and runs after the verdict is final.
 ///
-/// The hook is awaited inline before the handshake concludes and has no
-/// library deadline: keep it fast or bound it with your own timeout.
+/// # Contract
 ///
-/// The outcome is borrowed: implementations `to_owned` what they retain.
+/// - Awaited inline before the handshake concludes with **no library
+///   deadline**. Keep it fast or bound it yourself.
+/// - Outcome is borrowed: `to_owned` what you retain.
+/// - Stamp your own clock; persist to your own ledger for your dispute
+///   window.
 #[cfg(feature = "x509")]
 pub trait SessionObserver: MaybeSend + MaybeSync {
+	/// Observe a terminal receipt outcome.
 	fn on_outcome<'a>(&'a self, outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()>;
 }
 
@@ -790,12 +812,21 @@ async fn notify_observer(observer: Option<&dyn SessionObserver>, outcome: &Sessi
 	}
 }
 
-/// Match a server-issued receipt against the negotiated accept, failing
-/// closed on every disagreement.
+/// Match a server-issued receipt against the negotiated accept.
 ///
-/// Returns the receipt for a budget-bearing session, or `None` for an
-/// unmetered one. Shared by both handshake carriages so the presence
-/// matrix and the transcript/budgets/credit-unit binding cannot drift.
+/// Shared by both handshake carriages so the presence matrix and the
+/// transcript / budgets / credit-unit binding cannot drift.
+///
+/// # Returns
+///
+/// - `Ok(Some(receipt))` for a budget-bearing session.
+/// - `Ok(None)` for an unmetered session.
+///
+/// # Fail closed
+///
+/// - Receipt missing when budgets were granted: [`HandshakeError::ReceiptMissing`]
+/// - Receipt present when unmetered: [`HandshakeError::ReceiptMismatch`]
+/// - Transcript, budgets, or credit unit disagree: [`HandshakeError::ReceiptMismatch`]
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn match_receipt_to_accept<D>(
 	receipt: Option<SessionReceipt>,
@@ -842,10 +873,15 @@ where
 
 /// Approve a receipt and answer its settlement challenge, or fail closed.
 ///
-/// Without an approver, challenge-free receipts pass unanswered and
-/// challenge-bearing receipts abort with [`SETTLEMENT_UNSUPPORTED_CODE`].
-/// The answer is normalized: an empty answer is stored, signed, and
-/// sent as no answer.
+/// # When no approver is installed
+///
+/// - Challenge-free: pass unanswered (`Ok(None)`).
+/// - Challenge-bearing: abort with [`SETTLEMENT_UNSUPPORTED_CODE`].
+///
+/// # Normalization
+///
+/// Empty answers are stored, signed, and sent as no answer
+/// ([`normalize_answer`]).
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) async fn approve_or_fail_closed(
 	approver: Option<&dyn ReceiptApprover>,
@@ -866,12 +902,19 @@ pub(crate) async fn approve_or_fail_closed(
 	Ok(normalized)
 }
 
-/// Verify the client's countersignature and settle it into a terminal
-/// verdict, returning the recovered settlement answer alongside.
+/// Verify the client's countersignature and settle into a terminal verdict.
 ///
-/// A failing countersignature is a verdict, not an early error: the
-/// attempt must still reach the observer as evidence. Sessions without
-/// an authorizer activate unconditionally once the signature verifies.
+/// Returns the recovered settlement answer alongside the
+/// [`SessionVerdict`].
+///
+/// # Fail closed (as verdicts, not early errors)
+///
+/// A failing countersignature is still a verdict so the attempt reaches
+/// the observer as evidence.
+///
+/// # When no authorizer is installed
+///
+/// Activate unconditionally once the signature verifies.
 #[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
 pub(crate) async fn settle_receipt_ack<D, S, V>(
 	receipt: &SessionReceipt,
@@ -912,8 +955,12 @@ where
 ///
 /// Every concluded receipt exchange reaches the observer before any
 /// abort: a refused or forged acknowledgement is the strongest evidence
-/// of a disputed agreement. Returns the completed [`StoredReceipt`] for
-/// an activated session. Every other verdict maps to its abort error.
+/// of a disputed agreement.
+///
+/// # Returns
+///
+/// - [`StoredReceipt`] when the verdict is [`SessionVerdict::Activated`].
+/// - The matching abort [`HandshakeError`] for every other verdict.
 #[cfg(all(feature = "x509", any(feature = "transport-cms", feature = "transport-ecies")))]
 pub(crate) async fn record_receipt_outcome(
 	observer: Option<&dyn SessionObserver>,

@@ -121,7 +121,7 @@ pub const CURVE_X25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101
 
 /// ML-KEM-1024 (formerly Kyber-1024) - NIST-standardized post-quantum KEM
 /// FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard
-/// `id-alg-ml-kem-1024` — NIST CSOR / RFC 9935
+/// `id-alg-ml-kem-1024` - NIST CSOR / RFC 9935
 /// See `<https://csrc.nist.gov/projects/computer-security-objects-register/algorithm-registration>`
 /// See `<https://datatracker.ietf.org/doc/html/rfc9935>`
 pub const KEM_ML_KEM_1024: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.4.3");
@@ -129,7 +129,7 @@ pub const KEM_ML_KEM_1024: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16
 // ============================================================================
 // Transport Handshake Attribute OIDs (FULL_CMS profile)
 // ============================================================================
-// Wahid Group, LLC IANA PEN 64586 — arc 1.3.6.1.4.1.64586
+// Wahid Group, LLC IANA PEN 64586 - arc 1.3.6.1.4.1.64586
 //   .1  handshake / session attributes
 //   .2  algorithms (e.g. zstd)
 // ============================================================================

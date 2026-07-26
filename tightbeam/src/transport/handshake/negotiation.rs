@@ -1,8 +1,12 @@
-//! Security profile negotiation for TightBeam handshakes.
+//! Security profile and transport negotiation for TightBeam handshakes.
 //!
-//! Provides minimal wire-level structures (Offer, Accept) for algorithm
-//! negotiation without forcing concrete algorithm instantiation during the
-//! negotiation phase.
+//! Wire structures (offer / accept) carry algorithm and mux capability
+//! without instantiating concrete crypto during negotiation. Server and
+//! client helpers derive clamped [`MuxSettings`] and consult optional
+//! [`TransportAuthorizer`] / strength policy hooks.
+//!
+//! Profile selection is in *local* preference order so MITM reordering of
+//! the peer offer cannot steer the choice (CWE-757).
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -36,10 +40,11 @@ use crate::Errorizable;
 /// against offer-flood DoS (CWE-770).
 pub const MAX_OFFER_PROFILES: usize = 32;
 
-/// Handshake offer carrying a list of supported security profiles.
+/// Client security-profile offer on the wire (DER).
 ///
-/// Client sends this to advertise which algorithm combinations it supports.
-/// Serializable to DER for wire transmission.
+/// Advertises algorithm combinations the client supports. Preference
+/// order is first-most-preferred, but the server selects in *its* local
+/// order (peer offer ordering carries no weight).
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct SecurityOffer {
@@ -59,9 +64,10 @@ impl SecurityOffer {
 	}
 }
 
-/// Handshake accept response carrying the selected security profile.
+/// Server security-profile accept on the wire (DER).
 ///
-/// Server sends this after selecting a mutually supported profile from the client's offer.
+/// Carries the profile selected from the client's [`SecurityOffer`]
+/// under local preference and any [`ProfileStrengthPolicy`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct SecurityAccept {
@@ -78,10 +84,13 @@ impl SecurityAccept {
 
 /// Per-direction session budgets, in credits.
 ///
-/// A credit is the abstract TightBeam volume unit: a data chunk debits
+/// A credit is the abstract TightBeam volume unit. A data chunk debits
 /// `ceil(payload_len / credit_unit)` credits from its sender's direction.
-/// Budgets are fixed per key epoch and only shrink inside an epoch. Value
-/// semantics (free, fiat, anything) live outside the protocol.
+///
+/// # Lifetime
+///
+/// Fixed per key epoch; only shrinks inside an epoch. Value semantics
+/// (free, fiat, or other) live outside the protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct MuxBudgets {
@@ -111,15 +120,21 @@ impl MuxBudgets {
 	}
 }
 
-/// Transport capability offer (multiplexing).
+/// Client transport capability offer (multiplexing) on the wire.
 ///
-/// Each side advertises how many streams its *peer* may concurrently initiate
-/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)
-/// directional semantics). Sent by the client inside its handshake opening
-/// message so the offer is bound into the transcript. Chunk size and stream
-/// credit are equally directional: the sender of the struct advertises what
-/// it will *receive*. Budgets and the authorization token flow client to
-/// server only.
+/// Bound into the handshake transcript with the client's opening message.
+///
+/// # Directionality
+///
+/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2))
+/// Each field advertises what the *sender of this struct* will receive:
+/// peer-initiated stream cap, inbound chunk size, inbound stream credit.
+///
+/// # Client to server only
+///
+/// - `requested_budgets` - metering request (`None` = unmetered).
+/// - `authorization` - opaque token for [`TransportAuthorizer`] (never
+///   parsed by TightBeam).
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct TransportOffer {
@@ -198,14 +213,17 @@ impl TransportOffer {
 	}
 }
 
-/// Transport capability accept (multiplexing).
+/// Server transport capability accept (multiplexing) on the wire.
 ///
-/// Same directional shape as [`TransportOffer`]: the server advertises the
-/// stream cap, chunk size, and stream credit it will *receive*. The accept
-/// additionally fixes the credit unit for both directions and carries the
-/// budgets actually granted (each direction lower than requested or zero
-/// is allowed). Sent inside the server's handshake response and bound into
-/// the transcript.
+/// Bound into the handshake transcript with the server's response.
+/// Same directional shape as [`TransportOffer`]: the server advertises
+/// what it will *receive*.
+///
+/// # Additionally
+///
+/// - `credit_unit` - wins for both directions.
+/// - `granted_budgets` - metered terms (may be lower than requested per
+///   direction; absent = unmetered).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "derive", derive(Beamable, Sequence))]
 pub struct TransportAccept {
@@ -227,14 +245,16 @@ pub struct TransportAccept {
 	pub granted_budgets: Option<MuxBudgets>,
 }
 
-/// Negotiated multiplexing settings for one connection.
+/// Negotiated multiplexing settings for one connection endpoint.
 ///
-/// Caps, chunk sizes, and stream credit are directional
-/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2)):
-/// each endpoint enforces the value it advertised and respects the value its
-/// peer advertised. There is no symmetric min-collapse. Both endpoints
-/// derive their views from the same clamped wire values, so enforcement
-/// stays consistent.
+/// Derived from the same clamped wire offer/accept both sides observed.
+///
+/// # Directionality
+///
+/// ([RFC 9113 § 5.1.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.1.2))
+/// Caps, chunk sizes, and stream credit are directional: each endpoint
+/// enforces what it advertised and respects what its peer advertised.
+/// There is no symmetric min-collapse.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MuxSettings {
 	/// Concurrent streams this endpoint may initiate (peer-advertised).
@@ -262,13 +282,18 @@ pub struct MuxSettings {
 }
 
 impl MuxSettings {
-	/// Equal caps in both directions with default chunking and credit
-	/// values, for links without handshake negotiation (cleartext
-	/// multiplexing). Budgets stay unmetered: without an encrypted
-	/// session there is no epoch to renew, so a spendable bound would be
-	/// unrecoverable. Both endpoints MUST configure the same value or
-	/// their enforcement diverges. The cap is clamped to
-	/// [`MAX_MUX_STREAM_CAP`].
+	/// Equal caps both ways with default chunking and credit, for links
+	/// without handshake negotiation (cleartext multiplexing).
+	///
+	/// # Budgets
+	///
+	/// Always unmetered. Without an encrypted session there is no epoch
+	/// to renew, so a spendable bound would be unrecoverable.
+	///
+	/// # Contract
+	///
+	/// Both endpoints MUST configure the same `cap` or enforcement
+	/// diverges. Clamped to [`MAX_MUX_STREAM_CAP`].
 	pub fn symmetric(cap: u32) -> Self {
 		let cap = clamp_stream_cap(cap);
 		Self {
@@ -317,14 +342,21 @@ fn clamp_stream_credit(credit: u64) -> u64 {
 	credit.clamp(1, MAX_MUX_STREAM_CREDIT)
 }
 
-/// Server-side accept rule: multiplexing activates only when the peer
-/// offered it AND it is locally enabled. No offer or no local config means
-/// no accept, so both endpoints stay on the same activation decision.
+/// Server-side accept rule before any authorizer runs.
 ///
-/// The local [`TransportOffer`] doubles as server configuration: its
-/// receive-side values are advertised back, its `requested_budgets` acts
-/// as the grant ceiling, the componentwise minimum with the request.
-/// Nothing requested means nothing granted.
+/// Multiplexing activates only when the peer offered it and it is
+/// locally enabled. Missing offer or local config yields no accept, so
+/// both endpoints share the same activation decision.
+///
+/// The local [`TransportOffer`] is server configuration: receive-side
+/// values are advertised back; `requested_budgets` is the grant ceiling
+/// (componentwise minimum with the client's request).
+///
+/// # Budgets
+///
+/// Opt-in. A grant is a signed receipt attestation. Without a local
+/// ceiling (or an authorizer verdict that overrides this rule) nothing
+/// is granted, regardless of the client's request.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn accept_transport(
 	offer: Option<&TransportOffer>,
@@ -340,9 +372,8 @@ pub(crate) fn accept_transport(
 	// choke point, so the wire accept equals what the transport enforces
 	// and equals what the session receipt attests (SSOT, CWE-770).
 	let granted_budgets = match (offer.requested_budgets, local.requested_budgets) {
-		(None, _) => None,
-		(Some(requested), None) => Some(requested.clamped()),
 		(Some(requested), Some(ceiling)) => Some(requested.min(ceiling).clamped()),
+		_ => None,
 	};
 
 	Some(TransportAccept {
@@ -355,27 +386,33 @@ pub(crate) fn accept_transport(
 	})
 }
 
-/// Refusal verdict from a [`TransportAuthorizer`], carrying an
-/// application-defined code from the shared u32 code space.
+/// Refusal verdict from a [`TransportAuthorizer`].
 ///
-/// Application codes live at or above
-/// [`MUX_APPLICATION_CODE_FLOOR`](crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR).
-/// Codes below the floor are reserved for the TightBeam protocol (e.g.
-/// [`SETTLEMENT_UNSUPPORTED_CODE`]).
+/// Carries an application-defined code from the shared u32 code space.
+///
+/// # Code space
+///
+/// - Application codes: at or above
+///   [`MUX_APPLICATION_CODE_FLOOR`](crate::transport::envelopes::MUX_APPLICATION_CODE_FLOOR).
+/// - Below the floor: reserved for the protocol (e.g.
+///   [`SETTLEMENT_UNSUPPORTED_CODE`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthorizationRefusal {
 	/// Application-defined refusal code.
 	pub code: u32,
 }
 
-/// Grant verdict from a [`TransportAuthorizer`]: the budgets awarded plus
-/// an optional settlement challenge.
+/// Grant verdict from a [`TransportAuthorizer`].
 ///
-/// The challenge (unsigned transaction, invoice, anything opaque) enters
-/// the [`SessionReceipt`] body server-side, so it is covered by both
-/// receipt signatures. A challenge without budgets has no carriage. The
-/// receipt only exists for budget-bearing sessions and fails the
-/// handshake closed.
+/// Carries the budgets awarded and an optional settlement challenge
+/// (unsigned transaction, invoice, or other opaque bytes). The challenge
+/// enters the [`SessionReceipt`] body server-side and is covered by both
+/// receipt signatures.
+///
+/// # Fail closed
+///
+/// A challenge without budgets has no carriage: receipts exist only for
+/// budget-bearing sessions, so that combination aborts the handshake.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AuthorizationGrant {
 	/// Per-direction budgets granted. `None` grants an unmetered session.
@@ -391,26 +428,48 @@ impl From<Option<MuxBudgets>> for AuthorizationGrant {
 	}
 }
 
-/// Server hook between transport offer and accept: decides the
-/// per-direction budgets granted for the session described by the
-/// offer (its `requested_budgets` and opaque `authorization` token,
-/// which TightBeam never parses) and optionally attaches a settlement
-/// challenge. Runs before the accept is bound into the transcript, so
-/// the grant is covered by the server signature.
+/// Server policy for session budget grants and receipt settlement.
 ///
-/// Without an authorizer the server grants its local configuration:
-/// the componentwise minimum of the request and the local ceiling (see
-/// [`accept_transport`]). A grant with `budgets: None` is an unmetered
-/// session. A refusal aborts the handshake with its application code.
+/// Two hooks, both awaited inline with **no library deadline**. Bound
+/// external work yourself: a slow hook stalls per-connection handshake
+/// state and widens the window an unauthenticated peer can hold it.
 ///
-/// Both hooks are awaited inline in the handshake with no library
-/// deadline, while the server holds per-connection handshake state: a
-/// slow authorizer stalls the handshake and extends the window an
-/// unauthenticated peer can hold that state, so bound external lookups
-/// with your own timeout.
+/// 1. [`authorize`](Self::authorize) - after the client
+///    [`TransportOffer`], before accept enters the transcript. Inspects
+///    [`TransportOffer::requested_budgets`] and the opaque
+///    [`TransportOffer::authorization`] token (never parsed by
+///    TightBeam). Returns an [`AuthorizationGrant`] or
+///    [`AuthorizationRefusal`]. The grant is covered by the server
+///    Finished signature.
+///
+/// 2. [`settle`](Self::settle) - after the client's countersigned
+///    receipt verifies. The session activates only on `Ok`.
+///
+/// # Grants
+///
+/// - `budgets: Some(_)` - metered session. The library still clamps to
+///   the componentwise minimum of the client's request before binding
+///   accept and receipt.
+/// - `budgets: None` - unmetered. A client that requested budgets fails
+///   closed with [`BudgetGrantWithheld`](NegotiationError::BudgetGrantWithheld).
+///   To deny metering, return [`AuthorizationRefusal`] instead of an
+///   empty grant.
+/// - A challenge without budgets fails closed
+///   ([`ChallengeWithoutBudgets`](NegotiationError::ChallengeWithoutBudgets)):
+///   no receipt would exist to carry it.
+///
+/// # When no authorizer is installed
+///
+/// The server uses its local accept rule alone: componentwise minimum of
+/// the request and the local budget ceiling. No ceiling means nothing
+/// is granted.
 pub trait TransportAuthorizer: MaybeSend + MaybeSync {
-	/// Decide the budgets granted and the settlement challenge issued
-	/// for the session.
+	/// Grant budgets and optional settlement challenge for this offer.
+	///
+	/// # Errors
+	///
+	/// [`AuthorizationRefusal`] aborts the handshake with its application
+	/// code.
 	fn authorize<'a>(
 		&'a self,
 		offer: &'a TransportOffer,
@@ -418,15 +477,19 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 
 	/// Settle the countersigned receipt at the client's key exchange.
 	///
-	/// Called with the receipt body and the client's ancillary response
-	/// once the countersignature has verified. The session activates only
-	/// after `Ok`. A refusal aborts the handshake with its application
-	/// code.
+	/// Called with the receipt body and the client's ancillary response once
+	/// the countersignature has verified. The session activates only on `Ok`.
 	///
-	/// Fails closed by default: an authorizer that issues a challenge
-	/// without overriding this method refuses every settlement (code
-	/// [`SETTLEMENT_UNSUPPORTED_CODE`]). Challenge-free receipts settle
-	/// trivially.
+	/// # Default
+	///
+	/// Challenge-free receipts settle trivially. An authorizer that
+	/// issues a challenge without overriding this method refuses every
+	/// settlement with [`SETTLEMENT_UNSUPPORTED_CODE`].
+	///
+	/// # Errors
+	///
+	/// [`AuthorizationRefusal`] aborts the handshake with its application
+	/// code.
 	fn settle<'a>(
 		&'a self,
 		receipt: &'a SessionReceipt,
@@ -448,8 +511,10 @@ pub trait TransportAuthorizer: MaybeSend + MaybeSync {
 /// floor).
 pub const SETTLEMENT_UNSUPPORTED_CODE: u32 = 1;
 
-/// Authorized transport verdict: the accept bound into the transcript
-/// plus the settlement challenge destined for the session receipt.
+/// Authorized transport verdict after offer/accept authorization.
+///
+/// - `accept` - bound into the transcript.
+/// - `challenge` - settlement challenge for the session receipt body.
 pub struct AuthorizedTransport {
 	/// The transport accept sent to the client.
 	pub accept: TransportAccept,
@@ -457,14 +522,20 @@ pub struct AuthorizedTransport {
 	pub challenge: Option<OctetString>,
 }
 
-/// Server-side accept rule with the authorizer consulted between offer
-/// and accept. Without an authorizer this is exactly
-/// [`accept_transport`]. With one, the authorizer's verdict replaces
-/// the local-config budget grant, still bounded by the componentwise
-/// minimum with the request. Budgets only activate against a request:
-/// an unsolicited or over-request grant fails the client's consistency
-/// check in [`client_mux_settings`]. A challenge granted without
-/// budgets fails closed: the receipt that would carry it never exists.
+/// Server-side accept path with optional [`TransportAuthorizer`].
+///
+/// Starts from [`accept_transport`]. When an authorizer is present its
+/// grant replaces the local-config budget, still clamped to the
+/// componentwise minimum of the client's request before accept and
+/// receipt are bound.
+///
+/// # Fail closed
+///
+/// - Challenge without budgets: [`NegotiationError::ChallengeWithoutBudgets`]
+///   (no receipt would exist to carry it).
+///
+/// Client consistency for unsolicited or over-request grants is enforced
+/// in [`client_mux_settings`], not here.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) async fn authorize_transport(
 	offer: Option<&TransportOffer>,
@@ -502,8 +573,10 @@ pub(crate) async fn authorize_transport(
 	Ok(Some(authorized))
 }
 
-/// Directional budget view for one endpoint role, derived from the
-/// granted budgets both sides saw on the wire.
+/// `(send_budget, recv_budget)` for one endpoint role from wire grants.
+///
+/// `local_is_client` swaps which direction maps to local send versus
+/// receive. Absent grant yields `(None, None)` (unmetered).
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn budget_views(granted: Option<MuxBudgets>, local_is_client: bool) -> (Option<u64>, Option<u64>) {
 	let granted = match granted {
@@ -518,15 +591,21 @@ fn budget_views(granted: Option<MuxBudgets>, local_is_client: bool) -> (Option<u
 	(Some(granted.server_to_client), Some(granted.client_to_server))
 }
 
-/// Client-side settings rule: validates the server's accept against the
-/// local offer and derives the directional views, each clamped through
-/// the shared choke points.
+/// Client-side settings derived from offer and accept.
 ///
-/// An accept without a matching offer is a protocol violation (a peer must
-/// never activate an unrequested capability) and fails closed. So is a
-/// granted budget when none was requested, or one beyond
-/// [`MAX_MUX_SESSION_BUDGET`]: the receipt attests the wire values, so an
-/// over-cap grant is refused rather than silently clamped.
+/// Validates the server's accept against the local offer, then builds
+/// directional [`MuxSettings`] through the shared clamp choke points.
+///
+/// # Fail closed
+///
+/// - Accept with no matching mux offer: [`NegotiationError::UnsolicitedTransportAccept`]
+/// - Grant when none was requested: [`NegotiationError::UnsolicitedTransportAccept`]
+/// - Grant beyond [`MAX_MUX_SESSION_BUDGET`]: [`NegotiationError::BudgetBeyondCap`]
+/// - Grant beyond the request: [`NegotiationError::BudgetBeyondRequest`]
+/// - Grant withheld when budgets were requested: [`NegotiationError::BudgetGrantWithheld`]
+///
+/// The receipt attests wire values, so divergences are refused rather
+/// than repaired by clamping.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn client_mux_settings(
 	offer: Option<&TransportOffer>,
@@ -562,22 +641,32 @@ pub(crate) fn client_mux_settings(
 			return Err(NegotiationError::BudgetBeyondRequest);
 		}
 	}
+	// Requesting budgets requests an attested, spend-bounded session. A
+	// grant withheld (None against a request) is a refusal to meter:
+	// running unmetered instead would silently drop the receipt, so fail
+	// loud. Clients that tolerate unmetered sessions do not request budgets.
+	if accept.granted_budgets.is_none() && offer.requested_budgets.is_some() {
+		return Err(NegotiationError::BudgetGrantWithheld);
+	}
 
 	let settings = mux_settings(offer, accept, true);
 	Ok(Some(settings))
 }
 
-/// Server-side settings rule: derives the directional views from the
-/// client's offer and the accept the server just emitted, each clamped
-/// through the shared choke points.
+/// Server-side settings from the client's offer and the accept just emitted.
+///
+/// Directional views are clamped through the same choke points as
+/// [`client_mux_settings`].
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn server_mux_settings(offer: &TransportOffer, accept: &TransportAccept) -> MuxSettings {
 	mux_settings(offer, accept, false)
 }
 
-/// Derive directional [`MuxSettings`] from the same clamped wire values
-/// both endpoints observed. `local_is_client` selects which advertisement
-/// is local receive versus peer receive.
+/// Directional [`MuxSettings`] from the clamped wire values both endpoints
+/// observed.
+///
+/// `local_is_client` selects which advertisement is local receive versus
+/// peer receive.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn mux_settings(offer: &TransportOffer, accept: &TransportAccept, local_is_client: bool) -> MuxSettings {
 	let (send_budget, recv_budget) = budget_views(accept.granted_budgets, local_is_client);
@@ -649,19 +738,26 @@ pub enum NegotiationError {
 	#[error("Settlement challenge issued without budget grant")]
 	ChallengeWithoutBudgets,
 
-	/// The peer granted budgets beyond [`MAX_MUX_SESSION_BUDGET`]. The
-	/// receipt attests the raw wire values, so an over-cap grant would
-	/// be countersigned at figures the local endpoint never enforces
-	/// (dispute ambiguity). Fail closed instead of clamping.
+	/// Peer granted budgets beyond [`MAX_MUX_SESSION_BUDGET`].
+	///
+	/// Receipt attests raw wire values; clamping would countersign
+	/// figures the local endpoint never enforces. Fail closed.
 	#[error("Granted budgets exceed the session budget cap")]
 	BudgetBeyondCap,
 
-	/// The peer granted budgets beyond what was requested. A conforming
-	/// server derives the grant as the componentwise minimum with the
-	/// request, so an over-request grant would bind the countersignature
-	/// to figures the local endpoint never asked for. Fail closed.
+	/// Peer granted budgets beyond the request.
+	///
+	/// A conforming server uses the componentwise minimum with the
+	/// request. Fail closed rather than countersign unasked figures.
 	#[error("Granted budgets exceed the requested budgets")]
 	BudgetBeyondRequest,
+
+	/// Peer withheld budgets for a session that requested them.
+	///
+	/// Requesting budgets requests attestation; silent unmetered is
+	/// refused.
+	#[error("Budget grant withheld for a budget-requesting session")]
+	BudgetGrantWithheld,
 
 	/// DER encoding/decoding error.
 	#[error("DER encoding error: {0}")]
@@ -680,18 +776,25 @@ impl From<DerDecodeError> for NegotiationError {
 	}
 }
 
-/// Minimum-strength policy applied to profiles before negotiation.
+/// Minimum-strength filter applied to profiles before negotiation.
 ///
-/// Prevents downgrade attacks (CWE-757): even when a weak profile is mutually
-/// supported, negotiation refuses it unless the policy admits it.
+/// Blocks downgrade (CWE-757): a mutually supported weak profile is
+/// still refused unless the policy admits it.
 pub trait ProfileStrengthPolicy {
-	/// Returns `true` when the profile meets the policy floor.
+	/// `true` when the profile meets the policy floor.
 	fn meets_floor(&self, profile: &SecurityProfileDesc) -> bool;
 }
 
-/// Default strength floor: 256-bit AEAD key and a known digest of at least 256 bits.
+/// Default strength floor.
 ///
-/// Unknown digest OIDs fail closed.
+/// # Requires
+///
+/// - AEAD key size at least 256 bits.
+/// - Known digest OID of at least 256 bits.
+///
+/// # Fail closed
+///
+/// Unknown digest OIDs do not meet the floor.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultStrengthFloor;
 
@@ -719,10 +822,11 @@ impl ProfileStrengthPolicy for DefaultStrengthFloor {
 	}
 }
 
-/// Accepts every profile. Explicitly opts out of the minimum-strength floor.
+/// Strength policy that admits every profile.
 ///
-/// Use only where weaker profiles must remain negotiable (e.g. compatibility
-/// deployments or downgrade-attack tests). Prefer [`DefaultStrengthFloor`].
+/// Explicit opt-out of the minimum-strength floor. Prefer
+/// [`DefaultStrengthFloor`] except for compatibility deployments or
+/// downgrade-attack tests.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoStrengthFloor;
 
@@ -732,18 +836,17 @@ impl ProfileStrengthPolicy for NoStrengthFloor {
 	}
 }
 
-/// Select the first mutually supported profile in *local* (server) preference order.
+/// Select the first mutually supported profile in *local* preference order.
 ///
-/// Iterates `supported` in its configured order and picks the first profile the
-/// peer also offered. The peer's ordering carries no weight: a MITM rewriting
-/// the offer ordering cannot steer selection toward a weaker mutual profile
-/// (CWE-757).
+/// Iterates `supported` as configured and picks the first profile the peer
+/// also offered. Peer offer ordering carries no weight: a MITM rewriting
+/// it cannot steer selection toward a weaker mutual profile (CWE-757).
 ///
 /// # Errors
 ///
-/// - [`NegotiationError::EmptyOffer`] -- peer sent an empty offer.
-/// - [`NegotiationError::OfferTooLarge`] -- offer exceeds [`MAX_OFFER_PROFILES`].
-/// - [`NegotiationError::NoMutualProfile`] -- no intersection with `supported`.
+/// - [`NegotiationError::EmptyOffer`] - peer sent an empty offer.
+/// - [`NegotiationError::OfferTooLarge`] - offer exceeds [`MAX_OFFER_PROFILES`].
+/// - [`NegotiationError::NoMutualProfile`] - no intersection with `supported`.
 pub(crate) fn select_profile(
 	offer: &SecurityOffer,
 	supported: &[SecurityProfileDesc],
@@ -949,14 +1052,14 @@ mod tests {
 	}
 
 	#[test]
-	fn test_accept_transport_grants_request_without_ceiling() {
+	fn test_accept_transport_without_ceiling_grants_nothing() {
 		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
 		let offer = TransportOffer::mux(8).with_budgets(request);
 		let local = TransportOffer::mux(4);
 
 		let accept = accept_transport(Some(&offer), Some(&local));
 		let granted = accept.and_then(|accept| accept.granted_budgets);
-		assert_eq!(granted, Some(request));
+		assert_eq!(granted, None);
 	}
 
 	struct FixedAuthorizer {
@@ -1314,6 +1417,16 @@ mod tests {
 
 		let result = client_mux_settings(Some(&offer), Some(&accept));
 		assert!(matches!(result, Err(NegotiationError::BudgetBeyondRequest)));
+	}
+
+	#[test]
+	fn test_withheld_budget_grant_fails_closed() {
+		let request = MuxBudgets { client_to_server: 100, server_to_client: 300 };
+		let offer = TransportOffer::mux(8).with_budgets(request);
+		let accept = plain_accept(4);
+
+		let result = client_mux_settings(Some(&offer), Some(&accept));
+		assert!(matches!(result, Err(NegotiationError::BudgetGrantWithheld)));
 	}
 
 	#[test]

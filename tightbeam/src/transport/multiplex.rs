@@ -1677,7 +1677,7 @@ mod router {
 			};
 
 			if package.last() {
-				// Final chunk: dispatch without a credit raise — the stream
+				// Final chunk: dispatch without a credit raise - the stream
 				// is leaving reassembly
 				let stream = self.accept_chunk_or_violate(stream, package.payload())?;
 				return self.dispatch_request(stream_id, &stream.buffer).await;

@@ -471,7 +471,7 @@ impl Process {
 			let closure = self.tau_closure(&current_states);
 			let action = Action { event: *event, alphabet: Alphabet::Observable };
 
-			// Termination check: every candidate is a true STOP — terminal
+			// Termination check: every candidate is a true STOP - terminal
 			// with no enabled actions. Accepting states that still offer
 			// transitions (cyclic `terminal { Idle }` models) stay live.
 			if closure

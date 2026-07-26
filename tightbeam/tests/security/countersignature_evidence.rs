@@ -115,7 +115,7 @@ mod ecies {
 				let client_kex_der = client.process_server_handshake(&server_handshake).await?;
 
 				// Auth signature covers encrypted_data; flip a ciphertext
-				// byte — the only wire handle a MITM has on the sealed ack.
+				// byte - the only wire handle a MITM has on the sealed ack.
 				let mut kex = ClientKeyExchange::from_der(&client_kex_der)?;
 				let mut forged = kex.encrypted_data.as_bytes().to_vec();
 				let middle = forged.len() / 2;

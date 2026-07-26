@@ -77,7 +77,7 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			let client_offer = TransportOffer::mux(4).with_budgets(OVER_MAX);
-			let server_offer = TransportOffer::mux(4);
+			let server_offer = TransportOffer::mux(4).with_budgets(OVER_MAX);
 			let hooks = MutualSessionHooks::default();
 			let session = establish_mutual_transports(client_offer, server_offer, hooks).await?;
 
@@ -92,6 +92,7 @@ tb_scenario! {
 
 			let is_client_to_server_within_ceiling = stored.receipt().budgets.client_to_server <= MAX_MUX_SESSION_BUDGET;
 			let is_server_to_client_within_ceiling = stored.receipt().budgets.server_to_client <= MAX_MUX_SESSION_BUDGET;
+
 			trace.event_with(ReceiptBudgetClampSpec::receipt_budgets_within_ceiling, &[], is_client_to_server_within_ceiling && is_server_to_client_within_ceiling)?;
 
 			// The client's send budget is the client-to-server direction;
