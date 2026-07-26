@@ -8,9 +8,10 @@
 extern crate alloc;
 
 use crate::constants::{
-	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_CHUNK_SIZE,
-	MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CAP, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE,
+	DEFAULT_MUX_CHUNK_SIZE, DEFAULT_MUX_CREDIT_UNIT, DEFAULT_MUX_STREAM_CREDIT, MAX_MUX_STREAM_CAP,
 };
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::constants::{MAX_MUX_CHUNK_SIZE, MAX_MUX_SESSION_BUDGET, MAX_MUX_STREAM_CREDIT, MIN_MUX_CHUNK_SIZE};
 use crate::crypto::profiles::SecurityProfileDesc;
 use crate::der::asn1::{ObjectIdentifier, OctetString};
 use crate::der::Error as DerDecodeError;
@@ -101,6 +102,7 @@ impl MuxBudgets {
 	}
 
 	/// Clamp both directions to [`MAX_MUX_SESSION_BUDGET`] (CWE-770).
+	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 	fn clamped(self) -> MuxBudgets {
 		MuxBudgets {
 			client_to_server: self.client_to_server.min(MAX_MUX_SESSION_BUDGET),
@@ -294,12 +296,14 @@ fn clamp_stream_cap(cap: u32) -> u32 {
 /// `MIN_MUX_CHUNK_SIZE..=MAX_MUX_CHUNK_SIZE`. The floor stops tiny
 /// advertisements from amplifying record consumption (CWE-770). There is
 /// no opt-out value because chunking is the only send path.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn clamp_chunk_size(size: u32) -> u32 {
 	size.clamp(MIN_MUX_CHUNK_SIZE, MAX_MUX_CHUNK_SIZE)
 }
 
 /// Clamp a wire-advertised credit unit to at least one byte so debit
 /// arithmetic never divides by zero.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn clamp_credit_unit(unit: u32) -> u32 {
 	unit.max(1)
 }
@@ -308,6 +312,7 @@ fn clamp_credit_unit(unit: u32) -> u32 {
 /// `1..=MAX_MUX_STREAM_CREDIT`. The ceiling bounds receive memory
 /// (CWE-770). The floor of one chunk keeps every stream startable, since
 /// credit grants only flow once a first chunk has arrived.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn clamp_stream_credit(credit: u64) -> u64 {
 	credit.clamp(1, MAX_MUX_STREAM_CREDIT)
 }
@@ -320,6 +325,7 @@ fn clamp_stream_credit(credit: u64) -> u64 {
 /// receive-side values are advertised back, its `requested_budgets` acts
 /// as the grant ceiling, the componentwise minimum with the request.
 /// Nothing requested means nothing granted.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn accept_transport(
 	offer: Option<&TransportOffer>,
 	local: Option<&TransportOffer>,
@@ -454,10 +460,12 @@ pub struct AuthorizedTransport {
 /// Server-side accept rule with the authorizer consulted between offer
 /// and accept. Without an authorizer this is exactly
 /// [`accept_transport`]. With one, the authorizer's verdict replaces
-/// the local-config budget grant. Budgets only activate against a
-/// request: an unsolicited grant fails the client's consistency check
-/// in [`client_mux_settings`]. A challenge granted without budgets
-/// fails closed: the receipt that would carry it never exists.
+/// the local-config budget grant, still bounded by the componentwise
+/// minimum with the request. Budgets only activate against a request:
+/// an unsolicited or over-request grant fails the client's consistency
+/// check in [`client_mux_settings`]. A challenge granted without
+/// budgets fails closed: the receipt that would carry it never exists.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) async fn authorize_transport(
 	offer: Option<&TransportOffer>,
 	local: Option<&TransportOffer>,
@@ -473,12 +481,15 @@ pub(crate) async fn authorize_transport(
 	};
 
 	let grant = authorizer.authorize(offer).await?;
-	// The authorizer's grant is subject to the same enforcement ceiling as
-	// a local-config grant: clamp before it enters the transcript and the
-	// receipt (SSOT, CWE-770).
-	let requested = offer.requested_budgets;
-	let granted = grant.budgets;
-	let granted_budgets = requested.and(granted).map(MuxBudgets::clamped);
+	// The authorizer's grant is subject to the same enforcement bounds as
+	// a local-config grant: the componentwise minimum with the request,
+	// then the session cap, before it enters the transcript and the
+	// receipt (SSOT, CWE-770). A grant beyond the request would bind the
+	// client's countersignature to figures it never asked for.
+	let granted_budgets = match (offer.requested_budgets, grant.budgets) {
+		(Some(requested), Some(granted)) => Some(granted.min(requested).clamped()),
+		_ => None,
+	};
 	accept.granted_budgets = granted_budgets;
 
 	let challenge = grant.challenge;
@@ -492,6 +503,7 @@ pub(crate) async fn authorize_transport(
 
 /// Directional budget view for one endpoint role, derived from the
 /// granted budgets both sides saw on the wire.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn budget_views(granted: Option<MuxBudgets>, local_is_client: bool) -> (Option<u64>, Option<u64>) {
 	let granted = match granted {
 		Some(budgets) => budgets.clamped(),
@@ -514,6 +526,7 @@ fn budget_views(granted: Option<MuxBudgets>, local_is_client: bool) -> (Option<u
 /// granted budget when none was requested, or one beyond
 /// [`MAX_MUX_SESSION_BUDGET`]: the receipt attests the wire values, so an
 /// over-cap grant is refused rather than silently clamped.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn client_mux_settings(
 	offer: Option<&TransportOffer>,
 	accept: Option<&TransportAccept>,
@@ -539,6 +552,15 @@ pub(crate) fn client_mux_settings(
 	if accept.granted_budgets.is_some_and(|granted| granted != granted.clamped()) {
 		return Err(NegotiationError::BudgetBeyondCap);
 	}
+	// Same fail-closed contract for a grant beyond the request: a
+	// conforming server derives the grant as the componentwise minimum
+	// with the request, so an over-request grant is refused rather than
+	// countersigned at figures the client never asked for.
+	if let (Some(granted), Some(requested)) = (accept.granted_budgets, offer.requested_budgets) {
+		if granted != granted.min(requested) {
+			return Err(NegotiationError::BudgetBeyondRequest);
+		}
+	}
 
 	let settings = mux_settings(offer, accept, true);
 	Ok(Some(settings))
@@ -547,6 +569,7 @@ pub(crate) fn client_mux_settings(
 /// Server-side settings rule: derives the directional views from the
 /// client's offer and the accept the server just emitted, each clamped
 /// through the shared choke points.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) fn server_mux_settings(offer: &TransportOffer, accept: &TransportAccept) -> MuxSettings {
 	mux_settings(offer, accept, false)
 }
@@ -554,6 +577,7 @@ pub(crate) fn server_mux_settings(offer: &TransportOffer, accept: &TransportAcce
 /// Derive directional [`MuxSettings`] from the same clamped wire values
 /// both endpoints observed. `local_is_client` selects which advertisement
 /// is local receive versus peer receive.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 fn mux_settings(offer: &TransportOffer, accept: &TransportAccept, local_is_client: bool) -> MuxSettings {
 	let (send_budget, recv_budget) = budget_views(accept.granted_budgets, local_is_client);
 
@@ -638,6 +662,13 @@ pub enum NegotiationError {
 	#[cfg_attr(feature = "derive", error("Granted budgets exceed the session budget cap"))]
 	BudgetBeyondCap,
 
+	/// The peer granted budgets beyond what was requested. A conforming
+	/// server derives the grant as the componentwise minimum with the
+	/// request, so an over-request grant would bind the countersignature
+	/// to figures the local endpoint never asked for. Fail closed.
+	#[cfg_attr(feature = "derive", error("Granted budgets exceed the requested budgets"))]
+	BudgetBeyondRequest,
+
 	/// DER encoding/decoding error.
 	#[cfg_attr(feature = "derive", error("DER encoding error: {0}"))]
 	DerError(DerDecodeError),
@@ -652,6 +683,7 @@ crate::impl_error_display!(NegotiationError {
 	AuthorizationRefused { code } => "Transport authorization refused: code {code}",
 	ChallengeWithoutBudgets => "Settlement challenge issued without budget grant",
 	BudgetBeyondCap => "Granted budgets exceed the session budget cap",
+	BudgetBeyondRequest => "Granted budgets exceed the requested budgets",
 	DerError(e) => "DER encoding error: {e}",
 });
 
@@ -751,7 +783,9 @@ pub(crate) fn select_profile(
 	Err(NegotiationError::NoMutualProfile)
 }
 
-#[cfg(test)]
+// Exercises the mux negotiation helpers, which only exist when a
+// transport flavor is enabled.
+#[cfg(all(test, any(feature = "transport-cms", feature = "transport-ecies")))]
 mod tests {
 	use core::error::Error;
 
@@ -992,6 +1026,21 @@ mod tests {
 		let accept = authorize_transport(Some(&offer), Some(&local), Some(&authorizer)).await?;
 		let granted = accept.and_then(|authorized| authorized.accept.granted_budgets);
 		assert_eq!(granted, Some(verdict));
+
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn test_authorize_transport_grant_bounded_by_request() -> Result<(), NegotiationError> {
+		let request = MuxBudgets { client_to_server: 100, server_to_client: 900 };
+		let verdict = MuxBudgets { client_to_server: 250, server_to_client: 60 };
+		let offer = TransportOffer::mux(8).with_budgets(request);
+		let local = TransportOffer::mux(4).with_budgets(request);
+		let authorizer = FixedAuthorizer::budgets(Ok(Some(verdict)));
+
+		let accept = authorize_transport(Some(&offer), Some(&local), Some(&authorizer)).await?;
+		let granted = accept.and_then(|authorized| authorized.accept.granted_budgets);
+		assert_eq!(granted, Some(MuxBudgets { client_to_server: 100, server_to_client: 60 }));
 
 		Ok(())
 	}
@@ -1273,6 +1322,17 @@ mod tests {
 
 		let result = client_mux_settings(Some(&offer), Some(&accept));
 		assert!(matches!(result, Err(NegotiationError::BudgetBeyondCap)));
+	}
+
+	#[test]
+	fn test_over_request_granted_budget_fails_closed() {
+		let request = MuxBudgets { client_to_server: 100, server_to_client: 300 };
+		let over_request = MuxBudgets { client_to_server: 100, server_to_client: 301 };
+		let offer = TransportOffer::mux(8).with_budgets(request);
+		let accept = TransportAccept { granted_budgets: Some(over_request), ..plain_accept(4) };
+
+		let result = client_mux_settings(Some(&offer), Some(&accept));
+		assert!(matches!(result, Err(NegotiationError::BudgetBeyondRequest)));
 	}
 
 	#[test]

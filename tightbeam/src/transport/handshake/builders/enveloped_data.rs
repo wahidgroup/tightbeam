@@ -224,8 +224,9 @@ mod tests {
 
 	mod enveloped_data {
 		use super::*;
+		use crate::der::asn1::OctetString;
 		use crate::der::{Decode, Encode};
-		use crate::transport::handshake::attributes::{encode_client_nonce, encode_server_nonce};
+		use crate::oids::{HANDSHAKE_CLIENT_NONCE, HANDSHAKE_SERVER_NONCE};
 		use crate::transport::handshake::tests::{
 			create_test_key_enc_alg, create_test_keypair, create_test_recipient_id, create_test_ukm,
 		};
@@ -278,10 +279,10 @@ mod tests {
 			let kari_builder = create_test_kari_builder();
 
 			// 2. Create test attributes
-			let client_nonce = [0x11u8; 32];
-			let server_nonce = [0x22u8; 32];
-			let attr1 = encode_client_nonce(&client_nonce)?;
-			let attr2 = encode_server_nonce(&server_nonce)?;
+			let client_nonce = Any::encode_from(&OctetString::new([0x11u8; 32])?)?;
+			let server_nonce = Any::encode_from(&OctetString::new([0x22u8; 32])?)?;
+			let attr1 = HandshakeAttribute::new_single(HANDSHAKE_CLIENT_NONCE, client_nonce)?;
+			let attr2 = HandshakeAttribute::new_single(HANDSHAKE_SERVER_NONCE, server_nonce)?;
 
 			// 3. Build EnvelopedData with attributes
 			let plaintext = b"Authenticated message";

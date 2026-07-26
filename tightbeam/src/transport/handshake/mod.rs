@@ -137,9 +137,9 @@ extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
 
 #[cfg(not(feature = "std"))]
-pub use alloc::sync::Arc;
+pub(crate) use alloc::sync::Arc;
 #[cfg(feature = "std")]
-pub use std::sync::Arc;
+pub(crate) use std::sync::Arc;
 
 mod attributes;
 mod common;
@@ -167,11 +167,12 @@ pub mod kari;
 #[cfg(feature = "transport-cms")]
 pub mod processors;
 
-pub use attributes::*;
 pub use common::{DirectionalCiphers, HandshakeAlertHandler, HandshakeFinalization, HandshakeNegotiation};
 pub use error::HandshakeError;
-pub use utils::{aes_256_gcm_algorithm, aes_gcm_decrypt, aes_gcm_encrypt, generate_cek};
+pub(crate) use utils::aes_256_gcm_algorithm;
 
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub use attributes::HandshakeAttribute;
 #[cfg(feature = "transport-cms")]
 pub use builders::{KariBuilderError, TightBeamKariBuilder};
 #[cfg(feature = "transport-cms")]

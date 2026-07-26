@@ -1,5 +1,6 @@
 //! Transport layer integration tests
 
+mod cms_toolkit;
 mod connection_pool;
 mod connection_reuse;
 mod loopback;

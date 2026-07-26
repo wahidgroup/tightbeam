@@ -2037,10 +2037,7 @@ mod router {
 			let drain_headroom = drain_headroom(&settings);
 
 			Self {
-				handle: MuxHandle {
-					shared: Arc::clone(&shared),
-					outbound: outbound_handle(&outbound_sender),
-				},
+				handle: MuxHandle { shared: Arc::clone(&shared), outbound: outbound_handle(&outbound_sender) },
 				reader: MuxReaderDriver {
 					reader,
 					shared: Arc::clone(&shared),

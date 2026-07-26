@@ -92,7 +92,7 @@ use handshake::*;
 
 #[cfg(feature = "x509")]
 mod x509 {
-	pub use crate::transport::handshake::Arc;
+	pub(crate) use crate::transport::handshake::Arc;
 	pub use crate::x509::Certificate;
 
 	#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
@@ -1091,6 +1091,7 @@ mod tests {
 			let (client_provider, client_key) = test_provider();
 			let countersignature = countersign_receipt::<Sha3_256>(&receipt, answer, &client_provider).await?;
 			let completed = complete_receipt_artifact(artifact, countersignature)?;
+
 			let stored = StoredReceipt::try_from(completed)?;
 			Ok((stored, server_key, client_key))
 		}

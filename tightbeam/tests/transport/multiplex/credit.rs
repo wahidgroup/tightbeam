@@ -12,9 +12,7 @@ use tightbeam::testing::{ScenarioConf, SetupEnv};
 use tightbeam::transport::envelopes::{GoAwayReason, MuxCreditPackage, MuxDataPackage, MuxEnvelope, MuxOpenPackage};
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, NegotiationError};
 use tightbeam::transport::handshake::HandshakeError;
-use tightbeam::transport::{
-	EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError,
-};
+use tightbeam::transport::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError};
 use tightbeam::{Frame, TightBeamError};
 use tokio::time::timeout;
 
@@ -562,4 +560,3 @@ tb_scenario! {
 		}
 	}
 }
-
