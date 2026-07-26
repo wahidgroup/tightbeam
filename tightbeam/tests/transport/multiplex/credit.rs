@@ -3,6 +3,8 @@
 use core::time::Duration;
 use std::sync::Arc;
 
+use tokio::time::timeout;
+
 use tightbeam::der::Decode;
 use tightbeam::exactly;
 use tightbeam::tb_assert_spec;
@@ -12,14 +14,15 @@ use tightbeam::testing::{ScenarioConf, SetupEnv};
 use tightbeam::transport::envelopes::{GoAwayReason, MuxCreditPackage, MuxDataPackage, MuxEnvelope, MuxOpenPackage};
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, NegotiationError};
 use tightbeam::transport::handshake::HandshakeError;
-use tightbeam::transport::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError};
+use tightbeam::transport::{
+	EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportError, TransportFailure,
+};
 use tightbeam::{Frame, TightBeamError};
-use tokio::time::timeout;
 
 use crate::common::security::{expectation_failure, ServerMaterials};
 use crate::transport::support::{
-	await_ok, bind_encrypted_listener, connect_pinned_client, establish_mutual_transports, join_task,
-	serve_one_handshake_message, MutualSessionHooks,
+	await_ok, bind_encrypted_listener, bind_encrypted_listener_with_timeout, connect_pinned_client,
+	establish_mutual_transports, join_task, serve_one_handshake_message, MutualSessionHooks,
 };
 
 use super::common::*;
@@ -488,7 +491,6 @@ tb_scenario! {
 
 			let client_result = client.perform_client_handshake().await;
 			let server_result = join_task(server_task, "server handshake task must not panic").await?;
-
 			trace.event_with(
 				MuxAuthorizerRefusalSpec::server_refuses_with_code,
 				&[],
@@ -502,6 +504,72 @@ tb_scenario! {
 				),
 			)?;
 			trace.event_with(MuxAuthorizerRefusalSpec::client_fails_closed, &[], client_result.is_err())?;
+
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	pub MuxAuthorizerDeadlineSpec,
+	V(1,0,0): {
+		mode: Accept,
+		gate: Ok,
+		assertions: [
+			(server_bounds_hung_authorizer, exactly!(1), equals!(true)),
+			(client_fails_closed, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A hung TransportAuthorizer must not park pre-authentication
+// handshake state forever: the handshake deadline bounds processing
+// hooks and the server surfaces DeadlineExceeded.
+tb_scenario! {
+	name: mux_hung_authorizer_bounded_by_handshake_deadline,
+	spec: MuxAuthorizerDeadlineSpec,
+	environment Bare {
+		exec: |SetupEnv { trace, .. }| async move {
+			let materials = ServerMaterials::generate();
+			let (listener, addr) =
+				bind_encrypted_listener_with_timeout(&materials, Duration::from_millis(200)).await?;
+
+			let server_task = tokio::spawn(async move {
+				let (transport, _) = listener.accept().await?;
+				let mut transport = transport
+					.with_mux_offer(Some(mux_offer(4)))
+					.with_transport_authorizer(Arc::new(HangingAuthorizer));
+
+				serve_one_handshake_message(&mut transport).await?;
+				serve_one_handshake_message(&mut transport).await?;
+				Ok::<_, TightBeamError>(())
+			});
+
+			let request = MuxBudgets { client_to_server: 10, server_to_client: 10 };
+			let mut client = connect_pinned_client(addr, &materials.certificate).await?;
+			client = client.with_mux_offer(Some(mux_offer(4).with_budgets(request)));
+			let client_task = tokio::spawn(async move { client.perform_client_handshake().await });
+
+			let server_join = join_task(server_task, "server handshake task must not panic");
+			let server_result = timeout(Duration::from_secs(5), server_join)
+				.await
+				.map_err(|_| expectation_failure("hung authorizer must not stall the server past the deadline"))??;
+			trace.event_with(
+				MuxAuthorizerDeadlineSpec::server_bounds_hung_authorizer,
+				&[],
+				matches!(
+					server_result,
+					Err(TightBeamError::TransportError(TransportError::OperationFailed(
+						TransportFailure::DeadlineExceeded
+					)))
+				),
+			)?;
+
+			let client_join = join_task(client_task, "client handshake task must not panic");
+			let client_result = timeout(Duration::from_secs(5), client_join)
+				.await
+				.map_err(|_| expectation_failure("client must fail closed once the server abandons the handshake"))??;
+			trace.event_with(MuxAuthorizerDeadlineSpec::client_fails_closed, &[], client_result.is_err())?;
 
 			Ok(())
 		}

@@ -430,8 +430,12 @@ impl From<Option<MuxBudgets>> for AuthorizationGrant {
 
 /// Server policy for session budget grants and receipt settlement.
 ///
-/// Two hooks, both awaited inline with **no library deadline**. Bound
-/// external work yourself: a slow hook stalls per-connection handshake
+/// Two hooks, both awaited inline. On tokio runtimes the transport's
+/// handshake deadline bounds them: a hook still pending when the
+/// deadline elapses aborts the handshake with
+/// [`DeadlineExceeded`](crate::transport::TransportFailure::DeadlineExceeded).
+/// Runtimes without a timer (non-tokio) enforce no library deadline, so
+/// bound external work yourself: a slow hook stalls per-connection handshake
 /// state and widens the window an unauthenticated peer can hold it.
 ///
 /// 1. [`authorize`](Self::authorize) - after the client

@@ -754,6 +754,19 @@ impl TransportAuthorizer for RefusingAuthorizer {
 	}
 }
 
+/// Authorizer whose backend never responds, simulating a hung
+/// authorization service on the unauthenticated handshake path.
+pub(super) struct HangingAuthorizer;
+
+impl TransportAuthorizer for HangingAuthorizer {
+	fn authorize<'a>(
+		&'a self,
+		_offer: &'a TransportOffer,
+	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
+		Box::pin(core::future::pending())
+	}
+}
+
 pub(super) fn is_goaway(envelope: &TransportEnvelope, reason: GoAwayReason, last_stream_id: Option<u32>) -> bool {
 	match envelope {
 		TransportEnvelope::Mux(MuxEnvelope::GoAway(package)) => {

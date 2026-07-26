@@ -12,6 +12,9 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use core::future::Future;
+use core::mem;
+
 #[cfg(feature = "std")]
 use std::sync::Arc;
 #[cfg(all(
@@ -20,9 +23,6 @@ use std::sync::Arc;
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 use std::time::Instant;
-
-use core::future::Future;
-use core::mem;
 
 use crate::asn1::Frame;
 use crate::der::{Decode, Encode};
@@ -37,6 +37,28 @@ use crate::TightBeamError;
 
 #[cfg(feature = "transport-ecies")]
 use crate::crypto::ecies::Secp256k1EciesMessage;
+
+#[cfg(all(
+	feature = "tokio",
+	feature = "std",
+	not(target_arch = "wasm32"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+mod deadline {
+	pub use core::time::Duration;
+
+	pub use tokio::time::timeout;
+
+	pub use crate::transport::error::TransportFailure;
+}
+
+#[cfg(all(
+	feature = "tokio",
+	feature = "std",
+	not(target_arch = "wasm32"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use deadline::*;
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -96,6 +118,27 @@ use x509::*;
 /// Maximum wire size allowed for handshake-phase messages.
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
+
+/// Remaining allowance before the handshake deadline elapses.
+///
+/// - A fresh handshake receives the full configured timeout.
+/// - An in-flight handshake receives the unexpired remainder of its deadline.
+#[cfg(all(
+	feature = "tokio",
+	feature = "std",
+	not(target_arch = "wasm32"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+fn remaining_handshake_deadline<T: EncryptedProtocolState>(state: &T) -> Duration {
+	let allowance = state.to_handshake_timeout();
+	match state.to_handshake_state() {
+		TcpHandshakeState::AwaitingServerResponse { initiated_at }
+		| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
+			(initiated_at + allowance).saturating_duration_since(Instant::now())
+		}
+		_ => allowance,
+	}
+}
 
 /// Parse a DER length field into its numeric value.
 pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
@@ -952,7 +995,24 @@ pub trait EncryptedMessageIO: MessageIO {
 			*self.to_server_handshake_mut() = Some(orchestrator);
 		}
 
-		self.drive_server_handshake(kind, &raw_message).await
+		// The tokio runtime supplies the timer: the handshake deadline bounds
+		// processing (including authorizer/observer hooks) on the
+		// unauthenticated path, not just wire reads. Non-tokio runtimes have
+		// no portable timer here and rely on the embedding application.
+		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
+		{
+			let remaining = remaining_handshake_deadline(self);
+			if remaining.is_zero() {
+				return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
+			}
+
+			timeout(remaining, self.drive_server_handshake(kind, &raw_message)).await?
+		}
+
+		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
+		{
+			self.drive_server_handshake(kind, &raw_message).await
+		}
 	}
 
 	/// Perform server-side handshake (CMS-only build variant).
@@ -996,7 +1056,24 @@ pub trait EncryptedMessageIO: MessageIO {
 			*self.to_server_handshake_mut() = Some(orchestrator);
 		}
 
-		self.drive_server_handshake(kind, &raw_message).await
+		// The tokio runtime supplies the timer: the handshake deadline bounds
+		// processing (including authorizer/observer hooks) on the
+		// unauthenticated path, not just wire reads. Non-tokio runtimes have
+		// no portable timer here and rely on the embedding application.
+		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
+		{
+			let remaining = remaining_handshake_deadline(self);
+			if remaining.is_zero() {
+				return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
+			}
+
+			timeout(remaining, self.drive_server_handshake(kind, &raw_message)).await?
+		}
+
+		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
+		{
+			self.drive_server_handshake(kind, &raw_message).await
+		}
 	}
 
 	/// Perform a single request-response cycle

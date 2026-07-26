@@ -9,11 +9,13 @@
 	feature = "testing"
 ))]
 
+use core::time::Duration;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::policy::Secp256k1Policy;
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
 use tightbeam::der::{Decode, Encode};
 use tightbeam::prelude::TightBeamSocketAddr;
@@ -56,6 +58,25 @@ pub async fn bind_encrypted_listener(
 	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
 
 	let config = TransportEncryptionConfig::new(certificate, key_manager);
+	bind_with_config(config).await
+}
+
+/// Bind an encrypted listener with a custom handshake deadline.
+pub async fn bind_encrypted_listener_with_timeout(
+	materials: &ServerMaterials,
+	handshake_timeout: Duration,
+) -> Result<(TokioListener, SocketAddr), TightBeamError> {
+	let certificate = Certificate::clone(&materials.certificate);
+	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
+
+	let mut config = TransportEncryptionConfig::new(certificate, key_manager);
+	config.handshake_timeout = handshake_timeout;
+	bind_with_config(config).await
+}
+
+async fn bind_with_config(
+	config: TransportEncryptionConfig<DefaultCryptoProvider>,
+) -> Result<(TokioListener, SocketAddr), TightBeamError> {
 	let addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
 	let (listener, bound_addr) = TokioListener::bind_with(addr, config).await?;
 	Ok((listener, *bound_addr))
@@ -71,10 +92,7 @@ pub async fn bind_mutual_listener(
 	let key_manager = HandshakeKeyManager::new(Arc::clone(&materials.key_provider));
 	let validators = vec![pinning_validator(client_certificate)];
 	let config = TransportEncryptionConfig::new(certificate, key_manager).with_client_validators(validators);
-
-	let addr = "127.0.0.1:0".parse::<TightBeamSocketAddr>()?;
-	let (listener, bound_addr) = TokioListener::bind_with(addr, config).await?;
-	Ok((listener, *bound_addr))
+	bind_with_config(config).await
 }
 
 /// Connect a pinned client carrying its own identity for mutual auth.
