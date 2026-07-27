@@ -1948,8 +1948,8 @@ mod router {
 		/// Control commands buffered while the writer queue is full so
 		/// the read loop never parks
 		/// ([RFC 9113 § 5.2.2](https://datatracker.ietf.org/doc/html/rfc9113#section-5.2.2)).
-		/// Bounded: grants coalesce per stream, ping acks are capped,
-		/// rekey legs are one-in-flight
+		/// Bounded: grants coalesce per stream and evict when the stream
+		/// closes, ping acks are capped, rekey legs are one-in-flight
 		pending_control: VecDeque<Outbound>,
 		/// Role-fixed rekey exchange; `None` keeps every rekey leg an
 		/// unsolicited protocol violation
@@ -2340,9 +2340,16 @@ mod router {
 		/// Queue a credit grant, superseding any buffered grant for the
 		/// same stream: `Credit` is an absolute limit, only the newest matters.
 		fn queue_credit(&mut self, stream_id: u32, new_limit: u64) -> TransportResult<()> {
+			self.evict_credit(stream_id);
+			self.queue_control(MuxCreditPackage::new(stream_id, new_limit).into())
+		}
+
+		/// Drop any buffered grant for `stream_id`. Called when the stream
+		/// closes: ids never recur, so a leftover grant is dead weight that
+		/// would accumulate across stream churn under writer backpressure.
+		fn evict_credit(&mut self, stream_id: u32) {
 			self.pending_control
 				.retain(|envelope| !is_credit_grant_for(envelope, stream_id));
-			self.queue_control(MuxCreditPackage::new(stream_id, new_limit).into())
 		}
 
 		/// Queue a ping ack; probes beyond [`MAX_PENDING_PING_ACKS`] draw no ack.
@@ -2397,6 +2404,8 @@ mod router {
 			if !self.shared.role.initiates(stream_id) {
 				return Err(self.protocol_violation());
 			}
+
+			self.evict_credit(stream_id);
 
 			// The sender debited its ledgers for this record whether or
 			// not the stream is still pending, so account it either way
@@ -2539,6 +2548,7 @@ mod router {
 				// Final chunk: dispatch without a credit raise - the stream
 				// is leaving reassembly
 				let stream = self.accept_chunk_or_violate(stream, package.payload())?;
+				self.evict_credit(stream_id);
 				return self.dispatch_request(stream_id, &stream.buffer).await;
 			}
 
@@ -2561,6 +2571,7 @@ mod router {
 			// Stale flush of a stream this endpoint already resolved
 			if !self.shared.is_pending(stream_id) {
 				self.local_reassembly.remove(&stream_id);
+				self.evict_credit(stream_id);
 				return Ok(());
 			}
 
@@ -2596,6 +2607,7 @@ mod router {
 			if self.shared.role.initiates(stream_id) {
 				// Peer cancelled/refused a stream we initiated
 				self.local_reassembly.remove(&stream_id);
+				self.evict_credit(stream_id);
 				self.shared.resolve(stream_id, StreamOutcome::Cancelled(package.reason()));
 				return Ok(());
 			}
@@ -2603,6 +2615,7 @@ mod router {
 				// Peer withdrew its own request: drop any partial
 				// reassembly, release the response ledger, abort the handler
 				self.peer_reassembly.remove(&stream_id);
+				self.evict_credit(stream_id);
 				self.shared.finish_send_stream(stream_id);
 
 				let _ = self.inbound.send(InboundEvent::Cancel(stream_id)).await;
@@ -3822,6 +3835,32 @@ mod router {
 				Outbound::Envelope(TransportEnvelope::Mux(MuxEnvelope::Credit(package)))
 					if package.stream_id() == 1 && package.limit() == 4
 			));
+
+			Ok(())
+		}
+
+		// Stream ids never repeat, so per-stream coalescing alone lets
+		// grants for dead streams pile up under stream churn while the
+		// writer stays backpressured. Closing a stream must drop its
+		// buffered grant.
+		#[test]
+		fn test_buffered_grant_evicted_when_stream_closes() -> TransportResult<()> {
+			let mut fixture = reader_with_full_queue(Vec::new());
+			fixture.driver.queue_credit(1, 2)?;
+			fixture.driver.queue_credit(2, 2)?;
+			fixture.driver.queue_credit(3, 2)?;
+
+			let mut peer_cancel = Box::pin(fixture.driver.route_cancel(MuxCancelPackage::new(1, 0u32)));
+			poll_times(&mut peer_cancel, 1);
+			drop(peer_cancel);
+
+			let mut local_cancel = Box::pin(fixture.driver.route_cancel(MuxCancelPackage::new(2, 0u32)));
+			poll_times(&mut local_cancel, 1);
+			drop(local_cancel);
+
+			let buffered: Vec<_> = fixture.driver.pending_control.iter().collect();
+			assert_eq!(buffered.len(), 1);
+			assert!(is_credit_grant_for(buffered[0], 3));
 
 			Ok(())
 		}

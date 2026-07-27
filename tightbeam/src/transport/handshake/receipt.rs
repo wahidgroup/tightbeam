@@ -757,7 +757,8 @@ pub struct SessionOutcome {
 	/// Client receipt `SignerInfo` DER as received. Absent exactly when
 	/// the verdict is [`SessionVerdict::CountersignatureMissing`].
 	/// Present but unverified when it is
-	/// [`SessionVerdict::CountersignatureInvalid`].
+	/// [`SessionVerdict::CountersignatureInvalid`]. Its signed attributes
+	/// carry the settlement answer, so it is redacted from `Debug` with it.
 	pub countersignature: Option<OctetString>,
 	/// Application settlement answer recovered from the countersignature's
 	/// signed attributes, when the client attached one. A bearer secret:
@@ -775,7 +776,7 @@ impl fmt::Debug for SessionOutcome {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("SessionOutcome")
 			.field("receipt", &self.receipt)
-			.field("countersignature", &self.countersignature)
+			.field("countersignature", &redact(&self.countersignature))
 			.field("ancillary_response", &redact(&self.ancillary_response))
 			.field("client_certificate", &self.client_certificate)
 			.field("verdict", &self.verdict)
@@ -1207,6 +1208,33 @@ mod tests {
 			let rendered = format!("{stored:?}");
 			assert!(rendered.contains("<redacted 8 bytes>"));
 			assert!(!rendered.contains("preimage"));
+			Ok(())
+		}
+
+		// The countersignature SignerInfo carries the settlement answer in
+		// its signed attributes: its raw bytes are as secret as the answer.
+		#[tokio::test]
+		async fn outcome_debug_redacts_countersignature() -> Result<(), HandshakeError> {
+			let (receipt, artifact, _) = server_signed(Some(b"challenge")).await?;
+			let (client_provider, _) = test_provider();
+			let countersignature =
+				countersign_receipt::<Sha3_256>(&receipt, Some(b"preimage"), &client_provider).await?;
+			let countersignature_der = OctetString::new(countersignature.to_der()?)?;
+			let raw_debug = format!("{countersignature_der:?}");
+			let countersignature_len = countersignature_der.as_bytes().len();
+
+			let outcome = SessionOutcome {
+				receipt,
+				artifact,
+				countersignature: Some(countersignature_der),
+				ancillary_response: Some(OctetString::new(b"preimage")?),
+				client_certificate: None,
+				verdict: SessionVerdict::Activated,
+			};
+			let rendered = format!("{outcome:?}");
+			assert!(!rendered.contains(&raw_debug));
+			assert!(rendered.contains(&format!("<redacted {countersignature_len} bytes>")));
+			assert!(rendered.contains("<redacted 8 bytes>"));
 			Ok(())
 		}
 

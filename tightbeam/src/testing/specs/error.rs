@@ -8,6 +8,8 @@ use crate::trace::ExecutionMode;
 use crate::policy::TransitStatus;
 #[cfg(feature = "testing-timing")]
 use crate::testing::schedulability::{SchedulabilityError, SchedulabilityResult};
+#[cfg(feature = "testing-csp")]
+use crate::testing::specs::csp::CspViolation;
 #[cfg(feature = "derive")]
 use crate::Errorizable;
 
@@ -75,6 +77,10 @@ pub enum SpecViolation {
 	#[cfg(feature = "instrument")]
 	#[cfg_attr(feature = "derive", error("Event count mismatch: {0:?}"))]
 	EventCountMismatch(EventCountMismatchDetail),
+	/// CSP process validation failed (Layer 2)
+	#[cfg(feature = "testing-csp")]
+	#[cfg_attr(feature = "derive", error("CSP process violation: {0:?}"))]
+	CspProcessViolation(Vec<CspViolation>),
 	/// Schedulability violation (analysis failed)
 	#[cfg(feature = "testing-timing")]
 	#[cfg_attr(feature = "derive", error("Schedulability violation: {0:?}"))]
@@ -129,6 +135,14 @@ impl std::fmt::Display for SpecViolation {
 					"Event count mismatch: {:?} expected {}, found {}",
 					detail.kind, detail.expected, detail.actual
 				)
+			}
+			#[cfg(feature = "testing-csp")]
+			Self::CspProcessViolation(violations) => {
+				write!(f, "CSP process violation:")?;
+				for violation in violations {
+					write!(f, "\n  - {violation}")?;
+				}
+				Ok(())
 			}
 			#[cfg(feature = "testing-timing")]
 			Self::SchedulabilityViolation(result) => {
