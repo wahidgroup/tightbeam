@@ -8,10 +8,21 @@
 #![cfg(feature = "testing-fdr")]
 
 use std::sync::Arc;
+
 use tightbeam::testing::fdr::{FdrConfig, FdrTraceExt};
 use tightbeam::testing::specs::csp::Process;
 use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+
+pub(crate) const CONNECT: Urn<'static> = Urn::new("test", "event:trace-analysis/connect");
+pub(crate) const DECRYPT: Urn<'static> = Urn::new("test", "event:trace-analysis/decrypt");
+pub(crate) const DESERIALIZE: Urn<'static> = Urn::new("test", "event:trace-analysis/deserialize");
+pub(crate) const DISCONNECT: Urn<'static> = Urn::new("test", "event:trace-analysis/disconnect");
+pub(crate) const ENCRYPT: Urn<'static> = Urn::new("test", "event:trace-analysis/encrypt");
+pub(crate) const REQUEST: Urn<'static> = Urn::new("test", "event:trace-analysis/request");
+pub(crate) const RESPONSE: Urn<'static> = Urn::new("test", "event:trace-analysis/response");
+pub(crate) const SERIALIZE: Urn<'static> = Urn::new("test", "event:trace-analysis/serialize");
 
 fn build_fdr_config(specs: Vec<Process>) -> FdrConfig {
 	FdrConfig {
@@ -34,14 +45,14 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(connect, exactly!(1)),
-			(serialize, exactly!(1)),
-			(encrypt, exactly!(1)),
-			(request, exactly!(1)),
-			(decrypt, exactly!(1)),
-			(deserialize, exactly!(1)),
-			(response, exactly!(1)),
-			(disconnect, exactly!(1))
+			(CONNECT, exactly!(1)),
+			(SERIALIZE, exactly!(1)),
+			(ENCRYPT, exactly!(1)),
+			(REQUEST, exactly!(1)),
+			(DECRYPT, exactly!(1)),
+			(DESERIALIZE, exactly!(1)),
+			(RESPONSE, exactly!(1)),
+			(DISCONNECT, exactly!(1))
 		]
 	}
 }
@@ -55,18 +66,18 @@ tb_process_spec! {
 	/// Hidden: serialize, encrypt, decrypt, deserialize
 	pub SimpleRequestResponse,
 	events {
-		observable { "connect", "request", "response", "disconnect" }
-		hidden { "serialize", "encrypt", "decrypt", "deserialize" }
+		observable { CONNECT, REQUEST, RESPONSE, DISCONNECT }
+		hidden { SERIALIZE, ENCRYPT, DECRYPT, DESERIALIZE }
 	}
 	states {
-		Init => { "connect" => Connected },
-		Connected => { "serialize" => Serialized },
-		Serialized => { "encrypt" => Encrypted },
-		Encrypted => { "request" => Sent },
-		Sent => { "decrypt" => Decrypted },
-		Decrypted => { "deserialize" => Deserialized },
-		Deserialized => { "response" => Responded },
-		Responded => { "disconnect" => Complete }
+		Init => { CONNECT => Connected },
+		Connected => { SERIALIZE => Serialized },
+		Serialized => { ENCRYPT => Encrypted },
+		Encrypted => { REQUEST => Sent },
+		Sent => { DECRYPT => Decrypted },
+		Decrypted => { DESERIALIZE => Deserialized },
+		Deserialized => { RESPONSE => Responded },
+		Responded => { DISCONNECT => Complete }
 	}
 	terminal { Complete }
 }
@@ -104,14 +115,14 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
 			// Execute simple request-response flow (simulated)
-			trace.event(TraceAnalysisSpec::connect)?;
-			trace.event(TraceAnalysisSpec::serialize)?;
-			trace.event(TraceAnalysisSpec::encrypt)?;
-			trace.event(TraceAnalysisSpec::request)?;
-			trace.event(TraceAnalysisSpec::decrypt)?;
-			trace.event(TraceAnalysisSpec::deserialize)?;
-			trace.event(TraceAnalysisSpec::response)?;
-			trace.event(TraceAnalysisSpec::disconnect)?;
+			trace.event(CONNECT)?;
+			trace.event(SERIALIZE)?;
+			trace.event(ENCRYPT)?;
+			trace.event(REQUEST)?;
+			trace.event(DECRYPT)?;
+			trace.event(DESERIALIZE)?;
+			trace.event(RESPONSE)?;
+			trace.event(DISCONNECT)?;
 
 			Ok(())
 		}

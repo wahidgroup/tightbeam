@@ -45,7 +45,7 @@ use tightbeam::{
 		},
 	},
 	decode, encode, exactly, hive,
-	policy::{GatePolicy, TransitStatus},
+	policy::{GatePolicy, SessionContext, TransitStatus},
 	servlet, tb_assert_spec, tb_scenario,
 	testing::{ClusterEnv, SetupEnv},
 	trace::TraceCollector,
@@ -54,10 +54,38 @@ use tightbeam::{
 		GenericClient,
 	},
 	utils::compose as frame_compose,
+	utils::urn::Urn,
 	Beamable, Frame, TightBeamError, Version,
 };
 
 use crate::common::x509::create_test_cert_with_key;
+
+pub(crate) const CROSS_HIVE_UPDATE_FORBIDDEN: Urn<'static> =
+	Urn::new("test", "event:cluster/cross-hive-update-forbidden");
+pub(crate) const FRESH_REGISTRATION_ACCEPTED: Urn<'static> =
+	Urn::new("test", "event:cluster/fresh-registration-accepted");
+pub(crate) const FRESH_UPDATE_ACCEPTED: Urn<'static> = Urn::new("test", "event:cluster/fresh-update-accepted");
+pub(crate) const HIJACK_FORBIDDEN: Urn<'static> = Urn::new("test", "event:cluster/hijack-forbidden");
+pub(crate) const HIVES_REGISTERED: Urn<'static> = Urn::new("test", "event:cluster/hives-registered");
+pub(crate) const HIVE_EVICTED: Urn<'static> = Urn::new("test", "event:cluster/hive-evicted");
+pub(crate) const HIVE_REGISTERED: Urn<'static> = Urn::new("test", "event:cluster/hive-registered");
+pub(crate) const OWNER_BIND_INTACT: Urn<'static> = Urn::new("test", "event:cluster/owner-bind-intact");
+pub(crate) const OWNER_REGISTERED: Urn<'static> = Urn::new("test", "event:cluster/owner-registered");
+pub(crate) const OWNER_UPDATE_ACCEPTED: Urn<'static> = Urn::new("test", "event:cluster/owner-update-accepted");
+pub(crate) const POLICY_BLOCKED: Urn<'static> = Urn::new("test", "event:cluster/policy-blocked");
+pub(crate) const REGISTRATION_FORBIDDEN: Urn<'static> = Urn::new("test", "event:cluster/registration-forbidden");
+pub(crate) const REGISTRATION_SENT: Urn<'static> = Urn::new("test", "event:cluster/registration-sent");
+pub(crate) const REGISTRATION_UNAUTHORIZED: Urn<'static> = Urn::new("test", "event:cluster/registration-unauthorized");
+pub(crate) const REJECTED_HEARTBEAT_DECODED: Urn<'static> =
+	Urn::new("test", "event:cluster/rejected-heartbeat-decoded");
+pub(crate) const REPLAYED_REGISTRATION_REJECTED: Urn<'static> =
+	Urn::new("test", "event:cluster/replayed-registration-rejected");
+pub(crate) const REPLAYED_UPDATE_REJECTED: Urn<'static> = Urn::new("test", "event:cluster/replayed-update-rejected");
+pub(crate) const ROUTING_ACCEPTED: Urn<'static> = Urn::new("test", "event:cluster/routing-accepted");
+pub(crate) const SERVLET_STOPPED: Urn<'static> = Urn::new("test", "event:cluster/servlet-stopped");
+pub(crate) const STALE_REGISTRATION_REJECTED: Urn<'static> =
+	Urn::new("test", "event:cluster/stale-registration-rejected");
+pub(crate) const WORK_SENT: Urn<'static> = Urn::new("test", "event:cluster/work-sent");
 
 // ============================================================================
 // Shared Test Certificates
@@ -74,7 +102,7 @@ impl ClusterTestCerts {
 		let (cert, key) = create_test_cert_with_key("CN=Cluster Gateway", 365).expect("Failed to create cluster cert");
 		let trust: Arc<dyn CertificateTrust> = Arc::new(
 			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_chain(vec![cert.clone()])
+				.with_chain(vec![cert.to_owned()])
 				.expect("Failed to build trust")
 				.build(),
 		);
@@ -91,8 +119,8 @@ fn cluster_tls_config_with_trust(
 	hive_trust: Option<Arc<dyn CertificateTrust>>,
 ) -> ClusterTlsConfig {
 	ClusterTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 		validators: vec![],
 		client_validators: vec![],
 		hive_trust,
@@ -105,8 +133,8 @@ fn cluster_tls_config(certs: &ClusterTestCerts) -> ClusterTlsConfig {
 
 fn hive_tls_config_no_trust(certs: &ClusterTestCerts) -> HiveConf {
 	let hive_tls = Arc::new(HiveTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+		certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 		validators: vec![],
 	});
 	HiveConf {
@@ -125,8 +153,8 @@ fn servlet_tls_config(
 ) -> Result<ServletConf<TokioListener, PingRequest, DefaultCryptoProvider>, TightBeamError> {
 	Ok(ServletConf::<TokioListener, PingRequest, DefaultCryptoProvider>::builder()
 		.with_certificate(
-			CertificateSpec::Built(Box::new(certs.cert.clone())),
-			Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+			CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+			Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 			vec![],
 		)?
 		.with_mux_offer(Some(TransportOffer::mux(8)))
@@ -177,7 +205,7 @@ async fn signed_control_frame_with(
 		.with_message(request)
 		.build()?;
 
-	let provider = Secp256k1KeyProvider::from(key.clone());
+	let provider = Secp256k1KeyProvider::from(key.to_owned());
 	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
 }
 
@@ -248,7 +276,7 @@ servlet! {
 	protocol: TokioListener,
 	handle: |req, frame, _ctx| async move {
 		Ok(Some(compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: &frame.metadata.id,
 				message: PingResponse { doubled: req.value * 2 }
 		}?))
 	}
@@ -282,8 +310,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(work_sent, exactly!(1)),
-			(routing_accepted, exactly!(1))
+			(WORK_SENT, exactly!(1)),
+			(ROUTING_ACCEPTED, exactly!(1))
 		]
 	}
 }
@@ -322,7 +350,7 @@ async fn assert_ping_work_routes(
 	certs: &ClusterTestCerts,
 	cluster: &ClusterGateway,
 ) -> Result<(), TightBeamError> {
-	trace.event(ClusterRoutingSpec::work_sent)?;
+	trace.event(WORK_SENT)?;
 
 	let work_request = ClusterRequest::Work(ClusterWorkRequest {
 		servlet_type: b"ping".to_vec(),
@@ -345,7 +373,7 @@ async fn assert_ping_work_routes(
 	let ping_response: PingResponse = decode(&payload)?;
 	assert_eq!(ping_response.doubled, 42);
 
-	trace.event(ClusterRoutingSpec::routing_accepted)?;
+	trace.event(ROUTING_ACCEPTED)?;
 
 	Ok(())
 }
@@ -397,8 +425,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(hive_registered, exactly!(1), equals!(1u64)),
-			(servlet_stopped, exactly!(1))
+			(HIVE_REGISTERED, exactly!(1), equals!(1u64)),
+			(SERVLET_STOPPED, exactly!(1))
 		]
 	}
 }
@@ -415,7 +443,7 @@ impl ServletBox for StopProbeServlet {
 	}
 
 	fn stop_boxed(self: Box<Self>) {
-		let _ = self.trace.event(ClusterTeardownSpec::servlet_stopped);
+		let _ = self.trace.event(SERVLET_STOPPED);
 	}
 }
 
@@ -439,7 +467,7 @@ tb_scenario! {
 			Ok::<_, TightBeamError>(hive)
 		}],
 		client: |ClusterEnv { trace, cluster, .. }| async move {
-			trace.event_with(ClusterTeardownSpec::hive_registered, &[], cluster.hive_count() as u64)?;
+			trace.event_with(HIVE_REGISTERED, &[], cluster.hive_count() as u64)?;
 
 			cluster.stop();
 
@@ -455,7 +483,7 @@ tb_scenario! {
 struct RejectAllPolicy;
 
 impl GatePolicy for RejectAllPolicy {
-	fn evaluate(&self, _message: &Frame) -> TransitStatus {
+	fn evaluate(&self, _message: &Frame, _session: &SessionContext) -> TransitStatus {
 		TransitStatus::PermissionDenied
 	}
 }
@@ -466,8 +494,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(work_sent, exactly!(1)),
-			(policy_blocked, exactly!(1))
+			(WORK_SENT, exactly!(1)),
+			(POLICY_BLOCKED, exactly!(1))
 		]
 	}
 }
@@ -499,7 +527,7 @@ tb_scenario! {
 
 			let mut client = connect_cluster(&certs, cluster_addr).await?;
 
-			trace.event(ClusterPolicySpec::work_sent)?;
+			trace.event(WORK_SENT)?;
 
 			let response_frame = emit_frame(&mut client, frame).await?;
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
@@ -510,7 +538,7 @@ tb_scenario! {
 			);
 			assert!(work_response.payload.is_none(), "rejected request must not carry a payload");
 
-			trace.event(ClusterPolicySpec::policy_blocked)?;
+			trace.event(POLICY_BLOCKED)?;
 
 			cluster.stop();
 
@@ -529,8 +557,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(registration_sent, exactly!(1)),
-			(registration_unauthorized, exactly!(1))
+			(REGISTRATION_SENT, exactly!(1)),
+			(REGISTRATION_UNAUTHORIZED, exactly!(1))
 		]
 	}
 }
@@ -559,12 +587,12 @@ tb_scenario! {
 			let mut hive = ClusterTestHive::new(Some(hive_conf))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 
-			trace.event(ClusterUnsignedRegistrationSpec::registration_sent)?;
+			trace.event(REGISTRATION_SENT)?;
 
 			let response = hive.register_with_cluster(cluster_addr).await?;
 			assert_register_status(&response, TransitStatus::Unauthenticated, 0, &cluster);
 
-			trace.event(ClusterUnsignedRegistrationSpec::registration_unauthorized)?;
+			trace.event(REGISTRATION_UNAUTHORIZED)?;
 
 			hive.stop();
 			cluster.stop();
@@ -584,8 +612,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(registration_sent, exactly!(1)),
-			(registration_forbidden, exactly!(1))
+			(REGISTRATION_SENT, exactly!(1)),
+			(REGISTRATION_FORBIDDEN, exactly!(1))
 		]
 	}
 }
@@ -600,8 +628,8 @@ tb_scenario! {
 			// frames and must fail closed: even a validly signed
 			// registration is rejected.
 			let tls = ClusterTlsConfig {
-				certificate: CertificateSpec::Built(Box::new(certs.cert.clone())),
-				key: Arc::new(Secp256k1KeyProvider::from(certs.key.clone())),
+				certificate: CertificateSpec::Built(Box::new(certs.cert.to_owned())),
+				key: Arc::new(Secp256k1KeyProvider::from(certs.key.to_owned())),
 				validators: vec![],
 				client_validators: vec![],
 				hive_trust: None,
@@ -619,13 +647,13 @@ tb_scenario! {
 			)
 			.await?;
 
-			trace.event(ClusterNoTrustStoreSpec::registration_sent)?;
+			trace.event(REGISTRATION_SENT)?;
 
 			let response_frame = emit_frame(&mut client, signed).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_register_status(&response, TransitStatus::PermissionDenied, 0, &cluster);
 
-			trace.event(ClusterNoTrustStoreSpec::registration_forbidden)?;
+			trace.event(REGISTRATION_FORBIDDEN)?;
 
 			cluster.stop();
 
@@ -644,11 +672,11 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(fresh_registration_accepted, exactly!(1)),
-			(replayed_registration_rejected, exactly!(1)),
-			(stale_registration_rejected, exactly!(1)),
-			(fresh_update_accepted, exactly!(1)),
-			(replayed_update_rejected, exactly!(1))
+			(FRESH_REGISTRATION_ACCEPTED, exactly!(1)),
+			(REPLAYED_REGISTRATION_REJECTED, exactly!(1)),
+			(STALE_REGISTRATION_REJECTED, exactly!(1)),
+			(FRESH_UPDATE_ACCEPTED, exactly!(1)),
+			(REPLAYED_UPDATE_REJECTED, exactly!(1))
 		]
 	}
 }
@@ -672,20 +700,20 @@ tb_scenario! {
 				registration_request(current_timestamp_ms(), b"127.0.0.1:65000"),
 			)
 			.await?;
-			let replayed = fresh.clone();
+			let replayed = fresh.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_register_status(&response, TransitStatus::Ok, 1, &cluster);
 
-			trace.event(ClusterReplaySpec::fresh_registration_accepted)?;
+			trace.event(FRESH_REGISTRATION_ACCEPTED)?;
 
 			// Byte-identical resend carries an already-seen signature
 			let response_frame = emit_frame(&mut client, replayed).await?;
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_eq!(response.status, TransitStatus::PermissionDenied, "replayed registration must be rejected");
 
-			trace.event(ClusterReplaySpec::replayed_registration_rejected)?;
+			trace.event(REPLAYED_REGISTRATION_REJECTED)?;
 
 			// Valid signature but issued outside the freshness window
 			let stale_ts = current_timestamp_ms() - 2 * DEFAULT_COMMAND_FRESHNESS_WINDOW_MS;
@@ -700,7 +728,7 @@ tb_scenario! {
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_eq!(response.status, TransitStatus::PermissionDenied, "stale registration must be rejected");
 
-			trace.event(ClusterReplaySpec::stale_registration_rejected)?;
+			trace.event(STALE_REGISTRATION_REJECTED)?;
 
 			// Same enforcement on servlet address updates
 			let update = servlet_address_update(
@@ -708,19 +736,19 @@ tb_scenario! {
 				vec![servlet_info(b"ping", b"127.0.0.1:65001")],
 			);
 			let fresh_update = signed_control_frame(&certs, b"replay-update", update).await?;
-			let replayed_update = fresh_update.clone();
+			let replayed_update = fresh_update.to_owned();
 
 			let response_frame = emit_frame(&mut client, fresh_update).await?;
 			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
 			assert_eq!(response.status, TransitStatus::Ok, "fresh signed update must be accepted");
 
-			trace.event(ClusterReplaySpec::fresh_update_accepted)?;
+			trace.event(FRESH_UPDATE_ACCEPTED)?;
 
 			let response_frame = emit_frame(&mut client, replayed_update).await?;
 			let response: ServletAddressUpdateResponse = decode(&response_frame.message)?;
 			assert_eq!(response.status, TransitStatus::PermissionDenied, "replayed update must be rejected");
 
-			trace.event(ClusterReplaySpec::replayed_update_rejected)?;
+			trace.event(REPLAYED_UPDATE_REJECTED)?;
 
 			cluster.stop();
 
@@ -739,9 +767,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(hive_registered, exactly!(1)),
-			(rejected_heartbeat_decoded, exactly!(1)),
-			(hive_evicted, exactly!(1))
+			(HIVE_REGISTERED, exactly!(1)),
+			(REJECTED_HEARTBEAT_DECODED, exactly!(1)),
+			(HIVE_EVICTED, exactly!(1))
 		]
 	}
 }
@@ -806,7 +834,7 @@ tb_scenario! {
 			let response: RegisterHiveResponse = decode(&response_frame.message)?;
 			assert_register_status(&response, TransitStatus::Ok, 1, &cluster);
 
-			trace.event(ClusterHeartbeatRejectionSpec::hive_registered)?;
+			trace.event(HIVE_REGISTERED)?;
 
 			// Heartbeats run every 100ms with max_failures = 1: the first
 			// PermissionDenied heartbeat must evict the hive
@@ -820,8 +848,8 @@ tb_scenario! {
 				"hive must answer with a decodable rejected heartbeat"
 			);
 
-			trace.event(ClusterHeartbeatRejectionSpec::rejected_heartbeat_decoded)?;
-			trace.event(ClusterHeartbeatRejectionSpec::hive_evicted)?;
+			trace.event(REJECTED_HEARTBEAT_DECODED)?;
+			trace.event(HIVE_EVICTED)?;
 
 			hive.stop();
 			cluster.stop();
@@ -855,9 +883,9 @@ fn dual_hive_certs() -> DualHiveCerts {
 	let key_b = Secp256k1SigningKey::from(raw_b);
 	let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
 		CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-			.with_certificate(cert_a.clone())
+			.with_certificate(cert_a.to_owned())
 			.expect("hive A trust")
-			.with_certificate(cert_b.clone())
+			.with_certificate(cert_b.to_owned())
 			.expect("hive B trust")
 			.build(),
 	);
@@ -891,9 +919,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(hives_registered, exactly!(1)),
-			(cross_hive_update_forbidden, exactly!(1)),
-			(owner_update_accepted, exactly!(1))
+			(HIVES_REGISTERED, exactly!(1)),
+			(CROSS_HIVE_UPDATE_FORBIDDEN, exactly!(1)),
+			(OWNER_UPDATE_ACCEPTED, exactly!(1))
 		]
 	}
 }
@@ -923,7 +951,7 @@ tb_scenario! {
 			assert_eq!(response_b.status, TransitStatus::Ok);
 			assert_eq!(cluster.hive_count(), 2);
 
-			trace.event(ClusterCrossHiveUpdateSpec::hives_registered)?;
+			trace.event(HIVES_REGISTERED)?;
 
 			let update_cases = [
 				(
@@ -931,14 +959,14 @@ tb_scenario! {
 					b"cross-update".as_slice(),
 					servlet_address_update(hive_a_addr, vec![servlet_info(b"poison", b"127.0.0.1:65099")]),
 					TransitStatus::PermissionDenied,
-					ClusterCrossHiveUpdateSpec::cross_hive_update_forbidden,
+					CROSS_HIVE_UPDATE_FORBIDDEN,
 				),
 				(
 					&certs.hive_a.1,
 					b"owner-update".as_slice(),
 					servlet_address_update(hive_a_addr, vec![servlet_info(b"ping", b"127.0.0.1:65012")]),
 					TransitStatus::Ok,
-					ClusterCrossHiveUpdateSpec::owner_update_accepted,
+					OWNER_UPDATE_ACCEPTED,
 				),
 			];
 
@@ -960,9 +988,9 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(owner_registered, exactly!(1)),
-			(hijack_forbidden, exactly!(1)),
-			(owner_bind_intact, exactly!(1))
+			(OWNER_REGISTERED, exactly!(1)),
+			(HIJACK_FORBIDDEN, exactly!(1)),
+			(OWNER_BIND_INTACT, exactly!(1))
 		]
 	}
 }
@@ -988,13 +1016,13 @@ tb_scenario! {
 			assert_eq!(owner.status, TransitStatus::Ok);
 			assert_eq!(cluster.hive_count(), 1);
 
-			trace.event(ClusterRegistrationHijackSpec::owner_registered)?;
+			trace.event(OWNER_REGISTERED)?;
 
 			let hijack = register_signed_hive(&mut client, &certs.hive_b.1, b"hijack-reg", hive_a_addr).await?;
 			assert_eq!(hijack.status, TransitStatus::PermissionDenied);
 			assert_eq!(cluster.hive_count(), 1);
 
-			trace.event(ClusterRegistrationHijackSpec::hijack_forbidden)?;
+			trace.event(HIJACK_FORBIDDEN)?;
 
 			let owned = emit_servlet_update(
 				&mut client,
@@ -1005,7 +1033,7 @@ tb_scenario! {
 			.await?;
 			assert_eq!(owned.status, TransitStatus::Ok);
 
-			trace.event(ClusterRegistrationHijackSpec::owner_bind_intact)?;
+			trace.event(OWNER_BIND_INTACT)?;
 
 			cluster.stop();
 			Ok(())

@@ -1,6 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 use tightbeam::matrix::{Matrix, MatrixDyn, MatrixError, MatrixLike};
+use tightbeam::utils::urn::Urn;
 
 use super::constants::MAX_MOVES_TO_FIND;
 use super::piece;
@@ -444,6 +445,7 @@ impl ChessGameState {
 			if piece::Piece::from_u8(self.board.get(cr, cc)).is_some() {
 				return false; // Path blocked
 			}
+
 			current_row += row_step;
 			current_col += col_step;
 		}
@@ -787,9 +789,9 @@ impl ChessGameState {
 		&mut self.board
 	}
 
-	/// Get the piece kind label at a specific square
-	pub(crate) fn piece_kind_at(&self, row: u8, col: u8) -> Option<&'static str> {
-		piece::Piece::from_u8(self.board.get(row, col)).map(|p| p.as_kind_label())
+	/// Get the piece kind event URN at a specific square
+	pub(crate) fn piece_kind_at(&self, row: u8, col: u8) -> Option<Urn<'static>> {
+		piece::Piece::from_u8(self.board.get(row, col)).map(|p| p.as_kind_event())
 	}
 
 	/// Update board state from matrix

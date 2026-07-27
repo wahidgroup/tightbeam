@@ -25,7 +25,7 @@
 //!   <https://capec.mitre.org/data/definitions/220.html>
 //! - CAPEC-620: Drop Encryption Level
 //!   <https://capec.mitre.org/data/definitions/620.html>
-//! - RFC 8446 (TLS 1.3) §4.1.3: downgrade protection
+//! - RFC 9846 (TLS 1.3) §4.1.3: downgrade protection
 
 use std::sync::Arc;
 
@@ -33,6 +33,7 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
@@ -40,16 +41,25 @@ use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
+pub(crate) const DOWNGRADE_CAPTURE_STRONG: Urn<'static> =
+	Urn::new("test", "event:downgrade-attack/downgrade-capture-strong");
+pub(crate) const DOWNGRADE_CAPTURE_WEAK: Urn<'static> =
+	Urn::new("test", "event:downgrade-attack/downgrade-capture-weak");
+pub(crate) const DOWNGRADE_PROFILES_DIFFER: Urn<'static> =
+	Urn::new("test", "event:downgrade-attack/downgrade-profiles-differ");
+pub(crate) const DOWNGRADE_SUBSTITUTION_REJECTED: Urn<'static> =
+	Urn::new("test", "event:downgrade-attack/downgrade-substitution-rejected");
+
 tb_assert_spec! {
 	pub DowngradeAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(downgrade_capture_strong, exactly!(BACKEND_COUNT_U32)),
-			(downgrade_capture_weak, exactly!(BACKEND_COUNT_U32)),
-			(downgrade_profiles_differ, exactly!(BACKEND_COUNT_U32)),
-			(downgrade_substitution_rejected, exactly!(BACKEND_COUNT_U32))
+			(DOWNGRADE_CAPTURE_STRONG, exactly!(BACKEND_COUNT_U32)),
+			(DOWNGRADE_CAPTURE_WEAK, exactly!(BACKEND_COUNT_U32)),
+			(DOWNGRADE_PROFILES_DIFFER, exactly!(BACKEND_COUNT_U32)),
+			(DOWNGRADE_SUBSTITUTION_REJECTED, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -58,43 +68,43 @@ tb_process_spec! {
 	pub DowngradeAttackProcess,
 	events {
 		observable {
-			"downgrade_capture_strong",
-			"downgrade_capture_weak",
-			"downgrade_profiles_differ",
-			"downgrade_substitution_rejected"
+
+			DOWNGRADE_CAPTURE_STRONG,
+			DOWNGRADE_CAPTURE_WEAK,
+			DOWNGRADE_PROFILES_DIFFER,
+			DOWNGRADE_SUBSTITUTION_REJECTED,
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS,
+			SecurityThreatHarness::HARNESS_SPAWN_WEAK,
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES_WEAK,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS_WEAK
 		}
-		hidden {
-			"harness_spawn_session",
-			"harness_spawn_ecies",
-			"harness_spawn_cms",
-			"harness_spawn_weak",
-			"harness_spawn_ecies_weak",
-			"harness_spawn_cms_weak"
-		}
+		hidden { }
 	}
 	states {
 		Idle => {
-			"harness_spawn_session" => SpawningStrong,
-			"harness_spawn_weak" => SpawningWeak
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningStrong,
+			SecurityThreatHarness::HARNESS_SPAWN_WEAK => SpawningWeak
 		},
 		SpawningStrong => {
-			"harness_spawn_ecies" => StrongReady,
-			"harness_spawn_cms" => StrongReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => StrongReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => StrongReady
 		},
-		StrongReady => { "downgrade_capture_strong" => StrongCaptured },
-		StrongCaptured => { "harness_spawn_weak" => SpawningWeak },
+		StrongReady => { DOWNGRADE_CAPTURE_STRONG => StrongCaptured },
+		StrongCaptured => { SecurityThreatHarness::HARNESS_SPAWN_WEAK => SpawningWeak },
 		SpawningWeak => {
-			"harness_spawn_ecies_weak" => WeakReady,
-			"harness_spawn_cms_weak" => WeakReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES_WEAK => WeakReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS_WEAK => WeakReady
 		},
-		WeakReady => { "downgrade_capture_weak" => WeakCaptured },
-		WeakCaptured => { "downgrade_profiles_differ" => ProfilesDiffer },
-		ProfilesDiffer => { "harness_spawn_session" => SpawningAttack },
+		WeakReady => { DOWNGRADE_CAPTURE_WEAK => WeakCaptured },
+		WeakCaptured => { DOWNGRADE_PROFILES_DIFFER => ProfilesDiffer },
+		ProfilesDiffer => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
 		SpawningAttack => {
-			"harness_spawn_ecies" => AttackReady,
-			"harness_spawn_cms" => AttackReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => AttackReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackReady
 		},
-		AttackReady => { "downgrade_substitution_rejected" => Idle }
+		AttackReady => { DOWNGRADE_SUBSTITUTION_REJECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Downgrade attack: AES-256 vs AES-128 cross-session substitution" }
@@ -117,7 +127,6 @@ job! {
 	name: DowngradeAttackScenario,
 	async fn run((trace,): (Arc<TraceCollector>,)) -> Result<(), TightBeamError> {
 		let harness = SecurityThreatHarness::with_trace(Arc::clone(&trace));
-
 		for kind in HandshakeBackendKind::all() {
 			// ========================================
 			// Step 1: Capture STRONG handshake (AES-256-GCM)
@@ -126,7 +135,7 @@ job! {
 			let mut strong_session = harness.spawn(kind);
 			let strong_handshake = strong_session.capture_full().await?;
 
-			trace.event(DowngradeAttackSpec::downgrade_capture_strong)?;
+			trace.event(DOWNGRADE_CAPTURE_STRONG)?;
 
 			// ========================================
 			// Step 2: Capture WEAK handshake (AES-128-GCM)
@@ -135,7 +144,7 @@ job! {
 			let mut weak_session = harness.spawn_weak(kind);
 			let weak_handshake = weak_session.capture_full().await?;
 
-			trace.event(DowngradeAttackSpec::downgrade_capture_weak)?;
+			trace.event(DOWNGRADE_CAPTURE_WEAK)?;
 
 			// ========================================
 			// Step 3: Verify wire bytes are DIFFERENT
@@ -155,20 +164,19 @@ job! {
 				return Err(expectation_failure("AES-256 and AES-128 messages are identical"));
 			}
 
-			trace.event(DowngradeAttackSpec::downgrade_profiles_differ)?;
+			trace.event(DOWNGRADE_PROFILES_DIFFER)?;
 
 			// ========================================
 			// Step 4: Attempt downgrade substitution
 			// Inject WEAK hello into a STRONG session
 			// ========================================
 			let mut attack_session = harness.spawn(kind);
-
 			match attack_session.inject_at_step(weak_hello.step, &weak_hello.payload).await? {
 				InjectionOutcome::Rejected(_) => {
 					// Downgrade substitution rejected - the strong server's
 					// strength floor refuses the AES-128 offer, and the
 					// negotiated cipher is bound into the signed transcript.
-					trace.event(DowngradeAttackSpec::downgrade_substitution_rejected)?;
+					trace.event(DOWNGRADE_SUBSTITUTION_REJECTED)?;
 				}
 				InjectionOutcome::Accepted => {
 					// A strong session that accepts a weak ClientHello is a

@@ -9,7 +9,13 @@
 #![allow(unexpected_cfgs)]
 #![cfg(all(feature = "std", feature = "testing-csp"))]
 
+use tightbeam::utils::urn::Urn;
 use tightbeam::{at_least, exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+
+const START: Urn<'static> = Urn::new("fuzz", "event:simple/start");
+const ACTION_A: Urn<'static> = Urn::new("fuzz", "event:simple/action-a");
+const ACTION_B: Urn<'static> = Urn::new("fuzz", "event:simple/action-b");
+const DONE: Urn<'static> = Urn::new("fuzz", "event:simple/done");
 
 tb_assert_spec! {
 	pub SimpleFuzzSpec,
@@ -17,10 +23,10 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(start, exactly!(1)),
-			(action_a, at_least!(0)),
-			(action_b, at_least!(0)),
-			(done, exactly!(1))
+			(START, exactly!(1)),
+			(ACTION_A, at_least!(0)),
+			(ACTION_B, at_least!(0)),
+			(DONE, exactly!(1))
 		]
 	},
 }
@@ -28,12 +34,12 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SimpleFuzzProc,
 	events {
-		observable { "start", "action_a", "action_b", "done" }
+		observable { START, ACTION_A, ACTION_B, DONE }
 		hidden { }
 	}
 	states {
-		S0 => { "start" => S1 },
-		S1 => { "action_a" => S1, "action_b" => S1, "done" => S2 }
+		S0 => { START => S1 },
+		S1 => { ACTION_A => S1, ACTION_B => S1, DONE => S2 }
 	}
 	terminal { S2 }
 }
@@ -52,8 +58,9 @@ tb_scenario! {
 
 			// Make assertions based on execution trace
 			for event in trace.oracle().trace() {
-				trace.event(event.0)?;
+				trace.event(*event)?;
 			}
+
 			Ok(())
 		}
 	}

@@ -6,6 +6,8 @@
 
 use std::borrow::Cow;
 
+use crate::utils::urn::Urn;
+
 /// Trait for type-safe process state identifiers
 ///
 /// Auto-implemented by `tb_gen_process_types!` macro or can be manually
@@ -47,16 +49,25 @@ pub trait ProcessState: Copy + core::fmt::Debug {
 /// # Example
 ///
 /// ```ignore
+/// use std::borrow::Cow;
+///
 /// use tightbeam::testing::ProcessEvent;
 ///
 /// #[derive(Debug, Clone, Copy)]
 /// struct MyEvent(&'static str);
 ///
 /// impl ProcessEvent for MyEvent {
-///     fn event_label(&self) -> &'static str { self.0 }
+///     fn event_label(&self) -> Cow<'static, str> { Cow::Borrowed(self.0) }
 /// }
 /// ```
-pub trait ProcessEvent: Copy + core::fmt::Debug {
-	/// Event label as used in CSP spec (e.g., "connect", "send")
-	fn event_label(&self) -> &'static str;
+pub trait ProcessEvent: Clone + core::fmt::Debug {
+	/// Event label as used in CSP spec; the full URN rendering for
+	/// URN-identified events so fault keys match emitted trace labels.
+	fn event_label(&self) -> Cow<'static, str>;
+}
+
+impl ProcessEvent for Urn<'static> {
+	fn event_label(&self) -> Cow<'static, str> {
+		Cow::Owned(self.to_string())
+	}
 }

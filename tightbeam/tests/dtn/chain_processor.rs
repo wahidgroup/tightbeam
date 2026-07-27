@@ -126,7 +126,7 @@ impl ChainProcessor {
 			}
 
 			// Add current frame to collection
-			collected_frames.push(current_frame.clone());
+			collected_frames.push(current_frame.to_owned());
 
 			// Move to previous frame using previous_frame hash
 			match current_frame.metadata.previous_frame.as_ref() {

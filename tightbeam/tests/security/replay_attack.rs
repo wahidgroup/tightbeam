@@ -23,6 +23,7 @@ use tightbeam::{
 	exactly, job, tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
@@ -30,16 +31,21 @@ use crate::security::common::{
 	expectation_failure, HandshakeBackendKind, InjectionOutcome, SecurityThreatHarness, BACKEND_COUNT_U32,
 };
 
+pub(crate) const REPLAY_ATTEMPT: Urn<'static> = Urn::new("test", "event:replay-attack/replay-attempt");
+pub(crate) const REPLAY_DETECTED: Urn<'static> = Urn::new("test", "event:replay-attack/replay-detected");
+pub(crate) const REPLAY_INIT_HANDSHAKE: Urn<'static> = Urn::new("test", "event:replay-attack/replay-initial-handshake");
+pub(crate) const REPLAY_REJECTED: Urn<'static> = Urn::new("test", "event:replay-attack/replay-rejected");
+
 tb_assert_spec! {
 	pub ReplayAttackSpec,
 	V(1,0,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(replay_initial_handshake, exactly!(BACKEND_COUNT_U32)),
-			(replay_attempt, exactly!(BACKEND_COUNT_U32)),
-			(replay_detected, exactly!(BACKEND_COUNT_U32)),
-			(replay_rejected, exactly!(BACKEND_COUNT_U32))
+			(REPLAY_INIT_HANDSHAKE, exactly!(BACKEND_COUNT_U32)),
+			(REPLAY_ATTEMPT, exactly!(BACKEND_COUNT_U32)),
+			(REPLAY_DETECTED, exactly!(BACKEND_COUNT_U32)),
+			(REPLAY_REJECTED, exactly!(BACKEND_COUNT_U32))
 		]
 	}
 }
@@ -48,32 +54,32 @@ tb_process_spec! {
 	pub ReplayAttackProcess,
 	events {
 		observable {
-			"replay_initial_handshake",
-			"replay_attempt",
-			"replay_detected",
-			"replay_rejected"
+
+			REPLAY_INIT_HANDSHAKE,
+			REPLAY_ATTEMPT,
+			REPLAY_DETECTED,
+			REPLAY_REJECTED,
+			SecurityThreatHarness::HARNESS_SPAWN_SESSION,
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS
 		}
-		hidden {
-			"harness_spawn_session",
-			"harness_spawn_ecies",
-			"harness_spawn_cms"
-		}
+		hidden { }
 	}
 	states {
-		Idle => { "harness_spawn_session" => Spawning },
+		Idle => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => Spawning },
 		Spawning => {
-			"harness_spawn_ecies" => SessionReady,
-			"harness_spawn_cms" => SessionReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => SessionReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => SessionReady
 		},
-		SessionReady => { "replay_initial_handshake" => Established },
-		Established => { "harness_spawn_session" => SpawningAttack },
+		SessionReady => { REPLAY_INIT_HANDSHAKE => Established },
+		Established => { SecurityThreatHarness::HARNESS_SPAWN_SESSION => SpawningAttack },
 		SpawningAttack => {
-			"harness_spawn_ecies" => AttackSessionReady,
-			"harness_spawn_cms" => AttackSessionReady
+			SecurityThreatHarness::HARNESS_SPAWN_ECIES => AttackSessionReady,
+			SecurityThreatHarness::HARNESS_SPAWN_CMS => AttackSessionReady
 		},
-		AttackSessionReady => { "replay_attempt" => AttackObserved },
-		AttackObserved => { "replay_detected" => ReplaySuppressed },
-		ReplaySuppressed => { "replay_rejected" => Idle }
+		AttackSessionReady => { REPLAY_ATTEMPT => AttackObserved },
+		AttackObserved => { REPLAY_DETECTED => ReplaySuppressed },
+		ReplaySuppressed => { REPLAY_REJECTED => Idle }
 	}
 	terminal { Idle }
 	annotations { description: "Replay attack detection state machine" }
@@ -101,7 +107,7 @@ job! {
 			let mut session = harness.spawn(kind);
 			let captured = session.capture_full().await?;
 
-			trace.event(ReplayAttackSpec::replay_initial_handshake)?;
+			trace.event(REPLAY_INIT_HANDSHAKE)?;
 
 			// Get the final client message (replay target for all backends)
 			let target = captured
@@ -111,12 +117,12 @@ job! {
 			// Attempt replay on a fresh session
 			let mut attack_session = harness.spawn(captured.kind);
 
-			trace.event(ReplayAttackSpec::replay_attempt)?;
+			trace.event(REPLAY_ATTEMPT)?;
 
 			match attack_session.inject_at_step(target.step, &target.payload).await? {
 				InjectionOutcome::Rejected(_) => {
-					trace.event(ReplayAttackSpec::replay_detected)?;
-					trace.event(ReplayAttackSpec::replay_rejected)?;
+					trace.event(REPLAY_DETECTED)?;
+					trace.event(REPLAY_REJECTED)?;
 				}
 				InjectionOutcome::Accepted => {
 					return Err(expectation_failure("replay was accepted"));

@@ -383,8 +383,7 @@ impl CertificateTrustStore {
 	/// 4. Issuer/subject name chaining ([RFC 5280 §6.1.3(a)(4)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
 	/// 5. Issuer `basicConstraints.cA` / `keyUsage.keyCertSign` ([RFC 5280 §6.1.4(k),(n)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4))
 	/// 6. Cryptographic signature verification ([RFC 5280 §6.1.3(a)(1)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
-	/// 7. Revocation via the configured [`RevocationChecker`]
-	///    ([RFC 5280 §6.1.3(a)(3)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
+	/// 7. Revocation via the configured [`RevocationChecker`] ([RFC 5280 §6.1.3(a)(3)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.3))
 	/// 8. `pathLenConstraint` ([RFC 5280 §6.1.4(l),(m)](https://datatracker.ietf.org/doc/html/rfc5280#section-6.1.4))
 	///
 	/// Deliberately stricter than RFC 5280 in five fail-closed ways. TightBeam
@@ -734,12 +733,12 @@ mod tests {
 		let builder = match certs {
 			StoreCerts::None => builder,
 			StoreCerts::Root => {
-				let certificate = chain.root.clone();
+				let certificate = chain.root.to_owned();
 				builder.with_certificate(certificate)?
 			}
 			StoreCerts::RootAndIntermediate => {
-				let root = chain.root.clone();
-				let intermediate = chain.intermediate.clone();
+				let root = chain.root.to_owned();
+				let intermediate = chain.intermediate.to_owned();
 				builder.with_certificate(root)?.with_certificate(intermediate)?
 			}
 		};
@@ -770,7 +769,7 @@ mod tests {
 	#[test]
 	fn is_trusted_matches_fingerprint() -> TestResult {
 		let cert = create_test_certificate(&create_test_signing_key());
-		let certificate = cert.clone();
+		let certificate = cert.to_owned();
 		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 		assert!(store.is_trusted(&cert));
 		assert!(!store.is_trusted(&create_test_certificate(&SigningKey::from_bytes(&[2u8; 32].into())?)));
@@ -850,7 +849,7 @@ mod tests {
 
 		for (store_certs, chain_slice, should_succeed) in cases {
 			let store = build_store(&chain, *store_certs)?;
-			let chain_vec: Vec<_> = chain_slice.iter().map(|c| (*c).clone()).collect();
+			let chain_vec: Vec<_> = chain_slice.iter().map(|c| (*c).to_owned()).collect();
 
 			let result: Result<(), CertificateValidationError> = store.verify_chain(&chain_vec);
 			assert_eq!(
@@ -881,10 +880,10 @@ mod tests {
 		for (ca, key_cert_sign, path_len, expected) in ISSUER_CONSTRAINT_CASES {
 			let chain = create_test_certificate_chain()?;
 
-			let mut root = chain.root.clone();
+			let mut root = chain.root.to_owned();
 			root.tbs_certificate.extensions = Some(ca_extensions(*ca, *key_cert_sign, *path_len));
 
-			let certificate = root.clone();
+			let certificate = root.to_owned();
 			let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 			let result = store.verify_chain(&[root, chain.intermediate, chain.leaf]);
 			assert!(matches!(result, Err(ref e) if core::mem::discriminant(e) == core::mem::discriminant(expected)));
@@ -897,7 +896,7 @@ mod tests {
 	fn evaluate_enforces_path_len_constraint() -> TestResult {
 		let chain = create_test_certificate_chain()?;
 
-		let mut root = chain.root.clone();
+		let mut root = chain.root.to_owned();
 		root.tbs_certificate.extensions = Some(ca_extensions(true, true, Some(0)));
 
 		let store = TestBuilder::from(Secp256k1Policy)
@@ -920,7 +919,7 @@ mod tests {
 		crate::x509::ext::Extension {
 			extn_id: crate::der::oid::ObjectIdentifier::new_unwrap(oid),
 			critical,
-			extn_value: crate::der::asn1::OctetString::new(Vec::new()).unwrap(),
+			extn_value: crate::der::asn1::OctetString::new(Vec::new()).expect("empty payload fits an OCTET STRING"),
 		}
 	}
 
@@ -956,7 +955,7 @@ mod tests {
 	fn verify_chain_rejects_unknown_critical_extension() -> TestResult {
 		let chain = create_test_certificate_chain()?;
 
-		let mut leaf = chain.leaf.clone();
+		let mut leaf = chain.leaf.to_owned();
 		leaf.tbs_certificate.extensions = Some(vec![opaque_extension("2.5.29.30", true)]);
 
 		let store = build_store(&chain, StoreCerts::Root)?;
@@ -1013,7 +1012,7 @@ mod tests {
 		chain: &TestCertificateChain,
 		revocation: StaticRevocationList,
 	) -> Result<CertificateTrustStore, CertificateValidationError> {
-		let root = chain.root.clone();
+		let root = chain.root.to_owned();
 		Ok(TestBuilder::from(Secp256k1Policy)
 			.with_revocation_checker(revocation)
 			.with_certificate(root)?
@@ -1043,7 +1042,7 @@ mod tests {
 	#[test]
 	fn verify_chain_rejects_leaf_revoked_by_serial() -> TestResult {
 		let chain = create_test_certificate_chain()?;
-		let issuer = chain.leaf.tbs_certificate.issuer.clone();
+		let issuer = chain.leaf.tbs_certificate.issuer.to_owned();
 		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
 		let revocation = StaticRevocationList::default().with_serial(&issuer, serial)?;
 
@@ -1056,7 +1055,7 @@ mod tests {
 	#[test]
 	fn serial_revocation_is_scoped_to_issuer() -> TestResult {
 		let chain = create_test_certificate_chain()?;
-		let other_issuer = chain.leaf.tbs_certificate.subject.clone();
+		let other_issuer = chain.leaf.tbs_certificate.subject.to_owned();
 		let serial = chain.leaf.tbs_certificate.serial_number.as_bytes().to_vec();
 		let revocation = StaticRevocationList::default().with_serial(&other_issuer, serial)?;
 
@@ -1085,7 +1084,7 @@ mod tests {
 	fn rejects_algorithm_identifier_mismatch() -> TestResult {
 		let chain = create_test_certificate_chain()?;
 
-		let mut leaf = chain.leaf.clone();
+		let mut leaf = chain.leaf.to_owned();
 		leaf.signature_algorithm.oid = crate::oids::SIGNER_ECDSA_WITH_SHA256;
 
 		// Both the recursive `evaluate` walk and `verify_chain` must reject it.
@@ -1109,7 +1108,7 @@ mod tests {
 	fn find_by_signer_info_skid() -> TestResult {
 		let key = create_test_signing_key();
 		let cert = create_test_certificate(&key);
-		let certificate = cert.clone();
+		let certificate = cert.to_owned();
 		let store = TestBuilder::from(Secp256k1Policy).with_certificate(certificate)?.build();
 
 		// Create signer info via Signatory trait (uses SHA3-256 for SKID)

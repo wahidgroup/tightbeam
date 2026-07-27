@@ -13,45 +13,18 @@ use crate::crypto::kdf::KdfFunction;
 use crate::crypto::profiles::CryptoProvider;
 use crate::transport::handshake::error::HandshakeError;
 use crate::zeroize::Zeroizing;
+use crate::ZeroizingBytes;
 
-/// Multi-input HKDF combining multiple secrets with length prefixing.
+/// Multi-input HKDF: length-prefixed concatenation of secrets, then provider KDF.
 ///
-/// Concatenates all input secrets with 4-byte big-endian length prefixes,
-/// then derives a `key_size`-byte key using the provider's KDF.
-///
-/// # Length Prefixing
-/// Each input is prefixed with its length as `u32` in big-endian format.
-/// This prevents ambiguity in concatenation (e.g., "ab" + "cd" vs "abc" + "d").
-///
-/// # Parameters
-/// - `inputs`: Array of input secret slices to combine
-/// - `salt`: Salt bytes for KDF (minimum 16 bytes recommended)
-/// - `info`: Application-specific context string
-/// - `key_size`: Desired output key length in bytes (e.g. KEK size from the
-///   negotiated key-wrap algorithm)
-///
-/// # Returns
-/// Zeroizing vector containing the derived key
-///
-/// # Example
-/// ```rust,ignore
-/// let dh_secret = [0x42u8; 32];
-/// let kem_secret = [0x99u8; 32];
-/// let salt = [0xAAu8; 32];
-///
-/// let combined = multi_input_kdf::<DefaultCryptoProvider>(
-///     &[&dh_secret, &kem_secret],
-///     &salt,
-///     b"MyApp-PQXDH-v1",
-///     32,
-/// )?;
-/// ```
+/// Each input is prefixed with its length as big-endian `u32`, preventing
+/// concatenation ambiguity (e.g. "ab"+"cd" vs "abc"+"d").
 pub fn multi_input_kdf<P: CryptoProvider>(
 	inputs: &[&[u8]],
 	salt: &[u8],
 	info: &[u8],
 	key_size: usize,
-) -> Result<Zeroizing<Vec<u8>>, HandshakeError> {
+) -> Result<ZeroizingBytes, HandshakeError> {
 	// Concatenate all inputs with length prefixes. The buffer holds secret
 	// material, so it is zeroized on drop.
 	let mut combined = Zeroizing::new(Vec::new());
@@ -64,54 +37,16 @@ pub fn multi_input_kdf<P: CryptoProvider>(
 	Ok(P::Kdf::derive_dynamic_key(&combined, info, Some(salt), key_size)?)
 }
 
-/// Chain multiple KDF operations where each output becomes the next salt.
-///
-/// UNSTABLE: no caller in the crate yet; gated behind `unstable-pqxdh`.
-///
-/// Implements key derivation chaining as used in protocols like PQXDH:
-/// ```text
-/// KDF₁(input₁, salt₀, info₁) -> output₁
-/// KDF₂(input₂, output₁, info₂) -> output₂
-/// ...
-/// ```
-///
-/// Each stage uses the previous stage's output as salt, creating a
-/// dependency chain that incorporates all prior inputs.
-///
-/// # Parameters
-/// - `stages`: Array of (input, info) pairs for each KDF stage
-/// - `initial_salt`: Initial salt for first KDF stage
-///
-/// # Returns
-/// Final derived key (32 bytes), zeroized on drop
-///
-/// # Example
-/// ```rust,ignore
-/// let dh1 = [0x11u8; 32];
-/// let dh2 = [0x22u8; 32];
-/// let dh3 = [0x33u8; 32];
-/// let kem_ss = [0x44u8; 32];
-///
-/// let final_key = kdf_chain::<DefaultCryptoProvider>(
-///     &[
-///         (&dh1, b"DH1"),
-///         (&dh2, b"DH2"),
-///         (&dh3, b"DH3"),
-///         (&kem_ss, b"KEM"),
-///     ],
-///     b"InitialSalt"
-/// )?;
-/// ```
-#[cfg(feature = "unstable-pqxdh")]
+/// Chained KDF: each stage's output becomes the next stage's salt (PQXDH-style).
 pub fn kdf_chain<P: CryptoProvider>(
 	stages: &[(&[u8], &[u8])],
 	initial_salt: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, HandshakeError> {
+) -> Result<ZeroizingBytes, HandshakeError> {
 	if stages.is_empty() {
 		return Ok(Zeroizing::new(Vec::new()));
 	}
 
-	// Each intermediate output is key material; keep every stage in a
+	// Each intermediate output is key material. Keep every stage in a
 	// Zeroizing buffer so nothing lingers in the allocator.
 	let mut current = Zeroizing::new(initial_salt.to_vec());
 	for (input, info) in stages {
@@ -151,7 +86,6 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
-	#[cfg(feature = "unstable-pqxdh")]
 	#[test]
 	fn test_kdf_chain() -> Result<(), Box<dyn core::error::Error>> {
 		let input1 = [0x11u8; 32];
@@ -167,7 +101,6 @@ mod tests {
 		Ok(())
 	}
 
-	#[cfg(feature = "unstable-pqxdh")]
 	#[test]
 	fn test_kdf_chain_single_stage() {
 		let input = [0x42u8; 32];

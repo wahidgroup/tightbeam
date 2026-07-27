@@ -30,12 +30,32 @@ use tightbeam::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 		GenericClient,
 	},
-	utils::BasisPoints,
+	utils::{urn::Urn, BasisPoints},
 	Beamable, Frame, TightBeamError, Version,
 };
 
 use crate::common::security::pinning_trust_store;
 use crate::common::x509::create_test_cert_with_key;
+
+pub(crate) const BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
+	Urn::new("test", "event:hive/backpressure-heartbeat-heartbeat-shape");
+pub(crate) const BACKPRESSURE_MANAGE_MANAGE_SHAPE: Urn<'static> =
+	Urn::new("test", "event:hive/backpressure-manage-manage-shape");
+pub(crate) const DRAINING_MANAGE_MANAGE_SHAPE: Urn<'static> =
+	Urn::new("test", "event:hive/draining-manage-manage-shape");
+pub(crate) const FIRST_SPAWN_FORBIDDEN: Urn<'static> = Urn::new("test", "event:hive/first-spawn-forbidden");
+pub(crate) const HIVE_ESTABLISHED: Urn<'static> = Urn::new("test", "event:hive/hive-established");
+pub(crate) const HIVE_STARTED: Urn<'static> = Urn::new("test", "event:hive/hive-started");
+pub(crate) const OPEN_BREAKER_HEARTBEAT_SHAPE: Urn<'static> =
+	Urn::new("test", "event:hive/open-breaker-heartbeat-shape");
+pub(crate) const RETRY_SPAWN_ACCEPTED: Urn<'static> = Urn::new("test", "event:hive/retry-spawn-accepted");
+pub(crate) const SERVLET_RECEIVE: Urn<'static> = Urn::new("test", "event:hive/servlet-receive");
+pub(crate) const SERVLET_RESPOND: Urn<'static> = Urn::new("test", "event:hive/servlet-respond");
+pub(crate) const SIGNED_HEARTBEAT_ACCEPTED: Urn<'static> = Urn::new("test", "event:hive/signed-heartbeat-accepted");
+pub(crate) const UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE: Urn<'static> =
+	Urn::new("test", "event:hive/unsigned-heartbeat-heartbeat-shape");
+pub(crate) const UNSIGNED_MANAGE_MANAGE_SHAPE: Urn<'static> =
+	Urn::new("test", "event:hive/unsigned-manage-manage-shape");
 
 // ============================================================================
 // Test Messages
@@ -60,11 +80,11 @@ servlet! {
 	protocol: TokioListener,
 	handle: |req, frame, ctx| async move {
 		let trace = ctx.trace();
-		trace.event("servlet_receive")?;
-		trace.event("servlet_respond")?;
+		trace.event(SERVLET_RECEIVE)?;
+		trace.event(SERVLET_RESPOND)?;
 
 		Ok(Some(compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: &frame.metadata.id,
 				message: HiveTestResponse { doubled: req.value * 2 }
 		}?))
 	}
@@ -89,8 +109,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(hive_started, exactly!(1)),
-			(hive_established, exactly!(1))
+			(HIVE_STARTED, exactly!(1)),
+			(HIVE_ESTABLISHED, exactly!(1))
 		]
 	}
 }
@@ -105,14 +125,14 @@ async fn establish_registered_hive(
 	trace: &TraceCollector,
 	conf: Option<HiveConf>,
 ) -> Result<HiveX509Test, TightBeamError> {
-	trace.event(HiveEstablishSpec::hive_started)?;
+	trace.event(HIVE_STARTED)?;
 
 	let servlet = HiveTestServlet::start(Arc::new(TraceCollector::new()), None).await?;
 	let mut hive = HiveX509Test::new(conf)?;
 	hive.register("test_servlet", servlet, |t| HiveTestServlet::start(t, None))?;
 	hive.establish(Arc::new(TraceCollector::new())).await?;
 
-	trace.event(HiveEstablishSpec::hive_established)?;
+	trace.event(HIVE_ESTABLISHED)?;
 	Ok(hive)
 }
 
@@ -290,21 +310,21 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(unsigned_heartbeat_heartbeat_shape, exactly!(1)),
-			(unsigned_manage_manage_shape, exactly!(1)),
-			(signed_heartbeat_accepted, exactly!(1)),
-			(open_breaker_heartbeat_shape, exactly!(1))
+			(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1)),
+			(UNSIGNED_MANAGE_MANAGE_SHAPE, exactly!(1)),
+			(SIGNED_HEARTBEAT_ACCEPTED, exactly!(1)),
+			(OPEN_BREAKER_HEARTBEAT_SHAPE, exactly!(1))
 		]
 	},
 	V(1,1,0): {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(unsigned_heartbeat_heartbeat_shape, exactly!(1)),
-			(unsigned_manage_manage_shape, exactly!(1)),
-			(signed_heartbeat_accepted, exactly!(1)),
-			(draining_manage_manage_shape, exactly!(1)),
-			(open_breaker_heartbeat_shape, exactly!(1))
+			(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1)),
+			(UNSIGNED_MANAGE_MANAGE_SHAPE, exactly!(1)),
+			(SIGNED_HEARTBEAT_ACCEPTED, exactly!(1)),
+			(DRAINING_MANAGE_MANAGE_SHAPE, exactly!(1)),
+			(OPEN_BREAKER_HEARTBEAT_SHAPE, exactly!(1))
 		]
 	}
 }
@@ -337,21 +357,21 @@ tb_scenario! {
 			let response = emit_command(&mut client, unsigned_heartbeat).await?;
 			assert_heartbeat_shape(&response, TransitStatus::Unauthenticated, true);
 
-			trace.event(HiveGateShapeSpec::unsigned_heartbeat_heartbeat_shape)?;
+			trace.event(UNSIGNED_HEARTBEAT_HEARTBEAT_SHAPE)?;
 
 			// Unsigned manage: manage CHOICE (security verdict, no drain probe)
 			let unsigned_stop = stop_command_frame(b"manage-unsigned")?;
 			let response = emit_command(&mut client, unsigned_stop).await?;
 			assert_manage_stop_shape(&response, TransitStatus::Unauthenticated);
 
-			trace.event(HiveGateShapeSpec::unsigned_manage_manage_shape)?;
+			trace.event(UNSIGNED_MANAGE_MANAGE_SHAPE)?;
 
 			// Signed heartbeat: accepted end-to-end
 			let signed_heartbeat = signed_heartbeat_frame(&signer.provider, b"hb-signed").await?;
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			assert_heartbeat_shape(&response, TransitStatus::Ok, false);
 
-			trace.event(HiveGateShapeSpec::signed_heartbeat_accepted)?;
+			trace.event(SIGNED_HEARTBEAT_ACCEPTED)?;
 
 			// A signed manage command during drain must come back
 			// Unavailable in the manage CHOICE.
@@ -361,7 +381,7 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_stop).await?;
 			assert_manage_stop_shape(&response, TransitStatus::Unavailable);
 
-			trace.event(HiveGateShapeSpec::draining_manage_manage_shape)?;
+			trace.event(DRAINING_MANAGE_MANAGE_SHAPE)?;
 
 			// Trip the breaker (threshold 1): a trusted signer identity with a
 			// signature transplanted from a different frame is the one failure
@@ -371,7 +391,7 @@ tb_scenario! {
 			let donor = donor_heartbeat.sign_with_provider::<Sha3_256, _>(&signer.provider).await?;
 
 			let mut forged = command_frame(b"hb-forged", heartbeat_command(now.saturating_add(1)))?;
-			forged.nonrepudiation = donor.nonrepudiation.clone();
+			forged.nonrepudiation = donor.nonrepudiation.to_owned();
 
 			let response = emit_command(&mut client, forged).await?;
 			assert_heartbeat_shape(&response, TransitStatus::PermissionDenied, false);
@@ -383,7 +403,7 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			assert_heartbeat_shape(&response, TransitStatus::PermissionDenied, true);
 
-			trace.event(HiveGateShapeSpec::open_breaker_heartbeat_shape)?;
+			trace.event(OPEN_BREAKER_HEARTBEAT_SHAPE)?;
 
 			hive.stop();
 
@@ -398,8 +418,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(backpressure_manage_manage_shape, exactly!(1)),
-			(backpressure_heartbeat_heartbeat_shape, exactly!(1))
+			(BACKPRESSURE_MANAGE_MANAGE_SHAPE, exactly!(1)),
+			(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE, exactly!(1))
 		]
 	}
 }
@@ -431,7 +451,7 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_stop).await?;
 			assert_manage_stop_shape(&response, TransitStatus::ResourceExhausted);
 
-			trace.event(HiveBackpressureShapeSpec::backpressure_manage_manage_shape)?;
+			trace.event(BACKPRESSURE_MANAGE_MANAGE_SHAPE)?;
 
 			// Signed heartbeat is exempt from the gate: heartbeat CHOICE
 			// with real capacity data (ResourceExhausted status reflects saturation).
@@ -439,7 +459,7 @@ tb_scenario! {
 			let response = emit_command(&mut client, signed_heartbeat).await?;
 			assert_heartbeat_shape(&response, TransitStatus::ResourceExhausted, false);
 
-			trace.event(HiveBackpressureShapeSpec::backpressure_heartbeat_heartbeat_shape)?;
+			trace.event(BACKPRESSURE_HEARTBEAT_HEARTBEAT_SHAPE)?;
 
 			hive.stop();
 
@@ -473,8 +493,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(first_spawn_forbidden, exactly!(1)),
-			(retry_spawn_accepted, exactly!(1))
+			(FIRST_SPAWN_FORBIDDEN, exactly!(1)),
+			(RETRY_SPAWN_ACCEPTED, exactly!(1))
 		]
 	}
 }
@@ -511,15 +531,15 @@ tb_scenario! {
 		client: |HiveEnv { trace, context: signer, hive }| async move {
 			let mut client = connect_hive(&hive).await?;
 			let signed = signed_spawn_frame(&signer.provider, b"spawn-retry", b"flaky").await?;
-			let replay = signed.clone();
+			let replay = signed.to_owned();
 
 			let first = emit_command(&mut client, signed).await?;
 			assert_manage_spawn_shape(&first, TransitStatus::PermissionDenied);
-			trace.event(HiveSpawnRetrySpec::first_spawn_forbidden)?;
+			trace.event(FIRST_SPAWN_FORBIDDEN)?;
 
 			let second = emit_command(&mut client, replay).await?;
 			assert_manage_spawn_shape(&second, TransitStatus::Ok);
-			trace.event(HiveSpawnRetrySpec::retry_spawn_accepted)?;
+			trace.event(RETRY_SPAWN_ACCEPTED)?;
 
 			hive.stop();
 			Ok(())

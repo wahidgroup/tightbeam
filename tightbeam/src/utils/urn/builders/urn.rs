@@ -176,33 +176,19 @@ impl<'a> UrnBuilder<'a> {
 
 		Urn::validate_nid(nid_ref)?;
 
-		// Handle Spec case FIRST while self is still intact
-		if matches!(self.nss_mode, NssMode::Spec(_)) {
-			// Extract the closure by replacing with Unset
-			let builder_fn = match core::mem::replace(&mut self.nss_mode, NssMode::Unset) {
-				NssMode::Spec(f) => f,
-				_ => unreachable!(),
-			};
-
-			let nss = builder_fn(&mut self)?;
-			let nid = self.nid.ok_or(UrnValidationError::RequiredFieldMissing("nid"))?;
-			return Ok(Urn { nid, nss });
-		}
-
-		// For other modes, extract fields and build NSS
-		let nss_mode = self.nss_mode;
-		let components = self.components;
-		let nid = self.nid;
-
-		let nss = match nss_mode {
+		// Take the mode out so the Spec closure can borrow the builder,
+		// and match exhaustively: no mode leaves an unhandled case.
+		let nss = match core::mem::replace(&mut self.nss_mode, NssMode::Unset) {
+			NssMode::Spec(builder_fn) => builder_fn(&mut self)?,
+			NssMode::Direct(nss) => nss,
 			NssMode::Unset => {
 				// Collect and sort keys for deterministic ordering (important for HashMap)
-				let mut keys: Vec<&'static str> = components.keys().copied().collect();
+				let mut keys: Vec<&'static str> = self.components.keys().copied().collect();
 				keys.sort();
 
 				let mut nss_parts = Vec::new();
 				for key in keys {
-					if let Some(value) = components.get(key) {
+					if let Some(value) = self.components.get(key) {
 						nss_parts.push(value.as_ref());
 					}
 				}
@@ -213,11 +199,9 @@ impl<'a> UrnBuilder<'a> {
 
 				nss_parts.join(":").into()
 			}
-			NssMode::Direct(nss) => nss,
-			NssMode::Spec(_) => unreachable!("Spec case handled above"),
 		};
 
-		let nid = nid.ok_or(UrnValidationError::RequiredFieldMissing("nid"))?;
+		let nid = self.nid.ok_or(UrnValidationError::RequiredFieldMissing("nid"))?;
 		Ok(Urn { nid, nss })
 	}
 }

@@ -9,16 +9,14 @@
 pub mod kdf;
 pub mod transcript;
 
-/// UNSTABLE: PQXDH prekey structures; no orchestrator consumes them yet.
+/// UNSTABLE: PQXDH prekey structures. No orchestrator consumes them yet.
 /// Gated behind `unstable-pqxdh` until an end-to-end protocol exists.
 #[cfg(feature = "unstable-pqxdh")]
 #[doc(hidden)]
 pub mod prekeys;
 
-pub use kdf::multi_input_kdf;
+pub use kdf::{kdf_chain, multi_input_kdf};
 pub use transcript::transcript_hash;
 
-#[cfg(feature = "unstable-pqxdh")]
-pub use kdf::kdf_chain;
 #[cfg(feature = "unstable-pqxdh")]
 pub use prekeys::{PrekeyBundle, PrekeyIdentifiers, PrekeyInitialMessage};

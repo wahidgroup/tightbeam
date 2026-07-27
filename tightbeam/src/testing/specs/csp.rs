@@ -25,6 +25,7 @@ use crate::der::{Decode, DecodeValue, EncodeValue, Tag, Tagged};
 use crate::der::{Header, Length, Reader, Writer};
 use crate::testing::assertions::AssertionLabel;
 use crate::trace::ConsumedTrace;
+use crate::utils::urn::Urn;
 
 #[cfg(feature = "testing-schedulability")]
 use crate::testing::schedulability::{SchedulabilityError, SchedulerType, TaskSet};
@@ -71,12 +72,41 @@ impl fmt::Display for State {
 /// Represents a named event in a CSP process specification. Also used by
 /// timing verification to identify events with timing constraints (WCET,
 /// deadlines, jitter) and in violation reports.
+///
+/// Event identity is the full URN rendering (`urn:<nid>:<nss>`): spec
+/// surfaces convert from [`Urn`] so alphabets never collide across NIDs.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Event(pub &'static str);
 
 impl fmt::Display for Event {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "{}", self.0)
+	}
+}
+
+impl From<&Event> for Event {
+	fn from(event: &Event) -> Self {
+		*event
+	}
+}
+
+// CSP event identity is already the full URN rendering, so replaying a
+// process event into a trace preserves URN-keyed labels.
+impl crate::trace::IntoEventLabel for Event {
+	fn into_label(self) -> Cow<'static, str> {
+		Cow::Borrowed(self.0)
+	}
+}
+
+impl From<Urn<'_>> for Event {
+	fn from(urn: Urn<'_>) -> Self {
+		Event(intern(urn.to_string()))
+	}
+}
+
+impl From<&Urn<'_>> for Event {
+	fn from(urn: &Urn<'_>) -> Self {
+		Event(intern(urn.to_string()))
 	}
 }
 
@@ -443,23 +473,26 @@ impl Process {
 	/// The validator tracks the *set* of states the process may occupy
 	/// (subset construction), so all branches of a nondeterministic choice
 	/// are followed simultaneously. Multiple targets for a `(state, event)`
-	/// pair are legal at states registered via
-	/// [`ProcessBuilder::add_choice`]; multiple targets at an *undeclared*
-	/// state are reported as [`CspViolation::NondeterministicChoice`].
+	/// pair are legal at states registered via [`ProcessBuilder::add_choice`].
+	/// Multiple targets at an *undeclared* state are reported as
+	/// [`CspViolation::NondeterministicChoice`].
 	pub fn validate_trace(&self, trace: &ConsumedTrace) -> CspValidationResult {
 		let mut violations = Vec::new();
 		let mut current_states = vec![self.initial];
 
-		// Map assertion labels to events
+		// Map assertion labels onto this process's alphabet by exact URN
+		// identity. Out-of-alphabet labels are ignored.
 		let events: Vec<Event> = trace
 			.assertions
 			.iter()
-			.map(|assertion| {
-				let AssertionLabel::Custom(s) = &assertion.label;
-				match s {
-					Cow::Borrowed(static_str) => Event(static_str),
-					Cow::Owned(owned) => Event(intern(owned.as_str())),
-				}
+			.filter_map(|assertion| {
+				let AssertionLabel::Custom(recorded) = &assertion.label;
+				let recorded = recorded.as_ref();
+				self.observable
+					.iter()
+					.chain(self.hidden.iter())
+					.find(|event| recorded == event.0)
+					.copied()
 			})
 			.collect();
 
@@ -467,8 +500,13 @@ impl Process {
 			let closure = self.tau_closure(&current_states);
 			let action = Action { event: *event, alphabet: Alphabet::Observable };
 
-			// Termination check: every state the process may occupy is STOP
-			if closure.iter().all(|state| self.is_terminal(*state)) {
+			// Termination check: every candidate is a true STOP - terminal
+			// with no enabled actions. Accepting states that still offer
+			// transitions (cyclic `terminal { Idle }` models) stay live.
+			if closure
+				.iter()
+				.all(|state| self.is_terminal(*state) && self.enabled(*state).is_empty())
+			{
 				if let Some(terminal_state) = closure.first().copied() {
 					violations.push(CspViolation::AfterTermination { event: *event, terminal_state });
 				}
@@ -642,20 +680,20 @@ impl ProcessBuilder {
 		self
 	}
 
-	pub fn add_observable(mut self, event: &'static str) -> Self {
-		self.observable.insert(Event(event));
+	pub fn add_observable(mut self, event: impl Into<Event>) -> Self {
+		self.observable.insert(event.into());
 		self
 	}
 
-	pub fn add_hidden(mut self, event: &'static str) -> Self {
-		self.hidden.insert(Event(event));
+	pub fn add_hidden(mut self, event: impl Into<Event>) -> Self {
+		self.hidden.insert(event.into());
 		self
 	}
 
-	pub fn add_transition(mut self, from: State, event: &'static str, to: State) -> Self {
+	pub fn add_transition(mut self, from: State, event: impl Into<Event>, to: State) -> Self {
 		self.states.insert(from);
 		self.states.insert(to);
-		self.transitions.add(from, Event(event), to);
+		self.transitions.add(from, event.into(), to);
 		self
 	}
 
@@ -752,6 +790,7 @@ mod tests {
 	use crate::transport::tcp::TightBeamSocketAddr;
 	use crate::transport::MessageEmitter;
 	use crate::transport::Protocol;
+	use crate::utils::urn::Urn;
 
 	#[cfg(all(feature = "tcp", feature = "tokio"))]
 	use crate::{exactly, servlet, tb_assert_spec, tb_process_spec, tb_scenario};
@@ -760,12 +799,12 @@ mod tests {
 	fn builder_creates_valid_process() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("TestProc")
 			.initial_state(State("S0"))
-			.add_observable("start")
-			.add_observable("send")
-			.add_hidden("prepare")
-			.add_transition(State("S0"), "start", State("S1"))
-			.add_transition(State("S1"), "prepare", State("S2"))
-			.add_transition(State("S2"), "send", State("S3"))
+			.add_observable(Event("start"))
+			.add_observable(Event("send"))
+			.add_hidden(Event("prepare"))
+			.add_transition(State("S0"), Event("start"), State("S1"))
+			.add_transition(State("S1"), Event("prepare"), State("S2"))
+			.add_transition(State("S2"), Event("send"), State("S3"))
 			.add_terminal(State("S3"))
 			.description("Simple test process")
 			.build()?;
@@ -783,8 +822,8 @@ mod tests {
 	fn step_executes_transitions() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("StepTest")
 			.initial_state(State("S0"))
-			.add_observable("go")
-			.add_transition(State("S0"), "go", State("S1"))
+			.add_observable(Event("go"))
+			.add_transition(State("S0"), Event("go"), State("S1"))
 			.add_terminal(State("S1"))
 			.build()?;
 
@@ -802,11 +841,11 @@ mod tests {
 	fn enabled_returns_possible_actions() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("EnabledTest")
 			.initial_state(State("S0"))
-			.add_observable("a")
-			.add_observable("b")
-			.add_hidden("tau")
-			.add_transition(State("S0"), "a", State("S1"))
-			.add_transition(State("S0"), "tau", State("S2"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_hidden(Event("tau"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S0"), Event("tau"), State("S2"))
 			.add_terminal(State("S1"))
 			.add_terminal(State("S2"))
 			.build()?;
@@ -825,9 +864,9 @@ mod tests {
 	fn nondeterministic_choice() -> Result<(), Box<dyn core::error::Error>> {
 		let proc = Process::builder("ChoiceTest")
 			.initial_state(State("S0"))
-			.add_observable("choice")
-			.add_transition(State("S0"), "choice", State("S1"))
-			.add_transition(State("S0"), "choice", State("S2"))
+			.add_observable(Event("choice"))
+			.add_transition(State("S0"), Event("choice"), State("S1"))
+			.add_transition(State("S0"), Event("choice"), State("S2"))
 			.add_choice(State("S0"))
 			.add_terminal(State("S1"))
 			.add_terminal(State("S2"))
@@ -860,13 +899,13 @@ mod tests {
 	fn branching_process(declared_choice: bool) -> Result<Process, ProcessBuildError> {
 		let builder = Process::builder("Branching")
 			.initial_state(State("S0"))
-			.add_observable("go")
-			.add_observable("x")
-			.add_observable("y")
-			.add_transition(State("S0"), "go", State("S1"))
-			.add_transition(State("S0"), "go", State("S2"))
-			.add_transition(State("S1"), "x", State("T"))
-			.add_transition(State("S2"), "y", State("T"))
+			.add_observable(Event("go"))
+			.add_observable(Event("x"))
+			.add_observable(Event("y"))
+			.add_transition(State("S0"), Event("go"), State("S1"))
+			.add_transition(State("S0"), Event("go"), State("S2"))
+			.add_transition(State("S1"), Event("x"), State("T"))
+			.add_transition(State("S2"), Event("y"), State("T"))
 			.add_terminal(State("T"));
 
 		if declared_choice {
@@ -892,10 +931,10 @@ mod tests {
 	fn tau_transitions_traversed_silently() -> Result<(), ProcessBuildError> {
 		let proc = Process::builder("TauBridge")
 			.initial_state(State("S0"))
-			.add_hidden("tau")
-			.add_observable("a")
-			.add_transition(State("S0"), "tau", State("S1"))
-			.add_transition(State("S1"), "a", State("T"))
+			.add_hidden(Event("tau"))
+			.add_observable(Event("a"))
+			.add_transition(State("S0"), Event("tau"), State("S1"))
+			.add_transition(State("S1"), Event("a"), State("T"))
 			.add_terminal(State("T"))
 			.build()?;
 
@@ -909,14 +948,14 @@ mod tests {
 	fn tau_chain_traversed_across_multiple_hidden_steps() -> Result<(), ProcessBuildError> {
 		let proc = Process::builder("TauChain")
 			.initial_state(State("S0"))
-			.add_hidden("tau_1")
-			.add_hidden("tau_2")
-			.add_observable("a")
-			.add_observable("b")
-			.add_transition(State("S0"), "a", State("S1"))
-			.add_transition(State("S1"), "tau_1", State("S2"))
-			.add_transition(State("S2"), "tau_2", State("S3"))
-			.add_transition(State("S3"), "b", State("T"))
+			.add_hidden(Event("tau_1"))
+			.add_hidden(Event("tau_2"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("tau_1"), State("S2"))
+			.add_transition(State("S2"), Event("tau_2"), State("S3"))
+			.add_transition(State("S3"), Event("b"), State("T"))
 			.add_terminal(State("T"))
 			.build()?;
 
@@ -944,8 +983,8 @@ mod tests {
 	fn hidden_only_event_in_trace_is_not_enabled() -> Result<(), ProcessBuildError> {
 		let proc = Process::builder("HiddenOnly")
 			.initial_state(State("S0"))
-			.add_hidden("tau")
-			.add_transition(State("S0"), "tau", State("S1"))
+			.add_hidden(Event("tau"))
+			.add_transition(State("S0"), Event("tau"), State("S1"))
 			.add_terminal(State("S1"))
 			.build()?;
 
@@ -971,12 +1010,12 @@ mod tests {
 	fn enabled_is_sorted_by_event_name() -> Result<(), ProcessBuildError> {
 		let proc = Process::builder("Sorted")
 			.initial_state(State("S0"))
-			.add_observable("b")
-			.add_observable("a")
-			.add_hidden("c")
-			.add_transition(State("S0"), "b", State("S1"))
-			.add_transition(State("S0"), "a", State("S1"))
-			.add_transition(State("S0"), "c", State("S1"))
+			.add_observable(Event("b"))
+			.add_observable(Event("a"))
+			.add_hidden(Event("c"))
+			.add_transition(State("S0"), Event("b"), State("S1"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S0"), Event("c"), State("S1"))
 			.add_terminal(State("S1"))
 			.build()?;
 
@@ -992,25 +1031,25 @@ mod tests {
 		let proc = Process::builder("Handshake")
 			.initial_state(State("S0"))
 			// Observable alphabet
-			.add_observable("start")
-			.add_observable("send")
-			.add_observable("ack")
-			.add_observable("fail")
+			.add_observable(Event("start"))
+			.add_observable(Event("send"))
+			.add_observable(Event("ack"))
+			.add_observable(Event("fail"))
 			// Hidden alphabet (τ)
-			.add_hidden("serialize")
-			.add_hidden("encrypt")
-			.add_hidden("queue")
-			.add_hidden("dispatch")
+			.add_hidden(Event("serialize"))
+			.add_hidden(Event("encrypt"))
+			.add_hidden(Event("queue"))
+			.add_hidden(Event("dispatch"))
 			// Transitions
-			.add_transition(State("S0"), "start", State("S1"))
-			.add_transition(State("S1"), "serialize", State("S1s"))
-			.add_transition(State("S1"), "queue", State("S1q"))
-			.add_transition(State("S1s"), "encrypt", State("S1e"))
-			.add_transition(State("S1e"), "send", State("S2"))
-			.add_transition(State("S1q"), "dispatch", State("S1d"))
-			.add_transition(State("S1d"), "send", State("S2"))
-			.add_transition(State("S2"), "ack", State("S3"))
-			.add_transition(State("S2"), "fail", State("S3f"))
+			.add_transition(State("S0"), Event("start"), State("S1"))
+			.add_transition(State("S1"), Event("serialize"), State("S1s"))
+			.add_transition(State("S1"), Event("queue"), State("S1q"))
+			.add_transition(State("S1s"), Event("encrypt"), State("S1e"))
+			.add_transition(State("S1e"), Event("send"), State("S2"))
+			.add_transition(State("S1q"), Event("dispatch"), State("S1d"))
+			.add_transition(State("S1d"), Event("send"), State("S2"))
+			.add_transition(State("S2"), Event("ack"), State("S3"))
+			.add_transition(State("S2"), Event("fail"), State("S3f"))
 			// Terminal states (STOP)
 			.add_terminal(State("S3"))
 			.add_terminal(State("S3f"))
@@ -1052,17 +1091,17 @@ mod tests {
 		tb_process_spec! {
 			pub ComprehensiveHandshake,
 			events {
-				observable { "start", "send", "ack", "fail" }
-				hidden { "serialize", "encrypt", "queue", "dispatch" }
+				observable { Event("start"), Event("send"), Event("ack"), Event("fail") }
+				hidden { Event("serialize"), Event("encrypt"), Event("queue"), Event("dispatch") }
 			}
 			states {
-				S0  => { "start" => S1 },
-				S1  => { "serialize" => S1s, "queue" => S1q },
-				S1s => { "encrypt" => S1e },
-				S1e => { "send" => S2 },
-				S1q => { "dispatch" => S1d },
-				S1d => { "send" => S2 },
-				S2  => { "ack" => S3, "fail" => S3f },
+				S0  => { Event("start") => S1 },
+				S1  => { Event("serialize") => S1s, Event("queue") => S1q },
+				S1s => { Event("encrypt") => S1e },
+				S1e => { Event("send") => S2 },
+				S1q => { Event("dispatch") => S1d },
+				S1d => { Event("send") => S2 },
+				S2  => { Event("ack") => S3, Event("fail") => S3f },
 				S3  => {},
 				S3f => {}
 			}
@@ -1274,6 +1313,9 @@ mod tests {
 		}
 	}
 
+	const STEP1: Urn<'static> = Urn::new("test", "event:csp/step1");
+	const STEP2: Urn<'static> = Urn::new("test", "event:csp/step2");
+
 	// Integration test with tb_scenario! for Bare environment
 	tb_assert_spec! {
 		pub SimpleBareFlowSpec,
@@ -1281,8 +1323,8 @@ mod tests {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				("step1", exactly!(1)),
-				("step2", exactly!(1))
+				(STEP1, exactly!(1)),
+				(STEP2, exactly!(1))
 			]
 		},
 	}
@@ -1290,12 +1332,12 @@ mod tests {
 	tb_process_spec! {
 		pub SimpleBareFlowProc,
 		events {
-			observable { "step1", "step2" }
+			observable { STEP1, STEP2 }
 			hidden { }
 		}
 		states {
-			S0 => { "step1" => S1 },
-			S1 => { "step2" => S2 }
+			S0 => { STEP1 => S1 },
+			S1 => { STEP2 => S2 }
 		}
 		terminal { S2 }
 	}
@@ -1308,12 +1350,15 @@ mod tests {
 			.build(),
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				trace.event("step1")?;
-				trace.event("step2")?;
+				trace.event(STEP1)?;
+				trace.event(STEP2)?;
 				Ok(())
 			}
 		}
 	}
+
+	const RECEIVED: Urn<'static> = Urn::new("test", "event:csp/received");
+	const RESPONDED: Urn<'static> = Urn::new("test", "event:csp/responded");
 
 	// Define the assertion spec (what to validate at runtime)
 	tb_assert_spec! {
@@ -1322,8 +1367,8 @@ mod tests {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				(Received, exactly!(2)),
-				(Responded, exactly!(2))
+				(RECEIVED, exactly!(2)),
+				(RESPONDED, exactly!(2))
 			]
 		},
 	}
@@ -1333,14 +1378,14 @@ mod tests {
 	tb_process_spec! {
 		pub ClientServerFlowProc,
 		events {
-			observable { "Received", "Responded" }
+			observable { RECEIVED, RESPONDED }
 			hidden { }
 		}
 		states {
-			S0 => { "Responded" => S1 },
-			S1 => { "Received" => S2 },
-			S2 => { "Responded" => S3 },
-			S3 => { "Received" => S4 }
+			S0 => { RESPONDED => S1 },
+			S1 => { RECEIVED => S2 },
+			S2 => { RESPONDED => S3 },
+			S3 => { RECEIVED => S4 }
 		}
 		terminal { S4 }
 		annotations { description: "Client-server request-response with 2 client + 2 server assertions" }
@@ -1369,7 +1414,7 @@ mod tests {
 		environment ServiceClient {
 			worker_threads: 2,
 			server: |SetupEnv { trace, .. }| async move {
-				let bind_addr: TightBeamSocketAddr = "127.0.0.1:0".parse().unwrap();
+				let bind_addr = TightBeamSocketAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
 				let (listener, addr) = <TokioListener as Protocol>::bind(bind_addr).await?;
 
 				let handle = crate::server! {
@@ -1377,8 +1422,8 @@ mod tests {
 					assertions: trace.share(),
 					handle: |frame, trace| async move {
 						// Server-side assertions
-						trace.event(ClientServerFlowSpec::Received)?;
-						trace.event(ClientServerFlowSpec::Responded)?;
+						trace.event(RECEIVED)?;
+						trace.event(RESPONDED)?;
 						Ok(Some(frame))
 					}
 				};
@@ -1390,7 +1435,7 @@ mod tests {
 				let mut client = <TokioListener as Protocol>::create_transport(stream);
 
 				// Client-side assertion before sending
-				trace.event(ClientServerFlowSpec::Responded)?;
+				trace.event(RESPONDED)?;
 
 				let test_message = create_test_message(None);
 				let test_frame = compose! {
@@ -1400,7 +1445,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event(ClientServerFlowSpec::Received)?;
+				trace.event(RECEIVED)?;
 
 				Ok(())
 			}
@@ -1415,8 +1460,8 @@ mod tests {
 		handle: |_msg, frame, ctx| async move {
 			let trace = ctx.trace();
 			// Server-side assertions
-			trace.event(ClientServerFlowSpec::Received)?;
-			trace.event(ClientServerFlowSpec::Responded)?;
+			trace.event(RECEIVED)?;
+			trace.event(RESPONDED)?;
 			Ok(Some(frame))
 		}
 	}
@@ -1437,6 +1482,7 @@ mod tests {
 				let server_handle = tokio::spawn(async move {
 					let _ = servlet.join().await;
 				});
+
 				Ok((server_handle, addr))
 			},
 			client: |ClientEnv { trace, addr, .. }| async move {
@@ -1444,7 +1490,7 @@ mod tests {
 				let mut client = <TokioListener as Protocol>::create_transport(stream);
 
 				// Client-side assertion before sending
-				trace.event(ClientServerFlowSpec::Responded)?;
+				trace.event(RESPONDED)?;
 
 				let test_message = create_test_message(None);
 				let test_frame = compose! {
@@ -1454,7 +1500,7 @@ mod tests {
 				let _response = client.emit(test_frame, None).await?;
 
 				// Client-side assertion after receiving
-				trace.event(ClientServerFlowSpec::Received)?;
+				trace.event(RECEIVED)?;
 
 				Ok(())
 			}

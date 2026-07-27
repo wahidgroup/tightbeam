@@ -71,7 +71,7 @@ impl FrameStore {
 		})?;
 
 		// Cache in memory
-		self.frames.insert(frame_id.clone(), frame.clone());
+		self.frames.insert(frame_id.to_owned(), frame.to_owned());
 		Ok(frame_id)
 	}
 
@@ -79,7 +79,7 @@ impl FrameStore {
 	pub fn retrieve(&mut self, id: &str) -> Result<Frame, TightBeamError> {
 		// Check memory cache first
 		if let Some(frame) = self.frames.get(id) {
-			return Ok(frame.clone());
+			return Ok(frame.to_owned());
 		}
 
 		// Read from disk
@@ -88,7 +88,7 @@ impl FrameStore {
 		let frame = Frame::from_der(&frame_bytes)?;
 
 		// Cache for future retrievals
-		self.frames.insert(id.to_string(), frame.clone());
+		self.frames.insert(id.to_string(), frame.to_owned());
 		Ok(frame)
 	}
 
@@ -100,7 +100,7 @@ impl FrameStore {
 				.to_der()
 				.ok()
 				.filter(|bytes| Sha3_256::digest(bytes).as_slice() == hash)
-				.map(|_| frame.clone())
+				.map(|_| frame.to_owned())
 		});
 
 		if cached.is_some() {
@@ -187,7 +187,7 @@ mod tests {
 	#[test]
 	fn frame_store_persist_retrieve() -> Result<(), TightBeamError> {
 		let temp_dir = std::env::temp_dir().join("tightbeam_dtn_test");
-		let mut store = FrameStore::new(temp_dir.clone())?;
+		let mut store = FrameStore::new(temp_dir.to_owned())?;
 
 		// Create test frame
 		let payload = DtnPayload {
@@ -229,7 +229,7 @@ mod tests {
 	#[test]
 	fn storage_ordering_consensus_integration() -> Result<(), TightBeamError> {
 		let temp_dir = std::env::temp_dir().join("tightbeam_integration_test");
-		let mut store = FrameStore::new(temp_dir.clone())?;
+		let mut store = FrameStore::new(temp_dir.to_owned())?;
 		let mut order_buffer = OutOfOrderBuffer::new(10);
 
 		// Create 5 frames in order 1,2,3,4,5
@@ -255,7 +255,7 @@ mod tests {
 		let mut processed_frames = Vec::new();
 
 		for &idx in &receive_order {
-			let frame = frames[idx].clone();
+			let frame = frames[idx].to_owned();
 
 			// 1. Persist frame to storage
 			store.persist(&frame)?;

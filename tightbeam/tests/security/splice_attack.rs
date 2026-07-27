@@ -43,7 +43,7 @@ use tightbeam::{
 		sign::ecdsa::Secp256k1SigningKey,
 		x509::policy::{CertificateValidation, ExpiryValidator},
 	},
-	der::{Decode, Encode},
+	der::{Decode, Encode, Sequence},
 	exactly, job,
 	random::OsRng,
 	tb_assert_spec, tb_process_spec, tb_scenario,
@@ -55,10 +55,22 @@ use tightbeam::{
 	transport::handshake::{
 		client::EciesHandshakeClient, negotiation::SecurityOffer, server::EciesHandshakeServer, ClientKeyExchange,
 	},
+	utils::urn::Urn,
 	TightBeamError,
 };
 
 use crate::common::security::{default_security_profile, expectation_failure, pinning_validator, ServerMaterials};
+
+pub(crate) const SPLICED_KEX_REJECTED: Urn<'static> = Urn::new("test", "event:splice-attack/spliced-kex-rejected");
+
+/// Attacker's-eye view of the DER key-exchange plaintext: the two
+/// leading OCTET STRINGs are all a splice needs (the trailing receipt
+/// acknowledgement is absent on this unmetered session).
+#[derive(Sequence)]
+struct SplicedPayload {
+	base_key: OctetString,
+	client_random: OctetString,
+}
 
 tb_assert_spec! {
 	pub SpliceAttackSpec,
@@ -66,7 +78,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(spliced_kex_rejected, exactly!(1u32))
+			(SPLICED_KEX_REJECTED, exactly!(1u32))
 		]
 	}
 }
@@ -74,11 +86,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub SpliceAttackProcess,
 	events {
-		observable { "spliced_kex_rejected" }
+		observable { SPLICED_KEX_REJECTED }
 		hidden { }
 	}
 	states {
-		Idle => { "spliced_kex_rejected" => Done },
+		Idle => { SPLICED_KEX_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -140,16 +152,17 @@ job! {
 			Some(crate::security::common::HANDSHAKE_AAD),
 		)?
 		.to_insecure()?;
-		if victim_plain.len() != 64 {
-			return Err(expectation_failure("unexpected ECIES payload size"));
-		}
 
-		// Attacker forges [attacker_key || victim_client_random] under the
-		// server's public key and splices it into the victim's message.
-		let mut forged_plain = [0u8; 64];
-		forged_plain[..32].copy_from_slice(&[0x41u8; 32]); // attacker-chosen key
-		forged_plain[32..].copy_from_slice(&victim_plain[32..]); // victim client_random
+		// Attacker forges a payload with its own key under the server's
+		// public key and splices it into the victim's message, preserving
+		// the victim's client_random and the DER framing.
+		let victim_payload = SplicedPayload::from_der(&victim_plain)?;
+		let forged_payload = SplicedPayload {
+			base_key: OctetString::new([0x41u8; 32])?, // attacker-chosen key
+			client_random: victim_payload.client_random,
+		};
 
+		let forged_plain = forged_payload.to_der()?;
 		let recipient_pub = materials.secret_key().public_key();
 		let forged_message = encrypt::<_, _, _, Secp256k1EciesMessage, HkdfSha3_256, Aes256Gcm>(
 			&recipient_pub,
@@ -160,9 +173,10 @@ job! {
 
 		let spliced = ClientKeyExchange {
 			encrypted_data: OctetString::new(forged_message.to_bytes())?,
-			client_certificate: victim_kex.client_certificate.clone(),
-			client_signature: victim_kex.client_signature.clone(),
+			client_certificate: victim_kex.client_certificate.to_owned(),
+			client_signature: victim_kex.client_signature.to_owned(),
 		};
+
 		let spliced_der = spliced.to_der()?;
 		if spliced_der == client_kex_der {
 			return Err(expectation_failure("splice produced identical ClientKeyExchange bytes"));
@@ -170,7 +184,7 @@ job! {
 
 		match server.process_client_key_exchange(&spliced_der).await {
 			Err(_) => {
-				trace.event(SpliceAttackSpec::spliced_kex_rejected)?;
+				trace.event(SPLICED_KEX_REJECTED)?;
 			}
 			Ok(_) => return Err(expectation_failure("server accepted a spliced key exchange under victim identity")),
 		}

@@ -41,16 +41,20 @@ use tightbeam::{
 	transport::{
 		handshake::negotiation::TransportOffer, tcp::r#async::TokioListener, ClientBuilder, ConnectionBuilder,
 	},
-	utils::compose,
+	utils::{compose, urn::Urn},
 	TightBeamError, Version,
 };
+
+use crate::common::x509::create_test_cert_with_key;
 
 use super::cluster::PaymentGatewayCluster;
 use super::currency::MonetaryAmount;
 use super::hives::PaymentProcessorHive;
 use super::messages::{CreditTransferTransaction, PaymentIdentification, PaymentStatusCode, TransactionStatus};
 use super::servlets::AuthorizationServlet;
-use crate::common::x509::create_test_cert_with_key;
+
+pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> = Urn::new("test", "event:scenarios/authorization-approved");
+pub(crate) const WORK_COMPLETED: Urn<'static> = Urn::new("test", "event:scenarios/work-completed");
 
 // ============================================================================
 // Shared Test Certificates (lazily initialized)
@@ -71,7 +75,7 @@ impl TestCerts {
 			create_test_cert_with_key("CN=Payment Gateway", 365).expect("Failed to create cluster cert");
 		let cluster_trust: Arc<dyn CertificateTrust> = Arc::new(
 			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_chain(vec![cluster_cert.clone()])
+				.with_chain(vec![cluster_cert.to_owned()])
 				.expect("Failed to build cluster trust")
 				.build(),
 		);
@@ -80,7 +84,7 @@ impl TestCerts {
 			create_test_cert_with_key("CN=Payment Hive", 365).expect("Failed to create hive cert");
 		let hive_trust: Arc<dyn CertificateTrust> = Arc::new(
 			CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-				.with_chain(vec![hive_cert.clone()])
+				.with_chain(vec![hive_cert.to_owned()])
 				.expect("Failed to build hive trust")
 				.build(),
 		);
@@ -95,8 +99,8 @@ impl TestCerts {
 
 fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
 	ClusterTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.cluster_cert.clone())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.cluster_key.clone())),
+		certificate: CertificateSpec::Built(Box::new(certs.cluster_cert.to_owned())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.cluster_key.to_owned())),
 		validators: vec![],
 		client_validators: vec![],
 		hive_trust: Some(Arc::clone(&certs.hive_trust)),
@@ -105,8 +109,8 @@ fn cluster_tls_config(certs: &TestCerts) -> ClusterTlsConfig {
 
 fn hive_tls_config(certs: &TestCerts) -> HiveConf {
 	let hive_tls = Arc::new(HiveTlsConfig {
-		certificate: CertificateSpec::Built(Box::new(certs.hive_cert.clone())),
-		key: Arc::new(Secp256k1KeyProvider::from(certs.hive_key.clone())),
+		certificate: CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
+		key: Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
 		validators: vec![],
 	});
 	HiveConf {
@@ -122,8 +126,8 @@ fn servlet_tls_config(
 	Ok(
 		ServletConf::<TokioListener, CreditTransferTransaction, DefaultCryptoProvider>::builder()
 			.with_certificate(
-				CertificateSpec::Built(Box::new(certs.hive_cert.clone())),
-				Arc::new(Secp256k1KeyProvider::from(certs.hive_key.clone())),
+				CertificateSpec::Built(Box::new(certs.hive_cert.to_owned())),
+				Arc::new(Secp256k1KeyProvider::from(certs.hive_key.to_owned())),
 				vec![],
 			)?
 			.with_config(Arc::new(()))
@@ -165,7 +169,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(work_completed, at_least!(1))
+			(WORK_COMPLETED, at_least!(1))
 		]
 	}
 }
@@ -199,7 +203,6 @@ tb_scenario! {
 				mux_offer: Some(TransportOffer::mux(8)),
 				..hive_tls_config(&certs)
 			}))?;
-
 			hive.register("authorization", servlet, |t| AuthorizationServlet::start(t, None))?;
 			hive.establish(Arc::new(TraceCollector::new())).await?;
 
@@ -223,21 +226,20 @@ tb_scenario! {
 			let builder = ClientBuilder::<TokioListener>::builder()
 				.with_trust_store(Arc::clone(&certs.cluster_trust))
 				.build();
-			let mut client = builder.connect(cluster_addr).await?;
 
-			let response_frame = client.emit(frame, None).await?
-				.ok_or(TightBeamError::MissingResponse)?;
+			let mut client = builder.connect(cluster_addr).await?;
+			let response_frame = client.emit(frame, None).await?.ok_or(TightBeamError::MissingResponse)?;
 			let work_response: ClusterWorkResponse = decode(&response_frame.message)?;
 
 			// Mark test completion
-			trace.event(PaymentGatewaySpec::work_completed)?;
+			trace.event(WORK_COMPLETED)?;
 
 			// Verify routing succeeded
 			if work_response.status == TransitStatus::Ok {
 				if let Some(payload) = work_response.payload {
 					let status: TransactionStatus = decode(&payload)?;
 					let is_approved = matches!(status.status, PaymentStatusCode::AcceptedCustomerProfile);
-					trace.event_with("authorization_approved", &[] as &[&str], is_approved)?;
+					trace.event_with(AUTHORIZATION_APPROVED, &[] as &[&str], is_approved)?;
 				}
 			}
 

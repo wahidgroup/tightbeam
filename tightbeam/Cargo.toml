@@ -153,7 +153,6 @@ colony = [
 	"signature",
 	"digest",
 	"sha3",
-	"testing",
 ]
 testing = ["std", "transport"]
 testing-csp = ["testing"]
@@ -311,3 +310,6 @@ required-features = ["std", "testing-fuzz"]
 name = "fuzz_chess"
 path = "fuzz/chess/mod.rs"
 required-features = ["full", "testing-fuzz"]
+
+[build-dependencies]
+cfg_aliases = "0.2.2"

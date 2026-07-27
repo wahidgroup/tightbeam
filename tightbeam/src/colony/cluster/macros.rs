@@ -150,7 +150,7 @@ macro_rules! cluster {
 				let trace_for_server = ::std::sync::Arc::clone(&trace);
 
 				// Freshness window + replay set for signed hive control frames
-				// (registration, address updates); shared across all gateway
+				// (registration, address updates). Shared across all gateway
 				// requests (CWE-294)
 				#[cfg(feature = "x509")]
 				let replay_guard_for_server = ::std::sync::Arc::new(
@@ -312,12 +312,12 @@ macro_rules! cluster {
 
 	// Build gateway server
 	(@build_gateway_server $protocol:path, $listener:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $trace:ident, $replay_guard:ident) => {{
-		// Copied out before the handler closure captures the config.
-		let __mux_offer = $config.pool_config.mux_offer;
+		// Must be copied out before the handler closure captures the config.
+		let __mux_offer = $config.pool_config.mux_offer.to_owned();
 		$crate::server! {
 			protocol $protocol: $listener,
-			policies: { with_mux_offer: [ __mux_offer ] },
-			handle: move |frame: $crate::Frame| {
+			policies: { with_mux_offer: [ __mux_offer.to_owned() ] },
+			handle: move |frame: $crate::Frame, session: $crate::policy::SessionContext| {
 				let registry = ::std::sync::Arc::clone(&$registry);
 				let servlet_registry = ::std::sync::Arc::clone(&$servlet_registry);
 				let config = ::std::sync::Arc::clone(&$config);
@@ -325,7 +325,7 @@ macro_rules! cluster {
 				let _trace = ::std::sync::Arc::clone(&$trace);
 				let _replay_guard = ::core::clone::Clone::clone(&$replay_guard);
 				async move {
-					$crate::cluster!(@handle_gateway_request frame, registry, servlet_registry, config, pool, _replay_guard)
+					$crate::cluster!(@handle_gateway_request frame, session, registry, servlet_registry, config, pool, _replay_guard)
 				}
 			}
 		}
@@ -337,11 +337,12 @@ macro_rules! cluster {
 	};
 
 	// Handle gateway requests (registration + work)
-	(@handle_gateway_request $frame:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $replay_guard:ident) => {{
+	(@handle_gateway_request $frame:ident, $session:ident, $registry:ident, $servlet_registry:ident, $config:ident, $pool:ident, $replay_guard:ident) => {{
 		// Gate policies run before ANY decoding: an unevaluated policy
-		// list is indistinguishable from an open gateway.
+		// list is indistinguishable from an open gateway. Each gate sees
+		// the connection's authenticated peer context.
 		for policy in $config.policies.iter() {
-			let status = $crate::policy::GatePolicy::evaluate(policy.as_ref(), &$frame);
+			let status = $crate::policy::GatePolicy::evaluate(policy.as_ref(), &$frame, &$session);
 			if status != $crate::policy::TransitStatus::Ok {
 				return $crate::cluster!(@reply $frame,
 					$crate::colony::cluster::ClusterWorkResponse::err(status)
@@ -379,7 +380,7 @@ macro_rules! cluster {
 				return $crate::policy::TransitStatus::Unauthenticated;
 			};
 
-			// Signer identifier keys the replay partition; an unencodable
+			// Signer identifier keys the replay partition. An unencodable
 			// identifier cannot be attributed.
 			let Ok(signer_id) = $crate::der::Encode::to_der(&signer_info.sid) else {
 				return $crate::policy::TransitStatus::PermissionDenied;
@@ -474,8 +475,8 @@ macro_rules! cluster {
 					hive_id: Some(hive_addr.to_vec()),
 				},
 				Err(_) => {
-					// The signature was recorded before the registry ran;
-					// forget it so a legitimate retry of the same signed
+					// The signature was recorded before the registry ran.
+					// Forget it so a legitimate retry of the same signed
 					// frame is not rejected as a replay. A failed
 					// registration must not hand out an identity either.
 					#[cfg(feature = "x509")]
@@ -717,7 +718,7 @@ macro_rules! cluster {
 				manage: None,
 			};
 
-			// Priority is a V2+ metadata field; composing it on V1 fails at
+			// Priority is a V2+ metadata field. Composing it on V1 fails at
 			// build time and every heartbeat would count as a send failure.
 			let frame = $crate::builder::frame::FrameBuilder::from($crate::Version::V2)
 				.with_id(b"heartbeat")

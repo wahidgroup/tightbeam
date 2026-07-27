@@ -8,6 +8,7 @@
 
 mod board;
 mod constants;
+mod events;
 mod r#move;
 mod piece;
 mod state;
@@ -49,20 +50,20 @@ tb_assert_spec! {
 		gate: Ok,
 		assertions: [
 			// Core requirement: at least one move must be sent
-			(client_move_sent, at_least!(1)),
-			(client_moves_processed_balance, exactly!(1), equals!(0i64), tags: ["balance"]),
-			(client_server_move_balance, exactly!(1), equals!(0i64), tags: ["balance"]),
-			(client_game_restart_balance, exactly!(1), equals!(0i64), tags: ["lifecycle"]),
+			(events::CLIENT_MOVE_SENT, at_least!(1)),
+			(events::CLIENT_MOVES_PROCESSED_BALANCE, exactly!(1), equals!(0i64), tags: ["balance"]),
+			(events::CLIENT_SERVER_MOVE_BALANCE, exactly!(1), equals!(0i64), tags: ["balance"]),
+			(events::CLIENT_GAME_RESTART_BALANCE, exactly!(1), equals!(0i64), tags: ["lifecycle"]),
 
 			// Server-side servlet instrumentation guarantees
-			(server_move_received, at_least!(1)),
-			(server_response_emitted, at_least!(1)),
-			(server_decode_failure, exactly!(0)),
-			(server_state_lock_poisoned, exactly!(0)),
+			(events::SERVER_MOVE_RECEIVED, at_least!(1)),
+			(events::SERVER_RESPONSE_EMITTED, at_least!(1)),
+			(events::SERVER_DECODE_FAILURE, exactly!(0)),
+			(events::SERVER_STATE_LOCK_POISONED, exactly!(0)),
 
 			// Individual error bounds remain for diagnostics
-			(client_no_response, at_most!(5)),
-			(client_decode_error, at_most!(5)),
+			(events::CLIENT_NO_RESPONSE, at_most!(5)),
+			(events::CLIENT_DECODE_ERROR, at_most!(5)),
 		]
 	},
 	annotations { description: "Comprehensive chess game assertion specification" }
@@ -76,70 +77,70 @@ tb_process_spec! {
 	pub ChessGameFlow,
 	events {
 		observable {
-			"client_move_sent", "client_move_rejected", "client_move_validated",
-			"client_server_move", "client_game_ended", "client_game_restarted",
-			"client_no_response", "client_decode_error", "client_moves_processed_balance",
-			"client_server_move_balance", "client_game_restart_balance",
-			"errors_within_limit", "rejection_ratio",
-			"server_move_received", "server_move_validated", "server_move_generated",
-			"server_move_invalid", "server_response_emitted", "server_decode_failure",
-			"server_state_lock_poisoned", "server_game_ended", "server_game_restarted",
-			"pawn_move", "rook_move", "knight_move", "bishop_move", "queen_move", "king_move"
+			events::CLIENT_MOVE_SENT, events::CLIENT_MOVE_REJECTED, events::CLIENT_MOVE_VALIDATED,
+			events::CLIENT_SERVER_MOVE, events::CLIENT_GAME_ENDED, events::CLIENT_GAME_RESTARTED,
+			events::CLIENT_NO_RESPONSE, events::CLIENT_DECODE_ERROR, events::CLIENT_MOVES_PROCESSED_BALANCE,
+			events::CLIENT_SERVER_MOVE_BALANCE, events::CLIENT_GAME_RESTART_BALANCE,
+			events::ERRORS_WITHIN_LIMIT, events::REJECTION_RATIO,
+			events::SERVER_MOVE_RECEIVED, events::SERVER_MOVE_VALIDATED, events::SERVER_MOVE_GENERATED,
+			events::SERVER_MOVE_INVALID, events::SERVER_RESPONSE_EMITTED, events::SERVER_DECODE_FAILURE,
+			events::SERVER_STATE_LOCK_POISONED, events::SERVER_GAME_ENDED, events::SERVER_GAME_RESTARTED,
+			events::PAWN_MOVE, events::ROOK_MOVE, events::KNIGHT_MOVE, events::BISHOP_MOVE, events::QUEEN_MOVE, events::KING_MOVE
 		}
 		hidden { }
 	}
 	states {
 		WaitingForMove => {
-			"client_move_sent"                => ValidatingMove,
-			"client_game_ended"               => GameOver,
-			"client_moves_processed_balance"  => WaitingForMove,
-			"client_server_move_balance"      => WaitingForMove,
-			"client_game_restart_balance"     => WaitingForMove,
-			"errors_within_limit"             => WaitingForMove,
-			"rejection_ratio"                 => WaitingForMove,
+			events::CLIENT_MOVE_SENT                => ValidatingMove,
+			events::CLIENT_GAME_ENDED               => GameOver,
+			events::CLIENT_MOVES_PROCESSED_BALANCE  => WaitingForMove,
+			events::CLIENT_SERVER_MOVE_BALANCE      => WaitingForMove,
+			events::CLIENT_GAME_RESTART_BALANCE     => WaitingForMove,
+			events::ERRORS_WITHIN_LIMIT             => WaitingForMove,
+			events::REJECTION_RATIO                 => WaitingForMove,
 		},
 		ValidatingMove => {
-			"client_move_validated"       => ProcessingMove,
-			"client_move_rejected"        => WaitingForMove,
-			"client_no_response"          => WaitingForMove,
-			"client_decode_error"         => WaitingForMove,
-			"server_move_received"        => ValidatingMove,
-			"server_move_validated"       => ValidatingMove,
-			"server_move_generated"       => ValidatingMove,
-			"server_move_invalid"         => ValidatingMove,
-			"server_response_emitted"     => ValidatingMove,
-			"server_decode_failure"       => ValidatingMove,
-			"server_state_lock_poisoned"  => ValidatingMove,
-			"server_game_ended"           => ValidatingMove,
-			"server_game_restarted"       => ValidatingMove,
-			"pawn_move"                   => ValidatingMove,
-			"rook_move"                   => ValidatingMove,
-			"knight_move"                 => ValidatingMove,
-			"bishop_move"                 => ValidatingMove,
-			"queen_move"                  => ValidatingMove,
-			"king_move"                   => ValidatingMove,
+			events::CLIENT_MOVE_VALIDATED       => ProcessingMove,
+			events::CLIENT_MOVE_REJECTED        => WaitingForMove,
+			events::CLIENT_NO_RESPONSE          => WaitingForMove,
+			events::CLIENT_DECODE_ERROR         => WaitingForMove,
+			events::SERVER_MOVE_RECEIVED        => ValidatingMove,
+			events::SERVER_MOVE_VALIDATED       => ValidatingMove,
+			events::SERVER_MOVE_GENERATED       => ValidatingMove,
+			events::SERVER_MOVE_INVALID         => ValidatingMove,
+			events::SERVER_RESPONSE_EMITTED     => ValidatingMove,
+			events::SERVER_DECODE_FAILURE       => ValidatingMove,
+			events::SERVER_STATE_LOCK_POISONED  => ValidatingMove,
+			events::SERVER_GAME_ENDED           => ValidatingMove,
+			events::SERVER_GAME_RESTARTED       => ValidatingMove,
+			events::PAWN_MOVE                   => ValidatingMove,
+			events::ROOK_MOVE                   => ValidatingMove,
+			events::KNIGHT_MOVE                 => ValidatingMove,
+			events::BISHOP_MOVE                 => ValidatingMove,
+			events::QUEEN_MOVE                  => ValidatingMove,
+			events::KING_MOVE                   => ValidatingMove,
 		},
 		ProcessingMove => {
-			"client_server_move"       => WaitingForMove,
-			"client_game_ended"        => GameOver,
-			"client_move_validated"    => ProcessingMove,
-			"server_move_validated"    => ProcessingMove,
-			"server_move_generated"    => ProcessingMove,
-			"server_response_emitted"  => ProcessingMove,
-			"server_game_ended"        => ProcessingMove,
-			"server_game_restarted"    => ProcessingMove,
-			"pawn_move"                => ProcessingMove,
-			"rook_move"                => ProcessingMove,
-			"knight_move"              => ProcessingMove,
-			"bishop_move"              => ProcessingMove,
-			"queen_move"               => ProcessingMove,
-			"king_move"                => ProcessingMove,
+			events::CLIENT_SERVER_MOVE       => WaitingForMove,
+			events::CLIENT_GAME_ENDED        => GameOver,
+			events::CLIENT_MOVE_VALIDATED    => ProcessingMove,
+			events::SERVER_MOVE_VALIDATED    => ProcessingMove,
+			events::SERVER_MOVE_GENERATED    => ProcessingMove,
+			events::SERVER_RESPONSE_EMITTED  => ProcessingMove,
+			events::SERVER_GAME_ENDED        => ProcessingMove,
+			events::SERVER_GAME_RESTARTED    => ProcessingMove,
+			events::PAWN_MOVE                => ProcessingMove,
+			events::ROOK_MOVE                => ProcessingMove,
+			events::KNIGHT_MOVE              => ProcessingMove,
+			events::BISHOP_MOVE              => ProcessingMove,
+			events::QUEEN_MOVE               => ProcessingMove,
+			events::KING_MOVE                => ProcessingMove,
 		},
 		GameOver => {
-			"client_game_ended"        => GameOver,
-			"server_game_ended"        => GameOver,
-			"server_game_restarted"    => GameOver,
-			"client_game_restarted"    => WaitingForMove,
+			events::CLIENT_GAME_ENDED        => GameOver,
+			events::SERVER_GAME_ENDED        => GameOver,
+			events::SERVER_GAME_RESTARTED    => GameOver,
+			events::CLIENT_GAME_RESTARTED    => WaitingForMove,
 		}
 	}
 	annotations { description: "High-level chess game protocol flow" }
@@ -174,8 +175,8 @@ tb_scenario! {
 				.with_restart(restart_policy)
 				.with_timeout(Duration::from_millis(500))
 				.build();
-			let client = client_builder.connect(env.addr).await?;
 
+			let client = client_builder.connect(env.addr).await?;
 			Ok(client)
 		},
 		client: |ServletEnv { trace, mut client, .. }| async move {
@@ -207,7 +208,7 @@ tb_scenario! {
 			loop {
 				// Check execution time limit to prevent hangs
 				if start_time.elapsed().as_secs() >= MAX_EXECUTION_TIME_SECS {
-					trace.event("client_execution_timeout")?;
+					trace.event(events::CLIENT_EXECUTION_TIMEOUT)?;
 					break;
 				}
 
@@ -244,12 +245,12 @@ tb_scenario! {
 					_ => ChessMove::from((0u8, 0u8, 0u8, 0u8)).to_request(),
 				};
 
-				trace.event(ChessAssertSpec::client_move_sent)?;
+				trace.event(events::CLIENT_MOVE_SENT)?;
 				stats.move_sent_count += 1;
 
 				// Emit piece kind event only after move is sent (not before validation)
 				if let Some(piece) = Piece::from_u8(client_game_state.board().get(move_req.from_row, move_req.from_col)) {
-					trace.event(piece.as_kind_label())?;
+					trace.event(piece.as_kind_event())?;
 				}
 
 				// Send move request to server with current board state in matrix
@@ -269,19 +270,19 @@ tb_scenario! {
 				).await {
 					Ok(Ok(Some(frame))) => frame,
 					Ok(Ok(None)) => {
-						trace.event(ChessAssertSpec::client_no_response)?;
+						trace.event(events::CLIENT_NO_RESPONSE)?;
 						stats.no_response_count += 1;
 						break;
 					}
 					Ok(Err(_e)) => {
 						// Transport error - log and break
-						trace.event("client_emit_error")?;
+						trace.event(events::CLIENT_EMIT_ERROR)?;
 						stats.no_response_count += 1;
 						break;
 					}
 					Err(_) => {
 						// Timeout occurred
-						trace.event("client_timeout")?;
+						trace.event(events::CLIENT_TIMEOUT)?;
 						stats.no_response_count += 1;
 						break;
 					}
@@ -291,7 +292,7 @@ tb_scenario! {
 				let response: ChessMoveResponse = match decode(&response_frame.message) {
 					Ok(r) => r,
 					Err(_) => {
-						trace.event(ChessAssertSpec::client_decode_error)?;
+						trace.event(events::CLIENT_DECODE_ERROR)?;
 						stats.decode_error_count += 1;
 						break;
 					}
@@ -308,21 +309,21 @@ tb_scenario! {
 				// Track response type for coverage feedback
 				match response.game_status {
 					GameStatusCode::InvalidMove => {
-						trace.event("client_move_rejected")?;
+						trace.event(events::CLIENT_MOVE_REJECTED)?;
 						stats.move_rejected_count += 1;
 						// Continue to next move even if invalid
 					}
 					GameStatusCode::InProgress => {
-						trace.event("client_move_validated")?;
-						trace.event("client_server_move")?;
+						trace.event(events::CLIENT_MOVE_VALIDATED)?;
+						trace.event(events::CLIENT_SERVER_MOVE)?;
 						stats.move_validated_count += 1;
 						stats.server_move_count += 1;
 						order += 2; // Client move + server move
 					}
 					GameStatusCode::Checkmate | GameStatusCode::Stalemate => {
 						// Move was validated (we got a response), emit events
-						trace.event("client_move_validated")?;
-						trace.event("client_server_move")?;
+						trace.event(events::CLIENT_MOVE_VALIDATED)?;
+						trace.event(events::CLIENT_SERVER_MOVE)?;
 						stats.move_validated_count += 1;
 						stats.server_move_count += 1;
 						stats.game_ended_count += 1;
@@ -341,12 +342,15 @@ tb_scenario! {
 				+ stats.move_rejected_count
 				+ stats.no_response_count
 				+ stats.decode_error_count;
+
 			let moves_processed_balance = (stats.move_sent_count as i64) - (processed_moves as i64);
+			trace.event_with(events::CLIENT_MOVES_PROCESSED_BALANCE, &["balance"], moves_processed_balance)?;
+
 			let server_move_balance = (stats.move_validated_count as i64) - (stats.server_move_count as i64);
+			trace.event_with(events::CLIENT_SERVER_MOVE_BALANCE, &["balance"], server_move_balance)?;
+
 			let game_restart_balance = (stats.game_restarted_count as i64) - (stats.game_ended_count as i64);
-			trace.event_with(ChessAssertSpec::client_moves_processed_balance, &["balance"], moves_processed_balance)?;
-			trace.event_with(ChessAssertSpec::client_server_move_balance, &["balance"], server_move_balance)?;
-			trace.event_with(ChessAssertSpec::client_game_restart_balance, &["lifecycle"], game_restart_balance)?;
+			trace.event_with(events::CLIENT_GAME_RESTART_BALANCE, &["lifecycle"], game_restart_balance)?;
 
 			Ok(())
 		}

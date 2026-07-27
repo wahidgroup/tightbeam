@@ -232,8 +232,8 @@ macro_rules! tb_process_spec {
 				pub struct Event(pub &'static str);
 
 				impl $crate::testing::fault::ProcessEvent for Event {
-					fn event_label(&self) -> &'static str {
-						self.0
+					fn event_label(&self) -> ::std::borrow::Cow<'static, str> {
+						::std::borrow::Cow::Borrowed(self.0)
 					}
 				}
 			}
@@ -251,7 +251,7 @@ macro_rules! tb_process_spec {
 		// Parse WCET constraints
 		$($(
 			$constraints.add(
-				Event($wcet_event),
+				Event::from($wcet_event),
 				$crate::testing::timing::TimingConstraint::Wcet($wcet_constraint)
 			);
 		)*)?
@@ -259,7 +259,7 @@ macro_rules! tb_process_spec {
 		// Parse Jitter constraints
 		$($(
 			$constraints.add(
-				Event($jitter_event),
+				Event::from($jitter_event),
 				$jitter_constraint
 			);
 		)*)?
@@ -287,11 +287,13 @@ macro_rules! tb_process_spec {
 			let params: DeadlineParams = $deadline_params;
 			let mut builder = DeadlineBuilder::default()
 				.with_duration(params.duration)
-				.with_start_event(Event($deadline_start))
-				.with_end_event(Event($deadline_end));
+				.with_start_event(Event::from($deadline_start))
+				.with_end_event(Event::from($deadline_end));
+
 			if let Some(slack) = params.min_slack {
 				builder = builder.with_min_slack(slack);
 			}
+
 			let deadline = builder
 				.build()
 				.expect("Failed to build deadline");
@@ -314,7 +316,7 @@ macro_rules! tb_process_spec {
 			let scheduler = $crate::testing::schedulability::SchedulerType::$scheduler;
 			let mut periods = HashMap::new();
 			$(
-				periods.insert(Event($event_period), $period);
+				periods.insert(Event::from($event_period), $period);
 			)*
 			$builder = $builder.with_schedulability_periods(scheduler, periods);
 		}
@@ -443,7 +445,7 @@ macro_rules! tb_process_spec {
 			let reset_clocks: Vec<String> = vec![$( $reset_clock.to_string() ),*];
 			$builder = $builder.add_timed_transition(
 				$from_state,
-				Event($event),
+				Event::from($event),
 				State(stringify!($to_state)),
 				Some(guard),
 				reset_clocks,

@@ -2,6 +2,8 @@
 //!
 //! Processes received EnvelopedData structures to decrypt content.
 
+use core::marker::PhantomData;
+
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
@@ -44,7 +46,7 @@ where
 	recipient_index: usize,
 
 	/// Phantom data for crypto provider
-	_phantom: core::marker::PhantomData<P>,
+	_phantom: PhantomData<P>,
 }
 
 impl<P> TightBeamEnvelopedDataProcessor<P>
@@ -60,7 +62,7 @@ where
 		Self {
 			recipient_processor: Box::new(recipient_processor),
 			recipient_index: 0,
-			_phantom: core::marker::PhantomData,
+			_phantom: PhantomData,
 		}
 	}
 
@@ -253,15 +255,10 @@ mod tests {
 			let processor =
 				TightBeamEnvelopedDataProcessor::with_defaults(DummyRecipientProcessor).with_recipient_index(99);
 
-			// 4. Attempt to process with invalid index
+			// 4. Attempt to process with invalid index; the error MUST be
+			// InvalidRecipientIndex specifically.
 			let result = processor.process(&enveloped_data);
-			assert!(result.is_err());
-
-			// Verify specific error type (should be InvalidRecipientIndex)
-			match result.unwrap_err() {
-				HandshakeError::InvalidRecipientIndex => {}
-				_ => unreachable!("Expected InvalidRecipientIndex error"),
-			}
+			assert!(matches!(result, Err(HandshakeError::InvalidRecipientIndex)));
 
 			Ok(())
 		}

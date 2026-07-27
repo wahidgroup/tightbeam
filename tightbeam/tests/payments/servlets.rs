@@ -15,6 +15,22 @@ use tightbeam::{compose, servlet};
 
 use super::currency::MonetaryAmount;
 use super::harness::{PaymentHarness, PAYMENT_TAG};
+
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const AUTHORIZATION_APPROVED: Urn<'static> = Urn::new("test", "event:servlets/authorization-approved");
+pub(crate) const CAPTURE_COMPLETED: Urn<'static> = Urn::new("test", "event:servlets/capture-completed");
+pub(crate) const CHAIN_BROKEN: Urn<'static> = Urn::new("test", "event:servlets/chain-broken");
+pub(crate) const CHAIN_VALID: Urn<'static> = Urn::new("test", "event:servlets/chain-valid");
+pub(crate) const CURRENCY_BHD_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-bhd-processed");
+pub(crate) const CURRENCY_JPY_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-jpy-processed");
+pub(crate) const CURRENCY_OTHER_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-other-processed");
+pub(crate) const CURRENCY_USD_PROCESSED: Urn<'static> = Urn::new("test", "event:servlets/currency-usd-processed");
+pub(crate) const HIGH_VALUE_EXPEDITED: Urn<'static> = Urn::new("test", "event:servlets/high-value-expedited");
+pub(crate) const INTEGRITY_VERIFIED: Urn<'static> = Urn::new("test", "event:servlets/integrity-verified");
+pub(crate) const KEYMANAGER_DECRYPT_SUCCESS: Urn<'static> =
+	Urn::new("test", "event:servlets/keymanager-decrypt-success");
+pub(crate) const KEYMANAGER_PUBKEY_SERVED: Urn<'static> = Urn::new("test", "event:servlets/keymanager-pubkey-served");
 use super::messages::{
 	CaptureTransaction, CreditTransferTransaction, DecryptRequest, DecryptResponse, GetPublicKeyRequest,
 	GetPublicKeyResponse, PaymentIdentification, TransactionStatus,
@@ -62,42 +78,42 @@ servlet! {
 		// Check for duplicates and return cached response if available
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
-				V2: id: frame.metadata.id.clone(),
+				V2: id: &frame.metadata.id,
 					message: cached
 			}?));
 		}
 
 		// Verify integrity
 		if frame.integrity.is_some() {
-			trace.event_with("integrity_verified", &[PAYMENT_TAG], true)?;
+			trace.event_with(INTEGRITY_VERIFIED, &[PAYMENT_TAG], true)?;
 		}
 
 		// Log currency processing
 		match &req.instructed_amount.currency {
-			b"JPY" => trace.event_with("currency_jpy_processed", &[PAYMENT_TAG], true)?,
-			b"USD" => trace.event_with("currency_usd_processed", &[PAYMENT_TAG], true)?,
-			b"BHD" => trace.event_with("currency_bhd_processed", &[PAYMENT_TAG], true)?,
-			_ => trace.event_with("currency_other_processed", &[PAYMENT_TAG], true)?,
+			b"JPY" => trace.event_with(CURRENCY_JPY_PROCESSED, &[PAYMENT_TAG], true)?,
+			b"USD" => trace.event_with(CURRENCY_USD_PROCESSED, &[PAYMENT_TAG], true)?,
+			b"BHD" => trace.event_with(CURRENCY_BHD_PROCESSED, &[PAYMENT_TAG], true)?,
+			_ => trace.event_with(CURRENCY_OTHER_PROCESSED, &[PAYMENT_TAG], true)?,
 		};
 
 		// Check priority - only emit event for high-value transactions
 		let priority = to_priority(&req.instructed_amount);
 		if priority == MessagePriority::Expedited {
-			trace.event_with("high_value_expedited", &[PAYMENT_TAG], true)?;
+			trace.event_with(HIGH_VALUE_EXPEDITED, &[PAYMENT_TAG], true)?;
 		}
 
 		// Generate authorization code
 		let auth_code = format!("AUTH{:08X}", req.creation_datetime as u32).into_bytes();
-		let response = TransactionStatus::approved(req.payment_id.clone(), auth_code);
+		let response = TransactionStatus::approved(req.payment_id.to_owned(), auth_code);
 
 		// Cache the response
-		harness.dedup.cache_response(&frame, response.clone())?;
+		harness.dedup.cache_response(&frame, response.to_owned())?;
 
 		// Authorization approved
-		trace.event_with("authorization_approved", &[PAYMENT_TAG], true)?;
+		trace.event_with(AUTHORIZATION_APPROVED, &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
-			V2: id: frame.metadata.id.clone(),
+			V2: id: &frame.metadata.id,
 				message: response
 		}?))
 	}
@@ -119,22 +135,22 @@ servlet! {
 		// Check for duplicates and return cached response if available
 		if let Some(cached) = harness.check_dedup_cache(&frame)? {
 			return Ok(Some(compose! {
-				V2: id: frame.metadata.id.clone(),
+				V2: id: &frame.metadata.id,
 					message: cached
 			}?));
 		}
 
 		// Verify chain linkage (previous_frame should link to authorization)
 		if frame.metadata.previous_frame.is_some() {
-			trace.event_with("chain_valid", &[PAYMENT_TAG], true)?;
+			trace.event_with(CHAIN_VALID, &[PAYMENT_TAG], true)?;
 		} else {
-			trace.event_with("chain_broken", &[PAYMENT_TAG], true)?;
+			trace.event_with(CHAIN_BROKEN, &[PAYMENT_TAG], true)?;
 		}
 
 		// Create payment identification for response
 		let payment_id = PaymentIdentification::new(
 			b"CAPTURE",
-			req.original_end_to_end_id.clone(),
+			req.original_end_to_end_id.to_owned(),
 			format!("CAP{}", req.capture_datetime).as_bytes(),
 		);
 
@@ -143,13 +159,13 @@ servlet! {
 		let response = TransactionStatus::captured(payment_id, settlement_code);
 
 		// Cache the response
-		harness.dedup.cache_response(&frame, response.clone())?;
+		harness.dedup.cache_response(&frame, response.to_owned())?;
 
 		// Capture completed
-		trace.event_with("capture_completed", &[PAYMENT_TAG], true)?;
+		trace.event_with(CAPTURE_COMPLETED, &[PAYMENT_TAG], true)?;
 
 		Ok(Some(compose! {
-			V2: id: frame.metadata.id.clone(),
+			V2: id: &frame.metadata.id,
 				message: response
 		}?))
 	}
@@ -181,9 +197,9 @@ servlet! {
 				let response = GetPublicKeyResponse {
 					public_key: secret_key.public_key().to_bytes(),
 				};
-				trace.event_with("keymanager_pubkey_served", &[PAYMENT_TAG], true)?;
+				trace.event_with(KEYMANAGER_PUBKEY_SERVED, &[PAYMENT_TAG], true)?;
 				Ok(Some(compose! {
-					V2: id: frame.metadata.id.clone(),
+					V2: id: &frame.metadata.id,
 						message: response
 				}?))
 			}
@@ -195,9 +211,9 @@ servlet! {
 				// Convert SecretSlice<u8> to Vec<u8>
 				let plaintext = plaintext_secret.to_insecure()?.to_vec();
 				let response = DecryptResponse { plaintext };
-				trace.event_with("keymanager_decrypt_success", &[PAYMENT_TAG], true)?;
+				trace.event_with(KEYMANAGER_DECRYPT_SUCCESS, &[PAYMENT_TAG], true)?;
 				Ok(Some(compose! {
-					V2: id: frame.metadata.id.clone(),
+					V2: id: &frame.metadata.id,
 						message: response
 				}?))
 			}

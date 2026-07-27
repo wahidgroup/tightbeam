@@ -7,32 +7,36 @@ use tightbeam::testing::error::TestingError;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::specs::csp::Event;
 use tightbeam::testing::{ScenarioConf, SetupEnv, TestHooks};
+use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, wcet, TightBeamError};
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario};
+
+pub(crate) const TASK1: Urn<'static> = Urn::new("test", "event:rma-basic/task1");
+pub(crate) const TASK2: Urn<'static> = Urn::new("test", "event:rma-basic/task2");
 
 // Define a real-time process with timing and schedulability constraints
 tb_process_spec! {
 	pub RmaSchedulableProcess,
 	events {
-		observable { "task1", "task2" }
+		observable { TASK1, TASK2 }
 		hidden { }
 	}
 	states {
-		S0 => { "task1" => S1 },
-		S1 => { "task2" => S2 }
+		S0 => { TASK1 => S1 },
+		S1 => { TASK2 => S2 }
 	}
 	terminal { S2 }
 	timing {
 		wcet: {
-			"task1" => wcet!(Duration::from_millis(3)),
-			"task2" => wcet!(Duration::from_millis(5))
+			TASK1 => wcet!(Duration::from_millis(3)),
+			TASK2 => wcet!(Duration::from_millis(5))
 		}
 	}
 	schedulability {
 		scheduler: RateMonotonic,
 		periods: {
-			"task1" => Duration::from_millis(10),
-			"task2" => Duration::from_millis(20)
+			TASK1 => Duration::from_millis(10),
+			TASK2 => Duration::from_millis(20)
 		}
 	}
 }
@@ -47,8 +51,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(task1, exactly!(1)),
-			(task2, exactly!(1))
+			(TASK1, exactly!(1)),
+			(TASK2, exactly!(1))
 		]
 	}
 }
@@ -77,8 +81,8 @@ tb_scenario! {
 					.timing_constraints
 					.as_ref()
 					.ok_or(TightBeamError::TestingError(TestingError::InvalidTimingConstraint))?;
-				assert!(constraints.has_constraint(&Event("task1")), "Should have task1 constraint");
-				assert!(constraints.has_constraint(&Event("task2")), "Should have task2 constraint");
+				assert!(constraints.has_constraint(&Event::from(TASK1)), "Should have task1 constraint");
+				assert!(constraints.has_constraint(&Event::from(TASK2)), "Should have task2 constraint");
 				Ok(())
 			})),
 			on_fail: None,
@@ -86,8 +90,8 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(RmaAssertSpec::task1)?;
-			trace.event(RmaAssertSpec::task2)?;
+			trace.event(TASK1)?;
+			trace.event(TASK2)?;
 			Ok(())
 		}
 	}

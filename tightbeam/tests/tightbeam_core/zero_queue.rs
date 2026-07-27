@@ -12,7 +12,7 @@ use tightbeam::crypto::{
 	x509::CertificateSpec,
 };
 use tightbeam::der::ValueOrd;
-use tightbeam::policy::{GatePolicy, TransitStatus};
+use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
 use tightbeam::prelude::policy::PolicyConf;
 use tightbeam::prelude::*;
 use tightbeam::testing::ScenarioConf;
@@ -28,6 +28,22 @@ use tightbeam::{at_least, between, exactly, present, server, servlet, tb_assert_
 use tightbeam::{utils, Frame, TightBeamError, Version};
 
 use crate::common::x509::create_test_cert_with_key;
+
+use tightbeam::utils::urn::Urn;
+
+pub(crate) const ADAPTIVE_BEHAVIOR: Urn<'static> = Urn::new("test", "event:zero-queue/adaptive-behavior");
+pub(crate) const CHAIN_VALID: Urn<'static> = Urn::new("test", "event:zero-queue/chain-valid");
+pub(crate) const DEDUP_KEPT: Urn<'static> = Urn::new("test", "event:zero-queue/dedup-kept");
+pub(crate) const DEDUP_SKIPPED: Urn<'static> = Urn::new("test", "event:zero-queue/dedup-skipped");
+pub(crate) const EMIT_WORK: Urn<'static> = Urn::new("test", "event:zero-queue/emit-work");
+pub(crate) const LAG_TIP: Urn<'static> = Urn::new("test", "event:zero-queue/lag-tip");
+pub(crate) const THROTTLE_ENGAGED: Urn<'static> = Urn::new("test", "event:zero-queue/throttle-engaged");
+pub(crate) const PRIORITY_RESPECTED: Urn<'static> = Urn::new("test", "event:zero-queue/priority-respected");
+pub(crate) const REPLAY_ATTEMPT: Urn<'static> = Urn::new("test", "event:zero-queue/replay-attempt");
+pub(crate) const RESPONSE_READY: Urn<'static> = Urn::new("test", "event:zero-queue/response-ready");
+pub(crate) const WORKER_COMMIT: Urn<'static> = Urn::new("test", "event:zero-queue/worker-commit");
+pub(crate) const WORKER_FAN_OUT_0: Urn<'static> = Urn::new("test", "event:zero-queue/worker-fan-out-0");
+pub(crate) const WORKER_FAN_OUT_1: Urn<'static> = Urn::new("test", "event:zero-queue/worker-fan-out-1");
 
 const QUEUE_TAG: &str = "queue-free";
 const WORKER_0_TAG: &str = "worker:0";
@@ -146,7 +162,7 @@ impl ChainState {
 
 	fn record(&self, frame: &Frame) -> Result<(), TightBeamError> {
 		let mut guard = self.state.lock().expect("chain state mutex not poisoned");
-		let expected = guard.last_digest.clone();
+		let expected = guard.last_digest.to_owned();
 		let actual = frame.metadata.previous_frame.as_ref();
 		let prev_ok = match (expected.as_ref(), actual) {
 			(None, None) => true,
@@ -157,13 +173,14 @@ impl ChainState {
 		let order_ok = guard.last_order.is_none_or(|prev| frame.metadata.order > prev);
 		let valid = prev_ok && order_ok;
 
-		self.trace.event_with("chain_valid", &[QUEUE_TAG], valid)?;
+		self.trace.event_with(CHAIN_VALID, &[QUEUE_TAG], valid)?;
 
 		if valid {
 			guard.last_order = Some(frame.metadata.order);
 			let digest = utils::digest::<Sha3_256>(&frame.message)?;
 			guard.last_digest = Some(digest);
-			self.trace.event_with(QueueFreeSpec::lag_tip, &[QUEUE_TAG], 0u64)?;
+
+			self.trace.event_with(LAG_TIP, &[QUEUE_TAG], 0u64)?;
 		}
 
 		Ok(())
@@ -184,14 +201,14 @@ impl DedupBook {
 	}
 
 	fn record(&self, frame: &Frame) -> Result<bool, TightBeamError> {
-		let key = (frame.metadata.id.clone(), frame.metadata.order);
+		let key = (frame.metadata.id.to_owned(), frame.metadata.order);
 		let mut guard = self.seen.lock().expect("seen-set mutex not poisoned");
 
 		let inserted = guard.insert(key);
 		if inserted {
-			self.trace.event_with("dedup_kept", &[QUEUE_TAG], true)?;
+			self.trace.event_with(DEDUP_KEPT, &[QUEUE_TAG], true)?;
 		} else {
-			self.trace.event_with("dedup_skipped", &[QUEUE_TAG], true)?;
+			self.trace.event_with(DEDUP_SKIPPED, &[QUEUE_TAG], true)?;
 		}
 
 		Ok(inserted)
@@ -221,9 +238,9 @@ impl PriorityLedger {
 			WORKER_1_TAG
 		};
 		let label = if worker == 0 {
-			"worker_fan_out_0"
+			WORKER_FAN_OUT_0
 		} else {
-			"worker_fan_out_1"
+			WORKER_FAN_OUT_1
 		};
 
 		self.trace.event_with(label, vec![QUEUE_TAG, tag], worker)?;
@@ -234,8 +251,7 @@ impl PriorityLedger {
 			worker == 1
 		};
 
-		self.trace
-			.event_with(QueueFreeSpec::priority_respected, &[QUEUE_TAG], respected)?;
+		self.trace.event_with(PRIORITY_RESPECTED, &[QUEUE_TAG], respected)?;
 		Ok(worker)
 	}
 }
@@ -270,13 +286,13 @@ impl AdaptiveGate {
 }
 
 impl GatePolicy for AdaptiveGate {
-	fn evaluate(&self, frame: &Frame) -> TransitStatus {
+	fn evaluate(&self, frame: &Frame, _session: &SessionContext) -> TransitStatus {
 		// Throttle Standard-or-lower priority frames on first encounter
 		// Subsequent attempts (same order) will be accepted
 		let priority = frame.metadata.priority.unwrap_or(MessagePriority::Standard);
 		if priority <= MessagePriority::HighThroughput && self.stats.mark_throttled(frame.metadata.order) {
 			// Emit trace event for test verification
-			let _ = self.trace.event_with(QueueFreeSpec::throttle_engaged, &[QUEUE_TAG], true);
+			let _ = self.trace.event_with(THROTTLE_ENGAGED, &[QUEUE_TAG], true);
 			TransitStatus::ResourceExhausted
 		} else {
 			TransitStatus::Ok
@@ -310,8 +326,9 @@ impl QueueHarness {
 		self.chain.record(frame)?;
 
 		let worker = self.priority.assign(frame)?;
-		self.trace.event_with("worker_commit", &[QUEUE_TAG], worker as u64)?;
-		self.trace.event_with("response_ready", &[QUEUE_TAG], frame.metadata.order)?;
+
+		self.trace.event_with(WORKER_COMMIT, &[QUEUE_TAG], worker as u64)?;
+		self.trace.event_with(RESPONSE_READY, &[QUEUE_TAG], frame.metadata.order)?;
 		Ok(())
 	}
 }
@@ -346,12 +363,12 @@ tb_assert_spec! {
 		gate: Ok,
 		tag_filter: [QUEUE_TAG],
 		assertions: [
-			(lag_tip, present!(), equals!(0u64)),
-			(priority_respected, at_least!(1), equals!(true)),
-			(worker_fan_out_0, at_least!(1), equals!(0u8), tags: [WORKER_0_TAG]),
-			(worker_fan_out_1, at_least!(1), equals!(1u8), tags: [WORKER_1_TAG]),
-			(throttle_engaged, present!(), equals!(true)),
-			(adaptive_behavior, at_least!(1))
+			(LAG_TIP, present!(), equals!(0u64)),
+			(PRIORITY_RESPECTED, at_least!(1), equals!(true)),
+			(WORKER_FAN_OUT_0, at_least!(1), equals!(0u8), tags: [WORKER_0_TAG]),
+			(WORKER_FAN_OUT_1, at_least!(1), equals!(1u8), tags: [WORKER_1_TAG]),
+			(THROTTLE_ENGAGED, present!(), equals!(true)),
+			(ADAPTIVE_BEHAVIOR, at_least!(1))
 		]
 	}
 }
@@ -394,7 +411,7 @@ tb_scenario! {
 			let batch = default_batch();
 			let mut prev_hash: Option<DigestInfo> = None;
 			for (index, spec) in batch.entries().iter().enumerate() {
-				trace.event_with("emit_work", &[QUEUE_TAG], spec.order)?;
+				trace.event_with(EMIT_WORK, &[QUEUE_TAG], spec.order)?;
 				let (frame, digest) = match build_frame(batch.work_id(), spec, prev_hash) {
 					Ok(result) => result,
 					Err(err) => {
@@ -405,13 +422,13 @@ tb_scenario! {
 
 				prev_hash = Some(digest);
 
-				trace.event_with(QueueFreeSpec::adaptive_behavior, &[QUEUE_TAG], spec.order)?;
+				trace.event_with(ADAPTIVE_BEHAVIOR, &[QUEUE_TAG], spec.order)?;
 
 				if index == 1 {
 					// For the second frame, emit it then immediately replay it
 					// Server will throttle on first attempt, restart policy will retry
-					client.emit(frame.clone(), None).await?;
-					trace.event_with("replay_attempt", &[QUEUE_TAG], frame.metadata.order)?;
+					client.emit(frame.to_owned(), None).await?;
+					trace.event_with(REPLAY_ATTEMPT, &[QUEUE_TAG], frame.metadata.order)?;
 					client.emit(frame, None).await?;
 				} else {
 					// Server-side adaptive gate will throttle Normal+ priority frames

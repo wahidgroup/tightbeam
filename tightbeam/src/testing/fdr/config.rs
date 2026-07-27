@@ -4,6 +4,7 @@
 //! used by the FDR exploration engine.
 
 use std::collections::HashSet;
+
 #[cfg(feature = "testing-fault")]
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
@@ -138,7 +139,7 @@ impl FaultModel {
 		F: Fn() -> Err + Send + Sync + 'static,
 		Err: Into<TightBeamError>,
 	{
-		let key = (state.full_key(), Cow::Borrowed(event.event_label()));
+		let key = (state.full_key(), event.event_label());
 		self.injection_points.insert(
 			key,
 			FaultInjection { error_factory: Arc::new(move || error_fn().into()), probability_bps },
@@ -182,7 +183,7 @@ pub struct FdrConfig {
 	pub fail_fast: bool,
 
 	/// Expect FDR refinement to fail (for negative tests)
-	/// When true, the test passes if refinement fails (proving the trace violates the spec)
+	/// When true, the test passes if refinement fails
 	/// When false (default), the test fails if refinement fails
 	pub expect_failure: bool,
 
@@ -204,7 +205,8 @@ pub struct FdrConfig {
 	pub scheduler_model: Option<SchedulerModel>,
 
 	/// Fault injection model
-	/// When provided, enables CSP state-driven fault injection during FDR exploration
+	/// When provided, enables CSP state-driven fault injection during
+	/// FDR exploration
 	#[cfg(feature = "testing-fault")]
 	pub fault_model: Option<FaultModel>,
 
@@ -244,7 +246,9 @@ impl FdrConfig {
 	/// - If set, scheduler_count must be <= process_count
 	/// - If set, scheduler_count and process_count must be > 0
 	///
-	/// Returns `Ok(())` if validation passes, or a `TestingError` if validation fails.
+	/// ## Returns
+	/// - `Ok(())` if validation passes
+	/// - `Err(TestingError)` if validation fails
 	#[cfg(feature = "testing-fault")]
 	pub fn validate_scheduler_model(&self) -> Result<(), TestingError> {
 		match (self.scheduler_count, self.process_count) {
@@ -479,8 +483,8 @@ mod tests {
 		struct TestEvent;
 
 		impl ProcessEvent for TestEvent {
-			fn event_label(&self) -> &'static str {
-				"test_event"
+			fn event_label(&self) -> Cow<'static, str> {
+				Cow::Borrowed("test_event")
 			}
 		}
 
@@ -500,9 +504,18 @@ mod tests {
 		struct AnotherEvent;
 
 		impl ProcessEvent for AnotherEvent {
-			fn event_label(&self) -> &'static str {
-				"another_event"
+			fn event_label(&self) -> Cow<'static, str> {
+				Cow::Borrowed("another_event")
 			}
+		}
+
+		/// Look up the injection registered under a `Process.State` key and
+		/// event label.
+		fn injection<'a>(model: &'a FaultModel, state: &'static str, event: &'static str) -> &'a FaultInjection {
+			model
+				.injection_points
+				.get(&(Cow::Borrowed(state), Cow::Borrowed(event)))
+				.expect("fault registered for the requested state and event")
 		}
 
 		#[test]
@@ -523,8 +536,7 @@ mod tests {
 			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(5000));
 			assert_eq!(model.injection_points.len(), 1);
 
-			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
-			let injection = model.injection_points.get(&key).unwrap();
+			let injection = injection(&model, "TestProcess.TestState", "test_event");
 			assert_eq!(injection.probability_bps, BasisPoints::new(5000));
 		}
 
@@ -537,8 +549,7 @@ mod tests {
 				BasisPoints::new(100),
 			);
 
-			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
-			let error = (model.injection_points.get(&key).unwrap().error_factory)();
+			let error = (injection(&model, "TestProcess.TestState", "test_event").error_factory)();
 			assert!(matches!(error, TightBeamError::IoError(_)));
 		}
 
@@ -550,19 +561,16 @@ mod tests {
 				.with_fault(AnotherState, TestEvent, || TestError, BasisPoints::new(3000));
 			assert_eq!(model.injection_points.len(), 3);
 
-			let key1 = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
-			let key2 = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("another_event"));
-			let key3 = (Cow::Borrowed("TestProcess.AnotherState"), Cow::Borrowed("test_event"));
 			assert_eq!(
-				model.injection_points.get(&key1).unwrap().probability_bps,
+				injection(&model, "TestProcess.TestState", "test_event").probability_bps,
 				BasisPoints::new(1000)
 			);
 			assert_eq!(
-				model.injection_points.get(&key2).unwrap().probability_bps,
+				injection(&model, "TestProcess.TestState", "another_event").probability_bps,
 				BasisPoints::new(2000)
 			);
 			assert_eq!(
-				model.injection_points.get(&key3).unwrap().probability_bps,
+				injection(&model, "TestProcess.AnotherState", "test_event").probability_bps,
 				BasisPoints::new(3000)
 			);
 		}
@@ -570,8 +578,7 @@ mod tests {
 		#[test]
 		fn should_inject_probability_0_percent() {
 			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(0));
-			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
-			let injection = model.injection_points.get(&key).unwrap();
+			let injection = injection(&model, "TestProcess.TestState", "test_event");
 			assert!(!injection.should_inject(0));
 			assert!(!injection.should_inject(9999));
 		}
@@ -579,8 +586,7 @@ mod tests {
 		#[test]
 		fn should_inject_probability_100_percent() {
 			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(10000));
-			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
-			let injection = model.injection_points.get(&key).unwrap();
+			let injection = injection(&model, "TestProcess.TestState", "test_event");
 			assert!(injection.should_inject(0));
 			assert!(injection.should_inject(9999));
 		}
@@ -588,8 +594,7 @@ mod tests {
 		#[test]
 		fn should_inject_probability_50_percent() {
 			let model = FaultModel::default().with_fault(TestState, TestEvent, || TestError, BasisPoints::new(5000));
-			let key = (Cow::Borrowed("TestProcess.TestState"), Cow::Borrowed("test_event"));
-			let injection = model.injection_points.get(&key).unwrap();
+			let injection = injection(&model, "TestProcess.TestState", "test_event");
 			assert!(injection.should_inject(0));
 			assert!(injection.should_inject(4999));
 			assert!(!injection.should_inject(5000));

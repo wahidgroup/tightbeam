@@ -82,7 +82,7 @@ macro_rules! __servlet_create_server {
 		if $collector_gates.is_empty() {
 			$crate::server! {
 				protocol $protocol: $listener,
-				policies: { with_mux_offer: [ $mux_offer ] },
+				policies: { with_mux_offer: [ $mux_offer.to_owned() ] },
 				handle: move |frame_in| {
 					let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
 					async move {
@@ -103,26 +103,31 @@ macro_rules! __servlet_create_server {
 								for gate in &$collector_gates {
 									transport = transport.with_collector_gate(::std::sync::Arc::clone(gate));
 								}
-								transport = transport.with_mux_offer($mux_offer);
+
+								transport = transport.with_mux_offer($mux_offer.to_owned());
 
 								let ctx_clone = ::std::sync::Arc::clone(&$servlet_context);
-
 								$crate::colony::servlet::servlet_runtime::rt::spawn(async move {
 									let mut transport = transport;
+									// Servlet handlers are context-blind: the
+									// session context the takeover supplies is
+									// dropped.
 									let __servlet_mux_handler = {
 										let __ctx = ::std::sync::Arc::clone(&ctx_clone);
-										::std::sync::Arc::new(move |frame_in: $crate::Frame| {
-											let __ctx = ::std::sync::Arc::clone(&__ctx);
-											async move {
-												let $frame = frame_in;
-												let $ctx = &*__ctx;
-												let __response: ::core::result::Result<
-													::core::option::Option<$crate::Frame>,
-													$crate::TightBeamError,
-												> = $handler_body;
-												__response
-											}
-										})
+										::std::sync::Arc::new(
+											move |frame_in: $crate::Frame, _session: $crate::policy::SessionContext| {
+												let __ctx = ::std::sync::Arc::clone(&__ctx);
+												async move {
+													let $frame = frame_in;
+													let $ctx = &*__ctx;
+													let __response: ::core::result::Result<
+														::core::option::Option<$crate::Frame>,
+														$crate::TightBeamError,
+													> = $handler_body;
+													__response
+												}
+											},
+										)
 									};
 									let mut __servlet_error_tx =
 										$crate::macros::server::server_runtime::rt::empty_error_channel();

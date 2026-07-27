@@ -215,12 +215,12 @@ mod tests {
 		Process::builder("test")
 			.initial_state(State("s0"))
 			.add_terminal(State("s2"))
-			.add_observable("start")
-			.add_observable("process")
-			.add_observable("end")
-			.add_transition(State("s0"), "start", State("s1"))
-			.add_transition(State("s1"), "process", State("s2"))
-			.add_transition(State("s2"), "end", State("s2"))
+			.add_observable(Event("start"))
+			.add_observable(Event("process"))
+			.add_observable(Event("end"))
+			.add_transition(State("s0"), Event("start"), State("s1"))
+			.add_transition(State("s1"), Event("process"), State("s2"))
+			.add_transition(State("s2"), Event("end"), State("s2"))
 			.build()
 	}
 

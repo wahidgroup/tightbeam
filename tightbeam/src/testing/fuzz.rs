@@ -781,8 +781,8 @@ mod tests {
 	fn build_simple_process(event: &'static str) -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
-			.add_observable(event)
-			.add_transition(State("S0"), event, State("S1"))
+			.add_observable(Event(event))
+			.add_transition(State("S0"), Event(event), State("S1"))
 			.add_terminal(State("S1"))
 			.build()
 			.expect("fixture process builder has a valid initial state")
@@ -793,10 +793,10 @@ mod tests {
 	fn build_two_step_process(e1: &'static str, e2: &'static str) -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
-			.add_observable(e1)
-			.add_observable(e2)
-			.add_transition(State("S0"), e1, State("S1"))
-			.add_transition(State("S1"), e2, State("S2"))
+			.add_observable(Event(e1))
+			.add_observable(Event(e2))
+			.add_transition(State("S0"), Event(e1), State("S1"))
+			.add_transition(State("S1"), Event(e2), State("S2"))
 			.add_terminal(State("S2"))
 			.build()
 			.expect("fixture process builder has a valid initial state")
@@ -807,12 +807,12 @@ mod tests {
 	fn build_three_step_process() -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
-			.add_observable("a")
-			.add_observable("b")
-			.add_observable("c")
-			.add_transition(State("S0"), "a", State("S1"))
-			.add_transition(State("S1"), "b", State("S2"))
-			.add_transition(State("S2"), "c", State("S3"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_observable(Event("c"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S1"), Event("b"), State("S2"))
+			.add_transition(State("S2"), Event("c"), State("S3"))
 			.add_terminal(State("S3"))
 			.build()
 			.expect("fixture process builder has a valid initial state")
@@ -823,9 +823,9 @@ mod tests {
 	fn build_choice_process() -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
-			.add_observable("choice")
-			.add_transition(State("S0"), "choice", State("S1"))
-			.add_transition(State("S0"), "choice", State("S2"))
+			.add_observable(Event("choice"))
+			.add_transition(State("S0"), Event("choice"), State("S1"))
+			.add_transition(State("S0"), Event("choice"), State("S2"))
 			.add_choice(State("S0"))
 			.add_terminal(State("S1"))
 			.add_terminal(State("S2"))
@@ -838,12 +838,12 @@ mod tests {
 	fn build_branching_process() -> Process {
 		Process::builder("TestProc")
 			.initial_state(State("S0"))
-			.add_observable("a")
-			.add_observable("b")
-			.add_observable("c")
-			.add_transition(State("S0"), "a", State("S1"))
-			.add_transition(State("S0"), "b", State("S2"))
-			.add_transition(State("S0"), "c", State("S3"))
+			.add_observable(Event("a"))
+			.add_observable(Event("b"))
+			.add_observable(Event("c"))
+			.add_transition(State("S0"), Event("a"), State("S1"))
+			.add_transition(State("S0"), Event("b"), State("S2"))
+			.add_transition(State("S0"), Event("c"), State("S3"))
 			.add_terminal(State("S1"))
 			.add_terminal(State("S2"))
 			.add_terminal(State("S3"))
@@ -1015,8 +1015,8 @@ mod tests {
 				fn oracle_deadlock_reported_as_deadlock() {
 					let process = super::Process::builder("TestProc")
 						.initial_state(super::State("S0"))
-						.add_observable("go")
-						.add_transition(super::State("S0"), "go", super::State("Stuck"))
+						.add_observable(super::Event("go"))
+						.add_transition(super::State("S0"), super::Event("go"), super::State("Stuck"))
 						.build()
 						.expect("fixture process builder has a valid initial state");
 
@@ -1152,7 +1152,9 @@ mod tests {
 					let state_for_choice: Vec<super::State> = (0..3)
 						.map(|choice| {
 							let mut oracle = super::CspOracle::new(proc.clone());
-							oracle.fuzz_from_bytes(&[choice as u8]).unwrap();
+							oracle
+								.fuzz_from_bytes(&[choice as u8])
+								.expect("oracle accepts a valid choice byte");
 							oracle.current_state()
 						})
 						.collect();

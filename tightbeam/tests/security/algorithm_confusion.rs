@@ -35,10 +35,14 @@ use tightbeam::{
 	tb_assert_spec, tb_process_spec, tb_scenario,
 	testing::{ScenarioConf, SetupEnv},
 	trace::TraceCollector,
+	utils::urn::Urn,
 	TightBeamError,
 };
 
 use crate::common::security::{deterministic_signing_key, expectation_failure, test_certificate};
+
+pub(crate) const FOREIGN_OID_REJECTED: Urn<'static> =
+	Urn::new("test", "event:algorithm-confusion/foreign-oid-rejected");
 
 tb_assert_spec! {
 	pub AlgorithmConfusionSpec,
@@ -46,7 +50,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(foreign_oid_rejected, exactly!(1u32))
+			(FOREIGN_OID_REJECTED, exactly!(1u32))
 		]
 	}
 }
@@ -54,11 +58,11 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub AlgorithmConfusionProcess,
 	events {
-		observable { "foreign_oid_rejected" }
+		observable { FOREIGN_OID_REJECTED }
 		hidden { }
 	}
 	states {
-		Idle => { "foreign_oid_rejected" => Done },
+		Idle => { FOREIGN_OID_REJECTED => Done },
 		Done => { }
 	}
 	terminal { Done }
@@ -86,13 +90,11 @@ job! {
 		let spki_der = cert.tbs_certificate.subject_public_key_info.to_der()?;
 
 		let message: &[u8] = b"tbs-certificate-bytes";
-		let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, message)
-			.map_err(|_| expectation_failure("signing failed"))?;
+		let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&signing_key, message).map_err(|_| expectation_failure("signing failed"))?;
 		let signature_bytes = signature.to_bytes();
 
-		let policy = Secp256k1Policy;
-
 		// The signature genuinely verifies under the real secp256k1 ECDSA OID.
+		let policy = Secp256k1Policy;
 		policy
 			.verify_signature(&SIGNER_ECDSA_WITH_SHA3_256, &spki_der, message, signature_bytes.as_ref())
 			.map_err(|_| expectation_failure("baseline verification under the genuine OID failed"))?;
@@ -100,7 +102,7 @@ job! {
 		// Under an unrelated algorithm OID a sound policy must refuse it.
 		match policy.verify_signature(&AES_256_GCM, &spki_der, message, signature_bytes.as_ref()) {
 			Err(_) => {
-				trace.event(AlgorithmConfusionSpec::foreign_oid_rejected)?;
+				trace.event(FOREIGN_OID_REJECTED)?;
 			}
 			Ok(_) => return Err(expectation_failure("signature accepted under an unsupported algorithm OID")),
 		}

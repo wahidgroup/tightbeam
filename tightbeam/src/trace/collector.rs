@@ -3,35 +3,27 @@
 use core::cell::Cell;
 use core::time::Duration;
 
-#[cfg(all(feature = "std", feature = "testing-fault"))]
+use std::borrow::Cow;
+use std::sync::Arc;
+#[cfg(all(feature = "instrument", not(target_family = "wasm")))]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use core::fmt;
+#[cfg(feature = "testing-fault")]
 use std::collections::HashMap;
-#[cfg(feature = "std")]
-use std::{
-	borrow::Cow,
-	sync::{Arc, Mutex},
-};
+#[cfg(any(test, feature = "testing", feature = "instrument", feature = "testing-fault"))]
+use std::sync::Mutex;
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-	borrow::Cow,
-	sync::{Arc, Mutex},
-};
-
-use crate::testing::assertions::{Assertion, AssertionLabel, AssertionValue};
-use crate::trace::TraceConfigBuilder;
+use crate::trace::{AssertionValue, TraceConfigBuilder};
 use crate::utils::urn::Urn;
-use crate::Frame;
-
-#[cfg(feature = "instrument")]
-use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "testing-fault")]
 use crate::constants::DEFAULT_FAULT_SEED;
 #[cfg(feature = "instrument")]
 use crate::crypto::hash::{Digest, Sha3_256};
 #[cfg(feature = "instrument")]
-use crate::instrumentation::{events, TbEvent, TbInstrumentationConfig};
-#[cfg(feature = "policy")]
+use crate::instrumentation::{events, BoundedMemorySink, EventSink, TbEvent, TbInstrumentationConfig};
+#[cfg(all(feature = "policy", any(test, feature = "testing")))]
 use crate::policy::TransitStatus;
 #[cfg(feature = "testing-fault")]
 use crate::testing::fdr::FaultModel;
@@ -39,30 +31,20 @@ use crate::testing::fdr::FaultModel;
 use crate::testing::fdr::InjectionStrategy;
 #[cfg(feature = "logging")]
 use crate::trace::logging::LogRecord;
-#[cfg(feature = "transport")]
+#[cfg(any(test, feature = "testing"))]
+use crate::trace::{Assertion, AssertionLabel};
+#[cfg(all(feature = "transport", any(test, feature = "testing")))]
 use crate::transport::error::TransportError;
+#[cfg(any(test, feature = "testing"))]
+use crate::Frame;
 
-/// Trait for converting types into event labels
+/// Trait for converting types into event labels.
+///
+/// Event identity is a URN: only URN forms convert. Raw strings are
+/// rejected at compile time so every emitted label resolves to an entry
+/// in a URN inventory (crate: [`crate::instrumentation::events`]).
 pub trait IntoEventLabel {
 	fn into_label(self) -> Cow<'static, str>;
-}
-
-impl IntoEventLabel for &'static str {
-	fn into_label(self) -> Cow<'static, str> {
-		Cow::Borrowed(self)
-	}
-}
-
-impl IntoEventLabel for String {
-	fn into_label(self) -> Cow<'static, str> {
-		Cow::Owned(self)
-	}
-}
-
-impl IntoEventLabel for &String {
-	fn into_label(self) -> Cow<'static, str> {
-		Cow::Owned(self.to_owned())
-	}
 }
 
 impl IntoEventLabel for Urn<'_> {
@@ -78,12 +60,30 @@ impl IntoEventLabel for &Urn<'_> {
 }
 
 /// Configuration for trace collection
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct TraceConfig {
 	#[cfg(feature = "instrument")]
 	pub instrumentation: Option<TbInstrumentationConfig>,
+	/// Event retention/export sink. `None` uses the default bounded
+	/// in-memory buffer ([`BoundedMemorySink`]) sized by
+	/// `instrumentation.max_events`.
+	#[cfg(feature = "instrument")]
+	pub sink: Option<Arc<dyn EventSink>>,
 	#[cfg(feature = "logging")]
 	pub logger: Option<super::logging::LoggerConfig>,
+}
+
+impl fmt::Debug for TraceConfig {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let mut s = f.debug_struct("TraceConfig");
+		#[cfg(feature = "instrument")]
+		s.field("instrumentation", &self.instrumentation);
+		#[cfg(feature = "instrument")]
+		s.field("sink", &self.sink.as_ref().map(|_| "<dyn EventSink>"));
+		#[cfg(feature = "logging")]
+		s.field("logger", &self.logger);
+		s.finish()
+	}
 }
 
 impl TraceConfig {
@@ -95,6 +95,7 @@ impl TraceConfig {
 	pub fn with_instrumentation(config: TbInstrumentationConfig) -> Self {
 		Self {
 			instrumentation: Some(config),
+			sink: None,
 			#[cfg(feature = "logging")]
 			logger: None,
 		}
@@ -111,6 +112,7 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 	fn from(config: TbInstrumentationConfig) -> Self {
 		Self {
 			instrumentation: Some(config),
+			sink: None,
 			#[cfg(feature = "logging")]
 			logger: None,
 		}
@@ -125,9 +127,11 @@ impl From<TbInstrumentationConfig> for TraceConfig {
 /// # use core::time::Duration;
 /// # use tightbeam::error::TightBeamError;
 /// # use tightbeam::trace::{TraceCollector, EventValue};
+/// # use tightbeam::utils::urn::Urn;
+/// # const ROUTE_STEP: Urn<'static> = Urn::new("tightbeam", "event:route/step");
 /// # fn example() -> Result<(), TightBeamError> {
 /// # let trace = TraceCollector::default();
-/// trace.event("process")?
+/// trace.event(ROUTE_STEP)?
 ///     .with_timing(Duration::from_millis(5))
 ///     .with_payload(b"payload")
 ///     .emit();
@@ -249,52 +253,55 @@ impl<'a> EventBuilder<'a> {
 			}
 		}
 
-		let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
 		let label = core::mem::take(&mut self.label);
-		let tags = self.tags.take().map(|t| t.into_owned()).unwrap_or_default();
-		let assertion = match self.value.take() {
+		let value = self.value.take();
+
+		#[cfg(feature = "instrument")]
+		match &value {
 			Some(EventValue::None) | None => {
-				#[cfg(feature = "instrument")]
-				{
-					// Use TIMING_WCET URN if duration is specified, otherwise ASSERT_LABEL
-					let urn = if self.duration_ns.is_some() {
-						events::TIMING_WCET
-					} else {
-						events::ASSERT_LABEL
-					};
+				// Use TIMING_WCET URN if duration is specified, otherwise ASSERT_LABEL
+				let urn = if self.duration_ns.is_some() {
+					events::TIMING_WCET
+				} else {
+					events::ASSERT_LABEL
+				};
 
-					self.collector
-						.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
-				}
-
-				#[cfg(feature = "testing-fuzz")]
-				self.collector.dispatch_csp_event(&label);
-
-				Assertion::new(seq, AssertionLabel::Custom(label), tags, None)
+				self.collector
+					.emit_internal(urn, Some(&label), self.payload, self.duration_ns, None);
 			}
 			Some(EventValue::Value(assertion_value)) => {
-				#[cfg(feature = "instrument")]
-				{
-					let value_str = format_assertion_value(&assertion_value);
-					self.collector.emit_internal(
-						events::ASSERT_PAYLOAD,
-						Some(&label),
-						Some(value_str.as_bytes()),
-						self.duration_ns,
-						None,
-					);
-				}
-
-				#[cfg(feature = "testing-fuzz")]
-				self.collector.dispatch_csp_event(&label);
-
-				Assertion::with_value(seq, AssertionLabel::Custom(label), tags, None, assertion_value)
+				let value_str = format_assertion_value(assertion_value);
+				self.collector.emit_internal(
+					events::ASSERT_PAYLOAD,
+					Some(&label),
+					Some(value_str.as_bytes()),
+					self.duration_ns,
+					None,
+				);
 			}
-		};
-
-		if let Ok(mut assertions) = self.collector.state.assertions.lock() {
-			assertions.push(assertion);
 		}
+
+		#[cfg(feature = "testing-fuzz")]
+		self.collector.dispatch_csp_event(&label);
+
+		#[cfg(any(test, feature = "testing"))]
+		{
+			let seq = self.collector.state.assertions.lock().map(|a| a.len()).unwrap_or(0);
+			let tags = self.tags.take().map(|t| t.into_owned()).unwrap_or_default();
+			let assertion = match value {
+				Some(EventValue::None) | None => Assertion::new(seq, AssertionLabel::Custom(label), tags, None),
+				Some(EventValue::Value(assertion_value)) => {
+					Assertion::with_value(seq, AssertionLabel::Custom(label), tags, None, assertion_value)
+				}
+			};
+
+			if let Ok(mut assertions) = self.collector.state.assertions.lock() {
+				assertions.push(assertion);
+			}
+		}
+
+		#[cfg(not(any(test, feature = "testing")))]
+		let _ = (label, value, self.tags.take(), self.collector);
 	}
 }
 
@@ -309,20 +316,88 @@ pub struct TraceCollector {
 	state: Arc<TraceState>,
 }
 
+/// Debug-opaque handle around the configured event sink.
+#[cfg(feature = "instrument")]
+struct SinkHandle(Arc<dyn EventSink>);
+
+#[cfg(feature = "instrument")]
+impl fmt::Debug for SinkHandle {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("<dyn EventSink>")
+	}
+}
+
+#[cfg(feature = "instrument")]
+impl Default for SinkHandle {
+	fn default() -> Self {
+		Self(Arc::new(BoundedMemorySink::default()))
+	}
+}
+
+/// Monotonic trace clock: event timestamps count nanoseconds since the
+/// collector's construction. The construction wall-clock is recorded once
+/// (`TRACE_CLOCK_ORIGIN`) so absolute times are reconstructible without a
+/// per-event syscall.
+///
+/// `wasm` targets have no monotonic `Instant`; there the clock is inert
+/// and events carry no timestamps.
+#[cfg(feature = "instrument")]
+#[derive(Debug)]
+struct TraceClock {
+	#[cfg(not(target_family = "wasm"))]
+	origin: Instant,
+	#[cfg(not(target_family = "wasm"))]
+	origin_unix_ns: u128,
+	origin_recorded: core::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "instrument")]
+impl Default for TraceClock {
+	fn default() -> Self {
+		Self {
+			#[cfg(not(target_family = "wasm"))]
+			origin: Instant::now(),
+			// A wall clock before the epoch reads as origin zero rather
+			// than failing collector construction.
+			#[cfg(not(target_family = "wasm"))]
+			origin_unix_ns: SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map(|since| since.as_nanos())
+				.unwrap_or_default(),
+			origin_recorded: core::sync::atomic::AtomicBool::new(false),
+		}
+	}
+}
+
+#[cfg(feature = "instrument")]
+impl TraceClock {
+	fn now_ns(&self) -> Option<u64> {
+		#[cfg(not(target_family = "wasm"))]
+		{
+			Some(self.origin.elapsed().as_nanos() as u64)
+		}
+		#[cfg(target_family = "wasm")]
+		{
+			None
+		}
+	}
+}
+
 #[derive(Debug)]
 struct TraceState {
+	#[cfg(any(test, feature = "testing"))]
 	assertions: Mutex<Vec<Assertion>>,
+	/// Owns event retention: the default is a bounded in-memory buffer
+	/// ([`BoundedMemorySink`]); consumers may inject their own via
+	/// [`TraceConfig::sink`]
 	#[cfg(feature = "instrument")]
-	events: Mutex<Vec<TbEvent>>,
+	sink: SinkHandle,
 	#[cfg(feature = "instrument")]
 	config: TbInstrumentationConfig,
 	#[cfg(feature = "instrument")]
 	seq: Mutex<u32>,
-	/// Set when an event is dropped because `max_events` was reached;
-	/// propagated into `EvidenceArtifact.overflow` so under-reporting
-	/// traces cannot claim completeness
 	#[cfg(feature = "instrument")]
-	overflow: AtomicBool,
+	clock: TraceClock,
 	#[cfg(feature = "testing-fuzz")]
 	oracle: Option<crate::testing::fuzz::FuzzContext>,
 	#[cfg(feature = "testing-fault")]
@@ -338,15 +413,16 @@ struct TraceState {
 impl Default for TraceState {
 	fn default() -> Self {
 		Self {
+			#[cfg(any(test, feature = "testing"))]
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
-			events: Mutex::new(Vec::new()),
+			sink: SinkHandle::default(),
 			#[cfg(feature = "instrument")]
 			config: TbInstrumentationConfig::default(),
 			#[cfg(feature = "instrument")]
 			seq: Mutex::new(0),
 			#[cfg(feature = "instrument")]
-			overflow: AtomicBool::new(false),
+			clock: TraceClock::default(),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
 			#[cfg(feature = "testing-fault")]
@@ -363,13 +439,16 @@ impl Default for TraceState {
 
 impl TraceState {
 	#[cfg(feature = "instrument")]
-	fn with_config(config: TbInstrumentationConfig) -> Self {
+	fn with_config(config: TbInstrumentationConfig, sink: Option<Arc<dyn EventSink>>) -> Self {
+		let sink = SinkHandle(sink.unwrap_or_else(|| Arc::new(BoundedMemorySink::new(config.max_events))));
+
 		Self {
+			#[cfg(any(test, feature = "testing"))]
 			assertions: Mutex::new(Vec::new()),
-			events: Mutex::new(Vec::new()),
+			sink,
 			config,
 			seq: Mutex::new(0),
-			overflow: AtomicBool::new(false),
+			clock: TraceClock::default(),
 			#[cfg(feature = "testing-fuzz")]
 			oracle: None,
 			#[cfg(feature = "testing-fault")]
@@ -386,15 +465,16 @@ impl TraceState {
 	#[cfg(feature = "testing-fuzz")]
 	fn with_oracle(input: Vec<u8>, process: crate::testing::specs::csp::Process) -> Self {
 		Self {
+			// The testing-fuzz feature implies testing, so the field exists here
 			assertions: Mutex::new(Vec::new()),
 			#[cfg(feature = "instrument")]
-			events: Mutex::new(Vec::new()),
+			sink: SinkHandle::default(),
 			#[cfg(feature = "instrument")]
 			config: TbInstrumentationConfig::default(),
 			#[cfg(feature = "instrument")]
 			seq: Mutex::new(0),
 			#[cfg(feature = "instrument")]
-			overflow: AtomicBool::new(false),
+			clock: TraceClock::default(),
 			oracle: Some(crate::testing::fuzz::FuzzContext::new(input, process)),
 			#[cfg(feature = "testing-fault")]
 			runtime_fault_model: None,
@@ -426,8 +506,8 @@ impl TraceCollector {
 	}
 
 	#[cfg(feature = "instrument")]
-	fn with_config(config: TbInstrumentationConfig) -> Self {
-		Self { state: Arc::new(TraceState::with_config(config)) }
+	fn with_config(config: TbInstrumentationConfig, sink: Option<Arc<dyn EventSink>>) -> Self {
+		Self { state: Arc::new(TraceState::with_config(config, sink)) }
 	}
 
 	/// Configure logging backend for this trace collector
@@ -457,6 +537,9 @@ impl TraceCollector {
 	/// `tb_scenario!`-generated fuzz harnesses (feature `testing-fuzz`),
 	/// where a missing `csp:` parameter is a harness construction bug that
 	/// must abort the fuzz run rather than continue unguided.
+	// Test-harness surface: the documented abort is the contract, so the
+	// zero-panic deny is waived for this accessor alone.
+	#[allow(clippy::expect_used)]
 	#[cfg(feature = "testing-fuzz")]
 	pub fn oracle(&self) -> &crate::testing::fuzz::FuzzContext {
 		self.state
@@ -474,7 +557,8 @@ impl TraceCollector {
 	/// # Why `&Cow<'static, str>` instead of `&str`
 	///
 	/// This violates clippy's ptr_arg lint but is necessary for zero-copy:
-	/// - We must store the label in a HashMap<Cow<'static, str>, u32> for fault injection counters
+	/// - We must store the label in a HashMap<Cow<'static, str>, u32> for
+	///   fault injection counters
 	/// - `Cow::clone()` on `Cow::Borrowed` is zero-cost (just copies the pointer)
 	/// - Taking `&str` would force `Cow::Borrowed(label)` construction
 	/// - This maintains zero-allocation for static labels while supporting dynamic ones
@@ -541,9 +625,10 @@ impl TraceCollector {
 	///
 	/// # Zero-allocation option
 	/// Pass a static slice to avoid allocation:
+	///
 	/// ```ignore
 	/// const TAGS: &[&str] = &["critical", "network"];
-	/// trace.event_with("event", TAGS, value)?
+	/// trace.event_with(events::ROUTE_STEP, TAGS, value)?
 	/// ```
 	pub fn event_with<V>(
 		&self,
@@ -606,41 +691,110 @@ impl TraceCollector {
 	) {
 		let cfg = self.state.config;
 
-		// Capacity check and push happen under one lock acquisition so
-		// concurrent emitters cannot overshoot `max_events` between the
-		// check and the insert.
-		if let Ok(mut events) = self.state.events.lock() {
-			if (events.len() as u32) >= cfg.max_events {
-				self.state.overflow.store(true, Ordering::Relaxed);
-				return;
-			}
+		let payload_hash = if cfg.enable_payloads {
+			payload.map(hash_payload)
+		} else {
+			None
+		};
 
-			let payload_hash = if cfg.enable_payloads {
-				payload.map(hash_payload)
+		// The sink owns retention: events dropped by a bounded sink still
+		// consume a sequence number, so gaps in `seq` reveal exactly where
+		// truncation occurred.
+		self.state.sink.0.emit(TbEvent {
+			seq: self.next_seq(),
+			urn,
+			label: label.map(|l| l.to_string()),
+			payload_hash,
+			duration_ns: if cfg.record_durations {
+				duration_ns
 			} else {
 				None
-			};
-
-			events.push(TbEvent {
-				seq: self.next_seq(),
-				urn,
-				label: label.map(|l| l.to_string()),
-				payload_hash,
-				duration_ns: if cfg.record_durations {
-					duration_ns
-				} else {
-					None
-				},
-				timestamp_ns,
-				flags: 0,
-				extras: None,
-			});
-		}
+			},
+			timestamp_ns,
+			flags: 0,
+			extras: None,
+		});
 	}
 
 	#[cfg(feature = "instrument")]
 	pub fn emit(&self, event_urn: Urn<'static>, label: impl AsRef<str>) {
 		self.emit_with_payload(event_urn, label.as_ref(), None);
+	}
+
+	/// Record the trace clock's wall-clock origin once per collector, so
+	/// relative `timestamp_ns` values reconstruct to absolute times.
+	#[cfg(feature = "instrument")]
+	fn record_clock_origin(&self) {
+		use core::sync::atomic::Ordering;
+
+		if self.state.clock.origin_recorded.swap(true, Ordering::Relaxed) {
+			return;
+		}
+
+		#[cfg(not(target_family = "wasm"))]
+		self.emit_internal(
+			crate::instrumentation::events::TRACE_CLOCK_ORIGIN,
+			Some(&self.state.clock.origin_unix_ns.to_string()),
+			None,
+			None,
+			Some(0),
+		);
+	}
+
+	/// Dual-write a production control-plane event: the URN into the
+	/// instrument log, plus the same URN as assertion label for spec
+	/// assertions and CSP alphabets when the testing layer observes the
+	/// trace.
+	#[cfg(feature = "instrument")]
+	pub fn emit_event(&self, event: Urn<'static>) {
+		#[cfg(feature = "testing")]
+		{
+			if let Ok(builder) = self.event(&event) {
+				builder.emit()
+			}
+		}
+
+		self.record_clock_origin();
+		self.emit_internal(event, None, None, None, self.state.clock.now_ns());
+	}
+
+	/// Dual-write a production control-plane event carrying evidence: the
+	/// label records why (e.g. the refusing status) and the payload
+	/// records who (e.g. the peer's SPKI DER) as its SHA3-256 hash when
+	/// payload capture is enabled.
+	#[cfg(feature = "instrument")]
+	pub fn emit_event_with_evidence(&self, event: Urn<'static>, label: &str, payload: Option<&[u8]>) {
+		#[cfg(feature = "testing")]
+		{
+			if let Ok(builder) = self.event(&event) {
+				builder.emit()
+			}
+		}
+
+		self.record_clock_origin();
+		self.emit_internal(event, Some(label), payload, None, self.state.clock.now_ns());
+	}
+
+	/// Dual-write a production control-plane event carrying a
+	/// spec-assertable value: the label records why (e.g. the GoAway
+	/// reason name) and the value carries its wire code for `equals!`
+	/// assertions.
+	#[cfg(feature = "instrument")]
+	pub fn emit_event_with_value<V>(&self, event: Urn<'static>, label: &str, value: V)
+	where
+		V: Into<EventValue>,
+	{
+		#[cfg(feature = "testing")]
+		{
+			if let Ok(builder) = self.event_with(&event, &[], value) {
+				builder.emit()
+			}
+		}
+		#[cfg(not(feature = "testing"))]
+		let _ = value;
+
+		self.record_clock_origin();
+		self.emit_internal(event, Some(label), None, None, self.state.clock.now_ns());
 	}
 
 	#[cfg(feature = "instrument")]
@@ -663,6 +817,7 @@ impl TraceCollector {
 	}
 
 	/// Drain assertions into a vector
+	#[cfg(any(test, feature = "testing"))]
 	pub fn drain_assertions(&self) -> Vec<Assertion> {
 		if let Ok(mut assertions) = self.state.assertions.lock() {
 			assertions.drain(..).collect()
@@ -671,24 +826,20 @@ impl TraceCollector {
 		}
 	}
 
-	/// Drain events into a vector
+	/// Drain retained events from the configured sink
 	#[cfg(feature = "instrument")]
 	pub fn drain_events(&self) -> Vec<TbEvent> {
-		if let Ok(mut events) = self.state.events.lock() {
-			events.drain(..).collect()
-		} else {
-			Vec::new()
-		}
+		self.state.sink.0.drain()
 	}
 
-	/// Whether any event was dropped because `max_events` was reached
+	/// Whether the configured sink dropped any event (sticky)
 	///
 	/// Feed this into [`EvidenceArtifact::finalize`]
 	/// (crate::instrumentation::EvidenceArtifact::finalize) so evidence
 	/// built from a truncated trace reports `overflow = true`.
 	#[cfg(feature = "instrument")]
 	pub fn overflowed(&self) -> bool {
-		self.state.overflow.load(Ordering::Relaxed)
+		self.state.sink.0.overflowed()
 	}
 }
 
@@ -699,8 +850,8 @@ impl From<TraceConfig> for TraceCollector {
 			let mut collector = Self::default();
 
 			#[cfg(feature = "instrument")]
-			if let Some(instrumentation) = config.instrumentation {
-				collector = Self::with_config(instrumentation);
+			if config.instrumentation.is_some() || config.sink.is_some() {
+				collector = Self::with_config(config.instrumentation.unwrap_or_default(), config.sink);
 			}
 
 			#[cfg(feature = "logging")]
@@ -754,28 +905,35 @@ fn format_assertion_value(value: &AssertionValue) -> String {
 }
 
 /// Consumed execution trace after await completion.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct ConsumedTrace {
-	#[cfg(feature = "instrument")]
-	pub instrument_events: Vec<TbEvent>,
 	pub assertions: Vec<Assertion>,
-	pub gate_decision: Option<TransitStatus>,
 	pub accepted_frame: Option<Frame>,
 	pub rejected_frame: Option<Frame>,
 	pub response: Option<Frame>,
+
+	#[cfg(feature = "instrument")]
+	pub instrument_events: Vec<TbEvent>,
+	#[cfg(feature = "policy")]
+	pub gate_decision: Option<TransitStatus>,
+	#[cfg(feature = "transport")]
 	pub error: Option<TransportError>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ConsumedTrace {
 	pub fn new() -> Self {
 		Self {
-			#[cfg(feature = "instrument")]
-			instrument_events: Vec::new(),
 			assertions: Vec::new(),
-			gate_decision: None,
 			accepted_frame: None,
 			rejected_frame: None,
 			response: None,
+			#[cfg(feature = "instrument")]
+			instrument_events: Vec::new(),
+			#[cfg(feature = "policy")]
+			gate_decision: None,
+			#[cfg(feature = "transport")]
 			error: None,
 		}
 	}
@@ -791,15 +949,23 @@ impl ConsumedTrace {
 
 	/// Determine execution mode based on trace outcome
 	pub fn execution_mode(&self) -> ExecutionMode {
+		#[cfg(feature = "transport")]
 		if self.error.is_some() {
-			ExecutionMode::Error
-		} else if matches!(self.gate_decision, Some(TransitStatus::Ok)) {
-			ExecutionMode::Accept
-		} else if self.gate_decision.is_some() {
-			ExecutionMode::Reject
-		} else {
+			return ExecutionMode::Error;
+		}
+		#[cfg(feature = "policy")]
+		{
+			if matches!(self.gate_decision, Some(TransitStatus::Ok)) {
+				return ExecutionMode::Accept;
+			}
+			if self.gate_decision.is_some() {
+				return ExecutionMode::Reject;
+			}
+
 			ExecutionMode::Error
 		}
+		#[cfg(not(feature = "policy"))]
+		ExecutionMode::Accept
 	}
 
 	pub fn has_response(&self) -> bool {
@@ -849,6 +1015,7 @@ where
 }
 
 /// Execution mode classification for specs
+#[cfg(any(test, feature = "testing"))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
 	Accept,
@@ -856,6 +1023,7 @@ pub enum ExecutionMode {
 	Error,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl ExecutionMode {
 	pub fn as_str(&self) -> &'static str {
 		match self {
@@ -868,7 +1036,11 @@ impl ExecutionMode {
 
 #[cfg(test)]
 mod tests {
+	use crate::utils::urn::Urn;
 	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};
+
+	const ALPHA: Urn<'static> = Urn::new("test", "event:collector/alpha");
+	const BETA: Urn<'static> = Urn::new("test", "event:collector/beta");
 
 	tb_assert_spec! {
 		pub TraceCollectorSpec,
@@ -876,8 +1048,8 @@ mod tests {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				(alpha, exactly!(1)),
-				(beta, exactly!(1)),
+				(ALPHA, exactly!(1)),
+				(BETA, exactly!(1)),
 			]
 		}
 	}
@@ -887,8 +1059,8 @@ mod tests {
 		spec: TraceCollectorSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| {
-				trace.event(TraceCollectorSpec::alpha)?;
-				trace.event(TraceCollectorSpec::beta)?;
+				trace.event(ALPHA)?;
+				trace.event(BETA)?;
 				Ok(())
 			}
 		}
@@ -925,6 +1097,80 @@ mod tests {
 
 			assert!(collector.overflowed());
 			assert_eq!(collector.drain_events().len(), 2);
+		}
+	}
+
+	#[cfg(feature = "instrument")]
+	mod sink {
+		use std::sync::{Arc, Mutex};
+
+		use crate::instrumentation::{events, EventSink, TbEvent, TbInstrumentationConfig};
+		use crate::trace::{TraceCollector, TraceConfig};
+
+		/// Loss-free sink: retains every event with no cap.
+		#[derive(Default)]
+		struct UnboundedSink {
+			events: Mutex<Vec<TbEvent>>,
+		}
+
+		impl EventSink for UnboundedSink {
+			fn emit(&self, event: TbEvent) {
+				if let Ok(mut events) = self.events.lock() {
+					events.push(event);
+				}
+			}
+
+			fn drain(&self) -> Vec<TbEvent> {
+				if let Ok(mut events) = self.events.lock() {
+					events.drain(..).collect()
+				} else {
+					Vec::new()
+				}
+			}
+
+			fn overflowed(&self) -> bool {
+				false
+			}
+		}
+
+		#[test]
+		fn consumer_sink_replaces_bounded_buffer() {
+			let config = TbInstrumentationConfig { max_events: 1, ..Default::default() };
+			let collector = TraceCollector::from(
+				TraceConfig::builder()
+					.with_instrumentation(config)
+					.with_sink(Arc::new(UnboundedSink::default()))
+					.build(),
+			);
+
+			collector.emit(events::START, "first");
+			collector.emit(events::END, "second");
+			collector.emit(events::END, "third");
+
+			assert!(!collector.overflowed());
+			assert_eq!(collector.drain_events().len(), 3);
+		}
+
+		#[test]
+		fn sink_without_instrumentation_config_still_receives_events() {
+			let collector =
+				TraceCollector::from(TraceConfig::builder().with_sink(Arc::new(UnboundedSink::default())).build());
+
+			collector.emit(events::START, "only");
+
+			assert_eq!(collector.drain_events().len(), 1);
+		}
+
+		#[test]
+		fn sink_events_carry_contiguous_seq() {
+			let collector =
+				TraceCollector::from(TraceConfig::builder().with_sink(Arc::new(UnboundedSink::default())).build());
+
+			collector.emit(events::START, "first");
+			collector.emit(events::END, "second");
+
+			let seqs: Vec<u32> = collector.drain_events().iter().map(|e| e.seq).collect();
+			assert_eq!(seqs, vec![0, 1]);
 		}
 	}
 }

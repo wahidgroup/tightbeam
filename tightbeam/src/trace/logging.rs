@@ -4,12 +4,12 @@
 //! output targets (stdout, file, SIEM, etc.) while maintaining no_std
 //! compatibility for core traits.
 
+use core::fmt;
+
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::Cow, collections::BTreeMap as HashMap, vec::Vec};
 #[cfg(feature = "std")]
 use std::{borrow::Cow, collections::HashMap};
-
-use core::fmt;
 
 /// RFC 5424 Severity Levels
 ///
@@ -272,6 +272,19 @@ mod tests {
 
 	use super::*;
 	use crate::trace::TraceCollector;
+	use crate::utils::urn::Urn;
+
+	const TEST1: Urn<'static> = Urn::new("test", "event:log/test1");
+	const TEST2: Urn<'static> = Urn::new("test", "event:log/test2");
+	const NO_LOG: Urn<'static> = Urn::new("test", "event:log/no-log");
+	const SHOULD_LOG: Urn<'static> = Urn::new("test", "event:log/should-log");
+	const EMERGENCY: Urn<'static> = Urn::new("test", "event:log/emergency");
+	const ERROR: Urn<'static> = Urn::new("test", "event:log/error");
+	const WARNING: Urn<'static> = Urn::new("test", "event:log/warning");
+	const NOTICE: Urn<'static> = Urn::new("test", "event:log/notice");
+	const INFO: Urn<'static> = Urn::new("test", "event:log/info");
+	const DEBUG: Urn<'static> = Urn::new("test", "event:log/debug");
+	const TEST: Urn<'static> = Urn::new("test", "event:log/test");
 
 	#[test]
 	fn test_log_level_ordering() {
@@ -350,15 +363,15 @@ mod tests {
 			LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug)).with_default_level(LogLevel::Info);
 		let trace = TraceCollector::default().with_logger(config);
 
-		trace.event("test1")?.emit();
-		trace.event("test2")?.with_log_level(LogLevel::Error).emit();
+		trace.event(TEST1)?.emit();
+		trace.event(TEST2)?.with_log_level(LogLevel::Error).emit();
 
 		let records = captured.lock().ok().map(|r| r.clone()).unwrap_or_default();
 		assert_eq!(records.len(), 2);
 		assert_eq!(records[0].0, LogLevel::Info);
-		assert_eq!(records[0].1, "test1");
+		assert_eq!(records[0].1, TEST1.to_string());
 		assert_eq!(records[1].0, LogLevel::Error);
-		assert_eq!(records[1].1, "test2");
+		assert_eq!(records[1].1, TEST2.to_string());
 
 		Ok(())
 	}
@@ -374,13 +387,13 @@ mod tests {
 		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 
-		trace.event("no_log")?.emit();
-		trace.event("should_log")?.with_log_level(LogLevel::Warning).emit();
+		trace.event(NO_LOG)?.emit();
+		trace.event(SHOULD_LOG)?.with_log_level(LogLevel::Warning).emit();
 
 		let records = captured.lock().ok().map(|r| r.clone()).unwrap_or_default();
 		assert_eq!(records.len(), 1);
 		assert_eq!(records[0].0, LogLevel::Warning);
-		assert_eq!(records[0].1, "should_log");
+		assert_eq!(records[0].1, SHOULD_LOG.to_string());
 
 		Ok(())
 	}
@@ -397,18 +410,18 @@ mod tests {
 		let config = LoggerConfig::new(Box::new(backend), LogFilter::new(LogLevel::Warning));
 		let trace = TraceCollector::default().with_logger(config);
 
-		trace.event("emergency")?.with_log_level(LogLevel::Emergency).emit();
-		trace.event("error")?.with_log_level(LogLevel::Error).emit();
-		trace.event("warning")?.with_log_level(LogLevel::Warning).emit();
-		trace.event("notice")?.with_log_level(LogLevel::Notice).emit();
-		trace.event("info")?.with_log_level(LogLevel::Info).emit();
-		trace.event("debug")?.with_log_level(LogLevel::Debug).emit();
+		trace.event(EMERGENCY)?.with_log_level(LogLevel::Emergency).emit();
+		trace.event(ERROR)?.with_log_level(LogLevel::Error).emit();
+		trace.event(WARNING)?.with_log_level(LogLevel::Warning).emit();
+		trace.event(NOTICE)?.with_log_level(LogLevel::Notice).emit();
+		trace.event(INFO)?.with_log_level(LogLevel::Info).emit();
+		trace.event(DEBUG)?.with_log_level(LogLevel::Debug).emit();
 
 		let records = captured.lock().ok().map(|r| r.clone()).unwrap_or_default();
 		assert_eq!(records.len(), 3);
-		assert_eq!(records[0].1, "emergency");
-		assert_eq!(records[1].1, "error");
-		assert_eq!(records[2].1, "warning");
+		assert_eq!(records[0].1, EMERGENCY.to_string());
+		assert_eq!(records[1].1, ERROR.to_string());
+		assert_eq!(records[2].1, WARNING.to_string());
 
 		Ok(())
 	}
@@ -432,14 +445,14 @@ mod tests {
 		let config = LoggerConfig::new(Box::new(multiplex), LogFilter::new(LogLevel::Debug));
 		let trace = TraceCollector::default().with_logger(config);
 
-		trace.event("test")?.with_log_level(LogLevel::Info).emit();
+		trace.event(TEST)?.with_log_level(LogLevel::Info).emit();
 
 		let records1 = captured1.lock().ok().map(|r| r.clone()).unwrap_or_default();
 		let records2 = captured2.lock().ok().map(|r| r.clone()).unwrap_or_default();
 		assert_eq!(records1.len(), 1);
 		assert_eq!(records2.len(), 1);
-		assert_eq!(records1[0].1, "test");
-		assert_eq!(records2[0].1, "test");
+		assert_eq!(records1[0].1, TEST.to_string());
+		assert_eq!(records2[0].1, TEST.to_string());
 
 		Ok(())
 	}
@@ -448,7 +461,7 @@ mod tests {
 	#[test]
 	fn test_trace_collector_default() -> Result<(), crate::TightBeamError> {
 		let trace = TraceCollector::default();
-		trace.event("test")?.emit();
+		trace.event(TEST)?.emit();
 		Ok(())
 	}
 
@@ -456,7 +469,7 @@ mod tests {
 	#[test]
 	fn test_trace_collector_new() -> Result<(), crate::TightBeamError> {
 		let trace = TraceCollector::new();
-		trace.event("test")?.emit();
+		trace.event(TEST)?.emit();
 		Ok(())
 	}
 }

@@ -336,7 +336,7 @@ macro_rules! tb_scenario {
 
 	// ===== HELPER: Verify specs and call hooks (DRY) =====
 	(@verify_and_call_hooks $config:expr, $hook_ctx:expr, $exec_result:expr) => {
-		// Verify specs
+		// Verify Layer 1 assertion specs
 		for spec in $config.specs() {
 			match $crate::testing::specs::verify_trace(*spec, &$hook_ctx.trace) {
 				Err(violation) => {
@@ -348,6 +348,24 @@ macro_rules! tb_scenario {
 					panic!("Spec verification failed for {}: {:?}", spec.id(), violation);
 				}
 				Ok(()) => {}
+			}
+		}
+
+		// Verify Layer 2 CSP process (when configured). Failures travel
+		// the same path as Layer 1: on_fail first, then the panic.
+		#[cfg(feature = "testing-csp")]
+		if let Some(csp) = $config.csp() {
+			let csp_result =
+				$crate::testing::specs::csp::ProcessSpec::validate_trace(csp.as_ref(), &$hook_ctx.trace);
+			if !csp_result.valid {
+				let violation = $crate::testing::specs::SpecViolation::CspProcessViolation(csp_result.violations);
+				if let Some(hooks) = $config.hooks() {
+					if let Some(ref on_fail) = hooks.on_fail {
+						let _ = on_fail(&$hook_ctx, &violation);
+					}
+				}
+
+				panic!("CSP verification failed: {:?}", violation);
 			}
 		}
 
@@ -1023,4 +1041,61 @@ macro_rules! tb_scenario {
 		let hook_ctx = $crate::tb_scenario!(@build_hook_context config, trace, client_result);
 		$crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, client_result);
 	}};
+}
+
+#[cfg(all(test, feature = "testing-csp"))]
+mod tests {
+	use std::borrow::Cow;
+	use std::panic::{catch_unwind, AssertUnwindSafe};
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::Arc;
+
+	use crate::testing::specs::assert::TBSpec;
+	use crate::testing::specs::csp::{CspValidationResult, CspViolation, Event, Process, ProcessSpec, State};
+	use crate::testing::{HookContext, ScenarioConf, TestHooks};
+	use crate::trace::ConsumedTrace;
+
+	struct AlwaysInvalidSpec;
+
+	impl ProcessSpec for AlwaysInvalidSpec {
+		fn validate_trace(&self, _trace: &ConsumedTrace) -> CspValidationResult {
+			CspValidationResult {
+				valid: false,
+				violations: vec![CspViolation::Deadlock { event: Event("noop"), state: State("start") }],
+			}
+		}
+
+		fn to_process_cow(&self) -> Cow<'_, Process> {
+			let process = Process::builder("always_invalid")
+				.initial_state(State("start"))
+				.build()
+				.expect("single-state process builds");
+			Cow::Owned(process)
+		}
+	}
+
+	// Layer 2 CSP failures must travel the same failure path as Layer 1
+	// assertion failures: on_fail runs before the panic, so logging and
+	// cleanup hooks observe the regression.
+	#[test]
+	fn csp_failure_invokes_on_fail_before_panicking() {
+		let failed = Arc::new(AtomicBool::new(false));
+		let observed = Arc::clone(&failed);
+		let hooks = TestHooks {
+			on_pass: None,
+			on_fail: Some(Arc::new(move |_ctx, _violation| {
+				observed.store(true, Ordering::SeqCst);
+				Ok(())
+			})),
+		};
+
+		let config = ScenarioConf::builder().with_csp(AlwaysInvalidSpec).with_hooks(hooks).build();
+		let hook_ctx = HookContext::new(ConsumedTrace::new());
+		let outcome = catch_unwind(AssertUnwindSafe(|| {
+			crate::tb_scenario!(@verify_and_call_hooks config, hook_ctx, Ok::<(), core::fmt::Error>(()));
+		}));
+
+		assert!(outcome.is_err());
+		assert!(failed.load(Ordering::SeqCst));
+	}
 }

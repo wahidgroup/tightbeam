@@ -91,6 +91,22 @@
 //! built on ASN.1 DER encoding.
 
 #![deny(unsafe_code)]
+// Zero-panic: raw `unwrap()` is banned everywhere, tests included. Test
+// helpers state their invariant through `expect`, test cases propagate
+// with `?`. The remaining panic paths are banned in production code, while
+// tests are exempt, and the `testing` fixture surface carries its own
+// scoped allowance (see `src/testing/mod.rs`).
+#![deny(clippy::unwrap_used)]
+#![cfg_attr(
+	not(test),
+	deny(
+		clippy::expect_used,
+		clippy::panic,
+		clippy::unreachable,
+		clippy::todo,
+		clippy::unimplemented
+	)
+)]
 #![cfg_attr(test, allow(clippy::clone_on_ref_ptr))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -118,14 +134,7 @@ pub mod helpers;
 pub mod matrix;
 pub mod oids;
 pub mod prelude;
-#[cfg(feature = "std")]
-pub mod runtime;
-#[cfg(any(test, feature = "testing"))]
-pub mod trace;
 pub mod utils;
-
-#[cfg(feature = "instrument")]
-pub mod instrumentation;
 
 #[cfg(feature = "builder")]
 pub mod builder;
@@ -137,6 +146,8 @@ pub mod compress;
 pub mod crypto;
 #[cfg(feature = "doc")]
 pub mod doc;
+#[cfg(feature = "instrument")]
+pub mod instrumentation;
 pub mod macros;
 #[cfg(feature = "policy")]
 pub mod policy;
@@ -144,8 +155,12 @@ pub mod policy;
 pub mod random;
 #[cfg(feature = "router")]
 pub mod router;
+#[cfg(feature = "std")]
+pub mod runtime;
 #[cfg(feature = "standards")]
 pub mod standards;
+#[cfg(feature = "std")]
+pub mod trace;
 #[cfg(feature = "transport")]
 pub mod transport;
 #[cfg(feature = "rayon")]
@@ -190,96 +205,3 @@ pub mod testing;
 pub type ZeroizingBytes = zeroize::Zeroizing<Vec<u8>>;
 #[cfg(feature = "zeroize")]
 pub type ZeroizingArray<const N: usize> = zeroize::Zeroizing<[u8; N]>;
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn frame_size_calc() -> Result<(), Box<dyn std::error::Error>> {
-		use crate::asn1::*;
-		use crate::cms::cert::IssuerAndSerialNumber;
-		use crate::cms::compressed_data::CompressedData;
-		use crate::cms::content_info::CmsVersion;
-		use crate::cms::enveloped_data::EncryptedContentInfo;
-		use crate::cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier, SignerInfo};
-		use crate::der::{Decode, Encode};
-		use crate::oids::*;
-		use crate::pkcs12::digest_info::DigestInfo;
-		use crate::spki::AlgorithmIdentifier;
-		use crate::x509::name::Name;
-		use crate::x509::serial_number::SerialNumber;
-
-		// Create a square matrix with all zeros (data length must equal n*n)
-		let matrix_size: u8 = 16;
-		let matrix = Asn1Matrix { n: matrix_size, data: vec![0; (matrix_size as usize) * (matrix_size as usize)] };
-
-		// Create metadata with all optional fields
-		let metadata = Metadata {
-			id: vec![0; 16], // 16-byte ID
-			order: 0,
-			compactness: Some(CompressedData {
-				version: CmsVersion::V0,
-				compression_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB, parameters: None },
-				encap_content_info: EncapsulatedContentInfo {
-					econtent_type: DATA,
-					econtent: Some(der::Any::from_der(&der::asn1::OctetString::new(vec![0; 10])?.to_der()?)?),
-				},
-			}),
-			integrity: Some(DigestInfo {
-				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },
-				digest: der::asn1::OctetString::new(vec![0; 32])?,
-			}),
-			confidentiality: Some(EncryptedContentInfo {
-				content_type: DATA,
-				content_enc_alg: AlgorithmIdentifier { oid: COMPRESSION_ZLIB, parameters: None },
-				encrypted_content: Some(der::asn1::OctetString::new(vec![0; 50])?),
-			}),
-			priority: Some(MessagePriority::Standard),
-			lifetime: Some(3600),
-			previous_frame: Some(DigestInfo {
-				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },
-				digest: der::asn1::OctetString::new(vec![0; 32])?,
-			}),
-			matrix: Some(matrix),
-		};
-
-		// Create frame with empty message
-		// Compile-time validation built into Frame: V3 must support matrix since metadata has matrix
-		// This will fail to compile if V3 doesn't support matrix
-		const _: () = {
-			const VERSION: Version = Version::V3;
-			const HAS_MATRIX: bool = true; // metadata has matrix
-								  // Use Frame's built-in compile-time validation method
-			[(); 1][!Frame::const_validate_version_fields(VERSION, HAS_MATRIX) as usize];
-		};
-
-		let frame = Frame {
-			version: Version::V3,
-			metadata,
-			message: vec![], // empty message
-			integrity: Some(DigestInfo {
-				algorithm: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },
-				digest: der::asn1::OctetString::new(vec![0; 32])?,
-			}),
-			nonrepudiation: Some(SignerInfo {
-				version: CmsVersion::V1,
-				sid: SignerIdentifier::IssuerAndSerialNumber(IssuerAndSerialNumber {
-					issuer: Name::default(),
-					serial_number: SerialNumber::new(&[0; 8])?,
-				}),
-				digest_alg: AlgorithmIdentifier { oid: HASH_SHA3_256, parameters: None },
-				signed_attrs: None,
-				signature_algorithm: AlgorithmIdentifier { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None },
-				signature: der::asn1::OctetString::new(vec![0; 64])?,
-				unsigned_attrs: None,
-			}),
-		};
-
-		// Encode to DER
-		let der_bytes = der::Encode::to_der(&frame)?;
-		println!("DER-encoded frame size: {} bytes", der_bytes.len());
-		assert!(!der_bytes.is_empty());
-		Ok(())
-	}
-}

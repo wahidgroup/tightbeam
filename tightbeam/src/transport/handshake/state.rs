@@ -105,10 +105,15 @@ impl ServerHandshakeState {
 // Invariant Tracking
 // ---------------------------------------------------------------------------
 
+/// Once-only ordering guards for the handshake state machine: each flag
+/// flips exactly once and later steps demand the earlier ones.
 #[derive(Debug, Default)]
 pub struct HandshakeInvariant {
+	/// The transcript hash is sealed; no further messages may extend it.
 	pub transcript_locked: bool,
+	/// Session AEAD keys were derived (requires a locked transcript).
 	pub aead_key_derived: bool,
+	/// The finished message went out (requires derived AEAD keys).
 	pub finished_sent: bool,
 }
 

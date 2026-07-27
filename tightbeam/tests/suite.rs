@@ -4,6 +4,9 @@
 
 // Tests are exempt from the zero-copy Arc::clone discipline (workspace lints)
 #![allow(clippy::clone_on_ref_ptr)]
+// Raw `unwrap()` is banned crate-wide: test cases propagate with `?`,
+// helpers state their invariant through `expect`.
+#![deny(clippy::unwrap_used)]
 
 // Common test helpers
 mod common;
@@ -18,6 +21,10 @@ mod instrumentation;
 // Core protocol tests
 #[cfg(feature = "full")]
 mod tightbeam_core;
+
+// tests/core/
+#[cfg(feature = "full")]
+mod protocol_core;
 
 #[cfg(feature = "transport")]
 mod transport;

@@ -6,13 +6,6 @@
 pub mod error;
 pub mod gates;
 
-// Re-export submodule types
-pub use error::HiveError;
-pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker};
-
-#[cfg(feature = "x509")]
-pub use gates::{verify_frame_signature, ClusterSecurityGate, ReplayGuard, TrustVerification};
-
 // Re-export common types used by hives
 pub use crate::colony::common::{
 	ActivateServletRequest, ActivateServletResponse, ClusterCommand, ClusterCommandResponse, ClusterStatus,
@@ -21,6 +14,15 @@ pub use crate::colony::common::{
 	RegisterHiveRequest, RegisterHiveResponse, RoundRobin, ScalingDecision, ScalingMetrics, ServletAddressUpdate,
 	ServletAddressUpdateResponse, ServletInfo, ServletScaleConf, SpawnServletParams, SpawnServletResult,
 	StopServletParams, StopServletResult, TypeBasedRouter,
+};
+
+// Re-export submodule types
+pub use error::HiveError;
+pub use gates::{BackpressureGate, CircuitState, ClusterCircuitBreaker};
+
+#[cfg(feature = "x509")]
+pub use gates::{
+	verify_frame_signature, ClusterSecurityGate, PeerListGate, PeerListMode, ReplayGuard, TrustVerification,
 };
 
 #[cfg(not(feature = "std"))]

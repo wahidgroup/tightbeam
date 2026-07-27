@@ -146,7 +146,6 @@ pub fn generate_test_handshake_data() -> Result<TestHandshakeData, Box<dyn Error
 	let client_random = generate_nonce::<32>(None)?;
 	let server_random = generate_nonce::<32>(None)?;
 	let base_session_key = generate_nonce::<32>(None)?;
-
 	let transcript_hash = compute_test_transcript_hash(&client_random, &server_random, &[], &[]);
 
 	Ok(TestHandshakeData { client_random, server_random, base_session_key, transcript_hash })
@@ -190,12 +189,13 @@ pub fn create_test_server_handshake(
 	signature: &[u8],
 ) -> Result<Vec<u8>, Box<dyn Error>> {
 	let server_handshake = ServerHandshake {
-		certificate: certificate.clone(),
+		certificate: certificate.to_owned(),
 		server_random: OctetString::new(*server_random)?,
 		signature: OctetString::new(signature)?,
 		security_accept: Some(SecurityAccept::new(create_default_test_profile())),
 		client_cert_required: false,
 		transport_accept: None,
+		session_receipt: None,
 	};
 
 	Ok(server_handshake.to_der()?)
@@ -501,7 +501,7 @@ impl TestCmsClientBuilder {
 		};
 
 		let trust_store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-			.with_certificate(server_cert.clone())?
+			.with_certificate(server_cert.to_owned())?
 			.build();
 
 		let mut client = CmsHandshakeClient::<DefaultCryptoProvider>::new(

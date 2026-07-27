@@ -5,6 +5,7 @@
 use crate::testing::assertions::{AssertionContract, AssertionLabel, AssertionValue};
 use crate::testing::specs::{SpecViolation, TBSpec};
 use crate::trace::{ConsumedTrace, ExecutionMode};
+use crate::utils::urn::Urn;
 
 use std::borrow::Cow;
 
@@ -87,9 +88,7 @@ pub const fn between(min: u32, max: u32) -> Cardinality {
 }
 
 /// Compile-time check that `tb_assert_spec!` version blocks strictly
-/// ascend. The key constants generate from the last block in source order
-/// while `latest()` selects the highest semantic version; strict ascent
-/// makes those the same block.
+/// ascend. `latest()` selects the highest semantic version.
 pub const fn versions_strictly_ascending(versions: &[(u16, u16, u16)]) -> bool {
 	let mut index = 1;
 	while index < versions.len() {
@@ -124,11 +123,11 @@ pub const fn absent() -> Cardinality {
 #[cfg_attr(feature = "derive", derive(Errorizable))]
 pub enum SpecBuildError {
 	#[cfg_attr(feature = "derive", error("Duplicate label: {0}"))]
-	DuplicateLabel(&'static str),
+	DuplicateLabel(Urn<'static>),
 	#[cfg_attr(feature = "derive", error("Unknown ordering label: {0}"))]
-	UnknownOrderingLabel(&'static str),
+	UnknownOrderingLabel(Urn<'static>),
 	#[cfg_attr(feature = "derive", error("Invalid range: {0}"))]
-	InvalidRange(&'static str),
+	InvalidRange(Urn<'static>),
 }
 
 /// Builder for programmatic spec construction
@@ -140,9 +139,9 @@ pub struct AssertSpecBuilder {
 	version_major: u16,
 	version_minor: u16,
 	version_patch: u16,
-	assertions: Vec<(&'static str, Vec<&'static str>, Cardinality, Option<AssertionValue>)>,
+	assertions: Vec<(Urn<'static>, Vec<&'static str>, Cardinality, Option<AssertionValue>)>,
 	tag_filter: Option<Vec<&'static str>>,
-	ordering: Vec<&'static str>,
+	ordering: Vec<Urn<'static>>,
 	#[cfg(feature = "instrument")]
 	required_events: Vec<crate::utils::urn::Urn<'static>>,
 	description: Option<&'static str>,
@@ -189,7 +188,7 @@ impl AssertSpecBuilder {
 
 	pub fn assertion(
 		mut self,
-		label: &'static str,
+		label: Urn<'static>,
 		tags: Vec<&'static str>,
 		cardinality: Cardinality,
 	) -> Result<Self, SpecBuildError> {
@@ -201,13 +200,14 @@ impl AssertSpecBuilder {
 				return Err(SpecBuildError::InvalidRange(label));
 			}
 		}
+
 		self.assertions.push((label, tags, cardinality, None));
 		Ok(self)
 	}
 
 	pub fn assertion_with_value(
 		mut self,
-		label: &'static str,
+		label: Urn<'static>,
 		tags: Vec<&'static str>,
 		cardinality: Cardinality,
 		expected_value: Option<AssertionValue>,
@@ -220,17 +220,20 @@ impl AssertSpecBuilder {
 				return Err(SpecBuildError::InvalidRange(label));
 			}
 		}
+
 		self.assertions.push((label, tags, cardinality, expected_value));
 		Ok(self)
 	}
 
-	pub fn ordering(mut self, labels: &[&'static str]) -> Result<Self, SpecBuildError> {
-		for &lbl in labels {
-			if !self.assertions.iter().any(|(l, _, _, _)| *l == lbl) {
-				return Err(SpecBuildError::UnknownOrderingLabel(lbl));
+	pub fn ordering(mut self, labels: &[Urn<'static>]) -> Result<Self, SpecBuildError> {
+		for lbl in labels {
+			if !self.assertions.iter().any(|(l, _, _, _)| l == lbl) {
+				return Err(SpecBuildError::UnknownOrderingLabel(lbl.clone()));
 			}
-			self.ordering.push(lbl);
+
+			self.ordering.push(lbl.clone());
 		}
+
 		Ok(self)
 	}
 
@@ -243,6 +246,7 @@ impl AssertSpecBuilder {
 				self.required_events.push(k.clone());
 			}
 		}
+
 		self
 	}
 
@@ -287,9 +291,10 @@ impl BuiltAssertSpec {
 			.iter()
 			.map(|(label, _tags, card, value)| {
 				let mut contract = if let Some(ref val) = value {
-					AssertionContract::new(AssertionLabel::Custom(Cow::Borrowed(label)), *card).with_value(val.clone())
+					AssertionContract::new(AssertionLabel::Custom(Cow::Owned(label.to_string())), *card)
+						.with_value(val.clone())
 				} else {
-					AssertionContract::new(AssertionLabel::Custom(Cow::Borrowed(label)), *card)
+					AssertionContract::new(AssertionLabel::Custom(Cow::Owned(label.to_string())), *card)
 				};
 				if let Some(ref filter) = tag_filter {
 					contract = contract.with_tag_filter(filter.clone());
@@ -297,6 +302,7 @@ impl BuiltAssertSpec {
 				contract
 			})
 			.collect();
+
 		let spec_hash = Self::compute_hash(
 			builder.id,
 			builder.execution_mode,
@@ -311,6 +317,7 @@ impl BuiltAssertSpec {
 			#[cfg(feature = "testing-timing")]
 			builder.schedulability.as_ref(),
 		);
+
 		Self { inner: builder, contracts: contracts.into_boxed_slice(), spec_hash }
 	}
 
@@ -334,12 +341,15 @@ impl BuiltAssertSpec {
 		h.update(version_minor.to_be_bytes());
 		h.update(version_patch.to_be_bytes());
 		h.update(id.as_bytes());
+
 		let mode_code = match mode {
 			ExecutionMode::Accept => 0u8,
 			ExecutionMode::Reject => 1u8,
 			ExecutionMode::Error => 2u8,
 		};
+
 		h.update([mode_code]);
+
 		match gate {
 			Some(g) => {
 				h.update([1u8]);
@@ -351,12 +361,14 @@ impl BuiltAssertSpec {
 		if let Some(tags) = tag_filter {
 			h.update([1u8]);
 			h.update((tags.len() as u32).to_be_bytes());
+
 			for tag in tags {
 				h.update(tag.as_bytes());
 			}
 		} else {
 			h.update([0u8]);
 		}
+
 		// Normalize assertion order independent of insertion sequence
 		let mut norm: Vec<(&str, u32, Option<u32>, bool)> = Vec::with_capacity(contracts.len());
 		for c in contracts {
@@ -368,10 +380,13 @@ impl BuiltAssertSpec {
 				c.cardinality.must_be_present,
 			));
 		}
+
 		norm.sort_by(|a, b| a.0.cmp(b.0)); // label only
+
 		for (lbl, min, max, must) in norm {
 			h.update(lbl.as_bytes());
 			h.update(min.to_be_bytes());
+
 			match max {
 				Some(m) => {
 					h.update([1u8]);
@@ -379,6 +394,7 @@ impl BuiltAssertSpec {
 				}
 				None => h.update([0u8]),
 			}
+
 			h.update([must as u8]);
 		}
 		#[cfg(feature = "instrument")]
@@ -386,6 +402,7 @@ impl BuiltAssertSpec {
 			// Sort events for deterministic hashing (by string representation)
 			let mut sorted_events: Vec<String> = events.iter().map(|e| e.to_string()).collect();
 			sorted_events.sort();
+
 			for urn_str in sorted_events {
 				h.update(urn_str.as_bytes());
 			}
@@ -397,9 +414,11 @@ impl BuiltAssertSpec {
 				h.update([schedule.task_set.scheduler as u8]);
 				h.update([schedule.must_be_schedulable as u8]);
 				h.update((schedule.task_set.tasks.len() as u32).to_be_bytes());
+
 				// Hash task set: sort tasks by ID for deterministic hashing
 				let mut tasks: Vec<_> = schedule.task_set.tasks.iter().collect();
 				tasks.sort_by(|a, b| a.id.cmp(&b.id));
+
 				for task in tasks {
 					h.update(task.id.as_bytes());
 					h.update(task.period.as_nanos().to_be_bytes());
@@ -448,6 +467,7 @@ impl TBSpec for BuiltAssertSpec {
 				return Self::check_schedulability(schedule);
 			}
 		}
+
 		Ok(())
 	}
 }
@@ -479,6 +499,7 @@ impl BuiltAssertSpec {
 							schedule_result.utilization, schedule_result.utilization_bound
 						),
 					};
+
 					let mut modified_result = schedule_result;
 					modified_result.violations = vec![violation];
 					Err(SpecViolation::SchedulabilityViolation(modified_result))
@@ -686,7 +707,7 @@ macro_rules! __tb_assert_spec_build_all_impl {
 				$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 				assertions: [ $( $assertion ),* ],
 				$(
-					events: [ $($events_tt:tt)* ],
+					events: [ $($events_tt)* ],
 				)?
 				$(, tag_filter: [ $( $tag ),* ])?
 				$(, schedulability: { $($schedule_content)* })?
@@ -715,7 +736,7 @@ macro_rules! __tb_assert_spec_build_all_impl_with_events {
 			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 			assertions: [ $( $assertion ),* ],
 			$(
-				events_tt: [ $($events_tt:tt)* ],
+				events_tt: [ $($events_tt)* ],
 			)?
 			$( tag_filter: [ $( $tag ),* ])?
 			$(, schedulability: { $($schedule_content)* })?
@@ -746,7 +767,7 @@ macro_rules! __tb_assert_spec_build {
 			$vec, $base, $maj, $min, $patch, $mode, $gate,
 			assertions: [ $( $assertion ),* ],
 			$(
-				events_tt: [ $($events_tt:tt)* ],
+				events_tt: [ $($events_tt)* ],
 			)?
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, description: $desc)?
@@ -767,7 +788,7 @@ macro_rules! __tb_assert_spec_build {
 			@build_with_events_expanded
 			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 			assertions: [ $( $assertion ),* ],
-			events_tt: [ $($events_tt:tt)* ],
+			events_tt: [ $($events_tt)* ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, schedulability: { $($schedule_content)* })?
 		}
@@ -805,7 +826,7 @@ macro_rules! __tb_assert_spec_build {
 				@build_with_events_expanded
 				$vec, $base, None, $maj, $min, $patch, $mode, $gate,
 				assertions: [ $( $assertion ),* ],
-				events_tt: [ $($events_tt:tt)* ],
+				events_tt: [ $($events_tt)* ],
 				$( tag_filter: [ $( $tag ),* $(,)? ])?
 				$(, description: $desc)?
 				$(, schedulability: { $($schedule_content)* })?
@@ -827,7 +848,7 @@ macro_rules! __tb_assert_spec_build {
 	(@build_with_events_expanded
 		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
 		assertions: [ $( $assertion:tt ),* ],
-		events_tt: [ $( $ev:ident ),* $(,)? ],
+		events_tt: [ $( $ev:expr ),* $(,)? ],
 		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
 		$(, description: $desc:expr)?
 		$(, schedulability: { $($schedule_content:tt)* })?
@@ -836,27 +857,7 @@ macro_rules! __tb_assert_spec_build {
 			@build_with_events
 			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
 			assertions: [ $( $assertion ),* ],
-			events: [ $( $ev ),* $(,)? ],
-			$( tag_filter: [ $( $tag ),* $(,)? ])?
-			$(, description: $desc)?
-			$(, schedulability: { $($schedule_content)* })?
-		}
-	}};
-	// Handle token tree events (from __tb_assert_spec_build_all_impl_with_events)
-	(@build_with_events_expanded
-		$vec:ident, $base:ident, $desc_opt:expr, $maj:literal, $min:literal, $patch:literal, $mode:ident, $gate:ident,
-		assertions: [ $( $assertion:tt ),* ],
-		events_tt: [ $($events_tt:tt)* ],
-		$( tag_filter: [ $( $tag:expr ),* $(,)? ])?
-		$(, description: $desc:expr)?
-		$(, schedulability: { $($schedule_content:tt)* })?
-	) => {{
-		// Recursively expand token tree to identifiers
-		$crate::__tb_assert_spec_build! {
-			@build_with_events_expanded
-			$vec, $base, $desc_opt, $maj, $min, $patch, $mode, $gate,
-			assertions: [ $( $assertion ),* ],
-			events_tt: [ $($events_tt)* ],
+			events: [ $( $ev ),* ],
 			$( tag_filter: [ $( $tag ),* $(,)? ])?
 			$(, description: $desc)?
 			$(, schedulability: { $($schedule_content)* })?
@@ -901,7 +902,7 @@ macro_rules! __tb_assert_spec_build {
 		#[cfg(feature = "instrument")]
 		{
 			$(
-				builder = builder.required_events(&[$ev.clone()]);
+				builder = builder.required_events(::core::slice::from_ref(&$ev));
 			)*
 		}
 		$(
@@ -964,80 +965,31 @@ macro_rules! __tb_assert_spec_parse_schedulability {
 	}};
 }
 
-// Emit `pub const <key>: &str` for every ident assertion key in the
-// LATEST version block (peels leading blocks until one remains). Latest
-// is what scenarios run, so its keys are the ones event sites reference.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tb_assert_spec_keys {
-	($base:ident, $first:tt $($rest:tt)+) => {
-		$crate::__tb_assert_spec_keys!($base, $($rest)+);
-	};
-	($base:ident, [ $( $assertion:tt ),* ]) => {
-		impl $base {
-			$( $crate::__tb_assert_spec_key_const!($assertion); )*
-		}
-	};
-}
-
-// Emit one key const for an ident assertion key; string keys emit nothing
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __tb_assert_spec_key_const {
-	(($label:ident, $($rest:tt)*)) => {
-		#[allow(dead_code, non_upper_case_globals)]
-		pub const $label: &'static str = stringify!($label);
-	};
-	(($label:expr, $($rest:tt)*)) => {};
-}
-
-// Helper to add individual assertions (handles tags and values)
+// Helper to add individual assertions (handles tags and values).
+// Labels are URN expressions only: raw strings and auto-generated ident
+// keys are rejected by the builder signature.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __tb_assert_spec_add_assertion {
-	// IDENT KEY: With value and tags - match equals! specifically
-	($builder:expr, ($label:ident, $card:expr, equals!($value:expr), tags: [ $($tag:expr),* $(,)? ])) => {
-		$builder
-			.assertion_with_value(stringify!($label), vec![ $($tag),* ], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
-			.expect("duplicate label or invalid range")
-	};
-	// IDENT KEY: With value, no tags - match equals! specifically
-	($builder:expr, ($label:ident, $card:expr, equals!($value:expr))) => {
-		$builder
-			.assertion_with_value(stringify!($label), vec![], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
-			.expect("duplicate label or invalid range")
-	};
-	// IDENT KEY: With tags, no value
-	($builder:expr, ($label:ident, $card:expr, tags: [ $($tag:expr),* $(,)? ])) => {
-		$builder
-			.assertion(stringify!($label), vec![ $($tag),* ], $card)
-			.expect("duplicate label or invalid range")
-	};
-	// IDENT KEY: No tags, no value (2-element tuple)
-	($builder:expr, ($label:ident, $card:expr)) => {
-		$builder
-			.assertion(stringify!($label), vec![], $card)
-			.expect("duplicate label or invalid range")
-	};
-	// NEW SYNTAX: With value and tags - match equals! specifically
+	// With value and tags - match equals! specifically
 	($builder:expr, ($label:expr, $card:expr, equals!($value:expr), tags: [ $($tag:expr),* $(,)? ])) => {
 		$builder
 			.assertion_with_value($label, vec![ $($tag),* ], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
 			.expect("duplicate label or invalid range")
 	};
-	// NEW SYNTAX: With value, no tags - match equals! specifically
+	// With value, no tags - match equals! specifically
 	($builder:expr, ($label:expr, $card:expr, equals!($value:expr))) => {
 		$builder
 			.assertion_with_value($label, vec![], $card, Some($crate::testing::assertions::AssertionValue::from($value)))
 			.expect("duplicate label or invalid range")
 	};
-	// NEW SYNTAX: With tags, no value
+	// With tags, no value
 	($builder:expr, ($label:expr, $card:expr, tags: [ $($tag:expr),* $(,)? ])) => {
 		$builder
 			.assertion($label, vec![ $($tag),* ], $card)
 			.expect("duplicate label or invalid range")
 	};
-	// NEW SYNTAX: No tags, no value (2-element tuple)
+	// No tags, no value (2-element tuple)
 	($builder:expr, ($label:expr, $card:expr)) => {
 		$builder
 			.assertion($label, vec![], $card)
@@ -1064,17 +1016,14 @@ macro_rules! tb_assert_spec {
 		$(#[$meta])*
 		$vis struct $base;
 
-		// Version blocks must strictly ascend so the emitted key constants
-		// (from the last block) belong to the `latest()` spec.
+		// Version blocks must strictly ascend so `latest()` selects the
+		// last block in source order.
 		const _: () = assert!(
 			$crate::testing::macros::versions_strictly_ascending(
 				&[ $( ($maj as u16, $min as u16, $patch as u16) ),+ ]
 			),
 			"tb_assert_spec! version blocks must be in strictly ascending semver order"
 		);
-
-		// Key consts for the latest version's ident assertion keys
-		$crate::__tb_assert_spec_keys!($base, $( [ $( $assertion ),* ] )+);
 
 		impl $base {
 			pub fn all() -> &'static [$crate::testing::macros::BuiltAssertSpec] {
@@ -1086,7 +1035,7 @@ macro_rules! tb_assert_spec {
 						$maj, $min, $patch, $mode, $gate,
 						assertions: [ $( $assertion ),* ],
 						$(
-							events: [ $($events_tt:tt)* ],
+							events: [ $($events_tt)* ],
 						)?
 						$(, tag_filter: [ $( $tag ),* ])?
 						$(, schedulability: { $($schedule_content)* })?
@@ -1387,7 +1336,10 @@ macro_rules! __tb_scenario_verify_impl {
 				// Move timing constraints into result (if available)
 				#[cfg(feature = "testing-timing")]
 				{
-					let process = scenario_result.process.as_ref().unwrap();
+					let process = scenario_result
+						.process
+						.as_ref()
+						.expect("process assigned immediately above");
 					scenario_result.timing_constraints = process.timing_constraints.clone();
 				}
 			)?
@@ -1447,28 +1399,31 @@ macro_rules! __tb_scenario_verify_impl {
 mod tests {
 	use super::*;
 
+	const OLDER_KEY: Urn<'static> = Urn::new("test", "event:spec/older-key");
+	const NEWER_KEY: Urn<'static> = Urn::new("test", "event:spec/newer-key");
+
 	crate::tb_assert_spec! {
 		pub VersionedKeySpec,
 		V(1,0,0): {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				(older_key, exactly!(1))
+				(OLDER_KEY, exactly!(1))
 			]
 		},
 		V(2,0,0): {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				(newer_key, exactly!(1))
+				(NEWER_KEY, exactly!(1))
 			]
 		}
 	}
 
 	#[test]
-	fn key_consts_belong_to_latest_version() {
+	fn latest_selects_highest_version_block() {
 		let latest = VersionedKeySpec::latest();
-		let generated = AssertionLabel::Custom(Cow::Borrowed(VersionedKeySpec::newer_key));
+		let generated = AssertionLabel::Custom(Cow::Owned(NEWER_KEY.to_string()));
 		assert_eq!(latest.version(), (2, 0, 0));
 		assert!(latest
 			.required_assertions()

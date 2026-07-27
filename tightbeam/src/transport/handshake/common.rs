@@ -5,6 +5,11 @@
 //! - AEAD session key finalization (all orchestrators)
 //! - Alert attribute processing (all orchestrators)
 
+use core::fmt;
+
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::constants::{MIN_SALT_ENTROPY_BYTES, TIGHTBEAM_C2S_KDF_INFO, TIGHTBEAM_S2C_KDF_INFO};
 use crate::crypto::aead::KeyInit;
 use crate::crypto::kdf::KdfFunction;
@@ -18,9 +23,10 @@ use crate::transport::handshake::error::HandshakeError;
 use crate::transport::handshake::negotiation::{
 	select_profile, DefaultStrengthFloor, NegotiationError, ProfileStrengthPolicy, SecurityOffer,
 };
+use crate::ZeroizingBytes;
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+use crate::constants::TIGHTBEAM_EPOCH_KDF_INFO;
 
 /// Provides profile negotiation logic for server-side handshake orchestrators.
 ///
@@ -39,7 +45,7 @@ use alloc::vec::Vec;
 /// so a weak profile left in `supported_profiles()` for compatibility cannot be
 /// negotiated (CWE-757 downgrade resistance).
 pub trait HandshakeNegotiation {
-	/// Get the list of supported security profiles (first = most preferred).
+	/// Server preference order (first = most preferred).
 	fn supported_profiles(&self) -> &[SecurityProfileDesc];
 
 	/// Minimum-strength policy applied before selection.
@@ -50,12 +56,6 @@ pub trait HandshakeNegotiation {
 	}
 
 	/// Negotiate a security profile with the peer.
-	///
-	/// # Parameters
-	/// - `offer`: Client's `SecurityOffer` (None for dealer's choice mode)
-	///
-	/// # Returns
-	/// The selected `SecurityProfileDesc`
 	///
 	/// # Errors
 	/// - `NoSupportedProfiles`: No profiles configured on server
@@ -110,6 +110,70 @@ pub struct DirectionalCiphers<C> {
 	pub server_to_client: C,
 }
 
+/// Epoch state retained past handshake completion for in-band rekeying.
+///
+/// Produced by each orchestrator's `complete()` alongside the session
+/// keys: the epoch secret seeds the rekey KDF chain and the transcript
+/// hash is the chain root `hash_0`. The raw handshake secret itself
+/// keeps its zeroize-at-complete lifecycle.
+pub struct EpochMaterials {
+	/// Current epoch secret, zeroized on drop and on rotation
+	/// (RFC 9846, 7.2). Only read by transport::rekey, which builds
+	/// with a handshake but without `transport-multiplex` consumers.
+	#[allow(dead_code)]
+	pub(crate) secret: ZeroizingBytes,
+	/// Epoch counter: 0 at handshake, incremented per rekey install.
+	pub(crate) epoch: u32,
+	/// Chained transcript hash; `hash_0` is the handshake transcript.
+	pub(crate) transcript_hash: [u8; 32],
+}
+
+impl EpochMaterials {
+	/// Current epoch number.
+	pub fn epoch(&self) -> u32 {
+		self.epoch
+	}
+
+	/// Current chained transcript hash.
+	pub fn transcript_hash(&self) -> [u8; 32] {
+		self.transcript_hash
+	}
+}
+
+/// The epoch secret never appears in diagnostics.
+impl fmt::Debug for EpochMaterials {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("EpochMaterials")
+			.field("epoch", &self.epoch)
+			.field("transcript_hash", &self.transcript_hash)
+			.finish_non_exhaustive()
+	}
+}
+
+/// Derive the epoch-0 secret from handshake key material under the
+/// dedicated epoch info label.
+///
+/// Same `input_key`/`salt` pair as the directional traffic keys. The
+/// distinct label yields an independent secret (RFC 5869 domain
+/// separation), so retaining it never weakens the traffic keys.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+pub(crate) fn derive_epoch_materials<P>(
+	input_key: &[u8],
+	salt: &[u8],
+	transcript_hash: [u8; 32],
+) -> Result<EpochMaterials, HandshakeError>
+where
+	P: CryptoProvider,
+{
+	let secret = P::Kdf::derive_dynamic_key(input_key, TIGHTBEAM_EPOCH_KDF_INFO, Some(salt), EPOCH_SECRET_SIZE)?;
+	let materials = EpochMaterials { secret, epoch: 0, transcript_hash };
+	Ok(materials)
+}
+
+/// Epoch secret length in bytes: one 256-bit KDF chain link.
+#[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
+const EPOCH_SECRET_SIZE: usize = 32;
+
 /// Provides session key finalization logic for all handshake orchestrators.
 ///
 /// Orchestrators must implement `selected_profile()` to expose the negotiated
@@ -120,26 +184,21 @@ pub struct DirectionalCiphers<C> {
 /// - Enforces minimum `MIN_SALT_ENTROPY_BYTES` salt entropy
 /// - Uses HKDF with per-direction domain separation (`TIGHTBEAM_C2S_KDF_INFO`,
 ///   `TIGHTBEAM_S2C_KDF_INFO`), the RFC 5869 info-label pattern behind the
-///   TLS 1.3 directional traffic secrets (RFC 8446, § 7.3)
+///   TLS 1.3 directional traffic secrets (RFC 9846, § 7.3)
 /// - Derives key size dynamically from negotiated AEAD cipher profile
 /// - Constant-time operations via underlying crypto primitives
 pub trait HandshakeFinalization<P>
 where
 	P: CryptoProvider,
 {
-	/// Get the selected/negotiated security profile.
+	/// Negotiated profile after offer/accept, if any.
 	fn selected_profile(&self) -> Option<SecurityProfileDesc>;
 
-	/// Derive the directional session AEAD ciphers from input key material.
+	/// Derive directional AEAD ciphers from input key material and context salt.
 	///
-	/// # Parameters
-	/// - `input_key`: Base key material (CEK for CMS, base session key for ECIES)
-	/// - `salt`: Context-specific salt:
-	///   - **CMS**: transcript hash (32 bytes)
-	///   - **ECIES**: client_random || server_random (64 bytes)
-	///
-	/// # Returns
-	/// Initialized client-to-server and server-to-client AEAD ciphers
+	/// # Salt contract
+	/// - **CMS**: transcript hash (32 bytes)
+	/// - **ECIES**: `client_random || server_random` (64 bytes)
 	///
 	/// # Errors
 	/// - `InvalidState`: No profile selected or profile missing AEAD OID/key size
@@ -165,18 +224,34 @@ where
 			return Err(HandshakeError::AeadKeySizeMismatch { declared: key_size, expected });
 		}
 
-		// Enforce minimum salt entropy for both protocols
-		if salt.len() < MIN_SALT_ENTROPY_BYTES {
-			return Err(HandshakeError::InsufficientSaltEntropy {
-				actual: salt.len(),
-				minimum: MIN_SALT_ENTROPY_BYTES,
-			});
-		}
-
-		let client_to_server = derive_labeled_cipher::<P>(input_key, salt, TIGHTBEAM_C2S_KDF_INFO, key_size)?;
-		let server_to_client = derive_labeled_cipher::<P>(input_key, salt, TIGHTBEAM_S2C_KDF_INFO, key_size)?;
-		Ok(DirectionalCiphers { client_to_server, server_to_client })
+		derive_directional_from_oid::<P>(input_key, salt, aead_oid)
 	}
+}
+
+/// Derive the directional AEAD ciphers from input key material under a
+/// negotiated AEAD OID.
+///
+/// Single derivation path shared by handshake finalization and epoch
+/// rotation: the OID binds the key length (CWE-345) and the salt floor
+/// applies at every derivation.
+pub(crate) fn derive_directional_from_oid<P>(
+	input_key: &[u8],
+	salt: &[u8],
+	aead_oid: ObjectIdentifier,
+) -> Result<DirectionalCiphers<P::AeadCipher>, HandshakeError>
+where
+	P: CryptoProvider,
+	P::AeadCipher: KeyInit,
+{
+	let key_size = aead_key_size_from_oid(aead_oid)?;
+	let salt_len = salt.len();
+	if salt_len < MIN_SALT_ENTROPY_BYTES {
+		return Err(HandshakeError::InsufficientSaltEntropy { actual: salt_len, minimum: MIN_SALT_ENTROPY_BYTES });
+	}
+
+	let client_to_server = derive_labeled_cipher::<P>(input_key, salt, TIGHTBEAM_C2S_KDF_INFO, key_size)?;
+	let server_to_client = derive_labeled_cipher::<P>(input_key, salt, TIGHTBEAM_S2C_KDF_INFO, key_size)?;
+	Ok(DirectionalCiphers { client_to_server, server_to_client })
 }
 
 /// Derive one direction's cipher under the given KDF info label.
@@ -208,19 +283,7 @@ where
 /// - `DecryptFail`: Decryption or signature verification failed
 /// - `FinishedIntegrityFail`: Transcript hash mismatch
 pub trait HandshakeAlertHandler {
-	/// Check for abort alert in unprotected attributes.
-	///
-	/// # Security
-	/// Abort alerts exist in *unprotected* attributes and are therefore
-	/// advisory and unauthenticated (as in TLS): a MITM can inject a spurious
-	/// abort (DoS) or suppress a real one.
-	///
-	/// # Parameters
-	/// - `attrs`: Optional X.509 attributes from CMS unprotected attributes
-	///
-	/// # Returns
-	/// - `Ok(())`: No alert present, safe to proceed
-	/// - `Err(HandshakeError::AbortReceived(alert))`: Peer sent abort, handshake terminated
+	/// Abort alerts live in unprotected attributes (advisory, unauthenticated).
 	///
 	/// # Errors
 	/// - `AbortReceived`: Alert detected with specific alert code
@@ -228,10 +291,8 @@ pub trait HandshakeAlertHandler {
 	/// - `InvalidIntegerEncoding`: Alert code not valid INTEGER
 	fn check_for_alert(&self, attrs: Option<&Attributes>) -> Result<(), HandshakeError> {
 		if let Some(attrs) = attrs {
-			// Convert to slice of references to avoid cloning
 			let attr_refs: Vec<&Attribute> = attrs.iter().collect();
 
-			// Check for abort alert attribute
 			if let Ok(alert_attr) = find_x509(&attr_refs, &HANDSHAKE_ABORT_ALERT) {
 				let alert = extract_alert_x509(alert_attr)?;
 				return Err(HandshakeError::AbortReceived(alert));
@@ -250,7 +311,6 @@ mod tests {
 	use crate::transport::handshake::negotiation::NegotiationError;
 	use std::error::Error;
 
-	// Mock struct for testing negotiation
 	struct MockServer {
 		profiles: Vec<SecurityProfileDesc>,
 	}
@@ -261,7 +321,6 @@ mod tests {
 		}
 	}
 
-	// Mock struct for testing finalization
 	struct MockClient {
 		profile: Option<SecurityProfileDesc>,
 	}
@@ -356,47 +415,53 @@ mod tests {
 		assert!(result.is_ok());
 	}
 
-	#[test]
-	fn test_derive_directional_aead_directions_differ() {
+	/// Seal a fixture plaintext under a zero nonce with the given cipher.
+	fn seal(cipher: &<DefaultCryptoProvider as AeadProvider>::AeadCipher, plaintext: &[u8]) -> Vec<u8> {
 		use crate::crypto::aead::Aead;
 
-		let profile = create_test_profile(AES_256_GCM, 32);
-		let client = MockClient { profile: Some(profile) };
-
-		let input_key = [0x42u8; 32];
-		let salt = [0x99u8; 32];
-
-		let ciphers = derive_directional(&client, &input_key, &salt).unwrap();
-
-		// Same nonce and plaintext under both directions must produce
-		// different ciphertexts, proving the info labels separate the keys.
 		let nonce = [0u8; 12];
-		let plaintext = b"directional key separation";
-		let c2s_ciphertext = ciphers.client_to_server.encrypt((&nonce).into(), plaintext.as_slice()).unwrap();
-		let s2c_ciphertext = ciphers.server_to_client.encrypt((&nonce).into(), plaintext.as_slice()).unwrap();
-		assert_ne!(c2s_ciphertext, s2c_ciphertext);
+		cipher
+			.encrypt((&nonce).into(), plaintext)
+			.expect("fixture encryption with a freshly derived cipher")
 	}
 
 	#[test]
-	fn test_derive_directional_aead_is_deterministic() {
-		use crate::crypto::aead::Aead;
-
+	fn test_derive_directional_aead_directions_differ() -> Result<(), HandshakeError> {
 		let profile = create_test_profile(AES_256_GCM, 32);
 		let client = MockClient { profile: Some(profile) };
 
 		let input_key = [0x42u8; 32];
 		let salt = [0x99u8; 32];
 
-		let first = derive_directional(&client, &input_key, &salt).unwrap();
-		let second = derive_directional(&client, &input_key, &salt).unwrap();
+		let ciphers = derive_directional(&client, &input_key, &salt)?;
+
+		// Same nonce and plaintext under both directions must produce
+		// different ciphertexts, proving the info labels separate the keys.
+		let plaintext = b"directional key separation";
+		let c2s_ciphertext = seal(&ciphers.client_to_server, plaintext.as_slice());
+		let s2c_ciphertext = seal(&ciphers.server_to_client, plaintext.as_slice());
+		assert_ne!(c2s_ciphertext, s2c_ciphertext);
+		Ok(())
+	}
+
+	#[test]
+	fn test_derive_directional_aead_is_deterministic() -> Result<(), HandshakeError> {
+		let profile = create_test_profile(AES_256_GCM, 32);
+		let client = MockClient { profile: Some(profile) };
+
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+
+		let first = derive_directional(&client, &input_key, &salt)?;
+		let second = derive_directional(&client, &input_key, &salt)?;
 
 		// Both derivations agree, so two independent endpoints derive the
 		// same directional keys from shared input material.
-		let nonce = [0u8; 12];
 		let plaintext = b"deterministic derivation";
-		let first_ciphertext = first.client_to_server.encrypt((&nonce).into(), plaintext.as_slice()).unwrap();
-		let second_ciphertext = second.client_to_server.encrypt((&nonce).into(), plaintext.as_slice()).unwrap();
+		let first_ciphertext = seal(&first.client_to_server, plaintext.as_slice());
+		let second_ciphertext = seal(&second.client_to_server, plaintext.as_slice());
 		assert_eq!(first_ciphertext, second_ciphertext);
+		Ok(())
 	}
 
 	#[test]
@@ -452,5 +517,49 @@ mod tests {
 
 		let result = derive_directional(&client, &input_key, &salt);
 		assert!(matches!(result, Err(HandshakeError::InvalidState)));
+	}
+
+	#[test]
+	fn test_derive_epoch_materials_shape() -> Result<(), HandshakeError> {
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+		let transcript = [0x07u8; 32];
+
+		let materials = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &salt, transcript)?;
+		assert_eq!(materials.epoch(), 0);
+		assert_eq!(materials.transcript_hash(), transcript);
+		assert_eq!(materials.secret.len(), EPOCH_SECRET_SIZE);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_derive_epoch_materials_is_deterministic() -> Result<(), HandshakeError> {
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+		let transcript = [0x07u8; 32];
+
+		let first = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &salt, transcript)?;
+		let second = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &salt, transcript)?;
+		assert_eq!(first.secret, second.secret);
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_derive_epoch_materials_separates_inputs() -> Result<(), HandshakeError> {
+		let input_key = [0x42u8; 32];
+		let salt = [0x99u8; 32];
+		let other_key = [0x43u8; 32];
+		let other_salt = [0x9Au8; 32];
+		let transcript = [0x07u8; 32];
+
+		let base = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &salt, transcript)?;
+		let keyed = derive_epoch_materials::<DefaultCryptoProvider>(&other_key, &salt, transcript)?;
+		let salted = derive_epoch_materials::<DefaultCryptoProvider>(&input_key, &other_salt, transcript)?;
+		assert_ne!(base.secret, keyed.secret);
+		assert_ne!(base.secret, salted.secret);
+
+		Ok(())
 	}
 }

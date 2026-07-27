@@ -9,6 +9,7 @@
 
 use tightbeam::der::Sequence;
 use tightbeam::utils::task::Pipeline;
+use tightbeam::utils::urn::Urn;
 use tightbeam::{compose, exactly, job, tb_assert_spec, tb_scenario, testing::SetupEnv};
 use tightbeam::{Beamable, Frame, TightBeamError};
 
@@ -16,6 +17,23 @@ use tightbeam::{Beamable, Frame, TightBeamError};
 use tightbeam::tb_process_spec;
 #[cfg(feature = "testing-csp")]
 use tightbeam::testing::ScenarioConf;
+
+pub(crate) const FALLBACK_TRIGGERED: Urn<'static> = Urn::new("test", "event:pipeline/fallback-triggered");
+pub(crate) const PIPELINE_COMPLETE: Urn<'static> = Urn::new("test", "event:pipeline/pipeline-complete");
+pub(crate) const PIPELINE_START: Urn<'static> = Urn::new("test", "event:pipeline/pipeline-start");
+
+#[cfg(feature = "testing-csp")]
+pub(crate) const CREATE_TEST_FRAME_START: Urn<'static> = Urn::new("tightbeam", "event:job/create-test-frame-start");
+#[cfg(feature = "testing-csp")]
+pub(crate) const CREATE_TEST_FRAME_SUCCESS: Urn<'static> = Urn::new("tightbeam", "event:job/create-test-frame-success");
+#[cfg(feature = "testing-csp")]
+pub(crate) const TRANSFORM_CONTENT_START: Urn<'static> = Urn::new("tightbeam", "event:job/transform-content-start");
+#[cfg(feature = "testing-csp")]
+pub(crate) const TRANSFORM_CONTENT_SUCCESS: Urn<'static> = Urn::new("tightbeam", "event:job/transform-content-success");
+#[cfg(feature = "testing-csp")]
+pub(crate) const VALIDATE_FRAME_START: Urn<'static> = Urn::new("tightbeam", "event:job/validate-frame-start");
+#[cfg(feature = "testing-csp")]
+pub(crate) const VALIDATE_FRAME_SUCCESS: Urn<'static> = Urn::new("tightbeam", "event:job/validate-frame-success");
 
 // Test message types
 #[derive(Beamable, Clone, Debug, PartialEq, Sequence)]
@@ -51,7 +69,7 @@ job! {
 		let msg: TestMessage = tightbeam::decode(&frame.message)?;
 
 		compose! {
-			V0: id: frame.metadata.id.clone(),
+			V0: id: &frame.metadata.id,
 				message: TestMessage {
 					content: format!("{}_transformed", msg.content)
 				}
@@ -69,8 +87,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(pipeline_start, exactly!(1)),
-			(pipeline_complete, exactly!(1))
+			(PIPELINE_START, exactly!(1)),
+			(PIPELINE_COMPLETE, exactly!(1))
 		]
 	}
 }
@@ -80,7 +98,7 @@ tb_scenario! {
 	spec: ManualEventSpec,
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event(ManualEventSpec::pipeline_start)?;
+			trace.event(PIPELINE_START)?;
 
 			// Direct Result pipeline (no PipelineBuilder = no auto-trace)
 			let _frame = CreateTestFrame::run(("test-001".to_string(), "content".to_string()))
@@ -88,7 +106,7 @@ tb_scenario! {
 				.and_then(|f| TransformContent::run((f,)))
 				.run()?;
 
-			trace.event(ManualEventSpec::pipeline_complete)?;
+			trace.event(PIPELINE_COMPLETE)?;
 			Ok(())
 		}
 	}
@@ -105,13 +123,13 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			// Shorthand labels match full URNs: "foo" matches "urn:*:instrumentation:event/foo"
-			(create_test_frame_start, exactly!(1)),
-			(create_test_frame_success, exactly!(1)),
-			(validate_frame_start, exactly!(1)),
-			(validate_frame_success, exactly!(1)),
-			(transform_content_start, exactly!(1)),
-			(transform_content_success, exactly!(1))
+			// Auto-emitted job URNs from PipelineBuilder (urn:tightbeam:event:job/...)
+			(CREATE_TEST_FRAME_START, exactly!(1)),
+			(CREATE_TEST_FRAME_SUCCESS, exactly!(1)),
+			(VALIDATE_FRAME_START, exactly!(1)),
+			(VALIDATE_FRAME_SUCCESS, exactly!(1)),
+			(TRANSFORM_CONTENT_START, exactly!(1)),
+			(TRANSFORM_CONTENT_SUCCESS, exactly!(1))
 		]
 	}
 }
@@ -125,22 +143,22 @@ tb_process_spec! {
 	pub PipelineProcess,
 	events {
 		observable {
-			"create_test_frame_start",
-			"create_test_frame_success",
-			"validate_frame_start",
-			"validate_frame_success",
-			"transform_content_start",
-			"transform_content_success"
+			CREATE_TEST_FRAME_START,
+			CREATE_TEST_FRAME_SUCCESS,
+			VALIDATE_FRAME_START,
+			VALIDATE_FRAME_SUCCESS,
+			TRANSFORM_CONTENT_START,
+			TRANSFORM_CONTENT_SUCCESS
 		}
-		hidden {}
+		hidden { }
 	}
 	states {
-		Idle => { "create_test_frame_start" => Creating },
-		Creating => { "create_test_frame_success" => Validating },
-		Validating => { "validate_frame_start" => ValidatingRun },
-		ValidatingRun => { "validate_frame_success" => Transforming },
-		Transforming => { "transform_content_start" => TransformingRun },
-		TransformingRun => { "transform_content_success" => Done }
+		Idle => { CREATE_TEST_FRAME_START => Creating },
+		Creating => { CREATE_TEST_FRAME_SUCCESS => Validating },
+		Validating => { VALIDATE_FRAME_START => ValidatingRun },
+		ValidatingRun => { VALIDATE_FRAME_SUCCESS => Transforming },
+		Transforming => { TRANSFORM_CONTENT_START => TransformingRun },
+		TransformingRun => { TRANSFORM_CONTENT_SUCCESS => Done }
 	}
 	terminal { Done }
 }
@@ -176,7 +194,7 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(fallback_triggered, exactly!(1))
+			(FALLBACK_TRIGGERED, exactly!(1))
 		]
 	}
 }
@@ -189,7 +207,7 @@ tb_scenario! {
 			// Pipeline with fallback on error
 			let failing: Result<Frame, TightBeamError> = Err(TightBeamError::InvalidOrder);
 			let _frame = failing.or_else(|_| {
-				trace.event(FallbackSpec::fallback_triggered)?;
+				trace.event(FALLBACK_TRIGGERED)?;
 				compose! {
 					V0: id: b"fallback",
 						message: TestMessage {

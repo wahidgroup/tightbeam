@@ -358,9 +358,9 @@ pub trait CurveProvider {
 
 /// Provides Key Encapsulation Mechanism (KEM) operations.
 ///
-/// Enables post-quantum and hybrid key agreement using RustCrypto's `kem` traits.
-/// Applications can provide KEM implementations
-/// to enable hybrid classical+PQ protocols like PQXDH.
+/// Enables post-quantum and hybrid key agreement using RustCrypto's `kem`
+/// traits. Applications can provide KEM implementations to enable hybrid
+/// classical+PQ protocols like PQXDH.
 #[cfg(feature = "kem")]
 pub trait KemProvider {
 	type EncappedKey: EncappedKey;
@@ -608,6 +608,7 @@ mod tests {
 
 		// prefix + nonces + (tag+len+data)*2 = prefix + 64 + (1+2+5)*2 = prefix + 64 + 16
 		assert_eq!(ukm.len(), TIGHTBEAM_UKM_PREFIX.len() + 64 + 16);
+
 		let tail = &ukm[TIGHTBEAM_UKM_PREFIX.len() + 64..];
 		assert_eq!(tail[0], 0x01);
 		assert_eq!(&tail[1..3], &(5u16.to_be_bytes()));
@@ -622,14 +623,13 @@ mod tests {
 	fn ukm_duplicate_tag_error() -> Result<(), Box<dyn std::error::Error>> {
 		let c = nonce(3);
 		let s = nonce(4);
+
 		let mut b = UkmBuilder::new(c, s);
 		assert!(b.add_extension(0x01, b"a").is_ok());
-
-		let err = b.add_extension(0x01, b"b").unwrap_err();
-		match err {
-			UkmBuilderError::DuplicateTag { tag } => assert_eq!(tag, 0x01),
-			_ => panic!("wrong error"),
-		}
+		assert!(matches!(
+			b.add_extension(0x01, b"b"),
+			Err(UkmBuilderError::DuplicateTag { tag: 0x01 })
+		));
 
 		Ok(())
 	}
@@ -638,17 +638,13 @@ mod tests {
 	fn ukm_extension_too_large_error() -> Result<(), Box<dyn std::error::Error>> {
 		let c = nonce(5);
 		let s = nonce(6);
+
 		let mut b = UkmBuilder::new(c, s);
 		let big = vec![0u8; (u16::MAX as usize) + 1];
-		let err = b.add_extension(0x02, &big).unwrap_err();
-
-		match err {
-			UkmBuilderError::ExtensionTooLarge { tag, len } => {
-				assert_eq!(tag, 0x02);
-				assert_eq!(len, big.len());
-			}
-			_ => panic!("wrong error"),
-		}
+		assert!(matches!(
+			b.add_extension(0x02, &big),
+			Err(UkmBuilderError::ExtensionTooLarge { tag: 0x02, len }) if len == big.len()
+		));
 
 		Ok(())
 	}
@@ -661,6 +657,7 @@ mod tests {
 	#[test]
 	fn test_aes128_gcm_key_size() {
 		use crate::crypto::aead::Aes128GcmOid;
+
 		assert_eq!(<Aes128GcmOid as AeadKeySize>::KEY_SIZE, 16);
 	}
 
@@ -668,6 +665,7 @@ mod tests {
 	#[test]
 	fn test_aes256_gcm_key_size() {
 		use crate::crypto::aead::Aes256GcmOid;
+
 		assert_eq!(<Aes256GcmOid as AeadKeySize>::KEY_SIZE, 32);
 	}
 

@@ -122,7 +122,7 @@ impl UrnSpec for TightbeamUrnSpec {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::utils::urn::UrnBuilder;
+	use crate::utils::urn::{Urn, UrnBuilder};
 
 	#[cfg(feature = "testing")]
 	use crate::{exactly, tb_assert_spec, tb_scenario, testing::SetupEnv};
@@ -243,13 +243,16 @@ mod tests {
 	}
 
 	#[cfg(feature = "testing")]
+	const URN_STRING: Urn<'static> = Urn::new("test", "event:urn-spec/urn-string");
+
+	#[cfg(feature = "testing")]
 	tb_assert_spec! {
 		pub TightbeamUrnSpecSpec,
 		V(1,0,0): {
 			mode: Accept,
 			gate: Ok,
 			assertions: [
-				(urn_string, exactly!(1), equals!("urn:tightbeam:instrumentation:trace/abc-123"))
+				(URN_STRING, exactly!(1), equals!("urn:tightbeam:instrumentation:trace/abc-123"))
 			]
 		}
 	}
@@ -266,7 +269,7 @@ mod tests {
 					.set("resource_id", "abc-123")
 					.build()?;
 
-				trace.event_with(TightbeamUrnSpecSpec::urn_string, &[], urn.to_string())?;
+				trace.event_with(URN_STRING, &[], urn.to_string())?;
 
 				Ok(())
 			}

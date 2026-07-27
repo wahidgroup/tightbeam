@@ -542,20 +542,22 @@ mod tests {
 		($($name:ident: $value:expr,)*) => {
 			$(
 				#[test]
-				fn $name() {
+				fn $name() -> Result<()> {
 					let original = $value;
 
 					// Encode
-					let encoded = crate::encode(&original).unwrap();
+					let encoded = crate::encode(&original)?;
 					assert!(!encoded.is_empty());
 
 					// Decode
-					let decoded = crate::decode(&encoded).unwrap();
+					let decoded = crate::decode(&encoded)?;
 					assert_round_trip(&original, &decoded);
 
 					// Verify it's valid DER (encode again and compare)
-					let re_encoded = crate::encode(&decoded).unwrap();
+					let re_encoded = crate::encode(&decoded)?;
 					assert_eq!(encoded, re_encoded);
+
+					Ok(())
 				}
 			)*
 		};
@@ -632,16 +634,16 @@ mod tests {
 					let original = $tightbeam;
 
 					// Encode
-					let encoded = crate::encode(&original).unwrap();
+					let encoded = crate::encode(&original)?;
 					assert!(!encoded.is_empty());
 
 					// Decode
-					let decoded: Frame = crate::decode(&encoded).unwrap();
+					let decoded: Frame = crate::decode(&encoded)?;
 					// Verify round-trip
 					assert_eq!(original, decoded);
 
 					// Verify it's valid DER (encode again and compare)
-					let re_encoded = crate::encode(&decoded).unwrap();
+					let re_encoded = crate::encode(&decoded)?;
 					assert_eq!(encoded, re_encoded);
 
 					Ok(())
@@ -658,7 +660,7 @@ mod tests {
 					id: "test-001",
 					order: 1696521600,
 					message: message,
-			}.unwrap()
+			}?
 		},
 		tightbeam_v0_large_value: {
 			let message = create_test_message(Some(&("A".repeat(1000))));
@@ -667,7 +669,7 @@ mod tests {
 					id: "test-002",
 					order: 1696521700,
 					message: message
-			}.unwrap()
+			}?
 		},
 		tightbeam_v1_encrypted: {
 			use crate::crypto::aead::Aes256GcmOid;
@@ -683,7 +685,7 @@ mod tests {
 					message: message,
 					confidentiality<Aes256GcmOid, _>: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key
-			}.unwrap()
+			}?
 		},
 		tightbeam_v2_full: {
 			use crate::crypto::aead::Aes256GcmOid;
@@ -703,7 +705,7 @@ mod tests {
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::HighThroughput,
 					lifetime: 3600
-			}.unwrap()
+			}?
 		},
 	}
 
@@ -712,9 +714,11 @@ mod tests {
 		($($name:ident: $tightbeam:expr => $target:ty,)*) => {
 			$(
 				#[test]
-				fn $name() {
+				fn $name() -> Result<()> {
 					let tightbeam = $tightbeam;
 					let _converted: $target = tightbeam.clone().into();
+
+					Ok(())
 				}
 			)*
 		};
@@ -728,7 +732,7 @@ mod tests {
 					id: "meta-001",
 					order: 1000,
 					message: message
-			}.unwrap()
+			}?
 		} => Metadata,
 		tightbeam_to_protocol_version: {
 			use crate::crypto::aead::Aes256GcmOid;
@@ -749,7 +753,7 @@ mod tests {
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::Expedited,
 					lifetime: 60
-			}.unwrap()
+			}?
 		} => Version,
 	}
 
@@ -758,20 +762,24 @@ mod tests {
 		(success: $($name:ident: $tightbeam:expr => $target:ty,)*) => {
 			$(
 				#[test]
-				fn $name() {
+				fn $name() -> Result<()> {
 					let tightbeam = $tightbeam;
 					let result: Result<$target> = tightbeam.try_into();
 					assert!(result.is_ok());
+
+					Ok(())
 				}
 			)*
 		};
 		(failure: $($name:ident: $tightbeam:expr => $target:ty,)*) => {
 			$(
 				#[test]
-				fn $name() {
+				fn $name() -> Result<()> {
 					let tightbeam = $tightbeam;
 					let result: Result<$target> = tightbeam.try_into();
 					assert!(result.is_err());
+
+					Ok(())
 				}
 			)*
 		};
@@ -793,7 +801,7 @@ mod tests {
 					message: message,
 					confidentiality<Aes256GcmOid, _>: cipher,
 					nonrepudiation<Secp256k1Signature, _>: signing_key
-			}.unwrap()
+			}?
 		} => SignerInfo,
 		tightbeam_v2_to_encryption_info: {
 			use crate::crypto::aead::Aes256GcmOid;
@@ -814,7 +822,7 @@ mod tests {
 					message_integrity<Sha3_256>: [],
 					priority: MessagePriority::LowLatency,
 					lifetime: 120
-			}.unwrap()
+			}?
 		} => EncryptedContentInfo,
 	}
 
@@ -827,7 +835,7 @@ mod tests {
 					id: "fail-001",
 					order: 5000,
 					message: message
-			}.unwrap()
+			}?
 		} => SignerInfo,
 		tightbeam_v0_to_encryption_info_fails: {
 			let message = create_test_message(None);
@@ -836,7 +844,7 @@ mod tests {
 					id: "fail-002",
 					order: 6000,
 					message: message
-			}.unwrap()
+			}?
 		} => EncryptedContentInfo,
 	}
 
@@ -946,10 +954,11 @@ mod tests {
 		}
 
 		#[test]
-		fn absent_integrity_is_false() {
+		fn absent_integrity_is_false() -> Result<()> {
 			let message = create_test_message(None);
-			let frame = compose! { V0: id: "no-fi", order: 1u64, message: message }.unwrap();
+			let frame = compose! { V0: id: "no-fi", order: 1u64, message: message }?;
 			assert!(matches!(frame.verify_frame_integrity::<Sha3_256>(), Ok(false)));
+			Ok(())
 		}
 
 		#[test]

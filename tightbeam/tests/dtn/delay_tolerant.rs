@@ -82,7 +82,7 @@ async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 	let relay_frame1 = earth_store.retrieve("earth-msg-001")?;
 
 	// Verify frame at relay
-	let relay_chain = vec![relay_frame1.clone()];
+	let relay_chain = vec![relay_frame1.to_owned()];
 	let relay_verdict = relay_store.verify_chain(&relay_chain)?;
 	assert!(relay_verdict.valid, "Chain verification failed at relay");
 
@@ -92,9 +92,9 @@ async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 	let digest_info = DigestInfo::try_from(frame1_hash.as_slice())?;
 
 	let relay_payload = DtnPayload {
-		content: payload.content.clone(),
-		source_node: payload.source_node.clone(),
-		dest_node: payload.dest_node.clone(),
+		content: payload.content.to_owned(),
+		source_node: payload.source_node.to_owned(),
+		dest_node: payload.dest_node.to_owned(),
 		hop_count: payload.hop_count + 1,
 	};
 
@@ -115,7 +115,7 @@ async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 	let mars_frame1 = relay_store.retrieve("relay-fwd-001")?;
 
 	// Mars verifies complete chain
-	let full_chain = vec![relay_frame1, mars_frame1.clone()];
+	let full_chain = vec![relay_frame1, mars_frame1.to_owned()];
 	let mars_verdict = mars_store.verify_chain(&full_chain)?;
 
 	assert!(mars_verdict.valid, "Chain verification failed at Mars");
@@ -144,7 +144,7 @@ async fn dtn_multi_hop_earth_to_mars() -> Result<(), TightBeamError> {
 #[tokio::test]
 async fn dtn_chain_verification_detects_tampering() -> Result<(), TightBeamError> {
 	let temp_dir = std::env::temp_dir().join("tightbeam_dtn_tamper");
-	let store = FrameStore::new(temp_dir.clone())?;
+	let store = FrameStore::new(temp_dir.to_owned())?;
 
 	// Create valid chain
 	let frame1 = compose! {
@@ -242,7 +242,7 @@ async fn dtn_comparison_traditional_vs_tightbeam() -> Result<(), TightBeamError>
 
 	// This test validates the basic infrastructure is working:
 	let temp_dir = std::env::temp_dir().join("tightbeam_dtn_comparison");
-	let mut store = FrameStore::new(temp_dir.clone())?;
+	let mut store = FrameStore::new(temp_dir.to_owned())?;
 
 	let frame = compose! {
 		V0: id: "comparison-test",

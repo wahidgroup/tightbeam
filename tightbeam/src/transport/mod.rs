@@ -34,17 +34,18 @@ pub mod messaging;
 pub mod protocols;
 pub mod state;
 
+#[cfg(any(feature = "tcp", feature = "tokio", feature = "async-transport"))]
+pub(crate) mod framing;
 #[cfg(feature = "transport-multiplex")]
 pub mod multiplex;
 #[cfg(feature = "transport-policy")]
 pub mod policy;
 #[cfg(all(
-	feature = "x509",
-	feature = "tokio",
-	feature = "transport-policy",
 	feature = "transport-multiplex",
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
+pub(crate) mod rekey;
+#[cfg(pooled_mux)]
 pub mod serve;
 #[cfg(any(feature = "tcp", feature = "async-transport"))]
 pub mod tcp;
@@ -54,10 +55,10 @@ pub use builders::{EnvelopeBuilder, EnvelopeLimits};
 pub use client::GenericClient;
 pub use envelopes::{RequestPackage, ResponsePackage, TransportEnvelope, WireEnvelope, WireMode};
 pub use error::{TransportError, TransportFailure};
-pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO, Pingable};
+pub use io::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, MessageIO};
 pub use messaging::{MessageCollector, ResponseHandler, Transport};
 pub use protocols::{
-	AsyncListenerTrait, EncryptedProtocol, Mycelial, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
+	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, ProtocolStream, TightBeamAddress,
 	X509ClientConfig,
 };
 
@@ -66,11 +67,18 @@ pub use client::{ClientBuilder, ClientPolicies};
 #[cfg(feature = "std")]
 pub use client::{ConnectionBuilder, ConnectionPool, PoolConfig, PooledClient};
 #[cfg(feature = "transport-policy")]
+pub use messaging::GateAudit;
+#[cfg(feature = "transport-policy")]
 pub use messaging::MessageEmitter;
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+pub use protocols::{
+	AsyncByteRead, AsyncByteStream, AsyncByteWrite, AsyncProtocolStream, AsyncReadStream, AsyncWriteStream,
+	SplittableStream,
+};
+#[cfg(any(feature = "tokio", feature = "async-transport"))]
+pub use tcp::r#async::TcpTransport;
 #[cfg(all(feature = "tcp", feature = "tokio"))]
 pub use tcp::r#async::TokioListener;
-#[cfg(any(feature = "tokio", feature = "async-transport"))]
-pub use tcp::r#async::{AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream, TcpTransport};
 #[cfg(all(any(feature = "tokio", feature = "async-transport"), feature = "x509"))]
 pub use tcp::r#async::{CleartextReader, CleartextWriter, TransportReader, TransportWriter};
 
@@ -87,19 +95,25 @@ mod x509 {
 #[cfg(feature = "x509")]
 use x509::*;
 
-use crate::transport::handshake::HandshakeKeyManager;
-
 use crate::constants::TIGHTBEAM_AAD_DOMAIN_TAG;
+use crate::transport::handshake::HandshakeKeyManager;
 
 #[cfg(feature = "x509")]
 #[derive(Clone)]
 pub struct TransportEncryptionConfig<P: CryptoProvider> {
+	/// Identity certificate this endpoint presents during the handshake.
 	pub certificate: Certificate,
+	/// Signing and key-agreement material backing the certificate.
 	pub key_manager: Arc<HandshakeKeyManager<P>>,
+	/// Peer-certificate checks; `Some` demands mutual authentication.
 	pub client_validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	/// Domain-separation tag bound into every AEAD associated-data block.
 	pub aad_domain_tag: &'static [u8],
+	/// Ceiling in bytes for a cleartext envelope on the wire.
 	pub max_cleartext_envelope: usize,
+	/// Ceiling in bytes for an encrypted envelope on the wire.
 	pub max_encrypted_envelope: usize,
+	/// Deadline for the whole handshake exchange.
 	pub handshake_timeout: Duration,
 }
 
@@ -154,7 +168,6 @@ mod tests {
 			handle: move |message: Frame| {
 				let tx = Arc::clone(&tx);
 				async move {
-					// Quantum tunnel testing channel -- TUNNEL
 					let _ = tx.send(message);
 					Ok(None)
 				}
@@ -173,7 +186,6 @@ mod tests {
 		let result = client.emit(message.clone(), None).await;
 		result?;
 
-		// Verify server received the message -- TUNNEL
 		let received = rx
 			.recv_timeout(Duration::from_secs(1))
 			.map_err(|_| TransportError::OperationFailed(error::TransportFailure::DeadlineExceeded))?;
@@ -191,22 +203,20 @@ mod tests {
 		use crate::der::oid::AssociatedOid;
 
 		let frame = create_v0_tightbeam(None, None);
-		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32]).map_err(|_| "Invalid key")?;
-		let encryptor = SendCipher::new(RuntimeAead::new(cipher, Aes256GcmOid::OID));
+		let cipher = Aes256Gcm::new_from_slice(&[0u8; 32])
+			.map_err(|_| TransportError::OperationFailed(TransportFailure::Internal))?;
 
-		let err = builders::EnvelopeBuilder::request(frame.clone())
+		let encryptor = SendCipher::new(RuntimeAead::new(cipher, Aes256GcmOid::OID));
+		let result = builders::EnvelopeBuilder::request(frame.clone())
 			.with_wire_mode(WireMode::Encrypted)
 			.with_encryptor(&encryptor)
 			.with_max_encrypted_envelope(1)
-			.finish()
-			.expect_err("encrypted size limit should fail");
+			.finish();
 
-		match err {
-			TransportError::MessageNotSent(returned, TransportFailure::SizeExceeded) => {
-				assert_eq!(*returned, frame);
-			}
-			other => panic!("unexpected error variant: {other:?}"),
-		}
+		assert!(matches!(
+			result,
+			Err(TransportError::MessageNotSent(ref returned, TransportFailure::SizeExceeded)) if **returned == frame
+		));
 
 		Ok(())
 	}
@@ -214,16 +224,13 @@ mod tests {
 	#[test]
 	fn test_envelope_builder_cleartext_limit_returns_message() {
 		let frame = create_v0_tightbeam(None, None);
-		let err = builders::EnvelopeBuilder::request(frame.clone())
+		let result = builders::EnvelopeBuilder::request(frame.clone())
 			.with_max_cleartext_envelope(1)
-			.finish()
-			.expect_err("cleartext size limit should fail");
+			.finish();
 
-		match err {
-			TransportError::MessageNotSent(returned, TransportFailure::SizeExceeded) => {
-				assert_eq!(*returned, frame);
-			}
-			other => panic!("unexpected error variant: {other:?}"),
-		}
+		assert!(matches!(
+			result,
+			Err(TransportError::MessageNotSent(ref returned, TransportFailure::SizeExceeded)) if **returned == frame
+		));
 	}
 }

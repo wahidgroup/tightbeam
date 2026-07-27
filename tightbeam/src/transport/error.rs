@@ -11,7 +11,6 @@ use std::io::ErrorKind;
 #[cfg(all(feature = "std", feature = "tcp"))]
 use std::net::AddrParseError;
 
-#[cfg(feature = "derive")]
 use crate::Errorizable;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
@@ -41,6 +40,9 @@ pub enum TransportFailure {
 	/// concurrent stream slot is in flight. Retry after a response frees
 	/// a slot, or open another connection
 	StreamsExhausted,
+	/// Outbound session budget exhausted on a multiplexed connection:
+	/// the epoch's remaining spendable credits cannot cover the frame.
+	BudgetExhausted,
 	/// Gate policy rejected (general)
 	PolicyRejection,
 	/// Peer refusal: the caller cancelled the operation
@@ -78,89 +80,55 @@ pub enum TransportFailure {
 }
 
 /// Transport error types
-#[cfg_attr(feature = "derive", derive(Errorizable))]
-#[derive(Debug)]
+#[derive(Debug, Errorizable)]
 pub enum TransportError {
-	#[cfg_attr(feature = "derive", error("Connection closed gracefully"))]
+	#[error("Connection closed gracefully")]
 	ConnectionClosed,
-	#[cfg_attr(feature = "derive", error("Connection failed"))]
+	#[error("Connection failed")]
 	ConnectionFailed,
-	#[cfg_attr(feature = "derive", error("Send failed"))]
+	#[error("Send failed")]
 	SendFailed,
-	#[cfg_attr(feature = "derive", error("Encryption required but not provided"))]
+	#[error("Encryption required but not provided")]
 	MissingEncryption,
-	#[cfg_attr(
-		feature = "derive",
-		error("Handshake protocol not supported by this transport: {0:?}")
-	)]
+	#[error("Handshake protocol not supported by this transport: {0:?}")]
 	UnsupportedHandshakeProtocol(HandshakeProtocolKind),
-	#[cfg_attr(
-		feature = "derive",
-		error("Server certificate chain required but not provisioned")
-	)]
+	#[error("Server certificate chain required but not provisioned")]
 	MissingServerCertificateChain,
-	#[cfg_attr(feature = "derive", error("Invalid message"))]
+	#[error("Invalid message")]
 	InvalidMessage,
-	#[cfg_attr(feature = "derive", error("Invalid reply"))]
+	#[error("Invalid reply")]
 	InvalidReply,
-	#[cfg_attr(feature = "derive", error("Missing request"))]
+	#[error("Missing request")]
 	MissingRequest,
-	#[cfg_attr(feature = "derive", error("Max retries exceeded"))]
+	#[error("Max retries exceeded")]
 	MaxRetriesExceeded,
-	#[cfg_attr(feature = "derive", error("Invalid address"))]
+	#[error("Invalid address")]
 	InvalidAddress,
-	#[cfg_attr(feature = "derive", error("Invalid state"))]
+	#[error("Invalid state")]
 	InvalidState,
 	#[cfg(feature = "transport-multiplex")]
-	#[cfg_attr(feature = "derive", error("Connection draining after GoAway. No new streams"))]
+	#[error("Connection draining after GoAway. No new streams")]
 	Draining,
 	#[cfg(feature = "x509")]
-	#[cfg_attr(feature = "derive", error("Invalid certificate: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
+	#[error("Invalid certificate: {0}")]
+	#[from]
 	InvalidCertificate(CertificateValidationError),
-	#[cfg_attr(feature = "derive", error("Message not sent: {1:?} - {0:?}"))]
+	#[error("Message not sent: {1:?} - {0:?}")]
 	MessageNotSent(Box<Frame>, TransportFailure),
-	#[cfg_attr(feature = "derive", error("Operation failed: {0:?}"))]
+	#[error("Operation failed: {0:?}")]
 	OperationFailed(TransportFailure),
 	#[cfg(feature = "x509")]
-	#[cfg_attr(feature = "derive", error("Handshake error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
+	#[error("Handshake error: {0}")]
+	#[from]
 	HandshakeError(HandshakeError),
-	#[cfg_attr(feature = "derive", error("DER error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
+	#[error("DER error: {0}")]
+	#[from]
 	DerError(der::Error),
 	#[cfg(feature = "std")]
-	#[cfg_attr(feature = "derive", error("I/O error: {0}"))]
-	#[cfg_attr(feature = "derive", from)]
+	#[error("I/O error: {0}")]
+	#[from]
 	IoError(IoError),
 }
-
-crate::impl_error_display!(TransportError {
-	ConnectionClosed => "Connection closed gracefully",
-	ConnectionFailed => "Connection failed",
-	SendFailed => "Send failed",
-	MissingEncryption => "Encryption required but not provided",
-	UnsupportedHandshakeProtocol(kind) => "Handshake protocol not supported by this transport: {kind:?}",
-	MissingServerCertificateChain => "Server certificate chain required but not provisioned",
-	InvalidMessage => "Invalid message",
-	InvalidReply => "Invalid reply",
-	MissingRequest => "Missing request",
-	MaxRetriesExceeded => "Max retries exceeded",
-	InvalidAddress => "Invalid address",
-	InvalidState => "Invalid state",
-	MessageNotSent(frame, failure) => "Message not sent: {failure:?} - {frame:?}",
-	OperationFailed(failure) => "Operation failed: {failure:?}",
-	DerError(err) => "DER error: {err}",
-
-	#[cfg(feature = "transport-multiplex")]
-	Draining => "Connection draining after GoAway. No new streams",
-	#[cfg(feature = "x509")]
-	InvalidCertificate(err) => "Invalid certificate: {err}",
-	#[cfg(feature = "x509")]
-	HandshakeError(err) => "Handshake error: {err}",
-	#[cfg(feature = "std")]
-	IoError(err) => "I/O error: {err}",
-});
 
 /// Narrows [`TightBeamError`](crate::error::TightBeamError) into [`TransportError`];
 /// variants without a transport counterpart collapse to [`TransportError::InvalidMessage`].
@@ -256,15 +224,6 @@ impl TryFrom<TransportFailure> for TransitStatus {
 		Ok(status)
 	}
 }
-
-#[cfg(all(feature = "std", not(feature = "derive")))]
-crate::impl_from!(IoError => TransportError::IoError);
-#[cfg(not(feature = "derive"))]
-crate::impl_from!(der::Error => TransportError::DerError);
-#[cfg(all(feature = "x509", not(feature = "derive")))]
-crate::impl_from!(HandshakeError => TransportError::HandshakeError);
-#[cfg(all(feature = "x509", not(feature = "derive")))]
-crate::impl_from!(CertificateValidationError => TransportError::InvalidCertificate);
 
 crate::impl_from!(
 	spki::Error => TransportError::DerError extract spki::Error::Asn1(der_err) =>

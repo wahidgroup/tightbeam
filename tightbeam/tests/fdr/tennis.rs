@@ -9,7 +9,11 @@
 #![cfg(feature = "testing-fdr")]
 
 use tightbeam::testing::{fdr::FdrConfig, specs::csp::Process, ScenarioConf, SetupEnv};
+use tightbeam::utils::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario};
+
+pub(crate) const POINTA: Urn<'static> = Urn::new("test", "event:tennis/pointa");
+pub(crate) const POINTB: Urn<'static> = Urn::new("test", "event:tennis/pointb");
 
 fn build_fdr_config(
 	specs: Vec<Process>,
@@ -43,47 +47,47 @@ tb_process_spec! {
 	/// Events: pointA, pointB
 	pub TennisScorer,
 	events {
-		observable { "pointA", "pointB" }
+		observable { POINTA, POINTB }
 		hidden { }
 	}
 	states {
 		// Initial state: (0,0)
-		S0_0 => { "pointA" => S15_0, "pointB" => S0_15 },
+		S0_0 => { POINTA => S15_0, POINTB => S0_15 },
 		// Score (15,0)
-		S15_0 => { "pointA" => S30_0, "pointB" => S15_15 },
+		S15_0 => { POINTA => S30_0, POINTB => S15_15 },
 		// Score (0,15)
-		S0_15 => { "pointA" => S15_15, "pointB" => S0_30 },
+		S0_15 => { POINTA => S15_15, POINTB => S0_30 },
 		// Score (30,0)
-		S30_0 => { "pointA" => S40_0, "pointB" => S30_15 },
+		S30_0 => { POINTA => S40_0, POINTB => S30_15 },
 		// Score (15,15)
-		S15_15 => { "pointA" => S30_15, "pointB" => S15_30 },
+		S15_15 => { POINTA => S30_15, POINTB => S15_30 },
 		// Score (0,30)
-		S0_30 => { "pointA" => S15_30, "pointB" => S0_40 },
+		S0_30 => { POINTA => S15_30, POINTB => S0_40 },
 		// Score (40,0) - A can win or B can score
-		S40_0 => { "pointA" => GameA, "pointB" => S40_15 },
+		S40_0 => { POINTA => GameA, POINTB => S40_15 },
 		// Score (30,15)
-		S30_15 => { "pointA" => S40_15, "pointB" => S30_30 },
+		S30_15 => { POINTA => S40_15, POINTB => S30_30 },
 		// Score (15,30)
-		S15_30 => { "pointA" => S30_30, "pointB" => S15_40 },
+		S15_30 => { POINTA => S30_30, POINTB => S15_40 },
 		// Score (0,40) - B can win or A can score
-		S0_40 => { "pointA" => S15_40, "pointB" => GameB },
+		S0_40 => { POINTA => S15_40, POINTB => GameB },
 		// Score (40,15)
-		S40_15 => { "pointA" => GameA, "pointB" => S40_30 },
+		S40_15 => { POINTA => GameA, POINTB => S40_30 },
 		// Score (30,30)
-		S30_30 => { "pointA" => S40_30, "pointB" => S30_40 },
+		S30_30 => { POINTA => S40_30, POINTB => S30_40 },
 		// Score (15,40)
-		S15_40 => { "pointA" => S30_40, "pointB" => GameB },
+		S15_40 => { POINTA => S30_40, POINTB => GameB },
 		// Score (40,30) - A can win or go to Deuce
-		S40_30 => { "pointA" => GameA, "pointB" => Deuce },
+		S40_30 => { POINTA => GameA, POINTB => Deuce },
 		// Score (30,40) - B can win or go to Deuce
-		S30_40 => { "pointA" => Deuce, "pointB" => GameB },
+		S30_40 => { POINTA => Deuce, POINTB => GameB },
 
 		// Deuce state
-		Deuce => { "pointA" => AdvantageA, "pointB" => AdvantageB },
+		Deuce => { POINTA => AdvantageA, POINTB => AdvantageB },
 		// Advantage A
-		AdvantageA => { "pointA" => GameA, "pointB" => Deuce },
+		AdvantageA => { POINTA => GameA, POINTB => Deuce },
 		// Advantage B
-		AdvantageB => { "pointA" => Deuce, "pointB" => GameB },
+		AdvantageB => { POINTA => Deuce, POINTB => GameB },
 
 		// Terminal states
 		GameA => {},
@@ -103,8 +107,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(pointA, exactly!(4)),
-			(pointB, exactly!(1))
+			(POINTA, exactly!(4)),
+			(POINTB, exactly!(1))
 		]
 	},
 }
@@ -124,11 +128,11 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Valid trace: pointA -> pointA -> pointB -> pointA -> pointA (A wins)
-			trace.event(ValidTennisSpec::pointA)?;
-			trace.event(ValidTennisSpec::pointA)?;
-			trace.event(ValidTennisSpec::pointB)?;
-			trace.event(ValidTennisSpec::pointA)?;
-			trace.event(ValidTennisSpec::pointA)?;
+			trace.event(POINTA)?;
+			trace.event(POINTA)?;
+			trace.event(POINTB)?;
+			trace.event(POINTA)?;
+			trace.event(POINTA)?;
 			Ok(())
 		}
 	}
@@ -144,8 +148,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(pointA, exactly!(1)),
-			(pointB, exactly!(4))
+			(POINTA, exactly!(1)),
+			(POINTB, exactly!(4))
 		]
 	},
 }
@@ -166,11 +170,11 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| {
 			// Invalid trace: pointA -> pointB -> pointB -> pointB -> pointB
 			// This violates the tennis scoring rules - after (0,40), B should win
-			trace.event(InvalidTennisSpec::pointA)?;
-			trace.event(InvalidTennisSpec::pointB)?;
-			trace.event(InvalidTennisSpec::pointB)?;
-			trace.event(InvalidTennisSpec::pointB)?;
-			trace.event(InvalidTennisSpec::pointB)?;
+			trace.event(POINTA)?;
+			trace.event(POINTB)?;
+			trace.event(POINTB)?;
+			trace.event(POINTB)?;
+			trace.event(POINTB)?;
 			Ok(())
 		}
 	}
@@ -187,8 +191,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(pointA, exactly!(5)),
-			(pointB, exactly!(3))
+			(POINTA, exactly!(5)),
+			(POINTB, exactly!(3))
 		]
 	},
 }
@@ -208,14 +212,14 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Valid trace going through deuce: pointA -> pointB -> pointA -> pointB -> pointA -> pointB -> pointA -> pointA
-			trace.event(DeuceTennisSpec::pointA)?;
-			trace.event(DeuceTennisSpec::pointB)?;
-			trace.event(DeuceTennisSpec::pointA)?;
-			trace.event(DeuceTennisSpec::pointB)?;
-			trace.event(DeuceTennisSpec::pointA)?;
-			trace.event(DeuceTennisSpec::pointB)?;
-			trace.event(DeuceTennisSpec::pointA)?;
-			trace.event(DeuceTennisSpec::pointA)?;
+			trace.event(POINTA)?;
+			trace.event(POINTB)?;
+			trace.event(POINTA)?;
+			trace.event(POINTB)?;
+			trace.event(POINTA)?;
+			trace.event(POINTB)?;
+			trace.event(POINTA)?;
+			trace.event(POINTA)?;
 			Ok(())
 		}
 	}
@@ -230,8 +234,8 @@ tb_assert_spec! {
 		mode: Accept,
 		gate: Ok,
 		assertions: [
-			(pointA, exactly!(2)),
-			(pointB, exactly!(1))
+			(POINTA, exactly!(2)),
+			(POINTB, exactly!(1))
 		]
 	},
 }
@@ -251,9 +255,9 @@ tb_scenario! {
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
 			// Create a trace that should pass failures refinement
-			trace.event(FailuresTennisSpec::pointA)?;
-			trace.event(FailuresTennisSpec::pointB)?;
-			trace.event(FailuresTennisSpec::pointA)?;
+			trace.event(POINTA)?;
+			trace.event(POINTB)?;
+			trace.event(POINTA)?;
 			Ok(())
 		}
 	}

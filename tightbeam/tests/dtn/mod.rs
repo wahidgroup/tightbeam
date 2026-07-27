@@ -22,16 +22,6 @@
 //!
 //! This represents a fundamental rethinking of DTN based on Information Theory's
 //! constraint: `I(t) ∈ (0,1) for all t ∈ T`
-//!
-//! ## Test Structure
-//!
-//! - `clock.rs`: Simulated mission clock with realistic Mars-Earth delays
-//! - `messages.rs`: Rover telemetry, Earth commands, and consensus types
-//! - `faults.rs`: Fault flags and fault handling logic
-//! - `servlets.rs`: Earth and Relay servlet definitions
-//! - `storage.rs`: Frame storage and DtnPayload type
-//! - `ordering.rs`: Out-of-order buffer and ordering error types
-//! - `ultimate.rs`: Ultimate DTN test demonstrating all framework capabilities
 
 #![cfg(all(
 	feature = "testing-csp",
@@ -50,6 +40,7 @@ pub mod bms;
 pub mod certs;
 pub mod chain_processor;
 pub mod clock;
+pub mod events;
 pub mod fault_manager;
 pub mod fault_matrix;
 pub mod faults;

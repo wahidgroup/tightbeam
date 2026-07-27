@@ -71,8 +71,8 @@ macro_rules! tb_gen_process_types {
 				pub struct Event(pub &'static str);
 
 				impl $crate::testing::fault::ProcessEvent for Event {
-					fn event_label(&self) -> &'static str {
-						self.0
+					fn event_label(&self) -> ::std::borrow::Cow<'static, str> {
+						::std::borrow::Cow::Borrowed(self.0)
 					}
 				}
 			}
@@ -83,18 +83,24 @@ macro_rules! tb_gen_process_types {
 #[cfg(test)]
 mod tests {
 	use crate::testing::fault::{ProcessEvent, ProcessState};
+	use crate::utils::urn::Urn;
+
+	const CONNECT: Urn<'static> = Urn::new("test", "event:gen-states/connect");
+	const SEND: Urn<'static> = Urn::new("test", "event:gen-states/send");
+	const ACK: Urn<'static> = Urn::new("test", "event:gen-states/ack");
+	const DISCONNECT: Urn<'static> = Urn::new("test", "event:gen-states/disconnect");
 
 	// Test process definition
 	crate::tb_process_spec! {
 		pub MacroTestProcess,
 		events {
-			observable { "connect", "send", "ack", "disconnect" }
+			observable { CONNECT, SEND, ACK, DISCONNECT }
 			hidden { }
 		}
 		states {
-			Idle => { "connect" => Connected },
-			Connected => { "send" => Sending, "disconnect" => Idle },
-			Sending => { "ack" => Connected }
+			Idle => { CONNECT => Connected },
+			Connected => { SEND => Sending, DISCONNECT => Idle },
+			Sending => { ACK => Connected }
 		}
 		terminal { Idle }
 	}

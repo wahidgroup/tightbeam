@@ -7,7 +7,11 @@ use tightbeam::builder::TypeBuilder;
 use tightbeam::testing::fdr::FdrConfig;
 use tightbeam::testing::schedulability::SchedulerType;
 use tightbeam::testing::{ScenarioConf, SetupEnv, SpecViolation, TestHooks};
+use tightbeam::utils::urn::Urn;
 use tightbeam::{tb_assert_spec, tb_process_spec, tb_scenario, wcet};
+
+pub(crate) const TASK1: Urn<'static> = Urn::new("test", "event:violations/task1");
+pub(crate) const TASK2: Urn<'static> = Urn::new("test", "event:violations/task2");
 
 // Minimal spec for violation tests
 tb_assert_spec! {
@@ -24,25 +28,25 @@ tb_assert_spec! {
 tb_process_spec! {
 	pub RmaNotSchedulableProcess,
 	events {
-		observable { "task1", "task2" }
+		observable { TASK1, TASK2 }
 		hidden { }
 	}
 	states {
-		S0 => { "task1" => S1 },
-		S1 => { "task2" => S2 }
+		S0 => { TASK1 => S1 },
+		S1 => { TASK2 => S2 }
 	}
 	terminal { S2 }
 	timing {
 		wcet: {
-			"task1" => wcet!(Duration::from_millis(8)),
-			"task2" => wcet!(Duration::from_millis(5))
+			TASK1 => wcet!(Duration::from_millis(8)),
+			TASK2 => wcet!(Duration::from_millis(5))
 		}
 	}
 	schedulability {
 		scheduler: RateMonotonic,
 		periods: {
-			"task1" => Duration::from_millis(10),
-			"task2" => Duration::from_millis(20)
+			TASK1 => Duration::from_millis(10),
+			TASK2 => Duration::from_millis(20)
 		}
 	}
 }
@@ -81,8 +85,8 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("task1")?;
-			trace.event("task2")?;
+			trace.event(TASK1)?;
+			trace.event(TASK2)?;
 			Ok(())
 		}
 	}
@@ -92,25 +96,25 @@ tb_scenario! {
 tb_process_spec! {
 	pub EdfNotSchedulableProcess,
 	events {
-		observable { "task1", "task2" }
+		observable { TASK1, TASK2 }
 		hidden { }
 	}
 	states {
-		S0 => { "task1" => S1 },
-		S1 => { "task2" => S2 }
+		S0 => { TASK1 => S1 },
+		S1 => { TASK2 => S2 }
 	}
 	terminal { S2 }
 	timing {
 		wcet: {
-			"task1" => wcet!(Duration::from_millis(8)),
-			"task2" => wcet!(Duration::from_millis(5))
+			TASK1 => wcet!(Duration::from_millis(8)),
+			TASK2 => wcet!(Duration::from_millis(5))
 		}
 	}
 	schedulability {
 		scheduler: EarliestDeadlineFirst,
 		periods: {
-			"task1" => Duration::from_millis(10),
-			"task2" => Duration::from_millis(20)
+			TASK1 => Duration::from_millis(10),
+			TASK2 => Duration::from_millis(20)
 		}
 	}
 }
@@ -149,8 +153,8 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("task1")?;
-			trace.event("task2")?;
+			trace.event(TASK1)?;
+			trace.event(TASK2)?;
 			Ok(())
 		}
 	}
@@ -160,17 +164,17 @@ tb_scenario! {
 tb_process_spec! {
 	pub ProcessWithoutTiming,
 	events {
-		observable { "task1" }
+		observable { TASK1 }
 		hidden { }
 	}
 	states {
-		S0 => { "task1" => S1 }
+		S0 => { TASK1 => S1 }
 	}
 	terminal { S1 }
 	schedulability {
 		scheduler: RateMonotonic,
 		periods: {
-			"task1" => Duration::from_millis(10)
+			TASK1 => Duration::from_millis(10)
 		}
 	}
 }
@@ -206,7 +210,7 @@ tb_scenario! {
 		.build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| {
-			trace.event("task1")?;
+			trace.event(TASK1)?;
 			Ok(())
 		}
 	}

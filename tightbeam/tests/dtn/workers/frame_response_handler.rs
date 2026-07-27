@@ -6,7 +6,11 @@ use std::sync::Arc;
 
 use tightbeam::{der::Sequence, worker, Beamable, TightBeamError};
 
-use crate::dtn::{chain_processor::ChainProcessor, messages::FrameResponse};
+use crate::dtn::{
+	chain_processor::ChainProcessor,
+	messages::FrameResponse,
+	ultimate::{gap_recovery_event, GapRecoveryStep},
+};
 
 /// Frame response handler request
 #[derive(Beamable, Sequence, Clone, Debug, PartialEq)]
@@ -27,7 +31,7 @@ worker! {
 		chain_processor: Arc<ChainProcessor>,
 	},
 	handle: |request, trace, config| async move {
-		trace.event(format!("{}_receive_frame_response", request.node_name))?;
+		trace.event(gap_recovery_event(&request.node_name, GapRecoveryStep::ReceiveFrameResponse))?;
 
 		// Business logic: Process recovered frames through chain processor
 		let mut count = 0u32;

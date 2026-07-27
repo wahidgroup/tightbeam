@@ -12,6 +12,8 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use core::future::Future;
+
 #[cfg(feature = "std")]
 use std::sync::Arc;
 #[cfg(all(
@@ -20,9 +22,6 @@ use std::sync::Arc;
 	any(feature = "transport-cms", feature = "transport-ecies")
 ))]
 use std::time::Instant;
-
-use core::future::Future;
-use core::mem;
 
 use crate::asn1::Frame;
 use crate::der::{Decode, Encode};
@@ -35,8 +34,36 @@ use crate::transport::TransportResult;
 use crate::utils::marker::MaybeSend;
 use crate::TightBeamError;
 
+#[cfg(feature = "aead")]
+use crate::crypto::aead::{RecvCipher, SendCipher};
 #[cfg(feature = "transport-ecies")]
 use crate::crypto::ecies::Secp256k1EciesMessage;
+#[cfg(feature = "instrument")]
+use crate::instrumentation::events;
+#[cfg(feature = "instrument")]
+use crate::trace::TraceCollector;
+
+#[cfg(all(
+	feature = "tokio",
+	feature = "std",
+	not(target_arch = "wasm32"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+mod deadline {
+	pub use core::time::Duration;
+
+	pub use tokio::time::timeout;
+
+	pub use crate::transport::error::TransportFailure;
+}
+
+#[cfg(all(
+	feature = "tokio",
+	feature = "std",
+	not(target_arch = "wasm32"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+use deadline::*;
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -88,6 +115,23 @@ mod x509 {
 
 	#[cfg(feature = "transport-cms")]
 	pub use cms::*;
+
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
+	mod rekey {
+		pub(crate) use crate::transport::handshake::extract_verifying_key_from_cert;
+		pub(crate) use crate::transport::handshake::receipt::certificate_signer_identifier;
+		pub use crate::transport::multiplex::{MuxRekeyContext, MuxRole};
+		pub(crate) use crate::transport::rekey::{ClientRekey, RekeyDriver, RekeyMaterials, ServerRekey};
+	}
+
+	#[cfg(all(
+		feature = "transport-multiplex",
+		any(feature = "transport-cms", feature = "transport-ecies")
+	))]
+	pub(crate) use rekey::*;
 }
 
 #[cfg(feature = "x509")]
@@ -97,55 +141,99 @@ use x509::*;
 #[cfg(any(feature = "transport-cms", feature = "transport-ecies"))]
 pub(crate) const HANDSHAKE_MAX_WIRE: usize = 16 * 1024; // 16 KiB
 
-/// Parse a DER length field into its numeric value.
-pub(crate) fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
-	if first_byte & 0x80 == 0 {
-		return Some(first_byte as usize);
+/// Remaining allowance before the handshake deadline elapses.
+///
+/// - A fresh handshake receives the full configured timeout.
+/// - An in-flight handshake receives the unexpired remainder of its deadline.
+#[cfg(all(
+	feature = "tokio",
+	feature = "std",
+	not(target_arch = "wasm32"),
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+fn remaining_handshake_deadline<T: EncryptedProtocolState>(state: &T) -> Duration {
+	let allowance = state.to_handshake_timeout();
+	match state.to_handshake_state() {
+		TcpHandshakeState::AwaitingServerResponse { initiated_at }
+		| TcpHandshakeState::AwaitingClientFinish { initiated_at } => {
+			(initiated_at + allowance).saturating_duration_since(Instant::now())
+		}
+		_ => allowance,
 	}
-
-	let octet_count = (first_byte & 0x7F) as usize;
-	// 0x80 is the BER indefinite-length marker, forbidden in DER.
-	if octet_count == 0 || octet_count != length_octets.len() || octet_count > mem::size_of::<usize>() {
-		return None;
-	}
-
-	// Canonical form: no leading zero octet, and the long form is only used
-	// for values the short form cannot express (>= 128).
-	if length_octets[0] == 0 {
-		return None;
-	}
-
-	let mut length = 0usize;
-	for &byte in length_octets.iter() {
-		length = (length << 8) | (byte as usize);
-	}
-
-	if length < 0x80 {
-		return None;
-	}
-
-	Some(length)
 }
 
-/// Reconstruct a full DER encoding from its parsed tag, length, and content parts.
-pub(crate) fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets: &[u8], content: &[u8]) -> Vec<u8> {
-	let length_bytes_count = if length_first & 0x80 == 0 {
-		1
-	} else {
-		1 + length_octets.len()
+/// Harvest the in-band rekey wiring from a completed receipt-bearing handshake
+/// ([`MuxTransport::with_rekey`](crate::transport::multiplex::MuxTransport::with_rekey)
+/// consumes it). Detaches the retained epoch materials: at most one call
+/// returns `Ok(Some(..))` per handshake.
+///
+/// Crate-internal so the endpoint role is always fixed by the transport's
+/// [`MuxConnector::take_rekey`](crate::transport::multiplex::MuxConnector::take_rekey) /
+/// [`MuxAcceptor::take_rekey`](crate::transport::multiplex::MuxAcceptor::take_rekey).
+///
+/// `Ok(None)` when the session carries no dual-signed receipt, no
+/// retained peer identity, or no epoch materials.
+///
+/// # Errors
+/// - `EncryptorUnavailable`: no completed handshake
+/// - Peer key or signer-identifier extraction fails
+#[cfg(all(
+	feature = "x509",
+	feature = "transport-multiplex",
+	any(feature = "transport-cms", feature = "transport-ecies")
+))]
+pub(crate) fn take_rekey_context<T, P>(state: &mut T, role: MuxRole) -> TransportResult<Option<MuxRekeyContext>>
+where
+	T: EncryptedProtocolState<CryptoProvider = P>,
+	P: CryptoProvider + Send + Sync + 'static,
+	P::Curve: Curve + CurveArithmetic,
+	<P::Curve as Curve>::FieldBytesSize: ModulusSize,
+	AffinePoint<P::Curve>: FromEncodedPoint<P::Curve> + ToEncodedPoint<P::Curve>,
+	P::VerifyingKey: From<PublicKey<P::Curve>>,
+	for<'a> P::Signature: TryFrom<&'a [u8]>,
+	P::AeadCipher: KeyInit + 'static,
+{
+	let Some(stored) = state.to_session_receipt_ref().cloned() else {
+		return Ok(None);
+	};
+	let Some(provider) = state.to_key_manager_ref().map(|manager| manager.signing_provider()) else {
+		return Ok(None);
 	};
 
-	let mut buffer = Vec::with_capacity(1 + length_bytes_count + content.len());
-	buffer.push(tag);
-	buffer.push(length_first);
+	let aead_oid = state.to_encryptor_ref()?.algorithm_oid();
+	let Some(peer_cert) = state.to_peer_certificate_ref() else {
+		return Ok(None);
+	};
+	let public_key = extract_verifying_key_from_cert::<P::Curve>(peer_cert)?;
+	let peer_verifying_key = P::VerifyingKey::from(public_key);
+	let peer_sid = certificate_signer_identifier::<P::Digest>(peer_cert)?;
+	let peer_certificate = Arc::new(peer_cert.clone());
 
-	if length_first & 0x80 != 0 {
-		buffer.extend_from_slice(length_octets);
-	}
+	// Detached last so a session refused above keeps its materials
+	let Some(epoch) = state.take_epoch_materials() else {
+		return Ok(None);
+	};
+	let reference_receipt = stored.receipt().clone();
+	let materials =
+		RekeyMaterials::<P>::new(epoch, aead_oid, reference_receipt, provider, peer_verifying_key, peer_sid);
 
-	buffer.extend_from_slice(content);
+	let driver = match role {
+		MuxRole::Client => {
+			let exchange = ClientRekey::new(materials, state.to_receipt_approver());
+			RekeyDriver::client(exchange)
+		}
+		MuxRole::Server => {
+			let exchange = ServerRekey::new(
+				materials,
+				state.to_transport_authorizer(),
+				state.to_session_observer(),
+				Some(peer_certificate),
+			);
+			RekeyDriver::server(exchange)
+		}
+	};
 
-	buffer
+	Ok(Some(MuxRekeyContext { driver, receipt: stored }))
 }
 
 /// Decode a `TransportEnvelope` from DER bytes with version validation.
@@ -190,6 +278,32 @@ fn envelope_versions_compatible(envelope: &TransportEnvelope) -> bool {
 /// decrypts and enforces AEAD sequencing, a cleartext one enforces neither.
 pub trait EnvelopeSource: MaybeSend {
 	fn read_envelope(&mut self) -> impl Future<Output = TransportResult<TransportEnvelope>> + MaybeSend;
+
+	/// Envelopes still readable before the link demands a rekey.
+	///
+	/// Tracks the peer's send counter on the ordered channel, letting a
+	/// rekey initiator watch the receive direction without any wire
+	/// addition. Links without keys never rekey and report `u64::MAX`.
+	fn remaining_records(&self) -> u64 {
+		u64::MAX
+	}
+
+	/// Install a fresh receive-direction cipher at an epoch key-switch boundary
+	/// ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)).
+	///
+	/// Links without keys never rekey: the default fails closed so an epoch
+	/// install cannot silently land on an unprotected link.
+	#[cfg(feature = "aead")]
+	fn install_recv_cipher(&mut self, _cipher: RecvCipher) -> TransportResult<()> {
+		Err(TransportError::MissingEncryption)
+	}
+
+	/// Instrumentation collector inherited from the connection this half
+	/// was split from. Planes assembled over the half (mux) adopt it.
+	#[cfg(feature = "instrument")]
+	fn trace(&self) -> Option<TraceCollector> {
+		None
+	}
 }
 
 /// Send side of a split envelope link.
@@ -202,6 +316,23 @@ pub trait EnvelopeSink: MaybeSend {
 	///
 	/// Links without keys never rekey and report `u64::MAX`.
 	fn remaining_records(&self) -> u64;
+
+	/// Install a fresh send-direction cipher at an epoch key-switch boundary
+	/// ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)).
+	///
+	/// Links without keys never rekey: the default fails closed so an epoch
+	/// install cannot silently land on an unprotected link.
+	#[cfg(feature = "aead")]
+	fn install_send_cipher(&mut self, _cipher: SendCipher) -> TransportResult<()> {
+		Err(TransportError::MissingEncryption)
+	}
+
+	/// Instrumentation collector inherited from the connection this half
+	/// was split from. Planes assembled over the half (mux) adopt it.
+	#[cfg(feature = "instrument")]
+	fn trace(&self) -> Option<TraceCollector> {
+		None
+	}
 }
 
 /// Base I/O operations for message transport
@@ -261,23 +392,11 @@ pub trait MessageIO: ResponseHandler {
 		let frame = Arc::try_unwrap(message).unwrap_or_else(|arc| (*arc).clone());
 		self.handler().and_then(|handler| handler(frame))
 	}
-
-	/// Helper for parsing DER length encoding.
-	/// Returns `None` for non-canonical or indefinite-length encodings.
-	fn parse_der_length(first_byte: u8, length_octets: &[u8]) -> Option<usize> {
-		parse_der_length(first_byte, length_octets)
-	}
-
-	/// Helper to reconstruct full DER encoding from parts
-	fn reconstruct_der_encoding(tag: u8, length_first: u8, length_octets: &[u8], content: &[u8]) -> Vec<u8> {
-		reconstruct_der_encoding(tag, length_first, length_octets, content)
-	}
 }
 
 #[cfg(feature = "x509")]
 pub trait EncryptedMessageIO: MessageIO {
-	/// Relay a message by detecting whether it's encrypted or cleartext
-	/// Returns the decrypted TransportEnvelope ready for processing
+	/// Accept cleartext or encrypted wire form.
 	#[allow(async_fn_in_trait)]
 	async fn relay_message(&mut self) -> TransportResult<TransportEnvelope>
 	where
@@ -371,6 +490,52 @@ pub trait EncryptedMessageIO: MessageIO {
 		}
 	}
 
+	/// Dual-write the handshake outcome at the transport driver interface:
+	/// completion or a receipt approval/settlement refusal.
+	#[cfg(feature = "instrument")]
+	fn emit_handshake_outcome(&self, outcome: &TransportResult<()>)
+	where
+		Self: EncryptedProtocolState,
+	{
+		let Some(trace) = self.to_trace_ref() else {
+			return;
+		};
+
+		match outcome {
+			// Multi-round server handshakes report Ok per round; only the
+			// completed state marks the session as established.
+			Ok(()) => {
+				if self.to_handshake_state() != TcpHandshakeState::Complete {
+					return;
+				}
+
+				trace.emit_event(events::SESSION_HANDSHAKE_COMPLETE);
+				if self.to_session_receipt_ref().is_some() {
+					trace.emit_event(events::SESSION_RECEIPT_SETTLED);
+				}
+			}
+			Err(TransportError::HandshakeError(
+				HandshakeError::ApprovalRefused { .. } | HandshakeError::SettlementRejected { .. },
+			)) => {
+				trace.emit_event(events::SESSION_RECEIPT_REFUSED);
+			}
+			// Identity refusals: this transport rejected the peer's
+			// certificate or proof of possession.
+			Err(TransportError::HandshakeError(
+				HandshakeError::CertificateValidationError(_)
+				| HandshakeError::SignatureVerificationFailed
+				| HandshakeError::PeerIdentityMismatch
+				| HandshakeError::PinnedCertificateMismatch
+				| HandshakeError::CertificateNotYetValid
+				| HandshakeError::CertificateExpired
+				| HandshakeError::MutualAuthRequired,
+			)) => {
+				trace.emit_event(events::SESSION_CERT_REJECTED);
+			}
+			Err(_) => {}
+		}
+	}
+
 	/// Ensure handshake is complete, performing it if needed
 	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
@@ -435,8 +600,9 @@ pub trait EncryptedMessageIO: MessageIO {
 		Ok(())
 	}
 
-	/// Perform client-side ECIES handshake without mutual authentication (K=() variant)
-	/// This is a helper method because K=() cannot be cast to trait object due to missing Signer bound
+	/// Perform client-side ECIES handshake without mutual authentication
+	/// (K=() variant). This is a helper method because K=() cannot be cast
+	/// to trait object due to missing Signer bound.
 	#[cfg(feature = "transport-ecies")]
 	#[allow(async_fn_in_trait)]
 	async fn perform_client_handshake_no_mutual_auth<P>(&mut self) -> TransportResult<()>
@@ -471,6 +637,11 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Offer transport capabilities (multiplexing) when locally configured
 		if let Some(offer) = self.to_mux_config() {
 			client = client.with_transport_offer(offer);
+		}
+
+		// Receipt approver for budget-bearing sessions
+		if let Some(approver) = self.to_receipt_approver() {
+			client = client.with_receipt_approver(approver);
 		}
 
 		// Step 1: Build and send client hello
@@ -539,10 +710,15 @@ pub trait EncryptedMessageIO: MessageIO {
 		let ciphers = client.complete()?;
 		let profile = HandshakeFinalization::selected_profile(&client).ok_or(TransportError::InvalidMessage)?;
 		let aead_oid = profile.aead.ok_or(TransportError::InvalidMessage)?;
-
 		let session_keys = SessionKeys::for_client(ciphers.client_to_server, ciphers.server_to_client, aead_oid);
+
 		self.set_session_keys(session_keys);
 		self.set_mux_settings(client.negotiated_mux());
+		self.set_session_receipt(client.session_receipt().cloned());
+		if let Some(peer_cert) = client.peer_certificate().cloned() {
+			self.set_peer_certificate(peer_cert);
+		}
+		self.set_epoch_materials(client.take_epoch_materials());
 		self.set_handshake_state(TcpHandshakeState::Complete);
 
 		Ok(())
@@ -583,13 +759,14 @@ pub trait EncryptedMessageIO: MessageIO {
 			None,
 			validator,
 			self.to_mux_config(),
+			self.to_receipt_approver(),
 		)?)
 	}
 
 	/// Build the CMS client orchestrator from transport state.
 	///
 	/// CMS encrypts the session key to the server's public key up front, so
-	/// the server identity comes from the provisioned chain; missing trust
+	/// the server identity comes from the provisioned chain. Missing trust
 	/// store or chain fails closed.
 	#[cfg(feature = "transport-cms")]
 	fn build_cms_client_orchestrator<P>(&self) -> TransportResult<BoxedClientHandshake>
@@ -624,6 +801,7 @@ pub trait EncryptedMessageIO: MessageIO {
 			security_offer,
 			transport_offer: self.to_mux_config(),
 			client_certificate,
+			receipt_approver: self.to_receipt_approver(),
 		})?)
 	}
 
@@ -699,9 +877,14 @@ pub trait EncryptedMessageIO: MessageIO {
 		// Step 5: Complete handshake and get the directional session keys
 		let session_keys = orchestrator.complete().await?;
 
-		// Store session keys, negotiated mux settings, and mark handshake complete
+		// Handshake complete: persist keys, mux terms, receipt, peer cert, epoch materials
 		self.set_session_keys(session_keys);
 		self.set_mux_settings(orchestrator.negotiated_mux());
+		self.set_session_receipt(orchestrator.session_receipt().cloned());
+		if let Some(peer_cert) = orchestrator.peer_certificate().cloned() {
+			self.set_peer_certificate(peer_cert);
+		}
+		self.set_epoch_materials(orchestrator.take_epoch_materials());
 		self.set_handshake_state(TcpHandshakeState::Complete);
 
 		Ok(())
@@ -734,7 +917,12 @@ pub trait EncryptedMessageIO: MessageIO {
 
 		// Branch: Handle ECIES without mutual auth separately (K=() cannot be trait object)
 		if matches!(kind, HandshakeProtocolKind::Ecies) && self.to_key_manager_ref().is_none() {
-			return self.perform_client_handshake_no_mutual_auth().await;
+			let outcome = self.perform_client_handshake_no_mutual_auth().await;
+
+			#[cfg(feature = "instrument")]
+			self.emit_handshake_outcome(&outcome);
+
+			return outcome;
 		}
 
 		// Path: Mutual auth clients - trait objects via per-protocol builders
@@ -750,7 +938,12 @@ pub trait EncryptedMessageIO: MessageIO {
 			}
 		};
 
-		self.drive_client_handshake(kind, orchestrator).await
+		let outcome = self.drive_client_handshake(kind, orchestrator).await;
+
+		#[cfg(feature = "instrument")]
+		self.emit_handshake_outcome(&outcome);
+
+		outcome
 	}
 
 	/// Perform client-side handshake (CMS-only build variant).
@@ -773,7 +966,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		P::AeadCipher: KeyInit + Send + Sync,
 	{
 		let kind = self.to_handshake_protocol_kind();
-
 		let orchestrator = match kind {
 			HandshakeProtocolKind::Ecies => {
 				return Err(TransportError::UnsupportedHandshakeProtocol(HandshakeProtocolKind::Ecies));
@@ -781,7 +973,12 @@ pub trait EncryptedMessageIO: MessageIO {
 			HandshakeProtocolKind::Cms => self.build_cms_client_orchestrator()?,
 		};
 
-		self.drive_client_handshake(kind, orchestrator).await
+		let outcome = self.drive_client_handshake(kind, orchestrator).await;
+
+		#[cfg(feature = "instrument")]
+		self.emit_handshake_outcome(&outcome);
+
+		outcome
 	}
 
 	/// Build the ECIES server orchestrator from transport state.
@@ -809,6 +1006,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			supported_profiles,
 			client_validators,
 			self.to_mux_config(),
+			self.to_transport_authorizer(),
+			self.to_session_observer(),
 		)?)
 	}
 
@@ -830,7 +1029,13 @@ pub trait EncryptedMessageIO: MessageIO {
 		let client_validators = self.to_client_validators_ref().map(Arc::clone);
 		let supported_profiles = vec![SecurityProfileDesc::from(&TightbeamProfile)];
 
-		Ok(key_manager.create_cms_server(client_validators, supported_profiles, self.to_mux_config())?)
+		Ok(key_manager.create_cms_server(
+			client_validators,
+			supported_profiles,
+			self.to_mux_config(),
+			self.to_transport_authorizer(),
+			self.to_session_observer(),
+		)?)
 	}
 
 	/// Protocol-agnostic server handshake state machine: bytes in, bytes out.
@@ -844,7 +1049,6 @@ pub trait EncryptedMessageIO: MessageIO {
 		Self: Sized + MessageIO + EncryptedProtocolState,
 	{
 		let orchestrator = self.to_server_handshake_mut().as_mut().ok_or(TransportError::InvalidState)?;
-
 		// Process client handshake message - may return response to send
 		let response_bytes = orchestrator.handle_request(request).await?;
 
@@ -871,6 +1075,8 @@ pub trait EncryptedMessageIO: MessageIO {
 			// No response means handshake is complete - get the directional session keys
 			let session_keys = orchestrator.complete().await?;
 			let mux_settings = orchestrator.negotiated_mux();
+			let session_receipt = orchestrator.session_receipt().cloned();
+			let epoch_materials = orchestrator.take_epoch_materials();
 
 			// Extract peer certificate if mutual auth was performed
 			if let Some(peer_cert) = orchestrator.peer_certificate().cloned() {
@@ -879,6 +1085,8 @@ pub trait EncryptedMessageIO: MessageIO {
 
 			self.set_session_keys(session_keys);
 			self.set_mux_settings(mux_settings);
+			self.set_session_receipt(session_receipt);
+			self.set_epoch_materials(epoch_materials);
 			self.set_handshake_state(TcpHandshakeState::Complete);
 
 			// Clear handshake instance - no longer needed
@@ -932,7 +1140,27 @@ pub trait EncryptedMessageIO: MessageIO {
 			*self.to_server_handshake_mut() = Some(orchestrator);
 		}
 
-		self.drive_server_handshake(kind, &raw_message).await
+		// The tokio runtime supplies the timer: the handshake deadline bounds
+		// processing (including authorizer/observer hooks) on the
+		// unauthenticated path, not just wire reads. Non-tokio runtimes have
+		// no portable timer here and rely on the embedding application.
+		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
+		let outcome = {
+			let remaining = remaining_handshake_deadline(self);
+			if remaining.is_zero() {
+				return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
+			}
+
+			timeout(remaining, self.drive_server_handshake(kind, &raw_message)).await?
+		};
+
+		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
+		let outcome = self.drive_server_handshake(kind, &raw_message).await;
+
+		#[cfg(feature = "instrument")]
+		self.emit_handshake_outcome(&outcome);
+
+		outcome
 	}
 
 	/// Perform server-side handshake (CMS-only build variant).
@@ -976,7 +1204,27 @@ pub trait EncryptedMessageIO: MessageIO {
 			*self.to_server_handshake_mut() = Some(orchestrator);
 		}
 
-		self.drive_server_handshake(kind, &raw_message).await
+		// The tokio runtime supplies the timer: the handshake deadline bounds
+		// processing (including authorizer/observer hooks) on the
+		// unauthenticated path, not just wire reads. Non-tokio runtimes have
+		// no portable timer here and rely on the embedding application.
+		#[cfg(all(feature = "tokio", feature = "std", not(target_arch = "wasm32")))]
+		let outcome = {
+			let remaining = remaining_handshake_deadline(self);
+			if remaining.is_zero() {
+				return Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded));
+			}
+
+			timeout(remaining, self.drive_server_handshake(kind, &raw_message)).await?
+		};
+
+		#[cfg(not(all(feature = "tokio", feature = "std", not(target_arch = "wasm32"))))]
+		let outcome = self.drive_server_handshake(kind, &raw_message).await;
+
+		#[cfg(feature = "instrument")]
+		self.emit_handshake_outcome(&outcome);
+
+		outcome
 	}
 
 	/// Perform a single request-response cycle
@@ -1028,12 +1276,6 @@ pub trait EncryptedMessageIO: MessageIO {
 	}
 }
 
-/// Trait for checking transport connectivity
-pub trait Pingable {
-	/// Ping the transport layer to check connectivity
-	fn ping(&mut self) -> TransportResult<()>;
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1041,28 +1283,6 @@ mod tests {
 	use crate::transport::envelopes::{RequestPackage, ResponsePackage};
 	use crate::transport::ResponseHandler as TransportResponseHandler;
 	use crate::Version;
-
-	/// (first length octet, remaining octets, expected decode)
-	const PARSE_DER_LENGTH_CASES: &[(u8, &[u8], Option<usize>)] = &[
-		(0x00, &[], Some(0)),
-		(0x7F, &[], Some(127)),
-		(0x81, &[0x80], Some(128)),
-		(0x81, &[0xFF], Some(255)),
-		(0x82, &[0x01, 0x00], Some(256)),
-		(0x80, &[], None),
-		(0x81, &[0x05], None),
-		(0x82, &[0x00, 0x80], None),
-		(0x89, &[0x01; 9], None),
-		(0x82, &[0x01], None),
-		(0x81, &[], None),
-	];
-
-	#[test]
-	fn parse_der_length_cases() {
-		for &(first, rest, expected) in PARSE_DER_LENGTH_CASES {
-			assert_eq!(parse_der_length(first, rest), expected);
-		}
-	}
 
 	fn frame_with_priority(version: Version) -> Frame {
 		let mut metadata = Metadata::default();
@@ -1127,16 +1347,17 @@ mod tests {
 	}
 
 	#[test]
-	fn envelope_version_compatibility_and_decode_ingress() {
+	fn envelope_version_compatibility_and_decode_ingress() -> crate::error::Result<()> {
 		for (_label, envelope, compatible) in version_envelope_cases() {
 			assert_eq!(envelope_versions_compatible(&envelope), compatible);
 
-			let bytes = crate::encode(&envelope).expect("encode probe envelope");
+			let bytes = crate::encode(&envelope)?;
 			let decoded = <DecodeProbe as MessageIO>::decode_envelope(&bytes);
 			assert_eq!(decoded.is_ok(), compatible);
 			if !compatible {
 				assert!(matches!(decoded, Err(TransportError::InvalidMessage)));
 			}
 		}
+		Ok(())
 	}
 }

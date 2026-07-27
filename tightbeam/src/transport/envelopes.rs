@@ -17,10 +17,23 @@ use crate::cms::enveloped_data::EncryptedContentInfo;
 use crate::der::{Choice, Decode, Encode, EncodeValue, Length, Reader, Result as DerResult, Tag, Tagged, Writer};
 use crate::policy::TransitStatus;
 
+#[cfg(feature = "derive")]
+use crate::Beamable;
+#[cfg(not(feature = "derive"))]
+use crate::{Message, Version};
+
 #[cfg(feature = "transport-multiplex")]
-use crate::der::asn1::OctetString;
+mod multiplex {
+	#[cfg(not(feature = "x509"))]
+	pub use crate::cms::signed_data::SignedData;
+	pub use crate::cms::signed_data::SignerInfo;
+	pub use crate::der::asn1::OctetString;
+	pub use crate::der::Sequence;
+	pub use crate::der::{DecodeValue, FixedTag, Header};
+}
+
 #[cfg(feature = "transport-multiplex")]
-use crate::der::Sequence;
+use multiplex::*;
 
 #[cfg(feature = "x509")]
 mod x509 {
@@ -28,10 +41,6 @@ mod x509 {
 	pub use crate::cms::signed_data::SignedData;
 }
 
-#[cfg(feature = "derive")]
-use crate::Beamable;
-#[cfg(not(feature = "derive"))]
-use crate::{Message, Version};
 #[cfg(feature = "x509")]
 use x509::*;
 
@@ -137,11 +146,13 @@ impl<'a> Decode<'a> for ResponsePackage {
 /// First u32 code owned by applications in the multiplexing reason-code
 /// space. Codes below the floor are reserved for the TightBeam protocol
 /// (HTTP/2 error-code and QUIC application-close precedent:
-/// RFC 9113 § 7, RFC 9000 § 20.2).
+/// - [RFC 9113 § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
+/// - [RFC 9000 § 20.2](https://datatracker.ietf.org/doc/html/rfc9000#section-20.2))
 #[cfg(feature = "transport-multiplex")]
 pub const MUX_APPLICATION_CODE_FLOOR: u32 = 0x1000;
 
-/// Reason a single stream was cancelled (RFC 9113 § 6.4 analog).
+/// Reason a single stream was cancelled
+/// ([RFC 9113 § 6.4](https://datatracker.ietf.org/doc/html/rfc9113#section-6.4) analog).
 ///
 /// Open u32 code space: TB-reserved codes decode to named variants,
 /// everything else round-trips through [`CancelReason::Application`] so
@@ -186,7 +197,8 @@ impl From<u32> for CancelReason {
 	}
 }
 
-/// Reason the connection is shutting down (RFC 9113 § 6.8 analog).
+/// Reason the connection is shutting down
+/// ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8) analog).
 ///
 /// Same open u32 code space rules as [`CancelReason`].
 #[cfg(feature = "transport-multiplex")]
@@ -197,12 +209,35 @@ pub enum GoAwayReason {
 	Shutdown,
 	/// Peer violated the multiplexing protocol
 	ProtocolError,
-	/// Peer exceeded the cancel budget (RFC 9113 § 7
+	/// Peer exceeded the cancel budget
+	/// ([RFC 9113 § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
 	/// ENHANCE_YOUR_CALM analog, CVE-2023-44487 hardening)
 	EnhanceYourCalm,
+	/// Session budget spent down to the drain headroom: the epoch's
+	/// negotiated data volume is exhausted and the sender is draining
+	BudgetExhausted,
+	/// Settlement of the session agreement failed or was revoked after
+	/// activation
+	SettlementFailed,
 	/// Application-defined code (at or above
 	/// [`MUX_APPLICATION_CODE_FLOOR`]) or a TB code this build predates
 	Application(u32),
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl GoAwayReason {
+	/// Stable kebab-case name for audit labels; application codes share
+	/// one label and stay distinguishable by their wire code.
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Self::Shutdown => "shutdown",
+			Self::ProtocolError => "protocol-error",
+			Self::EnhanceYourCalm => "enhance-your-calm",
+			Self::BudgetExhausted => "budget-exhausted",
+			Self::SettlementFailed => "settlement-failed",
+			Self::Application(_) => "application",
+		}
+	}
 }
 
 #[cfg(feature = "transport-multiplex")]
@@ -212,6 +247,8 @@ impl From<GoAwayReason> for u32 {
 			GoAwayReason::Shutdown => 0,
 			GoAwayReason::ProtocolError => 1,
 			GoAwayReason::EnhanceYourCalm => 2,
+			GoAwayReason::BudgetExhausted => 3,
+			GoAwayReason::SettlementFailed => 4,
 			GoAwayReason::Application(code) => code,
 		}
 	}
@@ -224,6 +261,8 @@ impl From<u32> for GoAwayReason {
 			0 => Self::Shutdown,
 			1 => Self::ProtocolError,
 			2 => Self::EnhanceYourCalm,
+			3 => Self::BudgetExhausted,
+			4 => Self::SettlementFailed,
 			code => Self::Application(code),
 		}
 	}
@@ -270,7 +309,9 @@ macro_rules! mux_chunk_package {
 mux_chunk_package! {
 	/// Open a stream and carry its first payload chunk inline.
 	///
-	/// One unified stream grammar (RFC 9113 § 8.1 analog, request = stream):
+	/// One unified stream grammar
+	/// ([RFC 9113 § 8.1](https://datatracker.ietf.org/doc/html/rfc9113#section-8.1)
+	/// analog, request = stream):
 	///
 	/// ```text
 	/// initiator:  Open(last?)   Data(...)*  Data(last)
@@ -283,8 +324,7 @@ mux_chunk_package! {
 	/// the message frame DER. The ordered AEAD channel with strict counter
 	/// sequencing already proves order and completeness, so chunks carry no
 	/// sequence numbers. Stream correlation metadata travels inside the
-	/// encrypted envelope payload, so concurrency patterns never leak
-	/// outside the AEAD.
+	/// encrypted envelope payload.
 	MuxOpenPackage,
 	last: "Whether this is the initiator's final chunk on the stream"
 }
@@ -335,12 +375,12 @@ impl MuxEndPackage {
 	}
 }
 
-/// Grant absolute cumulative chunk credit on a stream (QUIC
-/// MAX_STREAM_DATA analog, RFC 9000 § 4.1).
+/// Grant absolute cumulative chunk credit on a stream (QUIC MAX_STREAM_DATA analog,
+/// [RFC 9000 § 4.1](https://datatracker.ietf.org/doc/html/rfc9000#section-4.1)).
 ///
 /// `limit` is the total chunk count the sender may have emitted on the
-/// stream, not a delta. Grants are idempotent and monotonic, so
-/// duplicated or reordered grants never corrupt the flow-control ledger.
+/// stream, not a delta. Grants are idempotent and monotonic, so duplicated
+/// or reordered grants never corrupt the flow-control ledger.
 #[cfg(feature = "transport-multiplex")]
 #[derive(Sequence, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MuxCreditPackage {
@@ -440,11 +480,118 @@ impl GoAwayPackage {
 	}
 }
 
+/// First leg, client -> server: client randomness opening an epoch renewal
+/// ([RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)
+/// analog with an explicit three-leg exchange).
+#[cfg(feature = "transport-multiplex")]
+#[derive(Sequence, Debug, Clone, PartialEq, Eq)]
+pub struct MuxRekeyRequestPackage {
+	pub(crate) client_random: OctetString,
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl MuxRekeyRequestPackage {
+	/// # Errors
+	/// - `client_random` longer than the DER length cap
+	pub fn new(client_random: impl Into<Vec<u8>>) -> DerResult<Self> {
+		let client_random = OctetString::new(client_random)?;
+		Ok(Self { client_random })
+	}
+
+	pub fn client_random(&self) -> &[u8] {
+		self.client_random.as_bytes()
+	}
+}
+
+/// Second rekey leg, server to client: server randomness plus the
+/// server-signed epoch receipt.
+///
+/// `epoch_receipt` is DER-optional for a future keys-only renewal
+/// (TLS KeyUpdate shape,
+/// [RFC 9846 § 4.7.3](https://datatracker.ietf.org/doc/html/rfc9846#section-4.7.3)),
+/// but on a budget-bearing session its absence is a protocol violation:
+/// receipt required iff budgets present.
+#[cfg(feature = "transport-multiplex")]
+#[derive(Sequence, Debug, Clone, PartialEq)]
+pub struct MuxRekeyResponsePackage {
+	pub(crate) server_random: OctetString,
+	pub(crate) epoch_receipt: Option<Box<SignedData>>,
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl MuxRekeyResponsePackage {
+	/// # Errors
+	/// `server_random` longer than the DER length cap
+	pub fn new(server_random: impl Into<Vec<u8>>, epoch_receipt: Option<SignedData>) -> DerResult<Self> {
+		let server_random = OctetString::new(server_random)?;
+		Ok(Self { server_random, epoch_receipt: epoch_receipt.map(Box::new) })
+	}
+
+	pub fn server_random(&self) -> &[u8] {
+		self.server_random.as_bytes()
+	}
+
+	pub fn epoch_receipt(&self) -> Option<&SignedData> {
+		self.epoch_receipt.as_deref()
+	}
+}
+
+/// Third rekey leg, client to server: the client `SignerInfo` the
+/// server appends to complete the dual-signed epoch receipt.
+#[cfg(feature = "transport-multiplex")]
+#[derive(Sequence, Debug, Clone, PartialEq)]
+pub struct MuxRekeyAckPackage {
+	pub(crate) countersignature: Option<Box<SignerInfo>>,
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl MuxRekeyAckPackage {
+	pub fn new(countersignature: Option<SignerInfo>) -> Self {
+		Self { countersignature: countersignature.map(Box::new) }
+	}
+
+	pub fn countersignature(&self) -> Option<&SignerInfo> {
+		self.countersignature.as_deref()
+	}
+}
+
+/// Server-to-client key-switch marker closing a rekey exchange: the
+/// server has settled the epoch receipt and switched its send cipher.
+///
+/// Encodes as an empty SEQUENCE; the derive macro cannot produce one,
+/// so the DER traits are implemented by hand.
+#[cfg(feature = "transport-multiplex")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MuxRekeyDonePackage {}
+
+#[cfg(feature = "transport-multiplex")]
+impl EncodeValue for MuxRekeyDonePackage {
+	fn value_len(&self) -> DerResult<Length> {
+		Ok(Length::ZERO)
+	}
+
+	fn encode_value(&self, _writer: &mut impl Writer) -> DerResult<()> {
+		Ok(())
+	}
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl<'a> DecodeValue<'a> for MuxRekeyDonePackage {
+	fn decode_value<R: Reader<'a>>(_reader: &mut R, _header: Header) -> DerResult<Self> {
+		Ok(Self {})
+	}
+}
+
+#[cfg(feature = "transport-multiplex")]
+impl FixedTag for MuxRekeyDonePackage {
+	const TAG: Tag = Tag::Sequence;
+}
+
 /// Every multiplexing message, nested under one [`TransportEnvelope`]
 /// arm so the mux plane evolves without touching the top-level envelope
 /// grammar and non-mux code never sees mux variants.
 #[cfg(feature = "transport-multiplex")]
-#[derive(Choice, Clone, Debug, PartialEq, Eq)]
+#[derive(Choice, Clone, Debug, PartialEq)]
 pub enum MuxEnvelope {
 	#[asn1(context_specific = "0", constructed = "true")]
 	Open(MuxOpenPackage),
@@ -460,6 +607,14 @@ pub enum MuxEnvelope {
 	GoAway(GoAwayPackage),
 	#[asn1(context_specific = "6", constructed = "true")]
 	Ping(MuxPingPackage),
+	#[asn1(context_specific = "7", constructed = "true")]
+	RekeyRequest(MuxRekeyRequestPackage),
+	#[asn1(context_specific = "8", constructed = "true")]
+	RekeyResponse(MuxRekeyResponsePackage),
+	#[asn1(context_specific = "9", constructed = "true")]
+	RekeyAck(MuxRekeyAckPackage),
+	#[asn1(context_specific = "10", constructed = "true")]
+	RekeyDone(MuxRekeyDonePackage),
 }
 
 /// Transport envelope wrapping all messages at the transport layer.
@@ -556,6 +711,10 @@ impl_mux_envelope_from! {
 	MuxCancelPackage => Cancel,
 	GoAwayPackage => GoAway,
 	MuxPingPackage => Ping,
+	MuxRekeyRequestPackage => RekeyRequest,
+	MuxRekeyResponsePackage => RekeyResponse,
+	MuxRekeyAckPackage => RekeyAck,
+	MuxRekeyDonePackage => RekeyDone,
 }
 
 impl TransportEnvelope {
@@ -790,6 +949,92 @@ mod tests {
 		])
 	}
 
+	/// Structurally valid `SignerInfo` for wire round-trips; the
+	/// signature bytes are arbitrary because envelope tests exercise
+	/// encoding, not verification.
+	#[cfg(feature = "transport-multiplex")]
+	fn sample_signer_info() -> Result<SignerInfo, Box<dyn Error>> {
+		use crate::cms::cert::x509::ext::pkix::SubjectKeyIdentifier;
+		use crate::cms::signed_data::SignerIdentifier;
+		use crate::crypto::sign::SignerInfoExt;
+		use crate::oids::{HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+		use crate::spki::AlgorithmIdentifierOwned;
+
+		let skid_octet = OctetString::new([0xAB; 20])?;
+		let skid = SubjectKeyIdentifier::from(skid_octet);
+		let signer = SignerInfo::from_parts(
+			[0xCD; 64],
+			AlgorithmIdentifierOwned { oid: SIGNER_ECDSA_WITH_SHA3_256, parameters: None },
+			AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None },
+			SignerIdentifier::SubjectKeyIdentifier(skid),
+		)?;
+		Ok(signer)
+	}
+
+	/// Structurally valid single-signer `SignedData` for wire round-trips.
+	#[cfg(feature = "transport-multiplex")]
+	fn sample_signed_data() -> Result<SignedData, Box<dyn Error>> {
+		use crate::cms::content_info::CmsVersion;
+		use crate::cms::signed_data::{EncapsulatedContentInfo, SignerInfos};
+		use crate::der::asn1::SetOfVec;
+		use crate::der::Any;
+		use crate::oids::{HASH_SHA3_256, SESSION_RECEIPT_CONTENT};
+		use crate::spki::AlgorithmIdentifierOwned;
+
+		let body_der = OctetString::new(b"epoch-receipt-body".as_slice())?.to_der()?;
+		let econtent = Any::from_der(&body_der)?;
+		let algorithm_identifier = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+		let digest_algorithms = SetOfVec::try_from(vec![algorithm_identifier])?;
+		let signer_infos = SignerInfos(SetOfVec::try_from(vec![sample_signer_info()?])?);
+
+		let artifact = SignedData {
+			version: CmsVersion::V3,
+			digest_algorithms,
+			encap_content_info: EncapsulatedContentInfo {
+				econtent_type: SESSION_RECEIPT_CONTENT,
+				econtent: Some(econtent),
+			},
+			certificates: None,
+			crls: None,
+			signer_infos,
+		};
+		Ok(artifact)
+	}
+
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_rekey_request_package_encode_decode() -> Result<(), Box<dyn Error>> {
+		assert_round_trip([
+			MuxRekeyRequestPackage::new([0u8; 32])?,
+			MuxRekeyRequestPackage::new([0xFF; 32])?,
+			MuxRekeyRequestPackage::new(Vec::new())?,
+		])
+	}
+
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_rekey_response_package_encode_decode() -> Result<(), Box<dyn Error>> {
+		assert_round_trip([
+			MuxRekeyResponsePackage::new([7u8; 32], Some(sample_signed_data()?))?,
+			MuxRekeyResponsePackage::new([9u8; 32], None)?,
+		])
+	}
+
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_rekey_ack_package_encode_decode() -> Result<(), Box<dyn Error>> {
+		assert_round_trip([
+			MuxRekeyAckPackage::new(Some(sample_signer_info()?)),
+			MuxRekeyAckPackage::new(None),
+		])
+	}
+
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_mux_rekey_done_package_encode_decode() -> Result<(), Box<dyn Error>> {
+		assert_round_trip([MuxRekeyDonePackage::default()])
+	}
+
 	#[cfg(feature = "transport-multiplex")]
 	#[test]
 	fn test_go_away_package_encode_decode() -> Result<(), Box<dyn Error>> {
@@ -798,8 +1043,26 @@ mod tests {
 			GoAwayPackage::new(7, GoAwayReason::ProtocolError),
 			GoAwayPackage::new(9, GoAwayReason::EnhanceYourCalm),
 			GoAwayPackage::new(11, GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR)),
+			GoAwayPackage::new(13, GoAwayReason::BudgetExhausted),
+			GoAwayPackage::new(15, GoAwayReason::SettlementFailed),
 			GoAwayPackage::new(u32::MAX, GoAwayReason::Shutdown),
 		])
+	}
+
+	#[cfg(feature = "transport-multiplex")]
+	#[test]
+	fn test_go_away_reason_labels() {
+		let cases = [
+			(GoAwayReason::Shutdown, "shutdown"),
+			(GoAwayReason::ProtocolError, "protocol-error"),
+			(GoAwayReason::EnhanceYourCalm, "enhance-your-calm"),
+			(GoAwayReason::BudgetExhausted, "budget-exhausted"),
+			(GoAwayReason::SettlementFailed, "settlement-failed"),
+			(GoAwayReason::Application(MUX_APPLICATION_CODE_FLOOR), "application"),
+		];
+		for (reason, label) in cases {
+			assert_eq!(reason.as_str(), label);
+		}
 	}
 
 	#[cfg(feature = "transport-multiplex")]
@@ -827,6 +1090,8 @@ mod tests {
 			(0u32, GoAwayReason::Shutdown),
 			(1, GoAwayReason::ProtocolError),
 			(2, GoAwayReason::EnhanceYourCalm),
+			(3, GoAwayReason::BudgetExhausted),
+			(4, GoAwayReason::SettlementFailed),
 		];
 		for (code, reason) in known {
 			assert_eq!(GoAwayReason::from(code), reason);
@@ -863,6 +1128,20 @@ mod tests {
 			TransportEnvelope::from(MuxCancelPackage::new(5, CancelReason::Cancelled)),
 			TransportEnvelope::from(GoAwayPackage::new(3, GoAwayReason::Shutdown)),
 			TransportEnvelope::from(MuxPingPackage::new(false, 7)),
+			{
+				let rekey_request = MuxRekeyRequestPackage::new([1u8; 32])?;
+				TransportEnvelope::from(rekey_request)
+			},
+			{
+				let signed = sample_signed_data()?;
+				let rekey_response = MuxRekeyResponsePackage::new([2u8; 32], Some(signed))?;
+				TransportEnvelope::from(rekey_response)
+			},
+			{
+				let signer = sample_signer_info()?;
+				TransportEnvelope::from(MuxRekeyAckPackage::new(Some(signer)))
+			},
+			TransportEnvelope::from(MuxRekeyDonePackage::default()),
 		])
 	}
 }

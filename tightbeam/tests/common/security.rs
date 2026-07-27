@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use tightbeam::{
+	crypto::profiles::DefaultCryptoProvider,
 	crypto::{
 		hash::Sha3_256,
 		key::{Secp256k1KeyProvider, SigningKeyProvider},
@@ -20,6 +21,7 @@ use tightbeam::{
 		error::{FdrConfigError, TestingError},
 		utils::{create_test_certificate, create_test_signing_key},
 	},
+	transport::handshake::HandshakeKeyManager,
 	x509::Certificate,
 	TightBeamError,
 };
@@ -62,12 +64,29 @@ impl ServerMaterials {
 	}
 }
 
+/// Generated client-side credentials for mutual-authentication handshakes.
+#[derive(Clone)]
+pub struct ClientMaterials {
+	pub certificate: Arc<Certificate>,
+	pub key_manager: Arc<HandshakeKeyManager<DefaultCryptoProvider>>,
+}
+
+impl ClientMaterials {
+	/// Fresh random identity, distinct from any server materials.
+	pub fn generate() -> Self {
+		let signing_key = random_signing_key();
+		let certificate = Arc::new(test_certificate(&signing_key));
+		let key_manager = Arc::new(HandshakeKeyManager::from(signing_key));
+		Self { certificate, key_manager }
+	}
+}
+
 /// Direct-trust validator pinning the given server certificate.
 ///
 /// Handshake clients fail closed without a validator (CWE-295), so every
 /// session pins the identity of the server it orchestrates against.
 pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValidation> {
-	let trust_chain = vec![certificate.clone()];
+	let trust_chain = vec![certificate.to_owned()];
 	let data = DirectTrustValidator::default().with_trust_chain(trust_chain);
 
 	Arc::new(data)
@@ -76,7 +95,7 @@ pub fn pinning_validator(certificate: &Certificate) -> Arc<dyn CertificateValida
 /// Trust store pinning the given server certificate (for CMS clients).
 pub fn pinning_trust_store(certificate: &Certificate) -> Result<Arc<dyn CertificateTrust>, TightBeamError> {
 	let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-		.with_certificate(certificate.clone())?
+		.with_certificate(certificate.to_owned())?
 		.build();
 	Ok(Arc::new(store))
 }
@@ -128,3 +147,282 @@ pub fn weak_security_profile() -> SecurityProfileDesc {
 		kem: None,
 	}
 }
+
+/// Shared hooks and doubles for receipt/settlement threat scenarios.
+#[cfg(all(
+	any(feature = "transport-cms", feature = "transport-ecies"),
+	feature = "transport-multiplex"
+))]
+mod receipt_fixtures {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::{Arc, Mutex};
+
+	use tightbeam::asn1::OctetString;
+	use tightbeam::transport::handshake::negotiation::{
+		AuthorizationGrant, AuthorizationRefusal, TransportAuthorizer, TransportOffer,
+	};
+	use tightbeam::transport::handshake::receipt::{
+		ApprovalRefusal, ReceiptApprover, SessionObserver, SessionOutcome, SessionReceipt,
+	};
+	use tightbeam::utils::marker::MaybeSendFuture;
+	use tightbeam::TightBeamError;
+
+	/// True when `needle` appears as a contiguous window inside `haystack`.
+	pub fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+		haystack.windows(needle.len()).any(|window| window == needle)
+	}
+
+	/// Grants the requested budgets, optionally issuing a settlement
+	/// challenge, and settles anything.
+	pub struct GrantingAuthorizer {
+		challenge: Option<OctetString>,
+	}
+
+	impl GrantingAuthorizer {
+		/// Grant without demanding a settlement answer.
+		pub fn challenge_free() -> Self {
+			Self { challenge: None }
+		}
+
+		/// Grant with the given settlement challenge attached.
+		pub fn challenging(challenge: &[u8]) -> Result<Self, TightBeamError> {
+			Ok(Self { challenge: Some(OctetString::new(challenge)?) })
+		}
+	}
+
+	impl TransportAuthorizer for GrantingAuthorizer {
+		fn authorize<'a>(
+			&'a self,
+			offer: &'a TransportOffer,
+		) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
+			Box::pin(async move {
+				Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: self.challenge.to_owned() })
+			})
+		}
+	}
+
+	/// Grants budgets with a settlement challenge and counts every call
+	/// to `settle`, so a scenario can prove whether the hook fired.
+	pub struct SettleSpyAuthorizer {
+		challenge: OctetString,
+		settle_calls: Arc<AtomicUsize>,
+	}
+
+	impl SettleSpyAuthorizer {
+		/// Spy granting budgets with the given settlement challenge.
+		pub fn challenging(challenge: &[u8]) -> Result<Self, TightBeamError> {
+			Ok(Self {
+				challenge: OctetString::new(challenge)?,
+				settle_calls: Arc::new(AtomicUsize::new(0)),
+			})
+		}
+
+		/// Calls the `settle` hook has received so far.
+		pub fn settle_calls(&self) -> usize {
+			self.settle_calls.load(Ordering::SeqCst)
+		}
+	}
+
+	impl TransportAuthorizer for SettleSpyAuthorizer {
+		fn authorize<'a>(
+			&'a self,
+			offer: &'a TransportOffer,
+		) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
+			Box::pin(async move {
+				Ok(AuthorizationGrant { budgets: offer.requested_budgets, challenge: Some(self.challenge.to_owned()) })
+			})
+		}
+
+		fn settle<'a>(
+			&'a self,
+			_receipt: &'a SessionReceipt,
+			_response: Option<&'a [u8]>,
+		) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
+			self.settle_calls.fetch_add(1, Ordering::SeqCst);
+			Box::pin(async move { Ok(()) })
+		}
+	}
+
+	/// Approves every receipt, answering its challenge with a fixed
+	/// settlement answer.
+	pub struct PayingApprover {
+		response: OctetString,
+	}
+
+	impl PayingApprover {
+		/// Approver answering every challenge with `response`.
+		pub fn answering(response: &[u8]) -> Result<Self, TightBeamError> {
+			Ok(Self { response: OctetString::new(response)? })
+		}
+	}
+
+	impl ReceiptApprover for PayingApprover {
+		fn approve<'a>(
+			&'a self,
+			_receipt: &'a SessionReceipt,
+		) -> MaybeSendFuture<'a, Result<Option<OctetString>, ApprovalRefusal>> {
+			Box::pin(async move { Ok(Some(self.response.to_owned())) })
+		}
+	}
+
+	/// Records every [`SessionOutcome`] the server hands to the observer.
+	#[derive(Default)]
+	pub struct RecordingObserver {
+		outcomes: Mutex<Vec<SessionOutcome>>,
+	}
+
+	impl RecordingObserver {
+		/// Snapshot of the outcomes recorded so far.
+		pub fn recorded(&self) -> Vec<SessionOutcome> {
+			self.outcomes.lock().map(|outcomes| outcomes.to_owned()).unwrap_or_default()
+		}
+	}
+
+	impl SessionObserver for RecordingObserver {
+		fn on_outcome<'a>(&'a self, outcome: &'a SessionOutcome) -> MaybeSendFuture<'a, ()> {
+			Box::pin(async move {
+				if let Ok(mut outcomes) = self.outcomes.lock() {
+					outcomes.push(outcome.to_owned());
+				}
+			})
+		}
+	}
+}
+
+#[cfg(all(
+	any(feature = "transport-cms", feature = "transport-ecies"),
+	feature = "transport-multiplex"
+))]
+pub use receipt_fixtures::*;
+
+/// Baseline mutually authenticated CMS pair shared by the loopback,
+/// receipt, and security threat suites: each layers its own offers,
+/// hooks, or policies on top instead of re-wiring the identities.
+#[cfg(feature = "transport-cms")]
+mod cms_pair {
+	use std::sync::Arc;
+
+	use tightbeam::crypto::key::{Secp256k1KeyProvider, SigningKeyProvider};
+	use tightbeam::crypto::profiles::{DefaultCryptoProvider, SecurityProfileDesc};
+	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use tightbeam::crypto::x509::policy::CertificateValidation;
+	use tightbeam::testing::utils::create_test_certificate;
+	use tightbeam::transport::handshake::negotiation::SecurityOffer;
+	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
+	use tightbeam::x509::Certificate;
+	use tightbeam::TightBeamError;
+
+	use super::{pinning_trust_store, random_signing_key, ServerMaterials};
+
+	/// Mutually authenticated CMS client/server pair over the fixture
+	/// server identity, plus the fresh client certificate the server
+	/// validates (for suites that also present it client-side).
+	pub struct CmsHandshakePair {
+		pub client: CmsHandshakeClient<DefaultCryptoProvider>,
+		pub server: CmsHandshakeServer<DefaultCryptoProvider>,
+		pub client_certificate: Arc<Certificate>,
+	}
+
+	/// Build the pair: the client offers `client_profiles` and pins the
+	/// server certificate; the server supports `server_profiles`, runs
+	/// `validators` against the fresh client certificate, and holds that
+	/// certificate for mutual authentication.
+	pub fn cms_handshake_pair(
+		materials: &ServerMaterials,
+		client_profiles: Vec<SecurityProfileDesc>,
+		server_profiles: Vec<SecurityProfileDesc>,
+		validators: Option<Arc<Vec<Arc<dyn CertificateValidation>>>>,
+	) -> Result<CmsHandshakePair, TightBeamError> {
+		let client_signing = random_signing_key();
+		let client_certificate = Arc::new(create_test_certificate(&client_signing));
+		let signing_key = Secp256k1SigningKey::from(client_signing);
+		let client_provider: Arc<dyn SigningKeyProvider> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let trust_store = pinning_trust_store(&materials.certificate)?;
+
+		let client = CmsHandshakeClient::<DefaultCryptoProvider>::new(
+			DefaultCryptoProvider::default(),
+			client_provider,
+			Arc::clone(&materials.certificate),
+		)
+		.with_security_offer(SecurityOffer::new(client_profiles))
+		.with_trust_store(trust_store);
+
+		let mut server =
+			CmsHandshakeServer::<DefaultCryptoProvider>::new(Arc::clone(&materials.key_provider), validators)
+				.with_supported_profiles(server_profiles);
+		server.set_client_certificate((*client_certificate).to_owned())?;
+
+		Ok(CmsHandshakePair { client, server, client_certificate })
+	}
+}
+
+// Consumers (loopback, receipt fixtures, security threats) sit behind
+// wider feature gates, so lean combos compile the fixture unused.
+#[allow(unused_imports)]
+#[cfg(feature = "transport-cms")]
+pub use cms_pair::*;
+
+/// Manual-drive CMS client/server pair fixture for receipt scenarios.
+#[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
+mod cms_fixtures {
+	use std::sync::Arc;
+
+	use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	use tightbeam::crypto::x509::policy::{CertificateValidation, ExpiryValidator};
+	use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportAuthorizer, TransportOffer};
+	use tightbeam::transport::handshake::receipt::{ReceiptApprover, SessionObserver};
+	use tightbeam::transport::handshake::{client::CmsHandshakeClient, server::CmsHandshakeServer};
+	use tightbeam::TightBeamError;
+
+	use super::{cms_handshake_pair, default_security_profile, ServerMaterials};
+
+	/// Hooks installed on a [`cms_mutual_budget_pair`] fixture.
+	#[derive(Default)]
+	pub struct CmsSessionHooks {
+		pub authorizer: Option<Arc<dyn TransportAuthorizer>>,
+		pub approver: Option<Arc<dyn ReceiptApprover>>,
+		pub observer: Option<Arc<dyn SessionObserver>>,
+	}
+
+	/// Mutually authenticated CMS client/server pair with a
+	/// budget-bearing transport offer, ready to drive manually.
+	pub struct CmsSessionPair {
+		pub client: CmsHandshakeClient<DefaultCryptoProvider>,
+		pub server: CmsHandshakeServer<DefaultCryptoProvider>,
+	}
+
+	/// Build the pair with a fresh client identity pinned to the server
+	/// materials, requesting `request` budgets.
+	pub fn cms_mutual_budget_pair(
+		materials: &ServerMaterials,
+		request: MuxBudgets,
+		hooks: CmsSessionHooks,
+	) -> Result<CmsSessionPair, TightBeamError> {
+		let profile = default_security_profile();
+		let offer = TransportOffer::mux(4).with_budgets(request);
+		let validators: Arc<Vec<Arc<dyn CertificateValidation>>> = Arc::new(vec![Arc::new(ExpiryValidator)]);
+
+		let pair = cms_handshake_pair(materials, vec![profile], vec![profile], Some(validators))?;
+
+		let mut client = pair
+			.client
+			.with_client_certificate(Arc::clone(&pair.client_certificate))
+			.with_transport_offer(offer.to_owned());
+		if let Some(approver) = hooks.approver {
+			client = client.with_receipt_approver(approver);
+		}
+
+		let mut server = pair.server.with_transport_config(offer);
+		if let Some(authorizer) = hooks.authorizer {
+			server = server.with_transport_authorizer(authorizer);
+		}
+		if let Some(observer) = hooks.observer {
+			server = server.with_session_observer(observer);
+		}
+
+		Ok(CmsSessionPair { client, server })
+	}
+}
+
+#[cfg(all(feature = "transport-cms", feature = "transport-multiplex"))]
+pub use cms_fixtures::*;

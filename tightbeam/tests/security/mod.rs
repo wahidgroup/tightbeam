@@ -18,16 +18,22 @@
 //! transport security table.
 
 pub mod algorithm_confusion;
+pub mod attribute_injection;
 pub mod certificate_forgery;
 pub mod certificate_trust;
 pub mod common;
 pub mod confidentiality;
+pub mod countersignature_evidence;
 pub mod dos_attack;
 pub mod downgrade_attack;
 pub mod envelope_tamper;
 pub mod forward_secrecy;
 pub mod mitm_attack;
 pub mod nonce_reuse;
+pub mod receipt_activation;
+pub mod receipt_confidentiality;
+pub mod receipt_integrity;
 pub mod replay_attack;
+pub mod settlement_ordering;
 pub mod splice_attack;
 pub mod transcript_binding;

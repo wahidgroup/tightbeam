@@ -3,7 +3,12 @@
 use tightbeam::{worker, TightBeamError};
 
 use super::messages::{CommandExecutionRequest, CommandExecutionResult};
-use crate::dtn::messages::{RoverCommand, RoverInstrument};
+use crate::dtn::{
+	events::{
+		ROVER_EXECUTE_COLLECT_SAMPLE, ROVER_EXECUTE_PROBE_LOCATION, ROVER_EXECUTE_STANDBY, ROVER_EXECUTE_TAKE_PHOTO,
+	},
+	messages::{RoverCommand, RoverInstrument},
+};
 
 worker! {
 	name: CommandExecutionWorker<CommandExecutionRequest, Result<CommandExecutionResult, TightBeamError>>,
@@ -12,7 +17,7 @@ worker! {
 		let command = RoverCommand::try_from(request.command_type)?;
 		match command {
 			RoverCommand::CollectSample { .. } => {
-				trace.event("rover_execute_collect_sample")?;
+				trace.event(ROVER_EXECUTE_COLLECT_SAMPLE)?;
 				Ok(CommandExecutionResult {
 					success: true,
 					instrument: RoverInstrument::Apxs,
@@ -20,7 +25,7 @@ worker! {
 				})
 			}
 			RoverCommand::ProbeLocation { .. } => {
-				trace.event("rover_execute_probe_location")?;
+				trace.event(ROVER_EXECUTE_PROBE_LOCATION)?;
 				Ok(CommandExecutionResult {
 					success: true,
 					instrument: RoverInstrument::ChemCam,
@@ -28,7 +33,7 @@ worker! {
 				})
 			}
 			RoverCommand::TakePhoto { .. } => {
-				trace.event("rover_execute_take_photo")?;
+				trace.event(ROVER_EXECUTE_TAKE_PHOTO)?;
 				Ok(CommandExecutionResult {
 					success: true,
 					instrument: RoverInstrument::Mastcam,
@@ -36,7 +41,7 @@ worker! {
 				})
 			}
 			RoverCommand::Standby => {
-				trace.event("rover_execute_standby")?;
+				trace.event(ROVER_EXECUTE_STANDBY)?;
 				Ok(CommandExecutionResult {
 					success: true,
 					instrument: RoverInstrument::Apxs,

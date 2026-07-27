@@ -1,38 +1,51 @@
 //! Key Derivation Functions (KDF)
 //!
-//! This module provides HKDF-based key derivation following RFC 5869, using
+//! This module provides HKDF-based key derivation following
+//! [RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869), using
 //! SHA3-256 as the default hash. It’s used both as a general-purpose KDF and
-//! for ECIES-style constructions where distinct encryption and MAC keys are required.
+//! for ECIES-style constructions where distinct encryption and MAC keys are
+//! required.
 //!
 //! Key properties
-//! - HKDF (RFC 5869) with SHA3-256
+//! - HKDF ([RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869)) with SHA3-256
 //! - Deterministic and domain-separated via the `info` parameter
+//!   ([RFC 5869 §3.2](https://datatracker.ietf.org/doc/html/rfc5869#section-3.2))
 //! - Secure memory handling via `Zeroizing`/`ZeroizingArray`
 //! - Input validation for ephemeral public key (33/65), shared secret (32), and salt (>=16)
 //!
 //! Provider notes
-//! - HKDF providers honor the optional `salt` parameter per RFC 5869.
+//! - HKDF providers honor the optional `salt` parameter per
+//!   [RFC 5869 §2.2](https://datatracker.ietf.org/doc/html/rfc5869#section-2.2).
 //! - ANSI X9.63 providers ignore `salt` entirely; derivation depends on the
-//!   shared secret Z and the `info`/SharedInfo context bytes.
+//!   shared secret Z and the `info`/SharedInfo context bytes
+//!   ([SECG SEC 1 v2.0 §3.6](https://www.secg.org/sec1-v2.pdf#page=37)).
 //!
 //! ECIES note
-//! - Many ECIES profiles (e.g., SECG SEC 1, IEEE 1363a, ISO/IEC 18033-2) mandate
-//!   separate symmetric encryption and MAC keys. This module enforces key separation
-//!   by either (a) running two HKDF expansions with distinct `info` labels or
-//!   (b) performing one HKDF expansion and splitting the output into two disjoint keys.
-//! - ECIES is parameterized by the KDF (see SECG SEC 1, IEEE 1363a). This
-//!   library provides a proper ECIES instantiation using HKDF per RFC 5869
-//!   with SHA3-256, enforcing key separation and context binding via `info`.
+//! - Many ECIES profiles (e.g.,
+//!   [SECG SEC 1 v2.0 §5.1](https://www.secg.org/sec1-v2.pdf#page=57),
+//!   [IEEE Std 1363a-2004](https://standards.ieee.org/standard/1363a-2004.html),
+//!   [ISO/IEC 18033-2:2006](https://www.iso.org/standard/37971.html))
+//!   mandate separate symmetric encryption and MAC keys. This module enforces
+//!   key separation by either (a) running two HKDF expansions with distinct
+//!   `info` labels or (b) performing one HKDF expansion and splitting the
+//!   output into two disjoint keys
+//!   ([SECG SEC 1 v2.0 §5.1.3](https://www.secg.org/sec1-v2.pdf#page=59)).
+//! - ECIES is parameterized by the KDF (see
+//!   [SECG SEC 1 v2.0 §5.1](https://www.secg.org/sec1-v2.pdf#page=57),
+//!   [IEEE Std 1363a-2004](https://standards.ieee.org/standard/1363a-2004.html)).
+//!   This library provides a proper ECIES instantiation using HKDF per
+//!   [RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869) with SHA3-256,
+//!   enforcing key separation and context binding via `info`.
 //!   If you must target a profile that mandates ANSI X9.63 KDF, supply a
 //!   `KdfProvider` that implements that KDF.
 //!
 //! References
-//! - RFC 5869: HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
-//! - NIST SP 800-56A Rev. 3: Recommendation for Pair-Wise Key Establishment Schemes
-//! - NIST SP 800-56C Rev. 2: Recommendation for KDFs using HMAC
-//! - SECG SEC 1 v2.0: Elliptic Curve Cryptography (ECIES)
-//! - IEEE 1363a: Standard Specifications for Public-Key Cryptography (ECIES/KEM-DEM)
-//! - ISO/IEC 18033-2: Asymmetric ciphers (ECIES)
+//! - [RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869): HMAC-based Extract-and-Expand Key Derivation Function (HKDF)
+//! - [NIST SP 800-56A Rev. 3 §5.8](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-56Ar3.pdf#page=64): Key-Derivation Methods for Key-Agreement Schemes
+//! - [NIST SP 800-56C Rev. 2 §5](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-56Cr2.pdf#page=25): Two-Step Key Derivation (Extraction-then-Expansion)
+//! - [SECG SEC 1 v2.0 §5.1](https://www.secg.org/sec1-v2.pdf#page=57): Elliptic Curve Integrated Encryption Scheme (ECIES)
+//! - [IEEE Std 1363a-2004](https://standards.ieee.org/standard/1363a-2004.html): Public-Key Cryptography - Amendment 1 (Additional Techniques)
+//! - [ISO/IEC 18033-2:2006](https://www.iso.org/standard/37971.html): Encryption algorithms - Part 2: Asymmetric ciphers
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -46,7 +59,7 @@ use crate::constants::{
 use crate::crypto::hash::{Digest, Sha3_256};
 use crate::crypto::secret::{SecretSlice, ToInsecure};
 use crate::zeroize::Zeroizing;
-use crate::ZeroizingArray;
+use crate::{ZeroizingArray, ZeroizingBytes};
 
 pub type Result<T> = ::core::result::Result<T, KdfError>;
 
@@ -70,34 +83,41 @@ pub trait KdfFunction {
 	/// - `key_size`: Desired output key size in bytes
 	///
 	/// # Returns
-	/// Zeroizing vector containing derived key bytes
+	/// Derived key bytes in a zeroizing buffer
 	///
 	/// # Errors
 	/// Returns `KdfError::DerivationFailed` if key_size is outside valid range.
-	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<Zeroizing<Vec<u8>>>;
+	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes>;
 
 	/// Derive two keys of the specified length (for ECIES encryption + MAC)
 	///
-	/// ECIES standards (e.g., SECG SEC 1, IEEE 1363a, ISO/IEC 18033-2) require
-	/// key separation: distinct symmetric keys must be derived for encryption
-	/// and for message authentication to avoid key reuse across primitives.
+	/// ECIES standards (e.g.,
+	/// [SECG SEC 1 v2.0 §5.1](https://www.secg.org/sec1-v2.pdf#page=57),
+	/// [IEEE Std 1363a-2004](https://standards.ieee.org/standard/1363a-2004.html),
+	/// [ISO/IEC 18033-2:2006](https://www.iso.org/standard/37971.html))
+	/// require key separation: distinct symmetric keys must be derived for
+	/// encryption and for message authentication to avoid key reuse across
+	/// primitives.
 	///
 	/// Default behavior
 	/// - Performs two HKDF-Expand operations with different `info` labels:
 	///   `{info}-encryption` and `{info}-mac`.
-	/// - This yields two independent keys while preserving RFC 5869 domain separation.
+	/// - This yields two independent keys while preserving
+	///   [RFC 5869 §3.2](https://datatracker.ietf.org/doc/html/rfc5869#section-3.2)
+	///   domain separation.
 	///
 	/// Provider override
 	/// - Implementations MAY override this with a single HKDF-Expand that
 	///   produces 2*N bytes and split the output into two keys, preserving
-	///   independence by non-overlapping segments. This is equivalent in
-	///   security if the underlying HKDF is robust and the segments do not
-	///   overlap.
+	///   independence by non-overlapping segments
+	///   ([SECG SEC 1 v2.0 §5.1.3](https://www.secg.org/sec1-v2.pdf#page=59)).
+	///   This is equivalent in security if the underlying HKDF is robust and
+	///   the segments do not overlap.
 	///
 	/// References
-	/// - RFC 5869 (HKDF): § 2.2 (the `info` field for context separation)
-	/// - NIST SP 800-56C Rev. 2: HMAC-based KDFs and context information (“OtherInfo”)
-	/// - SECG SEC 1 v2.0 / IEEE 1363a / ISO/IEC 18033-2: ECIES key separation requirement
+	/// - [RFC 5869 §3.2](https://datatracker.ietf.org/doc/html/rfc5869#section-3.2): `info` for context separation
+	/// - [NIST SP 800-56C Rev. 2 §5](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-56Cr2.pdf#page=25): extraction-then-expansion and context binding
+	/// - [SECG SEC 1 v2.0 §5.1.3](https://www.secg.org/sec1-v2.pdf#page=59): ECIES encryption/MAC key separation
 	fn derive_dual_keys<const N: usize>(
 		ikm: &[u8],
 		info: &[u8],
@@ -168,7 +188,7 @@ impl KdfFunction for HkdfSha3_256 {
 		Ok(output)
 	}
 
-	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<Zeroizing<Vec<u8>>> {
+	fn derive_dynamic_key(ikm: &[u8], info: &[u8], salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes> {
 		assert_hkdf_key_size(key_size)?;
 
 		let hk = Hkdf::<Sha3_256>::new(salt, ikm);
@@ -239,12 +259,7 @@ impl KdfFunction for X963Sha3_256 {
 		Ok(out)
 	}
 
-	fn derive_dynamic_key(
-		ikm: &[u8],
-		info: &[u8],
-		_salt: Option<&[u8]>,
-		key_size: usize,
-	) -> Result<Zeroizing<Vec<u8>>> {
+	fn derive_dynamic_key(ikm: &[u8], info: &[u8], _salt: Option<&[u8]>, key_size: usize) -> Result<ZeroizingBytes> {
 		assert_min_key_size(key_size)?;
 
 		// K(i) = Hash( Z || Counter_i || SharedInfo ), Counter_i starts at 1
@@ -271,10 +286,6 @@ impl KdfFunction for X963Sha3_256 {
 
 		Ok(Zeroizing::new(out))
 	}
-
-	// `derive_dual_keys` intentionally omitted: the trait default already derives
-	// independent encryption/MAC keys via distinct SharedInfo labels, and X9.63
-	// ignores `salt`, so an override would be byte-identical duplication.
 }
 
 /// Errors specific to KDF operations
@@ -320,6 +331,7 @@ fn assert_valid_shared_secret(shared_secret: &[u8]) -> Result<()> {
 	if shared_secret.len() != ECDH_SHARED_SECRET_SIZE {
 		return Err(KdfError::InvalidSharedSecretLength(shared_secret.len()));
 	}
+
 	Ok(())
 }
 
@@ -331,6 +343,7 @@ fn assert_valid_salt(salt: Option<&[u8]>) -> Result<()> {
 			return Err(KdfError::InvalidSaltLength(salt_bytes.len()));
 		}
 	}
+
 	Ok(())
 }
 
@@ -340,6 +353,7 @@ fn assert_valid_ephemeral_pubkey(ephemeral_pubkey: &[u8]) -> Result<()> {
 	if ephemeral_pubkey.len() != EC_PUBKEY_COMPRESSED_SIZE && ephemeral_pubkey.len() != EC_PUBKEY_UNCOMPRESSED_SIZE {
 		return Err(KdfError::InvalidPublicKeyLength(ephemeral_pubkey.len()));
 	}
+
 	Ok(())
 }
 
@@ -368,8 +382,10 @@ fn assert_valid_kdf_inputs(ephemeral_pubkey: &[u8], shared_secret: &[u8], salt: 
 /// - `DerivationFailed` if HKDF expansion fails
 ///
 /// Standards notes
-/// - Uses RFC 5869 (HKDF) with SHA3-256. For strict ECIES profiles that mandate
-///   X9.63 KDF, provide a custom `KdfProvider`.
+/// - Uses [RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869) (HKDF)
+///   with SHA3-256. For strict ECIES profiles that mandate X9.63 KDF
+///   ([SECG SEC 1 v2.0 §3.6.1](https://www.secg.org/sec1-v2.pdf#page=38)),
+///   provide a custom `KdfProvider`.
 pub fn ecies_kdf<P: KdfFunction>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
 	shared_secret: SecretSlice<u8>,
@@ -390,12 +406,17 @@ pub fn ecies_kdf<P: KdfFunction>(
 	P::derive_key::<32>(shared_secret, &shared_info, salt)
 }
 
-/// General-purpose HKDF (RFC 5869) using any `KdfProvider`.
+/// General-purpose HKDF
+/// ([RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869)) using any
+/// `KdfProvider`.
 ///
 /// Inputs
 /// - `ikm`: input key material
 /// - `info`: context string for domain separation
-/// - `salt`: optional HKDF salt; if provided and non-empty, must be >= 16 bytes
+///   ([RFC 5869 §3.2](https://datatracker.ietf.org/doc/html/rfc5869#section-3.2))
+/// - `salt`: optional HKDF salt
+///   ([RFC 5869 §2.2](https://datatracker.ietf.org/doc/html/rfc5869#section-2.2));
+///   if provided and non-empty, must be >= 16 bytes
 ///
 /// Output
 /// - Key of length `N`
@@ -430,7 +451,9 @@ pub fn hkdf<P: KdfFunction, const N: usize>(
 ///   impose the same bound.
 ///
 /// References
-/// - RFC 5869 (HKDF), NIST SP 800-56C (context/OtherInfo), ECIES profiles (key separation)
+/// - [RFC 5869 §3.2](https://datatracker.ietf.org/doc/html/rfc5869#section-3.2): `info` context binding
+/// - [NIST SP 800-56C Rev. 2 §5](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-56Cr2.pdf#page=25): extraction-then-expansion / FixedInfo
+/// - [SECG SEC 1 v2.0 §5.1.3](https://www.secg.org/sec1-v2.pdf#page=59): ECIES encryption/MAC key separation
 pub fn ecies_kdf_with_size<P: KdfFunction, const N: usize>(
 	ephemeral_pubkey: impl AsRef<[u8]>,
 	shared_secret: SecretSlice<u8>,
